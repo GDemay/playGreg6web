@@ -130,7 +130,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement SPIR-V/WGSL rewrite passes for unsupported WebGPU features (bindless indexing limits, subgroup/wave64 fallbacks, mesh-compute lowering).
 - [x] **S4 — DXBC/DXIL Container Inspector & Naga IR Push-Constant/BindGroup Lowering** — `DONE` (PR #56, closes #27) *(no game files required)*
   - Add pure-Rust DXBC/DXIL container parser (`shaders/src/dxbc.rs`) and Naga IR lowering passes (`shaders/src/lower.rs`: push constants → uniform buffer, >4 bind-group remapping) + `inspect-dxbc` CLI.
-- [ ] **S5 — Wave64/Subgroup Emulation & Mesh-Compute WGSL Lowering Library** — `IN PROGRESS` (#46, @Timon-ok) *(no game files required — wait for S4 or keep disjoint in `shaders/src/wave_emul.rs`)*
+- [x] **S5 — Wave64/Subgroup Emulation & Mesh-Compute WGSL Lowering Library** — `DONE` (PR #137, closes #46) *(no game files required — wait for S4 or keep disjoint in `shaders/src/wave_emul.rs`)*
   - Provide reusable WGSL workgroup-shared-memory emulation helpers for RDNA2 Wave64 ballot/shuffle/prefix-sum ops and indirect compute-driven meshlet culling/draw emission when WebGPU `subgroups` is unavailable.
 - [x] **S6 — Root-Signature-to-WebGPU `BindGroupLayout` Reflection & Cache Manifest** — `DONE` (PR #92, closes #47) *(no game files required — disjoint file `shaders/src/reflect.rs`)*
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
