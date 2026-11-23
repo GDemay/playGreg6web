@@ -18,7 +18,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Integrate `iced-x86` to decode `.text` blocks, follow calls/jumps, and build a CFG + relocation map.
 - [ ] **R3 — LLVM IR → Wasm64 Lifter Prototype** — `IN PROGRESS` (#14, @Timon-ok) *(no game files required)*
   - Lift small synthetic x86-64 test functions (arithmetic, branches, memory loads/stores, Win64 ABI calls) to LLVM IR and compile to `wasm64`.
-- [ ] **R4 — PE64 `.pdata` Exception Directory & Jump-Table Recovery** — `IN PROGRESS` (#38, @Timon-ok) *(no game files required — disjoint file `recomp/src/pdata.rs`)*
+- [x] **R4 — PE64 `.pdata` Exception Directory & Jump-Table Recovery** — `DONE` (PR #85, closes #38) *(no game files required — disjoint file `recomp/src/pdata.rs`)*
   - Parse PE64 `IMAGE_DIRECTORY_ENTRY_EXCEPTION` (`RUNTIME_FUNCTION` begin/end/unwind RVA) and `UNWIND_INFO` to recover exact function boundaries and switch/jump tables without heuristics.
 - [ ] **R5 — Import Thunk & Runtime Call-Bridge Generator** — `IN PROGRESS` (#39, @Timon-ok) *(no game files required — disjoint file `recomp/src/stubs.rs`)*
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
