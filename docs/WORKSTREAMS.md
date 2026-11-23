@@ -9,7 +9,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 1: Recompiler (`recomp/`, Rust)
 **Goal:** Lift the Xbox Series x86-64 PE executable into Wasm64 (`memory64`).
 
-- [ ] **R1 — PE Parser & Import Dumper** — `IN PROGRESS` (#1, @MarcBlattmann) *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
+- [x] **R1 — PE Parser & Import Dumper** — `DONE` (PR #21, closes #1) *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
   - Parse PE64 headers, sections, exports, TLS callbacks, and import tables (`object` / `goblin` crate).
   - Emit a sanitized symbol-only report (`docs/imports_required.md` — DLL + function names only, zero game bytes).
 - [ ] **R2 — x86-64 Decoder & Function Discovery** — `IN PROGRESS` (#13, @Timon-ok) *(no game files required for unit tests)*
@@ -22,8 +22,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 2: Xbox / Win32 OS Shims (`runtime/os/`, C++20 + Emscripten)
 **Goal:** Reimplement console OS APIs backed by browser workers, pthreads, and HTTPFS.
 
-- [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** *(no game files required; waits on W1+W2 & G2)*
-  - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`) and verify `runtime/build_wasm.ps1` boots in Chrome/Edge.
+- [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** — `IN PROGRESS` (#23, @MarcBlattmann) *(no game files required)*
+  - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`, `host_httpfs_*`) and SAB HTTPFS mailbox consumer in `io_worker.js`.
 - [x] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
 - [x] **O3 — Virtual Memory & Threading/TLS Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
@@ -64,9 +64,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
 
-- [ ] **W1 — OPFS + LRU Range Cache in `io_worker.js`** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
+- [x] **W1 — OPFS + LRU Range Cache in `io_worker.js`** — `DONE` (PR #15, closes #2) *(no game files required)*
   - Cache fetched HTTP `206` byte chunks in Origin Private File System (OPFS) with a configurable budget + `bootset.json` prefetch on startup.
-- [ ] **W2 — IndexedDB `/userdata` Save Persistence** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
+- [x] **W2 — IndexedDB `/userdata` Save Persistence** — `DONE` (PR #15, closes #2) *(no game files required)*
   - Restore `/userdata/` files into Wasm FS before `main()` and flush writes asynchronously (mirroring `playgta5`'s `loader.js` pattern).
 - [x] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** — `DONE` (PR #8, closes #6) *(no game files required)*
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
