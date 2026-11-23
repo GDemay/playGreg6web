@@ -25,6 +25,7 @@ add_library(playgta6_core STATIC
     os/ucrt_bridge.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
+    os/winsock_ordinals.cpp
     gpu/cmd_encoder.cpp
     gpu/pso_cache.cpp
     gpu/descriptor_heap.cpp
@@ -150,4 +151,8 @@ else()
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_boot_tests COMMAND test_guest_boot)
+
+    add_executable(test_winsock_ordinals ../tests/test_winsock_ordinals.cpp)
+    target_link_libraries(test_winsock_ordinals PRIVATE playgta6_core)
+    add_test(NAME playgta6_winsock_ordinals_tests COMMAND test_winsock_ordinals)
 endif()
