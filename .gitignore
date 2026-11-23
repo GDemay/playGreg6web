@@ -12,6 +12,7 @@ game/
 *.spv
 *.dxbc
 *.wgsl.pack
+*.pgim
 
 # Build outputs
 /target/
