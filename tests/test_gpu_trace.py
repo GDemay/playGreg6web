@@ -41,6 +41,17 @@ class TestGpuTraceDisassembler(unittest.TestCase):
         self.assertEqual(gpu_trace.SET_PIPELINE_STRUCT.size, 4)
         self.assertEqual(gpu_trace.SET_VERTEX_BUFFER_STRUCT.size, 16)
         self.assertEqual(gpu_trace.DESTROY_RESOURCE_STRUCT.size, 4)
+        self.assertEqual(gpu_trace.CREATE_TEXTURE_STRUCT.size, 32)
+        self.assertEqual(gpu_trace.WRITE_TEXTURE_STRUCT.size, 48)
+        self.assertEqual(gpu_trace.CREATE_SAMPLER_STRUCT.size, 32)
+        self.assertEqual(gpu_trace.BIND_GROUP_ENTRY_STRUCT.size, 32)
+        self.assertEqual(gpu_trace.CREATE_BIND_GROUP_STRUCT.size, 16)
+        self.assertEqual(gpu_trace.SET_BIND_GROUP_STRUCT.size, 8)
+        self.assertEqual(gpu_trace.SET_INDEX_BUFFER_STRUCT.size, 16)
+        self.assertEqual(gpu_trace.DRAW_INDEXED_STRUCT.size, 20)
+        self.assertEqual(gpu_trace.CREATE_COMPUTE_PIPELINE_STRUCT.size, 16)
+        self.assertEqual(gpu_trace.SET_COMPUTE_PIPELINE_STRUCT.size, 4)
+        self.assertEqual(gpu_trace.DISPATCH_COMPUTE_STRUCT.size, 12)
 
     def test_decode_all_frozen_opcodes_0_through_11_roundtrip(self) -> None:
         vertex_blob = bytes(range(64))
@@ -326,29 +337,29 @@ class TestGpuTraceDisassembler(unittest.TestCase):
         stream = b"".join(
             [
                 gpu_trace.encode_begin_frame(),
-                gpu_trace.encode_packet(12, future_payload, flags=0x0042),
+                gpu_trace.encode_packet(22, future_payload, flags=0x0042),
                 gpu_trace.encode_packet(99, b""),
                 gpu_trace.encode_present(),
             ]
         )
 
-        # Non-strict mode handles unknown opcodes cleanly without errors.
+        # Non-strict mode handles unknown opcodes (>= 22) cleanly without errors.
         lenient = gpu_trace.decode_stream(stream, strict=False)
         self.assertTrue(lenient.ok)
         self.assertEqual(lenient.diagnostics, ())
         self.assertEqual(lenient.packet_count, 4)
         self.assertEqual(lenient.unknown_opcode_count, 2)
 
-        u12 = lenient.packets[1]
-        self.assertFalse(u12.known)
-        self.assertTrue(u12.valid)
-        self.assertEqual(u12.opcode, 12)
-        self.assertEqual(u12.name, "Unknown(12)")
-        self.assertEqual(u12.flags, 0x0042)
-        self.assertEqual(u12.payload_bytes, len(future_payload))
-        self.assertEqual(u12.fields["payload_bytes"], len(future_payload))
-        self.assertEqual(u12.fields["crc32"], gpu_trace.crc32_hex(future_payload))
-        self.assertTrue(u12.fields["truncated_preview"])
+        u22 = lenient.packets[1]
+        self.assertFalse(u22.known)
+        self.assertTrue(u22.valid)
+        self.assertEqual(u22.opcode, 22)
+        self.assertEqual(u22.name, "Unknown(22)")
+        self.assertEqual(u22.flags, 0x0042)
+        self.assertEqual(u22.payload_bytes, len(future_payload))
+        self.assertEqual(u22.fields["payload_bytes"], len(future_payload))
+        self.assertEqual(u22.fields["crc32"], gpu_trace.crc32_hex(future_payload))
+        self.assertTrue(u22.fields["truncated_preview"])
 
         u99 = lenient.packets[2]
         self.assertEqual(u99.name, "Unknown(99)")
@@ -553,6 +564,492 @@ class TestGpuTraceDisassembler(unittest.TestCase):
             gpu_trace.encode_packet(0x10000)
         with self.assertRaises(ValueError):
             gpu_trace.encode_packet(0, b"", flags=0x10000)
+
+    def test_decode_all_g5_opcodes_12_through_21_roundtrip(self) -> None:
+        texel_blob = bytes((i * 7) & 0xFF for i in range(64))
+        stream = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_create_texture(
+                    resource_id=100,
+                    width=512,
+                    height=256,
+                    depth_or_layers=1,
+                    mip_levels=4,
+                    texture_format=gpu_trace.GpuTextureFormat.Bc7RgbaUnorm,
+                    usage_flags=0x0002 | 0x0004,  # COPY_DST | TEXTURE_BINDING
+                    dimension=gpu_trace.GpuTextureDimension.Dim2D,
+                ),
+                gpu_trace.encode_write_texture(
+                    texture_id=100,
+                    width=16,
+                    height=16,
+                    data=texel_blob,
+                    mip_level=1,
+                    origin_x=4,
+                    origin_y=8,
+                    origin_z=0,
+                    depth_or_layers=1,
+                    bytes_per_row=256,
+                    rows_per_image=16,
+                    reserved=3,
+                ),
+                gpu_trace.encode_create_sampler(
+                    resource_id=101,
+                    address_u=gpu_trace.GpuAddressMode.Repeat,
+                    address_v=gpu_trace.GpuAddressMode.MirrorRepeat,
+                    address_w=gpu_trace.GpuAddressMode.ClampToEdge,
+                    mag_filter=gpu_trace.GpuFilterMode.Linear,
+                    min_filter=gpu_trace.GpuFilterMode.Linear,
+                    mipmap_filter=gpu_trace.GpuFilterMode.Nearest,
+                    max_anisotropy=8,
+                ),
+                gpu_trace.encode_create_bind_group(
+                    resource_id=102,
+                    pipeline_id=30,
+                    group_index=1,
+                    entries=[
+                        gpu_trace.BindGroupEntry(
+                            binding=0,
+                            resource_type=gpu_trace.GpuBindResourceType.Buffer,
+                            resource_id=10,
+                            offset=64,
+                            size=256,
+                            reserved=0,
+                        ),
+                        {
+                            "binding": 1,
+                            "resource_type": gpu_trace.GpuBindResourceType.TextureView,
+                            "resource_id": 100,
+                        },
+                        gpu_trace.encode_bind_group_entry(
+                            binding=2,
+                            resource_type=gpu_trace.GpuBindResourceType.Sampler,
+                            resource_id=101,
+                        ),
+                    ],
+                ),
+                gpu_trace.encode_set_bind_group(group_index=1, bind_group_id=102),
+                gpu_trace.encode_set_index_buffer(
+                    buffer_id=11,
+                    index_format=gpu_trace.GpuIndexFormat.Uint32,
+                    offset=128,
+                ),
+                gpu_trace.encode_draw_indexed(
+                    index_count=72,
+                    instance_count=3,
+                    first_index=6,
+                    base_vertex=-16,
+                    first_instance=2,
+                ),
+                gpu_trace.encode_create_compute_pipeline(
+                    resource_id=200,
+                    cs_shader_id=22,
+                    pipeline_flags=0x0005,
+                    reserved=9,
+                ),
+                gpu_trace.encode_set_compute_pipeline(pipeline_id=200),
+                gpu_trace.encode_dispatch_compute(workgroup_x=16, workgroup_y=8, workgroup_z=2),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.diagnostics, ())
+        self.assertEqual(trace.consumed_bytes, len(stream))
+        self.assertEqual(trace.packet_count, 12)
+        self.assertEqual(trace.unknown_opcode_count, 0)
+
+        # 12: CreateTexture
+        p1 = trace.packets[1]
+        self.assertEqual(p1.opcode, 12)
+        self.assertEqual(p1.name, "CreateTexture")
+        self.assertEqual(p1.payload_bytes, 32)
+        self.assertEqual(p1.fields["id"], 100)
+        self.assertEqual(p1.fields["width"], 512)
+        self.assertEqual(p1.fields["height"], 256)
+        self.assertEqual(p1.fields["depth_or_layers"], 1)
+        self.assertEqual(p1.fields["mip_levels"], 4)
+        self.assertEqual(p1.fields["format"], 5)
+        self.assertEqual(p1.fields["format_name"], "Bc7RgbaUnorm")
+        self.assertEqual(p1.fields["format_webgpu"], "bc7-rgba-unorm")
+        self.assertEqual(p1.fields["usage_flags"], 0x0006)
+        self.assertEqual(p1.fields["usage_names"], ["COPY_DST", "TEXTURE_BINDING"])
+        self.assertEqual(p1.fields["dimension"], 1)
+        self.assertEqual(p1.fields["dimension_name"], "Dim2D")
+        self.assertEqual(p1.fields["dimension_webgpu"], "2d")
+
+        # 13: WriteTexture
+        p2 = trace.packets[2]
+        self.assertEqual(p2.opcode, 13)
+        self.assertEqual(p2.name, "WriteTexture")
+        self.assertEqual(p2.payload_bytes, 48 + len(texel_blob))
+        self.assertEqual(p2.fields["texture_id"], 100)
+        self.assertEqual(p2.fields["mip_level"], 1)
+        self.assertEqual(p2.fields["origin_x"], 4)
+        self.assertEqual(p2.fields["origin_y"], 8)
+        self.assertEqual(p2.fields["origin_z"], 0)
+        self.assertEqual(p2.fields["width"], 16)
+        self.assertEqual(p2.fields["height"], 16)
+        self.assertEqual(p2.fields["depth_or_layers"], 1)
+        self.assertEqual(p2.fields["bytes_per_row"], 256)
+        self.assertEqual(p2.fields["rows_per_image"], 16)
+        self.assertEqual(p2.fields["data_len"], 64)
+        self.assertEqual(p2.fields["reserved"], 3)
+        self.assertEqual(p2.fields["crc32"], gpu_trace.crc32_hex(texel_blob))
+        self.assertEqual(p2.fields["preview_bytes"], gpu_trace.DEFAULT_PREVIEW_BYTES)
+        self.assertEqual(
+            p2.fields["preview_hex"],
+            texel_blob[: gpu_trace.DEFAULT_PREVIEW_BYTES].hex(),
+        )
+        self.assertTrue(p2.fields["truncated_preview"])
+
+        # 14: CreateSampler
+        p3 = trace.packets[3]
+        self.assertEqual(p3.opcode, 14)
+        self.assertEqual(p3.name, "CreateSampler")
+        self.assertEqual(p3.payload_bytes, 32)
+        self.assertEqual(p3.fields["id"], 101)
+        self.assertEqual(p3.fields["address_u_name"], "Repeat")
+        self.assertEqual(p3.fields["address_u_webgpu"], "repeat")
+        self.assertEqual(p3.fields["address_v_name"], "MirrorRepeat")
+        self.assertEqual(p3.fields["address_v_webgpu"], "mirror-repeat")
+        self.assertEqual(p3.fields["address_w_name"], "ClampToEdge")
+        self.assertEqual(p3.fields["address_w_webgpu"], "clamp-to-edge")
+        self.assertEqual(p3.fields["mag_filter_name"], "Linear")
+        self.assertEqual(p3.fields["min_filter_name"], "Linear")
+        self.assertEqual(p3.fields["mipmap_filter_name"], "Nearest")
+        self.assertEqual(p3.fields["max_anisotropy"], 8)
+
+        # 15: CreateBindGroup (multi-entry)
+        p4 = trace.packets[4]
+        self.assertEqual(p4.opcode, 15)
+        self.assertEqual(p4.name, "CreateBindGroup")
+        self.assertEqual(p4.payload_bytes, 16 + 3 * 32)
+        self.assertEqual(p4.fields["id"], 102)
+        self.assertEqual(p4.fields["pipeline_id"], 30)
+        self.assertEqual(p4.fields["group_index"], 1)
+        self.assertEqual(p4.fields["entry_count"], 3)
+        self.assertEqual(len(p4.fields["entries"]), 3)
+        self.assertEqual(p4.fields["entries"][0]["binding"], 0)
+        self.assertEqual(p4.fields["entries"][0]["resource_type_name"], "Buffer")
+        self.assertEqual(p4.fields["entries"][0]["resource_id"], 10)
+        self.assertEqual(p4.fields["entries"][0]["offset"], 64)
+        self.assertEqual(p4.fields["entries"][0]["size"], 256)
+        self.assertEqual(p4.fields["entries"][1]["binding"], 1)
+        self.assertEqual(p4.fields["entries"][1]["resource_type_name"], "TextureView")
+        self.assertEqual(p4.fields["entries"][1]["resource_id"], 100)
+        self.assertEqual(p4.fields["entries"][2]["binding"], 2)
+        self.assertEqual(p4.fields["entries"][2]["resource_type_name"], "Sampler")
+        self.assertEqual(p4.fields["entries"][2]["resource_id"], 101)
+
+        # 16: SetBindGroup
+        p5 = trace.packets[5]
+        self.assertEqual(p5.opcode, 16)
+        self.assertEqual(p5.name, "SetBindGroup")
+        self.assertEqual(p5.payload_bytes, 8)
+        self.assertEqual(p5.fields["group_index"], 1)
+        self.assertEqual(p5.fields["bind_group_id"], 102)
+
+        # 17: SetIndexBuffer
+        p6 = trace.packets[6]
+        self.assertEqual(p6.opcode, 17)
+        self.assertEqual(p6.name, "SetIndexBuffer")
+        self.assertEqual(p6.payload_bytes, 16)
+        self.assertEqual(p6.fields["buffer_id"], 11)
+        self.assertEqual(p6.fields["index_format"], 1)
+        self.assertEqual(p6.fields["index_format_name"], "Uint32")
+        self.assertEqual(p6.fields["index_format_webgpu"], "uint32")
+        self.assertEqual(p6.fields["offset"], 128)
+
+        # 18: DrawIndexed (including negative signed int32 base_vertex)
+        p7 = trace.packets[7]
+        self.assertEqual(p7.opcode, 18)
+        self.assertEqual(p7.name, "DrawIndexed")
+        self.assertEqual(p7.payload_bytes, 20)
+        self.assertEqual(p7.fields["index_count"], 72)
+        self.assertEqual(p7.fields["instance_count"], 3)
+        self.assertEqual(p7.fields["first_index"], 6)
+        self.assertEqual(p7.fields["base_vertex"], -16)
+        self.assertEqual(p7.fields["first_instance"], 2)
+
+        # 19: CreateComputePipeline
+        p8 = trace.packets[8]
+        self.assertEqual(p8.opcode, 19)
+        self.assertEqual(p8.name, "CreateComputePipeline")
+        self.assertEqual(p8.payload_bytes, 16)
+        self.assertEqual(p8.fields["id"], 200)
+        self.assertEqual(p8.fields["cs_shader_id"], 22)
+        self.assertEqual(p8.fields["flags"], 0x0005)
+        self.assertEqual(p8.fields["reserved"], 9)
+
+        # 20: SetComputePipeline
+        p9 = trace.packets[9]
+        self.assertEqual(p9.opcode, 20)
+        self.assertEqual(p9.name, "SetComputePipeline")
+        self.assertEqual(p9.payload_bytes, 4)
+        self.assertEqual(p9.fields["pipeline_id"], 200)
+
+        # 21: DispatchCompute
+        p10 = trace.packets[10]
+        self.assertEqual(p10.opcode, 21)
+        self.assertEqual(p10.name, "DispatchCompute")
+        self.assertEqual(p10.payload_bytes, 12)
+        self.assertEqual(p10.fields["workgroup_x"], 16)
+        self.assertEqual(p10.fields["workgroup_y"], 8)
+        self.assertEqual(p10.fields["workgroup_z"], 2)
+
+        # Text formatting includes readable G5 summaries
+        text = gpu_trace.format_trace_text(trace)
+        self.assertIn("CreateTexture", text)
+        self.assertIn("fmt=bc7-rgba-unorm", text)
+        self.assertIn("COPY_DST|TEXTURE_BINDING", text)
+        self.assertIn("CreateBindGroup", text)
+        self.assertIn("@0:Buffer(#10)[64:256]", text)
+        self.assertIn("@1:TextureView(#100)", text)
+        self.assertIn("@2:Sampler(#101)", text)
+        self.assertIn("base_vertex=-16", text)
+        self.assertIn("workgroups=(16, 8, 2)", text)
+
+    def test_draw_indexed_negative_base_vertex_extremes(self) -> None:
+        stream = b"".join(
+            [
+                gpu_trace.encode_draw_indexed(3, base_vertex=-1),
+                gpu_trace.encode_draw_indexed(6, base_vertex=-2147483648),
+                gpu_trace.encode_draw_indexed(9, base_vertex=2147483647),
+            ]
+        )
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.packets[0].fields["base_vertex"], -1)
+        self.assertEqual(trace.packets[1].fields["base_vertex"], -2147483648)
+        self.assertEqual(trace.packets[2].fields["base_vertex"], 2147483647)
+
+    def test_g5_enums_and_invalid_enum_diagnostics(self) -> None:
+        # All known texture usage flags
+        names, unknown = gpu_trace.decode_texture_usage(0x001F)
+        self.assertEqual(unknown, 0)
+        self.assertEqual(
+            names,
+            [
+                "COPY_SRC",
+                "COPY_DST",
+                "TEXTURE_BINDING",
+                "STORAGE_BINDING",
+                "RENDER_ATTACHMENT",
+            ],
+        )
+
+        # Unknown texture format, usage bit, dimension, sampler modes, bind resource type, index fmt
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_texture(
+                    resource_id=1,
+                    width=32,
+                    height=32,
+                    texture_format=99,
+                    usage_flags=0x0044,  # TEXTURE_BINDING | unknown 0x40
+                    dimension=7,
+                ),
+                gpu_trace.encode_create_sampler(
+                    resource_id=2,
+                    address_u=9,
+                    mag_filter=8,
+                ),
+                gpu_trace.encode_create_bind_group(
+                    resource_id=3,
+                    pipeline_id=1,
+                    group_index=0,
+                    entries=[gpu_trace.BindGroupEntry(binding=0, resource_type=42, resource_id=1)],
+                ),
+                gpu_trace.encode_set_index_buffer(buffer_id=4, index_format=5, offset=0),
+            ]
+        )
+
+        lenient = gpu_trace.decode_stream(stream, strict=False)
+        self.assertTrue(lenient.ok)
+        self.assertEqual(lenient.packets[0].fields["format_name"], "Unknown(99)")
+        self.assertIsNone(lenient.packets[0].fields["format_webgpu"])
+        self.assertEqual(
+            lenient.packets[0].fields["usage_names"],
+            ["TEXTURE_BINDING", "UNKNOWN(0x40)"],
+        )
+        self.assertEqual(lenient.packets[0].fields["dimension_name"], "Unknown(7)")
+        self.assertEqual(lenient.packets[1].fields["address_u_name"], "Unknown(9)")
+        self.assertEqual(lenient.packets[1].fields["mag_filter_name"], "Unknown(8)")
+        self.assertEqual(
+            lenient.packets[2].fields["entries"][0]["resource_type_name"],
+            "Unknown(42)",
+        )
+        self.assertEqual(lenient.packets[3].fields["index_format_name"], "Unknown(5)")
+        self.assertIsNone(lenient.packets[3].fields["index_format_webgpu"])
+        self.assertEqual(
+            {d.code for d in lenient.diagnostics},
+            {
+                "unknown_texture_format",
+                "unknown_texture_usage_bits",
+                "unknown_texture_dimension",
+                "unknown_address_mode",
+                "unknown_filter_mode",
+                "unknown_bind_resource_type",
+                "unknown_index_format",
+            },
+        )
+
+        strict = gpu_trace.decode_stream(stream, strict=True)
+        self.assertFalse(strict.ok)
+        self.assertTrue(all(d.severity == "error" for d in strict.diagnostics))
+
+    def test_write_texture_and_bind_group_length_mismatch_diagnostics(self) -> None:
+        # 1. WriteTexture header too short (< 48 bytes)
+        wt_short_hdr = gpu_trace.encode_packet(gpu_trace.GpuOpcode.WriteTexture, b"\x00" * 24)
+        t_wt_hdr = gpu_trace.decode_stream(wt_short_hdr)
+        self.assertFalse(t_wt_hdr.ok)
+        self.assertFalse(t_wt_hdr.packets[0].valid)
+        self.assertEqual(t_wt_hdr.diagnostics[0].code, "payload_too_short")
+
+        # 2. WriteTexture truncated texel bytes (claims 64 bytes, only 10 follow)
+        wt_head = gpu_trace.WRITE_TEXTURE_STRUCT.pack(7, 0, 0, 0, 0, 4, 4, 1, 16, 4, 64, 0)
+        wt_trunc = gpu_trace.encode_packet(gpu_trace.GpuOpcode.WriteTexture, wt_head + b"\xaa" * 10)
+        t_wt_trunc = gpu_trace.decode_stream(wt_trunc)
+        self.assertFalse(t_wt_trunc.ok)
+        self.assertFalse(t_wt_trunc.packets[0].valid)
+        self.assertEqual(t_wt_trunc.packets[0].fields["data_len"], 64)
+        self.assertEqual(t_wt_trunc.packets[0].fields["available_bytes"], 10)
+        self.assertEqual(t_wt_trunc.diagnostics[0].code, "variable_payload_truncated")
+
+        # 3. WriteTexture trailing extra bytes (claims 4 bytes, 8 provided)
+        wt_head_small = gpu_trace.WRITE_TEXTURE_STRUCT.pack(7, 0, 0, 0, 0, 1, 1, 1, 4, 1, 4, 0)
+        wt_extra = gpu_trace.encode_packet(
+            gpu_trace.GpuOpcode.WriteTexture, wt_head_small + b"\x01\x02\x03\x04\xff\xff\xff\xff"
+        )
+        t_wt_extra = gpu_trace.decode_stream(wt_extra, strict=False)
+        self.assertTrue(t_wt_extra.ok)
+        self.assertTrue(t_wt_extra.has_warnings)
+        self.assertEqual(t_wt_extra.packets[0].fields["trailing_bytes"], 4)
+        self.assertEqual(t_wt_extra.packets[0].fields["crc32"], gpu_trace.crc32_hex(b"\x01\x02\x03\x04"))
+        self.assertEqual(t_wt_extra.diagnostics[0].code, "payload_size_mismatch")
+        self.assertFalse(gpu_trace.decode_stream(wt_extra, strict=True).ok)
+
+        # 4. CreateBindGroup truncated entries (claims 2 entries = 64B, only 40B follow -> 1 complete)
+        entry0 = gpu_trace.encode_bind_group_entry(
+            0, gpu_trace.GpuBindResourceType.Buffer, 55, offset=0, size=128
+        )
+        bg_trunc = gpu_trace.encode_packet(
+            gpu_trace.GpuOpcode.CreateBindGroup,
+            gpu_trace.CREATE_BIND_GROUP_STRUCT.pack(9, 1, 0, 2) + entry0 + b"\x00" * 8,
+        )
+        t_bg_trunc = gpu_trace.decode_stream(bg_trunc)
+        self.assertFalse(t_bg_trunc.ok)
+        self.assertFalse(t_bg_trunc.packets[0].valid)
+        self.assertEqual(t_bg_trunc.packets[0].fields["entry_count"], 2)
+        self.assertEqual(len(t_bg_trunc.packets[0].fields["entries"]), 1)
+        self.assertEqual(t_bg_trunc.packets[0].fields["available_bytes"], 40)
+        self.assertEqual(t_bg_trunc.diagnostics[0].code, "variable_payload_truncated")
+
+        # 5. CreateBindGroup trailing extra bytes
+        bg_extra = gpu_trace.encode_packet(
+            gpu_trace.GpuOpcode.CreateBindGroup,
+            gpu_trace.CREATE_BIND_GROUP_STRUCT.pack(9, 1, 0, 1) + entry0 + b"\xbe\xef",
+        )
+        t_bg_extra = gpu_trace.decode_stream(bg_extra, strict=False)
+        self.assertTrue(t_bg_extra.ok)
+        self.assertEqual(t_bg_extra.packets[0].fields["trailing_bytes"], 2)
+        self.assertEqual(t_bg_extra.diagnostics[0].code, "payload_size_mismatch")
+        self.assertFalse(gpu_trace.decode_stream(bg_extra, strict=True).ok)
+
+        # 6. Raw bind group entry length validation on encode
+        with self.assertRaises(ValueError):
+            gpu_trace.encode_create_bind_group(1, 1, 0, [b"\x00" * 16])
+
+    def test_compute_and_textured_indexed_draw_frame_summaries(self) -> None:
+        frame0 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_create_texture(10, 64, 64, usage_flags=0x0006),
+                gpu_trace.encode_create_texture(11, 64, 64, usage_flags=0x0014),
+                gpu_trace.encode_create_sampler(12),
+                gpu_trace.encode_create_compute_pipeline(20, cs_shader_id=1),
+                gpu_trace.encode_create_bind_group(
+                    30,
+                    pipeline_id=20,
+                    group_index=0,
+                    entries=[
+                        gpu_trace.BindGroupEntry(0, gpu_trace.GpuBindResourceType.Buffer, 1),
+                    ],
+                ),
+                gpu_trace.encode_create_bind_group(
+                    31,
+                    pipeline_id=21,
+                    group_index=0,
+                    entries=[
+                        gpu_trace.BindGroupEntry(0, gpu_trace.GpuBindResourceType.TextureView, 10),
+                        gpu_trace.BindGroupEntry(1, gpu_trace.GpuBindResourceType.Sampler, 12),
+                    ],
+                ),
+                # Compute pass #1 (two dispatches back-to-back)
+                gpu_trace.encode_set_compute_pipeline(20),
+                gpu_trace.encode_set_bind_group(0, 30),
+                gpu_trace.encode_dispatch_compute(8, 8, 1),
+                gpu_trace.encode_dispatch_compute(4, 4, 1),
+                # Render pass (1 DrawIndexed + 1 Draw)
+                gpu_trace.encode_set_pipeline(21),
+                gpu_trace.encode_set_bind_group(0, 31),
+                gpu_trace.encode_set_index_buffer(2, gpu_trace.GpuIndexFormat.Uint16, 0),
+                gpu_trace.encode_draw_indexed(36, 1, 0, -4, 0),
+                gpu_trace.encode_draw(3, 1, 0, 0),
+                # Compute pass #2 (after render pass -> increments compute_passes)
+                gpu_trace.encode_set_compute_pipeline(20),
+                gpu_trace.encode_dispatch_compute(2, 2, 1),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(frame0, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.frame_count, 1)
+
+        f0 = trace.frames[0]
+        self.assertTrue(f0.complete)
+        self.assertTrue(f0.has_begin_frame)
+        self.assertEqual(f0.draw_calls, 2)
+        self.assertEqual(f0.draw_indexed_calls, 1)
+        self.assertEqual(f0.compute_dispatches, 3)
+        self.assertEqual(f0.compute_passes, 2)
+        self.assertEqual(f0.textures_created, 2)
+        self.assertEqual(f0.bind_groups_created, 2)
+
+        # Trace-level aggregates match frame totals
+        self.assertEqual(trace.draw_calls, 2)
+        self.assertEqual(trace.draw_indexed_calls, 1)
+        self.assertEqual(trace.compute_dispatches, 3)
+        self.assertEqual(trace.compute_passes, 2)
+        self.assertEqual(trace.textures_created, 2)
+        self.assertEqual(trace.bind_groups_created, 2)
+
+        # JSON output includes all new counters alongside existing ones
+        parsed = json.loads(gpu_trace.trace_to_json(trace, stats_only=True))
+        self.assertEqual(parsed["draw_calls"], 2)
+        self.assertEqual(parsed["draw_indexed_calls"], 1)
+        self.assertEqual(parsed["compute_dispatches"], 3)
+        self.assertEqual(parsed["compute_passes"], 2)
+        self.assertEqual(parsed["textures_created"], 2)
+        self.assertEqual(parsed["bind_groups_created"], 2)
+        self.assertEqual(parsed["frames"][0]["draw_indexed_calls"], 1)
+        self.assertEqual(parsed["frames"][0]["compute_dispatches"], 3)
+        self.assertEqual(parsed["frames"][0]["compute_passes"], 2)
+        self.assertEqual(parsed["frames"][0]["textures_created"], 2)
+        self.assertEqual(parsed["frames"][0]["bind_groups_created"], 2)
+
+        # Text summary prints the new frame metrics
+        text = gpu_trace.format_trace_text(trace, stats_only=True)
+        self.assertIn("Dispatches: 3", text)
+        self.assertIn("indexed=1", text)
+        self.assertIn("dispatches=3", text)
+        self.assertIn("compute_passes=2", text)
+        self.assertIn("textures=2", text)
+        self.assertIn("bind_groups=2", text)
 
 
 if __name__ == "__main__":
