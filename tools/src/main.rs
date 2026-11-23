@@ -1,5 +1,6 @@
 mod rpf9;
 mod scan;
+mod xvd;
 
 use std::env;
 use std::fs;
@@ -12,6 +13,7 @@ use rpf9::{
     write_bootset,
 };
 use scan::{is_file_complete, resolve_env_key, resolve_game_dir_from_env, scan_directory};
+use xvd::inspect_xvd_file;
 
 const ABI_VERSION: u32 = 1;
 
@@ -243,6 +245,7 @@ fn print_usage() {
     );
     eprintln!("  playgta6-manifest scan (--dir <game-dir> | --from-env) [--json]");
     eprintln!("  playgta6-manifest inspect-rpf <file.rpf>");
+    eprintln!("  playgta6-manifest xvd <file.xvd|file.xvc> [--json]");
     eprintln!("Falls back to GTA6_GAME_DIR and GTA6_DATA_DIR from env or .env.");
 }
 
@@ -262,6 +265,10 @@ enum Command {
     },
     InspectRpf {
         rpf_path: PathBuf,
+    },
+    Xvd {
+        path: PathBuf,
+        json: bool,
     },
     Scan {
         dir: Option<PathBuf>,
@@ -393,6 +400,30 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 rpf_path: PathBuf::from(&args[1]),
             })
         }
+        Some("xvd") => {
+            let mut path: Option<PathBuf> = None;
+            let mut json = false;
+
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("Unknown argument for xvd: {other}"));
+                    }
+                    other => {
+                        if path.is_some() {
+                            return Err(format!("Unexpected extra argument for xvd: {other}"));
+                        }
+                        path = Some(PathBuf::from(other));
+                    }
+                }
+            }
+
+            let Some(path) = path else {
+                return Err("Usage: playgta6-manifest xvd <file.xvd|file.xvc> [--json]".to_string());
+            };
+            Ok(Command::Xvd { path, json })
+        }
         _ => parse_manifest_flags(args, 0),
     }
 }
@@ -515,6 +546,20 @@ fn main() -> ExitCode {
             }
             Err(err) => {
                 eprintln!("RPF inspection failed: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Xvd { path, json } => match inspect_xvd_file(&path) {
+            Ok(report) => {
+                if json {
+                    print!("{}", report.to_json());
+                } else {
+                    print!("{}", report.format_human());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("XVD inspection failed: {err}");
                 ExitCode::FAILURE
             }
         },
@@ -728,5 +773,56 @@ mod tests {
 
         let bad_inspect: Vec<String> = vec!["inspect-rpf".to_string()];
         assert!(parse_args(&bad_inspect).is_err());
+
+        let xvd_args: Vec<String> = vec!["xvd", "package.xvc"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_args(&xvd_args).unwrap(),
+            Command::Xvd {
+                path: PathBuf::from("package.xvc"),
+                json: false,
+            }
+        );
+
+        let xvd_json_args: Vec<String> = vec!["xvd", "package.xvc", "--json"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_args(&xvd_json_args).unwrap(),
+            Command::Xvd {
+                path: PathBuf::from("package.xvc"),
+                json: true,
+            }
+        );
+
+        let xvd_json_first_args: Vec<String> = vec!["xvd", "--json", "container.xvd"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_args(&xvd_json_first_args).unwrap(),
+            Command::Xvd {
+                path: PathBuf::from("container.xvd"),
+                json: true,
+            }
+        );
+
+        let bad_xvd_missing: Vec<String> = vec!["xvd".to_string()];
+        assert!(parse_args(&bad_xvd_missing).is_err());
+
+        let bad_xvd_flag: Vec<String> = vec!["xvd", "package.xvc", "--unknown"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(parse_args(&bad_xvd_flag).is_err());
+
+        let bad_xvd_extra: Vec<String> = vec!["xvd", "a.xvc", "b.xvc"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(parse_args(&bad_xvd_extra).is_err());
     }
 }
