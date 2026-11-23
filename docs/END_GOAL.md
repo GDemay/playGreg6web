@@ -8,26 +8,47 @@ Run **Grand Theft Auto VI (Xbox Series)** directly inside a user's modern web br
 - **No short-term fake sandbox / asset-viewer detour.** Every piece built here moves directly toward booting and running the real game binary.
 - **No copyrighted files, keys, DRM bypasses, or game source code** in git, issues, or PRs.
 
-## Definition of Done (Target Milestones)
+## Big Milestones Tracker (Live Progress)
 
-### M0 — Foundation *(Current)*
-- Hybrid repo ready: Rust pipelines (`recomp/`, `shaders/`, `tools/`), C++20/Emscripten Wasm64 runtime (`runtime/`), browser worker shell (`web/`), COOP/COEP + HTTP `206` Range server (`server/`), shared ABI contracts (`docs/`), and CI.
+> Update checkboxes here as major end-to-end milestones are proven (not just unit-tested).
 
-### M1 — Static Analysis & Asset/Shader Readiness
-- `tools/` generates `data-manifest.json` + `bootset.json` from a local `GTA6_GAME_DIR`.
-- `recomp/` parses the Xbox Series PE executable, dumps its complete import table (DLLs + symbols) and section layout into `docs/` (symbol names only, never binaries).
-- `shaders/` converts RDNA2 → SPIR-V (`--mesh-compute`, `--wave64-emulate`) → WGSL via `naga` and produces a coverage report + `shader-index.json`.
+### M0 — Foundation & Multi-Contributor Infrastructure — `DONE`
+- [x] Hybrid repo ready: Rust pipelines (`recomp/`, `shaders/`, `tools/`), C++20/Emscripten Wasm64 runtime (`runtime/`), browser worker shell (`web/`), COOP/COEP + HTTP `206` Range server (`server/`).
+- [x] Frozen cross-track contracts (`docs/io_manifest.md`, `docs/wasm_abi.md`, `docs/gpu_commands.md`) + multi-agent task-claiming workflow (`AGENTS.md`, `docs/WORKSTREAMS.md`).
+- [x] CI guardrails (No Game Files Guard, Rust workspace tests, C++ CTest, Python unittest, JS syntax & `node:test`).
 
-### M2 — First Wasm64 Boot & OS Shims
-- `recomp/` lifts x86-64 code sections → LLVM IR → Wasm64 object linked with `runtime/` (`-sMEMORY64=1 -pthread`).
-- `runtime/os/` implements the minimal boot surface (`xgameruntime`, `XTaskQueue`, threading/TLS, virtual memory, `httpfs` Range VFS, IndexedDB `/userdata`).
-- The recompiled binary initializes inside `web/loader.js` and reaches its first D3D12 device/swapchain creation calls.
+### M1 — Browser Runtime Shell, Streaming I/O & Shader Tooling — `IN PROGRESS`
+- [x] COOP/COEP + HTTP `206` Range + `ETag`/`If-Range` + `/api/status` local server (`server/serve_local.py`) & live diagnostics HUD (`web/index.html`).
+- [x] OPFS + LRU `RangeCache`, `bootset.json` prefetch, and IndexedDB `/userdata` persistence (`web/workers/`).
+- [x] Lock-free `SharedArrayBuffer` GPU command ring (`runtime/gpu/gpu_ring.h` ↔ `web/workers/gpu_ring.js`) & WebGPU command processor (`web/workers/wgpu_worker.js`).
+- [x] Full `InputBridge` (Pointer Lock, mouse/keyboard, Gamepad API → 40-byte `InputState` SAB) & SAB audio pipeline (`audio_worker.js`).
+- [x] SPIR-V → WGSL converter (`naga`), WebGPU compatibility sanitizer/auditor, `.wgsl.pack` bundler, and JS `WGPK` loader/cache (`wgsl_pack_loader.js`).
+- [ ] First Emscripten Wasm64 + Pthreads smoke build (`dist/runtime.wasm`) booting in Chrome/Edge and rendering a real WebGPU clear/triangle frame through the SAB GPU ring (`O1` + `G5`).
 
-### M3 — First WebGPU Frame
-- `runtime/gpu/` translates `d3d12_xs` resource creation, descriptor heaps, command lists, and `PresentX` into binary command streams consumed by `web/workers/wgpu_worker.js`.
-- First real frames from the game render onto the browser `OffscreenCanvas` using lowered WGSL shaders.
+### M2 — Real Game Static Analysis & Asset Readiness — `WAITING ON LOCAL FILES`
+- [x] Pure-Rust PE64 parser & sanitized import/export/TLS dumper (`playgta6-recomp inspect`).
+- [x] Non-extracting RPF9 header inspector, `bootset.json` generator, and partial-download folder scanner (`playgta6-manifest scan/rpf9/bootset`).
+- [ ] Run `playgta6-manifest scan --from-env` and `playgta6-recomp inspect --from-env` on a real local `GTA6_GAME_DIR` to verify container layout (`.xvc`/`.xvd` vs loose `.exe`/`.rpf9`) and publish sanitized `docs/imports_required.md` (symbol names only, zero game bytes).
+- [ ] Run `playgta6-shaders audit` / `convert` on real extracted local shaders to generate a real WebGPU blocker report + `shader-index.json` + `.wgsl.pack` locally.
 
-### M4 — Playable In-Browser Build
-- Interactive input (`web/input/input_bridge.js`: Pointer Lock, keyboard/mouse, Gamepad API → `GameInput` shim).
-- Streaming audio (`web/workers/audio_worker.js`: Opus/XMA2 → WebAudio).
-- Persistent saves in IndexedDB (`/userdata`), OPFS range cache in `io_worker.js`, and stable multi-threaded performance on consumer GPUs.
+### M3 — Wasm64 Recompilation & Console OS/GDK Boot Surface — `IN PROGRESS`
+- [x] Core OS shims: `VirtualMemoryArena`, `TlsTable`/`SrwLock`/`XTaskQueue`, `GameInputReader`, and `HttpfsMailbox` (`runtime/os/`).
+- [ ] Xbox GDK `xgameruntime` + Win32 kernel/file/sync/heap/`GetProcAddress` + offline Xbox Live shim coverage (`O5`–`O8`, driven by real `docs/imports_required.md`).
+- [ ] `recomp/` x86-64 decoder + CFG + `.pdata` exception table + LLVM IR → Wasm64 lifter (`R2`–`R6`) compiling synthetic Win64 functions to working Wasm64 objects.
+- [ ] Recompiled real game executable links against `runtime/` (`-sMEMORY64=1 -pthread`), passes CRT startup, and reaches its first `XGameRuntimeInitialize` + `D3D12CreateDevice` call in the browser.
+
+### M4 — First Real Frame / Intro Splash in Browser — `UPCOMING`
+- [ ] `runtime/gpu/` translates `d3d12_xs` textures, samplers, descriptor heaps, root signatures, PSOs, indexed draws, and compute passes (`G5`–`G7`) to `wgpu_worker.js`.
+- [ ] Lowered WGSL shaders execute without WebGPU validation errors on consumer GPUs.
+- [ ] **Big Milestone:** First real intro / splash / legal screen frames from the recompiled binary render onto the browser `OffscreenCanvas` via WebGPU.
+
+### M5 — Title Screen, Menus & World Streaming — `UPCOMING`
+- [ ] Interactive menu navigation via `InputBridge` (keyboard/mouse + Gamepad API).
+- [ ] Streaming multi-GB `.rpf9` world/UI assets smoothly over HTTP `206` Range + OPFS cache without stalling main/render threads.
+- [ ] Streaming audio voices (Opus/ADPCM/XMA2) playing through `audio_worker.js` / `AudioWorklet`.
+- [ ] **Big Milestone:** Reach the interactive main menu and trigger world load.
+
+### M6 — Playable In-Browser Build — `UPCOMING`
+- [ ] Persistent saves in IndexedDB (`/userdata`) survive page reloads.
+- [ ] Stable multi-threaded Wasm64 + WebGPU frame pacing on consumer Chrome/Edge GPUs.
+- [ ] **Big Milestone:** Playable open-world gameplay running 100% client-side in the browser.

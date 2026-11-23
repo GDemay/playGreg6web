@@ -58,7 +58,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
 - [x] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
-- [ ] **G4 — `WGPK` `.wgsl.pack` Binary Loader & Shader Module Cache** — `IN PROGRESS` (#18, @MarcBlattmann) *(no game files required)*
+- [x] **G4 — `WGPK` `.wgsl.pack` Binary Loader & Shader Module Cache** — `DONE` (PR #26, closes #18) *(no game files required)*
   - Parse `.wgsl.pack` binary bundles (`shaders/src/pack.rs`) in JS (`web/workers/wgsl_pack_loader.js`), resolve WGSL by 64-bit FNV-1a hash, and cache compiled `GPUShaderModule`s.
 - [ ] **G5 — D3D12-XS Textures, Samplers, BindGroups, Indexed Draw & Compute Dispatch** — `IN PROGRESS` (#24, @MarcBlattmann) *(no game files required)*
   - Extend GPU command ABI, `CommandEncoder`, `d3d12_xs.h`, and `wgpu_worker.js` with textures, samplers, bind groups, indexed drawing, and compute dispatch (for RDNA2 mesh-compute lowering).
@@ -66,7 +66,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement CPU/GPU descriptor heap tables (`CBV_SRV_UAV`, `SAMPLER`, `RTV`, `DSV`), root signature parameter mapping, and dirty-bind-group caching that compiles D3D12 descriptor tables into WebGPU `CreateBindGroup`/`SetBindGroup` calls.
 - [ ] **G7 — D3D12 PSO Cache, Render Targets & Viewport/Scissor State** *(unclaimed; no game files required — disjoint files `runtime/gpu/pso_cache.{h,cpp}`, `tests/test_pso_cache.cpp`)*
   - Hash D3D12 graphics & compute PSO descriptors (blend/depth/rasterizer/vertex-layout/shader hashes) to deduplicate WebGPU pipeline creation and track active RTV/DSV/viewport/scissor state per command list.
-- [ ] **G8 — Binary GPU Command Stream Disassembler & Trace Inspector** *(unclaimed; no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
+- [ ] **G8 — Binary GPU Command Stream Disassembler & Trace Inspector** — `IN PROGRESS` (#32, @MarcBlattmann) *(no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
   - Parse recorded `playgta6` GPU command ring byte streams into human-readable/JSON frame traces with opcode histograms, byte counts, and malformed-packet diagnostics for debugging M3 frames.
 
 ---
@@ -100,13 +100,15 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
 - [x] **W4 — Local Environment & Diagnostics (`tools/`)** — `DONE` (PR #8, closes #6) *(uses `GTA6_GAME_DIR` when available)*
   - Extend `tools/` to generate `bootset.json`, inspect RPF9 archive headers without extracting 100+ GB, and verify local file integrity.
-- [ ] **W5 — Full `InputBridge` (Gamepad API + Xbox Buttons/Sticks/Triggers + Pointer Lock)** — `IN PROGRESS` (#17, @MarcBlattmann) *(no game files required)*
+- [x] **W5 — Full `InputBridge` (Gamepad API + Xbox Buttons/Sticks/Triggers + Pointer Lock)** — `DONE` (PR #28, closes #17) *(no game files required)*
   - Populate the full 40-byte `playgta6::InputState` SAB from Pointer Lock mouse, keyboard, and `navigator.getGamepads()` matching `runtime/os/game_input.h`.
-- [ ] **W6 — Partial-Download Game Folder Scanner & Incremental Manifest CLI (`tools/`)** — `IN PROGRESS` (#19, @MarcBlattmann) *(works on partial or complete `GTA6_GAME_DIR`)*
+- [x] **W6 — Partial-Download Game Folder Scanner & Incremental Manifest CLI (`tools/`)** — `DONE` (PR #30, closes #19) *(works on partial or complete `GTA6_GAME_DIR`)*
   - Add read-only `scan` command detecting completed vs downloading files (`.!qB`/`.part`/sparse) and `--skip-incomplete` for `manifest`/`bootset`.
-- [ ] **W7 — Local Server Hardening (`/api/status`, ETag/If-Range) & Browser Diagnostics HUD (`server/`, `web/index.html`)** — `IN PROGRESS` (#20, @MarcBlattmann) *(no game files required)*
+- [x] **W7 — Local Server Hardening (`/api/status`, ETag/If-Range) & Browser Diagnostics HUD (`server/`, `web/index.html`)** — `DONE` (PR #29, closes #20) *(no game files required)*
   - Add ETag/`If-Range`/`HEAD` + sanitized `/api/status` to `server/serve_local.py` and upgrade `web/index.html` with a live Wasm64/WebGPU/SAB HUD.
-- [ ] **W8 — Multi-Voice Audio Mixer & PCM/ADPCM Voice Streamer** *(unclaimed; no game files required — disjoint files `web/workers/audio_mixer.js`, `tests/test_audio_mixer.mjs`)*
+- [ ] **W8 — Multi-Voice Audio Mixer & PCM/ADPCM Voice Streamer** — `IN PROGRESS` (#31, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_mixer.js`, `tests/test_audio_mixer.mjs`)*
   - Implement a lock-free multi-voice mixer (3D pan/gain, sample-rate resampling, ADPCM/PCM decoding, soft-clip limiter) that feeds `audio_worker.js`'s SAB ring buffer for XAudio2/XMA2 voice emulation.
-- [ ] **W9 — Headless End-to-End Integration Harness (Local Server ↔ Workers ↔ SAB ↔ WebGPU Mock)** *(unclaimed; no game files required — disjoint file `tests/test_e2e_pipeline.mjs`)*
-  - Spin up `server/serve_local.py` on an ephemeral port in a Node test, exercise real HTTP `206` Range + `ETag`/`If-Range` reads through `RangeCache` → `HttpfsMailbox` → `WgpuCommandProcessor` + `WgslPackCache` end-to-end.
+- [ ] **W9 — Headless End-to-End Integration Harness (Local Server ↔ Workers ↔ SAB ↔ WebGPU Mock)** — `IN PROGRESS` (#33, @MarcBlattmann) *(no game files required — disjoint file `tests/test_e2e_pipeline.mjs`)*
+  - Spin up `server/serve_local.py` on an ephemeral port in a Node test, exercise real HTTP `206` Range + `ETag`/`If-Range` reads through `RangeCache` → `WgslPackCache` → `InputBridge` → `GpuRingBuffer` → `WgpuCommandProcessor` end-to-end.
+- [ ] **W10 — Pure-Rust Xbox XVD/XVC Container Header & Layout Inspector** — `IN PROGRESS` (#34, @MarcBlattmann) *(works on local `.xvd`/`.xvc` or synthetic unit tests — disjoint files `tools/src/xvd.rs`, `tools/src/main.rs`)*
+  - Read-only parser for `msft-xvd` container headers (version, content type, drive/embedded XVD sizes, XVC region presence, encryption flags) wired as `playgta6-manifest xvd <path> [--json]`.
