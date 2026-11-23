@@ -11,6 +11,8 @@ add_library(playgta6_core STATIC
     os/threading.cpp
     os/game_input.cpp
     os/httpfs_mailbox.cpp
+    os/win32_kernel.cpp
+    os/xgameruntime.cpp
     gpu/cmd_encoder.cpp
 )
 target_include_directories(playgta6_core PUBLIC
@@ -48,4 +50,8 @@ else()
     add_executable(os_shim_tests ../tests/test_os_shims.cpp)
     target_link_libraries(os_shim_tests PRIVATE playgta6_core)
     add_test(NAME os_shim_tests COMMAND os_shim_tests)
+
+    add_executable(test_xgameruntime ../tests/test_xgameruntime.cpp)
+    target_link_libraries(test_xgameruntime PRIVATE playgta6_core)
+    add_test(NAME playgta6_xgameruntime_tests COMMAND test_xgameruntime)
 endif()
