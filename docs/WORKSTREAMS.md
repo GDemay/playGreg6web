@@ -36,10 +36,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse C++ EH `FuncInfo` (v3/v4) and `__C_specific_handler` scope tables into the CFG (funclets, catch/continuation targets); implement `RaiseException`/`RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`/`RtlRestoreContext`/`setjmp`/`longjmp` over guest state and `.pdata`; define the lifter/runtime resume protocol.
 - [ ] **R12 — Multi-Module Recompile: Bundled DLLs & Guest-to-Guest Import Binding (`recomp/`)** — `IN PROGRESS` (#161, @Timon-ok) *(starts once R9 is merged)*
   - Build the executable plus the redistributable DLLs shipped next to it (`MSVCP140`, `VCRUNTIME140`, `concrt140`, …) into one guest program: per-module image bases, exports, forwarders, imports bound to another module's exports, shared function registration tables.
-- [ ] **R13 — Parallel Sharded LLVM IR → Wasm64 Emscripten Build Orchestrator (`tools/build_guest_wasm.py`)** — `IN PROGRESS` (#193, @MarcBlattmann) *(no game files required — disjoint files `tools/build_guest_wasm.py`, `tests/test_build_guest_wasm.py`)*
+- [x] **R13 — Parallel Sharded LLVM IR → Wasm64 Emscripten Build Orchestrator (`tools/build_guest_wasm.py`)** — `DONE` (PR #212, closes #193) *(no game files required — disjoint files `tools/build_guest_wasm.py`, `tests/test_build_guest_wasm.py`)*
   - Compiles sharded `playgta6-recomp build` (`R9`) `.ll`/`.c`/`.cpp` outputs across CPU cores via `emcc` with SHA-256 `.o` caching, links with `libplaygta6_core.a` into `web/dist/runtime.{js,wasm}`, and validates ABI exports.
 - [ ] **R14 — Guest Boot Sequence & Native First-Boot Harness (`runtime/guest/boot.{h,cpp}`, `tools/build_native_boot.py`)** — `IN PROGRESS` (#198, @Timon-ok) *(no game files required for repo tests — disjoint files `runtime/guest/boot.{h,cpp}`, `runtime/guest/boot_main.cpp`, `tools/build_native_boot.py`, `tests/test_guest_boot.cpp`)*
   - Runtime boot sequence (load `PGIM` image, register lifted tables, bind import slots, minimal TEB/TLS + main thread, TLS callbacks, entry-point call, structured first-fault report) and a native host harness linking host-target lifted shards with the runtime for a first boot attempt without the browser toolchain (complements `R13`/`W40`).
+- [ ] **R15 — Recompilation Coverage & Boot-Path Bottleneck Profiler CLI (`tools/audit_recomp_build.py`)** — `IN PROGRESS` (#220, @MarcBlattmann) *(no game files required — disjoint files `tools/audit_recomp_build.py`, `tests/test_audit_recomp_build.py`)*
+  - Analyzes `R9` `build-manifest.json` / `discover --json` outputs to rank top unlifted x86-64 mnemonics and compute entry-point + TLS-callback reachable boot-path coverage.
 
 ---
 
@@ -84,7 +86,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Back the arena with one contiguous region and a single guest-base translation shared by the lifter's `guest_ptr` seam, the import-bridge seam, the guest runtime and the image loader, on host builds and under Emscripten `-sMEMORY64`, keeping commit/protect bookkeeping.
 - [ ] **O19 — `WS2_32.dll` 23 Ordinal Shims & Registry Bindings (`runtime/os/winsock_ordinals.{h,cpp}`)** — `IN PROGRESS` (#190, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 23 ordinal-imported Winsock2 symbols)*
   - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
-- [ ] **O20 — Complete Remaining 4 `WINHTTP.dll` Shims (`runtime/os/winhttp_ext.{h,cpp}`)** — `IN PROGRESS` (#199, @MarcBlattmann) *(driven by `W37` import audit: `WinHttpAddRequestHeaders`, `WinHttpCrackUrl`, `WinHttpQueryHeaders`, `WinHttpWriteData`)*
+- [x] **O20 — Complete Remaining 4 `WINHTTP.dll` Shims (`runtime/os/xbox_offline.cpp`)** — `DONE` (PR #208, closes #199) *(landed alongside `O15`: `WINHTTP.dll` is now 15/15 = 100%)*
   - Implements and registers the final 4 `WINHTTP.dll` exports in `Win32ModuleRegistry` for 15/15 (100%) WinHTTP coverage.
 - [ ] **O21 — Guest CPU Identification Helpers: `cpuid`/`rdtsc`/`rdtscp`/`xgetbv` (`runtime/guest/cpu_helpers.{h,cpp}`)** — `IN PROGRESS` (#207, @Timon-ok) *(no game files required — small ABI addition first, then disjoint files `runtime/guest/cpu_helpers.{h,cpp}`, `tests/test_cpu_helpers.cpp`)*
   - Document and implement `__playgta6_cpuid`/`__playgta6_rdtsc`/`__playgta6_rdtscp`/`__playgta6_xgetbv` (emitted by the lifter since R7) as a consistent virtual CPU whose advertised features match what the lifter implements.
@@ -144,6 +146,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Expose the exact 3 `d3d12_xs.dll` exports with Win64-ABI COM vtables (`ID3D12Device`, `ID3D12CommandQueue`, `ID3D12GraphicsCommandList`, `ID3D12Resource`, `ID3D12DescriptorHeap`, `ID3D12PipelineState`) bridged to `G6`/`G7`/`G20`.
 - [ ] **G25 — Upgrade `tools/gpu_trace.py` Disassembler for GPU Packet ABI v2 Opcodes `22..34`** — `IN PROGRESS` (#191, @MarcBlattmann) *(disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
   - Full typed payload decoding, summaries, and validation for all ABI v2 render-pass, pipeline-key, layout, and dynamic-state packets (`22..34`).
+- [ ] **G26 — Worker Splash & Bink2 Frame Presentation Bridge (`web/workers/splash_frame_bridge.js`)** — `IN PROGRESS` (#218, @MarcBlattmann) *(no game files required — disjoint files `web/workers/splash_frame_bridge.js`, `tests/test_splash_frame_bridge.mjs`)*
+  - Bridges raw RGBA8/YUV420p/ImageBitmap splash & Bink2 frames into `BinkVideoPresenter` (`W38`) and emits `FIRST_PRESENT` telemetry.
 
 ---
 
@@ -166,10 +170,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
 - [x] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `DONE` (PR #189, closes #181) *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
   - Read-only local scanner classifying shader containers (`DXBC`, `DXIL`, `SPIR-V`, or Xbox Scarlett RDNA2 ISA signatures) in a local directory into a sanitized JSON summary for M2/M4 shader planning.
-- [ ] **S9 — Fallback `WGPK` Shader Pack & S6 Reflection Manifest Generator (`tools/gen_fallback_shaders.py`)** — `IN PROGRESS` (#192, @MarcBlattmann) *(no game files required — disjoint files `tools/gen_fallback_shaders.py`, `tests/test_gen_fallback_shaders.py`)*
+- [x] **S9 — Fallback `WGPK` Shader Pack & S6 Reflection Manifest Generator (`tools/gen_fallback_shaders.py`)** — `DONE` (PR #211, closes #192) *(no game files required — disjoint files `tools/gen_fallback_shaders.py`, `tests/test_gen_fallback_shaders.py`)*
   - Generates a verified `WGPK` v1 bundle + S6 `reflection-manifest.json` with splash/UI blit, 3D debug mesh, and compute fallback WGSL shaders into gitignored `local-data/shaders/`.
 - [ ] **S10 — Local DXIL/DXBC Corpus Extractor & `RTS0`/`PSV0` Analyzer CLI (`tools/extract_dxil_corpus.py`)** — `IN PROGRESS` (#200, @MarcBlattmann) *(driven by `S8` finding 81 real `DXIL_SM6` containers in local DLLs)*
   - Extracts and structurally analyzes local DXIL/DXBC containers (`DXIL`, `PSV0`, `RTS0`, `ISG1`, `OSG1`, `ACCC`) into gitignored `work/shaders/dxil/` with sanitized manifest output.
+- [ ] **S11 — Offline DXIL → SPIR-V → WGSL Conversion Harness & Coverage CLI (`tools/convert_dxil_corpus.py`)** — `IN PROGRESS` (#219, @MarcBlattmann) *(no game files required — disjoint files `tools/convert_dxil_corpus.py`, `tests/test_convert_dxil_corpus.py`)*
+  - Drives `dxil-spirv` + `playgta6-shaders` in parallel over an extracted DXIL corpus (`S10`) with SHA-256 caching and structured failure classification.
 
 ---
 
@@ -256,7 +262,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Safely parses Xbox GDK `MicrosoftGame.Config` XML and verifies declared executables, bundled DLLs, and `ShellVisuals` splash assets in `GTA6_GAME_DIR` with sanitized JSON output.
 - [x] **W40 — Guest Boot Milestone Tracer & Unresolved-Import Trap Collector (`web/telemetry/boot_tracer.js`)** — `DONE` (PR #202, closes #194) *(no game files required — disjoint files `web/telemetry/boot_tracer.js`, `tests/test_boot_tracer.mjs`)*
   - Tracks real guest boot milestones (`PGIM_LOAD` → `TLS_INIT` → `CRT_INITTERM` → `D3D12_CREATE_DEVICE` → `FIRST_PRESENT`) and deduplicates `__playgta6_unimplemented` / unresolved-import traps for HUD & CrashReporter.
-- [ ] **W41 — Streaming `PGIM` v1 Guest Image & Shader Bundle Preloader (`web/runtime/pgim_preloader.js`)** — `IN PROGRESS` (#195, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/pgim_preloader.js`, `tests/test_pgim_preloader.mjs`)*
+- [x] **W41 — Streaming `PGIM` v1 Guest Image & Shader Bundle Preloader (`web/runtime/pgim_preloader.js`)** — `DONE` (PR #213, closes #195) *(no game files required — disjoint files `web/runtime/pgim_preloader.js`, `tests/test_pgim_preloader.mjs`)*
   - Streams and validates `PGIM` v1 guest images (`R6`/`O10`), `.wgsl.pack` bundles, and S6 reflection manifests via HTTP `206` Range with progress reporting before guest entry.
 - [ ] **W42 — Browser Local Splash Screen & Live Boot Stage Overlay (`web/ui/splash_overlay.js`)** — `IN PROGRESS` (#201, @MarcBlattmann) *(no game files required — disjoint files `web/ui/splash_overlay.js`, `tests/test_splash_overlay.mjs`)*
   - Displays the user's own local `ShellVisuals` splash image (`/game/xbs_splash.png`) with live `BootTracer` milestone progress and cross-fades cleanly to WebGPU on `FIRST_PRESENT`.
+- [ ] **W43 — Local Server Splash, Shader Pack & PGIM Boot-Bundle Endpoints (`server/serve_local.py`)** — `IN PROGRESS` (#216, @MarcBlattmann) *(no game files required — disjoint files `server/serve_local.py`, `tests/test_serve_local_boot.py`)*
+  - Exposes `/shaders/`, allowlisted `/boot/`, and sanitized `/api/status` boot discovery (`splashImage`, `shaderPackUrl`, `reflectionManifestUrl`, `pgimUrl`) with COOP/COEP + HTTP `206` Range.
+- [ ] **W44 — Browser Boot Pipeline Orchestrator (`web/runtime/boot_orchestrator.js`)** — `IN PROGRESS` (#217, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/boot_orchestrator.js`, `tests/test_boot_orchestrator.mjs`)*
+  - Coordinates `/api/status` discovery → `SplashOverlay` → `PgimPreloader` → `BootTracer` → `FIRST_PRESENT` cross-fade or Smoke Demo fallback.
