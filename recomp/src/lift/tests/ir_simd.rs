@@ -137,8 +137,8 @@ fn unsupported_vector_forms_trap_with_precise_reasons() {
             "256-bit form of Vmpsadbw is not supported yet",
         ),
         (
-            super::assemble(0x1000, |a| a.vfmadd213pd(xmm0, xmm1, xmm2)),
-            "double-precision FMA",
+            super::assemble(0x1000, |a| a.sha1rnds4(xmm0, xmm1, 0)),
+            "Sha1rnds4 is not supported yet",
         ),
         (
             vec![0x62, 0xF1, 0x74, 0x08, 0x58, 0xC2], // EVEX vaddps xmm0, xmm1, xmm2
@@ -154,8 +154,8 @@ fn unsupported_vector_forms_trap_with_precise_reasons() {
             "Pcmpistri is not supported yet",
         ),
         (
-            super::assemble(0x1000, |a| a.aesenc(xmm0, xmm1)),
-            "Aesenc is not supported yet",
+            super::assemble(0x1000, |a| a.maskmovdqu(xmm0, xmm1)),
+            "Maskmovdqu is not supported yet",
         ),
         (
             super::assemble(0x1000, |a| {

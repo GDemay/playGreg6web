@@ -264,6 +264,10 @@ pub(super) enum Feature {
     Avx2,
     Fma,
     F16c,
+    Aes,
+    Pclmulqdq,
+    Vaes,
+    Vpclmulqdq,
 }
 
 impl Feature {
@@ -278,6 +282,12 @@ impl Feature {
             Feature::Avx2 => is_x86_feature_detected!("avx2"),
             Feature::Fma => is_x86_feature_detected!("fma"),
             Feature::F16c => is_x86_feature_detected!("f16c"),
+            Feature::Aes => is_x86_feature_detected!("aes"),
+            Feature::Pclmulqdq => is_x86_feature_detected!("pclmulqdq"),
+            Feature::Vaes => is_x86_feature_detected!("vaes") && is_x86_feature_detected!("avx2"),
+            Feature::Vpclmulqdq => {
+                is_x86_feature_detected!("vpclmulqdq") && is_x86_feature_detected!("avx2")
+            }
         }
     }
 }
@@ -292,6 +302,11 @@ pub(super) enum Kind {
     /// addends of similar magnitude: cancellation) with often-short mantissas (rounding ties).
     F32Near,
     F64,
+    /// binary64 counterpart of [`Kind::F32Near`].
+    F64Near,
+    /// binary64 specials and uniformly random bit patterns (every exponent: overflow,
+    /// underflow, subnormal results).
+    F64Any,
     I8,
     I16,
     I32,
@@ -306,7 +321,7 @@ impl Kind {
             Kind::I8 => 1,
             Kind::I16 | Kind::F16 => 2,
             Kind::F32 | Kind::F32Near | Kind::I32 => 4,
-            Kind::F64 | Kind::I64 | Kind::Count => 8,
+            Kind::F64 | Kind::F64Near | Kind::F64Any | Kind::I64 | Kind::Count => 8,
         }
     }
 
@@ -321,7 +336,7 @@ impl Kind {
                 0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3C00, 0xBC00, 0x3C01, 0x7BFF,
                 0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01, 0x7D55, 0xFDFF, 0x3555, 0x0200,
             ],
-            Kind::F64 => F64_SPECIALS.to_vec(),
+            Kind::F64 | Kind::F64Near | Kind::F64Any => F64_SPECIALS.to_vec(),
             Kind::Count => vec![
                 0,
                 1,
@@ -414,6 +429,16 @@ impl Kind {
                 (r >> 63) << 63 | exp << 52 | (r & 0xF_FFFF_FFFF_FFFF)
             }
             Kind::Count => r % 80,
+            Kind::F64Any => r,
+            Kind::F64Near => {
+                let exp = 1022 + (r >> 12) % 4;
+                let mant = if r >> 50 & 1 == 1 {
+                    r & 0xF_FFFF_FFF0_0000
+                } else {
+                    r & 0xF_FFFF_FFFF_FFFF
+                };
+                (r >> 63) << 63 | exp << 52 | mant
+            }
             Kind::F32Near => {
                 let exp = 126 + (r >> 8) % 4;
                 let mant = if r >> 20 & 1 == 1 {
@@ -657,7 +682,10 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
     // Lane j of case k visits pair index c = k + j * span: lane 0 alone covers all ordered pairs
     // after p^2 cases, all lanes together after p^2 / lanes cases.
     let lane_values = |k: usize, j: usize, rng: &mut Lcg| -> (u64, u64) {
-        if (k + j) % 7 == 6 || (op.kind == Kind::F32Near && !(k + j).is_multiple_of(7)) {
+        if (k + j) % 7 == 6
+            || (matches!(op.kind, Kind::F32Near | Kind::F64Near | Kind::F64Any)
+                && !(k + j).is_multiple_of(7))
+        {
             return (op.kind.random(rng), op.kind.random(rng));
         }
         let c = k + j * span;

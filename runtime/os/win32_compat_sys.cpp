@@ -11,7 +11,6 @@
 #include <thread>
 #include <unordered_map>
 
-#include "guest/cpu_helpers.h"
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
 #include "os/win32_compat_internal.h"
@@ -61,8 +60,7 @@ bool is_thread_handle(Handle h) {
 }
 
 uint32_t processor_count() {
-    // Same source as cpuid, so the guest never sees two different processor counts.
-    const uint32_t hw = playgta6::guest::virtual_cpu().logical_processors;
+    const unsigned hw = std::thread::hardware_concurrency();
     uint64_t mask = get_process_affinity_mask();
     uint32_t bits = 0;
     while (mask != 0) {
