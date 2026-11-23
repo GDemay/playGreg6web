@@ -459,6 +459,324 @@ void test_gpu_ring_command_encoder_roundtrip() {
     CHECK(!tiny_reader.read_packet(out_hdr, out_payload));
 }
 
+void test_g5_abi_struct_sizes_and_encoder_roundtrip() {
+    using namespace playgta6;
+
+    // Verify opcode numeric stability and exact payload sizes.
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateTexture) == 12);
+    CHECK(static_cast<uint16_t>(GpuOpcode::WriteTexture) == 13);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateSampler) == 14);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateBindGroup) == 15);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetBindGroup) == 16);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetIndexBuffer) == 17);
+    CHECK(static_cast<uint16_t>(GpuOpcode::DrawIndexed) == 18);
+    CHECK(static_cast<uint16_t>(GpuOpcode::CreateComputePipeline) == 19);
+    CHECK(static_cast<uint16_t>(GpuOpcode::SetComputePipeline) == 20);
+    CHECK(static_cast<uint16_t>(GpuOpcode::DispatchCompute) == 21);
+
+    CHECK(sizeof(GpuCreateTexturePayload) == 32);
+    CHECK(sizeof(GpuWriteTexturePayload) == 48);
+    CHECK(sizeof(GpuCreateSamplerPayload) == 32);
+    CHECK(sizeof(GpuBindGroupEntry) == 32);
+    CHECK(sizeof(GpuCreateBindGroupPayload) == 16);
+    CHECK(sizeof(GpuSetBindGroupPayload) == 8);
+    CHECK(sizeof(GpuSetIndexBufferPayload) == 16);
+    CHECK(sizeof(GpuDrawIndexedPayload) == 20);
+    CHECK(sizeof(GpuCreateComputePipelinePayload) == 16);
+    CHECK(sizeof(GpuSetComputePipelinePayload) == 4);
+    CHECK(sizeof(GpuDispatchComputePayload) == 12);
+
+    const std::array<uint8_t, 16> texels = {
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 255,
+    };
+    const std::array<GpuBindGroupEntry, 3> entries = {{
+        {0u, static_cast<uint32_t>(GpuBindResourceType::Buffer), 10u, 0u, 256u, 64u},
+        {1u, static_cast<uint32_t>(GpuBindResourceType::TextureView), 20u, 0u, 0u, 0u},
+        {2u, static_cast<uint32_t>(GpuBindResourceType::Sampler), 30u, 0u, 0u, 0u},
+    }};
+
+    gpu::CommandEncoder enc;
+    enc.create_texture(
+        20u,
+        2u,
+        2u,
+        1u,
+        1u,
+        GpuTextureFormat::Rgba8Unorm,
+        GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst,
+        GpuTextureDimension::Dim2D);
+    enc.write_texture(
+        20u,
+        0u,
+        0u,
+        0u,
+        0u,
+        2u,
+        2u,
+        1u,
+        8u,
+        2u,
+        texels.data(),
+        static_cast<uint32_t>(texels.size()));
+    enc.create_sampler(
+        30u,
+        GpuAddressMode::Repeat,
+        GpuAddressMode::MirrorRepeat,
+        GpuAddressMode::ClampToEdge,
+        GpuFilterMode::Linear,
+        GpuFilterMode::Linear,
+        GpuFilterMode::Nearest,
+        8u);
+    enc.create_bind_group(40u, 50u, 1u, entries.data(), static_cast<uint32_t>(entries.size()));
+    enc.set_bind_group(1u, 40u);
+    enc.set_index_buffer(11u, GpuIndexFormat::Uint32, 128u);
+    enc.draw_indexed(36u, 4u, 6u, -2, 1u);
+    enc.create_compute_pipeline(60u, 70u, 0x5u);
+    enc.set_compute_pipeline(60u);
+    enc.dispatch_compute(8u, 4u, 2u);
+
+    const auto packets = decode_stream(enc.data(), enc.size());
+    CHECK(packets.size() == 10);
+
+    CHECK(packets[0].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateTexture));
+    CHECK(packets[0].header.payload_bytes == sizeof(GpuCreateTexturePayload));
+    const auto ct = read_pod<GpuCreateTexturePayload>(packets[0].payload);
+    CHECK(ct.id == 20u && ct.width == 2u && ct.height == 2u && ct.depth_or_layers == 1u);
+    CHECK(ct.mip_levels == 1u && ct.format == static_cast<uint32_t>(GpuTextureFormat::Rgba8Unorm));
+    CHECK(ct.usage_flags == (GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst));
+    CHECK(ct.dimension == static_cast<uint32_t>(GpuTextureDimension::Dim2D));
+
+    CHECK(packets[1].header.opcode == static_cast<uint16_t>(GpuOpcode::WriteTexture));
+    CHECK(packets[1].header.payload_bytes == sizeof(GpuWriteTexturePayload) + texels.size());
+    const auto wt = read_pod<GpuWriteTexturePayload>(packets[1].payload);
+    CHECK(wt.texture_id == 20u && wt.mip_level == 0u);
+    CHECK(wt.origin_x == 0u && wt.origin_y == 0u && wt.origin_z == 0u);
+    CHECK(wt.width == 2u && wt.height == 2u && wt.depth_or_layers == 1u);
+    CHECK(wt.bytes_per_row == 8u && wt.rows_per_image == 2u);
+    CHECK(wt.data_len == texels.size() && wt.reserved == 0u);
+    CHECK(std::memcmp(packets[1].payload + sizeof(GpuWriteTexturePayload), texels.data(), texels.size()) == 0);
+
+    CHECK(packets[2].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateSampler));
+    CHECK(packets[2].header.payload_bytes == sizeof(GpuCreateSamplerPayload));
+    const auto cs = read_pod<GpuCreateSamplerPayload>(packets[2].payload);
+    CHECK(cs.id == 30u);
+    CHECK(cs.address_u == static_cast<uint32_t>(GpuAddressMode::Repeat));
+    CHECK(cs.address_v == static_cast<uint32_t>(GpuAddressMode::MirrorRepeat));
+    CHECK(cs.address_w == static_cast<uint32_t>(GpuAddressMode::ClampToEdge));
+    CHECK(cs.mag_filter == static_cast<uint32_t>(GpuFilterMode::Linear));
+    CHECK(cs.min_filter == static_cast<uint32_t>(GpuFilterMode::Linear));
+    CHECK(cs.mipmap_filter == static_cast<uint32_t>(GpuFilterMode::Nearest));
+    CHECK(cs.max_anisotropy == 8u);
+
+    CHECK(packets[3].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup));
+    CHECK(packets[3].header.payload_bytes == sizeof(GpuCreateBindGroupPayload) + entries.size() * sizeof(GpuBindGroupEntry));
+    const auto cbg = read_pod<GpuCreateBindGroupPayload>(packets[3].payload);
+    CHECK(cbg.id == 40u && cbg.pipeline_id == 50u && cbg.group_index == 1u && cbg.entry_count == 3u);
+    const uint8_t* entry_ptr = packets[3].payload + sizeof(GpuCreateBindGroupPayload);
+    const auto e0 = read_pod<GpuBindGroupEntry>(entry_ptr);
+    const auto e1 = read_pod<GpuBindGroupEntry>(entry_ptr + sizeof(GpuBindGroupEntry));
+    const auto e2 = read_pod<GpuBindGroupEntry>(entry_ptr + 2 * sizeof(GpuBindGroupEntry));
+    CHECK(e0.binding == 0u && e0.resource_type == static_cast<uint32_t>(GpuBindResourceType::Buffer));
+    CHECK(e0.resource_id == 10u && e0.offset == 256u && e0.size == 64u);
+    CHECK(e1.binding == 1u && e1.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView) && e1.resource_id == 20u);
+    CHECK(e2.binding == 2u && e2.resource_type == static_cast<uint32_t>(GpuBindResourceType::Sampler) && e2.resource_id == 30u);
+
+    CHECK(packets[4].header.opcode == static_cast<uint16_t>(GpuOpcode::SetBindGroup));
+    CHECK(packets[4].header.payload_bytes == sizeof(GpuSetBindGroupPayload));
+    const auto sbg = read_pod<GpuSetBindGroupPayload>(packets[4].payload);
+    CHECK(sbg.group_index == 1u && sbg.bind_group_id == 40u);
+
+    CHECK(packets[5].header.opcode == static_cast<uint16_t>(GpuOpcode::SetIndexBuffer));
+    CHECK(packets[5].header.payload_bytes == sizeof(GpuSetIndexBufferPayload));
+    const auto sib = read_pod<GpuSetIndexBufferPayload>(packets[5].payload);
+    CHECK(sib.buffer_id == 11u && sib.index_format == static_cast<uint32_t>(GpuIndexFormat::Uint32) && sib.offset == 128u);
+
+    CHECK(packets[6].header.opcode == static_cast<uint16_t>(GpuOpcode::DrawIndexed));
+    CHECK(packets[6].header.payload_bytes == sizeof(GpuDrawIndexedPayload));
+    const auto di = read_pod<GpuDrawIndexedPayload>(packets[6].payload);
+    CHECK(di.index_count == 36u && di.instance_count == 4u && di.first_index == 6u);
+    CHECK(di.base_vertex == -2 && di.first_instance == 1u);
+
+    CHECK(packets[7].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateComputePipeline));
+    CHECK(packets[7].header.payload_bytes == sizeof(GpuCreateComputePipelinePayload));
+    const auto ccp = read_pod<GpuCreateComputePipelinePayload>(packets[7].payload);
+    CHECK(ccp.id == 60u && ccp.cs_shader_id == 70u && ccp.flags == 0x5u && ccp.reserved == 0u);
+
+    CHECK(packets[8].header.opcode == static_cast<uint16_t>(GpuOpcode::SetComputePipeline));
+    CHECK(packets[8].header.payload_bytes == sizeof(GpuSetComputePipelinePayload));
+    CHECK(read_pod<GpuSetComputePipelinePayload>(packets[8].payload).pipeline_id == 60u);
+
+    CHECK(packets[9].header.opcode == static_cast<uint16_t>(GpuOpcode::DispatchCompute));
+    CHECK(packets[9].header.payload_bytes == sizeof(GpuDispatchComputePayload));
+    const auto dc = read_pod<GpuDispatchComputePayload>(packets[9].payload);
+    CHECK(dc.workgroup_x == 8u && dc.workgroup_y == 4u && dc.workgroup_z == 2u);
+}
+
+void test_d3d12_xs_compute_and_textured_indexed_draw() {
+    using namespace playgta6;
+    using namespace playgta6::gpu::d3d12_xs;
+
+    gpu::CommandEncoder enc;
+    D3D12Device device(&enc);
+
+    // Invalid arg validation for new device methods.
+    D3D12TextureHandle bad_tex{};
+    CHECK(Failed(device.CreateTexture2D(D3D12Texture2DDesc{0, 4}, &bad_tex)));
+    D3D12SamplerHandle bad_sampler{};
+    CHECK(Failed(device.CreateSampler(D3D12SamplerDesc{
+        GpuAddressMode::Repeat,
+        GpuAddressMode::Repeat,
+        GpuAddressMode::Repeat,
+        GpuFilterMode::Linear,
+        GpuFilterMode::Linear,
+        GpuFilterMode::Linear,
+        0u,
+    }, &bad_sampler)));
+    D3D12PipelineStateHandle bad_pso{};
+    CHECK(Failed(device.CreateComputePipelineState(D3D12ComputePipelineStateDesc{0u, 0u}, &bad_pso)));
+    D3D12BindGroupHandle bad_bg{};
+    CHECK(Failed(device.CreateBindGroup(D3D12BindGroupDesc{0u, 0u, nullptr, 0u}, &bad_bg)));
+
+    // Create resources for compute + textured indexed draw.
+    D3D12ResourceHandle storage_buf{};
+    D3D12ResourceHandle vb{};
+    D3D12ResourceHandle ib{};
+    CHECK(Succeeded(device.CreateCommittedResource(
+        D3D12BufferDesc{256, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst}, &storage_buf)));
+    CHECK(Succeeded(device.CreateCommittedResource(
+        D3D12BufferDesc{64, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst}, &vb)));
+    CHECK(Succeeded(device.CreateCommittedResource(
+        D3D12BufferDesc{24, GpuBufferUsage::Index | GpuBufferUsage::CopyDst}, &ib)));
+
+    D3D12TextureHandle albedo_tex{};
+    CHECK(Succeeded(device.CreateTexture2D(
+        D3D12Texture2DDesc{
+            4,
+            4,
+            1,
+            1,
+            GpuTextureFormat::Rgba8Unorm,
+            GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst,
+            GpuTextureDimension::Dim2D,
+        },
+        &albedo_tex)));
+    CHECK(albedo_tex.id == 4 && albedo_tex.width == 4 && albedo_tex.height == 4);
+
+    D3D12SamplerHandle linear_sampler{};
+    CHECK(Succeeded(device.CreateSampler(
+        D3D12SamplerDesc{
+            GpuAddressMode::Repeat,
+            GpuAddressMode::Repeat,
+            GpuAddressMode::ClampToEdge,
+            GpuFilterMode::Linear,
+            GpuFilterMode::Linear,
+            GpuFilterMode::Linear,
+            4u,
+        },
+        &linear_sampler)));
+    CHECK(linear_sampler.id == 5);
+
+    D3D12ShaderHandle cs_shader{};
+    D3D12ShaderHandle vs_shader{};
+    D3D12ShaderHandle fs_shader{};
+    CHECK(Succeeded(device.CreateShaderModule(GpuShaderStage::Compute, "@compute @workgroup_size(64) fn cs_main() {}", &cs_shader)));
+    CHECK(Succeeded(device.CreateShaderModule(GpuShaderStage::Vertex, "@vertex fn vs_main() {}", &vs_shader)));
+    CHECK(Succeeded(device.CreateShaderModule(GpuShaderStage::Fragment, "@fragment fn fs_main() {}", &fs_shader)));
+
+    D3D12PipelineStateHandle compute_pso{};
+    D3D12PipelineStateHandle graphics_pso{};
+    CHECK(Succeeded(device.CreateComputePipelineState(D3D12ComputePipelineStateDesc{cs_shader.id, 0u}, &compute_pso)));
+    CHECK(Succeeded(device.CreateGraphicsPipelineState(
+        D3D12GraphicsPipelineStateDesc{vs_shader.id, fs_shader.id, 16u, GpuPrimitiveTopology::TriangleList, 0u},
+        &graphics_pso)));
+
+    const std::array<GpuBindGroupEntry, 1> compute_entries = {{
+        {0u, static_cast<uint32_t>(GpuBindResourceType::Buffer), storage_buf.id, 0u, 0u, 256u},
+    }};
+    D3D12BindGroupHandle compute_bg{};
+    CHECK(Succeeded(device.CreateBindGroup(
+        D3D12BindGroupDesc{compute_pso.id, 0u, compute_entries.data(), 1u}, &compute_bg)));
+
+    const std::array<GpuBindGroupEntry, 2> gfx_entries = {{
+        {0u, static_cast<uint32_t>(GpuBindResourceType::TextureView), albedo_tex.id, 0u, 0u, 0u},
+        {1u, static_cast<uint32_t>(GpuBindResourceType::Sampler), linear_sampler.id, 0u, 0u, 0u},
+    }};
+    D3D12BindGroupHandle gfx_bg{};
+    CHECK(Succeeded(device.CreateBindGroup(
+        D3D12BindGroupDesc{graphics_pso.id, 0u, gfx_entries.data(), 2u}, &gfx_bg)));
+
+    D3D12GraphicsCommandList cmd_list;
+    CHECK(Succeeded(device.CreateCommandList(&cmd_list)));
+    CHECK(Succeeded(cmd_list.Reset()));
+
+    std::array<uint8_t, 64> rgba_pixels{};
+    rgba_pixels.fill(0x7Fu);
+    cmd_list.UploadTexture(
+        albedo_tex,
+        D3D12TextureUploadRegion{0u, 0u, 0u, 0u, 4u, 4u, 1u, 16u, 4u},
+        rgba_pixels.data(),
+        static_cast<uint32_t>(rgba_pixels.size()));
+    cmd_list.SetComputePipelineState(compute_pso);
+    cmd_list.SetComputeRootBindGroup(0u, compute_bg);
+    cmd_list.Dispatch(4u, 2u, 1u);
+
+    const float clear_rgba[4] = {0.1f, 0.2f, 0.3f, 1.0f};
+    cmd_list.ClearRenderTargetView(clear_rgba);
+    cmd_list.SetPipelineState(graphics_pso);
+    cmd_list.SetGraphicsRootBindGroup(0u, gfx_bg);
+    cmd_list.IASetVertexBuffers(0u, D3D12VertexBufferView{vb.id, 0u, 64u, 16u});
+    cmd_list.IASetIndexBuffer(D3D12IndexBufferView{ib.id, 0u, 24u, GpuIndexFormat::Uint16});
+    cmd_list.DrawIndexedInstanced(6u, 2u, 0u, -1, 0u);
+    CHECK(Succeeded(cmd_list.Close()));
+
+    // Ignored when closed.
+    cmd_list.Dispatch(99u, 1u, 1u);
+    cmd_list.DrawIndexedInstanced(99u, 1u, 0u, 0, 0u);
+
+    PresentX present_x;
+    CHECK(Succeeded(device.CreatePresentX(&present_x)));
+    CHECK(Succeeded(present_x.Present(1, 0)));
+
+    CHECK(Succeeded(device.DestroyResource(albedo_tex.id)));
+    CHECK(Succeeded(device.DestroyResource(linear_sampler.id)));
+    CHECK(Succeeded(device.DestroyResource(compute_bg.id)));
+    CHECK(Succeeded(device.DestroyResource(gfx_bg.id)));
+    CHECK(Succeeded(device.DestroyResource(compute_pso.id)));
+
+    const auto packets = decode_stream(enc.data(), enc.size());
+    // 3 buffers + 1 texture + 1 sampler + 3 shaders + 2 pipelines + 2 bind groups
+    // + BeginFrame + WriteTexture + SetComputePipeline + SetBindGroup + DispatchCompute
+    // + ClearColor + SetPipeline + SetBindGroup + SetVertexBuffer + SetIndexBuffer + DrawIndexed
+    // + Present + 5 DestroyResource = 29 packets.
+    CHECK(packets.size() == 29);
+    CHECK(packets[3].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateTexture));
+    CHECK(packets[4].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateSampler));
+    CHECK(packets[8].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateComputePipeline));
+    CHECK(packets[9].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateRenderPipeline));
+    CHECK(packets[10].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup));
+    CHECK(packets[11].header.opcode == static_cast<uint16_t>(GpuOpcode::CreateBindGroup));
+    CHECK(packets[12].header.opcode == static_cast<uint16_t>(GpuOpcode::BeginFrame));
+    CHECK(packets[13].header.opcode == static_cast<uint16_t>(GpuOpcode::WriteTexture));
+    CHECK(packets[14].header.opcode == static_cast<uint16_t>(GpuOpcode::SetComputePipeline));
+    CHECK(packets[15].header.opcode == static_cast<uint16_t>(GpuOpcode::SetBindGroup));
+    CHECK(packets[16].header.opcode == static_cast<uint16_t>(GpuOpcode::DispatchCompute));
+    CHECK(packets[17].header.opcode == static_cast<uint16_t>(GpuOpcode::ClearColor));
+    CHECK(packets[18].header.opcode == static_cast<uint16_t>(GpuOpcode::SetPipeline));
+    CHECK(packets[19].header.opcode == static_cast<uint16_t>(GpuOpcode::SetBindGroup));
+    CHECK(packets[20].header.opcode == static_cast<uint16_t>(GpuOpcode::SetVertexBuffer));
+    CHECK(packets[21].header.opcode == static_cast<uint16_t>(GpuOpcode::SetIndexBuffer));
+    CHECK(packets[22].header.opcode == static_cast<uint16_t>(GpuOpcode::DrawIndexed));
+    CHECK(packets[23].header.opcode == static_cast<uint16_t>(GpuOpcode::Present));
+
+    const auto disp = read_pod<GpuDispatchComputePayload>(packets[16].payload);
+    CHECK(disp.workgroup_x == 4u && disp.workgroup_y == 2u && disp.workgroup_z == 1u);
+
+    const auto draw_idx = read_pod<GpuDrawIndexedPayload>(packets[22].payload);
+    CHECK(draw_idx.index_count == 6u && draw_idx.instance_count == 2u);
+    CHECK(draw_idx.first_index == 0u && draw_idx.base_vertex == -1 && draw_idx.first_instance == 0u);
+}
+
 }  // namespace
 
 int main() {
@@ -467,5 +785,7 @@ int main() {
     test_d3d12_xs_shim_flow();
     test_gpu_ring_wraparound_and_backpressure();
     test_gpu_ring_command_encoder_roundtrip();
+    test_g5_abi_struct_sizes_and_encoder_roundtrip();
+    test_d3d12_xs_compute_and_textured_indexed_draw();
     return 0;
 }

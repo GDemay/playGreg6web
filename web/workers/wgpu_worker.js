@@ -15,6 +15,16 @@ const OPCODES = Object.freeze({
   SET_PIPELINE: 9,
   SET_VERTEX_BUFFER: 10,
   DESTROY_RESOURCE: 11,
+  CREATE_TEXTURE: 12,
+  WRITE_TEXTURE: 13,
+  CREATE_SAMPLER: 14,
+  CREATE_BIND_GROUP: 15,
+  SET_BIND_GROUP: 16,
+  SET_INDEX_BUFFER: 17,
+  DRAW_INDEXED: 18,
+  CREATE_COMPUTE_PIPELINE: 19,
+  SET_COMPUTE_PIPELINE: 20,
+  DISPATCH_COMPUTE: 21,
 });
 
 const SHADER_STAGE = Object.freeze({
@@ -51,6 +61,68 @@ const BUFFER_USAGE = Object.freeze({
   INDIRECT: 0x0100,
   QUERY_RESOLVE: 0x0200,
 });
+
+const TEXTURE_USAGE = Object.freeze({
+  COPY_SRC: 0x0001,
+  COPY_DST: 0x0002,
+  TEXTURE_BINDING: 0x0004,
+  STORAGE_BINDING: 0x0008,
+  RENDER_ATTACHMENT: 0x0010,
+});
+
+const TEXTURE_FORMAT = Object.freeze({
+  RGBA8_UNORM: 0,
+  BGRA8_UNORM: 1,
+  RGBA16_FLOAT: 2,
+  DEPTH24_PLUS: 3,
+  DEPTH32_FLOAT: 4,
+  BC7_RGBA_UNORM: 5,
+});
+
+const TEXTURE_FORMAT_NAMES = Object.freeze([
+  'rgba8unorm',
+  'bgra8unorm',
+  'rgba16float',
+  'depth24plus',
+  'depth32float',
+  'bc7-rgba-unorm',
+]);
+
+const TEXTURE_DIMENSION = Object.freeze({
+  DIM_1D: 0,
+  DIM_2D: 1,
+  DIM_3D: 2,
+});
+
+const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
+
+const ADDRESS_MODE = Object.freeze({
+  CLAMP_TO_EDGE: 0,
+  REPEAT: 1,
+  MIRROR_REPEAT: 2,
+});
+
+const ADDRESS_MODE_NAMES = Object.freeze(['clamp-to-edge', 'repeat', 'mirror-repeat']);
+
+const FILTER_MODE = Object.freeze({
+  NEAREST: 0,
+  LINEAR: 1,
+});
+
+const FILTER_MODE_NAMES = Object.freeze(['nearest', 'linear']);
+
+const BIND_RESOURCE_TYPE = Object.freeze({
+  BUFFER: 0,
+  TEXTURE_VIEW: 1,
+  SAMPLER: 2,
+});
+
+const INDEX_FORMAT = Object.freeze({
+  UINT16: 0,
+  UINT32: 1,
+});
+
+const INDEX_FORMAT_NAMES = Object.freeze(['uint16', 'uint32']);
 
 const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
 
@@ -90,8 +162,14 @@ class WgpuCommandProcessor {
     this.ctx = ctx;
     this.format = options.format || 'bgra8unorm';
     this.buffers = new Map();
+    this.textures = new Map();
+    this.textureViews = new Map();
+    this.samplers = new Map();
+    this.bindGroups = new Map();
+    this._bindGroupKinds = new Map();
     this.shaderModules = new Map();
     this.pipelines = new Map();
+    this.computePipelines = new Map();
     this.frameCount = 0;
     this.ring = null;
     this._GpuRingBuffer = typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
@@ -112,6 +190,17 @@ class WgpuCommandProcessor {
       }
       this.buffers.delete(id);
     }
+  }
+
+  _destroyTextureIfPresent(id) {
+    const existing = this.textures.get(id);
+    if (existing) {
+      if (typeof existing.destroy === 'function') {
+        existing.destroy();
+      }
+      this.textures.delete(id);
+    }
+    this.textureViews.delete(id);
   }
 
   _handleCreateBuffer(view, payloadOffset) {
@@ -204,42 +293,307 @@ class WgpuCommandProcessor {
     this.pipelines.set(id, pipeline);
   }
 
+  _handleCreateTexture(view, payloadOffset) {
+    const id = view.getUint32(payloadOffset, true);
+    const width = view.getUint32(payloadOffset + 4, true);
+    const height = view.getUint32(payloadOffset + 8, true);
+    const depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 12, true));
+    const mipLevelCount = Math.max(1, view.getUint32(payloadOffset + 16, true));
+    const formatCode = view.getUint32(payloadOffset + 20, true);
+    const usage = view.getUint32(payloadOffset + 24, true);
+    const dimensionCode = view.getUint32(payloadOffset + 28, true);
+
+    const format = TEXTURE_FORMAT_NAMES[formatCode] || 'rgba8unorm';
+    const dimension = TEXTURE_DIMENSION_NAMES[dimensionCode] || '2d';
+
+    this._destroyTextureIfPresent(id);
+    const texture = this.device.createTexture({
+      size: {
+        width,
+        height,
+        depthOrArrayLayers,
+      },
+      mipLevelCount,
+      format,
+      usage,
+      dimension,
+    });
+    this.textures.set(id, texture);
+    if (texture && typeof texture.createView === 'function') {
+      this.textureViews.set(id, texture.createView());
+    }
+  }
+
+  _handleWriteTexture(view, payloadOffset, payloadBytes) {
+    const textureId = view.getUint32(payloadOffset, true);
+    const mipLevel = view.getUint32(payloadOffset + 4, true);
+    const originX = view.getUint32(payloadOffset + 8, true);
+    const originY = view.getUint32(payloadOffset + 12, true);
+    const originZ = view.getUint32(payloadOffset + 16, true);
+    const width = view.getUint32(payloadOffset + 20, true);
+    const height = view.getUint32(payloadOffset + 24, true);
+    const depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 28, true));
+    const bytesPerRow = view.getUint32(payloadOffset + 32, true);
+    const rowsPerImage = view.getUint32(payloadOffset + 36, true);
+    const dataLen = view.getUint32(payloadOffset + 40, true);
+    if (48 + dataLen > payloadBytes) return;
+
+    const texture = this.textures.get(textureId);
+    if (!texture) return;
+
+    const data = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 48, dataLen);
+    const dataLayout = { offset: 0 };
+    if (bytesPerRow > 0) {
+      dataLayout.bytesPerRow = bytesPerRow;
+    }
+    if (rowsPerImage > 0) {
+      dataLayout.rowsPerImage = rowsPerImage;
+    }
+    this.device.queue.writeTexture(
+      {
+        texture,
+        mipLevel,
+        origin: { x: originX, y: originY, z: originZ },
+      },
+      data,
+      dataLayout,
+      {
+        width,
+        height,
+        depthOrArrayLayers,
+      }
+    );
+  }
+
+  _handleCreateSampler(view, payloadOffset) {
+    const id = view.getUint32(payloadOffset, true);
+    const addressModeU = ADDRESS_MODE_NAMES[view.getUint32(payloadOffset + 4, true)] || 'clamp-to-edge';
+    const addressModeV = ADDRESS_MODE_NAMES[view.getUint32(payloadOffset + 8, true)] || 'clamp-to-edge';
+    const addressModeW = ADDRESS_MODE_NAMES[view.getUint32(payloadOffset + 12, true)] || 'clamp-to-edge';
+    const magFilter = FILTER_MODE_NAMES[view.getUint32(payloadOffset + 16, true)] || 'nearest';
+    const minFilter = FILTER_MODE_NAMES[view.getUint32(payloadOffset + 20, true)] || 'nearest';
+    const mipmapFilter = FILTER_MODE_NAMES[view.getUint32(payloadOffset + 24, true)] || 'nearest';
+    const maxAnisotropy = Math.max(1, view.getUint32(payloadOffset + 28, true));
+
+    const sampler = this.device.createSampler({
+      addressModeU,
+      addressModeV,
+      addressModeW,
+      magFilter,
+      minFilter,
+      mipmapFilter,
+      maxAnisotropy,
+    });
+    this.samplers.set(id, sampler);
+  }
+
+  _handleCreateComputePipeline(view, payloadOffset) {
+    const id = view.getUint32(payloadOffset, true);
+    const csShaderId = view.getUint32(payloadOffset + 4, true);
+    // Reserved flags at payloadOffset + 8 and reserved at payloadOffset + 12.
+
+    const csEntry = this.shaderModules.get(csShaderId);
+    if (!csEntry) return;
+
+    const pipeline = this.device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: csEntry.module,
+        entryPoint: 'cs_main',
+      },
+    });
+    this.computePipelines.set(id, pipeline);
+  }
+
+  _handleCreateBindGroup(view, payloadOffset, payloadBytes) {
+    const id = view.getUint32(payloadOffset, true);
+    const pipelineId = view.getUint32(payloadOffset + 4, true);
+    const groupIndex = view.getUint32(payloadOffset + 8, true);
+    const entryCount = view.getUint32(payloadOffset + 12, true);
+    if (16 + entryCount * 32 > payloadBytes) return;
+
+    const renderPipeline = this.pipelines.get(pipelineId);
+    const computePipeline = this.computePipelines.get(pipelineId);
+    const pipeline = renderPipeline || computePipeline;
+    if (!pipeline || typeof pipeline.getBindGroupLayout !== 'function') return;
+
+    const entries = [];
+    for (let i = 0; i < entryCount; i++) {
+      const entryOffset = payloadOffset + 16 + i * 32;
+      const binding = view.getUint32(entryOffset, true);
+      const resourceType = view.getUint32(entryOffset + 4, true);
+      const resourceId = view.getUint32(entryOffset + 8, true);
+      const offset = Number(view.getBigUint64(entryOffset + 16, true));
+      const size = Number(view.getBigUint64(entryOffset + 24, true));
+
+      if (resourceType === BIND_RESOURCE_TYPE.BUFFER) {
+        const buffer = this.buffers.get(resourceId);
+        if (!buffer) return;
+        const resource = { buffer, offset };
+        if (size > 0) {
+          resource.size = size;
+        }
+        entries.push({ binding, resource });
+      } else if (resourceType === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
+        let textureView = this.textureViews.get(resourceId);
+        if (!textureView) {
+          const texture = this.textures.get(resourceId);
+          if (texture && typeof texture.createView === 'function') {
+            textureView = texture.createView();
+            this.textureViews.set(resourceId, textureView);
+          }
+        }
+        if (!textureView) return;
+        entries.push({ binding, resource: textureView });
+      } else if (resourceType === BIND_RESOURCE_TYPE.SAMPLER) {
+        const sampler = this.samplers.get(resourceId);
+        if (!sampler) return;
+        entries.push({ binding, resource: sampler });
+      } else {
+        return;
+      }
+    }
+
+    const layout = pipeline.getBindGroupLayout(groupIndex);
+    const bindGroup = this.device.createBindGroup({
+      layout,
+      entries,
+    });
+    this.bindGroups.set(id, bindGroup);
+    this._bindGroupKinds.set(id, computePipeline && !renderPipeline ? 'compute' : 'render');
+  }
+
   _handleDestroyResource(id) {
     this._destroyBufferIfPresent(id);
+    this._destroyTextureIfPresent(id);
+    this.samplers.delete(id);
+    this.bindGroups.delete(id);
+    this._bindGroupKinds.delete(id);
     this.shaderModules.delete(id);
     this.pipelines.delete(id);
+    this.computePipelines.delete(id);
   }
 
   _flushPresent() {
     const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.ctx.getCurrentTexture().createView(),
-          loadOp: 'clear',
-          storeOp: 'store',
-          clearValue: { ...this._clearColor },
-        },
-      ],
-    });
+    const swapchainView = this.ctx.getCurrentTexture().createView();
+    let activePass = null;
+    let activePassKind = null;
+    let renderPassOpened = false;
+
+    const endActivePass = () => {
+      if (activePass) {
+        activePass.end();
+        activePass = null;
+        activePassKind = null;
+      }
+    };
+
+    const ensureRenderPass = () => {
+      if (activePassKind === 'render') return activePass;
+      endActivePass();
+      const attachment = {
+        view: swapchainView,
+        loadOp: renderPassOpened ? 'load' : 'clear',
+        storeOp: 'store',
+      };
+      if (!renderPassOpened) {
+        attachment.clearValue = { ...this._clearColor };
+      }
+      activePass = encoder.beginRenderPass({
+        colorAttachments: [attachment],
+      });
+      activePassKind = 'render';
+      renderPassOpened = true;
+      return activePass;
+    };
+
+    const ensureComputePass = () => {
+      if (activePassKind === 'compute') return activePass;
+      endActivePass();
+      activePass = encoder.beginComputePass();
+      activePassKind = 'compute';
+      return activePass;
+    };
 
     for (const cmd of this._passCommands) {
-      if (cmd.type === 'setPipeline') {
-        const pipeline = this.pipelines.get(cmd.pipelineId);
-        if (pipeline) {
-          pass.setPipeline(pipeline);
+      switch (cmd.type) {
+        case 'setPipeline': {
+          const pass = ensureRenderPass();
+          const pipeline = this.pipelines.get(cmd.pipelineId);
+          if (pipeline) {
+            pass.setPipeline(pipeline);
+          }
+          break;
         }
-      } else if (cmd.type === 'setVertexBuffer') {
-        const buffer = this.buffers.get(cmd.bufferId);
-        if (buffer) {
-          pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
+        case 'setVertexBuffer': {
+          const pass = ensureRenderPass();
+          const buffer = this.buffers.get(cmd.bufferId);
+          if (buffer) {
+            pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
+          }
+          break;
         }
-      } else if (cmd.type === 'draw') {
-        pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
+        case 'setIndexBuffer': {
+          const pass = ensureRenderPass();
+          const buffer = this.buffers.get(cmd.bufferId);
+          if (buffer) {
+            pass.setIndexBuffer(buffer, cmd.indexFormat, cmd.offset);
+          }
+          break;
+        }
+        case 'setBindGroup': {
+          const bindGroup = this.bindGroups.get(cmd.bindGroupId);
+          if (bindGroup) {
+            const pass =
+              activePass ||
+              (this._bindGroupKinds.get(cmd.bindGroupId) === 'compute'
+                ? ensureComputePass()
+                : ensureRenderPass());
+            pass.setBindGroup(cmd.groupIndex, bindGroup);
+          }
+          break;
+        }
+        case 'draw': {
+          const pass = ensureRenderPass();
+          pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
+          break;
+        }
+        case 'drawIndexed': {
+          const pass = ensureRenderPass();
+          pass.drawIndexed(
+            cmd.indexCount,
+            cmd.instanceCount,
+            cmd.firstIndex,
+            cmd.baseVertex,
+            cmd.firstInstance
+          );
+          break;
+        }
+        case 'setComputePipeline': {
+          const pass = ensureComputePass();
+          const pipeline = this.computePipelines.get(cmd.pipelineId);
+          if (pipeline) {
+            pass.setPipeline(pipeline);
+          }
+          break;
+        }
+        case 'dispatchCompute': {
+          const pass = ensureComputePass();
+          pass.dispatchWorkgroups(cmd.workgroupX, cmd.workgroupY, cmd.workgroupZ);
+          break;
+        }
+        default:
+          break;
       }
     }
 
-    pass.end();
+    endActivePass();
+    if (!renderPassOpened) {
+      ensureRenderPass();
+      endActivePass();
+    }
+
     this.device.queue.submit([encoder.finish()]);
     this.frameCount += 1;
     this._resetFrameState();
@@ -377,6 +731,81 @@ class WgpuCommandProcessor {
         case OPCODES.DESTROY_RESOURCE:
           if (payloadBytes >= 4) {
             this._handleDestroyResource(view.getUint32(payloadOffset, true));
+          }
+          break;
+        case OPCODES.CREATE_TEXTURE:
+          if (payloadBytes >= 32) {
+            this._handleCreateTexture(view, payloadOffset);
+          }
+          break;
+        case OPCODES.WRITE_TEXTURE:
+          if (payloadBytes >= 48) {
+            this._handleWriteTexture(view, payloadOffset, payloadBytes);
+          }
+          break;
+        case OPCODES.CREATE_SAMPLER:
+          if (payloadBytes >= 32) {
+            this._handleCreateSampler(view, payloadOffset);
+          }
+          break;
+        case OPCODES.CREATE_BIND_GROUP:
+          if (payloadBytes >= 16) {
+            this._handleCreateBindGroup(view, payloadOffset, payloadBytes);
+          }
+          break;
+        case OPCODES.SET_BIND_GROUP:
+          if (payloadBytes >= 8) {
+            this._passCommands.push({
+              type: 'setBindGroup',
+              groupIndex: view.getUint32(payloadOffset, true),
+              bindGroupId: view.getUint32(payloadOffset + 4, true),
+            });
+          }
+          break;
+        case OPCODES.SET_INDEX_BUFFER:
+          if (payloadBytes >= 16) {
+            const formatCode = view.getUint32(payloadOffset + 4, true);
+            this._passCommands.push({
+              type: 'setIndexBuffer',
+              bufferId: view.getUint32(payloadOffset, true),
+              indexFormat: INDEX_FORMAT_NAMES[formatCode] || 'uint16',
+              offset: Number(view.getBigUint64(payloadOffset + 8, true)),
+            });
+          }
+          break;
+        case OPCODES.DRAW_INDEXED:
+          if (payloadBytes >= 20) {
+            this._passCommands.push({
+              type: 'drawIndexed',
+              indexCount: view.getUint32(payloadOffset, true),
+              instanceCount: view.getUint32(payloadOffset + 4, true),
+              firstIndex: view.getUint32(payloadOffset + 8, true),
+              baseVertex: view.getInt32(payloadOffset + 12, true),
+              firstInstance: view.getUint32(payloadOffset + 16, true),
+            });
+          }
+          break;
+        case OPCODES.CREATE_COMPUTE_PIPELINE:
+          if (payloadBytes >= 16) {
+            this._handleCreateComputePipeline(view, payloadOffset);
+          }
+          break;
+        case OPCODES.SET_COMPUTE_PIPELINE:
+          if (payloadBytes >= 4) {
+            this._passCommands.push({
+              type: 'setComputePipeline',
+              pipelineId: view.getUint32(payloadOffset, true),
+            });
+          }
+          break;
+        case OPCODES.DISPATCH_COMPUTE:
+          if (payloadBytes >= 12) {
+            this._passCommands.push({
+              type: 'dispatchCompute',
+              workgroupX: view.getUint32(payloadOffset, true),
+              workgroupY: view.getUint32(payloadOffset + 4, true),
+              workgroupZ: view.getUint32(payloadOffset + 8, true),
+            });
           }
           break;
         default:
@@ -519,6 +948,13 @@ const exportedApi = {
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
   BUFFER_USAGE,
+  TEXTURE_USAGE,
+  TEXTURE_FORMAT,
+  TEXTURE_DIMENSION,
+  ADDRESS_MODE,
+  FILTER_MODE,
+  BIND_RESOURCE_TYPE,
+  INDEX_FORMAT,
 };
 
 if (typeof globalThis !== 'undefined') {
