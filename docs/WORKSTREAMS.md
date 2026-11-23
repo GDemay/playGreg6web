@@ -24,11 +24,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** *(no game files required)*
   - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`) and verify `runtime/build_wasm.ps1` boots in Chrome/Edge.
-- [ ] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** *(no game files required)*
+- [ ] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
-- [ ] **O3 — Virtual Memory & Threading/TLS Shims** *(no game files required)*
+- [ ] **O3 — Virtual Memory & Threading/TLS Shims** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
-- [ ] **O4 — `GameInput` & `/userdata` Shims** *(no game files required)*
+- [ ] **O4 — `GameInput` & `/userdata` Shims** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
 
 ---
@@ -36,11 +36,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 3: GPU Command Bridge (`runtime/gpu/` + `web/workers/wgpu_worker.js`, C++20 + JS)
 **Goal:** Translate `d3d12_xs` command lists to binary packets executed on WebGPU.
 
-- [ ] **G1 — Expand Command Ring & Resource Tables** *(no game files required)*
+- [ ] **G1 — Expand Command Ring & Resource Tables** — `IN PROGRESS` (#4, @MarcBlattmann) *(no game files required)*
   - Implement `CreateBuffer`, `WriteBuffer`, `CreateShaderModule`, `CreatePipeline`, and `Draw` packets across `runtime/abi/playgta6_abi.h`, `runtime/gpu/cmd_encoder.cpp`, and `web/workers/wgpu_worker.js`.
 - [ ] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** *(no game files required)*
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
-- [ ] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** *(no game files required)*
+- [ ] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `IN PROGRESS` (#4, @MarcBlattmann) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
 
 ---
@@ -48,9 +48,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 4: Shader Pipeline (`shaders/`, Rust)
 **Goal:** Convert Xbox RDNA2 shaders (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → WGSL packs.
 
-- [ ] **S1 — `naga` SPIR-V → WGSL Batch Converter** *(testable with synthetic SPIR-V; real corpus needs local SPIR-V)*
+- [ ] **S1 — `naga` SPIR-V → WGSL Batch Converter** — `IN PROGRESS` (#5, @MarcBlattmann) *(testable with synthetic SPIR-V; real corpus needs local SPIR-V)*
   - Add `naga` to `shaders/Cargo.toml`, convert a directory of `.spv` files to `.wgsl`, emit `shader-index.json`, and output a structured failure-reason report (unsupported capabilities/extensions).
-- [ ] **S2 — Shader Pack Bundler & WebGPU Pre-Validator** *(no game files required)*
+- [ ] **S2 — Shader Pack Bundler & WebGPU Pre-Validator** — `IN PROGRESS` (#5, @MarcBlattmann) *(no game files required)*
   - Pack lowered `.wgsl` files into compact `.wgsl.pack` bundles (like `playgta5`) for fast loading in `wgpu_worker.js`.
 - [ ] **S3 — WebGPU Compatibility Passes** *(needs SPIR-V failure report from S1)*
   - Implement SPIR-V/WGSL rewrite passes for unsupported WebGPU features (bindless indexing limits, subgroup/wave64 fallbacks, mesh-compute lowering).
@@ -64,7 +64,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Cache fetched HTTP `206` byte chunks in Origin Private File System (OPFS) with a configurable budget + `bootset.json` prefetch on startup.
 - [ ] **W2 — IndexedDB `/userdata` Save Persistence** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
   - Restore `/userdata/` files into Wasm FS before `main()` and flush writes asynchronously (mirroring `playgta5`'s `loader.js` pattern).
-- [ ] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** *(no game files required)*
+- [ ] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** — `IN PROGRESS` (#6, @MarcBlattmann) *(no game files required)*
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
-- [ ] **W4 — Local Environment & Diagnostics (`tools/`)** *(uses `GTA6_GAME_DIR` when available)*
+- [ ] **W4 — Local Environment & Diagnostics (`tools/`)** — `IN PROGRESS` (#6, @MarcBlattmann) *(uses `GTA6_GAME_DIR` when available)*
   - Extend `tools/` to generate `bootset.json`, inspect RPF9 archive headers without extracting 100+ GB, and verify local file integrity.
