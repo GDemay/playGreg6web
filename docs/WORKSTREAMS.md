@@ -58,8 +58,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add `naga` to `shaders/Cargo.toml`, convert a directory of `.spv` files to `.wgsl`, emit `shader-index.json`, and output a structured failure-reason report (unsupported capabilities/extensions).
 - [x] **S2 — Shader Pack Bundler & WebGPU Pre-Validator** — `DONE` (PR #9, closes #5) *(no game files required)*
   - Pack lowered `.wgsl` files into compact `.wgsl.pack` bundles (like `playgta5`) for fast loading in `wgpu_worker.js`.
-- [ ] **S3 — WebGPU Compatibility Passes** — `IN PROGRESS` (#11, @MarcBlattmann) *(needs SPIR-V failure report from S1)*
+- [x] **S3 — WebGPU Compatibility Passes** — `DONE` (PR #25, closes #11) *(needs SPIR-V failure report from S1)*
   - Implement SPIR-V/WGSL rewrite passes for unsupported WebGPU features (bindless indexing limits, subgroup/wave64 fallbacks, mesh-compute lowering).
+- [ ] **S4 — DXBC/DXIL Container Inspector & Naga IR Push-Constant/BindGroup Lowering** — `IN PROGRESS` (#27, @MarcBlattmann) *(no game files required)*
+  - Add pure-Rust DXBC/DXIL container parser (`shaders/src/dxbc.rs`) and Naga IR lowering passes (`shaders/src/lower.rs`: push constants → uniform buffer, >4 bind-group remapping) + `inspect-dxbc` CLI.
 
 ---
 
