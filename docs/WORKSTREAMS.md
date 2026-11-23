@@ -12,9 +12,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [ ] **R1 — PE Parser & Import Dumper** — `IN PROGRESS` (#1, @MarcBlattmann) *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
   - Parse PE64 headers, sections, exports, TLS callbacks, and import tables (`object` / `goblin` crate).
   - Emit a sanitized symbol-only report (`docs/imports_required.md` — DLL + function names only, zero game bytes).
-- [ ] **R2 — x86-64 Decoder & Function Discovery** *(no game files required for unit tests)*
+- [ ] **R2 — x86-64 Decoder & Function Discovery** — `IN PROGRESS` (#13, @Timon-ok) *(no game files required for unit tests)*
   - Integrate `iced-x86` to decode `.text` blocks, follow calls/jumps, and build a CFG + relocation map.
-- [ ] **R3 — LLVM IR → Wasm64 Lifter Prototype** *(no game files required)*
+- [ ] **R3 — LLVM IR → Wasm64 Lifter Prototype** — `IN PROGRESS` (#14, @Timon-ok) *(no game files required)*
   - Lift small synthetic x86-64 test functions (arithmetic, branches, memory loads/stores, Win64 ABI calls) to LLVM IR and compile to `wasm64`.
 
 ---
@@ -22,7 +22,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 2: Xbox / Win32 OS Shims (`runtime/os/`, C++20 + Emscripten)
 **Goal:** Reimplement console OS APIs backed by browser workers, pthreads, and HTTPFS.
 
-- [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** *(no game files required)*
+- [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** *(no game files required; waits on W1+W2 & G2)*
   - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`) and verify `runtime/build_wasm.ps1` boots in Chrome/Edge.
 - [x] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
@@ -30,6 +30,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
 - [x] **O4 — `GameInput` & `/userdata` Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
+- [ ] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `IN PROGRESS` (#16, @MarcBlattmann) *(no game files required)*
+  - Expose C-ABI Win32 & Xbox GDK imports (`XGameRuntimeInitialize`, `XTaskQueue*`, `XUser*` offline stub, `VirtualAlloc`/`Protect`/`Free`, `Tls*`, `SRWLock*`, `CriticalSection`/`Event`, `CreateFileW`/`ReadFile`/`SetFilePointerEx`/`GetFileSizeEx`/`CloseHandle`, `QueryPerformanceCounter`/`Frequency`) backed by our OS shims.
 
 ---
 
@@ -42,6 +44,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
 - [x] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
+- [ ] **G4 — `WGPK` `.wgsl.pack` Binary Loader & Shader Module Cache** — `IN PROGRESS` (#18, @MarcBlattmann) *(no game files required)*
+  - Parse `.wgsl.pack` binary bundles (`shaders/src/pack.rs`) in JS (`web/workers/wgsl_pack_loader.js`), resolve WGSL by 64-bit FNV-1a hash, and cache compiled `GPUShaderModule`s.
 
 ---
 
@@ -68,3 +72,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
 - [x] **W4 — Local Environment & Diagnostics (`tools/`)** — `DONE` (PR #8, closes #6) *(uses `GTA6_GAME_DIR` when available)*
   - Extend `tools/` to generate `bootset.json`, inspect RPF9 archive headers without extracting 100+ GB, and verify local file integrity.
+- [ ] **W5 — Full `InputBridge` (Gamepad API + Xbox Buttons/Sticks/Triggers + Pointer Lock)** — `IN PROGRESS` (#17, @MarcBlattmann) *(no game files required)*
+  - Populate the full 40-byte `playgta6::InputState` SAB from Pointer Lock mouse, keyboard, and `navigator.getGamepads()` matching `runtime/os/game_input.h`.
+- [ ] **W6 — Partial-Download Game Folder Scanner & Incremental Manifest CLI (`tools/`)** — `IN PROGRESS` (#19, @MarcBlattmann) *(works on partial or complete `GTA6_GAME_DIR`)*
+  - Add read-only `scan` command detecting completed vs downloading files (`.!qB`/`.part`/sparse) and `--skip-incomplete` for `manifest`/`bootset`.
+- [ ] **W7 — Local Server Hardening (`/api/status`, ETag/If-Range) & Browser Diagnostics HUD (`server/`, `web/index.html`)** — `IN PROGRESS` (#20, @MarcBlattmann) *(no game files required)*
+  - Add ETag/`If-Range`/`HEAD` + sanitized `/api/status` to `server/serve_local.py` and upgrade `web/index.html` with a live Wasm64/WebGPU/SAB HUD.
