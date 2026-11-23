@@ -57,7 +57,7 @@ fn raw_bytes_function_lifts_to_a_complete_module() {
     for helper in [HELPER_UNIMPLEMENTED, HELPER_DIVIDE_ERROR, HELPER_TRAP] {
         assert!(ir.contains(&format!("declare void @{helper}(ptr, i64) noreturn")));
     }
-    assert!(ir.contains("define void @sub_1000(ptr noalias %state) {\nentry:\n"));
+    assert!(ir.contains("define void @sub_1000(ptr noalias %state) #0 {\nentry:\n"));
     assert!(ir.contains("  br label %bb_1000\nbb_1000:\n"));
     // Only the registers the function touches get a slot (rax, rcx, rdx + always rsp).
     for reg in ["rax", "rcx", "rdx", "rsp"] {
@@ -409,7 +409,7 @@ fn unsupported_instructions_trap_and_are_reported() {
         a.cpuid()?;
         a.mov(eax, 1)?;
         a.set_label(&mut skip)?;
-        a.movaps(xmm0, xmmword_ptr(rax))?;
+        a.fld(dword_ptr(rax))?;
         a.ret()
     });
     let module = lift_module([&func]).expect("lifts despite unsupported instructions");
@@ -418,9 +418,9 @@ fn unsupported_instructions_trap_and_are_reported() {
     assert_eq!(report[0].instruction, "cpuid");
     assert_eq!(report[0].mnemonic, "cpuid");
     assert!(report[0].reason.contains("Cpuid"), "{:?}", report[0]);
-    assert_eq!(report[1].mnemonic, "movaps");
+    assert_eq!(report[1].mnemonic, "fld");
     assert!(
-        report[1].instruction.starts_with("movaps xmm0"),
+        report[1].instruction.starts_with("fld st,dword ptr"),
         "{:?}",
         report[1]
     );
