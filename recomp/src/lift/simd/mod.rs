@@ -1,40 +1,54 @@
-//! SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2 and VEX-128 (AVX) instruction lifting.
+//! SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2, AVX, AVX2, FMA3 and F16C instruction lifting.
 //!
-//! # XMM registers
-//! `xmm0..xmm15` live in the guest state ([`STATE_XMM_OFFSET`](super::super::STATE_XMM_OFFSET),
-//! 16 bytes each, little endian). Inside a function every XMM register the function touches gets
-//! an `alloca <2 x i64>` (the canonical in-memory type of an XMM register) that is loaded from the
-//! state at entry and after every call and stored back before every call, exit and trap, exactly
-//! like the GPRs. Instructions `bitcast` the 128-bit value to the lane type they operate on
-//! (`<4 x float>`, `<16 x i8>`, ...); LLVM promotes the allocas to SSA values and the bitcasts are
-//! free on wasm (`v128`). The import thunks (`crate::stubs`) therefore always find float arguments
-//! in the low lanes of the `xmm0..3` slots and leave float results in `xmm0`.
+//! # Vector registers
+//! `ymm0..15` live in the guest state in two parts: bits 0..127 (`xmm0..15`) at
+//! [`STATE_XMM_OFFSET`](super::super::STATE_XMM_OFFSET) and bits 128..255 at
+//! [`STATE_YMM_HI_OFFSET`](super::super::STATE_YMM_HI_OFFSET), 16 bytes each, little endian.
+//! Inside a function every 128-bit part the function touches gets an `alloca <2 x i64>` (the
+//! canonical in-memory type of a 128-bit part), `%xmmN` / `%ymmhN`, loaded from the state at
+//! entry and after every call and stored back before every call, exit and trap, exactly like the
+//! GPRs. Instructions `bitcast` the value to the lane type they operate on (`<4 x float>`,
+//! `<16 x i8>`, ...); LLVM promotes the allocas to SSA values and the bitcasts are free on wasm
+//! (`v128`). The import thunks (`crate::stubs`) therefore always find float arguments in the low
+//! lanes of the `xmm0..3` slots and leave float results in `xmm0`. Upper-half slots exist only in
+//! functions with AVX code: legacy-SSE encodings leave bits 128..255 untouched (exact), VEX-128
+//! encodings zero them (exact), `vzeroupper`/`vzeroall` clear them.
 //!
-//! # YMM, AVX and VEX
-//! The guest state has 128-bit slots only; the upper halves of `ymm0..15` are not modelled.
-//! VEX-128 encodings are lifted (non-destructive three-operand forms; they zero bits 128+ of the
-//! destination YMM register, which is exact because those bits are never observable here).
-//! Legacy-SSE encodings preserve bits 128+, which is equally exact. Every 256-bit (VEX.L=1) form
-//! traps as unsupported, so the unmodelled upper halves can never be read or written; for the
-//! same reason `vzeroupper` is a no-op and `vzeroall` zeroes `xmm0..15`. FMA, AVX-512 (EVEX),
-//! XOP, MMX and x87 instructions trap as unsupported.
+//! 256-bit instructions whose lanes are independent per 128-bit half (arithmetic, compares,
+//! in-lane shuffles, integer ops, FMA, ...) are lifted as two 128-bit halves (per-lane immediate
+//! bits such as `vshufpd`/`vblendps` are honoured); cross-lane ones (broadcasts, 128-bit
+//! inserts/extracts, `vperm*`, widening/narrowing conversions, sign masks, tests, masked moves)
+//! are lifted as a whole (`avx.rs`).
 //!
 //! # Supported instructions
-//! Legacy-SSE and VEX-128 forms of:
+//! Legacy-SSE, VEX-128 and (where they exist) VEX-256 forms of:
 //! - moves: `movaps/movups/movapd/movupd/movdqa/movdqu/lddqu`, `movnt{ps,pd,dq,dqa,i}`,
 //!   `movss/movsd`, `movd/movq`, `mov{l,h}{ps,pd}`, `movlhps/movhlps`, `movmskps/movmskpd/pmovmskb`,
-//!   `movsldup/movshdup/movddup`;
+//!   `movsldup/movshdup/movddup`, `vmaskmovps/pd`, `vpmaskmovd/q`;
 //! - float arithmetic: `add/sub/mul/div/min/max/sqrt` `ss/sd/ps/pd`, `rcp/rsqrt` `ss/ps`,
-//!   `and/andn/or/xor` `ps/pd`, `hadd/hsub/addsub` `ps/pd`, `round{ss,sd,ps,pd}`, `dpps/dppd`;
-//! - compares: `cmp{ss,sd,ps,pd}` (8 legacy / 32 VEX predicates), `(u)comis{s,d}`;
+//!   `and/andn/or/xor` `ps/pd`, `hadd/hsub/addsub` `ps/pd`, `round{ss,sd,ps,pd}`, `dpps/dppd`,
+//!   FMA3 `vf{,n}m{add,sub}{132,213,231}{ps,ss}` and `vfm{addsub,subadd}*ps`;
+//! - compares: `cmp{ss,sd,ps,pd}` (8 legacy / 32 VEX predicates), `(u)comis{s,d}`, `ptest`,
+//!   `vtestps/vtestpd`;
 //! - conversions: `cvtsi2ss/sd`, `cvtss2sd/cvtsd2ss`, `cvt(t)ss2si/cvt(t)sd2si`,
-//!   `cvtdq2ps/cvt(t)ps2dq/cvtdq2pd/cvt(t)pd2dq/cvtps2pd/cvtpd2ps`;
-//! - shuffles: `shufps/shufpd`, `unpck{l,h}{ps,pd}`, `blend{ps,pd}`, `blendv{ps,pd}`,
-//!   `insertps/extractps`;
+//!   `cvtdq2ps/cvt(t)ps2dq/cvtdq2pd/cvt(t)pd2dq/cvtps2pd/cvtpd2ps`, F16C `vcvtph2ps/vcvtps2ph`
+//!   (all rounding immediates);
+//! - float shuffles: `shufps/shufpd`, `unpck{l,h}{ps,pd}`, `blend{ps,pd}`, `blendv{ps,pd}`,
+//!   `insertps/extractps`, `vpermilps/vpermilpd` (immediate and variable), `vbroadcastss/sd/f128`,
+//!   `vinsertf128/vextractf128`, `vperm2f128`, `vpermps/vpermpd`;
+//! - integer: `padd/psub` `b/w/d/q`, `padds/paddus/psubs/psubus` `b/w`,
+//!   `pmullw/pmulhw/pmulhuw/pmulhrsw/pmulld/pmuludq/pmuldq/pmaddwd/pmaddubsw`, `pand/pandn/por/
+//!   pxor`, `pcmpeq/pcmpgt` `b/w/d/q`, `pmin/pmax` `s/u` `b/w/d`, `pavgb/w`, `psadbw`, `pabs*`,
+//!   `psign*`, `psll/psrl/psra` (immediate and XMM count, any count), `pslldq/psrldq`,
+//!   `vpsllv/vpsrlv/vpsrav`, `pshufd/pshuflw/pshufhw/pshufb`, `punpck*`, `packss*/packus*`,
+//!   `palignr`, `pblendw/vpblendd/pblendvb`, `phadd*/phsub*`, `pextr*/pinsr*`,
+//!   `pmovsx*/pmovzx*`, `vpbroadcast*`, `vbroadcasti128`, `vinserti128/vextracti128`,
+//!   `vperm2i128`, `vpermd/vpermq`;
 //! - `ldmxcsr/stmxcsr`, `vzeroupper/vzeroall`.
 //!
-//! Everything else that touches vector registers traps with a reason (integer SIMD, x87, MMX,
-//! FMA, AVX-512, string compares, AES/CLMUL, 256-bit forms, ...).
+//! Everything else that touches vector registers traps with a precise reason: double-precision
+//! FMA, AVX-512 (EVEX), XOP/FMA4/SSE4a, MMX, x87 (not routed here), SSE4.2 string compares,
+//! AES/CLMUL/SHA, gathers, `mpsadbw`, `phminposuw`, `maskmovdqu`.
 //!
 //! # Floating point semantics
 //! Arithmetic, square root, conversions and rounding are IEEE-754 binary32/binary64 with
@@ -43,30 +57,37 @@
 //! - **NaN payloads**: when an arithmetic result is NaN, its payload and sign are not guaranteed
 //!   (x86 returns the first NaN operand quieted, or the default `-QNaN`; LLVM may commute operands
 //!   and wasm leaves NaN bits nondeterministic). Whether the result is NaN is always exact. Data
-//!   movement, shuffles, blends, bitwise logic and `min`/`max` (compare + select) are bit-exact
-//!   for NaNs too.
+//!   movement, shuffles, blends, bitwise logic, `min`/`max` (compare + select) and F16C are
+//!   bit-exact for NaNs too.
 //! - **`min`/`max`** follow x86, not IEEE `minNum`: `minps a, b` is `a < b ? a : b` (the second
 //!   operand when either is NaN or both are zero), `maxps a, b` is `a > b ? a : b`.
 //! - **float -> int** conversions return the x86 "integer indefinite" value (`0x80000000` /
 //!   `0x8000000000000000`) for NaN and out-of-range inputs, exactly like hardware; the rounding
 //!   forms (`cvtss2si`, `cvtps2dq`, ...) round half to even, the `cvtt*` forms truncate.
+//! - **FMA** (binary32) is computed with a single rounding without a hardware FMA: the product is
+//!   exact in binary64, the sum is rounded to odd in binary64 (TwoSum error term) and then
+//!   rounded to binary32, which is correctly rounded. Double-precision FMA traps.
 //! - **`rcpss/rcpps/rsqrtss/rsqrtps`**: hardware returns an implementation-specific approximation
 //!   (relative error <= 1.5 * 2^-12). The lifter returns the correctly rounded `1/x` and
 //!   `1/sqrt(x)` (within the same bound of every conforming CPU) and reproduces the hardware's
 //!   special cases: denormal inputs count as zero (result `+-inf`) and `rcp` of `|x| >= 2^126`
 //!   (a result that is not a normal number) flushes to `+-0`.
-//! - **MXCSR**: the guest state has no MXCSR slot, so the lifted CPU always runs with the default
-//!   `0x1F80` (round to nearest, all exceptions masked, FTZ/DAZ off). `stmxcsr` stores `0x1F80`.
-//!   `ldmxcsr` accepts any value with the default rounding mode and no reserved bits, but ignores
-//!   FTZ/DAZ and the exception masks: denormals are always computed per IEEE (games that enable
-//!   FTZ/DAZ see slightly different results on denormal operands only), exception flags are never
-//!   raised and unmasked exceptions never fault. A value selecting another rounding mode (or
-//!   setting reserved bits, which raises `#GP` on hardware) traps at run time through
-//!   `__playgta6_unimplemented` instead of silently computing with the wrong rounding.
+//! - **MXCSR** is kept in the guest state ([`STATE_MXCSR_OFFSET`](super::super::STATE_MXCSR_OFFSET);
+//!   the runtime initialises it to `0x1F80`): `ldmxcsr`/`stmxcsr` round-trip every accepted value.
+//!   Lifted code always computes with round-to-nearest, no FTZ/DAZ and masked exceptions:
+//!   - FTZ/DAZ bits are stored but not modelled: denormals are always computed per IEEE (games
+//!     that enable FTZ/DAZ see different results on denormal operands/results only);
+//!   - exception flags are never raised and unmasked exceptions never fault;
+//!   - a value selecting another rounding mode (or setting reserved bits, which raises `#GP` on
+//!     hardware) traps at run time through `__playgta6_unimplemented` instead of silently
+//!     computing with the wrong rounding. `roundps`/`vcvtps2ph` immediates that select
+//!     "MXCSR.RC" therefore round to nearest-even.
 //! - **Alignment**: the aligned forms (`movaps`, `movdqa`, legacy-SSE memory operands, ...) do not
-//!   raise `#GP` on misaligned addresses; all accesses are `align 1`.
+//!   raise `#GP` on misaligned addresses; all accesses are `align 1`. Masked moves never touch
+//!   masked-out elements (like hardware, they cannot fault there).
 //! - Non-temporal hints (`movnt*`) are plain loads/stores.
 
+mod avx;
 mod float;
 mod int;
 mod moves;
@@ -80,9 +101,6 @@ use super::{FunctionLifter, R, imm, unsupported};
 
 /// Canonical type of an XMM register value (allocas and guest state slots).
 pub(super) const XMM_TYPE: &str = "<2 x i64>";
-
-/// Default MXCSR value (round to nearest, all exceptions masked, FTZ/DAZ off).
-const MXCSR_DEFAULT: u64 = 0x1F80;
 
 /// Lane element types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,6 +145,15 @@ impl Elem {
             Elem::F32 => Elem::I32,
             Elem::F64 => Elem::I64,
             e => e,
+        }
+    }
+
+    /// The integer type of twice the width (`I64` stays `I64`).
+    fn wide(self) -> Elem {
+        match self {
+            Elem::I8 => Elem::I16,
+            Elem::I16 => Elem::I32,
+            _ => Elem::I64,
         }
     }
 
@@ -200,6 +227,17 @@ impl Ty {
         format!("<{}>", lanes.join(", "))
     }
 
+    /// `true`/`false` in every lane of the matching `i1` shape.
+    fn bool_splat(self, v: bool) -> String {
+        let s = if v { "true" } else { "false" };
+        if self.n == 1 {
+            return s.to_string();
+        }
+        let lane = format!("i1 {s}");
+        let lanes: Vec<&str> = (0..self.n).map(|_| lane.as_str()).collect();
+        format!("<{}>", lanes.join(", "))
+    }
+
     /// LLVM intrinsic type suffix (`f32`, `v4f32`, `v16i8`, ...).
     fn suffix(self) -> String {
         let e = match self.e {
@@ -237,6 +275,14 @@ pub(in crate::lift) enum Intr {
     Floor,
     Ceil,
     Trunc,
+    SAddSat,
+    UAddSat,
+    SSubSat,
+    USubSat,
+    /// `llvm.abs` with `is_int_min_poison = false` (`abs(MIN) == MIN`, like `pabs*`).
+    Abs,
+    /// `llvm.wasm.swizzle` (`i8x16.swizzle`): indices >= 16 select 0.
+    Swizzle,
 }
 
 /// One module-level declaration required by lifted SIMD code (see `Support::Simd`).
@@ -254,12 +300,23 @@ impl Decl {
             Intr::Floor => "floor",
             Intr::Ceil => "ceil",
             Intr::Trunc => "trunc",
+            Intr::SAddSat => "sadd.sat",
+            Intr::UAddSat => "uadd.sat",
+            Intr::SSubSat => "ssub.sat",
+            Intr::USubSat => "usub.sat",
+            Intr::Abs => "abs",
+            Intr::Swizzle => return "llvm.wasm.swizzle".to_string(),
         };
         format!("llvm.{base}.{}", self.ty.suffix())
     }
 
     fn params(self) -> String {
-        self.ty.ir()
+        let t = self.ty.ir();
+        match self.intr {
+            Intr::Sqrt | Intr::Rint | Intr::Floor | Intr::Ceil | Intr::Trunc => t,
+            Intr::Abs => format!("{t}, i1"),
+            _ => format!("{t}, {t}"),
+        }
     }
 
     /// The `declare` line.
@@ -326,75 +383,145 @@ pub(super) fn is_simd(ins: &Instruction) -> bool {
         )
 }
 
-/// Records the XMM registers an instruction uses (`reg` from its used-register info).
-pub(super) fn note_register(reg: Register, xmms: &mut [bool; 16]) {
+/// Vector registers a function uses, plus the SIMD lifter's per-instruction state.
+#[derive(Debug, Default)]
+pub(super) struct Regs {
+    /// `xmm0..15` (bits 0..127 of `ymm0..15`) that get a slot.
+    xmm: [bool; 16],
+    /// Upper halves (bits 128..255) of `ymm0..15` that get a slot.
+    ymmh: [bool; 16],
+    /// The 128-bit lane the register/memory accessors address while a 256-bit instruction is
+    /// lifted one lane at a time (0 = low, 1 = high).
+    half: u32,
+    /// Whether the current instruction is a 256-bit one lifted per 128-bit lane.
+    wide: bool,
+}
+
+/// Records the vector registers an instruction uses (`reg` from its used-register info).
+/// (iced reports VEX destinations as the full ZMM register, as their upper bits are zeroed.)
+pub(super) fn note_register(reg: Register, regs: &mut Regs) {
     if (reg.is_xmm() || reg.is_ymm() || reg.is_zmm()) && reg.number() < 16 {
-        xmms[reg.number()] = true;
+        regs.xmm[reg.number()] = true;
+        if !reg.is_xmm() {
+            regs.ymmh[reg.number()] = true;
+        }
     }
 }
 
-/// Records XMM registers an instruction writes without listing them as operands.
-pub(super) fn note_instruction(ins: &Instruction, xmms: &mut [bool; 16]) {
-    if ins.mnemonic() == Mnemonic::Vzeroall {
-        *xmms = [true; 16];
+/// Records register halves an instruction writes without naming them as 256-bit operands: VEX
+/// instructions zero the upper half of their XMM destination, `vzeroupper`/`vzeroall` clear all.
+pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
+    match ins.mnemonic() {
+        Mnemonic::Vzeroall => {
+            regs.xmm = [true; 16];
+            regs.ymmh = [true; 16];
+        }
+        Mnemonic::Vzeroupper => regs.ymmh = [true; 16],
+        _ => {}
     }
+    if ins.encoding() == EncodingKind::VEX
+        && ins.op_count() > 0
+        && ins.op_kind(0) == OpKind::Register
+        && ins.op_register(0).is_xmm()
+        && ins.op_register(0).number() < 16
+    {
+        regs.xmm[ins.op_register(0).number()] = true;
+        regs.ymmh[ins.op_register(0).number()] = true;
+    }
+}
+
+/// Whether a VEX instruction with an XMM first operand reads it without writing it.
+fn reads_only_first_operand(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Vcomiss | M::Vucomiss | M::Vcomisd | M::Vucomisd | M::Vptest | M::Vtestps | M::Vtestpd
+    )
+}
+
+/// Whether the instruction operates on 256-bit vectors (VEX.L = 1).
+fn is_256(ins: &Instruction) -> bool {
+    (0..ins.op_count()).any(|i| match ins.op_kind(i) {
+        OpKind::Register => ins.op_register(i).is_ymm(),
+        OpKind::Memory => ins.memory_size().size() == 32,
+        _ => false,
+    })
 }
 
 impl FunctionLifter<'_> {
     // ----- state ---------------------------------------------------------------------------------
 
     pub(super) fn xmm_allocas(&self, ir: &mut String) {
-        for (idx, used) in self.xmms.iter().enumerate() {
-            if *used {
+        for idx in 0..16 {
+            if self.simd.xmm[idx] {
                 let _ = writeln!(ir, "  %xmm{idx} = alloca {XMM_TYPE}");
+            }
+            if self.simd.ymmh[idx] {
+                let _ = writeln!(ir, "  %ymmh{idx} = alloca {XMM_TYPE}");
             }
         }
     }
 
-    fn state_xmm_ptr(&mut self, idx: usize) -> String {
+    /// Pointer to slot `idx` of state field 5 (`xmm`) or 6 (`ymm_hi`).
+    fn state_vec_ptr(&mut self, field: u32, idx: usize) -> String {
         self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 5, i64 {idx}"
+            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {field}, i64 {idx}"
         ))
     }
 
-    /// Loads the tracked XMM registers from `%state` into their allocas.
-    pub(super) fn sync_xmm_in(&mut self) {
+    fn vec_slots(&self) -> Vec<(u32, usize, String)> {
+        let mut slots = Vec::new();
         for idx in 0..16 {
-            if self.xmms[idx] {
-                let ptr = self.state_xmm_ptr(idx);
-                let v = self.val(&format!("load {XMM_TYPE}, ptr {ptr}, align 8"));
-                self.emit(&format!("store {XMM_TYPE} {v}, ptr %xmm{idx}"));
+            if self.simd.xmm[idx] {
+                slots.push((5, idx, format!("%xmm{idx}")));
             }
+            if self.simd.ymmh[idx] {
+                slots.push((6, idx, format!("%ymmh{idx}")));
+            }
+        }
+        slots
+    }
+
+    /// Loads the tracked vector registers from `%state` into their allocas.
+    pub(super) fn sync_xmm_in(&mut self) {
+        for (field, idx, slot) in self.vec_slots() {
+            let ptr = self.state_vec_ptr(field, idx);
+            let v = self.val(&format!("load {XMM_TYPE}, ptr {ptr}, align 8"));
+            self.emit(&format!("store {XMM_TYPE} {v}, ptr {slot}"));
         }
     }
 
-    /// Stores the tracked XMM registers back into `%state`.
+    /// Stores the tracked vector registers back into `%state`.
     pub(super) fn sync_xmm_out(&mut self) {
-        for idx in 0..16 {
-            if self.xmms[idx] {
-                let v = self.val(&format!("load {XMM_TYPE}, ptr %xmm{idx}"));
-                let ptr = self.state_xmm_ptr(idx);
-                self.emit(&format!("store {XMM_TYPE} {v}, ptr {ptr}, align 8"));
-            }
+        for (field, idx, slot) in self.vec_slots() {
+            let v = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
+            let ptr = self.state_vec_ptr(field, idx);
+            self.emit(&format!("store {XMM_TYPE} {v}, ptr {ptr}, align 8"));
         }
     }
 
     // ----- registers and operands ----------------------------------------------------------------
 
-    fn xmm_index(&self, reg: Register) -> R<usize> {
-        if !reg.is_xmm() {
-            return unsupported(format!("operand {reg:?} is not an XMM register"));
+    /// The alloca holding 128-bit lane `half` of the vector register `reg`.
+    fn slot(&self, reg: Register, half: u32) -> R<String> {
+        if !(reg.is_xmm() || reg.is_ymm()) {
+            return unsupported(format!("operand {reg:?} is not an XMM/YMM register"));
         }
         let idx = reg.number();
         if idx >= 16 {
             return unsupported(format!(
-                "register {reg:?} (only xmm0..xmm15 exist without EVEX)"
+                "register {reg:?} (only 16 vector registers exist without EVEX)"
             ));
         }
-        if !self.xmms[idx] {
-            return unsupported(format!("internal: xmm{idx} is not tracked"));
+        let (tracked, name) = if half == 0 {
+            (self.simd.xmm[idx], "xmm")
+        } else {
+            (self.simd.ymmh[idx], "ymmh")
+        };
+        if !tracked {
+            return unsupported(format!("internal: {name}{idx} is not tracked"));
         }
-        Ok(idx)
+        Ok(format!("%{name}{idx}"))
     }
 
     fn cast(&mut self, v: &str, from: Ty, to: Ty) -> String {
@@ -405,57 +532,120 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// An XMM register as a 128-bit vector of `e`.
-    fn xget(&mut self, reg: Register, e: Elem) -> R<String> {
-        let idx = self.xmm_index(reg)?;
-        let raw = self.val(&format!("load {XMM_TYPE}, ptr %xmm{idx}"));
+    /// Lane `half` of a vector register as a 128-bit vector of `e`.
+    fn xget_half(&mut self, reg: Register, half: u32, e: Elem) -> R<String> {
+        let slot = self.slot(reg, half)?;
+        let raw = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
         Ok(self.cast(&raw, Ty::v(Elem::I64), Ty::v(e)))
     }
 
-    /// Writes a 128-bit vector of `e` to an XMM register.
-    fn xset(&mut self, reg: Register, v: &str, e: Elem) -> R<()> {
-        let idx = self.xmm_index(reg)?;
+    /// Writes lane `half` of a vector register.
+    fn xset_half(&mut self, reg: Register, half: u32, v: &str, e: Elem) -> R<()> {
+        let slot = self.slot(reg, half)?;
         let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
-        self.emit(&format!("store {XMM_TYPE} {raw}, ptr %xmm{idx}"));
+        self.emit(&format!("store {XMM_TYPE} {raw}, ptr {slot}"));
         Ok(())
+    }
+
+    /// A vector register (the current 128-bit lane of a YMM register) as a vector of `e`.
+    fn xget(&mut self, reg: Register, e: Elem) -> R<String> {
+        if self.simd.half == 1 && !reg.is_ymm() {
+            return unsupported("internal: upper lane of a 128-bit operand");
+        }
+        self.xget_half(reg, self.simd.half, e)
+    }
+
+    /// Writes a vector register (the current 128-bit lane of a YMM register).
+    fn xset(&mut self, reg: Register, v: &str, e: Elem) -> R<()> {
+        if self.simd.half == 1 && !reg.is_ymm() {
+            return unsupported("internal: upper lane of a 128-bit operand");
+        }
+        self.xset_half(reg, self.simd.half, v, e)
     }
 
     fn mem_bytes(ins: &Instruction) -> usize {
         ins.memory_size().size()
     }
 
-    fn mem_ptr(&mut self, ins: &Instruction) -> R<String> {
-        let ea = self.mem_ea(ins)?;
+    /// Pointer to the memory operand plus `offset` bytes.
+    fn mem_ptr_at(&mut self, ins: &Instruction, offset: u64) -> R<String> {
+        let mut ea = self.mem_ea(ins)?;
+        if offset != 0 {
+            ea = self.val(&format!("add i64 {ea}, {offset}"));
+        }
         Ok(self.guest_ptr(&ea))
     }
 
-    /// Loads a value of type `ty` from the memory operand, which must be exactly that large.
-    fn mem_load(&mut self, ins: &Instruction, ty: Ty) -> R<String> {
-        let bytes = (ty.e.bits() * ty.n / 8) as usize;
-        if Self::mem_bytes(ins) != bytes {
+    /// Byte offset of the current lane's part of the memory operand, checking its size: `bytes`
+    /// for 128-bit instructions, twice that (one part per lane) for 256-bit ones.
+    fn mem_part(&self, ins: &Instruction, bytes: usize) -> R<u64> {
+        let total = if self.simd.wide { 2 * bytes } else { bytes };
+        if Self::mem_bytes(ins) != total {
             return unsupported(format!(
-                "internal: {}-byte memory operand where {bytes} bytes were expected",
+                "internal: {}-byte memory operand where {total} bytes were expected",
                 Self::mem_bytes(ins)
             ));
         }
-        let ptr = self.mem_ptr(ins)?;
+        Ok(if self.simd.wide {
+            u64::from(self.simd.half) * bytes as u64
+        } else {
+            0
+        })
+    }
+
+    fn ty_bytes(ty: Ty) -> usize {
+        (ty.e.bits() * ty.n / 8) as usize
+    }
+
+    /// Loads a value of type `ty` from the memory operand (the current lane's part of it).
+    fn mem_load(&mut self, ins: &Instruction, ty: Ty) -> R<String> {
+        let offset = self.mem_part(ins, Self::ty_bytes(ty))?;
+        let ptr = self.mem_ptr_at(ins, offset)?;
         Ok(self.val(&format!("load {}, ptr {ptr}, align 1", ty.ir())))
     }
 
+    /// Stores a value of type `ty` to the memory operand (the current lane's part of it).
     fn mem_store(&mut self, ins: &Instruction, v: &str, ty: Ty) -> R<()> {
-        let bytes = (ty.e.bits() * ty.n / 8) as usize;
-        if Self::mem_bytes(ins) != bytes {
-            return unsupported(format!(
-                "internal: {}-byte memory operand where {bytes} bytes were expected",
-                Self::mem_bytes(ins)
-            ));
-        }
-        let ptr = self.mem_ptr(ins)?;
+        let offset = self.mem_part(ins, Self::ty_bytes(ty))?;
+        let ptr = self.mem_ptr_at(ins, offset)?;
         self.emit(&format!("store {} {v}, ptr {ptr}, align 1", ty.ir()));
         Ok(())
     }
 
-    /// A 128-bit operand (XMM register or `m128`) as a vector of `e`.
+    /// Loads `ty` at `offset` from a memory operand of exactly `total` bytes.
+    fn mem_load_at(&mut self, ins: &Instruction, ty: Ty, offset: u64, total: usize) -> R<String> {
+        if Self::mem_bytes(ins) != total {
+            return unsupported(format!(
+                "internal: {}-byte memory operand where {total} bytes were expected",
+                Self::mem_bytes(ins)
+            ));
+        }
+        let ptr = self.mem_ptr_at(ins, offset)?;
+        Ok(self.val(&format!("load {}, ptr {ptr}, align 1", ty.ir())))
+    }
+
+    /// Stores `ty` at `offset` into a memory operand of exactly `total` bytes.
+    fn mem_store_at(
+        &mut self,
+        ins: &Instruction,
+        v: &str,
+        ty: Ty,
+        offset: u64,
+        total: usize,
+    ) -> R<()> {
+        if Self::mem_bytes(ins) != total {
+            return unsupported(format!(
+                "internal: {}-byte memory operand where {total} bytes were expected",
+                Self::mem_bytes(ins)
+            ));
+        }
+        let ptr = self.mem_ptr_at(ins, offset)?;
+        self.emit(&format!("store {} {v}, ptr {ptr}, align 1", ty.ir()));
+        Ok(())
+    }
+
+    /// A 128-bit operand (XMM register or `m128`, or the current lane of a YMM register or
+    /// `m256`) as a vector of `e`.
     fn v128(&mut self, ins: &Instruction, i: u32, e: Elem) -> R<String> {
         match ins.op_kind(i) {
             OpKind::Register => self.xget(ins.op_register(i), e),
@@ -464,12 +654,27 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// Writes a 128-bit result to an XMM register or `m128` operand.
+    /// Writes a 128-bit result to a register or memory operand (current lane).
     fn set_v128(&mut self, ins: &Instruction, i: u32, v: &str, e: Elem) -> R<()> {
         match ins.op_kind(i) {
             OpKind::Register => self.xset(ins.op_register(i), v, e),
             OpKind::Memory => self.mem_store(ins, v, Ty::v(e)),
             kind => unsupported(format!("vector destination kind {kind:?}")),
+        }
+    }
+
+    /// Lane `half` of a 128/256-bit register or memory operand.
+    fn v_half(&mut self, ins: &Instruction, i: u32, half: u32, e: Elem) -> R<String> {
+        match ins.op_kind(i) {
+            OpKind::Register => self.xget_half(ins.op_register(i), half, e),
+            OpKind::Memory => {
+                let total = Self::mem_bytes(ins);
+                if total != 16 && total != 32 {
+                    return unsupported(format!("internal: {total}-byte vector memory operand"));
+                }
+                self.mem_load_at(ins, Ty::v(e), 16 * u64::from(half), total)
+            }
+            kind => unsupported(format!("vector operand kind {kind:?}")),
         }
     }
 
@@ -558,12 +763,21 @@ impl FunctionLifter<'_> {
         }
     }
 
+    /// The `per_lane` immediate bits that select within the current 128-bit lane (`vshufpd`,
+    /// `vblendps`, ... use separate immediate bits for the upper lane).
+    fn lane_imm(&self, imm8: u32, per_lane: u32) -> u32 {
+        (imm8 >> (self.simd.half * per_lane)) & ((1 << per_lane) - 1)
+    }
+
     /// Calls an intrinsic, declaring it at module level.
     fn intr(&mut self, intr: Intr, ty: Ty, args: &[&str]) -> String {
         let decl = Decl { intr, ty };
         self.support.insert(Support::Simd(decl));
         let t = ty.ir();
-        let list: Vec<String> = args.iter().map(|a| format!("{t} {a}")).collect();
+        let mut list: Vec<String> = args.iter().map(|a| format!("{t} {a}")).collect();
+        if intr == Intr::Abs {
+            list.push("i1 false".to_string());
+        }
         self.val(&format!("call {t} @{}({})", decl.name(), list.join(", ")))
     }
 
@@ -575,15 +789,20 @@ impl FunctionLifter<'_> {
         match ins.mnemonic() {
             M::Ldmxcsr | M::Vldmxcsr => return self.ldmxcsr(ins),
             M::Stmxcsr | M::Vstmxcsr => {
-                let v = imm(MXCSR_DEFAULT, 32);
+                let ptr = self.state_mxcsr_ptr();
+                let v = self.val(&format!("load i32, ptr {ptr}"));
                 return self.mem_store(ins, &v, Ty::s(Elem::I32));
             }
-            // The upper YMM halves are not modelled (every 256-bit form traps), so clearing
-            // them is unobservable.
-            M::Vzeroupper => return Ok(()),
+            M::Vzeroupper => {
+                for idx in 0..16u32 {
+                    self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
+                }
+                return Ok(());
+            }
             M::Vzeroall => {
-                for idx in 0..16 {
-                    self.xset(Register::XMM0 + idx, "zeroinitializer", Elem::I64)?;
+                for idx in 0..16u32 {
+                    self.xset_half(Register::YMM0 + idx, 0, "zeroinitializer", Elem::I64)?;
+                    self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
                 }
                 return Ok(());
             }
@@ -596,6 +815,32 @@ impl FunctionLifter<'_> {
             _ => {}
         }
         let vex = self.check_encoding(ins)?;
+        let result = if is_256(ins) {
+            self.lift_256(ins)
+        } else {
+            match self.lift_avx(ins) {
+                Ok(true) => Ok(()),
+                Ok(false) => self.lift_lane(ins, vex),
+                Err(e) => Err(e),
+            }
+        };
+        self.simd.half = 0;
+        self.simd.wide = false;
+        result?;
+        // VEX encodings zero bits 128..255 of an XMM destination register.
+        if vex
+            && ins.op_kind(0) == OpKind::Register
+            && ins.op_register(0).is_xmm()
+            && !reads_only_first_operand(ins.mnemonic())
+        {
+            let ymm = Register::YMM0 + ins.op_register(0).number() as u32;
+            self.xset_half(ymm, 1, "zeroinitializer", Elem::I64)?;
+        }
+        Ok(())
+    }
+
+    /// Lifts a 128-bit instruction (or, in a 256-bit loop, one lane of it).
+    fn lift_lane(&mut self, ins: &Instruction, vex: bool) -> R<()> {
         if self.lift_moves(ins, vex)? || self.lift_float(ins, vex)? || self.lift_int(ins, vex)? {
             return Ok(());
         }
@@ -605,8 +850,28 @@ impl FunctionLifter<'_> {
         ))
     }
 
-    /// Rejects encodings and operands outside the modelled 128-bit SSE/VEX state; returns whether
-    /// the instruction is VEX-encoded.
+    /// 256-bit forms: cross-lane instructions are lifted as a whole, in-lane ones as two
+    /// independent 128-bit halves.
+    fn lift_256(&mut self, ins: &Instruction) -> R<()> {
+        if self.lift_avx(ins)? {
+            return Ok(());
+        }
+        if !avx::in_lane(ins.mnemonic()) {
+            return unsupported(format!(
+                "256-bit form of {:?} is not supported yet",
+                ins.mnemonic()
+            ));
+        }
+        self.simd.wide = true;
+        for half in 0..2 {
+            self.simd.half = half;
+            self.lift_lane(ins, true)?;
+        }
+        Ok(())
+    }
+
+    /// Rejects encodings and operands outside the modelled SSE/AVX state; returns whether the
+    /// instruction is VEX-encoded.
     fn check_encoding(&self, ins: &Instruction) -> R<bool> {
         let vex = match ins.encoding() {
             EncodingKind::Legacy => false,
@@ -622,16 +887,10 @@ impl FunctionLifter<'_> {
             match ins.op_kind(i) {
                 OpKind::Register => {
                     let r = ins.op_register(i);
-                    if r.is_ymm() {
-                        return unsupported(
-                            "256-bit AVX form (the upper YMM halves are not modelled in the \
-                             guest state)",
-                        );
-                    }
                     if r.is_mm() {
                         return unsupported("MMX instructions are not supported");
                     }
-                    if r.is_zmm() || (r.is_xmm() && r.number() >= 16) {
+                    if r.is_zmm() || ((r.is_xmm() || r.is_ymm()) && r.number() >= 16) {
                         return unsupported(format!("register {r:?} requires EVEX"));
                     }
                 }
@@ -639,11 +898,8 @@ impl FunctionLifter<'_> {
                     if ins.is_vsib() {
                         return unsupported("gather (VSIB) instructions are not supported");
                     }
-                    if Self::mem_bytes(ins) > 16 {
-                        return unsupported(
-                            "256-bit AVX form (the upper YMM halves are not modelled in the \
-                             guest state)",
-                        );
+                    if Self::mem_bytes(ins) > 32 {
+                        return unsupported("memory operand wider than 256 bits");
                     }
                 }
                 _ => {}
@@ -652,7 +908,14 @@ impl FunctionLifter<'_> {
         Ok(vex)
     }
 
-    /// `ldmxcsr m32`: only the default rounding mode is supported (see the module docs).
+    fn state_mxcsr_ptr(&mut self) -> String {
+        self.val(&format!(
+            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 7"
+        ))
+    }
+
+    /// `ldmxcsr m32`: stores the value in the guest state; only the default rounding mode is
+    /// supported (see the module docs).
     fn ldmxcsr(&mut self, ins: &Instruction) -> R<()> {
         let v = self.mem_load(ins, Ty::s(Elem::I32))?;
         // Rounding control (bits 13-14) and the reserved bits 16-31 must be clear.
@@ -669,6 +932,8 @@ impl FunctionLifter<'_> {
         ));
         self.emit("unreachable");
         self.start_block(&ok);
+        let ptr = self.state_mxcsr_ptr();
+        self.emit(&format!("store i32 {v}, ptr {ptr}"));
         Ok(())
     }
 }

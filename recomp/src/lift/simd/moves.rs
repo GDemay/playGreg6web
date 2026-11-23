@@ -69,10 +69,52 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Movddup | M::Vmovddup => {
-                let s = self.low(ins, 1, I64, 1)?;
-                let v = self.zext_lanes(&s, I64, 1);
+                // xmm, xmm/m64 ; ymm, ymm/m256 (even quadword of each lane)
+                let v = if ins.op_kind(1) == OpKind::Memory && Self::mem_bytes(ins) == 8 {
+                    let s = self.low(ins, 1, I64, 1)?;
+                    self.zext_lanes(&s, I64, 1)
+                } else {
+                    self.v128(ins, 1, I64)?
+                };
                 let r = self.shuffle(&v, &v, I64, &[0, 0]);
                 self.xset(ins.op_register(0), &r, I64)?;
+            }
+            M::Vpermilps | M::Vpermilpd => {
+                let e = if ins.mnemonic() == M::Vpermilps {
+                    I32
+                } else {
+                    I64
+                };
+                let n = e.lanes();
+                let v = self.v128(ins, 1, e)?;
+                let r = if super::super::is_immediate(ins.op_kind(2)) {
+                    let i = Self::imm8(ins)?;
+                    let idx: Vec<u32> = if e == I32 {
+                        (0..4).map(|l| (i >> (2 * l)) & 3).collect()
+                    } else {
+                        let i = self.lane_imm(i, 2);
+                        (0..2).map(|l| (i >> l) & 1).collect()
+                    };
+                    self.shuffle(&v, &v, e, &idx)
+                } else {
+                    // Variable control: bits 1:0 (ps) or bit 1 (pd) of each control element.
+                    let ctl = self.v128(ins, 2, e)?;
+                    let t = Ty::v(e).ir();
+                    let mut r = "poison".to_string();
+                    for l in 0..n {
+                        let k = self.extract(&ctl, e, l);
+                        let k = if e == I32 {
+                            self.val(&format!("and i32 {k}, 3"))
+                        } else {
+                            let k = self.val(&format!("lshr i64 {k}, 1"));
+                            self.val(&format!("and i64 {k}, 1"))
+                        };
+                        let x = self.val(&format!("extractelement {t} {v}, {} {k}", e.scalar()));
+                        r = self.insert(&r, e, &x, l);
+                    }
+                    r
+                };
+                self.xset(ins.op_register(0), &r, e)?;
             }
             M::Shufps | M::Vshufps => {
                 let i = Self::imm8(ins)?;
@@ -81,6 +123,7 @@ impl FunctionLifter<'_> {
             }
             M::Shufpd | M::Vshufpd => {
                 let i = Self::imm8(ins)?;
+                let i = self.lane_imm(i, 2);
                 self.shuffle_op(ins, f, I64, &[i & 1, 2 + ((i >> 1) & 1)])?;
             }
             M::Unpcklps | M::Vunpcklps => self.shuffle_op(ins, f, I32, &[0, 4, 1, 5])?,
@@ -251,6 +294,8 @@ impl FunctionLifter<'_> {
     pub(super) fn blend_imm(&mut self, ins: &Instruction, f: Form, e: Elem) -> R<()> {
         let i = Self::imm8(ins)?;
         let n = e.lanes();
+        // 256-bit forms take the upper lane's selectors from the next immediate bits.
+        let i = self.lane_imm(i, n);
         let idx: Vec<u32> = (0..n)
             .map(|l| if i >> (l % 8) & 1 == 1 { n + l } else { l })
             .collect();

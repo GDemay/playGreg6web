@@ -203,7 +203,7 @@ fn sse_conversions_match_the_host_cpu() {
 }
 
 /// Enough cases to put every float/double special into lane 0 of the second source twice.
-const F32_POOL_CASES: usize = 2 * 44;
+const F32_POOL_CASES: usize = 2 * 55;
 const F64_POOL_CASES: usize = 2 * 46;
 
 #[test]

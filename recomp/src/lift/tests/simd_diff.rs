@@ -1,12 +1,13 @@
 //! Differential testing of the SSE/AVX lifter against the host CPU (x86-64 hosts only).
 //!
 //! Every instruction form under test is executed twice on identical inputs:
-//! - natively: its encoding is copied into a small JIT stub ([`jit`]) that loads `xmm0..15`, the
+//! - natively: its encoding is copied into a small JIT stub ([`jit`]) that loads `ymm0..15`, the
 //!   GPRs, RFLAGS and MXCSR (`0x1F80`) from a context block, executes the instruction and stores
 //!   everything back;
 //! - lifted: `instruction; ret` is discovered, lifted, compiled to wasm64 and run under node.
 //!
-//! The XMM registers `xmm0..3`, all GPRs except `rbx` (the memory operand base, a host buffer
+//! The full YMM registers `ymm0..3` (so VEX zeroing and legacy preservation of the upper halves
+//! are checked too; without AVX only the XMM halves), all GPRs except `rbx` (the memory operand base, a host buffer
 //! natively and guest memory when lifted) and `rsp`, all six arithmetic flags and the 64-byte
 //! memory buffer are compared. Inputs combine per-lane edge cases (signed zeros, denormals,
 //! infinities, quiet and signalling NaNs with payloads, rounding and conversion boundaries,
@@ -25,7 +26,7 @@ use super::exec::{
 };
 use super::ir::Lcg;
 use super::{Program, assemble};
-use crate::lift::STATE_XMM_OFFSET;
+use crate::lift::{STATE_XMM_OFFSET, STATE_YMM_HI_OFFSET};
 
 /// Executes single instructions on the host CPU.
 pub(super) mod jit {
@@ -38,17 +39,17 @@ pub(super) mod jit {
     #[repr(C, align(16))]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct Ctx {
-        pub xmm: [[u8; 16]; 16],
+        pub ymm: [[u8; 32]; 16],
         pub gpr: [u64; 16],
         pub rflags: u64,
         pub mxcsr: u32,
         pub pad: u32,
     }
 
-    const XMM: i32 = 0;
-    const GPR: i32 = 256;
-    const RFLAGS: i32 = 384;
-    const MXCSR: i32 = 392;
+    const YMM: i32 = 0;
+    const GPR: i32 = 512;
+    const RFLAGS: i32 = 640;
+    const MXCSR: i32 = 648;
     const ARENA_BYTES: usize = 16 << 20;
 
     /// A stub in executable memory.
@@ -100,11 +101,15 @@ pub(super) mod jit {
         None
     }
 
-    fn prologue() -> Vec<u8> {
+    fn prologue(avx: bool) -> Vec<u8> {
         let mut a = CodeAssembler::new(64).expect("assembler");
         let xmms = [
             xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13,
             xmm14, xmm15,
+        ];
+        let ymms = [
+            ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13,
+            ymm14, ymm15,
         ];
         let gprs = [
             (rcx, 1),
@@ -130,8 +135,13 @@ pub(super) mod jit {
             a.stmxcsr(dword_ptr(rsp))?;
             a.push(rax)?;
             a.ldmxcsr(dword_ptr(rax + MXCSR))?;
-            for (i, x) in xmms.iter().enumerate() {
-                a.movdqu(*x, xmmword_ptr(rax + (XMM + 16 * i as i32)))?;
+            for (i, (x, y)) in xmms.iter().zip(ymms).enumerate() {
+                let at = rax + (YMM + 32 * i as i32);
+                if avx {
+                    a.vmovdqu(y, ymmword_ptr(at))?;
+                } else {
+                    a.movdqu(*x, xmmword_ptr(at))?;
+                }
             }
             a.push(qword_ptr(rax + RFLAGS))?;
             a.popfq()?;
@@ -144,11 +154,15 @@ pub(super) mod jit {
         a.assemble(0).expect("prologue encodes")
     }
 
-    fn epilogue() -> Vec<u8> {
+    fn epilogue(avx: bool) -> Vec<u8> {
         let mut a = CodeAssembler::new(64).expect("assembler");
         let xmms = [
             xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13,
             xmm14, xmm15,
+        ];
+        let ymms = [
+            ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13,
+            ymm14, ymm15,
         ];
         let gprs = [
             (rcx, 1),
@@ -176,8 +190,13 @@ pub(super) mod jit {
             }
             a.pop(rcx)?;
             a.mov(qword_ptr(rax + GPR), rcx)?;
-            for (i, x) in xmms.iter().enumerate() {
-                a.movdqu(xmmword_ptr(rax + (XMM + 16 * i as i32)), *x)?;
+            for (i, (x, y)) in xmms.iter().zip(ymms).enumerate() {
+                let at = rax + (YMM + 32 * i as i32);
+                if avx {
+                    a.vmovdqu(ymmword_ptr(at), y)?;
+                } else {
+                    a.movdqu(xmmword_ptr(at), *x)?;
+                }
             }
             a.stmxcsr(dword_ptr(rax + MXCSR))?;
             a.pop(rax)?;
@@ -195,7 +214,8 @@ pub(super) mod jit {
     /// Copies `prologue; instruction; epilogue` into executable memory. `instruction` must be
     /// position independent and must not touch `rsp`. `None` if no executable memory is available.
     pub fn stub(instruction: &[u8]) -> Option<Stub> {
-        let code = [prologue(), instruction.to_vec(), epilogue()].concat();
+        let avx = is_x86_feature_detected!("avx");
+        let code = [prologue(avx), instruction.to_vec(), epilogue(avx)].concat();
         let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         if arena.0 == 0 {
             arena.0 = alloc_exec(ARENA_BYTES)?;
@@ -233,7 +253,6 @@ pub(super) mod jit {
 }
 
 /// CPU feature an instruction form needs.
-#[allow(dead_code)] // the integer SIMD tests use the remaining ones
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Feature {
     Sse2,
@@ -243,6 +262,8 @@ pub(super) enum Feature {
     Sse42,
     Avx,
     Avx2,
+    Fma,
+    F16c,
 }
 
 impl Feature {
@@ -255,15 +276,21 @@ impl Feature {
             Feature::Sse42 => is_x86_feature_detected!("sse4.2"),
             Feature::Avx => is_x86_feature_detected!("avx"),
             Feature::Avx2 => is_x86_feature_detected!("avx2"),
+            Feature::Fma => is_x86_feature_detected!("fma"),
+            Feature::F16c => is_x86_feature_detected!("f16c"),
         }
     }
 }
 
 /// Value pool of the XMM lanes and memory (or of `rax`).
-#[allow(dead_code)] // the integer SIMD tests use the remaining ones
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
+    /// binary16 bit patterns (F16C).
+    F16,
     F32,
+    /// binary32 specials, random values within a factor of 8 of each other (products and
+    /// addends of similar magnitude: cancellation) with often-short mantissas (rounding ties).
+    F32Near,
     F64,
     I8,
     I16,
@@ -277,8 +304,8 @@ impl Kind {
     fn bytes(self) -> usize {
         match self {
             Kind::I8 => 1,
-            Kind::I16 => 2,
-            Kind::F32 | Kind::I32 => 4,
+            Kind::I16 | Kind::F16 => 2,
+            Kind::F32 | Kind::F32Near | Kind::I32 => 4,
             Kind::F64 | Kind::I64 | Kind::Count => 8,
         }
     }
@@ -289,7 +316,11 @@ impl Kind {
 
     fn pool(self) -> Vec<u64> {
         match self {
-            Kind::F32 => F32_SPECIALS.iter().map(|&v| u64::from(v)).collect(),
+            Kind::F32 | Kind::F32Near => F32_SPECIALS.iter().map(|&v| u64::from(v)).collect(),
+            Kind::F16 => vec![
+                0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3C00, 0xBC00, 0x3C01, 0x7BFF,
+                0xFBFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01, 0x7D55, 0xFDFF, 0x3555, 0x0200,
+            ],
             Kind::F64 => F64_SPECIALS.to_vec(),
             Kind::Count => vec![
                 0,
@@ -383,6 +414,16 @@ impl Kind {
                 (r >> 63) << 63 | exp << 52 | (r & 0xF_FFFF_FFFF_FFFF)
             }
             Kind::Count => r % 80,
+            Kind::F32Near => {
+                let exp = 126 + (r >> 8) % 4;
+                let mant = if r >> 20 & 1 == 1 {
+                    r & 0x7F_F000
+                } else {
+                    r & 0x7F_FFFF
+                };
+                ((r >> 63) << 31 | exp << 23 | mant) & 0xFFFF_FFFF
+            }
+            Kind::F16 => r & 0xFFFF,
             int => {
                 let bits = int.bytes() * 8;
                 if bits == 64 {
@@ -397,7 +438,20 @@ impl Kind {
 
 /// float bit patterns: signed zeros, denormals, normal boundaries, rounding ties, conversion
 /// limits, infinities and NaNs (quiet/signalling, with payloads, both signs).
-const F32_SPECIALS: [u32; 44] = [
+const F32_SPECIALS: [u32; 55] = [
+    // binary16 conversion boundaries: max half, the overflow tie, min normal/denormal halves,
+    // the underflow tie, the largest denormal half, round-to-nearest ties at 1.0.
+    0x477F_E000,
+    0x477F_F000,
+    0x477F_EFFF,
+    0xC77F_F000,
+    0x3880_0000,
+    0x3380_0000,
+    0x3300_0000,
+    0x3300_0001,
+    0x387F_C000,
+    0x3F80_1000,
+    0x3F80_3000,
     0x0000_0000,
     0x8000_0000,
     0x0000_0001,
@@ -517,11 +571,18 @@ pub(super) struct Op {
     pub gpr: Kind,
     pub check: Check,
     pub cases: usize,
+    /// Put a shift count (around every lane width) into the low quadword of `xmm2`/`[rbx]`.
+    pub shift_count: bool,
 }
 
 impl Op {
     pub fn cases(mut self, n: usize) -> Self {
         self.cases = n;
+        self
+    }
+
+    pub fn shift_count(mut self) -> Self {
+        self.shift_count = true;
         self
     }
 
@@ -569,13 +630,14 @@ pub(super) fn op(
         gpr: Kind::I64,
         check,
         cases: 48,
+        shift_count: false,
     }
 }
 
 /// Inputs of one case.
 #[derive(Debug, Clone)]
 struct Input {
-    xmm: [[u8; 16]; 4],
+    ymm: [[u8; 32]; 4],
     gpr: [u64; 16],
     mem: [u8; 64],
     flags: [bool; 6],
@@ -590,18 +652,18 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
     let pool = op.kind.pool();
     let p = pool.len();
     let w = op.kind.bytes();
-    let lanes = 16 / w;
+    let lanes = 32 / w;
     let span = (p * p).div_ceil(lanes);
     // Lane j of case k visits pair index c = k + j * span: lane 0 alone covers all ordered pairs
     // after p^2 cases, all lanes together after p^2 / lanes cases.
     let lane_values = |k: usize, j: usize, rng: &mut Lcg| -> (u64, u64) {
-        if (k + j) % 7 == 6 {
+        if (k + j) % 7 == 6 || (op.kind == Kind::F32Near && !(k + j).is_multiple_of(7)) {
             return (op.kind.random(rng), op.kind.random(rng));
         }
         let c = k + j * span;
         (pool[c % p], pool[(c / p) % p])
     };
-    let mut xmm = [[0u8; 16]; 4];
+    let mut xmm = [[0u8; 32]; 4];
     let mut mem = [0u8; 64];
     for (i, b) in mem.iter_mut().enumerate() {
         *b = (rng.next() >> (i % 8)) as u8;
@@ -612,7 +674,9 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
         put(&mut xmm[1][j * w..(j + 1) * w], a);
         put(&mut xmm[3][j * w..(j + 1) * w], a3);
         put(&mut xmm[2][j * w..(j + 1) * w], b);
-        put(&mut mem[j * w..(j + 1) * w], b);
+        if (j + 1) * w <= 32 {
+            put(&mut mem[j * w..(j + 1) * w], b);
+        }
         // VEX forms read xmm3 as the first source: give it the "a" pattern of the pair too.
         if j % 2 == 0 {
             put(&mut xmm[3][j * w..(j + 1) * w], a);
@@ -624,6 +688,12 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
     let mut gpr = [0u64; 16];
     for (i, r) in gpr.iter_mut().enumerate() {
         *r = rng.next() ^ (i as u64) << 56;
+    }
+    if op.shift_count {
+        let counts = Kind::Count.pool();
+        let c = counts[k % counts.len()];
+        put(&mut xmm[2][..8], c);
+        put(&mut mem[..8], c);
     }
     let gpool = op.gpr.pool();
     gpr[RAX] = if k % 5 == 4 {
@@ -637,7 +707,7 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
     }
     let f = rng.next();
     Input {
-        xmm,
+        ymm: xmm,
         gpr,
         mem,
         flags: std::array::from_fn(|i| f >> i & 1 == 1),
@@ -647,7 +717,7 @@ fn input(op: &Op, k: usize, rng: &mut Lcg) -> Input {
 /// Native result: xmm0..3, GPRs, flags `[CF PF AF ZF SF OF]`, memory buffer.
 #[derive(Debug)]
 struct Output {
-    xmm: [[u8; 16]; 4],
+    ymm: [[u8; 32]; 4],
     gpr: [u64; 16],
     flags: [bool; 6],
     mem: [u8; 64],
@@ -665,7 +735,7 @@ fn native(stub: jit::Stub, input: &Input) -> Output {
         mxcsr: 0x1F80,
         ..Default::default()
     };
-    ctx.xmm[..4].copy_from_slice(&input.xmm);
+    ctx.ymm[..4].copy_from_slice(&input.ymm);
     ctx.gpr = input.gpr;
     ctx.gpr[RBX] = buf.0.as_mut_ptr() as u64;
     ctx.rflags = input
@@ -678,7 +748,7 @@ fn native(stub: jit::Stub, input: &Input) -> Output {
     let mut gpr = ctx.gpr;
     gpr[RBX] = input.gpr[RBX];
     Output {
-        xmm: std::array::from_fn(|i| ctx.xmm[i]),
+        ymm: std::array::from_fn(|i| ctx.ymm[i]),
         gpr,
         flags: std::array::from_fn(|i| ctx.rflags >> FLAG_BITS[i] & 1 == 1),
         mem: buf.0,
@@ -693,11 +763,11 @@ fn is_nan(bits: u64, width: u32) -> bool {
 }
 
 /// Whether the lifted 16 bytes `got` are acceptable for the host's `host`.
-fn xmm_matches(check: Check, host: &[u8; 16], got: &[u8; 16]) -> bool {
+fn ymm_matches(check: Check, host: &[u8; 32], got: &[u8; 32]) -> bool {
     if host == got {
         return true;
     }
-    let lane = |b: &[u8; 16], i: usize, w: usize| {
+    let lane = |b: &[u8; 32], i: usize, w: usize| {
         let mut v = [0u8; 8];
         v[..w].copy_from_slice(&b[i * w..(i + 1) * w]);
         u64::from_le_bytes(v)
@@ -706,12 +776,12 @@ fn xmm_matches(check: Check, host: &[u8; 16], got: &[u8; 16]) -> bool {
         Check::Exact => false,
         Check::Nan(width) => {
             let w = width as usize / 8;
-            (0..16 / w).all(|i| {
+            (0..32 / w).all(|i| {
                 let (h, g) = (lane(host, i, w), lane(got, i, w));
                 h == g || (is_nan(h, width) && is_nan(g, width))
             })
         }
-        Check::Approx => (0..4).all(|i| {
+        Check::Approx => (0..8).all(|i| {
             let h = f32::from_bits(lane(host, i, 4) as u32);
             let g = f32::from_bits(lane(got, i, 4) as u32);
             // Results at the bottom of the normal range may flush to zero on one side only
@@ -770,6 +840,7 @@ pub(super) fn check_ops(test: &str, ops: Vec<Op>) {
     let mut cases = Vec::new();
     let mut meta = Vec::new();
     let xmm_state = STATE_ADDR + STATE_XMM_OFFSET;
+    let ymm_state = STATE_ADDR + STATE_YMM_HI_OFFSET;
     for (i, op) in ops.iter().enumerate() {
         let va = CODE_BASE + i as u64 * 0x20;
         for k in 0..op.cases {
@@ -779,8 +850,14 @@ pub(super) fn check_ops(test: &str, ops: Vec<Op>) {
             case.regs[RBX] = DATA_ADDR;
             case.regs[RSP] = STACK_TOP;
             case.flags = inp.flags;
-            case.mem = vec![(xmm_state, inp.xmm.concat()), (DATA_ADDR, inp.mem.to_vec())];
-            case.read = vec![(xmm_state, 64), (DATA_ADDR, 64)];
+            let lo: Vec<u8> = inp.ymm.iter().flat_map(|y| y[..16].to_vec()).collect();
+            let hi: Vec<u8> = inp.ymm.iter().flat_map(|y| y[16..].to_vec()).collect();
+            case.mem = vec![
+                (xmm_state, lo),
+                (ymm_state, hi),
+                (DATA_ADDR, inp.mem.to_vec()),
+            ];
+            case.read = vec![(xmm_state, 64), (ymm_state, 64), (DATA_ADDR, 64)];
             case.out = (0..16).collect();
             cases.push(case);
             meta.push((i, inp));
@@ -793,26 +870,33 @@ pub(super) fn check_ops(test: &str, ops: Vec<Op>) {
         let op = &ops[*i];
         let host = native(stubs[*i], inp);
         let label = format!(
-            "`{}` xmm1={} xmm2={} xmm3={} xmm0={} rax={:#x} mem={}",
+            "`{}` ymm1={} ymm2={} ymm3={} ymm0={} rax={:#x} mem={}",
             op.name,
-            hex(&inp.xmm[1]),
-            hex(&inp.xmm[2]),
-            hex(&inp.xmm[3]),
-            hex(&inp.xmm[0]),
+            hex(&inp.ymm[1]),
+            hex(&inp.ymm[2]),
+            hex(&inp.ymm[3]),
+            hex(&inp.ymm[0]),
             inp.gpr[RAX],
-            hex(&inp.mem[..16])
+            hex(&inp.mem[..32])
         );
         if !o.error.is_empty() {
             mismatches.push(format!("{label}: trapped: {}", o.error));
             continue;
         }
         for x in 0..4 {
-            let got: [u8; 16] = o.mem[0][16 * x..16 * (x + 1)].try_into().expect("16 bytes");
-            if !xmm_matches(op.check, &host.xmm[x], &got) {
+            let mut got = [0u8; 32];
+            got[..16].copy_from_slice(&o.mem[0][16 * x..16 * (x + 1)]);
+            got[16..].copy_from_slice(&o.mem[1][16 * x..16 * (x + 1)]);
+            let mut expected = host.ymm[x];
+            if !is_x86_feature_detected!("avx") {
+                // The host stub could not observe the upper halves; legacy code preserves them.
+                expected[16..].copy_from_slice(&inp.ymm[x][16..]);
+            }
+            if !ymm_matches(op.check, &expected, &got) {
                 mismatches.push(format!(
-                    "{label}: xmm{x} = {}, host {}",
+                    "{label}: ymm{x} = {}, host {}",
                     hex(&got),
-                    hex(&host.xmm[x])
+                    hex(&expected)
                 ));
             }
         }
@@ -838,10 +922,10 @@ pub(super) fn check_ops(test: &str, ops: Vec<Op>) {
                 ));
             }
         }
-        if o.mem[1] != host.mem {
+        if o.mem[2] != host.mem {
             mismatches.push(format!(
                 "{label}: memory = {}, host {}",
-                hex(&o.mem[1]),
+                hex(&o.mem[2]),
                 hex(&host.mem)
             ));
         }
