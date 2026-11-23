@@ -3,12 +3,21 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+/// Big-endian / synthetic ASCII FourCC magics (`"RPF9"` / `"RPF8"` / `"RPF7"`).
 pub const RPF9_MAGIC: [u8; 4] = *b"RPF9";
 pub const RPF8_MAGIC: [u8; 4] = *b"RPF8";
 pub const RPF7_MAGIC: [u8; 4] = *b"RPF7";
 
+/// Real RAGE little-endian FourCC magics on disk (`0x52504639` LE = `[0x39, 0x46, 0x50, 0x52]` = `"9FPR"`).
+pub const RPF9_MAGIC_LE: [u8; 4] = *b"9FPR";
+pub const RPF8_MAGIC_LE: [u8; 4] = *b"8FPR";
+pub const RPF7_MAGIC_LE: [u8; 4] = *b"7FPR";
+
+/// Numeric RAGE RPF9 FourCC value (`u32::from_le_bytes(*b"9FPR") == 0x5250_4639`).
+pub const RPF9_MAGIC_U32: u32 = 0x5250_4639;
+
 /// Minimum header size for RPF9 archives inspected by this tool (24 bytes):
-/// - `0x00..0x04`: magic (`"RPF9"`)
+/// - `0x00..0x04`: magic (`"9FPR"` / `0x52504639` LE, or synthetic `"RPF9"` BE)
 /// - `0x04..0x08`: `entry_count` (`u32` LE)
 /// - `0x08..0x0C`: `names_size` (`u32` LE)
 /// - `0x0C..0x10`: `encryption_tag` (`u32` LE)
@@ -21,6 +30,23 @@ pub const RPF9_ENTRY_STRIDE: u64 = 16;
 
 /// Default prefix byte length prefetched per archive/config in `bootset.json`.
 pub const DEFAULT_BOOTSET_HEAD_BYTES: u64 = 65_536;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpfMagicEndian {
+    /// Real RAGE little-endian FourCC on disk (`39 46 50 52` = `"9FPR"`, `0x52504639` LE).
+    Little,
+    /// Synthetic / big-endian ASCII FourCC on disk (`52 50 46 39` = `"RPF9"`).
+    Big,
+}
+
+impl fmt::Display for RpfMagicEndian {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RpfMagicEndian::Little => write!(f, "little-endian"),
+            RpfMagicEndian::Big => write!(f, "big-endian"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpfVersion {
@@ -44,6 +70,8 @@ impl fmt::Display for RpfVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpfHeader {
     pub version: RpfVersion,
+    pub magic_bytes: [u8; 4],
+    pub magic_endian: RpfMagicEndian,
     pub entry_count: u32,
     pub names_size: u32,
     pub encryption_tag: u32,
@@ -67,10 +95,16 @@ impl RpfHeader {
 
     /// Formats a sanitized, metadata-only summary without ever dumping archive bytes.
     pub fn format_summary(&self) -> String {
+        let magic_ascii: String = self
+            .magic_bytes
+            .iter()
+            .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+            .collect();
         format!(
             concat!(
                 "{} Archive Header\n",
                 "  Version:          {}\n",
+                "  Magic:            \"{}\" ({:02X} {:02X} {:02X} {:02X}, {})\n",
                 "  File Size:        {} bytes\n",
                 "  Entry Count:      {}\n",
                 "  Names Size:       {} bytes\n",
@@ -81,6 +115,12 @@ impl RpfHeader {
             ),
             self.version,
             self.version,
+            magic_ascii,
+            self.magic_bytes[0],
+            self.magic_bytes[1],
+            self.magic_bytes[2],
+            self.magic_bytes[3],
+            self.magic_endian,
             self.total_size,
             self.entry_count,
             self.names_size,
@@ -123,7 +163,7 @@ impl fmt::Display for RpfError {
             ),
             RpfError::InvalidMagic(magic) => write!(
                 f,
-                "invalid RPF magic bytes: {:02X} {:02X} {:02X} {:02X} (expected RPF9)",
+                "invalid RPF magic bytes: {:02X} {:02X} {:02X} {:02X} (expected 9FPR / RPF9)",
                 magic[0], magic[1], magic[2], magic[3]
             ),
             RpfError::SizeOverflow => {
@@ -155,15 +195,23 @@ impl From<io::Error> for RpfError {
     }
 }
 
-fn detect_rpf_version(magic: [u8; 4]) -> Result<RpfVersion, RpfError> {
-    if magic == RPF9_MAGIC {
-        Ok(RpfVersion::Rpf9)
+fn detect_rpf_version(magic: [u8; 4]) -> Result<(RpfVersion, RpfMagicEndian), RpfError> {
+    if magic == RPF9_MAGIC_LE {
+        Ok((RpfVersion::Rpf9, RpfMagicEndian::Little))
+    } else if magic == RPF8_MAGIC_LE {
+        Ok((RpfVersion::Rpf8, RpfMagicEndian::Little))
+    } else if magic == RPF7_MAGIC_LE {
+        Ok((RpfVersion::Rpf7, RpfMagicEndian::Little))
+    } else if magic[1..4] == *b"FPR" && magic[0].is_ascii_alphanumeric() {
+        Ok((RpfVersion::Other(magic[0]), RpfMagicEndian::Little))
+    } else if magic == RPF9_MAGIC {
+        Ok((RpfVersion::Rpf9, RpfMagicEndian::Big))
     } else if magic == RPF8_MAGIC {
-        Ok(RpfVersion::Rpf8)
+        Ok((RpfVersion::Rpf8, RpfMagicEndian::Big))
     } else if magic == RPF7_MAGIC {
-        Ok(RpfVersion::Rpf7)
+        Ok((RpfVersion::Rpf7, RpfMagicEndian::Big))
     } else if magic[0..3] == *b"RPF" && magic[3].is_ascii_alphanumeric() {
-        Ok(RpfVersion::Other(magic[3]))
+        Ok((RpfVersion::Other(magic[3]), RpfMagicEndian::Big))
     } else {
         Err(RpfError::InvalidMagic(magic))
     }
@@ -180,9 +228,9 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
 
 /// Inspects an RPF9 header from an in-memory prefix slice and known total archive size.
 ///
-/// Validates the magic version (`RPF9` only; `RPF8`/`RPF7`/other `RPF*` return
-/// [`RpfError::UnsupportedVersion`]) and checks that declared TOC/name/metadata sizes
-/// fit within `total_size` using checked arithmetic.
+/// Validates the magic version (`9FPR` / `0x52504639` LE and synthetic `RPF9` BE only;
+/// `RPF8`/`8FPR`, `RPF7`/`7FPR`, and other `RPF*`/`*FPR` return [`RpfError::UnsupportedVersion`])
+/// and checks that declared TOC/name/metadata sizes fit within `total_size` using checked arithmetic.
 pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHeader, RpfError> {
     if header_bytes.len() < 4 {
         return Err(RpfError::TruncatedHeader {
@@ -197,7 +245,7 @@ pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHead
         header_bytes[2],
         header_bytes[3],
     ];
-    let version = detect_rpf_version(magic)?;
+    let (version, magic_endian) = detect_rpf_version(magic)?;
     if version != RpfVersion::Rpf9 {
         return Err(RpfError::UnsupportedVersion {
             found: version,
@@ -243,6 +291,8 @@ pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHead
 
     Ok(RpfHeader {
         version,
+        magic_bytes: magic,
+        magic_endian,
         entry_count,
         names_size,
         encryption_tag,
@@ -420,6 +470,8 @@ mod tests {
         let parsed = inspect_rpf_bytes(&header, total_size).unwrap();
 
         assert_eq!(parsed.version, RpfVersion::Rpf9);
+        assert_eq!(parsed.magic_bytes, RPF9_MAGIC);
+        assert_eq!(parsed.magic_endian, RpfMagicEndian::Big);
         assert_eq!(parsed.entry_count, 128);
         assert_eq!(parsed.names_size, 4096);
         assert_eq!(parsed.encryption_tag, 0x4E45_504F);
@@ -431,6 +483,7 @@ mod tests {
 
         let summary = parsed.format_summary();
         assert!(summary.contains("RPF9"));
+        assert!(summary.contains("52 50 46 39, big-endian"));
         assert!(summary.contains("128"));
         assert!(summary.contains("4096 bytes"));
         assert!(summary.contains("1024 bytes"));
@@ -439,29 +492,101 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rpf8_and_rpf7_with_clear_version_error() {
-        let rpf8 = make_rpf_header(RPF8_MAGIC, 10, 128, 0, 0, 0);
-        let err8 = inspect_rpf_bytes(&rpf8, 4096).unwrap_err();
-        match err8 {
-            RpfError::UnsupportedVersion { found, expected } => {
-                assert_eq!(found, RpfVersion::Rpf8);
-                assert_eq!(expected, RpfVersion::Rpf9);
-            }
-            other => panic!("expected UnsupportedVersion(Rpf8), got {other:?}"),
-        }
-        assert!(err8.to_string().contains("RPF8"));
-        assert!(err8.to_string().contains("RPF9"));
+    fn parses_real_little_endian_9fpr_rpf9_header_and_summary() {
+        assert_eq!(RPF9_MAGIC_LE, [0x39, 0x46, 0x50, 0x52]);
+        assert_eq!(u32::from_le_bytes(RPF9_MAGIC_LE), RPF9_MAGIC_U32);
+        assert_eq!(RPF9_MAGIC_U32.to_le_bytes(), *b"9FPR");
 
-        let rpf7 = make_rpf_header(RPF7_MAGIC, 10, 128, 0, 0, 0);
-        let err7 = inspect_rpf_bytes(&rpf7, 4096).unwrap_err();
-        match err7 {
-            RpfError::UnsupportedVersion { found, expected } => {
-                assert_eq!(found, RpfVersion::Rpf7);
-                assert_eq!(expected, RpfVersion::Rpf9);
+        let header = make_rpf_header(RPF9_MAGIC_LE, 64, 2048, 0x0FEF_FFFF, 512, 0x0000_0007);
+        let total_size = 8 * 1024 * 1024;
+        let parsed = inspect_rpf_bytes(&header, total_size).unwrap();
+
+        assert_eq!(parsed.version, RpfVersion::Rpf9);
+        assert_eq!(parsed.magic_bytes, [0x39, 0x46, 0x50, 0x52]);
+        assert_eq!(parsed.magic_endian, RpfMagicEndian::Little);
+        assert_eq!(parsed.entry_count, 64);
+        assert_eq!(parsed.names_size, 2048);
+        assert_eq!(parsed.encryption_tag, 0x0FEF_FFFF);
+        assert_eq!(parsed.encryption_label(), "ng");
+        assert_eq!(parsed.metadata_size, 512);
+        assert_eq!(parsed.flags, 0x0000_0007);
+        assert_eq!(parsed.total_size, total_size);
+        assert_eq!(parsed.min_index_bytes, 24 + 64 * 16 + 2048 + 512);
+
+        let summary = parsed.format_summary();
+        assert!(summary.contains("RPF9 Archive Header"));
+        assert!(summary.contains("\"9FPR\" (39 46 50 52, little-endian)"));
+        assert!(summary.contains("0x0FEFFFFF (ng)"));
+    }
+
+    #[test]
+    fn inspects_little_endian_9fpr_rpf_file_without_reading_payload() {
+        let dir = unique_temp_dir("inspect_file_le");
+        let rpf_path = dir.join("appdata_synthetic.rpf");
+
+        let header = make_rpf_header(
+            RPF9_MAGIC_U32.to_le_bytes(),
+            4,
+            128,
+            0x4E45_504F,
+            64,
+            0x0000_0001,
+        );
+        let mut content = Vec::with_capacity(4096);
+        content.extend_from_slice(&header);
+        content.extend_from_slice(&vec![0xBB; 4096 - RPF9_HEADER_SIZE]);
+        fs::write(&rpf_path, &content).unwrap();
+
+        let parsed = inspect_rpf_file(&rpf_path).unwrap();
+        assert_eq!(parsed.version, RpfVersion::Rpf9);
+        assert_eq!(parsed.magic_bytes, RPF9_MAGIC_LE);
+        assert_eq!(parsed.magic_endian, RpfMagicEndian::Little);
+        assert_eq!(parsed.entry_count, 4);
+        assert_eq!(parsed.encryption_label(), "open");
+        assert_eq!(parsed.total_size, 4096);
+        assert!(!parsed.format_summary().contains("BBBB"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_rpf8_and_rpf7_with_clear_version_error() {
+        for magic8 in [RPF8_MAGIC, RPF8_MAGIC_LE] {
+            let rpf8 = make_rpf_header(magic8, 10, 128, 0, 0, 0);
+            let err8 = inspect_rpf_bytes(&rpf8, 4096).unwrap_err();
+            match err8 {
+                RpfError::UnsupportedVersion { found, expected } => {
+                    assert_eq!(found, RpfVersion::Rpf8);
+                    assert_eq!(expected, RpfVersion::Rpf9);
+                }
+                other => panic!("expected UnsupportedVersion(Rpf8), got {other:?}"),
             }
-            other => panic!("expected UnsupportedVersion(Rpf7), got {other:?}"),
+            assert!(err8.to_string().contains("RPF8"));
+            assert!(err8.to_string().contains("RPF9"));
         }
-        assert!(err7.to_string().contains("RPF7"));
+
+        for magic7 in [RPF7_MAGIC, RPF7_MAGIC_LE] {
+            let rpf7 = make_rpf_header(magic7, 10, 128, 0, 0, 0);
+            let err7 = inspect_rpf_bytes(&rpf7, 4096).unwrap_err();
+            match err7 {
+                RpfError::UnsupportedVersion { found, expected } => {
+                    assert_eq!(found, RpfVersion::Rpf7);
+                    assert_eq!(expected, RpfVersion::Rpf9);
+                }
+                other => panic!("expected UnsupportedVersion(Rpf7), got {other:?}"),
+            }
+            assert!(err7.to_string().contains("RPF7"));
+        }
+
+        let rpf6_le = make_rpf_header(*b"6FPR", 10, 128, 0, 0, 0);
+        let err6 = inspect_rpf_bytes(&rpf6_le, 4096).unwrap_err();
+        assert!(matches!(
+            err6,
+            RpfError::UnsupportedVersion {
+                found: RpfVersion::Other(b'6'),
+                expected: RpfVersion::Rpf9,
+            }
+        ));
     }
 
     #[test]
@@ -470,6 +595,10 @@ mod tests {
         let err = inspect_rpf_bytes(&bad, 1024).unwrap_err();
         assert!(matches!(err, RpfError::InvalidMagic([0x50, 0x4B, 0x03, 0x04])));
         assert!(err.to_string().contains("invalid RPF magic"));
+
+        let near_miss = make_rpf_header(*b"9FPX", 0, 0, 0, 0, 0);
+        let near_err = inspect_rpf_bytes(&near_miss, 1024).unwrap_err();
+        assert!(matches!(near_err, RpfError::InvalidMagic([0x39, 0x46, 0x50, 0x58])));
     }
 
     #[test]
@@ -477,6 +606,15 @@ mod tests {
         let short_err = inspect_rpf_bytes(b"RPF9\x01\x00\x00\x00", 8).unwrap_err();
         assert!(matches!(
             short_err,
+            RpfError::TruncatedHeader {
+                actual: 8,
+                expected: RPF9_HEADER_SIZE
+            }
+        ));
+
+        let short_le_err = inspect_rpf_bytes(b"9FPR\x01\x00\x00\x00", 8).unwrap_err();
+        assert!(matches!(
+            short_le_err,
             RpfError::TruncatedHeader {
                 actual: 8,
                 expected: RPF9_HEADER_SIZE

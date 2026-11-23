@@ -12,8 +12,20 @@ const RPF9_MAGIC = 'RPF9';
 const RPF8_MAGIC = 'RPF8';
 const RPF7_MAGIC = 'RPF7';
 
+// Big-endian / synthetic ASCII FourCC magics alongside real RAGE little-endian FourCC magics
+// (0x52504639 LE = [0x39, 0x46, 0x50, 0x52] = "9FPR", etc.).
+const RPF9_MAGIC_BE = RPF9_MAGIC;
+const RPF8_MAGIC_BE = RPF8_MAGIC;
+const RPF7_MAGIC_BE = RPF7_MAGIC;
+const RPF9_MAGIC_LE = '9FPR';
+const RPF8_MAGIC_LE = '8FPR';
+const RPF7_MAGIC_LE = '7FPR';
+const RPF9_MAGIC_U32 = 0x52504639;
+const RPF8_MAGIC_U32 = 0x52504638;
+const RPF7_MAGIC_U32 = 0x52504637;
+
 // Header layout matching tools/src/rpf9.rs (24 bytes, little-endian):
-//   0x00..0x04: magic ("RPF9" / "RPF8" / "RPF7")
+//   0x00..0x04: magic ("9FPR"/"8FPR"/"7FPR" LE or synthetic "RPF9"/"RPF8"/"RPF7" BE)
 //   0x04..0x08: entryCount (u32 LE)
 //   0x08..0x0C: namesSize (u32 LE)
 //   0x0C..0x10: encryptionTag (u32 LE)
@@ -131,11 +143,61 @@ function detectMagicVersion(u8) {
   const b2 = u8[2];
   const b3 = u8[3];
 
-  // 'R'=0x52, 'P'=0x50, 'F'=0x46
+  // Real RAGE little-endian FourCC: '9'/'8'/'7', 'F'=0x46, 'P'=0x50, 'R'=0x52
+  // (e.g. u32 LE 0x52504639 -> [0x39, 0x46, 0x50, 0x52] = "9FPR").
+  if (b1 === 0x46 && b2 === 0x50 && b3 === 0x52) {
+    if (b0 === 0x39) {
+      return {
+        magic: RPF9_MAGIC,
+        rawMagic: RPF9_MAGIC_LE,
+        magicEndian: 'little',
+        version: 9,
+      };
+    }
+    if (b0 === 0x38) {
+      return {
+        magic: RPF8_MAGIC,
+        rawMagic: RPF8_MAGIC_LE,
+        magicEndian: 'little',
+        version: 8,
+      };
+    }
+    if (b0 === 0x37) {
+      return {
+        magic: RPF7_MAGIC,
+        rawMagic: RPF7_MAGIC_LE,
+        magicEndian: 'little',
+        version: 7,
+      };
+    }
+  }
+
+  // Synthetic / big-endian ASCII FourCC: 'R'=0x52, 'P'=0x50, 'F'=0x46, '9'/'8'/'7'.
   if (b0 === 0x52 && b1 === 0x50 && b2 === 0x46) {
-    if (b3 === 0x39) return { magic: RPF9_MAGIC, version: 9 };
-    if (b3 === 0x38) return { magic: RPF8_MAGIC, version: 8 };
-    if (b3 === 0x37) return { magic: RPF7_MAGIC, version: 7 };
+    if (b3 === 0x39) {
+      return {
+        magic: RPF9_MAGIC,
+        rawMagic: RPF9_MAGIC_BE,
+        magicEndian: 'big',
+        version: 9,
+      };
+    }
+    if (b3 === 0x38) {
+      return {
+        magic: RPF8_MAGIC,
+        rawMagic: RPF8_MAGIC_BE,
+        magicEndian: 'big',
+        version: 8,
+      };
+    }
+    if (b3 === 0x37) {
+      return {
+        magic: RPF7_MAGIC,
+        rawMagic: RPF7_MAGIC_BE,
+        magicEndian: 'big',
+        version: 7,
+      };
+    }
   }
 
   const hex = [b0, b1, b2, b3]
@@ -143,7 +205,7 @@ function detectMagicVersion(u8) {
     .join(' ');
   throw new RpfFormatError(
     'INVALID_MAGIC',
-    `Invalid RPF magic bytes: ${hex} (expected RPF7, RPF8, or RPF9)`,
+    `Invalid RPF magic bytes: ${hex} (expected 9FPR/8FPR/7FPR or RPF9/RPF8/RPF7)`,
     { magicBytes: [b0, b1, b2, b3] }
   );
 }
@@ -182,7 +244,7 @@ function parseRpfHeader(bytes, totalSize = null) {
     );
   }
 
-  const { magic, version } = detectMagicVersion(u8);
+  const { magic, rawMagic, magicEndian, version } = detectMagicVersion(u8);
 
   if (u8.byteLength < RPF9_HEADER_SIZE) {
     throw new RpfFormatError(
@@ -235,6 +297,8 @@ function parseRpfHeader(bytes, totalSize = null) {
 
   return {
     magic,
+    rawMagic,
+    magicEndian,
     version,
     headerSize: RPF9_HEADER_SIZE,
     entryCount,
@@ -1055,7 +1119,14 @@ class RpfVfsMountTable {
  */
 function buildSyntheticRpf9Buffer(files = [], options = {}) {
   const magic = options.magic || RPF9_MAGIC;
-  if (magic !== RPF9_MAGIC && magic !== RPF8_MAGIC && magic !== RPF7_MAGIC) {
+  if (
+    magic !== RPF9_MAGIC &&
+    magic !== RPF8_MAGIC &&
+    magic !== RPF7_MAGIC &&
+    magic !== RPF9_MAGIC_LE &&
+    magic !== RPF8_MAGIC_LE &&
+    magic !== RPF7_MAGIC_LE
+  ) {
     throw new RpfFormatError('INVALID_MAGIC', `Unsupported synthetic RPF magic: ${magic}`);
   }
   const encryptionTag = (options.encryptionTag ?? RPF_ENCRYPTION_NONE) >>> 0;
@@ -1310,6 +1381,15 @@ const exportedApi = {
   RPF9_MAGIC,
   RPF8_MAGIC,
   RPF7_MAGIC,
+  RPF9_MAGIC_BE,
+  RPF8_MAGIC_BE,
+  RPF7_MAGIC_BE,
+  RPF9_MAGIC_LE,
+  RPF8_MAGIC_LE,
+  RPF7_MAGIC_LE,
+  RPF9_MAGIC_U32,
+  RPF8_MAGIC_U32,
+  RPF7_MAGIC_U32,
   RPF9_HEADER_SIZE,
   RPF9_ENTRY_STRIDE,
   RPF_SECTOR_SIZE,
