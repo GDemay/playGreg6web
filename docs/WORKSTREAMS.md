@@ -70,8 +70,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse recorded `playgta6` GPU command ring byte streams into human-readable/JSON frame traces with opcode histograms, byte counts, and malformed-packet diagnostics for debugging M3 frames.
 - [ ] **G9 — WebGPU `OffscreenCanvas` Swapchain, Depth-Stencil & Resize Manager** — `IN PROGRESS` (#54, @MarcBlattmann) *(no game files required — disjoint files `web/workers/wgpu_swapchain.js`, `tests/test_wgpu_swapchain.mjs`)*
   - Manage `OffscreenCanvas` WebGPU context config, DPR-aware dynamic resize, `depth24plus`/`depth32float` depth-stencil attachment lifecycle, `device.lost` recovery, and frame-pacing telemetry.
-- [ ] **G10 — BCn / Texture Format & Mip-Chain Upload Helpers** *(unclaimed; no game files required — disjoint files `web/workers/texture_formats.js`, `tests/test_texture_formats.mjs`)*
-  - Map DXGI/Xbox texture formats (`BC1`–`BC7`, `RGBA8`, `RGBA16F`, depth/stencil) to WebGPU `GPUTextureFormat`, compute 256-byte-aligned `bytesPerRow` + mip dimensions, and provide CPU fallback BC7/DXT decompression when WebGPU `texture-compression-bc` is absent.
+- [ ] **G10 — BCn / Texture Format & Mip-Chain Upload Helpers** — `IN PROGRESS` (#57, @MarcBlattmann) *(no game files required — disjoint files `web/workers/texture_formats.js`, `tests/test_texture_formats.mjs`)*
+  - Map DXGI/Xbox texture formats (`BC1`–`BC7`, `RGBA8`, `RGBA16F`, depth/stencil) to WebGPU `GPUTextureFormat`, compute 256-byte-aligned `bytesPerRow` + mip dimensions, and provide CPU fallback BC1/BC3 decompression when WebGPU `texture-compression-bc` is absent.
+- [ ] **G11 — WebGPU Pipeline & BindGroupLayout Cache Manager (`web/workers/pipeline_cache.js`)** *(unclaimed; no game files required — disjoint files `web/workers/pipeline_cache.js`, `tests/test_pipeline_cache.mjs`)*
+  - Deduplicate `GPURenderPipeline` and `GPUComputePipeline` creation in JS by descriptor hash, support async `createRenderPipelineAsync` warm-up, and consume shader reflection metadata (`S6`).
 
 ---
 
@@ -84,7 +86,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Pack lowered `.wgsl` files into compact `.wgsl.pack` bundles (like `playgta5`) for fast loading in `wgpu_worker.js`.
 - [x] **S3 — WebGPU Compatibility Passes** — `DONE` (PR #25, closes #11) *(needs SPIR-V failure report from S1)*
   - Implement SPIR-V/WGSL rewrite passes for unsupported WebGPU features (bindless indexing limits, subgroup/wave64 fallbacks, mesh-compute lowering).
-- [ ] **S4 — DXBC/DXIL Container Inspector & Naga IR Push-Constant/BindGroup Lowering** — `IN PROGRESS` (#27, @MarcBlattmann) *(no game files required)*
+- [x] **S4 — DXBC/DXIL Container Inspector & Naga IR Push-Constant/BindGroup Lowering** — `DONE` (PR #56, closes #27) *(no game files required)*
   - Add pure-Rust DXBC/DXIL container parser (`shaders/src/dxbc.rs`) and Naga IR lowering passes (`shaders/src/lower.rs`: push constants → uniform buffer, >4 bind-group remapping) + `inspect-dxbc` CLI.
 - [ ] **S5 — Wave64/Subgroup Emulation & Mesh-Compute WGSL Lowering Library** — `IN PROGRESS` (#46, @Timon-ok) *(no game files required — wait for S4 or keep disjoint in `shaders/src/wave_emul.rs`)*
   - Provide reusable WGSL workgroup-shared-memory emulation helpers for RDNA2 Wave64 ballot/shuffle/prefix-sum ops and indirect compute-driven meshlet culling/draw emission when WebGPU `subgroups` is unavailable.
@@ -110,7 +112,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add read-only `scan` command detecting completed vs downloading files (`.!qB`/`.part`/sparse) and `--skip-incomplete` for `manifest`/`bootset`.
 - [x] **W7 — Local Server Hardening (`/api/status`, ETag/If-Range) & Browser Diagnostics HUD (`server/`, `web/index.html`)** — `DONE` (PR #29, closes #20) *(no game files required)*
   - Add ETag/`If-Range`/`HEAD` + sanitized `/api/status` to `server/serve_local.py` and upgrade `web/index.html` with a live Wasm64/WebGPU/SAB HUD.
-- [ ] **W8 — Multi-Voice Audio Mixer & PCM/ADPCM Voice Streamer** — `IN PROGRESS` (#31, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_mixer.js`, `tests/test_audio_mixer.mjs`)*
+- [x] **W8 — Multi-Voice Audio Mixer & PCM/ADPCM Voice Streamer** — `DONE` (PR #51, closes #31) *(no game files required — disjoint files `web/workers/audio_mixer.js`, `tests/test_audio_mixer.mjs`)*
   - Implement a lock-free multi-voice mixer (3D pan/gain, sample-rate resampling, ADPCM/PCM decoding, soft-clip limiter) that feeds `audio_worker.js`'s SAB ring buffer for XAudio2/XMA2 voice emulation.
 - [x] **W9 — Headless End-to-End Integration Harness (Local Server ↔ Workers ↔ SAB ↔ WebGPU Mock)** — `DONE` (PR #48, closes #33) *(no game files required — disjoint file `tests/test_e2e_pipeline.mjs`)*
   - Spin up `server/serve_local.py` on an ephemeral port in a Node test, exercise real HTTP `206` Range + `ETag`/`If-Range` reads through `RangeCache` → `WgslPackCache` → `InputBridge` → `GpuRingBuffer` → `WgpuCommandProcessor` end-to-end.
@@ -120,7 +122,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Fetch only RPF header + TOC + requested sub-file byte ranges via `RangeCache`, parse directory/file entries & names table, resolve virtual paths, and stream sub-file chunks on demand.
 - [ ] **W12 — `AudioWorklet` SAB Ring Processor & Main-Thread WebAudio Engine** — `IN PROGRESS` (#53, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_worklet_processor.js`, `web/audio/audio_engine.js`, `tests/test_audio_engine.mjs`)*
   - Zero-GC `AudioWorkletProcessor` pulling 128-frame stereo blocks from `AudioRingBuffer` SAB + main-thread `AudioEngine` (`AudioContext` bootstrap, user-gesture unlock, volume/mute, underrun telemetry).
-- [ ] **W13 — Local Preflight & Milestone Readiness Checker CLI** *(unclaimed; no game files required — disjoint files `tools/preflight.py`, `tests/test_preflight.py`)*
+- [ ] **W13 — Local Preflight & Milestone Readiness Checker CLI** — `IN PROGRESS` (#58, @MarcBlattmann) *(no game files required — disjoint files `tools/preflight.py`, `tests/test_preflight.py`)*
   - Single-command `python tools/preflight.py [--json]` verifying toolchains, `.env` / `GTA6_GAME_DIR`, COOP/COEP server sanity, `web/dist/runtime.wasm`, `data-manifest.json`, `bootset.json`, and `.wgsl.pack` readiness.
 - [ ] **W14 — OPFS Cache Quota Inspector & Browser Storage Manager** *(unclaimed; no game files required — disjoint files `web/storage/storage_manager.js`, `tests/test_storage_manager.mjs`)*
   - Query `navigator.storage.estimate()`, request persistent storage, inspect/clear OPFS range cache and IndexedDB `/userdata` slots cleanly from the browser HUD.
+- [ ] **W15 — Frame Telemetry Ring & Performance Profiler (`web/telemetry/perf_monitor.js`)** *(unclaimed; no game files required — disjoint files `web/telemetry/perf_monitor.js`, `tests/test_perf_monitor.mjs`)*
+  - Lock-free rolling frame-time, p95/p99 latency, HTTP Range throughput, GPU packet rate, and audio underrun aggregator feeding `window.playgta6Hud.updateMetrics()`.
