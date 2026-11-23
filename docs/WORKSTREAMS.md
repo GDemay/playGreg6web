@@ -14,7 +14,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [x] **R1 — PE Parser & Import Dumper** — `DONE` (PR #21, closes #1) *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
   - Parse PE64 headers, sections, exports, TLS callbacks, and import tables (`object` / `goblin` crate).
   - Emit a sanitized symbol-only report (`docs/imports_required.md` — DLL + function names only, zero game bytes).
-- [ ] **R2 — x86-64 Decoder & Function Discovery** — `IN PROGRESS` (#13, @Timon-ok) *(no game files required for unit tests)*
+- [x] **R2 — x86-64 Decoder & Function Discovery** — `DONE` (PR #37, closes #13) *(no game files required for unit tests)*
   - Integrate `iced-x86` to decode `.text` blocks, follow calls/jumps, and build a CFG + relocation map.
 - [ ] **R3 — LLVM IR → Wasm64 Lifter Prototype** — `IN PROGRESS` (#14, @Timon-ok) *(no game files required)*
   - Lift small synthetic x86-64 test functions (arithmetic, branches, memory loads/stores, Win64 ABI calls) to LLVM IR and compile to `wasm64`.
