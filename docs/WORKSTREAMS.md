@@ -30,7 +30,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 2: Xbox / Win32 OS Shims (`runtime/os/`, C++20 + Emscripten)
 **Goal:** Reimplement console OS APIs backed by browser workers, pthreads, and HTTPFS.
 
-- [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** — `IN PROGRESS` (#23, @MarcBlattmann) *(no game files required)*
+- [x] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** — `DONE` (PR #35, closes #23) *(no game files required)*
   - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`, `host_httpfs_*`) and SAB HTTPFS mailbox consumer in `io_worker.js`.
 - [x] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
@@ -38,7 +38,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
 - [x] **O4 — `GameInput` & `/userdata` Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
-- [ ] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `IN PROGRESS` (#16, @MarcBlattmann) *(no game files required)*
+- [x] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `DONE` (PR #36, closes #16) *(no game files required)*
   - Expose C-ABI Win32 & Xbox GDK imports (`XGameRuntimeInitialize`, `XTaskQueue*`, `XUser*` offline stub, `VirtualAlloc`/`Protect`/`Free`, `Tls*`, `SRWLock*`, `CriticalSection`/`Event`, `CreateFileW`/`ReadFile`/`SetFilePointerEx`/`GetFileSizeEx`/`CloseHandle`, `QueryPerformanceCounter`/`Frequency`) backed by our OS shims.
 - [ ] **O6 — Win32 Synchronization & Thread Pool Shims** *(unclaimed; no game files required — disjoint files `runtime/os/win32_sync.{h,cpp}`, `tests/test_win32_sync.cpp`)*
   - Implement `CreateSemaphoreW`/`ReleaseSemaphore`, `CreateMutexW`/`ReleaseMutex`, `WaitForMultipleObjects` (`bWaitAll` true/false), `SleepConditionVariableSRW`/`WakeConditionVariable`/`WakeAllConditionVariable`, and `CreateThread`/`SetThreadAffinityMask`/`GetCurrentThreadId`.
