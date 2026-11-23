@@ -135,6 +135,7 @@ fn mxcsr_policy_executes() {
     }
     let store = CODE_BASE;
     let load = CODE_BASE + 0x100;
+    let outer = CODE_BASE + 0x200;
     let program = Program::new()
         .asm(store, |a| {
             a.stmxcsr(dword_ptr(rcx))?;
@@ -146,7 +147,17 @@ fn mxcsr_policy_executes() {
         .asm(load, |a| {
             a.ldmxcsr(dword_ptr(rcx))?;
             a.vldmxcsr(dword_ptr(rcx))?;
-            a.mov(eax, 1)?;
+            a.stmxcsr(dword_ptr(rcx + 4))?;
+            a.mov(eax, dword_ptr(rcx + 4))?;
+            a.ret()
+        })
+        // MXCSR lives in the guest state: a value loaded by a callee is seen by its caller.
+        .asm(outer, |a| {
+            a.sub(rsp, 0x28)?;
+            a.call(load)?;
+            a.add(rsp, 0x28)?;
+            a.vstmxcsr(dword_ptr(rcx + 8))?;
+            a.mov(edx, dword_ptr(rcx + 8))?;
             a.ret()
         });
     let functions = program.discover();
@@ -162,16 +173,21 @@ fn mxcsr_policy_executes() {
         0x1F80u32, 0x9FC0, 0x1F00, 0x0000, 0x3F80, 0x5F80, 0x7F80, 0x1_1F80,
     ];
     let mut cases = vec![with(store, 0)];
-    cases.extend(values.iter().map(|&v| with(load, v)));
+    cases.extend(values.iter().map(|&v| with(outer, v)));
     let o = run(&built, &cases);
     assert!(o[0].error.is_empty(), "{}", o[0].error);
-    assert_eq!(o[0].regs[RAX], 0x1F80, "stmxcsr reports the default MXCSR");
-    assert_eq!(o[0].regs[RDX], 0x1F80, "vstmxcsr reports the default MXCSR");
+    assert_eq!(o[0].regs[RAX], 0x1F80, "stmxcsr of a new thread's MXCSR");
+    assert_eq!(o[0].regs[RDX], 0x1F80, "vstmxcsr of a new thread's MXCSR");
     for (v, out) in values.iter().zip(&o[1..]) {
         if v & 0xFFFF_6000 == 0 {
-            // FTZ/DAZ and exception masks are accepted (and ignored).
+            // FTZ/DAZ and exception masks are stored (and round-trip) but not modelled.
             assert!(out.error.is_empty(), "{v:#x}: {}", out.error);
-            assert_eq!(out.regs[RAX], 1);
+            assert_eq!(out.regs[RAX], u64::from(*v), "stmxcsr after ldmxcsr");
+            assert_eq!(
+                out.regs[RDX],
+                u64::from(*v),
+                "the caller sees the callee's MXCSR"
+            );
         } else {
             // Non-default rounding modes and reserved bits fail loudly.
             assert_eq!(

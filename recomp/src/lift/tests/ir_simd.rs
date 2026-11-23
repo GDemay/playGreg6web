@@ -55,6 +55,45 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
 }
 
 #[test]
+fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
+    let func = asm_function(0x1000, |a| {
+        a.addps(xmm0, xmm1)?; // legacy SSE: upper halves untouched
+        a.vaddps(ymm2, ymm3, ymm4)?; // 256-bit: both halves
+        a.vmulps(xmm5, xmm5, xmm5)?; // VEX-128: zeroes ymm5's upper half
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
+    for idx in [2, 3, 4, 5] {
+        assert!(
+            ir.contains(&format!(
+                "  %ymmh{idx} = alloca <2 x i64>
+"
+            )),
+            "{ir}"
+        );
+        // entry load + exit store of state field 6 (`ymm_hi`)
+        assert_eq!(
+            ir.matches(&format!(
+                "ptr %state, i64 0, i32 6, i64 {idx}
+"
+            ))
+            .count(),
+            2,
+            "{ir}"
+        );
+    }
+    for idx in [0, 1] {
+        assert!(!ir.contains(&format!("%ymmh{idx} =")), "{ir}");
+    }
+    assert!(
+        ir.contains("store <2 x i64> zeroinitializer, ptr %ymmh5"),
+        "{ir}"
+    );
+}
+
+#[test]
 fn lifted_functions_require_wasm_simd() {
     let func = asm_function(0x1000, |a| {
         a.sqrtps(xmm0, xmm1)?;
@@ -94,16 +133,12 @@ fn lifted_functions_require_wasm_simd() {
 fn unsupported_vector_forms_trap_with_precise_reasons() {
     let cases: Vec<(Vec<u8>, &str)> = vec![
         (
-            super::assemble(0x1000, |a| a.vaddps(ymm0, ymm1, ymm2)),
-            "256-bit AVX form",
+            super::assemble(0x1000, |a| a.vmpsadbw(ymm0, ymm1, ymm2, 0)),
+            "256-bit form of Vmpsadbw is not supported yet",
         ),
         (
-            super::assemble(0x1000, |a| a.vmovups(ymm0, ymmword_ptr(rax))),
-            "256-bit AVX form",
-        ),
-        (
-            super::assemble(0x1000, |a| a.vfmadd213ps(xmm0, xmm1, xmm2)),
-            "Vfmadd213ps is not supported yet",
+            super::assemble(0x1000, |a| a.vfmadd213pd(xmm0, xmm1, xmm2)),
+            "double-precision FMA",
         ),
         (
             vec![0x62, 0xF1, 0x74, 0x08, 0x58, 0xC2], // EVEX vaddps xmm0, xmm1, xmm2
@@ -201,7 +236,7 @@ pub(super) fn random_sse_program(count: usize) -> BTreeMap<u64, cfg::Function> {
                 _ => bytes.extend([
                     0xC4,
                     (r >> 8) as u8 & 0xE3 | 0xE0,
-                    (r >> 16) as u8 & 0x7B,
+                    (r >> 16) as u8 & 0x7F,
                     (r >> 24) as u8,
                 ]),
             }

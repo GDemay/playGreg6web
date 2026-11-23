@@ -9,9 +9,13 @@ mod exec_simd;
 #[cfg(target_arch = "x86_64")]
 mod host_diff;
 #[cfg(target_arch = "x86_64")]
+mod host_diff_avx;
+#[cfg(target_arch = "x86_64")]
 mod host_diff_integer;
 #[cfg(target_arch = "x86_64")]
 mod host_diff_simd;
+#[cfg(target_arch = "x86_64")]
+mod host_diff_simd_int;
 mod ir;
 mod ir_integer;
 mod ir_simd;

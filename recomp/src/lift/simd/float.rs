@@ -62,6 +62,64 @@ fn arith(m: Mnemonic) -> Option<(FOp, Elem, bool)> {
     })
 }
 
+/// Operand order of an FMA3 instruction (`132`, `213`, `231`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FmaOrder {
+    O132,
+    O213,
+    O231,
+}
+
+/// Signs of an FMA3 instruction: `-(x*y)` and `-z` per lane parity, plus lane type and width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fma {
+    order: FmaOrder,
+    /// Negate the product.
+    neg_product: bool,
+    /// Negate the addend in even / odd lanes (`fmaddsub`: even subtract, odd add).
+    neg_addend: [bool; 2],
+    e: Elem,
+    scalar: bool,
+}
+
+fn fma(m: Mnemonic) -> Option<Fma> {
+    use FmaOrder::*;
+    let name = format!("{m:?}");
+    let rest = name.strip_prefix("Vf")?;
+    let (kind, rest) = ["maddsub", "msubadd", "nmadd", "nmsub", "madd", "msub"]
+        .iter()
+        .find_map(|k| rest.strip_prefix(k).map(|r| (*k, r)))?;
+    let (order, suffix) = if let Some(r) = rest.strip_prefix("132") {
+        (O132, r)
+    } else if let Some(r) = rest.strip_prefix("213") {
+        (O213, r)
+    } else {
+        (O231, rest.strip_prefix("231")?)
+    };
+    let (e, scalar) = match suffix {
+        "ps" => (Elem::F32, false),
+        "pd" => (Elem::F64, false),
+        "ss" => (Elem::F32, true),
+        "sd" => (Elem::F64, true),
+        _ => return None,
+    };
+    let (neg_product, neg_addend) = match kind {
+        "madd" => (false, [false, false]),
+        "msub" => (false, [true, true]),
+        "nmadd" => (true, [false, false]),
+        "nmsub" => (true, [true, true]),
+        "maddsub" => (false, [true, false]),
+        _ => (false, [false, true]), // msubadd
+    };
+    Some(Fma {
+        order,
+        neg_product,
+        neg_addend,
+        e,
+        scalar,
+    })
+}
+
 /// LLVM `fcmp` predicate for an SSE/AVX comparison predicate (`imm8[3:0]`; bit 4 only selects
 /// the signalling variant, which makes no difference without exception flags).
 fn predicate(p: u32) -> &'static str {
@@ -93,6 +151,10 @@ impl FunctionLifter<'_> {
         let m = ins.mnemonic();
         if let Some((op, e, scalar)) = arith(m) {
             self.arith(ins, f, op, e, scalar)?;
+            return Ok(true);
+        }
+        if let Some(fma) = fma(m) {
+            self.fma(ins, fma)?;
             return Ok(true);
         }
         match m {
@@ -285,7 +347,7 @@ impl FunctionLifter<'_> {
     }
 
     /// Bitwise logic on 128 bits (`andn` complements the first source).
-    fn logic(&mut self, ins: &Instruction, f: Form, op: &str, not_a: bool) -> R<()> {
+    pub(super) fn logic(&mut self, ins: &Instruction, f: Form, op: &str, not_a: bool) -> R<()> {
         let t = Ty::v(Elem::I64).ir();
         let mut a = self.v128(ins, f.a, Elem::I64)?;
         let b = self.v128(ins, f.b, Elem::I64)?;
@@ -369,7 +431,7 @@ impl FunctionLifter<'_> {
     /// x86 float -> signed int conversion: round half to even (or truncate), and the "integer
     /// indefinite" value `1 << (bits - 1)` for NaN and out-of-range inputs (LLVM's `fptosi` is
     /// poison there, so it is only selected for in-range values).
-    fn float_to_int(&mut self, v: &str, ty: Ty, bits: u32, truncate: bool) -> String {
+    pub(super) fn float_to_int(&mut self, v: &str, ty: Ty, bits: u32, truncate: bool) -> String {
         let t = ty.ir();
         let x = if truncate {
             v.to_string()
@@ -467,5 +529,111 @@ impl FunctionLifter<'_> {
             }
         }
         self.xset(ins.op_register(f.dst), &r, e)
+    }
+
+    /// FMA3: `dst = (+-x) * y + (+-z)` with a single rounding. Operands: 132 `x=op0, y=op2,
+    /// z=op1`; 213 `x=op1, y=op0, z=op2`; 231 `x=op1, y=op2, z=op0`. Scalar forms merge lane 0
+    /// into the destination.
+    fn fma(&mut self, ins: &Instruction, f: Fma) -> R<()> {
+        if f.e == Elem::F64 {
+            return unsupported("double-precision FMA is not supported yet");
+        }
+        let e = f.e;
+        let n = if f.scalar { 1 } else { e.lanes() };
+        let ty = if f.scalar { Ty::s(e) } else { Ty::v(e) };
+        let mut ops = Vec::new();
+        for i in 0..3 {
+            ops.push(if f.scalar {
+                self.low(ins, i, e, 1)?
+            } else {
+                self.v128(ins, i, e)?
+            });
+        }
+        let (x, y, z) = match f.order {
+            FmaOrder::O132 => (&ops[0], &ops[2], &ops[1]),
+            FmaOrder::O213 => (&ops[1], &ops[0], &ops[2]),
+            FmaOrder::O231 => (&ops[1], &ops[2], &ops[0]),
+        };
+        let t = ty.ir();
+        let x = if f.neg_product {
+            self.val(&format!("fneg {t} {x}"))
+        } else {
+            x.clone()
+        };
+        let z = match f.neg_addend {
+            [false, false] => z.clone(),
+            [true, true] => self.val(&format!("fneg {t} {z}")),
+            [neg_even, _] => {
+                let nz = self.val(&format!("fneg {t} {z}"));
+                let idx: Vec<u32> = (0..n)
+                    .map(|l| if (l % 2 == 0) == neg_even { n + l } else { l })
+                    .collect();
+                self.shuffle(z, &nz, e, &idx)
+            }
+        };
+        let r = self.fma32(&x, y, &z, n);
+        if f.scalar {
+            let d = self.v128(ins, 0, e)?;
+            let v = self.insert(&d, e, &r, 0);
+            self.xset(ins.op_register(0), &v, e)
+        } else {
+            self.xset(ins.op_register(0), &r, e)
+        }
+    }
+
+    /// Correctly rounded binary32 `x * y + z` without a hardware FMA: the product is exact in
+    /// binary64, the sum is rounded to odd in binary64 (TwoSum error term), and the final
+    /// rounding to binary32 is then correct (53 >= 2 * 24 + 2).
+    fn fma32(&mut self, x: &str, y: &str, z: &str, n: u32) -> String {
+        let (ft, dt, it, bt) = if n == 1 {
+            (
+                "float".to_string(),
+                "double".to_string(),
+                "i64".to_string(),
+                "i1".to_string(),
+            )
+        } else {
+            (
+                format!("<{n} x float>"),
+                format!("<{n} x double>"),
+                format!("<{n} x i64>"),
+                format!("<{n} x i1>"),
+            )
+        };
+        let dty = Ty::vn(Elem::F64, n);
+        let ity = Ty::vn(Elem::I64, n);
+        let a = self.val(&format!("fpext {ft} {x} to {dt}"));
+        let b = self.val(&format!("fpext {ft} {y} to {dt}"));
+        let c = self.val(&format!("fpext {ft} {z} to {dt}"));
+        let p = self.val(&format!("fmul {dt} {a}, {b}"));
+        let s = self.val(&format!("fadd {dt} {p}, {c}"));
+        // TwoSum: e = (p - (s - bb)) + (c - bb), bb = s - p.
+        let bb = self.val(&format!("fsub {dt} {s}, {p}"));
+        let t1 = self.val(&format!("fsub {dt} {s}, {bb}"));
+        let e1 = self.val(&format!("fsub {dt} {p}, {t1}"));
+        let e2 = self.val(&format!("fsub {dt} {c}, {bb}"));
+        let err = self.val(&format!("fadd {dt} {e1}, {e2}"));
+        let zero = dty.splat(&fconst(0.0));
+        let inexact = self.val(&format!("fcmp one {dt} {err}, {zero}"));
+        let bits = self.val(&format!("bitcast {dt} {s} to {it}"));
+        let lsb = self.val(&format!("and {it} {bits}, {}", ity.splat("1")));
+        let even = self.val(&format!("icmp eq {it} {lsb}, {}", ity.splat("0")));
+        let fix = self.val(&format!("and {bt} {inexact}, {even}"));
+        // Step to the odd neighbour on the side of the exact value.
+        let err_pos = self.val(&format!("fcmp ogt {dt} {err}, {zero}"));
+        let s_neg = self.val(&format!("icmp slt {it} {bits}, {}", ity.splat("0")));
+        let away = self.val(&format!("xor {bt} {err_pos}, {s_neg}"));
+        let step = self.val(&format!(
+            "select {bt} {away}, {it} {}, {it} {}",
+            ity.splat("1"),
+            ity.splat("-1")
+        ));
+        let step = self.val(&format!(
+            "select {bt} {fix}, {it} {step}, {it} {}",
+            ity.splat("0")
+        ));
+        let odd = self.val(&format!("add {it} {bits}, {step}"));
+        let odd = self.val(&format!("bitcast {it} {odd} to {dt}"));
+        self.val(&format!("fptrunc {dt} {odd} to {ft}"))
     }
 }
