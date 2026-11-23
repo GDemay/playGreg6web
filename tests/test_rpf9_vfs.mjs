@@ -18,6 +18,13 @@ const {
   RPF9_MAGIC,
   RPF8_MAGIC,
   RPF7_MAGIC,
+  RPF9_MAGIC_BE,
+  RPF8_MAGIC_BE,
+  RPF7_MAGIC_BE,
+  RPF9_MAGIC_LE,
+  RPF8_MAGIC_LE,
+  RPF7_MAGIC_LE,
+  RPF9_MAGIC_U32,
   RPF9_HEADER_SIZE,
   RPF9_ENTRY_STRIDE,
   RPF_SECTOR_SIZE,
@@ -661,6 +668,124 @@ test('RpfVfsMountTable mounts multiple archives with later-mount override preced
   assert.equal(table.listMounts().length, 3);
 });
 
+test('parseRpfHeader accepts real little-endian 9FPR/8FPR/7FPR magics (0x52504639 LE) alongside BE magics', () => {
+  // Construct real little-endian 0x52504639 magic via DataView u32 LE -> [0x39, 0x46, 0x50, 0x52] ("9FPR").
+  const le9Raw = new Uint8Array(RPF9_HEADER_SIZE);
+  const le9View = new DataView(le9Raw.buffer);
+  le9View.setUint32(0, RPF9_MAGIC_U32, true);
+  le9View.setUint32(4, 64, true);
+  le9View.setUint32(8, 2048, true);
+  le9View.setUint32(12, RPF_ENCRYPTION_OPEN, true);
+  le9View.setUint32(16, 512, true);
+  le9View.setUint32(20, 0x00000005, true);
+
+  assert.deepEqual(Array.from(le9Raw.subarray(0, 4)), [0x39, 0x46, 0x50, 0x52]);
+
+  const parsedLe9 = parseRpfHeader(le9Raw, 8 * 1024 * 1024);
+  assert.equal(parsedLe9.magic, RPF9_MAGIC);
+  assert.equal(parsedLe9.rawMagic, RPF9_MAGIC_LE);
+  assert.equal(parsedLe9.magicEndian, 'little');
+  assert.equal(parsedLe9.version, 9);
+  assert.equal(parsedLe9.entryCount, 64);
+  assert.equal(parsedLe9.namesSize, 2048);
+  assert.equal(parsedLe9.encryptionLabel, 'open');
+  assert.equal(parsedLe9.metadataSize, 512);
+  assert.equal(parsedLe9.flags, 0x00000005);
+
+  for (const [rawMagic, expectedMagic, expectedVersion, expectedEndian] of [
+    [RPF9_MAGIC_LE, RPF9_MAGIC, 9, 'little'],
+    [RPF8_MAGIC_LE, RPF8_MAGIC, 8, 'little'],
+    [RPF7_MAGIC_LE, RPF7_MAGIC, 7, 'little'],
+    [RPF9_MAGIC_BE, RPF9_MAGIC, 9, 'big'],
+    [RPF8_MAGIC_BE, RPF8_MAGIC, 8, 'big'],
+    [RPF7_MAGIC_BE, RPF7_MAGIC, 7, 'big'],
+  ]) {
+    const parsed = parseRpfHeader(makeHeaderBytes({ magic: rawMagic, entryCount: 2, namesSize: 16 }), 4096);
+    assert.equal(parsed.magic, expectedMagic);
+    assert.equal(parsed.rawMagic, rawMagic);
+    assert.equal(parsed.magicEndian, expectedEndian);
+    assert.equal(parsed.version, expectedVersion);
+  }
+
+  // Unsupported LE version "6FPR" and truncated "9FPR" header are cleanly rejected.
+  assert.throws(
+    () => parseRpfHeader(makeHeaderBytes({ magic: '6FPR' }), 1024),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_MAGIC'
+  );
+  assert.throws(
+    () => parseRpfHeader(encoder.encode('9FPR\x01\x00\x00\x00'), 8),
+    (err) => err instanceof RpfFormatError && err.code === 'TRUNCATED_HEADER'
+  );
+});
+
+test('RpfArchiveVfs opens, resolves, and streams a synthetic RPF9 archive with little-endian "9FPR" (39 46 50 52) magic', async () => {
+  const untouchedBig = makePatternBytes(32768, 41);
+  const shaderBlob = makePatternBytes(1536, 17);
+  const manifestText = '{"archive":"appdata0.rpf","magic":"9FPR"}';
+
+  const archive = buildSyntheticRpf9Buffer(
+    [
+      { path: 'common/data/boot_manifest.json', data: manifestText },
+      { path: 'x64/shaders/main_ps.dxil', data: shaderBlob, isResource: true },
+      { path: 'x64/textures/unused_32k.ytd', data: untouchedBig },
+    ],
+    {
+      magic: RPF9_MAGIC_LE,
+      encryptionTag: RPF_ENCRYPTION_OPEN,
+      metadataSize: 32,
+      flags: 0x00000009,
+    }
+  );
+
+  // Confirm raw on-disk header magic is exact little-endian 0x52504639 (39 46 50 52 = "9FPR").
+  assert.deepEqual(Array.from(archive.subarray(0, 4)), [0x39, 0x46, 0x50, 0x52]);
+  assert.equal(new DataView(archive.buffer, archive.byteOffset, 4).getUint32(0, true), RPF9_MAGIC_U32);
+
+  const tracker = createTrackingRangeReader(archive);
+  const vfs = await RpfArchiveVfs.open(tracker.readRange, archive.byteLength, {
+    archivePath: 'appdata0.rpf',
+  });
+
+  // Header parse checks.
+  assert.equal(vfs.header.magic, RPF9_MAGIC);
+  assert.equal(vfs.header.rawMagic, RPF9_MAGIC_LE);
+  assert.equal(vfs.header.magicEndian, 'little');
+  assert.equal(vfs.header.version, 9);
+  assert.equal(vfs.header.encryptionLabel, 'open');
+
+  // TOC parse & resolution checks.
+  assert.equal(tracker.reads.length, 2);
+  assert.ok(tracker.getTotalBytesRead() < 1024, 'open() must fetch only header + TOC + names');
+  assert.equal(vfs.exists('common/data/boot_manifest.json'), true);
+  assert.equal(vfs.exists('/X64\\SHADERS\\MAIN_PS.DXIL'), true);
+  assert.deepEqual(
+    vfs.listDir('x64').map((e) => `${e.name}:${e.kind}`),
+    ['shaders:directory', 'textures:directory']
+  );
+
+  const shaderStat = vfs.stat('x64/shaders/main_ps.dxil');
+  assert.ok(shaderStat);
+  assert.equal(shaderStat.isFile, true);
+  assert.equal(shaderStat.isResource, true);
+  assert.equal(shaderStat.size, shaderBlob.byteLength);
+
+  // Streaming sub-range read checks.
+  const partial = await vfs.readFileRange('x64/shaders/main_ps.dxil', 256, 128);
+  assert.deepEqual(partial, shaderBlob.subarray(256, 384));
+  assert.deepEqual(tracker.reads[2], { offset: shaderStat.dataOffset + 256, length: 128 });
+
+  // Mount table integration & full file read.
+  const table = new RpfVfsMountTable();
+  table.mount('appdata/', vfs);
+  const resolved = table.resolve('APPDATA\\Common\\Data\\boot_manifest.json');
+  assert.ok(resolved);
+  assert.equal(resolved.archivePath, 'common/data/boot_manifest.json');
+  assert.equal(decoder.decode(await table.readFile('appdata/common/data/boot_manifest.json')), manifestText);
+
+  // Confirm 32 KiB untouched payload was never fetched.
+  assert.ok(tracker.getTotalBytesRead() < 2048);
+});
+
 test('web/workers/rpf9_vfs.js loads cleanly in a classic Web Worker global context (UMD)', () => {
   const src = fs.readFileSync(path.join(repoRoot, 'web', 'workers', 'rpf9_vfs.js'), 'utf8');
   const sandbox = {
@@ -675,6 +800,10 @@ test('web/workers/rpf9_vfs.js loads cleanly in a classic Web Worker global conte
   vm.runInNewContext(src, sandbox, { filename: 'rpf9_vfs.js' });
 
   assert.ok(sandbox.PlayGta6Rpf9Vfs, 'Expected globalThis.PlayGta6Rpf9Vfs UMD export');
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC, 'RPF9');
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC_BE, 'RPF9');
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC_LE, '9FPR');
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC_U32, 0x52504639);
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.parseRpfHeader, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfArchiveVfs, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfVfsMountTable, 'function');
