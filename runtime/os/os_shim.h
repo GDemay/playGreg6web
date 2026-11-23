@@ -6,7 +6,19 @@
 
 namespace playgta6::os {
 
+struct HttpfsMailbox;
+class HttpfsMailboxClient;
+
 void log(std::string_view message);
+
+// Optionally attach an in-process or shared-memory HTTPFS mailbox (or client).
+// When attached, httpfs_open / httpfs_read / httpfs_close route through the
+// mailbox protocol; otherwise they fall back to Emscripten EM_IMPORT(env)
+// host calls (or return an error on native builds). Pass nullptr to detach.
+void httpfs_attach_mailbox(HttpfsMailbox* mailbox);
+void httpfs_attach_client(HttpfsMailboxClient* client);
+bool httpfs_has_attached_mailbox();
+
 int32_t httpfs_open(std::string_view rel_path);
 int64_t httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
 void httpfs_close(int32_t handle);
