@@ -163,11 +163,69 @@
       transform: translateY(1px);
     }
 
+    .hud-btn[data-active="true"] {
+      border-color: rgba(52, 211, 153, 0.45);
+      background: var(--ok-bg);
+      color: #d1fae5;
+    }
+
+    .hud-btn[data-recording="true"] {
+      border-color: rgba(248, 113, 113, 0.5);
+      background: var(--err-bg);
+      color: #fee2e2;
+    }
+
+    .controls-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px;
+    }
+
+    .controls-grid .hud-btn {
+      width: 100%;
+      padding: 5px 7px;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .control-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 7px;
+      border-radius: 6px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .hud-select {
+      flex: 1;
+      min-width: 0;
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.9);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      padding: 3px 6px;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+
+    .hud-select:focus {
+      outline: 1px solid var(--info);
+      border-color: var(--info);
+    }
+
     #hud-body {
       padding: 10px;
       display: flex;
       flex-direction: column;
       gap: 10px;
+      max-height: calc(100vh - 56px);
+      overflow-y: auto;
     }
 
     #hud.collapsed #hud-body {
@@ -425,6 +483,25 @@
         </div>
       </section>
 
+      <section class="hud-section" aria-label="Controls and diagnostics">
+        <div class="hud-section-head">
+          <span>Controls &amp; Diagnostics</span>
+        </div>
+        <div class="controls-grid">
+          <button id="btn-smoke-demo" class="hud-btn" type="button" aria-pressed="false">Smoke Demo</button>
+          <button id="btn-restart-session" class="hud-btn" type="button">Restart</button>
+          <button id="btn-record-trace" class="hud-btn" type="button" data-recording="false" aria-pressed="false">Record Trace</button>
+          <button id="btn-export-trace" class="hud-btn" type="button">Export .pg6trace</button>
+          <button id="btn-clear-cache" class="hud-btn" type="button">Clear Cache</button>
+          <button id="btn-export-saves" class="hud-btn" type="button">Export Saves</button>
+          <button id="btn-export-crash" class="hud-btn" type="button">Export Report</button>
+        </div>
+        <div class="control-row">
+          <label class="kv-label" for="select-input-profile">Input Profile</label>
+          <select id="select-input-profile" class="hud-select" aria-label="Input Profile"></select>
+        </div>
+      </section>
+
       <section class="hud-section" aria-label="Runtime log">
         <div class="hud-section-head">
           <span>Runtime Log</span>
@@ -436,7 +513,8 @@
   </div>
 
   <script type="module">
-    import { InputBridge } from './input/input_bridge.js';
+    import { bootstrapPlayGta6App } from './app_bootstrap.js';
+    import { HudController } from './ui/hud_controller.js';
 
     const canvas = document.getElementById('viewport');
     const hudEl = document.getElementById('hud');
@@ -446,6 +524,15 @@
     const refreshStatusBtn = document.getElementById('hud-refresh-status');
     const clearLogBtn = document.getElementById('hud-clear-log');
     const logEl = document.getElementById('hud-log');
+
+    const smokeDemoBtn = document.getElementById('btn-smoke-demo');
+    const restartBtn = document.getElementById('btn-restart-session');
+    const recordTraceBtn = document.getElementById('btn-record-trace');
+    const exportTraceBtn = document.getElementById('btn-export-trace');
+    const clearCacheBtn = document.getElementById('btn-clear-cache');
+    const exportSavesBtn = document.getElementById('btn-export-saves');
+    const exportCrashBtn = document.getElementById('btn-export-crash');
+    const profileSelect = document.getElementById('select-input-profile');
 
     const capEls = {
       coi: document.getElementById('cap-coi'),
@@ -471,7 +558,6 @@
     };
 
     const MAX_LOG_LINES = 200;
-    const frameTimestamps = [];
 
     function formatTime() {
       const now = new Date();
@@ -598,6 +684,25 @@
       }
     }
 
+    function populateInputProfiles(selectEl, inputProfiles) {
+      if (!selectEl || !inputProfiles || typeof inputProfiles.listProfiles !== 'function') {
+        return;
+      }
+      selectEl.textContent = '';
+      for (const profile of inputProfiles.listProfiles()) {
+        const option = document.createElement('option');
+        option.value = profile.id;
+        option.textContent = profile.name;
+        selectEl.appendChild(option);
+      }
+      if (typeof inputProfiles.getActiveProfile === 'function') {
+        const active = inputProfiles.getActiveProfile();
+        if (active && typeof active.id === 'string') {
+          selectEl.value = active.id;
+        }
+      }
+    }
+
     const hudApi = {
       setStatus,
       appendLog,
@@ -606,6 +711,8 @@
       setCollapsed,
     };
     window.playgta6Hud = hudApi;
+    window.playgta6App = null;
+    window.playgta6HudController = null;
 
     toggleBtn.addEventListener('click', () => {
       setCollapsed(!hudEl.classList.contains('collapsed'));
@@ -692,79 +799,121 @@
 
     refreshServerStatus();
 
-    const bc = new BroadcastChannel('game-progress');
-    bc.onmessage = (ev) => {
-      const d = ev.data || {};
-      if (d.metrics && typeof d.metrics === 'object') {
-        updateMetrics(d.metrics);
-      }
-      if (d.status) {
-        setStatus(d.status, d.level || 'info');
-      }
-      if (d.error) {
-        setStatus('Runtime error', 'error');
-        appendLog(`ERROR: ${d.error}`, 'error');
-      } else if (d.label) {
-        const label = String(d.label);
-        const frameMatch = /^WebGPU frame #(\d+)/.exec(label);
-        if (frameMatch) {
-          const now = performance.now();
-          frameTimestamps.push(now);
-          while (frameTimestamps.length > 1 && now - frameTimestamps[0] > 1000) {
-            frameTimestamps.shift();
-          }
-          const fps = frameTimestamps.length > 1
-            ? ((frameTimestamps.length - 1) * 1000) / Math.max(1, now - frameTimestamps[0])
-            : 1;
-          updateMetrics({ fps, gpuPackets: Number(frameMatch[1]) });
-          setStatus('Running', 'ok');
-          appendLog(label, 'ok');
-        } else {
-          appendLog(label, label.includes('ready') ? 'ok' : 'info');
-        }
-      }
-    };
-
     if (!caps.coi || !caps.sab) {
       setStatus('Missing COOP/COEP', 'error');
       appendLog('Serve via server/serve_local.py so COOP/COEP headers enable SharedArrayBuffer.', 'error');
-    } else if (!caps.webgpu) {
-      setStatus('WebGPU unavailable', 'error');
-      appendLog('WebGPU is unavailable in this browser.', 'error');
     } else {
-      setStatus('Starting workers...', 'info');
-      const dpr = Math.max(1, window.devicePixelRatio || 1);
-      canvas.width = Math.floor(window.innerWidth * dpr);
-      canvas.height = Math.floor(window.innerHeight * dpr);
+      const app = bootstrapPlayGta6App({
+        canvas,
+        hud: hudApi,
+        dataBase: `${location.origin}/data/`,
+      });
 
-      const input = new InputBridge(canvas);
-      const offscreen = canvas.transferControlToOffscreen();
-      const loader = new Worker('./loader.js');
-
-      loader.onerror = (err) => {
-        setStatus('Worker error', 'error');
-        appendLog(`loader worker error: ${err.message || err}`, 'error');
+      const smokeRunnerProxy = {
+        get recorder() {
+          return app.getSmokeRunner()?.recorder || null;
+        },
+        get running() {
+          return Boolean(app.getSmokeRunner()?.running);
+        },
+        start() {
+          const runner = app.getSmokeRunner();
+          return runner ? runner.start() : false;
+        },
+        stop() {
+          const runner = app.getSmokeRunner();
+          return runner ? runner.stop() : false;
+        },
+        startRecording() {
+          const runner = app.getSmokeRunner();
+          if (!runner) {
+            throw new Error('Smoke demo runner is not active');
+          }
+          return runner.startRecording();
+        },
+        stopRecording() {
+          const runner = app.getSmokeRunner();
+          if (!runner) {
+            throw new Error('Smoke demo runner is not active');
+          }
+          return runner.stopRecording();
+        },
+        exportTraceBytes(opts) {
+          const runner = app.getSmokeRunner();
+          return runner ? runner.exportTraceBytes(opts) : new Uint8Array(0);
+        },
+        exportTraceMetadata() {
+          const runner = app.getSmokeRunner();
+          return runner ? runner.exportTraceMetadata() : null;
+        },
       };
 
-      loader.postMessage(
-        {
-          canvas: offscreen,
-          width: canvas.width,
-          height: canvas.height,
-          inputSab: input.sab,
-          dataBase: `${location.origin}/data/`,
-        },
-        [offscreen]
-      );
-
-      window.addEventListener('resize', () => {
-        const scale = Math.max(1, window.devicePixelRatio || 1);
-        loader.postMessage({
-          resize: true,
-          width: Math.floor(window.innerWidth * scale),
-          height: Math.floor(window.innerHeight * scale),
-        });
+      const hudController = new HudController({
+        sessionController: app.session,
+        smokeDemoRunner: smokeRunnerProxy,
+        storageManager: app.storageManager,
+        crashReporter: app.crashReporter,
+        perfMonitor: app.perfMonitor,
+        inputProfiles: app.inputProfiles,
+        hud: hudApi,
       });
+
+      populateInputProfiles(profileSelect, app.inputProfiles);
+      hudController.bindButtons({
+        smokeDemoBtn,
+        restartBtn,
+        recordTraceBtn,
+        exportTraceBtn,
+        clearCacheBtn,
+        exportSavesBtn,
+        exportCrashBtn,
+        profileSelect,
+      });
+
+      window.playgta6App = app;
+      window.playgta6HudController = hudController;
+
+      const syncControlStates = () => {
+        const isSmoke = app.session.getState() === 'running_smoke';
+        if (smokeDemoBtn) {
+          smokeDemoBtn.dataset.active = isSmoke ? 'true' : 'false';
+          smokeDemoBtn.setAttribute('aria-pressed', isSmoke ? 'true' : 'false');
+          smokeDemoBtn.textContent = isSmoke ? 'Stop Smoke' : 'Smoke Demo';
+        }
+        if (recordTraceBtn) {
+          const recording = Boolean(app.getSmokeRunner()?.recorder?.isRecording?.());
+          recordTraceBtn.dataset.recording = recording ? 'true' : 'false';
+          recordTraceBtn.setAttribute('aria-pressed', recording ? 'true' : 'false');
+          recordTraceBtn.textContent = recording ? 'Stop Trace' : 'Record Trace';
+        }
+      };
+
+      const unsubscribeSession = app.session.onStateChange(() => {
+        syncControlStates();
+      });
+      if (recordTraceBtn) {
+        recordTraceBtn.addEventListener('click', () => {
+          queueMicrotask(syncControlStates);
+        });
+      }
+      syncControlStates();
+
+      window.addEventListener('pagehide', () => {
+        unsubscribeSession();
+        hudController.destroy();
+        void app.destroy();
+      });
+
+      if (!caps.webgpu) {
+        setStatus('WebGPU unavailable', 'error');
+        appendLog('WebGPU is unavailable in this browser.', 'error');
+      } else {
+        setStatus('Booting runtime...', 'info');
+        app.start().catch((err) => {
+          setStatus('Startup error', 'error');
+          appendLog(`Runtime startup failed: ${err?.message || err}`, 'error');
+        });
+      }
     }
   </script>
 </body>
