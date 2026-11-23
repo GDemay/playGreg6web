@@ -38,7 +38,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [x] **G1 — Expand Command Ring & Resource Tables** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement `CreateBuffer`, `WriteBuffer`, `CreateShaderModule`, `CreatePipeline`, and `Draw` packets across `runtime/abi/playgta6_abi.h`, `runtime/gpu/cmd_encoder.cpp`, and `web/workers/wgpu_worker.js`.
-- [ ] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** *(no game files required)*
+- [ ] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** — `IN PROGRESS` (#10, @MarcBlattmann) *(no game files required)*
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
 - [x] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
@@ -48,11 +48,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 4: Shader Pipeline (`shaders/`, Rust)
 **Goal:** Convert Xbox RDNA2 shaders (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → WGSL packs.
 
-- [ ] **S1 — `naga` SPIR-V → WGSL Batch Converter** — `IN PROGRESS` (#5, @MarcBlattmann) *(testable with synthetic SPIR-V; real corpus needs local SPIR-V)*
+- [x] **S1 — `naga` SPIR-V → WGSL Batch Converter** — `DONE` (PR #9, closes #5) *(testable with synthetic SPIR-V; real corpus needs local SPIR-V)*
   - Add `naga` to `shaders/Cargo.toml`, convert a directory of `.spv` files to `.wgsl`, emit `shader-index.json`, and output a structured failure-reason report (unsupported capabilities/extensions).
-- [ ] **S2 — Shader Pack Bundler & WebGPU Pre-Validator** — `IN PROGRESS` (#5, @MarcBlattmann) *(no game files required)*
+- [x] **S2 — Shader Pack Bundler & WebGPU Pre-Validator** — `DONE` (PR #9, closes #5) *(no game files required)*
   - Pack lowered `.wgsl` files into compact `.wgsl.pack` bundles (like `playgta5`) for fast loading in `wgpu_worker.js`.
-- [ ] **S3 — WebGPU Compatibility Passes** *(needs SPIR-V failure report from S1)*
+- [ ] **S3 — WebGPU Compatibility Passes** — `IN PROGRESS` (#11, @MarcBlattmann) *(needs SPIR-V failure report from S1)*
   - Implement SPIR-V/WGSL rewrite passes for unsupported WebGPU features (bindless indexing limits, subgroup/wave64 fallbacks, mesh-compute lowering).
 
 ---
@@ -64,7 +64,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Cache fetched HTTP `206` byte chunks in Origin Private File System (OPFS) with a configurable budget + `bootset.json` prefetch on startup.
 - [ ] **W2 — IndexedDB `/userdata` Save Persistence** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
   - Restore `/userdata/` files into Wasm FS before `main()` and flush writes asynchronously (mirroring `playgta5`'s `loader.js` pattern).
-- [ ] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** — `IN PROGRESS` (#6, @MarcBlattmann) *(no game files required)*
+- [x] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** — `DONE` (PR #8, closes #6) *(no game files required)*
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
-- [ ] **W4 — Local Environment & Diagnostics (`tools/`)** — `IN PROGRESS` (#6, @MarcBlattmann) *(uses `GTA6_GAME_DIR` when available)*
+- [x] **W4 — Local Environment & Diagnostics (`tools/`)** — `DONE` (PR #8, closes #6) *(uses `GTA6_GAME_DIR` when available)*
   - Extend `tools/` to generate `bootset.json`, inspect RPF9 archive headers without extracting 100+ GB, and verify local file integrity.

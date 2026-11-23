@@ -51,8 +51,5 @@ jobs:
           node-version: "22"
       - run: python -m unittest discover -s tests -v
       - run: |
-          node --check web/loader.js
-          node --check web/workers/io_worker.js
-          node --check web/workers/wgpu_worker.js
-          node --check web/workers/audio_worker.js
-          node --check web/input/input_bridge.js
+          for f in $(find web -name '*.js'); do node --check "$f"; done
+          node --test tests/*.mjs
