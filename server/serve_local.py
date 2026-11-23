@@ -2,6 +2,9 @@
 """Local dev & asset-streaming HTTP server for playgta6web.
 
 - Serves `web/` at `/` and `--data` (default `local-data/`) at `/data/`.
+- Serves `GTA6_GAME_DIR` (when configured) at `/game/` for local splash assets.
+- Serves `local-data/shaders/` at `/shaders/` and `work/recomp_build/` at `/boot/`
+  (boot allowlisted to `.pgim`/`.json`/`.wasm`/`.js` only).
 - Serves sanitized JSON readiness diagnostics at `/api/status`.
 - Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
 - Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
@@ -11,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import mimetypes
 import os
@@ -22,9 +26,12 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlsplit
 
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
+
+BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
 
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
@@ -33,7 +40,7 @@ mimetypes.add_type("application/json", ".json")
 
 
 def safe_resolve(root: Path, rel_url_path: str) -> Path | None:
-    """Resolve a URL path strictly inside `root`, rejecting traversal."""
+    """Resolve a URL path strictly inside `root`, rejecting traversal and external symlinks."""
     normalized = posixpath.normpath("/" + unquote(rel_url_path)).lstrip("/")
     if not normalized or normalized.startswith(".."):
         return None
@@ -117,7 +124,7 @@ def if_range_matches(header_value: str, etag: str, last_modified: str, mtime: fl
     return int(parsed_dt.timestamp()) == int(mtime)
 
 
-def _count_shader_packs(web_root: Path, data_root: Path) -> int:
+def _count_shader_packs(web_root: Path, data_root: Path, shaders_root: Path | None = None) -> int:
     """Count `.wgsl.pack` bundles across expected shallow directories."""
     candidate_dirs = [
         data_root,
@@ -125,6 +132,8 @@ def _count_shader_packs(web_root: Path, data_root: Path) -> int:
         web_root / "dist",
         web_root / "shaders",
     ]
+    if shaders_root is not None:
+        candidate_dirs.append(shaders_root)
     seen: set[Path] = set()
     count = 0
     for directory in candidate_dirs:
@@ -146,7 +155,141 @@ def _count_shader_packs(web_root: Path, data_root: Path) -> int:
     return count
 
 
-def build_status_payload(web_root: Path, data_root: Path) -> dict[str, bool | int]:
+def _load_inspect_game_assets() -> Any | None:
+    """Lazily load tools/inspect_game_assets.py for safe MicrosoftGame.Config parsing."""
+    tools_path = Path(__file__).resolve().parent.parent / "tools" / "inspect_game_assets.py"
+    if not tools_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_playgta6_inspect_game_assets", tools_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _discover_splash_image_url(game_root: Path | None) -> str | None:
+    """Return `/game/<rel>` when ShellVisuals.SplashScreenImage exists inside game_root."""
+    if game_root is None:
+        return None
+    try:
+        if not game_root.is_dir():
+            return None
+        game_resolved = game_root.resolve()
+    except OSError:
+        return None
+
+    iga = _load_inspect_game_assets()
+    if iga is None:
+        return None
+
+    try:
+        config_path = iga._locate_microsoft_game_config(game_root)
+        if config_path is None:
+            return None
+        parsed = iga.parse_microsoft_game_config(config_path)
+        declared = (parsed.get("shellVisuals") or {}).get("splashScreenImage")
+        parts, err = iga._validate_package_relative_path(declared)
+        if err is not None or parts is None:
+            return None
+        package_root = config_path.parent
+        package_root_resolved = package_root.resolve()
+        resolved_file = iga._resolve_case_insensitive_in_root(
+            package_root, package_root_resolved, parts
+        )
+        if resolved_file is None or not resolved_file.is_file():
+            return None
+        resolved = resolved_file.resolve()
+        if not resolved.is_relative_to(game_resolved):
+            return None
+        rel = resolved.relative_to(game_resolved).as_posix()
+        if not rel or ".." in rel.split("/"):
+            return None
+        return f"/game/{rel}"
+    except Exception:
+        return None
+
+
+def _list_shader_pack_names(shaders_root: Path | None) -> list[str]:
+    if shaders_root is None or not shaders_root.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        for entry in shaders_root.iterdir():
+            try:
+                if entry.is_file() and entry.name.lower().endswith(".wgsl.pack"):
+                    # Ensure the file stays inside shaders_root (reject external symlinks).
+                    resolved = entry.resolve()
+                    if resolved.is_relative_to(shaders_root.resolve()):
+                        names.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(names, key=lambda name: name.lower())
+
+
+def _discover_shader_pack_url(shaders_root: Path | None) -> str | None:
+    names = _list_shader_pack_names(shaders_root)
+    if not names:
+        return None
+    preferred = next((name for name in names if name.lower() == "fallback.wgsl.pack"), None)
+    chosen = preferred or names[0]
+    return f"/shaders/{chosen}"
+
+
+def _discover_reflection_manifest_url(shaders_root: Path | None) -> str | None:
+    if shaders_root is None or not shaders_root.is_dir():
+        return None
+    candidate = shaders_root / "reflection-manifest.json"
+    try:
+        if not candidate.is_file():
+            return None
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(shaders_root.resolve()):
+            return None
+    except OSError:
+        return None
+    return "/shaders/reflection-manifest.json"
+
+
+def _discover_pgim_url(boot_root: Path | None) -> str | None:
+    if boot_root is None or not boot_root.is_dir():
+        return None
+    names: list[str] = []
+    try:
+        for entry in boot_root.iterdir():
+            try:
+                if entry.is_file() and entry.name.lower().endswith(".pgim"):
+                    resolved = entry.resolve()
+                    if resolved.is_relative_to(boot_root.resolve()):
+                        names.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not names:
+        return None
+    names.sort(key=lambda name: name.lower())
+    return f"/boot/{names[0]}"
+
+
+def _boot_extension_allowed(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in BOOT_ALLOWED_SUFFIXES)
+
+
+def build_status_payload(
+    web_root: Path,
+    data_root: Path,
+    *,
+    game_root: Path | None = None,
+    shaders_root: Path | None = None,
+    boot_root: Path | None = None,
+) -> dict[str, bool | int | str | None]:
     """Build sanitized readiness metadata with zero host filesystem paths."""
     data_configured = data_root.is_dir()
     has_manifest = data_configured and (data_root / "data-manifest.json").is_file()
@@ -163,6 +306,8 @@ def build_status_payload(web_root: Path, data_root: Path) -> dict[str, bool | in
         except OSError:
             has_wasm = False
 
+    effective_shaders = shaders_root if shaders_root is not None else (data_root / "shaders")
+
     return {
         "ok": True,
         "coopCoep": True,
@@ -170,16 +315,32 @@ def build_status_payload(web_root: Path, data_root: Path) -> dict[str, bool | in
         "hasManifest": has_manifest,
         "hasBootset": has_bootset,
         "hasWasmBinary": has_wasm,
-        "shaderPackCount": _count_shader_packs(web_root, data_root),
+        "shaderPackCount": _count_shader_packs(web_root, data_root, effective_shaders),
+        "splashImage": _discover_splash_image_url(game_root),
+        "shaderPackUrl": _discover_shader_pack_url(effective_shaders),
+        "reflectionManifestUrl": _discover_reflection_manifest_url(effective_shaders),
+        "pgimUrl": _discover_pgim_url(boot_root),
     }
 
 
 class PlayGta6Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, *args, web_root: Path, data_root: Path, **kwargs):
+    def __init__(
+        self,
+        *args,
+        web_root: Path,
+        data_root: Path,
+        game_root: Path | None = None,
+        shaders_root: Path | None = None,
+        boot_root: Path | None = None,
+        **kwargs,
+    ):
         self.web_root = web_root
         self.data_root = data_root
+        self.game_root = game_root
+        self.shaders_root = shaders_root if shaders_root is not None else (data_root / "shaders")
+        self.boot_root = boot_root
         super().__init__(*args, **kwargs)
 
     def end_headers(self) -> None:
@@ -189,15 +350,55 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
 
-    def _resolve_target(self, url_path: str) -> Path | None:
+    def _send_empty(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _resolve_target(self, url_path: str) -> Path | None | tuple[None, HTTPStatus]:
+        """Resolve a URL path to a filesystem target.
+
+        Returns:
+            Path on success, None for a generic 404, or (None, status) for an
+            explicit error status (e.g. 403 for disallowed `/boot/` extensions).
+        """
         if url_path == "/":
             return (self.web_root / "index.html").resolve()
         if url_path.startswith("/data/"):
-            return safe_resolve(self.data_root, url_path[len("/data/"):])
+            return safe_resolve(self.data_root, url_path[len("/data/") :])
+        if url_path.startswith("/game/"):
+            if self.game_root is None:
+                return None
+            return safe_resolve(self.game_root, url_path[len("/game/") :])
+        if url_path.startswith("/shaders/"):
+            if self.shaders_root is None:
+                return None
+            return safe_resolve(self.shaders_root, url_path[len("/shaders/") :])
+        if url_path.startswith("/boot/"):
+            if self.boot_root is None:
+                return None
+            rel = url_path[len("/boot/") :]
+            # Reject traversal before extension checks so `../secret.exe` cannot
+            # short-circuit the allowlist via a lucky extension after normpath.
+            if ".." in unquote(rel).replace("\\", "/").split("/"):
+                return None
+            target = safe_resolve(self.boot_root, rel)
+            if target is None:
+                return None
+            if not _boot_extension_allowed(target):
+                return (None, HTTPStatus.FORBIDDEN)
+            return target
         return safe_resolve(self.web_root, url_path.lstrip("/"))
 
     def _serve_status(self, send_body: bool) -> None:
-        payload = build_status_payload(self.web_root, self.data_root)
+        payload = build_status_payload(
+            self.web_root,
+            self.data_root,
+            game_root=self.game_root,
+            shaders_root=self.shaders_root,
+            boot_root=self.boot_root,
+        )
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
@@ -211,21 +412,19 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                 pass
 
     def _serve_file(self, url_path: str, send_body: bool) -> None:
-        target = self._resolve_target(url_path)
+        resolved = self._resolve_target(url_path)
+        if isinstance(resolved, tuple):
+            self._send_empty(resolved[1])
+            return
+        target = resolved
         if target is None or not target.is_file():
-            self.send_response(HTTPStatus.NOT_FOUND)
-            self.send_header("Content-Length", "0")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
         try:
             st = target.stat()
         except OSError:
-            self.send_response(HTTPStatus.NOT_FOUND)
-            self.send_header("Content-Length", "0")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
         file_size = st.st_size
@@ -309,8 +508,24 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self._dispatch(send_body=False)
 
 
-def create_server(host: str, port: int, web_root: Path, data_root: Path) -> ThreadingHTTPServer:
-    handler = partial(PlayGta6Handler, web_root=web_root, data_root=data_root)
+def create_server(
+    host: str,
+    port: int,
+    web_root: Path,
+    data_root: Path,
+    *,
+    game_root: Path | None = None,
+    shaders_root: Path | None = None,
+    boot_root: Path | None = None,
+) -> ThreadingHTTPServer:
+    handler = partial(
+        PlayGta6Handler,
+        web_root=web_root,
+        data_root=data_root,
+        game_root=game_root,
+        shaders_root=shaders_root,
+        boot_root=boot_root,
+    )
     return ThreadingHTTPServer((host, port), handler)
 
 
@@ -336,16 +551,65 @@ def main() -> None:
     if not default_data.is_absolute():
         default_data = (repo_root / default_data).resolve()
 
+    default_game_raw = os.environ.get("GTA6_GAME_DIR") or _load_dotenv_value(repo_root, "GTA6_GAME_DIR")
+    default_game = Path(default_game_raw) if default_game_raw else None
+    if default_game is not None and not default_game.is_absolute():
+        default_game = (repo_root / default_game).resolve()
+
+    default_work_raw = os.environ.get("GTA6_WORK_DIR") or _load_dotenv_value(repo_root, "GTA6_WORK_DIR")
+    default_work = Path(default_work_raw) if default_work_raw else (repo_root / "work")
+    if not default_work.is_absolute():
+        default_work = (repo_root / default_work).resolve()
+
     parser = argparse.ArgumentParser(description="Local COOP/COEP + HTTP Range server for playgta6web")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--web", type=Path, default=repo_root / "web")
     parser.add_argument("--data", type=Path, default=default_data)
+    parser.add_argument(
+        "--game",
+        type=Path,
+        default=default_game,
+        help="Local Xbox Series game directory served at /game/ (from GTA6_GAME_DIR when set).",
+    )
+    parser.add_argument(
+        "--shaders",
+        type=Path,
+        default=None,
+        help="Shader pack directory served at /shaders/ (default: <data>/shaders).",
+    )
+    parser.add_argument(
+        "--boot",
+        type=Path,
+        default=None,
+        help="Boot-bundle directory served at /boot/ (default: <work>/recomp_build).",
+    )
+    parser.add_argument(
+        "--work",
+        type=Path,
+        default=default_work,
+        help="Work directory used to derive the default --boot path.",
+    )
     args = parser.parse_args()
 
     args.data.mkdir(parents=True, exist_ok=True)
-    httpd = create_server(args.host, args.port, args.web, args.data)
-    print(f"Serving web={args.web} and /data={args.data} at http://{args.host}:{args.port}/")
+    shaders_root = args.shaders if args.shaders is not None else (args.data / "shaders")
+    boot_root = args.boot if args.boot is not None else (args.work / "recomp_build")
+    game_root = args.game if args.game is not None else None
+
+    httpd = create_server(
+        args.host,
+        args.port,
+        args.web,
+        args.data,
+        game_root=game_root,
+        shaders_root=shaders_root,
+        boot_root=boot_root,
+    )
+    print(
+        f"Serving web={args.web}, /data={args.data}, /shaders={shaders_root}, "
+        f"/boot={boot_root}, /game={game_root} at http://{args.host}:{args.port}/"
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
