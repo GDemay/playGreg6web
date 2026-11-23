@@ -36,6 +36,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse C++ EH `FuncInfo` (v3/v4) and `__C_specific_handler` scope tables into the CFG (funclets, catch/continuation targets); implement `RaiseException`/`RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`/`RtlRestoreContext`/`setjmp`/`longjmp` over guest state and `.pdata`; define the lifter/runtime resume protocol.
 - [ ] **R12 — Multi-Module Recompile: Bundled DLLs & Guest-to-Guest Import Binding (`recomp/`)** — `IN PROGRESS` (#161, @Timon-ok) *(starts once R9 is merged)*
   - Build the executable plus the redistributable DLLs shipped next to it (`MSVCP140`, `VCRUNTIME140`, `concrt140`, …) into one guest program: per-module image bases, exports, forwarders, imports bound to another module's exports, shared function registration tables.
+- [ ] **R13 — Parallel Sharded LLVM IR → Wasm64 Emscripten Build Orchestrator (`tools/build_guest_wasm.py`)** — `IN PROGRESS` (#193, @MarcBlattmann) *(no game files required — disjoint files `tools/build_guest_wasm.py`, `tests/test_build_guest_wasm.py`)*
+  - Compiles sharded `playgta6-recomp build` (`R9`) `.ll`/`.c`/`.cpp` outputs across CPU cores via `emcc` with SHA-256 `.o` caching, links with `libplaygta6_core.a` into `web/dist/runtime.{js,wasm}`, and validates ABI exports.
 
 ---
 
@@ -78,6 +80,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Wire `pg6_xbox_scarlett_register_all`, `pg6_ucrt_register_all`, `pg6_xbox_middleware_register_all`, `pg6_win32_compat_register_all`, and `pg6_d3d12_xs_register_all` into `shim_exports.cpp` and verify 100% coverage of all non-guest-DLL imports in `docs/imports_required.md`.
 - [ ] **O18 — Contiguous Guest Address Space: Offset-Mapped `VirtualMemoryArena` Backing for wasm64 (`runtime/os/vmem.{h,cpp}`)** — `IN PROGRESS` (#187, @Timon-ok) *(lifted code reads guest memory directly in linear memory; the arena keeps pages in separate host allocations)*
   - Back the arena with one contiguous region and a single guest-base translation shared by the lifter's `guest_ptr` seam, the import-bridge seam, the guest runtime and the image loader, on host builds and under Emscripten `-sMEMORY64`, keeping commit/protect bookkeeping.
+- [ ] **O19 — `WS2_32.dll` 23 Ordinal Shims & Registry Bindings (`runtime/os/winsock_ordinals.{h,cpp}`)** — `IN PROGRESS` (#190, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 23 ordinal-imported Winsock2 symbols)*
+  - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
 
 ---
 
@@ -132,6 +136,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, reflected bind-group layouts, resource registry, and render-target pool into the main WebGPU command processor.
 - [ ] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `IN PROGRESS` (#168, @Timon-ok) *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
   - Expose the exact 3 `d3d12_xs.dll` exports with Win64-ABI COM vtables (`ID3D12Device`, `ID3D12CommandQueue`, `ID3D12GraphicsCommandList`, `ID3D12Resource`, `ID3D12DescriptorHeap`, `ID3D12PipelineState`) bridged to `G6`/`G7`/`G20`.
+- [ ] **G25 — Upgrade `tools/gpu_trace.py` Disassembler for GPU Packet ABI v2 Opcodes `22..34`** — `IN PROGRESS` (#191, @MarcBlattmann) *(disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
+  - Full typed payload decoding, summaries, and validation for all ABI v2 render-pass, pipeline-key, layout, and dynamic-state packets (`22..34`).
 
 ---
 
@@ -154,6 +160,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
 - [ ] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `IN PROGRESS` (#181, @MarcBlattmann) *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
   - Read-only local scanner classifying shader containers (`DXBC`, `DXIL`, `SPIR-V`, or Xbox Scarlett RDNA2 ISA signatures) in a local directory into a sanitized JSON summary for M2/M4 shader planning.
+- [ ] **S9 — Fallback `WGPK` Shader Pack & S6 Reflection Manifest Generator (`tools/gen_fallback_shaders.py`)** — `IN PROGRESS` (#192, @MarcBlattmann) *(no game files required — disjoint files `tools/gen_fallback_shaders.py`, `tests/test_gen_fallback_shaders.py`)*
+  - Generates a verified `WGPK` v1 bundle + S6 `reflection-manifest.json` with splash/UI blit, 3D debug mesh, and compute fallback WGSL shaders into gitignored `local-data/shaders/`.
 
 ---
 
@@ -238,3 +246,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Double-buffered WebGPU YUV420p/YUVA/RGBA8 texture uploader + BT.709/BT.601 WGSL full-screen letterbox presenter for intro/splash frames (`Bink2Scarlett.dll`).
 - [ ] **W39 — `MicrosoftGame.Config` & Xbox Package Readiness Inspector CLI (`tools/inspect_game_assets.py`)** — `IN PROGRESS` (#185, @MarcBlattmann) *(no game files required — disjoint files `tools/inspect_game_assets.py`, `tests/test_inspect_game_assets.py`)*
   - Safely parses Xbox GDK `MicrosoftGame.Config` XML and verifies declared executables, bundled DLLs, and `ShellVisuals` splash assets in `GTA6_GAME_DIR` with sanitized JSON output.
+- [ ] **W40 — Guest Boot Milestone Tracer & Unresolved-Import Trap Collector (`web/telemetry/boot_tracer.js`)** — `IN PROGRESS` (#194, @MarcBlattmann) *(no game files required — disjoint files `web/telemetry/boot_tracer.js`, `tests/test_boot_tracer.mjs`)*
+  - Tracks real guest boot milestones (`PGIM_LOAD` → `TLS_INIT` → `CRT_INITTERM` → `D3D12_CREATE_DEVICE` → `FIRST_PRESENT`) and deduplicates `__playgta6_unimplemented` / unresolved-import traps for HUD & CrashReporter.
+- [ ] **W41 — Streaming `PGIM` v1 Guest Image & Shader Bundle Preloader (`web/runtime/pgim_preloader.js`)** — `IN PROGRESS` (#195, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/pgim_preloader.js`, `tests/test_pgim_preloader.mjs`)*
+  - Streams and validates `PGIM` v1 guest images (`R6`/`O10`), `.wgsl.pack` bundles, and S6 reflection manifests via HTTP `206` Range with progress reporting before guest entry.
