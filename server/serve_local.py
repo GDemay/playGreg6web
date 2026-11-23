@@ -147,17 +147,33 @@ def create_server(host: str, port: int, web_root: Path, data_root: Path) -> Thre
     return ThreadingHTTPServer((host, port), handler)
 
 
+def _load_dotenv_value(repo_root: Path, key: str) -> str | None:
+    env_file = repo_root / ".env"
+    if not env_file.is_file():
+        return None
+    for raw in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k.strip() == key:
+            val = v.strip().strip('"').strip("'")
+            return val or None
+    return None
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
+    default_data_raw = os.environ.get("GTA6_DATA_DIR") or _load_dotenv_value(repo_root, "GTA6_DATA_DIR")
+    default_data = Path(default_data_raw) if default_data_raw else (repo_root / "local-data")
+    if not default_data.is_absolute():
+        default_data = (repo_root / default_data).resolve()
+
     parser = argparse.ArgumentParser(description="Local COOP/COEP + HTTP Range server for playgta6web")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--web", type=Path, default=repo_root / "web")
-    parser.add_argument(
-        "--data",
-        type=Path,
-        default=Path(os.environ.get("GTA6_DATA_DIR", repo_root / "local-data")),
-    )
+    parser.add_argument("--data", type=Path, default=default_data)
     args = parser.parse_args()
 
     args.data.mkdir(parents=True, exist_ok=True)

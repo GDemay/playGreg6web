@@ -86,15 +86,40 @@ fn build_manifest(game_dir: &Path, out_file: &Path) -> io::Result<usize> {
     Ok(entries.len())
 }
 
+fn read_dotenv_key(key: &str) -> Option<String> {
+    if let Ok(val) = env::var(key)
+        && !val.trim().is_empty()
+    {
+        return Some(val);
+    }
+    let text = fs::read_to_string(".env").ok()?;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            let cleaned = v.trim().trim_matches('"').trim_matches('\'');
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        eprintln!("Usage: playgta6-manifest --game <game-dir> --out <local-data/data-manifest.json>");
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!("Usage: playgta6-manifest [--game <game-dir>] [--out <local-data/data-manifest.json>]");
+        eprintln!("Falls back to GTA6_GAME_DIR and GTA6_DATA_DIR from env or .env.");
         return ExitCode::SUCCESS;
     }
 
     let mut game_dir: Option<PathBuf> = None;
-    let mut out_file: PathBuf = PathBuf::from("local-data/data-manifest.json");
+    let mut out_file: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -104,7 +129,7 @@ fn main() -> ExitCode {
                 i += 2;
             }
             "--out" if i + 1 < args.len() => {
-                out_file = PathBuf::from(&args[i + 1]);
+                out_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             other => {
@@ -114,10 +139,16 @@ fn main() -> ExitCode {
         }
     }
 
-    let Some(game_dir) = game_dir else {
-        eprintln!("Error: --game <dir> is required.");
+    let Some(game_dir) = game_dir.or_else(|| read_dotenv_key("GTA6_GAME_DIR").map(PathBuf::from))
+    else {
+        eprintln!("Error: --game <dir> or GTA6_GAME_DIR (in .env) is required.");
         return ExitCode::FAILURE;
     };
+
+    let out_file = out_file.unwrap_or_else(|| {
+        let data_dir = read_dotenv_key("GTA6_DATA_DIR").unwrap_or_else(|| "local-data".to_string());
+        PathBuf::from(data_dir).join("data-manifest.json")
+    });
 
     match build_manifest(&game_dir, &out_file) {
         Ok(count) => {

@@ -1,0 +1,40 @@
+name: Workstream Task
+description: Propose or claim a task on one of the 5 playgta6web tracks
+labels: ["task"]
+body:
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track
+      options:
+        - "Track 1: Recompiler (recomp/)"
+        - "Track 2: Xbox / Win32 OS Shims (runtime/os/)"
+        - "Track 3: GPU Command Bridge (runtime/gpu/ + wgpu_worker.js)"
+        - "Track 4: Shader Pipeline (shaders/)"
+        - "Track 5: Browser Shell, I/O & Audio (web/ + server/ + tools/)"
+        - "Shared ABI / Docs (docs/ + runtime/abi/)"
+    validations:
+      required: true
+  - type: dropdown
+    id: game_files
+    attributes:
+      label: Requires local game files?
+      options:
+        - "No (testable with unit tests / synthetic fixtures)"
+        - "Yes (uses local GTA6_GAME_DIR via .env)"
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal & Acceptance Criteria
+      placeholder: What should work and what tests should pass when this task is done?
+    validations:
+      required: true
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Repository Rules
+      options:
+        - label: I will not attach copyrighted game files, binaries, keys, or extracted assets.
+          required: true
