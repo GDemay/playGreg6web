@@ -23,7 +23,9 @@ use crate::cfg;
 use crate::lift::compile::{
     LlvmTool, compile_to_wasm64_object, find_llvm_tool, find_on_path, rustc_tool_dir,
 };
-use crate::lift::{STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, lift_module};
+use crate::lift::{
+    STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_XMM_OFFSET, lift_module,
+};
 
 pub(super) const RAX: usize = 0;
 pub(super) const RCX: usize = 1;
@@ -39,8 +41,8 @@ const R10: usize = 10;
 const R11: usize = 11;
 
 /// Guest memory map used by the harness (all inside the 8 MiB linear memory).
-const STATE_ADDR: u64 = 0x10_0000;
-const DATA_ADDR: u64 = 0x18_0000;
+pub(super) const STATE_ADDR: u64 = 0x10_0000;
+pub(super) const DATA_ADDR: u64 = 0x18_0000;
 pub(super) const STACK_TOP: u64 = 0x1F_0000;
 pub(super) const CODE_BASE: u64 = 0x30_0000;
 const MEMORY_BYTES: u64 = 8 << 20;
@@ -54,18 +56,21 @@ const RUNNER_JS: &str = include_str!("runner.js");
 // Gating checks capability, not presence: an LLVM tool must compile a trivial wasm64 module, a
 // linker must link it and node must instantiate and run it. A tool that is present but too old or
 // built without the WebAssembly target turns into a skip with a note, never a failure. The probe
-// module is hand-written (no lifter output), so lifter bugs cannot hide behind a skip.
+// module is hand-written (no lifter output), so lifter bugs cannot hide behind a skip. Lifted
+// functions require WebAssembly SIMD (`simd128`, for SSE code), so the probe uses it as well.
 
 const PROBE_LL: &str = "\
 target triple = \"wasm64-unknown-unknown\"
 
-define void @probe(ptr %p) {
+define void @probe(ptr %p) #0 {
 entry:
-  %v = load i64, ptr %p, align 1
-  %w = add i64 %v, 1
-  store i64 %w, ptr %p, align 1
+  %v = load <2 x i64>, ptr %p, align 1
+  %w = add <2 x i64> %v, <i64 1, i64 1>
+  store <2 x i64> %w, ptr %p, align 1
   ret void
 }
+
+attributes #0 = { \"target-features\"=\"+simd128\" }
 ";
 
 const PROBE_JS: &str = "\
@@ -389,7 +394,7 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"state\":\"{STATE_ADDR:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"cases\":["
+        "{{\"state\":\"{STATE_ADDR:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"cases\":["
     );
     for (i, case) in cases.iter().enumerate() {
         if i > 0 {

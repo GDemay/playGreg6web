@@ -15,12 +15,19 @@
 //! | [`STATE_FLAGS_OFFSET`] (136) | 8 x 1 | `CF PF AF ZF SF OF DF pad`, one byte each, always 0 or 1 |
 //! | [`STATE_FS_BASE_OFFSET`] (144) | 8 | `fs` segment base |
 //! | [`STATE_GS_BASE_OFFSET`] (152) | 8 | `gs` segment base (TEB on Win64) |
-//! | [`STATE_XMM_OFFSET`] (160) | 16 x 16 | `xmm0..xmm15` (reserved, not lifted yet) |
+//! | [`STATE_XMM_OFFSET`] (160) | 16 x 16 | `xmm0..xmm15` (low 128 bits of `ymm0..15`) |
 //!
 //! Inside a function, every GPR the function touches and every flag lives in an `alloca` that is
 //! loaded from the state at entry and after each call, and stored back before each call and every
 //! exit. LLVM's `mem2reg`/`SROA` turn these into SSA values; flag slots that are never read are
 //! dead-store-eliminated. `%state` is `noalias`: guest code never addresses the state block itself.
+//! XMM registers are modelled the same way (one `alloca <2 x i64>` per register the function
+//! uses); see `lift/simd/mod.rs` for SSE/AVX semantics, the supported
+//! instruction set and the documented deviations (NaN payloads, FTZ/DAZ, MXCSR, `rcp`/`rsqrt`).
+//!
+//! # Target features
+//! Every lifted function carries [`LIFTED_FUNCTION_ATTRIBUTES`] (`+simd128`): SSE code is lifted
+//! to plain LLVM vector IR and lowers to WebAssembly SIMD (`v128`) instructions.
 //!
 //! Sub-registers follow x86-64 rules: 32-bit writes zero-extend to 64 bits, 8/16-bit writes
 //! preserve the untouched bits, and `AH/CH/DH/BH` address bits 8..16.
@@ -95,6 +102,12 @@ pub const WASM64_TRIPLE: &str = "wasm64-unknown-unknown";
 /// LLVM data layout of the emitted module (llc/clang replace it with their own wasm64 layout).
 pub const WASM64_DATALAYOUT: &str =
     "e-m:e-p:64:64-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20";
+
+/// Attributes of every lifted function (`#0`): lifted SSE code is plain LLVM vector IR, and
+/// WebAssembly SIMD (`simd128`) lets it lower to `v128` instructions instead of being
+/// scalarised. Consumers must run the module on an engine with wasm SIMD (every engine with
+/// memory64 has it).
+pub const LIFTED_FUNCTION_ATTRIBUTES: &str = "\"target-features\"=\"+simd128\"";
 
 /// Name of the guest CPU state type in the emitted IR.
 pub const GUEST_STATE_TYPE: &str = "%playgta6.GuestState";
@@ -223,6 +236,8 @@ enum Support {
     Umul128,
     Udiv128,
     Sdiv128,
+    /// An intrinsic used by lifted SSE/AVX code.
+    Simd(function::simd::Decl),
 }
 
 /// A complete lifted module.
@@ -326,6 +341,7 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
                     "declare i{bits} @llvm.fshr.i{bits}(i{bits}, i{bits}, i{bits})"
                 );
             }
+            Support::Simd(decl) => out.push_str(&decl.declaration()),
             Support::Umul128 | Support::Udiv128 | Support::Sdiv128 => {}
         }
     }
@@ -343,6 +359,8 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
         out.push('\n');
         out.push_str(&func.ir);
     }
+    out.push('\n');
+    let _ = writeln!(out, "attributes #0 = {{ {LIFTED_FUNCTION_ATTRIBUTES} }}");
     Ok(out)
 }
 

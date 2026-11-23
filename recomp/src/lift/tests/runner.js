@@ -1,7 +1,7 @@
 // Test-only harness: runs lifted wasm64 functions under node (memory64).
 // Usage: node [--experimental-wasm-memory64] runner.js <module.wasm> <cases.json>
 //
-// cases.json: { state, gprOffset, flagsOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
+// cases.json: { state, gprOffset, flagsOffset, xmmOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
 // `regs` lists [index, value] pairs; unlisted registers are zero.
 // For every case the harness writes guest registers/flags/memory, pushes a fake return address
 // (emulating the caller's `call`), invokes the export and prints one tab-separated line:
@@ -14,6 +14,7 @@ const spec = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
 const STATE = Number(BigInt(spec.state));
 const GPR = STATE + spec.gprOffset;
 const FLAGS = STATE + spec.flagsOffset;
+const XMM = STATE + (spec.xmmOffset || 0);
 const RSP = 4;
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 
@@ -25,6 +26,16 @@ const hostFunctions = new Map([
     const rcx = v.getBigUint64(GPR + 8, true);
     const rdx = v.getBigUint64(GPR + 16, true);
     v.setBigUint64(GPR, BigInt.asUintN(64, rcx * 10n + rdx), true);
+    v.setBigUint64(GPR + RSP * 8, v.getBigUint64(GPR + RSP * 8, true) + 8n, true);
+  }],
+  // 0x7FFE0010: double f(double x = xmm0, double y = xmm1, int64 n = r8) = x * y + n, result in
+  // xmm0 (upper half preserved, like the import thunks), then `ret`.
+  [0x7FFE0010n, () => {
+    const v = view();
+    const x = v.getFloat64(XMM, true);
+    const y = v.getFloat64(XMM + 16, true);
+    const n = v.getBigInt64(GPR + 8 * 8, true);
+    v.setFloat64(XMM, x * y + Number(n), true);
     v.setBigUint64(GPR + RSP * 8, v.getBigUint64(GPR + RSP * 8, true) + 8n, true);
   }],
 ]);

@@ -18,6 +18,9 @@ use super::{
 };
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
+#[path = "simd/mod.rs"]
+pub(super) mod simd;
+
 const GPR_NAMES: [&str; 16] = [
     "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
     "r14", "r15",
@@ -171,6 +174,7 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
     }
     let mut regs = [false; 16];
     regs[RSP] = true;
+    let mut xmms = [false; 16];
     let mut faulting_calls = BTreeSet::new();
     let mut info = InstructionInfoFactory::new();
     for (&start, block) in &func.blocks {
@@ -193,7 +197,9 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
                 if reg.is_gpr() && reg.full_register().is_gpr64() {
                     regs[reg.full_register().number()] = true;
                 }
+                simd::note_register(reg, &mut xmms);
             }
+            simd::note_instruction(ins, &mut xmms);
         }
         // Direct calls whose target discovery found to be unmapped or non-executable fault.
         for call in &block.calls {
@@ -215,6 +221,7 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
     let mut lifter = FunctionLifter {
         func,
         regs,
+        xmms,
         faulting_calls,
         body: String::new(),
         tmp: 0,
@@ -256,6 +263,8 @@ struct FunctionLifter<'a> {
     func: &'a cfg::Function,
     /// GPRs the function touches; only these get an alloca and are synced with the state.
     regs: [bool; 16],
+    /// XMM registers the function touches (`alloca <2 x i64>` each, synced like the GPRs).
+    xmms: [bool; 16],
     /// Sites of direct calls into unmapped or non-executable memory (lifted as traps).
     faulting_calls: BTreeSet<u64>,
     body: String,
@@ -422,7 +431,7 @@ impl FunctionLifter<'_> {
 
         let body = std::mem::take(&mut self.body);
         let mut ir = String::new();
-        let _ = writeln!(ir, "define void @{symbol}(ptr noalias %state) {{");
+        let _ = writeln!(ir, "define void @{symbol}(ptr noalias %state) #0 {{");
         ir.push_str("entry:\n");
         for (idx, name) in GPR_NAMES.iter().enumerate() {
             if self.regs[idx] {
@@ -432,6 +441,7 @@ impl FunctionLifter<'_> {
         for flag in FLAGS {
             let _ = writeln!(ir, "  {} = alloca i1", flag.slot());
         }
+        self.xmm_allocas(&mut ir);
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
         self.sync_in();
@@ -551,6 +561,7 @@ impl FunctionLifter<'_> {
             let bit = self.val(&format!("trunc i8 {byte} to i1"));
             self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
         }
+        self.sync_xmm_in();
     }
 
     /// Stores all tracked registers and flags from their allocas back into `%state`.
@@ -568,6 +579,7 @@ impl FunctionLifter<'_> {
             let ptr = self.state_flag_ptr(flag);
             self.emit(&format!("store i8 {byte}, ptr {ptr}"));
         }
+        self.sync_xmm_out();
     }
 
     fn segment_base(&mut self, field: u32) -> String {
@@ -912,6 +924,9 @@ impl FunctionLifter<'_> {
         use Mnemonic as M;
         if ins.code() == Code::INVALID {
             return unsupported("invalid instruction encoding");
+        }
+        if simd::is_simd(ins) {
+            return self.lift_simd(ins);
         }
         match ins.mnemonic() {
             M::Nop | M::Pause | M::Endbr64 => {}
