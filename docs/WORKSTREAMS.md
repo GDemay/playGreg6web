@@ -20,7 +20,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Lift small synthetic x86-64 test functions (arithmetic, branches, memory loads/stores, Win64 ABI calls) to LLVM IR and compile to `wasm64`.
 - [x] **R4 — PE64 `.pdata` Exception Directory & Jump-Table Recovery** — `DONE` (PR #85, closes #38) *(no game files required — disjoint file `recomp/src/pdata.rs`)*
   - Parse PE64 `IMAGE_DIRECTORY_ENTRY_EXCEPTION` (`RUNTIME_FUNCTION` begin/end/unwind RVA) and `UNWIND_INFO` to recover exact function boundaries and switch/jump tables without heuristics.
-- [ ] **R5 — Import Thunk & Runtime Call-Bridge Generator** — `IN PROGRESS` (#39, @Timon-ok) *(no game files required — disjoint file `recomp/src/stubs.rs`)*
+- [x] **R5 — Import Thunk & Runtime Call-Bridge Generator** — `DONE` (PR #93, closes #39) *(no game files required — disjoint file `recomp/src/stubs.rs`)*
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
 - [x] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `DONE` (PR #78, closes #40) *(no game files required — disjoint file `recomp/src/image.rs`)*
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
