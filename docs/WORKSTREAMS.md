@@ -88,7 +88,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
 - [x] **O20 — Complete Remaining 4 `WINHTTP.dll` Shims (`runtime/os/xbox_offline.cpp`)** — `DONE` (PR #208, closes #199) *(landed alongside `O15`: `WINHTTP.dll` is now 15/15 = 100%)*
   - Implements and registers the final 4 `WINHTTP.dll` exports in `Win32ModuleRegistry` for 15/15 (100%) WinHTTP coverage.
-- [ ] **O21 — Guest CPU Identification Helpers: `cpuid`/`rdtsc`/`rdtscp`/`xgetbv` (`runtime/guest/cpu_helpers.{h,cpp}`)** — `IN PROGRESS` (#207, @Timon-ok) *(no game files required — small ABI addition first, then disjoint files `runtime/guest/cpu_helpers.{h,cpp}`, `tests/test_cpu_helpers.cpp`)*
+- [x] **O21 — Guest CPU Identification Helpers: `cpuid`/`rdtsc`/`rdtscp`/`xgetbv` (`runtime/guest/cpu_helpers.{h,cpp}`)** — `DONE` (PRs #210 + #221, closes #207) *(no game files required — small ABI addition first, then disjoint files `runtime/guest/cpu_helpers.{h,cpp}`, `tests/test_cpu_helpers.cpp`)*
   - Document and implement `__playgta6_cpuid`/`__playgta6_rdtsc`/`__playgta6_rdtscp`/`__playgta6_xgetbv` (emitted by the lifter since R7) as a consistent virtual CPU whose advertised features match what the lifter implements.
 
 ---
