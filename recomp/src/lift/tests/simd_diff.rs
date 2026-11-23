@@ -714,18 +714,18 @@ fn xmm_matches(check: Check, host: &[u8; 16], got: &[u8; 16]) -> bool {
         Check::Approx => (0..4).all(|i| {
             let h = f32::from_bits(lane(host, i, 4) as u32);
             let g = f32::from_bits(lane(got, i, 4) as u32);
-            // Results at the bottom of the normal range may flush to zero on one side only.
-            let tiny = |v: f32| v.abs() <= f32::MIN_POSITIVE;
+            // Results at the bottom of the normal range may flush to zero on one side only
+            // (CPUs differ in where exactly they flush), so near-tiny results only need to be
+            // tiny on both sides.
+            let tiny = |v: f32| v.abs() <= 2.0 * f32::MIN_POSITIVE;
+            let same_sign = h.is_sign_negative() == g.is_sign_negative();
             if h.is_nan() {
                 g.is_nan()
-            } else if h.is_infinite() {
+            } else if h.is_infinite() || g.is_infinite() {
                 h.to_bits() == g.to_bits()
-            } else if tiny(h) || tiny(g) {
-                tiny(h) && tiny(g) && h.is_sign_negative() == g.is_sign_negative()
             } else {
-                g.is_finite()
-                    && h.is_sign_negative() == g.is_sign_negative()
-                    && f64::from((h - g).abs()) <= f64::from(h.abs()) / 2048.0
+                let close = h != 0.0 && f64::from((h - g).abs()) <= f64::from(h.abs()) / 2048.0;
+                same_sign && (close || (tiny(h) && tiny(g)))
             }
         }),
     }
