@@ -1,5 +1,10 @@
 #include "os/os_shim.h"
 
+#include <memory>
+#include <mutex>
+
+#include "os/httpfs_mailbox.h"
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 
@@ -9,12 +14,48 @@ EM_IMPORT(env) int32_t host_httpfs_open(const char* ptr, size_t len);
 EM_IMPORT(env) int64_t host_httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
 EM_IMPORT(env) void host_httpfs_close(int32_t handle);
 EM_IMPORT(env) void host_wgpu_submit(const uint8_t* ptr, size_t len);
+
+EMSCRIPTEN_KEEPALIVE void playgta6_attach_httpfs_mailbox(playgta6::os::HttpfsMailbox* mailbox) {
+    playgta6::os::httpfs_attach_mailbox(mailbox);
+}
 }
 #else
 #include <cstdio>
 #endif
 
 namespace playgta6::os {
+
+namespace {
+
+struct AttachedHttpfsState {
+    std::mutex mutex;
+    std::shared_ptr<HttpfsMailboxClient> owned_client;
+    HttpfsMailboxClient* external_client = nullptr;
+};
+
+AttachedHttpfsState& httpfs_state() {
+    static AttachedHttpfsState state;
+    return state;
+}
+
+struct ActiveHttpfsLease {
+    std::shared_ptr<HttpfsMailboxClient> owned;
+    HttpfsMailboxClient* client = nullptr;
+};
+
+ActiveHttpfsLease acquire_httpfs_client() {
+    auto& st = httpfs_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (st.external_client != nullptr) {
+        return ActiveHttpfsLease{nullptr, st.external_client};
+    }
+    if (st.owned_client != nullptr) {
+        return ActiveHttpfsLease{st.owned_client, st.owned_client.get()};
+    }
+    return ActiveHttpfsLease{};
+}
+
+}  // namespace
 
 void log(std::string_view message) {
 #ifdef __EMSCRIPTEN__
@@ -25,7 +66,34 @@ void log(std::string_view message) {
 #endif
 }
 
+void httpfs_attach_mailbox(HttpfsMailbox* mailbox) {
+    auto& st = httpfs_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.external_client = nullptr;
+    if (mailbox != nullptr) {
+        st.owned_client = std::make_shared<HttpfsMailboxClient>(mailbox);
+    } else {
+        st.owned_client.reset();
+    }
+}
+
+void httpfs_attach_client(HttpfsMailboxClient* client) {
+    auto& st = httpfs_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    st.owned_client.reset();
+    st.external_client = client;
+}
+
+bool httpfs_has_attached_mailbox() {
+    auto& st = httpfs_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return st.external_client != nullptr || st.owned_client != nullptr;
+}
+
 int32_t httpfs_open(std::string_view rel_path) {
+    if (auto lease = acquire_httpfs_client(); lease.client != nullptr) {
+        return lease.client->open(rel_path);
+    }
 #ifdef __EMSCRIPTEN__
     return host_httpfs_open(rel_path.data(), rel_path.size());
 #else
@@ -35,6 +103,9 @@ int32_t httpfs_open(std::string_view rel_path) {
 }
 
 int64_t httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len) {
+    if (auto lease = acquire_httpfs_client(); lease.client != nullptr) {
+        return lease.client->read(handle, offset, dst, len);
+    }
 #ifdef __EMSCRIPTEN__
     return host_httpfs_read(handle, offset, dst, len);
 #else
@@ -47,6 +118,10 @@ int64_t httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len) {
 }
 
 void httpfs_close(int32_t handle) {
+    if (auto lease = acquire_httpfs_client(); lease.client != nullptr) {
+        (void)lease.client->close(handle);
+        return;
+    }
 #ifdef __EMSCRIPTEN__
     host_httpfs_close(handle);
 #else

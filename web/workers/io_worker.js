@@ -1,17 +1,23 @@
 'use strict';
 
-// HTTP Range (206 Partial Content) VFS worker + OPFS/LRU RangeCache + bootset prefetch.
+// HTTP Range (206 Partial Content) VFS worker + OPFS/LRU RangeCache + bootset prefetch + SAB mailbox.
 if (typeof importScripts === 'function') {
   importScripts('./range_cache.js');
+  importScripts('./httpfs_mailbox.js');
 }
 
 const rangeCacheModule =
   (typeof globalThis !== 'undefined' && globalThis.PlayGta6RangeCache) ||
   (typeof require === 'function' ? require('./range_cache.js') : null);
 
+const httpfsMailboxModule =
+  (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
+  (typeof require === 'function' ? require('./httpfs_mailbox.js') : null);
+
 let dataBase = '/data/';
 let manifest = null;
 let rangeCache = null;
+let mailboxHost = null;
 
 function ensureRangeCache() {
   if (!rangeCache) {
@@ -21,6 +27,34 @@ function ensureRangeCache() {
     rangeCache = new rangeCacheModule.RangeCache({ dataBase });
   }
   return rangeCache;
+}
+
+async function detachMailbox() {
+  if (mailboxHost) {
+    const prev = mailboxHost;
+    mailboxHost = null;
+    await prev.stop();
+  }
+}
+
+async function attachMailbox(sab, options = {}) {
+  if (!httpfsMailboxModule || typeof httpfsMailboxModule.HttpfsMailboxHost !== 'function') {
+    throw new Error('PlayGta6HttpfsMailbox unavailable in io_worker');
+  }
+  await detachMailbox();
+  mailboxHost = new httpfsMailboxModule.HttpfsMailboxHost(sab, {
+    getRangeCache: ensureRangeCache,
+    getManifest: () => manifest,
+    probeOnOpen: options.probeOnOpen,
+    forcePoll: options.forcePoll,
+    fallbackPollMs: options.fallbackPollMs,
+  });
+  mailboxHost.start().catch((err) => {
+    if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
+      self.postMessage({ error: `httpfs_mailbox: ${err}` });
+    }
+  });
+  return mailboxHost;
 }
 
 function emptyStats() {
@@ -100,7 +134,20 @@ if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
     const msg = ev.data || {};
     try {
       if (msg.init) {
+        if (msg.mailboxSab) {
+          await attachMailbox(msg.mailboxSab, msg);
+        }
         await init(msg);
+      } else if (msg.attachMailbox) {
+        await attachMailbox(msg.sab || msg.mailboxSab, msg);
+        const reply = { mailboxAttached: true };
+        if (msg.id !== undefined) reply.id = msg.id;
+        self.postMessage(reply);
+      } else if (msg.detachMailbox) {
+        await detachMailbox();
+        const reply = { mailboxDetached: true };
+        if (msg.id !== undefined) reply.id = msg.id;
+        self.postMessage(reply);
       } else if (msg.read) {
         const cache = ensureRangeCache();
         const bytes = await cache.read(msg.path, msg.offset, msg.length);
