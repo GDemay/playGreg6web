@@ -16,8 +16,9 @@ Follow these steps whenever starting a session with a new or returning contribut
    - Run `python tools/local_env.py --check`.
    - If `GTA6_GAME_DIR` is **NOT SET**, ask the user where their local Xbox Series game folder is (or whether they want to work on a task that does not require game files).
    - When the user provides a path, save it into gitignored `.env` via `python tools/local_env.py --set-game "<path>"`. Never copy game files into the repo.
-3. **Pick a track & branch cleanly:**
-   - Match the user's installed toolchains (`tools/local_env.py --check`) and whether they have local game files to an open task in [docs/WORKSTREAMS.md](./docs/WORKSTREAMS.md).
+3. **Claim a task & branch cleanly (avoid duplicate work):**
+   - Check open GitHub Issues (`gh issue list`) and [docs/WORKSTREAMS.md](./docs/WORKSTREAMS.md) for any task already marked `IN PROGRESS` or assigned to someone else — **never start a claimed task**.
+   - Match the user's installed toolchains (`tools/local_env.py --check`) and whether they have local game files to an unclaimed task, then **claim it first** (create/assign a GitHub Issue via `gh issue create --assignee "@me"` and/or mark it `IN PROGRESS` in `docs/WORKSTREAMS.md`).
    - Work on a dedicated branch named `<track>/<task-slug>` (e.g., `recomp/pe-imports`, `shaders/naga-pass`, `web/opfs-cache`) so multiple contributors don't collide on `main`.
    - If a shared ABI in `docs/` or `runtime/abi/playgta6_abi.h` must change, keep that in a small dedicated PR first.
 4. **Verify before finishing:**

@@ -9,7 +9,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 1: Recompiler (`recomp/`, Rust)
 **Goal:** Lift the Xbox Series x86-64 PE executable into Wasm64 (`memory64`).
 
-- [ ] **R1 — PE Parser & Import Dumper** *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
+- [ ] **R1 — PE Parser & Import Dumper** — `IN PROGRESS` (#1, @MarcBlattmann) *(needs `GTA6_GAME_DIR` for real test; unit-testable with synthetic PE)*
   - Parse PE64 headers, sections, exports, TLS callbacks, and import tables (`object` / `goblin` crate).
   - Emit a sanitized symbol-only report (`docs/imports_required.md` — DLL + function names only, zero game bytes).
 - [ ] **R2 — x86-64 Decoder & Function Discovery** *(no game files required for unit tests)*
@@ -60,9 +60,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
 
-- [ ] **W1 — OPFS + LRU Range Cache in `io_worker.js`** *(no game files required)*
+- [ ] **W1 — OPFS + LRU Range Cache in `io_worker.js`** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
   - Cache fetched HTTP `206` byte chunks in Origin Private File System (OPFS) with a configurable budget + `bootset.json` prefetch on startup.
-- [ ] **W2 — IndexedDB `/userdata` Save Persistence** *(no game files required)*
+- [ ] **W2 — IndexedDB `/userdata` Save Persistence** — `IN PROGRESS` (#2, @MarcBlattmann) *(no game files required)*
   - Restore `/userdata/` files into Wasm FS before `main()` and flush writes asynchronously (mirroring `playgta5`'s `loader.js` pattern).
 - [ ] **W3 — `audio_worker.js` Opus / WebAudio Pipeline** *(no game files required)*
   - Implement `AudioWorklet` ring buffer + Ogg Opus stream decoding.
