@@ -9,11 +9,11 @@
 #include <emscripten/emscripten.h>
 
 extern "C" {
-EM_IMPORT(env) void host_log(const char* ptr, size_t len);
-EM_IMPORT(env) int32_t host_httpfs_open(const char* ptr, size_t len);
-EM_IMPORT(env) int64_t host_httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
-EM_IMPORT(env) void host_httpfs_close(int32_t handle);
-EM_IMPORT(env) void host_wgpu_submit(const uint8_t* ptr, size_t len);
+EM_IMPORT(host_log) void host_log(const char* ptr, size_t len);
+EM_IMPORT(host_httpfs_open) int32_t host_httpfs_open(const char* ptr, size_t len);
+EM_IMPORT(host_httpfs_read) int64_t host_httpfs_read(int32_t handle, uint64_t offset, void* dst, size_t len);
+EM_IMPORT(host_httpfs_close) void host_httpfs_close(int32_t handle);
+EM_IMPORT(host_wgpu_submit) void host_wgpu_submit(const uint8_t* ptr, size_t len);
 
 EMSCRIPTEN_KEEPALIVE void playgta6_attach_httpfs_mailbox(playgta6::os::HttpfsMailbox* mailbox) {
     playgta6::os::httpfs_attach_mailbox(mailbox);
