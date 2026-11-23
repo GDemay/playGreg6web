@@ -82,8 +82,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Sub-allocating ring of `MAP_WRITE | COPY_SRC` / `writeBuffer` staging chunks with fence-driven recycling to eliminate per-frame buffer allocation churn in `wgpu_worker.js`.
 - [ ] **G15 — Live WebGPU Smoke Demo Runner Wiring (`web/demo/run_smoke_demo.js`)** — `IN PROGRESS` (#88, @MarcBlattmann) *(no game files required — disjoint files `web/demo/run_smoke_demo.js`, `tests/test_run_smoke_demo.mjs`)*
   - Wires `SmokeSceneController` (`W16`) + `GpuRingBuffer` + `WgpuSwapchain` (`G9`) + `WgpuCommandProcessor` + `GpuFrameRecorder` (`G13`) + `PerfMonitor` (`W15`) into a turnkey browser `requestAnimationFrame` driver for live WebGPU testing.
-- [ ] **G16 — WebGPU Timestamp Query & Pass GPU-Time Profiler (`web/workers/gpu_timer.js`)** *(unclaimed; no game files required — disjoint files `web/workers/gpu_timer.js`, `tests/test_gpu_timer.mjs`)*
+- [ ] **G16 — WebGPU Timestamp Query & Pass GPU-Time Profiler (`web/workers/gpu_timer.js`)** — `IN PROGRESS` (#94, @MarcBlattmann) *(no game files required — disjoint files `web/workers/gpu_timer.js`, `tests/test_gpu_timer.mjs`)*
   - Wraps optional WebGPU `'timestamp-query'` `GPUQuerySet` resolution (gracefully degrading when absent) to measure per-pass render/compute GPU timings in milliseconds.
+- [ ] **G17 — S6 Reflection Manifest Loader & Auto-BindGroup Builder (`web/workers/reflection_loader.js`)** *(unclaimed; no game files required — disjoint files `web/workers/reflection_loader.js`, `tests/test_reflection_loader.mjs`)*
+  - Parses `S6` (`shaders/src/reflect.rs`) reflection JSON manifests in JS and builds exact `GPUBindGroupLayout` + `GPUPipelineLayout` descriptors via `WebGpuPipelineCache` (`G11`).
 
 ---
 
@@ -142,9 +144,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Self-contained binary command stream generator exercising `G5` (`CreateTexture`, `CreateSampler`, `CreateBindGroup`, `SetIndexBuffer`, `DrawIndexed`, `DispatchCompute`) + `WgpuSwapchain` so opening `http://127.0.0.1:8080` renders a live textured 3D/compute frame in Chrome/Edge even before `runtime.wasm` is compiled.
 - [x] **W17 — Emscripten Wasm64 Build Script for Linux/macOS (`runtime/build_wasm.sh`) & CI Artifact Check** — `DONE` (PR #76, closes #69) *(no game files required — disjoint files `runtime/build_wasm.sh`, `tests/test_build_scripts.py`)*
   - Cross-platform POSIX shell counterpart to `runtime/build_wasm.ps1` (`--check-only`, `-sMEMORY64=1 -pthread`, `web/dist/runtime.{js,wasm}` output).
-- [ ] **W18 — Streaming HTTPFS Priority Scheduler & Prefetch Queue (`web/workers/io_scheduler.js`)** — `IN PROGRESS` (#73, @MarcBlattmann) *(no game files required — disjoint files `web/workers/io_scheduler.js`, `tests/test_io_scheduler.mjs`)*
+- [x] **W18 — Streaming HTTPFS Priority Scheduler & Prefetch Queue (`web/workers/io_scheduler.js`)** — `DONE` (PR #87, closes #73) *(no game files required — disjoint files `web/workers/io_scheduler.js`, `tests/test_io_scheduler.mjs`)*
   - Priority queue (critical boot/sync reads > streaming world cells > background prefetch) with cancellation, retry backoff, and concurrency throttling in front of `RangeCache`.
-- [ ] **W19 — Binary Wasm64 Memory64/Threads & ABI Import Validator (`tools/check_wasm_exports.py`)** — `IN PROGRESS` (#74, @MarcBlattmann) *(no game files required — disjoint files `tools/check_wasm_exports.py`, `tests/test_wasm_exports.py`)*
+- [x] **W19 — Binary Wasm64 Memory64/Threads & ABI Import Validator (`tools/check_wasm_exports.py`)** — `DONE` (PR #90, closes #74) *(no game files required — disjoint files `tools/check_wasm_exports.py`, `tests/test_wasm_exports.py`)*
   - Binary `.wasm` section/import/export validator verifying a compiled `runtime.wasm` declares `memory64` (`i64` memory), shared memory (`threads`), and exact `env.host_*` ABI imports from `docs/wasm_abi.md`.
 - [ ] **W20 — Gamepad Remapper & Input Profile Persistence (`web/input/input_profiles.js`)** — `IN PROGRESS` (#83, @MarcBlattmann) *(no game files required — disjoint files `web/input/input_profiles.js`, `tests/test_input_profiles.mjs`)*
   - Configurable keyboard/mouse/gamepad presets, sensitivity/deadzone curves, and localStorage/IndexedDB profile persistence feeding `InputBridge`.
@@ -152,7 +154,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Captures Wasm traps, WebGPU validation/device-lost errors, recent runtime logs, and browser capability fingerprints into sanitized shareable JSON reports (never including game data or host paths).
 - [ ] **W22 — Browser Emscripten Runtime Session Controller (`web/runtime/session_controller.js`)** — `IN PROGRESS` (#89, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/session_controller.js`, `tests/test_session_controller.mjs`)*
   - Orchestrates worker startup (`io_worker`, `wgpu_worker`, `audio_engine`), `InputBridge`, `PerfMonitor`, `BrowserStorageManager`, and clean restart/fallback into `SmokeSceneController` when `dist/runtime.wasm` is absent.
-- [ ] **W23 — Local Asset Pipeline Orchestrator CLI (`tools/prepare_local.py`)** *(unclaimed; no game files required — disjoint files `tools/prepare_local.py`, `tests/test_prepare_local.py`)*
+- [ ] **W23 — Local Asset Pipeline Orchestrator CLI (`tools/prepare_local.py`)** — `IN PROGRESS` (#95, @MarcBlattmann) *(no game files required — disjoint files `tools/prepare_local.py`, `tests/test_prepare_local.py`)*
   - Single-command dry-run/execute helper that runs `scan` → `xvd`/`rpf9`/`manifest`/`bootset` → `recomp inspect` → `shaders convert` against `GTA6_GAME_DIR` into gitignored `local-data/` & `work/`.
 - [ ] **W24 — Browser HUD Action Controls & Interactive Diagnostics Wiring (`web/ui/hud_controller.js`)** *(unclaimed; no game files required — disjoint files `web/ui/hud_controller.js`, `tests/test_hud_controller.mjs`)*
   - Binds HUD buttons (Clear OPFS Cache, Export Saves, Capture GPU Trace, Export Crash Report, Switch Input Profile, Toggle Smoke Demo) to `BrowserStorageManager`, `GpuFrameRecorder`, `CrashReporter`, and `SessionController`.
+- [ ] **W25 — LAN / Private-Host CORS & Range Streaming Benchmark CLI (`tools/bench_range_server.py`)** *(unclaimed; no game files required — disjoint files `tools/bench_range_server.py`, `tests/test_bench_range_server.py`)*
+  - Measures concurrent HTTP `206` Range throughput, latency percentiles, and `If-None-Match` (`304`) overhead against `server/serve_local.py` on synthetic payloads.
