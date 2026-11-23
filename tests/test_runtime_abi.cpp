@@ -1060,7 +1060,7 @@ void test_guest_state_layout() {
     using namespace playgta6;
 
     // Pinned to the lifter's `%playgta6.GuestState` (recomp/src/lift STATE_* constants).
-    CHECK(sizeof(GuestState) == 416);
+    CHECK(sizeof(GuestState) == 688);
     CHECK(offsetof(GuestState, gpr) == 0);
     CHECK(offsetof(GuestState, rip) == 128);
     CHECK(offsetof(GuestState, flags) == 136);
@@ -1068,6 +1068,10 @@ void test_guest_state_layout() {
     CHECK(offsetof(GuestState, gs_base) == 152);
     CHECK(offsetof(GuestState, xmm) == 160);
     CHECK(kGuestStateXmmStride == 16);
+    CHECK(offsetof(GuestState, ymm_hi) == 416);
+    CHECK(kGuestStateYmmHiStride == 16);
+    CHECK(offsetof(GuestState, mxcsr) == 672);
+    CHECK(kGuestMxcsrDefault == 0x1F80);
     CHECK(kGuestStackArgOffset == 40);
     CHECK(GuestReg::Rsp == 4 && GuestReg::R8 == 8 && GuestReg::R15 == 15);
     CHECK(GuestFlag::CF == 0 && GuestFlag::OF == 5 && GuestFlag::DF == 6);
@@ -1079,6 +1083,8 @@ void test_guest_state_layout() {
     state.gs_base = 0xAABBCCDDEEFF0011ULL;
     state.xmm[3][0] = 0x0102030405060708ULL;
     state.xmm[3][1] = 0x090A0B0C0D0E0F10ULL;
+    state.ymm_hi[15][1] = 0x1112131415161718ULL;
+    state.mxcsr = kGuestMxcsrDefault;
     uint8_t raw[sizeof(GuestState)];
     std::memcpy(raw, &state, sizeof(raw));
     CHECK(raw[8] == 0x88 && raw[15] == 0x11);
@@ -1087,6 +1093,9 @@ void test_guest_state_layout() {
     CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride] == 0x08);
     CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride + 8] == 0x10);
     CHECK(raw[kGuestStateXmmOffset + 3 * kGuestStateXmmStride + 15] == 0x09);
+    CHECK(raw[kGuestStateYmmHiOffset + 15 * kGuestStateYmmHiStride + 8] == 0x18);
+    CHECK(raw[kGuestStateYmmHiOffset + 15 * kGuestStateYmmHiStride + 15] == 0x11);
+    CHECK(raw[kGuestStateMxcsrOffset] == 0x80 && raw[kGuestStateMxcsrOffset + 1] == 0x1F);
 
     // Lifted-function type and helper signatures (`(ptr, i64)` on wasm64).
     using HelperFn = void (*)(GuestState*, uint64_t);
