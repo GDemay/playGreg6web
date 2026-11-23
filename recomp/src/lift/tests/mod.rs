@@ -4,9 +4,15 @@
 //! `bytes -> CodeImage -> discover -> lift_module` pipeline.
 
 mod exec;
+mod exec_simd;
 #[cfg(target_arch = "x86_64")]
 mod host_diff;
+#[cfg(target_arch = "x86_64")]
+mod host_diff_simd;
 mod ir;
+mod ir_simd;
+#[cfg(target_arch = "x86_64")]
+mod simd_diff;
 
 use std::collections::BTreeMap;
 
