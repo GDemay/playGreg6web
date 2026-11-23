@@ -150,7 +150,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
 - [x] **S7 — Offline `WGPK` Shader Pack Inspector, Diff & WebGPU Limit Budget CLI (`tools/inspect_wgsl_pack.py`)** — `DONE` (PR #146, closes #129) *(no game files required — disjoint files `tools/inspect_wgsl_pack.py`, `tests/test_inspect_wgsl_pack.py`)*
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
-- [ ] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `UNCLAIMED` *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
+- [ ] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `IN PROGRESS` (#181, @MarcBlattmann) *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
   - Read-only local scanner classifying shader containers (`DXBC`, `DXIL`, `SPIR-V`, or Xbox Scarlett RDNA2 ISA signatures) in a local directory into a sanitized JSON summary for M2/M4 shader planning.
 
 ---
@@ -230,3 +230,5 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse the real Xbox Series RPF9 header words cleanly without rejecting valid archives as truncated, and report header layout/entry/encryption metadata cleanly.
 - [x] **W36 — Wasm64 Memory64 Runtime & BigInt64 Host Import Integration Tests (`tests/test_wasm64_runtime.mjs`)** — `DONE` (PR #177, closes #173) *(no game files required — disjoint file `tests/test_wasm64_runtime.mjs`)*
   - Verifies synthetic Wasm64 `i64` memory marshaling with `web/loader.js` `createHostImports` and validates local `web/dist/runtime.wasm` ABI exports when present.
+- [ ] **W37 — Real-Binary Import Coverage Auditor CLI (`tools/check_import_coverage.py`)** — `IN PROGRESS` (#182, @MarcBlattmann) *(no game files required — disjoint files `tools/check_import_coverage.py`, `tests/test_import_coverage.py`)*
+  - Parses all 68 DLLs / 587 symbols in `docs/imports_required.md`, audits live `runtime/` shim & registry coverage vs `R12` guest-recompiled DLLs, and reports exact remaining symbols.
