@@ -16,13 +16,17 @@ Follow these steps whenever starting a session with a new or returning contribut
    - Run `python tools/local_env.py --check`.
    - If `GTA6_GAME_DIR` is **NOT SET**, ask the user where their local Xbox Series game folder is (or whether they want to work on a task that does not require game files).
    - When the user provides a path, save it into gitignored `.env` via `python tools/local_env.py --set-game "<path>"`. Never copy game files into the repo.
-3. **Claim a task & branch cleanly (avoid duplicate work):**
-   - Check open GitHub Issues (`gh issue list`) and [docs/WORKSTREAMS.md](./docs/WORKSTREAMS.md) for any task already marked `IN PROGRESS` or assigned to someone else — **never start a claimed task**.
+3. **Claim a task & branch cleanly (avoid duplicate work — and NEVER stall):**
+   - Check open GitHub Issues (`gh issue list --state open`), open PRs (`gh pr list --state open`), and [docs/WORKSTREAMS.md](./docs/WORKSTREAMS.md) for any task already marked `IN PROGRESS` or assigned to someone else — **never start a claimed task**.
    - Match the user's installed toolchains (`tools/local_env.py --check`) and whether they have local game files to an unclaimed task, then **claim it first** (create/assign a GitHub Issue via `gh issue create --assignee "@me"` and/or mark it `IN PROGRESS` in `docs/WORKSTREAMS.md`).
+   - **If every listed task in `docs/WORKSTREAMS.md` is already `DONE` or `IN PROGRESS`, DO NOT stop and say "there is nothing left to take"!** Instead:
+     1. Read [docs/END_GOAL.md](./docs/END_GOAL.md) (M1 → M2 → M3 → M4) and check open PR file lists (`gh pr view <n> --json files`) to see which files are currently being edited.
+     2. Define the next concrete, non-overlapping milestone task needed to boot and play the real game (strictly disjoint files from open PRs), claim it with a new GitHub Issue (`gh issue create --assignee "@me"`), append it to `docs/WORKSTREAMS.md` as `IN PROGRESS`, and immediately start building it.
+     3. After completing and opening a PR for one task, **automatically continue** by claiming and starting the next unclaimed task toward M4 unless the user asked you to stop.
    - Work on a dedicated branch named `<track>/<task-slug>` (e.g., `recomp/pe-imports`, `shaders/naga-pass`, `web/opfs-cache`) so multiple contributors don't collide on `main`.
    - If a shared ABI in `docs/` or `runtime/abi/playgta6_abi.h` must change, keep that in a small dedicated PR first.
 4. **Verify before finishing:**
-   - Run `cargo test --workspace`, `python -m unittest discover -s tests -v`, `node --check` on modified JS files, and `ctest` on `runtime/` if CMake is installed.
+   - Run `cargo test --workspace`, `python -m unittest discover -s tests -v`, `node --check` on modified JS files, `node --test tests/*.mjs`, and `ctest` on `runtime/` if CMake is installed.
    - Run `git status` and confirm zero game files, dumps, or `.env` are staged.
 
 ## Folder Responsibilities
