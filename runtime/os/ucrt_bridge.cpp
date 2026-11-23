@@ -1017,9 +1017,9 @@ int32_t pg6_crt_wstat64(const uint16_t* path, Pg6CrtStat64* buffer) {
     buffer->st_gid = static_cast<int16_t>(st.st_gid);
     buffer->st_rdev = static_cast<uint32_t>(st.st_rdev);
     buffer->st_size = static_cast<int64_t>(st.st_size);
-    buffer->st_atime = static_cast<int64_t>(st.st_atime);
-    buffer->st_mtime = static_cast<int64_t>(st.st_mtime);
-    buffer->st_ctime = static_cast<int64_t>(st.st_ctime);
+    buffer->atime_sec = static_cast<int64_t>(st.st_atime);
+    buffer->mtime_sec = static_cast<int64_t>(st.st_mtime);
+    buffer->ctime_sec = static_cast<int64_t>(st.st_ctime);
     return 0;
 }
 

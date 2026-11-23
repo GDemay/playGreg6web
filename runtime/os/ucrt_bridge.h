@@ -98,9 +98,9 @@ struct Pg6CrtStat64 {
     uint32_t st_rdev;
     uint32_t _pad1;
     int64_t st_size;
-    int64_t st_atime;
-    int64_t st_mtime;
-    int64_t st_ctime;
+    int64_t atime_sec;
+    int64_t mtime_sec;
+    int64_t ctime_sec;
 };
 
 // Matches Win64 UCRT `struct lconv`.
