@@ -25,10 +25,10 @@ Run **Grand Theft Auto VI (Xbox Series)** directly inside a user's modern web br
 - [x] SPIR-V → WGSL converter (`naga`), WebGPU compatibility sanitizer/auditor, `.wgsl.pack` bundler, and JS `WGPK` loader/cache (`wgsl_pack_loader.js`).
 - [ ] First Emscripten Wasm64 + Pthreads smoke build (`dist/runtime.wasm`) booting in Chrome/Edge and rendering a real WebGPU clear/triangle frame through the SAB GPU ring (`O1` + `G5`).
 
-### M2 — Real Game Static Analysis & Asset Readiness — `WAITING ON LOCAL FILES`
+### M2 — Real Game Static Analysis & Asset Readiness — `IN PROGRESS`
 - [x] Pure-Rust PE64 parser & sanitized import/export/TLS dumper (`playgta6-recomp inspect`).
 - [x] Non-extracting RPF9 header inspector, `bootset.json` generator, and partial-download folder scanner (`playgta6-manifest scan/rpf9/bootset`).
-- [ ] Run `playgta6-manifest scan --from-env` and `playgta6-recomp inspect --from-env` on a real local `GTA6_GAME_DIR` to verify container layout (`.xvc`/`.xvd` vs loose `.exe`/`.rpf9`) and publish sanitized `docs/imports_required.md` (symbol names only, zero game bytes).
+- [x] Run `playgta6-manifest scan --from-env` and `playgta6-recomp inspect` on a real local Xbox Series build — verified loose `.rpf` (little-endian `0x52504639` `"9FPR"` magic) + `game_scarlett_master.exe` layout (`355,103` functions, `22.6M` instructions decoded with 0 errors, `68` DLLs / `587` imports) and published sanitized [`docs/imports_required.md`](./imports_required.md) (symbol names & header metadata only, zero game bytes).
 - [ ] Run `playgta6-shaders audit` / `convert` on real extracted local shaders to generate a real WebGPU blocker report + `shader-index.json` + `.wgsl.pack` locally.
 
 ### M3 — Wasm64 Recompilation & Console OS/GDK Boot Surface — `IN PROGRESS`
