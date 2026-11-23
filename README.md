@@ -41,18 +41,3 @@ playgta6web/
 ├── server/       # Local HTTP server with COOP/COEP + Range (206) support
 └── local-data/   # GITIGNORED: local game data, manifests, recompiled wasm, WGSL packs
 ```
-
----
-
-## Roadmap (How to Split Work)
-
-**Track 1 — Browser Host, Streaming VFS & WebGPU Backend (`server/`, `web/`, `runtime/`)**
-- [ ] `server/serve_local.py` with `COOP`/`COEP` headers + HTTP Range (`206`)
-- [ ] `web/` worker shell (`loader.js`, `io_worker.js`, `wgpu_worker.js` with `OffscreenCanvas` WebGPU)
-- [ ] Input bridge (Pointer Lock, KB/M, Gamepad → `SharedArrayBuffer`) + IndexedDB `/userdata`
-- [ ] `d3d12_xs` → WebGPU command buffer bridge & Xbox OS shims (`xgameruntime`, `XTaskQueue`, VFS)
-
-**Track 2 — Recompilation & Shader Pipeline (`recomp/`, `shaders/`)**
-- [ ] Static x86-64 PE loader & lifting pipeline (`x86-64 → LLVM IR → Wasm64`)
-- [ ] RDNA2 → SPIR-V (`--mesh-compute`, `--wave64-emulate`) → WGSL (`naga`/`tint`) packer & `shader-index.json`
-- [ ] `data-manifest.json` + `bootset.json` generator for range-streaming local `.rpf` files
