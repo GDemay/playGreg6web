@@ -24,11 +24,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [ ] **O1 — Emscripten Wasm64 + Pthreads Smoke Build** *(no game files required)*
   - Wire `runtime/main.cpp` JS glue (`web/loader.js` imports for `host_log`, `host_wgpu_submit`) and verify `runtime/build_wasm.ps1` boots in Chrome/Edge.
-- [ ] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
+- [x] **O2 — Blocking HTTPFS Bridge (`io_worker.js` ↔ `runtime/os/`)** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
-- [ ] **O3 — Virtual Memory & Threading/TLS Shims** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
+- [x] **O3 — Virtual Memory & Threading/TLS Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
-- [ ] **O4 — `GameInput` & `/userdata` Shims** — `IN PROGRESS` (#3, @MarcBlattmann) *(no game files required)*
+- [x] **O4 — `GameInput` & `/userdata` Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
 
 ---
