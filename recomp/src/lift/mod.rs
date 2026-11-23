@@ -15,7 +15,13 @@
 //! | [`STATE_FLAGS_OFFSET`] (136) | 8 x 1 | `CF PF AF ZF SF OF DF pad`, one byte each, always 0 or 1 |
 //! | [`STATE_FS_BASE_OFFSET`] (144) | 8 | `fs` segment base |
 //! | [`STATE_GS_BASE_OFFSET`] (152) | 8 | `gs` segment base (TEB on Win64) |
-//! | [`STATE_XMM_OFFSET`] (160) | 16 x 16 | `xmm0..xmm15` (low 128 bits of `ymm0..15`) |
+//! | [`STATE_XMM_OFFSET`] (160) | 16 x 16 | `xmm0..xmm15` (bits 0..127 of `ymm0..15`) |
+//! | [`STATE_YMM_HI_OFFSET`] (416) | 16 x 16 | bits 128..255 of `ymm0..15` |
+//! | [`STATE_MXCSR_OFFSET`] (672) | 4 | MXCSR (the runtime initialises it to [`MXCSR_DEFAULT`]) |
+//! | 676 | 12 | reserved (zero) |
+//!
+//! The layout is append-only (existing offsets never move) and mirrored by
+//! `runtime/abi/playgta6_abi.h` / `docs/wasm_abi.md`.
 //!
 //! Inside a function, every GPR the function touches and every flag lives in an `alloca` that is
 //! loaded from the state at entry and after each call, and stored back before each call and every
@@ -126,8 +132,16 @@ pub const STATE_GS_BASE_OFFSET: u64 = 152;
 pub const STATE_XMM_OFFSET: u64 = 160;
 /// Distance between two XMM registers in the guest state.
 pub const STATE_XMM_STRIDE: u64 = 16;
+/// Byte offset of the upper halves (bits 128..255) of `ymm0..ymm15` in the guest state.
+pub const STATE_YMM_HI_OFFSET: u64 = 416;
+/// Distance between two YMM upper halves in the guest state.
+pub const STATE_YMM_HI_STRIDE: u64 = 16;
+/// Byte offset of the 32-bit MXCSR in the guest state.
+pub const STATE_MXCSR_OFFSET: u64 = 672;
 /// Total size of the guest state in bytes.
-pub const STATE_SIZE: u64 = 416;
+pub const STATE_SIZE: u64 = 688;
+/// MXCSR value of a new guest thread (round to nearest, all exceptions masked, FTZ/DAZ off).
+pub const MXCSR_DEFAULT: u32 = 0x1F80;
 
 /// Offset of the fifth Win64 argument from `rsp` when lifted code enters a callee: the 8-byte
 /// return address pushed by the lifted `call` plus the caller's 32-byte shadow space.
@@ -306,11 +320,11 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
     out.push('\n');
     let _ = writeln!(
         out,
-        "; gpr[16], rip, flags[CF PF AF ZF SF OF DF pad], fs_base, gs_base, xmm[16]"
+        "; gpr[16], rip, flags[CF PF AF ZF SF OF DF pad], fs_base, gs_base, xmm[16], ymm_hi[16], mxcsr, reserved"
     );
     let _ = writeln!(
         out,
-        "{GUEST_STATE_TYPE} = type {{ [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]] }}"
+        "{GUEST_STATE_TYPE} = type {{ [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]], [16 x [2 x i64]], i32, [3 x i32] }}"
     );
     out.push('\n');
     let _ = writeln!(out, "declare void @{HELPER_INDIRECT_CALL}(ptr, i64)");
