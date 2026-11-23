@@ -66,8 +66,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement CPU/GPU descriptor heap tables (`CBV_SRV_UAV`, `SAMPLER`, `RTV`, `DSV`), root signature parameter mapping, and dirty-bind-group caching that compiles D3D12 descriptor tables into WebGPU `CreateBindGroup`/`SetBindGroup` calls.
 - [ ] **G7 — D3D12 PSO Cache, Render Targets & Viewport/Scissor State** — `IN PROGRESS` (#45, @Timon-ok) *(no game files required — disjoint files `runtime/gpu/pso_cache.{h,cpp}`, `tests/test_pso_cache.cpp`)*
   - Hash D3D12 graphics & compute PSO descriptors (blend/depth/rasterizer/vertex-layout/shader hashes) to deduplicate WebGPU pipeline creation and track active RTV/DSV/viewport/scissor state per command list.
-- [ ] **G8 — Binary GPU Command Stream Disassembler & Trace Inspector** — `IN PROGRESS` (#32, @MarcBlattmann) *(no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
+- [x] **G8 — Binary GPU Command Stream Disassembler & Trace Inspector** — `DONE` (PR #49, closes #32) *(no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
   - Parse recorded `playgta6` GPU command ring byte streams into human-readable/JSON frame traces with opcode histograms, byte counts, and malformed-packet diagnostics for debugging M3 frames.
+- [ ] **G9 — WebGPU `OffscreenCanvas` Swapchain, Depth-Stencil & Resize Manager** — `IN PROGRESS` (#54, @MarcBlattmann) *(no game files required — disjoint files `web/workers/wgpu_swapchain.js`, `tests/test_wgpu_swapchain.mjs`)*
+  - Manage `OffscreenCanvas` WebGPU context config, DPR-aware dynamic resize, `depth24plus`/`depth32float` depth-stencil attachment lifecycle, `device.lost` recovery, and frame-pacing telemetry.
+- [ ] **G10 — BCn / Texture Format & Mip-Chain Upload Helpers** *(unclaimed; no game files required — disjoint files `web/workers/texture_formats.js`, `tests/test_texture_formats.mjs`)*
+  - Map DXGI/Xbox texture formats (`BC1`–`BC7`, `RGBA8`, `RGBA16F`, depth/stencil) to WebGPU `GPUTextureFormat`, compute 256-byte-aligned `bytesPerRow` + mip dimensions, and provide CPU fallback BC7/DXT decompression when WebGPU `texture-compression-bc` is absent.
 
 ---
 
@@ -108,7 +112,15 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add ETag/`If-Range`/`HEAD` + sanitized `/api/status` to `server/serve_local.py` and upgrade `web/index.html` with a live Wasm64/WebGPU/SAB HUD.
 - [ ] **W8 — Multi-Voice Audio Mixer & PCM/ADPCM Voice Streamer** — `IN PROGRESS` (#31, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_mixer.js`, `tests/test_audio_mixer.mjs`)*
   - Implement a lock-free multi-voice mixer (3D pan/gain, sample-rate resampling, ADPCM/PCM decoding, soft-clip limiter) that feeds `audio_worker.js`'s SAB ring buffer for XAudio2/XMA2 voice emulation.
-- [ ] **W9 — Headless End-to-End Integration Harness (Local Server ↔ Workers ↔ SAB ↔ WebGPU Mock)** — `IN PROGRESS` (#33, @MarcBlattmann) *(no game files required — disjoint file `tests/test_e2e_pipeline.mjs`)*
+- [x] **W9 — Headless End-to-End Integration Harness (Local Server ↔ Workers ↔ SAB ↔ WebGPU Mock)** — `DONE` (PR #48, closes #33) *(no game files required — disjoint file `tests/test_e2e_pipeline.mjs`)*
   - Spin up `server/serve_local.py` on an ephemeral port in a Node test, exercise real HTTP `206` Range + `ETag`/`If-Range` reads through `RangeCache` → `WgslPackCache` → `InputBridge` → `GpuRingBuffer` → `WgpuCommandProcessor` end-to-end.
-- [ ] **W10 — Pure-Rust Xbox XVD/XVC Container Header & Layout Inspector** — `IN PROGRESS` (#34, @MarcBlattmann) *(works on local `.xvd`/`.xvc` or synthetic unit tests — disjoint files `tools/src/xvd.rs`, `tools/src/main.rs`)*
+- [x] **W10 — Pure-Rust Xbox XVD/XVC Container Header & Layout Inspector** — `DONE` (PR #50, closes #34) *(works on local `.xvd`/`.xvc` or synthetic unit tests — disjoint files `tools/src/xvd.rs`, `tools/src/main.rs`)*
   - Read-only parser for `msft-xvd` container headers (version, content type, drive/embedded XVD sizes, XVC region presence, encryption flags) wired as `playgta6-manifest xvd <path> [--json]`.
+- [ ] **W11 — Streaming Browser RPF9 TOC & Virtual File System Reader** — `IN PROGRESS` (#52, @MarcBlattmann) *(no game files required — disjoint files `web/workers/rpf9_vfs.js`, `tests/test_rpf9_vfs.mjs`)*
+  - Fetch only RPF header + TOC + requested sub-file byte ranges via `RangeCache`, parse directory/file entries & names table, resolve virtual paths, and stream sub-file chunks on demand.
+- [ ] **W12 — `AudioWorklet` SAB Ring Processor & Main-Thread WebAudio Engine** — `IN PROGRESS` (#53, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_worklet_processor.js`, `web/audio/audio_engine.js`, `tests/test_audio_engine.mjs`)*
+  - Zero-GC `AudioWorkletProcessor` pulling 128-frame stereo blocks from `AudioRingBuffer` SAB + main-thread `AudioEngine` (`AudioContext` bootstrap, user-gesture unlock, volume/mute, underrun telemetry).
+- [ ] **W13 — Local Preflight & Milestone Readiness Checker CLI** *(unclaimed; no game files required — disjoint files `tools/preflight.py`, `tests/test_preflight.py`)*
+  - Single-command `python tools/preflight.py [--json]` verifying toolchains, `.env` / `GTA6_GAME_DIR`, COOP/COEP server sanity, `web/dist/runtime.wasm`, `data-manifest.json`, `bootset.json`, and `.wgsl.pack` readiness.
+- [ ] **W14 — OPFS Cache Quota Inspector & Browser Storage Manager** *(unclaimed; no game files required — disjoint files `web/storage/storage_manager.js`, `tests/test_storage_manager.mjs`)*
+  - Query `navigator.storage.estimate()`, request persistent storage, inspect/clear OPFS range cache and IndexedDB `/userdata` slots cleanly from the browser HUD.
