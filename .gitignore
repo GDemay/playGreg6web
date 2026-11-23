@@ -1,0 +1,36 @@
+# Local game data, extracted assets, and generated shaders (NEVER commit)
+local-data/
+work/
+extracted/
+mirror/
+game/
+*.rpf
+*.xvd
+*.xvc
+*.ttpf
+*.awc
+*.spv
+*.dxbc
+*.wgsl.pack
+
+# Build outputs
+web/dist/
+engine/target/
+engine/build/
+*.wasm
+*.wasm.map
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / JS
+node_modules/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
