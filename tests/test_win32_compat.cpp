@@ -7,7 +7,6 @@
 #include <thread>
 #include <vector>
 
-#include "guest/cpu_helpers.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -814,7 +813,7 @@ void test_sysinfo() {
     CHECK(info.processor_architecture == 9);
     CHECK(info.page_size == 4096 && info.allocation_granularity == 65536);
     CHECK(info.number_of_processors >= 1 && info.number_of_processors <= 64);
-    CHECK(info.number_of_processors <= std::max(1u, playgta6::guest::virtual_cpu().logical_processors));
+    CHECK(info.number_of_processors <= std::max(1u, std::thread::hardware_concurrency()));
     CHECK(info.active_processor_mask != 0);
     int mask_bits = 0;
     for (uint64_t m = info.active_processor_mask; m != 0; m >>= 1) {

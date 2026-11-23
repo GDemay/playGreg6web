@@ -535,9 +535,6 @@ impl FunctionLifter<'_> {
     /// z=op1`; 213 `x=op1, y=op0, z=op2`; 231 `x=op1, y=op2, z=op0`. Scalar forms merge lane 0
     /// into the destination.
     fn fma(&mut self, ins: &Instruction, f: Fma) -> R<()> {
-        if f.e == Elem::F64 {
-            return unsupported("double-precision FMA is not supported yet");
-        }
         let e = f.e;
         let n = if f.scalar { 1 } else { e.lanes() };
         let ty = if f.scalar { Ty::s(e) } else { Ty::v(e) };
@@ -571,7 +568,11 @@ impl FunctionLifter<'_> {
                 self.shuffle(z, &nz, e, &idx)
             }
         };
-        let r = self.fma32(&x, y, &z, n);
+        let r = if e == Elem::F32 {
+            self.fma32(&x, y, &z, n)
+        } else {
+            self.fma64(&x, y, &z, n)
+        };
         if f.scalar {
             let d = self.v128(ins, 0, e)?;
             let v = self.insert(&d, e, &r, 0);
@@ -579,6 +580,28 @@ impl FunctionLifter<'_> {
         } else {
             self.xset(ins.op_register(0), &r, e)
         }
+    }
+
+    /// Correctly rounded binary64 `x * y + z` through the integer helper `__playgta6_fma_f64`.
+    fn fma64(&mut self, x: &str, y: &str, z: &str, n: u32) -> String {
+        self.use_helper(Intr::FmaF64);
+        let call = |l: &mut Self, a: &str, b: &str, c: &str| {
+            l.val(&format!(
+                "call double @__playgta6_fma_f64(double {a}, double {b}, double {c})"
+            ))
+        };
+        if n == 1 {
+            return call(self, x, y, z);
+        }
+        let mut r = "poison".to_string();
+        for lane in 0..n {
+            let a = self.extract(x, Elem::F64, lane);
+            let b = self.extract(y, Elem::F64, lane);
+            let c = self.extract(z, Elem::F64, lane);
+            let v = call(self, &a, &b, &c);
+            r = self.insert(&r, Elem::F64, &v, lane);
+        }
+        r
     }
 
     /// Correctly rounded binary32 `x * y + z` without a hardware FMA: the product is exact in

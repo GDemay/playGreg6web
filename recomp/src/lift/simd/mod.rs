@@ -27,7 +27,7 @@
 //!   `movsldup/movshdup/movddup`, `vmaskmovps/pd`, `vpmaskmovd/q`;
 //! - float arithmetic: `add/sub/mul/div/min/max/sqrt` `ss/sd/ps/pd`, `rcp/rsqrt` `ss/ps`,
 //!   `and/andn/or/xor` `ps/pd`, `hadd/hsub/addsub` `ps/pd`, `round{ss,sd,ps,pd}`, `dpps/dppd`,
-//!   FMA3 `vf{,n}m{add,sub}{132,213,231}{ps,ss}` and `vfm{addsub,subadd}*ps`;
+//!   FMA3 `vf{,n}m{add,sub}{132,213,231}{ps,pd,ss,sd}` and `vfm{addsub,subadd}*{ps,pd}`;
 //! - compares: `cmp{ss,sd,ps,pd}` (8 legacy / 32 VEX predicates), `(u)comis{s,d}`, `ptest`,
 //!   `vtestps/vtestpd`;
 //! - conversions: `cvtsi2ss/sd`, `cvtss2sd/cvtsd2ss`, `cvt(t)ss2si/cvt(t)sd2si`,
@@ -44,11 +44,15 @@
 //!   `palignr`, `pblendw/vpblendd/pblendvb`, `phadd*/phsub*`, `pextr*/pinsr*`,
 //!   `pmovsx*/pmovzx*`, `vpbroadcast*`, `vbroadcasti128`, `vinserti128/vextracti128`,
 //!   `vperm2i128`, `vpermd/vpermq`;
+//! - AES-NI `aesenc/aesenclast/aesdec/aesdeclast/aesimc/aeskeygenassist` (also VAES 256-bit),
+//!   `pclmulqdq` (also VPCLMULQDQ 256-bit), `phminposuw`;
+//! - SSE4a `extrq/insertq` (immediate and register forms; the architecturally undefined upper
+//!   quadword is preserved and field bits beyond bit 63 are dropped);
 //! - `ldmxcsr/stmxcsr`, `vzeroupper/vzeroall`.
 //!
-//! Everything else that touches vector registers traps with a precise reason: double-precision
-//! FMA, AVX-512 (EVEX), XOP/FMA4/SSE4a, MMX, x87 (not routed here), SSE4.2 string compares,
-//! AES/CLMUL/SHA, gathers, `mpsadbw`, `phminposuw`, `maskmovdqu`.
+//! Everything else that touches vector registers traps with a precise reason: AVX-512 (EVEX),
+//! XOP/FMA4, MMX, x87 (not routed here), SSE4.2 string compares, SHA, gathers, `mpsadbw`,
+//! `maskmovdqu`.
 //!
 //! # Floating point semantics
 //! Arithmetic, square root, conversions and rounding are IEEE-754 binary32/binary64 with
@@ -66,7 +70,9 @@
 //!   forms (`cvtss2si`, `cvtps2dq`, ...) round half to even, the `cvtt*` forms truncate.
 //! - **FMA** (binary32) is computed with a single rounding without a hardware FMA: the product is
 //!   exact in binary64, the sum is rounded to odd in binary64 (TwoSum error term) and then
-//!   rounded to binary32, which is correctly rounded. Double-precision FMA traps.
+//!   rounded to binary32, which is correctly rounded. Double-precision FMA uses an exact integer
+//!   implementation (`__playgta6_fma_f64`: 106-bit product, aligned 128-bit sum with sticky
+//!   bit, one rounding, subnormal and overflow handling).
 //! - **`rcpss/rcpps/rsqrtss/rsqrtps`**: hardware returns an implementation-specific approximation
 //!   (relative error <= 1.5 * 2^-12). The lifter returns the correctly rounded `1/x` and
 //!   `1/sqrt(x)` (within the same bound of every conforming CPU) and reproduces the hardware's
@@ -88,7 +94,9 @@
 //! - Non-temporal hints (`movnt*`) are plain loads/stores.
 
 mod avx;
+mod crypto;
 mod float;
+mod helpers;
 mod int;
 mod moves;
 
@@ -283,6 +291,12 @@ pub(in crate::lift) enum Intr {
     Abs,
     /// `llvm.wasm.swizzle` (`i8x16.swizzle`): indices >= 16 select 0.
     Swizzle,
+    /// Internal helper `@__playgta6_fma_f64` (double-precision FMA).
+    FmaF64,
+    /// Internal helper `@__playgta6_clmul` (carry-less multiplication).
+    Clmul,
+    /// The AES S-box tables.
+    AesTables,
 }
 
 /// One module-level declaration required by lifted SIMD code (see `Support::Simd`).
@@ -306,6 +320,9 @@ impl Decl {
             Intr::USubSat => "usub.sat",
             Intr::Abs => "abs",
             Intr::Swizzle => return "llvm.wasm.swizzle".to_string(),
+            Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
+            Intr::Clmul => return "__playgta6_clmul".to_string(),
+            Intr::AesTables => return "__playgta6_aes_sbox".to_string(),
         };
         format!("llvm.{base}.{}", self.ty.suffix())
     }
@@ -319,8 +336,14 @@ impl Decl {
         }
     }
 
-    /// The `declare` line.
+    /// The `declare` line (or, for internal helpers, the definition).
     pub(in crate::lift) fn declaration(self) -> String {
+        match self.intr {
+            Intr::FmaF64 => return helpers::fma_f64_ir(),
+            Intr::Clmul => return helpers::CLMUL_IR.to_string(),
+            Intr::AesTables => return helpers::aes_tables_ir(),
+            _ => {}
+        }
         format!(
             "declare {} @{}({})\n",
             self.ty.ir(),
@@ -769,6 +792,19 @@ impl FunctionLifter<'_> {
         (imm8 >> (self.simd.half * per_lane)) & ((1 << per_lane) - 1)
     }
 
+    /// Makes an internal helper (and what it needs) part of the module.
+    fn use_helper(&mut self, intr: Intr) {
+        self.support.insert(Support::Simd(Decl {
+            intr,
+            ty: Ty::s(Elem::I64),
+        }));
+        if intr == Intr::FmaF64 {
+            self.support.insert(Support::Umul128);
+            self.support
+                .insert(Support::BitIntrinsic(super::super::BitIntrinsic::Ctlz, 64));
+        }
+    }
+
     /// Calls an intrinsic, declaring it at module level.
     fn intr(&mut self, intr: Intr, ty: Ty, args: &[&str]) -> String {
         let decl = Decl { intr, ty };
@@ -841,7 +877,11 @@ impl FunctionLifter<'_> {
 
     /// Lifts a 128-bit instruction (or, in a 256-bit loop, one lane of it).
     fn lift_lane(&mut self, ins: &Instruction, vex: bool) -> R<()> {
-        if self.lift_moves(ins, vex)? || self.lift_float(ins, vex)? || self.lift_int(ins, vex)? {
+        if self.lift_moves(ins, vex)?
+            || self.lift_float(ins, vex)?
+            || self.lift_int(ins, vex)?
+            || self.lift_crypto(ins, vex)?
+        {
             return Ok(());
         }
         unsupported(format!(

@@ -97,6 +97,29 @@ pub(super) fn in_lane(m: Mnemonic) -> bool {
             | M::Vfmsubadd132ps
             | M::Vfmsubadd213ps
             | M::Vfmsubadd231ps
+            | M::Vfmadd132pd
+            | M::Vfmadd213pd
+            | M::Vfmadd231pd
+            | M::Vfmsub132pd
+            | M::Vfmsub213pd
+            | M::Vfmsub231pd
+            | M::Vfnmadd132pd
+            | M::Vfnmadd213pd
+            | M::Vfnmadd231pd
+            | M::Vfnmsub132pd
+            | M::Vfnmsub213pd
+            | M::Vfnmsub231pd
+            | M::Vfmaddsub132pd
+            | M::Vfmaddsub213pd
+            | M::Vfmaddsub231pd
+            | M::Vfmsubadd132pd
+            | M::Vfmsubadd213pd
+            | M::Vfmsubadd231pd
+            | M::Vaesenc
+            | M::Vaesenclast
+            | M::Vaesdec
+            | M::Vaesdeclast
+            | M::Vpclmulqdq
             | M::Vpaddb
             | M::Vpaddw
             | M::Vpaddd

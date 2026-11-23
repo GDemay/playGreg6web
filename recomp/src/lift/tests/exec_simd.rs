@@ -262,3 +262,97 @@ fn lifted_random_sse_code_compiles() {
     // `build` compiles and links the module; a lifter IR bug fails here.
     let _ = build("random_sse", functions.values());
 }
+
+/// Reference model of SSE4a `extrq`/`insertq` (AMD only, so not differentially testable on
+/// every host): low-quadword bit fields; the undefined parts as the lifter defines them.
+fn sse4a_model(dst: u64, src: u64, len: u64, idx: u64, insert: bool) -> u64 {
+    let (len, idx) = (len & 63, idx & 63);
+    let mask = if len == 0 { u64::MAX } else { (1 << len) - 1 };
+    if insert {
+        (dst & !(mask << idx)) | ((src & mask) << idx)
+    } else {
+        (dst >> idx) & mask
+    }
+}
+
+#[test]
+fn sse4a_bit_fields_execute() {
+    if !exec_or_skip("sse4a_bit_fields_execute") {
+        return;
+    }
+    let fields = [
+        (0u32, 0u32),
+        (1, 0),
+        (8, 4),
+        (16, 48),
+        (32, 31),
+        (63, 1),
+        (5, 59),
+        (0, 7),
+    ];
+    let mut program = Program::new();
+    for (i, &(len, idx)) in fields.iter().enumerate() {
+        let va = CODE_BASE + 0x100 * i as u64;
+        program = program
+            .asm(va, |a| {
+                a.extrq_3(xmm1, len, idx)?;
+                a.ret()
+            })
+            .asm(va + 0x40, |a| {
+                a.insertq_4(xmm1, xmm2, len, idx)?;
+                a.ret()
+            });
+    }
+    let reg_extrq = CODE_BASE + 0x2000;
+    let reg_insertq = CODE_BASE + 0x2040;
+    let program = program
+        .asm(reg_extrq, |a| {
+            a.extrq(xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(reg_insertq, |a| {
+            a.insertq(xmm1, xmm2)?;
+            a.ret()
+        });
+    let functions = program.discover();
+    let built = build("sse4a", functions.values());
+    let (d0, d1) = (0x0123_4567_89AB_CDEFu64, 0xFEDC_BA98_7654_3210u64);
+    let s0 = 0xA5A5_5A5A_F00F_0FF0u64;
+    let state = |x1: [u64; 2], x2: [u64; 2]| {
+        let mut b = vec![0u8; 48];
+        b[16..24].copy_from_slice(&x1[0].to_le_bytes());
+        b[24..32].copy_from_slice(&x1[1].to_le_bytes());
+        b[32..40].copy_from_slice(&x2[0].to_le_bytes());
+        b[40..48].copy_from_slice(&x2[1].to_le_bytes());
+        b
+    };
+    let case = |va: u64, x2: [u64; 2]| {
+        let mut c = Case::new(va);
+        c.mem.push((XMM_STATE, state([d0, d1], x2)));
+        c.read.push((XMM_STATE + 16, 16));
+        c
+    };
+    let mut cases = Vec::new();
+    let mut expected = Vec::new();
+    for (i, &(len, idx)) in fields.iter().enumerate() {
+        let va = CODE_BASE + 0x100 * i as u64;
+        let (l, x) = (u64::from(len), u64::from(idx));
+        cases.push(case(va, [s0, 0x77]));
+        expected.push(sse4a_model(d0, s0, l, x, false));
+        cases.push(case(va + 0x40, [s0, 0x77]));
+        expected.push(sse4a_model(d0, s0, l, x, true));
+        // Register forms take the field from xmm2 (bits 5:0 / 13:8, or 69:64 / 77:72).
+        cases.push(case(reg_extrq, [l | x << 8 | 0xC0C0, 0]));
+        expected.push(sse4a_model(d0, 0, l, x, false));
+        cases.push(case(reg_insertq, [s0, l | x << 8 | 0xC0C0]));
+        expected.push(sse4a_model(d0, s0, l, x, true));
+    }
+    let o = run(&built, &cases);
+    for (i, (out, want)) in o.iter().zip(&expected).enumerate() {
+        assert!(out.error.is_empty(), "case {i}: {}", out.error);
+        let lo = u64::from_le_bytes(out.mem[0][..8].try_into().unwrap());
+        let hi = u64::from_le_bytes(out.mem[0][8..].try_into().unwrap());
+        assert_eq!(lo, *want, "case {i}");
+        assert_eq!(hi, d1, "case {i}: upper quadword preserved");
+    }
+}

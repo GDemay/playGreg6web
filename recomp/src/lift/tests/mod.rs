@@ -11,6 +11,8 @@ mod host_diff;
 #[cfg(target_arch = "x86_64")]
 mod host_diff_avx;
 #[cfg(target_arch = "x86_64")]
+mod host_diff_crypto;
+#[cfg(target_arch = "x86_64")]
 mod host_diff_integer;
 #[cfg(target_arch = "x86_64")]
 mod host_diff_simd;
