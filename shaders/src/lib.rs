@@ -1,3 +1,5 @@
 pub mod compat;
 pub mod convert;
+pub mod dxbc;
+pub mod lower;
 pub mod pack;

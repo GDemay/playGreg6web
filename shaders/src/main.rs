@@ -9,6 +9,10 @@ use playgta6_shaders::convert::{
     ConvertOptions, ConvertedShader, ShaderStage, audit_spirv_file,
     convert_spirv_bytes_with_options, format_shader_hash, format_wgsl_filename,
 };
+use playgta6_shaders::dxbc::{
+    DxbcFileEntry, parse_dxbc, render_dxbc_batch_json, render_dxbc_batch_md,
+    render_dxbc_info_json, render_dxbc_info_md,
+};
 use playgta6_shaders::pack::{
     BlockerReportInput, FailedShaderRecord, PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry,
     SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, read_pack, render_blocker_report_md,
@@ -24,6 +28,7 @@ enum Command {
         pack_path: Option<PathBuf>,
         report_path: Option<PathBuf>,
         no_sanitize: bool,
+        no_lower: bool,
     },
     Audit {
         spirv_dir: PathBuf,
@@ -33,21 +38,26 @@ enum Command {
     InspectPack {
         pack_path: PathBuf,
     },
+    InspectDxbc {
+        target_path: PathBuf,
+        json: bool,
+    },
 }
 
 fn print_usage() {
     eprintln!("playgta6-shaders (ABI v{SHADER_INDEX_ABI_VERSION})");
     eprintln!("Usage:");
     eprintln!(
-        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--report <blockers.md>] [--no-sanitize]"
+        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--report <blockers.md>] [--no-sanitize] [--no-lower]"
     );
     eprintln!(
         "  playgta6-shaders audit --spirv <dir> [--report <audit.md>] [--no-sanitize]"
     );
     eprintln!("  playgta6-shaders inspect-pack <file.wgsl.pack>");
+    eprintln!("  playgta6-shaders inspect-dxbc <path-or-dir> [--json]");
     eprintln!();
     eprintln!(
-        "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> WGSL (naga) -> .wgsl.pack"
+        "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> Naga lower -> WGSL -> .wgsl.pack"
     );
 }
 
@@ -63,6 +73,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut pack_path: Option<PathBuf> = None;
             let mut report_path: Option<PathBuf> = None;
             let mut no_sanitize = false;
+            let mut no_lower = false;
 
             let mut i = 1;
             while i < args.len() {
@@ -98,6 +109,9 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                     "--no-sanitize" => {
                         no_sanitize = true;
                     }
+                    "--no-lower" => {
+                        no_lower = true;
+                    }
                     unknown => {
                         return Err(format!("unknown option for convert: {unknown}"));
                     }
@@ -116,6 +130,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 pack_path,
                 report_path,
                 no_sanitize,
+                no_lower,
             })
         }
         "audit" => {
@@ -169,8 +184,35 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 pack_path: PathBuf::from(&args[1]),
             })
         }
+        "inspect-dxbc" => {
+            let mut target_path: Option<PathBuf> = None;
+            let mut json = false;
+
+            for arg in &args[1..] {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option for inspect-dxbc: {other}"));
+                    }
+                    path_arg => {
+                        if target_path.is_some() {
+                            return Err(format!(
+                                "unexpected extra argument for inspect-dxbc: {path_arg}"
+                            ));
+                        }
+                        target_path = Some(PathBuf::from(path_arg));
+                    }
+                }
+            }
+
+            let target_path = target_path.ok_or_else(|| {
+                "inspect-dxbc requires <path-or-dir> [--json]".to_string()
+            })?;
+
+            Ok(Command::InspectDxbc { target_path, json })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', or 'inspect-pack')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', or 'inspect-dxbc')"
         )),
     }
 }
@@ -231,6 +273,8 @@ fn run_convert(
     let mut converted_file_count = 0usize;
     let mut sanitized_file_count = 0usize;
     let mut rewritten_instruction_count = 0usize;
+    let mut lowered_push_constant_count = 0usize;
+    let mut lowered_bind_group_count = 0usize;
     let mut failures: Vec<FailedShaderRecord> = Vec::new();
 
     for path in &spv_files {
@@ -245,6 +289,8 @@ fn run_convert(
                     sanitized_file_count += 1;
                     rewritten_instruction_count += shader.audit.rewritten_instructions;
                 }
+                lowered_push_constant_count += shader.lowering.push_constant_remaps.len();
+                lowered_bind_group_count += shader.lowering.bind_group_remaps.len();
                 converted_by_hash.entry(shader.hash).or_insert(shader);
             }
             Err(error) => {
@@ -363,7 +409,7 @@ fn run_convert(
     }
 
     println!(
-        "Converted {converted_file_count}/{} SPIR-V files ({} unique shaders: vertex={vertex_count}, fragment={fragment_count}, compute={compute_count}; sanitized={sanitized_file_count} files / {rewritten_instruction_count} instructions); index: {}",
+        "Converted {converted_file_count}/{} SPIR-V files ({} unique shaders: vertex={vertex_count}, fragment={fragment_count}, compute={compute_count}; sanitized={sanitized_file_count} files / {rewritten_instruction_count} instructions; lowered={lowered_push_constant_count} push-constants / {lowered_bind_group_count} bind-groups); index: {}",
         spv_files.len(),
         converted_by_hash.len(),
         index_dest.display()
@@ -488,6 +534,83 @@ fn run_inspect_pack(pack_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn collect_dxbc_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|err| format!("failed to read directory {}: {err}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| format!("failed to read directory entry: {err}"))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("dxbc")
+                    || ext.eq_ignore_ascii_case("dxil")
+                    || ext.eq_ignore_ascii_case("cso")
+            }) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn format_inspect_dxbc(target_path: &Path, json: bool) -> Result<String, String> {
+    if target_path.is_file() {
+        let bytes = fs::read(target_path).map_err(|err| {
+            format!(
+                "failed to read DXBC/DXIL file {}: {err}",
+                target_path.display()
+            )
+        })?;
+        let info = parse_dxbc(&bytes).map_err(|err| {
+            format!(
+                "invalid DXBC/DXIL container {}: {err}",
+                target_path.display()
+            )
+        })?;
+        let display_path = target_path.to_string_lossy().replace('\\', "/");
+        if json {
+            Ok(render_dxbc_info_json(Some(&display_path), &info))
+        } else {
+            Ok(render_dxbc_info_md(Some(&display_path), &info))
+        }
+    } else if target_path.is_dir() {
+        let files = collect_dxbc_files(target_path)?;
+        let mut entries = Vec::with_capacity(files.len());
+        for path in &files {
+            let rel_path = normalize_rel_path(path, target_path);
+            let result = match fs::read(path) {
+                Ok(bytes) => parse_dxbc(&bytes).map_err(|err| err.to_string()),
+                Err(err) => Err(format!("read error: {err}")),
+            };
+            entries.push(DxbcFileEntry {
+                path: rel_path,
+                result,
+            });
+        }
+        if json {
+            Ok(render_dxbc_batch_json(&entries))
+        } else {
+            Ok(render_dxbc_batch_md(&entries))
+        }
+    } else {
+        Err(format!(
+            "DXBC/DXIL path does not exist: {}",
+            target_path.display()
+        ))
+    }
+}
+
+fn run_inspect_dxbc(target_path: &Path, json: bool) -> Result<(), String> {
+    let rendered = format_inspect_dxbc(target_path, json)?;
+    print!("{rendered}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -501,12 +624,16 @@ fn main() -> ExitCode {
             pack_path,
             report_path,
             no_sanitize,
+            no_lower,
         }) => {
-            let options = if no_sanitize {
+            let mut options = if no_sanitize {
                 ConvertOptions::without_sanitization()
             } else {
                 ConvertOptions::default()
             };
+            if no_lower {
+                options = options.without_lowering();
+            }
             match run_convert(
                 &spirv_dir,
                 &out_dir,
@@ -546,6 +673,15 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Ok(Command::InspectDxbc { target_path, json }) => {
+            match run_inspect_dxbc(&target_path, json) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!();
@@ -630,6 +766,7 @@ mod tests {
             "--report".to_string(),
             "out_wgsl/blockers.md".to_string(),
             "--no-sanitize".to_string(),
+            "--no-lower".to_string(),
         ])
         .unwrap();
 
@@ -641,8 +778,34 @@ mod tests {
                 pack_path: Some(PathBuf::from("out_wgsl/all.wgsl.pack")),
                 report_path: Some(PathBuf::from("out_wgsl/blockers.md")),
                 no_sanitize: true,
+                no_lower: true,
             }
         );
+
+        let inspect_dxbc = parse_args(&[
+            "inspect-dxbc".to_string(),
+            "shaders_dir".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            inspect_dxbc,
+            Command::InspectDxbc {
+                target_path: PathBuf::from("shaders_dir"),
+                json: true,
+            }
+        );
+
+        let inspect_dxbc_md =
+            parse_args(&["inspect-dxbc".to_string(), "pixel.dxil".to_string()]).unwrap();
+        assert_eq!(
+            inspect_dxbc_md,
+            Command::InspectDxbc {
+                target_path: PathBuf::from("pixel.dxil"),
+                json: false,
+            }
+        );
+        assert!(parse_args(&["inspect-dxbc".to_string()]).is_err());
 
         let audit = parse_args(&[
             "audit".to_string(),
@@ -743,6 +906,59 @@ mod tests {
 
         run_inspect_pack(&pack_file).expect("inspect-pack should succeed");
 
+        // 4. inspect-dxbc works on both a single file and a directory in Markdown and JSON modes.
+        let dxbc_dir = root.join("dxbc");
+        fs::create_dir_all(&dxbc_dir).unwrap();
+        let dxbc_bytes = build_minimal_dxil_container();
+        let dxil_file = dxbc_dir.join("cs_main.dxil");
+        fs::write(&dxil_file, &dxbc_bytes).unwrap();
+        fs::write(dxbc_dir.join("invalid.cso"), b"bad-dxbc").unwrap();
+
+        let single_md = format_inspect_dxbc(&dxil_file, false).unwrap();
+        assert!(single_md.contains("# DXBC / DXIL Container Summary"));
+        assert!(single_md.contains("`compute`"));
+        assert!(single_md.contains("| `DXIL` |"));
+
+        let single_json = format_inspect_dxbc(&dxil_file, true).unwrap();
+        assert!(single_json.contains("\"is_dxil\": true"));
+        assert!(single_json.contains("\"has_llvm_bitcode\": true"));
+
+        let dir_md = format_inspect_dxbc(&dxbc_dir, false).unwrap();
+        assert!(dir_md.contains("| Total containers | 2 |"));
+        assert!(dir_md.contains("`cs_main.dxil`"));
+        assert!(dir_md.contains("`invalid.cso`"));
+
+        let dir_json = format_inspect_dxbc(&dxbc_dir, true).unwrap();
+        assert!(dir_json.contains("\"total\": 2"));
+        assert!(dir_json.contains("\"error\":"));
+
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn build_minimal_dxil_container() -> Vec<u8> {
+        let mut dxil_payload = Vec::new();
+        let program_version: u32 = (5u32 << 16) | (6u32 << 4) | 6u32; // cs_6_6
+        dxil_payload.extend_from_slice(&program_version.to_le_bytes());
+        dxil_payload.extend_from_slice(&8u32.to_le_bytes()); // size_in_uint32
+        dxil_payload.extend_from_slice(b"DXIL");
+        dxil_payload.extend_from_slice(&0x0000_0106u32.to_le_bytes()); // DXIL 1.6
+        dxil_payload.extend_from_slice(&16u32.to_le_bytes()); // bitcode_offset
+        dxil_payload.extend_from_slice(&8u32.to_le_bytes()); // bitcode_size
+        dxil_payload.extend_from_slice(&[0x42, 0x43, 0xC0, 0xDE, 0, 0, 0, 0]);
+
+        let chunk_offset = 36u32; // 32B header + 4B offset table
+        let total_size = chunk_offset + 8 + dxil_payload.len() as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"DXBC");
+        out.extend_from_slice(&[0x55u8; 16]); // digest
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&total_size.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // chunk_count
+        out.extend_from_slice(&chunk_offset.to_le_bytes());
+        out.extend_from_slice(b"DXIL");
+        out.extend_from_slice(&(dxil_payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&dxil_payload);
+        out
     }
 }
