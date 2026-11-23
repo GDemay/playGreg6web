@@ -38,6 +38,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Build the executable plus the redistributable DLLs shipped next to it (`MSVCP140`, `VCRUNTIME140`, `concrt140`, …) into one guest program: per-module image bases, exports, forwarders, imports bound to another module's exports, shared function registration tables.
 - [ ] **R13 — Parallel Sharded LLVM IR → Wasm64 Emscripten Build Orchestrator (`tools/build_guest_wasm.py`)** — `IN PROGRESS` (#193, @MarcBlattmann) *(no game files required — disjoint files `tools/build_guest_wasm.py`, `tests/test_build_guest_wasm.py`)*
   - Compiles sharded `playgta6-recomp build` (`R9`) `.ll`/`.c`/`.cpp` outputs across CPU cores via `emcc` with SHA-256 `.o` caching, links with `libplaygta6_core.a` into `web/dist/runtime.{js,wasm}`, and validates ABI exports.
+- [ ] **R14 — Guest Boot Sequence & Native First-Boot Harness (`runtime/guest/boot.{h,cpp}`, `tools/build_native_boot.py`)** — `IN PROGRESS` (#198, @Timon-ok) *(no game files required for repo tests — disjoint files `runtime/guest/boot.{h,cpp}`, `runtime/guest/boot_main.cpp`, `tools/build_native_boot.py`, `tests/test_guest_boot.cpp`)*
+  - Runtime boot sequence (load `PGIM` image, register lifted tables, bind import slots, minimal TEB/TLS + main thread, TLS callbacks, entry-point call, structured first-fault report) and a native host harness linking host-target lifted shards with the runtime for a first boot attempt without the browser toolchain (complements `R13`/`W40`).
 
 ---
 
