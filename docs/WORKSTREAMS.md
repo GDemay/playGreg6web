@@ -110,9 +110,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Encodes and validates WebGPU `drawIndirect` / `drawIndexedIndirect` / `dispatchWorkgroupsIndirect` command buffers for compute-driven RDNA2 meshlet culling (`S5`).
 - [ ] **G20 — Render Pipeline & Render Pass Packet ABI v2 + D3D12 State Bridge (`runtime/gpu/state_bridge`)** — `IN PROGRESS` (#121, @Timon-ok) *(no game files required — small ABI PR first, then disjoint files `runtime/gpu/state_bridge.{h,cpp}`, `tests/test_state_bridge.cpp`)*
   - Add packets for full pipeline keys, render pass begin/end with load/store ops, and viewport/scissor/blend-constant/stencil-ref, then wire the G6 descriptor/root-signature tracker and G7 PSO cache/state tracker into packet emission.
-- [ ] **G21 — WebGPU Resource Registry & Frame-Deferred Garbage Collector (`web/workers/resource_registry.js`)** — `IN PROGRESS` (#127, @MarcBlattmann) *(no game files required — disjoint files `web/workers/resource_registry.js`, `tests/test_resource_registry.mjs`)*
+- [x] **G21 — WebGPU Resource Registry & Frame-Deferred Garbage Collector (`web/workers/resource_registry.js`)** — `DONE` (PR #145, closes #127) *(no game files required — disjoint files `web/workers/resource_registry.js`, `tests/test_resource_registry.mjs`)*
   - Tracks GPU buffer/texture/view/sampler/bind-group/pipeline handles with VRAM byte accounting and frame-epoch deferred destruction after `onSubmittedWorkDone` fences.
-- [ ] **G22 — WebGPU Transient Render-Target Pool & Attachment Aliasing (`web/workers/rt_pool.js`)** — `IN PROGRESS` (#128, @MarcBlattmann) *(no game files required — disjoint files `web/workers/rt_pool.js`, `tests/test_rt_pool.mjs`)*
+- [x] **G22 — WebGPU Transient Render-Target Pool & Attachment Aliasing (`web/workers/rt_pool.js`)** — `DONE` (PR #144, closes #128) *(no game files required — disjoint files `web/workers/rt_pool.js`, `tests/test_rt_pool.mjs`)*
   - Pools transient color/depth/shadow/post-FX `GPUTexture` + view attachments by descriptor key with per-frame reuse and idle/budget LRU eviction.
 - [ ] **G23 — Wire `GpuStagingPool` (`G14`), `DynamicUniformRing` (`G18`), `GpuPassTimer` (`G16`) & `ReflectionLoader` (`G17`) into `web/workers/wgpu_worker.js`** — `UNCLAIMED` *(no game files required — wait for G17 merge)*
   - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, and reflected bind-group layouts into the main WebGPU command processor.
@@ -134,7 +134,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Provide reusable WGSL workgroup-shared-memory emulation helpers for RDNA2 Wave64 ballot/shuffle/prefix-sum ops and indirect compute-driven meshlet culling/draw emission when WebGPU `subgroups` is unavailable.
 - [x] **S6 — Root-Signature-to-WebGPU `BindGroupLayout` Reflection & Cache Manifest** — `DONE` (PR #92, closes #47) *(no game files required — disjoint file `shaders/src/reflect.rs`)*
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
-- [ ] **S7 — Offline `WGPK` Shader Pack Inspector, Diff & WebGPU Limit Budget CLI (`tools/inspect_wgsl_pack.py`)** — `IN PROGRESS` (#129, @MarcBlattmann) *(no game files required — disjoint files `tools/inspect_wgsl_pack.py`, `tests/test_inspect_wgsl_pack.py`)*
+- [x] **S7 — Offline `WGPK` Shader Pack Inspector, Diff & WebGPU Limit Budget CLI (`tools/inspect_wgsl_pack.py`)** — `DONE` (PR #146, closes #129) *(no game files required — disjoint files `tools/inspect_wgsl_pack.py`, `tests/test_inspect_wgsl_pack.py`)*
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
 
 ---
@@ -200,9 +200,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Read-only RAGE `.awc` audio bank container header parser (stream/chunk counts, codec tag PCM/IMA-ADPCM/XMA2/Opus, sample rate, channel count) without extracting or committing audio data.
 - [x] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** — `DONE` (PR #135, closes #114) *(no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
   - Reusable bounded Web Worker pool supporting transferable `ArrayBuffer` jobs, cancellation, and graceful crash recovery for background decompression & shader pre-parsing.
-- [ ] **W30 — Wire `web/index.html` to `web/app_bootstrap.js` & `web/ui/hud_controller.js` (`web/index.html`)** — `IN PROGRESS` (#130, @MarcBlattmann) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
+- [x] **W30 — Wire `web/index.html` to `web/app_bootstrap.js` & `web/ui/hud_controller.js` (`web/index.html`)** — `DONE` (PR #143, closes #130) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Adds compact interactive HUD action controls and replaces the legacy hardcoded worker bootstrap with `bootstrapPlayGta6App` + `HudController` so opening `http://127.0.0.1:8080` renders live WebGPU smoke frames or boots `runtime.wasm`.
-- [ ] **W31 — Browser Streaming Manifest & Chunk Integrity Verifier (`web/storage/manifest_verifier.js`)** — `IN PROGRESS` (#131, @MarcBlattmann) *(no game files required — disjoint files `web/storage/manifest_verifier.js`, `tests/test_manifest_verifier.mjs`)*
+- [x] **W31 — Browser Streaming Manifest & Chunk Integrity Verifier (`web/storage/manifest_verifier.js`)** — `DONE` (PR #142, closes #131) *(no game files required — disjoint files `web/storage/manifest_verifier.js`, `tests/test_manifest_verifier.mjs`)*
   - Validates `data-manifest.json` and `bootset.json` schemas, computes partial-download streaming readiness percentages, and probes live HTTP `206` Range / `ETag` consistency.
 - [ ] **W32 — Wire `IoPriorityScheduler` (`W18`) & `Rpf9Vfs` (`W11`) into `web/workers/io_worker.js`** — `UNCLAIMED` *(no game files required — disjoint files `web/workers/io_worker.js`, `tests/test_io_worker_integration.mjs`)*
   - Connect prioritized Range scheduling and on-demand RPF9 virtual sub-file streaming into the `HttpfsMailbox` worker loop.
