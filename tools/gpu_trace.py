@@ -524,6 +524,22 @@ class FrameSummary:
     compute_passes: int = 0
     textures_created: int = 0
     bind_groups_created: int = 0
+    # Packet ABI v2 summary metrics (opcodes 22..34).
+    begin_render_passes: int = 0
+    end_render_passes: int = 0
+    color_load_ops: dict[str, int] | None = None
+    color_store_ops: dict[str, int] | None = None
+    depth_load_ops: dict[str, int] | None = None
+    depth_store_ops: dict[str, int] | None = None
+    bind_group_layouts_created: int = 0
+    pipeline_layouts_created: int = 0
+    render_pipelines2_created: int = 0
+    compute_pipelines2_created: int = 0
+    viewport_changes: int = 0
+    scissor_changes: int = 0
+    blend_constant_changes: int = 0
+    stencil_ref_changes: int = 0
+    malformed_v2_packets: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -537,6 +553,21 @@ class FrameSummary:
             "compute_passes": self.compute_passes,
             "textures_created": self.textures_created,
             "bind_groups_created": self.bind_groups_created,
+            "begin_render_passes": self.begin_render_passes,
+            "end_render_passes": self.end_render_passes,
+            "color_load_ops": dict(self.color_load_ops or {}),
+            "color_store_ops": dict(self.color_store_ops or {}),
+            "depth_load_ops": dict(self.depth_load_ops or {}),
+            "depth_store_ops": dict(self.depth_store_ops or {}),
+            "bind_group_layouts_created": self.bind_group_layouts_created,
+            "pipeline_layouts_created": self.pipeline_layouts_created,
+            "render_pipelines2_created": self.render_pipelines2_created,
+            "compute_pipelines2_created": self.compute_pipelines2_created,
+            "viewport_changes": self.viewport_changes,
+            "scissor_changes": self.scissor_changes,
+            "blend_constant_changes": self.blend_constant_changes,
+            "stencil_ref_changes": self.stencil_ref_changes,
+            "malformed_v2_packets": self.malformed_v2_packets,
             "bytes": self.bytes,
             "opcode_histogram": self.opcode_histogram,
             "complete": self.complete,
@@ -598,6 +629,85 @@ class DecodedTrace:
         )
 
     @property
+    def begin_render_passes(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.BeginRenderPass and p.valid)
+
+    @property
+    def end_render_passes(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.EndRenderPass and p.valid)
+
+    @property
+    def bind_group_layouts_created(self) -> int:
+        return sum(
+            1 for p in self.packets if p.opcode == GpuOpcode.CreateBindGroupLayout and p.valid
+        )
+
+    @property
+    def pipeline_layouts_created(self) -> int:
+        return sum(
+            1 for p in self.packets if p.opcode == GpuOpcode.CreatePipelineLayout and p.valid
+        )
+
+    @property
+    def render_pipelines2_created(self) -> int:
+        return sum(
+            1 for p in self.packets if p.opcode == GpuOpcode.CreateRenderPipeline2 and p.valid
+        )
+
+    @property
+    def compute_pipelines2_created(self) -> int:
+        return sum(
+            1 for p in self.packets if p.opcode == GpuOpcode.CreateComputePipeline2 and p.valid
+        )
+
+    @property
+    def viewport_changes(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.SetViewport and p.valid)
+
+    @property
+    def scissor_changes(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.SetScissorRect and p.valid)
+
+    @property
+    def blend_constant_changes(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.SetBlendConstant and p.valid)
+
+    @property
+    def stencil_ref_changes(self) -> int:
+        return sum(
+            1 for p in self.packets if p.opcode == GpuOpcode.SetStencilReference and p.valid
+        )
+
+    @property
+    def color_load_ops(self) -> dict[str, int]:
+        return _merge_op_histograms(f.color_load_ops for f in self.frames)
+
+    @property
+    def color_store_ops(self) -> dict[str, int]:
+        return _merge_op_histograms(f.color_store_ops for f in self.frames)
+
+    @property
+    def depth_load_ops(self) -> dict[str, int]:
+        return _merge_op_histograms(f.depth_load_ops for f in self.frames)
+
+    @property
+    def depth_store_ops(self) -> dict[str, int]:
+        return _merge_op_histograms(f.depth_store_ops for f in self.frames)
+
+    @property
+    def malformed_v2_packets(self) -> int:
+        return sum(1 for p in self.packets if _is_v2_opcode(p.opcode) and not p.valid)
+
+    @property
+    def truncated_v2_diagnostics(self) -> int:
+        """Count truncated/short-payload diagnostics tied to ABI v2 packets."""
+        return sum(
+            1
+            for d in self.diagnostics
+            if d.code in _V2_TRUNCATION_DIAG_CODES and _diag_targets_v2(self, d)
+        )
+
+    @property
     def unknown_opcode_count(self) -> int:
         return sum(1 for p in self.packets if not p.known)
 
@@ -630,6 +740,22 @@ class DecodedTrace:
             "compute_passes": self.compute_passes,
             "textures_created": self.textures_created,
             "bind_groups_created": self.bind_groups_created,
+            "begin_render_passes": self.begin_render_passes,
+            "end_render_passes": self.end_render_passes,
+            "color_load_ops": self.color_load_ops,
+            "color_store_ops": self.color_store_ops,
+            "depth_load_ops": self.depth_load_ops,
+            "depth_store_ops": self.depth_store_ops,
+            "bind_group_layouts_created": self.bind_group_layouts_created,
+            "pipeline_layouts_created": self.pipeline_layouts_created,
+            "render_pipelines2_created": self.render_pipelines2_created,
+            "compute_pipelines2_created": self.compute_pipelines2_created,
+            "viewport_changes": self.viewport_changes,
+            "scissor_changes": self.scissor_changes,
+            "blend_constant_changes": self.blend_constant_changes,
+            "stencil_ref_changes": self.stencil_ref_changes,
+            "malformed_v2_packets": self.malformed_v2_packets,
+            "truncated_v2_diagnostics": self.truncated_v2_diagnostics,
             "unknown_opcode_count": self.unknown_opcode_count,
             "opcode_histogram": dict(self.opcode_histogram),
             "frames": [frame.to_dict() for frame in self.frames],
@@ -638,6 +764,38 @@ class DecodedTrace:
         if not stats_only:
             result["packets"] = [pkt.to_dict() for pkt in self.packets]
         return result
+
+
+_V2_TRUNCATION_DIAG_CODES = frozenset(
+    {
+        "truncated_header",
+        "truncated_payload",
+        "payload_too_short",
+        "variable_payload_truncated",
+    }
+)
+
+
+def _is_v2_opcode(opcode: int) -> bool:
+    return GpuOpcode.CreateBindGroupLayout <= opcode <= GpuOpcode.CreateSampler2
+
+
+def _merge_op_histograms(histograms: Any) -> dict[str, int]:
+    merged: Counter[str] = Counter()
+    for hist in histograms:
+        if hist:
+            merged.update(hist)
+    return dict(merged)
+
+
+def _diag_targets_v2(trace: DecodedTrace, diag: TraceDiagnostic) -> bool:
+    if diag.packet_index is not None and 0 <= diag.packet_index < len(trace.packets):
+        return _is_v2_opcode(trace.packets[diag.packet_index].opcode)
+    # Stream-level truncations (no packet object emitted): match "(opcode N)" in the message.
+    for op in range(int(GpuOpcode.CreateBindGroupLayout), int(GpuOpcode.CreateSampler2) + 1):
+        if f"(opcode {op})" in diag.message:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2773,11 +2931,28 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
         compute_passes = 0
         textures_created = 0
         bind_groups_created = 0
+        begin_render_passes = 0
+        end_render_passes = 0
+        color_load_ops: Counter[str] = Counter()
+        color_store_ops: Counter[str] = Counter()
+        depth_load_ops: Counter[str] = Counter()
+        depth_store_ops: Counter[str] = Counter()
+        bind_group_layouts_created = 0
+        pipeline_layouts_created = 0
+        render_pipelines2_created = 0
+        compute_pipelines2_created = 0
+        viewport_changes = 0
+        scissor_changes = 0
+        blend_constant_changes = 0
+        stencil_ref_changes = 0
+        malformed_v2_packets = 0
         total_bytes = 0
         active_pass: str | None = None
         for pkt in current:
             histogram[pkt.name] += 1
             total_bytes += pkt.total_bytes
+            if _is_v2_opcode(pkt.opcode) and not pkt.valid:
+                malformed_v2_packets += 1
             if not pkt.valid:
                 continue
             if pkt.opcode == GpuOpcode.Draw:
@@ -2791,6 +2966,35 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                 textures_created += 1
             elif pkt.opcode in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2):
                 bind_groups_created += 1
+            elif pkt.opcode == GpuOpcode.BeginRenderPass:
+                begin_render_passes += 1
+                for color in pkt.fields.get("color_attachments") or ():
+                    if color is None:
+                        continue
+                    color_load_ops[str(color["load_op"])] += 1
+                    color_store_ops[str(color["store_op"])] += 1
+                ds = pkt.fields.get("depth_stencil")
+                if ds is not None:
+                    depth_load_ops[str(ds["depth_load_op"])] += 1
+                    depth_store_ops[str(ds["depth_store_op"])] += 1
+            elif pkt.opcode == GpuOpcode.EndRenderPass:
+                end_render_passes += 1
+            elif pkt.opcode == GpuOpcode.CreateBindGroupLayout:
+                bind_group_layouts_created += 1
+            elif pkt.opcode == GpuOpcode.CreatePipelineLayout:
+                pipeline_layouts_created += 1
+            elif pkt.opcode == GpuOpcode.CreateRenderPipeline2:
+                render_pipelines2_created += 1
+            elif pkt.opcode == GpuOpcode.CreateComputePipeline2:
+                compute_pipelines2_created += 1
+            elif pkt.opcode == GpuOpcode.SetViewport:
+                viewport_changes += 1
+            elif pkt.opcode == GpuOpcode.SetScissorRect:
+                scissor_changes += 1
+            elif pkt.opcode == GpuOpcode.SetBlendConstant:
+                blend_constant_changes += 1
+            elif pkt.opcode == GpuOpcode.SetStencilReference:
+                stencil_ref_changes += 1
 
             if pkt.opcode in compute_pass_opcodes:
                 if active_pass != "compute":
@@ -2816,6 +3020,21 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                 compute_passes=compute_passes,
                 textures_created=textures_created,
                 bind_groups_created=bind_groups_created,
+                begin_render_passes=begin_render_passes,
+                end_render_passes=end_render_passes,
+                color_load_ops=dict(color_load_ops),
+                color_store_ops=dict(color_store_ops),
+                depth_load_ops=dict(depth_load_ops),
+                depth_store_ops=dict(depth_store_ops),
+                bind_group_layouts_created=bind_group_layouts_created,
+                pipeline_layouts_created=pipeline_layouts_created,
+                render_pipelines2_created=render_pipelines2_created,
+                compute_pipelines2_created=compute_pipelines2_created,
+                viewport_changes=viewport_changes,
+                scissor_changes=scissor_changes,
+                blend_constant_changes=blend_constant_changes,
+                stencil_ref_changes=stencil_ref_changes,
+                malformed_v2_packets=malformed_v2_packets,
             )
         )
         current.clear()
@@ -3207,6 +3426,12 @@ def _format_v2_fields(op: int, f: dict[str, Any]) -> str:
     return " ".join(f"{k}={v}" for k, v in f.items())
 
 
+def _format_op_histogram(hist: dict[str, int] | None) -> str:
+    if not hist:
+        return "(none)"
+    return ", ".join(f"{name}={count}" for name, count in sorted(hist.items()))
+
+
 def format_trace_text(trace: DecodedTrace, *, stats_only: bool = False) -> str:
     """Format a DecodedTrace as human-readable disassembly and/or statistics."""
     lines: list[str] = [
@@ -3217,6 +3442,23 @@ def format_trace_text(trace: DecodedTrace, *, stats_only: bool = False) -> str:
             f"Draws: {trace.draw_calls} | Dispatches: {trace.compute_dispatches} | "
             f"Unknown: {trace.unknown_opcode_count} | "
             f"Diagnostics: {len(trace.diagnostics)}"
+        ),
+        (
+            f"RenderPasses: begin={trace.begin_render_passes} end={trace.end_render_passes} | "
+            f"Layouts: bgl={trace.bind_group_layouts_created} "
+            f"pll={trace.pipeline_layouts_created} | "
+            f"Pipelines2: render={trace.render_pipelines2_created} "
+            f"compute={trace.compute_pipelines2_created} | "
+            f"Dynamic: vp={trace.viewport_changes} scissor={trace.scissor_changes} "
+            f"blend={trace.blend_constant_changes} stencil={trace.stencil_ref_changes} | "
+            f"V2Malformed: {trace.malformed_v2_packets} "
+            f"V2Truncated: {trace.truncated_v2_diagnostics}"
+        ),
+        (
+            f"ColorLoadOps: {_format_op_histogram(trace.color_load_ops)} | "
+            f"ColorStoreOps: {_format_op_histogram(trace.color_store_ops)} | "
+            f"DepthLoadOps: {_format_op_histogram(trace.depth_load_ops)} | "
+            f"DepthStoreOps: {_format_op_histogram(trace.depth_store_ops)}"
         ),
     ]
 
@@ -3255,6 +3497,26 @@ def format_trace_text(trace: DecodedTrace, *, stats_only: bool = False) -> str:
             extras.append(f"textures={frame.textures_created}")
         if frame.bind_groups_created:
             extras.append(f"bind_groups={frame.bind_groups_created}")
+        if frame.begin_render_passes or frame.end_render_passes:
+            extras.append(f"passes={frame.begin_render_passes}/{frame.end_render_passes}")
+        if frame.bind_group_layouts_created:
+            extras.append(f"bgl={frame.bind_group_layouts_created}")
+        if frame.pipeline_layouts_created:
+            extras.append(f"pll={frame.pipeline_layouts_created}")
+        if frame.render_pipelines2_created:
+            extras.append(f"rp2={frame.render_pipelines2_created}")
+        if frame.compute_pipelines2_created:
+            extras.append(f"cp2={frame.compute_pipelines2_created}")
+        if frame.viewport_changes:
+            extras.append(f"viewport={frame.viewport_changes}")
+        if frame.scissor_changes:
+            extras.append(f"scissor={frame.scissor_changes}")
+        if frame.blend_constant_changes:
+            extras.append(f"blend={frame.blend_constant_changes}")
+        if frame.stencil_ref_changes:
+            extras.append(f"stencil={frame.stencil_ref_changes}")
+        if frame.malformed_v2_packets:
+            extras.append(f"v2_malformed={frame.malformed_v2_packets}")
         extra_str = (" " + " ".join(extras)) if extras else ""
         lines.append(
             f"  Frame {frame.frame_index:03d} [{status}]: "
