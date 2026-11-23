@@ -34,6 +34,57 @@ public:
         uint32_t first_instance = 0);
     void present();
     void destroy_resource(uint32_t id);
+    void create_texture(
+        uint32_t id,
+        uint32_t width,
+        uint32_t height,
+        uint32_t depth_or_layers,
+        uint32_t mip_levels,
+        GpuTextureFormat format,
+        uint32_t usage_flags,
+        GpuTextureDimension dimension = GpuTextureDimension::Dim2D);
+    void write_texture(
+        uint32_t texture_id,
+        uint32_t mip_level,
+        uint32_t origin_x,
+        uint32_t origin_y,
+        uint32_t origin_z,
+        uint32_t width,
+        uint32_t height,
+        uint32_t depth_or_layers,
+        uint32_t bytes_per_row,
+        uint32_t rows_per_image,
+        const void* data,
+        uint32_t data_len);
+    void create_sampler(
+        uint32_t id,
+        GpuAddressMode address_u = GpuAddressMode::ClampToEdge,
+        GpuAddressMode address_v = GpuAddressMode::ClampToEdge,
+        GpuAddressMode address_w = GpuAddressMode::ClampToEdge,
+        GpuFilterMode mag_filter = GpuFilterMode::Linear,
+        GpuFilterMode min_filter = GpuFilterMode::Linear,
+        GpuFilterMode mipmap_filter = GpuFilterMode::Linear,
+        uint32_t max_anisotropy = 1);
+    void create_bind_group(
+        uint32_t id,
+        uint32_t pipeline_id,
+        uint32_t group_index,
+        const GpuBindGroupEntry* entries,
+        uint32_t entry_count);
+    void set_bind_group(uint32_t group_index, uint32_t bind_group_id);
+    void set_index_buffer(
+        uint32_t buffer_id,
+        GpuIndexFormat index_format = GpuIndexFormat::Uint16,
+        uint64_t offset = 0);
+    void draw_indexed(
+        uint32_t index_count,
+        uint32_t instance_count = 1,
+        uint32_t first_index = 0,
+        int32_t base_vertex = 0,
+        uint32_t first_instance = 0);
+    void create_compute_pipeline(uint32_t id, uint32_t cs_shader_id, uint32_t flags = 0);
+    void set_compute_pipeline(uint32_t pipeline_id);
+    void dispatch_compute(uint32_t workgroup_x, uint32_t workgroup_y = 1, uint32_t workgroup_z = 1);
 
     const uint8_t* data() const { return buf_.data(); }
     size_t size() const { return buf_.size(); }

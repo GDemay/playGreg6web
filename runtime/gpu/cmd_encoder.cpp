@@ -140,4 +140,147 @@ void CommandEncoder::destroy_resource(uint32_t id) {
     write_packet(GpuOpcode::DestroyResource, &payload, sizeof(payload));
 }
 
+void CommandEncoder::create_texture(
+    uint32_t id,
+    uint32_t width,
+    uint32_t height,
+    uint32_t depth_or_layers,
+    uint32_t mip_levels,
+    GpuTextureFormat format,
+    uint32_t usage_flags,
+    GpuTextureDimension dimension) {
+    const GpuCreateTexturePayload payload{
+        id,
+        width,
+        height,
+        depth_or_layers,
+        mip_levels,
+        static_cast<uint32_t>(format),
+        usage_flags,
+        static_cast<uint32_t>(dimension),
+    };
+    write_packet(GpuOpcode::CreateTexture, &payload, sizeof(payload));
+}
+
+void CommandEncoder::write_texture(
+    uint32_t texture_id,
+    uint32_t mip_level,
+    uint32_t origin_x,
+    uint32_t origin_y,
+    uint32_t origin_z,
+    uint32_t width,
+    uint32_t height,
+    uint32_t depth_or_layers,
+    uint32_t bytes_per_row,
+    uint32_t rows_per_image,
+    const void* data,
+    uint32_t data_len) {
+    const uint32_t actual_len = (data != nullptr) ? data_len : 0u;
+    const GpuWriteTexturePayload payload{
+        texture_id,
+        mip_level,
+        origin_x,
+        origin_y,
+        origin_z,
+        width,
+        height,
+        depth_or_layers,
+        bytes_per_row,
+        rows_per_image,
+        actual_len,
+        0u,
+    };
+    write_packet_with_tail(GpuOpcode::WriteTexture, &payload, sizeof(payload), data, actual_len);
+}
+
+void CommandEncoder::create_sampler(
+    uint32_t id,
+    GpuAddressMode address_u,
+    GpuAddressMode address_v,
+    GpuAddressMode address_w,
+    GpuFilterMode mag_filter,
+    GpuFilterMode min_filter,
+    GpuFilterMode mipmap_filter,
+    uint32_t max_anisotropy) {
+    const GpuCreateSamplerPayload payload{
+        id,
+        static_cast<uint32_t>(address_u),
+        static_cast<uint32_t>(address_v),
+        static_cast<uint32_t>(address_w),
+        static_cast<uint32_t>(mag_filter),
+        static_cast<uint32_t>(min_filter),
+        static_cast<uint32_t>(mipmap_filter),
+        max_anisotropy,
+    };
+    write_packet(GpuOpcode::CreateSampler, &payload, sizeof(payload));
+}
+
+void CommandEncoder::create_bind_group(
+    uint32_t id,
+    uint32_t pipeline_id,
+    uint32_t group_index,
+    const GpuBindGroupEntry* entries,
+    uint32_t entry_count) {
+    const uint32_t actual_count = (entries != nullptr) ? entry_count : 0u;
+    const GpuCreateBindGroupPayload payload{
+        id,
+        pipeline_id,
+        group_index,
+        actual_count,
+    };
+    const uint32_t tail_bytes = actual_count * static_cast<uint32_t>(sizeof(GpuBindGroupEntry));
+    write_packet_with_tail(GpuOpcode::CreateBindGroup, &payload, sizeof(payload), entries, tail_bytes);
+}
+
+void CommandEncoder::set_bind_group(uint32_t group_index, uint32_t bind_group_id) {
+    const GpuSetBindGroupPayload payload{group_index, bind_group_id};
+    write_packet(GpuOpcode::SetBindGroup, &payload, sizeof(payload));
+}
+
+void CommandEncoder::set_index_buffer(
+    uint32_t buffer_id,
+    GpuIndexFormat index_format,
+    uint64_t offset) {
+    const GpuSetIndexBufferPayload payload{
+        buffer_id,
+        static_cast<uint32_t>(index_format),
+        offset,
+    };
+    write_packet(GpuOpcode::SetIndexBuffer, &payload, sizeof(payload));
+}
+
+void CommandEncoder::draw_indexed(
+    uint32_t index_count,
+    uint32_t instance_count,
+    uint32_t first_index,
+    int32_t base_vertex,
+    uint32_t first_instance) {
+    const GpuDrawIndexedPayload payload{
+        index_count,
+        instance_count,
+        first_index,
+        base_vertex,
+        first_instance,
+    };
+    write_packet(GpuOpcode::DrawIndexed, &payload, sizeof(payload));
+}
+
+void CommandEncoder::create_compute_pipeline(uint32_t id, uint32_t cs_shader_id, uint32_t flags) {
+    const GpuCreateComputePipelinePayload payload{id, cs_shader_id, flags, 0u};
+    write_packet(GpuOpcode::CreateComputePipeline, &payload, sizeof(payload));
+}
+
+void CommandEncoder::set_compute_pipeline(uint32_t pipeline_id) {
+    const GpuSetComputePipelinePayload payload{pipeline_id};
+    write_packet(GpuOpcode::SetComputePipeline, &payload, sizeof(payload));
+}
+
+void CommandEncoder::dispatch_compute(
+    uint32_t workgroup_x,
+    uint32_t workgroup_y,
+    uint32_t workgroup_z) {
+    const GpuDispatchComputePayload payload{workgroup_x, workgroup_y, workgroup_z};
+    write_packet(GpuOpcode::DispatchCompute, &payload, sizeof(payload));
+}
+
 }  // namespace playgta6::gpu
