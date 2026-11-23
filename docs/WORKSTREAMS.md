@@ -208,5 +208,5 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Connect prioritized Range scheduling and on-demand RPF9 virtual sub-file streaming into the `HttpfsMailbox` worker loop.
 - [ ] **W33 — Headless Live Boot & HUD E2E Verification Harness (`tests/test_live_boot_e2e.mjs`)** — `UNCLAIMED` *(no game files required — wait for W30 merge)*
   - End-to-end test spinning up `server/serve_local.py`, fetching `/`, `/api/status`, and JS modules with `COOP`/`COEP` headers, and running `bootstrapPlayGta6App` + `HudController` through smoke-demo frames, trace export, and diagnostic bundle generation.
-- [ ] **W34 — Real RPF9 Little-Endian `0x52504639` (`"9FPR"`) Magic Support (`tools/src/rpf9.rs`, `web/workers/rpf9_vfs.js`)** — `IN PROGRESS` (#140, @MarcBlattmann) *(driven by M2 inspection of real Xbox `.rpf` archives)*
+- [x] **W34 — Real RPF9 Little-Endian `0x52504639` (`"9FPR"`) Magic Support (`tools/src/rpf9.rs`, `web/workers/rpf9_vfs.js`)** — `DONE` (PR #147, closes #140) *(driven by M2 inspection of real Xbox `.rpf` archives)*
   - Accept little-endian `0x52504639` (`39 46 50 52` = `"9FPR"`) alongside legacy big-endian `"RPF9"` headers in both the Rust CLI inspector and browser streaming RPF9 VFS reader.
