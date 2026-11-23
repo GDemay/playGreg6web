@@ -1,8 +1,8 @@
 # playgta6web
 
-An experimental, self-hosted browser runtime for **Grand Theft Auto VI (Xbox Series)** — built so the **user's browser** runs everything locally via **WebAssembly + WebGPU + HTTP Range streaming** (no server-side video streaming).
+An experimental, self-hosted project to run **Grand Theft Auto VI (Xbox Series)** directly inside the **user's browser** via **Wasm64 + WebGPU + HTTP Range streaming** — no server-side video streaming.
 
-We reuse what we can from [shadany7824/playgta5](https://github.com/shadany7824/playgta5) (browser worker/streaming pattern) and [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) / [breadbbbb/rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer) (RPF9 decoding & RDNA2 shader research) to speed up development.
+We reuse what we can from [shadany7824/playgta5](https://github.com/shadany7824/playgta5) (browser worker/streaming model) and [ItsNotRexed/Leonida](https://github.com/ItsNotRexed/Leonida) (RDNA2 shader translation & Xbox runtime research) to speed up development.
 
 > [!IMPORTANT]
 > **No game files are in this repo.** No binaries, keys, `.rpf` archives, or extracted assets. Supply your own local copy; all local data stays in gitignored folders (`local-data/`, `work/`).
@@ -15,17 +15,18 @@ We reuse what we can from [shadany7824/playgta5](https://github.com/shadany7824/
 flowchart LR
     Server["Local Server (COOP/COEP + HTTP Range)"] -->|Static + 206 Range| Browser
     subgraph Browser["Client Browser"]
-        Main["index.html (UI + Input)"] <-->|SharedArrayBuffer| Loader["loader.js (WASM Engine)"]
-        Loader <--> IO["io_worker.js (HTTP Range + OPFS/IndexedDB)"]
-        Loader --> WGPU["wgpu_worker.js (OffscreenCanvas WebGPU + WGSL)"]
-        Loader --> Audio["audio_worker.js (WebAudio / Opus)"]
+        Main["index.html (UI + Input)"] <-->|SharedArrayBuffer| Loader["loader.js (Wasm64 Recompiled Game + Xbox Shims)"]
+        Loader <--> IO["io_worker.js (HTTP Range RPF9 VFS + OPFS/IndexedDB)"]
+        Loader --> WGPU["wgpu_worker.js (d3d12_xs -> WebGPU + WGSL Shaders)"]
+        Loader --> Audio["audio_worker.js (WebAudio / Opus & XMA2)"]
     end
 ```
 
-### Main Technical Hurdles
-- **No C++ source code:** Unlike `playgta5`, GTA 6 only has compiled Xbox Series x86-64 binaries. Short-term we build a WASM/WebGPU world & asset runtime; long-term running original game code in-browser requires x86-64 → **Wasm64** recompilation + Xbox API shims.
-- **WebGPU limits:** No mesh shaders, no hardware ray tracing, no raw SPIR-V. RDNA2 shaders need lowering (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → **WGSL** (`naga`/`tint`).
-- **Size & Memory:** >100 GB package / 16 GB target RAM requires strict **HTTP `206` Range streaming** (`io_worker.js` + `bootset.json` + OPFS cache) and **Cross-Origin Isolation** (`COOP`/`COEP`) for `SharedArrayBuffer`.
+### Core Components Needed to Run the Real Game in Browser
+1. **CPU (x86-64 → Wasm64):** Lift/recompile the Xbox Series x86-64 executable to **Wasm64 (`memory64`)** + pthread worker support (`SharedArrayBuffer`) to handle the >4 GB address space.
+2. **OS Shims (`runtime/`):** Reimplement required Xbox Series / Win32 APIs (`xgameruntime`, `XTaskQueue`, threading/TLS, virtual memory, file I/O, GameInput) backed by browser APIs.
+3. **GPU (`d3d12_xs` → WebGPU + WGSL):** Lower RDNA2 (`gfx1013`) shaders (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → **WGSL** (`naga`/`tint`), and map `d3d12_xs` command lists to WebGPU inside `wgpu_worker.js` (`OffscreenCanvas`).
+4. **Streaming I/O (`io_worker.js`):** Serve local `.rpf` archives on demand via HTTP `206 Partial Content` range requests + `bootset.json` prefetch + OPFS/IndexedDB caching.
 
 ---
 
@@ -34,26 +35,24 @@ flowchart LR
 ```text
 playgta6web/
 ├── web/          # index.html, loader.js, io_worker.js, wgpu_worker.js, audio_worker.js, input
-├── engine/       # Rust/C++ -> WASM core (VFS, WebGPU streamer/renderer, sim)
-├── pipeline/     # Offline local tools: RPF9 indexing, BC7/KTX2 textures, Opus audio, SPIR-V -> WGSL
+├── recomp/       # x86-64 -> LLVM IR -> Wasm64 static recompilation pipeline
+├── runtime/      # Xbox/Win32 OS shims + d3d12_xs -> WebGPU command bridge (compiled to Wasm64)
+├── shaders/      # RDNA2 -> SPIR-V -> WGSL (naga/tint) offline shader packer & index
 ├── server/       # Local HTTP server with COOP/COEP + Range (206) support
-└── local-data/   # GITIGNORED: local manifests, streamed chunks, shader packs
+└── local-data/   # GITIGNORED: local game data, manifests, recompiled wasm, WGSL packs
 ```
 
 ---
 
 ## Roadmap (How to Split Work)
 
-**Track 1 — Browser & Server (`server/`, `web/`, `engine/`)**
+**Track 1 — Browser Host, Streaming VFS & WebGPU Backend (`server/`, `web/`, `runtime/`)**
 - [ ] `server/serve_local.py` with `COOP`/`COEP` headers + HTTP Range (`206`)
 - [ ] `web/` worker shell (`loader.js`, `io_worker.js`, `wgpu_worker.js` with `OffscreenCanvas` WebGPU)
 - [ ] Input bridge (Pointer Lock, KB/M, Gamepad → `SharedArrayBuffer`) + IndexedDB `/userdata`
-- [ ] WASM/WebGPU chunk streamer & renderer
+- [ ] `d3d12_xs` → WebGPU command buffer bridge & Xbox OS shims (`xgameruntime`, `XTaskQueue`, VFS)
 
-**Track 2 — Assets & Shaders (`pipeline/`)**
-- [ ] Index local RPF9 archives → `data-manifest.json` + `bootset.json`
-- [ ] Pack textures (BC7/KTX2) and audio (Ogg Opus) for browser streaming
-- [ ] Test RDNA2 → SPIR-V → WGSL (`naga`/`tint`) shader conversion & document blockers
-
-**Track 3 — Long-Term Runtime**
-- [ ] Xbox OS shim layer (`xgameruntime`, `XTaskQueue`) + Wasm64 static recompilation & `d3d12_xs` → WebGPU backend
+**Track 2 — Recompilation & Shader Pipeline (`recomp/`, `shaders/`)**
+- [ ] Static x86-64 PE loader & lifting pipeline (`x86-64 → LLVM IR → Wasm64`)
+- [ ] RDNA2 → SPIR-V (`--mesh-compute`, `--wave64-emulate`) → WGSL (`naga`/`tint`) packer & `shader-index.json`
+- [ ] `data-manifest.json` + `bootset.json` generator for range-streaming local `.rpf` files
