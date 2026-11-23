@@ -69,7 +69,11 @@
 //! Everything that depends on the guest CPU state layout, guest memory or the runtime is behind
 //! the functions of `pg6_guest_seam.h`. The generator writes a default seam matching the
 //! lifter's `%playgta6.GuestState` (16 GPRs in x86 encoding order at offset 0, `xmm0..15` at
-//! offset 160 with a 16-byte stride, guest addresses mapped 1:1 onto host memory). Building the
+//! offset 160 with a 16-byte stride, guest addresses translated like lifted code does:
+//! `host = __playgta6_guest_base + VA`, see `docs/wasm_abi.md` "Guest Address Space"). Only
+//! top-level pointer arguments and pointer results are translated; pointers a shim stores into
+//! guest memory (out-parameters, structures) are host pointers and are valid guest addresses only
+//! under the identity mapping (the browser build) or when they point into the guest arena. Building the
 //! thunks with `-DPG6_GUEST_SEAM_HEADER="<header>"` swaps in another seam without regenerating.
 //! A seam provides `pg6_seam_get_gpr`/`pg6_seam_set_gpr`, `pg6_seam_get_xmm_lo`/
 //! `pg6_seam_set_xmm_lo`, `pg6_seam_load_u64`, `pg6_seam_host_ptr`/`pg6_seam_guest_addr`
@@ -1396,7 +1400,9 @@ fn render_seam() -> String {
 // Guest-state seam of the import thunks. Every access to guest registers, guest memory and the
 // runtime goes through these functions. This default matches the lifter's guest state:
 // rax rcx rdx rbx rsp rbp rsi rdi r8..r15 (8 bytes each) at offset {gpr}, xmm0..xmm15 at
-// offset {xmm} ({stride} bytes each), guest addresses mapped 1:1 onto host memory.
+// offset {xmm} ({stride} bytes each), and guest addresses translate like lifted code does:
+// host = __playgta6_guest_base + guest VA (docs/wasm_abi.md \"Guest Address Space\"; 0, the
+// identity, in the browser build).
 // To use another layout, build the thunks with -DPG6_GUEST_SEAM_HEADER=\"<header>\" that
 // provides the same names.
 #pragma once
@@ -1405,6 +1411,7 @@ fn render_seam() -> String {
 #include <cstdlib>
 #include <cstring>
 
+#include \"abi/playgta6_abi.h\"
 #include \"os/os_shim.h\"
 
 static_assert(sizeof(void*) == 8, \"guest addresses are 64-bit\");
@@ -1437,13 +1444,17 @@ inline void pg6_seam_set_xmm_lo(void* state, unsigned n, uint64_t bits) {{
     std::memcpy(static_cast<unsigned char*>(state) + kPg6SeamXmmOffset + kPg6SeamXmmStride * n, &bits, 8);
 }}
 
-// Guest address -> host pointer (null stays null) and back.
+// Guest address -> host pointer and back (null stays null): the shared translation.
 inline void* pg6_seam_host_ptr(uint64_t guest_va) {{
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(guest_va));
+    return guest_va == 0 ? nullptr
+                         : reinterpret_cast<void*>(
+                               static_cast<uintptr_t>(__playgta6_guest_base + guest_va));
 }}
 
 inline uint64_t pg6_seam_guest_addr(const void* host) {{
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
+    return host == nullptr
+               ? 0
+               : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host)) - __playgta6_guest_base;
 }}
 
 inline uint64_t pg6_seam_load_u64(uint64_t guest_va) {{
@@ -2537,6 +2548,19 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         );
         assert!(out.seam.contains("std::abort();"));
         assert!(out.seam.contains("playgta6::os::log(message);"));
+        // Pointers use the lifter's translation (host = base + VA), null maps to null.
+        let base = crate::lift::GUEST_BASE_SYMBOL;
+        assert!(out.seam.contains("#include \"abi/playgta6_abi.h\""));
+        assert!(
+            out.seam
+                .contains(&format!("static_cast<uintptr_t>({base} + guest_va)"))
+        );
+        assert!(
+            out.seam
+                .contains(&format!("reinterpret_cast<uintptr_t>(host)) - {base}"))
+        );
+        assert!(out.seam.contains("return guest_va == 0 ? nullptr"));
+        assert!(out.seam.contains("return host == nullptr"));
 
         // Imports without an IAT slot appear in the manifest only.
         let slotless = find(&plan, "KERNEL32!VirtualAlloc");
@@ -3023,6 +3047,13 @@ void log(std::string_view message) {
     std::fflush(stderr);
 }
 }  // namespace playgta6::os
+
+// The runtime's guest -> host translation base. Identity, like the browser build: the fake shims
+// store host pointers through out-parameters (`*queue = &g_marker`), which the bridge does not
+// translate (see "Guest-state seam" in stubs.rs).
+extern "C" {
+uint64_t __playgta6_guest_base = 0;
+}
 
 namespace {
 int g_failures = 0;
