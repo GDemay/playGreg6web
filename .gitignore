@@ -14,11 +14,12 @@ game/
 *.wgsl.pack
 
 # Build outputs
+/target/
 web/dist/
-engine/target/
-engine/build/
+runtime/build*/
 *.wasm
 *.wasm.map
+.env
 
 # Python
 __pycache__/
