@@ -36,11 +36,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 ## Track 3: GPU Command Bridge (`runtime/gpu/` + `web/workers/wgpu_worker.js`, C++20 + JS)
 **Goal:** Translate `d3d12_xs` command lists to binary packets executed on WebGPU.
 
-- [ ] **G1 — Expand Command Ring & Resource Tables** — `IN PROGRESS` (#4, @MarcBlattmann) *(no game files required)*
+- [x] **G1 — Expand Command Ring & Resource Tables** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement `CreateBuffer`, `WriteBuffer`, `CreateShaderModule`, `CreatePipeline`, and `Draw` packets across `runtime/abi/playgta6_abi.h`, `runtime/gpu/cmd_encoder.cpp`, and `web/workers/wgpu_worker.js`.
 - [ ] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** *(no game files required)*
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
-- [ ] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `IN PROGRESS` (#4, @MarcBlattmann) *(no game files required)*
+- [x] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
 
 ---
