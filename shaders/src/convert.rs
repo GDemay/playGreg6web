@@ -8,6 +8,7 @@ use crate::compat::{
     CompatAudit, SanitizeOptions, ShaderAuditRecord, SpirvStreamError, audit_naga_module,
     sanitize_spirv_bytes,
 };
+use crate::lower::{LoweringReport, lower_module_for_webgpu};
 
 /// SPIR-V little-endian magic number (`0x07230203`).
 pub const SPIRV_MAGIC: u32 = 0x0723_0203;
@@ -56,12 +57,13 @@ impl fmt::Display for ShaderStage {
     }
 }
 
-/// Options controlling SPIR-V compatibility pre-passes and Naga WebGPU limit auditing.
+/// Options controlling SPIR-V compatibility pre-passes, Naga IR lowering, and WebGPU limit auditing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvertOptions {
     pub strip_float_controls: bool,
     pub strip_non_semantic: bool,
     pub audit_webgpu_limits: bool,
+    pub lower_for_webgpu: bool,
 }
 
 impl Default for ConvertOptions {
@@ -70,18 +72,26 @@ impl Default for ConvertOptions {
             strip_float_controls: true,
             strip_non_semantic: true,
             audit_webgpu_limits: true,
+            lower_for_webgpu: true,
         }
     }
 }
 
 impl ConvertOptions {
-    /// Disable SPIR-V sanitization rewrites while keeping WebGPU limit auditing enabled.
+    /// Disable SPIR-V sanitization rewrites while keeping WebGPU limit auditing and lowering enabled.
     pub const fn without_sanitization() -> Self {
         Self {
             strip_float_controls: false,
             strip_non_semantic: false,
             audit_webgpu_limits: true,
+            lower_for_webgpu: true,
         }
+    }
+
+    /// Return a copy of these options with Naga IR WebGPU lowering disabled.
+    pub const fn without_lowering(mut self) -> Self {
+        self.lower_for_webgpu = false;
+        self
     }
 
     pub const fn sanitize_options(self) -> SanitizeOptions {
@@ -101,6 +111,7 @@ pub struct ConvertedShader {
     pub wgsl: String,
     pub spirv_bytes: usize,
     pub audit: CompatAudit,
+    pub lowering: LoweringReport,
 }
 
 /// High-level error bucket for batch blocker reporting.
@@ -190,9 +201,16 @@ pub fn convert_spirv_bytes_with_options(
         block_ctx_dump_prefix: None,
     };
 
-    let module = spv::parse_u8_slice(&sanitized_bytes, &spv_options).map_err(classify_spv_error)?;
+    let mut module =
+        spv::parse_u8_slice(&sanitized_bytes, &spv_options).map_err(classify_spv_error)?;
 
     let (stage, entry_point) = detect_entry_point(&module)?;
+
+    let lowering = if options.lower_for_webgpu {
+        lower_module_for_webgpu(&mut module)
+    } else {
+        LoweringReport::default()
+    };
 
     if options.audit_webgpu_limits {
         audit.merge(audit_naga_module(&module));
@@ -213,6 +231,7 @@ pub fn convert_spirv_bytes_with_options(
         wgsl: wgsl_source,
         spirv_bytes: spirv_bytes.len(),
         audit,
+        lowering,
     })
 }
 
@@ -243,7 +262,7 @@ pub fn audit_spirv_file(
         block_ctx_dump_prefix: None,
     };
 
-    let module = match spv::parse_u8_slice(&sanitized_bytes, &spv_options) {
+    let mut module = match spv::parse_u8_slice(&sanitized_bytes, &spv_options) {
         Ok(module) => module,
         Err(err) => {
             let conv_err = classify_spv_error(err);
@@ -257,6 +276,10 @@ pub fn audit_spirv_file(
             };
         }
     };
+
+    if options.lower_for_webgpu {
+        let _ = lower_module_for_webgpu(&mut module);
+    }
 
     if options.audit_webgpu_limits {
         audit.merge(audit_naga_module(&module));
@@ -1110,5 +1133,73 @@ mod tests {
         assert!(kws
             .iter()
             .any(|k| k == "SPV_KHR_shader_subgroup_extended_types"));
+    }
+
+    #[test]
+    fn converts_spirv_with_push_constant_when_lowering_enabled_and_rejects_when_disabled() {
+        // Minimal compute shader reading from a PushConstant block and binding a uniform in set 5.
+        const OP_TYPE_STRUCT: u16 = 30;
+        const OP_MEMBER_DECORATE: u16 = 72;
+        const DECORATION_BLOCK: u32 = 2;
+        const DECORATION_BINDING: u32 = 33;
+        const DECORATION_DESCRIPTOR_SET: u32 = 34;
+        const DECORATION_OFFSET: u32 = 35;
+        const STORAGE_CLASS_UNIFORM: u32 = 2;
+        const STORAGE_CLASS_PUSH_CONSTANT: u32 = 9;
+
+        let mut b = SpirvBuilder::new();
+        let void_ty = b.id();
+        let fn_ty = b.id();
+        let f32_ty = b.id();
+        let vec4_ty = b.id();
+        let struct_ty = b.id();
+        let ptr_pc_ty = b.id();
+        let ptr_ubo_ty = b.id();
+        let pc_var = b.id();
+        let ubo_var = b.id();
+        let main_fn = b.id();
+        let entry_label = b.id();
+
+        b.inst(17, &[1]); // OpCapability Shader
+        b.inst(14, &[0, 1]); // OpMemoryModel Logical GLSL450
+        b.inst_with_string(15, &[5, main_fn], "main", &[]); // OpEntryPoint GLCompute
+        b.inst(16, &[main_fn, 17, 1, 1, 1]); // OpExecutionMode LocalSize 1 1 1
+        b.inst(71, &[struct_ty, DECORATION_BLOCK]);
+        b.inst(OP_MEMBER_DECORATE, &[struct_ty, 0, DECORATION_OFFSET, 0]);
+        b.inst(71, &[ubo_var, DECORATION_DESCRIPTOR_SET, 5]);
+        b.inst(71, &[ubo_var, DECORATION_BINDING, 1]);
+        b.inst(19, &[void_ty]);
+        b.inst(33, &[fn_ty, void_ty]);
+        b.inst(22, &[f32_ty, 32]);
+        b.inst(23, &[vec4_ty, f32_ty, 4]);
+        b.inst(OP_TYPE_STRUCT, &[struct_ty, vec4_ty]);
+        b.inst(32, &[ptr_pc_ty, STORAGE_CLASS_PUSH_CONSTANT, struct_ty]);
+        b.inst(32, &[ptr_ubo_ty, STORAGE_CLASS_UNIFORM, struct_ty]);
+        b.inst(59, &[ptr_pc_ty, pc_var, STORAGE_CLASS_PUSH_CONSTANT]);
+        b.inst(59, &[ptr_ubo_ty, ubo_var, STORAGE_CLASS_UNIFORM]);
+        b.inst(54, &[void_ty, main_fn, 0, fn_ty]);
+        b.inst(248, &[entry_label]);
+        b.inst(253, &[]);
+        b.inst(56, &[]);
+        let spv = b.finish_bytes();
+
+        // With default options (lower_for_webgpu = true), both push constants and set 5 lower cleanly.
+        let lowered = convert_spirv_bytes(&spv)
+            .expect("push constant + set 5 SPIR-V should convert when lowering is enabled");
+        assert_eq!(lowered.lowering.push_constant_remaps.len(), 1);
+        assert_eq!(lowered.lowering.push_constant_remaps[0].new_group, 3);
+        assert_eq!(lowered.lowering.push_constant_remaps[0].new_binding, 0);
+        assert_eq!(lowered.lowering.bind_group_remaps.len(), 1);
+        assert_eq!(lowered.lowering.bind_group_remaps[0].old_group, 5);
+        assert_eq!(lowered.lowering.bind_group_remaps[0].old_binding, 1);
+        assert!(lowered.lowering.bind_group_remaps[0].new_group < 4);
+        assert!(lowered.wgsl.contains("@group(3) @binding(0)"));
+        assert!(!lowered.wgsl.contains("var<immediate>"));
+        assert!(!lowered.wgsl.contains("@group(5)"));
+
+        // With lowering disabled, Naga baseline validation rejects AddressSpace::Immediate.
+        let err = convert_spirv_bytes_with_options(&spv, &ConvertOptions::default().without_lowering())
+            .expect_err("push constant SPIR-V must fail baseline validation when lowering is disabled");
+        assert_eq!(err.kind, ConversionErrorKind::ValidationError);
     }
 }
