@@ -40,12 +40,14 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [x] **G1 — Expand Command Ring & Resource Tables** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement `CreateBuffer`, `WriteBuffer`, `CreateShaderModule`, `CreatePipeline`, and `Draw` packets across `runtime/abi/playgta6_abi.h`, `runtime/gpu/cmd_encoder.cpp`, and `web/workers/wgpu_worker.js`.
-- [ ] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** — `IN PROGRESS` (#10, @MarcBlattmann) *(no game files required)*
+- [x] **G2 — SharedArrayBuffer Zero-Copy GPU Ring** — `DONE` (PR #22, closes #10) *(no game files required)*
   - Replace `postMessage` buffer copies with a lock-free SPSC `SharedArrayBuffer` ring buffer between Wasm64 and `wgpu_worker.js`.
 - [x] **G3 — `d3d12_xs` Interface Stubs & Trace Harness** — `DONE` (PR #7, closes #4) *(no game files required)*
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
 - [ ] **G4 — `WGPK` `.wgsl.pack` Binary Loader & Shader Module Cache** — `IN PROGRESS` (#18, @MarcBlattmann) *(no game files required)*
   - Parse `.wgsl.pack` binary bundles (`shaders/src/pack.rs`) in JS (`web/workers/wgsl_pack_loader.js`), resolve WGSL by 64-bit FNV-1a hash, and cache compiled `GPUShaderModule`s.
+- [ ] **G5 — D3D12-XS Textures, Samplers, BindGroups, Indexed Draw & Compute Dispatch** — `IN PROGRESS` (#24, @MarcBlattmann) *(no game files required)*
+  - Extend GPU command ABI, `CommandEncoder`, `d3d12_xs.h`, and `wgpu_worker.js` with textures, samplers, bind groups, indexed drawing, and compute dispatch (for RDNA2 mesh-compute lowering).
 
 ---
 
