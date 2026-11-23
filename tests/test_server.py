@@ -216,6 +216,10 @@ class TestServeLocal(unittest.TestCase):
             "hasBootset",
             "hasWasmBinary",
             "shaderPackCount",
+            "splashImage",
+            "shaderPackUrl",
+            "reflectionManifestUrl",
+            "pgimUrl",
         }
         self.assertEqual(set(data.keys()), expected_keys)
         self.assertTrue(data["ok"])
@@ -225,6 +229,10 @@ class TestServeLocal(unittest.TestCase):
         self.assertFalse(data["hasBootset"])
         self.assertFalse(data["hasWasmBinary"])
         self.assertEqual(data["shaderPackCount"], 0)
+        self.assertIsNone(data["splashImage"])
+        self.assertIsNone(data["shaderPackUrl"])
+        self.assertIsNone(data["reflectionManifestUrl"])
+        self.assertIsNone(data["pgimUrl"])
 
         # Populate artifacts and verify dynamic detection.
         (self.data_root / "data-manifest.json").write_text("{}", encoding="utf-8")
