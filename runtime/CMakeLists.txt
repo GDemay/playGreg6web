@@ -15,6 +15,7 @@ add_library(playgta6_core STATIC
     os/win32_sync.cpp
     os/xgameruntime.cpp
     os/xbox_offline.cpp
+    os/xbox_scarlett.cpp
     os/win32_loader.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
@@ -90,4 +91,8 @@ else()
     add_executable(test_win32_sync ../tests/test_win32_sync.cpp)
     target_link_libraries(test_win32_sync PRIVATE playgta6_core)
     add_test(NAME playgta6_win32_sync_tests COMMAND test_win32_sync)
+
+    add_executable(test_xbox_scarlett ../tests/test_xbox_scarlett.cpp)
+    target_link_libraries(test_xbox_scarlett PRIVATE playgta6_core)
+    add_test(NAME playgta6_xbox_scarlett_tests COMMAND test_xbox_scarlett)
 endif()
