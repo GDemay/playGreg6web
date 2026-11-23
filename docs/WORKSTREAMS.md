@@ -48,7 +48,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
 - [x] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `DONE` (PR #36, closes #16) *(no game files required)*
   - Expose C-ABI Win32 & Xbox GDK imports (`XGameRuntimeInitialize`, `XTaskQueue*`, `XUser*` offline stub, `VirtualAlloc`/`Protect`/`Free`, `Tls*`, `SRWLock*`, `CriticalSection`/`Event`, `CreateFileW`/`ReadFile`/`SetFilePointerEx`/`GetFileSizeEx`/`CloseHandle`, `QueryPerformanceCounter`/`Frequency`) backed by our OS shims.
-- [ ] **O6 — Win32 Synchronization & Thread Pool Shims** — `IN PROGRESS` (#41, @Timon-ok) *(no game files required — disjoint files `runtime/os/win32_sync.{h,cpp}`, `tests/test_win32_sync.cpp`)*
+- [x] **O6 — Win32 Synchronization & Thread Pool Shims** — `DONE` (PR #80, closes #41) *(no game files required — disjoint files `runtime/os/win32_sync.{h,cpp}`, `tests/test_win32_sync.cpp`)*
   - Implement `CreateSemaphoreW`/`ReleaseSemaphore`, `CreateMutexW`/`ReleaseMutex`, `WaitForMultipleObjects` (`bWaitAll` true/false), `SleepConditionVariableSRW`/`WakeConditionVariable`/`WakeAllConditionVariable`, and `CreateThread`/`SetThreadAffinityMask`/`GetCurrentThreadId`.
 - [x] **O7 — Win32 Heap, Module Registry & `GetProcAddress` Resolver** — `DONE` (PR #91, closes #42) *(no game files required — disjoint files `runtime/os/win32_loader.{h,cpp}`, `tests/test_win32_loader.cpp`)*
   - Implement `GetProcessHeap`/`HeapCreate`/`HeapAlloc`/`HeapReAlloc`/`HeapFree`/`HeapSize`, `GetModuleHandleW`/`LoadLibraryW`, and a dynamic `GetProcAddress` symbol registry mapping DLL + export names to registered runtime shims.
