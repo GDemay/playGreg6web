@@ -44,6 +44,7 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1
         -sENVIRONMENT=worker
         -sERROR_ON_UNDEFINED_SYMBOLS=0
+        -lexports.js
     )
 else()
     find_package(Threads REQUIRED)
