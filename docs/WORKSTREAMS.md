@@ -24,6 +24,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
 - [x] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `DONE` (PR #78, closes #40) *(no game files required — disjoint file `recomp/src/image.rs`)*
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
+- [ ] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `IN PROGRESS` (#118, @Timon-ok) *(no game files required — starts once R3 is merged)*
+  - Lift `rep movs/stos/cmps/scas/lods`, `bt*`, `bsf/bsr/tzcnt/lzcnt/popcnt`, `cmpxchg`/`xadd`/`bswap`, `rcl/rcr`, `shld/shrd`, `loop`/`jrcxz`, `leave`/`enter`, and `lock`-prefixed atomics, verified by execution and host-CPU differential tests.
+- [ ] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `IN PROGRESS` (#119, @Timon-ok) *(no game files required — starts once R3 is merged; disjoint file `recomp/src/lift/simd.rs`)*
+  - Lift the SSE/SSE2 (+ commonly emitted SSE3/SSSE3/SSE4.1) instructions MSVC x64 code uses onto the XMM slots of the guest state, verified by execution and host-CPU differential tests.
+- [ ] **R9 — End-to-End Recompile Pipeline Driver (`recomp/src/pipeline.rs`)** — `IN PROGRESS` (#120, @Timon-ok) *(no game files required — starts once R3 is merged; disjoint file `recomp/src/pipeline.rs`)*
+  - One `playgta6-recomp build <pe> --out <dir>` command chaining parse → `.pdata`-seeded discovery → lift → import thunks → packed guest image, with a deterministic build manifest and coverage report.
 
 ---
 
@@ -46,6 +52,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement `GetProcessHeap`/`HeapCreate`/`HeapAlloc`/`HeapReAlloc`/`HeapFree`/`HeapSize`, `GetModuleHandleW`/`LoadLibraryW`, and a dynamic `GetProcAddress` symbol registry mapping DLL + export names to registered runtime shims.
 - [x] **O8 — Offline Networking, Telemetry & Xbox Live Safe Stubs** — `DONE` (PR #77, closes #43) *(no game files required — disjoint files `runtime/os/xbox_offline.{h,cpp}`, `tests/test_xbox_offline.cpp`)*
   - Implement clean offline-mode stubs for `ws2_32` (`WSAStartup`, `socket`, `getaddrinfo` → offline), `winhttp`, and Xbox Live (`XblInitialize`, `XblContextCreateHandle`, `XStore*`) so single-player boot never blocks on online services.
+- [ ] **O9 — Guest CPU State ABI & Recompiled-Code Dispatcher (`runtime/guest/`)** — `IN PROGRESS` (#115, @Timon-ok) *(no game files required — small ABI PR first, then disjoint files `runtime/guest/guest_runtime.{h,cpp}`, `tests/test_guest_runtime.cpp`)*
+  - Document the lifter's guest CPU state layout + runtime helper symbols in the shared ABI, then implement `__playgta6_indirect_call`/`__playgta6_trap`/`__playgta6_unimplemented`/`__playgta6_divide_error`, the guest-address → lifted-function table, IAT-slot → import-thunk dispatch, guest stack setup, and entry-point invocation.
+- [ ] **O10 — `PGIM` Guest Image Loader for `VirtualMemoryArena`** — `IN PROGRESS` (#116, @Timon-ok) *(no game files required — disjoint files `runtime/os/image_loader.{h,cpp}`, `tests/test_image_loader.cpp`)*
+  - Load the `PGIM` v1 container from `playgta6-recomp pack-image` (R6): validate, reserve at the preferred base, commit sections, copy payloads, apply DIR64/HIGHLOW relocations when rebased, and set page protections.
+- [ ] **O11 — Runtime Shim Export Registration Table** — `IN PROGRESS` (#117, @Timon-ok) *(no game files required — disjoint files `runtime/os/shim_exports.{h,cpp}`, `tests/test_shim_exports.cpp`)*
+  - Register every `pg6_win32_*` / `pg6_gdk_*` C-ABI shim with the O7 module registry under its Win32/GDK export name so guest `GetProcAddress` and the R5 import bridge can resolve them, with a header-sync test.
 
 ---
 
@@ -62,7 +74,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse `.wgsl.pack` binary bundles (`shaders/src/pack.rs`) in JS (`web/workers/wgsl_pack_loader.js`), resolve WGSL by 64-bit FNV-1a hash, and cache compiled `GPUShaderModule`s.
 - [x] **G5 — D3D12-XS Textures, Samplers, BindGroups, Indexed Draw & Compute Dispatch** — `DONE` (PR #55, closes #24) *(no game files required)*
   - Extend GPU command ABI, `CommandEncoder`, `d3d12_xs.h`, and `wgpu_worker.js` with textures, samplers, bind groups, indexed drawing, and compute dispatch (for RDNA2 mesh-compute lowering).
-- [ ] **G6 — D3D12-XS Descriptor Heaps, Root Signatures & Resource State Tracker** — `IN PROGRESS` (#44, @Timon-ok) *(no game files required — disjoint files `runtime/gpu/descriptor_heap.{h,cpp}`, `tests/test_descriptor_heap.cpp`)*
+- [x] **G6 — D3D12-XS Descriptor Heaps, Root Signatures & Resource State Tracker** — `DONE` (PR #110, closes #44) *(no game files required — disjoint files `runtime/gpu/descriptor_heap.{h,cpp}`, `tests/test_descriptor_heap.cpp`)*
   - Implement CPU/GPU descriptor heap tables (`CBV_SRV_UAV`, `SAMPLER`, `RTV`, `DSV`), root signature parameter mapping, and dirty-bind-group caching that compiles D3D12 descriptor tables into WebGPU `CreateBindGroup`/`SetBindGroup` calls.
 - [x] **G7 — D3D12 PSO Cache, Render Targets & Viewport/Scissor State** — `DONE` (PR #109, closes #45) *(no game files required — disjoint files `runtime/gpu/pso_cache.{h,cpp}`, `tests/test_pso_cache.cpp`)*
   - Hash D3D12 graphics & compute PSO descriptors (blend/depth/rasterizer/vertex-layout/shader hashes) to deduplicate WebGPU pipeline creation and track active RTV/DSV/viewport/scissor state per command list.
@@ -88,8 +100,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parses `S6` (`shaders/src/reflect.rs`) reflection JSON manifests in JS and builds exact `GPUBindGroupLayout` + `GPUPipelineLayout` descriptors via `WebGpuPipelineCache` (`G11`).
 - [ ] **G18 — WebGPU Dynamic Uniform Ring & Draw-Call Constant Batcher (`web/workers/uniform_ring.js`)** — `IN PROGRESS` (#106, @MarcBlattmann) *(no game files required — disjoint files `web/workers/uniform_ring.js`, `tests/test_uniform_ring.mjs`)*
   - 256-byte-aligned dynamic uniform buffer ring (`hasDynamicOffset: true`) for per-draw constant uploads (D3D12 root constants / CBVs) with single-upload per-frame flush.
-- [ ] **G19 — WebGPU Indirect Draw & Compute-Culling Buffer Helper (`web/workers/indirect_draw.js`)** *(unclaimed; no game files required — disjoint files `web/workers/indirect_draw.js`, `tests/test_indirect_draw.mjs`)*
+- [ ] **G19 — WebGPU Indirect Draw & Compute-Culling Buffer Helper (`web/workers/indirect_draw.js`)** — `IN PROGRESS` (#112, @Timon-ok) *(no game files required — disjoint files `web/workers/indirect_draw.js`, `tests/test_indirect_draw.mjs`)*
   - Encodes and validates WebGPU `drawIndirect` / `drawIndexedIndirect` / `dispatchWorkgroupsIndirect` command buffers for compute-driven RDNA2 meshlet culling (`S5`).
+- [ ] **G20 — Render Pipeline & Render Pass Packet ABI v2 + D3D12 State Bridge (`runtime/gpu/state_bridge`)** — `IN PROGRESS` (#121, @Timon-ok) *(no game files required — small ABI PR first, then disjoint files `runtime/gpu/state_bridge.{h,cpp}`, `tests/test_state_bridge.cpp`)*
+  - Add packets for full pipeline keys, render pass begin/end with load/store ops, and viewport/scissor/blend-constant/stencil-ref, then wire the G6 descriptor/root-signature tracker and G7 PSO cache/state tracker into packet emission.
 
 ---
 
@@ -168,7 +182,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Clean ES module entrypoint connecting `RuntimeSessionController`, `SmokeDemoRunner`, `InputProfileManager`, `AudioEngine`, `BrowserStorageManager`, and `CrashReporter` for `web/index.html`.
 - [ ] **W27 — Multi-Track Integration Check & CI Coverage Summary Script (`tools/repo_health.py`)** — `IN PROGRESS` (#108, @MarcBlattmann) *(no game files required — disjoint files `tools/repo_health.py`, `tests/test_repo_health.py`)*
   - Verifies zero ABI drift between `runtime/abi/playgta6_abi.h`, `tools/gpu_trace.py`, `web/workers/wgpu_worker.js`, `web/input/input_bridge.js`, and `docs/WORKSTREAMS.md` in one fast stdlib check.
-- [ ] **W28 — Streaming Audio Bank / AWC Header Inspector (`tools/src/awc.rs`)** *(unclaimed; no game files required — disjoint file `tools/src/awc.rs`)*
+- [ ] **W28 — Streaming Audio Bank / AWC Header Inspector (`tools/src/awc.rs`)** — `IN PROGRESS` (#113, @Timon-ok) *(no game files required — disjoint file `tools/src/awc.rs`)*
   - Read-only RAGE `.awc` audio bank container header parser (stream/chunk counts, codec tag PCM/IMA-ADPCM/XMA2/Opus, sample rate, channel count) without extracting or committing audio data.
-- [ ] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** *(unclaimed; no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
+- [ ] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** — `IN PROGRESS` (#114, @Timon-ok) *(no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
   - Reusable bounded Web Worker pool supporting transferable `ArrayBuffer` jobs, cancellation, and graceful crash recovery for background decompression & shader pre-parsing.
