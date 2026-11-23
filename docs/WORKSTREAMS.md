@@ -64,7 +64,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Load the `PGIM` v1 container from `playgta6-recomp pack-image` (R6): validate, reserve at the preferred base, commit sections, copy payloads, apply DIR64/HIGHLOW relocations when rebased, and set page protections.
 - [x] **O11 — Runtime Shim Export Registration Table** — `DONE` (PR #133, closes #117) *(no game files required — disjoint files `runtime/os/shim_exports.{h,cpp}`, `tests/test_shim_exports.cpp`)*
   - Register every `pg6_win32_*` / `pg6_gdk_*` C-ABI shim with the O7 module registry under its Win32/GDK export name so guest `GetProcAddress` and the R5 import bridge can resolve them, with a header-sync test.
-- [ ] **O12 — Xbox Scarlett `xmem.dll` / `XCRDAPI.dll` / `xg_xs.dll` / `GameInput.dll` Shims (`runtime/os/xbox_scarlett.{h,cpp}`)** — `IN PROGRESS` (#150, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`)*
+- [x] **O12 — Xbox Scarlett `xmem.dll` / `XCRDAPI.dll` / `xg_xs.dll` / `GameInput.dll` Shims (`runtime/os/xbox_scarlett.{h,cpp}`)** — `DONE` (PR #157, closes #150) *(driven by M2 `docs/imports_required.md`)*
   - Implement C-ABI shims for the 12 `xmem.dll` physical/virtual memory APIs, `XCRDAPI.dll!DStorageGetFactory` (DirectStorage backed by HTTPFS), `xg_xs.dll` (`XGCreateTextureComputer`, `XGSuggestSwizzleMode`), and `GameInput.dll` ordinal `#1`.
 - [ ] **O13 — UCRT (`api-ms-win-crt-*`) & `VCRUNTIME140` C-ABI Bridge (`runtime/os/ucrt_bridge.{h,cpp}`)** — `IN PROGRESS` (#151, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 186 C-runtime imports)*
   - Expose thin Win64/C-ABI wrappers forwarding `api-ms-win-crt-{convert,filesystem,heap,locale,math,runtime,stdio,string,time,utility}` and `VCRUNTIME140` memory/string/exception exports onto Emscripten libc so `playgta6-recomp stubs` binds ~300 imports cleanly.
@@ -74,6 +74,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement the remaining ~55 Win32 core file/process/string/time/registry/bcrypt/window shims + `MSVCP140.dll` mutex/xtime/locale/iostream helpers to hit 100% import resolution for `game_scarlett_master.exe`.
 - [ ] **O16 — Guest COM Object Bridge & `xgameruntime.dll` `QueryApiImpl` Provider (`runtime/guest/com_bridge.{h,cpp}`)** — `IN PROGRESS` (#167, @Timon-ok) *(the executable has no static `xgameruntime.dll` imports: the GDK client code loads it and calls `QueryApiImpl`/`InitializeApiImpl`)*
   - Generic guest-memory COM objects (vtables of dispatchable addresses, `IUnknown` lifetime, argument marshaling) plus the `xgameruntime.dll` provider entry points routed onto the existing `pg6_gdk_*` shims; shared by `d3d12_xs` (G24), DirectStorage and GameInput interfaces.
+- [ ] **O17 — Unified Boot Import Coverage Wiring (`runtime/os/shim_exports.cpp` + `tools/check_import_coverage.py`)** — `UNCLAIMED` *(wait for O13/O14/O15/G24 merge)*
+  - Wire `pg6_xbox_scarlett_register_all`, `pg6_ucrt_register_all`, `pg6_xbox_middleware_register_all`, `pg6_win32_compat_register_all`, and `pg6_d3d12_xs_register_all` into `shim_exports.cpp` and verify 100% coverage of all non-guest-DLL imports in `docs/imports_required.md`.
 
 ---
 
@@ -124,8 +126,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Tracks GPU buffer/texture/view/sampler/bind-group/pipeline handles with VRAM byte accounting and frame-epoch deferred destruction after `onSubmittedWorkDone` fences.
 - [x] **G22 — WebGPU Transient Render-Target Pool & Attachment Aliasing (`web/workers/rt_pool.js`)** — `DONE` (PR #144, closes #128) *(no game files required — disjoint files `web/workers/rt_pool.js`, `tests/test_rt_pool.mjs`)*
   - Pools transient color/depth/shadow/post-FX `GPUTexture` + view attachments by descriptor key with per-frame reuse and idle/budget LRU eviction.
-- [ ] **G23 — Wire `GpuStagingPool` (`G14`), `DynamicUniformRing` (`G18`), `GpuPassTimer` (`G16`) & `ReflectionLoader` (`G17`) into `web/workers/wgpu_worker.js`** — `UNCLAIMED` *(no game files required — wait for G20/PR #148 merge)*
-  - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, and reflected bind-group layouts into the main WebGPU command processor.
+- [ ] **G23 — Wire `GpuStagingPool` (`G14`), `DynamicUniformRing` (`G18`), `GpuPassTimer` (`G16`) & `ReflectionLoader` (`G17`) into `web/workers/wgpu_worker.js`** — `IN PROGRESS` (#172, @MarcBlattmann) *(no game files required — disjoint files `web/workers/wgpu_worker.js`, `tests/test_wgpu_worker_integration.mjs`)*
+  - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, reflected bind-group layouts, resource registry, and render-target pool into the main WebGPU command processor.
 - [ ] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `IN PROGRESS` (#168, @Timon-ok) *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
   - Expose the exact 3 `d3d12_xs.dll` exports with Win64-ABI COM vtables (`ID3D12Device`, `ID3D12CommandQueue`, `ID3D12GraphicsCommandList`, `ID3D12Resource`, `ID3D12DescriptorHeap`, `ID3D12PipelineState`) bridged to `G6`/`G7`/`G20`.
 
@@ -148,6 +150,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
 - [x] **S7 — Offline `WGPK` Shader Pack Inspector, Diff & WebGPU Limit Budget CLI (`tools/inspect_wgsl_pack.py`)** — `DONE` (PR #146, closes #129) *(no game files required — disjoint files `tools/inspect_wgsl_pack.py`, `tests/test_inspect_wgsl_pack.py`)*
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
+- [ ] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `UNCLAIMED` *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
+  - Read-only local scanner classifying shader containers (`DXBC`, `DXIL`, `SPIR-V`, or Xbox Scarlett RDNA2 ISA signatures) in a local directory into a sanitized JSON summary for M2/M4 shader planning.
 
 ---
 
@@ -216,11 +220,13 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Adds compact interactive HUD action controls and replaces the legacy hardcoded worker bootstrap with `bootstrapPlayGta6App` + `HudController` so opening `http://127.0.0.1:8080` renders live WebGPU smoke frames or boots `runtime.wasm`.
 - [x] **W31 — Browser Streaming Manifest & Chunk Integrity Verifier (`web/storage/manifest_verifier.js`)** — `DONE` (PR #142, closes #131) *(no game files required — disjoint files `web/storage/manifest_verifier.js`, `tests/test_manifest_verifier.mjs`)*
   - Validates `data-manifest.json` and `bootset.json` schemas, computes partial-download streaming readiness percentages, and probes live HTTP `206` Range / `ETag` consistency.
-- [ ] **W32 — Wire `IoPriorityScheduler` (`W18`) & `Rpf9Vfs` (`W11`) into `web/workers/io_worker.js`** — `IN PROGRESS` (#153, @MarcBlattmann) *(no game files required — disjoint files `web/workers/io_worker.js`, `tests/test_io_worker_integration.mjs`)*
+- [x] **W32 — Wire `IoPriorityScheduler` (`W18`) & `Rpf9Vfs` (`W11`) into `web/workers/io_worker.js`** — `DONE` (PR #166, closes #153) *(no game files required — disjoint files `web/workers/io_worker.js`, `tests/test_io_worker_integration.mjs`)*
   - Connect prioritized Range scheduling and on-demand RPF9 virtual sub-file streaming into the `HttpfsMailbox` worker loop.
-- [ ] **W33 — Headless Live Boot & HUD E2E Verification Harness (`tests/test_live_boot_e2e.mjs`)** — `IN PROGRESS` (#154, @MarcBlattmann) *(no game files required — disjoint file `tests/test_live_boot_e2e.mjs`)*
+- [x] **W33 — Headless Live Boot & HUD E2E Verification Harness (`tests/test_live_boot_e2e.mjs`)** — `DONE` (PR #155, closes #154) *(no game files required — disjoint file `tests/test_live_boot_e2e.mjs`)*
   - End-to-end test spinning up `server/serve_local.py`, fetching `/`, `/api/status`, and JS modules with `COOP`/`COEP` headers, and running `bootstrapPlayGta6App` + `HudController` through smoke-demo frames, trace export, and diagnostic bundle generation.
 - [x] **W34 — Real RPF9 Little-Endian `0x52504639` (`"9FPR"`) Magic Support (`tools/src/rpf9.rs`, `web/workers/rpf9_vfs.js`)** — `DONE` (PR #147, closes #140) *(driven by M2 inspection of real Xbox `.rpf` archives)*
   - Accept little-endian `0x52504639` (`39 46 50 52` = `"9FPR"`) alongside legacy big-endian `"RPF9"` headers in both the Rust CLI inspector and browser streaming RPF9 VFS reader.
-- [ ] **W35 — Real RPF9 Header v9 Field Layout & Encryption-Flag Diagnostic (`tools/src/rpf9.rs`)** — `UNCLAIMED` *(driven by M2 inspection of real `appdata0.rpf`/`common.rpf`: word 4 is a 32-bit hash/flag rather than `names_length`)*
+- [ ] **W35 — Real RPF9 Header v9 Field Layout & Encryption-Flag Diagnostic (`tools/src/rpf9.rs`)** — `IN PROGRESS` (#171, @MarcBlattmann) *(driven by M2 inspection of real `appdata0.rpf`/`common.rpf`: word 4 is a 32-bit hash/flag rather than `names_length`)*
   - Parse the real Xbox Series RPF9 header words cleanly without rejecting valid archives as truncated, and report header layout/entry/encryption metadata cleanly.
+- [ ] **W36 — Wasm64 Memory64 Runtime & BigInt64 Host Import Integration Tests (`tests/test_wasm64_runtime.mjs`)** — `IN PROGRESS` (#173, @MarcBlattmann) *(no game files required — disjoint file `tests/test_wasm64_runtime.mjs`)*
+  - Verifies synthetic Wasm64 `i64` memory marshaling with `web/loader.js` `createHostImports` and validates local `web/dist/runtime.wasm` ABI exports when present.
