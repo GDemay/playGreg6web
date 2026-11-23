@@ -80,14 +80,16 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Ring-buffered in-browser frame recorder that captures raw binary GPU command streams (`BeginFrame`..`Present`) and exports downloadable `.pg6trace` blobs compatible with `tools/gpu_trace.py`.
 - [x] **G14 — WebGPU Staging Buffer Pool & Upload Ring (`web/workers/staging_pool.js`)** — `DONE` (PR #98, closes #82) *(no game files required — disjoint files `web/workers/staging_pool.js`, `tests/test_staging_pool.mjs`)*
   - Sub-allocating ring of `MAP_WRITE | COPY_SRC` / `writeBuffer` staging chunks with fence-driven recycling to eliminate per-frame buffer allocation churn in `wgpu_worker.js`.
-- [ ] **G15 — Live WebGPU Smoke Demo Runner Wiring (`web/demo/run_smoke_demo.js`)** — `IN PROGRESS` (#88, @MarcBlattmann) *(no game files required — disjoint files `web/demo/run_smoke_demo.js`, `tests/test_run_smoke_demo.mjs`)*
+- [x] **G15 — Live WebGPU Smoke Demo Runner Wiring (`web/demo/run_smoke_demo.js`)** — `DONE` (PR #99, closes #88) *(no game files required — disjoint files `web/demo/run_smoke_demo.js`, `tests/test_run_smoke_demo.mjs`)*
   - Wires `SmokeSceneController` (`W16`) + `GpuRingBuffer` + `WgpuSwapchain` (`G9`) + `WgpuCommandProcessor` + `GpuFrameRecorder` (`G13`) + `PerfMonitor` (`W15`) into a turnkey browser `requestAnimationFrame` driver for live WebGPU testing.
 - [ ] **G16 — WebGPU Timestamp Query & Pass GPU-Time Profiler (`web/workers/gpu_timer.js`)** — `IN PROGRESS` (#94, @MarcBlattmann) *(no game files required — disjoint files `web/workers/gpu_timer.js`, `tests/test_gpu_timer.mjs`)*
   - Wraps optional WebGPU `'timestamp-query'` `GPUQuerySet` resolution (gracefully degrading when absent) to measure per-pass render/compute GPU timings in milliseconds.
 - [ ] **G17 — S6 Reflection Manifest Loader & Auto-BindGroup Builder (`web/workers/reflection_loader.js`)** — `IN PROGRESS` (#101, @MarcBlattmann) *(no game files required — disjoint files `web/workers/reflection_loader.js`, `tests/test_reflection_loader.mjs`)*
   - Parses `S6` (`shaders/src/reflect.rs`) reflection JSON manifests in JS and builds exact `GPUBindGroupLayout` + `GPUPipelineLayout` descriptors via `WebGpuPipelineCache` (`G11`).
-- [ ] **G18 — WebGPU Dynamic Uniform Ring & Draw-Call Constant Batcher (`web/workers/uniform_ring.js`)** *(unclaimed; no game files required — disjoint files `web/workers/uniform_ring.js`, `tests/test_uniform_ring.mjs`)*
+- [ ] **G18 — WebGPU Dynamic Uniform Ring & Draw-Call Constant Batcher (`web/workers/uniform_ring.js`)** — `IN PROGRESS` (#106, @MarcBlattmann) *(no game files required — disjoint files `web/workers/uniform_ring.js`, `tests/test_uniform_ring.mjs`)*
   - 256-byte-aligned dynamic uniform buffer ring (`hasDynamicOffset: true`) for per-draw constant uploads (D3D12 root constants / CBVs) with single-upload per-frame flush.
+- [ ] **G19 — WebGPU Indirect Draw & Compute-Culling Buffer Helper (`web/workers/indirect_draw.js`)** *(unclaimed; no game files required — disjoint files `web/workers/indirect_draw.js`, `tests/test_indirect_draw.mjs`)*
+  - Encodes and validates WebGPU `drawIndirect` / `drawIndexedIndirect` / `dispatchWorkgroupsIndirect` command buffers for compute-driven RDNA2 meshlet culling (`S5`).
 
 ---
 
@@ -154,7 +156,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Configurable keyboard/mouse/gamepad presets, sensitivity/deadzone curves, and localStorage/IndexedDB profile persistence feeding `InputBridge`.
 - [x] **W21 — Structured Crash Reporter & Runtime Diagnostic Bundle Exporter (`web/telemetry/crash_report.js`)** — `DONE` (PR #97, closes #84) *(no game files required — disjoint files `web/telemetry/crash_report.js`, `tests/test_crash_report.mjs`)*
   - Captures Wasm traps, WebGPU validation/device-lost errors, recent runtime logs, and browser capability fingerprints into sanitized shareable JSON reports (never including game data or host paths).
-- [ ] **W22 — Browser Emscripten Runtime Session Controller (`web/runtime/session_controller.js`)** — `IN PROGRESS` (#89, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/session_controller.js`, `tests/test_session_controller.mjs`)*
+- [x] **W22 — Browser Emscripten Runtime Session Controller (`web/runtime/session_controller.js`)** — `DONE` (PR #100, closes #89) *(no game files required — disjoint files `web/runtime/session_controller.js`, `tests/test_session_controller.mjs`)*
   - Orchestrates worker startup (`io_worker`, `wgpu_worker`, `audio_engine`), `InputBridge`, `PerfMonitor`, `BrowserStorageManager`, and clean restart/fallback into `SmokeSceneController` when `dist/runtime.wasm` is absent.
 - [ ] **W23 — Local Asset Pipeline Orchestrator CLI (`tools/prepare_local.py`)** — `IN PROGRESS` (#95, @MarcBlattmann) *(no game files required — disjoint files `tools/prepare_local.py`, `tests/test_prepare_local.py`)*
   - Single-command dry-run/execute helper that runs `scan` → `xvd`/`rpf9`/`manifest`/`bootset` → `recomp inspect` → `shaders convert` against `GTA6_GAME_DIR` into gitignored `local-data/` & `work/`.
@@ -162,7 +164,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Binds HUD buttons (Clear OPFS Cache, Export Saves, Capture GPU Trace, Export Crash Report, Switch Input Profile, Toggle Smoke Demo) to `BrowserStorageManager`, `GpuFrameRecorder`, `CrashReporter`, and `SessionController`.
 - [ ] **W25 — LAN / Private-Host CORS & Range Streaming Benchmark CLI (`tools/bench_range_server.py`)** — `IN PROGRESS` (#103, @MarcBlattmann) *(no game files required — disjoint files `tools/bench_range_server.py`, `tests/test_bench_range_server.py`)*
   - Measures concurrent HTTP `206` Range throughput, latency percentiles, and `If-None-Match` (`304`) overhead against `server/serve_local.py` on synthetic payloads.
-- [ ] **W26 — Browser Diagnostics & Smoke Demo Bootstrap Glue (`web/app_bootstrap.js`)** *(unclaimed; no game files required — disjoint files `web/app_bootstrap.js`, `tests/test_app_bootstrap.mjs`)*
-  - Clean ES module entrypoint connecting `RuntimeSessionController`, `SmokeDemoRunner`, `HudController`, `InputProfileManager`, `AudioEngine`, `BrowserStorageManager`, and `CrashReporter` for `web/index.html`.
-- [ ] **W27 — Multi-Track Integration Check & CI Coverage Summary Script (`tools/repo_health.py`)** *(unclaimed; no game files required — disjoint files `tools/repo_health.py`, `tests/test_repo_health.py`)*
+- [ ] **W26 — Browser Diagnostics & Smoke Demo Bootstrap Glue (`web/app_bootstrap.js`)** — `IN PROGRESS` (#107, @MarcBlattmann) *(no game files required — disjoint files `web/app_bootstrap.js`, `tests/test_app_bootstrap.mjs`)*
+  - Clean ES module entrypoint connecting `RuntimeSessionController`, `SmokeDemoRunner`, `InputProfileManager`, `AudioEngine`, `BrowserStorageManager`, and `CrashReporter` for `web/index.html`.
+- [ ] **W27 — Multi-Track Integration Check & CI Coverage Summary Script (`tools/repo_health.py`)** — `IN PROGRESS` (#108, @MarcBlattmann) *(no game files required — disjoint files `tools/repo_health.py`, `tests/test_repo_health.py`)*
   - Verifies zero ABI drift between `runtime/abi/playgta6_abi.h`, `tools/gpu_trace.py`, `web/workers/wgpu_worker.js`, `web/input/input_bridge.js`, and `docs/WORKSTREAMS.md` in one fast stdlib check.
+- [ ] **W28 — Streaming Audio Bank / AWC Header Inspector (`tools/src/awc.rs`)** *(unclaimed; no game files required — disjoint file `tools/src/awc.rs`)*
+  - Read-only RAGE `.awc` audio bank container header parser (stream/chunk counts, codec tag PCM/IMA-ADPCM/XMA2/Opus, sample rate, channel count) without extracting or committing audio data.
+- [ ] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** *(unclaimed; no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
+  - Reusable bounded Web Worker pool supporting transferable `ArrayBuffer` jobs, cancellation, and graceful crash recovery for background decompression & shader pre-parsing.
