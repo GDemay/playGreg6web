@@ -26,7 +26,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
 - [x] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `DONE` (PR #205, closes #118) *(no game files required)*
   - Lift `rep movs/stos/cmps/scas/lods`, `bt*`, `bsf/bsr/tzcnt/lzcnt/popcnt`, `cmpxchg`/`xadd`/`bswap`, `rcl/rcr`, `shld/shrd`, `loop`/`jrcxz`, `leave`/`enter`, and `lock`-prefixed atomics, verified by execution and host-CPU differential tests.
-- [ ] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `IN PROGRESS` (#119, @Timon-ok) *(no game files required — disjoint file `recomp/src/lift/simd.rs`)*
+- [x] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `DONE` (PRs #175, #176, #215, #233, closes #119) *(no game files required — disjoint file `recomp/src/lift/simd.rs`)*
   - Lift the SSE/SSE2 (+ commonly emitted SSE3/SSSE3/SSE4.1) instructions MSVC x64 code uses onto the XMM slots of the guest state, verified by execution and host-CPU differential tests.
 - [x] **R9 — End-to-End Recompile Pipeline Driver (`recomp/src/pipeline.rs`)** — `DONE` (PR #186, closes #120) *(no game files required — disjoint file `recomp/src/pipeline.rs`)*
   - One `playgta6-recomp build <pe> --out <dir>` command chaining parse → `.pdata`-seeded discovery → lift → import thunks → packed guest image, with a deterministic build manifest and coverage report.
