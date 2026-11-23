@@ -56,7 +56,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Document the lifter's guest CPU state layout + runtime helper symbols in the shared ABI, then implement `__playgta6_indirect_call`/`__playgta6_trap`/`__playgta6_unimplemented`/`__playgta6_divide_error`, the guest-address → lifted-function table, IAT-slot → import-thunk dispatch, guest stack setup, and entry-point invocation.
 - [ ] **O10 — `PGIM` Guest Image Loader for `VirtualMemoryArena`** — `IN PROGRESS` (#116, @Timon-ok) *(no game files required — disjoint files `runtime/os/image_loader.{h,cpp}`, `tests/test_image_loader.cpp`)*
   - Load the `PGIM` v1 container from `playgta6-recomp pack-image` (R6): validate, reserve at the preferred base, commit sections, copy payloads, apply DIR64/HIGHLOW relocations when rebased, and set page protections.
-- [ ] **O11 — Runtime Shim Export Registration Table** — `IN PROGRESS` (#117, @Timon-ok) *(no game files required — disjoint files `runtime/os/shim_exports.{h,cpp}`, `tests/test_shim_exports.cpp`)*
+- [x] **O11 — Runtime Shim Export Registration Table** — `DONE` (PR #133, closes #117) *(no game files required — disjoint files `runtime/os/shim_exports.{h,cpp}`, `tests/test_shim_exports.cpp`)*
   - Register every `pg6_win32_*` / `pg6_gdk_*` C-ABI shim with the O7 module registry under its Win32/GDK export name so guest `GetProcAddress` and the R5 import bridge can resolve them, with a header-sync test.
 
 ---
