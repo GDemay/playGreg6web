@@ -84,6 +84,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Back the arena with one contiguous region and a single guest-base translation shared by the lifter's `guest_ptr` seam, the import-bridge seam, the guest runtime and the image loader, on host builds and under Emscripten `-sMEMORY64`, keeping commit/protect bookkeeping.
 - [ ] **O19 — `WS2_32.dll` 23 Ordinal Shims & Registry Bindings (`runtime/os/winsock_ordinals.{h,cpp}`)** — `IN PROGRESS` (#190, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 23 ordinal-imported Winsock2 symbols)*
   - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
+- [ ] **O20 — Complete Remaining 4 `WINHTTP.dll` Shims (`runtime/os/winhttp_ext.{h,cpp}`)** — `IN PROGRESS` (#199, @MarcBlattmann) *(driven by `W37` import audit: `WinHttpAddRequestHeaders`, `WinHttpCrackUrl`, `WinHttpQueryHeaders`, `WinHttpWriteData`)*
+  - Implements and registers the final 4 `WINHTTP.dll` exports in `Win32ModuleRegistry` for 15/15 (100%) WinHTTP coverage.
 
 ---
 
@@ -160,10 +162,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
 - [x] **S7 — Offline `WGPK` Shader Pack Inspector, Diff & WebGPU Limit Budget CLI (`tools/inspect_wgsl_pack.py`)** — `DONE` (PR #146, closes #129) *(no game files required — disjoint files `tools/inspect_wgsl_pack.py`, `tests/test_inspect_wgsl_pack.py`)*
   - Inspects, diffs, and audits compiled `.wgsl.pack` bundles against WebGPU group/binding/workgroup limits and feature directives (`f16`, `subgroups`).
-- [ ] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `IN PROGRESS` (#181, @MarcBlattmann) *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
+- [x] **S8 — Shader Container Format Scanner & DXBC/DXIL/RDNA2 Blob Classifier (`tools/scan_shaders.py`)** — `DONE` (PR #189, closes #181) *(no game files required — disjoint files `tools/scan_shaders.py`, `tests/test_scan_shaders.py`)*
   - Read-only local scanner classifying shader containers (`DXBC`, `DXIL`, `SPIR-V`, or Xbox Scarlett RDNA2 ISA signatures) in a local directory into a sanitized JSON summary for M2/M4 shader planning.
 - [ ] **S9 — Fallback `WGPK` Shader Pack & S6 Reflection Manifest Generator (`tools/gen_fallback_shaders.py`)** — `IN PROGRESS` (#192, @MarcBlattmann) *(no game files required — disjoint files `tools/gen_fallback_shaders.py`, `tests/test_gen_fallback_shaders.py`)*
   - Generates a verified `WGPK` v1 bundle + S6 `reflection-manifest.json` with splash/UI blit, 3D debug mesh, and compute fallback WGSL shaders into gitignored `local-data/shaders/`.
+- [ ] **S10 — Local DXIL/DXBC Corpus Extractor & `RTS0`/`PSV0` Analyzer CLI (`tools/extract_dxil_corpus.py`)** — `IN PROGRESS` (#200, @MarcBlattmann) *(driven by `S8` finding 81 real `DXIL_SM6` containers in local DLLs)*
+  - Extracts and structurally analyzes local DXIL/DXBC containers (`DXIL`, `PSV0`, `RTS0`, `ISG1`, `OSG1`, `ACCC`) into gitignored `work/shaders/dxil/` with sanitized manifest output.
 
 ---
 
@@ -242,13 +246,15 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse the real Xbox Series RPF9 header words cleanly without rejecting valid archives as truncated, and report header layout/entry/encryption metadata cleanly.
 - [x] **W36 — Wasm64 Memory64 Runtime & BigInt64 Host Import Integration Tests (`tests/test_wasm64_runtime.mjs`)** — `DONE` (PR #177, closes #173) *(no game files required — disjoint file `tests/test_wasm64_runtime.mjs`)*
   - Verifies synthetic Wasm64 `i64` memory marshaling with `web/loader.js` `createHostImports` and validates local `web/dist/runtime.wasm` ABI exports when present.
-- [ ] **W37 — Real-Binary Import Coverage Auditor CLI (`tools/check_import_coverage.py`)** — `IN PROGRESS` (#182, @MarcBlattmann) *(no game files required — disjoint files `tools/check_import_coverage.py`, `tests/test_import_coverage.py`)*
+- [x] **W37 — Real-Binary Import Coverage Auditor CLI (`tools/check_import_coverage.py`)** — `DONE` (PR #188, closes #182) *(no game files required — disjoint files `tools/check_import_coverage.py`, `tests/test_import_coverage.py`)*
   - Parses all 68 DLLs / 587 symbols in `docs/imports_required.md`, audits live `runtime/` shim & registry coverage vs `R12` guest-recompiled DLLs, and reports exact remaining symbols.
-- [ ] **W38 — WebGPU Bink2 / Splash Video Frame Presenter (`web/workers/bink_presenter.js`)** — `IN PROGRESS` (#184, @MarcBlattmann) *(no game files required — disjoint files `web/workers/bink_presenter.js`, `tests/test_bink_presenter.mjs`)*
+- [x] **W38 — WebGPU Bink2 / Splash Video Frame Presenter (`web/workers/bink_presenter.js`)** — `DONE` (PR #197, closes #184) *(no game files required — disjoint files `web/workers/bink_presenter.js`, `tests/test_bink_presenter.mjs`)*
   - Double-buffered WebGPU YUV420p/YUVA/RGBA8 texture uploader + BT.709/BT.601 WGSL full-screen letterbox presenter for intro/splash frames (`Bink2Scarlett.dll`).
-- [ ] **W39 — `MicrosoftGame.Config` & Xbox Package Readiness Inspector CLI (`tools/inspect_game_assets.py`)** — `IN PROGRESS` (#185, @MarcBlattmann) *(no game files required — disjoint files `tools/inspect_game_assets.py`, `tests/test_inspect_game_assets.py`)*
+- [x] **W39 — `MicrosoftGame.Config` & Xbox Package Readiness Inspector CLI (`tools/inspect_game_assets.py`)** — `DONE` (PR #196, closes #185) *(no game files required — disjoint files `tools/inspect_game_assets.py`, `tests/test_inspect_game_assets.py`)*
   - Safely parses Xbox GDK `MicrosoftGame.Config` XML and verifies declared executables, bundled DLLs, and `ShellVisuals` splash assets in `GTA6_GAME_DIR` with sanitized JSON output.
 - [ ] **W40 — Guest Boot Milestone Tracer & Unresolved-Import Trap Collector (`web/telemetry/boot_tracer.js`)** — `IN PROGRESS` (#194, @MarcBlattmann) *(no game files required — disjoint files `web/telemetry/boot_tracer.js`, `tests/test_boot_tracer.mjs`)*
   - Tracks real guest boot milestones (`PGIM_LOAD` → `TLS_INIT` → `CRT_INITTERM` → `D3D12_CREATE_DEVICE` → `FIRST_PRESENT`) and deduplicates `__playgta6_unimplemented` / unresolved-import traps for HUD & CrashReporter.
 - [ ] **W41 — Streaming `PGIM` v1 Guest Image & Shader Bundle Preloader (`web/runtime/pgim_preloader.js`)** — `IN PROGRESS` (#195, @MarcBlattmann) *(no game files required — disjoint files `web/runtime/pgim_preloader.js`, `tests/test_pgim_preloader.mjs`)*
   - Streams and validates `PGIM` v1 guest images (`R6`/`O10`), `.wgsl.pack` bundles, and S6 reflection manifests via HTTP `206` Range with progress reporting before guest entry.
+- [ ] **W42 — Browser Local Splash Screen & Live Boot Stage Overlay (`web/ui/splash_overlay.js`)** — `IN PROGRESS` (#201, @MarcBlattmann) *(no game files required — disjoint files `web/ui/splash_overlay.js`, `tests/test_splash_overlay.mjs`)*
+  - Displays the user's own local `ShellVisuals` splash image (`/game/xbs_splash.png`) with live `BootTracer` milestone progress and cross-fades cleanly to WebGPU on `FIRST_PRESENT`.
