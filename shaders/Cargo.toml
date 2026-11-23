@@ -1,0 +1,9 @@
+[package]
+name = "playgta6-shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "playgta6-shaders"
+path = "src/main.rs"

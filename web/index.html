@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>playgta6web</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0d14;
+      color: #e6edf3;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    #viewport {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    #hud {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      padding: 10px 14px;
+      background: rgba(10, 13, 20, 0.82);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+      pointer-events: none;
+      white-space: pre-wrap;
+      max-width: 460px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="viewport"></canvas>
+  <div id="hud">Booting playgta6web...</div>
+
+  <script type="module">
+    import { InputBridge } from './input/input_bridge.js';
+
+    const hud = document.getElementById('hud');
+    const canvas = document.getElementById('viewport');
+    const lines = [];
+    const log = (msg) => {
+      lines.push(msg);
+      if (lines.length > 14) lines.shift();
+      hud.textContent = lines.join('\n');
+    };
+
+    function detectWasm64() {
+      try {
+        new WebAssembly.Memory({ initial: 1n, maximum: 2n, index: 'i64' });
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    const caps = {
+      coi: self.crossOriginIsolated === true,
+      sab: typeof SharedArrayBuffer === 'function',
+      webgpu: 'gpu' in navigator,
+      wasm64: detectWasm64(),
+    };
+    log(`COOP/COEP: ${caps.coi} | SAB: ${caps.sab} | WebGPU: ${caps.webgpu} | Wasm64: ${caps.wasm64}`);
+
+    const bc = new BroadcastChannel('game-progress');
+    bc.onmessage = (ev) => {
+      const d = ev.data || {};
+      if (d.error) log(`ERROR: ${d.error}`);
+      else if (d.label) log(d.label);
+    };
+
+    if (!caps.coi || !caps.sab) {
+      log('Serve via server/serve_local.py so COOP/COEP headers enable SharedArrayBuffer.');
+    } else if (!caps.webgpu) {
+      log('WebGPU is unavailable in this browser.');
+    } else {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(window.innerWidth * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+
+      const input = new InputBridge(canvas);
+      const offscreen = canvas.transferControlToOffscreen();
+      const loader = new Worker('./loader.js');
+
+      loader.postMessage(
+        {
+          canvas: offscreen,
+          width: canvas.width,
+          height: canvas.height,
+          inputSab: input.sab,
+          dataBase: `${location.origin}/data/`,
+        },
+        [offscreen]
+      );
+
+      window.addEventListener('resize', () => {
+        const scale = Math.max(1, window.devicePixelRatio || 1);
+        loader.postMessage({
+          resize: true,
+          width: Math.floor(window.innerWidth * scale),
+          height: Math.floor(window.innerHeight * scale),
+        });
+      });
+    }
+  </script>
+</body>
+</html>

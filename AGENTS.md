@@ -11,11 +11,11 @@
 
 ## Folder Responsibilities
 - `web/` — Browser frontend (`index.html`, `loader.js`), dedicated workers (`web/workers/`), and input bridge (`web/input/`). Keep the main thread non-blocking; require Cross-Origin Isolation (`COOP`/`COEP`) for `SharedArrayBuffer`.
-- `recomp/` — Static `x86-64 -> LLVM IR -> Wasm64` recompilation pipeline.
-- `runtime/` — Wasm64 runtime shims: Xbox/Win32 OS APIs (`runtime/os/`) and `d3d12_xs -> WebGPU` command bridge (`runtime/gpu/`).
-- `shaders/` — Offline `RDNA2 -> SPIR-V -> WGSL` (`naga`/`tint`) translation and shader packing.
+- `recomp/` — **Rust** static `x86-64 -> LLVM IR -> Wasm64` recompilation pipeline.
+- `runtime/` — **C++20 + Emscripten (`-sMEMORY64 -pthread`)** runtime: shared ABI (`runtime/abi/`), Xbox/Win32 OS shims (`runtime/os/`), and `d3d12_xs -> WebGPU` command bridge (`runtime/gpu/`).
+- `shaders/` — **Rust** offline `RDNA2 -> SPIR-V -> WGSL` (`naga`) translation and shader packing.
 - `server/` — Lightweight local HTTP server with `COOP`/`COEP` headers and HTTP `Range` (`206 Partial Content`) support.
-- `tools/` — Local manifest/bootset builders and diagnostics.
-- `docs/` — Technical specs, format notes, and WebGPU/Wasm64 findings.
+- `tools/` — **Rust** local manifest/bootset builders and diagnostics.
+- `docs/` — Technical specs, ABI contracts, and WebGPU/Wasm64 findings.
 - `tests/` — Automated unit and integration tests.
 - `third_party/` — Open-source submodules/dependencies only (never game files).

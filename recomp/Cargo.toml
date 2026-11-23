@@ -1,0 +1,9 @@
+[package]
+name = "playgta6-recomp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "playgta6-recomp"
+path = "src/main.rs"
