@@ -58,7 +58,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement `GetProcessHeap`/`HeapCreate`/`HeapAlloc`/`HeapReAlloc`/`HeapFree`/`HeapSize`, `GetModuleHandleW`/`LoadLibraryW`, and a dynamic `GetProcAddress` symbol registry mapping DLL + export names to registered runtime shims.
 - [x] **O8 — Offline Networking, Telemetry & Xbox Live Safe Stubs** — `DONE` (PR #77, closes #43) *(no game files required — disjoint files `runtime/os/xbox_offline.{h,cpp}`, `tests/test_xbox_offline.cpp`)*
   - Implement clean offline-mode stubs for `ws2_32` (`WSAStartup`, `socket`, `getaddrinfo` → offline), `winhttp`, and Xbox Live (`XblInitialize`, `XblContextCreateHandle`, `XStore*`) so single-player boot never blocks on online services.
-- [ ] **O9 — Guest CPU State ABI & Recompiled-Code Dispatcher (`runtime/guest/`)** — `IN PROGRESS` (#115, @Timon-ok) *(no game files required — small ABI PR first, then disjoint files `runtime/guest/guest_runtime.{h,cpp}`, `tests/test_guest_runtime.cpp`)*
+- [x] **O9 — Guest CPU State ABI & Recompiled-Code Dispatcher (`runtime/guest/`)** — `DONE` (PRs #138 + #158, closes #115) *(no game files required — small ABI PR first, then disjoint files `runtime/guest/guest_runtime.{h,cpp}`, `tests/test_guest_runtime.cpp`)*
   - Document the lifter's guest CPU state layout + runtime helper symbols in the shared ABI, then implement `__playgta6_indirect_call`/`__playgta6_trap`/`__playgta6_unimplemented`/`__playgta6_divide_error`, the guest-address → lifted-function table, IAT-slot → import-thunk dispatch, guest stack setup, and entry-point invocation.
 - [x] **O10 — `PGIM` Guest Image Loader for `VirtualMemoryArena`** — `DONE` (PR #141, closes #116) *(no game files required — disjoint files `runtime/os/image_loader.{h,cpp}`, `tests/test_image_loader.cpp`)*
   - Load the `PGIM` v1 container from `playgta6-recomp pack-image` (R6): validate, reserve at the preferred base, commit sections, copy payloads, apply DIR64/HIGHLOW relocations when rebased, and set page protections.
@@ -76,6 +76,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Generic guest-memory COM objects (vtables of dispatchable addresses, `IUnknown` lifetime, argument marshaling) plus the `xgameruntime.dll` provider entry points routed onto the existing `pg6_gdk_*` shims; shared by `d3d12_xs` (G24), DirectStorage and GameInput interfaces.
 - [ ] **O17 — Unified Boot Import Coverage Wiring (`runtime/os/shim_exports.cpp` + `tools/check_import_coverage.py`)** — `UNCLAIMED` *(wait for O13/O14/O15/G24 merge)*
   - Wire `pg6_xbox_scarlett_register_all`, `pg6_ucrt_register_all`, `pg6_xbox_middleware_register_all`, `pg6_win32_compat_register_all`, and `pg6_d3d12_xs_register_all` into `shim_exports.cpp` and verify 100% coverage of all non-guest-DLL imports in `docs/imports_required.md`.
+- [ ] **O18 — Contiguous Guest Address Space: Offset-Mapped `VirtualMemoryArena` Backing for wasm64 (`runtime/os/vmem.{h,cpp}`)** — `IN PROGRESS` (#187, @Timon-ok) *(lifted code reads guest memory directly in linear memory; the arena keeps pages in separate host allocations)*
+  - Back the arena with one contiguous region and a single guest-base translation shared by the lifter's `guest_ptr` seam, the import-bridge seam, the guest runtime and the image loader, on host builds and under Emscripten `-sMEMORY64`, keeping commit/protect bookkeeping.
 
 ---
 
