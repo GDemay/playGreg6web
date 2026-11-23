@@ -282,26 +282,28 @@ def sanitize_argv(argv: Sequence[str]) -> list[str]:
 
 
 def _tool_label(token: str) -> str:
-    name = Path(token).name.lower()
+    normalized = token.replace("\\", "/")
+    basename = normalized.rsplit("/", 1)[-1]
+    name = basename.lower()
     if name.startswith("em++") or name.startswith("emxx"):
         return "em++"
     if name.startswith("emcc"):
         return "emcc"
     if name.startswith("python"):
         return "python"
-    stem = Path(token).stem
+    stem = Path(basename).stem
     return stem or "tool"
 
 
 def _sanitize_fs_token(token: str) -> str:
-    path = Path(token)
-    name = path.name
+    normalized = token.replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1]
     if name in {RUNTIME_JS, RUNTIME_WASM, "libplaygta6_core.a"}:
         return name
-    suffix = path.suffix.lower()
+    suffix = Path(name).suffix.lower()
     if suffix in {".o", ".a", ".ll", ".c", ".cc", ".cpp", ".cxx", ".js", ".wasm", ".h"}:
         return name
-    if suffix or "/" in token.replace("\\", "/") or (len(token) >= 2 and token[1] == ":"):
+    if suffix or "/" in normalized or (len(token) >= 2 and token[1] == ":"):
         return name or "<path>"
     return token
 
