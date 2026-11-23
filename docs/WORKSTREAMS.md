@@ -42,7 +42,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Expose C-ABI Win32 & Xbox GDK imports (`XGameRuntimeInitialize`, `XTaskQueue*`, `XUser*` offline stub, `VirtualAlloc`/`Protect`/`Free`, `Tls*`, `SRWLock*`, `CriticalSection`/`Event`, `CreateFileW`/`ReadFile`/`SetFilePointerEx`/`GetFileSizeEx`/`CloseHandle`, `QueryPerformanceCounter`/`Frequency`) backed by our OS shims.
 - [ ] **O6 — Win32 Synchronization & Thread Pool Shims** — `IN PROGRESS` (#41, @Timon-ok) *(no game files required — disjoint files `runtime/os/win32_sync.{h,cpp}`, `tests/test_win32_sync.cpp`)*
   - Implement `CreateSemaphoreW`/`ReleaseSemaphore`, `CreateMutexW`/`ReleaseMutex`, `WaitForMultipleObjects` (`bWaitAll` true/false), `SleepConditionVariableSRW`/`WakeConditionVariable`/`WakeAllConditionVariable`, and `CreateThread`/`SetThreadAffinityMask`/`GetCurrentThreadId`.
-- [ ] **O7 — Win32 Heap, Module Registry & `GetProcAddress` Resolver** — `IN PROGRESS` (#42, @Timon-ok) *(no game files required — disjoint files `runtime/os/win32_loader.{h,cpp}`, `tests/test_win32_loader.cpp`)*
+- [x] **O7 — Win32 Heap, Module Registry & `GetProcAddress` Resolver** — `DONE` (PR #91, closes #42) *(no game files required — disjoint files `runtime/os/win32_loader.{h,cpp}`, `tests/test_win32_loader.cpp`)*
   - Implement `GetProcessHeap`/`HeapCreate`/`HeapAlloc`/`HeapReAlloc`/`HeapFree`/`HeapSize`, `GetModuleHandleW`/`LoadLibraryW`, and a dynamic `GetProcAddress` symbol registry mapping DLL + export names to registered runtime shims.
 - [x] **O8 — Offline Networking, Telemetry & Xbox Live Safe Stubs** — `DONE` (PR #77, closes #43) *(no game files required — disjoint files `runtime/os/xbox_offline.{h,cpp}`, `tests/test_xbox_offline.cpp`)*
   - Implement clean offline-mode stubs for `ws2_32` (`WSAStartup`, `socket`, `getaddrinfo` → offline), `winhttp`, and Xbox Live (`XblInitialize`, `XblContextCreateHandle`, `XStore*`) so single-player boot never blocks on online services.
@@ -100,7 +100,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add pure-Rust DXBC/DXIL container parser (`shaders/src/dxbc.rs`) and Naga IR lowering passes (`shaders/src/lower.rs`: push constants → uniform buffer, >4 bind-group remapping) + `inspect-dxbc` CLI.
 - [ ] **S5 — Wave64/Subgroup Emulation & Mesh-Compute WGSL Lowering Library** — `IN PROGRESS` (#46, @Timon-ok) *(no game files required — wait for S4 or keep disjoint in `shaders/src/wave_emul.rs`)*
   - Provide reusable WGSL workgroup-shared-memory emulation helpers for RDNA2 Wave64 ballot/shuffle/prefix-sum ops and indirect compute-driven meshlet culling/draw emission when WebGPU `subgroups` is unavailable.
-- [ ] **S6 — Root-Signature-to-WebGPU `BindGroupLayout` Reflection & Cache Manifest** — `IN PROGRESS` (#47, @Timon-ok) *(no game files required — disjoint file `shaders/src/reflect.rs`)*
+- [x] **S6 — Root-Signature-to-WebGPU `BindGroupLayout` Reflection & Cache Manifest** — `DONE` (PR #92, closes #47) *(no game files required — disjoint file `shaders/src/reflect.rs`)*
   - Reflect parsed `naga::Module` resource bindings, vertex inputs, and workgroup sizes into compact JSON metadata alongside `shader-index.json` so `wgpu_worker.js` can build exact `GPUBindGroupLayout`s without runtime string parsing.
 
 ---
