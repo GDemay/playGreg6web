@@ -192,7 +192,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Verifies zero ABI drift between `runtime/abi/playgta6_abi.h`, `tools/gpu_trace.py`, `web/workers/wgpu_worker.js`, `web/input/input_bridge.js`, and `docs/WORKSTREAMS.md` in one fast stdlib check.
 - [ ] **W28 — Streaming Audio Bank / AWC Header Inspector (`tools/src/awc.rs`)** — `IN PROGRESS` (#113, @Timon-ok) *(no game files required — disjoint file `tools/src/awc.rs`)*
   - Read-only RAGE `.awc` audio bank container header parser (stream/chunk counts, codec tag PCM/IMA-ADPCM/XMA2/Opus, sample rate, channel count) without extracting or committing audio data.
-- [ ] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** — `IN PROGRESS` (#114, @Timon-ok) *(no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
+- [x] **W29 — Web Worker Pool & Offscreen Task Dispatcher (`web/workers/worker_pool.js`)** — `DONE` (PR #135, closes #114) *(no game files required — disjoint files `web/workers/worker_pool.js`, `tests/test_worker_pool.mjs`)*
   - Reusable bounded Web Worker pool supporting transferable `ArrayBuffer` jobs, cancellation, and graceful crash recovery for background decompression & shader pre-parsing.
 - [ ] **W30 — Wire `web/index.html` to `web/app_bootstrap.js` & `web/ui/hud_controller.js` (`web/index.html`)** — `IN PROGRESS` (#130, @MarcBlattmann) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Adds compact interactive HUD action controls and replaces the legacy hardcoded worker bootstrap with `bootstrapPlayGta6App` + `HudController` so opening `http://127.0.0.1:8080` renders live WebGPU smoke frames or boots `runtime.wasm`.
