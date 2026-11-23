@@ -1,28 +1,44 @@
 //! MSVC x64 switch jump-table recovery.
 //!
-//! [`crate::discover`] hands over the instruction trace that ends in an unresolved `jmp reg`: the
-//! jump's block preceded by its chain of sole predecessors, with the direction taken through
+//! [`crate::discover`] hands over the instruction trace that ends in an unresolved indirect `jmp`:
+//! the jump's block preceded by its chain of sole predecessors, with the direction taken through
 //! every conditional branch between them. A backward slice over that trace matches the dispatch
-//! MSVC emits for dense x64 `switch` statements:
+//! shapes MSVC (and Clang-cl) emit for x64 `switch` statements:
 //!
-//! ```text
-//!     cmp    ecx, N                              ; guard, usually in the predecessor block
-//!     ja     default                             ; (or jae / taken jbe / taken jb)
-//!     movsxd rax, ecx                            ; optional zero/sign extension
-//!     lea    rdx, [rip+__ImageBase]
-//!   [ movzx  eax, byte ptr [rdx+rax+index_rva] ] ; two-level variant
-//!     mov    ecx, dword ptr [rdx+rax*4+table_rva]
-//!     add    rcx, rdx
-//!     jmp    rcx
-//! ```
+//! 1. **Image-base-relative / anchor-relative 32-bit offset tables** (`mov` unsigned or `movsxd`
+//!    signed, `add` or `lea`, with base loaded in the same block or a predecessor, across register
+//!    copies, `lea rTab, [rBase + table_rva]`, or Win64 non-volatile registers across calls):
+//!    ```text
+//!        cmp    ecx, N                              ; guard, usually in a predecessor block
+//!        ja     default                             ; (or jae/jb/jbe/jg/jge/jl/jle, or `and` mask)
+//!        movsxd rax, ecx                            ; optional zero/sign extension
+//!        lea    rdx, [rip+__ImageBase]              ; or any section/anchor address
+//!      [ movzx  eax, byte/word [rdx+rax*s+idx_rva] ]; optional two-level byte/word index table
+//!        mov    ecx, dword ptr [rdx+rax*4+table_rva]; or `movsxd rcx, dword ptr [...]`
+//!        add    rcx, rdx                            ; or `lea rcx, [rdx+rcx]`
+//!        jmp    rcx
+//!    ```
+//! 2. **Table-relative 32-bit signed offset tables:**
+//!    ```text
+//!        lea    rdx, [rip+table_va]
+//!        movsxd rax, dword ptr [rdx+rcx*4]
+//!        add    rax, rdx
+//!        jmp    rax
+//!    ```
+//! 3. **Absolute 64-bit pointer tables:**
+//!    ```text
+//!        lea    rdx, [rip+table_va]
+//!        mov    rax, qword ptr [rdx+rcx*8] ; jmp rax
+//!        ; or: jmp qword ptr [rdx+rcx*8]
+//!    ```
 //!
 //! Register order, the choice of registers and interleaved unrelated instructions do not matter;
 //! what is matched is the data flow. The number of entries read comes only from a proven bound:
-//! an unsigned compare of the same register against an immediate guarding the path with no write
-//! in between, a zero-extension of a byte/word, or, for the second level, the largest byte of a
-//! bounded index table. Every target must be decodable code owned by the same `.pdata` function
-//! as the jump (or, for code no `.pdata` range covers, by none). Anything else leaves the jump
-//! unresolved; nothing is guessed.
+//! a compare/test guard on the path with no clobber in between, a bitmask (`and`) or logical right
+//! shift (`shr`), a zero-extension of a byte/word, or, for the second level, the largest entry of
+//! a bounded byte/word index table. Every target must be decodable code owned by the same `.pdata`
+//! function as the jump (or, for code no `.pdata` range covers, by none). Anything else leaves the
+//! jump unresolved; nothing is guessed.
 
 use iced_x86::{
     FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
@@ -34,8 +50,11 @@ use crate::code_image::CodeImage;
 /// Largest number of jump-table (or index-table) entries read for one dispatch.
 pub const MAX_JUMP_TABLE_ENTRIES: u64 = 1 << 16;
 
-/// Bound on nested slice steps (register copies, extensions) followed for one value.
+/// Bound on nested slice steps (register copies, extensions, address chains) followed for one value.
 const MAX_SLICE_DEPTH: u32 = 16;
+
+/// Bound on alias hops followed when matching a branch guard against an aliased register.
+const MAX_ALIAS_DEPTH: u32 = 4;
 
 /// One instruction of the trace. `taken` is set on a conditional branch that ends a predecessor
 /// block: whether the path to the jump took it.
@@ -45,39 +64,111 @@ pub(crate) struct Step<'b> {
     pub taken: Option<bool>,
 }
 
-/// Symbolic value of a register at a trace position.
+/// How jump-table entries encode target virtual addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryEncoding {
+    /// 32-bit unsigned offset added to `base` (e.g. `__ImageBase + u32`).
+    Unsigned32 { base: u64 },
+    /// 32-bit signed offset added to `base` (e.g. `table_va + i32` or `anchor_va + i32`).
+    Signed32 { base: u64 },
+    /// 64-bit absolute target virtual address stored directly in the table.
+    Absolute64,
+}
+
+impl EntryEncoding {
+    fn entry_size(self) -> u64 {
+        match self {
+            Self::Unsigned32 { .. } | Self::Signed32 { .. } => 4,
+            Self::Absolute64 => 8,
+        }
+    }
+
+    fn decode(self, chunk: &[u8]) -> u64 {
+        match self {
+            Self::Unsigned32 { base } => {
+                let raw = u32::from_le_bytes(chunk.try_into().unwrap());
+                base.wrapping_add(u64::from(raw))
+            }
+            Self::Signed32 { base } => {
+                let raw = i32::from_le_bytes(chunk.try_into().unwrap());
+                base.wrapping_add(i64::from(raw) as u64)
+            }
+            Self::Absolute64 => u64::from_le_bytes(chunk.try_into().unwrap()),
+        }
+    }
+}
+
+/// Symbolic value of a 64-bit register at a trace position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Value {
-    /// `__ImageBase`.
-    ImageBase,
-    /// A 32-bit table entry (zero-extended).
-    Entry(Load),
-    /// `__ImageBase + entry`: the dispatch target.
-    Target(Load),
+    /// Known address constant (e.g. `__ImageBase`, table VA, or section/anchor VA).
+    Const(u64),
+    /// Pre-computed pointer to a table element (`lea rPtr, [base + index*scale + disp]`).
+    TablePtr {
+        table: u64,
+        index: Register,
+        index_at: usize,
+        index_width: u32,
+        scale: u32,
+    },
+    /// A 32-bit table entry loaded into a register.
+    Entry { load: Load, signed: bool },
+    /// Resolved dispatch target address.
+    Target { load: Load, encoding: EntryEncoding },
 }
 
 /// `[base + index*scale + disp]` table read at trace position `at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Load {
+    /// Trace position of the memory-read instruction (`load_site`).
     at: usize,
+    /// Base VA of the table (index 0).
     table: u64,
+    /// Full 64-bit register holding the unscaled table index.
     index: Register,
+    /// Trace position where `index` is consumed (usually `at`, or an earlier `shl`/`lea`).
+    index_at: usize,
+    /// Bit width of `index` read at `index_at` (usually 64; 32 for 32-bit pre-scaling).
+    index_width: u32,
 }
 
-/// Proven inclusive upper bound of an index.
+/// Proven inclusive unsigned range `[min, max]` of an index.
+#[derive(Debug, Clone, Copy)]
 struct Bound {
+    min: u64,
     max: u64,
     index: Option<JumpTableIndex>,
 }
 
-/// Resolve the jump table dispatched by the `jmp reg` that ends `trace`.
+/// Constraint proven on a register by a conditional branch.
+#[derive(Debug, Clone, Copy)]
+enum GuardFact {
+    /// Unsigned `reg <= max`.
+    UnsignedUpper(u64),
+    /// Unsigned `reg >= min`.
+    UnsignedLower(u64),
+    /// Signed `reg <= max`.
+    SignedUpper(i64),
+    /// Signed `reg >= min`.
+    SignedLower(i64),
+    /// Exact equality `reg == val`.
+    Equal(u64),
+    /// Exclusion `reg != val`.
+    NotEqual(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawGuard {
+    reg: Register,
+    bits: u32,
+    fact: GuardFact,
+}
+
+/// Resolve the jump table dispatched by the indirect `jmp` that ends `trace`.
 pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpTable> {
     let at = trace.len().checked_sub(1)?;
     let jmp = trace[at].instr;
-    if jmp.flow_control() != FlowControl::IndirectBranch
-        || jmp.op0_kind() != OpKind::Register
-        || !jmp.op0_register().is_gpr64()
-    {
+    if jmp.flow_control() != FlowControl::IndirectBranch {
         return None;
     }
     let mut slicer = Slicer {
@@ -85,21 +176,36 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
         trace,
         info: InstructionInfoFactory::new(),
     };
-    let Some(Value::Target(load)) = slicer.value(jmp.op0_register(), at, 0) else {
-        return None;
+    let (load, encoding) = match jmp.op0_kind() {
+        OpKind::Register if jmp.op0_register().is_gpr64() => {
+            match slicer.value(jmp.op0_register(), at, 0)? {
+                Value::Target { load, encoding } => (load, encoding),
+                _ => return None,
+            }
+        }
+        OpKind::Memory if !jmp.is_ip_rel_memory_operand() && jmp.memory_size().size() == 8 => {
+            let load = slicer.table_load(at, 0, 8, 0)?;
+            (load, EntryEncoding::Absolute64)
+        }
+        _ => return None,
     };
-    let bound = slicer.bound(load.index, load.at, 64, 0)?;
-    let count = bound.max.checked_add(1)?;
+
+    let bound = slicer.bound(load.index, load.index_at, load.index_width, 0)?;
+    if bound.min > bound.max {
+        return None;
+    }
+    let count = bound.max.checked_sub(bound.min)?.checked_add(1)?;
     if count > MAX_JUMP_TABLE_ENTRIES {
         return None;
     }
-    let bytes = read(image, load.table, count * 4)?;
+    let entry_size = encoding.entry_size();
+    let table_start = load.table.wrapping_add(bound.min.checked_mul(entry_size)?);
+    let byte_len = count.checked_mul(entry_size)?;
+    let bytes = read(image, table_start, byte_len)?;
     let owner = image.function_table.function_at(jmp.ip());
     let mut targets = Vec::with_capacity(count as usize);
-    for &entry in bytes.as_chunks::<4>().0 {
-        let target = image
-            .base()
-            .checked_add(u64::from(u32::from_le_bytes(entry)))?;
+    for chunk in bytes.chunks_exact(entry_size as usize) {
+        let target = encoding.decode(chunk);
         if image.code_bytes(target).is_err() || image.function_table.function_at(target) != owner {
             return None;
         }
@@ -108,7 +214,7 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
     Some(JumpTable {
         site: jmp.ip(),
         load_site: trace[load.at].instr.ip(),
-        table: load.table,
+        table: table_start,
         targets,
         index: bound.index,
     })
@@ -130,11 +236,40 @@ fn mask(bits: u32) -> u64 {
     }
 }
 
+fn sign_extend(val: u64, bits: u32) -> i64 {
+    let shift = 64u32.saturating_sub(bits);
+    ((val << shift) as i64) >> shift
+}
+
+fn min_signed(bits: u32) -> i64 {
+    i64::MIN >> 64u32.saturating_sub(bits)
+}
+
+fn max_signed(bits: u32) -> i64 {
+    i64::MAX >> 64u32.saturating_sub(bits)
+}
+
 /// `AH`/`CH`/`DH`/`BH` alias bits 8..16 of their full register.
 fn is_high_byte(reg: Register) -> bool {
     matches!(
         reg,
         Register::AH | Register::CH | Register::DH | Register::BH
+    )
+}
+
+/// Windows x64 ABI non-volatile (callee-saved) general-purpose registers.
+fn is_win64_nonvolatile(reg: Register) -> bool {
+    matches!(
+        reg.full_register(),
+        Register::RBX
+            | Register::RBP
+            | Register::RDI
+            | Register::RSI
+            | Register::RSP
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15
     )
 }
 
@@ -145,13 +280,15 @@ struct Slicer<'t, 'b, 'i, 'a> {
 }
 
 impl Slicer<'_, '_, '_, '_> {
-    /// Whether `instr` may write any part of the full register `reg`. Calls clobber everything.
+    /// Whether `instr` may write any part of the full register `reg`. Calls clobber volatile
+    /// Win64 registers and preserve non-volatile callee-saved registers.
     fn writes(&mut self, instr: &Instruction, reg: Register) -> bool {
+        let reg = reg.full_register();
         if matches!(
             instr.flow_control(),
             FlowControl::Call | FlowControl::IndirectCall
         ) {
-            return true;
+            return !is_win64_nonvolatile(reg);
         }
         self.info.info(instr).used_registers().iter().any(|used| {
             used.register().full_register() == reg
@@ -167,10 +304,64 @@ impl Slicer<'_, '_, '_, '_> {
 
     /// Position of the last write to `reg` before `before`.
     fn def(&mut self, reg: Register, before: usize) -> Option<usize> {
+        let reg = reg.full_register();
         let trace = self.trace;
         (0..before)
             .rev()
             .find(|&i| self.writes(trace[i].instr, reg))
+    }
+
+    /// Whether bits 32..63 of the full 64-bit register `reg` are guaranteed zero just before
+    /// `before` (e.g., produced by a 32-bit GPR write, `movzx`, or `and r64, imm32_u`).
+    fn is_zero_extended_32(&mut self, reg: Register, before: usize, depth: u32) -> bool {
+        if depth > MAX_ALIAS_DEPTH {
+            return false;
+        }
+        let reg = reg.full_register();
+        let Some(at) = self.def(reg, before) else {
+            return false;
+        };
+        let instr = self.trace[at].instr;
+        if matches!(
+            instr.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            return false;
+        }
+        if instr.mnemonic() == Mnemonic::Movzx
+            && instr.op_count() == 2
+            && instr.op0_kind() == OpKind::Register
+            && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64())
+        {
+            return true;
+        }
+        if instr.mnemonic() == Mnemonic::And
+            && instr.op_count() == 2
+            && instr.op0_kind() == OpKind::Register
+            && instr.op0_register().is_gpr64()
+            && let Ok(imm) = instr.try_immediate(1)
+            && imm <= u64::from(u32::MAX)
+        {
+            return true;
+        }
+        if instr.mnemonic() == Mnemonic::Mov
+            && instr.op_count() == 2
+            && instr.op0_kind() == OpKind::Register
+            && instr.op1_kind() == OpKind::Register
+            && instr.op0_register().is_gpr64()
+            && instr.op1_register().is_gpr64()
+        {
+            return self.is_zero_extended_32(instr.op1_register(), at, depth + 1);
+        }
+        // In x86-64, every unconditional write to a 32-bit GPR zeroes bits 32..63.
+        // Note: `iced_x86::InstructionInfo::used_registers()` widens 32-bit GPR writes to the
+        // 64-bit register in 64-bit mode, so inspect operand 0 directly alongside `op0_access()`.
+        let info = self.info.info(instr);
+        instr.op_count() >= 1
+            && instr.op0_kind() == OpKind::Register
+            && instr.op0_register().is_gpr32()
+            && instr.op0_register().full_register() == reg
+            && matches!(info.op0_access(), OpAccess::Write | OpAccess::ReadWrite)
     }
 
     /// Symbolic value of the full register `reg` just before position `before`.
@@ -178,92 +369,525 @@ impl Slicer<'_, '_, '_, '_> {
         if depth > MAX_SLICE_DEPTH {
             return None;
         }
-        let at = self.def(reg.full_register(), before)?;
+        let reg = reg.full_register();
+        let at = self.def(reg, before)?;
         let instr = self.trace[at].instr;
-        let dst = instr.op0_register();
+        if instr.mnemonic() == Mnemonic::Cdqe {
+            return match self.value(Register::RAX, at, depth + 1)? {
+                Value::Entry { load, .. } => Some(Value::Entry { load, signed: true }),
+                _ => None,
+            };
+        }
         if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
             return None;
         }
+        let dst = instr.op0_register();
         match (instr.mnemonic(), instr.op1_kind()) {
             (Mnemonic::Lea, OpKind::Memory)
-                if dst.is_gpr64()
-                    && instr.is_ip_rel_memory_operand()
-                    && instr.ip_rel_memory_address() == self.image.base() =>
+                if dst.is_gpr64() && instr.is_ip_rel_memory_operand() =>
             {
-                Some(Value::ImageBase)
+                let va = instr.ip_rel_memory_address();
+                self.image.contains(va).then_some(Value::Const(va))
+            }
+            (Mnemonic::Lea, OpKind::Memory)
+                if dst.is_gpr64() && !instr.is_ip_rel_memory_operand() =>
+            {
+                self.lea_value(at, depth)
+            }
+            (Mnemonic::Mov, OpKind::Immediate64 | OpKind::Immediate32to64) if dst.is_gpr64() => {
+                let va = instr.try_immediate(1).ok()?;
+                self.image.contains(va).then_some(Value::Const(va))
             }
             (Mnemonic::Mov, OpKind::Register)
                 if dst.is_gpr64() && instr.op1_register().is_gpr64() =>
             {
                 self.value(instr.op1_register(), at, depth + 1)
             }
+            (Mnemonic::Mov, OpKind::Register)
+                if dst.is_gpr32() && instr.op1_register().is_gpr32() =>
+            {
+                match self.value(instr.op1_register(), at, depth + 1)? {
+                    Value::Entry { load, .. } => Some(Value::Entry {
+                        load,
+                        signed: false,
+                    }),
+                    _ => None,
+                }
+            }
+            (Mnemonic::Movsxd, OpKind::Register)
+                if dst.is_gpr64() && instr.op1_register().is_gpr32() =>
+            {
+                match self.value(instr.op1_register(), at, depth + 1)? {
+                    Value::Entry { load, .. } => Some(Value::Entry { load, signed: true }),
+                    _ => None,
+                }
+            }
             (Mnemonic::Mov, OpKind::Memory) if dst.is_gpr32() => {
-                self.table_load(at, 4, depth).map(Value::Entry)
+                let load = self.table_load(at, 1, 4, depth)?;
+                Some(Value::Entry {
+                    load,
+                    signed: false,
+                })
+            }
+            (Mnemonic::Movsxd, OpKind::Memory) if dst.is_gpr64() => {
+                let load = self.table_load(at, 1, 4, depth)?;
+                Some(Value::Entry { load, signed: true })
+            }
+            (Mnemonic::Mov, OpKind::Memory) if dst.is_gpr64() => {
+                let load = self.table_load(at, 1, 8, depth)?;
+                Some(Value::Target {
+                    load,
+                    encoding: EntryEncoding::Absolute64,
+                })
             }
             (Mnemonic::Add, OpKind::Register)
                 if dst.is_gpr64() && instr.op1_register().is_gpr64() =>
             {
-                let lhs = self.value(dst, at, depth + 1)?;
-                let rhs = self.value(instr.op1_register(), at, depth + 1)?;
-                match (lhs, rhs) {
-                    (Value::ImageBase, Value::Entry(load))
-                    | (Value::Entry(load), Value::ImageBase) => Some(Value::Target(load)),
-                    _ => None,
-                }
+                self.add_reg_value(dst, instr.op1_register(), at, 0, depth)
+            }
+            (Mnemonic::Add | Mnemonic::Sub, _)
+                if dst.is_gpr64() && instr.try_immediate(1).is_ok() =>
+            {
+                let imm = instr.try_immediate(1).ok()?;
+                let delta = if instr.mnemonic() == Mnemonic::Sub {
+                    0u64.wrapping_sub(imm)
+                } else {
+                    imm
+                };
+                let val = self.value(dst, at, depth + 1)?;
+                Self::offset_value(val, delta)
             }
             _ => None,
         }
     }
 
-    /// Match an `element`-byte read of `[base + index*element + disp]` with
-    /// `base == __ImageBase` in operand 1 of the instruction at `at`.
-    fn table_load(&mut self, at: usize, element: u32, depth: u32) -> Option<Load> {
+    fn offset_value(val: Value, delta: u64) -> Option<Value> {
+        match val {
+            Value::Const(va) => Some(Value::Const(va.wrapping_add(delta))),
+            Value::TablePtr {
+                table,
+                index,
+                index_at,
+                index_width,
+                scale,
+            } => Some(Value::TablePtr {
+                table: table.wrapping_add(delta),
+                index,
+                index_at,
+                index_width,
+                scale,
+            }),
+            Value::Target {
+                load,
+                encoding: EntryEncoding::Unsigned32 { base },
+            } => Some(Value::Target {
+                load,
+                encoding: EntryEncoding::Unsigned32 {
+                    base: base.wrapping_add(delta),
+                },
+            }),
+            Value::Target {
+                load,
+                encoding: EntryEncoding::Signed32 { base },
+            } => Some(Value::Target {
+                load,
+                encoding: EntryEncoding::Signed32 {
+                    base: base.wrapping_add(delta),
+                },
+            }),
+            _ => None,
+        }
+    }
+
+    /// Combine two registers added together (`add a, b` or `lea dst, [a + b + disp]`).
+    fn add_reg_value(
+        &mut self,
+        a: Register,
+        b: Register,
+        at: usize,
+        disp: u64,
+        depth: u32,
+    ) -> Option<Value> {
+        let lhs = self.value(a, at, depth + 1);
+        let rhs = self.value(b, at, depth + 1);
+        match (lhs, rhs) {
+            (Some(Value::Const(base)), Some(Value::Entry { load, signed }))
+            | (Some(Value::Entry { load, signed }), Some(Value::Const(base))) => {
+                let adj_base = base.wrapping_add(disp);
+                let encoding = if signed {
+                    EntryEncoding::Signed32 { base: adj_base }
+                } else {
+                    EntryEncoding::Unsigned32 { base: adj_base }
+                };
+                Some(Value::Target { load, encoding })
+            }
+            (Some(Value::Const(base)), _) => self.ptr_from_base_and_idx(base, b, at, disp, depth),
+            (_, Some(Value::Const(base))) => self.ptr_from_base_and_idx(base, a, at, disp, depth),
+            _ => None,
+        }
+    }
+
+    fn ptr_from_base_and_idx(
+        &mut self,
+        base: u64,
+        idx: Register,
+        at: usize,
+        disp: u64,
+        depth: u32,
+    ) -> Option<Value> {
+        let table = base.wrapping_add(disp);
+        if let Some((orig_idx, orig_at, orig_width, scale)) = self.scaled_index(idx, at, depth + 1)
+        {
+            Some(Value::TablePtr {
+                table,
+                index: orig_idx,
+                index_at: orig_at,
+                index_width: orig_width,
+                scale,
+            })
+        } else {
+            Some(Value::TablePtr {
+                table,
+                index: idx.full_register(),
+                index_at: at,
+                index_width: 64,
+                scale: 1,
+            })
+        }
+    }
+
+    /// Evaluate a non-RIP `lea dst64, [base + index*scale + disp]` at `at`.
+    fn lea_value(&mut self, at: usize, depth: u32) -> Option<Value> {
         let instr = self.trace[at].instr;
-        let (base, index) = (instr.memory_base(), instr.memory_index());
         let segment = instr.memory_segment();
-        if instr.op1_kind() != OpKind::Memory
+        if segment == Register::FS || segment == Register::GS {
+            return None;
+        }
+        let base = instr.memory_base();
+        let index = instr.memory_index();
+        let scale = instr.memory_index_scale();
+        let disp = instr.memory_displacement64();
+
+        if base.is_gpr64() && index == Register::None {
+            let v = self.value(base, at, depth + 1)?;
+            return Self::offset_value(v, disp);
+        }
+        if base.is_gpr64() && index.is_gpr64() && scale == 1 {
+            return self.add_reg_value(base, index, at, disp, depth);
+        }
+        if base.is_gpr64()
+            && index.is_gpr64()
+            && scale > 1
+            && let Some(Value::Const(base_va)) = self.value(base, at, depth + 1)
+        {
+            return Some(Value::TablePtr {
+                table: base_va.wrapping_add(disp),
+                index: index.full_register(),
+                index_at: at,
+                index_width: 64,
+                scale,
+            });
+        }
+        if base == Register::None && index.is_gpr64() && scale > 1 && self.image.contains(disp) {
+            return Some(Value::TablePtr {
+                table: disp,
+                index: index.full_register(),
+                index_at: at,
+                index_width: 64,
+                scale,
+            });
+        }
+        None
+    }
+
+    /// If `reg` before `before` holds `orig_idx * scale` (with `scale` in `{2, 4, 8}`), return
+    /// `(orig_idx, orig_at, orig_width, scale)`.
+    fn scaled_index(
+        &mut self,
+        reg: Register,
+        before: usize,
+        depth: u32,
+    ) -> Option<(Register, usize, u32, u32)> {
+        if depth > MAX_SLICE_DEPTH {
+            return None;
+        }
+        let reg = reg.full_register();
+        let at = self.def(reg, before)?;
+        let instr = self.trace[at].instr;
+        if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let dst = instr.op0_register();
+        if !(dst.is_gpr32() || dst.is_gpr64()) {
+            return None;
+        }
+        let width = if dst.is_gpr32() { 32 } else { 64 };
+        match (instr.mnemonic(), instr.op1_kind()) {
+            (Mnemonic::Mov, OpKind::Register)
+                if dst.is_gpr64() && instr.op1_register().is_gpr64() =>
+            {
+                self.scaled_index(instr.op1_register(), at, depth + 1)
+            }
+            (Mnemonic::Shl, _) if instr.try_immediate(1).is_ok() => {
+                let shift = instr.try_immediate(1).ok()?;
+                if matches!(shift, 1..=3) {
+                    Some((dst.full_register(), at, width, 1u32 << shift))
+                } else {
+                    None
+                }
+            }
+            (Mnemonic::Add, OpKind::Register) if dst == instr.op1_register() => {
+                if let Some((orig, orig_at, orig_w, s)) = self.scaled_index(dst, at, depth + 1)
+                    && s <= 4
+                {
+                    Some((orig, orig_at, orig_w.min(width), s * 2))
+                } else {
+                    Some((dst.full_register(), at, width, 2))
+                }
+            }
+            (Mnemonic::Lea, OpKind::Memory)
+                if !instr.is_ip_rel_memory_operand()
+                    && instr.memory_base() == Register::None
+                    && instr.memory_index().is_gpr64()
+                    && instr.memory_displacement64() == 0
+                    && matches!(instr.memory_index_scale(), 2 | 4 | 8) =>
+            {
+                Some((
+                    instr.memory_index().full_register(),
+                    at,
+                    width,
+                    instr.memory_index_scale(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Match an `element`-byte table read in operand `mem_op` of the instruction at `at`.
+    fn table_load(&mut self, at: usize, mem_op: u32, element: u32, depth: u32) -> Option<Load> {
+        let instr = self.trace[at].instr;
+        if instr.op_kind(mem_op) != OpKind::Memory
+            || instr.is_ip_rel_memory_operand()
             || instr.memory_size().size() != element as usize
-            || instr.memory_index_scale() != element
-            || !base.is_gpr64()
-            || !index.is_gpr64()
-            || segment == Register::FS
-            || segment == Register::GS
         {
             return None;
         }
-        if self.value(base, at, depth + 1)? != Value::ImageBase {
+        let segment = instr.memory_segment();
+        if segment == Register::FS || segment == Register::GS {
             return None;
         }
-        let rva = instr.memory_displacement64();
-        if rva >= self.image.end() - self.image.base() {
-            return None;
+        let base = instr.memory_base();
+        let index = instr.memory_index();
+        let scale = instr.memory_index_scale();
+        let disp = instr.memory_displacement64();
+
+        // Standard `[rBase + rIdx*element + disp]` (and swapped `[rIdx + rBase + disp]` for scale 1).
+        if base.is_gpr64() && index.is_gpr64() && scale == element {
+            if let Some(Value::Const(base_va)) = self.value(base, at, depth + 1) {
+                return Some(Load {
+                    at,
+                    table: base_va.wrapping_add(disp),
+                    index: index.full_register(),
+                    index_at: at,
+                    index_width: 64,
+                });
+            }
+            if element == 1
+                && let Some(Value::Const(base_va)) = self.value(index, at, depth + 1)
+            {
+                return Some(Load {
+                    at,
+                    table: base_va.wrapping_add(disp),
+                    index: base.full_register(),
+                    index_at: at,
+                    index_width: 64,
+                });
+            }
         }
-        Some(Load {
-            at,
-            table: self.image.base() + rva,
-            index,
-        })
+
+        // Pre-scaled index `[rBase + rScaled*scale + disp]` where `scale < element`.
+        if base.is_gpr64() && index.is_gpr64() && scale < element && element.is_multiple_of(scale) {
+            let need = element / scale;
+            let pairs: &[(Register, Register)] = if scale == 1 {
+                &[(base, index), (index, base)]
+            } else {
+                &[(base, index)]
+            };
+            for &(b, idx) in pairs {
+                if let Some(Value::Const(base_va)) = self.value(b, at, depth + 1)
+                    && let Some((orig_idx, orig_at, orig_width, s)) =
+                        self.scaled_index(idx, at, depth + 1)
+                    && s == need
+                {
+                    return Some(Load {
+                        at,
+                        table: base_va.wrapping_add(disp),
+                        index: orig_idx,
+                        index_at: orig_at,
+                        index_width: orig_width,
+                    });
+                }
+            }
+        }
+
+        // Pre-computed element pointer `[rPtr + disp]` (e.g. from `lea rPtr, [rBase + rIdx*4 + ...]`).
+        if base.is_gpr64()
+            && index == Register::None
+            && let Some(Value::TablePtr {
+                table: ptr_base,
+                index: orig_idx,
+                index_at,
+                index_width,
+                scale: ptr_scale,
+            }) = self.value(base, at, depth + 1)
+            && ptr_scale == element
+        {
+            return Some(Load {
+                at,
+                table: ptr_base.wrapping_add(disp),
+                index: orig_idx,
+                index_at,
+                index_width,
+            });
+        }
+
+        // Base-less absolute table `[rIdx*element + table_va]` (low-address image).
+        if base == Register::None
+            && index.is_gpr64()
+            && scale == element
+            && self.image.contains(disp)
+        {
+            return Some(Load {
+                at,
+                table: disp,
+                index: index.full_register(),
+                index_at: at,
+                index_width: 64,
+            });
+        }
+
+        None
     }
 
-    /// Proven inclusive bound of the low `width` bits of the full register `reg` just before
-    /// position `before` (`width == 64`: of the whole register).
+    /// Proven inclusive unsigned range `[min, max]` of the low `width` bits of the full register
+    /// `reg` just before position `before` (`width == 64`: of the whole register).
     fn bound(&mut self, reg: Register, before: usize, width: u32, depth: u32) -> Option<Bound> {
         if depth > MAX_SLICE_DEPTH {
             return None;
         }
         let reg = reg.full_register();
+        let wmask = mask(width);
+        let mut unsigned_upper: Option<u64> = None;
+        let mut unsigned_lower: u64 = 0;
+        let mut signed_upper: Option<i64> = None;
+        let mut signed_lower: Option<i64> = None;
+        let mut excluded: Vec<u64> = Vec::new();
+        let mut def_at: Option<usize> = None;
+
         for i in (0..before).rev() {
             let step = self.trace[i];
             if self.writes(step.instr, reg) {
-                return self.def_bound(i, width, depth);
+                def_at = Some(i);
+                break;
             }
             if let Some(taken) = step.taken
-                && let Some(max) = self.guard(i, taken, reg, width)
+                && let Some(raw) = self.guard_at(i, taken)
+                && let Some(fact) = self.adapt_guard(reg, width, i, raw)
             {
-                return Some(Bound { max, index: None });
+                match fact {
+                    GuardFact::UnsignedUpper(u) => {
+                        let u = u.min(wmask);
+                        unsigned_upper = Some(unsigned_upper.map_or(u, |cur| cur.min(u)));
+                    }
+                    GuardFact::UnsignedLower(l) => {
+                        unsigned_lower = unsigned_lower.max(l);
+                    }
+                    GuardFact::SignedUpper(su) => {
+                        signed_upper = Some(signed_upper.map_or(su, |cur| cur.min(su)));
+                    }
+                    GuardFact::SignedLower(sl) => {
+                        signed_lower = Some(signed_lower.map_or(sl, |cur| cur.max(sl)));
+                    }
+                    GuardFact::Equal(v) => {
+                        let v = v.min(wmask);
+                        unsigned_lower = unsigned_lower.max(v);
+                        unsigned_upper = Some(unsigned_upper.map_or(v, |cur| cur.min(v)));
+                    }
+                    GuardFact::NotEqual(v) => {
+                        if excluded.len() < 8 {
+                            excluded.push(v);
+                        }
+                    }
+                }
             }
         }
-        None
+
+        let def_b = def_at.and_then(|at| self.def_bound(at, width, depth));
+
+        let mut max_opt = unsigned_upper;
+        if let Some(su) = signed_upper {
+            if su < 0 {
+                return None;
+            }
+            if let Some(sl) = signed_lower
+                && sl < 0
+            {
+                return None;
+            }
+            let u = (su as u64).min(wmask);
+            max_opt = Some(max_opt.map_or(u, |cur| cur.min(u)));
+        }
+
+        let mut min = unsigned_lower;
+        if let Some(sl) = signed_lower
+            && sl > 0
+        {
+            min = min.max(sl as u64);
+        }
+
+        let (mut min, mut max, index) = match (def_b, max_opt) {
+            (Some(db), Some(gmax)) => (db.min.max(min), db.max.min(gmax), db.index),
+            (Some(db), None) => (db.min.max(min), db.max, db.index),
+            (None, Some(gmax)) => (min, gmax, None),
+            (None, None) => return None,
+        };
+
+        if min > max {
+            return None;
+        }
+        while excluded.contains(&max) {
+            if max == min {
+                return None;
+            }
+            max -= 1;
+        }
+        while excluded.contains(&min) {
+            if min == max {
+                return None;
+            }
+            min += 1;
+        }
+        if min > max {
+            return None;
+        }
+        Some(Bound { min, max, index })
+    }
+
+    /// Shift a proven range `[min, max]` by signed `delta`, failing if it would wrap `eff_bits`.
+    fn shift_bound(deeper: Bound, delta: i128, eff_bits: u32, width: u32) -> Option<Bound> {
+        if deeper.index.is_some() {
+            return None;
+        }
+        let new_min = i128::from(deeper.min) + delta;
+        let new_max = i128::from(deeper.max) + delta;
+        if new_min < 0 || new_min > new_max || new_max > i128::from(mask(eff_bits)) {
+            return None;
+        }
+        Some(Bound {
+            min: new_min as u64,
+            max: (new_max as u64).min(mask(width)),
+            index: None,
+        })
     }
 
     /// Bound of the register written by the instruction at `at`.
@@ -283,86 +907,476 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::Mov if src_is_reg && dst.is_gpr64() && src.is_gpr64() => {
                 self.bound(src, at, width, depth + 1)
             }
+            Mnemonic::Mov
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && width <= 8
+                    && dst.is_gpr8()
+                    && !is_high_byte(dst) =>
+            {
+                let load = self.table_load(at, 1, 1, depth)?;
+                self.index_table_from_load(load, 1, depth)
+            }
+            Mnemonic::Mov
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.try_immediate(1).is_ok()
+                    && (dst.is_gpr32()
+                        || dst.is_gpr64()
+                        || (!is_high_byte(dst) && width <= dst.size() as u32 * 8)) =>
+            {
+                let dst_bits = dst.size() as u32 * 8;
+                let v = (instr.try_immediate(1).ok()? & mask(dst_bits)).min(mask(width));
+                Some(Bound {
+                    min: v,
+                    max: v,
+                    index: None,
+                })
+            }
+            Mnemonic::Xor
+                if src_is_reg
+                    && dst == src
+                    && (dst.is_gpr32()
+                        || dst.is_gpr64()
+                        || (!is_high_byte(dst) && width <= dst.size() as u32 * 8)) =>
+            {
+                Some(Bound {
+                    min: 0,
+                    max: 0,
+                    index: None,
+                })
+            }
             Mnemonic::Movsxd if src_is_reg && dst.is_gpr64() && src.is_gpr32() => {
                 self.bound(src, at, 32, depth + 1).and_then(sign_extended)
             }
             Mnemonic::Cdqe => self
                 .bound(Register::RAX, at, 32, depth + 1)
                 .and_then(sign_extended),
-            Mnemonic::Movzx if src_is_reg && (src.is_gpr8() || src.is_gpr16()) => {
+            Mnemonic::Movzx
+                if src_is_reg
+                    && (src.is_gpr8() || src.is_gpr16())
+                    && (dst.is_gpr32() || dst.is_gpr64() || width <= dst.size() as u32 * 8) =>
+            {
                 let bits = src.size() as u32 * 8;
                 let deeper = if is_high_byte(src) {
                     None
                 } else {
                     self.bound(src, at, bits, depth + 1)
                 };
-                let max = deeper.map_or(mask(bits), |b| b.max.min(mask(bits)));
-                Some(Bound { max, index: None })
+                match deeper {
+                    Some(b) => Some(Bound {
+                        min: b.min.min(mask(bits)),
+                        max: b.max.min(mask(bits)),
+                        index: b.index,
+                    }),
+                    None => Some(Bound {
+                        min: 0,
+                        max: mask(bits),
+                        index: None,
+                    }),
+                }
             }
             Mnemonic::Movzx
                 if instr.op1_kind() == OpKind::Memory
-                    && instr.memory_size().size() == 1
+                    && matches!(instr.memory_size().size(), 1 | 2)
                     && (dst.is_gpr32() || dst.is_gpr64()) =>
             {
-                self.index_table(at, depth)
+                let elem = instr.memory_size().size() as u32;
+                if let Some(load) = self.table_load(at, 1, elem, depth) {
+                    self.index_table_from_load(load, elem, depth)
+                } else if elem == 1 {
+                    Some(Bound {
+                        min: 0,
+                        max: 0xff,
+                        index: None,
+                    })
+                } else {
+                    None
+                }
+            }
+            // Power-of-2 or arbitrary bitmask bound (`and ecx, 7`, `and rcx, 0xf`, etc.).
+            Mnemonic::And
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.try_immediate(1).is_ok() =>
+            {
+                let dst_bits = dst.size() as u32 * 8;
+                if !(dst.is_gpr32() || dst.is_gpr64() || (!is_high_byte(dst) && width <= dst_bits))
+                {
+                    return None;
+                }
+                let imm_mask = instr.try_immediate(1).ok()? & mask(dst_bits);
+                let deeper = self.bound(dst, at, dst_bits, depth + 1);
+                let max = deeper
+                    .map_or(imm_mask, |b| b.max.min(imm_mask))
+                    .min(mask(width));
+                Some(Bound {
+                    min: 0,
+                    max,
+                    index: None,
+                })
+            }
+            // Value-preserving `and r, r` / `or r, r` (often used to test sign/zero).
+            Mnemonic::And | Mnemonic::Or
+                if src_is_reg && dst == src && (dst.is_gpr32() || dst.is_gpr64()) =>
+            {
+                let eff_bits = if dst.is_gpr32() { 32 } else { width };
+                self.bound(dst, at, eff_bits, depth + 1)
+            }
+            // Logical right shift (`shr eax, 28` -> `0..=15`).
+            Mnemonic::Shr
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.try_immediate(1).is_ok() =>
+            {
+                let dst_bits = dst.size() as u32 * 8;
+                if !(dst.is_gpr32() || dst.is_gpr64() || (!is_high_byte(dst) && width <= dst_bits))
+                {
+                    return None;
+                }
+                let shift =
+                    (instr.try_immediate(1).ok()? & if dst_bits == 64 { 63 } else { 31 }) as u32;
+                let deeper = self.bound(dst, at, dst_bits, depth + 1);
+                let (min, max) = match deeper {
+                    Some(b) => (b.min >> shift, (b.max >> shift).min(mask(width))),
+                    None => (0, (mask(dst_bits) >> shift).min(mask(width))),
+                };
+                Some(Bound {
+                    min,
+                    max,
+                    index: None,
+                })
+            }
+            // Case-offset shift: `sub r, imm` / `add r, imm` / `dec r` / `inc r`.
+            Mnemonic::Sub | Mnemonic::Add
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.try_immediate(1).is_ok()
+                    && (dst.is_gpr32() || dst.is_gpr64()) =>
+            {
+                let eff_bits = if dst.is_gpr32() { 32 } else { width };
+                let imm = instr.try_immediate(1).ok()?;
+                let delta = if instr.mnemonic() == Mnemonic::Sub {
+                    -i128::from(imm & mask(eff_bits))
+                } else {
+                    i128::from(sign_extend(imm, eff_bits))
+                };
+                let deeper = self.bound(dst, at, eff_bits, depth + 1)?;
+                Self::shift_bound(deeper, delta, eff_bits, width)
+            }
+            Mnemonic::Dec | Mnemonic::Inc
+                if instr.op_count() == 1
+                    && instr.op0_kind() == OpKind::Register
+                    && (dst.is_gpr32() || dst.is_gpr64()) =>
+            {
+                let eff_bits = if dst.is_gpr32() { 32 } else { width };
+                let delta = if instr.mnemonic() == Mnemonic::Dec {
+                    -1
+                } else {
+                    1
+                };
+                let deeper = self.bound(dst, at, eff_bits, depth + 1)?;
+                Self::shift_bound(deeper, delta, eff_bits, width)
+            }
+            // `lea dst, [src + disp]` (copy or case-offset shift, e.g. `lea eax, [rcx - min_case]`).
+            Mnemonic::Lea
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && !instr.is_ip_rel_memory_operand()
+                    && (dst.is_gpr32() || dst.is_gpr64())
+                    && instr.memory_base().is_gpr64()
+                    && instr.memory_index() == Register::None =>
+            {
+                let eff_bits = if dst.is_gpr32() { 32 } else { width };
+                let src_reg = instr.memory_base();
+                let disp = instr.memory_displacement64() as i64;
+                if disp == 0 {
+                    self.bound(src_reg, at, eff_bits, depth + 1)
+                } else {
+                    let deeper = self.bound(src_reg, at, eff_bits, depth + 1)?;
+                    Self::shift_bound(deeper, i128::from(disp), eff_bits, width)
+                }
             }
             _ => None,
         }
     }
 
-    /// Two-level dispatch: `movzx r, byte [__ImageBase + index + index_rva]` at `at`.
-    fn index_table(&mut self, at: usize, depth: u32) -> Option<Bound> {
-        let load = self.table_load(at, 1, depth)?;
-        let outer = self.bound(load.index, at, 64, depth + 1)?;
-        if outer.index.is_some() {
+    /// Two-level dispatch: `movzx r, byte/word [base + index*element + index_rva]` from `load`.
+    fn index_table_from_load(&mut self, load: Load, element: u32, depth: u32) -> Option<Bound> {
+        let outer = self.bound(load.index, load.index_at, load.index_width, depth + 1)?;
+        if outer.index.is_some() || outer.min > outer.max {
             return None;
         }
-        let len = outer.max.checked_add(1)?;
-        if len > MAX_JUMP_TABLE_ENTRIES {
+        let count = outer.max.checked_sub(outer.min)?.checked_add(1)?;
+        if count > MAX_JUMP_TABLE_ENTRIES {
             return None;
         }
-        let max = read(self.image, load.table, len)?.iter().copied().max()?;
+        let elem = u64::from(element);
+        let table_start = load.table.wrapping_add(outer.min.checked_mul(elem)?);
+        let byte_len = count.checked_mul(elem)?;
+        let bytes = read(self.image, table_start, byte_len)?;
+        let max = match element {
+            1 => u64::from(bytes.iter().copied().max()?),
+            2 => bytes
+                .chunks_exact(2)
+                .map(|c| u64::from(u16::from_le_bytes([c[0], c[1]])))
+                .max()?,
+            _ => return None,
+        };
         Some(Bound {
-            max: u64::from(max),
+            min: 0,
+            max,
             index: Some(JumpTableIndex {
-                load_site: self.trace[at].instr.ip(),
-                table: load.table,
-                len,
+                load_site: self.trace[load.at].instr.ip(),
+                table: table_start,
+                len: byte_len,
             }),
         })
     }
 
-    /// Bound on `reg` implied by the conditional branch at `at` (taken or not, per `taken`):
-    /// the last flag write before it must be `cmp reg, imm` with no write to `reg` in between.
-    fn guard(&mut self, at: usize, taken: bool, reg: Register, width: u32) -> Option<u64> {
+    /// Constraint implied by the conditional branch at `at` (taken or not, per `taken`) from the
+    /// last flag-modifying instruction before it.
+    fn guard_at(&mut self, at: usize, taken: bool) -> Option<RawGuard> {
         let jcc = self.trace[at].instr.mnemonic();
         for i in (0..at).rev() {
             let instr = self.trace[i].instr;
-            if self.writes(instr, reg) {
+            if matches!(
+                instr.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            ) {
                 return None;
             }
             if instr.rflags_modified() == 0 {
                 continue;
             }
-            let cmp_reg = instr.op0_register();
-            if instr.mnemonic() != Mnemonic::Cmp
-                || instr.op0_kind() != OpKind::Register
-                || cmp_reg.full_register() != reg
-                || is_high_byte(cmp_reg)
-            {
-                return None;
+            match instr.mnemonic() {
+                Mnemonic::Cmp => {
+                    if instr.op0_kind() != OpKind::Register {
+                        return None;
+                    }
+                    let cmp_reg = instr.op0_register();
+                    if is_high_byte(cmp_reg)
+                        || (i + 1..at).any(|k| self.writes(self.trace[k].instr, cmp_reg))
+                    {
+                        return None;
+                    }
+                    let bits = cmp_reg.size() as u32 * 8;
+                    let imm = instr.try_immediate(1).ok()?;
+                    let imm_u = imm & mask(bits);
+                    let imm_s = sign_extend(imm, bits);
+                    let fact = match (jcc, taken) {
+                        (Mnemonic::Ja, false) | (Mnemonic::Jbe, true) => {
+                            GuardFact::UnsignedUpper(imm_u)
+                        }
+                        (Mnemonic::Jae, false) | (Mnemonic::Jb, true) => {
+                            GuardFact::UnsignedUpper(imm_u.checked_sub(1)?)
+                        }
+                        (Mnemonic::Jb, false) | (Mnemonic::Jae, true) => {
+                            GuardFact::UnsignedLower(imm_u)
+                        }
+                        (Mnemonic::Jbe, false) | (Mnemonic::Ja, true) => {
+                            if imm_u < mask(bits) {
+                                GuardFact::UnsignedLower(imm_u + 1)
+                            } else {
+                                return None;
+                            }
+                        }
+                        (Mnemonic::Jg, false) | (Mnemonic::Jle, true) => {
+                            GuardFact::SignedUpper(imm_s)
+                        }
+                        (Mnemonic::Jge, false) | (Mnemonic::Jl, true) => {
+                            if imm_s > min_signed(bits) {
+                                GuardFact::SignedUpper(imm_s - 1)
+                            } else {
+                                return None;
+                            }
+                        }
+                        (Mnemonic::Jl, false) | (Mnemonic::Jge, true) => {
+                            GuardFact::SignedLower(imm_s)
+                        }
+                        (Mnemonic::Jle, false) | (Mnemonic::Jg, true) => {
+                            if imm_s < max_signed(bits) {
+                                GuardFact::SignedLower(imm_s + 1)
+                            } else {
+                                return None;
+                            }
+                        }
+                        (Mnemonic::Je, true) | (Mnemonic::Jne, false) => GuardFact::Equal(imm_u),
+                        (Mnemonic::Je, false) | (Mnemonic::Jne, true) => GuardFact::NotEqual(imm_u),
+                        (Mnemonic::Js, false) | (Mnemonic::Jns, true) if imm_u == 0 => {
+                            GuardFact::SignedLower(0)
+                        }
+                        _ => return None,
+                    };
+                    return Some(RawGuard {
+                        reg: cmp_reg,
+                        bits,
+                        fact,
+                    });
+                }
+                Mnemonic::Test | Mnemonic::And | Mnemonic::Or => {
+                    if instr.op0_kind() != OpKind::Register {
+                        return None;
+                    }
+                    let r = instr.op0_register();
+                    if is_high_byte(r) || (i + 1..at).any(|k| self.writes(self.trace[k].instr, r)) {
+                        return None;
+                    }
+                    let bits = r.size() as u32 * 8;
+                    if instr.op1_kind() == OpKind::Register && instr.op1_register() == r {
+                        let fact = match (jcc, taken) {
+                            (Mnemonic::Js, false)
+                            | (Mnemonic::Jns, true)
+                            | (Mnemonic::Jl, false)
+                            | (Mnemonic::Jge, true) => GuardFact::SignedLower(0),
+                            (Mnemonic::Jle, false) | (Mnemonic::Jg, true) => {
+                                GuardFact::SignedLower(1)
+                            }
+                            (Mnemonic::Je, true) | (Mnemonic::Jne, false) => GuardFact::Equal(0),
+                            (Mnemonic::Je, false) | (Mnemonic::Jne, true) => GuardFact::NotEqual(0),
+                            _ => return None,
+                        };
+                        return Some(RawGuard { reg: r, bits, fact });
+                    }
+                    if instr.mnemonic() == Mnemonic::Test
+                        && let Ok(imm) = instr.try_immediate(1)
+                    {
+                        let imm_u = imm & mask(bits);
+                        if matches!((jcc, taken), (Mnemonic::Je, true) | (Mnemonic::Jne, false)) {
+                            return Some(RawGuard {
+                                reg: r,
+                                bits,
+                                fact: GuardFact::UnsignedUpper((!imm_u) & mask(bits)),
+                            });
+                        }
+                    }
+                    return None;
+                }
+                _ => return None,
             }
-            let bits = cmp_reg.size() as u32 * 8;
-            if bits < width {
-                return None;
+        }
+        None
+    }
+
+    /// Adapt `raw` (proven at `branch_at`) to `(reg, width)`, following register copies and
+    /// extensions performed before `branch_at` when `reg` and `raw.reg` differ (e.g.
+    /// `movsxd rax, ecx; cmp ecx, N; ja default`).
+    fn adapt_guard(
+        &mut self,
+        reg: Register,
+        width: u32,
+        branch_at: usize,
+        raw: RawGuard,
+    ) -> Option<GuardFact> {
+        let mut cur_reg = reg.full_register();
+        let mut cur_width = width;
+        let mut cur_pos = branch_at;
+        let mut sign_ext_32 = false;
+        let target_full = raw.reg.full_register();
+
+        for _ in 0..=MAX_ALIAS_DEPTH {
+            if cur_reg == target_full {
+                let width_ok = raw.bits >= cur_width
+                    || (raw.bits == 32
+                        && cur_width == 64
+                        && self.is_zero_extended_32(cur_reg, cur_pos, 0));
+                if width_ok {
+                    if sign_ext_32 {
+                        return match raw.fact {
+                            GuardFact::UnsignedUpper(u) if u < 0x8000_0000 => {
+                                Some(GuardFact::UnsignedUpper(u))
+                            }
+                            GuardFact::UnsignedLower(l) if l < 0x8000_0000 => {
+                                Some(GuardFact::UnsignedLower(l))
+                            }
+                            GuardFact::Equal(v) if v < 0x8000_0000 => Some(GuardFact::Equal(v)),
+                            GuardFact::NotEqual(v) if v < 0x8000_0000 => {
+                                Some(GuardFact::NotEqual(v))
+                            }
+                            GuardFact::SignedUpper(su) => Some(GuardFact::SignedUpper(su)),
+                            GuardFact::SignedLower(sl) => Some(GuardFact::SignedLower(sl)),
+                            _ => None,
+                        };
+                    }
+                    return Some(raw.fact);
+                }
             }
-            let imm = instr.try_immediate(1).ok()? & mask(bits);
-            let max = match (jcc, taken) {
-                (Mnemonic::Ja, false) | (Mnemonic::Jbe, true) => imm,
-                (Mnemonic::Jae, false) | (Mnemonic::Jb, true) => imm.checked_sub(1)?,
+
+            let def_at = self.def(cur_reg, cur_pos)?;
+            let instr = self.trace[def_at].instr;
+            let (next_reg, next_width, needs_sext) = match instr.mnemonic() {
+                Mnemonic::Mov
+                    if instr.op_count() == 2
+                        && instr.op0_kind() == OpKind::Register
+                        && instr.op1_kind() == OpKind::Register =>
+                {
+                    let (dst, src) = (instr.op0_register(), instr.op1_register());
+                    if dst.is_gpr64() && src.is_gpr64() {
+                        (src.full_register(), cur_width, false)
+                    } else if dst.is_gpr32() && src.is_gpr32() {
+                        (src.full_register(), cur_width.min(32), false)
+                    } else {
+                        return None;
+                    }
+                }
+                Mnemonic::Movsxd
+                    if instr.op_count() == 2
+                        && instr.op0_kind() == OpKind::Register
+                        && instr.op1_kind() == OpKind::Register
+                        && instr.op0_register().is_gpr64()
+                        && instr.op1_register().is_gpr32() =>
+                {
+                    (
+                        instr.op1_register().full_register(),
+                        cur_width.min(32),
+                        cur_width > 32,
+                    )
+                }
+                Mnemonic::Cdqe if cur_reg == Register::RAX => {
+                    (Register::RAX, cur_width.min(32), cur_width > 32)
+                }
+                Mnemonic::Movzx
+                    if instr.op_count() == 2
+                        && instr.op0_kind() == OpKind::Register
+                        && instr.op1_kind() == OpKind::Register
+                        && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64())
+                        && !is_high_byte(instr.op1_register()) =>
+                {
+                    let src = instr.op1_register();
+                    (
+                        src.full_register(),
+                        cur_width.min(src.size() as u32 * 8),
+                        false,
+                    )
+                }
+                Mnemonic::Lea
+                    if instr.op_count() == 2
+                        && instr.op0_kind() == OpKind::Register
+                        && instr.op1_kind() == OpKind::Memory
+                        && !instr.is_ip_rel_memory_operand()
+                        && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64())
+                        && instr.memory_base().is_gpr64()
+                        && instr.memory_index() == Register::None
+                        && instr.memory_displacement64() == 0 =>
+                {
+                    let next_w = if instr.op0_register().is_gpr32() {
+                        cur_width.min(32)
+                    } else {
+                        cur_width
+                    };
+                    (instr.memory_base().full_register(), next_w, false)
+                }
                 _ => return None,
             };
-            return Some(max.min(mask(width)));
+            if (def_at + 1..branch_at).any(|k| self.writes(self.trace[k].instr, next_reg)) {
+                return None;
+            }
+            cur_reg = next_reg;
+            cur_width = next_width;
+            cur_pos = def_at;
+            sign_ext_32 |= needs_sext;
         }
         None
     }
@@ -699,5 +1713,845 @@ mod tests {
         assert!(json.contains("\"pdata\": {\"functions\": 1, \"ranges\": 1},"));
         assert!(json.contains("\"jump_tables\": {\"resolved\": 1, \"unresolved\": 0},"));
         assert!(json.contains("\"jump_table_entry\": 4"));
+    }
+
+    // ---- Extended MSVC x64 jump-table pattern tests ----
+
+    use iced_x86::code_asm::*;
+    use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, Register};
+
+    /// Emit `lea dst, [rip + (va - next_ip)]` in `CodeAssembler`.
+    fn lea_rip(a: &mut CodeAssembler, dst: Register, va: u64) -> Result<(), iced_x86::IcedError> {
+        let instr = Instruction::with2(
+            Code::Lea_r64_m,
+            dst,
+            MemoryOperand::with_base_displ(Register::RIP, va as i64),
+        )?;
+        a.add_instruction(instr)
+    }
+
+    /// Assemble `build` at `TEXT` and return the encoded bytes.
+    fn assemble_at_text(
+        build: impl FnOnce(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>,
+    ) -> Vec<u8> {
+        let mut a = CodeAssembler::new(64).expect("64-bit assembler");
+        build(&mut a).expect("assemble");
+        a.assemble(TEXT).expect("encode at TEXT")
+    }
+
+    /// Find the VA of the first indirect `jmp` in `code` (mapped at `TEXT`).
+    fn find_indirect_jmp(code: &[u8]) -> u64 {
+        let mut dec = Decoder::with_ip(64, code, TEXT, DecoderOptions::NONE);
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if instr.flow_control() == iced_x86::FlowControl::IndirectBranch {
+                return instr.ip();
+            }
+        }
+        panic!("no indirect jmp found");
+    }
+
+    /// Append 4 standard 6-byte case stubs (`mov eax, 0..=2; ret` and `xor eax, eax; ret`) to `a`
+    /// and return their offsets after assembly (caller extracts exact IPs via `find_case_ips`).
+    fn emit_four_cases(
+        a: &mut CodeAssembler,
+        c0: &mut CodeLabel,
+        c1: &mut CodeLabel,
+        c2: &mut CodeLabel,
+        def: &mut CodeLabel,
+    ) -> Result<(), iced_x86::IcedError> {
+        a.set_label(c0)?;
+        a.mov(eax, 0x10)?;
+        a.ret()?;
+        a.set_label(c1)?;
+        a.mov(eax, 0x11)?;
+        a.ret()?;
+        a.set_label(c2)?;
+        a.mov(eax, 0x12)?;
+        a.ret()?;
+        a.set_label(def)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        Ok(())
+    }
+
+    /// Locate the 4 case VAs emitted by `emit_four_cases` (trailing `mov eax, 0x10/0x11/0x12` and
+    /// `xor eax, eax`).
+    fn find_four_cases(code: &[u8]) -> [u64; 4] {
+        let mut dec = Decoder::with_ip(64, code, TEXT, DecoderOptions::NONE);
+        let mut found = [0u64; 4];
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if instr.mnemonic() == iced_x86::Mnemonic::Mov
+                && instr.op0_register() == iced_x86::Register::EAX
+                && let Ok(imm) = instr.try_immediate(1)
+            {
+                match imm {
+                    0x10 => found[0] = instr.ip(),
+                    0x11 => found[1] = instr.ip(),
+                    0x12 => found[2] = instr.ip(),
+                    _ => {}
+                }
+            } else if instr.mnemonic() == iced_x86::Mnemonic::Xor
+                && instr.op0_register() == iced_x86::Register::EAX
+                && instr.op1_register() == iced_x86::Register::EAX
+            {
+                found[3] = instr.ip();
+            }
+        }
+        assert!(
+            found.iter().all(|&va| va != 0),
+            "missing case stub: {found:#x?}"
+        );
+        found
+    }
+
+    #[test]
+    fn resolves_rva_table_with_predecessor_lea_copy_and_movsxd() {
+        // `lea r12, [__ImageBase]` in predecessor block, copied to `rdx`, loaded via `movsxd`,
+        // added back to `r12`.
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            lea_rip(a, Register::R12, BASE)?;
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.mov(rdx, r12)?;
+            a.movsxd(rax, ecx)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let data = rva_table(cases.map(|va| (va - BASE) as u32));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("predecessor lea + copy + movsxd resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            cases.map(Edge::JumpTable)
+        );
+    }
+
+    #[test]
+    fn resolves_rva_table_with_separate_table_lea_and_lea_target() {
+        // `lea rdx, [__ImageBase]; lea r8, [rdx + DATA_RVA]; mov eax, [r8 + rcx*4]; lea rax, [rdx + rax]; jmp rax`
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.mov(ecx, ecx)?; // zero-extend ecx -> rcx
+            lea_rip(a, Register::RDX, BASE)?;
+            a.lea(r8, ptr(rdx + DATA_RVA as i32))?;
+            a.mov(eax, dword_ptr(r8 + rcx * 4))?;
+            a.lea(rax, ptr(rdx + rax))?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let data = rva_table(cases.map(|va| (va - BASE) as u32));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("separate lea rTab + lea target resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+    }
+
+    #[test]
+    fn resolves_rva_table_with_nonvolatile_base_across_call() {
+        // `lea rbx, [__ImageBase]` preserved across `call helper` per Win64 ABI.
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def, mut helper) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            lea_rip(a, Register::RBX, BASE)?;
+            a.call(helper)?;
+            a.cmp(eax, 3)?;
+            a.ja(def)?;
+            a.movsxd(rcx, eax)?;
+            a.mov(eax, dword_ptr(rbx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rbx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            a.set_label(&mut helper)?;
+            a.mov(eax, 1)?;
+            a.ret()?;
+            Ok(())
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let fn_end = (cases[3] - TEXT + 3) as u32;
+        let data = rva_table(cases.map(|va| (va - BASE) as u32));
+        let analysis = analyze(
+            &code,
+            &data,
+            &[0],
+            &[(0, fn_end, 0), (fn_end, code.len() as u32, fn_end)],
+        );
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("non-volatile base across call resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+    }
+
+    #[test]
+    fn resolves_table_relative_signed_offset_switch() {
+        // `lea rdx, [rip + DATA]; movsxd rcx, dword ptr [rdx + rax*4]; add rcx, rdx; jmp rcx`
+        // Note: DATA > TEXT, so all 32-bit offsets are NEGATIVE!
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let data: Vec<u8> = cases
+            .iter()
+            .flat_map(|&va| {
+                let rel = (va as i64 - DATA as i64) as i32;
+                assert!(rel < 0, "expected negative table-relative offset");
+                rel.to_le_bytes()
+            })
+            .collect();
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("table-relative signed offset switch resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            cases.map(Edge::JumpTable)
+        );
+    }
+
+    #[test]
+    fn resolves_arbitrary_anchor_relative_signed_table() {
+        // `lea rdx, [rip + TEXT]` (section/function anchor, neither __ImageBase nor table_va),
+        // `movsxd rax, dword ptr [rdx + rcx*4 + (DATA - TEXT)]`, `add rax, rdx`, `jmp rax`.
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rcx, ecx)?;
+            lea_rip(a, Register::RDX, TEXT)?;
+            a.movsxd(rax, dword_ptr(rdx + rcx * 4 + (DATA - TEXT) as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let data: Vec<u8> = cases
+            .iter()
+            .flat_map(|&va| ((va - TEXT) as i32).to_le_bytes())
+            .collect();
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("anchor-relative table resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+    }
+
+    #[test]
+    fn resolves_absolute_64bit_pointer_table_register_and_memory_jmp() {
+        // Variant A: `lea rdx, [rip + DATA]; mov rax, qword ptr [rdx + rax*8]; jmp rax` (via discover)
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.mov(rax, qword_ptr(rdx + rax * 8))?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let data: Vec<u8> = cases.iter().flat_map(|&va| va.to_le_bytes()).collect();
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("64-bit pointer table via register jmp resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+
+        // Variant B: direct `jmp qword ptr [rdx + rax*8]` resolved via `jump_table::resolve`.
+        let code_mem = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.jmp(qword_ptr(rdx + rax * 8))?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_mem = find_four_cases(&code_mem);
+        let data_mem: Vec<u8> = cases_mem.iter().flat_map(|&va| va.to_le_bytes()).collect();
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code_mem, true),
+                CodeSection::new(DATA, &data_mem, false),
+            ],
+            vec![TEXT],
+        );
+        image.function_table = FunctionTable::new(vec![FunctionRange {
+            start: TEXT,
+            end: TEXT + code_mem.len() as u64,
+            function: TEXT,
+        }]);
+        let mut dec = Decoder::with_ip(64, &code_mem, TEXT, DecoderOptions::NONE);
+        let mut instrs = Vec::new();
+        while dec.can_decode() {
+            let i = dec.decode();
+            let is_jmp = i.flow_control() == iced_x86::FlowControl::IndirectBranch;
+            instrs.push(i);
+            if is_jmp {
+                break;
+            }
+        }
+        let steps: Vec<super::Step<'_>> = instrs
+            .iter()
+            .map(|instr| super::Step {
+                instr,
+                taken: (instr.flow_control() == iced_x86::FlowControl::ConditionalBranch)
+                    .then_some(false),
+            })
+            .collect();
+        let jt_mem = super::resolve(&image, &steps).expect("direct jmp [rdx+rax*8] resolved");
+        assert_eq!(jt_mem.site, instrs.last().unwrap().ip());
+        assert_eq!(jt_mem.load_site, jt_mem.site);
+        assert_eq!(jt_mem.table, DATA);
+        assert_eq!(jt_mem.targets, cases_mem);
+    }
+
+    #[test]
+    fn resolves_two_level_word_index_and_swapped_sib_byte_index() {
+        // Variant A: 16-bit word index table `[rdx + rax*2 + idx_rva]` -> 32-bit RVA table.
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movzx(eax, word_ptr(rdx + rax * 2 + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let mut data = rva_table(cases.map(|va| (va - BASE) as u32));
+        data.resize(0x20, 0xcc);
+        for idx in [0u16, 3, 1, 2, 3, 0] {
+            data.extend_from_slice(&idx.to_le_bytes());
+        }
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("two-level word index table resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+        let idx = jt.index.expect("word JumpTableIndex present");
+        assert_eq!(idx.table, DATA + 0x20);
+        assert_eq!(idx.len, 12); // 6 u16 entries = 12 bytes
+
+        // Variant B: Byte index table via `lea r8, [rip + idx_table]` with SWAPPED SIB `[rax + r8]`.
+        let code_swapped = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::R8, DATA + 0x20)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movzx(eax, byte_ptr(rax + r8))?; // swapped: index in base slot, table in index slot!
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_s = find_four_cases(&code_swapped);
+        let jmp_s = find_indirect_jmp(&code_swapped);
+        let mut data_s = rva_table(cases_s.map(|va| (va - BASE) as u32));
+        data_s.resize(0x20, 0xcc);
+        data_s.extend_from_slice(&[0, 1, 2, 3, 1, 0]);
+        let analysis_s = analyze(
+            &code_swapped,
+            &data_s,
+            &[0],
+            &[(0, code_swapped.len() as u32, 0)],
+        );
+        let jt_s = analysis_s
+            .jump_tables
+            .get(&jmp_s)
+            .expect("swapped SIB byte index table resolved");
+        assert_eq!(jt_s.targets, cases_s);
+        assert_eq!(jt_s.index.unwrap().table, DATA + 0x20);
+        assert_eq!(jt_s.index.unwrap().len, 6);
+    }
+
+    #[test]
+    fn resolves_and_power_of_two_bounds() {
+        // 32-bit `and ecx, 3` (no cmp/ja at all; also zero-extends rcx!).
+        let code32 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.and(ecx, 3)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases32 = find_four_cases(&code32);
+        let jmp32 = find_indirect_jmp(&code32);
+        let data32 = rva_table(cases32.map(|va| (va - BASE) as u32));
+        let analysis32 = analyze(&code32, &data32, &[0], &[(0, code32.len() as u32, 0)]);
+        assert_eq!(
+            analysis32
+                .jump_tables
+                .get(&jmp32)
+                .expect("32-bit `and` bound resolved")
+                .targets,
+            cases32
+        );
+
+        // 64-bit `and rcx, 3` (no cmp/ja at all).
+        let code64 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.and(rcx, 3)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases64 = find_four_cases(&code64);
+        let jmp64 = find_indirect_jmp(&code64);
+        let data64 = rva_table(cases64.map(|va| (va - BASE) as u32));
+        let analysis64 = analyze(&code64, &data64, &[0], &[(0, code64.len() as u32, 0)]);
+        assert_eq!(
+            analysis64
+                .jump_tables
+                .get(&jmp64)
+                .expect("64-bit `and` bound resolved")
+                .targets,
+            cases64
+        );
+    }
+
+    #[test]
+    fn resolves_sub_cmp_ja_and_signed_guards_in_predecessor_blocks() {
+        // 1) `sub ecx, 10; cmp ecx, 3; ja default` WITHOUT `movsxd` (relies on 32-bit `sub` zero-extending `rcx`).
+        let code_sub = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.sub(ecx, 10)?;
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sub = find_four_cases(&code_sub);
+        let jmp_sub = find_indirect_jmp(&code_sub);
+        let data_sub = rva_table(cases_sub.map(|va| (va - BASE) as u32));
+        let analysis_sub = analyze(&code_sub, &data_sub, &[0], &[(0, code_sub.len() as u32, 0)]);
+        assert_eq!(
+            analysis_sub
+                .jump_tables
+                .get(&jmp_sub)
+                .expect("sub + cmp + ja without movsxd resolved")
+                .targets,
+            cases_sub
+        );
+
+        // 2) Range check BEFORE `lea eax, [rcx - 10]`: `cmp ecx, 10; jb def; cmp ecx, 13; ja def; lea eax, [rcx - 10]`.
+        let code_range = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 10)?;
+            a.jb(def)?;
+            a.cmp(ecx, 13)?;
+            a.ja(def)?;
+            a.lea(eax, ptr(rcx - 10))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_range = find_four_cases(&code_range);
+        let jmp_range = find_indirect_jmp(&code_range);
+        let data_range = rva_table(cases_range.map(|va| (va - BASE) as u32));
+        let analysis_range = analyze(
+            &code_range,
+            &data_range,
+            &[0],
+            &[(0, code_range.len() as u32, 0)],
+        );
+        assert_eq!(
+            analysis_range
+                .jump_tables
+                .get(&jmp_range)
+                .expect("jb + ja + lea [rcx-10] resolved")
+                .targets,
+            cases_range
+        );
+
+        // 3) Signed `test + js + cmp + jg` in predecessor blocks.
+        let code_jg = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.test(ecx, ecx)?;
+            a.js(def)?;
+            a.cmp(ecx, 3)?;
+            a.jg(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_jg = find_four_cases(&code_jg);
+        let jmp_jg = find_indirect_jmp(&code_jg);
+        let data_jg = rva_table(cases_jg.map(|va| (va - BASE) as u32));
+        let analysis_jg = analyze(&code_jg, &data_jg, &[0], &[(0, code_jg.len() as u32, 0)]);
+        assert_eq!(
+            analysis_jg
+                .jump_tables
+                .get(&jmp_jg)
+                .expect("signed test+js+cmp+jg resolved")
+                .targets,
+            cases_jg
+        );
+
+        // 4) Signed `cmp ecx, 4; jge default` with `movsxd` scheduled BEFORE `cmp` + `jge`.
+        let code_jge = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movsxd(rax, ecx)?;
+            a.cmp(ecx, 4)?;
+            a.jge(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_jge = find_four_cases(&code_jge);
+        let jmp_jge = find_indirect_jmp(&code_jge);
+        let data_jge = rva_table(cases_jge.map(|va| (va - BASE) as u32));
+        let analysis_jge = analyze(&code_jge, &data_jge, &[0], &[(0, code_jge.len() as u32, 0)]);
+        assert_eq!(
+            analysis_jge
+                .jump_tables
+                .get(&jmp_jge)
+                .expect("movsxd before cmp+jge resolved")
+                .targets,
+            cases_jge
+        );
+
+        // 5) Pre-scaled index (`shl rax, 2`) + pre-computed element pointer (`lea rcx, [rdx + rax + table_rva]`).
+        let code_prescaled = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            a.shl(rax, 2)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.lea(rcx, ptr(rdx + rax + DATA_RVA as i32))?;
+            a.mov(eax, dword_ptr(rcx))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_ps = find_four_cases(&code_prescaled);
+        let jmp_ps = find_indirect_jmp(&code_prescaled);
+        let data_ps = rva_table(cases_ps.map(|va| (va - BASE) as u32));
+        let analysis_ps = analyze(
+            &code_prescaled,
+            &data_ps,
+            &[0],
+            &[(0, code_prescaled.len() as u32, 0)],
+        );
+        assert_eq!(
+            analysis_ps
+                .jump_tables
+                .get(&jmp_ps)
+                .expect("pre-scaled shl + lea ptr resolved")
+                .targets,
+            cases_ps
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_and_invalid_extended_patterns() {
+        // 1) Unguarded `sub` after upper-only check (`ecx` could be < 10 and wrap!).
+        let code_wrap = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 13)?;
+            a.ja(def)?;
+            a.sub(ecx, 10)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_wrap = find_four_cases(&code_wrap);
+        let jmp_wrap = (find_indirect_jmp(&code_wrap) - TEXT) as u32;
+        let data_wrap = rva_table(cases_wrap.map(|va| (va - BASE) as u32));
+        assert_unresolved(
+            &analyze(
+                &code_wrap,
+                &data_wrap,
+                &[0],
+                &[(0, code_wrap.len() as u32, 0)],
+            ),
+            jmp_wrap,
+        );
+
+        // 2) Negative signed upper bound (`cmp ecx, -1; jg default`).
+        let code_neg = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, -1)?;
+            a.jg(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_neg = find_four_cases(&code_neg);
+        let jmp_neg = (find_indirect_jmp(&code_neg) - TEXT) as u32;
+        let data_neg = rva_table(cases_neg.map(|va| (va - BASE) as u32));
+        assert_unresolved(
+            &analyze(&code_neg, &data_neg, &[0], &[(0, code_neg.len() as u32, 0)]),
+            jmp_neg,
+        );
+
+        // 3) Volatile base register (`rdx`) clobbered by `call` before jump-table lookup.
+        let code_clobber = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def, mut helper) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            lea_rip(a, Register::RDX, BASE)?;
+            a.call(helper)?;
+            a.cmp(eax, 3)?;
+            a.ja(def)?;
+            a.movsxd(rcx, eax)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            a.set_label(&mut helper)?;
+            a.mov(eax, 1)?;
+            a.ret()?;
+            Ok(())
+        });
+        let cases_cl = find_four_cases(&code_clobber);
+        let jmp_cl = (find_indirect_jmp(&code_clobber) - TEXT) as u32;
+        let data_cl = rva_table(cases_cl.map(|va| (va - BASE) as u32));
+        assert_unresolved(&analyze(&code_clobber, &data_cl, &[0], &[]), jmp_cl);
+
+        // 4) Table-relative signed offset pointing outside the containing `.pdata` function.
+        let code_rel = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_rel = find_four_cases(&code_rel);
+        let jmp_rel = (find_indirect_jmp(&code_rel) - TEXT) as u32;
+        let data_rel: Vec<u8> = cases_rel
+            .iter()
+            .flat_map(|&va| ((va as i64 - DATA as i64) as i32).to_le_bytes())
+            .collect();
+        let def_off = (cases_rel[3] - TEXT) as u32;
+        assert_unresolved(
+            &analyze(
+                &code_rel,
+                &data_rel,
+                &[0],
+                &[(0, def_off, 0), (def_off, code_rel.len() as u32, def_off)],
+            ),
+            jmp_rel,
+        );
+
+        // 5) Absolute 64-bit pointer table with a non-code target in `.rdata`.
+        let code_abs = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.mov(rax, qword_ptr(rdx + rax * 8))?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let mut cases_abs = find_four_cases(&code_abs);
+        cases_abs[2] = DATA + 0x20; // non-executable data target
+        let jmp_abs = (find_indirect_jmp(&code_abs) - TEXT) as u32;
+        let mut data_abs: Vec<u8> = cases_abs.iter().flat_map(|&va| va.to_le_bytes()).collect();
+        data_abs.resize(0x30, 0);
+        assert_unresolved(&analyze(&code_abs, &data_abs, &[0], &[]), jmp_abs);
+
+        // 6) `and ecx, 7` when entries 4..7 point into data (out-of-code targets must reject all).
+        let code_and = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.and(ecx, 7)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_and = find_four_cases(&code_and);
+        let jmp_and = (find_indirect_jmp(&code_and) - TEXT) as u32;
+        let mut data_and = rva_table(cases_and.map(|va| (va - BASE) as u32));
+        data_and.extend_from_slice(&rva_table([DATA_RVA; 4]));
+        assert_unresolved(&analyze(&code_and, &data_and, &[0], &[]), jmp_and);
     }
 }
