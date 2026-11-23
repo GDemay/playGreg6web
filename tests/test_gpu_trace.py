@@ -1276,6 +1276,34 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertTrue(frame.complete)
         self.assertEqual(frame.draw_calls, 1)
         self.assertEqual(frame.compute_passes, 1)
+        self.assertEqual(frame.begin_render_passes, 1)
+        self.assertEqual(frame.end_render_passes, 1)
+        self.assertEqual(frame.viewport_changes, 1)
+        self.assertEqual(frame.scissor_changes, 1)
+        self.assertEqual(frame.blend_constant_changes, 1)
+        self.assertEqual(frame.stencil_ref_changes, 1)
+        self.assertEqual(frame.color_load_ops, {"clear": 1, "load": 1})
+        self.assertEqual(frame.color_store_ops, {"store": 1, "discard": 1})
+        self.assertEqual(frame.depth_load_ops, {"clear": 1})
+        self.assertEqual(frame.depth_store_ops, {"store": 1})
+
+        # Trace-level ABI v2 aggregates (setup frame + present frame).
+        self.assertEqual(trace.begin_render_passes, 1)
+        self.assertEqual(trace.end_render_passes, 1)
+        self.assertEqual(trace.bind_group_layouts_created, 2)
+        self.assertEqual(trace.pipeline_layouts_created, 1)
+        self.assertEqual(trace.render_pipelines2_created, 1)
+        self.assertEqual(trace.compute_pipelines2_created, 1)
+        self.assertEqual(trace.viewport_changes, 1)
+        self.assertEqual(trace.scissor_changes, 1)
+        self.assertEqual(trace.blend_constant_changes, 1)
+        self.assertEqual(trace.stencil_ref_changes, 1)
+        self.assertEqual(trace.malformed_v2_packets, 0)
+        self.assertEqual(trace.truncated_v2_diagnostics, 0)
+        self.assertEqual(
+            set(p.opcode for p in trace.packets if 22 <= p.opcode <= 34),
+            set(range(22, 35)),
+        )
 
         text = gpu_trace.format_trace_text(trace)
         self.assertIn("BeginRenderPass", text)
@@ -1288,7 +1316,15 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertIn("manifest-ref", text)
         self.assertIn("dynamic_offsets=[512]", text)
         self.assertIn("compare=less-equal", text)
-        json.loads(gpu_trace.trace_to_json(trace))
+        self.assertIn("RenderPasses: begin=1 end=1", text)
+        self.assertIn("Layouts: bgl=2 pll=1", text)
+        self.assertIn("Dynamic: vp=1 scissor=1 blend=1 stencil=1", text)
+        self.assertIn("ColorLoadOps: clear=1, load=1", text)
+        parsed = json.loads(gpu_trace.trace_to_json(trace, stats_only=True))
+        self.assertEqual(parsed["begin_render_passes"], 1)
+        self.assertEqual(parsed["render_pipelines2_created"], 1)
+        self.assertEqual(parsed["viewport_changes"], 1)
+        self.assertEqual(parsed["malformed_v2_packets"], 0)
 
     def test_v2_malformed_packets(self) -> None:
         # Truncated layout tail, short BeginRenderPass, unknown enum codes, oversize color_count.
@@ -1319,15 +1355,37 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(lenient.packets[0].fields["trailing_bytes"], 4)
         self.assertFalse(gpu_trace.decode_stream(padded, strict=True).ok)
 
+        self.assertGreaterEqual(trace.malformed_v2_packets, 2)
+        self.assertGreaterEqual(trace.truncated_v2_diagnostics, 2)
+        self.assertEqual(trace.frames[0].malformed_v2_packets, trace.malformed_v2_packets)
+
+        # Truncated mid-stream v2 header/payload (BeginRenderPass claims 368B, only 8 follow).
+        trunc_hdr = struct.pack("<HHI", gpu_trace.GpuOpcode.BeginRenderPass, 0, 368) + b"\x00" * 8
+        trunc_trace = gpu_trace.decode_stream(trunc_hdr)
+        self.assertFalse(trunc_trace.ok)
+        self.assertEqual(trunc_trace.packet_count, 0)
+        self.assertEqual(trunc_trace.diagnostics[0].code, "truncated_payload")
+        self.assertEqual(trunc_trace.truncated_v2_diagnostics, 1)
+
     def test_state_bridge_fixture_disassembles_strictly(self) -> None:
         # Packet stream recorded by runtime/gpu/state_bridge (tests/test_state_bridge.cpp).
-        hex_text = (REPO_ROOT / "tests" / "fixtures" / "state_bridge_frame.hex").read_text(encoding="utf-8")
+        fixture = REPO_ROOT / "tests" / "fixtures" / "state_bridge_frame.hex"
+        if not fixture.is_file():
+            self.skipTest("state_bridge_frame.hex fixture not present")
+        hex_text = fixture.read_text(encoding="utf-8")
         trace = gpu_trace.decode_stream(bytes.fromhex("".join(hex_text.split())), strict=True)
         self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
         self.assertEqual(trace.packet_count, 27)
         self.assertEqual(trace.draw_calls, 2)
         self.assertEqual(trace.opcode_histogram["BeginRenderPass"], 2)
         self.assertEqual(trace.opcode_histogram["EndRenderPass"], 2)
+        self.assertEqual(trace.begin_render_passes, 2)
+        self.assertEqual(trace.end_render_passes, 2)
+        self.assertEqual(trace.render_pipelines2_created, 2)
+        self.assertGreaterEqual(trace.viewport_changes, 1)
+        self.assertGreaterEqual(trace.scissor_changes, 1)
+        self.assertEqual(trace.malformed_v2_packets, 0)
+        self.assertEqual(trace.truncated_v2_diagnostics, 0)
         first_pass = trace.packets[0].fields
         self.assertTrue(first_pass["color_attachments"][0]["swapchain"])
         self.assertEqual(first_pass["depth_stencil"]["view"]["format"], "depth32float")
@@ -1336,6 +1394,51 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(pipelines[0].fields["key"]["color_targets"][0]["format"], "bgra8unorm")
         set_groups = [p.fields["dynamic_offsets"] for p in trace.packets if p.name == "SetBindGroup2"]
         self.assertEqual(set_groups, [[0], [256]])
+        stats = json.loads(gpu_trace.trace_to_json(trace, stats_only=True))
+        self.assertEqual(stats["begin_render_passes"], 2)
+        self.assertIn("clear", stats["color_load_ops"] or stats["depth_load_ops"])
+
+    def test_every_v2_opcode_22_through_34_encodes_and_decodes(self) -> None:
+        """Synthetic coverage for each ABI v2 opcode payload size and typed fields."""
+        key = build_render_pipeline_key()
+        packets = {
+            22: gpu_trace.encode_create_bind_group_layout(1, [(0, 0x1, 0, 0)], content_id=7),
+            23: gpu_trace.encode_create_pipeline_layout(2, [1, 0], content_id=8),
+            24: gpu_trace.encode_create_render_pipeline2(3, 10, 11, 2, key),
+            25: gpu_trace.encode_create_compute_pipeline2(4, 12, 2, cs_shader=9),
+            26: gpu_trace.encode_begin_render_pass(
+                [{"texture_id": 1, "load_op": 1, "store_op": 1}],
+                {"texture_id": 2, "depth_load_op": 2, "depth_store_op": 1},
+            ),
+            27: gpu_trace.encode_end_render_pass(),
+            28: gpu_trace.encode_set_viewport(0, 0, 64, 64),
+            29: gpu_trace.encode_set_scissor_rect(1, 2, 3, 4),
+            30: gpu_trace.encode_set_blend_constant(0.1, 0.2, 0.3, 0.4),
+            31: gpu_trace.encode_set_stencil_reference(7),
+            32: gpu_trace.encode_create_bind_group2(
+                5, 1, [(0, gpu_trace.GpuBindResourceType.Buffer, 9, 0, 16)]
+            ),
+            33: gpu_trace.encode_set_bind_group2(0, 5, [32]),
+            34: gpu_trace.encode_create_sampler2(6),
+        }
+        self.assertEqual(sorted(packets), list(range(22, 35)))
+        stream = b"".join(packets[op] for op in range(22, 35))
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+        self.assertEqual([p.opcode for p in trace.packets], list(range(22, 35)))
+        self.assertEqual(trace.begin_render_passes, 1)
+        self.assertEqual(trace.end_render_passes, 1)
+        self.assertEqual(trace.bind_group_layouts_created, 1)
+        self.assertEqual(trace.pipeline_layouts_created, 1)
+        self.assertEqual(trace.render_pipelines2_created, 1)
+        self.assertEqual(trace.compute_pipelines2_created, 1)
+        self.assertEqual(trace.viewport_changes, 1)
+        self.assertEqual(trace.scissor_changes, 1)
+        self.assertEqual(trace.blend_constant_changes, 1)
+        self.assertEqual(trace.stencil_ref_changes, 1)
+        self.assertEqual(trace.packets[11].fields["dynamic_offsets"], [32])
+        self.assertEqual(trace.color_load_ops, {"load": 1})
+        self.assertEqual(trace.depth_load_ops, {"clear": 1})
 
     def test_encoder_rejects_wrong_key_size(self) -> None:
         with self.assertRaises(ValueError):
