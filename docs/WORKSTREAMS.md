@@ -22,7 +22,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Parse PE64 `IMAGE_DIRECTORY_ENTRY_EXCEPTION` (`RUNTIME_FUNCTION` begin/end/unwind RVA) and `UNWIND_INFO` to recover exact function boundaries and switch/jump tables without heuristics.
 - [ ] **R5 — Import Thunk & Runtime Call-Bridge Generator** — `IN PROGRESS` (#39, @Timon-ok) *(no game files required — disjoint file `recomp/src/stubs.rs`)*
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
-- [ ] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `IN PROGRESS` (#40, @Timon-ok) *(no game files required — disjoint file `recomp/src/image.rs`)*
+- [x] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `DONE` (PR #78, closes #40) *(no game files required — disjoint file `recomp/src/image.rs`)*
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
 
 ---
@@ -44,7 +44,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement `CreateSemaphoreW`/`ReleaseSemaphore`, `CreateMutexW`/`ReleaseMutex`, `WaitForMultipleObjects` (`bWaitAll` true/false), `SleepConditionVariableSRW`/`WakeConditionVariable`/`WakeAllConditionVariable`, and `CreateThread`/`SetThreadAffinityMask`/`GetCurrentThreadId`.
 - [ ] **O7 — Win32 Heap, Module Registry & `GetProcAddress` Resolver** — `IN PROGRESS` (#42, @Timon-ok) *(no game files required — disjoint files `runtime/os/win32_loader.{h,cpp}`, `tests/test_win32_loader.cpp`)*
   - Implement `GetProcessHeap`/`HeapCreate`/`HeapAlloc`/`HeapReAlloc`/`HeapFree`/`HeapSize`, `GetModuleHandleW`/`LoadLibraryW`, and a dynamic `GetProcAddress` symbol registry mapping DLL + export names to registered runtime shims.
-- [ ] **O8 — Offline Networking, Telemetry & Xbox Live Safe Stubs** — `IN PROGRESS` (#43, @Timon-ok) *(no game files required — disjoint files `runtime/os/xbox_offline.{h,cpp}`, `tests/test_xbox_offline.cpp`)*
+- [x] **O8 — Offline Networking, Telemetry & Xbox Live Safe Stubs** — `DONE` (PR #77, closes #43) *(no game files required — disjoint files `runtime/os/xbox_offline.{h,cpp}`, `tests/test_xbox_offline.cpp`)*
   - Implement clean offline-mode stubs for `ws2_32` (`WSAStartup`, `socket`, `getaddrinfo` → offline), `winhttp`, and Xbox Live (`XblInitialize`, `XblContextCreateHandle`, `XStore*`) so single-player boot never blocks on online services.
 
 ---
