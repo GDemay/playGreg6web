@@ -2,8 +2,8 @@
 """Binary GPU command stream disassembler and frame trace inspector for playgta6web.
 
 Matches the frozen ABI v1 packet layout in `runtime/abi/playgta6_abi.h` and
-`docs/gpu_commands.md` (opcodes 0..11 plus forward-compatible handling of
-unknown/future opcodes >= 12).
+`docs/gpu_commands.md` (opcodes 0..21 plus forward-compatible handling of
+unknown/future opcodes >= 22).
 
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
@@ -39,6 +39,17 @@ CREATE_RENDER_PIPELINE_STRUCT = struct.Struct("<IIIIII")  # 24 bytes
 SET_PIPELINE_STRUCT = struct.Struct("<I")  # 4 bytes
 SET_VERTEX_BUFFER_STRUCT = struct.Struct("<IIQ")  # 16 bytes
 DESTROY_RESOURCE_STRUCT = struct.Struct("<I")  # 4 bytes
+CREATE_TEXTURE_STRUCT = struct.Struct("<IIIIIIII")  # 32 bytes
+WRITE_TEXTURE_STRUCT = struct.Struct("<IIIIIIIIIIII")  # 48 bytes + data_len
+CREATE_SAMPLER_STRUCT = struct.Struct("<IIIIIIII")  # 32 bytes
+BIND_GROUP_ENTRY_STRUCT = struct.Struct("<IIIIQQ")  # 32 bytes
+CREATE_BIND_GROUP_STRUCT = struct.Struct("<IIII")  # 16 bytes + entry_count * 32
+SET_BIND_GROUP_STRUCT = struct.Struct("<II")  # 8 bytes
+SET_INDEX_BUFFER_STRUCT = struct.Struct("<IIQ")  # 16 bytes
+DRAW_INDEXED_STRUCT = struct.Struct("<IIIiI")  # 20 bytes
+CREATE_COMPUTE_PIPELINE_STRUCT = struct.Struct("<IIII")  # 16 bytes
+SET_COMPUTE_PIPELINE_STRUCT = struct.Struct("<I")  # 4 bytes
+DISPATCH_COMPUTE_STRUCT = struct.Struct("<III")  # 12 bytes
 
 DEFAULT_PREVIEW_BYTES = 16
 
@@ -62,6 +73,65 @@ class GpuOpcode(IntEnum):
     SetPipeline = 9
     SetVertexBuffer = 10
     DestroyResource = 11
+    CreateTexture = 12
+    WriteTexture = 13
+    CreateSampler = 14
+    CreateBindGroup = 15
+    SetBindGroup = 16
+    SetIndexBuffer = 17
+    DrawIndexed = 18
+    CreateComputePipeline = 19
+    SetComputePipeline = 20
+    DispatchCompute = 21
+
+
+class GpuTextureFormat(IntEnum):
+    """Texture format enum from runtime/abi/playgta6_abi.h."""
+
+    Rgba8Unorm = 0
+    Bgra8Unorm = 1
+    Rgba16Float = 2
+    Depth24Plus = 3
+    Depth32Float = 4
+    Bc7RgbaUnorm = 5
+
+
+class GpuTextureDimension(IntEnum):
+    """Texture dimension enum from runtime/abi/playgta6_abi.h."""
+
+    Dim1D = 0
+    Dim2D = 1
+    Dim3D = 2
+
+
+class GpuAddressMode(IntEnum):
+    """Sampler address mode enum from runtime/abi/playgta6_abi.h."""
+
+    ClampToEdge = 0
+    Repeat = 1
+    MirrorRepeat = 2
+
+
+class GpuFilterMode(IntEnum):
+    """Sampler filter mode enum from runtime/abi/playgta6_abi.h."""
+
+    Nearest = 0
+    Linear = 1
+
+
+class GpuBindResourceType(IntEnum):
+    """Bind group entry resource type enum from runtime/abi/playgta6_abi.h."""
+
+    Buffer = 0
+    TextureView = 1
+    Sampler = 2
+
+
+class GpuIndexFormat(IntEnum):
+    """Index buffer format enum from runtime/abi/playgta6_abi.h."""
+
+    Uint16 = 0
+    Uint32 = 1
 
 
 class GpuShaderStage(IntEnum):
@@ -81,6 +151,37 @@ class GpuPrimitiveTopology(IntEnum):
     LineStrip = 3
     PointList = 4
 
+
+TEXTURE_FORMAT_WEBGPU_NAMES: dict[int, str] = {
+    GpuTextureFormat.Rgba8Unorm: "rgba8unorm",
+    GpuTextureFormat.Bgra8Unorm: "bgra8unorm",
+    GpuTextureFormat.Rgba16Float: "rgba16float",
+    GpuTextureFormat.Depth24Plus: "depth24plus",
+    GpuTextureFormat.Depth32Float: "depth32float",
+    GpuTextureFormat.Bc7RgbaUnorm: "bc7-rgba-unorm",
+}
+
+TEXTURE_DIMENSION_WEBGPU_NAMES: dict[int, str] = {
+    GpuTextureDimension.Dim1D: "1d",
+    GpuTextureDimension.Dim2D: "2d",
+    GpuTextureDimension.Dim3D: "3d",
+}
+
+ADDRESS_MODE_WEBGPU_NAMES: dict[int, str] = {
+    GpuAddressMode.ClampToEdge: "clamp-to-edge",
+    GpuAddressMode.Repeat: "repeat",
+    GpuAddressMode.MirrorRepeat: "mirror-repeat",
+}
+
+FILTER_MODE_WEBGPU_NAMES: dict[int, str] = {
+    GpuFilterMode.Nearest: "nearest",
+    GpuFilterMode.Linear: "linear",
+}
+
+INDEX_FORMAT_WEBGPU_NAMES: dict[int, str] = {
+    GpuIndexFormat.Uint16: "uint16",
+    GpuIndexFormat.Uint32: "uint32",
+}
 
 TOPOLOGY_WEBGPU_NAMES: dict[int, str] = {
     GpuPrimitiveTopology.TriangleList: "triangle-list",
@@ -112,6 +213,18 @@ BUFFER_USAGE_FLAGS: tuple[tuple[int, str], ...] = (
 BUFFER_USAGE_KNOWN_MASK = 0
 for _bit, _name in BUFFER_USAGE_FLAGS:
     BUFFER_USAGE_KNOWN_MASK |= _bit
+
+TEXTURE_USAGE_FLAGS: tuple[tuple[int, str], ...] = (
+    (0x0001, "COPY_SRC"),
+    (0x0002, "COPY_DST"),
+    (0x0004, "TEXTURE_BINDING"),
+    (0x0008, "STORAGE_BINDING"),
+    (0x0010, "RENDER_ATTACHMENT"),
+)
+
+TEXTURE_USAGE_KNOWN_MASK = 0
+for _bit, _name in TEXTURE_USAGE_FLAGS:
+    TEXTURE_USAGE_KNOWN_MASK |= _bit
 
 OPCODE_NAMES: dict[int, str] = {op.value: op.name for op in GpuOpcode}
 
@@ -154,6 +267,68 @@ def decode_primitive_topology(topology: int) -> tuple[str, str | None, bool]:
         return enum_val.name, TOPOLOGY_WEBGPU_NAMES[enum_val], True
     except ValueError:
         return f"Unknown({topology})", None, False
+
+
+def decode_texture_usage(usage_flags: int) -> tuple[list[str], int]:
+    """Decode GPUTextureUsage bitmask into ordered flag names and unknown bits."""
+    names = [name for bit, name in TEXTURE_USAGE_FLAGS if usage_flags & bit]
+    unknown_bits = usage_flags & ~TEXTURE_USAGE_KNOWN_MASK
+    if unknown_bits:
+        names.append(f"UNKNOWN(0x{unknown_bits:x})")
+    return names, unknown_bits
+
+
+def decode_texture_format(texture_format: int) -> tuple[str, str | None, bool]:
+    """Return (enum_name, webgpu_name_or_none, is_known) for GpuTextureFormat."""
+    try:
+        enum_val = GpuTextureFormat(texture_format)
+        return enum_val.name, TEXTURE_FORMAT_WEBGPU_NAMES[enum_val], True
+    except ValueError:
+        return f"Unknown({texture_format})", None, False
+
+
+def decode_texture_dimension(dimension: int) -> tuple[str, str | None, bool]:
+    """Return (enum_name, webgpu_name_or_none, is_known) for GpuTextureDimension."""
+    try:
+        enum_val = GpuTextureDimension(dimension)
+        return enum_val.name, TEXTURE_DIMENSION_WEBGPU_NAMES[enum_val], True
+    except ValueError:
+        return f"Unknown({dimension})", None, False
+
+
+def decode_address_mode(mode: int) -> tuple[str, str | None, bool]:
+    """Return (enum_name, webgpu_name_or_none, is_known) for GpuAddressMode."""
+    try:
+        enum_val = GpuAddressMode(mode)
+        return enum_val.name, ADDRESS_MODE_WEBGPU_NAMES[enum_val], True
+    except ValueError:
+        return f"Unknown({mode})", None, False
+
+
+def decode_filter_mode(mode: int) -> tuple[str, str | None, bool]:
+    """Return (enum_name, webgpu_name_or_none, is_known) for GpuFilterMode."""
+    try:
+        enum_val = GpuFilterMode(mode)
+        return enum_val.name, FILTER_MODE_WEBGPU_NAMES[enum_val], True
+    except ValueError:
+        return f"Unknown({mode})", None, False
+
+
+def decode_bind_resource_type(resource_type: int) -> tuple[str, bool]:
+    """Return (enum_name, is_known) for GpuBindResourceType."""
+    try:
+        return GpuBindResourceType(resource_type).name, True
+    except ValueError:
+        return f"Unknown({resource_type})", False
+
+
+def decode_index_format(index_format: int) -> tuple[str, str | None, bool]:
+    """Return (enum_name, webgpu_name_or_none, is_known) for GpuIndexFormat."""
+    try:
+        enum_val = GpuIndexFormat(index_format)
+        return enum_val.name, INDEX_FORMAT_WEBGPU_NAMES[enum_val], True
+    except ValueError:
+        return f"Unknown({index_format})", None, False
 
 
 def _format_preview(data: bytes | memoryview, preview_bytes: int) -> dict[str, Any]:
@@ -219,6 +394,18 @@ class DecodedPacket:
 
 
 @dataclass(frozen=True)
+class BindGroupEntry:
+    """Single resource binding entry for CreateBindGroup (32 bytes)."""
+
+    binding: int
+    resource_type: int | GpuBindResourceType
+    resource_id: int
+    offset: int = 0
+    size: int = 0
+    reserved: int = 0
+
+
+@dataclass(frozen=True)
 class FrameSummary:
     """Summary of packets grouped into a frame (BeginFrame..Present)."""
 
@@ -231,6 +418,11 @@ class FrameSummary:
     opcode_histogram: dict[str, int]
     complete: bool
     has_begin_frame: bool
+    draw_indexed_calls: int = 0
+    compute_dispatches: int = 0
+    compute_passes: int = 0
+    textures_created: int = 0
+    bind_groups_created: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -239,6 +431,11 @@ class FrameSummary:
             "end_packet_index": self.end_packet_index,
             "packet_count": self.packet_count,
             "draw_calls": self.draw_calls,
+            "draw_indexed_calls": self.draw_indexed_calls,
+            "compute_dispatches": self.compute_dispatches,
+            "compute_passes": self.compute_passes,
+            "textures_created": self.textures_created,
+            "bind_groups_created": self.bind_groups_created,
             "bytes": self.bytes,
             "opcode_histogram": self.opcode_histogram,
             "complete": self.complete,
@@ -269,7 +466,31 @@ class DecodedTrace:
 
     @property
     def draw_calls(self) -> int:
-        return sum(1 for p in self.packets if p.opcode == GpuOpcode.Draw and p.valid)
+        return sum(
+            1
+            for p in self.packets
+            if p.opcode in (GpuOpcode.Draw, GpuOpcode.DrawIndexed) and p.valid
+        )
+
+    @property
+    def draw_indexed_calls(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DrawIndexed and p.valid)
+
+    @property
+    def compute_dispatches(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DispatchCompute and p.valid)
+
+    @property
+    def compute_passes(self) -> int:
+        return sum(f.compute_passes for f in self.frames)
+
+    @property
+    def textures_created(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.CreateTexture and p.valid)
+
+    @property
+    def bind_groups_created(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.CreateBindGroup and p.valid)
 
     @property
     def unknown_opcode_count(self) -> int:
@@ -299,6 +520,11 @@ class DecodedTrace:
             "packet_count": self.packet_count,
             "frame_count": self.frame_count,
             "draw_calls": self.draw_calls,
+            "draw_indexed_calls": self.draw_indexed_calls,
+            "compute_dispatches": self.compute_dispatches,
+            "compute_passes": self.compute_passes,
+            "textures_created": self.textures_created,
+            "bind_groups_created": self.bind_groups_created,
             "unknown_opcode_count": self.unknown_opcode_count,
             "opcode_histogram": dict(self.opcode_histogram),
             "frames": [frame.to_dict() for frame in self.frames],
@@ -457,6 +683,238 @@ def encode_destroy_resource(resource_id: int, flags: int = 0) -> bytes:
     )
 
 
+def encode_create_texture(
+    resource_id: int,
+    width: int,
+    height: int,
+    depth_or_layers: int = 1,
+    mip_levels: int = 1,
+    texture_format: int | GpuTextureFormat = GpuTextureFormat.Rgba8Unorm,
+    usage_flags: int = 0,
+    dimension: int | GpuTextureDimension = GpuTextureDimension.Dim2D,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.CreateTexture,
+        CREATE_TEXTURE_STRUCT.pack(
+            resource_id,
+            width,
+            height,
+            depth_or_layers,
+            mip_levels,
+            int(texture_format),
+            usage_flags,
+            int(dimension),
+        ),
+        flags=flags,
+    )
+
+
+def encode_write_texture(
+    texture_id: int,
+    width: int,
+    height: int,
+    data: bytes | bytearray | memoryview,
+    *,
+    mip_level: int = 0,
+    origin_x: int = 0,
+    origin_y: int = 0,
+    origin_z: int = 0,
+    depth_or_layers: int = 1,
+    bytes_per_row: int = 0,
+    rows_per_image: int = 0,
+    reserved: int = 0,
+    flags: int = 0,
+) -> bytes:
+    raw = bytes(data)
+    head = WRITE_TEXTURE_STRUCT.pack(
+        texture_id,
+        mip_level,
+        origin_x,
+        origin_y,
+        origin_z,
+        width,
+        height,
+        depth_or_layers,
+        bytes_per_row,
+        rows_per_image,
+        len(raw),
+        reserved,
+    )
+    return encode_packet(GpuOpcode.WriteTexture, head + raw, flags=flags)
+
+
+def encode_create_sampler(
+    resource_id: int,
+    address_u: int | GpuAddressMode = GpuAddressMode.ClampToEdge,
+    address_v: int | GpuAddressMode = GpuAddressMode.ClampToEdge,
+    address_w: int | GpuAddressMode = GpuAddressMode.ClampToEdge,
+    mag_filter: int | GpuFilterMode = GpuFilterMode.Linear,
+    min_filter: int | GpuFilterMode = GpuFilterMode.Linear,
+    mipmap_filter: int | GpuFilterMode = GpuFilterMode.Nearest,
+    max_anisotropy: int = 1,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.CreateSampler,
+        CREATE_SAMPLER_STRUCT.pack(
+            resource_id,
+            int(address_u),
+            int(address_v),
+            int(address_w),
+            int(mag_filter),
+            int(min_filter),
+            int(mipmap_filter),
+            max_anisotropy,
+        ),
+        flags=flags,
+    )
+
+
+def encode_bind_group_entry(
+    binding: int,
+    resource_type: int | GpuBindResourceType,
+    resource_id: int,
+    offset: int = 0,
+    size: int = 0,
+    reserved: int = 0,
+) -> bytes:
+    return BIND_GROUP_ENTRY_STRUCT.pack(
+        binding,
+        int(resource_type),
+        resource_id,
+        reserved,
+        offset,
+        size,
+    )
+
+
+def encode_create_bind_group(
+    resource_id: int,
+    pipeline_id: int,
+    group_index: int,
+    entries: Sequence[BindGroupEntry | dict[str, Any] | bytes | bytearray | memoryview],
+    *,
+    flags: int = 0,
+) -> bytes:
+    packed_entries: list[bytes] = []
+    for entry in entries:
+        if isinstance(entry, BindGroupEntry):
+            packed_entries.append(
+                encode_bind_group_entry(
+                    binding=entry.binding,
+                    resource_type=entry.resource_type,
+                    resource_id=entry.resource_id,
+                    offset=entry.offset,
+                    size=entry.size,
+                    reserved=entry.reserved,
+                )
+            )
+        elif isinstance(entry, dict):
+            packed_entries.append(
+                encode_bind_group_entry(
+                    binding=entry["binding"],
+                    resource_type=entry["resource_type"],
+                    resource_id=entry["resource_id"],
+                    offset=entry.get("offset", 0),
+                    size=entry.get("size", 0),
+                    reserved=entry.get("reserved", 0),
+                )
+            )
+        else:
+            raw_entry = bytes(entry)
+            if len(raw_entry) != BIND_GROUP_ENTRY_STRUCT.size:
+                raise ValueError(
+                    f"Raw bind group entry must be {BIND_GROUP_ENTRY_STRUCT.size} bytes, "
+                    f"got {len(raw_entry)}"
+                )
+            packed_entries.append(raw_entry)
+    head = CREATE_BIND_GROUP_STRUCT.pack(resource_id, pipeline_id, group_index, len(packed_entries))
+    return encode_packet(GpuOpcode.CreateBindGroup, head + b"".join(packed_entries), flags=flags)
+
+
+def encode_set_bind_group(
+    group_index: int,
+    bind_group_id: int,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetBindGroup,
+        SET_BIND_GROUP_STRUCT.pack(group_index, bind_group_id),
+        flags=flags,
+    )
+
+
+def encode_set_index_buffer(
+    buffer_id: int,
+    index_format: int | GpuIndexFormat = GpuIndexFormat.Uint16,
+    offset: int = 0,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetIndexBuffer,
+        SET_INDEX_BUFFER_STRUCT.pack(buffer_id, int(index_format), offset),
+        flags=flags,
+    )
+
+
+def encode_draw_indexed(
+    index_count: int,
+    instance_count: int = 1,
+    first_index: int = 0,
+    base_vertex: int = 0,
+    first_instance: int = 0,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.DrawIndexed,
+        DRAW_INDEXED_STRUCT.pack(
+            index_count,
+            instance_count,
+            first_index,
+            base_vertex,
+            first_instance,
+        ),
+        flags=flags,
+    )
+
+
+def encode_create_compute_pipeline(
+    resource_id: int,
+    cs_shader_id: int,
+    pipeline_flags: int = 0,
+    *,
+    reserved: int = 0,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.CreateComputePipeline,
+        CREATE_COMPUTE_PIPELINE_STRUCT.pack(resource_id, cs_shader_id, pipeline_flags, reserved),
+        flags=flags,
+    )
+
+
+def encode_set_compute_pipeline(pipeline_id: int, flags: int = 0) -> bytes:
+    return encode_packet(
+        GpuOpcode.SetComputePipeline,
+        SET_COMPUTE_PIPELINE_STRUCT.pack(pipeline_id),
+        flags=flags,
+    )
+
+
+def encode_dispatch_compute(
+    workgroup_x: int,
+    workgroup_y: int = 1,
+    workgroup_z: int = 1,
+    flags: int = 0,
+) -> bytes:
+    return encode_packet(
+        GpuOpcode.DispatchCompute,
+        DISPATCH_COMPUTE_STRUCT.pack(workgroup_x, workgroup_y, workgroup_z),
+        flags=flags,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Decoding & frame grouping
 # ---------------------------------------------------------------------------
@@ -518,7 +976,7 @@ def _decode_known_payload(
     preview_bytes: int,
     diagnostics: list[TraceDiagnostic],
 ) -> tuple[dict[str, Any], bool]:
-    """Decode payload for a known opcode (0..11). Returns (fields, valid)."""
+    """Decode payload for a known opcode (0..21). Returns (fields, valid)."""
     payload_len = len(payload)
     name = opcode.name
 
@@ -909,6 +1367,545 @@ def _decode_known_payload(
             fields["trailing_bytes"] = payload_len - DESTROY_RESOURCE_STRUCT.size
         return fields, True
 
+    if opcode == GpuOpcode.CreateTexture:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=CREATE_TEXTURE_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": CREATE_TEXTURE_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        (
+            res_id,
+            width,
+            height,
+            depth_or_layers,
+            mip_levels,
+            tex_format,
+            usage_flags,
+            dimension,
+        ) = CREATE_TEXTURE_STRUCT.unpack_from(payload, 0)
+        format_name, format_webgpu, fmt_known = decode_texture_format(tex_format)
+        if not fmt_known:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity=_warn_severity(strict),
+                    code="unknown_texture_format",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=f"CreateTexture(id={res_id}) has unknown format={tex_format}",
+                )
+            )
+        usage_names, unknown_bits = decode_texture_usage(usage_flags)
+        if unknown_bits:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity=_warn_severity(strict),
+                    code="unknown_texture_usage_bits",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"CreateTexture(id={res_id}) has unrecognized usage_flags "
+                        f"bits: 0x{unknown_bits:x}"
+                    ),
+                )
+            )
+        dim_name, dim_webgpu, dim_known = decode_texture_dimension(dimension)
+        if not dim_known:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity=_warn_severity(strict),
+                    code="unknown_texture_dimension",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=f"CreateTexture(id={res_id}) has unknown dimension={dimension}",
+                )
+            )
+        fields = {
+            "id": res_id,
+            "width": width,
+            "height": height,
+            "depth_or_layers": depth_or_layers,
+            "mip_levels": mip_levels,
+            "format": tex_format,
+            "format_name": format_name,
+            "format_webgpu": format_webgpu,
+            "usage_flags": usage_flags,
+            "usage_names": usage_names,
+            "dimension": dimension,
+            "dimension_name": dim_name,
+            "dimension_webgpu": dim_webgpu,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - CREATE_TEXTURE_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.WriteTexture:
+        if payload_len < WRITE_TEXTURE_STRUCT.size:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity="error",
+                    code="payload_too_short",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"WriteTexture header expects at least {WRITE_TEXTURE_STRUCT.size} byte(s), "
+                        f"got {payload_len}"
+                    ),
+                )
+            )
+            return {
+                "expected_min_bytes": WRITE_TEXTURE_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        (
+            texture_id,
+            mip_level,
+            origin_x,
+            origin_y,
+            origin_z,
+            width,
+            height,
+            depth_or_layers,
+            bytes_per_row,
+            rows_per_image,
+            data_len,
+            reserved,
+        ) = WRITE_TEXTURE_STRUCT.unpack_from(payload, 0)
+        expected_total = WRITE_TEXTURE_STRUCT.size + data_len
+        available = payload_len - WRITE_TEXTURE_STRUCT.size
+        valid = True
+        if expected_total > payload_len:
+            valid = False
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity="error",
+                    code="variable_payload_truncated",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"WriteTexture(texture_id={texture_id}) declares data_len={data_len}, "
+                        f"but only {available} byte(s) are present in packet payload"
+                    ),
+                )
+            )
+            data_slice = payload[WRITE_TEXTURE_STRUCT.size :]
+        else:
+            if expected_total < payload_len:
+                diagnostics.append(
+                    TraceDiagnostic(
+                        severity=_warn_severity(strict),
+                        code="payload_size_mismatch",
+                        offset=offset,
+                        packet_index=packet_index,
+                        message=(
+                            f"WriteTexture(texture_id={texture_id}) expects {expected_total} "
+                            f"payload byte(s) ({WRITE_TEXTURE_STRUCT.size} + {data_len}), "
+                            f"got {payload_len}"
+                        ),
+                    )
+                )
+            data_slice = payload[WRITE_TEXTURE_STRUCT.size : expected_total]
+
+        preview = _format_preview(data_slice, preview_bytes)
+        fields = {
+            "texture_id": texture_id,
+            "mip_level": mip_level,
+            "origin_x": origin_x,
+            "origin_y": origin_y,
+            "origin_z": origin_z,
+            "width": width,
+            "height": height,
+            "depth_or_layers": depth_or_layers,
+            "bytes_per_row": bytes_per_row,
+            "rows_per_image": rows_per_image,
+            "data_len": data_len,
+            "reserved": reserved,
+            **preview,
+        }
+        if not valid:
+            fields["available_bytes"] = available
+        elif expected_total < payload_len:
+            fields["trailing_bytes"] = payload_len - expected_total
+        return fields, valid
+
+    if opcode == GpuOpcode.CreateSampler:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=CREATE_SAMPLER_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": CREATE_SAMPLER_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        (
+            res_id,
+            address_u,
+            address_v,
+            address_w,
+            mag_filter,
+            min_filter,
+            mipmap_filter,
+            max_anisotropy,
+        ) = CREATE_SAMPLER_STRUCT.unpack_from(payload, 0)
+
+        addr_u_name, addr_u_webgpu, addr_u_known = decode_address_mode(address_u)
+        addr_v_name, addr_v_webgpu, addr_v_known = decode_address_mode(address_v)
+        addr_w_name, addr_w_webgpu, addr_w_known = decode_address_mode(address_w)
+        for axis, raw_val, is_known in (
+            ("address_u", address_u, addr_u_known),
+            ("address_v", address_v, addr_v_known),
+            ("address_w", address_w, addr_w_known),
+        ):
+            if not is_known:
+                diagnostics.append(
+                    TraceDiagnostic(
+                        severity=_warn_severity(strict),
+                        code="unknown_address_mode",
+                        offset=offset,
+                        packet_index=packet_index,
+                        message=f"CreateSampler(id={res_id}) has unknown {axis}={raw_val}",
+                    )
+                )
+
+        mag_name, mag_webgpu, mag_known = decode_filter_mode(mag_filter)
+        min_name, min_webgpu, min_known = decode_filter_mode(min_filter)
+        mip_name, mip_webgpu, mip_known = decode_filter_mode(mipmap_filter)
+        for filt_field, raw_val, is_known in (
+            ("mag_filter", mag_filter, mag_known),
+            ("min_filter", min_filter, min_known),
+            ("mipmap_filter", mipmap_filter, mip_known),
+        ):
+            if not is_known:
+                diagnostics.append(
+                    TraceDiagnostic(
+                        severity=_warn_severity(strict),
+                        code="unknown_filter_mode",
+                        offset=offset,
+                        packet_index=packet_index,
+                        message=f"CreateSampler(id={res_id}) has unknown {filt_field}={raw_val}",
+                    )
+                )
+
+        fields = {
+            "id": res_id,
+            "address_u": address_u,
+            "address_u_name": addr_u_name,
+            "address_u_webgpu": addr_u_webgpu,
+            "address_v": address_v,
+            "address_v_name": addr_v_name,
+            "address_v_webgpu": addr_v_webgpu,
+            "address_w": address_w,
+            "address_w_name": addr_w_name,
+            "address_w_webgpu": addr_w_webgpu,
+            "mag_filter": mag_filter,
+            "mag_filter_name": mag_name,
+            "mag_filter_webgpu": mag_webgpu,
+            "min_filter": min_filter,
+            "min_filter_name": min_name,
+            "min_filter_webgpu": min_webgpu,
+            "mipmap_filter": mipmap_filter,
+            "mipmap_filter_name": mip_name,
+            "mipmap_filter_webgpu": mip_webgpu,
+            "max_anisotropy": max_anisotropy,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - CREATE_SAMPLER_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.CreateBindGroup:
+        if payload_len < CREATE_BIND_GROUP_STRUCT.size:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity="error",
+                    code="payload_too_short",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"CreateBindGroup header expects at least "
+                        f"{CREATE_BIND_GROUP_STRUCT.size} byte(s), got {payload_len}"
+                    ),
+                )
+            )
+            return {
+                "expected_min_bytes": CREATE_BIND_GROUP_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        res_id, pipeline_id, group_index, entry_count = CREATE_BIND_GROUP_STRUCT.unpack_from(
+            payload, 0
+        )
+        entry_stride = BIND_GROUP_ENTRY_STRUCT.size
+        expected_total = CREATE_BIND_GROUP_STRUCT.size + entry_count * entry_stride
+        available = payload_len - CREATE_BIND_GROUP_STRUCT.size
+        valid = True
+        if expected_total > payload_len:
+            valid = False
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity="error",
+                    code="variable_payload_truncated",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"CreateBindGroup(id={res_id}) declares entry_count={entry_count} "
+                        f"({entry_count * entry_stride} byte(s)), but only {available} byte(s) "
+                        f"are present in packet payload"
+                    ),
+                )
+            )
+            decodable_entries = available // entry_stride
+        else:
+            if expected_total < payload_len:
+                diagnostics.append(
+                    TraceDiagnostic(
+                        severity=_warn_severity(strict),
+                        code="payload_size_mismatch",
+                        offset=offset,
+                        packet_index=packet_index,
+                        message=(
+                            f"CreateBindGroup(id={res_id}) expects {expected_total} payload "
+                            f"byte(s) ({CREATE_BIND_GROUP_STRUCT.size} + {entry_count} * "
+                            f"{entry_stride}), got {payload_len}"
+                        ),
+                    )
+                )
+            decodable_entries = entry_count
+
+        decoded_entries: list[dict[str, Any]] = []
+        for idx in range(decodable_entries):
+            entry_off = CREATE_BIND_GROUP_STRUCT.size + idx * entry_stride
+            (
+                binding,
+                resource_type,
+                resource_id,
+                reserved,
+                entry_offset,
+                entry_size,
+            ) = BIND_GROUP_ENTRY_STRUCT.unpack_from(payload, entry_off)
+            rtype_name, rtype_known = decode_bind_resource_type(resource_type)
+            if not rtype_known:
+                diagnostics.append(
+                    TraceDiagnostic(
+                        severity=_warn_severity(strict),
+                        code="unknown_bind_resource_type",
+                        offset=offset,
+                        packet_index=packet_index,
+                        message=(
+                            f"CreateBindGroup(id={res_id}) entry[{idx}] (binding={binding}) "
+                            f"has unknown resource_type={resource_type}"
+                        ),
+                    )
+                )
+            decoded_entries.append(
+                {
+                    "binding": binding,
+                    "resource_type": resource_type,
+                    "resource_type_name": rtype_name,
+                    "resource_id": resource_id,
+                    "reserved": reserved,
+                    "offset": entry_offset,
+                    "size": entry_size,
+                }
+            )
+
+        fields = {
+            "id": res_id,
+            "pipeline_id": pipeline_id,
+            "group_index": group_index,
+            "entry_count": entry_count,
+            "entries": decoded_entries,
+        }
+        if not valid:
+            fields["available_bytes"] = available
+        elif expected_total < payload_len:
+            fields["trailing_bytes"] = payload_len - expected_total
+        return fields, valid
+
+    if opcode == GpuOpcode.SetBindGroup:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=SET_BIND_GROUP_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": SET_BIND_GROUP_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        group_index, bind_group_id = SET_BIND_GROUP_STRUCT.unpack_from(payload, 0)
+        fields = {
+            "group_index": group_index,
+            "bind_group_id": bind_group_id,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - SET_BIND_GROUP_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.SetIndexBuffer:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=SET_INDEX_BUFFER_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": SET_INDEX_BUFFER_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        buffer_id, index_format, ib_offset = SET_INDEX_BUFFER_STRUCT.unpack_from(payload, 0)
+        fmt_name, fmt_webgpu, fmt_known = decode_index_format(index_format)
+        if not fmt_known:
+            diagnostics.append(
+                TraceDiagnostic(
+                    severity=_warn_severity(strict),
+                    code="unknown_index_format",
+                    offset=offset,
+                    packet_index=packet_index,
+                    message=(
+                        f"SetIndexBuffer(buffer_id={buffer_id}) has unknown "
+                        f"index_format={index_format}"
+                    ),
+                )
+            )
+        fields = {
+            "buffer_id": buffer_id,
+            "index_format": index_format,
+            "index_format_name": fmt_name,
+            "index_format_webgpu": fmt_webgpu,
+            "offset": ib_offset,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - SET_INDEX_BUFFER_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.DrawIndexed:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=DRAW_INDEXED_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": DRAW_INDEXED_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        (
+            index_count,
+            instance_count,
+            first_index,
+            base_vertex,
+            first_instance,
+        ) = DRAW_INDEXED_STRUCT.unpack_from(payload, 0)
+        fields = {
+            "index_count": index_count,
+            "instance_count": instance_count,
+            "first_index": first_index,
+            "base_vertex": base_vertex,
+            "first_instance": first_instance,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - DRAW_INDEXED_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.CreateComputePipeline:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=CREATE_COMPUTE_PIPELINE_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": CREATE_COMPUTE_PIPELINE_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        res_id, cs_shader_id, pipeline_flags, reserved = (
+            CREATE_COMPUTE_PIPELINE_STRUCT.unpack_from(payload, 0)
+        )
+        fields = {
+            "id": res_id,
+            "cs_shader_id": cs_shader_id,
+            "flags": pipeline_flags,
+            "reserved": reserved,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - CREATE_COMPUTE_PIPELINE_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.SetComputePipeline:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=SET_COMPUTE_PIPELINE_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": SET_COMPUTE_PIPELINE_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        (pipeline_id,) = SET_COMPUTE_PIPELINE_STRUCT.unpack_from(payload, 0)
+        fields = {"pipeline_id": pipeline_id}
+        if not exact:
+            fields["trailing_bytes"] = payload_len - SET_COMPUTE_PIPELINE_STRUCT.size
+        return fields, True
+
+    if opcode == GpuOpcode.DispatchCompute:
+        can_decode, exact = _check_fixed_size(
+            opcode_name=name,
+            expected_size=DISPATCH_COMPUTE_STRUCT.size,
+            payload_bytes=payload_len,
+            offset=offset,
+            packet_index=packet_index,
+            strict=strict,
+            diagnostics=diagnostics,
+        )
+        if not can_decode:
+            return {
+                "expected_bytes": DISPATCH_COMPUTE_STRUCT.size,
+                "actual_bytes": payload_len,
+            }, False
+        workgroup_x, workgroup_y, workgroup_z = DISPATCH_COMPUTE_STRUCT.unpack_from(payload, 0)
+        fields = {
+            "workgroup_x": workgroup_x,
+            "workgroup_y": workgroup_y,
+            "workgroup_z": workgroup_z,
+        }
+        if not exact:
+            fields["trailing_bytes"] = payload_len - DISPATCH_COMPUTE_STRUCT.size
+        return fields, True
+
     raise AssertionError(f"Unhandled known opcode: {opcode}")
 
 
@@ -926,17 +1923,53 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
     frames: list[FrameSummary] = []
     current: list[DecodedPacket] = []
 
+    render_pass_opcodes = {
+        GpuOpcode.SetPipeline,
+        GpuOpcode.SetVertexBuffer,
+        GpuOpcode.SetIndexBuffer,
+        GpuOpcode.Draw,
+        GpuOpcode.DrawIndexed,
+    }
+    compute_pass_opcodes = {
+        GpuOpcode.SetComputePipeline,
+        GpuOpcode.DispatchCompute,
+    }
+
     def _flush(*, complete: bool) -> None:
         if not current:
             return
         histogram: Counter[str] = Counter()
         draw_calls = 0
+        draw_indexed_calls = 0
+        compute_dispatches = 0
+        compute_passes = 0
+        textures_created = 0
+        bind_groups_created = 0
         total_bytes = 0
+        active_pass: str | None = None
         for pkt in current:
             histogram[pkt.name] += 1
             total_bytes += pkt.total_bytes
-            if pkt.opcode == GpuOpcode.Draw and pkt.valid:
+            if not pkt.valid:
+                continue
+            if pkt.opcode == GpuOpcode.Draw:
                 draw_calls += 1
+            elif pkt.opcode == GpuOpcode.DrawIndexed:
+                draw_calls += 1
+                draw_indexed_calls += 1
+            elif pkt.opcode == GpuOpcode.DispatchCompute:
+                compute_dispatches += 1
+            elif pkt.opcode == GpuOpcode.CreateTexture:
+                textures_created += 1
+            elif pkt.opcode == GpuOpcode.CreateBindGroup:
+                bind_groups_created += 1
+
+            if pkt.opcode in compute_pass_opcodes:
+                if active_pass != "compute":
+                    compute_passes += 1
+                    active_pass = "compute"
+            elif pkt.opcode in render_pass_opcodes:
+                active_pass = "render"
         frames.append(
             FrameSummary(
                 frame_index=len(frames),
@@ -948,6 +1981,11 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                 opcode_histogram=dict(histogram),
                 complete=complete,
                 has_begin_frame=(current[0].opcode == GpuOpcode.BeginFrame),
+                draw_indexed_calls=draw_indexed_calls,
+                compute_dispatches=compute_dispatches,
+                compute_passes=compute_passes,
+                textures_created=textures_created,
+                bind_groups_created=bind_groups_created,
             )
         )
         current.clear()
@@ -1152,6 +2190,69 @@ def _format_packet_fields(pkt: DecodedPacket) -> str:
         return f"slot={f['slot']} buffer_id={f['buffer_id']} offset={f['offset']}"
     if op == GpuOpcode.DestroyResource:
         return f"id={f['id']}"
+    if op == GpuOpcode.CreateTexture:
+        usage = "|".join(f["usage_names"]) if f["usage_names"] else "NONE"
+        fmt = f["format_webgpu"] or f["format_name"]
+        dim = f["dimension_webgpu"] or f["dimension_name"]
+        return (
+            f"id={f['id']} {f['width']}x{f['height']}x{f['depth_or_layers']} "
+            f"mips={f['mip_levels']} dim={dim} fmt={fmt} "
+            f"usage=0x{f['usage_flags']:04x}({usage})"
+        )
+    if op == GpuOpcode.WriteTexture:
+        preview = f["preview_hex"]
+        suffix = "..." if f["truncated_preview"] else ""
+        preview_str = f" preview=0x{preview}{suffix}" if preview else ""
+        return (
+            f"texture_id={f['texture_id']} mip={f['mip_level']} "
+            f"origin=({f['origin_x']},{f['origin_y']},{f['origin_z']}) "
+            f"extent=({f['width']}x{f['height']}x{f['depth_or_layers']}) "
+            f"bpr={f['bytes_per_row']} rpi={f['rows_per_image']} "
+            f"data_len={f['data_len']} crc32={f['crc32']}{preview_str}"
+        )
+    if op == GpuOpcode.CreateSampler:
+        addr_u = f["address_u_webgpu"] or f["address_u_name"]
+        addr_v = f["address_v_webgpu"] or f["address_v_name"]
+        addr_w = f["address_w_webgpu"] or f["address_w_name"]
+        mag = f["mag_filter_webgpu"] or f["mag_filter_name"]
+        min_f = f["min_filter_webgpu"] or f["min_filter_name"]
+        mip = f["mipmap_filter_webgpu"] or f["mipmap_filter_name"]
+        return (
+            f"id={f['id']} addr=({addr_u},{addr_v},{addr_w}) "
+            f"filter=(mag={mag},min={min_f},mip={mip}) aniso={f['max_anisotropy']}"
+        )
+    if op == GpuOpcode.CreateBindGroup:
+        entry_parts: list[str] = []
+        for entry in f["entries"]:
+            base = f"@{entry['binding']}:{entry['resource_type_name']}(#{entry['resource_id']})"
+            if entry["resource_type"] == GpuBindResourceType.Buffer and (
+                entry["offset"] or entry["size"]
+            ):
+                size_str = str(entry["size"]) if entry["size"] else "end"
+                base += f"[{entry['offset']}:{size_str}]"
+            entry_parts.append(base)
+        entries_str = ", ".join(entry_parts)
+        return (
+            f"id={f['id']} pipeline={f['pipeline_id']} group={f['group_index']} "
+            f"entries={f['entry_count']} [{entries_str}]"
+        )
+    if op == GpuOpcode.SetBindGroup:
+        return f"group={f['group_index']} bind_group_id={f['bind_group_id']}"
+    if op == GpuOpcode.SetIndexBuffer:
+        fmt = f["index_format_webgpu"] or f["index_format_name"]
+        return f"buffer_id={f['buffer_id']} format={fmt} offset={f['offset']}"
+    if op == GpuOpcode.DrawIndexed:
+        return (
+            f"indices={f['index_count']} instances={f['instance_count']} "
+            f"first_index={f['first_index']} base_vertex={f['base_vertex']} "
+            f"first_instance={f['first_instance']}"
+        )
+    if op == GpuOpcode.CreateComputePipeline:
+        return f"id={f['id']} cs={f['cs_shader_id']} flags=0x{f['flags']:x}"
+    if op == GpuOpcode.SetComputePipeline:
+        return f"pipeline_id={f['pipeline_id']}"
+    if op == GpuOpcode.DispatchCompute:
+        return f"workgroups=({f['workgroup_x']}, {f['workgroup_y']}, {f['workgroup_z']})"
     return " ".join(f"{k}={v}" for k, v in f.items())
 
 
@@ -1162,7 +2263,8 @@ def format_trace_text(trace: DecodedTrace, *, stats_only: bool = False) -> str:
         (
             f"Bytes: {trace.consumed_bytes}/{trace.total_bytes} | "
             f"Packets: {trace.packet_count} | Frames: {trace.frame_count} | "
-            f"Draws: {trace.draw_calls} | Unknown: {trace.unknown_opcode_count} | "
+            f"Draws: {trace.draw_calls} | Dispatches: {trace.compute_dispatches} | "
+            f"Unknown: {trace.unknown_opcode_count} | "
             f"Diagnostics: {len(trace.diagnostics)}"
         ),
     ]
@@ -1191,10 +2293,22 @@ def format_trace_text(trace: DecodedTrace, *, stats_only: bool = False) -> str:
         if not frame.has_begin_frame:
             status += ",no-begin"
         hist_str = ", ".join(f"{k}={v}" for k, v in sorted(frame.opcode_histogram.items()))
+        extras: list[str] = []
+        if frame.draw_indexed_calls:
+            extras.append(f"indexed={frame.draw_indexed_calls}")
+        if frame.compute_dispatches:
+            extras.append(f"dispatches={frame.compute_dispatches}")
+        if frame.compute_passes:
+            extras.append(f"compute_passes={frame.compute_passes}")
+        if frame.textures_created:
+            extras.append(f"textures={frame.textures_created}")
+        if frame.bind_groups_created:
+            extras.append(f"bind_groups={frame.bind_groups_created}")
+        extra_str = (" " + " ".join(extras)) if extras else ""
         lines.append(
             f"  Frame {frame.frame_index:03d} [{status}]: "
             f"packets={frame.packet_count} (#{frame.start_packet_index}..#{frame.end_packet_index}) "
-            f"draws={frame.draw_calls} bytes={frame.bytes} | {hist_str}"
+            f"draws={frame.draw_calls}{extra_str} bytes={frame.bytes} | {hist_str}"
         )
 
     lines.append("")
@@ -1255,7 +2369,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help=(
-            "Fail with non-zero exit code on unknown opcodes (>= 12), "
+            "Fail with non-zero exit code on unknown opcodes (>= 22), "
             "size mismatches, or malformed/truncated packets."
         ),
     )
@@ -1264,7 +2378,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PREVIEW_BYTES,
         metavar="N",
-        help=f"Maximum raw payload preview bytes for WriteBuffer/Unknown (default: {DEFAULT_PREVIEW_BYTES}).",
+        help=(
+            "Maximum raw payload preview bytes for WriteBuffer/WriteTexture/Unknown "
+            f"(default: {DEFAULT_PREVIEW_BYTES})."
+        ),
     )
     return parser
 
