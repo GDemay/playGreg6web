@@ -24,7 +24,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
 - [x] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `DONE` (PR #78, closes #40) *(no game files required — disjoint file `recomp/src/image.rs`)*
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
-- [ ] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `IN PROGRESS` (#118, @Timon-ok) *(no game files required)*
+- [x] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `DONE` (PR #205, closes #118) *(no game files required)*
   - Lift `rep movs/stos/cmps/scas/lods`, `bt*`, `bsf/bsr/tzcnt/lzcnt/popcnt`, `cmpxchg`/`xadd`/`bswap`, `rcl/rcr`, `shld/shrd`, `loop`/`jrcxz`, `leave`/`enter`, and `lock`-prefixed atomics, verified by execution and host-CPU differential tests.
 - [ ] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `IN PROGRESS` (#119, @Timon-ok) *(no game files required — disjoint file `recomp/src/lift/simd.rs`)*
   - Lift the SSE/SSE2 (+ commonly emitted SSE3/SSSE3/SSE4.1) instructions MSVC x64 code uses onto the XMM slots of the guest state, verified by execution and host-CPU differential tests.
@@ -86,6 +86,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
 - [ ] **O20 — Complete Remaining 4 `WINHTTP.dll` Shims (`runtime/os/winhttp_ext.{h,cpp}`)** — `IN PROGRESS` (#199, @MarcBlattmann) *(driven by `W37` import audit: `WinHttpAddRequestHeaders`, `WinHttpCrackUrl`, `WinHttpQueryHeaders`, `WinHttpWriteData`)*
   - Implements and registers the final 4 `WINHTTP.dll` exports in `Win32ModuleRegistry` for 15/15 (100%) WinHTTP coverage.
+- [ ] **O21 — Guest CPU Identification Helpers: `cpuid`/`rdtsc`/`rdtscp`/`xgetbv` (`runtime/guest/cpu_helpers.{h,cpp}`)** — `IN PROGRESS` (#207, @Timon-ok) *(no game files required — small ABI addition first, then disjoint files `runtime/guest/cpu_helpers.{h,cpp}`, `tests/test_cpu_helpers.cpp`)*
+  - Document and implement `__playgta6_cpuid`/`__playgta6_rdtsc`/`__playgta6_rdtscp`/`__playgta6_xgetbv` (emitted by the lifter since R7) as a consistent virtual CPU whose advertised features match what the lifter implements.
 
 ---
 
