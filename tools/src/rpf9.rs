@@ -8,22 +8,34 @@ pub const RPF9_MAGIC: [u8; 4] = *b"RPF9";
 pub const RPF8_MAGIC: [u8; 4] = *b"RPF8";
 pub const RPF7_MAGIC: [u8; 4] = *b"RPF7";
 
-/// Real RAGE little-endian FourCC magics on disk (`0x52504639` LE = `[0x39, 0x46, 0x50, 0x52]` = `"9FPR"`).
-pub const RPF9_MAGIC_LE: [u8; 4] = *b"9FPR";
-pub const RPF8_MAGIC_LE: [u8; 4] = *b"8FPR";
-pub const RPF7_MAGIC_LE: [u8; 4] = *b"7FPR";
-
 /// Numeric RAGE RPF9 FourCC value (`u32::from_le_bytes(*b"9FPR") == 0x5250_4639`).
 pub const RPF9_MAGIC_U32: u32 = 0x5250_4639;
 
+/// Real RAGE little-endian FourCC magics on disk (`0x52504639` LE = `[0x39, 0x46, 0x50, 0x52]` = `"9FPR"`).
+pub const RPF9_MAGIC_LE: [u8; 4] = RPF9_MAGIC_U32.to_le_bytes();
+pub const RPF8_MAGIC_LE: [u8; 4] = *b"8FPR";
+pub const RPF7_MAGIC_LE: [u8; 4] = *b"7FPR";
+
 /// Minimum header size for RPF9 archives inspected by this tool (24 bytes):
-/// - `0x00..0x04`: magic (`"9FPR"` / `0x52504639` LE, or synthetic `"RPF9"` BE)
-/// - `0x04..0x08`: `entry_count` (`u32` LE)
-/// - `0x08..0x0C`: `names_size` (`u32` LE)
-/// - `0x0C..0x10`: `encryption_tag` (`u32` LE)
-/// - `0x10..0x14`: `metadata_size` (`u32` LE)
-/// - `0x14..0x18`: `flags` (`u32` LE)
+/// - Classic/synthetic layout:
+///   - `0x00..0x04`: magic (`"9FPR"` / `0x52504639` LE, or synthetic `"RPF9"` BE)
+///   - `0x04..0x08`: `entry_count` (`u32` LE)
+///   - `0x08..0x0C`: `names_size` (`u32` LE)
+///   - `0x0C..0x10`: `encryption_tag` (`u32` LE)
+///   - `0x10..0x14`: `metadata_size` (`u32` LE)
+///   - `0x14..0x18`: `flags` (`u32` LE)
+/// - Real Xbox Series RPF9 v9 layout (`"9FPR"` / `0x52504639` LE):
+///   - `0x00..0x04`: magic (`0x52504639` LE)
+///   - `0x04..0x10`: header / TOC byte offsets or sizes (`raw_words[1..=3]`)
+///   - `0x10..0x14`: 32-bit encryption / hash / signature tag (`raw_words[4]`)
+///   - `0x14..0x18`: 32-bit auxiliary tag / flags (`raw_words[5]`)
 pub const RPF9_HEADER_SIZE: usize = 24;
+
+/// Heuristic threshold for word 4 (`0x10..0x14`) on large little-endian `"9FPR"` archives
+/// whose word 3 is not a known classic encryption tag: values >= 16 MiB indicate a 32-bit
+/// encryption/hash/signature tag in the Xbox Series v9 header layout rather than a classic
+/// `metadata_size` byte count.
+const XBOX_V9_HASH_TAG_THRESHOLD: u32 = 0x0100_0000;
 
 /// Conservative minimum size (in bytes) per TOC entry in RPF7/8/9 archives.
 pub const RPF9_ENTRY_STRIDE: u64 = 16;
@@ -67,11 +79,34 @@ impl fmt::Display for RpfVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rpf9HeaderLayout {
+    /// Synthetic / classic layout where words 1..5 encode
+    /// `(entry_count, names_size, encryption_tag, metadata_size, flags)` and
+    /// `24 + entry_count * 16 + names_size + metadata_size <= total_size`.
+    Classic,
+    /// Real Xbox Series RPF9 v9 little-endian `"9FPR"` layout where words 1..3
+    /// hold header/TOC offsets or sizes and word 4 (`0x10..0x14`) is a 32-bit
+    /// encryption/hash/signature tag.
+    XboxSeriesV9,
+}
+
+impl fmt::Display for Rpf9HeaderLayout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Rpf9HeaderLayout::Classic => write!(f, "classic/synthetic"),
+            Rpf9HeaderLayout::XboxSeriesV9 => write!(f, "xbox-series-v9"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpfHeader {
     pub version: RpfVersion,
     pub magic_bytes: [u8; 4],
     pub magic_endian: RpfMagicEndian,
+    pub header_layout: Rpf9HeaderLayout,
+    pub raw_words: [u32; 6],
     pub entry_count: u32,
     pub names_size: u32,
     pub encryption_tag: u32,
@@ -100,36 +135,80 @@ impl RpfHeader {
             .iter()
             .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
             .collect();
-        format!(
-            concat!(
-                "{} Archive Header\n",
-                "  Version:          {}\n",
-                "  Magic:            \"{}\" ({:02X} {:02X} {:02X} {:02X}, {})\n",
-                "  File Size:        {} bytes\n",
-                "  Entry Count:      {}\n",
-                "  Names Size:       {} bytes\n",
-                "  Metadata Size:    {} bytes\n",
-                "  Min Index Bytes:  {} bytes\n",
-                "  Flags:            0x{:08X}\n",
-                "  Encryption Tag:   0x{:08X} ({})"
+        match self.header_layout {
+            Rpf9HeaderLayout::Classic => format!(
+                concat!(
+                    "{} Archive Header\n",
+                    "  Version:          {}\n",
+                    "  Magic:            \"{}\" ({:02X} {:02X} {:02X} {:02X}, {})\n",
+                    "  Header Layout:    {}\n",
+                    "  File Size:        {} bytes\n",
+                    "  Entry Count:      {}\n",
+                    "  Names Size:       {} bytes\n",
+                    "  Metadata Size:    {} bytes\n",
+                    "  Min Index Bytes:  {} bytes\n",
+                    "  Flags:            0x{:08X}\n",
+                    "  Encryption Tag:   0x{:08X} ({})"
+                ),
+                self.version,
+                self.version,
+                magic_ascii,
+                self.magic_bytes[0],
+                self.magic_bytes[1],
+                self.magic_bytes[2],
+                self.magic_bytes[3],
+                self.magic_endian,
+                self.header_layout,
+                self.total_size,
+                self.entry_count,
+                self.names_size,
+                self.metadata_size,
+                self.min_index_bytes,
+                self.flags,
+                self.encryption_tag,
+                self.encryption_label()
             ),
-            self.version,
-            self.version,
-            magic_ascii,
-            self.magic_bytes[0],
-            self.magic_bytes[1],
-            self.magic_bytes[2],
-            self.magic_bytes[3],
-            self.magic_endian,
-            self.total_size,
-            self.entry_count,
-            self.names_size,
-            self.metadata_size,
-            self.min_index_bytes,
-            self.flags,
-            self.encryption_tag,
-            self.encryption_label()
-        )
+            Rpf9HeaderLayout::XboxSeriesV9 => format!(
+                concat!(
+                    "{} Archive Header\n",
+                    "  Version:             {}\n",
+                    "  Magic:               \"{}\" ({:02X} {:02X} {:02X} {:02X}, {})\n",
+                    "  Header Layout:       {}\n",
+                    "  File Size:           {} bytes\n",
+                    "  Header Words:        0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}\n",
+                    "  Layout Words 1-3:    0x{:08X} ({}), 0x{:08X} ({}), 0x{:08X} ({})\n",
+                    "  Min Index Bytes:     {} bytes\n",
+                    "  Aux Tag / Flags:     0x{:08X}\n",
+                    "  Encryption/Hash Tag: 0x{:08X} ({})"
+                ),
+                self.version,
+                self.version,
+                magic_ascii,
+                self.magic_bytes[0],
+                self.magic_bytes[1],
+                self.magic_bytes[2],
+                self.magic_bytes[3],
+                self.magic_endian,
+                self.header_layout,
+                self.total_size,
+                self.raw_words[0],
+                self.raw_words[1],
+                self.raw_words[2],
+                self.raw_words[3],
+                self.raw_words[4],
+                self.raw_words[5],
+                self.raw_words[1],
+                self.raw_words[1],
+                self.raw_words[2],
+                self.raw_words[2],
+                self.raw_words[3],
+                self.raw_words[3],
+                self.min_index_bytes,
+                self.flags,
+                self.encryption_tag,
+                self.encryption_label()
+            ),
+        }
     }
 }
 
@@ -226,11 +305,27 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn is_known_classic_encryption_tag(tag: u32) -> bool {
+    matches!(tag, 0x0000_0000 | 0x4E45_504F | 0x0FFF_FFF9 | 0x0FEF_FFFF)
+}
+
+fn classic_min_index_bytes(entry_count: u32, names_size: u32, metadata_size: u32) -> Option<u64> {
+    let entries_bytes = u64::from(entry_count).checked_mul(RPF9_ENTRY_STRIDE)?;
+    (RPF9_HEADER_SIZE as u64)
+        .checked_add(entries_bytes)?
+        .checked_add(u64::from(names_size))?
+        .checked_add(u64::from(metadata_size))
+}
+
 /// Inspects an RPF9 header from an in-memory prefix slice and known total archive size.
 ///
 /// Validates the magic version (`9FPR` / `0x52504639` LE and synthetic `RPF9` BE only;
-/// `RPF8`/`8FPR`, `RPF7`/`7FPR`, and other `RPF*`/`*FPR` return [`RpfError::UnsupportedVersion`])
-/// and checks that declared TOC/name/metadata sizes fit within `total_size` using checked arithmetic.
+/// `RPF8`/`8FPR`, `RPF7`/`7FPR`, and other `RPF*`/`*FPR` return [`RpfError::UnsupportedVersion`]).
+///
+/// Big-endian `"RPF9"` archives are validated using the classic synthetic layout.
+/// Little-endian `"9FPR"` archives support both classic synthetic headers (where TOC/name/metadata
+/// sizes fit within `total_size`) and real Xbox Series RPF9 v9 headers (where word 4 at offset
+/// `0x10..0x14` is a 32-bit encryption/hash/signature tag and words 1..3 hold layout offsets/sizes).
 pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHeader, RpfError> {
     if header_bytes.len() < 4 {
         return Err(RpfError::TruncatedHeader {
@@ -267,21 +362,44 @@ pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHead
         });
     }
 
-    let entry_count = read_u32_le(header_bytes, 4);
-    let names_size = read_u32_le(header_bytes, 8);
-    let encryption_tag = read_u32_le(header_bytes, 12);
-    let metadata_size = read_u32_le(header_bytes, 16);
-    let flags = read_u32_le(header_bytes, 20);
+    let raw_words = [
+        read_u32_le(header_bytes, 0),
+        read_u32_le(header_bytes, 4),
+        read_u32_le(header_bytes, 8),
+        read_u32_le(header_bytes, 12),
+        read_u32_le(header_bytes, 16),
+        read_u32_le(header_bytes, 20),
+    ];
 
-    let entries_bytes = u64::from(entry_count)
-        .checked_mul(RPF9_ENTRY_STRIDE)
-        .ok_or(RpfError::SizeOverflow)?;
-    let min_index_bytes = (RPF9_HEADER_SIZE as u64)
-        .checked_add(entries_bytes)
-        .and_then(|v| v.checked_add(u64::from(names_size)))
-        .and_then(|v| v.checked_add(u64::from(metadata_size)))
-        .ok_or(RpfError::SizeOverflow)?;
+    let [_, w1, w2, w3, w4, w5] = raw_words;
+    let classic_min = classic_min_index_bytes(w1, w2, w4);
 
+    if magic_endian == RpfMagicEndian::Little {
+        let is_xbox_series_v9 = match classic_min {
+            None => true,
+            Some(min_bytes) if min_bytes > total_size => true,
+            Some(_) => !is_known_classic_encryption_tag(w3) && w4 >= XBOX_V9_HASH_TAG_THRESHOLD,
+        };
+
+        if is_xbox_series_v9 {
+            return Ok(RpfHeader {
+                version,
+                magic_bytes: magic,
+                magic_endian,
+                header_layout: Rpf9HeaderLayout::XboxSeriesV9,
+                raw_words,
+                entry_count: 0,
+                names_size: 0,
+                encryption_tag: w4,
+                metadata_size: 0,
+                flags: w5,
+                total_size,
+                min_index_bytes: RPF9_HEADER_SIZE as u64,
+            });
+        }
+    }
+
+    let min_index_bytes = classic_min.ok_or(RpfError::SizeOverflow)?;
     if min_index_bytes > total_size {
         return Err(RpfError::TruncatedArchive {
             required_bytes: min_index_bytes,
@@ -293,11 +411,13 @@ pub fn inspect_rpf_bytes(header_bytes: &[u8], total_size: u64) -> Result<RpfHead
         version,
         magic_bytes: magic,
         magic_endian,
-        entry_count,
-        names_size,
-        encryption_tag,
-        metadata_size,
-        flags,
+        header_layout: Rpf9HeaderLayout::Classic,
+        raw_words,
+        entry_count: w1,
+        names_size: w2,
+        encryption_tag: w3,
+        metadata_size: w4,
+        flags: w5,
         total_size,
         min_index_bytes,
     })
@@ -655,6 +775,150 @@ mod tests {
         assert!(!parsed.format_summary().contains("AAAA"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn make_raw_words_header(words: [u32; 6]) -> [u8; RPF9_HEADER_SIZE] {
+        let mut buf = [0u8; RPF9_HEADER_SIZE];
+        for (i, word) in words.iter().enumerate() {
+            let start = i * 4;
+            buf[start..start + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn parses_xbox_series_v9_appdata_header_and_summary() {
+        let words = [
+            RPF9_MAGIC_U32,
+            0x0000_0360,
+            0x0000_0340,
+            0x0000_0040,
+            0x24E6_3799,
+            0xB766_DF72,
+        ];
+        let header = make_raw_words_header(words);
+        let parsed = inspect_rpf_bytes(&header, 8_880).unwrap();
+
+        assert_eq!(parsed.version, RpfVersion::Rpf9);
+        assert_eq!(parsed.magic_bytes, RPF9_MAGIC_LE);
+        assert_eq!(parsed.magic_endian, RpfMagicEndian::Little);
+        assert_eq!(parsed.header_layout, Rpf9HeaderLayout::XboxSeriesV9);
+        assert_eq!(parsed.raw_words, words);
+        assert_eq!(parsed.entry_count, 0);
+        assert_eq!(parsed.names_size, 0);
+        assert_eq!(parsed.metadata_size, 0);
+        assert_eq!(parsed.encryption_tag, 0x24E6_3799);
+        assert_eq!(parsed.encryption_label(), "custom");
+        assert_eq!(parsed.flags, 0xB766_DF72);
+        assert_eq!(parsed.total_size, 8_880);
+        assert_eq!(parsed.min_index_bytes, RPF9_HEADER_SIZE as u64);
+
+        let summary = parsed.format_summary();
+        assert!(summary.contains("RPF9 Archive Header"));
+        assert!(summary.contains("\"9FPR\" (39 46 50 52, little-endian)"));
+        assert!(summary.contains("xbox-series-v9"));
+        assert!(summary.contains("8880 bytes"));
+        assert!(summary.contains("0x52504639 0x00000360 0x00000340 0x00000040 0x24E63799 0xB766DF72"));
+        assert!(summary.contains("0x00000360 (864), 0x00000340 (832), 0x00000040 (64)"));
+        assert!(summary.contains("0xB766DF72"));
+        assert!(summary.contains("0x24E63799 (custom)"));
+    }
+
+    #[test]
+    fn parses_xbox_series_v9_large_archives_without_misclassifying_hash_tag() {
+        let words = [
+            RPF9_MAGIC_U32,
+            0x0000_0360,
+            0x0000_0340,
+            0x0000_0040,
+            0x24E6_3799,
+            0xB766_DF72,
+        ];
+        let header = make_raw_words_header(words);
+
+        // 6.6 MiB archive (like common.rpf) and 4 GiB archive (where 0x24E63799 < total_size).
+        for total_size in [6_642_192u64, 4_294_967_296u64] {
+            let parsed = inspect_rpf_bytes(&header, total_size).unwrap();
+            assert_eq!(parsed.header_layout, Rpf9HeaderLayout::XboxSeriesV9);
+            assert_eq!(parsed.raw_words, words);
+            assert_eq!(parsed.encryption_tag, 0x24E6_3799);
+            assert_eq!(parsed.flags, 0xB766_DF72);
+            assert_eq!(parsed.total_size, total_size);
+        }
+    }
+
+    #[test]
+    fn inspects_xbox_series_v9_rpf_file_without_reading_payload() {
+        let dir = unique_temp_dir("inspect_file_v9");
+        let rpf_path = dir.join("appdata0_synthetic.rpf");
+
+        let words = [
+            RPF9_MAGIC_U32,
+            0x0000_0360,
+            0x0000_0340,
+            0x0000_0040,
+            0x24E6_3799,
+            0xB766_DF72,
+        ];
+        let header = make_raw_words_header(words);
+        let mut content = Vec::with_capacity(8_880);
+        content.extend_from_slice(&header);
+        content.extend_from_slice(&vec![0xCC; 8_880 - RPF9_HEADER_SIZE]);
+        fs::write(&rpf_path, &content).unwrap();
+
+        let parsed = inspect_rpf_file(&rpf_path).unwrap();
+        assert_eq!(parsed.header_layout, Rpf9HeaderLayout::XboxSeriesV9);
+        assert_eq!(parsed.encryption_tag, 0x24E6_3799);
+        assert_eq!(parsed.flags, 0xB766_DF72);
+        assert_eq!(parsed.total_size, 8_880);
+        assert!(!parsed.format_summary().contains("CCCC"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_genuinely_truncated_le_9fpr_files_under_header_size() {
+        for truncated_len in [0usize, 3, 4, 12, 15, 16, 20, 23] {
+            let mut buf = make_raw_words_header([
+                RPF9_MAGIC_U32,
+                0x360,
+                0x340,
+                0x40,
+                0x24E6_3799,
+                0xB766_DF72,
+            ])
+            .to_vec();
+            buf.truncate(truncated_len);
+            let err = inspect_rpf_bytes(&buf, truncated_len as u64).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    RpfError::TruncatedHeader {
+                        actual,
+                        expected: RPF9_HEADER_SIZE
+                    } if actual == truncated_len
+                ),
+                "len={truncated_len} gave unexpected err: {err:?}"
+            );
+        }
+
+        // Full 24-byte header slice but reported total_size < 24 is still rejected.
+        let header = make_raw_words_header([
+            RPF9_MAGIC_U32,
+            0x360,
+            0x340,
+            0x40,
+            0x24E6_3799,
+            0xB766_DF72,
+        ]);
+        let err = inspect_rpf_bytes(&header, 20).unwrap_err();
+        assert!(matches!(
+            err,
+            RpfError::TruncatedArchive {
+                required_bytes: 24,
+                actual_bytes: 20
+            }
+        ));
     }
 
     #[test]
