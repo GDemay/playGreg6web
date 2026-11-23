@@ -32,6 +32,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - One `playgta6-recomp build <pe> --out <dir>` command chaining parse → `.pdata`-seeded discovery → lift → import thunks → packed guest image, with a deterministic build manifest and coverage report.
 - [ ] **R10 — MSVC x64 Jump-Table Pattern Recovery (`recomp/src/jump_table.rs`)** — `IN PROGRESS` (#149, @MarcBlattmann) *(driven by M2 discovery: 9,969 unresolved switch tables in `game_scarlett_master.exe`)*
   - Expand `recomp/src/jump_table.rs` to recover MSVC image-base-relative (`lea rBase, [rip+...]; movsxd/mov reg, [rBase + idx*4]; add reg, rBase; jmp reg`) switch tables and bounds checks across the real binary.
+- [ ] **R11 — Win64 Exception Handling for Recompiled Code (`recomp/src/eh.rs` + `runtime/guest/`)** — `IN PROGRESS` (#160, @Timon-ok) *(imports `__CxxFrameHandler3/4`, `_CxxThrowException`, `__C_specific_handler`, `RtlVirtualUnwind`, `longjmp`)*
+  - Parse C++ EH `FuncInfo` (v3/v4) and `__C_specific_handler` scope tables into the CFG (funclets, catch/continuation targets); implement `RaiseException`/`RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`/`RtlRestoreContext`/`setjmp`/`longjmp` over guest state and `.pdata`; define the lifter/runtime resume protocol.
+- [ ] **R12 — Multi-Module Recompile: Bundled DLLs & Guest-to-Guest Import Binding (`recomp/`)** — `IN PROGRESS` (#161, @Timon-ok) *(starts once R9 is merged)*
+  - Build the executable plus the redistributable DLLs shipped next to it (`MSVCP140`, `VCRUNTIME140`, `concrt140`, …) into one guest program: per-module image bases, exports, forwarders, imports bound to another module's exports, shared function registration tables.
 
 ---
 
@@ -66,8 +70,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Expose thin Win64/C-ABI wrappers forwarding `api-ms-win-crt-{convert,filesystem,heap,locale,math,runtime,stdio,string,time,utility}` and `VCRUNTIME140` memory/string/exception exports onto Emscripten libc so `playgta6-recomp stubs` binds ~300 imports cleanly.
 - [ ] **O14 — Xbox Middleware Shims: `libHttpClient.GDK`, `Bink2Scarlett`, `AcpHal`/`xapu`/`chad`, FSR & `MFPlat` (`runtime/os/xbox_middleware.{h,cpp}`)** — `IN PROGRESS` (#152, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 104 middleware imports)*
   - Implement clean offline/non-blocking C-ABI shims for `libHttpClient.GDK.dll` (38), `Bink2Scarlett.dll` (23), `AcpHal`/`xapu`/`chad` (19), `XboxBvhBuilder` (7), `amd_fidelityfx_loader_xbox` (4), and `MFPlat`/`MFReadWrite` (7).
-- [ ] **O15 — Remaining Win32 Core (`api-ms-win-core-*`, `ADVAPI32`, `bcrypt`, `ntuser`) & `MSVCP140` C++ Runtime Shims (`runtime/os/win32_compat.{h,cpp}`)** — `UNCLAIMED` *(driven by M2 `docs/imports_required.md`)*
+- [ ] **O15 — Remaining Win32 Core (`api-ms-win-core-*`, `ADVAPI32`, `bcrypt`, `ntuser`) & `MSVCP140` C++ Runtime Shims (`runtime/os/win32_compat.{h,cpp}`)** — `IN PROGRESS` (#163, @Timon-ok) *(driven by M2 `docs/imports_required.md`)*
   - Implement the remaining ~55 Win32 core file/process/string/time/registry/bcrypt/window shims + `MSVCP140.dll` mutex/xtime/locale/iostream helpers to hit 100% import resolution for `game_scarlett_master.exe`.
+- [ ] **O16 — Guest COM Object Bridge & `xgameruntime.dll` `QueryApiImpl` Provider (`runtime/guest/com_bridge.{h,cpp}`)** — `IN PROGRESS` (#167, @Timon-ok) *(the executable has no static `xgameruntime.dll` imports: the GDK client code loads it and calls `QueryApiImpl`/`InitializeApiImpl`)*
+  - Generic guest-memory COM objects (vtables of dispatchable addresses, `IUnknown` lifetime, argument marshaling) plus the `xgameruntime.dll` provider entry points routed onto the existing `pg6_gdk_*` shims; shared by `d3d12_xs` (G24), DirectStorage and GameInput interfaces.
 
 ---
 
@@ -120,7 +126,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Pools transient color/depth/shadow/post-FX `GPUTexture` + view attachments by descriptor key with per-frame reuse and idle/budget LRU eviction.
 - [ ] **G23 — Wire `GpuStagingPool` (`G14`), `DynamicUniformRing` (`G18`), `GpuPassTimer` (`G16`) & `ReflectionLoader` (`G17`) into `web/workers/wgpu_worker.js`** — `UNCLAIMED` *(no game files required — wait for G20/PR #148 merge)*
   - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, and reflected bind-group layouts into the main WebGPU command processor.
-- [ ] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `UNCLAIMED` *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
+- [ ] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `IN PROGRESS` (#168, @Timon-ok) *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
   - Expose the exact 3 `d3d12_xs.dll` exports with Win64-ABI COM vtables (`ID3D12Device`, `ID3D12CommandQueue`, `ID3D12GraphicsCommandList`, `ID3D12Resource`, `ID3D12DescriptorHeap`, `ID3D12PipelineState`) bridged to `G6`/`G7`/`G20`.
 
 ---
