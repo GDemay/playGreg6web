@@ -42,6 +42,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Runtime boot sequence (load `PGIM` image, register lifted tables, bind import slots, minimal TEB/TLS + main thread, TLS callbacks, entry-point call, structured first-fault report) and a native host harness linking host-target lifted shards with the runtime for a first boot attempt without the browser toolchain (complements `R13`/`W40`).
 - [ ] **R15 — Recompilation Coverage & Boot-Path Bottleneck Profiler CLI (`tools/audit_recomp_build.py`)** — `IN PROGRESS` (#220, @MarcBlattmann) *(no game files required — disjoint files `tools/audit_recomp_build.py`, `tests/test_audit_recomp_build.py`)*
   - Analyzes `R9` `build-manifest.json` / `discover --json` outputs to rank top unlifted x86-64 mnemonics and compute entry-point + TLS-callback reachable boot-path coverage.
+- [ ] **R16 — Interface-Call Survey Subcommand: Vtable Slot Usage per COM Interface (`recomp/src/survey.rs`)** — `IN PROGRESS` (#238, @Timon-ok) *(no game files required — disjoint file `recomp/src/survey.rs`)*
+  - `playgta6-recomp survey-interfaces`: for interface pointers obtained from given sources (an import's out-parameter, a parent interface's vtable slot), report the vtable slots called, call-site counts and inferred argument counts (addresses, GUID constants and counts only).
 
 ---
 
@@ -78,7 +80,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement clean offline/non-blocking C-ABI shims for `libHttpClient.GDK.dll` (38), `Bink2Scarlett.dll` (23), `AcpHal`/`xapu`/`chad` (19), `XboxBvhBuilder` (7), `amd_fidelityfx_loader_xbox` (4), and `MFPlat`/`MFReadWrite` (7).
 - [x] **O15 — Remaining Win32 Core (`api-ms-win-core-*`, `ADVAPI32`, `bcrypt`, `ntuser`) & `MSVCP140` C++ Runtime Shims (`runtime/os/win32_compat.{h,cpp}`)** — `DONE` (PR #208, closes #163) *(driven by M2 `docs/imports_required.md`)*
   - Implement the remaining ~55 Win32 core file/process/string/time/registry/bcrypt/window shims + `MSVCP140.dll` mutex/xtime/locale/iostream helpers to hit 100% import resolution for `game_scarlett_master.exe`.
-- [ ] **O16 — Guest COM Object Bridge & `xgameruntime.dll` `QueryApiImpl` Provider (`runtime/guest/com_bridge.{h,cpp}`)** — `IN PROGRESS` (#167, @Timon-ok) *(the executable has no static `xgameruntime.dll` imports: the GDK client code loads it and calls `QueryApiImpl`/`InitializeApiImpl`)*
+- [x] **O16 — Guest COM Object Bridge & `xgameruntime.dll` `QueryApiImpl` Provider (`runtime/guest/com_bridge.{h,cpp}`)** — `DONE` (PRs #209 + #235, closes #167) *(the executable has no static `xgameruntime.dll` imports: the GDK client code loads it and calls `QueryApiImpl`/`InitializeApiImpl`)*
   - Generic guest-memory COM objects (vtables of dispatchable addresses, `IUnknown` lifetime, argument marshaling) plus the `xgameruntime.dll` provider entry points routed onto the existing `pg6_gdk_*` shims; shared by `d3d12_xs` (G24), DirectStorage and GameInput interfaces.
 - [ ] **O17 — Unified Boot Import Coverage Wiring (`runtime/os/shim_exports.cpp` + `tools/check_import_coverage.py`)** — `UNCLAIMED` *(wait for O13/O14/O15/G24 merge)*
   - Wire `pg6_xbox_scarlett_register_all`, `pg6_ucrt_register_all`, `pg6_xbox_middleware_register_all`, `pg6_win32_compat_register_all`, and `pg6_d3d12_xs_register_all` into `shim_exports.cpp` and verify 100% coverage of all non-guest-DLL imports in `docs/imports_required.md`.
@@ -90,6 +92,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implements and registers the final 4 `WINHTTP.dll` exports in `Win32ModuleRegistry` for 15/15 (100%) WinHTTP coverage.
 - [x] **O21 — Guest CPU Identification Helpers: `cpuid`/`rdtsc`/`rdtscp`/`xgetbv` (`runtime/guest/cpu_helpers.{h,cpp}`)** — `DONE` (PRs #210 + #221, closes #207) *(no game files required — small ABI addition first, then disjoint files `runtime/guest/cpu_helpers.{h,cpp}`, `tests/test_cpu_helpers.cpp`)*
   - Document and implement `__playgta6_cpuid`/`__playgta6_rdtsc`/`__playgta6_rdtscp`/`__playgta6_xgetbv` (emitted by the lifter since R7) as a consistent virtual CPU whose advertised features match what the lifter implements.
+- [ ] **O22 — Guest Callback Thunks for CRT Exit Registration & XAsync Provider / XTaskQueue Port Slots (`runtime/guest/`, `runtime/os/`)** — `IN PROGRESS` (#236, @Timon-ok) *(no game files required — follow-up to O16: the `xgameruntime.dll` provider's remaining XAsync/XTaskQueue slots and CRT `atexit`-family callbacks)*
+  - Guest-state thunks for `_crt_atexit`/`_register_onexit_function`/`_register_thread_local_exe_atexit_callback`, XAsync-taking shims calling guest completion callbacks, and the XAsync provider (`Begin`/`Schedule`/`Complete`/`Run`/`GetResult`/`Cancel`) + XTaskQueue port/composite slots.
+- [ ] **O23 — DirectStorage, GameInput & XG Guest Interface Adapters on the COM Bridge (`runtime/os/xbox_scarlett_guest.{h,cpp}`)** — `IN PROGRESS` (#237, @Timon-ok) *(no game files required — disjoint files `runtime/os/xbox_scarlett_guest.{h,cpp}`, `tests/test_xbox_scarlett_guest.cpp`)*
+  - Wrap the host objects behind `DStorageGetFactory`, `GameInputCreate` and `XGCreateTextureComputer` as guest COM-bridge interfaces with evidence-based slot layouts, logging stubs elsewhere, and the DirectStorage read path on the runtime file layer.
 
 ---
 
