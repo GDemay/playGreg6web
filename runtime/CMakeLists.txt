@@ -18,6 +18,7 @@ add_library(playgta6_core STATIC
     os/xbox_scarlett.cpp
     os/xbox_middleware.cpp
     os/win32_loader.cpp
+    os/ucrt_bridge.cpp
     os/shim_exports.cpp
     os/image_loader.cpp
     gpu/cmd_encoder.cpp
@@ -100,4 +101,8 @@ else()
     add_executable(test_xbox_middleware ../tests/test_xbox_middleware.cpp)
     target_link_libraries(test_xbox_middleware PRIVATE playgta6_core)
     add_test(NAME test_xbox_middleware COMMAND test_xbox_middleware)
+
+    add_executable(test_ucrt_bridge ../tests/test_ucrt_bridge.cpp)
+    target_link_libraries(test_ucrt_bridge PRIVATE playgta6_core)
+    add_test(NAME playgta6_ucrt_bridge_tests COMMAND test_ucrt_bridge)
 endif()
