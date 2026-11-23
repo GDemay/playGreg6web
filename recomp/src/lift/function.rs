@@ -189,7 +189,7 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
     }
     let mut regs = [false; 16];
     regs[RSP] = true;
-    let mut xmms = [false; 16];
+    let mut vector_regs = simd::Regs::default();
     let mut faulting_calls = BTreeSet::new();
     let mut info = InstructionInfoFactory::new();
     for (&start, block) in &func.blocks {
@@ -212,9 +212,9 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
                 if reg.is_gpr() && reg.full_register().is_gpr64() {
                     regs[reg.full_register().number()] = true;
                 }
-                simd::note_register(reg, &mut xmms);
+                simd::note_register(reg, &mut vector_regs);
             }
-            simd::note_instruction(ins, &mut xmms);
+            simd::note_instruction(ins, &mut vector_regs);
         }
         // Direct calls whose target discovery found to be unmapped or non-executable fault.
         for call in &block.calls {
@@ -236,7 +236,7 @@ pub(super) fn lift(func: &cfg::Function) -> Result<LiftedFunction, LiftError> {
     let mut lifter = FunctionLifter {
         func,
         regs,
-        xmms,
+        simd: vector_regs,
         faulting_calls,
         body: String::new(),
         tmp: 0,
@@ -278,8 +278,9 @@ struct FunctionLifter<'a> {
     func: &'a cfg::Function,
     /// GPRs the function touches; only these get an alloca and are synced with the state.
     regs: [bool; 16],
-    /// XMM registers the function touches (`alloca <2 x i64>` each, synced like the GPRs).
-    xmms: [bool; 16],
+    /// Vector registers the function touches (an `alloca <2 x i64>` per XMM register and per
+    /// YMM upper half, synced like the GPRs) and the SIMD lifter's per-instruction state.
+    simd: simd::Regs,
     /// Sites of direct calls into unmapped or non-executable memory (lifted as traps).
     faulting_calls: BTreeSet<u64>,
     body: String,

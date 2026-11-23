@@ -1,7 +1,7 @@
 // Test-only harness: runs lifted wasm64 functions under node (memory64).
 // Usage: node [--experimental-wasm-memory64] runner.js <module.wasm> <cases.json>
 //
-// cases.json: { state, gprOffset, flagsOffset, xmmOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
+// cases.json: { state, gprOffset, flagsOffset, xmmOffset, mxcsrOffset, cases: [{ fn, regs, flags[6], mem, read, out }] }
 // `regs` lists [index, value] pairs; unlisted registers are zero.
 // For every case the harness writes guest registers/flags/memory, pushes a fake return address
 // (emulating the caller's `call`), invokes the export and prints one tab-separated line:
@@ -15,6 +15,8 @@ const STATE = Number(BigInt(spec.state));
 const GPR = STATE + spec.gprOffset;
 const FLAGS = STATE + spec.flagsOffset;
 const XMM = STATE + (spec.xmmOffset || 0);
+// MXCSR of a new guest thread (the runtime initialises it like this).
+const MXCSR = spec.mxcsrOffset ? STATE + spec.mxcsrOffset : 0;
 const RSP = 4;
 const RETURN_ADDRESS = 0xC0DEC0DEn;
 
@@ -103,6 +105,7 @@ const lines = spec.cases.map((c, index) => {
   for (const [i, r] of c.regs) v.setBigUint64(GPR + i * 8, BigInt(r), true);
   const regs0 = new Map(c.regs.map(([i, r]) => [i, BigInt(r)]));
   c.flags.forEach((f, i) => v.setUint8(FLAGS + i, f));
+  if (MXCSR) v.setUint32(MXCSR, 0x1F80, true);
   for (const [addr, bytes] of c.mem) {
     const base = Number(BigInt(addr));
     for (let i = 0; i < bytes.length; i += 2) v.setUint8(base + i / 2, parseInt(bytes.substr(i, 2), 16));

@@ -24,7 +24,8 @@ use crate::lift::compile::{
     LlvmTool, compile_to_wasm64_object, find_llvm_tool, find_on_path, rustc_tool_dir,
 };
 use crate::lift::{
-    STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_XMM_OFFSET, lift_module,
+    STATE_FLAGS_OFFSET, STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_MXCSR_OFFSET,
+    STATE_XMM_OFFSET, lift_module,
 };
 
 pub(super) const RAX: usize = 0;
@@ -423,7 +424,7 @@ pub(super) fn run(built: &Built, cases: &[Case]) -> Vec<Outcome> {
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"state\":\"{STATE_ADDR:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"cases\":["
+        "{{\"state\":\"{STATE_ADDR:#x}\",\"gprOffset\":{STATE_GPR_OFFSET},\"flagsOffset\":{STATE_FLAGS_OFFSET},\"xmmOffset\":{STATE_XMM_OFFSET},\"mxcsrOffset\":{STATE_MXCSR_OFFSET},\"cases\":["
     );
     for (i, case) in cases.iter().enumerate() {
         if i > 0 {
