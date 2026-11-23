@@ -60,7 +60,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement minimal COM-like `ID3D12Device` / `ID3D12GraphicsCommandList` / `PresentX` shim layer that emits packets matching `docs/gpu_commands.md`.
 - [x] **G4 — `WGPK` `.wgsl.pack` Binary Loader & Shader Module Cache** — `DONE` (PR #26, closes #18) *(no game files required)*
   - Parse `.wgsl.pack` binary bundles (`shaders/src/pack.rs`) in JS (`web/workers/wgsl_pack_loader.js`), resolve WGSL by 64-bit FNV-1a hash, and cache compiled `GPUShaderModule`s.
-- [ ] **G5 — D3D12-XS Textures, Samplers, BindGroups, Indexed Draw & Compute Dispatch** — `IN PROGRESS` (#24, @MarcBlattmann) *(no game files required)*
+- [x] **G5 — D3D12-XS Textures, Samplers, BindGroups, Indexed Draw & Compute Dispatch** — `DONE` (PR #55, closes #24) *(no game files required)*
   - Extend GPU command ABI, `CommandEncoder`, `d3d12_xs.h`, and `wgpu_worker.js` with textures, samplers, bind groups, indexed drawing, and compute dispatch (for RDNA2 mesh-compute lowering).
 - [ ] **G6 — D3D12-XS Descriptor Heaps, Root Signatures & Resource State Tracker** — `IN PROGRESS` (#44, @Timon-ok) *(no game files required — disjoint files `runtime/gpu/descriptor_heap.{h,cpp}`, `tests/test_descriptor_heap.cpp`)*
   - Implement CPU/GPU descriptor heap tables (`CBV_SRV_UAV`, `SAMPLER`, `RTV`, `DSV`), root signature parameter mapping, and dirty-bind-group caching that compiles D3D12 descriptor tables into WebGPU `CreateBindGroup`/`SetBindGroup` calls.
@@ -68,12 +68,14 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Hash D3D12 graphics & compute PSO descriptors (blend/depth/rasterizer/vertex-layout/shader hashes) to deduplicate WebGPU pipeline creation and track active RTV/DSV/viewport/scissor state per command list.
 - [x] **G8 — Binary GPU Command Stream Disassembler & Trace Inspector** — `DONE` (PR #49, closes #32) *(no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
   - Parse recorded `playgta6` GPU command ring byte streams into human-readable/JSON frame traces with opcode histograms, byte counts, and malformed-packet diagnostics for debugging M3 frames.
-- [ ] **G9 — WebGPU `OffscreenCanvas` Swapchain, Depth-Stencil & Resize Manager** — `IN PROGRESS` (#54, @MarcBlattmann) *(no game files required — disjoint files `web/workers/wgpu_swapchain.js`, `tests/test_wgpu_swapchain.mjs`)*
+- [x] **G9 — WebGPU `OffscreenCanvas` Swapchain, Depth-Stencil & Resize Manager** — `DONE` (PR #59, closes #54) *(no game files required — disjoint files `web/workers/wgpu_swapchain.js`, `tests/test_wgpu_swapchain.mjs`)*
   - Manage `OffscreenCanvas` WebGPU context config, DPR-aware dynamic resize, `depth24plus`/`depth32float` depth-stencil attachment lifecycle, `device.lost` recovery, and frame-pacing telemetry.
 - [ ] **G10 — BCn / Texture Format & Mip-Chain Upload Helpers** — `IN PROGRESS` (#57, @MarcBlattmann) *(no game files required — disjoint files `web/workers/texture_formats.js`, `tests/test_texture_formats.mjs`)*
   - Map DXGI/Xbox texture formats (`BC1`–`BC7`, `RGBA8`, `RGBA16F`, depth/stencil) to WebGPU `GPUTextureFormat`, compute 256-byte-aligned `bytesPerRow` + mip dimensions, and provide CPU fallback BC1/BC3 decompression when WebGPU `texture-compression-bc` is absent.
-- [ ] **G11 — WebGPU Pipeline & BindGroupLayout Cache Manager (`web/workers/pipeline_cache.js`)** *(unclaimed; no game files required — disjoint files `web/workers/pipeline_cache.js`, `tests/test_pipeline_cache.mjs`)*
+- [ ] **G11 — WebGPU Pipeline & BindGroupLayout Cache Manager (`web/workers/pipeline_cache.js`)** — `IN PROGRESS` (#62, @MarcBlattmann) *(no game files required — disjoint files `web/workers/pipeline_cache.js`, `tests/test_pipeline_cache.mjs`)*
   - Deduplicate `GPURenderPipeline` and `GPUComputePipeline` creation in JS by descriptor hash, support async `createRenderPipelineAsync` warm-up, and consume shader reflection metadata (`S6`).
+- [ ] **G12 — Update `tools/gpu_trace.py` for G5 Opcodes `12..21`** *(unclaimed; no game files required — disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
+  - Add full typed payload decoding for `CreateTexture`..`DispatchCompute` (`12..21`), compute pass summaries, and texture/bind-group histograms matching the merged `G5` ABI.
 
 ---
 
@@ -120,11 +122,15 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Read-only parser for `msft-xvd` container headers (version, content type, drive/embedded XVD sizes, XVC region presence, encryption flags) wired as `playgta6-manifest xvd <path> [--json]`.
 - [ ] **W11 — Streaming Browser RPF9 TOC & Virtual File System Reader** — `IN PROGRESS` (#52, @MarcBlattmann) *(no game files required — disjoint files `web/workers/rpf9_vfs.js`, `tests/test_rpf9_vfs.mjs`)*
   - Fetch only RPF header + TOC + requested sub-file byte ranges via `RangeCache`, parse directory/file entries & names table, resolve virtual paths, and stream sub-file chunks on demand.
-- [ ] **W12 — `AudioWorklet` SAB Ring Processor & Main-Thread WebAudio Engine** — `IN PROGRESS` (#53, @MarcBlattmann) *(no game files required — disjoint files `web/workers/audio_worklet_processor.js`, `web/audio/audio_engine.js`, `tests/test_audio_engine.mjs`)*
+- [x] **W12 — `AudioWorklet` SAB Ring Processor & Main-Thread WebAudio Engine** — `DONE` (PR #60, closes #53) *(no game files required — disjoint files `web/workers/audio_worklet_processor.js`, `web/audio/audio_engine.js`, `tests/test_audio_engine.mjs`)*
   - Zero-GC `AudioWorkletProcessor` pulling 128-frame stereo blocks from `AudioRingBuffer` SAB + main-thread `AudioEngine` (`AudioContext` bootstrap, user-gesture unlock, volume/mute, underrun telemetry).
 - [ ] **W13 — Local Preflight & Milestone Readiness Checker CLI** — `IN PROGRESS` (#58, @MarcBlattmann) *(no game files required — disjoint files `tools/preflight.py`, `tests/test_preflight.py`)*
   - Single-command `python tools/preflight.py [--json]` verifying toolchains, `.env` / `GTA6_GAME_DIR`, COOP/COEP server sanity, `web/dist/runtime.wasm`, `data-manifest.json`, `bootset.json`, and `.wgsl.pack` readiness.
-- [ ] **W14 — OPFS Cache Quota Inspector & Browser Storage Manager** *(unclaimed; no game files required — disjoint files `web/storage/storage_manager.js`, `tests/test_storage_manager.mjs`)*
+- [ ] **W14 — OPFS Cache Quota Inspector & Browser Storage Manager** — `IN PROGRESS` (#63, @MarcBlattmann) *(no game files required — disjoint files `web/storage/storage_manager.js`, `tests/test_storage_manager.mjs`)*
   - Query `navigator.storage.estimate()`, request persistent storage, inspect/clear OPFS range cache and IndexedDB `/userdata` slots cleanly from the browser HUD.
-- [ ] **W15 — Frame Telemetry Ring & Performance Profiler (`web/telemetry/perf_monitor.js`)** *(unclaimed; no game files required — disjoint files `web/telemetry/perf_monitor.js`, `tests/test_perf_monitor.mjs`)*
+- [ ] **W15 — Frame Telemetry Ring & Performance Profiler (`web/telemetry/perf_monitor.js`)** — `IN PROGRESS` (#64, @MarcBlattmann) *(no game files required — disjoint files `web/telemetry/perf_monitor.js`, `tests/test_perf_monitor.mjs`)*
   - Lock-free rolling frame-time, p95/p99 latency, HTTP Range throughput, GPU packet rate, and audio underrun aggregator feeding `window.playgta6Hud.updateMetrics()`.
+- [ ] **W16 — Browser WebGPU Smoke Demo & Built-in Intro Splash Test Scene (`web/demo/smoke_scene.js`)** *(unclaimed; no game files required — disjoint files `web/demo/smoke_scene.js`, `tests/test_smoke_scene.mjs`)*
+  - Self-contained binary command stream generator exercising `G5` (`CreateTexture`, `CreateSampler`, `CreateBindGroup`, `SetIndexBuffer`, `DrawIndexed`, `DispatchCompute`) + `WgpuSwapchain` so opening `http://127.0.0.1:8080` renders a live textured 3D/compute frame in Chrome/Edge even before `runtime.wasm` is compiled.
+- [ ] **W17 — Emscripten Wasm64 Build Script for Linux/macOS (`runtime/build_wasm.sh`) & CI Artifact Check** *(unclaimed; no game files required — disjoint file `runtime/build_wasm.sh`)*
+  - Cross-platform POSIX shell counterpart to `runtime/build_wasm.ps1` (`--check-only`, `-sMEMORY64=1 -pthread`, `web/dist/runtime.{js,wasm}` output).
