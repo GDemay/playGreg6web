@@ -16,7 +16,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Emit a sanitized symbol-only report (`docs/imports_required.md` — DLL + function names only, zero game bytes).
 - [x] **R2 — x86-64 Decoder & Function Discovery** — `DONE` (PR #37, closes #13) *(no game files required for unit tests)*
   - Integrate `iced-x86` to decode `.text` blocks, follow calls/jumps, and build a CFG + relocation map.
-- [ ] **R3 — LLVM IR → Wasm64 Lifter Prototype** — `IN PROGRESS` (#14, @Timon-ok) *(no game files required)*
+- [x] **R3 — LLVM IR → Wasm64 Lifter Prototype** — `DONE` (PR #132, closes #14) *(no game files required)*
   - Lift small synthetic x86-64 test functions (arithmetic, branches, memory loads/stores, Win64 ABI calls) to LLVM IR and compile to `wasm64`.
 - [x] **R4 — PE64 `.pdata` Exception Directory & Jump-Table Recovery** — `DONE` (PR #85, closes #38) *(no game files required — disjoint file `recomp/src/pdata.rs`)*
   - Parse PE64 `IMAGE_DIRECTORY_ENTRY_EXCEPTION` (`RUNTIME_FUNCTION` begin/end/unwind RVA) and `UNWIND_INFO` to recover exact function boundaries and switch/jump tables without heuristics.
@@ -24,11 +24,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Given parsed PE64 imports (`R1`), generate C++/LLVM thunk glue tables binding imported Xbox/Win32 DLL symbols to `pg6_win32_*` / `pg6_gdk_*` / `d3d12_xs` runtime shims (and safe panic/log stubs for unresolved symbols).
 - [x] **R6 — PE Section Image & Relocation Packer for Wasm64 Memory** — `DONE` (PR #78, closes #40) *(no game files required — disjoint file `recomp/src/image.rs`)*
   - Emit a deterministic Wasm64 static data image + base-relocation table (`.rdata`, `.data`, `.bss`, `.reloc`) so recompiled code sees the exact guest virtual address layout inside `VirtualMemoryArena`.
-- [ ] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `IN PROGRESS` (#118, @Timon-ok) *(no game files required — starts once R3 is merged)*
+- [ ] **R7 — Lifter Coverage: String Ops, Bit Ops, Atomics & Remaining Integer Instructions (`recomp/src/lift/`)** — `IN PROGRESS` (#118, @Timon-ok) *(no game files required)*
   - Lift `rep movs/stos/cmps/scas/lods`, `bt*`, `bsf/bsr/tzcnt/lzcnt/popcnt`, `cmpxchg`/`xadd`/`bswap`, `rcl/rcr`, `shld/shrd`, `loop`/`jrcxz`, `leave`/`enter`, and `lock`-prefixed atomics, verified by execution and host-CPU differential tests.
-- [ ] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `IN PROGRESS` (#119, @Timon-ok) *(no game files required — starts once R3 is merged; disjoint file `recomp/src/lift/simd.rs`)*
+- [ ] **R8 — Lifter Coverage: SSE/SSE2 Scalar & Packed Float and Integer SIMD (`recomp/src/lift/simd.rs`)** — `IN PROGRESS` (#119, @Timon-ok) *(no game files required — disjoint file `recomp/src/lift/simd.rs`)*
   - Lift the SSE/SSE2 (+ commonly emitted SSE3/SSSE3/SSE4.1) instructions MSVC x64 code uses onto the XMM slots of the guest state, verified by execution and host-CPU differential tests.
-- [ ] **R9 — End-to-End Recompile Pipeline Driver (`recomp/src/pipeline.rs`)** — `IN PROGRESS` (#120, @Timon-ok) *(no game files required — starts once R3 is merged; disjoint file `recomp/src/pipeline.rs`)*
+- [ ] **R9 — End-to-End Recompile Pipeline Driver (`recomp/src/pipeline.rs`)** — `IN PROGRESS` (#120, @Timon-ok) *(no game files required — disjoint file `recomp/src/pipeline.rs`)*
   - One `playgta6-recomp build <pe> --out <dir>` command chaining parse → `.pdata`-seeded discovery → lift → import thunks → packed guest image, with a deterministic build manifest and coverage report.
 
 ---
