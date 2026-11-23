@@ -30,6 +30,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Lift the SSE/SSE2 (+ commonly emitted SSE3/SSSE3/SSE4.1) instructions MSVC x64 code uses onto the XMM slots of the guest state, verified by execution and host-CPU differential tests.
 - [ ] **R9 — End-to-End Recompile Pipeline Driver (`recomp/src/pipeline.rs`)** — `IN PROGRESS` (#120, @Timon-ok) *(no game files required — disjoint file `recomp/src/pipeline.rs`)*
   - One `playgta6-recomp build <pe> --out <dir>` command chaining parse → `.pdata`-seeded discovery → lift → import thunks → packed guest image, with a deterministic build manifest and coverage report.
+- [ ] **R10 — MSVC x64 Jump-Table Pattern Recovery (`recomp/src/jump_table.rs`)** — `UNCLAIMED` *(driven by M2 discovery: 9,969 unresolved switch tables in `game_scarlett_master.exe`)*
+  - Expand `recomp/src/jump_table.rs` to recover MSVC image-base-relative (`lea rBase, [rip+...]; movsxd/mov reg, [rBase + idx*4]; add reg, rBase; jmp reg`) switch tables and bounds checks across the real binary.
 
 ---
 
@@ -58,6 +60,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Load the `PGIM` v1 container from `playgta6-recomp pack-image` (R6): validate, reserve at the preferred base, commit sections, copy payloads, apply DIR64/HIGHLOW relocations when rebased, and set page protections.
 - [x] **O11 — Runtime Shim Export Registration Table** — `DONE` (PR #133, closes #117) *(no game files required — disjoint files `runtime/os/shim_exports.{h,cpp}`, `tests/test_shim_exports.cpp`)*
   - Register every `pg6_win32_*` / `pg6_gdk_*` C-ABI shim with the O7 module registry under its Win32/GDK export name so guest `GetProcAddress` and the R5 import bridge can resolve them, with a header-sync test.
+- [ ] **O12 — Xbox Scarlett `xmem.dll` / `XCRDAPI.dll` / `xg_xs.dll` / `GameInput.dll` Shims (`runtime/os/xbox_scarlett.{h,cpp}`)** — `UNCLAIMED` *(driven by M2 `docs/imports_required.md`)*
+  - Implement C-ABI shims for the 12 `xmem.dll` physical/virtual memory APIs, `XCRDAPI.dll!DStorageGetFactory` (DirectStorage backed by HTTPFS), `xg_xs.dll` (`XGCreateTextureComputer`, `XGSuggestSwizzleMode`), and `GameInput.dll` ordinal `#1`.
+- [ ] **O13 — UCRT (`api-ms-win-crt-*`) & `VCRUNTIME140` C-ABI Bridge (`runtime/os/ucrt_bridge.{h,cpp}`)** — `UNCLAIMED` *(driven by M2 `docs/imports_required.md`: 186 C-runtime imports)*
+  - Expose thin Win64/C-ABI wrappers forwarding `api-ms-win-crt-{convert,filesystem,heap,locale,math,runtime,stdio,string,time,utility}` and `VCRUNTIME140` memory/string/exception exports onto Emscripten libc so `playgta6-recomp stubs` binds ~300 imports cleanly.
 
 ---
 
@@ -96,7 +102,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Wires `SmokeSceneController` (`W16`) + `GpuRingBuffer` + `WgpuSwapchain` (`G9`) + `WgpuCommandProcessor` + `GpuFrameRecorder` (`G13`) + `PerfMonitor` (`W15`) into a turnkey browser `requestAnimationFrame` driver for live WebGPU testing.
 - [x] **G16 — WebGPU Timestamp Query & Pass GPU-Time Profiler (`web/workers/gpu_timer.js`)** — `DONE` (PR #104, closes #94) *(no game files required — disjoint files `web/workers/gpu_timer.js`, `tests/test_gpu_timer.mjs`)*
   - Wraps optional WebGPU `'timestamp-query'` `GPUQuerySet` resolution (gracefully degrading when absent) to measure per-pass render/compute GPU timings in milliseconds.
-- [ ] **G17 — S6 Reflection Manifest Loader & Auto-BindGroup Builder (`web/workers/reflection_loader.js`)** — `IN PROGRESS` (#101, @MarcBlattmann) *(no game files required — disjoint files `web/workers/reflection_loader.js`, `tests/test_reflection_loader.mjs`)*
+- [x] **G17 — S6 Reflection Manifest Loader & Auto-BindGroup Builder (`web/workers/reflection_loader.js`)** — `DONE` (PR #126, closes #101) *(no game files required — disjoint files `web/workers/reflection_loader.js`, `tests/test_reflection_loader.mjs`)*
   - Parses `S6` (`shaders/src/reflect.rs`) reflection JSON manifests in JS and builds exact `GPUBindGroupLayout` + `GPUPipelineLayout` descriptors via `WebGpuPipelineCache` (`G11`).
 - [x] **G18 — WebGPU Dynamic Uniform Ring & Draw-Call Constant Batcher (`web/workers/uniform_ring.js`)** — `DONE` (PR #124, closes #106) *(no game files required — disjoint files `web/workers/uniform_ring.js`, `tests/test_uniform_ring.mjs`)*
   - 256-byte-aligned dynamic uniform buffer ring (`hasDynamicOffset: true`) for per-draw constant uploads (D3D12 root constants / CBVs) with single-upload per-frame flush.
@@ -202,3 +208,5 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Connect prioritized Range scheduling and on-demand RPF9 virtual sub-file streaming into the `HttpfsMailbox` worker loop.
 - [ ] **W33 — Headless Live Boot & HUD E2E Verification Harness (`tests/test_live_boot_e2e.mjs`)** — `UNCLAIMED` *(no game files required — wait for W30 merge)*
   - End-to-end test spinning up `server/serve_local.py`, fetching `/`, `/api/status`, and JS modules with `COOP`/`COEP` headers, and running `bootstrapPlayGta6App` + `HudController` through smoke-demo frames, trace export, and diagnostic bundle generation.
+- [ ] **W34 — Real RPF9 Little-Endian `0x52504639` (`"9FPR"`) Magic Support (`tools/src/rpf9.rs`, `web/workers/rpf9_vfs.js`)** — `IN PROGRESS` (#140, @MarcBlattmann) *(driven by M2 inspection of real Xbox `.rpf` archives)*
+  - Accept little-endian `0x52504639` (`39 46 50 52` = `"9FPR"`) alongside legacy big-endian `"RPF9"` headers in both the Rust CLI inspector and browser streaming RPF9 VFS reader.
