@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  hygiene:
+    name: No Game Files Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject forbidden game extensions or .env in git
+        run: |
+          BAD=$(git ls-files | grep -iE '(^|/)\.env$|\.(rpf|xvd|xvc|ttpf|awc|dxbc|spv|wgsl\.pack|exe|dll)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "Forbidden files tracked in git:"
+            echo "$BAD"
+            exit 1
+          fi
+
+  rust:
+    name: Rust Pipelines (recomp, shaders, tools)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+
+  runtime-cpp:
+    name: C++ Runtime ABI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          cmake -S runtime -B runtime/build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build runtime/build-host --parallel
+          ctest --test-dir runtime/build-host --output-on-failure
+
+  python-and-web:
+    name: Server, Local Env & Web JS Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: python -m unittest discover -s tests -v
+      - run: |
+          node --check web/loader.js
+          node --check web/workers/io_worker.js
+          node --check web/workers/wgpu_worker.js
+          node --check web/workers/audio_worker.js
+          node --check web/input/input_bridge.js
