@@ -25,17 +25,3 @@ flowchart LR
 2. **OS Shims (`runtime/`):** Reimplement required Xbox Series / Win32 APIs (`xgameruntime`, `XTaskQueue`, threading/TLS, virtual memory, file I/O, GameInput) backed by browser APIs.
 3. **GPU (`d3d12_xs` → WebGPU + WGSL):** Lower RDNA2 (`gfx1013`) shaders (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → **WGSL** (`naga`/`tint`), and map `d3d12_xs` command lists to WebGPU inside `wgpu_worker.js` (`OffscreenCanvas`).
 4. **Streaming I/O (`io_worker.js`):** Serve local `.rpf` archives on demand via HTTP `206 Partial Content` range requests + `bootset.json` prefetch + OPFS/IndexedDB caching.
-
----
-
-## Repo Layout
-
-```text
-PlayGreg6Web/
-├── web/          # index.html, loader.js, io_worker.js, wgpu_worker.js, audio_worker.js, input
-├── recomp/       # x86-64 -> LLVM IR -> Wasm64 static recompilation pipeline
-├── runtime/      # Xbox/Win32 OS shims + d3d12_xs -> WebGPU command bridge (compiled to Wasm64)
-├── shaders/      # RDNA2 -> SPIR-V -> WGSL (naga/tint) offline shader packer & index
-├── server/       # Local HTTP server with COOP/COEP + Range (206) support
-└── local-data/   # GITIGNORED: local game data, manifests, recompiled wasm, WGSL packs
-```
