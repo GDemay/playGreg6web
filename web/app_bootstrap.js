@@ -16,13 +16,20 @@ import { InputProfileManager } from './input/input_profiles.js';
 import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
 import { PerfMonitor } from './telemetry/perf_monitor.js';
-import { CrashReporter } from './telemetry/crash_report.js';
+import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
 import { BootTracer } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_VIEWPORT_WIDTH = 640;
 export const DEFAULT_VIEWPORT_HEIGHT = 360;
 export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
+export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
+
+const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const MAX_SIDE_MODULE_URLS = 256;
+const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+const POSIX_HOST_ROOT_RE =
+  /^\/(?:home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv|proc|sys|dev|run|Library|Applications)(?:\/|$)/i;
 
 function defaultNow() {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -195,6 +202,130 @@ function pickBootUrl(...candidates) {
   return null;
 }
 
+function toNonNegativeInt(value, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function sanitizeDiagnosticText(raw, maxLength = MAX_VALIDATION_ERROR_MESSAGE_LENGTH) {
+  if (raw === null || raw === undefined) {
+    return '';
+  }
+  let text = typeof raw === 'string' ? raw : String(raw);
+  text = text.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
+  text = sanitizeString(text);
+  // Strip embedded data URIs, byte arrays, long hex dumps, and base64 blobs so
+  // diagnostic messages never carry raw memory or asset dumps.
+  text = text.replace(/\bdata:[^\s;,'"`<>]+;base64,[A-Za-z0-9+/=]{16,}/gi, '<buffer>');
+  text = text.replace(/(?:\b(?:0x)?[0-9a-fA-F]{1,4}\s*,\s*){16,}(?:0x)?[0-9a-fA-F]{1,4}\b/g, '<buffer>');
+  text = text.replace(/(?:\b[0-9a-fA-F]{2}\s+){16,}[0-9a-fA-F]{2}\b/g, '<buffer>');
+  text = text.replace(/\b(?:0x)?[0-9a-fA-F]{48,}\b/g, '<buffer>');
+  text = text.replace(/(^|[\s"'`(\[=,:])[A-Za-z0-9+/]{64,}={0,2}(?=$|[\s"'`)\]=,.;:])/g, '$1<buffer>');
+  text = text.replace(/\s{2,}/g, ' ').trim();
+  if (text.length > maxLength) {
+    text = `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+  return text;
+}
+
+function classifyGpuValidationErrorType(raw, fallback = 'validation') {
+  if (typeof raw !== 'string') {
+    return fallback;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (
+    normalized === 'out-of-memory' ||
+    normalized === 'out_of_memory' ||
+    normalized === 'outofmemory' ||
+    normalized === 'oom' ||
+    normalized.includes('outofmemory') ||
+    normalized.includes('out-of-memory') ||
+    normalized.includes('out_of_memory')
+  ) {
+    return 'out-of-memory';
+  }
+  if (normalized === 'validation' || normalized.includes('validation')) {
+    return 'validation';
+  }
+  if (normalized === 'internal' || normalized.includes('internal')) {
+    return 'internal';
+  }
+  if (normalized === 'unknown') {
+    return 'unknown';
+  }
+  return fallback;
+}
+
+function sanitizeSideModuleUrl(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes('\0') || trimmed.includes('\\')) {
+    return null;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!/\.wasm$/i.test(withoutQuery)) {
+    return null;
+  }
+  if (ABSOLUTE_URL_RE.test(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return null;
+    }
+    if (typeof URL === 'function') {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.username || parsed.password) {
+          return null;
+        }
+        const pathSegs = parsed.pathname.split('/');
+        if (pathSegs.includes('..') || POSIX_HOST_ROOT_RE.test(parsed.pathname)) {
+          return null;
+        }
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return null;
+      }
+    }
+    return withoutQuery;
+  }
+  if (POSIX_HOST_ROOT_RE.test(withoutQuery)) {
+    return null;
+  }
+  const segments = withoutQuery.replace(/^\/+/, '').split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    if (segments[i] === '..') {
+      return null;
+    }
+  }
+  return withoutQuery;
+}
+
+export function sanitizeSideModuleUrls(rawList) {
+  if (!Array.isArray(rawList)) {
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length && out.length < MAX_SIDE_MODULE_URLS; i += 1) {
+    const clean = sanitizeSideModuleUrl(rawList[i]);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
 export function extractBootAssetUrls(source) {
   if (!source || typeof source !== 'object') {
     return {};
@@ -216,6 +347,19 @@ export function extractBootAssetUrls(source) {
   if (reflectionManifestUrl) out.reflectionManifestUrl = reflectionManifestUrl;
   if (pgimUrl) out.pgimUrl = pgimUrl;
   if (programManifestUrl) out.programManifestUrl = programManifestUrl;
+
+  if (Array.isArray(source.sideModuleUrls)) {
+    out.sideModuleUrls = sanitizeSideModuleUrls(source.sideModuleUrls);
+  }
+  const parsedSideModuleCount = toNonNegativeInt(source.sideModuleCount, null);
+  if (parsedSideModuleCount !== null) {
+    out.sideModuleCount =
+      Array.isArray(out.sideModuleUrls) && out.sideModuleUrls.length > parsedSideModuleCount
+        ? out.sideModuleUrls.length
+        : parsedSideModuleCount;
+  } else if (Array.isArray(out.sideModuleUrls)) {
+    out.sideModuleCount = out.sideModuleUrls.length;
+  }
   return out;
 }
 
@@ -399,6 +543,7 @@ export class PlayGta6AppHandle {
 
     this._getSmokeRunner = components.getSmokeRunner;
     this._getWasmWorker = components.getWasmWorker;
+    this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._start = components.start;
     this._stop = components.stop;
@@ -417,6 +562,10 @@ export class PlayGta6AppHandle {
 
   getWasmWorker() {
     return this._getWasmWorker();
+  }
+
+  getDiagnosticsSnapshot() {
+    return this._getDiagnosticsSnapshot();
   }
 
   notifyFirstPresent(meta) {
@@ -547,6 +696,104 @@ export function bootstrapPlayGta6App(options = {}) {
   const defaultGameBase = resolveDefaultGameBase(options, windowObj);
   const initialBootAssets = extractBootAssetUrls(options);
   let latestDiscoveredBootAssets = { ...initialBootAssets };
+  let lastNotifiedSideModuleKey = null;
+  let session = null;
+
+  function invokeFirstHook(target, methodNames, ...args) {
+    if (!target || typeof target !== 'object') {
+      return false;
+    }
+    for (let i = 0; i < methodNames.length; i += 1) {
+      const fn = target[methodNames[i]];
+      if (typeof fn === 'function') {
+        try {
+          fn.apply(target, args);
+        } catch {
+          // Optional observer hooks must never disrupt bootstrap or runtime execution.
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function resolveHudTargets() {
+    const targets = [];
+    const pushUnique = (candidate) => {
+      if (candidate && typeof candidate === 'object' && !targets.includes(candidate)) {
+        targets.push(candidate);
+      }
+    };
+    pushUnique(hud);
+    pushUnique(options.hudController);
+    if (windowObj && typeof windowObj === 'object') {
+      pushUnique(windowObj.playgta6HudController);
+    }
+    return targets;
+  }
+
+  function notifySideModulePreflight(assets) {
+    if (destroyed || !assets || typeof assets !== 'object') {
+      return;
+    }
+    const hasUrls = Array.isArray(assets.sideModuleUrls);
+    const hasCount =
+      typeof assets.sideModuleCount === 'number' && Number.isFinite(assets.sideModuleCount);
+    if (!hasUrls && !hasCount) {
+      return;
+    }
+    const urls = hasUrls ? assets.sideModuleUrls.slice() : [];
+    const count = hasCount ? Math.max(0, Math.floor(assets.sideModuleCount)) : urls.length;
+    const signature = `${count}|${urls.join(',')}`;
+    if (signature === lastNotifiedSideModuleKey) {
+      return;
+    }
+    lastNotifiedSideModuleKey = signature;
+
+    const payload = Object.freeze({
+      sideModuleCount: count,
+      sideModuleUrls: Object.freeze(urls.slice()),
+    });
+
+    if (session) {
+      invokeFirstHook(
+        session,
+        [
+          'setSideModules',
+          'updateSideModules',
+          'onSideModulesDiscovered',
+          'recordSideModules',
+          'setSplitModuleInfo',
+          'updateSplitModuleStatus',
+        ],
+        payload
+      );
+    }
+
+    const hudTargets = resolveHudTargets();
+    for (let i = 0; i < hudTargets.length; i += 1) {
+      const target = hudTargets[i];
+      const handled = invokeFirstHook(
+        target,
+        [
+          'setSideModules',
+          'updateSideModules',
+          'onSideModulesDiscovered',
+          'recordSideModules',
+          'setSplitModuleInfo',
+          'updateSplitModuleStatus',
+        ],
+        payload
+      );
+      if (!handled && target === hud && typeof target.updateMetrics === 'function') {
+        try {
+          target.updateMetrics({ sideModuleCount: count, sideModuleUrls: urls.slice() });
+        } catch {
+          // Ignore HUD metrics errors.
+        }
+      }
+    }
+  }
 
   function recordDiscoveredBootAssets(payload) {
     if (!payload || typeof payload !== 'object') {
@@ -558,6 +805,9 @@ export function bootstrapPlayGta6App(options = {}) {
     const merged = { ...fromDirect, ...fromStatus, ...fromAssets };
     if (Object.keys(merged).length > 0) {
       latestDiscoveredBootAssets = { ...latestDiscoveredBootAssets, ...merged };
+      if (merged.sideModuleUrls !== undefined || merged.sideModuleCount !== undefined) {
+        notifySideModulePreflight(latestDiscoveredBootAssets);
+      }
     }
   }
 
@@ -598,6 +848,14 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (merged.programManifestUrl) {
       fields.programManifestUrl = merged.programManifestUrl;
+    }
+    if (Array.isArray(merged.sideModuleUrls)) {
+      fields.sideModuleUrls = merged.sideModuleUrls.slice();
+    }
+    if (typeof merged.sideModuleCount === 'number' && Number.isFinite(merged.sideModuleCount)) {
+      fields.sideModuleCount = Math.max(0, Math.floor(merged.sideModuleCount));
+    } else if (Array.isArray(fields.sideModuleUrls)) {
+      fields.sideModuleCount = fields.sideModuleUrls.length;
     }
     return fields;
   }
@@ -928,6 +1186,258 @@ export function bootstrapPlayGta6App(options = {}) {
     }
   }
 
+  const maxValidationErrors =
+    Number.isInteger(options.maxValidationErrors) && options.maxValidationErrors >= 1
+      ? options.maxValidationErrors
+      : DEFAULT_MAX_VALIDATION_ERRORS;
+  let validationErrorSeq = 0;
+  let validationErrorCount = 0;
+  const recentValidationErrors = [];
+  let wgpuFramesPresented = 0;
+  let splashFramesPresented = 0;
+
+  function recordValidationError(rawData, opts = {}) {
+    if (destroyed) {
+      return null;
+    }
+    const data = rawData && typeof rawData === 'object' ? rawData : { message: rawData };
+    const inner =
+      (data.record && typeof data.record === 'object' ? data.record : null) ||
+      (data.error && typeof data.error === 'object' ? data.error : null);
+
+    const rawType =
+      data.errorType ??
+      data.kind ??
+      (inner && (inner.errorType ?? inner.type ?? inner.name)) ??
+      (typeof data.name === 'string' ? data.name : null);
+    const errorType = classifyGpuValidationErrorType(rawType, 'validation');
+
+    const rawMessage =
+      data.message !== undefined && data.message !== null
+        ? data.message
+        : inner && inner.message !== undefined && inner.message !== null
+          ? inner.message
+          : typeof data.error === 'string'
+            ? data.error
+            : '';
+    const message = sanitizeDiagnosticText(rawMessage, MAX_VALIDATION_ERROR_MESSAGE_LENGTH);
+
+    const rawSeq = data.seq ?? (inner ? inner.seq : null);
+    const parsedSeq = toNonNegativeInt(rawSeq, null);
+    validationErrorSeq =
+      parsedSeq !== null && parsedSeq > validationErrorSeq ? parsedSeq : validationErrorSeq + 1;
+    validationErrorCount += 1;
+
+    const rawTs = data.timestampMs ?? data.timestamp ?? (inner ? inner.timestampMs : null);
+    const timestampMs =
+      typeof rawTs === 'number' && Number.isFinite(rawTs) ? rawTs : epochNow();
+
+    const rawSource =
+      opts.source ?? data.source ?? (inner ? inner.source : null) ?? 'wgpu_worker';
+    const source = sanitizeDiagnosticText(rawSource, 64) || 'wgpu_worker';
+
+    const record = Object.freeze({
+      seq: validationErrorSeq,
+      errorType,
+      message,
+      timestampMs,
+      source,
+    });
+
+    recentValidationErrors.push(record);
+    while (recentValidationErrors.length > maxValidationErrors) {
+      recentValidationErrors.shift();
+    }
+
+    if (opts.skipCrashReporter !== true) {
+      const errorName =
+        errorType === 'out-of-memory'
+          ? 'GPUOutOfMemoryError'
+          : errorType === 'internal'
+            ? 'GPUInternalError'
+            : 'GPUValidationError';
+      crashReporter.recordError(
+        'webgpu_validation',
+        { name: errorName, message },
+        { source, errorType, seq: record.seq, timestampMs }
+      );
+    }
+
+    const eventPayload = Object.freeze({
+      type: 'gpu-validation-error',
+      seq: record.seq,
+      errorType: record.errorType,
+      message: record.message,
+      timestampMs: record.timestampMs,
+      source: record.source,
+      validationErrorCount,
+    });
+
+    if (session) {
+      invokeFirstHook(
+        session,
+        [
+          'onGpuValidationError',
+          'recordGpuValidationError',
+          'handleGpuValidationError',
+          'handleWorkerMessage',
+        ],
+        eventPayload
+      );
+    }
+
+    const hudTargets = resolveHudTargets();
+    for (let i = 0; i < hudTargets.length; i += 1) {
+      const target = hudTargets[i];
+      const handled = invokeFirstHook(
+        target,
+        [
+          'onGpuValidationError',
+          'recordGpuValidationError',
+          'handleGpuValidationError',
+          'reportValidationError',
+        ],
+        eventPayload
+      );
+      if (
+        !handled &&
+        target === hud &&
+        opts.skipHudLog !== true &&
+        typeof target.appendLog === 'function'
+      ) {
+        try {
+          target.appendLog(
+            `[WebGPU ${record.errorType}] ${record.message || 'Validation error'}`,
+            'error'
+          );
+        } catch {
+          // Ignore HUD errors.
+        }
+      }
+    }
+
+    if (gpuBootPanel) {
+      invokeFirstHook(
+        gpuBootPanel,
+        ['onGpuValidationError', 'recordGpuValidationError', 'handleGpuValidationError'],
+        eventPayload
+      );
+    }
+
+    return record;
+  }
+
+  function handleGpuValidationErrorMessage(data) {
+    if (!data || typeof data !== 'object' || data.type !== 'gpu-validation-error') {
+      return false;
+    }
+    recordValidationError(data, { source: data.source || 'wgpu_worker' });
+    return true;
+  }
+
+  function handleSplashFramePresentedMessage(data) {
+    if (!data || typeof data !== 'object' || data.type !== 'splash-frame-presented') {
+      return false;
+    }
+    if (destroyed) {
+      return false;
+    }
+
+    const ok = data.ok !== false;
+    const frameIndex =
+      Number.isInteger(data.frameIndex) && data.frameIndex >= 0 ? data.frameIndex : null;
+    const reportedFrames = toNonNegativeInt(data.framesPresented, null);
+    const firstPresent = Boolean(data.firstPresent);
+    const error = data.error ? sanitizeDiagnosticText(data.error) : null;
+    const reason = data.reason ? sanitizeDiagnosticText(data.reason, 128) : null;
+    const rawTs = data.timestampMs ?? data.timestamp;
+    const timestampMs =
+      typeof rawTs === 'number' && Number.isFinite(rawTs) ? rawTs : epochNow();
+
+    if (reportedFrames !== null) {
+      wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+    } else if (ok) {
+      wgpuFramesPresented += 1;
+    }
+    if (ok) {
+      splashFramesPresented += 1;
+    }
+    const effectiveFramesPresented = Math.max(wgpuFramesPresented, reportedFrames ?? 0);
+
+    if (ok && (firstPresent || effectiveFramesPresented >= 1)) {
+      notifyFirstPresent({
+        source: 'splash-frame-presented',
+        frameIndex,
+        framesPresented: effectiveFramesPresented,
+      });
+    } else if (!ok && error) {
+      crashReporter.recordLog('warn', 'wgpu_worker', `splash-frame-presented failed: ${error}`);
+    }
+
+    if (ok && gpuBootPanel) {
+      safeUpdateGpuBootPanel({
+        frameStats: {
+          ...(latestPanelFrameStats && typeof latestPanelFrameStats === 'object'
+            ? latestPanelFrameStats
+            : {}),
+          framesPresented: effectiveFramesPresented,
+          droppedFrames:
+            latestPanelFrameStats && Number.isFinite(latestPanelFrameStats.droppedFrames)
+              ? latestPanelFrameStats.droppedFrames
+              : 0,
+        },
+      });
+    }
+
+    const eventPayload = Object.freeze({
+      type: 'splash-frame-presented',
+      ok,
+      frameIndex,
+      framesPresented: effectiveFramesPresented,
+      splashFramesPresented,
+      firstPresent,
+      ...(error ? { error } : {}),
+      ...(reason ? { reason } : {}),
+      timestampMs,
+    });
+
+    if (session) {
+      invokeFirstHook(
+        session,
+        [
+          'onSplashFramePresented',
+          'recordSplashFramePresented',
+          'handleSplashFramePresented',
+          'handleWorkerMessage',
+        ],
+        eventPayload
+      );
+    }
+
+    const hudTargets = resolveHudTargets();
+    for (let i = 0; i < hudTargets.length; i += 1) {
+      invokeFirstHook(
+        hudTargets[i],
+        [
+          'onSplashFramePresented',
+          'recordSplashFramePresented',
+          'handleSplashFramePresented',
+        ],
+        eventPayload
+      );
+    }
+
+    if (gpuBootPanel) {
+      invokeFirstHook(
+        gpuBootPanel,
+        ['onSplashFramePresented', 'handleSplashFramePresented'],
+        eventPayload
+      );
+    }
+
+    return true;
+  }
+
   function handleGpuTelemetryMessage(data) {
     if (!data || typeof data !== 'object' || data.type !== 'gpu-telemetry') {
       return false;
@@ -938,6 +1448,13 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (data.frameStats !== undefined) {
       patch.frameStats = data.frameStats;
+      const reportedFrames = toNonNegativeInt(
+        data.frameStats && data.frameStats.framesPresented,
+        null
+      );
+      if (reportedFrames !== null) {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+      }
     }
     if (data.fallbackStats !== undefined) {
       patch.fallbackStats = data.fallbackStats;
@@ -947,6 +1464,37 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     safeUpdateGpuBootPanel(patch);
     return true;
+  }
+
+  function handleWorkerMessage(data) {
+    if (!data || typeof data !== 'object') {
+      return false;
+    }
+    if (data.type === 'gpu-telemetry') {
+      return handleGpuTelemetryMessage(data);
+    }
+    if (data.type === 'gpu-validation-error') {
+      return handleGpuValidationErrorMessage(data);
+    }
+    if (data.type === 'splash-frame-presented') {
+      return handleSplashFramePresentedMessage(data);
+    }
+    if (data.type === 'first-present') {
+      const reportedFrames = toNonNegativeInt(data.framesPresented, null);
+      if (reportedFrames !== null) {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+      } else {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, 1);
+      }
+      notifyFirstPresent({
+        source: sanitizeDiagnosticText(data.source || 'wgpu_worker', 64) || 'wgpu_worker',
+        frameIndex:
+          Number.isInteger(data.frameIndex) && data.frameIndex >= 0 ? data.frameIndex : 0,
+        framesPresented: wgpuFramesPresented,
+      });
+      return true;
+    }
+    return false;
   }
 
   function hookBootTracerForPanel() {
@@ -1268,7 +1816,7 @@ export function bootstrapPlayGta6App(options = {}) {
         return;
       }
       const data = ev && typeof ev === 'object' && ev.data !== undefined ? ev.data : ev;
-      handleGpuTelemetryMessage(data);
+      handleWorkerMessage(data);
     };
 
     let usedAddEventListener = false;
@@ -1303,8 +1851,7 @@ export function bootstrapPlayGta6App(options = {}) {
         progressChannel.onmessage = (ev) => {
           const data = ev && ev.data && typeof ev.data === 'object' ? ev.data : null;
           if (!data) return;
-          if (data.type === 'gpu-telemetry') {
-            handleGpuTelemetryMessage(data);
+          if (handleWorkerMessage(data)) {
             return;
           }
           if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
@@ -1451,6 +1998,9 @@ export function bootstrapPlayGta6App(options = {}) {
     if (destroyed) {
       throw new Error('Cannot start SmokeDemoRunner on a destroyed PlayGta6AppHandle');
     }
+    if (launchContext && launchContext.serverStatus) {
+      recordDiscoveredBootAssets(launchContext.serverStatus);
+    }
     if (!canvas || typeof canvas !== 'object') {
       throw new Error('Cannot start SmokeDemoRunner: canvas is not configured');
     }
@@ -1513,6 +2063,10 @@ export function bootstrapPlayGta6App(options = {}) {
       if (deviceStopped || destroyed) return;
       const errObj = ev && ev.error ? ev.error : ev;
       crashReporter.recordError('webgpu_validation', errObj, { source: 'smokeDemo' });
+      recordValidationError(
+        { error: errObj, source: 'smokeDemo' },
+        { source: 'smokeDemo', skipCrashReporter: true, skipHudLog: true }
+      );
     };
 
     const hasDeviceEvents = isEventTargetLike(device);
@@ -1591,7 +2145,7 @@ export function bootstrapPlayGta6App(options = {}) {
       ? options.capabilityProbe
       : createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory });
 
-  const session = new RuntimeSessionController({
+  session = new RuntimeSessionController({
     fetchImpl,
     statusUrl,
     hud,
@@ -1608,6 +2162,13 @@ export function bootstrapPlayGta6App(options = {}) {
     audioGestureTarget:
       options.audioGestureTarget !== undefined ? options.audioGestureTarget : windowObj || undefined,
   });
+
+  if (
+    initialBootAssets.sideModuleUrls !== undefined ||
+    initialBootAssets.sideModuleCount !== undefined
+  ) {
+    notifySideModulePreflight(initialBootAssets);
+  }
 
   // 7b. Optional BootOrchestrator (W44) wired when splash overlay or explicit flag is enabled.
   const useBootOrchestrator =
@@ -1693,6 +2254,132 @@ export function bootstrapPlayGta6App(options = {}) {
     resizeListenerAttached = true;
   }
 
+  function resolveCurrentBootMode() {
+    if (session && typeof session.getBootMode === 'function') {
+      try {
+        const explicit = session.getBootMode();
+        if (typeof explicit === 'string' && explicit.trim().length > 0) {
+          return sanitizeDiagnosticText(explicit.trim(), 64);
+        }
+      } catch {
+        // Fall through to mode inference.
+      }
+    }
+    const sessionMode =
+      session && typeof session.getMode === 'function' ? session.getMode() : SESSION_MODE.NONE;
+    if (sessionMode === SESSION_MODE.WASM) {
+      return 'wasm-guest';
+    }
+    if (sessionMode === SESSION_MODE.SMOKE) {
+      return 'smoke-demo';
+    }
+    if (bootOrchestrator && typeof bootOrchestrator.getState === 'function') {
+      try {
+        const bState = bootOrchestrator.getState();
+        if (bState && typeof bState.bootMode === 'string' && bState.bootMode !== 'pending') {
+          return sanitizeDiagnosticText(bState.bootMode, 64);
+        }
+      } catch {
+        // Ignore orchestrator state errors.
+      }
+    }
+    return 'idle';
+  }
+
+  function resolveCurrentMilestone() {
+    if (bootTracer && typeof bootTracer.getSummary === 'function') {
+      try {
+        const summary = bootTracer.getSummary();
+        if (summary && typeof summary.stage === 'string' && summary.stage.length > 0) {
+          return sanitizeDiagnosticText(summary.stage, 64);
+        }
+      } catch {
+        // Ignore tracer errors.
+      }
+    }
+    return 'NOT_STARTED';
+  }
+
+  function resolveSideModuleCount() {
+    if (
+      typeof latestDiscoveredBootAssets.sideModuleCount === 'number' &&
+      Number.isFinite(latestDiscoveredBootAssets.sideModuleCount) &&
+      latestDiscoveredBootAssets.sideModuleCount >= 0
+    ) {
+      return Math.floor(latestDiscoveredBootAssets.sideModuleCount);
+    }
+    if (Array.isArray(latestDiscoveredBootAssets.sideModuleUrls)) {
+      return latestDiscoveredBootAssets.sideModuleUrls.length;
+    }
+    return 0;
+  }
+
+  function resolveFramesPresented() {
+    let frames = wgpuFramesPresented;
+    if (activeSmokeRunner && Number.isFinite(activeSmokeRunner.frameIndex)) {
+      frames = Math.max(frames, Math.max(0, Math.floor(activeSmokeRunner.frameIndex)));
+    }
+    if (perfMonitor && typeof perfMonitor.getSnapshot === 'function') {
+      try {
+        const snap = perfMonitor.getSnapshot();
+        const total = snap && snap.frames && snap.frames.totalFrames;
+        if (typeof total === 'number' && Number.isFinite(total) && total > 0) {
+          frames = Math.max(frames, Math.floor(total));
+        }
+      } catch {
+        // Ignore PerfMonitor errors.
+      }
+    }
+    return frames;
+  }
+
+  function getDiagnosticsSnapshot() {
+    let sessionState = SESSION_STATE.IDLE;
+    if (session && typeof session.getState === 'function') {
+      try {
+        const rawState = session.getState();
+        if (typeof rawState === 'string' && rawState.length > 0) {
+          sessionState = sanitizeDiagnosticText(rawState, 64);
+        }
+      } catch {
+        sessionState = SESSION_STATE.ERROR;
+      }
+    }
+    const recentCopy = Object.freeze(
+      recentValidationErrors.map((entry) => Object.freeze({ ...entry }))
+    );
+    return Object.freeze({
+      bootMode: resolveCurrentBootMode(),
+      sessionState,
+      milestone: resolveCurrentMilestone(),
+      sideModuleCount: resolveSideModuleCount(),
+      validationErrorCount,
+      recentValidationErrors: recentCopy,
+      framesPresented: resolveFramesPresented(),
+      splashFramesPresented,
+      destroyed,
+    });
+  }
+
+  const globalScope =
+    options.globalScope !== undefined ? options.globalScope : windowObj;
+  const diagnosticHook = Object.freeze({
+    getDiagnosticsSnapshot,
+  });
+  let attachedGlobalHook = false;
+  if (
+    options.attachGlobalHook !== false &&
+    globalScope &&
+    typeof globalScope === 'object'
+  ) {
+    try {
+      globalScope.__playgta6 = diagnosticHook;
+      attachedGlobalHook = true;
+    } catch {
+      // Ignore frozen or non-extensible global objects.
+    }
+  }
+
   async function start(startOpts) {
     if (destroyed) {
       return {
@@ -1703,6 +2390,7 @@ export function bootstrapPlayGta6App(options = {}) {
         error: new Error('PlayGta6AppHandle has been destroyed'),
       };
     }
+    lastNotifiedSideModuleKey = null;
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;
@@ -1710,15 +2398,23 @@ export function bootstrapPlayGta6App(options = {}) {
       const bootResult = await bootOrchestrator.start();
       recordDiscoveredBootAssets(bootResult);
       if (lastBootSessionResult) {
+        if (lastBootSessionResult.serverStatus) {
+          recordDiscoveredBootAssets(lastBootSessionResult.serverStatus);
+        }
         return lastBootSessionResult;
       }
-      if (bootResult && bootResult.ok === false) {
-        return session.start(startOpts);
+      const fallbackResult = await session.start(startOpts);
+      if (fallbackResult && fallbackResult.serverStatus) {
+        recordDiscoveredBootAssets(fallbackResult.serverStatus);
       }
-      return session.start(startOpts);
+      return fallbackResult;
     }
     latestDiscoveredBootAssets = { ...initialBootAssets };
-    return session.start(startOpts);
+    const sessionResult = await session.start(startOpts);
+    if (sessionResult && sessionResult.serverStatus) {
+      recordDiscoveredBootAssets(sessionResult.serverStatus);
+    }
+    return sessionResult;
   }
 
   async function stop() {
@@ -1744,6 +2440,17 @@ export function bootstrapPlayGta6App(options = {}) {
 
     destroyed = true;
     destroyPromise = (async () => {
+      if (attachedGlobalHook && globalScope && typeof globalScope === 'object') {
+        attachedGlobalHook = false;
+        try {
+          if (globalScope.__playgta6 === diagnosticHook) {
+            delete globalScope.__playgta6;
+          }
+        } catch {
+          // Ignore non-configurable global properties.
+        }
+      }
+
       if (resizeListenerAttached && isEventTargetLike(windowObj)) {
         resizeListenerAttached = false;
         windowObj.removeEventListener('resize', onWindowResize);
@@ -1854,6 +2561,7 @@ export function bootstrapPlayGta6App(options = {}) {
     bootOrchestrator,
     getSmokeRunner: () => activeSmokeRunner,
     getWasmWorker: () => activeWasmWorker,
+    getDiagnosticsSnapshot,
     notifyFirstPresent,
     start,
     stop,
