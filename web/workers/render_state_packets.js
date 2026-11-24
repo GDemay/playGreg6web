@@ -96,7 +96,9 @@ const KEY_OFFSET = 16; // CreateRenderPipeline2: header, then the 376-byte key
 const KEY_SIZE = 376;
 const CREATE_TEXTURE2_BYTES = 40;
 const MAX_TEXTURE_VIEW_FORMATS = 8;
-const GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST = 0x0040 | 0x0080 | 0x0008;
+const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
+const GPU_BUFFER_USAGE_STORAGE = 0x0080;
+const GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST = GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_STORAGE | 0x0008;
 const GPU_TEXTURE_USAGE_COPY_SRC = 0x0001;
 const GPU_TEXTURE_USAGE_COPY_DST = 0x0002;
 const GPU_TEXTURE_USAGE_TEXTURE_BINDING = 0x0004;
@@ -654,6 +656,248 @@ function wgslDeclaresGroup0(code) {
   return typeof code === 'string' && code.length > 0 && WGSL_GROUP0_RE.test(code);
 }
 
+const WGSL_GROUP0_VAR_RE =
+  /(?:@group\s*\(\s*0[ui]?\s*\)\s*@binding\s*\(\s*(\d+)[ui]?\s*\)|@binding\s*\(\s*(\d+)[ui]?\s*\)\s*@group\s*\(\s*0[ui]?\s*\))\s*var(?:\s*<\s*([^>]+)\s*>)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^;]+);/g;
+
+function classifyWgslTextureDim(typePrefix) {
+  if (typePrefix.endsWith('_2d_array')) return '2d-array';
+  if (typePrefix.endsWith('_cube_array')) return 'cube-array';
+  if (typePrefix.endsWith('_cube')) return 'cube';
+  if (typePrefix.endsWith('_3d')) return '3d';
+  if (typePrefix.endsWith('_1d')) return '1d';
+  if (typePrefix.endsWith('_2d') || typePrefix === 'texture_external') return '2d';
+  return '2d';
+}
+
+function extractWgslFunctionBodies(cleaned) {
+  const fnRe = /\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/g;
+  let bodies = '';
+  let foundFn = false;
+  let match;
+  while ((match = fnRe.exec(cleaned)) !== null) {
+    let i = match.index + match[0].length;
+    let parenDepth = 1;
+    while (i < cleaned.length && parenDepth > 0) {
+      if (cleaned[i] === '(') parenDepth += 1;
+      else if (cleaned[i] === ')') parenDepth -= 1;
+      i += 1;
+    }
+    while (i < cleaned.length && cleaned[i] !== '{') {
+      if (cleaned[i] === ';') break;
+      i += 1;
+    }
+    if (i >= cleaned.length || cleaned[i] !== '{') continue;
+    foundFn = true;
+    const bodyStart = i + 1;
+    let braceDepth = 1;
+    i += 1;
+    while (i < cleaned.length && braceDepth > 0) {
+      if (cleaned[i] === '{') braceDepth += 1;
+      else if (cleaned[i] === '}') braceDepth -= 1;
+      i += 1;
+    }
+    bodies += cleaned.slice(bodyStart, Math.max(bodyStart, i - 1)) + '\n';
+    fnRe.lastIndex = i;
+  }
+  return { hasFunction: foundFn, bodies };
+}
+
+// Parses statically referenced @group(0) @binding(N) (or @binding(N) @group(0)) var declarations
+// in WGSL source, returning entries sorted and deduplicated by binding index.
+function parseWgslGroup0Bindings(wgslSource) {
+  if (typeof wgslSource !== 'string' || wgslSource.length === 0) return [];
+  const cleaned = stripWgslComments(wgslSource);
+  if (cleaned.length === 0) return [];
+
+  const matches = [];
+  WGSL_GROUP0_VAR_RE.lastIndex = 0;
+  let match;
+  while ((match = WGSL_GROUP0_VAR_RE.exec(cleaned)) !== null) {
+    const bindingStr = match[1] !== undefined ? match[1] : match[2];
+    const binding = parseInt(bindingStr, 10);
+    if (!Number.isInteger(binding) || binding < 0) continue;
+    matches.push({
+      binding,
+      addrRaw: match[3] ? match[3].trim() : '',
+      varName: match[4],
+      typeRaw: match[5].trim(),
+    });
+  }
+  if (matches.length === 0) return [];
+
+  const { hasFunction, bodies: usageSource } = extractWgslFunctionBodies(cleaned);
+
+  const byBinding = new Map();
+  for (let i = 0; i < matches.length; i += 1) {
+    const m = matches[i];
+    if (byBinding.has(m.binding)) continue;
+    if (hasFunction) {
+      const refRe = new RegExp(`(?:^|[^A-Za-z0-9_.])${m.varName}(?![A-Za-z0-9_])`);
+      if (!refRe.test(usageSource)) continue;
+    }
+
+    let entry = null;
+    if (m.addrRaw.length > 0) {
+      const parts = m.addrRaw.split(',').map((s) => s.trim().toLowerCase());
+      if (parts[0] === 'uniform') {
+        entry = { binding: m.binding, kind: 'uniform' };
+      } else if (parts[0] === 'storage') {
+        entry = {
+          binding: m.binding,
+          kind: parts[1] === 'read' ? 'read-only-storage' : 'storage',
+        };
+      }
+    } else if (/^sampler_comparison\b/.test(m.typeRaw)) {
+      entry = { binding: m.binding, kind: 'sampler', comparison: true };
+    } else if (/^sampler\b/.test(m.typeRaw)) {
+      entry = { binding: m.binding, kind: 'sampler' };
+    } else if (/^texture_storage_/.test(m.typeRaw)) {
+      const prefixMatch = /^(texture_storage_[A-Za-z0-9_]+)/.exec(m.typeRaw);
+      const prefix = prefixMatch ? prefixMatch[1] : 'texture_storage_2d';
+      const fmtMatch = /^texture_storage_[A-Za-z0-9_]+\s*<\s*([A-Za-z0-9_-]+)/.exec(m.typeRaw);
+      entry = {
+        binding: m.binding,
+        kind: 'storage-texture',
+        viewDimension: classifyWgslTextureDim(prefix),
+      };
+      if (fmtMatch && fmtMatch[1]) {
+        entry.storageFormat = fmtMatch[1];
+      }
+    } else if (/^texture_/.test(m.typeRaw)) {
+      const prefixMatch = /^(texture_[A-Za-z0-9_]+)/.exec(m.typeRaw);
+      const prefix = prefixMatch ? prefixMatch[1] : 'texture_2d';
+      entry = {
+        binding: m.binding,
+        kind: 'texture',
+        viewDimension: classifyWgslTextureDim(prefix),
+      };
+      if (prefix.includes('_multisampled_')) {
+        entry.multisampled = true;
+      }
+      if (prefix.startsWith('texture_depth_')) {
+        entry.sampleType = 'depth';
+      } else {
+        const genericMatch = /<\s*(u32|i32|f32)\s*>/.exec(m.typeRaw);
+        if (genericMatch) {
+          if (genericMatch[1] === 'u32') entry.sampleType = 'uint';
+          else if (genericMatch[1] === 'i32') entry.sampleType = 'sint';
+        }
+      }
+    }
+
+    if (entry) {
+      byBinding.set(m.binding, entry);
+    }
+  }
+
+  return Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+}
+
+function mergeWgslGroup0Bindings(vsBindings, fsBindings) {
+  const byBinding = new Map();
+  if (Array.isArray(vsBindings)) {
+    for (let i = 0; i < vsBindings.length; i += 1) {
+      byBinding.set(vsBindings[i].binding, vsBindings[i]);
+    }
+  }
+  if (Array.isArray(fsBindings)) {
+    for (let i = 0; i < fsBindings.length; i += 1) {
+      const fb = fsBindings[i];
+      const existing = byBinding.get(fb.binding);
+      if (!existing) {
+        byBinding.set(fb.binding, fb);
+      } else if (existing.kind === 'read-only-storage' && fb.kind === 'storage') {
+        byBinding.set(fb.binding, fb);
+      }
+    }
+  }
+  return Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+}
+
+// Checks whether an explicit @group(0) BindGroupLayout's entries satisfy every binding declared
+// and statically referenced by a WGSL shader (or VS+FS pair).
+function isExplicitLayoutCompatibleWithWgsl(group0Entries, wgslBindings) {
+  if (!Array.isArray(wgslBindings) || wgslBindings.length === 0) return true;
+  if (!Array.isArray(group0Entries)) return true;
+
+  for (let i = 0; i < wgslBindings.length; i += 1) {
+    const b = wgslBindings[i];
+    const e = group0Entries.find((x) => x && x.binding === b.binding);
+    if (!e) return false;
+    switch (b.kind) {
+      case 'uniform':
+        if (!(e.buffer && (!e.buffer.type || e.buffer.type === 'uniform'))) return false;
+        break;
+      case 'read-only-storage':
+        if (!(e.buffer && (e.buffer.type === 'read-only-storage' || e.buffer.type === 'storage'))) {
+          return false;
+        }
+        break;
+      case 'storage':
+        if (!(e.buffer && e.buffer.type === 'storage')) return false;
+        break;
+      case 'texture':
+        if (!e.texture) return false;
+        break;
+      case 'storage-texture':
+        if (!e.storageTexture) return false;
+        break;
+      case 'sampler':
+        if (!e.sampler) return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+function synthLayoutEntryForWgslBinding(b) {
+  if (!b) return null;
+  if (b.kind === 'uniform') {
+    return {
+      binding: b.binding,
+      buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 4096 },
+    };
+  }
+  if (b.kind === 'read-only-storage') {
+    return {
+      binding: b.binding,
+      buffer: { type: 'read-only-storage', hasDynamicOffset: false, minBindingSize: 4096 },
+    };
+  }
+  if (b.kind === 'storage') {
+    return {
+      binding: b.binding,
+      buffer: { type: 'storage', hasDynamicOffset: false, minBindingSize: 4096 },
+    };
+  }
+  if (b.kind === 'sampler') {
+    return {
+      binding: b.binding,
+      sampler: { type: b.comparison ? 'comparison' : 'filtering' },
+    };
+  }
+  if (b.kind === 'storage-texture') {
+    return {
+      binding: b.binding,
+      storageTexture: {
+        access: 'write-only',
+        format: b.storageFormat || 'rgba8unorm',
+        viewDimension: b.viewDimension || '2d',
+      },
+    };
+  }
+  return {
+    binding: b.binding,
+    texture: {
+      sampleType: b.sampleType || 'float',
+      viewDimension: b.viewDimension || '2d',
+      multisampled: Boolean(b.multisampled),
+    },
+  };
+}
+
 // Resolves the WebGPU shader stage entry point: defaults to vs_main/fs_main/cs_main per
 // docs/gpu_commands.md, while honoring explicit entryPoint metadata and WGSL source declarations
 // (such as legacy `@fragment fn ps_main` from older packs).
@@ -1118,8 +1362,12 @@ class RenderStatePackets {
       typeof options.resolveManifestLayout === 'function' ? options.resolveManifestLayout : null;
     this.bindGroupLayouts = new Map(); // id -> { layout, entries, sequentialBindings }
     this.pipelineLayouts = new Map(); // id -> GPUPipelineLayout
-    this.pipelineLayoutMeta = new Map(); // id -> { groupCount, isSingleGroup0, sequentialGroup0 }
-    this.computePipelineMeta = new Map(); // id -> { id, csId, layoutId, entryPoint, hasComputeAttr }
+    this.pipelineLayoutMeta = new Map(); // id -> { groupCount, isSingleGroup0, sequentialGroup0, group0HasEntries, group0Entries }
+    this.computePipelineMeta = new Map(); // id -> { id, csId, layoutId, entryPoint, hasComputeAttr, autoLayoutRemap, wgslBindings }
+    this.renderPipelineAutoLayoutMeta = new Map(); // id -> { id, layoutId, autoLayoutRemap, wgslBindings }
+    this.bindGroupDescriptors = new Map(); // id -> { id, layoutId, resources }
+    this.remappedBindGroups = new Map(); // 'c:<pipeId>:<bgId>' | 'r:<pipeId>:<bgId>' -> GPUBindGroup | null
+    this._lastBuiltRenderPipelineAutoLayout = null;
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
     this.textureMeta = new Map(); // textureId -> { id, requestedFormat, format, bcFallback, usage, width, height }
@@ -1227,13 +1475,19 @@ class RenderStatePackets {
         return this._count(payloadBytes >= 32 && this._createComputePipeline(view, offset));
       case V2_OPCODES.BEGIN_RENDER_PASS:
         return this._count(payloadBytes >= 368 && this._beginRenderPass(view, offset));
-      case V2_OPCODES.END_RENDER_PASS:
-        this._queue((ctl) => {
-          if (ctl.passKind === 'render') ctl.endPass();
-          this._activePass = null;
-          this._activePassTargetSize = null;
-        });
+      case V2_OPCODES.END_RENDER_PASS: {
+        const endCmd = {
+          type: 'renderState',
+          _rsPassOp: 'endRenderPass',
+          run: (ctl) => {
+            if (ctl.passKind === 'render') ctl.endPass();
+            this._activePass = null;
+            this._activePassTargetSize = null;
+          },
+        };
+        this.processor._passCommands.push(endCmd);
         return this._count(true);
+      }
       case V2_OPCODES.SET_VIEWPORT: {
         if (payloadBytes < 24) return this._count(false);
         const rawViewport = {
@@ -1300,12 +1554,35 @@ class RenderStatePackets {
     return true;
   }
 
+  _invalidateRemappedBindGroupsForPipeline(pipelineId, isCompute) {
+    const prefix = `${isCompute ? 'c' : 'r'}:${pipelineId}:`;
+    for (const key of Array.from(this.remappedBindGroups.keys())) {
+      if (key.startsWith(prefix)) {
+        this.remappedBindGroups.delete(key);
+      }
+    }
+  }
+
+  _invalidateRemappedBindGroupsForBindGroup(bindGroupId) {
+    const suffix = `:${bindGroupId}`;
+    for (const key of Array.from(this.remappedBindGroups.keys())) {
+      if (key.endsWith(suffix)) {
+        this.remappedBindGroups.delete(key);
+      }
+    }
+  }
+
   // DestroyResource hook: forget layouts, metadata and cached views of `id`.
   destroyResource(id) {
     this.bindGroupLayouts.delete(id);
     this.pipelineLayouts.delete(id);
     this.pipelineLayoutMeta.delete(id);
     this.computePipelineMeta.delete(id);
+    this.renderPipelineAutoLayoutMeta.delete(id);
+    this.bindGroupDescriptors.delete(id);
+    this._invalidateRemappedBindGroupsForPipeline(id, true);
+    this._invalidateRemappedBindGroupsForPipeline(id, false);
+    this._invalidateRemappedBindGroupsForBindGroup(id);
     this.textureViews.delete(id);
     this.textureMeta.delete(id);
     if (
@@ -1412,6 +1689,7 @@ class RenderStatePackets {
       isSingleGroup0: false,
       sequentialGroup0: false,
       group0HasEntries: false,
+      group0Entries: null,
     };
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       layout = this.resolveManifestLayout && this.resolveManifestLayout('pipelineLayout', contentId);
@@ -1448,6 +1726,7 @@ class RenderStatePackets {
             (group0Record.entries === null ||
               (Array.isArray(group0Record.entries) && group0Record.entries.length > 0))
         ),
+        group0Entries: group0Record ? group0Record.entries : null,
       };
     }
     this.pipelineLayouts.set(id, layout);
@@ -1466,10 +1745,12 @@ class RenderStatePackets {
 
   // The exact GPURenderPipelineDescriptor for a CreateRenderPipeline2 payload at `offset`.
   buildRenderPipelineDescriptor(view, offset) {
+    this._lastBuiltRenderPipelineAutoLayout = null;
+    const pipeId = view.getUint32(offset, true);
     const vsId = view.getUint32(offset + 4, true);
     const fsId = view.getUint32(offset + 8, true);
     const layoutId = view.getUint32(offset + 12, true);
-    const layout = this._layoutFor(layoutId);
+    let layout = this._layoutFor(layoutId);
     const vs = this.processor.shaderModules.get(vsId);
     if (!vs || !layout) {
       if (!vs) this._packetError = `unknown vertex shader module ${vsId}`;
@@ -1512,13 +1793,32 @@ class RenderStatePackets {
       targets = targets.map((t) => (t ? { format: t.format, writeMask: 0 } : null));
     }
 
-    if (layoutId === 0) {
+    const vsSource = getShaderSourceText(vs);
+    const fsSource = fs ? getShaderSourceText(fs) : null;
+    const wgslBindings = mergeWgslGroup0Bindings(
+      vsSource ? parseWgslGroup0Bindings(vsSource) : [],
+      fsSource ? parseWgslGroup0Bindings(fsSource) : []
+    );
+    let autoLayoutRemap = false;
+    const layoutMeta = layoutId !== 0 ? this.pipelineLayoutMeta.get(layoutId) : null;
+    if (
+      layoutId !== 0 &&
+      layoutMeta &&
+      !isExplicitLayoutCompatibleWithWgsl(layoutMeta.group0Entries, wgslBindings)
+    ) {
+      layout = 'auto';
+      autoLayoutRemap = true;
+      this._lastBuiltRenderPipelineAutoLayout = { autoLayoutRemap: true, wgslBindings };
+      this._recordTelemetryWarningOnce(
+        `auto-layout-remap:render:${pipeId}:${layoutId}`,
+        `render pipeline ${pipeId}: explicit layout ${layoutId} incompatible with WGSL @group(0) bindings; falling back to layout:'auto'`
+      );
+    }
+
+    if (layoutId === 0 || autoLayoutRemap) {
       this.telemetry.autoLayoutFallbacks += 1;
-    } else {
-      const layoutMeta = this.pipelineLayoutMeta.get(layoutId);
-      if (layoutMeta && layoutMeta.isSingleGroup0) {
-        this.telemetry.rootSigGroup0Layouts += 1;
-      }
+    } else if (layoutMeta && layoutMeta.isSingleGroup0) {
+      this.telemetry.rootSigGroup0Layouts += 1;
     }
     if (key.depthStencil && isDepthTextureFormat(key.depthStencil.format) && view.getUint8(keyBase + 122) === 0) {
       this.telemetry.depthCompareDefaults += 1;
@@ -1542,6 +1842,8 @@ class RenderStatePackets {
   _createRenderPipeline(view, offset) {
     const descriptor = this.buildRenderPipelineDescriptor(view, offset);
     if (!descriptor) return false;
+    const autoLayoutInfo = this._lastBuiltRenderPipelineAutoLayout;
+    this._lastBuiltRenderPipelineAutoLayout = null;
     const id = view.getUint32(offset, true);
     const vsId = view.getUint32(offset + 4, true);
     const fsId = view.getUint32(offset + 8, true);
@@ -1556,6 +1858,17 @@ class RenderStatePackets {
       return false;
     }
     this.processor.pipelines.set(id, pipeline);
+    this._invalidateRemappedBindGroupsForPipeline(id, false);
+    if (autoLayoutInfo && autoLayoutInfo.autoLayoutRemap) {
+      this.renderPipelineAutoLayoutMeta.set(id, {
+        id,
+        layoutId,
+        autoLayoutRemap: true,
+        wgslBindings: autoLayoutInfo.wgslBindings,
+      });
+    } else {
+      this.renderPipelineAutoLayoutMeta.delete(id);
+    }
     if (this.processor._pipelineMeta && typeof this.processor._pipelineMeta.set === 'function') {
       const vs = this.processor.shaderModules.get(vsId) || null;
       const fs = fsId !== 0 ? this.processor.shaderModules.get(fsId) || null : null;
@@ -1635,13 +1948,29 @@ class RenderStatePackets {
     const id = view.getUint32(offset, true);
     const csId = view.getUint32(offset + 4, true);
     const layoutId = view.getUint32(offset + 8, true);
-    const layout = this._layoutFor(layoutId);
+    let layout = this._layoutFor(layoutId);
     const cs = this.processor.shaderModules.get(csId);
     if (!cs || !layout) {
       if (!cs) this._packetError = `unknown compute shader module ${csId}`;
       return false;
     }
     const { entryPoint: csEntryPoint, hasComputeAttr } = this._inspectComputeShaderEntryPoint(cs, csId);
+    const csSource = getShaderSourceText(cs);
+    const wgslBindings = csSource ? parseWgslGroup0Bindings(csSource) : [];
+    let autoLayoutRemap = false;
+    const layoutMeta = layoutId !== 0 ? this.pipelineLayoutMeta.get(layoutId) : null;
+    if (
+      layoutId !== 0 &&
+      layoutMeta &&
+      !isExplicitLayoutCompatibleWithWgsl(layoutMeta.group0Entries, wgslBindings)
+    ) {
+      layout = 'auto';
+      autoLayoutRemap = true;
+      this._recordTelemetryWarningOnce(
+        `auto-layout-remap:compute:${id}:${layoutId}`,
+        `compute pipeline ${id}: explicit layout ${layoutId} incompatible with WGSL @group(0) bindings; falling back to layout:'auto'`
+      );
+    }
     let pipeline;
     try {
       pipeline = this.device.createComputePipeline({
@@ -1652,21 +1981,21 @@ class RenderStatePackets {
       this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
       return false;
     }
-    if (layoutId === 0) {
+    if (layoutId === 0 || autoLayoutRemap) {
       this.telemetry.autoLayoutFallbacks += 1;
-    } else {
-      const layoutMeta = this.pipelineLayoutMeta.get(layoutId);
-      if (layoutMeta && layoutMeta.isSingleGroup0) {
-        this.telemetry.rootSigGroup0Layouts += 1;
-      }
+    } else if (layoutMeta && layoutMeta.isSingleGroup0) {
+      this.telemetry.rootSigGroup0Layouts += 1;
     }
     this.processor.computePipelines.set(id, pipeline);
+    this._invalidateRemappedBindGroupsForPipeline(id, true);
     this.computePipelineMeta.set(id, {
       id,
       csId,
       layoutId,
       entryPoint: csEntryPoint,
       hasComputeAttr,
+      autoLayoutRemap,
+      wgslBindings,
     });
     this.telemetry.computePipelineCount += 1;
     return true;
@@ -1695,60 +2024,425 @@ class RenderStatePackets {
     const nextPipeline =
       this.processor && this.processor.computePipelines ? this.processor.computePipelines.get(id) : undefined;
     if (nextPipeline && nextPipeline !== prevPipeline) {
+      this._invalidateRemappedBindGroupsForPipeline(id, true);
       this.computePipelineMeta.set(id, {
         id,
         csId,
         layoutId: 0,
         entryPoint: inspected ? inspected.entryPoint : DEFAULT_ENTRY_POINTS.compute,
         hasComputeAttr: Boolean(inspected && inspected.hasComputeAttr),
+        autoLayoutRemap: false,
+        wgslBindings: [],
       });
       this.telemetry.computePipelineCount += 1;
     }
   }
 
+  _resolveBindGroupDescriptor(bindGroupId) {
+    if (!bindGroupId) return null;
+    const desc = this.bindGroupDescriptors.get(bindGroupId);
+    if (desc) return desc;
+    const v1Meta =
+      this.processor &&
+      this.processor._bindGroupMeta &&
+      typeof this.processor._bindGroupMeta.get === 'function'
+        ? this.processor._bindGroupMeta.get(bindGroupId)
+        : null;
+    if (!v1Meta || !Array.isArray(v1Meta.entries)) return null;
+    const resources = [];
+    for (let i = 0; i < v1Meta.entries.length; i += 1) {
+      const e = v1Meta.entries[i];
+      if (!e || !e.resource) continue;
+      if (e.resource.buffer) {
+        const buf = e.resource.buffer;
+        let bufferUsage = null;
+        if (typeof buf.usage === 'number') {
+          bufferUsage = buf.usage;
+        } else if (buf.desc && typeof buf.desc.usage === 'number') {
+          bufferUsage = buf.desc.usage;
+        }
+        const kind =
+          bufferUsage !== null &&
+          (bufferUsage & GPU_BUFFER_USAGE_STORAGE) !== 0 &&
+          (bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0
+            ? 'storage'
+            : 'uniform';
+        resources.push({ binding: e.binding, kind, resource: e.resource, bufferUsage, isDummy: false });
+      } else if (
+        e.resource.kind === 'GPUSampler' ||
+        (e.resource.desc && ('magFilter' in e.resource.desc || 'compare' in e.resource.desc))
+      ) {
+        resources.push({
+          binding: e.binding,
+          kind: 'sampler',
+          resource: e.resource,
+          comparison: Boolean(e.resource.desc && e.resource.desc.compare),
+          isDummy: false,
+        });
+      } else {
+        resources.push({ binding: e.binding, kind: 'texture', resource: e.resource, isDummy: false });
+      }
+    }
+    return { id: bindGroupId, layoutId: v1Meta.layoutId || 0, resources };
+  }
+
+  _getOrCreateRemappedBindGroup(isCompute, pipelineId, pipeline, wgslBindings, bindGroupId, bindGroupDesc) {
+    if (!pipeline || typeof pipeline.getBindGroupLayout !== 'function') {
+      return { status: 'unsupported', bindGroup: null };
+    }
+    if (!Array.isArray(wgslBindings) || wgslBindings.length === 0) {
+      return { status: 'empty', bindGroup: null };
+    }
+
+    const effectiveBgId = bindGroupId || 0;
+    const isLiveDesc =
+      effectiveBgId === 0 ||
+      (bindGroupDesc && this.bindGroupDescriptors.get(effectiveBgId) === bindGroupDesc);
+    const cacheKey = `${isCompute ? 'c' : 'r'}:${pipelineId}:${effectiveBgId}`;
+    if (isLiveDesc && this.remappedBindGroups.has(cacheKey)) {
+      const cached = this.remappedBindGroups.get(cacheKey);
+      return cached ? { status: 'ok', bindGroup: cached } : { status: 'empty', bindGroup: null };
+    }
+
+    let autoBgl;
+    try {
+      autoBgl = pipeline.getBindGroupLayout(0);
+    } catch (_) {
+      if (isLiveDesc) this.remappedBindGroups.set(cacheKey, null);
+      return { status: 'empty', bindGroup: null };
+    }
+    if (!autoBgl) {
+      if (isLiveDesc) this.remappedBindGroups.set(cacheKey, null);
+      return { status: 'empty', bindGroup: null };
+    }
+
+    const available =
+      bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
+    const usedIndices = new Set();
+
+    const pickResourceForBinding = (b) => {
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (let i = 0; i < available.length; i += 1) {
+          if (usedIndices.has(i)) continue;
+          const r = available[i];
+          if (!r || !r.resource || r.isDummy) continue;
+          if (b.kind === 'uniform') {
+            const isBuf =
+              r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
+            if (!isBuf) continue;
+            if (pass === 0 && r.kind !== 'uniform') continue;
+            if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
+              if ((r.bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0) continue;
+            } else if (r.kind !== 'uniform') {
+              continue;
+            }
+            usedIndices.add(i);
+            return r.resource;
+          }
+          if (b.kind === 'read-only-storage' || b.kind === 'storage') {
+            const isBuf =
+              r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
+            if (!isBuf) continue;
+            if (
+              pass === 0 &&
+              !(r.kind === b.kind || (b.kind === 'read-only-storage' && r.kind === 'storage'))
+            ) {
+              continue;
+            }
+            if (r.bufferUsage !== null && r.bufferUsage !== undefined) {
+              if ((r.bufferUsage & GPU_BUFFER_USAGE_STORAGE) === 0) continue;
+            } else if (
+              !(r.kind === 'storage' || (b.kind === 'read-only-storage' && r.kind === 'read-only-storage'))
+            ) {
+              continue;
+            }
+            usedIndices.add(i);
+            return r.resource;
+          }
+          if (pass > 0) continue;
+          if (b.kind === 'texture') {
+            if (r.kind !== 'texture') continue;
+            if (
+              r.textureUsage !== null &&
+              r.textureUsage !== undefined &&
+              (r.textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
+            ) {
+              continue;
+            }
+            usedIndices.add(i);
+            return r.resource;
+          }
+          if (b.kind === 'storage-texture') {
+            if (r.kind !== 'storage-texture') continue;
+            if (
+              r.textureUsage !== null &&
+              r.textureUsage !== undefined &&
+              (r.textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) === 0
+            ) {
+              continue;
+            }
+            usedIndices.add(i);
+            return r.resource;
+          }
+          if (b.kind === 'sampler') {
+            if (r.kind !== 'sampler') continue;
+            if (
+              r.comparison !== undefined &&
+              r.comparison !== null &&
+              Boolean(r.comparison) !== Boolean(b.comparison)
+            ) {
+              continue;
+            }
+            usedIndices.add(i);
+            return r.resource;
+          }
+        }
+      }
+      return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+    };
+
+    const entries = wgslBindings.map((b) => ({
+      binding: b.binding,
+      resource: pickResourceForBinding(b),
+    }));
+
+    let remapped = null;
+    try {
+      remapped = this.device.createBindGroup({ layout: autoBgl, entries });
+    } catch (_) {
+      try {
+        const fallbackEntries = wgslBindings.map((b) => ({
+          binding: b.binding,
+          resource: this._dummyResource(synthLayoutEntryForWgslBinding(b)),
+        }));
+        remapped = this.device.createBindGroup({ layout: autoBgl, entries: fallbackEntries });
+      } catch (_err2) {
+        remapped = null;
+      }
+    }
+
+    if (isLiveDesc) {
+      this.remappedBindGroups.set(cacheKey, remapped);
+    }
+    return remapped ? { status: 'ok', bindGroup: remapped } : { status: 'empty', bindGroup: null };
+  }
+
   // Guards queued compute dispatches against zero/oversized workgroup dimensions and missing
-  // compute pipelines immediately before WgpuCommandProcessor._flushPresent() executes them.
+  // compute pipelines, and remaps @group(0) bind groups for pipelines that fell back to layout:'auto',
+  // immediately before WgpuCommandProcessor._flushPresent() executes them.
   _preparePassCommandsForFlush() {
     const cmds = this.processor && this.processor._passCommands;
     if (!Array.isArray(cmds) || cmds.length === 0) return;
 
+    let activePassMode = null; // 'render' | 'compute' | null
     let activeComputePipelineId = null;
     let activeComputePipelineValid = false;
+    let activeComputeAutoLayout = null;
     let hadExplicitSetComputePipeline = false;
+    let group0BoundForCompute = false;
+    let lastComputeGroup0 = null;
+
+    let activeRenderPipelineId = null;
+    let activeRenderAutoLayout = null;
+    let group0BoundForRender = false;
+    let lastRenderGroup0 = null;
+
     let modified = false;
     const filtered = [];
+
+    const makeRemappedSetBindGroupCmd = (bindGroup, bindGroupId) => ({
+      type: 'renderState',
+      run: (ctl) => {
+        if (ctl.pass) ctl.pass.setBindGroup(0, bindGroup);
+      },
+      _wgpuMeta: {
+        kind: 'setBindGroup2',
+        groupIndex: 0,
+        bindGroupId: bindGroupId || 0,
+      },
+    });
+
+    const makeNoopRenderGroup0Cmd = (bindGroupId) => ({
+      type: 'renderState',
+      run: () => {},
+      _wgpuMeta: {
+        kind: 'setBindGroup2',
+        groupIndex: 0,
+        bindGroupId: bindGroupId || 0,
+      },
+    });
 
     for (let i = 0; i < cmds.length; i += 1) {
       const cmd = cmds[i];
       if (!cmd) continue;
 
-      if (
-        cmd.type === 'setPipeline' ||
-        cmd.type === 'draw' ||
-        cmd.type === 'drawIndexed' ||
-        (cmd._wgpuMeta &&
-          (cmd._wgpuMeta.kind === 'beginRenderPass' || cmd._wgpuMeta.kind === 'endRenderPass'))
-      ) {
+      const passOpKind =
+        (cmd._wgpuMeta && cmd._wgpuMeta.kind) || cmd._rsPassOp || null;
+      if (passOpKind === 'beginRenderPass' || passOpKind === 'endRenderPass') {
+        activePassMode = passOpKind === 'beginRenderPass' ? 'render' : null;
         activeComputePipelineId = null;
         activeComputePipelineValid = false;
+        activeComputeAutoLayout = null;
         hadExplicitSetComputePipeline = false;
+        group0BoundForCompute = false;
+        lastComputeGroup0 = null;
+        activeRenderPipelineId = null;
+        activeRenderAutoLayout = null;
+        group0BoundForRender = false;
+        lastRenderGroup0 = null;
+        filtered.push(cmd);
+        continue;
+      }
+
+      if (cmd.type === 'setPipeline') {
+        activePassMode = 'render';
+        activeComputePipelineId = null;
+        activeComputePipelineValid = false;
+        activeComputeAutoLayout = null;
+        hadExplicitSetComputePipeline = false;
+        group0BoundForCompute = false;
+        lastComputeGroup0 = null;
+        activeRenderPipelineId = cmd.pipelineId;
+        const rMeta = this.renderPipelineAutoLayoutMeta.get(cmd.pipelineId) || null;
+        activeRenderAutoLayout = rMeta && rMeta.autoLayoutRemap ? rMeta : null;
+        group0BoundForRender = false;
         filtered.push(cmd);
         continue;
       }
 
       if (cmd.type === 'setComputePipeline') {
+        activePassMode = 'compute';
+        activeRenderPipelineId = null;
+        activeRenderAutoLayout = null;
+        group0BoundForRender = false;
+        lastRenderGroup0 = null;
         hadExplicitSetComputePipeline = true;
         activeComputePipelineId = cmd.pipelineId;
         activeComputePipelineValid = Boolean(
           this.processor.computePipelines && this.processor.computePipelines.has(cmd.pipelineId)
         );
         if (!activeComputePipelineValid) {
+          activeComputeAutoLayout = null;
+          group0BoundForCompute = false;
           this._recordTelemetryWarningOnce(
             `missing-compute-pipeline:${cmd.pipelineId}`,
             `compute pipeline ${cmd.pipelineId} unavailable; subsequent dispatches will be skipped`
           );
           modified = true;
           continue;
+        }
+        const cMeta = this.computePipelineMeta.get(cmd.pipelineId) || null;
+        activeComputeAutoLayout = cMeta && cMeta.autoLayoutRemap ? cMeta : null;
+        group0BoundForCompute = false;
+        filtered.push(cmd);
+        continue;
+      }
+
+      const isSetBgV1 = cmd.type === 'setBindGroup';
+      const isSetBgV2 = Boolean(cmd._rsSetBindGroup || passOpKind === 'setBindGroup2');
+      if (isSetBgV1 || isSetBgV2) {
+        let groupIndex;
+        let bindGroupId;
+        let bindGroupDesc;
+        if (cmd._rsSetBindGroup) {
+          groupIndex = cmd._rsSetBindGroup.groupIndex;
+          bindGroupId = cmd._rsSetBindGroup.bindGroupId;
+          bindGroupDesc =
+            cmd._rsSetBindGroup.bindGroupDesc || this._resolveBindGroupDescriptor(bindGroupId);
+        } else if (isSetBgV1) {
+          groupIndex = cmd.groupIndex;
+          bindGroupId = cmd.bindGroupId;
+          bindGroupDesc = this._resolveBindGroupDescriptor(bindGroupId);
+        } else {
+          groupIndex = cmd._wgpuMeta.groupIndex;
+          bindGroupId = cmd._wgpuMeta.bindGroupId;
+          bindGroupDesc = this._resolveBindGroupDescriptor(bindGroupId);
+        }
+
+        if (groupIndex === 0) {
+          if (activePassMode === 'compute') {
+            lastComputeGroup0 = { bindGroupId, bindGroupDesc };
+            if (activeComputePipelineValid && activeComputeAutoLayout) {
+              const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
+              const res = this._getOrCreateRemappedBindGroup(
+                true,
+                activeComputePipelineId,
+                pipeline,
+                activeComputeAutoLayout.wgslBindings,
+                bindGroupId,
+                bindGroupDesc
+              );
+              group0BoundForCompute = true;
+              if (res.status === 'ok') {
+                filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, bindGroupId));
+                modified = true;
+                continue;
+              }
+              if (res.status === 'empty') {
+                modified = true;
+                continue;
+              }
+            }
+          } else if (activePassMode === 'render') {
+            lastRenderGroup0 = { bindGroupId, bindGroupDesc };
+            if (activeRenderAutoLayout) {
+              const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
+              const res = this._getOrCreateRemappedBindGroup(
+                false,
+                activeRenderPipelineId,
+                pipeline,
+                activeRenderAutoLayout.wgslBindings,
+                bindGroupId,
+                bindGroupDesc
+              );
+              group0BoundForRender = true;
+              if (res.status === 'ok') {
+                filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, bindGroupId));
+                modified = true;
+                continue;
+              }
+              if (res.status === 'empty') {
+                filtered.push(makeNoopRenderGroup0Cmd(bindGroupId));
+                modified = true;
+                continue;
+              }
+            }
+          } else {
+            lastRenderGroup0 = { bindGroupId, bindGroupDesc };
+            lastComputeGroup0 = { bindGroupId, bindGroupDesc };
+          }
+        }
+        filtered.push(cmd);
+        continue;
+      }
+
+      if (cmd.type === 'draw' || cmd.type === 'drawIndexed') {
+        activePassMode = 'render';
+        activeComputePipelineId = null;
+        activeComputePipelineValid = false;
+        activeComputeAutoLayout = null;
+        hadExplicitSetComputePipeline = false;
+        group0BoundForCompute = false;
+        lastComputeGroup0 = null;
+        if (activeRenderAutoLayout && !group0BoundForRender) {
+          const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
+          const src = lastRenderGroup0 || { bindGroupId: 0, bindGroupDesc: null };
+          const res = this._getOrCreateRemappedBindGroup(
+            false,
+            activeRenderPipelineId,
+            pipeline,
+            activeRenderAutoLayout.wgslBindings,
+            src.bindGroupId,
+            src.bindGroupDesc
+          );
+          group0BoundForRender = true;
+          if (res.status === 'ok') {
+            filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, src.bindGroupId));
+            modified = true;
+          } else if (res.status === 'empty') {
+            filtered.push(makeNoopRenderGroup0Cmd(src.bindGroupId));
+            modified = true;
+          }
         }
         filtered.push(cmd);
         continue;
@@ -1786,6 +2480,23 @@ class RenderStatePackets {
             `clamp-dispatch:${rawX}x${rawY}x${rawZ}:${check.maxWorkgroupsPerDimension}`,
             `clamped compute dispatch from ${rawX}x${rawY}x${rawZ} to ${check.x}x${check.y}x${check.z} (limit=${check.maxWorkgroupsPerDimension})`
           );
+        }
+        if (activeComputeAutoLayout && !group0BoundForCompute) {
+          const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
+          const src = lastComputeGroup0 || { bindGroupId: 0, bindGroupDesc: null };
+          const res = this._getOrCreateRemappedBindGroup(
+            true,
+            activeComputePipelineId,
+            pipeline,
+            activeComputeAutoLayout.wgslBindings,
+            src.bindGroupId,
+            src.bindGroupDesc
+          );
+          group0BoundForCompute = true;
+          if (res.status === 'ok') {
+            filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, src.bindGroupId));
+            modified = true;
+          }
         }
         this.telemetry.computeDispatchCount += 1;
         filtered.push(cmd);
@@ -2081,10 +2792,14 @@ class RenderStatePackets {
         resolveTargetSize = () => staticSize;
       }
     }
-    this._queue((ctl) => {
-      const pass = ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl));
-      this._activePass = pass || ctl.pass || null;
-      this._activePassTargetSize = resolveTargetSize ? resolveTargetSize(ctl) : null;
+    this.processor._passCommands.push({
+      type: 'renderState',
+      _rsPassOp: 'beginRenderPass',
+      run: (ctl) => {
+        const pass = ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl));
+        this._activePass = pass || ctl.pass || null;
+        this._activePassTargetSize = resolveTargetSize ? resolveTargetSize(ctl) : null;
+      },
     });
     return true;
   }
@@ -2147,6 +2862,7 @@ class RenderStatePackets {
       return false;
     }
     const entries = [];
+    const descriptorResources = [];
     const seenBindings = new Set();
     for (let i = 0; i < count; i++) {
       const o = offset + 16 + i * 48;
@@ -2160,11 +2876,29 @@ class RenderStatePackets {
       const resourceId = view.getUint32(o + 8, true);
       const layoutEntry = record.entries ? record.entries.find((e) => e.binding === binding) : null;
       let resource = null;
+      let usedDummy = false;
+      let bufferUsage = null;
+      let textureUsage = null;
+      let samplerComparison = null;
       if (resourceId === 0) {
         resource = layoutEntry ? this._dummyResource(layoutEntry) : null;
+        if (resource) usedDummy = true;
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.processor.buffers.get(resourceId);
         if (buffer) {
+          const bufMeta =
+            this.processor &&
+            this.processor._bufferMeta &&
+            typeof this.processor._bufferMeta.get === 'function'
+              ? this.processor._bufferMeta.get(resourceId)
+              : null;
+          if (typeof buffer.usage === 'number') {
+            bufferUsage = buffer.usage;
+          } else if (bufMeta && typeof bufMeta.usage === 'number') {
+            bufferUsage = bufMeta.usage;
+          } else if (buffer.desc && typeof buffer.desc.usage === 'number') {
+            bufferUsage = buffer.desc.usage;
+          }
           const bufOffset = Number(view.getBigUint64(o + 16, true));
           const requestedSize = Number(view.getBigUint64(o + 24, true));
           const bufferSize =
@@ -2186,6 +2920,7 @@ class RenderStatePackets {
                 `bind group ${id}: binding ${binding} offset ${bufOffset} exceeds buffer size ${bufferSize}; using dummy buffer`
               );
               resource = this._dummyResource(layoutEntry);
+              usedDummy = true;
             }
           } else {
             let effectiveSize = requestedSize;
@@ -2208,6 +2943,7 @@ class RenderStatePackets {
                     `bind group ${id}: binding ${binding} buffer smaller than minBindingSize ${minBindingSize}; using dummy buffer`
                   );
                   resource = this._dummyResource(layoutEntry);
+                  usedDummy = true;
                 }
               }
             }
@@ -2220,6 +2956,15 @@ class RenderStatePackets {
       } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
         const viewDesc = decodeTextureViewDesc(view, o + 32);
         const texFormat = this._resolveTextureFormat(resourceId, viewDesc);
+        const texMeta = this.textureMeta.get(resourceId) || null;
+        const texObj = this.processor.textures.get(resourceId) || null;
+        if (texMeta && typeof texMeta.usage === 'number') {
+          textureUsage = texMeta.usage;
+        } else if (texObj && typeof texObj.usage === 'number') {
+          textureUsage = texObj.usage;
+        } else if (texObj && texObj.desc && typeof texObj.desc.usage === 'number') {
+          textureUsage = texObj.desc.usage;
+        }
         if (
           layoutEntry &&
           layoutEntry.texture &&
@@ -2234,17 +2979,66 @@ class RenderStatePackets {
             `bind group ${id}: binding ${binding} format ${texFormat} requires unfilterable-float without float32-filterable; substituting filterable fallback`
           );
           resource = this._dummyResource(layoutEntry);
+          usedDummy = true;
         } else {
           resource = this._textureView(resourceId, viewDesc);
         }
       } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
         resource = this.processor.samplers.get(resourceId) || null;
+        if (resource && resource.desc && resource.desc.compare !== undefined) {
+          samplerComparison = true;
+        } else if (resource && resource.desc) {
+          samplerComparison = false;
+        }
       }
       if (!resource) {
         this._packetError = `bind group ${id}: binding ${binding} resource ${resourceId} unavailable`;
         return false;
       }
       entries.push({ binding, resource });
+
+      let resourceKind = null;
+      if (layoutEntry) {
+        if (layoutEntry.buffer) {
+          resourceKind = layoutEntry.buffer.type || 'uniform';
+          if (usedDummy) bufferUsage = GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST;
+        } else if (layoutEntry.storageTexture) {
+          resourceKind = 'storage-texture';
+          if (usedDummy) textureUsage = GPU_TEXTURE_USAGE_STORAGE_BINDING;
+        } else if (layoutEntry.texture) {
+          resourceKind = 'texture';
+          if (usedDummy) textureUsage = GPU_TEXTURE_USAGE_TEXTURE_BINDING;
+        } else if (layoutEntry.sampler) {
+          resourceKind = 'sampler';
+          if (samplerComparison === null) {
+            samplerComparison = layoutEntry.sampler.type === 'comparison';
+          }
+        }
+      } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
+        resourceKind =
+          bufferUsage !== null &&
+          (bufferUsage & GPU_BUFFER_USAGE_STORAGE) !== 0 &&
+          (bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0
+            ? 'storage'
+            : 'uniform';
+      } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
+        resourceKind =
+          textureUsage !== null &&
+          (textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
+          (textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
+            ? 'storage-texture'
+            : 'texture';
+      } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
+        resourceKind = 'sampler';
+      }
+
+      if (resourceKind) {
+        const descEntry = { binding, kind: resourceKind, resource, isDummy: usedDummy };
+        if (bufferUsage !== null) descEntry.bufferUsage = bufferUsage;
+        if (textureUsage !== null) descEntry.textureUsage = textureUsage;
+        if (samplerComparison !== null) descEntry.comparison = samplerComparison;
+        descriptorResources.push(descEntry);
+      }
     }
     let bindGroup;
     try {
@@ -2254,6 +3048,8 @@ class RenderStatePackets {
       return false;
     }
     this.processor.bindGroups.set(id, bindGroup);
+    this.bindGroupDescriptors.set(id, { id, layoutId, resources: descriptorResources });
+    this._invalidateRemappedBindGroupsForBindGroup(id);
     return true;
   }
 
@@ -2271,8 +3067,19 @@ class RenderStatePackets {
       this._packetError = `unknown bind group ${bindGroupId}`;
       return false;
     }
-    this._queue((ctl) => {
-      if (ctl.pass) ctl.pass.setBindGroup(index, bindGroup, offsets);
+    const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
+    this.processor._passCommands.push({
+      type: 'renderState',
+      _rsSetBindGroup: {
+        groupIndex: index,
+        bindGroupId,
+        bindGroup,
+        bindGroupDesc,
+        offsets,
+      },
+      run: (ctl) => {
+        if (ctl.pass) ctl.pass.setBindGroup(index, bindGroup, offsets);
+      },
     });
     return true;
   }
@@ -2371,6 +3178,8 @@ const exportedApi = {
   computeMaxMipLevels,
   resolveShaderEntryPoint,
   findWgslStageEntryPoints,
+  parseWgslGroup0Bindings,
+  isExplicitLayoutCompatibleWithWgsl,
   validateVertexBufferLayouts,
   DEFAULT_ENTRY_POINTS,
   DEPTH_TEXTURE_FORMATS,

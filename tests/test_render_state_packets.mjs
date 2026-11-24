@@ -1520,6 +1520,8 @@ test('W81 G31 render_state_packets.js has zero ES module syntax and reloads clea
   assert.equal(typeof ctx.PlayGta6RenderState.sanitizeTextureDescriptor, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.validateComputeDispatch, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.resolveTextureSampleType, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.parseWgslGroup0Bindings, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.isExplicitLayoutCompatibleWithWgsl, 'function');
 
   // Verify zero leaked top-level lexical declarations
   assert.doesNotThrow(() => {
@@ -2335,4 +2337,532 @@ test('W93 CreateRenderPipeline2 with real-pack and fallback shaders increments r
   const snap2 = buildGpuTelemetrySnapshot(processor2, { timestamp: 9301 });
   assert.equal(snap2.frameStats.realPackDrawCount, 0);
   assert.equal(snap2.frameStats.fallbackDrawCount, 1);
+});
+
+// ---------------------------------------------------------------------------------------------
+// W97: WGSL @group(0) layout compatibility check, layout:'auto' fallback, and bind-group remap
+// ---------------------------------------------------------------------------------------------
+
+test('W97 parseWgslGroup0Bindings parses multi-line Naga WGSL, reversed attributes, storage/texture kinds, and skips unused bindings', () => {
+  const nagaWgsl = [
+    '// @group(0) @binding(99) var<uniform> commented_out: vec4<f32>;',
+    '/* @group(0) @binding(98) var<uniform> block_commented: vec4<f32>; */',
+    'struct Rdna2Cbv { v: vec4<f32> };',
+    '@group(0) @binding(0)',
+    'var<uniform> cb0_: Rdna2Cbv;',
+    '@binding(2) @group(0)',
+    'var samp0_: sampler;',
+    '@group(0) @binding(1)',
+    'var tex0_: texture_2d<f32>;',
+    '@group(0) @binding(3)',
+    'var<storage, read> src_buf: array<u32>;',
+    '@group(0) @binding(4)',
+    'var<storage, read_write> dst_buf: array<u32>;',
+    '@group(0) @binding(5)',
+    'var out_tex: texture_storage_2d<rgba8unorm,write>;',
+    '@group(0) @binding(6)',
+    'var shadow_tex: texture_depth_cube;',
+    '@group(0) @binding(7)',
+    'var shadow_samp: sampler_comparison;',
+    '@group(0) @binding(8)',
+    'var msaa_tex: texture_multisampled_2d<f32>;',
+    '@group(0) @binding(9)',
+    'var arr_storage: texture_storage_2d_array<rgba16float, write>;',
+    '@group(0) @binding(10)',
+    'var<uniform> unused_cb_: vec4<f32>;',
+    '@group(1) @binding(0)',
+    'var<uniform> group1_cb_: vec4<f32>;',
+    '',
+    '@compute @workgroup_size(1, 1, 1)',
+    'fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {',
+    '  let a = cb0_.v;',
+    '  let b = textureSampleLevel(tex0_, samp0_, vec2<f32>(0.0), 0.0);',
+    '  let c = src_buf[0];',
+    '  dst_buf[0] = c;',
+    '  textureStore(out_tex, vec2<i32>(0, 0), a + b);',
+    '  let d = textureSampleCompareLevel(shadow_tex, shadow_samp, vec3<f32>(0.0), 0.5);',
+    '  let e = textureLoad(msaa_tex, vec2<i32>(0, 0), 0);',
+    '  textureStore(arr_storage, vec2<i32>(0, 0), 0, e + vec4<f32>(d));',
+    '  _ = group1_cb_;',
+    '}',
+  ].join('\n');
+
+  const parsed = rs.parseWgslGroup0Bindings(nagaWgsl);
+  assert.deepEqual(parsed, [
+    { binding: 0, kind: 'uniform' },
+    { binding: 1, kind: 'texture', viewDimension: '2d' },
+    { binding: 2, kind: 'sampler' },
+    { binding: 3, kind: 'read-only-storage' },
+    { binding: 4, kind: 'storage' },
+    { binding: 5, kind: 'storage-texture', viewDimension: '2d', storageFormat: 'rgba8unorm' },
+    { binding: 6, kind: 'texture', viewDimension: 'cube', sampleType: 'depth' },
+    { binding: 7, kind: 'sampler', comparison: true },
+    { binding: 8, kind: 'texture', viewDimension: '2d', multisampled: true },
+    { binding: 9, kind: 'storage-texture', viewDimension: '2d-array', storageFormat: 'rgba16float' },
+  ]);
+
+  // Empty / non-string / zero-used-bindings inputs return []
+  assert.deepEqual(rs.parseWgslGroup0Bindings(''), []);
+  assert.deepEqual(rs.parseWgslGroup0Bindings(null), []);
+  assert.deepEqual(
+    rs.parseWgslGroup0Bindings(
+      '@group(0) @binding(0) var<uniform> dead_cb: vec4<f32>;\n@fragment fn fs_main() {}'
+    ),
+    []
+  );
+  // Header-only snippet (no fn body) still extracts declared bindings
+  assert.deepEqual(
+    rs.parseWgslGroup0Bindings('@group(0) @binding(0)\nvar<uniform> cb0_: vec4<f32>;'),
+    [{ binding: 0, kind: 'uniform' }]
+  );
+  // Member access `.unused_cb` must not count as a static reference to global `unused_cb`
+  assert.deepEqual(
+    rs.parseWgslGroup0Bindings(
+      'struct S { unused_cb: f32 }; @group(0) @binding(0) var<uniform> unused_cb: vec4<f32>; fn fs_main(s: S) -> f32 { return s.unused_cb; }'
+    ),
+    []
+  );
+});
+
+test('W97 isExplicitLayoutCompatibleWithWgsl detects type mismatches, missing bindings, and accepts compatible/manifest layouts', () => {
+  const wgsl3 = [
+    { binding: 0, kind: 'uniform' },
+    { binding: 1, kind: 'texture', viewDimension: '2d' },
+    { binding: 2, kind: 'sampler' },
+  ];
+  const fullGroup0 = [
+    { binding: 0, visibility: 3, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: 3, texture: { sampleType: 'float', viewDimension: '2d' } },
+    { binding: 2, visibility: 3, sampler: { type: 'filtering' } },
+    { binding: 3, visibility: 6, buffer: { type: 'storage' } },
+    { binding: 4, visibility: 6, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' } },
+  ];
+
+  // Exact/superset match
+  assert.equal(rs.isExplicitLayoutCompatibleWithWgsl(fullGroup0, wgsl3), true);
+  // Empty WGSL bindings or null manifest group0Entries are treated as compatible
+  assert.equal(rs.isExplicitLayoutCompatibleWithWgsl(fullGroup0, []), true);
+  assert.equal(rs.isExplicitLayoutCompatibleWithWgsl(null, wgsl3), true);
+  // RS-4 style: layout only has binding 0 CBV while WGSL needs bindings 0, 1, 2
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl([{ binding: 0, visibility: 3, buffer: { type: 'uniform' } }], wgsl3),
+    false
+  );
+  // RS-8 style: layout has texture at 0 while WGSL has uniform at 0
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl(
+      [
+        { binding: 0, visibility: 4, texture: { sampleType: 'float', viewDimension: '2d' } },
+        { binding: 1, visibility: 4, buffer: { type: 'uniform' } },
+        { binding: 2, visibility: 4, sampler: { type: 'filtering' } },
+      ],
+      wgsl3
+    ),
+    false
+  );
+  // Storage vs read-only-storage rules:
+  // 'storage' layout entry satisfies 'read-only-storage' WGSL binding, but NOT vice versa.
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl(
+      [{ binding: 0, visibility: 4, buffer: { type: 'storage' } }],
+      [{ binding: 0, kind: 'read-only-storage' }]
+    ),
+    true
+  );
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl(
+      [{ binding: 0, visibility: 4, buffer: { type: 'read-only-storage' } }],
+      [{ binding: 0, kind: 'storage' }]
+    ),
+    false
+  );
+  // Storage texture & storage buffer match
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl(fullGroup0, [
+      { binding: 3, kind: 'storage' },
+      { binding: 4, kind: 'storage-texture', storageFormat: 'rgba8unorm', viewDimension: '2d' },
+    ]),
+    true
+  );
+  assert.equal(
+    rs.isExplicitLayoutCompatibleWithWgsl(fullGroup0, [{ binding: 1, kind: 'storage-texture' }]),
+    false
+  );
+});
+
+test('W97 compute pipeline with RS-8 mismatching layout falls back to layout:auto and remaps setBindGroup(0) with usage-safe resources and dummies', () => {
+  const gpu = createMockWebGpu();
+  const autoBglMap = new Map();
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    const autoBgl = { kind: 'GPUBindGroupLayout', autoFor: pipe.handle };
+    autoBglMap.set(pipe, autoBgl);
+    pipe.getBindGroupLayout = (groupIndex) => {
+      if (groupIndex !== 0) throw new Error(`invalid group ${groupIndex}`);
+      return autoBgl;
+    };
+    return pipe;
+  };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // Naga-style compute WGSL: cb0@0, tex0@1, samp0@2, dstBuf@3, outTex@4, unused@5 (stripped!)
+  const csWgsl = [
+    'struct Rdna2Cbv { params: vec4<f32> };',
+    '@group(0) @binding(0)',
+    'var<uniform> cb0_: Rdna2Cbv;',
+    '@group(0) @binding(1)',
+    'var tex0_: texture_2d<f32>;',
+    '@group(0) @binding(2)',
+    'var samp0_: sampler;',
+    '@group(0) @binding(3)',
+    'var<storage, read_write> dst_buf: array<u32>;',
+    '@group(0) @binding(4)',
+    'var out_tex: texture_storage_2d<rgba8unorm,write>;',
+    '@group(0) @binding(5)',
+    'var<uniform> unused_cb: vec4<f32>;',
+    '@compute @workgroup_size(8, 8, 1)',
+    'fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {',
+    '  let t = textureSampleLevel(tex0_, samp0_, vec2<f32>(0.0), 0.0);',
+    '  dst_buf[gid.x] = u32(cb0_.params.x);',
+    '  textureStore(out_tex, vec2<i32>(0, 0), t + cb0_.params);',
+    '}',
+  ].join('\n');
+
+  // RS-8 style mismatched layout: SRV texture at 0, STORAGE-only buffer at 1, UNIFORM buffer at 2, sampler at 3
+  // (No storage texture in RS-8 -> binding 4 must fall back to dummy storage texture!)
+  const rs8Entries = [
+    { binding: 0, visibility: 4, type: 2, subtype: 0, dimension: 2 }, // texture at 0 (mismatches WGSL uniform@0!)
+    { binding: 1, visibility: 4, type: 0, subtype: 1, minBindingSize: 64 }, // storage buffer at 1
+    { binding: 2, visibility: 4, type: 0, subtype: 0, minBindingSize: 64 }, // uniform buffer at 2
+    { binding: 3, visibility: 4, type: 1, subtype: 0 }, // sampler at 3
+  ];
+
+  const stream = concat(
+    new Stream()
+      .shader(10, 2, csWgsl)
+      .buffer(101, 0x0080 | 0x0008, 256) // STORAGE-only buffer (NO UNIFORM bit!)
+      .buffer(102, 0x0040 | 0x0008, 256) // UNIFORM-only buffer (NO STORAGE bit!)
+      .bytes(),
+    createTexture2Packet({ id: 100, width: 32, height: 32, format: formatCodeOf('rgba8unorm'), usage: 0x04 }),
+    createSampler2Packet(103, { filter: 1 }),
+    bindGroupLayoutPacket(200, rs8Entries),
+    pipelineLayoutPacket(201, [200]),
+    createComputePipeline2Packet(300, 10, 201),
+    bindGroup2Packet(400, 200, [
+      { binding: 0, type: 1, id: 100 },
+      { binding: 1, type: 0, id: 101, offset: 0, size: 256 },
+      { binding: 2, type: 0, id: 102, offset: 0, size: 256 },
+      { binding: 3, type: 2, id: 103 },
+    ]),
+    new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [300]).bytes(),
+    setBindGroup2Packet(0, 400, []),
+    new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [4, 4, 1]).bytes(),
+    // Second dispatch with same bind group should reuse cached remapped bind group
+    setBindGroup2Packet(0, 400, []),
+    new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [2, 2, 1]).packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const [cp] = gpu.results('createComputePipeline');
+  assert.equal(cp.desc.layout, 'auto', 'mismatched RS-8 compute pipeline must fall back to layout:auto');
+  assert.equal(handler.telemetry.autoLayoutFallbacks, 1);
+  assert.equal(handler.telemetry.rootSigGroup0Layouts, 0);
+  assert.ok(
+    handler.getTelemetry().warnings.some((w) => /compute pipeline 300.*incompatible.*layout:'auto'/.test(w))
+  );
+  const cpMeta = handler.computePipelineMeta.get(300);
+  assert.equal(cpMeta.autoLayoutRemap, true);
+  assert.deepEqual(
+    cpMeta.wgslBindings.map((b) => b.binding),
+    [0, 1, 2, 3, 4],
+    'unused binding 5 must be excluded from wgslBindings'
+  );
+
+  // createBindGroup called twice total: 1) original RS-8 bindGroup, 2) cached remapped bindGroup
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 2, 'remapped bind group must be cached across repeated setBindGroup(0) calls');
+  const remappedBg = bgs[1];
+  assert.equal(remappedBg.desc.layout, autoBglMap.get(cp.result));
+  assert.deepEqual(
+    remappedBg.desc.entries.map((e) => e.binding),
+    [0, 1, 2, 3, 4]
+  );
+
+  const storageBuf = processor.buffers.get(101);
+  const uniformBuf = processor.buffers.get(102);
+  const realSampler = processor.samplers.get(103);
+  // Binding 0 (uniform) got real UNIFORM buffer (102), NOT storage-only buffer (101)!
+  assert.equal(remappedBg.desc.entries[0].resource.buffer, uniformBuf);
+  // Binding 1 (texture) got real texture 100 view
+  assert.equal(remappedBg.desc.entries[1].resource.textureHandle, processor.textures.get(100).handle);
+  // Binding 2 (sampler) got real sampler 103
+  assert.equal(remappedBg.desc.entries[2].resource, realSampler);
+  // Binding 3 (storage) got real STORAGE buffer (101), NOT uniform-only buffer (102)!
+  assert.equal(remappedBg.desc.entries[3].resource.buffer, storageBuf);
+  // Binding 4 (storage-texture) fell back to dummy storage texture (different handle from real texture 100)
+  assert.notEqual(remappedBg.desc.entries[4].resource.textureHandle, processor.textures.get(100).handle);
+
+  // Verify compute pass actually bound the remapped bind group (not the original RS-8 bind group)
+  const setBgCalls = gpu.passCalls.filter((c) => c.pass === 'compute' && c.op === 'setBindGroup');
+  assert.equal(setBgCalls.length, 2);
+  assert.equal(setBgCalls[0].args[0], 0);
+  assert.equal(setBgCalls[0].args[1], remappedBg.result);
+  assert.equal(setBgCalls[1].args[1], remappedBg.result);
+
+  // Destroying bind group 400 clears bindGroupDescriptors and invalidates remapped cache
+  processor.executeCommandBuffer(new Stream().u32s(OPCODES.DESTROY_RESOURCE, [400]).bytes());
+  assert.equal(handler.bindGroupDescriptors.has(400), false);
+  assert.equal(handler.remappedBindGroups.has('c:300:400'), false);
+
+  // Dispatching WITHOUT a prior setBindGroup(0) synthesizes a dummy-filled remapped bind group
+  const noBgFrame = concat(
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .u32s(OPCODES.SET_COMPUTE_PIPELINE, [300])
+      .u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1])
+      .packet(OPCODES.PRESENT)
+      .bytes()
+  );
+  processor.executeCommandBuffer(noBgFrame);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createBindGroup').length, 3);
+  const autoDummyBg = gpu.results('createBindGroup')[2];
+  assert.equal(autoDummyBg.desc.layout, autoBglMap.get(cp.result));
+  assert.deepEqual(
+    autoDummyBg.desc.entries.map((e) => e.binding),
+    [0, 1, 2, 3, 4]
+  );
+});
+
+test('W97 compute remap respects buffer usage flags (storage-only never bound to uniform) and handles throwing or absent getBindGroupLayout', () => {
+  // Case A: Bind group only provides a STORAGE-only buffer; WGSL wants uniform@0 -> must use dummy buffer!
+  const gpu = createMockWebGpu();
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    pipe.getBindGroupLayout = () => ({ kind: 'GPUBindGroupLayout', autoFor: pipe.handle });
+    return pipe;
+  };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = installRenderStatePackets(processor);
+
+  const csUniformOnly = [
+    '@group(0) @binding(0) var<uniform> cb0: vec4<f32>;',
+    '@compute @workgroup_size(1, 1, 1) fn cs_main() { let x = cb0; _ = x; }',
+  ].join('\n');
+
+  processor.executeCommandBuffer(
+    concat(
+      new Stream()
+        .shader(1, 2, csUniformOnly)
+        .buffer(10, 0x0080 | 0x0008, 256) // STORAGE-only, NO UNIFORM usage!
+        .bytes(),
+      bindGroupLayoutPacket(20, [{ binding: 0, visibility: 4, type: 0, subtype: 1, minBindingSize: 16 }]),
+      pipelineLayoutPacket(21, [20]),
+      createComputePipeline2Packet(30, 1, 21),
+      bindGroup2Packet(40, 20, [{ binding: 0, type: 0, id: 10, offset: 0, size: 256 }]),
+      new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [30]).bytes(),
+      setBindGroup2Packet(0, 40, []),
+      new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  const remapped = gpu.results('createBindGroup')[1];
+  assert.notEqual(
+    remapped.desc.entries[0].resource.buffer,
+    processor.buffers.get(10),
+    'storage-only buffer must not be bound to a uniform binding'
+  );
+
+  // Case B: getBindGroupLayout(0) throws (Dawn stripped group 0) -> setBindGroup(0) is skipped cleanly!
+  const gpuThrow = createMockWebGpu();
+  const origCreateCompute2 = gpuThrow.device.createComputePipeline.bind(gpuThrow.device);
+  gpuThrow.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute2(desc);
+    pipe.getBindGroupLayout = () => {
+      throw new Error('Binding group index 0 does not exist');
+    };
+    return pipe;
+  };
+  const procThrow = new WgpuCommandProcessor(gpuThrow.device, gpuThrow.ctx);
+  const handlerThrow = installRenderStatePackets(procThrow);
+  procThrow.executeCommandBuffer(
+    concat(
+      new Stream()
+        .shader(1, 2, csUniformOnly)
+        .buffer(10, 0x0080 | 0x0008, 256)
+        .bytes(),
+      bindGroupLayoutPacket(20, [{ binding: 0, visibility: 4, type: 0, subtype: 1, minBindingSize: 16 }]),
+      pipelineLayoutPacket(21, [20]),
+      createComputePipeline2Packet(30, 1, 21),
+      bindGroup2Packet(40, 20, [{ binding: 0, type: 0, id: 10, offset: 0, size: 256 }]),
+      new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [30]).bytes(),
+      setBindGroup2Packet(0, 40, []),
+      new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+    )
+  );
+  assert.equal(handlerThrow.stats.errors, 0, handlerThrow.lastError);
+  assert.equal(
+    gpuThrow.passCalls.filter((c) => c.op === 'setBindGroup').length,
+    0,
+    'setBindGroup(0) must be skipped when getBindGroupLayout(0) throws'
+  );
+
+  // Case C: Mock device without getBindGroupLayout on pipeline -> does not crash!
+  const gpuNoGetBgl = createMockWebGpu();
+  const procNoGetBgl = new WgpuCommandProcessor(gpuNoGetBgl.device, gpuNoGetBgl.ctx);
+  const handlerNoGetBgl = installRenderStatePackets(procNoGetBgl);
+  assert.doesNotThrow(() => {
+    procNoGetBgl.executeCommandBuffer(
+      concat(
+        new Stream()
+          .shader(1, 2, csUniformOnly)
+          .buffer(10, 0x0080 | 0x0008, 256)
+          .bytes(),
+        bindGroupLayoutPacket(20, [{ binding: 0, visibility: 4, type: 0, subtype: 1, minBindingSize: 16 }]),
+        pipelineLayoutPacket(21, [20]),
+        createComputePipeline2Packet(30, 1, 21),
+        bindGroup2Packet(40, 20, [{ binding: 0, type: 0, id: 10, offset: 0, size: 256 }]),
+        new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [30]).bytes(),
+        setBindGroup2Packet(0, 40, []),
+        new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+      )
+    );
+  });
+  assert.equal(handlerNoGetBgl.stats.errors, 0, handlerNoGetBgl.lastError);
+});
+
+test('W97 render pipeline: RS-4 mismatch falls back to layout:auto and remaps group 0, while compatible PSO #50450 preserves explicit PipelineLayout untouched', () => {
+  const gpu = createMockWebGpu();
+  const autoBglMap = new Map();
+  const origCreateRender = gpu.device.createRenderPipeline.bind(gpu.device);
+  gpu.device.createRenderPipeline = (desc) => {
+    const pipe = origCreateRender(desc);
+    const autoBgl = { kind: 'GPUBindGroupLayout', autoFor: pipe.handle };
+    autoBglMap.set(pipe, autoBgl);
+    pipe.getBindGroupLayout = (groupIndex) => {
+      if (groupIndex !== 0) throw new Error(`invalid group ${groupIndex}`);
+      return autoBgl;
+    };
+    return pipe;
+  };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+  const key = buildFrame1PipelineKey();
+
+  const vsWgsl = [
+    'struct Rdna2Cbv { m: vec4<f32> };',
+    '@group(0) @binding(0)',
+    'var<uniform> cb0_: Rdna2Cbv;',
+    '@vertex fn vs_main(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>, @location(2) uv: vec2<f32>) -> @builtin(position) vec4<f32> {',
+    '  return vec4<f32>(p + cb0_.m.xyz, 1.0);',
+    '}',
+  ].join('\n');
+  const fsWgsl = [
+    '@group(0) @binding(1)',
+    'var tex0_: texture_2d<f32>;',
+    '@group(0) @binding(2)',
+    'var samp0_: sampler;',
+    '@fragment fn fs_main() -> @location(0) vec4<f32> {',
+    '  return textureSample(tex0_, samp0_, vec2<f32>(0.5, 0.5));',
+    '}',
+  ].join('\n');
+
+  // RS-4 layout: only 1 CBV (binding 0, with dynamic offset) -> INCOMPATIBLE with tex0@1 & samp0@2!
+  const rs4Entries = [{ binding: 0, visibility: 3, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 }];
+  // PSO #50450 layout: CBV@0 (dynamic offset), tex0@1, samp0@2 -> COMPATIBLE!
+  const pso50450Entries = [
+    { binding: 0, visibility: 3, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 },
+    { binding: 1, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+    { binding: 2, visibility: 2, type: 1, subtype: 0 },
+  ];
+
+  const stream = concat(
+    new Stream()
+      .shader(1, 0, vsWgsl)
+      .shader(2, 1, fsWgsl)
+      .buffer(100, 0x0040 | 0x0008, 256) // CBV
+      .buffer(105, 0x0020 | 0x0008, 72) // VB
+      .bytes(),
+    createTexture2Packet({ id: 101, width: 32, height: 32, format: formatCodeOf('rgba8unorm'), usage: 0x04 }),
+    createSampler2Packet(102, { filter: 1 }),
+    bindGroupLayoutPacket(200, rs4Entries),
+    pipelineLayoutPacket(201, [200]),
+    bindGroupLayoutPacket(210, pso50450Entries),
+    pipelineLayoutPacket(211, [210]),
+    // PSO #50451 with RS-4 (mismatched -> auto fallback)
+    renderPipeline2Packet(50451, 1, 2, 201, key),
+    // PSO #50450 with matching explicit layout (untouched!)
+    renderPipeline2Packet(50450, 1, 2, 211, key),
+    bindGroup2Packet(400, 200, [{ binding: 0, type: 0, id: 100, offset: 0, size: 256 }]),
+    bindGroup2Packet(410, 210, [
+      { binding: 0, type: 0, id: 100, offset: 0, size: 256 },
+      { binding: 1, type: 1, id: 101 },
+      { binding: 2, type: 2, id: 102 },
+    ]),
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+    // Draw 1: PSO #50451 (autoLayoutRemap) with RS-4 bind group (dynamic offset [0] must be dropped on auto layout!)
+    new Stream().u32s(OPCODES.SET_PIPELINE, [50451]).bytes(),
+    setBindGroup2Packet(0, 400, [0]),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    // Draw 2: PSO #50450 (explicit layout preserved untouched with dynamic offset [0]!)
+    new Stream().u32s(OPCODES.SET_PIPELINE, [50450]).bytes(),
+    setBindGroup2Packet(0, 410, [0]),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(processor.skippedDrawCount, 0, 'neither PSO #50451 nor PSO #50450 draw should be skipped');
+
+  const [plRs4, pl50450] = gpu.results('createPipelineLayout');
+  const [pipe50451, pipe50450] = gpu.results('createRenderPipeline');
+
+  // PSO #50451 fell back to layout:'auto'
+  assert.equal(pipe50451.desc.layout, 'auto');
+  assert.equal(handler.renderPipelineAutoLayoutMeta.has(50451), true);
+  assert.equal(handler.renderPipelineAutoLayoutMeta.get(50451).autoLayoutRemap, true);
+  assert.deepEqual(
+    handler.renderPipelineAutoLayoutMeta.get(50451).wgslBindings.map((b) => b.binding),
+    [0, 1, 2]
+  );
+
+  // PSO #50450 kept its explicit PipelineLayout untouched!
+  assert.equal(pipe50450.desc.layout, pl50450.result);
+  assert.notEqual(plRs4.result, pl50450.result);
+  assert.equal(handler.renderPipelineAutoLayoutMeta.has(50450), false);
+  assert.equal(handler.telemetry.autoLayoutFallbacks, 1);
+  assert.equal(handler.telemetry.rootSigGroup0Layouts, 1);
+
+  // Verify bind groups: [0]=bg400(RS-4), [1]=bg410(50450), [2]=remapped for 50451
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 3);
+  const remapped50451 = bgs[2];
+  assert.equal(remapped50451.desc.layout, autoBglMap.get(pipe50451.result));
+  assert.deepEqual(
+    remapped50451.desc.entries.map((e) => e.binding),
+    [0, 1, 2]
+  );
+  // Real CBV buffer preserved at binding 0; dummy texture & dummy sampler synthesized for 1 & 2
+  assert.equal(remapped50451.desc.entries[0].resource.buffer, processor.buffers.get(100));
+  assert.equal(remapped50451.desc.entries[1].resource.kind, 'GPUTextureView');
+  assert.equal(remapped50451.desc.entries[2].resource.kind, 'GPUSampler');
+
+  const renderSetBgs = gpu.passCalls.filter((c) => c.pass === 'render' && c.op === 'setBindGroup');
+  assert.equal(renderSetBgs.length, 2);
+  // PSO #50451 received remapped bind group WITHOUT dynamic offsets
+  assert.deepEqual(renderSetBgs[0].args, [0, remapped50451.result]);
+  // PSO #50450 received original bind group 410 WITH dynamic offset [0] untouched
+  assert.deepEqual(renderSetBgs[1].args, [0, bgs[1].result, [0]]);
 });
