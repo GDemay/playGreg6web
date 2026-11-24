@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 
 import bootstrapDefault, {
   DEFAULT_LOADER_URL,
+  DEFAULT_MAX_VALIDATION_ERRORS,
   PlayGta6AppHandle,
   bootstrapPlayGta6App,
   detectWasm64,
   extractBootAssetUrls,
   resolveDefaultGameBase,
+  sanitizeSideModuleUrls,
 } from '../web/app_bootstrap.js';
 import { SESSION_MODE, SESSION_STATE } from '../web/runtime/session_controller.js';
 import { SmokeDemoRunner } from '../web/demo/run_smoke_demo.js';
@@ -1680,4 +1682,503 @@ test('W58 bootstrapPlayGta6App capability probe reports wasm64 for address: i64,
   // Explicitly absent WebAssembly API on windowObj.
   const absentResult = await probeWithWebAssembly(null);
   assert.equal(absentResult, false);
+});
+
+test('W73 sanitizeSideModuleUrls and extractBootAssetUrls filter unsafe paths and preserve clean split-module metadata', () => {
+  assert.equal(typeof DEFAULT_MAX_VALIDATION_ERRORS, 'number');
+  assert.ok(DEFAULT_MAX_VALIDATION_ERRORS >= 1);
+
+  assert.deepEqual(sanitizeSideModuleUrls(null), []);
+  assert.deepEqual(sanitizeSideModuleUrls('not-an-array'), []);
+  assert.deepEqual(
+    sanitizeSideModuleUrls([
+      '/dist/guest_part_0.wasm',
+      ' /dist/guest_part_1.wasm?token=secret ',
+      '/dist/guest_part_0.wasm', // duplicate
+      'guest_part_2.wasm',
+      'https://playgta6.local/dist/guest_part_3.wasm?auth=123',
+      'https://user:pass@playgta6.local/dist/cred.wasm', // credentials rejected
+      'file:///C:/Users/alice/guest_part_4.wasm', // file URL rejected
+      'C:\\Users\\alice\\guest_part_5.wasm', // Windows host path rejected
+      '/home/alice/work/guest_part_6.wasm', // POSIX host path rejected
+      '/Users/bob/guest_part_7.wasm', // macOS host path rejected
+      '../escape/guest_part_8.wasm', // traversal rejected
+      '/dist/runtime.js', // non-wasm rejected
+      '',
+      42,
+    ]),
+    [
+      '/dist/guest_part_0.wasm',
+      '/dist/guest_part_1.wasm',
+      'guest_part_2.wasm',
+      'https://playgta6.local/dist/guest_part_3.wasm',
+    ]
+  );
+
+  // Backwards compatibility: objects without sideModule fields do not gain sideModule keys.
+  assert.deepEqual(extractBootAssetUrls({ bootBase: '/boot/' }), { bootBase: '/boot/' });
+
+  // Derives sideModuleCount when only sideModuleUrls is present.
+  assert.deepEqual(
+    extractBootAssetUrls({
+      sideModuleUrls: ['/dist/guest_part_0.wasm', '/dist/guest_part_1.wasm', 'C:\\bad\\x.wasm'],
+    }),
+    {
+      sideModuleUrls: ['/dist/guest_part_0.wasm', '/dist/guest_part_1.wasm'],
+      sideModuleCount: 2,
+    }
+  );
+
+  // Preserves explicit sideModuleCount when sideModuleUrls is absent.
+  assert.deepEqual(extractBootAssetUrls({ sideModuleCount: 4 }), { sideModuleCount: 4 });
+
+  // Handles explicit empty sideModuleUrls with count 0.
+  assert.deepEqual(extractBootAssetUrls({ sideModuleUrls: [], sideModuleCount: 0 }), {
+    sideModuleUrls: [],
+    sideModuleCount: 0,
+  });
+});
+
+test('W73 forwards /api/status sideModuleUrls and sideModuleCount into loader boot payload and optional session/HUD hooks', async () => {
+  const clock = createClock(12000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+  webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const workerCalls = [];
+  const postedMessages = [];
+  const mockWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      postedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+
+  const hudControllerSideModules = [];
+  const hudController = {
+    updateSideModules(info) {
+      hudControllerSideModules.push(info);
+    },
+  };
+
+  const sessionSideModules = [];
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      dataDirConfigured: true,
+      hasManifest: true,
+      hasBootset: true,
+      hasWasmBinary: true,
+      shaderPackCount: 1,
+      sideModuleCount: 2,
+      sideModuleUrls: [
+        '/dist/guest_part_0.wasm',
+        '/dist/guest_part_1.wasm',
+        '/home/alice/leak.wasm',
+      ],
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    hudController,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      workerCalls.push(args);
+      return mockWorker;
+    },
+  });
+
+  // Attach optional session hook (simulating W72 SessionController extension).
+  app.session.setSideModules = (info) => {
+    sessionSideModules.push(info);
+  };
+
+  // Attach a throwing post-bootstrap window.playgta6HudController to verify error isolation.
+  windowObj.playgta6HudController = {
+    setSideModules() {
+      throw new Error('simulated HUD controller failure');
+    },
+  };
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(workerCalls.length, 1);
+  assert.equal(postedMessages.length, 1);
+
+  assert.deepEqual(workerCalls[0].sideModuleUrls, [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+  ]);
+  assert.equal(workerCalls[0].sideModuleCount, 2);
+
+  const initPayload = postedMessages[0].payload;
+  assert.deepEqual(initPayload.sideModuleUrls, [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+  ]);
+  assert.equal(initPayload.sideModuleCount, 2);
+
+  assert.equal(sessionSideModules.length, 1);
+  assert.equal(sessionSideModules[0].sideModuleCount, 2);
+  assert.deepEqual(sessionSideModules[0].sideModuleUrls, [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+  ]);
+
+  assert.equal(hudControllerSideModules.length, 1);
+  assert.equal(hudControllerSideModules[0].sideModuleCount, 2);
+  assert.deepEqual(hudControllerSideModules[0].sideModuleUrls, [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+  ]);
+
+  const sideMetric = hud.metricsUpdates.find((m) => m.sideModuleCount === 2);
+  assert.ok(sideMetric, 'hud.updateMetrics must receive discovered sideModuleCount');
+  assert.deepEqual(sideMetric.sideModuleUrls, [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+  ]);
+
+  const snap = app.getDiagnosticsSnapshot();
+  assert.equal(snap.bootMode, 'wasm-guest');
+  assert.equal(snap.sideModuleCount, 2);
+
+  await app.destroy();
+  assert.equal(windowObj.__playgta6, undefined);
+});
+
+test('W73 forwards wgpu_worker gpu-validation-error and splash-frame-presented to optional HUD/session hooks safely', async () => {
+  const clock = createClock(15000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const broadcastInstances = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this.closed = false;
+      broadcastInstances.push(this);
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.BroadcastChannel = MockBroadcastChannel;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const panelUpdates = [];
+  const mockGpuBootPanel = {
+    update(snapshot) {
+      panelUpdates.push(snapshot);
+    },
+  };
+
+  const sessionValidationErrors = [];
+  const sessionSplashFrames = [];
+  const hudValidationErrors = [];
+  const hudSplashFrames = [];
+
+  const hudController = {
+    onGpuValidationError(ev) {
+      hudValidationErrors.push(ev);
+    },
+    onSplashFramePresented(ev) {
+      hudSplashFrames.push(ev);
+    },
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      sideModuleUrls: ['/dist/guest_part_0.wasm'],
+      sideModuleCount: 1,
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    hudController,
+    gpuBootPanel: mockGpuBootPanel,
+    maxValidationErrors: 3,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  app.session.onGpuValidationError = (ev) => {
+    sessionValidationErrors.push(ev);
+  };
+  app.session.onSplashFramePresented = (ev) => {
+    sessionSplashFrames.push(ev);
+  };
+
+  // Post-bootstrap window.playgta6HudController that throws on every hook must be isolated.
+  windowObj.playgta6HudController = {
+    recordGpuValidationError() {
+      throw new Error('throwing validation hook');
+    },
+    recordSplashFramePresented() {
+      throw new Error('throwing splash hook');
+    },
+  };
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(broadcastInstances.length, 1);
+
+  // 1. Dispatch gpu-validation-error over worker message with sensitive host path & long hex dump.
+  mockWorker.dispatch('message', {
+    data: {
+      type: 'gpu-validation-error',
+      errorType: 'validation',
+      message:
+        'Shader error at C:\\Users\\alice\\shader.wgsl with dump 0xdeadbeefcafebabe0123456789abcdef0123456789abcdef01234567',
+      timestampMs: 15100,
+    },
+  });
+
+  // 2. Dispatch out-of-memory error via BroadcastChannel('game-progress') with POSIX host path.
+  broadcastInstances[0].onmessage({
+    data: {
+      type: 'gpu-validation-error',
+      error: { name: 'GPUOutOfMemoryError', message: 'Allocation failed in /home/bob/vram.bin' },
+      timestampMs: 15200,
+    },
+  });
+
+  // 3. Dispatch 3 more errors to verify bounded recentValidationErrors cap (maxValidationErrors: 3).
+  for (let i = 3; i <= 5; i += 1) {
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-validation-error',
+        errorType: i === 5 ? 'internal' : 'validation',
+        message: `Validation error #${i}`,
+        timestampMs: 15000 + i * 100,
+      },
+    });
+  }
+
+  assert.equal(sessionValidationErrors.length, 5);
+  assert.equal(hudValidationErrors.length, 5);
+  assert.equal(sessionValidationErrors[0].errorType, 'validation');
+  assert.ok(!sessionValidationErrors[0].message.includes('alice'));
+  assert.ok(!sessionValidationErrors[0].message.includes('deadbeefcafebabe'));
+  assert.equal(sessionValidationErrors[1].errorType, 'out-of-memory');
+  assert.ok(!sessionValidationErrors[1].message.includes('/home/bob'));
+  assert.equal(sessionValidationErrors[4].errorType, 'internal');
+
+  // Primary hud.appendLog also surfaced validation errors because hud had no dedicated hook.
+  assert.ok(hud.logs.some((entry) => entry.level === 'error' && entry.message.includes('[WebGPU validation]')));
+
+  // 4. Dispatch splash-frame-presented messages (first present, second frame, and non-fatal failure).
+  mockWorker.dispatch('message', {
+    data: {
+      type: 'splash-frame-presented',
+      frameIndex: 0,
+      framesPresented: 1,
+      ok: true,
+      firstPresent: true,
+    },
+  });
+  mockWorker.dispatch('message', {
+    data: {
+      type: 'splash-frame-presented',
+      frameIndex: 1,
+      framesPresented: 2,
+      ok: true,
+    },
+  });
+  mockWorker.dispatch('message', {
+    data: {
+      type: 'splash-frame-presented',
+      frameIndex: 2,
+      framesPresented: 2,
+      ok: false,
+      error: 'Context lost at /Users/alice/frame.png',
+      reason: 'device-not-ready',
+    },
+  });
+
+  assert.equal(sessionSplashFrames.length, 3);
+  assert.equal(hudSplashFrames.length, 3);
+  assert.equal(sessionSplashFrames[0].ok, true);
+  assert.equal(sessionSplashFrames[0].firstPresent, true);
+  assert.equal(sessionSplashFrames[0].framesPresented, 1);
+  assert.equal(sessionSplashFrames[1].framesPresented, 2);
+  assert.equal(sessionSplashFrames[2].ok, false);
+  assert.ok(!sessionSplashFrames[2].error.includes('/Users/alice'));
+
+  // FIRST_PRESENT milestone was marked in BootTracer and panel received frameStats.
+  assert.equal(app.bootTracer.getSummary().stage, 'FIRST_PRESENT');
+  assert.ok(panelUpdates.some((u) => u.frameStats && u.frameStats.framesPresented === 2));
+
+  // Verify bounded diagnostics snapshot on both app handle and globalScope.__playgta6.
+  const snap = app.getDiagnosticsSnapshot();
+  assert.ok(windowObj.__playgta6);
+  assert.deepEqual(Object.keys(windowObj.__playgta6), ['getDiagnosticsSnapshot']);
+  assert.equal(Object.isFrozen(windowObj.__playgta6), true);
+
+  const globalSnap = windowObj.__playgta6.getDiagnosticsSnapshot();
+  assert.deepEqual(globalSnap, snap);
+  assert.equal(Object.isFrozen(snap), true);
+  assert.equal(Object.isFrozen(snap.recentValidationErrors), true);
+  assert.equal(Object.isFrozen(snap.recentValidationErrors[0]), true);
+
+  assert.equal(snap.bootMode, 'wasm-guest');
+  assert.equal(snap.milestone, 'FIRST_PRESENT');
+  assert.equal(snap.sideModuleCount, 1);
+  assert.equal(snap.validationErrorCount, 5);
+  assert.equal(snap.recentValidationErrors.length, 3);
+  assert.deepEqual(
+    snap.recentValidationErrors.map((e) => e.message),
+    ['Validation error #3', 'Validation error #4', 'Validation error #5']
+  );
+  assert.equal(snap.framesPresented, 2);
+  assert.equal(snap.splashFramesPresented, 2);
+  assert.equal(snap.destroyed, false);
+
+  await app.destroy();
+  assert.equal(windowObj.__playgta6, undefined);
+  assert.equal(app.getDiagnosticsSnapshot().destroyed, true);
+});
+
+test('W73 globalScope.__playgta6 supports custom globalScope, attachGlobalHook opt-out, smoke diagnostics, and safe teardown', async () => {
+  const clock = createClock(20000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  // 1. Custom globalScope receives sanitized __playgta6 hook.
+  const customGlobal = {};
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    globalScope: customGlobal,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+
+  assert.equal(windowObj.__playgta6, undefined);
+  assert.ok(customGlobal.__playgta6);
+  assert.equal(customGlobal.__playgta6.getDiagnosticsSnapshot().bootMode, 'idle');
+  assert.equal(customGlobal.__playgta6.getDiagnosticsSnapshot().milestone, 'NOT_STARTED');
+
+  await app.start();
+  raf.flushFrame(16);
+  raf.flushFrame(16);
+
+  // Smoke device uncapturederror updates validationErrorCount without leaking paths.
+  webgpu.device.dispatch('uncapturederror', {
+    error: { name: 'GPUValidationError', message: 'Bad layout in C:\\Users\\secret\\file.wgsl' },
+  });
+
+  const smokeSnap = customGlobal.__playgta6.getDiagnosticsSnapshot();
+  assert.equal(smokeSnap.bootMode, 'smoke-demo');
+  assert.equal(smokeSnap.milestone, 'FIRST_PRESENT');
+  assert.equal(smokeSnap.sideModuleCount, 0);
+  assert.ok(smokeSnap.framesPresented >= 2);
+  assert.equal(smokeSnap.validationErrorCount, 1);
+  assert.equal(smokeSnap.recentValidationErrors.length, 1);
+  assert.ok(!smokeSnap.recentValidationErrors[0].message.includes('secret'));
+
+  // Optional session.getBootMode() override is honored if present.
+  app.session.getBootMode = () => 'real-wasm64';
+  assert.equal(app.getDiagnosticsSnapshot().bootMode, 'real-wasm64');
+
+  // If another instance replaces customGlobal.__playgta6, destroy() must not clobber it.
+  const sentinelHook = Object.freeze({ getDiagnosticsSnapshot: () => ({ sentinel: true }) });
+  customGlobal.__playgta6 = sentinelHook;
+  await app.destroy();
+  assert.equal(customGlobal.__playgta6, sentinelHook);
+
+  // 2. attachGlobalHook: false skips attaching __playgta6 even when windowObj is provided.
+  const optOutGlobal = {};
+  const optOutApp = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    globalScope: optOutGlobal,
+    attachGlobalHook: false,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+  assert.equal(optOutGlobal.__playgta6, undefined);
+  assert.equal(optOutApp.getDiagnosticsSnapshot().bootMode, 'idle');
+  await optOutApp.destroy();
+
+  // 3. Frozen globalScope never throws during bootstrap or destroy.
+  const frozenGlobal = Object.freeze({});
+  const frozenApp = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    globalScope: frozenGlobal,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+  assert.equal(frozenGlobal.__playgta6, undefined);
+  assert.equal(frozenApp.getDiagnosticsSnapshot().bootMode, 'idle');
+  await frozenApp.destroy();
 });
