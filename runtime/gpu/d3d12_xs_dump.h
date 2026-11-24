@@ -17,7 +17,7 @@
 // the identity the guest layer uses; the code+metadata identity is in the manifest.
 //
 // manifest.json (schema "playgta6-pipeline-dump", schema_version 1):
-//   native_stages: [{code_identity, identity, stage ("vertex" | "pixel"), layout ("A" | "B"),
+//   native_stages: [{code_identity, identity, stage ("vertex" | "pixel" | "compute"), layout ("A" | "B"),
 //                    code_bytes, metadata_bytes, code_file, metadata_file}]
 //   dxil: [{identity, hash_digest (32 hex digits, the HASH part; "" if none), kind (DXIL program
 //           kind: 0 pixel, 1 vertex, 5 compute, ...; -1 unknown), bytes, file}]
@@ -42,6 +42,10 @@
 //                            slope_scaled_depth_bias, depth_clip, multisample, antialiased_line,
 //                            forced_sample_count, conservative},
 //                input_layout: [{semantic, index, format, slot, offset, per_instance, step_rate}]}]
+//   compute_pipelines: [{index, created, dispatches,
+//                        cs: null or {dxil_identity, hash_digest, native_code_identity,
+//                                     native_identity},
+//                        root_signature (index or -1)}]
 // Enum values are the public D3D12 / DXGI numbers.
 
 #include <array>
@@ -68,8 +72,12 @@ public:
     bool ok() const { return ok_; }
     const std::string& dir() const { return dir_; }
 
+    enum class NativeStageKind : uint8_t { Vertex = 0, Pixel = 1, Compute = 2 };
+
     void native_stage(uint64_t code_identity, uint64_t identity, bool pixel, bool layout_b, const uint8_t* code,
                       size_t code_size, const uint8_t* metadata, size_t metadata_size);
+    void native_stage(uint64_t code_identity, uint64_t identity, NativeStageKind stage, bool layout_b,
+                      const uint8_t* code, size_t code_size, const uint8_t* metadata, size_t metadata_size);
     void dxil(uint64_t identity, const std::array<uint8_t, 16>* hash_digest, int kind, const uint8_t* bytes,
               size_t size);
     // Records a graphics pipeline (deduplicated by its manifest entry); returns its index.
@@ -78,11 +86,17 @@ public:
                       const std::array<uint8_t, 16>& ps_digest, const void* root_signature,
                       const d3d12_state::RootSignatureDesc* root_desc);
     void draw(uint32_t pipeline_index);
+    // Records a compute pipeline (deduplicated by its manifest entry); returns its index.
+    uint32_t compute_pipeline(uint64_t cs_identity, const std::array<uint8_t, 16>& cs_digest,
+                              uint64_t native_code_identity, uint64_t native_identity, const void* root_signature,
+                              const d3d12_state::RootSignatureDesc* root_desc);
+    void dispatch(uint32_t compute_pipeline_index);
     // Writes manifest.json (atomically: temporary file, then rename).
     void write_manifest();
 
 private:
     bool write_file(const std::string& path, const uint8_t* bytes, size_t size);
+    int intern_root_signature_locked(const void* root_signature, const d3d12_state::RootSignatureDesc* root_desc);
 
     std::string dir_;
     bool ok_ = false;
@@ -101,6 +115,13 @@ private:
     };
     std::vector<Pipeline> pipelines_;
     std::map<std::string, uint32_t> pipeline_index_;
+    struct ComputePipeline {
+        std::string body;  // manifest entry without index and counters
+        uint64_t created = 0;
+        uint64_t dispatches = 0;
+    };
+    std::vector<ComputePipeline> compute_pipelines_;
+    std::map<std::string, uint32_t> compute_pipeline_index_;
 };
 
 }  // namespace playgta6::gpu::d3d12_guest
