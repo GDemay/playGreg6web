@@ -100,6 +100,111 @@ function nameOf(table, code) {
   return code < table.length ? table[code] : undefined;
 }
 
+function finiteOr(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function validTargetSize(width, height) {
+  if (
+    typeof width === 'number' &&
+    typeof height === 'number' &&
+    Number.isFinite(width) &&
+    Number.isFinite(height) &&
+    width > 0 &&
+    height > 0
+  ) {
+    return { width, height };
+  }
+  return null;
+}
+
+// Clamps a guest viewport to the active render target bounds and WebGPU [0, 1] depth range.
+function clampViewportToTarget(viewport, targetSize) {
+  const rawX = finiteOr(viewport && viewport.x, 0);
+  const rawY = finiteOr(viewport && viewport.y, 0);
+  const rawW = finiteOr(viewport && viewport.width, 0);
+  const rawH = finiteOr(viewport && viewport.height, 0);
+
+  let minDepth = Math.min(1, Math.max(0, finiteOr(viewport && viewport.minDepth, 0)));
+  let maxDepth = Math.min(1, Math.max(0, finiteOr(viewport && viewport.maxDepth, 1)));
+  if (minDepth > maxDepth) {
+    const tmp = minDepth;
+    minDepth = maxDepth;
+    maxDepth = tmp;
+  }
+  minDepth = minDepth || 0;
+  maxDepth = maxDepth || 0;
+
+  const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
+  if (!target) {
+    return {
+      x: Math.max(0, rawX) || 0,
+      y: Math.max(0, rawY) || 0,
+      width: Math.max(0, rawW) || 0,
+      height: Math.max(0, rawH) || 0,
+      minDepth,
+      maxDepth,
+    };
+  }
+
+  const targetWidth = target.width;
+  const targetHeight = target.height;
+  if (
+    rawX >= 0 &&
+    rawY >= 0 &&
+    rawW >= 0 &&
+    rawH >= 0 &&
+    rawX + rawW <= targetWidth &&
+    rawY + rawH <= targetHeight
+  ) {
+    return {
+      x: rawX || 0,
+      y: rawY || 0,
+      width: rawW || 0,
+      height: rawH || 0,
+      minDepth,
+      maxDepth,
+    };
+  }
+
+  const x = Math.min(Math.max(0, rawX), targetWidth) || 0;
+  const y = Math.min(Math.max(0, rawY), targetHeight) || 0;
+  let width = Math.min(Math.max(0, rawW), targetWidth - x) || 0;
+  let height = Math.min(Math.max(0, rawH), targetHeight - y) || 0;
+  if (x + width > targetWidth) width = Math.max(0, targetWidth - x) || 0;
+  if (y + height > targetHeight) height = Math.max(0, targetHeight - y) || 0;
+  return { x, y, width, height, minDepth, maxDepth };
+}
+
+// Clamps a guest integer scissor rect to [0..targetWidth] x [0..targetHeight].
+function clampScissorToTarget(scissor, targetSize) {
+  const rawX = Math.max(0, Math.floor(finiteOr(scissor && scissor.x, 0))) || 0;
+  const rawY = Math.max(0, Math.floor(finiteOr(scissor && scissor.y, 0))) || 0;
+  const rawW = Math.max(0, Math.floor(finiteOr(scissor && scissor.width, 0))) || 0;
+  const rawH = Math.max(0, Math.floor(finiteOr(scissor && scissor.height, 0))) || 0;
+
+  const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
+  if (!target) {
+    return { x: rawX, y: rawY, width: rawW, height: rawH };
+  }
+
+  const targetWidth = Math.floor(target.width);
+  const targetHeight = Math.floor(target.height);
+  if (targetWidth <= 0 || targetHeight <= 0) {
+    return { x: rawX, y: rawY, width: rawW, height: rawH };
+  }
+
+  if (rawX + rawW <= targetWidth && rawY + rawH <= targetHeight) {
+    return { x: rawX, y: rawY, width: rawW, height: rawH };
+  }
+
+  const x = Math.min(rawX, targetWidth) || 0;
+  const y = Math.min(rawY, targetHeight) || 0;
+  const width = Math.min(rawW, targetWidth - x) || 0;
+  const height = Math.min(rawH, targetHeight - y) || 0;
+  return { x, y, width, height };
+}
+
 // ---- Decoders (pure; also used by the tests) ----
 
 function decodeTextureViewDesc(view, offset) {
@@ -330,6 +435,8 @@ class RenderStatePackets {
     this.stats = { packets: 0, errors: 0 };
     this.lastError = null;
     this._packetError = null;
+    this._activePass = null;
+    this._activePassTargetSize = null;
   }
 
   // Returns true when the opcode belongs to ABI v2 (handled, possibly with an error recorded).
@@ -349,18 +456,40 @@ class RenderStatePackets {
       case V2_OPCODES.END_RENDER_PASS:
         this._queue((ctl) => {
           if (ctl.passKind === 'render') ctl.endPass();
+          this._activePass = null;
+          this._activePassTargetSize = null;
         });
         return this._count(true);
       case V2_OPCODES.SET_VIEWPORT: {
         if (payloadBytes < 24) return this._count(false);
-        const a = [0, 4, 8, 12, 16, 20].map((o) => view.getFloat32(offset + o, true));
-        this._queueRender((pass) => pass.setViewport(a[0], a[1], a[2], a[3], a[4], a[5]));
+        const rawViewport = {
+          x: view.getFloat32(offset, true),
+          y: view.getFloat32(offset + 4, true),
+          width: view.getFloat32(offset + 8, true),
+          height: view.getFloat32(offset + 12, true),
+          minDepth: view.getFloat32(offset + 16, true),
+          maxDepth: view.getFloat32(offset + 20, true),
+        };
+        this._queue((ctl) => {
+          if (ctl.passKind !== 'render') return;
+          const vp = clampViewportToTarget(rawViewport, this._getActivePassTargetSize(ctl));
+          ctl.pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
+        });
         return this._count(true);
       }
       case V2_OPCODES.SET_SCISSOR_RECT: {
         if (payloadBytes < 16) return this._count(false);
-        const r = [0, 4, 8, 12].map((o) => view.getUint32(offset + o, true));
-        this._queueRender((pass) => pass.setScissorRect(r[0], r[1], r[2], r[3]));
+        const rawScissor = {
+          x: view.getUint32(offset, true),
+          y: view.getUint32(offset + 4, true),
+          width: view.getUint32(offset + 8, true),
+          height: view.getUint32(offset + 12, true),
+        };
+        this._queue((ctl) => {
+          if (ctl.passKind !== 'render') return;
+          const sc = clampScissorToTarget(rawScissor, this._getActivePassTargetSize(ctl));
+          ctl.pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
+        });
         return this._count(true);
       }
       case V2_OPCODES.SET_BLEND_CONSTANT: {
@@ -579,6 +708,89 @@ class RenderStatePackets {
     return textureView ? () => textureView : null;
   }
 
+  _textureAttachmentSize(textureId, viewDesc) {
+    const textures = this.processor && this.processor.textures;
+    const texture = textures && typeof textures.get === 'function' ? textures.get(textureId) : null;
+    if (!texture) return null;
+    const base = validTargetSize(texture.width, texture.height);
+    if (!base) return null;
+    const mip =
+      viewDesc && typeof viewDesc.baseMipLevel === 'number' && viewDesc.baseMipLevel > 0
+        ? Math.floor(viewDesc.baseMipLevel)
+        : 0;
+    if (mip === 0) return base;
+    const scale = mip >= 31 ? Infinity : Math.pow(2, mip);
+    return {
+      width: scale === Infinity ? 1 : Math.max(1, Math.floor(base.width / scale)),
+      height: scale === Infinity ? 1 : Math.max(1, Math.floor(base.height / scale)),
+    };
+  }
+
+  _resolveSwapchainSize(ctl) {
+    if (ctl) {
+      const fromCtl =
+        validTargetSize(ctl.canvasWidth, ctl.canvasHeight) ||
+        validTargetSize(ctl.swapchainWidth, ctl.swapchainHeight);
+      if (fromCtl) return fromCtl;
+      if (ctl.swapchainTexture) {
+        const fromTex = validTargetSize(ctl.swapchainTexture.width, ctl.swapchainTexture.height);
+        if (fromTex) return fromTex;
+      }
+      if (typeof ctl.getCanvasTexture === 'function') {
+        try {
+          const tex = ctl.getCanvasTexture();
+          if (tex) {
+            const fromGetter = validTargetSize(tex.width, tex.height);
+            if (fromGetter) return fromGetter;
+          }
+        } catch (_) {
+          // Fall through to remaining swapchain size probes.
+        }
+      }
+      if (ctl.swapchainView) {
+        const fromView =
+          validTargetSize(ctl.swapchainView.width, ctl.swapchainView.height) ||
+          (ctl.swapchainView.texture &&
+            validTargetSize(ctl.swapchainView.texture.width, ctl.swapchainView.texture.height));
+        if (fromView) return fromView;
+      }
+    }
+    const proc = this.processor;
+    if (proc) {
+      if (proc.canvas) {
+        const fromProcCanvas = validTargetSize(proc.canvas.width, proc.canvas.height);
+        if (fromProcCanvas) return fromProcCanvas;
+      }
+      if (proc.ctx) {
+        if (proc.ctx.canvas) {
+          const fromCtxCanvas = validTargetSize(proc.ctx.canvas.width, proc.ctx.canvas.height);
+          if (fromCtxCanvas) return fromCtxCanvas;
+        }
+        if (typeof proc.ctx.getCurrentTexture === 'function') {
+          try {
+            const current = proc.ctx.getCurrentTexture();
+            if (current) {
+              const fromCurrent = validTargetSize(current.width, current.height);
+              if (fromCurrent) return fromCurrent;
+            }
+          } catch (_) {
+            // Fall back to null when swapchain texture dimensions cannot be queried.
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  _getActivePassTargetSize(ctl) {
+    if (this._activePass !== null && ctl.pass === this._activePass) {
+      return this._activePassTargetSize;
+    }
+    this._activePass = null;
+    this._activePassTargetSize = null;
+    return this._resolveSwapchainSize(ctl);
+  }
+
   // The exact GPURenderPassDescriptor for a decoded BeginRenderPass (views resolved via `ctl`).
   buildRenderPassDescriptor(decoded, resolvers, ctl) {
     const colorAttachments = decoded.colors.map((c, i) => {
@@ -626,7 +838,21 @@ class RenderStatePackets {
         return false;
       }
     }
-    this._queue((ctl) => ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl)));
+    const targetAttachment = decoded.colors.find((c) => c !== null) || decoded.depthStencil || null;
+    let resolveTargetSize = null;
+    if (targetAttachment) {
+      if (targetAttachment.textureId === SWAPCHAIN_TEXTURE_ID) {
+        resolveTargetSize = (ctl) => this._resolveSwapchainSize(ctl);
+      } else {
+        const staticSize = this._textureAttachmentSize(targetAttachment.textureId, targetAttachment.view);
+        resolveTargetSize = () => staticSize;
+      }
+    }
+    this._queue((ctl) => {
+      const pass = ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl));
+      this._activePass = pass || ctl.pass || null;
+      this._activePassTargetSize = resolveTargetSize ? resolveTargetSize(ctl) : null;
+    });
     return true;
   }
 
@@ -765,6 +991,8 @@ function installRenderStatePackets(processor, options = {}) {
 const exportedApi = {
   RenderStatePackets,
   installRenderStatePackets,
+  clampViewportToTarget,
+  clampScissorToTarget,
   decodeRenderPipelineKey,
   decodeBeginRenderPass,
   decodeTextureViewDesc,
