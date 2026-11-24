@@ -618,6 +618,53 @@ function resolveGpuRingBuffer(injectedCtor) {
   throw new Error('GpuRingBuffer unavailable; load ./gpu_ring.js or inject GpuRingBuffer');
 }
 
+function normalizeSplashPixelFormat(format, payload) {
+  if (typeof format === 'string' && format.trim().length > 0) {
+    const key = format.trim().toLowerCase();
+    if (key === 'rgba8' || key === 'rgba' || key === 'rgba8unorm') {
+      return 'rgba8';
+    }
+    if (key === 'yuv420p' || key === 'yuv420') {
+      return 'yuv420p';
+    }
+    if (key === 'yuva420p' || key === 'yuva420') {
+      return 'yuva420p';
+    }
+    return key;
+  }
+  const planes = payload && payload.planes && typeof payload.planes === 'object' ? payload.planes : null;
+  const hasYuv =
+    (planes && (planes.y !== undefined || planes.u !== undefined || planes.v !== undefined)) ||
+    (payload && (payload.y !== undefined || payload.u !== undefined || payload.v !== undefined));
+  if (hasYuv) {
+    const hasAlpha =
+      (planes && planes.a !== undefined && planes.a !== null) ||
+      (payload && payload.a !== undefined && payload.a !== null);
+    return hasAlpha ? 'yuva420p' : 'yuv420p';
+  }
+  return 'rgba8';
+}
+
+function isExternalImageLike(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return false;
+  }
+  if (typeof ImageBitmap !== 'undefined' && obj instanceof ImageBitmap) {
+    return true;
+  }
+  if (
+    typeof obj.close === 'function' &&
+    typeof obj.width === 'number' &&
+    typeof obj.height === 'number' &&
+    obj.planes === undefined &&
+    obj.rgba === undefined &&
+    obj.y === undefined
+  ) {
+    return true;
+  }
+  return false;
+}
+
 class WgpuCommandProcessor {
   constructor(device, ctx, options = {}) {
     this.device = device;
@@ -640,6 +687,21 @@ class WgpuCommandProcessor {
     this._GpuRingBuffer = typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
     this._decoder = new TextDecoder('utf-8');
     this._destroyed = false;
+
+    // Viewport & splash/first-present tracking
+    this._viewportWidth =
+      typeof options.width === 'number' && Number.isFinite(options.width) && options.width > 0
+        ? Math.floor(options.width)
+        : 0;
+    this._viewportHeight =
+      typeof options.height === 'number' && Number.isFinite(options.height) && options.height > 0
+        ? Math.floor(options.height)
+        : 0;
+    this._onFirstPresent =
+      typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
+    this._firstPresentNotified = false;
+    this._splashFramesPresented = 0;
+    this._lastSplashPresentMs = null;
 
     // Telemetry counters
     this._packetCount = 0;
@@ -852,6 +914,37 @@ class WgpuCommandProcessor {
       this.loadWgslPack(options.wgslPackBuffer);
     }
 
+    // 8. BinkVideoPresenter (W38) + SplashFrameBridge (G26)
+    this._BinkVideoPresenterCtor =
+      options.BinkVideoPresenter !== undefined ? options.BinkVideoPresenter : undefined;
+    this._SplashFrameBridgeCtor =
+      options.SplashFrameBridge !== undefined ? options.SplashFrameBridge : undefined;
+    this._binkPresenterOptions = options.binkPresenterOptions || null;
+    this._splashBridgeOptions =
+      options.splashFrameBridgeOptions || options.splashBridgeOptions || null;
+    this._splashBridgeExplicitlyDisabled = options.enableSplashBridge === false;
+
+    this._ownsBinkPresenter = false;
+    this.binkPresenter = null;
+    if (options.binkPresenter && typeof options.binkPresenter === 'object') {
+      this.binkPresenter = options.binkPresenter;
+    }
+
+    this._ownsSplashFrameBridge = false;
+    this.splashFrameBridge = null;
+    if (options.splashFrameBridge && typeof options.splashFrameBridge === 'object') {
+      this.splashFrameBridge = options.splashFrameBridge;
+      if (!this.binkPresenter && this.splashFrameBridge.presenter) {
+        this.binkPresenter = this.splashFrameBridge.presenter;
+      }
+    } else if (
+      options.enableSplashBridge === true &&
+      device &&
+      typeof device.createTexture === 'function'
+    ) {
+      this._ensureSplashBridge();
+    }
+
     // Packet ABI v2 handler ({ handlePacket, destroyResource }), see render_state_packets.js.
     this.extension = null;
     this._resetFrameState();
@@ -859,6 +952,545 @@ class WgpuCommandProcessor {
 
   get destroyed() {
     return this._destroyed;
+  }
+
+  get framesPresented() {
+    return this.frameCount;
+  }
+
+  _notifyFirstPresent(info = {}) {
+    if (this._firstPresentNotified) {
+      return false;
+    }
+    this._firstPresentNotified = true;
+    if (typeof this._onFirstPresent === 'function') {
+      try {
+        this._onFirstPresent(info);
+      } catch (_) {
+        // Telemetry hooks must never break frame presentation.
+      }
+    }
+    return true;
+  }
+
+  _resolveBinkPresenterCtor() {
+    if (this._BinkVideoPresenterCtor === null || this._BinkVideoPresenterCtor === false) {
+      return null;
+    }
+    return resolveSubsystemCtor(
+      this._BinkVideoPresenterCtor,
+      'PlayGta6BinkPresenter',
+      'BinkVideoPresenter',
+      './bink_presenter.js'
+    );
+  }
+
+  _resolveSplashFrameBridgeCtor() {
+    if (this._SplashFrameBridgeCtor === null || this._SplashFrameBridgeCtor === false) {
+      return null;
+    }
+    return resolveSubsystemCtor(
+      this._SplashFrameBridgeCtor,
+      'PlayGta6SplashFrameBridge',
+      'SplashFrameBridge',
+      './splash_frame_bridge.js'
+    );
+  }
+
+  _ensureSplashBridge() {
+    if (this._destroyed) {
+      return null;
+    }
+    if (this.splashFrameBridge) {
+      if (this.splashFrameBridge.isDestroyed) {
+        return null;
+      }
+      if (!this.binkPresenter && this.splashFrameBridge.presenter) {
+        this.binkPresenter = this.splashFrameBridge.presenter;
+      }
+      return this.splashFrameBridge;
+    }
+    if (this._splashBridgeExplicitlyDisabled && !this.binkPresenter) {
+      return null;
+    }
+    if (!this.binkPresenter) {
+      if (!this.device || typeof this.device.createTexture !== 'function') {
+        return null;
+      }
+      const BinkCtor = this._resolveBinkPresenterCtor();
+      if (!BinkCtor) {
+        return null;
+      }
+      this.binkPresenter = new BinkCtor({
+        presentationFormat: this.format,
+        ...(this._binkPresenterOptions || {}),
+        device: this.device,
+      });
+      this._ownsBinkPresenter = true;
+    }
+    if (!this._splashBridgeExplicitlyDisabled) {
+      const BridgeCtor = this._resolveSplashFrameBridgeCtor();
+      if (BridgeCtor) {
+        const bridgeOpts = {
+          presentationFormat: this.format,
+          ...(this._splashBridgeOptions || {}),
+          device: this.device,
+          presenter: this.binkPresenter,
+        };
+        const userOnFirstPresent =
+          typeof bridgeOpts.onFirstPresent === 'function' ? bridgeOpts.onFirstPresent : null;
+        bridgeOpts.onFirstPresent = (info) => {
+          this._notifyFirstPresent({
+            ...info,
+            framesPresented: this.frameCount + 1,
+          });
+          if (userOnFirstPresent) {
+            try {
+              userOnFirstPresent(info);
+            } catch (_) {
+              // User callback failures must not break presentation.
+            }
+          }
+        };
+        this.splashFrameBridge = new BridgeCtor(bridgeOpts);
+        this._ownsSplashFrameBridge = true;
+      }
+    }
+    return this.splashFrameBridge;
+  }
+
+  _resolveSplashTargetSize(swapTexture, framePayload, extraOptions) {
+    const extImage =
+      framePayload && (framePayload.image || framePayload.imageBitmap || framePayload.bitmap);
+    const pickDim = (...candidates) => {
+      for (let i = 0; i < candidates.length; i += 1) {
+        const v = candidates[i];
+        if (typeof v === 'number' && Number.isFinite(v) && Math.floor(v) >= 1) {
+          return Math.floor(v);
+        }
+      }
+      return null;
+    };
+    const width =
+      pickDim(
+        extraOptions && extraOptions.targetWidth,
+        framePayload && framePayload.targetWidth,
+        swapTexture && swapTexture.width,
+        this._viewportWidth,
+        this.ctx && this.ctx.canvas && this.ctx.canvas.width,
+        framePayload && framePayload.width,
+        extImage && extImage.width
+      ) || 1280;
+    const height =
+      pickDim(
+        extraOptions && extraOptions.targetHeight,
+        framePayload && framePayload.targetHeight,
+        swapTexture && swapTexture.height,
+        this._viewportHeight,
+        this.ctx && this.ctx.canvas && this.ctx.canvas.height,
+        framePayload && framePayload.height,
+        extImage && extImage.height
+      ) || 720;
+    return { width, height };
+  }
+
+  /**
+   * Present an RGBA8, YUV420P/YUVA420P, ImageBitmap, or diagnostic splash/Bink2 frame
+   * onto the WebGPU swapchain via SplashFrameBridge -> BinkVideoPresenter.
+   *
+   * @param {object} framePayload
+   * @param {{ nowMs?: number, respectPacing?: boolean, targetWidth?: number, targetHeight?: number }} [options]
+   */
+  presentSplashFrame(framePayload, options = {}) {
+    const requestedFrameIndex =
+      framePayload && typeof framePayload === 'object' && Number.isInteger(framePayload.frameIndex)
+        ? framePayload.frameIndex
+        : null;
+
+    if (this._destroyed) {
+      return {
+        ok: false,
+        presented: false,
+        reason: 'destroyed',
+        error: 'WgpuCommandProcessor has been destroyed',
+        frameIndex: requestedFrameIndex,
+        framesPresented: this.frameCount,
+        splashFramesPresented: this._splashFramesPresented,
+        firstPresent: false,
+      };
+    }
+
+    if (!this.device || !this.ctx || typeof this.ctx.getCurrentTexture !== 'function') {
+      return {
+        ok: false,
+        presented: false,
+        reason: 'not-ready',
+        error: 'WebGPU device or swapchain context is not ready',
+        frameIndex: requestedFrameIndex,
+        framesPresented: this.frameCount,
+        splashFramesPresented: this._splashFramesPresented,
+        firstPresent: false,
+      };
+    }
+
+    if (!framePayload || typeof framePayload !== 'object') {
+      return {
+        ok: false,
+        presented: false,
+        reason: 'invalid-frame',
+        error: 'presentSplashFrame requires a frame payload object',
+        frameIndex: null,
+        framesPresented: this.frameCount,
+        splashFramesPresented: this._splashFramesPresented,
+        firstPresent: false,
+      };
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+
+    try {
+      const bridge = this._ensureSplashBridge();
+      const presenter =
+        this.binkPresenter || (bridge && bridge.presenter ? bridge.presenter : null);
+
+      if (!bridge && !presenter) {
+        return {
+          ok: false,
+          presented: false,
+          reason: 'presenter-unavailable',
+          error: 'BinkVideoPresenter / SplashFrameBridge unavailable',
+          frameIndex: requestedFrameIndex,
+          framesPresented: this.frameCount,
+          splashFramesPresented: this._splashFramesPresented,
+          firstPresent: false,
+        };
+      }
+
+      if (
+        bridge &&
+        !presenter &&
+        !bridge._BinkVideoPresenterCtor &&
+        !this._resolveBinkPresenterCtor()
+      ) {
+        return {
+          ok: false,
+          presented: false,
+          reason: 'presenter-unavailable',
+          error: 'BinkVideoPresenter unavailable',
+          frameIndex: requestedFrameIndex,
+          framesPresented: this.frameCount,
+          splashFramesPresented: this._splashFramesPresented,
+          firstPresent: false,
+        };
+      }
+
+      const swapTexture = this.ctx.getCurrentTexture();
+      const targetView =
+        swapTexture && typeof swapTexture.createView === 'function'
+          ? swapTexture.createView()
+          : swapTexture;
+      if (!targetView || typeof targetView !== 'object') {
+        return {
+          ok: false,
+          presented: false,
+          reason: 'not-ready',
+          error: 'Swapchain texture view unavailable',
+          frameIndex: requestedFrameIndex,
+          framesPresented: this.frameCount,
+          splashFramesPresented: this._splashFramesPresented,
+          firstPresent: false,
+        };
+      }
+
+      const { width: targetWidth, height: targetHeight } = this._resolveSplashTargetSize(
+        swapTexture,
+        framePayload,
+        opts
+      );
+
+      const externalImage =
+        framePayload.image ||
+        framePayload.imageBitmap ||
+        framePayload.bitmap ||
+        (isExternalImageLike(framePayload) ? framePayload : null);
+      const isDiagnostic =
+        framePayload.diagnostic === true ||
+        (framePayload.source === 'diagnostic' &&
+          !framePayload.planes &&
+          !framePayload.rgba &&
+          !framePayload.data &&
+          !externalImage);
+
+      const explicitNowMs =
+        typeof opts.nowMs === 'number' && Number.isFinite(opts.nowMs)
+          ? opts.nowMs
+          : typeof framePayload.nowMs === 'number' && Number.isFinite(framePayload.nowMs)
+            ? framePayload.nowMs
+            : null;
+      const respectPacing =
+        explicitNowMs !== null ||
+        opts.respectPacing === true ||
+        framePayload.respectPacing === true;
+
+      let renderNowMs = explicitNowMs;
+      if (!respectPacing) {
+        const targetFps =
+          presenter && typeof presenter.targetFps === 'number' && presenter.targetFps > 0
+            ? presenter.targetFps
+            : 30;
+        const minStepMs = 1000 / targetFps + 1;
+        const baseNow =
+          typeof framePayload.timestampMs === 'number' && Number.isFinite(framePayload.timestampMs)
+            ? framePayload.timestampMs
+            : typeof performance !== 'undefined' && typeof performance.now === 'function'
+              ? performance.now()
+              : Date.now();
+        const lastAdv =
+          presenter && typeof presenter._lastAdvanceMs === 'number'
+            ? presenter._lastAdvanceMs
+            : this._lastSplashPresentMs;
+        renderNowMs =
+          lastAdv !== null && Number.isFinite(lastAdv)
+            ? Math.max(baseNow, lastAdv + minStepMs)
+            : baseNow;
+      }
+
+      if (bridge) {
+        let pushed;
+        if (externalImage) {
+          const extOpts = {};
+          if (framePayload.width !== undefined) extOpts.width = framePayload.width;
+          if (framePayload.height !== undefined) extOpts.height = framePayload.height;
+          if (framePayload.timestampMs !== undefined) extOpts.timestampMs = framePayload.timestampMs;
+          if (framePayload.frameIndex !== undefined) extOpts.frameIndex = framePayload.frameIndex;
+          pushed = bridge.pushExternalImage(externalImage, extOpts);
+        } else if (isDiagnostic) {
+          const diagW =
+            typeof framePayload.width === 'number' && framePayload.width > 0
+              ? Math.floor(framePayload.width)
+              : targetWidth;
+          const diagH =
+            typeof framePayload.height === 'number' && framePayload.height > 0
+              ? Math.floor(framePayload.height)
+              : targetHeight;
+          pushed = bridge.pushDiagnosticFrame(diagW, diagH, framePayload.frameIndex, {
+            timestampMs: framePayload.timestampMs,
+          });
+        } else {
+          const format = normalizeSplashPixelFormat(framePayload.format, framePayload);
+          const rawPlanes =
+            framePayload.planes && typeof framePayload.planes === 'object'
+              ? framePayload.planes
+              : {};
+          let planes;
+          if (format === 'rgba8') {
+            planes = {
+              rgba:
+                rawPlanes.rgba !== undefined
+                  ? rawPlanes.rgba
+                  : rawPlanes.data !== undefined
+                    ? rawPlanes.data
+                    : framePayload.rgba !== undefined
+                      ? framePayload.rgba
+                      : framePayload.data,
+            };
+          } else {
+            planes = {
+              y: rawPlanes.y !== undefined ? rawPlanes.y : framePayload.y,
+              u: rawPlanes.u !== undefined ? rawPlanes.u : framePayload.u,
+              v: rawPlanes.v !== undefined ? rawPlanes.v : framePayload.v,
+            };
+            if (format === 'yuva420p') {
+              planes.a = rawPlanes.a !== undefined ? rawPlanes.a : framePayload.a;
+            }
+          }
+          pushed = bridge.pushRawFrame({
+            width: framePayload.width,
+            height: framePayload.height,
+            format,
+            planes,
+            timestampMs: framePayload.timestampMs,
+            colorSpace: framePayload.colorSpace,
+            source: framePayload.source,
+            frameIndex: framePayload.frameIndex,
+          });
+        }
+
+        const renderResult = bridge.renderFrame(
+          this.device,
+          targetView,
+          targetWidth,
+          targetHeight,
+          renderNowMs !== null ? renderNowMs : undefined
+        );
+
+        if (!this.binkPresenter && bridge.presenter) {
+          this.binkPresenter = bridge.presenter;
+        }
+
+        if (renderResult && renderResult.presented) {
+          if (renderNowMs !== null) {
+            this._lastSplashPresentMs = renderNowMs;
+          }
+          const prevFrameCount = this.frameCount;
+          this.frameCount += 1;
+          this._splashFramesPresented += 1;
+          const isFirstPresent = prevFrameCount === 0;
+          if (isFirstPresent) {
+            this._notifyFirstPresent({
+              frameIndex: renderResult.frameIndex,
+              framesPresented: this.frameCount,
+              width: renderResult.width,
+              height: renderResult.height,
+              source: renderResult.source || 'splash',
+              timestampMs: renderResult.timestampMs,
+            });
+          }
+          return {
+            ok: true,
+            presented: true,
+            reason: 'ok',
+            frameIndex: renderResult.frameIndex,
+            framesPresented: this.frameCount,
+            splashFramesPresented: this._splashFramesPresented,
+            firstPresent: isFirstPresent,
+            width: renderResult.width,
+            height: renderResult.height,
+            targetWidth,
+            targetHeight,
+            source: renderResult.source,
+            viewport: renderResult.viewport || null,
+            timestampMs: renderResult.timestampMs,
+          };
+        }
+
+        return {
+          ok: false,
+          presented: false,
+          reason: (renderResult && renderResult.reason) || 'not-presented',
+          frameIndex:
+            pushed && pushed.frameIndex !== undefined ? pushed.frameIndex : requestedFrameIndex,
+          framesPresented: this.frameCount,
+          splashFramesPresented: this._splashFramesPresented,
+          firstPresent: false,
+          queueDepth: renderResult && renderResult.queueDepth !== undefined ? renderResult.queueDepth : 0,
+        };
+      }
+
+      // Direct BinkVideoPresenter fallback when SplashFrameBridge is disabled/unavailable
+      // but an explicit BinkVideoPresenter instance was injected.
+      const format = normalizeSplashPixelFormat(framePayload.format, framePayload);
+      const rawPlanes =
+        framePayload.planes && typeof framePayload.planes === 'object' ? framePayload.planes : {};
+      const width =
+        framePayload.width !== undefined
+          ? framePayload.width
+          : externalImage && externalImage.width;
+      const height =
+        framePayload.height !== undefined
+          ? framePayload.height
+          : externalImage && externalImage.height;
+
+      if (format === 'rgba8') {
+        const rgba =
+          rawPlanes.rgba !== undefined
+            ? rawPlanes.rgba
+            : rawPlanes.data !== undefined
+              ? rawPlanes.data
+              : framePayload.rgba !== undefined
+                ? framePayload.rgba
+                : framePayload.data !== undefined
+                  ? framePayload.data
+                  : externalImage && externalImage.data;
+        presenter.uploadRgbaFrame(rgba, width, height);
+      } else {
+        const yuv = {
+          y: rawPlanes.y !== undefined ? rawPlanes.y : framePayload.y,
+          u: rawPlanes.u !== undefined ? rawPlanes.u : framePayload.u,
+          v: rawPlanes.v !== undefined ? rawPlanes.v : framePayload.v,
+          width,
+          height,
+        };
+        if (format === 'yuva420p') {
+          yuv.a = rawPlanes.a !== undefined ? rawPlanes.a : framePayload.a;
+        }
+        if (framePayload.colorSpace) {
+          yuv.colorSpace = framePayload.colorSpace;
+        }
+        presenter.uploadYuv420Frame(yuv);
+      }
+
+      const encoder = this.device.createCommandEncoder({
+        label: 'playgta6-wgpu-worker-bink-encoder',
+      });
+      const presentResult = presenter.presentFrame(encoder, targetView, targetWidth, targetHeight);
+      if (this.device.queue && typeof this.device.queue.submit === 'function') {
+        const cmdBuf = encoder && typeof encoder.finish === 'function' ? encoder.finish() : encoder;
+        this.device.queue.submit([cmdBuf]);
+      }
+
+      if (presentResult && presentResult.presented) {
+        const frameIndex =
+          requestedFrameIndex !== null ? requestedFrameIndex : this._splashFramesPresented;
+        const prevFrameCount = this.frameCount;
+        this.frameCount += 1;
+        this._splashFramesPresented += 1;
+        const isFirstPresent = prevFrameCount === 0;
+        const timestampMs =
+          typeof framePayload.timestampMs === 'number' && Number.isFinite(framePayload.timestampMs)
+            ? framePayload.timestampMs
+            : renderNowMs !== null
+              ? renderNowMs
+              : Date.now();
+        if (isFirstPresent) {
+          this._notifyFirstPresent({
+            frameIndex,
+            framesPresented: this.frameCount,
+            width,
+            height,
+            source: framePayload.source || 'raw',
+            timestampMs,
+          });
+        }
+        return {
+          ok: true,
+          presented: true,
+          reason: 'ok',
+          frameIndex,
+          framesPresented: this.frameCount,
+          splashFramesPresented: this._splashFramesPresented,
+          firstPresent: isFirstPresent,
+          width,
+          height,
+          targetWidth,
+          targetHeight,
+          source: framePayload.source || 'raw',
+          viewport: presentResult.viewport || null,
+          timestampMs,
+        };
+      }
+
+      return {
+        ok: false,
+        presented: false,
+        reason: 'not-presented',
+        frameIndex: requestedFrameIndex,
+        framesPresented: this.frameCount,
+        splashFramesPresented: this._splashFramesPresented,
+        firstPresent: false,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        presented: false,
+        reason: 'error',
+        error: String(err),
+        frameIndex: requestedFrameIndex,
+        framesPresented: this.frameCount,
+        splashFramesPresented: this._splashFramesPresented,
+        firstPresent: false,
+      };
+    }
   }
 
   _resetFrameState() {
@@ -1261,7 +1893,13 @@ class WgpuCommandProcessor {
    * @param {number} [height]
    * @returns {number} Number of invalidated idle render targets
    */
-  onResize(_width, _height) {
+  onResize(width, height) {
+    if (typeof width === 'number' && Number.isFinite(width) && width > 0) {
+      this._viewportWidth = Math.floor(width);
+    }
+    if (typeof height === 'number' && Number.isFinite(height) && height > 0) {
+      this._viewportHeight = Math.floor(height);
+    }
     if (
       !this._destroyed &&
       this.rtPool &&
@@ -2109,6 +2747,14 @@ class WgpuCommandProcessor {
 
     this.device.queue.submit([encoder.finish()]);
     this.frameCount += 1;
+    if (this.frameCount === 1) {
+      this._notifyFirstPresent({
+        frameIndex: 0,
+        framesPresented: 1,
+        source: 'command-buffer',
+        timestampMs: Date.now(),
+      });
+    }
 
     const workDoneFence = this._getWorkDoneFence();
     this._endSubsystemsForFrame(workDoneFence);
@@ -2406,9 +3052,26 @@ class WgpuCommandProcessor {
       this.wgslPackCache && typeof this.wgslPackCache.getStats === 'function'
         ? this.wgslPackCache.getStats()
         : null;
+    const splashBridge =
+      this.splashFrameBridge && typeof this.splashFrameBridge.getStats === 'function'
+        ? this.splashFrameBridge.getStats()
+        : null;
+    const activeBinkPresenter =
+      this.binkPresenter ||
+      (this.splashFrameBridge && this.splashFrameBridge.presenter) ||
+      null;
+    const binkPresenter =
+      activeBinkPresenter && typeof activeBinkPresenter.getStats === 'function'
+        ? activeBinkPresenter.getStats()
+        : splashBridge && splashBridge.presenterStats
+          ? splashBridge.presenterStats
+          : null;
 
     return {
       frameCount: this.frameCount,
+      framesPresented: this.frameCount,
+      splashFramesPresented: this._splashFramesPresented,
+      firstPresent: this._firstPresentNotified || this.frameCount > 0,
       packetCount: this._packetCount,
       drawCalls: this._drawCallCount,
       computeDispatches: this._computeDispatchCount,
@@ -2436,6 +3099,8 @@ class WgpuCommandProcessor {
       reflectionShaderCount: reflectionRegistry ? reflectionRegistry.shaderCount : 0,
       shaderFallback,
       wgslPackCache,
+      splashBridge,
+      binkPresenter,
     };
   }
 
@@ -2516,7 +3181,14 @@ class WgpuCommandProcessor {
     ) {
       this.wgslPackCache.clear();
     }
+    if (this.splashFrameBridge && typeof this.splashFrameBridge.destroy === 'function') {
+      this.splashFrameBridge.destroy();
+    }
+    if (this.binkPresenter && typeof this.binkPresenter.destroy === 'function') {
+      this.binkPresenter.destroy();
+    }
 
+    this._lastSplashPresentMs = null;
     this._pendingTimerReadbacks.clear();
     this._lastPassTimings = null;
     this.ring = null;
@@ -2683,7 +3355,12 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
         : processor && processor.frameCount,
     0
   );
-  const droppedFrames = toNonNegativeInt(stats && stats.droppedFrames, 0);
+  const droppedFrames = toNonNegativeInt(
+    stats && stats.droppedFrames !== undefined
+      ? stats.droppedFrames
+      : stats && stats.splashBridge && stats.splashBridge.droppedFrames,
+    0
+  );
   const drawCalls = toNonNegativeInt(stats && stats.drawCalls, 0);
   const computeDispatches = toNonNegativeInt(stats && stats.computeDispatches, 0);
   const packetsProcessed = toNonNegativeInt(
@@ -2775,11 +3452,29 @@ function createWgpuWorkerHandler(options = {}) {
       ? options.telemetryMissingLimit
       : DEFAULT_TELEMETRY_MISSING_LIMIT;
   const telemetryNow = typeof options.now === 'function' ? options.now : () => Date.now();
+  const onFirstPresent =
+    typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
   let canvas = options.canvas || null;
   let processor = options.processor || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
   let preloadedInDefaultInit = false;
   let lastTelemetryEmitMs = -Infinity;
+  let firstPresentNotified = false;
+
+  function notifyHandlerFirstPresent(info) {
+    if (firstPresentNotified) {
+      return false;
+    }
+    firstPresentNotified = true;
+    if (onFirstPresent) {
+      try {
+        onFirstPresent(info);
+      } catch (_) {
+        // Non-fatal telemetry callback error.
+      }
+    }
+    return true;
+  }
 
   function emitTelemetry(overrideOptions = {}) {
     const ts = telemetryNow();
@@ -2934,6 +3629,8 @@ function createWgpuWorkerHandler(options = {}) {
     ctx.configure({ device, format, alphaMode: 'opaque' });
     processor = new WgpuCommandProcessor(device, ctx, {
       format,
+      width,
+      height,
       GpuRingBuffer: injectedRingCtor,
       stagingPool: options.stagingPool,
       uniformRing: options.uniformRing,
@@ -2946,6 +3643,23 @@ function createWgpuWorkerHandler(options = {}) {
       shaderFallbackRouter: options.shaderFallbackRouter,
       ShaderFallbackRouter: options.ShaderFallbackRouter,
       shaderFallbackRouterOptions: options.shaderFallbackRouterOptions,
+      binkPresenter: initPayload.binkPresenter ?? options.binkPresenter,
+      splashFrameBridge: initPayload.splashFrameBridge ?? options.splashFrameBridge,
+      BinkVideoPresenter:
+        initPayload.BinkVideoPresenter !== undefined
+          ? initPayload.BinkVideoPresenter
+          : options.BinkVideoPresenter,
+      SplashFrameBridge:
+        initPayload.SplashFrameBridge !== undefined
+          ? initPayload.SplashFrameBridge
+          : options.SplashFrameBridge,
+      binkPresenterOptions:
+        initPayload.binkPresenterOptions ?? options.binkPresenterOptions,
+      splashFrameBridgeOptions:
+        initPayload.splashFrameBridgeOptions ??
+        initPayload.splashBridgeOptions ??
+        options.splashFrameBridgeOptions ??
+        options.splashBridgeOptions,
       enableStagingPool: initPayload.enableStagingPool ?? options.enableStagingPool,
       enableUniformRing: initPayload.enableUniformRing ?? options.enableUniformRing,
       enablePassTimer: initPayload.enablePassTimer ?? options.enablePassTimer,
@@ -2956,6 +3670,8 @@ function createWgpuWorkerHandler(options = {}) {
       enableRtPool: initPayload.enableRtPool ?? options.enableRtPool,
       enableShaderFallback:
         initPayload.enableShaderFallback ?? options.enableShaderFallback,
+      enableSplashBridge:
+        initPayload.enableSplashBridge ?? options.enableSplashBridge,
       fallbackShaderHashes:
         initPayload.fallbackShaderHashes ?? options.fallbackShaderHashes,
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
@@ -3024,6 +3740,7 @@ function createWgpuWorkerHandler(options = {}) {
         if (created && created !== processor) {
           processor = created;
           lastTelemetryEmitMs = -Infinity;
+          firstPresentNotified = false;
         }
         if (payload.ringSab || payload.ring) {
           attachRingFromMessage(payload);
@@ -3077,6 +3794,110 @@ function createWgpuWorkerHandler(options = {}) {
           id: payload.id,
           stats: processor && typeof processor.getStats === 'function' ? processor.getStats() : null,
         });
+      } else if (payload.type === 'present-splash-frame' || payload.type === 'bink-frame') {
+        const framePayload =
+          payload.frame && typeof payload.frame === 'object' ? payload.frame : payload;
+        const requestedFrameIndex =
+          framePayload && Number.isInteger(framePayload.frameIndex)
+            ? framePayload.frameIndex
+            : Number.isInteger(payload.frameIndex)
+              ? payload.frameIndex
+              : null;
+
+        if (
+          !processor ||
+          !processor.device ||
+          !processor.ctx ||
+          typeof processor.presentSplashFrame !== 'function'
+        ) {
+          const errMsg = !processor
+            ? 'WebGPU processor/device is not initialized yet'
+            : !processor.device
+              ? 'WebGPU device is not ready yet'
+              : !processor.ctx
+                ? 'WebGPU canvas context is not ready yet'
+                : 'WgpuCommandProcessor does not support presentSplashFrame';
+          const errorReply = {
+            type: 'splash-frame-presented',
+            frameIndex: requestedFrameIndex,
+            framesPresented: processor ? toNonNegativeInt(processor.frameCount, 0) : 0,
+            ok: false,
+            error: errMsg,
+          };
+          if (payload.id !== undefined) {
+            errorReply.id = payload.id;
+          }
+          postMessage(errorReply);
+          return;
+        }
+
+        const prevFrames = toNonNegativeInt(processor.frameCount, 0);
+        const presentOpts = {};
+        if (payload.nowMs !== undefined) {
+          presentOpts.nowMs = payload.nowMs;
+        }
+        if (payload.respectPacing !== undefined) {
+          presentOpts.respectPacing = payload.respectPacing;
+        }
+        if (payload.targetWidth !== undefined) {
+          presentOpts.targetWidth = payload.targetWidth;
+        } else if (canvas && Number.isInteger(canvas.width) && canvas.width > 0) {
+          presentOpts.targetWidth = canvas.width;
+        }
+        if (payload.targetHeight !== undefined) {
+          presentOpts.targetHeight = payload.targetHeight;
+        } else if (canvas && Number.isInteger(canvas.height) && canvas.height > 0) {
+          presentOpts.targetHeight = canvas.height;
+        }
+
+        const result = processor.presentSplashFrame(framePayload, presentOpts);
+        const framesPresented = toNonNegativeInt(
+          result && result.framesPresented !== undefined
+            ? result.framesPresented
+            : processor.frameCount,
+          prevFrames
+        );
+        const reply = {
+          type: 'splash-frame-presented',
+          frameIndex:
+            result && result.frameIndex !== undefined ? result.frameIndex : requestedFrameIndex,
+          framesPresented,
+          ok: Boolean(result && result.ok),
+        };
+        if (payload.id !== undefined) {
+          reply.id = payload.id;
+        }
+        if (result && result.firstPresent) {
+          reply.firstPresent = true;
+        }
+        if (result && !result.ok) {
+          if (result.error) {
+            reply.error = result.error;
+          }
+          if (result.reason) {
+            reply.reason = result.reason;
+          }
+        }
+        postMessage(reply);
+
+        if (result && result.ok && result.presented) {
+          if (result.firstPresent || (prevFrames === 0 && framesPresented >= 1)) {
+            const firstPresentInfo = {
+              type: 'first-present',
+              firstPresent: true,
+              source: result.source || 'splash',
+              frameIndex: reply.frameIndex,
+              framesPresented,
+              width: result.width,
+              height: result.height,
+              timestamp: telemetryNow(),
+            };
+            if (notifyHandlerFirstPresent(firstPresentInfo)) {
+              postMessage(firstPresentInfo);
+            }
+          }
+          maybeEmitFrameTelemetry(prevFrames, framesPresented);
+        }
       } else if (payload.destroy && processor) {
         if (typeof processor.destroy === 'function') {
           processor.destroy();
@@ -3086,6 +3907,14 @@ function createWgpuWorkerHandler(options = {}) {
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.drainRing();
         if (result.presents > 0) {
+          if (prevFrames === 0 && result.frameCount >= 1) {
+            notifyHandlerFirstPresent({
+              source: 'command-buffer',
+              frameIndex: 0,
+              framesPresented: result.frameCount,
+              timestamp: telemetryNow(),
+            });
+          }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
@@ -3100,6 +3929,14 @@ function createWgpuWorkerHandler(options = {}) {
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
+          if (prevFrames === 0 && result.frameCount >= 1) {
+            notifyHandlerFirstPresent({
+              source: 'command-buffer',
+              frameIndex: 0,
+              framesPresented: result.frameCount,
+              timestamp: telemetryNow(),
+            });
+          }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
