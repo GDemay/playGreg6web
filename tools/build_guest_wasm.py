@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -50,7 +50,9 @@ PROGRAM_MANIFEST_FILE = "program-manifest.json"
 RESPONSE_FILE_NAME = "link_objects.rsp"
 RESPONSE_FILE_THRESHOLD = 32
 BOOT_LINKED_GUEST_DEFINE = "-DPG6_BOOT_LINKED_GUEST=1"
-DEFAULT_GUEST_BOOT_ENTRY_REL = Path("runtime") / "guest" / "boot_main.cpp"
+BOOT_PROGRAM_DEFINE = "-DPG6_BOOT_PROGRAM=1"
+DEFAULT_GUEST_BOOT_ENTRY_REL = Path("runtime") / "main.cpp"
+DEFAULT_WASM_BOOT_REL = Path("runtime") / "wasm_boot.cpp"
 PROGRAM_LEVEL_UNITS: tuple[str, ...] = (
     "exports/pg6_export_thunks.cpp",
     "program_modules.cpp",
@@ -849,9 +851,28 @@ def should_use_response_file(object_count: int, requested: bool | None) -> bool:
     return object_count > RESPONSE_FILE_THRESHOLD
 
 
+def is_program_build(source_root: Path, units: Sequence[SourceUnit]) -> bool:
+    """Return True when building a multi-module R12 program tree."""
+    if (source_root / PROGRAM_MANIFEST_FILE).is_file():
+        return True
+    for unit in units:
+        if Path(unit.unit_id.replace("\\", "/")).name == "pg6_program.cpp":
+            return True
+    return False
+
+
+def _format_rsp_path(item: Path | str) -> str:
+    """Normalize a response-file object path to POSIX slashes; quote if it contains whitespace."""
+    normalized = str(item).replace("\\", "/")
+    if any(ch.isspace() for ch in normalized):
+        escaped = normalized.replace('"', '\\"')
+        return f'"{escaped}"'
+    return normalized
+
+
 def write_link_response_file(path: Path, objects: Sequence[Path | str]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [str(item) for item in objects]
+    lines = [_format_rsp_path(item) for item in objects]
     text = "\n".join(lines)
     if lines:
         text += "\n"
@@ -870,7 +891,8 @@ def build_link_argv(
 ) -> tuple[str, ...]:
     argv: list[str] = [str(linker), *LINK_FLAGS, *extra_flags]
     if response_file is not None:
-        argv.append(f"@{response_file}")
+        rsp_arg = str(response_file).replace("\\", "/")
+        argv.append(f"@{rsp_arg}")
     else:
         argv.extend(str(path) for path in objects)
     argv.extend(str(path) for path in runtime_libs)
@@ -1174,23 +1196,34 @@ def run_build(
 
     source_root = resolve_source_root(source_dir)
     all_units = discover_sources(source_dir)
+    program_build = is_program_build(source_root, all_units)
     if link_guest_boot:
         entry = guest_boot_entry or (repo_root / DEFAULT_GUEST_BOOT_ENTRY_REL)
         if not entry.is_file():
             report.ok = False
             report.errors.append(f"guest boot entrypoint not found: {entry.name}")
             return report
-        boot_id = posix_rel(entry.resolve(), repo_root.resolve())
-        if boot_id == entry.name and entry.resolve() != (repo_root / entry.name).resolve():
-            boot_id = "runtime/guest/" + entry.name
-        all_units.append(
-            SourceUnit(
+
+        def _make_boot_unit(path: Path) -> SourceUnit:
+            resolved_path = path.resolve()
+            resolved_repo = repo_root.resolve()
+            boot_id = posix_rel(resolved_path, resolved_repo)
+            if boot_id == resolved_path.name and resolved_path != (resolved_repo / resolved_path.name):
+                boot_id = "runtime/" + resolved_path.name
+            return SourceUnit(
                 unit_id=boot_id.replace("\\", "/"),
-                path=entry.resolve(),
+                path=resolved_path,
                 kind="cpp",
                 module="boot",
             )
-        )
+
+        entry_unit = _make_boot_unit(entry)
+        all_units.append(entry_unit)
+
+        wasm_boot = repo_root / DEFAULT_WASM_BOOT_REL
+        if wasm_boot.is_file() and wasm_boot.resolve() != entry_unit.path:
+            all_units.append(_make_boot_unit(wasm_boot))
+
         all_units.sort(key=lambda u: u.unit_id)
 
     if not all_units:
@@ -1209,6 +1242,11 @@ def run_build(
     include_dirs = [repo_root / "runtime", source_root.resolve()]
     include_dirs = [p for p in include_dirs if p.is_dir()]
 
+    boot_defines: tuple[str, ...] = (
+        (BOOT_LINKED_GUEST_DEFINE, BOOT_PROGRAM_DEFINE)
+        if program_build
+        else (BOOT_LINKED_GUEST_DEFINE,)
+    )
     planned: list[UnitBuildResult] = []
     compile_tasks: list[tuple[SourceUnit, Path, tuple[str, ...]]] = []
     for unit in units:
@@ -1217,7 +1255,7 @@ def run_build(
             report.ok = False
             report.errors.append(f"no compiler for {unit.unit_id} ({unit.kind})")
             continue
-        extra = (BOOT_LINKED_GUEST_DEFINE,) if link_guest_boot and unit.module == "boot" else ()
+        extra = boot_defines if link_guest_boot and unit.module == "boot" else ()
         flags = compile_flags_for(
             opt=opt_level,
             kind=unit.kind,
@@ -1529,14 +1567,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--link-guest-boot",
         action="store_true",
         help=(
-            f"Compile runtime/guest/boot_main.cpp with {BOOT_LINKED_GUEST_DEFINE} "
-            "and include it in the wasm64 link."
+            f"Compile runtime/main.cpp and runtime/wasm_boot.cpp with {BOOT_LINKED_GUEST_DEFINE} "
+            f"(plus {BOOT_PROGRAM_DEFINE} for multi-module program builds) and include them in the wasm64 link."
         ),
     )
     parser.add_argument(
         "--guest-boot-entry",
         default=None,
-        help="Entrypoint source for --link-guest-boot (default: runtime/guest/boot_main.cpp).",
+        help="Entrypoint source for --link-guest-boot (default: runtime/main.cpp).",
     )
     return parser
 
