@@ -214,7 +214,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Connect the pipeline dump, a shader pack keyed by stage identity, draw emission with rect-list expansion, a payload capture and the capture replayer into one rendered frame of the title's per-frame pass.
 - [x] **G48 — Read the Hardware Descriptors the Title Writes Directly into Its Descriptor Heap (`runtime/gpu/d3d12_xs*`)** — `DONE` (PRs #511, #529, #546, closes #497) *(found by G47: table slots written outside the descriptor API bind nothing today; repo tests synthetic)*
   - Decode directly written buffer, image and sampler descriptor slots with the GPU family's public descriptor-word definitions, resolve their addresses to tracked resources, and bind them at draw and dispatch time.
-- [ ] **G49 — Textures the Title Creates by View Alone: Back Slot-70 Views with GPU Textures and Decode Their Console Layouts** — `IN PROGRESS` (#551, @Timon-ok) *(found by G48; repo tests synthetic)*
+- [x] **G49 — Textures the Title Creates by View Alone: Back Slot-70 Views with GPU Textures and Decode Their Console Layouts** — `DONE` (PRs #607, #608, #613, #618, #619, closes #551) *(found by G48; repo tests synthetic)*
   - Create textures for views that name only a GPU address and a description, upload the data streamed into the GPU-window pages behind them, and convert the console tiled layouts to linear texels using the GPU family's public addressing rules.
 
 ---
