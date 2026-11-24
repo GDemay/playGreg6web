@@ -208,10 +208,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Work out what the fixed-size, non-DXIL pipeline records passed to device slot 57 are, create the right pipeline kind from them so the title's draws reach the command stream, and report what the shader track needs.
 - [x] **G37 — Graphics Pipelines Arrive as Console-Native Code: Recover Translatable Shaders and D3D12 State for Slot-57 Pipelines** — `DONE` (PRs #435, #456, #473, #474, #478, closes #419) *(follow-up to G32: graphics stages are GPU machine code, compute arrives as DXIL; repo tests synthetic)*
   - Establish the route that makes the title's graphics pipelines renderable (a DXIL path in the title, or a join from native stages to archive DXIL plus state recovered from the register image) and build the guest-layer side of it.
-- [ ] **G47 — First Real Pixels: Resolve the Per-Frame Pass's Shaders by Stage Identity, Emit Its Draw, and Replay the Native Capture Through the WebGPU Path** — `IN PROGRESS` (#483, @Timon-ok) *(follow-up to G37; uses the shader track's tools unmodified; repo tests synthetic)*
+- [x] **G47 — First Real Pixels: Resolve the Per-Frame Pass's Shaders by Stage Identity, Emit Its Draw, and Replay the Native Capture Through the WebGPU Path** — `DONE` (PRs #488, #494, #495, #546, closes #483) *(follow-up to G37; uses the shader track's tools unmodified; repo tests synthetic)*
   - Connect the pipeline dump, a shader pack keyed by stage identity, draw emission with rect-list expansion, a payload capture and the capture replayer into one rendered frame of the title's per-frame pass.
-- [ ] **G48 — Read the Hardware Descriptors the Title Writes Directly into Its Descriptor Heap (`runtime/gpu/d3d12_xs*`)** — `IN PROGRESS` (#497, @Timon-ok) *(found by G47: table slots written outside the descriptor API bind nothing today; repo tests synthetic)*
+- [x] **G48 — Read the Hardware Descriptors the Title Writes Directly into Its Descriptor Heap (`runtime/gpu/d3d12_xs*`)** — `DONE` (PRs #511, #529, #546, closes #497) *(found by G47: table slots written outside the descriptor API bind nothing today; repo tests synthetic)*
   - Decode directly written buffer, image and sampler descriptor slots with the GPU family's public descriptor-word definitions, resolve their addresses to tracked resources, and bind them at draw and dispatch time.
+- [ ] **G49 — Textures the Title Creates by View Alone: Back Slot-70 Views with GPU Textures and Decode Their Console Layouts** — `IN PROGRESS` (#551, @Timon-ok) *(found by G48; repo tests synthetic)*
+  - Create textures for views that name only a GPU address and a description, upload the data streamed into the GPU-window pages behind them, and convert the console tiled layouts to linear texels using the GPU family's public addressing rules.
 
 ---
 
