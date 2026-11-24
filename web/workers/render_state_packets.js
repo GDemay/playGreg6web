@@ -2120,6 +2120,23 @@ class RenderStatePackets {
       bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
     const usedIndices = new Set();
 
+    const isBufferBindingResource = (res) =>
+      Boolean(res && typeof res === 'object' && 'buffer' in res && res.buffer);
+    const isNonBufferBindingResource = (res) =>
+      Boolean(res && !(typeof res === 'object' && 'buffer' in res));
+    const isSamplerResource = (res) =>
+      Boolean(
+        res &&
+          ((typeof GPUSampler === 'function' && res instanceof GPUSampler) ||
+            (typeof res === 'object' && res.kind === 'GPUSampler'))
+      );
+    const isTextureViewResource = (res) =>
+      Boolean(
+        res &&
+          ((typeof GPUTextureView === 'function' && res instanceof GPUTextureView) ||
+            (typeof res === 'object' && res.kind === 'GPUTextureView'))
+      );
+
     const pickResourceForBinding = (b) => {
       for (let pass = 0; pass < 2; pass += 1) {
         for (let i = 0; i < available.length; i += 1) {
@@ -2127,6 +2144,7 @@ class RenderStatePackets {
           const r = available[i];
           if (!r || !r.resource || r.isDummy) continue;
           if (b.kind === 'uniform') {
+            if (!isBufferBindingResource(r.resource)) continue;
             const isBuf =
               r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
             if (!isBuf) continue;
@@ -2140,6 +2158,7 @@ class RenderStatePackets {
             return r.resource;
           }
           if (b.kind === 'read-only-storage' || b.kind === 'storage') {
+            if (!isBufferBindingResource(r.resource)) continue;
             const isBuf =
               r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
             if (!isBuf) continue;
@@ -2162,6 +2181,7 @@ class RenderStatePackets {
           if (pass > 0) continue;
           if (b.kind === 'texture') {
             if (r.kind !== 'texture') continue;
+            if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
             if (
               r.textureUsage !== null &&
               r.textureUsage !== undefined &&
@@ -2169,11 +2189,32 @@ class RenderStatePackets {
             ) {
               continue;
             }
+            const expectedDim = b.viewDimension || '2d';
+            if (r.viewDimension && r.viewDimension !== expectedDim) continue;
+            if (
+              r.multisampled !== undefined &&
+              r.multisampled !== null &&
+              Boolean(r.multisampled) !== Boolean(b.multisampled)
+            ) {
+              continue;
+            }
+            if (r.textureFormat) {
+              const expectedSampleType = b.sampleType || 'float';
+              const actualSampleType = resolveTextureSampleType(r.textureFormat, this.device);
+              if (expectedSampleType === 'unfilterable-float') {
+                if (actualSampleType !== 'float' && actualSampleType !== 'unfilterable-float') {
+                  continue;
+                }
+              } else if (actualSampleType !== expectedSampleType) {
+                continue;
+              }
+            }
             usedIndices.add(i);
             return r.resource;
           }
           if (b.kind === 'storage-texture') {
             if (r.kind !== 'storage-texture') continue;
+            if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
             if (
               r.textureUsage !== null &&
               r.textureUsage !== undefined &&
@@ -2181,11 +2222,19 @@ class RenderStatePackets {
             ) {
               continue;
             }
+            const expectedDim = b.viewDimension || '2d';
+            if (r.viewDimension && r.viewDimension !== expectedDim) continue;
+            if (r.textureFormat && b.storageFormat && r.textureFormat !== b.storageFormat) {
+              continue;
+            }
             usedIndices.add(i);
             return r.resource;
           }
           if (b.kind === 'sampler') {
             if (r.kind !== 'sampler') continue;
+            if (!isNonBufferBindingResource(r.resource) || isTextureViewResource(r.resource)) {
+              continue;
+            }
             if (
               r.comparison !== undefined &&
               r.comparison !== null &&
@@ -2576,8 +2625,11 @@ class RenderStatePackets {
       bcFallback: sanitized.bcFallback,
       formatFallback: sanitized.formatFallback,
       usage: sanitized.descriptor.usage,
+      dimension: sanitized.descriptor.dimension,
+      sampleCount: sanitized.descriptor.sampleCount,
       width: sanitized.descriptor.size.width,
       height: sanitized.descriptor.size.height,
+      depthOrArrayLayers: sanitized.descriptor.size.depthOrArrayLayers,
     });
     this.telemetry.texture2Count += 1;
     return true;
@@ -2827,14 +2879,18 @@ class RenderStatePackets {
     const viewDimension = tex.viewDimension || '2d';
     let format = tex.format;
     if (!format) {
-      format = { float: 'rgba8unorm', 'unfilterable-float': 'r32float', depth: 'depth32float', sint: 'rgba8sint', uint: 'rgba8uint' }[
-        tex.sampleType
-      ];
+      format =
+        { float: 'rgba8unorm', 'unfilterable-float': 'r32float', depth: 'depth32float', sint: 'rgba8sint', uint: 'rgba8uint' }[
+          tex.sampleType
+        ] || 'rgba8unorm';
     }
     if (layoutEntry.storageTexture && !isStorageBindingSupported(format, this.device)) {
       format = 'rgba8unorm';
     }
     const multisampled = Boolean(layoutEntry.texture && layoutEntry.texture.multisampled);
+    if (multisampled && !isMultisampleSupported(format, this.device)) {
+      format = 'rgba8unorm';
+    }
     const key = `texture:${format}:${viewDimension}:${multisampled}:${Boolean(layoutEntry.storageTexture)}`;
     if (!this.dummies.has(key)) {
       const layers = viewDimension === 'cube' || viewDimension === 'cube-array' ? 6 : 1;
@@ -2875,14 +2931,30 @@ class RenderStatePackets {
       const type = view.getUint32(o + 4, true);
       const resourceId = view.getUint32(o + 8, true);
       const layoutEntry = record.entries ? record.entries.find((e) => e.binding === binding) : null;
-      let resource = null;
-      let usedDummy = false;
+      const layoutExpectsBuffer = Boolean(layoutEntry && layoutEntry.buffer);
+      const layoutExpectsTexture = Boolean(
+        layoutEntry && (layoutEntry.texture || layoutEntry.storageTexture)
+      );
+      const layoutExpectsSampler = Boolean(layoutEntry && layoutEntry.sampler);
+      const kindMismatch =
+        resourceId !== 0 &&
+        Boolean(layoutEntry) &&
+        ((layoutExpectsBuffer && type !== BIND_RESOURCE_TYPE.BUFFER) ||
+          (layoutExpectsTexture && type !== BIND_RESOURCE_TYPE.TEXTURE_VIEW) ||
+          (layoutExpectsSampler && type !== BIND_RESOURCE_TYPE.SAMPLER));
+
+      let realResource = null;
+      let entryResource = null;
+      let entryUsedDummy = false;
       let bufferUsage = null;
       let textureUsage = null;
+      let textureFormat = null;
+      let textureViewDimension = null;
+      let textureMultisampled = null;
       let samplerComparison = null;
       if (resourceId === 0) {
-        resource = layoutEntry ? this._dummyResource(layoutEntry) : null;
-        if (resource) usedDummy = true;
+        entryResource = layoutEntry ? this._dummyResource(layoutEntry) : null;
+        if (entryResource) entryUsedDummy = true;
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.processor.buffers.get(resourceId);
         if (buffer) {
@@ -2905,9 +2977,21 @@ class RenderStatePackets {
             typeof buffer.size === 'number' && Number.isFinite(buffer.size) && buffer.size > 0
               ? buffer.size
               : null;
+          const bufLayoutType = layoutExpectsBuffer ? layoutEntry.buffer.type || 'uniform' : null;
+          const requiredBufferUsage =
+            bufLayoutType === 'uniform'
+              ? GPU_BUFFER_USAGE_UNIFORM
+              : bufLayoutType
+                ? GPU_BUFFER_USAGE_STORAGE
+                : 0;
+          const bufferUsageMismatch =
+            layoutExpectsBuffer &&
+            bufferUsage !== null &&
+            requiredBufferUsage !== 0 &&
+            (bufferUsage & requiredBufferUsage) === 0;
           const minBindingSize =
-            layoutEntry &&
-            layoutEntry.buffer &&
+            layoutExpectsBuffer &&
+            !bufferUsageMismatch &&
             typeof layoutEntry.buffer.minBindingSize === 'number' &&
             layoutEntry.buffer.minBindingSize > 0
               ? layoutEntry.buffer.minBindingSize
@@ -2919,8 +3003,8 @@ class RenderStatePackets {
                 `bg-buffer-oob:${layoutId}:${binding}`,
                 `bind group ${id}: binding ${binding} offset ${bufOffset} exceeds buffer size ${bufferSize}; using dummy buffer`
               );
-              resource = this._dummyResource(layoutEntry);
-              usedDummy = true;
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
             }
           } else {
             let effectiveSize = requestedSize;
@@ -2928,6 +3012,7 @@ class RenderStatePackets {
               effectiveSize = bufferSize - bufOffset;
             }
             const remaining = bufferSize !== null ? bufferSize - bufOffset : null;
+            let undersizedForLayout = false;
             if (minBindingSize > 0) {
               const boundSize = effectiveSize > 0 ? effectiveSize : remaining;
               if (boundSize !== null && boundSize < minBindingSize) {
@@ -2942,14 +3027,33 @@ class RenderStatePackets {
                     `bg-buffer-undersized:${layoutId}:${binding}:${minBindingSize}`,
                     `bind group ${id}: binding ${binding} buffer smaller than minBindingSize ${minBindingSize}; using dummy buffer`
                   );
-                  resource = this._dummyResource(layoutEntry);
-                  usedDummy = true;
+                  undersizedForLayout = true;
                 }
               }
             }
-            if (!resource) {
-              resource = { buffer, offset: bufOffset };
-              if (effectiveSize > 0) resource.size = effectiveSize;
+            if (undersizedForLayout) {
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else {
+              realResource = { buffer, offset: bufOffset };
+              if (effectiveSize > 0) realResource.size = effectiveSize;
+              if (kindMismatch) {
+                this._recordTelemetryWarningOnce(
+                  `bg-kind-mismatch:${layoutId}:${binding}:buffer`,
+                  `bind group ${id}: binding ${binding} buffer resource mismatches layout entry; substituting dummy resource`
+                );
+                entryResource = this._dummyResource(layoutEntry);
+                entryUsedDummy = true;
+              } else if (bufferUsageMismatch) {
+                this._recordTelemetryWarningOnce(
+                  `bg-buffer-usage-mismatch:${layoutId}:${binding}:${bufLayoutType}`,
+                  `bind group ${id}: binding ${binding} buffer usage 0x${bufferUsage.toString(16)} lacks required ${bufLayoutType} usage; using dummy buffer`
+                );
+                entryResource = this._dummyResource(layoutEntry);
+                entryUsedDummy = true;
+              } else {
+                entryResource = realResource;
+              }
             }
           }
         }
@@ -2965,7 +3069,32 @@ class RenderStatePackets {
         } else if (texObj && texObj.desc && typeof texObj.desc.usage === 'number') {
           textureUsage = texObj.desc.usage;
         }
+        textureFormat = texFormat || null;
+        if (viewDesc && typeof viewDesc.dimension === 'string' && viewDesc.dimension !== 'undefined') {
+          textureViewDimension = viewDesc.dimension;
+        } else {
+          const baseDim =
+            (texMeta && texMeta.dimension) ||
+            (texObj && typeof texObj.dimension === 'string' ? texObj.dimension : null) ||
+            (texObj && texObj.desc && typeof texObj.desc.dimension === 'string' ? texObj.desc.dimension : null) ||
+            '2d';
+          const baseLayers =
+            (texMeta && typeof texMeta.depthOrArrayLayers === 'number' ? texMeta.depthOrArrayLayers : null) ||
+            (texObj && typeof texObj.depthOrArrayLayers === 'number' ? texObj.depthOrArrayLayers : null) ||
+            (texObj && texObj.desc && texObj.desc.size && typeof texObj.desc.size.depthOrArrayLayers === 'number'
+              ? texObj.desc.size.depthOrArrayLayers
+              : 1);
+          textureViewDimension = baseDim === '2d' && baseLayers > 1 ? '2d-array' : baseDim;
+        }
+        const sampleCount =
+          (texMeta && typeof texMeta.sampleCount === 'number' ? texMeta.sampleCount : null) ||
+          (texObj && typeof texObj.sampleCount === 'number' ? texObj.sampleCount : null) ||
+          (texObj && texObj.desc && typeof texObj.desc.sampleCount === 'number' ? texObj.desc.sampleCount : null);
+        if (sampleCount !== null) {
+          textureMultisampled = sampleCount > 1;
+        }
         if (
+          !kindMismatch &&
           layoutEntry &&
           layoutEntry.texture &&
           layoutEntry.texture.sampleType === 'float' &&
@@ -2978,64 +3107,110 @@ class RenderStatePackets {
             `bg-unfilterable-float:${texFormat}:${binding}`,
             `bind group ${id}: binding ${binding} format ${texFormat} requires unfilterable-float without float32-filterable; substituting filterable fallback`
           );
-          resource = this._dummyResource(layoutEntry);
-          usedDummy = true;
+          entryResource = this._dummyResource(layoutEntry);
+          entryUsedDummy = true;
         } else {
-          resource = this._textureView(resourceId, viewDesc);
+          const resolvedView = this._textureView(resourceId, viewDesc);
+          if (resolvedView) {
+            realResource = resolvedView;
+            if (kindMismatch) {
+              this._recordTelemetryWarningOnce(
+                `bg-kind-mismatch:${layoutId}:${binding}:texture`,
+                `bind group ${id}: binding ${binding} texture resource mismatches layout entry; substituting dummy resource`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else {
+              entryResource = resolvedView;
+            }
+          }
         }
       } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
-        resource = this.processor.samplers.get(resourceId) || null;
-        if (resource && resource.desc && resource.desc.compare !== undefined) {
-          samplerComparison = true;
-        } else if (resource && resource.desc) {
-          samplerComparison = false;
+        const sampler = this.processor.samplers.get(resourceId) || null;
+        if (sampler) {
+          realResource = sampler;
+          if (sampler.desc && sampler.desc.compare !== undefined) {
+            samplerComparison = true;
+          } else if (sampler.desc) {
+            samplerComparison = false;
+          }
+          if (kindMismatch) {
+            this._recordTelemetryWarningOnce(
+              `bg-kind-mismatch:${layoutId}:${binding}:sampler`,
+              `bind group ${id}: binding ${binding} sampler resource mismatches layout entry; substituting dummy resource`
+            );
+            entryResource = this._dummyResource(layoutEntry);
+            entryUsedDummy = true;
+          } else {
+            entryResource = sampler;
+          }
         }
       }
-      if (!resource) {
+      if (!entryResource) {
         this._packetError = `bind group ${id}: binding ${binding} resource ${resourceId} unavailable`;
         return false;
       }
-      entries.push({ binding, resource });
+      entries.push({ binding, resource: entryResource });
 
+      const descResource = realResource || entryResource;
+      const descIsDummy = !realResource;
       let resourceKind = null;
-      if (layoutEntry) {
-        if (layoutEntry.buffer) {
-          resourceKind = layoutEntry.buffer.type || 'uniform';
-          if (usedDummy) bufferUsage = GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST;
-        } else if (layoutEntry.storageTexture) {
-          resourceKind = 'storage-texture';
-          if (usedDummy) textureUsage = GPU_TEXTURE_USAGE_STORAGE_BINDING;
-        } else if (layoutEntry.texture) {
-          resourceKind = 'texture';
-          if (usedDummy) textureUsage = GPU_TEXTURE_USAGE_TEXTURE_BINDING;
-        } else if (layoutEntry.sampler) {
-          resourceKind = 'sampler';
-          if (samplerComparison === null) {
-            samplerComparison = layoutEntry.sampler.type === 'comparison';
+      if (descIsDummy) {
+        if (layoutEntry) {
+          if (layoutEntry.buffer) {
+            resourceKind = layoutEntry.buffer.type || 'uniform';
+            bufferUsage = GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST;
+          } else if (layoutEntry.storageTexture) {
+            resourceKind = 'storage-texture';
+            textureUsage = GPU_TEXTURE_USAGE_STORAGE_BINDING;
+          } else if (layoutEntry.texture) {
+            resourceKind = 'texture';
+            textureUsage = GPU_TEXTURE_USAGE_TEXTURE_BINDING;
+          } else if (layoutEntry.sampler) {
+            resourceKind = 'sampler';
+            if (samplerComparison === null) {
+              samplerComparison = layoutEntry.sampler.type === 'comparison';
+            }
           }
         }
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
-        resourceKind =
-          bufferUsage !== null &&
-          (bufferUsage & GPU_BUFFER_USAGE_STORAGE) !== 0 &&
-          (bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0
-            ? 'storage'
-            : 'uniform';
+        if (!kindMismatch && !entryUsedDummy && layoutEntry && layoutEntry.buffer) {
+          resourceKind = layoutEntry.buffer.type || 'uniform';
+        } else {
+          resourceKind =
+            bufferUsage !== null &&
+            (bufferUsage & GPU_BUFFER_USAGE_STORAGE) !== 0 &&
+            (bufferUsage & GPU_BUFFER_USAGE_UNIFORM) === 0
+              ? 'storage'
+              : 'uniform';
+        }
       } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
-        resourceKind =
-          textureUsage !== null &&
-          (textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
-          (textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
-            ? 'storage-texture'
-            : 'texture';
+        if (!kindMismatch && !entryUsedDummy && layoutEntry && layoutEntry.storageTexture) {
+          resourceKind = 'storage-texture';
+        } else if (!kindMismatch && !entryUsedDummy && layoutEntry && layoutEntry.texture) {
+          resourceKind = 'texture';
+        } else {
+          resourceKind =
+            textureUsage !== null &&
+            (textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
+            (textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
+              ? 'storage-texture'
+              : 'texture';
+        }
       } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
         resourceKind = 'sampler';
+        if (!kindMismatch && layoutEntry && layoutEntry.sampler && samplerComparison === null) {
+          samplerComparison = layoutEntry.sampler.type === 'comparison';
+        }
       }
 
       if (resourceKind) {
-        const descEntry = { binding, kind: resourceKind, resource, isDummy: usedDummy };
+        const descEntry = { binding, kind: resourceKind, resource: descResource, isDummy: descIsDummy };
         if (bufferUsage !== null) descEntry.bufferUsage = bufferUsage;
         if (textureUsage !== null) descEntry.textureUsage = textureUsage;
+        if (textureFormat !== null && !descIsDummy) descEntry.textureFormat = textureFormat;
+        if (textureViewDimension !== null && !descIsDummy) descEntry.viewDimension = textureViewDimension;
+        if (textureMultisampled !== null && !descIsDummy) descEntry.multisampled = textureMultisampled;
         if (samplerComparison !== null) descEntry.comparison = samplerComparison;
         descriptorResources.push(descEntry);
       }
