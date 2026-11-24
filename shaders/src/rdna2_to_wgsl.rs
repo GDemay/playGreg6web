@@ -53,6 +53,20 @@ const MAX_WEBGPU_LOCATIONS: u8 = 16;
 /// Maximum color attachment count under WebGPU baseline limits.
 const MAX_WEBGPU_MRTS: u8 = 8;
 
+/// Returns `true` iff `f` can be emitted directly as a WGSL `Literal::F32` without
+/// risking Naga decimal rounding overflow past `f32::MAX` (which Chrome/Dawn Tint
+/// rejects as unrepresentable), losing `-0.0`, or emitting subnormals / NaN / Inf.
+///
+/// Naga prints `f32::MAX` (`0x7f7fffff`, `3.4028234663852886e38`) rounded up to
+/// `340282350000000000000000000000000000000f` (`3.4028235e38 > f32::MAX`), which
+/// Tint rejects. Any finite float with `|f| >= 3.4e38` (including `f32::MAX`,
+/// `-f32::MAX`, `0x7f7ffffe`, etc.) routes through `pg6_u32_bits_to_float(bits)`
+/// for an exact IEEE-754 bitcast that Tint accepts unconditionally.
+#[inline]
+fn is_safe_wgsl_f32_literal(f: f32) -> bool {
+    f.to_bits() == 0 || (f.is_finite() && f.is_normal() && f.abs() < 3.4e38_f32)
+}
+
 /// Stage override option for [`translate_rdna2_to_wgsl`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Rdna2StageOverride {
@@ -3283,7 +3297,7 @@ impl IrEmitter {
                             (Expression::Literal(Literal::U32(bits)), ScalarKind::Float) => {
                                 let bits = *bits;
                                 let f = f32::from_bits(bits);
-                                if bits == 0 || (f.is_finite() && f.is_normal()) {
+                                if is_safe_wgsl_f32_literal(f) {
                                     return self.raw_expr(Expression::Literal(Literal::F32(f)));
                                 }
                                 return self.call_pg6_u32_to_f32(inner);
@@ -3291,7 +3305,7 @@ impl IrEmitter {
                             (Expression::Literal(Literal::I32(val)), ScalarKind::Float) => {
                                 let bits = *val as u32;
                                 let f = f32::from_bits(bits);
-                                if bits == 0 || (f.is_finite() && f.is_normal()) {
+                                if is_safe_wgsl_f32_literal(f) {
                                     return self.raw_expr(Expression::Literal(Literal::F32(f)));
                                 }
                                 let u = self.lit_u32(bits);
@@ -3584,21 +3598,21 @@ impl IrEmitter {
     }
 
     fn lit_f32(&mut self, value: f32) -> Handle<Expression> {
-        if value.is_finite() {
+        if is_safe_wgsl_f32_literal(value) {
             self.raw_expr(Expression::Literal(Literal::F32(value)))
         } else {
             let bits = self.lit_u32(value.to_bits());
-            self.bitcast_u32_to_f32(bits)
+            self.call_pg6_u32_to_f32(bits)
         }
     }
 
     fn lit_f32_from_bits(&mut self, bits: u32) -> Handle<Expression> {
         let f = f32::from_bits(bits);
-        if bits == 0 || (f.is_finite() && f.is_normal()) {
+        if is_safe_wgsl_f32_literal(f) {
             self.raw_expr(Expression::Literal(Literal::F32(f)))
         } else {
             let u = self.lit_u32(bits);
-            self.bitcast_u32_to_f32(u)
+            self.call_pg6_u32_to_f32(u)
         }
     }
 
@@ -10212,5 +10226,104 @@ mod tests {
         assert!(!inplace_out.wgsl.contains("@binding(3)"));
         assert!(inplace_out.wgsl.contains("cb0_.data[2]"));
         assert_naga_wgsl_valid(&inplace_out.wgsl);
+    }
+
+    #[test]
+    fn is_safe_wgsl_f32_literal_predicate_bounds() {
+        // Safe normal floats and +0.0 emit directly as WGSL f32 literals.
+        assert!(is_safe_wgsl_f32_literal(0.0_f32));
+        assert!(is_safe_wgsl_f32_literal(1.0_f32));
+        assert!(is_safe_wgsl_f32_literal(-1.0_f32));
+        assert!(is_safe_wgsl_f32_literal(0.5_f32));
+        assert!(is_safe_wgsl_f32_literal(f32::MIN_POSITIVE));
+        assert!(is_safe_wgsl_f32_literal(-f32::MIN_POSITIVE));
+        assert!(is_safe_wgsl_f32_literal(3.39e38_f32));
+        assert!(is_safe_wgsl_f32_literal(-3.39e38_f32));
+
+        // Near-f32::MAX values (where Naga decimal printing can round up past f32::MAX)
+        // must route through pg6_u32_bits_to_float(bits).
+        assert!(!is_safe_wgsl_f32_literal(f32::MAX));
+        assert!(!is_safe_wgsl_f32_literal(-f32::MAX));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0x7F7F_FFFF)));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0xFF7F_FFFF)));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0x7F7F_FFFE)));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0xFF7F_FFFE)));
+        assert!(!is_safe_wgsl_f32_literal(3.4e38_f32));
+        assert!(!is_safe_wgsl_f32_literal(-3.4e38_f32));
+
+        // -0.0, subnormals, infinities, and NaNs also route through pg6_u32_bits_to_float.
+        assert!(!is_safe_wgsl_f32_literal(-0.0_f32));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0x0000_0001)));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0x007F_FFFF)));
+        assert!(!is_safe_wgsl_f32_literal(f32::from_bits(0x8000_0001)));
+        assert!(!is_safe_wgsl_f32_literal(f32::INFINITY));
+        assert!(!is_safe_wgsl_f32_literal(f32::NEG_INFINITY));
+        assert!(!is_safe_wgsl_f32_literal(f32::NAN));
+    }
+
+    #[test]
+    fn f32_max_and_neg_f32_max_literals_route_through_bitcast_helper() {
+        // Reproduces Chrome/Dawn Tint parse rejection from Test #42:
+        //   v_min3_f32 / v_max3_f32 / v_min_f32 / v_max_f32 / v_mov_b32 with
+        //   0x7f7fffff (f32::MAX), 0xff7fffff (-f32::MAX), and 0x7f7ffffe.
+        let mut words = Vec::new();
+        // v_min3_f32 v0, 0x7f7fffff, v1, v2
+        words.extend_from_slice(&enc_vop3(0x151, 0, 255, 256 + 1, 256 + 2, false, 0, 0, 0));
+        words.push(0x7F7F_FFFF);
+        // v_max3_f32 v1, 0xff7fffff, v0, v2
+        words.extend_from_slice(&enc_vop3(0x154, 1, 255, 256, 256 + 2, false, 0, 0, 0));
+        words.push(0xFF7F_FFFF);
+        // v_min_f32 v2, 0x7f7fffff, v0
+        words.push(enc_vop2(0x0F, 2, 255, 0));
+        words.push(0x7F7F_FFFF);
+        // v_max_f32 v3, 0xff7fffff, v1
+        words.push(enc_vop2(0x10, 3, 255, 1));
+        words.push(0xFF7F_FFFF);
+        // v_mov_b32 v4, 0x7f7ffffe (near-max, also routed via bitcast helper)
+        words.push(enc_vop1(0x01, 4, 255));
+        words.push(0x7F7F_FFFE);
+        // v_add_f32 v3, v3, v4
+        words.push(enc_vop2(0x03, 3, 256 + 3, 4));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("shader with f32::MAX / -f32::MAX literals must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        assert!(
+            !out.wgsl.contains("340282350000000000000000000000000000000f"),
+            "Naga rounded-up f32::MAX decimal literal must NOT appear in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("340282330000000000000000000000000000000f"),
+            "near-f32::MAX literal 0x7f7ffffe must NOT appear as raw decimal in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("fn pg6_u32_bits_to_float("),
+            "expected pg6_u32_bits_to_float runtime helper in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("pg6_u32_bits_to_float(2139095039u)"),
+            "expected exact 0x7f7fffff (2139095039u) bitcast call in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("pg6_u32_bits_to_float(4286578687u)"),
+            "expected exact 0xff7fffff (4286578687u) bitcast call in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("pg6_u32_bits_to_float(2139095038u)"),
+            "expected exact 0x7f7ffffe (2139095038u) bitcast call in WGSL:\n{}",
+            out.wgsl
+        );
     }
 }
