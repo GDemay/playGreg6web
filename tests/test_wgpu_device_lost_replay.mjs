@@ -796,3 +796,50 @@ test('W105 replayMaxBindGroups evicts oldest transient bind groups while keeping
   assert.equal(processor.bindGroups.has(5002), true);
   assert.equal(processor.bindGroups.has(5003), true);
 });
+
+test('W106 lazyShaderCompile defers device.createShaderModule until a pipeline references the shader', () => {
+  const first = createMockDevice('first');
+  const processor = newProcessor(first.device, { lazyShaderCompile: true });
+
+  const unusedShaders = [];
+  for (let i = 0; i < 40; i += 1) {
+    unusedShaders.push(shaderPacket(7000 + i, 0, VS));
+  }
+  processor.executeCommandBuffer(concat(...unusedShaders));
+  assert.equal(first.ops('createShaderModule').length, 0);
+  assert.equal(processor.shaderModules.size, 40);
+
+  processor.executeCommandBuffer(sceneSetupPackets());
+  // Only the 2 shaders referenced by CreateRenderPipeline2 should be compiled.
+  assert.equal(first.ops('createShaderModule').length, 2);
+  processor.executeCommandBuffer(drawFramePackets(2));
+  assert.equal(processor.validationErrorCount, 0, JSON.stringify(processor.getValidationErrors()));
+  assert.equal(first.passCalls.filter((c) => c.op === 'draw').length, 1);
+});
+
+test('W106 lazyShaderCompile skips unused shader compilation during async device-lost recovery', async () => {
+  const first = createMockDevice('first');
+  const processor = newProcessor(first.device, { lazyShaderCompile: true });
+
+  const unusedShaders = [];
+  for (let i = 0; i < 40; i += 1) {
+    unusedShaders.push(shaderPacket(8000 + i, 0, VS));
+  }
+  processor.executeCommandBuffer(concat(...unusedShaders, sceneSetupPackets()));
+  assert.equal(first.ops('createShaderModule').length, 2);
+
+  const second = createMockDevice('second');
+  processor.beginDeviceRecovery();
+  processor.rebindDevice(second.device, createMockContext());
+  installRenderStatePackets(processor);
+  const summary = await processor.replayRecordedResourcesAsync({ chunkSize: 8 });
+  processor.endDeviceRecovery(true);
+
+  assert.equal(summary.aborted, false);
+  assert.equal(summary.failedResources, 0);
+  // Only the 2 shaders referenced by the live pipeline are compiled on the new device!
+  assert.equal(second.ops('createShaderModule').length, 2);
+  processor.executeCommandBuffer(drawFramePackets(2));
+  assert.equal(processor.validationErrorCount, 0, JSON.stringify(processor.getValidationErrors()));
+  assert.equal(second.passCalls.filter((c) => c.op === 'draw').length, 1);
+});

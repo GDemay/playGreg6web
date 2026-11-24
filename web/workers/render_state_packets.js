@@ -1829,6 +1829,16 @@ class RenderStatePackets {
 
   // ---- Pipelines ----
 
+  // W106: materialize lazy GPUShaderModule on first pipeline reference.
+  _ensureShaderModule(id) {
+    if (this.processor && typeof this.processor.ensureShaderModule === 'function') {
+      return this.processor.ensureShaderModule(id);
+    }
+    return this.processor && this.processor.shaderModules
+      ? this.processor.shaderModules.get(id) || null
+      : null;
+  }
+
   // The exact GPURenderPipelineDescriptor for a CreateRenderPipeline2 payload at `offset`.
   buildRenderPipelineDescriptor(view, offset) {
     this._lastBuiltRenderPipelineAutoLayout = null;
@@ -1837,7 +1847,7 @@ class RenderStatePackets {
     const fsId = view.getUint32(offset + 8, true);
     const layoutId = view.getUint32(offset + 12, true);
     let layout = this._layoutFor(layoutId);
-    const vs = this.processor.shaderModules.get(vsId);
+    const vs = this._ensureShaderModule(vsId);
     if (!vs || !layout) {
       if (!vs) this._packetError = `unknown vertex shader module ${vsId}`;
       return null;
@@ -1866,7 +1876,7 @@ class RenderStatePackets {
     let fragmentModule = null;
     let targets = key.targets;
     if (fsId !== 0) {
-      fs = this.processor.shaderModules.get(fsId);
+      fs = this._ensureShaderModule(fsId);
       if (!fs) {
         this._packetError = `unknown fragment shader module ${fsId}`;
         return null;
@@ -2155,7 +2165,7 @@ class RenderStatePackets {
     const csId = view.getUint32(offset + 4, true);
     const layoutId = view.getUint32(offset + 8, true);
     let layout = this._layoutFor(layoutId);
-    const cs = this.processor.shaderModules.get(csId);
+    const cs = this._ensureShaderModule(csId);
     if (!cs || !layout) {
       if (!cs) this._packetError = `unknown compute shader module ${csId}`;
       return false;
@@ -2238,7 +2248,7 @@ class RenderStatePackets {
   _handleV1CreateComputePipeline(origHandler, view, payloadOffset) {
     const id = view.getUint32(payloadOffset, true);
     const csId = view.getUint32(payloadOffset + 4, true);
-    const cs = this.processor && this.processor.shaderModules ? this.processor.shaderModules.get(csId) : null;
+    const cs = this._ensureShaderModule(csId);
     let inspected = null;
     if (cs) {
       inspected = this._inspectComputeShaderEntryPoint(cs, csId);

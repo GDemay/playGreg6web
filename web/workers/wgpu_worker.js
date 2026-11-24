@@ -1530,6 +1530,15 @@ class WgpuCommandProcessor {
     this._replayFailedCount = 0;
     this._lastResourceReplay = null;
 
+    // W106: lazy GPUShaderModule compilation — defer device.createShaderModule({ code })
+    // until a pipeline actually references the shader id so 4,000+ preload shaders never stall
+    // Chrome's GPU process or trigger watchdog loss during boot or device recovery.
+    // Values: false (eager), 'pack' (defer pack-resolved WGSL), true (defer all shaders).
+    this._lazyShaderCompile =
+      options.lazyShaderCompile === 'pack' ? 'pack' : Boolean(options.lazyShaderCompile);
+    this._deferredShaderCount = 0;
+    this._materializedShaderCount = 0;
+
     // Pending staging upload encoder & frame lifecycle tracking
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
@@ -2497,8 +2506,8 @@ class WgpuCommandProcessor {
       return this._specializedFallbackPipelines.get(cacheKey);
     }
 
-    const vsOrig = this.shaderModules.get(pipeMeta.vsShaderId);
-    const fsOrig = pipeMeta.fsShaderId ? this.shaderModules.get(pipeMeta.fsShaderId) : null;
+    const vsOrig = this.ensureShaderModule(pipeMeta.vsShaderId);
+    const fsOrig = pipeMeta.fsShaderId ? this.ensureShaderModule(pipeMeta.fsShaderId) : null;
     if (!vsOrig) {
       return null;
     }
@@ -4641,25 +4650,8 @@ class WgpuCommandProcessor {
     this.device.queue.writeBuffer(buffer, dstOffset, data);
   }
 
-  _handleCreateShaderModule(view, payloadOffset, payloadBytes) {
-    const id = view.getUint32(payloadOffset, true);
-    const stage = view.getUint32(payloadOffset + 4, true);
-    const codeLen = view.getUint32(payloadOffset + 8, true);
-    if (16 + codeLen > payloadBytes) {
-      this._recordOpValidationError(
-        'CreateShaderModule',
-        `shader ${id}: truncated payload (${payloadBytes}B < ${16 + codeLen}B)`
-      );
-      return;
-    }
-
-    const rawBytes = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, codeLen);
-    const isShared = typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer;
-    const rawCode = this._decoder.decode(isShared ? rawBytes.slice() : rawBytes);
-    const trimmed = rawCode.trim();
+  _resolveShaderPayload(id, stage, rawCode, trimmed, hashOnlyHex) {
     const stageName = stageCodeToName(stage) || 'vertex';
-    const hashOnlyHex = parseHashOnlyShaderPayload(trimmed);
-
     let code = rawCode;
     let hashHex = null;
     let entryPoint = null;
@@ -4736,12 +4728,14 @@ class WgpuCommandProcessor {
     if (resolvedHash === null && source === 'inline') {
       resolvedHash = hashHex;
     }
+    return { code, hashHex, entryPoint, source, requestedHash, resolvedHash, fallbackProfile };
+  }
 
-    const allowDirectThrowOnEmpty =
-      this.shaderFallbackRouter === null &&
-      !this._captureValidationErrors &&
-      this._validationErrorCallbacks.size === 0 &&
-      trimmed.length === 0;
+  _compileShaderModuleEntry(id, entry, allowDirectThrowOnEmpty) {
+    if (!this.device) {
+      return null;
+    }
+    const code = entry.code;
     let module;
     if (allowDirectThrowOnEmpty) {
       module = this.device.createShaderModule({ code });
@@ -4750,7 +4744,7 @@ class WgpuCommandProcessor {
         module = this.device.createShaderModule({ code });
       } catch (err) {
         this._recordOpValidationError('CreateShaderModule', err);
-        return;
+        return null;
       }
     }
     if (module && typeof module.getCompilationInfo === 'function') {
@@ -4778,27 +4772,87 @@ class WgpuCommandProcessor {
         // Non-fatal: ignore compilation info inspection errors on mock devices.
       }
     }
-    this.shaderModules.set(id, {
-      module,
-      stage,
-      code,
-      hashHex,
-      entryPoint,
-      source,
-      requestedHash,
-      resolvedHash,
-      fallbackProfile,
-    });
+    entry.module = module;
+    this._materializedShaderCount += 1;
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
-      const byteSize =
-        code === rawCode
-          ? Math.max(0, Math.trunc(codeLen))
-          : new TextEncoder().encode(code).byteLength;
+      const byteSize = entry.isInlineCode
+        ? Math.max(0, Math.trunc(entry.codeLen || 0))
+        : new TextEncoder().encode(code).byteLength;
       this.resourceRegistry.register('shaderModule', id, module, {
         byteSize,
         label: `shaderModule:${id}`,
       });
     }
+    return entry;
+  }
+
+  /**
+   * W106: return the shader module entry for `id`, materializing the underlying GPUShaderModule
+   * on first pipeline reference when `lazyShaderCompile` is enabled.
+   */
+  ensureShaderModule(id) {
+    const entry = this.shaderModules.get(id);
+    if (!entry) {
+      return null;
+    }
+    if (entry.module) {
+      return entry;
+    }
+    return this._compileShaderModuleEntry(id, entry, false);
+  }
+
+  _handleCreateShaderModule(view, payloadOffset, payloadBytes) {
+    const id = view.getUint32(payloadOffset, true);
+    const stage = view.getUint32(payloadOffset + 4, true);
+    const codeLen = view.getUint32(payloadOffset + 8, true);
+    if (16 + codeLen > payloadBytes) {
+      this._recordOpValidationError(
+        'CreateShaderModule',
+        `shader ${id}: truncated payload (${payloadBytes}B < ${16 + codeLen}B)`
+      );
+      return;
+    }
+
+    const rawBytes = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, codeLen);
+    const isShared = typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer;
+    const rawCode = this._decoder.decode(isShared ? rawBytes.slice() : rawBytes);
+    const trimmed = rawCode.trim();
+    const hashOnlyHex = parseHashOnlyShaderPayload(trimmed);
+
+    const resolved = this._resolveShaderPayload(id, stage, rawCode, trimmed, hashOnlyHex);
+    const entry = {
+      module: null,
+      stage,
+      code: resolved.code,
+      codeLen,
+      isInlineCode: resolved.code === rawCode,
+      hashHex: resolved.hashHex,
+      entryPoint: resolved.entryPoint,
+      source: resolved.source,
+      requestedHash: resolved.requestedHash,
+      resolvedHash: resolved.resolvedHash,
+      fallbackProfile: resolved.fallbackProfile,
+    };
+
+    const shouldDefer =
+      this._lazyShaderCompile === true ||
+      (this._lazyShaderCompile === 'pack' && entry.source === 'pack');
+    if (shouldDefer) {
+      this._deferredShaderCount += 1;
+      this.shaderModules.set(id, entry);
+      return;
+    }
+
+    const allowDirectThrowOnEmpty =
+      this.shaderFallbackRouter === null &&
+      !this._captureValidationErrors &&
+      this._validationErrorCallbacks.size === 0 &&
+      trimmed.length === 0;
+    const compiled = this._compileShaderModuleEntry(id, entry, allowDirectThrowOnEmpty);
+    if (!compiled) {
+      return;
+    }
+    this.shaderModules.set(id, compiled);
   }
 
   _handleCreateRenderPipeline(view, payloadOffset) {
@@ -4809,7 +4863,7 @@ class WgpuCommandProcessor {
     const topologyCode = view.getUint32(payloadOffset + 16, true);
     // Reserved pipeline flags at payloadOffset + 20 for future blend/depth state.
 
-    const vsEntry = this.shaderModules.get(vsShaderId);
+    const vsEntry = this.ensureShaderModule(vsShaderId);
     if (!vsEntry) {
       this._recordOpValidationError(
         'CreateRenderPipeline',
@@ -4817,7 +4871,7 @@ class WgpuCommandProcessor {
       );
       return;
     }
-    const fsEntry = fsShaderId !== 0 ? this.shaderModules.get(fsShaderId) : null;
+    const fsEntry = fsShaderId !== 0 ? this.ensureShaderModule(fsShaderId) : null;
     if (fsShaderId !== 0 && !fsEntry) {
       this._recordOpValidationError(
         'CreateRenderPipeline',
@@ -5145,7 +5199,7 @@ class WgpuCommandProcessor {
     const csShaderId = view.getUint32(payloadOffset + 4, true);
     // Reserved flags at payloadOffset + 8 and reserved at payloadOffset + 12.
 
-    const csEntry = this.shaderModules.get(csShaderId);
+    const csEntry = this.ensureShaderModule(csShaderId);
     if (!csEntry) return null;
 
     const csRefl = this._resolveShaderReflection(csShaderId, csEntry, 'compute');
@@ -7798,6 +7852,12 @@ function createWgpuWorkerHandler(options = {}) {
       fallbackShaderHashes:
         initPayload.fallbackShaderHashes ?? options.fallbackShaderHashes,
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
+      lazyShaderCompile:
+        initPayload.lazyShaderCompile !== undefined
+          ? initPayload.lazyShaderCompile
+          : options.lazyShaderCompile !== undefined
+            ? options.lazyShaderCompile
+            : 'pack',
     });
     bindProcessorValidationErrors(processor);
     installPacketExtensions(processor);
