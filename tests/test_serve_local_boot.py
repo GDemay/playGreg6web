@@ -180,6 +180,8 @@ class TestServeLocalBoot(unittest.TestCase):
         self.assertEqual(data["pgimUrl"], "/boot/guest.pgim")
         self.assertIsNone(data["programManifestUrl"])
         self.assertEqual(data["gameBase"], "/game/")
+        self.assertEqual(data["sideModuleCount"], 0)
+        self.assertEqual(data["sideModuleUrls"], [])
 
         self._assert_no_host_leak(raw_text)
 
@@ -223,6 +225,8 @@ class TestServeLocalBoot(unittest.TestCase):
             self.assertIsNone(data["pgimUrl"])
             self.assertIsNone(data["programManifestUrl"])
             self.assertEqual(data["gameBase"], "/game/")
+            self.assertEqual(data["sideModuleCount"], 0)
+            self.assertEqual(data["sideModuleUrls"], [])
             self._assert_no_host_leak(raw)
         finally:
             httpd.shutdown()
@@ -795,6 +799,257 @@ class TestServeLocalQuietDisconnects(unittest.TestCase):
 
                     # Should return quietly without propagating socket disconnect errors.
                     handler._serve_file("/data/chunk.bin", send_body=True)
+
+
+class TestServeLocalSideModuleDiscovery(unittest.TestCase):
+    """Tests for W71 side-module `.wasm` discovery in `/api/status` and `/dist/` revalidation."""
+
+    def test_is_safe_side_module_name_unit(self) -> None:
+        valid = (
+            "guest_part_0.wasm",
+            "guest_part_12.wasm",
+            "extra-mod_1.2.wasm",
+            "ChunkA.WASM",
+        )
+        for name in valid:
+            with self.subTest(valid=name):
+                self.assertTrue(serve_local.is_safe_side_module_name(name))
+
+        invalid = (
+            "",
+            "runtime.wasm",
+            "RUNTIME.WASM",
+            ".hidden.wasm",
+            "-flag.wasm",
+            "../evil.wasm",
+            "a/b.wasm",
+            "a\\b.wasm",
+            "a..b.wasm",
+            "bad\x00.wasm",
+            "with space.wasm",
+            "semi;colon.wasm",
+            "guest_part_0.wasm.tmp",
+            "runtime.js",
+        )
+        for name in invalid:
+            with self.subTest(invalid=name):
+                self.assertFalse(serve_local.is_safe_side_module_name(name))
+
+    def test_discover_side_module_urls_natural_sort_filters_and_top_level_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            web.mkdir()
+            data.mkdir()
+
+            # Missing web/dist -> empty list.
+            self.assertEqual(serve_local._discover_side_module_urls(web), [])
+
+            dist = web / "dist"
+            dist.mkdir()
+            self.assertEqual(serve_local._discover_side_module_urls(web), [])
+
+            # Main runtime & JS artifacts must be excluded from side modules.
+            (dist / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (dist / "runtime.js").write_text("export default {};\n", encoding="utf-8")
+
+            # Valid top-level side modules in unsorted creation order.
+            for name in (
+                "guest_part_10.wasm",
+                "guest_part_2.wasm",
+                "guest_part_0.wasm",
+                "guest_part_1.wasm",
+                "alpha_10.wasm",
+                "alpha_2.wasm",
+            ):
+                (dist / name).write_bytes(b"\x00asm\x01\x00\x00\x00")
+
+            # Nested .wasm, directory ending with .wasm, and unsafe filenames must be skipped.
+            (dist / "nested").mkdir()
+            (dist / "nested" / "guest_part_99.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (dist / "dir_chunk.wasm").mkdir()
+            for unsafe in (
+                ".hidden.wasm",
+                "-dash.wasm",
+                "has space.wasm",
+                "bad..dot.wasm",
+                "guest_part_0.wasm.map",
+            ):
+                (dist / unsafe).write_bytes(b"\x00asm\x01\x00\x00\x00")
+
+            expected = [
+                "/dist/alpha_2.wasm",
+                "/dist/alpha_10.wasm",
+                "/dist/guest_part_0.wasm",
+                "/dist/guest_part_1.wasm",
+                "/dist/guest_part_2.wasm",
+                "/dist/guest_part_10.wasm",
+            ]
+            self.assertEqual(serve_local._discover_side_module_urls(web), expected)
+
+            payload = serve_local.build_status_payload(web, data)
+            self.assertTrue(payload["hasWasmBinary"])
+            self.assertEqual(payload["sideModuleCount"], len(expected))
+            self.assertEqual(payload["sideModuleUrls"], expected)
+
+            raw = json.dumps(payload)
+            self.assertNotIn(str(web), raw)
+            self.assertNotIn(str(base), raw)
+            self.assertNotRegex(raw, r"[A-Za-z]:\\")
+
+    def test_side_module_only_dist_sets_has_wasm_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            (web / "dist").mkdir(parents=True)
+            data.mkdir()
+
+            (web / "dist" / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            payload = serve_local.build_status_payload(web, data)
+            self.assertTrue(payload["hasWasmBinary"])
+            self.assertEqual(payload["sideModuleCount"], 1)
+            self.assertEqual(payload["sideModuleUrls"], ["/dist/guest_part_0.wasm"])
+
+    def test_discover_side_module_urls_skips_escaping_and_broken_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            dist = web / "dist"
+            dist.mkdir(parents=True)
+            data.mkdir()
+
+            outside_wasm = base / "outside.wasm"
+            outside_wasm.write_bytes(b"\x00asm\x01\x00\x00\x00OUTSIDE")
+            (dist / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00OK")
+            (dist / "secret.txt").write_text("not-wasm", encoding="utf-8")
+
+            try:
+                (dist / "escaped.wasm").symlink_to(outside_wasm)
+                (dist / "broken.wasm").symlink_to(dist / "missing.wasm")
+                (dist / "fake.wasm").symlink_to(dist / "secret.txt")
+                (dist / "alias_part_1.wasm").symlink_to(dist / "guest_part_0.wasm")
+            except OSError as exc:
+                self.skipTest(f"unable to create symlink: {exc}")
+
+            discovered = serve_local._discover_side_module_urls(web)
+            self.assertEqual(
+                discovered,
+                ["/dist/alias_part_1.wasm", "/dist/guest_part_0.wasm"],
+            )
+
+            # Escaping web/dist directory symlink itself must yield empty discovery & hasWasmBinary=False.
+            web_esc = base / "web_esc"
+            web_esc.mkdir()
+            outside_dist = base / "outside_dist"
+            outside_dist.mkdir()
+            (outside_dist / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (outside_dist / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (web_esc / "dist").symlink_to(outside_dist, target_is_directory=True)
+
+            payload_esc = serve_local.build_status_payload(web_esc, data)
+            self.assertFalse(payload_esc["hasWasmBinary"])
+            self.assertEqual(payload_esc["sideModuleCount"], 0)
+            self.assertEqual(payload_esc["sideModuleUrls"], [])
+
+    def test_live_server_api_status_side_modules_and_dist_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            dist = web / "dist"
+            dist.mkdir(parents=True)
+            data.mkdir()
+            (web / "index.html").write_text("<h1>side-modules</h1>", encoding="utf-8")
+
+            (dist / "runtime.js").write_text("export const boot = 1;\n", encoding="utf-8")
+            (dist / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00MAIN")
+            part_payloads = {
+                "guest_part_0.wasm": b"\x00asm\x01\x00\x00\x00PART0",
+                "guest_part_2.wasm": b"\x00asm\x01\x00\x00\x00PART2",
+                "guest_part_10.wasm": b"\x00asm\x01\x00\x00\x00PART10",
+            }
+            for filename, payload in part_payloads.items():
+                (dist / filename).write_bytes(payload)
+
+            httpd = serve_local.create_server("127.0.0.1", 0, web, data)
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def req(
+                    method: str,
+                    path: str,
+                    headers: list[tuple[str, str]] | dict[str, str] | None = None,
+                ):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        conn.putrequest(method, path)
+                        if isinstance(headers, dict):
+                            for k, v in headers.items():
+                                conn.putheader(k, v)
+                        elif isinstance(headers, list):
+                            for k, v in headers:
+                                conn.putheader(k, v)
+                        conn.endheaders()
+                        resp = conn.getresponse()
+                        body = resp.read()
+                        return resp.status, dict(resp.getheaders()), body
+                    finally:
+                        conn.close()
+
+                st, hdr, body = req("GET", "/api/status")
+                self.assertEqual(st, 200)
+                self.assertEqual(hdr.get("Cross-Origin-Opener-Policy"), "same-origin")
+                self.assertEqual(hdr.get("Cross-Origin-Embedder-Policy"), "require-corp")
+                raw = body.decode("utf-8")
+                status_json = json.loads(raw)
+                self.assertTrue(status_json["hasWasmBinary"])
+                self.assertEqual(status_json["sideModuleCount"], 3)
+                self.assertEqual(
+                    status_json["sideModuleUrls"],
+                    [
+                        "/dist/guest_part_0.wasm",
+                        "/dist/guest_part_2.wasm",
+                        "/dist/guest_part_10.wasm",
+                    ],
+                )
+                self.assertNotIn(str(base), raw)
+                self.assertNotIn(str(web), raw)
+
+                # Every advertised sideModuleUrl must serve with Cache-Control: no-cache, ETag, and 304.
+                for url in status_json["sideModuleUrls"]:
+                    filename = url.rsplit("/", 1)[-1]
+                    st_get, hdr_get, body_get = req("GET", url)
+                    self.assertEqual(st_get, 200)
+                    self.assertEqual(hdr_get.get("Content-Type"), "application/wasm")
+                    self.assertEqual(hdr_get.get("Cache-Control"), "no-cache")
+                    self.assertEqual(hdr_get.get("Cross-Origin-Opener-Policy"), "same-origin")
+                    self.assertEqual(hdr_get.get("Cross-Origin-Embedder-Policy"), "require-corp")
+                    self.assertEqual(hdr_get.get("Cross-Origin-Resource-Policy"), "same-origin")
+                    self.assertEqual(body_get, part_payloads[filename])
+                    etag = hdr_get.get("ETag")
+                    self.assertTrue(etag)
+
+                    # Multiple If-None-Match header lines with a matching ETag -> 304 + COOP/COEP.
+                    st_304, hdr_304, body_304 = req(
+                        "GET",
+                        url,
+                        [("If-None-Match", '"unrelated-etag"'), ("If-None-Match", etag)],
+                    )
+                    self.assertEqual(st_304, 304)
+                    self.assertEqual(hdr_304.get("Cache-Control"), "no-cache")
+                    self.assertEqual(hdr_304.get("ETag"), etag)
+                    self.assertEqual(hdr_304.get("Cross-Origin-Opener-Policy"), "same-origin")
+                    self.assertEqual(hdr_304.get("Cross-Origin-Embedder-Policy"), "require-corp")
+                    self.assertEqual(hdr_304.get("Cross-Origin-Resource-Policy"), "same-origin")
+                    self.assertEqual(body_304, b"")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":
