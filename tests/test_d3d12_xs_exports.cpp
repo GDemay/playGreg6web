@@ -1192,6 +1192,24 @@ void test_resources() {
     CHECK(result == 0 && fx.vcall(at, Slot2::GetGPUVirtualAddress) == title_memory);
     CHECK(object_of<dg::Resource>(at)->cpu_address() == title_memory);
 
+    // Map of a texture whose memory the title can address: subresource 0 returns the base of that
+    // memory (the title adds the XG subresource offsets itself); other subresources are refused and
+    // reported; a texture without memory is still refused.
+    const uint64_t tex_title_memory = com::guest_alloc(65536);
+    const uint64_t lut = fx.create(device, Slot2::CreatePlacedResourceX,
+                                   {I(tex_title_memory), I(put(texture_desc(256, 1, 2, 0, 2))), I(0), I(0)},
+                                   dg::IID_ID3D12Resource, &result);  // R32G32B32A32_FLOAT, 2 mips
+    CHECK(result == 0 && lut != 0);
+    store64(mapped, 0);
+    CHECK(hr(fx.vcall(lut, Slot2::Map, {I(0), I(0), I(mapped)})) == 0);
+    CHECK(load64(mapped) == tex_title_memory);
+    fx.vcall(lut, Slot2::Unmap, {I(0), I(0)});
+    const uint64_t bad_before_map = dev->stats().bad_arguments;
+    CHECK(hr(fx.vcall(lut, Slot2::Map, {I(1), I(0), I(mapped)})) == dg::kEInvalidArg);
+    CHECK(load64(mapped) == 0 && dev->stats().bad_arguments == bad_before_map + 1);
+    CHECK(hr(fx.vcall(bc, Slot2::Map, {I(0), I(0), I(mapped)})) == dg::kEInvalidArg);
+    CHECK(fx.vcall(lut, Slot::Release) == 0);
+
     // Xbox textures may carry 0x100 | an XG swizzle mode in the layout field (here 0x102 on a
     // 640x360 R32_UINT UAV texture); other layouts above 3, and swizzle modes on buffers, stay invalid.
     const uint64_t tex_memory = com::guest_alloc(1 << 20);
