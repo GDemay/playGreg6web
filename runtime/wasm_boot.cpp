@@ -436,6 +436,7 @@ struct ScopedDeviceOptions {
 
 bool try_load_shader_pack(const WasmBootConfig& cfg,
                           const std::string& path,
+                          bool is_fallback,
                           std::shared_ptr<gpu::ShaderPackIndex>& out_index) {
     if (path.empty()) {
         return false;
@@ -451,10 +452,28 @@ bool try_load_shader_pack(const WasmBootConfig& cfg,
         emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
         return false;
     }
+    const char* mode = is_fallback ? "fallback" : "primary";
     emit_boot_milestone(cfg, "SHADER_PACK",
-                        path + " loaded (" + std::to_string(index->size()) + " key(s))");
+                        path + " loaded (" + std::to_string(index->size()) + " key(s), " + mode +
+                            ")");
     out_index = std::move(index);
     return true;
+}
+
+std::string resolve_pipeline_dump_dir(const WasmBootConfig& cfg) {
+    if (!cfg.dump_pipelines_dir.empty()) {
+        return cfg.dump_pipelines_dir;
+    }
+    if (const char* env_dir = std::getenv("PG6_DUMP_PIPELINES");
+        env_dir != nullptr && env_dir[0] != '\0') {
+        return std::string(env_dir);
+    }
+    const int32_t flag_handle = open_path(cfg, "shaders/dump_pipelines.flag");
+    if (flag_handle >= 0) {
+        close_path(cfg, flag_handle);
+        return "/pg6_dump";
+    }
+    return {};
 }
 
 }  // namespace
@@ -679,18 +698,48 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     ScopedDeviceOptions device_options_guard;
 
     std::shared_ptr<gpu::ShaderPackIndex> shader_pack;
-    if (!try_load_shader_pack(cfg, cfg.shader_pack_path, shader_pack) &&
-        !cfg.fallback_shader_pack_path.empty() &&
-        cfg.fallback_shader_pack_path != cfg.shader_pack_path) {
-        (void)try_load_shader_pack(cfg, cfg.fallback_shader_pack_path, shader_pack);
+    if (!try_load_shader_pack(cfg, cfg.shader_pack_path, /*is_fallback=*/false, shader_pack)) {
+        if (!cfg.fallback_shader_pack_path.empty() &&
+            cfg.fallback_shader_pack_path != cfg.shader_pack_path) {
+            if (!cfg.shader_pack_path.empty()) {
+                emit_boot_milestone(cfg, "SHADER_PACK",
+                                    "primary " + cfg.shader_pack_path +
+                                        " unavailable; falling back to " +
+                                        cfg.fallback_shader_pack_path);
+            }
+            (void)try_load_shader_pack(
+                cfg, cfg.fallback_shader_pack_path, /*is_fallback=*/true, shader_pack);
+        }
+        if (!shader_pack &&
+            (!cfg.shader_pack_path.empty() || !cfg.fallback_shader_pack_path.empty())) {
+            emit_boot_milestone(cfg, "SHADER_PACK", "none loaded (draws will use unresolved PSOs)");
+        }
     }
-    if (shader_pack) {
+
+    const std::string dump_dir = resolve_pipeline_dump_dir(cfg);
+    if (!dump_dir.empty()) {
+        emit_boot_milestone(cfg, "PIPELINE_DUMP", dump_dir);
+    }
+
+    if (shader_pack || !dump_dir.empty()) {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.shader_pack = std::move(shader_pack);
+        device_options.dump_dir = dump_dir;
         device_options_guard.install(std::move(device_options));
     }
 
     const guest::BootResult boot = guest::run_boot(program_boot.config);
+    if (auto dev = gpu::d3d12_xs_exports::current_device()) {
+        if (!dump_dir.empty()) {
+            dev->flush_pipeline_dump();
+        }
+        const gpu::d3d12_guest::DeviceStats s = dev->stats();
+        emit_boot_milestone(cfg, "GPU_STATS",
+                            "psos=" + std::to_string(s.pipeline_states) +
+                                " submissions=" + std::to_string(s.submissions) +
+                                " presents=" + std::to_string(s.presents) +
+                                " skipped_draws=" + std::to_string(s.skipped_draws));
+    }
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;
     result.stage = result.ok ? "ENTRY_CALL" : guest::boot_status_name(boot.status);
