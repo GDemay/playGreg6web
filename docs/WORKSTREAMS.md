@@ -96,7 +96,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Guest-state thunks for `_crt_atexit`/`_register_onexit_function`/`_register_thread_local_exe_atexit_callback`, XAsync-taking shims calling guest completion callbacks, and the XAsync provider (`Begin`/`Schedule`/`Complete`/`Run`/`GetResult`/`Cancel`) + XTaskQueue port/composite slots.
 - [ ] **O23 — DirectStorage, GameInput & XG Guest Interface Adapters on the COM Bridge (`runtime/os/xbox_scarlett_guest.{h,cpp}`)** — `IN PROGRESS` (#237, @Timon-ok) *(no game files required — disjoint files `runtime/os/xbox_scarlett_guest.{h,cpp}`, `tests/test_xbox_scarlett_guest.cpp`)*
   - Wrap the host objects behind `DStorageGetFactory`, `GameInputCreate` and `XGCreateTextureComputer` as guest COM-bridge interfaces with evidence-based slot layouts, logging stubs elsewhere, and the DirectStorage read path on the runtime file layer.
-- [ ] **O24 — Route XMem and Guest-Facing CRT Heap Allocations into the Guest Address Space (`runtime/os/`)** — `IN PROGRESS` (#243, @Timon-ok) *(no game files required — follow-up to O18: the runtime heap is fenced below 4 GiB on wasm64)*
+- [x] **O24 — Route XMem and Guest-Facing CRT Heap Allocations into the Guest Address Space (`runtime/os/`)** — `DONE` (PR #251, closes #243) *(no game files required — follow-up to O18: the runtime heap is fenced below 4 GiB on wasm64)*
   - Back the `xmem.dll` shims and the guest-facing CRT `malloc` family with `VirtualMemoryArena` / the Win32 heap layer so the title's allocations live in the guest pool, with one consistent allocator family and tests.
 
 ---
