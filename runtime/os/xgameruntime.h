@@ -75,6 +75,8 @@ inline constexpr bool failed(HResult hr) {
 // Deterministic offline local profile constants (zero network/DRM dependencies).
 inline constexpr uint64_t kOfflineUserXuid = 0x0009000000000001ULL;
 inline constexpr const char* kOfflineUserGamertag = "OfflinePlayer";
+// XUserLocalId of the offline local user (non-zero, distinct from its XUID).
+inline constexpr uint64_t kOfflineUserLocalId = 1;
 
 // XTaskQueue enums matching Xbox GDK XTaskQueue.h (Manual is 0 there; guest code passes the raw
 // values, e.g. through the xgameruntime.dll provider).
@@ -188,6 +190,8 @@ HResult XUserGetGamertag(XUserHandle user,
                          char* gamertag,
                          size_t* gamertag_used);
 void XUserCloseHandle(XUserHandle user);
+// A second, independently closed handle to the same (local) user.
+HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated);
 
 // ---------------------------------------------------------------------------
 // XSystem device & analytics info
