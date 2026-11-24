@@ -1241,3 +1241,79 @@ test('W94 gpu-validation-error formats cleanly for progress channel and forwards
     totalCount: 1,
   });
 });
+
+test('W95 forwardGpuWorkerMessage preserves realPackDrawCount, fallbackDrawCount, and packetsProcessed in frameStats', () => {
+  const forwarded = [];
+  const res = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: {
+        framesPresented: 500,
+        droppedFrames: 0,
+        drawCalls: 59,
+        realPackDrawCount: 59,
+        fallbackDrawCount: 0,
+        computeDispatches: 12,
+        packetsProcessed: 4200,
+      },
+    },
+    (msg) => forwarded.push(msg),
+  );
+
+  assert.ok(res);
+  assert.equal(res.type, 'gpu-telemetry');
+  assert.equal(res.frameStats.framesPresented, 500);
+  assert.equal(res.frameStats.droppedFrames, 0);
+  assert.equal(res.frameStats.drawCalls, 59);
+  assert.equal(res.frameStats.realPackDrawCount, 59);
+  assert.equal(res.frameStats.fallbackDrawCount, 0);
+  assert.equal(res.frameStats.computeDispatches, 12);
+  assert.equal(res.frameStats.packetCount, 4200);
+  assert.equal(res.frameStats.packetsProcessed, 4200);
+  assert.equal(forwarded.length, 1);
+  assert.deepEqual(forwarded[0], res);
+
+  // Also verify stats and top-level eventData fallbacks + non-negative integer coercion.
+  const fromStats = forwardGpuWorkerMessage({
+    type: 'gpu-stats',
+    stats: {
+      framesPresented: 10,
+      realPackDrawCount: 14.8,
+      fallbackDrawCount: -3,
+      packetsProcessed: 310,
+    },
+  });
+  assert.equal(fromStats.frameStats.realPackDrawCount, 14);
+  assert.equal(fromStats.frameStats.fallbackDrawCount, 0);
+  assert.equal(fromStats.frameStats.packetCount, 310);
+  assert.equal(fromStats.frameStats.packetsProcessed, 310);
+
+  const fromTopLevel = forwardGpuWorkerMessage({
+    type: 'gpu-telemetry',
+    framesPresented: 2,
+    realPackDrawCount: 7,
+    fallbackDrawCount: 2,
+    packetsProcessed: 88,
+  });
+  assert.equal(fromTopLevel.frameStats.realPackDrawCount, 7);
+  assert.equal(fromTopLevel.frameStats.fallbackDrawCount, 2);
+  assert.equal(fromTopLevel.frameStats.packetCount, 88);
+  assert.equal(fromTopLevel.frameStats.packetsProcessed, 88);
+
+  // Undefined/null optional fields remain absent so callers using strict shape checks stay compatible.
+  const minimal = forwardGpuWorkerMessage({
+    type: 'gpu-telemetry',
+    frameStats: {
+      framesPresented: 3,
+      droppedFrames: 0,
+      realPackDrawCount: null,
+      fallbackDrawCount: undefined,
+      packetCount: 55,
+    },
+  });
+  assert.deepEqual(minimal.frameStats, {
+    framesPresented: 3,
+    droppedFrames: 0,
+    packetCount: 55,
+  });
+});
