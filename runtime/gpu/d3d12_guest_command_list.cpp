@@ -1051,12 +1051,13 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
 
 // Xbox slot 85: (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags) -> void. The title's texture upload
 // path copies rows into a staging buffer and calls slot 85 with the CopyTextureRegion arguments
-// followed by a trailing flags word.
+// followed by a trailing flags word. The flags are a 32-bit argument: the executable stores only
+// the low half of the stack slot (movl), so the upper half holds whatever was there before.
 void CommandList::CopyTextureRegionX(com::CallContext& ctx) {
     if (!usable()) {
         return;
     }
-    const uint64_t flags = ctx.int_arg(7);
+    const uint32_t flags = static_cast<uint32_t>(ctx.int_arg(7));
     if (flags != 0) {
         note("ID3D12GraphicsCommandList Xbox slot 85 (CopyTextureRegionX): trailing flags " + hex(flags) +
              " are not interpreted");
