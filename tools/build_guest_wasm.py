@@ -71,6 +71,11 @@ SKIP_DIR_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Bump whenever retarget_wasm64_ir changes its output (salted into .ll cache keys).
+WASM64_IR_RETARGET_VERSION = 1
+WASM64_SOURCE_TRIPLE = "wasm64-unknown-unknown"
+WASM64_EMSCRIPTEN_TRIPLE = "wasm64-unknown-emscripten"
+
 # Compile flags applied to every translation unit (plus `-O*` from --opt).
 COMPILE_WASM_FLAGS: tuple[str, ...] = ("-sMEMORY64=1", "-pthread")
 
@@ -107,6 +112,10 @@ _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
 _POSIX_PATH_RE = re.compile(
     r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+)
+_TARGET_DATALAYOUT_RE = re.compile(r"^[ \t]*target[ \t]+datalayout[ \t]*=")
+_TARGET_TRIPLE_WASM64_RE = re.compile(
+    r'^([ \t]*target[ \t]+triple[ \t]*=[ \t]*)"wasm64-unknown-unknown"([ \t]*(?:;.*)?)$'
 )
 
 CommandRunner = Callable[[Sequence[str]], "CommandResult"]
@@ -476,6 +485,31 @@ def parse_opt_level(raw: str) -> str:
     raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, or O3")
 
 
+def retarget_wasm64_ir(text: str) -> str:
+    """Normalize lifted wasm64 LLVM IR for Emscripten 7 / LLVM 24 `emcc`.
+
+    Drops any hardcoded `target datalayout = ...` line so `emcc` supplies the
+    active LLVM backend's DataLayout, and rewrites
+    `target triple = "wasm64-unknown-unknown"` to `"wasm64-unknown-emscripten"`.
+    """
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body, eol = line[:-2], "\r\n"
+        elif line.endswith("\n"):
+            body, eol = line[:-1], "\n"
+        else:
+            body, eol = line, ""
+        if _TARGET_DATALAYOUT_RE.match(body):
+            continue
+        match = _TARGET_TRIPLE_WASM64_RE.match(body)
+        if match is not None:
+            out.append(f'{match.group(1)}"{WASM64_EMSCRIPTEN_TRIPLE}"{match.group(2)}{eol}')
+        else:
+            out.append(line)
+    return "".join(out)
+
+
 def compile_flags_for(
     *,
     opt: str,
@@ -486,20 +520,34 @@ def compile_flags_for(
     flags: list[str] = [*COMPILE_WASM_FLAGS, f"-{opt}"]
     flags.extend(extra_flags)
     if kind == "ll":
+        if "-msimd128" not in flags:
+            flags.append("-msimd128")
         flags.extend(["-x", "ir"])
     elif kind == "cpp":
         flags.append("-std=c++20")
     flags.append("-c")
-    for include in include_dirs:
-        flags.extend(["-I", str(include)])
+    if kind != "ll":
+        for include in include_dirs:
+            flags.extend(["-I", str(include)])
     return tuple(flags)
 
 
-def cache_key_for(content: bytes, flags: Sequence[str], *, kind: str) -> str:
+def cache_key_for(
+    content: bytes,
+    flags: Sequence[str],
+    *,
+    kind: str,
+    retarget_version: int | str | None = None,
+) -> str:
     digest = hashlib.sha256()
     digest.update(b"playgta6-guest-wasm-v1\0")
     digest.update(kind.encode("utf-8"))
     digest.update(b"\0")
+    if kind == "ll":
+        version = WASM64_IR_RETARGET_VERSION if retarget_version is None else retarget_version
+        digest.update(b"retarget-v")
+        digest.update(str(version).encode("utf-8"))
+        digest.update(b"\0")
     for flag in flags:
         digest.update(flag.encode("utf-8"))
         digest.update(b"\0")
@@ -777,6 +825,13 @@ def cache_object_path(cache_dir: Path, key: str, unit_id: str) -> Path:
     return cache_dir / key[:2] / f"{stem}-{key[:16]}.o"
 
 
+def cache_retargeted_ir_path(cache_dir: Path, key: str, unit_id: str | None = None) -> Path:
+    if unit_id:
+        stem = Path(unit_id.replace("/", "__")).stem
+        return cache_dir / key[:2] / f"{stem}-{key[:16]}.retargeted.ll"
+    return cache_dir / f"{key}.retargeted.ll"
+
+
 def build_compile_argv(
     compiler: Path | str,
     source: Path,
@@ -876,7 +931,24 @@ def compile_unit(
         )
 
     object_path.parent.mkdir(parents=True, exist_ok=True)
-    result = run_command(argv)
+    retarget_path: Path | None = None
+    if unit.kind == "ll":
+        ir_text = content.decode("utf-8", errors="surrogateescape")
+        retargeted_text = retarget_wasm64_ir(ir_text)
+        if retargeted_text != ir_text:
+            retarget_path = cache_retargeted_ir_path(cache_dir, key, unit.unit_id)
+            retarget_path.parent.mkdir(parents=True, exist_ok=True)
+            retarget_path.write_bytes(retargeted_text.encode("utf-8", errors="surrogateescape"))
+            argv = build_compile_argv(compiler, retarget_path, object_path, flags)
+            display_argv = tuple(sanitize_argv(argv))
+    try:
+        result = run_command(argv)
+    finally:
+        if retarget_path is not None:
+            try:
+                retarget_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     elapsed = time.monotonic() - started
     if result.returncode != 0:
         err = sanitize_text((result.stderr or result.stdout or "compile failed").strip())

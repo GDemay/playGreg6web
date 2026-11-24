@@ -984,6 +984,158 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             self.assertTrue(any(u["id"].endswith("wasm_boot.cpp") for u in payload["sources"]))
 
 
+class TestWasm64IrRetargetAndFlags(unittest.TestCase):
+    SAMPLE_SHARD_IR = (
+        "; ModuleID = 'shard-00000'\n"
+        'target datalayout = "e-m:e-p:64:64-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20"\n'
+        'target triple = "wasm64-unknown-unknown"\n'
+        "\n"
+        "; target datalayout = \"comment-stays\"\n"
+        "define void @sub_140001000(ptr %state) #0 {\n"
+        "  ret void\n"
+        "}\n"
+        '\nattributes #0 = { "target-features"="+simd128" }\n'
+    )
+
+    def test_retarget_wasm64_ir_strips_datalayout_and_rewrites_triple(self) -> None:
+        retargeted = bgw.retarget_wasm64_ir(self.SAMPLE_SHARD_IR)
+        self.assertNotIn('target datalayout = "e-m:e', retargeted)
+        self.assertIn('; target datalayout = "comment-stays"\n', retargeted)
+        self.assertNotIn('target triple = "wasm64-unknown-unknown"', retargeted)
+        self.assertIn('target triple = "wasm64-unknown-emscripten"\n', retargeted)
+        self.assertIn("define void @sub_140001000(ptr %state) #0 {\n", retargeted)
+        self.assertIn('attributes #0 = { "target-features"="+simd128" }\n', retargeted)
+
+        # CRLF line endings are preserved on surviving lines.
+        crlf_in = self.SAMPLE_SHARD_IR.replace("\n", "\r\n")
+        crlf_out = bgw.retarget_wasm64_ir(crlf_in)
+        self.assertNotIn('target datalayout = "e-m:e', crlf_out)
+        self.assertIn('target triple = "wasm64-unknown-emscripten"\r\n', crlf_out)
+
+        # Already-emscripten and unrelated triples pass through unchanged.
+        other = 'target triple = "x86_64-pc-windows-msvc"\n'
+        self.assertEqual(bgw.retarget_wasm64_ir(other), other)
+        em_ir = 'target triple = "wasm64-unknown-emscripten"\n'
+        self.assertEqual(bgw.retarget_wasm64_ir(em_ir), em_ir)
+
+    def test_ll_compile_flags_include_simd128_and_omit_include_dirs(self) -> None:
+        includes = [Path("runtime"), Path("work/recomp_program")]
+        ll_flags = bgw.compile_flags_for(opt="O2", kind="ll", include_dirs=includes)
+        self.assertIn("-msimd128", ll_flags)
+        self.assertIn("-x", ll_flags)
+        self.assertIn("ir", ll_flags)
+        self.assertIn("-c", ll_flags)
+        self.assertNotIn("-I", ll_flags)
+        self.assertEqual(ll_flags.count("-msimd128"), 1)
+
+        cpp_flags = bgw.compile_flags_for(opt="O2", kind="cpp", include_dirs=includes)
+        self.assertIn("-I", cpp_flags)
+        self.assertIn("-std=c++20", cpp_flags)
+        self.assertNotIn("-msimd128", cpp_flags)
+
+        c_flags = bgw.compile_flags_for(opt="O2", kind="c", include_dirs=includes)
+        self.assertIn("-I", c_flags)
+        self.assertNotIn("-msimd128", c_flags)
+
+        self.assertEqual(bgw.COMPILE_WASM_FLAGS, ("-sMEMORY64=1", "-pthread"))
+
+    def test_cache_key_salts_ll_with_retarget_version(self) -> None:
+        ll_flags = bgw.compile_flags_for(opt="O2", kind="ll")
+        cpp_flags = bgw.compile_flags_for(opt="O2", kind="cpp")
+        raw = self.SAMPLE_SHARD_IR.encode("utf-8")
+
+        key_v1 = bgw.cache_key_for(raw, ll_flags, kind="ll")
+        key_v2 = bgw.cache_key_for(raw, ll_flags, kind="ll", retarget_version="v2")
+        self.assertNotEqual(key_v1, key_v2)
+
+        old_version = bgw.WASM64_IR_RETARGET_VERSION
+        try:
+            bgw.WASM64_IR_RETARGET_VERSION = 999
+            key_patched = bgw.cache_key_for(raw, ll_flags, kind="ll")
+            self.assertNotEqual(key_v1, key_patched)
+            cpp_before = bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp")
+        finally:
+            bgw.WASM64_IR_RETARGET_VERSION = old_version
+        cpp_after = bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp")
+        self.assertEqual(cpp_before, cpp_after)
+
+    def test_run_build_retargets_ll_into_cache_dir_without_modifying_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            (repo / "runtime").mkdir(exist_ok=True)
+            src = root / "recomp-out"
+            shard_path = _write(src / "lift" / "shard-00000.ll", self.SAMPLE_SHARD_IR)
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void pg6_thunk() {}\n")
+            cache_dir = root / "cache"
+            out_dir = root / "dist"
+
+            # Dry-run must not materialize any retargeted IR file in cache_dir.
+            dry_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache_dir,
+                out_dir=out_dir,
+                jobs=1,
+                dry_run=True,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(dry_report.ok, dry_report.errors)
+            self.assertFalse(cache_dir.exists() and list(cache_dir.rglob("*.retargeted.ll")))
+
+            seen_ll_sources: list[tuple[Path, str, tuple[str, ...]]] = []
+            seen_cpp_argvs: list[tuple[str, ...]] = []
+            base_runner = RecordingRunner()
+
+            def inspecting_runner(argv: Sequence[str]) -> bgw.CommandResult:
+                tokens = tuple(str(a) for a in argv)
+                src_token = _source_token(tokens)
+                if src_token is not None:
+                    src_p = Path(src_token)
+                    if src_p.suffix.lower() == ".ll":
+                        seen_ll_sources.append((src_p, src_p.read_text(encoding="utf-8"), tokens))
+                    elif src_p.suffix.lower() == ".cpp":
+                        seen_cpp_argvs.append(tokens)
+                return base_runner(tokens)
+
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache_dir,
+                out_dir=out_dir,
+                jobs=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=inspecting_runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(len(seen_ll_sources), 1)
+            ll_path, ll_text, ll_argv = seen_ll_sources[0]
+            self.assertTrue(ll_path.name.endswith(".retargeted.ll"))
+            self.assertTrue(ll_path.resolve().is_relative_to(cache_dir.resolve()))
+            self.assertNotIn('target datalayout = "e-m:e', ll_text)
+            self.assertIn('target triple = "wasm64-unknown-emscripten"', ll_text)
+            self.assertIn("define void @sub_140001000", ll_text)
+            self.assertIn("-msimd128", ll_argv)
+            self.assertNotIn("-I", ll_argv)
+
+            self.assertEqual(len(seen_cpp_argvs), 1)
+            self.assertIn("-I", seen_cpp_argvs[0])
+
+            # Original shard on disk is untouched and temp .retargeted.ll was cleaned up.
+            self.assertEqual(shard_path.read_text(encoding="utf-8"), self.SAMPLE_SHARD_IR)
+            self.assertEqual(list(cache_dir.rglob("*.retargeted.ll")), [])
+
+            # JSON output remains sanitized (no host paths or raw backslashes).
+            dumped = bgw.report_to_json(report)
+            self.assertNotIn("\\\\", dumped)
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+            if len(user) >= 3:
+                self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+
 class TestLinkFlagContract(unittest.TestCase):
     def test_public_constants_match_cmake(self) -> None:
         cmake = (REPO_ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
