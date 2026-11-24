@@ -48,6 +48,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Run the native boot harness (`R14`) on the real program build in a fix-and-rerun loop: triage each first fault, fix boot/loader/dispatcher/shim defects with regression tests or record the missing piece for its owning task, until the title reaches its first D3D12 device creation.
 - [ ] **R18 — Guest-Callable Thunks for Every Catalogued Shim Export: Dynamic `GetProcAddress` Coverage (`recomp/src/stubs/`, `runtime/guest/`)** — `IN PROGRESS` (#283, @Timon-ok) *(no game files required — observed at boot: `GetProcAddress` returns NULL for host shims that are not statically imported)*
   - Generate guest-callable marshaling thunks for every audited, bindable shim in the catalogue, register them with the guest runtime, and make dynamic `GetProcAddress` binding return callable guest addresses.
+- [ ] **R19 — Windowed Guest-Memory Translation: Fit a 16 GiB CPU Window into the wasm64 Guest Pool (prototype + measurements)** — `IN PROGRESS` (#285, @Timon-ok) *(follow-up to O27: the title's CPU window cannot be identity-mapped into the 12 GiB browser pool; option off by default, no ABI change until measured)*
+  - Prototype a second translation for one registered address range in the lifter's `guest_ptr` seam (per-64 KiB page table) with pool-backed window pages in the arena, and measure code-size and run-time cost.
 
 ---
 
@@ -106,7 +108,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Build every runtime test for Emscripten `-sMEMORY64 -pthread` in Docker, run it under a memory64-capable Node with a per-test report, and fix the wasm64-only failures (function-table identity in `GetProcAddress` checks, image-loader tests exceeding the wasm guest pool).
 - [x] **O26 — Win32 Shims Required by the Recompiled Runtime DLLs: FLS, InitOnce, SList, Pointer Encoding & Locale (`runtime/os/win32_rtl.{h,cpp}`)** — `DONE` (PR #269, closes #264) *(driven by the first real program boot: `vcruntime140.dll` `DllMain` stops at `InitializeCriticalSectionEx`)*
   - Implement and bind `Fls*`, `InitializeCriticalSectionEx`, `InitOnceExecuteOnce`, `EncodePointer`/`DecodePointer`, SList, `SwitchToThread`, `GetModuleHandleExW`, `RtlCaptureStackBackTrace`, `LCMapStringEx`/`CompareStringEx`/`GetLocaleInfoEx`/`GetStringTypeW`/`GetCPInfo`, `FindFirstFileExW`, `GetFileInformationByHandle`, `GetTempPathW` and the other Win32 imports of `vcruntime140`/`msvcp140` that have no shim.
-- [ ] **O27 — XMem CPU/GPU Window Model: GPU Alias Registration & Address-Space Budget for the wasm64 Guest Pool (`runtime/os/xmem_windows.{h,cpp}`)** — `IN PROGRESS` (#278, @Timon-ok) *(driven by the real boot: multi-GiB `XMemVirtualAlloc` reservations after `D3D12ConfigureVirtualMemoryX`; the browser guest pool is 12 GiB)*
+- [x] **O27 — XMem CPU/GPU Window Model: GPU Alias Registration & Address-Space Budget for the wasm64 Guest Pool (`runtime/os/xmem_windows.{h,cpp}`)** — `DONE` (PR #284, closes #278) *(driven by the real boot: multi-GiB `XMemVirtualAlloc` reservations after `D3D12ConfigureVirtualMemoryX`; the browser guest pool is 12 GiB)*
   - Model the title's CPU window and its GPU-visible alias (register the alias with the D3D12 layer, apply queue-side page mappings) and design how multi-GiB reservations fit the wasm64 guest pool, backed by measurements of what the title reserves and commits.
 
 ---
