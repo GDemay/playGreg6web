@@ -1047,3 +1047,20 @@ test('W86 createPatchedPthreadEnv and installPthreadHostImportShim handle .stub 
   assert.equal(captured.env.host_wgpu_submit, hostEnv.host_wgpu_submit);
   restore();
 });
+
+test('W86 regression: bare manifest runtimeJs resolves under dist/ so runtime.wasm never 404s', () => {
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+    guestManifest: {
+      runtimeJs: 'runtime.js',
+      indirectDispatch: 'shard',
+      sideModules: ['guest_part_0.wasm', 'guest_part_1.wasm', 'guest_part_2.wasm'],
+    },
+  });
+  assert.equal(cfg.mainScriptUrlOrBlob, 'http://127.0.0.1:8080/dist/runtime.js');
+  assert.equal(cfg.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/dist/runtime.wasm');
+  assert.equal(
+    cfg.locateFile('guest_part_0.wasm'),
+    'http://127.0.0.1:8080/dist/guest_part_0.wasm',
+  );
+});
