@@ -1,0 +1,1019 @@
+/*
+ * playgta6web In-Browser HUD Overlay — Astryx Design System (1:1 Tokens & Components)
+ *
+ * Design tokens and finished component geometry reproduced self-contained for
+ * COOP/COEP (`Cross-Origin-Embedder-Policy: require-corp`) isolation from:
+ *   - Meta Open Source Astryx Design System (MIT License)
+ *   - https://astryx.atmeta.com/components (`[data-astryx-theme="astryx"]`)
+ *   - @astryxdesign/core & @astryxdesign/theme-neutral v0.7.17
+ *
+ * Pure Astryx surface hierarchy: tonal fills, elevation shadows, pill buttons &
+ * badges, generous spacing — zero borders, zero external CDN fonts/CSS, zero glow.
+ */
+
+:root,
+[data-astryx-theme="astryx"] {
+  color-scheme: dark;
+
+  /* --- Typography (COOP/COEP-safe system stack matching Astryx sans + mono) --- */
+  --font-family-body: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-family-heading: var(--font-family-body);
+  --font-family-code: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  /* --- Core Neutral Dark Surface Hierarchy (Astryx dark — borderless tonal layers) --- */
+  --color-background-body: #111112;
+  --color-background-surface: rgba(31, 31, 34, 0.94);
+  --color-background-card: #1f1f22;
+  --color-background-popover: #2a2b2f;
+  --color-background-muted: rgba(255, 255, 255, 0.045);
+  --color-background-recessed: #171719;
+  --color-neutral: rgba(223, 226, 229, 0.12);
+  --color-neutral-hover: rgba(223, 226, 229, 0.18);
+  --color-neutral-pressed: rgba(223, 226, 229, 0.24);
+  --color-track: rgba(255, 255, 255, 0.11);
+
+  /* --- Astryx Signature Monochrome Accent (`data-astryx-theme="astryx"`) --- */
+  --color-accent: #dfe2e5;
+  --color-on-accent: #15110c;
+  --color-accent-muted: rgba(223, 226, 229, 0.14);
+
+  /* --- Interaction Overlays --- */
+  --color-overlay-hover: rgba(255, 255, 255, 0.06);
+  --color-overlay-pressed: rgba(255, 255, 255, 0.11);
+
+  /* --- Text Roles (WCAG AA 4.5:1+ on #1F1F22) --- */
+  --color-text-primary: #dfe2e5;
+  --color-text-strong: #ffffff;
+  --color-text-secondary: #9e9e9e;
+  --color-text-disabled: #6f747c;
+
+  /* --- Semantic Status Roles (Astryx theme-neutral dark stops) --- */
+  --color-success: #64af4c;
+  --color-background-green: #2b422b;
+  --color-text-green: #90ca90;
+  --color-success-muted: rgba(144, 202, 144, 0.18);
+  --color-on-success-muted: #90ca90;
+
+  --color-warning: #ffce2f;
+  --color-background-yellow: #453a1c;
+  --color-text-yellow: #eec448;
+  --color-warning-muted: rgba(226, 182, 35, 0.18);
+  --color-on-warning-muted: #eec448;
+
+  --color-error: #ff705d;
+  --color-background-red: #5b2b28;
+  --color-text-red: #ffaea7;
+  --color-error-muted: rgba(255, 152, 144, 0.18);
+  --color-on-error-muted: #ffaea7;
+
+  --color-info: #6d9cfe;
+  --color-background-blue: #253c5a;
+  --color-text-blue: #a1caff;
+  --color-info-muted: rgba(136, 188, 255, 0.18);
+  --color-on-info-muted: #a1caff;
+
+  --color-text-gray: #d4d4d4;
+
+  /* --- Spacing Scale (Astryx 4px steps) --- */
+  --spacing-1: 4px;
+  --spacing-1-5: 6px;
+  --spacing-2: 8px;
+  --spacing-3: 12px;
+  --spacing-4: 16px;
+
+  /* --- Element Sizes --- */
+  --size-element-sm: 28px;
+  --size-element-xs: 24px;
+
+  /* --- Radii (Astryx `astryx` theme) --- */
+  --radius-inner: 8px;
+  --radius-element: 12px;
+  --radius-container: 16px;
+  --radius-full: 9999px;
+
+  /* --- Elevation Shadows (Astryx dark — soft shadow, no border ring) --- */
+  --shadow-med:
+    0 2px 6px rgba(0, 0, 0, 0.32),
+    0 8px 20px rgba(0, 0, 0, 0.45);
+  --shadow-high:
+    0 4px 10px rgba(0, 0, 0, 0.36),
+    0 16px 36px rgba(0, 0, 0, 0.56);
+
+  /* --- Focus Ring (Astryx standard: 2px --color-accent) --- */
+  --focus-outline-width: 2px;
+  --focus-outline-offset: 2px;
+
+  /* --- Motion (Astryx standard easing) --- */
+  --duration-fast: 125ms;
+  --ease-standard: cubic-bezier(0.24, 1, 0.4, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-background-body);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#viewport {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: var(--color-background-body);
+}
+
+/* ============================================================================
+ * Astryx Floating Card Shell (`#hud`) — Borderless elevated surface
+ * ========================================================================== */
+
+#hud {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10010;
+  width: min(320px, calc(100vw - 24px));
+  max-width: 320px;
+  background: var(--color-background-surface);
+  border: none;
+  border-radius: var(--radius-container);
+  box-shadow: var(--shadow-high);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow: hidden;
+  user-select: none;
+  transition:
+    border-radius var(--duration-fast) var(--ease-standard),
+    box-shadow var(--duration-fast) var(--ease-standard);
+}
+
+/* Collapsed single-line Astryx status pill (`playgta6web · Real Wasm64 · 0 fps`) */
+#hud.collapsed {
+  width: auto;
+  max-width: calc(100vw - 24px);
+  border-radius: var(--radius-full);
+  box-shadow: var(--shadow-med);
+}
+
+#hud.collapsed #hud-body {
+  display: none;
+}
+
+/* ============================================================================
+ * Section 1: Header Bar
+ * ========================================================================== */
+
+.hud-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  padding: 12px 10px 8px 14px;
+}
+
+#hud.collapsed .hud-header {
+  padding: 5px 6px 5px 12px;
+}
+
+.hud-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+/* Astryx StatusDot — crisp 8px circle, zero glow, zero border */
+.astryx-status-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  background: var(--color-info);
+}
+
+.astryx-status-dot[data-level="ok"] {
+  background: var(--color-success);
+}
+
+.astryx-status-dot[data-level="warn"] {
+  background: var(--color-warning);
+}
+
+.astryx-status-dot[data-level="error"] {
+  background: var(--color-error);
+}
+
+.astryx-status-dot[data-level="info"] {
+  background: var(--color-info);
+}
+
+.hud-brand {
+  font-family: var(--font-family-heading);
+  font-size: 13px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.01em;
+  color: var(--color-text-strong);
+  white-space: nowrap;
+}
+
+.hud-pill-meta {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+#hud.collapsed .hud-pill-meta {
+  display: inline-flex;
+}
+
+.hud-pill-sep {
+  color: var(--color-text-disabled);
+}
+
+.hud-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  flex-shrink: 0;
+}
+
+/* ============================================================================
+ * Astryx Badge (`astryx-badge`) & Boot Mode States — Borderless pill
+ * ========================================================================== */
+
+.astryx-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-full);
+  font-family: var(--font-family-body);
+  font-size: 11px;
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+  width: fit-content;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--color-neutral);
+  color: var(--color-text-gray);
+}
+
+.astryx-badge[data-state="ok"],
+.astryx-badge[data-boot-mode="real-wasm64"] {
+  background: var(--color-background-green);
+  color: var(--color-text-green);
+}
+
+.astryx-badge[data-state="warn"],
+.astryx-badge[data-boot-mode="smoke"] {
+  background: var(--color-background-yellow);
+  color: var(--color-text-yellow);
+}
+
+.astryx-badge[data-state="err"] {
+  background: var(--color-background-red);
+  color: var(--color-text-red);
+}
+
+.astryx-badge[data-state="info"],
+.astryx-badge[data-boot-mode="idle"] {
+  background: var(--color-background-blue);
+  color: var(--color-text-blue);
+}
+
+.astryx-badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  background: var(--color-text-secondary);
+}
+
+.astryx-badge[data-state="ok"] .astryx-badge-dot {
+  background: var(--color-success);
+}
+
+.astryx-badge[data-state="warn"] .astryx-badge-dot {
+  background: var(--color-warning);
+}
+
+.astryx-badge[data-state="err"] .astryx-badge-dot {
+  background: var(--color-error);
+}
+
+.astryx-badge[data-state="info"] .astryx-badge-dot {
+  background: var(--color-info);
+}
+
+/* ============================================================================
+ * Astryx Button (`astryx-button`) — Borderless pill matching astryx.atmeta.com
+ * ========================================================================== */
+
+.astryx-button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--size-element-sm);
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--radius-full);
+  font-family: var(--font-family-body);
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
+}
+
+.astryx-button:focus-visible {
+  outline: var(--focus-outline-width) solid var(--color-accent);
+  outline-offset: var(--focus-outline-offset);
+}
+
+.astryx-button[data-size="xs"] {
+  height: var(--size-element-xs);
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.astryx-button[data-variant="primary"] {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+
+.astryx-button[data-variant="primary"]:hover {
+  background: #ffffff;
+}
+
+.astryx-button[data-variant="primary"]:active {
+  background: #c8cdd2;
+}
+
+.astryx-button[data-variant="secondary"] {
+  background: var(--color-neutral);
+  color: var(--color-text-primary);
+}
+
+.astryx-button[data-variant="secondary"]:hover {
+  background: var(--color-neutral-hover);
+}
+
+.astryx-button[data-variant="secondary"]:active {
+  background: var(--color-neutral-pressed);
+}
+
+.astryx-button[data-variant="ghost"] {
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.astryx-button[data-variant="ghost"]:hover {
+  background: var(--color-overlay-hover);
+  color: var(--color-text-primary);
+}
+
+.astryx-button[data-variant="ghost"]:active {
+  background: var(--color-overlay-pressed);
+}
+
+/* Stateful toggles (active Smoke Demo / active GPU Trace recording) */
+.astryx-button[data-active="true"] {
+  background: var(--color-background-green);
+  color: var(--color-text-green);
+}
+
+.astryx-button[data-recording="true"] {
+  background: var(--color-error-muted);
+  color: var(--color-on-error-muted);
+}
+
+/* ============================================================================
+ * HUD Body Layout — Open spacing, zero dividers
+ * ========================================================================== */
+
+#hud-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 14px 12px;
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+}
+
+#hud-body::-webkit-scrollbar,
+#hud-log::-webkit-scrollbar {
+  width: 5px;
+}
+
+#hud-body::-webkit-scrollbar-thumb,
+#hud-log::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-full);
+}
+
+/* ============================================================================
+ * Astryx Banner (Conditional — only shown for missing required caps or GPU errors)
+ * ========================================================================== */
+
+.astryx-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-2);
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-element);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: var(--font-weight-medium);
+}
+
+.astryx-banner[hidden] {
+  display: none !important;
+}
+
+.astryx-banner[data-status="warning"] {
+  background: var(--color-warning-muted);
+  color: var(--color-on-warning-muted);
+}
+
+.astryx-banner[data-status="error"] {
+  background: var(--color-error-muted);
+  color: var(--color-on-error-muted);
+}
+
+.astryx-banner-text {
+  min-width: 0;
+  word-break: break-word;
+}
+
+/* ============================================================================
+ * Section 2: Boot Progress Row (Astryx ProgressBar)
+ * ========================================================================== */
+
+.hud-boot-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hud-boot-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+}
+
+.hud-boot-stage-group {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+#hud-boot-stage {
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-strong);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+#hud-status {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+#hud-boot-elapsed {
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.astryx-progress-bar-track {
+  width: 100%;
+  height: 4px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--color-track);
+  overflow: hidden;
+}
+
+.astryx-progress-bar-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: var(--radius-full);
+  background: var(--color-accent);
+  transition:
+    width 180ms var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+.astryx-progress-bar-fill[data-state="ok"] {
+  background: var(--color-success);
+}
+
+.astryx-progress-bar-fill[data-state="warn"] {
+  background: var(--color-warning);
+}
+
+.astryx-progress-bar-fill[data-state="err"] {
+  background: var(--color-error);
+}
+
+/* Split-module status line — hidden when 0 side modules are configured */
+.hud-side-modules {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hud-side-modules[data-total="0"][data-loaded="0"],
+#hud.collapsed .hud-side-modules {
+  display: none;
+}
+
+.hud-side-modules[data-state="info"] {
+  color: var(--color-text-secondary);
+}
+
+.hud-side-modules[data-state="ok"] {
+  color: var(--color-text-green);
+}
+
+/* ============================================================================
+ * Section 3: Compact 3-Metric Row (Frames · FPS · GPU Errors) — Borderless tonal strip
+ * ========================================================================== */
+
+.hud-metrics-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.hud-metric-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-element);
+  background: var(--color-background-muted);
+  min-width: 0;
+}
+
+.hud-metric-label {
+  font-size: 10.5px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.hud-metric-value {
+  font-family: var(--font-family-code);
+  font-size: 13px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-strong);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hud-metric-value[data-state="ok"] {
+  color: var(--color-text-strong);
+}
+
+.hud-metric-value[data-state="warn"] {
+  color: var(--color-text-yellow);
+}
+
+.hud-metric-value[data-state="err"],
+.hud-gpu-errors[data-state="err"] {
+  color: var(--color-text-red);
+}
+
+.hud-metric-value[data-state="info"] {
+  color: var(--color-text-strong);
+}
+
+/* ============================================================================
+ * Section 4: Primary Actions + Compact Collapsible Log
+ * ========================================================================== */
+
+.hud-primary-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-2);
+}
+
+.hud-primary-actions .astryx-button {
+  width: 100%;
+}
+
+/* ============================================================================
+ * Astryx Collapsible / Disclosure (`<details class="astryx-collapsible">`)
+ * ========================================================================== */
+
+.astryx-collapsible {
+  width: 100%;
+}
+
+.astryx-collapsible-trigger {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  width: 100%;
+  padding: 6px 8px;
+  margin: 0 -8px;
+  width: calc(100% + 16px);
+  border: none;
+  border-radius: var(--radius-inner);
+  cursor: pointer;
+  font-family: var(--font-family-body);
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.astryx-collapsible-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.astryx-collapsible-trigger:hover {
+  background: var(--color-overlay-hover);
+}
+
+.astryx-collapsible-trigger:focus-visible {
+  outline: var(--focus-outline-width) solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.astryx-collapsible-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.astryx-collapsible-trailing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.astryx-collapsible-count {
+  font-family: var(--font-family-code);
+  font-size: 10.5px;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.astryx-chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+.astryx-collapsible[open] > .astryx-collapsible-trigger .astryx-chevron {
+  transform: rotate(180deg);
+}
+
+.astryx-collapsible-content {
+  padding: 6px 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+#hud-log-disclosure:not([open]) #hud-clear-log {
+  display: none;
+}
+
+.diag-group:has(#gpu-boot-panel-root:empty) {
+  display: none;
+}
+
+/* ============================================================================
+ * Compact Monospace Log (5-line viewport) — Borderless tonal recess
+ * ========================================================================== */
+
+#hud-log {
+  margin: 0;
+  padding: 8px 10px;
+  height: 86px;
+  overflow-y: auto;
+  border: none;
+  border-radius: var(--radius-element);
+  background: var(--color-background-recessed);
+  font-family: var(--font-family-code);
+  font-size: 10.5px;
+  line-height: 1.45;
+  user-select: text;
+}
+
+.log-entry {
+  display: flex;
+  gap: 6px;
+  word-break: break-word;
+  padding: 1px 0;
+}
+
+.log-time {
+  color: var(--color-text-disabled);
+  flex-shrink: 0;
+}
+
+.log-msg {
+  color: var(--color-text-primary);
+  white-space: pre-wrap;
+}
+
+.log-entry[data-level="ok"] .log-msg {
+  color: var(--color-text-green);
+}
+
+.log-entry[data-level="warn"] .log-msg {
+  color: var(--color-text-yellow);
+}
+
+.log-entry[data-level="error"] .log-msg {
+  color: var(--color-text-red);
+}
+
+/* ============================================================================
+ * Diagnostics & Tools Disclosure Content — Borderless tonal groups
+ * ========================================================================== */
+
+.diag-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.diag-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+}
+
+.badge-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-element);
+  background: var(--color-background-muted);
+}
+
+.kv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  padding: 3px 0;
+}
+
+.kv-label {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+
+.kv-value {
+  font-family: var(--font-family-code);
+  font-size: 11px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.kv-value[data-state="ok"] {
+  color: var(--color-text-green);
+}
+
+.kv-value[data-state="warn"] {
+  color: var(--color-text-yellow);
+}
+
+.kv-value[data-state="err"] {
+  color: var(--color-text-red);
+}
+
+.kv-value[data-state="info"] {
+  color: var(--color-text-blue);
+}
+
+.controls-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.controls-grid .astryx-button {
+  width: 100%;
+  padding: 0 8px;
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-2);
+  padding: 6px 10px;
+  border: none;
+  border-radius: var(--radius-element);
+  background: var(--color-background-muted);
+}
+
+.astryx-select {
+  flex: 1;
+  min-width: 0;
+  height: var(--size-element-xs);
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-inner);
+  background: var(--color-background-popover);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.astryx-select:focus-visible {
+  outline: var(--focus-outline-width) solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* ============================================================================
+ * GPU Boot & Shaders Panel — Borderless Astryx Token Integration
+ * ========================================================================== */
+
+#gpu-boot-panel-root {
+  width: 100%;
+  border: none;
+  border-radius: var(--radius-element);
+  background: var(--color-background-muted);
+  overflow: hidden;
+}
+
+#gpu-boot-panel-root:empty {
+  display: none;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel {
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  font-size: 11px;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__header {
+  background: transparent;
+  border-bottom: none;
+  padding: 8px 10px 4px;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__title {
+  font-family: var(--font-family-heading);
+  font-size: 11px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__summary-badge {
+  background: var(--color-neutral);
+  color: var(--color-text-gray);
+  font-size: 10px;
+  border-radius: var(--radius-full);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__btn {
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--color-neutral);
+  color: var(--color-text-primary);
+  font-family: var(--font-family-body);
+  font-size: 10.5px;
+  font-weight: var(--font-weight-medium);
+  padding: 3px 9px;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__btn:hover {
+  background: var(--color-neutral-hover);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__body {
+  padding: 6px 10px 10px;
+  gap: 8px;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__section-title,
+#gpu-boot-panel-root .pg6-gpu-panel__metric-label,
+#gpu-boot-panel-root .pg6-gpu-panel__table th,
+#gpu-boot-panel-root .pg6-gpu-panel__empty-cell {
+  color: var(--color-text-secondary);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__metric {
+  background: var(--color-background-recessed);
+  border: none;
+  border-radius: var(--radius-inner);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__metric-value {
+  font-family: var(--font-family-code);
+  color: var(--color-text-strong);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__table th,
+#gpu-boot-panel-root .pg6-gpu-panel__table td {
+  border-bottom: none;
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__progress-bar {
+  height: 4px;
+  background: var(--color-track);
+}
+
+#gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
+  background: var(--color-accent);
+}
