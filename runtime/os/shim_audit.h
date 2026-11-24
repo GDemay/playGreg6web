@@ -379,7 +379,7 @@
     X(pg6_mw_ffx_create_context, ok, "synthetic context handle; ignores the allocation callbacks") \
     X(pg6_mw_ffx_destroy_context, ok, "") \
     X(pg6_mw_ffx_dispatch, ok, "no-op") \
-    X(pg6_mw_ffx_query, deny, "reports FFX_OK without writing any query output (callers read uninitialised out-fields)") \
+    X(pg6_mw_ffx_query, ok, "answers GetJitterPhaseCount (pure function of the widths); every other query fails and writes nothing") \
     /* ---- XboxBvhBuilder (C++ members: this in rcx) ---- */ \
     X(pg6_mw_bvh_builder_ctor, ok, "returns this (MSVC constructor convention)") \
     X(pg6_mw_bvh_builder_dtor, ok, "") \
