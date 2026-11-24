@@ -311,6 +311,7 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::R8_UINT: return color(F::R8Uint);
         case D::R8_SNORM: return color(F::R8Snorm);
         case D::R8_SINT: return color(F::R8Sint);
+        case D::A8_UNORM: return color(F::R8Unorm);
         case D::R9G9B9E5_SHAREDEXP: return color(F::Rgb9e5Ufloat);
         case D::BC1_TYPELESS: return typeless_color(F::Bc1RgbaUnorm);
         case D::BC1_UNORM: return color(F::Bc1RgbaUnorm);
@@ -346,7 +347,7 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::BC7_UNORM: return color(F::Bc7RgbaUnorm);
         case D::BC7_UNORM_SRGB: return color(F::Bc7RgbaUnormSrgb);
         default:
-            // UNKNOWN, 3-component 32-bit formats, A8, R1, packed 4:2:2, B5G6R5/B5G5R5A1/B4G4R4A4,
+            // UNKNOWN, 3-component 32-bit formats, R1, packed 4:2:2, B5G6R5/B5G5R5A1/B4G4R4A4,
             // XR_BIAS and video formats: no WebGPU equivalent.
             return r;
     }

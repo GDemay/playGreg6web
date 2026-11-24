@@ -364,12 +364,39 @@ void test_formats() {
     CHECK(hardware_format(26, &f) && f.format == 36);   // R11G11B10_FLOAT -> 10_11_11_FLOAT
     CHECK(hardware_format(98, &f) && f.format == 181);  // BC7_UNORM
     CHECK(hardware_format(2, &f) && f.format == 77);    // R32G32B32A32_FLOAT
+    CHECK(hardware_format(61, &f) && f.format == 1 &&
+          f.swizzle == (Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}));  // R8_UNORM -> 8_UNORM (X,0,0,1)
+    CHECK(hardware_format(65, &f) && f.format == 1 &&
+          f.swizzle == (Swizzle{Sel::Zero, Sel::Zero, Sel::Zero, Sel::X}));  // A8_UNORM -> 8_UNORM (0,0,0,X)
     CHECK(!hardware_format(100, &f));                   // video format
     bool exact = false;
     CHECK(dxgi_format(56, Swizzle{Sel::Z, Sel::Y, Sel::X, Sel::W}, &exact) == 87 && exact);
     CHECK(dxgi_format(56, kIdentitySwizzle, &exact) == 28 && exact);
     CHECK(dxgi_format(56, Swizzle{Sel::W, Sel::Z, Sel::Y, Sel::X}, &exact) == 28 && !exact);
+    CHECK(dxgi_format(1, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 61 && exact);
+    CHECK(dxgi_format(1, Swizzle{Sel::Zero, Sel::Zero, Sel::Zero, Sel::X}, &exact) == 65 && exact);
+    CHECK(dxgi_format(1, kIdentitySwizzle, &exact) == 61 && !exact);
     CHECK(dxgi_format(200, kIdentitySwizzle, &exact) == 0 && !exact);
+    // A8_UNORM (65) T# image descriptor encode/decode round-trip preserves distinct DXGI format 65.
+    {
+        HardwareFormat a8;
+        CHECK(hardware_format(65, &a8));
+        ImageResource img;
+        img.base = 0x0000'0001'0002'0000ull;
+        img.format = a8.format;
+        img.width = 256;
+        img.height = 128;
+        img.dst_sel = compose_component_mapping(a8.swizzle, 0x1688u);
+        img.type = ImageType::Tex2D;
+        uint32_t words[kImageDwords] = {};
+        encode(img, words);
+        CHECK(plausible_image(words));
+        CHECK(classify_slot(words) == SlotContent::Image);
+        const ImageResource dec = decode_image(words);
+        CHECK(dec.format == 1u && dec.dst_sel == (Swizzle{Sel::Zero, Sel::Zero, Sel::Zero, Sel::X}));
+        bool a8_exact = false;
+        CHECK(dxgi_format(dec.format, dec.dst_sel, &a8_exact) == 65u && a8_exact);
+    }
     // Every DXGI format of the table maps to a hardware format that maps back to a DXGI format with
     // the same hardware format.
     for (uint32_t dxgi = 1; dxgi < 120; ++dxgi) {
