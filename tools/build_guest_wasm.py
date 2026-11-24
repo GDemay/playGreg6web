@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -9,7 +9,9 @@ C/C++ units), and links with `libplaygta6_core.a` into `web/dist/runtime.js` +
 `web/dist/runtime.wasm` (optionally splitting `.ll` shards and `functions.ll`
 registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC`,
 `-sMAIN_MODULE=1`, filtered whole-archive, runtime `Module.dynamicLibraries` loading,
-and post-link V8-cage GC + throttled pthread `CMD_LOAD` JS optimization).
+post-link V8-cage GC + throttled pthread `CMD_LOAD` JS optimization, auto-detected
+`Pg6ShardDispatchTable` shard-dispatch support, pure-Python Wasm section telemetry,
+and `guest_manifest.json` emission).
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -26,8 +28,9 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--split-strategy balanced|contiguous] [--proxy-to-pthread]
         [--max-concurrent-pthread-loads N] [--node-max-old-space-mb MB]
         [--pthread-pool-size N] [--extra-link-flag FLAG]
-        [--response-file] [--sample N] [--link-guest-boot]
-        [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
+        [--verify-max-table-imports N] [--response-file] [--sample N]
+        [--link-guest-boot] [--dry-run] [--check-only] [--verify]
+        [--json] [--sanitize]
 """
 
 from __future__ import annotations
@@ -36,10 +39,12 @@ import argparse
 from bisect import bisect_left, bisect_right
 import hashlib
 import inspect
+import io
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -47,7 +52,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Mapping, Sequence
 
 SCHEMA_VERSION = 1
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +62,7 @@ DEFAULT_RUNTIME_LIB_REL = Path("runtime") / "build-wasm64" / "libplaygta6_core.a
 EMSDK_UPSTREAM_REL = Path("work") / "emsdk" / "upstream" / "emscripten"
 RUNTIME_JS = "runtime.js"
 RUNTIME_WASM = "runtime.wasm"
+GUEST_MANIFEST_FILE = "guest_manifest.json"
 BUILD_MANIFEST_FILE = "build-manifest.json"
 PROGRAM_MANIFEST_FILE = "program-manifest.json"
 RESPONSE_FILE_NAME = "link_objects.rsp"
@@ -167,6 +173,27 @@ PROXY_TO_PTHREAD_FLAG = "-sPROXY_TO_PTHREAD=1"
 DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2
 SPLIT_PTHREAD_OPT_MARKER = "/* __playgta6_split_pthread_opt_v1__ */"
 
+# Shard-level indirect-call dispatch (R37: Pg6ShardDispatchTable).
+INDIRECT_DISPATCH_MODES: frozenset[str] = frozenset({"table", "shard"})
+DEFAULT_INDIRECT_DISPATCH = "table"
+SHARD_DISPATCH_FN_PREFIX = "__playgta6_dispatch_shard_"
+SHARD_DISPATCH_TABLE_PREFIX = "__playgta6_shard_dispatch_"
+LEGACY_TABLE_BASELINE_ENTRIES = 437_813
+
+# Pure-Python WebAssembly binary inspection constants (Wasm Core + Memory64 + dylink.0).
+WASM_MAGIC = b"\x00asm"
+WASM_VERSION = 1
+WASM_SECTION_CUSTOM = 0
+WASM_SECTION_IMPORT = 2
+WASM_SECTION_TABLE = 4
+WASM_SECTION_EXPORT = 7
+WASM_KNOWN_SECTION_IDS: frozenset[int] = frozenset(range(0, 14))
+WASM_DYLINK_MEM_INFO = 1
+WASM_REFTYPE_FUNCREF = 0x70
+WASM_LIMITS_FLAG_HAS_MAX = 0x01
+WASM_LIMITS_FLAG_MEMORY64 = 0x04
+WASM_TABLE_EXTENDED_PREFIX = 0x40
+
 VERIFY_FLAGS: tuple[str, ...] = (
     "--require-memory64",
     "--require-shared-memory",
@@ -201,6 +228,210 @@ WhichFn = Callable[[str], str | None]
 
 class BuildGuestWasmError(Exception):
     """Raised for user-facing configuration or discovery failures."""
+
+
+class WasmInspectError(ValueError):
+    """Raised when a linked WebAssembly binary is truncated or malformed."""
+
+
+@dataclass(frozen=True)
+class IndirectDispatchDetection:
+    """Result of auto-detecting `table` vs `shard` indirect-call dispatch mode."""
+
+    mode: str  # "table" | "shard"
+    source: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "mode": self.mode,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
+class WasmModuleMetrics:
+    """Numeric-only post-link section metrics for one built `.wasm` module."""
+
+    name: str
+    role: str  # "main" | "side"
+    wasm_bytes: int
+    func_imports: int = 0
+    got_func_imports: int = 0
+    got_mem_imports: int = 0
+    func_exports: int = 0
+    table_size: int = 0
+    defined_table_size: int = 0
+    dylink_table_size: int | None = None
+    dylink_memory_size: int | None = None
+    has_dylink: bool = False
+    shard_dispatch_exports: int = 0
+    shard_table_exports: int = 0
+    sub_func_exports: int = 0
+    sub_func_imports: int = 0
+    got_func_sub_imports: int = 0
+    got_func_shard_dispatch_imports: int = 0
+
+    @property
+    def size_mib(self) -> float:
+        return round(self.wasm_bytes / (1024 * 1024), 4)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "role": self.role,
+            "wasm_bytes": self.wasm_bytes,
+            "size_mib": self.size_mib,
+            "func_imports": self.func_imports,
+            "got_func_imports": self.got_func_imports,
+            "got_mem_imports": self.got_mem_imports,
+            "func_exports": self.func_exports,
+            "table_size": self.table_size,
+            "defined_table_size": self.defined_table_size,
+            "dylink_table_size": self.dylink_table_size,
+            "dylink_memory_size": self.dylink_memory_size,
+            "has_dylink": self.has_dylink,
+            "shard_dispatch_exports": self.shard_dispatch_exports,
+            "shard_table_exports": self.shard_table_exports,
+            "sub_func_exports": self.sub_func_exports,
+            "sub_func_imports": self.sub_func_imports,
+            "got_func_sub_imports": self.got_func_sub_imports,
+            "got_func_shard_dispatch_imports": self.got_func_shard_dispatch_imports,
+        }
+
+    def to_manifest_dict(self) -> dict[str, Any]:
+        """CamelCase numeric-only module metrics for `guest_manifest.json`."""
+        return {
+            "name": self.name,
+            "role": self.role,
+            "wasmBytes": self.wasm_bytes,
+            "sizeMiB": self.size_mib,
+            "funcImports": self.func_imports,
+            "gotFuncImports": self.got_func_imports,
+            "gotMemImports": self.got_mem_imports,
+            "funcExports": self.func_exports,
+            "tableSize": self.table_size,
+            "definedTableSize": self.defined_table_size,
+            "dylinkTableSize": self.dylink_table_size,
+            "dylinkMemorySize": self.dylink_memory_size,
+            "hasDylink": self.has_dylink,
+            "shardDispatchExports": self.shard_dispatch_exports,
+            "shardTableExports": self.shard_table_exports,
+            "subFuncExports": self.sub_func_exports,
+            "subFuncImports": self.sub_func_imports,
+            "gotFuncSubImports": self.got_func_sub_imports,
+            "gotFuncShardDispatchImports": self.got_func_shard_dispatch_imports,
+        }
+
+
+@dataclass(frozen=True)
+class WasmBuildMetrics:
+    """Aggregate post-link Wasm section metrics across main + all side modules."""
+
+    indirect_dispatch: str
+    modules: tuple[WasmModuleMetrics, ...]
+
+    @property
+    def total_wasm_bytes(self) -> int:
+        return sum(m.wasm_bytes for m in self.modules)
+
+    @property
+    def total_size_mib(self) -> float:
+        return round(self.total_wasm_bytes / (1024 * 1024), 4)
+
+    @property
+    def total_func_imports(self) -> int:
+        return sum(m.func_imports for m in self.modules)
+
+    @property
+    def total_got_func_imports(self) -> int:
+        return sum(m.got_func_imports for m in self.modules)
+
+    @property
+    def total_got_mem_imports(self) -> int:
+        return sum(m.got_mem_imports for m in self.modules)
+
+    @property
+    def total_func_exports(self) -> int:
+        return sum(m.func_exports for m in self.modules)
+
+    @property
+    def main_table_size(self) -> int:
+        return sum(m.table_size for m in self.modules if m.role == "main")
+
+    @property
+    def side_table_size(self) -> int:
+        return sum(m.table_size for m in self.modules if m.role == "side")
+
+    @property
+    def total_table_size(self) -> int:
+        return self.main_table_size + self.side_table_size
+
+    @property
+    def side_module_count(self) -> int:
+        return sum(1 for m in self.modules if m.role == "side")
+
+    @property
+    def shard_dispatch_exports(self) -> int:
+        return sum(m.shard_dispatch_exports for m in self.modules)
+
+    @property
+    def shard_table_exports(self) -> int:
+        return sum(m.shard_table_exports for m in self.modules)
+
+    @property
+    def got_func_sub_imports(self) -> int:
+        return sum(m.got_func_sub_imports for m in self.modules)
+
+    @property
+    def got_func_shard_dispatch_imports(self) -> int:
+        return sum(m.got_func_shard_dispatch_imports for m in self.modules)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "indirect_dispatch": self.indirect_dispatch,
+            "modules": [m.to_dict() for m in self.modules],
+            "totals": {
+                "module_count": len(self.modules),
+                "side_module_count": self.side_module_count,
+                "wasm_bytes": self.total_wasm_bytes,
+                "size_mib": self.total_size_mib,
+                "func_imports": self.total_func_imports,
+                "got_func_imports": self.total_got_func_imports,
+                "got_mem_imports": self.total_got_mem_imports,
+                "func_exports": self.total_func_exports,
+                "table_size": self.total_table_size,
+                "main_table_size": self.main_table_size,
+                "side_table_size": self.side_table_size,
+                "shard_dispatch_exports": self.shard_dispatch_exports,
+                "shard_table_exports": self.shard_table_exports,
+                "got_func_sub_imports": self.got_func_sub_imports,
+                "got_func_shard_dispatch_imports": self.got_func_shard_dispatch_imports,
+            },
+        }
+
+    def to_manifest_dict(self) -> dict[str, Any]:
+        """CamelCase numeric-only summary for `guest_manifest.json`."""
+        return {
+            "indirectDispatch": self.indirect_dispatch,
+            "modules": [m.to_manifest_dict() for m in self.modules],
+            "totals": {
+                "moduleCount": len(self.modules),
+                "sideModuleCount": self.side_module_count,
+                "wasmBytes": self.total_wasm_bytes,
+                "sizeMiB": self.total_size_mib,
+                "funcImports": self.total_func_imports,
+                "gotFuncImports": self.total_got_func_imports,
+                "gotMemImports": self.total_got_mem_imports,
+                "funcExports": self.total_func_exports,
+                "tableSize": self.total_table_size,
+                "mainTableSize": self.main_table_size,
+                "sideTableSize": self.side_table_size,
+                "shardDispatchExports": self.shard_dispatch_exports,
+                "shardTableExports": self.shard_table_exports,
+                "gotFuncSubImports": self.got_func_sub_imports,
+                "gotFuncShardDispatchImports": self.got_func_shard_dispatch_imports,
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -310,17 +541,21 @@ class SideModuleResult:
     link_argv: tuple[str, ...] = ()
     wasm_bytes: int = 0
     exceeds_v8_1gib_limit: bool = False
+    role: str = "shards"  # "shards" | "registration"
+    wasm_metrics: WasmModuleMetrics | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "index": self.index,
             "name": self.name,
+            "role": self.role,
             "shard_count": len(self.shards),
             "shards": list(self.shards),
             "response_file": self.response_file,
             "link_argv": list(self.link_argv),
             "wasm_bytes": self.wasm_bytes,
             "exceeds_v8_1gib_limit": self.exceeds_v8_1gib_limit,
+            "wasm_metrics": self.wasm_metrics.to_dict() if self.wasm_metrics is not None else None,
         }
 
 
@@ -364,6 +599,11 @@ class BuildReport:
     proxy_to_pthread: bool = False
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS
     split_runtime_js_patches: dict[str, bool] | None = None
+    indirect_dispatch: str = DEFAULT_INDIRECT_DISPATCH
+    indirect_dispatch_source: str = "default"
+    verify_max_table_imports: int | None = None
+    guest_manifest: str | None = None
+    wasm_metrics: WasmBuildMetrics | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -391,6 +631,11 @@ class BuildReport:
                 if self.split_runtime_js_patches is not None
                 else None
             ),
+            "indirect_dispatch": self.indirect_dispatch,
+            "indirect_dispatch_source": self.indirect_dispatch_source,
+            "verify_max_table_imports": self.verify_max_table_imports,
+            "guest_manifest": self.guest_manifest,
+            "wasm_metrics": self.wasm_metrics.to_dict() if self.wasm_metrics is not None else None,
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -727,6 +972,16 @@ def parse_max_concurrent_pthread_loads(raw: int) -> int:
         raise BuildGuestWasmError(
             f"invalid --max-concurrent-pthread-loads {raw!r}; "
             "expected an integer >= 0 (0 disables throttling)"
+        )
+    return raw
+
+
+def parse_verify_max_table_imports(raw: int | None) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise BuildGuestWasmError(
+            f"invalid --verify-max-table-imports {raw!r}; expected an integer >= 0"
         )
     return raw
 
@@ -1415,6 +1670,194 @@ def is_program_build(source_root: Path, units: Sequence[SourceUnit]) -> bool:
     return False
 
 
+def _normalize_dispatch_token(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    token = raw.strip().lower()
+    if token in INDIRECT_DISPATCH_MODES:
+        return token
+    return None
+
+
+def _extract_manifest_indirect_dispatch(data: Any) -> str | None:
+    """Inspect a `program-manifest.json` or `build-manifest.json` object for dispatch mode."""
+    if not isinstance(data, Mapping):
+        return None
+
+    direct = _normalize_dispatch_token(data.get("indirect_dispatch"))
+    if direct is not None:
+        return direct
+
+    options = data.get("options")
+    if isinstance(options, Mapping):
+        opt_mode = _normalize_dispatch_token(options.get("indirect_dispatch"))
+        if opt_mode is not None:
+            return opt_mode
+
+    lift = data.get("lift")
+    if isinstance(lift, Mapping):
+        lift_mode = _normalize_dispatch_token(lift.get("indirect_dispatch"))
+        if lift_mode is not None:
+            return lift_mode
+        reg = lift.get("registration")
+        if isinstance(reg, Mapping):
+            for key in ("indirect_dispatch", "mode"):
+                reg_mode = _normalize_dispatch_token(reg.get(key))
+                if reg_mode is not None:
+                    return reg_mode
+            for key in ("symbol", "table", "shard_dispatch", "shard_dispatch_symbol"):
+                sym = reg.get(key)
+                if isinstance(sym, str) and sym.startswith(SHARD_DISPATCH_TABLE_PREFIX):
+                    return "shard"
+
+    modules = data.get("modules")
+    if isinstance(modules, list):
+        seen_table = False
+        for mod in modules:
+            if not isinstance(mod, Mapping):
+                continue
+            mod_mode = _normalize_dispatch_token(mod.get("indirect_dispatch"))
+            if mod_mode == "shard":
+                return "shard"
+            if mod_mode == "table":
+                seen_table = True
+            for key in (
+                "shard_dispatch",
+                "shard_dispatch_symbol",
+                "shard_dispatch_table",
+                "registration_symbol",
+            ):
+                sym = mod.get(key)
+                if isinstance(sym, str) and sym.startswith(SHARD_DISPATCH_TABLE_PREFIX):
+                    return "shard"
+        if seen_table:
+            return "table"
+
+    return None
+
+
+def _file_head_tail_contains(
+    path: Path,
+    needles: Sequence[bytes],
+    *,
+    window_bytes: int = 262_144,
+) -> bool:
+    """Check head and tail slices of a file for any marker without loading huge IR files."""
+    if not path.is_file():
+        return False
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size <= window_bytes * 2:
+                blob = fh.read()
+                return any(needle in blob for needle in needles)
+            head = fh.read(window_bytes)
+            if any(needle in head for needle in needles):
+                return True
+            fh.seek(max(0, size - window_bytes))
+            tail = fh.read(window_bytes)
+            return any(needle in tail for needle in needles)
+    except OSError:
+        return False
+
+
+def detect_indirect_dispatch(
+    source_root: Path,
+    units: Sequence[SourceUnit],
+    *,
+    manifest_path: Path | None = None,
+) -> IndirectDispatchDetection:
+    """Auto-detect `shard` (`Pg6ShardDispatchTable`) vs legacy `table` indirect dispatch.
+
+    Checks in deterministic order:
+      1. `program-manifest.json` (`indirect_dispatch`, `options.indirect_dispatch`, or module entries).
+      2. Root and per-module `build-manifest.json`.
+      3. `pg6_program.cpp` (`__playgta6_shard_dispatch_` or `Pg6ShardDispatchTable`).
+      4. `functions.ll` registration units (`__playgta6_shard_dispatch_` / `__playgta6_dispatch_shard_`).
+      5. Sampled `shard-*.ll` units (`__playgta6_dispatch_shard_`).
+      6. Fallback: `"table"` (legacy).
+    """
+    prog_manifest = (
+        manifest_path
+        if manifest_path is not None and manifest_path.name == PROGRAM_MANIFEST_FILE
+        else (source_root / PROGRAM_MANIFEST_FILE)
+    )
+    if prog_manifest.is_file():
+        try:
+            prog_data = load_build_manifest(prog_manifest)
+        except (OSError, json.JSONDecodeError):
+            prog_data = None
+        prog_mode = _extract_manifest_indirect_dispatch(prog_data)
+        if prog_mode is not None:
+            return IndirectDispatchDetection(mode=prog_mode, source=PROGRAM_MANIFEST_FILE)
+
+    build_manifests: list[Path] = []
+    if manifest_path is not None and manifest_path.name == BUILD_MANIFEST_FILE:
+        build_manifests.append(manifest_path)
+    root_build_manifest = source_root / BUILD_MANIFEST_FILE
+    if root_build_manifest.is_file() and root_build_manifest not in build_manifests:
+        build_manifests.append(root_build_manifest)
+    seen_mod_dirs: set[str] = set()
+    for unit in units:
+        mod = unit.module
+        if not mod or mod in {"program", "boot"} or mod in seen_mod_dirs:
+            continue
+        seen_mod_dirs.add(mod)
+        mod_manifest = source_root / mod / BUILD_MANIFEST_FILE
+        if mod_manifest.is_file() and mod_manifest not in build_manifests:
+            build_manifests.append(mod_manifest)
+
+    saw_build_table = False
+    for bm_path in build_manifests:
+        try:
+            bm_data = load_build_manifest(bm_path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        bm_mode = _extract_manifest_indirect_dispatch(bm_data)
+        if bm_mode == "shard":
+            return IndirectDispatchDetection(mode="shard", source=BUILD_MANIFEST_FILE)
+        if bm_mode == "table":
+            saw_build_table = True
+    if saw_build_table:
+        return IndirectDispatchDetection(mode="table", source=BUILD_MANIFEST_FILE)
+
+    program_cpp_paths: list[Path] = [
+        unit.path
+        for unit in units
+        if Path(unit.unit_id.replace("\\", "/")).name == "pg6_program.cpp"
+    ]
+    root_prog_cpp = source_root / "pg6_program.cpp"
+    if root_prog_cpp.is_file() and root_prog_cpp.resolve() not in {p.resolve() for p in program_cpp_paths}:
+        program_cpp_paths.append(root_prog_cpp)
+    for cpp_path in program_cpp_paths:
+        if _file_head_tail_contains(
+            cpp_path,
+            (SHARD_DISPATCH_TABLE_PREFIX.encode("ascii"), b"Pg6ShardDispatchTable"),
+        ):
+            return IndirectDispatchDetection(mode="shard", source="pg6_program.cpp")
+
+    reg_needles = (
+        SHARD_DISPATCH_TABLE_PREFIX.encode("ascii"),
+        SHARD_DISPATCH_FN_PREFIX.encode("ascii"),
+    )
+    for unit in units:
+        if is_registration_unit(unit) and _file_head_tail_contains(unit.path, reg_needles):
+            return IndirectDispatchDetection(mode="shard", source="functions.ll")
+
+    shard_needles = (SHARD_DISPATCH_FN_PREFIX.encode("ascii"),)
+    checked_shards = 0
+    for unit in units:
+        if not is_shard_unit(unit):
+            continue
+        if _file_head_tail_contains(unit.path, shard_needles):
+            return IndirectDispatchDetection(mode="shard", source="shard-ir")
+        checked_shards += 1
+        if checked_shards >= 4:
+            break
+
+    return IndirectDispatchDetection(mode=DEFAULT_INDIRECT_DISPATCH, source="default")
+
+
 def _format_rsp_path(item: Path | str) -> str:
     """Normalize a response-file object path to POSIX slashes; quote if it contains whitespace."""
     normalized = str(item).replace("\\", "/")
@@ -2048,6 +2491,517 @@ def patch_split_runtime_js_file(
 
 
 # ---------------------------------------------------------------------------
+# Pure-Python Wasm binary section inspector & guest_manifest.json writer (R37d)
+# ---------------------------------------------------------------------------
+
+
+class _WasmStreamCursor:
+    """Bounds-checked binary cursor over a stream slice (`BinaryIO` or `BytesIO`)."""
+
+    __slots__ = ("_fh", "_pos", "_end")
+
+    def __init__(self, fh: BinaryIO, start: int, end: int) -> None:
+        self._fh = fh
+        self._pos = start
+        self._end = end
+        self._fh.seek(start)
+
+    @property
+    def pos(self) -> int:
+        return self._pos
+
+    @property
+    def remaining(self) -> int:
+        return self._end - self._pos
+
+    def skip(self, length: int, *, context: str = "bytes") -> None:
+        if length < 0 or self._pos + length > self._end:
+            raise WasmInspectError(
+                f"truncated {context}: need {length} bytes, only {self.remaining} available"
+            )
+        self._pos += length
+        self._fh.seek(self._pos)
+
+    def read_bytes(self, length: int, *, context: str = "bytes") -> bytes:
+        if length < 0 or self._pos + length > self._end:
+            raise WasmInspectError(
+                f"unexpected EOF reading {context}: need {length} bytes, only {self.remaining} available"
+            )
+        data = self._fh.read(length)
+        if len(data) != length:
+            raise WasmInspectError(
+                f"short read for {context}: expected {length} bytes, got {len(data)}"
+            )
+        self._pos += length
+        return data
+
+    def read_u8(self, *, context: str = "u8") -> int:
+        return self.read_bytes(1, context=context)[0]
+
+    def read_uleb128(self, *, max_bits: int, context: str = "u32") -> int:
+        result = 0
+        shift = 0
+        max_bytes = (max_bits + 6) // 7
+        for idx in range(max_bytes):
+            byte = self.read_u8(context=f"ULEB128 {context}")
+            if idx == max_bytes - 1:
+                if byte & 0x80:
+                    raise WasmInspectError(f"overlong ULEB128 {context}")
+                remaining_bits = max_bits - shift
+                overflow_mask = ~((1 << remaining_bits) - 1) & 0x7F
+                if byte & overflow_mask:
+                    raise WasmInspectError(f"ULEB128 {context} overflows {max_bits} bits")
+            result |= (byte & 0x7F) << shift
+            if (byte & 0x80) == 0:
+                return result
+            shift += 7
+        raise WasmInspectError(f"overlong ULEB128 {context}")
+
+    def read_sleb128(self, *, max_bits: int, context: str = "s33") -> int:
+        result = 0
+        shift = 0
+        max_bytes = (max_bits + 6) // 7
+        for idx in range(max_bytes):
+            byte = self.read_u8(context=f"SLEB128 {context}")
+            if idx == max_bytes - 1 and (byte & 0x80):
+                raise WasmInspectError(f"overlong SLEB128 {context}")
+            result |= (byte & 0x7F) << shift
+            shift += 7
+            if (byte & 0x80) == 0:
+                if shift < max_bits and (byte & 0x40):
+                    result |= -(1 << shift)
+                elif byte & 0x40:
+                    result -= 1 << shift
+                return result
+        raise WasmInspectError(f"overlong SLEB128 {context}")
+
+    def read_u32(self, *, context: str = "u32") -> int:
+        return self.read_uleb128(max_bits=32, context=context)
+
+    def read_u64(self, *, context: str = "u64") -> int:
+        return self.read_uleb128(max_bits=64, context=context)
+
+    def read_name(self, *, context: str = "name") -> str:
+        length = self.read_u32(context=f"{context} length")
+        raw = self.read_bytes(length, context=context)
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WasmInspectError(f"invalid UTF-8 in {context}: {exc}") from exc
+
+    def read_valtype_code(self, *, context: str = "valtype") -> int:
+        code = self.read_u8(context=context)
+        if code in (0x63, 0x64):
+            self.read_sleb128(max_bits=33, context=f"{context} heaptype")
+        return code
+
+    def read_limits(self, *, context: str = "limits") -> tuple[int, int, int | None]:
+        flags = self.read_u8(context=f"{context} flags")
+        has_max = bool(flags & WASM_LIMITS_FLAG_HAS_MAX)
+        is_64 = bool(flags & WASM_LIMITS_FLAG_MEMORY64)
+        if is_64:
+            min_val = self.read_u64(context=f"{context} min64")
+            max_val = self.read_u64(context=f"{context} max64") if has_max else None
+        else:
+            min_val = self.read_u32(context=f"{context} min32")
+            max_val = self.read_u32(context=f"{context} max32") if has_max else None
+        return flags, min_val, max_val
+
+    def skip_const_expr(self, *, context: str = "const expr") -> None:
+        """Advance past a Wasm constant expression ending with `0x0B` (end)."""
+        while self.remaining > 0:
+            op = self.read_u8(context=f"{context} opcode")
+            if op == 0x0B:
+                return
+            if op == 0x41:  # i32.const
+                self.read_sleb128(max_bits=32, context="i32.const")
+            elif op == 0x42:  # i64.const
+                self.read_sleb128(max_bits=64, context="i64.const")
+            elif op == 0x43:  # f32.const
+                self.skip(4, context="f32.const")
+            elif op == 0x44:  # f64.const
+                self.skip(8, context="f64.const")
+            elif op == 0x23:  # global.get
+                self.read_u32(context="global.get")
+            elif op == 0xD0:  # ref.null
+                self.read_sleb128(max_bits=33, context="ref.null")
+            elif op == 0xD2:  # ref.func
+                self.read_u32(context="ref.func")
+            elif op == 0xFD:  # SIMD v128.const
+                sub = self.read_u32(context="simd opcode")
+                if sub == 12:
+                    self.skip(16, context="v128.const")
+            elif op in (0x6A, 0x6B, 0x6C, 0x7C, 0x7D, 0x7E):
+                # Extended const expressions (i32/i64 add/sub/mul): no immediates.
+                continue
+            else:
+                raise WasmInspectError(f"unsupported opcode 0x{op:02x} in {context}")
+        raise WasmInspectError(f"unterminated {context}")
+
+
+def _parse_dylink0_mem_info(cursor: _WasmStreamCursor) -> tuple[int, int] | None:
+    """Parse `dylink.0` custom section subsections and return `(memory_size, table_size)`."""
+    while cursor.remaining > 0:
+        sub_type = cursor.read_u8(context="dylink.0 subsection type")
+        sub_size = cursor.read_u32(context="dylink.0 subsection size")
+        sub_start = cursor.pos
+        sub_end = sub_start + sub_size
+        if sub_end > cursor._end:
+            raise WasmInspectError("truncated dylink.0 subsection")
+        if sub_type == WASM_DYLINK_MEM_INFO:
+            sub_cursor = _WasmStreamCursor(cursor._fh, sub_start, sub_end)
+            mem_size = sub_cursor.read_u32(context="dylink.0 memory_size")
+            _mem_align = sub_cursor.read_u32(context="dylink.0 memory_alignment")
+            table_size = sub_cursor.read_u32(context="dylink.0 table_size")
+            _table_align = sub_cursor.read_u32(context="dylink.0 table_alignment")
+            return mem_size, table_size
+        cursor.skip(sub_size, context="dylink.0 subsection")
+    return None
+
+
+def _inspect_wasm_stream(
+    fh: BinaryIO,
+    total_bytes: int,
+    *,
+    name: str,
+    role: str,
+) -> WasmModuleMetrics:
+    if total_bytes < 8:
+        raise WasmInspectError(
+            f"{name}: Wasm binary too short ({total_bytes} bytes, need at least 8)"
+        )
+    cursor = _WasmStreamCursor(fh, 0, total_bytes)
+    magic = cursor.read_bytes(4, context="Wasm magic")
+    if magic != WASM_MAGIC:
+        raise WasmInspectError(f"{name}: invalid Wasm magic {magic!r}")
+    (version,) = struct.unpack("<I", cursor.read_bytes(4, context="Wasm version"))
+    if version != WASM_VERSION:
+        raise WasmInspectError(f"{name}: unsupported Wasm version {version}")
+
+    func_imports = 0
+    got_func_imports = 0
+    got_mem_imports = 0
+    func_exports = 0
+    defined_table_size = 0
+    imported_table_size = 0
+    dylink_table_size: int | None = None
+    dylink_memory_size: int | None = None
+    has_dylink = False
+    shard_dispatch_exports = 0
+    shard_table_exports = 0
+    sub_func_exports = 0
+    sub_func_imports = 0
+    got_func_sub_imports = 0
+    got_func_shard_dispatch_imports = 0
+
+    while cursor.remaining > 0:
+        sec_id = cursor.read_u8(context="section id")
+        if sec_id not in WASM_KNOWN_SECTION_IDS:
+            raise WasmInspectError(f"{name}: unknown Wasm section id {sec_id}")
+        sec_size = cursor.read_u32(context=f"section {sec_id} size")
+        sec_start = cursor.pos
+        sec_end = sec_start + sec_size
+        if sec_end > total_bytes:
+            raise WasmInspectError(
+                f"{name}: truncated section {sec_id} (size {sec_size} exceeds EOF)"
+            )
+
+        if sec_id == WASM_SECTION_CUSTOM:
+            sec_cur = _WasmStreamCursor(fh, sec_start, sec_end)
+            custom_name = sec_cur.read_name(context="custom section name")
+            if custom_name == "dylink.0":
+                has_dylink = True
+                mem_info = _parse_dylink0_mem_info(sec_cur)
+                if mem_info is not None:
+                    dylink_memory_size, dylink_table_size = mem_info
+            elif custom_name == "dylink" and not has_dylink:
+                has_dylink = True
+                dylink_memory_size = sec_cur.read_u32(context="dylink memory_size")
+                _mem_align = sec_cur.read_u32(context="dylink memory_alignment")
+                dylink_table_size = sec_cur.read_u32(context="dylink table_size")
+                _table_align = sec_cur.read_u32(context="dylink table_alignment")
+        elif sec_id == WASM_SECTION_IMPORT:
+            sec_cur = _WasmStreamCursor(fh, sec_start, sec_end)
+            count = sec_cur.read_u32(context="import count")
+            for idx in range(count):
+                mod_name = sec_cur.read_name(context=f"import[{idx}] module")
+                field_name = sec_cur.read_name(context=f"import[{idx}] field")
+                kind = sec_cur.read_u8(context=f"import[{idx}] kind")
+                if kind == 0x00:  # func
+                    sec_cur.read_u32(context=f"import[{idx}] func type_idx")
+                    func_imports += 1
+                    if field_name.startswith("sub_"):
+                        sub_func_imports += 1
+                elif kind == 0x01:  # table
+                    reftype = sec_cur.read_valtype_code(context=f"import[{idx}] table reftype")
+                    _, min_sz, _ = sec_cur.read_limits(context=f"import[{idx}] table limits")
+                    if reftype == WASM_REFTYPE_FUNCREF:
+                        imported_table_size += min_sz
+                elif kind == 0x02:  # memory
+                    sec_cur.read_limits(context=f"import[{idx}] memory limits")
+                elif kind == 0x03:  # global
+                    sec_cur.read_valtype_code(context=f"import[{idx}] global valtype")
+                    _mut = sec_cur.read_u8(context=f"import[{idx}] global mutability")
+                    if mod_name == "GOT.func":
+                        got_func_imports += 1
+                        if field_name.startswith("sub_"):
+                            got_func_sub_imports += 1
+                        elif field_name.startswith(SHARD_DISPATCH_FN_PREFIX):
+                            got_func_shard_dispatch_imports += 1
+                    elif mod_name == "GOT.mem":
+                        got_mem_imports += 1
+                elif kind == 0x04:  # tag
+                    _attr = sec_cur.read_u8(context=f"import[{idx}] tag attr")
+                    sec_cur.read_u32(context=f"import[{idx}] tag type_idx")
+                else:
+                    raise WasmInspectError(f"{name}: unknown import kind 0x{kind:02x}")
+        elif sec_id == WASM_SECTION_TABLE:
+            sec_cur = _WasmStreamCursor(fh, sec_start, sec_end)
+            count = sec_cur.read_u32(context="table count")
+            for idx in range(count):
+                first = sec_cur.read_u8(context=f"table[{idx}] prefix/reftype")
+                has_init = False
+                if first == WASM_TABLE_EXTENDED_PREFIX:
+                    reserved = sec_cur.read_u8(context=f"table[{idx}] reserved")
+                    if reserved != 0x00:
+                        raise WasmInspectError(
+                            f"{name}: invalid extended table reserved byte 0x{reserved:02x}"
+                        )
+                    reftype = sec_cur.read_valtype_code(context=f"table[{idx}] reftype")
+                    has_init = True
+                else:
+                    reftype = first
+                    if reftype in (0x63, 0x64):
+                        sec_cur.read_sleb128(max_bits=33, context=f"table[{idx}] heaptype")
+                _, min_sz, _ = sec_cur.read_limits(context=f"table[{idx}] limits")
+                if has_init:
+                    sec_cur.skip_const_expr(context=f"table[{idx}] init expr")
+                if reftype == WASM_REFTYPE_FUNCREF:
+                    defined_table_size += min_sz
+        elif sec_id == WASM_SECTION_EXPORT:
+            sec_cur = _WasmStreamCursor(fh, sec_start, sec_end)
+            count = sec_cur.read_u32(context="export count")
+            for idx in range(count):
+                exp_name = sec_cur.read_name(context=f"export[{idx}] name")
+                kind = sec_cur.read_u8(context=f"export[{idx}] kind")
+                _exp_idx = sec_cur.read_u32(context=f"export[{idx}] index")
+                if kind == 0x00:  # func
+                    func_exports += 1
+                    if exp_name.startswith(SHARD_DISPATCH_FN_PREFIX):
+                        shard_dispatch_exports += 1
+                    elif exp_name.startswith("sub_"):
+                        sub_func_exports += 1
+                elif kind == 0x03:  # global
+                    if exp_name.startswith(SHARD_DISPATCH_TABLE_PREFIX):
+                        shard_table_exports += 1
+
+        # Advance cleanly to the end of the section (O(1) seek over code/data sections).
+        cursor._pos = sec_end
+        fh.seek(sec_end)
+
+    effective_table_size = (
+        dylink_table_size
+        if has_dylink and dylink_table_size is not None
+        else (defined_table_size if defined_table_size > 0 else imported_table_size)
+    )
+    return WasmModuleMetrics(
+        name=name,
+        role=role,
+        wasm_bytes=total_bytes,
+        func_imports=func_imports,
+        got_func_imports=got_func_imports,
+        got_mem_imports=got_mem_imports,
+        func_exports=func_exports,
+        table_size=effective_table_size,
+        defined_table_size=defined_table_size,
+        dylink_table_size=dylink_table_size,
+        dylink_memory_size=dylink_memory_size,
+        has_dylink=has_dylink,
+        shard_dispatch_exports=shard_dispatch_exports,
+        shard_table_exports=shard_table_exports,
+        sub_func_exports=sub_func_exports,
+        sub_func_imports=sub_func_imports,
+        got_func_sub_imports=got_func_sub_imports,
+        got_func_shard_dispatch_imports=got_func_shard_dispatch_imports,
+    )
+
+
+def inspect_wasm_bytes(
+    data: bytes | bytearray | memoryview,
+    *,
+    name: str = RUNTIME_WASM,
+    role: str = "main",
+) -> WasmModuleMetrics:
+    """Parse `import`, `export`, `table`, and `dylink.0` sections from Wasm bytes."""
+    raw = bytes(data)
+    return _inspect_wasm_stream(io.BytesIO(raw), len(raw), name=name, role=role)
+
+
+def inspect_wasm_file(
+    wasm_path: Path,
+    *,
+    name: str | None = None,
+    role: str = "main",
+) -> WasmModuleMetrics:
+    """Stream-inspect a built `.wasm` file without loading `code`/`data` sections into RAM."""
+    label = name or wasm_path.name
+    try:
+        total_bytes = wasm_path.stat().st_size
+        with wasm_path.open("rb") as fh:
+            return _inspect_wasm_stream(fh, total_bytes, name=label, role=role)
+    except OSError as exc:
+        raise WasmInspectError(f"{label}: unable to read Wasm binary: {exc}") from exc
+
+
+def collect_wasm_metrics(
+    *,
+    main_wasm: Path,
+    side_wasms: Sequence[tuple[str, Path]] = (),
+    indirect_dispatch: str = DEFAULT_INDIRECT_DISPATCH,
+    warnings: list[str] | None = None,
+) -> WasmBuildMetrics:
+    """Inspect `runtime.wasm` and every `guest_part_*.wasm` side module after linking."""
+    modules: list[WasmModuleMetrics] = []
+    targets: list[tuple[str, str, Path]] = [(RUNTIME_WASM, "main", main_wasm)]
+    for side_name, side_path in side_wasms:
+        targets.append((side_name, "side", side_path))
+
+    for mod_name, role, path in targets:
+        try:
+            modules.append(inspect_wasm_file(path, name=mod_name, role=role))
+        except WasmInspectError as exc:
+            if warnings is not None:
+                warnings.append(f"wasm telemetry skipped for {mod_name}: {sanitize_text(str(exc))}")
+            modules.append(
+                WasmModuleMetrics(
+                    name=mod_name,
+                    role=role,
+                    wasm_bytes=_object_bytes(path),
+                )
+            )
+    return WasmBuildMetrics(indirect_dispatch=indirect_dispatch, modules=tuple(modules))
+
+
+def verify_table_import_limits(
+    metrics: WasmBuildMetrics,
+    max_table_imports: int,
+) -> list[str]:
+    """Verify total `GOT.func` imports and table footprint against `--verify-max-table-imports`."""
+    limit = parse_verify_max_table_imports(max_table_imports)
+    assert limit is not None
+    errors: list[str] = []
+    if metrics.total_got_func_imports > limit:
+        errors.append(
+            f"total GOT.func imports ({metrics.total_got_func_imports}) exceeds "
+            f"--verify-max-table-imports limit ({limit})"
+        )
+    if metrics.side_module_count > 0:
+        if metrics.side_table_size > limit:
+            errors.append(
+                f"total side-module dylink.0 tableSize ({metrics.side_table_size}) exceeds "
+                f"--verify-max-table-imports limit ({limit})"
+            )
+    elif metrics.total_table_size > limit:
+        errors.append(
+            f"total wasmTable size ({metrics.total_table_size}) exceeds "
+            f"--verify-max-table-imports limit ({limit})"
+        )
+    return errors
+
+
+def write_guest_manifest(
+    output_dir: Path,
+    *,
+    indirect_dispatch: str,
+    split_modules: int,
+    split_strategy: str,
+    side_modules: Sequence[SideModuleResult],
+    wasm_metrics: WasmBuildMetrics | None,
+) -> Path:
+    """Write or update `guest_manifest.json` with backwards-compatible fields + `wasmMetrics`."""
+    manifest_path = output_dir / GUEST_MANIFEST_FILE
+    payload: dict[str, Any] = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload.update(existing)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+
+    payload["schemaVersion"] = SCHEMA_VERSION
+    payload["runtimeJs"] = RUNTIME_JS
+    payload["runtimeWasm"] = RUNTIME_WASM
+    payload["indirectDispatch"] = indirect_dispatch
+    payload["splitModules"] = split_modules
+    payload["splitStrategy"] = split_strategy
+    payload["sideModules"] = [side.name for side in side_modules]
+    if wasm_metrics is not None:
+        payload["wasmMetrics"] = wasm_metrics.to_manifest_dict()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return manifest_path
+
+
+def format_wasm_metrics_lines(metrics: WasmBuildMetrics) -> list[str]:
+    """Render a crisp aligned Wasm module telemetry table and shard-dispatch banner."""
+    lines: list[str] = ["  Wasm module telemetry:"]
+    name_width = max(
+        len("Module"),
+        len("TOTAL"),
+        *(len(m.name) for m in metrics.modules),
+    )
+    header = (
+        f"    {'Module':<{name_width}}  {'Size (MiB)':>10}  {'Func Imp':>8}  "
+        f"{'GOT.func':>8}  {'Func Exp':>8}  {'TableSize':>9}"
+    )
+    lines.append(header)
+    for mod in metrics.modules:
+        mib = mod.wasm_bytes / (1024 * 1024)
+        lines.append(
+            f"    {mod.name:<{name_width}}  {mib:>10.2f}  {mod.func_imports:>8}  "
+            f"{mod.got_func_imports:>8}  {mod.func_exports:>8}  {mod.table_size:>9}"
+        )
+    if len(metrics.modules) > 1:
+        total_mib = metrics.total_wasm_bytes / (1024 * 1024)
+        lines.append(
+            f"    {'TOTAL':<{name_width}}  {total_mib:>10.2f}  {metrics.total_func_imports:>8}  "
+            f"{metrics.total_got_func_imports:>8}  {metrics.total_func_exports:>8}  "
+            f"{metrics.total_table_size:>9}"
+        )
+    lines.append(
+        f"  Table / GOT.func footprint: wasmTable={metrics.total_table_size} "
+        f"(main={metrics.main_table_size}, side={metrics.side_table_size}), "
+        f"GOT.func={metrics.total_got_func_imports}"
+    )
+    if metrics.indirect_dispatch == "shard":
+        effective = (
+            max(metrics.total_got_func_imports, metrics.side_table_size)
+            if metrics.side_module_count > 0
+            else metrics.total_table_size
+        )
+        if 0 < effective < LEGACY_TABLE_BASELINE_ENTRIES:
+            ratio = LEGACY_TABLE_BASELINE_ENTRIES / effective
+            reduction_note = (
+                f"vs {LEGACY_TABLE_BASELINE_ENTRIES:,} legacy per-function entries; "
+                f"~{ratio:,.1f}x reduction"
+            )
+        elif effective == 0:
+            reduction_note = (
+                f"0 guest table/GOT.func entries vs {LEGACY_TABLE_BASELINE_ENTRIES:,} legacy"
+            )
+        else:
+            reduction_note = f"vs {LEGACY_TABLE_BASELINE_ENTRIES:,} legacy baseline"
+        lines.append(
+            f"  [shard-dispatch] Active: GOT.func={metrics.total_got_func_imports}, "
+            f"side tableSize={metrics.side_table_size}, "
+            f"dispatchers={metrics.shard_dispatch_exports} ({reduction_note})"
+        )
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Build orchestration
 # ---------------------------------------------------------------------------
 
@@ -2309,6 +3263,7 @@ def run_build(
     node_max_old_space_mb: int | None = None,
     proxy_to_pthread: bool = False,
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+    verify_max_table_imports: int | None = None,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -2323,6 +3278,7 @@ def run_build(
     split_strat = parse_split_strategy(split_strategy)
     use_split = split_count > 1
     max_pthread_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
+    max_table_imports_limit = parse_verify_max_table_imports(verify_max_table_imports)
     explicit_node_mb = parse_node_max_old_space_mb(node_max_old_space_mb)
     base_link_env: Mapping[str, str] = os.environ if env is None else env
     link_env = build_link_env(
@@ -2400,6 +3356,7 @@ def run_build(
         node_max_old_space_mb=effective_node_mb,
         proxy_to_pthread=proxy_to_pthread,
         max_concurrent_pthread_loads=max_pthread_loads,
+        verify_max_table_imports=max_table_imports_limit,
     )
 
     if not toolchain.ok:
@@ -2421,6 +3378,13 @@ def run_build(
     source_root = resolve_source_root(source_dir)
     all_units = discover_sources(source_dir)
     program_build = is_program_build(source_root, all_units)
+    dispatch_info = detect_indirect_dispatch(
+        source_root,
+        all_units,
+        manifest_path=source_dir if source_dir.is_file() else None,
+    )
+    report.indirect_dispatch = dispatch_info.mode
+    report.indirect_dispatch_source = dispatch_info.source
     if link_guest_boot:
         entry = guest_boot_entry or (repo_root / DEFAULT_GUEST_BOOT_ENTRY_REL)
         if not entry.is_file():
@@ -2591,9 +3555,16 @@ def run_build(
             for item in ordered
             if not is_shard_unit(item.unit) and not is_registration_unit(item.unit)
         ]
-        all_side_buckets: list[list[UnitBuildResult]] = list(buckets)
+        all_side_buckets: list[tuple[str, list[UnitBuildResult]]] = [
+            ("shards", bucket) for bucket in buckets
+        ]
         if registration_items:
-            all_side_buckets.append(registration_items)
+            # Place `functions.ll` registration tables in the final side module (`guest_part_N.wasm`)
+            # for both legacy `table` mode and `shard` mode: all shard side modules load first via
+            # `Module.dynamicLibraries` and register their `__playgta6_dispatch_shard_*` exports in
+            # `GOT.func` before `functions.o` applies its data relocations and exports
+            # `__playgta6_shard_dispatch_*` to `runtime.wasm`'s `pg6_program.o`.
+            all_side_buckets.append(("registration", registration_items))
         side_link_flags = resolve_side_module_link_flags(
             opt=opt_level,
             strip=strip,
@@ -2603,7 +3574,7 @@ def run_build(
         side_plans: list[
             tuple[SideModuleResult, Path, list[Path], Path | None, tuple[str, ...]]
         ] = []
-        for idx, bucket in enumerate(all_side_buckets):
+        for idx, (bucket_role, bucket) in enumerate(all_side_buckets):
             side_name = SIDE_MODULE_NAME_TEMPLATE.format(index=idx)
             side_wasm_path = output_dir / side_name
             bucket_objects = [
@@ -2627,6 +3598,7 @@ def run_build(
                 shards=tuple(item.unit.unit_id for item in bucket),
                 response_file=side_rsp_name if side_rsp_path is not None else None,
                 link_argv=tuple(sanitize_argv(raw_side_link)),
+                role=bucket_role,
             )
             side_plans.append(
                 (side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link)
@@ -2798,6 +3770,43 @@ def run_build(
         if size_warning is not None:
             report.warnings.append(size_warning)
 
+    side_wasm_pairs = [
+        (side_result.name, output_dir / side_result.name) for side_result in report.side_modules
+    ]
+    report.wasm_metrics = collect_wasm_metrics(
+        main_wasm=output_wasm,
+        side_wasms=side_wasm_pairs,
+        indirect_dispatch=report.indirect_dispatch,
+        warnings=report.warnings,
+    )
+    metrics_by_name = {m.name: m for m in report.wasm_metrics.modules}
+    for side_result in report.side_modules:
+        side_result.wasm_metrics = metrics_by_name.get(side_result.name)
+
+    if report.indirect_dispatch == "shard" and report.wasm_metrics.got_func_sub_imports > 0:
+        report.warnings.append(
+            f"shard-dispatch build still has {report.wasm_metrics.got_func_sub_imports} "
+            "GOT.func sub_* import(s); verify functions.ll and shard objects were all built "
+            "with --indirect-dispatch shard"
+        )
+
+    write_guest_manifest(
+        output_dir,
+        indirect_dispatch=report.indirect_dispatch,
+        split_modules=report.split_modules,
+        split_strategy=report.split_strategy,
+        side_modules=report.side_modules,
+        wasm_metrics=report.wasm_metrics,
+    )
+    report.guest_manifest = GUEST_MANIFEST_FILE
+
+    if max_table_imports_limit is not None:
+        limit_errors = verify_table_import_limits(report.wasm_metrics, max_table_imports_limit)
+        if limit_errors:
+            report.ok = False
+            report.errors.extend(limit_errors)
+            return report
+
     if verify:
         report.verify = run_verify(
             output_wasm,
@@ -2825,6 +3834,13 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         f"  Link flags: {' '.join(report.link_flags)}",
         f"  Sources: {len(report.sources)} (cache hits {report.cache_hits}, misses {report.cache_misses})",
     ]
+    if report.mode != "check-only":
+        lines.append(
+            f"  Indirect dispatch: {report.indirect_dispatch} "
+            f"(detected from {report.indirect_dispatch_source})"
+        )
+    if report.verify_max_table_imports is not None:
+        lines.append(f"  Max table imports limit: {report.verify_max_table_imports}")
     if report.linked_guest_boot:
         lines.append("  Linked guest boot: yes")
     if report.no_link_opt:
@@ -2899,6 +3915,10 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         mib = report.wasm_bytes / (1024 * 1024)
         limit_note = " [EXCEEDS V8 1 GiB LIMIT]" if report.exceeds_v8_1gib_limit else ""
         lines.append(f"  Wasm size: {report.wasm_bytes} bytes ({mib:.2f} MiB){limit_note}")
+    if report.wasm_metrics is not None:
+        lines.extend(format_wasm_metrics_lines(report.wasm_metrics))
+    if report.guest_manifest:
+        lines.append(f"  Guest manifest: {report.guest_manifest}")
     if report.verify is not None:
         vstat = "PASS" if report.verify.get("ok") else "FAIL"
         lines.append(f"  Verify: {vstat}")
@@ -3132,6 +4152,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="After linking, run tools/check_wasm_exports.py with Wasm64/shared/host-import checks.",
     )
     parser.add_argument(
+        "--verify-max-table-imports",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Fail the build if total GOT.func imports or wasmTable footprint exceeds N "
+            "(useful for enforcing shard-dispatch bounds in CI/local builds)."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="as_json",
@@ -3263,6 +4293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             node_max_old_space_mb=args.node_max_old_space_mb,
             proxy_to_pthread=args.proxy_to_pthread,
             max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,
+            verify_max_table_imports=args.verify_max_table_imports,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)

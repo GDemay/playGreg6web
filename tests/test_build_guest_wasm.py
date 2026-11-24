@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d)."""
 
 from __future__ import annotations
 
@@ -4976,6 +4976,726 @@ class TestLinkFlagContract(unittest.TestCase):
             self.assertIn(flag, cmake, flag)
         for flag in bgw.COMPILE_WASM_FLAGS:
             self.assertIn(flag, cmake, flag)
+
+
+# ---------------------------------------------------------------------------
+# Minimal Wasm binary encoder helpers for R37d pure-Python parser tests
+# ---------------------------------------------------------------------------
+
+
+def _uleb128(value: int) -> bytes:
+    assert value >= 0
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _wasm_name(text: str) -> bytes:
+    raw = text.encode("utf-8")
+    return _uleb128(len(raw)) + raw
+
+
+def _wasm_section(sec_id: int, payload: bytes) -> bytes:
+    return bytes([sec_id]) + _uleb128(len(payload)) + payload
+
+
+def _encode_dylink0_section(
+    *,
+    memory_size: int,
+    memory_alignment: int = 4,
+    table_size: int = 0,
+    table_alignment: int = 0,
+    needed: Sequence[str] = (),
+) -> bytes:
+    mem_info = (
+        _uleb128(memory_size)
+        + _uleb128(memory_alignment)
+        + _uleb128(table_size)
+        + _uleb128(table_alignment)
+    )
+    subs = bytearray()
+    subs.append(bgw.WASM_DYLINK_MEM_INFO)
+    subs.extend(_uleb128(len(mem_info)))
+    subs.extend(mem_info)
+    if needed:
+        needed_body = _uleb128(len(needed)) + b"".join(_wasm_name(n) for n in needed)
+        subs.append(2)  # WASM_DYLINK_NEEDED
+        subs.extend(_uleb128(len(needed_body)))
+        subs.extend(needed_body)
+    return _wasm_section(bgw.WASM_SECTION_CUSTOM, _wasm_name("dylink.0") + bytes(subs))
+
+
+def _encode_import_section(entries: Sequence[tuple[str, str, str]]) -> bytes:
+    """Encode a Wasm import section from `(module, field, kind)` tuples.
+
+    Supported kinds: `"func"`, `"got_global"`, `"memory64"`, `"table32"`, `"table64"`, `"tag"`.
+    """
+    body = bytearray(_uleb128(len(entries)))
+    for mod, field, kind in entries:
+        body.extend(_wasm_name(mod))
+        body.extend(_wasm_name(field))
+        if kind == "func":
+            body.append(0x00)
+            body.extend(_uleb128(0))
+        elif kind == "table32":
+            body.extend(bytes([0x01, 0x70, 0x00]))
+            body.extend(_uleb128(0))
+        elif kind == "table64":
+            body.extend(bytes([0x01, 0x70, 0x05]))  # has_max | table64
+            body.extend(_uleb128(16))
+            body.extend(_uleb128(1024))
+        elif kind == "memory64":
+            body.extend(bytes([0x02, 0x07]))  # has_max | shared | memory64
+            body.extend(_uleb128(16))
+            body.extend(_uleb128(262144))
+        elif kind == "got_global":
+            body.extend(bytes([0x03, 0x7F, 0x01]))  # i32 mutable
+        elif kind == "tag":
+            body.extend(bytes([0x04, 0x00]))
+            body.extend(_uleb128(0))
+        else:
+            raise AssertionError(f"unsupported test import kind {kind!r}")
+    return _wasm_section(bgw.WASM_SECTION_IMPORT, bytes(body))
+
+
+def _encode_table_section(
+    tables: Sequence[tuple[int, int, int | None, bool]],
+) -> bytes:
+    """Encode a Wasm table section from `(reftype, min_sz, max_sz, extended_init)` tuples."""
+    body = bytearray(_uleb128(len(tables)))
+    for reftype, min_sz, max_sz, extended in tables:
+        if extended:
+            body.extend(bytes([0x40, 0x00]))
+        body.append(reftype)
+        flags = 0x01 if max_sz is not None else 0x00
+        body.append(flags)
+        body.extend(_uleb128(min_sz))
+        if max_sz is not None:
+            body.extend(_uleb128(max_sz))
+        if extended:
+            # ref.null func; end
+            body.extend(bytes([0xD0, 0x70, 0x0B]))
+    return _wasm_section(bgw.WASM_SECTION_TABLE, bytes(body))
+
+
+def _encode_export_section(exports: Sequence[tuple[str, int, int]]) -> bytes:
+    """Encode a Wasm export section from `(name, kind_code, index)` tuples."""
+    body = bytearray(_uleb128(len(exports)))
+    for name, kind_code, index in exports:
+        body.extend(_wasm_name(name))
+        body.append(kind_code)
+        body.extend(_uleb128(index))
+    return _wasm_section(bgw.WASM_SECTION_EXPORT, bytes(body))
+
+
+def _build_synthetic_wasm(
+    *,
+    dylink: tuple[int, int] | None = None,
+    imports: Sequence[tuple[str, str, str]] = (),
+    tables: Sequence[tuple[int, int, int | None, bool]] = (),
+    exports: Sequence[tuple[str, int, int]] = (),
+    code_padding_bytes: int = 0,
+) -> bytes:
+    parts = [b"\x00asm\x01\x00\x00\x00"]
+    if dylink is not None:
+        parts.append(
+            _encode_dylink0_section(
+                memory_size=dylink[0],
+                table_size=dylink[1],
+                needed=("runtime.wasm",),
+            )
+        )
+    if imports:
+        parts.append(_encode_import_section(imports))
+    if tables:
+        parts.append(_encode_table_section(tables))
+    if exports:
+        parts.append(_encode_export_section(exports))
+    if code_padding_bytes > 0:
+        parts.append(_wasm_section(10, b"\x00" * code_padding_bytes))
+    return b"".join(parts)
+
+
+class TestShardDispatchDetection(unittest.TestCase):
+    """R37d: Auto-detection of shard-dispatch (`Pg6ShardDispatchTable`) vs legacy `table` builds."""
+
+    def test_detects_from_program_manifest_options_and_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) Top-level indirect_dispatch == "shard"
+            src1 = _program_layout(root / "case1")
+            manifest1 = src1 / "program-manifest.json"
+            data1 = json.loads(manifest1.read_text(encoding="utf-8"))
+            data1["indirect_dispatch"] = "shard"
+            manifest1.write_text(json.dumps(data1), encoding="utf-8")
+            det1 = bgw.detect_indirect_dispatch(src1, bgw.discover_sources(src1))
+            self.assertEqual(det1, bgw.IndirectDispatchDetection("shard", "program-manifest.json"))
+
+            # 2) Nested options.indirect_dispatch == "shard"
+            src2 = _program_layout(root / "case2")
+            manifest2 = src2 / "program-manifest.json"
+            data2 = json.loads(manifest2.read_text(encoding="utf-8"))
+            data2["options"] = {"indirect_dispatch": "shard"}
+            manifest2.write_text(json.dumps(data2), encoding="utf-8")
+            det2 = bgw.detect_indirect_dispatch(src2, bgw.discover_sources(src2))
+            self.assertEqual(det2, bgw.IndirectDispatchDetection("shard", "program-manifest.json"))
+
+            # 3) Module entry shard_dispatch_symbol
+            src3 = _program_layout(root / "case3")
+            manifest3 = src3 / "program-manifest.json"
+            data3 = json.loads(manifest3.read_text(encoding="utf-8"))
+            data3["modules"][0]["shard_dispatch_symbol"] = "__playgta6_shard_dispatch_main"
+            manifest3.write_text(json.dumps(data3), encoding="utf-8")
+            det3 = bgw.detect_indirect_dispatch(src3, bgw.discover_sources(src3))
+            self.assertEqual(det3, bgw.IndirectDispatchDetection("shard", "program-manifest.json"))
+
+            # 4) Explicit "table" in program-manifest.json
+            src4 = _program_layout(root / "case4")
+            manifest4 = src4 / "program-manifest.json"
+            data4 = json.loads(manifest4.read_text(encoding="utf-8"))
+            data4["indirect_dispatch"] = "table"
+            manifest4.write_text(json.dumps(data4), encoding="utf-8")
+            det4 = bgw.detect_indirect_dispatch(src4, bgw.discover_sources(src4))
+            self.assertEqual(det4, bgw.IndirectDispatchDetection("table", "program-manifest.json"))
+
+    def test_detects_from_build_manifest_pg6_program_functions_ll_and_shard_ir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1) Nested module build-manifest.json with options.indirect_dispatch = "shard"
+            src_bm = _program_layout(root / "bm")
+            bm_path = src_bm / "main" / "build-manifest.json"
+            bm_data = json.loads(bm_path.read_text(encoding="utf-8"))
+            bm_data["options"] = {"indirect_dispatch": "shard"}
+            bm_path.write_text(json.dumps(bm_data), encoding="utf-8")
+            det_bm = bgw.detect_indirect_dispatch(src_bm, bgw.discover_sources(src_bm))
+            self.assertEqual(det_bm, bgw.IndirectDispatchDetection("shard", "build-manifest.json"))
+
+            # 2) pg6_program.cpp referencing __playgta6_shard_dispatch_main
+            src_cpp = _program_layout(root / "cpp")
+            _write(
+                src_cpp / "pg6_program.cpp",
+                'extern "C" const Pg6ShardDispatchTable __playgta6_shard_dispatch_main;\n',
+            )
+            det_cpp = bgw.detect_indirect_dispatch(src_cpp, bgw.discover_sources(src_cpp))
+            self.assertEqual(det_cpp, bgw.IndirectDispatchDetection("shard", "pg6_program.cpp"))
+
+            # 3) Large (>600 KiB) functions.ll with @__playgta6_shard_dispatch_main only at the tail
+            src_fn = _program_layout(root / "fn")
+            big_body = "; padding entry line\n" * 35_000
+            _write(
+                src_fn / "main" / "lift" / "functions.ll",
+                big_body
+                + "@__playgta6_shard_dispatch_main = constant { i32, i32, i64, ptr, ptr } zeroinitializer\n",
+            )
+            det_fn = bgw.detect_indirect_dispatch(src_fn, bgw.discover_sources(src_fn))
+            self.assertEqual(det_fn, bgw.IndirectDispatchDetection("shard", "functions.ll"))
+
+            # 4) Standalone shard IR without functions.ll or manifests
+            src_ir = root / "shard_only"
+            _write(
+                src_ir / "lift" / "shard-00000.ll",
+                "define internal void @sub_140001000(ptr %s) { ret void }\n"
+                "define void @__playgta6_dispatch_shard_main_00000(i32 %idx, ptr %s) { ret void }\n",
+            )
+            det_ir = bgw.detect_indirect_dispatch(src_ir, bgw.discover_sources(src_ir))
+            self.assertEqual(det_ir, bgw.IndirectDispatchDetection("shard", "shard-ir"))
+
+            # 5) Default legacy table layout
+            src_legacy = _program_layout(root / "legacy")
+            det_legacy = bgw.detect_indirect_dispatch(src_legacy, bgw.discover_sources(src_legacy))
+            self.assertEqual(det_legacy, bgw.IndirectDispatchDetection("table", "default"))
+
+
+class TestWasmBinaryTelemetryAndShardBuilds(unittest.TestCase):
+    """R37d: Pure-Python Wasm section parser, shard-dispatch split linking, telemetry & guest_manifest.json."""
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    def test_pure_python_wasm_parser_handles_imports_exports_tables_and_dylink0(self) -> None:
+        # 1) Main Wasm64 module with memory64 import, extended 0x40 table + standard table, and exports.
+        main_wasm = _build_synthetic_wasm(
+            imports=[
+                ("env", "memory", "memory64"),
+                ("env", "host_log", "func"),
+                ("env", "host_httpfs_open", "func"),
+                ("GOT.mem", "__playgta6_shard_dispatch_main", "got_global"),
+            ],
+            tables=[
+                (0x70, 48, 1024, False),
+                (0x70, 16, None, True),  # extended 0x40 0x00 table with ref.null init expr
+                (0x6F, 99, None, False),  # externref table must NOT count as funcref tableSize
+            ],
+            exports=[
+                ("main", 0x00, 0),
+                ("__playgta6_indirect_call", 0x00, 1),
+                ("memory", 0x02, 0),
+            ],
+            code_padding_bytes=4096,
+        )
+        m_main = bgw.inspect_wasm_bytes(main_wasm, name="runtime.wasm", role="main")
+        self.assertEqual(m_main.name, "runtime.wasm")
+        self.assertEqual(m_main.role, "main")
+        self.assertEqual(m_main.wasm_bytes, len(main_wasm))
+        self.assertEqual(m_main.func_imports, 2)
+        self.assertEqual(m_main.got_func_imports, 0)
+        self.assertEqual(m_main.got_mem_imports, 1)
+        self.assertEqual(m_main.func_exports, 2)
+        self.assertEqual(m_main.table_size, 64)
+        self.assertEqual(m_main.defined_table_size, 64)
+        self.assertFalse(m_main.has_dylink)
+        self.assertIsNone(m_main.dylink_table_size)
+
+        # 2) Shard side module with dylink.0 (tableSize=2), 2 exported dispatchers, 1 cross-shard sub_* export.
+        shard_side = _build_synthetic_wasm(
+            dylink=(2048, 2),
+            imports=[
+                ("env", "memory", "memory64"),
+                ("env", "__indirect_function_table", "table32"),
+                ("env", "__playgta6_indirect_call", "func"),
+                ("env", "sub_140009000", "func"),
+            ],
+            exports=[
+                ("__playgta6_dispatch_shard_main_00000", 0x00, 0),
+                ("__playgta6_dispatch_shard_main_00001", 0x00, 1),
+                ("sub_140001000", 0x00, 2),
+            ],
+            code_padding_bytes=8192,
+        )
+        m_side = bgw.inspect_wasm_bytes(shard_side, name="guest_part_0.wasm", role="side")
+        self.assertTrue(m_side.has_dylink)
+        self.assertEqual(m_side.dylink_memory_size, 2048)
+        self.assertEqual(m_side.dylink_table_size, 2)
+        self.assertEqual(m_side.table_size, 2)
+        self.assertEqual(m_side.func_imports, 2)
+        self.assertEqual(m_side.sub_func_imports, 1)
+        self.assertEqual(m_side.got_func_imports, 0)
+        self.assertEqual(m_side.func_exports, 3)
+        self.assertEqual(m_side.shard_dispatch_exports, 2)
+        self.assertEqual(m_side.sub_func_exports, 1)
+
+        # 3) Registration side module (functions.o in shard mode): 4 GOT.func dispatchers, 0 sub_* imports.
+        reg_side = _build_synthetic_wasm(
+            dylink=(65536, 0),
+            imports=[
+                ("GOT.func", "__playgta6_dispatch_shard_main_00000", "got_global"),
+                ("GOT.func", "__playgta6_dispatch_shard_main_00001", "got_global"),
+                ("GOT.func", "__playgta6_dispatch_shard_main_00002", "got_global"),
+                ("GOT.func", "__playgta6_dispatch_shard_main_00003", "got_global"),
+            ],
+            exports=[
+                ("__playgta6_shard_dispatch_main", 0x03, 0),
+            ],
+        )
+        m_reg = bgw.inspect_wasm_bytes(reg_side, name="guest_part_2.wasm", role="side")
+        self.assertEqual(m_reg.got_func_imports, 4)
+        self.assertEqual(m_reg.got_func_shard_dispatch_imports, 4)
+        self.assertEqual(m_reg.got_func_sub_imports, 0)
+        self.assertEqual(m_reg.shard_table_exports, 1)
+        self.assertEqual(m_reg.table_size, 0)
+
+        # 4) Legacy "dylink" custom section (without .0) and malformed Wasm error handling.
+        legacy_dylink_payload = _wasm_name("dylink") + _uleb128(512) + _uleb128(4) + _uleb128(7) + _uleb128(0)
+        legacy_dylink_wasm = b"\x00asm\x01\x00\x00\x00" + _wasm_section(0, legacy_dylink_payload)
+        m_leg = bgw.inspect_wasm_bytes(legacy_dylink_wasm, name="legacy.wasm", role="side")
+        self.assertTrue(m_leg.has_dylink)
+        self.assertEqual(m_leg.dylink_memory_size, 512)
+        self.assertEqual(m_leg.dylink_table_size, 7)
+        self.assertEqual(m_leg.table_size, 7)
+
+        for bad in (b"", b"\x00asm", b"notwasm!", b"\x00asm\x02\x00\x00\x00", b"\x00asm\x01\x00\x00\x00\x02\x10"):
+            with self.assertRaises(bgw.WasmInspectError):
+                bgw.inspect_wasm_bytes(bad, name="bad.wasm")
+
+    def test_shard_dispatch_split_build_telemetry_manifest_and_max_table_imports(self) -> None:
+        wasm_by_name = {
+            "runtime.wasm": _build_synthetic_wasm(
+                imports=[
+                    ("env", "memory", "memory64"),
+                    ("env", "host_log", "func"),
+                    ("GOT.mem", "__playgta6_shard_dispatch_main", "got_global"),
+                ],
+                tables=[(0x70, 64, None, False)],
+                exports=[("main", 0x00, 0), ("__playgta6_indirect_call", 0x00, 1)],
+                code_padding_bytes=2048,
+            ),
+            "guest_part_0.wasm": _build_synthetic_wasm(
+                dylink=(4096, 2),
+                imports=[("env", "__playgta6_indirect_call", "func")],
+                exports=[
+                    ("__playgta6_dispatch_shard_main_00000", 0x00, 0),
+                    ("__playgta6_dispatch_shard_main_00001", 0x00, 1),
+                ],
+                code_padding_bytes=4096,
+            ),
+            "guest_part_1.wasm": _build_synthetic_wasm(
+                dylink=(4096, 2),
+                imports=[("env", "__playgta6_indirect_call", "func")],
+                exports=[
+                    ("__playgta6_dispatch_shard_main_00002", 0x00, 0),
+                    ("__playgta6_dispatch_shard_main_00003", 0x00, 1),
+                ],
+                code_padding_bytes=4096,
+            ),
+            "guest_part_2.wasm": _build_synthetic_wasm(
+                dylink=(16384, 0),
+                imports=[
+                    ("GOT.func", "__playgta6_dispatch_shard_main_00000", "got_global"),
+                    ("GOT.func", "__playgta6_dispatch_shard_main_00001", "got_global"),
+                    ("GOT.func", "__playgta6_dispatch_shard_main_00002", "got_global"),
+                    ("GOT.func", "__playgta6_dispatch_shard_main_00003", "got_global"),
+                ],
+                exports=[("__playgta6_shard_dispatch_main", 0x03, 0)],
+            ),
+        }
+
+        class SyntheticWasmRunner(RecordingRunner):
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                tokens = tuple(str(a) for a in argv)
+                out_path = _dash_o(tokens)
+                if res.returncode == 0 and out_path is not None:
+                    p = Path(out_path)
+                    if p.name in wasm_by_name:
+                        p.write_bytes(wasm_by_name[p.name])
+                    elif p.name == bgw.RUNTIME_JS:
+                        p.with_suffix(".wasm").write_bytes(wasm_by_name["runtime.wasm"])
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = root / "shard-program"
+            for idx in range(4):
+                _write(
+                    src / "main" / "lift" / f"shard-{idx:05d}.ll",
+                    f"define internal void @sub_{0x140001000 + idx * 0x100:x}(ptr %s) {{ ret void }}\n"
+                    f"define void @__playgta6_dispatch_shard_main_{idx:05d}(i32 %i, ptr %s) {{ ret void }}\n",
+                )
+            _write(
+                src / "main" / "lift" / "functions.ll",
+                "declare void @__playgta6_dispatch_shard_main_00000(i32, ptr)\n"
+                "@__playgta6_shard_dispatch_main = constant { i32, i32, i64, ptr, ptr } zeroinitializer\n",
+            )
+            _write(src / "main" / "stubs" / "pg6_import_thunks.cpp", "void thunk_main() {}\n")
+            _write(src / "exports" / "pg6_export_thunks.cpp", "void pg6_export_thunks() {}\n")
+            _write(
+                src / "pg6_program.cpp",
+                'extern "C" const Pg6ShardDispatchTable __playgta6_shard_dispatch_main;\n',
+            )
+            (src / "program-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-recomp-program",
+                        "schema_version": 1,
+                        "indirect_dispatch": "shard",
+                        "modules": [{"module": "main", "file": "game.exe"}],
+                        "files": [
+                            {"path": "exports/pg6_export_thunks.cpp"},
+                            {"path": "pg6_program.cpp"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            out_dir = root / "dist"
+            # Pre-seed an existing field in guest_manifest.json to verify backwards-compatible merge.
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / bgw.GUEST_MANIFEST_FILE).write_text(
+                json.dumps({"customField": "preserved"}),
+                encoding="utf-8",
+            )
+
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            runner = SyntheticWasmRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="contiguous",
+                verify_max_table_imports=16,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.indirect_dispatch, "shard")
+            self.assertEqual(report.indirect_dispatch_source, "program-manifest.json")
+            self.assertEqual(report.guest_manifest, bgw.GUEST_MANIFEST_FILE)
+            self.assertEqual(
+                report.outputs,
+                (
+                    bgw.RUNTIME_JS,
+                    bgw.RUNTIME_WASM,
+                    "guest_part_0.wasm",
+                    "guest_part_1.wasm",
+                    "guest_part_2.wasm",
+                ),
+            )
+            # Bucketing + side module roles: 2 contiguous shard modules + functions.ll last.
+            self.assertEqual([m.role for m in report.side_modules], ["shards", "shards", "registration"])
+            self.assertEqual(report.side_modules[2].shards, ("main/lift/functions.ll",))
+            # Side-module link commands never force --export-all or unsupported --icf=safe.
+            for side_cmd in runner.side_link_calls:
+                self.assertIn("-sSIDE_MODULE=1", side_cmd)
+                self.assertNotIn("--export-all", " ".join(side_cmd))
+                self.assertNotIn("--icf=safe", " ".join(side_cmd))
+
+            # Post-link Wasm metrics assertions.
+            assert report.wasm_metrics is not None
+            self.assertEqual(report.wasm_metrics.total_got_func_imports, 4)
+            self.assertEqual(report.wasm_metrics.got_func_shard_dispatch_imports, 4)
+            self.assertEqual(report.wasm_metrics.got_func_sub_imports, 0)
+            self.assertEqual(report.wasm_metrics.side_table_size, 4)
+            self.assertEqual(report.wasm_metrics.main_table_size, 64)
+            self.assertEqual(report.wasm_metrics.total_table_size, 68)
+            self.assertEqual(report.wasm_metrics.shard_dispatch_exports, 4)
+            self.assertEqual(report.wasm_metrics.shard_table_exports, 1)
+            self.assertEqual(report.warnings, [])
+
+            # guest_manifest.json contains backwards-compatible sideModules + numeric wasmMetrics.
+            gm_path = out_dir / bgw.GUEST_MANIFEST_FILE
+            self.assertTrue(gm_path.is_file())
+            gm = json.loads(gm_path.read_text(encoding="utf-8"))
+            self.assertEqual(gm["customField"], "preserved")
+            self.assertEqual(gm["indirectDispatch"], "shard")
+            self.assertEqual(
+                gm["sideModules"],
+                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
+            )
+            self.assertEqual(gm["wasmMetrics"]["totals"]["gotFuncImports"], 4)
+            self.assertEqual(gm["wasmMetrics"]["totals"]["sideTableSize"], 4)
+            self.assertEqual(gm["wasmMetrics"]["totals"]["mainTableSize"], 64)
+            self.assertEqual(gm["wasmMetrics"]["totals"]["tableSize"], 68)
+            self.assertEqual(gm["wasmMetrics"]["totals"]["shardDispatchExports"], 4)
+            self.assertEqual(len(gm["wasmMetrics"]["modules"]), 4)
+            # Zero host paths in guest_manifest.json or JSON report.
+            self.assertNotIn("\\\\", gm_path.read_text(encoding="utf-8"))
+            self.assertNotIn("\\\\", bgw.report_to_json(report))
+
+            # Text report prints telemetry table + explicit [shard-dispatch] banner.
+            text = bgw.format_report_text(report, sanitize=True)
+            self.assertIn("Indirect dispatch: shard (detected from program-manifest.json)", text)
+            self.assertIn("Wasm module telemetry:", text)
+            self.assertIn("guest_part_2.wasm", text)
+            self.assertIn("TOTAL", text)
+            self.assertIn("[shard-dispatch] Active:", text)
+            self.assertIn("437,813", text)
+            self.assertIn("Guest manifest: guest_manifest.json", text)
+
+            # Enforcing a tight --verify-max-table-imports limit (e.g. 2 < 4) fails cleanly.
+            fail_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist-tight",
+                jobs=2,
+                split_modules=2,
+                split_strategy="contiguous",
+                verify_max_table_imports=2,
+                runtime_lib=orig_lib,
+                run_command=SyntheticWasmRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertFalse(fail_rep.ok)
+            self.assertTrue(
+                any("GOT.func imports (4) exceeds --verify-max-table-imports limit (2)" in e for e in fail_rep.errors),
+                fail_rep.errors,
+            )
+
+    def test_legacy_table_build_telemetry_limits_and_shard_sub_warning(self) -> None:
+        # Legacy table shape: functions.o (guest_part_1.wasm) imports 250 GOT.func.sub_* entries.
+        legacy_wasms = {
+            "runtime.wasm": _build_synthetic_wasm(
+                imports=[("env", "host_log", "func")],
+                tables=[(0x70, 32, None, False)],
+                exports=[("main", 0x00, 0)],
+            ),
+            "guest_part_0.wasm": _build_synthetic_wasm(
+                dylink=(4096, 250),
+                exports=[(f"sub_{i:04x}", 0x00, i) for i in range(250)],
+            ),
+            "guest_part_1.wasm": _build_synthetic_wasm(
+                dylink=(8192, 0),
+                imports=[("GOT.func", f"sub_{i:04x}", "got_global") for i in range(250)],
+                exports=[("__playgta6_lifted_functions", 0x03, 0)],
+            ),
+        }
+
+        class LegacyWasmRunner(RecordingRunner):
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                out_path = _dash_o(tuple(str(a) for a in argv))
+                if res.returncode == 0 and out_path is not None:
+                    p = Path(out_path)
+                    if p.name in legacy_wasms:
+                        p.write_bytes(legacy_wasms[p.name])
+                    elif p.name == bgw.RUNTIME_JS:
+                        p.with_suffix(".wasm").write_bytes(legacy_wasms["runtime.wasm"])
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _module_layout(root, "legacy_mod", shards=2)
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+
+            # 1) Legacy table build succeeds normally without [shard-dispatch] banner.
+            dist_ok = root / "dist-ok"
+            rep_ok = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=dist_ok,
+                jobs=2,
+                split_modules=1,
+                runtime_lib=orig_lib,
+                run_command=LegacyWasmRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_ok.ok, rep_ok.errors)
+            self.assertEqual(rep_ok.indirect_dispatch, "table")
+            self.assertNotIn("[shard-dispatch]", bgw.format_report_text(rep_ok))
+            gm_mono = json.loads((dist_ok / bgw.GUEST_MANIFEST_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(gm_mono["indirectDispatch"], "table")
+            self.assertEqual(gm_mono["sideModules"], [])
+            self.assertEqual(gm_mono["wasmMetrics"]["totals"]["tableSize"], 32)
+
+            # 2) Legacy split build fails --verify-max-table-imports 100.
+            rep_fail = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist-fail",
+                jobs=2,
+                split_modules=1,
+                verify_max_table_imports=10,
+                runtime_lib=orig_lib,
+                run_command=LegacyWasmRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertFalse(rep_fail.ok)
+            self.assertTrue(
+                any("total wasmTable size (32) exceeds --verify-max-table-imports limit (10)" in e for e in rep_fail.errors),
+                rep_fail.errors,
+            )
+
+            # 3) Shard manifest paired with stale GOT.func.sub_* emits warning.
+            bm_path = src / "build-manifest.json"
+            bm_data = json.loads(bm_path.read_text(encoding="utf-8"))
+            bm_data["indirect_dispatch"] = "shard"
+            bm_path.write_text(json.dumps(bm_data), encoding="utf-8")
+            rep_warn = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-warn",
+                out_dir=root / "dist-warn",
+                jobs=2,
+                split_modules=2,
+                runtime_lib=orig_lib,
+                run_command=LegacyWasmRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_warn.ok, rep_warn.errors)
+            self.assertTrue(
+                any("GOT.func sub_* import(s)" in w for w in rep_warn.warnings),
+                rep_warn.warnings,
+            )
+
+            # 4) CLI rejects negative --verify-max-table-imports cleanly with exit code 2.
+            bad_code, bad_out, _ = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--verify-max-table-imports",
+                    "-5",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2, bad_out)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("verify-max-table-imports" in e for e in bad_payload["errors"]))
+
+    def test_split_js_optimizer_preserves_shard_dispatch_symbols_in_got_and_wasm_imports(self) -> None:
+        fixture = r"""
+var LDSO = { loadedLibsByName: { 'guest_part_0.wasm': { exports: { __playgta6_dispatch_shard_main_00000: () => 1 } } } };
+var wasmImports = {
+  sub_140001000: () => 10,
+  __playgta6_dispatch_shard_main_00000: () => 20,
+  __playgta6_shard_dispatch_main: 4096,
+};
+var GOT = {
+  sub_140001000: { value: 1 },
+  __playgta6_dispatch_shard_main_00000: { value: 2 },
+  __playgta6_shard_dispatch_main: { value: 4096 },
+};
+var functionsInTableMap = new Map();
+function instantiate() {
+  var moduleExports;
+  function resolve(s) { return wasmImports[s]; }
+  var proxy = new Proxy({}, {
+    get(stubs, prop) {
+      if (!(prop in stubs)) {
+        var resolved;
+        stubs[prop] = (...args) => {
+          resolved ||= resolve(prop);
+          return resolved(...args);
+        };
+      }
+      return stubs[prop];
+    }
+  });
+  moduleExports = {};
+  return proxy;
+}
+async function loadDylibs() { instantiate().sub_140001000; }
+async function boot() { await loadDylibs(); }
+"""
+        patched, status = bgw.optimize_split_runtime_js(fixture, max_concurrent_pthread_loads=0)
+        self.assertTrue(status["post_load_dylibs_cleanup"])
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node not installed")
+        proc = subprocess.run(
+            [
+                node,
+                "-e",
+                patched
+                + "\n(async()=>{await boot();console.log(JSON.stringify({wi:Object.keys(wasmImports).sort(),got:Object.keys(GOT).sort()}));})();",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        res = json.loads(proc.stdout.strip())
+        self.assertEqual(
+            res["wi"],
+            ["__playgta6_dispatch_shard_main_00000", "__playgta6_shard_dispatch_main"],
+        )
+        self.assertEqual(
+            res["got"],
+            ["__playgta6_dispatch_shard_main_00000", "__playgta6_shard_dispatch_main"],
+        )
 
 
 if __name__ == "__main__":
