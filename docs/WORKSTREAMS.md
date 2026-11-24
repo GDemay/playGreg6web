@@ -68,6 +68,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Resolve switches whose table base or index reaches the indirect jump through control-flow merges, keeping the existing soundness rules, and measure resolved / unresolved counts before and after.
 - [x] **R32 — Real-Binary Boot Bring-Up, Phase 4: From a Sustained Frame Loop to the Title's First Real Content** — `DONE` (PRs #515–#658, closes #481) *(continues R23; local game files only for local runs)*
   - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
+- [ ] **R1 — Real-Binary Boot, Phase 5: Past the Start Screen — Steady State, Scripted Input, Next Blockers** — `IN PROGRESS` (#663, @Timon-ok) *(continues R32)*
+  - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
 
 ---
 
