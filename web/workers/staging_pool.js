@@ -68,6 +68,36 @@
     return remainder === 0 ? value : value + (alignment - remainder);
   }
 
+  /**
+   * Align a requested staging buffer size to a WebGPU 4-byte multiple with a
+   * minimum size of 4 bytes (`Math.max(4, Math.ceil(size / 4) * 4)`), safe across
+   * the full IEEE-754 integer range.
+   *
+   * @param {number} size
+   * @returns {number}
+   */
+  function alignBufferSize(size) {
+    assertNonNegativeInteger(size, 'size');
+    if (size === 0) {
+      return WEBGPU_BUFFER_COPY_ALIGNMENT;
+    }
+    return alignUp(size, WEBGPU_BUFFER_COPY_ALIGNMENT);
+  }
+
+  function lcmWithBufferAlignment(alignment) {
+    if (alignment % WEBGPU_BUFFER_COPY_ALIGNMENT === 0) {
+      return alignment;
+    }
+    if (alignment % 2 === 0) {
+      return alignment * 2;
+    }
+    return alignment * WEBGPU_BUFFER_COPY_ALIGNMENT;
+  }
+
+  function isSharedBuffer(buffer) {
+    return typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer;
+  }
+
   function toUint8Array(input, label) {
     if (input instanceof Uint8Array) {
       return input;
@@ -78,12 +108,58 @@
     if (input instanceof ArrayBuffer) {
       return new Uint8Array(input);
     }
-    if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) {
+    if (isSharedBuffer(input)) {
       return new Uint8Array(input);
     }
     throw new TypeError(
       `${label} expects a Uint8Array, ArrayBufferView, ArrayBuffer, or SharedArrayBuffer`
     );
+  }
+
+  /**
+   * Sanitize a buffer upload payload for `GPUQueue.writeBuffer()`:
+   *  - Copies `SharedArrayBuffer`-backed views into a regular `ArrayBuffer`-backed `Uint8Array`.
+   *  - Zero-pads non-4-byte lengths up to a 4-byte multiple (`alignBufferSize`).
+   *
+   * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
+   * @returns {{ bytes: Uint8Array, originalByteLength: number, alignedByteLength: number, padded: boolean, copiedFromSab: boolean }}
+   */
+  function sanitizeWriteBufferPayload(srcBytes) {
+    const src = toUint8Array(srcBytes, 'sanitizeWriteBufferPayload');
+    const originalByteLength = src.byteLength;
+    if (originalByteLength === 0) {
+      return {
+        bytes: new Uint8Array(0),
+        originalByteLength: 0,
+        alignedByteLength: 0,
+        padded: false,
+        copiedFromSab: false,
+      };
+    }
+
+    const alignedByteLength = alignBufferSize(originalByteLength);
+    const padded = alignedByteLength !== originalByteLength;
+    const copiedFromSab = isSharedBuffer(src.buffer);
+
+    if (padded || copiedFromSab) {
+      const copy = new Uint8Array(alignedByteLength);
+      copy.set(src, 0);
+      return {
+        bytes: copy,
+        originalByteLength,
+        alignedByteLength,
+        padded,
+        copiedFromSab,
+      };
+    }
+
+    return {
+      bytes: src,
+      originalByteLength,
+      alignedByteLength,
+      padded: false,
+      copiedFromSab: false,
+    };
   }
 
   function normalizeOrigin(origin) {
@@ -148,6 +224,7 @@
       }
 
       let resolvedChunkSize;
+      let initialAlignPads = 0;
       if (chunkSize === undefined) {
         const clampedMax = Math.max(
           WEBGPU_BUFFER_COPY_ALIGNMENT,
@@ -156,7 +233,10 @@
         resolvedChunkSize = Math.min(DEFAULT_CHUNK_SIZE, clampedMax);
       } else {
         assertPositiveInteger(chunkSize, 'chunkSize');
-        resolvedChunkSize = alignUp(chunkSize, WEBGPU_BUFFER_COPY_ALIGNMENT);
+        resolvedChunkSize = alignBufferSize(chunkSize);
+        if (resolvedChunkSize !== chunkSize) {
+          initialAlignPads = 1;
+        }
       }
 
       this.device = device;
@@ -168,9 +248,11 @@
       this._destroyed = false;
       this._currentFrame = -1;
       this._inFrame = false;
+      this._frameStartedAtLeastOnce = false;
       this._nextChunkId = 1;
 
       this._allChunks = new Set();
+      this._chunkByBuffer = new Map();
       this._activeChunks = [];
       this._recycledChunks = [];
       this._inFlightChunks = [];
@@ -185,6 +267,9 @@
       this._allocationCount = 0;
       this._bufferReuseHits = 0;
       this._bufferReuseMisses = 0;
+      this._alignPadCount = initialAlignPads;
+      this._sabCopyCount = 0;
+      this._doubleReleaseIgnored = 0;
 
       // Per-frame telemetry (reset on beginFrame / endFrame).
       this._frameAllocations = 0;
@@ -204,11 +289,12 @@
           this._currentFrame = 0;
         }
         this._inFrame = true;
+        this._frameStartedAtLeastOnce = true;
       }
     }
 
     _createChunk(byteSize, oversized) {
-      const allocSize = alignUp(byteSize, WEBGPU_BUFFER_COPY_ALIGNMENT);
+      const allocSize = alignBufferSize(byteSize);
       this._ensureBudget(allocSize, byteSize);
 
       const id = this._nextChunkId++;
@@ -248,6 +334,7 @@
         size: allocSize,
         cursor: 0,
         oversized,
+        state: 'active',
         retiredAtFrame: -1,
         gpuDone: false,
         readyToRecycle: false,
@@ -258,6 +345,7 @@
       };
 
       this._allChunks.add(chunk);
+      this._chunkByBuffer.set(buffer, chunk);
       this._totalChunksAllocated += 1;
       this._allocatedBytes += allocSize;
       if (this._allocatedBytes > this._peakAllocatedBytes) {
@@ -268,24 +356,115 @@
     }
 
     _destroyChunk(chunk) {
-      if (chunk.destroyed) {
+      if (!chunk || chunk.destroyed || chunk.state === 'destroyed') {
         return;
       }
       chunk.destroyed = true;
+      chunk.state = 'destroyed';
       chunk.isMapped = false;
       chunk.mapPending = false;
       chunk.mappedView = null;
       this._allChunks.delete(chunk);
+      if (chunk.buffer) {
+        this._chunkByBuffer.delete(chunk.buffer);
+      }
+      if (this._currentChunk === chunk) {
+        this._currentChunk = null;
+      }
+      const activeIdx = this._activeChunks.indexOf(chunk);
+      if (activeIdx !== -1) {
+        this._activeChunks.splice(activeIdx, 1);
+      }
+      const recycledIdx = this._recycledChunks.indexOf(chunk);
+      if (recycledIdx !== -1) {
+        this._recycledChunks.splice(recycledIdx, 1);
+      }
+      const inFlightIdx = this._inFlightChunks.indexOf(chunk);
+      if (inFlightIdx !== -1) {
+        this._inFlightChunks.splice(inFlightIdx, 1);
+      }
       this._allocatedBytes = Math.max(0, this._allocatedBytes - chunk.size);
       if (chunk.buffer && typeof chunk.buffer.destroy === 'function') {
         chunk.buffer.destroy();
       }
     }
 
+    _pickEvictionIndex() {
+      // Prefer evicting idle oversized burst chunks (largest first) to keep
+      // steady-state standard chunks warm in the recycled pool.
+      let oversizedIdx = -1;
+      let oversizedMax = -1;
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        const candidate = this._recycledChunks[i];
+        if (candidate.oversized && candidate.size > oversizedMax) {
+          oversizedIdx = i;
+          oversizedMax = candidate.size;
+        }
+      }
+      return oversizedIdx !== -1 ? oversizedIdx : 0;
+    }
+
+    _reclaimCompletedInFlight() {
+      if (this._destroyed || this._inFlightChunks.length === 0) {
+        return 0;
+      }
+      let reclaimed = 0;
+      const stillInFlight = [];
+      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
+        const chunk = this._inFlightChunks[i];
+        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight') {
+          continue;
+        }
+        if (chunk.gpuDone) {
+          if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
+            chunk.readyToRecycle = true;
+            this._beginRemap(chunk);
+            if (chunk.isMapped) {
+              chunk.cursor = 0;
+              chunk.retiredAtFrame = -1;
+              chunk.gpuDone = false;
+              chunk.readyToRecycle = false;
+              chunk.state = 'recycled';
+              this._recycledChunks.push(chunk);
+              reclaimed += 1;
+            } else {
+              stillInFlight.push(chunk);
+            }
+          } else {
+            chunk.cursor = 0;
+            chunk.retiredAtFrame = -1;
+            chunk.gpuDone = false;
+            chunk.readyToRecycle = false;
+            chunk.state = 'recycled';
+            this._recycledChunks.push(chunk);
+            reclaimed += 1;
+          }
+        } else {
+          stillInFlight.push(chunk);
+        }
+      }
+      this._inFlightChunks = stillInFlight;
+      return reclaimed;
+    }
+
+    /**
+     * Synchronously move any GPU-completed (`onSubmittedWorkDone`) in-flight chunks
+     * into the recycled pool so burst allocations can reuse them immediately.
+     *
+     * @returns {number} Number of chunks reclaimed into the recycled pool.
+     */
+    recycleCompleted() {
+      this._assertNotDestroyed();
+      return this._reclaimCompletedInFlight();
+    }
+
     _ensureBudget(allocSize, requestedSize) {
       if (this._allocatedBytes + allocSize <= this.maxPoolBytes) {
         return;
       }
+
+      // First reclaim any GPU-completed in-flight chunks so burst eviction can reuse/free them.
+      this._reclaimCompletedInFlight();
 
       // Check whether evicting idle recycled chunks can make room for this allocation.
       let reclaimable = 0;
@@ -298,7 +477,8 @@
           this._recycledChunks.length > 0 &&
           this._allocatedBytes + allocSize > this.maxPoolBytes
         ) {
-          const evicted = this._recycledChunks.shift();
+          const evictIdx = this._pickEvictionIndex();
+          const [evicted] = this._recycledChunks.splice(evictIdx, 1);
           this._destroyChunk(evicted);
         }
         return;
@@ -323,7 +503,13 @@
       if (!oversized) {
         for (let i = 0; i < this._recycledChunks.length; i += 1) {
           const candidate = this._recycledChunks[i];
-          if (!candidate.oversized && candidate.size >= minSize && candidate.size < bestSize) {
+          if (
+            !candidate.destroyed &&
+            candidate.state === 'recycled' &&
+            !candidate.oversized &&
+            candidate.size >= minSize &&
+            candidate.size < bestSize
+          ) {
             bestIndex = i;
             bestSize = candidate.size;
           }
@@ -333,7 +519,12 @@
       if (bestIndex === -1) {
         for (let i = 0; i < this._recycledChunks.length; i += 1) {
           const candidate = this._recycledChunks[i];
-          if (candidate.size >= minSize && candidate.size < bestSize) {
+          if (
+            !candidate.destroyed &&
+            candidate.state === 'recycled' &&
+            candidate.size >= minSize &&
+            candidate.size < bestSize
+          ) {
             bestIndex = i;
             bestSize = candidate.size;
           }
@@ -349,15 +540,20 @@
       chunk.retiredAtFrame = -1;
       chunk.gpuDone = false;
       chunk.readyToRecycle = false;
+      chunk.state = 'active';
       return chunk;
     }
 
     _acquireChunk(requiredSize, oversized) {
-      const targetSize = oversized ? alignUp(requiredSize, WEBGPU_BUFFER_COPY_ALIGNMENT) : this.chunkSize;
-      const recycled = this._takeRecycledChunk(
-        oversized ? targetSize : requiredSize,
-        oversized
-      );
+      const targetSize = oversized ? alignBufferSize(requiredSize) : this.chunkSize;
+      const minRequired = oversized ? targetSize : requiredSize;
+      let recycled = this._takeRecycledChunk(minRequired, oversized);
+
+      // During Frame-1 or mid-frame bursts, reclaim GPU-finished chunks on demand
+      // before allocating fresh GPUBuffers.
+      if (!recycled && this._reclaimCompletedInFlight() > 0) {
+        recycled = this._takeRecycledChunk(minRequired, oversized);
+      }
 
       if (recycled) {
         this._bufferReuseHits += 1;
@@ -372,6 +568,9 @@
     }
 
     _moveInFlightToRecycled(chunk) {
+      if (this._destroyed || !chunk || chunk.destroyed || chunk.state !== 'inFlight') {
+        return false;
+      }
       const idx = this._inFlightChunks.indexOf(chunk);
       if (idx === -1) {
         return false;
@@ -381,6 +580,7 @@
       chunk.retiredAtFrame = -1;
       chunk.gpuDone = false;
       chunk.readyToRecycle = false;
+      chunk.state = 'recycled';
       this._recycledChunks.push(chunk);
       return true;
     }
@@ -430,12 +630,32 @@
       }
       for (let i = 0; i < retiredChunks.length; i += 1) {
         const chunk = retiredChunks[i];
-        if (chunk.destroyed || this._inFlightChunks.indexOf(chunk) === -1) {
+        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight' || this._inFlightChunks.indexOf(chunk) === -1) {
           continue;
         }
         chunk.gpuDone = true;
         if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
           this._beginRemap(chunk);
+        }
+      }
+    }
+
+    _attachWorkDoneFence(retiredChunks) {
+      if (
+        retiredChunks.length > 0 &&
+        this.device.queue &&
+        typeof this.device.queue.onSubmittedWorkDone === 'function'
+      ) {
+        const workDone = this.device.queue.onSubmittedWorkDone();
+        if (workDone && typeof workDone.then === 'function') {
+          workDone.then(
+            () => {
+              this._onWorkDone(retiredChunks);
+            },
+            () => {
+              // Ignore rejected fence (e.g., lost/destroyed device).
+            }
+          );
         }
       }
     }
@@ -465,6 +685,7 @@
 
       this._currentFrame = nextFrame;
       this._inFrame = true;
+      this._frameStartedAtLeastOnce = true;
       this._frameAllocations = 0;
       this._frameBytesAllocated = 0;
       this._frameBytesUploaded = 0;
@@ -474,6 +695,9 @@
 
       for (let i = 0; i < this._inFlightChunks.length; i += 1) {
         const chunk = this._inFlightChunks[i];
+        if (!chunk || chunk.destroyed || chunk.state !== 'inFlight') {
+          continue;
+        }
         const epochElapsed = nextFrame - chunk.retiredAtFrame >= this.framesInFlight;
         if (chunk.gpuDone || epochElapsed) {
           if (this.mode === STAGING_MODE.MAPPED && !chunk.isMapped) {
@@ -484,6 +708,7 @@
               chunk.retiredAtFrame = -1;
               chunk.gpuDone = false;
               chunk.readyToRecycle = false;
+              chunk.state = 'recycled';
               this._recycledChunks.push(chunk);
               recycledCount += 1;
             } else {
@@ -494,6 +719,7 @@
             chunk.retiredAtFrame = -1;
             chunk.gpuDone = false;
             chunk.readyToRecycle = false;
+            chunk.state = 'recycled';
             this._recycledChunks.push(chunk);
             recycledCount += 1;
           }
@@ -523,7 +749,7 @@
       }
       for (let i = 0; i < this._activeChunks.length; i += 1) {
         const chunk = this._activeChunks[i];
-        if (chunk.isMapped) {
+        if (!chunk.destroyed && chunk.isMapped) {
           if (typeof chunk.buffer.unmap === 'function') {
             chunk.buffer.unmap();
           }
@@ -537,9 +763,60 @@
      * Await any in-progress `GPUBuffer.mapAsync()` operations (useful in `'mapped'` mode).
      */
     async waitForPendingMaps() {
-      while (this._pendingMapPromises.size > 0) {
+      while (!this._destroyed && this._pendingMapPromises.size > 0) {
         await Promise.all(Array.from(this._pendingMapPromises));
       }
+    }
+
+    /**
+     * Explicitly retire an active staging slice or GPUBuffer into the in-flight queue.
+     * Guarded against double-release: releasing an already-retired, recycled, destroyed,
+     * or unknown buffer is a safe no-op returning `false`.
+     *
+     * @param {{ buffer: GPUBuffer } | GPUBuffer} sliceOrBuffer
+     * @returns {boolean} `true` if the active chunk was retired, `false` if ignored.
+     */
+    release(sliceOrBuffer) {
+      this._assertNotDestroyed();
+      if (!sliceOrBuffer || typeof sliceOrBuffer !== 'object') {
+        return false;
+      }
+      const buffer = sliceOrBuffer.buffer !== undefined ? sliceOrBuffer.buffer : sliceOrBuffer;
+      if (!buffer || typeof buffer !== 'object') {
+        return false;
+      }
+      const chunk = this._chunkByBuffer.get(buffer);
+      if (!chunk) {
+        return false;
+      }
+      if (chunk.destroyed || chunk.state !== 'active') {
+        this._doubleReleaseIgnored += 1;
+        return false;
+      }
+
+      const activeIdx = this._activeChunks.indexOf(chunk);
+      if (activeIdx !== -1) {
+        this._activeChunks.splice(activeIdx, 1);
+      }
+      if (this._currentChunk === chunk) {
+        this._currentChunk = null;
+      }
+
+      if (this.mode === STAGING_MODE.MAPPED && chunk.isMapped) {
+        if (typeof chunk.buffer.unmap === 'function') {
+          chunk.buffer.unmap();
+        }
+        chunk.isMapped = false;
+        chunk.mappedView = null;
+      }
+
+      chunk.state = 'inFlight';
+      chunk.retiredAtFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+      chunk.gpuDone = false;
+      chunk.readyToRecycle = false;
+      this._inFlightChunks.push(chunk);
+      this._attachWorkDoneFence([chunk]);
+      return true;
     }
 
     /**
@@ -556,37 +833,34 @@
         this._currentFrame = 0;
       }
 
+      const wasNotInFrame = !this._inFrame && this._frameStartedAtLeastOnce;
+
       this.prepareSubmit();
 
-      const retiredChunks = this._activeChunks;
+      const rawActive = this._activeChunks;
       this._activeChunks = [];
       this._currentChunk = null;
 
-      for (let i = 0; i < retiredChunks.length; i += 1) {
-        const chunk = retiredChunks[i];
+      const retiredChunks = [];
+      for (let i = 0; i < rawActive.length; i += 1) {
+        const chunk = rawActive[i];
+        if (!chunk || chunk.destroyed || chunk.state !== 'active') {
+          this._doubleReleaseIgnored += 1;
+          continue;
+        }
+        chunk.state = 'inFlight';
         chunk.retiredAtFrame = this._currentFrame;
         chunk.gpuDone = false;
         chunk.readyToRecycle = false;
         this._inFlightChunks.push(chunk);
+        retiredChunks.push(chunk);
       }
 
-      if (
-        retiredChunks.length > 0 &&
-        this.device.queue &&
-        typeof this.device.queue.onSubmittedWorkDone === 'function'
-      ) {
-        const workDone = this.device.queue.onSubmittedWorkDone();
-        if (workDone && typeof workDone.then === 'function') {
-          workDone.then(
-            () => {
-              this._onWorkDone(retiredChunks);
-            },
-            () => {
-              // Ignore rejected fence (e.g., lost/destroyed device).
-            }
-          );
-        }
+      if (wasNotInFrame && retiredChunks.length === 0) {
+        this._doubleReleaseIgnored += 1;
       }
+
+      this._attachWorkDoneFence(retiredChunks);
 
       const frameStats = {
         frameIndex: this._currentFrame,
@@ -611,9 +885,12 @@
      * over to a recycled or newly allocated chunk (or a dedicated oversized chunk
      * when `byteSize > chunkSize`) within `maxPoolBytes`.
      *
+     * Enforces WebGPU 4-byte minimum alignment for buffer reservation and offsets
+     * while preserving `slice.size === byteSize` for backwards compatibility.
+     *
      * @param {number} byteSize
      * @param {number} [alignment=4]
-     * @returns {{ buffer: GPUBuffer, offset: number, size: number, view?: Uint8Array }}
+     * @returns {{ buffer: GPUBuffer, offset: number, size: number, alignedSize: number, view?: Uint8Array }}
      */
     allocate(byteSize, alignment = WEBGPU_BUFFER_COPY_ALIGNMENT) {
       this._assertNotDestroyed();
@@ -621,30 +898,37 @@
       assertPositiveInteger(alignment, 'alignment');
       this._ensureInFrame();
 
+      const alignedSize = alignBufferSize(byteSize);
+      const effectiveAlignment = lcmWithBufferAlignment(alignment);
+
       let chunk;
       let offset;
 
-      if (byteSize > this.chunkSize) {
+      if (alignedSize > this.chunkSize) {
         // Dedicated oversized chunk; preserve _currentChunk for smaller allocations.
-        chunk = this._acquireChunk(byteSize, true);
+        chunk = this._acquireChunk(alignedSize, true);
         offset = 0;
-        chunk.cursor = byteSize;
+        chunk.cursor = alignedSize;
       } else {
-        if (this._currentChunk) {
-          const candidateOffset = alignUp(this._currentChunk.cursor, alignment);
-          if (candidateOffset + byteSize <= this._currentChunk.size) {
+        if (this._currentChunk && !this._currentChunk.destroyed && this._currentChunk.state === 'active') {
+          const candidateOffset = alignUp(this._currentChunk.cursor, effectiveAlignment);
+          if (candidateOffset + alignedSize <= this._currentChunk.size) {
             chunk = this._currentChunk;
             offset = candidateOffset;
-            chunk.cursor = offset + byteSize;
+            chunk.cursor = offset + alignedSize;
           }
         }
 
         if (!chunk) {
-          chunk = this._acquireChunk(byteSize, false);
+          chunk = this._acquireChunk(alignedSize, false);
           offset = 0;
-          chunk.cursor = byteSize;
+          chunk.cursor = alignedSize;
           this._currentChunk = chunk;
         }
+      }
+
+      if (alignedSize !== byteSize) {
+        this._alignPadCount += 1;
       }
 
       this._allocationCount += 1;
@@ -655,16 +939,21 @@
         buffer: chunk.buffer,
         offset,
         size: byteSize,
+        alignedSize,
       };
       if (chunk.isMapped && chunk.mappedView) {
         slice.view = chunk.mappedView.subarray(offset, offset + byteSize);
+        if (alignedSize > byteSize) {
+          chunk.mappedView.fill(0, offset + byteSize, offset + alignedSize);
+        }
       }
       return slice;
     }
 
     /**
      * Stage `srcBytes` into the pool (with 4-byte aligned length per WebGPU
-     * `copyBufferToBuffer` requirements) and record `encoder.copyBufferToBuffer(...)`.
+     * `copyBufferToBuffer` requirements and SharedArrayBuffer-safe copies) and
+     * record `encoder.copyBufferToBuffer(...)`.
      *
      * Supports both `device.queue.writeBuffer` staging-ring mode and mapped
      * `copyBufferToBuffer` mode transparently.
@@ -699,13 +988,15 @@
         };
       }
 
-      const copySize = alignUp(src.byteLength, WEBGPU_BUFFER_COPY_ALIGNMENT);
+      const copySize = alignBufferSize(src.byteLength);
+      const needsPad = copySize !== src.byteLength;
       const slice = this.allocate(copySize, WEBGPU_BUFFER_COPY_ALIGNMENT);
 
       if (slice.view) {
         slice.view.set(src, 0);
-        if (copySize > src.byteLength) {
+        if (needsPad) {
           slice.view.fill(0, src.byteLength, copySize);
+          this._alignPadCount += 1;
         }
       } else {
         if (!this.device.queue || typeof this.device.queue.writeBuffer !== 'function') {
@@ -713,14 +1004,14 @@
             'stageBufferUpload in writeBuffer mode requires device.queue.writeBuffer()'
           );
         }
-        let payload;
-        if (copySize === src.byteLength) {
-          payload = src;
-        } else {
-          payload = new Uint8Array(copySize);
-          payload.set(src, 0);
+        const prepared = sanitizeWriteBufferPayload(src);
+        this.device.queue.writeBuffer(slice.buffer, slice.offset, prepared.bytes);
+        if (prepared.padded) {
+          this._alignPadCount += 1;
         }
-        this.device.queue.writeBuffer(slice.buffer, slice.offset, payload);
+        if (prepared.copiedFromSab) {
+          this._sabCopyCount += 1;
+        }
       }
 
       encoder.copyBufferToBuffer(slice.buffer, slice.offset, dstBuffer, dstOffset, copySize);
@@ -814,9 +1105,15 @@
             'stageTextureUpload in writeBuffer mode requires device.queue.writeBuffer()'
           );
         }
+        const fromSab = isSharedBuffer(src.buffer);
         let payload;
         if (alignedBytesPerRow === unalignedBytesPerRow) {
-          payload = src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes);
+          if (fromSab) {
+            payload = new Uint8Array(stagedBytes);
+            payload.set(src.subarray(0, stagedBytes), 0);
+          } else {
+            payload = src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes);
+          }
         } else {
           payload = new Uint8Array(stagedBytes);
           for (let row = 0; row < totalRows; row += 1) {
@@ -828,6 +1125,9 @@
           }
         }
         this.device.queue.writeBuffer(slice.buffer, slice.offset, payload);
+        if (fromSab) {
+          this._sabCopyCount += 1;
+        }
       }
 
       const source = {
@@ -886,17 +1186,25 @@
      * Return pool-wide allocation, reuse, and upload statistics.
      */
     getStats() {
+      const activeCount = this._activeChunks.length;
+      const recycledCount = this._recycledChunks.length;
       return {
         totalChunksAllocated: this._totalChunksAllocated,
-        activeChunks: this._activeChunks.length,
-        recycledChunks: this._recycledChunks.length,
+        activeChunks: activeCount,
+        recycledChunks: recycledCount,
         inFlightChunks: this._inFlightChunks.length,
+        activeBuffers: activeCount,
+        recycledBuffers: recycledCount,
         allocatedBytes: this._allocatedBytes,
         peakAllocatedBytes: this._peakAllocatedBytes,
         bytesUploaded: this._bytesUploaded,
         allocationCount: this._allocationCount,
         bufferReuseHits: this._bufferReuseHits,
         bufferReuseMisses: this._bufferReuseMisses,
+        alignPadCount: this._alignPadCount,
+        sabCopyCount: this._sabCopyCount,
+        doubleReleaseIgnored: this._doubleReleaseIgnored,
+        destroyed: this._destroyed,
       };
     }
 
@@ -905,6 +1213,7 @@
      */
     destroy() {
       if (this._destroyed) {
+        this._doubleReleaseIgnored += 1;
         return;
       }
       this._destroyed = true;
@@ -914,6 +1223,8 @@
       }
 
       this._allChunks.clear();
+      this._chunkByBuffer.clear();
+      this._pendingMapPromises.clear();
       this._activeChunks = [];
       this._recycledChunks = [];
       this._inFlightChunks = [];
@@ -933,6 +1244,9 @@
     MAP_MODE,
     STAGING_MODE,
     alignUp,
+    alignBufferSize,
+    isSharedBuffer,
+    sanitizeWriteBufferPayload,
     GpuStagingPool,
   });
 

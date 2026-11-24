@@ -1,12 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const stagingMod = require('../web/workers/staging_pool.js');
 
 const {
   alignUp,
+  alignBufferSize,
+  isSharedBuffer,
+  sanitizeWriteBufferPayload,
   GpuStagingPool,
   BUFFER_USAGE,
   MAP_MODE,
@@ -744,5 +749,443 @@ test('auto-incrementing beginFrame, empty uploads, aligned textures, and recycle
   assert.equal(pool.getStats().bufferReuseMisses, missesBefore);
 
   pool.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// G46 Hardening: 4-byte alignment, SharedArrayBuffer-safe uploads,
+// double-release / use-after-destroy guards, and Frame-1 burst recycling.
+// ---------------------------------------------------------------------------
+
+function createStrictWebGpuDevice(options = {}) {
+  const mock = createMockGpuDevice(options);
+  const origWriteBuffer = mock.device.queue.writeBuffer;
+  const rawWriteArgs = [];
+
+  mock.device.queue.writeBuffer = (buffer, bufferOffset, data) => {
+    if (bufferOffset % 4 !== 0) {
+      throw new RangeError(`WebGPU writeBuffer bufferOffset (${bufferOffset}) must be 4-byte aligned`);
+    }
+    if (typeof SharedArrayBuffer !== 'undefined') {
+      if (data instanceof SharedArrayBuffer) {
+        throw new TypeError('WebGPU writeBuffer rejected SharedArrayBuffer directly');
+      }
+      if (ArrayBuffer.isView(data) && data.buffer instanceof SharedArrayBuffer) {
+        throw new TypeError('WebGPU writeBuffer rejected SharedArrayBuffer-backed view');
+      }
+    }
+    const byteLength = ArrayBuffer.isView(data) ? data.byteLength : data.byteLength;
+    if (byteLength % 4 !== 0) {
+      throw new RangeError(`WebGPU writeBuffer size (${byteLength}) must be 4-byte aligned`);
+    }
+    rawWriteArgs.push({ buffer, bufferOffset, data });
+    return origWriteBuffer(buffer, bufferOffset, data);
+  };
+
+  return { ...mock, rawWriteArgs };
+}
+
+test('G46: alignBufferSize and 4-byte staging allocation alignment track alignPadCount accurately', () => {
+  assert.equal(alignBufferSize(0), 4);
+  assert.equal(alignBufferSize(1), 4);
+  assert.equal(alignBufferSize(2), 4);
+  assert.equal(alignBufferSize(3), 4);
+  assert.equal(alignBufferSize(4), 4);
+  assert.equal(alignBufferSize(5), 8);
+  assert.equal(alignBufferSize(7), 8);
+  assert.equal(alignBufferSize(8), 8);
+  assert.equal(alignBufferSize(0x100000001), 0x100000004);
+  assert.throws(() => alignBufferSize(-1), RangeError);
+  assert.throws(() => alignBufferSize(1.25), RangeError);
+
+  const { device, createdBuffers } = createStrictWebGpuDevice();
+  // Unaligned chunkSize (513) rounds up to 516 and increments alignPadCount once.
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 513,
+    maxPoolBytes: 4096,
+    framesInFlight: 2,
+  });
+
+  assert.equal(pool.chunkSize, 516);
+  assert.equal(pool.getStats().alignPadCount, 1);
+
+  pool.beginFrame(0);
+
+  // Unaligned sizes + sub-4-byte alignments still produce 4-byte aligned offsets and reservations.
+  const a1 = pool.allocate(1, 1);
+  assert.equal(a1.offset, 0);
+  assert.equal(a1.size, 1);
+  assert.equal(a1.alignedSize, 4);
+  assert.equal(createdBuffers[0].size, 516);
+
+  const a2 = pool.allocate(3, 2);
+  assert.equal(a2.offset, 4);
+  assert.equal(a2.offset % 4, 0);
+  assert.equal(a2.size, 3);
+  assert.equal(a2.alignedSize, 4);
+
+  // alignment=3 -> lcm(3, 4) = 12, so next offset is 12 (divisible by both 3 and 4).
+  const a3 = pool.allocate(5, 3);
+  assert.equal(a3.offset, 12);
+  assert.equal(a3.offset % 4, 0);
+  assert.equal(a3.offset % 3, 0);
+  assert.equal(a3.size, 5);
+  assert.equal(a3.alignedSize, 8);
+
+  // Already 4-byte aligned allocation does not increment alignPadCount.
+  const a4 = pool.allocate(16, 4);
+  assert.equal(a4.offset, 20);
+  assert.equal(a4.size, 16);
+  assert.equal(a4.alignedSize, 16);
+
+  // Oversized unaligned allocation (517 > 516) creates a 520B GPUBuffer and pads once.
+  const big = pool.allocate(517, 4);
+  assert.equal(big.offset, 0);
+  assert.equal(big.size, 517);
+  assert.equal(big.alignedSize, 520);
+  assert.equal(big.buffer.size, 520);
+
+  const stats = pool.getStats();
+  // 1 (chunkSize 513->516) + 3 (a1, a2, a3) + 1 (big 517->520) = 5
+  assert.equal(stats.alignPadCount, 5);
+  assert.equal(stats.activeBuffers, 2);
+  assert.equal(stats.activeChunks, 2);
+  assert.equal(stats.recycledBuffers, 0);
+  assert.equal(stats.recycledChunks, 0);
+
+  pool.destroy();
+});
+
+test('G46: sanitizeWriteBufferPayload copies SharedArrayBuffer views and zero-pads non-4B lengths', () => {
+  // Regular ArrayBuffer, 4B aligned -> zero-copy fast path.
+  const alignedAb = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const r1 = sanitizeWriteBufferPayload(alignedAb);
+  assert.equal(r1.bytes, alignedAb);
+  assert.equal(r1.padded, false);
+  assert.equal(r1.copiedFromSab, false);
+  assert.equal(r1.alignedByteLength, 8);
+
+  // Regular ArrayBuffer, unaligned -> zero-padded copy.
+  const oddAb = new Uint8Array([0xaa, 0xbb, 0xcc]);
+  const r2 = sanitizeWriteBufferPayload(oddAb);
+  assert.notEqual(r2.bytes, oddAb);
+  assert.ok(r2.bytes.buffer instanceof ArrayBuffer);
+  assert.equal(r2.padded, true);
+  assert.equal(r2.copiedFromSab, false);
+  assert.deepEqual(Array.from(r2.bytes), [0xaa, 0xbb, 0xcc, 0x00]);
+
+  // SharedArrayBuffer, 4B aligned -> copied into regular ArrayBuffer.
+  const sab = new SharedArrayBuffer(16);
+  const sabBytes = new Uint8Array(sab);
+  for (let i = 0; i < 16; i += 1) sabBytes[i] = i + 1;
+  assert.equal(isSharedBuffer(sab), true);
+  assert.equal(isSharedBuffer(alignedAb.buffer), false);
+
+  const r3 = sanitizeWriteBufferPayload(new Uint8Array(sab, 4, 8));
+  assert.ok(r3.bytes.buffer instanceof ArrayBuffer);
+  assert.equal(isSharedBuffer(r3.bytes.buffer), false);
+  assert.equal(r3.padded, false);
+  assert.equal(r3.copiedFromSab, true);
+  assert.deepEqual(Array.from(r3.bytes), [5, 6, 7, 8, 9, 10, 11, 12]);
+
+  // SharedArrayBuffer, unaligned DataView at non-zero byteOffset -> copied + zero-padded.
+  const dv = new DataView(sab, 3, 5);
+  const r4 = sanitizeWriteBufferPayload(dv);
+  assert.ok(r4.bytes.buffer instanceof ArrayBuffer);
+  assert.equal(isSharedBuffer(r4.bytes.buffer), false);
+  assert.equal(r4.padded, true);
+  assert.equal(r4.copiedFromSab, true);
+  assert.equal(r4.originalByteLength, 5);
+  assert.equal(r4.alignedByteLength, 8);
+  assert.deepEqual(Array.from(r4.bytes), [4, 5, 6, 7, 8, 0, 0, 0]);
+
+  // Empty SharedArrayBuffer -> empty regular Uint8Array.
+  const r5 = sanitizeWriteBufferPayload(new SharedArrayBuffer(0));
+  assert.equal(r5.bytes.byteLength, 0);
+  assert.ok(r5.bytes.buffer instanceof ArrayBuffer);
+  assert.equal(r5.padded, false);
+  assert.equal(r5.copiedFromSab, false);
+});
+
+test('G46: stageBufferUpload & stageTextureUpload safely copy SharedArrayBuffer views before queue.writeBuffer', () => {
+  const { device, queueWrites, rawWriteArgs } = createStrictWebGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4096,
+    maxPoolBytes: 16384,
+    framesInFlight: 2,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuffer = { id: 'dst-sab' };
+  const dstTexture = { id: 'tex-sab' };
+
+  pool.beginFrame(0);
+
+  // 1. Aligned SharedArrayBuffer-backed Float32Array upload.
+  const sab1 = new SharedArrayBuffer(16);
+  const f32 = new Float32Array(sab1, 4, 3);
+  f32.set([1.5, 2.5, 3.5]);
+  const res1 = pool.stageBufferUpload(encoder, dstBuffer, 0, f32);
+  // Immediately mutate SAB to verify copy isolation!
+  f32.set([999, 999, 999]);
+
+  assert.equal(res1.size, 12);
+  assert.equal(res1.srcByteLength, 12);
+  assert.ok(rawWriteArgs[0].data.buffer instanceof ArrayBuffer);
+  assert.equal(isSharedBuffer(rawWriteArgs[0].data.buffer), false);
+  assert.deepEqual(Array.from(new Float32Array(queueWrites[0].data.buffer)), [1.5, 2.5, 3.5]);
+
+  // 2. Unaligned SharedArrayBuffer-backed Uint8Array upload (5 bytes -> 8 bytes zero-padded).
+  const sab2 = new SharedArrayBuffer(10);
+  const u8 = new Uint8Array(sab2, 2, 5);
+  u8.set([0xde, 0xad, 0xbe, 0xef, 0x42]);
+  const res2 = pool.stageBufferUpload(encoder, dstBuffer, 16, u8);
+  u8.fill(0xff);
+
+  assert.equal(res2.size, 8);
+  assert.equal(res2.srcByteLength, 5);
+  assert.ok(rawWriteArgs[1].data.buffer instanceof ArrayBuffer);
+  assert.deepEqual(
+    Array.from(encoder.bufferCopies[1].snapshot),
+    [0xde, 0xad, 0xbe, 0xef, 0x42, 0x00, 0x00, 0x00]
+  );
+
+  // 3. Direct SharedArrayBuffer (not wrapped in a TypedArray), unaligned 3 bytes -> 4 bytes.
+  const sab3 = new SharedArrayBuffer(3);
+  new Uint8Array(sab3).set([7, 8, 9]);
+  const res3 = pool.stageBufferUpload(encoder, dstBuffer, 32, sab3);
+  assert.equal(res3.size, 4);
+  assert.deepEqual(Array.from(encoder.bufferCopies[2].snapshot), [7, 8, 9, 0]);
+
+  // 4. SharedArrayBuffer-backed texture upload (both aligned 256B/row and unaligned 16B/row).
+  const sabTexAligned = new SharedArrayBuffer(256 * 2);
+  new Uint8Array(sabTexAligned).fill(0x3c);
+  const texRes1 = pool.stageTextureUpload(encoder, dstTexture, new Uint8Array(sabTexAligned), {
+    width: 64,
+    height: 2,
+    bytesPerRow: 256,
+  });
+  assert.equal(texRes1.size, 512);
+  assert.ok(rawWriteArgs[3].data.buffer instanceof ArrayBuffer);
+  assert.equal(isSharedBuffer(rawWriteArgs[3].data.buffer), false);
+
+  const sabTexUnaligned = new SharedArrayBuffer(16 * 2);
+  new Uint8Array(sabTexUnaligned).fill(0x5f);
+  const texRes2 = pool.stageTextureUpload(encoder, dstTexture, new Uint8Array(sabTexUnaligned), {
+    width: 4,
+    height: 2,
+    bytesPerRow: 16,
+  });
+  assert.equal(texRes2.size, 512);
+  assert.ok(rawWriteArgs[4].data.buffer instanceof ArrayBuffer);
+  assert.equal(encoder.textureCopies[1].snapshot[0], 0x5f);
+  assert.equal(encoder.textureCopies[1].snapshot[16], 0);
+
+  const stats = pool.getStats();
+  assert.equal(stats.sabCopyCount, 5);
+  assert.equal(stats.alignPadCount, 2); // res2 (5->8) and res3 (3->4)
+  assert.equal(stats.activeBuffers, 1);
+
+  pool.destroy();
+});
+
+test('G46: double-release, double-endFrame, double-destroy, and use-after-destroy are guarded safely', async () => {
+  const { device, createdBuffers } = createStrictWebGpuDevice({ enableWorkDoneFence: true });
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 2048,
+    framesInFlight: 2,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuffer = { id: 'dst-guard' };
+  const dstTexture = { id: 'tex-guard' };
+
+  pool.beginFrame(0);
+  const slice = pool.allocate(5, 4);
+  assert.equal(slice.size, 5);
+  assert.equal(slice.alignedSize, 8);
+  assert.equal(pool.getStats().activeBuffers, 1);
+  assert.equal(pool.getStats().recycledBuffers, 0);
+
+  // Calling prepareSubmit twice must not double-unmap.
+  pool.prepareSubmit();
+  pool.prepareSubmit();
+  assert.equal(createdBuffers[0].unmapCount, 1);
+
+  // Explicit release retires the chunk once; second release is a safe no-op!
+  assert.equal(pool.release(slice), true);
+  assert.equal(pool.getStats().activeBuffers, 0);
+  assert.equal(pool.getStats().inFlightChunks, 1);
+  assert.equal(pool.release(slice), false);
+  assert.equal(pool.release(slice.buffer), false);
+  assert.equal(pool.getStats().inFlightChunks, 1);
+  assert.equal(pool.getStats().doubleReleaseIgnored, 2);
+
+  // Invalid / unknown release arguments return false without throwing.
+  assert.equal(pool.release(null), false);
+  assert.equal(pool.release(undefined), false);
+  assert.equal(pool.release({ buffer: { id: 'unknown' } }), false);
+
+  // Double endFrame() without intervening beginFrame() is guarded and idempotent.
+  const firstEnd = pool.endFrame();
+  assert.equal(firstEnd.chunksRetired, 0);
+  const secondEnd = pool.endFrame();
+  assert.equal(secondEnd.chunksRetired, 0);
+  assert.equal(pool.getStats().doubleReleaseIgnored, 3);
+
+  // Destroy twice: single GPUBuffer.destroy(), increments doubleReleaseIgnored on second call.
+  pool.destroy();
+  assert.equal(createdBuffers[0].destroyCount, 1);
+  assert.equal(pool.getStats().destroyed, true);
+  assert.equal(pool.getStats().activeBuffers, 0);
+  assert.equal(pool.getStats().recycledBuffers, 0);
+
+  pool.destroy();
+  assert.equal(createdBuffers[0].destroyCount, 1);
+  assert.equal(pool.getStats().doubleReleaseIgnored, 4);
+
+  // waitForPendingMaps() resolves cleanly after destroy without hanging.
+  await pool.waitForPendingMaps();
+
+  // All mutating methods throw cleanly after destroy.
+  assert.throws(() => pool.beginFrame(1), /destroyed/i);
+  assert.throws(() => pool.prepareSubmit(), /destroyed/i);
+  assert.throws(() => pool.endFrame(), /destroyed/i);
+  assert.throws(() => pool.allocate(16, 4), /destroyed/i);
+  assert.throws(() => pool.release(slice), /destroyed/i);
+  assert.throws(() => pool.recycleCompleted(), /destroyed/i);
+  assert.throws(() => pool.stageBufferUpload(encoder, dstBuffer, 0, new Uint8Array(4)), /destroyed/i);
+  assert.throws(
+    () => pool.stageTextureUpload(encoder, dstTexture, new Uint8Array(16), { width: 2, height: 2, bytesPerRow: 8 }),
+    /destroyed/i
+  );
+  assert.throws(() => pool.writeBuffer(encoder, dstBuffer, 0, new Uint8Array(4)), /destroyed/i);
+  assert.throws(
+    () => pool.writeTexture(encoder, dstTexture, new Uint8Array(16), { width: 2, height: 2, bytesPerRow: 8 }),
+    /destroyed/i
+  );
+});
+
+test('G46: Frame-1 burst recycling reclaims GPU-completed chunks on demand and evicts oversized burst chunks first', async () => {
+  const { device, createdBuffers, deferredFences } = createStrictWebGpuDevice({
+    enableWorkDoneFence: true,
+  });
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 2560, // fits 1 standard (512B) + 1 oversized (1024B) + 2 standard (1024B) = 2560B
+    framesInFlight: 3,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuffer = { id: 'dst-burst' };
+
+  // Frame 1 burst: 2 standard chunks + 1 oversized chunk (1024B) using SAB-backed unaligned data.
+  pool.beginFrame(1);
+  const sabChunk1 = new SharedArrayBuffer(401);
+  new Uint8Array(sabChunk1).fill(0x11);
+  pool.stageBufferUpload(encoder, dstBuffer, 0, new Uint8Array(sabChunk1)); // chunk 1 (512B, 404B used)
+
+  const sabChunk2 = new SharedArrayBuffer(303);
+  new Uint8Array(sabChunk2).fill(0x22);
+  pool.stageBufferUpload(encoder, dstBuffer, 512, new Uint8Array(sabChunk2)); // rolls over -> chunk 2 (512B)
+
+  const sabOversized = new SharedArrayBuffer(1021);
+  new Uint8Array(sabOversized).fill(0x33);
+  pool.stageBufferUpload(encoder, dstBuffer, 1024, new Uint8Array(sabOversized)); // oversized -> chunk 3 (1024B)
+
+  assert.equal(pool.getStats().activeBuffers, 3);
+  assert.equal(pool.getStats().allocatedBytes, 512 + 512 + 1024);
+  assert.equal(pool.getStats().sabCopyCount, 3);
+  assert.equal(pool.getStats().alignPadCount, 3);
+
+  const end1 = pool.endFrame();
+  assert.equal(end1.chunksRetired, 3);
+  assert.equal(pool.getStats().activeBuffers, 0);
+  assert.equal(pool.getStats().inFlightChunks, 3);
+
+  // Frame 2 starts before fence resolves -> allocates 1 fresh standard chunk (total = 2560B, at budget cap).
+  pool.beginFrame(2);
+  pool.stageBufferUpload(encoder, dstBuffer, 0, new Uint8Array(256));
+  assert.equal(createdBuffers.length, 4);
+  assert.equal(pool.getStats().allocatedBytes, 2560);
+
+  // Now Frame 1's GPU fence resolves mid-Frame 2!
+  deferredFences[0].resolve();
+  await deferredFences[0].promise;
+  await Promise.resolve();
+
+  // Another allocation in Frame 2 (rolling over chunk 4) reclaims Frame 1's GPU-completed chunks
+  // on demand instead of throwing budget-exceeded or creating a 5th buffer!
+  pool.stageBufferUpload(encoder, dstBuffer, 256, new Uint8Array(400));
+  assert.equal(createdBuffers.length, 4, 'must recycle GPU-completed Frame-1 burst chunks without extra createBuffer');
+  assert.equal(pool.getStats().activeBuffers, 2);
+  assert.equal(pool.getStats().recycledBuffers, 2); // 1 standard + 1 oversized left warm
+  assert.equal(pool.getStats().bufferReuseHits, 1);
+
+  // Requesting a new 1024B oversized chunk while at budget (2560B) reuses or evicts the idle
+  // oversized burst chunk cleanly while preserving standard chunks!
+  const oversizedReuse = pool.allocate(1024, 4);
+  assert.equal(oversizedReuse.buffer, createdBuffers[2]); // reused the 1024B oversized chunk!
+  assert.equal(createdBuffers.length, 4);
+  pool.endFrame();
+
+  // Advance 3 frames to recycle everything, then request a 1280B oversized chunk:
+  // pool must evict the idle 1024B oversized chunk FIRST (keeping standard 512B chunks intact).
+  pool.beginFrame(5);
+  assert.equal(pool.getStats().recycledBuffers, 4);
+  const huge = pool.allocate(1280, 4);
+  assert.equal(huge.size, 1280);
+  assert.equal(createdBuffers[2].destroyCount, 1, 'idle oversized chunk must be evicted before standard chunks');
+  assert.equal(createdBuffers[0].destroyCount, 0, 'warm standard chunk should stay alive');
+  assert.ok(pool.getStats().allocatedBytes <= 2560);
+
+  pool.destroy();
+});
+
+test('G46: classic-worker importScripts IIFE isolation attaches PlayGta6StagingPool cleanly', () => {
+  const source = fs.readFileSync(
+    new URL('../web/workers/staging_pool.js', import.meta.url),
+    'utf8'
+  );
+  const sandbox = {
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    DataView,
+    Float32Array,
+    Math,
+    Number,
+    Object,
+    Set,
+    Map,
+    Array,
+    Promise,
+    Error,
+    TypeError,
+    RangeError,
+    JSON,
+    Infinity,
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+
+  // Running the script twice (simulating duplicate importScripts or sibling scripts with
+  // matching helper names) must NOT throw SyntaxError / Redeclaration errors.
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+
+  assert.ok(ctx.PlayGta6StagingPool);
+  assert.equal(typeof ctx.PlayGta6StagingPool.GpuStagingPool, 'function');
+  assert.equal(typeof ctx.PlayGta6StagingPool.alignBufferSize, 'function');
+  assert.equal(typeof ctx.PlayGta6StagingPool.sanitizeWriteBufferPayload, 'function');
+  // Internal constants must stay isolated inside the IIFE.
+  assert.equal(ctx.DEFAULT_CHUNK_SIZE, undefined);
+  assert.equal(ctx.WEBGPU_BUFFER_COPY_ALIGNMENT, undefined);
 });
 
