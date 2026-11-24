@@ -22,6 +22,7 @@ const {
   IoWorkerController,
   isImmutableHttpfsPath,
   parseContentRangeHeader,
+  resolveHttpfsRoute,
 } = ioWorkerMod;
 
 const {
@@ -897,5 +898,315 @@ test('classic Web Worker (importScripts) exposes ImmutableHttpfsCache and report
     assert.equal(statsMsg.stats.immutableCache.filesIndexed, 1);
   } finally {
     await workerSelf.onmessage({ data: { detachMailbox: true, id: 3 } });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7. W91: shaders/ HTTPFS mount routing, manifest bypass, custom shadersBase,
+//    HTTP 206 range reads, traversal rejection, and worker init forwarding
+// ---------------------------------------------------------------------------
+
+test('W91: resolveHttpfsRoute routes shaders/... to shadersBase and blocks traversal', () => {
+  const bases = {
+    dataBase: '/data/',
+    bootBase: '/boot/',
+    gameBase: '/game/',
+    shadersBase: '/shaders/',
+  };
+
+  assert.deepEqual(resolveHttpfsRoute('shaders/splash.wgsl.pack', bases), {
+    ok: true,
+    isRpf: false,
+    mount: 'shaders',
+    base: '/shaders/',
+    relPath: 'splash.wgsl.pack',
+    url: '/shaders/splash.wgsl.pack',
+  });
+
+  assert.deepEqual(resolveHttpfsRoute('shaders/dump_pipelines.flag', bases), {
+    ok: true,
+    isRpf: false,
+    mount: 'shaders',
+    base: '/shaders/',
+    relPath: 'dump_pipelines.flag',
+    url: '/shaders/dump_pipelines.flag',
+  });
+
+  // Leading slash, ./ prefix, and case-insensitive mount prefix
+  assert.deepEqual(resolveHttpfsRoute('/shaders/sub/frame1.wgsl.pack', bases), {
+    ok: true,
+    isRpf: false,
+    mount: 'shaders',
+    base: '/shaders/',
+    relPath: 'sub/frame1.wgsl.pack',
+    url: '/shaders/sub/frame1.wgsl.pack',
+  });
+  assert.deepEqual(resolveHttpfsRoute('./SHADERS/splash.wgsl.pack', bases), {
+    ok: true,
+    isRpf: false,
+    mount: 'shaders',
+    base: '/shaders/',
+    relPath: 'splash.wgsl.pack',
+    url: '/shaders/splash.wgsl.pack',
+  });
+
+  // Xbox drive-prefixed paths must NOT hijack into shadersBase (stay on gameBase)
+  assert.deepEqual(resolveHttpfsRoute('G:\\shaders\\cache.bin', bases), {
+    ok: true,
+    isRpf: false,
+    mount: 'game',
+    base: '/game/',
+    relPath: 'shaders/cache.bin',
+    url: '/game/shaders/cache.bin',
+  });
+
+  // Explicit null/false disables the shaders/ mount
+  assert.deepEqual(
+    resolveHttpfsRoute('shaders/splash.wgsl.pack', { ...bases, shadersBase: null }),
+    {
+      ok: true,
+      isRpf: false,
+      mount: 'data',
+      base: '/data/',
+      relPath: 'shaders/splash.wgsl.pack',
+      url: '/data/shaders/splash.wgsl.pack',
+    },
+  );
+  assert.deepEqual(
+    resolveHttpfsRoute('shaders/splash.wgsl.pack', { ...bases, shadersBase: false }),
+    {
+      ok: true,
+      isRpf: false,
+      mount: 'data',
+      base: '/data/',
+      relPath: 'shaders/splash.wgsl.pack',
+      url: '/data/shaders/splash.wgsl.pack',
+    },
+  );
+
+  // Path traversal and NUL injection under shaders/ remain blocked
+  for (const bad of [
+    'shaders/../secret',
+    'shaders/../secret.pack',
+    'shaders/sub/../../secret',
+    'shaders/%2e%2e/secret',
+    'shaders/splash.wgsl.pack\0',
+  ]) {
+    assert.deepEqual(
+      resolveHttpfsRoute(bad, bases),
+      { ok: false, error: 'path traversal blocked' },
+      `Expected traversal rejection for ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('W91: shaders/splash.wgsl.pack and shaders/dump_pipelines.flag bypass data-manifest.json and serve HTTP 206 range reads', async () => {
+  const dataManifest = {
+    abi_version: 1,
+    file_count: 1,
+    files: [{ path: 'notes.txt', size: 5 }],
+  };
+  const splashPack = makePatternBytes(2048, 0x5a);
+  const dumpFlag = utf8Encoder.encode('1\n');
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/data/data-manifest.json', utf8Encoder.encode(JSON.stringify(dataManifest))],
+      ['/data/notes.txt', utf8Encoder.encode('hello')],
+      ['/shaders/splash.wgsl.pack', splashPack],
+      ['/shaders/dump_pipelines.flag', dumpFlag],
+    ]),
+  );
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    chunkSize: 256,
+    maxBytes: 16 * 1024,
+    opfsDir: null,
+  });
+
+  // Default shadersBase is '/shaders/' even when omitted from init()
+  const ready = await controller.init({
+    dataBase: '/data/',
+    bootBase: '/boot/',
+    gameBase: '/game/',
+  });
+  assert.equal(ready.shadersBase, '/shaders/');
+  assert.equal(controller.shadersBase, '/shaders/');
+
+  // 1. Open and range-read shaders/splash.wgsl.pack (not listed in data-manifest.json)
+  const hPack = await controller.openHandle('shaders/splash.wgsl.pack');
+  assert.ok(hPack >= 1, `Expected valid handle for shaders/splash.wgsl.pack, got ${hPack}`);
+  const packInfo = controller.getHandleInfo(hPack);
+  assert.equal(packInfo.mount, 'shaders');
+  assert.equal(packInfo.path, 'splash.wgsl.pack');
+  assert.equal(packInfo.url, '/shaders/splash.wgsl.pack');
+
+  const packHead = await controller.readHandle(hPack, 0, 512);
+  assert.deepEqual(packHead, splashPack.subarray(0, 512));
+  const packMid = await controller.readHandle(hPack, 300, 700);
+  assert.deepEqual(packMid, splashPack.subarray(300, 1000));
+  assert.equal(controller.closeHandle(hPack), true);
+
+  // 2. Open and read shaders/dump_pipelines.flag (not listed in data-manifest.json)
+  const hFlag = await controller.openHandle('shaders/dump_pipelines.flag');
+  assert.ok(hFlag >= 1, `Expected valid handle for shaders/dump_pipelines.flag, got ${hFlag}`);
+  assert.equal(controller.getHandleInfo(hFlag).mount, 'shaders');
+  assert.equal(controller.getHandleInfo(hFlag).url, '/shaders/dump_pipelines.flag');
+  const flagBytes = await controller.readHandle(hFlag, 0, 16);
+  assert.deepEqual(flagBytes, dumpFlag);
+  assert.equal(controller.closeHandle(hFlag), true);
+
+  // Verify HTTP 206 range requests went directly to /shaders/*
+  const rangeUrls = mock.requests.filter((r) => r.rangeHeader).map((r) => r.url);
+  assert.ok(rangeUrls.includes('/shaders/splash.wgsl.pack'));
+  assert.ok(rangeUrls.includes('/shaders/dump_pipelines.flag'));
+  assert.equal(
+    rangeUrls.some((u) => u.includes('/data/shaders/')),
+    false,
+    'Must not fall through to /data/shaders/',
+  );
+
+  // 3. Missing file under /shaders/ returns -2 (ENOENT) via HTTP 404
+  const hMissing = await controller.openHandle('shaders/nonexistent.wgsl.pack');
+  assert.equal(hMissing, -2);
+
+  // 4. Path traversal under shaders/ is rejected with -22 (EINVAL) and zero outbound fetches
+  const reqsBeforeTraversal = mock.requests.length;
+  assert.equal(await controller.openHandle('shaders/../secret'), -22);
+  assert.equal(await controller.openHandle('shaders/%2e%2e/secret'), -22);
+  assert.equal(mock.requests.length, reqsBeforeTraversal);
+});
+
+test('W91: custom shadersBase in init() overrides mount route and null disables it', async () => {
+  const dataManifest = {
+    abi_version: 1,
+    file_count: 0,
+    files: [],
+  };
+  const fooPack = makePatternBytes(512, 0x33);
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/data/data-manifest.json', utf8Encoder.encode(JSON.stringify(dataManifest))],
+      ['/custom-shaders/foo.pack', fooPack],
+    ]),
+  );
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    chunkSize: 128,
+    maxBytes: 8192,
+    opfsDir: null,
+  });
+
+  // Trailing slash omitted -> normalized to '/custom-shaders/'
+  const ready = await controller.init({
+    dataBase: '/data/',
+    shadersBase: '/custom-shaders',
+  });
+  assert.equal(ready.shadersBase, '/custom-shaders/');
+  assert.equal(controller.shadersBase, '/custom-shaders/');
+
+  const h = await controller.openHandle('shaders/foo.pack');
+  assert.ok(h >= 1, `Expected valid handle for shaders/foo.pack, got ${h}`);
+  assert.equal(controller.getHandleInfo(h).mount, 'shaders');
+  assert.equal(controller.getHandleInfo(h).url, '/custom-shaders/foo.pack');
+
+  const out = await controller.readHandle(h, 64, 192);
+  assert.deepEqual(out, fooPack.subarray(64, 256));
+  assert.equal(controller.closeHandle(h), true);
+
+  const rangeUrls = mock.requests.filter((r) => r.rangeHeader).map((r) => r.url);
+  assert.ok(rangeUrls.includes('/custom-shaders/foo.pack'));
+
+  // Explicit shadersBase: null disables the shaders/ mount -> falls back to data-manifest.json (-2)
+  const disabledReady = await controller.init({
+    dataBase: '/data/',
+    shadersBase: null,
+  });
+  assert.equal(disabledReady.shadersBase, null);
+  assert.equal(controller.shadersBase, null);
+  assert.equal(await controller.openHandle('shaders/foo.pack'), -2);
+});
+
+test('W91: classic Web Worker init message forwards custom shadersBase over self.onmessage', async () => {
+  const packData = makePatternBytes(384, 0x71);
+  const mock = createMockRangeFetch(new Map([['/alt-shaders/splash.wgsl.pack', packData]]));
+  const posted = [];
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      posted.push(msg);
+    },
+  };
+
+  class MockSyncXHR {
+    open(_method, url) {
+      this._url = url;
+    }
+    send() {
+      const resolved = path.resolve(repoRoot, 'web/workers', this._url);
+      this.status = 200;
+      this.responseText = fs.readFileSync(resolved, 'utf8');
+    }
+  }
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    fetch: mock.fetchImpl,
+    XMLHttpRequest: MockSyncXHR,
+    navigator: {},
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    AbortController,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    setTimeout,
+    clearTimeout,
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web/workers', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const ioWorkerPath = path.join(repoRoot, 'web/workers/io_worker.js');
+  vm.runInContext(fs.readFileSync(ioWorkerPath, 'utf8'), context, { filename: ioWorkerPath });
+
+  await workerSelf.onmessage({
+    data: { init: true, dataBase: '/data/', shadersBase: '/alt-shaders/' },
+  });
+  assert.equal(posted[0].ready, true);
+  assert.equal(posted[0].shadersBase, '/alt-shaders/');
+
+  const sab = createHttpfsMailboxBuffer(64 * 1024);
+  await workerSelf.onmessage({ data: { attachMailbox: true, id: 1, sab } });
+
+  const client = new HttpfsMailboxClient(sab);
+  try {
+    const h = await client.openAsync('shaders/splash.wgsl.pack');
+    assert.ok(h >= 1, `Expected valid mailbox handle, got ${h}`);
+    const out = new Uint8Array(packData.byteLength);
+    const n = await client.readAsync(h, 0n, out, packData.byteLength);
+    assert.equal(n, packData.byteLength);
+    assert.deepEqual(out, packData);
+    assert.equal(await client.closeAsync(h), true);
+  } finally {
+    await workerSelf.onmessage({ data: { detachMailbox: true, id: 2 } });
   }
 });

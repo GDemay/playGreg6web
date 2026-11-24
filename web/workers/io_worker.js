@@ -198,7 +198,8 @@
 
   /**
    * Normalize Xbox/Win32/POSIX HTTPFS paths and route them against `bootBase`, `gameBase`,
-   * or `dataBase` while preserving `rpf://...` virtual URIs and blocking `..` / NUL traversal.
+   * `shadersBase`, or `dataBase` while preserving `rpf://...` virtual URIs and blocking
+   * `..` / NUL traversal.
    */
   function resolveHttpfsRoute(rawPath, options = {}) {
     if (typeof rawPath !== 'string' || rawPath.length === 0) {
@@ -212,6 +213,7 @@
     const dataBase = normalizeDataBase(opts.dataBase);
     const bootBase = normalizeOptionalBase(opts.bootBase);
     const gameBase = normalizeOptionalBase(opts.gameBase);
+    const shadersBase = normalizeOptionalBase(opts.shadersBase);
 
     if (isRpfVirtualPath(rawPath)) {
       const rest = rawPath.slice(RPF_URI_PREFIX.length);
@@ -314,6 +316,23 @@
         base: gameBase,
         relPath: stripped,
         url: `${gameBase}${stripped}`,
+      };
+    }
+
+    // 3b. Explicit `shaders/...` mount prefix (without an Xbox/Win32 drive prefix) routes against
+    //     shadersBase (stripping leading `shaders/`) when configured.
+    if (shadersBase && !hadDrivePrefix && lower.startsWith('shaders/')) {
+      const stripped = cleanPath.slice('shaders/'.length);
+      if (!stripped) {
+        return { ok: false, error: 'invalid HTTPFS path' };
+      }
+      return {
+        ok: true,
+        isRpf: false,
+        mount: 'shaders',
+        base: shadersBase,
+        relPath: stripped,
+        url: `${shadersBase}${stripped}`,
       };
     }
 
@@ -1283,6 +1302,10 @@
       this.dataBase = normalizeDataBase(options.dataBase);
       this.bootBase = normalizeOptionalBase(options.bootBase);
       this.gameBase = normalizeOptionalBase(options.gameBase);
+      this.shadersBase =
+        options.shadersBase !== undefined
+          ? normalizeOptionalBase(options.shadersBase)
+          : '/shaders/';
       this.manifest = options.manifest || null;
       this.rangeCache = options.rangeCache || null;
       this._customRangeCacheProvided = Boolean(options.rangeCache);
@@ -1364,6 +1387,7 @@
         dataBase: this.dataBase,
         bootBase: this.bootBase,
         gameBase: this.gameBase,
+        shadersBase: this.shadersBase,
       };
     }
 
@@ -1372,7 +1396,10 @@
     }
 
     _routeToCachePath(route) {
-      if (this._hasRoutedRangeCache && (route.mount === 'boot' || route.mount === 'game')) {
+      if (
+        this._hasRoutedRangeCache &&
+        (route.mount === 'boot' || route.mount === 'game' || route.mount === 'shaders')
+      ) {
         return `${MOUNT_CACHE_PREFIX}${route.mount}/${route.relPath}`;
       }
       return route.relPath;
@@ -1395,6 +1422,11 @@
           if (controller.gameBase && url.startsWith(gameMarker)) {
             const rel = url.slice(gameMarker.length);
             return baseFetch(`${controller.gameBase}${rel}`, init);
+          }
+          const shadersMarker = `${dataPrefix}${MOUNT_CACHE_PREFIX}shaders/`;
+          if (controller.shadersBase && url.startsWith(shadersMarker)) {
+            const rel = url.slice(shadersMarker.length);
+            return baseFetch(`${controller.shadersBase}${rel}`, init);
           }
         }
         return baseFetch(url, init);
@@ -2116,6 +2148,9 @@
       if (opts.gameBase !== undefined) {
         this.gameBase = normalizeOptionalBase(opts.gameBase);
       }
+      if (opts.shadersBase !== undefined) {
+        this.shadersBase = normalizeOptionalBase(opts.shadersBase);
+      }
       if (typeof opts.fetchImpl === 'function') {
         this.fetchImpl = opts.fetchImpl;
       }
@@ -2290,6 +2325,7 @@
         dataBase: this.dataBase,
         bootBase: this.bootBase,
         gameBase: this.gameBase,
+        shadersBase: this.shadersBase,
       };
 
       if (this.postMessage) {
