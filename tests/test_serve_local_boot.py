@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import sys
@@ -706,6 +708,93 @@ class TestServeLocalBootSymlink(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=2)
+
+
+class TestServeLocalQuietDisconnects(unittest.TestCase):
+    """Tests for W59 quiet handling of client-disconnect socket errors."""
+
+    def test_create_server_uses_quiet_threading_http_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            web.mkdir()
+            data.mkdir()
+            httpd = serve_local.create_server("127.0.0.1", 0, web, data)
+            try:
+                self.assertIsInstance(httpd, serve_local.QuietThreadingHTTPServer)
+            finally:
+                httpd.server_close()
+
+    def test_quiet_server_handle_error_suppresses_disconnects_and_reports_others(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            web.mkdir()
+            data.mkdir()
+            httpd = serve_local.create_server("127.0.0.1", 0, web, data)
+            try:
+                for exc_cls in (
+                    ConnectionAbortedError,
+                    ConnectionResetError,
+                    BrokenPipeError,
+                ):
+                    with self.subTest(exc=exc_cls.__name__):
+                        buf = io.StringIO()
+                        with contextlib.redirect_stderr(buf):
+                            try:
+                                raise exc_cls("client cancelled range request")
+                            except Exception:
+                                httpd.handle_error(None, ("127.0.0.1", 54321))
+                        self.assertEqual(buf.getvalue(), "")
+
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    try:
+                        raise RuntimeError("unexpected server failure")
+                    except Exception:
+                        httpd.handle_error(None, ("127.0.0.1", 54321))
+                stderr_output = buf.getvalue()
+                self.assertIn("RuntimeError", stderr_output)
+                self.assertIn("unexpected server failure", stderr_output)
+            finally:
+                httpd.server_close()
+
+    def test_serve_file_handles_disconnect_during_chunk_write_quietly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            web.mkdir()
+            data.mkdir()
+            payload = b"0123456789abcdef" * 1024
+            (data / "chunk.bin").write_bytes(payload)
+
+            for exc_cls in (
+                ConnectionAbortedError,
+                ConnectionResetError,
+                BrokenPipeError,
+            ):
+                with self.subTest(exc=exc_cls.__name__):
+                    class _AbortingWriter:
+                        def write(self, _data: bytes) -> int:
+                            raise exc_cls("peer closed socket")
+
+                    handler = object.__new__(serve_local.PlayGta6Handler)
+                    handler.web_root = web
+                    handler.data_root = data
+                    handler.game_root = None
+                    handler.shaders_root = data / "shaders"
+                    handler.boot_root = None
+                    handler.headers = {}
+                    handler.wfile = _AbortingWriter()
+                    handler.send_response = lambda *a, **kw: None
+                    handler.send_header = lambda *a, **kw: None
+                    handler.end_headers = lambda *a, **kw: None
+
+                    # Should return quietly without propagating socket disconnect errors.
+                    handler._serve_file("/data/chunk.bin", send_body=True)
 
 
 if __name__ == "__main__":
