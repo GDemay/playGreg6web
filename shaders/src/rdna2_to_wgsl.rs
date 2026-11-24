@@ -351,6 +351,15 @@ struct VertexInputAttr {
     components: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CbvKey {
+    /// Base SGPR pair index (root descriptor table `sbase` for coalesced V# loads,
+    /// or direct SMEM `sbase` for direct CBV loads).
+    base_sbase: u8,
+    /// `Some(table_offset)` for a coalesced descriptor-table V# entry, `None` for direct SMEM.
+    table_offset: Option<i32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CbvUsage {
     max_vec4_index: u32,
@@ -359,7 +368,7 @@ struct CbvUsage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CbvSlotPlan {
-    sbase: u8,
+    key: CbvKey,
     vec4_count: u32,
     highest_vec4_offset: u32,
 }
@@ -380,6 +389,8 @@ struct ProgramPlan {
     vertex_attrs: Vec<VertexInputAttr>,
     has_buffer_fetch: bool,
     legacy_uv_attr_index: Option<usize>,
+    vsharp_fetch_insts: BTreeSet<usize>,
+    indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
     cbv_slots: Vec<CbvSlotPlan>,
     cbv_vec4_count: u32,
     tex_slots: Vec<u8>,
@@ -767,6 +778,266 @@ fn record_src_usage(
     }
 }
 
+#[derive(Debug, Clone)]
+struct VSharpCandidate {
+    def_inst_idx: usize,
+    dst_sgpr: u8,
+    table_sbase: u8,
+    table_offset: i32,
+    buffer_load_users: Vec<usize>,
+    tainted_by_scalar_read: bool,
+}
+
+fn sgpr_ranges_overlap(a_start: u8, a_len: u8, b_start: u8, b_len: u8) -> bool {
+    let a_end = a_start.saturating_add(a_len);
+    let b_end = b_start.saturating_add(b_len);
+    a_start < b_end && b_start < a_end
+}
+
+fn taint_vsharp_if_sgpr_read(live: &mut [VSharpCandidate], src: u16) {
+    if src <= 105 {
+        let r = src as u8;
+        for cand in live.iter_mut() {
+            if r >= cand.dst_sgpr && r < cand.dst_sgpr.saturating_add(4) {
+                cand.tainted_by_scalar_read = true;
+            }
+        }
+    }
+}
+
+fn retire_overwritten_vsharps(
+    live: &mut Vec<VSharpCandidate>,
+    finished: &mut Vec<VSharpCandidate>,
+    start: u8,
+    len: u8,
+) {
+    if start > 105 || len == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i < live.len() {
+        if sgpr_ranges_overlap(live[i].dst_sgpr, 4, start, len) {
+            finished.push(live.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Detect 2-step descriptor-table V# indirections:
+///   1. `s_load_dwordx4 s[D:D+3], s[table_ptr], static_offset` (`op == 0x02`)
+///   2. `s_buffer_load_* s[...], s[D:D+3], cbv_offset` (`op in 0x08..=0x0C`)
+///
+/// Matches only when `s[D:D+3]` is NOT consumed as ordinary scalar arithmetic/color data during its live range.
+///
+/// Returns `(vsharp_fetch_insts, indirect_smem_cbv_keys)` so the V# fetch itself does not
+/// allocate a spurious uniform buffer binding and the downstream `s_buffer_load_*` binds
+/// directly to the descriptor-table CBV slot (e.g. `cb0` at `@group(0) @binding(0)`).
+fn analyze_vsharp_indirections(
+    active: &[Rdna2Instruction],
+) -> (BTreeSet<usize>, BTreeMap<usize, CbvKey>) {
+    let mut live: Vec<VSharpCandidate> = Vec::new();
+    let mut finished: Vec<VSharpCandidate> = Vec::new();
+
+    for (inst_idx, inst) in active.iter().enumerate() {
+        if inst.truncated {
+            continue;
+        }
+        match &inst.detail {
+            Rdna2Detail::Sopc { ssrc0, ssrc1, .. } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1));
+            }
+            Rdna2Detail::Sop1 {
+                op, sdst, ssrc0, ..
+            } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
+                if matches!(*op, 0x04 | 0x0A) {
+                    if *ssrc0 <= 104 {
+                        taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0 + 1));
+                    }
+                    if *sdst <= 104 {
+                        retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
+                    } else if *sdst == 105 {
+                        retire_overwritten_vsharps(&mut live, &mut finished, 105, 1);
+                    }
+                } else {
+                    if *op == 0x05 {
+                        taint_vsharp_if_sgpr_read(&mut live, u16::from(*sdst));
+                    }
+                    if *sdst <= 105 {
+                        retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                    }
+                }
+            }
+            Rdna2Detail::Sopk { op, sdst, .. } => {
+                if matches!(*op, 0x0F | 0x10) {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*sdst));
+                }
+                if !matches!(*op, 0x17..=0x1A) && *sdst <= 105 {
+                    retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                }
+            }
+            Rdna2Detail::Sop2 {
+                sdst, ssrc0, ssrc1, ..
+            } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1));
+                if *sdst <= 105 {
+                    retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                }
+            }
+            Rdna2Detail::Smem {
+                op,
+                sdata,
+                sbase,
+                soffset,
+                offset,
+                ..
+            } => {
+                let is_dynamic = *soffset != 0x7D && *soffset <= 105;
+                if is_dynamic {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
+                }
+                let sbase_sgpr = sbase.saturating_mul(2);
+                if matches!(*op, 0x08..=0x0C) {
+                    for cand in live.iter_mut() {
+                        if cand.dst_sgpr == sbase_sgpr {
+                            cand.buffer_load_users.push(inst_idx);
+                        } else if sgpr_ranges_overlap(cand.dst_sgpr, 4, sbase_sgpr, 4) {
+                            cand.tainted_by_scalar_read = true;
+                        }
+                    }
+                } else if smem_load_dword_count(*op).is_some() {
+                    for cand in live.iter_mut() {
+                        if sgpr_ranges_overlap(cand.dst_sgpr, 4, sbase_sgpr, 2) {
+                            cand.tainted_by_scalar_read = true;
+                        }
+                    }
+                }
+                if let Some(count) = smem_load_dword_count(*op) {
+                    retire_overwritten_vsharps(&mut live, &mut finished, *sdata, count);
+                }
+                if *op == 0x02 && !is_dynamic && *sdata <= 102 && (*sdata % 2 == 0) {
+                    let inline_off = if (128..=192).contains(soffset) {
+                        i32::from(*soffset - 128)
+                    } else {
+                        0
+                    };
+                    live.push(VSharpCandidate {
+                        def_inst_idx: inst_idx,
+                        dst_sgpr: *sdata,
+                        table_sbase: *sbase,
+                        table_offset: offset.saturating_add(inline_off),
+                        buffer_load_users: Vec::new(),
+                        tainted_by_scalar_read: false,
+                    });
+                }
+            }
+            Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
+                if !matches!(op, 0x00 | 0x1B | 0x41) {
+                    taint_vsharp_if_sgpr_read(&mut live, *src0);
+                    if *op == 0x02 {
+                        let sd = *vdst & 0x7F;
+                        if sd <= 105 {
+                            retire_overwritten_vsharps(&mut live, &mut finished, sd, 1);
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Vopc { src0, .. } | Rdna2Detail::Vop2 { src0, .. } => {
+                taint_vsharp_if_sgpr_read(&mut live, *src0);
+            }
+            Rdna2Detail::Vop3 {
+                op,
+                vdst,
+                sdst,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                taint_vsharp_if_sgpr_read(&mut live, *src0);
+                let is_unary = (0x180..=0x1FF).contains(op);
+                if !is_unary {
+                    taint_vsharp_if_sgpr_read(&mut live, *src1);
+                }
+                let is_ternary = matches!(
+                    *op,
+                    0x100
+                        | 0x101
+                        | 0x140..=0x165
+                        | 0x16D..=0x171
+                        | 0x340..=0x35F
+                        | 0x36D..=0x370
+                );
+                if is_ternary {
+                    taint_vsharp_if_sgpr_read(&mut live, *src2);
+                }
+                if let Some(sd) = sdst {
+                    let sd7 = *sd & 0x7F;
+                    if sd7 <= 105 {
+                        retire_overwritten_vsharps(&mut live, &mut finished, sd7, 1);
+                    }
+                }
+                if *op <= 0xFF {
+                    let sd = *vdst & 0x7F;
+                    if sd <= 105 {
+                        retire_overwritten_vsharps(&mut live, &mut finished, sd, 1);
+                    }
+                }
+            }
+            Rdna2Detail::Vop3P {
+                op,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                taint_vsharp_if_sgpr_read(&mut live, *src0);
+                taint_vsharp_if_sgpr_read(&mut live, *src1);
+                if vop3p_is_ternary(*op) {
+                    taint_vsharp_if_sgpr_read(&mut live, *src2);
+                }
+            }
+            Rdna2Detail::Mubuf { soffset, .. } | Rdna2Detail::Mtbuf { soffset, .. } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
+            }
+            Rdna2Detail::Flat { saddr, .. } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*saddr));
+                if *saddr <= 104 {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*saddr + 1));
+                }
+            }
+            Rdna2Detail::Sopp { .. }
+            | Rdna2Detail::Vintrp { .. }
+            | Rdna2Detail::Mimg { .. }
+            | Rdna2Detail::Ds { .. }
+            | Rdna2Detail::Exp { .. }
+            | Rdna2Detail::Unknown { .. } => {}
+        }
+    }
+
+    finished.extend(live);
+
+    let mut vsharp_fetch_insts = BTreeSet::new();
+    let mut indirect_smem_cbv_keys = BTreeMap::new();
+    for cand in finished {
+        if !cand.tainted_by_scalar_read && !cand.buffer_load_users.is_empty() {
+            vsharp_fetch_insts.insert(cand.def_inst_idx);
+            let key = CbvKey {
+                base_sbase: cand.table_sbase,
+                table_offset: Some(cand.table_offset),
+            };
+            for user_idx in cand.buffer_load_users {
+                indirect_smem_cbv_keys.insert(user_idx, key);
+            }
+        }
+    }
+
+    (vsharp_fetch_insts, indirect_smem_cbv_keys)
+}
+
 fn plan_program(
     summary: &Rdna2ProgramSummary,
     instructions: &[Rdna2Instruction],
@@ -797,8 +1068,9 @@ fn plan_program(
     }
 
     let active = &instructions[..active_inst_count];
+    let (vsharp_fetch_insts, indirect_smem_cbv_keys) = analyze_vsharp_indirections(active);
 
-    let mut cbv_usage: BTreeMap<u8, CbvUsage> = BTreeMap::new();
+    let mut cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
     let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut storage_buf_usage: BTreeMap<u8, bool> = BTreeMap::new();
@@ -820,7 +1092,7 @@ fn plan_program(
     let mut needs_vcc = false;
     let mut needs_scc = false;
 
-    for inst in active {
+    for (inst_idx, inst) in active.iter().enumerate() {
         if inst.truncated {
             continue;
         }
@@ -954,6 +1226,9 @@ fn plan_program(
                 offset,
                 ..
             } => {
+                if vsharp_fetch_insts.contains(&inst_idx) {
+                    continue;
+                }
                 if let Some(count) = smem_load_dword_count(*op) {
                     let is_dynamic = *soffset != 0x7D && *soffset <= 105;
                     if is_dynamic {
@@ -975,8 +1250,15 @@ fn plan_program(
                     .max(1);
                     let highest_dword = base_word.saturating_add(loaded_dwords - 1);
                     let highest_vec4 = highest_dword / 4;
+                    let cbv_key = indirect_smem_cbv_keys
+                        .get(&inst_idx)
+                        .copied()
+                        .unwrap_or(CbvKey {
+                            base_sbase: *sbase,
+                            table_offset: None,
+                        });
                     cbv_usage
-                        .entry(*sbase)
+                        .entry(cbv_key)
                         .and_modify(|usage| {
                             usage.max_vec4_index = usage.max_vec4_index.max(highest_vec4);
                             usage.has_dynamic_offset |= is_dynamic;
@@ -1632,7 +1914,7 @@ fn plan_program(
     let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
     let cbv_slots: Vec<CbvSlotPlan> = cbv_usage
         .into_iter()
-        .map(|(sbase, usage)| {
+        .map(|(key, usage)| {
             let static_needed = usage.max_vec4_index.saturating_add(1);
             let floor = if usage.has_dynamic_offset {
                 min_vec4s.max(DEFAULT_DYNAMIC_CBV_VEC4_COUNT)
@@ -1642,7 +1924,7 @@ fn plan_program(
             let vec4_count = static_needed.max(floor).clamp(1, MAX_CBV_VEC4_COUNT);
             let highest_vec4_offset = usage.max_vec4_index.min(vec4_count - 1);
             CbvSlotPlan {
-                sbase,
+                key,
                 vec4_count,
                 highest_vec4_offset,
             }
@@ -1672,6 +1954,8 @@ fn plan_program(
         vertex_attrs,
         has_buffer_fetch,
         legacy_uv_attr_index,
+        vsharp_fetch_insts,
+        indirect_smem_cbv_keys,
         cbv_slots,
         cbv_vec4_count,
         tex_slots,
@@ -1695,15 +1979,28 @@ fn plan_program(
 // ---------------------------------------------------------------------------
 
 struct CommonTypes {
+    f32_ty: Handle<Type>,
+    u32_ty: Handle<Type>,
+    i32_ty: Handle<Type>,
     vec2_f32_ty: Handle<Type>,
     vec2_i32_ty: Handle<Type>,
     vec4_f32_ty: Handle<Type>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstExprType {
+    F32,
+    U32,
+    I32,
+    Vec2F32,
+}
+
 struct IrEmitter {
     module: Module,
     types: CommonTypes,
-    cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)>,
+    vsharp_fetch_insts: BTreeSet<usize>,
+    indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
+    cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)>,
     tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
@@ -1714,6 +2011,13 @@ struct IrEmitter {
     workgroup_size: [u32; 3],
     compute_seed_wg_sgprs: Vec<(u8, u32)>,
     func: Function,
+    helper_u32_to_f32: Option<Handle<Function>>,
+    helper_unpack2x16float: Option<Handle<Function>>,
+    helper_pack2x16float: Option<Handle<Function>>,
+    helper_rt_f32: Option<Handle<Function>>,
+    helper_rt_u32: Option<Handle<Function>>,
+    helper_rt_i32: Option<Handle<Function>>,
+    helper_rt_vec2_f32: Option<Handle<Function>>,
     vgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     sgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     vcc_local: Option<Handle<LocalVariable>>,
@@ -1754,6 +2058,7 @@ impl IrEmitter {
         let mut module = Module::default();
         let f32_ty = insert_type(&mut module, None, TypeInner::Scalar(Scalar::F32));
         let u32_ty = insert_type(&mut module, None, TypeInner::Scalar(Scalar::U32));
+        let i32_ty = insert_type(&mut module, None, TypeInner::Scalar(Scalar::I32));
         let bool_ty = insert_type(&mut module, None, TypeInner::Scalar(Scalar::BOOL));
         let vec2_f32_ty = insert_type(
             &mut module,
@@ -1805,6 +2110,9 @@ impl IrEmitter {
         );
 
         let types = CommonTypes {
+            f32_ty,
+            u32_ty,
+            i32_ty,
             vec2_f32_ty,
             vec2_i32_ty,
             vec4_f32_ty,
@@ -1815,7 +2123,7 @@ impl IrEmitter {
         //   tex0 -> @group(0) @binding(1)
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
-        let mut cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
+        let mut cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
         let mut tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
@@ -1880,7 +2188,7 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                cb_globals.insert(slot.sbase, (g, count));
+                cb_globals.insert(slot.key, (g, count));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -2397,6 +2705,8 @@ impl IrEmitter {
         let mut emitter = Self {
             module,
             types,
+            vsharp_fetch_insts: plan.vsharp_fetch_insts.clone(),
+            indirect_smem_cbv_keys: plan.indirect_smem_cbv_keys.clone(),
             cb_globals,
             tex_globals,
             samp_globals,
@@ -2408,6 +2718,13 @@ impl IrEmitter {
             workgroup_size: plan.workgroup_size,
             compute_seed_wg_sgprs: plan.compute_seed_wg_sgprs.clone(),
             func,
+            helper_u32_to_f32: None,
+            helper_unpack2x16float: None,
+            helper_pack2x16float: None,
+            helper_rt_f32: None,
+            helper_rt_u32: None,
+            helper_rt_i32: None,
+            helper_rt_vec2_f32: None,
             vgpr_locals,
             sgpr_locals,
             vcc_local,
@@ -2439,12 +2756,831 @@ impl IrEmitter {
         self.func.expressions.append(expr, Span::UNDEFINED)
     }
 
-    fn emit_expr(&mut self, expr: Expression) -> Handle<Expression> {
+    fn emit_expr_raw(&mut self, expr: Expression) -> Handle<Expression> {
         let h = self.func.expressions.append(expr, Span::UNDEFINED);
         self.func
             .body
             .push(Statement::Emit(Range::new_from_bounds(h, h)), Span::UNDEFINED);
         h
+    }
+
+    fn is_const_expr(&self, h: Handle<Expression>) -> bool {
+        match self.func.expressions[h] {
+            Expression::Literal(_) | Expression::ZeroValue(_) => true,
+            Expression::Unary { expr, .. } | Expression::As { expr, .. } => {
+                self.is_const_expr(expr)
+            }
+            Expression::Binary { left, right, .. } => {
+                self.is_const_expr(left) && self.is_const_expr(right)
+            }
+            Expression::Select {
+                condition,
+                accept,
+                reject,
+            } => {
+                self.is_const_expr(condition)
+                    && self.is_const_expr(accept)
+                    && self.is_const_expr(reject)
+            }
+            Expression::Splat { value, .. } => self.is_const_expr(value),
+            Expression::Swizzle { vector, .. } => self.is_const_expr(vector),
+            Expression::AccessIndex { base, .. } => self.is_const_expr(base),
+            Expression::Compose { ref components, .. } => {
+                components.iter().all(|&c| self.is_const_expr(c))
+            }
+            Expression::Math {
+                arg,
+                arg1,
+                arg2,
+                arg3,
+                ..
+            } => {
+                self.is_const_expr(arg)
+                    && arg1.is_none_or(|a| self.is_const_expr(a))
+                    && arg2.is_none_or(|a| self.is_const_expr(a))
+                    && arg3.is_none_or(|a| self.is_const_expr(a))
+            }
+            _ => false,
+        }
+    }
+
+    fn const_expr_type(&self, h: Handle<Expression>) -> Option<ConstExprType> {
+        match self.func.expressions[h] {
+            Expression::Literal(Literal::F32(_)) => Some(ConstExprType::F32),
+            Expression::Literal(Literal::U32(_)) => Some(ConstExprType::U32),
+            Expression::Literal(Literal::I32(_)) => Some(ConstExprType::I32),
+            Expression::As { kind, .. } => match kind {
+                ScalarKind::Float => Some(ConstExprType::F32),
+                ScalarKind::Uint => Some(ConstExprType::U32),
+                ScalarKind::Sint => Some(ConstExprType::I32),
+                _ => None,
+            },
+            Expression::Compose { ty, .. } if ty == self.types.vec2_f32_ty => {
+                Some(ConstExprType::Vec2F32)
+            }
+            Expression::Splat {
+                size: VectorSize::Bi,
+                value,
+            } if self.const_expr_type(value) == Some(ConstExprType::F32) => {
+                Some(ConstExprType::Vec2F32)
+            }
+            Expression::Swizzle {
+                size: VectorSize::Bi,
+                vector,
+                ..
+            } if self.const_expr_type(vector) == Some(ConstExprType::Vec2F32) => {
+                Some(ConstExprType::Vec2F32)
+            }
+            Expression::AccessIndex { base, .. }
+                if self.const_expr_type(base) == Some(ConstExprType::Vec2F32) =>
+            {
+                Some(ConstExprType::F32)
+            }
+            Expression::Unary { expr, .. } => self.const_expr_type(expr),
+            Expression::Binary { op, left, .. } => match op {
+                BinaryOperator::Equal
+                | BinaryOperator::NotEqual
+                | BinaryOperator::Less
+                | BinaryOperator::LessEqual
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::LogicalAnd
+                | BinaryOperator::LogicalOr => None,
+                _ => self.const_expr_type(left),
+            },
+            Expression::Select { accept, .. } => self.const_expr_type(accept),
+            Expression::Math { fun, arg, .. } => match fun {
+                MathFunction::Unpack2x16float => Some(ConstExprType::Vec2F32),
+                MathFunction::Pack2x16float => Some(ConstExprType::U32),
+                MathFunction::Dot => Some(ConstExprType::F32),
+                _ => self.const_expr_type(arg),
+            },
+            _ => None,
+        }
+    }
+
+    fn call_helper_1(
+        &mut self,
+        func_handle: Handle<Function>,
+        arg: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let res = self
+            .func
+            .expressions
+            .append(Expression::CallResult(func_handle), Span::UNDEFINED);
+        self.func.body.push(
+            Statement::Call {
+                function: func_handle,
+                arguments: vec![arg],
+                result: Some(res),
+            },
+            Span::UNDEFINED,
+        );
+        res
+    }
+
+    fn ensure_helper_u32_to_f32(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_u32_to_f32 {
+            return h;
+        }
+        let mut f = Function {
+            name: Some("pg6_u32_bits_to_float".to_string()),
+            arguments: vec![FunctionArgument {
+                name: Some("x".to_string()),
+                ty: self.types.u32_ty,
+                binding: None,
+            }],
+            result: Some(FunctionResult {
+                ty: self.types.f32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let arg = f
+            .expressions
+            .append(Expression::FunctionArgument(0), Span::UNDEFINED);
+        let cast = f.expressions.append(
+            Expression::As {
+                expr: arg,
+                kind: ScalarKind::Float,
+                convert: None,
+            },
+            Span::UNDEFINED,
+        );
+        f.body
+            .push(Statement::Emit(Range::new_from_bounds(cast, cast)), Span::UNDEFINED);
+        f.body
+            .push(Statement::Return { value: Some(cast) }, Span::UNDEFINED);
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_u32_to_f32 = Some(h);
+        h
+    }
+
+    fn call_pg6_u32_to_f32(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = self.ensure_helper_u32_to_f32();
+        self.call_helper_1(f, arg)
+    }
+
+    fn ensure_helper_unpack2x16float(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_unpack2x16float {
+            return h;
+        }
+        let mut f = Function {
+            name: Some("pg6_unpack_half_pair".to_string()),
+            arguments: vec![FunctionArgument {
+                name: Some("x".to_string()),
+                ty: self.types.u32_ty,
+                binding: None,
+            }],
+            result: Some(FunctionResult {
+                ty: self.types.vec2_f32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let arg = f
+            .expressions
+            .append(Expression::FunctionArgument(0), Span::UNDEFINED);
+        let unpacked = f.expressions.append(
+            Expression::Math {
+                fun: MathFunction::Unpack2x16float,
+                arg,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Emit(Range::new_from_bounds(unpacked, unpacked)),
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Return {
+                value: Some(unpacked),
+            },
+            Span::UNDEFINED,
+        );
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_unpack2x16float = Some(h);
+        h
+    }
+
+    fn call_pg6_unpack2x16float(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = self.ensure_helper_unpack2x16float();
+        self.call_helper_1(f, arg)
+    }
+
+    fn ensure_helper_pack2x16float(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_pack2x16float {
+            return h;
+        }
+        let mut f = Function {
+            name: Some("pg6_pack_half_pair".to_string()),
+            arguments: vec![FunctionArgument {
+                name: Some("v".to_string()),
+                ty: self.types.vec2_f32_ty,
+                binding: None,
+            }],
+            result: Some(FunctionResult {
+                ty: self.types.u32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let arg = f
+            .expressions
+            .append(Expression::FunctionArgument(0), Span::UNDEFINED);
+        let packed = f.expressions.append(
+            Expression::Math {
+                fun: MathFunction::Pack2x16float,
+                arg,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Emit(Range::new_from_bounds(packed, packed)),
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Return {
+                value: Some(packed),
+            },
+            Span::UNDEFINED,
+        );
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_pack2x16float = Some(h);
+        h
+    }
+
+    fn call_pg6_pack2x16float(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = self.ensure_helper_pack2x16float();
+        self.call_helper_1(f, arg)
+    }
+
+    fn ensure_identity_helper(
+        module: &mut Module,
+        slot: &mut Option<Handle<Function>>,
+        name: &str,
+        ty: Handle<Type>,
+    ) -> Handle<Function> {
+        if let Some(h) = *slot {
+            return h;
+        }
+        let mut f = Function {
+            name: Some(name.to_string()),
+            arguments: vec![FunctionArgument {
+                name: Some("x".to_string()),
+                ty,
+                binding: None,
+            }],
+            result: Some(FunctionResult { ty, binding: None }),
+            ..Function::default()
+        };
+        let arg = f
+            .expressions
+            .append(Expression::FunctionArgument(0), Span::UNDEFINED);
+        f.body
+            .push(Statement::Return { value: Some(arg) }, Span::UNDEFINED);
+        let h = module.functions.append(f, Span::UNDEFINED);
+        *slot = Some(h);
+        h
+    }
+
+    fn call_pg6_rt_f32(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = Self::ensure_identity_helper(
+            &mut self.module,
+            &mut self.helper_rt_f32,
+            "pg6_runtime_float",
+            self.types.f32_ty,
+        );
+        self.call_helper_1(f, arg)
+    }
+
+    fn call_pg6_rt_u32(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = Self::ensure_identity_helper(
+            &mut self.module,
+            &mut self.helper_rt_u32,
+            "pg6_runtime_uint",
+            self.types.u32_ty,
+        );
+        self.call_helper_1(f, arg)
+    }
+
+    fn call_pg6_rt_i32(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = Self::ensure_identity_helper(
+            &mut self.module,
+            &mut self.helper_rt_i32,
+            "pg6_runtime_sint",
+            self.types.i32_ty,
+        );
+        self.call_helper_1(f, arg)
+    }
+
+    fn call_pg6_rt_vec2_f32(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        let f = Self::ensure_identity_helper(
+            &mut self.module,
+            &mut self.helper_rt_vec2_f32,
+            "pg6_runtime_vec2f",
+            self.types.vec2_f32_ty,
+        );
+        self.call_helper_1(f, arg)
+    }
+
+    fn wrap_const_runtime(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
+        match self.const_expr_type(arg) {
+            Some(ConstExprType::F32) => self.call_pg6_rt_f32(arg),
+            Some(ConstExprType::U32) => self.call_pg6_rt_u32(arg),
+            Some(ConstExprType::I32) => self.call_pg6_rt_i32(arg),
+            Some(ConstExprType::Vec2F32) => self.call_pg6_rt_vec2_f32(arg),
+            None => arg,
+        }
+    }
+
+    fn emit_expr(&mut self, expr: Expression) -> Handle<Expression> {
+        match expr {
+            // Fold integer/boolean constant binary ops in Rust (wrapping semantics) so Tint
+            // WGSL const-eval never rejects shift/add/sub/mul overflow on literal operands,
+            // and guard non-finite float const-eval operations through runtime helpers.
+            Expression::Binary { op, left, right } => {
+                match (&self.func.expressions[left], &self.func.expressions[right]) {
+                    (
+                        Expression::Literal(Literal::U32(a)),
+                        Expression::Literal(Literal::U32(b)),
+                    ) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinaryOperator::Add => return self.lit_u32(a.wrapping_add(b)),
+                            BinaryOperator::Subtract => return self.lit_u32(a.wrapping_sub(b)),
+                            BinaryOperator::Multiply => return self.lit_u32(a.wrapping_mul(b)),
+                            BinaryOperator::Divide => {
+                                return self.lit_u32(if b == 0 { 0 } else { a / b });
+                            }
+                            BinaryOperator::Modulo => {
+                                return self.lit_u32(if b == 0 { 0 } else { a % b });
+                            }
+                            BinaryOperator::And => return self.lit_u32(a & b),
+                            BinaryOperator::InclusiveOr => return self.lit_u32(a | b),
+                            BinaryOperator::ExclusiveOr => return self.lit_u32(a ^ b),
+                            BinaryOperator::ShiftLeft => {
+                                return self.lit_u32(a.wrapping_shl(b & 31));
+                            }
+                            BinaryOperator::ShiftRight => {
+                                return self.lit_u32(a.wrapping_shr(b & 31));
+                            }
+                            BinaryOperator::Equal => return self.lit_bool(a == b),
+                            BinaryOperator::NotEqual => return self.lit_bool(a != b),
+                            BinaryOperator::Less => return self.lit_bool(a < b),
+                            BinaryOperator::LessEqual => return self.lit_bool(a <= b),
+                            BinaryOperator::Greater => return self.lit_bool(a > b),
+                            BinaryOperator::GreaterEqual => return self.lit_bool(a >= b),
+                            _ => {}
+                        }
+                    }
+                    (
+                        Expression::Literal(Literal::I32(a)),
+                        Expression::Literal(Literal::U32(b)),
+                    ) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinaryOperator::ShiftLeft => {
+                                return self.lit_i32(a.wrapping_shl(b & 31));
+                            }
+                            BinaryOperator::ShiftRight => {
+                                return self.lit_i32(a.wrapping_shr(b & 31));
+                            }
+                            _ => {}
+                        }
+                    }
+                    (
+                        Expression::Literal(Literal::I32(a)),
+                        Expression::Literal(Literal::I32(b)),
+                    ) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinaryOperator::Add => return self.lit_i32(a.wrapping_add(b)),
+                            BinaryOperator::Subtract => return self.lit_i32(a.wrapping_sub(b)),
+                            BinaryOperator::Multiply => return self.lit_i32(a.wrapping_mul(b)),
+                            BinaryOperator::Divide => {
+                                return self.lit_i32(if b == 0 { 0 } else { a.wrapping_div(b) });
+                            }
+                            BinaryOperator::Modulo => {
+                                return self.lit_i32(if b == 0 { 0 } else { a.wrapping_rem(b) });
+                            }
+                            BinaryOperator::And => return self.lit_i32(a & b),
+                            BinaryOperator::InclusiveOr => return self.lit_i32(a | b),
+                            BinaryOperator::ExclusiveOr => return self.lit_i32(a ^ b),
+                            BinaryOperator::Equal => return self.lit_bool(a == b),
+                            BinaryOperator::NotEqual => return self.lit_bool(a != b),
+                            BinaryOperator::Less => return self.lit_bool(a < b),
+                            BinaryOperator::LessEqual => return self.lit_bool(a <= b),
+                            BinaryOperator::Greater => return self.lit_bool(a > b),
+                            BinaryOperator::GreaterEqual => return self.lit_bool(a >= b),
+                            _ => {}
+                        }
+                    }
+                    (
+                        Expression::Literal(Literal::Bool(a)),
+                        Expression::Literal(Literal::Bool(b)),
+                    ) => {
+                        let (a, b) = (*a, *b);
+                        match op {
+                            BinaryOperator::LogicalAnd => return self.lit_bool(a && b),
+                            BinaryOperator::LogicalOr => return self.lit_bool(a || b),
+                            BinaryOperator::Equal => return self.lit_bool(a == b),
+                            BinaryOperator::NotEqual => return self.lit_bool(a != b),
+                            _ => {}
+                        }
+                    }
+                    (
+                        Expression::Literal(Literal::F32(a)),
+                        Expression::Literal(Literal::F32(b)),
+                    ) => {
+                        let (a, b) = (*a, *b);
+                        let unsafe_const = match op {
+                            BinaryOperator::Add => !(a + b).is_finite(),
+                            BinaryOperator::Subtract => !(a - b).is_finite(),
+                            BinaryOperator::Multiply => !(a * b).is_finite(),
+                            BinaryOperator::Divide => b == 0.0 || !(a / b).is_finite(),
+                            _ => false,
+                        };
+                        if unsafe_const {
+                            let rt_left = self.call_pg6_rt_f32(left);
+                            return self.emit_expr_raw(Expression::Binary {
+                                op,
+                                left: rt_left,
+                                right,
+                            });
+                        }
+                    }
+                    _ => {
+                        if matches!(
+                            op,
+                            BinaryOperator::Add
+                                | BinaryOperator::Subtract
+                                | BinaryOperator::Multiply
+                                | BinaryOperator::Divide
+                                | BinaryOperator::Modulo
+                                | BinaryOperator::ShiftLeft
+                                | BinaryOperator::ShiftRight
+                        ) && self.is_const_expr(left)
+                            && self.is_const_expr(right)
+                        {
+                            let rt_left = self.wrap_const_runtime(left);
+                            return self.emit_expr_raw(Expression::Binary {
+                                op,
+                                left: rt_left,
+                                right,
+                            });
+                        }
+                    }
+                }
+                self.emit_expr_raw(Expression::Binary { op, left, right })
+            }
+            Expression::Unary { op, expr: inner } => {
+                match (op, &self.func.expressions[inner]) {
+                    (UnaryOperator::BitwiseNot, Expression::Literal(Literal::U32(a))) => {
+                        return self.lit_u32(!*a);
+                    }
+                    (UnaryOperator::BitwiseNot, Expression::Literal(Literal::I32(a))) => {
+                        return self.lit_i32(!*a);
+                    }
+                    (UnaryOperator::Negate, Expression::Literal(Literal::I32(a))) => {
+                        return self.lit_i32((*a).wrapping_neg());
+                    }
+                    (UnaryOperator::LogicalNot, Expression::Literal(Literal::Bool(a))) => {
+                        return self.lit_bool(!*a);
+                    }
+                    _ => {}
+                }
+                self.emit_expr_raw(Expression::Unary { op, expr: inner })
+            }
+            Expression::Select {
+                condition,
+                accept,
+                reject,
+            } => {
+                if let Expression::Literal(Literal::Bool(c)) = self.func.expressions[condition] {
+                    return if c { accept } else { reject };
+                }
+                self.emit_expr_raw(Expression::Select {
+                    condition,
+                    accept,
+                    reject,
+                })
+            }
+            Expression::As {
+                expr: inner,
+                kind,
+                convert,
+            } => {
+                match convert {
+                    None => {
+                        match (&self.func.expressions[inner], kind) {
+                            (Expression::Literal(Literal::U32(bits)), ScalarKind::Float) => {
+                                let bits = *bits;
+                                let f = f32::from_bits(bits);
+                                if bits == 0 || (f.is_finite() && f.is_normal()) {
+                                    return self.raw_expr(Expression::Literal(Literal::F32(f)));
+                                }
+                                return self.call_pg6_u32_to_f32(inner);
+                            }
+                            (Expression::Literal(Literal::I32(val)), ScalarKind::Float) => {
+                                let bits = *val as u32;
+                                let f = f32::from_bits(bits);
+                                if bits == 0 || (f.is_finite() && f.is_normal()) {
+                                    return self.raw_expr(Expression::Literal(Literal::F32(f)));
+                                }
+                                let u = self.lit_u32(bits);
+                                return self.call_pg6_u32_to_f32(u);
+                            }
+                            (Expression::Literal(Literal::U32(val)), ScalarKind::Sint) => {
+                                return self.lit_i32(*val as i32);
+                            }
+                            (Expression::Literal(Literal::I32(val)), ScalarKind::Uint) => {
+                                return self.lit_u32(*val as u32);
+                            }
+                            (Expression::Literal(Literal::F32(f)), ScalarKind::Uint) => {
+                                return self.lit_u32(f.to_bits());
+                            }
+                            (Expression::Literal(Literal::F32(f)), ScalarKind::Sint) => {
+                                return self.lit_i32(f.to_bits() as i32);
+                            }
+                            _ if kind == ScalarKind::Float && self.is_const_expr(inner) => {
+                                let u_arg =
+                                    if self.const_expr_type(inner) == Some(ConstExprType::I32) {
+                                        self.emit_expr_raw(Expression::As {
+                                            expr: inner,
+                                            kind: ScalarKind::Uint,
+                                            convert: None,
+                                        })
+                                    } else {
+                                        inner
+                                    };
+                                return self.call_pg6_u32_to_f32(u_arg);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(4) => match (&self.func.expressions[inner], kind) {
+                        (Expression::Literal(Literal::F32(f)), ScalarKind::Uint)
+                            if !(0.0..4_294_967_296.0).contains(f) =>
+                        {
+                            let rt = self.call_pg6_rt_f32(inner);
+                            return self.emit_expr_raw(Expression::As {
+                                expr: rt,
+                                kind,
+                                convert,
+                            });
+                        }
+                        (Expression::Literal(Literal::F32(f)), ScalarKind::Sint)
+                            if !(-2_147_483_648.0..2_147_483_648.0).contains(f) =>
+                        {
+                            let rt = self.call_pg6_rt_f32(inner);
+                            return self.emit_expr_raw(Expression::As {
+                                expr: rt,
+                                kind,
+                                convert,
+                            });
+                        }
+                        _ if matches!(kind, ScalarKind::Uint | ScalarKind::Sint)
+                            && self.is_const_expr(inner)
+                            && self.const_expr_type(inner) == Some(ConstExprType::F32) =>
+                        {
+                            let rt = self.call_pg6_rt_f32(inner);
+                            return self.emit_expr_raw(Expression::As {
+                                expr: rt,
+                                kind,
+                                convert,
+                            });
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                self.emit_expr_raw(Expression::As {
+                    expr: inner,
+                    kind,
+                    convert,
+                })
+            }
+            Expression::Math {
+                fun,
+                arg,
+                arg1,
+                arg2,
+                arg3,
+            } => {
+                match fun {
+                    MathFunction::Unpack2x16float => {
+                        if let Expression::Literal(Literal::U32(bits)) =
+                            self.func.expressions[arg]
+                        {
+                            let lo_non_finite = (bits & 0x7C00) == 0x7C00;
+                            let hi_non_finite = ((bits >> 16) & 0x7C00) == 0x7C00;
+                            if lo_non_finite || hi_non_finite {
+                                return self.call_pg6_unpack2x16float(arg);
+                            }
+                        } else if self.is_const_expr(arg) {
+                            return self.call_pg6_unpack2x16float(arg);
+                        }
+                    }
+                    MathFunction::Pack2x16float => {
+                        if self.is_const_expr(arg) {
+                            return self.call_pg6_pack2x16float(arg);
+                        }
+                    }
+                    MathFunction::ReverseBits => {
+                        if let Expression::Literal(Literal::U32(a)) = self.func.expressions[arg] {
+                            return self.lit_u32(a.reverse_bits());
+                        }
+                    }
+                    MathFunction::CountOneBits => {
+                        if let Expression::Literal(Literal::U32(a)) = self.func.expressions[arg] {
+                            return self.lit_u32(a.count_ones());
+                        }
+                    }
+                    MathFunction::Abs => {
+                        if let Expression::Literal(Literal::I32(a)) = self.func.expressions[arg] {
+                            return self.lit_i32(a.wrapping_abs());
+                        }
+                    }
+                    MathFunction::Min | MathFunction::Max => {
+                        if let Some(a1) = arg1 {
+                            match (&self.func.expressions[arg], &self.func.expressions[a1]) {
+                                (
+                                    Expression::Literal(Literal::U32(a)),
+                                    Expression::Literal(Literal::U32(b)),
+                                ) => {
+                                    let res = if fun == MathFunction::Min {
+                                        (*a).min(*b)
+                                    } else {
+                                        (*a).max(*b)
+                                    };
+                                    return self.lit_u32(res);
+                                }
+                                (
+                                    Expression::Literal(Literal::I32(a)),
+                                    Expression::Literal(Literal::I32(b)),
+                                ) => {
+                                    let res = if fun == MathFunction::Min {
+                                        (*a).min(*b)
+                                    } else {
+                                        (*a).max(*b)
+                                    };
+                                    return self.lit_i32(res);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    MathFunction::Clamp => {
+                        if let (Some(lo_h), Some(hi_h)) = (arg1, arg2) {
+                            match (
+                                &self.func.expressions[arg],
+                                &self.func.expressions[lo_h],
+                                &self.func.expressions[hi_h],
+                            ) {
+                                (
+                                    Expression::Literal(Literal::U32(a)),
+                                    Expression::Literal(Literal::U32(lo)),
+                                    Expression::Literal(Literal::U32(hi)),
+                                ) => {
+                                    return self.lit_u32((*a).max(*lo).min(*hi));
+                                }
+                                (
+                                    Expression::Literal(Literal::I32(a)),
+                                    Expression::Literal(Literal::I32(lo)),
+                                    Expression::Literal(Literal::I32(hi)),
+                                ) => {
+                                    return self.lit_i32((*a).max(*lo).min(*hi));
+                                }
+                                (
+                                    Expression::Literal(Literal::F32(_)),
+                                    Expression::Literal(Literal::F32(lo)),
+                                    Expression::Literal(Literal::F32(hi)),
+                                ) => {
+                                    if *lo > *hi || !lo.is_finite() || !hi.is_finite() {
+                                        let rt = self.call_pg6_rt_f32(arg);
+                                        return self.emit_expr_raw(Expression::Math {
+                                            fun,
+                                            arg: rt,
+                                            arg1,
+                                            arg2,
+                                            arg3,
+                                        });
+                                    }
+                                }
+                                _ if self.is_const_expr(arg)
+                                    && self.is_const_expr(lo_h)
+                                    && self.is_const_expr(hi_h) =>
+                                {
+                                    let rt = self.wrap_const_runtime(arg);
+                                    return self.emit_expr_raw(Expression::Math {
+                                        fun,
+                                        arg: rt,
+                                        arg1,
+                                        arg2,
+                                        arg3,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    MathFunction::InverseSqrt | MathFunction::Log2 => {
+                        let needs_rt = match self.func.expressions[arg] {
+                            Expression::Literal(Literal::F32(x)) => x <= 0.0 || !x.is_finite(),
+                            _ => self.is_const_expr(arg),
+                        };
+                        if needs_rt {
+                            let rt = self.wrap_const_runtime(arg);
+                            return self.emit_expr_raw(Expression::Math {
+                                fun,
+                                arg: rt,
+                                arg1,
+                                arg2,
+                                arg3,
+                            });
+                        }
+                    }
+                    MathFunction::Sqrt => {
+                        let needs_rt = match self.func.expressions[arg] {
+                            Expression::Literal(Literal::F32(x)) => x < 0.0 || !x.is_finite(),
+                            _ => self.is_const_expr(arg),
+                        };
+                        if needs_rt {
+                            let rt = self.wrap_const_runtime(arg);
+                            return self.emit_expr_raw(Expression::Math {
+                                fun,
+                                arg: rt,
+                                arg1,
+                                arg2,
+                                arg3,
+                            });
+                        }
+                    }
+                    MathFunction::Exp2 => {
+                        let needs_rt = match self.func.expressions[arg] {
+                            Expression::Literal(Literal::F32(x)) => x >= 128.0 || !x.is_finite(),
+                            _ => self.is_const_expr(arg),
+                        };
+                        if needs_rt {
+                            let rt = self.wrap_const_runtime(arg);
+                            return self.emit_expr_raw(Expression::Math {
+                                fun,
+                                arg: rt,
+                                arg1,
+                                arg2,
+                                arg3,
+                            });
+                        }
+                    }
+                    MathFunction::Fma => {
+                        if let (Some(a1), Some(a2)) = (arg1, arg2)
+                            && self.is_const_expr(arg)
+                            && self.is_const_expr(a1)
+                            && self.is_const_expr(a2)
+                        {
+                            let needs_rt = match (
+                                &self.func.expressions[arg],
+                                &self.func.expressions[a1],
+                                &self.func.expressions[a2],
+                            ) {
+                                (
+                                    Expression::Literal(Literal::F32(a)),
+                                    Expression::Literal(Literal::F32(b)),
+                                    Expression::Literal(Literal::F32(c)),
+                                ) => !a.mul_add(*b, *c).is_finite(),
+                                _ => true,
+                            };
+                            if needs_rt {
+                                let rt = self.wrap_const_runtime(arg);
+                                return self.emit_expr_raw(Expression::Math {
+                                    fun,
+                                    arg: rt,
+                                    arg1,
+                                    arg2,
+                                    arg3,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.emit_expr_raw(Expression::Math {
+                    fun,
+                    arg,
+                    arg1,
+                    arg2,
+                    arg3,
+                })
+            }
+            other => self.emit_expr_raw(other),
+        }
     }
 
     fn lit_f32(&mut self, value: f32) -> Handle<Expression> {
@@ -3198,7 +4334,7 @@ impl IrEmitter {
 
     // -- Instruction dispatch --
 
-    fn translate_instruction(&mut self, inst: &Rdna2Instruction) {
+    fn translate_instruction(&mut self, inst_idx: usize, inst: &Rdna2Instruction) {
         if inst.truncated {
             self.record_unsupported(inst);
             return;
@@ -3235,7 +4371,7 @@ impl IrEmitter {
                 soffset,
                 offset,
                 ..
-            } => self.translate_smem(*op, *sdata, *sbase, *soffset, *offset),
+            } => self.translate_smem(inst_idx, *op, *sdata, *sbase, *soffset, *offset),
             Rdna2Detail::Vop1 {
                 op,
                 vdst,
@@ -4007,18 +5143,30 @@ impl IrEmitter {
 
     fn translate_smem(
         &mut self,
+        inst_idx: usize,
         op: u8,
         sdata: u8,
         sbase: u8,
         soffset: u8,
         byte_offset: i32,
     ) -> bool {
+        if self.vsharp_fetch_insts.contains(&inst_idx) {
+            return true;
+        }
         let Some(count) = smem_load_dword_count(op) else {
             return false;
         };
+        let cbv_key = self
+            .indirect_smem_cbv_keys
+            .get(&inst_idx)
+            .copied()
+            .unwrap_or(CbvKey {
+                base_sbase: sbase,
+                table_offset: None,
+            });
         let Some(&(cb_global, cb_vec4_count)) = self
             .cb_globals
-            .get(&sbase)
+            .get(&cbv_key)
             .or_else(|| self.cb_globals.values().next())
         else {
             return false;
@@ -6968,8 +8116,8 @@ pub fn translate_rdna2_to_wgsl(
     let plan = plan_program(&summary, &instructions, options);
 
     let mut emitter = IrEmitter::new(&plan);
-    for inst in &instructions[..plan.active_inst_count] {
-        emitter.translate_instruction(inst);
+    for (inst_idx, inst) in instructions[..plan.active_inst_count].iter().enumerate() {
+        emitter.translate_instruction(inst_idx, inst);
     }
 
     let entry_point = plan.entry_point.clone();
@@ -8873,5 +10021,196 @@ mod tests {
         assert!(out_b.naga_validated);
         assert!(out_b.wgsl.contains("s_4_ = wg_id.x"), "WGSL:\n{}", out_b.wgsl);
         assert_naga_wgsl_valid(&out_b.wgsl);
+    }
+
+    #[test]
+    fn tint_const_eval_safe_nan_and_shift_overflow() {
+        // Exercises all live Chrome/Dawn Tint const-eval rejection patterns from Test #38:
+        //   1. bitcast<f32>(4294967295u) / bitcast<f32>(4294967288u) (inline -1 / -8 as f32)
+        //   2. unpack2x16float(32505u) / unpack2x16float(4294967295u) (f16 NaN in v_fmaak_f16 & v_pk_add_f16)
+        //   3. 4294967295u << 16u (s_pack_ll_b32_b16), 3204448256u << 3u (s_lshl3_add_u32),
+        //      4294967295u << 1u (s_lshl1_add_u32), and u32 const add/sub/mul overflow.
+        let mut words = vec![
+            // s_mov_b32 s2, 7
+            enc_sop1(0x03, 2, 128 + 7),
+            // s_pack_ll_b32_b16 s3, s2, -1  (src1 = 193 -> 4294967295u << 16u)
+            enc_sop2(0x32, 3, 2, 193),
+            // s_lshl3_add_u32 s4, -0.5, s2  (src0 = 241 -> 3204448256u << 3u)
+            enc_sop2(0x30, 4, 241, 2),
+            // s_lshl1_add_u32 s5, -1, s2    (src0 = 193 -> 4294967295u << 1u)
+            enc_sop2(0x2E, 5, 193, 2),
+            // s_add_u32 s6, -1, 16          (4294967295u + 16u const overflow -> folds to 15u)
+            enc_sop2(0x00, 6, 193, 128 + 16),
+            // v_mov_b32 v0, -1              (src0 = 193 -> bitcast<f32>(4294967295u))
+            enc_vop1(0x01, 0, 193),
+            // v_add_f32 v1, -8, v0          (src0 = 200 -> bitcast<f32>(4294967288u))
+            enc_vop2(0x03, 1, 200, 0),
+            // v_fmaak_f16 v2, v0, v1, 0x00007ef9 (32505u -> f16 NaN in unpack2x16float)
+            enc_vop2(0x38, 2, 256, 1),
+            0x0000_7EF9,
+        ];
+        // v_pk_add_f16 v3, -1, v2       (src0 = 193 -> unpack2x16float(4294967295u))
+        words.extend_from_slice(&enc_vop3p(0x0F, 3, 193, 256 + 2, 0, false, 0, 0b011, 0, 0));
+        // v_rcp_f32 v4, 0.0             (1.0 / 0.0 const-eval guard)
+        words.push(enc_vop1(0x2A, 4, 128));
+        // v_add_f32 v4, s3, v4
+        words.push(enc_vop2(0x03, 4, 3, 4));
+        // v_add_f32 v4, s4, v4
+        words.push(enc_vop2(0x03, 4, 4, 4));
+        // v_add_f32 v4, s5, v4
+        words.push(enc_vop2(0x03, 4, 5, 4));
+        // v_add_f32 v4, s6, v4
+        words.push(enc_vop2(0x03, 4, 6, 4));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 4]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("shader with NaN bitcasts, f16 NaN unpacks, and shift overflows must validate");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Must NEVER emit raw const-eval NaN bitcast<f32>, unpack2x16float, or overflowing shifts.
+        assert!(
+            !out.wgsl.contains("bitcast<f32>(4294967295u)"),
+            "raw NaN bitcast<f32>(4294967295u) must not appear:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("bitcast<f32>(4294967288u)"),
+            "raw NaN bitcast<f32>(4294967288u) must not appear:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("unpack2x16float(4294967295u)"),
+            "raw NaN unpack2x16float(4294967295u) must not appear:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("unpack2x16float(32505u)"),
+            "raw NaN unpack2x16float(32505u) must not appear:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("4294967295u << 16u"),
+            "overflowing const shift 4294967295u << 16u must be folded:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("3204448256u << 3u"),
+            "overflowing const shift 3204448256u << 3u must be folded:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("4294967295u << 1u"),
+            "overflowing const shift 4294967295u << 1u must be folded:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("fn pg6_u32_bits_to_float("),
+            "expected pg6_u32_bits_to_float runtime helper in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("fn pg6_unpack_half_pair("),
+            "expected pg6_unpack_half_pair runtime helper in WGSL:\n{}",
+            out.wgsl
+        );
+    }
+
+    #[test]
+    fn coalesces_descriptor_table_s_load_vsharp_into_s_buffer_load_cb0() {
+        // Real PSO #50450 pattern:
+        //   s_load_dwordx4        s[12:15], s[0:1], 0x0   ; fetch V# descriptor from root table
+        //   s_waitcnt             lgkmcnt(0)
+        //   s_buffer_load_dwordx4 s[8:11], s[12:15], 0x20 ; read actual CBV data[2] via V#
+        //   s_waitcnt             lgkmcnt(0)
+        //   v_mov_b32             v0, s8
+        //   v_mov_b32             v1, s9
+        //   v_mov_b32             v2, s10
+        //   v_mov_b32             v3, s11
+        //   exp mrt0              v0, v1, v2, v3 done vm
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x02, 12, 0, 0x7D, 0x0, false, false)); // s_load_dwordx4 s[12:15], s[0:1], 0x0
+        words.push(enc_sopp(0x0C, 0xC07F)); // s_waitcnt lgkmcnt(0)
+        words.extend_from_slice(&enc_smem(0x0A, 8, 6, 0x7D, 0x20, false, false)); // s_buffer_load_dwordx4 s[8:11], s[12:15], 0x20 (sbase=6 -> s12)
+        words.push(enc_sopp(0x0C, 0xC07F));
+        words.push(enc_vop1(0x01, 0, 8));
+        words.push(enc_vop1(0x01, 1, 9));
+        words.push(enc_vop1(0x01, 2, 10));
+        words.push(enc_vop1(0x01, 3, 11));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("descriptor-table V# -> s_buffer_load PS should translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(
+            out.bindings,
+            vec![WgslBindingInfo {
+                group: 0,
+                binding: 0,
+                kind: "uniform",
+                name: "cb0".to_string(),
+                min_binding_size_bytes: Some(48),
+                highest_vec4_offset: Some(2),
+            }]
+        );
+        assert_eq!(out.binding_summary.cbv_vec4_count, 3);
+        assert!(
+            out.wgsl.contains("@group(0) @binding(0)"),
+            "expected @group(0) @binding(0) in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("@binding(3)"),
+            "must NOT emit spurious @binding(3) for coalesced descriptor-table CBV:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("array<vec4<u32>, 3>"),
+            "expected tightly sized array<vec4<u32>, 3> (48 B) in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("cb0_.data[2]"),
+            "expected direct cb0_.data[2] read in WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Also verify in-place overwrite: s_buffer_load_dwordx4 s[12:15], s[12:15], 0x20
+        // followed by VALU consuming s12..s15 still coalesces to a single cb0 @binding(0)!
+        let mut inplace_words = Vec::new();
+        inplace_words.extend_from_slice(&enc_smem(0x02, 12, 0, 0x7D, 0x0, false, false));
+        inplace_words.push(enc_sopp(0x0C, 0xC07F));
+        inplace_words.extend_from_slice(&enc_smem(0x0A, 12, 6, 0x7D, 0x20, false, false));
+        inplace_words.push(enc_sopp(0x0C, 0xC07F));
+        inplace_words.push(enc_vop1(0x01, 0, 12));
+        inplace_words.push(enc_vop1(0x01, 1, 13));
+        inplace_words.push(enc_vop1(0x01, 2, 14));
+        inplace_words.push(enc_vop1(0x01, 3, 15));
+        inplace_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        inplace_words.push(enc_sopp(0x01, 0));
+
+        let inplace_out = translate_rdna2_to_wgsl(
+            &words_to_bytes(&inplace_words),
+            &Rdna2TranslateOptions::default(),
+        )
+        .expect("in-place V# overwrite s_buffer_load PS should translate cleanly");
+        assert!(inplace_out.naga_validated);
+        assert_eq!(inplace_out.bindings.len(), 1);
+        assert_eq!(inplace_out.bindings[0].binding, 0);
+        assert_eq!(inplace_out.bindings[0].min_binding_size_bytes, Some(48));
+        assert!(!inplace_out.wgsl.contains("@binding(3)"));
+        assert!(inplace_out.wgsl.contains("cb0_.data[2]"));
+        assert_naga_wgsl_valid(&inplace_out.wgsl);
     }
 }
