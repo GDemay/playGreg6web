@@ -8,6 +8,7 @@
 
 #include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
+#include "os/vmem.h"
 #include "os/surface_blocks.h"
 #include "os/xbox_scarlett.h"
 
@@ -1368,6 +1369,24 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
         }
         live = copy.data();
     }
+    // Written pages since the previous flush (where the arena tracks writes): only those can differ
+    // from the shadow. The tracking is reset before the comparison, so a write racing with it is
+    // reported again at the next flush.
+    std::vector<uint64_t> written;
+    const bool tracked = copy.empty() && os::take_written_pages(live, size, &commit_seq_, &written);
+    const uint64_t skew = reinterpret_cast<uintptr_t>(live) & (os::kWrittenPageSize - 1);
+    std::vector<bool> candidate;
+    if (tracked && write_tracked_) {
+        candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
+        for (uint64_t off : written) {
+            const uint64_t lo = off > skew ? off - skew : 0;
+            const uint64_t hi = std::min<uint64_t>(size, off + os::kWrittenPageSize - skew);
+            for (uint64_t page = lo / kShadowPage * kShadowPage; page < hi; page += kShadowPage) {
+                candidate[static_cast<size_t>(page / kShadowPage)] = true;
+            }
+        }
+    }
+    write_tracked_ = tracked;
     uint64_t run_start = 0;
     bool in_run = false;
     uint64_t uploaded = 0;
@@ -1382,7 +1401,8 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     };
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const uint64_t n = std::min(kShadowPage, size - page);
-        const bool changed = std::memcmp(shadow_.data() + page, live + page, static_cast<size_t>(n)) != 0;
+        const bool changed = (candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)]) &&
+                             std::memcmp(shadow_.data() + page, live + page, static_cast<size_t>(n)) != 0;
         if (changed && !in_run) {
             run_start = page;
             in_run = true;

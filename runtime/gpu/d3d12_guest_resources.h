@@ -169,6 +169,10 @@ private:
     bool texture_tracked_ = false;
     std::atomic<bool> back_buffer_{false};
     std::vector<uint8_t> shadow_;
+    // The arena's write tracking covers this buffer and was reset at a full comparison: later
+    // flushes compare only the pages reported written since (os::take_written_pages).
+    bool write_tracked_ = false;
+    uint64_t commit_seq_ = 0;  // os::take_written_pages' commit log position
     friend TextureProbeTotals probe_texture_contents(size_t budget);
     bool probe_registered_ = false;
     bool probe_seen_data_ = false;

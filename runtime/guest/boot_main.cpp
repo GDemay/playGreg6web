@@ -824,6 +824,9 @@ int main(int argc, char** argv) {
         return kExitUsage;
     }
     os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
+    // Write tracking on the guest address space (Windows): the GPU layer then compares only the
+    // written pages of CPU-visible buffers at each ExecuteCommandLists instead of whole buffers.
+    os::set_write_tracking(true);
     // Claim the guest address space before anything else can map into it.
     os::VirtualMemoryArena* arena = os::win32::get_vmem_arena();
     std::fprintf(stderr,

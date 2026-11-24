@@ -353,4 +353,18 @@ using ArenaObserver = void (*)(const VirtualMemoryArena& arena,
                                bool ok);
 ArenaObserver set_arena_observer(ArenaObserver observer);
 
+// Write tracking of arena memory. Appends to `offsets` the offsets, relative to `host` rounded
+// down to kWrittenPageSize, of every kWrittenPageSize page in [host, host + len) written since the
+// previous call covering that page, and starts tracking them afresh. Pages committed (zero-filled)
+// after `*commit_seq` count as written too, since a decommit and recommit changes their contents
+// without a write; `*commit_seq` is advanced. Returns false where the platform cannot tell (no
+// write tracking, a range outside a tracked reservation, or more commits since `*commit_seq` than
+// are remembered): the caller must then treat the whole range as possibly written.
+inline constexpr uint64_t kWrittenPageSize = 4096;
+// Write tracking is opt-in: reservations made after set_write_tracking(true) carry it (Windows).
+// Tracking a large reservation costs the memory manager a bitmap and time on reserve/release, so
+// processes that create many arenas (tests) leave it off unless they need it.
+void set_write_tracking(bool on);
+bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+
 }  // namespace playgta6::os
