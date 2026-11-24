@@ -906,13 +906,41 @@
     });
     updateGamepadState();
 
-    function detectWasm64() {
-      try {
-        new WebAssembly.Memory({ initial: 1n, maximum: 2n, index: 'i64' });
-        return true;
-      } catch {
+    function detectWasm64(wasmApi = typeof WebAssembly !== 'undefined' ? WebAssembly : null) {
+      if (!wasmApi || typeof wasmApi.Memory !== 'function') {
         return false;
       }
+      // Probe spec-standard `{ address: 'i64' }` (Chrome 133+, Firefox 134+, Node 22+)
+      // first, then fall back to legacy proposal `{ index: 'i64' }` (matching W58/W60).
+      const descriptors = [
+        { initial: 1n, maximum: 2n, address: 'i64' },
+        { initial: 1n, maximum: 2n, index: 'i64' },
+      ];
+      for (const desc of descriptors) {
+        try {
+          const mem = new wasmApi.Memory(desc);
+          if (!mem || typeof mem !== 'object') {
+            continue;
+          }
+          if (typeof mem.type === 'function') {
+            try {
+              const info = mem.type();
+              if (info && typeof info === 'object') {
+                const addr = info.address ?? info.index;
+                if (addr !== undefined && addr !== 'i64') {
+                  continue;
+                }
+              }
+            } catch {
+              // Ignore optional type-reflection errors.
+            }
+          }
+          return true;
+        } catch {
+          // Try next descriptor key or report unsupported below.
+        }
+      }
+      return false;
     }
 
     const caps = {
