@@ -76,7 +76,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
+      gap: 8px;
       padding: 8px 10px;
       background: rgba(15, 23, 42, 0.72);
       border-bottom: 1px solid var(--border-subtle);
@@ -89,8 +89,118 @@
     .hud-title-group {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       min-width: 0;
+    }
+
+    .hud-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid var(--border-subtle);
+      background: var(--surface-elevated);
+      font-size: 9.5px;
+      font-weight: 600;
+      line-height: 1.2;
+      letter-spacing: 0.02em;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .hud-boot-badge::before {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+    }
+
+    .hud-boot-badge[data-state="info"],
+    .hud-boot-badge[data-boot-mode="idle"] {
+      border-color: rgba(56, 189, 248, 0.35);
+      background: var(--info-bg);
+      color: #e0f2fe;
+    }
+
+    .hud-boot-badge[data-state="info"]::before,
+    .hud-boot-badge[data-boot-mode="idle"]::before {
+      background: var(--info);
+    }
+
+    .hud-boot-badge[data-state="ok"],
+    .hud-boot-badge[data-boot-mode="real-wasm64"] {
+      border-color: rgba(52, 211, 153, 0.45);
+      background: var(--ok-bg);
+      color: #d1fae5;
+    }
+
+    .hud-boot-badge[data-state="ok"]::before,
+    .hud-boot-badge[data-boot-mode="real-wasm64"]::before {
+      background: var(--ok);
+    }
+
+    .hud-boot-badge[data-state="warn"],
+    .hud-boot-badge[data-boot-mode="smoke"] {
+      border-color: rgba(251, 191, 36, 0.45);
+      background: var(--warn-bg);
+      color: #fef3c7;
+    }
+
+    .hud-boot-badge[data-state="warn"]::before,
+    .hud-boot-badge[data-boot-mode="smoke"]::before {
+      background: var(--warn);
+    }
+
+    .hud-gpu-errors::before {
+      content: "GPU Err";
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .hud-gpu-errors[data-state="ok"] {
+      border-color: rgba(52, 211, 153, 0.25);
+      background: rgba(16, 185, 129, 0.08);
+      color: var(--ok);
+    }
+
+    .hud-gpu-errors[data-state="err"] {
+      border-color: rgba(248, 113, 113, 0.5);
+      background: var(--err-bg);
+      color: #fee2e2;
+    }
+
+    .hud-gpu-errors[data-state="err"]::before {
+      color: #fca5a5;
+    }
+
+    .hud-side-modules {
+      padding: 4px 10px;
+      background: rgba(15, 23, 42, 0.56);
+      border-bottom: 1px solid var(--border-subtle);
+      font-size: 10px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .hud-side-modules[data-total="0"][data-loaded="0"],
+    #hud.collapsed .hud-side-modules {
+      display: none;
+    }
+
+    .hud-side-modules[data-state="info"] {
+      color: #e0f2fe;
+      background: var(--info-bg);
+    }
+
+    .hud-side-modules[data-state="ok"] {
+      color: #d1fae5;
+      background: var(--ok-bg);
     }
 
     .hud-dot {
@@ -485,12 +595,42 @@
       <div class="hud-title-group">
         <span id="hud-status-dot" class="hud-dot" data-level="info"></span>
         <span class="hud-brand">playgta6web</span>
+        <span
+          id="boot-mode-badge"
+          class="hud-pill hud-boot-badge"
+          data-boot-mode="idle"
+          data-state="info"
+          role="status"
+          aria-live="polite"
+          aria-label="Boot mode: Idle"
+          title="Idle"
+        >Idle</span>
         <span id="hud-status">Booting...</span>
       </div>
       <div class="hud-actions">
+        <span
+          id="gpu-validation-errors"
+          class="hud-pill hud-gpu-errors"
+          data-count="0"
+          data-state="ok"
+          role="status"
+          aria-live="polite"
+          aria-label="0 WebGPU validation errors"
+          title="0 WebGPU validation errors"
+        >0</span>
         <button id="hud-toggle" class="hud-btn" type="button" title="Toggle HUD (F9)">Hide</button>
       </div>
     </div>
+    <div
+      id="side-module-status"
+      class="hud-side-modules"
+      data-loaded="0"
+      data-total="0"
+      data-state=""
+      role="status"
+      aria-live="polite"
+      title="No split modules"
+    >No split modules</div>
 
     <div id="hud-body">
       <section class="hud-section" aria-label="Browser capabilities">
@@ -609,6 +749,9 @@
     const gpuBootPanelRoot = document.getElementById('gpu-boot-panel-root');
     const hudEl = document.getElementById('hud');
     const statusDotEl = document.getElementById('hud-status-dot');
+    const bootModeBadgeEl = document.getElementById('boot-mode-badge');
+    const sideModuleStatusEl = document.getElementById('side-module-status');
+    const gpuValidationErrorsEl = document.getElementById('gpu-validation-errors');
     const statusEl = document.getElementById('hud-status');
     const toggleBtn = document.getElementById('hud-toggle');
     const refreshStatusBtn = document.getElementById('hud-refresh-status');
@@ -649,6 +792,153 @@
     };
 
     const MAX_LOG_LINES = 200;
+    let lastValidationEventKey = null;
+
+    function syncValidationPillTooltip(summary) {
+      if (!gpuValidationErrorsEl || !summary || typeof summary !== 'object') return;
+      const count = Number.isFinite(summary.count) ? Math.max(0, Math.floor(summary.count)) : 0;
+      const text =
+        typeof summary.statusText === 'string' && summary.statusText.length > 0
+          ? summary.statusText
+          : `${count} WebGPU validation error${count === 1 ? '' : 's'}`;
+      gpuValidationErrorsEl.title = text;
+      gpuValidationErrorsEl.setAttribute('aria-label', text);
+    }
+
+    function syncBootDiagnosticDisplay() {
+      if (!activeHudController) return;
+      const bootStatus = activeHudController.renderBootStatus({ updateHudStatus: false });
+      syncValidationPillTooltip(bootStatus.validation);
+    }
+
+    function updateBootModeDisplay(mode, opts = {}) {
+      if (activeHudController) {
+        const bootStatus = activeHudController.setBootMode(mode, {
+          ...opts,
+          updateHudStatus: false,
+        });
+        syncValidationPillTooltip(bootStatus.validation);
+        return;
+      }
+      if (!bootModeBadgeEl) return;
+      const raw = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
+      const normalized =
+        raw === 'real-wasm64' || raw === 'wasm-guest' || raw === 'wasm64' || raw === 'wasm'
+          ? 'real-wasm64'
+          : raw === 'smoke' || raw === 'smoke-demo' || raw === 'running_smoke'
+            ? 'smoke'
+            : 'idle';
+      const meta = {
+        idle: { label: 'Idle', state: 'info' },
+        'real-wasm64': { label: 'Real Wasm64', state: 'ok' },
+        smoke: { label: 'Smoke Demo', state: 'warn' },
+      }[normalized];
+      bootModeBadgeEl.textContent = meta.label;
+      bootModeBadgeEl.dataset.bootMode = normalized;
+      bootModeBadgeEl.dataset.state = meta.state;
+      bootModeBadgeEl.title = meta.label;
+      bootModeBadgeEl.setAttribute('aria-label', `Boot mode: ${meta.label}`);
+    }
+
+    function updateSideModuleDisplay(progress) {
+      if (!progress || typeof progress !== 'object') return;
+      if (activeHudController) {
+        activeHudController.setSideModuleProgress(progress, { updateHudStatus: false });
+        syncValidationPillTooltip(activeHudController.getValidationSummary());
+        return;
+      }
+      if (!sideModuleStatusEl) return;
+      const total = Number.isFinite(progress.sideModuleCount)
+        ? Math.max(0, Math.floor(progress.sideModuleCount))
+        : Array.isArray(progress.sideModuleUrls)
+          ? progress.sideModuleUrls.length
+          : Array.isArray(progress.sideModules)
+            ? progress.sideModules.length
+            : 0;
+      const loaded = Number.isFinite(progress.loadedCount)
+        ? Math.max(0, Math.floor(progress.loadedCount))
+        : Number.isFinite(progress.loadedSideModules)
+          ? Math.max(0, Math.floor(progress.loadedSideModules))
+          : 0;
+      const clampedLoaded = total > 0 ? Math.min(loaded, total) : loaded;
+      const active = total > 0 || clampedLoaded > 0;
+      const complete = total > 0 && clampedLoaded >= total;
+      const pct = total > 0 ? Math.round((clampedLoaded / total) * 100) : 0;
+      const text = !active
+        ? 'No split modules'
+        : complete
+          ? `Side modules: ${clampedLoaded}/${total} loaded`
+          : `Side modules: ${clampedLoaded}/${total} (${pct}%)`;
+      sideModuleStatusEl.textContent = text;
+      sideModuleStatusEl.dataset.loaded = String(clampedLoaded);
+      sideModuleStatusEl.dataset.total = String(total);
+      sideModuleStatusEl.dataset.state = !active ? '' : complete ? 'ok' : 'info';
+      sideModuleStatusEl.title = text;
+    }
+
+    function recordGpuValidationErrorDisplay(payload) {
+      if (payload === null || payload === undefined) return;
+      const record =
+        payload && typeof payload === 'object'
+          ? payload.record || payload.error || payload
+          : payload;
+      const seq =
+        payload && typeof payload === 'object' && Number.isInteger(payload.seq) && payload.seq > 0
+          ? payload.seq
+          : record && typeof record === 'object' && Number.isInteger(record.seq) && record.seq > 0
+            ? record.seq
+            : null;
+      const ts =
+        payload && typeof payload === 'object' && Number.isFinite(payload.timestampMs)
+          ? payload.timestampMs
+          : record && typeof record === 'object' && Number.isFinite(record.timestampMs)
+            ? record.timestampMs
+            : null;
+      const dedupeKey = seq !== null ? `${seq}:${ts ?? ''}` : null;
+      if (dedupeKey !== null && dedupeKey === lastValidationEventKey) {
+        if (activeHudController) {
+          syncValidationPillTooltip(activeHudController.getValidationSummary());
+        }
+        return;
+      }
+      if (dedupeKey !== null) {
+        lastValidationEventKey = dedupeKey;
+      }
+      if (activeHudController) {
+        activeHudController.recordValidationError(record);
+        syncValidationPillTooltip(activeHudController.getValidationSummary());
+      } else if (gpuValidationErrorsEl) {
+        const prev = Number.parseInt(gpuValidationErrorsEl.dataset.count || '0', 10) || 0;
+        const next = prev + 1;
+        gpuValidationErrorsEl.textContent = String(next);
+        gpuValidationErrorsEl.dataset.count = String(next);
+        gpuValidationErrorsEl.dataset.state = 'err';
+        syncValidationPillTooltip({ count: next });
+      }
+    }
+
+    function updateBootStatusDisplay(snapshot) {
+      if (!snapshot || typeof snapshot !== 'object') return;
+      if (
+        snapshot.sideModuleCount !== undefined ||
+        Array.isArray(snapshot.sideModuleUrls) ||
+        snapshot.loadedSideModules !== undefined ||
+        snapshot.loadedSideModuleCount !== undefined
+      ) {
+        updateSideModuleDisplay({
+          sideModuleCount: snapshot.sideModuleCount,
+          sideModules: snapshot.sideModuleUrls,
+          loadedCount: snapshot.loadedSideModules ?? snapshot.loadedSideModuleCount,
+        });
+      }
+      if (snapshot.bootMode !== undefined) {
+        updateBootModeDisplay(snapshot.bootMode, {
+          firstPresentSource: snapshot.firstPresentSource,
+        });
+      } else {
+        syncBootDiagnosticDisplay();
+      }
+    }
 
     function formatTime() {
       const now = new Date();
@@ -745,6 +1035,36 @@
       }
 
       if (
+        metrics.sideModuleCount !== undefined ||
+        Array.isArray(metrics.sideModuleUrls) ||
+        metrics.sideModuleProgress !== undefined ||
+        metrics.loadedSideModules !== undefined
+      ) {
+        updateSideModuleDisplay(
+          metrics.sideModuleProgress || {
+            sideModuleCount: metrics.sideModuleCount,
+            sideModuleUrls: metrics.sideModuleUrls,
+            loadedCount: metrics.loadedSideModules,
+          }
+        );
+      }
+
+      if (metrics.bootMode !== undefined || metrics.firstPresentSource !== undefined) {
+        updateBootModeDisplay(metrics.bootMode ?? metrics.firstPresentSource, {
+          firstPresentSource: metrics.firstPresentSource,
+        });
+      }
+
+      if (Array.isArray(metrics.validationErrors) && activeHudController) {
+        const summary = activeHudController.setValidationErrors(metrics.validationErrors, {
+          totalCount: metrics.validationErrorCount,
+        });
+        syncValidationPillTooltip(summary);
+      } else if (metrics.validationError !== undefined && metrics.validationError !== null) {
+        recordGpuValidationErrorDisplay(metrics.validationError);
+      }
+
+      if (
         activeHudController &&
         (metrics.bootSummary !== undefined ||
           metrics.missingShaders !== undefined ||
@@ -757,6 +1077,7 @@
           fallbackStats: metrics.fallbackStats,
           frameStats: metrics.frameStats,
         });
+        syncValidationPillTooltip(activeHudController.getValidationSummary());
       }
     }
 
@@ -811,6 +1132,12 @@
           `${packCount} pack${packCount === 1 ? '' : 's'}`,
           packCount > 0 ? 'ok' : 'warn'
         );
+        if (data.sideModuleCount !== undefined || Array.isArray(data.sideModuleUrls)) {
+          updateSideModuleDisplay({
+            sideModuleCount: data.sideModuleCount,
+            sideModuleUrls: data.sideModuleUrls,
+          });
+        }
       } catch {
         setValue(srvEls.manifest, 'Offline', 'err');
         setValue(srvEls.bootset, 'Offline', 'err');
@@ -845,6 +1172,12 @@
       updateMetrics,
       refreshServerStatus,
       setCollapsed,
+      setBootMode: updateBootModeDisplay,
+      updateBootStatus: updateBootStatusDisplay,
+      setSideModules: updateSideModuleDisplay,
+      setSideModuleProgress: updateSideModuleDisplay,
+      recordValidationError: recordGpuValidationErrorDisplay,
+      onGpuValidationError: recordGpuValidationErrorDisplay,
     };
     window.playgta6Hud = hudApi;
     window.playgta6App = null;
@@ -1051,8 +1384,14 @@
         inputProfiles: app.inputProfiles,
         gpuBootPanel,
         hud: hudApi,
+        displayElements: {
+          bootModeBadge: bootModeBadgeEl,
+          sideModuleStatusEl,
+          validationCountEl: gpuValidationErrorsEl,
+        },
       });
       activeHudController = hudController;
+      syncBootDiagnosticDisplay();
 
       populateInputProfiles(profileSelect, app.inputProfiles);
       hudController.bindButtons({
@@ -1089,6 +1428,7 @@
         if (app.bootTracer && typeof app.bootTracer.getSummary === 'function') {
           hudController.updateGpuBootTelemetry({ bootSummary: app.bootTracer.getSummary() });
         }
+        syncBootDiagnosticDisplay();
       };
 
       const unsubscribeSession = app.session.onStateChange(() => {
