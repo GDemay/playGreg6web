@@ -28,6 +28,7 @@
 //   --summary <file>     also write the text summary there (it always goes to stderr)
 //   --import-trace <file> write every import call (sequence, thread, DLL!symbol, rcx rdx r8 r9
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
+//   --dstorage-workers <n>  DirectStorage (XCRDAPI) worker threads, 1..16 (default 1)
 //   --console-mode <n>   console-mode registry value the title reads to pick its console type
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
 //   --sandbox-id <text>  Xbox Live sandbox the emulated console reports (default RETAIL, a retail
@@ -84,6 +85,7 @@
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/xgameruntime_provider.h"
+#include "os/xbox_scarlett_guest.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -146,6 +148,7 @@ struct Options {
     std::string summary;
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
+    uint64_t dstorage_workers = 1;  // --dstorage-workers: DirectStorage worker threads (1..16)
     uint64_t arena_log_limit = 4096;  // --arena-log-limit
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
@@ -235,7 +238,8 @@ bool parse(int argc, char** argv, Options& o) {
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
-                   a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit") {
+                   a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit" ||
+                   a == "--dstorage-workers") {
             if (!value(v)) {
                 return false;
             }
@@ -243,6 +247,7 @@ bool parse(int argc, char** argv, Options& o) {
                                : a == "--gpu-capture-frames" ? o.gpu_capture_frames
                                : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
+                               : a == "--dstorage-workers" ? o.dstorage_workers
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
                                : a == "--import-trace-limit" ? o.import_trace_limit
@@ -683,6 +688,7 @@ int main(int argc, char** argv) {
         usage();
         return kExitUsage;
     }
+    os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
     // Claim the guest address space before anything else can map into it.
     os::VirtualMemoryArena* arena = os::win32::get_vmem_arena();
     std::fprintf(stderr,
@@ -785,6 +791,13 @@ int main(int argc, char** argv) {
                 sample->counters.emplace_back(dg::work_name(static_cast<dg::Work>(w)),
                                               dg::work_total(static_cast<dg::Work>(w)));
             }
+            // DirectStorage (XCRDAPI): what the title's asset loading gets done.
+            const os::scarlett::guest_api::DStorageStats ds = os::scarlett::guest_api::dstorage_stats();
+            sample->counters.emplace_back("dstorage_requests_completed", ds.requests_completed);
+            sample->counters.emplace_back("dstorage_requests_failed", ds.requests_failed);
+            sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
+            sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
+            sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);
         });
     }
     start_watchdog();
