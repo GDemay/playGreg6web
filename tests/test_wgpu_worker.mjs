@@ -1699,3 +1699,238 @@ test('W96 defaultInitGpu passes requiredLimits when supported and falls back cle
     assert.deepEqual(readyMsg.features, []);
   }
 });
+
+function createInstanceLostError() {
+  const err = new Error('A valid external Instance reference no longer exists.');
+  err.name = 'OperationError';
+  return err;
+}
+
+async function collectUnhandledRejections(fn) {
+  const rejections = [];
+  const onUnhandled = (reason) => rejections.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    await fn();
+    // Let rejected fences settle and any unhandled-rejection detection run.
+    for (let i = 0; i < 3; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+  return rejections;
+}
+
+test('W99 _getWorkDoneFence tolerates synchronous OperationError from onSubmittedWorkDone', async () => {
+  const { device, ctx, calls } = createMockWebGpu();
+  let fenceCalls = 0;
+  device.queue.onSubmittedWorkDone = () => {
+    fenceCalls += 1;
+    throw createInstanceLostError();
+  };
+  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+
+  const rejections = await collectUnhandledRejections(async () => {
+    assert.equal(processor._getWorkDoneFence(), null);
+    // _flushPresent submits and then requests the fence; neither may throw.
+    assert.doesNotThrow(() => processor._flushPresent());
+    assert.doesNotThrow(() =>
+      processor.execute(new BinaryCommandBuilder().beginFrame().present().finish())
+    );
+  });
+
+  assert.deepEqual(rejections, []);
+  assert.ok(fenceCalls >= 3);
+  assert.equal(processor.frameCount, 2);
+  assert.equal(calls.filter((c) => c.op === 'submit').length, 2);
+  assert.equal(processor._workDoneFenceFailures, fenceCalls);
+  const fenceErrors = processor
+    .getValidationErrors()
+    .filter((r) => r.message.startsWith('OnSubmittedWorkDone:'));
+  assert.equal(fenceErrors.length, 1);
+  assert.match(fenceErrors[0].message, /OperationError: A valid external Instance reference/);
+});
+
+test('W99 _getWorkDoneFence converts a rejected onSubmittedWorkDone promise into a resolved fence', async () => {
+  const { device, ctx } = createMockWebGpu();
+  let fenceCalls = 0;
+  device.queue.onSubmittedWorkDone = () => {
+    fenceCalls += 1;
+    return Promise.reject(createInstanceLostError());
+  };
+  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+
+  let fenceValue = 'unset';
+  const rejections = await collectUnhandledRejections(async () => {
+    const fence = processor._getWorkDoneFence();
+    assert.ok(fence && typeof fence.then === 'function');
+    fenceValue = await fence;
+    assert.doesNotThrow(() => processor._flushPresent());
+    assert.doesNotThrow(() =>
+      processor.execute(new BinaryCommandBuilder().beginFrame().present().finish())
+    );
+  });
+
+  assert.equal(fenceValue, undefined);
+  assert.deepEqual(rejections, []);
+  assert.equal(processor.frameCount, 2);
+  assert.ok(fenceCalls >= 3);
+  assert.equal(processor._workDoneFenceFailures, fenceCalls);
+  const fenceErrors = processor
+    .getValidationErrors()
+    .filter((r) => r.message.startsWith('OnSubmittedWorkDone:'));
+  assert.equal(fenceErrors.length, 1);
+
+  // A healthy fence still resolves through the wrapper.
+  const healthy = createMockWebGpu();
+  healthy.device.queue.onSubmittedWorkDone = () => Promise.resolve('done');
+  const healthyProcessor = new WgpuCommandProcessor(healthy.device, healthy.ctx, {});
+  assert.equal(await healthyProcessor._getWorkDoneFence(), undefined);
+  assert.equal(healthyProcessor._workDoneFenceFailures, 0);
+});
+
+test('W99 _flushPresent records torn-down instance errors from finish/submit/encoder without throwing', () => {
+  const { device, ctx, calls } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+
+  // queue.submit throws OperationError: no frame counted, no fence requested.
+  let fenceCalls = 0;
+  device.queue.onSubmittedWorkDone = () => {
+    fenceCalls += 1;
+    return Promise.resolve();
+  };
+  const origSubmit = device.queue.submit;
+  device.queue.submit = () => {
+    throw createInstanceLostError();
+  };
+  assert.doesNotThrow(() => processor._flushPresent());
+  assert.equal(processor.frameCount, 0);
+  assert.equal(fenceCalls, 0);
+  device.queue.submit = origSubmit;
+
+  // encoder.finish throws OperationError: submit is skipped.
+  const origCreateEncoder = device.createCommandEncoder;
+  device.createCommandEncoder = function createThrowingFinishEncoder() {
+    const enc = origCreateEncoder.call(this);
+    enc.finish = () => {
+      throw createInstanceLostError();
+    };
+    return enc;
+  };
+  const submitsBefore = calls.filter((c) => c.op === 'submit').length;
+  assert.doesNotThrow(() => processor._flushPresent());
+  assert.equal(calls.filter((c) => c.op === 'submit').length, submitsBefore);
+  assert.equal(processor.frameCount, 0);
+
+  // createCommandEncoder itself throws: frame dropped cleanly.
+  device.createCommandEncoder = () => {
+    throw createInstanceLostError();
+  };
+  assert.doesNotThrow(() =>
+    processor.execute(new BinaryCommandBuilder().beginFrame().present().finish())
+  );
+  assert.equal(processor.frameCount, 0);
+  assert.equal(processor._presentSubmitFailures, 3);
+
+  const presentErrors = processor
+    .getValidationErrors()
+    .filter((r) => r.message.startsWith('Present:'));
+  assert.ok(presentErrors.length >= 1);
+  assert.match(presentErrors[0].message, /OperationError: A valid external Instance reference/);
+
+  // Recovery: a healthy encoder presents normally again.
+  device.createCommandEncoder = origCreateEncoder;
+  assert.doesNotThrow(() => processor._flushPresent());
+  assert.equal(processor.frameCount, 1);
+  assert.equal(fenceCalls, 1);
+});
+
+test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout counters with 0 defaults', () => {
+  const { installRenderStatePackets } = require('../web/workers/render_state_packets.js');
+  const zeroCounters = {
+    computeDispatchCount: 0,
+    computePipelineCount: 0,
+    autoLayoutFallbacks: 0,
+  };
+
+  // No render-state telemetry attached: counters default to 0, existing keys unchanged.
+  const bare = buildGpuTelemetrySnapshot({ getStats: () => ({ frameCount: 1 }) }, { timestamp: 1 });
+  assert.deepEqual(bare.renderStateStats, zeroCounters);
+  assert.deepEqual(Object.keys(bare.frameStats), [
+    'framesPresented',
+    'droppedFrames',
+    'drawCalls',
+    'realPackDrawCount',
+    'fallbackDrawCount',
+    'computeDispatches',
+    'packetsProcessed',
+  ]);
+  // Null processor keeps the pre-W99 empty snapshot shape (no renderStateStats key).
+  assert.equal('renderStateStats' in buildGpuTelemetrySnapshot(null, { timestamp: 1 }), false);
+
+  // Live render_state_packets.js handler installed on a real processor.
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+  assert.deepEqual(
+    buildGpuTelemetrySnapshot(processor, { timestamp: 2 }).renderStateStats,
+    zeroCounters
+  );
+  handler.telemetry.computeDispatchCount = 7;
+  handler.telemetry.computePipelineCount = 3;
+  handler.telemetry.autoLayoutFallbacks = 2;
+  const live = buildGpuTelemetrySnapshot(processor, { timestamp: 3 });
+  assert.deepEqual(live.renderStateStats, {
+    computeDispatchCount: 7,
+    computePipelineCount: 3,
+    autoLayoutFallbacks: 2,
+  });
+  assert.equal(live.frameStats.computeDispatches, 0);
+
+  // Explicit renderStateProcessor / _renderStatePackets objects and coercion of bad values.
+  const viaProp = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({}),
+      renderStateProcessor: {
+        getTelemetry: () => ({
+          computeDispatchCount: 5.9,
+          computePipelineCount: -1,
+          autoLayoutFallbacks: 'nope',
+        }),
+      },
+    },
+    { timestamp: 4 }
+  );
+  assert.deepEqual(viaProp.renderStateStats, {
+    computeDispatchCount: 5,
+    computePipelineCount: 0,
+    autoLayoutFallbacks: 0,
+  });
+  const viaPrivate = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({}),
+      _renderStatePackets: { telemetry: { computePipelineCount: 4 } },
+    },
+    { timestamp: 5 }
+  );
+  assert.deepEqual(viaPrivate.renderStateStats, {
+    computeDispatchCount: 0,
+    computePipelineCount: 4,
+    autoLayoutFallbacks: 0,
+  });
+
+  // Throwing telemetry getters never break the snapshot.
+  const throwing = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({}),
+      renderStateProcessor: {
+        getTelemetry() {
+          throw new Error('boom');
+        },
+      },
+    },
+    { timestamp: 6 }
+  );
+  assert.deepEqual(throwing.renderStateStats, zeroCounters);
+});
