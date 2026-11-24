@@ -64,7 +64,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add `--strip` (`-Wl,--strip-all`), `--opt Os/Oz`, `--pthread-pool-size`, `--extra-link-flag`, and a V8 1 GiB `.wasm` module size check to `build_guest_wasm.py`.
 - [x] **R26 — `--no-link-opt` & `--shrink-largest-shards` in `tools/build_guest_wasm.py`** — `DONE` (PR #381, closes #377) *(no game files required)*
   - Add `--no-link-opt` to skip high-RAM `wasm-opt` during linking and `--shrink-largest-shards` to recompile the heaviest shards at `-Oz` to stay under browser `.wasm` size limits.
-- [ ] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `IN PROGRESS` (#405, @Timon-ok) *(driven by the native boot; synthetic fixtures only)*
+- [x] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `DONE` (PR #433, closes #405) *(driven by the native boot; synthetic fixtures only)*
   - Resolve switches whose table base or index reaches the indirect jump through control-flow merges, keeping the existing soundness rules, and measure resolved / unresolved counts before and after.
 
 ---
