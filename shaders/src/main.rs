@@ -25,6 +25,9 @@ use playgta6_shaders::pack::{
 use playgta6_shaders::rdna2::{
     analyze_instructions, decode_program, format_disasm_with_summary, to_json_with_disasm,
 };
+use playgta6_shaders::rdna2_pack::{
+    Rdna2PackOptions, Rdna2PackResult, pack_rdna2_directory_to_file,
+};
 use playgta6_shaders::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, translate_rdna2_to_wgsl,
 };
@@ -80,6 +83,11 @@ enum Command {
         stage: Rdna2StageOverride,
         json: bool,
     },
+    PackRdna2 {
+        input_dir: PathBuf,
+        out_path: PathBuf,
+        json: bool,
+    },
 }
 
 fn print_usage() {
@@ -100,6 +108,9 @@ fn print_usage() {
     eprintln!("  playgta6-shaders disasm-rdna2 <file> [--json] [--max-instructions <N>]");
     eprintln!(
         "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]"
+    );
+    eprintln!(
+        "  playgta6-shaders pack-rdna2 <input-dir> --out <out.wgsl.pack> [--json]"
     );
     eprintln!();
     eprintln!(
@@ -435,8 +446,52 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 json,
             })
         }
+        "pack-rdna2" => {
+            let mut input_dir: Option<PathBuf> = None;
+            let mut out_path: Option<PathBuf> = None;
+            let mut json = false;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --out".to_string())?;
+                        out_path = Some(PathBuf::from(val));
+                    }
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option for pack-rdna2: {other}"));
+                    }
+                    dir_arg => {
+                        if input_dir.is_some() {
+                            return Err(format!(
+                                "unexpected extra argument for pack-rdna2: {dir_arg}"
+                            ));
+                        }
+                        input_dir = Some(PathBuf::from(dir_arg));
+                    }
+                }
+                i += 1;
+            }
+
+            let input_dir = input_dir.ok_or_else(|| {
+                "pack-rdna2 requires <input-dir> --out <out.wgsl.pack> [--json]".to_string()
+            })?;
+            let out_path = out_path.ok_or_else(|| {
+                "pack-rdna2 requires --out <out.wgsl.pack>".to_string()
+            })?;
+
+            Ok(Command::PackRdna2 {
+                input_dir,
+                out_path,
+                json,
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', 'reflect-dxil', 'disasm-rdna2', or 'translate-rdna2')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', 'reflect-dxil', 'disasm-rdna2', 'translate-rdna2', or 'pack-rdna2')"
         )),
     }
 }
@@ -1077,6 +1132,27 @@ fn run_translate_rdna2(
     Ok(())
 }
 
+fn format_and_write_pack_rdna2(
+    input_dir: &Path,
+    out_path: &Path,
+    json: bool,
+) -> Result<(String, Rdna2PackResult), String> {
+    let result = pack_rdna2_directory_to_file(input_dir, out_path, &Rdna2PackOptions::default())
+        .map_err(|err| err.to_string())?;
+    let rendered = if json {
+        result.summary.to_json()
+    } else {
+        result.summary.to_text()
+    };
+    Ok((rendered, result))
+}
+
+fn run_pack_rdna2(input_dir: &Path, out_path: &Path, json: bool) -> Result<(), String> {
+    let (rendered, _) = format_and_write_pack_rdna2(input_dir, out_path, json)?;
+    print!("{rendered}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -1206,6 +1282,17 @@ fn main() -> ExitCode {
             stage,
             json,
         }) => match run_translate_rdna2(&file_path, out_path.as_deref(), stage, json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::PackRdna2 {
+            input_dir,
+            out_path,
+            json,
+        }) => match run_pack_rdna2(&input_dir, &out_path, json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1888,6 +1975,193 @@ mod tests {
         let root_str = root.to_string_lossy().replace('\\', "/");
         assert!(!wgsl.contains(&root_str));
         assert!(!json.contains(&root_str));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_parses_pack_rdna2_arguments() {
+        let cmd = parse_args(&[
+            "pack-rdna2".to_string(),
+            "rdna2_blobs".to_string(),
+            "--out".to_string(),
+            "out/splash.wgsl.pack".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::PackRdna2 {
+                input_dir: PathBuf::from("rdna2_blobs"),
+                out_path: PathBuf::from("out/splash.wgsl.pack"),
+                json: true,
+            }
+        );
+
+        let cmd_text = parse_args(&[
+            "pack-rdna2".to_string(),
+            "--out".to_string(),
+            "out/all.wgsl.pack".to_string(),
+            "rdna2_blobs".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd_text,
+            Command::PackRdna2 {
+                input_dir: PathBuf::from("rdna2_blobs"),
+                out_path: PathBuf::from("out/all.wgsl.pack"),
+                json: false,
+            }
+        );
+
+        assert!(parse_args(&["pack-rdna2".to_string()]).is_err());
+        assert!(parse_args(&["pack-rdna2".to_string(), "rdna2_blobs".to_string()]).is_err());
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "extra_dir".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--bogus".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn end_to_end_pack_rdna2_writes_wgpk_and_emits_sanitized_summaries() {
+        let root = make_temp_dir("playgta6_shaders_pack_rdna2");
+        let in_dir = root.join("blobs");
+        let out_pack = root.join("out/splash.wgsl.pack");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        // Synthetic fullscreen-triangle VS:
+        //   v_lshlrev_b32 v1, 1, v0; v_and_b32 v1, 2, v1; v_and_b32 v2, 2, v0;
+        //   v_cvt_f32_u32 v1, v1; v_cvt_f32_u32 v2, v2;
+        //   v_fma_f32 v3, v1, 2.0, -1.0; v_fma_f32 v4, -v2, 2.0, 1.0;
+        //   v_mov_b32 v5, 0; v_mov_b32 v6, 1.0;
+        //   exp pos0 v3, v4, v5, v6; exp param0 v1, v2, off, off done; s_endpgm
+        let vs_words: Vec<u32> = vec![
+            (0x18u32 << 25) | (1u32 << 17) | (128 + 1),
+            (0x19u32 << 25) | (1u32 << 17) | (1u32 << 9) | (128 + 2),
+            (0x19u32 << 25) | (2u32 << 17) | (128 + 2),
+            (0b011_1111_u32 << 25) | (1u32 << 17) | (0x06u32 << 9) | (256 + 1),
+            (0b011_1111_u32 << 25) | (2u32 << 17) | (0x06u32 << 9) | (256 + 2),
+            (0b110101u32 << 26) | (0x14Bu32 << 16) | 3,
+            (243u32 << 18) | (244u32 << 9) | (256 + 1),
+            (0b110101u32 << 26) | (0x14Bu32 << 16) | 4,
+            (0b001u32 << 29) | (242u32 << 18) | (244u32 << 9) | (256 + 2),
+            (0b011_1111_u32 << 25) | (5u32 << 17) | (0x01u32 << 9) | 128,
+            (0b011_1111_u32 << 25) | (6u32 << 17) | (0x01u32 << 9) | 242,
+            (0b111110u32 << 26) | (12u32 << 4) | 0xF,
+            3 | (4 << 8) | (5 << 16) | (6 << 24),
+            (0b111110u32 << 26) | (1u32 << 11) | (32u32 << 4) | 0x3,
+            1 | (2 << 8),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ];
+        let vs_bytes = words_to_bytes(&vs_words);
+
+        // Synthetic textured splash PS:
+        //   v_interp_p1/p2 attr0.xy; image_sample; s_waitcnt; exp mrt0 done vm; s_endpgm
+        let ps_words: Vec<u32> = vec![
+            (0b110010u32 << 26) | (2u32 << 18),
+            (0b110010u32 << 26) | (2u32 << 18) | (1u32 << 16) | 1,
+            (0b110010u32 << 26) | (3u32 << 18) | (1u32 << 8),
+            (0b110010u32 << 26) | (3u32 << 18) | (1u32 << 16) | (1u32 << 8) | 1,
+            (0b111100u32 << 26) | (0x20u32 << 18) | (0xFu32 << 8) | (1u32 << 3),
+            (1u32 << 21) | (2u32 << 16) | (4u32 << 8) | 2,
+            (0b1_0111_1111_u32 << 23) | (0x0Cu32 << 16) | 0x3F70,
+            (0b111110u32 << 26) | (1u32 << 12) | (1u32 << 11) | 0xF,
+            4 | (5 << 8) | (6 << 16) | (7 << 24),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ];
+        let ps_bytes = words_to_bytes(&ps_words);
+
+        // Synthetic compute blob (unlabeled filename -> FNV-1a hash + inferred compute stage)
+        let cs_words: Vec<u32> = vec![
+            (0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242,
+            (0b1_0111_1111_u32 << 23) | (0x0Au32 << 16),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ];
+        let cs_bytes = words_to_bytes(&cs_words);
+        let cs_hash = playgta6_shaders::convert::fnv1a_64(&cs_bytes);
+
+        fs::write(in_dir.join("ps_0000000000000020.rdna2"), &ps_bytes).unwrap();
+        fs::write(in_dir.join("vs_0000000000000010.rdna2"), &vs_bytes).unwrap();
+        fs::write(in_dir.join("auto_compute.bin"), &cs_bytes).unwrap();
+        fs::write(in_dir.join("truncated.shader"), &[0x01, 0x02]).unwrap();
+        fs::write(in_dir.join("readme.md"), b"ignored").unwrap();
+
+        let (json_out, result) =
+            format_and_write_pack_rdna2(&in_dir, &out_pack, true).expect("pack-rdna2 JSON should succeed");
+        let (text_out, _) =
+            format_and_write_pack_rdna2(&in_dir, &out_pack, false).expect("pack-rdna2 text should succeed");
+
+        assert_eq!(result.summary.total_blobs, 4);
+        assert_eq!(result.summary.translated_ok, 3);
+        assert_eq!(result.summary.skipped_or_failed, 1);
+        assert_eq!(result.summary.vertex_count, 1);
+        assert_eq!(result.summary.pixel_count, 1);
+        assert_eq!(result.summary.compute_count, 1);
+        assert_eq!(result.summary.pack_bytes, result.pack_bytes.len());
+
+        // Strictly sanitized JSON & text summaries: zero host paths.
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(json_out.contains("\"total_blobs\": 4"));
+        assert!(json_out.contains("\"translated_ok\": 3"));
+        assert!(json_out.contains("\"skipped_or_failed\": 1"));
+        assert!(json_out.contains("\"vertex_count\": 1"));
+        assert!(json_out.contains("\"pixel_count\": 1"));
+        assert!(json_out.contains("\"compute_count\": 1"));
+        assert!(json_out.contains(&format!("\"pack_bytes\": {}", result.pack_bytes.len())));
+        assert!(!json_out.contains(&root_str));
+        assert!(!text_out.contains(&root_str));
+        assert!(text_out.contains("total_blobs:"));
+        assert!(text_out.contains("pack_bytes:"));
+
+        // Verify WGPK v1 round-trip from disk via crate::pack::read_pack + Naga WGSL validation.
+        let disk_bytes = fs::read(&out_pack).unwrap();
+        assert_eq!(disk_bytes, result.pack_bytes);
+        let decoded = read_pack(&disk_bytes).expect("disk WGPK pack must parse cleanly");
+        assert_eq!(decoded.entries.len(), 3);
+
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+        );
+        for entry in &decoded.entries {
+            let parsed =
+                naga::front::wgsl::parse_str(&entry.wgsl).expect("packed WGSL must parse");
+            validator
+                .validate(&parsed)
+                .expect("packed WGSL must pass Naga validation");
+        }
+
+        assert!(decoded.entries.iter().any(|e| e.hash == 0x10 && e.stage == ShaderStage::Vertex));
+        assert!(decoded.entries.iter().any(|e| e.hash == 0x20 && e.stage == ShaderStage::Fragment));
+        assert!(decoded.entries.iter().any(|e| e.hash == cs_hash && e.stage == ShaderStage::Compute));
+
+        // Verify inspect-pack and run_pack_rdna2 both succeed on the generated pack.
+        run_inspect_pack(&out_pack).expect("inspect-pack should accept pack-rdna2 output");
+        run_pack_rdna2(&in_dir, &out_pack, false).expect("run_pack_rdna2 should succeed");
 
         let _ = fs::remove_dir_all(&root);
     }
