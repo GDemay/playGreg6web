@@ -150,6 +150,35 @@ impl Default for Rdna2TranslateOptions {
     }
 }
 
+/// Origin of a reflected binding in console user-data SGPRs or static samplers
+/// (`runtime/gpu/stage_reflection.h` / `tools/stage_reflection_sidecar.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WgslBindingSource {
+    /// Descriptor loaded from a descriptor table whose 32-bit pointer lives in `user_sgpr`
+    /// (s8+ for graphics, s4+ for compute) at `table_byte_offset` bytes into the table.
+    Table {
+        user_sgpr: u32,
+        table_byte_offset: u32,
+    },
+    /// Root constants starting at `user_sgpr`.
+    RootConstants { user_sgpr: u32 },
+    /// Root CBV/SRV/UAV descriptor (64-bit GPU VA) starting at `user_sgpr`.
+    RootDescriptor { user_sgpr: u32 },
+    /// Inline static sampler S# materialized directly in SGPRs (0-based index in stage order).
+    StaticSampler { index: u32 },
+}
+
+/// Reflected vertex input attribute fetched by a vertex stage (`stage_reflection.h`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WgslVertexInputInfo {
+    pub location: u32,
+    pub vb_slot: u32,
+    pub byte_offset: u32,
+    pub components: u8,
+    pub component_type: &'static str,
+    pub fetch_format: Option<&'static str>,
+}
+
 /// Explicit WebGPU `@group(group) @binding(binding)` resource declaration emitted in a
 /// translated WGSL module.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,12 +187,16 @@ pub struct WgslBindingInfo {
     pub binding: u32,
     pub kind: &'static str,
     pub name: String,
+    /// Texture view dimension (`"2d"`, `"2d-array"`, etc.) for texture/storage-texture bindings.
+    pub view_dimension: Option<&'static str>,
     /// Minimum WebGPU uniform buffer binding size in bytes (`Some(N * 16)` for `"uniform"`
     /// bindings, `None` for non-buffer bindings such as textures and samplers).
     pub min_binding_size_bytes: Option<u32>,
     /// Highest `vec4` index statically read from this uniform CBV (`Some(max_vec4_index)` for
     /// `"uniform"` bindings, `None` for non-buffer bindings).
     pub highest_vec4_offset: Option<u32>,
+    /// Descriptor origin in console user-data SGPRs or static samplers when statically known.
+    pub source: Option<WgslBindingSource>,
 }
 
 /// Write a JSON array of [`WgslBindingInfo`] entries with the given leading indentation.
@@ -186,14 +219,79 @@ pub(crate) fn write_wgsl_bindings_json(
         write_json_string(out, b.kind);
         out.push_str(", \"name\": ");
         write_json_string(out, &b.name);
+        if let Some(dim) = b.view_dimension {
+            out.push_str(", \"view_dimension\": ");
+            write_json_string(out, dim);
+        }
         if let Some(min_bytes) = b.min_binding_size_bytes {
             let _ = write!(out, ", \"min_binding_size_bytes\": {min_bytes}");
         }
         if let Some(highest_vec4) = b.highest_vec4_offset {
             let _ = write!(out, ", \"highest_vec4_offset\": {highest_vec4}");
         }
+        if let Some(src) = b.source {
+            out.push_str(", \"source\": ");
+            match src {
+                WgslBindingSource::Table {
+                    user_sgpr,
+                    table_byte_offset,
+                } => {
+                    let _ = write!(
+                        out,
+                        "{{\"user_sgpr\": {user_sgpr}, \"table_byte_offset\": {table_byte_offset}}}"
+                    );
+                }
+                WgslBindingSource::RootConstants { user_sgpr } => {
+                    let _ = write!(
+                        out,
+                        "{{\"user_sgpr\": {user_sgpr}, \"root_constants\": true}}"
+                    );
+                }
+                WgslBindingSource::RootDescriptor { user_sgpr } => {
+                    let _ = write!(
+                        out,
+                        "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true}}"
+                    );
+                }
+                WgslBindingSource::StaticSampler { index } => {
+                    let _ = write!(out, "{{\"static_sampler\": {index}}}");
+                }
+            }
+        }
         out.push('}');
         if i + 1 < bindings.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push(']');
+}
+
+/// Write a JSON array of [`WgslVertexInputInfo`] entries with the given leading indentation.
+pub(crate) fn write_wgsl_vertex_inputs_json(
+    out: &mut String,
+    inputs: &[WgslVertexInputInfo],
+    indent: &str,
+) {
+    if inputs.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    out.push_str("[\n");
+    for (i, v) in inputs.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{indent}  {{\"location\": {}, \"vb_slot\": {}, \"byte_offset\": {}, \"components\": {}, \"component_type\": ",
+            v.location, v.vb_slot, v.byte_offset, v.components
+        );
+        write_json_string(out, v.component_type);
+        if let Some(fmt) = v.fetch_format {
+            out.push_str(", \"fetch_format\": ");
+            write_json_string(out, fmt);
+        }
+        out.push('}');
+        if i + 1 < inputs.len() {
             out.push(',');
         }
         out.push('\n');
@@ -230,6 +328,7 @@ pub struct Rdna2WgslOutput {
     pub unsupported_op_count: usize,
     pub naga_validated: bool,
     pub bindings: Vec<WgslBindingInfo>,
+    pub vertex_inputs: Vec<WgslVertexInputInfo>,
     pub binding_summary: Rdna2BindingSummary,
 }
 
@@ -275,6 +374,12 @@ impl Rdna2WgslOutput {
         out.push_str("  \"bindings\": ");
         write_wgsl_bindings_json(&mut out, &self.bindings, "  ");
         out.push_str(",\n");
+
+        if !self.vertex_inputs.is_empty() {
+            out.push_str("  \"vertex_inputs\": ");
+            write_wgsl_vertex_inputs_json(&mut out, &self.vertex_inputs, "  ");
+            out.push_str(",\n");
+        }
 
         // binding_summary
         let bs = &self.binding_summary;
@@ -363,6 +468,8 @@ impl VertexInputMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VertexInputAttr {
+    /// Vertex-buffer slot index (`vb_slot`, 0 for single-VB shaders).
+    vb_slot: u32,
     /// Byte offset inside the vertex buffer for MUBUF/MTBUF fetches (`None` for legacy synthetic attributes).
     byte_offset: Option<u16>,
     location: u32,
@@ -411,6 +518,15 @@ struct ProgramPlan {
     legacy_uv_attr_index: Option<usize>,
     vsharp_fetch_insts: BTreeSet<usize>,
     indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
+    cbv_sources: BTreeMap<CbvKey, WgslBindingSource>,
+    tex_sources: BTreeMap<u8, WgslBindingSource>,
+    samp_sources: BTreeMap<u8, WgslBindingSource>,
+    storage_buf_sources: BTreeMap<u8, WgslBindingSource>,
+    storage_tex_sources: BTreeMap<u8, WgslBindingSource>,
+    tex_arrayed: BTreeSet<u8>,
+    storage_tex_arrayed: BTreeSet<u8>,
+    vertex_storage_buf_insts: BTreeSet<usize>,
+    vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cbv_slots: Vec<CbvSlotPlan>,
     cbv_vec4_count: u32,
     tex_slots: Vec<u8>,
@@ -809,18 +925,56 @@ fn record_src_usage(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SgprOrigin {
+    Unknown,
+    /// Hardware vertex-buffer table pointer (`s[0:1]` in vertex stages).
+    VbTablePtr,
+    /// Console user-data SGPR (`s8+` for graphics, `s4+` for compute), optionally offset by bytes.
+    UserTable { user_sgpr: u32, byte_offset: i32 },
+    /// Descriptor dword loaded from a user-data descriptor table via `s_load_dwordx4/x8/x16`.
+    TableDesc {
+        def_inst_idx: usize,
+        user_sgpr: u32,
+        table_byte_offset: u32,
+    },
+    /// Vertex-buffer V# descriptor loaded from the hardware VB table (`s[0:1]`).
+    VbDesc {
+        def_inst_idx: usize,
+        vb_slot: u32,
+    },
+    /// Materialized from immediate/literal constants (used to detect inline static sampler S#).
+    ConstImmediate,
+}
+
 #[derive(Debug, Clone)]
 struct VSharpCandidate {
     def_inst_idx: usize,
     dst_sgpr: u8,
+    dword_count: u8,
     table_sbase: u8,
+    user_sgpr: Option<u32>,
     table_offset: i32,
-    buffer_load_users: Vec<usize>,
+    buffer_load_users: Vec<(usize, i32)>,
     tainted_by_scalar_read: bool,
     /// Vertex-shader `idxen` MUBUF/MTBUF attribute fetches using this V# as `srsrc`.
     vertex_fetch_users: usize,
-    /// Consumed as `srsrc` by a non-vertex-attribute buffer access (storage, non-`idxen`).
-    used_as_other_buffer: bool,
+    /// Consumed as `srsrc`/`ssamp` by MIMG or MUBUF/MTBUF storage buffer access.
+    used_as_descriptor: bool,
+}
+
+#[derive(Debug, Default)]
+struct DescriptorAnalysis {
+    vsharp_fetch_insts: BTreeSet<usize>,
+    indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
+    cbv_sources: BTreeMap<CbvKey, WgslBindingSource>,
+    direct_smem_user_sgpr: BTreeMap<usize, u32>,
+    tex_sources: BTreeMap<u8, WgslBindingSource>,
+    samp_sources: BTreeMap<u8, WgslBindingSource>,
+    storage_buf_sources: BTreeMap<u8, WgslBindingSource>,
+    storage_tex_sources: BTreeMap<u8, WgslBindingSource>,
+    vertex_storage_buf_insts: BTreeSet<usize>,
+    vertex_fetch_vb_slots: BTreeMap<usize, u32>,
 }
 
 fn sgpr_ranges_overlap(a_start: u8, a_len: u8, b_start: u8, b_len: u8) -> bool {
@@ -833,7 +987,7 @@ fn taint_vsharp_if_sgpr_read(live: &mut [VSharpCandidate], src: u16) {
     if src <= 105 {
         let r = src as u8;
         for cand in live.iter_mut() {
-            if r >= cand.dst_sgpr && r < cand.dst_sgpr.saturating_add(4) {
+            if r >= cand.dst_sgpr && r < cand.dst_sgpr.saturating_add(cand.dword_count) {
                 cand.tainted_by_scalar_read = true;
             }
         }
@@ -851,7 +1005,7 @@ fn retire_overwritten_vsharps(
     }
     let mut i = 0;
     while i < live.len() {
-        if sgpr_ranges_overlap(live[i].dst_sgpr, 4, start, len) {
+        if sgpr_ranges_overlap(live[i].dst_sgpr, live[i].dword_count, start, len) {
             finished.push(live.swap_remove(i));
         } else {
             i += 1;
@@ -859,25 +1013,44 @@ fn retire_overwritten_vsharps(
     }
 }
 
-/// Detect 2-step descriptor-table V# indirections:
-///   1. `s_load_dwordx4 s[D:D+3], s[table_ptr], static_offset` (`op == 0x02`)
-///   2. `s_buffer_load_* s[...], s[D:D+3], cbv_offset` (`op in 0x08..=0x0C`)
-///
-/// Matches only when `s[D:D+3]` is NOT consumed as ordinary scalar arithmetic/color data during its live range.
-///
-/// Returns `(vsharp_fetch_insts, indirect_smem_cbv_keys)` so the V# fetch itself does not
-/// allocate a spurious uniform buffer binding and the downstream `s_buffer_load_*` binds
-/// directly to the descriptor-table CBV slot (e.g. `cb0` at `@group(0) @binding(0)`).
-///
-/// In vertex shaders, a `s_load_dwordx4` V# that is consumed ONLY as the `srsrc` of `idxen`
-/// MUBUF/MTBUF attribute fetches (vertex-buffer descriptor, lowered to `VsIn` inputs) is
-/// also reported in `vsharp_fetch_insts`, so it never allocates a bogus `cbN_` binding.
+fn decode_inline_u32_src(src: u16, literal: Option<u32>) -> Option<i32> {
+    if src == 255 {
+        literal.map(|v| v as i32)
+    } else if (128..=192).contains(&src) {
+        Some((src - 128) as i32)
+    } else if (193..=208).contains(&src) {
+        Some(-(src as i32 - 192))
+    } else {
+        None
+    }
+}
+
+/// Detect descriptor-table V#/T#/S# indirections (`s_load_dwordx4/x8/x16`) and track
+/// console user-data SGPR provenance (`s8+` graphics, `s4+` compute) plus hardware VB-table
+/// (`s[0:1]`) and inline static-sampler S# origins for `<pack>.reflect.json` (S31 / #662).
 fn analyze_vsharp_indirections(
     active: &[Rdna2Instruction],
     stage: ShaderStage,
-) -> (BTreeSet<usize>, BTreeMap<usize, CbvKey>) {
+) -> DescriptorAnalysis {
+    let mut out = DescriptorAnalysis::default();
     let mut live: Vec<VSharpCandidate> = Vec::new();
     let mut finished: Vec<VSharpCandidate> = Vec::new();
+    let mut origins = [SgprOrigin::Unknown; 106];
+    let mut next_static_sampler_index: u32 = 0;
+
+    // Seed console ABI initial SGPR origins:
+    //   Graphics: user data starts at s8; vertex hardware VB table ptr is in s[0:1].
+    //   Compute:  user data starts at s4.
+    let user_base: usize = if stage == ShaderStage::Compute { 4 } else { 8 };
+    if stage == ShaderStage::Vertex {
+        origins[0] = SgprOrigin::VbTablePtr;
+    }
+    for (sgpr, slot) in origins.iter_mut().enumerate().take(32).skip(user_base) {
+        *slot = SgprOrigin::UserTable {
+            user_sgpr: sgpr as u32,
+            byte_offset: 0,
+        };
+    }
 
     for (inst_idx, inst) in active.iter().enumerate() {
         if inst.truncated {
@@ -898,7 +1071,10 @@ fn analyze_vsharp_indirections(
                 }
             }
             Rdna2Detail::Sop1 {
-                op, sdst, ssrc0, ..
+                op,
+                sdst,
+                ssrc0,
+                literal,
             } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
                 if matches!(*op, 0x04 | 0x0A) {
@@ -907,8 +1083,23 @@ fn analyze_vsharp_indirections(
                     }
                     if *sdst <= 104 {
                         retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
+                        let src_origin = if *ssrc0 <= 105 {
+                            origins[*ssrc0 as usize]
+                        } else if decode_inline_u32_src(u16::from(*ssrc0), *literal).is_some()
+                            || *ssrc0 == 0xFF
+                        {
+                            SgprOrigin::ConstImmediate
+                        } else {
+                            SgprOrigin::Unknown
+                        };
+                        origins[*sdst as usize] = src_origin;
+                        origins[(*sdst + 1) as usize] = match src_origin {
+                            SgprOrigin::ConstImmediate => SgprOrigin::ConstImmediate,
+                            _ => SgprOrigin::Unknown,
+                        };
                     } else if *sdst == 105 {
                         retire_overwritten_vsharps(&mut live, &mut finished, 105, 1);
+                        origins[105] = SgprOrigin::Unknown;
                     }
                 } else {
                     if *op == 0x05 {
@@ -916,6 +1107,28 @@ fn analyze_vsharp_indirections(
                     }
                     if *sdst <= 105 {
                         retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                        if *op == 0x03 {
+                            // s_mov_b32
+                            if *ssrc0 <= 105 {
+                                origins[*sdst as usize] = origins[*ssrc0 as usize];
+                            } else if *ssrc0 == 0x80
+                                && (*sdst % 2 == 1)
+                                && matches!(
+                                    origins[(*sdst - 1) as usize],
+                                    SgprOrigin::UserTable { .. } | SgprOrigin::VbTablePtr
+                                )
+                            {
+                                // Zero-extending a 32-bit console table pointer in s[2k:2k+1]:
+                                // preserve the low SGPR's UserTable/VbTablePtr origin.
+                                origins[*sdst as usize] = SgprOrigin::ConstImmediate;
+                            } else if *ssrc0 >= 128 {
+                                origins[*sdst as usize] = SgprOrigin::ConstImmediate;
+                            } else {
+                                origins[*sdst as usize] = SgprOrigin::Unknown;
+                            }
+                        } else {
+                            origins[*sdst as usize] = SgprOrigin::Unknown;
+                        }
                     }
                 }
             }
@@ -925,6 +1138,12 @@ fn analyze_vsharp_indirections(
                 }
                 if !matches!(*op, 0x17..=0x1A) && *sdst <= 105 {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                    origins[*sdst as usize] = if *op == 0x00 {
+                        // s_movk_i32
+                        SgprOrigin::ConstImmediate
+                    } else {
+                        SgprOrigin::Unknown
+                    };
                 }
             }
             Rdna2Detail::Sop2 {
@@ -932,7 +1151,7 @@ fn analyze_vsharp_indirections(
                 sdst,
                 ssrc0,
                 ssrc1,
-                ..
+                literal,
             } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1));
@@ -945,8 +1164,48 @@ fn analyze_vsharp_indirections(
                 }
                 if pair0 && *sdst <= 104 {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
+                    origins[*sdst as usize] = SgprOrigin::Unknown;
+                    origins[(*sdst + 1) as usize] = SgprOrigin::Unknown;
                 } else if *sdst <= 105 {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
+                    // Preserve table pointer + constant byte offset on s_add_u32 (op 0x00).
+                    let mut next_origin = SgprOrigin::Unknown;
+                    if *op == 0x00 {
+                        if *ssrc0 <= 105
+                            && let SgprOrigin::UserTable {
+                                user_sgpr,
+                                byte_offset,
+                            } = origins[*ssrc0 as usize]
+                            && let Some(imm) = decode_inline_u32_src(u16::from(*ssrc1), *literal)
+                        {
+                            next_origin = SgprOrigin::UserTable {
+                                user_sgpr,
+                                byte_offset: byte_offset.saturating_add(imm),
+                            };
+                        } else if *ssrc1 <= 105
+                            && let SgprOrigin::UserTable {
+                                user_sgpr,
+                                byte_offset,
+                            } = origins[*ssrc1 as usize]
+                            && let Some(imm) = decode_inline_u32_src(u16::from(*ssrc0), *literal)
+                        {
+                            next_origin = SgprOrigin::UserTable {
+                                user_sgpr,
+                                byte_offset: byte_offset.saturating_add(imm),
+                            };
+                        }
+                    } else if *op == 0x29 {
+                        // s_bfm_b32 with immediate operands (common in inline static sampler S#).
+                        if *ssrc0 >= 128 && *ssrc1 >= 128 {
+                            next_origin = SgprOrigin::ConstImmediate;
+                        }
+                    } else if matches!(*op, 0x0E | 0x10)
+                        && *ssrc0 >= 128
+                        && *ssrc1 >= 128
+                    {
+                        next_origin = SgprOrigin::ConstImmediate;
+                    }
+                    origins[*sdst as usize] = next_origin;
                 }
             }
             Rdna2Detail::Smem {
@@ -963,38 +1222,111 @@ fn analyze_vsharp_indirections(
                 }
                 let sbase_sgpr = sbase.saturating_mul(2);
                 if matches!(*op, 0x08..=0x0C) {
+                    // s_buffer_load_* consuming a V# in s[sbase_sgpr .. sbase_sgpr+3]
+                    let mut matched = false;
                     for cand in live.iter_mut() {
-                        if cand.dst_sgpr == sbase_sgpr {
-                            cand.buffer_load_users.push(inst_idx);
-                        } else if sgpr_ranges_overlap(cand.dst_sgpr, 4, sbase_sgpr, 4) {
+                        if sbase_sgpr >= cand.dst_sgpr
+                            && sbase_sgpr.saturating_add(4)
+                                <= cand.dst_sgpr.saturating_add(cand.dword_count)
+                            && (sbase_sgpr - cand.dst_sgpr) % 4 == 0
+                        {
+                            let delta_bytes = i32::from(sbase_sgpr - cand.dst_sgpr) * 4;
+                            cand.buffer_load_users.push((inst_idx, delta_bytes));
+                            matched = true;
+                        } else if sgpr_ranges_overlap(cand.dst_sgpr, cand.dword_count, sbase_sgpr, 4)
+                        {
                             cand.tainted_by_scalar_read = true;
+                        }
+                    }
+                    if !matched && (sbase_sgpr as usize) < origins.len() {
+                        if let SgprOrigin::UserTable { user_sgpr, .. } = origins[sbase_sgpr as usize]
+                        {
+                            out.direct_smem_user_sgpr.insert(inst_idx, user_sgpr);
                         }
                     }
                 } else if smem_load_dword_count(*op).is_some() {
                     for cand in live.iter_mut() {
-                        if sgpr_ranges_overlap(cand.dst_sgpr, 4, sbase_sgpr, 2) {
+                        if sgpr_ranges_overlap(cand.dst_sgpr, cand.dword_count, sbase_sgpr, 2) {
                             cand.tainted_by_scalar_read = true;
                         }
                     }
+                    if (sbase_sgpr as usize) < origins.len()
+                        && let SgprOrigin::UserTable { user_sgpr, .. } = origins[sbase_sgpr as usize]
+                    {
+                        out.direct_smem_user_sgpr.insert(inst_idx, user_sgpr);
+                    }
                 }
+                // Snapshot base origin BEFORE overwriting sdata (since sdata can alias sbase_sgpr,
+                // e.g. `s_load_dwordx4 s[8:11], s[8:9], 0x0`).
+                let base_origin = if (sbase_sgpr as usize) < origins.len() {
+                    origins[sbase_sgpr as usize]
+                } else {
+                    SgprOrigin::Unknown
+                };
                 if let Some(count) = smem_load_dword_count(*op) {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdata, count);
+                    for k in 0..count {
+                        let reg = sdata.saturating_add(k);
+                        if (reg as usize) < origins.len() {
+                            origins[reg as usize] = SgprOrigin::Unknown;
+                        }
+                    }
                 }
-                if *op == 0x02 && !is_dynamic && *sdata <= 102 && (*sdata % 2 == 0) {
+                // Track 4-, 8-, and 16-dword descriptor loads (`s_load_dwordx4/x8/x16`).
+                if matches!(*op, 0x02 | 0x03 | 0x04)
+                    && !is_dynamic
+                    && (*sdata % 2 == 0)
+                    && let Some(count) = smem_load_dword_count(*op)
+                    && sdata.saturating_add(count) <= 106
+                {
                     let inline_off = if (128..=192).contains(soffset) {
                         i32::from(*soffset - 128)
                     } else {
                         0
                     };
+                    let raw_off = offset.saturating_add(inline_off);
+                    let (user_sgpr, eff_table_off, is_vb_table) = match base_origin {
+                        SgprOrigin::VbTablePtr => (None, raw_off, true),
+                        SgprOrigin::UserTable {
+                            user_sgpr,
+                            byte_offset,
+                        } => (Some(user_sgpr), byte_offset.saturating_add(raw_off), false),
+                        _ => (None, raw_off, false),
+                    };
+                    if is_vb_table {
+                        for k in 0..count {
+                            let reg = sdata.saturating_add(k);
+                            let vb_slot = (eff_table_off.saturating_add(i32::from(k) * 4)).max(0)
+                                as u32
+                                / 16;
+                            origins[reg as usize] = SgprOrigin::VbDesc {
+                                def_inst_idx: inst_idx,
+                                vb_slot,
+                            };
+                        }
+                    } else if let Some(u) = user_sgpr {
+                        for k in 0..count {
+                            let reg = sdata.saturating_add(k);
+                            let byte_off =
+                                (eff_table_off.saturating_add(i32::from(k) * 4)).max(0) as u32;
+                            origins[reg as usize] = SgprOrigin::TableDesc {
+                                def_inst_idx: inst_idx,
+                                user_sgpr: u,
+                                table_byte_offset: byte_off,
+                            };
+                        }
+                    }
                     live.push(VSharpCandidate {
                         def_inst_idx: inst_idx,
                         dst_sgpr: *sdata,
+                        dword_count: count,
                         table_sbase: *sbase,
-                        table_offset: offset.saturating_add(inline_off),
+                        user_sgpr,
+                        table_offset: eff_table_off,
                         buffer_load_users: Vec::new(),
                         tainted_by_scalar_read: false,
                         vertex_fetch_users: 0,
-                        used_as_other_buffer: false,
+                        used_as_descriptor: false,
                     });
                 }
             }
@@ -1005,6 +1337,7 @@ fn analyze_vsharp_indirections(
                         let sd = *vdst & 0x7F;
                         if sd <= 105 {
                             retire_overwritten_vsharps(&mut live, &mut finished, sd, 1);
+                            origins[sd as usize] = SgprOrigin::Unknown;
                         }
                     }
                 }
@@ -1038,7 +1371,7 @@ fn analyze_vsharp_indirections(
                         | 0x140..=0x165
                         | 0x16D..=0x171
                         | 0x340..=0x35F
-                        | 0x36D..=0x370
+                        | 0x36D..=0x371
                 );
                 if is_ternary {
                     taint_vsharp_if_sgpr_read(&mut live, *src2);
@@ -1047,12 +1380,14 @@ fn analyze_vsharp_indirections(
                     let sd7 = *sd & 0x7F;
                     if sd7 <= 105 {
                         retire_overwritten_vsharps(&mut live, &mut finished, sd7, 1);
+                        origins[sd7 as usize] = SgprOrigin::Unknown;
                     }
                 }
                 if *op <= 0xFF {
                     let sd = *vdst & 0x7F;
                     if sd <= 105 {
                         retire_overwritten_vsharps(&mut live, &mut finished, sd, 1);
+                        origins[sd as usize] = SgprOrigin::Unknown;
                     }
                 }
             }
@@ -1069,6 +1404,77 @@ fn analyze_vsharp_indirections(
                     taint_vsharp_if_sgpr_read(&mut live, *src2);
                 }
             }
+            Rdna2Detail::Mimg {
+                op, srsrc, ssamp, ..
+            } => {
+                if let Some(layout) = mimg_addr_layout(*op) {
+                    let rsrc_sgpr = srsrc.saturating_mul(4);
+                    // Mark any live s_load_dwordx4/x8/x16 from a user-data descriptor table
+                    // providing T# as a descriptor fetch (so it never allocates a bogus CBV).
+                    for cand in live.iter_mut() {
+                        if cand.user_sgpr.is_some()
+                            && rsrc_sgpr >= cand.dst_sgpr
+                            && rsrc_sgpr < cand.dst_sgpr.saturating_add(cand.dword_count)
+                        {
+                            cand.used_as_descriptor = true;
+                        }
+                    }
+                    if (rsrc_sgpr as usize) < origins.len()
+                        && let SgprOrigin::TableDesc {
+                            def_inst_idx,
+                            user_sgpr,
+                            table_byte_offset,
+                        } = origins[rsrc_sgpr as usize]
+                    {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        let src = WgslBindingSource::Table {
+                            user_sgpr,
+                            table_byte_offset,
+                        };
+                        if layout.is_store {
+                            out.storage_tex_sources.entry(*srsrc).or_insert(src);
+                        } else {
+                            out.tex_sources.entry(*srsrc).or_insert(src);
+                        }
+                    }
+                    if !layout.is_load && !layout.is_store {
+                        let samp_sgpr = ssamp.saturating_mul(4);
+                        for cand in live.iter_mut() {
+                            if cand.user_sgpr.is_some()
+                                && samp_sgpr >= cand.dst_sgpr
+                                && samp_sgpr < cand.dst_sgpr.saturating_add(cand.dword_count)
+                            {
+                                cand.used_as_descriptor = true;
+                            }
+                        }
+                        if (samp_sgpr as usize) < origins.len() {
+                            match origins[samp_sgpr as usize] {
+                                SgprOrigin::TableDesc {
+                                    def_inst_idx,
+                                    user_sgpr,
+                                    table_byte_offset,
+                                } => {
+                                    out.vsharp_fetch_insts.insert(def_inst_idx);
+                                    out.samp_sources.entry(*ssamp).or_insert(
+                                        WgslBindingSource::Table {
+                                            user_sgpr,
+                                            table_byte_offset,
+                                        },
+                                    );
+                                }
+                                SgprOrigin::ConstImmediate => {
+                                    out.samp_sources.entry(*ssamp).or_insert_with(|| {
+                                        let idx = next_static_sampler_index;
+                                        next_static_sampler_index += 1;
+                                        WgslBindingSource::StaticSampler { index: idx }
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
             Rdna2Detail::Mubuf {
                 op,
                 idxen,
@@ -1077,9 +1483,45 @@ fn analyze_vsharp_indirections(
                 ..
             } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
-                let is_vertex_fetch =
-                    stage == ShaderStage::Vertex && *idxen && mubuf_load_components(*op).is_some();
-                record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
+                let rsrc_sgpr = srsrc.saturating_mul(4);
+                let origin = if (rsrc_sgpr as usize) < origins.len() {
+                    origins[rsrc_sgpr as usize]
+                } else {
+                    SgprOrigin::Unknown
+                };
+                match origin {
+                    SgprOrigin::VbDesc {
+                        def_inst_idx,
+                        vb_slot,
+                    } if stage == ShaderStage::Vertex && mubuf_load_components(*op).is_some() => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.vertex_fetch_vb_slots.insert(inst_idx, vb_slot);
+                        record_vsharp_buffer_use(&mut live, *srsrc, true);
+                    }
+                    SgprOrigin::TableDesc {
+                        def_inst_idx,
+                        user_sgpr,
+                        table_byte_offset,
+                    } => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.storage_buf_sources.entry(*srsrc).or_insert(
+                            WgslBindingSource::Table {
+                                user_sgpr,
+                                table_byte_offset,
+                            },
+                        );
+                        if stage == ShaderStage::Vertex && mubuf_storage_op(*op).is_some() {
+                            out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                        record_vsharp_buffer_use(&mut live, *srsrc, false);
+                    }
+                    _ => {
+                        let is_vertex_fetch = stage == ShaderStage::Vertex
+                            && *idxen
+                            && mubuf_load_components(*op).is_some();
+                        record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
+                    }
+                }
             }
             Rdna2Detail::Mtbuf {
                 op,
@@ -1089,9 +1531,45 @@ fn analyze_vsharp_indirections(
                 ..
             } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
-                let is_vertex_fetch =
-                    stage == ShaderStage::Vertex && *idxen && mtbuf_load_components(*op).is_some();
-                record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
+                let rsrc_sgpr = srsrc.saturating_mul(4);
+                let origin = if (rsrc_sgpr as usize) < origins.len() {
+                    origins[rsrc_sgpr as usize]
+                } else {
+                    SgprOrigin::Unknown
+                };
+                match origin {
+                    SgprOrigin::VbDesc {
+                        def_inst_idx,
+                        vb_slot,
+                    } if stage == ShaderStage::Vertex && mtbuf_load_components(*op).is_some() => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.vertex_fetch_vb_slots.insert(inst_idx, vb_slot);
+                        record_vsharp_buffer_use(&mut live, *srsrc, true);
+                    }
+                    SgprOrigin::TableDesc {
+                        def_inst_idx,
+                        user_sgpr,
+                        table_byte_offset,
+                    } => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.storage_buf_sources.entry(*srsrc).or_insert(
+                            WgslBindingSource::Table {
+                                user_sgpr,
+                                table_byte_offset,
+                            },
+                        );
+                        if stage == ShaderStage::Vertex && mtbuf_storage_op(*op).is_some() {
+                            out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                        record_vsharp_buffer_use(&mut live, *srsrc, false);
+                    }
+                    _ => {
+                        let is_vertex_fetch = stage == ShaderStage::Vertex
+                            && *idxen
+                            && mtbuf_load_components(*op).is_some();
+                        record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
+                    }
+                }
             }
             Rdna2Detail::Flat { saddr, .. } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*saddr));
@@ -1101,7 +1579,6 @@ fn analyze_vsharp_indirections(
             }
             Rdna2Detail::Sopp { .. }
             | Rdna2Detail::Vintrp { .. }
-            | Rdna2Detail::Mimg { .. }
             | Rdna2Detail::Ds { .. }
             | Rdna2Detail::Exp { .. }
             | Rdna2Detail::Unknown { .. } => {}
@@ -1110,39 +1587,48 @@ fn analyze_vsharp_indirections(
 
     finished.extend(live);
 
-    let mut vsharp_fetch_insts = BTreeSet::new();
-    let mut indirect_smem_cbv_keys = BTreeMap::new();
     for cand in finished {
         if !cand.tainted_by_scalar_read && !cand.buffer_load_users.is_empty() {
-            vsharp_fetch_insts.insert(cand.def_inst_idx);
-            let key = CbvKey {
-                base_sbase: cand.table_sbase,
-                table_offset: Some(cand.table_offset),
-            };
-            for user_idx in cand.buffer_load_users {
-                indirect_smem_cbv_keys.insert(user_idx, key);
+            out.vsharp_fetch_insts.insert(cand.def_inst_idx);
+            for (user_idx, delta_bytes) in cand.buffer_load_users {
+                let eff_off = cand.table_offset.saturating_add(delta_bytes);
+                let key = CbvKey {
+                    base_sbase: cand.table_sbase,
+                    table_offset: Some(eff_off),
+                };
+                out.indirect_smem_cbv_keys.insert(user_idx, key);
+                if let Some(u) = cand.user_sgpr {
+                    out.cbv_sources.entry(key).or_insert(WgslBindingSource::Table {
+                        user_sgpr: u,
+                        table_byte_offset: eff_off.max(0) as u32,
+                    });
+                }
             }
         } else if !cand.tainted_by_scalar_read
-            && cand.buffer_load_users.is_empty()
-            && cand.vertex_fetch_users > 0
-            && !cand.used_as_other_buffer
+            && (cand.used_as_descriptor || cand.vertex_fetch_users > 0)
         {
-            // Vertex-buffer V#: attribute fetches lower to `VsIn`, no uniform binding needed.
-            vsharp_fetch_insts.insert(cand.def_inst_idx);
+            // Pure descriptor fetch (T#/S#/VB V#/storage V#): never allocate a spurious CBV!
+            out.vsharp_fetch_insts.insert(cand.def_inst_idx);
         }
     }
 
-    (vsharp_fetch_insts, indirect_smem_cbv_keys)
+    out
 }
 
 /// Record a MUBUF/MTBUF `srsrc` (in units of 4 SGPRs) consuming a live V# candidate.
 fn record_vsharp_buffer_use(live: &mut [VSharpCandidate], srsrc: u8, is_vertex_fetch: bool) {
     let rsrc_sgpr = srsrc.saturating_mul(4);
     for cand in live.iter_mut() {
-        if cand.dst_sgpr == rsrc_sgpr && is_vertex_fetch {
-            cand.vertex_fetch_users += 1;
-        } else if sgpr_ranges_overlap(cand.dst_sgpr, 4, rsrc_sgpr, 4) {
-            cand.used_as_other_buffer = true;
+        if rsrc_sgpr >= cand.dst_sgpr
+            && rsrc_sgpr.saturating_add(4) <= cand.dst_sgpr.saturating_add(cand.dword_count)
+        {
+            if is_vertex_fetch {
+                cand.vertex_fetch_users += 1;
+            } else {
+                cand.used_as_descriptor = true;
+            }
+        } else if sgpr_ranges_overlap(cand.dst_sgpr, cand.dword_count, rsrc_sgpr, 4) {
+            cand.used_as_descriptor = true;
         }
     }
 }
@@ -1192,16 +1678,22 @@ fn plan_program(
     }
 
     let active = &instructions[..active_inst_count];
-    let (vsharp_fetch_insts, indirect_smem_cbv_keys) = analyze_vsharp_indirections(active, stage);
+    let mut desc_analysis = analyze_vsharp_indirections(active, stage);
+    let vsharp_fetch_insts = desc_analysis.vsharp_fetch_insts;
+    let indirect_smem_cbv_keys = desc_analysis.indirect_smem_cbv_keys;
+    let vertex_storage_buf_insts = desc_analysis.vertex_storage_buf_insts;
+    let vertex_fetch_vb_slots = desc_analysis.vertex_fetch_vb_slots;
 
     let mut cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
     let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
+    let mut tex_arrayed: BTreeSet<u8> = BTreeSet::new();
     let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut storage_buf_usage: BTreeMap<u8, bool> = BTreeMap::new();
     let mut storage_tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
+    let mut storage_tex_arrayed: BTreeSet<u8> = BTreeSet::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
-    let mut vertex_buf_fetches: BTreeMap<u16, u8> = BTreeMap::new();
+    let mut vertex_buf_fetches: BTreeMap<(u32, u16), u8> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
     let mut vs_param_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_mrt_set: BTreeSet<u8> = BTreeSet::new();
@@ -1459,6 +1951,14 @@ fn plan_program(
                             base_sbase: *sbase,
                             table_offset: None,
                         });
+                    if cbv_key.table_offset.is_none()
+                        && let Some(&user_sgpr) = desc_analysis.direct_smem_user_sgpr.get(&inst_idx)
+                    {
+                        desc_analysis
+                            .cbv_sources
+                            .entry(cbv_key)
+                            .or_insert(WgslBindingSource::RootDescriptor { user_sgpr });
+                    }
                     cbv_usage
                         .entry(cbv_key)
                         .and_modify(|usage| {
@@ -1620,7 +2120,7 @@ fn plan_program(
                         | 0x140..=0x165
                         | 0x16D..=0x171
                         | 0x340..=0x35F
-                        | 0x36D..=0x370
+                        | 0x36D..=0x371
                 );
                 if is_ternary {
                     record_src_usage(
@@ -1727,6 +2227,7 @@ fn plan_program(
             Rdna2Detail::Mimg {
                 op,
                 dmask,
+                dim,
                 vaddr,
                 vdata,
                 srsrc,
@@ -1734,10 +2235,15 @@ fn plan_program(
                 ..
             } => {
                 if let Some(layout) = mimg_addr_layout(*op) {
+                    let is_array = *dim == 5;
+                    let addr_vgprs = layout.total_vgprs.saturating_add(u8::from(is_array));
                     if layout.is_store {
                         if stage != ShaderStage::Vertex {
                             storage_tex_rsrc_set.insert(*srsrc);
-                            for a in 0..layout.total_vgprs {
+                            if is_array {
+                                storage_tex_arrayed.insert(*srsrc);
+                            }
+                            for a in 0..addr_vgprs {
                                 let reg = vaddr.saturating_add(a);
                                 vgprs.insert(reg);
                                 if !written_vgprs.contains(&reg) {
@@ -1756,10 +2262,13 @@ fn plan_program(
                         }
                     } else {
                         tex_rsrc_set.insert(*srsrc);
+                        if is_array {
+                            tex_arrayed.insert(*srsrc);
+                        }
                         if !layout.is_load {
                             samp_rsrc_set.insert(*ssamp);
                         }
-                        for a in 0..layout.total_vgprs {
+                        for a in 0..addr_vgprs {
                             let reg = vaddr.saturating_add(a);
                             vgprs.insert(reg);
                             if !written_vgprs.contains(&reg) {
@@ -1787,11 +2296,12 @@ fn plan_program(
                 soffset,
                 ..
             } => {
-                if stage == ShaderStage::Vertex {
+                if stage == ShaderStage::Vertex && !vertex_storage_buf_insts.contains(&inst_idx) {
                     if let Some(comps) = mubuf_load_components(*op) {
                         has_buffer_fetch = true;
+                        let vb_slot = vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
                         vertex_buf_fetches
-                            .entry(*offset)
+                            .entry((vb_slot, *offset))
                             .and_modify(|c| *c = (*c).max(comps))
                             .or_insert(comps);
                         for d in 0..comps {
@@ -1801,10 +2311,11 @@ fn plan_program(
                         }
                     }
                 } else if let Some(buf_op) = mubuf_storage_op(*op) {
+                    let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
                     storage_buf_usage
                         .entry(*srsrc)
-                        .and_modify(|w| *w |= buf_op.is_store())
-                        .or_insert(buf_op.is_store());
+                        .and_modify(|w| *w |= writable)
+                        .or_insert(writable);
                     if *offen || *idxen {
                         vgprs.insert(*vaddr);
                         if !written_vgprs.contains(vaddr) {
@@ -1840,7 +2351,7 @@ fn plan_program(
                             written_vgprs.insert(reg);
                         }
                     }
-                } else if mubuf_is_atomic(*op) {
+                } else if mubuf_is_atomic(*op) && stage != ShaderStage::Vertex {
                     storage_buf_usage.insert(*srsrc, true);
                 }
             }
@@ -1856,13 +2367,14 @@ fn plan_program(
                 soffset,
                 ..
             } => {
-                if stage == ShaderStage::Vertex {
+                if stage == ShaderStage::Vertex && !vertex_storage_buf_insts.contains(&inst_idx) {
                     if let Some(comps) = mtbuf_load_components(*op) {
                         has_buffer_fetch = true;
+                        let vb_slot = vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
                         let (attr_offset, shift) = vertex_fetch_slot(true, *op, *format, *offset);
                         let attr_comps = if shift != 0 { 4 } else { comps };
                         vertex_buf_fetches
-                            .entry(attr_offset)
+                            .entry((vb_slot, attr_offset))
                             .and_modify(|c| *c = (*c).max(attr_comps))
                             .or_insert(attr_comps);
                         for d in 0..comps {
@@ -1872,10 +2384,11 @@ fn plan_program(
                         }
                     }
                 } else if let Some(buf_op) = mtbuf_storage_op(*op) {
+                    let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
                     storage_buf_usage
                         .entry(*srsrc)
-                        .and_modify(|w| *w |= buf_op.is_store())
-                        .or_insert(buf_op.is_store());
+                        .and_modify(|w| *w |= writable)
+                        .or_insert(writable);
                     if *offen || *idxen {
                         vgprs.insert(*vaddr);
                         if !written_vgprs.contains(vaddr) {
@@ -2029,6 +2542,7 @@ fn plan_program(
             if vertex_buf_fetches.is_empty() {
                 // Pure multi-VGPR attribute input without MUBUF/MTBUF fetches.
                 vertex_attrs.push(VertexInputAttr {
+                    vb_slot: 0,
                     byte_offset: None,
                     location: 0,
                     name: "position".to_string(),
@@ -2036,44 +2550,51 @@ fn plan_program(
                 });
                 legacy_uv_attr_index = Some(vertex_attrs.len());
                 vertex_attrs.push(VertexInputAttr {
+                    vb_slot: 0,
                     byte_offset: None,
                     location: 1,
                     name: "uv".to_string(),
                     components: 2,
                 });
             } else {
-                // Map MUBUF/MTBUF vertex fetches deterministically by ascending byte offset:
-                //   offset 0  -> @location(0) position: vec3<f32> (3-comp) or vec4<f32>
-                //   offset 12 -> @location(1) color: vec4<f32> (R8G8B8A8_UNORM at +12B)
-                //   offset 16 -> @location(2) uv: vec2<f32> (R32G32_FLOAT at +16B)
-                //   any other offset -> deterministic sequential @location(N) attr_<offset>
+                // Map MUBUF/MTBUF vertex fetches deterministically by ascending (vb_slot, byte_offset):
+                //   (0, 0)  -> @location(0) position: vec3<f32> (3-comp) or vec4<f32>
+                //   (0, 12) -> @location(1) color: vec4<f32> (R8G8B8A8_UNORM at +12B)
+                //   (0, 16) -> @location(2) uv: vec2<f32> (R32G32_FLOAT at +16B)
+                //   any other slot/offset -> deterministic sequential @location(N) attr_<offset>
                 let mut next_loc: u32 = 0;
-                for (&byte_offset, &max_comps) in &vertex_buf_fetches {
-                    let (location, name, components) = match byte_offset {
-                        0 => {
+                for (&(vb_slot, byte_offset), &max_comps) in &vertex_buf_fetches {
+                    let (location, name, components) = match (vb_slot, byte_offset) {
+                        (0, 0) => {
                             let loc = next_loc;
                             next_loc = loc + 1;
                             let comps = if max_comps == 3 { 3 } else { 4 };
                             (loc, "position".to_string(), comps)
                         }
-                        12 => {
+                        (0, 12) => {
                             let loc = next_loc.max(1);
                             next_loc = loc + 1;
                             (loc, "color".to_string(), 4)
                         }
-                        16 => {
+                        (0, 16) => {
                             let loc = next_loc.max(2);
                             next_loc = loc + 1;
                             (loc, "uv".to_string(), 2)
                         }
-                        other => {
+                        (0, other) => {
                             let loc = next_loc;
                             next_loc = loc + 1;
                             (loc, format!("attr_{other}"), max_comps.clamp(1, 4))
                         }
+                        (slot, other) => {
+                            let loc = next_loc;
+                            next_loc = loc + 1;
+                            (loc, format!("vb{slot}_attr_{other}"), max_comps.clamp(1, 4))
+                        }
                     };
                     if location < u32::from(MAX_WEBGPU_LOCATIONS) {
                         vertex_attrs.push(VertexInputAttr {
+                            vb_slot,
                             byte_offset: Some(byte_offset),
                             location,
                             name,
@@ -2086,11 +2607,12 @@ fn plan_program(
                 let reads_legacy_uv =
                     read_before_write_vgprs.contains(&4) || read_before_write_vgprs.contains(&5);
                 if reads_legacy_uv
-                    && !vertex_buf_fetches.contains_key(&16)
+                    && !vertex_buf_fetches.contains_key(&(0, 16))
                     && next_loc < u32::from(MAX_WEBGPU_LOCATIONS)
                 {
                     legacy_uv_attr_index = Some(vertex_attrs.len());
                     vertex_attrs.push(VertexInputAttr {
+                        vb_slot: 0,
                         byte_offset: None,
                         location: next_loc,
                         name: "uv".to_string(),
@@ -2131,10 +2653,6 @@ fn plan_program(
     let mut ps_mrts: Vec<u8> = ps_mrt_set.into_iter().collect();
     if stage == ShaderStage::Fragment && ps_mrts.is_empty() {
         ps_mrts.push(0);
-    }
-
-    if !tex_rsrc_set.is_empty() && samp_rsrc_set.is_empty() {
-        samp_rsrc_set.insert(0);
     }
 
     let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
@@ -2182,6 +2700,15 @@ fn plan_program(
         legacy_uv_attr_index,
         vsharp_fetch_insts,
         indirect_smem_cbv_keys,
+        cbv_sources: desc_analysis.cbv_sources,
+        tex_sources: desc_analysis.tex_sources,
+        samp_sources: desc_analysis.samp_sources,
+        storage_buf_sources: desc_analysis.storage_buf_sources,
+        storage_tex_sources: desc_analysis.storage_tex_sources,
+        tex_arrayed,
+        storage_tex_arrayed,
+        vertex_storage_buf_insts,
+        vertex_fetch_vb_slots,
         cbv_slots,
         cbv_vec4_count,
         tex_slots,
@@ -2227,11 +2754,13 @@ struct IrEmitter {
     types: CommonTypes,
     vsharp_fetch_insts: BTreeSet<usize>,
     indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
+    vertex_storage_buf_insts: BTreeSet<usize>,
+    vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)>,
-    tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
     samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
-    storage_tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    storage_tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
     lds_global: Option<Handle<GlobalVariable>>,
     emitted_bindings: Vec<WgslBindingInfo>,
     stage: ShaderStage,
@@ -2268,8 +2797,8 @@ struct IrEmitter {
     frag_in_arg: Option<u32>,
     frag_attr_member_index: BTreeMap<u8, u32>,
     vs_in_arg: Option<u32>,
-    /// Map from vertex buffer byte offset -> `(VsIn member_index, attr_components)`.
-    vs_attr_by_offset: BTreeMap<u16, (u32, u8)>,
+    /// Map from `(vb_slot, vertex buffer byte offset)` -> `(VsIn member_index, attr_components)`.
+    vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8)>,
     has_buffer_fetch: bool,
     legacy_uv_member_index: Option<u32>,
     vertex_input_mode: VertexInputMode,
@@ -2364,10 +2893,10 @@ impl IrEmitter {
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
         let mut cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
-        let mut tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
         let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
-        let mut storage_tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut storage_tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
         let mut next_extra_binding: u32 = 3;
 
@@ -2434,31 +2963,55 @@ impl IrEmitter {
                     binding: binding_num,
                     kind: "uniform",
                     name,
+                    view_dimension: None,
                     min_binding_size_bytes: Some(count.saturating_mul(16)),
                     highest_vec4_offset: Some(slot.highest_vec4_offset),
+                    source: plan.cbv_sources.get(&slot.key).copied(),
                 });
             }
         }
 
         if !plan.tex_slots.is_empty() {
-            let tex_ty = insert_type(
-                &mut module,
-                None,
-                TypeInner::Image {
-                    dim: ImageDimension::D2,
-                    arrayed: false,
-                    class: ImageClass::Sampled {
-                        kind: ScalarKind::Float,
-                        multi: false,
-                    },
-                },
-            );
+            let mut tex_2d_ty: Option<Handle<Type>> = None;
+            let mut tex_2d_array_ty: Option<Handle<Type>> = None;
             let samp_ty = insert_type(
                 &mut module,
                 None,
                 TypeInner::Sampler { comparison: false },
             );
             for (idx, &srsrc) in plan.tex_slots.iter().enumerate() {
+                let is_array = plan.tex_arrayed.contains(&srsrc);
+                let tex_ty = if is_array {
+                    *tex_2d_array_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D2,
+                                arrayed: true,
+                                class: ImageClass::Sampled {
+                                    kind: ScalarKind::Float,
+                                    multi: false,
+                                },
+                            },
+                        )
+                    })
+                } else {
+                    *tex_2d_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D2,
+                                arrayed: false,
+                                class: ImageClass::Sampled {
+                                    kind: ScalarKind::Float,
+                                    multi: false,
+                                },
+                            },
+                        )
+                    })
+                };
                 let binding_num = if idx == 0 {
                     1
                 } else {
@@ -2481,14 +3034,16 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                tex_globals.insert(srsrc, g);
+                tex_globals.insert(srsrc, (g, is_array));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
                     kind: "texture_2d",
                     name,
+                    view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    source: plan.tex_sources.get(&srsrc).copied(),
                 });
             }
             for (idx, &ssamp) in plan.samp_slots.iter().enumerate() {
@@ -2520,8 +3075,10 @@ impl IrEmitter {
                     binding: binding_num,
                     kind: "sampler",
                     name,
+                    view_dimension: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    source: plan.samp_sources.get(&ssamp).copied(),
                 });
             }
         }
@@ -2574,26 +3131,50 @@ impl IrEmitter {
                     binding: binding_num,
                     kind,
                     name,
+                    view_dimension: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    source: plan.storage_buf_sources.get(&slot.srsrc).copied(),
                 });
             }
         }
 
         if !plan.storage_tex_slots.is_empty() {
-            let storage_tex_ty = insert_type(
-                &mut module,
-                None,
-                TypeInner::Image {
-                    dim: ImageDimension::D2,
-                    arrayed: false,
-                    class: ImageClass::Storage {
-                        format: StorageFormat::Rgba8Unorm,
-                        access: StorageAccess::STORE,
-                    },
-                },
-            );
+            let mut storage_tex_2d_ty: Option<Handle<Type>> = None;
+            let mut storage_tex_2d_array_ty: Option<Handle<Type>> = None;
             for (idx, &srsrc) in plan.storage_tex_slots.iter().enumerate() {
+                let is_array = plan.storage_tex_arrayed.contains(&srsrc);
+                let storage_tex_ty = if is_array {
+                    *storage_tex_2d_array_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D2,
+                                arrayed: true,
+                                class: ImageClass::Storage {
+                                    format: StorageFormat::Rgba8Unorm,
+                                    access: StorageAccess::STORE,
+                                },
+                            },
+                        )
+                    })
+                } else {
+                    *storage_tex_2d_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D2,
+                                arrayed: false,
+                                class: ImageClass::Storage {
+                                    format: StorageFormat::Rgba8Unorm,
+                                    access: StorageAccess::STORE,
+                                },
+                            },
+                        )
+                    })
+                };
                 let binding_num = next_extra_binding;
                 next_extra_binding += 1;
                 let name = format!("uav_tex{idx}");
@@ -2611,14 +3192,16 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                storage_tex_globals.insert(srsrc, g);
+                storage_tex_globals.insert(srsrc, (g, is_array));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
                     kind: "storage-texture",
                     name,
+                    view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    source: plan.storage_tex_sources.get(&srsrc).copied(),
                 });
             }
         }
@@ -2658,7 +3241,7 @@ impl IrEmitter {
         };
 
         let mut vs_in_arg = None;
-        let mut vs_attr_by_offset: BTreeMap<u16, (u32, u8)> = BTreeMap::new();
+        let mut vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8)> = BTreeMap::new();
         let mut legacy_uv_member_index: Option<u32> = None;
         let mut frag_in_arg = None;
         let mut frag_attr_member_index = BTreeMap::new();
@@ -2700,7 +3283,8 @@ impl IrEmitter {
                             max_align = max_align.max(align);
                             let member_idx = members.len() as u32;
                             if let Some(byte_off) = attr.byte_offset {
-                                vs_attr_by_offset.insert(byte_off, (member_idx, attr.components));
+                                vs_attr_by_offset
+                                    .insert((attr.vb_slot, byte_off), (member_idx, attr.components));
                             }
                             if plan.legacy_uv_attr_index == Some(attr_idx) {
                                 legacy_uv_member_index = Some(member_idx);
@@ -2960,6 +3544,8 @@ impl IrEmitter {
             types,
             vsharp_fetch_insts: plan.vsharp_fetch_insts.clone(),
             indirect_smem_cbv_keys: plan.indirect_smem_cbv_keys.clone(),
+            vertex_storage_buf_insts: plan.vertex_storage_buf_insts.clone(),
+            vertex_fetch_vb_slots: plan.vertex_fetch_vb_slots.clone(),
             cb_globals,
             tex_globals,
             samp_globals,
@@ -5079,12 +5665,13 @@ impl IrEmitter {
             Rdna2Detail::Mimg {
                 op,
                 dmask,
+                dim,
                 vaddr,
                 vdata,
                 srsrc,
                 ssamp,
                 ..
-            } => self.translate_mimg(*op, *dmask, *vaddr, *vdata, *srsrc, *ssamp),
+            } => self.translate_mimg(*op, *dmask, *dim, *vaddr, *vdata, *srsrc, *ssamp),
             Rdna2Detail::Mubuf {
                 op,
                 offset,
@@ -5096,7 +5683,7 @@ impl IrEmitter {
                 soffset,
                 ..
             } => self.translate_mubuf_or_mtbuf(
-                false, *op, 0, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+                inst_idx, false, *op, 0, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
             ),
             Rdna2Detail::Mtbuf {
                 op,
@@ -5110,7 +5697,7 @@ impl IrEmitter {
                 soffset,
                 ..
             } => self.translate_mubuf_or_mtbuf(
-                true, *op, *format, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+                inst_idx, true, *op, *format, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
             ),
             Rdna2Detail::Ds {
                 op,
@@ -7690,8 +8277,8 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
-            // v_and_or_b32: (src0 & src1) | src2
-            0x36F => {
+            // v_and_or_b32: (src0 & src1) | src2 (GFX10.3 VOP3 0x371; 0x36F retained for compat)
+            0x36F | 0x371 => {
                 let a = self.read_src_u32(src0, literal);
                 let b = self.read_src_u32(src1, literal);
                 let c = self.read_src_u32(src2, literal);
@@ -7934,12 +8521,14 @@ impl IrEmitter {
         true
     }
 
-    // -- MIMG (2D Texture sampling & loading) --
+    // -- MIMG (2D / 2D-Array Texture sampling, loading & storing) --
 
+    #[allow(clippy::too_many_arguments)]
     fn translate_mimg(
         &mut self,
         op: u8,
         dmask: u8,
+        dim: u8,
         vaddr: u8,
         vdata: u8,
         srsrc: u8,
@@ -7948,12 +8537,13 @@ impl IrEmitter {
         let Some(layout) = mimg_addr_layout(op) else {
             return false;
         };
+        let inst_is_array = dim == 5;
 
         if layout.is_store {
             if self.stage == ShaderStage::Vertex {
                 return false;
             }
-            let Some(&uav_tex_global) = self
+            let Some(&(uav_tex_global, tex_is_array)) = self
                 .storage_tex_globals
                 .get(&srsrc)
                 .or_else(|| self.storage_tex_globals.values().next())
@@ -7969,6 +8559,16 @@ impl IrEmitter {
                 ty: self.types.vec2_i32_ty,
                 components: vec![ix, iy],
             });
+            let array_index = if tex_is_array {
+                if inst_is_array {
+                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                    Some(self.bitcast_f32_to_i32(s))
+                } else {
+                    Some(self.lit_i32(0))
+                }
+            } else {
+                None
+            };
 
             let eff_mask = if dmask == 0 { 0xF } else { dmask };
             let mut src_offset = 0u8;
@@ -7989,7 +8589,7 @@ impl IrEmitter {
                 Statement::ImageStore {
                     image,
                     coordinate: coord,
-                    array_index: None,
+                    array_index,
                     value: val,
                 },
                 Span::UNDEFINED,
@@ -7997,7 +8597,7 @@ impl IrEmitter {
             return true;
         }
 
-        let Some(&tex_global) = self
+        let Some(&(tex_global, tex_is_array)) = self
             .tex_globals
             .get(&srsrc)
             .or_else(|| self.tex_globals.values().next())
@@ -8005,6 +8605,7 @@ impl IrEmitter {
             return false;
         };
         let image = self.raw_expr(Expression::GlobalVariable(tex_global));
+        let lod_shift = u8::from(inst_is_array);
 
         let sampled = if layout.is_load {
             // image_load / image_load_mip
@@ -8016,8 +8617,18 @@ impl IrEmitter {
                 ty: self.types.vec2_i32_ty,
                 components: vec![ix, iy],
             });
+            let array_index = if tex_is_array {
+                if inst_is_array {
+                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                    Some(self.bitcast_f32_to_i32(s))
+                } else {
+                    Some(self.lit_i32(0))
+                }
+            } else {
+                None
+            };
             let level = if let Some(lod_off) = layout.lod_off {
-                let ml = self.load_vgpr_f32(vaddr.saturating_add(lod_off));
+                let ml = self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
                 Some(self.bitcast_f32_to_i32(ml))
             } else {
                 Some(self.lit_i32(0))
@@ -8025,12 +8636,12 @@ impl IrEmitter {
             self.emit_expr(Expression::ImageLoad {
                 image,
                 coordinate: coord,
-                array_index: None,
+                array_index,
                 sample: None,
                 level,
             })
         } else {
-            // image_sample* (sampled 2D texture)
+            // image_sample* (sampled 2D or 2D-array texture)
             let Some(&samp_global) = self
                 .samp_globals
                 .get(&ssamp)
@@ -8045,6 +8656,20 @@ impl IrEmitter {
                 ty: self.types.vec2_f32_ty,
                 components: vec![u, v],
             });
+            let array_index = if tex_is_array {
+                if inst_is_array {
+                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                    Some(self.emit_expr(Expression::As {
+                        expr: s,
+                        kind: ScalarKind::Sint,
+                        convert: Some(4),
+                    }))
+                } else {
+                    Some(self.lit_i32(0))
+                }
+            } else {
+                None
+            };
 
             // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
             // in Fragment shaders; Vertex/Compute stages must use explicit `textureSampleLevel`
@@ -8052,7 +8677,8 @@ impl IrEmitter {
             let level = if layout.is_zero_lod {
                 SampleLevel::Exact(self.lit_f32(0.0))
             } else if let Some(lod_off) = layout.lod_off {
-                let lod = self.load_vgpr_f32(vaddr.saturating_add(lod_off));
+                let lod =
+                    self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
                 SampleLevel::Exact(lod)
             } else if let Some(grad_off) = layout.grad_off {
                 let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
@@ -8087,7 +8713,7 @@ impl IrEmitter {
                 sampler,
                 gather: None,
                 coordinate: coord,
-                array_index: None,
+                array_index,
                 offset: None,
                 level,
                 depth_ref: None,
@@ -8143,6 +8769,7 @@ impl IrEmitter {
     #[allow(clippy::too_many_arguments)]
     fn translate_mubuf_or_mtbuf(
         &mut self,
+        inst_idx: usize,
         is_mtbuf: bool,
         op: u8,
         format: u8,
@@ -8154,8 +8781,16 @@ impl IrEmitter {
         srsrc: u8,
         soffset: u8,
     ) -> bool {
-        if self.stage == ShaderStage::Vertex {
-            return self.translate_vertex_buf_fetch(is_mtbuf, op, format, byte_offset, vdata);
+        if self.stage == ShaderStage::Vertex && !self.vertex_storage_buf_insts.contains(&inst_idx) {
+            let vb_slot = self.vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
+            return self.translate_vertex_buf_fetch(
+                vb_slot,
+                is_mtbuf,
+                op,
+                format,
+                byte_offset,
+                vdata,
+            );
         }
         self.translate_storage_buf_op(
             is_mtbuf,
@@ -8622,6 +9257,7 @@ impl IrEmitter {
 
     fn translate_vertex_buf_fetch(
         &mut self,
+        vb_slot: u32,
         is_mtbuf: bool,
         op: u8,
         format: u8,
@@ -8644,7 +9280,8 @@ impl IrEmitter {
             return false;
         };
         let (attr_offset, shift) = vertex_fetch_slot(is_mtbuf, op, format, byte_offset);
-        let Some(&(member_idx, attr_comps)) = self.vs_attr_by_offset.get(&attr_offset) else {
+        let Some(&(member_idx, attr_comps)) = self.vs_attr_by_offset.get(&(vb_slot, attr_offset))
+        else {
             return false;
         };
         let vs_in = self.raw_expr(Expression::FunctionArgument(arg_idx));
@@ -9433,6 +10070,26 @@ pub fn translate_rdna2_to_wgsl(
         exports_depth: plan.stage == ShaderStage::Fragment && plan.ps_exports_depth,
     };
 
+    let vertex_inputs: Vec<WgslVertexInputInfo> = if plan.stage == ShaderStage::Vertex
+        && plan.vertex_input_mode == VertexInputMode::Attributes
+    {
+        plan.vertex_attrs
+            .iter()
+            .filter_map(|attr| {
+                attr.byte_offset.map(|byte_offset| WgslVertexInputInfo {
+                    location: attr.location,
+                    vb_slot: attr.vb_slot,
+                    byte_offset: u32::from(byte_offset),
+                    components: attr.components,
+                    component_type: "f32",
+                    fetch_format: None,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(Rdna2WgslOutput {
         wgsl,
         stage: plan.stage,
@@ -9442,6 +10099,7 @@ pub fn translate_rdna2_to_wgsl(
         unsupported_op_count,
         naga_validated: true,
         bindings,
+        vertex_inputs,
         binding_summary,
     })
 }
@@ -9705,6 +10363,8 @@ mod tests {
                     name: "tex0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -9713,6 +10373,8 @@ mod tests {
                     name: "samp0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
             ]
         );
@@ -10187,6 +10849,8 @@ mod tests {
                 name: "cb0".to_string(),
                 min_binding_size_bytes: Some(16),
                 highest_vec4_offset: Some(0),
+                view_dimension: None,
+                source: None,
             }]
         );
 
@@ -10402,7 +11066,7 @@ mod tests {
             "JSON:\n{json}"
         );
         assert!(
-            json.contains("{\"group\": 0, \"binding\": 1, \"kind\": \"texture_2d\", \"name\": \"tex0\"}"),
+            json.contains("{\"group\": 0, \"binding\": 1, \"kind\": \"texture_2d\", \"name\": \"tex0\", \"view_dimension\": \"2d\"}"),
             "JSON:\n{json}"
         );
         assert!(
@@ -10484,6 +11148,8 @@ mod tests {
                     name: "cb0".to_string(),
                     min_binding_size_bytes: Some(16),
                     highest_vec4_offset: Some(0),
+                    view_dimension: None,
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10492,6 +11158,8 @@ mod tests {
                     name: "tex0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10500,6 +11168,8 @@ mod tests {
                     name: "samp0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
             ]
         );
@@ -10666,6 +11336,8 @@ mod tests {
                     name: "tex0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10674,6 +11346,8 @@ mod tests {
                     name: "samp0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10682,6 +11356,8 @@ mod tests {
                     name: "tex1".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
             ]
         );
@@ -10787,6 +11463,8 @@ mod tests {
                 name: "cb0".to_string(),
                 min_binding_size_bytes: Some(48),
                 highest_vec4_offset: Some(2),
+                view_dimension: None,
+                source: None,
             }]
         );
         assert!(
@@ -10842,6 +11520,8 @@ mod tests {
                 name: "cb0".to_string(),
                 min_binding_size_bytes: Some(336),
                 highest_vec4_offset: Some(20),
+                view_dimension: None,
+                source: None,
             }]
         );
         assert!(
@@ -10891,6 +11571,8 @@ mod tests {
                     name: "cb0".to_string(),
                     min_binding_size_bytes: Some(32),
                     highest_vec4_offset: Some(1),
+                    view_dimension: None,
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10899,6 +11581,8 @@ mod tests {
                     name: "cb1".to_string(),
                     min_binding_size_bytes: Some(96),
                     highest_vec4_offset: Some(5),
+                    view_dimension: None,
+                    source: None,
                 },
             ]
         );
@@ -11065,6 +11749,8 @@ mod tests {
                     name: "sbuf0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11073,6 +11759,8 @@ mod tests {
                     name: "uav_buf0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
             ]
         );
@@ -11141,6 +11829,8 @@ mod tests {
                     name: "tex0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11149,6 +11839,8 @@ mod tests {
                     name: "samp0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: None,
+                    source: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11157,6 +11849,8 @@ mod tests {
                     name: "uav_tex0".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
+                    view_dimension: Some("2d"),
+                    source: None,
                 },
             ]
         );
@@ -11404,6 +12098,8 @@ mod tests {
                 name: "cb0".to_string(),
                 min_binding_size_bytes: Some(48),
                 highest_vec4_offset: Some(2),
+                view_dimension: None,
+                source: None,
             }]
         );
         assert_eq!(out.binding_summary.cbv_vec4_count, 3);
@@ -12768,6 +13464,127 @@ mod tests {
             "WGSL:\n{}",
             out.wgsl
         );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s31_compute_descriptor_table_sources_2d_array_and_tight_16b_cbv() {
+        // Compute stage copying user SGPR s4 -> s8, zero-extending s9=0,
+        // loading CBV V# from s[8:9]+0x40 and two T# descriptors via s_load_dwordx16 at +0x0,
+        // reading 16B from CBV, materializing an inline static sampler in s[12:15],
+        // and sampling a dim:5 (2d-array) texture with image_sample_l.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 8, 4)); // s_mov_b32 s8, s4
+        words.push(enc_sop1(0x03, 9, 0x80)); // s_mov_b32 s9, 0
+        words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x40, false, false)); // s_load_dwordx4 s[12:15], s[8:9], 0x40
+        words.extend_from_slice(&enc_smem(0x04, 24, 4, 0x7D, 0x00, false, false)); // s_load_dwordx16 s[24:39], s[8:9], 0x0
+        words.extend_from_slice(&enc_smem(0x0A, 8, 6, 0x7D, 0x00, false, false)); // s_buffer_load_dwordx4 s[8:11], s[12:15], 0x0
+        words.push(enc_sop1(0x03, 12, 0x81)); // inline static sampler in s[12:15]
+        words.push(enc_sop1(0x03, 13, 0x82));
+        words.push(enc_sop1(0x03, 14, 0x83));
+        words.push(enc_sop1(0x03, 15, 0x84));
+        // image_sample_l v4, v8, s[24:31] (srsrc=6), s[12:15] (ssamp=3) dmask:0x1 dim:5 (2d_array)
+        words.extend_from_slice(&enc_mimg(0x24, 0x1, 5, 8, 4, 6, 3));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("texture_2d_array<f32>"), "WGSL:\n{}", out.wgsl);
+        // Only the real 16-byte CBV should exist (NOT a bogus 64-byte CBV from s_load_dwordx16).
+        let cbvs: Vec<_> = out.bindings.iter().filter(|b| b.kind == "uniform").collect();
+        assert_eq!(cbvs.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(cbvs[0].min_binding_size_bytes, Some(16));
+        assert_eq!(
+            cbvs[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0x40,
+            })
+        );
+        let tex = out.bindings.iter().find(|b| b.kind == "texture_2d").unwrap();
+        assert_eq!(tex.view_dimension, Some("2d-array"));
+        assert_eq!(
+            tex.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0,
+            })
+        );
+        let samp = out.bindings.iter().find(|b| b.kind == "sampler").unwrap();
+        assert_eq!(samp.source, Some(WgslBindingSource::StaticSampler { index: 0 }));
+        let json = out.to_json();
+        assert!(json.contains("\"user_sgpr\": 4, \"table_byte_offset\": 64"));
+        assert!(json.contains("\"view_dimension\": \"2d-array\""));
+        assert!(json.contains("\"static_sampler\": 0"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s31_vertex_inputs_and_user_data_storage_buffer_separation() {
+        // Vertex stage:
+        //   s[10:11] <- s[0:1] (hardware VB table ptr) -> s_load_dwordx4 s[12:15], s[10:11], 0x0 (vb_slot 0)
+        //   s[8:9]   <- user data table s8 (s9=0)      -> s_load_dwordx4 s[16:19], s[8:9], 0x20 (storage SRV)
+        //   buffer_load_dwordx3 v0, v0, s[12:15], 0 idxen offset:0   (VsIn attr @location(0))
+        //   buffer_load_dwordx2 v4, v0, s[12:15], 0 idxen offset:16  (VsIn attr @location(2))
+        //   buffer_load_dwordx4 v8, v0, s[16:19], 0 offen            (read-only-storage sbuf0)
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s_mov_b32 s9, 0
+        words.push(enc_sop1(0x04, 10, 0)); // s_mov_b64 s[10:11], s[0:1]
+        words.extend_from_slice(&enc_smem(0x02, 12, 5, 0x7D, 0x00, false, false)); // VB slot 0
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0x20, false, false)); // user table slot @ +0x20
+        // MUBUF buffer_load_dwordx3 (op 0x0F) idxen=1, offset=0, srsrc=3 (s[12:15])
+        let mubuf_pos_w0 = (0b111000u32 << 26) | (0x0Fu32 << 18) | (1u32 << 13);
+        let mubuf_pos_w1 = (0x80u32 << 24) | (3u32 << 16);
+        words.extend_from_slice(&[mubuf_pos_w0, mubuf_pos_w1]);
+        // MUBUF buffer_load_dwordx2 (op 0x0D) idxen=1, offset=16, srsrc=3 (s[12:15])
+        let mubuf_uv_w0 = (0b111000u32 << 26) | (0x0Du32 << 18) | (1u32 << 13) | 16;
+        let mubuf_uv_w1 = (0x80u32 << 24) | (3u32 << 16) | (4u32 << 8);
+        words.extend_from_slice(&[mubuf_uv_w0, mubuf_uv_w1]);
+        // MUBUF buffer_load_dwordx4 (op 0x0E) offen=1, offset=0, srsrc=4 (s[16:19])
+        let mubuf_sbuf_w0 = (0b111000u32 << 26) | (0x0Eu32 << 18) | (1u32 << 12);
+        let mubuf_sbuf_w1 = (0x80u32 << 24) | (4u32 << 16) | (8u32 << 8);
+        words.extend_from_slice(&[mubuf_sbuf_w0, mubuf_sbuf_w1]);
+        words.extend_from_slice(&enc_exp(12, 0xF, true, false, false, [0, 1, 2, 8]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.vertex_inputs.len(), 2, "inputs: {:?}", out.vertex_inputs);
+        assert_eq!(out.vertex_inputs[0].vb_slot, 0);
+        assert_eq!(out.vertex_inputs[0].byte_offset, 0);
+        assert_eq!(out.vertex_inputs[0].components, 3);
+        assert_eq!(out.vertex_inputs[1].vb_slot, 0);
+        assert_eq!(out.vertex_inputs[1].byte_offset, 16);
+        assert_eq!(out.vertex_inputs[1].components, 2);
+
+        let sbuf = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "read-only-storage")
+            .expect("expected read-only-storage binding for user-data vertex buffer");
+        assert_eq!(
+            sbuf.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 0x20,
+            })
+        );
+        let json = out.to_json();
+        assert!(json.contains("\"vertex_inputs\""));
+        assert!(json.contains("\"vb_slot\": 0, \"byte_offset\": 16"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s31_vop3_0x371_v_and_or_b32_translates() {
+        let mut words = Vec::new();
+        words.push(enc_vop1(0x01, 8, 242)); // v_mov_b32 v8, 1.0
+        // v_and_or_b32 (0x371) v12, 0x80000000 (literal), v8, 1.0
+        words.extend_from_slice(&enc_vop3(0x371, 12, 255, 256 + 8, 242, false, 0, 0, 0));
+        words.push(0x8000_0000);
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
