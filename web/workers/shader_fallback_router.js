@@ -70,6 +70,186 @@
     ].join('\n'),
   });
 
+  /**
+   * Frame-1 D3D12 fullscreen-triangle + CBV fallback WGSL pair.
+   * Matches `DrawInstanced(3, 1)` with a 1-CBV `group(0) binding(0)` descriptor table
+   * (e.g. 256-byte `array<vec4<f32>, 16>` constant buffer) onto an RGBA8 render target.
+   * Works with or without bound vertex attributes via `@builtin(vertex_index) vid: u32`,
+   * uses bitcast-masked CBV modulation so output is never NaN and always `alpha = 1.0`.
+   */
+  const FULLSCREEN_TRIANGLE_CBV_WGSL = Object.freeze({
+    vertex: [
+      'struct FrameCbv {',
+      '    data: array<vec4<f32>, 16>,',
+      '};',
+      '',
+      '@group(0) @binding(0) var<uniform> frame_cbv: FrameCbv;',
+      '',
+      'struct VsOut {',
+      '    @builtin(position) position: vec4<f32>,',
+      '    @location(0) uv: vec2<f32>,',
+      '};',
+      '',
+      '@vertex',
+      'fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {',
+      '    var positions = array<vec2<f32>, 3>(',
+      '        vec2<f32>(-1.0, -1.0),',
+      '        vec2<f32>(3.0, -1.0),',
+      '        vec2<f32>(-1.0, 3.0),',
+      '    );',
+      '    var uvs = array<vec2<f32>, 3>(',
+      '        vec2<f32>(0.0, 1.0),',
+      '        vec2<f32>(2.0, 1.0),',
+      '        vec2<f32>(0.0, -1.0),',
+      '    );',
+      '    let idx = vid % 3u;',
+      '    let cbv_keep = f32(bitcast<u32>(frame_cbv.data[0].x) & 0xffu) * 0.0;',
+      '    var out: VsOut;',
+      '    out.position = vec4<f32>(positions[idx], cbv_keep, 1.0);',
+      '    out.uv = uvs[idx];',
+      '    return out;',
+      '}',
+      '',
+    ].join('\n'),
+    fragment: [
+      'struct FrameCbv {',
+      '    data: array<vec4<f32>, 16>,',
+      '};',
+      '',
+      '@group(0) @binding(0) var<uniform> frame_cbv: FrameCbv;',
+      '',
+      'struct FsIn {',
+      '    @location(0) uv: vec2<f32>,',
+      '};',
+      '',
+      '@fragment',
+      'fn fs_main(input: FsIn) -> @location(0) vec4<f32> {',
+      '    let uv = clamp(input.uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));',
+      '    let b0 = bitcast<u32>(frame_cbv.data[0].x);',
+      '    let b1 = bitcast<u32>(frame_cbv.data[0].y);',
+      '    let b2 = bitcast<u32>(frame_cbv.data[0].z) ^ bitcast<u32>(frame_cbv.data[0].w);',
+      '    let cbv_mod = vec3<f32>(',
+      '        f32(b0 & 0xffu) / 255.0,',
+      '        f32(b1 & 0xffu) / 255.0,',
+      '        f32(b2 & 0xffu) / 255.0,',
+      '    );',
+      '    let base = vec3<f32>(',
+      '        0.08 + 0.35 * uv.x,',
+      '        0.14 + 0.40 * uv.y,',
+      '        0.24 + 0.30 * (1.0 - uv.x),',
+      '    );',
+      '    let color = clamp(',
+      '        mix(base, cbv_mod, 0.25),',
+      '        vec3<f32>(0.0, 0.0, 0.0),',
+      '        vec3<f32>(1.0, 1.0, 1.0),',
+      '    );',
+      '    return vec4<f32>(color, 1.0);',
+      '}',
+      '',
+    ].join('\n'),
+    compute: BUILTIN_FALLBACK_WGSL.compute,
+  });
+
+  /**
+   * 24-byte-stride textured quad fallback WGSL pair for splash / UI draws.
+   * Vertex attributes: `@location(0) pos: vec4<f32>` (16 B) + `@location(1) uv: vec2<f32>` (8 B).
+   * Bindings: `@group(0) @binding(0)` texture_2d<f32> + `@group(0) @binding(1)` sampler.
+   */
+  const TEXTURED_QUAD_24B_WGSL = Object.freeze({
+    vertex: [
+      'struct VsOut {',
+      '    @builtin(position) position: vec4<f32>,',
+      '    @location(0) uv: vec2<f32>,',
+      '};',
+      '',
+      '@vertex',
+      'fn vs_main(',
+      '    @location(0) pos: vec4<f32>,',
+      '    @location(1) uv: vec2<f32>,',
+      ') -> VsOut {',
+      '    var out: VsOut;',
+      '    let w = select(pos.w, 1.0, pos.w == 0.0);',
+      '    out.position = vec4<f32>(pos.xyz, w);',
+      '    out.uv = uv;',
+      '    return out;',
+      '}',
+      '',
+    ].join('\n'),
+    fragment: [
+      '@group(0) @binding(0) var quad_tex: texture_2d<f32>;',
+      '@group(0) @binding(1) var quad_sampler: sampler;',
+      '',
+      '@fragment',
+      'fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {',
+      '    let texel = textureSample(quad_tex, quad_sampler, uv);',
+      '    return texel;',
+      '}',
+      '',
+    ].join('\n'),
+    compute: BUILTIN_FALLBACK_WGSL.compute,
+  });
+
+  const BUILTIN_FALLBACK_PROFILES = Object.freeze({
+    default: BUILTIN_FALLBACK_WGSL,
+    fullscreen_triangle_cbv: FULLSCREEN_TRIANGLE_CBV_WGSL,
+    textured_quad_24b: TEXTURED_QUAD_24B_WGSL,
+  });
+
+  const FALLBACK_PROFILE_ALIASES = Object.freeze({
+    default: 'default',
+    minimal: 'default',
+    fullscreen_triangle_cbv: 'fullscreen_triangle_cbv',
+    fullscreen_cbv: 'fullscreen_triangle_cbv',
+    'fullscreen-triangle-cbv': 'fullscreen_triangle_cbv',
+    'fullscreen-cbv': 'fullscreen_triangle_cbv',
+    textured_quad_24b: 'textured_quad_24b',
+    textured_24b: 'textured_quad_24b',
+    'textured-quad-24b': 'textured_quad_24b',
+    'textured-24b': 'textured_quad_24b',
+  });
+
+  /**
+   * Normalize a built-in fallback profile name or alias to a canonical profile key.
+   * Unknown or omitted values safely resolve to `'default'`.
+   *
+   * @param {string | null | undefined} profile
+   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b'}
+   */
+  function normalizeFallbackProfile(profile) {
+    if (typeof profile !== 'string') {
+      return 'default';
+    }
+    const key = profile.trim().toLowerCase();
+    if (key.length === 0) {
+      return 'default';
+    }
+    if (Object.prototype.hasOwnProperty.call(FALLBACK_PROFILE_ALIASES, key)) {
+      return FALLBACK_PROFILE_ALIASES[key];
+    }
+    return 'default';
+  }
+
+  /**
+   * Return a sanitized, JSON-serializable map of available built-in fallback WGSL profiles.
+   * Each call returns fresh copies so caller mutations cannot alter router templates.
+   *
+   * @returns {Record<string, { vertex: string, fragment: string, compute: string }>}
+   */
+  function getBuiltInFallbackProfiles() {
+    const out = {};
+    const names = Object.keys(BUILTIN_FALLBACK_PROFILES);
+    for (let i = 0; i < names.length; i += 1) {
+      const name = names[i];
+      const entry = BUILTIN_FALLBACK_PROFILES[name];
+      out[name] = {
+        vertex: entry.vertex,
+        fragment: entry.fragment,
+        compute: entry.compute,
+      };
+    }
+    return out;
+  }
+
   function defaultNow() {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
       return performance.now();
@@ -279,6 +459,7 @@
       this._maxTrackedMissing = maxTracked;
 
       this._now = typeof opts.now === 'function' ? opts.now : defaultNow;
+      this._defaultProfile = normalizeFallbackProfile(opts.defaultProfile);
 
       this._missing = new Map();
       this._overflowMissingCount = 0;
@@ -288,6 +469,14 @@
         fallbackHits: 0,
         builtinHits: 0,
       };
+    }
+
+    /**
+     * Return a sanitized map of available built-in fallback WGSL profiles.
+     * @returns {Record<string, { vertex: string, fragment: string, compute: string }>}
+     */
+    getBuiltInFallbackProfiles() {
+      return getBuiltInFallbackProfiles();
     }
 
     /**
@@ -313,6 +502,7 @@
      *
      * @param {bigint | string | number} hash
      * @param {number | string} stage
+     * @param {{ profile?: string | null }} [options]
      * @returns {{
      *   wgsl: string,
      *   source: 'pack' | 'fallback' | 'builtin',
@@ -320,13 +510,21 @@
      *   resolvedHash: string | null,
      *   stage: 'vertex' | 'fragment' | 'compute',
      *   entryPoint: string | null,
+     *   profile?: 'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b',
      * }}
      */
-    resolve(hash, stage) {
+    resolve(hash, stage, options) {
       const stageName = normalizeStage(stage);
       const requested = normalizeShaderHash(hash);
       const requestedHex = formatShaderHash(requested);
       const nowMs = this._now();
+      const profileName =
+        options &&
+        typeof options === 'object' &&
+        options.profile !== undefined &&
+        options.profile !== null
+          ? normalizeFallbackProfile(options.profile)
+          : this._defaultProfile;
 
       this._stats.totalLookups += 1;
 
@@ -363,7 +561,8 @@
         }
       }
 
-      const builtin = BUILTIN_FALLBACK_WGSL[stageName];
+      const profileTemplates = BUILTIN_FALLBACK_PROFILES[profileName] || BUILTIN_FALLBACK_WGSL;
+      const builtin = profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
       this._stats.builtinHits += 1;
       return {
         wgsl: builtin,
@@ -372,6 +571,7 @@
         resolvedHash: null,
         stage: stageName,
         entryPoint: extractEntryPoint(builtin, stageName),
+        profile: profileName,
       };
     }
 
@@ -464,15 +664,20 @@
     }
   }
 
+  ShaderFallbackRouter.getBuiltInFallbackProfiles = getBuiltInFallbackProfiles;
+
   const exportedApi = Object.freeze({
     SHADER_STAGE,
     STAGE_NAMES,
     BUILTIN_FALLBACK_WGSL,
+    BUILTIN_FALLBACK_PROFILES,
     DEFAULT_ENTRY_POINTS,
     DEFAULT_MAX_TRACKED_MISSING,
     normalizeShaderHash,
     formatShaderHash,
     normalizeStage,
+    normalizeFallbackProfile,
+    getBuiltInFallbackProfiles,
     ShaderFallbackRouter,
   });
 
