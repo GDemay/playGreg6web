@@ -7,10 +7,12 @@ import CrashReporterDefault, {
   DEFAULT_MAX_ERRORS,
   DEFAULT_APP_VERSION,
   ERROR_CATEGORIES,
+  BOOT_ERROR_CODES,
   CrashReporter,
   sanitizeString,
   sanitizeValue,
   classifyError,
+  classifyBootError,
 } from '../web/telemetry/crash_report.js';
 import { PerfMonitor } from '../web/telemetry/perf_monitor.js';
 
@@ -572,4 +574,373 @@ test('sanitizeValue handles Maps, Sets, Dates, non-finite numbers, and deeply ne
   assert.deepEqual(sanitized.set, ['Bearer [REDACTED]', 42, null, null]);
   assert.equal(sanitized.when, new Date(1700000000000).toISOString());
   assert.equal(sanitized.invalidDate, null);
+});
+
+test('classifyBootError classifies all Wasm64 browser boot failure categories with actionable hints', () => {
+  assert.deepEqual(BOOT_ERROR_CODES, {
+    WASM_MODULE_TOO_LARGE: 'WASM_MODULE_TOO_LARGE',
+    WASM64_UNSUPPORTED: 'WASM64_UNSUPPORTED',
+    COI_SAB_MISSING: 'COI_SAB_MISSING',
+    WORKER_SCRIPT_COLLISION: 'WORKER_SCRIPT_COLLISION',
+    HTTPFS_PGIM_ERROR: 'HTTPFS_PGIM_ERROR',
+    UNKNOWN_BOOT_ERROR: 'UNKNOWN_BOOT_ERROR',
+  });
+
+  // 1. V8 1 GiB Wasm module size limit (both error variants)
+  const tooLarge1 = classifyBootError(
+    new WebAssembly.CompileError('WebAssembly.compile(): Buffer source exceeds maximum size of 1073741824')
+  );
+  assert.equal(tooLarge1.code, 'WASM_MODULE_TOO_LARGE');
+  assert.equal(tooLarge1.category, 'wasm_compile');
+  assert.ok(tooLarge1.hint.includes('--opt Oz --no-link-opt --strip'));
+
+  const tooLarge2 = classifyBootError('RangeError: buffer source exceeds maximum size');
+  assert.equal(tooLarge2.code, 'WASM_MODULE_TOO_LARGE');
+  assert.equal(tooLarge2.category, 'wasm_compile');
+  assert.ok(tooLarge2.hint.includes('--opt Oz --no-link-opt --strip'));
+
+  // 2. Wasm64 / memory64 unsupported
+  const wasm64a = classifyBootError(new TypeError('WebAssembly.Memory(): memory64 not supported'));
+  assert.equal(wasm64a.code, 'WASM64_UNSUPPORTED');
+  assert.equal(wasm64a.category, 'capability');
+  assert.ok(wasm64a.hint.length > 0);
+
+  const wasm64b = classifyBootError('Wasm64 is unsupported in this browser');
+  assert.equal(wasm64b.code, 'WASM64_UNSUPPORTED');
+  assert.equal(wasm64b.category, 'capability');
+
+  const wasm64c = classifyBootError("TypeError: WebAssembly.Memory(): invalid address type 'i64'");
+  assert.equal(wasm64c.code, 'WASM64_UNSUPPORTED');
+  assert.equal(wasm64c.category, 'capability');
+
+  // 3. Cross-origin isolation / SharedArrayBuffer missing
+  const sab1 = classifyBootError(new ReferenceError('SharedArrayBuffer is not defined'));
+  assert.equal(sab1.code, 'COI_SAB_MISSING');
+  assert.equal(sab1.category, 'capability');
+  assert.ok(sab1.hint.length > 0);
+
+  const sab2 = classifyBootError('crossOriginIsolated is false; COOP/COEP headers missing');
+  assert.equal(sab2.code, 'COI_SAB_MISSING');
+  assert.equal(sab2.category, 'capability');
+
+  // 4. Classic worker importScripts global identifier collision
+  const collision1 = classifyBootError(
+    new SyntaxError("Identifier 'OPCODES' has already been declared")
+  );
+  assert.equal(collision1.code, 'WORKER_SCRIPT_COLLISION');
+  assert.equal(collision1.category, 'worker');
+  assert.ok(collision1.hint.length > 0);
+
+  const collision2 = classifyBootError('SyntaxError: redeclaration of const HEADER_BYTES');
+  assert.equal(collision2.code, 'WORKER_SCRIPT_COLLISION');
+  assert.equal(collision2.category, 'worker');
+
+  // 5. HTTPFS / PGIM load error
+  const httpfs1 = classifyBootError(new Error('HTTPFS range request failed (HTTP 404)'));
+  assert.equal(httpfs1.code, 'HTTPFS_PGIM_ERROR');
+  assert.equal(httpfs1.category, 'io');
+  assert.ok(httpfs1.hint.length > 0);
+
+  const pgim1 = classifyBootError('PGIM magic mismatch while mapping boot image');
+  assert.equal(pgim1.code, 'HTTPFS_PGIM_ERROR');
+  assert.equal(pgim1.category, 'io');
+
+  // 6. Generic fallback
+  const unknown1 = classifyBootError(new Error('Something completely unexpected happened'));
+  assert.equal(unknown1.code, 'UNKNOWN_BOOT_ERROR');
+  assert.equal(unknown1.category, 'runtime');
+  assert.ok(unknown1.hint.length > 0);
+
+  const unknownNull = classifyBootError(null);
+  assert.equal(unknownNull.code, 'UNKNOWN_BOOT_ERROR');
+  assert.equal(unknownNull.category, 'runtime');
+  assert.equal(unknownNull.message, '');
+});
+
+test('classifyBootError strips host paths, drive letters, usernames, and tokens from messages', () => {
+  const winTooLarge = classifyBootError(
+    new Error(
+      'Failed compiling C:\\Users\\alice\\GTA6\\guest.wasm?token=secret123: Buffer source exceeds maximum size of 1073741824 (Bearer eyJsecret)'
+    )
+  );
+  assert.equal(winTooLarge.code, 'WASM_MODULE_TOO_LARGE');
+  assert.equal(winTooLarge.category, 'wasm_compile');
+  for (const leaked of ['alice', 'C:\\', 'GTA6', 'guest.wasm', 'secret123', 'eyJsecret']) {
+    assert.ok(!winTooLarge.message.includes(leaked), `Leaked "${leaked}" in: ${winTooLarge.message}`);
+  }
+  assert.ok(winTooLarge.message.includes('[REDACTED_PATH]'));
+  assert.ok(winTooLarge.message.includes('Bearer [REDACTED]'));
+
+  const posixCollision = classifyBootError(
+    "Identifier 'OPCODES' has already been declared in /Users/charlie/work/worker.js and /home/bob/helper.js?api_key=xyz999"
+  );
+  assert.equal(posixCollision.code, 'WORKER_SCRIPT_COLLISION');
+  for (const leaked of ['charlie', 'bob', '/Users/', '/home/', 'xyz999']) {
+    assert.ok(!posixCollision.message.includes(leaked), `Leaked "${leaked}" in: ${posixCollision.message}`);
+  }
+
+  // Host path ending in .pgim still classifies as HTTPFS_PGIM_ERROR while redacting the path
+  const pgimHostPath = classifyBootError(
+    'Failed to read D:/Users/alice/GTA6/boot.pgim (Authorization: Bearer supersecret)'
+  );
+  assert.equal(pgimHostPath.code, 'HTTPFS_PGIM_ERROR');
+  assert.equal(pgimHostPath.category, 'io');
+  for (const leaked of ['alice', 'D:/', 'GTA6', 'boot.pgim', 'supersecret']) {
+    assert.ok(!pgimHostPath.message.includes(leaked), `Leaked "${leaked}" in: ${pgimHostPath.message}`);
+  }
+});
+
+test('setBootSnapshot and setGpuTelemetry enforce strict allowlisting and export bootDiagnostics in JSON bundles', () => {
+  const clock = createDeterministicClock(1700000500000);
+  const reporter = new CrashReporter({
+    appVersion: '0.3.0-test',
+    now: clock.now,
+    globalObj: { crossOriginIsolated: true, SharedArrayBuffer },
+    navigatorObj: { hardwareConcurrency: 12 },
+  });
+
+  // Record multiple boot errors (including a host-path .pgim error and V8 1 GiB limit error)
+  reporter.recordError(
+    'wasm_trap',
+    new WebAssembly.CompileError(
+      'WebAssembly.compile() of C:\\Users\\alice\\guest.wasm: Buffer source exceeds maximum size of 1073741824'
+    )
+  );
+  clock.advance(20);
+  reporter.recordError(
+    'io_error',
+    new Error('Failed loading /home/bob/game/boot.pgim?token=leaked-pgim-token')
+  );
+
+  // Attach boot snapshot with both allowlisted fields and disallowed host paths / raw bytes / secrets
+  const storedBoot = reporter.setBootSnapshot({
+    stage: 'PGIM_LOAD',
+    mode: 'real-wasm',
+    progressPct: 14.5,
+    readyForSplash: false,
+    elapsedMs: 412.5,
+    milestonesReached: 1,
+    wasmModuleBytes: 1200000000,
+    pgimBytes: 536870912,
+    pgimSegments: 4,
+    trapCount: 1,
+    uniqueTrapCount: 1,
+    milestones: [
+      {
+        milestone: 'PGIM_LOAD',
+        index: 0,
+        reached: true,
+        elapsedMs: 120,
+        lastElapsedMs: 120,
+        count: 1,
+        detail: {
+          source: 'boot',
+          line: 'Mapped C:\\Users\\alice\\GTA6\\boot.pgim?token=sec',
+          disallowedNested: 'should-drop',
+        },
+        secretBytes: new Uint8Array([1, 2, 3, 4]),
+      },
+    ],
+    lastTrap: {
+      seq: 1,
+      kind: 'UNRESOLVED_IMPORT',
+      guestVa: '0x140001234',
+      dll: 'kernel32.dll',
+      symbol: 'CreateFileW',
+      import: 'kernel32.dll!CreateFileW',
+      message: 'Unresolved call from /Users/charlie/GTA6/game.exe Bearer tok999',
+      fatal: false,
+      elapsedMs: 390,
+      stage: 'PGIM_LOAD',
+      count: 2,
+      rawDump: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+      hostPath: 'C:\\Users\\alice\\secret.bin',
+    },
+    unresolvedImports: [
+      {
+        name: 'kernel32.dll!CreateFileW',
+        dll: 'kernel32.dll',
+        symbol: 'CreateFileW',
+        ordinal: null,
+        guestVa: '0x140001234',
+        count: 2,
+        firstElapsedMs: 380,
+        lastElapsedMs: 390,
+        extraLeak: 'C:\\Users\\alice\\leak',
+      },
+    ],
+    // Disallowed top-level keys that MUST be dropped completely
+    hostPath: 'C:\\Users\\alice\\GTA6',
+    localGameDir: '/home/bob/gta6',
+    rawBytes: new Uint8Array([0xaa, 0xbb, 0xcc]),
+    wasmBinary: new ArrayBuffer(32),
+    secretToken: 'top-secret-boot-token',
+  });
+
+  assert.equal(storedBoot.stage, 'PGIM_LOAD');
+  assert.equal(storedBoot.mode, 'real-wasm');
+  assert.equal(storedBoot.progressPct, 14.5);
+  assert.equal(storedBoot.wasmModuleBytes, 1200000000);
+  assert.equal(storedBoot.pgimSegments, 4);
+  assert.equal('hostPath' in storedBoot, false);
+  assert.equal('localGameDir' in storedBoot, false);
+  assert.equal('rawBytes' in storedBoot, false);
+  assert.equal('wasmBinary' in storedBoot, false);
+  assert.equal('secretToken' in storedBoot, false);
+  assert.equal('rawDump' in storedBoot.lastTrap, false);
+  assert.equal('hostPath' in storedBoot.lastTrap, false);
+  assert.equal('disallowedNested' in storedBoot.milestones[0].detail, false);
+  assert.equal('secretBytes' in storedBoot.milestones[0], false);
+  assert.equal('extraLeak' in storedBoot.unresolvedImports[0], false);
+  assert.ok(!storedBoot.lastTrap.message.includes('charlie'));
+  assert.ok(!storedBoot.lastTrap.message.includes('tok999'));
+
+  // Attach GPU telemetry with both allowlisted fields and disallowed shader source / raw bytes / paths
+  const storedGpu = reporter.setGpuTelemetry({
+    timestamp: 1700000500020,
+    adapter: 'nvidia blackwell /home/bob/driver',
+    backend: 'webgpu',
+    deviceLost: false,
+    validationErrors: 1,
+    shaderPackCount: 2,
+    frameStats: {
+      framesPresented: 3,
+      droppedFrames: 0,
+      drawCalls: 42,
+      computeDispatches: 5,
+      packetsProcessed: 120,
+      width: 1280,
+      height: 720,
+      rawFrameBuffer: new Uint8Array([9, 8, 7]),
+      secretKey: 'drop-me',
+    },
+    fallbackStats: {
+      packHits: 18,
+      fallbackHits: 2,
+      builtinHits: 1,
+      totalLookups: 21,
+      uniqueMissing: 1,
+      overflowMissingCount: 0,
+      hitRatePct: 90.5,
+      leakedPath: 'C:\\Users\\alice\\shaders',
+    },
+    missingShaders: [
+      {
+        hash: 0x123456789abcdef0n,
+        stage: 'fragment',
+        hits: 4,
+        firstSeenFrame: 1,
+        wgsl: '@fragment fn main() {}',
+        rawSpirv: new Uint8Array([0x03, 0x02, 0x23, 0x07]),
+        sourcePath: 'C:\\Users\\alice\\shader.hlsl',
+      },
+    ],
+    // Disallowed top-level keys
+    wgslSource: 'secret shader code',
+    commandBuffer: new ArrayBuffer(128),
+    cacheDir: '/Users/charlie/gpu-cache',
+  });
+
+  assert.equal(storedGpu.backend, 'webgpu');
+  assert.equal(storedGpu.validationErrors, 1);
+  assert.ok(!storedGpu.adapter.includes('bob'));
+  assert.equal(storedGpu.frameStats.framesPresented, 3);
+  assert.equal(storedGpu.frameStats.drawCalls, 42);
+  assert.equal('rawFrameBuffer' in storedGpu.frameStats, false);
+  assert.equal('secretKey' in storedGpu.frameStats, false);
+  assert.equal(storedGpu.fallbackStats.hitRatePct, 90.5);
+  assert.equal('leakedPath' in storedGpu.fallbackStats, false);
+  assert.deepEqual(storedGpu.missingShaders, [
+    { hash: '0x123456789abcdef0', stage: 'fragment', hits: 4, firstSeenFrame: 1 },
+  ]);
+  assert.equal('wgslSource' in storedGpu, false);
+  assert.equal('commandBuffer' in storedGpu, false);
+  assert.equal('cacheDir' in storedGpu, false);
+
+  // Verify buildReport() and toJson() include bootDiagnostics while preserving all legacy fields
+  const report = reporter.buildReport({
+    serverStatus: { hasWasmBinary: true },
+  });
+  assert.equal(report.schemaVersion, SCHEMA_VERSION);
+  assert.equal(report.appVersion, '0.3.0-test');
+  assert.equal(report.errors.length, 2);
+  assert.equal(report.serverStatus.hasWasmBinary, true);
+
+  assert.ok(report.bootDiagnostics && typeof report.bootDiagnostics === 'object');
+  assert.equal(report.bootDiagnostics.classifiedErrors.length, 2);
+  assert.equal(report.bootDiagnostics.classifiedErrors[0].code, 'WASM_MODULE_TOO_LARGE');
+  assert.equal(report.bootDiagnostics.classifiedErrors[0].category, 'wasm_compile');
+  assert.ok(report.bootDiagnostics.classifiedErrors[0].hint.includes('--opt Oz --no-link-opt --strip'));
+  assert.equal(report.bootDiagnostics.classifiedErrors[1].code, 'HTTPFS_PGIM_ERROR');
+  assert.equal(report.bootDiagnostics.classifiedErrors[1].category, 'io');
+  assert.deepEqual(report.bootDiagnostics.errorCodeCounts, {
+    WASM_MODULE_TOO_LARGE: 1,
+    HTTPFS_PGIM_ERROR: 1,
+  });
+  assert.equal(report.bootDiagnostics.bootSnapshot.stage, 'PGIM_LOAD');
+  assert.equal(report.bootDiagnostics.gpuTelemetry.frameStats.framesPresented, 3);
+
+  const json = reporter.toJson();
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.bootDiagnostics.classifiedErrors.length, 2);
+  assert.equal(parsed.bootDiagnostics.bootSnapshot.stage, 'PGIM_LOAD');
+  assert.equal(parsed.bootDiagnostics.gpuTelemetry.missingShaders[0].hash, '0x123456789abcdef0');
+
+  for (const forbidden of [
+    'alice',
+    'bob',
+    'charlie',
+    'leaked-pgim-token',
+    'top-secret-boot-token',
+    'secret shader code',
+    '@fragment',
+    'tok999',
+    'drop-me',
+    'should-drop',
+    'shader.hlsl',
+    'gpu-cache',
+  ]) {
+    assert.ok(!json.includes(forbidden), `Exported JSON leaked forbidden token: ${forbidden}`);
+  }
+
+  // Duck-typed BootTracer instance support via getSummary()
+  const tracerLike = {
+    getSummary() {
+      return {
+        stage: 'FIRST_PRESENT',
+        progressPct: 100,
+        readyForSplash: true,
+        hostPath: 'C:\\Users\\alice\\should-be-dropped',
+      };
+    },
+  };
+  const fromTracer = reporter.setBootSnapshot(tracerLike);
+  assert.equal(fromTracer.stage, 'FIRST_PRESENT');
+  assert.equal(fromTracer.readyForSplash, true);
+  assert.equal('hostPath' in fromTracer, false);
+
+  // Passing raw binary buffers directly to setters returns null
+  assert.equal(reporter.setBootSnapshot(new Uint8Array([1, 2, 3])), null);
+  assert.equal(reporter.setGpuTelemetry(new ArrayBuffer(16)), null);
+  assert.equal(reporter.getBootSnapshot(), null);
+  assert.equal(reporter.getGpuTelemetry(), null);
+
+  // Per-call overrides in buildReport work without mutating stored state
+  const overrideReport = reporter.buildReport({
+    bootSnapshot: { stage: 'D3D12_CREATE_DEVICE', progressPct: 77, secret: 'nope' },
+    gpuTelemetry: { backend: 'webgpu', framesPresented: 1, rawBytes: new Uint8Array(8) },
+  });
+  assert.equal(overrideReport.bootDiagnostics.bootSnapshot.stage, 'D3D12_CREATE_DEVICE');
+  assert.equal('secret' in overrideReport.bootDiagnostics.bootSnapshot, false);
+  assert.equal(overrideReport.bootDiagnostics.gpuTelemetry.framesPresented, 1);
+  assert.equal('rawBytes' in overrideReport.bootDiagnostics.gpuTelemetry, false);
+  assert.equal(reporter.getBootSnapshot(), null);
+  assert.equal(reporter.getGpuTelemetry(), null);
+
+  // Clearing via clear() resets attached snapshots too
+  reporter.setBootSnapshot({ stage: 'TLS_INIT' });
+  reporter.setGpuTelemetry({ backend: 'webgpu' });
+  reporter.clear();
+  assert.equal(reporter.getBootSnapshot(), null);
+  assert.equal(reporter.getGpuTelemetry(), null);
 });
