@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R31)."""
 
 from __future__ import annotations
 
@@ -38,8 +38,10 @@ def _fake_emsdk(repo: Path) -> None:
     em_dir.mkdir(parents=True, exist_ok=True)
     _write(em_dir / "emcc", "#!/bin/sh\nexit 0\n")
     _write(em_dir / "em++", "#!/bin/sh\nexit 0\n")
+    _write(em_dir / "emar", "#!/bin/sh\nexit 0\n")
     _write(em_dir / "emcc.bat", "@echo off\r\n")
     _write(em_dir / "em++.bat", "@echo off\r\n")
+    _write(em_dir / "emar.bat", "@echo off\r\n")
 
 
 def _layout_sources(root: Path) -> Path:
@@ -67,6 +69,7 @@ class RecordingRunner:
         self.compile_calls: list[tuple[str, ...]] = []
         self.link_calls: list[tuple[str, ...]] = []
         self.side_link_calls: list[tuple[str, ...]] = []
+        self.ar_calls: list[tuple[str, ...]] = []
         self.fail_ids = fail_ids or frozenset()
         self.fail_outputs = fail_outputs or frozenset()
         self.delay = delay
@@ -89,6 +92,13 @@ class RecordingRunner:
                     returncode=0,
                     stdout=json.dumps({"ok": True, "errors": []}),
                 )
+            if tokens and Path(tokens[0]).name.lower().startswith("emar"):
+                with self._lock:
+                    self.ar_calls.append(tokens)
+                for tok in tokens[1:]:
+                    if Path(tok).name in self.fail_outputs:
+                        return bgw.CommandResult(returncode=1, stderr=f"failed {Path(tok).name}")
+                return bgw.CommandResult(returncode=0)
             out_path = _dash_o(tokens)
             is_side_link = bgw.SIDE_MODULE_FLAG in tokens or any(
                 t.startswith("-sSIDE_MODULE=") for t in tokens
@@ -2386,14 +2396,27 @@ class TestSplitModules(unittest.TestCase):
             self.assertEqual(report.side_modules, [])
             self.assertEqual(report.outputs, (bgw.RUNTIME_JS, bgw.RUNTIME_WASM))
             self.assertNotIn("-fPIC", report.compile_flags)
-            self.assertNotIn("-sMAIN_MODULE=2", report.link_flags)
+            self.assertFalse(any(t.startswith("-sMAIN_MODULE=") for t in report.link_flags))
+            self.assertIn("-sPTHREAD_POOL_SIZE=4", report.link_flags)
+            self.assertFalse(any(t.startswith("-sINITIAL_MEMORY=") for t in report.link_flags))
+            self.assertFalse(any(t.startswith("-sINCOMING_MODULE_JS_API=") for t in report.link_flags))
             self.assertEqual(runner.side_link_calls, [])
+            self.assertEqual(runner.ar_calls, [])
             self.assertEqual(len(runner.link_calls), 1)
-            self.assertNotIn("-sMAIN_MODULE=2", runner.link_calls[0])
+            main_call = runner.link_calls[0]
+            self.assertFalse(any(t.startswith("-sMAIN_MODULE=") for t in main_call))
+            self.assertNotIn("-Wl,--whole-archive", main_call)
+            self.assertNotIn("-Wl,--no-whole-archive", main_call)
+            self.assertIn("libplaygta6_core.a", [Path(t).name for t in main_call])
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            for reg_id in ("main/lift/functions.ll", "vcruntime140/lift/functions.ll"):
+                obj = by_id[reg_id].object_path
+                assert obj is not None
+                self.assertIn(obj.name, [Path(t).name for t in main_call])
             for call in runner.compile_calls:
                 self.assertNotIn("-fPIC", call)
             self.assertNotIn("-fPIC", bgw.COMPILE_WASM_FLAGS)
-            self.assertNotIn("-sMAIN_MODULE=2", bgw.LINK_FLAGS)
+            self.assertFalse(any(t.startswith("-sMAIN_MODULE=") for t in bgw.LINK_FLAGS))
 
             payload = json.loads(bgw.report_to_json(report))
             self.assertEqual(payload["split_modules"], 1)
@@ -2479,6 +2502,8 @@ class TestSplitModules(unittest.TestCase):
             src = _program_layout(root)
             cache = root / "cache"
             out_dir = root / "dist"
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            orig_lib_bytes = orig_lib.read_bytes()
             runner = RecordingRunner()
             report = bgw.run_build(
                 source_dir=src,
@@ -2490,14 +2515,21 @@ class TestSplitModules(unittest.TestCase):
                 wasm_exceptions=True,
                 link_guest_boot=True,
                 split_modules=3,
-                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                runtime_lib=orig_lib,
                 run_command=runner,
                 which_fn=lambda _name: None,
             )
             self.assertTrue(report.ok, report.errors)
             self.assertEqual(report.split_modules, 3)
             self.assertIn("-fPIC", report.compile_flags)
-            self.assertIn("-sMAIN_MODULE=2", report.link_flags)
+            self.assertIn("-sMAIN_MODULE=1", report.link_flags)
+            self.assertNotIn("-sMAIN_MODULE=2", report.link_flags)
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", report.link_flags)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", report.link_flags)
+            self.assertIn("-sALLOW_MEMORY_GROWTH=1", report.link_flags)
+            self.assertIn("-sMAXIMUM_MEMORY=16GB", report.link_flags)
+            self.assertIn("-sINITIAL_MEMORY=64MB", report.link_flags)
+            self.assertEqual(report.initial_memory, "64MB")
             self.assertEqual(
                 report.outputs,
                 (
@@ -2506,13 +2538,17 @@ class TestSplitModules(unittest.TestCase):
                     "guest_part_0.wasm",
                     "guest_part_1.wasm",
                     "guest_part_2.wasm",
+                    "guest_part_3.wasm",
                 ),
             )
-            self.assertEqual(len(report.side_modules), 3)
-            self.assertEqual(len(runner.side_link_calls), 3)
+            # 3 shard buckets (0..2) + 1 registration side module (3).
+            self.assertEqual(len(report.side_modules), 4)
+            self.assertEqual(len(runner.side_link_calls), 4)
+            self.assertEqual(len(runner.ar_calls), 1)
             self.assertEqual(len(runner.link_calls), 1)
 
-            # Verify every shard appears in exactly one side module and no non-shard appears.
+            # Verify every shard appears in exactly one shard side module (0..2),
+            # and registration functions.ll units appear together in guest_part_3.wasm.
             expected_shards = {
                 "main/lift/shard-00000.ll",
                 "main/lift/shard-00001.ll",
@@ -2520,6 +2556,10 @@ class TestSplitModules(unittest.TestCase):
                 "vcruntime140/lift/shard-00000.ll",
                 "vcruntime140/lift/shard-00001.ll",
             }
+            expected_regs = (
+                "main/lift/functions.ll",
+                "vcruntime140/lift/functions.ll",
+            )
             seen_shards: list[str] = []
             by_id = {u.unit.unit_id: u for u in report.sources}
             for idx, (side, side_call) in enumerate(zip(report.side_modules, runner.side_link_calls)):
@@ -2529,7 +2569,10 @@ class TestSplitModules(unittest.TestCase):
                 self.assertEqual(side.wasm_bytes, 8)
                 self.assertFalse(side.exceeds_v8_1gib_limit)
                 self.assertTrue((out_dir / side.name).is_file())
-                seen_shards.extend(side.shards)
+                if idx < 3:
+                    seen_shards.extend(side.shards)
+                else:
+                    self.assertEqual(side.shards, expected_regs)
 
                 self.assertIn("-sMEMORY64=1", side_call)
                 self.assertIn("-pthread", side_call)
@@ -2537,6 +2580,7 @@ class TestSplitModules(unittest.TestCase):
                 self.assertIn("-fwasm-exceptions", side_call)
                 self.assertIn("-Wl,--strip-all", side_call)
                 self.assertNotIn("-sASSERTIONS=0", side_call)
+                self.assertNotIn("-sMAIN_MODULE=1", side_call)
                 self.assertNotIn("-sMAIN_MODULE=2", side_call)
                 self.assertEqual(side_call[-2], "-o")
                 self.assertEqual(Path(side_call[-1]).name, f"guest_part_{idx}.wasm")
@@ -2563,26 +2607,58 @@ class TestSplitModules(unittest.TestCase):
             self.assertEqual(len(seen_shards), len(expected_shards))
             self.assertEqual(set(seen_shards), expected_shards)
             # Balanced 5 shards across 3 buckets -> sizes (2, 2, 1).
-            self.assertEqual(sorted(len(s.shards) for s in report.side_modules), [1, 2, 2])
+            self.assertEqual(sorted(len(s.shards) for s in report.side_modules[:3]), [1, 2, 2])
 
-            # Main module link has -sMAIN_MODULE=2, all non-shard objects, libplaygta6_core.a,
-            # and all 3 guest_part_*.wasm paths, and ZERO shard .o files.
+            # Verify emar d ran on a cache copy of libplaygta6_core.a (never the original).
+            filtered_lib = cache / "libplaygta6_core_split.a"
+            self.assertTrue(filtered_lib.is_file())
+            self.assertEqual(orig_lib.read_bytes(), orig_lib_bytes)
+            ar_call = runner.ar_calls[0]
+            self.assertTrue(Path(ar_call[0]).name.lower().startswith("emar"))
+            self.assertEqual(ar_call[1], "d")
+            self.assertEqual(Path(ar_call[2]).resolve(), filtered_lib.resolve())
+            self.assertNotEqual(Path(ar_call[2]).resolve(), orig_lib.resolve())
+            self.assertEqual(ar_call[3:], ("wasm_boot.cpp.o", "main.cpp.o"))
+
+            # Main module link has -sMAIN_MODULE=1, --whole-archive with the filtered archive,
+            # dynamicLibraries in INCOMING_MODULE_JS_API, growable 16GB memory, pool size 8,
+            # NO guest_part_*.wasm arguments, and ZERO shard or registration .o files.
             main_call = runner.link_calls[0]
-            self.assertIn("-sMAIN_MODULE=2", main_call)
+            self.assertIn("-sMAIN_MODULE=1", main_call)
+            self.assertNotIn("-sMAIN_MODULE=2", main_call)
             self.assertIn("-sMEMORY64=1", main_call)
             self.assertIn("-pthread", main_call)
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", main_call)
+            self.assertIn("-sALLOW_MEMORY_GROWTH=1", main_call)
+            self.assertIn("-sMAXIMUM_MEMORY=16GB", main_call)
+            self.assertIn("-sINITIAL_MEMORY=64MB", main_call)
             self.assertIn("-lexports.js", main_call)
             self.assertIn("-fwasm-exceptions", main_call)
             self.assertIn("-Wl,--strip-all", main_call)
+            incoming_tokens = [t for t in main_call if t.startswith("-sINCOMING_MODULE_JS_API=")]
+            self.assertEqual(len(incoming_tokens), 1)
+            self.assertIn("dynamicLibraries", incoming_tokens[0].split("=", 1)[1].split(","))
+
+            wa_idx = main_call.index("-Wl,--whole-archive")
+            nwa_idx = main_call.index("-Wl,--no-whole-archive")
+            self.assertEqual(nwa_idx, wa_idx + 2)
+            self.assertEqual(Path(main_call[wa_idx + 1]).resolve(), filtered_lib.resolve())
 
             main_names = [Path(t).name for t in main_call]
-            for part_name in ("guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"):
-                self.assertIn(part_name, main_names)
-                self.assertIn(part_name, report.link_argv)
-            self.assertIn("libplaygta6_core.a", main_names)
+            self.assertNotIn("libplaygta6_core.a", main_names)
+            self.assertIn("libplaygta6_core_split.a", main_names)
+            self.assertIn("libplaygta6_core_split.a", report.link_argv)
+            self.assertIn("-Wl,--whole-archive", report.link_argv)
+            self.assertIn("-Wl,--no-whole-archive", report.link_argv)
+            for part_name in (
+                "guest_part_0.wasm",
+                "guest_part_1.wasm",
+                "guest_part_2.wasm",
+                "guest_part_3.wasm",
+            ):
+                self.assertNotIn(part_name, main_names)
+                self.assertNotIn(part_name, report.link_argv)
             for non_shard_id in (
-                "main/lift/functions.ll",
-                "vcruntime140/lift/functions.ll",
                 "main/stubs/pg6_import_thunks.cpp",
                 "exports/pg6_export_thunks.cpp",
                 "pg6_program.cpp",
@@ -2593,8 +2669,8 @@ class TestSplitModules(unittest.TestCase):
                 obj = by_id[non_shard_id].object_path
                 assert obj is not None
                 self.assertIn(obj.name, main_names)
-            for shard_id in expected_shards:
-                obj = by_id[shard_id].object_path
+            for excluded_id in (*expected_shards, *expected_regs):
+                obj = by_id[excluded_id].object_path
                 assert obj is not None
                 self.assertNotIn(obj.name, main_names)
 
@@ -2606,16 +2682,22 @@ class TestSplitModules(unittest.TestCase):
                 self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
             payload = json.loads(dumped)
             self.assertEqual(payload["split_modules"], 3)
-            self.assertEqual(len(payload["side_modules"]), 3)
+            self.assertEqual(len(payload["side_modules"]), 4)
             self.assertEqual(
                 [m["name"] for m in payload["side_modules"]],
-                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
+                [
+                    "guest_part_0.wasm",
+                    "guest_part_1.wasm",
+                    "guest_part_2.wasm",
+                    "guest_part_3.wasm",
+                ],
             )
             text = bgw.format_report_text(report, sanitize=True)
             self.assertIn("Split modules: 3", text)
+            self.assertIn("-sMAIN_MODULE=1", text)
             self.assertIn("Side modules:", text)
             self.assertIn("guest_part_0.wasm", text)
-            self.assertIn("guest_part_2.wasm", text)
+            self.assertIn("guest_part_3.wasm", text)
             if len(user) >= 3:
                 self.assertNotRegex(text, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
 
@@ -2676,7 +2758,7 @@ class TestSplitModules(unittest.TestCase):
                 [[it.unit.unit_id for it in b] for b in buckets],
             )
 
-            # Fewer shards (2) than split_modules (5): emits only 2 non-empty buckets.
+            # Fewer shards (2) than split_modules (5): emits 2 shard buckets + 1 registration side module.
             repo = self._repo(root)
             small_src = root / "two-shards"
             _write(small_src / "lift" / "shard-00000.ll", "; s0\n")
@@ -2696,12 +2778,13 @@ class TestSplitModules(unittest.TestCase):
             )
             self.assertTrue(report_two.ok, report_two.errors)
             self.assertEqual(report_two.split_modules, 5)
-            self.assertEqual(len(report_two.side_modules), 2)
+            self.assertEqual(len(report_two.side_modules), 3)
             self.assertEqual(
                 [m.name for m in report_two.side_modules],
-                ["guest_part_0.wasm", "guest_part_1.wasm"],
+                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
             )
-            self.assertEqual(len(runner_two.side_link_calls), 2)
+            self.assertEqual(report_two.side_modules[2].shards, ("lift/functions.ll",))
+            self.assertEqual(len(runner_two.side_link_calls), 3)
             self.assertEqual(len(runner_two.link_calls), 1)
 
             # Failing side module link aborts before main module link.
@@ -2800,7 +2883,7 @@ class TestSplitModules(unittest.TestCase):
             self.assertTrue(report_side_over.exceeds_v8_1gib_limit)
             self.assertEqual(
                 [s.exceeds_v8_1gib_limit for s in report_side_over.side_modules],
-                [False, True, False],
+                [False, True, False, False],
             )
             self.assertEqual(len(report_side_over.warnings), 1)
             self.assertIn("guest_part_1.wasm", report_side_over.warnings[0])
@@ -2920,15 +3003,29 @@ class TestSplitModules(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["split_modules"], 3)
             self.assertIn("-fPIC", payload["compile_flags"])
-            self.assertIn("-sMAIN_MODULE=2", payload["link_flags"])
-            self.assertIn("-sMAIN_MODULE=2", payload["link_argv"])
-            self.assertEqual(len(payload["side_modules"]), 3)
+            self.assertIn("-sMAIN_MODULE=1", payload["link_flags"])
+            self.assertNotIn("-sMAIN_MODULE=2", payload["link_flags"])
+            self.assertIn("-sMAIN_MODULE=1", payload["link_argv"])
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", payload["link_flags"])
+            self.assertIn("-sALLOW_MEMORY_GROWTH=1", payload["link_flags"])
+            self.assertIn("-sMAXIMUM_MEMORY=16GB", payload["link_flags"])
+            self.assertIn("-sINITIAL_MEMORY=64MB", payload["link_flags"])
+            self.assertIn("-Wl,--whole-archive", payload["link_argv"])
+            self.assertIn("libplaygta6_core_split.a", payload["link_argv"])
+            self.assertIn("-Wl,--no-whole-archive", payload["link_argv"])
+            self.assertNotIn("libplaygta6_core.a", payload["link_argv"])
+            incoming_flags = [
+                f for f in payload["link_flags"] if f.startswith("-sINCOMING_MODULE_JS_API=")
+            ]
+            self.assertEqual(len(incoming_flags), 1)
+            self.assertIn("dynamicLibraries", incoming_flags[0].split("=", 1)[1].split(","))
+            self.assertEqual(len(payload["side_modules"]), 4)
             for idx, side in enumerate(payload["side_modules"]):
                 self.assertEqual(side["name"], f"guest_part_{idx}.wasm")
                 self.assertEqual(side["response_file"], f"side_part_{idx}.rsp")
                 self.assertIn("-sSIDE_MODULE=1", side["link_argv"])
                 self.assertIn(f"@side_part_{idx}.rsp", side["link_argv"])
-                self.assertIn(f"guest_part_{idx}.wasm", payload["link_argv"])
+                self.assertNotIn(f"guest_part_{idx}.wasm", payload["link_argv"])
             for unit in payload["sources"]:
                 self.assertIn("-fPIC", unit["argv"])
 
@@ -2958,9 +3055,208 @@ class TestSplitModules(unittest.TestCase):
             self.assertIn("Split modules: 3", out_txt)
             self.assertIn("Side modules:", out_txt)
             self.assertIn("guest_part_0.wasm", out_txt)
-            self.assertIn("guest_part_2.wasm", out_txt)
+            self.assertIn("guest_part_3.wasm", out_txt)
             if len(user) >= 3:
                 self.assertNotRegex(out_txt, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+    def test_r31_split_registration_side_module_main_rsp_filtered_archive_and_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            cache = root / "cache"
+            out_dir = root / "dist"
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            sentinel = b"!<arch>\noriginal-runtime-archive-bytes\n"
+            orig_lib.write_bytes(sentinel)
+
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=4,
+                response_file=True,
+                browser_boot_exports=True,
+                link_guest_boot=True,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            # 5 shards across 4 shard buckets (guest_part_0..3.wasm) + 1 reg side module (guest_part_4.wasm).
+            self.assertEqual(len(report.side_modules), 5)
+            reg_side = report.side_modules[-1]
+            self.assertEqual(reg_side.index, 4)
+            self.assertEqual(reg_side.name, "guest_part_4.wasm")
+            self.assertEqual(reg_side.response_file, "side_part_4.rsp")
+            self.assertEqual(
+                reg_side.shards,
+                ("main/lift/functions.ll", "vcruntime140/lift/functions.ll"),
+            )
+
+            # Registration functions.ll objects are in side_part_4.rsp and NOT in link_objects.rsp.
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            reg_rsp = (cache / "side_part_4.rsp").read_text(encoding="utf-8").splitlines()
+            main_rsp = (cache / "link_objects.rsp").read_text(encoding="utf-8").splitlines()
+            for reg_id in ("main/lift/functions.ll", "vcruntime140/lift/functions.ll"):
+                obj = by_id[reg_id].object_path
+                assert obj is not None
+                obj_posix = str(obj).replace("\\", "/")
+                self.assertIn(obj_posix, reg_rsp)
+                self.assertNotIn(obj_posix, main_rsp)
+            for main_id in (
+                "exports/pg6_export_thunks.cpp",
+                "main/stubs/pg6_import_thunks.cpp",
+                "pg6_program.cpp",
+                "program_modules.cpp",
+                "runtime/main.cpp",
+                "runtime/wasm_boot.cpp",
+            ):
+                obj = by_id[main_id].object_path
+                assert obj is not None
+                self.assertIn(str(obj).replace("\\", "/"), main_rsp)
+
+            # emar d ran on cache copy, never modifying the original archive.
+            self.assertEqual(len(runner.ar_calls), 1)
+            ar_call = runner.ar_calls[0]
+            filtered_copy = cache / "libplaygta6_core_split.a"
+            self.assertTrue(filtered_copy.is_file())
+            self.assertEqual(ar_call[1], "d")
+            self.assertEqual(Path(ar_call[2]).resolve(), filtered_copy.resolve())
+            self.assertTrue(Path(ar_call[2]).resolve().is_relative_to(cache.resolve()))
+            self.assertNotEqual(Path(ar_call[2]).resolve(), orig_lib.resolve())
+            self.assertEqual(ar_call[3:], ("wasm_boot.cpp.o", "main.cpp.o"))
+            self.assertEqual(orig_lib.read_bytes(), sentinel)
+
+            # Main link command checks: MAIN_MODULE=1, whole-archive filtered copy,
+            # zero guest_part_*.wasm args, single INCOMING_MODULE_JS_API with dynamicLibraries,
+            # EXPORTED_RUNTIME_METHODS present, growable 16GB memory + 64MB initial, pool size 8.
+            self.assertEqual(len(runner.link_calls), 1)
+            main_call = runner.link_calls[0]
+            self.assertIn("-sMAIN_MODULE=1", main_call)
+            self.assertNotIn("-sMAIN_MODULE=2", main_call)
+            self.assertIn("-Wl,--whole-archive", main_call)
+            self.assertIn("-Wl,--no-whole-archive", main_call)
+            wa_idx = main_call.index("-Wl,--whole-archive")
+            self.assertEqual(Path(main_call[wa_idx + 1]).resolve(), filtered_copy.resolve())
+            self.assertEqual(main_call[wa_idx + 2], "-Wl,--no-whole-archive")
+            self.assertFalse(any("guest_part_" in tok for tok in main_call))
+            self.assertNotIn(str(orig_lib), main_call)
+            incoming = [t for t in main_call if t.startswith("-sINCOMING_MODULE_JS_API=")]
+            self.assertEqual(len(incoming), 1)
+            api_items = incoming[0].split("=", 1)[1].split(",")
+            self.assertIn("dynamicLibraries", api_items)
+            self.assertIn("locateFile", api_items)
+            self.assertIn(
+                f"-sEXPORTED_RUNTIME_METHODS={bgw.BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}",
+                main_call,
+            )
+            self.assertIn("-sALLOW_MEMORY_GROWTH=1", main_call)
+            self.assertIn("-sMAXIMUM_MEMORY=16GB", main_call)
+            self.assertIn("-sINITIAL_MEMORY=64MB", main_call)
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", main_call)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", main_call)
+
+            # Explicit --initial-memory and --pthread-pool-size override split defaults.
+            override_flags = bgw.resolve_link_flags(
+                main_module=True,
+                initial_memory="128MB",
+                pthread_pool_size=12,
+            )
+            self.assertIn("-sINITIAL_MEMORY=128MB", override_flags)
+            self.assertNotIn("-sINITIAL_MEMORY=64MB", override_flags)
+            self.assertIn("-sPTHREAD_POOL_SIZE=12", override_flags)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=8", override_flags)
+
+            # emar d failure aborts before main link.
+            runner_ar_fail = RecordingRunner(fail_outputs=frozenset({"libplaygta6_core_split.a"}))
+            fail_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-ar-fail",
+                jobs=2,
+                split_modules=2,
+                runtime_lib=orig_lib,
+                run_command=runner_ar_fail,
+                which_fn=lambda _name: None,
+            )
+            self.assertFalse(fail_report.ok)
+            self.assertEqual(len(runner_ar_fail.ar_calls), 1)
+            self.assertEqual(runner_ar_fail.link_calls, [])
+            self.assertTrue(
+                any("libplaygta6_core_split.a" in e for e in fail_report.errors),
+                fail_report.errors,
+            )
+
+            # Split build with no functions.ll emits only the shard side modules.
+            no_reg_src = root / "no-reg"
+            _write(no_reg_src / "lift" / "shard-00000.ll", "; s0\n")
+            _write(no_reg_src / "lift" / "shard-00001.ll", "; s1\n")
+            _write(no_reg_src / "stubs" / "thunks.cpp", "void t() {}\n")
+            runner_no_reg = RecordingRunner()
+            no_reg_report = bgw.run_build(
+                source_dir=no_reg_src,
+                repo_root=repo,
+                cache_dir=root / "cache-no-reg",
+                out_dir=root / "dist-no-reg",
+                jobs=2,
+                split_modules=2,
+                runtime_lib=orig_lib,
+                run_command=runner_no_reg,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(no_reg_report.ok, no_reg_report.errors)
+            self.assertEqual(
+                [m.name for m in no_reg_report.side_modules],
+                ["guest_part_0.wasm", "guest_part_1.wasm"],
+            )
+
+    def test_r31_split_modules_one_commands_unchanged_with_browser_boot_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-mono",
+                out_dir=root / "dist-mono",
+                jobs=2,
+                split_modules=1,
+                browser_boot_exports=True,
+                link_guest_boot=True,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(runner.side_link_calls, [])
+            self.assertEqual(runner.ar_calls, [])
+            self.assertEqual(len(runner.link_calls), 1)
+            link = runner.link_calls[0]
+            self.assertEqual(
+                report.link_flags,
+                bgw.resolve_link_flags(browser_boot_exports=True, main_module=False),
+            )
+            self.assertIn("-sPTHREAD_POOL_SIZE=4", link)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=8", link)
+            self.assertNotIn("-sMAIN_MODULE=1", link)
+            self.assertNotIn("-sMAIN_MODULE=2", link)
+            self.assertNotIn("-Wl,--whole-archive", link)
+            self.assertNotIn("-Wl,--no-whole-archive", link)
+            self.assertIn(str(orig_lib), link)
+            self.assertFalse(any(t.startswith("-sINITIAL_MEMORY=") for t in link))
+            self.assertIn(
+                f"-sINCOMING_MODULE_JS_API={bgw.BROWSER_BOOT_INCOMING_MODULE_JS_API}",
+                link,
+            )
+            self.assertNotIn("dynamicLibraries", " ".join(link))
 
 
 class TestLinkFlagContract(unittest.TestCase):

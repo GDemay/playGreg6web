@@ -41,7 +41,8 @@
 //              result is read unconditionally: a pipeline state is always handed out. (high shape)
 //              The bases are slot-57 pipelines (see "Console-native pipelines" below).
 //   57    1    (desc, IID_ID3D12PipelineState, out): a console-native graphics pipeline
-//              (GuestNativePipelineDesc below)                    native PSO, unresolved (high shape)
+//              (GuestNativePipelineDesc below)  stages indexed, then E_NOTIMPL (default) or a
+//                                                                 native PSO, unresolved (high shape)
 //   61    1    (a, b); ignored                                     S_OK no-op (low)
 //   62    1    (desc, 0, 0, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (NodeMask 1, no
 //              cached PSO, flags 0) with a DXIL compute shader (program kind 5) in every call;
@@ -163,6 +164,35 @@
 // two alternating; 2,436 distinct DXIL compute containers (568 bytes .. over 64 KiB). Slot 62
 // creates ordinary compute pipeline states from them (the shader track's DXIL path applies).
 
+// Native pipelines and their DXIL (G37)
+// -------------------------------------
+// How the title picks a graphics pipeline (static analysis, confirmed at run time):
+//  * Every pipeline request goes through one function (0x142479760). It hashes the program and
+//    state and asks the native-pipeline manager (global at 0x1475DDB90, created unconditionally at
+//    startup) for a pipeline compiled earlier through slot 57, deriving state variants through slot
+//    55. Only when that lookup finds nothing does it build a pipeline-state stream from the
+//    program's DXIL stages and the public state structs and call slot 86.
+//  * The compile job inserts a pipeline into the manager's map only when slot 57 succeeds. So when
+//    slot 57 fails, every request falls back to slot 86. A real console does not fail these calls;
+//    DeviceOptions::refuse_native_pipelines (on by default) fails them on purpose, the same answer
+//    as for the native compute slot 67. One boot then created every requested graphics pipeline
+//    from DXIL (50,472 slot-86 calls, 738 distinct containers: 229 vertex, 509 pixel) and slot 55
+//    was never called. The per-frame pass carries its DXIL pair and its public state (input
+//    layout, render-target and depth formats, rectangle-list topology).
+//  * The containers are shader model 6.6 / DXIL 1.6 with clear signature, PSV0, SFI0, HASH and
+//    PRIV parts. The DXIL part's program header is valid, but its bitcode offset points at a
+//    trailer of under 16 bytes. The program body is a payload that starts with one fixed tag in
+//    every container, has 6-8 bits/byte of entropy and is not LLVM bitcode or a common compression
+//    format. The slot-62 compute containers are built the same way. The shader track cannot read
+//    these as DXIL; this layer does not try to decode the payload.
+//  * Join key: a stage's metadata range (slot 57) carries the 16-byte digest of the DXIL container's
+//    HASH part for the same shader, at 0x14 + 0x40 * k (pixel stages: range 3; vertex stages of
+//    layout A: range 5; no layout-B vertex stage has been seen joined yet). In one boot, 228 of 229
+//    distinct DXIL vertex shaders and 470 of 509 pixel shaders joined (97% of the 100,928 stage
+//    uses) against 18,829 indexed native stages. While refusing, slot 57 indexes its stages under
+//    those positions, and graphics pipeline states record the native stage (identity, code-only
+//    identity, sizes) that each of their DXIL stages joins to.
+
 // Raytracing
 // ----------
 // CheckFeatureSupport(OPTIONS5) reports RaytracingTier NOT_SUPPORTED and CreateStateObject (101)
@@ -262,6 +292,11 @@ struct NativePipeline {
     bool vertex_alt = false;    // vertex stage in ranges 6/7 (layout B) instead of 4/5
 };
 
+// Candidate positions of the DXIL HASH digest (16 bytes) inside a stage's metadata range:
+// kNativeDigestFirst + k * kNativeDigestStride (see "Native pipelines and their DXIL").
+inline constexpr size_t kNativeDigestFirst = 0x14;
+inline constexpr size_t kNativeDigestStride = 0x40;
+
 // Checks the range layout (header and metadata present; exactly one vertex pair; pixel pair whole
 // or absent; code 256-byte aligned; sizes bounded). The contents are not interpreted.
 bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* out, std::string* error);
@@ -270,9 +305,16 @@ bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* 
 // rectangle entry becomes primitive topology type 19 (0x13) in the PRIMITIVE_TOPOLOGY subobject,
 // and command lists then set topology 17 (0x11), the GPU's DI_PT_RECTLIST primitive type (public
 // gfx10 register definitions): three vertices per rectangle, the fourth corner implied. The
-// per-frame full-screen pass draws one this way (DrawInstanced(3, 1)). Pipeline states accept the
-// type (as triangles, flagged); draws with the topology are skipped, because emitting them as
-// triangle lists would cover half of each rectangle (no fourth-vertex expansion yet).
+// per-frame full-screen pass draws one this way (DrawInstanced(3, 1), 59 in one boot; no indexed
+// or multi-instance rectangle lists were seen). In the title's rectangles v1 is the right-angle
+// corner, so the implied corner is v3 = v0 + v2 - v1. Pipeline states accept the type (as
+// triangles, flagged). Non-indexed draws are expanded on the guest side without packet changes:
+// at ExecuteCommandLists each rectangle's vertices, read from CPU-visible vertex buffers, become
+// two triangles (v0 v1 v2, v2 v3 v0) in a runtime-owned buffer (v3 computed per per-vertex
+// attribute in the input layout's format; integer formats wrap, normalized ones clamp). This is
+// exact when the vertex shader is affine in its inputs (the hardware derives the corner from the
+// shaded vertices). Indexed rectangle lists, GPU-only vertex buffers and formats without a
+// corner rule are skipped and described.
 inline constexpr uint32_t kTopologyTypeRect = 19;
 inline constexpr uint32_t kTopologyRectList = 17;
 
@@ -364,7 +406,8 @@ enum class Counter : size_t {
     ExecutesWithToken,
     IndirectSkipped,
     RectListPipelineStates,      // topology type kTopologyTypeRect accepted
-    RectListDrawsSkipped,        // draws with topology kTopologyRectList
+    RectListDrawsSkipped,        // draws with topology kTopologyRectList that were not expanded
+    RectListDrawsExpanded,       // ... expanded into triangle lists
     DepthBoundsIgnored,
     ShadingRateIgnored,
     StreamPipelineStates,
@@ -372,6 +415,9 @@ enum class Counter : size_t {
     NativePipelineStates,        // slot 57
     NativePipelineStatesRejected,
     NativeOverridesIgnored,      // slot 55 override entries on a native base
+    NativePipelineStatesRefused, // slot 57 with DeviceOptions::refuse_native_pipelines
+    DxilStagesJoined,            // DXIL stage joined to an indexed native stage
+    DxilStagesNotJoined,
     PlaceholderPipelineStates,
     UnknownOverrideKinds,
     ComputePipelineStatesX,      // slot 62 (DXIL)

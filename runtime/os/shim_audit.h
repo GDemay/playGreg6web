@@ -379,13 +379,13 @@
     X(pg6_mw_ffx_create_context, ok, "synthetic context handle; ignores the allocation callbacks") \
     X(pg6_mw_ffx_destroy_context, ok, "") \
     X(pg6_mw_ffx_dispatch, ok, "no-op") \
-    X(pg6_mw_ffx_query, deny, "reports FFX_OK without writing any query output (callers read uninitialised out-fields)") \
+    X(pg6_mw_ffx_query, ok, "answers GetJitterPhaseCount (pure function of the widths); every other query fails and writes nothing") \
     /* ---- XboxBvhBuilder (C++ members: this in rcx) ---- */ \
     X(pg6_mw_bvh_builder_ctor, ok, "returns this (MSVC constructor convention)") \
     X(pg6_mw_bvh_builder_dtor, ok, "") \
     X(pg6_mw_bvh_builder_build_batched_2x, ok, "no-op") \
     X(pg6_mw_bvh_builder_copy, ok, "no-op") \
-    X(pg6_mw_bvh_builder_get_prebuild_info, ok, "zero sizes (24-byte D3D12 prebuild info)") \
+    X(pg6_mw_bvh_builder_get_prebuild_info, ok, "256-byte sizes: the runtime's build writes nothing (24-byte D3D12 prebuild info)") \
     X(pg6_mw_bvh_builder_rehydrate_batched_2x, ok, "") \
     X(pg6_mw_bvh_builder_set_64bit_morton_codes, ok, "") \
     /* ---- MFPlat / MFReadWrite ---- */ \

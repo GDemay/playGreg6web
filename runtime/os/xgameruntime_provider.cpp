@@ -55,9 +55,12 @@
 //   {01acd177-...} XUser: s4 CloseHandle h, s7 AddAsync h, s8 AddResult h, s11 GetId m,
 //     s20 CheckPrivilege m, s21/s22 ResolvePrivilegeWithUiAsync/Result m,
 //     s23 GetTokenAndSignatureAsync(9) h, s24 ...ResultSize m, s33/s34 Register/Unregister
-//     ForChangeEvent h; s3 Duplicate, s5 Compare, s9/s10 AddByIdWithUi, s12 FindUserById,
-//     s13 GetLocalId, s14 FindUserByLocalId, s19 GetAgeGroup, s25 GetTokenAndSignatureResult
-//     are left as stubs.
+//     ForChangeEvent h; s9 GetLocalId(2) h: the slots follow the public header order (Duplicate,
+//     Close, Compare, GetMaxUsers, AddAsync, AddResult, GetLocalId, FindUserByLocalId, GetId,
+//     FindUserById, ...); the executable keeps {handle, s11 XUID, s9 8-byte value} per user and
+//     rebuilds that record from the value through s10 (value, &handle), i.e. FindUserByLocalId.
+//     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
+//     s25 GetTokenAndSignatureResult; s13, s14, s19 are unidentified.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
@@ -80,8 +83,10 @@
 //     (returns Disabled: the runtime presents SDR).
 //   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
 //     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
+//   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h
+//     (no game-save provider offline: E_NOTIMPL, no handle, the async operation never starts).
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameSave {704c3f58-...}, XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
+//     XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
 //     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
@@ -609,6 +614,33 @@ public:
         return hr;
     }
 
+    // s3 XUserDuplicateHandle(user, XUserHandle* duplicated): a new handle to the same local user
+    // (closed independently with s4).
+    int32_t DuplicateHandle(uint64_t user, OutPtr duplicated) {
+        if (duplicated.is_null() || !duplicated.write(0) || !check_handle(users(), user, "XUserHandle")) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XUserHandle copy = nullptr;
+        const int32_t hr = gdk::XUserDuplicateHandle(from_guest<Pg6XUser>(user), &copy);
+        if (hr < 0 || copy == nullptr) {
+            return hr < 0 ? hr : E_INVALIDARG_HR;
+        }
+        users().add(copy);
+        duplicated.write(to_guest(copy));
+        return S_OK_HR;
+    }
+
+    // s9 XUserGetLocalId(user, XUserLocalId* localId): the local (per-console) identifier of the
+    // runtime's one local user: stable for the user's lifetime, non-zero, distinct from the XUID.
+    // It claims nothing about sign-in, privileges or ownership.
+    int32_t GetLocalId(uint64_t user, GuestPtr<uint64_t> local_id) {
+        if (!check_handle(users(), user, "XUserHandle") || local_id.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        local_id.write(kOfflineUserLocalId);
+        return S_OK_HR;
+    }
+
     int32_t CheckPrivilege(uint64_t user, uint32_t options, uint32_t privilege, GuestPtr<uint8_t> has_privilege,
                            GuestPtr<uint32_t> deny_reasons) {
         if (!check_handle(users(), user, "XUserHandle")) {
@@ -1050,6 +1082,46 @@ private:
     std::atomic<bool> logged_{false};
 };
 
+// XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync).
+// The executable calls s4 through a wrapper (user, configuration id string, bool syncOnDemand,
+// 0x38-byte block = XAsyncBlock) and, when the call fails, marks its save system as failed and
+// frees the block. The runtime has no game-save provider (no connected storage, offline): both
+// initialisations fail with E_NOTIMPL, no provider handle is invented and the async operation is
+// never started (its callback never runs).
+class GameSaveApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XGameSave";
+
+    // s3: XGameSaveInitializeProvider(user, configurationId, syncOnDemand, XGameSaveProviderHandle*).
+    int32_t InitializeProvider(uint64_t /*user*/, uint64_t /*configuration_id*/, uint64_t /*sync_on_demand*/,
+                               GuestPtr<uint64_t> provider) {
+        if (!provider.is_null()) {
+            provider.write(0);
+        }
+        log_once("XGameSaveInitializeProvider");
+        return com::E_NOTIMPL_HR;
+    }
+
+    // s4: XGameSaveInitializeProviderAsync(user, configurationId, syncOnDemand, XAsyncBlock*).
+    int32_t InitializeProviderAsync(uint64_t /*user*/, uint64_t /*configuration_id*/,
+                                    uint64_t /*sync_on_demand*/, uint64_t async) {
+        if (async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        log_once("XGameSaveInitializeProviderAsync");
+        return com::E_NOTIMPL_HR;
+    }
+
+private:
+    void log_once(const char* api) {
+        if (!logged_.exchange(true)) {
+            os::log(std::string("xgameruntime: ") + api + ": no game-save provider (offline runtime); returning E_NOTIMPL");
+        }
+    }
+
+    std::atomic<bool> logged_{false};
+};
+
 // XSystemAnalyticsInfo (x64): two XVersion (four uint16 each) and two 64-byte strings.
 struct GuestAnalyticsInfo {
     uint16_t os_version[4];       // major, minor, build, revision
@@ -1166,18 +1238,18 @@ constexpr auto kIAsyncQueue =
 
 using US = M<UserApi>;
 constexpr auto kUserTable = slot_table<32>({
-    {3, US::stub("XUserDuplicateHandle")},
+    {3, US::method<&UserApi::DuplicateHandle>("XUserDuplicateHandle")},
     {4, US::method<&UserApi::CloseHandle>("XUserCloseHandle")},
     {5, US::stub("XUserCompare")},
     {7, US::method<&UserApi::AddAsync>("XUserAddAsync")},
     {8, US::method<&UserApi::AddResult>("XUserAddResult")},
-    {9, US::stub("XUserAddByIdWithUiAsync")},
-    {10, US::stub("XUserAddByIdWithUiResult")},
+    {9, US::method<&UserApi::GetLocalId>("XUserGetLocalId")},
+    {10, US::stub("XUserFindUserByLocalId")},
     {11, US::method<&UserApi::GetId>("XUserGetId")},
     {12, US::stub("XUserFindUserById")},
-    {13, US::stub("XUserGetLocalId")},
-    {14, US::stub("XUserFindUserByLocalId")},
-    {19, US::stub("XUserGetAgeGroup")},
+    {13, US::stub("XUser slot 13 (unidentified)")},
+    {14, US::stub("XUser slot 14 (unidentified)")},
+    {19, US::stub("XUser slot 19 (unidentified)")},
     {20, US::method<&UserApi::CheckPrivilege>("XUserCheckPrivilege")},
     {21, US::method<&UserApi::ResolvePrivilegeWithUiAsync>("XUserResolvePrivilegeWithUiAsync")},
     {22, US::method<&UserApi::ResolvePrivilegeWithUiResult>("XUserResolvePrivilegeWithUiResult")},
@@ -1261,8 +1333,13 @@ constexpr auto kPackageTable = slot_table<37>({
 constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPackage", kPackageIid,
                                                               kPackageTable.slots, {.slot_count = 48});
 
-constexpr auto kIGameSave = com::declare_interface<StubApi>("xgameruntime.XGameSave", kGameSaveIid, {},
-                                                            {.slot_count = 40});
+using GS = M<GameSaveApi>;
+constexpr auto kGameSaveTable = slot_table<2>({
+    {3, GS::method<&GameSaveApi::InitializeProvider>("XGameSaveInitializeProvider")},
+    {4, GS::method<&GameSaveApi::InitializeProviderAsync>("XGameSaveInitializeProviderAsync")},
+});
+constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
+                                                               kGameSaveTable.slots, {.slot_count = 40});
 constexpr auto kIStoreExt = com::declare_interface<StubApi>("xgameruntime.XStoreExt", kStoreExtIid, {},
                                                             {.slot_count = 96});
 using PL = M<PersistentLocalStorageApi>;
@@ -1324,7 +1401,7 @@ const ApiEntry kApis[] = {
     {kStoreProvider, kStoreIid, &kIStore.info, [] { return make<StoreApi>(kIStore); }},
     {kNetworkingProvider, kNetworkingIid, &kINetworking.info, [] { return make<NetworkingApi>(kINetworking); }},
     {kPackageProvider, kPackageIid, &kIPackage.info, [] { return make<PackageApi>(kIPackage); }},
-    {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<StubApi>(kIGameSave); }},
+    {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<GameSaveApi>(kIGameSave); }},
     {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StubApi>(kIStoreExt); }},
     {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info,
      [] { return make<PersistentLocalStorageApi>(kIPersistentLocalStorage); }},
