@@ -70,6 +70,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
 - [ ] **R40 — Real-Binary Boot, Phase 5: Past the Start Screen — Steady State, Scripted Input, Next Blockers** — `IN PROGRESS` (#663, @Timon-ok) *(continues R32)*
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
+- [ ] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `IN PROGRESS` (#670, @Timon-ok)
+  - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 
 ---
 
@@ -144,6 +146,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Measure the lookup's share of frame time on the real boot and add a semantics-preserving per-thread cache for both dispatch modes.
 - [ ] **O34 — Local XGameSave Provider Backed by /userdata (`runtime/os`, xgameruntime)** — `IN PROGRESS` (#667, @Timon-ok)
   - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
+- [ ] **O35 — Full Sanitizer Sweep of the Runtime Suites (ASan, UBSan, TSan) and Fix What It Finds** — `IN PROGRESS` (#669, @Timon-ok)
+  - Run and loop every runtime suite under ASan+UBSan and TSan, fix findings by cause with regression tests, and close the thread-pool submission leak left by O32.
 
 ---
 
