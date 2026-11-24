@@ -5,10 +5,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  INPUT_ABI_VERSION,
   INPUT_STATE_BYTES,
+  INPUT_STATE_WORDS,
   INPUT_OFFSETS,
+  INPUT_WORD_INDICES,
+  INPUT_ABI_LAYOUT,
   INPUT_BUTTONS,
   DEFAULT_KEY_BINDINGS,
+  STANDARD_GAMEPAD_BUTTON_MAP,
   applyDeadzone,
   applyAxialDeadzone,
   applyTriggerDeadzone,
@@ -159,8 +164,10 @@ function approxEqual(actual, expected, eps = 1e-5) {
   );
 }
 
-test('ABI constants and button bitmasks match runtime/abi/playgta6_abi.h and runtime/os/game_input.h byte-for-byte', () => {
+test('ABI constants and button bitmasks match runtime/abi/playgta6_abi.h, runtime/os/game_input.h, and xbox_scarlett_guest_input.cpp byte-for-byte', () => {
+  assert.equal(INPUT_ABI_VERSION, 1);
   assert.equal(INPUT_STATE_BYTES, 40);
+  assert.equal(INPUT_STATE_WORDS, 10);
   assert.deepEqual(INPUT_OFFSETS, {
     SEQ: 0,
     BUTTONS: 4,
@@ -173,13 +180,55 @@ test('ABI constants and button bitmasks match runtime/abi/playgta6_abi.h and run
     LEFT_TRIGGER: 32,
     RIGHT_TRIGGER: 36,
   });
+  assert.deepEqual(INPUT_WORD_INDICES, {
+    SEQ: 0,
+    BUTTONS: 1,
+    MOUSE_DX: 2,
+    MOUSE_DY: 3,
+    LEFT_STICK_X: 4,
+    LEFT_STICK_Y: 5,
+    RIGHT_STICK_X: 6,
+    RIGHT_STICK_Y: 7,
+    LEFT_TRIGGER: 8,
+    RIGHT_TRIGGER: 9,
+  });
+  assert.equal(INPUT_ABI_LAYOUT.version, INPUT_ABI_VERSION);
+  assert.equal(INPUT_ABI_LAYOUT.byteLength, INPUT_STATE_BYTES);
+  assert.equal(INPUT_ABI_LAYOUT.wordCount, INPUT_STATE_WORDS);
+  assert.equal(INPUT_ABI_LAYOUT.fields.length, INPUT_STATE_WORDS);
 
-  // Verify C++ headers in repo still agree on sizeof(InputState) == 40 and bitmask shifts.
+  // Verify C++ headers in repo still agree on kAbiVersion, struct InputState field order/types/offsets,
+  // sizeof(InputState) == 40, and bitmask shifts.
   const abiHeader = fs.readFileSync(
     path.join(REPO_ROOT, 'runtime/abi/playgta6_abi.h'),
     'utf8'
   );
+  assert.match(abiHeader, /kAbiVersion\s*=\s*1\s*;/);
   assert.match(abiHeader, /static_assert\(sizeof\(InputState\)\s*==\s*40/);
+
+  const structMatch = abiHeader.match(/struct\s+InputState\s*\{([\s\S]*?)\};/);
+  assert.ok(structMatch, 'Expected struct InputState in runtime/abi/playgta6_abi.h');
+  const cppFields = [];
+  const cppTypeToJs = { uint32_t: 'uint32', int32_t: 'int32', float: 'float32' };
+  for (const rawLine of structMatch[1].split('\n')) {
+    const cleaned = rawLine.replace(/\/\/.*$/, '').trim();
+    if (!cleaned) continue;
+    const m = cleaned.match(/^(uint32_t|int32_t|float)\s+([a-z0-9_]+)\s*;$/);
+    assert.ok(m, `Unexpected field declaration in struct InputState: ${cleaned}`);
+    cppFields.push({ type: cppTypeToJs[m[1]], name: m[2] });
+  }
+  assert.equal(cppFields.length, INPUT_ABI_LAYOUT.fields.length);
+  for (let i = 0; i < cppFields.length; i++) {
+    const jsField = INPUT_ABI_LAYOUT.fields[i];
+    const cppField = cppFields[i];
+    assert.equal(jsField.name, cppField.name, `Field #${i} name mismatch`);
+    assert.equal(jsField.type, cppField.type, `Field #${i} type mismatch`);
+    assert.equal(jsField.offset, i * 4, `Field #${i} byte offset mismatch`);
+    assert.equal(jsField.wordIndex, i, `Field #${i} word index mismatch`);
+    assert.equal(jsField.size, 4, `Field #${i} byte size mismatch`);
+    assert.equal(INPUT_OFFSETS[jsField.key], jsField.offset);
+    assert.equal(INPUT_WORD_INDICES[jsField.key], jsField.wordIndex);
+  }
 
   const gameInputHeader = fs.readFileSync(
     path.join(REPO_ROOT, 'runtime/os/game_input.h'),
@@ -207,6 +256,35 @@ test('ABI constants and button bitmasks match runtime/abi/playgta6_abi.h and run
     const re = new RegExp(`constexpr\\s+uint32_t\\s+${cppName}\\s*=\\s*1u\\s*<<\\s*${bit}\\s*;`);
     assert.match(gameInputHeader, re, `Header mismatch for ${cppName}`);
   }
+
+  // Verify Xbox GameInput guest shim references the exact same SAB keyboard bits (0..5).
+  const guestInputCpp = fs.readFileSync(
+    path.join(REPO_ROOT, 'runtime/os/xbox_scarlett_guest_input.cpp'),
+    'utf8'
+  );
+  for (const sym of ['kMoveForward', 'kMoveLeft', 'kMoveBackward', 'kMoveRight', 'kJump', 'kSprint']) {
+    assert.match(guestInputCpp, new RegExp(`os::input_button::${sym}\\b`));
+  }
+
+  // Verify W3C Standard Gamepad button map covers all 17 indices accurately.
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP.length, 17);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[0], INPUT_BUTTONS.A);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[1], INPUT_BUTTONS.B);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[2], INPUT_BUTTONS.X);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[3], INPUT_BUTTONS.Y);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[4], INPUT_BUTTONS.LB);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[5], INPUT_BUTTONS.RB);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[6], 0);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[7], 0);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[8], INPUT_BUTTONS.VIEW);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[9], INPUT_BUTTONS.MENU);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[10], INPUT_BUTTONS.LS);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[11], INPUT_BUTTONS.RS);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[12], INPUT_BUTTONS.DPAD_UP);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[13], INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[14], INPUT_BUTTONS.DPAD_LEFT);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[15], INPUT_BUTTONS.DPAD_RIGHT);
+  assert.equal(STANDARD_GAMEPAD_BUTTON_MAP[16], INPUT_BUTTONS.GUIDE);
 
   // Ensure all defined INPUT_BUTTONS bits are distinct powers of two.
   const values = Object.values(INPUT_BUTTONS);
@@ -352,17 +430,20 @@ test('keyboard WASD drives normalized left stick axes + digital bits and Xbox ke
   approxEqual(snap.ly, -1);
   env.win.dispatch('keyup', { code: 'KeyS' });
 
-  // Verify all key bindings (Space, Shift, Ctrl, E, F, R, Q, Tab, Escape, Arrows)
+  // Verify all key bindings (Space, Enter, NumpadEnter, Shift, Ctrl, Backspace, E, F, R, Q, Tab, Escape, Arrows)
   const keysToVerify = [
     ['Space', INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A],
+    ['Enter', INPUT_BUTTONS.A],
+    ['NumpadEnter', INPUT_BUTTONS.A],
     ['ShiftLeft', INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS],
     ['ControlLeft', INPUT_BUTTONS.B],
+    ['Backspace', INPUT_BUTTONS.B],
     ['KeyR', INPUT_BUTTONS.X],
     ['KeyF', INPUT_BUTTONS.Y],
     ['KeyQ', INPUT_BUTTONS.LB],
     ['KeyE', INPUT_BUTTONS.RB],
     ['Tab', INPUT_BUTTONS.VIEW],
-    ['Escape', INPUT_BUTTONS.MENU],
+    ['Escape', INPUT_BUTTONS.B | INPUT_BUTTONS.MENU],
     ['KeyC', INPUT_BUTTONS.RS],
     ['ArrowUp', INPUT_BUTTONS.DPAD_UP],
     ['ArrowDown', INPUT_BUTTONS.DPAD_DOWN],
@@ -734,4 +815,196 @@ test('destroy() / dispose() cleans up all event listeners, stops rAF loop, and z
   bridge.dispose();
   assert.equal(bridge.getSnapshot().seq, seqAfterDestroy);
   assert.equal(bridge.getSnapshot().buttons, 0);
+});
+
+test('menu bindings (Enter/Space -> A, Escape/Backspace -> B, Tab -> View) respect browser shortcuts, editable targets, and focus', () => {
+  const env = createMockEnv();
+  let docFocused = true;
+  env.doc.hasFocus = () => docFocused;
+  env.doc.activeElement = null;
+
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // When unlocked, browser shortcuts (Ctrl+R, Ctrl+W, Alt+Tab, Meta+R) are NOT hijacked.
+  let prevented = false;
+  const preventDefault = () => {
+    prevented = true;
+  };
+  env.win.dispatch('keydown', { code: 'KeyR', ctrlKey: true, preventDefault });
+  env.win.dispatch('keydown', { code: 'KeyW', ctrlKey: true, preventDefault });
+  env.win.dispatch('keydown', { code: 'Tab', altKey: true, preventDefault });
+  env.win.dispatch('keydown', { code: 'Enter', metaKey: true, preventDefault });
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getSnapshot().ly, 0);
+  assert.equal(prevented, false);
+
+  // Typing inside an <input>/<textarea>/contentEditable does NOT trigger game inputs when unlocked.
+  env.win.dispatch('keydown', { code: 'Enter', target: { tagName: 'INPUT' }, preventDefault });
+  env.win.dispatch('keydown', { code: 'Space', target: { tagName: 'TEXTAREA' }, preventDefault });
+  env.win.dispatch('keydown', { code: 'Backspace', target: { isContentEditable: true }, preventDefault });
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(prevented, false);
+
+  // Unfocused document ignores keydown until focus returns.
+  docFocused = false;
+  env.win.dispatch('keydown', { code: 'Enter', preventDefault });
+  env.win.dispatch('keydown', { code: 'Escape', preventDefault });
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(prevented, false);
+
+  // Focused unlocked page accepts Enter/Space -> A, Escape/Backspace -> B, Tab -> View without calling preventDefault.
+  docFocused = true;
+  env.win.dispatch('keydown', { code: 'Enter', preventDefault });
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(prevented, false, 'should not fight browser defaults when pointer is unlocked');
+  env.win.dispatch('keyup', { code: 'Enter' });
+
+  env.win.dispatch('keydown', { code: 'Escape', preventDefault });
+  assert.equal(bridge.getSnapshot().buttons & INPUT_BUTTONS.B, INPUT_BUTTONS.B);
+  assert.equal(bridge.getSnapshot().buttons & INPUT_BUTTONS.MENU, INPUT_BUTTONS.MENU);
+  env.win.dispatch('keyup', { code: 'Escape' });
+
+  env.win.dispatch('keydown', { code: 'Backspace', preventDefault });
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.B);
+  env.win.dispatch('keyup', { code: 'Backspace' });
+
+  // When pointer-locked, crouch-walk (ControlLeft + KeyW) and preventDefault on Enter/Backspace work.
+  env.lockPointer();
+  env.win.dispatch('keydown', { code: 'ControlLeft', ctrlKey: true });
+  env.win.dispatch('keydown', { code: 'KeyW', ctrlKey: true });
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.B | INPUT_BUTTONS.MOVE_FORWARD);
+  approxEqual(snap.ly, 1.0);
+
+  env.win.dispatch('keydown', { code: 'Enter', preventDefault });
+  assert.equal(prevented, true);
+
+  // pagehide clears all stuck keys cleanly as well.
+  env.win.dispatch('pagehide');
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  assert.equal(snap.ly, 0);
+
+  bridge.destroy();
+});
+
+test('headless safety: never throws when SharedArrayBuffer, Atomics, or navigator.getGamepads is missing or throws', () => {
+  // 1. Missing SharedArrayBuffer and missing Atomics -> falls back to 40-byte ArrayBuffer cleanly.
+  const env = createMockEnv();
+  const throwingNav = {
+    getGamepads() {
+      throw new Error('Permissions policy blocked Gamepad API');
+    },
+  };
+  const bridgeNoSab = new InputBridge({
+    canvas: env.canvas,
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: throwingNav,
+    sharedArrayBufferCtor: null,
+    atomicsObj: null,
+  });
+
+  assert.equal(bridgeNoSab.isSharedBuffer, false);
+  assert.equal(bridgeNoSab.usesAtomics, false);
+  assert.ok(bridgeNoSab.sab instanceof ArrayBuffer);
+  assert.equal(bridgeNoSab.sab.byteLength, INPUT_STATE_BYTES);
+
+  // Keyboard, mouse, gamepad polling, reset, and snapshot all work without throwing.
+  env.lockPointer();
+  env.win.dispatch('keydown', { code: 'Enter' });
+  env.win.dispatch('keydown', { code: 'KeyW' });
+  env.win.dispatch('mousemove', { movementX: 6, movementY: -4 });
+  assert.equal(bridgeNoSab.pollGamepads(), false);
+
+  const snap = bridgeNoSab.getSnapshot();
+  assert.ok(snap !== null);
+  assert.ok(snap.seq > 0 && (snap.seq & 1) === 0);
+  assert.equal(snap.buttons, INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD);
+  assert.equal(snap.mouse_dx, 6);
+  assert.equal(snap.mouse_dy, -4);
+  approxEqual(snap.ly, 1.0);
+
+  // Verify raw 40-byte DataView layout matches playgta6::InputState even in fallback mode.
+  const dv = new DataView(bridgeNoSab.sab);
+  assert.equal(dv.getUint32(INPUT_OFFSETS.SEQ, true), snap.seq);
+  assert.equal(dv.getUint32(INPUT_OFFSETS.BUTTONS, true), INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD);
+  assert.equal(dv.getInt32(INPUT_OFFSETS.MOUSE_DX, true), 6);
+  assert.equal(dv.getInt32(INPUT_OFFSETS.MOUSE_DY, true), -4);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.LEFT_STICK_Y, true), 1.0);
+
+  // blur clears stuck keys even without SharedArrayBuffer/Atomics.
+  env.win.dispatch('blur');
+  assert.equal(bridgeNoSab.getSnapshot().buttons, 0);
+  assert.equal(bridgeNoSab.getSnapshot().ly, 0);
+  bridgeNoSab.destroy();
+
+  // 2. SharedArrayBuffer constructor throws (e.g., SecurityError) and navigator has no getGamepads.
+  class ThrowingSab {
+    constructor() {
+      throw new Error('SharedArrayBuffer unavailable without COOP/COEP');
+    }
+  }
+  const bridgeThrowingSab = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: {},
+    sharedArrayBufferCtor: ThrowingSab,
+  });
+  assert.equal(bridgeThrowingSab.isSharedBuffer, false);
+  assert.equal(bridgeThrowingSab.sab.byteLength, INPUT_STATE_BYTES);
+  assert.equal(bridgeThrowingSab.pollGamepads(), false);
+  assert.equal(bridgeThrowingSab.getSnapshot().seq, 0);
+  bridgeThrowingSab.destroy();
+
+  // 3. Undersized ArrayBuffer or non-buffer opts.sab still throws RangeError.
+  assert.throws(() => new InputBridge({ sab: new ArrayBuffer(20) }), RangeError);
+  assert.throws(() => new InputBridge({ sab: {} }), RangeError);
+});
+
+test('zero-alloc deadzone and snapshot reuse + steady-state gamepad polling avoids spurious commits', () => {
+  const scratchStick = { x: 99, y: 99 };
+  const returned = applyDeadzone(0.5, 0.5, 0.15, 0.98, scratchStick);
+  assert.equal(returned, scratchStick, 'applyDeadzone with out param must reuse object in-place');
+  assert.ok(scratchStick.x > 0 && scratchStick.y > 0);
+
+  const zeroed = applyDeadzone(0.05, -0.05, 0.15, 0.98, scratchStick);
+  assert.equal(zeroed, scratchStick);
+  assert.equal(scratchStick.x, 0);
+  assert.equal(scratchStick.y, 0);
+
+  const env = createMockEnv({
+    gamepads: [
+      makeStandardGamepad({
+        buttons: { 0: 1, 6: 0.4, 7: 0.8 },
+        axes: [0.6, -0.4, -0.5, 0.5],
+      }),
+    ],
+  });
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  assert.equal(bridge.pollGamepads(), true);
+  const reusableSnap = {};
+  const snap1 = bridge.getSnapshot(64, reusableSnap);
+  assert.equal(snap1, reusableSnap, 'getSnapshot with out param must reuse object in-place');
+  assert.equal(snap1.buttons, INPUT_BUTTONS.A);
+  const seq1 = snap1.seq;
+
+  // 100 consecutive identical polls must not bump seq or fail.
+  for (let i = 0; i < 100; i++) {
+    assert.equal(bridge.pollGamepads(), false);
+  }
+  const snap2 = bridge.getSnapshot(64, reusableSnap);
+  assert.equal(snap2, reusableSnap);
+  assert.equal(snap2.seq, seq1);
+
+  bridge.destroy();
 });
