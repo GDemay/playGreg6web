@@ -634,5 +634,243 @@ class TestCliJsonAndStrictSanitization(unittest.TestCase):
             self.assertNotIn(str(game_dir), out)
 
 
+class TestWholeFileStandaloneIdentityAndManifest(unittest.TestCase):
+    """Track 4 / S20: whole-file FNV-1a 64 identity hashing & pipeline dump manifest hints."""
+
+    def test_standalone_file_trailing_padding_hashes_whole_file(self) -> None:
+        trimmed_vs = build_synthetic_vs(extra_param=True)
+        trailing_pad = pack_words(
+            rdna2.S_CODE_END_WORD,
+            rdna2.S_CODE_END_WORD,
+            0x00000000,
+            0x00000000,
+            rdna2.S_CODE_END_WORD,
+            0x00000000,
+        )
+        full_vs = trimmed_vs + trailing_pad
+
+        expected_whole_hash = rdna2.fnv1a_64(full_vs)
+        expected_trimmed_hash = rdna2.fnv1a_64(trimmed_vs)
+        self.assertNotEqual(expected_whole_hash, expected_trimmed_hash)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            native_dir = Path(tmp) / "native"
+            native_dir.mkdir()
+            dump_file = native_dir / f"{rdna2.format_hash_64(expected_whole_hash)}.bin"
+            dump_file.write_bytes(full_vs)
+
+            plain_file = Path(tmp) / "per_frame_vs.rdna2"
+            plain_file.write_bytes(full_vs)
+
+            # 1. native/0x<hash>.bin hashes the ENTIRE file and validates filename hint
+            res_dump = rdna2.scan_file(dump_file)
+            self.assertEqual(res_dump.hash_scope, "whole_file")
+            self.assertEqual(res_dump.file_hash_fnv1a64, expected_whole_hash)
+            self.assertEqual(len(res_dump.shaders), 1)
+            hit = res_dump.shaders[0]
+            self.assertEqual(hit.stage, "vertex")
+            self.assertEqual(hit.hash_scope, "whole_file")
+            self.assertEqual(hit.fnv1a_64, expected_whole_hash)
+            self.assertEqual(hit.code_hash_fnv1a64, expected_whole_hash)
+            self.assertEqual(hit.hash_hex, rdna2.format_hash_64(expected_whole_hash))
+            self.assertEqual(hit.trimmed_hash_fnv1a64, expected_trimmed_hash)
+            self.assertEqual(hit.byte_size, len(full_vs))
+            self.assertEqual(hit.trimmed_byte_size, len(trimmed_vs))
+            self.assertEqual(hit.terminator_count, 1)
+            self.assertEqual(hit.filename_hash_hint, expected_whole_hash)
+            self.assertTrue(hit.filename_hash_matches)
+
+            # 2. Unhinted standalone .rdna2 file also hashes the ENTIRE file
+            res_plain = rdna2.scan_file(plain_file)
+            self.assertEqual(res_plain.hash_scope, "whole_file")
+            self.assertEqual(len(res_plain.shaders), 1)
+            self.assertEqual(res_plain.shaders[0].fnv1a_64, expected_whole_hash)
+            self.assertEqual(res_plain.shaders[0].trimmed_hash_fnv1a64, expected_trimmed_hash)
+            self.assertIsNone(res_plain.shaders[0].filename_hash_hint)
+
+            # 3. Embedded mode (--embedded / whole_file=False) preserves trimmed region hash
+            res_emb = rdna2.scan_file(dump_file, whole_file=False)
+            self.assertEqual(res_emb.hash_scope, "region")
+            self.assertEqual(len(res_emb.shaders), 1)
+            self.assertEqual(res_emb.shaders[0].fnv1a_64, expected_trimmed_hash)
+            self.assertEqual(res_emb.shaders[0].byte_size, len(trimmed_vs))
+
+            code_emb, out_emb, err_emb = _run_cli([str(dump_file), "--json", "--embedded"])
+            self.assertEqual(code_emb, 0, err_emb)
+            emb_json = json.loads(out_emb)
+            self.assertEqual(
+                emb_json["files"][0]["shaders"][0]["hash"],
+                rdna2.format_hash_64(expected_trimmed_hash),
+            )
+            self.assertEqual(emb_json["files"][0]["shaders"][0]["hash_scope"], "region")
+
+    def test_standalone_file_with_two_endpgm_terminators(self) -> None:
+        # Early-out branch (`s_nop` + `s_endpgm`) followed immediately by main pixel path
+        # (`v_interp` + `exp mrt0 done` + `s_endpgm`) and trailing padding.
+        first_branch = pack_words(encode_s_nop(0), encode_s_nop(1), rdna2.S_ENDPGM_WORD)
+        second_branch = build_synthetic_ps(include_mimg=True)
+        trailing_pad = pack_words(rdna2.S_CODE_END_WORD, rdna2.S_CODE_END_WORD, 0, 0)
+        full_ps = first_branch + second_branch + trailing_pad
+
+        expected_whole_hash = rdna2.fnv1a_64(full_ps)
+        expected_trimmed_hash = rdna2.fnv1a_64(first_branch)
+        self.assertNotEqual(expected_whole_hash, expected_trimmed_hash)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            named_file = Path(tmp) / f"{rdna2.format_hash_64(expected_whole_hash)}.bin"
+            named_file.write_bytes(full_ps)
+            plain_file = Path(tmp) / "two_endpgm_ps.bin"
+            plain_file.write_bytes(full_ps)
+
+            for target in (named_file, plain_file):
+                with self.subTest(target=target.name):
+                    res = rdna2.scan_file(target)
+                    self.assertEqual(res.hash_scope, "whole_file")
+                    self.assertEqual(len(res.shaders), 1)
+                    hit = res.shaders[0]
+                    self.assertEqual(hit.stage, "pixel")
+                    self.assertEqual(hit.terminator_count, 2)
+                    self.assertEqual(hit.fnv1a_64, expected_whole_hash)
+                    self.assertEqual(hit.code_hash_fnv1a64, expected_whole_hash)
+                    self.assertEqual(hit.trimmed_hash_fnv1a64, expected_trimmed_hash)
+                    self.assertEqual(hit.byte_size, len(full_ps))
+                    self.assertEqual(hit.trimmed_byte_size, len(first_branch))
+                    self.assertEqual(hit.vintrp_count, 1)
+                    self.assertEqual(hit.mimg_count, 1)
+                    self.assertEqual(hit.exp_count, 1)
+                    self.assertEqual(hit.export_targets, ("mrt0",))
+
+    def test_pipeline_dump_manifest_v1_identity_and_stage_hints(self) -> None:
+        vs_bytes = build_synthetic_vs(extra_param=True) + pack_words(rdna2.S_CODE_END_WORD, 0, 0)
+        # Pixel stage with internal padding before a second s_endpgm + trailing padding
+        ps_part1 = pack_words(encode_vintrp(), rdna2.S_ENDPGM_WORD)
+        ps_part2 = pack_words(*encode_exp(0, done=True), rdna2.S_ENDPGM_WORD)
+        ps_bytes = ps_part1 + pack_words(rdna2.S_CODE_END_WORD, rdna2.S_CODE_END_WORD) + ps_part2 + pack_words(0, 0)
+        # Stage whose ISA alone is "unknown" (`s_nop` + `s_endpgm`) rescued via manifest
+        unk_bytes = pack_words(encode_s_nop(0), encode_s_nop(1), rdna2.S_ENDPGM_WORD, 0, 0)
+
+        vs_hash = rdna2.fnv1a_64(vs_bytes)
+        ps_hash = rdna2.fnv1a_64(ps_bytes)
+        unk_hash = rdna2.fnv1a_64(unk_bytes)
+        vs_stage_id = 0x1111222233334444
+        ps_stage_id = 0x5555666677778888
+        wrong_hint_hash = 0xDEADBEEFCAFE0001
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dump_dir = Path(tmp) / "pipeline_dump"
+            native_dir = dump_dir / "native"
+            dxil_dir = dump_dir / "dxil"
+            native_dir.mkdir(parents=True)
+            dxil_dir.mkdir(parents=True)
+
+            vs_rel = f"native/{rdna2.format_hash_64(vs_hash)}.bin"
+            ps_rel = f"native/{rdna2.format_hash_64(ps_hash)}.bin"
+            unk_rel = f"native/{rdna2.format_hash_64(wrong_hint_hash)}.bin"
+
+            (dump_dir / vs_rel).write_bytes(vs_bytes)
+            (dump_dir / ps_rel).write_bytes(ps_bytes)
+            (dump_dir / unk_rel).write_bytes(unk_bytes)
+            (native_dir / f"{rdna2.format_hash_64(vs_hash)}.meta").write_bytes(b"\x01\x02\x03\x04")
+            (dxil_dir / "0x0000000000000001.dxbc").write_bytes(b"DXBC" + b"\x00" * 28)
+
+            manifest = {
+                "schema": "playgta6-pipeline-dump",
+                "schema_version": 1,
+                "native_stages": [
+                    {
+                        "code_identity": rdna2.format_hash_64(vs_hash),
+                        "identity": rdna2.format_hash_64(vs_stage_id),
+                        "stage": "vertex",
+                        "layout": "A",
+                        "code_bytes": len(vs_bytes),
+                        "metadata_bytes": 4,
+                        "code_file": vs_rel,
+                        "metadata_file": f"native/{rdna2.format_hash_64(vs_hash)}.meta",
+                    },
+                    {
+                        "code_identity": rdna2.format_hash_64(ps_hash),
+                        "identity": rdna2.format_hash_64(ps_stage_id),
+                        "stage": "pixel",
+                        "layout": "A",
+                        "code_bytes": len(ps_bytes),
+                        "metadata_bytes": 0,
+                        "code_file": ps_rel,
+                        "metadata_file": f"native/{rdna2.format_hash_64(ps_hash)}.meta",
+                    },
+                    {
+                        "code_identity": rdna2.format_hash_64(wrong_hint_hash),
+                        "identity": rdna2.format_hash_64(wrong_hint_hash),
+                        "stage": "pixel",
+                        "layout": "B",
+                        "code_bytes": len(unk_bytes),
+                        "metadata_bytes": 0,
+                        "code_file": unk_rel,
+                        "metadata_file": f"native/{rdna2.format_hash_64(wrong_hint_hash)}.meta",
+                    },
+                ],
+                "dxil": [],
+                "root_signatures": [],
+                "pipelines": [],
+            }
+            (dump_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            # Scan entire dump directory via CLI --json
+            code, raw_json, err = _run_cli([str(dump_dir), "--json"])
+            self.assertEqual(code, 0, err)
+            data = json.loads(raw_json)
+            self.assertEqual(data["summary"]["total_shaders"], 3)
+            self.assertEqual(data["summary"]["stage_counts"], {"pixel": 2, "vertex": 1})
+
+            by_path = {f["path"]: f for f in data["files"]}
+            vs_hit = by_path[vs_rel]["shaders"][0]
+            self.assertEqual(vs_hit["hash"], rdna2.format_hash_64(vs_hash))
+            self.assertEqual(vs_hit["code_hash_fnv1a64"], rdna2.format_hash_64(vs_hash))
+            self.assertEqual(vs_hit["manifest_code_identity"], rdna2.format_hash_64(vs_hash))
+            self.assertEqual(vs_hit["manifest_identity"], rdna2.format_hash_64(vs_stage_id))
+            self.assertTrue(vs_hit["manifest_identity_matches"])
+            self.assertTrue(vs_hit["filename_hash_matches"])
+
+            ps_hit = by_path[ps_rel]["shaders"][0]
+            self.assertEqual(ps_hit["hash"], rdna2.format_hash_64(ps_hash))
+            self.assertEqual(ps_hit["stage"], "pixel")
+            self.assertEqual(ps_hit["terminator_count"], 2)
+            self.assertTrue(ps_hit["manifest_identity_matches"])
+
+            # Mismatched filename/manifest still hashes actual full bytes and flags mismatch!
+            unk_hit = by_path[unk_rel]["shaders"][0]
+            self.assertEqual(unk_hit["hash"], rdna2.format_hash_64(unk_hash))
+            self.assertEqual(unk_hit["stage"], "pixel")  # rescued from "unknown" via manifest
+            self.assertEqual(unk_hit["manifest_stage"], "pixel")
+            self.assertFalse(unk_hit["filename_hash_matches"])
+            self.assertFalse(unk_hit["manifest_identity_matches"])
+
+            # Single-file scan inside native/ automatically discovers ../manifest.json
+            single_res = rdna2.scan_file(dump_dir / ps_rel)
+            self.assertEqual(len(single_res.shaders), 1)
+            self.assertEqual(single_res.shaders[0].manifest_code_identity, ps_hash)
+            self.assertTrue(single_res.shaders[0].manifest_identity_matches)
+
+            # Strict sanitization: zero host paths in JSON
+            self.assertNotIn(str(Path(tmp).resolve()), raw_json)
+
+    def test_embedded_multi_shader_bundle_preserves_region_hashing(self) -> None:
+        vs = build_synthetic_vs()
+        ps = build_synthetic_ps()
+        cs = build_synthetic_cs()
+        bundle = vs + (b"\x00" * 16) + ps + (b"\x00" * 16) + cs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fpath = Path(tmp) / "embedded_bundle.bin"
+            fpath.write_bytes(bundle)
+            res = rdna2.scan_file(fpath)
+            self.assertEqual(res.hash_scope, "region")
+            self.assertEqual(len(res.shaders), 3)
+            self.assertEqual([s.stage for s in res.shaders], ["vertex", "pixel", "compute"])
+            self.assertEqual(
+                [s.fnv1a_64 for s in res.shaders],
+                [rdna2.fnv1a_64(vs), rdna2.fnv1a_64(ps), rdna2.fnv1a_64(cs)],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
