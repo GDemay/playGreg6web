@@ -6,8 +6,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1966,7 +1970,7 @@ struct RtFormats {
     uint32_t count;
 };
 
-std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode) {
+std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode, uint32_t topology_type = 3) {
     StreamBuilder s;
     s.add<uint64_t>(0, 8, scene.rs);
     const dg::GuestShaderBytecode vs{put_bytes(scene.vs_bytes.data(), scene.vs_bytes.size()), scene.vs_bytes.size()};
@@ -1997,7 +2001,7 @@ std::vector<uint8_t> graphics_stream(Scene& scene, uint32_t cull_mode) {
     e.SemanticName = put_bytes(kPosition, sizeof(kPosition));
     e.Format = 6;
     s.add(12, 8, dg::GuestInputLayoutDesc{put(e), 1});
-    s.add<uint32_t>(14, 4, 3);
+    s.add<uint32_t>(14, 4, topology_type);
     RtFormats f{};
     f.formats[0] = 87;
     f.count = 1;
@@ -2143,6 +2147,289 @@ void test_xbox_pipeline_streams_and_overrides() {
     scene.release_all({list, pso, derived, cpso, cpso57, cpso62, cpso62b, mpso});
 }
 
+std::vector<uint8_t> byte_pattern(size_t n, uint8_t seed);
+uint64_t put_aligned(const std::vector<uint8_t>& bytes, uint64_t alignment);
+
+// A DXBC container with only a HASH part (flags, 16-byte digest), enough for the join.
+std::vector<uint8_t> container_with_hash(const std::array<uint8_t, 16>& digest) {
+    std::vector<uint8_t> c(32 + 4 + 8 + 20, 0);
+    std::memcpy(c.data(), "DXBC", 4);
+    const uint32_t total = static_cast<uint32_t>(c.size()), parts = 1, part_offset = 36, part_size = 20;
+    std::memcpy(c.data() + 24, &total, 4);
+    std::memcpy(c.data() + 28, &parts, 4);
+    std::memcpy(c.data() + 32, &part_offset, 4);
+    std::memcpy(c.data() + 36, "HASH", 4);
+    std::memcpy(c.data() + 40, &part_size, 4);
+    std::memcpy(c.data() + 48, digest.data(), 16);  // after the u32 flags
+    return c;
+}
+
+// G37: with refuse_native_pipelines, slot 57 indexes the stages and fails; slot-86 pipelines built
+// from DXIL record the native stage each DXIL stage joins to (by the HASH digest in the metadata).
+void test_xbox_native_dxil_join() {
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    CHECK(options.refuse_native_pipelines);  // the default
+    dx::set_device_options(options);
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    namespace xb = dg::xbox;
+    using R = xb::NativeRange;
+
+    std::array<uint8_t, 16> vs_digest{}, ps_digest{}, other_digest{};
+    for (int i = 0; i < 16; ++i) {
+        vs_digest[i] = static_cast<uint8_t>(0x10 + i);
+        ps_digest[i] = static_cast<uint8_t>(0x80 + i);
+        other_digest[i] = static_cast<uint8_t>(0xC0 + i);
+    }
+    // Metadata with the digest at a candidate position (0x14 + 0x40 * k).
+    std::vector<uint8_t> vs_meta = byte_pattern(0x80, 4), ps_meta = byte_pattern(0xC0, 6);
+    std::memcpy(vs_meta.data() + xb::kNativeDigestFirst + xb::kNativeDigestStride, vs_digest.data(), 16);
+    std::memcpy(ps_meta.data() + xb::kNativeDigestFirst + 2 * xb::kNativeDigestStride, ps_digest.data(), 16);
+    const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+    const std::vector<uint8_t> vs_code = byte_pattern(0x140, 3), ps_code = byte_pattern(0x180, 5);
+    xb::GuestNativePipelineDesc d{};
+    d.pRootSignature = scene.rs;
+    auto set = [&](R r, const std::vector<uint8_t>& bytes, bool aligned) {
+        d.ranges[static_cast<size_t>(r)] = {aligned ? put_aligned(bytes, 256) : put_bytes(bytes.data(), bytes.size()),
+                                            bytes.size()};
+    };
+    set(R::Header, header, false);
+    set(R::PipelineMetadata, meta, false);
+    set(R::PixelCode, ps_code, true);
+    set(R::PixelMetadata, ps_meta, false);
+    set(R::VertexCode, vs_code, true);
+    set(R::VertexMetadata, vs_meta, false);
+
+    // Slot 57 fails (the title then uses slot 86) after indexing both stages.
+    CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(d))}, dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kENotImpl);
+    CHECK(counter(dev, xb::Counter::NativePipelineStatesRefused) == 1 && dev->native_index_size() == 2);
+    CHECK(counter(dev, xb::Counter::NativePipelineStates) == 0);
+
+    // A DXIL pipeline whose containers carry those digests joins both stages.
+    scene.vs_bytes = container_with_hash(vs_digest);
+    scene.ps_bytes = container_with_hash(ps_digest);
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream,
+                                   {I(put(xb::GuestPipelineStateStreamDesc{bytes.size(),
+                                                                           put_bytes(bytes.data(), bytes.size())}))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    const dg::GraphicsPsoSource* src = object_of<dg::PipelineState>(pso)->graphics_source();
+    CHECK(src != nullptr);
+    CHECK(src->native_vs.identity ==
+              dg::native_stage_identity(vs_code.data(), vs_code.size(), vs_meta.data(), vs_meta.size()) &&
+          src->native_vs.code_identity == dg::shader_identity(vs_code.data(), vs_code.size()) &&
+          src->native_vs.code_bytes == vs_code.size() && src->native_vs.metadata_bytes == vs_meta.size());
+    CHECK(src->native_ps.identity ==
+          dg::native_stage_identity(ps_code.data(), ps_code.size(), ps_meta.data(), ps_meta.size()));
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 2 && counter(dev, xb::Counter::DxilStagesNotJoined) == 0);
+    // A container whose digest no native stage carries stays unjoined.
+    scene.ps_bytes = container_with_hash(other_digest);
+    const std::vector<uint8_t> bytes2 = graphics_stream(scene, 3);
+    const uint64_t pso2 = fx.create(scene.device, XSlot::CreatePsoStream,
+                                    {I(put(xb::GuestPipelineStateStreamDesc{bytes2.size(),
+                                                                            put_bytes(bytes2.data(), bytes2.size())}))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && object_of<dg::PipelineState>(pso2)->graphics_source()->native_ps.identity == 0);
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 3 && counter(dev, xb::Counter::DxilStagesNotJoined) == 1);
+
+    // The skipped draw (no shader modules) names the joined native stages.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    scene.execute({list});
+    CHECK(contains(dev->skipped_draw_reports(), "VS joins native stage 320 B code + 128 B metadata"));
+    CHECK(contains(dev->skipped_draw_reports(), "PS joins native stage 384 B code + 192 B metadata"));
+
+    CHECK(t_balanced);
+    scene.release_all({list, pso, pso2});
+}
+
+std::string read_text_file(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+std::string id_hex(uint64_t v) {
+    char b[24];
+    std::snprintf(b, sizeof(b), "0x%016llx", static_cast<unsigned long long>(v));
+    return b;
+}
+
+// G37: pipeline dump (d3d12_xs_dump.h) from synthetic stages, containers and draws.
+void test_xbox_pipeline_dump() {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pg6-dump-test-" + std::to_string(std::rand()));
+    std::filesystem::remove_all(dir);
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.dump_dir = dir.string();
+        dx::set_device_options(options);
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->pipeline_dump() != nullptr);
+        int32_t result = -1;
+        namespace xb = dg::xbox;
+        using R = xb::NativeRange;
+
+        std::array<uint8_t, 16> vs_digest{}, ps_digest{};
+        for (int i = 0; i < 16; ++i) {
+            vs_digest[i] = static_cast<uint8_t>(0x21 + i);
+            ps_digest[i] = static_cast<uint8_t>(0x61 + i);
+        }
+        std::vector<uint8_t> vs_meta = byte_pattern(0x80, 7), ps_meta = byte_pattern(0x80, 8);
+        std::memcpy(vs_meta.data() + xb::kNativeDigestFirst, vs_digest.data(), 16);
+        std::memcpy(ps_meta.data() + xb::kNativeDigestFirst, ps_digest.data(), 16);
+        const std::vector<uint8_t> header = byte_pattern(0x184, 1), meta = byte_pattern(0x50, 2);
+        const std::vector<uint8_t> vs_code = byte_pattern(0x100, 3), ps_code = byte_pattern(0x200, 5);
+        xb::GuestNativePipelineDesc d{};
+        d.pRootSignature = scene.rs;
+        auto set = [&](R r, const std::vector<uint8_t>& bytes, bool aligned) {
+            d.ranges[static_cast<size_t>(r)] = {aligned ? put_aligned(bytes, 256) : put_bytes(bytes.data(), bytes.size()),
+                                                bytes.size()};
+        };
+        set(R::Header, header, false);
+        set(R::PipelineMetadata, meta, false);
+        set(R::PixelCode, ps_code, true);
+        set(R::PixelMetadata, ps_meta, false);
+        set(R::VertexCode, vs_code, true);
+        set(R::VertexMetadata, vs_meta, false);
+        CHECK(fx.create(scene.device, XSlot::CreateNativePso, {I(put(d))}, dg::IID_ID3D12PipelineState, &result) == 0);
+
+        scene.vs_bytes = container_with_hash(vs_digest);
+        scene.ps_bytes = container_with_hash(ps_digest);
+        const std::vector<uint8_t> bytes = graphics_stream(scene, 3);
+        const uint64_t stream = put(xb::GuestPipelineStateStreamDesc{bytes.size(), put_bytes(bytes.data(), bytes.size())});
+        const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+        const uint64_t pso_again = fx.create(scene.device, XSlot::CreatePsoStream, {I(stream)}, dg::IID_ID3D12PipelineState, &result);
+        const uint32_t index = pso != 0 ? object_of<dg::PipelineState>(pso)->dump_index() : dg::PipelineState::kNoDumpIndex;
+        CHECK(index != dg::PipelineState::kNoDumpIndex && pso_again != 0 &&
+              object_of<dg::PipelineState>(pso_again)->dump_index() == index);
+        const uint64_t list = scene.new_list();
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+        staged_set_pipeline_state(fx, fx.thread, list, pso);
+        fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+        fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        dev->flush_pipeline_dump();
+
+        // Files are named by the FNV-1a 64 of their bytes; the manifest lists them.
+        const uint64_t vs_code_id = dg::shader_identity(vs_code.data(), vs_code.size());
+        const uint64_t ps_code_id = dg::shader_identity(ps_code.data(), ps_code.size());
+        const std::string vs_bin = read_text_file(dir / "native" / (id_hex(vs_code_id) + ".bin"));
+        CHECK(vs_bin.size() == vs_code.size() && std::memcmp(vs_bin.data(), vs_code.data(), vs_code.size()) == 0);
+        CHECK(read_text_file(dir / "native" / (id_hex(ps_code_id) + ".meta")).size() == ps_meta.size());
+        const uint64_t vs_dxil = dg::shader_identity(scene.vs_bytes.data(), scene.vs_bytes.size());
+        const std::string dxbc = read_text_file(dir / "dxil" / (id_hex(vs_dxil) + ".dxbc"));
+        CHECK(dg::shader_identity(dxbc.data(), dxbc.size()) == vs_dxil);
+        const std::string m = read_text_file(dir / "manifest.json");
+        auto has = [&](const std::string& s) {
+            const bool found = m.find(s) != std::string::npos;
+            if (!found) {
+                std::fprintf(stderr, "manifest lacks: %s\n", s.c_str());
+            }
+            return found;
+        };
+        CHECK(has("\"schema\": \"playgta6-pipeline-dump\", \"schema_version\": 1"));
+        CHECK(has("{\"code_identity\": \"" + id_hex(vs_code_id) + "\", \"identity\": \"" +
+                  id_hex(dg::native_stage_identity(vs_code.data(), vs_code.size(), vs_meta.data(), vs_meta.size())) +
+                  "\", \"stage\": \"vertex\", \"layout\": \"A\", \"code_bytes\": 256, \"metadata_bytes\": 128"));
+        CHECK(has("\"stage\": \"pixel\""));
+        CHECK(has("\"vs\": {\"dxil_identity\": \"" + id_hex(vs_dxil) + "\", \"hash_digest\": \"2122232425262728292a2b2c2d2e2f30\", "
+                  "\"native_code_identity\": \"" + id_hex(vs_code_id) + "\""));
+        CHECK(has("{\"index\": " + std::to_string(index) + ", \"created\": 2, \"draws\": 2, "));
+        CHECK(has("\"rtv_formats\": [87]"));
+        CHECK(has("\"input_layout\": [{\"semantic\": \"POSITION\", \"index\": 0, \"format\": 6"));
+        CHECK(has("\"rasterizer\": {\"fill\": 3, \"cull\": 3"));
+        CHECK(has("\"root_signatures\": [\n {\"index\": 0, \"version\": \"1.1\""));
+        CHECK(has("\"root_signature\": 0"));
+
+        scene.release_all({list, pso, pso_again});
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// G37: Xbox rectangle lists (topology type 19 in streams, topology 17 on lists).
+void test_xbox_rect_lists() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+    const std::vector<uint8_t> bytes = graphics_stream(scene, 3, dg::xbox::kTopologyTypeRect);
+    const uint64_t pso = fx.create(scene.device, XSlot::CreatePsoStream,
+                                   {I(put(dg::xbox::GuestPipelineStateStreamDesc{bytes.size(),
+                                                                                 put_bytes(bytes.data(), bytes.size())}))},
+                                   dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && pso != 0);
+    auto* state = object_of<dg::PipelineState>(pso);
+    CHECK(state->resolved() && state->graphics_source() != nullptr && state->graphics_source()->rect_list);
+    CHECK(state->graphics_source()->desc.PrimitiveTopologyType == playgta6::gpu::pso::D3D12PrimitiveTopologyType::Triangle);
+    CHECK(counter(dev, dg::xbox::Counter::RectListPipelineStates) == 1);
+    // Another unknown topology type is still refused.
+    const std::vector<uint8_t> bad = graphics_stream(scene, 3, 18);
+    CHECK(fx.create(scene.device, XSlot::CreatePsoStream,
+                    {I(put(dg::xbox::GuestPipelineStateStreamDesc{bad.size(), put_bytes(bad.data(), bad.size())}))},
+                    dg::IID_ID3D12PipelineState, &result) == 0 &&
+          result == dg::kEInvalidArg);
+
+    // A rectangle-list draw becomes two triangles (v0 v1 v2, v2 v3 v0, v3 = v0 + v2 - v1) in a
+    // runtime-owned vertex buffer written at execute time; a triangle-list draw after it is emitted
+    // as it is; an indexed rectangle list is skipped and described.
+    const float verts[9] = {0.0f, 1.0f, 0.25f, 0.0f, 0.0f, 0.5f, 1.0f, 0.0f, 0.75f};
+    CHECK(com::write_guest(scene.vb_va, verts, sizeof(verts)));
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+    staged_set_pipeline_state(fx, fx.thread, list, pso);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+    fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(dg::xbox::kTopologyRectList)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    fx.vcall(list, Slot2::DrawIndexedInstanced, {I(3), I(1), I(0), I(0), I(0)});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+    CHECK(count_op(ps, GpuOpcode::Draw) == 2);
+    const Packet* first = find_op(ps, GpuOpcode::Draw, 0);
+    const Packet* second = find_op(ps, GpuOpcode::Draw, 1);
+    CHECK(first != nullptr && payload_as<GpuDrawPayload>(*first).vertex_count == 6 &&
+          payload_as<GpuDrawPayload>(*first).first_vertex == 0);
+    CHECK(second != nullptr && payload_as<GpuDrawPayload>(*second).vertex_count == 3);
+    bool expanded = false;
+    for (const Packet& p : ps) {
+        if (p.opcode != GpuOpcode::WriteBuffer || payload_as<GpuWriteBufferPayload>(p).data_len != 72) {
+            continue;
+        }
+        float got[18];
+        std::memcpy(got, p.payload.data() + sizeof(GpuWriteBufferPayload), sizeof(got));
+        const float want[18] = {0, 1, 0.25f, 0, 0, 0.5f, 1, 0, 0.75f, 1, 0, 0.75f, 1, 1, 0.5f, 0, 1, 0.25f};
+        expanded = std::memcmp(got, want, sizeof(want)) == 0;
+    }
+    CHECK(expanded);
+    CHECK(counter(dev, dg::xbox::Counter::RectListDrawsExpanded) == 1);
+    CHECK(counter(dev, dg::xbox::Counter::RectListDrawsSkipped) == 1 && dev->stats().skipped_draws == 1);
+    CHECK(contains(dev->skipped_draw_reports(), "indexed rectangle-list topology"));
+    CHECK(contains(dev->skipped_draw_reports(), "topology type 3 (rectangle list)"));
+    CHECK(t_balanced);
+    scene.release_all({list, pso});
+}
+
 // G32: console-native pipelines (Xbox slot 57). Synthetic records built from the range layout in
 // d3d12_xs_xbox.h; the bytes are arbitrary patterns.
 std::vector<uint8_t> byte_pattern(size_t n, uint8_t seed) {
@@ -2163,6 +2450,10 @@ uint64_t put_aligned(const std::vector<uint8_t>& bytes, uint64_t alignment = 256
 
 void test_xbox_native_pipelines() {
     Fixture fx;
+    dg::DeviceOptions options;  // native pipeline states (refuse_native_pipelines is on by default)
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.refuse_native_pipelines = false;
+    dx::set_device_options(options);
     Scene scene(fx);
     dg::Device* dev = host_device(scene.device);
     int32_t result = -1;
@@ -2515,6 +2806,9 @@ int main() {
     test_frame_pacer_unit();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();
+    test_xbox_rect_lists();
+    test_xbox_native_dxil_join();
+    test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
     if (g_failures != 0) {

@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import RuntimeSessionControllerDefault, {
+  BOOT_MODE,
+  DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_STATUS_URL,
   SESSION_MODE,
   SESSION_STATE,
@@ -1018,5 +1020,586 @@ test('W60 probeBrowserCapabilities reflects detectWasm64 across address: i64, le
       globalThis.WebAssembly = originalWebAssembly;
     }
   }
+});
+
+// --- W72: Split-Module Boot Mode, WebGPU Validation Errors & Splash Presentation Telemetry ---
+
+function createMockWorker() {
+  const listeners = new Map();
+  return {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      listeners.get(type)?.delete(fn);
+    },
+    emitMessage(data) {
+      for (const fn of [...(listeners.get('message') || [])]) {
+        fn({ type: 'message', data });
+      }
+    },
+    listenerCount(type) {
+      if (type) return listeners.get(type)?.size ?? 0;
+      let total = 0;
+      for (const set of listeners.values()) total += set.size;
+      return total;
+    },
+  };
+}
+
+function createExtendedMockHud() {
+  const base = createMockHud();
+  const bootStatuses = [];
+  const bootModes = [];
+  const validationErrors = [];
+  const splashFrames = [];
+  const telemetryEvents = [];
+  return {
+    ...base,
+    bootStatuses,
+    bootModes,
+    validationErrors,
+    splashFrames,
+    telemetryEvents,
+    updateBootStatus(status) {
+      bootStatuses.push(status);
+    },
+    setBootMode(bootMode, meta) {
+      bootModes.push({ bootMode, meta });
+    },
+    recordValidationError(ev) {
+      validationErrors.push(ev);
+    },
+    onSplashFramePresented(ev) {
+      splashFrames.push(ev);
+    },
+    updateTelemetry(ev) {
+      telemetryEvents.push(ev);
+    },
+  };
+}
+
+test('W72 exports, defaults, and option/listener validation for telemetry & split-module APIs', () => {
+  assert.deepEqual(BOOT_MODE, {
+    IDLE: 'idle',
+    REAL_WASM64: 'real-wasm64',
+    SMOKE: 'smoke',
+  });
+  assert.equal(DEFAULT_MAX_VALIDATION_ERRORS, 32);
+
+  const controller = new RuntimeSessionController({ fetchImpl: null });
+  assert.equal(controller.getBootMode(), BOOT_MODE.IDLE);
+  assert.deepEqual(controller.getSideModuleMetadata(), {
+    sideModuleCount: 0,
+    sideModuleUrls: [],
+  });
+  assert.equal(controller.getValidationErrorCount(), 0);
+  assert.deepEqual(controller.getValidationErrors(), []);
+  assert.deepEqual(controller.getSplashStats(), {
+    framesPresented: 0,
+    errorCount: 0,
+    firstPresented: false,
+    lastFrame: null,
+  });
+
+  const snap = controller.getSnapshot();
+  assert.equal(snap.bootMode, 'idle');
+  assert.equal(snap.sideModuleCount, 0);
+  assert.deepEqual(snap.sideModuleUrls, []);
+  assert.equal(snap.validationErrorCount, 0);
+  assert.equal(snap.validationErrorHistorySize, 0);
+  assert.deepEqual(snap.recentValidationErrors, []);
+  assert.equal(snap.splashFramesPresented, 0);
+  assert.equal(snap.splashFrameErrorCount, 0);
+  assert.equal(snap.firstSplashPresented, false);
+  assert.equal(snap.lastSplashFrame, null);
+
+  assert.throws(() => new RuntimeSessionController({ maxValidationErrors: 0 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxValidationErrors: -5 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxValidationErrors: 1.5 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ wgpuWorker: {} }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onStatusUpdate: 123 }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onTelemetry: 'bad' }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onValidationError: {} }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onSplashFrame: true }), TypeError);
+
+  assert.throws(() => controller.onStatusUpdate('nope'), TypeError);
+  assert.throws(() => controller.onTelemetry(null), TypeError);
+  assert.throws(() => controller.onValidationError(42), TypeError);
+  assert.throws(() => controller.onSplashFrame({}), TypeError);
+  assert.throws(() => controller.attachWorker(null), TypeError);
+  assert.throws(() => controller.attachWorker({}), TypeError);
+});
+
+test('W72 tracks bootMode (idle -> real-wasm64 -> smoke -> idle) and sanitizes split-module metadata from /api/status', async () => {
+  const hud = createExtendedMockHud();
+  const statusUpdates = [];
+  const stateEvents = [];
+  let capturedLaunchCtx = null;
+
+  const fetchImpl = createMockFetch(
+    readyStatus({
+      hasWasmBinary: true,
+      bootMode: 'real-wasm64',
+      sideModuleCount: 5,
+      sideModuleUrls: [
+        '/dist/guest_part_0.wasm',
+        '/dist/guest_part_1.wasm',
+        '/dist/guest_part_0.wasm', // duplicate
+        '../escape/evil.wasm',
+        'C:\\Users\\alice\\secret.wasm',
+        '/Users/alice/secret.wasm',
+        'file:///etc/passwd.wasm',
+        'javascript:alert(1).wasm',
+        '/dist/not_a_wasm.js',
+        'https://localhost:8000/dist/guest_part_2.wasm',
+      ],
+    })
+  );
+
+  const controller = new RuntimeSessionController({
+    fetchImpl,
+    hud,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async (ctx) => {
+      capturedLaunchCtx = ctx;
+      return { stop() {} };
+    },
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const unsubStatus = controller.onStatusUpdate((ev) => statusUpdates.push(ev));
+  controller.onStateChange((ev) => stateEvents.push(ev));
+
+  assert.equal(controller.getBootMode(), 'idle');
+
+  const res = await controller.start();
+  assert.equal(res.ok, true);
+  assert.equal(res.bootMode, 'real-wasm64');
+  assert.equal(controller.getBootMode(), 'real-wasm64');
+
+  const expectedSideUrls = [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+    'https://localhost:8000/dist/guest_part_2.wasm',
+  ];
+  assert.equal(res.sideModuleCount, 3);
+  assert.deepEqual(res.sideModuleUrls, expectedSideUrls);
+  assert.deepEqual(controller.getSideModuleMetadata(), {
+    sideModuleCount: 3,
+    sideModuleUrls: expectedSideUrls,
+  });
+
+  // Launch context receives sanitized split-module metadata and callbacks.
+  assert.equal(capturedLaunchCtx.bootMode, 'real-wasm64');
+  assert.equal(capturedLaunchCtx.sideModuleCount, 3);
+  assert.deepEqual(capturedLaunchCtx.sideModuleUrls, expectedSideUrls);
+  assert.equal(typeof capturedLaunchCtx.onBootLifecycle, 'function');
+  assert.equal(typeof capturedLaunchCtx.onWorkerMessage, 'function');
+  assert.equal(typeof capturedLaunchCtx.onValidationError, 'function');
+  assert.equal(typeof capturedLaunchCtx.onSplashFramePresented, 'function');
+
+  // Diagnostics & snapshot reflect bootMode and side-module metadata without leaking mutations.
+  const diag = controller.getDiagnostics();
+  assert.equal(diag.bootMode, 'real-wasm64');
+  assert.equal(diag.sideModuleCount, 3);
+  assert.deepEqual(diag.sideModuleUrls, expectedSideUrls);
+  assert.equal(diag.serverStatus.sideModuleCount, 3);
+  assert.deepEqual(diag.serverStatus.sideModuleUrls, expectedSideUrls);
+  diag.sideModuleUrls.push('/dist/mutated.wasm');
+  assert.equal(controller.getSideModuleMetadata().sideModuleUrls.length, 3);
+
+  // HUD and status/state listeners received bootMode + side-module info.
+  assert.ok(hud.bootStatuses.some((s) => s.bootMode === 'real-wasm64' && s.sideModuleCount === 3));
+  assert.ok(hud.bootModes.some((m) => m.bootMode === 'real-wasm64' && m.meta.sideModuleCount === 3));
+  assert.ok(hud.logs.some((l) => /Split-module Wasm64 layout detected \(3 side modules\)/i.test(l.message)));
+  assert.ok(statusUpdates.some((u) => u.bootMode === 'real-wasm64' && u.sideModuleCount === 3));
+  assert.equal(stateEvents[stateEvents.length - 1].bootMode, 'real-wasm64');
+  assert.equal(stateEvents[stateEvents.length - 1].sideModuleCount, 3);
+
+  // Restart into smoke demo updates bootMode to 'smoke'.
+  const smokeRes = await controller.restart({ preferSmoke: true });
+  assert.equal(smokeRes.ok, true);
+  assert.equal(smokeRes.bootMode, 'smoke');
+  assert.equal(controller.getBootMode(), 'smoke');
+  assert.equal(controller.getSnapshot().bootMode, 'smoke');
+
+  // Stop resets bootMode to 'idle'.
+  unsubStatus();
+  const countBeforeStop = statusUpdates.length;
+  const stopRes = await controller.stop();
+  assert.equal(stopRes.bootMode, 'idle');
+  assert.equal(controller.getBootMode(), 'idle');
+  assert.equal(statusUpdates.length, countBeforeStop);
+});
+
+test('W72 supports summary-only sideModuleCount and dynamic boot lifecycle callbacks', async () => {
+  const statusUpdates = [];
+  const fetchImpl = createMockFetch(
+    readyStatus({
+      hasWasmBinary: true,
+      sideModuleCount: 4,
+    })
+  );
+
+  const controller = new RuntimeSessionController({
+    fetchImpl,
+    capabilityProbe: () => fullCapabilities(),
+    onStatusUpdate: (ev) => statusUpdates.push(ev),
+    startWasmRuntime: async (ctx) => {
+      // Preflight count from /api/status is preserved even without explicit URLs.
+      assert.equal(ctx.sideModuleCount, 4);
+      assert.deepEqual(ctx.sideModuleUrls, []);
+
+      // Boot lifecycle callback discovers actual side-module URLs during startup.
+      ctx.onBootLifecycle({
+        bootMode: 'wasm-guest', // alias normalized to 'real-wasm64'
+        sideModuleUrls: ['/dist/guest_part_0.wasm', '/dist/guest_part_1.wasm'],
+        stage: 'side-modules-discovered',
+      });
+      return { stop() {} };
+    },
+  });
+
+  const res = await controller.start();
+  assert.equal(res.ok, true);
+  assert.equal(res.bootMode, 'real-wasm64');
+  assert.equal(res.sideModuleCount, 2);
+  assert.deepEqual(res.sideModuleUrls, ['/dist/guest_part_0.wasm', '/dist/guest_part_1.wasm']);
+
+  // Direct notifyBootLifecycle updates & normalizes aliases without throwing on bad inputs.
+  const updated = controller.notifyBootLifecycle({
+    bootMode: 'smoke-demo',
+    sideModuleCount: 0,
+    sideModuleUrls: [],
+    reason: 'fallback-triggered',
+  });
+  assert.equal(updated.bootMode, 'smoke');
+  assert.equal(updated.sideModuleCount, 0);
+  assert.deepEqual(updated.sideModuleUrls, []);
+  assert.equal(controller.getBootMode(), 'smoke');
+
+  assert.doesNotThrow(() => controller.notifyBootLifecycle(null));
+  assert.doesNotThrow(() => controller.notifyBootLifecycle('invalid'));
+  assert.ok(statusUpdates.some((u) => u.reason === 'side-modules-discovered'));
+  assert.ok(statusUpdates.some((u) => u.reason === 'fallback-triggered'));
+
+  await controller.stop();
+});
+
+test('W72 handles gpu-validation-error messages with sanitization, bounded history, counters, and CrashReporter/HUD forwarding', async () => {
+  const clock = createClock(10_000);
+  const hud = createExtendedMockHud();
+  const reported = [];
+  const crashReporter = {
+    captureError(err, ctx) {
+      reported.push({ message: err.message, ctx });
+    },
+  };
+  const validationEvents = [];
+  const telemetryEvents = [];
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    crashReporter,
+    now: clock.now,
+    maxValidationErrors: 3,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  const unsubVal = controller.onValidationError((ev) => validationEvents.push(ev));
+  const unsubTel = controller.onTelemetry((ev) => telemetryEvents.push(ev));
+
+  await controller.start();
+
+  // 1. G35 WgpuSwapchain-shaped nested error with host paths & embedded byte dump.
+  const hexBlob = 'ab'.repeat(32);
+  const r1 = controller.handleWorkerMessage({
+    data: {
+      type: 'gpu-validation-error',
+      source: 'wgpu_swapchain',
+      error: {
+        seq: 1,
+        type: 'validation',
+        message: `Shader compile error in C:\\Users\\alice\\gta6\\shader.wgsl and /Users/alice/work/dump.bin payload=${hexBlob}\nnext line`,
+        timestampMs: 10_050,
+      },
+    },
+  });
+  assert.equal(r1.handled, true);
+  assert.equal(r1.validationErrorCount, 1);
+  assert.equal(r1.validationErrorHistorySize, 1);
+  assert.equal(r1.record.type, 'validation');
+  assert.equal(r1.record.workerSeq, 1);
+  assert.doesNotMatch(r1.record.message, /alice|C:\\|\/Users|abababab/);
+  assert.match(r1.record.message, /<path>/);
+  assert.match(r1.record.message, /<buffer>/);
+
+  // 2. Out-of-memory flat message format.
+  clock.advance(100);
+  const r2 = controller.handleWorkerMessage({
+    type: 'gpu-validation-error',
+    errorType: 'out-of-memory',
+    message: 'GPUOutOfMemoryError allocating 256MB texture at file:///home/dev/app.js',
+  });
+  assert.equal(r2.handled, true);
+  assert.equal(r2.record.type, 'out-of-memory');
+  assert.doesNotMatch(r2.record.message, /\/home\/dev/);
+
+  // 3. Internal error with oversized message (>512 chars) is truncated.
+  clock.advance(100);
+  const longMsg = `Internal driver fault: ${'bind-group mismatch detail; '.repeat(30)}`;
+  const r3 = controller.handleWorkerMessage({
+    type: 'gpu-validation-error',
+    error: { type: 'internal', message: longMsg },
+  });
+  assert.equal(r3.record.type, 'internal');
+  assert.equal(r3.record.message.length, 512);
+  assert.ok(r3.record.message.endsWith('...'));
+
+  // 4. Fourth error evicts oldest from bounded history (maxValidationErrors = 3),
+  //    while total validationErrorCount remains monotonic (4).
+  clock.advance(100);
+  controller.handleWorkerMessage({
+    type: 'gpu-validation-error',
+    message: 'Bind group layout mismatch at binding 2',
+  });
+
+  assert.equal(controller.getValidationErrorCount(), 4);
+  const history = controller.getValidationErrors();
+  assert.equal(history.length, 3);
+  assert.deepEqual(
+    history.map((e) => e.seq),
+    [2, 3, 4]
+  );
+  assert.equal(history[2].type, 'validation');
+  assert.equal(history[2].message, 'Bind group layout mismatch at binding 2');
+
+  // Snapshot & diagnostics expose counts and bounded history cleanly.
+  const diag = controller.getDiagnostics();
+  assert.equal(diag.validationErrorCount, 4);
+  assert.equal(diag.validationErrorHistorySize, 3);
+  assert.equal(diag.recentValidationErrors.length, 3);
+
+  // HUD, CrashReporter, and listeners all received sanitized events.
+  assert.equal(hud.validationErrors.length, 4);
+  assert.equal(validationEvents.length, 4);
+  assert.equal(
+    telemetryEvents.filter((e) => e.type === 'gpu-validation-error').length,
+    4
+  );
+  assert.equal(reported.length, 4);
+  assert.equal(reported[1].ctx.category, 'webgpu_validation');
+  assert.equal(reported[1].ctx.errorType, 'out-of-memory');
+  assert.equal(reported[1].ctx.bootMode, 'real-wasm64');
+
+  // clearValidationErrors clears history buffer but preserves cumulative count.
+  controller.clearValidationErrors();
+  assert.equal(controller.getValidationErrors().length, 0);
+  assert.equal(controller.getValidationErrorCount(), 4);
+
+  unsubVal();
+  unsubTel();
+  await controller.stop();
+});
+
+test('W72 handles splash-frame-presented messages (success, firstPresent, and failure) from wgpu_worker.js', async () => {
+  const clock = createClock(20_000);
+  const hud = createExtendedMockHud();
+  const splashEvents = [];
+  const telemetryEvents = [];
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  controller.onSplashFrame((ev) => splashEvents.push(ev));
+  controller.onTelemetry((ev) => telemetryEvents.push(ev));
+
+  await controller.start();
+
+  // First presented splash frame.
+  const s1 = controller.handleWorkerMessage({
+    data: {
+      type: 'splash-frame-presented',
+      frameIndex: 0,
+      framesPresented: 1,
+      ok: true,
+      firstPresent: true,
+    },
+  });
+  assert.equal(s1.handled, true);
+  assert.equal(s1.splashFramesPresented, 1);
+  assert.equal(s1.firstSplashPresented, true);
+  assert.equal(s1.record.ok, true);
+  assert.equal(s1.record.frameIndex, 0);
+  assert.equal(s1.record.firstPresent, true);
+
+  // Subsequent presented splash frame.
+  clock.advance(33);
+  const s2 = controller.handleWorkerMessage({
+    type: 'splash-frame-presented',
+    frameIndex: 1,
+    framesPresented: 2,
+    ok: true,
+  });
+  assert.equal(s2.handled, true);
+  assert.equal(s2.splashFramesPresented, 2);
+  assert.equal(s2.record.firstPresent, false);
+
+  // Failed splash presentation (e.g. WebGPU device not ready yet) sanitizes error & counts failure separately.
+  clock.advance(33);
+  const s3 = controller.handleWorkerMessage({
+    type: 'splash-frame-presented',
+    frameIndex: 2,
+    framesPresented: 2,
+    ok: false,
+    reason: 'device-not-ready',
+    error: 'WebGPU device not ready at C:\\Users\\bob\\worker.js',
+  });
+  assert.equal(s3.handled, true);
+  assert.equal(s3.splashFramesPresented, 2);
+  assert.equal(s3.splashFrameErrorCount, 1);
+  assert.equal(s3.record.ok, false);
+  assert.doesNotMatch(s3.record.error, /bob|C:\\/);
+  assert.match(s3.record.error, /<path>/);
+
+  const stats = controller.getSplashStats();
+  assert.equal(stats.framesPresented, 2);
+  assert.equal(stats.errorCount, 1);
+  assert.equal(stats.firstPresented, true);
+  assert.equal(stats.lastFrame.frameIndex, 2);
+  assert.equal(stats.lastFrame.ok, false);
+
+  const diag = controller.getDiagnostics();
+  assert.equal(diag.splashFramesPresented, 2);
+  assert.equal(diag.splashFrameErrorCount, 1);
+  assert.equal(diag.firstSplashPresented, true);
+
+  assert.equal(hud.splashFrames.length, 3);
+  assert.equal(splashEvents.length, 3);
+  assert.equal(
+    telemetryEvents.filter((e) => e.type === 'splash-frame-presented').length,
+    3
+  );
+  assert.ok(hud.logs.some((l) => l.level === 'ok' && /First splash frame presented/i.test(l.message)));
+  assert.ok(hud.logs.some((l) => l.level === 'warn' && /Splash frame presentation warning/i.test(l.message)));
+
+  await controller.stop();
+});
+
+test('W72 attaches/detaches wgpuWorker without listener leaks across restart and isolates throwing observers', async () => {
+  const worker = createMockWorker();
+  const throwingHud = {
+    setStatus() {
+      throw new Error('HUD setStatus boom');
+    },
+    appendLog() {
+      throw new Error('HUD appendLog boom');
+    },
+    updateBootStatus() {
+      throw new Error('HUD updateBootStatus boom');
+    },
+    setBootMode() {
+      throw new Error('HUD setBootMode boom');
+    },
+    recordValidationError() {
+      throw new Error('HUD recordValidationError boom');
+    },
+    onSplashFramePresented() {
+      throw new Error('HUD onSplashFramePresented boom');
+    },
+    updateTelemetry() {
+      throw new Error('HUD updateTelemetry boom');
+    },
+  };
+  const throwingCrashReporter = {
+    captureError() {
+      throw new Error('CrashReporter boom');
+    },
+  };
+
+  let receivedByGoodListener = 0;
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud: throwingHud,
+    crashReporter: throwingCrashReporter,
+    wgpuWorker: worker,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  controller.onStatusUpdate(() => {
+    throw new Error('status observer boom');
+  });
+  controller.onValidationError(() => {
+    throw new Error('validation observer boom');
+  });
+  controller.onSplashFrame(() => {
+    throw new Error('splash observer boom');
+  });
+  controller.onTelemetry(() => {
+    throw new Error('telemetry observer boom');
+  });
+  controller.onTelemetry(() => {
+    receivedByGoodListener += 1;
+  });
+
+  await controller.start();
+  assert.equal(worker.listenerCount('message'), 1);
+
+  // Duplicate attachWorker is idempotent (no duplicate listener).
+  const detach = controller.attachWorker(worker);
+  assert.equal(worker.listenerCount('message'), 1);
+
+  // Worker messages flow in cleanly and throwing observers never break delivery.
+  assert.doesNotThrow(() => {
+    worker.emitMessage({
+      type: 'gpu-validation-error',
+      error: { type: 'validation', message: 'Invalid texture view' },
+    });
+    worker.emitMessage({
+      type: 'splash-frame-presented',
+      frameIndex: 0,
+      framesPresented: 1,
+      ok: true,
+      firstPresent: true,
+    });
+    worker.emitMessage({ type: 'unrelated-worker-event', foo: 1 });
+    worker.emitMessage(null);
+  });
+
+  assert.equal(controller.getValidationErrorCount(), 1);
+  assert.equal(controller.getSplashStats().framesPresented, 1);
+  assert.ok(receivedByGoodListener >= 2);
+
+  // Unknown/malformed handleWorkerMessage inputs return handled: false without throwing.
+  assert.deepEqual(controller.handleWorkerMessage(null), { handled: false, type: null });
+  assert.deepEqual(controller.handleWorkerMessage(123), { handled: false, type: null });
+  assert.deepEqual(controller.handleWorkerMessage({ type: 'gpu-telemetry' }), {
+    handled: false,
+    type: 'gpu-telemetry',
+  });
+
+  // Restart resets per-session counters and re-attaches wgpuWorker with exactly 1 listener.
+  await controller.restart();
+  assert.equal(worker.listenerCount('message'), 1);
+  assert.equal(controller.getValidationErrorCount(), 0);
+  assert.equal(controller.getValidationErrors().length, 0);
+  assert.equal(controller.getSplashStats().framesPresented, 0);
+
+  // Detach & stop leave zero worker listeners.
+  detach();
+  detach(); // idempotent
+  await controller.stop();
+  assert.equal(worker.listenerCount('message'), 0);
 });
 
