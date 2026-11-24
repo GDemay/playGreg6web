@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -8,7 +8,8 @@ translation units, or a multi-module `playgta6-recomp build-program` (R12) tree 
 C/C++ units), and links with `libplaygta6_core.a` into `web/dist/runtime.js` +
 `web/dist/runtime.wasm` (optionally splitting `.ll` shards and `functions.ll`
 registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC`,
-`-sMAIN_MODULE=1`, filtered whole-archive, and runtime `Module.dynamicLibraries` loading).
+`-sMAIN_MODULE=1`, filtered whole-archive, runtime `Module.dynamicLibraries` loading,
+and post-link V8-cage GC + throttled pthread `CMD_LOAD` JS optimization).
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -22,6 +23,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
         [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
+        [--proxy-to-pthread] [--max-concurrent-pthread-loads N]
         [--node-max-old-space-mb MB] [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
@@ -157,6 +159,9 @@ SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
 DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB = 16384
+PROXY_TO_PTHREAD_FLAG = "-sPROXY_TO_PTHREAD=1"
+DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2
+SPLIT_PTHREAD_OPT_MARKER = "/* __playgta6_split_pthread_opt_v1__ */"
 
 VERIFY_FLAGS: tuple[str, ...] = (
     "--require-memory64",
@@ -351,6 +356,9 @@ class BuildReport:
     split_modules: int = 1
     side_modules: list[SideModuleResult] = field(default_factory=list)
     node_max_old_space_mb: int | None = None
+    proxy_to_pthread: bool = False
+    max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS
+    split_runtime_js_patches: dict[str, bool] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -370,6 +378,13 @@ class BuildReport:
             "split_modules": self.split_modules,
             "side_modules": [m.to_dict() for m in self.side_modules],
             "node_max_old_space_mb": self.node_max_old_space_mb,
+            "proxy_to_pthread": self.proxy_to_pthread,
+            "max_concurrent_pthread_loads": self.max_concurrent_pthread_loads,
+            "split_runtime_js_patches": (
+                dict(self.split_runtime_js_patches)
+                if self.split_runtime_js_patches is not None
+                else None
+            ),
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -684,6 +699,15 @@ def parse_node_max_old_space_mb(raw: int | None) -> int | None:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise BuildGuestWasmError(
             f"invalid --node-max-old-space-mb {raw!r}; expected an integer >= 1"
+        )
+    return raw
+
+
+def parse_max_concurrent_pthread_loads(raw: int) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise BuildGuestWasmError(
+            f"invalid --max-concurrent-pthread-loads {raw!r}; "
+            "expected an integer >= 0 (0 disables throttling)"
         )
     return raw
 
@@ -1251,6 +1275,7 @@ def resolve_link_flags(
     assertions: int | None = None,
     browser_boot_exports: bool = False,
     main_module: bool = False,
+    proxy_to_pthread: bool = False,
 ) -> tuple[str, ...]:
     """Compute effective linker flags for em++ from defaults and build options."""
     if pthread_pool_size is not None:
@@ -1338,6 +1363,9 @@ def resolve_link_flags(
         assertions_flag = f"{ASSERTIONS_PREFIX}{assertions_val}"
         if assertions_flag not in flags:
             flags.append(assertions_flag)
+
+    if proxy_to_pthread and PROXY_TO_PTHREAD_FLAG not in flags:
+        flags.append(PROXY_TO_PTHREAD_FLAG)
 
     for extra in extra_link_flags:
         if extra:
@@ -1477,6 +1505,7 @@ def build_link_argv(
     browser_boot_exports: bool = False,
     main_module: bool = False,
     whole_archive_libs: bool = False,
+    proxy_to_pthread: bool = False,
 ) -> tuple[str, ...]:
     if link_flags is None:
         effective_flags = resolve_link_flags(
@@ -1491,6 +1520,7 @@ def build_link_argv(
             assertions=assertions,
             browser_boot_exports=browser_boot_exports,
             main_module=main_module,
+            proxy_to_pthread=proxy_to_pthread,
         )
     else:
         effective_flags = (*link_flags, *extra_flags)
@@ -1509,6 +1539,340 @@ def build_link_argv(
     argv.extend(str(path) for path in side_modules)
     argv.extend(["-o", str(output_js)])
     return tuple(argv)
+
+
+# ---------------------------------------------------------------------------
+# Split-module JS post-link optimizer (R33)
+# ---------------------------------------------------------------------------
+
+_STUB_CREATOR_RE = re.compile(
+    r"(?P<prefix>if\s*\(\s*!\s*\(\s*(?P<prop>[A-Za-z_$][\w$]*)\s+in\s+(?P<stubs>[A-Za-z_$][\w$]*)\s*\)\s*\)\s*\{\s*"
+    r"(?:var|let)\s+(?P<resolved>[A-Za-z_$][\w$]*)\s*;\s*)"
+    r"(?P<stub_assign>(?P=stubs)\s*\[\s*(?P=prop)\s*\]\s*=\s*\(\s*\.\.\.(?P<args>[A-Za-z_$][\w$]*)\s*\)\s*=>\s*\{\s*"
+    r"(?P=resolved)\s*\|\|=\s*(?P<resolve_fn>[A-Za-z_$][\w$]*)\s*\(\s*(?P=prop)\s*\)\s*;\s*"
+    r"return\s+(?P=resolved)\s*\(\s*\.\.\.(?P=args)\s*\)\s*;?\s*\}\s*;?)"
+)
+
+_MODULE_EXPORTS_DECL_RE = re.compile(r"\b((?:var|let)\s+moduleExports\s*;)")
+
+_AWAIT_LOAD_DYLIBS_RE = re.compile(r"\bawait\s+loadDylibs\s*\(\s*\)\s*;")
+
+_WORKER_POST_MESSAGE_OBJ_RE = re.compile(
+    r"(?P<worker>[A-Za-z_$][\w$]*)\s*\.\s*postMessage\s*\(\s*\{"
+)
+
+_CMD_LOAD_PROP_RE = re.compile(
+    r"(?:^|[{,\s])(?:['\"])?cmd(?:['\"])?\s*:\s*(?:CMD_LOAD|['\"]load['\"])(?=\s*[,}])"
+)
+
+_CASE_CMD_LOADED_RE = re.compile(r"(\bcase\s+(?:CMD_LOADED|['\"]loaded['\"])\s*:)")
+
+_IF_CMD_LOADED_RE = re.compile(
+    r"(\bif\s*\(\s*(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*===?\s*"
+    r"(?:CMD_LOADED|['\"]loaded['\"])\s*\)\s*\{)"
+)
+
+
+def _find_balanced_call_end(js_text: str, open_paren_idx: int) -> int | None:
+    """Return index of the matching `)` for `js_text[open_paren_idx] == '('`."""
+    n = len(js_text)
+    if open_paren_idx < 0 or open_paren_idx >= n or js_text[open_paren_idx] != "(":
+        return None
+    depth = 0
+    idx = open_paren_idx
+    quote: str | None = None
+    while idx < n:
+        ch = js_text[idx]
+        if quote is not None:
+            if ch == "\\" and idx + 1 < n:
+                idx += 2
+                continue
+            if ch == quote:
+                quote = None
+            idx += 1
+            continue
+        if ch == "/" and idx + 1 < n:
+            nxt = js_text[idx + 1]
+            if nxt == "/":
+                nl = js_text.find("\n", idx + 2)
+                if nl == -1:
+                    return None
+                idx = nl + 1
+                continue
+            if nxt == "*":
+                end_comment = js_text.find("*/", idx + 2)
+                if end_comment == -1:
+                    return None
+                idx = end_comment + 2
+                continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            idx += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+        idx += 1
+    return None
+
+
+def _patch_pthread_cmd_load_throttle(
+    js_text: str,
+    *,
+    max_concurrent: int,
+) -> tuple[str, bool, bool]:
+    """Atomically patch `CMD_LOAD` throttling + `CMD_LOADED` queue dispatch.
+
+    Returns `(updated_js, throttle_applied, dispatch_applied)`. If either site is
+    missing, both edits are skipped so queued workers can never deadlock.
+    """
+    load_span: tuple[int, int, str, str] | None = None
+    for match in _WORKER_POST_MESSAGE_OBJ_RE.finditer(js_text):
+        open_paren = js_text.find("(", match.start())
+        close_paren = _find_balanced_call_end(js_text, open_paren)
+        if close_paren is None:
+            continue
+        args_text = js_text[open_paren + 1 : close_paren]
+        if not _CMD_LOAD_PROP_RE.search(args_text):
+            continue
+        end_idx = close_paren + 1
+        while end_idx < len(js_text) and js_text[end_idx] in " \t":
+            end_idx += 1
+        if end_idx < len(js_text) and js_text[end_idx] == ";":
+            end_idx += 1
+        else:
+            end_idx = close_paren + 1
+        load_span = (match.start(), end_idx, match.group("worker"), args_text)
+        break
+
+    if load_span is None:
+        return js_text, False, False
+
+    loaded_re: re.Pattern[str] | None = None
+    if _CASE_CMD_LOADED_RE.search(js_text) is not None:
+        loaded_re = _CASE_CMD_LOADED_RE
+    elif _IF_CMD_LOADED_RE.search(js_text) is not None:
+        loaded_re = _IF_CMD_LOADED_RE
+    if loaded_re is None:
+        return js_text, False, False
+
+    start_idx, end_idx, worker_var, args_text = load_span
+    throttled_block = (
+        "{ (() => {"
+        f" var _w = {worker_var};"
+        f" var _loadArgs = [{args_text}];"
+        f" var _maxLoads = {max_concurrent};"
+        " PThread._loadQueue ||= [];"
+        " PThread._activeLoads ||= 0;"
+        " PThread._dispatchCmdLoad ||= () => {"
+        " while (PThread._activeLoads < _maxLoads && PThread._loadQueue.length > 0) {"
+        " var _next = PThread._loadQueue.shift();"
+        " PThread._activeLoads++;"
+        " _next();"
+        " }"
+        " };"
+        " var _hasOwnPost = Object.prototype.hasOwnProperty.call(_w, 'postMessage');"
+        " var _origPost = _w.postMessage;"
+        " var _pending = [];"
+        " var _dispatched = false;"
+        " var _sendLoad = () => {"
+        " if (_dispatched) return;"
+        " _dispatched = true;"
+        " if (_hasOwnPost) { _w.postMessage = _origPost; } else { delete _w.postMessage; }"
+        " _origPost.apply(_w, _loadArgs);"
+        " for (var _i = 0; _i < _pending.length; _i++) { _origPost.apply(_w, _pending[_i]); }"
+        " _pending.length = 0;"
+        " };"
+        " _w.postMessage = (..._a) => {"
+        " if (_dispatched) return _origPost.apply(_w, _a);"
+        " _pending.push(_a);"
+        " };"
+        " PThread._loadQueue.push(_sendLoad);"
+        " PThread._dispatchCmdLoad();"
+        " })(); }"
+    )
+    updated = js_text[:start_idx] + throttled_block + js_text[end_idx:]
+
+    loaded_hook = (
+        " if (typeof PThread !== 'undefined' && PThread) {"
+        " if (PThread._activeLoads > 0) PThread._activeLoads--;"
+        " if (typeof PThread._dispatchCmdLoad === 'function') PThread._dispatchCmdLoad();"
+        " }"
+    )
+    updated, dispatch_count = loaded_re.subn(
+        lambda m: f"{m.group(1)}{loaded_hook}",
+        updated,
+        count=1,
+    )
+    if dispatch_count == 0:
+        return js_text, False, False
+    return updated, True, True
+
+
+def optimize_split_runtime_js(
+    js_text: str,
+    *,
+    max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+) -> tuple[str, dict[str, bool]]:
+    """Apply idempotent R33 V8-cage GC & throttled pthread `CMD_LOAD` patches to split `runtime.js`.
+
+    Patch 1 (V8 4 GiB pointer-compression cage cleanup):
+      - Registers eager cross-shard stub binders inside `instantiateModule`'s `proxyHandler`
+        (`globalThis.__pg6StubBinders`).
+      - Registers `moduleExports`/`localScope` clearers right after `var moduleExports;`
+        (`globalThis.__pg6ExportClearers`).
+      - Immediately after `await loadDylibs();`, binds all lazy stubs, clears `moduleExports`
+        and `localScope`, empties `LDSO.loadedLibsByName[lib].exports` for
+        `guest_part_\\d+\\.wasm`, deletes `sub_*` keys from `wasmImports` and `GOT`, and clears
+        `functionsInTableMap`.
+
+    Patch 2 (Ordered throttled pthread `CMD_LOAD`, when `max_concurrent_pthread_loads > 0`):
+      - Limits concurrent `worker.postMessage({ cmd: CMD_LOAD, ... })` calls to
+        `max_concurrent_pthread_loads` via `PThread._loadQueue` / `PThread._activeLoads`.
+      - Wraps `worker.postMessage` until `_dispatchCmdLoad` posts `CMD_LOAD`, buffering any
+        early `CMD_RUN` or other messages and flushing them strictly AFTER `CMD_LOAD`.
+      - Decrements `PThread._activeLoads` and dispatches the next queued load on `CMD_LOADED`.
+    """
+    max_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
+    status: dict[str, bool] = {
+        "already_patched": False,
+        "stub_binders": False,
+        "export_clearers": False,
+        "post_load_dylibs_cleanup": False,
+        "pthread_cmd_load_throttle": False,
+        "pthread_cmd_loaded_dispatch": False,
+    }
+    if SPLIT_PTHREAD_OPT_MARKER in js_text:
+        status["already_patched"] = True
+        return js_text, status
+
+    updated = js_text
+
+    # Patch 1: apply atomically only when both lazy stub creator and `await loadDylibs();` exist
+    # so we never clear `wasmImports`/`moduleExports` without eager stub binding first.
+    if (
+        _STUB_CREATOR_RE.search(updated) is not None
+        and _AWAIT_LOAD_DYLIBS_RE.search(updated) is not None
+    ):
+        def _inject_stub_binder(match: re.Match[str]) -> str:
+            prop = match.group("prop")
+            resolved = match.group("resolved")
+            resolve_fn = match.group("resolve_fn")
+            binder = (
+                f"const _p = {prop}; "
+                "(globalThis.__pg6StubBinders ||= []).push(() => { "
+                f"try {{ {resolved} ||= {resolve_fn}(_p); }} catch (_e) {{}} "
+                "}); "
+            )
+            return f"{match.group('prefix')}{binder}{match.group('stub_assign')}"
+
+        updated, stub_count = _STUB_CREATOR_RE.subn(_inject_stub_binder, updated)
+        status["stub_binders"] = stub_count > 0
+
+        clearer_snippet = (
+            " (globalThis.__pg6ExportClearers ||= []).push(() => {"
+            " moduleExports = null;"
+            " if (typeof localScope !== 'undefined') localScope = null;"
+            " });"
+        )
+        updated, clearer_count = _MODULE_EXPORTS_DECL_RE.subn(
+            lambda m: f"{m.group(1)}{clearer_snippet}",
+            updated,
+        )
+        status["export_clearers"] = clearer_count > 0
+
+        post_cleanup = (
+            "{ await loadDylibs(); (() => {"
+            " var _binders = globalThis.__pg6StubBinders;"
+            " if (_binders) {"
+            " for (var _i = 0; _i < _binders.length; _i++) {"
+            " try { _binders[_i](); } catch (_e) {}"
+            " }"
+            " _binders.length = 0;"
+            " globalThis.__pg6StubBinders = null;"
+            " }"
+            " var _clearers = globalThis.__pg6ExportClearers;"
+            " if (_clearers) {"
+            " for (var _j = 0; _j < _clearers.length; _j++) {"
+            " try { _clearers[_j](); } catch (_e) {}"
+            " }"
+            " _clearers.length = 0;"
+            " globalThis.__pg6ExportClearers = null;"
+            " }"
+            " if (typeof LDSO !== 'undefined' && LDSO && LDSO.loadedLibsByName) {"
+            " for (var _lib in LDSO.loadedLibsByName) {"
+            " if (/guest_part_\\d+\\.wasm$/.test(_lib) && LDSO.loadedLibsByName[_lib]) {"
+            " LDSO.loadedLibsByName[_lib].exports = {};"
+            " }"
+            " }"
+            " }"
+            " if (typeof wasmImports !== 'undefined' && wasmImports) {"
+            " for (var _k in wasmImports) {"
+            " if (_k.startsWith('sub_')) delete wasmImports[_k];"
+            " }"
+            " }"
+            " if (typeof GOT !== 'undefined' && GOT) {"
+            " for (var _g in GOT) {"
+            " if (_g.startsWith('sub_')) delete GOT[_g];"
+            " }"
+            " }"
+            " if (typeof functionsInTableMap !== 'undefined' && functionsInTableMap) {"
+            " if (typeof functionsInTableMap.clear === 'function') {"
+            " functionsInTableMap.clear();"
+            " } else {"
+            " try { functionsInTableMap = undefined; } catch (_e) {}"
+            " }"
+            " }"
+            " })(); }"
+        )
+        updated, cleanup_count = _AWAIT_LOAD_DYLIBS_RE.subn(
+            lambda _m: post_cleanup,
+            updated,
+        )
+        status["post_load_dylibs_cleanup"] = cleanup_count > 0
+
+    # Patch 2: ordered throttled pthread CMD_LOAD (disabled when max_loads == 0).
+    if max_loads > 0:
+        updated, throttle_ok, dispatch_ok = _patch_pthread_cmd_load_throttle(
+            updated,
+            max_concurrent=max_loads,
+        )
+        status["pthread_cmd_load_throttle"] = throttle_ok
+        status["pthread_cmd_loaded_dispatch"] = dispatch_ok
+
+    any_applied = any(v for k, v in status.items() if k != "already_patched")
+    if any_applied:
+        updated = f"{SPLIT_PTHREAD_OPT_MARKER}\n{updated}"
+    return updated, status
+
+
+def patch_split_runtime_js_file(
+    runtime_js_path: Path,
+    *,
+    max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+) -> dict[str, bool]:
+    """Read, optimize in-place, and return patch status for a split-module `runtime.js` file."""
+    max_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
+    if not runtime_js_path.is_file():
+        return {
+            "already_patched": False,
+            "stub_binders": False,
+            "export_clearers": False,
+            "post_load_dylibs_cleanup": False,
+            "pthread_cmd_load_throttle": False,
+            "pthread_cmd_loaded_dispatch": False,
+        }
+    original = runtime_js_path.read_text(encoding="utf-8")
+    patched, status = optimize_split_runtime_js(
+        original,
+        max_concurrent_pthread_loads=max_loads,
+    )
+    if patched != original:
+        runtime_js_path.write_text(patched, encoding="utf-8")
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +2134,8 @@ def run_build(
     browser_boot_exports: bool = False,
     split_modules: int = 1,
     node_max_old_space_mb: int | None = None,
+    proxy_to_pthread: bool = False,
+    max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -1782,6 +2148,7 @@ def run_build(
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
     split_count = parse_split_modules(split_modules)
     use_split = split_count > 1
+    max_pthread_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
     explicit_node_mb = parse_node_max_old_space_mb(node_max_old_space_mb)
     base_link_env: Mapping[str, str] = os.environ if env is None else env
     link_env = build_link_env(
@@ -1819,6 +2186,7 @@ def run_build(
         assertions=assertions_val,
         browser_boot_exports=browser_boot_exports,
         main_module=use_split,
+        proxy_to_pthread=proxy_to_pthread,
     )
 
     runner = run_command or default_run_command
@@ -1855,6 +2223,8 @@ def run_build(
         browser_boot_exports=browser_boot_exports,
         split_modules=split_count,
         node_max_old_space_mb=effective_node_mb,
+        proxy_to_pthread=proxy_to_pthread,
+        max_concurrent_pthread_loads=max_pthread_loads,
     )
 
     if not toolchain.ok:
@@ -2183,6 +2553,11 @@ def run_build(
             report.errors.append("missing link outputs: " + ", ".join(missing_outputs))
             return report
 
+        report.split_runtime_js_patches = patch_split_runtime_js_file(
+            output_js,
+            max_concurrent_pthread_loads=max_pthread_loads,
+        )
+
         report.wasm_bytes = _object_bytes(output_wasm)
         runtime_exceeds, runtime_warning = check_v8_wasm_size(
             report.wasm_bytes,
@@ -2299,6 +2674,14 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
             f"  Split modules: {report.split_modules} "
             f"({PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
         )
+    if report.proxy_to_pthread:
+        lines.append(f"  Proxy to pthread: yes ({PROXY_TO_PTHREAD_FLAG})")
+    if report.split_runtime_js_patches is not None:
+        applied = [
+            k for k, v in report.split_runtime_js_patches.items() if v and k != "already_patched"
+        ]
+        if applied:
+            lines.append(f"  Split runtime JS opt: {', '.join(applied)}")
     if report.node_max_old_space_mb is not None:
         lines.append(
             f"  Node max old space: {report.node_max_old_space_mb} MB "
@@ -2497,6 +2880,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--proxy-to-pthread",
+        action="store_true",
+        help=(
+            f"Pass {PROXY_TO_PTHREAD_FLAG} on the link line so main() runs on a dedicated "
+            "pthread instead of blocking the coordinator worker JS event loop."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent-pthread-loads",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+        metavar="N",
+        help=(
+            "Max concurrent pthread CMD_LOAD instantiations in split-module runtime.js "
+            f"post-link optimization (default: {DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS}; "
+            "0 disables CMD_LOAD throttling)."
+        ),
+    )
+    parser.add_argument(
         "--node-max-old-space-mb",
         type=int,
         default=None,
@@ -2673,6 +3075,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             browser_boot_exports=args.browser_boot_exports,
             split_modules=args.split_modules,
             node_max_old_space_mb=args.node_max_old_space_mb,
+            proxy_to_pthread=args.proxy_to_pthread,
+            max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)
