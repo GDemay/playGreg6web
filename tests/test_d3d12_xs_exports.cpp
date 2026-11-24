@@ -4627,6 +4627,18 @@ void test_g54_copy_texture_region_x_slot85() {
         }
     }
 
+    // 3) The flags are a 32-bit argument: the title stores only the low half of the stack slot, so
+    //    a stale upper half (here 0x1'00000000) is not a flag and must not be reported.
+    const uint64_t bad_mid = dev->stats().bad_arguments;
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 85, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0), I(0x100000000ull)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    CHECK(dev->stats().bad_arguments == bad_mid);
+    CHECK(!contains(dev->diagnostics(), "trailing flags 0x100000000"));
+    mark = fx.captured.size();
+    scene.execute({list});
+    CHECK(count_op(packets_since(fx, mark), GpuOpcode::WriteTexture) == 1);
+
     CHECK(t_balanced);
     scene.release_all({list, upload, tex});
 }
