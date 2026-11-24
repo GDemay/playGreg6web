@@ -52,8 +52,6 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Prototype a second translation for one registered address range in the lifter's `guest_ptr` seam (per-64 KiB page table) with pool-backed window pages in the arena, and measure code-size and run-time cost.
 - [ ] **R20 — Real-Binary Boot Bring-Up, Phase 2: Native Boot from Device Creation to the First Presented Frame** — `IN PROGRESS` (#296, @Timon-ok) *(continues R17; local game files only for local runs)*
   - Iterate the native boot past `D3D12XboxCreateDevice` until the title presents its first frame, fixing each blocker by cause with a synthetic regression test.
-- [ ] **R21 — wasm64 Program Build & Headless Node Boot Harness: First wasm64 Boot Attempt of the Recompiled Program** — `IN PROGRESS` (#314, @Timon-ok) *(repo tests synthetic; local game files only for local runs)*
-  - Build the full recompiled program for wasm64, boot it headless under Node with the same boot sequence and fault report as the native harness, and fix or measure what the first attempts reveal (engine limits, toolchain, wasm-only runtime defects).
 
 ---
 
