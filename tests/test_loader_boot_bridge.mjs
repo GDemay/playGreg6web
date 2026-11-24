@@ -12,9 +12,16 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..');
 
 const {
+  EMSCRIPTEN_PTHREAD_WORKER_NAME,
+  PTHREAD_WGPU_CHANNEL_NAME,
+  PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
   BOOT_INIT_FORWARD_KEYS,
+  isEmscriptenPthreadWorker,
+  installPthreadHostImportShim,
+  bootstrapEmscriptenPthreadWorker,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
@@ -903,4 +910,481 @@ test('createRuntimeModuleOptions forwards mainScriptUrlOrBlob and locateFile def
   });
   assert.equal(opts.mainScriptUrlOrBlob, 'http://127.0.0.1:8080/web/dist/runtime.js');
   assert.equal(opts.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/web/dist/runtime.wasm');
+});
+
+test('isEmscriptenPthreadWorker detects em-pthread workers and rejects normal workers', () => {
+  assert.equal(EMSCRIPTEN_PTHREAD_WORKER_NAME, 'em-pthread');
+  assert.equal(PTHREAD_WGPU_CHANNEL_NAME, 'playgta6-wgpu-pthread');
+  assert.equal(PTHREAD_HTTPFS_SAB_CHANNEL_NAME, 'playgta6-httpfs-sab');
+  assert.deepEqual(HOST_ABI_IMPORT_NAMES, [
+    'host_log',
+    'host_httpfs_open',
+    'host_httpfs_read',
+    'host_httpfs_close',
+    'host_wgpu_submit',
+  ]);
+
+  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread' }), true);
+  assert.equal(isEmscriptenPthreadWorker({ name: '' }), false);
+  assert.equal(isEmscriptenPthreadWorker({ name: 'loader' }), false);
+  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread-2' }), false);
+  assert.equal(isEmscriptenPthreadWorker({}), false);
+  assert.equal(isEmscriptenPthreadWorker(null), false);
+  assert.equal(isEmscriptenPthreadWorker(undefined), false);
+});
+
+test('installPthreadHostImportShim replaces stub/missing ABI imports, binds memory, preserves prototype/instanceof, and restores cleanly', () => {
+  const logs = [];
+  const submitted = [];
+  const hostImports = createHostImports({
+    log: (msg) => logs.push(msg),
+    wgpuSubmit: (bytes) => submitted.push(bytes.slice()),
+    report: () => {},
+  });
+
+  // 1. Test against real WebAssembly.Module / WebAssembly.Instance (preserving prototype & instanceof).
+  const realScope = { WebAssembly: { Instance: WebAssembly.Instance } };
+  const origRealInstance = realScope.WebAssembly.Instance;
+  const restoreReal = installPthreadHostImportShim(realScope, hostImports);
+  assert.equal(realScope.WebAssembly.Instance.prototype, origRealInstance.prototype);
+
+  const wasmModule = new WebAssembly.Module(buildMinimalHostLogWasm());
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  const abortingHostLogStub = () => {
+    throw new Error('abort("missing function: host_log")');
+  };
+  abortingHostLogStub.stub = true;
+
+  const realInstance = new realScope.WebAssembly.Instance(wasmModule, {
+    env: {
+      memory,
+      host_log: abortingHostLogStub,
+    },
+  });
+  assert.ok(realInstance instanceof realScope.WebAssembly.Instance);
+  assert.ok(realInstance instanceof origRealInstance);
+
+  const greeting = 'hello from em-pthread wasm';
+  const encoded = new TextEncoder().encode(greeting);
+  new Uint8Array(memory.buffer).set(encoded, 48);
+  realInstance.exports.ping(48, encoded.byteLength);
+  assert.deepEqual(logs, [greeting]);
+
+  restoreReal();
+  restoreReal(); // idempotent
+  assert.equal(realScope.WebAssembly.Instance, origRealInstance);
+
+  // 2. Test all 5 ABI imports (stub + missing), preservation of non-stub functions and non-ABI stubs.
+  let capturedImports = null;
+  let boundMemory = null;
+  class MockWasmInstance {
+    constructor(mod, imports) {
+      this.mod = mod;
+      this.imports = imports;
+      capturedImports = imports;
+    }
+  }
+  const mockHostImports = {
+    env: {
+      host_log: () => 'real-log',
+      host_httpfs_open: () => 7,
+      host_httpfs_read: () => 12n,
+      host_httpfs_close: () => {},
+      host_wgpu_submit: () => 'real-wgpu',
+    },
+    setMemory(mem) {
+      boundMemory = mem;
+    },
+  };
+  const mockScope = { WebAssembly: { Instance: MockWasmInstance } };
+  const restoreMock = installPthreadHostImportShim(mockScope, mockHostImports);
+
+  const makeStub = (name) => {
+    const fn = () => {
+      throw new Error(`missing function: ${name}`);
+    };
+    fn.stub = true;
+    return fn;
+  };
+  const keepaliveFn = () => 99;
+  const nonAbiStub = makeStub('some_other_emscripten_sym');
+  const realHostClose = () => 'custom-non-stub-close';
+  const mockMem = { buffer: new ArrayBuffer(64) };
+  const wasiNs = { fd_write: () => 0 };
+
+  const inst = new mockScope.WebAssembly.Instance('fake-mod', {
+    env: {
+      memory: mockMem,
+      host_log: makeStub('host_log'),
+      host_httpfs_open: makeStub('host_httpfs_open'),
+      // host_httpfs_read intentionally missing
+      host_httpfs_close: realHostClose, // non-stub must be preserved
+      host_wgpu_submit: makeStub('host_wgpu_submit'),
+      emscripten_keepalive: keepaliveFn,
+      other_stub: nonAbiStub,
+    },
+    wasi_snapshot_preview1: wasiNs,
+  });
+
+  assert.ok(inst instanceof mockScope.WebAssembly.Instance);
+  assert.ok(inst instanceof MockWasmInstance);
+  assert.equal(boundMemory, mockMem);
+  assert.equal(capturedImports.env.host_log, mockHostImports.env.host_log);
+  assert.equal(capturedImports.env.host_httpfs_open, mockHostImports.env.host_httpfs_open);
+  assert.equal(capturedImports.env.host_httpfs_read, mockHostImports.env.host_httpfs_read);
+  assert.equal(capturedImports.env.host_httpfs_close, realHostClose);
+  assert.equal(capturedImports.env.host_wgpu_submit, mockHostImports.env.host_wgpu_submit);
+  assert.equal(capturedImports.env.emscripten_keepalive, keepaliveFn);
+  assert.equal(capturedImports.env.other_stub, nonAbiStub);
+  assert.equal(capturedImports.wasi_snapshot_preview1, wasiNs);
+
+  restoreMock();
+  assert.equal(mockScope.WebAssembly.Instance, MockWasmInstance);
+});
+
+// Minimal valid Wasm32 binary importing env.memory, env.host_log(i32, i32), and env.host_wgpu_submit(i32, i32),
+// exporting `emit(logPtr, logLen, gpuPtr, gpuLen)`.
+function buildMinimalPthreadLogAndWgpuWasm() {
+  const sec = (id, payload) => [id, payload.length, ...payload];
+  // type 0: (i32, i32) -> ()
+  // type 1: (i32, i32, i32, i32) -> ()
+  const typeSec = sec(0x01, [
+    0x02,
+    0x60, 0x02, 0x7f, 0x7f, 0x00,
+    0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x00,
+  ]);
+  const encStr = (s) => [s.length, ...Array.from(s, (ch) => ch.charCodeAt(0))];
+  const importSec = sec(0x02, [
+    0x03,
+    // env.memory (min=1, max=1)
+    ...encStr('env'), ...encStr('memory'), 0x02, 0x01, 0x01, 0x01,
+    // env.host_log (func 0, type 0)
+    ...encStr('env'), ...encStr('host_log'), 0x00, 0x00,
+    // env.host_wgpu_submit (func 1, type 0)
+    ...encStr('env'), ...encStr('host_wgpu_submit'), 0x00, 0x00,
+  ]);
+  const funcSec = sec(0x03, [0x01, 0x01]);
+  const exportSec = sec(0x07, [0x01, ...encStr('emit'), 0x00, 0x02]);
+  const codeSec = sec(0x0a, [
+    0x01,
+    0x0e,
+    0x00,
+    0x20, 0x00, 0x20, 0x01, 0x10, 0x00,
+    0x20, 0x02, 0x20, 0x03, 0x10, 0x01,
+    0x0b,
+  ]);
+  return new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...typeSec,
+    ...importSec,
+    ...funcSec,
+    ...exportSec,
+    ...codeSec,
+  ]);
+}
+
+function createMockBroadcastBus({ rejectSabOnChannel = null } = {}) {
+  const channelsByName = new Map();
+  const postedLog = [];
+
+  class BusBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this.closed = false;
+      if (!channelsByName.has(name)) {
+        channelsByName.set(name, new Set());
+      }
+      channelsByName.get(name).add(this);
+    }
+
+    postMessage(data) {
+      if (this.closed) return;
+      if (
+        rejectSabOnChannel === this.name &&
+        data &&
+        typeof data === 'object' &&
+        typeof SharedArrayBuffer !== 'undefined' &&
+        data.sab instanceof SharedArrayBuffer
+      ) {
+        throw new Error('DataCloneError: SharedArrayBuffer rejected');
+      }
+      postedLog.push({ channel: this.name, data });
+      const peers = channelsByName.get(this.name);
+      if (!peers) return;
+      for (const peer of peers) {
+        if (peer === this || peer.closed) continue;
+        if (typeof peer.onmessage === 'function') {
+          peer.onmessage({ data });
+        }
+      }
+    }
+
+    close() {
+      this.closed = true;
+      const peers = channelsByName.get(this.name);
+      if (peers) {
+        peers.delete(this);
+      }
+    }
+  }
+
+  return { BusBroadcastChannel, postedLog, channelsByName };
+}
+
+test('loader.js in em-pthread worker loads dist/runtime.js without overwriting self.onmessage and relays host_log, host_wgpu_submit, and httpfs SAB', () => {
+  const bus = createMockBroadcastBus();
+  const loaderSource = fs.readFileSync(path.join(repoRoot, 'web/loader.js'), 'utf8');
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+
+  // --- 1. Boot the main coordinator loader.js in its own VM sandbox ---
+  const coordWorkers = new Map();
+  class CoordMockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      coordWorkers.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+  const coordSelf = {
+    name: '',
+    onmessage: null,
+    postMessage() {},
+  };
+  const coordSandbox = {
+    self: coordSelf,
+    globalThis: null,
+    BroadcastChannel: bus.BusBroadcastChannel,
+    Worker: CoordMockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), coordContext, { filename: resolved });
+    },
+  };
+  coordSandbox.globalThis = coordSandbox;
+  const coordContext = vm.createContext(coordSandbox);
+  vm.runInContext(loaderSource, coordContext, { filename: loaderPath });
+
+  // Initialize coordinator so gpuWorker and httpfsMailboxSab exist.
+  coordSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
+  const ioWorker = coordWorkers.get('./workers/io_worker.js');
+  assert.ok(gpuWorker && ioWorker);
+  const attachMsg = ioWorker.posted.find((m) => m && m.attachMailbox === true);
+  assert.ok(attachMsg && attachMsg.sab instanceof SharedArrayBuffer);
+
+  // --- 2. Boot an em-pthread worker running web/loader.js in a second VM sandbox ---
+  const pthreadImported = [];
+  const pthreadWorkerSpawns = [];
+  let emscriptenOnMessage = null;
+  let pthreadInstance = null;
+
+  const pthreadSelf = {
+    name: 'em-pthread',
+    onmessage: null,
+    postMessage() {},
+  };
+
+  // Use a per-sandbox WebAssembly namespace so we don't mutate Node's global WebAssembly.Instance.
+  const pthreadWebAssembly = {
+    Module: WebAssembly.Module,
+    Memory: WebAssembly.Memory,
+    Instance: WebAssembly.Instance,
+  };
+
+  const pthreadSandbox = {
+    self: pthreadSelf,
+    globalThis: null,
+    WebAssembly: pthreadWebAssembly,
+    BroadcastChannel: bus.BusBroadcastChannel,
+    Worker: class ForbiddenWorker {
+      constructor(script) {
+        pthreadWorkerSpawns.push(script);
+      }
+    },
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    importScripts(scriptPath) {
+      pthreadImported.push(scriptPath);
+      if (scriptPath === './dist/runtime.js') {
+        // Simulate Emscripten 7.0.1 pthread bootstrap installing self.onmessage = handleMessage.
+        emscriptenOnMessage = (ev) => {
+          const { cmd, wasmModule, wasmMemory } = ev.data;
+          if (cmd !== 'load') return;
+          const makeStub = (name) => {
+            const fn = () => {
+              throw new Error(`abort("missing function: ${name}")`);
+            };
+            fn.stub = true;
+            return fn;
+          };
+          pthreadInstance = new pthreadSandbox.WebAssembly.Instance(wasmModule, {
+            env: {
+              memory: wasmMemory,
+              host_log: makeStub('host_log'),
+              host_httpfs_open: makeStub('host_httpfs_open'),
+              host_httpfs_read: makeStub('host_httpfs_read'),
+              host_httpfs_close: makeStub('host_httpfs_close'),
+              host_wgpu_submit: makeStub('host_wgpu_submit'),
+            },
+          });
+        };
+        pthreadSelf.onmessage = emscriptenOnMessage;
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), pthreadContext, { filename: resolved });
+    },
+  };
+  pthreadSandbox.globalThis = pthreadSandbox;
+  const pthreadContext = vm.createContext(pthreadSandbox);
+  vm.runInContext(loaderSource, pthreadContext, { filename: loaderPath });
+
+  // Verify pthread fast-path: loaded httpfs_mailbox.js + dist/runtime.js, did NOT spawn workers,
+  // and did NOT overwrite Emscripten's self.onmessage!
+  assert.deepEqual(pthreadImported, ['./workers/httpfs_mailbox.js', './dist/runtime.js']);
+  assert.equal(pthreadWorkerSpawns.length, 0);
+  assert.equal(pthreadSelf.onmessage, emscriptenOnMessage);
+
+  // Verify httpfs SAB handshake happened between pthread and coordinator.
+  const sabReply = bus.postedLog.find(
+    (entry) => entry.channel === PTHREAD_HTTPFS_SAB_CHANNEL_NAME && entry.data.type === 'httpfs-sab',
+  );
+  assert.ok(sabReply && sabReply.data.sab === attachMsg.sab);
+
+  // Simulate Emscripten PThread.loadWasmModuleToWorker delivering { cmd: 'load', wasmModule, wasmMemory }.
+  const wasmModule = new WebAssembly.Module(buildMinimalPthreadLogAndWgpuWasm());
+  const wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  pthreadSelf.onmessage({ data: { cmd: 'load', wasmModule, wasmMemory } });
+  assert.ok(pthreadInstance instanceof WebAssembly.Instance);
+
+  // Invoke Wasm exports that call host_log and host_wgpu_submit (with a Present frame).
+  const msgBytes = new TextEncoder().encode('d3d12 render thread alive');
+  const frameBytes = new Uint8Array(encodeTestFramePacket(0.25, 0.5, 0.75, 1.0));
+  const memU8 = new Uint8Array(wasmMemory.buffer);
+  memU8.set(msgBytes, 16);
+  memU8.set(frameBytes, 128);
+
+  pthreadInstance.exports.emit(16, msgBytes.byteLength, 128, frameBytes.byteLength);
+  // Submit a second frame to confirm FIRST_PRESENT is emitted only once.
+  pthreadInstance.exports.emit(16, msgBytes.byteLength, 128, frameBytes.byteLength);
+
+  // Check host_log reached game-progress channel.
+  const progressLabels = bus.postedLog
+    .filter((entry) => entry.channel === 'game-progress' && entry.data && entry.data.label)
+    .map((entry) => entry.data.label);
+  assert.ok(progressLabels.includes('[wasm] d3d12 render thread alive'));
+
+  // Check FIRST_PRESENT was emitted exactly once by the coordinator.
+  const firstPresentEvents = progressLabels.filter((label) => label === '[boot] FIRST_PRESENT');
+  assert.equal(firstPresentEvents.length, 1);
+
+  // Check GPU command batches were forwarded via playgta6-wgpu-pthread straight to gpuWorker!
+  const gpuCmdPosts = gpuWorker.posted.filter((m) => m && m.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(gpuCmdPosts.length, 2);
+  assert.deepEqual(new Uint8Array(gpuCmdPosts[0].cmdBuffer), frameBytes);
+  assert.deepEqual(new Uint8Array(gpuCmdPosts[1].cmdBuffer), frameBytes);
+});
+
+test('bootstrapEmscriptenPthreadWorker degrades safely when BroadcastChannel rejects SharedArrayBuffer and supports host_httpfs_open via SAB', () => {
+  const { createHttpfsMailboxBuffer, HttpfsMailboxClient, HttpfsOffsets, HttpfsStatus } = require(
+    '../web/workers/httpfs_mailbox.js',
+  );
+
+  // 1. Degrade safely if BroadcastChannel throws on SAB.
+  const rejectingBus = createMockBroadcastBus({ rejectSabOnChannel: PTHREAD_HTTPFS_SAB_CHANNEL_NAME });
+  const mockScope = {
+    name: 'em-pthread',
+    WebAssembly: { Instance: WebAssembly.Instance },
+  };
+  let importedUrl = null;
+  const handle = bootstrapEmscriptenPthreadWorker({
+    scope: mockScope,
+    importScriptsFn: (url) => {
+      importedUrl = url;
+    },
+    BroadcastChannelCtor: rejectingBus.BusBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient },
+  });
+  assert.equal(importedUrl, './dist/runtime.js');
+
+  // Even if coordinator fails to post SAB over BroadcastChannel, host_httpfs_open returns -1 cleanly.
+  const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  handle.hostImports.setMemory(mem);
+  const pathBytes = new TextEncoder().encode('boot/guest.pgim');
+  new Uint8Array(mem.buffer).set(pathBytes, 32);
+  assert.equal(handle.hostImports.env.host_httpfs_open(32n, BigInt(pathBytes.byteLength)), -1);
+
+  // 2. When SAB arrives over BroadcastChannel, host_httpfs_open uses HttpfsMailboxClient(sab).
+  const sab = createHttpfsMailboxBuffer(1024);
+  const clientApi = {
+    HttpfsMailboxClient: class ResponderClient extends HttpfsMailboxClient {
+      constructor(buf) {
+        super(buf, (s) => {
+          const header = new DataView(s, 0, 40);
+          const statusView = new Int32Array(s, 0, 1);
+          header.setBigInt64(HttpfsOffsets.RESULT, 42n, true);
+          Atomics.store(statusView, 0, HttpfsStatus.ResponseReady);
+          Atomics.notify(statusView, 0, 1);
+        });
+      }
+    },
+  };
+  const okBus = createMockBroadcastBus();
+  const handle2 = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: okBus.BusBroadcastChannel,
+    httpfsMailboxApi: clientApi,
+  });
+  handle2.hostImports.setMemory(mem);
+  const sender = new okBus.BusBroadcastChannel(PTHREAD_HTTPFS_SAB_CHANNEL_NAME);
+  sender.postMessage({ type: 'httpfs-sab', sab });
+  assert.equal(handle2.hostImports.env.host_httpfs_open(32n, BigInt(pathBytes.byteLength)), 42);
+
+  handle.cleanup();
+  handle2.cleanup();
+  sender.close();
 });
