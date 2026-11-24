@@ -5,6 +5,7 @@ import bootstrapDefault, {
   DEFAULT_LOADER_URL,
   PlayGta6AppHandle,
   bootstrapPlayGta6App,
+  detectWasm64,
   extractBootAssetUrls,
   resolveDefaultGameBase,
 } from '../web/app_bootstrap.js';
@@ -1522,4 +1523,161 @@ test('W54 constructs owned GpuBootPanelController from gpuBootPanelRoot and glob
       globalThis.PlayGta6GpuBootPanel = prevGlobal;
     }
   }
+});
+
+test('W58 detectWasm64 supports spec-standard address: i64, legacy index: i64, and rejects non-Wasm64 engines', () => {
+  // Simulates WebIDL ToNumber coercion on i32 memory limits, which throws TypeError on BigInt.
+  function assertI32Limit(value) {
+    return +value;
+  }
+
+  // 1. Modern Chrome/V8/Firefox/Node engine accepting only `{ address: 'i64' }` with BigInt limits.
+  const modernCalls = [];
+  const modernWasmApi = {
+    Memory: class MockModernMemory {
+      constructor(desc) {
+        modernCalls.push(desc);
+        if (desc.address === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(modernWasmApi), true);
+  assert.equal(modernCalls.length, 1);
+  assert.equal(modernCalls[0].address, 'i64');
+  assert.equal(modernCalls[0].initial, 1n);
+  assert.equal(modernCalls[0].maximum, 2n);
+
+  // 2. Older memory64 proposal engine accepting only legacy `{ index: 'i64' }`.
+  const legacyCalls = [];
+  const legacyWasmApi = {
+    Memory: class MockLegacyMemory {
+      constructor(desc) {
+        legacyCalls.push(desc);
+        if (desc.index === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        // Unknown `address` key is ignored -> treated as i32 -> BigInt throws TypeError.
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(legacyWasmApi), true);
+  assert.equal(legacyCalls.length, 2);
+  assert.equal(legacyCalls[0].address, 'i64');
+  assert.equal(legacyCalls[1].index, 'i64');
+
+  // 3. Non-Wasm64 engine that ignores both keys and throws on BigInt initial/maximum.
+  const wasm32Calls = [];
+  const wasm32OnlyApi = {
+    Memory: class MockWasm32Memory {
+      constructor(desc) {
+        wasm32Calls.push(desc);
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(wasm32OnlyApi), false);
+  assert.equal(wasm32Calls.length, 2);
+  assert.equal(wasm32Calls[0].address, 'i64');
+  assert.equal(wasm32Calls[1].index, 'i64');
+
+  // 4. Defensive edge cases: missing API or mock whose type reflection reports i32.
+  assert.equal(detectWasm64(null), false);
+  assert.equal(detectWasm64(undefined), false);
+  assert.equal(detectWasm64({}), false);
+  assert.equal(
+    detectWasm64({
+      Memory: class MockI32ReflectingMemory {
+        type() {
+          return { minimum: 1, maximum: 2, address: 'i32' };
+        }
+      },
+    }),
+    false
+  );
+});
+
+test('W58 bootstrapPlayGta6App capability probe reports wasm64 for address: i64, legacy index: i64, and non-Wasm64 engines', async () => {
+  async function probeWithWebAssembly(mockWebAssembly) {
+    const clock = createClock(11000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.WebAssembly = mockWebAssembly;
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      raf: raf.raf,
+      cancelRaf: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    try {
+      const env = await app.session.probeEnvironment();
+      return env.capabilities.wasm64;
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // Modern engine accepting only `{ address: 'i64' }`.
+  const modernResult = await probeWithWebAssembly({
+    Memory: class MockModernMemory {
+      constructor(desc) {
+        if (desc.address !== 'i64') {
+          return +desc.initial;
+        }
+      }
+    },
+  });
+  assert.equal(modernResult, true);
+
+  // Legacy engine accepting only `{ index: 'i64' }`.
+  const legacyResult = await probeWithWebAssembly({
+    Memory: class MockLegacyMemory {
+      constructor(desc) {
+        if (desc.index !== 'i64') {
+          return +desc.initial;
+        }
+      }
+    },
+  });
+  assert.equal(legacyResult, true);
+
+  // Non-Wasm64 engine rejecting BigInt/i64 memory.
+  const wasm32Result = await probeWithWebAssembly({
+    Memory: class MockWasm32Memory {
+      constructor(desc) {
+        return +desc.initial;
+      }
+    },
+  });
+  assert.equal(wasm32Result, false);
+
+  // Explicitly absent WebAssembly API on windowObj.
+  const absentResult = await probeWithWebAssembly(null);
+  assert.equal(absentResult, false);
 });
