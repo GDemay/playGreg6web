@@ -1227,6 +1227,142 @@ void test_program_boot_pipeline_dump_triggers() {
     }
 }
 
+void test_wgpu_features_and_dstorage_defaults() {
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace dx = playgta6::gpu::d3d12_xs_exports;
+    namespace pso = playgta6::gpu::pso;
+
+    // 1. Default WasmBootConfig enables negotiated WebGPU features and 4 DirectStorage workers.
+    const WasmBootConfig cfg;
+    CHECK(cfg.dstorage_worker_threads == 4);
+    CHECK(cfg.wgpu_features == playgta6::boot::kDefaultWasmWgpuFeatures);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::TextureCompressionBc) != 0);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::Depth32FloatStencil8) != 0);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::Rg11b10UfloatRenderable) != 0);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::TextureFormatsTier1) != 0);
+    // Non-negotiated features must remain off by default.
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::DepthClipControl) == 0);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::Float32Blendable) == 0);
+    CHECK((cfg.wgpu_features & pso::WgpuFeature::DualSourceBlending) == 0);
+
+    // 2. Trailing-field aggregate initialization keeps the new defaults intact.
+    {
+        WasmBootConfig legacy_init{"boot/program-manifest.json",
+                                   "boot/guest.pgim",
+                                   "shaders/splash.wgsl.pack",
+                                   "shaders/fallback.wgsl.pack",
+                                   4096,
+                                   1024 * 1024,
+                                   {},
+                                   {},
+                                   {},
+                                   {}};
+        CHECK(legacy_init.wgpu_features == playgta6::boot::kDefaultWasmWgpuFeatures);
+        CHECK(legacy_init.dstorage_worker_threads == 4);
+    }
+
+    // 3. pso::map_texture_format accepts BC1/BC3/BC7, D32_FLOAT_S8X24_UINT, R11G11B10_FLOAT,
+    //    and texture-formats-tier1 formats cleanly with cfg.wgpu_features.
+    const auto bc1 = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(71), pso::FormatUsage::Sampled, cfg.wgpu_features);
+    CHECK(bc1.supported());
+    CHECK(bc1.format == pso::WgpuTextureFormat::Bc1RgbaUnorm);
+    CHECK((bc1.diagnostics & (pso::FormatDiag::FeatureFallback | pso::FormatDiag::NeedsCpuConversion)) == 0);
+
+    const auto bc3 = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(77), pso::FormatUsage::Sampled, cfg.wgpu_features);
+    CHECK(bc3.supported());
+    CHECK(bc3.format == pso::WgpuTextureFormat::Bc3RgbaUnorm);
+    CHECK((bc3.diagnostics & (pso::FormatDiag::FeatureFallback | pso::FormatDiag::NeedsCpuConversion)) == 0);
+
+    const auto bc7 = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(98), pso::FormatUsage::Sampled, cfg.wgpu_features);
+    CHECK(bc7.supported());
+    CHECK(bc7.format == pso::WgpuTextureFormat::Bc7RgbaUnorm);
+    CHECK((bc7.diagnostics & (pso::FormatDiag::FeatureFallback | pso::FormatDiag::NeedsCpuConversion)) == 0);
+
+    const auto d32s8 = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(20), pso::FormatUsage::DepthStencil, cfg.wgpu_features);
+    CHECK(d32s8.supported());
+    CHECK(d32s8.format == pso::WgpuTextureFormat::Depth32FloatStencil8);
+    CHECK((d32s8.diagnostics & pso::FormatDiag::FeatureFallback) == 0);
+
+    const auto rg11b10 = pso::map_texture_format(
+        pso::DxgiFormat::R11G11B10_FLOAT, pso::FormatUsage::RenderTarget, cfg.wgpu_features);
+    CHECK(rg11b10.supported());
+    CHECK(rg11b10.format == pso::WgpuTextureFormat::Rg11b10Ufloat);
+    CHECK((rg11b10.diagnostics & pso::FormatDiag::FeatureFallback) == 0);
+
+    const auto r16_unorm = pso::map_texture_format(
+        pso::DxgiFormat::R16_UNORM, pso::FormatUsage::RenderTarget, cfg.wgpu_features);
+    CHECK(r16_unorm.supported());
+    CHECK(r16_unorm.format == pso::WgpuTextureFormat::R16Unorm);
+    CHECK((r16_unorm.diagnostics & pso::FormatDiag::FeatureFallback) == 0);
+
+    // 4. run_wasm_program_boot always installs DeviceOptions with bridge.features even when
+    //    no shader pack and no pipeline dump directory are configured.
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto probe_device_features = [&](const WasmBootConfig& boot_cfg,
+                                     uint32_t& observed_features_out) -> WasmBootResult {
+        observed_features_out = 0xFFFFFFFFu;
+        g_test_entry_hook = [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            auto dev = dx::current_device();
+            CHECK(static_cast<bool>(dev));
+            if (dev) {
+                observed_features_out = dev->state_bridge().options().features;
+            }
+        };
+
+        playgta6::os::VirtualMemoryArena arena;
+        playgta6::os::win32::set_vmem_arena(&arena);
+        dx::reset_for_tests();
+        const WasmBootResult r = playgta6::boot::run_wasm_program_boot(boot_cfg, prog);
+        g_test_entry_hook = nullptr;
+        dx::reset_for_tests();
+        playgta6::guest::com::reset_com_bridge();
+        playgta6::guest::reset_boot();
+        playgta6::os::win32::set_vmem_arena(nullptr);
+        return r;
+    };
+
+    ScopedEnvVar env_guard("PG6_DUMP_PIPELINES");
+    env_guard.unset();
+
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig boot_cfg = make_cfg(fs);
+        boot_cfg.read_chunk_bytes = 4096;
+        uint32_t observed = 0;
+        const WasmBootResult r = probe_device_features(boot_cfg, observed);
+        CHECK(r.ok);
+        CHECK(observed == playgta6::boot::kDefaultWasmWgpuFeatures);
+    }
+
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig boot_cfg = make_cfg(fs);
+        boot_cfg.read_chunk_bytes = 4096;
+        boot_cfg.wgpu_features = pso::WgpuFeature::TextureCompressionBc;
+        boot_cfg.dstorage_worker_threads = 2;
+        uint32_t observed = 0;
+        const WasmBootResult r = probe_device_features(boot_cfg, observed);
+        CHECK(r.ok);
+        CHECK(observed == pso::WgpuFeature::TextureCompressionBc);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1252,6 +1388,7 @@ int main() {
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
     test_program_boot_pipeline_dump_triggers();
+    test_wgpu_features_and_dstorage_defaults();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

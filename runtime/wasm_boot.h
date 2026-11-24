@@ -8,12 +8,24 @@
 #include <string_view>
 #include <vector>
 
+#include "gpu/pso_cache.h"
+
 struct Pg6Program;
 
 namespace playgta6::boot {
 
 inline constexpr char kPgimMagic[4] = {'P', 'G', 'I', 'M'};
 inline constexpr size_t kPgimMagicBytes = 4;
+
+// Default pso::WgpuFeature bitmask matching the optional WebGPU adapter features negotiated by
+// web/workers/wgpu_worker.js (W92) that the C++ GPU bridge gates on. (float32-filterable and
+// bgra8unorm-storage are also negotiated on the JS side but have no C++ pso::WgpuFeature gate bits.)
+inline constexpr uint32_t kDefaultWasmWgpuFeatures =
+    gpu::pso::WgpuFeature::TextureCompressionBc |
+    gpu::pso::WgpuFeature::Depth32FloatStencil8 |
+    gpu::pso::WgpuFeature::Rg11b10UfloatRenderable |
+    gpu::pso::WgpuFeature::TextureFormatsTier1;
+inline constexpr uint32_t kDefaultDStorageWorkerThreads = 4;
 
 using HttpfsOpenFn = std::function<int32_t(std::string_view rel_path)>;
 using HttpfsReadFn = std::function<int64_t(int32_t handle, uint64_t offset, void* dst, size_t len)>;
@@ -36,6 +48,11 @@ struct WasmBootConfig {
     // Opt-in pipeline dump directory (empty: disabled unless PG6_DUMP_PIPELINES env
     // or HTTPFS `shaders/dump_pipelines.flag` is present). Kept trailing for ABI safety.
     std::string dump_pipelines_dir;
+    // Optional WebGPU device features (gpu::pso::WgpuFeature bits) forwarded to
+    // DeviceOptions::bridge.features. Kept trailing for ABI safety.
+    uint32_t wgpu_features = kDefaultWasmWgpuFeatures;
+    // DirectStorage worker thread count (clamped to [1, 16] by set_dstorage_worker_threads).
+    uint32_t dstorage_worker_threads = kDefaultDStorageWorkerThreads;
 };
 
 struct WasmBootResult {
