@@ -72,8 +72,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
-- [ ] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `IN PROGRESS` (#673, @Timon-ok) *(R41 follow-up)*
+- [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
   - Add the missing fields to the harness's report JSON (additive, versioned) and make the comparison tool use them.
+- [ ] **R43 — One-Command Native Boot Runner (`tools/run_native_boot.py`)** — `IN PROGRESS` (#680, @Timon-ok)
+  - Rebuild only what is stale, boot with named presets, collect the run folder and compare against a baseline.
 
 ---
 
