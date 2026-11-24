@@ -32,7 +32,8 @@ use crate::convert::{ShaderStage, format_shader_hash};
 use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
-    analyze_instructions, decode_program,
+    analyze_instructions, decode_program, sop2_src_pair_widths, sopc_src_pair_widths,
+    vop2_is_co_ci, vop2_is_madk,
 };
 
 /// Default minimum number of `vec4<u32>` slots in a statically-sized uniform CBV (`cb0`, `cb1`, ...).
@@ -753,6 +754,14 @@ fn ds_lds_op(op: u8) -> Option<DsLdsOp> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 64-bit shift flavour emitted on `(lo, hi)` u32 register pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shift64Kind {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+}
+
 fn record_src_usage(
     src: u16,
     vgprs: &mut BTreeSet<u8>,
@@ -867,9 +876,18 @@ fn analyze_vsharp_indirections(
             continue;
         }
         match &inst.detail {
-            Rdna2Detail::Sopc { ssrc0, ssrc1, .. } => {
+            Rdna2Detail::Sopc {
+                op, ssrc0, ssrc1, ..
+            } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1));
+                let (pair0, pair1) = sopc_src_pair_widths(*op);
+                if pair0 && *ssrc0 <= 104 {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0 + 1));
+                }
+                if pair1 && *ssrc1 <= 104 {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1 + 1));
+                }
             }
             Rdna2Detail::Sop1 {
                 op, sdst, ssrc0, ..
@@ -902,11 +920,24 @@ fn analyze_vsharp_indirections(
                 }
             }
             Rdna2Detail::Sop2 {
-                sdst, ssrc0, ssrc1, ..
+                op,
+                sdst,
+                ssrc0,
+                ssrc1,
+                ..
             } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0));
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1));
-                if *sdst <= 105 {
+                let (pair0, pair1) = sop2_src_pair_widths(*op);
+                if pair0 && *ssrc0 <= 104 {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc0 + 1));
+                }
+                if pair1 && *ssrc1 <= 104 {
+                    taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1 + 1));
+                }
+                if pair0 && *sdst <= 104 {
+                    retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
+                } else if *sdst <= 105 {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
                 }
             }
@@ -987,10 +1018,15 @@ fn analyze_vsharp_indirections(
                 if !is_unary {
                     taint_vsharp_if_sgpr_read(&mut live, *src1);
                 }
+                if matches!(*op, 0x2FF..=0x301) && *src1 <= 104 {
+                    // 64-bit shifts read an SGPR pair in src1
+                    taint_vsharp_if_sgpr_read(&mut live, *src1 + 1);
+                }
                 let is_ternary = matches!(
                     *op,
                     0x100
                         | 0x101
+                        | 0x128..=0x12A
                         | 0x140..=0x165
                         | 0x16D..=0x171
                         | 0x340..=0x35F
@@ -1172,12 +1208,40 @@ fn plan_program(
     let mut needs_vcc = false;
     let mut needs_scc = false;
 
+    // Record a source operand read (register usage, read-before-write, VCC/SCC needs).
+    macro_rules! record_src {
+        ($src:expr) => {
+            record_src_usage(
+                $src,
+                &mut vgprs,
+                &mut sgprs,
+                &written_vgprs,
+                &mut read_before_write_vgprs,
+                &written_sgprs,
+                &mut read_before_write_sgprs,
+                &mut needs_vcc,
+                &mut needs_scc,
+            )
+        };
+    }
+    // Record the high half of a 64-bit SGPR (`s[n:n+1]`) or VGPR (`v[n:n+1]`) pair source.
+    macro_rules! record_src_pair_hi {
+        ($src:expr) => {{
+            let src: u16 = $src;
+            if src <= 104 || (256..=510).contains(&src) {
+                record_src!(src + 1);
+            }
+        }};
+    }
+
     for (inst_idx, inst) in active.iter().enumerate() {
         if inst.truncated {
             continue;
         }
         match &inst.detail {
-            Rdna2Detail::Sopc { ssrc0, ssrc1, .. } => {
+            Rdna2Detail::Sopc {
+                op, ssrc0, ssrc1, ..
+            } => {
                 record_src_usage(
                     u16::from(*ssrc0),
                     &mut vgprs,
@@ -1200,6 +1264,13 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
+                let (pair0, pair1) = sopc_src_pair_widths(*op);
+                if pair0 {
+                    record_src_pair_hi!(u16::from(*ssrc0));
+                }
+                if pair1 {
+                    record_src_pair_hi!(u16::from(*ssrc1));
+                }
                 needs_scc = true;
             }
             Rdna2Detail::Sop1 {
@@ -1290,12 +1361,28 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                if *op == 0x0A {
+                let (pair0, pair1) = sop2_src_pair_widths(*op);
+                if pair0 {
+                    record_src_pair_hi!(u16::from(*ssrc0));
+                }
+                if pair1 {
+                    record_src_pair_hi!(u16::from(*ssrc1));
+                }
+                if matches!(*op, 0x0A | 0x0B) {
+                    // s_cselect_b32 / s_cselect_b64 read SCC
                     needs_scc = true;
                 }
-                if *sdst <= 105 {
+                if pair0 && *sdst <= 104 {
+                    // 64-bit SGPR pair destination
+                    sgprs.insert(*sdst);
+                    sgprs.insert(*sdst + 1);
+                    written_sgprs.insert(*sdst);
+                    written_sgprs.insert(*sdst + 1);
+                } else if *sdst <= 105 {
                     sgprs.insert(*sdst);
                     written_sgprs.insert(*sdst);
+                } else if pair0 && *sdst == 106 {
+                    needs_vcc = true;
                 }
             }
             Rdna2Detail::Smem {
@@ -1435,8 +1522,8 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                if matches!(op, 0x02 | 0x06 | 0x2B | 0x36 | 0x3C) {
-                    // v_dot2c_f32_f16 / v_fmac* / v_pk_fmac_f16 read vdst as accumulator
+                if matches!(op, 0x02 | 0x06 | 0x1F | 0x2B | 0x36 | 0x3C) {
+                    // v_dot2c_f32_f16 / v_fmac* / v_mac_f32 / v_pk_fmac_f16 read vdst as accumulator
                     record_src_usage(
                         256 + u16::from(*vdst),
                         &mut vgprs,
@@ -1449,7 +1536,8 @@ fn plan_program(
                         &mut needs_scc,
                     );
                 }
-                if matches!(op, 0x00 | 0x01) {
+                if matches!(op, 0x00 | 0x01) || vop2_is_co_ci(*op) {
+                    // v_cndmask_b32 reads VCC; v_*_co_ci_u32 read carry-in from and write carry-out to VCC
                     needs_vcc = true;
                 }
                 vgprs.insert(*vdst);
@@ -1493,6 +1581,7 @@ fn plan_program(
                     *op,
                     0x100
                         | 0x101
+                        | 0x128..=0x12A
                         | 0x140..=0x165
                         | 0x16D..=0x171
                         | 0x340..=0x35F
@@ -1511,26 +1600,40 @@ fn plan_program(
                         &mut needs_scc,
                     );
                 }
-                if let Some(sd) = sdst {
-                    let sd7 = *sd & 0x7F;
+                if matches!(*op, 0x102 | 0x106 | 0x11F | 0x12B | 0x136 | 0x13C) {
+                    // VOP3-promoted accumulating VOP2 ops read vdst
+                    record_src!(256 + u16::from(*vdst));
+                }
+                let is_shift64 = matches!(*op, 0x2FF..=0x301);
+                if is_shift64 {
+                    // v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64 read a 64-bit src1 pair
+                    record_src_pair_hi!(*src1);
+                }
+                // Lane-mask SGPR destinations are written as canonical `(lo = lane bit, hi = 0)` pairs.
+                let mut record_lane_mask_dst = |sd7: u8| {
                     if sd7 <= 105 {
                         sgprs.insert(sd7);
                         written_sgprs.insert(sd7);
+                        if sd7 <= 104 {
+                            sgprs.insert(sd7 + 1);
+                            written_sgprs.insert(sd7 + 1);
+                        }
                     } else if sd7 == 106 {
                         needs_vcc = true;
                     }
+                };
+                if let Some(sd) = sdst {
+                    record_lane_mask_dst(*sd & 0x7F);
                 }
                 if *op <= 0xFF {
-                    let sd = *vdst & 0x7F;
-                    if sd <= 105 {
-                        sgprs.insert(sd);
-                        written_sgprs.insert(sd);
-                    } else if sd == 106 {
-                        needs_vcc = true;
-                    }
+                    record_lane_mask_dst(*vdst & 0x7F);
                 } else {
                     vgprs.insert(*vdst);
                     written_vgprs.insert(*vdst);
+                    if is_shift64 && *vdst < 255 {
+                        vgprs.insert(*vdst + 1);
+                        written_vgprs.insert(*vdst + 1);
+                    }
                 }
             }
             Rdna2Detail::Vop3P {
@@ -2121,6 +2224,8 @@ struct IrEmitter {
     translated_op_count: usize,
     unsupported_op_count: usize,
     unsupported_comments: Vec<String>,
+    /// Sanitized informational comments for ops translated as deliberate no-ops.
+    note_comments: Vec<String>,
 }
 
 fn align_up(value: u32, align: u32) -> u32 {
@@ -2827,6 +2932,7 @@ impl IrEmitter {
             translated_op_count: 0,
             unsupported_op_count: 0,
             unsupported_comments: Vec::new(),
+            note_comments: Vec::new(),
         };
 
         emitter.emit_prologue();
@@ -4368,6 +4474,333 @@ impl IrEmitter {
         }
     }
 
+    fn emit_bin(
+        &mut self,
+        op: BinaryOperator,
+        left: Handle<Expression>,
+        right: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit_expr(Expression::Binary { op, left, right })
+    }
+
+    fn emit_select(
+        &mut self,
+        condition: Handle<Expression>,
+        accept: Handle<Expression>,
+        reject: Handle<Expression>,
+    ) -> Handle<Expression> {
+        self.emit_expr(Expression::Select {
+            condition,
+            accept,
+            reject,
+        })
+    }
+
+    fn emit_bit_not(&mut self, expr: Handle<Expression>) -> Handle<Expression> {
+        self.emit_expr(Expression::Unary {
+            op: UnaryOperator::BitwiseNot,
+            expr,
+        })
+    }
+
+    /// Canonical lane-mask SGPR value for a per-lane boolean (`1u` / `0u`).
+    fn bool_to_u32(&mut self, cond: Handle<Expression>) -> Handle<Expression> {
+        let t = self.lit_u32(1);
+        let f = self.lit_u32(0);
+        self.emit_select(cond, t, f)
+    }
+
+    /// Store a per-lane boolean into a 64-bit lane-mask destination (`vcc` or `s[n:n+1]`).
+    ///
+    /// One WGSL invocation models one wave lane, so SGPR lane masks are canonically
+    /// `(lo = lane bit, hi = 0)`; `exec` / `null` destinations are no-ops.
+    fn store_lane_mask(&mut self, sdst: u8, cond: Handle<Expression>) {
+        let sd7 = sdst & 0x7F;
+        if sd7 == 106 {
+            self.store_vcc(cond);
+        } else if sd7 <= 105 {
+            let mask_u = self.bool_to_u32(cond);
+            self.store_sgpr_u32(sd7, mask_u);
+            if sd7 <= 104 {
+                let zero = self.lit_u32(0);
+                self.store_sgpr_u32(sd7 + 1, zero);
+            }
+        }
+    }
+
+    /// Read this lane's bit (bit 0 of the low dword) of a 64-bit lane-mask source.
+    fn read_lane_mask_bit(&mut self, src: u16, literal: Option<u32>) -> Handle<Expression> {
+        match src {
+            106 => self.load_vcc(),
+            126 => self.lit_bool(true),
+            _ => {
+                let v = self.read_src_u32(src, literal);
+                let one = self.lit_u32(1);
+                let bit = self.emit_bin(BinaryOperator::And, v, one);
+                let zero = self.lit_u32(0);
+                self.emit_bin(BinaryOperator::NotEqual, bit, zero)
+            }
+        }
+    }
+
+    /// Read a 64-bit scalar source operand as `(lo, hi)` u32 halves.
+    ///
+    /// SGPR pairs read both registers, `vcc` yields `(lane bit, 0)`, `exec` is all ones, integer
+    /// inline constants are sign-extended, float inline constants use their `f64` bit pattern,
+    /// and 32-bit literals are zero-extended.
+    fn read_ssrc_pair(
+        &mut self,
+        src: u8,
+        literal: Option<u32>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        match src {
+            0..=104 => (self.load_sgpr_u32(src), self.load_sgpr_u32(src + 1)),
+            105 => (self.load_sgpr_u32(105), self.lit_u32(0)),
+            106 => (self.read_src_u32(106, None), self.lit_u32(0)),
+            126 => (self.lit_u32(0xFFFF_FFFF), self.lit_u32(0xFFFF_FFFF)),
+            128..=192 => (self.lit_u32(u32::from(src - 128)), self.lit_u32(0)),
+            193..=208 => {
+                let neg = -(i32::from(src) - 192);
+                (self.lit_u32(neg as u32), self.lit_u32(0xFFFF_FFFF))
+            }
+            240..=248 => {
+                let f = f64::from(Self::inline_float_value(u16::from(src)).unwrap_or(0.0));
+                let bits = f.to_bits();
+                (
+                    self.lit_u32((bits & 0xFFFF_FFFF) as u32),
+                    self.lit_u32((bits >> 32) as u32),
+                )
+            }
+            255 => (self.lit_u32(literal.unwrap_or(0)), self.lit_u32(0)),
+            _ => (self.read_src_u32(u16::from(src), literal), self.lit_u32(0)),
+        }
+    }
+
+    /// Read a 64-bit vector-ALU source (`v[n:n+1]`, SGPR pair, or constant) as `(lo, hi)`.
+    fn read_vsrc_pair(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        match src {
+            0..=255 => self.read_ssrc_pair(src as u8, literal),
+            256..=510 => {
+                let lo = self.read_src_u32(src, None);
+                let hi = self.read_src_u32(src + 1, None);
+                (lo, hi)
+            }
+            _ => (self.read_src_u32(src, literal), self.lit_u32(0)),
+        }
+    }
+
+    /// Store a 64-bit `(lo, hi)` scalar result into an SGPR pair destination.
+    ///
+    /// `vcc` receives this lane's bit (bit 0 of `lo`); `exec` / `null` are no-ops.
+    fn store_sdst_pair(&mut self, sdst: u8, lo: Handle<Expression>, hi: Handle<Expression>) {
+        match sdst {
+            0..=104 => {
+                self.store_sgpr_u32(sdst, lo);
+                self.store_sgpr_u32(sdst + 1, hi);
+            }
+            105 => self.store_sgpr_u32(105, lo),
+            106 => {
+                let one = self.lit_u32(1);
+                let bit = self.emit_bin(BinaryOperator::And, lo, one);
+                let zero = self.lit_u32(0);
+                let cond = self.emit_bin(BinaryOperator::NotEqual, bit, zero);
+                self.store_vcc(cond);
+            }
+            _ => {}
+        }
+    }
+
+    /// `scc = ((lo | hi) != 0u)` for 64-bit scalar results.
+    fn update_scc_nonzero_pair(&mut self, lo: Handle<Expression>, hi: Handle<Expression>) {
+        if self.scc_local.is_some() {
+            let any = self.emit_bin(BinaryOperator::InclusiveOr, lo, hi);
+            self.update_scc_nonzero(any);
+        }
+    }
+
+    /// Exact unsigned `32 x 32 -> hi32` multiply using only `u32` 16-bit half-word products.
+    fn emit_mul_hi_u32(
+        &mut self,
+        a: Handle<Expression>,
+        b: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let m16 = self.lit_u32(0xFFFF);
+        let s16 = self.lit_u32(16);
+        let a_lo = self.emit_bin(BinaryOperator::And, a, m16);
+        let a_hi = self.emit_bin(BinaryOperator::ShiftRight, a, s16);
+        let b_lo = self.emit_bin(BinaryOperator::And, b, m16);
+        let b_hi = self.emit_bin(BinaryOperator::ShiftRight, b, s16);
+        let ll = self.emit_bin(BinaryOperator::Multiply, a_lo, b_lo);
+        let lh = self.emit_bin(BinaryOperator::Multiply, a_lo, b_hi);
+        let hl = self.emit_bin(BinaryOperator::Multiply, a_hi, b_lo);
+        let hh = self.emit_bin(BinaryOperator::Multiply, a_hi, b_hi);
+        // mid = (ll >> 16) + lo16(lh) + lo16(hl)  (<= 3 * 0xFFFF, never overflows)
+        let ll_hi = self.emit_bin(BinaryOperator::ShiftRight, ll, s16);
+        let lh_lo = self.emit_bin(BinaryOperator::And, lh, m16);
+        let hl_lo = self.emit_bin(BinaryOperator::And, hl, m16);
+        let mid0 = self.emit_bin(BinaryOperator::Add, ll_hi, lh_lo);
+        let mid = self.emit_bin(BinaryOperator::Add, mid0, hl_lo);
+        // hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16)
+        let lh_hi = self.emit_bin(BinaryOperator::ShiftRight, lh, s16);
+        let hl_hi = self.emit_bin(BinaryOperator::ShiftRight, hl, s16);
+        let mid_hi = self.emit_bin(BinaryOperator::ShiftRight, mid, s16);
+        let r0 = self.emit_bin(BinaryOperator::Add, hh, lh_hi);
+        let r1 = self.emit_bin(BinaryOperator::Add, r0, hl_hi);
+        self.emit_bin(BinaryOperator::Add, r1, mid_hi)
+    }
+
+    /// Exact signed `32 x 32 -> hi32` multiply on `u32` bit patterns:
+    /// `mulhi_s(a, b) = mulhi_u(a, b) - (a < 0 ? b : 0) - (b < 0 ? a : 0)` (mod 2^32).
+    fn emit_mul_hi_i32(
+        &mut self,
+        a: Handle<Expression>,
+        b: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let hu = self.emit_mul_hi_u32(a, b);
+        let sign = self.lit_u32(0x8000_0000);
+        let zero = self.lit_u32(0);
+        let a_neg = self.emit_bin(BinaryOperator::GreaterEqual, a, sign);
+        let b_neg = self.emit_bin(BinaryOperator::GreaterEqual, b, sign);
+        let corr_a = self.emit_select(a_neg, b, zero);
+        let corr_b = self.emit_select(b_neg, a, zero);
+        let r0 = self.emit_bin(BinaryOperator::Subtract, hu, corr_a);
+        self.emit_bin(BinaryOperator::Subtract, r0, corr_b)
+    }
+
+    /// 64-bit shift of a `(lo, hi)` u32 pair by `amount & 63`, using only masked (`< 32`)
+    /// WGSL shift amounts and `select` for the `>= 32` half-swap.
+    fn emit_shift64(
+        &mut self,
+        kind: Shift64Kind,
+        lo: Handle<Expression>,
+        hi: Handle<Expression>,
+        amount: Handle<Expression>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let mask63 = self.lit_u32(63);
+        let mask31 = self.lit_u32(31);
+        let c32 = self.lit_u32(32);
+        let zero = self.lit_u32(0);
+        let amt = self.emit_bin(BinaryOperator::And, amount, mask63);
+        let s5 = self.emit_bin(BinaryOperator::And, amt, mask31);
+        let big = self.emit_bin(BinaryOperator::GreaterEqual, amt, c32);
+        let s5_nonzero = self.emit_bin(BinaryOperator::NotEqual, s5, zero);
+        let inv_raw = self.emit_bin(BinaryOperator::Subtract, c32, s5);
+        let inv = self.emit_bin(BinaryOperator::And, inv_raw, mask31);
+        let (lo_small, hi_small, lo_big, hi_big) = match kind {
+            Shift64Kind::Left => {
+                let lo_sh = self.emit_bin(BinaryOperator::ShiftLeft, lo, s5);
+                let hi_sh = self.emit_bin(BinaryOperator::ShiftLeft, hi, s5);
+                let spill_raw = self.emit_bin(BinaryOperator::ShiftRight, lo, inv);
+                let spill = self.emit_select(s5_nonzero, spill_raw, zero);
+                let hi_small = self.emit_bin(BinaryOperator::InclusiveOr, hi_sh, spill);
+                (lo_sh, hi_small, zero, lo_sh)
+            }
+            Shift64Kind::LogicalRight | Shift64Kind::ArithmeticRight => {
+                let lo_sh = self.emit_bin(BinaryOperator::ShiftRight, lo, s5);
+                let spill_raw = self.emit_bin(BinaryOperator::ShiftLeft, hi, inv);
+                let spill = self.emit_select(s5_nonzero, spill_raw, zero);
+                let lo_small = self.emit_bin(BinaryOperator::InclusiveOr, lo_sh, spill);
+                if kind == Shift64Kind::LogicalRight {
+                    let hi_sh = self.emit_bin(BinaryOperator::ShiftRight, hi, s5);
+                    (lo_small, hi_sh, hi_sh, zero)
+                } else {
+                    let hi_i = self.bitcast_u32_to_i32(hi);
+                    let hi_sar_i = self.emit_bin(BinaryOperator::ShiftRight, hi_i, s5);
+                    let hi_sar = self.bitcast_i32_to_u32(hi_sar_i);
+                    let c31 = self.lit_u32(31);
+                    let sign_i = self.emit_bin(BinaryOperator::ShiftRight, hi_i, c31);
+                    let sign = self.bitcast_i32_to_u32(sign_i);
+                    (lo_small, hi_sar, hi_sar, sign)
+                }
+            }
+        };
+        let out_lo = self.emit_select(big, lo_big, lo_small);
+        let out_hi = self.emit_select(big, hi_big, hi_small);
+        (out_lo, out_hi)
+    }
+
+    /// One 32-bit half of a SOP2 `*_b64` bitwise op (`and`/`or`/`xor`/`andn2`/`orn2`/`nand`/`nor`/`xnor`).
+    fn emit_sop2_bitwise_half(
+        &mut self,
+        op: u8,
+        l: Handle<Expression>,
+        r: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let (bin, invert_rhs, invert_result) = match op {
+            0x0E | 0x0F => (BinaryOperator::And, false, false),
+            0x10 | 0x11 => (BinaryOperator::InclusiveOr, false, false),
+            0x12 | 0x13 => (BinaryOperator::ExclusiveOr, false, false),
+            0x14 | 0x15 => (BinaryOperator::And, true, false),
+            0x16 | 0x17 => (BinaryOperator::InclusiveOr, true, false),
+            0x18 | 0x19 => (BinaryOperator::And, false, true),
+            0x1A | 0x1B => (BinaryOperator::InclusiveOr, false, true),
+            _ => (BinaryOperator::ExclusiveOr, false, true),
+        };
+        let rhs = if invert_rhs { self.emit_bit_not(r) } else { r };
+        let res = self.emit_bin(bin, l, rhs);
+        if invert_result {
+            self.emit_bit_not(res)
+        } else {
+            res
+        }
+    }
+
+    /// IEEE-754 binary32 class test for `v_cmp_class_f32`: returns `true` when the class of
+    /// `bits` has its bit set in `mask` (0 sNaN, 1 qNaN, 2 -Inf, 3 -Normal, 4 -Subnormal,
+    /// 5 -0, 6 +0, 7 +Subnormal, 8 +Normal, 9 +Inf).
+    fn emit_f32_class_test(
+        &mut self,
+        bits: Handle<Expression>,
+        mask: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let s23 = self.lit_u32(23);
+        let s31 = self.lit_u32(31);
+        let exp_mask = self.lit_u32(0xFF);
+        let mant_mask = self.lit_u32(0x007F_FFFF);
+        let quiet_bit = self.lit_u32(0x0040_0000);
+        let zero = self.lit_u32(0);
+        let one = self.lit_u32(1);
+        let exp_sh = self.emit_bin(BinaryOperator::ShiftRight, bits, s23);
+        let exp = self.emit_bin(BinaryOperator::And, exp_sh, exp_mask);
+        let mant = self.emit_bin(BinaryOperator::And, bits, mant_mask);
+        let sign = self.emit_bin(BinaryOperator::ShiftRight, bits, s31);
+        let neg = self.emit_bin(BinaryOperator::NotEqual, sign, zero);
+        let exp_max = self.emit_bin(BinaryOperator::Equal, exp, exp_mask);
+        let exp_zero = self.emit_bin(BinaryOperator::Equal, exp, zero);
+        let mant_zero = self.emit_bin(BinaryOperator::Equal, mant, zero);
+        let quiet_raw = self.emit_bin(BinaryOperator::And, bits, quiet_bit);
+        let quiet = self.emit_bin(BinaryOperator::NotEqual, quiet_raw, zero);
+
+        let idx_snan = self.lit_u32(0);
+        let idx_qnan = self.lit_u32(1);
+        let idx_ninf = self.lit_u32(2);
+        let idx_nnorm = self.lit_u32(3);
+        let idx_nsub = self.lit_u32(4);
+        let idx_nzero = self.lit_u32(5);
+        let idx_pzero = self.lit_u32(6);
+        let idx_psub = self.lit_u32(7);
+        let idx_pnorm = self.lit_u32(8);
+        let idx_pinf = self.lit_u32(9);
+
+        let nan_idx = self.emit_select(quiet, idx_qnan, idx_snan);
+        let inf_idx = self.emit_select(neg, idx_ninf, idx_pinf);
+        let zero_idx = self.emit_select(neg, idx_nzero, idx_pzero);
+        let sub_idx = self.emit_select(neg, idx_nsub, idx_psub);
+        let norm_idx = self.emit_select(neg, idx_nnorm, idx_pnorm);
+        let special_idx = self.emit_select(mant_zero, inf_idx, nan_idx);
+        let tiny_idx = self.emit_select(mant_zero, zero_idx, sub_idx);
+        let finite_idx = self.emit_select(exp_zero, tiny_idx, norm_idx);
+        let idx = self.emit_select(exp_max, special_idx, finite_idx);
+
+        let shifted = self.emit_bin(BinaryOperator::ShiftRight, mask, idx);
+        let bit = self.emit_bin(BinaryOperator::And, shifted, one);
+        self.emit_bin(BinaryOperator::NotEqual, bit, zero)
+    }
+
     fn apply_float_out_mods(
         &mut self,
         mut val: Handle<Expression>,
@@ -4424,7 +4857,7 @@ impl IrEmitter {
         }
 
         let handled = match &inst.detail {
-            Rdna2Detail::Sopp { op, .. } => self.translate_sopp(*op),
+            Rdna2Detail::Sopp { op, .. } => self.translate_sopp(*op, inst.offset),
             Rdna2Detail::Sopc {
                 op,
                 ssrc0,
@@ -4484,6 +4917,7 @@ impl IrEmitter {
                 false,
                 0,
                 0,
+                None,
             ),
             Rdna2Detail::Vop3 {
                 op,
@@ -4598,29 +5032,95 @@ impl IrEmitter {
 
     // -- SOPP / SOPC / SOP1 / SOPK / SOP2 / SMEM --
 
-    fn translate_sopp(&mut self, op: u8) -> bool {
+    fn translate_sopp(&mut self, op: u8, offset: usize) -> bool {
         match op {
             // s_nop, s_endpgm, s_waitcnt, s_setprio (scheduling priority hint),
             // s_endpgm_saved, s_endpgm_ordered_ps_done, s_code_end,
             // s_inst_prefetch, s_clause, s_wait_idle, s_waitcnt_depctr
             0x00 | 0x01 | 0x0C | 0x0F | 0x1B | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 => true,
-            // s_barrier
+            // s_barrier: `workgroupBarrier()` in compute; WGSL/WebGPU forbids it in vertex and
+            // fragment stages (no workgroups there), so it lowers to a documented no-op.
             0x0A => {
                 if self.stage == ShaderStage::Compute {
                     self.func.body.push(
                         Statement::ControlBarrier(naga::Barrier::WORK_GROUP),
                         Span::UNDEFINED,
                     );
-                    true
                 } else {
-                    false
+                    self.note_comments.push(format!(
+                        "// note [0x{offset:04x}] s_barrier: no-op in {} stage (workgroupBarrier is compute-only)",
+                        self.stage.as_str()
+                    ));
                 }
+                true
             }
             _ => false,
         }
     }
 
     fn translate_sopc(&mut self, op: u8, ssrc0: u8, ssrc1: u8, literal: Option<u32>) -> bool {
+        match op {
+            // s_bitcmp0_b32 / s_bitcmp1_b32: scc = (src0 & (1u << (src1 & 31u))) ==/!= 0u
+            0x0C | 0x0D => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let idx_raw = self.read_src_u32(u16::from(ssrc1), literal);
+                let mask31 = self.lit_u32(31);
+                let idx = self.emit_bin(BinaryOperator::And, idx_raw, mask31);
+                let one = self.lit_u32(1);
+                let bit_mask = self.emit_bin(BinaryOperator::ShiftLeft, one, idx);
+                let bit = self.emit_bin(BinaryOperator::And, v, bit_mask);
+                let zero = self.lit_u32(0);
+                let cmp_op = if op == 0x0C {
+                    BinaryOperator::Equal
+                } else {
+                    BinaryOperator::NotEqual
+                };
+                let cmp = self.emit_bin(cmp_op, bit, zero);
+                self.store_scc(cmp);
+                return true;
+            }
+            // s_bitcmp0_b64 / s_bitcmp1_b64: test bit (src1 & 63) of the 64-bit src0 pair
+            0x0E | 0x0F => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let idx_raw = self.read_src_u32(u16::from(ssrc1), literal);
+                let mask63 = self.lit_u32(63);
+                let mask31 = self.lit_u32(31);
+                let c32 = self.lit_u32(32);
+                let idx = self.emit_bin(BinaryOperator::And, idx_raw, mask63);
+                let in_hi = self.emit_bin(BinaryOperator::GreaterEqual, idx, c32);
+                let word = self.emit_select(in_hi, hi, lo);
+                let sh = self.emit_bin(BinaryOperator::And, idx, mask31);
+                let one = self.lit_u32(1);
+                let bit_mask = self.emit_bin(BinaryOperator::ShiftLeft, one, sh);
+                let bit = self.emit_bin(BinaryOperator::And, word, bit_mask);
+                let zero = self.lit_u32(0);
+                let cmp_op = if op == 0x0E {
+                    BinaryOperator::Equal
+                } else {
+                    BinaryOperator::NotEqual
+                };
+                let cmp = self.emit_bin(cmp_op, bit, zero);
+                self.store_scc(cmp);
+                return true;
+            }
+            // s_cmp_eq_u64 / s_cmp_lg_u64 on SGPR pairs
+            0x12 | 0x13 => {
+                let (a_lo, a_hi) = self.read_ssrc_pair(ssrc0, literal);
+                let (b_lo, b_hi) = self.read_ssrc_pair(ssrc1, literal);
+                let cmp = if op == 0x12 {
+                    let eq_lo = self.emit_bin(BinaryOperator::Equal, a_lo, b_lo);
+                    let eq_hi = self.emit_bin(BinaryOperator::Equal, a_hi, b_hi);
+                    self.emit_bin(BinaryOperator::LogicalAnd, eq_lo, eq_hi)
+                } else {
+                    let ne_lo = self.emit_bin(BinaryOperator::NotEqual, a_lo, b_lo);
+                    let ne_hi = self.emit_bin(BinaryOperator::NotEqual, a_hi, b_hi);
+                    self.emit_bin(BinaryOperator::LogicalOr, ne_lo, ne_hi)
+                };
+                self.store_scc(cmp);
+                return true;
+            }
+            _ => {}
+        }
         let bin_op = match op {
             0x00 | 0x06 => BinaryOperator::Equal,
             0x01 | 0x07 => BinaryOperator::NotEqual,
@@ -4664,27 +5164,7 @@ impl IrEmitter {
             }
             // s_mov_b64 / s_wqm_b64: 64-bit scalar register-pair move (evaluate both halves before storing)
             0x04 | 0x0A => {
-                let (lo, hi) = match ssrc0 {
-                    0..=104 => (self.load_sgpr_u32(ssrc0), self.load_sgpr_u32(ssrc0 + 1)),
-                    105 => (self.load_sgpr_u32(105), self.lit_u32(0)),
-                    106 => (self.read_src_u32(106, None), self.lit_u32(0)),
-                    126 => (self.lit_u32(0xFFFF_FFFF), self.lit_u32(0xFFFF_FFFF)),
-                    128..=192 => (self.lit_u32(u32::from(ssrc0 - 128)), self.lit_u32(0)),
-                    193..=208 => {
-                        let neg = -(i32::from(ssrc0) - 192);
-                        (self.lit_u32(neg as u32), self.lit_u32(0xFFFF_FFFF))
-                    }
-                    240..=248 => {
-                        let f = f64::from(Self::inline_float_value(u16::from(ssrc0)).unwrap_or(0.0));
-                        let bits = f.to_bits();
-                        (
-                            self.lit_u32((bits & 0xFFFF_FFFF) as u32),
-                            self.lit_u32((bits >> 32) as u32),
-                        )
-                    }
-                    255 => (self.lit_u32(literal.unwrap_or(0)), self.lit_u32(0)),
-                    _ => (self.read_src_u32(u16::from(ssrc0), literal), self.lit_u32(0)),
-                };
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
                 match sdst {
                     0..=104 => {
                         self.store_sgpr_u32(sdst, lo);
@@ -4922,6 +5402,52 @@ impl IrEmitter {
                     accept,
                     reject,
                 });
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_cselect_b64: scc ? src0[0:1] : src1[0:1]
+            0x0B => {
+                let cond = self.load_scc();
+                let (a_lo, a_hi) = self.read_ssrc_pair(ssrc0, literal);
+                let (b_lo, b_hi) = self.read_ssrc_pair(ssrc1, literal);
+                let lo = self.emit_select(cond, a_lo, b_lo);
+                let hi = self.emit_select(cond, a_hi, b_hi);
+                self.store_sdst_pair(sdst, lo, hi);
+                true
+            }
+            // s_{and,or,xor,andn2,orn2,nand,nor,xnor}_b64 on SGPR pairs; scc = ((lo | hi) != 0u)
+            0x0F | 0x11 | 0x13 | 0x15 | 0x17 | 0x19 | 0x1B | 0x1D => {
+                let (l_lo, l_hi) = self.read_ssrc_pair(ssrc0, literal);
+                let (r_lo, r_hi) = self.read_ssrc_pair(ssrc1, literal);
+                let lo = self.emit_sop2_bitwise_half(op, l_lo, r_lo);
+                let hi = self.emit_sop2_bitwise_half(op, l_hi, r_hi);
+                self.store_sdst_pair(sdst, lo, hi);
+                self.update_scc_nonzero_pair(lo, hi);
+                true
+            }
+            // s_lshl_b64 / s_lshr_b64 / s_ashr_i64: 64-bit pair shift by (src1 & 63); scc = result != 0
+            0x1F | 0x21 | 0x23 => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let amount = self.read_src_u32(s1_u(), literal);
+                let kind = match op {
+                    0x1F => Shift64Kind::Left,
+                    0x21 => Shift64Kind::LogicalRight,
+                    _ => Shift64Kind::ArithmeticRight,
+                };
+                let (rlo, rhi) = self.emit_shift64(kind, lo, hi, amount);
+                self.store_sdst_pair(sdst, rlo, rhi);
+                self.update_scc_nonzero_pair(rlo, rhi);
+                true
+            }
+            // s_mul_hi_u32 / s_mul_hi_i32: exact high 32 bits of the 64-bit product
+            0x35 | 0x36 => {
+                let l = self.read_src_u32(s0_u(), literal);
+                let r = self.read_src_u32(s1_u(), literal);
+                let res = if op == 0x35 {
+                    self.emit_mul_hi_u32(l, r)
+                } else {
+                    self.emit_mul_hi_i32(l, r)
+                };
                 self.store_sgpr_u32(sdst, res);
                 true
             }
@@ -5704,25 +6230,27 @@ impl IrEmitter {
                 let r = self.read_src_u32(src1, literal);
                 self.emit_int_cmp(cc, l, r)
             }
+            // v_cmp_class_f32 / v_cmpx_class_f32: IEEE-754 class of src0 tested against the
+            // src1 class mask (bits 0..9). Source modifiers act on the raw sign bit.
+            0x88 | 0x98 => {
+                let mut bits = self.read_src_u32(src0, literal);
+                if (abs & 1) != 0 {
+                    let clear_sign = self.lit_u32(0x7FFF_FFFF);
+                    bits = self.emit_bin(BinaryOperator::And, bits, clear_sign);
+                }
+                if (neg & 1) != 0 {
+                    let sign = self.lit_u32(0x8000_0000);
+                    bits = self.emit_bin(BinaryOperator::ExclusiveOr, bits, sign);
+                }
+                let mask = self.read_src_u32(src1, literal);
+                self.emit_f32_class_test(bits, mask)
+            }
             _ => return false,
         };
 
-        if let Some(sd) = sdst_override {
-            let sd7 = sd & 0x7F;
-            if sd7 == 106 {
-                self.store_vcc(cmp);
-            } else if sd7 <= 105 {
-                let t = self.lit_u32(1);
-                let f = self.lit_u32(0);
-                let mask_u = self.emit_expr(Expression::Select {
-                    condition: cmp,
-                    accept: t,
-                    reject: f,
-                });
-                self.store_sgpr_u32(sd7, mask_u);
-            }
-        } else {
-            self.store_vcc(cmp);
+        match sdst_override {
+            Some(sd) => self.store_lane_mask(sd, cmp),
+            None => self.store_vcc(cmp),
         }
         true
     }
@@ -5782,6 +6310,7 @@ impl IrEmitter {
         clamp: bool,
         abs: u8,
         neg: u8,
+        carry_sdst: Option<u8>,
     ) -> bool {
         let abs0 = (abs & 1) != 0;
         let neg0 = (neg & 1) != 0;
@@ -6042,8 +6571,32 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_mul_hi_i32_i24 / v_mul_hi_u32_u24: bits [47:32] of the 24x24-bit product
+            0x0A | 0x0C => {
+                let l_raw = self.read_src_u32(src0, literal);
+                let r_raw = self.read_src_u32(src1, literal);
+                let res = if op == 0x0C {
+                    let mask24 = self.lit_u32(0x00FF_FFFF);
+                    let l = self.emit_bin(BinaryOperator::And, l_raw, mask24);
+                    let r = self.emit_bin(BinaryOperator::And, r_raw, mask24);
+                    self.emit_mul_hi_u32(l, r)
+                } else {
+                    let sh8 = self.lit_u32(8);
+                    let l_i = self.bitcast_u32_to_i32(l_raw);
+                    let r_i = self.bitcast_u32_to_i32(r_raw);
+                    let l_shl = self.emit_bin(BinaryOperator::ShiftLeft, l_i, sh8);
+                    let r_shl = self.emit_bin(BinaryOperator::ShiftLeft, r_i, sh8);
+                    let l_sext = self.emit_bin(BinaryOperator::ShiftRight, l_shl, sh8);
+                    let r_sext = self.emit_bin(BinaryOperator::ShiftRight, r_shl, sh8);
+                    let l = self.bitcast_i32_to_u32(l_sext);
+                    let r = self.bitcast_i32_to_u32(r_sext);
+                    self.emit_mul_hi_i32(l, r)
+                };
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_lshrrev_b32 / v_lshlrev_b32: src1 >>/<< (src0 & 31)
-            0x16 | 0x18 => {
+            0x16 | 0x1A => {
                 let sh_raw = self.read_src_u32(src0, literal);
                 let val = self.read_src_u32(src1, literal);
                 let mask = self.lit_u32(31);
@@ -6066,7 +6619,7 @@ impl IrEmitter {
                 true
             }
             // v_ashrrev_i32: i32(src1) >> (src0 & 31)
-            0x17 => {
+            0x18 => {
                 let sh_raw = self.read_src_u32(src0, literal);
                 let val = self.read_src_i32(src1, literal);
                 let mask = self.lit_u32(31);
@@ -6084,12 +6637,12 @@ impl IrEmitter {
                 true
             }
             // v_and_b32 / v_or_b32 / v_xor_b32
-            0x19 | 0x1A | 0x1B => {
+            0x1B..=0x1D => {
                 let l = self.read_src_u32(src0, literal);
                 let r = self.read_src_u32(src1, literal);
                 let bin = match op {
-                    0x19 => BinaryOperator::And,
-                    0x1A => BinaryOperator::InclusiveOr,
+                    0x1B => BinaryOperator::And,
+                    0x1C => BinaryOperator::InclusiveOr,
                     _ => BinaryOperator::ExclusiveOr,
                 };
                 let res = self.emit_expr(Expression::Binary {
@@ -6101,7 +6654,7 @@ impl IrEmitter {
                 true
             }
             // v_xnor_b32: ~(src0 ^ src1)
-            0x1C => {
+            0x1E => {
                 let l = self.read_src_u32(src0, literal);
                 let r = self.read_src_u32(src1, literal);
                 let x = self.emit_expr(Expression::Binary {
@@ -6114,6 +6667,64 @@ impl IrEmitter {
                     expr: x,
                 });
                 self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_mac_f32 (GFX10.1): vdst = src0 * src1 + vdst (unfused)
+            0x1F => {
+                let a = self.read_src_f32(src0, literal, abs0, neg0);
+                let b = self.read_src_f32(src1, literal, abs1, neg1);
+                let c = self.load_vgpr_f32(vdst);
+                let prod = self.emit_bin(BinaryOperator::Multiply, a, b);
+                let res = self.emit_bin(BinaryOperator::Add, prod, c);
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_madmk_f32 (GFX10.1): vdst = src0 * K + src1 (unfused, mandatory K literal)
+            // v_madak_f32 (GFX10.1): vdst = src0 * src1 + K (unfused, mandatory K literal)
+            0x20 | 0x21 => {
+                let a = self.read_src_f32(src0, None, abs0, neg0);
+                let b = self.read_src_f32(src1, None, abs1, neg1);
+                let k = self.lit_f32_from_bits(literal.unwrap_or(0));
+                let res = if op == 0x20 {
+                    let prod = self.emit_bin(BinaryOperator::Multiply, a, k);
+                    self.emit_bin(BinaryOperator::Add, prod, b)
+                } else {
+                    let prod = self.emit_bin(BinaryOperator::Multiply, a, b);
+                    self.emit_bin(BinaryOperator::Add, prod, k)
+                };
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_add_co_ci_u32 / v_sub_co_ci_u32 / v_subrev_co_ci_u32:
+            //   carry-in from VCC (VOP2) or src2 (VOP3B); carry/borrow-out to VCC or sdst.
+            0x28..=0x2A => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let cin_bool = match cond_src {
+                    Some(csrc) => self.read_lane_mask_bit(csrc, literal),
+                    None => self.load_vcc(),
+                };
+                let cin = self.bool_to_u32(cin_bool);
+                let (res, carry) = if op == 0x28 {
+                    let s1 = self.emit_bin(BinaryOperator::Add, a, b);
+                    let c1 = self.emit_bin(BinaryOperator::Less, s1, a);
+                    let s2 = self.emit_bin(BinaryOperator::Add, s1, cin);
+                    let c2 = self.emit_bin(BinaryOperator::Less, s2, s1);
+                    let c = self.emit_bin(BinaryOperator::LogicalOr, c1, c2);
+                    (s2, c)
+                } else {
+                    let (x, y) = if op == 0x29 { (a, b) } else { (b, a) };
+                    let d1 = self.emit_bin(BinaryOperator::Subtract, x, y);
+                    let b1 = self.emit_bin(BinaryOperator::Less, x, y);
+                    let d2 = self.emit_bin(BinaryOperator::Subtract, d1, cin);
+                    let b2 = self.emit_bin(BinaryOperator::Less, d1, cin);
+                    let c = self.emit_bin(BinaryOperator::LogicalOr, b1, b2);
+                    (d2, c)
+                };
+                self.store_vgpr_u32(vdst, res);
+                self.store_lane_mask(carry_sdst.unwrap_or(106), carry);
                 true
             }
             // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32
@@ -6166,7 +6777,7 @@ impl IrEmitter {
                 true
             }
             // v_cvt_pkrtz_f16_f32: pack2x16float(vec2<f32>(src0, src1))
-            0x2E => {
+            0x2F => {
                 let a_raw = self.read_src_f32(src0, literal, abs0, neg0);
                 let b_raw = self.read_src_f32(src1, literal, abs1, neg1);
                 let a = self.apply_float_out_mods(a_raw, omod, clamp);
@@ -6353,13 +6964,17 @@ impl IrEmitter {
         // VOP2 promoted to VOP3 (0x100..=0x13F)
         if (0x100..=0x13F).contains(&op) {
             let v2_op = (op - 0x100) as u8;
-            let cond = if matches!(v2_op, 0x00 | 0x01) {
+            if vop2_is_madk(v2_op) {
+                // *mk*/*ak* forms are VOP2-only (inline K literal); no VOP3 encoding exists.
+                return false;
+            }
+            let cond = if matches!(v2_op, 0x00 | 0x01) || vop2_is_co_ci(v2_op) {
                 Some(src2)
             } else {
                 None
             };
             return self.translate_vop2(
-                v2_op, vdst, src0, src1, cond, literal, omod, clamp, abs, neg,
+                v2_op, vdst, src0, src1, cond, literal, omod, clamp, abs, neg, sdst,
             );
         }
         // VOP1 promoted to VOP3 (0x180..=0x1FF)
@@ -6817,19 +7432,36 @@ impl IrEmitter {
                 };
                 self.store_vgpr_u32(vdst, res);
                 if let Some(sd) = sdst {
-                    let sd7 = sd & 0x7F;
-                    if sd7 == 106 {
-                        self.store_vcc(carry);
-                    } else if sd7 <= 105 {
-                        let t = self.lit_u32(1);
-                        let f = self.lit_u32(0);
-                        let mask_u = self.emit_expr(Expression::Select {
-                            condition: carry,
-                            accept: t,
-                            reject: f,
-                        });
-                        self.store_sgpr_u32(sd7, mask_u);
-                    }
+                    self.store_lane_mask(sd, carry);
+                }
+                true
+            }
+            // v_mul_hi_u32 / v_mul_hi_i32: exact high 32 bits of the 32x32 product (u32-only WGSL)
+            0x16A | 0x16C => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let res = if op == 0x16A {
+                    self.emit_mul_hi_u32(a, b)
+                } else {
+                    self.emit_mul_hi_i32(a, b)
+                };
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64:
+            //   vdst[0:1] = src1[0:1] <</>>/>>> (src0 & 63) on u32 register pairs
+            0x2FF..=0x301 => {
+                let amount = self.read_src_u32(src0, literal);
+                let (lo, hi) = self.read_vsrc_pair(src1, literal);
+                let kind = match op {
+                    0x2FF => Shift64Kind::Left,
+                    0x300 => Shift64Kind::LogicalRight,
+                    _ => Shift64Kind::ArithmeticRight,
+                };
+                let (rlo, rhi) = self.emit_shift64(kind, lo, hi, amount);
+                self.store_vgpr_u32(vdst, rlo);
+                if vdst < 255 {
+                    self.store_vgpr_u32(vdst + 1, rhi);
                 }
                 true
             }
@@ -8132,7 +8764,14 @@ impl IrEmitter {
     fn finish(
         mut self,
         entry_name: String,
-    ) -> (Module, usize, usize, Vec<String>, Vec<WgslBindingInfo>) {
+    ) -> (
+        Module,
+        usize,
+        usize,
+        Vec<String>,
+        Vec<String>,
+        Vec<WgslBindingInfo>,
+    ) {
         // Emit stage return statement.
         match self.stage {
             ShaderStage::Vertex => {
@@ -8181,6 +8820,7 @@ impl IrEmitter {
             self.translated_op_count,
             self.unsupported_op_count,
             self.unsupported_comments,
+            self.note_comments,
             self.emitted_bindings,
         )
     }
@@ -8209,8 +8849,14 @@ pub fn translate_rdna2_to_wgsl(
     }
 
     let entry_point = plan.entry_point.clone();
-    let (module, translated_op_count, unsupported_op_count, unsupported_comments, bindings) =
-        emitter.finish(entry_point.clone());
+    let (
+        module,
+        translated_op_count,
+        unsupported_op_count,
+        unsupported_comments,
+        note_comments,
+        bindings,
+    ) = emitter.finish(entry_point.clone());
 
     // Unconditional Naga validation against baseline WebGPU capabilities.
     let mut validator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
@@ -8239,7 +8885,7 @@ pub fn translate_rdna2_to_wgsl(
         translated_op_count,
         unsupported_op_count
     );
-    for comment in &unsupported_comments {
+    for comment in unsupported_comments.iter().chain(note_comments.iter()) {
         let _ = writeln!(wgsl, "{comment}");
     }
     wgsl.push('\n');
@@ -8469,9 +9115,9 @@ mod tests {
         //   exp param0 v1, v2, off, off done
         //   s_endpgm
         let mut words = Vec::new();
-        words.push(enc_vop2(0x18, 1, 128 + 1, 0)); // v_lshlrev_b32 v1, 1, v0
-        words.push(enc_vop2(0x19, 1, 128 + 2, 1)); // v_and_b32 v1, 2, v1
-        words.push(enc_vop2(0x19, 2, 128 + 2, 0)); // v_and_b32 v2, 2, v0
+        words.push(enc_vop2(0x1A, 1, 128 + 1, 0)); // v_lshlrev_b32 v1, 1, v0
+        words.push(enc_vop2(0x1B, 1, 128 + 2, 1)); // v_and_b32 v1, 2, v1
+        words.push(enc_vop2(0x1B, 2, 128 + 2, 0)); // v_and_b32 v2, 2, v0
         words.push(enc_vop1(0x06, 1, 256 + 1)); // v_cvt_f32_u32 v1, v1
         words.push(enc_vop1(0x06, 2, 256 + 2)); // v_cvt_f32_u32 v2, v2
         words.extend_from_slice(&enc_vop3(0x14B, 3, 256 + 1, 244, 243, false, 0, 0, 0)); // fma(v1, 2.0, -1.0)
@@ -8655,8 +9301,8 @@ mod tests {
         let mut words = Vec::new();
         words.push(enc_vop1(0x01, 0, 242)); // 1.0
         words.push(enc_vop1(0x01, 1, 240)); // 0.5
-        words.push(enc_vop2(0x2E, 2, 256 + 0, 1)); // v_cvt_pkrtz_f16_f32 v2, v0, v1
-        words.push(enc_vop2(0x2E, 3, 256 + 1, 0)); // v_cvt_pkrtz_f16_f32 v3, v1, v0
+        words.push(enc_vop2(0x2F, 2, 256 + 0, 1)); // v_cvt_pkrtz_f16_f32 v2, v0, v1
+        words.push(enc_vop2(0x2F, 3, 256 + 1, 0)); // v_cvt_pkrtz_f16_f32 v3, v1, v0
         words.extend_from_slice(&enc_exp(0, 0xF, true, true, true, [2, 3, 0, 0])); // compr
         words.push(enc_sopp(0x01, 0));
 
@@ -9281,8 +9927,8 @@ mod tests {
         words.push(enc_sopp(0x0C, 0xC07F)); // s_waitcnt lgkmcnt(0)
         words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 4, 2, 3)); // image_sample_lz
         words.push(enc_sopp(0x0C, 0x3F70)); // s_waitcnt vmcnt(0)
-        words.push(enc_vop2(0x2E, 8, 256 + 4, 5)); // v_cvt_pkrtz_f16_f32 v8, v4, v5
-        words.push(enc_vop2(0x2E, 9, 256 + 6, 7)); // v_cvt_pkrtz_f16_f32 v9, v6, v7
+        words.push(enc_vop2(0x2F, 8, 256 + 4, 5)); // v_cvt_pkrtz_f16_f32 v8, v4, v5
+        words.push(enc_vop2(0x2F, 9, 256 + 6, 7)); // v_cvt_pkrtz_f16_f32 v9, v6, v7
         words.extend_from_slice(&enc_vop3p(
             0x0E,
             8,
@@ -9442,8 +10088,8 @@ mod tests {
         fs_words.extend_from_slice(&enc_mimg(0x24, 0xF, 1, 2, 5, 2, 1)); // image_sample_l v[5:8], v[2:4]
         fs_words.extend_from_slice(&enc_vop3(0x157, 5, 256 + 5, 4, 5, false, 0, 0, 0)); // v_med3_f32
         // VOP3 v_cvt_pkrtz_f16_f32 (0x12E) with clamp
-        fs_words.extend_from_slice(&enc_vop3(0x12E, 9, 256 + 5, 256 + 6, 0, true, 0, 0, 0));
-        fs_words.extend_from_slice(&enc_vop3(0x12E, 10, 256 + 7, 256 + 8, 0, true, 0, 0, 0));
+        fs_words.extend_from_slice(&enc_vop3(0x12F, 9, 256 + 5, 256 + 6, 0, true, 0, 0, 0));
+        fs_words.extend_from_slice(&enc_vop3(0x12F, 10, 256 + 7, 256 + 8, 0, true, 0, 0, 0));
         fs_words.extend_from_slice(&enc_vop3p(0x10, 9, 256 + 9, 6, 0, false, 0, 0b011, 0, 0)); // v_pk_mul_f16
         fs_words.extend_from_slice(&enc_vop3p(0x0F, 9, 256 + 9, 7, 0, true, 0, 0b011, 0, 0)); // v_pk_add_f16
         fs_words.extend_from_slice(&enc_exp(0, 0xF, true, true, true, [9, 10, 0, 0]));
@@ -9878,7 +10524,7 @@ mod tests {
         //   s_endpgm
         let mut words = Vec::new();
         words.extend_from_slice(&enc_vop3(0x346, 3, 0, 128 + 6, 256 + 0, false, 0, 0, 0)); // v_lshl_add_u32 v3, s0, 6, v0
-        words.push(enc_vop2(0x18, 3, 128 + 4, 3)); // v_lshlrev_b32 v3, 4, v3
+        words.push(enc_vop2(0x1A, 3, 128 + 4, 3)); // v_lshlrev_b32 v3, 4, v3
         words.extend_from_slice(&enc_mubuf_full(0x0E, 0, true, false, 3, 4, 1, 128)); // buffer_load_dwordx4
         words.extend_from_slice(&enc_mubuf_full(0x08, 2, true, false, 3, 8, 1, 128)); // buffer_load_ubyte
         words.extend_from_slice(&enc_mubuf_full(0x0A, 4, true, false, 3, 9, 1, 128)); // buffer_load_ushort
@@ -10030,7 +10676,7 @@ mod tests {
         // ds_write_b128, s_barrier, ds_read_b32, ds_read2_b32, ds_read_b64, ds_read_b128,
         // and buffer_store_dword{,x2,x3,x4}:
         let mut words = Vec::new();
-        words.push(enc_vop2(0x18, 3, 128 + 2, 0)); // v_lshlrev_b32 v3, 2, v0 (byte addr = local_id.x * 4)
+        words.push(enc_vop2(0x1A, 3, 128 + 2, 0)); // v_lshlrev_b32 v3, 2, v0 (byte addr = local_id.x * 4)
         words.push(enc_vop1(0x01, 4, 242)); // v4 = 1.0
         words.push(enc_vop1(0x01, 5, 244)); // v5 = 2.0
         words.push(enc_vop1(0x01, 6, 240)); // v6 = 0.5
@@ -10577,6 +11223,632 @@ mod tests {
             .expect("VS should translate");
         assert_eq!(out.bindings.len(), 1, "bindings: {:?}", out.bindings);
         assert_eq!(out.bindings[0].name, "cb0");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    // -----------------------------------------------------------------------
+    // S28: GFX10 VOP2 slots, 64-bit SOP2/SOPC, mul_hi, 64-bit shifts, class, s_barrier
+    // -----------------------------------------------------------------------
+
+    fn enc_sopc(op: u8, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b1011_1111_0u32 << 23)
+            | (u32::from(op & 0x7F) << 16)
+            | (u32::from(ssrc1) << 8)
+            | u32::from(ssrc0)
+    }
+
+    /// VOP3B encoding (`sdst` in bits [14:8]) for carry-out ops such as `v_add_co_ci_u32_e64`.
+    fn enc_vop3b(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+        let w0 = (0b110101u32 << 26)
+            | (u32::from(op & 0x3FF) << 16)
+            | (u32::from(sdst & 0x7F) << 8)
+            | u32::from(vdst);
+        let w1 = (u32::from(src2 & 0x1FF) << 18)
+            | (u32::from(src1 & 0x1FF) << 9)
+            | u32::from(src0 & 0x1FF);
+        [w0, w1]
+    }
+
+    fn translate_as(words: &[u32], stage: Rdna2StageOverride) -> Rdna2WgslOutput {
+        let bytes = words_to_bytes(words);
+        let options = Rdna2TranslateOptions {
+            stage,
+            ..Rdna2TranslateOptions::default()
+        };
+        translate_rdna2_to_wgsl(&bytes, &options)
+            .unwrap_or_else(|e| panic!("translation must succeed: {e}"))
+    }
+
+    /// Right-hand side of the last `name = <rhs>;` assignment in the WGSL text.
+    fn last_assignment(wgsl: &str, name: &str) -> Option<String> {
+        let prefix = format!("{name} = ");
+        wgsl.lines()
+            .map(str::trim)
+            .rfind(|line| line.starts_with(&prefix) && line.ends_with(';'))
+            .map(|line| line[prefix.len()..line.len() - 1].to_string())
+    }
+
+    /// Reference multiply-high values computed with native 64-bit integers.
+    fn ref_mul_hi_u32(a: u32, b: u32) -> u32 {
+        ((u64::from(a) * u64::from(b)) >> 32) as u32
+    }
+
+    fn ref_mul_hi_i32(a: u32, b: u32) -> u32 {
+        ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+    }
+
+    /// Reference `v_cmp_class_f32` class index computed with Rust's `f32::classify`.
+    fn ref_f32_class(bits: u32) -> u32 {
+        let f = f32::from_bits(bits);
+        let neg = (bits >> 31) != 0;
+        match f.classify() {
+            std::num::FpCategory::Nan => u32::from((bits & 0x0040_0000) != 0),
+            std::num::FpCategory::Infinite => {
+                if neg {
+                    2
+                } else {
+                    9
+                }
+            }
+            std::num::FpCategory::Normal => {
+                if neg {
+                    3
+                } else {
+                    8
+                }
+            }
+            std::num::FpCategory::Subnormal => {
+                if neg {
+                    4
+                } else {
+                    7
+                }
+            }
+            std::num::FpCategory::Zero => {
+                if neg {
+                    5
+                } else {
+                    6
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn translates_gfx10_vop2_alu_fmac_madk_carry_and_pkrtz_ops_with_zero_unsupported() {
+        let mut words = Vec::new();
+        words.push(enc_vop1(0x01, 1, 242)); // v_mov_b32 v1, 1.0
+        words.push(enc_vop1(0x01, 2, 244)); // v_mov_b32 v2, 2.0
+        words.push(enc_vop2(0x2B, 3, 256 + 1, 2)); // v_fmac_f32 v3, v1, v2
+        words.push(enc_vop2(0x2C, 4, 256 + 1, 2)); // v_fmamk_f32 v4, v1, K, v2
+        words.push(0x4040_0000); //   K = 3.0
+        words.push(enc_vop2(0x2D, 5, 256 + 1, 2)); // v_fmaak_f32 v5, v1, v2, K
+        words.push(0x3F00_0000); //   K = 0.5
+        words.push(enc_vop2(0x1F, 3, 256 + 4, 5)); // v_mac_f32 v3, v4, v5
+        words.push(enc_vop2(0x20, 6, 256 + 1, 2)); // v_madmk_f32 v6, v1, K, v2
+        words.push(0x4000_0000); //   K = 2.0
+        words.push(enc_vop2(0x21, 7, 128 + 3, 2)); // v_madak_f32 v7, 3, v2, K (inline src0; K still present)
+        words.push(0x4000_0000); //   K = 2.0
+        words.push(enc_vop1(0x01, 8, 128 + 7)); // v_mov_b32 v8, 7
+        words.push(enc_vop1(0x01, 9, 0xFF)); // v_mov_b32 v9, 0x89abcdef
+        words.push(0x89AB_CDEF);
+        words.push(enc_vop2(0x25, 10, 256 + 8, 9)); // v_add_nc_u32 v10, v8, v9
+        words.push(enc_vop2(0x26, 11, 256 + 10, 8)); // v_sub_nc_u32 v11, v10, v8
+        words.push(enc_vop2(0x27, 12, 256 + 8, 11)); // v_subrev_nc_u32 v12, v8, v11
+        words.push(enc_vop2(0x1E, 13, 256 + 11, 12)); // v_xnor_b32 v13, v11, v12
+        words.push(enc_vop2(0x1B, 14, 128 + 63, 13)); // v_and_b32 v14, 63, v13
+        words.push(enc_vop2(0x1C, 14, 256 + 14, 8)); // v_or_b32 v14, v14, v8
+        words.push(enc_vop2(0x1D, 14, 256 + 14, 9)); // v_xor_b32 v14, v14, v9
+        words.push(enc_vop2(0x1A, 15, 128 + 2, 14)); // v_lshlrev_b32 v15, 2, v14
+        words.push(enc_vop2(0x16, 16, 128 + 1, 15)); // v_lshrrev_b32 v16, 1, v15
+        words.push(enc_vop2(0x18, 17, 128 + 1, 15)); // v_ashrrev_i32 v17, 1, v15
+        words.push(enc_vop2(0x0C, 18, 256 + 9, 15)); // v_mul_hi_u32_u24 v18, v9, v15
+        words.push(enc_vop2(0x0A, 19, 256 + 9, 17)); // v_mul_hi_i32_i24 v19, v9, v17
+        words.extend_from_slice(&enc_vop3b(0x30F, 20, 106, 256 + 9, 256 + 9, 0)); // v_add_co_u32 v20, vcc, v9, v9
+        words.push(enc_vop2(0x28, 21, 256 + 9, 9)); // v_add_co_ci_u32 v21, vcc, v9, v9, vcc
+        words.push(enc_vop2(0x29, 22, 256 + 8, 21)); // v_sub_co_ci_u32 v22, vcc, v8, v21, vcc
+        words.push(enc_vop2(0x2A, 23, 256 + 8, 22)); // v_subrev_co_ci_u32 v23, vcc, v8, v22, vcc
+        words.extend_from_slice(&enc_vop3b(0x128, 24, 4, 256 + 22, 256 + 23, 106)); // v_add_co_ci_u32_e64 v24, s[4:5], v22, v23, vcc
+        words.extend_from_slice(&enc_vop3b(0x129, 25, 106, 256 + 24, 256 + 23, 4)); // v_sub_co_ci_u32_e64 v25, vcc, v24, v23, s[4:5]
+        words.push(enc_vop2(0x2F, 26, 256 + 3, 4)); // v_cvt_pkrtz_f16_f32 v26, v3, v4
+        words.extend_from_slice(&enc_vop3(0x12F, 27, 256 + 6, 256 + 7, 0, true, 0, 0, 0)); // VOP3 pkrtz clamp
+        words.push(enc_vop1(0x06, 28, 256 + 25)); // v_cvt_f32_u32 v28, v25
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [3, 5, 26, 28]));
+        words.push(enc_sopp(0x01, 0)); // s_endpgm
+
+        let out = translate_as(&words, Rdna2StageOverride::Auto);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("fma("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("pack2x16float("), "WGSL:\n{}", out.wgsl);
+        // Carry chains flow through the VCC lane bit and the SGPR lane mask s[4:5].
+        assert!(out.wgsl.contains("vcc"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("s_4_"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("s_5_"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn vop2_only_madk_forms_are_rejected_in_vop3_encoding() {
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_vop3(0x12C, 1, 256, 256, 0, false, 0, 0, 0)); // invalid v_fmamk_f32_e64
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 1, 1, 1]));
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 1, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("v_fmamk_f32"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn translates_64bit_sop2_bitwise_cselect_shift_and_sopc_ops_on_runtime_sgpr_pairs() {
+        let mut words = Vec::new();
+        // s[0:3] are runtime values (read before written).
+        words.push(enc_sop2(0x0F, 8, 0, 2)); // s_and_b64 s[8:9], s[0:1], s[2:3]
+        words.push(enc_sop2(0x11, 10, 0, 2)); // s_or_b64 s[10:11], s[0:1], s[2:3]
+        words.push(enc_sop2(0x13, 12, 0, 2)); // s_xor_b64 s[12:13], s[0:1], s[2:3]
+        words.push(enc_sop2(0x15, 14, 0, 2)); // s_andn2_b64 s[14:15], s[0:1], s[2:3]
+        words.push(enc_sop2(0x17, 16, 0, 8)); // s_orn2_b64 s[16:17], s[0:1], s[8:9]
+        words.push(enc_sop2(0x19, 18, 0, 8)); // s_nand_b64 s[18:19], s[0:1], s[8:9]
+        words.push(enc_sop2(0x1B, 20, 0, 8)); // s_nor_b64 s[20:21], s[0:1], s[8:9]
+        words.push(enc_sop2(0x1D, 22, 0, 8)); // s_xnor_b64 s[22:23], s[0:1], s[8:9]
+        words.push(enc_sopc(0x13, 8, 10)); // s_cmp_lg_u64 s[8:9], s[10:11]
+        words.push(enc_sop2(0x0B, 24, 0, 2)); // s_cselect_b64 s[24:25], s[0:1], s[2:3]
+        words.push(enc_sopc(0x0D, 0, 128 + 3)); // s_bitcmp1_b32 s0, 3
+        words.push(enc_sop2(0x0A, 26, 0, 1)); // s_cselect_b32 s26, s0, s1
+        words.push(enc_sopc(0x0C, 0, 2)); // s_bitcmp0_b32 s0, s2
+        words.push(enc_sopc(0x0E, 0, 2)); // s_bitcmp0_b64 s[0:1], s2
+        words.push(enc_sopc(0x0F, 0, 128 + 1)); // s_bitcmp1_b64 s[0:1], 1
+        words.push(enc_sopc(0x12, 0, 2)); // s_cmp_eq_u64 s[0:1], s[2:3]
+        words.push(enc_sop2(0x1F, 28, 0, 2)); // s_lshl_b64 s[28:29], s[0:1], s2
+        words.push(enc_sop2(0x21, 30, 0, 2)); // s_lshr_b64 s[30:31], s[0:1], s2
+        words.push(enc_sop2(0x23, 32, 0, 2)); // s_ashr_i64 s[32:33], s[0:1], s2
+        words.push(enc_sop2(0x35, 34, 0, 1)); // s_mul_hi_u32 s34, s0, s1
+        words.push(enc_sop2(0x36, 35, 0, 1)); // s_mul_hi_i32 s35, s0, s1
+        words.push(enc_sop2(0x15, 106, 126, 8)); // s_andn2_b64 vcc, exec, s[8:9]
+        words.push(enc_sop2(0x13, 106, 126, 106)); // s_xor_b64 vcc, exec, vcc
+        words.push(enc_sop2(0x0F, 126, 126, 106)); // s_and_b64 exec, exec, vcc (exec write is a no-op)
+        words.push(enc_vop2(0x01, 1, 128, 0)); // v_cndmask_b32 v1, 0, v0, vcc
+        words.push(enc_sopp(0x01, 0)); // s_endpgm
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        for reg in [
+            8, 9, 10, 11, 12, 13, 22, 23, 24, 25, 28, 29, 30, 31, 32, 33, 34, 35,
+        ] {
+            assert!(
+                last_assignment(&out.wgsl, &format!("s_{reg}_")).is_some(),
+                "missing store to s{reg}:\n{}",
+                out.wgsl
+            );
+        }
+        assert!(
+            last_assignment(&out.wgsl, "scc").is_some(),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("select("), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("i64") && !out.wgsl.contains("u64"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn scalar_mul_hi_shift64_bitwise64_and_sopc_constant_fold_to_exact_reference_values() {
+        // With literal / inline-constant operands every emitted u32 op folds in Rust, so the
+        // stored constants prove the half-word mul-hi, pair-shift, and 64-bit bitwise trees.
+        let a = 0xDEAD_BEEFu32;
+        let b = 0x9E37_79B9u32;
+        // (program body, register name, expected RHS)
+        let cases: Vec<(Vec<u32>, &str, String)> = vec![
+            (
+                vec![enc_sop2(0x35, 4, 0xFF, 0xFF), a],
+                "s_4_",
+                format!("{}u", ref_mul_hi_u32(a, a)),
+            ),
+            (
+                vec![enc_sop2(0x35, 4, 0xFF, 0xFF), b],
+                "s_4_",
+                format!("{}u", ref_mul_hi_u32(b, b)),
+            ),
+            (
+                vec![enc_sop2(0x35, 4, 0xFF, 128 + 64), b],
+                "s_4_",
+                format!("{}u", ref_mul_hi_u32(b, 64)),
+            ),
+            (
+                vec![enc_sop2(0x36, 4, 0xFF, 0xFF), a],
+                "s_4_",
+                format!("{}u", ref_mul_hi_i32(a, a)),
+            ),
+            (
+                vec![enc_sop2(0x36, 4, 0xFF, 192 + 7), b],
+                "s_4_",
+                format!("{}u", ref_mul_hi_i32(b, (-7i32) as u32)),
+            ),
+            (
+                vec![enc_sop2(0x36, 4, 0xFF, 128 + 5), 0x7FFF_FFFF],
+                "s_4_",
+                format!("{}u", ref_mul_hi_i32(0x7FFF_FFFF, 5)),
+            ),
+            // s_lshr_b64 s[4:5], -1, 36 -> (0x0fffffff, 0)
+            (
+                vec![enc_sop2(0x21, 4, 193, 128 + 36)],
+                "s_4_",
+                format!("{}u", 0x0FFF_FFFFu32),
+            ),
+            (
+                vec![enc_sop2(0x21, 4, 193, 128 + 36)],
+                "s_5_",
+                "0u".to_string(),
+            ),
+            // s_lshr_b64 s[4:5], -1, 4 -> (0xffffffff, 0x0fffffff)
+            (
+                vec![enc_sop2(0x21, 4, 193, 128 + 4)],
+                "s_4_",
+                format!("{}u", u32::MAX),
+            ),
+            (
+                vec![enc_sop2(0x21, 4, 193, 128 + 4)],
+                "s_5_",
+                format!("{}u", 0x0FFF_FFFFu32),
+            ),
+            // s_lshl_b64 s[4:5], 0x80000001 (zero-extended), 31 -> (0x80000000, 0x40000000)
+            (
+                vec![enc_sop2(0x1F, 4, 0xFF, 128 + 31), 0x8000_0001],
+                "s_4_",
+                format!("{}u", 0x8000_0000u32),
+            ),
+            (
+                vec![enc_sop2(0x1F, 4, 0xFF, 128 + 31), 0x8000_0001],
+                "s_5_",
+                format!("{}u", 0x4000_0000u32),
+            ),
+            // s_lshl_b64 s[4:5], 0x12345678, 44 -> (0, 0x45678000)
+            (
+                vec![enc_sop2(0x1F, 4, 0xFF, 128 + 44), 0x1234_5678],
+                "s_4_",
+                "0u".to_string(),
+            ),
+            (
+                vec![enc_sop2(0x1F, 4, 0xFF, 128 + 44), 0x1234_5678],
+                "s_5_",
+                format!("{}u", 0x4567_8000u32),
+            ),
+            // shift amount is masked to 6 bits: s_lshr_b64 s[4:5], 0x12345678, 64 -> unchanged
+            (
+                vec![enc_sop2(0x21, 4, 0xFF, 128 + 64), 0x1234_5678],
+                "s_4_",
+                format!("{}u", 0x1234_5678u32),
+            ),
+            // s_ashr_i64 s[4:5], -16, 2 -> (0xfffffffc, 0xffffffff)
+            (
+                vec![enc_sop2(0x23, 4, 208, 128 + 2)],
+                "s_4_",
+                format!("{}u", 0xFFFF_FFFCu32),
+            ),
+            (
+                vec![enc_sop2(0x23, 4, 208, 128 + 2)],
+                "s_5_",
+                format!("{}u", u32::MAX),
+            ),
+            // s_ashr_i64 s[4:5], -16, 40 -> (0xffffffff, 0xffffffff)
+            (
+                vec![enc_sop2(0x23, 4, 208, 128 + 40)],
+                "s_4_",
+                format!("{}u", u32::MAX),
+            ),
+            // 64-bit bitwise: s_andn2_b64 s[4:5], 0xf0f0f0f1, -2 -> (0xf0f0f0f1 & ~0xfffffffe, 0 & ~0xffffffff)
+            (
+                vec![enc_sop2(0x15, 4, 0xFF, 194), 0xF0F0_F0F1],
+                "s_4_",
+                "1u".to_string(),
+            ),
+            (
+                vec![enc_sop2(0x1B, 4, 128, 128)],
+                "s_5_",
+                format!("{}u", u32::MAX),
+            ), // s_nor_b64 0, 0
+            (
+                vec![enc_sop2(0x1D, 4, 0xFF, 193), 0xF0F0_F0F0],
+                "s_4_",
+                format!("{}u", 0xF0F0_F0F0u32),
+            ), // s_xnor_b64 x, -1
+            (
+                vec![enc_sop2(0x1D, 4, 0xFF, 193), 0xF0F0_F0F0],
+                "s_5_",
+                "0u".to_string(),
+            ),
+            // scc = ((lo | hi) != 0) for 64-bit bitwise ops (read back by s_cselect_b32)
+            (
+                vec![enc_sop2(0x13, 4, 193, 193), enc_sop2(0x0A, 6, 128, 128)],
+                "scc",
+                "false".to_string(),
+            ),
+            (
+                vec![
+                    enc_sop2(0x11, 4, 128, 0xFF),
+                    0x0000_0100,
+                    enc_sop2(0x0A, 6, 128, 128),
+                ],
+                "scc",
+                "true".to_string(),
+            ),
+            // SOPC bit tests and 64-bit compares
+            (
+                vec![enc_sopc(0x0D, 0xFF, 128 + 3), 0x8],
+                "scc",
+                "true".to_string(),
+            ),
+            (
+                vec![enc_sopc(0x0D, 0xFF, 128 + 35), 0x8],
+                "scc",
+                "true".to_string(),
+            ), // 35 & 31 == 3
+            (
+                vec![enc_sopc(0x0C, 0xFF, 128 + 3), 0x8],
+                "scc",
+                "false".to_string(),
+            ),
+            (
+                vec![enc_sopc(0x0C, 0xFF, 128 + 2), 0x8],
+                "scc",
+                "true".to_string(),
+            ),
+            (
+                vec![enc_sopc(0x0F, 193, 128 + 63)],
+                "scc",
+                "true".to_string(),
+            ), // bit 63 of -1
+            (
+                vec![enc_sopc(0x0F, 0xFF, 128 + 33), 0x2],
+                "scc",
+                "false".to_string(),
+            ), // hi = 0
+            (
+                vec![enc_sopc(0x0E, 0xFF, 128 + 1), 0x2],
+                "scc",
+                "false".to_string(),
+            ),
+            (vec![enc_sopc(0x12, 193, 193)], "scc", "true".to_string()),
+            (
+                vec![enc_sopc(0x12, 193, 0xFF), u32::MAX],
+                "scc",
+                "false".to_string(),
+            ), // hi differs
+            (
+                vec![enc_sopc(0x13, 128 + 1, 128 + 1)],
+                "scc",
+                "false".to_string(),
+            ),
+            (
+                vec![enc_sopc(0x13, 128 + 1, 128 + 2)],
+                "scc",
+                "true".to_string(),
+            ),
+            // VCC destinations receive this lane's bit (bit 0 of lo)
+            (
+                vec![enc_sop2(0x13, 106, 126, 128 + 1)],
+                "vcc",
+                "false".to_string(),
+            ), // s_xor_b64 vcc, exec, 1
+            (
+                vec![enc_sop2(0x13, 106, 126, 128 + 2)],
+                "vcc",
+                "true".to_string(),
+            ), // s_xor_b64 vcc, exec, 2
+        ];
+        for (body, reg, expect) in cases {
+            let mut words = body.clone();
+            words.push(enc_sopp(0x01, 0));
+            let out = translate_as(&words, Rdna2StageOverride::Compute);
+            assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+            assert_eq!(
+                last_assignment(&out.wgsl, reg).as_deref(),
+                Some(expect.as_str()),
+                "program {body:08x?} -> {reg}:\n{}",
+                out.wgsl
+            );
+        }
+    }
+
+    #[test]
+    fn vector_mul_hi_and_shift64_ops_translate_with_runtime_operands_and_validate() {
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_vop3(0x16A, 2, 256, 6, 0, false, 0, 0, 0)); // v_mul_hi_u32 v2, v0, s6
+        words.extend_from_slice(&enc_vop3(0x16C, 3, 256, 256 + 2, 0, false, 0, 0, 0)); // v_mul_hi_i32 v3, v0, v2
+        words.extend_from_slice(&enc_vop3(0x16A, 10, 0xFF, 256 + 3, 0, false, 0, 0, 0)); // v_mul_hi_u32 v10, lit, v3
+        words.push(0x0001_0001);
+        words.extend_from_slice(&enc_vop3(0x300, 4, 256, 256 + 2, 0, false, 0, 0, 0)); // v_lshrrev_b64 v[4:5], v0, v[2:3]
+        words.extend_from_slice(&enc_vop3(0x2FF, 6, 6, 0, 0, false, 0, 0, 0)); // v_lshlrev_b64 v[6:7], s6, s[0:1]
+        words.extend_from_slice(&enc_vop3(0x301, 8, 7, 256 + 4, 0, false, 0, 0, 0)); // v_ashrrev_i64 v[8:9], s7, v[4:5]
+        words.extend_from_slice(&enc_vop3(0x300, 11, 128 + 40, 193, 0, false, 0, 0, 0)); // v_lshrrev_b64 v[11:12], 40, -1
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        // 16-bit half-word products and 6-bit masked shift amounts; no 64-bit integer types.
+        assert!(out.wgsl.contains("65535u"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("63u"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            !out.wgsl.contains("u64") && !out.wgsl.contains("i64"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        for reg in [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+            assert!(
+                last_assignment(&out.wgsl, &format!("v_{reg}_")).is_some(),
+                "missing store to v{reg}:\n{}",
+                out.wgsl
+            );
+        }
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn v_cmp_class_f32_constant_folds_to_reference_ieee754_classes() {
+        let values: [u32; 14] = [
+            0x7F80_0001, // signaling NaN
+            0x7FC0_0000, // quiet NaN
+            0xFF80_0000, // -Inf
+            0xBF80_0000, // -1.0 (normal)
+            0x8000_0001, // -subnormal
+            0x8000_0000, // -0
+            0x0000_0000, // +0
+            0x0000_0001, // +subnormal
+            0x3F80_0000, // +1.0 (normal)
+            0x7F80_0000, // +Inf
+            0x0000_0080, // +subnormal with mantissa bit 7 set
+            0x0000_0100, // +subnormal with mantissa bit 8 set (bit 7 clear)
+            0x3F80_0100, // +normal with bit 8 set
+            0x3F80_0080, // +normal with bit 8 clear
+        ];
+        // (src1 operand encoding, mask value); `None` reuses the shared VOP3 literal (mask == bits).
+        let masks: [(Option<u16>, u32); 11] = [
+            (Some(128), 0),
+            (Some(128 + 1), 1),
+            (Some(128 + 2), 2),
+            (Some(128 + 4), 4),
+            (Some(128 + 8), 8),
+            (Some(128 + 16), 16),
+            (Some(128 + 32), 32),
+            (Some(128 + 63), 63),
+            (Some(128 + 64), 64),
+            (Some(193), u32::MAX),
+            (None, 0),
+        ];
+        for bits in values {
+            let class = ref_f32_class(bits);
+            for (mask_src, mask_val) in masks {
+                let (src1, mask) = match mask_src {
+                    Some(src) => (src, mask_val),
+                    None => (0xFF, bits),
+                };
+                let mut words = Vec::new();
+                // v_cmp_class_f32_e64 vcc, lit(bits), mask
+                words.extend_from_slice(&enc_vop3(0x088, 106, 0xFF, src1, 0, false, 0, 0, 0));
+                words.push(bits);
+                words.push(enc_sopp(0x01, 0));
+                let out = translate_as(&words, Rdna2StageOverride::Compute);
+                assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+                let expect = ((mask >> class) & 1) != 0;
+                assert_eq!(
+                    last_assignment(&out.wgsl, "vcc").as_deref(),
+                    Some(if expect { "true" } else { "false" }),
+                    "bits {bits:#010x} (class {class}) mask {mask:#x}:\n{}",
+                    out.wgsl
+                );
+            }
+        }
+
+        // |x| and -x source modifiers act on the raw sign bit: class(-|-1.0|) == -normal.
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_vop3(
+            0x088,
+            106,
+            0xFF,
+            128 + 8,
+            0,
+            false,
+            0,
+            0b01,
+            0b01,
+        ));
+        words.push(0xBF80_0000);
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(
+            last_assignment(&out.wgsl, "vcc").as_deref(),
+            Some("true"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+    }
+
+    #[test]
+    fn v_cmp_class_f32_runtime_vopc_and_vop3_sgpr_forms_validate() {
+        let mut words = Vec::new();
+        words.push(enc_vopc(0x88, 256, 1)); // v_cmp_class_f32 vcc, v0, v1
+        words.push(enc_vop2(0x01, 2, 128, 0)); // v_cndmask_b32 v2, 0, v0, vcc
+        words.extend_from_slice(&enc_vop3(0x088, 10, 256 + 2, 0xFF, 0, false, 0, 0b01, 0)); // v_cmp_class_f32 s[10:11], |v2|, 0x3ff
+        words.push(0x3FF);
+        words.push(enc_sop2(0x0F, 106, 10, 106)); // s_and_b64 vcc, s[10:11], vcc
+        words.push(enc_vop2(0x01, 3, 128, 2)); // v_cndmask_b32 v3, 0, v2, vcc
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [2, 3, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        // Lane-mask SGPR destinations are canonical (lo = lane bit, hi = 0).
+        assert_eq!(
+            last_assignment(&out.wgsl, "s_11_").as_deref(),
+            Some("0u"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s_barrier_emits_workgroup_barrier_only_in_compute_and_a_note_elsewhere() {
+        let body = |words: &mut Vec<u32>| {
+            words.push(enc_vop1(0x01, 1, 242)); // v_mov_b32 v1, 1.0
+            words.push(enc_sopp(0x0A, 0)); // s_barrier
+        };
+
+        // Compute: real workgroup barrier.
+        let mut cs = Vec::new();
+        body(&mut cs);
+        cs.push(enc_sopp(0x01, 0));
+        let out = translate_as(&cs, Rdna2StageOverride::Compute);
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("workgroupBarrier()"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(!out.wgsl.contains("// note"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Vertex: barrier must not be emitted (WGSL forbids it outside compute).
+        let mut vs = Vec::new();
+        body(&mut vs);
+        vs.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [1, 1, 1, 1])); // exp pos0
+        vs.push(enc_sopp(0x01, 0));
+        let out = translate_as(&vs, Rdna2StageOverride::Vertex);
+        assert_eq!(out.stage, ShaderStage::Vertex);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            !out.wgsl.contains("workgroupBarrier()"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl
+                .contains("// note [0x0004] s_barrier: no-op in vertex stage (workgroupBarrier is compute-only)"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Fragment: same benign no-op.
+        let mut ps = Vec::new();
+        body(&mut ps);
+        ps.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 1, 1, 1])); // exp mrt0
+        ps.push(enc_sopp(0x01, 0));
+        let out = translate_as(&ps, Rdna2StageOverride::Pixel);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            !out.wgsl.contains("workgroupBarrier()"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("s_barrier: no-op in "),
+            "WGSL:\n{}",
+            out.wgsl
+        );
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
