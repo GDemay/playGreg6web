@@ -56,7 +56,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Teach `build_guest_wasm.py` to discover `program-manifest.json` multi-module R12 builds, pass large object lists via `@link_objects.rsp`, and add `--sample` / `--link-guest-boot`.
 - [x] **R22 — Emscripten 7 / LLVM 24 DataLayout Retargeting, `-msimd128` & Recursive `.pgim` Scan (`tools/build_guest_wasm.py`, `tools/verify_browser_boot.py`)** — `DONE` (PR #328, closes #322) *(no game files required)*
   - Retarget lifted wasm64 LLVM IR DataLayout and enable `-msimd128` for Emscripten 7 / LLVM 24, and recursively scan `.pgim` artifacts in `verify_browser_boot.py`.
-- [ ] **R23 — Real-Binary Boot Bring-Up, Phase 3: Native Boot from the First Present to a Sustained Frame Loop** — `IN PROGRESS` (#341, @Timon-ok) *(continues R20; local game files only for local runs)*
+- [x] **R23 — Real-Binary Boot Bring-Up, Phase 3: Native Boot from the First Present to a Sustained Frame Loop** — `DONE` (PRs #362–#514, closes #341) *(continues R20; local game files only for local runs)*
   - Iterate the native boot past the first presented frames (audio HAL object, remaining command-list slots) to a sustained frame loop, and add a local frame capture of the recorded GPU command stream.
 - [x] **R24 — POSIX `@link_objects.rsp` Paths & Multi-Module `wasm_boot.cpp` Linking (`tools/build_guest_wasm.py`)** — `DONE` (PR #352, closes #344) *(no game files required)*
   - Emit POSIX forward-slash paths inside `@link_objects.rsp` and link `runtime/wasm_boot.cpp` cleanly for multi-module browser builds.
