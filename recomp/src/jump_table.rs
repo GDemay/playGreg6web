@@ -3610,6 +3610,90 @@ mod tests {
         assert!(blocks > 512, "{blocks} blocks");
     }
 
+    // ---- R39: `!=` guard at the end of a masked range, behind a loop merge ------------------
+
+    /// A 15-case table indexed by `r10b`, masked to `[0, 15]` and with `15` sent to the default
+    /// before a loop that leaves `r10` alone, so the slice stops at the loop header:
+    /// ```text
+    /// entry: and r10d, 0xf; cmp r10, 0xf; je default
+    ///        xor esi, esi
+    /// loop:  inc rsi; cmp rsi, r11; jne loop
+    ///        movzx ecx, r10b; lea rdx, [rip+DATA]; movsxd rcx, [rdx+rcx*4]; add rcx, rdx; jmp rcx
+    /// cases 0..=14: mov eax, 0x20+i; ret
+    /// default: xor eax, eax; ret
+    /// ```
+    fn not_equal_guarded_loop_switch() -> (Vec<u8>, Vec<u64>, u64) {
+        const CASES: usize = 15;
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut lp = a.create_label();
+            let mut default = a.create_label();
+            let mut cases: Vec<CodeLabel> = (0..CASES).map(|_| a.create_label()).collect();
+            a.and(r10d, 0xf)?;
+            a.cmp(r10, 0xf)?;
+            a.je(default)?;
+            a.xor(esi, esi)?;
+            a.set_label(&mut lp)?;
+            a.inc(rsi)?;
+            a.cmp(rsi, r11)?;
+            a.jne(lp)?;
+            a.movzx(ecx, r10b)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movsxd(rcx, dword_ptr(rdx + rcx * 4))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            for (i, case) in cases.iter_mut().enumerate() {
+                a.set_label(case)?;
+                a.mov(eax, 0x20 + i as u32)?;
+                a.ret()?;
+            }
+            a.set_label(&mut default)?;
+            a.xor(eax, eax)?;
+            a.ret()?;
+            labels.extend(cases.iter().copied());
+            Ok(())
+        });
+        let jmp_va = find_indirect_jmp(&code);
+        (code, ips, jmp_va)
+    }
+
+    #[test]
+    fn resolves_masked_index_excluded_at_its_top_by_a_not_equal_guard_before_a_loop() {
+        let (code, cases, jmp_va) = not_equal_guarded_loop_switch();
+        assert_eq!(cases.len(), 15);
+        // Entry 15 (right after the 15 cases) is a zero offset: the table itself, not code.
+        let data = signed_table(&cases);
+        assert_eq!(data.len(), 16 * 4);
+        for ranges in [&[][..], &[(0, code.len() as u32, 0)]] {
+            let analysis = analyze(&code, &data, &[0], ranges);
+            let jt = analysis
+                .jump_tables
+                .get(&jmp_va)
+                .unwrap_or_else(|| panic!("15-case table resolved (ranges {ranges:?})"));
+            assert!(!jt.inferred, "bound proven, not inferred: {jt:#x?}");
+            assert_eq!(jt.table, DATA);
+            assert_eq!(jt.targets, cases);
+            assert!(!analysis.unresolved_jumps.contains_key(&jmp_va));
+            let succs = jump_successors(&analysis.functions[&TEXT], jmp_va);
+            assert!(
+                !succs.contains(&Edge::IndirectJump { slot: None }),
+                "no run-time dispatch fallback: {succs:x?}"
+            );
+            assert_eq!(succs.len(), 15, "{succs:x?}");
+        }
+    }
+
+    #[test]
+    fn not_equal_guard_on_an_interior_value_leaves_the_sentinel_unproven() {
+        // `cmp r10, 7; je default` excludes an interior value only: [0, 15] still reaches the
+        // non-code entry 15, so no proven table may be claimed.
+        let (mut code, cases, jmp_va) = not_equal_guarded_loop_switch();
+        // `cmp r10, 0xf` is `49 83 fa 0f` right after `and r10d, 0xf` (`41 83 e2 0f`).
+        assert_eq!(&code[4..8], &[0x49, 0x83, 0xfa, 0x0f]);
+        code[7] = 7;
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        assert_not_proven(&analysis, (jmp_va - TEXT) as u32);
+    }
+
     #[test]
     fn unresolved_jumps_are_classified() {
         // Three functions: `jmp [rcx+8]`, `mov rax, [rcx]; jmp rax`, and `jmp rcx`.

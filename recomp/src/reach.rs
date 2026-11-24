@@ -592,9 +592,21 @@ fn unsigned_fact(
         Mnemonic::Jle if nonneg => ("gt", !taken),
         Mnemonic::Je if taken => return Some((imm, imm)),
         Mnemonic::Jne if !taken => return Some((imm, imm)),
+        // `reg != imm` excludes one value: it tightens the range only at an end of it (e.g.
+        // `and r10d, 0xf; cmp r10, 0xf; je default` leaves `[0, 14]` on the fallthrough).
+        Mnemonic::Je | Mnemonic::Jne => {
+            return if cur_lo >= cur_hi {
+                None
+            } else if imm == cur_hi {
+                Some((cur_lo, cur_hi - 1))
+            } else if imm == cur_lo {
+                Some((cur_lo + 1, cur_hi))
+            } else {
+                None
+            };
+        }
         _ => return None,
     };
-    let _ = cur_lo;
     // holds: reg > imm (gt) / reg >= imm (ge); otherwise the negation.
     match (op, holds) {
         ("gt", true) => imm.checked_add(1).map(|l| (l, u64::MAX)),
@@ -671,4 +683,30 @@ fn decode(bytes: &[u8], ip: u64) -> Option<Instruction> {
     let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
     let instr = decoder.decode();
     (!instr.is_invalid() && instr.len() == bytes.len()).then_some(instr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_equal_edge_trims_an_end_of_the_range() {
+        // `cmp r, 15; je` fallthrough / `jne` taken on [0, 15]: [0, 14].
+        assert_eq!(unsigned_fact(Mnemonic::Je, false, 15, 0, 15), Some((0, 14)));
+        assert_eq!(unsigned_fact(Mnemonic::Jne, true, 15, 0, 15), Some((0, 14)));
+        // Excluding the low end: [1, 15].
+        assert_eq!(unsigned_fact(Mnemonic::Je, false, 0, 0, 15), Some((1, 15)));
+        assert_eq!(unsigned_fact(Mnemonic::Jne, true, 0, 0, 15), Some((1, 15)));
+        // An interior value or one outside the range excludes nothing expressible.
+        assert_eq!(unsigned_fact(Mnemonic::Je, false, 7, 0, 15), None);
+        assert_eq!(unsigned_fact(Mnemonic::Je, false, 16, 0, 15), None);
+        // A single-value range is never emptied.
+        assert_eq!(unsigned_fact(Mnemonic::Je, false, 3, 3, 3), None);
+        // The equal sides are unchanged.
+        assert_eq!(unsigned_fact(Mnemonic::Je, true, 15, 0, 15), Some((15, 15)));
+        assert_eq!(
+            unsigned_fact(Mnemonic::Jne, false, 15, 0, 15),
+            Some((15, 15))
+        );
+    }
 }
