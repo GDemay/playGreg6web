@@ -12,7 +12,12 @@ const ringMod = require('../web/workers/gpu_ring.js');
 
 const {
   GpuFrameRecorder,
+  GpuTraceReplayer,
   createInterceptor,
+  splitTraceIntoFrames,
+  parseFrameCaptureSidecar,
+  FRAME_CAPTURE_SCHEMA,
+  FRAME_CAPTURE_SCHEMA_VERSION,
   PACKET_HEADER_BYTES,
   DEFAULT_MAX_FRAMES,
   DEFAULT_MAX_BYTES,
@@ -21,7 +26,13 @@ const {
   getOpcodeName,
 } = recorderMod;
 
-const { WgpuCommandProcessor, BUFFER_USAGE, SHADER_STAGE, PRIMITIVE_TOPOLOGY } = wgpuMod;
+const {
+  WgpuCommandProcessor,
+  OPCODES: WGPU_OPCODES,
+  BUFFER_USAGE,
+  SHADER_STAGE,
+  PRIMITIVE_TOPOLOGY,
+} = wgpuMod;
 const { GpuRingBuffer } = ringMod;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -717,4 +728,482 @@ test('exported .pg6trace binary stream disassembles cleanly with tools/gpu_trace
   assert.equal(parsed.frames[0].has_begin_frame, true);
   assert.equal(parsed.frames[1].complete, true);
   assert.equal(parsed.frames[1].has_begin_frame, true);
+});
+
+test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
+  const expectedV2 = [
+    ['CREATE_BIND_GROUP_LAYOUT', 22, 'CreateBindGroupLayout'],
+    ['CREATE_PIPELINE_LAYOUT', 23, 'CreatePipelineLayout'],
+    ['CREATE_RENDER_PIPELINE2', 24, 'CreateRenderPipeline2'],
+    ['CREATE_COMPUTE_PIPELINE2', 25, 'CreateComputePipeline2'],
+    ['BEGIN_RENDER_PASS', 26, 'BeginRenderPass'],
+    ['END_RENDER_PASS', 27, 'EndRenderPass'],
+    ['SET_VIEWPORT', 28, 'SetViewport'],
+    ['SET_SCISSOR_RECT', 29, 'SetScissorRect'],
+    ['SET_BLEND_CONSTANT', 30, 'SetBlendConstant'],
+    ['SET_STENCIL_REFERENCE', 31, 'SetStencilReference'],
+    ['CREATE_BIND_GROUP2', 32, 'CreateBindGroup2'],
+    ['SET_BIND_GROUP2', 33, 'SetBindGroup2'],
+    ['CREATE_SAMPLER2', 34, 'CreateSampler2'],
+    ['CREATE_TEXTURE2', 35, 'CreateTexture2'],
+  ];
+
+  // Exact parity with WgpuCommandProcessor's OPCODES table (0..35).
+  assert.deepEqual(OPCODES, WGPU_OPCODES);
+  assert.equal(Object.keys(OPCODES).length, 36);
+  assert.equal(Object.keys(OPCODE_NAMES).length, 36);
+
+  for (const [constName, value, canonicalName] of expectedV2) {
+    assert.equal(OPCODES[constName], value);
+    assert.equal(OPCODE_NAMES[value], canonicalName);
+    assert.equal(getOpcodeName(value), canonicalName);
+  }
+  assert.equal(OPCODES.CREATE_TEXTURE2, 35);
+  assert.equal(getOpcodeName(35), 'CreateTexture2');
+});
+
+test('splitTraceIntoFrames splits multi-frame, omitted-payload, empty, and truncated traces', () => {
+  // 1) Empty trace -> []
+  assert.deepEqual(splitTraceIntoFrames(new Uint8Array(0)), []);
+  assert.deepEqual(splitTraceIntoFrames(new ArrayBuffer(0)), []);
+  assert.throws(() => splitTraceIntoFrames('not-binary'), TypeError);
+
+  // 2) Multi-frame real-capture style trace:
+  //    Frame 0 starts with resource creation (no BeginFrame) + zero-length omitted payloads
+  //    (--gpu-capture default mode: WriteBuffer/CreateShaderModule/WriteTexture with data_len=0)
+  //    plus ABI v2 CreateTexture2, ending with Present.
+  const writeTextureOmitted = new Uint8Array(48); // all zeros => data_len = 0
+  const createTexture2Payload = new Uint8Array(40);
+  const frame0 = new BinaryPacketBuilder()
+    .createBuffer(1, BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST, 1024)
+    .writeBuffer(1, 0, new Uint8Array(0)) // omitted WriteBuffer payload (data_len = 0)
+    .createShaderModule(2, SHADER_STAGE.VERTEX, '') // omitted CreateShaderModule (code_len = 0)
+    .packet(OPCODES.CREATE_TEXTURE2, createTexture2Payload)
+    .packet(OPCODES.WRITE_TEXTURE, writeTextureOmitted) // omitted WriteTexture (data_len = 0)
+    .packet(OPCODES.BEGIN_RENDER_PASS, new Uint8Array(0)) // zero-length payload test
+    .draw(3, 1, 0, 0)
+    .packet(OPCODES.END_RENDER_PASS, new Uint8Array(0))
+    .present()
+    .finish();
+
+  const frame1 = new BinaryPacketBuilder()
+    .packet(OPCODES.SET_VIEWPORT, new Uint8Array(24))
+    .packet(OPCODES.SET_SCISSOR_RECT, new Uint8Array(16))
+    .draw(6, 1, 0, 0)
+    .present()
+    .finish();
+
+  // Trailing unclosed partial frame (valid packets, no Present)
+  const partialFrame2 = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.2, 0.3, 0.4, 1.0)
+    .finish();
+
+  const combined = new Uint8Array(
+    frame0.byteLength + frame1.byteLength + partialFrame2.byteLength
+  );
+  combined.set(frame0, 0);
+  combined.set(frame1, frame0.byteLength);
+  combined.set(partialFrame2, frame0.byteLength + frame1.byteLength);
+
+  // Pass via SharedArrayBuffer subarray to verify copy isolation.
+  const sab = new SharedArrayBuffer(combined.byteLength + 8);
+  const sabView = new Uint8Array(sab, 4, combined.byteLength);
+  sabView.set(combined);
+  const frames = splitTraceIntoFrames(sabView);
+  sabView.fill(0xaa);
+
+  assert.equal(frames.length, 3);
+
+  assert.equal(frames[0].index, 0);
+  assert.equal(frames[0].offset, 0);
+  assert.equal(frames[0].packetCount, 9);
+  assert.equal(frames[0].byteLength, frame0.byteLength);
+  assert.equal(frames[0].hasPresent, true);
+  assert.equal(frames[0].complete, true);
+  assert.equal(frames[0].truncated, false);
+  assert.equal(frames[0].truncatedBytes, 0);
+  assert.deepEqual(frames[0].bytes, frame0);
+  assert.equal(frames[0].bytes.buffer instanceof ArrayBuffer, true);
+  assert.deepEqual(frames[0].opcodeCounts, {
+    CreateBuffer: 1,
+    WriteBuffer: 1,
+    CreateShaderModule: 1,
+    CreateTexture2: 1,
+    WriteTexture: 1,
+    BeginRenderPass: 1,
+    Draw: 1,
+    EndRenderPass: 1,
+    Present: 1,
+  });
+
+  assert.equal(frames[1].index, 1);
+  assert.equal(frames[1].offset, frame0.byteLength);
+  assert.equal(frames[1].packetCount, 4);
+  assert.equal(frames[1].byteLength, frame1.byteLength);
+  assert.equal(frames[1].hasPresent, true);
+  assert.equal(frames[1].complete, true);
+  assert.equal(frames[1].truncated, false);
+  assert.deepEqual(frames[1].bytes, frame1);
+  assert.deepEqual(frames[1].opcodeCounts, {
+    SetViewport: 1,
+    SetScissorRect: 1,
+    Draw: 1,
+    Present: 1,
+  });
+
+  assert.equal(frames[2].index, 2);
+  assert.equal(frames[2].offset, frame0.byteLength + frame1.byteLength);
+  assert.equal(frames[2].packetCount, 2);
+  assert.equal(frames[2].byteLength, partialFrame2.byteLength);
+  assert.equal(frames[2].hasPresent, false);
+  assert.equal(frames[2].complete, false);
+  assert.equal(frames[2].truncated, false);
+  assert.equal(frames[2].truncatedBytes, 0);
+  assert.deepEqual(frames[2].bytes, partialFrame2);
+
+  // 3) Truncated header (< 8 bytes)
+  const truncatedHeader = splitTraceIntoFrames(new Uint8Array([1, 0, 0, 0, 5]));
+  assert.equal(truncatedHeader.length, 1);
+  assert.equal(truncatedHeader[0].packetCount, 0);
+  assert.equal(truncatedHeader[0].byteLength, 0);
+  assert.equal(truncatedHeader[0].hasPresent, false);
+  assert.equal(truncatedHeader[0].truncated, true);
+  assert.equal(truncatedHeader[0].truncatedBytes, 5);
+
+  // 4) Truncated payload (valid frame0 followed by half of a ClearColor packet)
+  const truncatedPayloadStream = new Uint8Array(frame0.byteLength + 12);
+  truncatedPayloadStream.set(frame0, 0);
+  // ClearColor header declaring 16-byte payload, but only 4 payload bytes follow
+  const truncView = new DataView(
+    truncatedPayloadStream.buffer,
+    frame0.byteLength,
+    12
+  );
+  truncView.setUint16(0, OPCODES.CLEAR_COLOR, true);
+  truncView.setUint16(2, 0, true);
+  truncView.setUint32(4, 16, true);
+
+  const splitTrunc = splitTraceIntoFrames(truncatedPayloadStream);
+  assert.equal(splitTrunc.length, 2);
+  assert.equal(splitTrunc[0].complete, true);
+  assert.equal(splitTrunc[0].truncated, false);
+  assert.equal(splitTrunc[1].packetCount, 0);
+  assert.equal(splitTrunc[1].byteLength, 0);
+  assert.equal(splitTrunc[1].hasPresent, false);
+  assert.equal(splitTrunc[1].truncated, true);
+  assert.equal(splitTrunc[1].truncatedBytes, 12);
+});
+
+test('parseFrameCaptureSidecar validates schema, normalizes fields, and strips host paths', () => {
+  assert.equal(FRAME_CAPTURE_SCHEMA, 'playgta6-frame-capture');
+  assert.equal(FRAME_CAPTURE_SCHEMA_VERSION, 1);
+
+  const rawSidecar = {
+    schema: 'playgta6-frame-capture',
+    schema_version: 1,
+    trace: 'C:\\Users\\alice\\secret_local\\captures\\frame1.pg6trace',
+    payloads: 'omitted',
+    frames_requested: 2,
+    frames_complete: 2,
+    presents_seen: 3,
+    packets: 13,
+    bytes: 512,
+    omitted_bytes: 4096,
+    frames: [
+      { index: 0, offset: 0, bytes: 320, packets: 9 },
+      { index: 1, offset: 320, bytes: 192, packets: 4 },
+    ],
+    presents: [
+      {
+        index: 0,
+        wall_ms: 14.25,
+        dispatches: 120,
+        import_calls: 45,
+        reserved_bytes: 1048576,
+        committed_bytes: 524288,
+      },
+    ],
+    omitted: [
+      { packet: 1, opcode: 4, length: 1024, fnv1a64: '0x0123456789ABCDEF' },
+      { packet: 2, opcode: 5, length: 3072, fnv1a64: '0xfedcba9876543210' },
+    ],
+    // Extra host-specific property that must never be copied through.
+    host_cwd: 'C:\\Users\\alice\\secret_local',
+  };
+
+  // Parse from JSON string
+  const parsedFromJson = parseFrameCaptureSidecar(JSON.stringify(rawSidecar));
+  assert.equal(parsedFromJson.schema, 'playgta6-frame-capture');
+  assert.equal(parsedFromJson.schemaVersion, 1);
+  assert.equal(parsedFromJson.trace, 'frame1.pg6trace');
+  assert.equal(parsedFromJson.payloads, 'omitted');
+  assert.equal(parsedFromJson.payloadsOmitted, true);
+  assert.equal(parsedFromJson.framesRequested, 2);
+  assert.equal(parsedFromJson.framesComplete, 2);
+  assert.equal(parsedFromJson.presentsSeen, 3);
+  assert.equal(parsedFromJson.packets, 13);
+  assert.equal(parsedFromJson.bytes, 512);
+  assert.equal(parsedFromJson.omittedBytes, 4096);
+  assert.equal(parsedFromJson.frames.length, 2);
+  assert.deepEqual(parsedFromJson.presents[0], {
+    index: 0,
+    wallMs: 14.25,
+    dispatches: 120,
+    importCalls: 45,
+    reservedBytes: 1048576,
+    committedBytes: 524288,
+  });
+  assert.deepEqual(parsedFromJson.omitted[0], {
+    packet: 1,
+    opcode: 4,
+    opcodeName: 'WriteBuffer',
+    length: 1024,
+    fnv1a64: '0x0123456789abcdef',
+  });
+  assert.equal(parsedFromJson.host_cwd, undefined);
+
+  const serialized = JSON.stringify(parsedFromJson);
+  assert.equal(serialized.includes('alice'), false);
+  assert.equal(serialized.includes('C:\\'), false);
+  assert.equal(serialized.includes('secret_local'), false);
+
+  // POSIX & UNC path sanitization from plain object
+  const parsedPosix = parseFrameCaptureSidecar({
+    schema: 'playgta6-frame-capture',
+    schema_version: 1,
+    trace: '/home/bob/work/capture.pg6trace',
+    payloads: 'kept',
+    frames: [],
+  });
+  assert.equal(parsedPosix.trace, 'capture.pg6trace');
+  assert.equal(parsedPosix.payloadsOmitted, false);
+  assert.deepEqual(parsedPosix.presents, []);
+  assert.deepEqual(parsedPosix.omitted, []);
+
+  const parsedUnc = parseFrameCaptureSidecar({
+    schema: 'playgta6-frame-capture',
+    schema_version: 1,
+    trace: '\\\\fileserver\\share\\run2.pg6trace',
+    payloads: 'omitted',
+    frames: [],
+  });
+  assert.equal(parsedUnc.trace, 'run2.pg6trace');
+
+  // Bad schemas & invalid field rejections
+  assert.throws(() => parseFrameCaptureSidecar('{bad json'), SyntaxError);
+  assert.throws(() => parseFrameCaptureSidecar(null), TypeError);
+  assert.throws(() => parseFrameCaptureSidecar([]), TypeError);
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'wrong-schema',
+        schema_version: 1,
+        payloads: 'omitted',
+        frames: [],
+      }),
+    Error
+  );
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'playgta6-frame-capture',
+        schema_version: 2,
+        payloads: 'omitted',
+        frames: [],
+      }),
+    Error
+  );
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'playgta6-frame-capture',
+        schema_version: 1,
+        payloads: 'invalid',
+        frames: [],
+      }),
+    Error
+  );
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'playgta6-frame-capture',
+        schema_version: 1,
+        payloads: 'omitted',
+        frames: 'not-array',
+      }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'playgta6-frame-capture',
+        schema_version: 1,
+        payloads: 'omitted',
+        frames: [{ index: -1, offset: 0, bytes: 8, packets: 1 }],
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      parseFrameCaptureSidecar({
+        schema: 'playgta6-frame-capture',
+        schema_version: 1,
+        payloads: 'omitted',
+        frames: [],
+        omitted: [{ packet: 0, opcode: 4, length: 16, fnv1a64: 'not-hex' }],
+      }),
+    TypeError
+  );
+});
+
+test('GpuTraceReplayer replays multi-frame traces, captures errors, and integrates with WgpuCommandProcessor', () => {
+  const frame0 = buildSimpleFrame(0.1, 3);
+  const frame1 = buildSimpleFrame(0.5, 6);
+  const frame2 = buildSimpleFrame(0.9, 9);
+  const trace = new Uint8Array(frame0.byteLength + frame1.byteLength + frame2.byteLength);
+  trace.set(frame0, 0);
+  trace.set(frame1, frame0.byteLength);
+  trace.set(frame2, frame0.byteLength + frame1.byteLength);
+
+  const sidecar = {
+    schema: 'playgta6-frame-capture',
+    schema_version: 1,
+    trace: 'C:\\Users\\dev\\captures\\demo.pg6trace',
+    payloads: 'omitted',
+    frames_requested: 3,
+    frames_complete: 3,
+    presents_seen: 3,
+    packets: 12,
+    bytes: trace.byteLength,
+    omitted_bytes: 256,
+    frames: [
+      { index: 0, offset: 0, bytes: frame0.byteLength, packets: 4 },
+      { index: 1, offset: frame0.byteLength, bytes: frame1.byteLength, packets: 4 },
+      {
+        index: 2,
+        offset: frame0.byteLength + frame1.byteLength,
+        bytes: frame2.byteLength,
+        packets: 4,
+      },
+    ],
+    omitted: [{ packet: 1, opcode: 4, length: 256, fnv1a64: '0x0000000000001234' }],
+  };
+
+  // Deterministic clock for testing durationMs.
+  let clockMs = 100;
+  const replayer = new GpuTraceReplayer({
+    now() {
+      const t = clockMs;
+      clockMs += 2.5;
+      return t;
+    },
+  });
+
+  assert.equal(replayer.getFrameCount(), 0);
+  assert.equal(replayer.getSummary().loaded, false);
+
+  assert.equal(replayer.loadTrace(trace, sidecar), replayer);
+  assert.equal(replayer.getFrameCount(), 3);
+
+  // 1) Mock processor implementing executeBatch(bytes) with an error injected on frame 1
+  const receivedSlices = [];
+  const mockBatchProcessor = {
+    executeBatch(bytes) {
+      assert.ok(bytes instanceof Uint8Array);
+      receivedSlices.push(new Uint8Array(bytes));
+      if (receivedSlices.length === 2) {
+        throw new Error('simulated WebGPU validation error on frame 1');
+      }
+      return { executedBytes: bytes.byteLength };
+    },
+  };
+
+  const run = replayer.replayAll(mockBatchProcessor);
+  assert.equal(receivedSlices.length, 3);
+  assert.deepEqual(receivedSlices[0], frame0);
+  assert.deepEqual(receivedSlices[1], frame1);
+  assert.deepEqual(receivedSlices[2], frame2);
+
+  assert.equal(run.ok, false);
+  assert.equal(run.frameCount, 3);
+  assert.equal(run.replayedFrames, 3);
+  assert.equal(run.succeededFrames, 2);
+  assert.equal(run.failedFrames, 1);
+  assert.equal(run.totalPackets, 12);
+  assert.equal(run.totalBytes, trace.byteLength);
+  assert.equal(run.totalDurationMs, 7.5);
+  assert.equal(run.payloadsOmitted, true);
+  assert.equal(run.omittedPayloadCount, 1);
+  assert.equal(run.omittedBytes, 256);
+  assert.deepEqual(run.errors, [
+    { frameIndex: 1, error: 'simulated WebGPU validation error on frame 1' },
+  ]);
+
+  assert.equal(run.frames[0].frameIndex, 0);
+  assert.equal(run.frames[0].packetCount, 4);
+  assert.equal(run.frames[0].byteLength, frame0.byteLength);
+  assert.equal(run.frames[0].ok, true);
+  assert.equal(run.frames[0].error, null);
+  assert.equal(run.frames[0].durationMs, 2.5);
+
+  assert.equal(run.frames[1].frameIndex, 1);
+  assert.equal(run.frames[1].ok, false);
+  assert.equal(run.frames[1].error, 'simulated WebGPU validation error on frame 1');
+  assert.equal(run.frames[1].durationMs, 2.5);
+
+  assert.equal(run.frames[2].frameIndex, 2);
+  assert.equal(run.frames[2].ok, true);
+  assert.equal(run.frames[2].error, null);
+
+  const summary = replayer.getSummary();
+  assert.deepEqual(JSON.parse(JSON.stringify(summary)), summary);
+  assert.equal(summary.loaded, true);
+  assert.equal(summary.frameCount, 3);
+  assert.equal(summary.completeFrameCount, 3);
+  assert.equal(summary.truncatedFrameCount, 0);
+  assert.equal(summary.totalPackets, 12);
+  assert.equal(summary.totalBytes, trace.byteLength);
+  assert.equal(summary.sidecar.trace, 'demo.pg6trace');
+  assert.equal(summary.replay.replayedFrames, 3);
+  assert.equal(summary.replay.succeededFrames, 2);
+  assert.equal(summary.replay.failedFrames, 1);
+  assert.deepEqual(summary.replay.errors, [
+    { frameIndex: 1, error: 'simulated WebGPU validation error on frame 1' },
+  ]);
+
+  // 2) stopOnError halts immediately on first failing frame
+  let stopCalls = 0;
+  const stopRun = replayer.replayAll(
+    {
+      executeBatch() {
+        stopCalls += 1;
+        if (stopCalls === 1) {
+          throw new Error('boom on frame 0');
+        }
+      },
+    },
+    { stopOnError: true }
+  );
+  assert.equal(stopRun.ok, false);
+  assert.equal(stopRun.replayedFrames, 1);
+  assert.equal(stopRun.failedFrames, 1);
+  assert.equal(stopCalls, 1);
+
+  // 3) Replaying directly into a real WgpuCommandProcessor (via executeCommandBuffer)
+  const { device, ctx, calls } = createMockWebGpu();
+  const wgpuProcessor = new WgpuCommandProcessor(device, ctx);
+  const wgpuReplayer = new GpuTraceReplayer().loadTrace(trace);
+  const wgpuRun = wgpuReplayer.replayAll(wgpuProcessor);
+  assert.equal(wgpuRun.ok, true);
+  assert.equal(wgpuRun.succeededFrames, 3);
+  assert.equal(wgpuRun.failedFrames, 0);
+  assert.equal(calls.filter((c) => c.op === 'submit').length, 3);
+  assert.deepEqual(wgpuRun.frames[2].result, { frameCount: 3, presents: 1 });
+
+  // 4) Validation errors
+  assert.throws(() => replayer.replayFrame(-1, mockBatchProcessor), RangeError);
+  assert.throws(() => replayer.replayFrame(3, mockBatchProcessor), RangeError);
+  assert.throws(() => replayer.replayFrame(0, null), TypeError);
+  assert.throws(() => replayer.replayAll({}), TypeError);
 });

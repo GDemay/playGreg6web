@@ -9,6 +9,8 @@
   const PACKET_HEADER_BYTES = 8;
   const DEFAULT_MAX_FRAMES = 60;
   const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+  const FRAME_CAPTURE_SCHEMA = 'playgta6-frame-capture';
+  const FRAME_CAPTURE_SCHEMA_VERSION = 1;
 
   const OPCODES = Object.freeze({
     NOP: 0,
@@ -33,6 +35,20 @@
     CREATE_COMPUTE_PIPELINE: 19,
     SET_COMPUTE_PIPELINE: 20,
     DISPATCH_COMPUTE: 21,
+    CREATE_BIND_GROUP_LAYOUT: 22,
+    CREATE_PIPELINE_LAYOUT: 23,
+    CREATE_RENDER_PIPELINE2: 24,
+    CREATE_COMPUTE_PIPELINE2: 25,
+    BEGIN_RENDER_PASS: 26,
+    END_RENDER_PASS: 27,
+    SET_VIEWPORT: 28,
+    SET_SCISSOR_RECT: 29,
+    SET_BLEND_CONSTANT: 30,
+    SET_STENCIL_REFERENCE: 31,
+    CREATE_BIND_GROUP2: 32,
+    SET_BIND_GROUP2: 33,
+    CREATE_SAMPLER2: 34,
+    CREATE_TEXTURE2: 35,
   });
 
   // Canonical opcode names matching runtime/abi/playgta6_abi.h and tools/gpu_trace.py.
@@ -59,6 +75,20 @@
     19: 'CreateComputePipeline',
     20: 'SetComputePipeline',
     21: 'DispatchCompute',
+    22: 'CreateBindGroupLayout',
+    23: 'CreatePipelineLayout',
+    24: 'CreateRenderPipeline2',
+    25: 'CreateComputePipeline2',
+    26: 'BeginRenderPass',
+    27: 'EndRenderPass',
+    28: 'SetViewport',
+    29: 'SetScissorRect',
+    30: 'SetBlendConstant',
+    31: 'SetStencilReference',
+    32: 'CreateBindGroup2',
+    33: 'SetBindGroup2',
+    34: 'CreateSampler2',
+    35: 'CreateTexture2',
   });
 
   function getOpcodeName(opcode) {
@@ -77,7 +107,7 @@
     return false;
   }
 
-  function toUint8Array(input) {
+  function toUint8Array(input, caller = 'GpuFrameRecorder.recordChunk') {
     if (input instanceof Uint8Array) {
       return input;
     }
@@ -91,7 +121,7 @@
       return new Uint8Array(input);
     }
     throw new TypeError(
-      'GpuFrameRecorder.recordChunk expects a Uint8Array, ArrayBufferView, ArrayBuffer, or SharedArrayBuffer'
+      `${caller} expects a Uint8Array, ArrayBufferView, ArrayBuffer, or SharedArrayBuffer`
     );
   }
 
@@ -587,9 +617,688 @@
     return recorder.createInterceptor(processor);
   }
 
+  function defaultNowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function assertNonNegativeInteger(value, fieldName) {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+      throw new RangeError(`${fieldName} must be a non-negative integer`);
+    }
+    return value;
+  }
+
+  function assertNonNegativeFiniteNumber(value, fieldName) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new RangeError(`${fieldName} must be a non-negative finite number`);
+    }
+    return value;
+  }
+
+  function sanitizeTraceName(rawTrace) {
+    if (rawTrace === undefined || rawTrace === null) {
+      return '';
+    }
+    if (typeof rawTrace !== 'string') {
+      throw new TypeError('sidecar.trace must be a string');
+    }
+    const trimmed = rawTrace.trim();
+    if (!trimmed) {
+      return '';
+    }
+    const normalized = trimmed.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter((segment) => segment.length > 0);
+    if (parts.length === 0) {
+      return '';
+    }
+    const base = parts[parts.length - 1];
+    if (base === '.' || base === '..' || /^[A-Za-z]:$/.test(base)) {
+      return '';
+    }
+    return base;
+  }
+
+  function formatErrorMessage(err) {
+    if (err instanceof Error) {
+      return err.message || err.name || 'Error';
+    }
+    return String(err);
+  }
+
+  function cloneSidecar(sidecar) {
+    return {
+      schema: sidecar.schema,
+      schemaVersion: sidecar.schemaVersion,
+      trace: sidecar.trace,
+      payloads: sidecar.payloads,
+      payloadsOmitted: sidecar.payloadsOmitted,
+      framesRequested: sidecar.framesRequested,
+      framesComplete: sidecar.framesComplete,
+      presentsSeen: sidecar.presentsSeen,
+      packets: sidecar.packets,
+      bytes: sidecar.bytes,
+      omittedBytes: sidecar.omittedBytes,
+      frames: sidecar.frames.map((f) => ({
+        index: f.index,
+        offset: f.offset,
+        bytes: f.bytes,
+        packets: f.packets,
+      })),
+      presents: sidecar.presents.map((p) => ({
+        index: p.index,
+        wallMs: p.wallMs,
+        dispatches: p.dispatches,
+        importCalls: p.importCalls,
+        reservedBytes: p.reservedBytes,
+        committedBytes: p.committedBytes,
+      })),
+      omitted: sidecar.omitted.map((o) => ({
+        packet: o.packet,
+        opcode: o.opcode,
+        opcodeName: o.opcodeName,
+        length: o.length,
+        fnv1a64: o.fnv1a64,
+      })),
+    };
+  }
+
+  /**
+   * Walks a flat binary `GpuPacketHeader` (`u16 opcode, u16 flags, u32 payloadSize`)
+   * `.pg6trace` stream and splits it into frame slices delimited by `Present` (opcode 7),
+   * matching `runtime/gpu/frame_capture.h`:
+   *   - frame 0 = everything up to and including the first `Present`
+   *   - frame i = packets after `Present i-1` up to and including `Present i`
+   *   - trailing partial frame (if packets or truncated bytes remain after the last `Present`)
+   *
+   * Handles zero-length payloads and `--gpu-capture` omitted-payload packets cleanly.
+   *
+   * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer} bytes
+   * @returns {Array<{
+   *   index: number,
+   *   offset: number,
+   *   byteLength: number,
+   *   bytes: Uint8Array,
+   *   packetCount: number,
+   *   opcodeCounts: Record<string, number>,
+   *   hasPresent: boolean,
+   *   complete: boolean,
+   *   truncated: boolean,
+   *   truncatedBytes: number
+   * }>}
+   */
+  function splitTraceIntoFrames(bytes) {
+    const src = toUint8Array(bytes, 'splitTraceIntoFrames');
+    const len = src.byteLength;
+    if (len === 0) {
+      return [];
+    }
+
+    const view = new DataView(src.buffer, src.byteOffset, len);
+    const frames = [];
+
+    let offset = 0;
+    let frameStart = 0;
+    let packetCount = 0;
+    let opcodeCounts = {};
+    let truncated = false;
+    let truncatedBytes = 0;
+
+    while (offset < len) {
+      if (offset + PACKET_HEADER_BYTES > len) {
+        truncated = true;
+        truncatedBytes = len - offset;
+        break;
+      }
+
+      const opcode = view.getUint16(offset, true);
+      // flags at offset + 2 (uint16 LE) preserved verbatim in frame slice.
+      const payloadSize = view.getUint32(offset + 4, true);
+      const packetLen = PACKET_HEADER_BYTES + payloadSize;
+
+      if (offset + packetLen > len) {
+        truncated = true;
+        truncatedBytes = len - offset;
+        break;
+      }
+
+      const opName = getOpcodeName(opcode);
+      opcodeCounts[opName] = (opcodeCounts[opName] || 0) + 1;
+      packetCount += 1;
+      offset += packetLen;
+
+      if (opcode === OPCODES.PRESENT) {
+        const frameBytes = copyBytes(src.subarray(frameStart, offset));
+        frames.push({
+          index: frames.length,
+          offset: frameStart,
+          byteLength: frameBytes.byteLength,
+          bytes: frameBytes,
+          packetCount,
+          opcodeCounts,
+          hasPresent: true,
+          complete: true,
+          truncated: false,
+          truncatedBytes: 0,
+        });
+        frameStart = offset;
+        packetCount = 0;
+        opcodeCounts = {};
+      }
+    }
+
+    if (packetCount > 0 || truncated) {
+      const frameBytes = copyBytes(src.subarray(frameStart, offset));
+      frames.push({
+        index: frames.length,
+        offset: frameStart,
+        byteLength: frameBytes.byteLength,
+        bytes: frameBytes,
+        packetCount,
+        opcodeCounts,
+        hasPresent: false,
+        complete: false,
+        truncated,
+        truncatedBytes,
+      });
+    }
+
+    return frames;
+  }
+
+  /**
+   * Validates and normalizes a `playgta6-frame-capture` (`schema_version: 1`) JSON
+   * sidecar produced by `--gpu-capture` (`runtime/gpu/frame_capture.cpp`) without
+   * leaking host filesystem paths.
+   *
+   * @param {string|object} jsonOrObject
+   */
+  function parseFrameCaptureSidecar(jsonOrObject) {
+    let raw;
+    if (typeof jsonOrObject === 'string') {
+      try {
+        raw = JSON.parse(jsonOrObject);
+      } catch (err) {
+        throw new SyntaxError(`Invalid frame capture sidecar JSON: ${formatErrorMessage(err)}`);
+      }
+    } else if (isPlainObject(jsonOrObject)) {
+      raw = jsonOrObject;
+    } else {
+      throw new TypeError('parseFrameCaptureSidecar expects a JSON string or plain object');
+    }
+
+    if (!isPlainObject(raw)) {
+      throw new TypeError('Frame capture sidecar root must be a JSON object');
+    }
+
+    if (raw.schema !== FRAME_CAPTURE_SCHEMA) {
+      throw new Error(
+        `Unsupported frame capture sidecar schema: expected "${FRAME_CAPTURE_SCHEMA}"`
+      );
+    }
+
+    const schemaVersion = raw.schema_version !== undefined ? raw.schema_version : raw.schemaVersion;
+    if (schemaVersion !== FRAME_CAPTURE_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported frame capture sidecar schema_version: expected ${FRAME_CAPTURE_SCHEMA_VERSION}`
+      );
+    }
+
+    if (raw.payloads !== 'omitted' && raw.payloads !== 'kept') {
+      throw new Error('Frame capture sidecar payloads must be "omitted" or "kept"');
+    }
+
+    const trace = sanitizeTraceName(raw.trace);
+
+    if (!Array.isArray(raw.frames)) {
+      throw new TypeError('Frame capture sidecar frames must be an array');
+    }
+    const frames = raw.frames.map((entry, idx) => {
+      if (!isPlainObject(entry)) {
+        throw new TypeError(`sidecar.frames[${idx}] must be an object`);
+      }
+      return {
+        index: assertNonNegativeInteger(entry.index, `sidecar.frames[${idx}].index`),
+        offset: assertNonNegativeInteger(entry.offset, `sidecar.frames[${idx}].offset`),
+        bytes: assertNonNegativeInteger(entry.bytes, `sidecar.frames[${idx}].bytes`),
+        packets: assertNonNegativeInteger(entry.packets, `sidecar.frames[${idx}].packets`),
+      };
+    });
+
+    if (raw.presents !== undefined && !Array.isArray(raw.presents)) {
+      throw new TypeError('Frame capture sidecar presents must be an array');
+    }
+    const presents = (raw.presents || []).map((entry, idx) => {
+      if (!isPlainObject(entry)) {
+        throw new TypeError(`sidecar.presents[${idx}] must be an object`);
+      }
+      const wallMsRaw = entry.wall_ms !== undefined ? entry.wall_ms : entry.wallMs;
+      const importCallsRaw =
+        entry.import_calls !== undefined ? entry.import_calls : entry.importCalls;
+      const reservedBytesRaw =
+        entry.reserved_bytes !== undefined ? entry.reserved_bytes : entry.reservedBytes;
+      const committedBytesRaw =
+        entry.committed_bytes !== undefined ? entry.committed_bytes : entry.committedBytes;
+      return {
+        index: assertNonNegativeInteger(entry.index, `sidecar.presents[${idx}].index`),
+        wallMs: assertNonNegativeFiniteNumber(wallMsRaw, `sidecar.presents[${idx}].wall_ms`),
+        dispatches:
+          entry.dispatches === undefined
+            ? 0
+            : assertNonNegativeInteger(entry.dispatches, `sidecar.presents[${idx}].dispatches`),
+        importCalls:
+          importCallsRaw === undefined
+            ? 0
+            : assertNonNegativeInteger(importCallsRaw, `sidecar.presents[${idx}].import_calls`),
+        reservedBytes:
+          reservedBytesRaw === undefined
+            ? 0
+            : assertNonNegativeInteger(
+                reservedBytesRaw,
+                `sidecar.presents[${idx}].reserved_bytes`
+              ),
+        committedBytes:
+          committedBytesRaw === undefined
+            ? 0
+            : assertNonNegativeInteger(
+                committedBytesRaw,
+                `sidecar.presents[${idx}].committed_bytes`
+              ),
+      };
+    });
+
+    if (raw.omitted !== undefined && !Array.isArray(raw.omitted)) {
+      throw new TypeError('Frame capture sidecar omitted must be an array');
+    }
+    const omitted = (raw.omitted || []).map((entry, idx) => {
+      if (!isPlainObject(entry)) {
+        throw new TypeError(`sidecar.omitted[${idx}] must be an object`);
+      }
+      const packet = assertNonNegativeInteger(entry.packet, `sidecar.omitted[${idx}].packet`);
+      const opcode = assertNonNegativeInteger(entry.opcode, `sidecar.omitted[${idx}].opcode`);
+      if (opcode > 0xffff) {
+        throw new RangeError(`sidecar.omitted[${idx}].opcode must fit in uint16`);
+      }
+      const length = assertNonNegativeInteger(entry.length, `sidecar.omitted[${idx}].length`);
+      if (typeof entry.fnv1a64 !== 'string' || !/^0x[0-9a-fA-F]{1,16}$/.test(entry.fnv1a64)) {
+        throw new TypeError(`sidecar.omitted[${idx}].fnv1a64 must be a 0x-prefixed hex string`);
+      }
+      return {
+        packet,
+        opcode,
+        opcodeName: getOpcodeName(opcode),
+        length,
+        fnv1a64: entry.fnv1a64.toLowerCase(),
+      };
+    });
+
+    const framesRequestedRaw =
+      raw.frames_requested !== undefined ? raw.frames_requested : raw.framesRequested;
+    const framesCompleteRaw =
+      raw.frames_complete !== undefined ? raw.frames_complete : raw.framesComplete;
+    const presentsSeenRaw =
+      raw.presents_seen !== undefined ? raw.presents_seen : raw.presentsSeen;
+    const omittedBytesRaw =
+      raw.omitted_bytes !== undefined ? raw.omitted_bytes : raw.omittedBytes;
+
+    const sumFramePackets = frames.reduce((acc, f) => acc + f.packets, 0);
+    const sumFrameBytes = frames.reduce((acc, f) => acc + f.bytes, 0);
+    const sumOmittedBytes = omitted.reduce((acc, o) => acc + o.length, 0);
+
+    const framesRequested =
+      framesRequestedRaw === undefined
+        ? frames.length
+        : assertNonNegativeInteger(framesRequestedRaw, 'sidecar.frames_requested');
+    const framesComplete =
+      framesCompleteRaw === undefined
+        ? frames.length
+        : assertNonNegativeInteger(framesCompleteRaw, 'sidecar.frames_complete');
+    const presentsSeen =
+      presentsSeenRaw === undefined
+        ? presents.length
+        : assertNonNegativeInteger(presentsSeenRaw, 'sidecar.presents_seen');
+    const packets =
+      raw.packets === undefined
+        ? sumFramePackets
+        : assertNonNegativeInteger(raw.packets, 'sidecar.packets');
+    const bytes =
+      raw.bytes === undefined
+        ? sumFrameBytes
+        : assertNonNegativeInteger(raw.bytes, 'sidecar.bytes');
+    const omittedBytes =
+      omittedBytesRaw === undefined
+        ? sumOmittedBytes
+        : assertNonNegativeInteger(omittedBytesRaw, 'sidecar.omitted_bytes');
+
+    return {
+      schema: FRAME_CAPTURE_SCHEMA,
+      schemaVersion: FRAME_CAPTURE_SCHEMA_VERSION,
+      trace,
+      payloads: raw.payloads,
+      payloadsOmitted: raw.payloads === 'omitted',
+      framesRequested,
+      framesComplete,
+      presentsSeen,
+      packets,
+      bytes,
+      omittedBytes,
+      frames,
+      presents,
+      omitted,
+    };
+  }
+
+  function resolveProcessorInvoker(processor) {
+    if (!processor || typeof processor !== 'object') {
+      throw new TypeError(
+        'GpuTraceReplayer requires a processor with executeBatch(bytes) or executeCommandBuffer(bytes)'
+      );
+    }
+    if (typeof processor.executeBatch === 'function') {
+      return (slice) => processor.executeBatch(slice);
+    }
+    if (typeof processor.executeCommandBuffer === 'function') {
+      return (slice) => processor.executeCommandBuffer(slice);
+    }
+    if (typeof processor.execute === 'function') {
+      return (slice) => processor.execute(slice);
+    }
+    throw new TypeError(
+      'GpuTraceReplayer requires a processor with executeBatch(bytes) or executeCommandBuffer(bytes)'
+    );
+  }
+
+  /**
+   * Replays `.pg6trace` and native `--gpu-capture` (`playgta6-frame-capture`)
+   * binary GPU command streams frame-by-frame into any processor exposing
+   * `executeBatch(bytes)` or `executeCommandBuffer(bytes)` (such as `WgpuCommandProcessor`).
+   */
+  class GpuTraceReplayer {
+    static ABI_VERSION = ABI_VERSION;
+    static PACKET_HEADER_BYTES = PACKET_HEADER_BYTES;
+    static FRAME_CAPTURE_SCHEMA = FRAME_CAPTURE_SCHEMA;
+    static FRAME_CAPTURE_SCHEMA_VERSION = FRAME_CAPTURE_SCHEMA_VERSION;
+    static OPCODES = OPCODES;
+    static OPCODE_NAMES = OPCODE_NAMES;
+
+    constructor(options = {}) {
+      const opts = options || {};
+      if (opts.now !== undefined && typeof opts.now !== 'function') {
+        throw new TypeError('GpuTraceReplayer option now must be a function');
+      }
+      this._now = opts.now || defaultNowMs;
+      this._loaded = false;
+      this._frames = [];
+      this._sidecar = null;
+      this._sourceByteLength = 0;
+      this._totalBytes = 0;
+      this._totalPackets = 0;
+      this._completeFrameCount = 0;
+      this._truncatedFrameCount = 0;
+      this._opcodeCounts = {};
+      this._resetReplayStats();
+    }
+
+    _resetReplayStats() {
+      this._replayCount = 0;
+      this._replaySucceeded = 0;
+      this._replayFailed = 0;
+      this._replayTotalDurationMs = 0;
+      this._replayTotalPackets = 0;
+      this._replayTotalBytes = 0;
+      this._replayErrors = [];
+    }
+
+    /**
+     * Loads a flat `.pg6trace` binary command stream and optional
+     * `playgta6-frame-capture` JSON sidecar.
+     *
+     * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer} bytes
+     * @param {string|object|null} [sidecar]
+     * @returns {GpuTraceReplayer}
+     */
+    loadTrace(bytes, sidecar) {
+      const src = toUint8Array(bytes, 'GpuTraceReplayer.loadTrace');
+      const parsedSidecar =
+        sidecar !== undefined && sidecar !== null ? parseFrameCaptureSidecar(sidecar) : null;
+      const frames = splitTraceIntoFrames(src);
+
+      let totalBytes = 0;
+      let totalPackets = 0;
+      let completeFrameCount = 0;
+      let truncatedFrameCount = 0;
+      const opcodeCounts = {};
+
+      for (let i = 0; i < frames.length; i++) {
+        const frame = frames[i];
+        totalBytes += frame.byteLength;
+        totalPackets += frame.packetCount;
+        if (frame.hasPresent) {
+          completeFrameCount += 1;
+        }
+        if (frame.truncated) {
+          truncatedFrameCount += 1;
+        }
+        const keys = Object.keys(frame.opcodeCounts);
+        for (let k = 0; k < keys.length; k++) {
+          const opName = keys[k];
+          opcodeCounts[opName] = (opcodeCounts[opName] || 0) + frame.opcodeCounts[opName];
+        }
+      }
+
+      this._loaded = true;
+      this._frames = frames;
+      this._sidecar = parsedSidecar;
+      this._sourceByteLength = src.byteLength;
+      this._totalBytes = totalBytes;
+      this._totalPackets = totalPackets;
+      this._completeFrameCount = completeFrameCount;
+      this._truncatedFrameCount = truncatedFrameCount;
+      this._opcodeCounts = opcodeCounts;
+      this._resetReplayStats();
+
+      return this;
+    }
+
+    getFrameCount() {
+      return this._frames.length;
+    }
+
+    getFrame(index) {
+      if (!Number.isInteger(index) || index < 0 || index >= this._frames.length) {
+        throw new RangeError(
+          `Frame index ${index} out of range (loaded frames: ${this._frames.length})`
+        );
+      }
+      const frame = this._frames[index];
+      return {
+        index: frame.index,
+        offset: frame.offset,
+        byteLength: frame.byteLength,
+        bytes: copyBytes(frame.bytes),
+        packetCount: frame.packetCount,
+        opcodeCounts: cloneCounts(frame.opcodeCounts),
+        hasPresent: frame.hasPresent,
+        complete: frame.complete,
+        truncated: frame.truncated,
+        truncatedBytes: frame.truncatedBytes,
+      };
+    }
+
+    /**
+     * Replays a single loaded frame slice into `processor`.
+     *
+     * @param {number} index
+     * @param {{ executeBatch?: Function, executeCommandBuffer?: Function, execute?: Function }} processor
+     */
+    replayFrame(index, processor) {
+      const invoke = resolveProcessorInvoker(processor);
+      if (!Number.isInteger(index) || index < 0 || index >= this._frames.length) {
+        throw new RangeError(
+          `Frame index ${index} out of range (loaded frames: ${this._frames.length})`
+        );
+      }
+
+      const frame = this._frames[index];
+      const sliceCopy = copyBytes(frame.bytes);
+      const startMs = this._now();
+      let ok = true;
+      let error = null;
+      let result = null;
+
+      try {
+        const ret = invoke(sliceCopy);
+        if (ret !== undefined) {
+          result = ret;
+        }
+      } catch (err) {
+        ok = false;
+        error = formatErrorMessage(err);
+      }
+
+      const rawElapsed = this._now() - startMs;
+      const durationMs = Number.isFinite(rawElapsed) && rawElapsed >= 0 ? rawElapsed : 0;
+
+      this._replayCount += 1;
+      if (ok) {
+        this._replaySucceeded += 1;
+      } else {
+        this._replayFailed += 1;
+        this._replayErrors.push({ frameIndex: index, error });
+      }
+      this._replayTotalDurationMs += durationMs;
+      this._replayTotalPackets += frame.packetCount;
+      this._replayTotalBytes += frame.byteLength;
+
+      return {
+        frameIndex: index,
+        packetCount: frame.packetCount,
+        byteLength: frame.byteLength,
+        opcodeCounts: cloneCounts(frame.opcodeCounts),
+        hasPresent: frame.hasPresent,
+        truncated: frame.truncated,
+        ok,
+        error,
+        durationMs,
+        result,
+      };
+    }
+
+    /**
+     * Replays all loaded frames in order into `processor` and returns per-frame
+     * results plus aggregate execution telemetry.
+     *
+     * @param {{ executeBatch?: Function, executeCommandBuffer?: Function, execute?: Function }} processor
+     * @param {{ stopOnError?: boolean }} [options]
+     */
+    replayAll(processor, options = {}) {
+      resolveProcessorInvoker(processor);
+      const opts = options || {};
+      const stopOnError = Boolean(opts.stopOnError);
+
+      const results = [];
+      const errors = [];
+      const opcodeCounts = {};
+      let succeededFrames = 0;
+      let failedFrames = 0;
+      let totalPackets = 0;
+      let totalBytes = 0;
+      let totalDurationMs = 0;
+      let truncatedFrames = 0;
+
+      for (let i = 0; i < this._frames.length; i++) {
+        const frameRes = this.replayFrame(i, processor);
+        results.push(frameRes);
+        totalPackets += frameRes.packetCount;
+        totalBytes += frameRes.byteLength;
+        totalDurationMs += frameRes.durationMs;
+        if (frameRes.truncated) {
+          truncatedFrames += 1;
+        }
+        const keys = Object.keys(frameRes.opcodeCounts);
+        for (let k = 0; k < keys.length; k++) {
+          const opName = keys[k];
+          opcodeCounts[opName] = (opcodeCounts[opName] || 0) + frameRes.opcodeCounts[opName];
+        }
+        if (frameRes.ok) {
+          succeededFrames += 1;
+        } else {
+          failedFrames += 1;
+          errors.push({ frameIndex: frameRes.frameIndex, error: frameRes.error });
+          if (stopOnError) {
+            break;
+          }
+        }
+      }
+
+      return {
+        ok: failedFrames === 0,
+        frameCount: this._frames.length,
+        replayedFrames: results.length,
+        succeededFrames,
+        failedFrames,
+        totalPackets,
+        totalBytes,
+        totalDurationMs,
+        opcodeCounts,
+        truncatedFrames,
+        payloadsOmitted: Boolean(this._sidecar && this._sidecar.payloadsOmitted),
+        omittedPayloadCount: this._sidecar ? this._sidecar.omitted.length : 0,
+        omittedBytes: this._sidecar ? this._sidecar.omittedBytes : 0,
+        errors,
+        frames: results,
+      };
+    }
+
+    /**
+     * Returns a JSON-safe summary of the loaded trace, normalized sidecar (if any),
+     * and cumulative replay telemetry.
+     */
+    getSummary() {
+      return {
+        abiVersion: ABI_VERSION,
+        loaded: this._loaded,
+        frameCount: this._frames.length,
+        completeFrameCount: this._completeFrameCount,
+        truncatedFrameCount: this._truncatedFrameCount,
+        totalBytes: this._totalBytes,
+        sourceByteLength: this._sourceByteLength,
+        totalPackets: this._totalPackets,
+        opcodeCounts: cloneCounts(this._opcodeCounts),
+        sidecar: this._sidecar ? cloneSidecar(this._sidecar) : null,
+        payloadsOmitted: Boolean(this._sidecar && this._sidecar.payloadsOmitted),
+        omittedPayloadCount: this._sidecar ? this._sidecar.omitted.length : 0,
+        omittedBytes: this._sidecar ? this._sidecar.omittedBytes : 0,
+        replay: {
+          replayedFrames: this._replayCount,
+          succeededFrames: this._replaySucceeded,
+          failedFrames: this._replayFailed,
+          totalDurationMs: this._replayTotalDurationMs,
+          totalPackets: this._replayTotalPackets,
+          totalBytes: this._replayTotalBytes,
+          errors: this._replayErrors.map((e) => ({
+            frameIndex: e.frameIndex,
+            error: e.error,
+          })),
+        },
+      };
+    }
+  }
+
   const exportsObj = {
     GpuFrameRecorder,
+    GpuTraceReplayer,
     createInterceptor,
+    splitTraceIntoFrames,
+    parseFrameCaptureSidecar,
+    FRAME_CAPTURE_SCHEMA,
+    FRAME_CAPTURE_SCHEMA_VERSION,
     ABI_VERSION,
     PACKET_HEADER_BYTES,
     DEFAULT_MAX_FRAMES,
