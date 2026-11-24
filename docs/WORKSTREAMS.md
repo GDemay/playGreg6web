@@ -176,6 +176,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Bridges raw RGBA8/YUV420p/ImageBitmap splash & Bink2 frames into `BinkVideoPresenter` (`W38`) and emits `FIRST_PRESENT` telemetry.
 - [x] **G27 — Xbox-Specific D3D12 Device & Queue Slots on the Startup Path (`runtime/gpu/d3d12_xs_xbox.{h,cpp}`)** — `DONE` (PRs #270 + #277, closes #262) *(no game files required for repo tests — follow-up to G24)*
   - Establish from call-site evidence and implement the Xbox-only device/queue/command-list methods the title's device initialisation and submission thread call (device slots 49, 61/62, 70, 78–80, 101; queue 23/24/31; list 131/132), and contribute the survey improvements used.
+- [ ] **G32 — Identify the Pipeline Records Behind Xbox Device Slot 57 and Bind Their Graphics Pipelines in the D3D12 Guest Layer (`runtime/gpu/d3d12_xs*`)** — `IN PROGRESS` (#391, @Timon-ok) *(driven by the native boot's frame capture; repo tests synthetic)*
+  - Work out what the fixed-size, non-DXIL pipeline records passed to device slot 57 are, create the right pipeline kind from them so the title's draws reach the command stream, and report what the shader track needs.
 
 ---
 
