@@ -16,6 +16,7 @@ import {
   normalizeIndirectDispatchMode,
   sanitizeValidationErrorMessage,
   parseSideModuleProgressLabel,
+  formatFpsDisplay,
 } from '../web/ui/hud_controller.js';
 import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
 import {
@@ -2365,4 +2366,454 @@ test('W87: restartSession resets stale GPU, Audio, and Pthread telemetry cleanly
 
   await sessionController.stop();
   controller.destroy();
+});
+
+// --- W90: Live HUD Frames/FPS Counters, Milestone Badge Sync & realPackDrawCount Readout ---
+
+test('W90: live app_bootstrap -> HudController -> index.html HUD DOM updates Frames, rolling FPS, milestone badge, and realPackDrawCount without PerfMonitor zero-clobber', async () => {
+  const channels = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this.closed = false;
+      channels.push(this);
+    }
+    emit(data) {
+      if (!this.closed && typeof this.onmessage === 'function') {
+        this.onmessage({ data });
+      }
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  let nowMs = 10000;
+  const scheduledIntervals = [];
+  const fakeSetInterval = (fn, ms) => {
+    const id = scheduledIntervals.length + 1;
+    scheduledIntervals.push({ id, fn, ms, cleared: false });
+    return id;
+  };
+  const fakeClearInterval = (id) => {
+    const entry = scheduledIntervals.find((item) => item.id === id);
+    if (entry) entry.cleared = true;
+  };
+  const tickPerfIntervals = () => {
+    for (const entry of scheduledIntervals) {
+      if (!entry.cleared) entry.fn();
+    }
+  };
+
+  // Mirror the exact DOM elements and hudApi wiring from web/index.html (which W90 does not modify).
+  const dom = {
+    bootModeBadge: createDisplayMockElement({ textContent: 'Idle', dataset: { bootMode: 'idle', state: 'info' } }),
+    sideModuleStatusEl: createDisplayMockElement({ textContent: 'No split modules', dataset: { loaded: '0', total: '0' } }),
+    gpuValidationErrorsEl: createDisplayMockElement({ textContent: '0', dataset: { count: '0', state: 'ok' } }),
+    validationLatestEl: createDisplayMockElement({ textContent: 'None' }),
+    validationBannerEl: createDisplayMockElement({ hidden: true }),
+    bootStageEl: createDisplayMockElement({ textContent: 'BOOTING' }),
+    bootElapsedEl: createDisplayMockElement({ textContent: '0.0s' }),
+    bootProgressBarEl: createDisplayMockElement(),
+    bootProgressFillEl: createDisplayMockElement({ style: { width: '0%' } }),
+    statusEl: createDisplayMockElement({ textContent: 'Booting...' }),
+    statusDotEl: createDisplayMockElement({ dataset: { level: 'info' } }),
+    metricFramesEl: createDisplayMockElement({ textContent: '0' }),
+    metricFpsEl: createDisplayMockElement({ textContent: '--' }),
+    pillFpsEl: createDisplayMockElement({ textContent: '0 fps' }),
+  };
+
+  let activeHudController = null;
+  const setValue = (el, text, state = '') => {
+    el.textContent = text;
+    if (state) el.dataset.state = state;
+    else delete el.dataset.state;
+  };
+  const updateBootProgress = (bootSummary) => {
+    if (!bootSummary || typeof bootSummary !== 'object') return;
+    const stage = typeof bootSummary.stage === 'string' && bootSummary.stage.trim().length > 0
+      ? bootSummary.stage.trim().toUpperCase()
+      : null;
+    if (stage) dom.bootStageEl.textContent = stage;
+    let pct = null;
+    if (typeof bootSummary.progressPct === 'number' && Number.isFinite(bootSummary.progressPct)) {
+      pct = Math.max(0, Math.min(100, bootSummary.progressPct));
+    }
+    if (pct !== null) {
+      dom.bootProgressFillEl.style.width = `${pct.toFixed(1)}%`;
+      dom.bootProgressBarEl.setAttribute('aria-valuenow', String(Math.round(pct)));
+      if (pct >= 100 || stage === 'FIRST_PRESENT' || bootSummary.readyForSplash) {
+        dom.bootProgressFillEl.dataset.state = 'ok';
+      }
+    }
+    if (typeof bootSummary.elapsedMs === 'number' && Number.isFinite(bootSummary.elapsedMs)) {
+      dom.bootElapsedEl.textContent = `${(Math.max(0, bootSummary.elapsedMs) / 1000).toFixed(1)}s`;
+    }
+  };
+
+  const hudApi = {
+    logs: [],
+    setStatus(text, level = 'info') {
+      dom.statusEl.textContent = String(text ?? '');
+      dom.statusDotEl.dataset.level = ['info', 'ok', 'warn', 'error'].includes(level) ? level : 'info';
+    },
+    appendLog(message, level = 'info') {
+      this.logs.push({ message, level });
+    },
+    updateMetrics(metrics = {}) {
+      if (!metrics || typeof metrics !== 'object') return;
+      if (metrics.fps !== undefined && metrics.fps !== null) {
+        const fpsVal =
+          typeof metrics.fps === 'number' && Number.isFinite(metrics.fps)
+            ? metrics.fps >= 10
+              ? Math.round(metrics.fps).toString()
+              : metrics.fps.toFixed(1)
+            : String(metrics.fps);
+        setValue(dom.metricFpsEl, fpsVal, typeof metrics.fps === 'number' && metrics.fps >= 30 ? 'ok' : 'info');
+        dom.pillFpsEl.textContent = `${fpsVal} fps`;
+      }
+      const frames = metrics.framesPresented ?? metrics.frameStats?.framesPresented ?? metrics.totalFrames;
+      if (frames !== undefined && frames !== null) {
+        setValue(dom.metricFramesEl, String(frames));
+      }
+      if (metrics.status !== undefined) {
+        this.setStatus(metrics.status, metrics.level || 'info');
+      }
+      if (metrics.bootSummary !== undefined) {
+        updateBootProgress(metrics.bootSummary);
+      }
+      if (metrics.bootMode !== undefined || metrics.firstPresentSource !== undefined) {
+        if (activeHudController) {
+          activeHudController.setBootMode(metrics.bootMode ?? metrics.firstPresentSource, {
+            firstPresentSource: metrics.firstPresentSource,
+            updateHudStatus: false,
+          });
+        }
+      }
+      if (
+        activeHudController &&
+        (metrics.bootSummary !== undefined ||
+          metrics.missingShaders !== undefined ||
+          metrics.fallbackStats !== undefined ||
+          metrics.frameStats !== undefined)
+      ) {
+        activeHudController.updateGpuBootTelemetry({
+          bootSummary: metrics.bootSummary,
+          missingShaders: metrics.missingShaders,
+          fallbackStats: metrics.fallbackStats,
+          frameStats: metrics.frameStats,
+        });
+      }
+    },
+    setBootMode(mode, opts = {}) {
+      if (activeHudController) {
+        activeHudController.setBootMode(mode, { ...opts, updateHudStatus: false });
+      }
+    },
+    updateBootStatus(snapshot) {
+      if (activeHudController && snapshot && snapshot.bootMode !== undefined) {
+        activeHudController.setBootMode(snapshot.bootMode, { updateHudStatus: false });
+      }
+    },
+    setSideModules(progress) {
+      if (activeHudController) {
+        activeHudController.setSideModuleProgress(progress, { updateHudStatus: false });
+      }
+    },
+  };
+
+  const origUpdateMetrics = hudApi.updateMetrics;
+  const origSetStatus = hudApi.setStatus;
+  const origAppendLog = hudApi.appendLog;
+
+  const mockWindow = {
+    crossOriginIsolated: true,
+    SharedArrayBuffer,
+    BroadcastChannel: MockBroadcastChannel,
+    location: { origin: 'http://127.0.0.1:8080' },
+    addEventListener() {},
+    removeEventListener() {},
+    playgta6HudController: null,
+  };
+
+  const workerListeners = new Map();
+  const mockWorker = {
+    postMessage() {},
+    addEventListener(type, fn) {
+      if (!workerListeners.has(type)) workerListeners.set(type, new Set());
+      workerListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      workerListeners.get(type)?.delete(fn);
+    },
+    emitMessage(data) {
+      for (const fn of [...(workerListeners.get('message') || [])]) {
+        fn({ data });
+      }
+    },
+    terminate() {},
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj: mockWindow,
+    documentObj: null,
+    navigatorObj: { gpu: {} },
+    canvas: { width: 640, height: 360 },
+    hud: hudApi,
+    now: () => nowMs,
+    epochNow: () => nowMs,
+    setInterval: fakeSetInterval,
+    clearInterval: fakeClearInterval,
+    capabilityProbe: () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    createWasmWorker: async () => mockWorker,
+    attachGlobalErrorHandlers: false,
+    autoResize: false,
+  });
+
+  const hudController = new HudController({
+    app,
+    sessionController: app.session,
+    perfMonitor: app.perfMonitor,
+    hud: hudApi,
+    now: () => nowMs,
+    displayElements: {
+      bootModeBadge: dom.bootModeBadge,
+      sideModuleStatusEl: dom.sideModuleStatusEl,
+      validationCountEl: dom.gpuValidationErrorsEl,
+      validationLatestEl: dom.validationLatestEl,
+      validationBannerEl: dom.validationBannerEl,
+    },
+  });
+  activeHudController = hudController;
+  mockWindow.playgta6HudController = hudController;
+
+  await app.start();
+  const progressChannel = channels.find((ch) => ch.name === 'game-progress');
+  assert.ok(progressChannel, 'expected game-progress channel');
+
+  // 1. Milestone progression: PGIM_LOAD -> XMEM_INIT -> D3D12_CREATE_DEVICE updates #hud-boot-stage in real time.
+  nowMs += 200;
+  progressChannel.emit({ label: '[boot] PGIM_LOAD mapped guest image' });
+  assert.equal(dom.bootStageEl.textContent, 'PGIM_LOAD');
+  assert.equal(dom.bootProgressBarEl.getAttribute('aria-valuenow'), '11');
+
+  nowMs += 300;
+  progressChannel.emit({ label: '[boot] XMEM_INIT initialized' });
+  assert.equal(dom.bootStageEl.textContent, 'XMEM_INIT');
+
+  nowMs += 300;
+  progressChannel.emit({ label: '[boot] D3D12_CREATE_DEVICE ready' });
+  assert.equal(dom.bootStageEl.textContent, 'D3D12_CREATE_DEVICE');
+  assert.equal(dom.bootProgressBarEl.getAttribute('aria-valuenow'), '78');
+
+  // 2. First present via wgpu_worker splash-frame-presented advances stage to FIRST_PRESENT and Frames to 1.
+  nowMs += 200;
+  mockWorker.emitMessage({
+    type: 'splash-frame-presented',
+    ok: true,
+    frameIndex: 0,
+    framesPresented: 1,
+    firstPresent: true,
+    timestampMs: nowMs,
+  });
+  assert.equal(dom.bootStageEl.textContent, 'FIRST_PRESENT');
+  assert.equal(dom.bootProgressFillEl.dataset.state, 'ok');
+  assert.equal(dom.bootProgressBarEl.getAttribute('aria-valuenow'), '100');
+  assert.equal(dom.metricFramesEl.textContent, '1');
+  assert.equal(mockWindow.__playgta6.getDiagnosticsSnapshot().milestone, 'FIRST_PRESENT');
+  assert.equal(mockWindow.__playgta6BootState.presentCount, 1);
+
+  // 3. Subsequent gpu-stats after 500ms (+30 frames -> 60 FPS) with realPackDrawCount + fallbackDrawCount.
+  nowMs += 500;
+  mockWorker.emitMessage({
+    type: 'gpu-stats',
+    realPackDrawCount: 48,
+    fallbackDrawCount: 2,
+    presentCount: 31,
+    validationErrorCount: 0,
+  });
+  assert.equal(dom.metricFramesEl.textContent, '31');
+  assert.equal(dom.metricFpsEl.textContent, '60');
+  assert.equal(dom.metricFpsEl.dataset.state, 'ok');
+  assert.equal(dom.pillFpsEl.textContent, '60 fps');
+  assert.equal(dom.statusEl.textContent, 'Draws: 48 real, 2 fallback');
+  assert.match(dom.bootModeBadge.title, /Draws: 48 real, 2 fallback \(31 presents\)/);
+
+  // 4. PerfMonitor 250ms tick emits { fps: 0, totalFrames: 0 } in Wasm64 mode; HUD MUST NOT revert to 0 / 0.0!
+  nowMs += 250;
+  tickPerfIntervals();
+  assert.equal(dom.metricFramesEl.textContent, '31');
+  assert.equal(dom.metricFpsEl.textContent, '60');
+  assert.equal(dom.pillFpsEl.textContent, '60 fps');
+  assert.equal(dom.bootStageEl.textContent, 'FIRST_PRESENT');
+
+  // 5. Real-pack-only draws + frame-presented up to 1,217 frames (Live Chrome Test #31 scenario).
+  // 250ms elapsed before PerfMonitor tick + 750ms here = 1000ms since frame 31 (+60 frames -> 60 FPS).
+  nowMs += 750;
+  mockWorker.emitMessage({
+    type: 'gpu-stats',
+    realPackDrawCount: 96,
+    fallbackDrawCount: 0,
+    presentCount: 91,
+    validationErrorCount: 1,
+  });
+  assert.equal(dom.metricFramesEl.textContent, '91');
+  assert.equal(dom.metricFpsEl.textContent, '60');
+  assert.equal(dom.gpuValidationErrorsEl.textContent, '1');
+  assert.equal(dom.statusEl.textContent, 'Draws: 96 real');
+  assert.equal(dom.statusDotEl.dataset.level, 'error');
+
+  nowMs += 18767;
+  mockWorker.emitMessage({
+    type: 'frame-presented',
+    presentCount: 1217,
+  });
+  tickPerfIntervals();
+  assert.equal(dom.metricFramesEl.textContent, '1217');
+  assert.equal(dom.metricFpsEl.textContent, '60');
+  assert.equal(dom.pillFpsEl.textContent, '60 fps');
+  assert.equal(dom.bootStageEl.textContent, 'FIRST_PRESENT');
+  assert.equal(mockWindow.__playgta6.getDiagnosticsSnapshot().framesPresented, 1217);
+  assert.equal(mockWindow.__playgta6BootState.presentCount, 1217);
+
+  // 6. restartSession() cleanly resets Frames to '0', FPS to '0.0', and stage to 'BOOTING'.
+  const restartRes = await hudController.restartSession({ preferSmoke: false });
+  assert.equal(restartRes.ok, true);
+  assert.equal(dom.metricFramesEl.textContent, '0');
+  assert.equal(dom.metricFpsEl.textContent, '0.0');
+  assert.equal(dom.pillFpsEl.textContent, '0.0 fps');
+  assert.equal(dom.bootStageEl.textContent, 'BOOTING');
+  assert.equal(hudController.getBootStatus().framesPresented, 0);
+  assert.equal(hudController.getBootStatus().fps, 0);
+
+  // PerfMonitor tick immediately after restart keeps 0 / 0.0 (does not resurrect stale 1217 from mock app).
+  nowMs += 250;
+  tickPerfIntervals();
+  assert.equal(dom.metricFramesEl.textContent, '0');
+  assert.equal(dom.metricFpsEl.textContent, '0.0');
+
+  // 7. destroy() restores all wrapped HUD methods cleanly.
+  hudController.destroy();
+  assert.equal(hudApi.updateMetrics, origUpdateMetrics);
+  assert.equal(hudApi.setStatus, origSetStatus);
+  assert.equal(hudApi.appendLog, origAppendLog);
+  await app.destroy();
+});
+
+test('W90: direct displayElements update across all HUD frame/milestone APIs with rolling FPS, explicit FPS, and monotonic guards', async () => {
+  assert.equal(formatFpsDisplay(0), '0.0');
+  assert.equal(formatFpsDisplay(5.44), '5.4');
+  assert.equal(formatFpsDisplay(59.7), '60');
+  assert.equal(formatFpsDisplay(Number.NaN), '0.0');
+
+  const framesEl = createDisplayMockElement();
+  const fpsEl = createDisplayMockElement();
+  const pillFpsEl = createDisplayMockElement();
+  const bootStageEl = createDisplayMockElement();
+  const bootProgressBarEl = createDisplayMockElement();
+  const bootProgressFillEl = createDisplayMockElement({ style: {} });
+  const bootElapsedEl = createDisplayMockElement();
+  const bootModeBadge = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+
+  let nowMs = 5000;
+  const sessionController = new RuntimeSessionController({
+    capabilityProbe: async () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    startWasmRuntime: async () => ({ stop() {} }),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const controller = new HudController({
+    hud: createMockHud(),
+    sessionController,
+    bootMode: 'real-wasm64',
+    now: () => nowMs,
+    displayElements: {
+      framesEl,
+      fpsEl,
+      pillFpsEl,
+      bootStageEl,
+      bootProgressBarEl,
+      bootProgressFillEl,
+      bootElapsedEl,
+      bootModeBadge,
+      bootStatusEl,
+    },
+  });
+
+  // Initial rendered state.
+  assert.equal(framesEl.textContent, '0');
+  assert.equal(fpsEl.textContent, '0.0');
+  assert.equal(pillFpsEl.textContent, '0.0 fps');
+  assert.equal(bootStageEl.textContent, 'BOOTING');
+
+  // Advance milestones via updateGpuBootTelemetry and verify stale stage never regresses.
+  controller.updateGpuBootTelemetry({
+    bootSummary: { stage: 'PGIM_LOAD', progressPct: 11, elapsedMs: 1200 },
+  });
+  assert.equal(bootStageEl.textContent, 'PGIM_LOAD');
+  assert.equal(bootProgressBarEl.getAttribute('aria-valuenow'), '11');
+  assert.equal(bootProgressFillEl.style.width, '11.0%');
+  assert.equal(bootElapsedEl.textContent, '1.2s');
+
+  controller.updateTelemetry({
+    milestone: 'D3D12_CREATE_DEVICE',
+    gpu: { realPackDrawCount: 12, fallbackDrawCount: 4, presentCount: 1 },
+  });
+  assert.equal(bootStageEl.textContent, 'D3D12_CREATE_DEVICE');
+  assert.equal(framesEl.textContent, '1');
+  assert.match(framesEl.title, /Draws: 12 real, 4 fallback \(1 present\)/);
+
+  // Same-ms burst must not divide by zero or produce NaN/Infinity FPS.
+  controller.recordFramePresented(2);
+  assert.equal(framesEl.textContent, '2');
+  assert.equal(fpsEl.textContent, '0.0');
+
+  // 1000ms later with +5 frames -> 5.0 FPS (single-decimal formatting < 10 FPS).
+  nowMs += 1000;
+  controller.recordFramePresented(7);
+  assert.equal(framesEl.textContent, '7');
+  assert.equal(fpsEl.textContent, '5.0');
+  assert.equal(fpsEl.dataset.state, 'info');
+  assert.equal(pillFpsEl.textContent, '5.0 fps');
+  assert.equal(bootStageEl.textContent, 'FIRST_PRESENT');
+  assert.equal(bootProgressFillEl.dataset.state, 'ok');
+
+  // Stale PGIM_LOAD bootSummary must NOT regress FIRST_PRESENT back to PGIM_LOAD.
+  controller.updateGpuBootTelemetry({
+    bootSummary: { stage: 'PGIM_LOAD', progressPct: 11 },
+  });
+  assert.equal(bootStageEl.textContent, 'FIRST_PRESENT');
+
+  // Explicit positive FPS passed via updateMetrics is respected and zero-ticks do not overwrite it.
+  controller.updateMetrics({ framesPresented: 100, fps: 59.6 });
+  assert.equal(framesEl.textContent, '100');
+  assert.equal(fpsEl.textContent, '60');
+  assert.equal(fpsEl.dataset.state, 'ok');
+  assert.equal(pillFpsEl.textContent, '60 fps');
+
+  controller.updateMetrics({ totalFrames: 0, fps: 0 });
+  assert.equal(framesEl.textContent, '100');
+  assert.equal(fpsEl.textContent, '60');
+
+  // restartSession resets DOM counters cleanly to '0' and '0.0'.
+  await controller.restartSession({ preferSmoke: false });
+  assert.equal(framesEl.textContent, '0');
+  assert.equal(fpsEl.textContent, '0.0');
+  assert.equal(pillFpsEl.textContent, '0.0 fps');
+  assert.equal(bootStageEl.textContent, 'BOOTING');
+  assert.equal(bootProgressFillEl.style.width, '0.0%');
+
+  // After destroy(), all live frame/metrics mutators are safe no-ops.
+  controller.destroy();
+  controller.onSplashFramePresented({ ok: true, framesPresented: 500, firstPresent: true });
+  controller.recordFramePresented(600);
+  controller.updateMetrics({ framesPresented: 700, fps: 120 });
+  assert.equal(framesEl.textContent, '0');
+  assert.equal(fpsEl.textContent, '0.0');
+
+  await sessionController.stop();
 });
