@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21)."""
 
 from __future__ import annotations
 
@@ -562,6 +562,426 @@ class TestCli(unittest.TestCase):
         joined = " ".join(cleaned)
         self.assertNotIn("someone", joined)
         self.assertNotIn("C:\\", joined)
+
+
+def _module_layout(root: Path, name: str, *, shards: int = 2) -> Path:
+    module = root / name
+    for index in range(shards):
+        _write(
+            module / "lift" / f"shard-{index:05d}.ll",
+            f"; ModuleID = '{name}-{index}'\n",
+        )
+    _write(module / "lift" / "functions.ll", f"; registration {name}\n")
+    _write(module / "stubs" / "pg6_import_thunks.cpp", f"void thunk_{name}() {{}}\n")
+    _write(module / "stubs" / "pg6_guest_seam.h", "#pragma once\n")
+    (module / "build-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "playgta6-recomp-build",
+                "schema_version": 1,
+                "module": name,
+                "lift": {
+                    "shards": [
+                        {
+                            "index": index,
+                            "ll": f"lift/shard-{index:05d}.ll",
+                            "instructions": 10 * (index + 1),
+                        }
+                        for index in range(shards)
+                    ],
+                    "registration": {"ll": "lift/functions.ll"},
+                },
+                "files": [
+                    {"path": "stubs/pg6_import_thunks.cpp"},
+                    {"path": "lift/functions.ll"},
+                ]
+                + [{"path": f"lift/shard-{index:05d}.ll"} for index in range(shards)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return module
+
+
+def _program_layout(root: Path) -> Path:
+    src = root / "program-out"
+    _module_layout(src, "main", shards=3)
+    _module_layout(src, "vcruntime140", shards=2)
+    _write(src / "exports" / "pg6_export_thunks.cpp", "void pg6_export_thunks() {}\n")
+    _write(src / "program_modules.cpp", "const int pg6_program_modules = 2;\n")
+    _write(src / "pg6_program.cpp", "extern const int pg6_program_modules;\n")
+    (src / "program-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "playgta6-recomp-program",
+                "schema_version": 1,
+                "modules": [
+                    {"module": "main", "file": "game.exe"},
+                    {"module": "vcruntime140", "file": "vcruntime140.dll"},
+                ],
+                "files": [
+                    {"path": "exports/pg6_export_thunks.cpp"},
+                    {"path": "program_modules.cpp"},
+                    {"path": "pg6_program.cpp"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return src
+
+
+class TestProgramManifestDiscovery(unittest.TestCase):
+    def test_discovers_every_module_and_program_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = _program_layout(Path(tmp))
+            units = bgw.discover_sources(src)
+            ids = [u.unit_id for u in units]
+            self.assertEqual(
+                ids,
+                [
+                    "exports/pg6_export_thunks.cpp",
+                    "main/lift/functions.ll",
+                    "main/lift/shard-00000.ll",
+                    "main/lift/shard-00001.ll",
+                    "main/lift/shard-00002.ll",
+                    "main/stubs/pg6_import_thunks.cpp",
+                    "pg6_program.cpp",
+                    "program_modules.cpp",
+                    "vcruntime140/lift/functions.ll",
+                    "vcruntime140/lift/shard-00000.ll",
+                    "vcruntime140/lift/shard-00001.ll",
+                    "vcruntime140/stubs/pg6_import_thunks.cpp",
+                ],
+            )
+            by_id = {u.unit_id: u for u in units}
+            self.assertEqual(by_id["main/lift/shard-00001.ll"].module, "main")
+            self.assertEqual(by_id["vcruntime140/stubs/pg6_import_thunks.cpp"].module, "vcruntime140")
+            self.assertEqual(by_id["program_modules.cpp"].module, "program")
+            self.assertEqual(by_id["exports/pg6_export_thunks.cpp"].module, "program")
+            self.assertEqual(by_id["main/lift/shard-00001.ll"].instructions, 20)
+
+    def test_program_build_compiles_tagged_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            src = _program_layout(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(len(report.sources), 12)
+            modules = {u.unit.module for u in report.sources}
+            self.assertEqual(modules, {"main", "vcruntime140", "program"})
+            self.assertEqual(len(runner.link_calls), 1)
+
+    def test_program_manifest_file_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = _program_layout(Path(tmp))
+            units = bgw.discover_sources(src / "program-manifest.json")
+            self.assertTrue(any(u.unit_id == "main/lift/shard-00000.ll" for u in units))
+            self.assertTrue(any(u.unit_id == "program_modules.cpp" for u in units))
+
+    def test_windows_backslash_paths_in_program_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "out"
+            _write(src / "main" / "lift" / "shard-00000.ll", "; shard\n")
+            _write(src / "main" / "lift" / "functions.ll", "; fn\n")
+            _write(src / "main" / "stubs" / "pg6_import_thunks.cpp", "void t() {}\n")
+            _write(src / "exports" / "pg6_export_thunks.cpp", "void e() {}\n")
+            (src / "main" / "build-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "lift": {
+                            "shards": [{"ll": r"lift\shard-00000.ll", "instructions": 4}],
+                            "registration": {"ll": r"lift\functions.ll"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (src / "program-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "modules": [{"module": "main"}],
+                        "files": [{"path": r"exports\pg6_export_thunks.cpp"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ids = [u.unit_id for u in bgw.discover_sources(src)]
+            self.assertIn("main/lift/shard-00000.ll", ids)
+            self.assertIn("exports/pg6_export_thunks.cpp", ids)
+            for unit_id in ids:
+                self.assertNotIn("\\", unit_id)
+
+
+class TestResponseFileLinking(unittest.TestCase):
+    def test_build_link_argv_uses_at_response_file(self) -> None:
+        rsp = Path("work") / "wasm_obj_cache" / "link_objects.rsp"
+        link = bgw.build_link_argv(
+            "em++",
+            [Path("a.o"), Path("b.o")],
+            output_js=Path("web/dist/runtime.js"),
+            runtime_libs=[Path("libplaygta6_core.a")],
+            response_file=rsp,
+        )
+        self.assertTrue(any(t.startswith("@") and t.endswith("link_objects.rsp") for t in link))
+        self.assertNotIn("a.o", [Path(t).name for t in link if not t.startswith("@")])
+        self.assertIn("libplaygta6_core.a", [Path(t).name for t in link])
+
+    def test_write_and_sanitize_windows_rsp_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rsp = Path(tmp) / "link_objects.rsp"
+            win_objects = [
+                r"C:\Users\someone\work\wasm_obj_cache\aa\shard-00000.o",
+                r"C:\Users\someone\work\wasm_obj_cache\bb\shard-00001.o",
+            ]
+            bgw.write_link_response_file(rsp, win_objects)
+            text = rsp.read_text(encoding="utf-8")
+            self.assertEqual(text.splitlines(), win_objects)
+            cleaned = bgw.sanitize_text(text)
+            self.assertNotIn("someone", cleaned)
+            self.assertNotIn("C:\\", cleaned)
+            argv = [
+                r"C:\Users\someone\emsdk\upstream\emscripten\em++.bat",
+                "-sMEMORY64=1",
+                rf"@{rsp}".replace(str(rsp), r"C:\Users\someone\work\wasm_obj_cache\link_objects.rsp"),
+                "-o",
+                r"C:\Users\someone\web\dist\runtime.js",
+            ]
+            sanitized = bgw.sanitize_argv(argv)
+            self.assertEqual(sanitized[0], "em++")
+            self.assertEqual(sanitized[2], "@link_objects.rsp")
+            self.assertEqual(sanitized[-1], "runtime.js")
+            self.assertNotIn("someone", " ".join(sanitized))
+
+    def test_auto_response_file_when_over_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            src = root / "recomp-out"
+            for index in range(bgw.RESPONSE_FILE_THRESHOLD + 1):
+                _write(src / "lift" / f"shard-{index:05d}.ll", f"; s{index}\n")
+            cache = root / "cache"
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.response_file, "link_objects.rsp")
+            rsp = cache / "link_objects.rsp"
+            self.assertTrue(rsp.is_file())
+            self.assertEqual(len(rsp.read_text(encoding="utf-8").splitlines()), bgw.RESPONSE_FILE_THRESHOLD + 1)
+            self.assertEqual(len(runner.link_calls), 1)
+            link = runner.link_calls[0]
+            self.assertTrue(any(t.replace("\\", "/").endswith("/link_objects.rsp") and t.startswith("@") for t in link))
+            self.assertIn("@link_objects.rsp", report.link_argv)
+            dumped = json.dumps(report.to_dict())
+            self.assertNotIn("\\\\", bgw.sanitize_text(dumped))
+
+    def test_explicit_response_file_below_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            src = _layout_sources(root)
+            cache = root / "cache"
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist",
+                jobs=1,
+                runtime_lib=None,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                response_file=True,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.response_file, "link_objects.rsp")
+            self.assertTrue((cache / "link_objects.rsp").is_file())
+            self.assertTrue(any(t.startswith("@") for t in runner.link_calls[0]))
+
+    def test_no_response_file_keeps_objects_on_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            src = root / "recomp-out"
+            for index in range(bgw.RESPONSE_FILE_THRESHOLD + 1):
+                _write(src / "lift" / f"shard-{index:05d}.ll", f"; s{index}\n")
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                response_file=False,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertIsNone(report.response_file)
+            self.assertFalse(any(t.startswith("@") for t in runner.link_calls[0]))
+
+
+class TestSampleAndGuestBoot(unittest.TestCase):
+    def test_sample_evenly_spaces_shards_and_skips_link(self) -> None:
+        units = [
+            bgw.SourceUnit(f"lift/shard-{i:05d}.ll", Path(f"shard-{i:05d}.ll"), "ll")
+            for i in range(10)
+        ]
+        units.append(bgw.SourceUnit("lift/functions.ll", Path("functions.ll"), "ll"))
+        picked = bgw.sample_units(units, 3)
+        self.assertEqual(
+            [u.unit_id for u in picked],
+            ["lift/shard-00000.ll", "lift/shard-00003.ll", "lift/shard-00006.ll"],
+        )
+
+    def test_sample_build_extrapolates_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            src = root / "recomp-out"
+            for index in range(10):
+                _write(src / "lift" / f"shard-{index:05d}.ll", f"; s{index}\n")
+            _write(src / "lift" / "functions.ll", "; registration\n")
+            runner = RecordingRunner(delay=0.01)
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                sample=3,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.mode, "sample")
+            self.assertEqual(report.sample, 3)
+            self.assertEqual(len(report.sources), 3)
+            self.assertEqual(len(runner.compile_calls), 3)
+            self.assertEqual(runner.link_calls, [])
+            self.assertIsNotNone(report.extrapolated)
+            extra = report.extrapolated or {}
+            self.assertEqual(extra["sample_units"], 3)
+            self.assertEqual(extra["total_shards"], 10)
+            self.assertGreater(extra["object_bytes"], 0)
+            self.assertGreaterEqual(extra["compile_seconds"], 0)
+            self.assertEqual(extra["object_bytes"], int(3 * 3 * (10 / 3)))
+
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--sample",
+                    "3",
+                    "--dry-run",
+                    "--json",
+                    "--jobs",
+                    "2",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache2"),
+                    "--out-dir",
+                    str(root / "dist2"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["mode"], "sample")
+            self.assertIn("extrapolated", payload)
+            self.assertIn("object_bytes", payload["extrapolated"])
+            self.assertIn("compile_seconds", payload["extrapolated"])
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or "nobody"
+            dumped = json.dumps(payload)
+            self.assertNotIn("\\\\", dumped)
+            if len(user) >= 3:
+                self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+    def test_link_guest_boot_compiles_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            boot = repo / "runtime" / "guest" / "boot_main.cpp"
+            _write(boot, "int main() { return 0; }\n")
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                link_guest_boot=True,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertTrue(report.linked_guest_boot)
+            ids = [u.unit.unit_id for u in report.sources]
+            self.assertTrue(any(i.endswith("boot_main.cpp") for i in ids))
+            define_seen = False
+            for argv in runner.compile_calls:
+                joined = " ".join(argv)
+                if "boot_main.cpp" in joined.replace("\\", "/"):
+                    self.assertIn("-DPG6_BOOT_LINKED_GUEST=1", argv)
+                    define_seen = True
+            self.assertTrue(define_seen)
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertTrue(payload["linked_guest_boot"])
+
+    def test_link_guest_boot_custom_entry_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            entry = repo / "runtime" / "wasm_boot.cpp"
+            _write(entry, "int boot() { return 0; }\n")
+            src = _layout_sources(root)
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--link-guest-boot",
+                    "--guest-boot-entry",
+                    str(entry),
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache"),
+                    "--out-dir",
+                    str(root / "dist"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["linked_guest_boot"])
+            self.assertTrue(any(u["id"].endswith("wasm_boot.cpp") for u in payload["sources"]))
 
 
 class TestLinkFlagContract(unittest.TestCase):
