@@ -210,8 +210,11 @@ void test_enum_tables() {
             features.insert(feature_name(bit));
         }
     }
-    CHECK(features.size() == 7);
+    CHECK(features.size() == 8);
     CHECK(feature_name(WgpuFeature::All + 1) == nullptr);
+    CHECK(std::string(feature_name(WgpuFeature::Bgra8UnormStorage)) == "bgra8unorm-storage");
+    CHECK((WgpuFeature::All & WgpuFeature::Bgra8UnormStorage) == WgpuFeature::Bgra8UnormStorage);
+    CHECK(WgpuFeature::Bgra8UnormStorage == (WgpuFeature::TextureFormatsTier1 << 1));
     CHECK(std::string(texture_format_name(TF::Depth24PlusStencil8)) == "depth24plus-stencil8");
     CHECK(std::string(vertex_format_name(VF::Unorm10_10_10_2)) == "unorm10-10-10-2");
     CHECK(std::string(blend_factor_name(WgpuBlendFactor::SrcAlphaSaturated)) == "src-alpha-saturated");
@@ -331,6 +334,75 @@ void test_texture_format_mapping() {
         CHECK(!ds.supported());
         CHECK(has(ds.diagnostics, FormatDiag::Unsupported));
     }
+    // G59: packed 16-bit B5G5R5A1_UNORM (86) / B4G4R4A4_UNORM (115) promote to core rgba8unorm for
+    // Sampled and RenderTarget (no device features needed); there is no depth-stencil form.
+    {
+        CHECK(static_cast<uint32_t>(D::B5G5R5A1_UNORM) == 86);
+        CHECK(static_cast<uint32_t>(D::B4G4R4A4_UNORM) == 115);
+        for (D packed : {D::B5G5R5A1_UNORM, D::B4G4R4A4_UNORM}) {
+            for (uint32_t features : {0u, WgpuFeature::All}) {
+                for (FormatUsage usage : {FormatUsage::Sampled, FormatUsage::RenderTarget}) {
+                    const TextureFormatMapping m = map_texture_format(packed, usage, features);
+                    CHECK(m.supported());
+                    CHECK(m.format == TF::Rgba8Unorm);
+                    CHECK(m.aspect == WgpuTextureAspect::All);
+                    CHECK(m.required_features == 0);
+                    CHECK(m.diagnostics == (FormatDiag::FeatureFallback | FormatDiag::NeedsCpuConversion));
+                }
+                const TextureFormatMapping ds = map_texture_format(packed, FormatUsage::DepthStencil, features);
+                CHECK(!ds.supported());
+                CHECK(ds.diagnostics == FormatDiag::Unsupported);
+            }
+        }
+    }
+    // G59: Xbox D16_UNORM_S8_UINT (118) promotes to depth24plus-stencil8 for DepthStencil and Sampled with
+    // no device features; it is never a color target. Its R16_UNORM_X8 (119) / X16_G8 (120) views sample
+    // the depth / stencil aspect of the same promoted format.
+    {
+        CHECK(static_cast<uint32_t>(D::D16_UNORM_S8_UINT) == 118);
+        CHECK(static_cast<uint32_t>(D::R16_UNORM_X8_TYPELESS) == 119);
+        CHECK(static_cast<uint32_t>(D::X16_TYPELESS_G8_UINT) == 120);
+        for (uint32_t features : {0u, WgpuFeature::All}) {
+            const TextureFormatMapping ds = map_texture_format(D::D16_UNORM_S8_UINT, FormatUsage::DepthStencil, features);
+            CHECK(ds.supported());
+            CHECK(ds.format == TF::Depth24PlusStencil8);
+            CHECK(ds.aspect == WgpuTextureAspect::All);
+            CHECK(ds.required_features == 0);
+            CHECK(ds.diagnostics == FormatDiag::FeatureFallback);
+            CHECK(has_depth_aspect(ds.format) && has_stencil_aspect(ds.format));
+
+            const TextureFormatMapping sampled = map_texture_format(D::D16_UNORM_S8_UINT, FormatUsage::Sampled, features);
+            CHECK(sampled.supported());
+            CHECK(sampled.format == TF::Depth24PlusStencil8);
+            CHECK(sampled.aspect == WgpuTextureAspect::All);
+            CHECK(sampled.required_features == 0);
+            CHECK(sampled.diagnostics == FormatDiag::FeatureFallback);
+
+            const TextureFormatMapping rt = map_texture_format(D::D16_UNORM_S8_UINT, FormatUsage::RenderTarget, features);
+            CHECK(!rt.supported());
+            CHECK(rt.diagnostics == FormatDiag::Unsupported);
+
+            const TextureFormatMapping depth_view =
+                map_texture_format(D::R16_UNORM_X8_TYPELESS, FormatUsage::Sampled, features);
+            CHECK(depth_view.supported());
+            CHECK(depth_view.format == TF::Depth24PlusStencil8);
+            CHECK(depth_view.aspect == WgpuTextureAspect::DepthOnly);
+            CHECK(depth_view.required_features == 0);
+            CHECK(depth_view.diagnostics == FormatDiag::FeatureFallback);
+
+            const TextureFormatMapping stencil_view =
+                map_texture_format(D::X16_TYPELESS_G8_UINT, FormatUsage::Sampled, features);
+            CHECK(stencil_view.supported());
+            CHECK(stencil_view.format == TF::Depth24PlusStencil8);
+            CHECK(stencil_view.aspect == WgpuTextureAspect::StencilOnly);
+            CHECK(stencil_view.required_features == 0);
+            CHECK(stencil_view.diagnostics == FormatDiag::FeatureFallback);
+        }
+        // The 16-bit D16_UNORM (no stencil) keeps its exact depth16unorm mapping.
+        const TextureFormatMapping d16 = map_texture_format(D::D16_UNORM, FormatUsage::DepthStencil, 0);
+        CHECK(d16.format == TF::Depth16Unorm);
+        CHECK(d16.diagnostics == 0);
+    }
     // A8_UNORM maps cleanly to core r8unorm with no extra device features required.
     CHECK(map_texture_format(D::A8_UNORM, FormatUsage::Sampled, 0).required_features == 0);
     CHECK(map_texture_format(D::A8_UNORM, FormatUsage::RenderTarget, 0).required_features == 0);
@@ -348,8 +420,11 @@ void test_texture_format_mapping() {
     const std::pair<D, FormatUsage> unsupported[] = {
         {D::UNKNOWN, FormatUsage::RenderTarget},       {D::R32G32B32_FLOAT, FormatUsage::RenderTarget},
         {D::R32G32B32_FLOAT, FormatUsage::Sampled},    {D::B5G6R5_UNORM, FormatUsage::Sampled},
-        {D::B5G5R5A1_UNORM, FormatUsage::RenderTarget},{D::A8_UNORM, FormatUsage::DepthStencil},
-        {D::R1_UNORM, FormatUsage::Sampled},           {D::B4G4R4A4_UNORM, FormatUsage::Sampled},
+        {D::B5G5R5A1_UNORM, FormatUsage::DepthStencil},{D::A8_UNORM, FormatUsage::DepthStencil},
+        {D::R1_UNORM, FormatUsage::Sampled},           {D::B4G4R4A4_UNORM, FormatUsage::DepthStencil},
+        {D::D16_UNORM_S8_UINT, FormatUsage::RenderTarget},
+        {D::R16_UNORM_X8_TYPELESS, FormatUsage::RenderTarget},
+        {D::X16_TYPELESS_G8_UINT, FormatUsage::RenderTarget},
         {D::BC1_UNORM, FormatUsage::RenderTarget},     {D::BC7_UNORM, FormatUsage::DepthStencil},
         {D::D32_FLOAT, FormatUsage::RenderTarget},     {D::R32_FLOAT, FormatUsage::DepthStencil},
         {D::R9G9B9E5_SHAREDEXP, FormatUsage::DepthStencil}, {static_cast<D>(103), FormatUsage::Sampled},
@@ -1044,6 +1119,15 @@ void test_diagnostics() {
     GraphicsKeyResult d32s8 = with([](auto& d) { d.DSVFormat = D::D32_FLOAT_S8X24_UINT; });
     CHECK(d32s8.diagnostics == PipelineDiag::TargetFormatFallback);
     CHECK(d32s8.key.depth_stencil.format == TF::Depth24PlusStencil8);
+    GraphicsKeyResult b5g5r5a1 = with([](auto& d) { d.RTVFormats[0] = D::B5G5R5A1_UNORM; });
+    CHECK(b5g5r5a1.diagnostics == PipelineDiag::TargetFormatFallback);
+    CHECK(b5g5r5a1.key.color_targets[0].format == TF::Rgba8Unorm);
+    GraphicsKeyResult b4g4r4a4 = with([](auto& d) { d.RTVFormats[0] = D::B4G4R4A4_UNORM; });
+    CHECK(b4g4r4a4.diagnostics == PipelineDiag::TargetFormatFallback);
+    CHECK(b4g4r4a4.key.color_targets[0].format == TF::Rgba8Unorm);
+    GraphicsKeyResult d16s8 = with([](auto& d) { d.DSVFormat = D::D16_UNORM_S8_UINT; });
+    CHECK(d16s8.diagnostics == PipelineDiag::TargetFormatFallback);
+    CHECK(d16s8.key.depth_stencil.format == TF::Depth24PlusStencil8);
     CHECK(is_fatal(with([](auto& d) {
                        d.RTVFormats[0] = D::R32G32B32A32_UINT;
                        d.SampleDesc.Count = 4;
