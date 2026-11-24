@@ -77,6 +77,17 @@ std::string stage_entry(uint64_t dxil, const std::array<uint8_t, 16>& digest, co
            ", \"native_identity\": " + json_string(n.identity != 0 ? id_text(n.identity) : "") + "}";
 }
 
+std::string compute_stage_entry(uint64_t dxil, const std::array<uint8_t, 16>& digest, uint64_t native_code_identity,
+                                uint64_t native_identity) {
+    if (dxil == 0 && native_identity == 0) {
+        return "null";
+    }
+    return "{\"dxil_identity\": " + json_string(dxil != 0 ? id_text(dxil) : "") +
+           ", \"hash_digest\": " + json_string(digest_text(digest)) +
+           ", \"native_code_identity\": " + json_string(native_identity != 0 ? id_text(native_code_identity) : "") +
+           ", \"native_identity\": " + json_string(native_identity != 0 ? id_text(native_identity) : "") + "}";
+}
+
 const char* range_type(d3d::DescriptorRangeType t) {
     switch (t) {
         case d3d::DescriptorRangeType::Srv:
@@ -152,6 +163,12 @@ bool PipelineDump::write_file(const std::string& path, const uint8_t* bytes, siz
 
 void PipelineDump::native_stage(uint64_t code_identity, uint64_t identity, bool pixel, bool layout_b,
                                 const uint8_t* code, size_t code_size, const uint8_t* metadata, size_t metadata_size) {
+    native_stage(code_identity, identity, pixel ? NativeStageKind::Pixel : NativeStageKind::Vertex, layout_b, code,
+                 code_size, metadata, metadata_size);
+}
+
+void PipelineDump::native_stage(uint64_t code_identity, uint64_t identity, NativeStageKind stage, bool layout_b,
+                                const uint8_t* code, size_t code_size, const uint8_t* metadata, size_t metadata_size) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!ok_ || !native_seen_.insert(identity).second) {
         return;
@@ -168,8 +185,11 @@ void PipelineDump::native_stage(uint64_t code_identity, uint64_t identity, bool 
         meta_file = "native/" + id_text(code_identity) + "-" + id_text(identity) + ".meta";
         write_file(dir_ + "/" + meta_file, metadata, metadata_size);
     }
+    const char* stage_name = stage == NativeStageKind::Compute
+                                 ? "compute"
+                                 : (stage == NativeStageKind::Pixel ? "pixel" : "vertex");
     native_entries_.push_back("{\"code_identity\": " + json_string(id_text(code_identity)) + ", \"identity\": " +
-                              json_string(id_text(identity)) + ", \"stage\": \"" + (pixel ? "pixel" : "vertex") +
+                              json_string(id_text(identity)) + ", \"stage\": \"" + stage_name +
                               "\", \"layout\": \"" + (layout_b ? "B" : "A") + "\", \"code_bytes\": " +
                               num(code_size) + ", \"metadata_bytes\": " + num(metadata_size) + ", \"code_file\": " +
                               json_string(code_file) + ", \"metadata_file\": " + json_string(meta_file) + "}");
@@ -188,22 +208,27 @@ void PipelineDump::dxil(uint64_t identity, const std::array<uint8_t, 16>* hash_d
                             inum(kind) + ", \"bytes\": " + num(size) + ", \"file\": " + json_string(file) + "}");
 }
 
+int PipelineDump::intern_root_signature_locked(const void* root_signature,
+                                               const d3d::RootSignatureDesc* root_desc) {
+    if (root_signature == nullptr || root_desc == nullptr) {
+        return -1;
+    }
+    auto it = root_index_.find(root_signature);
+    if (it != root_index_.end()) {
+        return it->second;
+    }
+    const int root = static_cast<int>(root_entries_.size());
+    root_index_.emplace(root_signature, root);
+    root_entries_.push_back(root_entry(root, *root_desc));
+    return root;
+}
+
 uint32_t PipelineDump::pipeline(const GraphicsPsoSource& src, const std::array<uint8_t, 16>& vs_digest,
                                 const std::array<uint8_t, 16>& ps_digest, const void* root_signature,
                                 const d3d::RootSignatureDesc* root_desc) {
     const pso::D3D12GraphicsPsoDesc& d = src.desc;
     std::lock_guard<std::mutex> lock(mutex_);
-    int root = -1;
-    if (root_signature != nullptr && root_desc != nullptr) {
-        auto it = root_index_.find(root_signature);
-        if (it == root_index_.end()) {
-            root = static_cast<int>(root_entries_.size());
-            root_index_.emplace(root_signature, root);
-            root_entries_.push_back(root_entry(root, *root_desc));
-        } else {
-            root = it->second;
-        }
-    }
+    const int root = intern_root_signature_locked(root_signature, root_desc);
     std::string s = "\"vs\": " + stage_entry(d.vs, vs_digest, src.native_vs) +
                     ", \"ps\": " + stage_entry(d.ps, ps_digest, src.native_ps) + ", \"root_signature\": " +
                     inum(root) + ", \"topology_type\": " + en(d.PrimitiveTopologyType) +
@@ -264,6 +289,31 @@ void PipelineDump::draw(uint32_t pipeline_index) {
     }
 }
 
+uint32_t PipelineDump::compute_pipeline(uint64_t cs_identity, const std::array<uint8_t, 16>& cs_digest,
+                                        uint64_t native_code_identity, uint64_t native_identity,
+                                        const void* root_signature, const d3d::RootSignatureDesc* root_desc) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const int root = intern_root_signature_locked(root_signature, root_desc);
+    std::string s = "\"cs\": " + compute_stage_entry(cs_identity, cs_digest, native_code_identity, native_identity) +
+                    ", \"root_signature\": " + inum(root);
+    auto it = compute_pipeline_index_.find(s);
+    if (it != compute_pipeline_index_.end()) {
+        ++compute_pipelines_[it->second].created;
+        return it->second;
+    }
+    const uint32_t index = static_cast<uint32_t>(compute_pipelines_.size());
+    compute_pipeline_index_.emplace(s, index);
+    compute_pipelines_.push_back(ComputePipeline{std::move(s), 1, 0});
+    return index;
+}
+
+void PipelineDump::dispatch(uint32_t compute_pipeline_index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (compute_pipeline_index < compute_pipelines_.size()) {
+        ++compute_pipelines_[compute_pipeline_index].dispatches;
+    }
+}
+
 void PipelineDump::write_manifest() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!ok_) {
@@ -284,6 +334,12 @@ void PipelineDump::write_manifest() {
     for (size_t i = 0; i < pipelines_.size(); ++i) {
         s += std::string(i ? ",\n " : "\n ") + "{\"index\": " + num(i) + ", \"created\": " +
              num(pipelines_[i].created) + ", \"draws\": " + num(pipelines_[i].draws) + ", " + pipelines_[i].body + "}";
+    }
+    s += "],\n\"compute_pipelines\": [";
+    for (size_t i = 0; i < compute_pipelines_.size(); ++i) {
+        s += std::string(i ? ",\n " : "\n ") + "{\"index\": " + num(i) + ", \"created\": " +
+             num(compute_pipelines_[i].created) + ", \"dispatches\": " + num(compute_pipelines_[i].dispatches) +
+             ", " + compute_pipelines_[i].body + "}";
     }
     s += "]}\n";
     const std::string tmp = dir_ + "/manifest.json.tmp";

@@ -5,11 +5,14 @@
 #include "gpu/d3d12_xs_xbox.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
@@ -99,6 +102,110 @@ bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* 
     p.vertex_alt = b.present();
     *out = p;
     return true;
+}
+
+bool parse_native_compute_pipeline(const GuestNativeComputePipelineDesc& desc, NativeComputePipeline* out,
+                                   std::string* error) {
+    constexpr uint64_t kMaxRecordBytes = 64u << 10;
+    auto fail = [&](const std::string& message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    for (size_t i = 0; i < kNativeComputeRangeCount; ++i) {
+        const GuestNativeRange& r = desc.ranges[i];
+        if ((r.address == 0) != (r.size == 0)) {
+            return fail("range " + std::to_string(i) + " has an address or a size but not both");
+        }
+        if (r.size > kMaxNativeRangeBytes) {
+            return fail("range " + std::to_string(i) + " is too large (" + std::to_string(r.size) + " bytes)");
+        }
+    }
+    NativeComputePipeline p;
+    p.root_signature = desc.pRootSignature;
+    p.header = desc.ranges[0];
+    if (p.header.size == 0) {
+        return fail("no header record (range 0)");
+    }
+    if (p.header.size > kMaxRecordBytes) {
+        return fail("header record larger than 64 KiB");
+    }
+    if (desc.ranges[2].size != 0 && desc.ranges[3].size != 0) {
+        // 4-range layout (matching slot 57): header, pipeline metadata, compute code, compute metadata.
+        p.metadata = desc.ranges[1];
+        if (p.metadata.size > kMaxRecordBytes) {
+            return fail("pipeline metadata larger than 64 KiB");
+        }
+        p.compute.code = desc.ranges[2];
+        p.compute.metadata = desc.ranges[3];
+    } else if (desc.ranges[1].size != 0 && desc.ranges[3].size == 0) {
+        // 3-range compact layout: header, compute code, optional compute metadata.
+        p.compute.code = desc.ranges[1];
+        p.compute.metadata = desc.ranges[2];
+    } else {
+        return fail("no compute stage code range");
+    }
+    if (p.compute.code.address % kNativeCodeAlignment != 0) {
+        return fail("compute stage code is not 256-byte aligned");
+    }
+    *out = p;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slot 70/71 address-based texture view metadata registry
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+struct AddressTextureViewRegistry {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, AddressTextureViewInfo> by_va;
+};
+
+AddressTextureViewRegistry& address_texture_registry() {
+    static AddressTextureViewRegistry reg;
+    return reg;
+}
+
+}  // namespace
+
+void record_address_texture_view(const AddressTextureViewInfo& info) {
+    if (info.gpu_va == 0) {
+        return;
+    }
+    AddressTextureViewRegistry& reg = address_texture_registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    reg.by_va[info.gpu_va] = info;
+}
+
+bool lookup_address_texture_view(uint64_t gpu_va, AddressTextureViewInfo* out) {
+    if (gpu_va == 0) {
+        return false;
+    }
+    AddressTextureViewRegistry& reg = address_texture_registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    const auto it = reg.by_va.find(gpu_va);
+    if (it == reg.by_va.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second;
+    }
+    return true;
+}
+
+size_t address_texture_view_count() {
+    AddressTextureViewRegistry& reg = address_texture_registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    return reg.by_va.size();
+}
+
+void clear_address_texture_views() {
+    AddressTextureViewRegistry& reg = address_texture_registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    reg.by_va.clear();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,7 +431,13 @@ uint64_t FramePacer::frame_locked(Clock::time_point now) const {
 }
 
 FramePacer::Clock::time_point FramePacer::start_of_locked(uint64_t frame) const {
-    return origin_ + std::chrono::microseconds(static_cast<int64_t>((frame - base_frame_) * interval_us_));
+    if (frame <= base_frame_) {
+        return origin_;
+    }
+    const uint64_t delta = frame - base_frame_;
+    const uint64_t max_frames = static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / interval_us_;
+    const uint64_t clamped = std::min(delta, max_frames);
+    return origin_ + std::chrono::microseconds(static_cast<int64_t>(clamped * interval_us_));
 }
 
 void FramePacer::set_interval(uint32_t interval_us, uint32_t period) {
@@ -359,22 +472,26 @@ FramePacer::WaitResult FramePacer::wait_after(uint64_t after, uint32_t timeout_m
     const auto start = Clock::now();
     const bool bounded = timeout_ms != kInfinite;
     const auto deadline = start + std::chrono::milliseconds(bounded ? timeout_ms : 0);
+    // Bound any future target to at most one interval past the tick at wait entry, so an
+    // ahead-of-clock or out-of-range token never blocks indefinitely or overflows wake math.
+    const uint64_t initial = frame_locked(start);
+    const uint64_t target_after = std::min(after, initial);
     for (;;) {
         const auto now = Clock::now();
         const uint64_t current = frame_locked(now);
         if (shutdown_) {
-            *frame = current;
+            *frame = std::max<uint64_t>(current, 1);
             return WaitResult::Shutdown;
         }
-        if (current > after) {
-            *frame = current;
+        if (current > target_after) {
+            *frame = std::max<uint64_t>(current, 1);
             return WaitResult::Ok;
         }
         if (bounded && now >= deadline) {
-            *frame = current;
+            *frame = std::max<uint64_t>(current, 1);
             return WaitResult::Timeout;
         }
-        auto wake = start_of_locked(after + 1);
+        auto wake = start_of_locked(target_after + 1);
         if (bounded && deadline < wake) {
             wake = deadline;
         }
@@ -440,13 +557,18 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
     count(xbox::Counter::FrameWaits);
     uint64_t frame = 0;
     if (timeout_ms == 0) {
-        // Poll: the current tick, never a failure (the executable traps if this fails).
+        // Poll: never fails and never blocks (the executable traps if this fails).
         g_frame_polls.fetch_add(1, std::memory_order_relaxed);
         frame = pacer_.current_frame();
     } else {
-        // Type 2 with a token waits until that frame is over; otherwise until a tick newer than
-        // the last one handed out.
-        const uint64_t after = (type == 2 && in != 0) ? in : last_frame_token_.load();
+        // Type 2 (PRESENT) with a token already completed by PresentX returns immediately;
+        // otherwise wait at most one pacer interval so valid ORIGIN / PRESENT waits never stall.
+        const uint64_t pacer_now = pacer_.current_frame();
+        uint64_t after = pacer_now;
+        if (type == 2 && in != 0) {
+            const uint64_t completed = last_present_token.load(std::memory_order_acquire);
+            after = (completed != 0 && in <= completed) ? uint64_t{0} : std::min(in, pacer_now);
+        }
         const auto started = std::chrono::steady_clock::now();
         const auto r = pacer_.wait_after(after, timeout_ms, &frame);
         g_frame_waits.fetch_add(1, std::memory_order_relaxed);
@@ -457,14 +579,24 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         if (r == xbox::FramePacer::WaitResult::Timeout) {
             g_frame_timeouts.fetch_add(1, std::memory_order_relaxed);
             count(xbox::Counter::FrameWaitTimeouts);
-            token.write(frame);
+            const uint64_t out_tok = std::max<uint64_t>(std::max<uint64_t>(frame, 1),
+                                                        last_frame_token_.load(std::memory_order_acquire));
+            token.write(out_tok);
             return static_cast<HResult>(0x887A0027u);  // DXGI_ERROR_WAIT_TIMEOUT
         }
     }
-    uint64_t prev = last_frame_token_.load();
-    while (frame > prev && !last_frame_token_.compare_exchange_weak(prev, frame)) {
+    // Always hand out a strictly monotonic, non-zero D3D12XBOX_FRAME_PIPELINE_TOKEN.
+    const uint64_t floor_tok = std::max<uint64_t>(frame, 1);
+    uint64_t prev = last_frame_token_.load(std::memory_order_relaxed);
+    uint64_t out_tok = floor_tok;
+    for (;;) {
+        out_tok = std::max<uint64_t>(floor_tok, prev + 1);
+        if (last_frame_token_.compare_exchange_weak(prev, out_tok, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+            break;
+        }
     }
-    token.write(frame);
+    token.write(out_tok);
     return kSOk;
 }
 
@@ -514,6 +646,122 @@ HResult Device::RegisterPagePool_unverified(uint64_t, uint32_t, GuestPtr<uint64_
     return kSOk;
 }
 
+namespace {
+
+constexpr uint64_t kMaxComputeShaderBytes = 64u << 20;
+
+// Extracts the 16-byte DXBC HASH part digest (after its u32 flags), or false if absent.
+bool extract_dxil_hash_digest(const uint8_t* p, size_t n, Device::DxilDigest* out) {
+    auto u32 = [&](size_t at) {
+        uint32_t v = 0;
+        std::memcpy(&v, p + at, 4);
+        return v;
+    };
+    if (n < 32 || u32(0) != 0x43425844u) {  // "DXBC"
+        return false;
+    }
+    const uint32_t parts = u32(28);
+    if (parts > 64 || 32 + uint64_t{parts} * 4 > n) {
+        return false;
+    }
+    for (uint32_t i = 0; i < parts; ++i) {
+        const uint32_t off = u32(32 + i * 4);
+        if (uint64_t{off} + 8 > n) {
+            return false;
+        }
+        if (u32(off) == 0x48534148u && u32(off + 4) >= 20 && uint64_t{off} + 8 + 20 <= n) {  // "HASH"
+            std::memcpy(out->data(), p + off + 12, 16);
+            return true;
+        }
+    }
+    return false;
+}
+
+struct PreparedComputeShader {
+    uint64_t cs_identity = 0;
+    Device::DxilDigest cs_digest{};
+    Device::NativeStageRecord native_cs{};
+    uint64_t pack_key = 0;
+};
+
+// Reads the compute shader bytes, joins any slot-67 native compute stage by HASH digest, and
+// resolves against ShaderPackIndex (PackStage::Compute, entry point cs_main).
+PreparedComputeShader prepare_compute_shader(Device& dev, const GuestComputePipelineStateDesc& g,
+                                             const ShaderPackIndex* pack, std::mutex& pack_mutex,
+                                             std::unordered_map<uint64_t, uint32_t>& pack_modules,
+                                             std::set<std::pair<uint64_t, uint64_t>>& pack_layouts) {
+    PreparedComputeShader prep{};
+    if (g.CS.pShaderBytecode == 0 || g.CS.BytecodeLength == 0 || g.CS.BytecodeLength > kMaxComputeShaderBytes) {
+        return prep;
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(g.CS.BytecodeLength));
+    if (!com::read_guest(g.CS.pShaderBytecode, bytes.data(), bytes.size())) {
+        return prep;
+    }
+    prep.cs_identity = shader_identity(bytes.data(), bytes.size());
+    static const Device::DxilDigest kZero{};
+    if (extract_dxil_hash_digest(bytes.data(), bytes.size(), &prep.cs_digest) && dev.native_index_size() != 0 &&
+        prep.cs_digest != kZero) {
+        dev.count(dev.find_native_stage(prep.cs_digest, &prep.native_cs) ? xbox::Counter::DxilStagesJoined
+                                                                         : xbox::Counter::DxilStagesNotJoined);
+    }
+    if (pack == nullptr || prep.cs_identity == 0) {
+        return prep;
+    }
+    for (uint64_t k : {prep.native_cs.identity != 0 ? prep.native_cs.code_identity : uint64_t{0}, prep.cs_identity}) {
+        auto it = k != 0 ? pack->find(k) : pack->end();
+        if (it != pack->end() && it->second == PackStage::Compute) {
+            prep.pack_key = k;
+            break;
+        }
+    }
+    if (prep.pack_key == 0) {
+        return prep;
+    }
+    std::lock_guard<std::mutex> lock(pack_mutex);
+    uint32_t module_id = 0;
+    auto it = pack_modules.find(prep.pack_key);
+    if (it != pack_modules.end()) {
+        module_id = it->second;
+    } else {
+        module_id = dev.allocate_id();
+        CommandEncoder enc;
+        enc.create_shader_module(module_id, GpuShaderStage::Compute, pack_key_code(prep.pack_key));
+        dev.submit(enc);
+        pack_modules.emplace(prep.pack_key, module_id);
+    }
+    dev.register_shader_module(prep.cs_identity, module_id);
+    if (g.pRootSignature != 0) {
+        auto rs_arg = InterfaceArg<IRootSignatureHost>::resolve(g.pRootSignature);
+        if (rs_arg && pack_layouts.insert({prep.cs_identity, 0}).second) {
+            auto* rs = static_cast<RootSignature*>(rs_arg.get());
+            bridge::PipelineLayoutDesc layout = layout_from_root_signature(rs->signature().desc());
+            for (bridge::GroupLayoutDesc& group : layout.groups) {
+                for (bridge::LayoutBinding& b : group.bindings) {
+                    b.entry.visibility = GpuShaderStageBits::Compute;
+                }
+            }
+            dev.state_bridge().register_pipeline_layout(prep.cs_identity, 0, std::move(layout));
+        }
+    }
+    return prep;
+}
+
+uint32_t record_compute_dump(PipelineDump& dump, const GuestComputePipelineStateDesc& g,
+                             const PreparedComputeShader& prep) {
+    RootSignature* rs = nullptr;
+    if (g.pRootSignature != 0) {
+        auto rs_arg = InterfaceArg<IRootSignatureHost>::resolve(g.pRootSignature);
+        if (rs_arg) {
+            rs = static_cast<RootSignature*>(rs_arg.get());
+        }
+    }
+    return dump.compute_pipeline(prep.cs_identity, prep.cs_digest, prep.native_cs.code_identity,
+                                 prep.native_cs.identity, rs, rs != nullptr ? &rs->signature().desc() : nullptr);
+}
+
+}  // namespace
+
 HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
     // Slot 62: (desc, a, b, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (DXIL compute
     // shader). a and b were always 0; other values are recorded and otherwise ignored.
@@ -533,9 +781,20 @@ HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
         note_bad_argument("CreateComputePipelineState (Xbox slot 62): unknown arguments " + hex(a) + ", " + hex(b) +
                           " ignored");
     }
+    const PreparedComputeShader prep =
+        prepare_compute_shader(*this, g, options_.shader_pack.get(), pack_mutex_, pack_modules_, pack_layouts_);
     const HResult hr = create_compute_pso(g, riid, out);
     if (hr >= 0) {
         count(xbox::Counter::ComputePipelineStatesX);
+        if (dump_ && prep.cs_identity != 0) {
+            const uint32_t dump_idx = record_compute_dump(*dump_, g, prep);
+            uint64_t pso_va = 0;
+            if (hr == kSOk && !out.is_null() && com::read_guest(out.va(), pso_va)) {
+                if (auto pso_arg = InterfaceArg<IPipelineStateHost>::resolve(pso_va)) {
+                    static_cast<PipelineState*>(pso_arg.get())->dump_index_ = dump_idx;
+                }
+            }
+        }
     } else if (out) {
         out.write(0);  // the caller frees the bytecode and takes its failure path
     }
@@ -543,14 +802,57 @@ HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
 }
 
 HResult Device::CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) {
-    // Slot 67: (&desc, riid, out), a console-native compute pipeline. Refused with a cleared out
-    // pointer: the caller falls back to slot 62 with the DXIL compute shader.
+    // Slot 67: (&desc, riid, out), a console-native compute pipeline. When a valid native compute
+    // descriptor is present, index its stage for the DXIL join and dump it when dump_dir is active,
+    // then refuse with E_NOTIMPL and a cleared out pointer so the caller falls back to slot 62.
     count(xbox::Counter::BlobPipelineStatesRefused);
-    const uint64_t out = ctx.int_arg(3);
-    uint64_t current = 1;
-    if (out != 0 && com::read_guest(out, &current, sizeof(current)) && current == 0) {
+    const uint64_t desc_va = ctx.int_arg(1);
+    const uint64_t out_va = ctx.int_arg(3);
+    if (out_va != 0) {
         const uint64_t zero = 0;
-        com::write_guest(out, &zero, sizeof(zero));
+        com::write_guest(out_va, &zero, sizeof(zero));
+    }
+    if (desc_va != 0) {
+        xbox::GuestNativeComputePipelineDesc d{};
+        bool readable = com::read_guest(desc_va, d);
+        if (!readable) {
+            // Compact 3-range form (0x38 bytes) near a page boundary.
+            readable = com::read_guest(desc_va, &d, sizeof(d) - sizeof(xbox::GuestNativeRange));
+            d.ranges[3] = {};
+        }
+        xbox::NativeComputePipeline p;
+        std::string error;
+        if (readable && xbox::parse_native_compute_pipeline(d, &p, &error)) {
+            std::vector<uint8_t> code(static_cast<size_t>(p.compute.code.size));
+            std::vector<uint8_t> meta(static_cast<size_t>(p.compute.metadata.size));
+            const bool code_ok = com::read_guest(p.compute.code.address, code.data(), code.size());
+            const bool meta_ok = meta.empty() || com::read_guest(p.compute.metadata.address, meta.data(), meta.size());
+            if (code_ok && meta_ok) {
+                const uint64_t code_id = shader_identity(code.data(), code.size());
+                const uint64_t stage_id = native_stage_identity(code.data(), code.size(), meta.data(), meta.size());
+                note_shader_size(stage_id, code.size());
+                if (dump_) {
+                    dump_->native_stage(code_id, stage_id, PipelineDump::NativeStageKind::Compute, /*layout_b=*/false,
+                                        code.data(), code.size(), meta.data(), meta.size());
+                }
+                std::lock_guard<std::mutex> lock(shader_mutex_);
+                if (indexed_native_.insert(stage_id).second) {
+                    static const DxilDigest kZero{};
+                    NativeStageRecord rec{};
+                    rec.identity = stage_id;
+                    rec.code_identity = code_id;
+                    rec.code_bytes = static_cast<uint32_t>(code.size());
+                    rec.metadata_bytes = static_cast<uint32_t>(meta.size());
+                    for (size_t o = xbox::kNativeDigestFirst; o + 16 <= meta.size(); o += xbox::kNativeDigestStride) {
+                        DxilDigest dig;
+                        std::memcpy(dig.data(), meta.data() + o, 16);
+                        if (dig != kZero) {
+                            native_by_digest_.emplace(dig, rec);
+                        }
+                    }
+                }
+            }
+        }
     }
     return kENotImpl;
 }
@@ -596,8 +898,22 @@ HResult Device::CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& 
     }
     count(xbox::Counter::StreamPipelineStates);
     switch (p.kind) {
-    case xbox::StreamPipelineKind::Compute:
-        return create_compute_pso(p.compute, riid, out);
+    case xbox::StreamPipelineKind::Compute: {
+        const PreparedComputeShader prep =
+            prepare_compute_shader(*this, p.compute, options_.shader_pack.get(), pack_mutex_, pack_modules_,
+                                   pack_layouts_);
+        const HResult hr = create_compute_pso(p.compute, riid, out);
+        if (hr >= 0 && dump_ && prep.cs_identity != 0) {
+            const uint32_t dump_idx = record_compute_dump(*dump_, p.compute, prep);
+            uint64_t pso_va = 0;
+            if (hr == kSOk && !out.is_null() && com::read_guest(out.va(), pso_va)) {
+                if (auto pso_arg = InterfaceArg<IPipelineStateHost>::resolve(pso_va)) {
+                    static_cast<PipelineState*>(pso_arg.get())->dump_index_ = dump_idx;
+                }
+            }
+        }
+        return hr;
+    }
     case xbox::StreamPipelineKind::Mesh:
         count(xbox::Counter::PlaceholderPipelineStates);
         return create_placeholder_pso("mesh/amplification shaders", riid, out);
@@ -764,6 +1080,8 @@ void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDe
     uint32_t words[bridge::kViewSlotBytes / 4] = {};
     d3d::ViewDesc vd = desc;
     uint32_t id = 0;
+    bool has_texture_view_info = false;
+    xbox::AddressTextureViewInfo tex_view_info{};
     if (vd.dimension == d3d::ViewDimension::Buffer) {
         bridge::buffer_words_at_address(va, words_record(kind, desc), words);
         d3d::GpuVaResolution res;
@@ -801,6 +1119,15 @@ void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDe
         t.format = rd.Format;
         t.sample_count = rd.SampleCount;
         const bridge::WordsStatus ws = bridge::image_words_at_address(va, t, words_record(kind, desc), words);
+        tex_view_info.gpu_va = va;
+        tex_view_info.dxgi_format = desc.format != 0 ? desc.format : rd.Format;
+        tex_view_info.width = static_cast<uint32_t>(rd.Width);
+        tex_view_info.height = rd.Height;
+        tex_view_info.depth = rd.DepthOrArraySize == 0 ? 1u : static_cast<uint32_t>(rd.DepthOrArraySize);
+        tex_view_info.mip_levels = t.mip_levels;
+        tex_view_info.d3d12_layout = rd.Layout;
+        tex_view_info.is_uav = uav;
+        has_texture_view_info = true;
         if (count_texture_view_at_address() == 1) {
             os::log(std::string("d3d12_xs: ") + what + ": first texture view at an address (" + hex(va) + ", format " +
                     std::to_string(rd.Format) + ", " + std::to_string(rd.Width) + "x" + std::to_string(rd.Height) +
@@ -813,6 +1140,9 @@ void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDe
     if (s != d3d::Status::Ok) {
         note_bad_argument(std::string(what) + ": " + d3d::status_name(s));
         return;
+    }
+    if (has_texture_view_info) {
+        xbox::record_address_texture_view(tex_view_info);
     }
     store_descriptor_words(dest, words, bridge::kViewSlotBytes);
 }
@@ -977,7 +1307,10 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) 
         return kEInvalidArg;
     }
     if (plane.Token != 0) {
-        device_->last_present_token.store(plane.Token);
+        uint64_t prev = device_->last_present_token.load(std::memory_order_relaxed);
+        while (plane.Token > prev && !device_->last_present_token.compare_exchange_weak(
+                                         prev, plane.Token, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        }
     }
     uint64_t resource = 0;
     if (plane.ResourceCount != 0 && plane.ppResources != 0 &&

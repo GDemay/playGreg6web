@@ -305,6 +305,30 @@ inline constexpr size_t kNativeDigestStride = 0x40;
 // or absent; code 256-byte aligned; sizes bounded). The contents are not interpreted.
 bool parse_native_pipeline(const GuestNativePipelineDesc& desc, NativePipeline* out, std::string* error);
 
+// Device slot 67 descriptor (console-native compute pipeline): root signature followed by up to
+// four {address, size} ranges:
+//   - 4-range form (matching slot 57): header, pipeline metadata, compute code, compute metadata
+//   - 3-range compact form: header, compute code, compute metadata (ranges[3] == {0, 0})
+inline constexpr size_t kNativeComputeRangeCount = 4;
+struct GuestNativeComputePipelineDesc {
+    uint64_t pRootSignature;
+    GuestNativeRange ranges[kNativeComputeRangeCount];
+};
+static_assert(sizeof(GuestNativeComputePipelineDesc) == 0x48 &&
+              offsetof(GuestNativeComputePipelineDesc, ranges) == 8);
+
+struct NativeComputePipeline {
+    uint64_t root_signature = 0;
+    GuestNativeRange header{};
+    GuestNativeRange metadata{};  // per-pipeline metadata (empty in 3-range form)
+    NativeStage compute;          // {code, metadata}
+};
+
+// Checks a slot-67 native compute descriptor (header present; compute code present and 256-byte
+// aligned; sizes bounded). The contents are not interpreted.
+bool parse_native_compute_pipeline(const GuestNativeComputePipelineDesc& desc, NativeComputePipeline* out,
+                                   std::string* error);
+
 // Rectangle lists. The title's pipeline-stream builder maps its topology enum through a table: the
 // rectangle entry becomes primitive topology type 19 (0x13) in the PRIMITIVE_TOPOLOGY subobject,
 // and command lists then set topology 17 (0x11), the GPU's DI_PT_RECTLIST primitive type (public
@@ -324,6 +348,24 @@ inline constexpr uint32_t kTopologyRectList = 17;
 
 // Device slots 70/71: the public view description followed by the buffer's GPU address.
 inline constexpr uint64_t kViewAtAddressOffset = 0x28;
+
+// Parsed resource geometry recorded for every Xbox Slot-70 (SRV at address) and Slot-71 (UAV at
+// address) texture view, keyed by its GPU virtual address in a thread-safe lookup table.
+struct AddressTextureViewInfo {
+    uint64_t gpu_va = 0;
+    uint32_t dxgi_format = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    uint32_t mip_levels = 1;
+    uint32_t d3d12_layout = 0;
+    bool is_uav = false;
+};
+
+void record_address_texture_view(const AddressTextureViewInfo& info);
+bool lookup_address_texture_view(uint64_t gpu_va, AddressTextureViewInfo* out);
+size_t address_texture_view_count();
+void clear_address_texture_views();
 
 // ---------------------------------------------------------------------------------------------
 // Pipeline-state streams (public D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values and layout)
