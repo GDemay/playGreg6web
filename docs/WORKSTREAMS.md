@@ -130,6 +130,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Load multi-module `PG6_BOOT_PROGRAM` bundles over HTTPFS inside `runtime/wasm_boot` with synthetic unit test coverage.
 - [ ] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `IN PROGRESS` (#373, @Timon-ok) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
   - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
+- [ ] **O30 — `XMemMapPhysicalPagesScatter` Semantics: One Page Number per Large Page, Not per 64 KiB Slot (`runtime/os/xbox_scarlett.cpp`, `xmem_windows`)** — `IN PROGRESS` (#464, @Timon-ok) *(found by O29's contiguity measurement on the real mapping sequence; synthetic tests)*
+  - Establish the scatter-mapping call's real page-array semantics from the title's call sites, fix the shim and the window model (CPU and GPU side), and check the neighbouring physical-page shims for the same unit error.
 
 ---
 
