@@ -300,6 +300,15 @@ void Device::track_guest_texture(const TrackedTexture& tex) {
 void Device::untrack_guest_texture(uint32_t resource_id) {
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
     tracked_textures_.erase(resource_id);
+    copy_destinations_.erase(resource_id);
+}
+
+void Device::note_texture_copy_destination(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    copy_destinations_.insert(resource_id);
 }
 
 bool Device::tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const {
@@ -326,6 +335,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     TrackedTexture tt{};
     {
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        if (copy_destinations_.count(resource_id) != 0) {
+            return false;  // a recorded copy defines the texels (note_texture_copy_destination)
+        }
         const auto it = tracked_textures_.find(resource_id);
         if (it != tracked_textures_.end()) {
             tt = it->second;

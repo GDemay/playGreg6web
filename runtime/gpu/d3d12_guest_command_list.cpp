@@ -1047,6 +1047,7 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     wr.tex.bytes_per_row = fp.RowPitch;
     wr.tex.rows_per_image = rows_per_slice;
     deferred_.push_back(wr);
+    device_->note_texture_copy_destination(tex->id());
 }
 
 // Xbox slot 85: (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags) -> void. The title's texture upload

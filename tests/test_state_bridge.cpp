@@ -1447,6 +1447,14 @@ void test_dirty_texture_memory_upload() {
         gpu::CommandEncoder alias_enc;
         CHECK(device->sync_bound_texture_memory(alias_tex->id(), alias_enc));
         CHECK(decode(alias_enc).size() == 1 && decode(alias_enc)[0].opcode == GpuOpcode::WriteTexture);
+        // Once a recorded copy has written the texture, its memory is not uploaded (or de-tiled)
+        // over the copied texels, even when that memory changes.
+        const uint32_t px2[4] = {1u, 2u, 3u, 4u};
+        CHECK(com::write_guest(cpu_win, px2, sizeof(px2)));
+        device->note_texture_copy_destination(alias_tex->id());
+        gpu::CommandEncoder alias_enc2;
+        CHECK(!device->sync_bound_texture_memory(alias_tex->id(), alias_enc2));
+        CHECK(alias_enc2.size() == 0);
 
         // Guard / PAGE_NOACCESS page: must safely skip without crashing.
         const uint64_t guard_mem =

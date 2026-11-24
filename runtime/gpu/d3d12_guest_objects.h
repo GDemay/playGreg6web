@@ -790,6 +790,10 @@ public:
     bool tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const;
     void set_detile_fn(DetileFn fn);
     bool sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder);
+    // Marks a texture as the destination of a recorded copy (CopyTextureRegion). The copy writes
+    // texels in API coordinates and defines the contents from then on; the guest memory at the
+    // texture's address is no longer uploaded (or de-tiled) over it.
+    void note_texture_copy_destination(uint32_t resource_id);
     // Creates (or returns a cached) WebGPU texture for a GPU VA that has no ID3D12Resource
     // (Xbox Slot-70/71 address views and raw GFX10 T# image descriptors in descriptor memory).
     // Registers TextureInfo in the state bridge and tracks guest memory for detiled WriteTexture
@@ -953,6 +957,7 @@ private:
     std::vector<Resource*> tracked_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
+    std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
     struct AddressTextureKey {
         uint64_t gpu_va = 0;
         uint32_t dxgi_format = 0;
