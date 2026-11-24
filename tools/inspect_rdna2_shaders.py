@@ -61,6 +61,13 @@ DEFAULT_MAX_SHADER_BYTES = 256 * 1024  # 256 KiB max backward window per shader
 DEFAULT_MIN_DWORDS = 2
 MIN_CHUNK_SIZE = 64
 
+# Standalone native RDNA2 stage dump files (`playgta6_boot --dump-pipelines` or raw blobs)
+STANDALONE_SHADER_EXTENSIONS: frozenset[str] = frozenset({".bin", ".rdna2", ".shader"})
+PIPELINE_DUMP_SCHEMA = "playgta6-pipeline-dump"
+PIPELINE_DUMP_SCHEMA_VERSION = 1
+PIPELINE_DUMP_MANIFEST_MAX_BYTES = 16 * 1024 * 1024  # 16 MiB safety cap
+STANDALONE_MANIFEST_MAX_SHADER_BYTES = 4 * 1024 * 1024  # 4 MiB cap for manifest-listed stages
+
 # FNV-1a 64-bit constants (matching shaders/src/convert.rs & tools/inspect_wgsl_pack.py)
 FNV1A_64_OFFSET_BASIS = 0xCBF29CE484222325
 FNV1A_64_PRIME = 0x00000100000001B3
@@ -197,6 +204,239 @@ def fnv1a_64(data: bytes | bytearray | memoryview) -> int:
 def format_hash_64(digest: int) -> str:
     """Format a 64-bit integer digest as canonical `0x` + 16 lowercase hex digits."""
     return f"0x{digest & U64_MAX:016x}"
+
+
+def _parse_exact_hex_u64(token: str) -> int | None:
+    """Parse an exact 16-hex-digit 64-bit hash token (with optional `0x` prefix)."""
+    raw = token.strip()
+    if raw.lower().startswith("0x"):
+        raw = raw[2:]
+    if len(raw) != 16 or not all(ch in "0123456789abcdefABCDEF" for ch in raw):
+        return None
+    return int(raw, 16)
+
+
+def _parse_stage_token(token: str) -> str | None:
+    """Parse a stage name/prefix token into canonical S15 stage (`vertex`/`pixel`/`compute`)."""
+    low = token.strip().lower()
+    if low in ("vs", "vertex", "vert"):
+        return "vertex"
+    if low in ("ps", "fs", "pixel", "fragment", "frag"):
+        return "pixel"
+    if low in ("cs", "compute", "comp"):
+        return "compute"
+    return None
+
+
+@dataclass(frozen=True)
+class FilenameIdentityHint:
+    """Optional stage and 64-bit FNV-1a hash hints parsed from a standalone shader filename."""
+
+    stage: str | None = None
+    hash_fnv1a64: int | None = None
+
+
+@dataclass(frozen=True)
+class ManifestStageHint:
+    """Validated `playgta6-pipeline-dump` v1 `native_stages` entry for a native `.bin` file."""
+
+    code_identity: int
+    stage_identities: tuple[int, ...]
+    stage: str | None
+    code_bytes: int | None
+    code_file: str
+
+
+def parse_filename_identity_hint(source: str | Path) -> FilenameIdentityHint:
+    """Parse optional stage and 16-hex-digit 64-bit identity hash hints from a filename.
+
+    Matches `shaders/src/rdna2_pack.rs` (`parse_filename_hint`) and D3D12 guest
+    `native/0x<16hex>.bin` naming:
+      - `0x<16hex>.bin`, `<16hex>.bin`, `0x<16hex>.rdna2`
+      - `vs_<16hex>.rdna2`, `ps_0x<16hex>.bin`, `fs_<16hex>.shader`, `cs_<16hex>.bin`
+      - `<16hex>_ps.rdna2`, `vs_splash_<16hex>.bin`
+    """
+    basename = sanitize_source_label(source)
+    if not basename or basename.startswith("<"):
+        return FilenameIdentityHint()
+    if "." in basename:
+        stem, _ext = basename.rsplit(".", 1)
+        if not stem:
+            return FilenameIdentityHint()
+    else:
+        stem = basename
+
+    parts = [part for part in re.split(r"[_-]+", stem) if part]
+    if not parts:
+        return FilenameIdentityHint()
+
+    stage: str | None = None
+    remaining = parts
+    first_stage = _parse_stage_token(parts[0])
+    if first_stage is not None:
+        stage = first_stage
+        remaining = parts[1:]
+    else:
+        last_stage = _parse_stage_token(parts[-1])
+        if last_stage is not None:
+            stage = last_stage
+            remaining = parts[:-1]
+
+    hash_hint: int | None = None
+    if len(remaining) == 1:
+        hash_hint = _parse_exact_hex_u64(remaining[0])
+    elif len(remaining) > 1:
+        hash_hint = _parse_exact_hex_u64(remaining[-1])
+        if hash_hint is None:
+            hash_hint = _parse_exact_hex_u64(remaining[0])
+
+    return FilenameIdentityHint(stage=stage, hash_fnv1a64=hash_hint)
+
+
+def _normalize_manifest_rel_path(raw: str) -> str | None:
+    """Normalize a manifest relative `code_file` path to canonical POSIX form."""
+    cleaned = raw.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.lstrip("/")
+    if not cleaned:
+        return None
+    parts = [p for p in cleaned.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    return "/".join(parts)
+
+
+def load_pipeline_dump_manifest(manifest_path: Path) -> dict[str, ManifestStageHint]:
+    """Read an optional `playgta6-pipeline-dump` v1 `manifest.json` (strictly read-only).
+
+    Returns a mapping from normalized relative `code_file` (e.g. `native/0x<16hex>.bin`)
+    to `ManifestStageHint`, or `{}` if the file is absent, invalid, or another schema.
+    """
+    try:
+        if not manifest_path.is_file():
+            return {}
+        if manifest_path.stat().st_size > PIPELINE_DUMP_MANIFEST_MAX_BYTES:
+            return {}
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return {}
+
+    if not isinstance(payload, Mapping):
+        return {}
+    if payload.get("schema") != PIPELINE_DUMP_SCHEMA:
+        return {}
+    if payload.get("schema_version") != PIPELINE_DUMP_SCHEMA_VERSION:
+        return {}
+
+    native_stages = payload.get("native_stages")
+    if not isinstance(native_stages, list):
+        return {}
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for entry in native_stages:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_code_file = entry.get("code_file")
+        raw_code_id = entry.get("code_identity")
+        if not isinstance(raw_code_file, str) or not isinstance(raw_code_id, (str, int)):
+            continue
+        rel_file = _normalize_manifest_rel_path(raw_code_file)
+        if rel_file is None:
+            continue
+        if isinstance(raw_code_id, bool):
+            continue
+        code_id = (
+            raw_code_id
+            if isinstance(raw_code_id, int) and 0 <= raw_code_id <= U64_MAX
+            else _parse_exact_hex_u64(str(raw_code_id))
+        )
+        if code_id is None:
+            continue
+
+        raw_stage_id = entry.get("identity")
+        stage_id: int | None = None
+        if isinstance(raw_stage_id, int) and not isinstance(raw_stage_id, bool) and 0 <= raw_stage_id <= U64_MAX:
+            stage_id = raw_stage_id
+        elif isinstance(raw_stage_id, str):
+            stage_id = _parse_exact_hex_u64(raw_stage_id)
+
+        raw_stage = entry.get("stage")
+        stage = _parse_stage_token(raw_stage) if isinstance(raw_stage, str) else None
+
+        raw_code_bytes = entry.get("code_bytes")
+        code_bytes = (
+            raw_code_bytes
+            if isinstance(raw_code_bytes, int) and not isinstance(raw_code_bytes, bool) and raw_code_bytes >= 0
+            else None
+        )
+
+        bucket = grouped.get(rel_file)
+        if bucket is None:
+            grouped[rel_file] = {
+                "code_identity": code_id,
+                "stage_identities": [stage_id] if stage_id is not None else [],
+                "stage": stage,
+                "code_bytes": code_bytes,
+                "code_file": rel_file,
+            }
+        else:
+            if stage_id is not None and stage_id not in bucket["stage_identities"]:
+                bucket["stage_identities"].append(stage_id)
+            if bucket["stage"] is None and stage is not None:
+                bucket["stage"] = stage
+            if bucket["code_bytes"] is None and code_bytes is not None:
+                bucket["code_bytes"] = code_bytes
+
+    result: dict[str, ManifestStageHint] = {}
+    for rel_file, bucket in grouped.items():
+        result[rel_file] = ManifestStageHint(
+            code_identity=bucket["code_identity"],
+            stage_identities=tuple(sorted(bucket["stage_identities"])),
+            stage=bucket["stage"],
+            code_bytes=bucket["code_bytes"],
+            code_file=rel_file,
+        )
+    return result
+
+
+def _find_manifest_for_directory(root: Path) -> tuple[Path, dict[str, ManifestStageHint]] | None:
+    """Locate a `playgta6-pipeline-dump` v1 manifest in `root` or `root.parent`."""
+    for candidate_dir in (root, root.parent):
+        manifest_file = candidate_dir / "manifest.json"
+        if manifest_file.is_file():
+            entries = load_pipeline_dump_manifest(manifest_file)
+            if entries:
+                return candidate_dir.resolve(), entries
+    return None
+
+
+def _lookup_manifest_hint(
+    file_path: Path,
+    manifest_ctx: tuple[Path, Mapping[str, ManifestStageHint]] | None,
+) -> ManifestStageHint | None:
+    """Resolve a `ManifestStageHint` for `file_path` given `(manifest_dir, manifest_map)`."""
+    if manifest_ctx is None:
+        return None
+    manifest_dir, manifest_map = manifest_ctx
+    try:
+        rel = file_path.resolve().relative_to(manifest_dir).as_posix()
+    except (ValueError, OSError):
+        return None
+    return manifest_map.get(rel)
+
+
+def _find_manifest_hint_for_file(file_path: Path) -> ManifestStageHint | None:
+    """Check `file_path.parent` and `file_path.parent.parent` for a dump manifest."""
+    for candidate_dir in (file_path.parent, file_path.parent.parent):
+        manifest_file = candidate_dir / "manifest.json"
+        if manifest_file.is_file():
+            entries = load_pipeline_dump_manifest(manifest_file)
+            if entries:
+                hit = _lookup_manifest_hint(file_path, (candidate_dir.resolve(), entries))
+                if hit is not None:
+                    return hit
+    return None
 
 
 def load_dotenv(env_path: Path = ENV_FILE) -> dict[str, str]:
@@ -418,21 +658,56 @@ class Rdna2ShaderHit:
     vmem_count: int = 0
     ds_count: int = 0
     flat_count: int = 0
+    hash_scope: str = "region"  # "whole_file" | "region"
+    trimmed_hash_fnv1a64: int | None = None
+    trimmed_byte_size: int | None = None
+    terminator_count: int = 1
+    filename_hash_hint: int | None = None
+    filename_hash_matches: bool | None = None
+    manifest_code_identity: int | None = None
+    manifest_identity: int | None = None
+    manifest_stage: str | None = None
+    manifest_identity_matches: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.trimmed_hash_fnv1a64 is None:
+            object.__setattr__(self, "trimmed_hash_fnv1a64", self.fnv1a_64)
+        if self.trimmed_byte_size is None:
+            object.__setattr__(self, "trimmed_byte_size", self.byte_size)
+
+    @property
+    def code_hash_fnv1a64(self) -> int:
+        """Canonical FNV-1a 64-bit code identity (whole-file for standalone dumps, region otherwise)."""
+        return self.fnv1a_64
 
     @property
     def hash_hex(self) -> str:
         return format_hash_64(self.fnv1a_64)
 
+    @property
+    def code_hash_hex(self) -> str:
+        return format_hash_64(self.fnv1a_64)
+
+    @property
+    def trimmed_hash_hex(self) -> str:
+        assert self.trimmed_hash_fnv1a64 is not None
+        return format_hash_64(self.trimmed_hash_fnv1a64)
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "hash": self.hash_hex,
+            "code_hash_fnv1a64": self.code_hash_hex,
+            "trimmed_hash_fnv1a64": self.trimmed_hash_hex,
+            "hash_scope": self.hash_scope,
             "offset": self.offset,
             "end_offset": self.end_offset,
             "byte_size": self.byte_size,
+            "trimmed_byte_size": self.trimmed_byte_size,
             "dword_count": self.dword_count,
             "instruction_count": self.instruction_count,
             "stage": self.stage,
             "terminator": self.terminator,
+            "terminator_count": self.terminator_count,
             "export_targets": list(self.export_targets),
             "has_done_export": self.has_done_export,
             "exports": [exp.to_dict() for exp in self.exports],
@@ -449,6 +724,17 @@ class Rdna2ShaderHit:
                 "flat": self.flat_count,
             },
         }
+        if self.filename_hash_hint is not None:
+            payload["filename_hash_hint"] = format_hash_64(self.filename_hash_hint)
+            payload["filename_hash_matches"] = self.filename_hash_matches
+        if self.manifest_code_identity is not None:
+            payload["manifest_code_identity"] = format_hash_64(self.manifest_code_identity)
+            payload["manifest_identity_matches"] = self.manifest_identity_matches
+        if self.manifest_identity is not None:
+            payload["manifest_identity"] = format_hash_64(self.manifest_identity)
+        if self.manifest_stage is not None:
+            payload["manifest_stage"] = self.manifest_stage
+        return payload
 
 
 @dataclass(frozen=True)
@@ -484,6 +770,8 @@ class FileInspectResult:
     shaders: tuple[Rdna2ShaderHit, ...] = field(default_factory=tuple)
     pipeline_records: tuple[PipelineRecordHit, ...] = field(default_factory=tuple)
     error: str | None = None
+    hash_scope: str = "region"  # "whole_file" | "region"
+    file_hash_fnv1a64: int | None = None
 
     @property
     def stage_counts(self) -> dict[str, int]:
@@ -505,6 +793,7 @@ class FileInspectResult:
             "truncated": self.truncated,
             "hit_limit_reached": self.hit_limit_reached,
             "unaligned_tail_bytes": self.unaligned_tail_bytes,
+            "hash_scope": self.hash_scope,
             "shader_count": len(self.shaders),
             "pipeline_record_count": len(self.pipeline_records),
             "stage_counts": self.stage_counts,
@@ -512,6 +801,8 @@ class FileInspectResult:
             "shaders": [s.to_dict() for s in self.shaders],
             "pipeline_records": [r.to_dict() for r in self.pipeline_records],
         }
+        if self.file_hash_fnv1a64 is not None:
+            payload["file_hash_fnv1a64"] = format_hash_64(self.file_hash_fnv1a64)
         if self.error is not None:
             payload["error"] = self.error
         return payload
@@ -844,6 +1135,221 @@ def analyze_shader_region(
         vmem_count=counts["vmem"],
         ds_count=counts["ds"],
         flat_count=counts["flat"],
+        hash_scope="region",
+        trimmed_hash_fnv1a64=fnv1a_64(shader_bytes),
+        trimmed_byte_size=len(shader_bytes),
+        terminator_count=1,
+    )
+
+
+def _starts_with_container_magic(blob: bytes | bytearray | memoryview) -> bool:
+    """Return True if `blob` starts with a known multi-shader container magic."""
+    if len(blob) < 4:
+        return False
+    prefix = bytes(blob[:4])
+    return prefix in (b"DXBC", ACCC_MAGIC, ELF_MAGIC)
+
+
+def _is_standalone_multi_endpgm_stage(shaders: Sequence[Rdna2ShaderHit]) -> bool:
+    """Return True if multiple `s_endpgm` hits in a small `.bin`/`.rdna2`/`.shader` file
+    represent one standalone native stage (e.g. early-out `s_endpgm` + main body or stub)
+    rather than a padded multi-shader bundle.
+    """
+    if len(shaders) < 2:
+        return True
+    if shaders[0].offset != 0:
+        return False
+
+    graphics_stages = {s.stage for s in shaders if s.stage in ("vertex", "pixel")}
+    if len(graphics_stages) > 1:
+        # Conflicting vertex + pixel stages in the same file -> multi-shader bundle.
+        return False
+
+    for idx in range(1, len(shaders)):
+        prev = shaders[idx - 1]
+        curr = shaders[idx]
+        if curr.offset == prev.end_offset:
+            # Immediately contiguous after previous `s_endpgm` (zero padding gap).
+            continue
+        if curr.stage == "unknown":
+            # Trailing `s_nop` + `s_endpgm` epilogue/stub after padding.
+            continue
+        # Non-contiguous padded shader of a distinct concrete stage -> multi-shader bundle.
+        return False
+
+    return True
+
+
+def analyze_standalone_shader(
+    raw_bytes: bytes | bytearray | memoryview,
+    *,
+    min_dwords: int = DEFAULT_MIN_DWORDS,
+    filename_hint: FilenameIdentityHint | None = None,
+    manifest_hint: ManifestStageHint | None = None,
+) -> Rdna2ShaderHit | None:
+    """Analyze a standalone native RDNA2 stage file and hash its **entire** byte range.
+
+    Matches `disasm-rdna2` (S14), `translate-rdna2` (S17), `pack-rdna2` (S18), and
+    `runtime/gpu/d3d12_guest_resources.cpp`:
+      - `fnv1a_64` / `code_hash_fnv1a64` hashes the FULL file bytes (including any
+        trailing alignment padding or second `s_endpgm`).
+      - `trimmed_hash_fnv1a64` records the legacy hash up to and including the first
+        `s_endpgm` / `s_endpgm_saved` terminator for diagnostics.
+      - Instruction/export decoding covers all executable code up to the final
+        `s_endpgm` / `s_endpgm_saved`, skipping padding words (`0x00000000`,
+        `s_code_end`, `0xFFFFFFFF`, `0xCCCCCCCC`).
+    """
+    blob = bytes(raw_bytes)
+    if len(blob) < 4 or _starts_with_container_magic(blob):
+        return None
+
+    dword_count = len(blob) // 4
+    words = struct.unpack(f"<{dword_count}I", blob[: dword_count * 4])
+
+    # Pass 1: locate all instruction-aligned `s_endpgm` / `s_endpgm_saved` terminators.
+    endpgm_positions: list[tuple[int, int]] = []
+    i = 0
+    while i < dword_count:
+        w0 = words[i]
+        if w0 in (S_ENDPGM_WORD, S_ENDPGM_SAVED_WORD):
+            endpgm_positions.append((i, w0))
+            i += 1
+            continue
+        if w0 in _PADDING_WORDS:
+            i += 1
+            continue
+        cat, inst_dwords = _classify_word0(w0)
+        if cat == "mimg":
+            step = inst_dwords if (i + inst_dwords <= dword_count) else (2 if i + 2 <= dword_count else 1)
+        elif cat in ("exp", "smem", "vintrp", "valu", "salu", "sopp", "vmem", "ds", "flat"):
+            step = inst_dwords if (i + inst_dwords <= dword_count) else 1
+        else:
+            step = 1
+        i += step
+
+    if not endpgm_positions:
+        return None
+
+    first_endpgm_idx, _first_term_word = endpgm_positions[0]
+    last_endpgm_idx, last_term_word = endpgm_positions[-1]
+    if (last_endpgm_idx + 1) < min_dwords:
+        return None
+
+    # Pass 2: decode all instructions & exports across `[0 .. last_endpgm_idx]`.
+    exports: list[ExportInstruction] = []
+    counts: dict[str, int] = {
+        "exp": 0,
+        "smem": 0,
+        "vintrp": 0,
+        "mimg": 0,
+        "valu": 0,
+        "salu": 0,
+        "sopp": 0,
+        "vmem": 0,
+        "ds": 0,
+        "flat": 0,
+    }
+    instruction_count = 0
+
+    i = 0
+    code_limit = last_endpgm_idx + 1
+    while i < code_limit:
+        w0 = words[i]
+        if w0 in (S_ENDPGM_WORD, S_ENDPGM_SAVED_WORD):
+            counts["sopp"] += 1
+            instruction_count += 1
+            i += 1
+            continue
+        if w0 in _PADDING_WORDS:
+            i += 1
+            continue
+        cat, inst_dwords = _classify_word0(w0)
+        if cat == "exp":
+            exp = decode_exp_instruction(w0)
+            if exp is not None:
+                exports.append(exp)
+            counts["exp"] += 1
+            instruction_count += 1
+            step = 2 if (i + 2 <= code_limit) else 1
+        elif cat == "mimg":
+            counts["mimg"] += 1
+            instruction_count += 1
+            step = inst_dwords if (i + inst_dwords <= code_limit) else (2 if i + 2 <= code_limit else 1)
+        elif cat in counts:
+            counts[cat] += 1
+            instruction_count += 1
+            step = inst_dwords if (i + inst_dwords <= code_limit) else 1
+        else:
+            step = 1
+        i += step
+
+    export_targets = tuple(sorted({e.target for e in exports}))
+    has_done_export = any(e.done for e in exports)
+    stage = infer_shader_stage(
+        export_targets=export_targets,
+        exp_count=counts["exp"],
+        vintrp_count=counts["vintrp"],
+        smem_count=counts["smem"],
+        valu_count=counts["valu"],
+    )
+    if stage == "unknown":
+        if manifest_hint is not None and manifest_hint.stage is not None:
+            stage = manifest_hint.stage
+        elif filename_hint is not None and filename_hint.stage is not None:
+            stage = filename_hint.stage
+
+    terminator_name = "s_endpgm" if last_term_word == S_ENDPGM_WORD else "s_endpgm_saved"
+    whole_hash = fnv1a_64(blob)
+    trimmed_byte_size = (first_endpgm_idx + 1) * 4
+    trimmed_hash = fnv1a_64(blob[:trimmed_byte_size])
+
+    filename_hash_hint = filename_hint.hash_fnv1a64 if filename_hint is not None else None
+    filename_hash_matches = (
+        whole_hash == filename_hash_hint if filename_hash_hint is not None else None
+    )
+    manifest_code_identity = manifest_hint.code_identity if manifest_hint is not None else None
+    manifest_identity = (
+        manifest_hint.stage_identities[0]
+        if (manifest_hint is not None and manifest_hint.stage_identities)
+        else None
+    )
+    manifest_stage = manifest_hint.stage if manifest_hint is not None else None
+    manifest_identity_matches = (
+        whole_hash == manifest_code_identity if manifest_code_identity is not None else None
+    )
+
+    return Rdna2ShaderHit(
+        offset=0,
+        end_offset=len(blob),
+        byte_size=len(blob),
+        dword_count=dword_count,
+        instruction_count=instruction_count,
+        fnv1a_64=whole_hash,
+        stage=stage,
+        terminator=terminator_name,
+        exports=tuple(exports),
+        export_targets=export_targets,
+        has_done_export=has_done_export,
+        exp_count=counts["exp"],
+        smem_count=counts["smem"],
+        vintrp_count=counts["vintrp"],
+        mimg_count=counts["mimg"],
+        valu_count=counts["valu"],
+        salu_count=counts["salu"],
+        sopp_count=counts["sopp"],
+        vmem_count=counts["vmem"],
+        ds_count=counts["ds"],
+        flat_count=counts["flat"],
+        hash_scope="whole_file",
+        trimmed_hash_fnv1a64=trimmed_hash,
+        trimmed_byte_size=trimmed_byte_size,
+        terminator_count=len(endpgm_positions),
+        filename_hash_hint=filename_hash_hint,
+        filename_hash_matches=filename_hash_matches,
+        manifest_code_identity=manifest_code_identity,
+        manifest_identity=manifest_identity,
+        manifest_stage=manifest_stage,
+        manifest_identity_matches=manifest_identity_matches,
     )
 
 
@@ -1055,8 +1561,15 @@ def scan_bytes(
     max_shader_bytes: int = DEFAULT_MAX_SHADER_BYTES,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP_BYTES,
+    whole_file: bool = False,
+    filename_hint: FilenameIdentityHint | None = None,
+    manifest_hint: ManifestStageHint | None = None,
 ) -> FileInspectResult:
-    """Scan an in-memory buffer for AMD RDNA2 / GFX10.3 shaders using bounded chunks."""
+    """Scan an in-memory buffer for AMD RDNA2 / GFX10.3 shaders using bounded chunks.
+
+    When `whole_file=True`, treats the entire buffer as a standalone native RDNA2 stage
+    blob and computes `fnv1a_64` / `code_hash_fnv1a64` over all bytes in the buffer.
+    """
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError(f"expected bytes-like buffer, got {type(data).__name__}")
     if max_bytes is not None and (
@@ -1082,6 +1595,32 @@ def scan_bytes(
     view = memoryview(data)
     total_len = len(view)
     limit = total_len if max_bytes is None else min(total_len, max_bytes)
+
+    if whole_file and limit == total_len:
+        effective_hint = (
+            filename_hint
+            if filename_hint is not None
+            else parse_filename_identity_hint(source_label)
+        )
+        standalone_hit = analyze_standalone_shader(
+            view,
+            min_dwords=min_dwords,
+            filename_hint=effective_hint,
+            manifest_hint=manifest_hint,
+        )
+        if standalone_hit is not None:
+            return FileInspectResult(
+                path=safe_label,
+                file_size=total_len,
+                bytes_scanned=total_len,
+                truncated=False,
+                hit_limit_reached=False,
+                unaligned_tail_bytes=total_len % 4,
+                shaders=(standalone_hit,),
+                pipeline_records=(),
+                hash_scope="whole_file",
+                file_hash_fnv1a64=standalone_hit.fnv1a_64,
+            )
 
     shaders: list[Rdna2ShaderHit] = []
     records: list[PipelineRecordHit] = []
@@ -1165,8 +1704,18 @@ def scan_file(
     max_shader_bytes: int = DEFAULT_MAX_SHADER_BYTES,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     overlap: int = DEFAULT_OVERLAP_BYTES,
+    whole_file: bool | None = None,
+    manifest_hint: ManifestStageHint | None = None,
 ) -> FileInspectResult:
-    """Stream-scan a single file on disk in bounded memory (`chunk_size + overlap`)."""
+    """Stream-scan a single file on disk in bounded memory (`chunk_size + overlap`).
+
+    Standalone native RDNA2 stage dump files (`native/<code-identity>.bin` from
+    `playgta6_boot --dump-pipelines`, or standalone `.bin`/`.rdna2`/`.shader` files
+    starting at offset 0 without container records) are hashed over the **entire**
+    file bytes (`hash_scope="whole_file"`) to match the D3D12 guest code identity,
+    `disasm-rdna2`, `translate-rdna2`, and `pack-rdna2`. Embedded multi-shader blobs
+    inside larger containers continue to use bounded streaming region hashing.
+    """
     file_path = Path(path)
     if max_bytes is not None and (
         isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0
@@ -1198,6 +1747,47 @@ def scan_file(
             truncated=False,
             error=sanitize_error_message(file_path, exc),
         )
+
+    filename_hint = parse_filename_identity_hint(file_path.name)
+    has_standalone_ext = file_path.suffix.lower() in STANDALONE_SHADER_EXTENSIONS
+    resolved_manifest_hint = manifest_hint
+    if resolved_manifest_hint is None and base_dir is None and has_standalone_ext:
+        resolved_manifest_hint = _find_manifest_hint_for_file(file_path)
+
+    # Fast path for explicitly requested whole-file mode or manifest-verified native stages.
+    whole_file_cap = max(max_shader_bytes, STANDALONE_MANIFEST_MAX_SHADER_BYTES)
+    if (
+        whole_file is True or (whole_file is None and resolved_manifest_hint is not None)
+    ) and (max_bytes is None or max_bytes >= file_size) and (min_dwords * 4 <= file_size <= whole_file_cap):
+        try:
+            raw_bytes = file_path.read_bytes()
+        except OSError as exc:
+            return FileInspectResult(
+                path=rel_label,
+                file_size=file_size,
+                bytes_scanned=0,
+                truncated=file_size > 0,
+                error=sanitize_error_message(file_path, exc),
+            )
+        standalone_hit = analyze_standalone_shader(
+            raw_bytes,
+            min_dwords=min_dwords,
+            filename_hint=filename_hint,
+            manifest_hint=resolved_manifest_hint,
+        )
+        if standalone_hit is not None:
+            return FileInspectResult(
+                path=rel_label,
+                file_size=file_size,
+                bytes_scanned=len(raw_bytes),
+                truncated=False,
+                hit_limit_reached=False,
+                unaligned_tail_bytes=len(raw_bytes) % 4,
+                shaders=(standalone_hit,),
+                pipeline_records=(),
+                hash_scope="whole_file",
+                file_hash_fnv1a64=standalone_hit.fnv1a_64,
+            )
 
     shaders: list[Rdna2ShaderHit] = []
     records: list[PipelineRecordHit] = []
@@ -1279,15 +1869,58 @@ def scan_file(
             error=sanitize_error_message(file_path, exc),
         )
 
+    truncated = file_size > bytes_read
+    # Auto-promote standalone native RDNA2 stage files to whole-file FNV-1a 64 identity.
+    if (
+        whole_file is None
+        and has_standalone_ext
+        and not truncated
+        and not hit_limit_reached
+        and not records
+        and shaders
+        and file_size <= max_shader_bytes
+        and shaders[0].offset == 0
+        and (
+            filename_hint.hash_fnv1a64 is not None
+            or len(shaders) == 1
+            or _is_standalone_multi_endpgm_stage(shaders)
+        )
+    ):
+        try:
+            raw_bytes = file_path.read_bytes()
+        except OSError:
+            raw_bytes = b""
+        if raw_bytes and not _starts_with_container_magic(raw_bytes):
+            standalone_hit = analyze_standalone_shader(
+                raw_bytes,
+                min_dwords=min_dwords,
+                filename_hint=filename_hint,
+                manifest_hint=resolved_manifest_hint,
+            )
+            if standalone_hit is not None:
+                return FileInspectResult(
+                    path=rel_label,
+                    file_size=file_size,
+                    bytes_scanned=bytes_read,
+                    truncated=False,
+                    hit_limit_reached=False,
+                    unaligned_tail_bytes=bytes_read % 4,
+                    shaders=(standalone_hit,),
+                    pipeline_records=(),
+                    hash_scope="whole_file",
+                    file_hash_fnv1a64=standalone_hit.fnv1a_64,
+                )
+
     return FileInspectResult(
         path=rel_label,
         file_size=file_size,
         bytes_scanned=bytes_read,
-        truncated=file_size > bytes_read,
+        truncated=truncated,
         hit_limit_reached=hit_limit_reached,
         unaligned_tail_bytes=bytes_read % 4,
         shaders=tuple(shaders),
         pipeline_records=tuple(records),
+        hash_scope="region",
     )
 
 
@@ -1417,6 +2050,7 @@ def scan_directory(
     overlap: int = DEFAULT_OVERLAP_BYTES,
     target_label: str | None = None,
     include_empty: bool = False,
+    whole_file: bool | None = None,
 ) -> InspectReport:
     """Recursively scan a directory for RDNA2 / GFX10.3 shaders in deterministic order."""
     root = Path(root_dir)
@@ -1425,6 +2059,7 @@ def scan_directory(
 
     chunk_size, overlap = _validate_chunk_params(chunk_size, overlap)
     label = sanitize_source_label(target_label if target_label is not None else root)
+    manifest_ctx = _find_manifest_for_directory(root)
 
     discovered: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1444,6 +2079,7 @@ def scan_directory(
             hit_limit_reached = True
             break
         remaining_hits = None if max_hits is None else (max_hits - total_hits)
+        file_manifest_hint = _lookup_manifest_hint(fpath, manifest_ctx)
         res = scan_file(
             fpath,
             base_dir=root,
@@ -1453,6 +2089,8 @@ def scan_directory(
             max_shader_bytes=max_shader_bytes,
             chunk_size=chunk_size,
             overlap=overlap,
+            whole_file=whole_file,
+            manifest_hint=file_manifest_hint,
         )
         all_results.append(res)
         total_hits += len(res.shaders)
@@ -1483,6 +2121,7 @@ def scan_path(
     overlap: int = DEFAULT_OVERLAP_BYTES,
     target_label: str | None = None,
     include_empty: bool = False,
+    whole_file: bool | None = None,
 ) -> InspectReport:
     """Scan either a single file or a directory and return a unified `InspectReport`."""
     target_path = Path(target)
@@ -1497,6 +2136,7 @@ def scan_path(
             overlap=overlap,
             target_label=target_label,
             include_empty=include_empty,
+            whole_file=whole_file,
         )
     if target_path.is_file():
         label = sanitize_source_label(target_label if target_label is not None else target_path)
@@ -1508,6 +2148,7 @@ def scan_path(
             max_shader_bytes=max_shader_bytes,
             chunk_size=chunk_size,
             overlap=overlap,
+            whole_file=whole_file,
         )
         return _build_report(
             target_label=label,
@@ -1662,6 +2303,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum bytes to scan per file (e.g. 4194304 or 4M) for bounded sampling.",
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--whole-file",
+        action="store_true",
+        help="Force whole-file FNV-1a 64 identity hashing on every scanned file.",
+    )
+    mode_group.add_argument(
+        "--embedded",
+        action="store_true",
+        help="Force embedded sub-region scanning (disable standalone whole-file hashing).",
+    )
     return parser
 
 
@@ -1696,6 +2348,8 @@ def main(
         print(f"Error: scan target does not exist: {target_label}", file=sys.stderr)
         return 1
 
+    whole_file_mode: bool | None = True if args.whole_file else (False if args.embedded else None)
+
     try:
         report = scan_path(
             target,
@@ -1703,6 +2357,7 @@ def main(
             max_hits=args.max_hits,
             min_dwords=args.min_dwords,
             target_label=target_label,
+            whole_file=whole_file_mode,
         )
     except OSError as exc:
         print(f"Error: {sanitize_error_message(target_label, exc)}", file=sys.stderr)

@@ -635,5 +635,220 @@ class TestSanitizationAndSafetyGuards(unittest.TestCase):
             self.assertTrue(any("symlink" in w for w in res.warnings))
 
 
+class TestWholeFileNativeDumpPackingAndEntryPoints(unittest.TestCase):
+    """Track 4 / S20: whole-file identity keying and `fs_main` fragment entry point."""
+
+    def _build_native_dump_fixture(self, dump_dir: Path) -> dict[str, int]:
+        """Create a synthetic `playgta6-pipeline-dump` v1 dir with padded & 2-s_endpgm stages."""
+        native_dir = dump_dir / "native"
+        native_dir.mkdir(parents=True)
+        s_endpgm = struct.pack("<I", rdna2.S_ENDPGM_WORD)
+        s_code_end = struct.pack("<I", rdna2.S_CODE_END_WORD)
+        s_nop = struct.pack("<I", rdna2.ENC_SOPP)
+
+        # Vertex stage: code up to first s_endpgm + trailing padding (100% of real dump files!)
+        vs_trimmed = _build_synthetic_rdna2_exp(12, done=True) + s_endpgm
+        vs_full = vs_trimmed + (s_code_end * 4) + (b"\x00" * 16)
+        vs_whole_hash = rdna2.fnv1a_64(vs_full)
+        vs_trimmed_hash = rdna2.fnv1a_64(vs_trimmed)
+        self.assertNotEqual(vs_whole_hash, vs_trimmed_hash)
+
+        # Pixel stage: early-out s_endpgm + main mrt0 export + second s_endpgm + trailing padding
+        ps_first = s_nop + s_nop + s_endpgm
+        ps_second = _build_synthetic_rdna2_exp(0, done=True) + s_endpgm
+        ps_full = ps_first + ps_second + (s_code_end * 4) + (b"\x00" * 16)
+        ps_whole_hash = rdna2.fnv1a_64(ps_full)
+        ps_trimmed_hash = rdna2.fnv1a_64(ps_first)
+        self.assertNotEqual(ps_whole_hash, ps_trimmed_hash)
+
+        vs_rel = f"native/0x{vs_whole_hash:016x}.bin"
+        ps_rel = f"native/0x{ps_whole_hash:016x}.bin"
+        (dump_dir / vs_rel).write_bytes(vs_full)
+        (dump_dir / ps_rel).write_bytes(ps_full)
+
+        manifest = {
+            "schema": "playgta6-pipeline-dump",
+            "schema_version": 1,
+            "native_stages": [
+                {
+                    "code_identity": f"0x{vs_whole_hash:016x}",
+                    "identity": f"0x{vs_whole_hash:016x}",
+                    "stage": "vertex",
+                    "layout": "A",
+                    "code_bytes": len(vs_full),
+                    "metadata_bytes": 0,
+                    "code_file": vs_rel,
+                    "metadata_file": f"native/0x{vs_whole_hash:016x}.meta",
+                },
+                {
+                    "code_identity": f"0x{ps_whole_hash:016x}",
+                    "identity": f"0x{ps_whole_hash:016x}",
+                    "stage": "pixel",
+                    "layout": "A",
+                    "code_bytes": len(ps_full),
+                    "metadata_bytes": 0,
+                    "code_file": ps_rel,
+                    "metadata_file": f"native/0x{ps_whole_hash:016x}.meta",
+                },
+            ],
+            "dxil": [],
+            "root_signatures": [],
+            "pipelines": [],
+        }
+        (dump_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        return {
+            "vs_whole_hash": vs_whole_hash,
+            "vs_trimmed_hash": vs_trimmed_hash,
+            "ps_whole_hash": ps_whole_hash,
+            "ps_trimmed_hash": ps_trimmed_hash,
+        }
+
+    def test_pack_keys_native_dump_files_by_whole_file_identity_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dump_dir = tmp_path / "pipeline_dump"
+            hashes = self._build_native_dump_fixture(dump_dir)
+
+            # Path 1: S15 scan JSON -> S16 packer
+            scan_report = rdna2.scan_path(dump_dir)
+            scan_json = tmp_path / "s15_scan.json"
+            scan_json.write_text(rdna2.render_json(scan_report), encoding="utf-8")
+            pack_from_scan = tmp_path / "from_scan.wgsl.pack"
+            report_from_scan = tmp_path / "from_scan_report.json"
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc1 = packer.main(
+                    [
+                        "--scan-json",
+                        str(scan_json),
+                        "--profile",
+                        "fullscreen_triangle_cbv",
+                        "--out",
+                        str(pack_from_scan),
+                        "--report-json",
+                        str(report_from_scan),
+                    ]
+                )
+            self.assertEqual(rc1, 0)
+
+            # Path 2: Direct playgta6-pipeline-dump manifest.json -> S16 packer
+            pack_from_manifest = tmp_path / "from_manifest.wgsl.pack"
+            with redirect_stdout(io.StringIO()):
+                rc2 = packer.main(
+                    [
+                        "--scan-json",
+                        str(dump_dir / "manifest.json"),
+                        "--profile",
+                        "fullscreen_triangle_cbv",
+                        "--out",
+                        str(pack_from_manifest),
+                    ]
+                )
+            self.assertEqual(rc2, 0)
+
+            # Path 3: Direct --native-dir -> S16 packer
+            pack_from_native_dir = tmp_path / "from_native_dir.wgsl.pack"
+            with redirect_stdout(io.StringIO()):
+                rc3 = packer.main(
+                    [
+                        "--native-dir",
+                        str(dump_dir),
+                        "--profile",
+                        "fullscreen_triangle_cbv",
+                        "--out",
+                        str(pack_from_native_dir),
+                    ]
+                )
+            self.assertEqual(rc3, 0)
+
+            # All three paths must produce byte-identical WGPK packs!
+            pack_bytes = pack_from_scan.read_bytes()
+            self.assertEqual(pack_bytes, pack_from_manifest.read_bytes())
+            self.assertEqual(pack_bytes, pack_from_native_dir.read_bytes())
+
+            bundle = wgpk.parse_wgpk(pack_bytes)
+            self.assertEqual(bundle.entry_count, 2)
+            self.assertEqual(bundle.stage_counts(), {"vertex": 1, "fragment": 1, "compute": 0})
+
+            vs_entry = bundle.entry_by_hash(hashes["vs_whole_hash"])
+            ps_entry = bundle.entry_by_hash(hashes["ps_whole_hash"])
+            self.assertIsNotNone(vs_entry)
+            self.assertIsNotNone(ps_entry)
+            assert vs_entry is not None and ps_entry is not None
+            self.assertEqual(vs_entry.stage, wgpk.ShaderStage.VERTEX)
+            self.assertEqual(ps_entry.stage, wgpk.ShaderStage.FRAGMENT)
+            self.assertIn("fn vs_main", vs_entry.wgsl)
+            self.assertIn("fn fs_main", ps_entry.wgsl)
+
+            # Trimmed first-s_endpgm hashes must NOT be used as pack keys!
+            self.assertIsNone(bundle.entry_by_hash(hashes["vs_trimmed_hash"]))
+            self.assertIsNone(bundle.entry_by_hash(hashes["ps_trimmed_hash"]))
+
+            rep = json.loads(report_from_scan.read_text(encoding="utf-8"))
+            by_hash = {e["hash"]: e for e in rep["entries"]}
+            self.assertEqual(by_hash[f"0x{hashes['vs_whole_hash']:016x}"]["entry_point"], "vs_main")
+            self.assertEqual(by_hash[f"0x{hashes['ps_whole_hash']:016x}"]["entry_point"], "fs_main")
+            self.assertTrue(wgpk.inspect_pack(bundle).clean)
+
+    def test_fragment_override_normalizes_ps_main_to_fs_main(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dump_dir = tmp_path / "pipeline_dump"
+            hashes = self._build_native_dump_fixture(dump_dir)
+
+            wgsl_dir = tmp_path / "overrides"
+            wgsl_dir.mkdir()
+            legacy_ps_wgsl = (
+                "// Legacy S17 output mentioning fn ps_main in a comment\n"
+                "@fragment\n"
+                "fn ps_main() -> @location(0) vec4<f32> {\n"
+                "    return vec4<f32>(0.2, 0.4, 0.6, 1.0);\n"
+                "}\n"
+            )
+            (wgsl_dir / f"0x{hashes['ps_whole_hash']:016x}.wgsl").write_text(
+                legacy_ps_wgsl,
+                encoding="utf-8",
+            )
+
+            out_pack = tmp_path / "normalized.wgsl.pack"
+            out_report = tmp_path / "normalized_report.json"
+            with redirect_stdout(io.StringIO()):
+                rc = packer.main(
+                    [
+                        "--native-dir",
+                        str(dump_dir),
+                        "--wgsl-dir",
+                        str(wgsl_dir),
+                        "--profile",
+                        "default",
+                        "--out",
+                        str(out_pack),
+                        "--report-json",
+                        str(out_report),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+
+            bundle = wgpk.parse_wgpk(out_pack.read_bytes())
+            ps_entry = bundle.entry_by_hash(hashes["ps_whole_hash"])
+            assert ps_entry is not None
+            self.assertIn("fn fs_main()", ps_entry.wgsl)
+            self.assertIn("// Legacy S17 output mentioning fn ps_main in a comment", ps_entry.wgsl)
+            self.assertEqual(packer.extract_entry_point(ps_entry.wgsl, packer.ShaderStage.FRAGMENT), "fs_main")
+
+            rep = json.loads(out_report.read_text(encoding="utf-8"))
+            by_hash = {e["hash"]: e for e in rep["entries"]}
+            self.assertEqual(by_hash[f"0x{hashes['ps_whole_hash']:016x}"]["entry_point"], "fs_main")
+            self.assertTrue(any("ps_main" in w and "fs_main" in w for w in rep["warnings"]))
+
+            # Already-normalized fs_main override does not emit a rename warning
+            already_ok_wgsl = "@fragment\nfn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }\n"
+            updated, renamed = packer.normalize_fragment_entry_point(already_ok_wgsl)
+            self.assertFalse(renamed)
+            self.assertEqual(updated, already_ok_wgsl)
+
+
 if __name__ == "__main__":
     unittest.main()
