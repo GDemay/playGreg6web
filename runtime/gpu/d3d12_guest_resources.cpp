@@ -188,6 +188,34 @@ uint64_t tiled_mip0_footprint_bytes(uint32_t d3d12_layout, uint32_t dxgi_format,
     return total_tiles * tile_bytes;
 }
 
+bool read_guest_best_effort(uint64_t cpu_va, uint8_t* dst, size_t size) {
+    if (size == 0) {
+        return false;
+    }
+    if (com::read_guest(cpu_va, dst, size)) {
+        return true;
+    }
+    uint8_t probe = 0;
+    if (!com::read_guest(cpu_va, &probe, 1)) {
+        return false;
+    }
+    std::memset(dst, 0, size);
+    size_t off = 0;
+    while (off < size) {
+        const uint64_t cur = cpu_va + off;
+        const size_t to_page_end = static_cast<size_t>(kShadowPage - (cur & (kShadowPage - 1)));
+        const size_t step = std::min(size - off, to_page_end);
+        if (!com::read_guest(cur, dst + off, step)) {
+            if (off == 0) {
+                dst[0] = probe;
+            }
+            break;
+        }
+        off += step;
+    }
+    return true;
+}
+
 }  // namespace
 
 uint64_t shader_identity(const void* data, size_t size) {
@@ -632,16 +660,44 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         }
     }
     // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.
-    std::lock_guard<std::mutex> lock(relocation_mutex_);
-    std::vector<uint8_t> bytes;
-    for (auto& [key, r] : relocations_) {
-        bytes.resize(static_cast<size_t>(r.size));
-        if (!com::read_guest(cpu_address_for_gpu(r.va), bytes.data(), bytes.size()) || bytes == r.shadow) {
-            continue;
+    {
+        std::lock_guard<std::mutex> lock(relocation_mutex_);
+        std::vector<uint8_t> bytes;
+        for (auto& [key, r] : relocations_) {
+            bytes.resize(static_cast<size_t>(r.size));
+            if (!com::read_guest(cpu_address_for_gpu(r.va), bytes.data(), bytes.size()) || bytes == r.shadow) {
+                continue;
+            }
+            encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
+            r.shadow = bytes;
+            note_upload(r.size);
         }
-        encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
-        r.shadow = bytes;
-        note_upload(r.size);
+    }
+    // Relocated storage buffers (G51): refresh any relocated range whose guest bytes changed.
+    {
+        std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+        std::vector<uint8_t> bytes;
+        for (auto& [key, r] : storage_relocations_) {
+            const uint64_t write_len = align_up(r.size, 4u);
+            bytes.resize(static_cast<size_t>(r.size));
+            if (!read_guest_best_effort(cpu_address_for_gpu(r.va), bytes.data(), bytes.size())) {
+                continue;
+            }
+            const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+            if (r.ever_uploaded && hash == r.last_hash) {
+                continue;
+            }
+            bytes.resize(static_cast<size_t>(write_len), 0);
+            for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
+                const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
+                encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset + off),
+                                     bytes.data() + off, static_cast<uint32_t>(n));
+            }
+            count_work(Work::BufferUploads);
+            note_upload(write_len);
+            r.last_hash = hash;
+            r.ever_uploaded = true;
+        }
     }
 }
 
@@ -681,6 +737,134 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, u
 size_t Device::relocated_uniform_count() const {
     std::lock_guard<std::mutex> lock(relocation_mutex_);
     return relocations_.size();
+}
+
+bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset,
+                                     bool require_zero_offset) {
+    constexpr uint64_t kStorageOffsetAlignment = 256;
+    constexpr uint64_t kChunk = uint64_t{4u} << 20;
+    constexpr uint64_t kMaxBytes = uint64_t{16u} << 20;
+    constexpr size_t kMaxEntries = 512;
+
+    if (va == 0 || size == 0 || size > kMaxBytes || buffer_id == nullptr || offset == nullptr) {
+        return false;
+    }
+    const uint64_t cpu_va = cpu_address_for_gpu(va);
+    uint8_t probe = 0;
+    if (!com::read_guest(cpu_va, &probe, 1)) {
+        return false;  // unmapped / GPU-only memory: no bytes to copy
+    }
+
+    const uint64_t need = align_up(size, kStorageOffsetAlignment);
+    const bool dedicated = require_zero_offset || need > kChunk;
+    const RelocatedStorageKey key{va, size, dedicated};
+
+    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    const uint64_t seq = ++storage_relocation_seq_;
+    if (auto it = storage_relocations_.find(key); it != storage_relocations_.end()) {
+        it->second.last_used_seq = seq;
+        *buffer_id = it->second.buffer_id;
+        *offset = it->second.offset;
+        return true;
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(size), 0);
+    if (!read_guest_best_effort(cpu_va, bytes.data(), bytes.size())) {
+        return false;
+    }
+    const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+    const uint64_t write_len = align_up(size, 4u);
+    bytes.resize(static_cast<size_t>(write_len), 0);
+
+    CommandEncoder enc;
+    uint32_t target_buf = 0;
+    uint64_t target_off = 0;
+    uint64_t target_cap = 0;
+
+    if (storage_relocations_.size() >= kMaxEntries) {
+        auto reuse_it = storage_relocations_.end();
+        auto lru_it = storage_relocations_.begin();
+        for (auto it = storage_relocations_.begin(); it != storage_relocations_.end(); ++it) {
+            if (it->second.last_used_seq < lru_it->second.last_used_seq) {
+                lru_it = it;
+            }
+            if (it->second.dedicated == dedicated && it->second.slot_capacity >= need) {
+                if (reuse_it == storage_relocations_.end() ||
+                    it->second.last_used_seq < reuse_it->second.last_used_seq) {
+                    reuse_it = it;
+                }
+            }
+        }
+        if (reuse_it != storage_relocations_.end()) {
+            target_buf = reuse_it->second.buffer_id;
+            target_off = reuse_it->second.offset;
+            target_cap = reuse_it->second.slot_capacity;
+            storage_relocations_.erase(reuse_it);
+        } else {
+            if (lru_it->second.dedicated) {
+                const uint32_t old_id = lru_it->second.buffer_id;
+                bridge_->unregister_resource(old_id);
+                enc.destroy_resource(old_id);
+                storage_relocation_buffers_.erase(
+                    std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
+                    storage_relocation_buffers_.end());
+            }
+            storage_relocations_.erase(lru_it);
+        }
+    }
+
+    if (target_buf == 0) {
+        if (dedicated) {
+            target_buf = allocate_id();
+            target_off = 0;
+            target_cap = need;
+            enc.create_buffer(target_buf, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, target_cap);
+            bridge_->register_buffer(target_buf, allocate_gpu_va(target_cap), target_cap);
+            storage_relocation_buffers_.push_back(target_buf);
+        } else {
+            if (storage_relocation_buffer_ == 0 || storage_relocation_used_ + need > kChunk) {
+                storage_relocation_buffer_ = allocate_id();
+                enc.create_buffer(storage_relocation_buffer_, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, kChunk);
+                bridge_->register_buffer(storage_relocation_buffer_, allocate_gpu_va(kChunk), kChunk);
+                storage_relocation_buffers_.push_back(storage_relocation_buffer_);
+                storage_relocation_used_ = 0;
+            }
+            target_buf = storage_relocation_buffer_;
+            target_off = storage_relocation_used_;
+            target_cap = need;
+            storage_relocation_used_ += need;
+        }
+    }
+
+    for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
+        const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
+        enc.write_buffer(target_buf, static_cast<uint32_t>(target_off + off),
+                         bytes.data() + off, static_cast<uint32_t>(n));
+    }
+    submit(enc);
+    count_work(Work::BufferUploads);
+    note_upload(write_len);
+
+    RelocatedStorage entry{};
+    entry.va = va;
+    entry.size = size;
+    entry.buffer_id = target_buf;
+    entry.offset = target_off;
+    entry.slot_capacity = target_cap;
+    entry.last_hash = hash;
+    entry.last_used_seq = seq;
+    entry.ever_uploaded = true;
+    entry.dedicated = dedicated;
+    storage_relocations_.emplace(key, entry);
+
+    *buffer_id = target_buf;
+    *offset = target_off;
+    return true;
+}
+
+size_t Device::relocated_storage_count() const {
+    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    return storage_relocations_.size();
 }
 
 bool Device::set_back_buffer(uint64_t resource_interface_pointer) {

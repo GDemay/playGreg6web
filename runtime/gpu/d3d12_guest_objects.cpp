@@ -308,6 +308,26 @@ void Device::flush_pipeline_dump() {
 
 Device::~Device() {
     {
+        std::vector<uint32_t> storage_ids;
+        {
+            std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+            storage_ids.swap(storage_relocation_buffers_);
+            storage_relocations_.clear();
+            storage_relocation_buffer_ = 0;
+            storage_relocation_used_ = 0;
+        }
+        if (!storage_ids.empty()) {
+            CommandEncoder enc;
+            for (uint32_t id : storage_ids) {
+                if (bridge_) {
+                    bridge_->unregister_resource(id);
+                }
+                enc.destroy_resource(id);
+            }
+            submit(enc);
+        }
+    }
+    {
         std::vector<uint32_t> ids;
         {
             std::lock_guard<std::mutex> lock(address_textures_mutex_);
@@ -879,8 +899,39 @@ d3d::ViewDescriptor Device::MemorySlotSource::view(const d3d::DescriptorHeap& he
     bridge::DecodeStatus status = bridge::DecodeStatus::NotDescriptor;
     if (heap.increment() >= bridge::kViewSlotBytes && com::read_guest(address, words, bridge::kViewSlotBytes)) {
         status = bridge::decode_view_words(*device_.bridge_, words, range, &v);
-        if (status == bridge::DecodeStatus::UnknownTexture && range != d3d::DescriptorRangeType::Cbv &&
-            gfx10::classify_slot(words) == gfx10::SlotContent::Image) {
+        if (range != d3d::DescriptorRangeType::Cbv && gfx10::classify_slot(words) == gfx10::SlotContent::Buffer &&
+            (status == bridge::DecodeStatus::UnresolvedAddress ||
+             (status == bridge::DecodeStatus::Ok && v.dimension == d3d::ViewDimension::Buffer &&
+              (v.first_element_or_address % bridge::kUniformOffsetAlignment) != 0))) {
+            const gfx10::BufferResource b = gfx10::decode_buffer(words);
+            if (b.base != 0) {
+                const uint64_t raw_bytes =
+                    (b.stride != 0 && b.oob_select != gfx10::Oob::Complete)
+                        ? uint64_t{b.num_records} * uint64_t{b.stride}
+                        : uint64_t{b.num_records};
+                uint64_t byte_size = raw_bytes != 0 ? raw_bytes : (uint64_t{64u} << 10);
+                if (status == bridge::DecodeStatus::Ok && v.num_elements_or_size != 0) {
+                    byte_size = v.num_elements_or_size;
+                }
+                byte_size = std::clamp<uint64_t>(byte_size, uint64_t{4u}, uint64_t{16u} << 20);
+                const bool require_zero_offset = b.stride != 0 && (uint64_t{256u} % b.stride != 0);
+                uint32_t reloc_id = 0;
+                uint64_t reloc_offset = 0;
+                if (device_.relocate_storage_buffer(b.base, byte_size, &reloc_id, &reloc_offset,
+                                                    require_zero_offset)) {
+                    v = d3d::ViewDescriptor{};
+                    v.kind = range == d3d::DescriptorRangeType::Uav ? d3d::DescriptorKind::Uav
+                                                                    : d3d::DescriptorKind::Srv;
+                    v.dimension = static_cast<uint8_t>(d3d::ViewDimension::Buffer);
+                    v.resource_id = reloc_id;
+                    v.structure_byte_stride = 1;
+                    v.first_element_or_address = reloc_offset;
+                    v.num_elements_or_size = static_cast<uint32_t>(std::min<uint64_t>(byte_size, uint64_t{0xFFFFFFFFu}));
+                    status = bridge::DecodeStatus::Ok;
+                }
+            }
+        } else if (status == bridge::DecodeStatus::UnknownTexture && range != d3d::DescriptorRangeType::Cbv &&
+                   gfx10::classify_slot(words) == gfx10::SlotContent::Image) {
             const gfx10::ImageResource img = gfx10::decode_image(words);
             const bool is_msaa =
                 img.type == gfx10::ImageType::Tex2DMsaa || img.type == gfx10::ImageType::Tex2DMsaaArray;

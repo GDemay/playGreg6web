@@ -739,6 +739,14 @@ public:
     // buffers, refreshed from guest memory at every submission (flush_cpu_buffers) when changed.
     bool relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset);
     size_t relocated_uniform_count() const;
+    // Storage buffer views at unaligned offsets or address-only GPU VAs (G51): the bytes at
+    // [va, va + size) (readable guest/alias memory only) get a 256-byte aligned home (or a
+    // dedicated offset-0 buffer when `require_zero_offset` is true, e.g. element stride does not
+    // divide 256) in runtime-owned Storage|CopyDst buffers registered with the state bridge,
+    // uploaded immediately and refreshed on flush_cpu_buffers when guest bytes change.
+    bool relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset,
+                                 bool require_zero_offset = false);
+    size_t relocated_storage_count() const;
     // Shader pack resolution (DeviceOptions::shader_pack). Each stage of a graphics pipeline is
     // looked up by the code-only identity of the console-native stage its DXIL joins to, else by
     // its DXIL identity. When every stage has a key, the stages get modules (one CreateShaderModule
@@ -897,6 +905,33 @@ private:
     };
     mutable std::mutex relocation_mutex_;
     std::map<std::pair<uint64_t, uint64_t>, RelocatedUniform> relocations_;  // (va, size)
+    struct RelocatedStorage {
+        uint64_t va = 0;
+        uint64_t size = 0;
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+        uint64_t slot_capacity = 0;
+        uint64_t last_hash = 0;
+        uint64_t last_used_seq = 0;
+        bool ever_uploaded = false;
+        bool dedicated = false;
+    };
+    struct RelocatedStorageKey {
+        uint64_t va = 0;
+        uint64_t size = 0;
+        bool dedicated = false;
+        bool operator<(const RelocatedStorageKey& o) const noexcept {
+            if (va != o.va) return va < o.va;
+            if (size != o.size) return size < o.size;
+            return dedicated < o.dedicated;
+        }
+    };
+    mutable std::mutex storage_relocation_mutex_;
+    std::map<RelocatedStorageKey, RelocatedStorage> storage_relocations_;
+    std::vector<uint32_t> storage_relocation_buffers_;
+    uint32_t storage_relocation_buffer_ = 0;
+    uint64_t storage_relocation_used_ = 0;
+    uint64_t storage_relocation_seq_ = 0;
     std::mutex pack_mutex_;
     std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // pack key -> module id
     std::set<std::pair<uint64_t, uint64_t>> pack_layouts_;                // (vs, ps) identities
