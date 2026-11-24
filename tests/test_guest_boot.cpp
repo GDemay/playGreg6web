@@ -1347,6 +1347,266 @@ void test_host_fault_mapping() {
     CHECK(report["fault"]["function"]["entry"].hex() == kMid);
 }
 
+// ---------------------------------------------------------------------------
+// R37c: Shard-only dispatch boot tests (empty lifted_tables)
+// ---------------------------------------------------------------------------
+
+enum class ShardScenario {
+    IndirectAndImport,
+    UnknownTargetFault,
+    TrapFault,
+};
+
+ShardScenario g_shard_scenario = ShardScenario::IndirectAndImport;
+std::vector<std::string> g_shard_events;
+uint64_t g_shard_helper_result = 0;
+uint64_t g_shard_last_error = 0;
+
+void shard0_dispatch(uint32_t local_idx, Pg6GuestState* state) {
+    switch (local_idx) {
+        case 0: {  // kEntry
+            g_shard_events.push_back("shard0:entry");
+            if (g_shard_scenario == ShardScenario::IndirectAndImport) {
+                // 1) Indirect call into a function living in shard 1.
+                reg(state, GuestReg::Rcx) = 19;
+                push(state, kEntryCallsMid);
+                __playgta6_indirect_call(state, kMid);
+                g_shard_helper_result = reg(state, GuestReg::Rax);
+
+                // 2) Synthetic import thunk calls (SetLastError / GetLastError).
+                reg(state, GuestReg::Rcx) = 0x2468;
+                call_iat(state, kSlotSetLastError, kEntryCallsIat);
+                call_iat(state, kSlotGetLastError, kEntryCallsIat);
+                g_shard_last_error = reg(state, GuestReg::Rax);
+
+                // 3) Synthetic host callable (COM-style) alongside shard dispatch.
+                const uint64_t answer = register_host_callable(&host_answer, "IShard::Answer");
+                push(state, kEntryCallsIat);
+                __playgta6_indirect_call(state, answer);
+                const uint64_t host_val = reg(state, GuestReg::Rax);
+
+                reg(state, GuestReg::Rax) = g_shard_helper_result + host_val;
+                ret(state);
+                return;
+            }
+            if (g_shard_scenario == ShardScenario::UnknownTargetFault) {
+                push(state, kEntryCallsIat);
+                __playgta6_indirect_call(state, kUnknownInsideEntry);
+                ret(state);
+                return;
+            }
+            // TrapFault: push 8-byte prolog matching .pdata UWOP_ALLOC_SMALL 8, then call kMid -> kLeaf.
+            push(state, kEntryStaleValue);
+            push(state, kEntryCallsMid);
+            __playgta6_indirect_call(state, kMid);
+            reg(state, GuestReg::Rsp) += 8;
+            ret(state);
+            return;
+        }
+        case 1:  // kCallback1
+            g_shard_events.push_back("shard0:cb1");
+            ret(state);
+            return;
+        case 2:  // kCallback2
+            g_shard_events.push_back("shard0:cb2");
+            ret(state);
+            return;
+        default:
+            __playgta6_trap(state, kEntry);
+    }
+}
+
+void shard1_dispatch(uint32_t local_idx, Pg6GuestState* state) {
+    switch (local_idx) {
+        case 0: {  // kMid
+            g_shard_events.push_back("shard1:mid");
+            if (g_shard_scenario == ShardScenario::TrapFault) {
+                push(state, 0x1234);  // 8-byte prolog matching .pdata UWOP_ALLOC_SMALL 8
+                push(state, kMidCallsLeaf);
+                __playgta6_indirect_call(state, kLeaf);
+                reg(state, GuestReg::Rsp) += 8;
+                ret(state);
+                return;
+            }
+            reg(state, GuestReg::Rax) = reg(state, GuestReg::Rcx) * 2 + 3;
+            ret(state);
+            return;
+        }
+        case 1:  // kLeaf
+            g_shard_events.push_back("shard1:leaf");
+            __playgta6_trap(state, kLeaf + 4);
+        case 2:  // kWorker
+            g_shard_events.push_back("shard1:worker");
+            reg(state, GuestReg::Rax) = reg(state, GuestReg::Rcx) + 100;
+            ret(state);
+            return;
+        default:
+            __playgta6_trap(state, kMid);
+    }
+}
+
+const Pg6ShardDispatchFn kTestShards[] = {&shard0_dispatch, &shard1_dispatch};
+const Pg6ShardFunctionEntry kTestShardEntries[] = {
+    {kEntry, 0u, 0u},
+    {kMid, 1u, 0u},
+    {kLeaf, 1u, 1u},
+    {kCallback1, 0u, 1u},
+    {kCallback2, 0u, 2u},
+    {kWorker, 1u, 2u},
+};
+const Pg6ShardDispatchTable kTestShardTable{
+    kPg6ShardDispatchVersion,
+    static_cast<uint32_t>(std::size(kTestShards)),
+    static_cast<uint64_t>(std::size(kTestShardEntries)),
+    kTestShards,
+    kTestShardEntries,
+};
+
+Run boot_shard_only(ShardScenario scenario) {
+    g_shard_scenario = scenario;
+    g_shard_events.clear();
+    g_shard_helper_result = 0;
+    g_shard_last_error = 0;
+    os::pgim::MemoryImageReader reader(g_image.data(), g_image.size());
+    BootConfig cfg;
+    BootModule exe;
+    exe.image = &reader;
+    exe.name = "boot_test.exe";
+    // Explicitly empty lifted_tables: everything resolves through Pg6ShardDispatchTable.
+    exe.shard_dispatch_tables.push_back(&kTestShardTable);
+    exe.imports = std::span<const BootImport>(kImports);
+    cfg.modules.push_back(std::move(exe));
+    cfg.arena = g_arena;
+    cfg.log_progress = false;
+    Run run;
+    run.result = run_boot(cfg);
+    bool ok = false;
+    run.report = parse_json(run.result.report_json, &ok);
+    CHECK(ok);
+    return run;
+}
+
+void test_shard_dispatch_boot() {
+    // 1. Direct entry point + TLS callbacks + cross-shard indirect call + synthetic import thunk +
+    //    synthetic host callable + call_guest callback on a second thread.
+    {
+        const Run run = boot_shard_only(ShardScenario::IndirectAndImport);
+        CHECK(run.result.status == BootStatus::Exited);
+        CHECK(g_shard_helper_result == 41);  // 19 * 2 + 3
+        CHECK(g_shard_last_error == 0x2468);
+        CHECK(run.result.stats.exit_code == 41 + 42);
+        CHECK(run.result.stats.functions_registered == std::size(kTestShardEntries));
+        CHECK(run.report["startup"]["lifted_tables"].number == 0);
+        CHECK(run.report["startup"]["shard_dispatch_tables"].number == 1);
+        CHECK(run.report["startup"]["functions_registered"].number == std::size(kTestShardEntries));
+        CHECK(g_shard_events.size() == 4);
+        if (g_shard_events.size() == 4) {
+            CHECK(g_shard_events[0] == "shard0:cb1" && g_shard_events[1] == "shard0:cb2" &&
+                  g_shard_events[2] == "shard0:entry" && g_shard_events[3] == "shard1:mid");
+        }
+
+        // call_guest invocation into a shard-dispatched function on a newly prepared thread.
+        GuestThreadContext worker{};
+        CHECK(prepare_guest_thread(0x10000, 88, worker));
+        CHECK(call_guest_args(*g_arena, worker.thread.state, kWorker, uint64_t{23}) == 123);
+        CHECK(g_shard_events.back() == "shard1:worker");
+        release_guest_thread(worker);
+
+        // Lazy guest thread (CreateThread / pool callback path) dispatches TLS + worker via shard.
+        uint64_t lazy_res = 0;
+        std::thread host([&] {
+            GuestState& state = com::current_guest_state();
+            lazy_res = call_guest_args(*g_arena, state, kWorker, uint64_t{55});
+        });
+        host.join();
+        CHECK(lazy_res == 155);
+    }
+
+    // 2. Nearest-function fault reporting on unknown_target (`sub_XXXX+0xYY` + fault.detail).
+    {
+        const Run run = boot_shard_only(ShardScenario::UnknownTargetFault);
+        CHECK(run.result.status == BootStatus::Fault);
+        check_fault(run, "unknown_target", kUnknownInsideEntry, kEntry);
+        CHECK(run.report["fault"]["detail"].hex() == kEntry);
+        CHECK(run.result.summary.find("sub_140001000+0x34") != std::string::npos);
+    }
+
+    // 3. Nearest-function fault reporting + backtrace on a trap inside a shard-dispatched leaf.
+    {
+        const Run run = boot_shard_only(ShardScenario::TrapFault);
+        CHECK(run.result.status == BootStatus::Fault);
+        check_fault(run, "trap", kLeaf + 4, kLeaf);
+        CHECK(run.result.summary.find("sub_140001180+0x4") != std::string::npos);
+        const Json& bt = run.report["backtrace"];
+        CHECK(bt["frames"].items.size() == 2);
+        CHECK(bt["frames"][0]["function"].hex() == kMid);
+        CHECK(bt["frames"][1]["function"].hex() == kEntry);
+    }
+
+    // 4. Malformed shard dispatch table fails registration cleanly with BootStatus::RegisterFailed.
+    {
+        const Pg6ShardDispatchTable bad_table{
+            kPg6ShardDispatchVersion + 99u, 1u, 1u, kTestShards, kTestShardEntries,
+        };
+        os::pgim::MemoryImageReader reader(g_image.data(), g_image.size());
+        BootConfig cfg;
+        BootModule exe;
+        exe.image = &reader;
+        exe.name = "boot_test.exe";
+        exe.shard_dispatch_tables.push_back(&bad_table);
+        cfg.modules.push_back(std::move(exe));
+        cfg.arena = g_arena;
+        cfg.log_progress = false;
+        const BootResult res = run_boot(cfg);
+        CHECK(res.status == BootStatus::RegisterFailed);
+        CHECK(res.summary.find("shard dispatch table") != std::string::npos);
+    }
+
+    // 4b. Shard dispatch table with synthetic guest VA is rejected cleanly.
+    {
+        const Pg6ShardFunctionEntry synthetic_entries[] = {{kSyntheticBase + kSyntheticStride, 0u, 0u}};
+        const Pg6ShardDispatchTable synth_table{
+            kPg6ShardDispatchVersion, 1u, 1u, kTestShards, synthetic_entries,
+        };
+        os::pgim::MemoryImageReader reader(g_image.data(), g_image.size());
+        BootConfig cfg;
+        BootModule exe;
+        exe.image = &reader;
+        exe.name = "boot_test.exe";
+        exe.shard_dispatch_tables.push_back(&synth_table);
+        cfg.modules.push_back(std::move(exe));
+        cfg.arena = g_arena;
+        cfg.log_progress = false;
+        const BootResult res = run_boot(cfg);
+        CHECK(res.status == BootStatus::RegisterFailed);
+        CHECK(res.summary.find("synthetic") != std::string::npos);
+    }
+
+    // 5. C ABI Pg6GuestBootModule forwards shard_dispatch_tables.
+    {
+        g_shard_scenario = ShardScenario::IndirectAndImport;
+        g_shard_events.clear();
+        const Pg6ShardDispatchTable* shard_tables[] = {&kTestShardTable};
+        Pg6GuestBootModule module{};
+        module.image_bytes = g_image.data();
+        module.image_size = g_image.size();
+        module.name = "boot_test.exe";
+        module.imports = kImports;
+        module.import_count = std::size(kImports);
+        module.shard_dispatch_tables = shard_tables;
+        module.shard_dispatch_table_count = 1;
+        Pg6GuestBootConfig cfg{};
+        cfg.modules = &module;
+        cfg.module_count = 1;
+        cfg.quiet = 1;
+        Pg6GuestBootStats stats{};
+        os::win32::set_vmem_arena(g_arena);
+        CHECK(pg6_guest_boot_run(&cfg, &stats) == PG6_BOOT_EXITED);
+        CHECK(stats.exit_code == 41 + 42);
+        CHECK(stats.functions_registered == std::size(kTestShardEntries));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1374,6 +1634,7 @@ int main() {
     test_no_tls_and_load_failure();
     test_two_modules();
     test_host_fault_mapping();
+    test_shard_dispatch_boot();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);
