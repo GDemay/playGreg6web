@@ -7,6 +7,8 @@
 #include <cstring>
 
 #include "gpu/descriptor_words.h"
+#include "gpu/gfx10_descriptors.h"
+#include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/xmem_windows.h"
@@ -240,6 +242,47 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
     detile_texture_ = options_.detile_texture;
+    if (!detile_texture_) {
+        detile_texture_ = [](const TextureDetileRequest& req,
+                             const uint8_t* src,
+                             size_t src_bytes,
+                             uint8_t* dst,
+                             size_t dst_bytes) -> bool {
+            if (dst == nullptr || req.dst_row_pitch == 0) {
+                return false;
+            }
+            gfx10::TextureLayoutDesc desc{};
+            desc.dxgi_format = req.dxgi_format;
+            desc.width = req.width;
+            desc.height = req.height;
+            desc.depth = std::max<uint32_t>(1u, req.depth);
+            desc.mip_levels = std::max<uint32_t>(1u, req.mip_levels);
+            desc.d3d12_layout = req.layout;
+            desc.pitch_bytes = 0;
+
+            std::vector<uint8_t> linear_out;
+            const gfx10::DetileResult res = gfx10::detile_subresource(desc, /*mip=*/0u, src, src_bytes, linear_out);
+            if (!res.ok || req.dst_row_pitch < res.row_pitch_bytes) {
+                return false;
+            }
+            const uint64_t total_rows = uint64_t{res.rows} * res.slices;
+            const uint64_t required_dst = total_rows * req.dst_row_pitch;
+            const uint64_t required_src = total_rows * res.row_pitch_bytes;
+            if (required_dst > dst_bytes || required_src > linear_out.size()) {
+                return false;
+            }
+            const size_t pad_bytes = static_cast<size_t>(req.dst_row_pitch - res.row_pitch_bytes);
+            for (uint64_t r = 0; r < total_rows; ++r) {
+                uint8_t* dst_row = dst + static_cast<size_t>(r * req.dst_row_pitch);
+                const uint8_t* src_row = linear_out.data() + static_cast<size_t>(r * res.row_pitch_bytes);
+                std::memcpy(dst_row, src_row, res.row_pitch_bytes);
+                if (pad_bytes > 0) {
+                    std::memset(dst_row + res.row_pitch_bytes, 0, pad_bytes);
+                }
+            }
+            return true;
+        };
+    }
     slot_source_ = std::make_unique<MemorySlotSource>(*this);
     bo.slot_source = slot_source_.get();
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
@@ -264,6 +307,28 @@ void Device::flush_pipeline_dump() {
 }
 
 Device::~Device() {
+    {
+        std::vector<uint32_t> ids;
+        {
+            std::lock_guard<std::mutex> lock(address_textures_mutex_);
+            ids.reserve(address_textures_.size());
+            for (const auto& entry : address_textures_) {
+                ids.push_back(entry.second);
+            }
+            address_textures_.clear();
+        }
+        if (!ids.empty()) {
+            CommandEncoder enc;
+            for (uint32_t id : ids) {
+                untrack_guest_texture(id);
+                if (bridge_) {
+                    bridge_->unregister_resource(id);
+                }
+                enc.destroy_resource(id);
+            }
+            submit(enc);
+        }
+    }
     flush_pipeline_dump();
     os::xmem_windows::remove_alias_listener(alias_listener_);
     pacer_.shutdown();
@@ -814,6 +879,53 @@ d3d::ViewDescriptor Device::MemorySlotSource::view(const d3d::DescriptorHeap& he
     bridge::DecodeStatus status = bridge::DecodeStatus::NotDescriptor;
     if (heap.increment() >= bridge::kViewSlotBytes && com::read_guest(address, words, bridge::kViewSlotBytes)) {
         status = bridge::decode_view_words(*device_.bridge_, words, range, &v);
+        if (status == bridge::DecodeStatus::UnknownTexture && range != d3d::DescriptorRangeType::Cbv &&
+            gfx10::classify_slot(words) == gfx10::SlotContent::Image) {
+            const gfx10::ImageResource img = gfx10::decode_image(words);
+            const bool is_msaa =
+                img.type == gfx10::ImageType::Tex2DMsaa || img.type == gfx10::ImageType::Tex2DMsaaArray;
+            if (!is_msaa && img.base != 0) {
+                GpuTextureDimension dim = GpuTextureDimension::Dim2D;
+                if (img.type == gfx10::ImageType::Tex1D || img.type == gfx10::ImageType::Tex1DArray) {
+                    dim = GpuTextureDimension::Dim1D;
+                } else if (img.type == gfx10::ImageType::Tex3D) {
+                    dim = GpuTextureDimension::Dim3D;
+                }
+                uint32_t width = img.width;
+                uint32_t height = img.height;
+                uint32_t depth = std::max<uint32_t>(1u, img.depth);
+                uint32_t mip_levels = std::max<uint32_t>(img.max_mip, img.last_level) + 1u;
+                uint32_t d3d12_layout = (img.sw_mode == 0u) ? 1u : (0x100u | img.sw_mode);
+                uint32_t dxgi_format = gfx10::dxgi_format(img.format, img.dst_sel);
+                xbox::AddressTextureViewInfo view_info{};
+                if (xbox::lookup_address_texture_view(img.base, &view_info)) {
+                    if (view_info.dxgi_format != 0) {
+                        dxgi_format = view_info.dxgi_format;
+                    }
+                    if (view_info.d3d12_layout != 0) {
+                        d3d12_layout = view_info.d3d12_layout;
+                    }
+                    if (view_info.width != 0) {
+                        width = view_info.width;
+                    }
+                    if (view_info.height != 0) {
+                        height = view_info.height;
+                    }
+                    if (view_info.depth != 0) {
+                        depth = view_info.depth;
+                    }
+                    if (view_info.mip_levels != 0) {
+                        mip_levels = view_info.mip_levels;
+                    }
+                }
+                const bool uav = range == d3d::DescriptorRangeType::Uav;
+                if (dxgi_format != 0 &&
+                    device_.ensure_address_texture(img.base, dxgi_format, width, height, depth, mip_levels,
+                                                   d3d12_layout, dim, uav) != 0) {
+                    status = bridge::decode_view_words(*device_.bridge_, words, range, &v);
+                }
+            }
+        }
     } else {
         v.kind = range == d3d::DescriptorRangeType::Cbv ? d3d::DescriptorKind::Cbv
                                                         : (range == d3d::DescriptorRangeType::Uav ? d3d::DescriptorKind::Uav

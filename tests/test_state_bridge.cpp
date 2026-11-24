@@ -1462,7 +1462,8 @@ void test_dirty_texture_memory_upload() {
         CHECK(!device->sync_bound_texture_memory(guard_tex->id(), guard_enc));
         CHECK(guard_enc.size() == 0);
 
-        // Case D: Tiled console layouts (layout >= 0x101) — tiny 2x2 uploads immediately; 4x4 uses DetileFn hook.
+        // Case D: Tiled console layouts (layout >= 0x101) — default Device detiles via GFX10 detiler;
+        // clearing DetileFn skips non-tiny tiled textures, and custom DetileFn overrides work.
         const uint64_t tiled_mem =
             arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
         CHECK(com::write_guest(tiled_mem, texels.data(), texels.size()));
@@ -1483,6 +1484,8 @@ void test_dirty_texture_memory_upload() {
             com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
             make_tex_desc(4, 4, 28, 0x102), pl_tiled_4x4, 0u);
         CHECK(tiled_4x4 && tiled_4x4->initialize());
+        // With detile hook explicitly cleared, non-tiny tiled texture is skipped.
+        device->set_detile_fn(nullptr);
         gpu::CommandEncoder tiled_enc1;
         CHECK(!device->sync_bound_texture_memory(tiled_4x4->id(), tiled_enc1));
         CHECK(tiled_enc1.size() == 0);

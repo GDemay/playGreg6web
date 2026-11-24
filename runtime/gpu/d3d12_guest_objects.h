@@ -780,6 +780,13 @@ public:
     bool tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const;
     void set_detile_fn(DetileFn fn);
     bool sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder);
+    // Creates (or returns a cached) WebGPU texture for a GPU VA that has no ID3D12Resource
+    // (Xbox Slot-70/71 address views and raw GFX10 T# image descriptors in descriptor memory).
+    // Registers TextureInfo in the state bridge and tracks guest memory for detiled WriteTexture
+    // uploads on bind. Returns 0 when dimensions or format are unsupported.
+    uint32_t ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, uint32_t width, uint32_t height,
+                                    uint32_t depth, uint32_t mip_levels, uint32_t d3d12_layout,
+                                    GpuTextureDimension dim, bool uav);
     // Designates a texture as the presented back buffer: render passes that target it write the
     // canvas texture (kGpuSwapchainTextureId). PresentX calls it for plane 0's resource the first
     // time that resource is presented (d3d12_xs_xbox.h). False if `resource` is not a 2D texture.
@@ -909,6 +916,41 @@ private:
     std::vector<Resource*> tracked_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
+    struct AddressTextureKey {
+        uint64_t gpu_va = 0;
+        uint32_t dxgi_format = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t depth = 1;
+        uint32_t mip_levels = 1;
+        uint32_t d3d12_layout = 0;
+        uint8_t dim = 0;
+
+        bool operator==(const AddressTextureKey& o) const noexcept {
+            return gpu_va == o.gpu_va && dxgi_format == o.dxgi_format && width == o.width && height == o.height &&
+                   depth == o.depth && mip_levels == o.mip_levels && d3d12_layout == o.d3d12_layout && dim == o.dim;
+        }
+    };
+    struct AddressTextureKeyHash {
+        size_t operator()(const AddressTextureKey& k) const noexcept {
+            uint64_t h = uint64_t{0xcbf29ce484222325ull};
+            auto mix = [&](uint64_t v) {
+                h ^= v;
+                h *= uint64_t{0x00000100000001b3ull};
+            };
+            mix(k.gpu_va);
+            mix(k.dxgi_format);
+            mix(k.width);
+            mix(k.height);
+            mix(k.depth);
+            mix(k.mip_levels);
+            mix(k.d3d12_layout);
+            mix(k.dim);
+            return static_cast<size_t>(h);
+        }
+    };
+    mutable std::mutex address_textures_mutex_;
+    std::unordered_map<AddressTextureKey, uint32_t, AddressTextureKeyHash> address_textures_;
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
     std::atomic<uint64_t> upload_bytes_{0};
