@@ -361,6 +361,8 @@ struct IGraphicsCommandListHost : IDeviceChildHost {
                                   InterfaceArg<IResourceHost> src, uint64_t src_offset,
                                   uint64_t bytes) = 0;                                               // 15
     virtual void CopyTextureRegion(com::CallContext& ctx) = 0;                                       // 16
+    // Xbox slot 85: (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags), CopyTextureRegion + trailing flags.
+    virtual void CopyTextureRegionX(com::CallContext& ctx) = 0;
     virtual void CopyResource(InterfaceArg<IResourceHost> dst, InterfaceArg<IResourceHost> src) = 0;  // 17
     virtual void ResolveSubresource(com::CallContext& ctx) = 0;                                      // 19
     virtual void IASetPrimitiveTopology(uint32_t topology) = 0;                                      // 20

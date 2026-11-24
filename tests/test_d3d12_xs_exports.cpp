@@ -4488,6 +4488,107 @@ void test_g53_compute_meta_tail_28_digest_join() {
     scene.release_all({list, cpso62, cpso11});
 }
 
+// G54: Xbox ID3D12GraphicsCommandList slot 85 (CopyTextureRegionX) takes the 6 CopyTextureRegion
+// arguments plus a trailing flags word. Verify slot 85 uploads a 4x4 R8G8B8A8_UNORM texture from a
+// CPU-visible staging buffer (256-byte row pitch) as a GpuOpcode::WriteTexture packet with exact
+// payload bytes, and that non-zero trailing flags still perform the copy while recording a
+// diagnostic note without crashing or returning an error.
+void test_g54_copy_texture_region_x_slot85() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+
+    constexpr uint32_t kWidth = 4;
+    constexpr uint32_t kHeight = 4;
+    constexpr uint32_t kRowPitch = 256;
+    constexpr uint32_t kDxgiRgba8Unorm = 28;
+    constexpr uint32_t kExpectedLen = kRowPitch * (kHeight - 1) + kWidth * 4;
+
+    const uint64_t upload = committed(fx, scene.device, 2, buffer_desc(kRowPitch * kHeight), 0xAC3);
+    const uint64_t tex = committed(fx, scene.device, 1, texture_desc(kWidth, kHeight, kDxgiRgba8Unorm, 0), 0x400);
+    CHECK(upload != 0 && tex != 0);
+    const uint64_t up_cpu = object_of<dg::Resource>(upload)->cpu_address();
+    const uint32_t tex_id = object_of<dg::Resource>(tex)->id();
+    CHECK(up_cpu != 0 && tex_id != 0);
+
+    std::vector<uint8_t> staging(kRowPitch * kHeight, 0);
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        for (uint32_t x = 0; x < kWidth * 4; ++x) {
+            staging[y * kRowPitch + x] = static_cast<uint8_t>((y * 37u + x * 11u + 5u) & 0xFFu);
+        }
+    }
+    CHECK(com::write_guest(up_cpu, staging.data(), staging.size()));
+
+    dg::GuestTextureCopyLocation dst{};
+    dst.pResource = tex;
+    dst.Type = 0;  // SubresourceIndex 0
+    dg::GuestTextureCopyLocation src{};
+    src.pResource = upload;
+    src.Type = 1;  // PlacedFootprint
+    src.PlacedFootprint = {0, {kDxgiRgba8Unorm, kWidth, kHeight, 1, kRowPitch}};
+
+    // 1) Slot 85 with flags == 0: emits WriteTexture with exact bytes and zero diagnostics.
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    const uint64_t uploads_before = dg::work_total(dg::Work::TextureUploads);
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 85, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0), I(0)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 85) == 0);
+    CHECK(dev->stats().bad_arguments == bad_before);
+
+    size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto pkts0 = packets_since(fx, mark);
+    CHECK(dg::work_total(dg::Work::TextureUploads) == uploads_before + 1);
+    const Packet* wt0 = find_op(pkts0, GpuOpcode::WriteTexture);
+    CHECK(wt0 != nullptr);
+    if (wt0 != nullptr) {
+        const auto t = payload_as<GpuWriteTexturePayload>(*wt0);
+        CHECK(t.texture_id == tex_id && t.mip_level == 0 && t.origin_x == 0 && t.origin_y == 0 && t.origin_z == 0 &&
+              t.width == kWidth && t.height == kHeight && t.depth_or_layers == 1 && t.bytes_per_row == kRowPitch &&
+              t.data_len == kExpectedLen);
+        CHECK(wt0->payload.size() == sizeof(GpuWriteTexturePayload) + kExpectedLen);
+        if (wt0->payload.size() == sizeof(GpuWriteTexturePayload) + kExpectedLen) {
+            CHECK(std::memcmp(wt0->payload.data() + sizeof(GpuWriteTexturePayload), staging.data(), kExpectedLen) == 0);
+        }
+    }
+
+    // 2) Slot 85 with non-zero trailing flags (1): still emits WriteTexture and logs a diagnostic note.
+    for (uint32_t y = 0; y < kHeight; ++y) {
+        for (uint32_t x = 0; x < kWidth * 4; ++x) {
+            staging[y * kRowPitch + x] = static_cast<uint8_t>((y * 53u + x * 19u + 0xA0u) & 0xFFu);
+        }
+    }
+    CHECK(com::write_guest(up_cpu, staging.data(), staging.size()));
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 85, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0), I(1)});
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 85) == 0);
+    CHECK(dev->stats().bad_arguments == bad_before + 1);
+    CHECK(contains(dev->diagnostics(), "slot 85 (CopyTextureRegionX): trailing flags 0x1"));
+
+    mark = fx.captured.size();
+    scene.execute({list});
+    const auto pkts1 = packets_since(fx, mark);
+    CHECK(dg::work_total(dg::Work::TextureUploads) == uploads_before + 2);
+    const Packet* wt1 = find_op(pkts1, GpuOpcode::WriteTexture);
+    CHECK(wt1 != nullptr);
+    if (wt1 != nullptr) {
+        const auto t = payload_as<GpuWriteTexturePayload>(*wt1);
+        CHECK(t.texture_id == tex_id && t.width == kWidth && t.height == kHeight && t.bytes_per_row == kRowPitch &&
+              t.data_len == kExpectedLen);
+        CHECK(wt1->payload.size() == sizeof(GpuWriteTexturePayload) + kExpectedLen);
+        if (wt1->payload.size() == sizeof(GpuWriteTexturePayload) + kExpectedLen) {
+            CHECK(std::memcmp(wt1->payload.data() + sizeof(GpuWriteTexturePayload), staging.data(), kExpectedLen) == 0);
+        }
+    }
+
+    CHECK(t_balanced);
+    scene.release_all({list, upload, tex});
+}
+
 }  // namespace
 
 int main() {
@@ -4529,6 +4630,7 @@ int main() {
     test_g51_slot70_unaligned_buffer_views();
     test_g51_slot70_address_only_buffer_view();
     test_g53_compute_meta_tail_28_digest_join();
+    test_g54_copy_texture_region_x_slot85();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

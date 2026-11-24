@@ -1049,6 +1049,21 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     deferred_.push_back(wr);
 }
 
+// Xbox slot 85: (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags) -> void. The title's texture upload
+// path copies rows into a staging buffer and calls slot 85 with the CopyTextureRegion arguments
+// followed by a trailing flags word.
+void CommandList::CopyTextureRegionX(com::CallContext& ctx) {
+    if (!usable()) {
+        return;
+    }
+    const uint64_t flags = ctx.int_arg(7);
+    if (flags != 0) {
+        note("ID3D12GraphicsCommandList Xbox slot 85 (CopyTextureRegionX): trailing flags " + hex(flags) +
+             " are not interpreted");
+    }
+    CopyTextureRegion(ctx);
+}
+
 void CommandList::ResolveSubresource(com::CallContext&) {
     if (usable()) {
         device_->note_unsupported_copy("ResolveSubresource: no resolve packet (skipped)");
@@ -1673,7 +1688,8 @@ constexpr com::MethodDesc kCommandListMethods[] = {
     CL::method<&H::XboxSlot<75>>("Xbox slot 75"),                                     // 75
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 76..79
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 80..83
-    CL::stub(nullptr), CL::stub(nullptr),                                             // 84..85
+    CL::stub(nullptr),                                                                // 84
+    CL::method<&H::CopyTextureRegionX>("CopyTextureRegion (Xbox slot 85)"),           // 85
     CL::method<&H::XboxSlot<86>>("Xbox slot 86"),                                     // 86
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),                          // 87..89
     CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr), CL::stub(nullptr),       // 90..93
