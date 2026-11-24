@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51)."""
+"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66)."""
 
 from __future__ import annotations
 
@@ -591,6 +591,477 @@ class TestWasm64ValidatedStaging(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertEqual(report["wasm"]["status"], "error")
             self.assertFalse(web_dist.exists())
+
+    def test_no_side_modules_keeps_backwards_compatible_report_and_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["wasm"]["status"], "staged")
+            self.assertEqual(report["wasm"]["copied_count"], 2)
+            self.assertEqual(report["wasm"]["side_module_count"], 0)
+            self.assertEqual(report["wasm"]["side_modules"], [])
+            rendered = sbb.format_report_text(report)
+            self.assertNotIn("side_modules=", rendered)
+
+
+class TestSideModuleWasmStaging(unittest.TestCase):
+    def test_side_modules_dry_run_initial_stage_unchanged_and_incremental_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            _populate_program_dir(program_dir)
+
+            valid_wasm = wasm.build_valid_runtime_wasm()
+            js_payload = "export default function createRuntimeModule() { return 64; }\n"
+            _write_wasm_pair(wasm_dir, valid_wasm, js_payload)
+
+            part0_bytes = b"\x00asm\x01\x00\x00\x00" + b"\x10" * 40
+            part1_bytes = b"\x00asm\x01\x00\x00\x00" + b"\x20" * 64
+            (wasm_dir / "guest_part_0.wasm").write_bytes(part0_bytes)
+            (wasm_dir / "guest_part_1.wasm").write_bytes(part1_bytes)
+            # Non-.wasm siblings and nested .wasm files must NOT be staged.
+            (wasm_dir / "guest_part_0.o").write_bytes(b"\x7fELF")
+            (wasm_dir / "notes.txt").write_text("ignore me\n", encoding="utf-8")
+            (wasm_dir / "nested").mkdir()
+            (wasm_dir / "nested" / "ignored_nested.wasm").write_bytes(
+                b"\x00asm\x01\x00\x00\x00"
+            )
+
+            # 1. Dry-run plans all 4 files (runtime + 2 side modules) without writing.
+            dry = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+                dry_run=True,
+            )
+            self.assertTrue(dry["ok"])
+            self.assertTrue(dry["dry_run"])
+            self.assertEqual(dry["wasm"]["status"], "planned")
+            self.assertEqual(dry["wasm"]["planned_count"], 4)
+            self.assertEqual(dry["wasm"]["copied_count"], 0)
+            self.assertEqual(dry["wasm"]["side_module_count"], 2)
+            self.assertEqual(
+                [m["name"] for m in dry["wasm"]["side_modules"]],
+                ["guest_part_0.wasm", "guest_part_1.wasm"],
+            )
+            self.assertEqual(
+                [m["action"] for m in dry["wasm"]["side_modules"]],
+                ["plan_copy", "plan_copy"],
+            )
+            self.assertEqual(
+                [m["size_bytes"] for m in dry["wasm"]["side_modules"]],
+                [len(part0_bytes), len(part1_bytes)],
+            )
+            self.assertFalse(web_dist.exists())
+
+            # 2. Initial stage copies runtime + both side modules atomically.
+            initial = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(initial["ok"])
+            self.assertEqual(initial["wasm"]["status"], "staged")
+            self.assertEqual(initial["wasm"]["copied_count"], 4)
+            self.assertEqual(initial["wasm"]["unchanged_count"], 0)
+            self.assertEqual(initial["wasm"]["side_module_count"], 2)
+            self.assertEqual(
+                [(m["name"], m["size_bytes"], m["action"]) for m in initial["wasm"]["side_modules"]],
+                [
+                    ("guest_part_0.wasm", len(part0_bytes), "copied"),
+                    ("guest_part_1.wasm", len(part1_bytes), "copied"),
+                ],
+            )
+            self.assertEqual(
+                sorted(p.name for p in web_dist.iterdir()),
+                ["guest_part_0.wasm", "guest_part_1.wasm", "runtime.js", "runtime.wasm"],
+            )
+            self.assertEqual((web_dist / "guest_part_0.wasm").read_bytes(), part0_bytes)
+            self.assertEqual((web_dist / "guest_part_1.wasm").read_bytes(), part1_bytes)
+
+            # 3. Incremental unchanged re-run is a clean no-op.
+            unchanged = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(unchanged["ok"])
+            self.assertEqual(unchanged["wasm"]["status"], "unchanged")
+            self.assertEqual(unchanged["wasm"]["copied_count"], 0)
+            self.assertEqual(unchanged["wasm"]["unchanged_count"], 4)
+            self.assertEqual(
+                [m["action"] for m in unchanged["wasm"]["side_modules"]],
+                ["unchanged", "unchanged"],
+            )
+
+            # 4a. Same-size SHA-256 modification (even with preserved mtime) updates only part 0.
+            part0_src = wasm_dir / "guest_part_0.wasm"
+            orig_stat = part0_src.stat()
+            part0_updated = b"\x00asm\x01\x00\x00\x00" + b"\x99" * 40
+            self.assertEqual(len(part0_updated), len(part0_bytes))
+            part0_src.write_bytes(part0_updated)
+            os.utime(part0_src, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+
+            sha_update = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(sha_update["ok"])
+            self.assertEqual(sha_update["wasm"]["status"], "staged")
+            self.assertEqual(sha_update["wasm"]["copied_count"], 1)
+            self.assertEqual(sha_update["wasm"]["unchanged_count"], 3)
+            by_side = {m["name"]: m for m in sha_update["wasm"]["side_modules"]}
+            self.assertEqual(by_side["guest_part_0.wasm"]["action"], "copied")
+            self.assertEqual(by_side["guest_part_0.wasm"]["reason"], "sha256_changed")
+            self.assertEqual(by_side["guest_part_1.wasm"]["action"], "unchanged")
+            self.assertEqual((web_dist / "guest_part_0.wasm").read_bytes(), part0_updated)
+            self.assertEqual((web_dist / "guest_part_1.wasm").read_bytes(), part1_bytes)
+
+            # 4b. Size modification updates only part 1.
+            part1_updated = b"\x00asm\x01\x00\x00\x00" + b"\x33" * 96
+            (wasm_dir / "guest_part_1.wasm").write_bytes(part1_updated)
+
+            size_update = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(size_update["ok"])
+            self.assertEqual(size_update["wasm"]["status"], "staged")
+            self.assertEqual(size_update["wasm"]["copied_count"], 1)
+            self.assertEqual(size_update["wasm"]["unchanged_count"], 3)
+            by_side_2 = {m["name"]: m for m in size_update["wasm"]["side_modules"]}
+            self.assertEqual(by_side_2["guest_part_0.wasm"]["action"], "unchanged")
+            self.assertEqual(by_side_2["guest_part_1.wasm"]["action"], "copied")
+            self.assertEqual(by_side_2["guest_part_1.wasm"]["reason"], "size_changed")
+            self.assertEqual(by_side_2["guest_part_1.wasm"]["size_bytes"], len(part1_updated))
+            self.assertEqual((web_dist / "guest_part_1.wasm").read_bytes(), part1_updated)
+
+    def test_side_modules_natural_order_for_multidigit_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            web_dist = repo / "web" / "dist"
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            for idx in (10, 2, 0, 1):
+                (wasm_dir / f"guest_part_{idx}.wasm").write_bytes(
+                    b"\x00asm\x01\x00\x00\x00" + bytes([idx]) * 8
+                )
+
+            wasm_section, errors, warnings = sbb.stage_wasm_runtime(
+                wasm_dir=wasm_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(warnings, [])
+            self.assertEqual(wasm_section["status"], "staged")
+            self.assertEqual(
+                [m["name"] for m in wasm_section["side_modules"]],
+                [
+                    "guest_part_0.wasm",
+                    "guest_part_1.wasm",
+                    "guest_part_2.wasm",
+                    "guest_part_10.wasm",
+                ],
+            )
+
+    def test_refuses_to_stage_side_modules_when_runtime_wasm_fails_abi_validation(
+        self,
+    ) -> None:
+        cases = [
+            ("wasm32_not_memory64", wasm.build_valid_runtime_wasm(is_memory64=False)),
+            ("unshared_memory", wasm.build_valid_runtime_wasm(is_shared=False)),
+            (
+                "missing_host_import",
+                wasm.build_valid_runtime_wasm(omit_host_imports=("host_wgpu_submit",)),
+            ),
+            ("corrupt_bytes", b"NOT_WASM"),
+        ]
+        for label, bad_wasm in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                repo = _make_repo_skeleton(Path(tmp))
+                program_dir = repo / "work" / "recomp_program"
+                wasm_dir = repo / "work" / "wasm_guest_dist"
+                boot_dir = repo / "work" / "recomp_build"
+                web_dist = repo / "web" / "dist"
+                _populate_program_dir(program_dir)
+
+                # Pre-populate known-good runtime + existing side module in web/dist.
+                existing_wasm = wasm.build_valid_runtime_wasm(min_pages=512)
+                existing_js = "// known-good runtime.js\n"
+                existing_part0 = b"\x00asm\x01\x00\x00\x00GOOD_PART0"
+                _write_wasm_pair(web_dist, existing_wasm, existing_js)
+                (web_dist / "guest_part_0.wasm").write_bytes(existing_part0)
+
+                # Candidate has invalid runtime.wasm + new/updated side modules.
+                _write_wasm_pair(wasm_dir, bad_wasm, "// bad runtime.js\n")
+                (wasm_dir / "guest_part_0.wasm").write_bytes(
+                    b"\x00asm\x01\x00\x00\x00BAD_PART0"
+                )
+                (wasm_dir / "guest_part_1.wasm").write_bytes(
+                    b"\x00asm\x01\x00\x00\x00NEW_PART1"
+                )
+
+                report = sbb.stage_browser_boot(
+                    program_dir=program_dir,
+                    wasm_dir=wasm_dir,
+                    boot_dir=boot_dir,
+                    web_dist=web_dist,
+                    repo_root=repo,
+                )
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["wasm"]["status"], "refused")
+                self.assertFalse(report["wasm"]["validation"]["ok"])
+                self.assertEqual(report["wasm"]["side_modules"], [])
+                self.assertEqual(report["wasm"]["side_module_count"], 0)
+                # Existing web/dist files MUST remain untouched, and guest_part_1.wasm MUST NOT exist.
+                self.assertEqual((web_dist / "runtime.wasm").read_bytes(), existing_wasm)
+                self.assertEqual(
+                    (web_dist / "runtime.js").read_text(encoding="utf-8"),
+                    existing_js,
+                )
+                self.assertEqual(
+                    (web_dist / "guest_part_0.wasm").read_bytes(),
+                    existing_part0,
+                )
+                self.assertFalse((web_dist / "guest_part_1.wasm").exists())
+
+    def test_external_side_module_symlink_is_skipped_real_fs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            if not _can_create_symlinks(base):
+                self.skipTest("symlinks require elevated privileges on this host")
+            repo = _make_repo_skeleton(base)
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            (wasm_dir / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00OK")
+
+            outside_secret = base / "outside_secret.wasm"
+            outside_secret.write_bytes(b"\x00asm\x01\x00\x00\x00SECRET")
+            os.symlink(outside_secret, wasm_dir / "escape_side.wasm")
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["wasm"]["status"], "staged")
+            self.assertEqual(report["wasm"]["skipped_escaping_symlinks"], 1)
+            self.assertEqual(
+                [m["name"] for m in report["wasm"]["side_modules"]],
+                ["guest_part_0.wasm"],
+            )
+            self.assertTrue((web_dist / "guest_part_0.wasm").is_file())
+            self.assertFalse((web_dist / "escape_side.wasm").exists())
+
+    def test_external_side_module_symlink_guard_via_mock_runs_on_all_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _make_repo_skeleton(base)
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            (wasm_dir / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00OK")
+            (wasm_dir / "escape_side.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00FAKE")
+
+            outside_target = base / "outside_secret.wasm"
+            outside_target.write_bytes(b"\x00asm\x01\x00\x00\x00OUTSIDE")
+
+            orig_is_symlink = Path.is_symlink
+            orig_resolve = Path.resolve
+
+            def fake_is_symlink(self_path: Path) -> bool:
+                if self_path.name == "escape_side.wasm":
+                    return True
+                return orig_is_symlink(self_path)
+
+            def fake_resolve(self_path: Path, strict: bool = False) -> Path:
+                if self_path.name == "escape_side.wasm":
+                    return orig_resolve(outside_target, strict=strict)
+                return orig_resolve(self_path, strict=strict)
+
+            with (
+                mock.patch.object(Path, "is_symlink", fake_is_symlink),
+                mock.patch.object(Path, "resolve", fake_resolve),
+            ):
+                report = sbb.stage_browser_boot(
+                    program_dir=program_dir,
+                    wasm_dir=wasm_dir,
+                    boot_dir=boot_dir,
+                    web_dist=web_dist,
+                    repo_root=repo,
+                )
+
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["wasm"]["status"], "staged")
+            self.assertEqual(report["wasm"]["skipped_escaping_symlinks"], 1)
+            self.assertEqual(
+                [m["name"] for m in report["wasm"]["side_modules"]],
+                ["guest_part_0.wasm"],
+            )
+            self.assertTrue((web_dist / "guest_part_0.wasm").is_file())
+            self.assertFalse((web_dist / "escape_side.wasm").exists())
+            self.assertTrue(
+                any("escaping wasm-dir" in w for w in report["warnings"]),
+                f"expected escaping symlink warning, got {report['warnings']!r}",
+            )
+
+    def test_rejects_unsafe_side_module_names_and_traversal(self) -> None:
+        self.assertTrue(sbb.is_safe_side_module_name("guest_part_0.wasm"))
+        self.assertTrue(sbb.is_safe_side_module_name("guest-part.v2.wasm"))
+        for bad_name in (
+            "",
+            "runtime.wasm",
+            "RUNTIME.WASM",
+            "../escape.wasm",
+            "..\\escape.wasm",
+            "..evil.wasm",
+            ".hidden.wasm",
+            "guest..part.wasm",
+            "sub/part.wasm",
+            "bad name.wasm",
+            "bad;cmd.wasm",
+            "part\x00.wasm",
+        ):
+            self.assertFalse(
+                sbb.is_safe_side_module_name(bad_name),
+                f"expected unsafe name rejection for {bad_name!r}",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            (wasm_dir / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00OK")
+            (wasm_dir / "..evil.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00EVIL")
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                repo_root=repo,
+            )
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["wasm"]["status"], "refused")
+            self.assertFalse(web_dist.exists())
+            self.assertTrue(
+                any("unsafe side-module filename" in err for err in report["errors"]),
+                f"expected unsafe filename error, got {report['errors']!r}",
+            )
+
+    def test_stage_wasm_runtime_direct_refuses_tracked_web_dist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            (wasm_dir / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+
+            wasm_section, errors, _ = sbb.stage_wasm_runtime(
+                wasm_dir=wasm_dir,
+                web_dist=repo / "web",
+                repo_root=repo,
+            )
+            self.assertEqual(wasm_section["status"], "refused")
+            self.assertTrue(errors)
+            self.assertFalse((repo / "web" / "guest_part_0.wasm").exists())
+
+    def test_side_module_json_and_text_output_contain_zero_host_paths_or_raw_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="SideModSecretHost_") as tmp:
+            base = Path(tmp)
+            repo = _make_repo_skeleton(base)
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            ext_boot = base / "ext_boot_out"
+            ext_dist = base / "ext_dist_out"
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm())
+            (wasm_dir / "guest_part_0.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00PART0")
+            (wasm_dir / "guest_part_1.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00PART1")
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=ext_boot,
+                web_dist=ext_dist,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(len(report["wasm"]["side_modules"]), 2)
+            encoded = json.dumps(report)
+            rendered = sbb.format_report_text(report)
+
+            self.assertIn("guest_part_0.wasm", encoded)
+            self.assertIn("guest_part_1.wasm", encoded)
+            self.assertIn("side_modules=2", rendered)
+            self.assertIn("guest_part_0.wasm", rendered)
+            self.assertIn("guest_part_1.wasm", rendered)
+
+            for text in (encoded, rendered):
+                self.assertNotIn("SideModSecretHost_", text)
+                self.assertNotIn(str(base), text)
+                self.assertNotIn(str(base).replace("\\", "/"), text)
+                self.assertNotIn("PART0", text)
+                self.assertNotIn("PART1", text)
+                self.assertNotRegex(text, r"[A-Za-z]:[\\/]")
+                self.assertNotIn("/Users/", text)
+                self.assertNotIn("/home/", text)
+                self.assertNotIn("/tmp/", text)
+                for username in sbb._current_usernames():
+                    self.assertNotRegex(
+                        text,
+                        re.compile(
+                            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+                            re.IGNORECASE,
+                        ),
+                    )
 
 
 class TestDryRunAndCli(unittest.TestCase):

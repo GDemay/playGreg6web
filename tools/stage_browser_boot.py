@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Safe local browser real-boot artifact staging CLI (Track 5 / W51).
+"""Safe local browser real-boot artifact staging CLI (Track 5 / W51, W66).
 
 Stages allowlisted local recompilation boot artifacts (`program-manifest.json`,
 `build-manifest.json`, nested `*.pgim`) from `--program-dir` into `--boot-dir`
 (served at `/boot/` by `server/serve_local.py`), and validates + atomically
-stages `runtime.wasm` + `runtime.js` from `--wasm-dir` into `--web-dist`.
+stages `runtime.wasm`, `runtime.js`, and any sibling top-level `*.wasm`
+Emscripten side modules from `--wasm-dir` into `--web-dist`.
 
 Safety & privacy invariants:
 - Refuses to write boot artifacts into tracked repository directories
   (`--boot-dir` must be under `work/`, `local-data/`, or outside the repo).
 - Refuses to write Wasm64 runtime artifacts into tracked repository directories
   (`--web-dist` must be `web/dist` or outside the repo).
-- Skips any symlinks escaping `--program-dir` / `--wasm-dir` and never copies
-  non-allowlisted build artifacts (`.ll`, `.o`, `.cpp`, `.c`, `.h`, `.rsp`, etc.).
+- Skips any symlinks escaping `--program-dir` / `--wasm-dir`, rejects unsafe
+  side-module filenames/traversal, and never copies non-allowlisted build
+  artifacts (`.ll`, `.o`, `.cpp`, `.c`, `.h`, `.rsp`, etc.).
 - Validates `runtime.wasm` via `tools/check_wasm_exports.py` (`memory64`,
   shared memory, 5/5 `env.host_*` ABI imports) BEFORE atomically replacing
-  files in `--web-dist` (`os.replace` via same-directory temp file).
+  files (including any side-module `*.wasm` chunks) in `--web-dist`
+  (`os.replace` via same-directory temp file).
 - Strictly sanitized JSON and text output: zero Windows/POSIX/UNC host paths,
   zero usernames, and zero raw bytes.
 - Pure Python 3.12 standard library only.
@@ -48,6 +51,9 @@ DEFAULT_WEB_DIST_REL = Path("web") / "dist"
 
 RUNTIME_WASM_NAME = "runtime.wasm"
 RUNTIME_JS_NAME = "runtime.js"
+_SAFE_SIDE_MODULE_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE
+)
 
 ALLOWLISTED_MANIFEST_NAMES: frozenset[str] = frozenset(
     {
@@ -572,8 +578,110 @@ def validate_wasm_candidate(wasm_path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end staging pipeline
+# Sibling Wasm64 side-module discovery & runtime staging
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SideModuleWasm:
+    """One top-level sibling `*.wasm` side module discovered under `--wasm-dir`."""
+
+    name: str
+    source_path: Path
+
+
+@dataclass
+class SideModuleDiscovery:
+    """Result of scanning `--wasm-dir` for top-level sibling `*.wasm` side modules."""
+
+    modules: list[SideModuleWasm] = field(default_factory=list)
+    skipped_escaping_symlinks: int = 0
+    rejected_unsafe_names: list[str] = field(default_factory=list)
+
+
+def _natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
+    parts = re.split(r"(\d+)", name.lower())
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts if part)
+
+
+def is_safe_side_module_name(filename: str) -> bool:
+    """Return True only for safe top-level sibling `*.wasm` side-module filenames."""
+    if not filename or filename.lower() == RUNTIME_WASM_NAME.lower():
+        return False
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        return False
+    return _SAFE_SIDE_MODULE_NAME_RE.match(filename) is not None
+
+
+def discover_side_module_wasms(wasm_dir: Path) -> SideModuleDiscovery:
+    """Discover top-level sibling `*.wasm` side modules inside `wasm_dir`.
+
+    Excludes `runtime.wasm`, skips external/broken symlinks, ignores non-`.wasm`
+    entries and directories, and records any unsafe `.wasm` filenames or path
+    traversal attempts for explicit rejection.
+    """
+    resolved_root = wasm_dir.resolve()
+    discovery = SideModuleDiscovery()
+    seen_lower: set[str] = set()
+
+    for entry in wasm_dir.iterdir():
+        name = entry.name
+        lowered = name.lower()
+        if not lowered.endswith(".wasm"):
+            continue
+        if lowered == RUNTIME_WASM_NAME.lower():
+            continue
+
+        if not is_safe_side_module_name(name):
+            if entry.is_symlink() or not entry.is_dir():
+                discovery.rejected_unsafe_names.append(sanitize_text(name))
+            continue
+
+        if entry.is_symlink():
+            try:
+                resolved = entry.resolve(strict=True)
+            except OSError:
+                discovery.skipped_escaping_symlinks += 1
+                continue
+            if not resolved.is_relative_to(resolved_root):
+                discovery.skipped_escaping_symlinks += 1
+                continue
+            if not resolved.is_file():
+                continue
+        else:
+            if not entry.is_file():
+                continue
+            try:
+                resolved = entry.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_relative_to(resolved_root):
+                discovery.skipped_escaping_symlinks += 1
+                continue
+
+        if lowered in seen_lower:
+            discovery.rejected_unsafe_names.append(sanitize_text(name))
+            continue
+        seen_lower.add(lowered)
+        discovery.modules.append(SideModuleWasm(name=name, source_path=resolved))
+
+    discovery.modules.sort(key=lambda item: (_natural_sort_key(item.name), item.name))
+    discovery.rejected_unsafe_names.sort()
+    return discovery
+
+
+def _empty_wasm_section() -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "validation": None,
+        "copied_count": 0,
+        "planned_count": 0,
+        "unchanged_count": 0,
+        "side_module_count": 0,
+        "skipped_escaping_symlinks": 0,
+        "files": [],
+        "side_modules": [],
+    }
 
 
 def _check_file_within_root(path: Path, root: Path) -> tuple[bool, Path | None]:
@@ -588,6 +696,205 @@ def _check_file_within_root(path: Path, root: Path) -> tuple[bool, Path | None]:
     if not resolved.is_file():
         return False, None
     return True, resolved
+
+
+def stage_wasm_runtime(
+    *,
+    wasm_dir: Path | str,
+    web_dist: Path | str = DEFAULT_WEB_DIST_REL,
+    repo_root: Path | str = DEFAULT_REPO_ROOT,
+    dry_run: bool = False,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Validate `runtime.wasm` and atomically stage runtime + sibling `*.wasm` side modules."""
+    resolved_repo = Path(repo_root).resolve()
+    wasm_path = _resolve_against_repo(wasm_dir, resolved_repo)
+    web_dist_path = _resolve_against_repo(web_dist, resolved_repo)
+
+    wasm_section = _empty_wasm_section()
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    web_dist_safe, web_dist_safety_err = validate_web_dist_safety(
+        web_dist_path, resolved_repo
+    )
+    if not web_dist_safe:
+        wasm_section["status"] = "refused"
+        errors.append(web_dist_safety_err or "refused unsafe --web-dist")
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if not wasm_path.is_dir():
+        wasm_section["status"] = "skipped"
+        warnings.append("wasm-dir does not exist; skipping Wasm64 staging")
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    src_wasm_raw = wasm_path / RUNTIME_WASM_NAME
+    src_js_raw = wasm_path / RUNTIME_JS_NAME
+
+    wasm_exists_raw = src_wasm_raw.exists() or src_wasm_raw.is_symlink()
+    js_exists_raw = src_js_raw.exists() or src_js_raw.is_symlink()
+
+    if not wasm_exists_raw and not js_exists_raw:
+        wasm_section["status"] = "skipped"
+        warnings.append(
+            "wasm-dir does not contain runtime.wasm + runtime.js; skipping Wasm64 staging"
+        )
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    wasm_safe_file, resolved_wasm = _check_file_within_root(src_wasm_raw, wasm_path)
+    js_safe_file, resolved_js = _check_file_within_root(src_js_raw, wasm_path)
+
+    if wasm_exists_raw and not wasm_safe_file:
+        wasm_section["status"] = "refused"
+        errors.append(
+            "refusing runtime.wasm from wasm-dir (escaping symlink or not a regular file)"
+        )
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+    if js_exists_raw and not js_safe_file:
+        wasm_section["status"] = "refused"
+        errors.append(
+            "refusing runtime.js from wasm-dir (escaping symlink or not a regular file)"
+        )
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+    if not wasm_safe_file:
+        wasm_section["status"] = "error"
+        errors.append("runtime.wasm missing in wasm-dir alongside runtime.js")
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+    if not js_safe_file:
+        wasm_section["status"] = "error"
+        errors.append("runtime.js missing in wasm-dir alongside runtime.wasm")
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    assert resolved_wasm is not None and resolved_js is not None
+    validation = validate_wasm_candidate(resolved_wasm)
+    wasm_section["validation"] = validation
+
+    if not validation.get("ok"):
+        wasm_section["status"] = "refused"
+        val_errors = validation.get("errors") or [
+            "runtime.wasm failed Wasm64/shared/host-ABI validation"
+        ]
+        errors.append(
+            "refusing to stage runtime.wasm into web-dist (validation failed): "
+            + "; ".join(val_errors)
+        )
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    # Discover top-level sibling `*.wasm` side modules only after `runtime.wasm`
+    # passes ABI validation.
+    side_discovery = discover_side_module_wasms(wasm_path)
+    wasm_section["skipped_escaping_symlinks"] = side_discovery.skipped_escaping_symlinks
+    if side_discovery.skipped_escaping_symlinks > 0:
+        warnings.append(
+            f"skipped {side_discovery.skipped_escaping_symlinks} symlink(s) escaping wasm-dir"
+        )
+    if side_discovery.rejected_unsafe_names:
+        wasm_section["status"] = "refused"
+        errors.append(
+            "refusing unsafe side-module filename(s) in wasm-dir: "
+            + ", ".join(side_discovery.rejected_unsafe_names)
+        )
+        return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+    candidates: list[tuple[str, Path, Path, bool]] = [
+        (RUNTIME_WASM_NAME, resolved_wasm, web_dist_path / RUNTIME_WASM_NAME, False),
+        (RUNTIME_JS_NAME, resolved_js, web_dist_path / RUNTIME_JS_NAME, False),
+    ]
+    for side_mod in side_discovery.modules:
+        candidates.append(
+            (side_mod.name, side_mod.source_path, web_dist_path / side_mod.name, True)
+        )
+
+    resolved_web_dist = web_dist_path.resolve()
+    for name, _, dst_file, _ in candidates:
+        if dst_file.parent.resolve() != resolved_web_dist or dst_file.name != name:
+            wasm_section["status"] = "refused"
+            errors.append(
+                f"refused Wasm64 artifact escaping web-dist: {sanitize_text(name)}"
+            )
+            return (
+                sanitize_value(wasm_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    plans: list[tuple[str, Path, Path, bool, FileStagePlan]] = []
+    for name, src_file, dst_file, is_side_module in candidates:
+        try:
+            plan = plan_file_stage(src_file, dst_file)
+        except (OSError, StageBrowserBootError) as exc:
+            wasm_section["status"] = "error"
+            errors.append(f"failed to inspect {sanitize_text(name)}: {sanitize_text(str(exc))}")
+            return (
+                sanitize_value(wasm_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+        plans.append((name, src_file, dst_file, is_side_module, plan))
+
+    to_copy = [
+        (src_file, dst_file)
+        for _, src_file, dst_file, _, plan in plans
+        if plan.needs_copy
+    ]
+    if to_copy and not dry_run:
+        try:
+            atomic_copy_files(to_copy)
+        except OSError as exc:
+            wasm_section["status"] = "error"
+            errors.append(
+                f"failed to atomically stage Wasm64 runtime: {sanitize_text(str(exc))}"
+            )
+            return (
+                sanitize_value(wasm_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    copied = 0
+    planned = 0
+    unchanged = 0
+    file_entries: list[dict[str, Any]] = []
+    side_module_entries: list[dict[str, Any]] = []
+    for name, _, _, is_side_module, plan in plans:
+        if not plan.needs_copy:
+            unchanged += 1
+            action = "unchanged"
+        elif dry_run:
+            planned += 1
+            action = "plan_copy"
+        else:
+            copied += 1
+            action = "copied"
+        entry = {
+            "name": sanitize_text(name),
+            "action": action,
+            "reason": plan.reason,
+            "size_bytes": plan.size_bytes,
+            "sha256": plan.sha256,
+        }
+        file_entries.append(entry)
+        if is_side_module:
+            side_module_entries.append(dict(entry))
+
+    wasm_section["copied_count"] = copied
+    wasm_section["planned_count"] = planned
+    wasm_section["unchanged_count"] = unchanged
+    wasm_section["side_module_count"] = len(side_module_entries)
+    wasm_section["files"] = file_entries
+    wasm_section["side_modules"] = side_module_entries
+    if dry_run:
+        wasm_section["status"] = "planned" if planned > 0 else "unchanged"
+    elif copied > 0:
+        wasm_section["status"] = "staged"
+    else:
+        wasm_section["status"] = "unchanged"
+
+    return sanitize_value(wasm_section), sanitize_value(errors), sanitize_value(warnings)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end staging pipeline
+# ---------------------------------------------------------------------------
 
 
 def stage_browser_boot(
@@ -627,14 +934,7 @@ def stage_browser_boot(
         "total_bytes": 0,
         "artifacts": [],
     }
-    wasm_section: dict[str, Any] = {
-        "status": "skipped",
-        "validation": None,
-        "copied_count": 0,
-        "planned_count": 0,
-        "unchanged_count": 0,
-        "files": [],
-    }
+    wasm_section: dict[str, Any] = _empty_wasm_section()
 
     if not boot_safe:
         boot_section["status"] = "refused"
@@ -772,135 +1072,16 @@ def stage_browser_boot(
                 else:
                     boot_section["status"] = "unchanged"
 
-    # ---- Stage 2: Validated Wasm64 runtime (--wasm-dir -> --web-dist) ----
+    # ---- Stage 2: Validated Wasm64 runtime + side modules (--wasm-dir -> --web-dist) ----
     if wasm_path is not None:
-        if not wasm_path.is_dir():
-            wasm_section["status"] = "skipped"
-            warnings.append("wasm-dir does not exist; skipping Wasm64 staging")
-        else:
-            src_wasm_raw = wasm_path / RUNTIME_WASM_NAME
-            src_js_raw = wasm_path / RUNTIME_JS_NAME
-
-            wasm_exists_raw = src_wasm_raw.exists() or src_wasm_raw.is_symlink()
-            js_exists_raw = src_js_raw.exists() or src_js_raw.is_symlink()
-
-            if not wasm_exists_raw and not js_exists_raw:
-                wasm_section["status"] = "skipped"
-                warnings.append(
-                    "wasm-dir does not contain runtime.wasm + runtime.js; skipping Wasm64 staging"
-                )
-            else:
-                wasm_safe_file, resolved_wasm = _check_file_within_root(
-                    src_wasm_raw, wasm_path
-                )
-                js_safe_file, resolved_js = _check_file_within_root(
-                    src_js_raw, wasm_path
-                )
-
-                if wasm_exists_raw and not wasm_safe_file:
-                    wasm_section["status"] = "refused"
-                    errors.append(
-                        "refusing runtime.wasm from wasm-dir (escaping symlink or not a regular file)"
-                    )
-                elif js_exists_raw and not js_safe_file:
-                    wasm_section["status"] = "refused"
-                    errors.append(
-                        "refusing runtime.js from wasm-dir (escaping symlink or not a regular file)"
-                    )
-                elif not wasm_safe_file:
-                    wasm_section["status"] = "error"
-                    errors.append("runtime.wasm missing in wasm-dir alongside runtime.js")
-                elif not js_safe_file:
-                    wasm_section["status"] = "error"
-                    errors.append("runtime.js missing in wasm-dir alongside runtime.wasm")
-                else:
-                    assert resolved_wasm is not None and resolved_js is not None
-                    validation = validate_wasm_candidate(resolved_wasm)
-                    wasm_section["validation"] = validation
-
-                    if not validation.get("ok"):
-                        wasm_section["status"] = "refused"
-                        val_errors = validation.get("errors") or [
-                            "runtime.wasm failed Wasm64/shared/host-ABI validation"
-                        ]
-                        errors.append(
-                            "refusing to stage runtime.wasm into web-dist (validation failed): "
-                            + "; ".join(val_errors)
-                        )
-                    else:
-                        file_pairs = (
-                            (RUNTIME_WASM_NAME, resolved_wasm, web_dist_path / RUNTIME_WASM_NAME),
-                            (RUNTIME_JS_NAME, resolved_js, web_dist_path / RUNTIME_JS_NAME),
-                        )
-                        plans: list[tuple[str, Path, Path, FileStagePlan]] = []
-                        plan_failed = False
-                        for name, src_file, dst_file in file_pairs:
-                            try:
-                                plan = plan_file_stage(src_file, dst_file)
-                            except (OSError, StageBrowserBootError) as exc:
-                                plan_failed = True
-                                errors.append(
-                                    f"failed to inspect {name}: {sanitize_text(str(exc))}"
-                                )
-                                break
-                            plans.append((name, src_file, dst_file, plan))
-
-                        if plan_failed:
-                            wasm_section["status"] = "error"
-                        else:
-                            to_copy = [
-                                (src_file, dst_file)
-                                for _, src_file, dst_file, plan in plans
-                                if plan.needs_copy
-                            ]
-                            if to_copy and not dry_run:
-                                try:
-                                    atomic_copy_files(to_copy)
-                                except OSError as exc:
-                                    wasm_section["status"] = "error"
-                                    errors.append(
-                                        f"failed to atomically stage Wasm64 runtime: "
-                                        f"{sanitize_text(str(exc))}"
-                                    )
-                                    to_copy = []
-                                    plan_failed = True
-
-                            if not plan_failed:
-                                copied = 0
-                                planned = 0
-                                unchanged = 0
-                                file_entries: list[dict[str, Any]] = []
-                                for name, _, _, plan in plans:
-                                    if not plan.needs_copy:
-                                        unchanged += 1
-                                        action = "unchanged"
-                                    elif dry_run:
-                                        planned += 1
-                                        action = "plan_copy"
-                                    else:
-                                        copied += 1
-                                        action = "copied"
-                                    file_entries.append(
-                                        {
-                                            "name": name,
-                                            "action": action,
-                                            "reason": plan.reason,
-                                            "size_bytes": plan.size_bytes,
-                                            "sha256": plan.sha256,
-                                        }
-                                    )
-                                wasm_section["copied_count"] = copied
-                                wasm_section["planned_count"] = planned
-                                wasm_section["unchanged_count"] = unchanged
-                                wasm_section["files"] = file_entries
-                                if dry_run:
-                                    wasm_section["status"] = (
-                                        "planned" if planned > 0 else "unchanged"
-                                    )
-                                elif copied > 0:
-                                    wasm_section["status"] = "staged"
-                                else:
-                                    wasm_section["status"] = "unchanged"
+        wasm_section, wasm_errors, wasm_warnings = stage_wasm_runtime(
+            wasm_dir=wasm_path,
+            web_dist=web_dist_path,
+            repo_root=resolved_repo,
+            dry_run=dry_run,
+        )
+        errors.extend(wasm_errors)
+        warnings.extend(wasm_warnings)
 
     ok = len(errors) == 0
     return sanitize_value(
@@ -961,8 +1142,16 @@ def format_report_text(report: Mapping[str, Any]) -> str:
 
     wasm_status = str(wasm.get("status", "skipped")).upper()
     wasm_src = paths.get("wasm_dir") or "<none>"
+    side_modules = wasm.get("side_modules") or []
+    wasm_skipped_symlinks = int(wasm.get("skipped_escaping_symlinks", 0) or 0)
+    wasm_meta_parts: list[str] = []
+    if side_modules:
+        wasm_meta_parts.append(f"side_modules={len(side_modules)}")
+    if wasm_skipped_symlinks > 0:
+        wasm_meta_parts.append(f"skipped_symlinks={wasm_skipped_symlinks}")
+    wasm_meta = f" ({', '.join(wasm_meta_parts)})" if wasm_meta_parts else ""
     lines.append(
-        f"  Wasm64: {wasm_src} -> {paths.get('web_dist')} [{wasm_status}]"
+        f"  Wasm64: {wasm_src} -> {paths.get('web_dist')} [{wasm_status}]{wasm_meta}"
     )
     validation = wasm.get("validation")
     if isinstance(validation, Mapping):
@@ -974,10 +1163,22 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             f"host_imports={validation.get('host_imports_valid', 0)}/"
             f"{validation.get('host_imports_total', 0)}"
         )
-    for item in wasm.get("files") or []:
+    files_list = wasm.get("files") or []
+    listed_names: set[str] = set()
+    for item in files_list:
+        item_name = str(item.get("name", ""))
+        listed_names.add(item_name)
         lines.append(
             f"    [{str(item.get('action', '')).upper()}] "
-            f"{item.get('name')} ({item.get('size_bytes')} bytes, {item.get('reason')})"
+            f"{item_name} ({item.get('size_bytes')} bytes, {item.get('reason')})"
+        )
+    for item in side_modules:
+        item_name = str(item.get("name", ""))
+        if item_name in listed_names:
+            continue
+        lines.append(
+            f"    [{str(item.get('action', '')).upper()}] "
+            f"{item_name} ({item.get('size_bytes')} bytes, {item.get('reason')})"
         )
 
     warnings = report.get("warnings") or []
@@ -999,7 +1200,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Safely stage allowlisted local recomp boot artifacts (.pgim + manifests) "
-            "and validated Wasm64 runtime.{wasm,js} for server/serve_local.py."
+            "and validated Wasm64 runtime.{wasm,js} plus sibling *.wasm side modules "
+            "for server/serve_local.py."
         )
     )
     parser.add_argument(
@@ -1012,7 +1214,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--wasm-dir",
         type=Path,
         default=None,
-        help="Optional directory containing runtime.wasm + runtime.js (e.g. work/wasm_guest_dist).",
+        help=(
+            "Optional directory containing runtime.wasm, runtime.js, and any "
+            "sibling *.wasm side modules (e.g. work/wasm_guest_dist)."
+        ),
     )
     parser.add_argument(
         "--boot-dir",
