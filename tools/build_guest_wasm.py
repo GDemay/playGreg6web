@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -17,6 +17,8 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--jobs N] [--cache-dir work/wasm_obj_cache] [--out-dir web/dist]
         [--opt O0|O1|O2|O3|Os|Oz] [--runtime-lib path/to/libplaygta6_core.a]
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
+        [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
+        [--assertions 0|1] [--browser-boot-exports]
         [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
@@ -110,6 +112,22 @@ STRIP_LINK_FLAGS: tuple[str, ...] = (
 )
 PTHREAD_POOL_SIZE_PREFIX = "-sPTHREAD_POOL_SIZE="
 LINK_OPT_LEVELS: frozenset[str] = frozenset({"Os", "Oz"})
+WASM_EXCEPTIONS_FLAG = "-fwasm-exceptions"
+INITIAL_MEMORY_PREFIX = "-sINITIAL_MEMORY="
+STACK_SIZE_PREFIX = "-sSTACK_SIZE="
+DEFAULT_PTHREAD_STACK_SIZE_PREFIX = "-sDEFAULT_PTHREAD_STACK_SIZE="
+ASSERTIONS_PREFIX = "-sASSERTIONS="
+BROWSER_BOOT_INCOMING_MODULE_JS_API = (
+    "locateFile,instantiateWasm,mainScriptUrlOrBlob,print,printErr,"
+    "preRun,onRuntimeInitialized,noInitialRun,setStatus,onExit"
+)
+BROWSER_BOOT_EXPORTED_RUNTIME_METHODS = (
+    "wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
+)
+BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
+    f"-sINCOMING_MODULE_JS_API={BROWSER_BOOT_INCOMING_MODULE_JS_API}",
+    f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}",
+)
 
 # Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
@@ -121,6 +139,8 @@ VERIFY_FLAGS: tuple[str, ...] = (
 )
 
 OPT_LEVELS: frozenset[str] = frozenset({"O0", "O1", "O2", "O3", "Os", "Oz"})
+
+_SIZE_TOKEN_RE = re.compile(r"^([0-9]+)([A-Za-z]*)$")
 
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
@@ -258,6 +278,11 @@ class BuildReport:
     exceeds_v8_1gib_limit: bool = False
     no_link_opt: bool = False
     shrink_largest_shards: int = 0
+    wasm_exceptions: bool = False
+    initial_memory: str | None = None
+    stack_size: str | None = None
+    assertions: int | None = None
+    browser_boot_exports: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,6 +294,11 @@ class BuildReport:
             "opt": self.opt,
             "no_link_opt": self.no_link_opt,
             "shrink_largest_shards": self.shrink_largest_shards,
+            "wasm_exceptions": self.wasm_exceptions,
+            "initial_memory": self.initial_memory,
+            "stack_size": self.stack_size,
+            "assertions": self.assertions,
+            "browser_boot_exports": self.browser_boot_exports,
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -507,6 +537,28 @@ def parse_opt_level(raw: str) -> str:
     raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, O3, Os, or Oz")
 
 
+def parse_size_token(raw: str, *, flag_name: str) -> str:
+    if not isinstance(raw, str):
+        raise BuildGuestWasmError(
+            f"invalid {flag_name} {raw!r}; expected non-empty positive alphanumeric size token (e.g. 64MB)"
+        )
+    token = raw.strip()
+    match = _SIZE_TOKEN_RE.match(token)
+    if match is None or int(match.group(1)) <= 0:
+        raise BuildGuestWasmError(
+            f"invalid {flag_name} {raw!r}; expected non-empty positive alphanumeric size token (e.g. 64MB, 8MB, 8388608)"
+        )
+    return token
+
+
+def parse_assertions(raw: int | None) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw not in (0, 1):
+        raise BuildGuestWasmError(f"invalid --assertions {raw!r}; expected 0 or 1")
+    return raw
+
+
 def retarget_wasm64_ir(text: str) -> str:
     """Normalize lifted wasm64 LLVM IR for Emscripten 7 / LLVM 24 `emcc`.
 
@@ -538,6 +590,7 @@ def compile_flags_for(
     kind: str,
     include_dirs: Sequence[Path] = (),
     extra_flags: Sequence[str] = (),
+    wasm_exceptions: bool = False,
 ) -> tuple[str, ...]:
     flags: list[str] = [*COMPILE_WASM_FLAGS, f"-{opt}"]
     flags.extend(extra_flags)
@@ -547,6 +600,8 @@ def compile_flags_for(
         flags.extend(["-x", "ir"])
     elif kind == "cpp":
         flags.append("-std=c++20")
+        if wasm_exceptions and WASM_EXCEPTIONS_FLAG not in flags:
+            flags.append(WASM_EXCEPTIONS_FLAG)
     flags.append("-c")
     if kind != "ll":
         for include in include_dirs:
@@ -935,11 +990,27 @@ def resolve_link_flags(
     pthread_pool_size: int | None = None,
     extra_link_flags: Sequence[str] = (),
     no_link_opt: bool = False,
+    wasm_exceptions: bool = False,
+    initial_memory: str | None = None,
+    stack_size: str | None = None,
+    assertions: int | None = None,
+    browser_boot_exports: bool = False,
 ) -> tuple[str, ...]:
     """Compute effective linker flags for em++ from defaults and build options."""
     if pthread_pool_size is not None:
         if isinstance(pthread_pool_size, bool) or pthread_pool_size < 1:
             raise BuildGuestWasmError("--pthread-pool-size must be >= 1")
+    initial_memory_token = (
+        parse_size_token(initial_memory, flag_name="--initial-memory")
+        if initial_memory is not None
+        else None
+    )
+    stack_size_token = (
+        parse_size_token(stack_size, flag_name="--stack-size")
+        if stack_size is not None
+        else None
+    )
+    assertions_val = parse_assertions(assertions)
 
     flags: list[str] = []
     replaced_pool = False
@@ -957,10 +1028,38 @@ def resolve_link_flags(
         if opt_flag not in flags:
             flags.append(opt_flag)
 
+    if wasm_exceptions and WASM_EXCEPTIONS_FLAG not in flags:
+        flags.append(WASM_EXCEPTIONS_FLAG)
+
+    if initial_memory_token is not None:
+        init_mem_flag = f"{INITIAL_MEMORY_PREFIX}{initial_memory_token}"
+        if init_mem_flag not in flags:
+            flags.append(init_mem_flag)
+
+    if stack_size_token is not None:
+        for stack_flag in (
+            f"{STACK_SIZE_PREFIX}{stack_size_token}",
+            f"{DEFAULT_PTHREAD_STACK_SIZE_PREFIX}{stack_size_token}",
+        ):
+            if stack_flag not in flags:
+                flags.append(stack_flag)
+
+    if browser_boot_exports:
+        for export_flag in BROWSER_BOOT_EXPORT_LINK_FLAGS:
+            if export_flag not in flags:
+                flags.append(export_flag)
+
     if strip:
         for strip_flag in STRIP_LINK_FLAGS:
+            if assertions_val is not None and strip_flag.startswith(ASSERTIONS_PREFIX):
+                continue
             if strip_flag not in flags:
                 flags.append(strip_flag)
+
+    if assertions_val is not None:
+        assertions_flag = f"{ASSERTIONS_PREFIX}{assertions_val}"
+        if assertions_flag not in flags:
+            flags.append(assertions_flag)
 
     for extra in extra_link_flags:
         if extra:
@@ -1002,6 +1101,11 @@ def build_link_argv(
     strip: bool = False,
     pthread_pool_size: int | None = None,
     no_link_opt: bool = False,
+    wasm_exceptions: bool = False,
+    initial_memory: str | None = None,
+    stack_size: str | None = None,
+    assertions: int | None = None,
+    browser_boot_exports: bool = False,
 ) -> tuple[str, ...]:
     if link_flags is None:
         effective_flags = resolve_link_flags(
@@ -1010,6 +1114,11 @@ def build_link_argv(
             pthread_pool_size=pthread_pool_size,
             extra_link_flags=extra_flags,
             no_link_opt=no_link_opt,
+            wasm_exceptions=wasm_exceptions,
+            initial_memory=initial_memory,
+            stack_size=stack_size,
+            assertions=assertions,
+            browser_boot_exports=browser_boot_exports,
         )
     else:
         effective_flags = (*link_flags, *extra_flags)
@@ -1275,6 +1384,11 @@ def run_build(
     guest_boot_entry: Path | None = None,
     no_link_opt: bool = False,
     shrink_largest_shards: int = 0,
+    wasm_exceptions: bool = False,
+    initial_memory: str | None = None,
+    stack_size: str | None = None,
+    assertions: int | None = None,
+    browser_boot_exports: bool = False,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -1285,12 +1399,28 @@ def run_build(
         raise BuildGuestWasmError("--sample must be >= 0")
     if isinstance(shrink_largest_shards, bool) or shrink_largest_shards < 0:
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
+    initial_memory_token = (
+        parse_size_token(initial_memory, flag_name="--initial-memory")
+        if initial_memory is not None
+        else None
+    )
+    stack_size_token = (
+        parse_size_token(stack_size, flag_name="--stack-size")
+        if stack_size is not None
+        else None
+    )
+    assertions_val = parse_assertions(assertions)
     effective_link_flags = resolve_link_flags(
         opt=opt_level,
         strip=strip,
         pthread_pool_size=pthread_pool_size,
         extra_link_flags=extra_link_flags,
         no_link_opt=no_link_opt,
+        wasm_exceptions=wasm_exceptions,
+        initial_memory=initial_memory_token,
+        stack_size=stack_size_token,
+        assertions=assertions_val,
+        browser_boot_exports=browser_boot_exports,
     )
 
     runner = run_command or default_run_command
@@ -1315,6 +1445,11 @@ def run_build(
         sample=sample,
         no_link_opt=no_link_opt,
         shrink_largest_shards=shrink_largest_shards,
+        wasm_exceptions=wasm_exceptions,
+        initial_memory=initial_memory_token,
+        stack_size=stack_size_token,
+        assertions=assertions_val,
+        browser_boot_exports=browser_boot_exports,
     )
 
     if not toolchain.ok:
@@ -1406,6 +1541,7 @@ def run_build(
             kind=unit.kind,
             include_dirs=include_dirs,
             extra_flags=extra,
+            wasm_exceptions=wasm_exceptions,
         )
         content = unit.path.read_bytes()
         key = cache_key_for(content, flags, kind=unit.kind)
@@ -1573,6 +1709,19 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append("  No link opt: yes (skipping link-time -Os/-Oz wasm-opt)")
     if report.shrink_largest_shards:
         lines.append(f"  Shrink largest shards: {report.shrink_largest_shards} (compiled at -Oz)")
+    if report.wasm_exceptions:
+        lines.append("  Wasm exceptions: yes (-fwasm-exceptions on C++ units and link)")
+    if report.initial_memory:
+        lines.append(f"  Initial memory: {report.initial_memory}")
+    if report.stack_size:
+        lines.append(
+            f"  Stack size: {report.stack_size} "
+            f"(-sSTACK_SIZE={report.stack_size} -sDEFAULT_PTHREAD_STACK_SIZE={report.stack_size})"
+        )
+    if report.assertions is not None:
+        lines.append(f"  Assertions: {report.assertions} (-sASSERTIONS={report.assertions})")
+    if report.browser_boot_exports:
+        lines.append("  Browser boot exports: yes")
     if report.response_file:
         lines.append(f"  Response file: @{report.response_file}")
     if report.sample:
@@ -1700,6 +1849,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Compile the top-N largest .ll shards at -Oz instead of --opt (must be >= 0; "
             "no-op when --opt is already Oz)."
+        ),
+    )
+    parser.add_argument(
+        "--wasm-exceptions",
+        action="store_true",
+        help=(
+            "Enable native Wasm C++ exceptions (-fwasm-exceptions) on C++ translation units "
+            "and on the em++ link line (never applied to .ll IR shards)."
+        ),
+    )
+    parser.add_argument(
+        "--initial-memory",
+        default=None,
+        metavar="SIZE",
+        help="Pass -sINITIAL_MEMORY=SIZE on the link line (e.g. 64MB).",
+    )
+    parser.add_argument(
+        "--stack-size",
+        default=None,
+        metavar="SIZE",
+        help=(
+            "Pass both -sSTACK_SIZE=SIZE and -sDEFAULT_PTHREAD_STACK_SIZE=SIZE on the link "
+            "line (e.g. 8MB)."
+        ),
+    )
+    parser.add_argument(
+        "--assertions",
+        type=int,
+        default=None,
+        metavar="0|1",
+        help=(
+            "Explicitly set -sASSERTIONS=0 or -sASSERTIONS=1 on the link line "
+            "(overrides --strip's -sASSERTIONS=0 when set)."
+        ),
+    )
+    parser.add_argument(
+        "--browser-boot-exports",
+        action="store_true",
+        help=(
+            "Export Emscripten 7.0.1 incoming Module JS API and runtime methods required by "
+            "web/loader.js for browser boot."
         ),
     )
     parser.add_argument(
@@ -1857,6 +2047,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             guest_boot_entry=guest_boot_entry,
             no_link_opt=args.no_link_opt,
             shrink_largest_shards=args.shrink_largest_shards,
+            wasm_exceptions=args.wasm_exceptions,
+            initial_memory=args.initial_memory,
+            stack_size=args.stack_size,
+            assertions=args.assertions,
+            browser_boot_exports=args.browser_boot_exports,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)
