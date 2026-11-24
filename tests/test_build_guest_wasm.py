@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R31)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31)."""
 
 from __future__ import annotations
 
@@ -3257,6 +3257,580 @@ class TestSplitModules(unittest.TestCase):
                 link,
             )
             self.assertNotIn("dynamicLibraries", " ".join(link))
+
+
+class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
+    """R30: NODE_OPTIONS heap scaling for split-module links & sibling C/C++ header hashing."""
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    def test_build_link_env_scaling_merging_and_validation(self) -> None:
+        # split_modules=1 with no explicit override leaves NODE_OPTIONS unset or untouched.
+        base_empty = {"PATH": "/usr/bin"}
+        env_single = bgw.build_link_env(base_empty, split_modules=1)
+        self.assertNotIn("NODE_OPTIONS", env_single)
+        self.assertEqual(env_single, base_empty)
+        self.assertIsNot(env_single, base_empty)
+
+        base_flags = {"NODE_OPTIONS": "--trace-warnings --no-deprecation"}
+        env_single_flags = bgw.build_link_env(base_flags, split_modules=1)
+        self.assertEqual(env_single_flags["NODE_OPTIONS"], "--trace-warnings --no-deprecation")
+
+        # split_modules > 1 auto-sets --max-old-space-size=16384 when absent.
+        env_split = bgw.build_link_env(base_empty, split_modules=4)
+        self.assertEqual(env_split["NODE_OPTIONS"], "--max-old-space-size=16384")
+        self.assertNotIn("NODE_OPTIONS", base_empty)  # original dict not mutated
+
+        # split_modules > 1 merges without clobbering existing NODE_OPTIONS flags.
+        env_split_merged = bgw.build_link_env(base_flags, split_modules=4)
+        self.assertEqual(
+            env_split_merged["NODE_OPTIONS"],
+            "--trace-warnings --no-deprecation --max-old-space-size=16384",
+        )
+
+        # Whitespace-only NODE_OPTIONS gets clean flag with no leading spaces.
+        env_split_ws = bgw.build_link_env({"NODE_OPTIONS": "   "}, split_modules=2)
+        self.assertEqual(env_split_ws["NODE_OPTIONS"], "--max-old-space-size=16384")
+
+        # Existing --max-old-space-size (equals, space, or underscore form) is respected when unset.
+        for existing_opt in (
+            "--max-old-space-size=8192",
+            "--trace-warnings --max-old-space-size=8192 --no-warnings",
+            "--trace-warnings --max-old-space-size 8192",
+            "--max_old_space_size=8192",
+        ):
+            env_respected = bgw.build_link_env(
+                {"NODE_OPTIONS": existing_opt},
+                split_modules=4,
+            )
+            self.assertEqual(env_respected["NODE_OPTIONS"], existing_opt)
+
+        # Explicit node_max_old_space_mb overrides existing --max-old-space-size while preserving
+        # all other flags (including Windows paths with backslashes and quoted spaces).
+        existing_complex = (
+            '--trace-warnings --max-old-space-size=4096 --require "C:\\Program Files\\hook.js"'
+        )
+        env_override = bgw.build_link_env(
+            {"NODE_OPTIONS": existing_complex},
+            split_modules=4,
+            node_max_old_space_mb=24576,
+        )
+        self.assertEqual(
+            env_override["NODE_OPTIONS"],
+            '--trace-warnings --require "C:\\Program Files\\hook.js" --max-old-space-size=24576',
+        )
+
+        # Explicit node_max_old_space_mb also works for split_modules=1 and space-separated forms.
+        env_single_explicit = bgw.build_link_env(
+            {"NODE_OPTIONS": "--max-old-space-size 4096 --trace-warnings"},
+            split_modules=1,
+            node_max_old_space_mb=12288,
+        )
+        self.assertEqual(
+            env_single_explicit["NODE_OPTIONS"],
+            "--trace-warnings --max-old-space-size=12288",
+        )
+        env_single_fresh = bgw.build_link_env({}, split_modules=1, node_max_old_space_mb=12288)
+        self.assertEqual(env_single_fresh["NODE_OPTIONS"], "--max-old-space-size=12288")
+
+        # Invalid values raise BuildGuestWasmError.
+        for bad in (0, -1, -16384, True, False, "16384", 1.5):
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"mb={bad!r}"):
+                bgw.build_link_env({}, split_modules=4, node_max_old_space_mb=bad)  # type: ignore[arg-type]
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.build_link_env({}, split_modules=0)
+
+    def test_main_module_link_receives_scaled_node_options_env(self) -> None:
+        class EnvCapturingRunner(RecordingRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.link_envs: list[dict[str, str] | None] = []
+                self.side_link_envs: list[dict[str, str] | None] = []
+
+            def __call__(
+                self,
+                argv: Sequence[str],
+                *,
+                env: dict[str, str] | None = None,
+            ) -> bgw.CommandResult:
+                tokens = tuple(str(a) for a in argv)
+                is_side = bgw.SIDE_MODULE_FLAG in tokens
+                is_main_link = "-lexports.js" in tokens
+                if is_side:
+                    self.side_link_envs.append(dict(env) if env is not None else None)
+                elif is_main_link:
+                    self.link_envs.append(dict(env) if env is not None else None)
+                return super().__call__(argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            cache = root / "cache"
+
+            # 1) split_modules=3 with existing unrelated NODE_OPTIONS auto-merges 16384.
+            runner_split = EnvCapturingRunner()
+            report_split = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-split",
+                jobs=2,
+                split_modules=3,
+                env={"NODE_OPTIONS": "--trace-warnings", "KEEP_ME": "yes"},
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_split,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_split.ok, report_split.errors)
+            self.assertEqual(report_split.node_max_old_space_mb, 16384)
+            self.assertEqual(len(runner_split.link_envs), 1)
+            link_env = runner_split.link_envs[0]
+            assert link_env is not None
+            self.assertEqual(link_env["KEEP_ME"], "yes")
+            self.assertEqual(
+                link_env["NODE_OPTIONS"],
+                "--trace-warnings --max-old-space-size=16384",
+            )
+            # Side module links (3 shard buckets + 1 registration side module) do not get main-module env override.
+            self.assertEqual(len(runner_split.side_link_envs), 4)
+            self.assertTrue(all(e is None for e in runner_split.side_link_envs))
+
+            # 2) split_modules=3 respects existing --max-old-space-size in env.
+            runner_respect = EnvCapturingRunner()
+            report_respect = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-respect",
+                jobs=2,
+                split_modules=3,
+                env={"NODE_OPTIONS": "--max-old-space-size=8192"},
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_respect,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_respect.ok, report_respect.errors)
+            self.assertIsNone(report_respect.node_max_old_space_mb)
+            assert runner_respect.link_envs[0] is not None
+            self.assertEqual(
+                runner_respect.link_envs[0]["NODE_OPTIONS"],
+                "--max-old-space-size=8192",
+            )
+
+            # 3) Explicit node_max_old_space_mb overrides existing NODE_OPTIONS value.
+            runner_override = EnvCapturingRunner()
+            report_override = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-override",
+                jobs=2,
+                split_modules=3,
+                node_max_old_space_mb=20480,
+                env={"NODE_OPTIONS": "--trace-warnings --max-old-space-size=8192"},
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_override,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_override.ok, report_override.errors)
+            self.assertEqual(report_override.node_max_old_space_mb, 20480)
+            assert runner_override.link_envs[0] is not None
+            self.assertEqual(
+                runner_override.link_envs[0]["NODE_OPTIONS"],
+                "--trace-warnings --max-old-space-size=20480",
+            )
+
+            # 4) split_modules=1 leaves NODE_OPTIONS unset unless explicitly requested.
+            runner_single = EnvCapturingRunner()
+            report_single = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-single",
+                out_dir=root / "dist-single",
+                jobs=2,
+                split_modules=1,
+                env={"KEEP_ME": "1"},
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_single,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_single.ok, report_single.errors)
+            self.assertIsNone(report_single.node_max_old_space_mb)
+            assert runner_single.link_envs[0] is not None
+            self.assertNotIn("NODE_OPTIONS", runner_single.link_envs[0])
+
+            runner_single_explicit = EnvCapturingRunner()
+            report_single_explicit = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-single",
+                out_dir=root / "dist-single-explicit",
+                jobs=2,
+                split_modules=1,
+                node_max_old_space_mb=10240,
+                env={"KEEP_ME": "1"},
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_single_explicit,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_single_explicit.ok, report_single_explicit.errors)
+            self.assertEqual(report_single_explicit.node_max_old_space_mb, 10240)
+            assert runner_single_explicit.link_envs[0] is not None
+            self.assertEqual(
+                runner_single_explicit.link_envs[0]["NODE_OPTIONS"],
+                "--max-old-space-size=10240",
+            )
+
+            # 5) Legacy 1-arg runner remains 100% compatible.
+            legacy_runner = RecordingRunner()
+            report_legacy = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-legacy",
+                jobs=2,
+                split_modules=3,
+                node_max_old_space_mb=16384,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=legacy_runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_legacy.ok, report_legacy.errors)
+            self.assertEqual(len(legacy_runner.link_calls), 1)
+
+    def test_default_run_command_passes_env_to_subprocess(self) -> None:
+        custom_env = dict(os.environ)
+        custom_env["NODE_OPTIONS"] = "--max-old-space-size=16384"
+        res = bgw.default_run_command(
+            [sys.executable, "-c", "import os; print(os.environ.get('NODE_OPTIONS', ''))"],
+            env=custom_env,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "--max-old-space-size=16384")
+
+    def test_node_max_old_space_mb_cli_flags_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+
+            old_node_opts = os.environ.pop("NODE_OPTIONS", None)
+            try:
+                # Auto-scaled to 16384 for --split-modules 4.
+                code, out, err = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--json",
+                        "--split-modules",
+                        "4",
+                        "--repo-root",
+                        str(repo),
+                        "--cache-dir",
+                        str(root / "cache1"),
+                        "--out-dir",
+                        str(root / "dist1"),
+                    ]
+                )
+                self.assertEqual(code, 0, err)
+                payload = json.loads(out)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["node_max_old_space_mb"], 16384)
+
+                # Untouched (None) for default --split-modules 1.
+                code_single, out_single, err_single = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--json",
+                        "--repo-root",
+                        str(repo),
+                        "--cache-dir",
+                        str(root / "cache2"),
+                        "--out-dir",
+                        str(root / "dist2"),
+                    ]
+                )
+                self.assertEqual(code_single, 0, err_single)
+                self.assertIsNone(json.loads(out_single)["node_max_old_space_mb"])
+
+                # Explicit --node-max-old-space-mb sets JSON & text output.
+                code_exp, out_exp, err_exp = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--json",
+                        "--split-modules",
+                        "4",
+                        "--node-max-old-space-mb",
+                        "24576",
+                        "--repo-root",
+                        str(repo),
+                        "--cache-dir",
+                        str(root / "cache3"),
+                        "--out-dir",
+                        str(root / "dist3"),
+                    ]
+                )
+                self.assertEqual(code_exp, 0, err_exp)
+                self.assertEqual(json.loads(out_exp)["node_max_old_space_mb"], 24576)
+
+                code_txt, out_txt, err_txt = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--sanitize",
+                        "--node-max-old-space-mb",
+                        "12288",
+                        "--repo-root",
+                        str(repo),
+                        "--cache-dir",
+                        str(root / "cache4"),
+                        "--out-dir",
+                        str(root / "dist4"),
+                    ]
+                )
+                self.assertEqual(code_txt, 0, err_txt)
+                self.assertIn("Node max old space: 12288 MB", out_txt)
+                self.assertIn("--max-old-space-size=12288", out_txt)
+
+                # Invalid values exit with code 2.
+                for bad_cli in ("0", "-512"):
+                    bad_code, bad_out, _bad_err = _run_cli(
+                        [
+                            str(src),
+                            "--dry-run",
+                            "--json",
+                            "--node-max-old-space-mb",
+                            bad_cli,
+                            "--repo-root",
+                            str(repo),
+                        ]
+                    )
+                    self.assertEqual(bad_code, 2, bad_out)
+                    bad_payload = json.loads(bad_out)
+                    self.assertFalse(bad_payload["ok"])
+                    self.assertTrue(
+                        any("node-max-old-space-mb" in e for e in bad_payload["errors"])
+                    )
+            finally:
+                if old_node_opts is not None:
+                    os.environ["NODE_OPTIONS"] = old_node_opts
+
+    def test_sibling_header_changes_invalidate_cpp_and_c_while_ll_keys_stay_unchanged(self) -> None:
+        # Direct cache_key_for backwards compatibility with extra_fingerprint.
+        cpp_flags = bgw.compile_flags_for(opt="O2", kind="cpp")
+        ll_flags = bgw.compile_flags_for(opt="O2", kind="ll")
+        base_cpp_key = bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp")
+        self.assertEqual(
+            base_cpp_key,
+            bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp", extra_fingerprint=b""),
+        )
+        fp_key_a = bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp", extra_fingerprint=b"hdr-a")
+        fp_key_b = bgw.cache_key_for(b"int x = 1;\n", cpp_flags, kind="cpp", extra_fingerprint=b"hdr-b")
+        self.assertNotEqual(base_cpp_key, fp_key_a)
+        self.assertNotEqual(fp_key_a, fp_key_b)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            # Add sibling headers matching real R9/R12 layout + a .hpp + a .c unit + stray .h next to .ll.
+            seam_h = src / "main" / "stubs" / "pg6_guest_seam.h"
+            _write(seam_h, "#pragma once\n// v1\n")
+            _write(src / "main" / "stubs" / "pg6_import_thunks.h", "#pragma once\nvoid thunk_main();\n")
+            export_hpp = src / "exports" / "pg6_export_thunks.hpp"
+            _write(export_hpp, "#pragma once\n// export v1\n")
+            helper_c = _write(src / "c_helpers" / "helper.c", "int helper(void) { return 1; }\n")
+            helper_h = _write(src / "c_helpers" / "helper.h", "#pragma once\n#define HELPER_VAL 1\n")
+            # Subdirectory ending in .h must be ignored.
+            (src / "main" / "stubs" / "dir.h").mkdir(parents=True, exist_ok=True)
+            # Stray header inside .ll shard directory must NEVER affect .ll cache keys.
+            stray_ll_h = _write(src / "main" / "lift" / "stray.h", "#pragma once\n// v1\n")
+            # Ensure helper.c is discovered via program-manifest.json too.
+            manifest_path = src / "program-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"].append({"path": "c_helpers/helper.c"})
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            # Verify sibling_headers_fingerprint returns b"" when directory has no headers.
+            no_hdr_cpp = _write(root / "isolated" / "plain.cpp", "int plain() { return 0; }\n")
+            self.assertEqual(bgw.sibling_headers_fingerprint(no_hdr_cpp), b"")
+            self.assertTrue(len(bgw.sibling_headers_fingerprint(helper_c)) > 0)
+
+            cache = root / "cache"
+            # Step 1: Warm the cache.
+            runner1 = RecordingRunner()
+            first = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist1",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner1,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(first.ok, first.errors)
+            self.assertEqual(first.cache_hits, 0)
+            self.assertEqual(first.cache_misses, len(first.sources))
+            first_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+
+            # Verify every .ll shard cache key matches bare cache_key_for(..., kind="ll") exactly!
+            for item in first.sources:
+                if item.unit.kind == "ll":
+                    expected_ll_key = bgw.cache_key_for(
+                        item.unit.path.read_bytes(),
+                        ll_flags,
+                        kind="ll",
+                    )
+                    self.assertEqual(item.cache_key, expected_ll_key, item.unit.unit_id)
+
+            # Step 2: Unchanged rebuild -> 100% cache hits.
+            runner2 = RecordingRunner()
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist2",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner2,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second.cache_hits, len(second.sources))
+            self.assertEqual(second.cache_misses, 0)
+            self.assertEqual(runner2.compile_calls, [])
+
+            # Step 3: Update main/stubs/pg6_guest_seam.h -> ONLY main/stubs/pg6_import_thunks.cpp misses!
+            _write(seam_h, "#pragma once\n// v2 updated seam signature\n")
+            runner3 = RecordingRunner()
+            third = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist3",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner3,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(third.ok, third.errors)
+            self.assertEqual(third.cache_misses, 1)
+            self.assertEqual(third.cache_hits, len(third.sources) - 1)
+            self.assertEqual(len(runner3.compile_calls), 1)
+            for item in third.sources:
+                if item.unit.unit_id == "main/stubs/pg6_import_thunks.cpp":
+                    self.assertEqual(item.status, "compiled")
+                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+                else:
+                    self.assertEqual(item.status, "hit", item.unit.unit_id)
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+            # Step 4: Update exports/pg6_export_thunks.hpp -> ONLY exports/pg6_export_thunks.cpp misses!
+            _write(export_hpp, "#pragma once\n// export v2\n")
+            runner4 = RecordingRunner()
+            fourth = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist4",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner4,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(fourth.ok, fourth.errors)
+            self.assertEqual(fourth.cache_misses, 1)
+            compiled_ids_4 = [u.unit.unit_id for u in fourth.sources if u.status == "compiled"]
+            self.assertEqual(compiled_ids_4, ["exports/pg6_export_thunks.cpp"])
+
+            # Step 5: Update c_helpers/helper.h -> ONLY c_helpers/helper.c misses!
+            _write(helper_h, "#pragma once\n#define HELPER_VAL 2\n")
+            runner5 = RecordingRunner()
+            fifth = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist5",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner5,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(fifth.ok, fifth.errors)
+            self.assertEqual(fifth.cache_misses, 1)
+            compiled_ids_5 = [u.unit.unit_id for u in fifth.sources if u.status == "compiled"]
+            self.assertEqual(compiled_ids_5, ["c_helpers/helper.c"])
+
+            # Step 6: Modify stray header inside main/lift/ -> ZERO misses, .ll cache keys unchanged!
+            _write(stray_ll_h, "#pragma once\n// v2 modified next to .ll\n")
+            _write(src / "main" / "lift" / "added.hpp", "#pragma once\n")
+            runner6 = RecordingRunner()
+            sixth = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist6",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner6,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(sixth.ok, sixth.errors)
+            self.assertEqual(sixth.cache_misses, 0)
+            self.assertEqual(sixth.cache_hits, len(sixth.sources))
+            self.assertEqual(runner6.compile_calls, [])
+            for item in sixth.sources:
+                if item.unit.kind == "ll":
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+            # Step 7: Direct compile_unit() also respects sibling header invalidation.
+            unit = bgw.SourceUnit(
+                unit_id="main/stubs/pg6_import_thunks.cpp",
+                path=src / "main" / "stubs" / "pg6_import_thunks.cpp",
+                kind="cpp",
+                module="main",
+            )
+            direct_flags = bgw.compile_flags_for(opt="O2", kind="cpp")
+            direct_cache = root / "direct-cache"
+            r_dir_1 = bgw.compile_unit(
+                unit,
+                compiler=Path("em++"),
+                flags=direct_flags,
+                cache_dir=direct_cache,
+                dry_run=False,
+                run_command=RecordingRunner(),
+            )
+            self.assertEqual(r_dir_1.status, "compiled")
+            r_dir_2 = bgw.compile_unit(
+                unit,
+                compiler=Path("em++"),
+                flags=direct_flags,
+                cache_dir=direct_cache,
+                dry_run=False,
+                run_command=RecordingRunner(),
+            )
+            self.assertEqual(r_dir_2.status, "hit")
+            _write(seam_h, "#pragma once\n// v3 direct compile_unit check\n")
+            r_dir_3 = bgw.compile_unit(
+                unit,
+                compiler=Path("em++"),
+                flags=direct_flags,
+                cache_dir=direct_cache,
+                dry_run=False,
+                run_command=RecordingRunner(),
+            )
+            self.assertEqual(r_dir_3.status, "compiled")
+            self.assertNotEqual(r_dir_1.cache_key, r_dir_3.cache_key)
 
 
 class TestLinkFlagContract(unittest.TestCase):
