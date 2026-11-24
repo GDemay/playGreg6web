@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
 `program-manifest.json`, compiles dirty shards in parallel with `emcc`/`em++`, caches
 `.o` files by SHA-256 of content + compiler flags (plus sibling `.h`/`.hpp` headers for
 C/C++ units), and links with `libplaygta6_core.a` into `web/dist/runtime.js` +
-`web/dist/runtime.wasm` (optionally splitting `.ll` shards across `guest_part_*.wasm`
-`-sSIDE_MODULE=1` modules with `-fPIC` and `-sMAIN_MODULE=2`).
+`web/dist/runtime.wasm` (optionally splitting `.ll` shards and `functions.ll`
+registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC`,
+`-sMAIN_MODULE=1`, filtered whole-archive, and runtime `Module.dynamicLibraries` loading).
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -125,6 +126,9 @@ BROWSER_BOOT_INCOMING_MODULE_JS_API = (
     "locateFile,instantiateWasm,mainScriptUrlOrBlob,print,printErr,"
     "preRun,onRuntimeInitialized,noInitialRun,setStatus,onExit"
 )
+SPLIT_INCOMING_MODULE_JS_API = (
+    f"{BROWSER_BOOT_INCOMING_MODULE_JS_API},dynamicLibraries"
+)
 BROWSER_BOOT_EXPORTED_RUNTIME_METHODS = (
     "wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
 )
@@ -136,10 +140,15 @@ BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
 # Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
 
-# Split-module dynamic linking (R28): -fPIC + -sMAIN_MODULE=2 + -sSIDE_MODULE=1.
+# Split-module dynamic linking (R28/R31): -fPIC + -sMAIN_MODULE=1 + -sSIDE_MODULE=1,
+# with registration tables in an extra side module, filtered whole-archive runtime lib,
+# growable 16 GiB linear memory, and Module.dynamicLibraries loaded by web/loader.js.
 PIC_FLAG = "-fPIC"
-MAIN_MODULE_FLAG = "-sMAIN_MODULE=2"
+MAIN_MODULE_FLAG = "-sMAIN_MODULE=1"
 SIDE_MODULE_FLAG = "-sSIDE_MODULE=1"
+SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
+SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 8
+SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
 SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
@@ -216,6 +225,7 @@ class Toolchain:
     emcc: Path | None
     emxx: Path | None
     origin: str
+    emar: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -230,6 +240,18 @@ class Toolchain:
         if self.emxx is not None:
             return self.emxx
         return self.emcc
+
+    def archiver(self) -> Path | None:
+        if self.emar is not None:
+            return self.emar
+        base = self.emcc or self.emxx
+        if base is not None:
+            sibling = _first_existing(base.parent, _EMAR_NAMES)
+            if sibling is not None:
+                return sibling
+            suffix = base.suffix if base.suffix.lower() in {".bat", ".cmd", ".exe", ".py"} else ""
+            return base.parent / f"emar{suffix}"
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,6 +469,8 @@ def _tool_label(token: str) -> str:
         return "em++"
     if name.startswith("emcc"):
         return "emcc"
+    if name.startswith("emar"):
+        return "emar"
     if name.startswith("python"):
         return "python"
     stem = Path(basename).stem
@@ -494,6 +518,7 @@ _EMXX_NAMES: tuple[str, ...] = (
     "emxx.bat",
     "emxx.cmd",
 )
+_EMAR_NAMES: tuple[str, ...] = ("emar", "emar.bat", "emar.cmd", "emar.exe", "emar.py")
 
 
 def _first_existing(directory: Path, names: Sequence[str]) -> Path | None:
@@ -512,16 +537,18 @@ def discover_emscripten(
     env: Mapping[str, str] | None = None,
     which_fn: WhichFn | None = None,
 ) -> Toolchain:
-    """Locate emcc/em++ on PATH, EMSDK, or `work/emsdk/upstream/emscripten`."""
+    """Locate emcc/em++/emar on PATH, EMSDK, or `work/emsdk/upstream/emscripten`."""
     env_map = dict(os.environ if env is None else env)
     which = shutil.which if which_fn is None else which_fn
 
     emcc_path: Path | None = None
     emxx_path: Path | None = None
+    emar_path: Path | None = None
     origin = "missing"
 
     which_emcc = which("emcc")
     which_emxx = which("em++") or which("emxx")
+    which_emar = which("emar")
     if which_emcc:
         emcc_path = Path(which_emcc)
         origin = "path"
@@ -529,6 +556,8 @@ def discover_emscripten(
         emxx_path = Path(which_emxx)
         if origin == "missing":
             origin = "path"
+    if which_emar:
+        emar_path = Path(which_emar)
 
     search_dirs: list[tuple[str, Path]] = []
     emsdk = (env_map.get("EMSDK") or "").strip()
@@ -539,6 +568,7 @@ def discover_emscripten(
     for label, directory in search_dirs:
         found_cc = _first_existing(directory, _EMCC_NAMES)
         found_xx = _first_existing(directory, _EMXX_NAMES)
+        found_ar = _first_existing(directory, _EMAR_NAMES)
         if emcc_path is None and found_cc is not None:
             emcc_path = found_cc
             origin = label
@@ -546,8 +576,10 @@ def discover_emscripten(
             emxx_path = found_xx
             if origin == "missing":
                 origin = label
+        if emar_path is None and found_ar is not None:
+            emar_path = found_ar
 
-    return Toolchain(emcc=emcc_path, emxx=emxx_path, origin=origin)
+    return Toolchain(emcc=emcc_path, emxx=emxx_path, origin=origin, emar=emar_path)
 
 
 def default_run_command(
@@ -926,6 +958,12 @@ def is_shard_unit(unit: SourceUnit) -> bool:
     return unit.kind == "ll" and name.startswith("shard-")
 
 
+def is_registration_unit(unit: SourceUnit) -> bool:
+    """Return True for lifted function registration tables (`functions.ll`)."""
+    name = Path(unit.unit_id.replace("\\", "/")).name
+    return unit.kind == "ll" and name == "functions.ll"
+
+
 def sample_units(units: Sequence[SourceUnit], count: int) -> list[SourceUnit]:
     """`count` shards spread evenly over the set (registration / thunks are not sampled)."""
     shards = [unit for unit in units if is_shard_unit(unit)]
@@ -1218,10 +1256,15 @@ def resolve_link_flags(
     if pthread_pool_size is not None:
         if isinstance(pthread_pool_size, bool) or pthread_pool_size < 1:
             raise BuildGuestWasmError("--pthread-pool-size must be >= 1")
+    effective_pool_size = (
+        pthread_pool_size
+        if pthread_pool_size is not None
+        else (SPLIT_DEFAULT_PTHREAD_POOL_SIZE if main_module else None)
+    )
     initial_memory_token = (
         parse_size_token(initial_memory, flag_name="--initial-memory")
         if initial_memory is not None
-        else None
+        else (SPLIT_DEFAULT_INITIAL_MEMORY if main_module else None)
     )
     stack_size_token = (
         parse_size_token(stack_size, flag_name="--stack-size")
@@ -1233,16 +1276,20 @@ def resolve_link_flags(
     flags: list[str] = []
     replaced_pool = False
     for flag in LINK_FLAGS:
-        if pthread_pool_size is not None and flag.startswith(PTHREAD_POOL_SIZE_PREFIX):
-            flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
+        if effective_pool_size is not None and flag.startswith(PTHREAD_POOL_SIZE_PREFIX):
+            flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{effective_pool_size}")
             replaced_pool = True
         else:
             flags.append(flag)
-    if pthread_pool_size is not None and not replaced_pool:
-        flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
+    if effective_pool_size is not None and not replaced_pool:
+        flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{effective_pool_size}")
 
-    if main_module and MAIN_MODULE_FLAG not in flags:
-        flags.append(MAIN_MODULE_FLAG)
+    if main_module:
+        for growth_flag in ("-sALLOW_MEMORY_GROWTH=1", "-sMAXIMUM_MEMORY=16GB"):
+            if growth_flag not in flags:
+                flags.append(growth_flag)
+        if MAIN_MODULE_FLAG not in flags:
+            flags.append(MAIN_MODULE_FLAG)
 
     if not no_link_opt and opt in LINK_OPT_LEVELS:
         opt_flag = f"-{opt}"
@@ -1265,7 +1312,17 @@ def resolve_link_flags(
             if stack_flag not in flags:
                 flags.append(stack_flag)
 
-    if browser_boot_exports:
+    if main_module:
+        split_incoming_flag = f"-sINCOMING_MODULE_JS_API={SPLIT_INCOMING_MODULE_JS_API}"
+        if split_incoming_flag not in flags:
+            flags.append(split_incoming_flag)
+        if browser_boot_exports:
+            runtime_methods_flag = (
+                f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}"
+            )
+            if runtime_methods_flag not in flags:
+                flags.append(runtime_methods_flag)
+    elif browser_boot_exports:
         for export_flag in BROWSER_BOOT_EXPORT_LINK_FLAGS:
             if export_flag not in flags:
                 flags.append(export_flag)
@@ -1361,6 +1418,44 @@ def build_side_module_link_argv(
     return tuple(argv)
 
 
+def split_filtered_archive_path(cache_dir: Path, archive: Path) -> Path:
+    """Return the cache-dir copy path for a split-module filtered runtime archive."""
+    return cache_dir / f"{archive.stem}_split{archive.suffix}"
+
+
+def prepare_split_runtime_archive(
+    archive: Path,
+    *,
+    cache_dir: Path,
+    archiver: Path | str,
+    excludes: Sequence[str] = SPLIT_RUNTIME_ARCHIVE_EXCLUDES,
+    dry_run: bool = False,
+    run_command: CommandRunner | None = None,
+) -> tuple[Path, tuple[str, ...], CommandResult]:
+    """Copy `archive` into `cache_dir` and strip boot members via `emar d`.
+
+    Never mutates the original archive. Under `dry_run=True`, returns the planned
+    cache copy path and `emar d` command without touching disk or running `emar`.
+    """
+    filtered_path = split_filtered_archive_path(cache_dir, archive)
+    argv: tuple[str, ...] = (str(archiver), "d", str(filtered_path), *excludes)
+    if dry_run:
+        return filtered_path, argv, CommandResult(returncode=0)
+    if not archive.is_file():
+        return (
+            filtered_path,
+            argv,
+            CommandResult(returncode=1, stderr=f"runtime archive not found: {archive.name}"),
+        )
+    filtered_path.parent.mkdir(parents=True, exist_ok=True)
+    if filtered_path.exists():
+        filtered_path.unlink()
+    shutil.copyfile(archive, filtered_path)
+    runner = run_command or default_run_command
+    result = runner(argv)
+    return filtered_path, argv, result
+
+
 def build_link_argv(
     linker: Path | str,
     objects: Sequence[Path],
@@ -1381,6 +1476,7 @@ def build_link_argv(
     assertions: int | None = None,
     browser_boot_exports: bool = False,
     main_module: bool = False,
+    whole_archive_libs: bool = False,
 ) -> tuple[str, ...]:
     if link_flags is None:
         effective_flags = resolve_link_flags(
@@ -1398,13 +1494,18 @@ def build_link_argv(
         )
     else:
         effective_flags = (*link_flags, *extra_flags)
+    use_whole_archive = whole_archive_libs or (link_flags is None and main_module)
     argv: list[str] = [str(linker), *effective_flags]
     if response_file is not None:
         rsp_arg = str(response_file).replace("\\", "/")
         argv.append(f"@{rsp_arg}")
     else:
         argv.extend(str(path) for path in objects)
-    argv.extend(str(path) for path in runtime_libs)
+    for lib in runtime_libs:
+        if use_whole_archive and lib.suffix.lower() == ".a":
+            argv.extend(["-Wl,--whole-archive", str(lib), "-Wl,--no-whole-archive"])
+        else:
+            argv.append(str(lib))
     argv.extend(str(path) for path in side_modules)
     argv.extend(["-o", str(output_js)])
     return tuple(argv)
@@ -1698,7 +1799,7 @@ def run_build(
     initial_memory_token = (
         parse_size_token(initial_memory, flag_name="--initial-memory")
         if initial_memory is not None
-        else None
+        else (SPLIT_DEFAULT_INITIAL_MEMORY if use_split else None)
     )
     stack_size_token = (
         parse_size_token(stack_size, flag_name="--stack-size")
@@ -1939,7 +2040,15 @@ def run_build(
 
     if use_split:
         buckets = partition_shard_units(ordered, split_count)
-        non_shard_items = [item for item in ordered if not is_shard_unit(item.unit)]
+        registration_items = [item for item in ordered if is_registration_unit(item.unit)]
+        non_shard_items = [
+            item
+            for item in ordered
+            if not is_shard_unit(item.unit) and not is_registration_unit(item.unit)
+        ]
+        all_side_buckets: list[list[UnitBuildResult]] = list(buckets)
+        if registration_items:
+            all_side_buckets.append(registration_items)
         side_link_flags = resolve_side_module_link_flags(
             opt=opt_level,
             strip=strip,
@@ -1949,8 +2058,7 @@ def run_build(
         side_plans: list[
             tuple[SideModuleResult, Path, list[Path], Path | None, tuple[str, ...]]
         ] = []
-        side_wasm_paths: list[Path] = []
-        for idx, bucket in enumerate(buckets):
+        for idx, bucket in enumerate(all_side_buckets):
             side_name = SIDE_MODULE_NAME_TEMPLATE.format(index=idx)
             side_wasm_path = output_dir / side_name
             bucket_objects = [
@@ -1978,7 +2086,17 @@ def run_build(
             side_plans.append(
                 (side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link)
             )
-            side_wasm_paths.append(side_wasm_path)
+
+        archiver = toolchain.archiver()
+        split_runtime_libs: list[Path] = []
+        archive_filter_plans: list[tuple[Path, Path]] = []
+        for lib in runtime_libs:
+            if lib.suffix.lower() == ".a":
+                filtered_lib = split_filtered_archive_path(cache_root, lib)
+                split_runtime_libs.append(filtered_lib)
+                archive_filter_plans.append((lib, filtered_lib))
+            else:
+                split_runtime_libs.append(lib)
 
         main_objects = [
             item.object_path
@@ -1994,10 +2112,10 @@ def run_build(
             linker,
             main_objects,
             output_js=output_js,
-            runtime_libs=runtime_libs,
-            side_modules=side_wasm_paths,
+            runtime_libs=split_runtime_libs,
             link_flags=effective_link_flags,
             response_file=rsp_path,
+            whole_archive_libs=True,
         )
         report.side_modules = [plan[0] for plan in side_plans]
         report.link_argv = tuple(sanitize_argv(raw_link))
@@ -2028,6 +2146,24 @@ def run_build(
                 report.errors.append(f"missing side module link output: {side_result.name}")
                 return report
             side_result.wasm_bytes = _object_bytes(side_wasm_path)
+
+        if archive_filter_plans:
+            assert archiver is not None
+            for orig_archive, filtered_archive in archive_filter_plans:
+                _, _, ar_result = prepare_split_runtime_archive(
+                    orig_archive,
+                    cache_dir=cache_root,
+                    archiver=archiver,
+                    dry_run=False,
+                    run_command=runner,
+                )
+                if ar_result.returncode != 0:
+                    report.ok = False
+                    err = sanitize_text(
+                        (ar_result.stderr or ar_result.stdout or "emar d failed").strip()
+                    )
+                    report.errors.append(f"{filtered_archive.name}: {err}")
+                    return report
 
         if rsp_path is not None:
             write_link_response_file(rsp_path, main_objects)
@@ -2355,9 +2491,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         metavar="N",
         help=(
-            "Split .ll shards into N balanced Emscripten -sSIDE_MODULE=1 modules linked "
-            "into a -sMAIN_MODULE=2 runtime with -fPIC to stay under V8's 1 GiB per-module "
-            "limit (must be >= 1; default: 1 = monolithic module)."
+            "Split .ll shards into N balanced Emscripten -sSIDE_MODULE=1 modules (plus an extra "
+            "side module for functions.ll registration tables) paired with a -sMAIN_MODULE=1 "
+            "runtime loaded via Module.dynamicLibraries (must be >= 1; default: 1 = monolithic)."
         ),
     )
     parser.add_argument(
@@ -2388,7 +2524,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="Override -sPTHREAD_POOL_SIZE=N on the link line (must be >= 1; default: 4).",
+        help=(
+            "Override -sPTHREAD_POOL_SIZE=N on the link line (must be >= 1; "
+            "default: 4 monolithic, 8 when --split-modules > 1)."
+        ),
     )
     parser.add_argument(
         "--dry-run",

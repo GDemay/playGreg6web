@@ -6,6 +6,11 @@ import {
   HudController,
   HUD_ACTIONS,
   DEFAULT_FILENAMES,
+  BOOT_MODE,
+  DEFAULT_MAX_VALIDATION_ERRORS,
+  MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
+  normalizeBootMode,
+  sanitizeValidationErrorMessage,
 } from '../web/ui/hud_controller.js';
 import {
   BrowserStorageManager,
@@ -1165,4 +1170,466 @@ test('HudController resolves app.gpuBootPanel fallback and preserves backwards c
   assert.match(errRes.error, /panel export boom/);
 
   appStub.gpuBootPanel.destroy();
+});
+
+// --- W69: Real-vs-Smoke Boot Mode, Split-Module Progress, and Live WebGPU Validation Errors ---
+
+function createDisplayMockElement(extra = {}) {
+  const attributes = new Map();
+  return {
+    textContent: '',
+    title: '',
+    hidden: false,
+    dataset: {},
+    children: [],
+    _attributes: attributes,
+    setAttribute(name, val) {
+      attributes.set(name, String(val));
+    },
+    getAttribute(name) {
+      return attributes.has(name) ? attributes.get(name) : null;
+    },
+    ...extra,
+  };
+}
+
+test('W69: normalizeBootMode and bootMode tracking distinguish real-wasm64, smoke, and idle without mislabeling smoke frames', async () => {
+  assert.equal(normalizeBootMode('real-wasm64'), BOOT_MODE.REAL_WASM64);
+  assert.equal(normalizeBootMode('wasm-guest'), BOOT_MODE.REAL_WASM64);
+  assert.equal(normalizeBootMode('running_wasm'), BOOT_MODE.REAL_WASM64);
+  assert.equal(normalizeBootMode('smoke'), BOOT_MODE.SMOKE);
+  assert.equal(normalizeBootMode('smoke-demo'), BOOT_MODE.SMOKE);
+  assert.equal(normalizeBootMode('running_smoke'), BOOT_MODE.SMOKE);
+  assert.equal(normalizeBootMode('idle'), BOOT_MODE.IDLE);
+  assert.equal(normalizeBootMode('pending'), BOOT_MODE.IDLE);
+  assert.equal(normalizeBootMode('unknown-garbage'), BOOT_MODE.IDLE);
+  assert.equal(normalizeBootMode(null), BOOT_MODE.IDLE);
+
+  const bootModeBadge = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+  const hud = createMockHud();
+
+  const controller = new HudController({
+    hud,
+    displayElements: { bootModeBadge, bootStatusEl },
+  });
+
+  // Initial state is idle.
+  assert.equal(controller.getBootMode(), BOOT_MODE.IDLE);
+  assert.equal(bootModeBadge.textContent, 'Idle');
+  assert.equal(bootModeBadge.dataset.bootMode, 'idle');
+  assert.equal(bootModeBadge.dataset.state, 'info');
+  assert.equal(bootStatusEl.textContent, 'Idle');
+
+  // Switch to smoke mode -> unmistakable smoke-demo badge and status text.
+  const smokeStatus = controller.setBootMode('smoke');
+  assert.equal(smokeStatus.bootMode, 'smoke');
+  assert.equal(smokeStatus.isSmoke, true);
+  assert.equal(smokeStatus.isRealWasm64, false);
+  assert.equal(smokeStatus.badgeText, 'Smoke Demo');
+  assert.match(smokeStatus.statusText, /Smoke Demo/i);
+  assert.match(smokeStatus.statusText, /Not Real Game/i);
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+  assert.equal(bootModeBadge.dataset.bootMode, 'smoke');
+  assert.equal(bootModeBadge.dataset.state, 'warn');
+  assert.equal(bootModeBadge.getAttribute('aria-label'), 'Boot mode: Smoke Demo');
+  assert.equal(hud.statuses.at(-1).level, 'warn');
+
+  // Receiving frame telemetry without a real boot transition must keep smoke mode.
+  controller.updateGpuBootTelemetry({
+    bootSummary: { stage: 'FIRST_PRESENT', milestonesReached: 9, totalMilestones: 9 },
+    frameStats: { framesPresented: 120 },
+  });
+  assert.equal(controller.getBootMode(), 'smoke');
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+
+  // Conflicting firstPresentSource='smoke-demo' with bootMode='real-wasm64' must NEVER mislabel as real game.
+  const guarded = controller.setBootMode('real-wasm64', { firstPresentSource: 'smoke-demo' });
+  assert.equal(guarded.bootMode, 'smoke');
+  assert.equal(guarded.isRealWasm64, false);
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+
+  controller.updateGpuBootTelemetry({
+    bootMode: 'real-wasm64',
+    firstPresentSource: 'smoke-demo',
+  });
+  assert.equal(controller.getBootMode(), 'smoke');
+
+  // Valid transition to real-wasm64 updates badge and status text cleanly.
+  const realStatus = controller.setBootMode('real-wasm64');
+  assert.equal(realStatus.bootMode, 'real-wasm64');
+  assert.equal(realStatus.isRealWasm64, true);
+  assert.equal(realStatus.isSmoke, false);
+  assert.equal(realStatus.badgeText, 'Real Wasm64');
+  assert.equal(realStatus.statusText, 'Real Wasm64 Guest');
+  assert.equal(bootModeBadge.textContent, 'Real Wasm64');
+  assert.equal(bootModeBadge.dataset.bootMode, 'real-wasm64');
+  assert.equal(bootModeBadge.dataset.state, 'ok');
+  assert.equal(hud.statuses.at(-1).level, 'ok');
+});
+
+test('W69: active RuntimeSessionController smoke mode can never be mislabeled as real-wasm64 and syncs across lifecycle transitions', async () => {
+  const sessionController = new RuntimeSessionController({
+    capabilityProbe: async () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    startWasmRuntime: async () => ({ stop() {} }),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const bootModeBadge = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+  const controller = new HudController({
+    hud: createMockHud(),
+    sessionController,
+    displayElements: { bootModeBadge, bootStatusEl },
+  });
+
+  assert.equal(controller.getBootMode(), 'idle');
+
+  // Start smoke demo via HudController.
+  await controller.toggleSmokeDemo();
+  assert.equal(sessionController.getState(), SESSION_STATE.RUNNING_SMOKE);
+  assert.equal(controller.getBootMode(), 'smoke');
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+  assert.equal(bootModeBadge.dataset.bootMode, 'smoke');
+
+  // Even if caller tries to force real-wasm64 while smoke session is active, guard preserves smoke.
+  controller.setBootMode('real-wasm64');
+  assert.equal(controller.getBootMode(), 'smoke');
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+  assert.equal(controller.getBootStatus().isRealWasm64, false);
+
+  // Stop smoke directly on sessionController -> immediately returns to idle.
+  await sessionController.stop();
+  assert.equal(controller.getBootMode(), 'idle');
+
+  // Restart into Wasm64 runtime -> updates to real-wasm64.
+  await controller.restartSession({ preferSmoke: false });
+  assert.equal(sessionController.getState(), SESSION_STATE.RUNNING_WASM);
+  assert.equal(controller.getBootMode(), 'real-wasm64');
+  assert.equal(bootModeBadge.textContent, 'Real Wasm64');
+  assert.equal(bootModeBadge.dataset.bootMode, 'real-wasm64');
+  assert.equal(bootModeBadge.dataset.state, 'ok');
+
+  // Restart back into smoke demo -> updates to smoke.
+  await controller.restartSession({ preferSmoke: true });
+  assert.equal(controller.getBootMode(), 'smoke');
+  assert.equal(bootModeBadge.textContent, 'Smoke Demo');
+
+  await sessionController.stop();
+
+  // Also verify inference from app.bootOrchestrator when sessionController is absent.
+  const orchController = new HudController({
+    app: {
+      bootOrchestrator: {
+        getState() {
+          return { bootMode: 'wasm-guest' };
+        },
+      },
+    },
+  });
+  assert.equal(orchController.getBootMode(), 'real-wasm64');
+});
+
+test('W69: split-module (sideModuleCount / guest_part_*.wasm) progress tracks, deduplicates, sanitizes paths, and renders cleanly', () => {
+  const bootStatusEl = createDisplayMockElement();
+  const sideModuleStatusEl = createDisplayMockElement();
+  const hud = createMockHud();
+
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    displayElements: { bootStatusEl, sideModuleStatusEl },
+  });
+
+  // Initial state: no split modules reported.
+  const initial = controller.getSideModuleProgress();
+  assert.equal(initial.active, false);
+  assert.equal(initial.sideModuleCount, 0);
+  assert.equal(initial.loadedCount, 0);
+  assert.equal(initial.complete, false);
+  assert.equal(sideModuleStatusEl.textContent, 'No split modules');
+
+  // Announce 4 split side modules before any finish loading.
+  const announced = controller.setSideModuleProgress({ sideModuleCount: 4, loadedCount: 0 });
+  assert.equal(announced.active, true);
+  assert.equal(announced.sideModuleCount, 4);
+  assert.equal(announced.loadedCount, 0);
+  assert.equal(announced.remainingCount, 4);
+  assert.equal(announced.progressPct, 0);
+  assert.equal(announced.statusText, 'Side modules: 0/4 (0%)');
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 0/4 (0%)');
+  assert.equal(sideModuleStatusEl.dataset.state, 'info');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — Side modules: 0/4 (0%)');
+
+  // Load first module incrementally + verify duplicate load does not double-count.
+  controller.recordSideModuleLoaded('guest_part_0.wasm');
+  const dup = controller.recordSideModuleLoaded('./dist/guest_part_0.wasm?v=1');
+  assert.equal(dup.loadedCount, 1);
+  assert.equal(dup.remainingCount, 3);
+  assert.equal(dup.progressPct, 25);
+  assert.deepEqual(dup.loadedModules, ['guest_part_0.wasm']);
+
+  // Host path in side module name is stripped to basename (zero host username leakage).
+  const second = controller.recordSideModuleLoaded(
+    'C:\\Users\\secretuser\\playgta6web\\web\\dist\\guest_part_1.wasm?token=abc'
+  );
+  assert.equal(second.loadedCount, 2);
+  assert.equal(second.progressPct, 50);
+  assert.equal(second.currentModule, 'guest_part_1.wasm');
+  assert.deepEqual(second.loadedModules, ['guest_part_0.wasm', 'guest_part_1.wasm']);
+  assert.doesNotMatch(second.loadedModules.join(','), /secretuser|token/);
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — Side modules: 2/4 (50%)');
+
+  // Load remaining 2 modules -> complete state.
+  controller.recordSideModuleLoaded('/home/alice/dist/guest_part_2.wasm');
+  const done = controller.recordSideModuleLoaded('guest_part_3.wasm', { updateHudStatus: true });
+  assert.equal(done.complete, true);
+  assert.equal(done.loadedCount, 4);
+  assert.equal(done.remainingCount, 0);
+  assert.equal(done.progressPct, 100);
+  assert.equal(done.statusText, 'Side modules: 4/4 loaded');
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 4/4 loaded');
+  assert.equal(sideModuleStatusEl.dataset.state, 'ok');
+  assert.equal(sideModuleStatusEl.dataset.loaded, '4');
+  assert.equal(sideModuleStatusEl.dataset.total, '4');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — Side modules: 4/4 loaded');
+  assert.equal(hud.statuses.at(-1).text, 'Real Wasm64 Guest — Side modules: 4/4 loaded');
+
+  // Update via updateGpuBootTelemetry payload works seamlessly too.
+  controller.updateGpuBootTelemetry({
+    side_module_count: 6,
+    loadedSideModules: 3,
+  });
+  assert.equal(controller.getSideModuleProgress().sideModuleCount, 6);
+  assert.equal(controller.getSideModuleProgress().loadedCount, 3);
+  assert.equal(controller.getSideModuleProgress().progressPct, 50);
+
+  // Invalid/negative numbers degrade safely without throwing, and reset clears state.
+  controller.setSideModuleProgress({ sideModuleCount: -10, loadedCount: Number.NaN });
+  assert.equal(controller.getSideModuleProgress().sideModuleCount, 0);
+  assert.equal(controller.getSideModuleProgress().loadedCount, 0);
+
+  controller.recordSideModuleLoaded('guest_part_0.wasm');
+  const reset = controller.resetSideModuleProgress();
+  assert.equal(reset.active, false);
+  assert.equal(reset.sideModuleCount, 0);
+  assert.equal(reset.loadedCount, 0);
+  assert.deepEqual(reset.loadedModules, []);
+  assert.equal(sideModuleStatusEl.textContent, 'No split modules');
+});
+
+test('W69: live WebGPU validation errors are bounded, sanitized, capped in length, and rendered cleanly', () => {
+  const bootStatusEl = createDisplayMockElement();
+  const validationCountEl = createDisplayMockElement();
+  const validationLatestEl = createDisplayMockElement();
+  const validationBannerEl = createDisplayMockElement({ hidden: true });
+  const hud = createMockHud();
+
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    maxValidationErrors: 3,
+    maxValidationMessageLength: 96,
+    now: () => 1700001000000,
+    displayElements: {
+      bootStatusEl,
+      validationCountEl,
+      validationLatestEl,
+      validationBannerEl,
+    },
+  });
+
+  // Initial empty summary.
+  const empty = controller.getValidationSummary();
+  assert.equal(empty.count, 0);
+  assert.equal(empty.historySize, 0);
+  assert.equal(empty.maxHistory, 3);
+  assert.equal(empty.hasErrors, false);
+  assert.equal(empty.latestError, null);
+  assert.equal(empty.latestMessage, null);
+  assert.deepEqual(empty.errors, []);
+  assert.equal(validationCountEl.textContent, '0');
+  assert.equal(validationCountEl.dataset.state, 'ok');
+  assert.equal(validationLatestEl.textContent, 'None');
+  assert.equal(validationBannerEl.hidden, true);
+
+  // Record #1 with Windows host path, POSIX host path, query secret, and control characters.
+  const rec1 = controller.recordValidationError({
+    type: 'validation',
+    message:
+      'Invalid shader at C:\\Users\\alice\\GTA6\\shader.wgsl\nand /home/alice/secret.bin?token=xyz Bearer secret-tok',
+    timestampMs: 1700001000100,
+  });
+  assert.ok(rec1);
+  assert.equal(rec1.type, 'validation');
+  assert.doesNotMatch(rec1.message, /alice|secret-tok|token=xyz|[\r\n]/i);
+  assert.ok(rec1.message.length <= 96);
+  assert.equal(validationCountEl.textContent, '1');
+  assert.equal(validationCountEl.dataset.state, 'err');
+  assert.equal(validationLatestEl.textContent, rec1.message);
+  assert.equal(validationBannerEl.hidden, false);
+  assert.equal(validationBannerEl.dataset.hasErrors, 'true');
+  assert.match(bootStatusEl.textContent, /1 WebGPU validation error/);
+  assert.equal(controller.getBootStatus().statusLevel, 'error');
+  assert.equal(hud.logs.length, 1);
+  assert.equal(hud.logs[0].level, 'error');
+
+  // Record #2 (OOM) + #3 (overly long message -> length capped with ellipsis) + #4 (evicts #1 from bounded ring).
+  controller.recordValidationError({
+    error: { name: 'GPUOutOfMemoryError', message: 'Allocation failed for file:///Users/bob/tex.bin' },
+  });
+  const longMsg = 'BindGroup layout mismatch at binding 0 in render pass pipeline validation. '.repeat(4);
+  const rec3 = controller.recordValidationError(longMsg);
+  assert.equal(rec3.message.length, 96);
+  assert.ok(rec3.message.endsWith('...'));
+
+  const rec4 = controller.recordValidationError(
+    new Error('Pipeline layout incompatible with \\\\fileserver\\private\\dump.rpf')
+  );
+  assert.doesNotMatch(rec4.message, /fileserver|private/i);
+
+  const summary = controller.getValidationSummary();
+  assert.equal(summary.count, 4);
+  assert.equal(summary.historySize, 3);
+  assert.equal(summary.maxHistory, 3);
+  assert.equal(summary.errors.length, 3);
+  assert.equal(summary.errors[0].type, 'out-of-memory');
+  assert.doesNotMatch(summary.errors[0].message, /bob/i);
+  assert.equal(summary.latestMessage, rec4.message);
+  assert.equal(validationCountEl.textContent, '4');
+  assert.equal(validationLatestEl.textContent, rec4.message);
+  assert.match(bootStatusEl.textContent, /4 WebGPU validation errors/);
+
+  // Returned summary is a defensive copy.
+  summary.errors[0].message = 'MUTATED';
+  summary.latestError.message = 'MUTATED';
+  assert.notEqual(controller.getValidationSummary().errors[0].message, 'MUTATED');
+  assert.notEqual(controller.getValidationSummary().latestMessage, 'MUTATED');
+
+  // setValidationErrors replaces list cleanly without spamming HUD logs and respects totalCount + ring cap.
+  const logCountBeforeBulk = hud.logs.length;
+  const bulkSummary = controller.setValidationErrors(
+    [
+      { seq: 10, type: 'validation', message: 'Error A from /Users/carol/a.wgsl' },
+      { seq: 11, type: 'internal', message: 'Error B' },
+      { seq: 12, type: 'validation', message: 'Error C' },
+      { seq: 13, type: 'validation', message: 'Error D from C:\\Users\\carol\\d.wgsl' },
+    ],
+    { totalCount: 12 }
+  );
+  assert.equal(hud.logs.length, logCountBeforeBulk);
+  assert.equal(bulkSummary.count, 12);
+  assert.equal(bulkSummary.historySize, 3);
+  assert.equal(bulkSummary.errors[0].seq, 11);
+  assert.equal(bulkSummary.latestError.seq, 13);
+  assert.doesNotMatch(bulkSummary.latestMessage, /carol/i);
+  assert.equal(validationCountEl.textContent, '12');
+
+  // clearValidationErrors resets counters and hides the banner.
+  const cleared = controller.clearValidationErrors();
+  assert.equal(cleared.count, 0);
+  assert.equal(cleared.historySize, 0);
+  assert.equal(cleared.hasErrors, false);
+  assert.equal(validationCountEl.textContent, '0');
+  assert.equal(validationLatestEl.textContent, 'None');
+  assert.equal(validationBannerEl.hidden, true);
+  assert.equal(controller.getBootStatus().statusLevel, 'ok');
+
+  // Default constants and direct sanitizeValidationErrorMessage checks.
+  assert.equal(DEFAULT_MAX_VALIDATION_ERRORS, 32);
+  assert.equal(MAX_VALIDATION_ERROR_MESSAGE_LENGTH, 256);
+  const directSanitized = sanitizeValidationErrorMessage(
+    'Failed at C:\\Users\\dave\\file.bin data:application/octet-stream;base64,QUFBQUFBQUFBQUFBQUFBQUFBQUFB',
+    120
+  );
+  assert.doesNotMatch(directSanitized, /dave|QUFB/);
+  assert.match(directSanitized, /\[REDACTED_PATH\]/);
+  assert.match(directSanitized, /\[REDACTED_BUFFER\]/);
+});
+
+test('W69: absent, frozen, or throwing optional DOM elements never throw and destroy() stops further mutations', () => {
+  // 1. Completely absent DOM elements and HUD.
+  const bare = new HudController();
+  assert.doesNotThrow(() => {
+    bare.setBootMode('real-wasm64');
+    bare.setSideModuleProgress({ sideModuleCount: 2, loadedCount: 1 });
+    bare.recordSideModuleLoaded('guest_part_1.wasm');
+    bare.recordValidationError('Invalid vertex buffer stride');
+    bare.setValidationErrors([{ message: 'Blend state mismatch' }]);
+    bare.clearValidationErrors();
+    bare.renderBootStatus({ updateHudStatus: true });
+  });
+  assert.equal(bare.getBootMode(), 'real-wasm64');
+  assert.equal(bare.getValidationSummary().count, 0);
+
+  // 2. Frozen / throwing DOM elements and throwing hud.setStatus never crash.
+  const throwingEl = {
+    set textContent(_v) {
+      throw new Error('DOM detached');
+    },
+    set title(_v) {
+      throw new Error('DOM detached');
+    },
+    set hidden(_v) {
+      throw new Error('DOM detached');
+    },
+    get dataset() {
+      throw new Error('DOM detached');
+    },
+    setAttribute() {
+      throw new Error('DOM detached');
+    },
+  };
+  const resilient = new HudController({
+    hud: {
+      appendLog() {
+        throw new Error('log detached');
+      },
+      setStatus() {
+        throw new Error('status detached');
+      },
+    },
+    displayElements: {
+      bootModeBadge: Object.freeze({}),
+      bootStatusEl: throwingEl,
+      sideModuleStatusEl: throwingEl,
+      validationCountEl: throwingEl,
+      validationLatestEl: throwingEl,
+      validationBannerEl: throwingEl,
+    },
+  });
+
+  assert.doesNotThrow(() => {
+    resilient.setBootMode('smoke');
+    resilient.recordSideModuleLoaded('guest_part_0.wasm');
+    resilient.recordValidationError({ message: 'Attachment format mismatch' });
+  });
+  assert.equal(resilient.getBootMode(), 'smoke');
+  assert.equal(resilient.getValidationSummary().count, 1);
+
+  // 3. Container validationBannerEl with child elements preserves child DOM while updating attributes/hidden.
+  const childNode = createDisplayMockElement();
+  const containerBanner = createDisplayMockElement({ children: [childNode], textContent: 'KEEP' });
+  const btn = createMockElement();
+  const withBindButtons = new HudController();
+  withBindButtons.bindButtons({
+    clearCacheBtn: btn,
+    validationBannerEl: containerBanner,
+  });
+  // Display element passed to bindButtons does not inflate boundControlCount.
+  assert.equal(withBindButtons.getState().boundControlCount, 1);
+  withBindButtons.recordValidationError('Render pass depth format invalid');
+  assert.equal(containerBanner.hidden, false);
+  assert.equal(containerBanner.dataset.count, '1');
+  assert.equal(containerBanner.textContent, 'KEEP');
+
+  // 4. After destroy(), mutators safely no-op without changing state.
+  withBindButtons.destroy();
+  assert.equal(withBindButtons.recordValidationError('Should be ignored'), null);
+  assert.equal(withBindButtons.getValidationSummary().count, 1);
+  withBindButtons.setBootMode('real-wasm64');
+  assert.equal(withBindButtons.getBootMode(), 'idle');
+  withBindButtons.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 5 });
+  assert.equal(withBindButtons.getSideModuleProgress().sideModuleCount, 0);
 });

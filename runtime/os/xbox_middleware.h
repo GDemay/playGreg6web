@@ -114,6 +114,16 @@ struct Pg6FfxApiHeader {
     Pg6FfxApiHeader* p_next = nullptr;
 };
 
+// ffxQueryDescUpscaleGetJitterPhaseCount (FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT).
+inline constexpr uint64_t kFfxQueryUpscaleGetJitterPhaseCount = 0x00010004ULL;
+struct Pg6FfxQueryJitterPhaseCount {
+    Pg6FfxApiHeader header;
+    uint32_t render_width = 0;
+    uint32_t display_width = 0;
+    int32_t* out_phase_count = nullptr;
+};
+static_assert(sizeof(Pg6FfxQueryJitterPhaseCount) == 0x20);
+
 // ---------------------------------------------------------------------------
 // D3D12 raytracing prebuild info (matches D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO)
 // ---------------------------------------------------------------------------

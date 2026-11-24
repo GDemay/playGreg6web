@@ -1237,31 +1237,57 @@ bool TlsSetValue(uint32_t tls_index, void* value) {
     return ok;
 }
 
+namespace {
+
+// Host locks of SRWLOCKs, keyed by the guest lock's address (see Pg6SrwLock). A zeroed SRWLOCK is
+// unlocked, so a lock appears on first use; entries are never removed (SRWLOCK has no delete, and
+// memory reused for a new lock while unlocked keeps a valid unlocked entry).
+struct SrwShard {
+    std::mutex mutex;
+    std::unordered_map<uintptr_t, std::unique_ptr<playgta6::os::SrwLock>> locks;
+};
+
+playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
+    static SrwShard shards[64];
+    const uintptr_t key = reinterpret_cast<uintptr_t>(srw_lock);
+    SrwShard& shard = shards[(key >> 3) % 64];
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    std::unique_ptr<playgta6::os::SrwLock>& entry = shard.locks[key];
+    if (!entry) {
+        entry = std::make_unique<playgta6::os::SrwLock>();
+    }
+    return *entry;
+}
+
+}  // namespace
+
 void InitializeSRWLock(SrwLock* srw_lock) {
-    (void)srw_lock;
+    if (srw_lock != nullptr) {
+        srw_lock->reserved = 0;
+    }
 }
 
 void AcquireSRWLockExclusive(SrwLock* srw_lock) {
     if (srw_lock != nullptr) {
-        srw_lock->lock.lock_exclusive();
+        srw_lock_for(srw_lock).lock_exclusive();
     }
 }
 
 void ReleaseSRWLockExclusive(SrwLock* srw_lock) {
     if (srw_lock != nullptr) {
-        srw_lock->lock.unlock_exclusive();
+        srw_lock_for(srw_lock).unlock_exclusive();
     }
 }
 
 void AcquireSRWLockShared(SrwLock* srw_lock) {
     if (srw_lock != nullptr) {
-        srw_lock->lock.lock_shared();
+        srw_lock_for(srw_lock).lock_shared();
     }
 }
 
 void ReleaseSRWLockShared(SrwLock* srw_lock) {
     if (srw_lock != nullptr) {
-        srw_lock->lock.unlock_shared();
+        srw_lock_for(srw_lock).unlock_shared();
     }
 }
 
@@ -1269,14 +1295,14 @@ bool TryAcquireSRWLockExclusive(SrwLock* srw_lock) {
     if (srw_lock == nullptr) {
         return false;
     }
-    return srw_lock->lock.try_lock_exclusive();
+    return srw_lock_for(srw_lock).try_lock_exclusive();
 }
 
 bool TryAcquireSRWLockShared(SrwLock* srw_lock) {
     if (srw_lock == nullptr) {
         return false;
     }
-    return srw_lock->lock.try_lock_shared();
+    return srw_lock_for(srw_lock).try_lock_shared();
 }
 
 // ---------------------------------------------------------------------------

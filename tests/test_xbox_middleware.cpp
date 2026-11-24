@@ -565,8 +565,30 @@ void test_ffx_bvh_mf() {
     desc.type = 0x00010001ULL;
     CHECK(pg6_mw_ffx_create_context(&ffx, &desc, nullptr) == kFfxReturnOk);
     CHECK(ffx != nullptr);
-    CHECK(pg6_mw_ffx_query(&ffx, &desc) == kFfxReturnOk);
-    CHECK(pg6_mw_ffx_query(nullptr, &desc) == kFfxReturnOk);
+    // Unknown query types fail and write nothing.
+    CHECK(pg6_mw_ffx_query(&ffx, &desc) == kFfxReturnError);
+    CHECK(pg6_mw_ffx_query(nullptr, &desc) == kFfxReturnError);
+    // GetJitterPhaseCount: int(8 * (display / render)^2).
+    {
+        int32_t phases = -7;
+        Pg6FfxQueryJitterPhaseCount query{};
+        query.header.type = kFfxQueryUpscaleGetJitterPhaseCount;
+        query.out_phase_count = &phases;
+        const uint32_t widths[][3] = {{3840, 3840, 8}, {1920, 3840, 32}, {2560, 3840, 18}, {1280, 3840, 72}};
+        for (const auto& w : widths) {
+            query.render_width = w[0];
+            query.display_width = w[1];
+            CHECK(pg6_mw_ffx_query(&ffx, &query.header) == kFfxReturnOk);
+            CHECK(phases == static_cast<int32_t>(w[2]));
+        }
+        query.render_width = 0;
+        phases = -7;
+        CHECK(pg6_mw_ffx_query(&ffx, &query.header) == kFfxReturnErrorParameter);
+        CHECK(phases == -7);
+        query.render_width = 1920;
+        query.out_phase_count = nullptr;
+        CHECK(pg6_mw_ffx_query(&ffx, &query.header) == kFfxReturnErrorParameter);
+    }
     CHECK(pg6_mw_ffx_dispatch(&ffx, &desc) == kFfxReturnOk);
     CHECK(pg6_mw_ffx_destroy_context(&ffx, nullptr) == kFfxReturnOk);
     CHECK(ffx == nullptr);
@@ -579,9 +601,9 @@ void test_ffx_bvh_mf() {
 
     Pg6D3D12RaytracingPrebuildInfo prebuild{111u, 222u, 333u};
     pg6_mw_bvh_builder_get_prebuild_info(builder_storage, nullptr, nullptr, &prebuild);
-    CHECK(prebuild.result_data_max_size_in_bytes == 0u);
-    CHECK(prebuild.scratch_data_size_in_bytes == 0u);
-    CHECK(prebuild.update_scratch_data_size_in_bytes == 0u);
+    CHECK(prebuild.result_data_max_size_in_bytes == 256u);
+    CHECK(prebuild.scratch_data_size_in_bytes == 256u);
+    CHECK(prebuild.update_scratch_data_size_in_bytes == 256u);
 
     pg6_mw_bvh_builder_build_batched_2x(builder_storage, nullptr, 0u, nullptr);
     pg6_mw_bvh_builder_copy(builder_storage, nullptr, 0u, 0u, 0u);

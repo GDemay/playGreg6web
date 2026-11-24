@@ -5,10 +5,12 @@
 - Serves `GTA6_GAME_DIR` (when configured) at `/game/` for local game & splash assets.
 - Serves `local-data/shaders/` at `/shaders/` and `work/recomp_build/` at `/boot/`
   (boot allowlisted to `.pgim`/`.json`/`.wasm`/`.js` only).
-- Serves sanitized JSON readiness diagnostics at `/api/status`.
+- Serves sanitized JSON readiness diagnostics at `/api/status` (including staged
+  `/dist/*.wasm` side-module discovery).
 - Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
 - Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
-  deterministic `ETag`/`Last-Modified`, `If-None-Match` (`304`), and `If-Range`.
+  `Cache-Control: no-cache`, deterministic `ETag`/`Last-Modified`, `If-None-Match` (`304`),
+  and `If-Range`.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from urllib.parse import unquote, urlsplit
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
 BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
+RUNTIME_WASM_NAME = "runtime.wasm"
+SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
 
 CLIENT_DISCONNECT_ERRORS = (
     BrokenPipeError,
@@ -346,6 +350,68 @@ def _boot_extension_allowed(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in BOOT_ALLOWED_SUFFIXES)
 
 
+def _natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
+    """Return a case-insensitive natural sort key (e.g., part_2 before part_10)."""
+    parts = re.split(r"(\d+)", name.lower())
+    return tuple((0, int(part)) if part.isdigit() else (1, part) for part in parts if part)
+
+
+def is_safe_side_module_name(filename: str) -> bool:
+    """Return True only for safe top-level sibling `*.wasm` side-module filenames."""
+    if not filename or filename.lower() == RUNTIME_WASM_NAME.lower():
+        return False
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        return False
+    return SAFE_SIDE_MODULE_NAME_RE.match(filename) is not None
+
+
+def _discover_side_module_urls(web_root: Path) -> list[str]:
+    """Discover top-level `*.wasm` side modules in `web_root/dist` as `/dist/<name>` URLs.
+
+    Excludes `runtime.wasm`, skips directories, nested files, unsafe filenames, and
+    broken or escaping symlinks, and returns URLs in natural sort order with zero host paths.
+    """
+    dist_dir = web_root / "dist"
+    if not dist_dir.is_dir():
+        return []
+    try:
+        web_root_resolved = web_root.resolve()
+        dist_resolved = dist_dir.resolve(strict=True)
+        if not dist_resolved.is_relative_to(web_root_resolved):
+            return []
+        entries = list(dist_dir.iterdir())
+    except OSError:
+        return []
+
+    names: list[str] = []
+    for entry in entries:
+        name = entry.name
+        if not is_safe_side_module_name(name):
+            continue
+        try:
+            resolved = entry.resolve(strict=True)
+            if not resolved.is_relative_to(dist_resolved):
+                continue
+            if not resolved.is_file():
+                continue
+            if not resolved.name.lower().endswith(".wasm"):
+                continue
+        except OSError:
+            continue
+        names.append(name)
+
+    names.sort(key=lambda item: (_natural_sort_key(item), item))
+    urls: list[str] = []
+    seen_lower: set[str] = set()
+    for name in names:
+        lowered = name.lower()
+        if lowered in seen_lower:
+            continue
+        seen_lower.add(lowered)
+        urls.append(f"/dist/{name}")
+    return urls
+
+
 def build_status_payload(
     web_root: Path,
     data_root: Path,
@@ -353,22 +419,30 @@ def build_status_payload(
     game_root: Path | None = None,
     shaders_root: Path | None = None,
     boot_root: Path | None = None,
-) -> dict[str, bool | int | str | None]:
+) -> dict[str, bool | int | str | list[str] | None]:
     """Build sanitized readiness metadata with zero host filesystem paths."""
     data_configured = data_root.is_dir()
     has_manifest = data_configured and (data_root / "data-manifest.json").is_file()
     has_bootset = data_configured and (data_root / "bootset.json").is_file()
 
     dist_dir = web_root / "dist"
-    has_wasm = (dist_dir / "runtime.wasm").is_file()
-    if not has_wasm and dist_dir.is_dir():
+    side_module_urls = _discover_side_module_urls(web_root)
+    has_wasm = False
+    runtime_wasm = dist_dir / RUNTIME_WASM_NAME
+    if runtime_wasm.is_file():
         try:
-            has_wasm = any(
-                entry.is_file() and entry.suffix.lower() == ".wasm"
-                for entry in dist_dir.iterdir()
+            web_root_resolved = web_root.resolve()
+            dist_resolved = dist_dir.resolve(strict=True)
+            runtime_resolved = runtime_wasm.resolve(strict=True)
+            has_wasm = (
+                dist_resolved.is_relative_to(web_root_resolved)
+                and runtime_resolved.is_relative_to(dist_resolved)
+                and runtime_resolved.is_file()
             )
         except OSError:
             has_wasm = False
+    if not has_wasm:
+        has_wasm = bool(side_module_urls)
 
     effective_shaders = shaders_root if shaders_root is not None else (data_root / "shaders")
 
@@ -379,6 +453,8 @@ def build_status_payload(
         "hasManifest": has_manifest,
         "hasBootset": has_bootset,
         "hasWasmBinary": has_wasm,
+        "sideModuleCount": len(side_module_urls),
+        "sideModuleUrls": side_module_urls,
         "shaderPackCount": _count_shader_packs(web_root, data_root, effective_shaders),
         "splashImage": _discover_splash_image_url(game_root),
         "shaderPackUrl": _discover_shader_pack_url(effective_shaders),
@@ -497,7 +573,11 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         etag = compute_etag(st)
         last_modified = formatdate(st.st_mtime, usegmt=True)
 
-        if_none_match = self.headers.get("If-None-Match")
+        if hasattr(self.headers, "get_all"):
+            raw_if_none_match = self.headers.get_all("If-None-Match")
+            if_none_match = ", ".join(raw_if_none_match) if raw_if_none_match else None
+        else:
+            if_none_match = self.headers.get("If-None-Match")
         if if_none_match and etag_matches_if_none_match(if_none_match, etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("ETag", etag)
