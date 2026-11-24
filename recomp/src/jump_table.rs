@@ -187,6 +187,7 @@ pub(crate) fn resolve_in(
         image,
         trace,
         info: InstructionInfoFactory::new(),
+        width_only: false,
     };
     let (load, encoding) = match jmp.op0_kind() {
         OpKind::Register if jmp.op0_register().is_gpr64() => {
@@ -210,6 +211,7 @@ pub(crate) fn resolve_in(
             load.table,
             encoding,
             leaf,
+            MAX_INFERRED_ENTRIES,
         );
     };
     if bound.min > bound.max {
@@ -222,13 +224,35 @@ pub(crate) fn resolve_in(
     let entry_size = encoding.entry_size();
     let table_start = load.table.wrapping_add(bound.min.checked_mul(entry_size)?);
     let byte_len = count.checked_mul(entry_size)?;
-    let bytes = read(image, table_start, byte_len)?;
+    // The only bound is the width of a zero-extended byte/word index (e.g. its mask or guard lies
+    // before a loop the slice does not cross): a table that ends before that range does is read
+    // as far as its entries stay inside the function, as for a table without a bound. A bound
+    // narrowed by a guard or a definition still rejects such a table.
+    let width_only = slicer.width_only && bound.min == 0 && matches!(bound.max, 0xff | 0xffff);
+    let infer_within_width = || {
+        width_only
+            .then(|| {
+                infer_extent(
+                    image,
+                    jmp,
+                    trace[load.at].instr.ip(),
+                    load.table,
+                    encoding,
+                    leaf,
+                    usize::try_from(count).ok()?,
+                )
+            })
+            .flatten()
+    };
+    let Some(bytes) = read(image, table_start, byte_len) else {
+        return infer_within_width();
+    };
     let owner = image.function_table.function_at(jmp.ip());
     let mut targets = Vec::with_capacity(count as usize);
     for chunk in bytes.chunks_exact(entry_size as usize) {
         let target = encoding.decode(chunk);
         if image.code_bytes(target).is_err() || image.function_table.function_at(target) != owner {
-            return None;
+            return infer_within_width();
         }
         targets.push(target);
     }
@@ -263,6 +287,7 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
         image,
         trace,
         info: InstructionInfoFactory::new(),
+        width_only: false,
     };
     if let Some(Value::Target { .. }) = slicer.value(jmp.op0_register(), at, 0) {
         return UnresolvedJump::TableUnbounded;
@@ -357,6 +382,7 @@ fn infer_extent(
     table: u64,
     encoding: EntryEncoding,
     leaf: Option<(u64, u64)>,
+    limit: usize,
 ) -> Option<JumpTable> {
     let owner = image.function_table.function_at(jmp.ip());
     let leaf_gap = match owner {
@@ -381,7 +407,7 @@ fn infer_extent(
     let entry_size = encoding.entry_size();
     let mut targets = Vec::new();
     let mut va = table;
-    while targets.len() < MAX_INFERRED_ENTRIES {
+    while targets.len() < limit.min(MAX_INFERRED_ENTRIES) {
         let Some(chunk) = read(image, va, entry_size) else {
             break;
         };
@@ -459,6 +485,9 @@ struct Slicer<'t, 'b, 'i, 'a> {
     image: &'i CodeImage<'a>,
     trace: &'t [Step<'b>],
     info: InstructionInfoFactory,
+    /// Set when a bound came only from the width of a zero-extended byte/word (no guard or
+    /// definition narrowed it): the full range `[0, 0xff]` or `[0, 0xffff]`.
+    width_only: bool,
 }
 
 impl Slicer<'_, '_, '_, '_> {
@@ -1194,11 +1223,14 @@ impl Slicer<'_, '_, '_, '_> {
                         max: b.max.min(mask(bits)),
                         index: b.index,
                     }),
-                    None => Some(Bound {
-                        min: 0,
-                        max: mask(bits),
-                        index: None,
-                    }),
+                    None => {
+                        self.width_only = true;
+                        Some(Bound {
+                            min: 0,
+                            max: mask(bits),
+                            index: None,
+                        })
+                    }
                 }
             }
             Mnemonic::Movzx
@@ -1210,6 +1242,7 @@ impl Slicer<'_, '_, '_, '_> {
                 if let Some(load) = self.table_load(at, 1, elem, depth) {
                     self.index_table_from_load(load, elem, depth)
                 } else if elem == 1 {
+                    self.width_only = true;
                     Some(Bound {
                         min: 0,
                         max: 0xff,
@@ -2319,6 +2352,49 @@ mod tests {
         let cases = find_four_cases(&code);
         let jmp_va = find_indirect_jmp(&code);
         (code, cases, jmp_va)
+    }
+
+    /// `jmp` through a table indexed by a zero-extended byte whose value nothing on the slice
+    /// bounds further (here a live-in register): the only bound is the byte's width.
+    fn zero_extended_byte_switch() -> (Vec<u8>, [u64; 4], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(ecx, r10b)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn infers_the_extent_within_a_zero_extended_byte_bound() {
+        let (code, cases, jmp_va) = zero_extended_byte_switch();
+        // Three cases inside the function, then an entry that leaves it: the byte range (256
+        // entries) is wider than the table, so the extent is inferred instead of rejected.
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA, 0]));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(table.inferred);
+        assert_eq!(table.targets, cases[..3]);
+
+        // A table that fills the whole byte range with valid cases keeps its proven bound.
+        let mut data = rva_table(std::iter::repeat_n((cases[0] - BASE) as u32, 256));
+        data.extend_from_slice(&rva_table([DATA_RVA]));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(!table.inferred);
+        assert_eq!(table.targets.len(), 256);
     }
 
     #[test]
