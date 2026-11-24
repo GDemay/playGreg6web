@@ -416,6 +416,10 @@ struct BootConfig {
     // "ConsoleMode" under HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM), seeded into the
     // runtime registry before the entry point runs. 0 leaves the registry untouched.
     uint32_t console_mode = kConsoleModeSeriesX;
+    // Emulated console's Xbox Live sandbox (environment configuration next to the console mode):
+    // what XSystemGetXboxLiveSandboxId reports. A retail console reports "RETAIL"; empty = no
+    // sandbox (E_NOTIMPL). The runtime stays offline either way: no user, network or store.
+    std::string sandbox_id = "RETAIL";
     // Start address of the host function containing a code address (0 if unknown), e.g. from the
     // host's unwind tables; makes host-frame -> lifted-function mapping exact.
     HostFunctionStartFn host_function_start = nullptr;

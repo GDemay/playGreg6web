@@ -30,6 +30,8 @@
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
 //   --console-mode <n>   console-mode registry value the title reads to pick its console type
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
+//   --sandbox-id <text>  Xbox Live sandbox the emulated console reports (default RETAIL, a retail
+//                        console; "" = none: XSystemGetXboxLiveSandboxId fails with E_NOTIMPL)
 //   --gpu-capture <file> write the GPU command stream of the first frames there as a .pg6trace
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --gpu-capture-frames <n>  frames to capture (default 10)
@@ -134,6 +136,7 @@ struct Options {
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
+    std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
@@ -189,12 +192,13 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--pgim" || a == "--name" || a == "--game-dir" || a == "--cwd" ||
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
-                   a == "--gpu-capture") {
+                   a == "--gpu-capture" || a == "--sandbox-id") {
             if (!value(v)) {
                 return false;
             }
             std::string& target = a == "--pgim"       ? o.pgim
                                   : a == "--gpu-capture" ? o.gpu_capture
+                                  : a == "--sandbox-id" ? o.sandbox_id
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -601,6 +605,7 @@ void run_boot_thread() {
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.host_function_start = host_function_start;
     cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
+    cfg.sandbox_id = g_options.sandbox_id;
     cfg.off_thread_fault = &off_thread_fault;
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {
