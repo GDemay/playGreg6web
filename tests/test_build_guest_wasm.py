@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33)."""
 
 from __future__ import annotations
 
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3831,6 +3833,720 @@ class TestNodeHeapAndHeaderCacheKeys(unittest.TestCase):
             )
             self.assertEqual(r_dir_3.status, "compiled")
             self.assertNotEqual(r_dir_1.cache_key, r_dir_3.cache_key)
+
+
+class TestProxyToPthreadAndSplitJsOptimizer(unittest.TestCase):
+    """R33: --proxy-to-pthread and split-module V8-cage GC + throttled pthread CMD_LOAD pass."""
+
+    EMSCRIPTEN_701_FIXTURE = r"""
+const CMD_LOAD = 'load';
+const CMD_LOADED = 'loaded';
+const CMD_RUN = 'run';
+
+var LDSO = {
+  loadedLibsByName: {
+    'guest_part_0.wasm': { exports: { sub_1000: () => 10, keep_meta: 1 } },
+    'guest_part_1.wasm': { exports: { sub_2000: (a, b) => a + b } },
+    'other_plugin.wasm': { exports: { plugin_init: () => 'ok' } },
+  },
+};
+var wasmImports = {
+  sub_1000: () => 10,
+  emscripten_notify: () => 'alive',
+  malloc: () => 128,
+};
+var GOT = {
+  sub_1000: { value: 1 },
+  sub_2000: { value: 2 },
+  __stack_pointer: { value: 4096 },
+};
+var functionsInTableMap = new Map([
+  ['sub_1000', 1],
+  ['sub_2000', 2],
+]);
+
+var __debugClearChecks = [];
+var __debugResolveCalls = 0;
+
+function instantiateModule(libName, localScope, exportsObj) {
+  var moduleExports;
+  function resolveSymbol(sym) {
+    __debugResolveCalls++;
+    var resolved = wasmImports[sym];
+    if (!resolved && localScope) {
+      resolved = localScope[sym];
+    }
+    if (!resolved && moduleExports) {
+      resolved = moduleExports[sym];
+    }
+    return resolved;
+  }
+
+  var proxyHandler = {
+    get(stubs, prop) {
+      if (!(prop in stubs)) {
+        var resolved;
+        stubs[prop] = (...args) => {
+          resolved ||= resolveSymbol(prop);
+          return resolved(...args);
+        };
+      }
+      return stubs[prop];
+    }
+  };
+  var envProxy = new Proxy({}, proxyHandler);
+  moduleExports = exportsObj;
+  __debugClearChecks.push(() => ({
+    moduleExportsIsNull: moduleExports === null,
+    localScopeIsNull: localScope === null,
+  }));
+  return { envProxy, resolveSymbol };
+}
+
+var __createdStubs = {};
+
+async function loadDylibs() {
+  // Part 0 imports sub_2000 (not in wasmImports yet) and sub_missing (weak/undefined).
+  var part0 = instantiateModule(
+    'guest_part_0.wasm',
+    { sub_local_0: () => 7 },
+    { sub_1000: () => 10 }
+  );
+  __createdStubs.sub_2000 = part0.envProxy.sub_2000;
+  __createdStubs.sub_local_0 = part0.envProxy.sub_local_0;
+  __createdStubs.sub_missing = part0.envProxy.sub_missing;
+
+  // Part 1 loads afterwards and publishes sub_2000 into wasmImports.
+  wasmImports.sub_2000 = (a, b) => a + b;
+  instantiateModule(
+    'guest_part_1.wasm',
+    { sub_local_1: () => 9 },
+    { sub_2000: wasmImports.sub_2000 }
+  );
+}
+
+async function initRuntime() {
+  await loadDylibs();
+}
+
+var PThread = {
+  loadWasmModuleToWorker(worker) {
+    return new Promise((onFinishedLoading) => {
+      worker.onmessage = (e) => {
+        var d = e.data;
+        var cmd = d.cmd;
+        switch (cmd) {
+          case CMD_LOADED:
+            worker.loaded = true;
+            onFinishedLoading(worker);
+            break;
+          default:
+            break;
+        }
+      };
+      worker.postMessage({
+        cmd: CMD_LOAD,
+        urlOrBlob: 'runtime.js',
+        wasmMemory: { shared: true },
+        wasmModule: { id: 'main' },
+        dynamicLibraries: ['guest_part_0.wasm', 'guest_part_1.wasm'],
+      });
+    });
+  },
+};
+"""
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    def _require_node(self) -> str:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node executable not available on PATH")
+        return node
+
+    def _run_node_check(self, js_text: str) -> None:
+        node = self._require_node()
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "runtime.js"
+            js_path.write_text(js_text, encoding="utf-8")
+            proc = subprocess.run(
+                [node, "--check", str(js_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"node --check failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+            )
+
+    def _run_node_script(self, js_text: str) -> dict[str, object]:
+        node = self._require_node()
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "harness.js"
+            js_path.write_text(js_text, encoding="utf-8")
+            proc = subprocess.run(
+                [node, str(js_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"node harness failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+            )
+            return json.loads(proc.stdout)
+
+    def test_proxy_to_pthread_flag_api_and_cli_backwards_compatibility(self) -> None:
+        # Default preserves existing flags identically (no -sPROXY_TO_PTHREAD=1).
+        default_flags = bgw.resolve_link_flags()
+        self.assertEqual(default_flags, bgw.LINK_FLAGS)
+        self.assertNotIn("-sPROXY_TO_PTHREAD=1", default_flags)
+        self.assertNotIn("-sPROXY_TO_PTHREAD=1", bgw.LINK_FLAGS)
+
+        # Enabled via resolve_link_flags and build_link_argv.
+        proxied_flags = bgw.resolve_link_flags(proxy_to_pthread=True)
+        self.assertIn("-sPROXY_TO_PTHREAD=1", proxied_flags)
+        self.assertEqual(proxied_flags.count("-sPROXY_TO_PTHREAD=1"), 1)
+
+        proxied_split_flags = bgw.resolve_link_flags(main_module=True, proxy_to_pthread=True)
+        self.assertIn("-sMAIN_MODULE=1", proxied_split_flags)
+        self.assertIn("-sPROXY_TO_PTHREAD=1", proxied_split_flags)
+
+        argv_default = bgw.build_link_argv(
+            "em++",
+            [Path("a.o")],
+            output_js=Path("web/dist/runtime.js"),
+        )
+        self.assertNotIn("-sPROXY_TO_PTHREAD=1", argv_default)
+
+        argv_proxied = bgw.build_link_argv(
+            "em++",
+            [Path("a.o")],
+            output_js=Path("web/dist/runtime.js"),
+            proxy_to_pthread=True,
+        )
+        self.assertIn("-sPROXY_TO_PTHREAD=1", argv_proxied)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+
+            # run_build default keeps proxy_to_pthread=False.
+            runner_default = RecordingRunner()
+            rep_default = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache1",
+                out_dir=root / "dist1",
+                jobs=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_default,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_default.ok, rep_default.errors)
+            self.assertFalse(rep_default.proxy_to_pthread)
+            self.assertNotIn("-sPROXY_TO_PTHREAD=1", rep_default.link_flags)
+            self.assertNotIn("-sPROXY_TO_PTHREAD=1", runner_default.link_calls[0])
+
+            # run_build with proxy_to_pthread=True appends -sPROXY_TO_PTHREAD=1.
+            runner_proxied = RecordingRunner()
+            rep_proxied = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache2",
+                out_dir=root / "dist2",
+                jobs=1,
+                proxy_to_pthread=True,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_proxied,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_proxied.ok, rep_proxied.errors)
+            self.assertTrue(rep_proxied.proxy_to_pthread)
+            self.assertIn("-sPROXY_TO_PTHREAD=1", rep_proxied.link_flags)
+            self.assertIn("-sPROXY_TO_PTHREAD=1", rep_proxied.link_argv)
+            self.assertIn("-sPROXY_TO_PTHREAD=1", runner_proxied.link_calls[0])
+            self.assertIn("Proxy to pthread: yes (-sPROXY_TO_PTHREAD=1)", bgw.format_report_text(rep_proxied))
+
+            # CLI --proxy-to-pthread & --max-concurrent-pthread-loads dry-run JSON.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--proxy-to-pthread",
+                    "--max-concurrent-pthread-loads",
+                    "3",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-cli"),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["proxy_to_pthread"])
+            self.assertEqual(payload["max_concurrent_pthread_loads"], 3)
+            self.assertIn("-sPROXY_TO_PTHREAD=1", payload["link_flags"])
+            self.assertIn("-sPROXY_TO_PTHREAD=1", payload["link_argv"])
+
+            # Invalid --max-concurrent-pthread-loads values are rejected.
+            for bad in (-1, -5, True, False, "2"):
+                with self.assertRaises(bgw.BuildGuestWasmError, msg=f"bad={bad!r}"):
+                    bgw.parse_max_concurrent_pthread_loads(bad)  # type: ignore[arg-type]
+
+            bad_code, bad_out, _bad_err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--max-concurrent-pthread-loads",
+                    "-1",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2, bad_out)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("max-concurrent-pthread-loads" in e for e in bad_payload["errors"]))
+
+    def test_optimize_split_runtime_js_node_execution_v8_cage_cleanup_and_ordered_throttle(self) -> None:
+        patched, status = bgw.optimize_split_runtime_js(
+            self.EMSCRIPTEN_701_FIXTURE,
+            max_concurrent_pthread_loads=2,
+        )
+        self.assertEqual(
+            status,
+            {
+                "already_patched": False,
+                "stub_binders": True,
+                "export_clearers": True,
+                "post_load_dylibs_cleanup": True,
+                "pthread_cmd_load_throttle": True,
+                "pthread_cmd_loaded_dispatch": True,
+            },
+        )
+        self.assertIn(bgw.SPLIT_PTHREAD_OPT_MARKER, patched)
+        self._run_node_check(patched)
+
+        # Execute live Node.js harness verifying BOTH Patch 1 (V8 cage cleanup + bound stubs)
+        # AND Patch 2 (max 2 concurrent CMD_LOADs + strict CMD_LOAD-before-CMD_RUN ordering).
+        harness = patched + r"""
+(async () => {
+  // ---- Part 1: V8 4 GiB cage cleanup & eager cross-shard stub binding ----
+  await initRuntime();
+
+  const resolveCallsAfterInit = __debugResolveCalls;
+  // Cross-shard lazy stub MUST still invoke resolved target AFTER cleanup without re-resolving!
+  const crossShardResult = __createdStubs.sub_2000(40, 2);
+  const localScopeResult = __createdStubs.sub_local_0();
+  const resolveCallsAfterStubInvocation = __debugResolveCalls;
+
+  const wasmImportKeys = Object.keys(wasmImports).sort();
+  const gotKeys = Object.keys(GOT).sort();
+  const part0ExportKeys = Object.keys(LDSO.loadedLibsByName['guest_part_0.wasm'].exports);
+  const part1ExportKeys = Object.keys(LDSO.loadedLibsByName['guest_part_1.wasm'].exports);
+  const otherPluginKeys = Object.keys(LDSO.loadedLibsByName['other_plugin.wasm'].exports);
+  const clearStates = __debugClearChecks.map((fn) => fn());
+
+  // ---- Part 2: Ordered throttled pthread CMD_LOAD (max 2 concurrent) ----
+  let inFlightLoads = 0;
+  let peakInFlightLoads = 0;
+  let runBeforeLoadViolations = 0;
+  const workerLogs = [];
+
+  class ProtoWorker {
+    constructor(id) {
+      this.id = id;
+      this.onmessage = null;
+      this.loaded = false;
+      this.seenLoad = false;
+      this.messages = [];
+      workerLogs.push(this.messages);
+    }
+    postMessage(msg, transfer) {
+      if (msg.cmd === CMD_LOAD) {
+        this.seenLoad = true;
+        inFlightLoads++;
+        if (inFlightLoads > peakInFlightLoads) peakInFlightLoads = inFlightLoads;
+      } else if (msg.cmd === CMD_RUN && !this.seenLoad) {
+        runBeforeLoadViolations++;
+      }
+      this.messages.push({ cmd: msg.cmd, tag: msg.tag || null, hasTransfer: Array.isArray(transfer) });
+    }
+    completeLoad() {
+      inFlightLoads--;
+      this.onmessage({ data: { cmd: CMD_LOADED } });
+    }
+  }
+
+  function makeOwnPostWorker(id) {
+    const messages = [];
+    workerLogs.push(messages);
+    const w = {
+      id,
+      onmessage: null,
+      loaded: false,
+      seenLoad: false,
+      messages,
+      postMessage(msg, transfer) {
+        if (msg.cmd === CMD_LOAD) {
+          this.seenLoad = true;
+          inFlightLoads++;
+          if (inFlightLoads > peakInFlightLoads) peakInFlightLoads = inFlightLoads;
+        } else if (msg.cmd === CMD_RUN && !this.seenLoad) {
+          runBeforeLoadViolations++;
+        }
+        messages.push({ cmd: msg.cmd, tag: msg.tag || null, hasTransfer: Array.isArray(transfer) });
+      },
+      completeLoad() {
+        inFlightLoads--;
+        this.onmessage({ data: { cmd: CMD_LOADED } });
+      },
+    };
+    return w;
+  }
+
+  // Mix prototype-based Workers (real browser Worker shape) and own-property mock Workers.
+  const workers = [];
+  const loadPromises = [];
+  for (let i = 0; i < 8; i++) {
+    const w = (i % 2 === 0) ? new ProtoWorker(i) : makeOwnPostWorker(i);
+    workers.push(w);
+    loadPromises.push(PThread.loadWasmModuleToWorker(w));
+    // Immediately send CMD_RUN and an extra message with transferList BEFORE CMD_LOADED!
+    w.postMessage({ cmd: CMD_RUN, tag: 'run-' + i });
+    w.postMessage({ cmd: 'custom', tag: 'extra-' + i }, ['fake-port']);
+  }
+
+  const immediateInFlight = inFlightLoads;
+  const queuedWorker2MsgsBeforeRelease = workers[2].messages.length;
+  const queuedWorker7MsgsBeforeRelease = workers[7].messages.length;
+
+  // Complete workers one by one in FIFO order; each completion should release exactly one queued load.
+  const inFlightAfterEachStep = [];
+  for (let i = 0; i < workers.length; i++) {
+    workers[i].completeLoad();
+    inFlightAfterEachStep.push(inFlightLoads);
+  }
+  await Promise.all(loadPromises);
+
+  // Verify postMessage is cleanly unwrapped after load completes.
+  workers[3].postMessage({ cmd: 'ping', tag: 'after-3' });
+  const protoWorkerOwnPropRestored = !Object.prototype.hasOwnProperty.call(workers[2], 'postMessage');
+
+  console.log(JSON.stringify({
+    crossShardResult,
+    localScopeResult,
+    resolveCallsAfterInit,
+    resolveCallsAfterStubInvocation,
+    wasmImportKeys,
+    gotKeys,
+    part0ExportKeys,
+    part1ExportKeys,
+    otherPluginKeys,
+    clearStates,
+    functionsInTableMapSize: functionsInTableMap.size,
+    stubBindersNull: globalThis.__pg6StubBinders === null,
+    exportClearersNull: globalThis.__pg6ExportClearers === null,
+    immediateInFlight,
+    peakInFlightLoads,
+    runBeforeLoadViolations,
+    queuedWorker2MsgsBeforeRelease,
+    queuedWorker7MsgsBeforeRelease,
+    inFlightAfterEachStep,
+    finalActiveLoads: PThread._activeLoads,
+    finalQueueLength: PThread._loadQueue.length,
+    protoWorkerOwnPropRestored,
+    workerLogs,
+  }));
+})();
+"""
+        result = self._run_node_script(harness)
+        # Patch 1 assertions.
+        self.assertEqual(result["crossShardResult"], 42)
+        self.assertEqual(result["localScopeResult"], 7)
+        self.assertEqual(result["resolveCallsAfterStubInvocation"], result["resolveCallsAfterInit"])
+        self.assertEqual(result["wasmImportKeys"], ["emscripten_notify", "malloc"])
+        self.assertEqual(result["gotKeys"], ["__stack_pointer"])
+        self.assertEqual(result["part0ExportKeys"], [])
+        self.assertEqual(result["part1ExportKeys"], [])
+        self.assertEqual(result["otherPluginKeys"], ["plugin_init"])
+        self.assertEqual(
+            result["clearStates"],
+            [
+                {"moduleExportsIsNull": True, "localScopeIsNull": True},
+                {"moduleExportsIsNull": True, "localScopeIsNull": True},
+            ],
+        )
+        self.assertEqual(result["functionsInTableMapSize"], 0)
+        self.assertTrue(result["stubBindersNull"])
+        self.assertTrue(result["exportClearersNull"])
+
+        # Patch 2 assertions.
+        self.assertEqual(result["immediateInFlight"], 2)
+        self.assertEqual(result["peakInFlightLoads"], 2)
+        self.assertEqual(result["runBeforeLoadViolations"], 0)
+        self.assertEqual(result["queuedWorker2MsgsBeforeRelease"], 0)
+        self.assertEqual(result["queuedWorker7MsgsBeforeRelease"], 0)
+        self.assertEqual(result["inFlightAfterEachStep"], [2, 2, 2, 2, 2, 2, 1, 0])
+        self.assertEqual(result["finalActiveLoads"], 0)
+        self.assertEqual(result["finalQueueLength"], 0)
+        self.assertTrue(result["protoWorkerOwnPropRestored"])
+
+        worker_logs = result["workerLogs"]
+        assert isinstance(worker_logs, list)
+        self.assertEqual(len(worker_logs), 8)
+        for idx, msgs in enumerate(worker_logs):
+            expected_prefix = [
+                {"cmd": "load", "tag": None, "hasTransfer": False},
+                {"cmd": "run", "tag": f"run-{idx}", "hasTransfer": False},
+                {"cmd": "custom", "tag": f"extra-{idx}", "hasTransfer": True},
+            ]
+            self.assertEqual(msgs[:3], expected_prefix, f"worker {idx}: {msgs}")
+        self.assertEqual(
+            worker_logs[3][-1],
+            {"cmd": "ping", "tag": "after-3", "hasTransfer": False},
+        )
+
+    def test_optimize_split_runtime_js_idempotency_disable_throttle_and_safe_noop(self) -> None:
+        # 1) Idempotent: calling twice yields byte-for-byte identical output.
+        once, status1 = bgw.optimize_split_runtime_js(self.EMSCRIPTEN_701_FIXTURE)
+        twice, status2 = bgw.optimize_split_runtime_js(once)
+        self.assertEqual(twice, once)
+        self.assertFalse(status1["already_patched"])
+        self.assertTrue(status2["already_patched"])
+        self.assertFalse(any(v for k, v in status2.items() if k != "already_patched"))
+
+        # 2) max_concurrent_pthread_loads=0 disables Patch 2 while keeping Patch 1 active.
+        no_throttle, status_nt = bgw.optimize_split_runtime_js(
+            self.EMSCRIPTEN_701_FIXTURE,
+            max_concurrent_pthread_loads=0,
+        )
+        self.assertTrue(status_nt["stub_binders"])
+        self.assertTrue(status_nt["export_clearers"])
+        self.assertTrue(status_nt["post_load_dylibs_cleanup"])
+        self.assertFalse(status_nt["pthread_cmd_load_throttle"])
+        self.assertFalse(status_nt["pthread_cmd_loaded_dispatch"])
+        self.assertNotIn("PThread._loadQueue", no_throttle)
+        self._run_node_check(no_throttle)
+
+        # 3) Non-matching JS is returned completely unmodified without marker comment.
+        plain_js = "export default function createRuntimeModule() { return {}; }\n"
+        out_plain, status_plain = bgw.optimize_split_runtime_js(plain_js)
+        self.assertEqual(out_plain, plain_js)
+        self.assertNotIn(bgw.SPLIT_PTHREAD_OPT_MARKER, out_plain)
+        self.assertFalse(any(status_plain.values()))
+
+        # 4) Atomic guard: CMD_LOAD without CMD_LOADED does NOT apply throttle (prevents deadlock).
+        load_only_js = (
+            "var PThread = { loadWasmModuleToWorker(worker) {\n"
+            "  worker.postMessage({ cmd: CMD_LOAD, wasmMemory });\n"
+            "} };\n"
+        )
+        out_load_only, status_load_only = bgw.optimize_split_runtime_js(load_only_js)
+        self.assertEqual(out_load_only, load_only_js)
+        self.assertFalse(status_load_only["pthread_cmd_load_throttle"])
+        self.assertFalse(status_load_only["pthread_cmd_loaded_dispatch"])
+
+        # 5) Atomic guard: var moduleExports without await loadDylibs() leaves JS unmodified.
+        exports_only_js = "function f() { var moduleExports; return moduleExports; }\n"
+        out_exp_only, status_exp_only = bgw.optimize_split_runtime_js(exports_only_js)
+        self.assertEqual(out_exp_only, exports_only_js)
+        self.assertFalse(status_exp_only["export_clearers"])
+
+    def test_optimize_split_runtime_js_whitespace_quote_and_weakmap_variations(self) -> None:
+        # Realistic variation: quoted keys, string 'load'/'loaded', if-style handler,
+        # WeakMap functionsInTableMap, non-first cmd property, strings with '})' inside postMessage,
+        # and compact/minified lazy stub syntax.
+        variant_js = r"""
+var LDSO = { loadedLibsByName: { '/dist/guest_part_4.wasm': { exports: { sub_9: () => 99 } } } };
+var wasmImports = { sub_9: () => 99, keep_fn: () => 1 };
+var GOT = { sub_9: { value: 9 }, keep_got: { value: 1 } };
+var functionsInTableMap = new WeakMap();
+functionsInTableMap.set(wasmImports.sub_9, 1);
+
+function loadWebAssemblyModule(localScope) {
+  let moduleExports;
+  function resolveSymbol(s) { return wasmImports[s] || (localScope && localScope[s]) || (moduleExports && moduleExports[s]); }
+  var proxyHandler = {
+    get(stubs, prop) {
+      if(!(prop in stubs)){let resolved;stubs[prop]=(...args)=>{resolved||=resolveSymbol(prop);return resolved(...args)};}
+      return stubs[prop];
+    }
+  };
+  moduleExports = { sub_9: wasmImports.sub_9 };
+  return new Proxy({}, proxyHandler);
+}
+var p;
+async function loadDylibs() { p = loadWebAssemblyModule({}); p.sub_9; }
+async function boot() { await loadDylibs(); }
+
+var PThread = {
+  loadWasmModuleToWorker(w) {
+    w.onmessage = (e) => {
+      var cmd = e.data.cmd;
+      if (cmd === 'loaded') {
+        w.done = true;
+      }
+    };
+    w.postMessage({
+      urlOrBlob: "https://example.invalid/runtime.js?a=({b})",
+      'cmd': 'load',
+      nested: { ok: true },
+    });
+  }
+};
+"""
+        patched, status = bgw.optimize_split_runtime_js(variant_js, max_concurrent_pthread_loads=1)
+        self.assertTrue(status["stub_binders"])
+        self.assertTrue(status["export_clearers"])
+        self.assertTrue(status["post_load_dylibs_cleanup"])
+        self.assertTrue(status["pthread_cmd_load_throttle"])
+        self.assertTrue(status["pthread_cmd_loaded_dispatch"])
+        self._run_node_check(patched)
+
+        res = self._run_node_script(
+            patched
+            + r"""
+(async () => {
+  await boot();
+  const val = p.sub_9();
+  const seen = [];
+  const makeW = (id) => ({
+    onmessage: null,
+    postMessage(m) { seen.push([id, m.cmd]); },
+  });
+  const w0 = makeW(0), w1 = makeW(1);
+  PThread.loadWasmModuleToWorker(w0);
+  PThread.loadWasmModuleToWorker(w1);
+  w1.postMessage({ cmd: 'run' });
+  const beforeComplete = seen.slice();
+  w0.onmessage({ data: { cmd: 'loaded' } });
+  w1.onmessage({ data: { cmd: 'loaded' } });
+  console.log(JSON.stringify({
+    val,
+    weakMapCleared: functionsInTableMap === undefined,
+    part4Cleared: Object.keys(LDSO.loadedLibsByName['/dist/guest_part_4.wasm'].exports).length === 0,
+    beforeComplete,
+    seen,
+    active: PThread._activeLoads,
+  }));
+})();
+"""
+        )
+        self.assertEqual(res["val"], 99)
+        self.assertTrue(res["weakMapCleared"])
+        self.assertTrue(res["part4Cleared"])
+        self.assertEqual(res["beforeComplete"], [[0, "load"]])
+        self.assertEqual(res["seen"], [[0, "load"], [1, "load"], [1, "run"]])
+        self.assertEqual(res["active"], 0)
+
+    def test_run_build_auto_patches_split_runtime_js_only_for_non_dry_split_builds(self) -> None:
+        fixture_js = self.EMSCRIPTEN_701_FIXTURE
+
+        class EmscriptenJsRunner(RecordingRunner):
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                out_path = _dash_o(tuple(str(a) for a in argv))
+                if out_path is not None and Path(out_path).name == bgw.RUNTIME_JS:
+                    Path(out_path).write_text(fixture_js, encoding="utf-8")
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+
+            # 1) Split build (split_modules=2) patches runtime.js automatically.
+            dist_split = root / "dist-split"
+            rep_split = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-split",
+                out_dir=dist_split,
+                jobs=2,
+                split_modules=2,
+                proxy_to_pthread=True,
+                max_concurrent_pthread_loads=2,
+                runtime_lib=orig_lib,
+                run_command=EmscriptenJsRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_split.ok, rep_split.errors)
+            self.assertTrue(rep_split.proxy_to_pthread)
+            self.assertIn("-sPROXY_TO_PTHREAD=1", rep_split.link_flags)
+            self.assertEqual(
+                rep_split.split_runtime_js_patches,
+                {
+                    "already_patched": False,
+                    "stub_binders": True,
+                    "export_clearers": True,
+                    "post_load_dylibs_cleanup": True,
+                    "pthread_cmd_load_throttle": True,
+                    "pthread_cmd_loaded_dispatch": True,
+                },
+            )
+            patched_text = (dist_split / bgw.RUNTIME_JS).read_text(encoding="utf-8")
+            self.assertIn(bgw.SPLIT_PTHREAD_OPT_MARKER, patched_text)
+            self._run_node_check(patched_text)
+            self.assertIn("Split runtime JS opt:", bgw.format_report_text(rep_split))
+
+            # Re-running file wrapper directly is idempotent.
+            second_status = bgw.patch_split_runtime_js_file(dist_split / bgw.RUNTIME_JS)
+            self.assertTrue(second_status["already_patched"])
+            self.assertEqual((dist_split / bgw.RUNTIME_JS).read_text(encoding="utf-8"), patched_text)
+
+            # Missing file degrades cleanly without raising.
+            missing_status = bgw.patch_split_runtime_js_file(root / "does_not_exist.js")
+            self.assertFalse(any(missing_status.values()))
+
+            # 2) Monolithic build (split_modules=1) leaves runtime.js untouched.
+            dist_mono = root / "dist-mono"
+            rep_mono = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-mono",
+                out_dir=dist_mono,
+                jobs=2,
+                split_modules=1,
+                runtime_lib=orig_lib,
+                run_command=EmscriptenJsRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_mono.ok, rep_mono.errors)
+            self.assertIsNone(rep_mono.split_runtime_js_patches)
+            self.assertEqual((dist_mono / bgw.RUNTIME_JS).read_text(encoding="utf-8"), fixture_js)
+
+            # 3) Dry-run split build skips patching and leaves split_runtime_js_patches=None.
+            rep_dry = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-dry",
+                out_dir=root / "dist-dry",
+                jobs=2,
+                split_modules=2,
+                dry_run=True,
+                runtime_lib=orig_lib,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep_dry.ok, rep_dry.errors)
+            self.assertIsNone(rep_dry.split_runtime_js_patches)
 
 
 class TestLinkFlagContract(unittest.TestCase):
