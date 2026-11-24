@@ -1063,4 +1063,108 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    fn enc_smem(
+        op: u8,
+        sdata: u8,
+        sbase_pair: u8,
+        soffset: u8,
+        offset: i32,
+        glc: bool,
+        dlc: bool,
+    ) -> [u32; 2] {
+        let w0 = (0b111101u32 << 26)
+            | (u32::from(op) << 18)
+            | (u32::from(glc) << 16)
+            | (u32::from(dlc) << 14)
+            | (u32::from(sdata & 0x7F) << 6)
+            | u32::from(sbase_pair & 0x3F);
+        let w1 = (u32::from(soffset & 0x7F) << 25) | ((offset as u32) & 0x001F_FFFF);
+        [w0, w1]
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_emits_tight_cbv_sizes_and_binding_metadata_in_json() {
+        // 1) Small CBV shader reading cb[0..2] (offsets 0..44) -> 48 B (3 vec4s)
+        let mut small_words = Vec::new();
+        small_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x00, false, false));
+        small_words.extend_from_slice(&enc_smem(0x08, 8, 0, 0x7D, 0x2C, false, false));
+        small_words.push(enc_vop1(0x01, 0, 4));
+        small_words.push(enc_vop1(0x01, 1, 8));
+        small_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        small_words.push(enc_sopp(0x01, 0));
+
+        // 2) Large CBV shader reading cb[20] (offset 0x140) -> 336 B (21 vec4s)
+        let mut large_words = Vec::new();
+        large_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x140, false, false));
+        large_words.push(enc_vop1(0x01, 0, 4));
+        large_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 0, 0, 0]));
+        large_words.push(enc_sopp(0x01, 0));
+
+        // 3) Multi-CBV shader: cb0 reading vec4 1 (32 B) and cb1 reading vec4 5 (96 B)
+        let mut multi_words = Vec::new();
+        multi_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x10, false, false));
+        multi_words.extend_from_slice(&enc_smem(0x0A, 8, 2, 0x7D, 0x50, false, false));
+        multi_words.push(enc_vop1(0x01, 0, 4));
+        multi_words.push(enc_vop1(0x01, 1, 8));
+        multi_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        multi_words.push(enc_sopp(0x01, 0));
+
+        let blobs = vec![
+            Rdna2BlobInput::new("ps_0000000000000101.rdna2", words_to_bytes(&small_words)),
+            Rdna2BlobInput::new("ps_0000000000000102.rdna2", words_to_bytes(&large_words)),
+            Rdna2BlobInput::new("ps_0000000000000103.rdna2", words_to_bytes(&multi_words)),
+        ];
+
+        let result = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default())
+            .expect("pack_rdna2_blobs should succeed");
+        assert_eq!(result.summary.translated_ok, 3);
+
+        let decoded = read_pack(&result.pack_bytes).expect("WGPK read should succeed");
+        assert_eq!(decoded.entries.len(), 3);
+        assert!(decoded.entries[0].wgsl.contains("array<vec4<u32>, 3>"));
+        assert!(decoded.entries[1].wgsl.contains("array<vec4<u32>, 21>"));
+        assert!(decoded.entries[2].wgsl.contains("array<vec4<u32>, 2>"));
+        assert!(decoded.entries[2].wgsl.contains("array<vec4<u32>, 6>"));
+        for entry in &decoded.entries {
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        // Verify per-entry binding metadata in summary structs and JSON.
+        assert_eq!(result.summary.entries[0].bindings[0].min_binding_size_bytes, Some(48));
+        assert_eq!(result.summary.entries[0].bindings[0].highest_vec4_offset, Some(2));
+        assert_eq!(result.summary.entries[1].bindings[0].min_binding_size_bytes, Some(336));
+        assert_eq!(result.summary.entries[1].bindings[0].highest_vec4_offset, Some(20));
+        assert_eq!(result.summary.entries[2].bindings.len(), 2);
+        assert_eq!(result.summary.entries[2].bindings[0].min_binding_size_bytes, Some(32));
+        assert_eq!(result.summary.entries[2].bindings[0].highest_vec4_offset, Some(1));
+        assert_eq!(result.summary.entries[2].bindings[1].min_binding_size_bytes, Some(96));
+        assert_eq!(result.summary.entries[2].bindings[1].highest_vec4_offset, Some(5));
+
+        let json = result.summary.to_json();
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 48, \"highest_vec4_offset\": 2}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 336, \"highest_vec4_offset\": 20}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 32, \"highest_vec4_offset\": 1}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 3, \"kind\": \"uniform\", \"name\": \"cb1\", \"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5}"
+            ),
+            "JSON:\n{json}"
+        );
+    }
 }
