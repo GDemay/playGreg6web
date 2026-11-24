@@ -296,6 +296,9 @@ ProgramError prepare_program_boot(const Pg6Program& program,
         if (m.lifted_functions != nullptr && count != 0) {
             module.lifted_tables.emplace_back(m.lifted_functions, static_cast<size_t>(count));
         }
+        if (m.shard_dispatch != nullptr) {
+            module.shard_dispatch_tables.push_back(m.shard_dispatch);
+        }
         const Pg6BootImport* imports = m.imports != nullptr ? *m.imports : nullptr;
         const size_t import_count = m.import_count != nullptr ? *m.import_count : 0;
         std::vector<BootImport>& table = out.imports.emplace_back();

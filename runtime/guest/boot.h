@@ -11,6 +11,7 @@
 #include "guest/export_thunks.h"
 #include "guest/guest_runtime.h"
 #include "guest/memory_model.h"
+#include "guest/shard_dispatch.h"
 #include "os/xgameruntime_provider.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
@@ -389,6 +390,8 @@ struct BootModule {
     std::string path;                        // may be empty
     // This module's lifted functions (the generated `__playgta6_lifted_functions_<module>` table).
     std::vector<std::span<const LiftedFunctionEntry>> lifted_tables;
+    // Optional shard-level dispatch tables (R37, Pg6ShardDispatchTable).
+    std::vector<const Pg6ShardDispatchTable*> shard_dispatch_tables;
     std::span<const BootImport> imports;  // this image's IAT slots
     // TLS directory RVA override when the PE headers are not mapped (0 = read the headers).
     uint32_t tls_directory_rva = 0;
@@ -551,6 +554,8 @@ struct Pg6GuestBootModule {
     size_t lifted_table_count;
     const Pg6BootImport* imports;
     size_t import_count;
+    const Pg6ShardDispatchTable* const* shard_dispatch_tables;
+    size_t shard_dispatch_table_count;
 };
 
 struct Pg6GuestBootConfig {

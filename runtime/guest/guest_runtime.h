@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <type_traits>
 
 #include "abi/playgta6_abi.h"
+#include "guest/shard_dispatch.h"
 #include "os/vmem.h"
 
 // Guest runtime: runs statically recompiled guest code (see docs/wasm_abi.md, "Recompiled Guest
@@ -159,7 +161,18 @@ inline constexpr bool is_synthetic_address(uint64_t va) {
 // synthetic va, a range overlapping an already registered table, or more than kMaxLiftedTables.
 bool register_lifted_functions(std::span<const LiftedFunctionEntry> table);
 LiftedFn find_lifted_function(uint64_t va);
+// Total registered lifted functions across both per-function tables and shard dispatch tables.
 size_t lifted_function_count();
+
+// Registers a shard-level dispatch table (R37, Pg6ShardDispatchTable). Multiple modules may each
+// register a table; lookups are lock-free O(log N) with zero allocations. Fails (false) if the
+// table is malformed, contains a synthetic VA, or duplicates an existing shard-dispatched VA.
+bool register_shard_dispatch_table(const Pg6ShardDispatchTable& table, std::string* error = nullptr);
+bool find_shard_dispatch_target(uint64_t va, ResolvedShardTarget& out);
+// Highest registered lifted entry <= va across both per-function and shard dispatch tables (0 if none).
+uint64_t nearest_lifted_function_entry(uint64_t va);
+size_t shard_dispatch_function_count();
+size_t shard_dispatch_shard_count();
 
 // ---------------------------------------------------------------------------
 // Imports and host callables
@@ -293,6 +306,7 @@ void reset_guest_runtime();
 extern "C" {
 
 int32_t pg6_guest_register_lifted_functions(const Pg6LiftedFunctionEntry* entries, size_t count);
+int32_t pg6_guest_register_shard_dispatch_table(const Pg6ShardDispatchTable* table);
 playgta6::LiftedFn pg6_guest_find_lifted_function(uint64_t va);
 size_t pg6_guest_bind_import_slots(uint64_t image_base, const Pg6ImportSlotBinding* slots, size_t count);
 uint64_t pg6_guest_register_host_callable(Pg6HostThunkFn thunk, const char* name, uint64_t proc_address);

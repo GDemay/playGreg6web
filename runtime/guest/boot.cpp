@@ -120,6 +120,7 @@ struct ModuleState {
     uint32_t tls_rva = 0;
     uint32_t tls_size = 0;
     std::vector<std::span<const LiftedFunctionEntry>> tables;
+    size_t shard_table_count = 0;
     uint64_t functions = 0;
     size_t import_count = 0;
     uint64_t imports_bound = 0;
@@ -229,6 +230,7 @@ struct BootState {
     std::vector<ModuleState> modules;
     std::vector<ExecRange> exec;
     std::vector<std::span<const LiftedFunctionEntry>> tables;  // all modules
+    size_t shard_table_count = 0;
     uint64_t functions_registered = 0;
     std::vector<std::pair<uint64_t, uint64_t>> host_map;  // host fn -> guest va (lazy)
     bool host_map_built = false;
@@ -447,9 +449,9 @@ std::u16string utf8_to_utf16(std::string_view text) {
 // Lookups
 // ---------------------------------------------------------------------------
 
-// Highest registered lifted entry <= va (0 if none).
+// Highest registered lifted entry <= va (0 if none), across both per-function and shard dispatch tables.
 uint64_t nearest_entry(uint64_t va) {
-    uint64_t best = 0;
+    uint64_t best = nearest_lifted_function_entry(va);
     for (const auto& table : boot().tables) {
         if (table.empty() || va < table.front().va) {
             continue;
@@ -1833,7 +1835,8 @@ std::string build_report() {
         o += "{\"name\": " + json_string(m.name) + ", \"image_base\": " + hex_or_null(m.image.base) +
              ", \"image_size\": " + hex(m.image.size_of_image) + ", \"entry_point\": " +
              hex_or_null(m.image.entry_point) + ", \"rebased\": " + (m.image.rebased ? "true" : "false") +
-             ", \"lifted_tables\": " + std::to_string(m.tables.size()) + ", \"functions\": " +
+             ", \"lifted_tables\": " + std::to_string(m.tables.size()) +
+             ", \"shard_dispatch_tables\": " + std::to_string(m.shard_table_count) + ", \"functions\": " +
              std::to_string(m.functions) + ", \"imports\": {\"total\": " +
              std::to_string(m.import_count) + ", \"bound\": " + std::to_string(m.imports_bound) +
              ", \"unresolved\": " + std::to_string(m.imports_unresolved) + ", \"runtime_thunks\": " +
@@ -1842,6 +1845,7 @@ std::string build_report() {
     }
     o += b.modules.empty() ? "],\n" : "\n  ],\n";
     o += "    \"lifted_tables\": " + std::to_string(b.tables.size()) +
+         ", \"shard_dispatch_tables\": " + std::to_string(b.shard_table_count) +
          ", \"functions_registered\": " + std::to_string(b.functions_registered) + ",\n";
     o += "    \"imports\": {\"total\": " + std::to_string(b.imports.size()) +
          ", \"bound\": " + std::to_string(b.imports_bound) +
@@ -2456,6 +2460,7 @@ void reset_boot() {
     b.modules.clear();
     b.exec.clear();
     b.tables.clear();
+    b.shard_table_count = 0;
     b.functions_registered = 0;
     b.host_map.clear();
     b.host_map_built = false;
@@ -2636,6 +2641,22 @@ BootResult run_boot(const BootConfig& config) {
             m.functions += table.size();
             b.tables.push_back(table);
         }
+        for (const Pg6ShardDispatchTable* shard_table : config.modules[i].shard_dispatch_tables) {
+            if (shard_table == nullptr) {
+                fail_setup(BootStatus::RegisterFailed,
+                           "shard dispatch table of " + m.name + " rejected: null table pointer");
+                return finish();
+            }
+            std::string shard_error;
+            if (!register_shard_dispatch_table(*shard_table, &shard_error)) {
+                fail_setup(BootStatus::RegisterFailed,
+                           "shard dispatch table of " + m.name + " rejected: " + shard_error);
+                return finish();
+            }
+            ++m.shard_table_count;
+            m.functions += shard_table->entry_count;
+            ++b.shard_table_count;
+        }
     }
     b.functions_registered = lifted_function_count();
     b.phase = "bind";
@@ -2695,10 +2716,11 @@ BootResult run_boot(const BootConfig& config) {
             return finish();
         }
     }
-    logf("guest boot: %" PRIu64 " lifted functions in %zu table(s); %zu imports, %" PRIu64
-         " bound to shims, %" PRIu64 " without a shim%s",
-         b.functions_registered, b.tables.size(), b.imports.size(), b.imports_bound,
-         b.imports_unresolved, b.survey ? " [survey mode]" : "");
+    logf("guest boot: %" PRIu64 " lifted functions in %zu table(s) and %zu shard dispatch table(s) (%zu shard(s)); "
+         "%zu imports, %" PRIu64 " bound to shims, %" PRIu64 " without a shim%s",
+         b.functions_registered, b.tables.size(), b.shard_table_count, shard_dispatch_shard_count(),
+         b.imports.size(), b.imports_bound, b.imports_unresolved,
+         b.survey ? " [survey mode]" : "");
     if (!config.export_thunks.empty()) {
         const ExportThunkStats exports = register_export_thunks(config.export_thunks);
         logf("guest boot: %zu export thunks: %zu new guest-callable entries, %zu sharing an existing "
@@ -2849,6 +2871,11 @@ int32_t pg6_guest_boot_run(const Pg6GuestBootConfig* config, Pg6GuestBootStats* 
                 if (in.lifted_tables != nullptr && in.lifted_table_counts != nullptr &&
                     in.lifted_tables[i] != nullptr) {
                     module.lifted_tables.emplace_back(in.lifted_tables[i], in.lifted_table_counts[i]);
+                }
+            }
+            for (size_t i = 0; i < in.shard_dispatch_table_count; ++i) {
+                if (in.shard_dispatch_tables != nullptr && in.shard_dispatch_tables[i] != nullptr) {
+                    module.shard_dispatch_tables.push_back(in.shard_dispatch_tables[i]);
                 }
             }
             if (in.imports != nullptr) {
