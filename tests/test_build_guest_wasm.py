@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e)."""
 
 from __future__ import annotations
 
@@ -4771,6 +4771,8 @@ class TestContiguousSplitBucketing(unittest.TestCase):
             self.assertEqual(bgw.parse_split_strategy("balanced"), "balanced")
             self.assertEqual(bgw.parse_split_strategy("contiguous"), "contiguous")
             self.assertEqual(bgw.parse_split_strategy(" CONTIGUOUS "), "contiguous")
+            self.assertEqual(bgw.parse_split_strategy("asymmetric"), "asymmetric")
+            self.assertEqual(bgw.parse_split_strategy(" ASYMMETRIC "), "asymmetric")
             for bad in ("", "roundrobin", "random", "lpt", None, 123, True):
                 with self.assertRaises(bgw.BuildGuestWasmError, msg=f"strategy={bad!r}"):
                     bgw.parse_split_strategy(bad)  # type: ignore[arg-type]
@@ -4967,6 +4969,294 @@ class TestContiguousSplitBucketing(unittest.TestCase):
             )
             self.assertEqual(bad_code_txt, 2)
             self.assertIn("split-strategy", bad_err_txt)
+
+
+class TestAsymmetricSideModuleSplit(unittest.TestCase):
+    """R37e: asymmetric contiguous pack + -sSIDE_MODULE=2 under the V8 1 GiB cap."""
+
+    def _fake_item(self, unit_id: str, size: int) -> bgw.UnitBuildResult:
+        path = Path(unit_id)
+        return bgw.UnitBuildResult(
+            unit=bgw.SourceUnit(unit_id, path, "ll"),
+            cache_key="k",
+            cache_hit=True,
+            object_path=path.with_suffix(".o"),
+            argv=(),
+            status="hit",
+            object_bytes=size,
+        )
+
+    def test_constants_and_side_module_mode_defaults(self) -> None:
+        self.assertEqual(bgw.SIDE_MODULE_FLAG, "-sSIDE_MODULE=1")
+        self.assertEqual(bgw.SIDE_MODULE_PRUNED_FLAG, "-sSIDE_MODULE=2")
+        self.assertEqual(bgw.DEFAULT_MAX_SIDE_MODULE_MIB, 994)
+        self.assertLessEqual(bgw.DEFAULT_MAX_SIDE_MODULE_MIB, bgw.MAX_SIDE_MODULE_MIB_LIMIT)
+        self.assertEqual(bgw.MAX_SIDE_MODULE_MIB_LIMIT, 1024)
+        self.assertEqual(bgw.side_module_mode_for_strategy("balanced"), 1)
+        self.assertEqual(bgw.side_module_mode_for_strategy("contiguous"), 1)
+        self.assertEqual(bgw.side_module_mode_for_strategy("asymmetric"), 2)
+        pruned = bgw.resolve_side_module_link_flags(pruned=True)
+        legacy = bgw.resolve_side_module_link_flags(pruned=False)
+        self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, pruned)
+        self.assertNotIn(bgw.SIDE_MODULE_FLAG, pruned)
+        self.assertIn(bgw.SIDE_MODULE_FLAG, legacy)
+        self.assertNotIn(bgw.SIDE_MODULE_PRUNED_FLAG, legacy)
+
+    def test_asymmetric_partition_targets_994_171_two_part_shape(self) -> None:
+        # Scale the proven ~994/171 MiB shape down to small byte weights for unit tests.
+        # part_0 packs up to 994, part_1 gets the remaining 171.
+        sizes = [400, 300, 294, 100, 71]  # sums to 1165; ceiling 994 -> [400+300+294]=994 | [100+71]=171
+        items = [
+            self._fake_item(f"lift/shard-{idx:05d}.ll", size) for idx, size in enumerate(sizes)
+        ]
+        buckets = bgw.partition_shards_asymmetric(items, 2, max_bucket_bytes=994)
+        self.assertEqual(len(buckets), 2)
+        self.assertEqual(
+            [it.unit.unit_id for it in buckets[0]],
+            ["lift/shard-00000.ll", "lift/shard-00001.ll", "lift/shard-00002.ll"],
+        )
+        self.assertEqual(
+            [it.unit.unit_id for it in buckets[1]],
+            ["lift/shard-00003.ll", "lift/shard-00004.ll"],
+        )
+        self.assertEqual(sum(bgw._partition_weight(it) for it in buckets[0]), 994)
+        self.assertEqual(sum(bgw._partition_weight(it) for it in buckets[1]), 171)
+        # Largest module stays under a 1024 MiB-equivalent ceiling.
+        self.assertLessEqual(sum(bgw._partition_weight(it) for it in buckets[0]), 1024)
+
+        via_wrapper = bgw.partition_shard_units(
+            items,
+            2,
+            strategy="asymmetric",
+            max_bucket_bytes=994,
+        )
+        self.assertEqual(
+            [[it.unit.unit_id for it in b] for b in via_wrapper],
+            [[it.unit.unit_id for it in b] for b in buckets],
+        )
+
+        # Default MiB ceiling converts to bytes via DEFAULT_MAX_SIDE_MODULE_MIB.
+        default_cap = bgw.DEFAULT_MAX_SIDE_MODULE_MIB * 1024 * 1024
+        big = [
+            self._fake_item("lift/shard-00000.ll", default_cap - 10),
+            self._fake_item("lift/shard-00001.ll", 5),
+            self._fake_item("lift/shard-00002.ll", 20),
+        ]
+        packed = bgw.partition_shards_asymmetric(big, 2)
+        self.assertEqual(len(packed), 2)
+        self.assertEqual(
+            [it.unit.unit_id for it in packed[0]],
+            ["lift/shard-00000.ll", "lift/shard-00001.ll"],
+        )
+        self.assertEqual([it.unit.unit_id for it in packed[1]], ["lift/shard-00002.ll"])
+        self.assertLessEqual(
+            sum(bgw._partition_weight(it) for it in packed[0]),
+            bgw.V8_MAX_WASM_MODULE_BYTES,
+        )
+
+    def test_asymmetric_partition_validation_and_edge_cases(self) -> None:
+        items = [self._fake_item(f"lift/shard-{i:05d}.ll", 10 * (i + 1)) for i in range(4)]
+        self.assertEqual(bgw.partition_shards_asymmetric([], 2), [])
+        self.assertEqual(
+            [[it.unit.unit_id for it in b] for b in bgw.partition_shards_asymmetric(items, 1)],
+            [["lift/shard-00000.ll", "lift/shard-00001.ll", "lift/shard-00002.ll", "lift/shard-00003.ll"]],
+        )
+        # Fewer shards than buckets: one shard per bucket.
+        singleton = bgw.partition_shards_asymmetric(items[:2], 5)
+        self.assertEqual(len(singleton), 2)
+        self.assertTrue(all(len(b) == 1 for b in singleton))
+
+        self.assertEqual(bgw.parse_max_side_module_mib(994), 994)
+        self.assertEqual(bgw.parse_max_side_module_mib(1024), 1024)
+        for bad in (0, -1, 1025, True, None, "990"):
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"max_side_module_mib={bad!r}"):
+                bgw.parse_max_side_module_mib(bad)  # type: ignore[arg-type]
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.partition_shards_asymmetric(items, 2, max_bucket_bytes=0)
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.partition_shards_asymmetric(items, 2, max_bucket_bytes=True)  # type: ignore[arg-type]
+
+    def test_run_build_asymmetric_uses_side_module_2_and_records_sizes(self) -> None:
+        class SizedCompileRunner(RecordingRunner):
+            def __init__(self, size_by_stem: dict[str, int]) -> None:
+                super().__init__()
+                self.size_by_stem = size_by_stem
+
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                tokens = tuple(str(a) for a in argv)
+                out_path = _dash_o(tokens)
+                src_token = _source_token(tokens)
+                if (
+                    res.returncode == 0
+                    and out_path is not None
+                    and Path(out_path).suffix.lower() == ".o"
+                    and src_token is not None
+                ):
+                    stem = Path(src_token).stem
+                    size = self.size_by_stem.get(stem)
+                    if size is not None:
+                        Path(out_path).write_bytes(b"\x00" * size)
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+            _write(repo / "runtime" / "wasm_boot.cpp", "void wasm_boot() {}\n")
+
+            src = root / "recomp-asym"
+            # Object weights: 500+300+194 = 994 for part_0; 100+71 = 171 for part_1.
+            shard_sizes = {
+                "shard-00000": 500,
+                "shard-00001": 300,
+                "shard-00002": 194,
+                "shard-00003": 100,
+                "shard-00004": 71,
+            }
+            for name in sorted(shard_sizes):
+                _write(src / "lift" / f"{name}.ll", f"; {name}\n")
+            _write(src / "lift" / "functions.ll", "; registration table\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            cache = root / "cache-asym"
+            out_dir = root / "dist-asym"
+            # Object weights are tiny vs the 994 MiB ceiling, so part_0 takes every shard
+            # except the one reserved for a non-empty part_1. The exact 994/171 cut is
+            # covered by test_asymmetric_partition_targets_994_171_two_part_shape.
+            runner = SizedCompileRunner(shard_sizes)
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                max_side_module_mib=994,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.split_strategy, "asymmetric")
+            self.assertEqual(report.side_module_mode, 2)
+            self.assertEqual(report.max_side_module_mib, 994)
+            self.assertEqual(len(report.side_modules), 3)
+            for side in report.side_modules:
+                self.assertEqual(side.side_module_mode, 2)
+                self.assertGreater(side.estimated_bytes, 0)
+                self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, side.link_argv)
+                self.assertNotIn(bgw.SIDE_MODULE_FLAG, side.link_argv)
+            for side_call in runner.side_link_calls:
+                self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, side_call)
+                self.assertNotIn(bgw.SIDE_MODULE_FLAG, side_call)
+
+            # With a 994 MiB ceiling and only ~1 KiB of objects, asymmetric still emits two
+            # non-empty contiguous shard buckets (reserves at least one shard for part_1).
+            self.assertEqual(len(report.side_modules[0].shards) + len(report.side_modules[1].shards), 5)
+            self.assertGreaterEqual(len(report.side_modules[0].shards), 1)
+            self.assertGreaterEqual(len(report.side_modules[1].shards), 1)
+            self.assertEqual(report.side_modules[2].shards, ("lift/functions.ll",))
+            self.assertEqual(
+                report.side_modules[0].estimated_bytes + report.side_modules[1].estimated_bytes,
+                sum(shard_sizes.values()),
+            )
+
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertEqual(payload["split_strategy"], "asymmetric")
+            self.assertEqual(payload["side_module_mode"], 2)
+            self.assertEqual(payload["max_side_module_mib"], 994)
+            self.assertEqual(payload["side_modules"][0]["estimated_bytes"], report.side_modules[0].estimated_bytes)
+
+            gm = json.loads((out_dir / bgw.GUEST_MANIFEST_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(gm["splitStrategy"], "asymmetric")
+            self.assertEqual(gm["sideModuleMode"], 2)
+            self.assertEqual(gm["maxSideModuleMiB"], 994)
+            self.assertEqual(
+                gm["sideModules"],
+                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
+            )
+            self.assertEqual(len(gm["sideModuleSizes"]), 3)
+            self.assertEqual(gm["sideModuleSizes"][0]["estimatedBytes"], report.side_modules[0].estimated_bytes)
+            self.assertEqual(gm["sideModuleSizes"][0]["sideModuleMode"], 2)
+            self.assertEqual(gm["sideModuleSizes"][0]["wasmBytes"], report.side_modules[0].wasm_bytes)
+
+            text = bgw.format_report_text(report, sanitize=True)
+            self.assertIn("strategy=asymmetric, max_side=994MiB", text)
+            self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, text)
+
+            # Default balanced callers still get SIDE_MODULE=1.
+            bal = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-bal",
+                jobs=2,
+                split_modules=2,
+                split_strategy="balanced",
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(bal.ok, bal.errors)
+            self.assertEqual(bal.side_module_mode, 1)
+            self.assertIn(bgw.SIDE_MODULE_FLAG, bal.side_modules[0].link_argv)
+            self.assertNotIn(bgw.SIDE_MODULE_PRUNED_FLAG, bal.side_modules[0].link_argv)
+
+            # CLI opt-in + invalid --max-side-module-mib.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "asymmetric",
+                    "--max-side-module-mib",
+                    "994",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(cache),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            cli_payload = json.loads(out)
+            self.assertTrue(cli_payload["ok"])
+            self.assertEqual(cli_payload["split_strategy"], "asymmetric")
+            self.assertEqual(cli_payload["side_module_mode"], 2)
+            self.assertEqual(cli_payload["max_side_module_mib"], 994)
+            self.assertIn(
+                bgw.SIDE_MODULE_PRUNED_FLAG,
+                cli_payload["side_modules"][0]["link_argv"],
+            )
+
+            bad_code, bad_out, _bad_err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "asymmetric",
+                    "--max-side-module-mib",
+                    "2048",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2, bad_out)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("max-side-module-mib" in e for e in bad_payload["errors"]))
 
 
 class TestLinkFlagContract(unittest.TestCase):
