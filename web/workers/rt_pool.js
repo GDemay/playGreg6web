@@ -8,6 +8,8 @@
 (function (root) {
   const DEFAULT_MAX_POOL_BYTES = 256 * 1024 * 1024; // 256 MiB
   const DEFAULT_IDLE_FRAME_TTL = 8;
+  const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 8192;
+  const DEFAULT_MAX_TEXTURE_ARRAY_LAYERS = 256;
 
   // WebGPU GPUTextureUsage bitmask values with headless/Node fallbacks.
   const TEXTURE_USAGE = Object.freeze({
@@ -36,6 +38,73 @@
   const DEFAULT_TEXTURE_USAGE = TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING;
 
   const VALID_DIMENSIONS = Object.freeze(['1d', '2d', '3d']);
+
+  /**
+   * Common DXGI / Xbox Series render-target and depth-stencil format aliases mapped
+   * to canonical WebGPU `GPUTextureFormat` strings.
+   */
+  const DXGI_FORMAT_ALIASES = Object.freeze({
+    // 8-bit single-channel
+    r8_unorm: 'r8unorm',
+    r8_snorm: 'r8snorm',
+    r8_uint: 'r8uint',
+    r8_sint: 'r8sint',
+
+    // 16-bit formats
+    r16_float: 'r16float',
+    r16_unorm: 'r16unorm',
+    r16_snorm: 'r16snorm',
+    r16_uint: 'r16uint',
+    r16_sint: 'r16sint',
+    r8g8_unorm: 'rg8unorm',
+    r8g8_snorm: 'rg8snorm',
+    r8g8_uint: 'rg8uint',
+    r8g8_sint: 'rg8sint',
+    d16_unorm: 'depth16unorm',
+
+    // 32-bit color & depth-stencil formats
+    r32_float: 'r32float',
+    r32_uint: 'r32uint',
+    r32_sint: 'r32sint',
+    r16g16_float: 'rg16float',
+    r16g16_unorm: 'rg16unorm',
+    r16g16_snorm: 'rg16snorm',
+    r16g16_uint: 'rg16uint',
+    r16g16_sint: 'rg16sint',
+    r8g8b8a8_unorm: 'rgba8unorm',
+    r8g8b8a8_unorm_srgb: 'rgba8unorm-srgb',
+    r8g8b8a8_snorm: 'rgba8snorm',
+    r8g8b8a8_uint: 'rgba8uint',
+    r8g8b8a8_sint: 'rgba8sint',
+    b8g8r8a8_unorm: 'bgra8unorm',
+    b8g8r8a8_unorm_srgb: 'bgra8unorm-srgb',
+    r10g10b10a2_unorm: 'rgb10a2unorm',
+    r10g10b10a2_uint: 'rgb10a2uint',
+    r11g11b10_float: 'rg11b10ufloat',
+    r9g9b9e5_sharedexp: 'rgb9e5ufloat',
+    d32_float: 'depth32float',
+    d24_unorm_s8_uint: 'depth24plus-stencil8',
+    r24g8_typeless: 'depth24plus-stencil8',
+    x24_typeless_g8_uint: 'depth24plus-stencil8',
+
+    // 64-bit color & depth-stencil formats
+    r32g32_float: 'rg32float',
+    r32g32_uint: 'rg32uint',
+    r32g32_sint: 'rg32sint',
+    r16g16b16a16_float: 'rgba16float',
+    r16g16b16a16_unorm: 'rgba16unorm',
+    r16g16b16a16_snorm: 'rgba16snorm',
+    r16g16b16a16_uint: 'rgba16uint',
+    r16g16b16a16_sint: 'rgba16sint',
+    d32_float_s8x24_uint: 'depth32float-stencil8',
+    r32g8x24_typeless: 'depth32float-stencil8',
+    x32_typeless_g8x24_uint: 'depth32float-stencil8',
+
+    // 128-bit color formats
+    r32g32b32a32_float: 'rgba32float',
+    r32g32b32a32_uint: 'rgba32uint',
+    r32g32b32a32_sint: 'rgba32sint',
+  });
 
   /**
    * Bytes-per-texel lookup table for common WebGPU color, depth, and stencil render-target formats.
@@ -115,32 +184,148 @@
     }
   }
 
-  function isPowerOfTwo(n) {
-    return Number.isInteger(n) && n >= 1 && (n & (n - 1)) === 0;
+  /**
+   * Resolve the effective 2D texture dimension limit from a WebGPU device,
+   * defaulting to `8192` when `device.limits.maxTextureDimension2D` is absent.
+   *
+   * @param {object | null | undefined} device
+   * @returns {number}
+   */
+  function resolveMaxTextureDimension2D(device) {
+    const raw =
+      device &&
+      device.limits &&
+      typeof device.limits.maxTextureDimension2D === 'number' &&
+      Number.isFinite(device.limits.maxTextureDimension2D) &&
+      device.limits.maxTextureDimension2D >= 1
+        ? Math.floor(device.limits.maxTextureDimension2D)
+        : DEFAULT_MAX_TEXTURE_DIMENSION_2D;
+    return raw;
+  }
+
+  function resolveDeviceTextureLimits(device, overrideMaxDim2D) {
+    const maxDim2D =
+      typeof overrideMaxDim2D === 'number' &&
+      Number.isFinite(overrideMaxDim2D) &&
+      overrideMaxDim2D >= 1
+        ? Math.floor(overrideMaxDim2D)
+        : resolveMaxTextureDimension2D(device);
+
+    const maxDim1D =
+      device &&
+      device.limits &&
+      typeof device.limits.maxTextureDimension1D === 'number' &&
+      Number.isFinite(device.limits.maxTextureDimension1D) &&
+      device.limits.maxTextureDimension1D >= 1
+        ? Math.floor(device.limits.maxTextureDimension1D)
+        : maxDim2D;
+
+    const maxDim3D =
+      device &&
+      device.limits &&
+      typeof device.limits.maxTextureDimension3D === 'number' &&
+      Number.isFinite(device.limits.maxTextureDimension3D) &&
+      device.limits.maxTextureDimension3D >= 1
+        ? Math.floor(device.limits.maxTextureDimension3D)
+        : maxDim2D;
+
+    const maxArrayLayers =
+      device &&
+      device.limits &&
+      typeof device.limits.maxTextureArrayLayers === 'number' &&
+      Number.isFinite(device.limits.maxTextureArrayLayers) &&
+      device.limits.maxTextureArrayLayers >= 1
+        ? Math.floor(device.limits.maxTextureArrayLayers)
+        : DEFAULT_MAX_TEXTURE_ARRAY_LAYERS;
+
+    return { maxDim1D, maxDim2D, maxDim3D, maxArrayLayers };
+  }
+
+  function clampDimensionValue(raw, maxDim) {
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      return { value: 1, clamped: true };
+    }
+    const floored = Math.floor(raw);
+    if (floored < 1) {
+      return { value: 1, clamped: true };
+    }
+    if (floored > maxDim) {
+      return { value: maxDim, clamped: true };
+    }
+    return { value: floored, clamped: floored !== raw };
+  }
+
+  function _normalizeFormatWithMeta(format) {
+    if (typeof format !== 'string' || format.trim().length === 0) {
+      throw new TypeError('desc.format must be a non-empty WebGPU GPUTextureFormat string');
+    }
+    const lower = format.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(FORMAT_BYTES_PER_PIXEL, lower)) {
+      return { format: lower, normalized: false };
+    }
+    const aliasKey = lower.startsWith('dxgi_format_')
+      ? lower.slice('dxgi_format_'.length)
+      : lower;
+    if (Object.prototype.hasOwnProperty.call(DXGI_FORMAT_ALIASES, aliasKey)) {
+      return { format: DXGI_FORMAT_ALIASES[aliasKey], normalized: true };
+    }
+    return { format: lower, normalized: false };
   }
 
   /**
-   * Normalize a render-target descriptor (accepting flat `{ width, height, ... }` or
-   * WebGPU `{ size: { width, height, depthOrArrayLayers } | [w, h, d], ... }` shapes)
-   * into a canonical frozen descriptor object.
+   * Normalize a DXGI / Xbox Series render-target or depth-stencil format string
+   * to its canonical WebGPU `GPUTextureFormat`, while preserving valid WebGPU
+   * format strings untouched.
    *
-   * @param {object} desc
-   * @returns {{
-   *   width: number,
-   *   height: number,
-   *   format: string,
-   *   usage: number,
-   *   sampleCount: number,
-   *   mipLevelCount: number,
-   *   depthOrArrayLayers: number,
-   *   dimension: '1d' | '2d' | '3d',
-   * }}
+   * @param {string} format
+   * @returns {string}
    */
-  function normalizeRenderTargetDesc(desc) {
-    if (!desc || typeof desc !== 'object') {
-      throw new TypeError('Render target descriptor must be an object');
+  function normalizeRenderTargetFormat(format) {
+    return _normalizeFormatWithMeta(format).format;
+  }
+
+  /**
+   * Normalize a requested `sampleCount` to WebGPU's valid set `{1, 4}`, falling
+   * back to `1` when texture constraints disallow multisampling.
+   *
+   * @param {number | undefined | null} requestedSampleCount
+   * @param {{
+   *   mipLevelCount?: number,
+   *   dimension?: string,
+   *   depthOrArrayLayers?: number,
+   *   usage?: number,
+   * }} [context]
+   * @returns {{ sampleCount: number, normalized: boolean }}
+   */
+  function normalizeSampleCount(requestedSampleCount, context = {}) {
+    if (requestedSampleCount === undefined || requestedSampleCount === null) {
+      return { sampleCount: 1, normalized: false };
+    }
+    const numeric = Number(requestedSampleCount);
+    if (!Number.isFinite(numeric)) {
+      return { sampleCount: 1, normalized: true };
     }
 
+    const mipLevelCount = context.mipLevelCount !== undefined ? context.mipLevelCount : 1;
+    const dimension = context.dimension !== undefined ? context.dimension : '2d';
+    const depthOrArrayLayers =
+      context.depthOrArrayLayers !== undefined ? context.depthOrArrayLayers : 1;
+    const usage = context.usage !== undefined ? context.usage : 0;
+
+    const multisampleAllowed =
+      mipLevelCount <= 1 &&
+      dimension === '2d' &&
+      depthOrArrayLayers === 1 &&
+      (usage & TEXTURE_USAGE.STORAGE_BINDING) === 0;
+
+    const resolved = numeric >= 4 && multisampleAllowed ? 4 : 1;
+    return {
+      sampleCount: resolved,
+      normalized: resolved !== requestedSampleCount,
+    };
+  }
+
+  function extractRawDimensions(desc) {
     let width = desc.width;
     let height = desc.height;
     let depthOrArrayLayers = desc.depthOrArrayLayers;
@@ -174,6 +359,161 @@
       }
     }
 
+    return { width, height, depthOrArrayLayers };
+  }
+
+  /**
+   * Sanitize a render-target descriptor for WebGPU device safety:
+   * - Clamps dimensions to `[1, maxTextureDimension2D]` (default `8192`).
+   * - Normalizes DXGI / Xbox render-target & depth-stencil formats to canonical WebGPU strings.
+   * - Clamps `mipLevelCount` to the valid chain depth for the clamped dimensions.
+   * - Normalizes `sampleCount` to `{1, 4}` respecting WebGPU multisampling constraints.
+   *
+   * @param {object} desc
+   * @param {{ device?: object | null, maxTextureDimension2D?: number }} [options]
+   * @returns {{
+   *   desc: Readonly<{
+   *     width: number,
+   *     height: number,
+   *     format: string,
+   *     usage: number,
+   *     sampleCount: number,
+   *     mipLevelCount: number,
+   *     depthOrArrayLayers: number,
+   *     dimension: '1d' | '2d' | '3d',
+   *   }>,
+   *   dimensionClamped: boolean,
+   *   formatNormalized: boolean,
+   *   sampleCountNormalized: boolean,
+   * }}
+   */
+  function sanitizeRenderTargetDesc(desc, options = {}) {
+    if (!desc || typeof desc !== 'object') {
+      throw new TypeError('Render target descriptor must be an object');
+    }
+
+    const rawDims = extractRawDimensions(desc);
+
+    const dimension = desc.dimension === undefined ? '2d' : String(desc.dimension).trim().toLowerCase();
+    if (!VALID_DIMENSIONS.includes(dimension)) {
+      throw new RangeError(
+        `Unsupported texture dimension "${desc.dimension}"; expected one of: ${VALID_DIMENSIONS.join(', ')}`
+      );
+    }
+
+    const limits = resolveDeviceTextureLimits(options.device, options.maxTextureDimension2D);
+    const maxWidth =
+      dimension === '1d' ? limits.maxDim1D : dimension === '3d' ? limits.maxDim3D : limits.maxDim2D;
+    const maxHeight =
+      dimension === '1d' ? 1 : dimension === '3d' ? limits.maxDim3D : limits.maxDim2D;
+    const maxDepth =
+      dimension === '1d' ? 1 : dimension === '3d' ? limits.maxDim3D : limits.maxArrayLayers;
+
+    const widthResult = clampDimensionValue(rawDims.width, maxWidth);
+
+    let heightResult;
+    if (dimension === '1d' && rawDims.height === undefined) {
+      heightResult = { value: 1, clamped: false };
+    } else {
+      heightResult = clampDimensionValue(rawDims.height, maxHeight);
+    }
+
+    let depthResult;
+    if (rawDims.depthOrArrayLayers === undefined) {
+      depthResult = { value: 1, clamped: false };
+    } else {
+      depthResult = clampDimensionValue(rawDims.depthOrArrayLayers, maxDepth);
+    }
+
+    const dimensionClamped =
+      widthResult.clamped || heightResult.clamped || depthResult.clamped;
+
+    const formatResult = _normalizeFormatWithMeta(desc.format);
+
+    const usage = desc.usage === undefined ? DEFAULT_TEXTURE_USAGE : desc.usage;
+    assertPositiveInteger(usage, 'usage');
+
+    const maxExtent =
+      dimension === '1d'
+        ? widthResult.value
+        : dimension === '3d'
+          ? Math.max(widthResult.value, heightResult.value, depthResult.value)
+          : Math.max(widthResult.value, heightResult.value);
+    const maxMips = Math.floor(Math.log2(maxExtent)) + 1;
+
+    let mipLevelCount;
+    if (desc.mipLevelCount === undefined) {
+      mipLevelCount = 1;
+    } else if (
+      typeof desc.mipLevelCount !== 'number' ||
+      !Number.isFinite(desc.mipLevelCount) ||
+      Math.floor(desc.mipLevelCount) < 1
+    ) {
+      mipLevelCount = 1;
+    } else {
+      mipLevelCount = Math.min(Math.floor(desc.mipLevelCount), maxMips);
+    }
+
+    const sampleResult = normalizeSampleCount(desc.sampleCount, {
+      mipLevelCount,
+      dimension,
+      depthOrArrayLayers: depthResult.value,
+      usage,
+    });
+
+    return {
+      desc: Object.freeze({
+        width: widthResult.value,
+        height: heightResult.value,
+        format: formatResult.format,
+        usage,
+        sampleCount: sampleResult.sampleCount,
+        mipLevelCount,
+        depthOrArrayLayers: depthResult.value,
+        dimension,
+      }),
+      dimensionClamped,
+      formatNormalized: formatResult.normalized,
+      sampleCountNormalized: sampleResult.normalized,
+    };
+  }
+
+  /**
+   * Normalize a render-target descriptor (accepting flat `{ width, height, ... }` or
+   * WebGPU `{ size: { width, height, depthOrArrayLayers } | [w, h, d], ... }` shapes)
+   * into a canonical frozen descriptor object.
+   *
+   * When `options.sanitize` (or `options.clampDimensions` / `options.normalizeSampleCount`)
+   * is truthy, delegates to `sanitizeRenderTargetDesc(desc, options)`.
+   *
+   * @param {object} desc
+   * @param {{ sanitize?: boolean, clampDimensions?: boolean, normalizeSampleCount?: boolean, device?: object | null, maxTextureDimension2D?: number }} [options]
+   * @returns {{
+   *   width: number,
+   *   height: number,
+   *   format: string,
+   *   usage: number,
+   *   sampleCount: number,
+   *   mipLevelCount: number,
+   *   depthOrArrayLayers: number,
+   *   dimension: '1d' | '2d' | '3d',
+   * }}
+   */
+  function normalizeRenderTargetDesc(desc, options) {
+    if (
+      options &&
+      typeof options === 'object' &&
+      (options.sanitize || options.clampDimensions || options.normalizeSampleCount)
+    ) {
+      return sanitizeRenderTargetDesc(desc, options).desc;
+    }
+
+    if (!desc || typeof desc !== 'object') {
+      throw new TypeError('Render target descriptor must be an object');
+    }
+
+    let { width, height, depthOrArrayLayers } = extractRawDimensions(desc);
+
     const dimension = desc.dimension === undefined ? '2d' : String(desc.dimension).trim().toLowerCase();
     if (!VALID_DIMENSIONS.includes(dimension)) {
       throw new RangeError(
@@ -192,17 +532,14 @@
     assertPositiveInteger(height, 'height');
     assertPositiveInteger(depthOrArrayLayers, 'depthOrArrayLayers');
 
-    if (typeof desc.format !== 'string' || desc.format.trim().length === 0) {
-      throw new TypeError('desc.format must be a non-empty WebGPU GPUTextureFormat string');
-    }
-    const format = desc.format.trim().toLowerCase();
+    const format = _normalizeFormatWithMeta(desc.format).format;
 
     const usage = desc.usage === undefined ? DEFAULT_TEXTURE_USAGE : desc.usage;
     assertPositiveInteger(usage, 'usage');
 
     const sampleCount = desc.sampleCount === undefined ? 1 : desc.sampleCount;
-    if (!isPowerOfTwo(sampleCount)) {
-      throw new RangeError(`sampleCount must be a positive power-of-two integer, got ${sampleCount}`);
+    if (sampleCount !== 1 && sampleCount !== 4) {
+      throw new RangeError(`sampleCount must be 1 or 4, got ${sampleCount}`);
     }
 
     const mipLevelCount = desc.mipLevelCount === undefined ? 1 : desc.mipLevelCount;
@@ -340,6 +677,11 @@
       this._idleLru = new Map();
       /** @type {WeakMap<object, { id: number, leaseToken: number }>} Per-acquire handle tokens */
       this._handleTokens = new WeakMap();
+      /** @type {WeakSet<object>} Tracks GPUTexture instances already destroyed to guarantee no double-destroy */
+      this._destroyedTextures = new WeakSet();
+
+      // Resolved device dimension cap (cached for post-destroy telemetry safety)
+      this._maxTextureDimension2D = resolveMaxTextureDimension2D(device);
 
       // Telemetry counters
       this._hits = 0;
@@ -349,6 +691,9 @@
       this._peakBytes = 0;
       this._evictions = 0;
       this._leakedReleases = 0;
+      this._dimensionClampCount = 0;
+      this._formatNormalizeCount = 0;
+      this._sampleCountNormalizeCount = 0;
     }
 
     get isDestroyed() {
@@ -365,6 +710,17 @@
 
     get currentFrame() {
       return this._currentFrame;
+    }
+
+    get maxTextureDimension2D() {
+      return this._effectiveMaxTextureDimension2D();
+    }
+
+    _effectiveMaxTextureDimension2D() {
+      if (this._device) {
+        this._maxTextureDimension2D = resolveMaxTextureDimension2D(this._device);
+      }
+      return this._maxTextureDimension2D;
     }
 
     _assertNotDestroyed() {
@@ -387,28 +743,77 @@
       }
     }
 
+    _destroyTextureSafely(texture) {
+      if (!texture || typeof texture.destroy !== 'function') {
+        return false;
+      }
+      if (texture.destroyed === true || this._destroyedTextures.has(texture)) {
+        return false;
+      }
+      this._destroyedTextures.add(texture);
+      try {
+        texture.destroy();
+      } catch (_) {
+        // Ignore device-lost / already-destroyed WebGPU errors during teardown.
+      }
+      return true;
+    }
+
+    _isRecordTextureAlive(record) {
+      if (!record || record.destroyed || !record.texture) {
+        return false;
+      }
+      if (record.texture.destroyed === true || this._destroyedTextures.has(record.texture)) {
+        return false;
+      }
+      if (record.hasView && !record.view) {
+        return false;
+      }
+      return true;
+    }
+
+    _isRecordReusable(record) {
+      return this._isRecordTextureAlive(record) && !record.retireOnRelease;
+    }
+
     _destroyRecord(record) {
-      if (record.destroyed) {
-        return;
+      if (!record || record.destroyed) {
+        return false;
       }
       record.destroyed = true;
       record.active = false;
+      record.retireOnRelease = false;
       record.leaseToken = 0;
       this._allEntries.delete(record.id);
 
-      if (record.texture && typeof record.texture.destroy === 'function') {
-        record.texture.destroy();
-      }
+      const tex = record.texture;
       record.texture = null;
       record.view = null;
+      this._destroyTextureSafely(tex);
+      return true;
     }
 
     _evictIdleRecord(record) {
       this._idleLru.delete(record.id);
       this._removeFromIdleBucket(record);
       this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
-      this._destroyRecord(record);
-      this._evictions += 1;
+      if (this._destroyRecord(record)) {
+        this._evictions += 1;
+        return true;
+      }
+      return false;
+    }
+
+    _retireActiveRecord(record) {
+      record.active = false;
+      record.leaseToken = 0;
+      this._activeEntries.delete(record.id);
+      this._activeBytes = Math.max(0, this._activeBytes - record.byteSize);
+      if (this._destroyRecord(record)) {
+        this._evictions += 1;
+        return true;
+      }
+      return false;
     }
 
     _moveActiveToIdle(record, frameIndex) {
@@ -431,12 +836,19 @@
     _makeHandle(record, reused) {
       const leaseToken = this._nextLeaseToken++;
       record.leaseToken = leaseToken;
+      const textureRef = record.texture;
+      const pool = this;
       const handle = {
         id: record.id,
         key: record.key,
         desc: record.desc,
-        texture: record.texture,
-        view: record.view,
+        texture: textureRef,
+        get view() {
+          return pool._isRecordTextureAlive(record) ? record.view : null;
+        },
+        get destroyed() {
+          return !pool._isRecordTextureAlive(record);
+        },
         byteSize: record.byteSize,
         reused,
       };
@@ -450,14 +862,19 @@
      * available; otherwise allocates a new `GPUTexture` and cached default `GPUTextureView`,
      * LRU-evicting idle textures as needed to stay within `maxPoolBytes`.
      *
+     * Sanitizes requested dimensions into `[1, device.limits.maxTextureDimension2D]`
+     * (default `8192`), normalizes common DXGI/Xbox color & depth-stencil formats, and
+     * normalizes `sampleCount` to `{1, 4}` to prevent WebGPU validation errors.
+     *
      * @param {object} desc
      * @param {string} [label]
      * @returns {{
      *   id: number,
      *   key: string,
      *   desc: Readonly<object>,
-     *   texture: GPUTexture,
+     *   texture: GPUTexture | null,
      *   view: GPUTextureView | null,
+     *   destroyed: boolean,
      *   byteSize: number,
      *   reused: boolean,
      * }}
@@ -465,31 +882,57 @@
     acquire(desc, label) {
       this._assertNotDestroyed();
 
-      const normalizedDesc = normalizeRenderTargetDesc(desc);
+      const maxDim2D = this._effectiveMaxTextureDimension2D();
+      const sanitized = sanitizeRenderTargetDesc(desc, {
+        device: this._device,
+        maxTextureDimension2D: maxDim2D,
+      });
+      const normalizedDesc = sanitized.desc;
       const key = makeRenderTargetKey(normalizedDesc);
       const byteSize = estimateRenderTargetBytes(normalizedDesc);
 
       // 1. Check idle bucket for an exact descriptor match (MRU pop lets unused duplicates age out).
+      //    Skip and clean up any invalidated or externally-destroyed records so stale views are never returned.
       const bucket = this._idleBuckets.get(key);
       if (bucket && bucket.length > 0) {
-        const record = bucket.pop();
-        if (bucket.length === 0) {
-          this._idleBuckets.delete(key);
+        while (bucket.length > 0) {
+          const record = bucket.pop();
+          if (bucket.length === 0) {
+            this._idleBuckets.delete(key);
+          }
+          this._idleLru.delete(record.id);
+
+          if (!this._isRecordReusable(record)) {
+            this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
+            if (this._destroyRecord(record)) {
+              this._evictions += 1;
+            }
+            continue;
+          }
+
+          record.active = true;
+          record.lastUsedFrame = this._currentFrame;
+          if (typeof label === 'string' && label.length > 0) {
+            record.label = label;
+          }
+
+          this._activeEntries.set(record.id, record);
+          this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
+          this._activeBytes += record.byteSize;
+          this._hits += 1;
+
+          if (sanitized.dimensionClamped) {
+            this._dimensionClampCount += 1;
+          }
+          if (sanitized.formatNormalized) {
+            this._formatNormalizeCount += 1;
+          }
+          if (sanitized.sampleCountNormalized) {
+            this._sampleCountNormalizeCount += 1;
+          }
+
+          return this._makeHandle(record, true);
         }
-        this._idleLru.delete(record.id);
-
-        record.active = true;
-        record.lastUsedFrame = this._currentFrame;
-        if (typeof label === 'string' && label.length > 0) {
-          record.label = label;
-        }
-
-        this._activeEntries.set(record.id, record);
-        this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
-        this._activeBytes += record.byteSize;
-        this._hits += 1;
-
-        return this._makeHandle(record, true);
       }
 
       // 2. Miss: check strict memory budget before evicting idle targets or allocating.
@@ -535,9 +978,7 @@
       try {
         view = texture && typeof texture.createView === 'function' ? texture.createView() : null;
       } catch (err) {
-        if (texture && typeof texture.destroy === 'function') {
-          texture.destroy();
-        }
+        this._destroyTextureSafely(texture);
         throw err;
       }
 
@@ -548,9 +989,11 @@
         label: resolvedLabel,
         texture,
         view,
+        hasView: view !== null,
         byteSize,
         active: true,
         destroyed: false,
+        retireOnRelease: false,
         lastUsedFrame: this._currentFrame,
         leaseToken: 0,
       };
@@ -559,6 +1002,16 @@
       this._activeEntries.set(id, record);
       this._activeBytes += byteSize;
       this._misses += 1;
+
+      if (sanitized.dimensionClamped) {
+        this._dimensionClampCount += 1;
+      }
+      if (sanitized.formatNormalized) {
+        this._formatNormalizeCount += 1;
+      }
+      if (sanitized.sampleCountNormalized) {
+        this._sampleCountNormalizeCount += 1;
+      }
 
       const totalBytes = this._activeBytes + this._idleBytes;
       if (totalBytes > this._peakBytes) {
@@ -570,8 +1023,9 @@
 
     /**
      * Mark an acquired render target available for immediate aliasing within the same frame
-     * (or subsequent frames). Safe against duplicate / stale releases (returns `false` instead
-     * of throwing or corrupting pool state).
+     * (or subsequent frames). If the target was invalidated during a resize while in flight
+     * (or externally destroyed), it is retired and destroyed cleanly instead of re-entering
+     * the idle pool. Safe against duplicate / stale releases.
      *
      * @param {object | number} entryOrId
      * @returns {boolean} True if an active target was released; false if already idle/unknown/stale.
@@ -615,6 +1069,11 @@
         return false;
       }
 
+      if (!this._isRecordReusable(record)) {
+        this._retireActiveRecord(record);
+        return true;
+      }
+
       this._moveActiveToIdle(record, this._currentFrame);
       return true;
     }
@@ -622,9 +1081,10 @@
     /**
      * End the current frame epoch:
      * 1. Handle any leaked (still-active) render targets: auto-release back into the idle pool
-     *    when `autoReleaseLeaked` is enabled, or warn/notify via `onLeak` / `warn` when disabled.
+     *    (or retire/destroy if invalidated during resize) when `autoReleaseLeaked` is enabled,
+     *    or warn/notify via `onLeak` / `warn` when disabled.
      * 2. Increment the frame epoch (`currentFrame += 1`).
-     * 3. Destroy idle textures unused for more than `idleFrameTtl` frames.
+     * 3. Destroy idle textures unused for more than `idleFrameTtl` frames (or externally destroyed).
      *
      * @returns {{
      *   frame: number,
@@ -643,6 +1103,7 @@
 
       let leakedCount = 0;
       let autoReleasedCount = 0;
+      let evictedCount = 0;
 
       if (this._activeEntries.size > 0) {
         const leakedRecords = Array.from(this._activeEntries.values());
@@ -660,7 +1121,13 @@
           };
 
           if (this._autoReleaseLeaked) {
-            this._moveActiveToIdle(record, endedFrame);
+            if (!this._isRecordReusable(record)) {
+              if (this._retireActiveRecord(record)) {
+                evictedCount += 1;
+              }
+            } else {
+              this._moveActiveToIdle(record, endedFrame);
+            }
             this._leakedReleases += 1;
             autoReleasedCount += 1;
           }
@@ -687,14 +1154,17 @@
         }
       }
 
-      // Evict idle textures unused for more than idleFrameTtl frames.
-      let evictedCount = 0;
+      // Evict idle textures unused for more than idleFrameTtl frames or no longer reusable.
       const idleRecords = Array.from(this._idleLru.values());
       for (let i = 0; i < idleRecords.length; i += 1) {
         const record = idleRecords[i];
-        if (this._currentFrame - record.lastUsedFrame > this._idleFrameTtl) {
-          this._evictIdleRecord(record);
-          evictedCount += 1;
+        if (
+          this._currentFrame - record.lastUsedFrame > this._idleFrameTtl ||
+          !this._isRecordReusable(record)
+        ) {
+          if (this._evictIdleRecord(record)) {
+            evictedCount += 1;
+          }
         }
       }
 
@@ -710,9 +1180,10 @@
 
     /**
      * Destroy all currently idle pooled render targets (e.g., on viewport/swapchain resize)
-     * while leaving any currently active targets intact.
+     * while leaving any currently active in-flight targets intact and flagging them for
+     * immediate destruction on release so stale pre-resize targets are never reused.
      *
-     * @returns {number} Number of idle textures destroyed.
+     * @returns {number} Number of idle textures destroyed immediately.
      */
     invalidateAll() {
       this._assertNotDestroyed();
@@ -721,21 +1192,38 @@
       const idleRecords = Array.from(this._idleLru.values());
       for (let i = 0; i < idleRecords.length; i += 1) {
         const record = idleRecords[i];
-        this._idleLru.delete(record.id);
-        this._removeFromIdleBucket(record);
-        this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
-        this._destroyRecord(record);
-        destroyedCount += 1;
+        if (this._evictIdleRecord(record)) {
+          destroyedCount += 1;
+        }
       }
 
       this._idleBuckets.clear();
       this._idleLru.clear();
       this._idleBytes = 0;
+
+      // Mark in-flight active records so they are retired/destroyed cleanly on release
+      // instead of being returned to post-resize passes.
+      this._activeEntries.forEach((record) => {
+        record.retireOnRelease = true;
+      });
+
       return destroyedCount;
     }
 
     /**
-     * Return pool hit-rate, occupancy, memory, and lifecycle telemetry.
+     * Convenience resize hook: invalidates all idle targets and flags in-flight active
+     * targets for retirement on release.
+     *
+     * @param {number} [_width]
+     * @param {number} [_height]
+     * @returns {number} Number of idle textures destroyed immediately.
+     */
+    resize(_width, _height) {
+      return this.invalidateAll();
+    }
+
+    /**
+     * Return pool hit-rate, occupancy, memory, sanitization, and lifecycle telemetry.
      */
     getStats() {
       const totalRequests = this._hits + this._misses;
@@ -752,6 +1240,10 @@
         peakBytes: this._peakBytes,
         evictions: this._evictions,
         leakedReleases: this._leakedReleases,
+        dimensionClampCount: this._dimensionClampCount,
+        formatNormalizeCount: this._formatNormalizeCount,
+        sampleCountNormalizeCount: this._sampleCountNormalizeCount,
+        maxTextureDimension2D: this._effectiveMaxTextureDimension2D(),
         currentFrame: this._currentFrame,
       };
     }
@@ -785,9 +1277,14 @@
   const exportsObj = Object.freeze({
     DEFAULT_MAX_POOL_BYTES,
     DEFAULT_IDLE_FRAME_TTL,
+    DEFAULT_MAX_TEXTURE_DIMENSION_2D,
     TEXTURE_USAGE,
     DEFAULT_TEXTURE_USAGE,
     FORMAT_BYTES_PER_PIXEL,
+    DXGI_FORMAT_ALIASES,
+    normalizeRenderTargetFormat,
+    normalizeSampleCount,
+    sanitizeRenderTargetDesc,
     normalizeRenderTargetDesc,
     makeRenderTargetKey,
     estimateRenderTargetBytes,
