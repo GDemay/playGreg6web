@@ -111,6 +111,8 @@ const MAX_TELEMETRY_WARNINGS = 32;
 // W101: upper bound on cached layout:'auto' remapped bind groups. Root-constant ring offsets rotate
 // per draw, so the (pipeline, bind group, dynamic offsets) key space is unbounded; evict LRU-first.
 const REMAPPED_BIND_GROUP_CACHE_LIMIT = 2048;
+// W104: bound on distinct missing render-pass textures remembered for error deduplication.
+const MISSING_TEXTURE_REPORT_LIMIT = 4096;
 const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
@@ -1432,11 +1434,15 @@ class RenderStatePackets {
       asyncPipelineCompiles: 0,
       asyncPipelineFailures: 0,
       pendingAsyncPipelineSkips: 0,
+      suppressedMissingTextureErrors: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
     this.lastError = null;
     this._packetError = null;
+    // W104: 'gen:textureId' keys of missing render-pass attachments already reported once.
+    this._reportedMissingTextures = new Set();
+    this._suppressPacketError = false;
     this._activePass = null;
     this._activePassTargetSize = null;
   }
@@ -1480,6 +1486,7 @@ class RenderStatePackets {
       asyncPipelineCompiles: this.telemetry.asyncPipelineCompiles,
       asyncPipelineFailures: this.telemetry.asyncPipelineFailures,
       pendingAsyncPipelineSkips: this.telemetry.pendingAsyncPipelineSkips,
+      suppressedMissingTextureErrors: this.telemetry.suppressedMissingTextureErrors,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -1514,6 +1521,7 @@ class RenderStatePackets {
   // Returns true when the opcode belongs to ABI v2 (handled, possibly with an error recorded).
   handlePacket(opcode, view, offset, payloadBytes) {
     this._packetError = null;
+    this._suppressPacketError = false;
     switch (opcode) {
       case V2_OPCODES.CREATE_BIND_GROUP_LAYOUT:
         return this._count(this._createBindGroupLayout(view, offset, payloadBytes));
@@ -1597,6 +1605,12 @@ class RenderStatePackets {
 
   _count(ok) {
     this.stats.packets += 1;
+    if (!ok && this._suppressPacketError) {
+      // W104: repeated error already reported once for this device generation.
+      this._suppressPacketError = false;
+      this.telemetry.suppressedMissingTextureErrors += 1;
+      return true;
+    }
     if (!ok) {
       this.stats.errors += 1;
       this.lastError = this._packetError || 'malformed or truncated v2 packet';
@@ -3216,22 +3230,40 @@ class RenderStatePackets {
     return descriptor;
   }
 
+  // W104: report a missing render-pass attachment once per texture id and device generation
+  // instead of once per frame.
+  _missingRenderPassTexture(textureId) {
+    this._packetError = `render pass: unknown texture ${textureId}`;
+    const generation =
+      this.processor && Number.isInteger(this.processor._deviceGeneration)
+        ? this.processor._deviceGeneration
+        : 0;
+    const key = `${generation}:${textureId}`;
+    if (this._reportedMissingTextures.has(key)) {
+      this._suppressPacketError = true;
+    } else {
+      if (this._reportedMissingTextures.size >= MISSING_TEXTURE_REPORT_LIMIT) {
+        this._reportedMissingTextures.clear();
+      }
+      this._reportedMissingTextures.add(key);
+    }
+    return false;
+  }
+
   _beginRenderPass(view, offset) {
     const decoded = decodeBeginRenderPass(view, offset);
     const resolvers = { colors: [], depthStencil: null };
     for (const c of decoded.colors) {
       const resolver = c ? this._attachmentView(c.textureId, c.view) : null;
       if (c && !resolver) {
-        this._packetError = `render pass: unknown texture ${c.textureId}`;
-        return false;
+        return this._missingRenderPassTexture(c.textureId);
       }
       resolvers.colors.push(resolver);
     }
     if (decoded.depthStencil) {
       resolvers.depthStencil = this._attachmentView(decoded.depthStencil.textureId, decoded.depthStencil.view);
       if (!resolvers.depthStencil) {
-        this._packetError = `render pass: unknown texture ${decoded.depthStencil.textureId}`;
-        return false;
+        return this._missingRenderPassTexture(decoded.depthStencil.textureId);
       }
     }
     const targetAttachment = decoded.colors.find((c) => c !== null) || decoded.depthStencil || null;
