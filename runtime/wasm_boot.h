@@ -25,6 +25,8 @@ using LogFn = std::function<void(std::string_view message)>;
 struct WasmBootConfig {
     std::string manifest_path = "boot/program-manifest.json";
     std::string fallback_pgim_path = "boot/guest.pgim";
+    std::string shader_pack_path = "shaders/splash.wgsl.pack";
+    std::string fallback_shader_pack_path = "shaders/fallback.wgsl.pack";
     size_t read_chunk_bytes = 65536;
     size_t max_file_bytes = 512 * 1024 * 1024;
     HttpfsOpenFn open_fn;   // empty: playgta6::os::httpfs_open

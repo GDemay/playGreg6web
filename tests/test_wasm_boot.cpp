@@ -1,14 +1,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_guest_resources.h"
+#include "gpu/d3d12_xs_exports.h"
 #include "guest/boot.h"
+#include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
 #include "guest/program_loader.h"
+#include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -431,6 +439,7 @@ std::vector<uint8_t> make_valid_pgim(uint64_t base, uint32_t entry_rva) {
 
 bool g_test_dllmain_ran = false;
 bool g_test_entry_ran = false;
+std::function<void()> g_test_entry_hook;
 
 void fake_dll_main(playgta6::GuestState* s) {
     g_test_dllmain_ran = true;
@@ -440,6 +449,9 @@ void fake_dll_main(playgta6::GuestState* s) {
 
 void fake_exe_entry(playgta6::GuestState* s) {
     g_test_entry_ran = true;
+    if (g_test_entry_hook) {
+        g_test_entry_hook();
+    }
     s->gpr[playgta6::GuestReg::Rax] = 42;
     s->gpr[playgta6::GuestReg::Rsp] += 8;
 }
@@ -620,6 +632,343 @@ void test_program_boot_full_synthetic_execution() {
     CHECK(pgim_milestones == 2);
 }
 
+std::vector<uint8_t> make_synthetic_wgpk(const std::vector<std::pair<uint64_t, uint8_t>>& entries) {
+    std::vector<uint8_t> out(16 + entries.size() * 20, 0);
+    std::memcpy(out.data(), "WGPK", 4);
+    const uint32_t version = 1;
+    const uint32_t count = static_cast<uint32_t>(entries.size());
+    const uint32_t flags = 0;
+    std::memcpy(out.data() + 4, &version, 4);
+    std::memcpy(out.data() + 8, &count, 4);
+    std::memcpy(out.data() + 12, &flags, 4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const std::string code = "// stage " + std::to_string(entries[i].second) + "\n";
+        const uint32_t offset = static_cast<uint32_t>(out.size());
+        const uint32_t length = static_cast<uint32_t>(code.size());
+        uint8_t* entry = out.data() + 16 + i * 20;
+        std::memcpy(entry, &entries[i].first, 8);
+        entry[8] = entries[i].second;
+        std::memcpy(entry + 12, &offset, 4);
+        std::memcpy(entry + 16, &length, 4);
+        out.insert(out.end(), code.begin(), code.end());
+    }
+    return out;
+}
+
+void setup_synthetic_program_fs(FakeFs& fs) {
+    put_file(fs, "boot/program-manifest.json",
+             R"({"files":[{"path":"main/image/guest.pgim"}]})");
+    put_bytes(fs, "main/image/guest.pgim", make_valid_pgim(kTestExeBase, kTestTextRva));
+}
+
+void test_program_boot_scoped_httpfs_bridge() {
+    FakeFs fs;
+    setup_synthetic_program_fs(fs);
+    // "game/<rel>" takes precedence over "<rel>" for unprefixed paths.
+    put_file(fs, "game/data/config.bin", "GAME_CONFIG_DATA");
+    put_file(fs, "data/config.bin", "ROOT_CONFIG_DATA");
+    // Unprefixed path missing under "game/" falls back to "<rel>".
+    put_file(fs, "loose/fallback.txt", "FALLBACK_PAYLOAD");
+    // Already-prefixed "game/" and "boot/" paths must not be double-prefixed.
+    put_file(fs, "game/exact.dat", "EXACT_GAME");
+    put_file(fs, "boot/meta.txt", "BOOT_META");
+
+    WasmBootConfig cfg = make_cfg(fs);
+    cfg.read_chunk_bytes = 4096;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    CHECK(playgta6::os::win32::get_httpfs_client() == nullptr);
+
+    bool hook_ran = false;
+    bool client_installed = false;
+    std::string read_game_pref;
+    std::string read_fallback;
+    std::string read_exact_game;
+    std::string read_boot_meta;
+    std::string read_win32;
+    bool missing_failed = false;
+    bool empty_failed = false;
+    bool close_ok = false;
+
+    g_test_entry_hook = [&]() {
+        hook_ran = true;
+        playgta6::os::HttpfsMailboxClient* client = playgta6::os::win32::get_httpfs_client();
+        client_installed = (client != nullptr);
+        if (client == nullptr) {
+            return;
+        }
+
+        auto read_all_via_client = [&](std::string_view path, bool& closed_out) -> std::string {
+            const int32_t h = client->open(path);
+            if (h < 0) {
+                return {};
+            }
+            char buf[64]{};
+            const int64_t n1 = client->read(h, 0, buf, 5);
+            const int64_t n2 = client->read(h, 5, buf + 5, sizeof(buf) - 5);
+            closed_out = client->close(h);
+            if (n1 < 0 || n2 < 0) {
+                return {};
+            }
+            return std::string(buf, static_cast<size_t>(n1 + n2));
+        };
+
+        bool c1 = false;
+        bool c2 = false;
+        bool c3 = false;
+        bool c4 = false;
+        read_game_pref = read_all_via_client("\\./data\\config.bin", c1);
+        read_fallback = read_all_via_client("/loose/fallback.txt", c2);
+        read_exact_game = read_all_via_client("/game/exact.dat", c3);
+        read_boot_meta = read_all_via_client("./boot/meta.txt", c4);
+        close_ok = c1 && c2 && c3 && c4;
+        missing_failed = (client->open("does/not/exist.bin") < 0);
+        empty_failed = (client->open("///./") < 0);
+
+        // End-to-end Win32 CreateFileA / ReadFile / CloseHandle via the scoped bridge.
+        const playgta6::os::win32::Handle fh = playgta6::os::win32::CreateFileA(
+            "G:\\data\\config.bin",
+            playgta6::os::win32::GENERIC_READ,
+            playgta6::os::win32::FILE_SHARE_READ,
+            nullptr,
+            playgta6::os::win32::OPEN_EXISTING,
+            playgta6::os::win32::FILE_ATTRIBUTE_NORMAL);
+        if (fh != playgta6::os::win32::INVALID_HANDLE_VALUE) {
+            char wbuf[64]{};
+            uint32_t got = 0;
+            if (playgta6::os::win32::ReadFile(fh, wbuf, sizeof(wbuf), &got, nullptr)) {
+                read_win32.assign(wbuf, got);
+            }
+            playgta6::os::win32::CloseHandle(fh);
+        }
+    };
+
+    playgta6::os::VirtualMemoryArena arena;
+    playgta6::os::win32::set_vmem_arena(&arena);
+    const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+    g_test_entry_hook = nullptr;
+    playgta6::guest::reset_boot();
+    playgta6::os::win32::set_vmem_arena(nullptr);
+
+    CHECK(r.ok);
+    CHECK(r.exit_code == 42);
+    CHECK(hook_ran);
+    CHECK(client_installed);
+    CHECK(read_game_pref == "GAME_CONFIG_DATA");
+    CHECK(read_fallback == "FALLBACK_PAYLOAD");
+    CHECK(read_exact_game == "EXACT_GAME");
+    CHECK(read_boot_meta == "BOOT_META");
+    CHECK(read_win32 == "GAME_CONFIG_DATA");
+    CHECK(missing_failed);
+    CHECK(empty_failed);
+    CHECK(close_ok);
+    CHECK(fs.handles.empty());
+    // Scoped bridge must restore nullptr on exit.
+    CHECK(playgta6::os::win32::get_httpfs_client() == nullptr);
+}
+
+void test_program_boot_preserves_existing_httpfs_client() {
+    FakeFs fs;
+    setup_synthetic_program_fs(fs);
+    WasmBootConfig cfg = make_cfg(fs);
+    cfg.read_chunk_bytes = 4096;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto mb = std::make_unique<playgta6::os::HttpfsMailbox>();
+    playgta6::os::HttpfsMailboxClient::init_mailbox(*mb);
+    playgta6::os::HttpfsMailboxClient existing(mb.get());
+    playgta6::os::win32::set_httpfs_client(&existing);
+
+    playgta6::os::HttpfsMailboxClient* seen_inside = nullptr;
+    g_test_entry_hook = [&]() {
+        seen_inside = playgta6::os::win32::get_httpfs_client();
+    };
+
+    playgta6::os::VirtualMemoryArena arena;
+    playgta6::os::win32::set_vmem_arena(&arena);
+    const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+    g_test_entry_hook = nullptr;
+    playgta6::guest::reset_boot();
+    playgta6::os::win32::set_vmem_arena(nullptr);
+
+    CHECK(r.ok);
+    CHECK(seen_inside == &existing);
+    CHECK(playgta6::os::win32::get_httpfs_client() == &existing);
+    playgta6::os::win32::set_httpfs_client(nullptr);
+}
+
+void test_program_boot_shader_pack_loading() {
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace dx = playgta6::gpu::d3d12_xs_exports;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto run_and_probe = [&](FakeFs& fs,
+                             const WasmBootConfig& cfg,
+                             uint64_t vs_id,
+                             uint64_t ps_id,
+                             bool& resolved_out,
+                             uint64_t& vs_key_out,
+                             uint64_t& ps_key_out,
+                             bool& unknown_resolved_out) -> WasmBootResult {
+        (void)fs;
+        resolved_out = false;
+        vs_key_out = 0;
+        ps_key_out = 0;
+        unknown_resolved_out = true;
+
+        g_test_entry_hook = [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            CHECK(dev_ptr != 0);
+            auto dev = dx::current_device();
+            CHECK(static_cast<bool>(dev));
+            if (!dev) {
+                return;
+            }
+            dg::GraphicsPsoSource src;
+            src.desc.vs = vs_id;
+            src.desc.ps = ps_id;
+            resolved_out = dev->resolve_with_pack(src, &vs_key_out, &ps_key_out);
+
+            dg::GraphicsPsoSource unknown_src;
+            unknown_src.desc.vs = 0xDEADBEEF12345678ULL;
+            unknown_src.desc.ps = 0xCAFEBABE87654321ULL;
+            uint64_t u_vs = 0;
+            uint64_t u_ps = 0;
+            unknown_resolved_out = dev->resolve_with_pack(unknown_src, &u_vs, &u_ps);
+        };
+
+        playgta6::os::VirtualMemoryArena arena;
+        playgta6::os::win32::set_vmem_arena(&arena);
+        dx::reset_for_tests();
+        const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+        g_test_entry_hook = nullptr;
+        dx::reset_for_tests();
+        playgta6::guest::com::reset_com_bridge();
+        playgta6::guest::reset_boot();
+        playgta6::os::win32::set_vmem_arena(nullptr);
+        return r;
+    };
+
+    // 1. Preferred shader pack (`shaders/splash.wgsl.pack`) resolves parsed keys.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack",
+                  make_synthetic_wgpk({{0x1111ULL, 1}, {0x2222ULL, 2}}));
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool resolved = false;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        bool unknown_resolved = true;
+        const WasmBootResult r = run_and_probe(
+            fs, cfg, 0x1111ULL, 0x2222ULL, resolved, vs_key, ps_key, unknown_resolved);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(resolved);
+        CHECK(vs_key == 0x1111ULL);
+        CHECK(ps_key == 0x2222ULL);
+        CHECK(!unknown_resolved);
+        bool saw_pack_log = false;
+        for (const std::string& line : g_logs) {
+            if (line == "[boot] SHADER_PACK: shaders/splash.wgsl.pack loaded (2 key(s))") {
+                saw_pack_log = true;
+            }
+        }
+        CHECK(saw_pack_log);
+    }
+
+    // 2. Missing preferred pack falls back to `shaders/fallback.wgsl.pack`.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/fallback.wgsl.pack",
+                  make_synthetic_wgpk({{0x3333ULL, 1}, {0x4444ULL, 2}}));
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool resolved = false;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        bool unknown_resolved = true;
+        const WasmBootResult r = run_and_probe(
+            fs, cfg, 0x3333ULL, 0x4444ULL, resolved, vs_key, ps_key, unknown_resolved);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(resolved);
+        CHECK(vs_key == 0x3333ULL);
+        CHECK(ps_key == 0x4444ULL);
+        CHECK(!unknown_resolved);
+        bool saw_pack_log = false;
+        for (const std::string& line : g_logs) {
+            if (line == "[boot] SHADER_PACK: shaders/fallback.wgsl.pack loaded (2 key(s))") {
+                saw_pack_log = true;
+            }
+        }
+        CHECK(saw_pack_log);
+    }
+
+    // 3. Missing shader packs degrade cleanly without failing boot (and previous pack is not leaked).
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool resolved = true;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        bool unknown_resolved = true;
+        const WasmBootResult r = run_and_probe(
+            fs, cfg, 0x1111ULL, 0x2222ULL, resolved, vs_key, ps_key, unknown_resolved);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(!resolved);
+        CHECK(!unknown_resolved);
+    }
+
+    // 4. Malformed shader pack degrades cleanly without failing boot.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack", {'N', 'O', 'P', 'E', 0, 1, 2, 3});
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool resolved = true;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        bool unknown_resolved = true;
+        const WasmBootResult r = run_and_probe(
+            fs, cfg, 0x1111ULL, 0x2222ULL, resolved, vs_key, ps_key, unknown_resolved);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(!resolved);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -641,6 +990,9 @@ int main() {
     test_program_boot_bad_magic();
     test_program_boot_corrupt_pgim_error_propagation();
     test_program_boot_full_synthetic_execution();
+    test_program_boot_scoped_httpfs_bridge();
+    test_program_boot_preserves_existing_httpfs_client();
+    test_program_boot_shader_pack_loading();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);

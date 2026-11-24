@@ -1,13 +1,21 @@
 #include "wasm_boot.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <utility>
 
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_xs_exports.h"
+#include "gpu/shader_pack_index.h"
 #include "guest/boot.h"
 #include "guest/program_loader.h"
+#include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 
 #if defined(PG6_BOOT_LINKED_GUEST) && defined(PG6_BOOT_PROGRAM)
 extern "C" const Pg6Program pg6_program;
@@ -271,6 +279,184 @@ WasmBootResult fail_result(std::string stage, std::string error) {
     return r;
 }
 
+std::atomic<const WasmBootConfig*> g_active_boot_cfg{nullptr};
+
+void wasm_off_thread_fault() {
+    const WasmBootConfig* active = g_active_boot_cfg.load(std::memory_order_acquire);
+    if (active != nullptr) {
+        write_log(*active, "[boot] off-thread guest fault captured");
+    } else {
+        os::log("[boot] off-thread guest fault captured");
+    }
+    std::abort();
+}
+
+struct ScopedActiveBootConfig {
+    const WasmBootConfig* prev = nullptr;
+
+    explicit ScopedActiveBootConfig(const WasmBootConfig* cfg)
+        : prev(g_active_boot_cfg.exchange(cfg, std::memory_order_acq_rel)) {}
+    ~ScopedActiveBootConfig() {
+        g_active_boot_cfg.store(prev, std::memory_order_release);
+    }
+    ScopedActiveBootConfig(const ScopedActiveBootConfig&) = delete;
+    ScopedActiveBootConfig& operator=(const ScopedActiveBootConfig&) = delete;
+};
+
+size_t mailbox_payload_cap(const os::HttpfsMailbox& mb) {
+    if (mb.payload_capacity == 0) {
+        return os::kHttpfsPayloadBytes;
+    }
+    return std::min<size_t>(mb.payload_capacity, os::kHttpfsPayloadBytes);
+}
+
+// Bridges Win32 CreateFile/GetFileAttributes and Xbox DirectStorage (XCRDAPI) onto
+// open_path/read_path/close_path whenever no Win32 HTTPFS client is already installed.
+class ScopedWin32HttpfsBridge {
+public:
+    explicit ScopedWin32HttpfsBridge(const WasmBootConfig& cfg) : cfg_(&cfg) {
+        previous_ = os::win32::get_httpfs_client();
+        if (previous_ != nullptr) {
+            return;
+        }
+        mailbox_ = std::make_unique<os::HttpfsMailbox>();
+        os::HttpfsMailboxClient::init_mailbox(*mailbox_);
+        client_ = std::make_unique<os::HttpfsMailboxClient>(
+            mailbox_.get(), [this](os::HttpfsMailbox& mb) { handle(mb); });
+        os::win32::set_httpfs_client(client_.get());
+        installed_ = true;
+    }
+
+    ~ScopedWin32HttpfsBridge() {
+        if (installed_) {
+            os::win32::set_httpfs_client(previous_);
+        }
+    }
+
+    ScopedWin32HttpfsBridge(const ScopedWin32HttpfsBridge&) = delete;
+    ScopedWin32HttpfsBridge& operator=(const ScopedWin32HttpfsBridge&) = delete;
+
+private:
+    void handle(os::HttpfsMailbox& mb) {
+        using os::HttpfsMailboxClient;
+        using os::HttpfsOp;
+        using os::HttpfsStatus;
+
+        const size_t cap = mailbox_payload_cap(mb);
+        switch (static_cast<HttpfsOp>(mb.op)) {
+            case HttpfsOp::Open: {
+                const size_t len = static_cast<size_t>(std::min<uint64_t>(mb.length, cap));
+                std::string rel(reinterpret_cast<const char*>(mb.payload), len);
+                std::replace(rel.begin(), rel.end(), '\\', '/');
+                for (;;) {
+                    if (rel.size() >= 2 && rel[0] == '.' && rel[1] == '/') {
+                        rel.erase(0, 2);
+                    } else if (!rel.empty() && rel.front() == '/') {
+                        rel.erase(0, 1);
+                    } else {
+                        break;
+                    }
+                }
+                if (rel.empty()) {
+                    HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
+                    return;
+                }
+                const std::string lower = to_lower_ascii(rel);
+                const bool has_root_prefix =
+                    lower.rfind("game/", 0) == 0 || lower.rfind("boot/", 0) == 0;
+                int32_t handle = -1;
+                if (!has_root_prefix) {
+                    handle = open_path(*cfg_, "game/" + rel);
+                }
+                if (handle < 0) {
+                    handle = open_path(*cfg_, rel);
+                }
+                if (handle < 0) {
+                    HttpfsMailboxClient::complete_response(mb, handle, HttpfsStatus::Error);
+                    return;
+                }
+                HttpfsMailboxClient::complete_response(mb, handle, HttpfsStatus::ResponseReady);
+                return;
+            }
+            case HttpfsOp::Read: {
+                if (mb.handle < 0) {
+                    HttpfsMailboxClient::complete_response(mb, -9, HttpfsStatus::Error);
+                    return;
+                }
+                const size_t len = static_cast<size_t>(std::min<uint64_t>(mb.length, cap));
+                const int64_t n = read_path(*cfg_, mb.handle, mb.offset, mb.payload, len);
+                if (n < 0 || static_cast<uint64_t>(n) > len) {
+                    HttpfsMailboxClient::complete_response(
+                        mb, n < 0 ? n : -1, HttpfsStatus::Error);
+                    return;
+                }
+                HttpfsMailboxClient::complete_response(mb, n, HttpfsStatus::ResponseReady);
+                return;
+            }
+            case HttpfsOp::Close: {
+                if (mb.handle < 0) {
+                    HttpfsMailboxClient::complete_response(mb, -9, HttpfsStatus::Error);
+                    return;
+                }
+                close_path(*cfg_, mb.handle);
+                HttpfsMailboxClient::complete_response(mb, 0, HttpfsStatus::ResponseReady);
+                return;
+            }
+            default:
+                HttpfsMailboxClient::complete_response(mb, -1, HttpfsStatus::Error);
+                return;
+        }
+    }
+
+    const WasmBootConfig* cfg_ = nullptr;
+    os::HttpfsMailboxClient* previous_ = nullptr;
+    bool installed_ = false;
+    std::unique_ptr<os::HttpfsMailbox> mailbox_;
+    std::unique_ptr<os::HttpfsMailboxClient> client_;
+};
+
+struct ScopedDeviceOptions {
+    bool installed = false;
+
+    void install(gpu::d3d12_guest::DeviceOptions options) {
+        gpu::d3d12_xs_exports::set_device_options(std::move(options));
+        installed = true;
+    }
+
+    ~ScopedDeviceOptions() {
+        if (installed) {
+            gpu::d3d12_xs_exports::set_device_options(gpu::d3d12_guest::DeviceOptions{});
+        }
+    }
+
+    ScopedDeviceOptions() = default;
+    ScopedDeviceOptions(const ScopedDeviceOptions&) = delete;
+    ScopedDeviceOptions& operator=(const ScopedDeviceOptions&) = delete;
+};
+
+bool try_load_shader_pack(const WasmBootConfig& cfg,
+                          const std::string& path,
+                          std::shared_ptr<gpu::ShaderPackIndex>& out_index) {
+    if (path.empty()) {
+        return false;
+    }
+    std::vector<uint8_t> bytes;
+    std::string read_error;
+    if (!load_file_via_httpfs(cfg, path, bytes, read_error)) {
+        return false;
+    }
+    auto index = std::make_shared<gpu::ShaderPackIndex>();
+    std::string parse_error;
+    if (!gpu::parse_shader_pack_index(bytes.data(), bytes.size(), index.get(), &parse_error)) {
+        emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
+        return false;
+    }
+    emit_boot_milestone(cfg, "SHADER_PACK",
+                        path + " loaded (" + std::to_string(index->size()) + " key(s))");
+    out_index = std::move(index);
+    return true;
+}
+
 }  // namespace
 
 bool has_pgim_magic(std::span<const uint8_t> bytes) {
@@ -483,8 +669,26 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
 
     program_boot.config.log_progress = true;
     program_boot.config.console_mode = guest::kConsoleModeSeriesX;
+    program_boot.config.sandbox_id = "RETAIL";
     program_boot.config.working_directory = "G:\\";
     program_boot.config.command_line = "game_scarlett_master.exe";
+    program_boot.config.off_thread_fault = &wasm_off_thread_fault;
+
+    ScopedActiveBootConfig active_boot_cfg(&cfg);
+    ScopedWin32HttpfsBridge httpfs_bridge(cfg);
+    ScopedDeviceOptions device_options_guard;
+
+    std::shared_ptr<gpu::ShaderPackIndex> shader_pack;
+    if (!try_load_shader_pack(cfg, cfg.shader_pack_path, shader_pack) &&
+        !cfg.fallback_shader_pack_path.empty() &&
+        cfg.fallback_shader_pack_path != cfg.shader_pack_path) {
+        (void)try_load_shader_pack(cfg, cfg.fallback_shader_pack_path, shader_pack);
+    }
+    if (shader_pack) {
+        gpu::d3d12_guest::DeviceOptions device_options;
+        device_options.shader_pack = std::move(shader_pack);
+        device_options_guard.install(std::move(device_options));
+    }
 
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     result.ok = boot.status == guest::BootStatus::Exited;
