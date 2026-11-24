@@ -1,603 +1,24 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-astryx-theme="astryx" data-astryx-scheme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>playgta6web</title>
-  <style>
-    :root {
-      --bg: #070a10;
-      --surface: rgba(11, 16, 26, 0.88);
-      --surface-elevated: rgba(18, 25, 39, 0.82);
-      --border: rgba(148, 163, 184, 0.2);
-      --border-subtle: rgba(148, 163, 184, 0.12);
-      --text: #e6edf3;
-      --muted: #8b99ae;
-      --ok: #34d399;
-      --ok-bg: rgba(16, 185, 129, 0.14);
-      --warn: #fbbf24;
-      --warn-bg: rgba(245, 158, 11, 0.14);
-      --err: #f87171;
-      --err-bg: rgba(239, 68, 68, 0.14);
-      --info: #38bdf8;
-      --info-bg: rgba(56, 189, 248, 0.14);
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html, body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--mono);
-    }
-
-    #viewport {
-      position: fixed;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      display: block;
-      background: radial-gradient(circle at 20% 20%, #101829 0%, #070a10 70%);
-    }
-
-    #hud {
-      position: fixed;
-      top: 12px;
-      left: 12px;
-      z-index: 10010;
-      width: min(410px, calc(100vw - 24px));
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      font-size: 11px;
-      line-height: 1.4;
-      color: var(--text);
-      overflow: hidden;
-      user-select: none;
-    }
-
-    #hud.collapsed {
-      width: auto;
-      min-width: 240px;
-    }
-
-    .hud-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 8px 10px;
-      background: rgba(15, 23, 42, 0.72);
-      border-bottom: 1px solid var(--border-subtle);
-    }
-
-    #hud.collapsed .hud-header {
-      border-bottom: none;
-    }
-
-    .hud-title-group {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-    }
-
-    .hud-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      flex-shrink: 0;
-      padding: 2px 6px;
-      border-radius: 999px;
-      border: 1px solid var(--border-subtle);
-      background: var(--surface-elevated);
-      font-size: 9.5px;
-      font-weight: 600;
-      line-height: 1.2;
-      letter-spacing: 0.02em;
-      color: var(--text);
-      white-space: nowrap;
-    }
-
-    .hud-boot-badge::before {
-      content: "";
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: var(--muted);
-      flex-shrink: 0;
-    }
-
-    .hud-boot-badge[data-state="info"],
-    .hud-boot-badge[data-boot-mode="idle"] {
-      border-color: rgba(56, 189, 248, 0.35);
-      background: var(--info-bg);
-      color: #e0f2fe;
-    }
-
-    .hud-boot-badge[data-state="info"]::before,
-    .hud-boot-badge[data-boot-mode="idle"]::before {
-      background: var(--info);
-    }
-
-    .hud-boot-badge[data-state="ok"],
-    .hud-boot-badge[data-boot-mode="real-wasm64"] {
-      border-color: rgba(52, 211, 153, 0.45);
-      background: var(--ok-bg);
-      color: #d1fae5;
-    }
-
-    .hud-boot-badge[data-state="ok"]::before,
-    .hud-boot-badge[data-boot-mode="real-wasm64"]::before {
-      background: var(--ok);
-    }
-
-    .hud-boot-badge[data-state="warn"],
-    .hud-boot-badge[data-boot-mode="smoke"] {
-      border-color: rgba(251, 191, 36, 0.45);
-      background: var(--warn-bg);
-      color: #fef3c7;
-    }
-
-    .hud-boot-badge[data-state="warn"]::before,
-    .hud-boot-badge[data-boot-mode="smoke"]::before {
-      background: var(--warn);
-    }
-
-    .hud-gpu-errors::before {
-      content: "GPU Err";
-      color: var(--muted);
-      font-weight: 500;
-    }
-
-    .hud-gpu-errors[data-state="ok"] {
-      border-color: rgba(52, 211, 153, 0.25);
-      background: rgba(16, 185, 129, 0.08);
-      color: var(--ok);
-    }
-
-    .hud-gpu-errors[data-state="err"] {
-      border-color: rgba(248, 113, 113, 0.5);
-      background: var(--err-bg);
-      color: #fee2e2;
-    }
-
-    .hud-gpu-errors[data-state="err"]::before {
-      color: #fca5a5;
-    }
-
-    .hud-side-modules {
-      padding: 4px 10px;
-      background: rgba(15, 23, 42, 0.56);
-      border-bottom: 1px solid var(--border-subtle);
-      font-size: 10px;
-      color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .hud-side-modules[data-total="0"][data-loaded="0"],
-    #hud.collapsed .hud-side-modules {
-      display: none;
-    }
-
-    .hud-side-modules[data-state="info"] {
-      color: #e0f2fe;
-      background: var(--info-bg);
-    }
-
-    .hud-side-modules[data-state="ok"] {
-      color: #d1fae5;
-      background: var(--ok-bg);
-    }
-
-    .hud-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      flex-shrink: 0;
-      background: var(--info);
-      box-shadow: 0 0 8px var(--info);
-    }
-
-    .hud-dot[data-level="ok"] {
-      background: var(--ok);
-      box-shadow: 0 0 8px var(--ok);
-    }
-
-    .hud-dot[data-level="warn"] {
-      background: var(--warn);
-      box-shadow: 0 0 8px var(--warn);
-    }
-
-    .hud-dot[data-level="error"] {
-      background: var(--err);
-      box-shadow: 0 0 8px var(--err);
-    }
-
-    .hud-brand {
-      font-family: var(--sans);
-      font-weight: 700;
-      font-size: 12px;
-      letter-spacing: 0.03em;
-      color: #f8fafc;
-      white-space: nowrap;
-    }
-
-    #hud-status {
-      color: var(--muted);
-      font-size: 11px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .hud-actions {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      flex-shrink: 0;
-    }
-
-    .hud-btn {
-      appearance: none;
-      border: 1px solid var(--border);
-      background: rgba(30, 41, 59, 0.72);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 10px;
-      padding: 3px 7px;
-      border-radius: 5px;
-      cursor: pointer;
-      transition: background 120ms ease, border-color 120ms ease;
-    }
-
-    .hud-btn:hover {
-      background: rgba(51, 65, 85, 0.85);
-      border-color: rgba(148, 163, 184, 0.4);
-    }
-
-    .hud-btn:active {
-      transform: translateY(1px);
-    }
-
-    .hud-btn[data-active="true"] {
-      border-color: rgba(52, 211, 153, 0.45);
-      background: var(--ok-bg);
-      color: #d1fae5;
-    }
-
-    .hud-btn[data-recording="true"] {
-      border-color: rgba(248, 113, 113, 0.5);
-      background: var(--err-bg);
-      color: #fee2e2;
-    }
-
-    .controls-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 5px;
-    }
-
-    .controls-grid .hud-btn {
-      width: 100%;
-      padding: 5px 7px;
-      text-align: center;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .control-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 4px 7px;
-      border-radius: 6px;
-      background: var(--surface-elevated);
-      border: 1px solid var(--border-subtle);
-    }
-
-    .hud-select {
-      flex: 1;
-      min-width: 0;
-      border: 1px solid var(--border);
-      background: rgba(15, 23, 42, 0.9);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 10.5px;
-      padding: 3px 6px;
-      border-radius: 5px;
-      cursor: pointer;
-    }
-
-    .hud-select:focus {
-      outline: 1px solid var(--info);
-      border-color: var(--info);
-    }
-
-    #hud-body {
-      padding: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      max-height: calc(100vh - 56px);
-      overflow-y: auto;
-    }
-
-    #hud.collapsed #hud-body {
-      display: none;
-    }
-
-    .hud-section {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .hud-section-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-family: var(--sans);
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-
-    .badge-grid {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 3px 7px;
-      border-radius: 5px;
-      border: 1px solid var(--border-subtle);
-      background: var(--surface-elevated);
-      font-size: 10.5px;
-      color: var(--text);
-    }
-
-    .badge-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--muted);
-    }
-
-    .badge[data-state="ok"] {
-      border-color: rgba(52, 211, 153, 0.35);
-      background: var(--ok-bg);
-      color: #d1fae5;
-    }
-
-    .badge[data-state="ok"] .badge-dot {
-      background: var(--ok);
-    }
-
-    .badge[data-state="warn"] {
-      border-color: rgba(251, 191, 36, 0.35);
-      background: var(--warn-bg);
-      color: #fef3c7;
-    }
-
-    .badge[data-state="warn"] .badge-dot {
-      background: var(--warn);
-    }
-
-    .badge[data-state="err"] {
-      border-color: rgba(248, 113, 113, 0.35);
-      background: var(--err-bg);
-      color: #fee2e2;
-    }
-
-    .badge[data-state="err"] .badge-dot {
-      background: var(--err);
-    }
-
-    .badge[data-state="info"] {
-      border-color: rgba(56, 189, 248, 0.35);
-      background: var(--info-bg);
-      color: #e0f2fe;
-    }
-
-    .badge[data-state="info"] .badge-dot {
-      background: var(--info);
-    }
-
-    .kv-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 5px;
-    }
-
-    .kv-card {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
-      padding: 5px 7px;
-      border-radius: 6px;
-      background: var(--surface-elevated);
-      border: 1px solid var(--border-subtle);
-    }
-
-    .kv-card.span-2 {
-      grid-column: span 2;
-    }
-
-    .kv-label {
-      color: var(--muted);
-      font-size: 10px;
-      white-space: nowrap;
-    }
-
-    .kv-value {
-      font-weight: 600;
-      font-size: 11px;
-      color: var(--text);
-      text-align: right;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .kv-value[data-state="ok"] { color: var(--ok); }
-    .kv-value[data-state="warn"] { color: var(--warn); }
-    .kv-value[data-state="err"] { color: var(--err); }
-    .kv-value[data-state="info"] { color: var(--info); }
-
-    #hud-log {
-      margin: 0;
-      padding: 7px 8px;
-      height: 150px;
-      overflow-y: auto;
-      border-radius: 6px;
-      background: rgba(4, 7, 13, 0.85);
-      border: 1px solid var(--border-subtle);
-      font-size: 10.5px;
-      line-height: 1.45;
-      user-select: text;
-    }
-
-    .log-entry {
-      display: flex;
-      gap: 6px;
-      word-break: break-word;
-      padding: 1px 0;
-    }
-
-    .log-time {
-      color: #64748b;
-      flex-shrink: 0;
-    }
-
-    .log-msg {
-      color: #cbd5e1;
-      white-space: pre-wrap;
-    }
-
-    .log-entry[data-level="ok"] .log-msg { color: var(--ok); }
-    .log-entry[data-level="warn"] .log-msg { color: var(--warn); }
-    .log-entry[data-level="error"] .log-msg { color: var(--err); }
-
-    #hud-log::-webkit-scrollbar {
-      width: 6px;
-    }
-
-    #hud-log::-webkit-scrollbar-thumb {
-      background: rgba(148, 163, 184, 0.28);
-      border-radius: 3px;
-    }
-
-    #gpu-boot-panel-root {
-      width: 100%;
-      border-radius: 6px;
-      background: var(--surface-elevated);
-      border: 1px solid var(--border-subtle);
-      overflow: hidden;
-    }
-
-    #gpu-boot-panel-root:empty {
-      display: none;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel {
-      width: 100%;
-      border: none;
-      border-radius: 0;
-      background: transparent;
-      box-shadow: none;
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 10.5px;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__header {
-      background: rgba(15, 23, 42, 0.65);
-      border-bottom-color: var(--border-subtle);
-      padding: 6px 8px;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__title {
-      font-family: var(--sans);
-      font-size: 11px;
-      color: var(--text);
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__summary-badge {
-      background: var(--info-bg);
-      color: #e0f2fe;
-      font-size: 10px;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__btn {
-      border-color: var(--border);
-      background: rgba(30, 41, 59, 0.72);
-      color: var(--text);
-      font-family: var(--mono);
-      font-size: 10px;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__btn:hover {
-      background: rgba(51, 65, 85, 0.85);
-      border-color: rgba(148, 163, 184, 0.4);
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__body {
-      padding: 8px;
-      gap: 8px;
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__section-title,
-    #gpu-boot-panel-root .pg6-gpu-panel__metric-label,
-    #gpu-boot-panel-root .pg6-gpu-panel__table th,
-    #gpu-boot-panel-root .pg6-gpu-panel__empty-cell {
-      color: var(--muted);
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__metric {
-      background: rgba(15, 23, 42, 0.6);
-      border: 1px solid var(--border-subtle);
-    }
-
-    #gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
-      background: var(--info);
-    }
-  </style>
+  <link rel="stylesheet" href="./ui/overlay.css" />
 </head>
 <body>
   <canvas id="viewport"></canvas>
   <div id="splash-overlay-root"></div>
 
-  <div id="hud" role="region" aria-label="playgta6web diagnostics HUD">
+  <div id="hud" class="astryx-card" role="region" aria-label="playgta6web diagnostics HUD">
+    <!-- Section 1: Header Bar -->
     <div class="hud-header">
       <div class="hud-title-group">
-        <span id="hud-status-dot" class="hud-dot" data-level="info"></span>
+        <span id="hud-status-dot" class="astryx-status-dot" data-level="info" aria-hidden="true"></span>
         <span class="hud-brand">playgta6web</span>
         <span
           id="boot-mode-badge"
-          class="hud-pill hud-boot-badge"
+          class="astryx-badge"
           data-boot-mode="idle"
           data-state="info"
           role="status"
@@ -605,134 +26,204 @@
           aria-label="Boot mode: Idle"
           title="Idle"
         >Idle</span>
-        <span id="hud-status">Booting...</span>
+        <span class="hud-pill-meta" aria-hidden="true">
+          <span class="hud-pill-sep">·</span>
+          <span id="hud-pill-fps">0 fps</span>
+        </span>
       </div>
       <div class="hud-actions">
-        <span
-          id="gpu-validation-errors"
-          class="hud-pill hud-gpu-errors"
-          data-count="0"
-          data-state="ok"
-          role="status"
-          aria-live="polite"
-          aria-label="0 WebGPU validation errors"
-          title="0 WebGPU validation errors"
-        >0</span>
-        <button id="hud-toggle" class="hud-btn" type="button" title="Toggle HUD (F9)">Hide</button>
+        <button id="hud-toggle" class="astryx-button" data-variant="ghost" data-size="xs" type="button" title="Toggle HUD (F9)">Hide</button>
       </div>
     </div>
-    <div
-      id="side-module-status"
-      class="hud-side-modules"
-      data-loaded="0"
-      data-total="0"
-      data-state=""
-      role="status"
-      aria-live="polite"
-      title="No split modules"
-    >No split modules</div>
 
     <div id="hud-body">
-      <section class="hud-section" aria-label="Browser capabilities">
-        <div class="hud-section-head">
-          <span>Browser Capabilities</span>
+      <!-- Conditional Banners (hidden unless required capability is missing or GPU error occurs) -->
+      <div id="hud-capability-banner" class="astryx-banner" data-status="error" role="alert" hidden>
+        <span id="hud-capability-banner-text" class="astryx-banner-text"></span>
+      </div>
+      <div id="hud-validation-banner" class="astryx-banner" data-status="error" role="alert" hidden>
+        <span id="hud-validation-latest" class="astryx-banner-text">None</span>
+      </div>
+
+      <!-- Section 2: Boot Progress Row -->
+      <section class="hud-boot-section" aria-label="Boot progress">
+        <div class="hud-boot-meta">
+          <div class="hud-boot-stage-group">
+            <span id="hud-boot-stage">BOOTING</span>
+            <span id="hud-status">Booting...</span>
+          </div>
+          <span id="hud-boot-elapsed">0.0s</span>
         </div>
-        <div class="badge-grid">
-          <span id="cap-coi" class="badge" data-state="warn"><span class="badge-dot"></span>COI / SAB</span>
-          <span id="cap-webgpu" class="badge" data-state="warn"><span class="badge-dot"></span>WebGPU</span>
-          <span id="cap-wasm64" class="badge" data-state="warn"><span class="badge-dot"></span>Wasm64</span>
-          <span id="cap-opfs" class="badge" data-state="warn"><span class="badge-dot"></span>OPFS</span>
-          <span id="cap-gamepad" class="badge" data-state="warn"><span class="badge-dot"></span>Gamepad API</span>
+        <div
+          id="hud-boot-progress-bar"
+          class="astryx-progress-bar-track"
+          role="progressbar"
+          aria-label="Boot progress"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+        >
+          <div id="hud-boot-progress-fill" class="astryx-progress-bar-fill"></div>
+        </div>
+        <div
+          id="side-module-status"
+          class="hud-side-modules"
+          data-loaded="0"
+          data-total="0"
+          role="status"
+          aria-live="polite"
+        >No split modules</div>
+      </section>
+
+      <!-- Section 3: Compact 3-Metric Row -->
+      <section class="hud-metrics-strip" aria-label="Key telemetry">
+        <div class="hud-metric-cell">
+          <span class="hud-metric-label">Frames</span>
+          <span id="metric-frames" class="hud-metric-value">0</span>
+        </div>
+        <div class="hud-metric-cell">
+          <span class="hud-metric-label">FPS</span>
+          <span id="metric-fps" class="hud-metric-value">--</span>
+        </div>
+        <div class="hud-metric-cell">
+          <span class="hud-metric-label">GPU Errors</span>
+          <span
+            id="gpu-validation-errors"
+            class="hud-metric-value hud-gpu-errors"
+            data-count="0"
+            data-state="ok"
+            role="status"
+            aria-live="polite"
+            title="0 WebGPU validation errors"
+            aria-label="0 WebGPU validation errors"
+          >0</span>
         </div>
       </section>
 
-      <section class="hud-section" aria-label="Server readiness">
-        <div class="hud-section-head">
-          <span>Server Readiness (/api/status)</span>
-          <button id="hud-refresh-status" class="hud-btn" type="button">Refresh</button>
-        </div>
-        <div class="kv-grid">
-          <div class="kv-card">
-            <span class="kv-label">Manifest</span>
-            <span id="srv-manifest" class="kv-value" data-state="warn">Checking...</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">Bootset</span>
-            <span id="srv-bootset" class="kv-value" data-state="warn">Checking...</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">Wasm Binary</span>
-            <span id="srv-wasm" class="kv-value" data-state="warn">Checking...</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">Shader Packs</span>
-            <span id="srv-shaders" class="kv-value" data-state="warn">--</span>
-          </div>
-        </div>
-      </section>
+      <!-- Section 4: Primary Actions + Compact Collapsible Log -->
+      <div class="hud-primary-actions" aria-label="Primary actions">
+        <button id="btn-restart-session" class="astryx-button" data-variant="primary" type="button">Restart</button>
+        <button id="btn-export-crash" class="astryx-button" data-variant="secondary" type="button">Export Report</button>
+      </div>
 
-      <section class="hud-section" aria-label="Live telemetry">
-        <div class="hud-section-head">
-          <span>Live Telemetry</span>
+      <details id="hud-log-disclosure" class="astryx-collapsible">
+        <summary class="astryx-collapsible-trigger">
+          <span class="astryx-collapsible-title">
+            <span>Log</span>
+            <span id="hud-log-count" class="astryx-collapsible-count">0</span>
+          </span>
+          <span class="astryx-collapsible-trailing">
+            <button id="hud-clear-log" class="astryx-button" data-variant="ghost" data-size="xs" type="button">Clear</button>
+            <svg class="astryx-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+        </summary>
+        <div class="astryx-collapsible-content">
+          <div id="hud-log" role="log" aria-live="polite"></div>
         </div>
-        <div class="kv-grid">
-          <div class="kv-card">
-            <span class="kv-label">FPS</span>
-            <span id="metric-fps" class="kv-value">--</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">GPU Packets</span>
-            <span id="metric-gpu-packets" class="kv-value">0</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">OPFS Cache Hits</span>
-            <span id="metric-opfs-hits" class="kv-value">0</span>
-          </div>
-          <div class="kv-card">
-            <span class="kv-label">Pointer Lock</span>
-            <span id="metric-pointer-lock" class="kv-value">Unlocked</span>
-          </div>
-          <div class="kv-card span-2">
-            <span class="kv-label">Gamepad</span>
-            <span id="metric-gamepad" class="kv-value">None</span>
-          </div>
-        </div>
-      </section>
+      </details>
 
-      <section class="hud-section" aria-label="Controls and diagnostics">
-        <div class="hud-section-head">
-          <span>Controls &amp; Diagnostics</span>
-        </div>
-        <div class="controls-grid">
-          <button id="btn-smoke-demo" class="hud-btn" type="button" aria-pressed="false">Smoke Demo</button>
-          <button id="btn-restart-session" class="hud-btn" type="button">Restart</button>
-          <button id="btn-record-trace" class="hud-btn" type="button" data-recording="false" aria-pressed="false">Record Trace</button>
-          <button id="btn-export-trace" class="hud-btn" type="button">Export .pg6trace</button>
-          <button id="btn-clear-cache" class="hud-btn" type="button">Clear Cache</button>
-          <button id="btn-export-saves" class="hud-btn" type="button">Export Saves</button>
-          <button id="btn-export-crash" class="hud-btn" type="button">Export Report</button>
-          <button id="btn-export-missing-shaders" class="hud-btn" type="button">Missing Shaders</button>
-        </div>
-        <div class="control-row">
-          <label class="kv-label" for="select-input-profile">Input Profile</label>
-          <select id="select-input-profile" class="hud-select" aria-label="Input Profile"></select>
-        </div>
-      </section>
+      <!-- Collapsed Astryx Disclosure: Diagnostics & Tools (closed by default) -->
+      <details id="hud-diagnostics-disclosure" class="astryx-collapsible">
+        <summary class="astryx-collapsible-trigger">
+          <span class="astryx-collapsible-title">Diagnostics &amp; Tools</span>
+          <span class="astryx-collapsible-trailing">
+            <svg class="astryx-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+        </summary>
 
-      <section class="hud-section" aria-label="Frame-1 GPU and shader diagnostics">
-        <div class="hud-section-head">
-          <span>GPU Boot &amp; Shaders</span>
-        </div>
-        <div id="gpu-boot-panel-root" class="gpu-boot-panel-slot"></div>
-      </section>
+        <div class="astryx-collapsible-content">
+          <section class="diag-group" aria-label="Browser capabilities">
+            <div class="diag-group-head">
+              <span>Capabilities</span>
+            </div>
+            <div class="badge-grid">
+              <span id="cap-coi" class="astryx-badge" data-state="warn"><span class="astryx-badge-dot"></span>COI / SAB</span>
+              <span id="cap-webgpu" class="astryx-badge" data-state="warn"><span class="astryx-badge-dot"></span>WebGPU</span>
+              <span id="cap-wasm64" class="astryx-badge" data-state="warn"><span class="astryx-badge-dot"></span>Wasm64</span>
+              <span id="cap-opfs" class="astryx-badge" data-state="warn"><span class="astryx-badge-dot"></span>OPFS</span>
+              <span id="cap-gamepad" class="astryx-badge" data-state="warn"><span class="astryx-badge-dot"></span>Gamepad</span>
+            </div>
+          </section>
 
-      <section class="hud-section" aria-label="Runtime log">
-        <div class="hud-section-head">
-          <span>Runtime Log</span>
-          <button id="hud-clear-log" class="hud-btn" type="button">Clear</button>
+          <section class="diag-group" aria-label="Server readiness">
+            <div class="diag-group-head">
+              <span>Server Readiness</span>
+              <button id="hud-refresh-status" class="astryx-button" data-variant="ghost" data-size="xs" type="button">Refresh</button>
+            </div>
+            <div class="kv-list">
+              <div class="kv-row">
+                <span class="kv-label">Manifest</span>
+                <span id="srv-manifest" class="kv-value" data-state="warn">Checking...</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">Bootset</span>
+                <span id="srv-bootset" class="kv-value" data-state="warn">Checking...</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">Wasm Binary</span>
+                <span id="srv-wasm" class="kv-value" data-state="warn">Checking...</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">Shader Packs</span>
+                <span id="srv-shaders" class="kv-value" data-state="warn">--</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="diag-group" aria-label="Runtime telemetry">
+            <div class="diag-group-head">
+              <span>Telemetry</span>
+            </div>
+            <div class="kv-list">
+              <div class="kv-row">
+                <span class="kv-label">GPU Packets</span>
+                <span id="metric-gpu-packets" class="kv-value">0</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">OPFS Cache Hits</span>
+                <span id="metric-opfs-hits" class="kv-value">0</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">Pointer Lock</span>
+                <span id="metric-pointer-lock" class="kv-value">Unlocked</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">Gamepad</span>
+                <span id="metric-gamepad" class="kv-value">None</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="diag-group" aria-label="Controls and tools">
+            <div class="diag-group-head">
+              <span>Controls</span>
+            </div>
+            <div class="controls-grid">
+              <button id="btn-smoke-demo" class="astryx-button" data-variant="secondary" data-size="xs" type="button" aria-pressed="false">Smoke Demo</button>
+              <button id="btn-record-trace" class="astryx-button" data-variant="secondary" data-size="xs" type="button" data-recording="false" aria-pressed="false">Record Trace</button>
+              <button id="btn-export-trace" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Export .pg6trace</button>
+              <button id="btn-clear-cache" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Clear Cache</button>
+              <button id="btn-export-saves" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Export Saves</button>
+              <button id="btn-export-missing-shaders" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Missing Shaders</button>
+            </div>
+            <div class="control-row">
+              <label class="kv-label" for="select-input-profile">Input Profile</label>
+              <select id="select-input-profile" class="astryx-select" aria-label="Input Profile"></select>
+            </div>
+          </section>
+
+          <section class="diag-group" aria-label="GPU boot and shaders">
+            <div class="diag-group-head">
+              <span>GPU Boot &amp; Shaders</span>
+            </div>
+            <div id="gpu-boot-panel-root" class="gpu-boot-panel-slot"></div>
+          </section>
         </div>
-        <div id="hud-log" role="log" aria-live="polite"></div>
-      </section>
+      </details>
     </div>
   </div>
 
@@ -753,10 +244,22 @@
     const sideModuleStatusEl = document.getElementById('side-module-status');
     const gpuValidationErrorsEl = document.getElementById('gpu-validation-errors');
     const statusEl = document.getElementById('hud-status');
+    const pillFpsEl = document.getElementById('hud-pill-fps');
     const toggleBtn = document.getElementById('hud-toggle');
     const refreshStatusBtn = document.getElementById('hud-refresh-status');
     const clearLogBtn = document.getElementById('hud-clear-log');
     const logEl = document.getElementById('hud-log');
+    const logCountEl = document.getElementById('hud-log-count');
+
+    const capabilityBannerEl = document.getElementById('hud-capability-banner');
+    const capabilityBannerTextEl = document.getElementById('hud-capability-banner-text');
+    const validationBannerEl = document.getElementById('hud-validation-banner');
+    const validationLatestEl = document.getElementById('hud-validation-latest');
+
+    const bootStageEl = document.getElementById('hud-boot-stage');
+    const bootElapsedEl = document.getElementById('hud-boot-elapsed');
+    const bootProgressBarEl = document.getElementById('hud-boot-progress-bar');
+    const bootProgressFillEl = document.getElementById('hud-boot-progress-fill');
 
     const smokeDemoBtn = document.getElementById('btn-smoke-demo');
     const restartBtn = document.getElementById('btn-restart-session');
@@ -784,6 +287,7 @@
     };
 
     const metricEls = {
+      frames: document.getElementById('metric-frames'),
       fps: document.getElementById('metric-fps'),
       gpuPackets: document.getElementById('metric-gpu-packets'),
       opfsCacheHits: document.getElementById('metric-opfs-hits'),
@@ -793,6 +297,10 @@
 
     const MAX_LOG_LINES = 200;
     let lastValidationEventKey = null;
+    const bootStartedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+    let bootCompleted = false;
 
     function syncValidationPillTooltip(summary) {
       if (!gpuValidationErrorsEl || !summary || typeof summary !== 'object') return;
@@ -945,6 +453,11 @@
       return now.toTimeString().slice(0, 8);
     }
 
+    function formatElapsed(ms) {
+      const clamped = Number.isFinite(ms) && ms > 0 ? ms : 0;
+      return `${(clamped / 1000).toFixed(1)}s`;
+    }
+
     function setBadge(el, ok, labelOk, labelFail) {
       if (!el) return;
       el.dataset.state = ok ? 'ok' : 'err';
@@ -958,10 +471,56 @@
       else delete el.dataset.state;
     }
 
+    function syncLogCount() {
+      if (logCountEl) {
+        logCountEl.textContent = String(logEl.childElementCount);
+      }
+    }
+
+    function updateBootProgress(bootSummary) {
+      if (!bootSummary || typeof bootSummary !== 'object') return;
+
+      const stage = typeof bootSummary.stage === 'string' && bootSummary.stage.trim().length > 0
+        ? bootSummary.stage.trim().toUpperCase()
+        : null;
+      if (stage && bootStageEl) {
+        bootStageEl.textContent = stage;
+      }
+
+      let pct = null;
+      if (typeof bootSummary.progressPct === 'number' && Number.isFinite(bootSummary.progressPct)) {
+        pct = Math.max(0, Math.min(100, bootSummary.progressPct));
+      } else if (
+        typeof bootSummary.milestonesReached === 'number' &&
+        typeof bootSummary.totalMilestones === 'number' &&
+        bootSummary.totalMilestones > 0
+      ) {
+        pct = Math.max(0, Math.min(100, (bootSummary.milestonesReached / bootSummary.totalMilestones) * 100));
+      }
+
+      if (pct !== null && bootProgressFillEl) {
+        bootProgressFillEl.style.width = `${pct.toFixed(1)}%`;
+        if (bootProgressBarEl) {
+          bootProgressBarEl.setAttribute('aria-valuenow', String(Math.round(pct)));
+        }
+        if (pct >= 100 || stage === 'FIRST_PRESENT' || bootSummary.readyForSplash) {
+          bootProgressFillEl.dataset.state = 'ok';
+          bootCompleted = true;
+        }
+      }
+
+      if (typeof bootSummary.elapsedMs === 'number' && Number.isFinite(bootSummary.elapsedMs) && bootElapsedEl) {
+        bootElapsedEl.textContent = formatElapsed(bootSummary.elapsedMs);
+      }
+    }
+
     function setStatus(text, level = 'info') {
       statusEl.textContent = String(text ?? '');
       const normalized = ['info', 'ok', 'warn', 'error'].includes(level) ? level : 'info';
       statusDotEl.dataset.level = normalized;
+      if (bootProgressFillEl && normalized === 'error') {
+        bootProgressFillEl.dataset.state = 'err';
+      }
     }
 
     function appendLog(message, level = 'info') {
@@ -985,6 +544,7 @@
         logEl.removeChild(logEl.firstElementChild);
       }
       logEl.scrollTop = logEl.scrollHeight;
+      syncLogCount();
     }
 
     function updateMetrics(metrics = {}) {
@@ -995,6 +555,17 @@
           ? (metrics.fps >= 10 ? Math.round(metrics.fps).toString() : metrics.fps.toFixed(1))
           : String(metrics.fps);
         setValue(metricEls.fps, fpsVal, typeof metrics.fps === 'number' && metrics.fps >= 30 ? 'ok' : 'info');
+        if (pillFpsEl) {
+          pillFpsEl.textContent = `${fpsVal} fps`;
+        }
+      }
+
+      const frames =
+        metrics.framesPresented ??
+        metrics.frameStats?.framesPresented ??
+        metrics.totalFrames;
+      if (frames !== undefined && frames !== null) {
+        setValue(metricEls.frames, String(frames));
       }
 
       const packets = metrics.gpuPackets ?? metrics.packets;
@@ -1032,6 +603,10 @@
 
       if (metrics.status !== undefined) {
         setStatus(metrics.status, metrics.level || 'info');
+      }
+
+      if (metrics.bootSummary !== undefined) {
+        updateBootProgress(metrics.bootSummary);
       }
 
       if (
@@ -1114,6 +689,7 @@
       const next = Boolean(collapsed);
       hudEl.classList.toggle('collapsed', next);
       toggleBtn.textContent = next ? 'Show' : 'Hide';
+      toggleBtn.setAttribute('aria-expanded', next ? 'false' : 'true');
     }
 
     async function refreshServerStatus() {
@@ -1192,8 +768,11 @@
       refreshServerStatus();
     });
 
-    clearLogBtn.addEventListener('click', () => {
+    clearLogBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
       logEl.textContent = '';
+      syncLogCount();
     });
 
     window.addEventListener('keydown', (ev) => {
@@ -1202,6 +781,17 @@
         setCollapsed(!hudEl.classList.contains('collapsed'));
       }
     });
+
+    const elapsedTimer = window.setInterval(() => {
+      if (bootCompleted || !bootElapsedEl) {
+        window.clearInterval(elapsedTimer);
+        return;
+      }
+      const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+      bootElapsedEl.textContent = formatElapsed(now - bootStartedAt);
+    }, 100);
 
     function updatePointerLockState() {
       const locked = document.pointerLockElement === canvas;
@@ -1291,6 +881,18 @@
     setBadge(capEls.opfs, caps.opfs, 'Origin Private File System supported', 'OPFS unavailable');
     setBadge(capEls.gamepad, caps.gamepad, 'Gamepad API available', 'Gamepad API unavailable');
 
+    const missingRequiredCaps = [];
+    if (!caps.coi || !caps.sab) {
+      missingRequiredCaps.push('COOP/COEP (SharedArrayBuffer)');
+    }
+    if (!caps.webgpu) {
+      missingRequiredCaps.push('WebGPU');
+    }
+    if (missingRequiredCaps.length > 0 && capabilityBannerEl && capabilityBannerTextEl) {
+      capabilityBannerTextEl.textContent = `Missing required: ${missingRequiredCaps.join(', ')}.`;
+      capabilityBannerEl.hidden = false;
+    }
+
     appendLog(
       `COI/SAB: ${caps.coi && caps.sab} | WebGPU: ${caps.webgpu} | Wasm64: ${caps.wasm64} | OPFS: ${caps.opfs} | Gamepad: ${caps.gamepad}`
     );
@@ -1298,6 +900,9 @@
     refreshServerStatus();
 
     if (!caps.coi || !caps.sab) {
+      bootCompleted = true;
+      window.clearInterval(elapsedTimer);
+      if (bootStageEl) bootStageEl.textContent = 'BLOCKED';
       setStatus('Missing COOP/COEP', 'error');
       appendLog('Serve via server/serve_local.py so COOP/COEP headers enable SharedArrayBuffer.', 'error');
     } else {
@@ -1388,6 +993,8 @@
           bootModeBadge: bootModeBadgeEl,
           sideModuleStatusEl,
           validationCountEl: gpuValidationErrorsEl,
+          validationLatestEl,
+          validationBannerEl,
         },
       });
       activeHudController = hudController;
@@ -1426,7 +1033,9 @@
           recordTraceBtn.textContent = recording ? 'Stop Trace' : 'Record Trace';
         }
         if (app.bootTracer && typeof app.bootTracer.getSummary === 'function') {
-          hudController.updateGpuBootTelemetry({ bootSummary: app.bootTracer.getSummary() });
+          const summary = app.bootTracer.getSummary();
+          updateBootProgress(summary);
+          hudController.updateGpuBootTelemetry({ bootSummary: summary });
         }
         syncBootDiagnosticDisplay();
       };
@@ -1442,6 +1051,7 @@
       syncControlStates();
 
       window.addEventListener('pagehide', () => {
+        window.clearInterval(elapsedTimer);
         unsubscribeSession();
         activeHudController = null;
         hudController.destroy();
@@ -1452,11 +1062,16 @@
       });
 
       if (!caps.webgpu) {
+        bootCompleted = true;
+        window.clearInterval(elapsedTimer);
+        if (bootStageEl) bootStageEl.textContent = 'NO_WEBGPU';
         setStatus('WebGPU unavailable', 'error');
         appendLog('WebGPU is unavailable in this browser.', 'error');
       } else {
         setStatus('Booting runtime...', 'info');
         app.start().catch((err) => {
+          bootCompleted = true;
+          window.clearInterval(elapsedTimer);
           setStatus('Startup error', 'error');
           appendLog(`Runtime startup failed: ${err?.message || err}`, 'error');
         });

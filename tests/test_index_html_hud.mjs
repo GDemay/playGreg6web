@@ -1,7 +1,9 @@
-// Unit & integration tests for W74 HUD indicators in web/index.html:
+// Unit & integration tests for W74 + W76 HUD overlay in web/index.html & web/ui/overlay.css:
 // - Real-vs-smoke bootMode badge (#boot-mode-badge / data-boot-mode="idle")
 // - Split-module load progress status line (#side-module-status)
-// - Live WebGPU validation error pill (#gpu-validation-errors)
+// - Live WebGPU validation error metric (#gpu-validation-errors)
+// - W76 debloated 4-section Astryx 1:1 layout, collapsed Diagnostics & Tools disclosure,
+//   collapsed status pill, and self-contained COOP/COEP-safe Astryx stylesheet
 // - Preservation of all existing HUD IDs, COI/WebGPU checks, Wasm64 `address: 'i64'`
 //   detection, valid HTML5 structure, and zero hardcoded host paths or game files.
 
@@ -17,17 +19,13 @@ import { HudController, BOOT_MODE } from '../web/ui/hud_controller.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const INDEX_HTML_PATH = path.join(REPO_ROOT, 'web', 'index.html');
+const OVERLAY_CSS_PATH = path.join(REPO_ROOT, 'web', 'ui', 'overlay.css');
 const indexHtml = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
+const overlayCss = fs.readFileSync(OVERLAY_CSS_PATH, 'utf8');
 
 function extractModuleScript(html) {
   const match = /<script\s+type="module">([\s\S]*?)<\/script>/i.exec(html);
   assert.ok(match, 'web/index.html must contain a <script type="module"> block');
-  return match[1];
-}
-
-function extractStyleBlock(html) {
-  const match = /<style>([\s\S]*?)<\/style>/i.exec(html);
-  assert.ok(match, 'web/index.html must contain a <style> block');
   return match[1];
 }
 
@@ -45,6 +43,15 @@ function extractElementById(html, id) {
     attrs[m[1]] = m[2];
   }
   return { tag: tag.toLowerCase(), attrs, innerText: innerText.trim(), raw: match[0] };
+}
+
+function extractTagBlock(html, openRe, closeTag) {
+  const startMatch = openRe.exec(html);
+  assert.ok(startMatch, `Expected opening pattern ${openRe} in web/index.html`);
+  const startIdx = startMatch.index;
+  const endIdx = html.indexOf(closeTag, startIdx);
+  assert.ok(endIdx !== -1, `Expected closing tag ${closeTag} after ${startMatch[0]}`);
+  return html.slice(startIdx, endIdx + closeTag.length);
 }
 
 function createMockDisplayElement(initial = {}) {
@@ -65,7 +72,7 @@ function createMockDisplayElement(initial = {}) {
 
 test('W74 web/index.html is valid HTML5 with all required existing & new HUD IDs and zero duplicates', () => {
   assert.match(indexHtml, /^\s*<!doctype html>/i, 'web/index.html must start with HTML5 doctype');
-  assert.match(indexHtml, /<html\s+lang="en">/i);
+  assert.match(indexHtml, /<html\s+lang="en"[^>]*>/i);
   assert.match(indexHtml, /<meta\s+charset="utf-8"\s*\/>/i);
   assert.match(indexHtml, /<head>[\s\S]*<\/head>/i);
   assert.match(indexHtml, /<body>[\s\S]*<\/body>/i);
@@ -107,7 +114,7 @@ test('W74 web/index.html is valid HTML5 with all required existing & new HUD IDs
     'btn-export-missing-shaders',
     'select-input-profile',
     'gpu-boot-panel-root',
-    // W74 new HUD diagnostic indicators
+    // W74 HUD diagnostic indicators
     'boot-mode-badge',
     'side-module-status',
     'gpu-validation-errors',
@@ -130,7 +137,7 @@ test('W74 web/index.html is valid HTML5 with all required existing & new HUD IDs
   }
 });
 
-test('W74 boot-mode badge, split-module status line, and GPU validation error pill are accessible and unobtrusive inside #hud', () => {
+test('W74 boot-mode badge, split-module status line, and GPU validation error indicator are accessible and unobtrusive inside #hud', () => {
   const hudStart = indexHtml.indexOf('<div id="hud"');
   const scriptStart = indexHtml.indexOf('<script src="./runtime/pgim_preloader.js">');
   assert.ok(hudStart !== -1 && scriptStart > hudStart, 'Expected #hud container before scripts');
@@ -165,15 +172,14 @@ test('W74 boot-mode badge, split-module status line, and GPU validation error pi
   assert.ok(gpuErrPill.attrs['aria-label'], '#gpu-validation-errors must define aria-label');
   assert.equal(gpuErrPill.innerText, '0');
 
-  // Verify unobtrusive styling rules exist for all boot modes, 0-side-module hiding, and GPU errors.
-  const css = extractStyleBlock(indexHtml);
-  assert.match(css, /\[data-boot-mode="idle"\]/);
-  assert.match(css, /\[data-boot-mode="real-wasm64"\]/);
-  assert.match(css, /\[data-boot-mode="smoke"\]/);
-  assert.match(css, /\.hud-side-modules\[data-total="0"\]\[data-loaded="0"\][\s\S]*display:\s*none/);
-  assert.match(css, /\.hud-gpu-errors\[data-state="err"\]/);
-  assert.match(css, /#viewport\s*\{[\s\S]*inset:\s*0/);
-  assert.match(css, /#hud\s*\{[\s\S]*top:\s*12px[\s\S]*left:\s*12px/);
+  // Verify unobtrusive styling rules exist in overlay.css for all boot modes, 0-side-module hiding, and GPU errors.
+  assert.match(overlayCss, /\[data-boot-mode="idle"\]/);
+  assert.match(overlayCss, /\[data-boot-mode="real-wasm64"\]/);
+  assert.match(overlayCss, /\[data-boot-mode="smoke"\]/);
+  assert.match(overlayCss, /\.hud-side-modules\[data-total="0"\]\[data-loaded="0"\][\s\S]*display:\s*none/);
+  assert.match(overlayCss, /\.hud-gpu-errors\[data-state="err"\]/);
+  assert.match(overlayCss, /#viewport\s*\{[\s\S]*inset:\s*0/);
+  assert.match(overlayCss, /#hud\s*\{[\s\S]*top:\s*12px[\s\S]*left:\s*12px/);
 });
 
 test('W74 preserves COI/WebGPU checks, Wasm64 address: i64 detection, and valid ES module syntax', () => {
@@ -334,4 +340,112 @@ test('W74 integration: HudController drives #boot-mode-badge, #side-module-statu
   assert.equal(validationCountEl.dataset.state, 'ok');
 
   controller.destroy();
+});
+
+test('W76 web/index.html loads self-contained Astryx overlay.css with zero external CDN assets (COOP/COEP safe)', () => {
+  assert.equal(fs.existsSync(OVERLAY_CSS_PATH), true, 'web/ui/overlay.css must exist');
+  assert.match(indexHtml, /<html[^>]*data-astryx-theme="astryx"/);
+  assert.match(indexHtml, /<link\s+rel="stylesheet"\s+href="\.\/ui\/overlay\.css"\s*\/?>/);
+
+  // Must never pull un-CORP'd external fonts or stylesheets that COEP blocks.
+  assert.doesNotMatch(indexHtml, /https?:\/\/[^\s"'<>]+(?:\.css|fonts\.googleapis|fonts\.gstatic|unpkg\.com|cdn)/i);
+  assert.doesNotMatch(overlayCss, /@import\s+url\(\s*['"]?https?:/i);
+  assert.doesNotMatch(overlayCss, /url\(\s*['"]?https?:/i);
+
+  // Attribution + Astryx tokens and slim 320px overlay / pill collapse geometry.
+  assert.match(overlayCss, /Astryx/i);
+  assert.match(overlayCss, /--color-background-body:\s*#111112/i);
+  assert.match(overlayCss, /--color-accent:\s*#dfe2e5/i);
+  assert.match(overlayCss, /--color-on-accent:\s*#15110c/i);
+  assert.match(overlayCss, /--radius-full:\s*9999px/);
+  assert.match(overlayCss, /max-width:\s*320px/);
+  assert.match(overlayCss, /#hud\.collapsed[\s\S]*border-radius:\s*var\(--radius-full\)/);
+  assert.match(overlayCss, /\.astryx-button\b/);
+  assert.match(overlayCss, /\.astryx-badge\b/);
+  assert.match(overlayCss, /\.astryx-progress-bar-track\b/);
+  assert.match(overlayCss, /\.astryx-collapsible\b/);
+});
+
+test('W76 HUD defaults to 4 clean visible sections with Diagnostics & Tools collapsed by default', () => {
+  // 1. Header bar: brand, Astryx boot-mode badge, collapsed pill FPS readout, and Hide button.
+  assert.match(indexHtml, /id="boot-mode-badge"/);
+  assert.match(indexHtml, /id="hud-pill-fps"/);
+  assert.match(indexHtml, /id="hud-toggle"[^>]*>Hide<\/button>/);
+
+  // 2. Boot progress row: stage label, thin Astryx progress bar, elapsed time, side-module status line.
+  assert.match(indexHtml, /id="hud-boot-stage"/);
+  assert.match(indexHtml, /id="hud-boot-progress-bar"[^>]*role="progressbar"/);
+  assert.match(indexHtml, /id="hud-boot-progress-fill"/);
+  assert.match(indexHtml, /id="hud-boot-elapsed"/);
+  assert.match(indexHtml, /id="side-module-status"/);
+
+  // 3. Compact 3-metric strip: Frames, FPS, GPU Errors.
+  const metricsStrip = extractTagBlock(
+    indexHtml,
+    /<section\s+class="hud-metrics-strip"[^>]*>/,
+    '</section>'
+  );
+  assert.match(metricsStrip, /id="metric-frames"/);
+  assert.match(metricsStrip, /id="metric-fps"/);
+  assert.match(metricsStrip, /id="gpu-validation-errors"/);
+
+  // 4. Primary actions row has ONLY 2 primary buttons: Restart and Export Report.
+  const primaryActions = extractTagBlock(
+    indexHtml,
+    /<div\s+class="hud-primary-actions"[^>]*>/,
+    '</div>'
+  );
+  const primaryButtons = [...primaryActions.matchAll(/<button\b[^>]*id="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(primaryButtons, ['btn-restart-session', 'btn-export-crash']);
+
+  // Conditional banners start hidden by default.
+  assert.match(indexHtml, /<div\s+id="hud-capability-banner"[^>]*\bhidden\b/);
+  assert.match(indexHtml, /<div\s+id="hud-validation-banner"[^>]*\bhidden\b/);
+
+  // Compact collapsible Log is a <details> closed by default.
+  assert.match(indexHtml, /<details\s+id="hud-log-disclosure"\s+class="astryx-collapsible">/);
+  assert.doesNotMatch(indexHtml, /<details\s+id="hud-log-disclosure"[^>]*\bopen\b/);
+
+  // Diagnostics & Tools disclosure is a <details> closed by default and contains all secondary controls.
+  assert.match(indexHtml, /<details\s+id="hud-diagnostics-disclosure"\s+class="astryx-collapsible">/);
+  assert.doesNotMatch(indexHtml, /<details\s+id="hud-diagnostics-disclosure"[^>]*\bopen\b/);
+
+  const diagBlock = extractTagBlock(
+    indexHtml,
+    /<details\s+id="hud-diagnostics-disclosure"[^>]*>/,
+    '</details>'
+  );
+
+  const tuckedDiagnosticIds = [
+    'cap-coi',
+    'cap-webgpu',
+    'cap-wasm64',
+    'cap-opfs',
+    'cap-gamepad',
+    'hud-refresh-status',
+    'srv-manifest',
+    'srv-bootset',
+    'srv-wasm',
+    'srv-shaders',
+    'metric-gpu-packets',
+    'metric-opfs-hits',
+    'metric-pointer-lock',
+    'metric-gamepad',
+    'btn-smoke-demo',
+    'btn-record-trace',
+    'btn-export-trace',
+    'btn-clear-cache',
+    'btn-export-saves',
+    'btn-export-missing-shaders',
+    'select-input-profile',
+    'gpu-boot-panel-root',
+  ];
+
+  for (const id of tuckedDiagnosticIds) {
+    assert.match(
+      diagBlock,
+      new RegExp(`id="${id}"`),
+      `Secondary diagnostic element id="${id}" must be tucked inside collapsed #hud-diagnostics-disclosure`
+    );
+  }
 });
