@@ -990,3 +990,117 @@ test('web/index.html wires W55 GpuBootPanelController script, #gpu-boot-panel-ro
   assert.equal(exportBtn.listenerCount('click'), 0);
   assert.equal(panelRoot.children.length, 0);
 });
+
+test('W63 web/index.html inline detectWasm64 probes spec-standard address: i64 first with legacy index: i64 fallback', () => {
+  const moduleScript = extractModuleScript(indexHtml);
+  const fnMatch =
+    /function\s+detectWasm64\b[\s\S]*?\r?\n\s*\}(?=\s*\r?\n\s*const\s+caps\s*=)/.exec(moduleScript);
+  assert.ok(fnMatch, 'web/index.html must define inline detectWasm64() before caps');
+  const fnSource = fnMatch[0];
+
+  const addressIdx = fnSource.search(/address\s*:\s*['"]i64['"]/);
+  const indexIdx = fnSource.search(/index\s*:\s*['"]i64['"]/);
+  assert.ok(addressIdx !== -1, 'detectWasm64() must probe spec-standard address: "i64"');
+  assert.ok(indexIdx !== -1, 'detectWasm64() must keep legacy index: "i64" fallback');
+  assert.ok(
+    addressIdx < indexIdx,
+    'detectWasm64() must probe address: "i64" before legacy index: "i64"'
+  );
+
+  // Confirm caps.wasm64 feeds both the HUD badge and the startup capability log.
+  assert.match(moduleScript, /wasm64:\s*detectWasm64\(\)/);
+  assert.match(moduleScript, /setBadge\(\s*capEls\.wasm64\s*,\s*caps\.wasm64\b/);
+  assert.match(moduleScript, /Wasm64:\s*\$\{caps\.wasm64\}/);
+
+  // Execute the extracted inline detectWasm64() against mock WebAssembly engines.
+  const runInlineDetectWasm64 = (mockWebAssembly) => {
+    const runner = new Function('WebAssembly', `${fnSource}\nreturn detectWasm64();`);
+    return runner(mockWebAssembly);
+  };
+
+  // Simulates WebIDL ToNumber coercion on i32 memory limits, which throws TypeError on BigInt.
+  function assertI32Limit(value) {
+    return +value;
+  }
+
+  // 1. Chrome 133+ / Chrome 152 engine: accepts `{ address: 'i64' }` with BigInt limits.
+  const modernCalls = [];
+  assert.equal(
+    runInlineDetectWasm64({
+      Memory: class MockModernMemory {
+        constructor(desc) {
+          modernCalls.push(desc);
+          if (desc.address === 'i64') {
+            if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+              throw new TypeError('Expected BigInt limits for i64 memory');
+            }
+            return;
+          }
+          assertI32Limit(desc.initial);
+        }
+        type() {
+          return { minimum: 1n, maximum: 2n, address: 'i64' };
+        }
+      },
+    }),
+    true
+  );
+  assert.equal(modernCalls.length, 1);
+  assert.equal(modernCalls[0].address, 'i64');
+  assert.equal(modernCalls[0].initial, 1n);
+  assert.equal(modernCalls[0].maximum, 2n);
+
+  // 2. Legacy proposal engine: rejects `address` (BigInt TypeError) and accepts `{ index: 'i64' }`.
+  const legacyCalls = [];
+  assert.equal(
+    runInlineDetectWasm64({
+      Memory: class MockLegacyMemory {
+        constructor(desc) {
+          legacyCalls.push(desc);
+          if (desc.index === 'i64') {
+            if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+              throw new TypeError('Expected BigInt limits for i64 memory');
+            }
+            return;
+          }
+          assertI32Limit(desc.initial);
+        }
+      },
+    }),
+    true
+  );
+  assert.equal(legacyCalls.length, 2);
+  assert.equal(legacyCalls[0].address, 'i64');
+  assert.equal(legacyCalls[1].index, 'i64');
+
+  // 3. Non-Wasm64 engine: ignores unknown keys and throws on BigInt coercion for both descriptors.
+  const wasm32Calls = [];
+  assert.equal(
+    runInlineDetectWasm64({
+      Memory: class MockWasm32Memory {
+        constructor(desc) {
+          wasm32Calls.push(desc);
+          assertI32Limit(desc.initial);
+        }
+      },
+    }),
+    false
+  );
+  assert.equal(wasm32Calls.length, 2);
+  assert.equal(wasm32Calls[0].address, 'i64');
+  assert.equal(wasm32Calls[1].index, 'i64');
+
+  // 4. Non-i64 type reflection must be rejected; missing WebAssembly returns false.
+  assert.equal(
+    runInlineDetectWasm64({
+      Memory: class MockI32ReflectingMemory {
+        type() {
+          return { minimum: 1, maximum: 2, address: 'i32' };
+        }
+      },
+    }),
+    false
+  );
+  assert.equal(runInlineDetectWasm64(undefined), false);
+  assert.equal(runInlineDetectWasm64({}), false);
+});
