@@ -3,12 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "gpu/pso_cache.h"
+#include "gpu/stage_reflection.h"
 
 struct Pg6Program;
 
@@ -76,6 +78,14 @@ bool load_file_via_httpfs(const WasmBootConfig& cfg,
 void emit_boot_milestone(const WasmBootConfig& cfg,
                          const char* milestone,
                          const std::string& detail = "");
+
+// Optional stage-reflection sidecar (G62/G63): reads `<pack_path>.reflect.json` over HTTPFS and
+// parses it into a gpu::StageReflectionIndex. Missing/unreadable sidecar: false, silently.
+// Malformed sidecar: false plus a `SHADER_PACK` warning milestone (boot continues with the
+// layer's conventions). Valid: true, a `SHADER_PACK` loaded milestone, and `out_reflection` set.
+bool try_load_stage_reflection(const WasmBootConfig& cfg,
+                               const std::string& pack_path,
+                               std::shared_ptr<gpu::StageReflectionIndex>& out_reflection);
 
 // Zero-dependency scan of a program-manifest.json buffer for `.pgim` path strings
 // (not `.pgim.json`). Order is first-seen; duplicates are dropped.
