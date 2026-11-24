@@ -142,6 +142,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Reproduce the intermittent heap-corruption failure deterministically, decide whether the defect is in the runtime or the test, fix by cause and add a reliable regression test.
 - [ ] **O33 — Fast Path for Guest Indirect Calls: Measure and Cut the Cost of `__playgta6_indirect_call` (`runtime/guest`)** — `IN PROGRESS` (#666, @Timon-ok)
   - Measure the lookup's share of frame time on the real boot and add a semantics-preserving per-thread cache for both dispatch modes.
+- [ ] **O34 — Local XGameSave Provider Backed by /userdata (`runtime/os`, xgameruntime)** — `IN PROGRESS` (#667, @Timon-ok)
+  - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
 
 ---
 
