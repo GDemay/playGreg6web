@@ -31,9 +31,14 @@ struct Pg6FileTime {
     uint32_t high_date_time = 0;
 };
 
+// SRWLOCK (8 bytes on x64). Like CRITICAL_SECTION below, the guest owns this storage: the host lock
+// lives in a table keyed by the lock's address, so no host object is ever placed in (or copied
+// over) guest memory. A host std::shared_mutex is 8 bytes on MSVC but 56 on wasm64/POSIX, and
+// writing it in place corrupted the guest variables that follow the SRWLOCK.
 struct Pg6SrwLock {
-    playgta6::os::SrwLock lock;
+    uint64_t reserved = 0;
 };
+static_assert(sizeof(Pg6SrwLock) == 8, "SRWLOCK is pointer-sized on x64");
 
 // CRITICAL_SECTION (RTL_CRITICAL_SECTION, 40 bytes on x64). The guest owns this storage and may hand
 // in uninitialized or statically zeroed memory, so the runtime never interprets it as a pointer:

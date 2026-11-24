@@ -1887,6 +1887,11 @@ uint32_t pg6_mw_ffx_dispatch(Pg6FfxContext* context, const Pg6FfxApiHeader* desc
     return mw::kFfxReturnOk;
 }
 
+// ffxQuery answers only the queries whose result is a pure function of the descriptor; every
+// other query type fails (kFfxReturnError) and writes nothing, so no caller reads an output that
+// was never produced.
+//   0x00010004 upscale GetJitterPhaseCount {header; uint32 renderWidth; uint32 displayWidth;
+//              int32* pOutPhaseCount}: the FSR rule int(8 * (displayWidth / renderWidth)^2).
 uint32_t pg6_mw_ffx_query(Pg6FfxContext* context, Pg6FfxApiHeader* desc) {
     if (desc == nullptr) {
         return mw::kFfxReturnErrorParameter;
@@ -1898,7 +1903,16 @@ uint32_t pg6_mw_ffx_query(Pg6FfxContext* context, Pg6FfxApiHeader* desc) {
             return mw::kFfxReturnErrorParameter;
         }
     }
-    return mw::kFfxReturnOk;
+    if (desc->type == kFfxQueryUpscaleGetJitterPhaseCount) {
+        auto* query = reinterpret_cast<Pg6FfxQueryJitterPhaseCount*>(desc);
+        if (query->render_width == 0 || query->out_phase_count == nullptr) {
+            return mw::kFfxReturnErrorParameter;
+        }
+        const float ratio = static_cast<float>(query->display_width) / static_cast<float>(query->render_width);
+        *query->out_phase_count = static_cast<int32_t>(8.0f * ratio * ratio);
+        return mw::kFfxReturnOk;
+    }
+    return mw::kFfxReturnError;
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,14 +1929,20 @@ void pg6_mw_bvh_builder_build_batched_2x(void*, void*, uint32_t, const void*) {}
 
 void pg6_mw_bvh_builder_copy(void*, void*, uint64_t, uint64_t, uint32_t) {}
 
+// The runtime builds no acceleration structures (the build, copy and rehydrate entry points
+// write nothing), so any size is an upper bound for what its build writes. Zero is not usable:
+// the title allocates the result buffer from the reported size and treats a null allocation as
+// fatal (int3). The smallest valid D3D12 size is one alignment unit
+// (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT, 256 bytes) for each buffer.
 void pg6_mw_bvh_builder_get_prebuild_info(void*,
                                           const void*,
                                           const void*,
                                           Pg6D3D12RaytracingPrebuildInfo* out_info) {
+    constexpr uint64_t kMinimumSize = 256u;
     if (out_info != nullptr) {
-        out_info->result_data_max_size_in_bytes = 0u;
-        out_info->scratch_data_size_in_bytes = 0u;
-        out_info->update_scratch_data_size_in_bytes = 0u;
+        out_info->result_data_max_size_in_bytes = kMinimumSize;
+        out_info->scratch_data_size_in_bytes = kMinimumSize;
+        out_info->update_scratch_data_size_in_bytes = kMinimumSize;
     }
 }
 
