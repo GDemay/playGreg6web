@@ -16,6 +16,7 @@
 #include "os/image_loader.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_scarlett_guest.h"
 
 #if defined(PG6_BOOT_LINKED_GUEST) && defined(PG6_BOOT_PROGRAM)
 extern "C" const Pg6Program pg6_program;
@@ -434,6 +435,19 @@ struct ScopedDeviceOptions {
     ScopedDeviceOptions& operator=(const ScopedDeviceOptions&) = delete;
 };
 
+struct ScopedDStorageWorkerThreads {
+    explicit ScopedDStorageWorkerThreads(uint32_t count) {
+        os::scarlett::guest_api::set_dstorage_worker_threads(count);
+    }
+
+    ~ScopedDStorageWorkerThreads() {
+        os::scarlett::guest_api::set_dstorage_worker_threads(1);
+    }
+
+    ScopedDStorageWorkerThreads(const ScopedDStorageWorkerThreads&) = delete;
+    ScopedDStorageWorkerThreads& operator=(const ScopedDStorageWorkerThreads&) = delete;
+};
+
 bool try_load_shader_pack(const WasmBootConfig& cfg,
                           const std::string& path,
                           bool is_fallback,
@@ -695,6 +709,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
 
     ScopedActiveBootConfig active_boot_cfg(&cfg);
     ScopedWin32HttpfsBridge httpfs_bridge(cfg);
+    ScopedDStorageWorkerThreads dstorage_threads_guard(cfg.dstorage_worker_threads);
     ScopedDeviceOptions device_options_guard;
 
     std::shared_ptr<gpu::ShaderPackIndex> shader_pack;
@@ -721,12 +736,11 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
         emit_boot_milestone(cfg, "PIPELINE_DUMP", dump_dir);
     }
 
-    if (shader_pack || !dump_dir.empty()) {
-        gpu::d3d12_guest::DeviceOptions device_options;
-        device_options.shader_pack = std::move(shader_pack);
-        device_options.dump_dir = dump_dir;
-        device_options_guard.install(std::move(device_options));
-    }
+    gpu::d3d12_guest::DeviceOptions device_options;
+    device_options.shader_pack = std::move(shader_pack);
+    device_options.dump_dir = dump_dir;
+    device_options.bridge.features = cfg.wgpu_features;
+    device_options_guard.install(std::move(device_options));
 
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     if (auto dev = gpu::d3d12_xs_exports::current_device()) {
