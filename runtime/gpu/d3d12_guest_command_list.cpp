@@ -153,7 +153,11 @@ void CommandQueue::ExecuteCommandListsX(com::CallContext& ctx) {
     const uint32_t count = static_cast<uint32_t>(ctx.int_arg(1));
     const uint64_t lists = ctx.int_arg(2);
     if (ctx.int_arg(3) != 0) {
-        device_->last_execute_token.store(ctx.int_arg(3));
+        const uint64_t tok = ctx.int_arg(3);
+        uint64_t prev = device_->last_execute_token.load(std::memory_order_relaxed);
+        while (tok > prev && !device_->last_execute_token.compare_exchange_weak(
+                                 prev, tok, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        }
         device_->count(xbox::Counter::ExecutesWithToken);
     }
     std::vector<uint64_t> pointers;
@@ -903,6 +907,11 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
 void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
     if (!usable()) {
         return;
+    }
+    if (compute_pso_ != nullptr && compute_pso_->dump_index() != PipelineState::kNoDumpIndex) {
+        if (PipelineDump* dump = device_->pipeline_dump()) {
+            dump->dispatch(compute_pso_->dump_index());
+        }
     }
     count_work(Work::DispatchesIssued);
     if (compute_pso_ != nullptr && !compute_pso_->resolved()) {

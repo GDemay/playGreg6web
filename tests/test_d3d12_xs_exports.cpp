@@ -3224,6 +3224,372 @@ void test_xmem_window_alias_wiring() {
     sc::xmem_reset_for_testing();
 }
 
+// G50: compute native stage dumping (slot 67), ShaderPackIndex cs_main resolution (slots 62 & 86),
+// compute_pipelines manifest output, and CommandList::Dispatch emission & dump tracking.
+void test_xbox_compute_pipeline_dump_and_pack_resolve() {
+    namespace xb = dg::xbox;
+    // Unit: parse_native_compute_pipeline (4-range and 3-range layouts + validation failures).
+    {
+        const std::vector<uint8_t> hdr = byte_pattern(28, 1), pmeta = byte_pattern(48, 2);
+        const std::vector<uint8_t> code = byte_pattern(0x100, 3), cmeta = byte_pattern(0x80, 4);
+        xb::GuestNativeComputePipelineDesc d4{};
+        d4.pRootSignature = 0x1000;
+        d4.ranges[0] = {0x2000, hdr.size()};
+        d4.ranges[1] = {0x3000, pmeta.size()};
+        d4.ranges[2] = {0x4000, code.size()};  // 256-byte aligned
+        d4.ranges[3] = {0x5000, cmeta.size()};
+        xb::NativeComputePipeline parsed;
+        std::string err;
+        CHECK(xb::parse_native_compute_pipeline(d4, &parsed, &err));
+        CHECK(parsed.header.size == 28 && parsed.metadata.size == 48 && parsed.compute.code.address == 0x4000 &&
+              parsed.compute.metadata.size == 0x80);
+
+        xb::GuestNativeComputePipelineDesc d3{};
+        d3.pRootSignature = 0x1000;
+        d3.ranges[0] = {0x2000, hdr.size()};
+        d3.ranges[1] = {0x4100, code.size()};  // 256-byte aligned
+        d3.ranges[2] = {0x5000, cmeta.size()};
+        CHECK(xb::parse_native_compute_pipeline(d3, &parsed, &err));
+        CHECK(parsed.metadata.size == 0 && parsed.compute.code.address == 0x4100 && parsed.compute.metadata.size == 0x80);
+
+        xb::GuestNativeComputePipelineDesc bad = d4;
+        bad.ranges[2].address += 4;  // misaligned
+        CHECK(!xb::parse_native_compute_pipeline(bad, &parsed, &err) && err.find("256-byte") != std::string::npos);
+        bad = d4;
+        bad.ranges[0] = {};
+        CHECK(!xb::parse_native_compute_pipeline(bad, &parsed, &err) && err.find("header") != std::string::npos);
+    }
+
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("pg6-g50-compute-dump-" + std::to_string(std::rand()));
+    std::filesystem::remove_all(dir);
+    {
+        std::array<uint8_t, 16> cs_digest{}, stream_digest{}, wrong_stage_digest{};
+        for (int i = 0; i < 16; ++i) {
+            cs_digest[i] = static_cast<uint8_t>(0x41 + i);
+            stream_digest[i] = static_cast<uint8_t>(0x71 + i);
+            wrong_stage_digest[i] = static_cast<uint8_t>(0xA1 + i);
+        }
+        const std::vector<uint8_t> cs_hdr = byte_pattern(28, 11);
+        const std::vector<uint8_t> cs_pmeta = byte_pattern(48, 12);
+        const std::vector<uint8_t> cs_code = byte_pattern(0x100, 13);
+        std::vector<uint8_t> cs_meta = byte_pattern(0x80, 14);
+        std::memcpy(cs_meta.data() + xb::kNativeDigestFirst, cs_digest.data(), 16);
+        const std::vector<uint8_t> cs_dxil = container_with_hash(cs_digest);
+        const std::vector<uint8_t> stream_dxil = container_with_hash(stream_digest);
+        const std::vector<uint8_t> wrong_dxil = container_with_hash(wrong_stage_digest);
+
+        const uint64_t cs_code_id = dg::shader_identity(cs_code.data(), cs_code.size());
+        const uint64_t cs_stage_id =
+            dg::native_stage_identity(cs_code.data(), cs_code.size(), cs_meta.data(), cs_meta.size());
+        const uint64_t cs_dxil_id = dg::shader_identity(cs_dxil.data(), cs_dxil.size());
+        const uint64_t stream_dxil_id = dg::shader_identity(stream_dxil.data(), stream_dxil.size());
+        const uint64_t wrong_dxil_id = dg::shader_identity(wrong_dxil.data(), wrong_dxil.size());
+
+        auto index = std::make_shared<playgta6::gpu::ShaderPackIndex>();
+        std::string err;
+        // Pack: native compute code key (stage 3 = Compute), stream DXIL key (stage 3 = Compute),
+        // and wrong_dxil_id registered as Vertex (stage 1) to verify stage filtering.
+        const std::vector<uint8_t> pack_bytes = wgpk({{cs_code_id, 3}, {stream_dxil_id, 3}, {wrong_dxil_id, 1}});
+        CHECK(playgta6::gpu::parse_shader_pack_index(pack_bytes.data(), pack_bytes.size(), index.get(), &err));
+
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.dump_dir = dir.string();
+        options.shader_pack = index;
+        dx::set_device_options(options);
+        Scene scene(fx, /*register_shaders=*/false);
+        dg::Device* dev = host_device(scene.device);
+        int32_t result = -1;
+
+        // Slot 67: native compute pipeline is indexed & dumped as "stage": "compute", then refused.
+        xb::GuestNativeComputePipelineDesc nd{};
+        nd.pRootSignature = scene.rs;
+        nd.ranges[0] = {put_bytes(cs_hdr.data(), cs_hdr.size()), cs_hdr.size()};
+        nd.ranges[1] = {put_bytes(cs_pmeta.data(), cs_pmeta.size()), cs_pmeta.size()};
+        nd.ranges[2] = {put_aligned(cs_code, 256), cs_code.size()};
+        nd.ranges[3] = {put_bytes(cs_meta.data(), cs_meta.size()), cs_meta.size()};
+        const uint64_t out67 = put<uint64_t>(0xBEEF);
+        CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlobCached,
+                          {I(put(nd)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out67)})) == dg::kENotImpl);
+        CHECK(load64(out67) == 0);
+        CHECK(counter(dev, xb::Counter::BlobPipelineStatesRefused) == 1);
+        CHECK(dev->native_index_size() == 1);
+
+        // Slot 62 fallback: DXIL compute container joins the slot-67 native compute stage and
+        // resolves against ShaderPackIndex (cs_main).
+        dg::GuestComputePipelineStateDesc cd{};
+        cd.pRootSignature = scene.rs;
+        cd.CS = {put_bytes(cs_dxil.data(), cs_dxil.size()), cs_dxil.size()};
+        size_t mark = fx.captured.size();
+        const uint64_t cpso =
+            fx.create(scene.device, XSlot::PsoFromBlob, {I(put(cd)), I(0), I(0)}, dg::IID_ID3D12PipelineState, &result);
+        CHECK(result == 0 && cpso != 0);
+        auto* cstate = object_of<dg::PipelineState>(cpso);
+        CHECK(cstate->is_compute() && cstate->resolved());
+        CHECK(cstate->dump_index() != dg::PipelineState::kNoDumpIndex);
+        CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 1);
+        auto mod_pkts = packets_since(fx, mark);
+        CHECK(count_op(mod_pkts, GpuOpcode::CreateShaderModule) == 1);
+        uint32_t cs_module_id = 0;
+        if (const Packet* mp = find_op(mod_pkts, GpuOpcode::CreateShaderModule)) {
+            const auto m = payload_as<GpuCreateShaderModulePayload>(*mp);
+            const std::string code_str(mp->payload.begin() + sizeof(GpuCreateShaderModulePayload), mp->payload.end());
+            CHECK(m.stage == static_cast<uint32_t>(GpuShaderStage::Compute));
+            CHECK(code_str == playgta6::gpu::pack_key_code(cs_code_id));
+            cs_module_id = m.id;
+        }
+
+        // Duplicate creation reuses module and increments compute_pipelines.created.
+        mark = fx.captured.size();
+        const uint64_t cpso_dup =
+            fx.create(scene.device, XSlot::PsoFromBlob, {I(put(cd)), I(0), I(0)}, dg::IID_ID3D12PipelineState, &result);
+        CHECK(result == 0 && cpso_dup != 0 && object_of<dg::PipelineState>(cpso_dup)->resolved());
+        CHECK(object_of<dg::PipelineState>(cpso_dup)->dump_index() == cstate->dump_index());
+        CHECK(count_op(packets_since(fx, mark), GpuOpcode::CreateShaderModule) == 0);
+
+        // Slot 86 compute stream: resolves directly by DXIL identity in ShaderPackIndex.
+        StreamBuilder sb;
+        sb.add<uint64_t>(0, 8, scene.rs);
+        sb.add(6, 8, dg::GuestShaderBytecode{put_bytes(stream_dxil.data(), stream_dxil.size()), stream_dxil.size()});
+        sb.finish();
+        const uint64_t spso = fx.create(
+            scene.device, XSlot::CreatePsoStream,
+            {I(put(xb::GuestPipelineStateStreamDesc{sb.bytes.size(), put_bytes(sb.bytes.data(), sb.bytes.size())}))},
+            dg::IID_ID3D12PipelineState, &result);
+        CHECK(result == 0 && spso != 0 && object_of<dg::PipelineState>(spso)->is_compute() &&
+              object_of<dg::PipelineState>(spso)->resolved());
+        CHECK(object_of<dg::PipelineState>(spso)->dump_index() != cstate->dump_index());
+
+        // Wrong stage in pack (Vertex instead of Compute): stays unresolved.
+        dg::GuestComputePipelineStateDesc wcd{};
+        wcd.pRootSignature = scene.rs;
+        wcd.CS = {put_bytes(wrong_dxil.data(), wrong_dxil.size()), wrong_dxil.size()};
+        const uint64_t wpso = fx.create(scene.device, XSlot::PsoFromBlob, {I(put(wcd)), I(0), I(0)},
+                                        dg::IID_ID3D12PipelineState, &result);
+        CHECK(result == 0 && wpso != 0 && !object_of<dg::PipelineState>(wpso)->resolved());
+
+        // Dispatch with resolved compute PSO emits CreateComputePipeline2 + DispatchCompute.
+        const uint64_t issued0 = dg::work_total(dg::Work::DispatchesIssued);
+        const uint64_t emitted0 = dg::work_total(dg::Work::DispatchesEmitted);
+        const uint64_t no_mod0 = dg::work_total(dg::Work::DispatchesNoShaderModule);
+        const uint64_t list = scene.new_list();
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, 33, {I(scene.rs)});  // SetComputeRootSignature
+        staged_set_pipeline_state(fx, fx.thread, list, cpso);
+        fx.vcall(list, 14, {I(4), I(2), I(1)});  // Dispatch
+        fx.vcall(list, 14, {I(8), I(1), I(1)});  // Dispatch #2
+        staged_set_pipeline_state(fx, fx.thread, list, wpso);
+        fx.vcall(list, 14, {I(1), I(1), I(1)});  // Unresolved -> skipped, still counted in dump
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        CHECK(dg::work_total(dg::Work::DispatchesIssued) == issued0 + 3);
+        CHECK(dg::work_total(dg::Work::DispatchesEmitted) == emitted0 + 2);
+        CHECK(dg::work_total(dg::Work::DispatchesNoShaderModule) == no_mod0 + 1);
+
+        mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        CHECK(count_op(ps, GpuOpcode::DispatchCompute) == 2);
+        const Packet* cp = find_op(ps, GpuOpcode::CreateComputePipeline2);
+        CHECK(cp != nullptr && payload_as<GpuCreateComputePipeline2Payload>(*cp).cs_module_id == cs_module_id &&
+              payload_as<GpuCreateComputePipeline2Payload>(*cp).pipeline_layout_id != 0);
+        const Packet* dp0 = find_op(ps, GpuOpcode::DispatchCompute, 0);
+        CHECK(dp0 != nullptr && payload_as<GpuDispatchComputePayload>(*dp0).workgroup_x == 4 &&
+              payload_as<GpuDispatchComputePayload>(*dp0).workgroup_y == 2 &&
+              payload_as<GpuDispatchComputePayload>(*dp0).workgroup_z == 1);
+
+        dev->flush_pipeline_dump();
+        const std::string bin = read_text_file(dir / "native" / (id_hex(cs_code_id) + ".bin"));
+        CHECK(bin.size() == cs_code.size() && std::memcmp(bin.data(), cs_code.data(), cs_code.size()) == 0);
+        const std::string m = read_text_file(dir / "manifest.json");
+        CHECK(m.find("{\"code_identity\": \"" + id_hex(cs_code_id) + "\", \"identity\": \"" + id_hex(cs_stage_id) +
+                     "\", \"stage\": \"compute\", \"layout\": \"A\", \"code_bytes\": 256, \"metadata_bytes\": 128") !=
+              std::string::npos);
+        CHECK(m.find("\"compute_pipelines\": [") != std::string::npos);
+        CHECK(m.find("{\"index\": " + std::to_string(cstate->dump_index()) +
+                     ", \"created\": 2, \"dispatches\": 2, \"cs\": {\"dxil_identity\": \"" + id_hex(cs_dxil_id) +
+                     "\"") != std::string::npos);
+        CHECK(m.find("\"native_code_identity\": \"" + id_hex(cs_code_id) + "\"") != std::string::npos);
+        CHECK(m.find("\"dxil_identity\": \"" + id_hex(stream_dxil_id) + "\"") != std::string::npos);
+        CHECK(m.find("\"dispatches\": 1, \"cs\": {\"dxil_identity\": \"" + id_hex(wrong_dxil_id) + "\"") !=
+              std::string::npos);
+
+        CHECK(t_balanced);
+        scene.release_all({list, cpso, cpso_dup, spso, wpso});
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// G50: Slot 70/71 address-based texture view metadata registry (AddressTextureViewInfo).
+void test_slot70_71_address_texture_view_registry() {
+    namespace xb = dg::xbox;
+    xb::clear_address_texture_views();
+    CHECK(xb::address_texture_view_count() == 0);
+
+    Fixture fx;
+    Scene scene(fx);
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                    {I(put(dg::GuestDescriptorHeapDesc{0, 16, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    const uint64_t start = put<uint64_t>(0);
+    fx.sret_call(heap, Slot::GetCPUStart, start);
+    const uint64_t cpu0 = load64(start);
+
+    // Slot 70: 2D BC7_UNORM SRV at address with MipLevels == 0 (full chain = 10) and Xbox swizzle layout 0x102.
+    uint8_t srv[48] = {};
+    dg::GuestShaderResourceViewDesc td{};
+    td.Format = 98;  // BC7_UNORM
+    td.ViewDimension = 4;  // TEXTURE2D
+    td.Shader4ComponentMapping = 0x1688;
+    td.u[1] = 0xffffffffu;
+    std::memcpy(srv, &td, sizeof(td));
+    const uint64_t va_srv = 0x0000'000A'0000'0000ull;
+    std::memcpy(srv + xb::kViewAtAddressOffset, &va_srv, 8);
+    dg::GuestResourceDesc rd_srv = texture_desc(512, 256, 98, 0);
+    rd_srv.MipLevels = 0;
+    rd_srv.Layout = 0x102;
+    fx.vcall(scene.device, XSlot::SrvAtAddress, {I(put(rd_srv)), I(put_bytes(srv, sizeof(srv))), I(cpu0)});
+
+    CHECK(xb::address_texture_view_count() == 1);
+    xb::AddressTextureViewInfo info{};
+    CHECK(xb::lookup_address_texture_view(va_srv, &info));
+    CHECK(info.gpu_va == va_srv && info.dxgi_format == 98 && info.width == 512 && info.height == 256 &&
+          info.depth == 1 && info.mip_levels == 10 && info.d3d12_layout == 0x102 && !info.is_uav);
+
+    // Slot 71: 3D R8G8B8A8_UNORM UAV at address with explicit mip count and Xbox layout 0x10A.
+    uint8_t uav[48] = {};
+    dg::GuestUnorderedAccessViewDesc ud{};
+    ud.Format = 28;  // R8G8B8A8_UNORM
+    ud.ViewDimension = 8;  // TEXTURE3D
+    ud.u[0] = 0;  // MipSlice
+    ud.u[1] = 0;  // FirstWSlice
+    ud.u[2] = 8;  // WSize
+    std::memcpy(uav, &ud, sizeof(ud));
+    const uint64_t va_uav = 0x0000'000A'1000'0000ull;
+    std::memcpy(uav + xb::kViewAtAddressOffset, &va_uav, 8);
+    dg::GuestResourceDesc rd_uav = texture_desc(64, 32, 28, 0x4, 3);
+    rd_uav.Dimension = 4;  // TEXTURE3D
+    rd_uav.DepthOrArraySize = 8;
+    rd_uav.Layout = 0x10A;
+    fx.vcall(scene.device, XSlot::UavAtAddress, {I(put(rd_uav)), I(put_bytes(uav, sizeof(uav))), I(cpu0 + 32)});
+
+    CHECK(xb::address_texture_view_count() == 2);
+    CHECK(xb::lookup_address_texture_view(va_uav, &info));
+    CHECK(info.gpu_va == va_uav && info.dxgi_format == 28 && info.width == 64 && info.height == 32 &&
+          info.depth == 8 && info.mip_levels == 3 && info.d3d12_layout == 0x10A && info.is_uav);
+
+    // Buffer view at address must not enter the texture view registry.
+    const uint64_t buf = committed(fx, scene.device, 2, buffer_desc(1024), 0xAC3);
+    const uint64_t buf_va = fx.vcall(buf, Slot2::GetGPUVirtualAddress);
+    uint8_t bsrv[48] = {};
+    dg::GuestShaderResourceViewDesc bd{};
+    bd.ViewDimension = 1;  // BUFFER
+    bd.Shader4ComponentMapping = 0x1688;
+    bd.u[2] = 4;
+    bd.u[3] = 16;
+    std::memcpy(bsrv, &bd, sizeof(bd));
+    std::memcpy(bsrv + xb::kViewAtAddressOffset, &buf_va, 8);
+    fx.vcall(scene.device, XSlot::SrvAtAddress, {I(put(buffer_desc(64))), I(put_bytes(bsrv, sizeof(bsrv))), I(cpu0 + 64)});
+    CHECK(xb::address_texture_view_count() == 2);
+    CHECK(!xb::lookup_address_texture_view(buf_va, &info));
+    CHECK(!xb::lookup_address_texture_view(0xDEADBEEF0000ULL, &info));
+
+    // Concurrent reads and updates stay consistent.
+    std::thread reader([&] {
+        for (int i = 0; i < 64; ++i) {
+            xb::AddressTextureViewInfo snap{};
+            CHECK(xb::lookup_address_texture_view(va_srv, &snap));
+            CHECK(snap.gpu_va == va_srv && snap.width == 512);
+        }
+    });
+    for (int i = 0; i < 32; ++i) {
+        xb::AddressTextureViewInfo upd = info;
+        upd.gpu_va = va_uav;
+        upd.mip_levels = static_cast<uint32_t>(1 + (i % 4));
+        xb::record_address_texture_view(upd);
+    }
+    reader.join();
+    CHECK(xb::address_texture_view_count() == 2);
+
+    xb::clear_address_texture_views();
+    CHECK(xb::address_texture_view_count() == 0);
+    CHECK(t_balanced);
+    scene.release_all({heap, buf});
+}
+
+// G50: WaitFrameEventX always produces strictly monotonic non-zero tokens and never stalls
+// indefinitely on ORIGIN or PRESENT events (including rapid polls and out-of-range tokens).
+void test_xbox_wait_frame_event_monotonic_tokens() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(2000), I(1), I(0)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::ScheduleFrameEvent, {I(0), I(0), I(0), I(0)})) == 0);
+
+    // Null token pointer fails cleanly with E_INVALIDARG.
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(0)})) == dg::kEInvalidArg);
+
+    const uint64_t tok_va = put<uint64_t>(0);
+    uint64_t prev = 0;
+    // Rapid timeout-0 polls within a single frame interval must still be strictly monotonic & non-zero.
+    for (int i = 0; i < 16; ++i) {
+        store64(tok_va, 0);
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_va)})) == 0);
+        const uint64_t tok = load64(tok_va);
+        CHECK(tok != 0 && tok > prev);
+        prev = tok;
+    }
+
+    // PresentX records completion; PRESENT wait (type 2, INFINITE) on that token returns promptly
+    // with a strictly greater non-zero token.
+    const uint64_t rt_slot = put<uint64_t>(scene.rt);
+    dg::xbox::GuestPresentPlaneX plane{};
+    plane.Token = prev;
+    plane.ResourceCount = 1;
+    plane.ppResources = rt_slot;
+    CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+    CHECK(dev->last_present_token.load() == prev);
+
+    store64(tok_va, prev);
+    const auto t_present = std::chrono::steady_clock::now();
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(2), I(0xFFFFFFFFu), I(0), I(0), I(tok_va)})) == 0);
+    CHECK(std::chrono::steady_clock::now() - t_present < std::chrono::milliseconds(200));
+    const uint64_t after_present = load64(tok_va);
+    CHECK(after_present > prev);
+    prev = after_present;
+
+    // Out-of-range future token with INFINITE timeout must never block indefinitely or overflow.
+    store64(tok_va, UINT64_MAX);
+    const auto t_future = std::chrono::steady_clock::now();
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(2), I(0xFFFFFFFFu), I(0), I(0), I(tok_va)})) == 0);
+    CHECK(std::chrono::steady_clock::now() - t_future < std::chrono::milliseconds(500));
+    const uint64_t after_future = load64(tok_va);
+    CHECK(after_future > prev && after_future != UINT64_MAX);
+    prev = after_future;
+
+    // Blocking ORIGIN wait after rapid polls is still bounded by one interval and strictly monotonic.
+    store64(tok_va, 0);
+    const auto t_origin = std::chrono::steady_clock::now();
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0xFFFFFFFFu), I(0), I(0), I(tok_va)})) == 0);
+    CHECK(std::chrono::steady_clock::now() - t_origin < std::chrono::milliseconds(500));
+    const uint64_t after_origin = load64(tok_va);
+    CHECK(after_origin > prev);
+    prev = after_origin;
+
+    // Post-shutdown waits return immediately and remain strictly monotonic non-zero.
+    dev->shutdown_frame_events();
+    for (int i = 0; i < 8; ++i) {
+        store64(tok_va, 0);
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0xFFFFFFFFu), I(0), I(0), I(tok_va)})) == 0);
+        const uint64_t tok = load64(tok_va);
+        CHECK(tok > prev);
+        prev = tok;
+    }
+
+    CHECK(t_balanced);
+    scene.release_all();
+}
+
 }  // namespace
 
 int main() {
@@ -3256,6 +3622,9 @@ int main() {
     test_xbox_pipeline_dump();
     test_xbox_device_queue_and_list_slots();
     test_xmem_window_alias_wiring();
+    test_xbox_compute_pipeline_dump_and_pack_resolve();
+    test_slot70_71_address_texture_view_registry();
+    test_xbox_wait_frame_event_monotonic_tokens();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;
