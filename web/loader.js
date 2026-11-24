@@ -5,6 +5,13 @@
 const EMSCRIPTEN_PTHREAD_WORKER_NAME = 'em-pthread';
 const PTHREAD_WGPU_CHANNEL_NAME = 'playgta6-wgpu-pthread';
 const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
+const PTHREAD_CMD_LOAD = 'load';
+const PTHREAD_CMD_LOADED = 'loaded';
+const PTHREAD_CMD_RUN = 'run';
+const PTHREAD_CMD_OBJECT_TRANSFER = 'objectTransfer';
+const DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2;
+const DEFAULT_GUEST_MANIFEST_RELATIVE = './dist/guest_manifest.json';
+const INDIRECT_DISPATCH_MODES = new Set(['shard', 'table']);
 const HOST_ABI_IMPORT_NAMES = Object.freeze([
   'host_log',
   'host_httpfs_open',
@@ -994,7 +1001,7 @@ function inspectRequiredHostAbiImports(wasmModule, wasmNs) {
 }
 
 function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
-  if (!hostEnv) {
+  if (!baseEnv || typeof baseEnv !== 'object' || !hostEnv) {
     return baseEnv;
   }
   const targetNames = requiredHostNames ? Array.from(requiredHostNames) : HOST_ABI_IMPORT_NAMES;
@@ -1002,13 +1009,30 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
     return baseEnv;
   }
 
-  // If baseEnv is frozen or has a non-configurable non-writable host_* stub,
-  // a Proxy get-trap cannot return a replacement without throwing TypeError.
-  let needsClone = Object.isFrozen(baseEnv);
+  // If baseEnv is frozen or has a non-configurable non-writable host_* stub (or write-only
+  // non-configurable accessor), a Proxy get-trap cannot return a replacement without throwing.
+  let needsClone = false;
+  try {
+    needsClone = Object.isFrozen(baseEnv);
+  } catch {
+    needsClone = false;
+  }
   if (!needsClone) {
     for (let i = 0; i < targetNames.length; i += 1) {
-      const desc = Reflect.getOwnPropertyDescriptor(baseEnv, targetNames[i]);
-      if (desc && !desc.configurable && 'value' in desc && !desc.writable) {
+      let desc = null;
+      try {
+        desc = Reflect.getOwnPropertyDescriptor(baseEnv, targetNames[i]);
+      } catch {
+        // If baseEnv's getOwnPropertyDescriptor trap throws, a Proxy get-trap invariant check
+        // will also fail when substituting a host ABI function; clone instead.
+        needsClone = true;
+        break;
+      }
+      if (
+        desc &&
+        !desc.configurable &&
+        (('value' in desc && !desc.writable) || (!('value' in desc) && desc.get === undefined))
+      ) {
         needsClone = true;
         break;
       }
@@ -1016,15 +1040,63 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
   }
 
   if (needsClone) {
-    const cloned = Object.assign({}, baseEnv);
+    const cloned = {};
+    try {
+      const ownKeys = Reflect.ownKeys(baseEnv);
+      for (let i = 0; i < ownKeys.length; i += 1) {
+        const key = ownKeys[i];
+        try {
+          const desc = Reflect.getOwnPropertyDescriptor(baseEnv, key);
+          if (desc) {
+            if ('value' in desc) {
+              Object.defineProperty(cloned, key, {
+                value: desc.value,
+                writable: true,
+                configurable: true,
+                enumerable: desc.enumerable !== false,
+              });
+            } else {
+              Object.defineProperty(cloned, key, {
+                get: desc.get,
+                set: desc.set,
+                configurable: true,
+                enumerable: desc.enumerable !== false,
+              });
+            }
+          }
+        } catch {
+          try {
+            cloned[key] = baseEnv[key];
+          } catch {
+            // Ignore exotic keys that fail both descriptor inspection and property read.
+          }
+        }
+      }
+    } catch {
+      try {
+        Object.assign(cloned, baseEnv);
+      } catch {
+        // Ignore if baseEnv cannot be enumerated via Object.assign.
+      }
+    }
     for (let i = 0; i < targetNames.length; i += 1) {
       const name = targetNames[i];
       if (typeof hostEnv[name] !== 'function') {
         continue;
       }
-      const existing = cloned[name];
+      let existing;
+      try {
+        existing = cloned[name];
+      } catch {
+        existing = undefined;
+      }
       if (typeof existing !== 'function' || existing.stub === true) {
-        cloned[name] = hostEnv[name];
+        Object.defineProperty(cloned, name, {
+          value: hostEnv[name],
+          writable: true,
+          configurable: true,
+          enumerable: true,
+        });
       }
     }
     return cloned;
@@ -1034,7 +1106,8 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
   //   if (!wasmImports["host_log"] || wasmImports["host_log"].stub) abort(...);
   //   return wasmImports["host_log"](...args);
   // }`) that read the unwrapped `wasmImports` object directly rather than our Proxy.
-  // Overwrite writable own `.stub === true` properties in-place so those wrappers resolve.
+  // Overwrite writable (or configurable non-writable) own `.stub === true` properties in-place
+  // so those wrappers resolve.
   for (let i = 0; i < targetNames.length; i += 1) {
     const name = targetNames[i];
     if (typeof hostEnv[name] !== 'function') {
@@ -1042,14 +1115,17 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
     }
     try {
       const desc = Reflect.getOwnPropertyDescriptor(baseEnv, name);
-      if (
-        desc &&
-        'value' in desc &&
-        desc.writable &&
-        typeof desc.value === 'function' &&
-        desc.value.stub === true
-      ) {
-        baseEnv[name] = hostEnv[name];
+      if (desc && 'value' in desc && typeof desc.value === 'function' && desc.value.stub === true) {
+        if (desc.writable) {
+          baseEnv[name] = hostEnv[name];
+        } else if (desc.configurable) {
+          Object.defineProperty(baseEnv, name, {
+            value: hostEnv[name],
+            writable: true,
+            configurable: true,
+            enumerable: desc.enumerable !== false,
+          });
+        }
       }
     } catch {
       // Ignore non-writable or Proxy-protected targets; the returned Proxy still intercepts reads.
@@ -1337,6 +1413,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
   }
 
   let pthreadHttpfsClient = null;
+  let attachedHttpfsSab = null;
   const hostImports = createHostImports({
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
@@ -1358,8 +1435,12 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     if (!sab || !mailboxApi || typeof mailboxApi.HttpfsMailboxClient !== 'function') {
       return false;
     }
+    if (attachedHttpfsSab === sab && pthreadHttpfsClient) {
+      return true;
+    }
     try {
       pthreadHttpfsClient = new mailboxApi.HttpfsMailboxClient(sab);
+      attachedHttpfsSab = sab;
       hostImports.setHttpfsClient(pthreadHttpfsClient);
       return true;
     } catch {
@@ -1394,12 +1475,14 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
         attachHttpfsSab(msg.sab);
       }
     };
-    try {
-      if (typeof httpfsChannel.postMessage === 'function') {
-        httpfsChannel.postMessage({ type: 'request-httpfs-sab' });
+    if (!attachedHttpfsSab) {
+      try {
+        if (typeof httpfsChannel.postMessage === 'function') {
+          httpfsChannel.postMessage({ type: 'request-httpfs-sab' });
+        }
+      } catch {
+        // Ignore runtimes where BroadcastChannel messaging is restricted.
       }
-    } catch {
-      // Ignore runtimes where BroadcastChannel messaging is restricted.
     }
   }
 
@@ -1421,6 +1504,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     runtimeScriptUrl: resolvedRuntimeScriptUrl,
     restoreWasmInstance,
     attachHttpfsSab,
+    hasHttpfsSab: () => Boolean(pthreadHttpfsClient),
     channels: {
       progress: progressChannel,
       wgpu: wgpuChannel,
@@ -1428,6 +1512,11 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     },
     cleanup() {
       restoreWasmInstance();
+      attachedHttpfsSab = null;
+      pthreadHttpfsClient = null;
+      if (hostImports && typeof hostImports.setHttpfsClient === 'function') {
+        hostImports.setHttpfsClient(null);
+      }
       if (
         installedBootstrapMessageListener &&
         scope &&
@@ -1654,42 +1743,457 @@ function resolveSideModuleUrl(file, runtimeScriptUrl, locateFileBase) {
   return `${scriptDir}${effectiveRel}`;
 }
 
+function normalizeIndirectDispatchMode(raw) {
+  if (typeof raw === 'string') {
+    const lower = raw.trim().toLowerCase();
+    if (INDIRECT_DISPATCH_MODES.has(lower)) {
+      return lower;
+    }
+  }
+  return 'table';
+}
+
+function sanitizeManifestScriptUrl(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes('\0') || trimmed.includes('\\')) {
+    return null;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!/\.m?js$/i.test(withoutQuery)) {
+    return null;
+  }
+  if (isAbsoluteUrl(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return null;
+    }
+    if (typeof URL === 'function') {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.pathname.split('/').includes('..')) {
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return trimmed;
+  }
+  const segments = withoutQuery.replace(/^\/+/, '').split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    if (segments[i] === '..') {
+      return null;
+    }
+  }
+  return trimmed;
+}
+
+function extractSideModuleEntryUrl(entry) {
+  if (typeof entry === 'string') {
+    return sanitizeSideModuleUrl(entry);
+  }
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const candidate =
+      entry.url !== undefined
+        ? entry.url
+        : entry.path !== undefined
+          ? entry.path
+          : entry.name !== undefined
+            ? entry.name
+            : entry.file;
+    return sanitizeSideModuleUrl(candidate);
+  }
+  return null;
+}
+
+function sanitizeManifestSideModules(rawList) {
+  if (!Array.isArray(rawList)) {
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i += 1) {
+    const clean = extractSideModuleEntryUrl(rawList[i]);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function pickFirstDefined(obj, keys) {
+  if (!obj || typeof obj !== 'object') {
+    return undefined;
+  }
+  for (let i = 0; i < keys.length; i += 1) {
+    const val = obj[keys[i]];
+    if (val !== undefined && val !== null && val !== '') {
+      return val;
+    }
+  }
+  return undefined;
+}
+
+function toOptionalNonNegativeInt(value) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+    return null;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return Math.floor(n);
+}
+
+function sanitizeWasmMetrics(rawMetrics, fallbackSideModuleCount = 0, topLevelManifest = null) {
+  const src =
+    rawMetrics && typeof rawMetrics === 'object' && !Array.isArray(rawMetrics) ? rawMetrics : null;
+  const top =
+    topLevelManifest && typeof topLevelManifest === 'object' && !Array.isArray(topLevelManifest)
+      ? topLevelManifest
+      : null;
+
+  const totalTableSize = toOptionalNonNegativeInt(
+    pickFirstDefined(src, [
+      'totalTableSize',
+      'total_table_size',
+      'tableSize',
+      'table_size',
+      'wasmTableSize',
+      'wasm_table_size',
+    ]) !== undefined
+      ? pickFirstDefined(src, [
+          'totalTableSize',
+          'total_table_size',
+          'tableSize',
+          'table_size',
+          'wasmTableSize',
+          'wasm_table_size',
+        ])
+      : pickFirstDefined(top, [
+          'totalTableSize',
+          'total_table_size',
+          'wasmTableSize',
+          'wasm_table_size',
+        ]),
+  );
+  const totalGotFuncImports = toOptionalNonNegativeInt(
+    pickFirstDefined(src, [
+      'totalGotFuncImports',
+      'total_got_func_imports',
+      'gotFuncImports',
+      'got_func_imports',
+    ]) !== undefined
+      ? pickFirstDefined(src, [
+          'totalGotFuncImports',
+          'total_got_func_imports',
+          'gotFuncImports',
+          'got_func_imports',
+        ])
+      : pickFirstDefined(top, [
+          'totalGotFuncImports',
+          'total_got_func_imports',
+          'gotFuncImports',
+          'got_func_imports',
+        ]),
+  );
+  const explicitSideModuleCount = toOptionalNonNegativeInt(
+    pickFirstDefined(src, ['sideModuleCount', 'side_module_count']),
+  );
+
+  const optionalSpecs = [
+    [
+      'totalGotMemImports',
+      ['totalGotMemImports', 'total_got_mem_imports', 'gotMemImports', 'got_mem_imports'],
+    ],
+    ['totalWasmBytes', ['totalWasmBytes', 'total_wasm_bytes', 'wasmBytes', 'wasm_bytes']],
+    [
+      'mainWasmBytes',
+      ['mainWasmBytes', 'main_wasm_bytes', 'runtimeWasmBytes', 'runtime_wasm_bytes'],
+    ],
+    ['sideModulesTotalBytes', ['sideModulesTotalBytes', 'side_modules_total_bytes']],
+    ['shardCount', ['shardCount', 'shard_count']],
+    ['dispatchShardCount', ['dispatchShardCount', 'dispatch_shard_count']],
+    ['functionCount', ['functionCount', 'function_count']],
+    ['exportedFunctionCount', ['exportedFunctionCount', 'exported_function_count']],
+  ];
+
+  const extras = {};
+  let hasAnyOptional = false;
+  if (src) {
+    for (let i = 0; i < optionalSpecs.length; i += 1) {
+      const [outKey, aliases] = optionalSpecs[i];
+      const val = toOptionalNonNegativeInt(pickFirstDefined(src, aliases));
+      if (val !== null) {
+        extras[outKey] = val;
+        hasAnyOptional = true;
+      }
+    }
+  }
+
+  const hasMetricsSource =
+    Boolean(src) || totalTableSize !== null || totalGotFuncImports !== null || hasAnyOptional;
+  if (!hasMetricsSource) {
+    return null;
+  }
+
+  const baseCount = toNonNegativeInt(fallbackSideModuleCount, 0);
+  const sideModuleCount =
+    explicitSideModuleCount !== null ? Math.max(explicitSideModuleCount, baseCount) : baseCount;
+
+  const sanitized = {
+    sideModuleCount,
+  };
+  if (totalTableSize !== null) {
+    sanitized.totalTableSize = totalTableSize;
+  }
+  if (totalGotFuncImports !== null) {
+    sanitized.totalGotFuncImports = totalGotFuncImports;
+  }
+  const extraKeys = Object.keys(extras);
+  for (let i = 0; i < extraKeys.length; i += 1) {
+    sanitized[extraKeys[i]] = extras[extraKeys[i]];
+  }
+  return sanitized;
+}
+
+/**
+ * Parse and sanitize `guest_manifest.json` while preserving backwards compatibility with
+ * legacy `table`-dispatch manifests and surfacing optional `indirectDispatch` (`"shard"` | `"table"`)
+ * and numeric-only `wasmMetrics` (`totalTableSize`, `totalGotFuncImports`, `sideModuleCount`, ...).
+ */
+function parseGuestManifest(rawManifest) {
+  let manifest = rawManifest;
+  if (typeof manifest === 'string') {
+    try {
+      manifest = JSON.parse(manifest);
+    } catch {
+      return null;
+    }
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return null;
+  }
+
+  const rawSideList =
+    manifest.sideModules !== undefined
+      ? manifest.sideModules
+      : manifest.side_modules !== undefined
+        ? manifest.side_modules
+        : manifest.sideModuleUrls !== undefined
+          ? manifest.sideModuleUrls
+          : manifest.side_module_urls !== undefined
+            ? manifest.side_module_urls
+            : manifest.dynamicLibraries !== undefined
+              ? manifest.dynamicLibraries
+              : manifest.dynamic_libraries;
+  const sideModules = sanitizeManifestSideModules(rawSideList);
+
+  const explicitSideCount = toOptionalNonNegativeInt(
+    pickFirstDefined(manifest, ['sideModuleCount', 'side_module_count']),
+  );
+  const sideModuleCount =
+    explicitSideCount !== null ? Math.max(explicitSideCount, sideModules.length) : sideModules.length;
+
+  const rawMetrics =
+    manifest.wasmMetrics !== undefined ? manifest.wasmMetrics : manifest.wasm_metrics;
+  const rawDispatch =
+    pickFirstDefined(manifest, ['indirectDispatch', 'indirect_dispatch']) !== undefined
+      ? pickFirstDefined(manifest, ['indirectDispatch', 'indirect_dispatch'])
+      : pickFirstDefined(rawMetrics, ['indirectDispatch', 'indirect_dispatch']);
+  const indirectDispatch = normalizeIndirectDispatchMode(rawDispatch);
+
+  const wasmMetrics = sanitizeWasmMetrics(rawMetrics, sideModuleCount, manifest);
+  const maxConcurrentPthreadLoads = toOptionalNonNegativeInt(
+    pickFirstDefined(manifest, ['maxConcurrentPthreadLoads', 'max_concurrent_pthread_loads']),
+  );
+  const runtimeScriptUrl = sanitizeManifestScriptUrl(
+    pickFirstDefined(manifest, ['runtimeScriptUrl', 'runtimeJs', 'runtime_js']),
+  );
+
+  return {
+    indirectDispatch,
+    sideModules,
+    sideModuleCount,
+    wasmMetrics,
+    maxConcurrentPthreadLoads,
+    runtimeScriptUrl,
+  };
+}
+
+async function loadGuestManifest(options = {}) {
+  const url =
+    typeof options.url === 'string' && options.url.trim().length > 0
+      ? options.url.trim()
+      : DEFAULT_GUEST_MANIFEST_RELATIVE;
+  const fetchFn =
+    typeof options.fetchFn === 'function'
+      ? options.fetchFn
+      : typeof fetch === 'function'
+        ? fetch
+        : null;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const reportFn = typeof options.reportFn === 'function' ? options.reportFn : null;
+
+  if (!fetchFn) {
+    return null;
+  }
+
+  let parsed = null;
+  try {
+    const resp = await fetchFn(url, { credentials: 'same-origin' });
+    if (!resp || resp.ok === false) {
+      return null;
+    }
+    const raw =
+      typeof resp.json === 'function'
+        ? await resp.json()
+        : typeof resp.text === 'function'
+          ? await resp.text()
+          : null;
+    parsed = parseGuestManifest(raw);
+  } catch {
+    return null;
+  }
+
+  if (!parsed) {
+    return null;
+  }
+
+  if (onProgress) {
+    try {
+      onProgress({
+        phase: 'manifest',
+        indirectDispatch: parsed.indirectDispatch,
+        sideModules: parsed.sideModules.slice(),
+        sideModuleCount: parsed.sideModuleCount,
+        wasmMetrics: parsed.wasmMetrics ? Object.assign({}, parsed.wasmMetrics) : null,
+      });
+    } catch {
+      // Progress hooks must never fail manifest loading.
+    }
+  }
+  if (reportFn) {
+    try {
+      const tableSuffix =
+        parsed.wasmMetrics && parsed.wasmMetrics.totalTableSize !== undefined
+          ? `, table=${parsed.wasmMetrics.totalTableSize}`
+          : '';
+      reportFn(
+        `Guest manifest loaded (dispatch=${parsed.indirectDispatch}, sideModules=${parsed.sideModuleCount}${tableSuffix})`,
+      );
+    } catch {
+      // Progress reporting failures are non-fatal.
+    }
+  }
+
+  return parsed;
+}
+
 function createRuntimeLocateFile(runtimeScriptUrl, locateFileBase, options = {}) {
   const reportFn = typeof options.reportFn === 'function' ? options.reportFn : null;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const indirectDispatch =
+    options.indirectDispatch !== undefined
+      ? normalizeIndirectDispatchMode(options.indirectDispatch)
+      : null;
+  const wasmMetrics =
+    options.wasmMetrics && typeof options.wasmMetrics === 'object'
+      ? Object.assign({}, options.wasmMetrics)
+      : null;
   const knownSideModules = new Set();
+  const expectedModuleNames = [];
   if (Array.isArray(options.sideModuleNames)) {
     for (let i = 0; i < options.sideModuleNames.length; i += 1) {
       const base = extractWasmBasename(options.sideModuleNames[i]);
       if (base) {
-        knownSideModules.add(base.toLowerCase());
+        const lower = base.toLowerCase();
+        if (!knownSideModules.has(lower)) {
+          knownSideModules.add(lower);
+          expectedModuleNames.push(base);
+        }
       }
     }
   }
+  const explicitExpectedCount = toOptionalNonNegativeInt(options.expectedSideModuleCount);
   const reportedSideModules = new Set();
+  const loadedModuleNames = [];
 
-  return function locateFile(file) {
+  function getProgress() {
+    const loadedCount = reportedSideModules.size;
+    const baseExpected = Math.max(
+      knownSideModules.size,
+      explicitExpectedCount !== null ? explicitExpectedCount : 0,
+    );
+    const totalCount = Math.max(baseExpected, loadedCount);
+    const remainingCount = Math.max(0, totalCount - loadedCount);
+    const complete = totalCount === 0 || loadedCount >= totalCount;
+    const pct = totalCount > 0 ? Math.round((loadedCount / totalCount) * 10000) / 100 : 100;
+    return {
+      loadedCount,
+      totalCount,
+      remainingCount,
+      complete,
+      pct,
+      loadedModules: loadedModuleNames.slice(),
+      expectedModules: expectedModuleNames.slice(),
+    };
+  }
+
+  function locateFile(file) {
     const resolved = resolveSideModuleUrl(file, runtimeScriptUrl, locateFileBase);
     if (!resolved) {
       return '';
     }
-    if (reportFn) {
-      const base = extractWasmBasename(resolved) || extractWasmBasename(file);
-      const baseLower = base ? base.toLowerCase() : '';
-      if (
-        baseLower &&
-        (GUEST_SIDE_MODULE_BASENAME_RE.test(baseLower) || knownSideModules.has(baseLower)) &&
-        !reportedSideModules.has(baseLower)
-      ) {
-        reportedSideModules.add(baseLower);
+    const base = extractWasmBasename(resolved) || extractWasmBasename(file);
+    const baseLower = base ? base.toLowerCase() : '';
+    if (
+      baseLower &&
+      (GUEST_SIDE_MODULE_BASENAME_RE.test(baseLower) || knownSideModules.has(baseLower)) &&
+      !reportedSideModules.has(baseLower)
+    ) {
+      reportedSideModules.add(baseLower);
+      loadedModuleNames.push(base);
+      const snapshot = getProgress();
+      if (reportFn) {
         try {
           reportFn(`Loading Wasm side module (${base})...`);
         } catch {
           // Progress channel errors must never break locateFile.
         }
       }
+      if (onProgress) {
+        try {
+          const payload = {
+            phase: 'side-module',
+            module: base,
+            url: resolved,
+            loadedCount: snapshot.loadedCount,
+            totalCount: snapshot.totalCount,
+            remainingCount: snapshot.remainingCount,
+            complete: snapshot.complete,
+            pct: snapshot.pct,
+          };
+          if (indirectDispatch) {
+            payload.indirectDispatch = indirectDispatch;
+          }
+          if (wasmMetrics) {
+            payload.wasmMetrics = Object.assign({}, wasmMetrics);
+          }
+          onProgress(payload);
+        } catch {
+          // Progress callback errors must never break locateFile.
+        }
+      }
     }
     return resolved;
-  };
+  }
+
+  locateFile.getProgress = getProgress;
+  return locateFile;
 }
 
 function extractMemoryFromImports(imports) {
@@ -1861,12 +2365,20 @@ function buildRuntimeModuleConfig(options = {}) {
           emitFirstPresentLog: options.emitFirstPresentLog === true,
         });
 
+  const rawManifestInput =
+    options.guestManifest !== undefined ? options.guestManifest : options.manifest;
+  const manifestSummary =
+    rawManifestInput !== undefined && rawManifestInput !== null
+      ? parseGuestManifest(rawManifestInput)
+      : null;
+
   const resolvedRuntimeScriptUrl = resolveRuntimeScriptUrl(
-    options.runtimeScriptUrl,
+    options.runtimeScriptUrl || (manifestSummary && manifestSummary.runtimeScriptUrl) || undefined,
     options.locationHref,
   );
   const rawDynamicLibraries = sanitizeSideModuleUrls(options.dynamicLibraries);
   const rawSideModuleUrls = sanitizeSideModuleUrls(options.sideModuleUrls);
+  const manifestSideModules = manifestSummary ? manifestSummary.sideModules : [];
   const combinedDynamicLibraries = [];
   const seenSideModules = new Set();
   const addSideModuleEntry = (entry) => {
@@ -1887,13 +2399,25 @@ function buildRuntimeModuleConfig(options = {}) {
   for (let i = 0; i < rawSideModuleUrls.length; i += 1) {
     addSideModuleEntry(rawSideModuleUrls[i]);
   }
+  if (combinedDynamicLibraries.length === 0 && manifestSideModules.length > 0) {
+    for (let i = 0; i < manifestSideModules.length; i += 1) {
+      addSideModuleEntry(manifestSideModules[i]);
+    }
+  }
   const resolvedSideModuleUrls = combinedDynamicLibraries.map((entry) =>
     resolveSideModuleUrl(entry, resolvedRuntimeScriptUrl, options.locateFileBase),
   );
 
   const locateFile = createRuntimeLocateFile(resolvedRuntimeScriptUrl, options.locateFileBase, {
     reportFn: activeReportFn,
+    onProgress: typeof options.onProgress === 'function' ? options.onProgress : null,
     sideModuleNames: combinedDynamicLibraries,
+    expectedSideModuleCount:
+      manifestSummary && combinedDynamicLibraries.length === 0
+        ? manifestSummary.sideModuleCount
+        : combinedDynamicLibraries.length,
+    indirectDispatch: manifestSummary ? manifestSummary.indirectDispatch : undefined,
+    wasmMetrics: manifestSummary ? manifestSummary.wasmMetrics : null,
   });
 
   const preRun = Array.isArray(options.preRun)
@@ -1964,6 +2488,23 @@ function buildRuntimeModuleConfig(options = {}) {
     config.dynamicLibraries = combinedDynamicLibraries.slice();
     config.sideModuleUrls = resolvedSideModuleUrls.slice();
   }
+  if (manifestSummary) {
+    config.indirectDispatch = manifestSummary.indirectDispatch;
+    config.wasmMetrics = manifestSummary.wasmMetrics
+      ? Object.assign({}, manifestSummary.wasmMetrics)
+      : null;
+    config.manifestSummary = {
+      indirectDispatch: manifestSummary.indirectDispatch,
+      sideModules: manifestSummary.sideModules.slice(),
+      sideModuleCount: manifestSummary.sideModuleCount,
+      wasmMetrics: manifestSummary.wasmMetrics
+        ? Object.assign({}, manifestSummary.wasmMetrics)
+        : null,
+    };
+  }
+  if (typeof locateFile.getProgress === 'function') {
+    config.getSideModuleProgress = () => locateFile.getProgress();
+  }
 
   if (typeof options.instantiateWasm === 'function') {
     config.instantiateWasm = options.instantiateWasm;
@@ -1985,9 +2526,704 @@ function createRuntimeModuleOptions(overrides = {}) {
   return buildRuntimeModuleConfig(overrides);
 }
 
+function normalizeMaxConcurrentPthreadLoads(value, fallback = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function isPthreadLoadMessage(msg) {
+  return Boolean(
+    msg &&
+      typeof msg === 'object' &&
+      (msg.cmd === PTHREAD_CMD_LOAD || msg.cmd === 'CMD_LOAD'),
+  );
+}
+
+function isPthreadLoadedMessage(msg) {
+  return Boolean(
+    msg &&
+      typeof msg === 'object' &&
+      (msg.cmd === PTHREAD_CMD_LOADED || msg.cmd === 'CMD_LOADED'),
+  );
+}
+
+function isPthreadPostLoadMessage(msg) {
+  return Boolean(
+    msg &&
+      typeof msg === 'object' &&
+      (msg.cmd === PTHREAD_CMD_RUN ||
+        msg.cmd === 'CMD_RUN' ||
+        msg.cmd === PTHREAD_CMD_OBJECT_TRANSFER ||
+        msg.cmd === 'CMD_OBJECT_TRANSFER'),
+  );
+}
+
+function isHttpfsSabControlMessage(msg) {
+  return Boolean(msg && typeof msg === 'object' && msg.__playgta6_httpfs_sab);
+}
+
+function hookWorkerEventProperty(worker, propName, observer) {
+  let protoDesc = null;
+  let proto = Object.getPrototypeOf(worker);
+  while (proto && !protoDesc) {
+    try {
+      protoDesc = Object.getOwnPropertyDescriptor(proto, propName) || null;
+    } catch {
+      protoDesc = null;
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  let ownDesc = null;
+  try {
+    ownDesc = Object.getOwnPropertyDescriptor(worker, propName) || null;
+  } catch {
+    return null;
+  }
+  if (ownDesc && !ownDesc.configurable) {
+    return null;
+  }
+
+  const hasProtoAccessor = Boolean(protoDesc && typeof protoDesc.set === 'function');
+  let userHandler =
+    !hasProtoAccessor && ownDesc && typeof ownDesc.value === 'function' ? ownDesc.value : null;
+  let wrappedHandler = null;
+
+  const makeWrapped = (fn) => {
+    if (typeof fn !== 'function') {
+      return null;
+    }
+    return function wrappedWorkerEventHandler(ev) {
+      observer(ev);
+      return fn.call(this, ev);
+    };
+  };
+
+  try {
+    if (hasProtoAccessor) {
+      const existing = protoDesc.get ? protoDesc.get.call(worker) : null;
+      if (typeof existing === 'function') {
+        userHandler = existing;
+        wrappedHandler = makeWrapped(existing);
+        protoDesc.set.call(worker, wrappedHandler);
+      }
+      Object.defineProperty(worker, propName, {
+        configurable: true,
+        enumerable: protoDesc.enumerable !== false,
+        get() {
+          return userHandler;
+        },
+        set(fn) {
+          userHandler = typeof fn === 'function' ? fn : null;
+          wrappedHandler = makeWrapped(userHandler);
+          protoDesc.set.call(worker, wrappedHandler);
+        },
+      });
+    } else {
+      wrappedHandler = makeWrapped(userHandler);
+      Object.defineProperty(worker, propName, {
+        configurable: true,
+        enumerable: ownDesc ? ownDesc.enumerable !== false : true,
+        get() {
+          return wrappedHandler;
+        },
+        set(fn) {
+          userHandler = typeof fn === 'function' ? fn : null;
+          wrappedHandler = makeWrapped(userHandler);
+        },
+      });
+    }
+  } catch {
+    return null;
+  }
+
+  let unhooked = false;
+  return function unhookWorkerEventProperty() {
+    if (unhooked) {
+      return;
+    }
+    unhooked = true;
+    const current = userHandler;
+    userHandler = null;
+    wrappedHandler = null;
+    try {
+      delete worker[propName];
+      if (hasProtoAccessor) {
+        if (typeof current === 'function') {
+          protoDesc.set.call(worker, current);
+        }
+      } else {
+        worker[propName] = current;
+      }
+    } catch {
+      // Ignore unhook errors on frozen or exotic worker mocks.
+    }
+  };
+}
+
+/**
+ * Coordinates 52+ concurrent Emscripten `em-pthread` / `em-pthread-<N>` workers:
+ * - Delivers `{ __playgta6_httpfs_sab }` immediately before `CMD_LOAD` when available.
+ * - Throttles concurrent in-flight `CMD_LOAD` instantiations to `maxConcurrentPthreadLoads`
+ *   (0 = unthrottled) so burst spawns do not starve `io_worker.js` / `wgpu_worker.js` or blow V8 memory.
+ * - Buffers any `CMD_RUN`, `CMD_OBJECT_TRANSFER`, or interleaved post-load messages (even if posted
+ *   before `CMD_LOAD` is dispatched or while `CMD_LOAD` is in flight) and flushes them in strict FIFO
+ *   order only AFTER `CMD_LOADED` completes.
+ * - Cleans up all worker tracking references on `terminate()` or `'error'` and frees load slots
+ *   immediately so queued workers never deadlock or leak memory.
+ * - Tracks clean numeric-only telemetry (`pthreadSpawnedCount`, `pthreadActiveCount`,
+ *   `pthreadPeakCount`, `pthreadLoadQueueDepth`, `pthreadFailedCount`).
+ */
+function createPthreadPoolCoordinator(options = {}) {
+  let maxConcurrentLoads = normalizeMaxConcurrentPthreadLoads(
+    options.maxConcurrentPthreadLoads,
+    DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+  );
+  const getHttpfsMailboxSab =
+    typeof options.getHttpfsMailboxSab === 'function'
+      ? options.getHttpfsMailboxSab
+      : () => options.httpfsMailboxSab || null;
+  const onTelemetryChange =
+    typeof options.onTelemetryChange === 'function' ? options.onTelemetryChange : null;
+
+  const trackedWorkers = new Map();
+  const loadQueue = [];
+  let queueHead = 0;
+  let queuedCount = 0;
+  let activeLoads = 0;
+  let draining = false;
+
+  let pthreadSpawnedCount = 0;
+  let pthreadActiveCount = 0;
+  let pthreadPeakCount = 0;
+  let pthreadFailedCount = 0;
+  let pthreadLoadedCount = 0;
+  let peakConcurrentLoads = 0;
+
+  function getTelemetry() {
+    return {
+      pthreadSpawnedCount,
+      pthreadActiveCount,
+      pthreadPeakCount,
+      pthreadLoadQueueDepth: queuedCount,
+      pthreadFailedCount,
+      pthreadLoadedCount,
+      pthreadActiveLoads: activeLoads,
+      pthreadPeakConcurrentLoads: peakConcurrentLoads,
+      maxConcurrentPthreadLoads: maxConcurrentLoads,
+    };
+  }
+
+  function emitTelemetry() {
+    if (!onTelemetryChange) {
+      return;
+    }
+    try {
+      onTelemetryChange(getTelemetry());
+    } catch {
+      // Telemetry callbacks must never interfere with pthread scheduling.
+    }
+  }
+
+  function compactQueueIfNeeded() {
+    if (queuedCount === 0 || queueHead >= loadQueue.length) {
+      loadQueue.length = 0;
+      queueHead = 0;
+      return;
+    }
+    if (queueHead >= 32 && queueHead * 2 >= loadQueue.length) {
+      let writeIdx = 0;
+      for (let i = queueHead; i < loadQueue.length; i += 1) {
+        const item = loadQueue[i];
+        if (item && !item.cleanedUp && item.state === 'queued') {
+          loadQueue[writeIdx] = item;
+          item.queueIndex = writeIdx;
+          writeIdx += 1;
+        }
+      }
+      loadQueue.length = writeIdx;
+      queueHead = 0;
+    }
+  }
+
+  function enqueueLoad(entry) {
+    entry.state = 'queued';
+    entry.queueIndex = loadQueue.length;
+    loadQueue.push(entry);
+    queuedCount += 1;
+  }
+
+  function removeFromLoadQueue(entry) {
+    if (entry.queueIndex >= 0 && entry.queueIndex < loadQueue.length) {
+      if (loadQueue[entry.queueIndex] === entry) {
+        loadQueue[entry.queueIndex] = null;
+        queuedCount = Math.max(0, queuedCount - 1);
+      }
+    }
+    entry.queueIndex = -1;
+    compactQueueIfNeeded();
+  }
+
+  function detachMessageObservers(entry) {
+    if (!entry.messageCleanupHooks || entry.messageCleanupHooks.length === 0) {
+      return;
+    }
+    const hooks = entry.messageCleanupHooks;
+    entry.messageCleanupHooks = [];
+    for (let i = 0; i < hooks.length; i += 1) {
+      try {
+        hooks[i]();
+      } catch {
+        // Ignore listener detach errors.
+      }
+    }
+  }
+
+  function cleanupEntry(entry, finalState) {
+    if (!entry || entry.cleanedUp) {
+      return;
+    }
+    entry.cleanedUp = true;
+
+    const prevState = entry.state;
+    if (prevState === 'queued') {
+      removeFromLoadQueue(entry);
+    } else if (prevState === 'loading') {
+      activeLoads = Math.max(0, activeLoads - 1);
+    }
+
+    entry.state = finalState;
+    if (finalState === 'failed') {
+      pthreadFailedCount += 1;
+    }
+    pthreadActiveCount = Math.max(0, pthreadActiveCount - 1);
+
+    entry.pendingMessages.length = 0;
+    entry.loadArgs = null;
+
+    detachMessageObservers(entry);
+    const hooks = entry.cleanupHooks;
+    entry.cleanupHooks = [];
+    for (let i = 0; i < hooks.length; i += 1) {
+      try {
+        hooks[i]();
+      } catch {
+        // Ignore worker hook restoration errors.
+      }
+    }
+
+    const worker = entry.worker;
+    entry.worker = null;
+    if (worker) {
+      trackedWorkers.delete(worker);
+    }
+
+    emitTelemetry();
+    drainLoadQueue();
+  }
+
+  function handleWorkerLoaded(entry) {
+    if (!entry || entry.cleanedUp) {
+      return;
+    }
+    if (entry.state !== 'loading' && entry.state !== 'queued' && entry.state !== 'spawned') {
+      return;
+    }
+    if (entry.state === 'queued') {
+      removeFromLoadQueue(entry);
+    } else if (entry.state === 'loading') {
+      activeLoads = Math.max(0, activeLoads - 1);
+    }
+
+    entry.state = 'loaded';
+    entry.loadArgs = null;
+    pthreadLoadedCount += 1;
+    detachMessageObservers(entry);
+
+    const worker = entry.worker;
+    const origPost = entry.origPostMessage;
+    const queued = entry.pendingMessages;
+    entry.pendingMessages = [];
+
+    if (worker && origPost) {
+      for (let i = 0; i < queued.length; i += 1) {
+        if (entry.cleanedUp || entry.state !== 'loaded') {
+          break;
+        }
+        try {
+          origPost.apply(worker, queued[i]);
+        } catch {
+          cleanupEntry(entry, 'failed');
+          return;
+        }
+      }
+    }
+
+    emitTelemetry();
+    drainLoadQueue();
+  }
+
+  function drainLoadQueue() {
+    if (draining) {
+      return;
+    }
+    draining = true;
+    try {
+      while (queuedCount > 0 && (maxConcurrentLoads === 0 || activeLoads < maxConcurrentLoads)) {
+        let nextEntry = null;
+        while (queueHead < loadQueue.length) {
+          const candidate = loadQueue[queueHead];
+          loadQueue[queueHead] = null;
+          queueHead += 1;
+          if (candidate && !candidate.cleanedUp && candidate.state === 'queued') {
+            nextEntry = candidate;
+            break;
+          }
+        }
+        if (!nextEntry) {
+          queuedCount = 0;
+          compactQueueIfNeeded();
+          break;
+        }
+
+        nextEntry.queueIndex = -1;
+        queuedCount = Math.max(0, queuedCount - 1);
+        compactQueueIfNeeded();
+
+        const loadArgs = nextEntry.loadArgs;
+        nextEntry.loadArgs = null;
+        if (!loadArgs || !nextEntry.worker || !nextEntry.origPostMessage) {
+          cleanupEntry(nextEntry, 'failed');
+          continue;
+        }
+
+        nextEntry.state = 'loading';
+        activeLoads += 1;
+        if (activeLoads > peakConcurrentLoads) {
+          peakConcurrentLoads = activeLoads;
+        }
+        emitTelemetry();
+
+        try {
+          nextEntry.origPostMessage.apply(nextEntry.worker, loadArgs);
+        } catch {
+          cleanupEntry(nextEntry, 'failed');
+        }
+      }
+    } finally {
+      draining = false;
+    }
+  }
+
+  function registerWorker(worker, meta = {}) {
+    if (!worker || typeof worker !== 'object') {
+      return worker;
+    }
+    if (trackedWorkers.has(worker)) {
+      return worker;
+    }
+
+    const origPostMessage = typeof worker.postMessage === 'function' ? worker.postMessage : null;
+    const hasOwnPostMessage = Object.prototype.hasOwnProperty.call(worker, 'postMessage');
+    const origTerminate = typeof worker.terminate === 'function' ? worker.terminate : null;
+    const hasOwnTerminate = Object.prototype.hasOwnProperty.call(worker, 'terminate');
+
+    const sab =
+      meta && meta.httpfsMailboxSab !== undefined ? meta.httpfsMailboxSab : getHttpfsMailboxSab();
+    if (sab && origPostMessage) {
+      try {
+        origPostMessage.call(worker, { __playgta6_httpfs_sab: sab });
+      } catch {
+        // Non-fatal: BroadcastChannel handshake remains as fallback.
+      }
+    }
+
+    pthreadSpawnedCount += 1;
+    pthreadActiveCount += 1;
+    if (pthreadActiveCount > pthreadPeakCount) {
+      pthreadPeakCount = pthreadActiveCount;
+    }
+
+    const entry = {
+      worker,
+      name: meta && typeof meta.name === 'string' ? meta.name : EMSCRIPTEN_PTHREAD_WORKER_NAME,
+      state: 'spawned',
+      cleanedUp: false,
+      queueIndex: -1,
+      loadArgs: null,
+      pendingMessages: [],
+      origPostMessage,
+      origTerminate,
+      messageCleanupHooks: [],
+      cleanupHooks: [],
+    };
+    trackedWorkers.set(worker, entry);
+
+    const onWorkerMessage = (ev) => {
+      const data = ev && ev.data !== undefined ? ev.data : ev;
+      if (isPthreadLoadedMessage(data)) {
+        handleWorkerLoaded(entry);
+      }
+    };
+    const onWorkerError = () => {
+      cleanupEntry(entry, 'failed');
+    };
+
+    if (typeof worker.addEventListener === 'function') {
+      try {
+        worker.addEventListener('message', onWorkerMessage);
+        entry.messageCleanupHooks.push(() => {
+          if (typeof worker.removeEventListener === 'function') {
+            worker.removeEventListener('message', onWorkerMessage);
+          }
+        });
+      } catch {
+        // Ignore non-standard addEventListener failures.
+      }
+      try {
+        worker.addEventListener('error', onWorkerError);
+        entry.cleanupHooks.push(() => {
+          if (typeof worker.removeEventListener === 'function') {
+            worker.removeEventListener('error', onWorkerError);
+          }
+        });
+      } catch {
+        // Ignore non-standard addEventListener failures.
+      }
+    }
+
+    const unhookOnMessage = hookWorkerEventProperty(worker, 'onmessage', onWorkerMessage);
+    if (unhookOnMessage) {
+      entry.messageCleanupHooks.push(unhookOnMessage);
+    }
+    const unhookOnError = hookWorkerEventProperty(worker, 'onerror', onWorkerError);
+    if (unhookOnError) {
+      entry.cleanupHooks.push(unhookOnError);
+    }
+
+    if (origPostMessage) {
+      const wrappedPostMessage = function wrappedPthreadPostMessage(msg) {
+        const callArgs = Array.prototype.slice.call(arguments);
+        if (entry.cleanedUp || entry.state === 'terminated' || entry.state === 'failed') {
+          return undefined;
+        }
+        if (isHttpfsSabControlMessage(msg)) {
+          return origPostMessage.apply(worker, callArgs);
+        }
+        if (entry.state === 'loaded') {
+          return origPostMessage.apply(worker, callArgs);
+        }
+        if (isPthreadLoadMessage(msg)) {
+          if (entry.state === 'spawned') {
+            entry.loadArgs = callArgs;
+            enqueueLoad(entry);
+            emitTelemetry();
+            drainLoadQueue();
+          }
+          return undefined;
+        }
+        if (
+          entry.state === 'queued' ||
+          entry.state === 'loading' ||
+          isPthreadPostLoadMessage(msg)
+        ) {
+          entry.pendingMessages.push(callArgs);
+          return undefined;
+        }
+        return origPostMessage.apply(worker, callArgs);
+      };
+      try {
+        worker.postMessage = wrappedPostMessage;
+        entry.cleanupHooks.push(() => {
+          if (worker.postMessage === wrappedPostMessage) {
+            if (hasOwnPostMessage) {
+              worker.postMessage = origPostMessage;
+            } else {
+              delete worker.postMessage;
+            }
+          }
+        });
+      } catch {
+        // Ignore if worker.postMessage is non-writable.
+      }
+    }
+
+    if (origTerminate) {
+      const wrappedTerminate = function wrappedPthreadTerminate() {
+        cleanupEntry(entry, 'terminated');
+        return origTerminate.apply(worker, arguments);
+      };
+      try {
+        worker.terminate = wrappedTerminate;
+        entry.cleanupHooks.push(() => {
+          if (worker.terminate === wrappedTerminate) {
+            if (hasOwnTerminate) {
+              worker.terminate = origTerminate;
+            } else {
+              delete worker.terminate;
+            }
+          }
+        });
+      } catch {
+        // Ignore if worker.terminate is non-writable.
+      }
+    }
+
+    emitTelemetry();
+    return worker;
+  }
+
+  return {
+    registerWorker,
+    getTelemetry,
+    getStats: getTelemetry,
+    getTrackedCount: () => trackedWorkers.size,
+    getMaxConcurrentPthreadLoads: () => maxConcurrentLoads,
+    setMaxConcurrentPthreadLoads(nextLimit) {
+      maxConcurrentLoads = normalizeMaxConcurrentPthreadLoads(nextLimit, maxConcurrentLoads);
+      emitTelemetry();
+      drainLoadQueue();
+      return maxConcurrentLoads;
+    },
+    notifyWorkerLoaded(worker) {
+      const entry = trackedWorkers.get(worker);
+      if (entry) {
+        handleWorkerLoaded(entry);
+      }
+    },
+    notifyWorkerError(worker) {
+      const entry = trackedWorkers.get(worker);
+      if (entry) {
+        cleanupEntry(entry, 'failed');
+      }
+    },
+    notifyWorkerTerminated(worker) {
+      const entry = trackedWorkers.get(worker);
+      if (entry) {
+        cleanupEntry(entry, 'terminated');
+      }
+    },
+  };
+}
+
+/**
+ * Wrap a `Worker` constructor so `em-pthread` / `em-pthread-<N>` workers redirect to
+ * `getRedirectHref()` and register with `coordinator` for `httpfsMailboxSab` delivery,
+ * bounded `CMD_LOAD` throttling, strict `CMD_LOAD`-before-`CMD_RUN`/`CMD_OBJECT_TRANSFER`
+ * ordering, cleanup on error/terminate, and numeric pthread telemetry.
+ */
+function installPthreadWorkerProxy(options = {}) {
+  const OriginalWorker = options.WorkerCtor || null;
+  if (typeof OriginalWorker !== 'function') {
+    return null;
+  }
+  const coordinator = options.coordinator || createPthreadPoolCoordinator(options);
+  const getRedirectHref =
+    typeof options.getRedirectHref === 'function'
+      ? options.getRedirectHref
+      : () => (typeof options.redirectHref === 'string' ? options.redirectHref : '');
+
+  const WrappedWorker = new Proxy(OriginalWorker, {
+    construct(target, args, newTarget) {
+      const nextArgs = Array.prototype.slice.call(args);
+      const workerOpts = nextArgs.length >= 2 ? nextArgs[1] : undefined;
+      const isEmPthread = Boolean(
+        workerOpts &&
+          typeof workerOpts === 'object' &&
+          isEmscriptenPthreadWorkerName(workerOpts.name),
+      );
+      if (isEmPthread) {
+        const redirectHref = getRedirectHref();
+        if (typeof redirectHref === 'string' && redirectHref.length > 0) {
+          nextArgs[0] = redirectHref;
+        }
+      }
+      const targetNew = newTarget === WrappedWorker ? target : newTarget;
+      const instance = Reflect.construct(target, nextArgs, targetNew);
+      if (isEmPthread && instance) {
+        coordinator.registerWorker(instance, { name: workerOpts.name });
+      }
+      return instance;
+    },
+  });
+
+  return { WrappedWorker, coordinator };
+}
+
 let coordinatorFirstPresentEmitted = false;
 let configuredSideModuleUrls = null;
 let configuredDynamicLibraries = null;
+let configuredGuestManifest = null;
+let configuredGuestManifestUrl = null;
+let configuredMaxConcurrentPthreadLoads = null;
+let activeGuestManifestSummary = null;
+let activeSideModuleProgressGetter = null;
+
+const coordinatorPthreadPool = createPthreadPoolCoordinator({
+  getHttpfsMailboxSab: () => httpfsMailboxSab,
+});
+
+function getPthreadTelemetry() {
+  return coordinatorPthreadPool.getTelemetry();
+}
+
+function getLoaderStatus() {
+  const pthread = coordinatorPthreadPool.getTelemetry();
+  const sideModules =
+    typeof activeSideModuleProgressGetter === 'function'
+      ? activeSideModuleProgressGetter()
+      : {
+          loadedCount: 0,
+          totalCount: activeGuestManifestSummary ? activeGuestManifestSummary.sideModuleCount : 0,
+          remainingCount: activeGuestManifestSummary
+            ? activeGuestManifestSummary.sideModuleCount
+            : 0,
+          complete: !activeGuestManifestSummary || activeGuestManifestSummary.sideModuleCount === 0,
+          pct:
+            !activeGuestManifestSummary || activeGuestManifestSummary.sideModuleCount === 0
+              ? 100
+              : 0,
+          loadedModules: [],
+          expectedModules: activeGuestManifestSummary
+            ? activeGuestManifestSummary.sideModules.slice()
+            : [],
+        };
+  return {
+    pthreadSpawnedCount: pthread.pthreadSpawnedCount,
+    pthreadActiveCount: pthread.pthreadActiveCount,
+    pthreadPeakCount: pthread.pthreadPeakCount,
+    pthreadLoadQueueDepth: pthread.pthreadLoadQueueDepth,
+    pthreadFailedCount: pthread.pthreadFailedCount,
+    pthreadLoadedCount: pthread.pthreadLoadedCount,
+    pthreadActiveLoads: pthread.pthreadActiveLoads,
+    pthreadPeakConcurrentLoads: pthread.pthreadPeakConcurrentLoads,
+    maxConcurrentPthreadLoads: pthread.maxConcurrentPthreadLoads,
+    indirectDispatch: activeGuestManifestSummary
+      ? activeGuestManifestSummary.indirectDispatch
+      : 'table',
+    wasmMetrics:
+      activeGuestManifestSummary && activeGuestManifestSummary.wasmMetrics
+        ? Object.assign({}, activeGuestManifestSummary.wasmMetrics)
+        : null,
+    manifest: activeGuestManifestSummary
+      ? {
+          indirectDispatch: activeGuestManifestSummary.indirectDispatch,
+          sideModules: activeGuestManifestSummary.sideModules.slice(),
+          sideModuleCount: activeGuestManifestSummary.sideModuleCount,
+          wasmMetrics: activeGuestManifestSummary.wasmMetrics
+            ? Object.assign({}, activeGuestManifestSummary.wasmMetrics)
+            : null,
+        }
+      : null,
+    sideModules,
+    firstPresentEmitted: coordinatorFirstPresentEmitted,
+  };
+}
 
 async function tryBootWasmRuntime() {
   try {
@@ -1998,6 +3234,45 @@ async function tryBootWasmRuntime() {
       gpuWorker.postMessage({ cmdBuffer: pkt }, [pkt]);
       return;
     }
+
+    let manifestSummary = null;
+    if (configuredGuestManifest !== null) {
+      manifestSummary = parseGuestManifest(configuredGuestManifest);
+    } else if (typeof fetch === 'function') {
+      manifestSummary = await loadGuestManifest({
+        url: configuredGuestManifestUrl || DEFAULT_GUEST_MANIFEST_RELATIVE,
+        fetchFn: fetch,
+        reportFn: report,
+      });
+    }
+    if (manifestSummary) {
+      activeGuestManifestSummary = manifestSummary;
+      if (
+        configuredMaxConcurrentPthreadLoads === null &&
+        manifestSummary.maxConcurrentPthreadLoads !== null
+      ) {
+        coordinatorPthreadPool.setMaxConcurrentPthreadLoads(
+          manifestSummary.maxConcurrentPthreadLoads,
+        );
+      }
+      if (progress) {
+        try {
+          progress.postMessage({
+            metrics: {
+              indirectDispatch: manifestSummary.indirectDispatch,
+              sideModuleCount: manifestSummary.sideModuleCount,
+              sideModuleUrls: manifestSummary.sideModules.slice(),
+              wasmMetrics: manifestSummary.wasmMetrics
+                ? Object.assign({}, manifestSummary.wasmMetrics)
+                : null,
+            },
+          });
+        } catch {
+          // Non-fatal progress broadcast error.
+        }
+      }
+    }
+
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
@@ -2011,13 +3286,20 @@ async function tryBootWasmRuntime() {
           }
         },
       };
+      if (manifestSummary) {
+        runtimeOptions.guestManifest = manifestSummary;
+      }
       if (configuredSideModuleUrls) {
         runtimeOptions.sideModuleUrls = configuredSideModuleUrls;
       }
       if (configuredDynamicLibraries) {
         runtimeOptions.dynamicLibraries = configuredDynamicLibraries;
       }
-      await self.createRuntimeModule(createRuntimeModuleOptions(runtimeOptions));
+      const moduleConfig = createRuntimeModuleOptions(runtimeOptions);
+      if (typeof moduleConfig.getSideModuleProgress === 'function') {
+        activeSideModuleProgressGetter = moduleConfig.getSideModuleProgress;
+      }
+      await self.createRuntimeModule(moduleConfig);
     }
   } catch (err) {
     if (progress) {
@@ -2034,54 +3316,29 @@ if (typeof self !== 'undefined') {
         ? Worker
         : null;
   if (OriginalWorker) {
-    const WrappedWorker = new Proxy(OriginalWorker, {
-      construct(target, args, newTarget) {
-        const nextArgs = Array.prototype.slice.call(args);
-        const workerOpts = nextArgs.length >= 2 ? nextArgs[1] : undefined;
-        const isEmPthread = Boolean(
-          workerOpts &&
-            typeof workerOpts === 'object' &&
-            isEmscriptenPthreadWorkerName(workerOpts.name),
-        );
-        if (
-          isEmPthread &&
-          self.location &&
-          typeof self.location.href === 'string' &&
-          self.location.href.length > 0
-        ) {
-          nextArgs[0] = self.location.href;
-        }
-        const targetNew = newTarget === WrappedWorker ? target : newTarget;
-        const instance = Reflect.construct(target, nextArgs, targetNew);
-        if (
-          isEmPthread &&
-          httpfsMailboxSab &&
-          instance &&
-          typeof instance.postMessage === 'function'
-        ) {
-          try {
-            instance.postMessage({ __playgta6_httpfs_sab: httpfsMailboxSab });
-          } catch {
-            // Non-fatal: BroadcastChannel handshake remains as fallback.
-          }
-        }
-        return instance;
-      },
+    const proxyBundle = installPthreadWorkerProxy({
+      WorkerCtor: OriginalWorker,
+      coordinator: coordinatorPthreadPool,
+      getRedirectHref: () =>
+        self.location && typeof self.location.href === 'string' ? self.location.href : '',
     });
-    try {
-      self.Worker = WrappedWorker;
-    } catch {
-      // Ignore if self.Worker is non-writable in a custom harness.
-    }
-    if (
-      typeof globalThis !== 'undefined' &&
-      globalThis !== self &&
-      globalThis.Worker === OriginalWorker
-    ) {
+    const WrappedWorker = proxyBundle ? proxyBundle.WrappedWorker : null;
+    if (WrappedWorker) {
       try {
-        globalThis.Worker = WrappedWorker;
+        self.Worker = WrappedWorker;
       } catch {
-        // Ignore if globalThis.Worker is non-writable.
+        // Ignore if self.Worker is non-writable in a custom harness.
+      }
+      if (
+        typeof globalThis !== 'undefined' &&
+        globalThis !== self &&
+        globalThis.Worker === OriginalWorker
+      ) {
+        try {
+          globalThis.Worker = WrappedWorker;
+        } catch {
+          // Ignore if globalThis.Worker is non-writable.
+        }
       }
     }
   }
@@ -2154,6 +3411,22 @@ if (typeof self !== 'undefined') {
 
   self.onmessage = (ev) => {
     const msg = ev.data || {};
+    if (msg.type === 'request-loader-status' || msg.type === 'request-pthread-telemetry') {
+      if (postToMain) {
+        const payload = Object.assign({ type: 'loader-status' }, getLoaderStatus(), {
+          timestamp: Date.now(),
+        });
+        if (msg.id !== undefined) {
+          payload.id = msg.id;
+        }
+        try {
+          postToMain(payload);
+        } catch {
+          // Non-fatal status reply failure.
+        }
+      }
+      return;
+    }
     if (msg.type === 'request-gpu-telemetry') {
       if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
         const statsReq = { stats: true };
@@ -2185,6 +3458,16 @@ if (typeof self !== 'undefined') {
     configuredDynamicLibraries = Array.isArray(msg.dynamicLibraries)
       ? msg.dynamicLibraries
       : null;
+    configuredGuestManifest =
+      msg.guestManifest !== undefined ? msg.guestManifest : msg.manifest !== undefined ? msg.manifest : null;
+    configuredGuestManifestUrl =
+      typeof msg.guestManifestUrl === 'string' && msg.guestManifestUrl.trim().length > 0
+        ? msg.guestManifestUrl.trim()
+        : null;
+    configuredMaxConcurrentPthreadLoads = toOptionalNonNegativeInt(msg.maxConcurrentPthreadLoads);
+    if (configuredMaxConcurrentPthreadLoads !== null) {
+      coordinatorPthreadPool.setMaxConcurrentPthreadLoads(configuredMaxConcurrentPthreadLoads);
+    }
 
     if (
       typeof SharedArrayBuffer !== 'undefined' &&
@@ -2247,6 +3530,11 @@ const exportedApi = {
   EMSCRIPTEN_PTHREAD_WORKER_NAME,
   PTHREAD_WGPU_CHANNEL_NAME,
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  PTHREAD_CMD_LOAD,
+  PTHREAD_CMD_LOADED,
+  PTHREAD_CMD_RUN,
+  PTHREAD_CMD_OBJECT_TRANSFER,
+  DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
@@ -2256,6 +3544,12 @@ const exportedApi = {
   createPatchedPthreadEnv,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,
+  createPthreadPoolCoordinator,
+  installPthreadWorkerProxy,
+  getPthreadTelemetry,
+  getLoaderStatus,
+  parseGuestManifest,
+  loadGuestManifest,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
