@@ -1955,6 +1955,7 @@ mod tests {
         assert!(json.contains("\"source\": \"splash_vs.bin\""));
         assert!(json.contains("\"stage\": \"vertex\""));
         assert!(json.contains("\"naga_validated\": true"));
+        assert!(json.contains("\"bindings\": []"));
 
         run_translate_rdna2(&bin_path, Some(&out_wgsl), Rdna2StageOverride::Auto, false)
             .expect("translate-rdna2 --out should write validated WGSL");
@@ -2132,6 +2133,9 @@ mod tests {
         assert!(json_out.contains("\"pixel_count\": 1"));
         assert!(json_out.contains("\"compute_count\": 1"));
         assert!(json_out.contains(&format!("\"pack_bytes\": {}", result.pack_bytes.len())));
+        assert!(json_out.contains("\"entries\": ["));
+        assert!(json_out.contains("\"entry_point\": \"fs_main\""));
+        assert!(json_out.contains("\"bindings\": ["));
         assert!(!json_out.contains(&root_str));
         assert!(!text_out.contains(&root_str));
         assert!(text_out.contains("total_blobs:"));
@@ -2156,7 +2160,12 @@ mod tests {
         }
 
         assert!(decoded.entries.iter().any(|e| e.hash == 0x10 && e.stage == ShaderStage::Vertex));
-        assert!(decoded.entries.iter().any(|e| e.hash == 0x20 && e.stage == ShaderStage::Fragment));
+        let ps_packed = decoded
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x20 && e.stage == ShaderStage::Fragment)
+            .expect("packed PS entry must exist");
+        assert!(ps_packed.wgsl.contains("fn fs_main("));
         assert!(decoded.entries.iter().any(|e| e.hash == cs_hash && e.stage == ShaderStage::Compute));
 
         // Verify inspect-pack and run_pack_rdna2 both succeed on the generated pack.

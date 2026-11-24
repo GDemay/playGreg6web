@@ -995,7 +995,7 @@ fn vopc_mnemonic(op: u8) -> String {
 fn vop2_info(op: u8) -> (String, bool) {
     // Returns (mnemonic, always_has_literal_word)
     match op {
-        0x01 => ("v_cndmask_b32".to_string(), false),
+        0x00 | 0x01 => ("v_cndmask_b32".to_string(), false),
         0x02 => ("v_dot2c_f32_f16".to_string(), false),
         0x03 => ("v_add_f32".to_string(), false),
         0x04 => ("v_sub_f32".to_string(), false),
@@ -1054,7 +1054,7 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x100..=0x13F => {
             let v2_op = (op - 0x100) as u8;
             let (name, _) = vop2_info(v2_op);
-            let srcs = if v2_op == 0x01 { 3 } else { 2 };
+            let srcs = if matches!(v2_op, 0x00 | 0x01) { 3 } else { 2 };
             let is_b = matches!(v2_op, 0x20..=0x22);
             (name, srcs, is_b)
         }
@@ -1801,7 +1801,7 @@ fn decode_vop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
                 format_src_operand(src0, None)
             )
         }
-    } else if op == 0x01 {
+    } else if matches!(op, 0x00 | 0x01) {
         // v_cndmask_b32 vdst, src0, vsrc1, vcc
         format!(
             "v{vdst}, {}, v{vsrc1}, vcc",
@@ -3854,5 +3854,21 @@ mod tests {
         assert_eq!(summary.trailing_bytes, 3);
         let _ = format_disasm(&fuzz_buf, Some(32));
         let _ = summary.to_json();
+    }
+
+    #[test]
+    fn decodes_v_cndmask_b32_gfx10_vop2_0x00_and_vop3_0x100_encodings() {
+        let mut words = Vec::new();
+        words.push(enc_vop2(0x00, 3, 256 + 1, 2)); // v_cndmask_b32 v3, v1, v2, vcc
+        words.extend_from_slice(&enc_vop3(0x100, 4, 256 + 1, 256 + 2, 10, false, 0, 0, 0)); // v_cndmask_b32 v4, v1, v2, s10
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 3);
+        assert_eq!(insts[0].mnemonic, "v_cndmask_b32");
+        assert_eq!(insts[0].format_text(), "v_cndmask_b32 v3, v1, v2, vcc");
+        assert_eq!(insts[1].mnemonic, "v_cndmask_b32");
+        assert_eq!(insts[1].format_text(), "v_cndmask_b32 v4, v1, v2, s10");
     }
 }
