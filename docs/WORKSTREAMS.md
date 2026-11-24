@@ -52,8 +52,18 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Prototype a second translation for one registered address range in the lifter's `guest_ptr` seam (per-64 KiB page table) with pool-backed window pages in the arena, and measure code-size and run-time cost.
 - [x] **R20 — Real-Binary Boot Bring-Up, Phase 2: Native Boot from Device Creation to the First Presented Frame** — `DONE` (PRs #297–#338, closes #296) *(continues R17; local game files only for local runs)*
   - Iterate the native boot past `D3D12XboxCreateDevice` until the title presents its first frame, fixing each blocker by cause with a synthetic regression test.
+- [x] **R21 — Multi-Module Program Wasm64 Build, Response-File Linking & Sample Estimator (`tools/build_guest_wasm.py`)** — `DONE` (PR #318, closes #308) *(no game files required — disjoint files `tools/build_guest_wasm.py`, `tests/test_build_guest_wasm.py`)*
+  - Teach `build_guest_wasm.py` to discover `program-manifest.json` multi-module R12 builds, pass large object lists via `@link_objects.rsp`, and add `--sample` / `--link-guest-boot`.
+- [x] **R22 — Emscripten 7 / LLVM 24 DataLayout Retargeting, `-msimd128` & Recursive `.pgim` Scan (`tools/build_guest_wasm.py`, `tools/verify_browser_boot.py`)** — `DONE` (PR #328, closes #322) *(no game files required)*
+  - Retarget lifted wasm64 LLVM IR DataLayout and enable `-msimd128` for Emscripten 7 / LLVM 24, and recursively scan `.pgim` artifacts in `verify_browser_boot.py`.
 - [ ] **R23 — Real-Binary Boot Bring-Up, Phase 3: Native Boot from the First Present to a Sustained Frame Loop** — `IN PROGRESS` (#341, @Timon-ok) *(continues R20; local game files only for local runs)*
   - Iterate the native boot past the first presented frames (audio HAL object, remaining command-list slots) to a sustained frame loop, and add a local frame capture of the recorded GPU command stream.
+- [x] **R24 — POSIX `@link_objects.rsp` Paths & Multi-Module `wasm_boot.cpp` Linking (`tools/build_guest_wasm.py`)** — `DONE` (PR #352, closes #344) *(no game files required)*
+  - Emit POSIX forward-slash paths inside `@link_objects.rsp` and link `runtime/wasm_boot.cpp` cleanly for multi-module browser builds.
+- [x] **R25 — `--strip`, `--opt Os/Oz`, Configurable Pthread Pool & V8 1 GiB Size Check (`tools/build_guest_wasm.py`)** — `DONE` (PR #372, closes #364) *(no game files required)*
+  - Add `--strip` (`-Wl,--strip-all`), `--opt Os/Oz`, `--pthread-pool-size`, `--extra-link-flag`, and a V8 1 GiB `.wasm` module size check to `build_guest_wasm.py`.
+- [x] **R26 — `--no-link-opt` & `--shrink-largest-shards` in `tools/build_guest_wasm.py`** — `DONE` (PR #381, closes #377) *(no game files required)*
+  - Add `--no-link-opt` to skip high-RAM `wasm-opt` during linking and `--shrink-largest-shards` to recompile the heaviest shards at `-Oz` to stay under browser `.wasm` size limits.
 
 ---
 
@@ -114,6 +124,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement and bind `Fls*`, `InitializeCriticalSectionEx`, `InitOnceExecuteOnce`, `EncodePointer`/`DecodePointer`, SList, `SwitchToThread`, `GetModuleHandleExW`, `RtlCaptureStackBackTrace`, `LCMapStringEx`/`CompareStringEx`/`GetLocaleInfoEx`/`GetStringTypeW`/`GetCPInfo`, `FindFirstFileExW`, `GetFileInformationByHandle`, `GetTempPathW` and the other Win32 imports of `vcruntime140`/`msvcp140` that have no shim.
 - [x] **O27 — XMem CPU/GPU Window Model: GPU Alias Registration & Address-Space Budget for the wasm64 Guest Pool (`runtime/os/xmem_windows.{h,cpp}`)** — `DONE` (PR #284, closes #278) *(driven by the real boot: multi-GiB `XMemVirtualAlloc` reservations after `D3D12ConfigureVirtualMemoryX`; the browser guest pool is 12 GiB)*
   - Model the title's CPU window and its GPU-visible alias (register the alias with the D3D12 layer, apply queue-side page mappings) and design how multi-GiB reservations fit the wasm64 guest pool, backed by measurements of what the title reserves and commits.
+- [x] **O28 — Multi-Module `PG6_BOOT_PROGRAM` HTTPFS Boot Support (`runtime/wasm_boot.{h,cpp}`)** — `DONE` (PR #359, closes #345) *(no game files required — disjoint files `runtime/wasm_boot.{h,cpp}`, `tests/test_wasm_boot.cpp`)*
+  - Load multi-module `PG6_BOOT_PROGRAM` bundles over HTTPFS inside `runtime/wasm_boot` with synthetic unit test coverage.
 - [ ] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `IN PROGRESS` (#373, @Timon-ok) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
   - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
 
@@ -176,6 +188,14 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Bridges raw RGBA8/YUV420p/ImageBitmap splash & Bink2 frames into `BinkVideoPresenter` (`W38`) and emits `FIRST_PRESENT` telemetry.
 - [x] **G27 — Xbox-Specific D3D12 Device & Queue Slots on the Startup Path (`runtime/gpu/d3d12_xs_xbox.{h,cpp}`)** — `DONE` (PRs #270 + #277, closes #262) *(no game files required for repo tests — follow-up to G24)*
   - Establish from call-site evidence and implement the Xbox-only device/queue/command-list methods the title's device initialisation and submission thread call (device slots 49, 61/62, 70, 78–80, 101; queue 23/24/31; list 131/132), and contribute the survey improvements used.
+- [x] **G28 — Wire `ShaderFallbackRouter` (`S12`) & Preloaded Shader/Reflection Init into `web/workers/wgpu_worker.js`** — `DONE` (PR #331, closes #323) *(no game files required — disjoint files `web/workers/wgpu_worker.js`, `tests/test_wgpu_worker_fallback.mjs`)*
+  - Connect `ShaderFallbackRouter` and preloaded `.wgsl.pack` / S6 reflection manifest initialization inside `wgpu_worker.js` so unresolved shaders degrade cleanly on Frame 1.
+- [x] **G29 — Live Frame-1 GPU & Missing-Shader Diagnostics Panel (`web/ui/gpu_boot_panel.js`)** — `DONE` (PR #339, closes #336) *(no game files required — disjoint files `web/ui/gpu_boot_panel.js`, `tests/test_gpu_boot_panel.mjs`)*
+  - Provide an interactive browser HUD panel displaying live Frame-1 GPU packet counts, draw/dispatch activity, and missing-shader fallback telemetry.
+- [x] **G30 — Emit Live Frame-1 GPU & Missing-Shader Telemetry Events from `web/workers/wgpu_worker.js`** — `DONE` (PR #357, closes #350) *(no game files required — disjoint files `web/workers/wgpu_worker.js`, `tests/test_wgpu_worker_telemetry.mjs`)*
+  - Stream periodic and milestone GPU frame/packet/missing-shader telemetry snapshots out of `wgpu_worker.js` to the loader and `GpuBootPanelController`.
+- [x] **G31 — Wrap `wgpu_worker` Packet Helpers in UMD IIFEs to Fix `importScripts` Global `const` Collisions** — `DONE` (PR #370, closes #360) *(no game files required — disjoint files `web/workers/texture_formats.js`, `web/workers/texture_packets.js`, `web/workers/render_state_packets.js`, `tests/test_wgpu_worker_importscripts.mjs`)*
+  - Encapsulate `wgpu_worker` helper modules in UMD IIFEs so classic worker `importScripts` never hits duplicate top-level `const` collisions (such as `TEXTURE_FORMAT_NAMES`).
 - [ ] **G32 — Identify the Pipeline Records Behind Xbox Device Slot 57 and Bind Their Graphics Pipelines in the D3D12 Guest Layer (`runtime/gpu/d3d12_xs*`)** — `IN PROGRESS` (#391, @Timon-ok) *(driven by the native boot's frame capture; repo tests synthetic)*
   - Work out what the fixed-size, non-DXIL pipeline records passed to device slot 57 are, create the right pipeline kind from them so the title's draws reach the command stream, and report what the shader track needs.
 
@@ -206,6 +226,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Extracts and structurally analyzes local DXIL/DXBC containers (`DXIL`, `PSV0`, `RTS0`, `ISG1`, `OSG1`, `ACCC`) into gitignored `work/shaders/dxil/` with sanitized manifest output.
 - [x] **S11 — Offline DXIL → SPIR-V → WGSL Conversion Harness & Coverage CLI (`tools/convert_dxil_corpus.py`)** — `DONE` (PR #231, closes #219) *(no game files required — disjoint files `tools/convert_dxil_corpus.py`, `tests/test_convert_dxil_corpus.py`)*
   - Drives `dxil-spirv` + `playgta6-shaders` in parallel over an extracted DXIL corpus (`S10`) with SHA-256 caching and structured failure classification.
+- [x] **S12 — WebGPU Missing-Shader Fallback Router & Frame-1 Shader Telemetry (`web/workers/shader_fallback_router.js`)** — `DONE` (PR #313, closes #310) *(no game files required — disjoint files `web/workers/shader_fallback_router.js`, `tests/test_shader_fallback_router.mjs`)*
+  - Routes unresolved VS/PS/CS shader hashes through `S9` fallback packs or built-in WGSL stubs and exports bounded missing-shader reports for early bring-up.
+- [x] **S13 — Pure-Rust DXBC/DXIL `RTS0`/`ISG1` → `S6` WebGPU `BindGroupLayout` Reflection Emitter (`shaders/src/dxil_reflect.rs`)** — `DONE` (PR #343, closes #335) *(no game files required — disjoint file `shaders/src/dxil_reflect.rs`)*
+  - Parses DXBC/DXIL `RTS0` (v1.0 & v1.1), `ISG1`/`OSG1`, and optional `PSV0` chunks into S6-compatible WebGPU `BindGroupLayout` JSON (groups 0..3) via `playgta6-shaders reflect-dxil`.
 
 ---
 
@@ -302,3 +326,39 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Coordinates `/api/status` discovery → `SplashOverlay` → `PgimPreloader` → `BootTracer` → `FIRST_PRESENT` cross-fade or Smoke Demo fallback.
 - [x] **W45 — Wire `SplashOverlay`, `BootOrchestrator`, `BootTracer` & `PgimPreloader` into `web/index.html` & `web/app_bootstrap.js`** — `DONE` (closes #301) *(no game files required)*
   - Mounts `#splash-overlay-root`, loads the UMD boot/splash modules in `web/index.html`, and connects `BootOrchestrator` + `SplashOverlayController` + `BootTracer` + `PgimPreloader` into `bootstrapPlayGta6App` with smooth `FIRST_PRESENT` cross-fade.
+- [x] **W46 — Browser HTTPFS Guest Program Loader & Boot Milestone Bridge (`runtime/wasm_boot.{h,cpp}`)** — `DONE` (PR #316, closes #307) *(no game files required — disjoint files `runtime/wasm_boot.{h,cpp}`, `tests/test_wasm_boot.cpp`)*
+  - Streams guest `PGIM` images through HTTPFS inside the wasm64 runtime and emits `BootTracer` milestones (`PGIM_LOAD` through entry).
+- [x] **W47 — Loader First Guest `Present` Detection, Shader Pack Forwarding & `/boot/` HTTPFS Routing (`web/loader.js`)** — `DONE` (PR #315, closes #309) *(no game files required — disjoint files `web/loader.js`, `tests/test_loader_boot_bridge.mjs`)*
+  - Fires `FIRST_PRESENT` once from `host_wgpu_submit` on ABI opcode `7`, forwards shader packs to `wgpu_worker`, and routes `/boot/` paths through HTTPFS.
+- [x] **W48 — End-to-End Browser Real-Boot Readiness Verifier CLI (`tools/verify_browser_boot.py`)** — `DONE` (PR #319, closes #312) *(no game files required — disjoint files `tools/verify_browser_boot.py`, `tests/test_verify_browser_boot.py`)*
+  - Verifies local browser real-boot prerequisites (`runtime.{js,wasm}`, `PGIM` bundles, shader packs, `/api/status`, COOP/COEP headers) with sanitized JSON reporting.
+- [x] **W49 — Wire `PG6_BOOT_LINKED_GUEST` Entrypoint & Forward Boot URLs to Loader (`runtime/main.cpp`, `web/app_bootstrap.js`)** — `DONE` (PR #327, closes #324) *(no game files required)*
+  - Wires the `PG6_BOOT_LINKED_GUEST` startup path in `runtime/main.cpp` and forwards discovered boot/shader/reflection URLs from `app_bootstrap.js` into `web/loader.js`.
+- [x] **W50 — Multi-Base HTTPFS Routing (`/boot/`, `/game/`, `/data/`) & Xbox Path Normalization (`web/workers/io_worker.js`)** — `DONE` (PR #340, closes #334) *(no game files required — disjoint files `web/workers/io_worker.js`, `tests/test_io_worker_boot_routing.mjs`)*
+  - Normalizes Xbox/Win32 drive and backslash paths in `io_worker.js` and routes requests across `/boot/`, `/game/`, and `/data/` HTTPFS bases.
+- [x] **W51 — Safe Local Browser Real-Boot Artifact Staging CLI (`tools/stage_browser_boot.py`)** — `DONE` (PR #342, closes #337) *(no game files required — disjoint files `tools/stage_browser_boot.py`, `tests/test_stage_browser_boot.py`)*
+  - Stages locally built wasm64 runtimes, `PGIM` modules, fallback shaders, and manifests into gitignored local folders for browser boot runs without touching tracked files.
+- [x] **W52 — Recursive Multi-Module `PGIM`, `programManifestUrl` & `gameBase` Discovery (`server/serve_local.py`)** — `DONE` (PR #356, closes #346) *(no game files required — disjoint files `server/serve_local.py`, `tests/test_serve_local_boot.py`)*
+  - Recursively discovers multi-module `PGIM` bundles and exposes `programManifestUrl` and `gameBase` in sanitized `/api/status` responses.
+- [x] **W53 — Forward `gameBase`/`programManifestUrl` & Bridge GPU/Missing-Shader Telemetry in `web/loader.js`** — `DONE` (PR #355, closes #347) *(no game files required — disjoint files `web/loader.js`, `tests/test_loader_boot_bridge.mjs`)*
+  - Passes `gameBase` and `programManifestUrl` into worker bootstrap and bridges live GPU and missing-shader telemetry messages from `wgpu_worker.js`.
+- [x] **W54 — Forward `gameBase`/`programManifestUrl` & Connect `GpuBootPanel` Telemetry in `web/app_bootstrap.js`** — `DONE` (PR #353, closes #348) *(no game files required — disjoint files `web/app_bootstrap.js`, `tests/test_app_bootstrap.mjs`)*
+  - Connects `GpuBootPanelController` to loader/worker GPU telemetry streams and forwards `gameBase`/`programManifestUrl` through `bootstrapPlayGta6App`.
+- [x] **W55 — Mount Live `GpuBootPanelController` (`G29`) in `web/index.html` & `web/ui/hud_controller.js`** — `DONE` (PR #354, closes #349) *(no game files required — disjoint files `web/index.html`, `web/ui/hud_controller.js`)*
+  - Mounts the Frame-1 GPU and missing-shader diagnostics panel into `web/index.html` and wires its controls and exports into `HudController`.
+- [x] **W56 — Multi-Module Boot Discovery (`programManifestUrl`/`gameBase`) & Explicit `bootMode` in `web/runtime/boot_orchestrator.js`** — `DONE` (PR #358, closes #351) *(no game files required — disjoint files `web/runtime/boot_orchestrator.js`, `tests/test_boot_orchestrator.mjs`)*
+  - Surfaces `programManifestUrl`/`gameBase` from `/api/status` and distinguishes explicit real-boot vs smoke-demo `bootMode` transitions in `BootOrchestrator`.
+- [x] **W57 — Pass `mainScriptUrlOrBlob` (`dist/runtime.js`) to Emscripten `createRuntimeModule` in `web/loader.js`** — `DONE` (PR #371, closes #361) *(no game files required — disjoint files `web/loader.js`, `tests/test_loader_boot_bridge.mjs`)*
+  - Supplies explicit `mainScriptUrlOrBlob` (`dist/runtime.js`) to Emscripten `createRuntimeModule` so pthread worker instantiation resolves the runtime script URL reliably.
+- [x] **W58 — Fix Wasm64 Detection (`address: 'i64'` + `index: 'i64'`) in `web/app_bootstrap.js`** — `DONE` (PR #368, closes #363) *(no game files required — disjoint files `web/app_bootstrap.js`, `tests/test_app_bootstrap.mjs`)*
+  - Probes both standard `address: 'i64'` and legacy `index: 'i64'` descriptors in `app_bootstrap.js` so Chromium/Edge Memory64 detection succeeds accurately.
+- [x] **W59 — Suppress Noisy Client-Disconnect Socket Tracebacks on Cancelled HTTP 206 Ranges (`server/serve_local.py`)** — `DONE` (PR #367, closes #365) *(no game files required — disjoint files `server/serve_local.py`, `tests/test_serve_local_boot.py`)*
+  - Handles `ConnectionResetError`/`BrokenPipeError`/`ConnectionAbortedError` cleanly when browsers cancel in-flight HTTP `206` Range requests.
+- [x] **W60 — Align Standalone `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/runtime/session_controller.js`** — `DONE` (PR #379, closes #376) *(no game files required — disjoint files `web/runtime/session_controller.js`, `tests/test_session_controller.mjs`)*
+  - Aligns `SessionController`'s standalone `detectWasm64` probe with `address: 'i64'` and `index: 'i64'` fallback matching `app_bootstrap.js`.
+- [x] **W61 — Wasm64 Boot Error Classification & Boot/GPU Snapshot Diagnostics in `web/telemetry/crash_report.js`** — `DONE` (PR #380, closes #378) *(no game files required — disjoint files `web/telemetry/crash_report.js`, `tests/test_crash_report.mjs`)*
+  - Classifies Wasm64 memory/module/pthread boot errors and embeds sanitized `BootTracer` and GPU/missing-shader snapshots into exported crash reports.
+- [x] **W62 — Bridge Emscripten 7.0.1 `em-pthread` Workers & `env.host_*` Imports in `web/loader.js`** — `DONE` (PR #386, closes #383) *(no game files required — disjoint files `web/loader.js`, `tests/test_loader_boot_bridge.mjs`)*
+  - Handles Emscripten 7.0.1 `em-pthread` worker bootstrap and forwards `env.host_*` host-import bindings across worker threads inside `web/loader.js`.
+- [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
+  - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
