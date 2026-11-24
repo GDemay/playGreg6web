@@ -141,7 +141,56 @@ const INDEX_FORMAT_NAMES = Object.freeze(['uint16', 'uint32']);
 const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
 
 const DEFAULT_MAX_VALIDATION_ERROR_HISTORY = 32;
+const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
+
+const OPCODE_NAMES = Object.freeze({
+  [OPCODES.NOP]: 'Nop',
+  [OPCODES.BEGIN_FRAME]: 'BeginFrame',
+  [OPCODES.CLEAR_COLOR]: 'ClearColor',
+  [OPCODES.CREATE_BUFFER]: 'CreateBuffer',
+  [OPCODES.WRITE_BUFFER]: 'WriteBuffer',
+  [OPCODES.CREATE_SHADER_MODULE]: 'CreateShaderModule',
+  [OPCODES.DRAW]: 'Draw',
+  [OPCODES.PRESENT]: 'Present',
+  [OPCODES.CREATE_RENDER_PIPELINE]: 'CreateRenderPipeline',
+  [OPCODES.SET_PIPELINE]: 'SetPipeline',
+  [OPCODES.SET_VERTEX_BUFFER]: 'SetVertexBuffer',
+  [OPCODES.DESTROY_RESOURCE]: 'DestroyResource',
+  [OPCODES.CREATE_TEXTURE]: 'CreateTexture',
+  [OPCODES.WRITE_TEXTURE]: 'WriteTexture',
+  [OPCODES.CREATE_SAMPLER]: 'CreateSampler',
+  [OPCODES.CREATE_BIND_GROUP]: 'CreateBindGroup',
+  [OPCODES.SET_BIND_GROUP]: 'SetBindGroup',
+  [OPCODES.SET_INDEX_BUFFER]: 'SetIndexBuffer',
+  [OPCODES.DRAW_INDEXED]: 'DrawIndexed',
+  [OPCODES.CREATE_COMPUTE_PIPELINE]: 'CreateComputePipeline',
+  [OPCODES.SET_COMPUTE_PIPELINE]: 'SetComputePipeline',
+  [OPCODES.DISPATCH_COMPUTE]: 'DispatchCompute',
+  [OPCODES.CREATE_BIND_GROUP_LAYOUT]: 'CreateBindGroupLayout',
+  [OPCODES.CREATE_PIPELINE_LAYOUT]: 'CreatePipelineLayout',
+  [OPCODES.CREATE_RENDER_PIPELINE2]: 'CreateRenderPipeline2',
+  [OPCODES.CREATE_COMPUTE_PIPELINE2]: 'CreateComputePipeline2',
+  [OPCODES.BEGIN_RENDER_PASS]: 'BeginRenderPass',
+  [OPCODES.END_RENDER_PASS]: 'EndRenderPass',
+  [OPCODES.SET_VIEWPORT]: 'SetViewport',
+  [OPCODES.SET_SCISSOR_RECT]: 'SetScissorRect',
+  [OPCODES.SET_BLEND_CONSTANT]: 'SetBlendConstant',
+  [OPCODES.SET_STENCIL_REFERENCE]: 'SetStencilReference',
+  [OPCODES.CREATE_BIND_GROUP2]: 'CreateBindGroup2',
+  [OPCODES.SET_BIND_GROUP2]: 'SetBindGroup2',
+  [OPCODES.CREATE_SAMPLER2]: 'CreateSampler2',
+  [OPCODES.CREATE_TEXTURE2]: 'CreateTexture2',
+});
+
+function wgslDeclaresGroup0(code) {
+  return typeof code === 'string' && code.length > 0 && WGSL_GROUP0_RE.test(code);
+}
+
+function opcodeLabel(opcode) {
+  return OPCODE_NAMES[opcode] || `Opcode(${opcode})`;
+}
 
 const FALLBACK_PROFILE = Object.freeze({
   DEFAULT: 'default',
@@ -1176,8 +1225,15 @@ class WgpuCommandProcessor {
     // Telemetry counters
     this._packetCount = 0;
     this._drawCallCount = 0;
+    this._realPackDrawCount = 0;
+    this._fallbackDrawCount = 0;
+    this._presentCount = 0;
+    this._unboundBindGroupCount = 0;
+    this._skippedDrawCount = 0;
     this._computeDispatchCount = 0;
     this._bytesProcessed = 0;
+    this._v2BindGroupLayouts = new Map();
+    this._v2PipelineLayouts = new Map();
 
     // Pending staging upload encoder & frame lifecycle tracking
     this._pendingEncoder = null;
@@ -1446,9 +1502,17 @@ class WgpuCommandProcessor {
       Number.isInteger(rawMaxErrHistory) && rawMaxErrHistory >= 1
         ? rawMaxErrHistory
         : DEFAULT_MAX_VALIDATION_ERROR_HISTORY;
+    const rawMaxErrPosts = options.maxValidationErrorPosts;
+    this._maxValidationErrorPosts =
+      Number.isInteger(rawMaxErrPosts) && rawMaxErrPosts >= 1
+        ? rawMaxErrPosts
+        : DEFAULT_MAX_VALIDATION_ERROR_POSTS;
     this._validationErrors = [];
     this._validationErrorCount = 0;
     this._validationErrorSeq = 0;
+    this._validationErrorPostedCount = 0;
+    this._validationErrorSuppressedCount = 0;
+    this._validationErrorDedup = new Map();
     this._validationErrorCallbacks = new Set();
     if (typeof options.onValidationError === 'function') {
       this._validationErrorCallbacks.add(options.onValidationError);
@@ -1482,6 +1546,26 @@ class WgpuCommandProcessor {
 
   get framesPresented() {
     return this.frameCount;
+  }
+
+  get presentCount() {
+    return this._presentCount;
+  }
+
+  get realPackDrawCount() {
+    return this._realPackDrawCount;
+  }
+
+  get fallbackDrawCount() {
+    return this._fallbackDrawCount;
+  }
+
+  get unboundBindGroupCount() {
+    return this._unboundBindGroupCount;
+  }
+
+  get skippedDrawCount() {
+    return this._skippedDrawCount;
   }
 
   get swapchain() {
@@ -1537,10 +1621,13 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * Clear the bounded validation error history ring (monotonic counter stays intact).
+   * Clear the bounded validation error history ring and deduplication table
+   * (monotonic counter stays intact).
    */
   clearValidationErrors() {
     this._validationErrors.length = 0;
+    this._validationErrorDedup.clear();
+    this._validationErrorPostedCount = 0;
   }
 
   _unhookDeviceUncapturedError() {
@@ -1749,8 +1836,25 @@ class WgpuCommandProcessor {
       timestampMs = typeof nowVal === 'number' && Number.isFinite(nowVal) ? nowVal : Date.now();
     }
 
-    this._validationErrorSeq += 1;
     this._validationErrorCount += 1;
+
+    const dedupKey = `${type}|${message}`;
+    const existingDedup = this._validationErrorDedup.get(dedupKey);
+    if (existingDedup) {
+      existingDedup.count += 1;
+      this._validationErrorSuppressedCount += 1;
+      return null;
+    }
+
+    if (this._validationErrorPostedCount >= this._maxValidationErrorPosts) {
+      this._validationErrorDedup.set(dedupKey, { count: 1, seq: 0, capped: true });
+      this._validationErrorSuppressedCount += 1;
+      return null;
+    }
+
+    this._validationErrorSeq += 1;
+    this._validationErrorPostedCount += 1;
+    this._validationErrorDedup.set(dedupKey, { count: 1, seq: this._validationErrorSeq });
 
     const record = {
       seq: this._validationErrorSeq,
@@ -1774,6 +1878,47 @@ class WgpuCommandProcessor {
     }
 
     return { ...record };
+  }
+
+  _recordOpValidationError(operation, errOrMessage, errorType = 'validation') {
+    if (this._destroyed) {
+      return null;
+    }
+    const opPrefix = typeof operation === 'string' && operation.length > 0 ? operation : 'WebGPU';
+    let detail;
+    if (errOrMessage && typeof errOrMessage === 'object' && typeof errOrMessage.message === 'string') {
+      detail = errOrMessage.message;
+    } else if (typeof errOrMessage === 'string') {
+      detail = errOrMessage;
+    } else if (errOrMessage !== null && errOrMessage !== undefined) {
+      detail = String(errOrMessage);
+    } else {
+      detail = 'operation failed';
+    }
+    const trimmed = detail.trim();
+    const message =
+      trimmed.length === 0
+        ? `${opPrefix}: operation failed`
+        : trimmed.toLowerCase().startsWith(`${opPrefix.toLowerCase()}:`)
+          ? trimmed
+          : `${opPrefix}: ${trimmed}`;
+    return this._recordValidationError({
+      error: {
+        type: errorType,
+        message,
+      },
+    });
+  }
+
+  _getRenderStateExtension() {
+    let ext = this.extension;
+    while (ext) {
+      if (ext.bindGroupLayouts instanceof Map && ext.pipelineLayouts instanceof Map) {
+        return ext;
+      }
+      ext = ext.next || null;
+    }
+    return null;
   }
 
   /**
@@ -3290,7 +3435,13 @@ class WgpuCommandProcessor {
     const id = view.getUint32(payloadOffset, true);
     const stage = view.getUint32(payloadOffset + 4, true);
     const codeLen = view.getUint32(payloadOffset + 8, true);
-    if (16 + codeLen > payloadBytes) return;
+    if (16 + codeLen > payloadBytes) {
+      this._recordOpValidationError(
+        'CreateShaderModule',
+        `shader ${id}: truncated payload (${payloadBytes}B < ${16 + codeLen}B)`
+      );
+      return;
+    }
 
     const rawBytes = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, codeLen);
     const isShared = typeof SharedArrayBuffer !== 'undefined' && view.buffer instanceof SharedArrayBuffer;
@@ -3376,7 +3527,47 @@ class WgpuCommandProcessor {
       resolvedHash = hashHex;
     }
 
-    const module = this.device.createShaderModule({ code });
+    const allowDirectThrowOnEmpty =
+      this.shaderFallbackRouter === null &&
+      !this._captureValidationErrors &&
+      this._validationErrorCallbacks.size === 0 &&
+      trimmed.length === 0;
+    let module;
+    if (allowDirectThrowOnEmpty) {
+      module = this.device.createShaderModule({ code });
+    } else {
+      try {
+        module = this.device.createShaderModule({ code });
+      } catch (err) {
+        this._recordOpValidationError('CreateShaderModule', err);
+        return;
+      }
+    }
+    if (module && typeof module.getCompilationInfo === 'function') {
+      try {
+        Promise.resolve(module.getCompilationInfo()).then(
+          (info) => {
+            if (this._destroyed || !info || !Array.isArray(info.messages)) {
+              return;
+            }
+            for (let i = 0; i < info.messages.length; i += 1) {
+              const m = info.messages[i];
+              if (m && m.type === 'error') {
+                const loc =
+                  typeof m.lineNum === 'number' && m.lineNum > 0 ? ` (line ${m.lineNum})` : '';
+                this._recordOpValidationError(
+                  'CreateShaderModule',
+                  `shader ${id}${loc}: ${m.message || 'WGSL compilation error'}`
+                );
+              }
+            }
+          },
+          () => {}
+        );
+      } catch (_) {
+        // Non-fatal: ignore compilation info inspection errors on mock devices.
+      }
+    }
     this.shaderModules.set(id, {
       module,
       stage,
@@ -3409,11 +3600,34 @@ class WgpuCommandProcessor {
     // Reserved pipeline flags at payloadOffset + 20 for future blend/depth state.
 
     const vsEntry = this.shaderModules.get(vsShaderId);
-    if (!vsEntry) return;
+    if (!vsEntry) {
+      this._recordOpValidationError(
+        'CreateRenderPipeline',
+        `pipeline ${id}: unknown vertex shader module ${vsShaderId}`
+      );
+      return;
+    }
     const fsEntry = fsShaderId !== 0 ? this.shaderModules.get(fsShaderId) : null;
+    if (fsShaderId !== 0 && !fsEntry) {
+      this._recordOpValidationError(
+        'CreateRenderPipeline',
+        `pipeline ${id}: unknown fragment shader module ${fsShaderId}`
+      );
+      return;
+    }
 
     const isFallback = Boolean(
       (vsEntry && vsEntry.source === 'builtin') || (fsEntry && fsEntry.source === 'builtin')
+    );
+    const usesFallbackShader = Boolean(
+      (vsEntry && (vsEntry.source === 'builtin' || vsEntry.source === 'fallback')) ||
+        (fsEntry && (fsEntry.source === 'builtin' || fsEntry.source === 'fallback'))
+    );
+    const isRealPack = Boolean(
+      vsEntry && vsEntry.source === 'pack' && (fsShaderId === 0 || (fsEntry && fsEntry.source === 'pack'))
+    );
+    const expectsGroup0 = Boolean(
+      wgslDeclaresGroup0(vsEntry && vsEntry.code) || wgslDeclaresGroup0(fsEntry && fsEntry.code)
     );
     const effectiveFallbackProfile =
       vsEntry && vsEntry.fallbackProfile && vsEntry.fallbackProfile !== FALLBACK_PROFILE.DEFAULT
@@ -3509,7 +3723,13 @@ class WgpuCommandProcessor {
       };
     }
 
-    const pipeline = this.device.createRenderPipeline(descriptor);
+    let pipeline;
+    try {
+      pipeline = this.device.createRenderPipeline(descriptor);
+    } catch (err) {
+      this._recordOpValidationError('CreateRenderPipeline', err);
+      return;
+    }
     this.pipelines.set(id, pipeline);
     this._pipelineMeta.set(id, {
       id,
@@ -3517,8 +3737,12 @@ class WgpuCommandProcessor {
       fsShaderId,
       vertexStride,
       topology,
+      isV2: false,
       hasReflectedLayout: Boolean(reflected),
+      isRealPack,
       isFallback,
+      usesFallbackShader,
+      expectsGroup0,
       fallbackProfile: effectiveFallbackProfile,
     });
     this._invalidateSpecializedPipelinesFor(id);
@@ -3732,24 +3956,55 @@ class WgpuCommandProcessor {
     const pipelineId = view.getUint32(payloadOffset + 4, true);
     const groupIndex = view.getUint32(payloadOffset + 8, true);
     const entryCount = view.getUint32(payloadOffset + 12, true);
-    if (16 + entryCount * 32 > payloadBytes) return;
+    if (16 + entryCount * 32 > payloadBytes) {
+      this._recordOpValidationError(
+        'CreateBindGroup',
+        `bind group ${id}: truncated payload (${payloadBytes}B < ${16 + entryCount * 32}B)`
+      );
+      return;
+    }
 
     const renderPipeline = this.pipelines.get(pipelineId);
     const computePipeline = this.computePipelines.get(pipelineId);
     const pipeline = renderPipeline || computePipeline;
     const pipeMeta = this._pipelineMeta.get(pipelineId) || null;
-    if (!pipeline) return;
+    const renderStateExt = this._getRenderStateExtension();
 
     let layout = null;
-    if (pipeMeta && pipeMeta.isFallback) {
+    if (!pipeline) {
+      const bglRec =
+        renderStateExt && renderStateExt.bindGroupLayouts
+          ? renderStateExt.bindGroupLayouts.get(pipelineId)
+          : null;
+      if (bglRec && bglRec.layout) {
+        layout = bglRec.layout;
+      } else {
+        this._recordOpValidationError(
+          'CreateBindGroup',
+          `bind group ${id}: unknown pipeline or bind group layout ${pipelineId}`
+        );
+        return;
+      }
+    } else if (pipeMeta && pipeMeta.isFallback) {
       try {
         layout = this.getBindGroupLayout(pipelineId, groupIndex);
       } catch (_) {
         layout = null;
       }
     } else {
-      layout = this.getBindGroupLayout(pipelineId, groupIndex);
-      if (!layout) return;
+      try {
+        layout = this.getBindGroupLayout(pipelineId, groupIndex);
+      } catch (err) {
+        this._recordOpValidationError('CreateBindGroup', err);
+        return;
+      }
+      if (!layout) {
+        this._recordOpValidationError(
+          'CreateBindGroup',
+          `bind group ${id}: pipeline ${pipelineId} has no bind group layout for @group(${groupIndex})`
+        );
+        return;
+      }
     }
 
     const entries = [];
@@ -3766,7 +4021,13 @@ class WgpuCommandProcessor {
 
       if (resourceType === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.buffers.get(resourceId);
-        if (!buffer) return;
+        if (!buffer) {
+          this._recordOpValidationError(
+            'CreateBindGroup',
+            `bind group ${id}: binding ${binding} unknown buffer ${resourceId}`
+          );
+          return;
+        }
         const resource = { buffer, offset };
         if (size > 0) {
           resource.size = size;
@@ -3788,15 +4049,31 @@ class WgpuCommandProcessor {
             }
           }
         }
-        if (!textureView) return;
+        if (!textureView) {
+          this._recordOpValidationError(
+            'CreateBindGroup',
+            `bind group ${id}: binding ${binding} unknown texture ${resourceId}`
+          );
+          return;
+        }
         hasTexture = true;
         entries.push({ binding, resource: textureView });
       } else if (resourceType === BIND_RESOURCE_TYPE.SAMPLER) {
         const sampler = this.samplers.get(resourceId);
-        if (!sampler) return;
+        if (!sampler) {
+          this._recordOpValidationError(
+            'CreateBindGroup',
+            `bind group ${id}: binding ${binding} unknown sampler ${resourceId}`
+          );
+          return;
+        }
         hasSampler = true;
         entries.push({ binding, resource: sampler });
       } else {
+        this._recordOpValidationError(
+          'CreateBindGroup',
+          `bind group ${id}: binding ${binding} invalid resourceType ${resourceType}`
+        );
         return;
       }
     }
@@ -3816,10 +4093,16 @@ class WgpuCommandProcessor {
       return;
     }
 
-    const bindGroup = this.device.createBindGroup({
-      layout,
-      entries,
-    });
+    let bindGroup;
+    try {
+      bindGroup = this.device.createBindGroup({
+        layout,
+        entries,
+      });
+    } catch (err) {
+      this._recordOpValidationError('CreateBindGroup', err);
+      return;
+    }
     this.bindGroups.set(id, bindGroup);
     this._bindGroupKinds.set(id, computePipeline && !renderPipeline ? 'compute' : 'render');
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
@@ -3827,6 +4110,235 @@ class WgpuCommandProcessor {
         byteSize: 0,
         label: `bindGroup:${id}`,
       });
+    }
+  }
+
+  _dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes) {
+    if (!this.extension || typeof this.extension.handlePacket !== 'function') {
+      return;
+    }
+    const renderStateExt = this._getRenderStateExtension();
+    const prevRsErrors =
+      renderStateExt && renderStateExt.stats && typeof renderStateExt.stats.errors === 'number'
+        ? renderStateExt.stats.errors
+        : 0;
+    const prevExtErrors =
+      this.extension.stats && typeof this.extension.stats.errors === 'number'
+        ? this.extension.stats.errors
+        : 0;
+    const prevCmdLen = this._passCommands.length;
+
+    let handled = false;
+    try {
+      handled = Boolean(this.extension.handlePacket(opcode, view, payloadOffset, payloadBytes));
+    } catch (err) {
+      this._recordOpValidationError(opcodeLabel(opcode), err);
+      return;
+    }
+
+    if (
+      renderStateExt &&
+      renderStateExt.stats &&
+      typeof renderStateExt.stats.errors === 'number' &&
+      renderStateExt.stats.errors > prevRsErrors
+    ) {
+      this._recordOpValidationError(
+        opcodeLabel(opcode),
+        renderStateExt.lastError || 'malformed or invalid ABI v2 packet'
+      );
+      return;
+    }
+
+    if (
+      this.extension !== renderStateExt &&
+      this.extension.stats &&
+      typeof this.extension.stats.errors === 'number' &&
+      this.extension.stats.errors > prevExtErrors
+    ) {
+      this._recordOpValidationError(
+        opcodeLabel(opcode),
+        this.extension.lastError || 'malformed or invalid extension packet'
+      );
+      return;
+    }
+
+    if (!handled) {
+      return;
+    }
+
+    switch (opcode) {
+      case OPCODES.CREATE_BIND_GROUP_LAYOUT: {
+        if (payloadBytes >= 24) {
+          const id = view.getUint32(payloadOffset, true);
+          const count = view.getUint32(payloadOffset + 4, true);
+          const flags = view.getUint32(payloadOffset + 8, true);
+          this._v2BindGroupLayouts.set(id, {
+            id,
+            entryCount: count,
+            isManifestRef: (flags & 0x1) !== 0,
+          });
+        }
+        break;
+      }
+      case OPCODES.CREATE_PIPELINE_LAYOUT: {
+        if (payloadBytes >= 24) {
+          const id = view.getUint32(payloadOffset, true);
+          const count = view.getUint32(payloadOffset + 4, true);
+          const flags = view.getUint32(payloadOffset + 8, true);
+          const isManifestRef = (flags & 0x1) !== 0;
+          let groupLayoutIds = null;
+          if (!isManifestRef && 24 + count * 4 <= payloadBytes) {
+            groupLayoutIds = [];
+            for (let g = 0; g < count; g += 1) {
+              groupLayoutIds.push(view.getUint32(payloadOffset + 24 + g * 4, true));
+            }
+          }
+          this._v2PipelineLayouts.set(id, { id, groupLayoutIds, isManifestRef });
+        }
+        break;
+      }
+      case OPCODES.CREATE_RENDER_PIPELINE2: {
+        if (payloadBytes >= 16 + 376) {
+          const id = view.getUint32(payloadOffset, true);
+          const vsShaderId = view.getUint32(payloadOffset + 4, true);
+          const fsShaderId = view.getUint32(payloadOffset + 8, true);
+          const layoutId = view.getUint32(payloadOffset + 12, true);
+          const vsEntry = this.shaderModules.get(vsShaderId) || null;
+          const fsEntry = fsShaderId !== 0 ? this.shaderModules.get(fsShaderId) || null : null;
+
+          const isFallback = Boolean(
+            (vsEntry && vsEntry.source === 'builtin') || (fsEntry && fsEntry.source === 'builtin')
+          );
+          const usesFallbackShader = Boolean(
+            (vsEntry && (vsEntry.source === 'builtin' || vsEntry.source === 'fallback')) ||
+              (fsEntry && (fsEntry.source === 'builtin' || fsEntry.source === 'fallback'))
+          );
+          const isRealPack = Boolean(
+            vsEntry &&
+              vsEntry.source === 'pack' &&
+              (fsShaderId === 0 || (fsEntry && fsEntry.source === 'pack'))
+          );
+          const effectiveFallbackProfile =
+            vsEntry && vsEntry.fallbackProfile && vsEntry.fallbackProfile !== FALLBACK_PROFILE.DEFAULT
+              ? vsEntry.fallbackProfile
+              : fsEntry && fsEntry.fallbackProfile && fsEntry.fallbackProfile !== FALLBACK_PROFILE.DEFAULT
+                ? fsEntry.fallbackProfile
+                : isFallback
+                  ? FALLBACK_PROFILE.DEFAULT
+                  : null;
+
+          let expectsGroup0 = Boolean(
+            wgslDeclaresGroup0(vsEntry && vsEntry.code) || wgslDeclaresGroup0(fsEntry && fsEntry.code)
+          );
+          if (layoutId !== 0) {
+            const plMeta = this._v2PipelineLayouts.get(layoutId) || null;
+            if (plMeta && Array.isArray(plMeta.groupLayoutIds)) {
+              const resolvedBgls = plMeta.groupLayoutIds.map((bglId) => {
+                if (bglId === 0 || !renderStateExt) return null;
+                const rec = renderStateExt.bindGroupLayouts.get(bglId);
+                return rec ? rec.layout : null;
+              });
+              this._pipelineBindGroupLayouts.set(id, resolvedBgls);
+              const group0BglId = plMeta.groupLayoutIds.length > 0 ? plMeta.groupLayoutIds[0] : 0;
+              if (group0BglId !== 0) {
+                const bglMeta = this._v2BindGroupLayouts.get(group0BglId) || null;
+                const extBgl = renderStateExt
+                  ? renderStateExt.bindGroupLayouts.get(group0BglId)
+                  : null;
+                if (
+                  (bglMeta && (bglMeta.entryCount > 0 || bglMeta.isManifestRef)) ||
+                  (extBgl && Array.isArray(extBgl.entries) && extBgl.entries.length > 0)
+                ) {
+                  expectsGroup0 = true;
+                }
+              }
+            }
+          } else {
+            this._pipelineBindGroupLayouts.delete(id);
+          }
+
+          const keyBase = payloadOffset + 16;
+          const bufferCount = Math.min(view.getUint32(keyBase + 172, true), 8);
+          const vertexStride = bufferCount > 0 ? view.getUint32(keyBase + 180, true) : 0;
+
+          this._pipelineMeta.set(id, {
+            id,
+            vsShaderId,
+            fsShaderId,
+            layoutId,
+            vertexStride,
+            topology: 'triangle-list',
+            isV2: true,
+            hasReflectedLayout: layoutId !== 0,
+            isRealPack,
+            isFallback,
+            usesFallbackShader,
+            expectsGroup0,
+            fallbackProfile: effectiveFallbackProfile,
+          });
+          this._invalidateSpecializedPipelinesFor(id);
+        }
+        break;
+      }
+      case OPCODES.CREATE_BIND_GROUP2: {
+        if (payloadBytes >= 16) {
+          const id = view.getUint32(payloadOffset, true);
+          const layoutId = view.getUint32(payloadOffset + 4, true);
+          const count = view.getUint32(payloadOffset + 8, true);
+          let hasCbv = false;
+          let hasTexture = false;
+          let hasSampler = false;
+          if (16 + count * 48 <= payloadBytes) {
+            for (let i = 0; i < count; i += 1) {
+              const entryType = view.getUint32(payloadOffset + 16 + i * 48 + 4, true);
+              if (entryType === BIND_RESOURCE_TYPE.BUFFER) hasCbv = true;
+              else if (entryType === BIND_RESOURCE_TYPE.TEXTURE_VIEW) hasTexture = true;
+              else if (entryType === BIND_RESOURCE_TYPE.SAMPLER) hasSampler = true;
+            }
+          }
+          this._bindGroupMeta.set(id, {
+            id,
+            pipelineId: 0,
+            layoutId,
+            isV2: true,
+            groupIndex: 0,
+            hasCbv,
+            hasTexture,
+            hasSampler,
+            entries: null,
+          });
+          this._invalidateSpecializedBindGroupsFor(id);
+        }
+        break;
+      }
+      case OPCODES.SET_BIND_GROUP2: {
+        if (payloadBytes >= 16 && this._passCommands.length > prevCmdLen) {
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
+            kind: 'setBindGroup2',
+            groupIndex: view.getUint32(payloadOffset, true),
+            bindGroupId: view.getUint32(payloadOffset + 4, true),
+          };
+        }
+        break;
+      }
+      case OPCODES.BEGIN_RENDER_PASS: {
+        if (this._passCommands.length > prevCmdLen) {
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
+            kind: 'beginRenderPass',
+          };
+        }
+        break;
+      }
+      case OPCODES.END_RENDER_PASS: {
+        if (this._passCommands.length > prevCmdLen) {
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
+            kind: 'endRenderPass',
+          };
+        }
+        break;
+      }
+      default:
+        break;
     }
   }
 
@@ -3841,6 +4353,8 @@ class WgpuCommandProcessor {
     this.bindGroups.delete(id);
     this._bindGroupKinds.delete(id);
     this._bindGroupMeta.delete(id);
+    this._v2BindGroupLayouts.delete(id);
+    this._v2PipelineLayouts.delete(id);
     this._invalidateSpecializedBindGroupsFor(id);
     this.shaderModules.delete(id);
     this.pipelines.delete(id);
@@ -3858,7 +4372,11 @@ class WgpuCommandProcessor {
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
 
-    const swapchainView = this.ctx.getCurrentTexture().createView();
+    const swapchainTexture = this.ctx.getCurrentTexture();
+    const swapchainView =
+      swapchainTexture && typeof swapchainTexture.createView === 'function'
+        ? swapchainTexture.createView()
+        : swapchainTexture;
     let activePass = null;
     let activePassKind = null;
     let renderPassOpened = false;
@@ -3867,11 +4385,28 @@ class WgpuCommandProcessor {
 
     const timerSupported = Boolean(this.passTimer && this.passTimer.supported);
 
+    let activePipelineId = null;
+    let specializedActiveKey = null;
+    const boundBindGroups = new Map();
+    const boundVertexBuffers = new Map();
+
+    const clearPassBindings = () => {
+      activePipelineId = null;
+      specializedActiveKey = null;
+      boundBindGroups.clear();
+      boundVertexBuffers.clear();
+    };
+
     const endActivePass = () => {
       if (activePass) {
-        activePass.end();
+        try {
+          activePass.end();
+        } catch (err) {
+          this._recordOpValidationError('EndRenderPass', err);
+        }
         activePass = null;
         activePassKind = null;
+        clearPassBindings();
       }
     };
 
@@ -3921,7 +4456,10 @@ class WgpuCommandProcessor {
 
     // Pass access for queued extension commands ({ type, run(passControl) }).
     const passControl = {
+      swapchainTexture,
       swapchainView,
+      canvasWidth: this._viewportWidth > 0 ? this._viewportWidth : undefined,
+      canvasHeight: this._viewportHeight > 0 ? this._viewportHeight : undefined,
       get pass() { return activePass; },
       get passKind() { return activePassKind; },
       endPass: endActivePass,
@@ -3938,11 +4476,6 @@ class WgpuCommandProcessor {
         return activePass;
       },
     };
-
-    let activePipelineId = null;
-    let specializedActiveKey = null;
-    const boundBindGroups = new Map();
-    const boundVertexBuffers = new Map();
 
     const maybeSpecializeFallbackPipeline = (pass, vertexCount, instanceCount) => {
       if (activePipelineId === null || !this.shaderFallbackRouter) {
@@ -3983,10 +4516,58 @@ class WgpuCommandProcessor {
             );
             if (specBg) {
               pass.setBindGroup(groupIndex, specBg);
+              boundBg.bindGroup = specBg;
             }
           }
         }
         specializedActiveKey = key;
+      }
+    };
+
+    const executeRenderDraw = (drawOpName, count, instanceCount, invokeDraw) => {
+      const pass = ensureRenderPass();
+      maybeSpecializeFallbackPipeline(pass, count, instanceCount);
+      const pipeMeta =
+        activePipelineId !== null ? this._pipelineMeta.get(activePipelineId) || null : null;
+      const activePipeline =
+        activePipelineId !== null ? this.pipelines.get(activePipelineId) || null : null;
+      if (activePipelineId !== null && !activePipeline && specializedActiveKey === null) {
+        this._skippedDrawCount += 1;
+        this._recordOpValidationError(
+          drawOpName,
+          `skipped draw: render pipeline ${activePipelineId} is unavailable`
+        );
+        return;
+      }
+      const group0Entry = boundBindGroups.get(0);
+      const hasLiveGroup0 = Boolean(group0Entry && group0Entry.bindGroup);
+      if (pipeMeta && pipeMeta.expectsGroup0 && !hasLiveGroup0) {
+        this._unboundBindGroupCount += 1;
+        this._skippedDrawCount += 1;
+        this._recordOpValidationError(
+          drawOpName,
+          `skipped draw on pipeline ${activePipelineId}: expected @group(0) bind group is not bound`
+        );
+        return;
+      }
+      try {
+        invokeDraw(pass);
+      } catch (err) {
+        this._skippedDrawCount += 1;
+        if (/\b(?:group|bind\s*group)\b/i.test(String(err))) {
+          this._unboundBindGroupCount += 1;
+        }
+        this._recordOpValidationError(drawOpName, err);
+        return;
+      }
+      this._drawCallCount += 1;
+      if (pipeMeta && pipeMeta.isRealPack && specializedActiveKey === null) {
+        this._realPackDrawCount += 1;
+      } else if (
+        (pipeMeta && (pipeMeta.isFallback || pipeMeta.usesFallbackShader)) ||
+        specializedActiveKey !== null
+      ) {
+        this._fallbackDrawCount += 1;
       }
     };
 
@@ -3996,9 +4577,18 @@ class WgpuCommandProcessor {
           const pass = ensureRenderPass();
           activePipelineId = cmd.pipelineId;
           specializedActiveKey = null;
-          const pipeline = this.pipelines.get(cmd.pipelineId);
+          const pipeline = this.pipelines.get(cmd.pipelineId) || cmd.pipeline || null;
           if (pipeline) {
-            pass.setPipeline(pipeline);
+            try {
+              pass.setPipeline(pipeline);
+            } catch (err) {
+              this._recordOpValidationError('SetPipeline', err);
+            }
+          } else {
+            this._recordOpValidationError(
+              'SetPipeline',
+              `render pipeline ${cmd.pipelineId} not found`
+            );
           }
           break;
         }
@@ -4017,7 +4607,11 @@ class WgpuCommandProcessor {
                     ? buffer.arrayStride
                     : undefined,
             });
-            pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
+            try {
+              pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
+            } catch (err) {
+              this._recordOpValidationError('SetVertexBuffer', err);
+            }
           }
           break;
         }
@@ -4025,12 +4619,16 @@ class WgpuCommandProcessor {
           const pass = ensureRenderPass();
           const buffer = this.buffers.get(cmd.bufferId);
           if (buffer) {
-            pass.setIndexBuffer(buffer, cmd.indexFormat, cmd.offset);
+            try {
+              pass.setIndexBuffer(buffer, cmd.indexFormat, cmd.offset);
+            } catch (err) {
+              this._recordOpValidationError('SetIndexBuffer', err);
+            }
           }
           break;
         }
         case 'setBindGroup': {
-          const bindGroup = this.bindGroups.get(cmd.bindGroupId);
+          const bindGroup = this.bindGroups.get(cmd.bindGroupId) || cmd.bindGroup || null;
           const bgMeta = this._bindGroupMeta.get(cmd.bindGroupId) || null;
           if (bindGroup || bgMeta) {
             boundBindGroups.set(cmd.groupIndex, {
@@ -4043,6 +4641,11 @@ class WgpuCommandProcessor {
               entries: bgMeta ? bgMeta.entries : null,
               desc: bindGroup && bindGroup.desc ? bindGroup.desc : null,
             });
+          } else {
+            this._recordOpValidationError(
+              'SetBindGroup',
+              `bind group ${cmd.bindGroupId} not found for @group(${cmd.groupIndex})`
+            );
           }
           if (bindGroup) {
             const pass =
@@ -4050,46 +4653,80 @@ class WgpuCommandProcessor {
               (this._bindGroupKinds.get(cmd.bindGroupId) === 'compute'
                 ? ensureComputePass()
                 : ensureRenderPass());
-            pass.setBindGroup(cmd.groupIndex, bindGroup);
+            try {
+              pass.setBindGroup(cmd.groupIndex, bindGroup);
+            } catch (err) {
+              this._recordOpValidationError('SetBindGroup', err);
+            }
           }
           break;
         }
         case 'draw': {
-          const pass = ensureRenderPass();
-          maybeSpecializeFallbackPipeline(pass, cmd.vertexCount, cmd.instanceCount);
-          pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
-          this._drawCallCount += 1;
+          executeRenderDraw('Draw', cmd.vertexCount, cmd.instanceCount, (pass) => {
+            pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
+          });
           break;
         }
         case 'drawIndexed': {
-          const pass = ensureRenderPass();
-          maybeSpecializeFallbackPipeline(pass, cmd.indexCount, cmd.instanceCount);
-          pass.drawIndexed(
-            cmd.indexCount,
-            cmd.instanceCount,
-            cmd.firstIndex,
-            cmd.baseVertex,
-            cmd.firstInstance
-          );
-          this._drawCallCount += 1;
+          executeRenderDraw('DrawIndexed', cmd.indexCount, cmd.instanceCount, (pass) => {
+            pass.drawIndexed(
+              cmd.indexCount,
+              cmd.instanceCount,
+              cmd.firstIndex,
+              cmd.baseVertex,
+              cmd.firstInstance
+            );
+          });
           break;
         }
         case 'setComputePipeline': {
           const pass = ensureComputePass();
           const pipeline = this.computePipelines.get(cmd.pipelineId);
           if (pipeline) {
-            pass.setPipeline(pipeline);
+            try {
+              pass.setPipeline(pipeline);
+            } catch (err) {
+              this._recordOpValidationError('SetComputePipeline', err);
+            }
           }
           break;
         }
         case 'dispatchCompute': {
           const pass = ensureComputePass();
-          pass.dispatchWorkgroups(cmd.workgroupX, cmd.workgroupY, cmd.workgroupZ);
-          this._computeDispatchCount += 1;
+          try {
+            pass.dispatchWorkgroups(cmd.workgroupX, cmd.workgroupY, cmd.workgroupZ);
+            this._computeDispatchCount += 1;
+          } catch (err) {
+            this._recordOpValidationError('DispatchCompute', err);
+          }
           break;
         }
         default:
-          if (typeof cmd.run === 'function') cmd.run(passControl);
+          if (typeof cmd.run === 'function') {
+            const meta = cmd._wgpuMeta || null;
+            try {
+              cmd.run(passControl);
+              if (meta && meta.kind === 'setBindGroup2' && activePass) {
+                const bg = this.bindGroups.get(meta.bindGroupId) || null;
+                const bgMeta = this._bindGroupMeta.get(meta.bindGroupId) || null;
+                boundBindGroups.set(meta.groupIndex, {
+                  bindGroupId: meta.bindGroupId,
+                  bindGroup: bg || { bound: true },
+                  meta: bgMeta,
+                  hasCbv: Boolean(bgMeta && bgMeta.hasCbv),
+                  hasTexture: Boolean(bgMeta && bgMeta.hasTexture),
+                  hasSampler: Boolean(bgMeta && bgMeta.hasSampler),
+                  entries: bgMeta ? bgMeta.entries : null,
+                  desc: bg && bg.desc ? bg.desc : null,
+                });
+              }
+            } catch (err) {
+              this._recordOpValidationError(
+                meta && meta.kind ? meta.kind : 'RenderStatePassCommand',
+                err
+              );
+            }
+          }
           break;
       }
     }
@@ -4123,21 +4760,32 @@ class WgpuCommandProcessor {
       this.stagingPool.prepareSubmit();
     }
 
-    this.device.queue.submit([encoder.finish()]);
-    this.frameCount += 1;
-    if (this.frameCount === 1) {
-      this._notifyFirstPresent({
-        frameIndex: 0,
-        framesPresented: 1,
-        source: 'command-buffer',
-        timestampMs: Date.now(),
-      });
+    let submitted = false;
+    try {
+      this.device.queue.submit([encoder.finish()]);
+      submitted = true;
+    } catch (err) {
+      this._recordOpValidationError('Present', err);
     }
 
-    const workDoneFence = this._getWorkDoneFence();
+    if (submitted) {
+      this.frameCount += 1;
+      this._presentCount += 1;
+      if (this.frameCount === 1) {
+        this._notifyFirstPresent({
+          frameIndex: 0,
+          framesPresented: 1,
+          source: 'command-buffer',
+          timestampMs: Date.now(),
+        });
+      }
+    }
+
+    const workDoneFence = submitted ? this._getWorkDoneFence() : null;
     this._endSubsystemsForFrame(workDoneFence);
 
     if (
+      submitted &&
       timerResolved &&
       this.passTimer &&
       typeof this.passTimer.collectCompletedReadback === 'function'
@@ -4221,7 +4869,13 @@ class WgpuCommandProcessor {
       const opcode = view.getUint16(offset, true);
       const payloadBytes = view.getUint32(offset + 4, true);
       const payloadOffset = offset + 8;
-      if (payloadOffset + payloadBytes > view.byteLength) break;
+      if (payloadOffset + payloadBytes > view.byteLength) {
+        this._recordOpValidationError(
+          'CommandStream',
+          `truncated packet ${opcodeLabel(opcode)} (need ${payloadBytes}B, remaining ${view.byteLength - payloadOffset}B)`
+        );
+        break;
+      }
 
       this._packetCount += 1;
       this._bytesProcessed += 8 + payloadBytes;
@@ -4244,34 +4898,54 @@ class WgpuCommandProcessor {
               b: view.getFloat32(payloadOffset + 8, true),
               a: view.getFloat32(payloadOffset + 12, true),
             };
+          } else {
+            this._recordOpValidationError('ClearColor', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.CREATE_BUFFER:
           if (payloadBytes >= 16) {
             this._handleCreateBuffer(view, payloadOffset);
+          } else {
+            this._recordOpValidationError('CreateBuffer', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.WRITE_BUFFER:
           if (payloadBytes >= 16) {
             this._handleWriteBuffer(view, payloadOffset, payloadBytes);
+          } else {
+            this._recordOpValidationError('WriteBuffer', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.CREATE_SHADER_MODULE:
           if (payloadBytes >= 16) {
             this._handleCreateShaderModule(view, payloadOffset, payloadBytes);
+          } else {
+            this._recordOpValidationError(
+              'CreateShaderModule',
+              `truncated payload (${payloadBytes}B < 16B)`
+            );
           }
           break;
         case OPCODES.CREATE_RENDER_PIPELINE:
           if (payloadBytes >= 24) {
             this._handleCreateRenderPipeline(view, payloadOffset);
+          } else {
+            this._recordOpValidationError(
+              'CreateRenderPipeline',
+              `truncated payload (${payloadBytes}B < 24B)`
+            );
           }
           break;
         case OPCODES.SET_PIPELINE:
           if (payloadBytes >= 4) {
+            const pipelineId = view.getUint32(payloadOffset, true);
             this._passCommands.push({
               type: 'setPipeline',
-              pipelineId: view.getUint32(payloadOffset, true),
+              pipelineId,
+              pipeline: this.pipelines.get(pipelineId) || null,
             });
+          } else {
+            this._recordOpValidationError('SetPipeline', `truncated payload (${payloadBytes}B < 4B)`);
           }
           break;
         case OPCODES.SET_VERTEX_BUFFER:
@@ -4282,6 +4956,8 @@ class WgpuCommandProcessor {
               bufferId: view.getUint32(payloadOffset + 4, true),
               offset: Number(view.getBigUint64(payloadOffset + 8, true)),
             });
+          } else {
+            this._recordOpValidationError('SetVertexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.DRAW:
@@ -4293,6 +4969,8 @@ class WgpuCommandProcessor {
               firstVertex: view.getUint32(payloadOffset + 8, true),
               firstInstance: view.getUint32(payloadOffset + 12, true),
             });
+          } else {
+            this._recordOpValidationError('Draw', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.PRESENT:
@@ -4307,30 +4985,46 @@ class WgpuCommandProcessor {
         case OPCODES.CREATE_TEXTURE:
           if (payloadBytes >= 32) {
             this._handleCreateTexture(view, payloadOffset);
+          } else {
+            this._recordOpValidationError('CreateTexture', `truncated payload (${payloadBytes}B < 32B)`);
           }
           break;
         case OPCODES.WRITE_TEXTURE:
           if (payloadBytes >= 48) {
             this._handleWriteTexture(view, payloadOffset, payloadBytes);
+          } else {
+            this._recordOpValidationError('WriteTexture', `truncated payload (${payloadBytes}B < 48B)`);
           }
           break;
         case OPCODES.CREATE_SAMPLER:
           if (payloadBytes >= 32) {
             this._handleCreateSampler(view, payloadOffset);
+          } else {
+            this._recordOpValidationError('CreateSampler', `truncated payload (${payloadBytes}B < 32B)`);
           }
           break;
         case OPCODES.CREATE_BIND_GROUP:
           if (payloadBytes >= 16) {
             this._handleCreateBindGroup(view, payloadOffset, payloadBytes);
+          } else {
+            this._recordOpValidationError(
+              'CreateBindGroup',
+              `truncated payload (${payloadBytes}B < 16B)`
+            );
           }
           break;
         case OPCODES.SET_BIND_GROUP:
           if (payloadBytes >= 8) {
+            const groupIndex = view.getUint32(payloadOffset, true);
+            const bindGroupId = view.getUint32(payloadOffset + 4, true);
             this._passCommands.push({
               type: 'setBindGroup',
-              groupIndex: view.getUint32(payloadOffset, true),
-              bindGroupId: view.getUint32(payloadOffset + 4, true),
+              groupIndex,
+              bindGroupId,
+              bindGroup: this.bindGroups.get(bindGroupId) || null,
             });
+          } else {
+            this._recordOpValidationError('SetBindGroup', `truncated payload (${payloadBytes}B < 8B)`);
           }
           break;
         case OPCODES.SET_INDEX_BUFFER:
@@ -4342,6 +5036,8 @@ class WgpuCommandProcessor {
               indexFormat: INDEX_FORMAT_NAMES[formatCode] || 'uint16',
               offset: Number(view.getBigUint64(payloadOffset + 8, true)),
             });
+          } else {
+            this._recordOpValidationError('SetIndexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
           }
           break;
         case OPCODES.DRAW_INDEXED:
@@ -4354,11 +5050,18 @@ class WgpuCommandProcessor {
               baseVertex: view.getInt32(payloadOffset + 12, true),
               firstInstance: view.getUint32(payloadOffset + 16, true),
             });
+          } else {
+            this._recordOpValidationError('DrawIndexed', `truncated payload (${payloadBytes}B < 20B)`);
           }
           break;
         case OPCODES.CREATE_COMPUTE_PIPELINE:
           if (payloadBytes >= 16) {
             this._handleCreateComputePipeline(view, payloadOffset);
+          } else {
+            this._recordOpValidationError(
+              'CreateComputePipeline',
+              `truncated payload (${payloadBytes}B < 16B)`
+            );
           }
           break;
         case OPCODES.SET_COMPUTE_PIPELINE:
@@ -4380,7 +5083,9 @@ class WgpuCommandProcessor {
           }
           break;
         default:
-          if (this.extension) this.extension.handlePacket(opcode, view, payloadOffset, payloadBytes);
+          if (this.extension) {
+            this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+          }
           break;
       }
 
@@ -4454,10 +5159,15 @@ class WgpuCommandProcessor {
     return {
       frameCount: this.frameCount,
       framesPresented: this.frameCount,
+      presentCount: this._presentCount,
       splashFramesPresented: this._splashFramesPresented,
       firstPresent: this._firstPresentNotified || this.frameCount > 0,
       packetCount: this._packetCount,
       drawCalls: this._drawCallCount,
+      realPackDrawCount: this._realPackDrawCount,
+      fallbackDrawCount: this._fallbackDrawCount,
+      unboundBindGroupCount: this._unboundBindGroupCount,
+      skippedDrawCount: this._skippedDrawCount,
       computeDispatches: this._computeDispatchCount,
       bytesProcessed: this._bytesProcessed,
       destroyed: this._destroyed,
@@ -4486,6 +5196,7 @@ class WgpuCommandProcessor {
       lastFallbackProfile: this._lastFallbackProfile,
       validationErrorCount: this._validationErrorCount,
       validationErrorHistorySize: this._validationErrors.length,
+      validationErrorSuppressedCount: this._validationErrorSuppressedCount,
       wgslPackCache,
       splashBridge,
       binkPresenter,
@@ -4549,6 +5260,9 @@ class WgpuCommandProcessor {
     this.bindGroups.clear();
     this._bindGroupKinds.clear();
     this._bindGroupMeta.clear();
+    this._v2BindGroupLayouts.clear();
+    this._v2PipelineLayouts.clear();
+    this._validationErrorDedup.clear();
     this.shaderModules.clear();
     this.pipelines.clear();
     this._pipelineMeta.clear();
@@ -5221,6 +5935,8 @@ function createWgpuWorkerHandler(options = {}) {
       captureValidationErrors: true,
       maxValidationErrorHistory:
         initPayload.maxValidationErrorHistory ?? options.maxValidationErrorHistory,
+      maxValidationErrorPosts:
+        initPayload.maxValidationErrorPosts ?? options.maxValidationErrorPosts,
       defaultFallbackProfile:
         initPayload.defaultFallbackProfile ?? options.defaultFallbackProfile,
       GpuRingBuffer: injectedRingCtor,
@@ -5232,6 +5948,7 @@ function createWgpuWorkerHandler(options = {}) {
       rtPool: options.rtPool,
       pipelineCache: options.pipelineCache,
       wgslPackCache: options.wgslPackCache,
+      wgslPackBuffer: initPayload.wgslPackBuffer ?? options.wgslPackBuffer,
       shaderFallbackRouter: options.shaderFallbackRouter,
       ShaderFallbackRouter: options.ShaderFallbackRouter,
       shaderFallbackRouterOptions: options.shaderFallbackRouterOptions,
@@ -5270,14 +5987,38 @@ function createWgpuWorkerHandler(options = {}) {
     });
     bindProcessorValidationErrors(processor);
     try {
-      if (!globalThis.PlayGta6RenderState && typeof importScripts === 'function') {
+      let renderStateApi =
+        typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
+          ? globalThis.PlayGta6RenderState
+          : null;
+      if (!renderStateApi && typeof importScripts === 'function') {
         importScripts('./render_state_packets.js');
+        renderStateApi =
+          typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
+            ? globalThis.PlayGta6RenderState
+            : null;
+      } else if (!renderStateApi && typeof require === 'function') {
+        renderStateApi = require('./render_state_packets.js');
       }
-      if (globalThis.PlayGta6RenderState) globalThis.PlayGta6RenderState.installRenderStatePackets(processor);
-      if (!globalThis.PlayGta6TexturePackets && typeof importScripts === 'function') {
+      if (renderStateApi && typeof renderStateApi.installRenderStatePackets === 'function') {
+        renderStateApi.installRenderStatePackets(processor);
+      }
+      let texturePacketsApi =
+        typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
+          ? globalThis.PlayGta6TexturePackets
+          : null;
+      if (!texturePacketsApi && typeof importScripts === 'function') {
         importScripts('./texture_packets.js');
+        texturePacketsApi =
+          typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
+            ? globalThis.PlayGta6TexturePackets
+            : null;
+      } else if (!texturePacketsApi && typeof require === 'function') {
+        texturePacketsApi = require('./texture_packets.js');
       }
-      if (globalThis.PlayGta6TexturePackets) globalThis.PlayGta6TexturePackets.installTexturePackets(processor);
+      if (texturePacketsApi && typeof texturePacketsApi.installTexturePackets === 'function') {
+        texturePacketsApi.installTexturePackets(processor);
+      }
     } catch (err) {
       postMessage({ error: `packet ABI v2 unavailable: ${String(err)}` });
     }
@@ -5393,11 +6134,34 @@ function createWgpuWorkerHandler(options = {}) {
               ? processor.getShaderFallbackStats()
               : null,
         });
-      } else if (payload.stats) {
-        postMessage({
-          id: payload.id,
-          stats: processor && typeof processor.getStats === 'function' ? processor.getStats() : null,
-        });
+      } else if (
+        payload.stats ||
+        payload.type === 'gpu-stats' ||
+        payload.type === 'request-gpu-stats'
+      ) {
+        const stats =
+          processor && typeof processor.getStats === 'function' ? processor.getStats() : null;
+        if (payload.type === 'gpu-stats' || payload.type === 'request-gpu-stats') {
+          const reply = {
+            type: 'gpu-stats',
+            stats,
+            framesPresented: stats ? toNonNegativeInt(stats.framesPresented, 0) : 0,
+            presentCount: stats ? toNonNegativeInt(stats.presentCount, 0) : 0,
+            drawCalls: stats ? toNonNegativeInt(stats.drawCalls, 0) : 0,
+            realPackDrawCount: stats ? toNonNegativeInt(stats.realPackDrawCount, 0) : 0,
+            fallbackDrawCount: stats ? toNonNegativeInt(stats.fallbackDrawCount, 0) : 0,
+            validationErrorCount: stats ? toNonNegativeInt(stats.validationErrorCount, 0) : 0,
+          };
+          if (payload.id !== undefined) {
+            reply.id = payload.id;
+          }
+          postMessage(reply);
+        } else {
+          postMessage({
+            id: payload.id,
+            stats,
+          });
+        }
       } else if (payload.type === 'present-splash-frame' || payload.type === 'bink-frame') {
         const framePayload =
           payload.frame && typeof payload.frame === 'object' ? payload.frame : payload;
@@ -5582,6 +6346,7 @@ const exportedApi = {
   normalizeValidationErrorType,
   FALLBACK_PROFILE,
   DEFAULT_MAX_VALIDATION_ERROR_HISTORY,
+  DEFAULT_MAX_VALIDATION_ERROR_POSTS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   DEFAULT_TELEMETRY_INTERVAL_MS,
   DEFAULT_TELEMETRY_MISSING_LIMIT,
