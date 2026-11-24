@@ -912,6 +912,8 @@ pub struct DiscoveryStats {
     pub jump_tables_unresolved: usize,
     /// Resolved tables whose extent was inferred (no proven index bound); part of `resolved`.
     pub jump_tables_inferred: usize,
+    /// Unresolved indirect jumps by reason, in [`crate::cfg::UnresolvedJump`] declaration order.
+    pub jump_tables_unresolved_by_reason: Vec<(&'static str, usize)>,
     pub trap_blocks: usize,
     pub invalid_blocks: usize,
     pub no_return_calls: usize,
@@ -932,6 +934,15 @@ impl DiscoveryStats {
             jump_tables_resolved: analysis.jump_tables.len(),
             jump_tables_unresolved: 0,
             jump_tables_inferred: analysis.jump_tables.values().filter(|t| t.inferred).count(),
+            jump_tables_unresolved_by_reason: crate::cfg::UnresolvedJump::ALL
+                .iter()
+                .map(|&k| {
+                    (
+                        k.name(),
+                        analysis.unresolved_jumps.values().filter(|&&r| r == k).count(),
+                    )
+                })
+                .collect(),
             trap_blocks: 0,
             invalid_blocks: 0,
             no_return_calls: 0,
@@ -1477,6 +1488,15 @@ pub fn render_report(r: &PipelineReport) -> String {
          (dispatched at run time)",
         d.jump_tables_resolved, d.jump_tables_inferred, d.jump_tables_unresolved
     );
+    if d.jump_tables_unresolved > 0 {
+        let reasons: Vec<String> = d
+            .jump_tables_unresolved_by_reason
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name} {n}"))
+            .collect();
+        let _ = writeln!(out, "    unresolved by reason: {}", reasons.join(", "));
+    }
     if !l.unsupported.is_empty() {
         let mut rows: Vec<(&String, &usize)> = l.unsupported.iter().collect();
         rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
@@ -1962,6 +1982,15 @@ pub fn render_manifest(r: &PipelineReport) -> String {
                 ("resolved", num(d.jump_tables_resolved)),
                 ("unresolved", num(d.jump_tables_unresolved)),
                 ("inferred", num(d.jump_tables_inferred)),
+                (
+                    "unresolved_by_reason",
+                    Json::Obj(
+                        d.jump_tables_unresolved_by_reason
+                            .iter()
+                            .map(|&(name, n)| (name.to_string(), num(n)))
+                            .collect(),
+                    ),
+                ),
             ]),
         ),
         (

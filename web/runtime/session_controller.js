@@ -20,7 +20,19 @@ export const SESSION_MODE = Object.freeze({
   SMOKE: 'smoke',
 });
 
+export const BOOT_MODE = Object.freeze({
+  IDLE: 'idle',
+  REAL_WASM64: 'real-wasm64',
+  SMOKE: 'smoke',
+});
+
 export const DEFAULT_STATUS_URL = '/api/status';
+export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
+
+const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const MAX_SIDE_MODULE_URLS = 256;
+const HOST_UNIX_PATH_PREFIX_RE =
+  /^\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)(?:\/|$)/i;
 
 const VALID_CAPABILITY_KEYS = Object.freeze([
   'crossOriginIsolated',
@@ -145,6 +157,251 @@ function toError(err, fallbackMessage = 'Unknown session error') {
   return new Error(fallbackMessage);
 }
 
+function isNonNegativeInt(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
+function normalizeBootMode(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    normalized === 'real-wasm64' ||
+    normalized === 'real_wasm64' ||
+    normalized === 'wasm-guest' ||
+    normalized === 'wasm_guest' ||
+    normalized === 'wasm64' ||
+    normalized === 'wasm'
+  ) {
+    return BOOT_MODE.REAL_WASM64;
+  }
+  if (normalized === 'smoke' || normalized === 'smoke-demo' || normalized === 'smoke_demo') {
+    return BOOT_MODE.SMOKE;
+  }
+  if (normalized === 'idle' || normalized === 'none' || normalized === 'pending') {
+    return BOOT_MODE.IDLE;
+  }
+  return null;
+}
+
+function isAbsoluteUrl(value) {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value) || value.startsWith('//');
+}
+
+function sanitizeSideModuleUrl(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    trimmed.includes('\0') ||
+    trimmed.includes('\\') ||
+    /[\x00-\x1F\x7F]/.test(trimmed) ||
+    /^[A-Za-z]:\//.test(trimmed)
+  ) {
+    return null;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!/\.wasm$/i.test(withoutQuery)) {
+    return null;
+  }
+  if (isAbsoluteUrl(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return null;
+    }
+    if (typeof URL === 'function') {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.pathname.split('/').includes('..')) {
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return trimmed;
+  }
+  if (HOST_UNIX_PATH_PREFIX_RE.test(withoutQuery)) {
+    return null;
+  }
+  const segments = withoutQuery.replace(/^\/+/, '').split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    if (segments[i] === '..') {
+      return null;
+    }
+  }
+  return trimmed;
+}
+
+function sanitizeSideModuleUrls(rawList) {
+  if (!Array.isArray(rawList)) {
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length && out.length < MAX_SIDE_MODULE_URLS; i += 1) {
+    const clean = sanitizeSideModuleUrl(rawList[i]);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function extractSideModuleMetadata(source) {
+  if (!source || typeof source !== 'object') {
+    return {
+      hasSideModuleUrls: false,
+      hasSideModuleCount: false,
+      sideModuleUrls: [],
+      sideModuleCount: 0,
+    };
+  }
+
+  const hasRawUrls = Array.isArray(source.sideModuleUrls) || Array.isArray(source.sideModules);
+  const rawUrls = Array.isArray(source.sideModuleUrls)
+    ? source.sideModuleUrls
+    : Array.isArray(source.sideModules)
+      ? source.sideModules
+      : null;
+  const hasRawCount = isNonNegativeInt(source.sideModuleCount);
+
+  if (rawUrls && rawUrls.length > 0) {
+    const sanitized = sanitizeSideModuleUrls(rawUrls);
+    return {
+      hasSideModuleUrls: true,
+      hasSideModuleCount: true,
+      sideModuleUrls: sanitized,
+      sideModuleCount: sanitized.length,
+    };
+  }
+
+  return {
+    hasSideModuleUrls: hasRawUrls,
+    hasSideModuleCount: hasRawCount,
+    sideModuleUrls: [],
+    sideModuleCount: hasRawCount ? source.sideModuleCount : 0,
+  };
+}
+
+function classifyGpuErrorType(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized || normalized === 'gpu-validation-error') {
+    return null;
+  }
+  if (
+    normalized === 'out-of-memory' ||
+    normalized === 'out_of_memory' ||
+    normalized === 'outofmemory' ||
+    normalized === 'oom' ||
+    normalized.includes('outofmemory') ||
+    normalized.includes('out-of-memory') ||
+    normalized.includes('out_of_memory')
+  ) {
+    return 'out-of-memory';
+  }
+  if (normalized === 'validation' || normalized.includes('validation')) {
+    return 'validation';
+  }
+  if (normalized === 'internal' || normalized.includes('internal')) {
+    return 'internal';
+  }
+  return null;
+}
+
+function normalizeValidationErrorType(errorObj, envelope) {
+  if (errorObj && typeof errorObj === 'object') {
+    const fromType = classifyGpuErrorType(errorObj.type);
+    if (fromType) return fromType;
+    const fromErrorType = classifyGpuErrorType(errorObj.errorType || errorObj.kind);
+    if (fromErrorType) return fromErrorType;
+    const fromName = classifyGpuErrorType(errorObj.name);
+    if (fromName) return fromName;
+    if (errorObj.constructor && typeof errorObj.constructor.name === 'string') {
+      const fromCtor = classifyGpuErrorType(errorObj.constructor.name);
+      if (fromCtor) return fromCtor;
+    }
+  }
+  if (envelope && typeof envelope === 'object') {
+    const fromEnv = classifyGpuErrorType(
+      envelope.errorType || envelope.kind || envelope.gpuErrorType
+    );
+    if (fromEnv) return fromEnv;
+    const fromType = classifyGpuErrorType(envelope.type);
+    if (fromType) return fromType;
+  }
+  if (envelope && typeof envelope === 'object' && envelope.type === 'gpu-validation-error') {
+    return 'validation';
+  }
+  return 'unknown';
+}
+
+function sanitizeDiagnosticText(rawMessage, maxLength = MAX_VALIDATION_ERROR_MESSAGE_LENGTH) {
+  let msg;
+  if (typeof rawMessage === 'string') {
+    msg = rawMessage;
+  } else if (rawMessage === null || rawMessage === undefined) {
+    return '';
+  } else {
+    msg = String(rawMessage);
+  }
+
+  // Normalize line breaks/tabs to spaces and strip control characters.
+  msg = msg.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
+
+  // Strip file:// URLs and host filesystem paths (Windows drive, UNC, and Unix paths).
+  msg = msg.replace(/\bfile:\/\/[^\s"'`<>)\]]+/gi, '<path>');
+  msg = msg.replace(/\\\\[^\s\\"'`<>)\]]+\\[^\s"'`<>)\]]+/g, '<path>');
+  msg = msg.replace(/(["'`])[A-Za-z]:[\\\/][^"'`\r\n]+\1/g, '$1<path>$1');
+  msg = msg.replace(/\b[A-Za-z]:[\\\/][^\s"'`<>)\],;]+/g, '<path>');
+  msg = msg.replace(
+    /(["'`])\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)\/[^"'`\r\n]+\1/gi,
+    '$1<path>$1'
+  );
+  msg = msg.replace(
+    /(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]+/g,
+    '$1<path>'
+  );
+
+  // Strip long embedded buffers (data URIs, byte arrays, hex dumps, base64 blobs).
+  msg = msg.replace(/\bdata:[^\s;,'"`<>]+;base64,[A-Za-z0-9+/=]{16,}/gi, '<buffer>');
+  msg = msg.replace(
+    /(?:\b(?:0x)?[0-9a-fA-F]{1,4}\s*,\s*){16,}(?:0x)?[0-9a-fA-F]{1,4}\b/g,
+    '<buffer>'
+  );
+  msg = msg.replace(/(?:\b[0-9a-fA-F]{2}\s+){16,}[0-9a-fA-F]{2}\b/g, '<buffer>');
+  msg = msg.replace(/\b(?:0x)?[0-9a-fA-F]{48,}\b/g, '<buffer>');
+  msg = msg.replace(
+    /(^|[\s"'`(\[=,:])[A-Za-z0-9+/]{64,}={0,2}(?=$|[\s"'`)\]=,.;:])/g,
+    '$1<buffer>'
+  );
+
+  msg = msg.replace(/\s{2,}/g, ' ').trim();
+
+  if (msg.length > maxLength) {
+    msg = `${msg.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+  return msg;
+}
+
+function isEventTargetLike(target) {
+  return Boolean(
+    target &&
+      typeof target === 'object' &&
+      typeof target.addEventListener === 'function' &&
+      typeof target.removeEventListener === 'function'
+  );
+}
+
 function createOfflineServerStatus(errorMessage, httpStatus = null) {
   return {
     ok: false,
@@ -157,10 +414,17 @@ function createOfflineServerStatus(errorMessage, httpStatus = null) {
     hasBootset: false,
     hasWasmBinary: false,
     shaderPackCount: 0,
+    bootMode: BOOT_MODE.IDLE,
+    sideModuleCount: 0,
+    sideModuleUrls: [],
   };
 }
 
 function normalizeServerStatus(data, httpStatus = 200) {
+  const hasWasmBinary = Boolean(data.hasWasmBinary);
+  const reportedBootMode = normalizeBootMode(data.bootMode);
+  const sideMeta = extractSideModuleMetadata(data);
+
   return {
     ...data,
     ok: data.ok !== undefined ? Boolean(data.ok) : true,
@@ -171,8 +435,11 @@ function normalizeServerStatus(data, httpStatus = 200) {
     dataDirConfigured: Boolean(data.dataDirConfigured),
     hasManifest: Boolean(data.hasManifest),
     hasBootset: Boolean(data.hasBootset),
-    hasWasmBinary: Boolean(data.hasWasmBinary),
+    hasWasmBinary,
     shaderPackCount: Number.isFinite(data.shaderPackCount) ? data.shaderPackCount : 0,
+    bootMode: reportedBootMode || (hasWasmBinary ? BOOT_MODE.REAL_WASM64 : BOOT_MODE.SMOKE),
+    sideModuleCount: sideMeta.sideModuleCount,
+    sideModuleUrls: [...sideMeta.sideModuleUrls],
   };
 }
 
@@ -245,6 +512,12 @@ export class RuntimeSessionController {
       now = () => Date.now(),
       hudIntervalMs,
       audioGestureTarget,
+      wgpuWorker = null,
+      maxValidationErrors = DEFAULT_MAX_VALIDATION_ERRORS,
+      onStatusUpdate = null,
+      onTelemetry = null,
+      onValidationError = null,
+      onSplashFrame = null,
     } = options;
 
     if (fetchImpl !== null && fetchImpl !== undefined && typeof fetchImpl !== 'function') {
@@ -265,6 +538,26 @@ export class RuntimeSessionController {
     if (capabilityProbe !== null && typeof capabilityProbe !== 'function') {
       throw new TypeError('capabilityProbe must be a function or null');
     }
+    if (wgpuWorker !== null && !isEventTargetLike(wgpuWorker)) {
+      throw new TypeError('wgpuWorker must implement addEventListener/removeEventListener or be null');
+    }
+    if (!Number.isInteger(maxValidationErrors) || maxValidationErrors < 1) {
+      throw new RangeError(
+        `maxValidationErrors must be a positive integer, got ${maxValidationErrors}`
+      );
+    }
+    if (onStatusUpdate !== null && typeof onStatusUpdate !== 'function') {
+      throw new TypeError('onStatusUpdate must be a function or null');
+    }
+    if (onTelemetry !== null && typeof onTelemetry !== 'function') {
+      throw new TypeError('onTelemetry must be a function or null');
+    }
+    if (onValidationError !== null && typeof onValidationError !== 'function') {
+      throw new TypeError('onValidationError must be a function or null');
+    }
+    if (onSplashFrame !== null && typeof onSplashFrame !== 'function') {
+      throw new TypeError('onSplashFrame must be a function or null');
+    }
 
     this._fetchImpl = fetchImpl || null;
     this._statusUrl = statusUrl;
@@ -280,9 +573,14 @@ export class RuntimeSessionController {
     this._now = now;
     this._hudIntervalMs = hudIntervalMs;
     this._audioGestureTarget = audioGestureTarget;
+    this._wgpuWorker = wgpuWorker || null;
+    this._maxValidationErrors = maxValidationErrors;
 
     this._state = SESSION_STATE.IDLE;
     this._mode = SESSION_MODE.NONE;
+    this._bootMode = BOOT_MODE.IDLE;
+    this._sideModuleCount = 0;
+    this._sideModuleUrls = [];
     this._capabilities = null;
     this._serverStatus = null;
     this._storageSummary = null;
@@ -291,14 +589,40 @@ export class RuntimeSessionController {
     this._lastError = null;
     this._startedAtMs = null;
 
+    this._validationErrorCount = 0;
+    this._validationErrorSeq = 0;
+    this._recentValidationErrors = [];
+    this._splashFramesPresented = 0;
+    this._splashFrameErrorCount = 0;
+    this._firstSplashPresented = false;
+    this._lastSplashFrame = null;
+
     this._activeHandle = null;
     this._perfDetach = null;
     this._audioGestureCleanup = null;
     this._inputStarted = false;
+    this._attachedWorkers = new Map();
 
     this._sessionToken = 0;
     this._startPromise = null;
     this._stateListeners = new Set();
+    this._statusListeners = new Set();
+    this._telemetryListeners = new Set();
+    this._validationErrorListeners = new Set();
+    this._splashListeners = new Set();
+
+    if (onStatusUpdate) {
+      this._statusListeners.add(onStatusUpdate);
+    }
+    if (onTelemetry) {
+      this._telemetryListeners.add(onTelemetry);
+    }
+    if (onValidationError) {
+      this._validationErrorListeners.add(onValidationError);
+    }
+    if (onSplashFrame) {
+      this._splashListeners.add(onSplashFrame);
+    }
   }
 
   // --- Observability & Diagnostics ---
@@ -311,10 +635,42 @@ export class RuntimeSessionController {
     return this._mode;
   }
 
+  getBootMode() {
+    return this._bootMode;
+  }
+
+  getSideModuleMetadata() {
+    return {
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
+    };
+  }
+
+  getValidationErrorCount() {
+    return this._validationErrorCount;
+  }
+
+  getValidationErrors() {
+    return this._recentValidationErrors.map((entry) => ({ ...entry }));
+  }
+
+  clearValidationErrors() {
+    this._recentValidationErrors.length = 0;
+  }
+
+  getSplashStats() {
+    return {
+      framesPresented: this._splashFramesPresented,
+      errorCount: this._splashFrameErrorCount,
+      firstPresented: this._firstSplashPresented,
+      lastFrame: this._lastSplashFrame ? { ...this._lastSplashFrame } : null,
+    };
+  }
+
   /**
    * Registers a state transition listener.
    *
-   * @param {(event: { state: string, previousState: string, mode: string, timestampMs: number }) => void} listener
+   * @param {(event: { state: string, previousState: string, mode: string, bootMode: string, sideModuleCount: number, sideModuleUrls: string[], timestampMs: number }) => void} listener
    * @returns {() => void} Idempotent unsubscribe function.
    */
   onStateChange(listener) {
@@ -327,6 +683,128 @@ export class RuntimeSessionController {
       if (!active) return;
       active = false;
       this._stateListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Registers a boot/split-module status listener notified on /api/status probes,
+   * boot lifecycle updates, and session state changes.
+   *
+   * @param {(status: object) => void} listener
+   * @returns {() => void} Idempotent unsubscribe function.
+   */
+  onStatusUpdate(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('onStatusUpdate requires a listener function');
+    }
+    this._statusListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._statusListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Registers a live WebGPU validation error observer (`gpu-validation-error`).
+   *
+   * @param {(event: object) => void} listener
+   * @returns {() => void} Idempotent unsubscribe function.
+   */
+  onValidationError(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('onValidationError requires a listener function');
+    }
+    this._validationErrorListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._validationErrorListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Registers a splash/Bink frame presentation observer (`splash-frame-presented`).
+   *
+   * @param {(event: object) => void} listener
+   * @returns {() => void} Idempotent unsubscribe function.
+   */
+  onSplashFrame(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('onSplashFrame requires a listener function');
+    }
+    this._splashListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._splashListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Registers a unified telemetry/diagnostic listener notified on `gpu-validation-error`,
+   * `splash-frame-presented`, and `boot-status` events.
+   *
+   * @param {(event: object) => void} listener
+   * @returns {() => void} Idempotent unsubscribe function.
+   */
+  onTelemetry(listener) {
+    if (typeof listener !== 'function') {
+      throw new TypeError('onTelemetry requires a listener function');
+    }
+    this._telemetryListeners.add(listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._telemetryListeners.delete(listener);
+    };
+  }
+
+  _cloneServerStatus() {
+    if (!this._serverStatus) {
+      return null;
+    }
+    return {
+      ...this._serverStatus,
+      sideModuleUrls: Array.isArray(this._serverStatus.sideModuleUrls)
+        ? [...this._serverStatus.sideModuleUrls]
+        : [],
+    };
+  }
+
+  _computeUptimeMs() {
+    const isRunning =
+      this._state === SESSION_STATE.RUNNING_WASM || this._state === SESSION_STATE.RUNNING_SMOKE;
+    return isRunning && this._startedAtMs !== null
+      ? Math.max(0, this._now() - this._startedAtMs)
+      : 0;
+  }
+
+  getSnapshot() {
+    return {
+      state: this._state,
+      mode: this._mode,
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
+      validationErrorCount: this._validationErrorCount,
+      validationErrorHistorySize: this._recentValidationErrors.length,
+      recentValidationErrors: this._recentValidationErrors.map((entry) => ({ ...entry })),
+      splashFramesPresented: this._splashFramesPresented,
+      splashFrameErrorCount: this._splashFrameErrorCount,
+      firstSplashPresented: this._firstSplashPresented,
+      lastSplashFrame: this._lastSplashFrame ? { ...this._lastSplashFrame } : null,
+      capabilities: this._capabilities ? { ...this._capabilities } : null,
+      serverStatus: this._cloneServerStatus(),
+      storageSummary: this._storageSummary,
+      uptimeMs: this._computeUptimeMs(),
+      fallbackReason: this._fallbackReason,
+      diagnosticReasons: [...this._diagnosticReasons],
+      lastError: this._lastError ? this._lastError.message : null,
     };
   }
 
@@ -343,22 +821,9 @@ export class RuntimeSessionController {
       }
     }
 
-    const isRunning =
-      this._state === SESSION_STATE.RUNNING_WASM || this._state === SESSION_STATE.RUNNING_SMOKE;
-    const uptimeMs =
-      isRunning && this._startedAtMs !== null ? Math.max(0, this._now() - this._startedAtMs) : 0;
-
     return {
-      state: this._state,
-      mode: this._mode,
-      capabilities: this._capabilities ? { ...this._capabilities } : null,
-      serverStatus: this._serverStatus ? { ...this._serverStatus } : null,
-      storageSummary: this._storageSummary,
+      ...this.getSnapshot(),
       perfSnapshot,
-      uptimeMs,
-      fallbackReason: this._fallbackReason,
-      diagnosticReasons: [...this._diagnosticReasons],
-      lastError: this._lastError ? this._lastError.message : null,
     };
   }
 
@@ -375,6 +840,9 @@ export class RuntimeSessionController {
       state: nextState,
       previousState,
       mode: this._mode,
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
       timestampMs: this._now(),
       ...(detail && typeof detail === 'object' ? detail : {}),
     };
@@ -411,6 +879,513 @@ export class RuntimeSessionController {
         // Never allow HUD errors to disrupt session lifecycle.
       }
     }
+  }
+
+  _buildStatusSnapshot(reason = null) {
+    return {
+      state: this._state,
+      mode: this._mode,
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
+      serverStatus: this._cloneServerStatus(),
+      fallbackReason: this._fallbackReason,
+      validationErrorCount: this._validationErrorCount,
+      splashFramesPresented: this._splashFramesPresented,
+      firstSplashPresented: this._firstSplashPresented,
+      reason,
+      timestampMs: this._now(),
+    };
+  }
+
+  _emitStatusUpdate(reason = null) {
+    const snapshot = this._buildStatusSnapshot(reason);
+
+    if (this._hud) {
+      const hudStatusFns = ['updateBootStatus', 'setBootStatus', 'updateSessionStatus'];
+      for (const fnName of hudStatusFns) {
+        if (typeof this._hud[fnName] === 'function') {
+          try {
+            this._hud[fnName]({
+              ...snapshot,
+              sideModuleUrls: [...snapshot.sideModuleUrls],
+            });
+          } catch {
+            // Isolate HUD callback errors.
+          }
+          break;
+        }
+      }
+      if (typeof this._hud.setBootMode === 'function') {
+        try {
+          this._hud.setBootMode(this._bootMode, {
+            sideModuleCount: this._sideModuleCount,
+            sideModuleUrls: [...this._sideModuleUrls],
+            state: this._state,
+            mode: this._mode,
+          });
+        } catch {
+          // Isolate HUD callback errors.
+        }
+      }
+    }
+
+    for (const listener of [...this._statusListeners]) {
+      try {
+        listener({
+          ...snapshot,
+          sideModuleUrls: [...snapshot.sideModuleUrls],
+        });
+      } catch {
+        // Never allow status observers to throw into session lifecycle.
+      }
+    }
+
+    for (const listener of [...this._telemetryListeners]) {
+      try {
+        listener({
+          type: 'boot-status',
+          ...snapshot,
+          sideModuleUrls: [...snapshot.sideModuleUrls],
+        });
+      } catch {
+        // Never allow telemetry observers to throw into session lifecycle.
+      }
+    }
+  }
+
+  /**
+   * Apply boot lifecycle metadata (`bootMode`, `sideModuleCount`, `sideModuleUrls`)
+   * from `/api/status`, `BootOrchestrator`, `loader.js`, or runtime callbacks and
+   * forward sanitized updates to HUD and subscribed status/telemetry observers.
+   * Never throws.
+   */
+  notifyBootLifecycle(payload) {
+    try {
+      if (!payload || typeof payload !== 'object') {
+        return {
+          bootMode: this._bootMode,
+          sideModuleCount: this._sideModuleCount,
+          sideModuleUrls: [...this._sideModuleUrls],
+        };
+      }
+
+      const nextBootMode =
+        normalizeBootMode(payload.bootMode) ||
+        normalizeBootMode(payload.mode);
+      if (nextBootMode) {
+        this._bootMode = nextBootMode;
+      }
+
+      const sideMeta = extractSideModuleMetadata(payload);
+      if (sideMeta.hasSideModuleUrls) {
+        this._sideModuleUrls = [...sideMeta.sideModuleUrls];
+        this._sideModuleCount = sideMeta.sideModuleCount;
+      } else if (sideMeta.hasSideModuleCount) {
+        this._sideModuleCount = sideMeta.sideModuleCount;
+      }
+
+      const reason =
+        typeof payload.reason === 'string' && payload.reason.trim().length > 0
+          ? sanitizeDiagnosticText(payload.reason, 160)
+          : typeof payload.stage === 'string' && payload.stage.trim().length > 0
+            ? sanitizeDiagnosticText(payload.stage, 64)
+            : typeof payload.phase === 'string' && payload.phase.trim().length > 0
+              ? sanitizeDiagnosticText(payload.phase, 64)
+              : 'boot-lifecycle';
+
+      this._emitStatusUpdate(reason);
+    } catch {
+      // Boot lifecycle callbacks must never throw.
+    }
+
+    return {
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
+    };
+  }
+
+  /**
+   * Records a live WebGPU validation/OOM/internal error (e.g. `gpu-validation-error`
+   * from `wgpu_worker.js` / `WgpuSwapchain` G35), maintains bounded sanitized history
+   * and monotonic counters, and forwards sanitized updates to HUD, CrashReporter,
+   * and subscribed listeners without ever throwing.
+   */
+  recordGpuValidationError(payload) {
+    try {
+      const envelope = payload && typeof payload === 'object' ? payload : null;
+      const rawError =
+        envelope && envelope.error !== undefined && envelope.error !== null
+          ? envelope.error
+          : payload;
+
+      const errorType = normalizeValidationErrorType(rawError, envelope);
+
+      let rawMessage = '';
+      if (rawError && typeof rawError === 'object' && typeof rawError.message === 'string') {
+        rawMessage = rawError.message;
+      } else if (envelope && typeof envelope.message === 'string') {
+        rawMessage = envelope.message;
+      } else if (typeof rawError === 'string') {
+        rawMessage = rawError;
+      } else if (rawError !== null && rawError !== undefined) {
+        rawMessage = String(rawError);
+      }
+
+      const message = sanitizeDiagnosticText(rawMessage) || 'WebGPU validation error';
+
+      let rawTimestamp = null;
+      if (rawError && typeof rawError === 'object' && typeof rawError.timestampMs === 'number' && Number.isFinite(rawError.timestampMs)) {
+        rawTimestamp = rawError.timestampMs;
+      } else if (envelope && typeof envelope.timestampMs === 'number' && Number.isFinite(envelope.timestampMs)) {
+        rawTimestamp = envelope.timestampMs;
+      }
+      const nowVal = this._now();
+      const timestampMs =
+        rawTimestamp !== null
+          ? rawTimestamp
+          : typeof nowVal === 'number' && Number.isFinite(nowVal)
+            ? nowVal
+            : Date.now();
+
+      const workerSeq =
+        rawError && typeof rawError === 'object' && isNonNegativeInt(rawError.seq)
+          ? rawError.seq
+          : envelope && isNonNegativeInt(envelope.seq)
+            ? envelope.seq
+            : null;
+
+      const rawSource =
+        (envelope && typeof envelope.source === 'string' && envelope.source) ||
+        (rawError && typeof rawError === 'object' && typeof rawError.source === 'string' && rawError.source) ||
+        'wgpu_worker';
+      const source = sanitizeDiagnosticText(rawSource, 64) || 'wgpu_worker';
+
+      const rawLabel =
+        (envelope && typeof envelope.label === 'string' && envelope.label) ||
+        (rawError && typeof rawError === 'object' && typeof rawError.label === 'string' && rawError.label) ||
+        null;
+      const label = rawLabel ? sanitizeDiagnosticText(rawLabel, 128) : null;
+
+      this._validationErrorSeq += 1;
+      this._validationErrorCount += 1;
+
+      const record = {
+        seq: this._validationErrorSeq,
+        type: errorType,
+        message,
+        source,
+        timestampMs,
+        ...(workerSeq !== null ? { workerSeq } : {}),
+        ...(label ? { label } : {}),
+      };
+
+      this._recentValidationErrors.push(record);
+      while (this._recentValidationErrors.length > this._maxValidationErrors) {
+        this._recentValidationErrors.shift();
+      }
+
+      const level = errorType === 'out-of-memory' || errorType === 'internal' ? 'error' : 'warn';
+      this._hudLog(`[WebGPU ${errorType}] ${message}`, level);
+
+      const eventPayload = {
+        type: 'gpu-validation-error',
+        error: { ...record },
+        record: { ...record },
+        validationErrorCount: this._validationErrorCount,
+        validationErrorHistorySize: this._recentValidationErrors.length,
+        bootMode: this._bootMode,
+        state: this._state,
+        mode: this._mode,
+      };
+
+      if (this._hud) {
+        const hudErrFns = ['recordValidationError', 'onValidationError', 'updateGpuValidation'];
+        for (const fnName of hudErrFns) {
+          if (typeof this._hud[fnName] === 'function') {
+            try {
+              this._hud[fnName]({ ...eventPayload, error: { ...record }, record: { ...record } });
+            } catch {
+              // Isolate HUD callback errors.
+            }
+            break;
+          }
+        }
+        if (typeof this._hud.updateTelemetry === 'function') {
+          try {
+            this._hud.updateTelemetry({ ...eventPayload, error: { ...record }, record: { ...record } });
+          } catch {
+            // Isolate HUD callback errors.
+          }
+        }
+      }
+
+      this._reportError(new Error(`[WebGPU ${errorType}] ${message}`), {
+        phase: 'runtime',
+        source,
+        category: 'webgpu_validation',
+        errorType,
+        seq: record.seq,
+        validationErrorCount: this._validationErrorCount,
+        bootMode: this._bootMode,
+      });
+
+      for (const listener of [...this._validationErrorListeners]) {
+        try {
+          listener({ ...eventPayload, error: { ...record }, record: { ...record } });
+        } catch {
+          // Never allow validation error observers to throw.
+        }
+      }
+
+      for (const listener of [...this._telemetryListeners]) {
+        try {
+          listener({ ...eventPayload, error: { ...record }, record: { ...record } });
+        } catch {
+          // Never allow telemetry observers to throw.
+        }
+      }
+
+      return {
+        handled: true,
+        type: 'gpu-validation-error',
+        record: { ...record },
+        validationErrorCount: this._validationErrorCount,
+        validationErrorHistorySize: this._recentValidationErrors.length,
+      };
+    } catch {
+      return {
+        handled: false,
+        type: 'gpu-validation-error',
+        record: null,
+        validationErrorCount: this._validationErrorCount,
+        validationErrorHistorySize: this._recentValidationErrors.length,
+      };
+    }
+  }
+
+  /**
+   * Records a `splash-frame-presented` message from `wgpu_worker.js` (W67),
+   * updates splash presentation counters/state, and forwards sanitized updates
+   * to HUD and subscribed listeners without ever throwing.
+   */
+  recordSplashFramePresented(payload) {
+    try {
+      const msg = payload && typeof payload === 'object' ? payload : {};
+      const ok = msg.ok !== undefined ? Boolean(msg.ok) : !msg.error;
+      const frameIndex = isNonNegativeInt(msg.frameIndex) ? msg.frameIndex : null;
+      const workerFramesPresented = isNonNegativeInt(msg.framesPresented)
+        ? msg.framesPresented
+        : null;
+      const rawSource = typeof msg.source === 'string' && msg.source ? msg.source : 'splash';
+      const source = sanitizeDiagnosticText(rawSource, 64) || 'splash';
+      const reason =
+        typeof msg.reason === 'string' && msg.reason.trim().length > 0
+          ? sanitizeDiagnosticText(msg.reason, 128)
+          : null;
+      const error = !ok
+        ? sanitizeDiagnosticText(msg.error || msg.reason || 'Splash frame presentation failed')
+        : msg.error
+          ? sanitizeDiagnosticText(msg.error)
+          : null;
+
+      const nowVal = this._now();
+      const timestampMs =
+        typeof msg.timestampMs === 'number' && Number.isFinite(msg.timestampMs)
+          ? msg.timestampMs
+          : typeof nowVal === 'number' && Number.isFinite(nowVal)
+            ? nowVal
+            : Date.now();
+
+      let isFirstPresent = false;
+      if (ok) {
+        this._splashFramesPresented += 1;
+        isFirstPresent = Boolean(msg.firstPresent) || !this._firstSplashPresented;
+        if (isFirstPresent) {
+          this._firstSplashPresented = true;
+        }
+      } else {
+        this._splashFrameErrorCount += 1;
+      }
+
+      const record = {
+        ok,
+        frameIndex,
+        framesPresented: this._splashFramesPresented,
+        workerFramesPresented:
+          workerFramesPresented !== null ? workerFramesPresented : this._splashFramesPresented,
+        firstPresent: isFirstPresent,
+        source,
+        reason,
+        error,
+        timestampMs,
+      };
+      this._lastSplashFrame = record;
+
+      if (ok && isFirstPresent) {
+        this._hudLog(
+          `First splash frame presented (frame ${frameIndex ?? 0}, total ${this._splashFramesPresented}).`,
+          'ok'
+        );
+      } else if (!ok) {
+        this._hudLog(
+          `Splash frame presentation warning: ${error || 'failed'}`,
+          'warn'
+        );
+      }
+
+      const eventPayload = {
+        type: 'splash-frame-presented',
+        ...record,
+        splashFramesPresented: this._splashFramesPresented,
+        splashFrameErrorCount: this._splashFrameErrorCount,
+        firstSplashPresented: this._firstSplashPresented,
+        bootMode: this._bootMode,
+        state: this._state,
+        mode: this._mode,
+      };
+
+      if (this._hud) {
+        const hudSplashFns = ['onSplashFramePresented', 'recordSplashFrame', 'updateSplashStatus'];
+        for (const fnName of hudSplashFns) {
+          if (typeof this._hud[fnName] === 'function') {
+            try {
+              this._hud[fnName]({ ...eventPayload });
+            } catch {
+              // Isolate HUD callback errors.
+            }
+            break;
+          }
+        }
+        if (typeof this._hud.updateTelemetry === 'function') {
+          try {
+            this._hud.updateTelemetry({ ...eventPayload });
+          } catch {
+            // Isolate HUD callback errors.
+          }
+        }
+      }
+
+      for (const listener of [...this._splashListeners]) {
+        try {
+          listener({ ...eventPayload });
+        } catch {
+          // Never allow splash observers to throw.
+        }
+      }
+
+      for (const listener of [...this._telemetryListeners]) {
+        try {
+          listener({ ...eventPayload });
+        } catch {
+          // Never allow telemetry observers to throw.
+        }
+      }
+
+      return {
+        handled: true,
+        type: 'splash-frame-presented',
+        record: { ...record },
+        splashFramesPresented: this._splashFramesPresented,
+        splashFrameErrorCount: this._splashFrameErrorCount,
+        firstSplashPresented: this._firstSplashPresented,
+      };
+    } catch {
+      return {
+        handled: false,
+        type: 'splash-frame-presented',
+        record: null,
+        splashFramesPresented: this._splashFramesPresented,
+        splashFrameErrorCount: this._splashFrameErrorCount,
+        firstSplashPresented: this._firstSplashPresented,
+      };
+    }
+  }
+
+  /**
+   * Dispatches a message (or MessageEvent) from `wgpu_worker.js` / `loader.js`.
+   * Handles `gpu-validation-error`, `splash-frame-presented`, and optional boot
+   * lifecycle messages without ever throwing.
+   */
+  handleWorkerMessage(messageOrEvent) {
+    try {
+      const msg =
+        messageOrEvent &&
+        typeof messageOrEvent === 'object' &&
+        'data' in messageOrEvent &&
+        messageOrEvent.data &&
+        typeof messageOrEvent.data === 'object'
+          ? messageOrEvent.data
+          : messageOrEvent;
+
+      if (!msg || typeof msg !== 'object') {
+        return { handled: false, type: null };
+      }
+
+      if (msg.type === 'gpu-validation-error') {
+        return this.recordGpuValidationError(msg);
+      }
+
+      if (msg.type === 'splash-frame-presented') {
+        return this.recordSplashFramePresented(msg);
+      }
+
+      if (
+        msg.type === 'boot-status' ||
+        msg.type === 'boot-lifecycle' ||
+        msg.type === 'runtime-boot-mode'
+      ) {
+        const meta = this.notifyBootLifecycle(msg);
+        return {
+          handled: true,
+          type: msg.type,
+          ...meta,
+        };
+      }
+
+      return {
+        handled: false,
+        type: typeof msg.type === 'string' ? msg.type : null,
+      };
+    } catch {
+      return { handled: false, type: null };
+    }
+  }
+
+  /**
+   * Subscribes to `message` events on a `wgpu_worker.js` (or compatible EventTarget)
+   * instance so `gpu-validation-error` and `splash-frame-presented` notifications flow
+   * automatically into session state and observers. Returns an idempotent detach function.
+   */
+  attachWorker(worker) {
+    if (!isEventTargetLike(worker)) {
+      throw new TypeError('attachWorker requires an EventTarget-like worker with addEventListener/removeEventListener');
+    }
+    const existing = this._attachedWorkers.get(worker);
+    if (existing) {
+      return existing;
+    }
+
+    const onMessage = (event) => {
+      this.handleWorkerMessage(event);
+    };
+    worker.addEventListener('message', onMessage);
+
+    let active = true;
+    const detach = () => {
+      if (!active) return;
+      active = false;
+      this._attachedWorkers.delete(worker);
+      try {
+        worker.removeEventListener('message', onMessage);
+      } catch {
+        // Ignore worker listener removal errors during teardown.
+      }
+    };
+
+    this._attachedWorkers.set(worker, detach);
+    return detach;
   }
 
   _reportError(err, context = {}) {
@@ -514,6 +1489,21 @@ export class RuntimeSessionController {
         });
       }
     }
+
+    if (this._attachedWorkers.size > 0) {
+      const detachers = [...this._attachedWorkers.values()];
+      this._attachedWorkers.clear();
+      for (const detach of detachers) {
+        try {
+          detach();
+        } catch (err) {
+          this._reportError(toError(err, 'Failed to detach worker message listener'), {
+            phase: 'stop',
+            source: 'wgpuWorker',
+          });
+        }
+      }
+    }
   }
 
   _wireSubsystems() {
@@ -555,6 +1545,18 @@ export class RuntimeSessionController {
           ? this._audioEngine.resumeOnUserGesture(this._audioGestureTarget)
           : this._audioEngine.resumeOnUserGesture();
       this._audioGestureCleanup = typeof cleanup === 'function' ? cleanup : null;
+    }
+
+    // 4. Attach optional explicit wgpuWorker (or handle.wgpuWorker) for live GPU telemetry.
+    if (this._wgpuWorker) {
+      this.attachWorker(this._wgpuWorker);
+    }
+    if (
+      this._activeHandle &&
+      typeof this._activeHandle === 'object' &&
+      isEventTargetLike(this._activeHandle.wgpuWorker)
+    ) {
+      this.attachWorker(this._activeHandle.wgpuWorker);
     }
   }
 
@@ -629,6 +1631,8 @@ export class RuntimeSessionController {
       }
     }
     this._serverStatus = serverStatus;
+    this._sideModuleCount = serverStatus.sideModuleCount;
+    this._sideModuleUrls = [...serverStatus.sideModuleUrls];
 
     // 3. Optional BrowserStorageManager summary
     if (this._storageManager && typeof this._storageManager.getSummary === 'function') {
@@ -642,10 +1646,14 @@ export class RuntimeSessionController {
     }
 
     const { missing, reasons } = evaluateRequirements(capabilities);
+    this._emitStatusUpdate('probe');
 
     return {
       capabilities: { ...capabilities },
-      serverStatus: { ...serverStatus },
+      serverStatus: this._cloneServerStatus(),
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
       storageSummary: this._storageSummary,
       missingCapabilities: missing,
       diagnosticReasons: reasons,
@@ -678,9 +1686,12 @@ export class RuntimeSessionController {
         alreadyRunning: true,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         fallbackReason: this._fallbackReason,
         capabilities: this._capabilities ? { ...this._capabilities } : null,
-        serverStatus: this._serverStatus ? { ...this._serverStatus } : null,
+        serverStatus: this._cloneServerStatus(),
         handle: this._activeHandle,
         diagnostics: this.getDiagnostics(),
       };
@@ -701,7 +1712,16 @@ export class RuntimeSessionController {
     this._diagnosticReasons = [];
     this._fallbackReason = null;
     this._mode = SESSION_MODE.NONE;
+    this._bootMode = BOOT_MODE.IDLE;
     this._startedAtMs = null;
+
+    this._validationErrorCount = 0;
+    this._validationErrorSeq = 0;
+    this._recentValidationErrors = [];
+    this._splashFramesPresented = 0;
+    this._splashFrameErrorCount = 0;
+    this._firstSplashPresented = false;
+    this._lastSplashFrame = null;
 
     this._transition(SESSION_STATE.PROBING, {
       reason: 'Probing browser capabilities and server readiness',
@@ -715,6 +1735,9 @@ export class RuntimeSessionController {
         aborted: true,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         diagnostics: this.getDiagnostics(),
       };
     }
@@ -730,6 +1753,7 @@ export class RuntimeSessionController {
       this._lastError = error;
       this._diagnosticReasons = [...diagnosticReasons];
       this._mode = SESSION_MODE.NONE;
+      this._bootMode = BOOT_MODE.IDLE;
 
       const shortStatus =
         missingCapabilities.includes('crossOriginIsolated') ||
@@ -754,15 +1778,19 @@ export class RuntimeSessionController {
         reasons: [...diagnosticReasons],
         missingCapabilities: [...missingCapabilities],
       });
+      this._emitStatusUpdate('missing-capabilities');
 
       return {
         ok: false,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         error,
         reasons: [...diagnosticReasons],
         capabilities: { ...capabilities },
-        serverStatus: { ...serverStatus },
+        serverStatus: this._cloneServerStatus(),
         diagnostics: this.getDiagnostics(),
       };
     }
@@ -795,10 +1823,18 @@ export class RuntimeSessionController {
       }
     }
 
+    const targetBootMode =
+      targetMode === SESSION_MODE.WASM
+        ? BOOT_MODE.REAL_WASM64
+        : targetMode === SESSION_MODE.SMOKE
+          ? BOOT_MODE.SMOKE
+          : BOOT_MODE.IDLE;
+
     this._fallbackReason = fallbackReason;
 
     this._transition(SESSION_STATE.STARTING, {
       targetMode,
+      targetBootMode,
       fallbackReason,
     });
 
@@ -811,6 +1847,7 @@ export class RuntimeSessionController {
       error.code = 'NO_RUNTIME_LAUNCHER';
       this._lastError = error;
       this._diagnosticReasons = [error.message];
+      this._bootMode = BOOT_MODE.IDLE;
 
       this._hudStatus('No runtime launcher', 'error');
       this._hudLog(error.message, 'error');
@@ -818,18 +1855,22 @@ export class RuntimeSessionController {
         phase: 'starting',
         code: error.code,
         preferSmoke,
-        serverStatus: { ...serverStatus },
+        serverStatus: this._cloneServerStatus(),
       });
 
       this._transition(SESSION_STATE.ERROR, { error, reasons: [error.message] });
+      this._emitStatusUpdate('no-runtime-launcher');
       return {
         ok: false,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         error,
         reasons: [error.message],
         capabilities: { ...capabilities },
-        serverStatus: { ...serverStatus },
+        serverStatus: this._cloneServerStatus(),
         diagnostics: this.getDiagnostics(),
       };
     }
@@ -837,15 +1878,25 @@ export class RuntimeSessionController {
     if (targetMode === SESSION_MODE.WASM) {
       this._hudStatus('Starting Wasm64 runtime...', 'info');
       this._hudLog('Server reports Wasm64 runtime binary ready; launching Wasm64 runtime.', 'info');
+      if (this._sideModuleCount > 0) {
+        this._hudLog(
+          `Split-module Wasm64 layout detected (${this._sideModuleCount} side module${this._sideModuleCount === 1 ? '' : 's'}).`,
+          'info'
+        );
+      }
     } else {
       this._hudStatus('Starting smoke demo...', 'info');
       this._hudLog(fallbackReason, preferSmoke ? 'info' : 'warn');
     }
 
+    let callbackReportedBootMode = false;
     const launchContext = {
       mode: targetMode,
+      bootMode: targetBootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
       capabilities: { ...capabilities },
-      serverStatus: { ...serverStatus },
+      serverStatus: this._cloneServerStatus(),
       storageSummary: this._storageSummary,
       hud: this._hud,
       inputBridge: this._inputBridge,
@@ -853,6 +1904,33 @@ export class RuntimeSessionController {
       storageManager: this._storageManager,
       perfMonitor: this._perfMonitor,
       crashReporter: this._crashReporter,
+      onBootLifecycle: (meta) => {
+        if (token !== this._sessionToken) {
+          return this.getSideModuleMetadata();
+        }
+        if (meta && typeof meta === 'object' && normalizeBootMode(meta.bootMode || meta.mode)) {
+          callbackReportedBootMode = true;
+        }
+        return this.notifyBootLifecycle(meta);
+      },
+      onWorkerMessage: (msg) => {
+        if (token !== this._sessionToken) {
+          return { handled: false, type: null };
+        }
+        return this.handleWorkerMessage(msg);
+      },
+      onValidationError: (errPayload) => {
+        if (token !== this._sessionToken) {
+          return { handled: false, type: 'gpu-validation-error' };
+        }
+        return this.recordGpuValidationError(errPayload);
+      },
+      onSplashFramePresented: (splashPayload) => {
+        if (token !== this._sessionToken) {
+          return { handled: false, type: 'splash-frame-presented' };
+        }
+        return this.recordSplashFramePresented(splashPayload);
+      },
     };
 
     const launcher =
@@ -868,6 +1946,9 @@ export class RuntimeSessionController {
           aborted: true,
           state: this._state,
           mode: this._mode,
+          bootMode: this._bootMode,
+          sideModuleCount: this._sideModuleCount,
+          sideModuleUrls: [...this._sideModuleUrls],
           diagnostics: this.getDiagnostics(),
         };
       }
@@ -875,12 +1956,14 @@ export class RuntimeSessionController {
       this._lastError = normalized;
       this._diagnosticReasons = [normalized.message];
       this._mode = SESSION_MODE.NONE;
+      this._bootMode = BOOT_MODE.IDLE;
 
       this._hudStatus('Runtime start error', 'error');
       this._hudLog(`Failed to start ${targetMode} runtime: ${normalized.message}`, 'error');
       this._reportError(normalized, {
         phase: 'starting',
         targetMode,
+        targetBootMode,
         fallbackReason,
       });
 
@@ -889,15 +1972,19 @@ export class RuntimeSessionController {
         targetMode,
         reasons: [normalized.message],
       });
+      this._emitStatusUpdate('launcher-error');
 
       return {
         ok: false,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         error: normalized,
         reasons: [normalized.message],
         capabilities: { ...capabilities },
-        serverStatus: { ...serverStatus },
+        serverStatus: this._cloneServerStatus(),
         diagnostics: this.getDiagnostics(),
       };
     }
@@ -910,11 +1997,31 @@ export class RuntimeSessionController {
         aborted: true,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         diagnostics: this.getDiagnostics(),
       };
     }
 
     this._activeHandle = handle ?? null;
+
+    if (handle && typeof handle === 'object') {
+      const handleSideMeta = extractSideModuleMetadata(handle);
+      if (handleSideMeta.hasSideModuleUrls) {
+        this._sideModuleUrls = [...handleSideMeta.sideModuleUrls];
+        this._sideModuleCount = handleSideMeta.sideModuleCount;
+      } else if (handleSideMeta.hasSideModuleCount) {
+        this._sideModuleCount = handleSideMeta.sideModuleCount;
+      }
+      if (!callbackReportedBootMode) {
+        const handleBootMode = normalizeBootMode(handle.bootMode);
+        if (handleBootMode) {
+          this._bootMode = handleBootMode;
+          callbackReportedBootMode = true;
+        }
+      }
+    }
 
     try {
       this._wireSubsystems();
@@ -928,6 +2035,7 @@ export class RuntimeSessionController {
       this._lastError = normalized;
       this._diagnosticReasons = [normalized.message];
       this._mode = SESSION_MODE.NONE;
+      this._bootMode = BOOT_MODE.IDLE;
 
       this._hudStatus('Subsystem error', 'error');
       this._hudLog(`Subsystem initialization failed: ${normalized.message}`, 'error');
@@ -941,20 +2049,27 @@ export class RuntimeSessionController {
         error: normalized,
         reasons: [normalized.message],
       });
+      this._emitStatusUpdate('subsystem-error');
 
       return {
         ok: false,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         error: normalized,
         reasons: [normalized.message],
         capabilities: { ...capabilities },
-        serverStatus: { ...serverStatus },
+        serverStatus: this._cloneServerStatus(),
         diagnostics: this.getDiagnostics(),
       };
     }
 
     this._mode = targetMode;
+    if (!callbackReportedBootMode || this._bootMode === BOOT_MODE.IDLE) {
+      this._bootMode = targetBootMode;
+    }
     this._startedAtMs = this._now();
 
     const runningState =
@@ -968,16 +2083,21 @@ export class RuntimeSessionController {
     );
     this._transition(runningState, {
       mode: targetMode,
+      bootMode: this._bootMode,
       fallbackReason,
     });
+    this._emitStatusUpdate('running');
 
     return {
       ok: true,
       state: this._state,
       mode: this._mode,
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
       fallbackReason: this._fallbackReason,
       capabilities: { ...capabilities },
-      serverStatus: { ...serverStatus },
+      serverStatus: this._cloneServerStatus(),
       handle: this._activeHandle,
       diagnostics: this.getDiagnostics(),
     };
@@ -1000,6 +2120,7 @@ export class RuntimeSessionController {
     await this._stopHandle(handleToStop);
 
     this._mode = SESSION_MODE.NONE;
+    this._bootMode = BOOT_MODE.IDLE;
     this._startedAtMs = null;
     this._fallbackReason = null;
 
@@ -1009,18 +2130,25 @@ export class RuntimeSessionController {
         alreadyStopped: true,
         state: this._state,
         mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
         diagnostics: this.getDiagnostics(),
       };
     }
 
     this._hudStatus('Stopped', 'info');
     this._transition(SESSION_STATE.STOPPED, { reason: 'Session stopped' });
+    this._emitStatusUpdate('stopped');
 
     return {
       ok: true,
       alreadyStopped: false,
       state: this._state,
       mode: this._mode,
+      bootMode: this._bootMode,
+      sideModuleCount: this._sideModuleCount,
+      sideModuleUrls: [...this._sideModuleUrls],
       diagnostics: this.getDiagnostics(),
     };
   }

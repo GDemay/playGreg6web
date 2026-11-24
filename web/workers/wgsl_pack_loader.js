@@ -174,6 +174,100 @@ function resolveStageCode(stage) {
   throw new TypeError(`Shader stage must be a stage code (1..3) or stage name`);
 }
 
+function createDynamicShaderEntry(hash, stage, wgslSource, meta, prevEntry) {
+  const key = normalizeHash(hash);
+  const hashHex = formatHashHex(key);
+  const stageCode = resolveStageCode(stage);
+  const stageName = STAGE_NAMES[stageCode];
+
+  if (typeof wgslSource !== 'string') {
+    throw new TypeError('wgslSource must be a non-empty string');
+  }
+  if (wgslSource.trim().length === 0) {
+    throw new RangeError('wgslSource must be a non-empty WGSL string');
+  }
+
+  let opts = {};
+  if (meta !== undefined && meta !== null) {
+    if (typeof meta !== 'object' || Array.isArray(meta)) {
+      throw new TypeError('meta must be an object');
+    }
+    opts = meta;
+  }
+
+  let label = null;
+  if (opts.label !== undefined && opts.label !== null) {
+    if (typeof opts.label !== 'string') {
+      throw new TypeError('meta.label must be a string');
+    }
+    label = opts.label;
+  }
+
+  let entryPoint = null;
+  if (opts.entryPoint !== undefined && opts.entryPoint !== null) {
+    if (typeof opts.entryPoint !== 'string') {
+      throw new TypeError('meta.entryPoint must be a string');
+    }
+    entryPoint = opts.entryPoint;
+  }
+
+  let source = 'dynamic';
+  if (opts.source !== undefined && opts.source !== null) {
+    if (typeof opts.source !== 'string' || opts.source.trim().length === 0) {
+      throw new TypeError('meta.source must be a non-empty string');
+    }
+    source = opts.source;
+  }
+
+  let tags = [];
+  if (opts.tags !== undefined && opts.tags !== null) {
+    if (!Array.isArray(opts.tags) || opts.tags.some((t) => typeof t !== 'string')) {
+      throw new TypeError('meta.tags must be an array of strings');
+    }
+    tags = opts.tags.slice();
+  }
+
+  const byteLength = textEncoder.encode(wgslSource).byteLength;
+  const revision = prevEntry ? prevEntry.revision + 1 : 1;
+
+  return {
+    hash: key,
+    hashHex,
+    stage: stageName,
+    stageCode,
+    wgsl: wgslSource,
+    length: byteLength,
+    dynamic: true,
+    override: Boolean(opts.override),
+    source,
+    label,
+    entryPoint,
+    tags,
+    revision,
+    registeredAt: Date.now(),
+  };
+}
+
+function formatDynamicLookupRecord(entry, overridesStatic) {
+  return {
+    hash: entry.hash,
+    hashHex: entry.hashHex,
+    stage: entry.stage,
+    stageCode: entry.stageCode,
+    wgsl: entry.wgsl,
+    length: entry.length,
+    dynamic: true,
+    overridesStatic,
+    packName: null,
+    source: entry.source,
+    label: entry.label,
+    entryPoint: entry.entryPoint,
+    tags: entry.tags.slice(),
+    revision: entry.revision,
+    registeredAt: entry.registeredAt,
+  };
+}
+
 /**
  * Serialize shader entries into a binary `.wgsl.pack` `ArrayBuffer` matching
  * `write_pack` / `write_pack_with_layout` in `shaders/src/pack.rs` byte-for-byte.
@@ -257,7 +351,7 @@ export function buildWgslPackBuffer(entries, options = {}) {
 }
 
 /**
- * Parsed read-only view over a single `.wgsl.pack` archive.
+ * Parsed view over a single `.wgsl.pack` archive with optional live dynamic WGSL overlays.
  */
 export class WgslPack {
   /**
@@ -287,19 +381,162 @@ export class WgslPack {
     this._entryList = entryList;
     this._stageCounts = stageCounts;
     this._getDecodedCount = getDecodedCount;
+    this._dynamicEntries = new Map();
+    this._dynamicHits = 0;
   }
 
-  /** Number of shader entries in this pack. */
+  /** Number of distinct resolvable shader entries (static + non-overriding dynamic). */
   get size() {
-    return this._entryList.length;
+    let extraDynamic = 0;
+    for (const key of this._dynamicEntries.keys()) {
+      if (!this.entries.has(key)) {
+        extraDynamic += 1;
+      }
+    }
+    return this._entryList.length + extraDynamic;
+  }
+
+  /**
+   * Register a live dynamic WGSL shader on this pack instance.
+   * Pass `{ override: true }` in `meta` to supersede an existing static pack entry
+   * while preserving the static entry for `clearDynamicShaders()`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} stage
+   * @param {string} wgslSource
+   * @param {{ override?: boolean, label?: string, entryPoint?: string, source?: string, tags?: string[] }} [meta]
+   */
+  registerDynamicShader(hash, stage, wgslSource, meta) {
+    const key = normalizeHash(hash);
+    const hasStatic = this.entries.has(key);
+    const prevDynamic = this._dynamicEntries.get(key);
+    const entry = createDynamicShaderEntry(hash, stage, wgslSource, meta, prevDynamic);
+
+    if (hasStatic && !entry.override) {
+      throw new Error(
+        `Shader ${entry.hashHex} already exists in static WGSL pack; pass { override: true } to supersede it`
+      );
+    }
+
+    this._dynamicEntries.set(key, entry);
+    return formatDynamicLookupRecord(entry, hasStatic);
+  }
+
+  /**
+   * Check whether a dynamic shader is registered for `hash` (and optional `stage`).
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {boolean}
+   */
+  hasDynamicShader(hash, stage) {
+    const key = normalizeHash(hash);
+    const entry = this._dynamicEntries.get(key);
+    if (!entry) {
+      return false;
+    }
+    if (stage !== undefined && stage !== null) {
+      return entry.stageCode === resolveStageCode(stage);
+    }
+    return true;
+  }
+
+  /**
+   * Remove a single dynamic shader by hash, restoring any underlying static pack entry.
+   *
+   * @param {bigint | string | number} hash
+   * @returns {boolean}
+   */
+  unregisterDynamicShader(hash) {
+    const key = normalizeHash(hash);
+    return this._dynamicEntries.delete(key);
+  }
+
+  /**
+   * Remove all registered dynamic shaders while preserving static pack entries.
+   *
+   * @returns {number} Number of dynamic shaders cleared
+   */
+  clearDynamicShaders() {
+    const count = this._dynamicEntries.size;
+    this._dynamicEntries.clear();
+    return count;
+  }
+
+  /**
+   * Look up a shader entry by hash (and optional stage), checking dynamic overrides first
+   * and falling back to static pack entries.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   */
+  lookup(hash, stage) {
+    const key = normalizeHash(hash);
+    const expectedStage =
+      stage !== undefined && stage !== null ? resolveStageCode(stage) : null;
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      if (expectedStage !== null && dynamicEntry.stageCode !== expectedStage) {
+        return undefined;
+      }
+      this._dynamicHits += 1;
+      return formatDynamicLookupRecord(dynamicEntry, this.entries.has(key));
+    }
+
+    const staticEntry = this.entries.get(key);
+    if (!staticEntry) {
+      return undefined;
+    }
+    if (expectedStage !== null && staticEntry.stageCode !== expectedStage) {
+      return undefined;
+    }
+    return {
+      hash: staticEntry.hash,
+      hashHex: staticEntry.hashHex,
+      stage: staticEntry.stage,
+      stageCode: staticEntry.stageCode,
+      wgsl: staticEntry.wgsl,
+      length: staticEntry.length,
+      offset: staticEntry.offset,
+      dynamic: false,
+      overridesStatic: false,
+      packName: null,
+      source: 'pack',
+      label: null,
+      entryPoint: null,
+      tags: [],
+      revision: 0,
+      registeredAt: null,
+    };
+  }
+
+  /**
+   * Alias for `lookup(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   */
+  get(hash, stage) {
+    return this.lookup(hash, stage);
   }
 
   /**
    * Look up a shader entry by `BigInt` hash, hex string, or safe integer.
+   * Checks dynamic overrides first, then static pack entries.
    *
    * @param {bigint | string | number} hash
    */
   getByHash(hash) {
+    if (this._dynamicEntries.size > 0) {
+      const key = normalizeHash(hash);
+      const dynamicEntry = this._dynamicEntries.get(key);
+      if (dynamicEntry) {
+        this._dynamicHits += 1;
+        return formatDynamicLookupRecord(dynamicEntry, this.entries.has(key));
+      }
+      return this.entries.get(key);
+    }
     if (typeof hash === 'string') {
       const fast = this._byHex.get(hash);
       if (fast !== undefined) {
@@ -312,7 +549,7 @@ export class WgslPack {
 
   /**
    * Retrieve the UTF-8 WGSL source string for a shader hash.
-   * In `lazyDecode` mode, decodes and caches the string on first access.
+   * Checks dynamic overrides first; in `lazyDecode` mode, decodes static entries on first access.
    *
    * @param {bigint | string | number} hash
    * @returns {string | undefined}
@@ -323,12 +560,20 @@ export class WgslPack {
   }
 
   /**
-   * Check whether a shader hash exists in this pack without triggering lazy UTF-8 decode.
+   * Check whether a shader hash exists in dynamic overrides or this static pack
+   * without triggering lazy UTF-8 decode.
    *
    * @param {bigint | string | number} hash
    * @returns {boolean}
    */
   has(hash) {
+    if (this._dynamicEntries.size > 0) {
+      const key = normalizeHash(hash);
+      if (this._dynamicEntries.has(key)) {
+        return true;
+      }
+      return this.entries.has(key);
+    }
     if (typeof hash === 'string') {
       if (this._byHex.has(hash)) {
         return true;
@@ -339,7 +584,7 @@ export class WgslPack {
   }
 
   /**
-   * Return all shader entries in their original pack table order.
+   * Return all static shader entries in their original pack table order.
    * Does not trigger lazy UTF-8 decoding until `.wgsl` is accessed on an entry.
    */
   listEntries() {
@@ -347,10 +592,62 @@ export class WgslPack {
   }
 
   /**
-   * Return structural and decode statistics for this pack.
+   * Return metadata summaries for all dynamically registered shaders on this pack.
+   *
+   * @param {{ stage?: number | string, includeSource?: boolean }} [options]
+   */
+  listDynamicShaders(options = {}) {
+    const expectedStage =
+      options && options.stage !== undefined && options.stage !== null
+        ? resolveStageCode(options.stage)
+        : null;
+    const includeSource = Boolean(options && options.includeSource);
+
+    const results = [];
+    for (const entry of this._dynamicEntries.values()) {
+      if (expectedStage !== null && entry.stageCode !== expectedStage) {
+        continue;
+      }
+      const item = {
+        hash: entry.hash,
+        hashHex: entry.hashHex,
+        stage: entry.stage,
+        stageCode: entry.stageCode,
+        length: entry.length,
+        dynamic: true,
+        overridesStatic: this.entries.has(entry.hash),
+        source: entry.source,
+        label: entry.label,
+        entryPoint: entry.entryPoint,
+        tags: entry.tags.slice(),
+        revision: entry.revision,
+        registeredAt: entry.registeredAt,
+      };
+      if (includeSource) {
+        item.wgsl = entry.wgsl;
+      }
+      results.push(item);
+    }
+    return results;
+  }
+
+  /**
+   * Return structural, decode, and dynamic overlay statistics for this pack.
    */
   stats() {
     const entryCount = this._entryList.length;
+    let dynamicOverrideCount = 0;
+    let dynamicPayloadBytes = 0;
+    const dynamicStageCounts = { vertex: 0, fragment: 0, compute: 0 };
+
+    for (const entry of this._dynamicEntries.values()) {
+      if (this.entries.has(entry.hash)) {
+        dynamicOverrideCount += 1;
+      }
+      dynamicPayloadBytes += entry.length;
+      dynamicStageCounts[entry.stage] += 1;
+    }
+
     return {
       version: this.version,
       flags: this.flags,
@@ -362,7 +659,19 @@ export class WgslPack {
       decodedCount: this._getDecodedCount(),
       lazyDecode: this.lazyDecode,
       stageCounts: { ...this._stageCounts },
+      dynamicCount: this._dynamicEntries.size,
+      dynamicOverrideCount,
+      dynamicPayloadBytes,
+      dynamicHits: this._dynamicHits,
+      dynamicStageCounts,
     };
+  }
+
+  /**
+   * Alias for `stats()`.
+   */
+  getStats() {
+    return this.stats();
   }
 }
 
@@ -544,6 +853,7 @@ export class WgslPackCache {
 
     this._packs = new Map();
     this._shaderEntries = new Map();
+    this._dynamicEntries = new Map();
     this._deviceModules = new Map();
     this._indexMeta = new Map();
     this._shaderIndexAbiVersion = null;
@@ -555,12 +865,14 @@ export class WgslPackCache {
       misses: 0,
       compiles: 0,
       evictions: 0,
+      dynamicHits: 0,
     };
   }
 
   /**
    * Parse and register a `.wgsl.pack` binary buffer.
    * If a pack with the same `packName` is already loaded, its entries are replaced.
+   * Active dynamic shader overrides are preserved across static pack loads.
    *
    * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
    * @param {string} [packName]
@@ -581,14 +893,16 @@ export class WgslPackCache {
       for (const [hash, record] of this._shaderEntries.entries()) {
         if (record.packName === name) {
           this._shaderEntries.delete(hash);
-          this._evictModuleOnly(hash);
+          if (!this._dynamicEntries.has(hash)) {
+            this._evictModuleOnly(hash);
+          }
         }
       }
     }
 
     this._packs.set(name, pack);
     for (const entry of pack.listEntries()) {
-      if (this._shaderEntries.has(entry.hash)) {
+      if (this._shaderEntries.has(entry.hash) && !this._dynamicEntries.has(entry.hash)) {
         this._evictModuleOnly(entry.hash);
       }
       this._shaderEntries.set(entry.hash, { entry, pack, packName: name });
@@ -718,37 +1032,217 @@ export class WgslPackCache {
   }
 
   /**
-   * Return whether any loaded pack contains the given shader hash.
+   * Register a live dynamic WGSL shader at runtime (e.g., freshly translated RDNA2->WGSL
+   * or hot-patched shader). Pass `{ override: true }` in `meta` to supersede an existing
+   * static pack entry while preserving the static entry for `clearDynamicShaders()`.
+   * Automatically evicts any stale compiled `GPUShaderModule` cached for `hash`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} stage
+   * @param {string} wgslSource
+   * @param {{ override?: boolean, label?: string, entryPoint?: string, source?: string, tags?: string[] }} [meta]
+   */
+  registerDynamicShader(hash, stage, wgslSource, meta) {
+    const key = normalizeHash(hash);
+    const staticRecord = this._shaderEntries.get(key);
+    const prevDynamic = this._dynamicEntries.get(key);
+    const entry = createDynamicShaderEntry(hash, stage, wgslSource, meta, prevDynamic);
+
+    if (staticRecord && !entry.override) {
+      throw new Error(
+        `Shader ${entry.hashHex} already exists in static pack "${staticRecord.packName}"; pass { override: true } to supersede it`
+      );
+    }
+
+    this._dynamicEntries.set(key, entry);
+    this._evictModuleOnly(key);
+    return formatDynamicLookupRecord(entry, Boolean(staticRecord));
+  }
+
+  /**
+   * Check whether a dynamic shader is registered for `hash` (and optional `stage`).
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {boolean}
+   */
+  hasDynamicShader(hash, stage) {
+    const key = normalizeHash(hash);
+    const entry = this._dynamicEntries.get(key);
+    if (!entry) {
+      return false;
+    }
+    if (stage !== undefined && stage !== null) {
+      return entry.stageCode === resolveStageCode(stage);
+    }
+    return true;
+  }
+
+  /**
+   * Remove a single dynamic shader by hash and evict its compiled module(s),
+   * restoring any underlying static pack entry.
    *
    * @param {bigint | string | number} hash
    * @returns {boolean}
    */
-  hasShader(hash) {
-    return this._shaderEntries.has(normalizeHash(hash));
+  unregisterDynamicShader(hash) {
+    const key = normalizeHash(hash);
+    const removed = this._dynamicEntries.delete(key);
+    if (removed) {
+      this._evictModuleOnly(key);
+    }
+    return removed;
   }
 
   /**
-   * Get the WGSL source string for a shader hash from loaded packs.
+   * Remove all dynamically registered shaders and evict their compiled `GPUShaderModule`s
+   * while preserving all static packs, static entries, and shader-index metadata.
+   *
+   * @returns {number} Number of dynamic shaders cleared
+   */
+  clearDynamicShaders() {
+    const count = this._dynamicEntries.size;
+    for (const key of this._dynamicEntries.keys()) {
+      this._evictModuleOnly(key);
+    }
+    this._dynamicEntries.clear();
+    return count;
+  }
+
+  /**
+   * Look up a shader entry by hash (and optional stage), checking dynamic overrides first
+   * and then static pack entries. Increments `dynamicHits` when resolved dynamically.
    *
    * @param {bigint | string | number} hash
-   * @returns {string | undefined}
+   * @param {number | string} [stage]
    */
-  getShaderSource(hash) {
-    const record = this._shaderEntries.get(normalizeHash(hash));
-    return record ? record.entry.wgsl : undefined;
+  lookup(hash, stage) {
+    const key = normalizeHash(hash);
+    const expectedStage =
+      stage !== undefined && stage !== null ? resolveStageCode(stage) : null;
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      if (expectedStage !== null && dynamicEntry.stageCode !== expectedStage) {
+        return undefined;
+      }
+      this._stats.dynamicHits += 1;
+      return formatDynamicLookupRecord(dynamicEntry, this._shaderEntries.has(key));
+    }
+
+    const record = this._shaderEntries.get(key);
+    if (!record) {
+      return undefined;
+    }
+    if (expectedStage !== null && record.entry.stageCode !== expectedStage) {
+      return undefined;
+    }
+    const indexMeta = this._indexMeta.get(key);
+    return {
+      hash: record.entry.hash,
+      hashHex: record.entry.hashHex,
+      stage: record.entry.stage,
+      stageCode: record.entry.stageCode,
+      wgsl: record.entry.wgsl,
+      length: record.entry.length,
+      offset: record.entry.offset,
+      dynamic: false,
+      overridesStatic: false,
+      packName: record.packName,
+      source: 'pack',
+      label: null,
+      entryPoint: indexMeta ? indexMeta.entryPoint : null,
+      tags: [],
+      revision: 0,
+      registeredAt: null,
+    };
   }
 
   /**
-   * Get combined pack + optional `shader-index.json` metadata for a shader hash.
+   * Alias for `lookup(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   */
+  get(hash, stage) {
+    return this.lookup(hash, stage);
+  }
+
+  /**
+   * Return whether any dynamic override or loaded static pack contains the given shader hash
+   * (optionally matching `stage`).
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {boolean}
+   */
+  hasShader(hash, stage) {
+    const key = normalizeHash(hash);
+    const expectedStage =
+      stage !== undefined && stage !== null ? resolveStageCode(stage) : null;
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      return expectedStage === null || dynamicEntry.stageCode === expectedStage;
+    }
+
+    const record = this._shaderEntries.get(key);
+    if (!record) {
+      return false;
+    }
+    return expectedStage === null || record.entry.stageCode === expectedStage;
+  }
+
+  /**
+   * Get the WGSL source string for a shader hash, checking dynamic overrides first
+   * and then loaded static packs.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {string | undefined}
+   */
+  getShaderSource(hash, stage) {
+    const found = this.lookup(hash, stage);
+    return found ? found.wgsl : undefined;
+  }
+
+  /**
+   * Get combined dynamic + static pack + optional `shader-index.json` metadata for a shader hash.
    *
    * @param {bigint | string | number} hash
    */
   getShaderMetadata(hash) {
     const key = normalizeHash(hash);
+    const dynamicEntry = this._dynamicEntries.get(key);
     const record = this._shaderEntries.get(key);
     const indexMeta = this._indexMeta.get(key);
-    if (!record && !indexMeta) {
+    if (!dynamicEntry && !record && !indexMeta) {
       return undefined;
+    }
+    if (dynamicEntry) {
+      return {
+        hash: key,
+        hashHex: formatHashHex(key),
+        stage: dynamicEntry.stage,
+        stageCode: dynamicEntry.stageCode,
+        packName: record ? record.packName : null,
+        offset: record ? record.entry.offset : indexMeta ? indexMeta.packOffset : null,
+        length: dynamicEntry.length,
+        wgslPath: indexMeta ? indexMeta.wgslPath : null,
+        entryPoint:
+          dynamicEntry.entryPoint !== null
+            ? dynamicEntry.entryPoint
+            : indexMeta
+              ? indexMeta.entryPoint
+              : null,
+        dynamic: true,
+        overridesStatic: Boolean(record),
+        source: dynamicEntry.source,
+        label: dynamicEntry.label,
+        tags: dynamicEntry.tags.slice(),
+        revision: dynamicEntry.revision,
+        registeredAt: dynamicEntry.registeredAt,
+      };
     }
     return {
       hash: key,
@@ -760,6 +1254,8 @@ export class WgslPackCache {
       length: record ? record.entry.length : indexMeta.packLength,
       wgslPath: indexMeta ? indexMeta.wgslPath : null,
       entryPoint: indexMeta ? indexMeta.entryPoint : null,
+      dynamic: false,
+      overridesStatic: false,
     };
   }
 
@@ -779,6 +1275,7 @@ export class WgslPackCache {
 
   /**
    * Return a cached `GPUShaderModule` for `(device, hash)` or compile and cache it.
+   * Resolves dynamic shader overrides ahead of static pack entries.
    *
    * @param {GPUDevice} device
    * @param {bigint | string | number} hash
@@ -795,20 +1292,32 @@ export class WgslPackCache {
     const cached = deviceMap.get(key);
     if (cached !== undefined) {
       this._stats.hits += 1;
+      if (this._dynamicEntries.has(key)) {
+        this._stats.dynamicHits += 1;
+      }
       return cached;
     }
 
     this._stats.misses += 1;
-    const record = this._shaderEntries.get(key);
-    if (!record) {
-      throw new Error(`Shader ${formatHashHex(key)} not found in any loaded WGSL pack`);
+    const dynamicEntry = this._dynamicEntries.get(key);
+    let entry;
+    if (dynamicEntry) {
+      this._stats.dynamicHits += 1;
+      entry = dynamicEntry;
+    } else {
+      const record = this._shaderEntries.get(key);
+      if (!record) {
+        throw new Error(`Shader ${formatHashHex(key)} not found in any loaded WGSL pack`);
+      }
+      entry = record.entry;
     }
 
-    const { entry } = record;
     const prefix = labelPrefix !== undefined ? String(labelPrefix) : this._labelPrefix;
-    const label = prefix
+    const baseLabel = prefix
       ? `${prefix}:${entry.stage}:${entry.hashHex}`
       : `${entry.stage}:${entry.hashHex}`;
+    const label =
+      dynamicEntry && dynamicEntry.label ? `${baseLabel}:${dynamicEntry.label}` : baseLabel;
 
     const shaderModule = device.createShaderModule({
       label,
@@ -859,7 +1368,7 @@ export class WgslPackCache {
 
     const rawList =
       hashes === undefined || hashes === null
-        ? Array.from(this._shaderEntries.keys())
+        ? [...this._shaderEntries.keys(), ...this._dynamicEntries.keys()]
         : Array.from(hashes, (h) => normalizeHash(h));
 
     // Deduplicate while preserving submission order.
@@ -927,7 +1436,7 @@ export class WgslPackCache {
 
   /**
    * Evict a compiled `GPUShaderModule` for `hash` from the cache.
-   * Pass `{ removeSource: true }` to also drop its loaded pack entry.
+   * Pass `{ removeSource: true }` to also drop its loaded pack / dynamic entry.
    *
    * @param {bigint | string | number} hash
    * @param {{ removeSource?: boolean }} [options]
@@ -938,19 +1447,22 @@ export class WgslPackCache {
     const evictedModule = this._evictModuleOnly(key);
     let evictedSource = false;
     if (options && options.removeSource) {
-      evictedSource = this._shaderEntries.delete(key);
+      const removedStatic = this._shaderEntries.delete(key);
+      const removedDynamic = this._dynamicEntries.delete(key);
+      evictedSource = removedStatic || removedDynamic;
     }
     return evictedModule || evictedSource;
   }
 
   /**
-   * Clear all loaded packs, cached shader modules, and index metadata.
+   * Clear all loaded packs, dynamic shaders, cached shader modules, and index metadata.
    *
    * @param {{ resetStats?: boolean }} [options]
    */
   clear(options = {}) {
     this._packs.clear();
     this._shaderEntries.clear();
+    this._dynamicEntries.clear();
     this._deviceModules.clear();
     this._indexMeta.clear();
     this._shaderIndexAbiVersion = null;
@@ -960,11 +1472,176 @@ export class WgslPackCache {
       this._stats.misses = 0;
       this._stats.compiles = 0;
       this._stats.evictions = 0;
+      this._stats.dynamicHits = 0;
     }
   }
 
   /**
-   * Return cache statistics across all loaded packs and compiled shader modules.
+   * List metadata summaries for all dynamically registered shaders.
+   *
+   * @param {{ stage?: number | string, includeSource?: boolean }} [options]
+   */
+  listDynamicShaders(options = {}) {
+    const expectedStage =
+      options && options.stage !== undefined && options.stage !== null
+        ? resolveStageCode(options.stage)
+        : null;
+    const includeSource = Boolean(options && options.includeSource);
+
+    const results = [];
+    for (const entry of this._dynamicEntries.values()) {
+      if (expectedStage !== null && entry.stageCode !== expectedStage) {
+        continue;
+      }
+      const item = {
+        hash: entry.hash,
+        hashHex: entry.hashHex,
+        stage: entry.stage,
+        stageCode: entry.stageCode,
+        length: entry.length,
+        dynamic: true,
+        overridesStatic: this._shaderEntries.has(entry.hash),
+        source: entry.source,
+        label: entry.label,
+        entryPoint: entry.entryPoint,
+        tags: entry.tags.slice(),
+        revision: entry.revision,
+        registeredAt: entry.registeredAt,
+      };
+      if (includeSource) {
+        item.wgsl = entry.wgsl;
+      }
+      results.push(item);
+    }
+    return results;
+  }
+
+  /**
+   * List active resolvable shaders across static packs and dynamic overrides
+   * without triggering lazy UTF-8 decoding unless `includeSource: true`.
+   *
+   * @param {{
+   *   stage?: number | string,
+   *   dynamicOnly?: boolean,
+   *   staticOnly?: boolean,
+   *   includeSource?: boolean,
+   * }} [options]
+   */
+  listShaders(options = {}) {
+    const expectedStage =
+      options && options.stage !== undefined && options.stage !== null
+        ? resolveStageCode(options.stage)
+        : null;
+    const dynamicOnly = Boolean(options && options.dynamicOnly);
+    const staticOnly = Boolean(options && options.staticOnly);
+    const includeSource = Boolean(options && options.includeSource);
+
+    const results = [];
+    const seen = new Set();
+
+    if (!staticOnly) {
+      for (const entry of this._dynamicEntries.values()) {
+        seen.add(entry.hash);
+        if (expectedStage !== null && entry.stageCode !== expectedStage) {
+          continue;
+        }
+        const item = {
+          hash: entry.hash,
+          hashHex: entry.hashHex,
+          stage: entry.stage,
+          stageCode: entry.stageCode,
+          length: entry.length,
+          dynamic: true,
+          overridesStatic: this._shaderEntries.has(entry.hash),
+          packName: null,
+          source: entry.source,
+          label: entry.label,
+          entryPoint: entry.entryPoint,
+          tags: entry.tags.slice(),
+          revision: entry.revision,
+          registeredAt: entry.registeredAt,
+        };
+        if (includeSource) {
+          item.wgsl = entry.wgsl;
+        }
+        results.push(item);
+      }
+    }
+
+    if (!dynamicOnly) {
+      for (const [hash, record] of this._shaderEntries.entries()) {
+        if (!staticOnly && seen.has(hash)) {
+          continue;
+        }
+        if (expectedStage !== null && record.entry.stageCode !== expectedStage) {
+          continue;
+        }
+        const indexMeta = this._indexMeta.get(hash);
+        const item = {
+          hash,
+          hashHex: record.entry.hashHex,
+          stage: record.entry.stage,
+          stageCode: record.entry.stageCode,
+          length: record.entry.length,
+          offset: record.entry.offset,
+          dynamic: false,
+          overridesStatic: false,
+          overriddenByDynamic: this._dynamicEntries.has(hash),
+          packName: record.packName,
+          source: 'pack',
+          label: null,
+          entryPoint: indexMeta ? indexMeta.entryPoint : null,
+          tags: [],
+          revision: 0,
+          registeredAt: null,
+        };
+        if (includeSource) {
+          item.wgsl = record.entry.wgsl;
+        }
+        results.push(item);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Return a JSON-serializable introspection snapshot of loaded packs, index metadata,
+   * dynamic overrides, and cache statistics.
+   */
+  inspect() {
+    const stats = this.getStats();
+    const dynamicShaders = [];
+    for (const entry of this._dynamicEntries.values()) {
+      dynamicShaders.push({
+        hashHex: entry.hashHex,
+        stage: entry.stage,
+        stageCode: entry.stageCode,
+        length: entry.length,
+        overridesStatic: this._shaderEntries.has(entry.hash),
+        source: entry.source,
+        label: entry.label,
+        entryPoint: entry.entryPoint,
+        tags: entry.tags.slice(),
+        revision: entry.revision,
+        registeredAt: entry.registeredAt,
+      });
+    }
+
+    return {
+      stats,
+      packNames: Array.from(this._packs.keys()),
+      shaderIndex: {
+        abiVersion: this._shaderIndexAbiVersion,
+        packPath: this._shaderIndexPackPath,
+        count: this._indexMeta.size,
+      },
+      dynamicShaders,
+    };
+  }
+
+  /**
+   * Return cache statistics across all loaded packs, dynamic shaders, and compiled modules.
    */
   getStats() {
     let cachedModules = 0;
@@ -980,10 +1657,38 @@ export class WgslPackCache {
       packs[name] = s;
     }
 
+    const stageCounts = { vertex: 0, fragment: 0, compute: 0 };
+    const dynamicStageCounts = { vertex: 0, fragment: 0, compute: 0 };
+    let dynamicOverrideCount = 0;
+    let dynamicPayloadBytes = 0;
+
+    for (const [hash, entry] of this._dynamicEntries.entries()) {
+      if (this._shaderEntries.has(hash)) {
+        dynamicOverrideCount += 1;
+      }
+      dynamicPayloadBytes += entry.length;
+      dynamicStageCounts[entry.stage] += 1;
+      stageCounts[entry.stage] += 1;
+    }
+
+    for (const [hash, record] of this._shaderEntries.entries()) {
+      if (!this._dynamicEntries.has(hash)) {
+        stageCounts[record.entry.stage] += 1;
+      }
+    }
+
+    const staticShaderCount = this._shaderEntries.size;
+    const dynamicCount = this._dynamicEntries.size;
+    const shaderCount = staticShaderCount + (dynamicCount - dynamicOverrideCount);
+
     const totalLookups = this._stats.hits + this._stats.misses;
     return {
       packCount: this._packs.size,
-      shaderCount: this._shaderEntries.size,
+      shaderCount,
+      staticShaderCount,
+      dynamicCount,
+      dynamicOverrideCount,
+      dynamicPayloadBytes,
       indexedMetadataCount: this._indexMeta.size,
       cachedModules,
       totalPackBytes,
@@ -991,7 +1696,10 @@ export class WgslPackCache {
       misses: this._stats.misses,
       compiles: this._stats.compiles,
       evictions: this._stats.evictions,
+      dynamicHits: this._stats.dynamicHits,
       hitRate: totalLookups > 0 ? this._stats.hits / totalLookups : 0,
+      stageCounts,
+      dynamicStageCounts,
       packs,
     };
   }
