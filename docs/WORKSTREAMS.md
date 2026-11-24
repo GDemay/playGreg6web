@@ -84,7 +84,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Generic guest-memory COM objects (vtables of dispatchable addresses, `IUnknown` lifetime, argument marshaling) plus the `xgameruntime.dll` provider entry points routed onto the existing `pg6_gdk_*` shims; shared by `d3d12_xs` (G24), DirectStorage and GameInput interfaces.
 - [ ] **O17 — Unified Boot Import Coverage Wiring (`runtime/os/shim_exports.cpp` + `tools/check_import_coverage.py`)** — `UNCLAIMED` *(wait for O13/O14/O15/G24 merge)*
   - Wire `pg6_xbox_scarlett_register_all`, `pg6_ucrt_register_all`, `pg6_xbox_middleware_register_all`, `pg6_win32_compat_register_all`, and `pg6_d3d12_xs_register_all` into `shim_exports.cpp` and verify 100% coverage of all non-guest-DLL imports in `docs/imports_required.md`.
-- [ ] **O18 — Contiguous Guest Address Space: Offset-Mapped `VirtualMemoryArena` Backing for wasm64 (`runtime/os/vmem.{h,cpp}`)** — `IN PROGRESS` (#187, @Timon-ok) *(lifted code reads guest memory directly in linear memory; the arena keeps pages in separate host allocations)*
+- [x] **O18 — Contiguous Guest Address Space: Offset-Mapped `VirtualMemoryArena` Backing for wasm64 (`runtime/os/vmem.{h,cpp}`)** — `DONE` (PRs #206, #232, #240, closes #187) *(lifted code reads guest memory directly in linear memory; the arena keeps pages in separate host allocations)*
   - Back the arena with one contiguous region and a single guest-base translation shared by the lifter's `guest_ptr` seam, the import-bridge seam, the guest runtime and the image loader, on host builds and under Emscripten `-sMEMORY64`, keeping commit/protect bookkeeping.
 - [ ] **O19 — `WS2_32.dll` 23 Ordinal Shims & Registry Bindings (`runtime/os/winsock_ordinals.{h,cpp}`)** — `IN PROGRESS` (#190, @MarcBlattmann) *(driven by M2 `docs/imports_required.md`: 23 ordinal-imported Winsock2 symbols)*
   - Implements and registers all 23 `WS2_32.dll` ordinals (`#1`..`#151`) + `getaddrinfo`/`freeaddrinfo` offline-safe shims in `Win32ModuleRegistry`.
@@ -96,6 +96,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Guest-state thunks for `_crt_atexit`/`_register_onexit_function`/`_register_thread_local_exe_atexit_callback`, XAsync-taking shims calling guest completion callbacks, and the XAsync provider (`Begin`/`Schedule`/`Complete`/`Run`/`GetResult`/`Cancel`) + XTaskQueue port/composite slots.
 - [ ] **O23 — DirectStorage, GameInput & XG Guest Interface Adapters on the COM Bridge (`runtime/os/xbox_scarlett_guest.{h,cpp}`)** — `IN PROGRESS` (#237, @Timon-ok) *(no game files required — disjoint files `runtime/os/xbox_scarlett_guest.{h,cpp}`, `tests/test_xbox_scarlett_guest.cpp`)*
   - Wrap the host objects behind `DStorageGetFactory`, `GameInputCreate` and `XGCreateTextureComputer` as guest COM-bridge interfaces with evidence-based slot layouts, logging stubs elsewhere, and the DirectStorage read path on the runtime file layer.
+- [ ] **O24 — Route XMem and Guest-Facing CRT Heap Allocations into the Guest Address Space (`runtime/os/`)** — `IN PROGRESS` (#243, @Timon-ok) *(no game files required — follow-up to O18: the runtime heap is fenced below 4 GiB on wasm64)*
+  - Back the `xmem.dll` shims and the guest-facing CRT `malloc` family with `VirtualMemoryArena` / the Win32 heap layer so the title's allocations live in the guest pool, with one consistent allocator family and tests.
 
 ---
 
