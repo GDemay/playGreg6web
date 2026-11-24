@@ -1676,6 +1676,231 @@ fn resolved_switch_executes() {
     assert_eq!(o[inputs.len()].regs[RAX], 77, "dispatcher default arm");
 }
 
+// ----- jump tables behind control-flow merges (R29) ---------------------------------------------
+
+/// Assembles `build` at `va`, returning the bytes and the address of every returned label.
+fn assemble_with_labels(
+    va: u64,
+    build: impl FnOnce(&mut CodeAssembler) -> Result<Vec<CodeLabel>, IcedError>,
+) -> (Vec<u8>, Vec<u64>) {
+    let mut a = CodeAssembler::new(64).expect("64-bit assembler");
+    let labels = build(&mut a).expect("test code assembles");
+    let result = a
+        .assemble_options(
+            va,
+            iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+        )
+        .expect("test code encodes");
+    let ips = labels
+        .iter()
+        .map(|l| result.label_ip(l).expect("label ip"))
+        .collect();
+    (result.inner.code_buffer, ips)
+}
+
+fn lea_rip(a: &mut CodeAssembler, dst: Register, va: u64) -> Result<(), IcedError> {
+    a.add_instruction(Instruction::with2(
+        Code::Lea_r64_m,
+        dst,
+        MemoryOperand::with_base_displ(Register::RIP, va as i64),
+    )?)
+}
+
+/// Table-relative signed 32-bit offsets of `targets` from `table`, then a zero entry.
+fn signed_table(table: u64, targets: &[u64]) -> Vec<u8> {
+    let mut out: Vec<u8> = targets
+        .iter()
+        .flat_map(|&t| ((t as i64 - table as i64) as i32).to_le_bytes())
+        .collect();
+    out.extend(0i32.to_le_bytes());
+    out
+}
+
+/// Runs `functions` (expected to resolve the switch ending at `jmp_va`) for every
+/// `(rcx, rdx, rdi) -> rax` case at `text`.
+fn run_merge_switch(
+    name: &str,
+    functions: &std::collections::BTreeMap<u64, cfg::Function>,
+    text: u64,
+    table: u64,
+    data: &[u8],
+    cases: &[(u64, u64, u64, u64)],
+) {
+    assert!(
+        functions[&text].blocks.values().any(|b| b
+            .successors
+            .iter()
+            .any(|e| matches!(e, cfg::Edge::JumpTable(_)))),
+        "{name}: the switch behind the merge must be resolved by discovery"
+    );
+    let built = build(name, functions.values());
+    let runs: Vec<Case> = cases
+        .iter()
+        .map(|&(c, d, n, _)| {
+            Case::new(text)
+                .reg(RCX, c)
+                .reg(RDX, d)
+                .reg(RDI, n)
+                .mem(table, data)
+        })
+        .collect();
+    let o = run_ok(&built, &runs);
+    for (outcome, &(c, d, n, expected)) in o.iter().zip(cases) {
+        assert_eq!(
+            outcome.regs[RAX], expected,
+            "{name}(rcx={c:#x}, rdx={d}, rdi={n})"
+        );
+    }
+}
+
+/// The boot's shape (base set in the entry block, index constant on every edge into the merge,
+/// base parked in another register while its own register holds a stack address): `rdi` loop
+/// iterations add 1, 10, 100, 1000 for cases 0, 1, 2, 3, visited in that order, repeatedly.
+#[test]
+fn switch_behind_a_loop_merge_executes() {
+    if !exec_or_skip("switch_behind_a_loop_merge_executes") {
+        return;
+    }
+    let base = 0x40_0000u64;
+    let text = base + 0x1000;
+    let table = base + 0x2000;
+    let (code, ips) = assemble_with_labels(text, |a| {
+        let mut merge = a.create_label();
+        let mut done = a.create_label();
+        let mut cases = [
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        ];
+        lea_rip(a, Register::RSI, table)?;
+        lea_rip(a, Register::RBX, table + 0x40)?;
+        a.xor(ecx, ecx)?;
+        a.xor(eax, eax)?;
+        a.set_label(&mut merge)?;
+        a.test(edi, edi)?;
+        a.je(done)?;
+        a.dec(edi)?;
+        a.mov(r8d, ecx)?;
+        a.movsxd(rdx, dword_ptr(rsi + r8 * 4))?;
+        a.add(rdx, rsi)?;
+        a.jmp(rdx)?;
+        a.set_label(&mut cases[0])?;
+        a.add(eax, 1)?;
+        a.mov(ecx, 1)?;
+        a.jmp(merge)?;
+        a.set_label(&mut cases[1])?;
+        a.add(eax, 10)?;
+        a.mov(rbx, rsi)?;
+        a.lea(rsi, ptr(rsp - 8))?;
+        a.mov(r9, qword_ptr(rsi))?;
+        a.mov(rsi, rbx)?;
+        a.mov(ecx, 2)?;
+        a.jmp(merge)?;
+        a.set_label(&mut cases[2])?;
+        a.add(eax, 100)?;
+        a.mov(ecx, 3)?;
+        a.jmp(merge)?;
+        a.set_label(&mut cases[3])?;
+        a.add(eax, 1000)?;
+        a.xor(ecx, ecx)?;
+        a.jmp(merge)?;
+        a.set_label(&mut done)?;
+        a.ret()?;
+        Ok(cases.to_vec())
+    });
+    let data = signed_table(table, &ips);
+    let functions = Program::new()
+        .base(base)
+        .bytes(text, &code)
+        .data(table, &data)
+        .discover();
+    let cases: Vec<(u64, u64, u64, u64)> = [
+        (0, 0),
+        (1, 1),
+        (2, 11),
+        (3, 111),
+        (4, 1111),
+        (5, 1112),
+        (9, 2223),
+    ]
+    .iter()
+    .map(|&(n, sum)| (0, 0, n, sum))
+    .collect();
+    run_merge_switch("loop_merge_switch", &functions, text, table, &data, &cases);
+}
+
+/// A merge entered from two differently guarded paths: `rdx == 0` takes `cmp ecx, 2; ja done`,
+/// otherwise `and ecx, 3`; the dispatch returns 0x20 + index, `done` returns 0.
+#[test]
+fn switch_bounded_by_different_guards_executes() {
+    if !exec_or_skip("switch_bounded_by_different_guards_executes") {
+        return;
+    }
+    let base = 0x40_0000u64;
+    let text = base + 0x1000;
+    let table = base + 0x2000;
+    let (code, ips) = assemble_with_labels(text, |a| {
+        let mut b = a.create_label();
+        let mut merge = a.create_label();
+        let mut done = a.create_label();
+        let mut cases = [
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        ];
+        lea_rip(a, Register::RSI, table)?;
+        a.mov(ecx, ecx)?;
+        a.test(edx, edx)?;
+        a.jne(b)?;
+        a.cmp(ecx, 2)?;
+        a.ja(done)?;
+        a.jmp(merge)?;
+        a.set_label(&mut b)?;
+        a.and(ecx, 3)?;
+        a.jmp(merge)?;
+        a.set_label(&mut merge)?;
+        a.mov(ecx, ecx)?;
+        a.movsxd(rax, dword_ptr(rsi + rcx * 4))?;
+        a.add(rax, rsi)?;
+        a.jmp(rax)?;
+        for (i, case) in cases.iter_mut().enumerate() {
+            a.set_label(case)?;
+            a.mov(eax, 0x20 + i as u32)?;
+            a.ret()?;
+        }
+        a.set_label(&mut done)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        Ok(cases.to_vec())
+    });
+    let data = signed_table(table, &ips);
+    let functions = Program::new()
+        .base(base)
+        .bytes(text, &code)
+        .data(table, &data)
+        .discover();
+    let cases = [
+        (0, 0, 0, 0x20),
+        (2, 0, 0, 0x22),
+        (3, 0, 0, 0),
+        (0xffff_ffff, 0, 0, 0),
+        (1, 1, 0, 0x21),
+        (3, 1, 0, 0x23),
+        (6, 1, 0, 0x22),
+        (0x1_0000_0007, 1, 0, 0x23),
+    ];
+    run_merge_switch(
+        "guarded_merge_switch",
+        &functions,
+        text,
+        table,
+        &data,
+        &cases,
+    );
+}
+
 // ----- guest address translation -----------------------------------------------------------------
 
 /// Loads from an absolute address, a guest stack round trip (`push`/`pop`) and stores through
