@@ -5,5 +5,6 @@ pub mod dxil_reflect;
 pub mod lower;
 pub mod pack;
 pub mod rdna2;
+pub mod rdna2_to_wgsl;
 pub mod reflect;
 pub mod wave_emul;
