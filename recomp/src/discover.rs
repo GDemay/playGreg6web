@@ -674,25 +674,39 @@ impl<'i, 'a> Discovery<'i, 'a> {
     fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
         let leaf = self.leaf_extent(site);
-        if let Some(table) = jump_table::resolve_in(self.image, &trace, leaf) {
-            return Some(table);
+        let direct = jump_table::resolve_in(self.image, &trace, leaf);
+        if direct.as_ref().is_some_and(|t| !t.inferred) {
+            return direct;
         }
         // The chain stops at a merge (e.g. a loop header): a table base or an index bound
         // established before the merge is invisible to the slice. What holds on every path into
         // the merge is stated in front of the trace and the slice runs again: first only the
         // constants, then also the bounds, so tables resolved by the base alone keep their
-        // resolution.
-        let (constants, all) = self.reaching_prefix(&trace, first_block, preds)?;
+        // resolution. An extent inferred without those facts (no bound, or only the width of a
+        // zero-extended byte index) yields to a bound they prove; the first table found wins
+        // when none is proven.
+        let Some((constants, all)) = self.reaching_prefix(&trace, first_block, preds) else {
+            return direct;
+        };
+        let mut first = direct;
         if !constants.is_empty()
             && let Some(table) =
                 jump_table::resolve_in(self.image, &prefixed(&constants, &trace), leaf)
         {
-            return Some(table);
+            if !table.inferred {
+                return Some(table);
+            }
+            first.get_or_insert(table);
         }
-        if all.len() == constants.len() {
-            return None;
+        if all.len() > constants.len()
+            && let Some(table) = jump_table::resolve_in(self.image, &prefixed(&all, &trace), leaf)
+        {
+            if !table.inferred {
+                return Some(table);
+            }
+            first.get_or_insert(table);
         }
-        jump_table::resolve_in(self.image, &prefixed(&all, &trace), leaf)
+        first
     }
 
     /// Why each indirect jump without an import slot that is left to run-time dispatch did not
