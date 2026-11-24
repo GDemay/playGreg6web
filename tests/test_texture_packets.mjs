@@ -2,20 +2,47 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const { WgpuCommandProcessor, OPCODES } = require('../web/workers/wgpu_worker.js');
 const { installRenderStatePackets, TEXTURE_FORMAT_NAMES: RS_FORMATS } = require('../web/workers/render_state_packets.js');
+const { GpuStagingPool } = require('../web/workers/staging_pool.js');
 const tp = require('../web/workers/texture_packets.js');
 
+const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
 const repoFile = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
-function createMockWebGpu() {
+function createMockWebGpu({ strictWebGpu = false } = {}) {
   const calls = [];
+  const buffers = new Map();
   let nextHandle = 1;
+
   const device = {
+    createBuffer(desc) {
+      const backing = new Uint8Array(desc.size);
+      const buffer = {
+        kind: 'GPUBuffer',
+        handle: nextHandle++,
+        size: desc.size,
+        usage: desc.usage,
+        desc,
+        backing,
+        destroyed: false,
+        destroy() {
+          buffer.destroyed = true;
+        },
+      };
+      buffers.set(buffer.handle, buffer);
+      calls.push({ op: 'createBuffer', desc, result: buffer });
+      return buffer;
+    },
     createTexture(desc) {
-      if (desc.format === 'bc7-rgba-unorm' && desc.sampleCount > 1) throw new Error('not multisampleable');
+      if (desc.format === 'bc7-rgba-unorm' && desc.sampleCount > 1) {
+        throw new Error('not multisampleable');
+      }
       const texture = {
         kind: 'GPUTexture',
         handle: nextHandle++,
@@ -32,19 +59,133 @@ function createMockWebGpu() {
       return texture;
     },
     createCommandEncoder() {
-      return {
+      const encoder = {
         beginRenderPass: () => ({ end() {}, setPipeline() {}, draw() {} }),
         beginComputePass: () => ({ end() {} }),
-        finish: () => ({}),
+        copyBufferToBuffer(srcBuf, srcOff, dstBuf, dstOff, size) {
+          if (strictWebGpu && size % 4 !== 0) {
+            throw new Error(`WebGPU validation: copyBufferToBuffer size (${size}) not 4B aligned`);
+          }
+          if (srcBuf.backing && dstBuf.backing) {
+            dstBuf.backing.set(srcBuf.backing.subarray(srcOff, srcOff + size), dstOff);
+          }
+          calls.push({ op: 'copyBufferToBuffer', srcBuf, srcOff, dstBuf, dstOff, size });
+        },
+        copyBufferToTexture(source, destination, copySize) {
+          if (
+            strictWebGpu &&
+            source.bytesPerRow !== undefined &&
+            source.bytesPerRow % 256 !== 0
+          ) {
+            throw new Error(
+              `WebGPU validation: copyBufferToTexture bytesPerRow (${source.bytesPerRow}) must be a multiple of 256`
+            );
+          }
+          const snapshot =
+            source.buffer && source.buffer.backing
+              ? source.buffer.backing.slice(source.offset || 0)
+              : null;
+          calls.push({
+            op: 'copyBufferToTexture',
+            source: { ...source },
+            destination: { ...destination },
+            copySize: { ...copySize },
+            bytes: snapshot,
+          });
+        },
+        finish: () => ({ kind: 'GPUCommandBuffer' }),
       };
+      return encoder;
     },
-    queue: { writeBuffer() {}, writeTexture() {}, submit() {} },
+    queue: {
+      writeBuffer(buffer, bufferOffset, data) {
+        if (
+          strictWebGpu &&
+          typeof SharedArrayBuffer !== 'undefined' &&
+          data &&
+          data.buffer instanceof SharedArrayBuffer
+        ) {
+          throw new TypeError('WebGPU validation: SharedArrayBuffer view disallowed in writeBuffer');
+        }
+        const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        if (buffer && buffer.backing) {
+          buffer.backing.set(bytes, bufferOffset);
+        }
+        calls.push({
+          op: 'writeBuffer',
+          buffer,
+          bufferOffset,
+          byteLength: bytes.byteLength,
+          isSab: typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer,
+          bytes: bytes.slice(),
+        });
+      },
+      writeTexture(destination, data, dataLayout, size) {
+        if (
+          strictWebGpu &&
+          typeof SharedArrayBuffer !== 'undefined' &&
+          data &&
+          data.buffer instanceof SharedArrayBuffer
+        ) {
+          throw new TypeError('WebGPU validation: SharedArrayBuffer view disallowed in writeTexture');
+        }
+        const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        calls.push({
+          op: 'writeTexture',
+          destination: { ...destination },
+          dataLayout: { ...dataLayout },
+          size: { ...size },
+          isSab: typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer,
+          bytes: bytes.slice(),
+        });
+      },
+      submit() {
+        calls.push({ op: 'submit' });
+      },
+    },
   };
   const ctx = { getCurrentTexture: () => ({ createView: () => ({ kind: 'swapchain' }) }) };
   return { device, ctx, calls };
 }
 
-function createTexture2Packet({ id, width, height, layers = 1, mips = 1, samples = 1, usage = 0x14, dimension = 1, format, viewFormats = [] }) {
+function createTexture1Packet({
+  id,
+  width,
+  height,
+  layers = 1,
+  mips = 1,
+  format = 0,
+  usage = 0x06,
+  dimension = 1,
+}) {
+  const out = new Uint8Array(8 + 32);
+  const view = new DataView(out.buffer);
+  view.setUint16(0, OPCODES.CREATE_TEXTURE, true);
+  view.setUint32(4, 32, true);
+  const p = 8;
+  view.setUint32(p, id, true);
+  view.setUint32(p + 4, width, true);
+  view.setUint32(p + 8, height, true);
+  view.setUint32(p + 12, layers, true);
+  view.setUint32(p + 16, mips, true);
+  view.setUint32(p + 20, format, true);
+  view.setUint32(p + 24, usage, true);
+  view.setUint32(p + 28, dimension, true);
+  return out;
+}
+
+function createTexture2Packet({
+  id,
+  width,
+  height,
+  layers = 1,
+  mips = 1,
+  samples = 1,
+  usage = 0x14,
+  dimension = 1,
+  format,
+  viewFormats = [],
+}) {
   const out = new Uint8Array(8 + 40);
   const view = new DataView(out.buffer);
   view.setUint16(0, 35, true);
@@ -64,6 +205,43 @@ function createTexture2Packet({ id, width, height, layers = 1, mips = 1, samples
   return out;
 }
 
+function writeTexturePacket({
+  textureId,
+  mipLevel = 0,
+  originX = 0,
+  originY = 0,
+  originZ = 0,
+  width,
+  height,
+  layers = 1,
+  bytesPerRow = 0,
+  rowsPerImage = 0,
+  data,
+  useSab = false,
+}) {
+  const totalBytes = 8 + 48 + data.byteLength;
+  const backing = useSab ? new SharedArrayBuffer(totalBytes) : new ArrayBuffer(totalBytes);
+  const out = new Uint8Array(backing);
+  const view = new DataView(backing);
+  view.setUint16(0, OPCODES.WRITE_TEXTURE, true);
+  view.setUint32(4, 48 + data.byteLength, true);
+  const p = 8;
+  view.setUint32(p, textureId, true);
+  view.setUint32(p + 4, mipLevel, true);
+  view.setUint32(p + 8, originX, true);
+  view.setUint32(p + 12, originY, true);
+  view.setUint32(p + 16, originZ, true);
+  view.setUint32(p + 20, width, true);
+  view.setUint32(p + 24, height, true);
+  view.setUint32(p + 28, layers, true);
+  view.setUint32(p + 32, bytesPerRow, true);
+  view.setUint32(p + 36, rowsPerImage, true);
+  view.setUint32(p + 40, data.byteLength, true);
+  view.setUint32(p + 44, 0, true);
+  out.set(data, p + 48);
+  return out;
+}
+
 function destroyPacket(id) {
   const out = new Uint8Array(12);
   const view = new DataView(out.buffer);
@@ -76,6 +254,10 @@ function destroyPacket(id) {
 test('CreateTexture2 opcode and payload size match the ABI header', () => {
   assert.equal(OPCODES.CREATE_TEXTURE2, 35);
   assert.equal(tp.CREATE_TEXTURE2, 35);
+  assert.equal(tp.CREATE_TEXTURE2_BYTES, 40);
+  assert.equal(tp.CREATE_TEXTURE, 12);
+  assert.equal(tp.WRITE_TEXTURE, 13);
+  assert.equal(tp.WEBGPU_BYTES_PER_ROW_ALIGNMENT, 256);
   const header = repoFile('runtime/abi/playgta6_abi.h');
   assert.match(header, /CreateTexture2 = 35,/);
   assert.match(header, /sizeof\(GpuCreateTexture2Payload\) == 40/);
@@ -90,12 +272,29 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
   const handler = tp.installTexturePackets(processor);
 
   // rgba16float (40) 4x MSAA render target; bgra8unorm (27) with an sRGB view format (28).
-  processor.executeCommandBuffer(createTexture2Packet({ id: 7, width: 640, height: 360, samples: 4, usage: 0x10, format: 40 }));
   processor.executeCommandBuffer(
-    createTexture2Packet({ id: 8, width: 256, height: 128, layers: 6, mips: 9, usage: 0x06, format: 27, viewFormats: [28] })
+    createTexture2Packet({ id: 7, width: 640, height: 360, samples: 4, usage: 0x10, format: 40 })
   );
-  assert.deepEqual(handler.stats, { created: 2, errors: 0 });
-  const [rt, tex] = gpu.calls.map((c) => c.desc);
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 8,
+      width: 256,
+      height: 128,
+      layers: 6,
+      mips: 9,
+      usage: 0x06,
+      format: 27,
+      viewFormats: [28],
+    })
+  );
+  assert.deepEqual(handler.getStats(), {
+    created: 2,
+    errors: 0,
+    createTexture2Count: 2,
+    rowPitchRepackCount: 0,
+    sabCopyCount: 0,
+  });
+  const [rt, tex] = gpu.calls.filter((c) => c.op === 'createTexture').map((c) => c.desc);
   assert.deepEqual(rt, {
     size: { width: 640, height: 360, depthOrArrayLayers: 1 },
     mipLevelCount: 1,
@@ -116,6 +315,7 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
   processor.executeCommandBuffer(createTexture2Packet({ id: 7, width: 64, height: 64, format: 22 }));
   assert.equal(first.destroyed, true);
   assert.equal(processor.textures.get(7).desc.format, 'rgba8unorm');
+  assert.equal(handler.stats.createTexture2Count, 3);
   processor.executeCommandBuffer(destroyPacket(7));
   assert.equal(processor.textures.has(7), false);
 });
@@ -126,11 +326,20 @@ test('invalid CreateTexture2 payloads are counted and leave the id unbound', () 
   const handler = tp.installTexturePackets(processor);
   processor.executeCommandBuffer(createTexture2Packet({ id: 1, width: 4, height: 4, format: 0 }));
   processor.executeCommandBuffer(createTexture2Packet({ id: 2, width: 4, height: 4, format: 200 }));
-  processor.executeCommandBuffer(createTexture2Packet({ id: 3, width: 4, height: 4, format: 22, dimension: 9 }));
-  processor.executeCommandBuffer(createTexture2Packet({ id: 4, width: 4, height: 4, format: 62, samples: 4 }));
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3, width: 4, height: 4, format: 22, dimension: 9 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4, width: 4, height: 4, format: 62, samples: 4 })
+  );
   assert.equal(handler.stats.errors, 4);
+  assert.equal(handler.stats.createTexture2Count, 0);
   assert.match(handler.lastError, /not multisampleable/);
   for (const id of [1, 2, 3, 4]) assert.equal(processor.textures.has(id), false);
+
+  // Truncated payload decoded directly returns a clean error instead of throwing RangeError.
+  const truncated = tp.decodeCreateTexture2(new DataView(new ArrayBuffer(20)), 0);
+  assert.match(truncated.error, /payload 20 < 40 bytes/);
 });
 
 test('the texture handler chains other opcodes to the previously installed extension', () => {
@@ -150,4 +359,387 @@ test('the texture handler chains other opcodes to the previously installed exten
     ['packet', 77],
     ['destroy', 5],
   ]);
+});
+
+test('CreateTexture2 and CreateTexture safely clamp mipLevels, sampleCount, and dimensions', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // Excessive mip levels (99 -> 9 for 256x128) and MSAA with mips > 1 (4 -> 1).
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 10, width: 256, height: 128, mips: 99, samples: 4, format: 22 })
+  );
+  // 8x MSAA on single-mip 2D -> clamped to 4.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 11, width: 64, height: 64, mips: 0, samples: 8, format: 22 })
+  );
+  // 2x MSAA (unsupported in WebGPU) -> clamped to 1.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 12, width: 64, height: 64, mips: 1, samples: 2, format: 22 })
+  );
+  // 4x MSAA on 2D array (layers=6) -> clamped to 1.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 13, width: 64, height: 64, layers: 6, mips: 1, samples: 4, format: 22 })
+  );
+  // 3D texture: depth participates in max mip calculation (16x16x64 -> 7 mips), MSAA -> 1.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 14,
+      width: 16,
+      height: 16,
+      layers: 64,
+      mips: 20,
+      samples: 4,
+      dimension: 2,
+      format: 22,
+    })
+  );
+  // 1D texture: height=1, depthOrArrayLayers=1, mipLevelCount=1, sampleCount=1.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 15,
+      width: 128,
+      height: 8,
+      layers: 4,
+      mips: 5,
+      samples: 4,
+      dimension: 0,
+      format: 22,
+    })
+  );
+  // v1 CreateTexture alongside CreateTexture2 also clamps excessive mipLevels (50 -> 6 for 32x16).
+  processor.executeCommandBuffer(
+    createTexture1Packet({ id: 16, width: 32, height: 16, mips: 50, format: 0, dimension: 1 })
+  );
+
+  const byId = (id) => processor.textures.get(id).desc;
+  assert.equal(byId(10).mipLevelCount, 9);
+  assert.equal(byId(10).sampleCount, 1);
+
+  assert.equal(byId(11).mipLevelCount, 1);
+  assert.equal(byId(11).sampleCount, 4);
+
+  assert.equal(byId(12).sampleCount, 1);
+  assert.equal(byId(13).sampleCount, 1);
+
+  assert.equal(byId(14).dimension, '3d');
+  assert.equal(byId(14).mipLevelCount, 7);
+  assert.equal(byId(14).sampleCount, 1);
+
+  assert.deepEqual(byId(15).size, { width: 128, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(byId(15).mipLevelCount, 1);
+  assert.equal(byId(15).sampleCount, 1);
+
+  assert.equal(byId(16).mipLevelCount, 6);
+  assert.equal(byId(16).format, 'rgba8unorm');
+
+  // createTexture2Count counts only v2 CreateTexture2 (6), while created counts both v1 + v2 (7).
+  assert.equal(handler.stats.created, 7);
+  assert.equal(handler.stats.createTexture2Count, 6);
+  assert.equal(handler.stats.errors, 0);
+});
+
+test('alignBytesPerRow256 and repackRowsTo256 enforce WebGPU 256-byte row pitch alignment', () => {
+  assert.equal(tp.alignBytesPerRow256(0), 0);
+  assert.equal(tp.alignBytesPerRow256(1), 256);
+  assert.equal(tp.alignBytesPerRow256(12), 256);
+  assert.equal(tp.alignBytesPerRow256(256), 256);
+  assert.equal(tp.alignBytesPerRow256(257), 512);
+  assert.equal(tp.alignBytesPerRow256(768), 768);
+  assert.throws(() => tp.alignBytesPerRow256(-4), RangeError);
+  assert.throws(() => tp.alignBytesPerRow256(12.5), RangeError);
+
+  // Unaligned 3 rows x 12 bytes -> 3 rows x 256 bytes, zero-padded tails.
+  const srcUnaligned = new Uint8Array(36);
+  for (let i = 0; i < 36; i += 1) srcUnaligned[i] = i + 1;
+  const repacked = tp.repackRowsTo256(srcUnaligned, 12, 3);
+  assert.equal(repacked.repacked, true);
+  assert.equal(repacked.copiedFromSab, false);
+  assert.equal(repacked.bytesPerRow, 256);
+  assert.equal(repacked.originalBytesPerRow, 12);
+  assert.equal(repacked.rowCount, 3);
+  assert.equal(repacked.data.byteLength, 768);
+  for (let row = 0; row < 3; row += 1) {
+    const rowStart = row * 256;
+    assert.deepEqual(
+      Array.from(repacked.data.subarray(rowStart, rowStart + 12)),
+      Array.from(srcUnaligned.subarray(row * 12, row * 12 + 12))
+    );
+    for (let pad = 12; pad < 256; pad += 1) {
+      assert.equal(repacked.data[rowStart + pad], 0);
+    }
+  }
+
+  // Already 256-byte aligned plain ArrayBuffer view -> zero-copy, repacked: false.
+  const srcAligned = new Uint8Array(512);
+  srcAligned[0] = 0xaa;
+  srcAligned[256] = 0xbb;
+  const alignedRes = tp.repackRowsTo256(srcAligned, 256, 2);
+  assert.equal(alignedRes.repacked, false);
+  assert.equal(alignedRes.copiedFromSab, false);
+  assert.equal(alignedRes.bytesPerRow, 256);
+  assert.equal(alignedRes.data, srcAligned);
+
+  // Multi-layer (2D array / 3D) repacking preserves byteOffset on subarray input.
+  const outer = new Uint8Array(16 + 16 * 2 * 3);
+  outer.fill(0xff, 0, 16);
+  for (let i = 0; i < 96; i += 1) outer[16 + i] = (i * 7) & 0xff;
+  const sub = outer.subarray(16);
+  const multi = tp.repackRowsTo256(sub, 16, 2, 3);
+  assert.equal(multi.repacked, true);
+  assert.equal(multi.rowCount, 6);
+  assert.equal(multi.data.byteLength, 6 * 256);
+  assert.equal(multi.data[0], 0);
+  assert.equal(multi.data[5 * 256 + 15], (95 * 7) & 0xff);
+
+  // SharedArrayBuffer-backed views are safely copied out even when already aligned.
+  const sabAligned = new SharedArrayBuffer(512);
+  const sabAlignedView = new Uint8Array(sabAligned);
+  sabAlignedView[0] = 42;
+  sabAlignedView[256] = 99;
+  const sabRes = tp.repackRowsTo256(sabAlignedView, 256, 2);
+  assert.equal(sabRes.repacked, false);
+  assert.equal(sabRes.copiedFromSab, true);
+  assert.equal(sabRes.data.buffer instanceof ArrayBuffer, true);
+  assert.equal(sabRes.data[0], 42);
+  assert.equal(sabRes.data[256], 99);
+
+  // SharedArrayBuffer-backed unaligned view is both repacked and copied out.
+  const sabUnaligned = new SharedArrayBuffer(32);
+  const sabUnalignedView = new Uint8Array(sabUnaligned);
+  for (let i = 0; i < 32; i += 1) sabUnalignedView[i] = i + 10;
+  const sabRepacked = tp.repackRowsTo256(sabUnalignedView, 16, 2);
+  assert.equal(sabRepacked.repacked, true);
+  assert.equal(sabRepacked.copiedFromSab, true);
+  assert.equal(sabRepacked.data.buffer instanceof ArrayBuffer, true);
+  assert.equal(sabRepacked.bytesPerRow, 256);
+  assert.equal(sabRepacked.data[256 + 15], 41);
+
+  // Insufficient bytes throw RangeError.
+  assert.throws(() => tp.repackRowsTo256(new Uint8Array(10), 16, 2), RangeError);
+});
+
+test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 256B and copy SAB views', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // Create a 4x4 rgba8unorm texture via ABI v2 CreateTexture2.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 50, width: 4, height: 4, usage: 0x06, format: 22 })
+  );
+
+  // Upload 4x4 RGBA8 (bytesPerRow = 16, unaligned!) from a SharedArrayBuffer command packet.
+  const texels = new Uint8Array(64);
+  for (let i = 0; i < 64; i += 1) texels[i] = i + 1;
+
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 50,
+      width: 4,
+      height: 4,
+      bytesPerRow: 16,
+      rowsPerImage: 4,
+      data: texels,
+      useSab: true,
+    })
+  );
+
+  // Verify copyBufferToTexture received 256-byte aligned bytesPerRow and zero SAB views reached queue.writeBuffer.
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 1);
+  assert.equal(c2tCalls[0].source.bytesPerRow, 256);
+  assert.equal(c2tCalls[0].source.rowsPerImage, 4);
+  for (let row = 0; row < 4; row += 1) {
+    assert.deepEqual(
+      Array.from(c2tCalls[0].bytes.subarray(row * 256, row * 256 + 16)),
+      Array.from(texels.subarray(row * 16, row * 16 + 16))
+    );
+  }
+  const wbCalls = gpu.calls.filter((c) => c.op === 'writeBuffer');
+  assert.ok(wbCalls.length >= 1);
+  assert.ok(wbCalls.every((c) => c.isSab === false));
+
+  assert.deepEqual(handler.getStats(), {
+    created: 1,
+    errors: 0,
+    createTexture2Count: 1,
+    rowPitchRepackCount: 1,
+    sabCopyCount: 1,
+  });
+});
+
+test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks sabCopyCount', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 60, width: 2, height: 2, usage: 0x06, format: 22 })
+  );
+
+  const texels = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+
+  // Upload 1: SharedArrayBuffer-backed WriteTexture packet -> must copy out of SAB.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 60,
+      width: 2,
+      height: 2,
+      bytesPerRow: 8,
+      rowsPerImage: 2,
+      data: texels,
+      useSab: true,
+    })
+  );
+
+  // Upload 2: plain ArrayBuffer-backed WriteTexture packet -> no SAB copy needed.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 60,
+      width: 2,
+      height: 2,
+      bytesPerRow: 8,
+      rowsPerImage: 2,
+      data: texels,
+      useSab: false,
+    })
+  );
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 2);
+  assert.equal(wtCalls[0].isSab, false);
+  assert.deepEqual(Array.from(wtCalls[0].bytes), Array.from(texels));
+  assert.equal(wtCalls[1].isSab, false);
+
+  assert.deepEqual(handler.getStats(), {
+    created: 1,
+    errors: 0,
+    createTexture2Count: 1,
+    rowPitchRepackCount: 0,
+    sabCopyCount: 1,
+  });
+});
+
+test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only unaligned copies', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 70, width: 4, height: 2, usage: 0x06, format: 22 })
+  );
+  const texture = processor.textures.get(70);
+  const encoder = gpu.device.createCommandEncoder();
+
+  // Case 1: CPU-backed SAB bytes with unaligned bytesPerRow = 16.
+  const sab = new SharedArrayBuffer(32);
+  const sabView = new Uint8Array(sab);
+  for (let i = 0; i < 32; i += 1) sabView[i] = 100 + i;
+
+  const resCpu = handler.copyBufferToTexture(
+    encoder,
+    { bytesPerRow: 16, rowsPerImage: 2 },
+    { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 4, height: 2, depthOrArrayLayers: 1 },
+    sabView
+  );
+  assert.equal(resCpu.repacked, true);
+  assert.equal(resCpu.copiedFromSab, true);
+  assert.equal(resCpu.bytesPerRow, 256);
+
+  // Case 2: GPU-buffer-only copy with unaligned 4-byte-multiple bytesPerRow = 16.
+  const gpuBuf = gpu.device.createBuffer({ size: 32, usage: 0x0004 | 0x0008 });
+  for (let i = 0; i < 32; i += 1) gpuBuf.backing[i] = 200 + i;
+  const resGpu = handler.copyBufferToTexture(
+    encoder,
+    { buffer: gpuBuf, offset: 0, bytesPerRow: 16, rowsPerImage: 2 },
+    { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 4, height: 2, depthOrArrayLayers: 1 }
+  );
+  assert.equal(resGpu.repacked, true);
+  assert.equal(resGpu.copiedFromSab, false);
+  assert.equal(resGpu.bytesPerRow, 256);
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 2);
+  assert.equal(c2tCalls[0].source.bytesPerRow, 256);
+  assert.equal(c2tCalls[1].source.bytesPerRow, 256);
+  assert.deepEqual(Array.from(c2tCalls[1].bytes.subarray(0, 16)), Array.from(gpuBuf.backing.subarray(0, 16)));
+  assert.deepEqual(
+    Array.from(c2tCalls[1].bytes.subarray(256, 272)),
+    Array.from(gpuBuf.backing.subarray(16, 32))
+  );
+
+  // Case 3: Already-aligned GPU buffer passes straight through without repacking.
+  const alignedBuf = gpu.device.createBuffer({ size: 512, usage: 0x0004 });
+  const resAligned = handler.copyBufferToTexture(
+    encoder,
+    { buffer: alignedBuf, offset: 0, bytesPerRow: 256, rowsPerImage: 2 },
+    { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 4, height: 2, depthOrArrayLayers: 1 }
+  );
+  assert.equal(resAligned.repacked, false);
+  assert.equal(resAligned.bytesPerRow, 256);
+
+  const stats = handler.getStats();
+  assert.deepEqual(stats, {
+    created: 1,
+    errors: 0,
+    createTexture2Count: 1,
+    rowPitchRepackCount: 2,
+    sabCopyCount: 1,
+  });
+  for (const [key, val] of Object.entries(stats)) {
+    assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
+    assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
+  }
+});
+
+test('G31 classic-worker importScripts IIFE isolation preserves zero top-level lexical leaks', () => {
+  const ctx = vm.createContext({
+    console,
+    Uint8Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Map,
+    Set,
+  });
+  ctx.globalThis = ctx;
+  ctx.self = ctx;
+
+  const load = (file) => {
+    const src = readFileSync(path.join(WORKERS_DIR, file), 'utf8');
+    vm.runInContext(src, ctx, { filename: file });
+  };
+
+  // Load texture_formats.js, render_state_packets.js, and texture_packets.js twice without SyntaxError.
+  assert.doesNotThrow(() => {
+    load('texture_formats.js');
+    load('render_state_packets.js');
+    load('texture_packets.js');
+    load('texture_packets.js');
+  });
+
+  // Verify no internal identifiers leaked into global lexical scope.
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const CREATE_TEXTURE2 = 0;
+      const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 0;
+      const TEXTURE_FORMAT_NAMES = [];
+      const alignBytesPerRow256 = null;
+      const repackRowsTo256 = null;
+      class TexturePackets {}
+      `,
+      ctx
+    );
+  });
+
+  assert.equal(typeof ctx.PlayGta6TexturePackets.alignBytesPerRow256, 'function');
+  assert.equal(typeof ctx.PlayGta6TexturePackets.repackRowsTo256, 'function');
+  assert.equal(ctx.PlayGta6TexturePackets.alignBytesPerRow256(16), 256);
 });
