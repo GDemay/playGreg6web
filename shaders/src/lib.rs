@@ -4,5 +4,6 @@ pub mod dxbc;
 pub mod dxil_reflect;
 pub mod lower;
 pub mod pack;
+pub mod rdna2;
 pub mod reflect;
 pub mod wave_emul;
