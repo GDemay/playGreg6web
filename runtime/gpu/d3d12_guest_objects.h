@@ -63,6 +63,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -641,6 +642,17 @@ public:
     // Root signatures created, by blob version (1.0, 1.1, 1.2).
     std::array<uint32_t, 3> root_signature_versions() const;
     bool shader_known(uint64_t identity) const;
+    // Bytecode length of each shader identity seen in a pipeline state (0 if unknown).
+    void note_shader_size(uint64_t identity, uint64_t bytes, int kind = -1);
+    uint64_t shader_size(uint64_t identity) const;
+    // The shader kind the DXIL container declares (program header; 0 pixel, 1 vertex, 5 compute,
+    // ...), -1 if unknown.
+    int shader_kind(uint64_t identity) const;
+    // The first skipped draw of each pipeline state is described once (counts, formats, sizes):
+    // claim_skipped_draw_report is true exactly once per pipeline state.
+    bool claim_skipped_draw_report(const void* pipeline_state);
+    void add_skipped_draw_report(const std::string& text);
+    std::vector<std::string> skipped_draw_reports() const;
 
     // ---- Resources ----
     // GPU virtual address range for memory without guest backing (default heaps, reserved
@@ -719,6 +731,13 @@ private:
     std::array<uint32_t, 3> unresolved_by_stage_{};
     std::array<uint32_t, 3> root_signature_versions_{};  // under shader_mutex_
     std::unordered_set<uint64_t> known_shaders_;
+    struct ShaderFacts {
+        uint64_t bytes = 0;
+        int kind = -1;
+    };
+    std::unordered_map<uint64_t, ShaderFacts> shader_sizes_;  // under shader_mutex_
+    std::unordered_set<const void*> described_pipelines_;   // under shader_mutex_
+    std::vector<std::string> skipped_draw_reports_;          // under shader_mutex_ (first 64)
     std::mutex va_mutex_;
     uint64_t next_fake_va_ = kFakeGpuVaBase;
     std::mutex tracked_mutex_;
