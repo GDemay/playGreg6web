@@ -811,6 +811,42 @@ void test_queries_and_footprints() {
     const auto ai = get<dg::GuestResourceAllocationInfo>(info);
     CHECK(ai.Alignment == 65536 && ai.SizeInBytes == 65536 + 393216);  // 256*256*4*4/3 rounded to 64K
 
+    // Depth-stencil formats: separate 4-byte depth and 1-byte stencil planes, 5 bytes per texel
+    // (D32_FLOAT_S8X24_UINT = 20, R32G8X24_TYPELESS = 19, D24_UNORM_S8_UINT = 45).
+    for (const uint32_t format : {19u, 20u, 45u}) {
+        dg::GuestResourceDesc ds{};
+        ds.Dimension = 3;
+        ds.Width = 3840;
+        ds.Height = 2160;
+        ds.DepthOrArraySize = 1;
+        ds.MipLevels = 1;
+        ds.Format = format;
+        ds.SampleCount = 1;
+        ds.Flags = 0x2;  // ALLOW_DEPTH_STENCIL
+        const uint64_t ds_info = put(dg::GuestResourceAllocationInfo{});
+        fx.sret_call(device, Slot::GetResourceAllocationInfo, ds_info, {I(0), I(1), I(put(ds))});
+        const auto dsi = get<dg::GuestResourceAllocationInfo>(ds_info);
+        const uint64_t expected = (3840ull * 2160ull * 5ull + 65535ull) & ~65535ull;
+        CHECK(dsi.Alignment == 65536 && dsi.SizeInBytes == expected);
+        CHECK(dg::resource_size_estimate(ds) == 3840ull * 2160ull * 5ull);
+    }
+    // Xbox D16_UNORM_S8_UINT (118): a 2-byte depth plane and a 1-byte stencil plane.
+    {
+        dg::GuestResourceDesc ds{};
+        ds.Dimension = 3;
+        ds.Width = 1024;
+        ds.Height = 1024;
+        ds.DepthOrArraySize = 1;
+        ds.MipLevels = 1;
+        ds.Format = 118;
+        ds.SampleCount = 1;
+        ds.Flags = 0x2;
+        CHECK(dg::resource_size_estimate(ds) == 1024ull * 1024ull * 3ull);
+        CHECK(dg::plane_block_bytes(118, 0) == 2 && dg::plane_block_bytes(118, 1) == 1);
+        CHECK(dg::dxgi_format_layout(119).known && dg::dxgi_format_layout(120).known);
+        CHECK(dg::dxgi_format_layout(116).block_bytes == 4 && dg::dxgi_format_layout(117).block_bytes == 4);
+    }
+
     // GetCopyableFootprints: 2D texture, mips 0..2.
     const uint64_t layouts = com::guest_alloc(3 * sizeof(dg::GuestPlacedSubresourceFootprint));
     const uint64_t rows = com::guest_alloc(3 * 4);
@@ -1174,6 +1210,12 @@ void test_resources() {
     const dg::TextureProbeTotals probe1 = dg::probe_texture_contents(1 << 20);
     CHECK(probe1.with_data == probe0.with_data + 1);
     CHECK(dg::probe_texture_contents(1 << 20).with_data == probe1.with_data);
+    // An Xbox D16_UNORM_S8_UINT (118) depth-stencil texture at title memory is accepted.
+    dg::GuestResourceDesc d16s8 = texture_desc(256, 256, 118, 0x2);
+    const uint64_t ds16 = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(d16s8)), I(0), I(0)},
+                                    dg::IID_ID3D12Resource, &result);
+    CHECK(result == 0 && ds16 != 0);
+    fx.vcall(ds16, Slot::Release);
     swizzled.Layout = 0x200;
     CHECK(fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(swizzled)), I(0), I(0)},
                     dg::IID_ID3D12Resource, &result) == 0);
