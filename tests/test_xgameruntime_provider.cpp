@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <mutex>
 #include <string>
@@ -21,6 +22,7 @@
 #include "os/xbox_middleware.h"
 #include "os/xgameruntime.h"
 #include "os/xgameruntime_provider.h"
+#include "os/xgamesave_local.h"
 
 namespace {
 
@@ -182,11 +184,34 @@ void sub_work(GuestState* s) {
     ret(s);
 }
 
+// bool callback(const XGameSaveContainerInfo*, void* context): records the container name and
+// blob count and stops after g_enum_stop_after calls.
+constexpr uint64_t kEnumCb = 0x140020500ULL;
+std::vector<std::string> g_enum_names;
+std::vector<uint32_t> g_enum_blobs;
+size_t g_enum_stop_after = 100;
+
+void sub_enum_cb(GuestState* s) {
+    const uint64_t info = s->gpr[GuestReg::Rcx];
+    uint64_t name_ptr = 0;
+    uint32_t blobs = 0;
+    CHECK(g_arena->read(info, &name_ptr, sizeof(name_ptr)));
+    CHECK(g_arena->read(info + 16, &blobs, sizeof(blobs)));
+    char name[64] = {};
+    CHECK(g_arena->read(name_ptr, name, sizeof(name) - 1));
+    g_enum_names.push_back(name);
+    g_enum_blobs.push_back(blobs);
+    CHECK(s->gpr[GuestReg::Rdx] == 0xE11E);
+    s->gpr[GuestReg::Rax] = g_enum_names.size() < g_enum_stop_after ? 1 : 0;
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
     {kProvider, sub_provider},
     {kWorkFn, sub_work},
+    {kEnumCb, sub_enum_cb},
 };
 
 struct GuestFault {
@@ -216,6 +241,9 @@ bool wait_for(Pred pred) {
     }
     return pred();
 }
+
+struct Fixture;
+uint64_t make_guest_block(Fixture& fx, uint64_t queue);
 
 constexpr Guid kAsyncQueue = com::make_guid("073b7dcb-1fcf-4030-94be-e3c9eb623428");
 constexpr Guid kUser = com::make_guid("01acd177-91f9-4763-a38e-ccbb55ce32e0");
@@ -463,17 +491,74 @@ void test_query_api() {
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
     }
     {
-        // XGameSave slots 3/4 (InitializeProvider / InitializeProviderAsync): no game-save
-        // provider offline, so both fail; no handle is invented and a null block is invalid.
+        // XGameSave (O34): a local provider. s3 hands out a handle, s4 completes through the
+        // XAsync queue and s5 returns the handle, s6 closes it. A null block / user is invalid.
+        namespace gs = playgta6::os::gdk::gamesave;
+        const std::filesystem::path dir = std::filesystem::temp_directory_path() / "pg6_o34_provider_test";
+        std::filesystem::remove_all(dir);
+        gs::set_save_dir(dir.string());
         const uint64_t save = fx.query(com::make_guid("704c3f58-e629-4cc2-b197-30511b996fe2"),
                                        com::make_guid("1bfff3af-f14a-40a3-8e35-9ada906593f9"));
         const uint64_t provider = fx.alloc(8);
+        const uint64_t cfg = fx.cstring("00000000-0000-0000-0000-000000000001");
         CHECK(com::write_guest(provider, uint64_t{0x1234}));
-        CHECK(hr32(fx.vcall(save, 3, {0x10, 0x20, 0, provider})) == com::E_NOTIMPL_HR);
+        CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, provider})) == 0);
+        const uint64_t handle = load64(provider);
+        CHECK(handle != 0 && handle != 0x1234);
+        CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, 0})) == com::E_POINTER_HR);
+        CHECK(hr32(fx.vcall(save, 3, {0, cfg, 0, provider})) == com::E_INVALIDARG_HR);
         CHECK(load64(provider) == 0);
-        const uint64_t block = fx.alloc(0x38);
-        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, block})) == com::E_NOTIMPL_HR);
-        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, 0})) == com::E_INVALIDARG_HR);
+        fx.vcall(save, 6, {handle});
+
+        const uint64_t queue_api = fx.query(kAsyncQueue, kAsyncQueue);
+        const uint64_t qout = fx.alloc(8);
+        CHECK(hr32(fx.vcall(queue_api, 12, {0, 0, qout})) == 0);
+        const uint64_t queue = load64(qout);
+        const uint64_t block = make_guest_block(fx, queue);
+        CHECK(hr32(fx.vcall(save, 4, {0x10, cfg, 0, block})) == 0);
+        CHECK(hr32(fx.vcall(queue_api, 3, {block, 0})) == playgta6::os::gdk::E_PENDING_HR);
+        CHECK(hr32(fx.vcall(save, 5, {block, provider})) == playgta6::os::gdk::E_PENDING_HR);
+        g_done_block = 0;
+        auto dispatch = [&](uint32_t port) { return (fx.vcall(queue_api, 16, {queue, port, 0}) & 0xFF) == 1; };
+        CHECK(dispatch(0));  // DoWork
+        CHECK(dispatch(1));  // completion callback
+        CHECK(g_done_block == block);
+        CHECK(hr32(fx.vcall(queue_api, 3, {block, 0})) == 0);
+        CHECK(hr32(fx.vcall(save, 5, {block, provider})) == 0);
+        const uint64_t async_handle = load64(provider);
+        CHECK(async_handle != 0);
+        fx.vcall(save, 6, {async_handle});
+        CHECK(hr32(fx.vcall(save, 4, {0x10, cfg, 0, 0})) == com::E_INVALIDARG_HR);
+
+        // s13 / s14: container enumeration through the guest callback (context passed through).
+        {
+            const uint64_t p2 = fx.alloc(8);
+            CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, p2})) == 0);
+            const uint64_t h2 = load64(p2);
+            const uint64_t player = fx.cstring("Player");
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 13, {h2, player, 0xE11E, kEnumCb})) == 0);  // empty store
+            CHECK(g_enum_names.empty());
+            gs::Store store = gs::open_store("00000000-0000-0000-0000-000000000001");
+            CHECK(store.create_container("Player") == 0);
+            CHECK(store.create_container("Settings") == 0);
+            CHECK(store.submit_update("Player", {{"a", {1, 2, 3}}}, {}) == 0);
+            CHECK(hr32(fx.vcall(save, 13, {h2, player, 0xE11E, kEnumCb})) == 0);
+            CHECK(g_enum_names.size() == 1 && g_enum_names[0] == "Player" && g_enum_blobs[0] == 1);
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == 0);
+            CHECK(g_enum_names.size() == 2 && g_enum_names[1] == "Settings");
+            g_enum_names.clear();
+            g_enum_stop_after = 1;  // the callback returns false: enumeration stops
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == 0 && g_enum_names.size() == 1);
+            g_enum_stop_after = 100;
+            CHECK(hr32(fx.vcall(save, 14, {0x9999, 0xE11E, kEnumCb})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, 0})) == com::E_INVALIDARG_HR);
+            fx.vcall(save, 6, {h2});
+            CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == com::E_INVALIDARG_HR);  // closed
+        }
+        std::filesystem::remove_all(dir);
+        gs::set_save_dir("");
     }
     {
         // {b884675d} slot 3: XSystemGetAnalyticsInfo through the hidden result pointer.
