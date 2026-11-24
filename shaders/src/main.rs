@@ -2174,4 +2174,99 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn end_to_end_translate_and_pack_rdna2_json_emit_tight_cbv_binding_sizes() {
+        let root = make_temp_dir("playgta6_shaders_tight_cbv_cli");
+        let in_dir = root.join("blobs");
+        let out_pack = root.join("out/tight_cbv.wgsl.pack");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        let enc_smem = |op: u8, sdata: u8, sbase_pair: u8, offset: i32| -> [u32; 2] {
+            let w0 = (0b111101u32 << 26)
+                | (u32::from(op) << 18)
+                | (u32::from(sdata & 0x7F) << 6)
+                | u32::from(sbase_pair & 0x3F);
+            let w1 = (0x7Du32 << 25) | ((offset as u32) & 0x001F_FFFF);
+            [w0, w1]
+        };
+
+        // 1) Synthetic PS reading cb[0..2] (offsets 0..44) -> 48 B (array<vec4<u32>, 3>)
+        let mut small_words = Vec::new();
+        small_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x00));
+        small_words.extend_from_slice(&enc_smem(0x08, 8, 0, 0x2C));
+        small_words.push((0b0111_111u32 << 25) | (0u32 << 17) | (0x01u32 << 9) | 4);
+        small_words.push((0b0111_111u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 8);
+        small_words.extend_from_slice(&[
+            (0b111110u32 << 26) | (1u32 << 12) | (1u32 << 11) | 0xF,
+            0 | (1 << 8) | (0 << 16) | (1 << 24),
+        ]);
+        small_words.push((0b1011_1111_1u32 << 23) | (0x01u32 << 16));
+
+        // 2) Synthetic PS with two CBVs: cb0 (vec4 1 -> 32 B) + cb1 (vec4 5 -> 96 B)
+        let mut multi_words = Vec::new();
+        multi_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x10));
+        multi_words.extend_from_slice(&enc_smem(0x0A, 8, 2, 0x50));
+        multi_words.push((0b0111_111u32 << 25) | (0u32 << 17) | (0x01u32 << 9) | 4);
+        multi_words.push((0b0111_111u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 8);
+        multi_words.extend_from_slice(&[
+            (0b111110u32 << 26) | (1u32 << 12) | (1u32 << 11) | 0xF,
+            0 | (1 << 8) | (0 << 16) | (1 << 24),
+        ]);
+        multi_words.push((0b1011_1111_1u32 << 23) | (0x01u32 << 16));
+
+        let small_path = in_dir.join("ps_0000000000000201.rdna2");
+        let multi_path = in_dir.join("ps_0000000000000202.rdna2");
+        fs::write(&small_path, words_to_bytes(&small_words)).unwrap();
+        fs::write(&multi_path, words_to_bytes(&multi_words)).unwrap();
+
+        // translate-rdna2 --json for small 48 B CBV
+        let (small_json, small_out, _) =
+            format_translate_rdna2(&small_path, Rdna2StageOverride::Auto, true)
+                .expect("translate-rdna2 --json should succeed");
+        assert!(small_out.wgsl.contains("array<vec4<u32>, 3>"));
+        assert!(
+            small_json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 48, \"highest_vec4_offset\": 2}"
+            ),
+            "JSON:\n{small_json}"
+        );
+
+        // translate-rdna2 --json for multi-CBV (32 B + 96 B)
+        let (multi_json, multi_out, _) =
+            format_translate_rdna2(&multi_path, Rdna2StageOverride::Auto, true)
+                .expect("translate-rdna2 --json should succeed for multi-CBV");
+        assert!(multi_out.wgsl.contains("array<vec4<u32>, 2>"));
+        assert!(multi_out.wgsl.contains("array<vec4<u32>, 6>"));
+        assert!(
+            multi_json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 32, \"highest_vec4_offset\": 1}"
+            ),
+            "JSON:\n{multi_json}"
+        );
+        assert!(
+            multi_json.contains(
+                "{\"group\": 0, \"binding\": 3, \"kind\": \"uniform\", \"name\": \"cb1\", \"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5}"
+            ),
+            "JSON:\n{multi_json}"
+        );
+
+        // pack-rdna2 --json emits the same tight binding metadata for all packed shaders
+        let (pack_json, _) = format_and_write_pack_rdna2(&in_dir, &out_pack, true)
+            .expect("pack-rdna2 --json should succeed");
+        assert!(
+            pack_json.contains("\"min_binding_size_bytes\": 48, \"highest_vec4_offset\": 2"),
+            "pack JSON:\n{pack_json}"
+        );
+        assert!(
+            pack_json.contains("\"min_binding_size_bytes\": 32, \"highest_vec4_offset\": 1"),
+            "pack JSON:\n{pack_json}"
+        );
+        assert!(
+            pack_json.contains("\"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5"),
+            "pack JSON:\n{pack_json}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

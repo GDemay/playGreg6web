@@ -34,10 +34,16 @@ use crate::rdna2::{
     analyze_instructions, decode_program,
 };
 
-/// Default minimum number of `vec4<u32>` slots in the synthesized uniform CBV (`cb0`).
-pub const DEFAULT_MIN_CBV_VEC4_COUNT: u32 = 16;
+/// Default minimum number of `vec4<u32>` slots in a statically-sized uniform CBV (`cb0`, `cb1`, ...).
+/// Tightly sized to `1` (`16` bytes) so small Xbox Series CBVs (e.g. 48 B / 96 B) are never
+/// over-declared as 256 B uniform blocks in WebGPU.
+pub const DEFAULT_MIN_CBV_VEC4_COUNT: u32 = 1;
 
-/// Upper bound on `vec4<u32>` slots in `cb0` (1024 * 16B = 16 KiB, within WebGPU 64 KiB baseline).
+/// Minimum number of `vec4<u32>` slots (`256` bytes) emitted for a CBV that uses a dynamic/unknown
+/// `soffset` where no upper bound is statically known.
+pub const DEFAULT_DYNAMIC_CBV_VEC4_COUNT: u32 = 16;
+
+/// Upper bound on `vec4<u32>` slots in a single CBV (1024 * 16B = 16 KiB, within WebGPU 64 KiB baseline).
 pub const MAX_CBV_VEC4_COUNT: u32 = 1024;
 
 /// Maximum inter-stage location count under WebGPU baseline limits.
@@ -115,6 +121,12 @@ pub struct WgslBindingInfo {
     pub binding: u32,
     pub kind: &'static str,
     pub name: String,
+    /// Minimum WebGPU uniform buffer binding size in bytes (`Some(N * 16)` for `"uniform"`
+    /// bindings, `None` for non-buffer bindings such as textures and samplers).
+    pub min_binding_size_bytes: Option<u32>,
+    /// Highest `vec4` index statically read from this uniform CBV (`Some(max_vec4_index)` for
+    /// `"uniform"` bindings, `None` for non-buffer bindings).
+    pub highest_vec4_offset: Option<u32>,
 }
 
 /// Write a JSON array of [`WgslBindingInfo`] entries with the given leading indentation.
@@ -137,6 +149,12 @@ pub(crate) fn write_wgsl_bindings_json(
         write_json_string(out, b.kind);
         out.push_str(", \"name\": ");
         write_json_string(out, &b.name);
+        if let Some(min_bytes) = b.min_binding_size_bytes {
+            let _ = write!(out, ", \"min_binding_size_bytes\": {min_bytes}");
+        }
+        if let Some(highest_vec4) = b.highest_vec4_offset {
+            let _ = write!(out, ", \"highest_vec4_offset\": {highest_vec4}");
+        }
         out.push('}');
         if i + 1 < bindings.len() {
             out.push(',');
@@ -306,6 +324,19 @@ struct VertexInputAttr {
     components: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CbvUsage {
+    max_vec4_index: u32,
+    has_dynamic_offset: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CbvSlotPlan {
+    sbase: u8,
+    vec4_count: u32,
+    highest_vec4_offset: u32,
+}
+
 struct ProgramPlan {
     stage: ShaderStage,
     entry_point: String,
@@ -314,7 +345,7 @@ struct ProgramPlan {
     vertex_attrs: Vec<VertexInputAttr>,
     has_buffer_fetch: bool,
     legacy_uv_attr_index: Option<usize>,
-    cbv_slots: Vec<u8>,
+    cbv_slots: Vec<CbvSlotPlan>,
     cbv_vec4_count: u32,
     tex_slots: Vec<u8>,
     samp_slots: Vec<u8>,
@@ -615,8 +646,7 @@ fn plan_program(
 
     let active = &instructions[..active_inst_count];
 
-    let mut cbv_base_set: BTreeSet<u8> = BTreeSet::new();
-    let mut max_cbv_dword: u32 = 0;
+    let mut cbv_usage: BTreeMap<u8, CbvUsage> = BTreeMap::new();
     let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut has_buffer_fetch = false;
@@ -739,8 +769,8 @@ fn plan_program(
                 ..
             } => {
                 if let Some(count) = smem_load_dword_count(*op) {
-                    cbv_base_set.insert(*sbase);
-                    if *soffset != 0x7D && *soffset <= 105 {
+                    let is_dynamic = *soffset != 0x7D && *soffset <= 105;
+                    if is_dynamic {
                         sgprs.insert(*soffset);
                     }
                     let base_word = if *offset > 0 {
@@ -748,7 +778,24 @@ fn plan_program(
                     } else {
                         0
                     };
-                    max_cbv_dword = max_cbv_dword.max(base_word.saturating_add(u32::from(count)));
+                    let loaded_dwords = if *sdata <= 105 {
+                        u32::from(count).min(u32::from(106 - *sdata))
+                    } else {
+                        u32::from(count)
+                    }
+                    .max(1);
+                    let highest_dword = base_word.saturating_add(loaded_dwords - 1);
+                    let highest_vec4 = highest_dword / 4;
+                    cbv_usage
+                        .entry(*sbase)
+                        .and_modify(|usage| {
+                            usage.max_vec4_index = usage.max_vec4_index.max(highest_vec4);
+                            usage.has_dynamic_offset |= is_dynamic;
+                        })
+                        .or_insert(CbvUsage {
+                            max_vec4_index: highest_vec4,
+                            has_dynamic_offset: is_dynamic,
+                        });
                     for k in 0..count {
                         let reg = sdata.saturating_add(k);
                         if reg <= 105 {
@@ -1174,17 +1221,33 @@ fn plan_program(
         samp_rsrc_set.insert(0);
     }
 
-    let cbv_slots: Vec<u8> = cbv_base_set.into_iter().collect();
+    let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
+    let cbv_slots: Vec<CbvSlotPlan> = cbv_usage
+        .into_iter()
+        .map(|(sbase, usage)| {
+            let static_needed = usage.max_vec4_index.saturating_add(1);
+            let floor = if usage.has_dynamic_offset {
+                min_vec4s.max(DEFAULT_DYNAMIC_CBV_VEC4_COUNT)
+            } else {
+                min_vec4s
+            };
+            let vec4_count = static_needed.max(floor).clamp(1, MAX_CBV_VEC4_COUNT);
+            let highest_vec4_offset = usage.max_vec4_index.min(vec4_count - 1);
+            CbvSlotPlan {
+                sbase,
+                vec4_count,
+                highest_vec4_offset,
+            }
+        })
+        .collect();
     let tex_slots: Vec<u8> = tex_rsrc_set.into_iter().collect();
     let samp_slots: Vec<u8> = samp_rsrc_set.into_iter().collect();
 
-    let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
-    let needed_vec4s = max_cbv_dword.div_ceil(4).max(min_vec4s);
-    let cbv_vec4_count = if !cbv_slots.is_empty() {
-        needed_vec4s.min(MAX_CBV_VEC4_COUNT)
-    } else {
-        0
-    };
+    let cbv_vec4_count = cbv_slots
+        .iter()
+        .map(|slot| slot.vec4_count)
+        .max()
+        .unwrap_or(0);
 
     ProgramPlan {
         stage,
@@ -1222,8 +1285,7 @@ struct CommonTypes {
 struct IrEmitter {
     module: Module,
     types: CommonTypes,
-    cb_globals: BTreeMap<u8, Handle<GlobalVariable>>,
-    cb0_vec4_count: u32,
+    cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)>,
     tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     emitted_bindings: Vec<WgslBindingInfo>,
@@ -1330,39 +1392,47 @@ impl IrEmitter {
         //   tex0 -> @group(0) @binding(1)
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
-        let mut cb_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
         let mut tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
         let mut next_extra_binding: u32 = 3;
 
         if !plan.cbv_slots.is_empty() {
-            let count = plan.cbv_vec4_count.max(1);
-            let arr_ty = insert_type(
-                &mut module,
-                None,
-                TypeInner::Array {
-                    base: vec4_u32_ty,
-                    size: ArraySize::Constant(
-                        NonZeroU32::new(count).unwrap_or(NonZeroU32::MIN),
-                    ),
-                    stride: 16,
-                },
-            );
-            let cbv_struct_ty = insert_type(
-                &mut module,
-                Some("Rdna2Cbv".to_string()),
-                TypeInner::Struct {
-                    members: vec![StructMember {
-                        name: Some("data".to_string()),
-                        ty: arr_ty,
-                        binding: None,
-                        offset: 0,
-                    }],
-                    span: count.saturating_mul(16),
-                },
-            );
-            for (idx, &sbase) in plan.cbv_slots.iter().enumerate() {
+            let mut cbv_struct_by_count: BTreeMap<u32, Handle<Type>> = BTreeMap::new();
+            for (idx, slot) in plan.cbv_slots.iter().enumerate() {
+                let count = slot.vec4_count.max(1);
+                let cbv_struct_ty = *cbv_struct_by_count.entry(count).or_insert_with(|| {
+                    let arr_ty = insert_type(
+                        &mut module,
+                        None,
+                        TypeInner::Array {
+                            base: vec4_u32_ty,
+                            size: ArraySize::Constant(
+                                NonZeroU32::new(count).unwrap_or(NonZeroU32::MIN),
+                            ),
+                            stride: 16,
+                        },
+                    );
+                    let struct_name = if idx == 0 {
+                        "Rdna2Cbv".to_string()
+                    } else {
+                        format!("Rdna2Cbv{idx}")
+                    };
+                    insert_type(
+                        &mut module,
+                        Some(struct_name),
+                        TypeInner::Struct {
+                            members: vec![StructMember {
+                                name: Some("data".to_string()),
+                                ty: arr_ty,
+                                binding: None,
+                                offset: 0,
+                            }],
+                            span: count.saturating_mul(16),
+                        },
+                    )
+                });
                 let binding_num = if idx == 0 {
                     0
                 } else {
@@ -1385,12 +1455,14 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                cb_globals.insert(sbase, g);
+                cb_globals.insert(slot.sbase, (g, count));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
                     kind: "uniform",
                     name,
+                    min_binding_size_bytes: Some(count.saturating_mul(16)),
+                    highest_vec4_offset: Some(slot.highest_vec4_offset),
                 });
             }
         }
@@ -1442,6 +1514,8 @@ impl IrEmitter {
                     binding: binding_num,
                     kind: "texture_2d",
                     name,
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 });
             }
             for (idx, &ssamp) in plan.samp_slots.iter().enumerate() {
@@ -1473,6 +1547,8 @@ impl IrEmitter {
                     binding: binding_num,
                     kind: "sampler",
                     name,
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 });
             }
         }
@@ -1762,7 +1838,6 @@ impl IrEmitter {
             module,
             types,
             cb_globals,
-            cb0_vec4_count: plan.cbv_vec4_count,
             tex_globals,
             samp_globals,
             emitted_bindings,
@@ -3332,14 +3407,14 @@ impl IrEmitter {
         let Some(count) = smem_load_dword_count(op) else {
             return false;
         };
-        let Some(&cb_global) = self
+        let Some(&(cb_global, cb_vec4_count)) = self
             .cb_globals
             .get(&sbase)
             .or_else(|| self.cb_globals.values().next())
         else {
             return false;
         };
-        let total_dwords = self.cb0_vec4_count.max(1).saturating_mul(4);
+        let total_dwords = cb_vec4_count.max(1).saturating_mul(4);
 
         let cb_ptr = self.raw_expr(Expression::GlobalVariable(cb_global));
         let data_ptr = self.emit_expr(Expression::AccessIndex {
@@ -6097,12 +6172,16 @@ mod tests {
                     binding: 1,
                     kind: "texture_2d",
                     name: "tex0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
                 WgslBindingInfo {
                     group: 0,
                     binding: 2,
                     kind: "sampler",
                     name: "samp0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
             ]
         );
@@ -6161,11 +6240,15 @@ mod tests {
         assert!(out.naga_validated);
         assert_eq!(out.stage, ShaderStage::Fragment);
         assert!(out.binding_summary.has_cbv);
-        assert!(out.binding_summary.cbv_vec4_count >= DEFAULT_MIN_CBV_VEC4_COUNT);
+        // s_load_dwordx4 at offset 0x10 reads dwords 4..=7 -> vec4 index 1 -> 2 vec4s (32 bytes).
+        assert_eq!(out.binding_summary.cbv_vec4_count, 2);
+        assert_eq!(out.bindings[0].min_binding_size_bytes, Some(32));
+        assert_eq!(out.bindings[0].highest_vec4_offset, Some(1));
         assert!(out.binding_summary.has_texture_2d);
         assert!(out.binding_summary.has_sampler);
         assert_eq!(out.unsupported_op_count, 0);
         assert!(out.wgsl.contains("struct Rdna2Cbv"));
+        assert!(out.wgsl.contains("array<vec4<u32>, 2>"), "WGSL:\n{}", out.wgsl);
         assert!(out.wgsl.contains("@group(0) @binding(0)"));
         assert!(
             out.wgsl.contains("var<uniform>") && out.wgsl.contains("cb0") && out.wgsl.contains("Rdna2Cbv"),
@@ -6398,6 +6481,9 @@ mod tests {
         assert_eq!(out.entry_point, "cs_main");
         assert_eq!(out.unsupported_op_count, 0);
         assert!(out.binding_summary.has_cbv);
+        // Dynamic soffset falls back cleanly to at least 16 vec4s (256 bytes).
+        assert_eq!(out.binding_summary.cbv_vec4_count, DEFAULT_DYNAMIC_CBV_VEC4_COUNT);
+        assert_eq!(out.bindings[0].min_binding_size_bytes, Some(256));
         assert!(out.binding_summary.has_texture_2d);
         assert!(out.wgsl.contains("@compute"));
         assert!(out.wgsl.contains("workgroupBarrier()"));
@@ -6568,6 +6654,8 @@ mod tests {
                 binding: 0,
                 kind: "uniform",
                 name: "cb0".to_string(),
+                min_binding_size_bytes: Some(16),
+                highest_vec4_offset: Some(0),
             }]
         );
 
@@ -6588,7 +6676,7 @@ mod tests {
         let json = out.to_json();
         assert!(json.contains("\"bindings\": ["), "JSON:\n{json}");
         assert!(
-            json.contains("{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\"}"),
+            json.contains("{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 16, \"highest_vec4_offset\": 0}"),
             "JSON:\n{json}"
         );
     }
@@ -6756,14 +6844,20 @@ mod tests {
         assert_eq!(out.bindings[0].binding, 0);
         assert_eq!(out.bindings[0].kind, "uniform");
         assert_eq!(out.bindings[0].name, "cb0");
+        assert_eq!(out.bindings[0].min_binding_size_bytes, Some(16));
+        assert_eq!(out.bindings[0].highest_vec4_offset, Some(0));
         assert_eq!(out.bindings[1].group, 0);
         assert_eq!(out.bindings[1].binding, 1);
         assert_eq!(out.bindings[1].kind, "texture_2d");
         assert_eq!(out.bindings[1].name, "tex0");
+        assert_eq!(out.bindings[1].min_binding_size_bytes, None);
+        assert_eq!(out.bindings[1].highest_vec4_offset, None);
         assert_eq!(out.bindings[2].group, 0);
         assert_eq!(out.bindings[2].binding, 2);
         assert_eq!(out.bindings[2].kind, "sampler");
         assert_eq!(out.bindings[2].name, "samp0");
+        assert_eq!(out.bindings[2].min_binding_size_bytes, None);
+        assert_eq!(out.bindings[2].highest_vec4_offset, None);
 
         // Every declared binding in `out.bindings` must match a real `@group(g) @binding(b)` in WGSL.
         for b in &out.bindings {
@@ -6773,7 +6867,7 @@ mod tests {
 
         let json = out.to_json();
         assert!(
-            json.contains("{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\"}"),
+            json.contains("{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 16, \"highest_vec4_offset\": 0}"),
             "JSON:\n{json}"
         );
         assert!(
@@ -6857,18 +6951,24 @@ mod tests {
                     binding: 0,
                     kind: "uniform",
                     name: "cb0".to_string(),
+                    min_binding_size_bytes: Some(16),
+                    highest_vec4_offset: Some(0),
                 },
                 WgslBindingInfo {
                     group: 0,
                     binding: 1,
                     kind: "texture_2d",
                     name: "tex0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
                 WgslBindingInfo {
                     group: 0,
                     binding: 2,
                     kind: "sampler",
                     name: "samp0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
             ]
         );
@@ -6932,10 +7032,14 @@ mod tests {
         assert_eq!(vs_out.unsupported_op_count, 0, "WGSL:\n{}", vs_out.wgsl);
         assert_eq!(vs_out.bindings.len(), 4); // cb0@0, tex0@1, samp0@2, cb1@3
         assert_eq!(vs_out.bindings[0].name, "cb0");
+        assert_eq!(vs_out.bindings[0].min_binding_size_bytes, Some(64));
+        assert_eq!(vs_out.bindings[0].highest_vec4_offset, Some(3));
         assert_eq!(vs_out.bindings[1].name, "tex0");
         assert_eq!(vs_out.bindings[2].name, "samp0");
         assert_eq!(vs_out.bindings[3].name, "cb1");
         assert_eq!(vs_out.bindings[3].binding, 3);
+        assert_eq!(vs_out.bindings[3].min_binding_size_bytes, Some(128));
+        assert_eq!(vs_out.bindings[3].highest_vec4_offset, Some(7));
         assert!(vs_out.wgsl.contains("textureSampleLevel("));
         assert!(
             vs_out.wgsl.contains("cb0_.data[2]") && vs_out.wgsl.contains("cb0_.data[3]"),
@@ -7029,18 +7133,24 @@ mod tests {
                     binding: 1,
                     kind: "texture_2d",
                     name: "tex0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
                 WgslBindingInfo {
                     group: 0,
                     binding: 2,
                     kind: "sampler",
                     name: "samp0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
                 WgslBindingInfo {
                     group: 0,
                     binding: 3,
                     kind: "texture_2d",
                     name: "tex1".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
                 },
             ]
         );
@@ -7108,5 +7218,236 @@ mod tests {
         assert!(out.wgsl.contains("clamp("));
         assert!(!out.wgsl.contains("enable f16"));
         assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn tight_cbv_sizing_48_byte_frame1_cbv_avoids_256_byte_overdeclaration() {
+        // Synthetic shader reading only cb[0]..cb[2] (byte offsets 0..44):
+        //   s_buffer_load_dwordx4 s[4:7],  s[0:3], 0x00  (cb[0]: bytes 0..15)
+        //   s_buffer_load_dwordx4 s[8:11], s[0:3], 0x10  (cb[1]: bytes 16..31)
+        //   s_buffer_load_dword   s12,     s[0:3], 0x2C  (cb[2].w: bytes 44..47)
+        //   v_mov_b32 v0, s4
+        //   v_add_f32 v1, s8, s12
+        //   exp mrt0 v0, v1, v0, v1 done vm
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x00, false, false));
+        words.extend_from_slice(&enc_smem(0x0A, 8, 0, 0x7D, 0x10, false, false));
+        words.extend_from_slice(&enc_smem(0x08, 12, 0, 0x7D, 0x2C, false, false));
+        words.push(enc_vop1(0x01, 0, 4));
+        words.push(enc_vop2(0x03, 1, 8, 0));
+        words.push(enc_vop2(0x03, 1, 12, 1));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("small 48-byte CBV shader should translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.binding_summary.cbv_vec4_count, 3);
+        assert_eq!(
+            out.bindings,
+            vec![WgslBindingInfo {
+                group: 0,
+                binding: 0,
+                kind: "uniform",
+                name: "cb0".to_string(),
+                min_binding_size_bytes: Some(48),
+                highest_vec4_offset: Some(2),
+            }]
+        );
+        assert!(
+            out.wgsl.contains("array<vec4<u32>, 3>"),
+            "expected tightly sized 3-vec4 (48 B) CBV array in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("array<vec4<u32>, 16>"),
+            "must NOT over-declare 256-byte CBV for 48-byte read:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("cb0_.data[2]"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 48, \"highest_vec4_offset\": 2}"
+            ),
+            "JSON:\n{json}"
+        );
+    }
+
+    #[test]
+    fn tight_cbv_sizing_large_cbv_reads_vec4_20_without_clamping() {
+        // Synthetic shader reading cb[20] (byte offset 20 * 16 = 320 = 0x140):
+        //   s_buffer_load_dwordx4 s[4:7], s[0:3], 0x140
+        //   v_mov_b32 v0, s4
+        //   v_mov_b32 v1, s7
+        //   exp mrt0 v0, v1, v0, v1 done vm
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x140, false, false));
+        words.push(enc_vop1(0x01, 0, 4));
+        words.push(enc_vop1(0x01, 1, 7));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("large 336-byte CBV shader should translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.binding_summary.cbv_vec4_count, 21);
+        assert_eq!(
+            out.bindings,
+            vec![WgslBindingInfo {
+                group: 0,
+                binding: 0,
+                kind: "uniform",
+                name: "cb0".to_string(),
+                min_binding_size_bytes: Some(336),
+                highest_vec4_offset: Some(20),
+            }]
+        );
+        assert!(
+            out.wgsl.contains("array<vec4<u32>, 21>"),
+            "expected 21-vec4 (336 B) CBV array in WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("cb0_.data[20]"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 336, \"highest_vec4_offset\": 20}"
+            ),
+            "JSON:\n{json}"
+        );
+    }
+
+    #[test]
+    fn tight_cbv_sizing_multiple_cbvs_sized_independently() {
+        // Synthetic shader with two CBVs:
+        //   cb0 (sbase=0): reads vec4 1 (offset 0x10) -> N=2 (32 bytes), highest_vec4_offset=1
+        //   cb1 (sbase=2): reads vec4 5 (offset 0x50) -> N=6 (96 bytes), highest_vec4_offset=5
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x10, false, false));
+        words.extend_from_slice(&enc_smem(0x0A, 8, 2, 0x7D, 0x50, false, false));
+        words.push(enc_vop1(0x01, 0, 4));
+        words.push(enc_vop1(0x01, 1, 8));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("multi-CBV shader should translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.binding_summary.cbv_vec4_count, 6);
+        assert_eq!(
+            out.bindings,
+            vec![
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 0,
+                    kind: "uniform",
+                    name: "cb0".to_string(),
+                    min_binding_size_bytes: Some(32),
+                    highest_vec4_offset: Some(1),
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 3,
+                    kind: "uniform",
+                    name: "cb1".to_string(),
+                    min_binding_size_bytes: Some(96),
+                    highest_vec4_offset: Some(5),
+                },
+            ]
+        );
+        assert!(
+            out.wgsl.contains("array<vec4<u32>, 2>"),
+            "expected cb0 sized to 2 vec4s (32 B):\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("array<vec4<u32>, 6>"),
+            "expected cb1 sized to 6 vec4s (96 B):\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("cb0_.data[1]"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("cb1_.data[5]"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 0, \"kind\": \"uniform\", \"name\": \"cb0\", \"min_binding_size_bytes\": 32, \"highest_vec4_offset\": 1}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "{\"group\": 0, \"binding\": 3, \"kind\": \"uniform\", \"name\": \"cb1\", \"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5}"
+            ),
+            "JSON:\n{json}"
+        );
+    }
+
+    #[test]
+    fn tight_cbv_sizing_dynamic_soffset_falls_back_to_max_static_or_16() {
+        // Case A: Dynamic soffset with small static offset (0x04) -> falls back to 16 vec4s (256 B).
+        let mut words_small = Vec::new();
+        words_small.push(enc_sop1(0x03, 2, 128 + 16)); // s_mov_b32 s2, 16
+        words_small.extend_from_slice(&enc_smem(0x09, 4, 0, 2, 0x04, false, false)); // dynamic soffset=s2
+        words_small.push(enc_vop1(0x01, 0, 4));
+        words_small.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 0, 0, 0]));
+        words_small.push(enc_sopp(0x01, 0));
+
+        let out_small = translate_rdna2_to_wgsl(
+            &words_to_bytes(&words_small),
+            &Rdna2TranslateOptions::default(),
+        )
+        .expect("dynamic CBV shader should translate cleanly");
+        assert!(out_small.naga_validated);
+        assert_eq!(out_small.bindings[0].min_binding_size_bytes, Some(256));
+        assert_eq!(out_small.bindings[0].highest_vec4_offset, Some(0));
+        assert!(
+            out_small.wgsl.contains("array<vec4<u32>, 16>"),
+            "WGSL:\n{}",
+            out_small.wgsl
+        );
+        assert_naga_wgsl_valid(&out_small.wgsl);
+
+        // Case B: Dynamic soffset + static read at cb[20] -> max(20 + 1, 16) = 21 vec4s (336 B).
+        let mut words_large = Vec::new();
+        words_large.push(enc_sop1(0x03, 2, 128 + 16));
+        words_large.extend_from_slice(&enc_smem(0x09, 4, 0, 2, 0x04, false, false));
+        words_large.extend_from_slice(&enc_smem(0x0A, 8, 0, 0x7D, 0x140, false, false));
+        words_large.push(enc_vop1(0x01, 0, 4));
+        words_large.push(enc_vop1(0x01, 1, 8));
+        words_large.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        words_large.push(enc_sopp(0x01, 0));
+
+        let out_large = translate_rdna2_to_wgsl(
+            &words_to_bytes(&words_large),
+            &Rdna2TranslateOptions::default(),
+        )
+        .expect("dynamic + large static CBV shader should translate cleanly");
+        assert!(out_large.naga_validated);
+        assert_eq!(out_large.bindings[0].min_binding_size_bytes, Some(336));
+        assert_eq!(out_large.bindings[0].highest_vec4_offset, Some(20));
+        assert!(
+            out_large.wgsl.contains("array<vec4<u32>, 21>"),
+            "WGSL:\n{}",
+            out_large.wgsl
+        );
+        assert_naga_wgsl_valid(&out_large.wgsl);
     }
 }
