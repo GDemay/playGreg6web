@@ -21,6 +21,9 @@ const {
   createWorkerBootInitPayloads,
   forwardGpuWorkerMessage,
   createHostImports,
+  resolveRuntimeScriptUrl,
+  buildRuntimeModuleConfig,
+  createRuntimeModuleOptions,
   encodeTestFramePacket,
 } = require('../web/loader.js');
 
@@ -621,4 +624,283 @@ test('loader.js worker bridges gameBase/programManifestUrl init and on-demand gp
   gpuWorker.onmessage({ data: { ready: true, adapter: 'mock' } });
   gpuWorker.onmessage({ data: { error: 'test error' } });
   assert.equal(mainMessages.length, 1);
+});
+
+// Minimal valid Wasm32 binary importing env.memory and env.host_log(i32, i32) -> (),
+// exporting `ping(ptr: i32, len: i32) -> ()` that calls host_log.
+function buildMinimalHostLogWasm() {
+  const sec = (id, payload) => [id, payload.length, ...payload];
+  const typeSec = sec(0x01, [0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00]);
+  const importSec = sec(0x02, [
+    0x02,
+    // env.memory (min=1, max=1)
+    0x03, 0x65, 0x6e, 0x76, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x01, 0x01, 0x01,
+    // env.host_log (func type 0)
+    0x03, 0x65, 0x6e, 0x76, 0x08, 0x68, 0x6f, 0x73, 0x74, 0x5f, 0x6c, 0x6f, 0x67, 0x00, 0x00,
+  ]);
+  const funcSec = sec(0x03, [0x01, 0x00]);
+  const exportSec = sec(0x07, [0x01, 0x04, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x01]);
+  const codeSec = sec(0x0a, [0x01, 0x08, 0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x00, 0x0b]);
+  return new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...typeSec,
+    ...importSec,
+    ...funcSec,
+    ...exportSec,
+    ...codeSec,
+  ]);
+}
+
+test('resolveRuntimeScriptUrl and buildRuntimeModuleConfig pin mainScriptUrlOrBlob to dist/runtime.js (never loader.js)', () => {
+  assert.equal(
+    resolveRuntimeScriptUrl(undefined, 'http://127.0.0.1:8080/loader.js'),
+    'http://127.0.0.1:8080/dist/runtime.js',
+  );
+  assert.equal(
+    resolveRuntimeScriptUrl(undefined, 'https://play.example.test/sub/loader.js?v=42'),
+    'https://play.example.test/sub/dist/runtime.js',
+  );
+  assert.equal(resolveRuntimeScriptUrl(undefined, ''), 'dist/runtime.js');
+
+  const absCfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+  });
+  assert.equal(absCfg.mainScriptUrlOrBlob, 'http://127.0.0.1:8080/dist/runtime.js');
+  assert.equal(absCfg.mainScriptUrlOrBlob.includes('loader.js'), false);
+  assert.equal(absCfg.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/dist/runtime.wasm');
+  assert.equal(
+    absCfg.locateFile('runtime.worker.js'),
+    'http://127.0.0.1:8080/dist/runtime.worker.js',
+  );
+  assert.equal(
+    absCfg.locateFile('https://cdn.example.test/runtime.wasm'),
+    'https://cdn.example.test/runtime.wasm',
+  );
+
+  // Relative fallback when no worker locationHref is available.
+  const relCfg = buildRuntimeModuleConfig({ locationHref: '' });
+  assert.equal(relCfg.mainScriptUrlOrBlob, 'dist/runtime.js');
+  assert.equal(relCfg.mainScriptUrlOrBlob.includes('loader.js'), false);
+  assert.equal(relCfg.locateFile('runtime.wasm'), 'dist/runtime.wasm');
+  assert.equal(relCfg.locateFile('runtime.worker.js'), 'dist/runtime.worker.js');
+  assert.equal(relCfg.locateFile('./runtime.wasm'), 'dist/runtime.wasm');
+
+  // Explicit runtimeScriptUrl + locateFileBase overrides.
+  const customCfg = buildRuntimeModuleConfig({
+    runtimeScriptUrl: 'http://127.0.0.1:9000/assets/dist/runtime.js',
+    locateFileBase: 'http://127.0.0.1:9000/wasm-bin',
+  });
+  assert.equal(customCfg.mainScriptUrlOrBlob, 'http://127.0.0.1:9000/assets/dist/runtime.js');
+  assert.equal(customCfg.locateFile('runtime.wasm'), 'http://127.0.0.1:9000/wasm-bin/runtime.wasm');
+  assert.equal(
+    customCfg.locateFile('runtime.worker.js'),
+    'http://127.0.0.1:9000/wasm-bin/runtime.worker.js',
+  );
+});
+
+test('buildRuntimeModuleConfig instantiateWasm merges all env.host_* imports and passes (instance, module)', async () => {
+  const logs = [];
+  const reports = [];
+  const fetchedUrls = [];
+  const hostImports = createHostImports({
+    log: (msg) => logs.push(msg),
+    report: (msg) => reports.push(msg),
+  });
+
+  const wasmBytes = buildMinimalHostLogWasm();
+  let wasmErr = null;
+  const cfg = buildRuntimeModuleConfig({
+    runtimeScriptUrl: 'http://127.0.0.1:8080/dist/runtime.js',
+    hostImports,
+    reportFn: (msg) => reports.push(msg),
+    onWasmError: (err) => {
+      wasmErr = err;
+    },
+    fetchFn: async (url) => {
+      fetchedUrls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/octet-stream' },
+        arrayBuffer: async () => wasmBytes.buffer.slice(0),
+      };
+    },
+  });
+
+  for (const name of [
+    'host_log',
+    'host_httpfs_open',
+    'host_httpfs_read',
+    'host_httpfs_close',
+    'host_wgpu_submit',
+  ]) {
+    assert.equal(typeof cfg.env[name], 'function', `Expected cfg.env.${name}`);
+  }
+  assert.equal(typeof cfg.instantiateWasm, 'function');
+
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  const received = await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(wasmErr || new Error(`instantiateWasm timed out: ${reports.join('; ')}`)),
+      2000,
+    );
+    const syncRet = cfg.instantiateWasm(
+      {
+        env: {
+          memory,
+          // Simulate Emscripten's -sERROR_ON_UNDEFINED_SYMBOLS=0 stub being replaced by host_log.
+          host_log: () => {
+            throw new Error('stub host_log should be overridden by hostImports.env.host_log');
+          },
+          emscripten_keepalive_stub: () => 42,
+        },
+      },
+      (instance, mod) => {
+        clearTimeout(timer);
+        resolve({ instance, mod });
+      },
+    );
+    assert.deepEqual(syncRet, {});
+  });
+
+  assert.deepEqual(fetchedUrls, ['http://127.0.0.1:8080/dist/runtime.wasm']);
+  assert.ok(received.instance instanceof WebAssembly.Instance);
+  assert.ok(received.mod instanceof WebAssembly.Module);
+
+  const text = 'hello from instantiateWasm';
+  const encoded = new TextEncoder().encode(text);
+  new Uint8Array(memory.buffer).set(encoded, 32);
+  received.instance.exports.ping(32, encoded.byteLength);
+  assert.deepEqual(logs, [text]);
+});
+
+test('buildRuntimeModuleConfig instantiateWasm reports fetch failures without unhandled rejection', async () => {
+  const reports = [];
+  const errors = [];
+  const cfg = buildRuntimeModuleConfig({
+    runtimeScriptUrl: 'http://127.0.0.1:8080/dist/runtime.js',
+    reportFn: (msg) => reports.push(msg),
+    onWasmError: (err) => errors.push(err),
+    fetchFn: async () => ({ ok: false, status: 404 }),
+  });
+
+  const ret = cfg.instantiateWasm({ env: {} }, () => {
+    throw new Error('receiveInstance must not be called on 404');
+  });
+  assert.deepEqual(ret, {});
+
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(errors.length, 1);
+  assert.match(String(errors[0]), /404/);
+  assert.ok(reports.some((m) => m.includes('runtime wasm instantiation failed')));
+});
+
+test('loader.js worker passes resolved dist/runtime.js mainScriptUrlOrBlob and locateFile to createRuntimeModule', async () => {
+  let receivedOpts = null;
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+      if (msg.init) {
+        queueMicrotask(() => {
+          if (this.onmessage) {
+            this.onmessage({ data: { ready: true, summary: 'ok', adapter: 'mock' } });
+          }
+        });
+      }
+    }
+  }
+
+  const workerSelf = {
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    onmessage: null,
+    postMessage() {},
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url) => {
+      if (url === './dist/runtime.js') {
+        return { ok: true, status: 200 };
+      }
+      return { ok: false, status: 404 };
+    },
+    importScripts(scriptPath) {
+      if (scriptPath === './dist/runtime.js') {
+        workerSelf.createRuntimeModule = async (opts) => {
+          receivedOpts = opts;
+          return {};
+        };
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(receivedOpts, 'Expected createRuntimeModule to be invoked');
+  assert.equal(receivedOpts.mainScriptUrlOrBlob, 'http://127.0.0.1:8080/dist/runtime.js');
+  assert.equal(receivedOpts.mainScriptUrlOrBlob.includes('loader.js'), false);
+  assert.equal(receivedOpts.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/dist/runtime.wasm');
+  assert.equal(
+    receivedOpts.locateFile('runtime.worker.js'),
+    'http://127.0.0.1:8080/dist/runtime.worker.js',
+  );
+  assert.equal(typeof receivedOpts.instantiateWasm, 'function');
+  assert.equal(typeof receivedOpts.env.host_log, 'function');
+  assert.equal(typeof receivedOpts.env.host_httpfs_open, 'function');
+  assert.equal(typeof receivedOpts.env.host_httpfs_read, 'function');
+  assert.equal(typeof receivedOpts.env.host_httpfs_close, 'function');
+  assert.equal(typeof receivedOpts.env.host_wgpu_submit, 'function');
+});
+
+test('createRuntimeModuleOptions forwards mainScriptUrlOrBlob and locateFile defaults', () => {
+  const opts = createRuntimeModuleOptions({
+    locationHref: 'http://127.0.0.1:8080/web/loader.js',
+  });
+  assert.equal(opts.mainScriptUrlOrBlob, 'http://127.0.0.1:8080/web/dist/runtime.js');
+  assert.equal(opts.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/web/dist/runtime.wasm');
 });

@@ -887,17 +887,236 @@ function encodeTestFramePacket(r, g, b, a) {
   return buf;
 }
 
-function createRuntimeModuleOptions(overrides = {}) {
+const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+const DEFAULT_RUNTIME_SCRIPT_RELATIVE = './dist/runtime.js';
+const DEFAULT_RUNTIME_SCRIPT_FALLBACK = 'dist/runtime.js';
+
+function isAbsoluteUrl(value) {
+  return typeof value === 'string' && ABSOLUTE_URL_RE.test(value);
+}
+
+function dirnameWithSlash(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) {
+    return 'dist/';
+  }
+  const clean = relPath.split(/[?#]/, 1)[0];
+  const slash = clean.lastIndexOf('/');
+  if (slash < 0) {
+    return 'dist/';
+  }
+  return clean.slice(0, slash + 1);
+}
+
+/**
+ * Resolve the Emscripten main script URL (`dist/runtime.js`) relative to the
+ * coordinator worker location so `-pthread` workers spawn `dist/runtime.js`
+ * instead of recursively spawning `loader.js` via `self.location.href`.
+ */
+function resolveRuntimeScriptUrl(runtimeScriptUrl, locationHref) {
+  const rawScript =
+    typeof runtimeScriptUrl === 'string' && runtimeScriptUrl.trim().length > 0
+      ? runtimeScriptUrl.trim()
+      : '';
+  if (rawScript && isAbsoluteUrl(rawScript)) {
+    return rawScript;
+  }
+
+  const baseHref =
+    typeof locationHref === 'string' && locationHref.trim().length > 0
+      ? locationHref.trim()
+      : typeof self !== 'undefined' &&
+          self &&
+          self.location &&
+          typeof self.location.href === 'string'
+        ? self.location.href
+        : '';
+
+  const relativeTarget = rawScript || DEFAULT_RUNTIME_SCRIPT_RELATIVE;
+  if (baseHref && typeof URL === 'function') {
+    try {
+      return new URL(relativeTarget, baseHref).href;
+    } catch {
+      // Fall through to relative fallback when baseHref is not a valid URL.
+    }
+  }
+
+  return rawScript || DEFAULT_RUNTIME_SCRIPT_FALLBACK;
+}
+
+function createRuntimeLocateFile(runtimeScriptUrl, locateFileBase) {
+  const explicitBase =
+    typeof locateFileBase === 'string' && locateFileBase.trim().length > 0
+      ? ensureTrailingSlash(locateFileBase.trim())
+      : '';
+
+  return function locateFile(file) {
+    if (typeof file !== 'string' || file.length === 0) {
+      return '';
+    }
+    if (isAbsoluteUrl(file)) {
+      return file;
+    }
+    if (explicitBase) {
+      if (isAbsoluteUrl(explicitBase) && typeof URL === 'function') {
+        try {
+          return new URL(file, explicitBase).href;
+        } catch {
+          // Fall through to string join.
+        }
+      }
+      return `${explicitBase}${file.replace(/^\.\//, '')}`;
+    }
+    if (isAbsoluteUrl(runtimeScriptUrl) && typeof URL === 'function') {
+      try {
+        return new URL(file, runtimeScriptUrl).href;
+      } catch {
+        // Fall through to relative dist/ join.
+      }
+    }
+    return `${dirnameWithSlash(runtimeScriptUrl)}${file.replace(/^\.\//, '')}`;
+  };
+}
+
+function extractMemoryFromImports(imports) {
+  if (!imports || typeof imports !== 'object') {
+    return null;
+  }
+  if (imports.env && imports.env.memory) {
+    return imports.env.memory;
+  }
+  if (imports.a && imports.a.memory) {
+    return imports.a.memory;
+  }
+  return null;
+}
+
+function mergeHostImportsIntoWasmImports(imports, hostEnv) {
+  const merged = Object.assign({}, imports && typeof imports === 'object' ? imports : {});
+  const baseEnv = merged.env && typeof merged.env === 'object' ? merged.env : {};
+  merged.env = Object.assign({}, baseEnv, hostEnv || {});
+  return merged;
+}
+
+function createInstantiateWasmHandler(options = {}) {
+  const locateFile =
+    typeof options.locateFile === 'function' ? options.locateFile : (f) => `dist/${f}`;
+  const hostImports = options.hostImports || null;
+  const reportFn = typeof options.reportFn === 'function' ? options.reportFn : report;
+  const fetchFn =
+    typeof options.fetchFn === 'function'
+      ? options.fetchFn
+      : typeof fetch === 'function'
+        ? fetch
+        : null;
+  const wasmBinary = options.wasmBinary || null;
+  const onError = typeof options.onError === 'function' ? options.onError : null;
+
+  return function instantiateWasm(imports, receiveInstance) {
+    const importedMemory = extractMemoryFromImports(imports);
+    if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
+      hostImports.setMemory(importedMemory);
+    }
+
+    const mergedImports = mergeHostImportsIntoWasmImports(
+      imports,
+      hostImports && hostImports.env ? hostImports.env : null,
+    );
+
+    const finish = (result) => {
+      const instance = result && result.instance ? result.instance : result;
+      const mod =
+        result && result.module
+          ? result.module
+          : typeof WebAssembly !== 'undefined' && wasmBinary instanceof WebAssembly.Module
+            ? wasmBinary
+            : undefined;
+      if (
+        instance &&
+        instance.exports &&
+        instance.exports.memory &&
+        hostImports &&
+        typeof hostImports.setMemory === 'function'
+      ) {
+        hostImports.setMemory(instance.exports.memory);
+      }
+      if (typeof receiveInstance === 'function') {
+        receiveInstance(instance, mod);
+      }
+    };
+
+    const handleFailure = (err) => {
+      try {
+        reportFn(`runtime wasm instantiation failed: ${err}`);
+      } catch {
+        // Progress channel failures must not mask instantiation errors.
+      }
+      if (onError) {
+        try {
+          onError(err);
+        } catch {
+          // Ignore secondary error hook exceptions.
+        }
+      }
+    };
+
+    const wasmUrl = locateFile('runtime.wasm');
+    let instantiatePromise;
+    if (wasmBinary) {
+      instantiatePromise = WebAssembly.instantiate(wasmBinary, mergedImports);
+    } else if (!fetchFn) {
+      handleFailure(new Error(`fetch unavailable while loading ${wasmUrl}`));
+      return {};
+    } else {
+      instantiatePromise = Promise.resolve()
+        .then(() => fetchFn(wasmUrl, { credentials: 'same-origin' }))
+        .then((resp) => {
+          if (!resp || resp.ok === false) {
+            const status = resp && resp.status !== undefined ? resp.status : 'unknown';
+            throw new Error(`Failed to fetch ${wasmUrl} (HTTP ${status})`);
+          }
+          const contentType =
+            resp.headers && typeof resp.headers.get === 'function'
+              ? String(resp.headers.get('content-type') || '')
+              : '';
+          const canStream =
+            typeof WebAssembly.instantiateStreaming === 'function' &&
+            (typeof Response === 'undefined' || resp instanceof Response) &&
+            contentType.toLowerCase().includes('application/wasm');
+          if (canStream) {
+            return WebAssembly.instantiateStreaming(Promise.resolve(resp), mergedImports);
+          }
+          return resp.arrayBuffer().then((bytes) => WebAssembly.instantiate(bytes, mergedImports));
+        });
+    }
+
+    instantiatePromise.then(finish, handleFailure);
+    return {};
+  };
+}
+
+/**
+ * Build the Emscripten `createRuntimeModule(...)` configuration object with:
+ * - `mainScriptUrlOrBlob` pinned to `dist/runtime.js` (never `loader.js`),
+ * - `locateFile` resolving `runtime.wasm` / `runtime.worker.js` cleanly under `dist/`,
+ * - `env` + `instantiateWasm` merging `host_log`, `host_httpfs_*`, and `host_wgpu_submit`.
+ */
+function buildRuntimeModuleConfig(options = {}) {
   let boundModule = null;
+  const activeReportFn =
+    typeof options.reportFn === 'function'
+      ? options.reportFn
+      : typeof options.report === 'function'
+        ? options.report
+        : report;
   const activeHttpfsClient =
-    overrides.httpfsClient !== undefined ? overrides.httpfsClient : httpfsClient;
+    options.httpfsClient !== undefined ? options.httpfsClient : httpfsClient;
   const activeUserdataStore =
-    overrides.userdataStore !== undefined ? overrides.userdataStore : userdataStore;
-  const activeGpuWorker = overrides.gpuWorker !== undefined ? overrides.gpuWorker : gpuWorker;
+    options.userdataStore !== undefined ? options.userdataStore : userdataStore;
+  const activeGpuWorker = options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
 
   const wgpuSubmit =
-    typeof overrides.wgpuSubmit === 'function'
-      ? overrides.wgpuSubmit
+    typeof options.wgpuSubmit === 'function'
+      ? options.wgpuSubmit
       : (bytes) => {
           if (!activeGpuWorker) return;
           const copy = bytes.slice().buffer;
@@ -905,78 +1124,116 @@ function createRuntimeModuleOptions(overrides = {}) {
         };
 
   const logFn =
-    typeof overrides.log === 'function' ? overrides.log : (msg) => report(`[wasm] ${msg}`);
+    typeof options.log === 'function' ? options.log : (msg) => activeReportFn(`[wasm] ${msg}`);
 
-  const hostImports = createHostImports({
-    memory: overrides.memory || null,
-    getMemory: () =>
-      overrides.memory ||
-      (boundModule && (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
-      null,
-    log: logFn,
-    wgpuSubmit,
-    httpfsClient: activeHttpfsClient,
-    userdataStore: activeUserdataStore,
-    onFirstPresent:
-      typeof overrides.onFirstPresent === 'function' ? overrides.onFirstPresent : null,
-    emitFirstPresentLog: overrides.emitFirstPresentLog === true,
-  });
-
-  const preRun = [
-    (mod) => {
-      boundModule = mod || null;
-      if (mod && (mod.wasmMemory || (mod.HEAPU8 && mod.HEAPU8.buffer))) {
-        hostImports.setMemory(mod.wasmMemory || mod.HEAPU8.buffer);
-      }
-      if (!activeUserdataStore || !mod || !mod.FS) return;
-      const useRunDep =
-        typeof mod.addRunDependency === 'function' &&
-        typeof mod.removeRunDependency === 'function';
-      if (useRunDep) {
-        mod.addRunDependency('userdata-restore');
-      }
-      activeUserdataStore
-        .restoreAll(mod.FS, { timeoutMs: 8000 })
-        .then((res) => {
-          if (res.timedOut) {
-            report(`userdata restore timed out (continuing boot): ${res.error}`);
-          } else if (res.error) {
-            report(`userdata restore skipped: ${res.error}`);
-          } else {
-            report(`userdata restored (${res.restored} files)`);
-          }
-        })
-        .catch((err) => {
-          report(`userdata restore warning: ${err}`);
-        })
-        .finally(() => {
-          if (useRunDep) {
-            mod.removeRunDependency('userdata-restore');
-          }
+  const activeHostImports =
+    options.hostImports && typeof options.hostImports === 'object'
+      ? options.hostImports
+      : createHostImports({
+          memory: options.memory || null,
+          getMemory: () =>
+            options.memory ||
+            (boundModule &&
+              (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
+            null,
+          log: logFn,
+          report: activeReportFn,
+          wgpuSubmit,
+          httpfsClient: activeHttpfsClient,
+          userdataStore: activeUserdataStore,
+          onFirstPresent:
+            typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null,
+          emitFirstPresentLog: options.emitFirstPresentLog === true,
         });
-    },
-  ];
 
-  return {
-    locateFile: (p) => `./dist/${p}`,
+  const resolvedRuntimeScriptUrl = resolveRuntimeScriptUrl(
+    options.runtimeScriptUrl,
+    options.locationHref,
+  );
+  const locateFile = createRuntimeLocateFile(resolvedRuntimeScriptUrl, options.locateFileBase);
+
+  const preRun = Array.isArray(options.preRun)
+    ? options.preRun
+    : [
+        (mod) => {
+          boundModule = mod || null;
+          if (
+            mod &&
+            (mod.wasmMemory || (mod.HEAPU8 && mod.HEAPU8.buffer)) &&
+            typeof activeHostImports.setMemory === 'function'
+          ) {
+            activeHostImports.setMemory(mod.wasmMemory || mod.HEAPU8.buffer);
+          }
+          if (!activeUserdataStore || !mod || !mod.FS) return;
+          const useRunDep =
+            typeof mod.addRunDependency === 'function' &&
+            typeof mod.removeRunDependency === 'function';
+          if (useRunDep) {
+            mod.addRunDependency('userdata-restore');
+          }
+          activeUserdataStore
+            .restoreAll(mod.FS, { timeoutMs: 8000 })
+            .then((res) => {
+              if (res.timedOut) {
+                activeReportFn(`userdata restore timed out (continuing boot): ${res.error}`);
+              } else if (res.error) {
+                activeReportFn(`userdata restore skipped: ${res.error}`);
+              } else {
+                activeReportFn(`userdata restored (${res.restored} files)`);
+              }
+            })
+            .catch((err) => {
+              activeReportFn(`userdata restore warning: ${err}`);
+            })
+            .finally(() => {
+              if (useRunDep) {
+                mod.removeRunDependency('userdata-restore');
+              }
+            });
+        },
+      ];
+
+  const userdataApiObj = activeHostImports.userdata || {};
+  const config = {
+    mainScriptUrlOrBlob: resolvedRuntimeScriptUrl,
+    locateFile,
     preRun,
-    env: hostImports.env,
-    hostImports,
+    env: activeHostImports.env,
+    hostImports: activeHostImports,
     httpfsMailboxSab:
-      overrides.httpfsMailboxSab !== undefined ? overrides.httpfsMailboxSab : httpfsMailboxSab,
-    inputSab: overrides.inputSab !== undefined ? overrides.inputSab : inputSab,
-    hostCallbacks: {
+      options.httpfsMailboxSab !== undefined ? options.httpfsMailboxSab : httpfsMailboxSab,
+    inputSab: options.inputSab !== undefined ? options.inputSab : inputSab,
+    hostCallbacks: options.hostCallbacks || {
       log: logFn,
       wgpuSubmit,
       httpfsOpen: (relPath) => (activeHttpfsClient ? activeHttpfsClient.open(relPath) : -1),
       httpfsRead: (handle, offset, dst, len) =>
         activeHttpfsClient ? activeHttpfsClient.read(handle, offset, dst, len) : -1,
       httpfsClose: (handle) => (activeHttpfsClient ? activeHttpfsClient.close(handle) : false),
-      userdataRestore: hostImports.userdata.restore,
-      userdataSave: hostImports.userdata.save,
-      userdataDelete: hostImports.userdata.delete,
+      userdataRestore: userdataApiObj.restore,
+      userdataSave: userdataApiObj.save,
+      userdataDelete: userdataApiObj.delete,
     },
   };
+
+  if (typeof options.instantiateWasm === 'function') {
+    config.instantiateWasm = options.instantiateWasm;
+  } else if (options.instantiateWasm !== null && options.instantiateWasm !== false) {
+    config.instantiateWasm = createInstantiateWasmHandler({
+      locateFile,
+      hostImports: activeHostImports,
+      reportFn: activeReportFn,
+      fetchFn: options.fetchFn,
+      wasmBinary: options.wasmBinary,
+      onError: options.onWasmError,
+    });
+  }
+
+  return config;
+}
+
+function createRuntimeModuleOptions(overrides = {}) {
+  return buildRuntimeModuleConfig(overrides);
 }
 
 async function tryBootWasmRuntime() {
@@ -991,7 +1248,15 @@ async function tryBootWasmRuntime() {
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
-      await self.createRuntimeModule(createRuntimeModuleOptions());
+      await self.createRuntimeModule(
+        createRuntimeModuleOptions({
+          onWasmError: (err) => {
+            if (progress) {
+              progress.postMessage({ error: `runtime wasm: ${err}` });
+            }
+          },
+        }),
+      );
     }
   } catch (err) {
     if (progress) {
@@ -1100,6 +1365,8 @@ const exportedApi = {
   createWorkerBootInitPayloads,
   forwardGpuWorkerMessage,
   createHostImports,
+  resolveRuntimeScriptUrl,
+  buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
   ptrToNumber,
