@@ -79,6 +79,7 @@
 #include "gpu/frame_capture.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
+#include "guest/input_script.h"
 #include "os/guest_heap.h"
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
@@ -86,6 +87,7 @@
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_scarlett.h"
 #include "os/xgameruntime_provider.h"
 #include "os/xbox_scarlett_guest.h"
 
@@ -163,6 +165,7 @@ struct Options {
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
+    std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
@@ -181,7 +184,7 @@ void usage() {
                  "                     [--no-entry] [--quiet]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
-                 "                     [--shader-pack <file.wgsl.pack>]\n");
+                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n");
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
@@ -220,7 +223,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" ||
+                   a == "--shader-pack" || a == "--input-script" ||
                    a == "--user-age-group" || a == "--profile") {
             if (!value(v)) {
                 return false;
@@ -230,6 +233,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--sandbox-id" ? o.sandbox_id
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
+                                  : a == "--input-script" ? o.input_script
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
@@ -940,6 +944,28 @@ int main(int argc, char** argv) {
             sample->counters.emplace_back("textures_with_memory", probe.registered);
             sample->counters.emplace_back("textures_with_data", probe.with_data);
         });
+    }
+    // --input-script: a test tool that presses buttons on a schedule through the same InputState
+    // the browser's input bridge writes (the title reads it through the GameInput adapter).
+    static playgta6::InputState script_input{};
+    static std::unique_ptr<playgta6::guest::InputScriptPlayer> script_player;
+    if (!g_options.input_script.empty()) {
+        std::ifstream in(g_options.input_script, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<playgta6::guest::InputScriptEvent> events;
+        std::string error;
+        if (!in.good() && !in.eof()) {
+            std::fprintf(stderr, "[harness] cannot read the input script %s\n", g_options.input_script.c_str());
+            return kExitUsage;
+        }
+        if (!playgta6::guest::parse_input_script(text, events, error)) {
+            std::fprintf(stderr, "[harness] input script %s: %s\n", g_options.input_script.c_str(), error.c_str());
+            return kExitUsage;
+        }
+        std::fprintf(stderr, "[harness] input script %s: %zu event(s)\n", g_options.input_script.c_str(), events.size());
+        playgta6::os::scarlett::set_game_input_state(&script_input);
+        script_player = std::make_unique<playgta6::guest::InputScriptPlayer>(std::move(events), &script_input);
+        script_player->start();
     }
     start_watchdog();
     start_profile();
