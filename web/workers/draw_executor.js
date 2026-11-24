@@ -14,6 +14,7 @@
     DEFAULT: 'default',
     FULLSCREEN_TRIANGLE_CBV: 'fullscreen_triangle_cbv',
     TEXTURED_QUAD_24B: 'textured_quad_24b',
+    SPLASH_RECT_24B: 'splash_rect_24b',
   });
 
   const FALLBACK_PROFILE_ALIASES = Object.freeze({
@@ -27,6 +28,12 @@
     textured_24b: FALLBACK_PROFILE.TEXTURED_QUAD_24B,
     'textured-quad-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
     'textured-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+    splash_rect_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+    'splash-rect-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
+    rectlist_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+    'rectlist-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
+    frame1_splash_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+    'frame1-splash-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
   });
 
   const TEXTURED_QUAD_VERTEX_STRIDE = 24;
@@ -43,6 +50,22 @@
     attributes: Object.freeze([
       Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x4' }),
       Object.freeze({ shaderLocation: 1, offset: 16, format: 'float32x2' }),
+    ]),
+  });
+
+  /**
+   * Exact real Frame-1 24-byte splash pass vertex layout (G37 / G47):
+   *   POSITION: R32G32B32_FLOAT (float32x3 @ 0, @location(0))
+   *   COLOR:    R8G8B8A8_UNORM  (unorm8x4  @ 12, @location(1))
+   *   TEXCOORD: R32G32_FLOAT    (float32x2 @ 16, @location(2))
+   */
+  const FRAME1_SPLASH_VERTEX_LAYOUT_24B = Object.freeze({
+    arrayStride: TEXTURED_QUAD_VERTEX_STRIDE,
+    stepMode: 'vertex',
+    attributes: Object.freeze([
+      Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x3' }),
+      Object.freeze({ shaderLocation: 1, offset: 12, format: 'unorm8x4' }),
+      Object.freeze({ shaderLocation: 2, offset: 16, format: 'float32x2' }),
     ]),
   });
 
@@ -320,16 +343,146 @@
     return false;
   }
 
+  function isRectListTopology(topology) {
+    if (typeof topology !== 'string') {
+      return false;
+    }
+    const norm = topology.trim().toLowerCase();
+    return (
+      norm === 'rect-list' ||
+      norm === 'rectlist' ||
+      norm === 'd3d_primitive_topology_rectlist'
+    );
+  }
+
+  function isRectListDrawState(drawState) {
+    if (!drawState || typeof drawState !== 'object') {
+      return false;
+    }
+    if (drawState.isRectList === true || isRectListTopology(drawState.topology)) {
+      return true;
+    }
+    const pipe =
+      drawState.pipeline && typeof drawState.pipeline === 'object' ? drawState.pipeline : null;
+    if (pipe && (pipe.isRectList === true || isRectListTopology(pipe.topology))) {
+      return true;
+    }
+    return false;
+  }
+
   /**
-   * Pure helper that selects the appropriate G34 built-in fallback WGSL profile from active
+   * Expand Xbox `D3D_PRIMITIVE_TOPOLOGY_RECTLIST` 24-byte vertices (3 vertices per quad:
+   * `v0, v1, v2`) into WebGPU `triangle-list` vertices (6 vertices per quad:
+   * `[v0, v1, v2, v1, v3, v2]`).
+   *
+   * Frame-1 24-byte vertex layout:
+   *   bytes  0..11: POSITION (`float32x3`, little-endian)
+   *   bytes 12..15: COLOR    (`unorm8x4`)
+   *   bytes 16..23: TEXCOORD (`float32x2`, little-endian)
+   *
+   * Implicit 4th corner `v3`:
+   *   `pos3 = pos1 + pos2 - pos0`
+   *   `color3 = color2` (bytes 12..15 copied verbatim)
+   *   `uv3 = uv1 + uv2 - uv0`
+   *
+   * @param {Uint8Array | ArrayBufferView | ArrayBuffer} srcBytes
+   * @param {number} [vertexCount]
+   * @returns {Uint8Array}
+   */
+  function expandRectListVertices24B(srcBytes, vertexCount) {
+    let bytes;
+    if (srcBytes instanceof Uint8Array) {
+      bytes = srcBytes;
+    } else if (ArrayBuffer.isView(srcBytes)) {
+      bytes = new Uint8Array(srcBytes.buffer, srcBytes.byteOffset, srcBytes.byteLength);
+    } else if (srcBytes instanceof ArrayBuffer) {
+      bytes = new Uint8Array(srcBytes);
+    } else {
+      return new Uint8Array(0);
+    }
+
+    const stride = TEXTURED_QUAD_VERTEX_STRIDE;
+    const maxAvailableVerts = Math.floor(bytes.byteLength / stride);
+    const effectiveVerts =
+      vertexCount === undefined || vertexCount === null
+        ? maxAvailableVerts
+        : Math.min(toNonNegativeInt(vertexCount, 0), maxAvailableVerts);
+
+    const rectCount = Math.floor(effectiveVerts / 3);
+    if (rectCount <= 0) {
+      return new Uint8Array(0);
+    }
+
+    const out = new Uint8Array(rectCount * 6 * stride);
+    const srcView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const dstView = new DataView(out.buffer, out.byteOffset, out.byteLength);
+
+    for (let r = 0; r < rectCount; r += 1) {
+      const v0Off = r * 3 * stride;
+      const v1Off = v0Off + stride;
+      const v2Off = v1Off + stride;
+      const dstBase = r * 6 * stride;
+
+      // Triangle 1: [v0, v1, v2]
+      out.set(bytes.subarray(v0Off, v0Off + stride), dstBase);
+      out.set(bytes.subarray(v1Off, v1Off + stride), dstBase + stride);
+      out.set(bytes.subarray(v2Off, v2Off + stride), dstBase + 2 * stride);
+
+      // Triangle 2: [v1, v3, v2]
+      out.set(bytes.subarray(v1Off, v1Off + stride), dstBase + 3 * stride);
+
+      const v3DstOff = dstBase + 4 * stride;
+      const x3 =
+        srcView.getFloat32(v1Off + 0, true) +
+        srcView.getFloat32(v2Off + 0, true) -
+        srcView.getFloat32(v0Off + 0, true);
+      const y3 =
+        srcView.getFloat32(v1Off + 4, true) +
+        srcView.getFloat32(v2Off + 4, true) -
+        srcView.getFloat32(v0Off + 4, true);
+      const z3 =
+        srcView.getFloat32(v1Off + 8, true) +
+        srcView.getFloat32(v2Off + 8, true) -
+        srcView.getFloat32(v0Off + 8, true);
+      dstView.setFloat32(v3DstOff + 0, x3, true);
+      dstView.setFloat32(v3DstOff + 4, y3, true);
+      dstView.setFloat32(v3DstOff + 8, z3, true);
+
+      // color3 = color2 (unorm8x4 bytes 12..15)
+      out[v3DstOff + 12] = bytes[v2Off + 12];
+      out[v3DstOff + 13] = bytes[v2Off + 13];
+      out[v3DstOff + 14] = bytes[v2Off + 14];
+      out[v3DstOff + 15] = bytes[v2Off + 15];
+
+      const u3 =
+        srcView.getFloat32(v1Off + 16, true) +
+        srcView.getFloat32(v2Off + 16, true) -
+        srcView.getFloat32(v0Off + 16, true);
+      const v3 =
+        srcView.getFloat32(v1Off + 20, true) +
+        srcView.getFloat32(v2Off + 20, true) -
+        srcView.getFloat32(v0Off + 20, true);
+      dstView.setFloat32(v3DstOff + 16, u3, true);
+      dstView.setFloat32(v3DstOff + 20, v3, true);
+
+      out.set(bytes.subarray(v2Off, v2Off + stride), dstBase + 5 * stride);
+    }
+
+    return out;
+  }
+
+  /**
+   * Pure helper that selects the appropriate G34/G47 built-in fallback WGSL profile from active
    * draw state when real shaders are missing or fallback-routed:
+   * - Xbox `rect-list` topology (`topology === 'rect-list'` or `isRectList === true`) with
+   *   24-byte-stride vertex layout -> `'splash_rect_24b'`
    * - `vertexCount === 3` with a bound CBV and no bound sampled texture (real title Frame-1
    *   `DrawInstanced(3, 1)` pattern) -> `'fullscreen_triangle_cbv'`
    * - 24-byte-stride vertex buffer with a bound texture/sampler -> `'textured_quad_24b'`
    * - Otherwise -> `'default'`
    *
    * @param {object | null | undefined} drawState
-   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b'}
+   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b'}
    */
   function selectFallbackShaderProfile(drawState) {
     if (!drawState || typeof drawState !== 'object') {
@@ -337,6 +490,13 @@
     }
 
     const vertexCount = toNonNegativeInt(drawState.vertexCount, 0);
+    const has24BStride = hasVertexStride(drawState, TEXTURED_QUAD_VERTEX_STRIDE);
+
+    // 0. Xbox RECTLIST draw with Frame-1 24-byte vertex stride (POSITION + COLOR + TEXCOORD).
+    if (isRectListDrawState(drawState) && has24BStride) {
+      return FALLBACK_PROFILE.SPLASH_RECT_24B;
+    }
+
     const bgInfo = inspectBindGroupMeta(drawState.bindGroups);
 
     const hasBoundCbv =
@@ -376,10 +536,7 @@
     }
 
     // 2. 24-byte-stride vertex buffer with bound texture or sampler.
-    if (
-      hasVertexStride(drawState, TEXTURED_QUAD_VERTEX_STRIDE) &&
-      (hasBoundTexture || hasBoundSampler)
-    ) {
+    if (has24BStride && (hasBoundTexture || hasBoundSampler)) {
       return FALLBACK_PROFILE.TEXTURED_QUAD_24B;
     }
 
@@ -477,6 +634,16 @@
     const vsCode = vsResult && typeof vsResult.wgsl === 'string' ? vsResult.wgsl : '';
     const fsCode = fsResult && typeof fsResult.wgsl === 'string' ? fsResult.wgsl : '';
 
+    if (
+      /@location\(0\)[\s\S]*?vec3<f32>[\s\S]*?@location\(1\)[\s\S]*?vec4<f32>[\s\S]*?@location\(2\)[\s\S]*?vec2<f32>/.test(
+        vsCode
+      ) &&
+      /@group\(0\)\s+@binding\(0\)\s+var<uniform>/.test(fsCode) &&
+      /@group\(0\)\s+@binding\(1\)[\s\S]*?texture_2d<f32>/.test(fsCode) &&
+      /@group\(0\)\s+@binding\(2\)[\s\S]*?sampler/.test(fsCode)
+    ) {
+      return FALLBACK_PROFILE.SPLASH_RECT_24B;
+    }
     if (
       /@group\(0\)\s+@binding\(0\)\s+var<uniform>/.test(vsCode) ||
       /@group\(0\)\s+@binding\(0\)\s+var<uniform>/.test(fsCode)
@@ -652,6 +819,7 @@
         [FALLBACK_PROFILE.DEFAULT]: 0,
         [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: 0,
         [FALLBACK_PROFILE.TEXTURED_QUAD_24B]: 0,
+        [FALLBACK_PROFILE.SPLASH_RECT_24B]: 0,
       },
       fallbackPipelineCacheHits: 0,
       fallbackPipelineCacheMisses: 0,
@@ -742,6 +910,7 @@
       this._fallbackTextureView = null;
       this._fallbackSampler = null;
       this._fallbackVertexBuffer24B = null;
+      this._fallbackSplashVertexBuffer24B = null;
 
       this._destroyed = false;
       this._stats = createZeroedStats();
@@ -1064,6 +1233,7 @@
         'vertexShader',
         'fragmentShader',
         'topology',
+        'isRectList',
         'format',
         'sampleCount',
         'depthStencilFormat',
@@ -1227,7 +1397,8 @@
 
       const pipe = drawState.pipeline && typeof drawState.pipeline === 'object' ? drawState.pipeline : null;
       const format = drawState.format || (pipe && pipe.format) || this._format || DEFAULT_COLOR_FORMAT;
-      const topology = drawState.topology || (pipe && pipe.topology) || DEFAULT_TOPOLOGY;
+      const rawTopology = drawState.topology || (pipe && pipe.topology) || DEFAULT_TOPOLOGY;
+      const topology = isRectListTopology(rawTopology) ? DEFAULT_TOPOLOGY : rawTopology;
       const sampleCount = toNonNegativeInt(
         drawState.sampleCount !== undefined
           ? drawState.sampleCount
@@ -1269,15 +1440,23 @@
         }
 
         const vertexBuffers =
-          resolved.effectiveProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B
+          resolved.effectiveProfile === FALLBACK_PROFILE.SPLASH_RECT_24B
             ? [
                 {
-                  arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
-                  stepMode: FALLBACK_VERTEX_LAYOUT_24B.stepMode,
-                  attributes: FALLBACK_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+                  arrayStride: FRAME1_SPLASH_VERTEX_LAYOUT_24B.arrayStride,
+                  stepMode: FRAME1_SPLASH_VERTEX_LAYOUT_24B.stepMode,
+                  attributes: FRAME1_SPLASH_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
                 },
               ]
-            : [];
+            : resolved.effectiveProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B
+              ? [
+                  {
+                    arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
+                    stepMode: FALLBACK_VERTEX_LAYOUT_24B.stepMode,
+                    attributes: FALLBACK_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+                  },
+                ]
+              : [];
 
         const descriptor = {
           label: `draw_executor:fallback:${resolved.effectiveProfile}`,
@@ -1465,6 +1644,57 @@
         return buf;
       } catch (err) {
         this._warn('Failed to create synthetic 24B fallback vertex buffer', {
+          error: String(err && err.message ? err.message : err),
+        });
+        return null;
+      }
+    }
+
+    _ensureFallbackSplashVertexBuffer24B() {
+      if (
+        this._fallbackSplashVertexBuffer24B &&
+        this._fallbackSplashVertexBuffer24B.destroyed !== true
+      ) {
+        return this._fallbackSplashVertexBuffer24B;
+      }
+      if (!this._device || typeof this._device.createBuffer !== 'function') {
+        return null;
+      }
+      try {
+        // 3 RECTLIST vertices in exact Frame-1 24B layout (float32x3 pos, unorm8x4 color, float32x2 uv)
+        // expanded to 6 triangle-list vertices (144 bytes).
+        const rect3 = new Uint8Array(3 * TEXTURED_QUAD_VERTEX_STRIDE);
+        const view = new DataView(rect3.buffer);
+        const corners = [
+          { x: -1.0, y: 1.0, z: 0.0, u: 0.0, v: 0.0 },
+          { x: 1.0, y: 1.0, z: 0.0, u: 1.0, v: 0.0 },
+          { x: -1.0, y: -1.0, z: 0.0, u: 0.0, v: 1.0 },
+        ];
+        for (let i = 0; i < 3; i += 1) {
+          const base = i * TEXTURED_QUAD_VERTEX_STRIDE;
+          view.setFloat32(base + 0, corners[i].x, true);
+          view.setFloat32(base + 4, corners[i].y, true);
+          view.setFloat32(base + 8, corners[i].z, true);
+          rect3[base + 12] = 0xff;
+          rect3[base + 13] = 0xff;
+          rect3[base + 14] = 0xff;
+          rect3[base + 15] = 0xff;
+          view.setFloat32(base + 16, corners[i].u, true);
+          view.setFloat32(base + 20, corners[i].v, true);
+        }
+        const expanded = expandRectListVertices24B(rect3, 3);
+        const buf = this._device.createBuffer({
+          label: 'draw_executor:fallback_vb_24b_splash_rect',
+          size: expanded.byteLength,
+          usage: BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST,
+        });
+        if (buf && this._device.queue && typeof this._device.queue.writeBuffer === 'function') {
+          this._device.queue.writeBuffer(buf, 0, expanded);
+        }
+        this._fallbackSplashVertexBuffer24B = buf;
+        return buf;
+      } catch (err) {
+        this._warn('Failed to create synthetic 24B splash rect fallback vertex buffer', {
           error: String(err && err.message ? err.message : err),
         });
         return null;
@@ -1737,6 +1967,181 @@
       } catch (err) {
         this._stats.passErrors += 1;
         this._warn('Failed to bind synthetic 24B fallback vertex buffer', {
+          error: String(err && err.message ? err.message : err),
+        });
+        return {
+          ok: false,
+          substitutedVertexBuffer: true,
+          effectiveVertexCount: 0,
+          effectiveFirstVertex: 0,
+        };
+      }
+    }
+
+    _bindFallbackGroupForSplashRect(pass, pipeline, drawState) {
+      if (
+        !this._device ||
+        typeof this._device.createBindGroup !== 'function' ||
+        typeof pipeline.getBindGroupLayout !== 'function'
+      ) {
+        this._stats.bindGroupErrors += 1;
+        return {
+          ok: false,
+          substitutedCbv: false,
+          substitutedTexture: false,
+          substitutedSampler: false,
+        };
+      }
+
+      const cbvCandidate = this._findBoundCbvCandidate(drawState);
+      let cbvBuffer;
+      let cbvOffset = 0;
+      let cbvSize = FRAME1_CBV_MIN_BYTES;
+      let substitutedCbv = false;
+      let substitutedTexture = false;
+      let substitutedSampler = false;
+
+      if (cbvCandidate && isValidCbvBinding(cbvCandidate)) {
+        cbvBuffer = cbvCandidate.buffer !== undefined ? cbvCandidate.buffer : cbvCandidate;
+        cbvOffset = cbvCandidate.offset || 0;
+        if (cbvCandidate.size !== undefined && cbvCandidate.size !== null) {
+          cbvSize = cbvCandidate.size;
+        } else if (typeof cbvBuffer.size === 'number' && Number.isFinite(cbvBuffer.size)) {
+          cbvSize = Math.max(FRAME1_CBV_MIN_BYTES, cbvBuffer.size - cbvOffset);
+        }
+      } else {
+        this._stats.bindGroupGuards += 1;
+        this._stats.invalidCbvSubstitutions += 1;
+        substitutedCbv = true;
+        cbvBuffer = this._ensureFallbackCbvBuffer();
+        if (!cbvBuffer) {
+          this._stats.bindGroupErrors += 1;
+          return {
+            ok: false,
+            substitutedCbv: true,
+            substitutedTexture: false,
+            substitutedSampler: false,
+          };
+        }
+      }
+
+      let textureView = resolveTextureView(this._findBoundTextureCandidate(drawState));
+      if (!textureView) {
+        this._stats.bindGroupGuards += 1;
+        this._stats.invalidTextureSubstitutions += 1;
+        substitutedTexture = true;
+        textureView = this._ensureFallbackTextureView();
+        if (!textureView) {
+          this._stats.bindGroupErrors += 1;
+          return {
+            ok: false,
+            substitutedCbv,
+            substitutedTexture: true,
+            substitutedSampler: false,
+          };
+        }
+      }
+
+      let sampler = unwrapSampler(this._findBoundSamplerCandidate(drawState));
+      if (!sampler) {
+        this._stats.bindGroupGuards += 1;
+        this._stats.invalidSamplerSubstitutions += 1;
+        substitutedSampler = true;
+        sampler = this._ensureFallbackSampler();
+        if (!sampler) {
+          this._stats.bindGroupErrors += 1;
+          return {
+            ok: false,
+            substitutedCbv,
+            substitutedTexture,
+            substitutedSampler: true,
+          };
+        }
+      }
+
+      try {
+        const layout = pipeline.getBindGroupLayout(0);
+        const bindGroup = this._device.createBindGroup({
+          label: 'draw_executor:fallback_splash_rect_bg',
+          layout,
+          entries: [
+            { binding: 0, resource: { buffer: cbvBuffer, offset: cbvOffset, size: cbvSize } },
+            { binding: 1, resource: textureView },
+            { binding: 2, resource: sampler },
+          ],
+        });
+        pass.setBindGroup(0, bindGroup);
+        return { ok: true, substitutedCbv, substitutedTexture, substitutedSampler };
+      } catch (err) {
+        this._stats.bindGroupErrors += 1;
+        this._warn('Failed to bind fallback splash rect bind group', {
+          error: String(err && err.message ? err.message : err),
+        });
+        return { ok: false, substitutedCbv, substitutedTexture, substitutedSampler };
+      }
+    }
+
+    _bindFallbackVertexBufferSplashRect24B(pass, drawState, vertexCount, firstVertex) {
+      const slot0 =
+        this._vertexBuffers.get(0) ||
+        (Array.isArray(drawState.vertexBuffers) ? drawState.vertexBuffers[0] : null);
+      const requiredBytes = drawState.indexed
+        ? TEXTURED_QUAD_VERTEX_STRIDE
+        : (firstVertex + vertexCount) * TEXTURED_QUAD_VERTEX_STRIDE;
+
+      if (slot0 && isValidVertexBufferBinding(slot0, requiredBytes, TEXTURED_QUAD_VERTEX_STRIDE)) {
+        const buffer = slot0.buffer !== undefined ? slot0.buffer : slot0;
+        const offset = slot0.offset || 0;
+        try {
+          if (slot0.size !== undefined && slot0.size !== null) {
+            pass.setVertexBuffer(0, buffer, offset, slot0.size);
+          } else {
+            pass.setVertexBuffer(0, buffer, offset);
+          }
+          return {
+            ok: true,
+            substitutedVertexBuffer: false,
+            effectiveVertexCount: vertexCount,
+            effectiveFirstVertex: firstVertex,
+          };
+        } catch (err) {
+          this._warn(
+            'setVertexBuffer threw on bound 24B splash vertex buffer; substituting synthetic splash quad',
+            {
+              error: String(err && err.message ? err.message : err),
+            }
+          );
+        }
+      }
+
+      this._stats.invalidVertexBufferGuards += 1;
+      this._stats.vertexBufferSubstitutions += 1;
+      const fallbackVb = this._ensureFallbackSplashVertexBuffer24B();
+      if (!fallbackVb) {
+        return {
+          ok: false,
+          substitutedVertexBuffer: true,
+          effectiveVertexCount: 0,
+          effectiveFirstVertex: 0,
+        };
+      }
+
+      try {
+        pass.setVertexBuffer(0, fallbackVb, 0);
+        const expandedCount =
+          isRectListDrawState(drawState) && vertexCount >= 3
+            ? Math.floor(vertexCount / 3) * 6
+            : vertexCount;
+        const clampedCount = drawState.indexed ? vertexCount : Math.min(Math.max(expandedCount, 3), 6);
+        return {
+          ok: true,
+          substitutedVertexBuffer: true,
+          effectiveVertexCount: clampedCount,
+          effectiveFirstVertex: 0,
+        };
+      } catch (err) {
+        this._stats.passErrors += 1;
+        this._warn('Failed to bind synthetic 24B splash fallback vertex buffer', {
           error: String(err && err.message ? err.message : err),
         });
         return {
@@ -2040,6 +2445,29 @@
         }
         effectiveCount = vbRes.effectiveVertexCount;
         effectiveFirstVertex = vbRes.effectiveFirstVertex;
+      } else if (resolved.effectiveProfile === FALLBACK_PROFILE.SPLASH_RECT_24B) {
+        const bgRes = this._bindFallbackGroupForSplashRect(pass, fallbackPipeline, drawState);
+        baseResult.substitutedCbv = bgRes.substitutedCbv;
+        baseResult.substitutedTexture = bgRes.substitutedTexture;
+        baseResult.substitutedSampler = bgRes.substitutedSampler;
+        if (!bgRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-splash-bind-failed' };
+        }
+
+        const vbRes = this._bindFallbackVertexBufferSplashRect24B(
+          pass,
+          drawState,
+          count,
+          firstVertex
+        );
+        baseResult.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
+        if (!vbRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-vb-bind-failed' };
+        }
+        effectiveCount = vbRes.effectiveVertexCount;
+        effectiveFirstVertex = vbRes.effectiveFirstVertex;
       }
 
       try {
@@ -2098,6 +2526,8 @@
             this._stats.fallbackProfileCounts[FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV],
           [FALLBACK_PROFILE.TEXTURED_QUAD_24B]:
             this._stats.fallbackProfileCounts[FALLBACK_PROFILE.TEXTURED_QUAD_24B],
+          [FALLBACK_PROFILE.SPLASH_RECT_24B]:
+            this._stats.fallbackProfileCounts[FALLBACK_PROFILE.SPLASH_RECT_24B],
         },
         fallbackPipelineCacheHits: this._stats.fallbackPipelineCacheHits,
         fallbackPipelineCacheMisses: this._stats.fallbackPipelineCacheMisses,
@@ -2136,11 +2566,13 @@
       destroySafe(this._fallbackCbvBuffer);
       destroySafe(this._fallbackTexture);
       destroySafe(this._fallbackVertexBuffer24B);
+      destroySafe(this._fallbackSplashVertexBuffer24B);
       this._fallbackCbvBuffer = null;
       this._fallbackTexture = null;
       this._fallbackTextureView = null;
       this._fallbackSampler = null;
       this._fallbackVertexBuffer24B = null;
+      this._fallbackSplashVertexBuffer24B = null;
     }
 
     /**
@@ -2156,12 +2588,15 @@
   }
 
   DrawExecutor.selectFallbackShaderProfile = selectFallbackShaderProfile;
+  DrawExecutor.expandRectListVertices24B = expandRectListVertices24B;
 
   const exportedApi = Object.freeze({
     FALLBACK_PROFILE,
     TEXTURED_QUAD_VERTEX_STRIDE,
     FRAME1_CBV_MIN_BYTES,
     FALLBACK_VERTEX_LAYOUT_24B,
+    FRAME1_SPLASH_VERTEX_LAYOUT_24B,
+    expandRectListVertices24B,
     selectFallbackShaderProfile,
     DrawExecutor,
   });
