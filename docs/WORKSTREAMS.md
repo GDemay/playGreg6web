@@ -42,7 +42,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Runtime boot sequence (load `PGIM` image, register lifted tables, bind import slots, minimal TEB/TLS + main thread, TLS callbacks, entry-point call, structured first-fault report) and a native host harness linking host-target lifted shards with the runtime for a first boot attempt without the browser toolchain (complements `R13`/`W40`).
 - [ ] **R15 — Recompilation Coverage & Boot-Path Bottleneck Profiler CLI (`tools/audit_recomp_build.py`)** — `IN PROGRESS` (#220, @MarcBlattmann) *(no game files required — disjoint files `tools/audit_recomp_build.py`, `tests/test_audit_recomp_build.py`)*
   - Analyzes `R9` `build-manifest.json` / `discover --json` outputs to rank top unlifted x86-64 mnemonics and compute entry-point + TLS-callback reachable boot-path coverage.
-- [ ] **R16 — Interface-Call Survey Subcommand: Vtable Slot Usage per COM Interface (`recomp/src/survey.rs`)** — `IN PROGRESS` (#238, @Timon-ok) *(no game files required — disjoint file `recomp/src/survey.rs`)*
+- [x] **R16 — Interface-Call Survey Subcommand: Vtable Slot Usage per COM Interface (`recomp/src/survey.rs`)** — `DONE` (PR #249, closes #238) *(no game files required — disjoint file `recomp/src/survey.rs`)*
   - `playgta6-recomp survey-interfaces`: for interface pointers obtained from given sources (an import's out-parameter, a parent interface's vtable slot), report the vtable slots called, call-site counts and inferred argument counts (addresses, GUID constants and counts only).
 
 ---
