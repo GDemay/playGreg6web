@@ -24,7 +24,7 @@ use naga::{
     FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass, ImageDimension,
     Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module, Range,
     ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage, Span,
-    Statement, StructMember, Type, TypeInner, UnaryOperator, VectorSize,
+    Statement, StructMember, SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
 };
 
 use crate::convert::{ShaderStage, format_shader_hash};
@@ -314,9 +314,10 @@ struct ProgramPlan {
     vertex_attrs: Vec<VertexInputAttr>,
     has_buffer_fetch: bool,
     legacy_uv_attr_index: Option<usize>,
-    uses_cbv: bool,
+    cbv_slots: Vec<u8>,
     cbv_vec4_count: u32,
-    uses_mimg: bool,
+    tex_slots: Vec<u8>,
+    samp_slots: Vec<u8>,
     frag_attrs: Vec<u8>,
     vs_params: Vec<u8>,
     ps_mrts: Vec<u8>,
@@ -380,18 +381,154 @@ fn smem_load_dword_count(op: u8) -> Option<u8> {
     }
 }
 
-fn is_supported_mimg_op(op: u8) -> bool {
-    matches!(
-        op,
-        0x00 | 0x01 | 0x20 | 0x21 | 0x22 | 0x24 | 0x25 | 0x27 | 0x30 | 0x34 | 0x37
-    )
+#[derive(Debug, Clone, Copy)]
+struct MimgAddrLayout {
+    total_vgprs: u8,
+    bias_off: Option<u8>,
+    compare_off: Option<u8>,
+    grad_off: Option<u8>,
+    uv_off: u8,
+    lod_off: Option<u8>,
+    is_zero_lod: bool,
+    is_load: bool,
 }
 
-fn mimg_addr_vgpr_count(op: u8) -> u8 {
+/// Decode GFX10.3 2D MIMG address VGPR layout (`[offset], [bias], [z_compare], [grad], u, v, [lod/clamp]`).
+fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
+    let base = MimgAddrLayout {
+        total_vgprs: 2,
+        bias_off: None,
+        compare_off: None,
+        grad_off: None,
+        uv_off: 0,
+        lod_off: None,
+        is_zero_lod: false,
+        is_load: false,
+    };
     match op {
-        0x01 | 0x24 | 0x34 => 3, // u, v, lod/mip
-        _ => 2,                  // u, v
+        // image_load: (x, y)
+        0x00 => Some(MimgAddrLayout {
+            is_load: true,
+            ..base
+        }),
+        // image_load_mip: (x, y, mip)
+        0x01 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            lod_off: Some(2),
+            is_load: true,
+            ..base
+        }),
+        // image_sample: (u, v)
+        0x20 => Some(base),
+        // image_sample_cl: (u, v, clamp)
+        0x21 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            ..base
+        }),
+        // image_sample_d: (dudx, dvdx, dudy, dvdy, u, v)
+        0x22 => Some(MimgAddrLayout {
+            total_vgprs: 6,
+            grad_off: Some(0),
+            uv_off: 4,
+            ..base
+        }),
+        // image_sample_l: (u, v, lod)
+        0x24 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            lod_off: Some(2),
+            ..base
+        }),
+        // image_sample_b: (bias, u, v)
+        0x25 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            bias_off: Some(0),
+            uv_off: 1,
+            ..base
+        }),
+        // image_sample_lz: (u, v)
+        0x27 => Some(MimgAddrLayout {
+            is_zero_lod: true,
+            ..base
+        }),
+        // image_sample_c: (z_ref, u, v)
+        0x28 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            compare_off: Some(0),
+            uv_off: 1,
+            ..base
+        }),
+        // image_sample_c_l: (z_ref, u, v, lod)
+        0x2C => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            compare_off: Some(0),
+            uv_off: 1,
+            lod_off: Some(3),
+            ..base
+        }),
+        // image_sample_c_b: (bias, z_ref, u, v)
+        0x2D => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            bias_off: Some(0),
+            compare_off: Some(1),
+            uv_off: 2,
+            ..base
+        }),
+        // image_sample_c_lz: (z_ref, u, v)
+        0x2F => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            compare_off: Some(0),
+            uv_off: 1,
+            is_zero_lod: true,
+            ..base
+        }),
+        // image_sample_o: (offset, u, v)
+        0x30 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            uv_off: 1,
+            ..base
+        }),
+        // image_sample_l_o: (offset, u, v, lod)
+        0x34 => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            uv_off: 1,
+            lod_off: Some(3),
+            ..base
+        }),
+        // image_sample_b_o: (offset, bias, u, v)
+        0x35 => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            bias_off: Some(1),
+            uv_off: 2,
+            ..base
+        }),
+        // image_sample_lz_o: (offset, u, v)
+        0x37 => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            uv_off: 1,
+            is_zero_lod: true,
+            ..base
+        }),
+        // image_sample_c_o: (offset, z_ref, u, v)
+        0x38 => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            compare_off: Some(1),
+            uv_off: 2,
+            ..base
+        }),
+        // image_sample_c_lz_o: (offset, z_ref, u, v)
+        0x3F => Some(MimgAddrLayout {
+            total_vgprs: 4,
+            compare_off: Some(1),
+            uv_off: 2,
+            is_zero_lod: true,
+            ..base
+        }),
+        _ => None,
     }
+}
+
+fn vop3p_is_ternary(op: u8) -> bool {
+    !matches!(op, 0x01..=0x08 | 0x0A..=0x0D | 0x0F..=0x12)
 }
 
 fn mubuf_load_components(op: u8) -> Option<u8> {
@@ -478,9 +615,10 @@ fn plan_program(
 
     let active = &instructions[..active_inst_count];
 
-    let mut uses_cbv = false;
+    let mut cbv_base_set: BTreeSet<u8> = BTreeSet::new();
     let mut max_cbv_dword: u32 = 0;
-    let mut uses_mimg = false;
+    let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
+    let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut has_buffer_fetch = false;
     let mut vertex_buf_fetches: BTreeMap<u16, u8> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
@@ -533,8 +671,8 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                if *op == 0x04 {
-                    // s_mov_b64: 64-bit SGPR pair source and destination
+                if matches!(*op, 0x04 | 0x0A) {
+                    // s_mov_b64 / s_wqm_b64: 64-bit SGPR pair source and destination
                     if *ssrc0 <= 104 {
                         sgprs.insert(*ssrc0 + 1);
                     }
@@ -595,12 +733,13 @@ fn plan_program(
             Rdna2Detail::Smem {
                 op,
                 sdata,
+                sbase,
                 soffset,
                 offset,
                 ..
             } => {
                 if let Some(count) = smem_load_dword_count(*op) {
-                    uses_cbv = true;
+                    cbv_base_set.insert(*sbase);
                     if *soffset != 0x7D && *soffset <= 105 {
                         sgprs.insert(*soffset);
                     }
@@ -686,8 +825,8 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                if matches!(op, 0x06 | 0x2B | 0x36) {
-                    // v_fmac* reads vdst as accumulator
+                if matches!(op, 0x02 | 0x06 | 0x2B | 0x36 | 0x3C) {
+                    // v_dot2c_f32_f16 / v_fmac* / v_pk_fmac_f16 read vdst as accumulator
                     record_src_usage(
                         256 + u16::from(*vdst),
                         &mut vgprs,
@@ -707,6 +846,7 @@ fn plan_program(
             Rdna2Detail::Vop3 {
                 op,
                 vdst,
+                sdst,
                 src0,
                 src1,
                 src2,
@@ -753,6 +893,14 @@ fn plan_program(
                         &mut needs_scc,
                     );
                 }
+                if let Some(sd) = sdst {
+                    let sd7 = *sd & 0x7F;
+                    if sd7 <= 105 {
+                        sgprs.insert(sd7);
+                    } else if sd7 == 106 {
+                        needs_vcc = true;
+                    }
+                }
                 if *op <= 0xFF {
                     let sd = *vdst & 0x7F;
                     if sd <= 105 {
@@ -766,6 +914,7 @@ fn plan_program(
                 }
             }
             Rdna2Detail::Vop3P {
+                op,
                 vdst,
                 src0,
                 src1,
@@ -790,15 +939,17 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                record_src_usage(
-                    *src2,
-                    &mut vgprs,
-                    &mut sgprs,
-                    &written_vgprs,
-                    &mut read_before_write_vgprs,
-                    &mut needs_vcc,
-                    &mut needs_scc,
-                );
+                if vop3p_is_ternary(*op) {
+                    record_src_usage(
+                        *src2,
+                        &mut vgprs,
+                        &mut sgprs,
+                        &written_vgprs,
+                        &mut read_before_write_vgprs,
+                        &mut needs_vcc,
+                        &mut needs_scc,
+                    );
+                }
                 vgprs.insert(*vdst);
                 written_vgprs.insert(*vdst);
             }
@@ -814,12 +965,16 @@ fn plan_program(
                 dmask,
                 vaddr,
                 vdata,
+                srsrc,
+                ssamp,
                 ..
             } => {
-                if is_supported_mimg_op(*op) {
-                    uses_mimg = true;
-                    let addr_cnt = mimg_addr_vgpr_count(*op);
-                    for a in 0..addr_cnt {
+                if let Some(layout) = mimg_addr_layout(*op) {
+                    tex_rsrc_set.insert(*srsrc);
+                    if !layout.is_load {
+                        samp_rsrc_set.insert(*ssamp);
+                    }
+                    for a in 0..layout.total_vgprs {
                         let reg = vaddr.saturating_add(a);
                         vgprs.insert(reg);
                         if !written_vgprs.contains(&reg) {
@@ -1015,9 +1170,17 @@ fn plan_program(
         ps_mrts.push(0);
     }
 
+    if !tex_rsrc_set.is_empty() && samp_rsrc_set.is_empty() {
+        samp_rsrc_set.insert(0);
+    }
+
+    let cbv_slots: Vec<u8> = cbv_base_set.into_iter().collect();
+    let tex_slots: Vec<u8> = tex_rsrc_set.into_iter().collect();
+    let samp_slots: Vec<u8> = samp_rsrc_set.into_iter().collect();
+
     let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
     let needed_vec4s = max_cbv_dword.div_ceil(4).max(min_vec4s);
-    let cbv_vec4_count = if uses_cbv {
+    let cbv_vec4_count = if !cbv_slots.is_empty() {
         needed_vec4s.min(MAX_CBV_VEC4_COUNT)
     } else {
         0
@@ -1031,9 +1194,10 @@ fn plan_program(
         vertex_attrs,
         has_buffer_fetch,
         legacy_uv_attr_index,
-        uses_cbv,
+        cbv_slots,
         cbv_vec4_count,
-        uses_mimg,
+        tex_slots,
+        samp_slots,
         frag_attrs: frag_attr_set.into_iter().collect(),
         vs_params: vs_param_set.into_iter().collect(),
         ps_mrts,
@@ -1058,10 +1222,11 @@ struct CommonTypes {
 struct IrEmitter {
     module: Module,
     types: CommonTypes,
-    cb0_global: Option<Handle<GlobalVariable>>,
+    cb_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     cb0_vec4_count: u32,
-    tex0_global: Option<Handle<GlobalVariable>>,
-    samp0_global: Option<Handle<GlobalVariable>>,
+    tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    emitted_bindings: Vec<WgslBindingInfo>,
     stage: ShaderStage,
     func: Function,
     vgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
@@ -1160,8 +1325,18 @@ impl IrEmitter {
             vec4_f32_ty,
         };
 
-        // Optional @group(0) @binding(0) var<uniform> cb0: Rdna2Cbv;
-        let cb0_global = if plan.uses_cbv {
+        // Uniform constant buffers:
+        //   cb0 -> @group(0) @binding(0)
+        //   tex0 -> @group(0) @binding(1)
+        //   samp0 -> @group(0) @binding(2)
+        //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
+        let mut cb_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
+        let mut next_extra_binding: u32 = 3;
+
+        if !plan.cbv_slots.is_empty() {
             let count = plan.cbv_vec4_count.max(1);
             let arr_ty = insert_type(
                 &mut module,
@@ -1187,26 +1362,40 @@ impl IrEmitter {
                     span: count.saturating_mul(16),
                 },
             );
-            Some(module.global_variables.append(
-                GlobalVariable {
-                    name: Some("cb0".to_string()),
-                    space: AddressSpace::Uniform,
-                    binding: Some(ResourceBinding {
-                        group: 0,
-                        binding: 0,
-                    }),
-                    ty: cbv_struct_ty,
-                    init: None,
-                    memory_decorations: MemoryDecorations::empty(),
-                },
-                Span::UNDEFINED,
-            ))
-        } else {
-            None
-        };
+            for (idx, &sbase) in plan.cbv_slots.iter().enumerate() {
+                let binding_num = if idx == 0 {
+                    0
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding += 1;
+                    b
+                };
+                let name = format!("cb{idx}");
+                let g = module.global_variables.append(
+                    GlobalVariable {
+                        name: Some(name.clone()),
+                        space: AddressSpace::Uniform,
+                        binding: Some(ResourceBinding {
+                            group: 0,
+                            binding: binding_num,
+                        }),
+                        ty: cbv_struct_ty,
+                        init: None,
+                        memory_decorations: MemoryDecorations::empty(),
+                    },
+                    Span::UNDEFINED,
+                );
+                cb_globals.insert(sbase, g);
+                emitted_bindings.push(WgslBindingInfo {
+                    group: 0,
+                    binding: binding_num,
+                    kind: "uniform",
+                    name,
+                });
+            }
+        }
 
-        // Optional @group(0) @binding(1) tex0 + @group(0) @binding(2) samp0
-        let (tex0_global, samp0_global) = if plan.uses_mimg {
+        if !plan.tex_slots.is_empty() {
             let tex_ty = insert_type(
                 &mut module,
                 None,
@@ -1224,38 +1413,70 @@ impl IrEmitter {
                 None,
                 TypeInner::Sampler { comparison: false },
             );
-            let tex_g = module.global_variables.append(
-                GlobalVariable {
-                    name: Some("tex0".to_string()),
-                    space: AddressSpace::Handle,
-                    binding: Some(ResourceBinding {
-                        group: 0,
-                        binding: 1,
-                    }),
-                    ty: tex_ty,
-                    init: None,
-                    memory_decorations: MemoryDecorations::empty(),
-                },
-                Span::UNDEFINED,
-            );
-            let samp_g = module.global_variables.append(
-                GlobalVariable {
-                    name: Some("samp0".to_string()),
-                    space: AddressSpace::Handle,
-                    binding: Some(ResourceBinding {
-                        group: 0,
-                        binding: 2,
-                    }),
-                    ty: samp_ty,
-                    init: None,
-                    memory_decorations: MemoryDecorations::empty(),
-                },
-                Span::UNDEFINED,
-            );
-            (Some(tex_g), Some(samp_g))
-        } else {
-            (None, None)
-        };
+            for (idx, &srsrc) in plan.tex_slots.iter().enumerate() {
+                let binding_num = if idx == 0 {
+                    1
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding += 1;
+                    b
+                };
+                let name = format!("tex{idx}");
+                let g = module.global_variables.append(
+                    GlobalVariable {
+                        name: Some(name.clone()),
+                        space: AddressSpace::Handle,
+                        binding: Some(ResourceBinding {
+                            group: 0,
+                            binding: binding_num,
+                        }),
+                        ty: tex_ty,
+                        init: None,
+                        memory_decorations: MemoryDecorations::empty(),
+                    },
+                    Span::UNDEFINED,
+                );
+                tex_globals.insert(srsrc, g);
+                emitted_bindings.push(WgslBindingInfo {
+                    group: 0,
+                    binding: binding_num,
+                    kind: "texture_2d",
+                    name,
+                });
+            }
+            for (idx, &ssamp) in plan.samp_slots.iter().enumerate() {
+                let binding_num = if idx == 0 {
+                    2
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding += 1;
+                    b
+                };
+                let name = format!("samp{idx}");
+                let g = module.global_variables.append(
+                    GlobalVariable {
+                        name: Some(name.clone()),
+                        space: AddressSpace::Handle,
+                        binding: Some(ResourceBinding {
+                            group: 0,
+                            binding: binding_num,
+                        }),
+                        ty: samp_ty,
+                        init: None,
+                        memory_decorations: MemoryDecorations::empty(),
+                    },
+                    Span::UNDEFINED,
+                );
+                samp_globals.insert(ssamp, g);
+                emitted_bindings.push(WgslBindingInfo {
+                    group: 0,
+                    binding: binding_num,
+                    kind: "sampler",
+                    name,
+                });
+            }
+        }
+        emitted_bindings.sort_by_key(|b| (b.group, b.binding));
 
         let mut func = Function {
             name: Some(plan.entry_point.clone()),
@@ -1540,10 +1761,11 @@ impl IrEmitter {
         let mut emitter = Self {
             module,
             types,
-            cb0_global,
+            cb_globals,
             cb0_vec4_count: plan.cbv_vec4_count,
-            tex0_global,
-            samp0_global,
+            tex_globals,
+            samp_globals,
+            emitted_bindings,
             stage: plan.stage,
             func,
             vgpr_locals,
@@ -2139,6 +2361,138 @@ impl IrEmitter {
         })
     }
 
+    /// Read a packed 2x16-bit `f16` VOP3P operand as `vec2<f32>` via core WGSL `unpack2x16float`
+    /// (zero `enable f16;` required), applying exact GFX10.3 `op_sel`, `op_sel_hi`, `neg_lo`,
+    /// and `neg_hi` modifiers.
+    fn read_src_pk_f16(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+        op_sel_lo: bool,
+        op_sel_hi: bool,
+        neg_lo: bool,
+        neg_hi: bool,
+    ) -> Handle<Expression> {
+        let raw = match src {
+            128 => {
+                let z = self.lit_f32(0.0);
+                self.emit_expr(Expression::Splat {
+                    size: VectorSize::Bi,
+                    value: z,
+                })
+            }
+            240..=248 => {
+                // GFX10.3 inline float constants populate the low 16-bit f16 half (0.0 in hi).
+                let lo = self.lit_f32(Self::inline_float_value(src).unwrap_or(0.0));
+                let hi = self.lit_f32(0.0);
+                self.emit_expr(Expression::Compose {
+                    ty: self.types.vec2_f32_ty,
+                    components: vec![lo, hi],
+                })
+            }
+            _ => {
+                let u = self.read_src_u32(src, literal);
+                self.emit_expr(Expression::Math {
+                    fun: MathFunction::Unpack2x16float,
+                    arg: u,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                })
+            }
+        };
+
+        let selected = match (op_sel_lo, op_sel_hi) {
+            (false, true) => raw,
+            (false, false) => self.emit_expr(Expression::Swizzle {
+                size: VectorSize::Bi,
+                vector: raw,
+                pattern: [
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                ],
+            }),
+            (true, true) => self.emit_expr(Expression::Swizzle {
+                size: VectorSize::Bi,
+                vector: raw,
+                pattern: [
+                    SwizzleComponent::Y,
+                    SwizzleComponent::Y,
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                ],
+            }),
+            (true, false) => self.emit_expr(Expression::Swizzle {
+                size: VectorSize::Bi,
+                vector: raw,
+                pattern: [
+                    SwizzleComponent::Y,
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                    SwizzleComponent::X,
+                ],
+            }),
+        };
+
+        match (neg_lo, neg_hi) {
+            (false, false) => selected,
+            (true, true) => self.emit_expr(Expression::Unary {
+                op: UnaryOperator::Negate,
+                expr: selected,
+            }),
+            (true, false) => {
+                let x = self.emit_expr(Expression::AccessIndex {
+                    base: selected,
+                    index: 0,
+                });
+                let nx = self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::Negate,
+                    expr: x,
+                });
+                let y = self.emit_expr(Expression::AccessIndex {
+                    base: selected,
+                    index: 1,
+                });
+                self.emit_expr(Expression::Compose {
+                    ty: self.types.vec2_f32_ty,
+                    components: vec![nx, y],
+                })
+            }
+            (false, true) => {
+                let x = self.emit_expr(Expression::AccessIndex {
+                    base: selected,
+                    index: 0,
+                });
+                let y = self.emit_expr(Expression::AccessIndex {
+                    base: selected,
+                    index: 1,
+                });
+                let ny = self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::Negate,
+                    expr: y,
+                });
+                self.emit_expr(Expression::Compose {
+                    ty: self.types.vec2_f32_ty,
+                    components: vec![x, ny],
+                })
+            }
+        }
+    }
+
+    fn update_scc_nonzero(&mut self, val_u32: Handle<Expression>) {
+        if self.scc_local.is_some() {
+            let zero = self.lit_u32(0);
+            let nonzero = self.emit_expr(Expression::Binary {
+                op: BinaryOperator::NotEqual,
+                left: val_u32,
+                right: zero,
+            });
+            self.store_scc(nonzero);
+        }
+    }
+
     fn apply_float_out_mods(
         &mut self,
         mut val: Handle<Expression>,
@@ -2221,10 +2575,11 @@ impl IrEmitter {
             Rdna2Detail::Smem {
                 op,
                 sdata,
+                sbase,
                 soffset,
                 offset,
                 ..
-            } => self.translate_smem(*op, *sdata, *soffset, *offset),
+            } => self.translate_smem(*op, *sdata, *sbase, *soffset, *offset),
             Rdna2Detail::Vop1 {
                 op,
                 vdst,
@@ -2258,6 +2613,7 @@ impl IrEmitter {
             Rdna2Detail::Vop3 {
                 op,
                 vdst,
+                sdst,
                 src0,
                 src1,
                 src2,
@@ -2268,7 +2624,7 @@ impl IrEmitter {
                 literal,
                 ..
             } => self.translate_vop3(
-                *op, *vdst, *src0, *src1, *src2, *clamp, *omod, *abs, *neg, *literal,
+                *op, *vdst, *sdst, *src0, *src1, *src2, *clamp, *omod, *abs, *neg, *literal,
             ),
             Rdna2Detail::Vop3P {
                 op,
@@ -2307,8 +2663,10 @@ impl IrEmitter {
                 dmask,
                 vaddr,
                 vdata,
+                srsrc,
+                ssamp,
                 ..
-            } => self.translate_mimg(*op, *dmask, *vaddr, *vdata),
+            } => self.translate_mimg(*op, *dmask, *vaddr, *vdata, *srsrc, *ssamp),
             Rdna2Detail::Mubuf {
                 op, offset, vdata, ..
             } => self.translate_vertex_buf_fetch(false, *op, *offset, *vdata),
@@ -2391,14 +2749,17 @@ impl IrEmitter {
 
     fn translate_sop1(&mut self, op: u8, sdst: u8, ssrc0: u8, literal: Option<u32>) -> bool {
         match op {
-            // s_mov_b32
-            0x03 => {
+            // s_mov_b32 / s_wqm_b32 (whole-quad-mode exec mask setup is identity in WGSL)
+            0x03 | 0x09 => {
                 let v = self.read_src_u32(u16::from(ssrc0), literal);
                 self.store_sgpr_u32(sdst, v);
+                if op == 0x09 {
+                    self.update_scc_nonzero(v);
+                }
                 true
             }
-            // s_mov_b64: 64-bit scalar register-pair move (evaluate both halves before storing)
-            0x04 => {
+            // s_mov_b64 / s_wqm_b64: 64-bit scalar register-pair move (evaluate both halves before storing)
+            0x04 | 0x0A => {
                 let (lo, hi) = match ssrc0 {
                     0..=104 => (self.load_sgpr_u32(ssrc0), self.load_sgpr_u32(ssrc0 + 1)),
                     105 => (self.load_sgpr_u32(105), self.lit_u32(0)),
@@ -2467,6 +2828,53 @@ impl IrEmitter {
                     expr: v,
                 });
                 self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
+            // s_brev_b32
+            0x0B => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::ReverseBits,
+                    arg: v,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_bcnt1_i32_b32
+            0x0F => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountOneBits,
+                    arg: v,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
+            // s_sext_i32_i8 / s_sext_i32_i16
+            0x19 | 0x1A => {
+                let v = self.read_src_i32(u16::from(ssrc0), literal);
+                let shift_bits = if op == 0x19 { 24u32 } else { 16u32 };
+                let sh = self.lit_u32(shift_bits);
+                let left = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: v,
+                    right: sh,
+                });
+                let sext = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left,
+                    right: sh,
+                });
+                let u = self.bitcast_i32_to_u32(sext);
+                self.store_sgpr_u32(sdst, u);
                 true
             }
             // s_abs_i32
@@ -2628,22 +3036,51 @@ impl IrEmitter {
                     right: r,
                 });
                 self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
                 true
             }
-            // s_andn2_b32: s0 & ~s1
-            0x14 => {
+            // s_andn2_b32 / s_orn2_b32: s0 & ~s1 / s0 | ~s1
+            0x14 | 0x16 => {
                 let l = self.read_src_u32(s0_u(), literal);
                 let r = self.read_src_u32(s1_u(), literal);
                 let nr = self.emit_expr(Expression::Unary {
                     op: UnaryOperator::BitwiseNot,
                     expr: r,
                 });
+                let bin = if op == 0x14 {
+                    BinaryOperator::And
+                } else {
+                    BinaryOperator::InclusiveOr
+                };
                 let res = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::And,
+                    op: bin,
                     left: l,
                     right: nr,
                 });
                 self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
+            // s_nand_b32 / s_nor_b32 / s_xnor_b32: ~(s0 op s1)
+            0x18 | 0x1A | 0x1C => {
+                let l = self.read_src_u32(s0_u(), literal);
+                let r = self.read_src_u32(s1_u(), literal);
+                let bin = match op {
+                    0x18 => BinaryOperator::And,
+                    0x1A => BinaryOperator::InclusiveOr,
+                    _ => BinaryOperator::ExclusiveOr,
+                };
+                let inner = self.emit_expr(Expression::Binary {
+                    op: bin,
+                    left: l,
+                    right: r,
+                });
+                let res = self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::BitwiseNot,
+                    expr: inner,
+                });
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
                 true
             }
             // s_lshl_b32 / s_lshr_b32
@@ -2667,6 +3104,7 @@ impl IrEmitter {
                     right: shift,
                 });
                 self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
                 true
             }
             // s_ashr_i32
@@ -2686,6 +3124,41 @@ impl IrEmitter {
                 });
                 let u = self.bitcast_i32_to_u32(res);
                 self.store_sgpr_u32(sdst, u);
+                self.update_scc_nonzero(u);
+                true
+            }
+            // s_bfm_b32: ((1u << (s0 & 31)) - 1u) << (s1 & 31)
+            0x24 => {
+                let l = self.read_src_u32(s0_u(), literal);
+                let r = self.read_src_u32(s1_u(), literal);
+                let mask31 = self.lit_u32(31);
+                let width = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: l,
+                    right: mask31,
+                });
+                let offset = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: r,
+                    right: mask31,
+                });
+                let one = self.lit_u32(1);
+                let sh_w = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: one,
+                    right: width,
+                });
+                let base_mask = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Subtract,
+                    left: sh_w,
+                    right: one,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: base_mask,
+                    right: offset,
+                });
+                self.store_sgpr_u32(sdst, res);
                 true
             }
             // s_mul_i32
@@ -2803,22 +3276,74 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_pack_ll_b32_b16 / s_pack_lh_b32_b16 / s_pack_hh_b32_b16
+            0x32..=0x34 => {
+                let l = self.read_src_u32(s0_u(), literal);
+                let r = self.read_src_u32(s1_u(), literal);
+                let mask_lo = self.lit_u32(0x0000_FFFF);
+                let mask_hi = self.lit_u32(0xFFFF_0000);
+                let sh16 = self.lit_u32(16);
+                let lo_half = if op == 0x34 {
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftRight,
+                        left: l,
+                        right: sh16,
+                    })
+                } else {
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: l,
+                        right: mask_lo,
+                    })
+                };
+                let hi_half = if op == 0x32 {
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftLeft,
+                        left: r,
+                        right: sh16,
+                    })
+                } else {
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: r,
+                        right: mask_hi,
+                    })
+                };
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
+                    left: lo_half,
+                    right: hi_half,
+                });
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
             _ => false,
         }
     }
 
-    fn translate_smem(&mut self, op: u8, sdata: u8, soffset: u8, byte_offset: i32) -> bool {
+    fn translate_smem(
+        &mut self,
+        op: u8,
+        sdata: u8,
+        sbase: u8,
+        soffset: u8,
+        byte_offset: i32,
+    ) -> bool {
         let Some(count) = smem_load_dword_count(op) else {
             return false;
         };
-        let Some(cb0) = self.cb0_global else {
+        let Some(&cb_global) = self
+            .cb_globals
+            .get(&sbase)
+            .or_else(|| self.cb_globals.values().next())
+        else {
             return false;
         };
         let total_dwords = self.cb0_vec4_count.max(1).saturating_mul(4);
 
-        let cb0_ptr = self.raw_expr(Expression::GlobalVariable(cb0));
+        let cb_ptr = self.raw_expr(Expression::GlobalVariable(cb_global));
         let data_ptr = self.emit_expr(Expression::AccessIndex {
-            base: cb0_ptr,
+            base: cb_ptr,
             index: 0,
         });
 
@@ -2846,6 +3371,7 @@ impl IrEmitter {
         } else {
             0
         };
+        let mut cached_static_vec: Option<(u32, Handle<Expression>)> = None;
 
         for k in 0..count {
             let dst_reg = sdata.saturating_add(k);
@@ -2890,11 +3416,18 @@ impl IrEmitter {
                 let word_idx = (static_base_word.saturating_add(u32::from(k))) % total_dwords;
                 let vec_idx = word_idx / 4;
                 let comp_idx = word_idx % 4;
-                let vec_ptr = self.emit_expr(Expression::AccessIndex {
-                    base: data_ptr,
-                    index: vec_idx,
-                });
-                let vec_val = self.emit_expr(Expression::Load { pointer: vec_ptr });
+                let vec_val = match cached_static_vec {
+                    Some((cached_idx, handle)) if cached_idx == vec_idx => handle,
+                    _ => {
+                        let vec_ptr = self.emit_expr(Expression::AccessIndex {
+                            base: data_ptr,
+                            index: vec_idx,
+                        });
+                        let loaded = self.emit_expr(Expression::Load { pointer: vec_ptr });
+                        cached_static_vec = Some((vec_idx, loaded));
+                        loaded
+                    }
+                };
                 self.emit_expr(Expression::AccessIndex {
                     base: vec_val,
                     index: comp_idx,
@@ -3001,6 +3534,63 @@ impl IrEmitter {
                 self.store_vgpr_f32(vdst, out);
                 true
             }
+            // v_cvt_rpi_i32_f32 / v_cvt_flr_i32_f32
+            0x0C | 0x0D => {
+                let f = self.read_src_f32(src0, literal, abs0, neg0);
+                let shifted = if op == 0x0C {
+                    let half = self.lit_f32(0.5);
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::Add,
+                        left: f,
+                        right: half,
+                    })
+                } else {
+                    f
+                };
+                let floored = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Floor,
+                    arg: shifted,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let i = self.emit_expr(Expression::As {
+                    expr: floored,
+                    kind: ScalarKind::Sint,
+                    convert: Some(4),
+                });
+                self.store_vgpr_i32(vdst, i);
+                true
+            }
+            // v_cvt_f32_ubyte0..3: extract byte k as f32
+            0x11..=0x14 => {
+                let u = self.read_src_u32(src0, literal);
+                let shift_bits = u32::from(op - 0x11) * 8;
+                let shifted = if shift_bits > 0 {
+                    let sh = self.lit_u32(shift_bits);
+                    self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftRight,
+                        left: u,
+                        right: sh,
+                    })
+                } else {
+                    u
+                };
+                let mask = self.lit_u32(0xFF);
+                let byte_u = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: shifted,
+                    right: mask,
+                });
+                let f = self.emit_expr(Expression::As {
+                    expr: byte_u,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
+                });
+                let out = self.apply_float_out_mods(f, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
             // v_fract_f32 / v_trunc_f32 / v_ceil_f32 / v_rndne_f32 / v_floor_f32 /
             // v_exp_f32 / v_log_f32 / v_rsq_f32 / v_sqrt_f32
             0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x27 | 0x2E | 0x33 => {
@@ -3073,6 +3663,58 @@ impl IrEmitter {
                     expr: u,
                 });
                 self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_bfrev_b32
+            0x38 => {
+                let u = self.read_src_u32(src0, literal);
+                let res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::ReverseBits,
+                    arg: u,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_rcp_f16 (emulated via f32 + pack2x16float, zero `enable f16;`)
+            0x54 => {
+                let one = self.lit_f32(1.0);
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Divide,
+                    left: one,
+                    right: f,
+                });
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_sqrt_f16 / v_rsq_f16 / v_log_f16 / v_exp_f16 / v_floor_f16 / v_ceil_f16 /
+            // v_trunc_f16 / v_rndne_f16 / v_fract_f16
+            0x55 | 0x56 | 0x57 | 0x58 | 0x5B | 0x5C | 0x5D | 0x5E | 0x5F => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let fun = match op {
+                    0x55 => MathFunction::Sqrt,
+                    0x56 => MathFunction::InverseSqrt,
+                    0x57 => MathFunction::Log2,
+                    0x58 => MathFunction::Exp2,
+                    0x5B => MathFunction::Floor,
+                    0x5C => MathFunction::Ceil,
+                    0x5D => MathFunction::Trunc,
+                    0x5E => MathFunction::Round,
+                    _ => MathFunction::Fract,
+                };
+                let res = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: f,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
                 true
             }
             _ => false,
@@ -3256,6 +3898,27 @@ impl IrEmitter {
                 self.store_vgpr_f32(vdst, res);
                 true
             }
+            // v_dot2c_f32_f16: vdst = dot(unpack(src0), unpack(src1)) + vdst
+            0x02 => {
+                let a = self.read_src_pk_f16(src0, literal, false, true, neg0, neg0);
+                let b = self.read_src_pk_f16(src1, literal, false, true, neg1, neg1);
+                let acc = self.load_vgpr_f32(vdst);
+                let d = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Dot,
+                    arg: a,
+                    arg1: Some(b),
+                    arg2: None,
+                    arg3: None,
+                });
+                let sum = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: d,
+                    right: acc,
+                });
+                let out = self.apply_float_out_mods(sum, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
             // v_add_f32
             0x03 => {
                 let l = self.read_src_f32(src0, literal, abs0, neg0);
@@ -3347,6 +4010,62 @@ impl IrEmitter {
                 };
                 let out = self.apply_float_out_mods(res, omod, clamp);
                 self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_mul_i32_i24: sign-extend low 24 bits and multiply
+            0x09 => {
+                let l_raw = self.read_src_i32(src0, literal);
+                let r_raw = self.read_src_i32(src1, literal);
+                let sh8 = self.lit_u32(8);
+                let l_sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: l_raw,
+                    right: sh8,
+                });
+                let l = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: l_sh,
+                    right: sh8,
+                });
+                let r_sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: r_raw,
+                    right: sh8,
+                });
+                let r = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: r_sh,
+                    right: sh8,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Multiply,
+                    left: l,
+                    right: r,
+                });
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_mul_u32_u24: mask low 24 bits and multiply
+            0x0B => {
+                let l_raw = self.read_src_u32(src0, literal);
+                let r_raw = self.read_src_u32(src1, literal);
+                let mask24 = self.lit_u32(0x00FF_FFFF);
+                let l = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: l_raw,
+                    right: mask24,
+                });
+                let r = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: r_raw,
+                    right: mask24,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Multiply,
+                    left: l,
+                    right: r,
+                });
+                self.store_vgpr_u32(vdst, res);
                 true
             }
             // v_min_f32 / v_max_f32
@@ -3465,6 +4184,22 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_xnor_b32: ~(src0 ^ src1)
+            0x1C => {
+                let l = self.read_src_u32(src0, literal);
+                let r = self.read_src_u32(src1, literal);
+                let x = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ExclusiveOr,
+                    left: l,
+                    right: r,
+                });
+                let res = self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::BitwiseNot,
+                    expr: x,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32
             0x25 | 0x26 | 0x27 => {
                 let l = self.read_src_u32(src0, literal);
@@ -3516,8 +4251,10 @@ impl IrEmitter {
             }
             // v_cvt_pkrtz_f16_f32: pack2x16float(vec2<f32>(src0, src1))
             0x2E => {
-                let a = self.read_src_f32(src0, literal, abs0, neg0);
-                let b = self.read_src_f32(src1, literal, abs1, neg1);
+                let a_raw = self.read_src_f32(src0, literal, abs0, neg0);
+                let b_raw = self.read_src_f32(src1, literal, abs1, neg1);
+                let a = self.apply_float_out_mods(a_raw, omod, clamp);
+                let b = self.apply_float_out_mods(b_raw, omod, clamp);
                 let pair = self.emit_expr(Expression::Compose {
                     ty: self.types.vec2_f32_ty,
                     components: vec![a, b],
@@ -3626,6 +4363,54 @@ impl IrEmitter {
                 self.store_vgpr_f16_lo(vdst, out);
                 true
             }
+            // v_pk_fmac_f16: packed 2xf16 fma(src0, src1, vdst) via unpack2x16float/pack2x16float
+            0x3C => {
+                let a = self.read_src_pk_f16(src0, literal, false, true, neg0, neg0);
+                let b = self.read_src_pk_f16(src1, literal, false, true, neg1, neg1);
+                let c = self.read_src_pk_f16(
+                    256 + u16::from(vdst),
+                    None,
+                    false,
+                    true,
+                    false,
+                    false,
+                );
+                let mut res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Fma,
+                    arg: a,
+                    arg1: Some(b),
+                    arg2: Some(c),
+                    arg3: None,
+                });
+                if clamp {
+                    let z = self.lit_f32(0.0);
+                    let o = self.lit_f32(1.0);
+                    let lo = self.emit_expr(Expression::Splat {
+                        size: VectorSize::Bi,
+                        value: z,
+                    });
+                    let hi = self.emit_expr(Expression::Splat {
+                        size: VectorSize::Bi,
+                        value: o,
+                    });
+                    res = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: res,
+                        arg1: Some(lo),
+                        arg2: Some(hi),
+                        arg3: None,
+                    });
+                }
+                let packed = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Pack2x16float,
+                    arg: res,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_vgpr_u32(vdst, packed);
+                true
+            }
             _ => false,
         }
     }
@@ -3635,6 +4420,7 @@ impl IrEmitter {
         &mut self,
         op: u16,
         vdst: u8,
+        sdst: Option<u8>,
         src0: u16,
         src1: u16,
         src2: u16,
@@ -3699,6 +4485,203 @@ impl IrEmitter {
                 self.store_vgpr_f32(vdst, out);
                 true
             }
+            // v_mad_i32_i24: sext24(src0) * sext24(src1) + src2
+            0x142 => {
+                let a_raw = self.read_src_i32(src0, literal);
+                let b_raw = self.read_src_i32(src1, literal);
+                let c = self.read_src_i32(src2, literal);
+                let sh8 = self.lit_u32(8);
+                let a_sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: a_raw,
+                    right: sh8,
+                });
+                let a = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: a_sh,
+                    right: sh8,
+                });
+                let b_sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: b_raw,
+                    right: sh8,
+                });
+                let b = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: b_sh,
+                    right: sh8,
+                });
+                let prod = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Multiply,
+                    left: a,
+                    right: b,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: prod,
+                    right: c,
+                });
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_mad_u32_u24: (src0 & 0xFFFFFF) * (src1 & 0xFFFFFF) + src2
+            0x143 => {
+                let a_raw = self.read_src_u32(src0, literal);
+                let b_raw = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask24 = self.lit_u32(0x00FF_FFFF);
+                let a = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: a_raw,
+                    right: mask24,
+                });
+                let b = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: b_raw,
+                    right: mask24,
+                });
+                let prod = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Multiply,
+                    left: a,
+                    right: b,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: prod,
+                    right: c,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_bfe_u32: unsigned bitfield extract (offset = src1[4:0], width = src2[4:0])
+            0x148 => {
+                let s0 = self.read_src_u32(src0, literal);
+                let s1 = self.read_src_u32(src1, literal);
+                let s2 = self.read_src_u32(src2, literal);
+                let mask31 = self.lit_u32(31);
+                let offset = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: s1,
+                    right: mask31,
+                });
+                let width = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: s2,
+                    right: mask31,
+                });
+                let shifted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: s0,
+                    right: offset,
+                });
+                let one = self.lit_u32(1);
+                let one_shl = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: one,
+                    right: width,
+                });
+                let bit_mask = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Subtract,
+                    left: one_shl,
+                    right: one,
+                });
+                let extracted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: shifted,
+                    right: bit_mask,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Equal,
+                    left: width,
+                    right: zero,
+                });
+                let res = self.emit_expr(Expression::Select {
+                    condition: is_zero,
+                    accept: zero,
+                    reject: extracted,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_bfi_b32: (src0 & src1) | (~src0 & src2)
+            0x14A => {
+                let mask = self.read_src_u32(src0, literal);
+                let a = self.read_src_u32(src1, literal);
+                let b = self.read_src_u32(src2, literal);
+                let nmask = self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::BitwiseNot,
+                    expr: mask,
+                });
+                let lhs = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: mask,
+                    right: a,
+                });
+                let rhs = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: nmask,
+                    right: b,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
+                    left: lhs,
+                    right: rhs,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_alignbit_b32: funnel shift right of (src0:src1) by (src2 & 31)
+            0x14E => {
+                let hi = self.read_src_u32(src0, literal);
+                let lo = self.read_src_u32(src1, literal);
+                let sh_raw = self.read_src_u32(src2, literal);
+                let mask31 = self.lit_u32(31);
+                let sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: sh_raw,
+                    right: mask31,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Equal,
+                    left: sh,
+                    right: zero,
+                });
+                let c32 = self.lit_u32(32);
+                let inv_sh_raw = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Subtract,
+                    left: c32,
+                    right: sh,
+                });
+                let inv_sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: inv_sh_raw,
+                    right: mask31,
+                });
+                let hi_part = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: hi,
+                    right: inv_sh,
+                });
+                let lo_part = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: lo,
+                    right: sh,
+                });
+                let shifted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
+                    left: hi_part,
+                    right: lo_part,
+                });
+                let res = self.emit_expr(Expression::Select {
+                    condition: is_zero,
+                    accept: lo,
+                    reject: shifted,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_min3_f32 / v_max3_f32
             0x151 | 0x154 => {
                 let a = self.read_src_f32(src0, literal, abs0, neg0);
@@ -3757,6 +4740,108 @@ impl IrEmitter {
                 self.store_vgpr_f32(vdst, out);
                 true
             }
+            // v_min3_i32 / v_max3_i32 / v_med3_i32
+            0x152 | 0x155 | 0x158 => {
+                let a = self.read_src_i32(src0, literal);
+                let b = self.read_src_i32(src1, literal);
+                let c = self.read_src_i32(src2, literal);
+                let res = if op == 0x158 {
+                    let lo = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: b,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    let hi = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Max,
+                        arg: b,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: a,
+                        arg1: Some(lo),
+                        arg2: Some(hi),
+                        arg3: None,
+                    })
+                } else {
+                    let fun = if op == 0x152 {
+                        MathFunction::Min
+                    } else {
+                        MathFunction::Max
+                    };
+                    let ab = self.emit_expr(Expression::Math {
+                        fun,
+                        arg: a,
+                        arg1: Some(b),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::Math {
+                        fun,
+                        arg: ab,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    })
+                };
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_min3_u32 / v_max3_u32 / v_med3_u32
+            0x153 | 0x156 | 0x159 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let res = if op == 0x159 {
+                    let lo = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: b,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    let hi = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Max,
+                        arg: b,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: a,
+                        arg1: Some(lo),
+                        arg2: Some(hi),
+                        arg3: None,
+                    })
+                } else {
+                    let fun = if op == 0x153 {
+                        MathFunction::Min
+                    } else {
+                        MathFunction::Max
+                    };
+                    let ab = self.emit_expr(Expression::Math {
+                        fun,
+                        arg: a,
+                        arg1: Some(b),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::Math {
+                        fun,
+                        arg: ab,
+                        arg1: Some(c),
+                        arg2: None,
+                        arg3: None,
+                    })
+                };
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_mul_lo_u32
             0x169 => {
                 let a = self.read_src_u32(src0, literal);
@@ -3767,6 +4852,69 @@ impl IrEmitter {
                     right: b,
                 });
                 self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 (VOP3B with carry-out in sdst)
+            0x30F | 0x310 | 0x319 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let (res, carry) = match op {
+                    0x30F => {
+                        let sum = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: a,
+                            right: b,
+                        });
+                        let c = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Less,
+                            left: sum,
+                            right: a,
+                        });
+                        (sum, c)
+                    }
+                    0x310 => {
+                        let diff = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Subtract,
+                            left: a,
+                            right: b,
+                        });
+                        let c = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Less,
+                            left: a,
+                            right: b,
+                        });
+                        (diff, c)
+                    }
+                    _ => {
+                        let diff = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Subtract,
+                            left: b,
+                            right: a,
+                        });
+                        let c = self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Less,
+                            left: b,
+                            right: a,
+                        });
+                        (diff, c)
+                    }
+                };
+                self.store_vgpr_u32(vdst, res);
+                if let Some(sd) = sdst {
+                    let sd7 = sd & 0x7F;
+                    if sd7 == 106 {
+                        self.store_vcc(carry);
+                    } else if sd7 <= 105 {
+                        let t = self.lit_u32(1);
+                        let f = self.lit_u32(0);
+                        let mask_u = self.emit_expr(Expression::Select {
+                            condition: carry,
+                            accept: t,
+                            reject: f,
+                        });
+                        self.store_sgpr_u32(sd7, mask_u);
+                    }
+                }
                 true
             }
             // v_lshl_add_u32: (src0 << (src1 & 31)) + src2
@@ -3851,6 +4999,30 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_lshl_or_b32: (src0 << (src1 & 31)) | src2
+            0x36E => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask = self.lit_u32(31);
+                let sh = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: b,
+                    right: mask,
+                });
+                let shifted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: a,
+                    right: sh,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
+                    left: shifted,
+                    right: c,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_and_or_b32: (src0 & src1) | src2
             0x36F => {
                 let a = self.read_src_u32(src0, literal);
@@ -3858,6 +5030,24 @@ impl IrEmitter {
                 let c = self.read_src_u32(src2, literal);
                 let ab = self.emit_expr(Expression::Binary {
                     op: BinaryOperator::And,
+                    left: a,
+                    right: b,
+                });
+                let res = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
+                    left: ab,
+                    right: c,
+                });
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_or3_b32: src0 | src1 | src2
+            0x370 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let ab = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::InclusiveOr,
                     left: a,
                     right: b,
                 });
@@ -3888,15 +5078,16 @@ impl IrEmitter {
         neg_hi: u8,
         literal: Option<u32>,
     ) -> bool {
-        let unpack = |this: &mut Self, s: u16| {
-            let u = this.read_src_u32(s, literal);
-            this.emit_expr(Expression::Math {
-                fun: MathFunction::Unpack2x16float,
-                arg: u,
-                arg1: None,
-                arg2: None,
-                arg3: None,
-            })
+        let read_pk = |this: &mut Self, s: u16, idx: u8| {
+            let bit = 1u8 << idx;
+            this.read_src_pk_f16(
+                s,
+                literal,
+                (op_sel & bit) != 0,
+                (op_sel_hi & bit) != 0,
+                (neg_lo & bit) != 0,
+                (neg_hi & bit) != 0,
+            )
         };
         let pack_and_store = |this: &mut Self, mut vec2_val: Handle<Expression>| {
             if clamp {
@@ -3931,9 +5122,9 @@ impl IrEmitter {
         match op {
             // v_pk_fma_f16
             0x0E => {
-                let a = unpack(self, src0);
-                let b = unpack(self, src1);
-                let c = unpack(self, src2);
+                let a = read_pk(self, src0, 0);
+                let b = read_pk(self, src1, 1);
+                let c = read_pk(self, src2, 2);
                 let res = self.emit_expr(Expression::Math {
                     fun: MathFunction::Fma,
                     arg: a,
@@ -3946,8 +5137,8 @@ impl IrEmitter {
             }
             // v_pk_add_f16 / v_pk_mul_f16
             0x0F | 0x10 => {
-                let a = unpack(self, src0);
-                let b = unpack(self, src1);
+                let a = read_pk(self, src0, 0);
+                let b = read_pk(self, src1, 1);
                 let bin = if op == 0x0F {
                     BinaryOperator::Add
                 } else {
@@ -3963,8 +5154,8 @@ impl IrEmitter {
             }
             // v_pk_min_f16 / v_pk_max_f16
             0x11 | 0x12 => {
-                let a = unpack(self, src0);
-                let b = unpack(self, src1);
+                let a = read_pk(self, src0, 0);
+                let b = read_pk(self, src1, 1);
                 let fun = if op == 0x11 {
                     MathFunction::Min
                 } else {
@@ -3982,9 +5173,9 @@ impl IrEmitter {
             }
             // v_dot2_f32_f16: dot(unpack(src0), unpack(src1)) + src2
             0x13 => {
-                let a = unpack(self, src0);
-                let b = unpack(self, src1);
-                let c = self.read_src_f32(src2, literal, false, false);
+                let a = read_pk(self, src0, 0);
+                let b = read_pk(self, src1, 1);
+                let c = self.read_src_f32(src2, literal, false, (neg_lo & 4) != 0);
                 let d = self.emit_expr(Expression::Math {
                     fun: MathFunction::Dot,
                     arg: a,
@@ -4078,76 +5269,140 @@ impl IrEmitter {
 
     // -- MIMG (2D Texture sampling & loading) --
 
-    fn translate_mimg(&mut self, op: u8, dmask: u8, vaddr: u8, vdata: u8) -> bool {
-        if !is_supported_mimg_op(op) {
-            return false;
-        }
-        let Some(tex0) = self.tex0_global else {
+    fn translate_mimg(
+        &mut self,
+        op: u8,
+        dmask: u8,
+        vaddr: u8,
+        vdata: u8,
+        srsrc: u8,
+        ssamp: u8,
+    ) -> bool {
+        let Some(layout) = mimg_addr_layout(op) else {
             return false;
         };
-        let image = self.raw_expr(Expression::GlobalVariable(tex0));
+        let Some(&tex_global) = self
+            .tex_globals
+            .get(&srsrc)
+            .or_else(|| self.tex_globals.values().next())
+        else {
+            return false;
+        };
+        let image = self.raw_expr(Expression::GlobalVariable(tex_global));
 
-        let sampled = match op {
+        let sampled = if layout.is_load {
             // image_load / image_load_mip
-            0x00 | 0x01 => {
-                let ux = self.load_vgpr_f32(vaddr);
-                let uy = self.load_vgpr_f32(vaddr.saturating_add(1));
-                let ix = self.bitcast_f32_to_i32(ux);
-                let iy = self.bitcast_f32_to_i32(uy);
-                let coord = self.emit_expr(Expression::Compose {
-                    ty: self.types.vec2_i32_ty,
-                    components: vec![ix, iy],
-                });
-                let level = if op == 0x01 {
-                    let ml = self.load_vgpr_f32(vaddr.saturating_add(2));
-                    Some(self.bitcast_f32_to_i32(ml))
-                } else {
-                    Some(self.lit_i32(0))
-                };
-                self.emit_expr(Expression::ImageLoad {
-                    image,
-                    coordinate: coord,
-                    array_index: None,
-                    sample: None,
-                    level,
-                })
-            }
+            let ux = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
+            let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let ix = self.bitcast_f32_to_i32(ux);
+            let iy = self.bitcast_f32_to_i32(uy);
+            let coord = self.emit_expr(Expression::Compose {
+                ty: self.types.vec2_i32_ty,
+                components: vec![ix, iy],
+            });
+            let level = if let Some(lod_off) = layout.lod_off {
+                let ml = self.load_vgpr_f32(vaddr.saturating_add(lod_off));
+                Some(self.bitcast_f32_to_i32(ml))
+            } else {
+                Some(self.lit_i32(0))
+            };
+            self.emit_expr(Expression::ImageLoad {
+                image,
+                coordinate: coord,
+                array_index: None,
+                sample: None,
+                level,
+            })
+        } else {
             // image_sample* (sampled 2D texture)
-            _ => {
-                let Some(samp0) = self.samp0_global else {
-                    return false;
-                };
-                let sampler = self.raw_expr(Expression::GlobalVariable(samp0));
-                let u = self.load_vgpr_f32(vaddr);
-                let v = self.load_vgpr_f32(vaddr.saturating_add(1));
-                let coord = self.emit_expr(Expression::Compose {
+            let Some(&samp_global) = self
+                .samp_globals
+                .get(&ssamp)
+                .or_else(|| self.samp_globals.values().next())
+            else {
+                return false;
+            };
+            let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
+            let u = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
+            let v = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let coord = self.emit_expr(Expression::Compose {
+                ty: self.types.vec2_f32_ty,
+                components: vec![u, v],
+            });
+
+            // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
+            // in Fragment shaders; Vertex/Compute stages must use explicit `textureSampleLevel`
+            // or `textureSampleGrad`.
+            let level = if layout.is_zero_lod {
+                SampleLevel::Exact(self.lit_f32(0.0))
+            } else if let Some(lod_off) = layout.lod_off {
+                let lod = self.load_vgpr_f32(vaddr.saturating_add(lod_off));
+                SampleLevel::Exact(lod)
+            } else if let Some(grad_off) = layout.grad_off {
+                let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
+                let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
+                let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2));
+                let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 3));
+                let x = self.emit_expr(Expression::Compose {
                     ty: self.types.vec2_f32_ty,
-                    components: vec![u, v],
+                    components: vec![dudx, dvdx],
                 });
+                let y = self.emit_expr(Expression::Compose {
+                    ty: self.types.vec2_f32_ty,
+                    components: vec![dudy, dvdy],
+                });
+                SampleLevel::Gradient { x, y }
+            } else if let Some(bias_off) = layout.bias_off {
+                if self.stage == ShaderStage::Fragment {
+                    let bias = self.load_vgpr_f32(vaddr.saturating_add(bias_off));
+                    SampleLevel::Bias(bias)
+                } else {
+                    SampleLevel::Exact(self.lit_f32(0.0))
+                }
+            } else if self.stage == ShaderStage::Fragment {
+                SampleLevel::Auto
+            } else {
+                SampleLevel::Exact(self.lit_f32(0.0))
+            };
 
-                // WGSL only permits implicit-derivative `textureSample` in Fragment shaders;
-                // Vertex/Compute stages must use explicit `textureSampleLevel`.
-                let level = match op {
-                    0x27 | 0x37 => SampleLevel::Exact(self.lit_f32(0.0)),
-                    0x24 | 0x34 => {
-                        let lod = self.load_vgpr_f32(vaddr.saturating_add(2));
-                        SampleLevel::Exact(lod)
-                    }
-                    _ if self.stage == ShaderStage::Fragment => SampleLevel::Auto,
-                    _ => SampleLevel::Exact(self.lit_f32(0.0)),
-                };
+            let raw_sample = self.emit_expr(Expression::ImageSample {
+                image,
+                sampler,
+                gather: None,
+                coordinate: coord,
+                array_index: None,
+                offset: None,
+                level,
+                depth_ref: None,
+                clamp_to_edge: false,
+            });
 
-                self.emit_expr(Expression::ImageSample {
-                    image,
-                    sampler,
-                    gather: None,
-                    coordinate: coord,
-                    array_index: None,
-                    offset: None,
-                    level,
-                    depth_ref: None,
-                    clamp_to_edge: false,
+            if let Some(cmp_off) = layout.compare_off {
+                // Depth/shadow comparison on baseline `texture_2d<f32>` + `sampler`:
+                // returns 1.0 when `z_ref <= tex.x`, else 0.0, replicated across channels.
+                let z_ref = self.load_vgpr_f32(vaddr.saturating_add(cmp_off));
+                let depth_val = self.emit_expr(Expression::AccessIndex {
+                    base: raw_sample,
+                    index: 0,
+                });
+                let passed = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::LessEqual,
+                    left: z_ref,
+                    right: depth_val,
+                });
+                let one = self.lit_f32(1.0);
+                let zero = self.lit_f32(0.0);
+                let cmp_f = self.emit_expr(Expression::Select {
+                    condition: passed,
+                    accept: one,
+                    reject: zero,
+                });
+                self.emit_expr(Expression::Splat {
+                    size: VectorSize::Quad,
+                    value: cmp_f,
                 })
+            } else {
+                raw_sample
             }
         };
 
@@ -4426,7 +5681,10 @@ impl IrEmitter {
 
     // -- Finalize function & module --
 
-    fn finish(mut self, entry_name: String) -> (Module, usize, usize, Vec<String>) {
+    fn finish(
+        mut self,
+        entry_name: String,
+    ) -> (Module, usize, usize, Vec<String>, Vec<WgslBindingInfo>) {
         // Emit stage return statement.
         match self.stage {
             ShaderStage::Vertex => {
@@ -4475,6 +5733,7 @@ impl IrEmitter {
             self.translated_op_count,
             self.unsupported_op_count,
             self.unsupported_comments,
+            self.emitted_bindings,
         )
     }
 }
@@ -4502,7 +5761,7 @@ pub fn translate_rdna2_to_wgsl(
     }
 
     let entry_point = plan.entry_point.clone();
-    let (module, translated_op_count, unsupported_op_count, unsupported_comments) =
+    let (module, translated_op_count, unsupported_op_count, unsupported_comments, bindings) =
         emitter.finish(entry_point.clone());
 
     // Unconditional Naga validation against baseline WebGPU capabilities.
@@ -4556,35 +5815,11 @@ pub fn translate_rdna2_to_wgsl(
         ShaderStage::Compute => Vec::new(),
     };
 
-    let mut bindings = Vec::new();
-    if plan.uses_cbv {
-        bindings.push(WgslBindingInfo {
-            group: 0,
-            binding: 0,
-            kind: "uniform",
-            name: "cb0".to_string(),
-        });
-    }
-    if plan.uses_mimg {
-        bindings.push(WgslBindingInfo {
-            group: 0,
-            binding: 1,
-            kind: "texture_2d",
-            name: "tex0".to_string(),
-        });
-        bindings.push(WgslBindingInfo {
-            group: 0,
-            binding: 2,
-            kind: "sampler",
-            name: "samp0".to_string(),
-        });
-    }
-
     let binding_summary = Rdna2BindingSummary {
-        has_cbv: plan.uses_cbv,
+        has_cbv: !plan.cbv_slots.is_empty(),
         cbv_vec4_count: plan.cbv_vec4_count,
-        has_texture_2d: plan.uses_mimg,
-        has_sampler: plan.uses_mimg,
+        has_texture_2d: !plan.tex_slots.is_empty(),
+        has_sampler: !plan.samp_slots.is_empty(),
         vertex_input_mode: plan.vertex_input_mode.as_str().to_string(),
         fragment_input_locations: plan.frag_attrs.iter().map(|&a| u32::from(a)).collect(),
         output_locations,
@@ -5549,5 +6784,329 @@ mod tests {
             json.contains("{\"group\": 0, \"binding\": 2, \"kind\": \"sampler\", \"name\": \"samp0\"}"),
             "JSON:\n{json}"
         );
+    }
+
+    #[test]
+    fn translates_textured_splash_ui_ps_with_cbv_image_sample_lz_v_pk_fma_f16_and_pkrtz_compr() {
+        // Synthetic textured splash/UI pixel shader exercising:
+        //   s_wqm_b64 exec, exec
+        //   v_interp_p1_f32 / v_interp_p2_f32 attr0.xy (UV)
+        //   s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0 (tint/bias CBV)
+        //   s_waitcnt lgkmcnt(0)
+        //   image_sample_lz v4, v2, s[8:15], s[12:15] dmask:0xf dim:1
+        //   s_waitcnt vmcnt(0)
+        //   v_cvt_pkrtz_f16_f32 v8, v4, v5
+        //   v_cvt_pkrtz_f16_f32 v9, v6, v7
+        //   v_pk_fma_f16 v8, v8, s4, s5 op_sel:[0,1,0] op_sel_hi:[1,0,1] neg_lo:[0,0,1] neg_hi:[1,0,0] clamp
+        //   v_pk_fma_f16 v9, v9, s6, 1.0 op_sel:[0,0,0] op_sel_hi:[1,1,0] clamp
+        //   exp mrt0 v8, v9, off, off done compr vm
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x0A, 126, 126)); // s_wqm_b64 exec, exec
+        words.push(enc_vintrp(0, 2, 0, 0, 0));
+        words.push(enc_vintrp(1, 2, 0, 0, 1));
+        words.push(enc_vintrp(0, 3, 0, 1, 0));
+        words.push(enc_vintrp(1, 3, 0, 1, 1));
+        words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x0, false, false)); // s_buffer_load_dwordx4
+        words.push(enc_sopp(0x0C, 0xC07F)); // s_waitcnt lgkmcnt(0)
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 4, 2, 3)); // image_sample_lz
+        words.push(enc_sopp(0x0C, 0x3F70)); // s_waitcnt vmcnt(0)
+        words.push(enc_vop2(0x2E, 8, 256 + 4, 5)); // v_cvt_pkrtz_f16_f32 v8, v4, v5
+        words.push(enc_vop2(0x2E, 9, 256 + 6, 7)); // v_cvt_pkrtz_f16_f32 v9, v6, v7
+        words.extend_from_slice(&enc_vop3p(
+            0x0E,
+            8,
+            256 + 8,
+            4, // s4
+            5, // s5
+            true,
+            0b010, // op_sel: src1 uses hi for lo lane
+            0b101, // op_sel_hi: src1 uses lo for hi lane (.yx swap)
+            0b100, // neg_lo on src2
+            0b001, // neg_hi on src0
+        ));
+        words.extend_from_slice(&enc_vop3p(
+            0x0E,
+            9,
+            256 + 9,
+            6,   // s6
+            242, // inline 1.0 broadcast via op_sel_hi bit 2 = 0
+            true,
+            0b000,
+            0b011,
+            0b000,
+            0b000,
+        ));
+        words.extend_from_slice(&enc_exp(0, 0xF, true, true, true, [8, 9, 0, 0])); // compr done vm
+        words.push(enc_sopp(0x01, 0)); // s_endpgm
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("textured splash/UI PS should translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.entry_point, "fs_main");
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 15);
+        assert_eq!(
+            out.bindings,
+            vec![
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 0,
+                    kind: "uniform",
+                    name: "cb0".to_string(),
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 1,
+                    kind: "texture_2d",
+                    name: "tex0".to_string(),
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 2,
+                    kind: "sampler",
+                    name: "samp0".to_string(),
+                },
+            ]
+        );
+        assert!(out.wgsl.contains("textureSampleLevel("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("unpack2x16float("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("pack2x16float("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("fma("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("clamp("), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("enable f16"), "must not require shader-f16");
+        assert!(!out.wgsl.contains("<f16>"), "must not emit f16 type");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn translates_vs_and_fs_with_v_pk_ops_v_med3_f32_image_sample_l_and_s_buffer_load_x8_x16() {
+        // 1) Synthetic Vertex Shader exercising s_buffer_load_dwordx8 + x16 across two CBVs (cb0, cb1),
+        //    v_pk_mul_f16, v_pk_add_f16, v_pk_min_f16, v_pk_max_f16, v_pk_fmac_f16, v_med3_f32,
+        //    and image_sample_l.
+        let mut vs_words = Vec::new();
+        // s_buffer_load_dwordx8 s[4:11], s[0:3], 0x20 (cb0 words 8..15)
+        vs_words.extend_from_slice(&enc_smem(0x0B, 4, 0, 0x7D, 0x20, false, false));
+        // s_buffer_load_dwordx16 s[16:31], s[4:7], 0x40 (cb1 words 16..31)
+        vs_words.extend_from_slice(&enc_smem(0x0C, 16, 2, 0x7D, 0x40, false, false));
+        vs_words.push(enc_sopp(0x0C, 0xC07F));
+        vs_words.push(enc_vop1(0x06, 1, 256 + 0)); // v_cvt_f32_u32 v1, v0
+        vs_words.push(enc_vop1(0x01, 2, 240)); // v_mov_b32 v2, 0.5
+        // v_med3_f32 v2, v1, s4, s5
+        vs_words.extend_from_slice(&enc_vop3(0x157, 2, 256 + 1, 4, 5, true, 0, 0, 0));
+        // v_pk_mul_f16 v3, v1, s6 op_sel:[0,0] op_sel_hi:[1,1]
+        vs_words.extend_from_slice(&enc_vop3p(0x10, 3, 256 + 1, 6, 0, false, 0, 0b011, 0, 0));
+        // v_pk_add_f16 v3, v3, s7 op_sel:[0,1] op_sel_hi:[1,0] neg_lo:[0,1] clamp
+        vs_words.extend_from_slice(&enc_vop3p(
+            0x0F,
+            3,
+            256 + 3,
+            7,
+            0,
+            true,
+            0b010,
+            0b001,
+            0b010,
+            0,
+        ));
+        // v_pk_min_f16 v4, v3, s8
+        vs_words.extend_from_slice(&enc_vop3p(0x11, 4, 256 + 3, 8, 0, false, 0, 0b011, 0, 0));
+        // v_pk_max_f16 v4, v4, s16
+        vs_words.extend_from_slice(&enc_vop3p(0x12, 4, 256 + 4, 16, 0, false, 0, 0b011, 0, 0));
+        // v_pk_fmac_f16 v4, v3, s31 (VOP2 0x3C)
+        vs_words.push(enc_vop2(0x3C, 4, 31, 3));
+        // image_sample_l v5, v0, s[8:15], s[12:15] dmask:0xf dim:1
+        vs_words.extend_from_slice(&enc_mimg(0x24, 0xF, 1, 0, 5, 2, 3));
+        vs_words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [5, 6, 7, 8])); // pos0
+        vs_words.extend_from_slice(&enc_exp(32, 0x3, false, true, false, [2, 4, 0, 0])); // param0 done
+        vs_words.push(enc_sopp(0x01, 0));
+
+        let vs_bytes = words_to_bytes(&vs_words);
+        let vs_out = translate_rdna2_to_wgsl(&vs_bytes, &Rdna2TranslateOptions::default())
+            .expect("VS with v_pk_*_f16, v_med3_f32, image_sample_l, and s_buffer_load_x8/x16 must succeed");
+        assert!(vs_out.naga_validated);
+        assert_eq!(vs_out.stage, ShaderStage::Vertex);
+        assert_eq!(vs_out.unsupported_op_count, 0, "WGSL:\n{}", vs_out.wgsl);
+        assert_eq!(vs_out.bindings.len(), 4); // cb0@0, tex0@1, samp0@2, cb1@3
+        assert_eq!(vs_out.bindings[0].name, "cb0");
+        assert_eq!(vs_out.bindings[1].name, "tex0");
+        assert_eq!(vs_out.bindings[2].name, "samp0");
+        assert_eq!(vs_out.bindings[3].name, "cb1");
+        assert_eq!(vs_out.bindings[3].binding, 3);
+        assert!(vs_out.wgsl.contains("textureSampleLevel("));
+        assert!(
+            vs_out.wgsl.contains("cb0_.data[2]") && vs_out.wgsl.contains("cb0_.data[3]"),
+            "expected cb0_.data[2..4] in WGSL:\n{}",
+            vs_out.wgsl
+        );
+        assert!(
+            vs_out.wgsl.contains("cb1_.data[4]") && vs_out.wgsl.contains("cb1_.data[7]"),
+            "expected cb1_.data[4..8] in WGSL:\n{}",
+            vs_out.wgsl
+        );
+        assert!(!vs_out.wgsl.contains("enable f16"));
+        assert_naga_wgsl_valid(&vs_out.wgsl);
+
+        // 2) Synthetic Fragment Shader exercising s_buffer_load_dwordx8, image_sample_l,
+        //    v_med3_f32, v_pk_mul_f16, v_pk_add_f16, and VOP3 v_cvt_pkrtz_f16_f32 clamp.
+        let mut fs_words = Vec::new();
+        fs_words.extend_from_slice(&enc_smem(0x0B, 4, 0, 0x7D, 0x0, false, false)); // s_buffer_load_dwordx8
+        fs_words.push(enc_vintrp(0, 2, 0, 0, 0));
+        fs_words.push(enc_vintrp(1, 2, 0, 0, 1));
+        fs_words.push(enc_vintrp(0, 3, 0, 1, 0));
+        fs_words.push(enc_vintrp(1, 3, 0, 1, 1));
+        fs_words.push(enc_vop1(0x01, 4, 242)); // lod = 1.0 in v4
+        fs_words.extend_from_slice(&enc_mimg(0x24, 0xF, 1, 2, 5, 2, 1)); // image_sample_l v[5:8], v[2:4]
+        fs_words.extend_from_slice(&enc_vop3(0x157, 5, 256 + 5, 4, 5, false, 0, 0, 0)); // v_med3_f32
+        // VOP3 v_cvt_pkrtz_f16_f32 (0x12E) with clamp
+        fs_words.extend_from_slice(&enc_vop3(0x12E, 9, 256 + 5, 256 + 6, 0, true, 0, 0, 0));
+        fs_words.extend_from_slice(&enc_vop3(0x12E, 10, 256 + 7, 256 + 8, 0, true, 0, 0, 0));
+        fs_words.extend_from_slice(&enc_vop3p(0x10, 9, 256 + 9, 6, 0, false, 0, 0b011, 0, 0)); // v_pk_mul_f16
+        fs_words.extend_from_slice(&enc_vop3p(0x0F, 9, 256 + 9, 7, 0, true, 0, 0b011, 0, 0)); // v_pk_add_f16
+        fs_words.extend_from_slice(&enc_exp(0, 0xF, true, true, true, [9, 10, 0, 0]));
+        fs_words.push(enc_sopp(0x01, 0));
+
+        let fs_bytes = words_to_bytes(&fs_words);
+        let fs_out = translate_rdna2_to_wgsl(&fs_bytes, &Rdna2TranslateOptions::default())
+            .expect("FS with v_pk_mul/add_f16, v_med3_f32, image_sample_l, and s_buffer_load_x8 must succeed");
+        assert!(fs_out.naga_validated);
+        assert_eq!(fs_out.stage, ShaderStage::Fragment);
+        assert_eq!(fs_out.unsupported_op_count, 0, "WGSL:\n{}", fs_out.wgsl);
+        assert!(fs_out.wgsl.contains("textureSampleLevel("));
+        assert!(fs_out.wgsl.contains("pack2x16float("));
+        assert!(fs_out.wgsl.contains("unpack2x16float("));
+        assert!(!fs_out.wgsl.contains("enable f16"));
+        assert_naga_wgsl_valid(&fs_out.wgsl);
+    }
+
+    #[test]
+    fn translates_all_mimg_sampling_and_load_variants_with_dmask_and_multi_texture_bindings() {
+        // Fragment shader exercising all 7 required MIMG variants + partial dmasks + 2 textures:
+        //   image_sample      (0x20) dmask:0xf on tex0 (srsrc=2)
+        //   image_sample_lz   (0x27) dmask:0x3 (RG compacted to v10..v11) on tex0
+        //   image_sample_l    (0x24) dmask:0x9 (RA compacted to v12..v13) on tex1 (srsrc=4)
+        //   image_sample_b    (0x25) dmask:0xf (bias in v1, uv in v2..v3) on tex0
+        //   image_sample_c    (0x28) dmask:0x1 (z_ref in v1, uv in v2..v3 -> shadow factor in v18) on tex1
+        //   image_load        (0x00) dmask:0x3 on tex0
+        //   image_load_mip    (0x01) dmask:0x5 (RB compacted to v21..v22) on tex1
+        let mut words = Vec::new();
+        words.push(enc_vop1(0x01, 1, 240)); // v1 = 0.5 (bias / z_ref)
+        words.push(enc_vintrp(0, 2, 0, 0, 0)); // v2 = uv.x
+        words.push(enc_vintrp(1, 2, 0, 0, 1));
+        words.push(enc_vintrp(0, 3, 0, 1, 0)); // v3 = uv.y
+        words.push(enc_vintrp(1, 3, 0, 1, 1));
+        words.push(enc_vop1(0x01, 4, 244)); // v4 = 2.0 (lod / mip)
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 6, 2, 1)); // image_sample -> v6..v9
+        words.extend_from_slice(&enc_mimg(0x27, 0x3, 1, 2, 10, 2, 1)); // image_sample_lz (RG) -> v10..v11
+        words.extend_from_slice(&enc_mimg(0x24, 0x9, 1, 2, 12, 4, 1)); // image_sample_l (RA) on tex1 -> v12..v13
+        words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 1, 14, 2, 1)); // image_sample_b -> v14..v17
+        words.extend_from_slice(&enc_mimg(0x28, 0x1, 1, 1, 18, 4, 1)); // image_sample_c on tex1 -> v18
+        words.extend_from_slice(&enc_mimg(0x00, 0x3, 1, 2, 19, 2, 0)); // image_load -> v19..v20
+        words.extend_from_slice(&enc_mimg(0x01, 0x5, 1, 2, 21, 4, 0)); // image_load_mip on tex1 -> v21..v22
+        // Combine into mrt0
+        words.push(enc_vop2(0x03, 6, 256 + 10, 6));
+        words.push(enc_vop2(0x03, 7, 256 + 12, 14));
+        words.push(enc_vop2(0x08, 8, 256 + 18, 19));
+        words.push(enc_vop2(0x03, 9, 256 + 21, 9));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [6, 7, 8, 9]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("all MIMG sampling & load variants must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(
+            out.bindings,
+            vec![
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 1,
+                    kind: "texture_2d",
+                    name: "tex0".to_string(),
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 2,
+                    kind: "sampler",
+                    name: "samp0".to_string(),
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 3,
+                    kind: "texture_2d",
+                    name: "tex1".to_string(),
+                },
+            ]
+        );
+        assert!(out.wgsl.contains("textureSample("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("textureSampleLevel("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("textureSampleBias("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("textureLoad("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("tex0") && out.wgsl.contains("tex1"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn translates_common_gfx10_3_scalar_and_vector_alu_ops_with_zero_unsupported() {
+        // Exercises all common UI/splash scalar & vector ALU ops:
+        //   s_lshl_b32, s_lshr_b32, s_and_b32, s_or_b32, s_xor_b32, s_pack_ll/lh/hh_b32_b16,
+        //   v_med3_f32, v_floor_f32, v_fract_f32, v_rcp_f32, v_rsq_f32, v_sqrt_f32,
+        //   v_exp_f32, v_log_f32, v_cvt_f32_ubyte0..3, v_bfi_b32, v_lshl_or_b32, v_or3_b32,
+        //   v_med3_i32, v_med3_u32, v_rcp_f16, v_sqrt_f16
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 2, 128 + 15)); // s_mov_b32 s2, 15
+        words.push(enc_sop2(0x1E, 3, 2, 128 + 2)); // s_lshl_b32 s3, s2, 2
+        words.push(enc_sop2(0x20, 4, 3, 128 + 1)); // s_lshr_b32 s4, s3, 1
+        words.push(enc_sop2(0x0E, 5, 4, 128 + 7)); // s_and_b32 s5, s4, 7
+        words.push(enc_sop2(0x10, 6, 5, 128 + 8)); // s_or_b32 s6, s5, 8
+        words.push(enc_sop2(0x12, 7, 6, 128 + 3)); // s_xor_b32 s7, s6, 3
+        words.push(enc_sop2(0x32, 8, 5, 6)); // s_pack_ll_b32_b16 s8, s5, s6
+        words.push(enc_sop2(0x33, 9, 8, 7)); // s_pack_lh_b32_b16 s9, s8, s7
+        words.push(enc_sop2(0x34, 10, 9, 8)); // s_pack_hh_b32_b16 s10, s9, s8
+        words.push(enc_vop1(0x06, 0, 7)); // v_cvt_f32_u32 v0, s7
+        words.push(enc_vop1(0x24, 1, 256 + 0)); // v_floor_f32 v1, v0
+        words.push(enc_vop1(0x20, 2, 256 + 0)); // v_fract_f32 v2, v0
+        words.push(enc_vop1(0x2A, 3, 256 + 0)); // v_rcp_f32 v3, v0
+        words.push(enc_vop1(0x2E, 4, 256 + 3)); // v_rsq_f32 v4, v3
+        words.push(enc_vop1(0x33, 5, 256 + 4)); // v_sqrt_f32 v5, v4
+        words.push(enc_vop1(0x25, 6, 256 + 5)); // v_exp_f32 v6, v5
+        words.push(enc_vop1(0x27, 7, 256 + 6)); // v_log_f32 v7, v6
+        words.extend_from_slice(&enc_vop3(0x157, 8, 256 + 7, 256 + 1, 256 + 2, true, 0, 0, 0)); // v_med3_f32
+        words.push(enc_vop1(0x11, 9, 10)); // v_cvt_f32_ubyte0 v9, s10
+        words.push(enc_vop1(0x12, 10, 10)); // v_cvt_f32_ubyte1 v10, s10
+        words.push(enc_vop1(0x13, 11, 10)); // v_cvt_f32_ubyte2 v11, s10
+        words.push(enc_vop1(0x14, 12, 10)); // v_cvt_f32_ubyte3 v12, s10
+        words.extend_from_slice(&enc_vop3(0x14A, 13, 10, 256 + 9, 256 + 10, false, 0, 0, 0)); // v_bfi_b32
+        words.extend_from_slice(&enc_vop3(0x36E, 14, 256 + 13, 128 + 2, 256 + 11, false, 0, 0, 0)); // v_lshl_or_b32
+        words.extend_from_slice(&enc_vop3(0x370, 15, 256 + 14, 256 + 12, 7, false, 0, 0, 0)); // v_or3_b32
+        words.extend_from_slice(&enc_vop3(0x158, 16, 256 + 13, 256 + 14, 256 + 15, false, 0, 0, 0)); // v_med3_i32
+        words.extend_from_slice(&enc_vop3(0x159, 17, 256 + 13, 256 + 14, 256 + 15, false, 0, 0, 0)); // v_med3_u32
+        words.push(enc_vop1(0x54, 18, 256 + 8)); // v_rcp_f16
+        words.push(enc_vop1(0x55, 18, 256 + 18)); // v_sqrt_f16
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [8, 9, 17, 18]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("common GFX10.3 ALU ops must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("floor("));
+        assert!(out.wgsl.contains("fract("));
+        assert!(out.wgsl.contains("inverseSqrt("));
+        assert!(out.wgsl.contains("sqrt("));
+        assert!(out.wgsl.contains("exp2("));
+        assert!(out.wgsl.contains("log2("));
+        assert!(out.wgsl.contains("clamp("));
+        assert!(!out.wgsl.contains("enable f16"));
+        assert_naga_wgsl_valid(&out.wgsl);
     }
 }
