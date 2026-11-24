@@ -2,7 +2,7 @@
 """Local dev & asset-streaming HTTP server for playgta6web.
 
 - Serves `web/` at `/` and `--data` (default `local-data/`) at `/data/`.
-- Serves `GTA6_GAME_DIR` (when configured) at `/game/` for local splash assets.
+- Serves `GTA6_GAME_DIR` (when configured) at `/game/` for local game & splash assets.
 - Serves `local-data/shaders/` at `/shaders/` and `work/recomp_build/` at `/boot/`
   (boot allowlisted to `.pgim`/`.json`/`.wasm`/`.js` only).
 - Serves sanitized JSON readiness diagnostics at `/api/status`.
@@ -41,14 +41,20 @@ mimetypes.add_type("application/json", ".json")
 
 def safe_resolve(root: Path, rel_url_path: str) -> Path | None:
     """Resolve a URL path strictly inside `root`, rejecting traversal and external symlinks."""
-    normalized = posixpath.normpath("/" + unquote(rel_url_path)).lstrip("/")
+    decoded = unquote(rel_url_path)
+    if "\x00" in decoded:
+        return None
+    unslashed = decoded.replace("\\", "/")
+    if ".." in unslashed.split("/"):
+        return None
+    normalized = posixpath.normpath("/" + unslashed).lstrip("/")
     if not normalized or normalized.startswith(".."):
         return None
-    candidate = (root / normalized).resolve()
-    root_resolved = root.resolve()
     try:
+        root_resolved = root.resolve()
+        candidate = (root / normalized).resolve()
         candidate.relative_to(root_resolved)
-    except ValueError:
+    except (OSError, ValueError):
         return None
     return candidate
 
@@ -256,25 +262,76 @@ def _discover_reflection_manifest_url(shaders_root: Path | None) -> str | None:
     return "/shaders/reflection-manifest.json"
 
 
+def _pgim_sort_key(rel_posix: str) -> tuple[int, str, str]:
+    """Rank discovered `.pgim` paths: `main/image/guest.pgim`, other `main/*`, top-level, nested."""
+    lowered = rel_posix.lower()
+    if lowered == "main/image/guest.pgim":
+        rank = 0
+    elif lowered.startswith("main/"):
+        rank = 1
+    elif "/" not in lowered:
+        rank = 2
+    else:
+        rank = 3
+    return (rank, lowered, rel_posix)
+
+
 def _discover_pgim_url(boot_root: Path | None) -> str | None:
     if boot_root is None or not boot_root.is_dir():
         return None
-    names: list[str] = []
     try:
-        for entry in boot_root.iterdir():
-            try:
-                if entry.is_file() and entry.name.lower().endswith(".pgim"):
-                    resolved = entry.resolve()
-                    if resolved.is_relative_to(boot_root.resolve()):
-                        names.append(entry.name)
-            except OSError:
-                continue
+        boot_root_resolved = boot_root.resolve()
     except OSError:
         return None
-    if not names:
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    try:
+        for dirpath, _dirnames, filenames in os.walk(boot_root, followlinks=False):
+            dir_path = Path(dirpath)
+            for filename in filenames:
+                if not filename.lower().endswith(".pgim"):
+                    continue
+                entry = dir_path / filename
+                try:
+                    if not entry.is_file():
+                        continue
+                    resolved = entry.resolve(strict=True)
+                    if not resolved.is_relative_to(boot_root_resolved):
+                        continue
+                    if not resolved.name.lower().endswith(".pgim"):
+                        continue
+                    rel_posix = entry.relative_to(boot_root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                if not rel_posix or ".." in rel_posix.split("/") or rel_posix in seen:
+                    continue
+                seen.add(rel_posix)
+                candidates.append(rel_posix)
+    except OSError:
         return None
-    names.sort(key=lambda name: name.lower())
-    return f"/boot/{names[0]}"
+
+    if not candidates:
+        return None
+    candidates.sort(key=_pgim_sort_key)
+    return f"/boot/{candidates[0]}"
+
+
+def _discover_program_manifest_url(boot_root: Path | None) -> str | None:
+    if boot_root is None or not boot_root.is_dir():
+        return None
+    candidate = boot_root / "program-manifest.json"
+    try:
+        if not candidate.is_file():
+            return None
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(boot_root.resolve()):
+            return None
+        if not _boot_extension_allowed(resolved):
+            return None
+    except OSError:
+        return None
+    return "/boot/program-manifest.json"
 
 
 def _boot_extension_allowed(path: Path) -> bool:
@@ -320,6 +377,8 @@ def build_status_payload(
         "shaderPackUrl": _discover_shader_pack_url(effective_shaders),
         "reflectionManifestUrl": _discover_reflection_manifest_url(effective_shaders),
         "pgimUrl": _discover_pgim_url(boot_root),
+        "programManifestUrl": _discover_program_manifest_url(boot_root),
+        "gameBase": "/game/" if (game_root is not None and game_root.is_dir()) else None,
     }
 
 
