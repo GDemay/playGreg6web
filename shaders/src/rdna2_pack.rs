@@ -25,8 +25,8 @@ use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
 use crate::pack::{PackEntry, PackError, write_json_string, write_pack};
 use crate::rdna2_to_wgsl::{
-    Rdna2StageOverride, Rdna2TranslateOptions, WgslBindingInfo, translate_rdna2_to_wgsl,
-    write_wgsl_bindings_json,
+    Rdna2StageOverride, Rdna2TranslateOptions, WgslBindingInfo, WgslVertexInputInfo,
+    translate_rdna2_to_wgsl, write_wgsl_bindings_json, write_wgsl_vertex_inputs_json,
 };
 
 /// File extensions recognized as raw RDNA2 shader blobs (ASCII case-insensitive).
@@ -129,7 +129,9 @@ pub struct Rdna2PackEntrySummary {
     pub translated_op_count: usize,
     pub unsupported_op_count: usize,
     pub wgsl_byte_len: usize,
+    pub vertex_input_mode: String,
     pub bindings: Vec<WgslBindingInfo>,
+    pub vertex_inputs: Vec<WgslVertexInputInfo>,
 }
 
 /// Strictly sanitized record of an individual shader that failed packing (zero host paths,
@@ -215,6 +217,14 @@ impl Rdna2PackSummary {
                 let _ = writeln!(out, "      \"wgsl_byte_len\": {},", entry.wgsl_byte_len);
                 out.push_str("      \"bindings\": ");
                 write_wgsl_bindings_json(&mut out, &entry.bindings, "      ");
+                out.push_str(",\n");
+                out.push_str("      \"binding_summary\": {\"vertex_input_mode\": ");
+                write_json_string(&mut out, &entry.vertex_input_mode);
+                out.push_str("}");
+                if !entry.vertex_inputs.is_empty() {
+                    out.push_str(",\n      \"vertex_inputs\": ");
+                    write_wgsl_vertex_inputs_json(&mut out, &entry.vertex_inputs, "      ");
+                }
                 out.push('\n');
                 if i + 1 < self.entries.len() {
                     out.push_str("    },\n");
@@ -1188,7 +1198,9 @@ fn pack_blobs_into_map(
                     translated_op_count: output.translated_op_count,
                     unsupported_op_count: output.unsupported_op_count,
                     wgsl_byte_len,
+                    vertex_input_mode: output.binding_summary.vertex_input_mode,
                     bindings: output.bindings,
+                    vertex_inputs: output.vertex_inputs,
                 },
             ),
         );
@@ -1660,7 +1672,9 @@ fn pack_manifest_into_map(
                     translated_op_count: output.translated_op_count,
                     unsupported_op_count: output.unsupported_op_count,
                     wgsl_byte_len,
+                    vertex_input_mode: output.binding_summary.vertex_input_mode,
                     bindings: output.bindings,
+                    vertex_inputs: output.vertex_inputs,
                 },
             ),
         );
@@ -2093,7 +2107,9 @@ mod tests {
         assert!(summary_json.contains("\"entries\": ["), "JSON:\n{summary_json}");
         assert!(summary_json.contains("\"entry_point\": \"fs_main\""), "JSON:\n{summary_json}");
         assert!(
-            summary_json.contains("{\"group\": 0, \"binding\": 1, \"kind\": \"texture_2d\", \"name\": \"tex0\"}"),
+            summary_json.contains(
+                "{\"group\": 0, \"binding\": 1, \"kind\": \"texture_2d\", \"name\": \"tex0\", \"view_dimension\": \"2d\"}"
+            ),
             "JSON:\n{summary_json}"
         );
 

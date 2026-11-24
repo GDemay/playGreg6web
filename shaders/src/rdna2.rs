@@ -1190,6 +1190,7 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x36E => ("v_lshl_or_b32".to_string(), 3, false),
         0x36F => ("v_and_or_b32".to_string(), 3, false),
         0x370 => ("v_or3_b32".to_string(), 3, false),
+        0x371 => ("v_and_or_b32".to_string(), 3, false),
         other => (format!("vop3_op_{other:#05x}"), 3, false),
     }
 }
