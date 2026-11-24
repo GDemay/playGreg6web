@@ -108,6 +108,7 @@ const GPU_SHADER_STAGE_ALL_MASK = 0x7;
 const MAX_TELEMETRY_WARNINGS = 32;
 const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
 const HOOK_ORIG_FLUSH_PRESENT = '__playgta6RsOrigFlushPresent';
 const HOOK_ORIG_CREATE_COMPUTE_PIPELINE = '__playgta6RsOrigCreateComputePipeline';
@@ -647,6 +648,10 @@ function getShaderSourceText(shaderEntry) {
     return shaderEntry.module.code;
   }
   return null;
+}
+
+function wgslDeclaresGroup0(code) {
+  return typeof code === 'string' && code.length > 0 && WGSL_GROUP0_RE.test(code);
 }
 
 // Resolves the WebGPU shader stage entry point: defaults to vs_main/fs_main/cs_main per
@@ -1303,6 +1308,13 @@ class RenderStatePackets {
     this.computePipelineMeta.delete(id);
     this.textureViews.delete(id);
     this.textureMeta.delete(id);
+    if (
+      this.processor &&
+      this.processor._pipelineMeta &&
+      typeof this.processor._pipelineMeta.delete === 'function'
+    ) {
+      this.processor._pipelineMeta.delete(id);
+    }
   }
 
   _queue(run) {
@@ -1395,7 +1407,12 @@ class RenderStatePackets {
     const flags = view.getUint32(offset + 8, true);
     const contentId = view.getBigUint64(offset + 16, true);
     let layout;
-    let meta = { groupCount: count, isSingleGroup0: false, sequentialGroup0: false };
+    let meta = {
+      groupCount: count,
+      isSingleGroup0: false,
+      sequentialGroup0: false,
+      group0HasEntries: false,
+    };
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       layout = this.resolveManifestLayout && this.resolveManifestLayout('pipelineLayout', contentId);
       if (!layout) {
@@ -1426,6 +1443,11 @@ class RenderStatePackets {
         groupCount: count,
         isSingleGroup0: count === 1 && group0Record !== null,
         sequentialGroup0: Boolean(count === 1 && group0Record && group0Record.sequentialBindings),
+        group0HasEntries: Boolean(
+          group0Record &&
+            (group0Record.entries === null ||
+              (Array.isArray(group0Record.entries) && group0Record.entries.length > 0))
+        ),
       };
     }
     this.pipelineLayouts.set(id, layout);
@@ -1520,16 +1542,77 @@ class RenderStatePackets {
   _createRenderPipeline(view, offset) {
     const descriptor = this.buildRenderPipelineDescriptor(view, offset);
     if (!descriptor) return false;
+    const id = view.getUint32(offset, true);
+    const vsId = view.getUint32(offset + 4, true);
+    const fsId = view.getUint32(offset + 8, true);
+    const layoutId = view.getUint32(offset + 12, true);
     let pipeline;
     try {
       pipeline = this.device.createRenderPipeline(descriptor);
     } catch (err) {
-      this._packetError = `render pipeline ${view.getUint32(offset, true)}: ${String(
+      this._packetError = `render pipeline ${id}: ${String(
         err && err.message ? err.message : err
       )}`;
       return false;
     }
-    this.processor.pipelines.set(view.getUint32(offset, true), pipeline);
+    this.processor.pipelines.set(id, pipeline);
+    if (this.processor._pipelineMeta && typeof this.processor._pipelineMeta.set === 'function') {
+      const vs = this.processor.shaderModules.get(vsId) || null;
+      const fs = fsId !== 0 ? this.processor.shaderModules.get(fsId) || null : null;
+      const isFallback = Boolean(
+        (vs && vs.source === 'builtin') || (fs && fs.source === 'builtin')
+      );
+      const usesFallbackShader = Boolean(
+        (vs && (vs.source === 'builtin' || vs.source === 'fallback')) ||
+          (fs && (fs.source === 'builtin' || fs.source === 'fallback'))
+      );
+      const isRealPack = Boolean(
+        vs && vs.source === 'pack' && (fsId === 0 || (fs && fs.source === 'pack'))
+      );
+      let expectsGroup0 = Boolean(
+        wgslDeclaresGroup0(getShaderSourceText(vs)) || wgslDeclaresGroup0(getShaderSourceText(fs))
+      );
+      if (!expectsGroup0 && layoutId !== 0) {
+        const layoutMeta = this.pipelineLayoutMeta.get(layoutId);
+        if (layoutMeta && layoutMeta.group0HasEntries) {
+          expectsGroup0 = true;
+        }
+      }
+      const effectiveFallbackProfile =
+        vs && vs.fallbackProfile && vs.fallbackProfile !== 'default'
+          ? vs.fallbackProfile
+          : fs && fs.fallbackProfile && fs.fallbackProfile !== 'default'
+            ? fs.fallbackProfile
+            : isFallback
+              ? 'default'
+              : null;
+      const firstBuffer =
+        descriptor.vertex && Array.isArray(descriptor.vertex.buffers) && descriptor.vertex.buffers.length > 0
+          ? descriptor.vertex.buffers[0]
+          : null;
+      const vertexStride =
+        firstBuffer && typeof firstBuffer.arrayStride === 'number' ? firstBuffer.arrayStride : 0;
+      const topology =
+        (descriptor.primitive && descriptor.primitive.topology) || 'triangle-list';
+      this.processor._pipelineMeta.set(id, {
+        id,
+        vsShaderId: vsId,
+        fsShaderId: fsId,
+        layoutId,
+        vertexStride,
+        topology,
+        isV2: true,
+        hasReflectedLayout: layoutId !== 0,
+        isRealPack,
+        isFallback,
+        usesFallbackShader,
+        expectsGroup0,
+        fallbackProfile: effectiveFallbackProfile,
+      });
+    }
+    if (typeof this.processor._invalidateSpecializedPipelinesFor === 'function') {
+      this.processor._invalidateSpecializedPipelinesFor(id);
+    }
     return true;
   }
 
