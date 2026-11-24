@@ -29,6 +29,8 @@ const {
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
   forwardGpuWorkerMessage,
+  sanitizeRenderStateStats,
+  getLoaderStatus,
   createHostImports,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
@@ -2368,4 +2370,60 @@ test('W77 createPatchedPthreadEnv and installPthreadHostImportShim overwrite wri
   assert.deepEqual(realLogs, [text, text]);
 
   restore();
+});
+
+test('W101 forwardGpuWorkerMessage surfaces sanitized renderStateStats and getLoaderStatus keeps the latest', () => {
+  const posted = [];
+  const post = (msg) => posted.push(msg);
+
+  // Messages without renderStateStats keep the pre-W101 shape (no renderStateStats key).
+  const plain = forwardGpuWorkerMessage({ type: 'frame-presented', framesPresented: 2 }, post);
+  assert.equal(Object.prototype.hasOwnProperty.call(plain, 'renderStateStats'), false);
+
+  // 1. buildGpuTelemetrySnapshot() shape: top-level renderStateStats.
+  const snap = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: { framesPresented: 3, droppedFrames: 0 },
+      renderStateStats: {
+        computeDispatchCount: 12,
+        computePipelineCount: '4',
+        autoLayoutFallbacks: 2.9,
+        dynamicOffsetRemaps: 7,
+        remappedBindGroupEvictions: -1,
+        hostPath: 'C:\\Users\\secret\\x.bin',
+      },
+    },
+    post
+  );
+  assert.deepEqual(snap.renderStateStats, {
+    computeDispatchCount: 12,
+    computePipelineCount: 4,
+    autoLayoutFallbacks: 2,
+    dynamicOffsetRemaps: 7,
+    remappedBindGroupEvictions: 0,
+  });
+  assert.deepEqual(snap.frameStats, { framesPresented: 3, droppedFrames: 0 });
+  assert.equal(posted.at(-1), snap);
+  assert.deepEqual(getLoaderStatus().renderStateStats, snap.renderStateStats);
+
+  // 2. { id, stats: { renderState } } response shape; missing core keys default to 0.
+  const fromStats = forwardGpuWorkerMessage(
+    { id: 3, stats: { frameCount: 1, renderState: { autoLayoutFallbacks: 5 } } },
+    post
+  );
+  assert.deepEqual(fromStats.renderStateStats, {
+    computeDispatchCount: 0,
+    computePipelineCount: 0,
+    autoLayoutFallbacks: 5,
+  });
+  const status = getLoaderStatus();
+  assert.deepEqual(status.renderStateStats, fromStats.renderStateStats);
+  status.renderStateStats.autoLayoutFallbacks = 99;
+  assert.equal(getLoaderStatus().renderStateStats.autoLayoutFallbacks, 5, 'status returns a copy');
+
+  // Invalid inputs are ignored.
+  assert.equal(sanitizeRenderStateStats(null), null);
+  assert.equal(sanitizeRenderStateStats([1, 2]), null);
+  assert.equal(sanitizeRenderStateStats('x'), null);
 });
