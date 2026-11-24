@@ -463,6 +463,19 @@ void test_query_api() {
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
     }
     {
+        // XGameSave slots 3/4 (InitializeProvider / InitializeProviderAsync): no game-save
+        // provider offline, so both fail; no handle is invented and a null block is invalid.
+        const uint64_t save = fx.query(com::make_guid("704c3f58-e629-4cc2-b197-30511b996fe2"),
+                                       com::make_guid("1bfff3af-f14a-40a3-8e35-9ada906593f9"));
+        const uint64_t provider = fx.alloc(8);
+        CHECK(com::write_guest(provider, uint64_t{0x1234}));
+        CHECK(hr32(fx.vcall(save, 3, {0x10, 0x20, 0, provider})) == com::E_NOTIMPL_HR);
+        CHECK(load64(provider) == 0);
+        const uint64_t block = fx.alloc(0x38);
+        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, block})) == com::E_NOTIMPL_HR);
+        CHECK(hr32(fx.vcall(save, 4, {0x10, 0x20, 0, 0})) == com::E_INVALIDARG_HR);
+    }
+    {
         // {b884675d} slot 3: XSystemGetAnalyticsInfo through the hidden result pointer.
         const Guid analytics = com::make_guid("b884675d-b738-4a9c-815d-9a9a1e0c6c9b");
         const uint64_t api = fx.query(analytics, analytics);
@@ -588,6 +601,22 @@ void test_user_slots() {
     CHECK(cbk::live_async_shadows() == 0);
     CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == 0);  // XUserGetId
     CHECK(load64(out) == playgta6::os::gdk::kOfflineUserXuid);
+    // XUserGetLocalId (s9): stable, non-zero, distinct from the XUID; invalid without an out pointer.
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0);
+    const uint64_t local_id = load64(out);
+    CHECK(local_id != 0 && local_id != playgta6::os::gdk::kOfflineUserXuid);
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == 0 && load64(out) == local_id);
+    CHECK(hr32(fx.vcall(user_api, 9, {user, 0})) == com::E_INVALIDARG_HR);
+    // XUserDuplicateHandle (s3): a second handle to the same local user, closed independently.
+    const uint64_t dup_out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(user_api, 3, {user, dup_out})) == 0);
+    const uint64_t dup = load64(dup_out);
+    CHECK(dup != 0 && dup != user);
+    CHECK(hr32(fx.vcall(user_api, 11, {dup, out})) == 0 && load64(out) == playgta6::os::gdk::kOfflineUserXuid);
+    CHECK(hr32(fx.vcall(user_api, 9, {dup, out})) == 0 && load64(out) == local_id);
+    fx.vcall(user_api, 4, {dup});  // XUserCloseHandle on the duplicate only
+    CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == 0);
+    CHECK(hr32(fx.vcall(user_api, 3, {0x1234, dup_out})) == com::E_INVALIDARG_HR);
     const uint64_t tag = fx.alloc(32);
     CHECK(hr32(fx.vcall(user_ext, 3, {user, 0, 32, tag, out})) == 0);  // XUserGetGamertag
     char text[32] = {};
@@ -602,6 +631,7 @@ void test_user_slots() {
     com::clear_diagnostics();
     CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == com::E_INVALIDARG_HR);
     CHECK(diag_contains("invalid XUserHandle"));
+    CHECK(hr32(fx.vcall(user_api, 9, {user, out})) == com::E_INVALIDARG_HR);  // closed handle
     // Results on a block without an operation.
     const uint64_t other_block = fx.alloc(sizeof(cbk::GuestAsyncBlock));
     CHECK(hr32(fx.vcall(user_api, 8, {other_block, out})) == com::E_INVALIDARG_HR);
