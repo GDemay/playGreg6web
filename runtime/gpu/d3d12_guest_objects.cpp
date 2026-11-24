@@ -121,12 +121,20 @@ DxgiFormatLayout dxgi_format_layout(uint32_t format) {
     else if (format >= 87 && format <= 93) set(4);
     else if (format >= 94 && format <= 99) set(16, 4, 4);
     else if (format == 115) set(2);
+    // Xbox-only formats (public Xbox DXGI extensions): 116 R10G10B10_7E3_A2_FLOAT and 117
+    // R10G10B10_6E4_A2_FLOAT (4 bytes), 118 D16_UNORM_S8_UINT with its plane views 119
+    // R16_UNORM_X8_TYPELESS and 120 X16_TYPELESS_G8_UINT (a 2-byte depth and a 1-byte stencil plane).
+    else if (format == 116 || format == 117) set(4);
+    else if (format >= 118 && format <= 120) set(2, 1, 1, 2);
     return l;
 }
 
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane) {
     const DxgiFormatLayout l = dxgi_format_layout(format);
     if (l.planes == 2) {
+        if (format >= 118 && format <= 120) {
+            return plane == 0 ? 2u : 1u;  // Xbox D16_UNORM_S8_UINT: 16-bit depth, 8-bit stencil
+        }
         return plane == 0 ? 4u : 1u;  // depth (D32 / D24) plane, then the 8-bit stencil plane
     }
     return l.block_bytes;
@@ -1123,7 +1131,12 @@ uint64_t resource_size_estimate(const GuestResourceDesc& d) {
         return d.Width;
     }
     const DxgiFormatLayout l = dxgi_format_layout(d.Format);
-    const uint32_t bytes = l.known ? l.block_bytes : 4u;
+    // Depth-stencil formats are stored as separate planes on this GPU: a 4-byte depth plane and a
+    // 1-byte stencil plane (plane_block_bytes), i.e. 5 bytes per texel in all, not the format's
+    // interleaved element size (8 for D32_S8X24, 4 for D24_S8) once per plane.
+    const uint32_t bytes = !l.known ? 4u
+                           : l.planes == 2 ? plane_block_bytes(d.Format, 0) + plane_block_bytes(d.Format, 1)
+                                           : l.block_bytes;
     const uint32_t mips = d.MipLevels == 0 ? 1u : d.MipLevels;
     const uint32_t layers = d.Dimension == ResourceDimension::Texture3D ? 1u : std::max<uint32_t>(1, d.DepthOrArraySize);
     uint64_t total = 0;
@@ -1133,7 +1146,7 @@ uint64_t resource_size_estimate(const GuestResourceDesc& d) {
         const uint64_t z = d.Dimension == ResourceDimension::Texture3D ? std::max<uint64_t>(1, d.DepthOrArraySize >> m) : 1;
         const uint64_t bw = (w + l.block_width - 1) / std::max<uint32_t>(1, l.block_width);
         const uint64_t bh = (h + l.block_height - 1) / std::max<uint32_t>(1, l.block_height);
-        total += bw * bh * z * bytes * l.planes;
+        total += bw * bh * z * bytes;
     }
     return total * layers * std::max<uint32_t>(1, d.SampleCount);
 }
