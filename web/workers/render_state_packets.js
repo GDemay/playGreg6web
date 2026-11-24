@@ -108,6 +108,9 @@ const EMPTY_FRAGMENT_WGSL = '@fragment fn fs_main() {}\n';
 const GPU_SHADER_STAGE_VERTEX = 0x1;
 const GPU_SHADER_STAGE_ALL_MASK = 0x7;
 const MAX_TELEMETRY_WARNINGS = 32;
+// W101: upper bound on cached layout:'auto' remapped bind groups. Root-constant ring offsets rotate
+// per draw, so the (pipeline, bind group, dynamic offsets) key space is unbounded; evict LRU-first.
+const REMAPPED_BIND_GROUP_CACHE_LIMIT = 2048;
 const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
@@ -852,6 +855,31 @@ function isExplicitLayoutCompatibleWithWgsl(group0Entries, wgslBindings) {
   return true;
 }
 
+// W101: normalize a setBindGroup dynamicOffsets argument (Array / typed array / null) into a plain
+// array of uint32 offsets; anything else yields [].
+function normalizeDynamicOffsets(raw) {
+  if (!raw || !(Array.isArray(raw) || ArrayBuffer.isView(raw))) return [];
+  const out = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    const v = Number(raw[i]);
+    out.push(Number.isFinite(v) && v > 0 ? Math.floor(v) >>> 0 : 0);
+  }
+  return out;
+}
+
+// W101: WebGPU orders setBindGroup dynamicOffsets by ascending layout binding number over the
+// entries with buffer.hasDynamicOffset. Returns Map(binding -> dynamicOffsetIndex).
+function dynamicOffsetIndicesForLayoutEntries(entries) {
+  const indices = new Map();
+  if (!Array.isArray(entries)) return indices;
+  const dynBindings = entries
+    .filter((e) => e && e.buffer && e.buffer.hasDynamicOffset)
+    .map((e) => e.binding)
+    .sort((a, b) => a - b);
+  for (let i = 0; i < dynBindings.length; i += 1) indices.set(dynBindings[i], i);
+  return indices;
+}
+
 function synthLayoutEntryForWgslBinding(b) {
   if (!b) return null;
   if (b.kind === 'uniform') {
@@ -1366,7 +1394,13 @@ class RenderStatePackets {
     this.computePipelineMeta = new Map(); // id -> { id, csId, layoutId, entryPoint, hasComputeAttr, autoLayoutRemap, wgslBindings }
     this.renderPipelineAutoLayoutMeta = new Map(); // id -> { id, layoutId, autoLayoutRemap, wgslBindings }
     this.bindGroupDescriptors = new Map(); // id -> { id, layoutId, resources }
-    this.remappedBindGroups = new Map(); // 'c:<pipeId>:<bgId>' | 'r:<pipeId>:<bgId>' -> GPUBindGroup | null
+    // 'c|r:<pipeId>:<bgId>' (+ '@<dynOffsets>' when root-constant dynamic offsets are non-zero)
+    // -> GPUBindGroup | null. LRU-bounded by remappedBindGroupCacheLimit.
+    this.remappedBindGroups = new Map();
+    this.remappedBindGroupCacheLimit =
+      Number.isInteger(options.remappedBindGroupCacheLimit) && options.remappedBindGroupCacheLimit > 0
+        ? options.remappedBindGroupCacheLimit
+        : REMAPPED_BIND_GROUP_CACHE_LIMIT;
     this._lastBuiltRenderPipelineAutoLayout = null;
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
@@ -1388,6 +1422,9 @@ class RenderStatePackets {
       bcFormatFallbacks: 0,
       usageStrips: 0,
       unfilterableFloatFallbacks: 0,
+      dynamicOffsetRemaps: 0,
+      dynamicOffsetClamps: 0,
+      remappedBindGroupEvictions: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -1430,6 +1467,9 @@ class RenderStatePackets {
       bcFormatFallbacks: this.telemetry.bcFormatFallbacks,
       usageStrips: this.telemetry.usageStrips,
       unfilterableFloatFallbacks: this.telemetry.unfilterableFloatFallbacks,
+      dynamicOffsetRemaps: this.telemetry.dynamicOffsetRemaps,
+      dynamicOffsetClamps: this.telemetry.dynamicOffsetClamps,
+      remappedBindGroupEvictions: this.telemetry.remappedBindGroupEvictions,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -1564,11 +1604,26 @@ class RenderStatePackets {
   }
 
   _invalidateRemappedBindGroupsForBindGroup(bindGroupId) {
-    const suffix = `:${bindGroupId}`;
+    const target = String(bindGroupId);
     for (const key of Array.from(this.remappedBindGroups.keys())) {
-      if (key.endsWith(suffix)) {
+      // Key shape: '<c|r>:<pipeId>:<bgId>[@<dynOffsets>]'.
+      const at = key.indexOf('@');
+      const base = at >= 0 ? key.slice(0, at) : key;
+      if (base.slice(base.lastIndexOf(':') + 1) === target) {
         this.remappedBindGroups.delete(key);
       }
+    }
+  }
+
+  // LRU insert: re-inserting moves the key to the most-recently-used end; the oldest entries are
+  // evicted once the cache exceeds remappedBindGroupCacheLimit.
+  _cacheRemappedBindGroup(cacheKey, bindGroup) {
+    if (this.remappedBindGroups.has(cacheKey)) this.remappedBindGroups.delete(cacheKey);
+    this.remappedBindGroups.set(cacheKey, bindGroup);
+    while (this.remappedBindGroups.size > this.remappedBindGroupCacheLimit) {
+      const oldest = this.remappedBindGroups.keys().next().value;
+      this.remappedBindGroups.delete(oldest);
+      this.telemetry.remappedBindGroupEvictions += 1;
     }
   }
 
@@ -1668,7 +1723,12 @@ class RenderStatePackets {
       }
       if (contentKey) this.layoutsByContent.set(contentKey, layout);
     }
-    this.bindGroupLayouts.set(id, { layout, entries, sequentialBindings });
+    this.bindGroupLayouts.set(id, {
+      layout,
+      entries,
+      sequentialBindings,
+      dynamicOffsetIndices: dynamicOffsetIndicesForLayoutEntries(entries),
+    });
     return true;
   }
 
@@ -2086,7 +2146,18 @@ class RenderStatePackets {
     return { id: bindGroupId, layoutId: v1Meta.layoutId || 0, resources };
   }
 
-  _getOrCreateRemappedBindGroup(isCompute, pipelineId, pipeline, wgslBindings, bindGroupId, bindGroupDesc) {
+  // `dynamicOffsets` are the setBindGroup(0, ..., dynamicOffsets) values (root-constant ring
+  // offsets). layout:'auto' bind group layouts never have hasDynamicOffset, so each offset is folded
+  // into the static offset of the buffer entry whose dynamicOffsetIndex it belongs to.
+  _getOrCreateRemappedBindGroup(
+    isCompute,
+    pipelineId,
+    pipeline,
+    wgslBindings,
+    bindGroupId,
+    bindGroupDesc,
+    dynamicOffsets
+  ) {
     if (!pipeline || typeof pipeline.getBindGroupLayout !== 'function') {
       return { status: 'unsupported', bindGroup: null };
     }
@@ -2094,13 +2165,41 @@ class RenderStatePackets {
       return { status: 'empty', bindGroup: null };
     }
 
+    const available =
+      bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
+    const dynOffsets = normalizeDynamicOffsets(dynamicOffsets);
+    const dynOffsetFor = (r) =>
+      r &&
+      r.hasDynamicOffset &&
+      Number.isInteger(r.dynamicOffsetIndex) &&
+      r.dynamicOffsetIndex >= 0 &&
+      r.dynamicOffsetIndex < dynOffsets.length
+        ? dynOffsets[r.dynamicOffsetIndex]
+        : 0;
+    // Only offsets that land on a real dynamic-offset buffer entry split the cache; all-zero
+    // offsets share the plain '<c|r>:<pipeId>:<bgId>' key.
+    let dynKey = '';
+    if (dynOffsets.some((v) => v > 0)) {
+      const parts = [];
+      let anyNonZero = false;
+      for (let i = 0; i < available.length; i += 1) {
+        const r = available[i];
+        if (!r || !r.hasDynamicOffset || r.isDummy) continue;
+        const v = dynOffsetFor(r);
+        if (v > 0) anyNonZero = true;
+        parts.push(`${r.binding}=${v}`);
+      }
+      if (anyNonZero) dynKey = parts.join(',');
+    }
+
     const effectiveBgId = bindGroupId || 0;
     const isLiveDesc =
       effectiveBgId === 0 ||
       (bindGroupDesc && this.bindGroupDescriptors.get(effectiveBgId) === bindGroupDesc);
-    const cacheKey = `${isCompute ? 'c' : 'r'}:${pipelineId}:${effectiveBgId}`;
+    const cacheKey = `${isCompute ? 'c' : 'r'}:${pipelineId}:${effectiveBgId}${dynKey ? `@${dynKey}` : ''}`;
     if (isLiveDesc && this.remappedBindGroups.has(cacheKey)) {
       const cached = this.remappedBindGroups.get(cacheKey);
+      this._cacheRemappedBindGroup(cacheKey, cached);
       return cached ? { status: 'ok', bindGroup: cached } : { status: 'empty', bindGroup: null };
     }
 
@@ -2108,17 +2207,54 @@ class RenderStatePackets {
     try {
       autoBgl = pipeline.getBindGroupLayout(0);
     } catch (_) {
-      if (isLiveDesc) this.remappedBindGroups.set(cacheKey, null);
+      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null);
       return { status: 'empty', bindGroup: null };
     }
     if (!autoBgl) {
-      if (isLiveDesc) this.remappedBindGroups.set(cacheKey, null);
+      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null);
       return { status: 'empty', bindGroup: null };
     }
 
-    const available =
-      bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
     const usedIndices = new Set();
+
+    // Folds r's dynamic offset into a static { buffer, offset, size } binding, clamped so that
+    // offset + size never exceeds the GPUBuffer size; an out-of-bounds offset binds a dummy.
+    const bufferResourceWithDynamicOffset = (r, b) => {
+      const dyn = dynOffsetFor(r);
+      if (dyn <= 0) return r.resource;
+      const base = r.resource;
+      const effectiveOffset = (Number(base.offset) || 0) + dyn;
+      const bufferSize =
+        typeof r.bufferSize === 'number' && Number.isFinite(r.bufferSize) && r.bufferSize > 0
+          ? r.bufferSize
+          : base.buffer && typeof base.buffer.size === 'number' && base.buffer.size > 0
+            ? base.buffer.size
+            : null;
+      let size = typeof base.size === 'number' && base.size > 0 ? base.size : null;
+      if (bufferSize !== null) {
+        if (effectiveOffset >= bufferSize) {
+          this.telemetry.dynamicOffsetClamps += 1;
+          this._recordTelemetryWarningOnce(
+            `remap-dyn-offset-oob:${effectiveBgId}:${r.binding}`,
+            `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} dynamic offset ${dyn} exceeds buffer size ${bufferSize}; using dummy buffer`
+          );
+          return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+        }
+        const remaining = bufferSize - effectiveOffset;
+        if (size !== null && size > remaining) {
+          size = remaining;
+          this.telemetry.dynamicOffsetClamps += 1;
+          this._recordTelemetryWarningOnce(
+            `remap-dyn-offset-clamp:${effectiveBgId}:${r.binding}`,
+            `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} size clamped to ${remaining} at dynamic offset ${dyn}`
+          );
+        }
+      }
+      this.telemetry.dynamicOffsetRemaps += 1;
+      const out = { buffer: base.buffer, offset: effectiveOffset };
+      if (size !== null) out.size = size;
+      return out;
+    };
 
     const isBufferBindingResource = (res) =>
       Boolean(res && typeof res === 'object' && 'buffer' in res && res.buffer);
@@ -2155,7 +2291,7 @@ class RenderStatePackets {
               continue;
             }
             usedIndices.add(i);
-            return r.resource;
+            return bufferResourceWithDynamicOffset(r, b);
           }
           if (b.kind === 'read-only-storage' || b.kind === 'storage') {
             if (!isBufferBindingResource(r.resource)) continue;
@@ -2176,7 +2312,7 @@ class RenderStatePackets {
               continue;
             }
             usedIndices.add(i);
-            return r.resource;
+            return bufferResourceWithDynamicOffset(r, b);
           }
           if (pass > 0) continue;
           if (b.kind === 'texture') {
@@ -2271,7 +2407,7 @@ class RenderStatePackets {
     }
 
     if (isLiveDesc) {
-      this.remappedBindGroups.set(cacheKey, remapped);
+      this._cacheRemappedBindGroup(cacheKey, remapped);
     }
     return remapped ? { status: 'ok', bindGroup: remapped } : { status: 'empty', bindGroup: null };
   }
@@ -2393,24 +2529,32 @@ class RenderStatePackets {
         let groupIndex;
         let bindGroupId;
         let bindGroupDesc;
+        let dynamicOffsets;
         if (cmd._rsSetBindGroup) {
           groupIndex = cmd._rsSetBindGroup.groupIndex;
           bindGroupId = cmd._rsSetBindGroup.bindGroupId;
           bindGroupDesc =
             cmd._rsSetBindGroup.bindGroupDesc || this._resolveBindGroupDescriptor(bindGroupId);
+          dynamicOffsets = normalizeDynamicOffsets(
+            cmd._rsSetBindGroup.offsets || cmd._rsSetBindGroup.dynamicOffsets
+          );
         } else if (isSetBgV1) {
           groupIndex = cmd.groupIndex;
           bindGroupId = cmd.bindGroupId;
           bindGroupDesc = this._resolveBindGroupDescriptor(bindGroupId);
+          dynamicOffsets = normalizeDynamicOffsets(cmd.dynamicOffsets || cmd.offsets);
         } else {
           groupIndex = cmd._wgpuMeta.groupIndex;
           bindGroupId = cmd._wgpuMeta.bindGroupId;
           bindGroupDesc = this._resolveBindGroupDescriptor(bindGroupId);
+          dynamicOffsets = normalizeDynamicOffsets(
+            cmd._wgpuMeta.dynamicOffsets || cmd._wgpuMeta.offsets
+          );
         }
 
         if (groupIndex === 0) {
           if (activePassMode === 'compute') {
-            lastComputeGroup0 = { bindGroupId, bindGroupDesc };
+            lastComputeGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
             if (activeComputePipelineValid && activeComputeAutoLayout) {
               const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
               const res = this._getOrCreateRemappedBindGroup(
@@ -2419,7 +2563,8 @@ class RenderStatePackets {
                 pipeline,
                 activeComputeAutoLayout.wgslBindings,
                 bindGroupId,
-                bindGroupDesc
+                bindGroupDesc,
+                dynamicOffsets
               );
               group0BoundForCompute = true;
               if (res.status === 'ok') {
@@ -2433,7 +2578,7 @@ class RenderStatePackets {
               }
             }
           } else if (activePassMode === 'render') {
-            lastRenderGroup0 = { bindGroupId, bindGroupDesc };
+            lastRenderGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
             if (activeRenderAutoLayout) {
               const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
               const res = this._getOrCreateRemappedBindGroup(
@@ -2442,7 +2587,8 @@ class RenderStatePackets {
                 pipeline,
                 activeRenderAutoLayout.wgslBindings,
                 bindGroupId,
-                bindGroupDesc
+                bindGroupDesc,
+                dynamicOffsets
               );
               group0BoundForRender = true;
               if (res.status === 'ok') {
@@ -2457,8 +2603,8 @@ class RenderStatePackets {
               }
             }
           } else {
-            lastRenderGroup0 = { bindGroupId, bindGroupDesc };
-            lastComputeGroup0 = { bindGroupId, bindGroupDesc };
+            lastRenderGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
+            lastComputeGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
           }
         }
         filtered.push(cmd);
@@ -2475,14 +2621,15 @@ class RenderStatePackets {
         lastComputeGroup0 = null;
         if (activeRenderAutoLayout && !group0BoundForRender) {
           const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
-          const src = lastRenderGroup0 || { bindGroupId: 0, bindGroupDesc: null };
+          const src = lastRenderGroup0 || { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: [] };
           const res = this._getOrCreateRemappedBindGroup(
             false,
             activeRenderPipelineId,
             pipeline,
             activeRenderAutoLayout.wgslBindings,
             src.bindGroupId,
-            src.bindGroupDesc
+            src.bindGroupDesc,
+            src.dynamicOffsets
           );
           group0BoundForRender = true;
           if (res.status === 'ok') {
@@ -2532,14 +2679,15 @@ class RenderStatePackets {
         }
         if (activeComputeAutoLayout && !group0BoundForCompute) {
           const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
-          const src = lastComputeGroup0 || { bindGroupId: 0, bindGroupDesc: null };
+          const src = lastComputeGroup0 || { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: [] };
           const res = this._getOrCreateRemappedBindGroup(
             true,
             activeComputePipelineId,
             pipeline,
             activeComputeAutoLayout.wgslBindings,
             src.bindGroupId,
-            src.bindGroupDesc
+            src.bindGroupDesc,
+            src.dynamicOffsets
           );
           group0BoundForCompute = true;
           if (res.status === 'ok') {
@@ -2947,6 +3095,7 @@ class RenderStatePackets {
       let entryResource = null;
       let entryUsedDummy = false;
       let bufferUsage = null;
+      let bufferSizeKnown = null;
       let textureUsage = null;
       let textureFormat = null;
       let textureViewDimension = null;
@@ -2977,6 +3126,7 @@ class RenderStatePackets {
             typeof buffer.size === 'number' && Number.isFinite(buffer.size) && buffer.size > 0
               ? buffer.size
               : null;
+          bufferSizeKnown = bufferSize;
           const bufLayoutType = layoutExpectsBuffer ? layoutEntry.buffer.type || 'uniform' : null;
           const requiredBufferUsage =
             bufLayoutType === 'uniform'
@@ -3212,6 +3362,19 @@ class RenderStatePackets {
         if (textureViewDimension !== null && !descIsDummy) descEntry.viewDimension = textureViewDimension;
         if (textureMultisampled !== null && !descIsDummy) descEntry.multisampled = textureMultisampled;
         if (samplerComparison !== null) descEntry.comparison = samplerComparison;
+        if (type === BIND_RESOURCE_TYPE.BUFFER && !descIsDummy) {
+          if (bufferSizeKnown !== null) descEntry.bufferSize = bufferSizeKnown;
+          // W101: remember which setBindGroup dynamicOffsets slot (root-constant ring offset)
+          // applies to this buffer so layout:'auto' remapping can fold it into the static offset.
+          const dynIndex =
+            record.dynamicOffsetIndices && layoutExpectsBuffer
+              ? record.dynamicOffsetIndices.get(binding)
+              : undefined;
+          if (dynIndex !== undefined) {
+            descEntry.hasDynamicOffset = true;
+            descEntry.dynamicOffsetIndex = dynIndex;
+          }
+        }
         descriptorResources.push(descEntry);
       }
     }

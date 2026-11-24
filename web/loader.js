@@ -83,6 +83,22 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
 ]);
 const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
 const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;
+// W101: render_state_packets.js counters surfaced from wgpu_worker.js `renderStateStats` (W99).
+// The first three are always present (0 default); the rest are forwarded only when reported.
+const RENDER_STATE_STATS_CORE_KEYS = Object.freeze([
+  'computeDispatchCount',
+  'computePipelineCount',
+  'autoLayoutFallbacks',
+]);
+const RENDER_STATE_STATS_OPTIONAL_KEYS = Object.freeze([
+  'skippedComputeDispatchCount',
+  'clampedComputeDispatchCount',
+  'rootSigGroup0Layouts',
+  'dynamicOffsetRemaps',
+  'dynamicOffsetClamps',
+  'remappedBindGroupEvictions',
+]);
+let lastRenderStateStats = null;
 const GPU_TELEMETRY_MESSAGE_TYPES = new Set([
   'gpu-stats',
   'gpu-telemetry',
@@ -546,6 +562,23 @@ function sanitizeFallbackStats(raw) {
   };
 }
 
+// Returns a numeric-only copy of a renderStateStats object, or null when absent/invalid.
+function sanitizeRenderStateStats(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const out = {};
+  for (const key of RENDER_STATE_STATS_CORE_KEYS) {
+    out[key] = toNonNegativeInt(raw[key], 0);
+  }
+  for (const key of RENDER_STATE_STATS_OPTIONAL_KEYS) {
+    if (raw[key] !== undefined && raw[key] !== null) {
+      out[key] = toNonNegativeInt(raw[key], 0);
+    }
+  }
+  return out;
+}
+
 function sanitizeFrameStats(eventData) {
   const rawFrameStats =
     eventData.frameStats && typeof eventData.frameStats === 'object' ? eventData.frameStats : null;
@@ -824,6 +857,15 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     missingShaders: sanitizeMissingShadersList(rawMissing),
     timestamp,
   };
+  const renderStateStats = sanitizeRenderStateStats(
+    eventData.renderStateStats ||
+      (rawStats && (rawStats.renderStateStats || rawStats.renderState)) ||
+      null
+  );
+  if (renderStateStats) {
+    telemetry.renderStateStats = renderStateStats;
+    lastRenderStateStats = renderStateStats;
+  }
 
   if (typeof postMessageFn === 'function') {
     try {
@@ -3354,6 +3396,7 @@ function getLoaderStatus() {
       : null,
     sideModules,
     firstPresentEmitted: coordinatorFirstPresentEmitted,
+    renderStateStats: lastRenderStateStats ? Object.assign({}, lastRenderStateStats) : null,
   };
 }
 
@@ -3687,6 +3730,7 @@ const exportedApi = {
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
   forwardGpuWorkerMessage,
+  sanitizeRenderStateStats,
   createHostImports,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
