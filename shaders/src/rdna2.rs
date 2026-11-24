@@ -421,6 +421,10 @@ pub struct Rdna2BranchRef {
 pub struct Rdna2ProgramSummary {
     pub fnv1a_hash: u64,
     pub byte_len: usize,
+    /// Byte offset of the first decoded instruction (`0x24` when the 36-byte Xbox Series
+    /// microcode preamble was detected and skipped, otherwise `0`). The hash always covers
+    /// the full blob including the preamble.
+    pub code_start_offset: usize,
     pub trailing_bytes: usize,
     pub instruction_count: usize,
     pub truncated_instructions: usize,
@@ -2645,13 +2649,49 @@ fn decode_ds(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     }
 }
 
+/// Size in bytes of the Xbox Series (Scarlett / RDNA2) shader microcode preamble.
+pub const XBOX_SHADER_PREAMBLE_LEN: usize = 0x24;
+
+/// Fixed trailing dwords of the Xbox Series shader preamble at byte offsets `0x18..0x24`.
+const XBOX_SHADER_PREAMBLE_TAIL: [u32; 3] = [0xd580_0000, 0x03fe_0100, 0x0000_0ac0];
+
+/// `s_inst_prefetch 0x3`: the first real instruction following the Xbox preamble.
+const XBOX_SHADER_ENTRY_INST: u32 = 0xbfa0_0003;
+
+/// Byte offset at which the machine code of `bytes` starts.
+///
+/// Native Xbox Series shader blobs begin with a 36-byte header (`0x00..0x24`) whose last
+/// three dwords are always `[0xd5800000, 0x03fe0100, 0x00000ac0]`, followed by the real
+/// entry point `s_inst_prefetch 0x3` (`0xbfa00003`) at `0x24`. Decoding that header as
+/// instructions would emit a bogus `v_cndmask_b32 v0, 64, v5, vcc` (clobbering the vertex
+/// index and fabricating a `v5` vertex input), so it is skipped when the exact signature
+/// matches. Returns `0` for every other input (bare synthetic programs are unchanged).
+pub fn rdna2_code_start_offset(bytes: &[u8]) -> usize {
+    if bytes.len() < XBOX_SHADER_PREAMBLE_LEN + 4 {
+        return 0;
+    }
+    let tail_matches = XBOX_SHADER_PREAMBLE_TAIL
+        .iter()
+        .enumerate()
+        .all(|(i, &word)| read_u32_le(bytes, 0x18 + i * 4) == Some(word));
+    if tail_matches && read_u32_le(bytes, XBOX_SHADER_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
+    {
+        XBOX_SHADER_PREAMBLE_LEN
+    } else {
+        0
+    }
+}
+
 /// Decode all RDNA2 instructions in `bytes` up to `max_instructions` (or the entire buffer).
+///
+/// Decoding starts at [`rdna2_code_start_offset`] (skipping the Xbox Series preamble when
+/// present); instruction offsets stay absolute within `bytes`.
 pub fn decode_program_limited(
     bytes: &[u8],
     max_instructions: Option<usize>,
 ) -> Vec<Rdna2Instruction> {
     let mut out = Vec::new();
-    let mut offset = 0usize;
+    let mut offset = rdna2_code_start_offset(bytes);
     let limit = max_instructions.unwrap_or(usize::MAX);
 
     while out.len() < limit {
@@ -3148,6 +3188,7 @@ pub fn analyze_instructions(
     Rdna2ProgramSummary {
         fnv1a_hash: fnv1a_64(bytes),
         byte_len: bytes.len(),
+        code_start_offset: rdna2_code_start_offset(bytes),
         trailing_bytes: bytes.len() % 4,
         instruction_count: instructions.len(),
         truncated_instructions,
@@ -3196,6 +3237,13 @@ pub fn format_disasm_with_summary(
         "; bytes:        {} (trailing: {})",
         summary.byte_len, summary.trailing_bytes
     );
+    if summary.code_start_offset != 0 {
+        let _ = writeln!(
+            out,
+            "; code start:   {:#06x} (xbox preamble skipped)",
+            summary.code_start_offset
+        );
+    }
     let _ = writeln!(
         out,
         "; instructions: {} (endpgm: {}, truncated: {}, unknown: {})",
@@ -3297,6 +3345,7 @@ fn to_json_inner(
     out.push_str(",\n");
     let _ = writeln!(out, "  \"byte_len\": {},", summary.byte_len);
     let _ = writeln!(out, "  \"trailing_bytes\": {},", summary.trailing_bytes);
+    let _ = writeln!(out, "  \"code_start_offset\": {},", summary.code_start_offset);
     let _ = writeln!(out, "  \"instruction_count\": {},", summary.instruction_count);
     let _ = writeln!(
         out,
@@ -4193,5 +4242,89 @@ mod tests {
         img_only.push(enc_sopp(0x01, 0));
         let img_summary = analyze_program(&words_to_bytes(&img_only));
         assert_eq!(img_summary.inferred_stage, Rdna2InferredStage::Compute);
+    }
+
+    /// Synthetic Xbox Series preamble: 6 arbitrary header dwords + the fixed 3-dword tail.
+    fn xbox_preamble_words() -> Vec<u32> {
+        vec![
+            0x0000_0001,
+            0x0000_0024,
+            0x1234_5678,
+            0x0000_0000,
+            0xCAFE_F00D,
+            0x0000_0100,
+            0xd580_0000,
+            0x03fe_0100,
+            0x0000_0ac0,
+        ]
+    }
+
+    #[test]
+    fn detects_and_skips_xbox_preamble_but_hashes_full_blob() {
+        let mut words = xbox_preamble_words();
+        words.push(0xbfa0_0003); // s_inst_prefetch 0x3 (real entry point)
+        words.push(0xBF81_0000); // s_endpgm
+        let bytes = words_to_bytes(&words);
+
+        assert_eq!(rdna2_code_start_offset(&bytes), XBOX_SHADER_PREAMBLE_LEN);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].offset, 0x24);
+        assert_eq!(insts[0].mnemonic, "s_inst_prefetch");
+        assert_eq!(insts[1].offset, 0x28);
+        assert_eq!(insts[1].mnemonic, "s_endpgm");
+        assert!(insts.iter().all(|i| i.mnemonic != "v_cndmask_b32"));
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.fnv1a_hash, fnv1a_64(&bytes));
+        assert_ne!(
+            summary.fnv1a_hash,
+            fnv1a_64(&bytes[XBOX_SHADER_PREAMBLE_LEN..])
+        );
+        assert_eq!(summary.byte_len, bytes.len());
+        assert_eq!(summary.code_start_offset, 0x24);
+        assert_eq!(summary.unknown_instructions, 0);
+        assert_eq!(
+            summary.max_vgpr, None,
+            "preamble must not fabricate v0/v5 usage"
+        );
+        assert!(format_disasm(&bytes, None).contains("; code start:   0x0024"));
+        assert!(summary.to_json().contains("\"code_start_offset\": 36,"));
+    }
+
+    #[test]
+    fn near_miss_preambles_and_bare_programs_decode_from_offset_zero() {
+        let mut good = xbox_preamble_words();
+        good.push(0xbfa0_0003);
+        good.push(0xBF81_0000);
+
+        // Each tail dword or the entry instruction differing disables the skip.
+        for idx in [6usize, 7, 8, 9] {
+            let mut words = good.clone();
+            words[idx] ^= 0x1;
+            let bytes = words_to_bytes(&words);
+            assert_eq!(rdna2_code_start_offset(&bytes), 0, "dword {idx} mutated");
+            let insts = decode_program(&bytes);
+            assert_eq!(insts[0].offset, 0);
+            assert_eq!(analyze_program(&bytes).code_start_offset, 0);
+        }
+
+        // Exactly the 36-byte header plus a partial entry word is too short (< 40 bytes).
+        let full = words_to_bytes(&good);
+        assert_eq!(rdna2_code_start_offset(&full[..39]), 0);
+        assert_eq!(rdna2_code_start_offset(&full[..40]), 0x24);
+
+        // Bare synthetic program without a preamble is unchanged.
+        let bare = words_to_bytes(&[0xbfa0_0003, 0xBF81_0000]);
+        assert_eq!(rdna2_code_start_offset(&bare), 0);
+        let insts = decode_program(&bare);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].offset, 0);
+        assert!(!format_disasm(&bare, None).contains("code start"));
+        assert!(
+            analyze_program(&bare)
+                .to_json()
+                .contains("\"code_start_offset\": 0,")
+        );
     }
 }
