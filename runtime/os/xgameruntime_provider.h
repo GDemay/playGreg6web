@@ -51,6 +51,12 @@ struct ApiRequest {
 // XGameGetXboxTitleId result (default 0: the title id is not known to the runtime yet).
 void set_xbox_title_id(uint32_t title_id);
 
+// The emulated console's Xbox Live sandbox (console environment configuration, like the console
+// mode): what XSystemGetXboxLiveSandboxId reports. Empty (the default) = no sandbox: E_NOTIMPL,
+// an empty string and used = 0. A retail console reports "RETAIL". At most 15 characters.
+void set_xbox_live_sandbox_id(const std::string& sandbox_id);
+std::string xbox_live_sandbox_id();
+
 // Every distinct QueryApiImpl request so far (known and unknown), sorted by GUID.
 std::vector<ApiRequest> api_requests();
 

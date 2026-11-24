@@ -22,6 +22,7 @@
 #include "os/win32_kernel.h"
 #include "os/win32_compat.h"
 #include "os/win32_sync.h"
+#include "os/xgameruntime_provider.h"
 
 // Boot sequence tests: a synthetic PGIM image (PE headers with a TLS directory, IAT, TLS template)
 // and hand-written guest-convention functions standing in for lifted code. Like lifted code they
@@ -1049,6 +1050,12 @@ void test_observability() {
     os::win32::registry_clear();
     boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.console_mode = 0; });
     CHECK(console_mode() == -1);
+
+    // The emulated console's sandbox reaches the xgameruntime provider (default: retail).
+    boot_scenario(Scenario::LastError);
+    CHECK(os::gdk::provider::xbox_live_sandbox_id() == "RETAIL");
+    boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.sandbox_id.clear(); });
+    CHECK(os::gdk::provider::xbox_live_sandbox_id().empty());
 }
 
 // host_callable_calls counts calls to named host callables in first-call order; com_stub_hits

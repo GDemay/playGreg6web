@@ -485,12 +485,25 @@ void test_query_api() {
     CHECK(com::read_guest(buffer, id, sizeof(id)));
     CHECK(std::strlen(id) == 38);
     CHECK(hr32(fx.vcall(system, 3, {8, buffer, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
-    // XSystemGetXboxLiveSandboxId (s4): offline, no sandbox: E_NOTIMPL, empty string, used 0.
+    // XSystemGetXboxLiveSandboxId (s4), no sandbox configured: E_NOTIMPL, empty string, used 0.
     CHECK(com::write_guest(used, uint64_t{77}));
     CHECK(hr32(fx.vcall(system, 4, {0x20, buffer, used})) == com::E_NOTIMPL_HR);
     CHECK(load64(used) == 0);
     char sandbox = 'x';
     CHECK(com::read_guest(buffer, &sandbox, 1) && sandbox == '\0');
+    // A configured sandbox (a retail console: "RETAIL"): terminated string, used = length + 1;
+    // a buffer that is too small fails with the size needed.
+    prov::set_xbox_live_sandbox_id("RETAIL");
+    CHECK(hr32(fx.vcall(system, 4, {0x20, buffer, used})) == 0);
+    CHECK(load64(used) == 7);
+    char text[8] = {};
+    CHECK(com::read_guest(buffer, text, sizeof(text)));
+    CHECK(std::strcmp(text, "RETAIL") == 0);
+    CHECK(hr32(fx.vcall(system, 4, {6, buffer, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+    CHECK(load64(used) == 7);
+    CHECK(hr32(fx.vcall(system, 4, {0x20, 0, used})) == com::E_INVALIDARG_HR);
+    prov::set_xbox_live_sandbox_id("");
+    CHECK(hr32(fx.vcall(system, 4, {0x20, buffer, used})) == com::E_NOTIMPL_HR);
 }
 
 void test_task_queue_slots() {
