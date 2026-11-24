@@ -32,7 +32,39 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
   'reflectionManifestUrl',
   'pgimUrl',
   'bootBase',
+  'gameBase',
+  'programManifestUrl',
 ]);
+const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
+const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;
+const GPU_TELEMETRY_MESSAGE_TYPES = new Set([
+  'gpu-stats',
+  'gpu-telemetry',
+  'missing-shaders',
+  'frame-presented',
+]);
+const GPU_SHADER_STAGE_NAMES = Object.freeze({
+  1: 'vertex',
+  2: 'fragment',
+  3: 'compute',
+});
+const GPU_SHADER_STAGE_ALIASES = Object.freeze({
+  vertex: 'vertex',
+  vs: 'vertex',
+  vert: 'vertex',
+  1: 'vertex',
+  fragment: 'fragment',
+  fs: 'fragment',
+  frag: 'fragment',
+  pixel: 'fragment',
+  ps: 'fragment',
+  2: 'fragment',
+  compute: 'compute',
+  cs: 'compute',
+  comp: 'compute',
+  3: 'compute',
+});
+const U64_MAX = 0xffffffffffffffffn;
 
 let gpuWorker = null;
 let ioWorker = null;
@@ -197,21 +229,44 @@ function basenameOfPath(posixPath) {
 
 function isDataPinnedHttpfsPath(cleanPath) {
   const base = basenameOfPath(cleanPath).toLowerCase();
-  if (base === 'data-manifest.json') {
+  if (base === 'data-manifest.json' || base === 'bootset.json') {
     return true;
   }
   return /\.rpf$/i.test(cleanPath);
 }
 
+function isManifestPinnedHttpfsPath(cleanPath) {
+  const base = basenameOfPath(cleanPath).toLowerCase();
+  return base === 'data-manifest.json' || base === 'bootset.json';
+}
+
+function isExplicitBootHttpfsPath(cleanPath) {
+  const lower = cleanPath.toLowerCase();
+  return lower === 'boot' || lower.startsWith('boot/');
+}
+
 function isBootRoutedHttpfsPath(cleanPath) {
   const lower = cleanPath.toLowerCase();
-  if (lower === 'boot' || lower.startsWith('boot/')) {
+  if (isExplicitBootHttpfsPath(cleanPath)) {
     return true;
   }
   if (basenameOfPath(lower) === 'program-manifest.json') {
     return true;
   }
   return /\.pgim$/i.test(lower);
+}
+
+function isGamePrefixedHttpfsPath(cleanPath) {
+  const lower = cleanPath.toLowerCase();
+  return lower === 'game' || lower.startsWith('game/');
+}
+
+function isGamePackageHttpfsPath(cleanPath) {
+  const base = basenameOfPath(cleanPath).toLowerCase();
+  if (base === 'microsoftgame.config') {
+    return true;
+  }
+  return GAME_PACKAGE_HTTPFS_EXT_RE.test(cleanPath);
 }
 
 function stripBootPrefix(cleanPath) {
@@ -225,6 +280,17 @@ function stripBootPrefix(cleanPath) {
   return cleanPath;
 }
 
+function stripGamePrefix(cleanPath) {
+  const lower = cleanPath.toLowerCase();
+  if (lower === 'game') {
+    return '';
+  }
+  if (lower.startsWith('game/')) {
+    return cleanPath.slice('game/'.length);
+  }
+  return cleanPath;
+}
+
 function joinHttpfsBase(base, rel) {
   const prefix = ensureTrailingSlash(base) || '/data/';
   const tail = String(rel || '').replace(/^\/+/, '');
@@ -233,17 +299,374 @@ function joinHttpfsBase(base, rel) {
 
 /**
  * Route guest HTTPFS paths: `boot/...`, `program-manifest.json`, and `*.pgim` go to
- * `bootBase` when configured. `data-manifest.json` and `*.rpf` stay on `dataBase`.
+ * `bootBase` when configured; Xbox game package/drive paths (`G:\...`, `game/...`,
+ * `*.rpf`, `*.dll`, `MicrosoftGame.Config`, etc.) go to `gameBase` when configured;
+ * `data-manifest.json`, `bootset.json`, and fallback paths resolve on `dataBase`.
  */
 function normalizeBootHttpfsPath(relPath, options = {}) {
-  const clean = sanitizeHttpfsRelPath(relPath);
-  const dataBase = options && options.dataBase !== undefined ? options.dataBase : '/data/';
-  const bootBase = options && typeof options.bootBase === 'string' ? options.bootBase : '';
+  if (typeof relPath !== 'string' || relPath.length === 0) {
+    throw new Error('HTTPFS path must be a non-empty string');
+  }
+  if (relPath.includes('\0')) {
+    throw new Error(`Invalid HTTPFS path: ${relPath}`);
+  }
 
+  const dataBase = options && options.dataBase !== undefined ? options.dataBase : '/data/';
+  const bootBase =
+    options && typeof options.bootBase === 'string' ? options.bootBase.trim() : '';
+  const gameBase =
+    options && typeof options.gameBase === 'string' ? options.gameBase.trim() : '';
+
+  let hadDrivePrefix = false;
+  let pathToSanitize = relPath;
+  if (gameBase) {
+    const driveMatch = WIN32_DRIVE_PATH_RE.exec(relPath);
+    if (driveMatch) {
+      hadDrivePrefix = true;
+      pathToSanitize = driveMatch[2].replace(/\\/g, '/');
+    }
+  }
+
+  const clean = sanitizeHttpfsRelPath(pathToSanitize);
+
+  if (isManifestPinnedHttpfsPath(clean)) {
+    return joinHttpfsBase(dataBase, clean);
+  }
+  if (bootBase && isExplicitBootHttpfsPath(clean) && !isDataPinnedHttpfsPath(clean)) {
+    return joinHttpfsBase(bootBase, stripBootPrefix(clean));
+  }
+  if (gameBase && !hadDrivePrefix && isGamePrefixedHttpfsPath(clean)) {
+    return joinHttpfsBase(gameBase, stripGamePrefix(clean));
+  }
   if (bootBase && isBootRoutedHttpfsPath(clean) && !isDataPinnedHttpfsPath(clean)) {
     return joinHttpfsBase(bootBase, stripBootPrefix(clean));
   }
+  if (gameBase && (hadDrivePrefix || isGamePackageHttpfsPath(clean))) {
+    return joinHttpfsBase(gameBase, clean);
+  }
   return joinHttpfsBase(dataBase, clean);
+}
+
+function toNonNegativeInt(value, fallback = 0) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function toNonNegativeFinite(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return n;
+}
+
+function clampPct(value) {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (n >= 100) return 100;
+  return n;
+}
+
+function normalizeShaderHashHex(raw) {
+  if (typeof raw === 'bigint') {
+    if (raw < 0n || raw > U64_MAX) return null;
+    return `0x${raw.toString(16).padStart(16, '0')}`;
+  }
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw) || raw < 0) return null;
+    return `0x${BigInt(raw).toString(16).padStart(16, '0')}`;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    const hex =
+      trimmed.startsWith('0x') || trimmed.startsWith('0X') ? trimmed.slice(2) : trimmed;
+    if (!/^[0-9a-fA-F]{1,16}$/.test(hex)) {
+      return null;
+    }
+    return `0x${BigInt(`0x${hex}`).toString(16).padStart(16, '0')}`;
+  }
+  return null;
+}
+
+function normalizeShaderStageName(stage) {
+  if (typeof stage === 'number') {
+    return GPU_SHADER_STAGE_NAMES[stage] || 'unknown';
+  }
+  if (typeof stage === 'string') {
+    const key = stage.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(GPU_SHADER_STAGE_ALIASES, key)) {
+      return GPU_SHADER_STAGE_ALIASES[key];
+    }
+  }
+  return 'unknown';
+}
+
+function sanitizeMissingShadersList(rawList) {
+  if (!rawList || typeof rawList === 'string') {
+    return [];
+  }
+  let items;
+  if (Array.isArray(rawList)) {
+    items = rawList;
+  } else if (typeof rawList[Symbol.iterator] === 'function') {
+    try {
+      items = Array.from(rawList);
+    } catch {
+      return [];
+    }
+  } else {
+    return [];
+  }
+
+  const out = [];
+  for (let i = 0; i < items.length; i += 1) {
+    const entry = items[i];
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const rawHash =
+      entry.hash !== undefined
+        ? entry.hash
+        : entry.shaderHash !== undefined
+          ? entry.shaderHash
+          : entry.hashHex;
+    const hash = normalizeShaderHashHex(rawHash);
+    if (hash === null) {
+      continue;
+    }
+    const stage = normalizeShaderStageName(entry.stage);
+    const rawHits =
+      entry.hits !== undefined
+        ? entry.hits
+        : entry.hitCount !== undefined
+          ? entry.hitCount
+          : entry.drawCount !== undefined
+            ? entry.drawCount
+            : entry.count;
+    const hits = rawHits === undefined || rawHits === null ? 1 : toNonNegativeInt(rawHits, 0);
+    const sanitized = { hash, stage, hits };
+    const firstSeenMs = toNonNegativeFinite(entry.firstSeenMs);
+    const lastSeenMs = toNonNegativeFinite(entry.lastSeenMs);
+    if (firstSeenMs !== null) {
+      sanitized.firstSeenMs = firstSeenMs;
+    }
+    if (lastSeenMs !== null) {
+      sanitized.lastSeenMs = lastSeenMs;
+    }
+    out.push(sanitized);
+  }
+  return out;
+}
+
+function sanitizeFallbackStats(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const packHits = toNonNegativeInt(raw.packHits, 0);
+  const fallbackHits = toNonNegativeInt(raw.fallbackHits, 0);
+  const builtinHits = toNonNegativeInt(raw.builtinHits, 0);
+  const sumHits = packHits + fallbackHits + builtinHits;
+  const totalLookups =
+    raw.totalLookups !== undefined && raw.totalLookups !== null
+      ? toNonNegativeInt(raw.totalLookups, sumHits)
+      : sumHits;
+  const overflowMissingCount = toNonNegativeInt(raw.overflowMissingCount, 0);
+  let hitRatePct;
+  if (
+    raw.hitRatePct !== undefined &&
+    raw.hitRatePct !== null &&
+    Number.isFinite(Number(raw.hitRatePct))
+  ) {
+    hitRatePct = Math.round(clampPct(Number(raw.hitRatePct)) * 100) / 100;
+  } else {
+    hitRatePct = totalLookups > 0 ? Math.round((packHits / totalLookups) * 10000) / 100 : 0;
+  }
+  return {
+    totalLookups,
+    packHits,
+    fallbackHits,
+    builtinHits,
+    hitRatePct,
+    overflowMissingCount,
+  };
+}
+
+function sanitizeFrameStats(eventData) {
+  const rawFrameStats =
+    eventData.frameStats && typeof eventData.frameStats === 'object' ? eventData.frameStats : null;
+  const rawStats =
+    eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+
+  const hasFrameField =
+    Boolean(rawFrameStats) ||
+    Boolean(rawStats) ||
+    typeof eventData.framesPresented === 'number' ||
+    typeof eventData.droppedFrames === 'number' ||
+    typeof eventData.frame === 'number' ||
+    typeof eventData.frameCount === 'number' ||
+    eventData.type === 'frame-presented' ||
+    eventData.type === 'gpu-stats';
+
+  if (!hasFrameField) {
+    return null;
+  }
+
+  const rawPresented =
+    rawFrameStats && rawFrameStats.framesPresented !== undefined
+      ? rawFrameStats.framesPresented
+      : rawFrameStats && rawFrameStats.frameCount !== undefined
+        ? rawFrameStats.frameCount
+        : eventData.framesPresented !== undefined
+          ? eventData.framesPresented
+          : rawStats && rawStats.framesPresented !== undefined
+            ? rawStats.framesPresented
+            : rawStats && rawStats.frameCount !== undefined
+              ? rawStats.frameCount
+              : eventData.frameCount !== undefined
+                ? eventData.frameCount
+                : eventData.frame;
+
+  const rawDropped =
+    rawFrameStats && rawFrameStats.droppedFrames !== undefined
+      ? rawFrameStats.droppedFrames
+      : eventData.droppedFrames !== undefined
+        ? eventData.droppedFrames
+        : rawStats && rawStats.droppedFrames !== undefined
+          ? rawStats.droppedFrames
+          : 0;
+
+  const frameStats = {
+    framesPresented: toNonNegativeInt(rawPresented, 0),
+    droppedFrames: toNonNegativeInt(rawDropped, 0),
+  };
+
+  const drawCallsSrc =
+    rawFrameStats && rawFrameStats.drawCalls !== undefined
+      ? rawFrameStats.drawCalls
+      : rawStats && rawStats.drawCalls !== undefined
+        ? rawStats.drawCalls
+        : eventData.drawCalls;
+  if (drawCallsSrc !== undefined && drawCallsSrc !== null) {
+    frameStats.drawCalls = toNonNegativeInt(drawCallsSrc, 0);
+  }
+
+  const computeSrc =
+    rawFrameStats && rawFrameStats.computeDispatches !== undefined
+      ? rawFrameStats.computeDispatches
+      : rawStats && rawStats.computeDispatches !== undefined
+        ? rawStats.computeDispatches
+        : eventData.computeDispatches;
+  if (computeSrc !== undefined && computeSrc !== null) {
+    frameStats.computeDispatches = toNonNegativeInt(computeSrc, 0);
+  }
+
+  const packetSrc =
+    rawFrameStats && rawFrameStats.packetCount !== undefined
+      ? rawFrameStats.packetCount
+      : rawStats && rawStats.packetCount !== undefined
+        ? rawStats.packetCount
+        : eventData.packetCount;
+  if (packetSrc !== undefined && packetSrc !== null) {
+    frameStats.packetCount = toNonNegativeInt(packetSrc, 0);
+  }
+
+  const vramSrc =
+    rawFrameStats && rawFrameStats.vramBytes !== undefined
+      ? rawFrameStats.vramBytes
+      : rawStats && rawStats.vramBytes !== undefined
+        ? rawStats.vramBytes
+        : eventData.vramBytes;
+  if (vramSrc !== undefined && vramSrc !== null) {
+    frameStats.vramBytes = toNonNegativeInt(vramSrc, 0);
+  }
+
+  return frameStats;
+}
+
+function isGpuTelemetryMessage(eventData) {
+  if (!eventData || typeof eventData !== 'object' || Array.isArray(eventData)) {
+    return false;
+  }
+  if (typeof eventData.type === 'string' && GPU_TELEMETRY_MESSAGE_TYPES.has(eventData.type)) {
+    return true;
+  }
+  if (Array.isArray(eventData.missingShaders)) {
+    return true;
+  }
+  if (
+    (eventData.shaderFallback && typeof eventData.shaderFallback === 'object') ||
+    (eventData.shaderFallbackStats && typeof eventData.shaderFallbackStats === 'object') ||
+    (eventData.fallbackStats && typeof eventData.fallbackStats === 'object') ||
+    (eventData.frameStats && typeof eventData.frameStats === 'object') ||
+    (eventData.stats && typeof eventData.stats === 'object')
+  ) {
+    return true;
+  }
+  if (
+    (typeof eventData.framesPresented === 'number' && Number.isFinite(eventData.framesPresented)) ||
+    (typeof eventData.frame === 'number' && Number.isFinite(eventData.frame))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Inspect a message emitted by `wgpu_worker.js`, sanitize/normalize GPU frame,
+ * shader-fallback, and missing-shader telemetry, and forward `{ type: 'gpu-telemetry', ... }`
+ * to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
+ */
+function forwardGpuWorkerMessage(eventData, postMessageFn) {
+  if (!isGpuTelemetryMessage(eventData)) {
+    return null;
+  }
+
+  const rawStats =
+    eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+  const rawFallback =
+    eventData.fallbackStats ||
+    eventData.shaderFallbackStats ||
+    eventData.shaderFallback ||
+    (rawStats && (rawStats.shaderFallback || rawStats.fallbackStats || rawStats.shaderFallbackStats)) ||
+    null;
+  const rawMissing =
+    eventData.missingShaders !== undefined
+      ? eventData.missingShaders
+      : rawStats && rawStats.missingShaders !== undefined
+        ? rawStats.missingShaders
+        : null;
+
+  const timestamp =
+    typeof eventData.timestamp === 'number' && Number.isFinite(eventData.timestamp)
+      ? eventData.timestamp
+      : Date.now();
+
+  const telemetry = {
+    type: 'gpu-telemetry',
+    frameStats: sanitizeFrameStats(eventData),
+    fallbackStats: sanitizeFallbackStats(rawFallback),
+    missingShaders: sanitizeMissingShadersList(rawMissing),
+    timestamp,
+  };
+
+  if (typeof postMessageFn === 'function') {
+    try {
+      postMessageFn(telemetry);
+    } catch {
+      // Telemetry forwarding must never disrupt the GPU worker loop.
+    }
+  }
+
+  return telemetry;
 }
 
 function collectBootBridgeInitFields(src) {
@@ -578,8 +1001,31 @@ async function tryBootWasmRuntime() {
 }
 
 if (typeof self !== 'undefined') {
+  const postToMain =
+    typeof self.postMessage === 'function' ? (payload) => self.postMessage(payload) : null;
+
   self.onmessage = (ev) => {
     const msg = ev.data || {};
+    if (msg.type === 'request-gpu-telemetry') {
+      if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
+        const statsReq = { stats: true };
+        if (msg.id !== undefined) {
+          statsReq.id = msg.id;
+        }
+        gpuWorker.postMessage(statsReq);
+        if (msg.includeMissingShaders !== false) {
+          const missingReq = { missingShaders: true };
+          if (msg.id !== undefined) {
+            missingReq.id = msg.id;
+          }
+          if (msg.limit !== undefined) {
+            missingReq.limit = msg.limit;
+          }
+          gpuWorker.postMessage(missingReq);
+        }
+      }
+      return;
+    }
     if (msg.resize && gpuWorker) {
       gpuWorker.postMessage({ resize: true, width: msg.width, height: msg.height });
       return;
@@ -617,9 +1063,18 @@ if (typeof self !== 'undefined') {
       else if (e.data.error && progress) progress.postMessage({ error: `io_worker: ${e.data.error}` });
     };
     gpuWorker.onmessage = (e) => {
-      if (e.data.ready) onWorkerReady('wgpu_worker', e.data.adapter);
-      else if (e.data.frame) report(`WebGPU frame #${e.data.frame} presented`);
-      else if (e.data.error && progress) progress.postMessage({ error: `wgpu_worker: ${e.data.error}` });
+      const data = e && e.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.ready) {
+        onWorkerReady('wgpu_worker', data.adapter);
+        return;
+      }
+      if (data.frame) {
+        report(`WebGPU frame #${data.frame} presented`);
+      } else if (data.error && progress) {
+        progress.postMessage({ error: `wgpu_worker: ${data.error}` });
+      }
+      forwardGpuWorkerMessage(data, postToMain);
     };
     audioWorker.onmessage = (e) => {
       if (e.data.ready) onWorkerReady('audio_worker');
@@ -643,6 +1098,7 @@ const exportedApi = {
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
+  forwardGpuWorkerMessage,
   createHostImports,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
