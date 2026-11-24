@@ -206,8 +206,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Encapsulate `wgpu_worker` helper modules in UMD IIFEs so classic worker `importScripts` never hits duplicate top-level `const` collisions (such as `TEXTURE_FORMAT_NAMES`).
 - [x] **G32 — Identify the Pipeline Records Behind Xbox Device Slot 57 and Bind Their Graphics Pipelines in the D3D12 Guest Layer (`runtime/gpu/d3d12_xs*`)** — `DONE` (PRs #412 + #413, closes #391) *(driven by the native boot's frame capture; repo tests synthetic)*
   - Work out what the fixed-size, non-DXIL pipeline records passed to device slot 57 are, create the right pipeline kind from them so the title's draws reach the command stream, and report what the shader track needs.
-- [ ] **G37 — Graphics Pipelines Arrive as Console-Native Code: Recover Translatable Shaders and D3D12 State for Slot-57 Pipelines** — `IN PROGRESS` (#419, @Timon-ok) *(follow-up to G32: graphics stages are GPU machine code, compute arrives as DXIL; repo tests synthetic)*
+- [x] **G37 — Graphics Pipelines Arrive as Console-Native Code: Recover Translatable Shaders and D3D12 State for Slot-57 Pipelines** — `DONE` (PRs #435, #456, #473, #474, #478, closes #419) *(follow-up to G32: graphics stages are GPU machine code, compute arrives as DXIL; repo tests synthetic)*
   - Establish the route that makes the title's graphics pipelines renderable (a DXIL path in the title, or a join from native stages to archive DXIL plus state recovered from the register image) and build the guest-layer side of it.
+- [ ] **G47 — First Real Pixels: Resolve the Per-Frame Pass's Shaders by Stage Identity, Emit Its Draw, and Replay the Native Capture Through the WebGPU Path** — `IN PROGRESS` (#483, @Timon-ok) *(follow-up to G37; uses the shader track's tools unmodified; repo tests synthetic)*
+  - Connect the pipeline dump, a shader pack keyed by stage identity, draw emission with rect-list expansion, a payload capture and the capture replayer into one rendered frame of the title's per-frame pass.
 
 ---
 
