@@ -748,3 +748,51 @@ test('W104 telemetry deviceStats exposes replay counters with zero defaults', ()
   assert.equal(after.deviceStats.replayedResourceCount, 10);
   assert.equal(after.deviceStats.replayedBufferWriteCount, 1);
 });
+
+test('W105 replayRecordedResourcesAsync replays in chunks without giant stream copy and draws cleanly', async () => {
+  const first = createMockDevice('first');
+  const processor = newProcessor(first.device);
+  processor.executeCommandBuffer(sceneSetupPackets());
+
+  const second = createMockDevice('second');
+  processor.beginDeviceRecovery();
+  processor.rebindDevice(second.device, createMockContext());
+  installRenderStatePackets(processor);
+  const summary = await processor.replayRecordedResourcesAsync({ chunkSize: 3 });
+  processor.endDeviceRecovery(true);
+
+  assert.equal(summary.aborted, false);
+  assert.equal(summary.replayedResources, 10);
+  assert.equal(summary.replayedBufferWrites, 1);
+  assert.equal(summary.failedResources, 0);
+
+  processor.executeCommandBuffer(drawFramePackets(2));
+  assert.equal(processor.validationErrorCount, 0, JSON.stringify(processor.getValidationErrors()));
+  assert.equal(second.passCalls.filter((c) => c.op === 'draw').length, 1);
+});
+
+test('W105 replayMaxBindGroups evicts oldest transient bind groups while keeping persistent resources', () => {
+  const first = createMockDevice('first');
+  const processor = newProcessor(first.device, { replayMaxBindGroups: 2 });
+  const bglEntry = { binding: 0, visibility: 0x3, type: 0, subtype: 0 };
+  const bgEntry = { binding: 0, type: 0, id: 10, offset: 0, size: 64 };
+  processor.executeCommandBuffer(
+    concat(
+      createBufferPacket(10, 0x48, 64),
+      bindGroupLayoutPacket(100, [bglEntry]),
+      bindGroup2Packet(5001, 100, [bgEntry]),
+      bindGroup2Packet(5002, 100, [bgEntry]),
+      bindGroup2Packet(5003, 100, [bgEntry])
+    )
+  );
+
+  const stats = processor.getResourceReplayStats();
+  assert.equal(stats.replayBindGroupEvictions, 1);
+
+  const second = createMockDevice('second');
+  recoverOnto(processor, second.device);
+  assert.equal(processor.buffers.has(10), true);
+  assert.equal(processor.bindGroups.has(5001), false);
+  assert.equal(processor.bindGroups.has(5002), true);
+  assert.equal(processor.bindGroups.has(5003), true);
+});
