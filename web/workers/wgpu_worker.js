@@ -1243,6 +1243,8 @@ const REPLAY_SHADOW_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 const REPLAY_SHADOW_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
 const REPLAY_LOG_MAX_ENTRIES = 65536;
 const REPLAY_LOG_MAX_BYTES = 128 * 1024 * 1024;
+const REPLAY_LOG_MAX_BIND_GROUPS = 512;
+const REPLAY_ASYNC_CHUNK_SIZE = 24;
 const REPLAY_PHASE_COUNT = 5;
 
 // opcode -> [resource kind, replay phase (1 = leaf resources ... 5 = bind groups)]
@@ -1505,7 +1507,13 @@ class WgpuCommandProcessor {
       REPLAY_LOG_MAX_ENTRIES
     );
     this._replayLogMaxBytes = resolvePositiveIntOption(options.replayLogMaxBytes, REPLAY_LOG_MAX_BYTES);
+    this._replayLogMaxBindGroups = resolvePositiveIntOption(
+      options.replayMaxBindGroups,
+      REPLAY_LOG_MAX_BIND_GROUPS
+    );
+    this._replayBindGroupKeys = new Set(); // insertion-ordered 'bindGroup:<id>' keys for LRU cap
     this._replayLogOverflowCount = 0;
+    this._replayBindGroupEvictions = 0;
     this._shadowBuffers = new Map(); // bufferId -> { data: Uint8Array, dirtyEnd } (LRU order)
     this._shadowBufferBytes = 0;
     this._shadowBufferMaxBytes = resolvePositiveIntOption(
@@ -3653,10 +3661,25 @@ class WgpuCommandProcessor {
     if (previous) {
       this._replayLog.delete(key);
       this._replayLogBytes -= previous.payload.byteLength;
+      if (kind === 'bindGroup') {
+        this._replayBindGroupKeys.delete(key);
+      }
     }
     if (kind === 'buffer') {
       // A re-created buffer starts zero-filled; its old contents must not be replayed.
       this._dropShadowBuffer(id);
+    }
+    if (kind === 'bindGroup') {
+      while (this._replayBindGroupKeys.size >= this._replayLogMaxBindGroups) {
+        const oldestKey = this._replayBindGroupKeys.values().next().value;
+        this._replayBindGroupKeys.delete(oldestKey);
+        const evicted = this._replayLog.get(oldestKey);
+        if (evicted) {
+          this._replayLog.delete(oldestKey);
+          this._replayLogBytes -= evicted.payload.byteLength;
+          this._replayBindGroupEvictions += 1;
+        }
+      }
     }
     if (
       this._replayLog.size >= this._replayLogMaxEntries ||
@@ -3668,6 +3691,9 @@ class WgpuCommandProcessor {
     const payload = new Uint8Array(view.buffer, view.byteOffset + payloadOffset, payloadBytes).slice();
     this._replayLog.set(key, { kind, id, opcode, phase, payload });
     this._replayLogBytes += payloadBytes;
+    if (kind === 'bindGroup') {
+      this._replayBindGroupKeys.add(key);
+    }
   }
 
   /**
@@ -3698,6 +3724,9 @@ class WgpuCommandProcessor {
       if (entry) {
         this._replayLog.delete(key);
         this._replayLogBytes -= entry.payload.byteLength;
+        if (entry.kind === 'bindGroup') {
+          this._replayBindGroupKeys.delete(key);
+        }
       }
     }
     this._dropShadowBuffer(id);
@@ -3780,6 +3809,23 @@ class WgpuCommandProcessor {
    *
    * @returns {{ replayedResources: number, failedResources: number, replayedBufferWrites: number }}
    */
+  _collectOrderedReplayEntries() {
+    const phases = [];
+    for (let p = 0; p < REPLAY_PHASE_COUNT; p += 1) {
+      phases.push([]);
+    }
+    for (const entry of this._replayLog.values()) {
+      phases[entry.phase - 1].push(entry);
+    }
+    const ordered = [];
+    for (let p = 0; p < phases.length; p += 1) {
+      for (const entry of phases[p]) {
+        ordered.push(entry);
+      }
+    }
+    return ordered;
+  }
+
   replayRecordedResources() {
     const summary = { replayedResources: 0, failedResources: 0, replayedBufferWrites: 0 };
     if (
@@ -3791,50 +3837,21 @@ class WgpuCommandProcessor {
       return summary;
     }
 
-    const phases = [];
-    for (let p = 0; p < REPLAY_PHASE_COUNT; p += 1) {
-      phases.push([]);
-    }
-    let streamBytes = 0;
-    for (const entry of this._replayLog.values()) {
-      phases[entry.phase - 1].push(entry);
-      streamBytes += 8 + entry.payload.byteLength;
-    }
-
-    // One contiguous replay stream lets the v1 shader fallback profile scan see the pipelines and
-    // bind groups that reference each shader module, exactly as in the original command buffers.
-    const stream = new Uint8Array(streamBytes);
-    const streamView = new DataView(stream.buffer);
-    const ordered = [];
-    let cursor = 0;
-    for (let p = 0; p < phases.length; p += 1) {
-      for (const entry of phases[p]) {
-        streamView.setUint16(cursor, entry.opcode, true);
-        streamView.setUint32(cursor + 4, entry.payload.byteLength, true);
-        stream.set(entry.payload, cursor + 8);
-        ordered.push({ entry, payloadOffset: cursor + 8 });
-        cursor += 8 + entry.payload.byteLength;
-      }
-    }
-
+    const ordered = this._collectOrderedReplayEntries();
     const prevPendingHints = this._pendingCommandStreamShaderProfiles;
     const prevPassCommands = this._passCommands;
     this._replayingResources = true;
     try {
-      try {
-        this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(streamView);
-      } catch (_) {
-        this._pendingCommandStreamShaderProfiles = null;
-      }
+      this._pendingCommandStreamShaderProfiles = null;
       this._passCommands = [];
       let shadowWritesDone = false;
       for (let i = 0; i < ordered.length; i += 1) {
-        const { entry, payloadOffset } = ordered[i];
+        const entry = ordered[i];
         if (!shadowWritesDone && entry.phase > 1) {
           summary.replayedBufferWrites += this._replayShadowBufferWrites();
           shadowWritesDone = true;
         }
-        if (this._replayOnePacket(entry, streamView, payloadOffset)) {
+        if (this._replayOneEntry(entry)) {
           summary.replayedResources += 1;
         } else {
           summary.failedResources += 1;
@@ -3861,13 +3878,92 @@ class WgpuCommandProcessor {
     return summary;
   }
 
-  _replayOnePacket(entry, view, payloadOffset) {
+  /**
+   * W105: chunked async resource replay for live device recovery. Yields between small batches
+   * so Chrome's GPU IPC drains cleanly without stalling the worker or re-triggering TDR.
+   */
+  async replayRecordedResourcesAsync(opts = {}) {
+    const summary = { replayedResources: 0, failedResources: 0, replayedBufferWrites: 0, aborted: false };
+    if (
+      this._destroyed ||
+      this._replayingResources ||
+      !this.device ||
+      (this._replayLog.size === 0 && this._shadowBuffers.size === 0)
+    ) {
+      return summary;
+    }
+
+    const chunkSize = resolvePositiveIntOption(opts && opts.chunkSize, REPLAY_ASYNC_CHUNK_SIZE);
+    const ordered = this._collectOrderedReplayEntries();
+    const startGen = this._deviceGeneration;
+    const startMs = Date.now();
+    const logMiB = (this._replayLogBytes / (1024 * 1024)).toFixed(1);
+    this._logDiagnostic(
+      'info',
+      `[wgpu_worker] starting GPU resource replay (${ordered.length} entries, ${logMiB} MiB, ${this._shadowBuffers.size} shadow buffers)`
+    );
+
+    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPassCommands = this._passCommands;
+    this._replayingResources = true;
+    try {
+      this._pendingCommandStreamShaderProfiles = null;
+      this._passCommands = [];
+      let shadowWritesDone = false;
+      for (let i = 0; i < ordered.length; i += 1) {
+        if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
+          summary.aborted = true;
+          break;
+        }
+        const entry = ordered[i];
+        if (!shadowWritesDone && entry.phase > 1) {
+          summary.replayedBufferWrites += this._replayShadowBufferWrites();
+          shadowWritesDone = true;
+        }
+        if (this._replayOneEntry(entry)) {
+          summary.replayedResources += 1;
+        } else {
+          summary.failedResources += 1;
+        }
+        if ((i + 1) % chunkSize === 0 && i + 1 < ordered.length) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      if (!shadowWritesDone && !summary.aborted) {
+        summary.replayedBufferWrites += this._replayShadowBufferWrites();
+      }
+    } finally {
+      this._passCommands = prevPassCommands;
+      this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._replayingResources = false;
+    }
+
+    this._replayedResourceCount += summary.replayedResources;
+    this._replayedBufferWriteCount += summary.replayedBufferWrites;
+    this._replayFailedCount += summary.failedResources;
+    this._lastResourceReplay = { ...summary, deviceGeneration: this._deviceGeneration };
+    const elapsedMs = Math.max(0, Date.now() - startMs);
+    this._logDiagnostic(
+      'info',
+      `[wgpu_worker] replayed ${summary.replayedResources} GPU resources and ${summary.replayedBufferWrites} buffer writes in ${elapsedMs}ms after device recovery` +
+        (summary.failedResources > 0 ? ` (${summary.failedResources} failed)` : '') +
+        (summary.aborted ? ' (aborted)' : '')
+    );
+    return summary;
+  }
+
+  _replayOneEntry(entry) {
     if (REPLAY_EXTENSION_OPCODES.has(entry.opcode) && !this.extension) {
       return false;
     }
+    const entryView = new DataView(
+      entry.payload.buffer,
+      entry.payload.byteOffset,
+      entry.payload.byteLength
+    );
     const errorsBefore = this._validationErrorCount;
     try {
-      this._dispatchPacket(entry.opcode, view, payloadOffset, entry.payload.byteLength);
+      this._dispatchPacket(entry.opcode, entryView, 0, entry.payload.byteLength);
     } catch (_) {
       return false;
     }
@@ -3904,6 +4000,7 @@ class WgpuCommandProcessor {
       recordedResourceCount: this._replayLog.size,
       recordedResourceBytes: this._replayLogBytes,
       replayLogOverflowCount: this._replayLogOverflowCount,
+      replayBindGroupEvictions: this._replayBindGroupEvictions,
       shadowBufferCount: this._shadowBuffers.size,
       shadowBufferBytes: this._shadowBufferBytes,
       shadowBufferEvictions: this._shadowBufferEvictions,
@@ -6445,6 +6542,7 @@ class WgpuCommandProcessor {
     this._frameBegunForIndex = -1;
     // W104: drop the replay log and shadow buffer cache.
     this._replayLog.clear();
+    this._replayBindGroupKeys.clear();
     this._replayLogBytes = 0;
     this._shadowBuffers.clear();
     this._shadowBufferBytes = 0;
@@ -7408,9 +7506,18 @@ function createWgpuWorkerHandler(options = {}) {
         alphaMode: 'opaque',
       });
       installPacketExtensions(targetProcessor);
-      // W104: the guest still references its pre-loss resource ids; recreate them on the new
-      // device now that the ABI v2 extensions are bound to it.
-      if (typeof targetProcessor.replayRecordedResources === 'function') {
+      // W104/W105: recreate live pre-loss guest resources on the new device in async chunks so
+      // Chrome's GPU IPC drains cleanly without stalling the worker.
+      if (typeof targetProcessor.replayRecordedResourcesAsync === 'function') {
+        try {
+          await targetProcessor.replayRecordedResourcesAsync();
+        } catch (replayErr) {
+          targetProcessor._logDiagnostic(
+            'warn',
+            `[wgpu_worker] GPU resource replay failed: ${sanitizeGpuErrorDetail(replayErr)}`
+          );
+        }
+      } else if (typeof targetProcessor.replayRecordedResources === 'function') {
         try {
           targetProcessor.replayRecordedResources();
         } catch (replayErr) {
@@ -7532,6 +7639,16 @@ function createWgpuWorkerHandler(options = {}) {
     if (!adapter) {
       postMessage({ error: 'no WebGPU adapter available' });
       return null;
+    }
+    if (adapter.info && typeof adapter.info === 'object') {
+      const desc = [adapter.info.vendor, adapter.info.architecture, adapter.info.description]
+        .filter((s) => typeof s === 'string' && s.length > 0)
+        .join(' / ');
+      const adapterLogger =
+        (options && options.logger) || (typeof console !== 'undefined' ? console : null);
+      if (desc && adapterLogger && typeof adapterLogger.info === 'function') {
+        adapterLogger.info(`[wgpu_worker] WebGPU adapter: ${sanitizeGpuErrorDetail(desc)}`);
+      }
     }
 
     const { device, enabledFeatures } = await requestNegotiatedDevice(adapter);
