@@ -130,6 +130,15 @@ VirtualMemoryArena& default_vmem_arena();
 void set_vmem_arena(VirtualMemoryArena* arena);
 VirtualMemoryArena* get_vmem_arena();
 
+// Live entries of the kernel handle table by kind: dispatcher objects (events, semaphores,
+// mutexes, threads, timers, ...), files, and opaque objects (find handles, registry keys, ...).
+struct KernelHandleCounts {
+    uint64_t dispatcher = 0;
+    uint64_t file = 0;
+    uint64_t opaque = 0;
+};
+KernelHandleCounts live_kernel_handles();
+
 TlsTable& default_tls_table();
 void set_tls_table(TlsTable* table);
 TlsTable* get_tls_table();
