@@ -890,3 +890,59 @@ void __playgta6_rdtscp(playgta6::GuestState* state);
 // not return).
 void __playgta6_xgetbv(playgta6::GuestState* state);
 }  // extern "C"
+
+// Shard-level indirect-call dispatch ABI (docs/wasm_abi.md).
+// Each lifted LLVM IR shard exports a single dispatcher (`Pg6ShardDispatchFn`) that switches on
+// `local_idx` instead of registering every lifted function individually in the Wasm64 function
+// table, shrinking `wasmTable` by ~1,155x for multi-threaded browser execution.
+inline constexpr uint32_t kPg6ShardDispatchVersion = 1u;
+
+using Pg6GuestState = playgta6::GuestState;
+
+extern "C" {
+
+typedef void (*Pg6ShardDispatchFn)(uint32_t local_idx, Pg6GuestState* state);
+
+struct Pg6ShardFunctionEntry {
+    uint64_t guest_va;
+    uint32_t shard_idx;
+    uint32_t local_idx;
+};
+
+struct Pg6ShardDispatchTable {
+    uint32_t version;      // kPg6ShardDispatchVersion
+    uint32_t shard_count;  // number of dispatchers in `shards`
+    uint64_t entry_count;  // number of entries in `entries`
+    const Pg6ShardDispatchFn* shards;
+    const Pg6ShardFunctionEntry* entries;
+};
+
+}  // extern "C"
+
+static_assert(sizeof(Pg6ShardFunctionEntry) == 16,
+              "Pg6ShardFunctionEntry layout must stay 16 bytes");
+static_assert(alignof(Pg6ShardFunctionEntry) == 8,
+              "Pg6ShardFunctionEntry must stay 8-byte aligned");
+static_assert(offsetof(Pg6ShardFunctionEntry, guest_va) == 0,
+              "Pg6ShardFunctionEntry::guest_va offset");
+static_assert(offsetof(Pg6ShardFunctionEntry, shard_idx) == 8,
+              "Pg6ShardFunctionEntry::shard_idx offset");
+static_assert(offsetof(Pg6ShardFunctionEntry, local_idx) == 12,
+              "Pg6ShardFunctionEntry::local_idx offset");
+
+static_assert(sizeof(Pg6ShardDispatchTable) == 16 + 2 * sizeof(void*),
+              "Pg6ShardDispatchTable layout must stay compact");
+static_assert(sizeof(void*) != 8 || sizeof(Pg6ShardDispatchTable) == 32,
+              "Pg6ShardDispatchTable layout must stay 32 bytes on 64-bit targets");
+static_assert(alignof(Pg6ShardDispatchTable) == 8,
+              "Pg6ShardDispatchTable must stay 8-byte aligned");
+static_assert(offsetof(Pg6ShardDispatchTable, version) == 0,
+              "Pg6ShardDispatchTable::version offset");
+static_assert(offsetof(Pg6ShardDispatchTable, shard_count) == 4,
+              "Pg6ShardDispatchTable::shard_count offset");
+static_assert(offsetof(Pg6ShardDispatchTable, entry_count) == 8,
+              "Pg6ShardDispatchTable::entry_count offset");
+static_assert(offsetof(Pg6ShardDispatchTable, shards) == 16,
+              "Pg6ShardDispatchTable::shards offset");
+static_assert(offsetof(Pg6ShardDispatchTable, entries) == 16 + sizeof(void*),
+              "Pg6ShardDispatchTable::entries offset");

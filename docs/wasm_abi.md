@@ -72,6 +72,15 @@ CPU identification helpers take only the state pointer, `(state: ptr) -> ()`. Li
 
 The advertised `cpuid` features must not exceed what the lifter implements.
 
+### Shard-Level Indirect Dispatch (`Pg6ShardDispatchTable`)
+Registering every lifted function individually as a `LiftedFn` function pointer (`Pg6LiftedFunctionEntry`) places one `wasmTable` slot per lifted function in every Emscripten pthread worker. For the full recompiled binary (437,801 functions) across 52+ guest threads (~22.7M `WasmFuncRef` objects), this exhausts Chromium's shared 4 GiB V8 pointer-compression cage.
+
+To eliminate per-function `wasmTable` slots and function-pointer relocations, `runtime/abi/playgta6_abi.h` defines an additive shard-level dispatch ABI (`kPg6ShardDispatchVersion = 1`):
+- Each lifted LLVM IR shard exports one dispatcher function `Pg6ShardDispatchFn`: `void (*)(uint32_t local_idx, Pg6GuestState* state)` (an internal `br_table` switch over that shard's lifted functions). This shrinks `wasmTable` from ~437,801 entries to ~379 shard dispatchers (~1,155x reduction).
+- `Pg6ShardFunctionEntry` (16 bytes, 8-byte aligned) stores pure data with zero function-pointer relocations: `guest_va` (`uint64_t`, offset `0`), `shard_idx` (`uint32_t`, offset `8`), `local_idx` (`uint32_t`, offset `12`).
+- `Pg6ShardDispatchTable` (32 bytes on 64-bit targets, 8-byte aligned): `version` (`uint32_t`, offset `0`), `shard_count` (`uint32_t`, offset `4`), `entry_count` (`uint64_t`, offset `8`), `shards` (`const Pg6ShardDispatchFn*`, offset `16`), `entries` (`const Pg6ShardFunctionEntry*`, offset `24`).
+- `playgta6::guest::ShardDispatchRegistry` (`runtime/guest/shard_dispatch.h`) validates and merges per-module tables (`game.exe`, guest DLLs), remaps each table's local `shard_idx` into a unified dispatcher vector, and serves lock-free O(log N) binary-search `lookup()` / `dispatch()` after registration.
+
 ## Guest Address Space
 Guest virtual addresses (VAs) reach host memory through **one** translation, shared by lifted code, the import bridge (`pg6_guest_seam.h`, `pg6_seam_host_ptr` / `pg6_seam_guest_addr`) and the runtime (`VirtualMemoryArena`, the image loader, guest stacks, heaps):
 
