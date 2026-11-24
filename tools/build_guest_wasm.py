@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -13,11 +13,14 @@ post-link V8-cage GC + throttled pthread `CMD_LOAD` JS optimization, auto-detect
 `Pg6ShardDispatchTable` shard-dispatch support, pure-Python Wasm section telemetry,
 and `guest_manifest.json` emission).
 
-Opt-in browser-proven split (R37e): `--split-strategy asymmetric` packs contiguous
+Opt-in browser-proven split (R37e/R37f): `--split-strategy asymmetric` packs contiguous
 shards so the largest side module stays under V8's 1024 MiB cap (default part-0 ceiling
 994 MiB, reproducing the live ~994/171 MiB two-part shape) and links side modules with
-`-sSIDE_MODULE=2` so unused internal `sub_*` exports are pruned. Existing callers that
-omit the flag keep `-sSIDE_MODULE=1` and the prior balanced/contiguous strategies.
+`-sSIDE_MODULE=2` plus `llvm-nm`-computed cross-module `-Wl,--export=<sym>` response
+files (`side_part_<i>_exports.rsp`) and `-Wl,--export-if-defined=__wasm_call_ctors` so
+unused internal `sub_*` exports are pruned without stripping live cross-part or entry
+functions. Existing callers that omit the flag keep `-sSIDE_MODULE=1` and the prior
+balanced/contiguous strategies.
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -168,6 +171,7 @@ SIDE_MODULE_PRUNED_FLAG = "-sSIDE_MODULE=2"
 SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
 SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 8
 SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
+SIDE_MODULE_CTOR_EXPORT_FLAG = "-Wl,--export-if-defined=__wasm_call_ctors"
 SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
@@ -177,9 +181,17 @@ SIDE_MODULE_PRUNED_LINK_FLAGS: tuple[str, ...] = (
     "-sMEMORY64=1",
     "-pthread",
     SIDE_MODULE_PRUNED_FLAG,
+    SIDE_MODULE_CTOR_EXPORT_FLAG,
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
+SIDE_EXPORTS_RESPONSE_FILE_TEMPLATE = "side_part_{index}_exports.rsp"
+LLVM_NM_DEFINED_GLOBAL_TYPES: frozenset[str] = frozenset({"T", "W", "D", "B", "R", "C", "V"})
+LLVM_NM_UNDEFINED_TYPES: frozenset[str] = frozenset({"U", "w"})
+LLVM_NM_MAX_CMD_CHARS = 16_384
+SIDE_MODULE_MIN_INPUT_BYTES_FOR_SIZE_GUARD = 64 * 1024  # 64 KiB
+SIDE_MODULE_MIN_OUTPUT_BYTES = 4096  # 4 KiB (catches ~676 B stripped side modules)
+SIDE_MODULE_REQUIRED_EXPORT_NAMES: frozenset[str] = frozenset({"__wasm_call_ctors"})
 SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous", "asymmetric"})
 DEFAULT_SPLIT_STRATEGY = "balanced"
 # Proven Chrome two-part ceiling: pack part_0 up to ~994 MiB so part_1 lands near ~171 MiB.
@@ -195,6 +207,16 @@ INDIRECT_DISPATCH_MODES: frozenset[str] = frozenset({"table", "shard"})
 DEFAULT_INDIRECT_DISPATCH = "table"
 SHARD_DISPATCH_FN_PREFIX = "__playgta6_dispatch_shard_"
 SHARD_DISPATCH_TABLE_PREFIX = "__playgta6_shard_dispatch_"
+SIDE_MODULE_REQUIRED_EXPORT_PREFIXES: tuple[str, ...] = (
+    "pg6_register_",
+    "pg6_dispatch_",
+    "pg6_entry_",
+    "__playgta6_register_lifted_functions_",
+    "__playgta6_lifted_functions_",
+    "__playgta6_lifted_function_count_",
+    SHARD_DISPATCH_FN_PREFIX,
+    SHARD_DISPATCH_TABLE_PREFIX,
+)
 LEGACY_TABLE_BASELINE_ENTRIES = 437_813
 
 # Pure-Python WebAssembly binary inspection constants (Wasm Core + Memory64 + dylink.0).
@@ -483,6 +505,7 @@ class Toolchain:
     emxx: Path | None
     origin: str
     emar: Path | None = None
+    llvm_nm: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -510,11 +533,23 @@ class Toolchain:
             return base.parent / f"emar{suffix}"
         return None
 
+    def nm(self) -> Path | None:
+        if self.llvm_nm is not None:
+            return self.llvm_nm
+        base = self.emxx or self.emcc
+        if base is not None:
+            for directory in (base.parent.parent / "bin", base.parent):
+                found = _first_existing(directory, _LLVM_NM_NAMES)
+                if found is not None:
+                    return found
+        return None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "emcc_found": self.emcc is not None,
             "emxx_found": self.emxx is not None,
+            "llvm_nm_found": self.nm() is not None,
             "origin": self.origin,
         }
 
@@ -555,6 +590,8 @@ class SideModuleResult:
     name: str
     shards: tuple[str, ...] = ()
     response_file: str | None = None
+    exports_response_file: str | None = None
+    exported_symbol_count: int | None = None
     link_argv: tuple[str, ...] = ()
     wasm_bytes: int = 0
     exceeds_v8_1gib_limit: bool = False
@@ -571,6 +608,8 @@ class SideModuleResult:
             "shard_count": len(self.shards),
             "shards": list(self.shards),
             "response_file": self.response_file,
+            "exports_response_file": self.exports_response_file,
+            "exported_symbol_count": self.exported_symbol_count,
             "link_argv": list(self.link_argv),
             "estimated_bytes": self.estimated_bytes,
             "estimated_size_mib": round(self.estimated_bytes / (1024 * 1024), 4)
@@ -584,7 +623,7 @@ class SideModuleResult:
 
     def to_manifest_dict(self) -> dict[str, Any]:
         """CamelCase side-module entry for `guest_manifest.json` telemetry."""
-        return {
+        out: dict[str, Any] = {
             "index": self.index,
             "name": self.name,
             "role": self.role,
@@ -599,6 +638,9 @@ class SideModuleResult:
             "exceedsV8_1GiBLimit": self.exceeds_v8_1gib_limit,
             "sideModuleMode": self.side_module_mode,
         }
+        if self.exported_symbol_count is not None:
+            out["exportedSymbolCount"] = self.exported_symbol_count
+        return out
 
 
 @dataclass
@@ -783,6 +825,8 @@ def _tool_label(token: str) -> str:
         return "emcc"
     if name.startswith("emar"):
         return "emar"
+    if name.startswith("llvm-nm"):
+        return "llvm-nm"
     if name.startswith("python"):
         return "python"
     stem = Path(basename).stem
@@ -831,6 +875,11 @@ _EMXX_NAMES: tuple[str, ...] = (
     "emxx.cmd",
 )
 _EMAR_NAMES: tuple[str, ...] = ("emar", "emar.bat", "emar.cmd", "emar.exe", "emar.py")
+_LLVM_NM_NAMES: tuple[str, ...] = (
+    ("llvm-nm.exe", "llvm-nm", "llvm-nm.bat", "llvm-nm.cmd")
+    if os.name == "nt"
+    else ("llvm-nm", "llvm-nm.exe", "llvm-nm.bat", "llvm-nm.cmd")
+)
 
 
 def _first_existing(directory: Path, names: Sequence[str]) -> Path | None:
@@ -849,13 +898,14 @@ def discover_emscripten(
     env: Mapping[str, str] | None = None,
     which_fn: WhichFn | None = None,
 ) -> Toolchain:
-    """Locate emcc/em++/emar on PATH, EMSDK, or `work/emsdk/upstream/emscripten`."""
+    """Locate emcc/em++/emar/llvm-nm on PATH, EMSDK, or `work/emsdk/upstream`."""
     env_map = dict(os.environ if env is None else env)
     which = shutil.which if which_fn is None else which_fn
 
     emcc_path: Path | None = None
     emxx_path: Path | None = None
     emar_path: Path | None = None
+    llvm_nm_path: Path | None = None
     origin = "missing"
 
     which_emcc = which("emcc")
@@ -891,7 +941,32 @@ def discover_emscripten(
         if emar_path is None and found_ar is not None:
             emar_path = found_ar
 
-    return Toolchain(emcc=emcc_path, emxx=emxx_path, origin=origin, emar=emar_path)
+    # Prefer llvm-nm from the discovered Emscripten toolchain's sibling LLVM bin/ dir,
+    # then EMSDK / work/emsdk upstream/bin, then PATH.
+    base_tool = emxx_path or emcc_path
+    nm_dirs: list[Path] = []
+    if base_tool is not None:
+        nm_dirs.append(base_tool.parent.parent / "bin")
+        nm_dirs.append(base_tool.parent)
+    for _, directory in search_dirs:
+        nm_dirs.append(directory.parent / "bin")
+    for nm_dir in nm_dirs:
+        found_nm = _first_existing(nm_dir, _LLVM_NM_NAMES)
+        if found_nm is not None:
+            llvm_nm_path = found_nm
+            break
+    if llvm_nm_path is None:
+        which_nm = which("llvm-nm")
+        if which_nm:
+            llvm_nm_path = Path(which_nm)
+
+    return Toolchain(
+        emcc=emcc_path,
+        emxx=emxx_path,
+        origin=origin,
+        emar=emar_path,
+        llvm_nm=llvm_nm_path,
+    )
 
 
 def default_run_command(
@@ -2014,6 +2089,228 @@ def write_link_response_file(path: Path, objects: Sequence[Path | str]) -> Path:
     return path
 
 
+_HEX_OR_DASH_RE = re.compile(r"^[0-9a-fA-F-]+$")
+
+
+def is_required_side_export_symbol(
+    symbol: str,
+    *,
+    required_prefixes: Sequence[str] = SIDE_MODULE_REQUIRED_EXPORT_PREFIXES,
+    required_names: frozenset[str] = SIDE_MODULE_REQUIRED_EXPORT_NAMES,
+) -> bool:
+    """Return True for dynamic-init/registration/dispatch roots always kept exported."""
+    if symbol in required_names:
+        return True
+    prefixes = tuple(required_prefixes)
+    return bool(prefixes) and symbol.startswith(prefixes)
+
+
+def parse_llvm_nm_output(stdout: str) -> tuple[set[str], set[str]]:
+    """Parse BSD (default) or POSIX `llvm-nm` output into `(defined_globals, undefined)`."""
+    defined: set[str] = set()
+    undefined: set[str] = set()
+    for raw_line in stdout.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.endswith(":"):
+            continue
+        parts = stripped.split()
+        sym_type: str | None = None
+        sym_name: str | None = None
+        if (
+            len(parts) >= 3
+            and len(parts[1]) == 1
+            and parts[1].isalpha()
+            and _HEX_OR_DASH_RE.match(parts[0]) is not None
+        ):
+            # BSD format with address or dashes: `00000000 T sub_140001000` / `-------- D foo`
+            sym_type = parts[1]
+            sym_name = parts[2]
+        elif len(parts) == 2 and len(parts[0]) == 1 and parts[0].isalpha():
+            # BSD format without address (common on wasm objects / `U`): `T sub_...` / `U sub_...`
+            sym_type = parts[0]
+            sym_name = parts[1]
+        elif len(parts) >= 2 and len(parts[1]) == 1 and parts[1].isalpha():
+            # POSIX format (`-P`): `sub_140001000 T 0 0` / `sub_140009000 U`
+            sym_type = parts[1]
+            sym_name = parts[0]
+        else:
+            continue
+        if not sym_name:
+            continue
+        if sym_type in LLVM_NM_DEFINED_GLOBAL_TYPES:
+            defined.add(sym_name)
+        elif sym_type in LLVM_NM_UNDEFINED_TYPES:
+            undefined.add(sym_name)
+    return defined, undefined
+
+
+def _chunk_object_paths(
+    objects: Sequence[Path | str],
+    *,
+    max_cmd_chars: int = LLVM_NM_MAX_CMD_CHARS,
+) -> list[list[str]]:
+    """Split object paths into command-line-safe batches below Windows' 32 KiB CreateProcess cap."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for obj in objects:
+        token = str(obj)
+        token_len = len(token) + 3
+        if current and current_chars + token_len > max_cmd_chars:
+            batches.append(current)
+            current = [token]
+            current_chars = token_len
+        else:
+            current.append(token)
+            current_chars += token_len
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _inspect_objects_with_llvm_nm(
+    objects: Sequence[Path | str],
+    *,
+    llvm_nm_path: Path | str,
+    run_command: CommandRunner,
+    max_cmd_chars: int = LLVM_NM_MAX_CMD_CHARS,
+) -> tuple[set[str], set[str]]:
+    defined: set[str] = set()
+    undefined: set[str] = set()
+    if not objects:
+        return defined, undefined
+    for batch in _chunk_object_paths(objects, max_cmd_chars=max_cmd_chars):
+        argv = (str(llvm_nm_path), "--extern-only", "--no-sort", *batch)
+        result = run_command(argv)
+        if result.returncode != 0:
+            err = sanitize_text((result.stderr or result.stdout or "llvm-nm failed").strip())
+            raise BuildGuestWasmError(f"llvm-nm failed (exit {result.returncode}): {err}")
+        batch_def, batch_undef = parse_llvm_nm_output(result.stdout)
+        defined.update(batch_def)
+        undefined.update(batch_undef)
+    return defined, undefined
+
+
+def compute_side_module_cross_exports(
+    side_buckets: Sequence[Sequence[Path | str]],
+    main_objects: Sequence[Path | str],
+    llvm_nm_path: Path | str,
+    *,
+    run_command: CommandRunner | None = None,
+    required_prefixes: Sequence[str] = SIDE_MODULE_REQUIRED_EXPORT_PREFIXES,
+    required_names: frozenset[str] = SIDE_MODULE_REQUIRED_EXPORT_NAMES,
+    max_cmd_chars: int = LLVM_NM_MAX_CMD_CHARS,
+) -> list[list[str]]:
+    """Compute per-bucket required cross-module exports for `-sSIDE_MODULE=2` via `llvm-nm`.
+
+    For each side bucket `i`, returns the deterministically sorted list of global symbols
+    defined (`T`, `W`, `D`, `B`, `R`, `C`, `V`) in bucket `i` that are either:
+      - referenced as undefined (`U`, `w`) by ANY other side bucket `j != i`,
+      - referenced as undefined (`U`, `w`) by `main_objects`, or
+      - matched by required dynamic-init / registration / dispatch / entry prefixes or names.
+
+    Intra-bucket symbols that are never referenced outside bucket `i` are omitted so
+    `wasm-ld` under `-sSIDE_MODULE=2` prunes them from the Wasm export section.
+    """
+    runner = run_command or default_run_command
+    bucket_defined: list[set[str]] = []
+    bucket_undefined: list[set[str]] = []
+    for bucket in side_buckets:
+        b_def, b_undef = _inspect_objects_with_llvm_nm(
+            bucket,
+            llvm_nm_path=llvm_nm_path,
+            run_command=runner,
+            max_cmd_chars=max_cmd_chars,
+        )
+        bucket_defined.append(b_def)
+        bucket_undefined.append(b_undef)
+
+    _, main_undefined = _inspect_objects_with_llvm_nm(
+        main_objects,
+        llvm_nm_path=llvm_nm_path,
+        run_command=runner,
+        max_cmd_chars=max_cmd_chars,
+    )
+
+    undef_ref_counts: dict[str, int] = {}
+    for b_undef in bucket_undefined:
+        for sym in b_undef:
+            undef_ref_counts[sym] = undef_ref_counts.get(sym, 0) + 1
+
+    req_prefixes_tuple = tuple(required_prefixes)
+    exports_per_bucket: list[list[str]] = []
+    for idx, b_def in enumerate(bucket_defined):
+        own_undef = bucket_undefined[idx]
+        needed: list[str] = []
+        for sym in b_def:
+            in_main = sym in main_undefined
+            in_other_bucket = undef_ref_counts.get(sym, 0) > (1 if sym in own_undef else 0)
+            is_required = is_required_side_export_symbol(
+                sym,
+                required_prefixes=req_prefixes_tuple,
+                required_names=required_names,
+            )
+            if in_main or in_other_bucket or is_required:
+                needed.append(sym)
+        needed.sort()
+        exports_per_bucket.append(needed)
+    return exports_per_bucket
+
+
+def write_side_exports_response_file(
+    path: Path,
+    symbols: Sequence[str],
+    *,
+    include_ctors: bool = True,
+) -> Path:
+    """Write `-Wl,--export=<sym>` flags (plus `__wasm_call_ctors` root) to a linker `.rsp` file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    if include_ctors:
+        lines.append(SIDE_MODULE_CTOR_EXPORT_FLAG)
+    seen: set[str] = set()
+    for sym in symbols:
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        if sym == "__wasm_call_ctors" and include_ctors:
+            continue
+        flag = f"-Wl,--export={sym}"
+        if any(ch.isspace() for ch in flag):
+            escaped = flag.replace('"', '\\"')
+            flag = f'"{escaped}"'
+        lines.append(flag)
+    text = "\n".join(lines) + ("\n" if lines else "")
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def check_side_module_not_empty(
+    wasm_bytes: int,
+    *,
+    input_object_bytes: int,
+    module_name: str,
+    side_module_mode: int = 1,
+    min_output_bytes: int = SIDE_MODULE_MIN_OUTPUT_BYTES,
+    min_input_bytes: int = SIDE_MODULE_MIN_INPUT_BYTES_FOR_SIZE_GUARD,
+) -> str | None:
+    """Return an error string if a linked side module looks stripped/empty relative to its inputs."""
+    if input_object_bytes <= min_input_bytes:
+        return None
+    if wasm_bytes >= min_output_bytes:
+        return None
+    mode_hint = (
+        "under -sSIDE_MODULE=2 (check cross-module llvm-nm export response file and root symbols)"
+        if side_module_mode == 2
+        else "during side-module linking"
+    )
+    return (
+        f"{module_name} linked to only {wasm_bytes} bytes from {input_object_bytes} bytes of "
+        f"input objects (threshold: output >= {min_output_bytes} bytes when inputs > "
+        f"{min_input_bytes} bytes); all guest functions appear to have been stripped {mode_hint}"
+    )
+
+
 def resolve_link_flags(
     *,
     opt: str = "O2",
@@ -2181,6 +2478,7 @@ def build_side_module_link_argv(
     output_wasm: Path,
     side_link_flags: Sequence[str] | None = None,
     response_file: Path | None = None,
+    exports_response_file: Path | None = None,
     opt: str = "O2",
     strip: bool = False,
     no_link_opt: bool = False,
@@ -2198,6 +2496,9 @@ def build_side_module_link_argv(
     else:
         effective_flags = tuple(side_link_flags)
     argv: list[str] = [str(linker), *effective_flags]
+    if exports_response_file is not None:
+        exp_rsp_arg = str(exports_response_file).replace("\\", "/")
+        argv.append(f"@{exp_rsp_arg}")
     if response_file is not None:
         rsp_arg = str(response_file).replace("\\", "/")
         argv.append(f"@{rsp_arg}")
@@ -3741,7 +4042,7 @@ def run_build(
             pruned=use_pruned_side,
         )
         side_plans: list[
-            tuple[SideModuleResult, Path, list[Path], Path | None, tuple[str, ...]]
+            tuple[SideModuleResult, Path, list[Path], Path | None, Path | None, tuple[str, ...]]
         ] = []
         for idx, (bucket_role, bucket) in enumerate(all_side_buckets):
             side_name = SIDE_MODULE_NAME_TEMPLATE.format(index=idx)
@@ -3755,12 +4056,19 @@ def run_build(
             estimated_bytes = sum(_partition_weight(item) for item in bucket)
             side_rsp_name = SIDE_RESPONSE_FILE_TEMPLATE.format(index=idx)
             side_rsp_path = None if response_file is False else (cache_root / side_rsp_name)
+            side_exports_rsp_name = (
+                SIDE_EXPORTS_RESPONSE_FILE_TEMPLATE.format(index=idx) if use_pruned_side else None
+            )
+            side_exports_rsp_path = (
+                (cache_root / side_exports_rsp_name) if side_exports_rsp_name is not None else None
+            )
             raw_side_link = build_side_module_link_argv(
                 linker,
                 bucket_objects,
                 output_wasm=side_wasm_path,
                 side_link_flags=side_link_flags,
                 response_file=side_rsp_path,
+                exports_response_file=side_exports_rsp_path,
                 pruned=use_pruned_side,
             )
             side_result = SideModuleResult(
@@ -3768,13 +4076,21 @@ def run_build(
                 name=side_name,
                 shards=tuple(item.unit.unit_id for item in bucket),
                 response_file=side_rsp_name if side_rsp_path is not None else None,
+                exports_response_file=side_exports_rsp_name,
                 link_argv=tuple(sanitize_argv(raw_side_link)),
                 role=bucket_role,
                 estimated_bytes=estimated_bytes,
                 side_module_mode=side_mode,
             )
             side_plans.append(
-                (side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link)
+                (
+                    side_result,
+                    side_wasm_path,
+                    bucket_objects,
+                    side_rsp_path,
+                    side_exports_rsp_path,
+                    raw_side_link,
+                )
             )
 
         archiver = toolchain.archiver()
@@ -3819,10 +4135,47 @@ def run_build(
             report.ok = True
             return report
 
+        cross_exports_by_part: list[list[str]] = []
+        if use_pruned_side and side_plans:
+            llvm_nm_path = toolchain.nm()
+            if llvm_nm_path is None:
+                report.ok = False
+                report.errors.append(
+                    "llvm-nm not found alongside em++/emcc (upstream/bin) or on PATH; "
+                    "required to compute cross-module exports for --split-strategy asymmetric "
+                    "(-sSIDE_MODULE=2)"
+                )
+                return report
+            nm_main_objects = list(main_objects) + [
+                p for p in extra_objects if p.suffix.lower() == ".o" and p.is_file()
+            ]
+            try:
+                cross_exports_by_part = compute_side_module_cross_exports(
+                    [plan[2] for plan in side_plans],
+                    nm_main_objects,
+                    llvm_nm_path,
+                    run_command=runner,
+                )
+            except BuildGuestWasmError as exc:
+                report.ok = False
+                report.errors.append(sanitize_text(str(exc)))
+                return report
+
         output_dir.mkdir(parents=True, exist_ok=True)
-        for side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link in side_plans:
+        for idx, (
+            side_result,
+            side_wasm_path,
+            bucket_objects,
+            side_rsp_path,
+            side_exports_rsp_path,
+            raw_side_link,
+        ) in enumerate(side_plans):
             if side_rsp_path is not None:
                 write_link_response_file(side_rsp_path, bucket_objects)
+            if side_exports_rsp_path is not None:
+                part_exports = cross_exports_by_part[idx] if idx < len(cross_exports_by_part) else []
+                write_side_exports_response_file(side_exports_rsp_path, part_exports)
+                side_result.exported_symbol_count = len(part_exports)
             side_link_result = runner(raw_side_link)
             if side_link_result.returncode != 0:
                 report.ok = False
@@ -3836,6 +4189,17 @@ def run_build(
                 report.errors.append(f"missing side module link output: {side_result.name}")
                 return report
             side_result.wasm_bytes = _object_bytes(side_wasm_path)
+            input_obj_bytes = sum(_object_bytes(obj_path) for obj_path in bucket_objects)
+            empty_err = check_side_module_not_empty(
+                side_result.wasm_bytes,
+                input_object_bytes=input_obj_bytes,
+                module_name=side_result.name,
+                side_module_mode=side_result.side_module_mode,
+            )
+            if empty_err is not None:
+                report.ok = False
+                report.errors.append(empty_err)
+                return report
 
         if archive_filter_plans:
             assert archiver is not None
@@ -4091,9 +4455,14 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
             elif side.estimated_bytes:
                 emib = side.estimated_bytes / (1024 * 1024)
                 size_part = f" — est. {side.estimated_bytes} bytes ({emib:.2f} MiB)"
+            exports_part = (
+                f", {side.exported_symbol_count} cross-exports"
+                if side.exported_symbol_count is not None
+                else ""
+            )
             lines.append(
                 f"    {side.name} ({len(side.shards)} shards, "
-                f"SIDE_MODULE={side.side_module_mode}){size_part}"
+                f"SIDE_MODULE={side.side_module_mode}{exports_part}){size_part}"
             )
             if side.link_argv:
                 lines.append("      Link: " + " ".join(side.link_argv))
