@@ -74,7 +74,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
   - Add the missing fields to the harness's report JSON (additive, versioned) and make the comparison tool use them.
-- [ ] **R43 — One-Command Native Boot Runner (`tools/run_native_boot.py`)** — `IN PROGRESS` (#680, @Timon-ok)
+- [x] **R43 — One-Command Native Boot Runner (`tools/run_native_boot.py`)** — `DONE` (PR #681, closes #680)
   - Rebuild only what is stale, boot with named presets, collect the run folder and compare against a baseline.
 
 ---
