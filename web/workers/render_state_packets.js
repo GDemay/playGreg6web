@@ -95,6 +95,247 @@ const GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST = 0x0040 | 0x0080 | 0x0008;
 const GPU_TEXTURE_USAGE_TEXTURE_BINDING = 0x0004;
 const GPU_TEXTURE_USAGE_STORAGE_BINDING = 0x0008;
 const EMPTY_FRAGMENT_WGSL = '@fragment fn fs_main() {}\n';
+const GPU_SHADER_STAGE_VERTEX = 0x1;
+const GPU_SHADER_STAGE_ALL_MASK = 0x7;
+const MAX_TELEMETRY_WARNINGS = 32;
+const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const DEFAULT_ENTRY_POINTS = Object.freeze({
+  vertex: 'vs_main',
+  fragment: 'fs_main',
+  compute: 'cs_main',
+});
+
+const DEPTH_TEXTURE_FORMATS = Object.freeze(
+  new Set([
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+  ])
+);
+
+const VERTEX_FORMAT_BYTE_SIZES = Object.freeze({
+  uint8: 1,
+  uint8x2: 2,
+  uint8x4: 4,
+  sint8: 1,
+  sint8x2: 2,
+  sint8x4: 4,
+  unorm8: 1,
+  unorm8x2: 2,
+  unorm8x4: 4,
+  snorm8: 1,
+  snorm8x2: 2,
+  snorm8x4: 4,
+  uint16: 2,
+  uint16x2: 4,
+  uint16x4: 8,
+  sint16: 2,
+  sint16x2: 4,
+  sint16x4: 8,
+  unorm16: 2,
+  unorm16x2: 4,
+  unorm16x4: 8,
+  snorm16: 2,
+  snorm16x2: 4,
+  snorm16x4: 8,
+  float16: 2,
+  float16x2: 4,
+  float16x4: 8,
+  float32: 4,
+  float32x2: 8,
+  float32x3: 12,
+  float32x4: 16,
+  uint32: 4,
+  uint32x2: 8,
+  uint32x3: 12,
+  uint32x4: 16,
+  sint32: 4,
+  sint32x2: 8,
+  sint32x3: 12,
+  sint32x4: 16,
+  'unorm10-10-10-2': 4,
+  'unorm8x4-bgra': 4,
+});
+
+function isDepthTextureFormat(format) {
+  return typeof format === 'string' && DEPTH_TEXTURE_FORMATS.has(format);
+}
+
+// Strips WGSL line (//) and nestable block (/* ... */) comments so commented-out entry points are ignored.
+function stripWgslComments(code) {
+  if (typeof code !== 'string' || code.length === 0) return '';
+  let out = '';
+  let blockDepth = 0;
+  for (let i = 0; i < code.length; i += 1) {
+    const ch = code[i];
+    const next = i + 1 < code.length ? code[i + 1] : '';
+    if (blockDepth > 0) {
+      if (ch === '/' && next === '*') {
+        blockDepth += 1;
+        i += 1;
+      } else if (ch === '*' && next === '/') {
+        blockDepth -= 1;
+        i += 1;
+        out += ' ';
+      } else if (ch === '\n') {
+        out += '\n';
+      }
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < code.length && code[i] !== '\n') i += 1;
+      if (i < code.length && code[i] === '\n') out += '\n';
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blockDepth = 1;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function findWgslStageEntryPoints(code, stage) {
+  if (typeof code !== 'string' || code.length === 0) return [];
+  const stageAttr =
+    stage === 'vertex' || stage === 'fragment' || stage === 'compute' ? stage : null;
+  if (!stageAttr) return [];
+  const cleaned = stripWgslComments(code);
+  const re = new RegExp(
+    `@${stageAttr}\\b(?:\\s*@[A-Za-z_][A-Za-z0-9_]*(?:\\s*\\([^)]*\\))?)*\\s*fn\\s+([A-Za-z_][A-Za-z0-9_]*)`,
+    'g'
+  );
+  const found = [];
+  let match;
+  while ((match = re.exec(cleaned)) !== null) {
+    if (!found.includes(match[1])) {
+      found.push(match[1]);
+    }
+  }
+  return found;
+}
+
+function normalizeEntryPointName(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || !VALID_WGSL_IDENT_RE.test(trimmed)) return null;
+  return trimmed;
+}
+
+function getShaderSourceText(shaderEntry) {
+  if (!shaderEntry || typeof shaderEntry !== 'object') return null;
+  if (typeof shaderEntry.code === 'string' && shaderEntry.code.length > 0) return shaderEntry.code;
+  if (typeof shaderEntry.wgsl === 'string' && shaderEntry.wgsl.length > 0) return shaderEntry.wgsl;
+  if (
+    shaderEntry.module &&
+    typeof shaderEntry.module.code === 'string' &&
+    shaderEntry.module.code.length > 0
+  ) {
+    return shaderEntry.module.code;
+  }
+  return null;
+}
+
+// Resolves the WebGPU shader stage entry point: defaults to vs_main/fs_main/cs_main per
+// docs/gpu_commands.md, while honoring explicit entryPoint metadata and WGSL source declarations
+// (such as legacy `@fragment fn ps_main` from older packs).
+function resolveShaderEntryPoint(shaderEntry, stage) {
+  const defaultEntryPoint = DEFAULT_ENTRY_POINTS[stage] || 'vs_main';
+  const explicit =
+    normalizeEntryPointName(shaderEntry && shaderEntry.entryPoint) ||
+    normalizeEntryPointName(shaderEntry && shaderEntry.entry_point);
+  const sourceText = getShaderSourceText(shaderEntry);
+  const declared = sourceText ? findWgslStageEntryPoints(sourceText, stage) : [];
+
+  let entryPoint = defaultEntryPoint;
+  let reason = 'default';
+
+  if (declared.length > 0) {
+    if (explicit && declared.includes(explicit)) {
+      entryPoint = explicit;
+      reason = explicit === defaultEntryPoint ? 'default' : 'metadata+source';
+    } else if (declared.includes(defaultEntryPoint)) {
+      entryPoint = defaultEntryPoint;
+      reason = 'default';
+    } else {
+      entryPoint = declared[0];
+      reason = explicit ? 'source-override' : 'source-inspect';
+    }
+  } else if (explicit) {
+    entryPoint = explicit;
+    reason = explicit === defaultEntryPoint ? 'default' : 'metadata';
+  }
+
+  return {
+    entryPoint,
+    defaultEntryPoint,
+    remapped: entryPoint !== defaultEntryPoint,
+    reason,
+  };
+}
+
+// Validates decoded GPURenderPipelineDescriptor.vertex.buffers against WebGPU layout rules.
+function validateVertexBufferLayouts(buffers) {
+  if (!Array.isArray(buffers)) {
+    return { valid: false, error: 'vertex buffers must be an array' };
+  }
+  const usedLocations = new Set();
+  for (let i = 0; i < buffers.length; i += 1) {
+    const slot = buffers[i];
+    if (slot === null) continue;
+    if (!slot || typeof slot !== 'object') {
+      return { valid: false, error: `vertex buffer slot ${i}: invalid layout object` };
+    }
+    if (slot.stepMode !== 'vertex' && slot.stepMode !== 'instance') {
+      return { valid: false, error: `vertex buffer slot ${i}: invalid stepMode ${String(slot.stepMode)}` };
+    }
+    if (!Number.isInteger(slot.arrayStride) || slot.arrayStride < 0 || slot.arrayStride % 4 !== 0) {
+      return { valid: false, error: `vertex buffer slot ${i}: invalid arrayStride ${slot.arrayStride}` };
+    }
+    if (!Array.isArray(slot.attributes)) {
+      return { valid: false, error: `vertex buffer slot ${i}: attributes must be an array` };
+    }
+    for (let j = 0; j < slot.attributes.length; j += 1) {
+      const attr = slot.attributes[j];
+      if (!attr || typeof attr !== 'object') {
+        return { valid: false, error: `vertex buffer slot ${i} attr ${j}: invalid attribute` };
+      }
+      const byteSize = VERTEX_FORMAT_BYTE_SIZES[attr.format];
+      if (!byteSize) {
+        return { valid: false, error: `vertex buffer slot ${i} attr ${j}: invalid format ${String(attr.format)}` };
+      }
+      if (!Number.isInteger(attr.offset) || attr.offset < 0) {
+        return { valid: false, error: `vertex buffer slot ${i} attr ${j}: invalid offset ${attr.offset}` };
+      }
+      if (!Number.isInteger(attr.shaderLocation) || attr.shaderLocation < 0 || attr.shaderLocation >= 16) {
+        return {
+          valid: false,
+          error: `vertex buffer slot ${i} attr ${j}: invalid shaderLocation ${attr.shaderLocation}`,
+        };
+      }
+      if (usedLocations.has(attr.shaderLocation)) {
+        return {
+          valid: false,
+          error: `vertex buffer slot ${i} attr ${j}: duplicate shaderLocation ${attr.shaderLocation}`,
+        };
+      }
+      usedLocations.add(attr.shaderLocation);
+      if (slot.arrayStride > 0 && attr.offset + byteSize > slot.arrayStride) {
+        return {
+          valid: false,
+          error: `vertex buffer slot ${i} attr ${j}: offset ${attr.offset} + ${byteSize} exceeds arrayStride ${slot.arrayStride}`,
+        };
+      }
+    }
+  }
+  return { valid: true };
+}
 
 function nameOf(table, code) {
   return code < table.length ? table[code] : undefined;
@@ -229,7 +470,7 @@ function decodeTextureViewDesc(view, offset) {
 function decodeBindGroupLayoutEntry(view, offset) {
   const entry = {
     binding: view.getUint32(offset, true),
-    visibility: view.getUint32(offset + 4, true),
+    visibility: view.getUint32(offset + 4, true) & GPU_SHADER_STAGE_ALL_MASK,
   };
   const type = view.getUint8(offset + 8);
   const subtype = view.getUint8(offset + 9);
@@ -238,23 +479,42 @@ function decodeBindGroupLayoutEntry(view, offset) {
   const storageFormat = view.getUint8(offset + 12);
   const viewDimension = dimension !== 0 ? nameOf(VIEW_DIMENSION_NAMES, dimension) : '2d';
   if (type === BINDING_LAYOUT_TYPE.BUFFER) {
+    const bufferType = nameOf(BUFFER_BINDING_TYPE_NAMES, subtype);
+    if (!bufferType) return null;
+    // WebGPU forbids read-write 'storage' buffers in the vertex stage (e.g., root-signature layouts
+    // that tag all entries Vertex|Fragment). Strip the illegal VERTEX visibility bit cleanly.
+    if (bufferType === 'storage' && (entry.visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
+      entry.visibility &= ~GPU_SHADER_STAGE_VERTEX;
+    }
     entry.buffer = {
-      type: nameOf(BUFFER_BINDING_TYPE_NAMES, subtype),
+      type: bufferType,
       hasDynamicOffset: (flags & 0x1) !== 0,
       minBindingSize: Number(view.getBigUint64(offset + 16, true)),
     };
   } else if (type === BINDING_LAYOUT_TYPE.SAMPLER) {
-    entry.sampler = { type: nameOf(SAMPLER_BINDING_TYPE_NAMES, subtype) };
+    const samplerType = nameOf(SAMPLER_BINDING_TYPE_NAMES, subtype);
+    if (!samplerType) return null;
+    entry.sampler = { type: samplerType };
   } else if (type === BINDING_LAYOUT_TYPE.TEXTURE) {
+    const sampleType = nameOf(TEXTURE_SAMPLE_TYPE_NAMES, subtype);
+    if (!sampleType || !viewDimension || viewDimension === 'undefined') return null;
     entry.texture = {
-      sampleType: nameOf(TEXTURE_SAMPLE_TYPE_NAMES, subtype),
+      sampleType,
       viewDimension,
       multisampled: (flags & 0x2) !== 0,
     };
   } else if (type === BINDING_LAYOUT_TYPE.STORAGE_TEXTURE) {
+    const access = nameOf(STORAGE_TEXTURE_ACCESS_NAMES, subtype);
+    const format = storageFormat !== 0 ? nameOf(TEXTURE_FORMAT_NAMES, storageFormat) : undefined;
+    if (!access || !format || format === 'undefined' || !viewDimension || viewDimension === 'undefined') {
+      return null;
+    }
+    if ((access === 'write-only' || access === 'read-write') && (entry.visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
+      entry.visibility &= ~GPU_SHADER_STAGE_VERTEX;
+    }
     entry.storageTexture = {
-      access: nameOf(STORAGE_TEXTURE_ACCESS_NAMES, subtype),
-      format: nameOf(TEXTURE_FORMAT_NAMES, storageFormat),
+      access,
+      format,
       viewDimension,
     };
   } else {
@@ -265,18 +525,20 @@ function decodeBindGroupLayoutEntry(view, offset) {
 
 function decodeBlendComponent(view, offset) {
   return {
-    operation: nameOf(BLEND_OPERATION_NAMES, view.getUint8(offset)),
-    srcFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 1)),
-    dstFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 2)),
+    operation: nameOf(BLEND_OPERATION_NAMES, view.getUint8(offset)) || 'add',
+    srcFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 1)) || 'one',
+    dstFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 2)) || 'zero',
   };
 }
 
 function decodeStencilFace(view, offset) {
+  const compareCode = view.getUint8(offset);
+  const compare = compareCode !== 0 ? nameOf(COMPARE_FUNCTION_NAMES, compareCode) : undefined;
   return {
-    compare: nameOf(COMPARE_FUNCTION_NAMES, view.getUint8(offset)),
-    failOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 1)),
-    depthFailOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 2)),
-    passOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 3)),
+    compare: compare && compare !== 'undefined' ? compare : 'always',
+    failOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 1)) || 'keep',
+    depthFailOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 2)) || 'keep',
+    passOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 3)) || 'keep',
   };
 }
 
@@ -298,7 +560,8 @@ function decodeRenderPipelineKey(view, base) {
       targets.push(null);
       continue;
     }
-    const target = { format: nameOf(TEXTURE_FORMAT_NAMES, format), writeMask: view.getUint8(o + 2) };
+    const targetFormat = nameOf(TEXTURE_FORMAT_NAMES, format);
+    const target = { format: targetFormat, writeMask: view.getUint8(o + 2) & 0x0f };
     if (view.getUint8(o + 1) !== 0) {
       target.blend = { color: decodeBlendComponent(view, o + 4), alpha: decodeBlendComponent(view, o + 8) };
     }
@@ -308,35 +571,51 @@ function decodeRenderPipelineKey(view, base) {
   const ds = base + 120;
   let depthStencil;
   const dsFormat = view.getUint8(ds);
-  if (dsFormat !== 0) {
+  const dsFormatName = dsFormat !== 0 ? nameOf(TEXTURE_FORMAT_NAMES, dsFormat) : undefined;
+  if (dsFormatName && dsFormatName !== 'undefined') {
+    const hasDepth = isDepthTextureFormat(dsFormatName);
+    const rawDepthCompare = view.getUint8(ds + 2);
+    const mappedCompare = rawDepthCompare !== 0 ? nameOf(COMPARE_FUNCTION_NAMES, rawDepthCompare) : undefined;
+    const validCompare = mappedCompare && mappedCompare !== 'undefined' ? mappedCompare : undefined;
     depthStencil = {
-      format: nameOf(TEXTURE_FORMAT_NAMES, dsFormat),
-      depthWriteEnabled: view.getUint8(ds + 1) !== 0,
+      format: dsFormatName,
+      depthWriteEnabled: hasDepth ? Boolean(view.getUint8(ds + 1) !== 0) : false,
       stencilFront: decodeStencilFace(view, ds + 4),
       stencilBack: decodeStencilFace(view, ds + 8),
       stencilReadMask: view.getUint32(ds + 12, true),
       stencilWriteMask: view.getUint32(ds + 16, true),
       depthBias: view.getInt32(ds + 20, true),
-      depthBiasSlopeScale: f32FromBits(view.getUint32(ds + 24, true)),
-      depthBiasClamp: f32FromBits(view.getUint32(ds + 28, true)),
+      depthBiasSlopeScale: finiteOr(f32FromBits(view.getUint32(ds + 24, true)), 0),
+      depthBiasClamp: finiteOr(f32FromBits(view.getUint32(ds + 28, true)), 0),
     };
-    const depthCompare = view.getUint8(ds + 2);
-    if (depthCompare !== 0) depthStencil.depthCompare = nameOf(COMPARE_FUNCTION_NAMES, depthCompare);
+    if (hasDepth) {
+      // Depth-containing formats (e.g. depth24plus-stencil8, depth32float) must always carry a
+      // valid GPUCompareFunction; default to 'always' when depth test is disabled (code 0).
+      depthStencil.depthCompare = validCompare || 'always';
+    } else if (validCompare === 'always') {
+      depthStencil.depthCompare = 'always';
+    }
   }
 
   const pr = base + 152;
+  const topology = nameOf(PRIMITIVE_TOPOLOGY_NAMES, view.getUint8(pr)) || 'triangle-list';
   const primitive = {
-    topology: nameOf(PRIMITIVE_TOPOLOGY_NAMES, view.getUint8(pr)),
-    frontFace: nameOf(FRONT_FACE_NAMES, view.getUint8(pr + 2)),
-    cullMode: nameOf(CULL_MODE_NAMES, view.getUint8(pr + 3)),
+    topology,
+    frontFace: nameOf(FRONT_FACE_NAMES, view.getUint8(pr + 2)) || 'ccw',
+    cullMode: nameOf(CULL_MODE_NAMES, view.getUint8(pr + 3)) || 'none',
   };
   const stripIndexFormat = view.getUint8(pr + 1);
-  if (stripIndexFormat !== 0) primitive.stripIndexFormat = nameOf(INDEX_FORMAT_NAMES, stripIndexFormat);
+  if (stripIndexFormat !== 0 && (topology === 'triangle-strip' || topology === 'line-strip')) {
+    const idxFormat = nameOf(INDEX_FORMAT_NAMES, stripIndexFormat);
+    if (idxFormat && idxFormat !== 'undefined') {
+      primitive.stripIndexFormat = idxFormat;
+    }
+  }
   if (view.getUint8(pr + 4) !== 0) primitive.unclippedDepth = true;
 
   const ms = base + 160;
   const multisample = {
-    count: view.getUint32(ms, true),
+    count: view.getUint32(ms, true) || 1,
     mask: view.getUint32(ms + 4, true),
     alphaToCoverageEnabled: view.getUint8(ms + 8) !== 0,
   };
@@ -425,18 +704,66 @@ class RenderStatePackets {
     // ManifestReference layouts loaded from layout-manifest.json (e.g. by reflection_loader.js).
     this.resolveManifestLayout =
       typeof options.resolveManifestLayout === 'function' ? options.resolveManifestLayout : null;
-    this.bindGroupLayouts = new Map(); // id -> { layout, entries }
+    this.bindGroupLayouts = new Map(); // id -> { layout, entries, sequentialBindings }
     this.pipelineLayouts = new Map(); // id -> GPUPipelineLayout
+    this.pipelineLayoutMeta = new Map(); // id -> { groupCount, isSingleGroup0, sequentialGroup0 }
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
     this.dummies = new Map();
     this.emptyLayout = null;
     this.emptyFragment = null;
     this.stats = { packets: 0, errors: 0 };
+    this.telemetry = {
+      legacyEntryPointRemaps: 0,
+      depthCompareDefaults: 0,
+      rootSigGroup0Layouts: 0,
+      autoLayoutFallbacks: 0,
+      warnings: [],
+    };
     this.lastError = null;
     this._packetError = null;
     this._activePass = null;
     this._activePassTargetSize = null;
+  }
+
+  getStats() {
+    return {
+      packets: this.stats.packets,
+      errors: this.stats.errors,
+      legacyEntryPointRemaps: this.telemetry.legacyEntryPointRemaps,
+      depthCompareDefaults: this.telemetry.depthCompareDefaults,
+      rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
+      autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+    };
+  }
+
+  getTelemetry() {
+    return {
+      legacyEntryPointRemaps: this.telemetry.legacyEntryPointRemaps,
+      depthCompareDefaults: this.telemetry.depthCompareDefaults,
+      rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
+      autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+      warnings: this.telemetry.warnings.slice(),
+    };
+  }
+
+  _recordTelemetryWarning(message) {
+    if (typeof message !== 'string' || message.length === 0) return;
+    if (this.telemetry.warnings.length >= MAX_TELEMETRY_WARNINGS) {
+      this.telemetry.warnings.shift();
+    }
+    this.telemetry.warnings.push(message);
+  }
+
+  _resolveEntryPoint(shaderEntry, stage) {
+    const resolved = resolveShaderEntryPoint(shaderEntry, stage);
+    if (resolved.remapped) {
+      this.telemetry.legacyEntryPointRemaps += 1;
+      this._recordTelemetryWarning(
+        `legacy entry point remapped: stage=${stage} default=${resolved.defaultEntryPoint} resolved=${resolved.entryPoint} reason=${resolved.reason}`
+      );
+    }
+    return resolved.entryPoint;
   }
 
   // Returns true when the opcode belongs to ABI v2 (handled, possibly with an error recorded).
@@ -528,6 +855,7 @@ class RenderStatePackets {
   destroyResource(id) {
     this.bindGroupLayouts.delete(id);
     this.pipelineLayouts.delete(id);
+    this.pipelineLayoutMeta.delete(id);
     this.textureViews.delete(id);
   }
 
@@ -560,9 +888,17 @@ class RenderStatePackets {
     }
     if (24 + count * 24 > payloadBytes) return false;
     const entries = [];
+    const seenBindings = new Set();
+    let sequentialBindings = true;
     for (let i = 0; i < count; i++) {
       const entry = decodeBindGroupLayoutEntry(view, offset + 24 + i * 24);
       if (!entry) return false;
+      if (seenBindings.has(entry.binding)) {
+        this._packetError = `bind group layout ${id}: duplicate binding ${entry.binding}`;
+        return false;
+      }
+      seenBindings.add(entry.binding);
+      if (entry.binding !== i) sequentialBindings = false;
       entries.push(entry);
     }
     const contentKey = contentId !== 0n ? `bgl:${contentId.toString(16)}` : null;
@@ -571,7 +907,7 @@ class RenderStatePackets {
       layout = this.device.createBindGroupLayout({ entries });
       if (contentKey) this.layoutsByContent.set(contentKey, layout);
     }
-    this.bindGroupLayouts.set(id, { layout, entries });
+    this.bindGroupLayouts.set(id, { layout, entries, sequentialBindings });
     return true;
   }
 
@@ -587,6 +923,7 @@ class RenderStatePackets {
     const flags = view.getUint32(offset + 8, true);
     const contentId = view.getBigUint64(offset + 16, true);
     let layout;
+    let meta = { groupCount: count, isSingleGroup0: false, sequentialGroup0: false };
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       layout = this.resolveManifestLayout && this.resolveManifestLayout('pipelineLayout', contentId);
       if (!layout) {
@@ -596,6 +933,7 @@ class RenderStatePackets {
     } else {
       if (24 + count * 4 > payloadBytes) return false;
       const bindGroupLayouts = [];
+      let group0Record = null;
       for (let g = 0; g < count; g++) {
         const bglId = view.getUint32(offset + 24 + g * 4, true);
         const record = bglId !== 0 ? this.bindGroupLayouts.get(bglId) : null;
@@ -603,11 +941,18 @@ class RenderStatePackets {
           this._packetError = `pipeline layout ${id}: unknown bind group layout ${bglId}`;
           return false;
         }
+        if (g === 0) group0Record = record;
         bindGroupLayouts.push(record ? record.layout : this._emptyBindGroupLayout());
       }
       layout = this.device.createPipelineLayout({ bindGroupLayouts });
+      meta = {
+        groupCount: count,
+        isSingleGroup0: count === 1 && group0Record !== null,
+        sequentialGroup0: Boolean(count === 1 && group0Record && group0Record.sequentialBindings),
+      };
     }
     this.pipelineLayouts.set(id, layout);
+    this.pipelineLayoutMeta.set(id, meta);
     return true;
   }
 
@@ -624,24 +969,38 @@ class RenderStatePackets {
   buildRenderPipelineDescriptor(view, offset) {
     const vsId = view.getUint32(offset + 4, true);
     const fsId = view.getUint32(offset + 8, true);
-    const layout = this._layoutFor(view.getUint32(offset + 12, true));
+    const layoutId = view.getUint32(offset + 12, true);
+    const layout = this._layoutFor(layoutId);
     const vs = this.processor.shaderModules.get(vsId);
     if (!vs || !layout) {
       if (!vs) this._packetError = `unknown vertex shader module ${vsId}`;
       return null;
     }
-    const key = decodeRenderPipelineKey(view, offset + KEY_OFFSET);
-    const descriptor = {
-      layout,
-      vertex: { module: vs.module, entryPoint: 'vs_main', buffers: key.buffers },
-      primitive: key.primitive,
-      multisample: key.multisample,
-    };
-    if (key.depthStencil) descriptor.depthStencil = key.depthStencil;
+    const keyBase = offset + KEY_OFFSET;
+    const key = decodeRenderPipelineKey(view, keyBase);
+    const vertexCheck = validateVertexBufferLayouts(key.buffers);
+    if (!vertexCheck.valid) {
+      this._packetError = `render pipeline vertex layout invalid: ${vertexCheck.error}`;
+      return null;
+    }
+    const expectedAttrs = Math.min(view.getUint32(keyBase + 176, true), 16);
+    const attachedAttrs = key.buffers.reduce((n, b) => n + (b ? b.attributes.length : 0), 0);
+    if (attachedAttrs !== expectedAttrs) {
+      this._packetError = `render pipeline vertex layout dropped attributes (${attachedAttrs}/${expectedAttrs})`;
+      return null;
+    }
+    for (let i = 0; i < key.targets.length; i += 1) {
+      const target = key.targets[i];
+      if (target && (!target.format || target.format === 'undefined')) {
+        this._packetError = `render pipeline target ${i}: invalid texture format`;
+        return null;
+      }
+    }
+    let fs = null;
     let fragmentModule = null;
     let targets = key.targets;
     if (fsId !== 0) {
-      const fs = this.processor.shaderModules.get(fsId);
+      fs = this.processor.shaderModules.get(fsId);
       if (!fs) {
         this._packetError = `unknown fragment shader module ${fsId}`;
         return null;
@@ -653,8 +1012,30 @@ class RenderStatePackets {
       fragmentModule = this.emptyFragment;
       targets = targets.map((t) => (t ? { format: t.format, writeMask: 0 } : null));
     }
+
+    if (layoutId === 0) {
+      this.telemetry.autoLayoutFallbacks += 1;
+    } else {
+      const layoutMeta = this.pipelineLayoutMeta.get(layoutId);
+      if (layoutMeta && layoutMeta.isSingleGroup0) {
+        this.telemetry.rootSigGroup0Layouts += 1;
+      }
+    }
+    if (key.depthStencil && isDepthTextureFormat(key.depthStencil.format) && view.getUint8(keyBase + 122) === 0) {
+      this.telemetry.depthCompareDefaults += 1;
+    }
+
+    const vsEntryPoint = this._resolveEntryPoint(vs, 'vertex');
+    const descriptor = {
+      layout,
+      vertex: { module: vs.module, entryPoint: vsEntryPoint, buffers: key.buffers },
+      primitive: key.primitive,
+      multisample: key.multisample,
+    };
+    if (key.depthStencil) descriptor.depthStencil = key.depthStencil;
     if (fragmentModule) {
-      descriptor.fragment = { module: fragmentModule, entryPoint: 'fs_main', targets };
+      const fsEntryPoint = fs ? this._resolveEntryPoint(fs, 'fragment') : DEFAULT_ENTRY_POINTS.fragment;
+      descriptor.fragment = { module: fragmentModule, entryPoint: fsEntryPoint, targets };
     }
     return descriptor;
   }
@@ -669,15 +1050,20 @@ class RenderStatePackets {
   _createComputePipeline(view, offset) {
     const id = view.getUint32(offset, true);
     const csId = view.getUint32(offset + 4, true);
-    const layout = this._layoutFor(view.getUint32(offset + 8, true));
+    const layoutId = view.getUint32(offset + 8, true);
+    const layout = this._layoutFor(layoutId);
     const cs = this.processor.shaderModules.get(csId);
     if (!cs || !layout) {
       if (!cs) this._packetError = `unknown compute shader module ${csId}`;
       return false;
     }
+    if (layoutId === 0) {
+      this.telemetry.autoLayoutFallbacks += 1;
+    }
+    const csEntryPoint = this._resolveEntryPoint(cs, 'compute');
     this.processor.computePipelines.set(
       id,
-      this.device.createComputePipeline({ layout, compute: { module: cs.module, entryPoint: 'cs_main' } })
+      this.device.createComputePipeline({ layout, compute: { module: cs.module, entryPoint: csEntryPoint } })
     );
     return true;
   }
@@ -997,6 +1383,12 @@ const exportedApi = {
   decodeBeginRenderPass,
   decodeTextureViewDesc,
   decodeBindGroupLayoutEntry,
+  resolveShaderEntryPoint,
+  findWgslStageEntryPoints,
+  validateVertexBufferLayouts,
+  DEFAULT_ENTRY_POINTS,
+  DEPTH_TEXTURE_FORMATS,
+  VERTEX_FORMAT_BYTE_SIZES,
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
   TEXTURE_FORMAT_NAMES,
