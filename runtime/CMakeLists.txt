@@ -66,6 +66,7 @@ add_library(playgta6_core STATIC
     os/xgameruntime_provider.cpp
     os/xbox_scarlett_guest.cpp
     guest/program_loader.cpp
+    guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
     os/acp_hal_guest.cpp
 )
@@ -309,6 +310,10 @@ else()
     add_executable(test_wasm_boot ../tests/test_wasm_boot.cpp)
     target_link_libraries(test_wasm_boot PRIVATE playgta6_core)
     add_test(NAME test_wasm_boot COMMAND test_wasm_boot)
+
+    add_executable(test_shard_dispatch ../tests/test_shard_dispatch.cpp)
+    target_link_libraries(test_shard_dispatch PRIVATE playgta6_core)
+    add_test(NAME test_shard_dispatch COMMAND test_shard_dispatch)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)
