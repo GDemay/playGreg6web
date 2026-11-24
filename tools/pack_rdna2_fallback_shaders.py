@@ -602,6 +602,40 @@ def extract_entry_point(wgsl: str, stage: ShaderStage) -> str:
     return DEFAULT_ENTRY_POINTS[stage]
 
 
+def normalize_fragment_entry_point(wgsl: str) -> tuple[str, bool]:
+    """Normalize a legacy `@fragment ... fn ps_main` entry point to `fs_main`.
+
+    The WebGPU v2 pipeline path (`web/workers/render_state_packets.js`) and
+    `docs/gpu_commands.md` bind fragment modules with the fixed entry point
+    `fs_main`. When an override WGSL module defines `@fragment fn ps_main(...)`
+    without an existing `fs_main` declaration, rename the entry point declaration
+    comment-safely to `fs_main` while leaving custom entry names untouched.
+    """
+    stripped = strip_wgsl_comments(wgsl)
+    if re.search(r"\bfn\s+fs_main\b", stripped):
+        return wgsl, False
+    match = re.search(r"@fragment\b[\s\S]*?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)", stripped)
+    if not match or match.group(1) != "ps_main":
+        return wgsl, False
+    updated = wgsl[: match.start(1)] + "fs_main" + wgsl[match.end(1) :]
+    return updated, True
+
+
+def _import_rdna2_inspector() -> Any:
+    """Import sibling `tools/inspect_rdna2_shaders.py` regardless of invocation style."""
+    try:
+        from tools import inspect_rdna2_shaders as inspector  # type: ignore[import-not-found]
+
+        return inspector
+    except ImportError:
+        tools_dir = str(Path(__file__).resolve().parent)
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import inspect_rdna2_shaders as inspector  # type: ignore[import-not-found]
+
+        return inspector
+
+
 # ---------------------------------------------------------------------------
 # Input ingestion (`--scan-json` & `--hashes`) and `--wgsl-dir` indexing
 # ---------------------------------------------------------------------------
@@ -694,12 +728,15 @@ def extract_scan_records_from_payload(
                     f"invalid shader entry at index {idx} in {sanitize_label(source_label)}",
                     code="scan_json_schema_error",
                 )
-            if "hash" not in item:
+            if "code_hash_fnv1a64" in item:
+                shader_hash = normalize_shader_hash(item["code_hash_fnv1a64"])
+            elif "hash" in item:
+                shader_hash = normalize_shader_hash(item["hash"])
+            else:
                 raise PackerError(
                     f"shader entry at index {idx} missing 'hash' in {sanitize_label(source_label)}",
                     code="scan_json_schema_error",
                 )
-            shader_hash = normalize_shader_hash(item["hash"])
             raw_stage = item.get("stage", "unknown")
             stage = normalize_stage(raw_stage, allow_unknown=True)
             records.append(
@@ -721,6 +758,35 @@ def extract_scan_records_from_payload(
         )
 
     handled = False
+    if "native_stages" in payload:
+        native_stages = payload["native_stages"]
+        if not isinstance(native_stages, list):
+            raise PackerError(
+                f"'native_stages' must be a list in {sanitize_label(source_label)}",
+                code="scan_json_schema_error",
+            )
+        for idx, entry in enumerate(native_stages):
+            if not isinstance(entry, Mapping):
+                raise PackerError(
+                    f"invalid native_stages entry at index {idx} in {sanitize_label(source_label)}",
+                    code="scan_json_schema_error",
+                )
+            if "code_identity" not in entry:
+                raise PackerError(
+                    f"native_stages entry at index {idx} missing 'code_identity' in {sanitize_label(source_label)}",
+                    code="scan_json_schema_error",
+                )
+            shader_hash = normalize_shader_hash(entry["code_identity"])
+            stage = normalize_stage(entry.get("stage", "unknown"), allow_unknown=True)
+            records.append(
+                ShaderInputRecord(
+                    shader_hash=shader_hash,
+                    stage=stage,
+                    origin="pipeline_dump_manifest",
+                )
+            )
+        handled = True
+
     if "files" in payload:
         files = payload["files"]
         if not isinstance(files, list):
@@ -771,10 +837,49 @@ def extract_scan_records_from_payload(
     if not handled:
         raise PackerError(
             f"unrecognized scan JSON schema in {sanitize_label(source_label)} "
-            "(expected 'files[*].shaders' or 'shaders')",
+            "(expected 'files[*].shaders', 'shaders', or 'native_stages')",
             code="scan_json_schema_error",
         )
 
+    return records
+
+
+def load_native_dir_records(native_path: Path | str) -> list[ShaderInputRecord]:
+    """Scan a native RDNA2 dump file or pipeline dump directory using whole-file FNV-1a 64 hashes.
+
+    Keys every discovered standalone native RDNA2 stage (`native/<code-identity>.bin`,
+    `.bin`/`.rdna2`/`.shader`) by its whole-file FNV-1a 64-bit code identity, matching
+    the D3D12 guest layer (`playgta6-pipeline-dump` v1) and `pack-rdna2` (S18).
+    """
+    target = Path(native_path).expanduser()
+    if not target.exists():
+        raise PackerError(
+            f"--native-dir target does not exist: {sanitize_label(target)}",
+            code="native_dir_missing",
+        )
+
+    inspector = _import_rdna2_inspector()
+    try:
+        report = inspector.scan_path(
+            target,
+            whole_file=True if target.is_file() else None,
+        )
+    except OSError as exc:
+        raise PackerError(sanitize_os_error(target, exc), code="native_dir_read_error") from exc
+
+    records: list[ShaderInputRecord] = []
+    for file_res in report.files:
+        if file_res.error is not None:
+            raise PackerError(sanitize_text(file_res.error), code="native_dir_read_error")
+        for hit in file_res.shaders:
+            stage = normalize_stage(hit.stage, allow_unknown=True)
+            records.append(
+                ShaderInputRecord(
+                    shader_hash=hit.code_hash_fnv1a64,
+                    stage=stage,
+                    origin="native_dir",
+                )
+            )
     return records
 
 
@@ -968,6 +1073,7 @@ class PackBuildResult:
         *,
         output_label: str,
         scan_json_labels: Sequence[str] = (),
+        native_dir_labels: Sequence[str] = (),
         hash_spec_count: int = 0,
         wgsl_dir_label: str | None = None,
     ) -> dict[str, Any]:
@@ -981,6 +1087,14 @@ class PackBuildResult:
         profile_count = sum(1 for e in self.entries if e.source == "profile")
         total_wgsl_bytes = sum(e.pack_length for e in self.entries)
 
+        inputs_payload: dict[str, Any] = {
+            "scan_json_files": [sanitize_label(lbl) for lbl in scan_json_labels],
+            "hash_spec_count": int(hash_spec_count),
+            "wgsl_dir": sanitize_label(wgsl_dir_label) if wgsl_dir_label else None,
+        }
+        if native_dir_labels:
+            inputs_payload["native_dirs"] = [sanitize_label(lbl) for lbl in native_dir_labels]
+
         report: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "pack_format": PACK_MAGIC.decode("ascii"),
@@ -990,11 +1104,7 @@ class PackBuildResult:
             "output_file": sanitize_label(output_label),
             "pack_bytes": len(self.pack_bytes),
             "pack_sha256": self.pack_sha256,
-            "inputs": {
-                "scan_json_files": [sanitize_label(lbl) for lbl in scan_json_labels],
-                "hash_spec_count": int(hash_spec_count),
-                "wgsl_dir": sanitize_label(wgsl_dir_label) if wgsl_dir_label else None,
-            },
+            "inputs": inputs_payload,
             "summary": {
                 "input_records_total": self.input_records_total,
                 "packed_entry_count": len(self.entries),
@@ -1148,15 +1258,26 @@ def build_fallback_pack(
         )
 
     resolved_specs: list[tuple[int, ShaderStage, str, str, str | None, str | None]] = []
-    wgsl_cache: dict[Path, str] = {}
+    wgsl_cache: dict[tuple[Path, ShaderStage], tuple[str, bool]] = {}
 
     for shader_hash, stage in sorted_pairs:
         override_hit = override_index.lookup(shader_hash, stage) if override_index is not None else None
         if override_hit is not None:
-            wgsl = wgsl_cache.get(override_hit.path)
-            if wgsl is None:
-                wgsl = read_override_wgsl(override_hit)
-                wgsl_cache[override_hit.path] = wgsl
+            cache_key = (override_hit.path, stage)
+            cached = wgsl_cache.get(cache_key)
+            if cached is None:
+                raw_wgsl = read_override_wgsl(override_hit)
+                if stage == ShaderStage.FRAGMENT:
+                    wgsl, renamed = normalize_fragment_entry_point(raw_wgsl)
+                else:
+                    wgsl, renamed = raw_wgsl, False
+                wgsl_cache[cache_key] = (wgsl, renamed)
+            else:
+                wgsl, renamed = cached
+            if renamed:
+                warnings.append(
+                    f"normalized fragment entry point 'ps_main' -> 'fs_main' for {format_shader_hash(shader_hash)}"
+                )
             resolved_specs.append(
                 (shader_hash, stage, wgsl, "override", None, override_hit.filename)
             )
@@ -1268,7 +1389,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PATH",
-        help="Path to inspect_rdna2_shaders.py --json output (may be repeated).",
+        help="Path to inspect_rdna2_shaders.py --json output or playgta6-pipeline-dump manifest.json (may be repeated).",
+    )
+    parser.add_argument(
+        "--native-dir",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Path to a native RDNA2 dump file or pipeline dump directory to hash whole-file (may be repeated).",
     )
     parser.add_argument(
         "--hashes",
@@ -1317,9 +1445,9 @@ def main(
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if not args.scan_json and not args.hashes:
+    if not args.scan_json and not args.hashes and not args.native_dir:
         print(
-            "Error: at least one of --scan-json or --hashes is required",
+            "Error: at least one of --scan-json, --native-dir, or --hashes is required",
             file=sys.stderr,
         )
         return 2
@@ -1338,6 +1466,11 @@ def main(
             scan_labels.append(sanitize_label(scan_arg))
             records.extend(load_scan_json_records(scan_arg))
 
+        native_labels: list[str] = []
+        for native_arg in args.native_dir:
+            native_labels.append(sanitize_label(native_arg))
+            records.extend(load_native_dir_records(native_arg))
+
         hash_records: list[ShaderInputRecord] = []
         if args.hashes:
             hash_records = parse_hashes_arg(args.hashes)
@@ -1352,6 +1485,7 @@ def main(
         report = result.to_report_dict(
             output_label=out_path.name,
             scan_json_labels=scan_labels,
+            native_dir_labels=native_labels,
             hash_spec_count=len(hash_records),
             wgsl_dir_label=sanitize_label(args.wgsl_dir) if args.wgsl_dir is not None else None,
         )
