@@ -29,6 +29,8 @@ const {
   forwardGpuWorkerMessage,
   createHostImports,
   resolveRuntimeScriptUrl,
+  resolveSideModuleUrl,
+  sanitizeSideModuleUrls,
   buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
@@ -1387,4 +1389,592 @@ test('bootstrapEmscriptenPthreadWorker degrades safely when BroadcastChannel rej
   handle.cleanup();
   handle2.cleanup();
   sender.close();
+});
+
+// Minimal valid Wasm32 SIDE_MODULE-style binary importing:
+// - env.memory (min=1, max=1)
+// - env.__memory_base (i32 immutable global)
+// - env.__table_base (i32 immutable global)
+// - env.__indirect_function_table (funcref table min=1)
+// - GOT.mem.sym_offset (i32 mutable global)
+// - GOT.func.sym_idx (i32 mutable global)
+// - optionally env.host_log(i32, i32) -> ()
+// Exports:
+// - read_got_sum() -> i32  (returns __memory_base + __table_base + GOT.mem.sym_offset + GOT.func.sym_idx)
+// - when withHostLog=true: log_from_base(len: i32) -> () (calls host_log(__memory_base + GOT.mem.sym_offset, len))
+function buildMinimalSideModuleWasm({ withHostLog = false } = {}) {
+  const uleb128 = (value) => {
+    const out = [];
+    let v = value >>> 0;
+    do {
+      let b = v & 0x7f;
+      v >>>= 7;
+      if (v !== 0) b |= 0x80;
+      out.push(b);
+    } while (v !== 0);
+    return out;
+  };
+  const sec = (id, payload) => [id, ...uleb128(payload.length), ...payload];
+  const encStr = (s) => [...uleb128(s.length), ...Array.from(s, (ch) => ch.charCodeAt(0))];
+
+  const typeEntries = [
+    [0x60, 0x00, 0x01, 0x7f], // type 0: () -> i32
+  ];
+  if (withHostLog) {
+    typeEntries.push([0x60, 0x02, 0x7f, 0x7f, 0x00]); // type 1: (i32, i32) -> ()
+    typeEntries.push([0x60, 0x01, 0x7f, 0x00]); // type 2: (i32) -> ()
+  }
+  const typeSec = sec(0x01, [typeEntries.length, ...typeEntries.flat()]);
+
+  const importEntries = [
+    // env.memory (min=1, max=1)
+    [...encStr('env'), ...encStr('memory'), 0x02, 0x01, 0x01, 0x01],
+    // env.__memory_base (global 0: i32 immutable)
+    [...encStr('env'), ...encStr('__memory_base'), 0x03, 0x7f, 0x00],
+    // env.__table_base (global 1: i32 immutable)
+    [...encStr('env'), ...encStr('__table_base'), 0x03, 0x7f, 0x00],
+    // env.__indirect_function_table (table 0: funcref, min=1)
+    [...encStr('env'), ...encStr('__indirect_function_table'), 0x01, 0x70, 0x00, 0x01],
+    // GOT.mem.sym_offset (global 2: i32 mutable)
+    [...encStr('GOT.mem'), ...encStr('sym_offset'), 0x03, 0x7f, 0x01],
+    // GOT.func.sym_idx (global 3: i32 mutable)
+    [...encStr('GOT.func'), ...encStr('sym_idx'), 0x03, 0x7f, 0x01],
+  ];
+  if (withHostLog) {
+    // env.host_log (func 0, type 1)
+    importEntries.push([...encStr('env'), ...encStr('host_log'), 0x00, 0x01]);
+  }
+  const importSec = sec(0x02, [importEntries.length, ...importEntries.flat()]);
+
+  const definedFuncTypes = withHostLog ? [0x00, 0x02] : [0x00];
+  const funcSec = sec(0x03, [definedFuncTypes.length, ...definedFuncTypes]);
+
+  const readGotSumFuncIdx = withHostLog ? 1 : 0;
+  const exportEntries = [[...encStr('read_got_sum'), 0x00, readGotSumFuncIdx]];
+  if (withHostLog) {
+    exportEntries.push([...encStr('log_from_base'), 0x00, 2]);
+  }
+  const exportSec = sec(0x07, [exportEntries.length, ...exportEntries.flat()]);
+
+  // read_got_sum: global.get 0 + global.get 1 + global.get 2 + global.get 3
+  const readGotSumBody = [
+    0x00, // 0 locals
+    0x23, 0x00,
+    0x23, 0x01, 0x6a,
+    0x23, 0x02, 0x6a,
+    0x23, 0x03, 0x6a,
+    0x0b,
+  ];
+  const codeBodies = [[readGotSumBody.length, ...readGotSumBody]];
+  if (withHostLog) {
+    // log_from_base(len): call host_log(global.get 0 + global.get 2, local.get 0)
+    const logFromBaseBody = [
+      0x00, // 0 locals
+      0x23, 0x00,
+      0x23, 0x02, 0x6a,
+      0x20, 0x00,
+      0x10, 0x00,
+      0x0b,
+    ];
+    codeBodies.push([logFromBaseBody.length, ...logFromBaseBody]);
+  }
+  const codeSec = sec(0x0a, [codeBodies.length, ...codeBodies.flat()]);
+
+  return new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...typeSec,
+    ...importSec,
+    ...funcSec,
+    ...exportSec,
+    ...codeSec,
+  ]);
+}
+
+test('resolveSideModuleUrl and buildRuntimeModuleConfig.locateFile resolve guest_part_*.wasm cleanly and log once per side module', () => {
+  // Direct resolveSideModuleUrl helper checks
+  assert.equal(
+    resolveSideModuleUrl('guest_part_0.wasm', 'http://localhost:8080/dist/runtime.js'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    resolveSideModuleUrl('./guest_part_1.wasm', 'http://localhost:8080/dist/runtime.js'),
+    'http://localhost:8080/dist/guest_part_1.wasm',
+  );
+  assert.equal(
+    resolveSideModuleUrl('dist/guest_part_2.wasm', 'http://localhost:8080/dist/runtime.js'),
+    'http://localhost:8080/dist/guest_part_2.wasm',
+  );
+  assert.equal(
+    resolveSideModuleUrl('/dist/guest_part_3.wasm', 'http://localhost:8080/dist/runtime.js'),
+    'http://localhost:8080/dist/guest_part_3.wasm',
+  );
+  assert.equal(
+    resolveSideModuleUrl('guest_part_0.wasm', 'dist/runtime.js'),
+    'dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    resolveSideModuleUrl('dist/guest_part_0.wasm', 'dist/runtime.js'),
+    'dist/guest_part_0.wasm',
+  );
+  assert.equal(resolveSideModuleUrl('guest_part_0.wasm', ''), 'dist/guest_part_0.wasm');
+  assert.equal(
+    resolveSideModuleUrl('https://cdn.example.test/guest_part_0.wasm', 'dist/runtime.js'),
+    'https://cdn.example.test/guest_part_0.wasm',
+  );
+
+  // buildRuntimeModuleConfig locateFile with absolute locationHref + once-per-module reporting
+  const reports = [];
+  const absCfg = buildRuntimeModuleConfig({
+    locationHref: 'http://localhost:8080/loader.js',
+    reportFn: (msg) => reports.push(msg),
+  });
+  assert.equal(
+    absCfg.locateFile('guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    absCfg.locateFile('./guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    absCfg.locateFile('http://localhost:8080/dist/guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    absCfg.locateFile('guest_part_1.wasm'),
+    'http://localhost:8080/dist/guest_part_1.wasm',
+  );
+  assert.equal(
+    absCfg.locateFile('runtime.wasm'),
+    'http://localhost:8080/dist/runtime.wasm',
+  );
+  assert.equal(
+    absCfg.locateFile('runtime.worker.js'),
+    'http://localhost:8080/dist/runtime.worker.js',
+  );
+  // Each side module is reported exactly once; runtime.wasm/runtime.worker.js are not logged as side modules.
+  assert.deepEqual(reports, [
+    'Loading Wasm side module (guest_part_0.wasm)...',
+    'Loading Wasm side module (guest_part_1.wasm)...',
+  ]);
+  assert.equal('dynamicLibraries' in absCfg, false);
+  assert.equal('sideModuleUrls' in absCfg, false);
+
+  // Relative fallback when no locationHref is present
+  const relReports = [];
+  const relCfg = buildRuntimeModuleConfig({
+    locationHref: '',
+    reportFn: (msg) => relReports.push(msg),
+  });
+  assert.equal(relCfg.locateFile('guest_part_0.wasm'), 'dist/guest_part_0.wasm');
+  assert.equal(relCfg.locateFile('dist/guest_part_0.wasm'), 'dist/guest_part_0.wasm');
+  assert.deepEqual(relReports, ['Loading Wasm side module (guest_part_0.wasm)...']);
+});
+
+test('buildRuntimeModuleConfig sanitizes and forwards optional sideModuleUrls and dynamicLibraries', () => {
+  assert.deepEqual(
+    sanitizeSideModuleUrls([
+      'guest_part_0.wasm',
+      '  guest_part_1.wasm  ',
+      '../escape.wasm',
+      'foo\\bar.wasm',
+      'bad.js',
+      'javascript:alert(1).wasm',
+      'https://cdn.example.test/guest_part_2.wasm',
+      'guest_part_0.wasm',
+      '',
+      null,
+    ]),
+    [
+      'guest_part_0.wasm',
+      'guest_part_1.wasm',
+      'https://cdn.example.test/guest_part_2.wasm',
+    ],
+  );
+
+  const reports = [];
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://localhost:8080/loader.js',
+    reportFn: (msg) => reports.push(msg),
+    sideModuleUrls: [
+      'guest_part_0.wasm',
+      'guest_part_1.wasm',
+      '../blocked.wasm',
+      'guest_part_0.wasm',
+    ],
+  });
+  assert.deepEqual(cfg.dynamicLibraries, ['guest_part_0.wasm', 'guest_part_1.wasm']);
+  assert.deepEqual(cfg.sideModuleUrls, [
+    'http://localhost:8080/dist/guest_part_0.wasm',
+    'http://localhost:8080/dist/guest_part_1.wasm',
+  ]);
+
+  // Explicit custom dynamicLibraries entry also logs once when located.
+  const customReports = [];
+  const customCfg = buildRuntimeModuleConfig({
+    locationHref: 'http://localhost:8080/loader.js',
+    reportFn: (msg) => customReports.push(msg),
+    dynamicLibraries: ['custom_chunk.wasm'],
+  });
+  assert.deepEqual(customCfg.dynamicLibraries, ['custom_chunk.wasm']);
+  assert.deepEqual(customCfg.sideModuleUrls, ['http://localhost:8080/dist/custom_chunk.wasm']);
+  assert.equal(
+    customCfg.locateFile('custom_chunk.wasm'),
+    'http://localhost:8080/dist/custom_chunk.wasm',
+  );
+  assert.equal(
+    customCfg.locateFile('custom_chunk.wasm'),
+    'http://localhost:8080/dist/custom_chunk.wasm',
+  );
+  assert.deepEqual(customReports, ['Loading Wasm side module (custom_chunk.wasm)...']);
+});
+
+test('installPthreadHostImportShim preserves GOT.mem, GOT.func, __memory_base, __table_base, __indirect_function_table, Proxy env, and non-stub functions for side modules', async () => {
+  // 1. Mock side module with Proxy env (Emscripten dylink style), GOT.mem, GOT.func, and stub host_*
+  let capturedImports = null;
+  let boundMemoryCount = 0;
+  let lastBoundMemory = null;
+  class MockWasmInstance {
+    constructor(mod, imports) {
+      this.mod = mod;
+      this.imports = imports;
+      capturedImports = imports;
+    }
+  }
+
+  const mockHostImports = {
+    env: {
+      host_log: () => 'real-host-log',
+      host_httpfs_open: () => 5,
+      host_httpfs_read: () => 16n,
+      host_httpfs_close: () => {},
+      host_wgpu_submit: () => 'real-wgpu-submit',
+    },
+    setMemory(mem) {
+      boundMemoryCount += 1;
+      lastBoundMemory = mem;
+    },
+  };
+  const mockScope = { WebAssembly: { Instance: MockWasmInstance } };
+  const restoreMock = installPthreadHostImportShim(mockScope, mockHostImports);
+
+  const makeStub = (name) => {
+    const fn = () => {
+      throw new Error(`missing function: ${name}`);
+    };
+    fn.stub = true;
+    return fn;
+  };
+  const sharedMem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  const memoryBase = new WebAssembly.Global({ value: 'i32', mutable: false }, 64);
+  const tableBase = new WebAssembly.Global({ value: 'i32', mutable: false }, 8);
+  const indirectTable = new WebAssembly.Table({ initial: 4, element: 'anyfunc' });
+  const liftedFn = () => 0x140001000;
+  const dynamicResolvedFn = () => 'resolved-via-dylink-proxy';
+  const customHostClose = () => 'real-non-stub-close';
+  const gotMemProxy = new Proxy(
+    { sym_offset: new WebAssembly.Global({ value: 'i32', mutable: true }, 16) },
+    { get: (t, p) => t[p] },
+  );
+  const gotFuncProxy = new Proxy(
+    { sym_idx: new WebAssembly.Global({ value: 'i32', mutable: true }, 3) },
+    { get: (t, p) => t[p] },
+  );
+
+  const baseEnvTarget = {
+    memory: sharedMem,
+    __memory_base: memoryBase,
+    __table_base: tableBase,
+    __indirect_function_table: indirectTable,
+    lifted_fn: liftedFn,
+    host_log: makeStub('host_log'),
+    host_wgpu_submit: makeStub('host_wgpu_submit'),
+    host_httpfs_close: customHostClose,
+  };
+  const dylinkEnvProxy = new Proxy(baseEnvTarget, {
+    get(target, prop) {
+      if (prop in target) {
+        return target[prop];
+      }
+      if (prop === 'lazy_lifted_0x140002000') {
+        return dynamicResolvedFn;
+      }
+      return undefined;
+    },
+  });
+
+  new mockScope.WebAssembly.Instance('fake-side-mod', {
+    env: dylinkEnvProxy,
+    'GOT.mem': gotMemProxy,
+    'GOT.func': gotFuncProxy,
+  });
+
+  assert.equal(boundMemoryCount, 1);
+  assert.equal(lastBoundMemory, sharedMem);
+  assert.equal(capturedImports['GOT.mem'], gotMemProxy);
+  assert.equal(capturedImports['GOT.func'], gotFuncProxy);
+  assert.equal(capturedImports.env.memory, sharedMem);
+  assert.equal(capturedImports.env.__memory_base, memoryBase);
+  assert.equal(capturedImports.env.__table_base, tableBase);
+  assert.equal(capturedImports.env.__indirect_function_table, indirectTable);
+  assert.equal(capturedImports.env.lifted_fn, liftedFn);
+  assert.equal(capturedImports.env.lazy_lifted_0x140002000, dynamicResolvedFn);
+  assert.equal(capturedImports.env.host_log, mockHostImports.env.host_log);
+  assert.equal(capturedImports.env.host_wgpu_submit, mockHostImports.env.host_wgpu_submit);
+  assert.equal(capturedImports.env.host_httpfs_close, customHostClose);
+
+  // Calling with no env.memory must NOT call setMemory again (preserve previously bound memory).
+  new mockScope.WebAssembly.Instance('fake-side-mod-no-mem', {
+    env: { __memory_base: memoryBase },
+    'GOT.mem': gotMemProxy,
+    'GOT.func': gotFuncProxy,
+  });
+  assert.equal(boundMemoryCount, 1);
+  assert.equal(lastBoundMemory, sharedMem);
+
+  restoreMock();
+  assert.equal(mockScope.WebAssembly.Instance, MockWasmInstance);
+
+  // 2. Real compiled WebAssembly.Module side modules (both without and with host_log)
+  const logs = [];
+  const realHostImports = createHostImports({
+    log: (msg) => logs.push(msg),
+    report: () => {},
+  });
+
+  let sawRawImportsOnNoHostMod = null;
+  const SpyInstance = new Proxy(WebAssembly.Instance, {
+    construct(target, args, newTarget) {
+      sawRawImportsOnNoHostMod = args[1];
+      return Reflect.construct(target, args, newTarget === SpyInstance ? target : newTarget);
+    },
+  });
+  const realScope = {
+    WebAssembly: {
+      Module: WebAssembly.Module,
+      Instance: SpyInstance,
+      instantiate: WebAssembly.instantiate,
+    },
+  };
+  const restoreReal = installPthreadHostImportShim(realScope, realHostImports);
+
+  // 2a. Side module that imports NO host_* functions: imports & imports.env passed completely untouched!
+  const noHostSideMod = new WebAssembly.Module(buildMinimalSideModuleWasm({ withHostLog: false }));
+  const noHostImports = {
+    env: {
+      memory: sharedMem,
+      __memory_base: memoryBase,
+      __table_base: tableBase,
+      __indirect_function_table: indirectTable,
+    },
+    'GOT.mem': gotMemProxy,
+    'GOT.func': gotFuncProxy,
+  };
+  const noHostInst = new realScope.WebAssembly.Instance(noHostSideMod, noHostImports);
+  assert.equal(sawRawImportsOnNoHostMod, noHostImports);
+  assert.equal(sawRawImportsOnNoHostMod.env, noHostImports.env);
+  assert.equal(noHostInst.exports.read_got_sum(), 64 + 8 + 16 + 3);
+
+  // 2b. Side module importing GOT.mem, GOT.func, __memory_base, __indirect_function_table AND env.host_log
+  const withHostSideMod = new WebAssembly.Module(buildMinimalSideModuleWasm({ withHostLog: true }));
+  const msg = 'hello from side module';
+  const encoded = new TextEncoder().encode(msg);
+  new Uint8Array(sharedMem.buffer).set(encoded, 64 + 16);
+
+  const sideEnvProxy = new Proxy(
+    {
+      memory: sharedMem,
+      __memory_base: memoryBase,
+      __table_base: tableBase,
+      __indirect_function_table: indirectTable,
+      host_log: makeStub('host_log'),
+    },
+    { get: (t, p) => t[p] },
+  );
+  const withHostInst = new realScope.WebAssembly.Instance(withHostSideMod, {
+    env: sideEnvProxy,
+    'GOT.mem': gotMemProxy,
+    'GOT.func': gotFuncProxy,
+  });
+  assert.equal(withHostInst.exports.read_got_sum(), 64 + 8 + 16 + 3);
+  withHostInst.exports.log_from_base(encoded.byteLength);
+  assert.deepEqual(logs, [msg]);
+
+  // 2c. Async WebAssembly.instantiate path also patches stub host_log while preserving GOT.*
+  const asyncInst = await realScope.WebAssembly.instantiate(withHostSideMod, {
+    env: sideEnvProxy,
+    'GOT.mem': gotMemProxy,
+    'GOT.func': gotFuncProxy,
+  });
+  assert.equal(asyncInst.exports.read_got_sum(), 64 + 8 + 16 + 3);
+  asyncInst.exports.log_from_base(encoded.byteLength);
+  assert.deepEqual(logs, [msg, msg]);
+
+  restoreReal();
+  assert.equal(realScope.WebAssembly.Instance, SpyInstance);
+  assert.equal(realScope.WebAssembly.instantiate, WebAssembly.instantiate);
+});
+
+test('bootstrapEmscriptenPthreadWorker configures dist/ locateFile for side modules inside em-pthread workers', () => {
+  const bus = createMockBroadcastBus();
+  const mockScope = {
+    name: 'em-pthread',
+    location: { href: 'http://localhost:8080/loader.js' },
+    WebAssembly: { Instance: WebAssembly.Instance },
+  };
+  let importedUrl = null;
+  const handle = bootstrapEmscriptenPthreadWorker({
+    scope: mockScope,
+    importScriptsFn: (url) => {
+      importedUrl = url;
+    },
+    BroadcastChannelCtor: bus.BusBroadcastChannel,
+  });
+
+  assert.equal(importedUrl, './dist/runtime.js');
+  assert.equal(handle.runtimeScriptUrl, 'http://localhost:8080/dist/runtime.js');
+  assert.equal(
+    handle.locateFile('guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+  assert.equal(
+    mockScope.Module.locateFile('guest_part_1.wasm'),
+    'http://localhost:8080/dist/guest_part_1.wasm',
+  );
+  // Second lookup of guest_part_0.wasm must not duplicate progress logs.
+  assert.equal(
+    mockScope.Module.locateFile('./guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
+
+  const progressLabels = bus.postedLog
+    .filter((entry) => entry.channel === 'game-progress' && entry.data && entry.data.label)
+    .map((entry) => entry.data.label);
+  assert.deepEqual(progressLabels, [
+    'Loading Wasm side module (guest_part_0.wasm)...',
+    'Loading Wasm side module (guest_part_1.wasm)...',
+  ]);
+
+  handle.cleanup();
+  assert.equal('Module' in mockScope, false);
+
+  // Fallback without scope.location resolves cleanly to relative dist/
+  const relHandle = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: bus.BusBroadcastChannel,
+  });
+  assert.equal(relHandle.locateFile('guest_part_0.wasm'), 'dist/guest_part_0.wasm');
+  relHandle.cleanup();
+});
+
+test('loader.js coordinator worker forwards sideModuleUrls to createRuntimeModule', async () => {
+  let receivedOpts = null;
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+      if (msg.init) {
+        queueMicrotask(() => {
+          if (this.onmessage) {
+            this.onmessage({ data: { ready: true, summary: 'ok', adapter: 'mock' } });
+          }
+        });
+      }
+    }
+  }
+
+  const workerSelf = {
+    location: { href: 'http://localhost:8080/loader.js' },
+    onmessage: null,
+    postMessage() {},
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url) => {
+      if (url === './dist/runtime.js') {
+        return { ok: true, status: 200 };
+      }
+      return { ok: false, status: 404 };
+    },
+    importScripts(scriptPath) {
+      if (scriptPath === './dist/runtime.js') {
+        workerSelf.createRuntimeModule = async (opts) => {
+          receivedOpts = opts;
+          return {};
+        };
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+      sideModuleUrls: ['guest_part_0.wasm', 'guest_part_1.wasm', 'guest_part_2.wasm', 'guest_part_3.wasm'],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(receivedOpts, 'Expected createRuntimeModule to be invoked');
+  assert.deepEqual(Array.from(receivedOpts.dynamicLibraries), [
+    'guest_part_0.wasm',
+    'guest_part_1.wasm',
+    'guest_part_2.wasm',
+    'guest_part_3.wasm',
+  ]);
+  assert.deepEqual(Array.from(receivedOpts.sideModuleUrls), [
+    'http://localhost:8080/dist/guest_part_0.wasm',
+    'http://localhost:8080/dist/guest_part_1.wasm',
+    'http://localhost:8080/dist/guest_part_2.wasm',
+    'http://localhost:8080/dist/guest_part_3.wasm',
+  ]);
+  assert.equal(
+    receivedOpts.locateFile('guest_part_0.wasm'),
+    'http://localhost:8080/dist/guest_part_0.wasm',
+  );
 });
