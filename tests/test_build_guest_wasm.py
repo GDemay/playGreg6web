@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25)."""
 
 from __future__ import annotations
 
@@ -1294,6 +1294,331 @@ class TestWasm64IrRetargetAndFlags(unittest.TestCase):
             user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
             if len(user) >= 3:
                 self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+
+class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        (repo / "runtime").mkdir(exist_ok=True)
+        return repo
+
+    def test_strip_appends_strip_all_and_assertions_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                strip=True,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(len(runner.link_calls), 1)
+            link = runner.link_calls[0]
+            self.assertIn("-Wl,--strip-all", link)
+            self.assertIn("-sASSERTIONS=0", link)
+            self.assertIn("-Wl,--strip-all", report.link_flags)
+            self.assertIn("-sASSERTIONS=0", report.link_flags)
+            self.assertIn("-Wl,--strip-all", report.link_argv)
+            self.assertIn("-sASSERTIONS=0", report.link_argv)
+            # Default LINK_FLAGS constant remains untouched for CMake contract.
+            self.assertNotIn("-Wl,--strip-all", bgw.LINK_FLAGS)
+            self.assertNotIn("-sASSERTIONS=0", bgw.LINK_FLAGS)
+
+            # CLI --strip works in dry-run JSON output.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--strip",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache2"),
+                    "--out-dir",
+                    str(root / "dist2"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertIn("-Wl,--strip-all", payload["link_flags"])
+            self.assertIn("-sASSERTIONS=0", payload["link_flags"])
+            self.assertIn("-Wl,--strip-all", payload["link_argv"])
+            self.assertIn("-sASSERTIONS=0", payload["link_argv"])
+
+    def test_extra_link_flag_cli_and_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                extra_link_flags=("-Wl,--gc-sections", "-sINITIAL_MEMORY=2GB"),
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            link = runner.link_calls[0]
+            self.assertIn("-Wl,--gc-sections", link)
+            self.assertIn("-sINITIAL_MEMORY=2GB", link)
+            self.assertIn("-Wl,--gc-sections", report.link_flags)
+            self.assertIn("-sINITIAL_MEMORY=2GB", report.link_flags)
+
+            # Repeatable CLI --extra-link-flag accepts both space-separated and `=` forms.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--extra-link-flag",
+                    "-Wl,--gc-sections",
+                    "--extra-link-flag=-sINITIAL_MEMORY=2GB",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache2"),
+                    "--out-dir",
+                    str(root / "dist2"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertIn("-Wl,--gc-sections", payload["link_flags"])
+            self.assertIn("-sINITIAL_MEMORY=2GB", payload["link_flags"])
+            self.assertIn("-Wl,--gc-sections", payload["link_argv"])
+            self.assertIn("-sINITIAL_MEMORY=2GB", payload["link_argv"])
+
+    def test_pthread_pool_size_override_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                pthread_pool_size=8,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            link = runner.link_calls[0]
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", link)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", link)
+            self.assertIn("-sPTHREAD_POOL_SIZE=8", report.link_flags)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", report.link_flags)
+
+            # CLI --pthread-pool-size overrides default pool size.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--pthread-pool-size",
+                    "12",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache2"),
+                    "--out-dir",
+                    str(root / "dist2"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertIn("-sPTHREAD_POOL_SIZE=12", payload["link_flags"])
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", payload["link_flags"])
+            self.assertIn("-sPTHREAD_POOL_SIZE=12", payload["link_argv"])
+
+            # Invalid pool sizes (< 1) raise BuildGuestWasmError / CLI exit code 2.
+            with self.assertRaises(bgw.BuildGuestWasmError):
+                bgw.resolve_link_flags(pthread_pool_size=0)
+            with self.assertRaises(bgw.BuildGuestWasmError):
+                bgw.resolve_link_flags(pthread_pool_size=-2)
+            bad_code, bad_out, _bad_err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--pthread-pool-size",
+                    "0",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("pthread-pool-size" in e for e in bad_payload["errors"]))
+
+    def test_opt_os_and_oz_compile_and_link_flags(self) -> None:
+        self.assertEqual(bgw.parse_opt_level("Os"), "Os")
+        self.assertEqual(bgw.parse_opt_level("-Os"), "Os")
+        self.assertEqual(bgw.parse_opt_level("s"), "Os")
+        self.assertEqual(bgw.parse_opt_level("Oz"), "Oz")
+        self.assertEqual(bgw.parse_opt_level("-Oz"), "Oz")
+        self.assertEqual(bgw.parse_opt_level("z"), "Oz")
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.parse_opt_level("O4")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            for opt_level in ("Os", "Oz"):
+                runner = RecordingRunner()
+                report = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=root / f"cache-{opt_level}",
+                    out_dir=root / f"dist-{opt_level}",
+                    jobs=2,
+                    opt=opt_level,
+                    runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                    run_command=runner,
+                    which_fn=lambda _name: None,
+                )
+                self.assertTrue(report.ok, report.errors)
+                self.assertEqual(report.opt, opt_level)
+                expected_flag = f"-{opt_level}"
+                self.assertIn(expected_flag, report.compile_flags)
+                self.assertIn(expected_flag, report.link_flags)
+                self.assertTrue(all(expected_flag in call for call in runner.compile_calls))
+                self.assertIn(expected_flag, runner.link_calls[0])
+
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--opt",
+                    "Oz",
+                    "--strip",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-cli"),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["opt"], "Oz")
+            self.assertIn("-Oz", payload["compile_flags"])
+            self.assertIn("-Oz", payload["link_flags"])
+            self.assertIn("-Oz", payload["link_argv"])
+            self.assertIn("-Wl,--strip-all", payload["link_argv"])
+
+    def test_v8_1gib_size_check_and_warning(self) -> None:
+        self.assertEqual(bgw.V8_MAX_WASM_MODULE_BYTES, 1024 * 1024 * 1024)
+        self.assertEqual(bgw.V8_MAX_WASM_MODULE_BYTES, 1073741824)
+
+        exceeds_exact, warn_exact = bgw.check_v8_wasm_size(bgw.V8_MAX_WASM_MODULE_BYTES)
+        self.assertFalse(exceeds_exact)
+        self.assertIsNone(warn_exact)
+
+        exceeds_over1, warn_over1 = bgw.check_v8_wasm_size(bgw.V8_MAX_WASM_MODULE_BYTES + 1)
+        self.assertTrue(exceeds_over1)
+        self.assertIsNotNone(warn_over1)
+        assert warn_over1 is not None
+        self.assertIn(str(bgw.V8_MAX_WASM_MODULE_BYTES + 1), warn_over1)
+        self.assertIn("1073741824", warn_over1)
+        self.assertIn("--strip", warn_over1)
+        self.assertIn("--opt Oz", warn_over1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+
+            # Under-limit real build records exact wasm_bytes and no V8 warning.
+            small_runner = RecordingRunner()
+            small_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-small",
+                out_dir=root / "dist-small",
+                jobs=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=small_runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(small_report.ok, small_report.errors)
+            self.assertEqual(small_report.wasm_bytes, 8)
+            self.assertFalse(small_report.exceeds_v8_1gib_limit)
+            self.assertEqual(small_report.warnings, [])
+            small_json = json.loads(bgw.report_to_json(small_report))
+            self.assertEqual(small_json["wasm_bytes"], 8)
+            self.assertFalse(small_json["exceeds_v8_1gib_limit"])
+            small_text = bgw.format_report_text(small_report)
+            self.assertIn("Wasm size: 8 bytes", small_text)
+            self.assertNotIn("EXCEEDS V8 1 GiB LIMIT", small_text)
+
+            # Over-limit build (live observed 1,092,331,701 bytes) emits clear warning.
+            oversized_bytes = 1_092_331_701
+            orig_object_bytes = bgw._object_bytes
+
+            def fake_object_bytes(path: Path | None) -> int:
+                if path is not None and path.name == bgw.RUNTIME_WASM:
+                    return oversized_bytes
+                return orig_object_bytes(path)
+
+            big_runner = RecordingRunner()
+            bgw._object_bytes = fake_object_bytes
+            try:
+                big_report = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=root / "cache-big",
+                    out_dir=root / "dist-big",
+                    jobs=1,
+                    runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                    run_command=big_runner,
+                    which_fn=lambda _name: None,
+                )
+            finally:
+                bgw._object_bytes = orig_object_bytes
+
+            self.assertTrue(big_report.ok, big_report.errors)
+            self.assertEqual(big_report.wasm_bytes, oversized_bytes)
+            self.assertTrue(big_report.exceeds_v8_1gib_limit)
+            self.assertEqual(len(big_report.warnings), 1)
+            warning = big_report.warnings[0]
+            self.assertIn(str(oversized_bytes), warning)
+            self.assertIn("1073741824", warning)
+            self.assertIn("--strip", warning)
+            self.assertIn("--opt Oz", warning)
+
+            big_json = json.loads(bgw.report_to_json(big_report))
+            self.assertEqual(big_json["wasm_bytes"], oversized_bytes)
+            self.assertTrue(big_json["exceeds_v8_1gib_limit"])
+            self.assertIn(warning, big_json["warnings"])
+
+            big_text = bgw.format_report_text(big_report)
+            self.assertIn(f"Wasm size: {oversized_bytes} bytes", big_text)
+            self.assertIn("[EXCEEDS V8 1 GiB LIMIT]", big_text)
+            self.assertIn("--opt Oz", big_text)
 
 
 class TestLinkFlagContract(unittest.TestCase):
