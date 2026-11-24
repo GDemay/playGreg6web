@@ -827,3 +827,19 @@ test('integration: bootstrapPlayGta6App + HudController wired to web/index.html 
     );
   }
 });
+
+test('web/index.html wires W45 splash overlay root, UMD boot scripts, and global hooks', () => {
+  assert.match(indexHtml, /id="splash-overlay-root"/);
+  assert.match(indexHtml, /<script\s+src="\.\/runtime\/pgim_preloader\.js"><\/script>/);
+  assert.match(indexHtml, /<script\s+src="\.\/ui\/splash_overlay\.js"><\/script>/);
+  assert.match(indexHtml, /<script\s+src="\.\/runtime\/boot_orchestrator\.js"><\/script>/);
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, 'web', 'runtime', 'pgim_preloader.js')), true);
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, 'web', 'ui', 'splash_overlay.js')), true);
+  assert.equal(fs.existsSync(path.join(REPO_ROOT, 'web', 'runtime', 'boot_orchestrator.js')), true);
+
+  const moduleScript = extractModuleScript(indexHtml);
+  assert.match(moduleScript, /getElementById\(\s*['"]splash-overlay-root['"]\s*\)/);
+  assert.match(moduleScript, /splashContainer:\s*splashOverlayRoot/);
+  assert.match(moduleScript, /window\.playgta6SplashOverlay\s*=\s*app\.splashOverlay/);
+  assert.match(moduleScript, /window\.playgta6BootOrchestrator\s*=\s*app\.bootOrchestrator/);
+});

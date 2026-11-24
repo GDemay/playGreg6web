@@ -17,6 +17,7 @@ import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
 import { PerfMonitor } from './telemetry/perf_monitor.js';
 import { CrashReporter } from './telemetry/crash_report.js';
+import { BootTracer } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_VIEWPORT_WIDTH = 640;
@@ -210,6 +211,85 @@ function createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory }
   };
 }
 
+function createSplashOverlayAdapter(splashOverlay) {
+  if (!splashOverlay || typeof splashOverlay !== 'object') {
+    return null;
+  }
+  const hasBootState = typeof splashOverlay.updateBootState === 'function';
+  if (!hasBootState) {
+    return splashOverlay;
+  }
+  return {
+    init(payload = {}) {
+      if (typeof splashOverlay.show === 'function') {
+        splashOverlay.show();
+      }
+      if (payload.splashImage && typeof splashOverlay.setSplashImageUrl === 'function') {
+        splashOverlay.setSplashImageUrl(payload.splashImage);
+      }
+      if (payload.tracer) {
+        splashOverlay.updateBootState(payload.tracer);
+      }
+    },
+    show() {
+      if (typeof splashOverlay.show === 'function') {
+        splashOverlay.show();
+      }
+    },
+    setSplashImage(url) {
+      if (typeof splashOverlay.setSplashImageUrl === 'function') {
+        splashOverlay.setSplashImageUrl(url);
+      } else if (typeof splashOverlay.setSplashImage === 'function') {
+        splashOverlay.setSplashImage(url);
+      }
+    },
+    update(payload = {}) {
+      const base = payload.tracer && typeof payload.tracer === 'object' ? { ...payload.tracer } : {};
+      if (payload.progress && typeof payload.progress === 'object') {
+        base.streamingProgress = payload.progress;
+      }
+      if (payload.phase === 'DISCOVERING' && !base.statusText) {
+        base.statusText = 'Discovering local boot assets...';
+      } else if (payload.phase === 'PRELOADING' && !base.statusText) {
+        base.statusText = 'Streaming guest image & shaders...';
+      } else if (payload.phase === 'LAUNCHING_RUNTIME' && !base.statusText) {
+        base.statusText = 'Launching Wasm64 runtime...';
+      } else if (payload.phase === 'FALLBACK_SMOKE_DEMO' && !base.statusText) {
+        base.statusText = 'Starting WebGPU smoke demo...';
+      }
+      splashOverlay.updateBootState(base);
+    },
+    updateProgress(progress) {
+      splashOverlay.updateBootState({ streamingProgress: progress });
+    },
+    updateTracer(tracer) {
+      splashOverlay.updateBootState(tracer);
+    },
+    dismiss(meta) {
+      if (typeof splashOverlay.onFirstPresent === 'function') {
+        splashOverlay.onFirstPresent(meta);
+      } else if (typeof splashOverlay.dismiss === 'function') {
+        splashOverlay.dismiss(meta);
+      }
+    },
+    hide() {
+      // Allow smooth dismiss fade to complete when dismiss() already started fading.
+      const state = typeof splashOverlay.getState === 'function' ? splashOverlay.getState() : null;
+      if (state && state.fading) {
+        return;
+      }
+      if (typeof splashOverlay.hide === 'function') {
+        splashOverlay.hide();
+      }
+    },
+    destroy() {
+      if (typeof splashOverlay.destroy === 'function') {
+        splashOverlay.destroy();
+      }
+    },
+  };
+}
+
 /**
  * Unified lifecycle handle returned by `bootstrapPlayGta6App(options)`.
  */
@@ -222,9 +302,14 @@ export class PlayGta6AppHandle {
     this.inputBridge = components.inputBridge;
     this.audioEngine = components.audioEngine;
     this.storageManager = components.storageManager;
+    this.bootTracer = components.bootTracer || null;
+    this.splashOverlay = components.splashOverlay || null;
+    this.pgimPreloader = components.pgimPreloader || null;
+    this.bootOrchestrator = components.bootOrchestrator || null;
 
     this._getSmokeRunner = components.getSmokeRunner;
     this._getWasmWorker = components.getWasmWorker;
+    this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._start = components.start;
     this._stop = components.stop;
     this._resize = components.resize;
@@ -242,6 +327,10 @@ export class PlayGta6AppHandle {
 
   getWasmWorker() {
     return this._getWasmWorker();
+  }
+
+  notifyFirstPresent(meta) {
+    return this._notifyFirstPresent(meta);
   }
 
   start(opts) {
@@ -543,6 +632,152 @@ export function bootstrapPlayGta6App(options = {}) {
     },
   });
 
+  // 5b. BootTracer (W40), optional SplashOverlay (W42), PgimPreloader (W41) & BootOrchestrator (W44).
+  const bootTracerOptions =
+    options.bootTracerOptions && typeof options.bootTracerOptions === 'object'
+      ? options.bootTracerOptions
+      : {};
+  const bootTracer =
+    options.bootTracer !== undefined
+      ? options.bootTracer
+      : new BootTracer({
+          ...bootTracerOptions,
+          crashReporter,
+          hud,
+          now: bootTracerOptions.now || now,
+        });
+
+  const globalObj =
+    windowObj && typeof windowObj === 'object'
+      ? windowObj
+      : typeof globalThis !== 'undefined'
+        ? globalThis
+        : {};
+
+  const splashContainer =
+    options.splashContainer !== undefined ? options.splashContainer : null;
+  const SplashOverlayCtor =
+    options.SplashOverlayCtor ||
+    (globalObj.PlayGta6SplashOverlay && globalObj.PlayGta6SplashOverlay.SplashOverlayController) ||
+    (typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6SplashOverlay &&
+      globalThis.PlayGta6SplashOverlay.SplashOverlayController) ||
+    null;
+
+  let splashOverlay = null;
+  let ownsSplashOverlay = false;
+  if (options.splashOverlay !== undefined) {
+    splashOverlay = options.splashOverlay;
+  } else if (
+    options.enableSplashOverlay !== false &&
+    splashContainer &&
+    typeof SplashOverlayCtor === 'function'
+  ) {
+    const splashOverlayOptions =
+      options.splashOverlayOptions && typeof options.splashOverlayOptions === 'object'
+        ? options.splashOverlayOptions
+        : {};
+    splashOverlay = new SplashOverlayCtor({
+      ...splashOverlayOptions,
+      parent: splashContainer,
+      documentObj: documentObj || undefined,
+      windowObj: windowObj || undefined,
+    });
+    ownsSplashOverlay = true;
+  }
+
+  const PgimPreloaderCtor =
+    options.PgimPreloaderCtor ||
+    (globalObj.PlayGta6PgimPreloader && globalObj.PlayGta6PgimPreloader.PgimPreloader) ||
+    (typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6PgimPreloader &&
+      globalThis.PlayGta6PgimPreloader.PgimPreloader) ||
+    null;
+  const pgimPreloader =
+    options.pgimPreloader !== undefined
+      ? options.pgimPreloader
+      : typeof PgimPreloaderCtor === 'function'
+        ? new PgimPreloaderCtor({
+            ...(options.pgimPreloaderOptions && typeof options.pgimPreloaderOptions === 'object'
+              ? options.pgimPreloaderOptions
+              : {}),
+            fetchImpl: fetchImpl || undefined,
+          })
+        : null;
+
+  const BootOrchestratorCtor =
+    options.BootOrchestratorCtor ||
+    (globalObj.PlayGta6BootOrchestrator && globalObj.PlayGta6BootOrchestrator.BootOrchestrator) ||
+    (typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6BootOrchestrator &&
+      globalThis.PlayGta6BootOrchestrator.BootOrchestrator) ||
+    null;
+
+  let bootOrchestrator = null;
+  let ownsBootOrchestrator = false;
+  let firstPresentNotified = false;
+
+  function notifyFirstPresent(meta = {}) {
+    if (destroyed) {
+      return { ok: false, destroyed: true };
+    }
+    if (firstPresentNotified) {
+      return { ok: true, alreadyPresented: true };
+    }
+    firstPresentNotified = true;
+    if (bootOrchestrator && typeof bootOrchestrator.notifyFirstPresent === 'function') {
+      try {
+        return bootOrchestrator.notifyFirstPresent(meta);
+      } catch {
+        // Fall through to direct overlay dismissal.
+      }
+    }
+    if (bootTracer && typeof bootTracer.markMilestone === 'function') {
+      try {
+        bootTracer.markMilestone('FIRST_PRESENT', meta);
+      } catch {
+        // Ignore duplicate/validation errors.
+      }
+    }
+    if (splashOverlay) {
+      try {
+        if (typeof splashOverlay.onFirstPresent === 'function') {
+          splashOverlay.onFirstPresent(meta);
+        } else if (typeof splashOverlay.dismiss === 'function') {
+          splashOverlay.dismiss(meta);
+        }
+      } catch {
+        // Overlay errors must never interrupt rendering.
+      }
+    }
+    return { ok: true, alreadyPresented: false };
+  }
+
+  function feedBootLog(line) {
+    if (bootOrchestrator && typeof bootOrchestrator.feedRuntimeLog === 'function') {
+      try {
+        bootOrchestrator.feedRuntimeLog(line);
+        return;
+      } catch {
+        // Fall back to direct tracer update.
+      }
+    }
+    if (bootTracer && typeof bootTracer.ingestLog === 'function') {
+      try {
+        bootTracer.ingestLog(line);
+        const summary = bootTracer.getSummary();
+        if (splashOverlay && typeof splashOverlay.updateBootState === 'function') {
+          splashOverlay.updateBootState(summary);
+        }
+        if (summary && summary.readyForSplash) {
+          notifyFirstPresent({ source: 'boot_log' });
+        }
+      } catch {
+        // Tracer errors must never interrupt runtime logs.
+      }
+    }
+  }
+
   // Shared mutable lifecycle state managed by the app handle.
   const smokeDemoOptions =
     options.smokeDemoOptions && typeof options.smokeDemoOptions === 'object'
@@ -691,6 +926,7 @@ export function bootstrapPlayGta6App(options = {}) {
             crashReporter.recordError('worker_error', String(data.error), {
               source: 'loader',
             });
+            feedBootLog(`ERROR: ${data.error}`);
             if (hud && typeof hud.appendLog === 'function') {
               try {
                 hud.appendLog(`ERROR: ${data.error}`, 'error');
@@ -700,6 +936,7 @@ export function bootstrapPlayGta6App(options = {}) {
             }
           } else if (data.label) {
             crashReporter.recordLog('info', 'loader', String(data.label));
+            feedBootLog(String(data.label));
             if (hud && typeof hud.appendLog === 'function') {
               try {
                 hud.appendLog(String(data.label), String(data.label).includes('ready') ? 'ok' : 'info');
@@ -916,6 +1153,7 @@ export function bootstrapPlayGta6App(options = {}) {
     } else {
       runner.init();
     }
+    notifyFirstPresent({ source: 'smoke_demo' });
 
     const cleanupDeviceListeners = () => {
       deviceStopped = true;
@@ -967,6 +1205,39 @@ export function bootstrapPlayGta6App(options = {}) {
     audioGestureTarget:
       options.audioGestureTarget !== undefined ? options.audioGestureTarget : windowObj || undefined,
   });
+
+  // 7b. Optional BootOrchestrator (W44) wired when splash overlay or explicit flag is enabled.
+  const useBootOrchestrator =
+    options.bootOrchestrator !== undefined ||
+    options.enableBootOrchestrator === true ||
+    Boolean(splashOverlay && options.enableBootOrchestrator !== false);
+
+  let lastBootSessionResult = null;
+  let pendingStartOpts = undefined;
+
+  if (options.bootOrchestrator !== undefined) {
+    bootOrchestrator = options.bootOrchestrator;
+  } else if (useBootOrchestrator && typeof BootOrchestratorCtor === 'function') {
+    const splashAdapter = createSplashOverlayAdapter(splashOverlay);
+    bootOrchestrator = new BootOrchestratorCtor({
+      fetchImpl,
+      statusUrl,
+      splashOverlay: splashAdapter,
+      preloader: pgimPreloader,
+      bootTracer,
+      onLaunchRuntime: async () => {
+        lastBootSessionResult = await session.start(pendingStartOpts);
+      },
+      onFallbackSmokeDemo: async () => {
+        const fallbackOpts =
+          pendingStartOpts && typeof pendingStartOpts === 'object'
+            ? { preferSmoke: true, ...pendingStartOpts }
+            : { preferSmoke: true };
+        lastBootSessionResult = await session.start(fallbackOpts);
+      },
+    });
+    ownsBootOrchestrator = true;
+  }
 
   // 8. Viewport resize handler (manual API + optional window resize listener).
   function resize(nextWidth, nextHeight, nextDpr) {
@@ -1026,6 +1297,18 @@ export function bootstrapPlayGta6App(options = {}) {
         mode: SESSION_MODE.NONE,
         error: new Error('PlayGta6AppHandle has been destroyed'),
       };
+    }
+    if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
+      pendingStartOpts = startOpts;
+      lastBootSessionResult = null;
+      const bootResult = await bootOrchestrator.start();
+      if (lastBootSessionResult) {
+        return lastBootSessionResult;
+      }
+      if (bootResult && bootResult.ok === false) {
+        return session.start(startOpts);
+      }
+      return session.start(startOpts);
     }
     return session.start(startOpts);
   }
@@ -1106,6 +1389,22 @@ export function bootstrapPlayGta6App(options = {}) {
       }
 
       try {
+        if (ownsBootOrchestrator && bootOrchestrator && typeof bootOrchestrator.destroy === 'function') {
+          bootOrchestrator.destroy();
+        }
+      } catch {
+        // Ignore teardown errors.
+      }
+
+      try {
+        if (ownsSplashOverlay && splashOverlay && typeof splashOverlay.destroy === 'function') {
+          splashOverlay.destroy();
+        }
+      } catch {
+        // Ignore teardown errors.
+      }
+
+      try {
         crashReporter.detachGlobalHandlers();
       } catch {
         // Ignore teardown errors.
@@ -1123,8 +1422,13 @@ export function bootstrapPlayGta6App(options = {}) {
     inputBridge,
     audioEngine,
     storageManager,
+    bootTracer,
+    splashOverlay,
+    pgimPreloader,
+    bootOrchestrator,
     getSmokeRunner: () => activeSmokeRunner,
     getWasmWorker: () => activeWasmWorker,
+    notifyFirstPresent,
     start,
     stop,
     resize,
