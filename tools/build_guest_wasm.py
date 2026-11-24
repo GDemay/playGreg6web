@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -13,6 +13,12 @@ post-link V8-cage GC + throttled pthread `CMD_LOAD` JS optimization, auto-detect
 `Pg6ShardDispatchTable` shard-dispatch support, pure-Python Wasm section telemetry,
 and `guest_manifest.json` emission).
 
+Opt-in browser-proven split (R37e): `--split-strategy asymmetric` packs contiguous
+shards so the largest side module stays under V8's 1024 MiB cap (default part-0 ceiling
+994 MiB, reproducing the live ~994/171 MiB two-part shape) and links side modules with
+`-sSIDE_MODULE=2` so unused internal `sub_*` exports are pruned. Existing callers that
+omit the flag keep `-sSIDE_MODULE=1` and the prior balanced/contiguous strategies.
+
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
     -sMEMORY64=1 -pthread -sMODULARIZE=1 -lexports.js ...
@@ -25,7 +31,8 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
         [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
-        [--split-strategy balanced|contiguous] [--proxy-to-pthread]
+        [--split-strategy balanced|contiguous|asymmetric]
+        [--max-side-module-mib MIB] [--proxy-to-pthread]
         [--max-concurrent-pthread-loads N] [--node-max-old-space-mb MB]
         [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--verify-max-table-imports N] [--response-file] [--sample N]
@@ -150,12 +157,14 @@ BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
 # Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
 
-# Split-module dynamic linking (R28/R31): -fPIC + -sMAIN_MODULE=1 + -sSIDE_MODULE=1,
-# with registration tables in an extra side module, filtered whole-archive runtime lib,
-# growable 16 GiB linear memory, and Module.dynamicLibraries loaded by web/loader.js.
+# Split-module dynamic linking (R28/R31/R37e): -fPIC + -sMAIN_MODULE=1 + -sSIDE_MODULE=1
+# (default) or -sSIDE_MODULE=2 (asymmetric / pruned), with registration tables in an extra
+# side module, filtered whole-archive runtime lib, growable 16 GiB linear memory, and
+# Module.dynamicLibraries loaded by web/loader.js.
 PIC_FLAG = "-fPIC"
 MAIN_MODULE_FLAG = "-sMAIN_MODULE=1"
 SIDE_MODULE_FLAG = "-sSIDE_MODULE=1"
+SIDE_MODULE_PRUNED_FLAG = "-sSIDE_MODULE=2"
 SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
 SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 8
 SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
@@ -164,10 +173,18 @@ SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
     "-pthread",
     SIDE_MODULE_FLAG,
 )
+SIDE_MODULE_PRUNED_LINK_FLAGS: tuple[str, ...] = (
+    "-sMEMORY64=1",
+    "-pthread",
+    SIDE_MODULE_PRUNED_FLAG,
+)
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
-SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous"})
+SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous", "asymmetric"})
 DEFAULT_SPLIT_STRATEGY = "balanced"
+# Proven Chrome two-part ceiling: pack part_0 up to ~994 MiB so part_1 lands near ~171 MiB.
+DEFAULT_MAX_SIDE_MODULE_MIB = 994
+MAX_SIDE_MODULE_MIB_LIMIT = V8_MAX_WASM_MODULE_BYTES // (1024 * 1024)
 DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB = 16384
 PROXY_TO_PTHREAD_FLAG = "-sPROXY_TO_PTHREAD=1"
 DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2
@@ -543,6 +560,8 @@ class SideModuleResult:
     exceeds_v8_1gib_limit: bool = False
     role: str = "shards"  # "shards" | "registration"
     wasm_metrics: WasmModuleMetrics | None = None
+    estimated_bytes: int = 0
+    side_module_mode: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -553,9 +572,32 @@ class SideModuleResult:
             "shards": list(self.shards),
             "response_file": self.response_file,
             "link_argv": list(self.link_argv),
+            "estimated_bytes": self.estimated_bytes,
+            "estimated_size_mib": round(self.estimated_bytes / (1024 * 1024), 4)
+            if self.estimated_bytes
+            else 0.0,
             "wasm_bytes": self.wasm_bytes,
             "exceeds_v8_1gib_limit": self.exceeds_v8_1gib_limit,
+            "side_module_mode": self.side_module_mode,
             "wasm_metrics": self.wasm_metrics.to_dict() if self.wasm_metrics is not None else None,
+        }
+
+    def to_manifest_dict(self) -> dict[str, Any]:
+        """CamelCase side-module entry for `guest_manifest.json` telemetry."""
+        return {
+            "index": self.index,
+            "name": self.name,
+            "role": self.role,
+            "shardCount": len(self.shards),
+            "shards": list(self.shards),
+            "estimatedBytes": self.estimated_bytes,
+            "estimatedSizeMiB": round(self.estimated_bytes / (1024 * 1024), 4)
+            if self.estimated_bytes
+            else 0.0,
+            "wasmBytes": self.wasm_bytes,
+            "sizeMiB": round(self.wasm_bytes / (1024 * 1024), 4) if self.wasm_bytes else 0.0,
+            "exceedsV8_1GiBLimit": self.exceeds_v8_1gib_limit,
+            "sideModuleMode": self.side_module_mode,
         }
 
 
@@ -594,6 +636,8 @@ class BuildReport:
     browser_boot_exports: bool = False
     split_modules: int = 1
     split_strategy: str = DEFAULT_SPLIT_STRATEGY
+    max_side_module_mib: int = DEFAULT_MAX_SIDE_MODULE_MIB
+    side_module_mode: int = 1
     side_modules: list[SideModuleResult] = field(default_factory=list)
     node_max_old_space_mb: int | None = None
     proxy_to_pthread: bool = False
@@ -622,6 +666,8 @@ class BuildReport:
             "browser_boot_exports": self.browser_boot_exports,
             "split_modules": self.split_modules,
             "split_strategy": self.split_strategy,
+            "max_side_module_mib": self.max_side_module_mib,
+            "side_module_mode": self.side_module_mode,
             "side_modules": [m.to_dict() for m in self.side_modules],
             "node_max_old_space_mb": self.node_max_old_space_mb,
             "proxy_to_pthread": self.proxy_to_pthread,
@@ -947,14 +993,33 @@ def parse_split_modules(raw: int) -> int:
 def parse_split_strategy(raw: str) -> str:
     if not isinstance(raw, str):
         raise BuildGuestWasmError(
-            f"invalid --split-strategy {raw!r}; expected 'balanced' or 'contiguous'"
+            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', or 'asymmetric'"
         )
     token = raw.strip().lower()
     if token not in SPLIT_STRATEGIES:
         raise BuildGuestWasmError(
-            f"invalid --split-strategy {raw!r}; expected 'balanced' or 'contiguous'"
+            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', or 'asymmetric'"
         )
     return token
+
+
+def parse_max_side_module_mib(raw: int) -> int:
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, int)
+        or raw < 1
+        or raw > MAX_SIDE_MODULE_MIB_LIMIT
+    ):
+        raise BuildGuestWasmError(
+            f"invalid --max-side-module-mib {raw!r}; expected an integer between 1 and "
+            f"{MAX_SIDE_MODULE_MIB_LIMIT} (V8 1 GiB module limit)"
+        )
+    return raw
+
+
+def side_module_mode_for_strategy(strategy: str) -> int:
+    """Return 2 for asymmetric (pruned) side modules, else 1 (legacy default)."""
+    return 2 if parse_split_strategy(strategy) == "asymmetric" else 1
 
 
 def parse_node_max_old_space_mb(raw: int | None) -> int | None:
@@ -1461,20 +1526,86 @@ def partition_shards_contiguous(
     return [ordered[cuts[b] : cuts[b + 1]] for b in range(k)]
 
 
+def partition_shards_asymmetric(
+    shard_items: Sequence[UnitBuildResult],
+    bucket_count: int,
+    *,
+    max_bucket_bytes: int | None = None,
+) -> list[list[UnitBuildResult]]:
+    """Partition shards into up to `bucket_count` asymmetric contiguous slices in VA order.
+
+    Packs `part_0` greedily up to `max_bucket_bytes` (default `DEFAULT_MAX_SIDE_MODULE_MIB` MiB,
+    the proven ~994 MiB Chrome ceiling under V8's 1,024 MiB module cap), then packs remaining
+    shards into `part_1..N-1` in strictly contiguous `unit_id` order while keeping every bucket
+    non-empty. When total weight exceeds `bucket_count * max_bucket_bytes`, relaxes the per-bucket
+    ceiling only to the exact minimax contiguous bound so remaining buckets stay as small as
+    possible under V8's 1 GiB limit (two-part shape ≈ 994/171 MiB).
+    """
+    bucket_limit = parse_split_modules(bucket_count)
+    if max_bucket_bytes is not None:
+        if (
+            isinstance(max_bucket_bytes, bool)
+            or not isinstance(max_bucket_bytes, int)
+            or max_bucket_bytes < 1
+        ):
+            raise BuildGuestWasmError(
+                f"invalid max_bucket_bytes {max_bucket_bytes!r}; expected a positive integer"
+            )
+        ceiling = max_bucket_bytes
+    else:
+        ceiling = DEFAULT_MAX_SIDE_MODULE_MIB * 1024 * 1024
+
+    if not shard_items:
+        return []
+    ordered = sorted(shard_items, key=lambda item: item.unit.unit_id)
+    n = len(ordered)
+    k = min(bucket_limit, n)
+    if k == 1:
+        return [ordered]
+    if k == n:
+        return [[item] for item in ordered]
+
+    weights = [_partition_weight(item) for item in ordered]
+    minimax_cap = _minimax_contiguous_bound(weights, k)
+    effective_cap = max(ceiling, minimax_cap)
+
+    buckets: list[list[UnitBuildResult]] = []
+    pos = 0
+    for b in range(k):
+        remaining_buckets = k - 1 - b
+        if remaining_buckets == 0:
+            buckets.append(ordered[pos:])
+            break
+        max_end_idx = n - remaining_buckets
+        bucket: list[UnitBuildResult] = [ordered[pos]]
+        acc = weights[pos]
+        pos += 1
+        while pos < max_end_idx and acc + weights[pos] <= effective_cap:
+            bucket.append(ordered[pos])
+            acc += weights[pos]
+            pos += 1
+        buckets.append(bucket)
+    return buckets
+
+
 def partition_shard_units(
     items: Sequence[UnitBuildResult],
     split_modules: int,
     *,
     strategy: str = DEFAULT_SPLIT_STRATEGY,
+    max_bucket_bytes: int | None = None,
 ) -> list[list[UnitBuildResult]]:
     """Deterministically partition `.ll` shard units into up to `split_modules` buckets.
 
-    Supports two strategies:
+    Supports three strategies:
       - `"balanced"` (default): greedy LPT bin-packing by compiled `.o` byte size (falling
         back to source file byte size for dry-runs), tie-broken deterministically by `unit_id`.
       - `"contiguous"`: exact minimax contiguous partition in ascending `unit_id` (guest VA /
         `.text`) order via `partition_shards_contiguous`, keeping adjacent shards together to
         minimize cross-module imports and JS stub closures.
+      - `"asymmetric"`: contiguous min-cut via `partition_shards_asymmetric`, packing `part_0`
+        up to `max_bucket_bytes` (default 994 MiB) under V8's 1 GiB cap so a two-part guest
+        reproduces the proven ~994/171 MiB browser split; pairs with `-sSIDE_MODULE=2`.
 
     Emits only non-empty buckets when fewer shards exist than `split_modules`.
     """
@@ -1485,6 +1616,12 @@ def partition_shard_units(
         return []
     if split_strat == "contiguous":
         return partition_shards_contiguous(shards, bucket_limit)
+    if split_strat == "asymmetric":
+        return partition_shards_asymmetric(
+            shards,
+            bucket_limit,
+            max_bucket_bytes=max_bucket_bytes,
+        )
     bucket_count = min(bucket_limit, len(shards))
     ranked = sorted(shards, key=lambda item: (-_partition_weight(item), item.unit.unit_id))
     buckets: list[list[UnitBuildResult]] = [[] for _ in range(bucket_count)]
@@ -1995,9 +2132,16 @@ def resolve_side_module_link_flags(
     strip: bool = False,
     no_link_opt: bool = False,
     wasm_exceptions: bool = False,
+    pruned: bool = False,
 ) -> tuple[str, ...]:
-    """Compute em++ linker flags for a `-sSIDE_MODULE=1` guest shard partition."""
-    flags: list[str] = list(SIDE_MODULE_LINK_FLAGS)
+    """Compute em++ linker flags for a guest shard side module.
+
+    Uses `-sSIDE_MODULE=1` by default. When `pruned=True` (asymmetric browser split), uses
+    `-sSIDE_MODULE=2` so Emscripten drops unused internal `sub_*` exports.
+    """
+    flags: list[str] = list(
+        SIDE_MODULE_PRUNED_LINK_FLAGS if pruned else SIDE_MODULE_LINK_FLAGS
+    )
     if not no_link_opt and opt in LINK_OPT_LEVELS:
         opt_flag = f"-{opt}"
         if opt_flag not in flags:
@@ -2041,6 +2185,7 @@ def build_side_module_link_argv(
     strip: bool = False,
     no_link_opt: bool = False,
     wasm_exceptions: bool = False,
+    pruned: bool = False,
 ) -> tuple[str, ...]:
     if side_link_flags is None:
         effective_flags = resolve_side_module_link_flags(
@@ -2048,6 +2193,7 @@ def build_side_module_link_argv(
             strip=strip,
             no_link_opt=no_link_opt,
             wasm_exceptions=wasm_exceptions,
+            pruned=pruned,
         )
     else:
         effective_flags = tuple(side_link_flags)
@@ -2917,6 +3063,8 @@ def write_guest_manifest(
     split_strategy: str,
     side_modules: Sequence[SideModuleResult],
     wasm_metrics: WasmBuildMetrics | None,
+    max_side_module_mib: int | None = None,
+    side_module_mode: int | None = None,
 ) -> Path:
     """Write or update `guest_manifest.json` with backwards-compatible fields + `wasmMetrics`."""
     manifest_path = output_dir / GUEST_MANIFEST_FILE
@@ -2935,7 +3083,13 @@ def write_guest_manifest(
     payload["indirectDispatch"] = indirect_dispatch
     payload["splitModules"] = split_modules
     payload["splitStrategy"] = split_strategy
+    if max_side_module_mib is not None:
+        payload["maxSideModuleMiB"] = max_side_module_mib
+    if side_module_mode is not None:
+        payload["sideModuleMode"] = side_module_mode
+    # Keep the legacy name list for loaders; also emit sized telemetry for each part.
     payload["sideModules"] = [side.name for side in side_modules]
+    payload["sideModuleSizes"] = [side.to_manifest_dict() for side in side_modules]
     if wasm_metrics is not None:
         payload["wasmMetrics"] = wasm_metrics.to_manifest_dict()
 
@@ -3260,6 +3414,7 @@ def run_build(
     browser_boot_exports: bool = False,
     split_modules: int = 1,
     split_strategy: str = DEFAULT_SPLIT_STRATEGY,
+    max_side_module_mib: int = DEFAULT_MAX_SIDE_MODULE_MIB,
     node_max_old_space_mb: int | None = None,
     proxy_to_pthread: bool = False,
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
@@ -3276,6 +3431,8 @@ def run_build(
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
     split_count = parse_split_modules(split_modules)
     split_strat = parse_split_strategy(split_strategy)
+    max_side_mib = parse_max_side_module_mib(max_side_module_mib)
+    side_mode = side_module_mode_for_strategy(split_strat) if split_count > 1 else 1
     use_split = split_count > 1
     max_pthread_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
     max_table_imports_limit = parse_verify_max_table_imports(verify_max_table_imports)
@@ -3353,6 +3510,8 @@ def run_build(
         browser_boot_exports=browser_boot_exports,
         split_modules=split_count,
         split_strategy=split_strat,
+        max_side_module_mib=max_side_mib,
+        side_module_mode=side_mode,
         node_max_old_space_mb=effective_node_mb,
         proxy_to_pthread=proxy_to_pthread,
         max_concurrent_pthread_loads=max_pthread_loads,
@@ -3548,7 +3707,15 @@ def run_build(
     output_wasm = output_dir / RUNTIME_WASM
 
     if use_split:
-        buckets = partition_shard_units(ordered, split_count, strategy=split_strat)
+        max_bucket_bytes = (
+            max_side_mib * 1024 * 1024 if split_strat == "asymmetric" else None
+        )
+        buckets = partition_shard_units(
+            ordered,
+            split_count,
+            strategy=split_strat,
+            max_bucket_bytes=max_bucket_bytes,
+        )
         registration_items = [item for item in ordered if is_registration_unit(item.unit)]
         non_shard_items = [
             item
@@ -3565,11 +3732,13 @@ def run_build(
             # `GOT.func` before `functions.o` applies its data relocations and exports
             # `__playgta6_shard_dispatch_*` to `runtime.wasm`'s `pg6_program.o`.
             all_side_buckets.append(("registration", registration_items))
+        use_pruned_side = side_mode == 2
         side_link_flags = resolve_side_module_link_flags(
             opt=opt_level,
             strip=strip,
             no_link_opt=no_link_opt,
             wasm_exceptions=wasm_exceptions,
+            pruned=use_pruned_side,
         )
         side_plans: list[
             tuple[SideModuleResult, Path, list[Path], Path | None, tuple[str, ...]]
@@ -3583,6 +3752,7 @@ def run_build(
                 else Path(item.unit.unit_id).with_suffix(".o")
                 for item in bucket
             ]
+            estimated_bytes = sum(_partition_weight(item) for item in bucket)
             side_rsp_name = SIDE_RESPONSE_FILE_TEMPLATE.format(index=idx)
             side_rsp_path = None if response_file is False else (cache_root / side_rsp_name)
             raw_side_link = build_side_module_link_argv(
@@ -3591,6 +3761,7 @@ def run_build(
                 output_wasm=side_wasm_path,
                 side_link_flags=side_link_flags,
                 response_file=side_rsp_path,
+                pruned=use_pruned_side,
             )
             side_result = SideModuleResult(
                 index=idx,
@@ -3599,6 +3770,8 @@ def run_build(
                 response_file=side_rsp_name if side_rsp_path is not None else None,
                 link_argv=tuple(sanitize_argv(raw_side_link)),
                 role=bucket_role,
+                estimated_bytes=estimated_bytes,
+                side_module_mode=side_mode,
             )
             side_plans.append(
                 (side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link)
@@ -3797,6 +3970,8 @@ def run_build(
         split_strategy=report.split_strategy,
         side_modules=report.side_modules,
         wasm_metrics=report.wasm_metrics,
+        max_side_module_mib=report.max_side_module_mib if report.split_modules > 1 else None,
+        side_module_mode=report.side_module_mode if report.split_modules > 1 else None,
     )
     report.guest_manifest = GUEST_MANIFEST_FILE
 
@@ -3861,9 +4036,18 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
     if report.browser_boot_exports:
         lines.append("  Browser boot exports: yes")
     if report.split_modules > 1:
+        side_flag = (
+            SIDE_MODULE_PRUNED_FLAG if report.side_module_mode == 2 else SIDE_MODULE_FLAG
+        )
+        split_extra = (
+            f", max_side={report.max_side_module_mib}MiB"
+            if report.split_strategy == "asymmetric"
+            else ""
+        )
         lines.append(
             f"  Split modules: {report.split_modules} "
-            f"(strategy={report.split_strategy}, {PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
+            f"(strategy={report.split_strategy}{split_extra}, {PIC_FLAG}, "
+            f"{MAIN_MODULE_FLAG}, {side_flag})"
         )
     if report.proxy_to_pthread:
         lines.append(f"  Proxy to pthread: yes ({PROXY_TO_PTHREAD_FLAG})")
@@ -3904,7 +4088,13 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
                 smib = side.wasm_bytes / (1024 * 1024)
                 slimit = " [EXCEEDS V8 1 GiB LIMIT]" if side.exceeds_v8_1gib_limit else ""
                 size_part = f" — {side.wasm_bytes} bytes ({smib:.2f} MiB){slimit}"
-            lines.append(f"    {side.name} ({len(side.shards)} shards){size_part}")
+            elif side.estimated_bytes:
+                emib = side.estimated_bytes / (1024 * 1024)
+                size_part = f" — est. {side.estimated_bytes} bytes ({emib:.2f} MiB)"
+            lines.append(
+                f"    {side.name} ({len(side.shards)} shards, "
+                f"SIDE_MODULE={side.side_module_mode}){size_part}"
+            )
             if side.link_argv:
                 lines.append("      Link: " + " ".join(side.link_argv))
     if report.link_argv:
@@ -4069,19 +4259,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         metavar="N",
         help=(
-            "Split .ll shards into N Emscripten -sSIDE_MODULE=1 modules (plus an extra "
-            "side module for functions.ll registration tables) paired with a -sMAIN_MODULE=1 "
-            "runtime loaded via Module.dynamicLibraries (must be >= 1; default: 1 = monolithic)."
+            "Split .ll shards into N Emscripten side modules (plus an extra side module for "
+            "functions.ll registration tables) paired with a -sMAIN_MODULE=1 runtime loaded via "
+            "Module.dynamicLibraries (must be >= 1; default: 1 = monolithic). Uses "
+            f"{SIDE_MODULE_FLAG} unless --split-strategy asymmetric selects {SIDE_MODULE_PRUNED_FLAG}."
         ),
     )
     parser.add_argument(
         "--split-strategy",
         default=DEFAULT_SPLIT_STRATEGY,
-        metavar="balanced|contiguous",
+        metavar="balanced|contiguous|asymmetric",
         help=(
             "Shard bucketing strategy when --split-modules > 1: 'balanced' (default, greedy LPT "
-            "size bin-packing) or 'contiguous' (exact minimax contiguous partition in sorted "
-            "unit_id / guest VA order to minimize cross-module imports and JS stub closures)."
+            "size bin-packing), 'contiguous' (exact minimax contiguous partition in sorted "
+            "unit_id / guest VA order), or 'asymmetric' (opt-in browser-proven contiguous pack "
+            f"with part_0 capped at --max-side-module-mib / default {DEFAULT_MAX_SIDE_MODULE_MIB} "
+            f"MiB and {SIDE_MODULE_PRUNED_FLAG} export pruning)."
+        ),
+    )
+    parser.add_argument(
+        "--max-side-module-mib",
+        type=int,
+        default=DEFAULT_MAX_SIDE_MODULE_MIB,
+        metavar="MIB",
+        help=(
+            "Asymmetric part_0 ceiling in MiB when --split-strategy asymmetric "
+            f"(default: {DEFAULT_MAX_SIDE_MODULE_MIB}; must be 1..{MAX_SIDE_MODULE_MIB_LIMIT}). "
+            "Uses the same .o/source size estimate as balanced/contiguous partitioning."
         ),
     )
     parser.add_argument(
@@ -4290,6 +4494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             browser_boot_exports=args.browser_boot_exports,
             split_modules=args.split_modules,
             split_strategy=args.split_strategy,
+            max_side_module_mib=args.max_side_module_mib,
             node_max_old_space_mb=args.node_max_old_space_mb,
             proxy_to_pthread=args.proxy_to_pthread,
             max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,
