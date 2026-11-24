@@ -800,6 +800,10 @@ struct VSharpCandidate {
     table_offset: i32,
     buffer_load_users: Vec<usize>,
     tainted_by_scalar_read: bool,
+    /// Vertex-shader `idxen` MUBUF/MTBUF attribute fetches using this V# as `srsrc`.
+    vertex_fetch_users: usize,
+    /// Consumed as `srsrc` by a non-vertex-attribute buffer access (storage, non-`idxen`).
+    used_as_other_buffer: bool,
 }
 
 fn sgpr_ranges_overlap(a_start: u8, a_len: u8, b_start: u8, b_len: u8) -> bool {
@@ -847,8 +851,13 @@ fn retire_overwritten_vsharps(
 /// Returns `(vsharp_fetch_insts, indirect_smem_cbv_keys)` so the V# fetch itself does not
 /// allocate a spurious uniform buffer binding and the downstream `s_buffer_load_*` binds
 /// directly to the descriptor-table CBV slot (e.g. `cb0` at `@group(0) @binding(0)`).
+///
+/// In vertex shaders, a `s_load_dwordx4` V# that is consumed ONLY as the `srsrc` of `idxen`
+/// MUBUF/MTBUF attribute fetches (vertex-buffer descriptor, lowered to `VsIn` inputs) is
+/// also reported in `vsharp_fetch_insts`, so it never allocates a bogus `cbN_` binding.
 fn analyze_vsharp_indirections(
     active: &[Rdna2Instruction],
+    stage: ShaderStage,
 ) -> (BTreeSet<usize>, BTreeMap<usize, CbvKey>) {
     let mut live: Vec<VSharpCandidate> = Vec::new();
     let mut finished: Vec<VSharpCandidate> = Vec::new();
@@ -945,6 +954,8 @@ fn analyze_vsharp_indirections(
                         table_offset: offset.saturating_add(inline_off),
                         buffer_load_users: Vec::new(),
                         tainted_by_scalar_read: false,
+                        vertex_fetch_users: 0,
+                        used_as_other_buffer: false,
                     });
                 }
             }
@@ -1014,8 +1025,29 @@ fn analyze_vsharp_indirections(
                     taint_vsharp_if_sgpr_read(&mut live, *src2);
                 }
             }
-            Rdna2Detail::Mubuf { soffset, .. } | Rdna2Detail::Mtbuf { soffset, .. } => {
+            Rdna2Detail::Mubuf {
+                op,
+                idxen,
+                srsrc,
+                soffset,
+                ..
+            } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
+                let is_vertex_fetch =
+                    stage == ShaderStage::Vertex && *idxen && mubuf_load_components(*op).is_some();
+                record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
+            }
+            Rdna2Detail::Mtbuf {
+                op,
+                idxen,
+                srsrc,
+                soffset,
+                ..
+            } => {
+                taint_vsharp_if_sgpr_read(&mut live, u16::from(*soffset));
+                let is_vertex_fetch =
+                    stage == ShaderStage::Vertex && *idxen && mtbuf_load_components(*op).is_some();
+                record_vsharp_buffer_use(&mut live, *srsrc, is_vertex_fetch);
             }
             Rdna2Detail::Flat { saddr, .. } => {
                 taint_vsharp_if_sgpr_read(&mut live, u16::from(*saddr));
@@ -1046,10 +1078,44 @@ fn analyze_vsharp_indirections(
             for user_idx in cand.buffer_load_users {
                 indirect_smem_cbv_keys.insert(user_idx, key);
             }
+        } else if !cand.tainted_by_scalar_read
+            && cand.buffer_load_users.is_empty()
+            && cand.vertex_fetch_users > 0
+            && !cand.used_as_other_buffer
+        {
+            // Vertex-buffer V#: attribute fetches lower to `VsIn`, no uniform binding needed.
+            vsharp_fetch_insts.insert(cand.def_inst_idx);
         }
     }
 
     (vsharp_fetch_insts, indirect_smem_cbv_keys)
+}
+
+/// Record a MUBUF/MTBUF `srsrc` (in units of 4 SGPRs) consuming a live V# candidate.
+fn record_vsharp_buffer_use(live: &mut [VSharpCandidate], srsrc: u8, is_vertex_fetch: bool) {
+    let rsrc_sgpr = srsrc.saturating_mul(4);
+    for cand in live.iter_mut() {
+        if cand.dst_sgpr == rsrc_sgpr && is_vertex_fetch {
+            cand.vertex_fetch_users += 1;
+        } else if sgpr_ranges_overlap(cand.dst_sgpr, 4, rsrc_sgpr, 4) {
+            cand.used_as_other_buffer = true;
+        }
+    }
+}
+
+/// Map a vertex-shader MUBUF/MTBUF attribute fetch to `(attribute_byte_offset, component_shift)`.
+///
+/// A 1-component 8-bit `tbuffer_load_format_x` (`BUF_FMT_8_*`, formats 1..=6) at a byte offset
+/// that is not dword aligned reads a single channel of a packed 4x8-bit attribute (e.g.
+/// `offset:7` on an `R8G8B8A8_UNORM` element at `+4` reads `.w`). Such fetches are folded into
+/// the dword-aligned `vec4<f32>` attribute (matching WebGPU `unorm8x4`) with a component shift.
+fn vertex_fetch_slot(is_mtbuf: bool, op: u8, format: u8, byte_offset: u16) -> (u16, u8) {
+    let sub_dword = (byte_offset % 4) as u8;
+    if is_mtbuf && op == 0x00 && (1..=6).contains(&format) && sub_dword != 0 {
+        (byte_offset - u16::from(sub_dword), sub_dword)
+    } else {
+        (byte_offset, 0)
+    }
 }
 
 fn plan_program(
@@ -1082,7 +1148,7 @@ fn plan_program(
     }
 
     let active = &instructions[..active_inst_count];
-    let (vsharp_fetch_insts, indirect_smem_cbv_keys) = analyze_vsharp_indirections(active);
+    let (vsharp_fetch_insts, indirect_smem_cbv_keys) = analyze_vsharp_indirections(active, stage);
 
     let mut cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
     let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
@@ -1642,6 +1708,7 @@ fn plan_program(
             }
             Rdna2Detail::Mtbuf {
                 op,
+                format,
                 offset,
                 offen,
                 idxen,
@@ -1654,10 +1721,12 @@ fn plan_program(
                 if stage == ShaderStage::Vertex {
                     if let Some(comps) = mtbuf_load_components(*op) {
                         has_buffer_fetch = true;
+                        let (attr_offset, shift) = vertex_fetch_slot(true, *op, *format, *offset);
+                        let attr_comps = if shift != 0 { 4 } else { comps };
                         vertex_buf_fetches
-                            .entry(*offset)
-                            .and_modify(|c| *c = (*c).max(comps))
-                            .or_insert(comps);
+                            .entry(attr_offset)
+                            .and_modify(|c| *c = (*c).max(attr_comps))
+                            .or_insert(attr_comps);
                         for d in 0..comps {
                             let reg = vdata.saturating_add(d);
                             vgprs.insert(reg);
@@ -4484,10 +4553,11 @@ impl IrEmitter {
                 soffset,
                 ..
             } => self.translate_mubuf_or_mtbuf(
-                false, *op, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+                false, *op, 0, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
             ),
             Rdna2Detail::Mtbuf {
                 op,
+                format,
                 offset,
                 offen,
                 idxen,
@@ -4497,7 +4567,7 @@ impl IrEmitter {
                 soffset,
                 ..
             } => self.translate_mubuf_or_mtbuf(
-                true, *op, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+                true, *op, *format, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
             ),
             Rdna2Detail::Ds {
                 op,
@@ -7323,6 +7393,7 @@ impl IrEmitter {
         &mut self,
         is_mtbuf: bool,
         op: u8,
+        format: u8,
         byte_offset: u16,
         offen: bool,
         idxen: bool,
@@ -7332,7 +7403,7 @@ impl IrEmitter {
         soffset: u8,
     ) -> bool {
         if self.stage == ShaderStage::Vertex {
-            return self.translate_vertex_buf_fetch(is_mtbuf, op, byte_offset, vdata);
+            return self.translate_vertex_buf_fetch(is_mtbuf, op, format, byte_offset, vdata);
         }
         self.translate_storage_buf_op(
             is_mtbuf,
@@ -7801,6 +7872,7 @@ impl IrEmitter {
         &mut self,
         is_mtbuf: bool,
         op: u8,
+        format: u8,
         byte_offset: u16,
         vdata: u8,
     ) -> bool {
@@ -7819,7 +7891,8 @@ impl IrEmitter {
         }) else {
             return false;
         };
-        let Some(&(member_idx, attr_comps)) = self.vs_attr_by_offset.get(&byte_offset) else {
+        let (attr_offset, shift) = vertex_fetch_slot(is_mtbuf, op, format, byte_offset);
+        let Some(&(member_idx, attr_comps)) = self.vs_attr_by_offset.get(&attr_offset) else {
             return false;
         };
         let vs_in = self.raw_expr(Expression::FunctionArgument(arg_idx));
@@ -7828,18 +7901,19 @@ impl IrEmitter {
             index: member_idx,
         });
         for c in 0..comps {
+            let src_c = c.saturating_add(shift);
             let val = if attr_comps == 1 {
-                if c == 0 {
+                if src_c == 0 {
                     attr_val
                 } else if c == 3 {
                     self.lit_f32(1.0)
                 } else {
                     self.lit_f32(0.0)
                 }
-            } else if c < attr_comps {
+            } else if src_c < attr_comps {
                 self.emit_expr(Expression::AccessIndex {
                     base: attr_val,
-                    index: u32::from(c),
+                    index: u32::from(src_c),
                 })
             } else if c == 3 {
                 self.lit_f32(1.0)
@@ -10325,5 +10399,184 @@ mod tests {
             "expected exact 0x7f7ffffe (2139095038u) bitcast call in WGSL:\n{}",
             out.wgsl
         );
+    }
+
+    /// Synthetic Xbox Series preamble (36 bytes): 6 arbitrary header dwords + the fixed tail
+    /// `[0xd5800000, 0x03fe0100, 0x00000ac0]` (the last decodes as `v_cndmask_b32 v0, 64, v5, vcc`).
+    fn xbox_preamble_words() -> Vec<u32> {
+        vec![
+            0x0000_0001,
+            0x0000_0024,
+            0x1234_5678,
+            0x0000_0000,
+            0xCAFE_F00D,
+            0x0000_0100,
+            0xd580_0000,
+            0x03fe_0100,
+            0x0000_0ac0,
+        ]
+    }
+
+    /// PSO #12114-shaped UI vertex shader body (starting at the real entry point):
+    ///   s_inst_prefetch 0x3
+    ///   s_mov_b32 s9, 0
+    ///   s_mov_b64 s[12:13], s[0:1]
+    ///   s_bfe_u32 s13, s13, 0x00080000
+    ///   s_load_dwordx4 s[8:11], s[8:9], 0x0      ; CBV V# table
+    ///   s_load_dwordx4 s[12:15], s[12:13], 0x0   ; vertex-buffer V# table
+    ///   v_add_nc_u32 v0, s2, v0
+    ///   tbuffer_load_format_xyzw v[4:7], v0, s[12:15], 0 format:56 idxen          ; COLOR0
+    ///   tbuffer_load_format_x    v1,     v0, s[12:15], 0 format:1  idxen offset:7 ; COLOR1.w
+    ///   buffer_load_dwordx2      v[2:3], v0, s[12:15], 0 idxen offset:8           ; POSITION0
+    ///   s_buffer_load_dwordx16 s[8:23], s[8:11], 0x0
+    ///   v_mul_f32 v8, s8, v2 ; v_mul_f32 v9, s9, v3
+    ///   exp pos0 v8, v9, v2, v3 done ; exp param0 v4, v5, v6, v1 ; s_endpgm
+    fn pso_12114_vs_body_words() -> Vec<u32> {
+        let mut words = vec![
+            0xbfa0_0003,                  // s_inst_prefetch 0x3
+            enc_sop1(0x03, 9, 128),       // s_mov_b32 s9, 0
+            enc_sop1(0x04, 12, 0),        // s_mov_b64 s[12:13], s[0:1]
+            enc_sop2(0x27, 13, 13, 0xFF), // s_bfe_u32 s13, s13, 0x00080000
+            0x0008_0000,
+        ];
+        words.extend_from_slice(&enc_smem(0x02, 8, 4, 0x7D, 0, false, false));
+        words.extend_from_slice(&enc_smem(0x02, 12, 6, 0x7D, 0, false, false));
+        words.push(enc_vop2(0x25, 0, 2, 0)); // v_add_nc_u32 v0, s2, v0
+        words.extend_from_slice(&enc_mtbuf(0x03, 56, 0, 4, 0, 3, true));
+        words.extend_from_slice(&enc_mtbuf(0x00, 1, 7, 1, 0, 3, true));
+        words.extend_from_slice(&enc_mubuf(0x0D, 8, 2, 0, 3, true));
+        words.extend_from_slice(&enc_smem(0x0C, 8, 4, 0x7D, 0, false, false));
+        words.push(enc_vop2(0x08, 8, 8, 2)); // v_mul_f32 v8, s8, v2
+        words.push(enc_vop2(0x08, 9, 9, 3)); // v_mul_f32 v9, s9, v3
+        words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [8, 9, 2, 3]));
+        words.extend_from_slice(&enc_exp(32, 0xF, false, false, false, [4, 5, 6, 1]));
+        words.push(enc_sopp(0x01, 0));
+        words
+    }
+
+    /// WGSL text without the leading `// Translated ...` / `// hash: ...` header lines.
+    fn wgsl_without_hash_header(wgsl: &str) -> String {
+        wgsl.lines()
+            .filter(|l| !l.starts_with("// hash:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn skips_xbox_preamble_preserves_full_blob_hash_and_never_clobbers_v0() {
+        let body = pso_12114_vs_body_words();
+        let mut words = xbox_preamble_words();
+        words.extend_from_slice(&body);
+        let full = words_to_bytes(&words);
+        let bare = words_to_bytes(&body);
+        assert_eq!(&full[0x24..], &bare[..]);
+
+        let decoded = decode_program(&full);
+        assert_eq!(decoded[0].offset, 0x24);
+        assert_eq!(decoded[0].mnemonic, "s_inst_prefetch");
+        assert!(decoded.iter().all(|i| i.mnemonic != "v_cndmask_b32"));
+
+        let out = translate_rdna2_to_wgsl(&full, &Rdna2TranslateOptions::default())
+            .expect("preamble-prefixed VS should translate");
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Vertex);
+        // Shader identity key: FNV-1a 64 over the FULL blob (matches d3d12_xs native_code_identity).
+        assert_eq!(out.hash_fnv1a64, fnv1a_64(&full));
+        assert_ne!(out.hash_fnv1a64, fnv1a_64(&bare));
+        assert!(
+            out.wgsl.contains(&format_shader_hash(fnv1a_64(&full))),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        // No bogus `v_cndmask_b32 v0, 64, v5, vcc` (v0 clobber / v5 pre-read -> legacy uv).
+        assert!(!out.wgsl.contains("select("), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("64f"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains(" uv:"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("@location(3)"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("unknown_enc"), "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // The stripped body translates identically apart from the hash header line.
+        let bare_out = translate_rdna2_to_wgsl(&bare, &Rdna2TranslateOptions::default())
+            .expect("bare VS body should translate");
+        assert_eq!(bare_out.hash_fnv1a64, fnv1a_64(&bare));
+        assert_eq!(
+            wgsl_without_hash_header(&out.wgsl),
+            wgsl_without_hash_header(&bare_out.wgsl)
+        );
+        assert_eq!(out.bindings, bare_out.bindings);
+        assert_eq!(out.translated_op_count, bare_out.translated_op_count);
+    }
+
+    #[test]
+    fn pso_12114_vertex_buffer_vsharp_emits_no_bogus_cbv_and_three_vs_inputs() {
+        let mut words = xbox_preamble_words();
+        words.extend_from_slice(&pso_12114_vs_body_words());
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("PSO #12114-shaped VS should translate");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Vertex);
+        assert_eq!(out.binding_summary.vertex_input_mode, "attributes");
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+
+        // Only the CBV descriptor-table slot `cb0` at @binding(0); no `cb1` for the VB V#.
+        assert_eq!(out.bindings.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(out.bindings[0].group, 0);
+        assert_eq!(out.bindings[0].binding, 0);
+        assert_eq!(out.bindings[0].kind, "uniform");
+        assert_eq!(out.bindings[0].name, "cb0");
+        assert_eq!(out.bindings[0].highest_vec4_offset, Some(3));
+        assert!(
+            out.wgsl.contains("var<uniform> cb0_"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(!out.wgsl.contains("cb1"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("@binding(3)"), "WGSL:\n{}", out.wgsl);
+
+        // VsIn: exactly locations 0 (COLOR0 unorm8x4), 1 (COLOR1 unorm8x4, `.w` read by the
+        // offset:7 8-bit fetch) and 2 (POSITION0 float2).
+        assert!(out.wgsl.contains("struct VsIn"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("@location(0) position: vec4<f32>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("@location(1) attr_4_: vec4<f32>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("@location(2) attr_8_: vec2<f32>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(!out.wgsl.contains("@location(3)"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("attr_7"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("vs_in.attr_4_.w"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("vs_in.attr_4_.x"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn vertex_buffer_vsharp_also_read_by_s_buffer_load_still_binds_cbv() {
+        // A V# consumed by both an idxen vertex fetch and `s_buffer_load` is a real CBV.
+        let mut words = vec![];
+        words.extend_from_slice(&enc_smem(0x02, 12, 0, 0x7D, 0, false, false)); // s_load_dwordx4 s[12:15], s[0:1]
+        words.extend_from_slice(&enc_mubuf(0x0D, 0, 2, 0, 3, true)); // buffer_load_dwordx2 v[2:3] idxen
+        words.extend_from_slice(&enc_smem(0x08, 16, 6, 0x7D, 0, false, false)); // s_buffer_load_dword s16, s[12:15]
+        words.push(enc_vop2(0x08, 8, 16, 2)); // v_mul_f32 v8, s16, v2
+        words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [8, 3, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("VS should translate");
+        assert_eq!(out.bindings.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(out.bindings[0].name, "cb0");
+        assert_naga_wgsl_valid(&out.wgsl);
     }
 }
