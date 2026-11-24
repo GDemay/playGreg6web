@@ -27,10 +27,59 @@ export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const MAX_VALIDATION_ERROR_CODE_LENGTH = 64;
+const MAX_TELEMETRY_URL_LENGTH = 512;
 const MAX_SIDE_MODULE_URLS = 256;
 const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+const WIN_DRIVE_PREFIX_RE = /^[a-zA-Z]:[\\/]/;
 const POSIX_HOST_ROOT_RE =
   /^\/(?:home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv|proc|sys|dev|run|Library|Applications)(?:\/|$)/i;
+
+const INDIRECT_DISPATCH_ALIASES = Object.freeze({
+  shard: 'shard',
+  sharded: 'shard',
+  'shard-dispatch': 'shard',
+  shard_dispatch: 'shard',
+  'split-shard': 'shard',
+  split_shard: 'shard',
+  table: 'table',
+  'indirect-table': 'table',
+  indirect_table: 'table',
+  'wasm-table': 'table',
+  wasm_table: 'table',
+  monolithic: 'table',
+});
+
+const AUDIO_OUTPUT_STATE_ALIASES = Object.freeze({
+  running: 'running',
+  active: 'running',
+  playing: 'running',
+  suspended: 'suspended',
+  paused: 'suspended',
+  closed: 'closed',
+  stopped: 'closed',
+  interrupted: 'interrupted',
+  idle: 'idle',
+  ready: 'idle',
+  uninitialized: 'idle',
+  degraded: 'degraded',
+  fallback: 'degraded',
+  error: 'error',
+  failed: 'error',
+  unknown: 'unknown',
+});
+
+const LOADER_TELEMETRY_MESSAGE_TYPES = new Set([
+  'pthread-stats',
+  'pthread-status',
+  'loader-stats',
+  'loader-telemetry',
+  'runtime-stats',
+  'runtime-telemetry',
+  'manifest-stats',
+  'shard-dispatch',
+  'boot-telemetry',
+]);
 
 function defaultNow() {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -204,8 +253,21 @@ function pickBootUrl(...candidates) {
 }
 
 function toNonNegativeInt(value, fallback = null) {
-  if (value === undefined || value === null || value === '') {
+  if (
+    value === undefined ||
+    value === null ||
+    value === '' ||
+    typeof value === 'boolean' ||
+    typeof value === 'symbol' ||
+    typeof value === 'object'
+  ) {
     return fallback;
+  }
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return fallback;
+    }
+    return Number(value);
   }
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n) || n < 0) {
@@ -214,11 +276,99 @@ function toNonNegativeInt(value, fallback = null) {
   return Math.floor(n);
 }
 
+function toSafeNonNegativeInt(value, fallback = 0) {
+  const parsed = toNonNegativeInt(value, null);
+  return parsed === null ? fallback : parsed;
+}
+
+function normalizeIndirectDispatch(raw) {
+  if (typeof raw !== 'string') {
+    return 'unknown';
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return 'unknown';
+  }
+  return Object.prototype.hasOwnProperty.call(INDIRECT_DISPATCH_ALIASES, normalized)
+    ? INDIRECT_DISPATCH_ALIASES[normalized]
+    : 'unknown';
+}
+
+function normalizeAudioOutputState(raw) {
+  if (typeof raw !== 'string') {
+    return 'unknown';
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return 'unknown';
+  }
+  return Object.prototype.hasOwnProperty.call(AUDIO_OUTPUT_STATE_ALIASES, normalized)
+    ? AUDIO_OUTPUT_STATE_ALIASES[normalized]
+    : 'unknown';
+}
+
+function sanitizeTelemetryUrl(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (
+    !trimmed ||
+    trimmed.length > MAX_TELEMETRY_URL_LENGTH ||
+    /[\x00-\x1F\x7F]/.test(trimmed) ||
+    trimmed.includes('\\') ||
+    WIN_DRIVE_PREFIX_RE.test(trimmed)
+  ) {
+    return null;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!withoutQuery) {
+    return null;
+  }
+  if (ABSOLUTE_URL_RE.test(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return null;
+    }
+    if (typeof URL === 'function') {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.username || parsed.password) {
+          return null;
+        }
+        const pathSegs = parsed.pathname.split('/');
+        if (pathSegs.includes('..') || POSIX_HOST_ROOT_RE.test(parsed.pathname)) {
+          return null;
+        }
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return null;
+      }
+    }
+    return withoutQuery;
+  }
+  if (POSIX_HOST_ROOT_RE.test(withoutQuery)) {
+    return null;
+  }
+  const segments = withoutQuery.replace(/^\/+/, '').split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    if (segments[i] === '..') {
+      return null;
+    }
+  }
+  return withoutQuery;
+}
+
 function sanitizeDiagnosticText(raw, maxLength = MAX_VALIDATION_ERROR_MESSAGE_LENGTH) {
   if (raw === null || raw === undefined) {
     return '';
   }
   let text = typeof raw === 'string' ? raw : String(raw);
+  // Strip multi-line and inline JS stack frames so raw exception stacks never leak.
+  text = text.replace(/\r?\n[ \t]*at[ \t]+[\s\S]*$/, '');
+  text = text.replace(
+    /\s+at\s+(?:[A-Za-z0-9_.$<>]+\s+\([^)]*:\d+:\d+\)|(?:file:\/\/|https?:\/\/|[A-Za-z]:[\\/]|\/)[^\s)]+:\d+:\d+)/g,
+    ''
+  );
   text = text.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
   text = sanitizeString(text);
   // Strip embedded data URIs, byte arrays, long hex dumps, and base64 blobs so
@@ -233,6 +383,23 @@ function sanitizeDiagnosticText(raw, maxLength = MAX_VALIDATION_ERROR_MESSAGE_LE
     text = `${text.slice(0, Math.max(0, maxLength - 3))}...`;
   }
   return text;
+}
+
+function sanitizeValidationErrorCode(raw, fallback = 'validation') {
+  if (raw === null || raw === undefined || raw === '') {
+    return fallback;
+  }
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? String(Math.trunc(raw)) : fallback;
+  }
+  if (typeof raw !== 'string') {
+    return fallback;
+  }
+  const cleaned = sanitizeDiagnosticText(raw, MAX_VALIDATION_ERROR_CODE_LENGTH);
+  if (!cleaned || cleaned.includes('[REDACTED')) {
+    return fallback;
+  }
+  return cleaned;
 }
 
 function classifyGpuValidationErrorType(raw, fallback = 'validation') {
@@ -550,6 +717,7 @@ export class PlayGta6AppHandle {
     this._getSmokeRunner = components.getSmokeRunner;
     this._getWasmWorker = components.getWasmWorker;
     this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
+    this._getBootTelemetry = components.getBootTelemetry || (() => null);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._start = components.start;
     this._stop = components.stop;
@@ -572,6 +740,10 @@ export class PlayGta6AppHandle {
 
   getDiagnosticsSnapshot() {
     return this._getDiagnosticsSnapshot();
+  }
+
+  getBootTelemetry() {
+    return this._getBootTelemetry();
   }
 
   notifyFirstPresent(meta) {
@@ -713,6 +885,78 @@ export function bootstrapPlayGta6App(options = {}) {
   let lastNotifiedSideModuleKey = null;
   let session = null;
 
+  const gpuTelemetry = {
+    realPackDrawCount: 0,
+    fallbackDrawCount: 0,
+    presentCount: 0,
+    unboundBindGroupCount: 0,
+    skippedDrawCount: 0,
+    lastValidationErrorCode: null,
+    lastValidationErrorMessage: null,
+  };
+
+  const audioTelemetry = {
+    hasReceivedStats: false,
+    outputState: 'unknown',
+    framesDrained: 0,
+    underruns: 0,
+    overruns: 0,
+  };
+
+  const loaderTelemetry = {
+    indirectDispatch: normalizeIndirectDispatch(
+      options.indirectDispatch ?? options.dispatchMode ?? null
+    ),
+    pthreadSpawnedCount: toSafeNonNegativeInt(options.pthreadSpawnedCount, 0),
+    pthreadActiveCount: toSafeNonNegativeInt(options.pthreadActiveCount, 0),
+    pthreadPeakCount: toSafeNonNegativeInt(options.pthreadPeakCount, 0),
+    pthreadLoadQueueDepth: toSafeNonNegativeInt(options.pthreadLoadQueueDepth, 0),
+    preferredShaderPackUrl: sanitizeTelemetryUrl(
+      pickBootUrl(options.preferredShaderPackUrl, options.shaderPackUrl)
+    ),
+  };
+
+  function collectPlainSources(candidates) {
+    const out = [];
+    for (let i = 0; i < candidates.length; i += 1) {
+      const item = candidates[i];
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        out.push(item);
+      }
+    }
+    return out;
+  }
+
+  function pickFirstDefinedField(sources, keys) {
+    for (let i = 0; i < sources.length; i += 1) {
+      const src = sources[i];
+      for (let j = 0; j < keys.length; j += 1) {
+        const key = keys[j];
+        if (Object.prototype.hasOwnProperty.call(src, key) && src[key] !== undefined) {
+          return { found: true, value: src[key] };
+        }
+      }
+    }
+    return { found: false, value: undefined };
+  }
+
+  function resolveSanitizedPreferredShaderPackUrl() {
+    const candidates = [
+      startOverrideShaderPackUrl,
+      explicitShaderPackUrl,
+      loaderTelemetry.preferredShaderPackUrl,
+      latestDiscoveredBootAssets.shaderPackUrl,
+      DEFAULT_SHADER_PACK_URL,
+    ];
+    for (let i = 0; i < candidates.length; i += 1) {
+      const clean = sanitizeTelemetryUrl(candidates[i]);
+      if (clean) {
+        return clean;
+      }
+    }
+    return DEFAULT_SHADER_PACK_URL;
+  }
+
   function invokeFirstHook(target, methodNames, ...args) {
     if (!target || typeof target !== 'object') {
       return false;
@@ -823,6 +1067,19 @@ export function bootstrapPlayGta6App(options = {}) {
         notifySideModulePreflight(latestDiscoveredBootAssets);
       }
     }
+    const preferredFromPayload = sanitizeTelemetryUrl(
+      pickBootUrl(
+        payload.preferredShaderPackUrl,
+        payload.status && payload.status.preferredShaderPackUrl,
+        payload.serverStatus && payload.serverStatus.preferredShaderPackUrl,
+        payload.assets && payload.assets.preferredShaderPackUrl,
+        merged.shaderPackUrl
+      )
+    );
+    if (preferredFromPayload) {
+      loaderTelemetry.preferredShaderPackUrl = preferredFromPayload;
+    }
+    ingestLoaderTelemetry(payload, { notify: false, parseLabel: false });
   }
 
   function resolveBootForwardFields(launchContext) {
@@ -1238,11 +1495,20 @@ export function bootstrapPlayGta6App(options = {}) {
             : '';
     const message = sanitizeDiagnosticText(rawMessage, MAX_VALIDATION_ERROR_MESSAGE_LENGTH);
 
+    const rawCode =
+      data.code ??
+      data.errorCode ??
+      (inner && (inner.code ?? inner.errorCode)) ??
+      null;
+    const errorCode = sanitizeValidationErrorCode(rawCode, errorType);
+
     const rawSeq = data.seq ?? (inner ? inner.seq : null);
     const parsedSeq = toNonNegativeInt(rawSeq, null);
     validationErrorSeq =
       parsedSeq !== null && parsedSeq > validationErrorSeq ? parsedSeq : validationErrorSeq + 1;
     validationErrorCount += 1;
+    gpuTelemetry.lastValidationErrorCode = errorCode;
+    gpuTelemetry.lastValidationErrorMessage = message || null;
 
     const rawTs = data.timestampMs ?? data.timestamp ?? (inner ? inner.timestampMs : null);
     const timestampMs =
@@ -1379,6 +1645,7 @@ export function bootstrapPlayGta6App(options = {}) {
       splashFramesPresented += 1;
     }
     const effectiveFramesPresented = Math.max(wgpuFramesPresented, reportedFrames ?? 0);
+    gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, effectiveFramesPresented);
 
     if (ok && (firstPresent || effectiveFramesPresented >= 1)) {
       notifyFirstPresent({
@@ -1454,6 +1721,427 @@ export function bootstrapPlayGta6App(options = {}) {
     return true;
   }
 
+  function buildGpuStatsPayload() {
+    const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
+    return Object.freeze({
+      type: 'gpu-stats',
+      realPackDrawCount: gpuTelemetry.realPackDrawCount,
+      fallbackDrawCount: gpuTelemetry.fallbackDrawCount,
+      presentCount: effectivePresentCount,
+      unboundBindGroupCount: gpuTelemetry.unboundBindGroupCount,
+      skippedDrawCount: gpuTelemetry.skippedDrawCount,
+      validationErrorCount,
+      lastValidationErrorCode: gpuTelemetry.lastValidationErrorCode,
+      lastValidationErrorMessage: gpuTelemetry.lastValidationErrorMessage,
+    });
+  }
+
+  function forwardGpuStatsToObservers(gpuStatsPayload, { allowHudMetricsFallback = true } = {}) {
+    if (destroyed) {
+      return;
+    }
+    if (session) {
+      invokeFirstHook(
+        session,
+        ['updateGpuStats', 'setGpuStats', 'onGpuStats', 'recordGpuStats'],
+        gpuStatsPayload
+      );
+    }
+
+    const hudTargets = resolveHudTargets();
+    for (let i = 0; i < hudTargets.length; i += 1) {
+      const target = hudTargets[i];
+      const handled = invokeFirstHook(
+        target,
+        ['updateGpuStats', 'setGpuStats', 'onGpuStats', 'recordGpuStats', 'updateStats'],
+        gpuStatsPayload
+      );
+      if (
+        !handled &&
+        allowHudMetricsFallback &&
+        target === hud &&
+        typeof target.updateMetrics === 'function'
+      ) {
+        try {
+          target.updateMetrics({
+            gpuStats: gpuStatsPayload,
+            realPackDrawCount: gpuStatsPayload.realPackDrawCount,
+            fallbackDrawCount: gpuStatsPayload.fallbackDrawCount,
+            presentCount: gpuStatsPayload.presentCount,
+            unboundBindGroupCount: gpuStatsPayload.unboundBindGroupCount,
+            skippedDrawCount: gpuStatsPayload.skippedDrawCount,
+            validationErrorCount: gpuStatsPayload.validationErrorCount,
+          });
+        } catch {
+          // Ignore HUD metrics errors.
+        }
+      }
+    }
+
+    if (gpuBootPanel) {
+      invokeFirstHook(
+        gpuBootPanel,
+        ['updateGpuStats', 'setGpuStats', 'onGpuStats'],
+        gpuStatsPayload
+      );
+    }
+  }
+
+  function applyGpuStatsFields(data) {
+    const sources = collectPlainSources([
+      data,
+      data.stats,
+      data.gpuStats,
+      data.drawStats,
+      data.frameStats,
+    ]);
+    let matchedW83Field = false;
+
+    const realPackField = pickFirstDefinedField(sources, [
+      'realPackDrawCount',
+      'realPackDraws',
+      'packDrawCount',
+      'packDraws',
+    ]);
+    if (realPackField.found) {
+      gpuTelemetry.realPackDrawCount = toSafeNonNegativeInt(realPackField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const fallbackField = pickFirstDefinedField(sources, [
+      'fallbackDrawCount',
+      'fallbackDraws',
+    ]);
+    if (fallbackField.found) {
+      gpuTelemetry.fallbackDrawCount = toSafeNonNegativeInt(fallbackField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const presentField = pickFirstDefinedField(sources, [
+      'presentCount',
+      'presents',
+      'framesPresented',
+      'frameCount',
+    ]);
+    if (presentField.found) {
+      const parsedPresent = toSafeNonNegativeInt(presentField.value, 0);
+      gpuTelemetry.presentCount = parsedPresent;
+      if (parsedPresent > 0) {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, parsedPresent);
+      }
+      matchedW83Field = true;
+    }
+
+    const unboundField = pickFirstDefinedField(sources, [
+      'unboundBindGroupCount',
+      'unboundBindGroups',
+      'missingBindGroupCount',
+    ]);
+    if (unboundField.found) {
+      gpuTelemetry.unboundBindGroupCount = toSafeNonNegativeInt(unboundField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const skippedField = pickFirstDefinedField(sources, ['skippedDrawCount', 'skippedDraws']);
+    if (skippedField.found) {
+      gpuTelemetry.skippedDrawCount = toSafeNonNegativeInt(skippedField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const validationCountField = pickFirstDefinedField(sources, [
+      'validationErrorCount',
+      'validationErrors',
+    ]);
+    if (validationCountField.found) {
+      const parsedCount = toSafeNonNegativeInt(validationCountField.value, 0);
+      validationErrorCount = Math.max(validationErrorCount, parsedCount);
+      matchedW83Field = true;
+    }
+
+    const validationCodeField = pickFirstDefinedField(sources, [
+      'lastValidationErrorCode',
+      'validationErrorCode',
+    ]);
+    if (validationCodeField.found && validationCodeField.value !== null) {
+      gpuTelemetry.lastValidationErrorCode = sanitizeValidationErrorCode(
+        validationCodeField.value,
+        'validation'
+      );
+      matchedW83Field = true;
+    }
+
+    const validationMsgField = pickFirstDefinedField(sources, [
+      'lastValidationErrorMessage',
+      'validationErrorMessage',
+    ]);
+    if (validationMsgField.found && validationMsgField.value !== null) {
+      const sanitizedMsg = sanitizeDiagnosticText(
+        validationMsgField.value,
+        MAX_VALIDATION_ERROR_MESSAGE_LENGTH
+      );
+      gpuTelemetry.lastValidationErrorMessage = sanitizedMsg || null;
+      matchedW83Field = true;
+    }
+
+    return matchedW83Field;
+  }
+
+  function handleGpuStatsMessage(data) {
+    if (!data || typeof data !== 'object' || destroyed) {
+      return false;
+    }
+    applyGpuStatsFields(data);
+    const gpuStatsPayload = buildGpuStatsPayload();
+    forwardGpuStatsToObservers(gpuStatsPayload, { allowHudMetricsFallback: true });
+    if (gpuBootPanel && gpuStatsPayload.presentCount > 0) {
+      safeUpdateGpuBootPanel({
+        frameStats: {
+          ...(latestPanelFrameStats && typeof latestPanelFrameStats === 'object'
+            ? latestPanelFrameStats
+            : {}),
+          framesPresented: gpuStatsPayload.presentCount,
+          droppedFrames:
+            latestPanelFrameStats && Number.isFinite(latestPanelFrameStats.droppedFrames)
+              ? latestPanelFrameStats.droppedFrames
+              : 0,
+        },
+      });
+    }
+    return true;
+  }
+
+  function handleAudioStatsMessage(data) {
+    if (!data || typeof data !== 'object' || destroyed) {
+      return false;
+    }
+    const sources = collectPlainSources([data, data.stats, data.audioStats, data.audio]);
+    audioTelemetry.hasReceivedStats = true;
+
+    const outputStateField = pickFirstDefinedField(sources, [
+      'outputState',
+      'state',
+      'audioState',
+      'contextState',
+    ]);
+    if (outputStateField.found) {
+      audioTelemetry.outputState = normalizeAudioOutputState(outputStateField.value);
+    }
+
+    const framesDrainedField = pickFirstDefinedField(sources, [
+      'framesDrained',
+      'drainedFrames',
+      'totalPulledFrames',
+      'pulledFrames',
+    ]);
+    if (framesDrainedField.found) {
+      audioTelemetry.framesDrained = toSafeNonNegativeInt(framesDrainedField.value, 0);
+    }
+
+    const underrunsField = pickFirstDefinedField(sources, ['underruns', 'underrunCount']);
+    if (underrunsField.found) {
+      audioTelemetry.underruns = toSafeNonNegativeInt(underrunsField.value, 0);
+    }
+
+    const overrunsField = pickFirstDefinedField(sources, [
+      'overruns',
+      'overrunCount',
+      'overflows',
+      'overflowCount',
+    ]);
+    if (overrunsField.found) {
+      audioTelemetry.overruns = toSafeNonNegativeInt(overrunsField.value, 0);
+    }
+
+    const audioStatsPayload = Object.freeze({
+      type: 'audio-stats',
+      outputState: audioTelemetry.outputState,
+      framesDrained: audioTelemetry.framesDrained,
+      underruns: audioTelemetry.underruns,
+      overruns: audioTelemetry.overruns,
+    });
+
+    if (session) {
+      invokeFirstHook(
+        session,
+        ['updateAudioStats', 'setAudioStats', 'onAudioStats', 'recordAudioStats'],
+        audioStatsPayload
+      );
+    }
+
+    const hudTargets = resolveHudTargets();
+    for (let i = 0; i < hudTargets.length; i += 1) {
+      const target = hudTargets[i];
+      const handled = invokeFirstHook(
+        target,
+        ['updateAudioStats', 'setAudioStats', 'onAudioStats', 'recordAudioStats', 'updateStats'],
+        audioStatsPayload
+      );
+      if (!handled && target === hud && typeof target.updateMetrics === 'function') {
+        try {
+          target.updateMetrics({
+            audioStats: audioStatsPayload,
+            audioOutputState: audioStatsPayload.outputState,
+            framesDrained: audioStatsPayload.framesDrained,
+            audioUnderruns: audioStatsPayload.underruns,
+            audioOverruns: audioStatsPayload.overruns,
+          });
+        } catch {
+          // Ignore HUD metrics errors.
+        }
+      }
+    }
+
+    return true;
+  }
+
+  function ingestLoaderTelemetry(data, { notify = true, parseLabel = true } = {}) {
+    if (!data || typeof data !== 'object' || destroyed) {
+      return false;
+    }
+    const sources = collectPlainSources([
+      data,
+      data.metrics,
+      data.stats,
+      data.pthread,
+      data.pthreads,
+      data.pthreadStats,
+      data.manifest,
+      data.programManifest,
+      data.bootManifest,
+      data.status,
+      data.serverStatus,
+    ]);
+    let updated = false;
+
+    const dispatchField = pickFirstDefinedField(sources, [
+      'indirectDispatch',
+      'indirect_dispatch',
+      'dispatchMode',
+      'indirectDispatchMode',
+    ]);
+    if (dispatchField.found) {
+      loaderTelemetry.indirectDispatch = normalizeIndirectDispatch(dispatchField.value);
+      updated = true;
+    } else if (
+      parseLabel &&
+      typeof data.label === 'string' &&
+      loaderTelemetry.indirectDispatch === 'unknown'
+    ) {
+      const m = /\bindirect[_ -]?dispatch\s*[:=]\s*(shard|table)\b/i.exec(data.label);
+      if (m) {
+        loaderTelemetry.indirectDispatch = normalizeIndirectDispatch(m[1]);
+        updated = true;
+      } else if (/\bshard[_ -]?dispatch\b/i.test(data.label)) {
+        loaderTelemetry.indirectDispatch = 'shard';
+        updated = true;
+      }
+    }
+
+    const spawnedField = pickFirstDefinedField(sources, [
+      'pthreadSpawnedCount',
+      'pthreadSpawned',
+      'spawnedCount',
+      'spawned',
+      'totalSpawned',
+    ]);
+    if (spawnedField.found) {
+      loaderTelemetry.pthreadSpawnedCount = toSafeNonNegativeInt(spawnedField.value, 0);
+      updated = true;
+    }
+
+    const activeField = pickFirstDefinedField(sources, [
+      'pthreadActiveCount',
+      'pthreadActive',
+      'activeCount',
+      'active',
+      'liveCount',
+    ]);
+    if (activeField.found) {
+      loaderTelemetry.pthreadActiveCount = toSafeNonNegativeInt(activeField.value, 0);
+      updated = true;
+    }
+
+    const peakField = pickFirstDefinedField(sources, [
+      'pthreadPeakCount',
+      'pthreadPeak',
+      'peakCount',
+      'peak',
+      'maxActiveCount',
+    ]);
+    if (peakField.found) {
+      loaderTelemetry.pthreadPeakCount = toSafeNonNegativeInt(peakField.value, 0);
+      if (loaderTelemetry.pthreadActiveCount > loaderTelemetry.pthreadPeakCount) {
+        loaderTelemetry.pthreadPeakCount = loaderTelemetry.pthreadActiveCount;
+      }
+      updated = true;
+    } else if (activeField.found) {
+      loaderTelemetry.pthreadPeakCount = Math.max(
+        loaderTelemetry.pthreadPeakCount,
+        loaderTelemetry.pthreadActiveCount
+      );
+    }
+
+    const queueDepthField = pickFirstDefinedField(sources, [
+      'pthreadLoadQueueDepth',
+      'loadQueueDepth',
+      'pthreadQueueDepth',
+      'queueDepth',
+      'pendingLoadCount',
+    ]);
+    if (queueDepthField.found) {
+      loaderTelemetry.pthreadLoadQueueDepth = toSafeNonNegativeInt(queueDepthField.value, 0);
+      updated = true;
+    }
+
+    const preferredPackField = pickFirstDefinedField(sources, ['preferredShaderPackUrl']);
+    if (preferredPackField.found) {
+      const cleanUrl = sanitizeTelemetryUrl(preferredPackField.value);
+      if (cleanUrl) {
+        loaderTelemetry.preferredShaderPackUrl = cleanUrl;
+        updated = true;
+      }
+    }
+
+    if (updated && notify) {
+      const loaderStatsPayload = Object.freeze({
+        type: 'loader-stats',
+        indirectDispatch: loaderTelemetry.indirectDispatch,
+        pthreadSpawnedCount: loaderTelemetry.pthreadSpawnedCount,
+        pthreadActiveCount: loaderTelemetry.pthreadActiveCount,
+        pthreadPeakCount: loaderTelemetry.pthreadPeakCount,
+        pthreadLoadQueueDepth: loaderTelemetry.pthreadLoadQueueDepth,
+        preferredShaderPackUrl: resolveSanitizedPreferredShaderPackUrl(),
+      });
+
+      if (session) {
+        invokeFirstHook(
+          session,
+          ['updateLoaderStats', 'updatePthreadStats', 'setPthreadStats', 'onPthreadStats'],
+          loaderStatsPayload
+        );
+      }
+
+      const hudTargets = resolveHudTargets();
+      for (let i = 0; i < hudTargets.length; i += 1) {
+        invokeFirstHook(
+          hudTargets[i],
+          [
+            'updateLoaderStats',
+            'updatePthreadStats',
+            'setPthreadStats',
+            'onPthreadStats',
+            'updateRuntimeStats',
+            'updateBootTelemetry',
+            'updateStats',
+          ],
+          loaderStatsPayload
+        );
+      }
+    }
+
+    return updated;
+  }
+
   function handleGpuTelemetryMessage(data) {
     if (!data || typeof data !== 'object' || data.type !== 'gpu-telemetry') {
       return false;
@@ -1470,6 +2158,7 @@ export function bootstrapPlayGta6App(options = {}) {
       );
       if (reportedFrames !== null) {
         wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+        gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, reportedFrames);
       }
     }
     if (data.fallbackStats !== undefined) {
@@ -1478,8 +2167,27 @@ export function bootstrapPlayGta6App(options = {}) {
     if (data.missingShaders !== undefined) {
       patch.missingShaders = data.missingShaders;
     }
+    const hadDrawOrBindFields = applyGpuStatsFields(data);
     safeUpdateGpuBootPanel(patch);
+    if (hadDrawOrBindFields) {
+      forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+    }
     return true;
+  }
+
+  function looksLikeAudioStatsPayload(data) {
+    const src = data && typeof data.stats === 'object' && data.stats ? data.stats : data;
+    if (!src || typeof src !== 'object') {
+      return false;
+    }
+    return (
+      'outputState' in src ||
+      'framesDrained' in src ||
+      'drainedFrames' in src ||
+      'underruns' in src ||
+      'overruns' in src ||
+      'overflows' in src
+    );
   }
 
   function handleWorkerMessage(data) {
@@ -1489,19 +2197,59 @@ export function bootstrapPlayGta6App(options = {}) {
     if (data.type === 'gpu-telemetry') {
       return handleGpuTelemetryMessage(data);
     }
+    if (data.type === 'gpu-stats') {
+      return handleGpuStatsMessage(data);
+    }
+    if (data.type === 'stats') {
+      if (
+        looksLikeAudioStatsPayload(data) &&
+        !('realPackDrawCount' in data) &&
+        !('fallbackDrawCount' in data) &&
+        !('presentCount' in data) &&
+        !(
+          data.stats &&
+          typeof data.stats === 'object' &&
+          ('realPackDrawCount' in data.stats ||
+            'fallbackDrawCount' in data.stats ||
+            'presentCount' in data.stats)
+        )
+      ) {
+        return handleAudioStatsMessage(data);
+      }
+      return handleGpuStatsMessage(data);
+    }
+    if (data.type === 'audio-stats' || data.type === 'audio-telemetry') {
+      return handleAudioStatsMessage(data);
+    }
     if (data.type === 'gpu-validation-error') {
       return handleGpuValidationErrorMessage(data);
     }
     if (data.type === 'splash-frame-presented') {
       return handleSplashFramePresentedMessage(data);
     }
+    if (data.type === 'frame-presented') {
+      const reportedFrames = toNonNegativeInt(
+        data.presentCount ?? data.framesPresented ?? data.frame ?? data.frameCount,
+        null
+      );
+      if (reportedFrames !== null) {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+        gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, reportedFrames);
+      } else {
+        wgpuFramesPresented += 1;
+        gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, wgpuFramesPresented);
+      }
+      forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+      return true;
+    }
     if (data.type === 'first-present') {
-      const reportedFrames = toNonNegativeInt(data.framesPresented, null);
+      const reportedFrames = toNonNegativeInt(data.framesPresented ?? data.presentCount, null);
       if (reportedFrames !== null) {
         wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
       } else {
         wgpuFramesPresented = Math.max(wgpuFramesPresented, 1);
       }
+      gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, wgpuFramesPresented);
       notifyFirstPresent({
         source: sanitizeDiagnosticText(data.source || 'wgpu_worker', 64) || 'wgpu_worker',
         frameIndex:
@@ -1509,6 +2257,15 @@ export function bootstrapPlayGta6App(options = {}) {
         framesPresented: wgpuFramesPresented,
       });
       return true;
+    }
+    if (typeof data.type === 'string' && LOADER_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
+      ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
+      return true;
+    }
+    if (data.type === undefined && data.label === undefined && data.error === undefined) {
+      if (ingestLoaderTelemetry(data, { notify: true, parseLabel: false })) {
+        return true;
+      }
     }
     return false;
   }
@@ -1718,6 +2475,27 @@ export function bootstrapPlayGta6App(options = {}) {
   let activeWasmWorker = null;
   let destroyed = false;
   let destroyPromise = null;
+  const externalWorkerCleanups = [];
+
+  for (const workerCandidate of [options.gpuWorker, options.audioWorker, options.ioWorker]) {
+    if (isEventTargetLike(workerCandidate)) {
+      const onExternalWorkerMessage = (ev) => {
+        if (destroyed) {
+          return;
+        }
+        const data = ev && typeof ev === 'object' && ev.data !== undefined ? ev.data : ev;
+        handleWorkerMessage(data);
+      };
+      try {
+        workerCandidate.addEventListener('message', onExternalWorkerMessage);
+        externalWorkerCleanups.push(() => {
+          workerCandidate.removeEventListener('message', onExternalWorkerMessage);
+        });
+      } catch {
+        // Ignore worker mocks that do not support message listeners.
+      }
+    }
+  }
 
   hookBootTracerForPanel();
 
@@ -1870,6 +2648,7 @@ export function bootstrapPlayGta6App(options = {}) {
           if (handleWorkerMessage(data)) {
             return;
           }
+          ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
           if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
             try {
               hud.updateMetrics(data.metrics);
@@ -2353,7 +3132,7 @@ export function bootstrapPlayGta6App(options = {}) {
     return frames;
   }
 
-  function getDiagnosticsSnapshot() {
+  function resolveSessionStateText() {
     let sessionState = SESSION_STATE.IDLE;
     if (session && typeof session.getState === 'function') {
       try {
@@ -2365,6 +3144,11 @@ export function bootstrapPlayGta6App(options = {}) {
         sessionState = SESSION_STATE.ERROR;
       }
     }
+    return sessionState;
+  }
+
+  function getDiagnosticsSnapshot() {
+    const sessionState = resolveSessionStateText();
     const recentCopy = Object.freeze(
       recentValidationErrors.map((entry) => Object.freeze({ ...entry }))
     );
@@ -2381,22 +3165,130 @@ export function bootstrapPlayGta6App(options = {}) {
     });
   }
 
+  function getBootTelemetry() {
+    const sessionState = resolveSessionStateText();
+    const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
+    const effectiveAudioOutputState = audioTelemetry.hasReceivedStats
+      ? audioTelemetry.outputState
+      : normalizeAudioOutputState(audioEngine && audioEngine.state);
+
+    const gpu = Object.freeze({
+      realPackDrawCount: toSafeNonNegativeInt(gpuTelemetry.realPackDrawCount, 0),
+      fallbackDrawCount: toSafeNonNegativeInt(gpuTelemetry.fallbackDrawCount, 0),
+      presentCount: toSafeNonNegativeInt(effectivePresentCount, 0),
+      unboundBindGroupCount: toSafeNonNegativeInt(gpuTelemetry.unboundBindGroupCount, 0),
+      skippedDrawCount: toSafeNonNegativeInt(gpuTelemetry.skippedDrawCount, 0),
+      validationErrorCount: toSafeNonNegativeInt(validationErrorCount, 0),
+      lastValidationErrorCode: gpuTelemetry.lastValidationErrorCode,
+      lastValidationErrorMessage: gpuTelemetry.lastValidationErrorMessage,
+    });
+
+    const audio = Object.freeze({
+      outputState: effectiveAudioOutputState,
+      framesDrained: toSafeNonNegativeInt(audioTelemetry.framesDrained, 0),
+      underruns: toSafeNonNegativeInt(audioTelemetry.underruns, 0),
+      overruns: toSafeNonNegativeInt(audioTelemetry.overruns, 0),
+    });
+
+    const loader = Object.freeze({
+      indirectDispatch: loaderTelemetry.indirectDispatch,
+      pthreadSpawnedCount: toSafeNonNegativeInt(loaderTelemetry.pthreadSpawnedCount, 0),
+      pthreadActiveCount: toSafeNonNegativeInt(loaderTelemetry.pthreadActiveCount, 0),
+      pthreadPeakCount: toSafeNonNegativeInt(loaderTelemetry.pthreadPeakCount, 0),
+      pthreadLoadQueueDepth: toSafeNonNegativeInt(loaderTelemetry.pthreadLoadQueueDepth, 0),
+      sideModuleCount: toSafeNonNegativeInt(resolveSideModuleCount(), 0),
+      preferredShaderPackUrl: resolveSanitizedPreferredShaderPackUrl(),
+    });
+
+    return Object.freeze({
+      bootMode: resolveCurrentBootMode(),
+      sessionState,
+      milestone: resolveCurrentMilestone(),
+      destroyed: Boolean(destroyed),
+      realPackDrawCount: gpu.realPackDrawCount,
+      fallbackDrawCount: gpu.fallbackDrawCount,
+      presentCount: gpu.presentCount,
+      unboundBindGroupCount: gpu.unboundBindGroupCount,
+      skippedDrawCount: gpu.skippedDrawCount,
+      validationErrorCount: gpu.validationErrorCount,
+      lastValidationErrorCode: gpu.lastValidationErrorCode,
+      lastValidationErrorMessage: gpu.lastValidationErrorMessage,
+      outputState: audio.outputState,
+      framesDrained: audio.framesDrained,
+      underruns: audio.underruns,
+      overruns: audio.overruns,
+      indirectDispatch: loader.indirectDispatch,
+      pthreadSpawnedCount: loader.pthreadSpawnedCount,
+      pthreadActiveCount: loader.pthreadActiveCount,
+      pthreadPeakCount: loader.pthreadPeakCount,
+      pthreadLoadQueueDepth: loader.pthreadLoadQueueDepth,
+      sideModuleCount: loader.sideModuleCount,
+      preferredShaderPackUrl: loader.preferredShaderPackUrl,
+      gpu,
+      audio,
+      loader,
+    });
+  }
+
   const globalScope =
     options.globalScope !== undefined ? options.globalScope : windowObj;
   const diagnosticHook = Object.freeze({
     getDiagnosticsSnapshot,
   });
+  const bootStateGetter = () => getBootTelemetry();
+  const telemetryHook = Object.freeze(
+    Object.assign(
+      function getPlayGta6BootTelemetry() {
+        return getBootTelemetry();
+      },
+      {
+        getBootTelemetry,
+        getSnapshot: getBootTelemetry,
+      }
+    )
+  );
+  const runtimeGlobalThis =
+    typeof globalThis !== 'undefined' && globalThis && typeof globalThis === 'object'
+      ? globalThis
+      : null;
   let attachedGlobalHook = false;
-  if (
-    options.attachGlobalHook !== false &&
-    globalScope &&
-    typeof globalScope === 'object'
-  ) {
-    try {
-      globalScope.__playgta6 = diagnosticHook;
-      attachedGlobalHook = true;
-    } catch {
-      // Ignore frozen or non-extensible global objects.
+  let attachedBootStateHook = false;
+  let attachedGlobalScopeTelemetryHook = false;
+  let attachedGlobalThisTelemetryHook = false;
+  if (options.attachGlobalHook !== false) {
+    if (globalScope && typeof globalScope === 'object') {
+      try {
+        globalScope.__playgta6 = diagnosticHook;
+        attachedGlobalHook = true;
+      } catch {
+        // Ignore frozen or non-extensible global objects.
+      }
+      try {
+        Object.defineProperty(globalScope, '__playgta6BootState', {
+          configurable: true,
+          enumerable: true,
+          get: bootStateGetter,
+        });
+        attachedBootStateHook = true;
+      } catch {
+        // Ignore frozen or non-extensible global objects.
+      }
+      if (globalScope !== runtimeGlobalThis) {
+        try {
+          globalScope.__playgta6Telemetry = telemetryHook;
+          attachedGlobalScopeTelemetryHook = true;
+        } catch {
+          // Ignore frozen or non-extensible global objects.
+        }
+      }
+    }
+    if (runtimeGlobalThis) {
+      try {
+        runtimeGlobalThis.__playgta6Telemetry = telemetryHook;
+        attachedGlobalThisTelemetryHook = true;
+      } catch {
+        // Ignore frozen or non-extensible globalThis objects.
+      }
     }
   }
 
@@ -2424,6 +3316,9 @@ export function bootstrapPlayGta6App(options = {}) {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;
       latestDiscoveredBootAssets = { ...initialBootAssets };
+      loaderTelemetry.preferredShaderPackUrl = sanitizeTelemetryUrl(
+        pickBootUrl(options.preferredShaderPackUrl, options.shaderPackUrl)
+      );
       const bootResult = await bootOrchestrator.start();
       recordDiscoveredBootAssets(bootResult);
       if (lastBootSessionResult) {
@@ -2439,6 +3334,9 @@ export function bootstrapPlayGta6App(options = {}) {
       return fallbackResult;
     }
     latestDiscoveredBootAssets = { ...initialBootAssets };
+    loaderTelemetry.preferredShaderPackUrl = sanitizeTelemetryUrl(
+      pickBootUrl(options.preferredShaderPackUrl, options.shaderPackUrl)
+    );
     const sessionResult = await session.start(startOpts);
     if (sessionResult && sessionResult.serverStatus) {
       recordDiscoveredBootAssets(sessionResult.serverStatus);
@@ -2477,6 +3375,49 @@ export function bootstrapPlayGta6App(options = {}) {
           }
         } catch {
           // Ignore non-configurable global properties.
+        }
+      }
+
+      if (attachedBootStateHook && globalScope && typeof globalScope === 'object') {
+        attachedBootStateHook = false;
+        try {
+          const desc = Object.getOwnPropertyDescriptor(globalScope, '__playgta6BootState');
+          if (desc && desc.get === bootStateGetter) {
+            delete globalScope.__playgta6BootState;
+          }
+        } catch {
+          // Ignore non-configurable global properties.
+        }
+      }
+
+      if (attachedGlobalScopeTelemetryHook && globalScope && typeof globalScope === 'object') {
+        attachedGlobalScopeTelemetryHook = false;
+        try {
+          if (globalScope.__playgta6Telemetry === telemetryHook) {
+            delete globalScope.__playgta6Telemetry;
+          }
+        } catch {
+          // Ignore non-configurable global properties.
+        }
+      }
+
+      if (attachedGlobalThisTelemetryHook && runtimeGlobalThis) {
+        attachedGlobalThisTelemetryHook = false;
+        try {
+          if (runtimeGlobalThis.__playgta6Telemetry === telemetryHook) {
+            delete runtimeGlobalThis.__playgta6Telemetry;
+          }
+        } catch {
+          // Ignore non-configurable globalThis properties.
+        }
+      }
+
+      while (externalWorkerCleanups.length > 0) {
+        const cleanup = externalWorkerCleanups.pop();
+        try {
+          cleanup();
+        } catch {
+          // Ignore external worker teardown errors.
         }
       }
 
@@ -2591,6 +3532,7 @@ export function bootstrapPlayGta6App(options = {}) {
     getSmokeRunner: () => activeSmokeRunner,
     getWasmWorker: () => activeWasmWorker,
     getDiagnosticsSnapshot,
+    getBootTelemetry,
     notifyFirstPresent,
     start,
     stop,
