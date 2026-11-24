@@ -206,6 +206,17 @@ bool parse_pipeline_stream(const uint8_t* bytes, size_t size, StreamPipeline* ou
 // Frame pacing
 // ---------------------------------------------------------------------------------------------
 
+// Process-wide totals of ID3D12Device::WaitFrameEventX (all devices): blocking waits, the time
+// they spent blocked, and polls (timeout 0). Lets a per-frame timeline separate waiting for the
+// frame event from the title's own work.
+struct FrameWaitTotals {
+    uint64_t waits = 0;
+    uint64_t wait_us = 0;
+    uint64_t polls = 0;
+    uint64_t timeouts = 0;
+};
+FrameWaitTotals frame_wait_totals();
+
 class FramePacer {
 public:
     using Clock = std::chrono::steady_clock;

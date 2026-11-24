@@ -413,6 +413,8 @@ struct BootConfig {
     // Record up to this many import calls (name, thread, first five integer arguments) for
     // import_trace_text(); 0 = off.
     size_t import_trace_limit = 0;
+    // Address-space events kept in the report's address_space.log (all are counted).
+    size_t arena_log_limit = 4096;
     // Emulated console type: the console-mode value the title reads at startup (REG_DWORD
     // "ConsoleMode" under HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM), seeded into the
     // runtime registry before the entry point runs. 0 leaves the registry untouched.
@@ -508,6 +510,7 @@ std::string import_trace_text();
 struct LiveCounters {
     uint64_t dispatches = 0;
     uint64_t import_calls = 0;
+    uint64_t arena_events = 0;  // reserve / commit / release events of the boot arena
 };
 LiveCounters live_counters();
 

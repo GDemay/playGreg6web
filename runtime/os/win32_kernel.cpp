@@ -169,6 +169,30 @@ KernelHandleTable& handle_table() {
     return table;
 }
 
+}  // namespace
+
+KernelHandleCounts live_kernel_handles() {
+    KernelHandleTable& t = handle_table();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    KernelHandleCounts c;
+    for (const auto& [handle, object] : t.objects) {
+        switch (object->kind) {
+            case KernelObjectKind::Dispatcher:
+                ++c.dispatcher;
+                break;
+            case KernelObjectKind::File:
+                ++c.file;
+                break;
+            default:
+                ++c.opaque;
+                break;
+        }
+    }
+    return c;
+}
+
+namespace {
+
 // Called with overlay.mutex held: stamps an entry as created (new) or written (modified).
 void stamp_locked(UserdataOverlay& overlay, const std::string& key, bool created) {
     const uint64_t now = now_filetime_ticks();

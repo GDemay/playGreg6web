@@ -36,6 +36,7 @@
 //                        plus <file>.json (gpu/frame_capture.h); data payloads are omitted
 //   --gpu-capture-frames <n>  frames to capture (default 10)
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
+//   --arena-log-limit <n>     address-space events kept in the report log (default 4096)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
 // Exit code: the BootStatus (0 = the guest exited; its own exit code is in the report),
@@ -66,7 +67,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
+#include "guest/com_bridge.h"
+#include "guest/guest_callbacks.h"
+#include "os/guest_heap.h"
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
@@ -135,6 +140,7 @@ struct Options {
     std::string summary;
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
+    uint64_t arena_log_limit = 4096;  // --arena-log-limit
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
     std::string gpu_capture;          // --gpu-capture: .pg6trace path
@@ -210,12 +216,13 @@ bool parse(int argc, char** argv, Options& o) {
             target = v;
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
-                   a == "--console-mode" || a == "--gpu-capture-frames") {
+                   a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit") {
             if (!value(v)) {
                 return false;
             }
             uint64_t& target = a == "--max-calls"     ? o.max_calls
                                : a == "--gpu-capture-frames" ? o.gpu_capture_frames
+                               : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
@@ -603,6 +610,7 @@ void run_boot_thread() {
     cfg.log_progress = !g_options.quiet;
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
+    cfg.arena_log_limit = static_cast<size_t>(g_options.arena_log_limit);
     cfg.host_function_start = host_function_start;
     cfg.console_mode = static_cast<uint32_t>(g_options.console_mode);
     cfg.sandbox_id = g_options.sandbox_id;
@@ -688,6 +696,27 @@ int main(int argc, char** argv) {
             const os::VirtualMemoryArena* arena = os::win32::get_vmem_arena();
             sample->reserved_bytes = arena->reserved_bytes();
             sample->committed_bytes = arena->committed_bytes();
+            // Runtime-side state, to tell growth of the runtime from the title's own.
+            const os::win32::KernelHandleCounts h = os::win32::live_kernel_handles();
+            const guest::com::BridgeStats com = guest::com::bridge_stats();
+            const os::GuestHeapStats heap = os::default_guest_heap().stats();
+            const gpu::d3d12_guest::xbox::FrameWaitTotals waits = gpu::d3d12_guest::xbox::frame_wait_totals();
+            sample->counters = {
+                {"handles_dispatcher", h.dispatcher},
+                {"handles_file", h.file},
+                {"handles_opaque", h.opaque},
+                {"com_live_objects", com.live_objects},
+                {"com_guest_bytes", com.guest_bytes_in_use},
+                {"lazy_guest_threads", com.lazy_guest_threads},
+                {"async_shadows", static_cast<uint64_t>(guest::callbacks::live_async_shadows())},
+                {"heap_live_blocks", heap.live_blocks},
+                {"heap_live_bytes", heap.live_bytes},
+                {"heap_total_allocs", heap.total_allocs},
+                {"frame_waits", waits.waits},
+                {"frame_wait_us", waits.wait_us},
+                {"frame_polls", waits.polls},
+                {"arena_events", c.arena_events},
+            };
         });
     }
     start_watchdog();

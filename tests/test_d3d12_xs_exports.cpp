@@ -1832,6 +1832,7 @@ void test_xbox_frame_loop_present_and_pacing() {
     uint64_t previous = 0;
     std::vector<std::vector<Packet>> frames;
     const auto start = std::chrono::steady_clock::now();
+    const dg::xbox::FrameWaitTotals waits_before = dg::xbox::frame_wait_totals();
     for (int frame = 0; frame < 4; ++frame) {
         const size_t mark = fx.captured.size();
         // Frame start: (type 0, timeout 0, 0, flags 2, &token) never fails and never blocks.
@@ -1868,6 +1869,11 @@ void test_xbox_frame_loop_present_and_pacing() {
         CHECK(load64(token_slot) > token);
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
+    // Process-wide totals: 4 polls, 4 + 3 blocking waits, and the time they spent blocked.
+    const dg::xbox::FrameWaitTotals waits_after = dg::xbox::frame_wait_totals();
+    CHECK(waits_after.polls - waits_before.polls == 4);
+    CHECK(waits_after.waits - waits_before.waits == 7);
+    CHECK(waits_after.wait_us > waits_before.wait_us);
     // Paced: four frames take at least ~3 intervals, and nothing spins for long.
     CHECK(elapsed >= std::chrono::milliseconds(12));
     CHECK(elapsed < std::chrono::seconds(5));

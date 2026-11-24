@@ -82,6 +82,7 @@ void test_capture_omits_payloads_and_stops() {
         s->import_calls = calls / 10;
         s->reserved_bytes = 0x1000 * calls;
         s->committed_bytes = 0x100 * calls;
+        s->counters = {{"handles_dispatcher", calls / 10}, {"heap_live_blocks", 7}};
     });
 
     const std::vector<uint8_t> blob(1000, 0xAB);
@@ -133,8 +134,8 @@ void test_capture_omits_payloads_and_stops() {
     const std::string frame1 = "\"index\": 1, \"offset\": " + std::to_string(ps[5].offset);
     CHECK(side.find(frame1) != std::string::npos);
     // One sample per Present, the third one after the captured frames.
-    CHECK(side.find("\"dispatches\": 30, \"import_calls\": 3, \"reserved_bytes\": 122880, \"committed_bytes\": 7680") !=
-          std::string::npos);
+    CHECK(side.find("\"dispatches\": 30, \"import_calls\": 3, \"reserved_bytes\": 122880, \"committed_bytes\": 7680, "
+                    "\"counters\": {\"handles_dispatcher\": 3, \"heap_live_blocks\": 7}") != std::string::npos);
     fc::frame_capture_set_counters(nullptr);
     std::filesystem::remove(path);
     std::filesystem::remove(path + ".json");

@@ -14,7 +14,8 @@
 // Sidecar (<path>.json): {schema "playgta6-frame-capture", schema_version 1, trace, payloads
 // ("omitted" | "kept"), frames_requested, frames_complete, presents_seen, packets, bytes,
 // frames [{index, offset, bytes, packets}], presents [{index, wall_ms, dispatches, import_calls,
-// reserved_bytes, committed_bytes}], omitted [{packet, opcode, length, fnv1a64}], omitted_bytes}.
+// reserved_bytes, committed_bytes, counters {name: value}}], omitted [{packet, opcode, length,
+// fnv1a64}], omitted_bytes}.
 // `presents` has one sample per Present seen, also after the captured frames (a timeline of the
 // whole run): wall time since the capture started and the counters of frame_capture_set_counters
 // at that Present.
@@ -26,6 +27,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace playgta6::gpu {
 
@@ -49,6 +52,9 @@ struct FrameCaptureSample {
     uint64_t import_calls = 0;
     uint64_t reserved_bytes = 0;   // guest address space reserved
     uint64_t committed_bytes = 0;  // guest memory committed
+    // Further named runtime counters (live handles by kind, COM bridge objects, heap blocks, ...),
+    // written as a "counters" object in the sample.
+    std::vector<std::pair<std::string, uint64_t>> counters;
 };
 using FrameCaptureCounters = void (*)(FrameCaptureSample* sample);
 void frame_capture_set_counters(FrameCaptureCounters counters);
