@@ -66,6 +66,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add `--no-link-opt` to skip high-RAM `wasm-opt` during linking and `--shrink-largest-shards` to recompile the heaviest shards at `-Oz` to stay under browser `.wasm` size limits.
 - [x] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `DONE` (PR #433, closes #405) *(driven by the native boot; synthetic fixtures only)*
   - Resolve switches whose table base or index reaches the indirect jump through control-flow merges, keeping the existing soundness rules, and measure resolved / unresolved counts before and after.
+- [ ] **R32 — Real-Binary Boot Bring-Up, Phase 4: From a Sustained Frame Loop to the Title's First Real Content** — `IN PROGRESS` (#481, @Timon-ok) *(continues R23; local game files only for local runs)*
+  - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
 
 ---
 
@@ -128,8 +130,12 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Model the title's CPU window and its GPU-visible alias (register the alias with the D3D12 layer, apply queue-side page mappings) and design how multi-GiB reservations fit the wasm64 guest pool, backed by measurements of what the title reserves and commits.
 - [x] **O28 — Multi-Module `PG6_BOOT_PROGRAM` HTTPFS Boot Support (`runtime/wasm_boot.{h,cpp}`)** — `DONE` (PR #359, closes #345) *(no game files required — disjoint files `runtime/wasm_boot.{h,cpp}`, `tests/test_wasm_boot.cpp`)*
   - Load multi-module `PG6_BOOT_PROGRAM` bundles over HTTPFS inside `runtime/wasm_boot` with synthetic unit test coverage.
-- [ ] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `IN PROGRESS` (#373, @Timon-ok) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
+- [x] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `DONE` (PRs #387, #401, #414, #431, #457, closes #373) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
   - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
+- [x] **O30 — `XMemMapPhysicalPagesScatter` Semantics: One Page Number per Large Page, Not per 64 KiB Slot (`runtime/os/xbox_scarlett.cpp`, `xmem_windows`)** — `DONE` (PR #471, closes #464) *(found by O29's contiguity measurement on the real mapping sequence; synthetic tests)*
+  - Establish the scatter-mapping call's real page-array semantics from the title's call sites, fix the shim and the window model (CPU and GPU side), and check the neighbouring physical-page shims for the same unit error.
+- [ ] **O31 — Boot the Real Program Natively Under the Translated-Window Memory Model and Fix What It Reveals** — `IN PROGRESS` (#475, @Timon-ok) *(follow-up to O29/O30; repo tests synthetic, local game files only for local runs)*
+  - Lift the real program with `--memory-model window`, boot it natively to the default-model boot's milestones, fix every consumer that still assumes identity mapping for window pointers, and measure cost and the contiguous-runs variant.
 
 ---
 
@@ -200,8 +206,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Encapsulate `wgpu_worker` helper modules in UMD IIFEs so classic worker `importScripts` never hits duplicate top-level `const` collisions (such as `TEXTURE_FORMAT_NAMES`).
 - [x] **G32 — Identify the Pipeline Records Behind Xbox Device Slot 57 and Bind Their Graphics Pipelines in the D3D12 Guest Layer (`runtime/gpu/d3d12_xs*`)** — `DONE` (PRs #412 + #413, closes #391) *(driven by the native boot's frame capture; repo tests synthetic)*
   - Work out what the fixed-size, non-DXIL pipeline records passed to device slot 57 are, create the right pipeline kind from them so the title's draws reach the command stream, and report what the shader track needs.
-- [ ] **G37 — Graphics Pipelines Arrive as Console-Native Code: Recover Translatable Shaders and D3D12 State for Slot-57 Pipelines** — `IN PROGRESS` (#419, @Timon-ok) *(follow-up to G32: graphics stages are GPU machine code, compute arrives as DXIL; repo tests synthetic)*
+- [x] **G37 — Graphics Pipelines Arrive as Console-Native Code: Recover Translatable Shaders and D3D12 State for Slot-57 Pipelines** — `DONE` (PRs #435, #456, #473, #474, #478, closes #419) *(follow-up to G32: graphics stages are GPU machine code, compute arrives as DXIL; repo tests synthetic)*
   - Establish the route that makes the title's graphics pipelines renderable (a DXIL path in the title, or a join from native stages to archive DXIL plus state recovered from the register image) and build the guest-layer side of it.
+- [ ] **G47 — First Real Pixels: Resolve the Per-Frame Pass's Shaders by Stage Identity, Emit Its Draw, and Replay the Native Capture Through the WebGPU Path** — `IN PROGRESS` (#483, @Timon-ok) *(follow-up to G37; uses the shader track's tools unmodified; repo tests synthetic)*
+  - Connect the pipeline dump, a shader pack keyed by stage identity, draw emission with rect-list expansion, a payload capture and the capture replayer into one rendered frame of the title's per-frame pass.
 
 ---
 

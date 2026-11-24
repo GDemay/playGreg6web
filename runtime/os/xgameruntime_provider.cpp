@@ -55,9 +55,12 @@
 //   {01acd177-...} XUser: s4 CloseHandle h, s7 AddAsync h, s8 AddResult h, s11 GetId m,
 //     s20 CheckPrivilege m, s21/s22 ResolvePrivilegeWithUiAsync/Result m,
 //     s23 GetTokenAndSignatureAsync(9) h, s24 ...ResultSize m, s33/s34 Register/Unregister
-//     ForChangeEvent h; s3 Duplicate, s5 Compare, s9/s10 AddByIdWithUi, s12 FindUserById,
-//     s13 GetLocalId, s14 FindUserByLocalId, s19 GetAgeGroup, s25 GetTokenAndSignatureResult
-//     are left as stubs.
+//     ForChangeEvent h; s9 GetLocalId(2) h: the slots follow the public header order (Duplicate,
+//     Close, Compare, GetMaxUsers, AddAsync, AddResult, GetLocalId, FindUserByLocalId, GetId,
+//     FindUserById, ...); the executable keeps {handle, s11 XUID, s9 8-byte value} per user and
+//     rebuilds that record from the value through s10 (value, &handle), i.e. FindUserByLocalId.
+//     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
+//     s25 GetTokenAndSignatureResult; s13, s14, s19 are unidentified.
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
@@ -609,6 +612,33 @@ public:
         }
         id.write(xuid);
         return hr;
+    }
+
+    // s3 XUserDuplicateHandle(user, XUserHandle* duplicated): a new handle to the same local user
+    // (closed independently with s4).
+    int32_t DuplicateHandle(uint64_t user, OutPtr duplicated) {
+        if (duplicated.is_null() || !duplicated.write(0) || !check_handle(users(), user, "XUserHandle")) {
+            return E_INVALIDARG_HR;
+        }
+        Pg6XUserHandle copy = nullptr;
+        const int32_t hr = gdk::XUserDuplicateHandle(from_guest<Pg6XUser>(user), &copy);
+        if (hr < 0 || copy == nullptr) {
+            return hr < 0 ? hr : E_INVALIDARG_HR;
+        }
+        users().add(copy);
+        duplicated.write(to_guest(copy));
+        return S_OK_HR;
+    }
+
+    // s9 XUserGetLocalId(user, XUserLocalId* localId): the local (per-console) identifier of the
+    // runtime's one local user: stable for the user's lifetime, non-zero, distinct from the XUID.
+    // It claims nothing about sign-in, privileges or ownership.
+    int32_t GetLocalId(uint64_t user, GuestPtr<uint64_t> local_id) {
+        if (!check_handle(users(), user, "XUserHandle") || local_id.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        local_id.write(kOfflineUserLocalId);
+        return S_OK_HR;
     }
 
     int32_t CheckPrivilege(uint64_t user, uint32_t options, uint32_t privilege, GuestPtr<uint8_t> has_privilege,
@@ -1208,18 +1238,18 @@ constexpr auto kIAsyncQueue =
 
 using US = M<UserApi>;
 constexpr auto kUserTable = slot_table<32>({
-    {3, US::stub("XUserDuplicateHandle")},
+    {3, US::method<&UserApi::DuplicateHandle>("XUserDuplicateHandle")},
     {4, US::method<&UserApi::CloseHandle>("XUserCloseHandle")},
     {5, US::stub("XUserCompare")},
     {7, US::method<&UserApi::AddAsync>("XUserAddAsync")},
     {8, US::method<&UserApi::AddResult>("XUserAddResult")},
-    {9, US::stub("XUserAddByIdWithUiAsync")},
-    {10, US::stub("XUserAddByIdWithUiResult")},
+    {9, US::method<&UserApi::GetLocalId>("XUserGetLocalId")},
+    {10, US::stub("XUserFindUserByLocalId")},
     {11, US::method<&UserApi::GetId>("XUserGetId")},
     {12, US::stub("XUserFindUserById")},
-    {13, US::stub("XUserGetLocalId")},
-    {14, US::stub("XUserFindUserByLocalId")},
-    {19, US::stub("XUserGetAgeGroup")},
+    {13, US::stub("XUser slot 13 (unidentified)")},
+    {14, US::stub("XUser slot 14 (unidentified)")},
+    {19, US::stub("XUser slot 19 (unidentified)")},
     {20, US::method<&UserApi::CheckPrivilege>("XUserCheckPrivilege")},
     {21, US::method<&UserApi::ResolvePrivilegeWithUiAsync>("XUserResolvePrivilegeWithUiAsync")},
     {22, US::method<&UserApi::ResolvePrivilegeWithUiResult>("XUserResolvePrivilegeWithUiResult")},
