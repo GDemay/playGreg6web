@@ -48,17 +48,39 @@ function isEventTargetLike(obj) {
   );
 }
 
-function detectWasm64(wasmApi) {
+export function detectWasm64(wasmApi) {
   if (!wasmApi || typeof wasmApi.Memory !== 'function') {
     return false;
   }
-  try {
-    // eslint-disable-next-line no-new
-    new wasmApi.Memory({ initial: 1n, maximum: 2n, index: 'i64' });
-    return true;
-  } catch {
-    return false;
+  // Probe spec-standard `{ address: 'i64' }` (Chrome 133+, Firefox 134+, Node 22+)
+  // first, then fall back to legacy proposal `{ index: 'i64' }`. Passing BigInt
+  // `initial`/`maximum` ensures non-Wasm64 engines (or mocks) that silently ignore
+  // unknown descriptor keys still throw a TypeError on BigInt-to-Number coercion.
+  for (const key of ['address', 'index']) {
+    try {
+      const mem = new wasmApi.Memory({ initial: 1n, maximum: 2n, [key]: 'i64' });
+      if (!mem || typeof mem !== 'object') {
+        continue;
+      }
+      if (typeof mem.type === 'function') {
+        try {
+          const info = mem.type();
+          if (info && typeof info === 'object') {
+            const addr = info.address ?? info.index;
+            if (addr !== undefined && addr !== 'i64') {
+              continue;
+            }
+          }
+        } catch {
+          // Ignore optional type-reflection errors.
+        }
+      }
+      return true;
+    } catch {
+      // Try next descriptor key or report unsupported below.
+    }
   }
+  return false;
 }
 
 function resolveDefaultWindow(options) {
@@ -248,8 +270,11 @@ function createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory }
     );
 
     const wasmApi =
-      (windowObj && typeof windowObj === 'object' && windowObj.WebAssembly) ||
-      (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+      windowObj && typeof windowObj === 'object' && 'WebAssembly' in windowObj
+        ? windowObj.WebAssembly
+        : typeof WebAssembly !== 'undefined'
+          ? WebAssembly
+          : null;
     const wasm64 = detectWasm64(wasmApi);
 
     const opfs = Boolean(nav && nav.storage && typeof nav.storage.getDirectory === 'function');
