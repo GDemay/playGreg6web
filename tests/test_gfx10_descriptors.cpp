@@ -1,12 +1,21 @@
 // gfx10 descriptor words (runtime/gpu/gfx10_descriptors.h): field positions against the public
-// driver definitions, round trips, slot classification, format and sampler mappings. Synthetic
+// driver definitions, round trips, slot classification, format and sampler mappings; plus the
+// STORAGE_BINDING usage of UAV textures whose descriptors those formats feed (G60). Synthetic
 // values only.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
+#include "gpu/cmd_encoder.h"
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_guest_resources.h"
 #include "gpu/gfx10_descriptors.h"
+#include "gpu/pso_cache.h"
+#include "guest/com_bridge.h"
+#include "os/vmem.h"
 
 namespace {
 
@@ -355,6 +364,74 @@ void test_classify_slot() {
     CHECK(classify_slot(w) == SlotContent::Unknown);
 }
 
+// G60: typeless, depth/stencil-plane and Xbox DXGI formats map to gfx10 image formats; reverse
+// lookups of the shared hardware formats keep their canonical DXGI format.
+void test_g60_formats() {
+    struct Case {
+        uint32_t dxgi;
+        uint32_t hw;
+        Swizzle sel;
+    };
+    const Swizzle x001 = {Sel::X, Sel::Zero, Sel::Zero, Sel::One};
+    const Swizzle xyz1 = {Sel::X, Sel::Y, Sel::Z, Sel::One};
+    const Swizzle zyxw = {Sel::Z, Sel::Y, Sel::X, Sel::W};
+    const Swizzle zyx1 = {Sel::Z, Sel::Y, Sel::X, Sel::One};
+    const Case cases[] = {
+        {115, 136, zyxw},              // B4G4R4A4_UNORM -> 4_4_4_4_UNORM
+        {118, 7, x001},                // D16_UNORM_S8_UINT -> 16_UNORM (depth plane)
+        {119, 7, x001},                // R16_UNORM_X8_TYPELESS
+        {120, 5, x001},                // X16_TYPELESS_G8_UINT -> 8_UINT (stencil plane)
+        {19, 22, x001},                // R32G8X24_TYPELESS -> 32_FLOAT
+        {22, 5, x001},                 // X32_TYPELESS_G8X24_UINT -> 8_UINT
+        {44, 141, x001},               // R24G8_TYPELESS -> 8_24_UNORM
+        {47, 5, x001},                 // X24_TYPELESS_G8_UINT -> 8_UINT
+        {90, 56, zyxw},                // B8G8R8A8_TYPELESS -> 8_8_8_8_UNORM
+        {92, 56, zyx1},                // B8G8R8X8_TYPELESS
+        {5, 72, xyz1},                 // R32G32B32_TYPELESS -> 32_32_32_UINT
+        {89, 50, kIdentitySwizzle},    // R10G10B10_XR_BIAS_A2_UNORM -> 2_10_10_10_UNORM
+    };
+    for (const Case& c : cases) {
+        HardwareFormat f;
+        CHECK(hardware_format(c.dxgi, &f) && f.format == c.hw && f.swizzle == c.sel);
+        // T# encode/decode keeps the format and selects, and the slot classifies as an image
+        // (valid_image_format accepts every new hardware format).
+        ImageResource img;
+        img.base = 0x0000000100040000ull;
+        img.format = f.format;
+        img.width = 64;
+        img.height = 32;
+        img.dst_sel = compose_component_mapping(f.swizzle, 0x1688u);
+        img.type = ImageType::Tex2D;
+        uint32_t words[kImageDwords] = {};
+        encode(img, words);
+        CHECK(plausible_image(words));
+        CHECK(classify_slot(words) == SlotContent::Image);
+        const ImageResource dec = decode_image(words);
+        CHECK(dec.format == c.hw && dec.dst_sel == c.sel && dec.width == 64 && dec.height == 32);
+        // The reverse lookup lands on a DXGI format with the same hardware format and selects.
+        bool exact = false;
+        const uint32_t back = dxgi_format(dec.format, dec.dst_sel, &exact);
+        HardwareFormat bf;
+        CHECK(exact && hardware_format(back, &bf) && bf.format == c.hw && bf.swizzle == c.sel);
+    }
+    // The new hardware format reverses to its only DXGI format; aliases do not take over the
+    // canonical reverse mappings of shared hardware formats.
+    bool exact = false;
+    CHECK(dxgi_format(136, zyxw, &exact) == 115 && exact);
+    CHECK(dxgi_format(7, x001, &exact) == 56 && exact);    // R16_UNORM, not D16 / Xbox D16S8
+    CHECK(dxgi_format(5, x001, &exact) == 62 && exact);    // R8_UINT, not a stencil plane
+    CHECK(dxgi_format(22, x001, &exact) == 41 && exact);   // R32_FLOAT
+    CHECK(dxgi_format(141, x001, &exact) == 45 && exact);  // D24_UNORM_S8_UINT
+    CHECK(dxgi_format(72, xyz1, &exact) == 7 && exact);    // R32G32B32_UINT
+    CHECK(dxgi_format(50, kIdentitySwizzle, &exact) == 24 && exact);  // R10G10B10A2_UNORM
+    CHECK(dxgi_format(56, zyxw, &exact) == 87 && exact);   // B8G8R8A8_UNORM
+    CHECK(dxgi_format(56, zyx1, &exact) == 88 && exact);   // B8G8R8X8_UNORM
+    CHECK(dxgi_format(56, kIdentitySwizzle, &exact) == 28 && exact);  // R8G8B8A8_UNORM
+    CHECK(dxgi_format(136, kIdentitySwizzle, &exact) == 115 && !exact);
+    // 4_4_4_4 is image-only: not a buffer format.
+    CHECK(buffer_format_bytes(136) == 0);
+}
+
 void test_formats() {
     HardwareFormat f;
     CHECK(hardware_format(28, &f) && f.format == 56 && f.swizzle == kIdentitySwizzle);  // R8G8B8A8_UNORM
@@ -399,7 +476,7 @@ void test_formats() {
     }
     // Every DXGI format of the table maps to a hardware format that maps back to a DXGI format with
     // the same hardware format.
-    for (uint32_t dxgi = 1; dxgi < 120; ++dxgi) {
+    for (uint32_t dxgi = 1; dxgi <= 120; ++dxgi) {
         HardwareFormat h;
         if (!hardware_format(dxgi, &h)) {
             continue;
@@ -408,6 +485,7 @@ void test_formats() {
         HardwareFormat h2;
         CHECK(back != 0 && hardware_format(back, &h2) && h2.format == h.format);
     }
+    test_g60_formats();
     CHECK(buffer_format_bytes(Fmt::F32) == 4 && buffer_format_bytes(77) == 16 && buffer_format_bytes(74) == 12 &&
           buffer_format_bytes(14) == 2 && buffer_format_bytes(1) == 1 && buffer_format_bytes(0) == 0);
 }
@@ -477,6 +555,104 @@ void test_samplers() {
     CHECK(!exact);
 }
 
+// G60: a BGRA8 UAV texture gets STORAGE_BINDING only when the WebGPU device has
+// "bgra8unorm-storage"; without it the texture keeps its other usages and the device notes why.
+struct GpuPacket {
+    playgta6::GpuOpcode opcode{};
+    std::vector<uint8_t> payload;
+};
+
+std::vector<GpuPacket> split_packets(const std::vector<std::vector<uint8_t>>& captured) {
+    std::vector<uint8_t> all;
+    for (const auto& c : captured) {
+        all.insert(all.end(), c.begin(), c.end());
+    }
+    std::vector<GpuPacket> out;
+    size_t off = 0;
+    while (off + sizeof(playgta6::GpuPacketHeader) <= all.size()) {
+        playgta6::GpuPacketHeader h{};
+        std::memcpy(&h, all.data() + off, sizeof(h));
+        off += sizeof(h);
+        if (off + h.payload_bytes > all.size()) {
+            break;
+        }
+        GpuPacket p;
+        p.opcode = static_cast<playgta6::GpuOpcode>(h.opcode);
+        p.payload.assign(all.begin() + static_cast<std::ptrdiff_t>(off),
+                         all.begin() + static_cast<std::ptrdiff_t>(off + h.payload_bytes));
+        off += h.payload_bytes;
+        out.push_back(std::move(p));
+    }
+    CHECK(off == all.size());
+    return out;
+}
+
+void test_bgra8_uav_storage_usage() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace pso = playgta6::gpu::pso;
+    using playgta6::GpuCreateTexture2Payload;
+    using playgta6::GpuOpcode;
+    namespace GpuTextureUsage = playgta6::GpuTextureUsage;
+
+    playgta6::os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    for (const bool enabled : {true, false}) {
+        std::vector<std::vector<uint8_t>> captured;
+        dg::DeviceOptions options;
+        options.sink = [&captured](const uint8_t* data, size_t size) { captured.emplace_back(data, data + size); };
+        options.bridge.features = enabled ? pso::WgpuFeature::Bgra8UnormStorage : 0u;
+        com::Ref<dg::Device> device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), options);
+        CHECK(device);
+        if (!device) {
+            continue;
+        }
+        dg::GuestResourceDesc desc{};
+        desc.Dimension = 3;  // TEXTURE2D
+        desc.Width = 64;
+        desc.Height = 64;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = 87;  // B8G8R8A8_UNORM
+        desc.SampleCount = 1;
+        desc.Flags = dg::ResourceFlags::AllowUnorderedAccess;
+        dg::Resource::Placement placement;
+        placement.heap.Type = dg::HeapType::Default;
+        com::Ref<dg::Resource> resource =
+            com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource), dg::device_ref(device.get()), desc,
+                                             std::move(placement), uint32_t{0});
+        CHECK(resource && resource->initialize() && resource->has_gpu_texture());
+
+        const std::vector<GpuPacket> ps = split_packets(captured);
+        const GpuPacket* create = nullptr;
+        size_t creates = 0;
+        for (const GpuPacket& p : ps) {
+            if (p.opcode == GpuOpcode::CreateTexture2) {
+                create = &p;
+                ++creates;
+            }
+        }
+        CHECK(creates == 1 && create != nullptr && create->payload.size() >= sizeof(GpuCreateTexture2Payload));
+        if (create != nullptr && create->payload.size() >= sizeof(GpuCreateTexture2Payload)) {
+            GpuCreateTexture2Payload t{};
+            std::memcpy(&t, create->payload.data(), sizeof(t));
+            CHECK(t.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Bgra8Unorm));
+            CHECK((t.usage_flags & GpuTextureUsage::TextureBinding) != 0);
+            CHECK(((t.usage_flags & GpuTextureUsage::StorageBinding) != 0) == enabled);
+        }
+        bool warned = false;
+        for (const std::string& d : device->diagnostics()) {
+            warned = warned || d.find("has no WebGPU storage binding") != std::string::npos;
+        }
+        CHECK(warned == !enabled);
+        resource = {};
+        device = {};
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -488,6 +664,7 @@ int main() {
     test_formats();
     test_component_mapping();
     test_samplers();
+    test_bgra8_uav_storage_usage();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_gfx10_descriptors failed with %d failure(s)\n", g_failures);
         return 1;
