@@ -579,9 +579,9 @@ void test_ffx_bvh_mf() {
 
     Pg6D3D12RaytracingPrebuildInfo prebuild{111u, 222u, 333u};
     pg6_mw_bvh_builder_get_prebuild_info(builder_storage, nullptr, nullptr, &prebuild);
-    CHECK(prebuild.result_data_max_size_in_bytes == 0u);
-    CHECK(prebuild.scratch_data_size_in_bytes == 0u);
-    CHECK(prebuild.update_scratch_data_size_in_bytes == 0u);
+    CHECK(prebuild.result_data_max_size_in_bytes == 256u);
+    CHECK(prebuild.scratch_data_size_in_bytes == 256u);
+    CHECK(prebuild.update_scratch_data_size_in_bytes == 256u);
 
     pg6_mw_bvh_builder_build_batched_2x(builder_storage, nullptr, 0u, nullptr);
     pg6_mw_bvh_builder_copy(builder_storage, nullptr, 0u, 0u, 0u);

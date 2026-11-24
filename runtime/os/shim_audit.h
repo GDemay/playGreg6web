@@ -385,7 +385,7 @@
     X(pg6_mw_bvh_builder_dtor, ok, "") \
     X(pg6_mw_bvh_builder_build_batched_2x, ok, "no-op") \
     X(pg6_mw_bvh_builder_copy, ok, "no-op") \
-    X(pg6_mw_bvh_builder_get_prebuild_info, ok, "zero sizes (24-byte D3D12 prebuild info)") \
+    X(pg6_mw_bvh_builder_get_prebuild_info, ok, "256-byte sizes: the runtime's build writes nothing (24-byte D3D12 prebuild info)") \
     X(pg6_mw_bvh_builder_rehydrate_batched_2x, ok, "") \
     X(pg6_mw_bvh_builder_set_64bit_morton_codes, ok, "") \
     /* ---- MFPlat / MFReadWrite ---- */ \
