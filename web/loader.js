@@ -666,12 +666,89 @@ function isGpuTelemetryMessage(eventData) {
   return false;
 }
 
+function formatGpuWorkerError(err) {
+  if (err && typeof err === 'object') {
+    const prefix = typeof err.type === 'string' && err.type.length > 0 ? `[${err.type}] ` : '';
+    if (typeof err.message === 'string' && err.message.length > 0) {
+      return `${prefix}${err.message}`;
+    }
+    try {
+      return `${prefix}${JSON.stringify(err)}`;
+    } catch {
+      return `${prefix}${String(err)}`;
+    }
+  }
+  return String(err);
+}
+
 /**
  * Inspect a message emitted by `wgpu_worker.js`, sanitize/normalize GPU frame,
- * shader-fallback, and missing-shader telemetry, and forward `{ type: 'gpu-telemetry', ... }`
+ * shader-fallback, missing-shader, and validation-error telemetry, and forward
  * to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
  */
 function forwardGpuWorkerMessage(eventData, postMessageFn) {
+  if (
+    eventData &&
+    typeof eventData === 'object' &&
+    !Array.isArray(eventData) &&
+    eventData.type === 'gpu-validation-error'
+  ) {
+    const rawErr =
+      eventData.error && typeof eventData.error === 'object' ? eventData.error : null;
+    const rawTs = rawErr
+      ? rawErr.timestampMs
+      : eventData.timestampMs !== undefined
+        ? eventData.timestampMs
+        : eventData.timestamp;
+    const timestampMs =
+      typeof rawTs === 'number' && Number.isFinite(rawTs) ? rawTs : Date.now();
+    const cleanErr = rawErr
+      ? {
+          seq: toNonNegativeInt(rawErr.seq, 0),
+          type:
+            typeof rawErr.type === 'string' && rawErr.type.length > 0
+              ? rawErr.type
+              : typeof rawErr.errorType === 'string' && rawErr.errorType.length > 0
+                ? rawErr.errorType
+                : 'validation',
+          message:
+            rawErr.message !== undefined && rawErr.message !== null
+              ? String(rawErr.message)
+              : '',
+          timestampMs,
+        }
+      : {
+          seq: toNonNegativeInt(eventData.seq, 0),
+          type:
+            typeof eventData.errorType === 'string' && eventData.errorType.length > 0
+              ? eventData.errorType
+              : 'validation',
+          message:
+            eventData.message !== undefined && eventData.message !== null
+              ? String(eventData.message)
+              : typeof eventData.error === 'string'
+                ? eventData.error
+                : '',
+          timestampMs,
+        };
+    const payload = {
+      type: 'gpu-validation-error',
+      error: cleanErr,
+      totalCount: toNonNegativeInt(eventData.totalCount, cleanErr.seq || 1),
+    };
+    if (typeof eventData.source === 'string' && eventData.source.length > 0) {
+      payload.source = eventData.source;
+    }
+    if (typeof postMessageFn === 'function') {
+      try {
+        postMessageFn(payload);
+      } catch {
+        // Telemetry forwarding must never disrupt the GPU worker loop.
+      }
+    }
+    return payload;
+  }
+
   if (!isGpuTelemetryMessage(eventData)) {
     return null;
   }
@@ -3519,7 +3596,7 @@ if (typeof self !== 'undefined') {
       if (data.frame) {
         report(`WebGPU frame #${data.frame} presented`);
       } else if (data.error && progress) {
-        progress.postMessage({ error: `wgpu_worker: ${data.error}` });
+        progress.postMessage({ error: `wgpu_worker: ${formatGpuWorkerError(data.error)}` });
       }
       forwardGpuWorkerMessage(data, postToMain);
     };

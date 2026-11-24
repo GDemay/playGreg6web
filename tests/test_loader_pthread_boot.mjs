@@ -26,6 +26,7 @@ const {
   parseGuestManifest,
   loadGuestManifest,
   buildRuntimeModuleConfig,
+  forwardGpuWorkerMessage,
 } = require('../web/loader.js');
 
 const { createHttpfsMailboxBuffer } = require('../web/workers/httpfs_mailbox.js');
@@ -1093,4 +1094,150 @@ test('W94 buildRuntimeModuleConfig preRun publishes bound module to globalThis._
       delete globalThis.__playgta6RuntimeModule;
     }
   }
+});
+
+test('W94 gpu-validation-error formats cleanly for progress channel and forwards to main thread', async () => {
+  const forwarded = [];
+  const res = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-validation-error',
+      error: {
+        seq: 3,
+        type: 'validation',
+        message: 'Slot 70 bind group layout mismatch',
+        timestampMs: 123456,
+      },
+      totalCount: 3,
+    },
+    (msg) => forwarded.push(msg),
+  );
+  assert.deepEqual(res, {
+    type: 'gpu-validation-error',
+    error: {
+      seq: 3,
+      type: 'validation',
+      message: 'Slot 70 bind group layout mismatch',
+      timestampMs: 123456,
+    },
+    totalCount: 3,
+  });
+  assert.deepEqual(forwarded, [res]);
+
+  // Verify coordinator gpuWorker.onmessage formats object errors instead of [object Object]
+  // and forwards gpu-validation-error to main thread.
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+  const mainMessages = [];
+  const progressMessages = [];
+  let gpuWorkerInstance = null;
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+    }
+    postMessage(msg) {
+      if (this.name === 'game-progress') {
+        progressMessages.push(msg);
+      }
+    }
+  }
+
+  class MockGpuCaptureWorker extends StressMockWorker {
+    constructor(script, opts) {
+      super(script, opts);
+      if (typeof script === 'string' && script.includes('wgpu_worker.js')) {
+        gpuWorkerInstance = this;
+      }
+    }
+  }
+
+  const workerSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    Worker: MockGpuCaptureWorker,
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockGpuCaptureWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    Object,
+    Array,
+    Proxy,
+    Reflect,
+    JSON,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(loaderSource, context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  assert.ok(gpuWorkerInstance, 'expected wgpu_worker instance to be created');
+
+  gpuWorkerInstance.emitMessage({
+    type: 'gpu-validation-error',
+    error: {
+      seq: 1,
+      type: 'validation',
+      message: 'Texture view format mismatch',
+      timestampMs: 9999,
+    },
+    totalCount: 1,
+  });
+  gpuWorkerInstance.emitMessage({ error: 'WebGPU adapter unavailable' });
+
+  const errorProgressMsgs = progressMessages
+    .filter((m) => m && typeof m.error === 'string')
+    .map((m) => m.error);
+  assert.deepEqual(errorProgressMsgs, [
+    'wgpu_worker: [validation] Texture view format mismatch',
+    'wgpu_worker: WebGPU adapter unavailable',
+  ]);
+
+  const validationMainMsg = mainMessages.find((m) => m && m.type === 'gpu-validation-error');
+  assert.ok(validationMainMsg);
+  assert.deepEqual(JSON.parse(JSON.stringify(validationMainMsg)), {
+    type: 'gpu-validation-error',
+    error: {
+      seq: 1,
+      type: 'validation',
+      message: 'Texture view format mismatch',
+      timestampMs: 9999,
+    },
+    totalCount: 1,
+  });
 });
