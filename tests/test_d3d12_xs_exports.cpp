@@ -4319,6 +4319,175 @@ void test_g51_slot70_address_only_buffer_view() {
     scene.release_all({heap});
 }
 
+// G53: Real Xbox Series compute .meta blobs store their 16-byte DXIL HASH digest at
+// meta.size() - 28 (e.g. offset 252 of 280, 316 of 344, 124 of 152), NOT on the graphics
+// kNativeDigestFirst + n * kNativeDigestStride grid. Verify Slot 67 and Slot 57 index the tail-28
+// digest, Slot 62 and standard Slot 11 join & resolve against ShaderPackIndex(PackStage::Compute),
+// emit CreateShaderModule(Compute) with pack_key_code(code_id), and Dispatch(4, 2, 1) emits
+// DispatchCompute with skipped_draws == 0.
+void test_g53_compute_meta_tail_28_digest_join() {
+    namespace xb = dg::xbox;
+
+    std::array<uint8_t, 16> cs62_digest{}, cs11_digest{}, gfx57_digest{};
+    for (int i = 0; i < 16; ++i) {
+        cs62_digest[i] = static_cast<uint8_t>(0x31 + i);
+        cs11_digest[i] = static_cast<uint8_t>(0x61 + i);
+        gfx57_digest[i] = static_cast<uint8_t>(0x91 + i);
+    }
+
+    // 280-byte compute .meta blob with digest ONLY at offset 252 (meta.size() - 28).
+    const std::vector<uint8_t> cs62_hdr = byte_pattern(28, 21);
+    const std::vector<uint8_t> cs62_pmeta = byte_pattern(48, 22);
+    const std::vector<uint8_t> cs62_code = byte_pattern(0x100, 23);
+    std::vector<uint8_t> cs62_meta(280, 0);
+    std::memcpy(cs62_meta.data() + cs62_meta.size() - 28, cs62_digest.data(), 16);
+    for (size_t o = xb::kNativeDigestFirst; o + 16 <= cs62_meta.size(); o += xb::kNativeDigestStride) {
+        CHECK(std::memcmp(cs62_meta.data() + o, cs62_digest.data(), 16) != 0);
+    }
+    const std::vector<uint8_t> cs62_dxil = container_with_hash(cs62_digest);
+    const uint64_t cs62_code_id = dg::shader_identity(cs62_code.data(), cs62_code.size());
+    const uint64_t cs62_stage_id =
+        dg::native_stage_identity(cs62_code.data(), cs62_code.size(), cs62_meta.data(), cs62_meta.size());
+
+    // 344-byte compute .meta blob with digest ONLY at offset 316 (meta.size() - 28) for Slot 11.
+    const std::vector<uint8_t> cs11_hdr = byte_pattern(28, 31);
+    const std::vector<uint8_t> cs11_pmeta = byte_pattern(48, 32);
+    const std::vector<uint8_t> cs11_code = byte_pattern(0x200, 33);
+    std::vector<uint8_t> cs11_meta(344, 0);
+    std::memcpy(cs11_meta.data() + cs11_meta.size() - 28, cs11_digest.data(), 16);
+    const std::vector<uint8_t> cs11_dxil = container_with_hash(cs11_digest);
+    const uint64_t cs11_code_id = dg::shader_identity(cs11_code.data(), cs11_code.size());
+
+    // 152-byte native stage .meta blob with digest ONLY at offset 124 (meta.size() - 28) for Slot 57.
+    const std::vector<uint8_t> gfx_hdr = byte_pattern(384, 41);
+    const std::vector<uint8_t> gfx_pmeta = byte_pattern(96, 42);
+    const std::vector<uint8_t> gfx_vs_code = byte_pattern(0x100, 43);
+    std::vector<uint8_t> gfx_vs_meta(152, 0);
+    std::memcpy(gfx_vs_meta.data() + gfx_vs_meta.size() - 28, gfx57_digest.data(), 16);
+    const uint64_t gfx_vs_code_id = dg::shader_identity(gfx_vs_code.data(), gfx_vs_code.size());
+
+    // Pack contains ONLY the native code identities (not the DXIL identities), so resolution proves
+    // the tail-28 native digest join succeeded.
+    auto index = std::make_shared<playgta6::gpu::ShaderPackIndex>();
+    std::string err;
+    const std::vector<uint8_t> pack_bytes = wgpk({{cs62_code_id, 3}, {cs11_code_id, 3}});
+    CHECK(playgta6::gpu::parse_shader_pack_index(pack_bytes.data(), pack_bytes.size(), index.get(), &err));
+
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.shader_pack = index;
+    dx::set_device_options(options);
+    Scene scene(fx, /*register_shaders=*/false);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+
+    // 1) Slot 67 indexes the 280-byte compute .meta tail-28 digest (offset 252).
+    xb::GuestNativeComputePipelineDesc nd62{};
+    nd62.pRootSignature = scene.rs;
+    nd62.ranges[0] = {put_bytes(cs62_hdr.data(), cs62_hdr.size()), cs62_hdr.size()};
+    nd62.ranges[1] = {put_bytes(cs62_pmeta.data(), cs62_pmeta.size()), cs62_pmeta.size()};
+    nd62.ranges[2] = {put_aligned(cs62_code, 256), cs62_code.size()};
+    nd62.ranges[3] = {put_bytes(cs62_meta.data(), cs62_meta.size()), cs62_meta.size()};
+    const uint64_t out67 = put<uint64_t>(0xBEEF);
+    CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlobCached,
+                      {I(put(nd62)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out67)})) == dg::kENotImpl);
+    CHECK(load64(out67) == 0);
+    dg::Device::NativeStageRecord found{};
+    CHECK(dev->find_native_stage(cs62_digest, &found));
+    CHECK(found.code_identity == cs62_code_id && found.identity == cs62_stage_id && found.metadata_bytes == 280);
+
+    // 2) Slot 62 joins it, resolves against ShaderPackIndex(PackStage::Compute), emits CreateShaderModule(Compute).
+    dg::GuestComputePipelineStateDesc cd62{};
+    cd62.pRootSignature = scene.rs;
+    cd62.CS = {put_bytes(cs62_dxil.data(), cs62_dxil.size()), cs62_dxil.size()};
+    size_t mark = fx.captured.size();
+    const uint64_t cpso62 =
+        fx.create(scene.device, XSlot::PsoFromBlob, {I(put(cd62)), I(0), I(0)}, dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && cpso62 != 0);
+    auto* cstate62 = object_of<dg::PipelineState>(cpso62);
+    CHECK(cstate62->is_compute() && cstate62->resolved());
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 1 && counter(dev, xb::Counter::DxilStagesNotJoined) == 0);
+    const auto mod_pkts62 = packets_since(fx, mark);
+    CHECK(count_op(mod_pkts62, GpuOpcode::CreateShaderModule) == 1);
+    uint32_t cs62_module_id = 0;
+    if (const Packet* mp = find_op(mod_pkts62, GpuOpcode::CreateShaderModule)) {
+        const auto m = payload_as<GpuCreateShaderModulePayload>(*mp);
+        const std::string code_str(mp->payload.begin() + sizeof(GpuCreateShaderModulePayload), mp->payload.end());
+        CHECK(m.stage == static_cast<uint32_t>(GpuShaderStage::Compute));
+        CHECK(code_str == playgta6::gpu::pack_key_code(cs62_code_id));
+        cs62_module_id = m.id;
+    }
+
+    // 3) Dispatch(4, 2, 1) emits CreateComputePipeline2 + DispatchCompute with skipped_draws == 0.
+    const uint64_t emitted0 = dg::work_total(dg::Work::DispatchesEmitted);
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 33, {I(scene.rs)});  // SetComputeRootSignature
+    staged_set_pipeline_state(fx, fx.thread, list, cpso62);
+    fx.vcall(list, 14, {I(4), I(2), I(1)});  // Dispatch
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    CHECK(dg::work_total(dg::Work::DispatchesEmitted) == emitted0 + 1);
+    CHECK(dev->stats().skipped_draws == 0);
+
+    mark = fx.captured.size();
+    scene.execute({list});
+    const auto exec_pkts = packets_since(fx, mark);
+    const Packet* cp = find_op(exec_pkts, GpuOpcode::CreateComputePipeline2);
+    CHECK(cp != nullptr && payload_as<GpuCreateComputePipeline2Payload>(*cp).cs_module_id == cs62_module_id &&
+          payload_as<GpuCreateComputePipeline2Payload>(*cp).pipeline_layout_id != 0);
+    const Packet* dp = find_op(exec_pkts, GpuOpcode::DispatchCompute);
+    CHECK(dp != nullptr && payload_as<GpuDispatchComputePayload>(*dp).workgroup_x == 4 &&
+          payload_as<GpuDispatchComputePayload>(*dp).workgroup_y == 2 &&
+          payload_as<GpuDispatchComputePayload>(*dp).workgroup_z == 1);
+
+    // 4) Standard Slot 11 (CreateComputePipelineState) also joins a 344-byte tail-28 native compute
+    //    stage, resolves against ShaderPackIndex(PackStage::Compute), and dispatches without skipping.
+    xb::GuestNativeComputePipelineDesc nd11{};
+    nd11.pRootSignature = scene.rs;
+    nd11.ranges[0] = {put_bytes(cs11_hdr.data(), cs11_hdr.size()), cs11_hdr.size()};
+    nd11.ranges[1] = {put_bytes(cs11_pmeta.data(), cs11_pmeta.size()), cs11_pmeta.size()};
+    nd11.ranges[2] = {put_aligned(cs11_code, 256), cs11_code.size()};
+    nd11.ranges[3] = {put_bytes(cs11_meta.data(), cs11_meta.size()), cs11_meta.size()};
+    CHECK(hr(fx.vcall(scene.device, XSlot::PsoFromBlobCached,
+                      {I(put(nd11)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out67)})) == dg::kENotImpl);
+    dg::GuestComputePipelineStateDesc cd11{};
+    cd11.pRootSignature = scene.rs;
+    cd11.CS = {put_bytes(cs11_dxil.data(), cs11_dxil.size()), cs11_dxil.size()};
+    mark = fx.captured.size();
+    const uint64_t cpso11 = fx.create(scene.device, Slot2::CreateComputePipelineState, {I(put(cd11))},
+                                      dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && cpso11 != 0 && object_of<dg::PipelineState>(cpso11)->is_compute() &&
+          object_of<dg::PipelineState>(cpso11)->resolved());
+    CHECK(counter(dev, xb::Counter::DxilStagesJoined) == 2);
+    const auto mod_pkts11 = packets_since(fx, mark);
+    CHECK(count_op(mod_pkts11, GpuOpcode::CreateShaderModule) == 1);
+    if (const Packet* mp = find_op(mod_pkts11, GpuOpcode::CreateShaderModule)) {
+        const auto m = payload_as<GpuCreateShaderModulePayload>(*mp);
+        const std::string code_str(mp->payload.begin() + sizeof(GpuCreateShaderModulePayload), mp->payload.end());
+        CHECK(m.stage == static_cast<uint32_t>(GpuShaderStage::Compute));
+        CHECK(code_str == playgta6::gpu::pack_key_code(cs11_code_id));
+    }
+
+    // 5) Slot 57 (read_native_stage) also indexes a 152-byte .meta tail-28 digest (offset 124).
+    xb::GuestNativePipelineDesc nd57{};
+    nd57.pRootSignature = scene.rs;
+    nd57.ranges[0] = {put_bytes(gfx_hdr.data(), gfx_hdr.size()), gfx_hdr.size()};
+    nd57.ranges[1] = {put_bytes(gfx_pmeta.data(), gfx_pmeta.size()), gfx_pmeta.size()};
+    nd57.ranges[4] = {put_aligned(gfx_vs_code, 256), gfx_vs_code.size()};
+    nd57.ranges[5] = {put_bytes(gfx_vs_meta.data(), gfx_vs_meta.size()), gfx_vs_meta.size()};
+    const uint64_t out57 = put<uint64_t>(0xBEEF);
+    CHECK(hr(fx.vcall(scene.device, XSlot::CreateNativePso,
+                      {I(put(nd57)), I(fx.guid(dg::IID_ID3D12PipelineState)), I(out57)})) == dg::kENotImpl);
+    dg::Device::NativeStageRecord found57{};
+    CHECK(dev->find_native_stage(gfx57_digest, &found57));
+    CHECK(found57.code_identity == gfx_vs_code_id && found57.metadata_bytes == 152);
+
+    CHECK(dev->stats().skipped_draws == 0);
+    CHECK(t_balanced);
+    scene.release_all({list, cpso62, cpso11});
+}
+
 }  // namespace
 
 int main() {
@@ -4359,6 +4528,7 @@ int main() {
     test_g49c_raw_tsharp_descriptor_memory_draw();
     test_g51_slot70_unaligned_buffer_views();
     test_g51_slot70_address_only_buffer_view();
+    test_g53_compute_meta_tail_28_digest_join();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

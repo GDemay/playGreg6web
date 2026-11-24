@@ -2272,6 +2272,13 @@ bool Device::read_native_stage(const xbox::NativeStage& s, bool index, NativeSta
             native_by_digest_.emplace(d, *out);
         }
     }
+    if (meta.size() >= 28) {
+        DxilDigest d;
+        std::memcpy(d.data(), meta.data() + meta.size() - 28, 16);
+        if (d != kZero) {
+            native_by_digest_.emplace(d, *out);
+        }
+    }
     return true;
 }
 
@@ -2340,12 +2347,53 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
         return kEInvalidArg;
     }
     pso::D3D12ComputePsoDesc d{};
-    if (!read_shader(*this, g.CS, "CS", &d.cs)) {
+    DxilDigest cs_digest{};
+    if (!read_shader(*this, g.CS, "CS", &d.cs, &cs_digest)) {
         return kEInvalidArg;
     }
     if (d.cs == 0) {
         note_bad_argument("CreateComputePipelineState: no compute shader");
         return kEInvalidArg;
+    }
+    NativeStageRecord native_cs{};
+    static const DxilDigest kZero{};
+    if (native_index_size() != 0 && cs_digest != kZero) {
+        count(find_native_stage(cs_digest, &native_cs) ? xbox::Counter::DxilStagesJoined
+                                                       : xbox::Counter::DxilStagesNotJoined);
+    }
+    if (const ShaderPackIndex* pack = options_.shader_pack.get(); pack != nullptr) {
+        uint64_t pack_key = 0;
+        for (uint64_t k : {native_cs.identity != 0 ? native_cs.code_identity : uint64_t{0}, d.cs}) {
+            auto it = k != 0 ? pack->find(k) : pack->end();
+            if (it != pack->end() && it->second == PackStage::Compute) {
+                pack_key = k;
+                break;
+            }
+        }
+        if (pack_key != 0) {
+            std::lock_guard<std::mutex> lock(pack_mutex_);
+            uint32_t module_id = 0;
+            auto it = pack_modules_.find(pack_key);
+            if (it != pack_modules_.end()) {
+                module_id = it->second;
+            } else {
+                module_id = allocate_id();
+                CommandEncoder enc;
+                enc.create_shader_module(module_id, GpuShaderStage::Compute, pack_key_code(pack_key));
+                submit(enc);
+                pack_modules_.emplace(pack_key, module_id);
+            }
+            register_shader_module(d.cs, module_id);
+            if (rs && pack_layouts_.insert({d.cs, 0}).second) {
+                bridge::PipelineLayoutDesc layout = layout_from_root_signature(rs->signature().desc());
+                for (bridge::GroupLayoutDesc& group : layout.groups) {
+                    for (bridge::LayoutBinding& b : group.bindings) {
+                        b.entry.visibility = GpuShaderStageBits::Compute;
+                    }
+                }
+                bridge_->register_pipeline_layout(d.cs, 0, std::move(layout));
+            }
+        }
     }
     d.root_signature_id = rs ? static_cast<uint32_t>(rs->signature().hash()) : 0u;
     auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
@@ -2358,6 +2406,10 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     state->resolved_ = (state->compute_->diagnostics() & bridge::BridgeDiag::UnknownShaderModule) == 0;
     if (!state->resolved_ && !shader_known(d.cs)) {
         note_unresolved_shader(d.cs, ShaderStage::Compute);
+    }
+    if (dump_) {
+        state->dump_index_ = dump_->compute_pipeline(d.cs, cs_digest, native_cs.code_identity, native_cs.identity,
+                                                     rs.get(), rs ? &rs->signature().desc() : nullptr);
     }
     return hand_out(std::move(state), riid, out);
 }
