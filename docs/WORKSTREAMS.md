@@ -134,7 +134,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
 - [x] **O30 — `XMemMapPhysicalPagesScatter` Semantics: One Page Number per Large Page, Not per 64 KiB Slot (`runtime/os/xbox_scarlett.cpp`, `xmem_windows`)** — `DONE` (PR #471, closes #464) *(found by O29's contiguity measurement on the real mapping sequence; synthetic tests)*
   - Establish the scatter-mapping call's real page-array semantics from the title's call sites, fix the shim and the window model (CPU and GPU side), and check the neighbouring physical-page shims for the same unit error.
-- [ ] **O31 — Boot the Real Program Natively Under the Translated-Window Memory Model and Fix What It Reveals** — `IN PROGRESS` (#475, @Timon-ok) *(follow-up to O29/O30; repo tests synthetic, local game files only for local runs)*
+- [x] **O31 — Boot the Real Program Natively Under the Translated-Window Memory Model and Fix What It Reveals** — `DONE` (PRs #498, #505, #525, closes #475) *(follow-up to O29/O30; repo tests synthetic, local game files only for local runs)*
   - Lift the real program with `--memory-model window`, boot it natively to the default-model boot's milestones, fix every consumer that still assumes identity mapping for window pointers, and measure cost and the contiguous-runs variant.
 
 ---
