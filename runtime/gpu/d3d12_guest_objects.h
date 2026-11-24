@@ -56,6 +56,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -507,6 +508,44 @@ struct IDeviceHost : IObjectHost {
 // Where packets go (default: playgta6::os::wgpu_submit). Called with the device's submit mutex held.
 using PacketSink = std::function<void(const uint8_t* data, size_t size)>;
 
+// Pluggable detiling callback for console-tiled guest textures (G49b / G49a hook).
+// Given raw guest bytes (`src`, `src_bytes`) in console layout `req.layout` (e.g. 0x100 | swizzle),
+// writes mip-0 linear rows with `req.dst_row_pitch` bytes per row into `dst` (`dst_bytes`).
+// Returns true on success, false if unsupported.
+struct TextureDetileRequest {
+    uint32_t dxgi_format = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    uint32_t mip_levels = 1;
+    uint32_t layout = 0;
+    uint32_t block_bytes = 0;
+    uint32_t block_width = 1;
+    uint32_t block_height = 1;
+    uint32_t dst_row_pitch = 0;
+};
+using DetileFn = std::function<bool(const TextureDetileRequest& req,
+                                    const uint8_t* src,
+                                    size_t src_bytes,
+                                    uint8_t* dst,
+                                    size_t dst_bytes)>;
+
+// Dirty-tracking state and layout metadata for a guest-memory-backed GPU texture (G49b).
+struct TrackedTexture {
+    uint32_t resource_id = 0;
+    uint64_t gpu_va = 0;
+    uint32_t dxgi_format = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    uint32_t mip_levels = 1;
+    uint32_t layout = 0;
+    uint32_t dimension = 0;     // ResourceDimension (2=1D, 3=2D, 4=3D)
+    uint32_t sample_count = 1;
+    uint64_t last_upload_hash = 0;
+    bool ever_uploaded = false;
+};
+
 struct DeviceOptions {
     PacketSink sink;                    // empty: os::wgpu_submit
     bridge::BridgeOptions bridge;       // id_allocator is replaced by the device's allocator
@@ -525,6 +564,8 @@ struct DeviceOptions {
     // --shader-pack). Graphics pipelines whose stages all have a key are resolved: see
     // Device::resolve_with_pack. Null: no pack, every pipeline stays unresolved.
     std::shared_ptr<const ShaderPackIndex> shader_pack;
+    // Optional detiling hook for tiled console layouts (layout >= 0x101).
+    DetileFn detile_texture;
 };
 
 struct DeviceStats {
@@ -533,6 +574,7 @@ struct DeviceStats {
     uint64_t pipeline_states = 0;
     uint64_t command_lists = 0;
     uint64_t upload_bytes = 0;        // WriteBuffer / WriteTexture payload bytes emitted from guest memory
+    uint64_t textures_uploaded = 0;   // WriteTexture packets emitted from guest texture memory
     uint64_t skipped_draws = 0;       // draws skipped because the bound PSO has no shader module
     uint64_t unsupported_copies = 0;  // GPU-to-GPU copies, resolves, ... (no packet; diagnosed)
     uint64_t queues = 0;
@@ -730,6 +772,14 @@ public:
     void track_cpu_buffer(Resource* resource);
     void untrack_cpu_buffer(Resource* resource);
     void flush_cpu_buffers(CommandEncoder& encoder);
+    // Dirty-tracked guest texture memory upload (G49b): tracks mip-0 FNV-1a 64 hashes and layout
+    // metadata for guest-memory-backed GPU textures and emits WriteTexture packets when bound SRV
+    // memory changes.
+    void track_guest_texture(const TrackedTexture& tex);
+    void untrack_guest_texture(uint32_t resource_id);
+    bool tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const;
+    void set_detile_fn(DetileFn fn);
+    bool sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder);
     // Designates a texture as the presented back buffer: render passes that target it write the
     // canvas texture (kGpuSwapchainTextureId). PresentX calls it for plane 0's resource the first
     // time that resource is presented (d3d12_xs_xbox.h). False if `resource` is not a 2D texture.
@@ -740,6 +790,7 @@ public:
     void register_gpu_alias(uint64_t gpu_base, uint64_t cpu_base, uint64_t size);
     uint64_t cpu_address_for_gpu(uint64_t gpu_va) const;  // gpu_va itself outside every window
     void note_upload(uint64_t bytes) { upload_bytes_.fetch_add(bytes, std::memory_order_relaxed); }
+    void note_texture_upload(uint64_t count = 1) { textures_uploaded_.fetch_add(count, std::memory_order_relaxed); }
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
 
@@ -856,7 +907,12 @@ private:
     uint64_t next_fake_va_ = kFakeGpuVaBase;
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
+    mutable std::mutex tracked_textures_mutex_;
+    std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
+    mutable std::mutex detile_mutex_;
+    DetileFn detile_texture_;
     std::atomic<uint64_t> upload_bytes_{0};
+    std::atomic<uint64_t> textures_uploaded_{0};
     std::array<std::atomic<uint64_t>, 7> descriptor_words_{};
     std::atomic<uint32_t> descriptor_words_reported_{0};  // bit per WordsStatus already logged
     // Root tables read from descriptor memory (BridgeOptions::slot_source).
@@ -940,9 +996,9 @@ public:
     HResult Signal(uint64_t value) override;
     uint32_t GetCreationFlags() override { return flags_; }
     uint64_t CompletedValueAddress() override;
-    // GPU-side signal (queue Signal): completes when the work submitted before it completed, which
-    // in this runtime is at submission time (see Queue::Signal).
-    void signal_from_queue(uint64_t value) { Signal(value); }
+    // GPU-side signal (queue Signal): monotonically advances completed value when the work
+    // submitted before it completed, which in this runtime is at submission time (see Queue::Signal).
+    void signal_from_queue(uint64_t value);
 
 private:
     void fire_events_locked(std::vector<uint64_t>* to_set);
@@ -951,7 +1007,9 @@ private:
     std::atomic<uint64_t> value_;
     uint32_t flags_;
     uint64_t value_word_ = 0;  // guest word behind CompletedValueAddress (allocated on first use)
+    bool destroyed_ = false;
     std::mutex mutex_;
+    std::condition_variable cv_;
     std::multimap<uint64_t, uint64_t> waits_;  // value -> event handle
 };
 

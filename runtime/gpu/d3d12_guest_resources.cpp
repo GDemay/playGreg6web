@@ -241,6 +241,196 @@ void Device::untrack_cpu_buffer(Resource* resource) {
     tracked_.erase(std::remove(tracked_.begin(), tracked_.end(), resource), tracked_.end());
 }
 
+void Device::track_guest_texture(const TrackedTexture& tex) {
+    if (tex.resource_id == 0 || tex.gpu_va == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    tracked_textures_[tex.resource_id] = tex;
+}
+
+void Device::untrack_guest_texture(uint32_t resource_id) {
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    tracked_textures_.erase(resource_id);
+}
+
+bool Device::tracked_texture_info(uint32_t resource_id, TrackedTexture* out) const {
+    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    const auto it = tracked_textures_.find(resource_id);
+    if (it == tracked_textures_.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second;
+    }
+    return true;
+}
+
+void Device::set_detile_fn(DetileFn fn) {
+    std::lock_guard<std::mutex> lock(detile_mutex_);
+    detile_texture_ = std::move(fn);
+}
+
+bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& encoder) {
+    if (resource_id == 0) {
+        return false;
+    }
+    TrackedTexture tt{};
+    {
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        const auto it = tracked_textures_.find(resource_id);
+        if (it != tracked_textures_.end()) {
+            tt = it->second;
+        } else {
+            bridge::TextureInfo info{};
+            if (!bridge_->texture_info(resource_id, &info) || info.swapchain || info.gpu_va == 0 ||
+                info.gpu_va >= kFakeGpuVaBase || info.sample_count > 1) {
+                return false;
+            }
+            tt.resource_id = resource_id;
+            tt.gpu_va = info.gpu_va;
+            tt.dxgi_format = static_cast<uint32_t>(info.format);
+            tt.width = info.width;
+            tt.height = info.height;
+            tt.depth = info.depth_or_array_size;
+            tt.mip_levels = info.mip_levels;
+            tt.layout = info.layout;
+            tt.dimension = info.dimension == GpuTextureDimension::Dim1D
+                               ? ResourceDimension::Texture1D
+                               : (info.dimension == GpuTextureDimension::Dim3D ? ResourceDimension::Texture3D
+                                                                             : ResourceDimension::Texture2D);
+            tt.sample_count = info.sample_count;
+            tracked_textures_[resource_id] = tt;
+        }
+    }
+    if (tt.gpu_va == 0 || tt.width == 0 || tt.height == 0 || tt.sample_count > 1) {
+        return false;
+    }
+    const DxgiFormatLayout l = dxgi_format_layout(tt.dxgi_format);
+    if (!l.known || l.block_bytes == 0 || l.block_width == 0 || l.block_height == 0 || l.planes > 1) {
+        return false;
+    }
+    const pso::TextureFormatMapping mapping =
+        pso::map_texture_format(static_cast<pso::DxgiFormat>(tt.dxgi_format), pso::FormatUsage::Sampled,
+                                bridge_->options().features);
+    if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
+        return false;
+    }
+    const uint32_t w = tt.width;
+    const uint32_t h = (tt.dimension == ResourceDimension::Texture1D) ? 1u : std::max<uint32_t>(1u, tt.height);
+    const uint32_t d = (tt.dimension == ResourceDimension::Texture3D) ? std::max<uint32_t>(1u, tt.depth) : 1u;
+    const uint32_t blocks_x = (w + l.block_width - 1u) / l.block_width;
+    const uint32_t blocks_y = (h + l.block_height - 1u) / l.block_height;
+    const uint32_t copy_w = blocks_x * l.block_width;
+    const uint32_t copy_h = blocks_y * l.block_height;
+    const uint64_t tight_row_bytes = uint64_t{blocks_x} * l.block_bytes;
+    const uint64_t aligned_row_pitch = align_up(tight_row_bytes, 256u);
+    const uint64_t tight_mip0_bytes = tight_row_bytes * blocks_y * d;
+    const uint64_t aligned_mip0_bytes = aligned_row_pitch * blocks_y * d;
+    constexpr uint64_t kMaxSyncTextureBytes = 64u << 20;
+    if (tight_mip0_bytes == 0 || aligned_mip0_bytes == 0 || aligned_mip0_bytes > kMaxSyncTextureBytes) {
+        return false;
+    }
+
+    const bool is_tiled = tt.layout >= 0x101u;
+    const bool is_tiny = (w <= 2u && h <= 2u);
+    DetileFn detile_fn;
+    {
+        std::lock_guard<std::mutex> lock(detile_mutex_);
+        detile_fn = detile_texture_;
+    }
+    if (is_tiled && !detile_fn && !is_tiny) {
+        return false;
+    }
+
+    // Safely read mip-0 bytes via CPU-window translation (never crashes on unmapped/guard pages).
+    const uint64_t cpu_va = cpu_address_for_gpu(tt.gpu_va);
+    std::vector<uint8_t> raw;
+    bool read_ok = false;
+    if (is_tiled && detile_fn) {
+        GuestResourceDesc tmp{};
+        tmp.Dimension = tt.dimension;
+        tmp.Width = w;
+        tmp.Height = h;
+        tmp.DepthOrArraySize = static_cast<uint16_t>(std::min<uint32_t>(d, 0xFFFFu));
+        tmp.MipLevels = 1;
+        tmp.Format = tt.dxgi_format;
+        tmp.SampleCount = 1;
+        tmp.Layout = tt.layout;
+        const uint64_t tiled_bytes = committed_memory_size(tmp);
+        if (tiled_bytes > tight_mip0_bytes && tiled_bytes <= kMaxSyncTextureBytes) {
+            raw.resize(static_cast<size_t>(tiled_bytes));
+            read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
+        }
+    }
+    if (!read_ok) {
+        raw.resize(static_cast<size_t>(tight_mip0_bytes));
+        read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
+    }
+    if (!read_ok) {
+        return false;
+    }
+
+    const bool all_zero = std::all_of(raw.begin(), raw.end(), [](uint8_t b) { return b == 0; });
+    if (all_zero && !tt.ever_uploaded) {
+        return false;
+    }
+
+    const uint64_t hash = shader_identity(raw.data(), raw.size());
+    if (tt.ever_uploaded && hash == tt.last_upload_hash) {
+        return false;
+    }
+
+    std::vector<uint8_t> staged(static_cast<size_t>(aligned_mip0_bytes), 0);
+    bool detiled = false;
+    if (is_tiled && detile_fn) {
+        TextureDetileRequest req{};
+        req.dxgi_format = tt.dxgi_format;
+        req.width = w;
+        req.height = h;
+        req.depth = d;
+        req.mip_levels = tt.mip_levels;
+        req.layout = tt.layout;
+        req.block_bytes = l.block_bytes;
+        req.block_width = l.block_width;
+        req.block_height = l.block_height;
+        req.dst_row_pitch = static_cast<uint32_t>(aligned_row_pitch);
+        detiled = detile_fn(req, raw.data(), raw.size(), staged.data(), staged.size());
+        if (!detiled && !is_tiny) {
+            return false;
+        }
+    }
+    if (!detiled) {
+        const uint32_t total_rows = blocks_y * d;
+        for (uint32_t r = 0; r < total_rows; ++r) {
+            std::memcpy(staged.data() + static_cast<size_t>(r) * aligned_row_pitch,
+                        raw.data() + static_cast<size_t>(r) * tight_row_bytes,
+                        static_cast<size_t>(tight_row_bytes));
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        const auto it = tracked_textures_.find(resource_id);
+        if (it == tracked_textures_.end()) {
+            return false;
+        }
+        if (it->second.ever_uploaded && it->second.last_upload_hash == hash) {
+            return false;
+        }
+        it->second.last_upload_hash = hash;
+        it->second.ever_uploaded = true;
+    }
+
+    encoder.write_texture(resource_id, 0u, 0u, 0u, 0u, copy_w, copy_h, d,
+                          static_cast<uint32_t>(aligned_row_pitch), blocks_y,
+                          staged.data(), static_cast<uint32_t>(staged.size()));
+    count_work(Work::TextureUploads);
+    note_upload(staged.size());
+    note_texture_upload();
+    return true;
+}
+
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     {
         std::lock_guard<std::mutex> lock(tracked_mutex_);
@@ -363,6 +553,9 @@ Resource::~Resource() {
     if (tracked_) {
         device_->untrack_cpu_buffer(this);
     }
+    if (texture_tracked_) {
+        device_->untrack_guest_texture(id_);
+    }
     if (id_ != 0) {
         device_->state_bridge().unregister_resource(id_);
         device_->resource_states().unregister_resource(id_);
@@ -470,14 +663,32 @@ bool Resource::initialize() {
                 id_ = 0;
                 return false;
             }
+        } else if (!depth && !placement_.placed_heap && !placement_.reserved && placement_.address == 0 &&
+                   heap_cpu_visible(placement_.heap)) {
+            const uint64_t size = align_up(std::max<uint64_t>(committed_memory_size(desc_), 1), 64u << 10);
+            const uint64_t va = com::guest_memory().virtual_alloc(0, size, os::kMemReserve | os::kMemCommit,
+                                                                  os::PageProtect::ReadWrite);
+            if (va == 0) {
+                dev.note_bad_argument("out of guest memory for a " + std::to_string(size) + "-byte texture");
+                id_ = 0;
+                return false;
+            }
+            owned_guest_memory_ = va;
         }
         // The texture's GPU VA is its memory (see the header comment).
         if (placement_.address != 0) {
             gpu_va_ = placement_.address;
+            cpu_va_ = dev.cpu_address_for_gpu(gpu_va_);
         } else if (placement_.placed_heap) {
             gpu_va_ = placement_.placed_heap->base() + placement_.heap_offset;
+            if (placement_.placed_heap->cpu_visible()) {
+                cpu_va_ = gpu_va_;
+            }
         } else if (xmem_memory_ != nullptr) {
             gpu_va_ = com::host_to_guest(xmem_memory_);
+            cpu_va_ = dev.cpu_address_for_gpu(gpu_va_);
+        } else if (owned_guest_memory_ != 0) {
+            gpu_va_ = cpu_va_ = owned_guest_memory_;
         }
         if (gpu_va_ != 0 && xmem_memory_ == nullptr) {
             TextureProbe& p = texture_probe();
@@ -500,15 +711,20 @@ bool Resource::initialize() {
             p.depth_or_layers = std::max<uint32_t>(1, desc_.DepthOrArraySize);
             p.mip_levels = mips_;
             p.sample_count = pso::map_sample_count(desc_.SampleCount);
+            p.dimension = static_cast<uint8_t>(desc_.Dimension == ResourceDimension::Texture1D
+                                                   ? GpuTextureDimension::Dim1D
+                                                   : (desc_.Dimension == ResourceDimension::Texture3D
+                                                          ? GpuTextureDimension::Dim3D
+                                                          : GpuTextureDimension::Dim2D));
             p.usage_flags = GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst;
             if ((desc_.Flags & ResourceFlags::DenyShaderResource) == 0) {
                 p.usage_flags |= GpuTextureUsage::TextureBinding;
             }
-            if (rt || depth) {
+            if ((rt || depth) && p.dimension != static_cast<uint8_t>(GpuTextureDimension::Dim1D)) {
                 p.usage_flags |= GpuTextureUsage::RenderAttachment;
             }
             if ((desc_.Flags & ResourceFlags::AllowUnorderedAccess) != 0) {
-                if (storage_capable(m.format, dev.state_bridge().options().features)) {
+                if (p.sample_count == 1 && storage_capable(m.format, dev.state_bridge().options().features)) {
                     p.usage_flags |= GpuTextureUsage::StorageBinding;
                 } else {
                     // WebGPU rejects the whole texture when STORAGE_BINDING is not allowed for its
@@ -517,11 +733,6 @@ bool Resource::initialize() {
                                           " has no WebGPU storage binding: created without storage usage");
                 }
             }
-            p.dimension = static_cast<uint8_t>(desc_.Dimension == ResourceDimension::Texture1D
-                                                   ? GpuTextureDimension::Dim1D
-                                                   : (desc_.Dimension == ResourceDimension::Texture3D
-                                                          ? GpuTextureDimension::Dim3D
-                                                          : GpuTextureDimension::Dim2D));
             p.format = static_cast<uint8_t>(m.format);
             CommandEncoder enc;
             enc.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
@@ -540,7 +751,23 @@ bool Resource::initialize() {
             info.sample_count = p.sample_count;
             info.dimension = static_cast<GpuTextureDimension>(p.dimension);
             info.gpu_va = descriptor_va_;
+            info.layout = desc_.Layout;
             dev.state_bridge().register_texture(id_, info);
+            if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
+                TrackedTexture tt{};
+                tt.resource_id = id_;
+                tt.gpu_va = gpu_va_;
+                tt.dxgi_format = desc_.Format;
+                tt.width = p.width;
+                tt.height = p.height;
+                tt.depth = p.depth_or_layers;
+                tt.mip_levels = mips_;
+                tt.layout = desc_.Layout;
+                tt.dimension = desc_.Dimension;
+                tt.sample_count = p.sample_count;
+                dev.track_guest_texture(tt);
+                texture_tracked_ = true;
+            }
         }
     }
     d3d::ResourceStateDesc sd;
@@ -711,6 +938,7 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
                       row_pitch != 0 ? depth_pitch / row_pitch : rows, bytes.data(), static_cast<uint32_t>(len));
     device_->submit(enc);
     device_->note_upload(len);
+    device_->note_texture_upload();
     return kSOk;
 }
 

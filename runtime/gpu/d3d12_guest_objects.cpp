@@ -236,6 +236,10 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.relocate_uniform = [this](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
         return relocate_uniform(va, size, id, offset);
     };
+    bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
+        return sync_bound_texture_memory(resource_id, encoder);
+    };
+    detile_texture_ = options_.detile_texture;
     slot_source_ = std::make_unique<MemorySlotSource>(*this);
     bo.slot_source = slot_source_.get();
     bridge_ = std::make_unique<bridge::StateBridgeDevice>(heaps_, std::move(bo), &resource_states_);
@@ -346,6 +350,7 @@ DeviceStats Device::stats() const {
     s.pipeline_states = pipeline_states.load();
     s.command_lists = command_lists.load();
     s.upload_bytes = upload_bytes_.load();
+    s.textures_uploaded = textures_uploaded_.load();
     s.skipped_draws = skipped_draws_.load();
     s.unsupported_copies = unsupported_copies_.load();
     return s;
@@ -1170,6 +1175,12 @@ Fence::Fence(com::Ref<Device> device, uint64_t initial_value, uint32_t flags)
 }
 
 Fence::~Fence() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        destroyed_ = true;
+        waits_.clear();
+    }
+    cv_.notify_all();
     if (value_word_ != 0) {
         com::guest_free(value_word_);
     }
@@ -1194,27 +1205,22 @@ void Fence::publish_value_locked() {
     if (value_word_ == 0) {
         return;
     }
+    const uint64_t current = value_.load(std::memory_order_acquire);
     if (auto* word = static_cast<uint64_t*>(com::guest_to_host(value_word_, sizeof(uint64_t)))) {
-        std::atomic_ref<uint64_t>(*word).store(value_.load(std::memory_order_acquire), std::memory_order_release);
+        std::atomic_ref<uint64_t>(*word).store(current, std::memory_order_release);
+    } else {
+        com::write_guest(value_word_, current);
     }
 }
 
-namespace {
-std::mutex& fence_wait_mutex() {
-    static std::mutex m;
-    return m;
-}
-std::condition_variable& fence_wait_cv() {
-    static std::condition_variable cv;
-    return cv;
-}
-}  // namespace
-
 HResult Fence::SetEventOnCompletion(uint64_t value, uint64_t event_handle) {
     if (event_handle == 0) {
-        // D3D12: a null event blocks until the fence reaches `value`.
-        std::unique_lock<std::mutex> lock(fence_wait_mutex());
-        fence_wait_cv().wait(lock, [&] { return value_.load(std::memory_order_acquire) >= value; });
+        // D3D12: a null event blocks synchronously until the fence reaches `value`.
+        if (value_.load(std::memory_order_acquire) >= value) {
+            return kSOk;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return value_.load(std::memory_order_acquire) >= value || destroyed_; });
         return kSOk;
     }
     {
@@ -1236,14 +1242,27 @@ HResult Fence::Signal(uint64_t value) {
         publish_value_locked();
         fire_events_locked(&to_set);
     }
+    cv_.notify_all();
     for (uint64_t handle : to_set) {
         pg6_win32_set_event(handle);
     }
-    {
-        std::lock_guard<std::mutex> lock(fence_wait_mutex());
-    }
-    fence_wait_cv().notify_all();
     return kSOk;
+}
+
+void Fence::signal_from_queue(uint64_t value) {
+    std::vector<uint64_t> to_set;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (value > value_.load(std::memory_order_acquire)) {
+            value_.store(value, std::memory_order_release);
+            publish_value_locked();
+        }
+        fire_events_locked(&to_set);
+    }
+    cv_.notify_all();
+    for (uint64_t handle : to_set) {
+        pg6_win32_set_event(handle);
+    }
 }
 
 void Fence::fire_events_locked(std::vector<uint64_t>* to_set) {

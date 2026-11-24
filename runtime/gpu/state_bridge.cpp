@@ -1127,28 +1127,47 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
     }
     uint32_t refreshed = 0;
     for (MemoryBindGroup& m : memory_groups_) {
-        if (!d3d::refresh_table_entries(device_.heaps(), *source, m.plan, &StateBridgeDevice::gpu_va_trampoline,
-                                        &device_, &m.built)) {
-            continue;
+        const bool changed = d3d::refresh_table_entries(device_.heaps(), *source, m.plan,
+                                                        &StateBridgeDevice::gpu_va_trampoline, &device_, &m.built);
+        if (changed) {
+            std::vector<GpuBindGroupEntry2> entries;
+            gpu_entries(*m.group, m.built, prelude, &entries);
+            const size_t bytes = entries.size() * sizeof(GpuBindGroupEntry2);
+            if (m.entries_offset != kNoPacket) {
+                encoder_.patch(m.entries_offset, entries.data(), bytes);
+            } else {
+                // Created by an earlier recording of this list: create it again under the same id.
+                GpuCreateBindGroup2Payload header{};
+                header.id = m.built.gpu_id;
+                header.layout_id = m.group->id;
+                header.entry_count = static_cast<uint32_t>(entries.size());
+                prelude.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(),
+                                    static_cast<uint32_t>(bytes));
+            }
+            ++refreshed;
+            ++stats_.memory_bind_groups_refreshed;
         }
-        std::vector<GpuBindGroupEntry2> entries;
-        gpu_entries(*m.group, m.built, prelude, &entries);
-        const size_t bytes = entries.size() * sizeof(GpuBindGroupEntry2);
-        if (m.entries_offset != kNoPacket) {
-            encoder_.patch(m.entries_offset, entries.data(), bytes);
-        } else {
-            // Created by an earlier recording of this list: create it again under the same id.
-            GpuCreateBindGroup2Payload header{};
-            header.id = m.built.gpu_id;
-            header.layout_id = m.group->id;
-            header.entry_count = static_cast<uint32_t>(entries.size());
-            prelude.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(),
-                                static_cast<uint32_t>(bytes));
-        }
-        ++refreshed;
-        ++stats_.memory_bind_groups_refreshed;
+        sync_bound_textures(*m.group, m.built, prelude);
     }
     return refreshed;
+}
+
+void CommandListBridge::sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group,
+                                            const d3d::CachedBindGroup& cached,
+                                            CommandEncoder& target) {
+    if (!device_.options().sync_texture_memory) {
+        return;
+    }
+    for (size_t i = 0; i < cached.entries.size() && i < group.joins.size(); ++i) {
+        const d3d::BindGroupEntry& e = cached.entries[i];
+        if (e.kind == d3d::BindResourceKind::TextureView && e.resource_id != 0 &&
+            (e.view.kind == d3d::DescriptorKind::Srv ||
+             group.joins[i].register_class == d3d::DescriptorRangeType::Srv)) {
+            if (device_.options().sync_texture_memory(e.resource_id, target)) {
+                ++stats_.texture_memory_syncs;
+            }
+        }
+    }
 }
 
 void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group,
@@ -1290,6 +1309,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             } else if (cached->from_memory) {
                 note_memory_group(group, plans[g], *cached, kNoPacket);  // created by an earlier recording
             }
+            sync_bound_textures(group, *cached, encoder_);
             bind_group_id = cached->gpu_id;
             for (size_t i = 0; i < group.entries.size(); ++i) {
                 if ((group.entries[i].flags & GpuBindGroupLayoutEntryFlags::HasDynamicOffset) == 0) {
@@ -1443,6 +1463,17 @@ void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::Resour
     if (num_barriers != 0 && barriers != nullptr) {
         resource_states_.resource_barrier(num_barriers, barriers);
     }
+}
+
+void CommandListBridge::WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
+                                     uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,
+                                     uint32_t bytes_per_row, uint32_t rows_per_image, const void* data,
+                                     uint32_t data_len) {
+    if (!writable()) {
+        return;
+    }
+    encoder_.write_texture(texture_id, mip_level, origin_x, origin_y, origin_z, width, height, depth_or_layers,
+                           bytes_per_row, rows_per_image, data, data_len);
 }
 
 }  // namespace playgta6::gpu::bridge
