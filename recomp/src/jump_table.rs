@@ -44,7 +44,7 @@ use iced_x86::{
     FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
 };
 
-use crate::cfg::{JumpTable, JumpTableIndex};
+use crate::cfg::{JumpTable, JumpTableIndex, UnresolvedJump};
 use crate::code_image::CodeImage;
 
 /// Largest number of jump-table (or index-table) entries read for one dispatch.
@@ -221,6 +221,97 @@ pub(crate) fn resolve(image: &CodeImage<'_>, trace: &[Step<'_>]) -> Option<JumpT
         index: bound.index,
         inferred: false,
     })
+}
+
+/// Why the indirect jump ending `trace` did not resolve (call only after [`resolve`] failed).
+pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJump {
+    let Some(at) = trace.len().checked_sub(1) else {
+        return UnresolvedJump::Computed;
+    };
+    let jmp = trace[at].instr;
+    if jmp.op0_kind() == OpKind::Memory {
+        let scaled = jmp.memory_index() != Register::None && jmp.memory_index_scale() == 8;
+        return if scaled {
+            UnresolvedJump::TableBaseUnknown
+        } else {
+            UnresolvedJump::MemoryOperand
+        };
+    }
+    if jmp.op0_kind() != OpKind::Register {
+        return UnresolvedJump::Computed;
+    }
+    let mut slicer = Slicer {
+        image,
+        trace,
+        info: InstructionInfoFactory::new(),
+    };
+    if let Some(Value::Target { .. }) = slicer.value(jmp.op0_register(), at, 0) {
+        return UnresolvedJump::TableUnbounded;
+    }
+    // Follow register copies to the instruction that computes the target.
+    let mut reg = jmp.op0_register();
+    let mut before = at;
+    for _ in 0..MAX_SLICE_DEPTH {
+        let Some(def) = slicer.def(reg, before) else {
+            return UnresolvedJump::RegisterLiveIn;
+        };
+        let instr = trace[def].instr;
+        let src_reg = (instr.op_count() == 2 && instr.op1_kind() == OpKind::Register)
+            .then(|| instr.op1_register());
+        match instr.mnemonic() {
+            Mnemonic::Mov if src_reg.is_some_and(|r| r.is_gpr64()) => {
+                reg = src_reg.unwrap_or(reg);
+                before = def;
+                continue;
+            }
+            Mnemonic::Mov | Mnemonic::Movsxd
+                if instr.op_count() == 2 && instr.op1_kind() == OpKind::Memory =>
+            {
+                return if is_table_read(instr) {
+                    UnresolvedJump::TableBaseUnknown
+                } else if instr.op0_register().is_gpr64() && instr.memory_size().size() == 8 {
+                    UnresolvedJump::LoadedPointer
+                } else {
+                    UnresolvedJump::Computed
+                };
+            }
+            Mnemonic::Add | Mnemonic::Lea => {
+                // `add target, base` / `lea target, [a + b]`: table-shaped when an operand was
+                // read from a table.
+                let operands: Vec<Register> = if instr.mnemonic() == Mnemonic::Add {
+                    std::iter::once(instr.op0_register())
+                        .chain(src_reg)
+                        .collect()
+                } else {
+                    [instr.memory_base(), instr.memory_index()]
+                        .into_iter()
+                        .filter(|r| *r != Register::None)
+                        .collect()
+                };
+                let table_shaped = operands.iter().any(|&r| {
+                    slicer
+                        .def(r, def)
+                        .is_some_and(|d| is_table_read(trace[d].instr))
+                });
+                return if table_shaped {
+                    UnresolvedJump::TableBaseUnknown
+                } else {
+                    UnresolvedJump::Computed
+                };
+            }
+            _ => return UnresolvedJump::Computed,
+        }
+    }
+    UnresolvedJump::Computed
+}
+
+/// `mov r32 / movsxd r64 / mov r64, [base + index*scale + disp]` with a scaled index (4 or 8).
+fn is_table_read(instr: &Instruction) -> bool {
+    matches!(instr.mnemonic(), Mnemonic::Mov | Mnemonic::Movsxd)
+        && instr.op_count() == 2
+        && instr.op1_kind() == OpKind::Memory
+        && instr.memory_index() != Register::None
+        && matches!(instr.memory_index_scale(), 4 | 8)
 }
 
 /// Fewest leading entries an inferred table must have.
@@ -1590,7 +1681,7 @@ impl Slicer<'_, '_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::cfg::{Edge, Function, JumpTable, JumpTableIndex, Terminator};
+    use crate::cfg::{Edge, Function, JumpTable, JumpTableIndex, Terminator, UnresolvedJump};
     use crate::code_image::{CodeImage, CodeSection, Region};
     use crate::discover::{Analysis, discover};
     use crate::pdata::{FunctionRange, FunctionTable};
@@ -3034,5 +3125,316 @@ mod tests {
         let mut data_and = rva_table(cases_and.map(|va| (va - BASE) as u32));
         data_and.extend_from_slice(&rva_table([DATA_RVA; 4]));
         assert_unresolved(&analyze(&code_and, &data_and, &[0], &[]), jmp_and);
+    }
+
+    // ---- R29: tables behind control-flow merges (reaching values over the CFG) ----------------
+
+    /// Assembles `build` at `TEXT`; returns the bytes and the address of every label in `labels`
+    /// order (labels are created by `build` and pushed into the vector).
+    fn assemble_labeled(
+        build: impl FnOnce(&mut CodeAssembler, &mut Vec<CodeLabel>) -> Result<(), iced_x86::IcedError>,
+    ) -> (Vec<u8>, Vec<u64>) {
+        let mut a = CodeAssembler::new(64).expect("64-bit assembler");
+        let mut labels = Vec::new();
+        build(&mut a, &mut labels).expect("assemble");
+        let result = a
+            .assemble_options(
+                TEXT,
+                iced_x86::BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+            )
+            .expect("encode at TEXT");
+        let ips = labels
+            .iter()
+            .map(|l| result.label_ip(l).expect("label ip"))
+            .collect();
+        (result.inner.code_buffer, ips)
+    }
+
+    /// Table-relative signed 32-bit offsets of `targets` (table at `DATA`), followed by a zero
+    /// entry (which points at the table itself, not at code).
+    fn signed_table(targets: &[u64]) -> Vec<u8> {
+        let mut out = signed_offsets(targets);
+        out.extend(0i32.to_le_bytes());
+        out
+    }
+
+    /// The boot's shape: a loop whose dispatch block starts at a merge. The table base `rsi` is
+    /// set in the entry block; the index `ecx` arrives as a different constant on every edge into
+    /// the merge; case 1 parks the base in `rbx`, reuses `rsi` for a stack address and restores it
+    /// before looping, while `rbx` holds another table address on entry.
+    /// ```text
+    /// entry: lea rsi, [rip+DATA]; lea rbx, [rip+DATA+0x40]; xor ecx, ecx; xor eax, eax
+    /// merge: test edi, edi; je done
+    ///        dec edi; mov r8d, ecx; movsxd rdx, [rsi+r8*4]; add rdx, rsi; jmp rdx
+    /// case0: add eax, 1;    mov ecx, 1; jmp merge
+    /// case1: add eax, 10;   mov rbx, rsi; lea rsi, [rsp-8]; mov r9, [rsi]; mov rsi, rbx;
+    ///        mov ecx, 2; jmp merge
+    /// case2: add eax, 100;  mov ecx, 3; jmp merge
+    /// case3: add eax, 1000; xor ecx, ecx; jmp merge
+    /// done:  ret
+    /// ```
+    /// `edi` iterations give eax = sum of the visited cases in the order 0, 1, 2, 3, 0, ...
+    fn merge_switch() -> (Vec<u8>, [u64; 4], u64) {
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut merge = a.create_label();
+            let mut done = a.create_label();
+            let mut dispatch = a.create_label();
+            let mut cases = [
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            ];
+            lea_rip(a, Register::RSI, DATA)?;
+            lea_rip(a, Register::RBX, DATA + 0x40)?;
+            a.xor(ecx, ecx)?;
+            a.xor(eax, eax)?;
+            a.set_label(&mut merge)?;
+            a.test(edi, edi)?;
+            a.je(done)?;
+            a.dec(edi)?;
+            a.mov(r8d, ecx)?;
+            a.set_label(&mut dispatch)?;
+            a.movsxd(rdx, dword_ptr(rsi + r8 * 4))?;
+            a.add(rdx, rsi)?;
+            a.jmp(rdx)?;
+            a.set_label(&mut cases[0])?;
+            a.add(eax, 1)?;
+            a.mov(ecx, 1)?;
+            a.jmp(merge)?;
+            a.set_label(&mut cases[1])?;
+            a.add(eax, 10)?;
+            a.mov(rbx, rsi)?;
+            a.lea(rsi, ptr(rsp - 8))?;
+            a.mov(r9, qword_ptr(rsi))?;
+            a.mov(rsi, rbx)?;
+            a.mov(ecx, 2)?;
+            a.jmp(merge)?;
+            a.set_label(&mut cases[2])?;
+            a.add(eax, 100)?;
+            a.mov(ecx, 3)?;
+            a.jmp(merge)?;
+            a.set_label(&mut cases[3])?;
+            a.add(eax, 1000)?;
+            a.xor(ecx, ecx)?;
+            a.jmp(merge)?;
+            a.set_label(&mut done)?;
+            a.ret()?;
+            labels.extend([cases[0], cases[1], cases[2], cases[3], dispatch]);
+            Ok(())
+        });
+        let cases = [ips[0], ips[1], ips[2], ips[3]];
+        let jmp_va = find_indirect_jmp_after(&code, ips[4]);
+        (code, cases, jmp_va)
+    }
+
+    fn find_indirect_jmp_after(code: &[u8], from: u64) -> u64 {
+        let mut dec = Decoder::with_ip(64, code, TEXT, DecoderOptions::NONE);
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if instr.ip() >= from && instr.flow_control() == iced_x86::FlowControl::IndirectBranch {
+                return instr.ip();
+            }
+        }
+        panic!("no indirect jmp after {from:#x}");
+    }
+
+    #[test]
+    fn resolves_merge_switch_with_base_carried_through_a_register_copy() {
+        // With a `.pdata` owner the base alone resolves it (inferred extent, as before R29).
+        let (code, cases, jmp_va) = merge_switch();
+        let analysis = analyze(
+            &code,
+            &signed_table(&cases),
+            &[0],
+            &[(0, code.len() as u32, 0)],
+        );
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("merge switch resolved");
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, cases);
+    }
+
+    #[test]
+    fn resolves_merge_switch_from_the_index_constants_on_every_incoming_edge() {
+        // Without `.pdata` no extent can be inferred: the bound [0, 3] comes from the constant
+        // index on each of the five edges into the merge.
+        let (code, cases, jmp_va) = merge_switch();
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("bounded by the reaching index values");
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets, cases);
+    }
+
+    /// A merge whose dispatch reads `ecx`, entered from two guarded paths and (when `third` is
+    /// set) a third path built by `third`:
+    /// ```text
+    /// entry: lea rsi, [rip+DATA]; mov ecx, [rsp+8]; test edx, edx; jne b
+    ///   a:   cmp ecx, 2; ja done; jmp merge
+    ///   b:   and ecx, 3; jmp merge            (or the `third` variant before `jmp merge`)
+    /// merge: movsxd rax, [rsi+rcx*4]; add rax, rsi; jmp rax
+    /// cases, done
+    /// ```
+    fn guarded_merge(
+        path_b: impl FnOnce(&mut CodeAssembler, CodeLabel, CodeLabel) -> Result<(), iced_x86::IcedError>,
+    ) -> (Vec<u8>, [u64; 4], u64) {
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut b = a.create_label();
+            let mut merge = a.create_label();
+            let mut done = a.create_label();
+            let mut helper = a.create_label();
+            let mut cases = [
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            ];
+            lea_rip(a, Register::RSI, DATA)?;
+            a.mov(ecx, dword_ptr(rsp + 8))?;
+            a.test(edx, edx)?;
+            a.jne(b)?;
+            a.cmp(ecx, 2)?;
+            a.ja(done)?;
+            a.jmp(merge)?;
+            a.set_label(&mut b)?;
+            path_b(a, done, helper)?;
+            a.jmp(merge)?;
+            a.set_label(&mut merge)?;
+            a.mov(ecx, ecx)?;
+            a.movsxd(rax, dword_ptr(rsi + rcx * 4))?;
+            a.add(rax, rsi)?;
+            a.jmp(rax)?;
+            for (i, case) in cases.iter_mut().enumerate() {
+                a.set_label(case)?;
+                a.mov(eax, 0x20 + i as u32)?;
+                a.ret()?;
+            }
+            a.set_label(&mut done)?;
+            a.xor(eax, eax)?;
+            a.ret()?;
+            a.set_label(&mut helper)?;
+            a.ret()?;
+            labels.extend([cases[0], cases[1], cases[2], cases[3], merge]);
+            Ok(())
+        });
+        let cases = [ips[0], ips[1], ips[2], ips[3]];
+        let jmp_va = find_indirect_jmp_after(&code, ips[4]);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn resolves_switch_bounded_by_different_guards_on_each_incoming_path() {
+        // Path a: `cmp ecx, 2; ja done` (<= 2); path b: `and ecx, 3` (<= 3): the larger bound.
+        let (code, cases, jmp_va) = guarded_merge(|a, _, _| a.and(ecx, 3));
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("bounded on both paths");
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets, cases);
+    }
+
+    #[test]
+    fn merge_switch_with_an_unguarded_path_stays_unresolved() {
+        // Path b leaves the loaded index unbounded.
+        let (code, cases, jmp_va) = guarded_merge(|a, _, _| a.nop());
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+        assert_eq!(
+            analysis.unresolved_jumps.get(&jmp_va),
+            Some(&UnresolvedJump::TableUnbounded)
+        );
+    }
+
+    #[test]
+    fn merge_switch_with_a_guard_on_the_wrong_register_stays_unresolved() {
+        let (code, cases, jmp_va) = guarded_merge(|a, done, _| {
+            a.cmp(edx, 3)?;
+            a.ja(done)
+        });
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+    }
+
+    #[test]
+    fn merge_switch_with_the_base_overwritten_after_the_guard_stays_unresolved() {
+        // Path b bounds the index, then replaces the base with a loaded pointer.
+        let (code, cases, jmp_va) = guarded_merge(|a, _, _| {
+            a.and(ecx, 3)?;
+            a.mov(rsi, qword_ptr(rsp + 16))
+        });
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+        assert_eq!(
+            analysis.unresolved_jumps.get(&jmp_va),
+            Some(&UnresolvedJump::TableBaseUnknown)
+        );
+    }
+
+    #[test]
+    fn merge_switch_with_conflicting_bases_stays_unresolved() {
+        // Path b bounds the index but points the base at another table.
+        let (code, cases, jmp_va) = guarded_merge(|a, _, _| {
+            a.and(ecx, 3)?;
+            lea_rip(a, Register::RSI, DATA + 0x10)
+        });
+        let mut data = signed_table(&cases);
+        data.extend(signed_table(&cases));
+        let analysis = analyze(&code, &data, &[0], &[]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+        assert_eq!(
+            analysis.unresolved_jumps.get(&jmp_va),
+            Some(&UnresolvedJump::TableBaseUnknown)
+        );
+    }
+
+    #[test]
+    fn merge_switch_with_an_index_reloaded_after_a_call_stays_unresolved() {
+        // Path b bounds ecx, spills it, calls (which may change the slot) and reloads it.
+        let (code, cases, jmp_va) = guarded_merge(|a, _, helper| {
+            a.and(ecx, 3)?;
+            a.mov(dword_ptr(rsp + 0x20), ecx)?;
+            a.call(helper)?;
+            a.mov(ecx, dword_ptr(rsp + 0x20))
+        });
+        let analysis = analyze(&code, &signed_table(&cases), &[0], &[]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+    }
+
+    #[test]
+    fn unresolved_jumps_are_classified() {
+        // Three functions: `jmp [rcx+8]`, `mov rax, [rcx]; jmp rax`, and `jmp rcx`.
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut f1 = a.create_label();
+            let mut f2 = a.create_label();
+            let mut f3 = a.create_label();
+            a.set_label(&mut f1)?;
+            a.jmp(qword_ptr(rcx + 8))?;
+            a.set_label(&mut f2)?;
+            a.mov(rax, qword_ptr(rcx))?;
+            a.jmp(rax)?;
+            a.set_label(&mut f3)?;
+            a.add(rcx, 0x40)?;
+            a.jmp(rdx)?;
+            labels.extend([f1, f2, f3]);
+            Ok(())
+        });
+        let entries: Vec<u32> = ips.iter().map(|&va| (va - TEXT) as u32).collect();
+        let analysis = analyze(&code, &[0; 16], &entries, &[]);
+        let kinds: Vec<UnresolvedJump> = analysis.unresolved_jumps.values().copied().collect();
+        assert_eq!(
+            kinds,
+            [
+                UnresolvedJump::MemoryOperand,
+                UnresolvedJump::LoadedPointer,
+                UnresolvedJump::RegisterLiveIn,
+            ]
+        );
     }
 }

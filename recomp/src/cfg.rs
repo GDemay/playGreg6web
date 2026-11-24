@@ -137,6 +137,51 @@ pub struct JumpTableIndex {
     pub len: u64,
 }
 
+/// Why an indirect jump without an import slot stayed on run-time dispatch (see
+/// [`crate::discover::Analysis::unresolved_jumps`]). Read from the jump's slice; descriptive only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnresolvedJump {
+    /// `jmp [reg + disp]`: a function pointer read from memory (vtable / callback slot tail call).
+    MemoryOperand,
+    /// `jmp reg` with `reg` a 64-bit pointer loaded from memory (no table shape).
+    LoadedPointer,
+    /// A table-shaped read (`[base + index*4]` or `[base + index*8]`) whose base is not a proven
+    /// constant on every path.
+    TableBaseUnknown,
+    /// A table with a proven base whose index has no proven bound, and no extent could be
+    /// inferred (no `.pdata` owner, or fewer than two leading entries inside the function).
+    TableUnbounded,
+    /// The jump register is not written in the slice (set before a merge or passed in): a tail
+    /// call through a register, or a value the slice cannot see.
+    RegisterLiveIn,
+    /// Any other computation.
+    Computed,
+}
+
+impl UnresolvedJump {
+    /// Every kind, in declaration order.
+    pub const ALL: [UnresolvedJump; 6] = [
+        Self::MemoryOperand,
+        Self::LoadedPointer,
+        Self::TableBaseUnknown,
+        Self::TableUnbounded,
+        Self::RegisterLiveIn,
+        Self::Computed,
+    ];
+
+    /// Stable snake_case name (reports and manifests).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MemoryOperand => "memory_operand",
+            Self::LoadedPointer => "loaded_pointer",
+            Self::TableBaseUnknown => "table_base_unknown",
+            Self::TableUnbounded => "table_unbounded",
+            Self::RegisterLiveIn => "register_live_in",
+            Self::Computed => "computed",
+        }
+    }
+}
+
 /// A switch dispatch resolved from its jump table (MSVC x64 shape: 32-bit entries holding RVAs
 /// relative to the image base).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
