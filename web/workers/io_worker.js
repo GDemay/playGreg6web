@@ -108,6 +108,25 @@
 
   const MOUNT_CACHE_PREFIX = '__pg6_mount__/';
   const GAME_PACKAGE_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
+  const IMMUTABLE_HTTPFS_EXT_RE = /\.(?:rpf|pgim|dll)$/i;
+
+  const DEFAULT_IMMUTABLE_CHUNK_SIZE = 64 * 1024; // 64 KiB aligned chunks
+  const DEFAULT_IMMUTABLE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB RAM cap
+  const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30 * 1000; // 30s bounded TTL for missing optional files
+  const DEFAULT_NEGATIVE_CACHE_MAX_ENTRIES = 512;
+  const DEFAULT_METADATA_MAX_ENTRIES = 4096;
+  const MAX_COALESCED_FETCH_BYTES = 4 * 1024 * 1024; // 4 MiB cap per single HTTP 206 fetch
+
+  function isImmutableHttpfsPath(cleanPath) {
+    if (typeof cleanPath !== 'string' || cleanPath.length === 0) {
+      return false;
+    }
+    const base = basenameOfPath(cleanPath).toLowerCase();
+    if (base === 'microsoftgame.config') {
+      return true;
+    }
+    return IMMUTABLE_HTTPFS_EXT_RE.test(cleanPath);
+  }
 
   function normalizeDataBase(base) {
     const raw = typeof base === 'string' && base.length > 0 ? base : '/data/';
@@ -515,6 +534,676 @@
     return defaultErrno;
   }
 
+  function getResponseHeader(headers, name) {
+    if (!headers) {
+      return null;
+    }
+    const lower = name.toLowerCase();
+    if (typeof headers.get === 'function') {
+      return headers.get(name) || headers.get(lower) || null;
+    }
+    if (typeof headers === 'object') {
+      if (typeof headers[name] === 'string') return headers[name];
+      if (typeof headers[lower] === 'string') return headers[lower];
+    }
+    return null;
+  }
+
+  function parseContentRangeHeader(header) {
+    if (typeof header !== 'string') {
+      return null;
+    }
+    const trimmed = header.trim();
+    const unsatisfied = /^bytes\s+\*\/(\d+)$/i.exec(trimmed);
+    if (unsatisfied) {
+      const total = Number(unsatisfied[1]);
+      if (!Number.isSafeInteger(total) || total < 0) {
+        return null;
+      }
+      return { start: null, end: null, total, unsatisfied: true };
+    }
+    const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(trimmed);
+    if (!match) {
+      return null;
+    }
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    const total = match[3] === '*' ? null : Number(match[3]);
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      end < start ||
+      (total !== null && (!Number.isSafeInteger(total) || total < 0))
+    ) {
+      return null;
+    }
+    return { start, end, total, unsatisfied: false };
+  }
+
+  function emptyImmutableCacheStats(options = {}) {
+    return {
+      hits: 0,
+      misses: 0,
+      metaHits: 0,
+      metaMisses: 0,
+      negativeHits: 0,
+      negativeEntries: 0,
+      inFlightCoalesced: 0,
+      networkFetches: 0,
+      evictions: 0,
+      bytesCached: 0,
+      maxBytes:
+        Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+          ? Math.floor(options.maxBytes)
+          : DEFAULT_IMMUTABLE_MAX_BYTES,
+      chunkSize:
+        Number.isInteger(options.chunkSize) && options.chunkSize > 0
+          ? options.chunkSize
+          : DEFAULT_IMMUTABLE_CHUNK_SIZE,
+      entries: 0,
+      filesIndexed: 0,
+    };
+  }
+
+  /**
+   * Bounded in-memory chunked LRU + file-length metadata + short negative cache
+   * for immutable HTTPFS files (`*.rpf`, `*.pgim`, `*.dll`, `MicrosoftGame.Config`).
+   * Eliminates redundant HTTP 206 round-trips across guest worker threads while
+   * keeping RAM strictly bounded and returning 100% exact byte slices.
+   */
+  class ImmutableHttpfsCache {
+    constructor(options = {}) {
+      this.chunkSize =
+        Number.isInteger(options.chunkSize) && options.chunkSize > 0
+          ? options.chunkSize
+          : DEFAULT_IMMUTABLE_CHUNK_SIZE;
+      this.maxBytes =
+        Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+          ? Math.floor(options.maxBytes)
+          : DEFAULT_IMMUTABLE_MAX_BYTES;
+      this.negativeCacheTtlMs =
+        Number.isFinite(options.negativeCacheTtlMs) && options.negativeCacheTtlMs >= 0
+          ? Math.floor(options.negativeCacheTtlMs)
+          : DEFAULT_NEGATIVE_CACHE_TTL_MS;
+      this.negativeCacheMaxEntries =
+        Number.isInteger(options.negativeCacheMaxEntries) && options.negativeCacheMaxEntries >= 0
+          ? options.negativeCacheMaxEntries
+          : DEFAULT_NEGATIVE_CACHE_MAX_ENTRIES;
+      this.metadataMaxEntries =
+        Number.isInteger(options.metadataMaxEntries) && options.metadataMaxEntries > 0
+          ? options.metadataMaxEntries
+          : DEFAULT_METADATA_MAX_ENTRIES;
+      this.fetchImpl =
+        typeof options.fetchImpl === 'function'
+          ? options.fetchImpl
+          : typeof fetch === 'function'
+            ? fetch.bind(globalThis)
+            : null;
+      this._now = typeof options.now === 'function' ? options.now : () => Date.now();
+
+      this._chunks = new Map(); // key (`${url}::${chunkIndex}`) -> owned Uint8Array (LRU order)
+      this._fileMeta = new Map(); // normalized url -> { size: number | null } (LRU order)
+      this._negativeCache = new Map(); // normalized url -> { errno, status, expiresAt } (LRU order)
+      this._inFlightChunks = new Map(); // chunkKey -> Promise<Uint8Array>
+      this._inFlightOpen = new Map(); // url -> Promise<{ ok, size, errno, status }>
+      this._bytesCached = 0;
+
+      this._stats = {
+        chunkHits: 0,
+        chunkMisses: 0,
+        metaHits: 0,
+        metaMisses: 0,
+        negativeHits: 0,
+        inFlightCoalesced: 0,
+        networkFetches: 0,
+        evictions: 0,
+      };
+    }
+
+    _chunkKey(url, chunkIndex) {
+      return `${url}::${chunkIndex}`;
+    }
+
+    _touchMeta(url) {
+      if (!this._fileMeta.has(url)) {
+        return null;
+      }
+      const meta = this._fileMeta.get(url);
+      this._fileMeta.delete(url);
+      this._fileMeta.set(url, meta);
+      return meta;
+    }
+
+    setFileMetadata(url, size) {
+      if (typeof url !== 'string' || url.length === 0) {
+        return;
+      }
+      const cleanSize = Number.isSafeInteger(size) && size >= 0 ? size : null;
+      const existing = this._fileMeta.get(url);
+      const nextSize = cleanSize !== null ? cleanSize : existing ? existing.size : null;
+      if (existing) {
+        this._fileMeta.delete(url);
+      } else if (this._fileMeta.size >= this.metadataMaxEntries) {
+        const oldestUrl = this._fileMeta.keys().next().value;
+        if (oldestUrl !== undefined) {
+          this._fileMeta.delete(oldestUrl);
+        }
+      }
+      this._fileMeta.set(url, { size: nextSize });
+      // A confirmed existing file clears any stale negative entry.
+      this._negativeCache.delete(url);
+    }
+
+    getFileMetadata(url) {
+      const meta = this._touchMeta(url);
+      return meta ? { size: meta.size } : null;
+    }
+
+    getFileSize(url) {
+      const meta = this._fileMeta.get(url);
+      return meta && Number.isSafeInteger(meta.size) ? meta.size : null;
+    }
+
+    _getNegative(url) {
+      const entry = this._negativeCache.get(url);
+      if (!entry) {
+        return null;
+      }
+      if (this.negativeCacheTtlMs <= 0 || this._now() >= entry.expiresAt) {
+        this._negativeCache.delete(url);
+        return null;
+      }
+      // Refresh LRU position on active negative hit.
+      this._negativeCache.delete(url);
+      this._negativeCache.set(url, entry);
+      return entry;
+    }
+
+    _putNegative(url, errno, status) {
+      if (this.negativeCacheTtlMs <= 0 || this.negativeCacheMaxEntries <= 0) {
+        return;
+      }
+      if (this._negativeCache.has(url)) {
+        this._negativeCache.delete(url);
+      } else if (this._negativeCache.size >= this.negativeCacheMaxEntries) {
+        const oldestUrl = this._negativeCache.keys().next().value;
+        if (oldestUrl !== undefined) {
+          this._negativeCache.delete(oldestUrl);
+        }
+      }
+      this._negativeCache.set(url, {
+        errno,
+        status,
+        expiresAt: this._now() + this.negativeCacheTtlMs,
+      });
+    }
+
+    _touchChunk(key) {
+      if (!this._chunks.has(key)) {
+        return null;
+      }
+      const bytes = this._chunks.get(key);
+      this._chunks.delete(key);
+      this._chunks.set(key, bytes);
+      return bytes;
+    }
+
+    _putChunk(key, bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+        return;
+      }
+      // Always store a tightly-sized owned Uint8Array so evicting one chunk
+      // never leaves a larger coalesced ArrayBuffer pinned in memory.
+      const owned =
+        bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+          ? bytes
+          : bytes.slice();
+
+      if (this._chunks.has(key)) {
+        const existing = this._chunks.get(key);
+        this._bytesCached -= existing.byteLength;
+        this._chunks.delete(key);
+      }
+
+      if (this.maxBytes <= 0 || owned.byteLength > this.maxBytes) {
+        return;
+      }
+
+      while (this._bytesCached + owned.byteLength > this.maxBytes && this._chunks.size > 0) {
+        const oldestKey = this._chunks.keys().next().value;
+        const oldestBytes = this._chunks.get(oldestKey);
+        this._chunks.delete(oldestKey);
+        this._bytesCached -= oldestBytes.byteLength;
+        this._stats.evictions += 1;
+      }
+
+      this._chunks.set(key, owned);
+      this._bytesCached += owned.byteLength;
+    }
+
+    _makeHttpError(status, url, rangeLabel) {
+      const errno = status === 403 ? -13 : status === 404 ? -2 : -5;
+      const err = createErrnoError(errno, `HTTP ${status} reading ${url}[${rangeLabel}]`);
+      err.status = status;
+      return err;
+    }
+
+    async _fetchRangeBytes(url, reqStart, reqEnd) {
+      if (typeof this.fetchImpl !== 'function') {
+        throw createErrnoError(-19, 'ImmutableHttpfsCache has no fetch implementation available');
+      }
+
+      this._stats.networkFetches += 1;
+      const res = await this.fetchImpl(url, {
+        headers: { Range: `bytes=${reqStart}-${reqEnd}` },
+      });
+
+      const status = res && typeof res.status === 'number' ? res.status : 0;
+
+      if (status === 416) {
+        const cr = parseContentRangeHeader(getResponseHeader(res.headers, 'Content-Range'));
+        if (cr && Number.isSafeInteger(cr.total)) {
+          this.setFileMetadata(url, cr.total);
+        }
+        return {
+          bytes: new Uint8Array(0),
+          actualStart: reqStart,
+          actualEnd: reqStart - 1,
+          knownTotal: cr && Number.isSafeInteger(cr.total) ? cr.total : this.getFileSize(url),
+          reachedEof: true,
+        };
+      }
+
+      if (status === 404 || status === 403) {
+        const errno = status === 403 ? -13 : -2;
+        this._putNegative(url, errno, status);
+        throw this._makeHttpError(status, url, `${reqStart}..${reqEnd}`);
+      }
+
+      if (!res || (!res.ok && status !== 206)) {
+        throw this._makeHttpError(status || 500, url, `${reqStart}..${reqEnd}`);
+      }
+
+      const raw = new Uint8Array(await res.arrayBuffer());
+
+      if (status === 206) {
+        const cr = parseContentRangeHeader(getResponseHeader(res.headers, 'Content-Range'));
+        if (cr && !cr.unsatisfied) {
+          if (cr.total !== null) {
+            this.setFileMetadata(url, cr.total);
+          } else {
+            this.setFileMetadata(url, null);
+          }
+          const expectedLen = cr.end - cr.start + 1;
+          const availLen = Math.min(raw.byteLength, expectedLen);
+          const actualEnd = cr.start + availLen - 1;
+          const reachedEof =
+            (cr.total !== null && actualEnd + 1 >= cr.total) || availLen === 0;
+          return {
+            bytes: availLen === raw.byteLength ? raw : raw.subarray(0, availLen),
+            actualStart: cr.start,
+            actualEnd,
+            knownTotal: cr.total !== null ? cr.total : this.getFileSize(url),
+            reachedEof,
+          };
+        }
+
+        // 206 without parseable Content-Range header.
+        const requestedLen = reqEnd - reqStart + 1;
+        const reachedEof = raw.byteLength < requestedLen;
+        if (reachedEof) {
+          this.setFileMetadata(url, reqStart + raw.byteLength);
+        } else {
+          this.setFileMetadata(url, null);
+        }
+        return {
+          bytes: raw,
+          actualStart: reqStart,
+          actualEnd: reqStart + raw.byteLength - 1,
+          knownTotal: reachedEof ? reqStart + raw.byteLength : this.getFileSize(url),
+          reachedEof,
+        };
+      }
+
+      // 200 OK fallback (server returned full resource instead of 206 Partial Content).
+      this.setFileMetadata(url, raw.byteLength);
+      return {
+        bytes: raw,
+        actualStart: 0,
+        actualEnd: raw.byteLength - 1,
+        knownTotal: raw.byteLength,
+        reachedEof: true,
+      };
+    }
+
+    _fetchChunkRun(url, runStartIdx, runEndIdx) {
+      const deferreds = [];
+      for (let idx = runStartIdx; idx <= runEndIdx; idx += 1) {
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        const key = this._chunkKey(url, idx);
+        this._inFlightChunks.set(key, promise);
+        deferreds.push({ idx, key, promise, resolve, reject });
+      }
+
+      const executeRun = async () => {
+        try {
+          const knownSize = this.getFileSize(url);
+          const runStart = runStartIdx * this.chunkSize;
+          if (knownSize !== null && runStart >= knownSize) {
+            for (let i = 0; i < deferreds.length; i += 1) {
+              deferreds[i].resolve(new Uint8Array(0));
+            }
+            return;
+          }
+
+          const naturalEnd = (runEndIdx + 1) * this.chunkSize - 1;
+          const reqEnd =
+            knownSize !== null && knownSize > 0
+              ? Math.min(naturalEnd, knownSize - 1)
+              : naturalEnd;
+
+          const fetched = await this._fetchRangeBytes(url, runStart, reqEnd);
+          const totalAfter =
+            fetched.knownTotal !== null ? fetched.knownTotal : this.getFileSize(url);
+          const uncovered = [];
+
+          for (let i = 0; i < deferreds.length; i += 1) {
+            const item = deferreds[i];
+            const cStart = item.idx * this.chunkSize;
+            const cMaxEnd = (item.idx + 1) * this.chunkSize - 1;
+
+            if (totalAfter !== null && cStart >= totalAfter) {
+              item.resolve(new Uint8Array(0));
+              continue;
+            }
+
+            const expectedEnd =
+              totalAfter !== null ? Math.min(cMaxEnd, totalAfter - 1) : cMaxEnd;
+
+            const startsInResponse =
+              fetched.bytes.byteLength > 0 &&
+              cStart >= fetched.actualStart &&
+              cStart <= fetched.actualEnd;
+
+            if (startsInResponse) {
+              const relStart = cStart - fetched.actualStart;
+              const availFromChunkStart = fetched.bytes.byteLength - relStart;
+              const neededLen = expectedEnd - cStart + 1;
+              const coversCompleteChunk =
+                fetched.actualEnd >= expectedEnd ||
+                (fetched.reachedEof && availFromChunkStart > 0);
+
+              if (coversCompleteChunk) {
+                const takeLen = Math.min(this.chunkSize, neededLen, availFromChunkStart);
+                const chunkBytes = fetched.bytes.slice(relStart, relStart + takeLen);
+                if (chunkBytes.byteLength > 0) {
+                  this._putChunk(item.key, chunkBytes);
+                }
+                item.resolve(chunkBytes);
+                continue;
+              }
+            } else if (fetched.reachedEof && cStart > fetched.actualEnd) {
+              item.resolve(new Uint8Array(0));
+              continue;
+            }
+
+            uncovered.push(item);
+          }
+
+          // If the server returned a truncated 206 covering only a prefix of the
+          // coalesced run, fetch each remaining uncovered chunk individually.
+          for (let i = 0; i < uncovered.length; i += 1) {
+            const item = uncovered[i];
+            const latestSize = this.getFileSize(url);
+            const cStart = item.idx * this.chunkSize;
+            if (latestSize !== null && cStart >= latestSize) {
+              item.resolve(new Uint8Array(0));
+              continue;
+            }
+            const cNaturalEnd = (item.idx + 1) * this.chunkSize - 1;
+            const cReqEnd =
+              latestSize !== null && latestSize > 0
+                ? Math.min(cNaturalEnd, latestSize - 1)
+                : cNaturalEnd;
+            try {
+              const single = await this._fetchRangeBytes(url, cStart, cReqEnd);
+              if (
+                single.bytes.byteLength === 0 ||
+                cStart < single.actualStart ||
+                cStart > single.actualEnd
+              ) {
+                item.resolve(new Uint8Array(0));
+              } else {
+                const relStart = cStart - single.actualStart;
+                const takeLen = Math.min(this.chunkSize, single.bytes.byteLength - relStart);
+                const chunkBytes = single.bytes.slice(relStart, relStart + takeLen);
+                if (chunkBytes.byteLength > 0) {
+                  this._putChunk(item.key, chunkBytes);
+                }
+                item.resolve(chunkBytes);
+              }
+            } catch (err) {
+              item.reject(err);
+            }
+          }
+        } catch (err) {
+          for (let i = 0; i < deferreds.length; i += 1) {
+            deferreds[i].reject(err);
+          }
+        } finally {
+          for (let i = 0; i < deferreds.length; i += 1) {
+            const item = deferreds[i];
+            if (this._inFlightChunks.get(item.key) === item.promise) {
+              this._inFlightChunks.delete(item.key);
+            }
+          }
+        }
+      };
+
+      executeRun();
+      return deferreds.map((d) => d.promise);
+    }
+
+    _getChunkRange(url, firstChunk, lastChunk) {
+      const totalChunks = lastChunk - firstChunk + 1;
+      const chunkPromises = new Array(totalChunks);
+      const maxRunChunks = Math.max(1, Math.floor(MAX_COALESCED_FETCH_BYTES / this.chunkSize));
+
+      let runStartPos = -1;
+      const flushMissingRun = (endPosExclusive) => {
+        if (runStartPos < 0) {
+          return;
+        }
+        let curPos = runStartPos;
+        while (curPos < endPosExclusive) {
+          const batchEndExclusive = Math.min(endPosExclusive, curPos + maxRunChunks);
+          const runStartIdx = firstChunk + curPos;
+          const runEndIdx = firstChunk + batchEndExclusive - 1;
+          const promises = this._fetchChunkRun(url, runStartIdx, runEndIdx);
+          for (let k = 0; k < promises.length; k += 1) {
+            chunkPromises[curPos + k] = promises[k];
+          }
+          curPos = batchEndExclusive;
+        }
+        runStartPos = -1;
+      };
+
+      for (let i = 0; i < totalChunks; i += 1) {
+        const chunkIndex = firstChunk + i;
+        const key = this._chunkKey(url, chunkIndex);
+
+        const memHit = this._touchChunk(key);
+        if (memHit !== null) {
+          flushMissingRun(i);
+          this._stats.chunkHits += 1;
+          chunkPromises[i] = Promise.resolve(memHit);
+          continue;
+        }
+
+        const inFlight = this._inFlightChunks.get(key);
+        if (inFlight) {
+          flushMissingRun(i);
+          this._stats.inFlightCoalesced += 1;
+          chunkPromises[i] = inFlight;
+          continue;
+        }
+
+        this._stats.chunkMisses += 1;
+        if (runStartPos < 0) {
+          runStartPos = i;
+        }
+      }
+      flushMissingRun(totalChunks);
+
+      return Promise.all(chunkPromises);
+    }
+
+    async open(url) {
+      const existingMeta = this._touchMeta(url);
+      if (existingMeta !== null) {
+        this._stats.metaHits += 1;
+        return { ok: true, size: existingMeta.size };
+      }
+
+      const neg = this._getNegative(url);
+      if (neg !== null) {
+        this._stats.negativeHits += 1;
+        return { ok: false, errno: neg.errno, status: neg.status };
+      }
+
+      const existingOpen = this._inFlightOpen.get(url);
+      if (existingOpen) {
+        this._stats.inFlightCoalesced += 1;
+        return existingOpen;
+      }
+
+      this._stats.metaMisses += 1;
+      const openPromise = (async () => {
+        try {
+          await this._getChunkRange(url, 0, 0);
+          const meta = this._fileMeta.get(url);
+          if (!meta) {
+            this.setFileMetadata(url, null);
+          }
+          return { ok: true, size: meta ? meta.size : null };
+        } catch (err) {
+          return {
+            ok: false,
+            errno: mapErrorToErrno(err, -2),
+            status: err && typeof err.status === 'number' ? err.status : null,
+          };
+        }
+      })();
+
+      this._inFlightOpen.set(url, openPromise);
+      try {
+        return await openPromise;
+      } finally {
+        if (this._inFlightOpen.get(url) === openPromise) {
+          this._inFlightOpen.delete(url);
+        }
+      }
+    }
+
+    async read(url, offset, length) {
+      if (!Number.isInteger(offset) || offset < 0) {
+        throw createErrnoError(-22, `Invalid read offset: ${offset}`);
+      }
+      if (!Number.isInteger(length) || length < 0) {
+        throw createErrnoError(-22, `Invalid read length: ${length}`);
+      }
+      if (length === 0) {
+        return new Uint8Array(0);
+      }
+
+      const neg = this._getNegative(url);
+      if (neg !== null) {
+        this._stats.negativeHits += 1;
+        throw this._makeHttpError(neg.status || 404, url, `${offset}..${offset + length - 1}`);
+      }
+
+      let effectiveLen = length;
+      const meta = this._touchMeta(url);
+      if (meta && Number.isSafeInteger(meta.size)) {
+        if (offset >= meta.size) {
+          return new Uint8Array(0);
+        }
+        effectiveLen = Math.min(length, meta.size - offset);
+        if (effectiveLen <= 0) {
+          return new Uint8Array(0);
+        }
+      }
+
+      const firstChunk = Math.floor(offset / this.chunkSize);
+      const lastChunk = Math.floor((offset + effectiveLen - 1) / this.chunkSize);
+      const chunks = await this._getChunkRange(url, firstChunk, lastChunk);
+
+      const slices = [];
+      let totalBytes = 0;
+
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunkIndex = firstChunk + i;
+        const chunk = chunks[i];
+        if (!chunk || chunk.byteLength === 0) {
+          break;
+        }
+        const chunkStart = chunkIndex * this.chunkSize;
+        const sliceStart = Math.max(0, offset - chunkStart);
+        const sliceEnd = Math.min(chunk.byteLength, offset + effectiveLen - chunkStart);
+        if (sliceEnd > sliceStart) {
+          const part = chunk.subarray(sliceStart, sliceEnd);
+          slices.push(part);
+          totalBytes += part.byteLength;
+        }
+        if (chunk.byteLength < this.chunkSize) {
+          break;
+        }
+      }
+
+      // Always return a fresh owned buffer so callers cannot mutate cached chunks.
+      const out = new Uint8Array(totalBytes);
+      let cursor = 0;
+      for (let i = 0; i < slices.length; i += 1) {
+        const part = slices[i];
+        out.set(part, cursor);
+        cursor += part.byteLength;
+      }
+      return out;
+    }
+
+    clear() {
+      this._chunks.clear();
+      this._fileMeta.clear();
+      this._negativeCache.clear();
+      this._bytesCached = 0;
+    }
+
+    getStats() {
+      return {
+        hits: this._stats.chunkHits,
+        misses: this._stats.chunkMisses,
+        metaHits: this._stats.metaHits,
+        metaMisses: this._stats.metaMisses,
+        negativeHits: this._stats.negativeHits,
+        negativeEntries: this._negativeCache.size,
+        inFlightCoalesced: this._stats.inFlightCoalesced,
+        networkFetches: this._stats.networkFetches,
+        evictions: this._stats.evictions,
+        bytesCached: this._bytesCached,
+        maxBytes: this.maxBytes,
+        chunkSize: this.chunkSize,
+        entries: this._chunks.size,
+        filesIndexed: this._fileMeta.size,
+      };
+    }
+  }
+
   function emptyRangeCacheStats() {
     return {
       hits: 0,
@@ -562,6 +1251,7 @@
       bytesCached: cacheStats.bytesCached,
       entries: cacheStats.entries,
       rangeCache: cacheStats,
+      immutableCache: emptyImmutableCacheStats(),
       scheduler: emptySchedulerStats(),
       rpf: {
         mountedCount: 0,
@@ -595,7 +1285,10 @@
       this.gameBase = normalizeOptionalBase(options.gameBase);
       this.manifest = options.manifest || null;
       this.rangeCache = options.rangeCache || null;
+      this._customRangeCacheProvided = Boolean(options.rangeCache);
       this._hasRoutedRangeCache = !options.rangeCache;
+      this.immutableCache = options.immutableCache || null;
+      this._immutableCacheEnabled = options.immutableCacheEnabled !== false;
       this.scheduler = options.scheduler || null;
       this.rpfMountTable = options.rpfMountTable || null;
       this.fetchImpl = typeof options.fetchImpl === 'function' ? options.fetchImpl : null;
@@ -609,6 +1302,14 @@
         maxBytes: options.maxBytes,
         maxPrefetchConcurrency: options.maxPrefetchConcurrency,
         opfsDir: options.opfsDir !== undefined ? options.opfsDir : undefined,
+      };
+      this._immutableCacheOptions = {
+        chunkSize: options.immutableCacheChunkSize,
+        maxBytes: options.immutableCacheMaxBytes,
+        negativeCacheTtlMs: options.negativeCacheTtlMs,
+        negativeCacheMaxEntries: options.negativeCacheMaxEntries,
+        metadataMaxEntries: options.metadataMaxEntries,
+        now: typeof options.now === 'function' ? options.now : undefined,
       };
       this._schedulerOptions = {
         maxConcurrency: options.maxConcurrency,
@@ -717,6 +1418,34 @@
         });
       }
       return this.rangeCache;
+    }
+
+    ensureImmutableCache() {
+      if (!this.immutableCache) {
+        this.immutableCache = new ImmutableHttpfsCache({
+          chunkSize: this._immutableCacheOptions.chunkSize,
+          maxBytes: this._immutableCacheOptions.maxBytes,
+          negativeCacheTtlMs: this._immutableCacheOptions.negativeCacheTtlMs,
+          negativeCacheMaxEntries: this._immutableCacheOptions.negativeCacheMaxEntries,
+          metadataMaxEntries: this._immutableCacheOptions.metadataMaxEntries,
+          now: this._immutableCacheOptions.now,
+          fetchImpl: this._getFetchImpl(),
+        });
+      }
+      return this.immutableCache;
+    }
+
+    _shouldUseImmutableCache(route) {
+      if (!this._immutableCacheEnabled || !route || !route.ok || route.isRpf) {
+        return false;
+      }
+      if (!isImmutableHttpfsPath(route.relPath)) {
+        return false;
+      }
+      if (this._customRangeCacheProvided && !this.immutableCache && !this.fetchImpl) {
+        return false;
+      }
+      return Boolean(this.immutableCache || this._getFetchImpl());
     }
 
     ensureScheduler() {
@@ -1046,6 +1775,18 @@
           size: manifestLookup.entry.size ?? null,
         };
       }
+      if (this.immutableCache && this._shouldUseImmutableCache(route)) {
+        const cachedMeta = this.immutableCache.getFileMetadata(route.url);
+        if (cachedMeta) {
+          return {
+            path: cleanPath,
+            kind: 'file',
+            isFile: true,
+            isDirectory: false,
+            size: cachedMeta.size,
+          };
+        }
+      }
       return null;
     }
 
@@ -1136,17 +1877,43 @@
         return -2; // ENOENT
       }
 
-      try {
-        this.ensureRangeCache();
-      } catch {
-        return -19; // ENODEV
-      }
+      const useImmutableCache = this._shouldUseImmutableCache(route);
+      let resolvedSize =
+        manifestLookup.entry && Number.isSafeInteger(manifestLookup.entry.size)
+          ? manifestLookup.entry.size
+          : null;
 
-      if (manifestLookup.known === null && probeOnOpen) {
+      if (useImmutableCache) {
+        const immCache = this.ensureImmutableCache();
+        if (manifestLookup.known === true) {
+          immCache.setFileMetadata(route.url, resolvedSize);
+        } else if (probeOnOpen) {
+          const openRes = await immCache.open(route.url);
+          if (!openRes.ok) {
+            return typeof openRes.errno === 'number' && openRes.errno < 0 ? openRes.errno : -2;
+          }
+          if (Number.isSafeInteger(openRes.size)) {
+            resolvedSize = openRes.size;
+          }
+        } else {
+          const cachedSize = immCache.getFileSize(route.url);
+          if (Number.isSafeInteger(cachedSize)) {
+            resolvedSize = cachedSize;
+          }
+        }
+      } else {
         try {
-          await this._scheduledRead(cachePath, 0, 1, { priority: IO_PRIORITY.CRITICAL });
-        } catch (err) {
-          return mapErrorToErrno(err, -2);
+          this.ensureRangeCache();
+        } catch {
+          return -19; // ENODEV
+        }
+
+        if (manifestLookup.known === null && probeOnOpen) {
+          try {
+            await this._scheduledRead(cachePath, 0, 1, { priority: IO_PRIORITY.CRITICAL });
+          } catch (err) {
+            return mapErrorToErrno(err, -2);
+          }
         }
       }
 
@@ -1158,10 +1925,8 @@
         cachePath,
         mount: route.mount,
         url: route.url,
-        size:
-          manifestLookup.entry && Number.isSafeInteger(manifestLookup.entry.size)
-            ? manifestLookup.entry.size
-            : null,
+        useImmutableCache,
+        size: resolvedSize,
       });
       return handle;
     }
@@ -1182,6 +1947,17 @@
           reqLen,
           IO_PRIORITY.CRITICAL,
         );
+      }
+      if (entry.useImmutableCache) {
+        const immCache = this.ensureImmutableCache();
+        const bytes = await immCache.read(entry.url, offset, reqLen);
+        if (entry.size === null) {
+          const learnedSize = immCache.getFileSize(entry.url);
+          if (Number.isSafeInteger(learnedSize)) {
+            entry.size = learnedSize;
+          }
+        }
+        return bytes;
       }
       return this._scheduledRead(entry.cachePath || entry.path, offset, reqLen, {
         priority: IO_PRIORITY.CRITICAL,
@@ -1277,6 +2053,12 @@
 
     getStats() {
       const cacheStats = this.rangeCache ? this.rangeCache.getStats() : emptyRangeCacheStats();
+      const immutableCacheStats = this.immutableCache
+        ? this.immutableCache.getStats()
+        : emptyImmutableCacheStats({
+            chunkSize: this._immutableCacheOptions.chunkSize,
+            maxBytes: this._immutableCacheOptions.maxBytes,
+          });
       const schedulerStats = this.scheduler ? this.scheduler.getStats() : emptySchedulerStats();
       const mounts = this.rpfMountTable ? this.rpfMountTable.listMounts() : [];
       const mountedArchives = mounts.map((m) => {
@@ -1305,6 +2087,7 @@
         entries: cacheStats.entries,
         // Detailed subsystem telemetry
         rangeCache: cacheStats,
+        immutableCache: immutableCacheStats,
         scheduler: schedulerStats,
         rpf: {
           mountedCount: mountedArchives.length,
@@ -1362,7 +2145,38 @@
       const fetchFn = this._getFetchImpl(opts.fetchImpl);
       const routedFetchFn = this._createRoutedFetch(fetchFn);
 
+      if (opts.immutableCacheEnabled !== undefined) {
+        this._immutableCacheEnabled = opts.immutableCacheEnabled !== false;
+      }
+      this._customRangeCacheProvided = Boolean(opts.rangeCache);
       this._hasRoutedRangeCache = !opts.rangeCache;
+      this.immutableCache =
+        opts.immutableCache ||
+        new ImmutableHttpfsCache({
+          chunkSize:
+            opts.immutableCacheChunkSize !== undefined
+              ? opts.immutableCacheChunkSize
+              : this._immutableCacheOptions.chunkSize,
+          maxBytes:
+            opts.immutableCacheMaxBytes !== undefined
+              ? opts.immutableCacheMaxBytes
+              : this._immutableCacheOptions.maxBytes,
+          negativeCacheTtlMs:
+            opts.negativeCacheTtlMs !== undefined
+              ? opts.negativeCacheTtlMs
+              : this._immutableCacheOptions.negativeCacheTtlMs,
+          negativeCacheMaxEntries:
+            opts.negativeCacheMaxEntries !== undefined
+              ? opts.negativeCacheMaxEntries
+              : this._immutableCacheOptions.negativeCacheMaxEntries,
+          metadataMaxEntries:
+            opts.metadataMaxEntries !== undefined
+              ? opts.metadataMaxEntries
+              : this._immutableCacheOptions.metadataMaxEntries,
+          now:
+            typeof opts.now === 'function' ? opts.now : this._immutableCacheOptions.now,
+          fetchImpl: fetchFn,
+        });
       this.rangeCache =
         opts.rangeCache ||
         new rangeCacheMod.RangeCache({
@@ -1591,13 +2405,20 @@
   const exportedApi = {
     IO_PRIORITY,
     RPF_URI_PREFIX,
+    DEFAULT_IMMUTABLE_CHUNK_SIZE,
+    DEFAULT_IMMUTABLE_MAX_BYTES,
+    DEFAULT_NEGATIVE_CACHE_TTL_MS,
+    ImmutableHttpfsCache,
     IoWorkerController,
     createIoWorkerHandler,
     resolveHttpfsRoute,
+    isImmutableHttpfsPath,
+    parseContentRangeHeader,
     isRpfVirtualPath,
     parseRpfVirtualPath,
     emptyStats,
     emptyRangeCacheStats,
+    emptyImmutableCacheStats,
     emptySchedulerStats,
     getDefaultController: () => defaultController,
   };
