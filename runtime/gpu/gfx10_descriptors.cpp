@@ -66,7 +66,11 @@ constexpr Swizzle kZYX1 = {Sel::Z, Sel::Y, Sel::X, Sel::One};
 
 // Hardware format names list components from the most significant bits down (2_10_10_10 holds
 // R in bits 0..9 and A in bits 30..31, i.e. DXGI R10G10B10A2); one-component reads use X.
-// The first entry of a hardware format is the one dxgi_format() picks when selects do not match.
+// The first entry of a hardware format is the one dxgi_format() picks when selects do not match,
+// and the first entry with matching selects wins otherwise: aliases (typeless, depth/stencil plane
+// and Xbox formats) follow their canonical entry so reverse lookups keep the canonical format.
+// Image formats >= 128 follow gfx10 IMG_FMT: 131 6E4_FLOAT, 132 5_9_9_9_FLOAT, 133 5_6_5_UNORM,
+// 134 1_5_5_5_UNORM, 135 5_5_5_1_UNORM, 136 4_4_4_4_UNORM, 141 8_24_UNORM.
 constexpr FormatEntry kFormats[] = {
     {2, 77, kXYZW},    // R32G32B32A32_FLOAT -> 32_32_32_32_FLOAT
     {3, 75, kXYZW},    // R32G32B32A32_UINT
@@ -75,6 +79,7 @@ constexpr FormatEntry kFormats[] = {
     {6, 74, kXYZ1},    // R32G32B32_FLOAT
     {7, 72, kXYZ1},    // R32G32B32_UINT
     {8, 73, kXYZ1},    // R32G32B32_SINT
+    {5, 72, kXYZ1},    // R32G32B32_TYPELESS (as UINT)
     {10, 71, kXYZW},   // R16G16B16A16_FLOAT
     {11, 65, kXYZW},   // R16G16B16A16_UNORM
     {12, 69, kXYZW},   // R16G16B16A16_UINT
@@ -88,6 +93,7 @@ constexpr FormatEntry kFormats[] = {
     {24, 50, kXYZW},   // R10G10B10A2_UNORM -> 2_10_10_10_UNORM
     {25, 54, kXYZW},   // R10G10B10A2_UINT
     {23, 54, kXYZW},   // R10G10B10A2_TYPELESS (as UINT)
+    {89, 50, kXYZW},   // R10G10B10_XR_BIAS_A2_UNORM (bits as 2_10_10_10_UNORM; no XR bias)
     {26, 36, kXYZ1},   // R11G11B10_FLOAT -> 10_11_11_FLOAT
     {28, 56, kXYZW},   // R8G8B8A8_UNORM -> 8_8_8_8_UNORM
     {29, 130, kXYZW},  // R8G8B8A8_UNORM_SRGB -> 8_8_8_8_SRGB
@@ -99,6 +105,8 @@ constexpr FormatEntry kFormats[] = {
     {88, 56, kZYX1},   // B8G8R8X8_UNORM
     {91, 130, kZYXW},  // B8G8R8A8_UNORM_SRGB
     {93, 130, kZYX1},  // B8G8R8X8_UNORM_SRGB
+    {90, 56, kZYXW},   // B8G8R8A8_TYPELESS (as UNORM)
+    {92, 56, kZYX1},   // B8G8R8X8_TYPELESS (as UNORM)
     {34, 29, kXY01},   // R16G16_FLOAT
     {35, 23, kXY01},   // R16G16_UNORM
     {36, 27, kXY01},   // R16G16_UINT
@@ -112,8 +120,10 @@ constexpr FormatEntry kFormats[] = {
     {39, 20, kX001},   // R32_TYPELESS (as UINT)
     {21, 22, kX001},   // R32_FLOAT_X8X24_TYPELESS (depth plane)
     {20, 22, kX001},   // D32_FLOAT_S8X24_UINT (depth plane)
+    {19, 22, kX001},   // R32G8X24_TYPELESS (depth plane)
     {45, 141, kX001},  // D24_UNORM_S8_UINT -> 8_24_UNORM (depth)
     {46, 141, kX001},  // R24_UNORM_X8_TYPELESS
+    {44, 141, kX001},  // R24G8_TYPELESS (depth plane)
     {49, 14, kXY01},   // R8G8_UNORM
     {50, 18, kXY01},   // R8G8_UINT
     {51, 15, kXY01},   // R8G8_SNORM
@@ -122,6 +132,8 @@ constexpr FormatEntry kFormats[] = {
     {54, 13, kX001},   // R16_FLOAT
     {56, 7, kX001},    // R16_UNORM
     {55, 7, kX001},    // D16_UNORM
+    {118, 7, kX001},   // D16_UNORM_S8_UINT (Xbox; depth plane)
+    {119, 7, kX001},   // R16_UNORM_X8_TYPELESS (Xbox; depth plane)
     {57, 11, kX001},   // R16_UINT
     {58, 8, kX001},    // R16_SNORM
     {59, 12, kX001},   // R16_SINT
@@ -131,10 +143,14 @@ constexpr FormatEntry kFormats[] = {
     {63, 2, kX001},    // R8_SNORM
     {64, 6, kX001},    // R8_SINT
     {60, 5, kX001},    // R8_TYPELESS (as UINT)
+    {22, 5, kX001},    // X32_TYPELESS_G8X24_UINT (stencil plane -> 8_UINT)
+    {47, 5, kX001},    // X24_TYPELESS_G8_UINT (stencil plane)
+    {120, 5, kX001},   // X16_TYPELESS_G8_UINT (Xbox; stencil plane)
     {65, 1, k000X},    // A8_UNORM -> 8_UNORM read 0, 0, 0, X
     {67, 132, kXYZ1},  // R9G9B9E5_SHAREDEXP -> 5_9_9_9_FLOAT
     {85, 133, kZYX1},  // B5G6R5_UNORM -> 5_6_5_UNORM (X = bits 0..4 = B)
     {86, 134, kZYXW},  // B5G5R5A1_UNORM -> 1_5_5_5_UNORM
+    {115, 136, kZYXW}, // B4G4R4A4_UNORM -> 4_4_4_4_UNORM (X = bits 0..3 = B)
     {71, 169, kXYZW},  // BC1_UNORM
     {72, 170, kXYZW},  // BC1_UNORM_SRGB
     {70, 169, kXYZW},  // BC1_TYPELESS

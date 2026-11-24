@@ -71,7 +71,9 @@ uint64_t u64_at(const uint32_t* u, size_t i) {
     return uint64_t{u[i]} | (uint64_t{u[i + 1]} << 32);
 }
 
-// Formats WebGPU allows STORAGE_BINDING for: the core set, plus the "texture-formats-tier1" set.
+// Formats WebGPU allows STORAGE_BINDING for: the core set, plus the "texture-formats-tier1" set
+// and BGRA8 with "bgra8unorm-storage". Both texture creation paths (committed/placed resources and
+// address-only textures) gate STORAGE_BINDING through this one predicate.
 bool storage_capable(pso::WgpuTextureFormat f, uint32_t features) {
     using F = pso::WgpuTextureFormat;
     switch (f) {
@@ -88,6 +90,8 @@ bool storage_capable(pso::WgpuTextureFormat f, uint32_t features) {
         case F::Rgba16Unorm: case F::Rgba16Snorm:
         case F::Rgb10a2Uint: case F::Rgb10a2Unorm: case F::Rg11b10Ufloat:
             return (features & pso::WgpuFeature::TextureFormatsTier1) != 0;
+        case F::Bgra8Unorm:
+            return (features & pso::WgpuFeature::Bgra8UnormStorage) != 0;
         default:
             return false;
     }
