@@ -140,9 +140,479 @@ const INDEX_FORMAT_NAMES = Object.freeze(['uint16', 'uint32']);
 
 const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
 
+const DEFAULT_MAX_VALIDATION_ERROR_HISTORY = 32;
+const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+
+const FALLBACK_PROFILE = Object.freeze({
+  DEFAULT: 'default',
+  FULLSCREEN_TRIANGLE_CBV: 'fullscreen_triangle_cbv',
+  TEXTURED_QUAD_24B: 'textured_quad_24b',
+});
+
+const FALLBACK_PROFILE_ALIASES = Object.freeze({
+  default: FALLBACK_PROFILE.DEFAULT,
+  minimal: FALLBACK_PROFILE.DEFAULT,
+  fullscreen_triangle_cbv: FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV,
+  fullscreen_cbv: FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV,
+  'fullscreen-triangle-cbv': FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV,
+  'fullscreen-cbv': FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV,
+  textured_quad_24b: FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+  textured_24b: FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+  'textured-quad-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+  'textured-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+});
+
+const TEXTURED_QUAD_24B_STRIDE = 24;
+
+const FALLBACK_VERTEX_LAYOUT_24B = Object.freeze({
+  arrayStride: TEXTURED_QUAD_24B_STRIDE,
+  stepMode: 'vertex',
+  attributes: Object.freeze([
+    Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x4' }),
+    Object.freeze({ shaderLocation: 1, offset: 16, format: 'float32x2' }),
+  ]),
+});
+
 const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV1A_64_PRIME = 0x00000100000001b3n;
 const U64_MASK = 0xffffffffffffffffn;
+
+function defaultNowMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function classifyGpuErrorType(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    normalized === 'out-of-memory' ||
+    normalized === 'out_of_memory' ||
+    normalized === 'outofmemory' ||
+    normalized === 'oom' ||
+    normalized.includes('outofmemory') ||
+    normalized.includes('out-of-memory') ||
+    normalized.includes('out_of_memory')
+  ) {
+    return 'out-of-memory';
+  }
+  if (normalized === 'validation' || normalized.includes('validation')) {
+    return 'validation';
+  }
+  if (normalized === 'internal' || normalized.includes('internal')) {
+    return 'internal';
+  }
+  return null;
+}
+
+function normalizeValidationErrorType(error, event) {
+  if (error && typeof error === 'object') {
+    if (typeof GPUOutOfMemoryError === 'function' && error instanceof GPUOutOfMemoryError) {
+      return 'out-of-memory';
+    }
+    if (typeof GPUValidationError === 'function' && error instanceof GPUValidationError) {
+      return 'validation';
+    }
+    if (typeof GPUInternalError === 'function' && error instanceof GPUInternalError) {
+      return 'internal';
+    }
+    const fromType = classifyGpuErrorType(error.type);
+    if (fromType) {
+      return fromType;
+    }
+    const fromName = classifyGpuErrorType(error.name);
+    if (fromName) {
+      return fromName;
+    }
+    if (error.constructor && typeof error.constructor.name === 'string') {
+      const fromCtor = classifyGpuErrorType(error.constructor.name);
+      if (fromCtor) {
+        return fromCtor;
+      }
+    }
+  }
+  if (event && typeof event === 'object') {
+    const fromEventType = classifyGpuErrorType(event.errorType);
+    if (fromEventType) {
+      return fromEventType;
+    }
+  }
+  return 'unknown';
+}
+
+function sanitizeValidationErrorMessage(rawMessage) {
+  let msg;
+  if (typeof rawMessage === 'string') {
+    msg = rawMessage;
+  } else if (rawMessage === null || rawMessage === undefined) {
+    return '';
+  } else {
+    msg = String(rawMessage);
+  }
+
+  msg = msg.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
+
+  // Strip file:// URLs and host filesystem paths (Windows drive, UNC, and Unix paths).
+  msg = msg.replace(/\bfile:\/\/[^\s"'`<>)\]]+/gi, '<path>');
+  msg = msg.replace(/\\\\[^\s\\"'`<>)\]]+\\[^\s"'`<>)\]]+/g, '<path>');
+  msg = msg.replace(/(["'`])[A-Za-z]:[\\\/][^"'`\r\n]+\1/g, '$1<path>$1');
+  msg = msg.replace(/\b[A-Za-z]:[\\\/][^\s"'`<>)\],;]+/g, '<path>');
+  msg = msg.replace(
+    /(["'`])\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)\/[^"'`\r\n]+\1/gi,
+    '$1<path>$1'
+  );
+  msg = msg.replace(
+    /(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]+/g,
+    '$1<path>'
+  );
+
+  // Strip long embedded buffers (data URIs, byte arrays, hex dumps, base64 blobs).
+  msg = msg.replace(/\bdata:[^\s;,'"`<>]+;base64,[A-Za-z0-9+/=]{16,}/gi, '<buffer>');
+  msg = msg.replace(
+    /(?:\b(?:0x)?[0-9a-fA-F]{1,4}\s*,\s*){16,}(?:0x)?[0-9a-fA-F]{1,4}\b/g,
+    '<buffer>'
+  );
+  msg = msg.replace(/(?:\b[0-9a-fA-F]{2}\s+){16,}[0-9a-fA-F]{2}\b/g, '<buffer>');
+  msg = msg.replace(/\b(?:0x)?[0-9a-fA-F]{48,}\b/g, '<buffer>');
+  msg = msg.replace(
+    /(^|[\s"'`(\[=,:])[A-Za-z0-9+/]{64,}={0,2}(?=$|[\s"'`)\]=,.;:])/g,
+    '$1<buffer>'
+  );
+
+  msg = msg.replace(/\s{2,}/g, ' ').trim();
+
+  if (msg.length > MAX_VALIDATION_ERROR_MESSAGE_LENGTH) {
+    msg = `${msg.slice(0, MAX_VALIDATION_ERROR_MESSAGE_LENGTH - 3)}...`;
+  }
+  return msg;
+}
+
+function normalizeFallbackProfileName(profile) {
+  if (typeof profile !== 'string') {
+    return FALLBACK_PROFILE.DEFAULT;
+  }
+  const key = profile.trim().toLowerCase();
+  if (key.length === 0) {
+    return FALLBACK_PROFILE.DEFAULT;
+  }
+  if (Object.prototype.hasOwnProperty.call(FALLBACK_PROFILE_ALIASES, key)) {
+    return FALLBACK_PROFILE_ALIASES[key];
+  }
+  return FALLBACK_PROFILE.DEFAULT;
+}
+
+function iterateDrawCollectionValues(collection) {
+  if (!collection) {
+    return [];
+  }
+  if (collection instanceof Map) {
+    return Array.from(collection.values());
+  }
+  if (Array.isArray(collection)) {
+    return collection;
+  }
+  if (typeof collection === 'object') {
+    return Object.values(collection);
+  }
+  return [];
+}
+
+function hasAnyTruthyResource(collection) {
+  const values = iterateDrawCollectionValues(collection);
+  for (let i = 0; i < values.length; i += 1) {
+    const item = values[i];
+    if (item !== null && item !== undefined && item !== false) {
+      if (typeof item === 'object') {
+        if (item.destroyed === true) continue;
+        if ('buffer' in item && item.buffer === null && item.present !== true) continue;
+        if ('texture' in item && item.texture === null && !item.textureView && item.present !== true) continue;
+        if ('sampler' in item && item.sampler === null && item.present !== true) continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+function inspectBindGroupCollection(bindGroups) {
+  let hasCbv = false;
+  let hasTexture = false;
+  let hasSampler = false;
+
+  const groups = iterateDrawCollectionValues(bindGroups);
+  for (let i = 0; i < groups.length; i += 1) {
+    const group = groups[i];
+    if (!group || typeof group !== 'object') {
+      continue;
+    }
+    if (group.hasCbv === true || group.hasBoundCbv === true || group.cbv || group.cbvBuffer || group.uniformBuffer) {
+      hasCbv = true;
+    }
+    if (
+      group.hasTexture === true ||
+      group.hasBoundTexture === true ||
+      group.hasSampledTexture === true ||
+      group.hasSrv === true ||
+      group.texture ||
+      group.textureView ||
+      group.srv
+    ) {
+      hasTexture = true;
+    }
+    if (group.hasSampler === true || group.hasBoundSampler === true || group.sampler) {
+      hasSampler = true;
+    }
+    if (group.meta && typeof group.meta === 'object') {
+      if (group.meta.hasCbv === true) hasCbv = true;
+      if (group.meta.hasTexture === true) hasTexture = true;
+      if (group.meta.hasSampler === true) hasSampler = true;
+    }
+
+    const entries = Array.isArray(group.entries)
+      ? group.entries
+      : group.meta && Array.isArray(group.meta.entries)
+        ? group.meta.entries
+        : group.desc && Array.isArray(group.desc.entries)
+          ? group.desc.entries
+          : null;
+    if (!entries) {
+      continue;
+    }
+    for (let j = 0; j < entries.length; j += 1) {
+      const entry = entries[j];
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      const type = typeof entry.type === 'string' ? entry.type.toLowerCase() : '';
+      const kind = typeof entry.kind === 'string' ? entry.kind.toLowerCase() : '';
+      const resourceType = entry.resourceType;
+      const resource = entry.resource;
+      const resKind =
+        resource && typeof resource === 'object' && typeof resource.kind === 'string'
+          ? resource.kind.toLowerCase()
+          : '';
+
+      if (
+        type === 'uniform' ||
+        type === 'cbv' ||
+        kind === 'cbv' ||
+        kind === 'uniform' ||
+        entry.isCbv === true ||
+        resourceType === BIND_RESOURCE_TYPE.BUFFER ||
+        resourceType === 'buffer' ||
+        (resource && typeof resource === 'object' && resource.buffer)
+      ) {
+        hasCbv = true;
+      }
+      if (
+        type === 'texture' ||
+        type === 'srv' ||
+        type === 'sampled-texture' ||
+        kind === 'srv' ||
+        kind === 'texture' ||
+        kind === 'gputextureview' ||
+        resKind === 'gputextureview' ||
+        resKind === 'gputexture' ||
+        entry.isTexture === true ||
+        resourceType === BIND_RESOURCE_TYPE.TEXTURE_VIEW ||
+        resourceType === 'textureView' ||
+        resourceType === 'texture' ||
+        entry.textureView ||
+        entry.texture
+      ) {
+        hasTexture = true;
+      }
+      if (
+        type === 'sampler' ||
+        kind === 'sampler' ||
+        kind === 'gpusampler' ||
+        resKind === 'gpusampler' ||
+        entry.isSampler === true ||
+        resourceType === BIND_RESOURCE_TYPE.SAMPLER ||
+        resourceType === 'sampler' ||
+        entry.sampler
+      ) {
+        hasSampler = true;
+      }
+    }
+  }
+
+  return { hasCbv, hasTexture, hasSampler };
+}
+
+function hasVertexStrideInState(drawState, targetStride) {
+  if (
+    drawState.vertexStride === targetStride ||
+    drawState.arrayStride === targetStride ||
+    drawState.vertexBufferStride === targetStride
+  ) {
+    return true;
+  }
+
+  const vbValues = iterateDrawCollectionValues(drawState.vertexBuffers);
+  for (let i = 0; i < vbValues.length; i += 1) {
+    const vb = vbValues[i];
+    if (!vb || typeof vb !== 'object') {
+      continue;
+    }
+    if (vb.stride === targetStride || vb.arrayStride === targetStride) {
+      return true;
+    }
+    if (
+      vb.buffer &&
+      typeof vb.buffer === 'object' &&
+      (vb.buffer.stride === targetStride || vb.buffer.arrayStride === targetStride)
+    ) {
+      return true;
+    }
+  }
+
+  const layoutValues = iterateDrawCollectionValues(
+    drawState.vertexBufferLayouts || drawState.vertexLayouts
+  );
+  for (let i = 0; i < layoutValues.length; i += 1) {
+    const layout = layoutValues[i];
+    if (!layout || typeof layout !== 'object') {
+      continue;
+    }
+    if (layout.arrayStride === targetStride || layout.stride === targetStride) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Detect the real Frame-1 draw pattern and select the matching G34 fallback WGSL profile:
+ * - `vertexCount === 3` + bound CBV and no bound texture -> `'fullscreen_triangle_cbv'`
+ * - 24-byte-stride VB + bound texture -> `'textured_quad_24b'`
+ * - Otherwise -> `'default'`
+ *
+ * @param {object | null | undefined} drawState
+ * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b'}
+ */
+function selectFallbackShaderProfile(drawState) {
+  if (!drawState || typeof drawState !== 'object') {
+    return FALLBACK_PROFILE.DEFAULT;
+  }
+
+  const rawVertexCount = drawState.vertexCount;
+  const vertexCount =
+    typeof rawVertexCount === 'number' && Number.isFinite(rawVertexCount) && rawVertexCount >= 0
+      ? Math.trunc(rawVertexCount)
+      : 0;
+  const bgInfo = inspectBindGroupCollection(drawState.bindGroups);
+
+  const hasBoundCbv =
+    drawState.hasBoundCbv === true ||
+    drawState.hasCbv === true ||
+    (typeof drawState.cbvCount === 'number' && drawState.cbvCount > 0) ||
+    Boolean(drawState.cbv || drawState.cbvBuffer || drawState.uniformBuffer) ||
+    hasAnyTruthyResource(drawState.cbvs) ||
+    hasAnyTruthyResource(drawState.uniformBuffers) ||
+    bgInfo.hasCbv;
+
+  const hasBoundTexture =
+    drawState.hasBoundTexture === true ||
+    drawState.hasTexture === true ||
+    drawState.hasSampledTexture === true ||
+    drawState.hasBoundSampledTexture === true ||
+    drawState.hasBoundSrv === true ||
+    (typeof drawState.textureCount === 'number' && drawState.textureCount > 0) ||
+    (typeof drawState.srvCount === 'number' && drawState.srvCount > 0) ||
+    Boolean(drawState.texture || drawState.textureView || drawState.srv) ||
+    hasAnyTruthyResource(drawState.textures) ||
+    hasAnyTruthyResource(drawState.textureViews) ||
+    hasAnyTruthyResource(drawState.srvs) ||
+    bgInfo.hasTexture;
+
+  if (vertexCount === 3 && hasBoundCbv && !hasBoundTexture) {
+    return FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV;
+  }
+
+  if (hasVertexStrideInState(drawState, TEXTURED_QUAD_24B_STRIDE) && hasBoundTexture) {
+    return FALLBACK_PROFILE.TEXTURED_QUAD_24B;
+  }
+
+  return FALLBACK_PROFILE.DEFAULT;
+}
+
+function normalizeFallbackRouterResult(raw, lookupHashHex, stageName) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw === 'string' && raw.length > 0) {
+    return {
+      wgsl: raw,
+      source: 'builtin',
+      requestedHash: lookupHashHex,
+      resolvedHash: null,
+      stage: stageName,
+      entryPoint: null,
+      profile: null,
+    };
+  }
+  if (typeof raw === 'object') {
+    const wgsl =
+      typeof raw.wgsl === 'string'
+        ? raw.wgsl
+        : typeof raw.code === 'string'
+          ? raw.code
+          : typeof raw.source === 'string' && raw.source.includes('fn ')
+            ? raw.source
+            : null;
+    if (!wgsl || wgsl.length === 0) {
+      return null;
+    }
+    const source =
+      typeof raw.source === 'string' && !raw.source.includes('fn ') ? raw.source : 'fallback';
+    return {
+      wgsl,
+      source,
+      requestedHash: raw.requestedHash || lookupHashHex,
+      resolvedHash: raw.resolvedHash !== undefined ? raw.resolvedHash : null,
+      stage: raw.stage || stageName,
+      entryPoint: typeof raw.entryPoint === 'string' ? raw.entryPoint : null,
+      profile:
+        typeof raw.profile === 'string' && raw.profile.length > 0
+          ? normalizeFallbackProfileName(raw.profile)
+          : null,
+    };
+  }
+  return null;
+}
+
+/**
+ * Call `shaderFallbackRouter.resolve(hash, stage, { profile })` while staying 100%
+ * backwards-compatible with legacy 2-arg routers (including strict mocks that reject a 3rd arg).
+ */
+function callFallbackRouterResolve(router, lookupHashHex, stageName, profile) {
+  if (!router || typeof router.resolve !== 'function') {
+    return null;
+  }
+  const canonicalProfile = normalizeFallbackProfileName(profile);
+  if (canonicalProfile !== FALLBACK_PROFILE.DEFAULT) {
+    try {
+      const withProfile = router.resolve(lookupHashHex, stageName, { profile: canonicalProfile });
+      const normalized = normalizeFallbackRouterResult(withProfile, lookupHashHex, stageName);
+      if (normalized) {
+        return normalized;
+      }
+    } catch (_) {
+      // Legacy 2-arg router threw on the 3rd options argument — retry with 2 args.
+    }
+  }
+  const legacy = router.resolve(lookupHashHex, stageName);
+  return normalizeFallbackRouterResult(legacy, lookupHashHex, stageName);
+}
 
 const TEXTURE_FORMAT_BPP = Object.freeze({
   rgba8unorm: 4,
@@ -947,6 +1417,62 @@ class WgpuCommandProcessor {
 
     // Packet ABI v2 handler ({ handlePacket, destroyResource }), see render_state_packets.js.
     this.extension = null;
+
+    // 9. Frame-1 fallback shader profile tracking & cross-buffer specialization (G34 / G38 / G44)
+    this._defaultFallbackProfile = normalizeFallbackProfileName(options.defaultFallbackProfile);
+    this._explicitFallbackDrawContext = null;
+    this._bufferMeta = new Map();
+    this._pipelineMeta = new Map();
+    this._bindGroupMeta = new Map();
+    this._specializedFallbackPipelines = new Map();
+    this._specializedFallbackBindGroups = new Map();
+    this._pendingCommandStreamShaderProfiles = null;
+    this._fallbackProfileCounts = {
+      [FALLBACK_PROFILE.DEFAULT]: 0,
+      [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: 0,
+      [FALLBACK_PROFILE.TEXTURED_QUAD_24B]: 0,
+    };
+    this._lastFallbackProfile = null;
+
+    // 10. Live WebGPU validation error capture (G35 / G44)
+    this._validationNow = typeof options.now === 'function' ? options.now : defaultNowMs;
+    const rawMaxErrHistory =
+      options.maxValidationErrorHistory !== undefined
+        ? options.maxValidationErrorHistory
+        : options.maxErrorHistory !== undefined
+          ? options.maxErrorHistory
+          : DEFAULT_MAX_VALIDATION_ERROR_HISTORY;
+    this._maxValidationErrorHistory =
+      Number.isInteger(rawMaxErrHistory) && rawMaxErrHistory >= 1
+        ? rawMaxErrHistory
+        : DEFAULT_MAX_VALIDATION_ERROR_HISTORY;
+    this._validationErrors = [];
+    this._validationErrorCount = 0;
+    this._validationErrorSeq = 0;
+    this._validationErrorCallbacks = new Set();
+    if (typeof options.onValidationError === 'function') {
+      this._validationErrorCallbacks.add(options.onValidationError);
+    }
+    this._captureValidationErrors = Boolean(
+      options.captureValidationErrors === true ||
+      options.enableValidationErrors === true ||
+      typeof options.onValidationError === 'function' ||
+      (options.swapchain && typeof options.swapchain === 'object')
+    );
+    this._validationErrorHookedDevice = null;
+    this._boundDeviceUncapturedErrorHandler = null;
+    this._swapchain = null;
+    this._ownsSwapchain = false;
+    this._swapchainValidationAttached = false;
+    this._swapchainOriginalOnValidationError = null;
+    this._swapchainWrappedOnValidationError = null;
+
+    if (options.swapchain && typeof options.swapchain === 'object') {
+      this.attachSwapchain(options.swapchain, { owned: options.ownsSwapchain === true });
+    } else if (this._captureValidationErrors) {
+      this._hookDeviceUncapturedError(this.device);
+    }
+
     this._resetFrameState();
   }
 
@@ -956,6 +1482,679 @@ class WgpuCommandProcessor {
 
   get framesPresented() {
     return this.frameCount;
+  }
+
+  get swapchain() {
+    return this._swapchain;
+  }
+
+  get validationErrorCount() {
+    return this._validationErrorCount;
+  }
+
+  _ensureValidationErrorHooked() {
+    if (this._destroyed) {
+      return false;
+    }
+    if (this._swapchainValidationAttached) {
+      return true;
+    }
+    return this._hookDeviceUncapturedError(this.device);
+  }
+
+  /**
+   * Register a callback notified on every captured WebGPU validation/OOM/internal error.
+   * Returns an unsubscribe function.
+   *
+   * @param {(error: { seq: number, type: string, message: string, timestampMs: number }, totalCount: number) => void} callback
+   * @returns {() => void}
+   */
+  addValidationErrorListener(callback) {
+    if (typeof callback !== 'function') {
+      throw new TypeError('addValidationErrorListener requires a callback function');
+    }
+    this._validationErrorCallbacks.add(callback);
+    this._ensureValidationErrorHooked();
+    return () => {
+      this._validationErrorCallbacks.delete(callback);
+      if (
+        this._validationErrorCallbacks.size === 0 &&
+        !this._captureValidationErrors &&
+        !this._swapchain
+      ) {
+        this._unhookDeviceUncapturedError();
+      }
+    };
+  }
+
+  /**
+   * Return shallow copies of captured sanitized WebGPU validation errors in the bounded history ring.
+   *
+   * @returns {Array<{ seq: number, type: string, message: string, timestampMs: number }>}
+   */
+  getValidationErrors() {
+    return this._validationErrors.map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * Clear the bounded validation error history ring (monotonic counter stays intact).
+   */
+  clearValidationErrors() {
+    this._validationErrors.length = 0;
+  }
+
+  _unhookDeviceUncapturedError() {
+    const prevDevice = this._validationErrorHookedDevice;
+    const prevHandler = this._boundDeviceUncapturedErrorHandler;
+    this._validationErrorHookedDevice = null;
+    this._boundDeviceUncapturedErrorHandler = null;
+
+    if (
+      prevDevice &&
+      prevHandler &&
+      typeof prevDevice.removeEventListener === 'function'
+    ) {
+      try {
+        prevDevice.removeEventListener('uncapturederror', prevHandler);
+      } catch (_) {
+        // Ignore removal failures on torn-down or mock devices.
+      }
+    }
+  }
+
+  _hookDeviceUncapturedError(device) {
+    if (!device || typeof device !== 'object') {
+      this._unhookDeviceUncapturedError();
+      return false;
+    }
+    if (device === this._validationErrorHookedDevice && this._boundDeviceUncapturedErrorHandler) {
+      return true;
+    }
+    this._unhookDeviceUncapturedError();
+    if (typeof device.addEventListener !== 'function') {
+      return false;
+    }
+    const handler = (event) => {
+      if (this._destroyed || this.device !== device) {
+        return;
+      }
+      this._recordValidationError(event);
+    };
+    this._validationErrorHookedDevice = device;
+    this._boundDeviceUncapturedErrorHandler = handler;
+    device.addEventListener('uncapturederror', handler);
+    return true;
+  }
+
+  _unhookSwapchainValidation() {
+    const prevSwapchain = this._swapchain;
+    if (prevSwapchain && this._swapchainValidationAttached) {
+      if (
+        '_onValidationError' in prevSwapchain &&
+        prevSwapchain._onValidationError === this._swapchainWrappedOnValidationError
+      ) {
+        prevSwapchain._onValidationError = this._swapchainOriginalOnValidationError;
+      }
+    }
+    this._swapchainValidationAttached = false;
+    this._swapchainOriginalOnValidationError = null;
+    this._swapchainWrappedOnValidationError = null;
+  }
+
+  /**
+   * Bind a WgpuSwapchain to this processor and wire its `onValidationError` hook without
+   * double-hooking `device.addEventListener('uncapturederror', ...)`.
+   *
+   * @param {object | null | undefined} swapchain
+   * @param {{ owned?: boolean }} [opts]
+   */
+  attachSwapchain(swapchain, opts = {}) {
+    this._unhookSwapchainValidation();
+    this._unhookDeviceUncapturedError();
+
+    if (!swapchain || typeof swapchain !== 'object') {
+      this._swapchain = null;
+      this._ownsSwapchain = false;
+      if (this._captureValidationErrors || this._validationErrorCallbacks.size > 0) {
+        this._hookDeviceUncapturedError(this.device);
+      }
+      return null;
+    }
+
+    this._swapchain = swapchain;
+    this._ownsSwapchain = Boolean(opts && opts.owned);
+
+    if (!this.device && swapchain.device) {
+      this.device = swapchain.device;
+    }
+    if (!this.ctx && swapchain.context) {
+      this.ctx = swapchain.context;
+    }
+
+    if ('_onValidationError' in swapchain) {
+      const prevCb =
+        typeof swapchain._onValidationError === 'function' ? swapchain._onValidationError : null;
+      const wrappedCb = (record) => {
+        if (prevCb) {
+          try {
+            prevCb(record);
+          } catch (_) {
+            // Isolate prior callback failures.
+          }
+        }
+        this._recordValidationError(record);
+      };
+      swapchain._onValidationError = wrappedCb;
+      this._swapchainOriginalOnValidationError = prevCb;
+      this._swapchainWrappedOnValidationError = wrappedCb;
+      this._swapchainValidationAttached = true;
+
+      // If a custom mock swapchain exposes `_onValidationError` without hooking the device itself,
+      // fall back to attaching directly on `device`.
+      const swapchainHookedDevice =
+        swapchain._errorHookedDevice === this.device ||
+        typeof swapchain._hookUncapturedError === 'function';
+      if (!swapchainHookedDevice) {
+        this._hookDeviceUncapturedError(this.device);
+      }
+    } else if (typeof swapchain.setOnValidationError === 'function') {
+      swapchain.setOnValidationError((record) => {
+        this._recordValidationError(record);
+      });
+      this._swapchainValidationAttached = true;
+    } else {
+      this._hookDeviceUncapturedError(this.device);
+    }
+
+    return this._swapchain;
+  }
+
+  /**
+   * Bind a newly acquired or recovered GPUDevice and re-attach live validation error capture.
+   *
+   * @param {GPUDevice} newDevice
+   * @param {{ format?: string, recoverSwapchain?: boolean }} [opts]
+   */
+  bindDevice(newDevice, opts = {}) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    this.device = newDevice;
+    if (opts && typeof opts.format === 'string' && opts.format.length > 0) {
+      this.format = opts.format;
+    }
+    this._specializedFallbackPipelines.clear();
+    this._specializedFallbackBindGroups.clear();
+
+    if (
+      this._swapchain &&
+      !this._swapchain.isDestroyed &&
+      typeof this._swapchain.recover === 'function' &&
+      opts.recoverSwapchain !== false
+    ) {
+      this._swapchain.recover(newDevice, opts.format);
+      if (!this._swapchainValidationAttached && (this._captureValidationErrors || this._validationErrorCallbacks.size > 0)) {
+        this._hookDeviceUncapturedError(newDevice);
+      }
+    } else if (this._captureValidationErrors || this._validationErrorCallbacks.size > 0) {
+      this._hookDeviceUncapturedError(newDevice);
+    } else {
+      this._unhookDeviceUncapturedError();
+    }
+  }
+
+  _recordValidationError(eventOrRecord) {
+    if (this._destroyed) {
+      return null;
+    }
+    const rawError =
+      eventOrRecord && typeof eventOrRecord === 'object' && 'error' in eventOrRecord
+        ? eventOrRecord.error
+        : eventOrRecord;
+    const type = normalizeValidationErrorType(rawError, eventOrRecord);
+
+    let rawMessage = '';
+    if (rawError && typeof rawError === 'object' && typeof rawError.message === 'string') {
+      rawMessage = rawError.message;
+    } else if (
+      eventOrRecord &&
+      typeof eventOrRecord === 'object' &&
+      typeof eventOrRecord.message === 'string'
+    ) {
+      rawMessage = eventOrRecord.message;
+    } else if (typeof rawError === 'string') {
+      rawMessage = rawError;
+    } else if (rawError !== null && rawError !== undefined) {
+      rawMessage = String(rawError);
+    }
+
+    const message = sanitizeValidationErrorMessage(rawMessage);
+    let timestampMs;
+    if (
+      rawError &&
+      typeof rawError === 'object' &&
+      typeof rawError.timestampMs === 'number' &&
+      Number.isFinite(rawError.timestampMs)
+    ) {
+      timestampMs = rawError.timestampMs;
+    } else if (
+      eventOrRecord &&
+      typeof eventOrRecord === 'object' &&
+      typeof eventOrRecord.timestampMs === 'number' &&
+      Number.isFinite(eventOrRecord.timestampMs)
+    ) {
+      timestampMs = eventOrRecord.timestampMs;
+    } else {
+      const nowVal = this._validationNow();
+      timestampMs = typeof nowVal === 'number' && Number.isFinite(nowVal) ? nowVal : Date.now();
+    }
+
+    this._validationErrorSeq += 1;
+    this._validationErrorCount += 1;
+
+    const record = {
+      seq: this._validationErrorSeq,
+      type,
+      message,
+      timestampMs,
+    };
+
+    this._validationErrors.push(record);
+    if (this._validationErrors.length > this._maxValidationErrorHistory) {
+      this._validationErrors.shift();
+    }
+
+    const totalCount = this._validationErrorCount;
+    for (const cb of Array.from(this._validationErrorCallbacks)) {
+      try {
+        cb({ ...record }, totalCount);
+      } catch (_) {
+        // Isolate callback failures so validation error reporting never crashes the worker.
+      }
+    }
+
+    return { ...record };
+  }
+
+  /**
+   * Select a G34 fallback shader profile for a draw state (`fullscreen_triangle_cbv`,
+   * `textured_quad_24b`, or `default`).
+   */
+  selectFallbackShaderProfile(drawState) {
+    return selectFallbackShaderProfile(drawState);
+  }
+
+  /**
+   * Set or clear an explicit draw-state hint used for subsequent missing-shader resolutions.
+   *
+   * @param {object | null | undefined} drawState
+   */
+  setFallbackDrawContext(drawState) {
+    this._explicitFallbackDrawContext =
+      drawState && typeof drawState === 'object' ? { ...drawState } : null;
+  }
+
+  /**
+   * Resolve a missing/untranslatable shader hash via `shaderFallbackRouter` using the detected
+   * Frame-1 fallback profile, remaining 100% compatible with legacy 2-arg routers.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} stage
+   * @param {object | string | null | undefined} [drawStateOrOptions]
+   */
+  resolveFallbackShader(hash, stage, drawStateOrOptions) {
+    if (!this.shaderFallbackRouter || typeof this.shaderFallbackRouter.resolve !== 'function') {
+      return null;
+    }
+    const stageName =
+      typeof stage === 'number' ? stageCodeToName(stage) || 'vertex' : String(stage || 'vertex');
+    let profile = this._defaultFallbackProfile;
+    if (typeof drawStateOrOptions === 'string') {
+      profile = normalizeFallbackProfileName(drawStateOrOptions);
+    } else if (drawStateOrOptions && typeof drawStateOrOptions === 'object') {
+      if (typeof drawStateOrOptions.profile === 'string') {
+        profile = normalizeFallbackProfileName(drawStateOrOptions.profile);
+      } else {
+        profile = selectFallbackShaderProfile(drawStateOrOptions);
+      }
+    } else if (this._explicitFallbackDrawContext) {
+      profile = selectFallbackShaderProfile(this._explicitFallbackDrawContext);
+    }
+
+    const big = normalizeShaderHashBigInt(hash);
+    const lookupHashHex = big !== null ? formatShaderHashHex(big) : String(hash);
+    const resolved = callFallbackRouterResolve(
+      this.shaderFallbackRouter,
+      lookupHashHex,
+      stageName,
+      profile
+    );
+    if (resolved && resolved.source === 'builtin') {
+      const effectiveProfile = normalizeFallbackProfileName(resolved.profile || profile);
+      this._recordFallbackProfileUsage(effectiveProfile);
+      resolved.profile = effectiveProfile;
+    }
+    return resolved;
+  }
+
+  _recordFallbackProfileUsage(profile) {
+    const canonical = normalizeFallbackProfileName(profile);
+    this._fallbackProfileCounts[canonical] = (this._fallbackProfileCounts[canonical] || 0) + 1;
+    this._lastFallbackProfile = canonical;
+  }
+
+  _invalidateSpecializedPipelinesFor(pipelineId) {
+    const prefix = `${pipelineId}|`;
+    for (const key of Array.from(this._specializedFallbackPipelines.keys())) {
+      if (key.startsWith(prefix)) {
+        this._specializedFallbackPipelines.delete(key);
+      }
+    }
+    for (const key of Array.from(this._specializedFallbackBindGroups.keys())) {
+      if (key.startsWith(prefix)) {
+        this._specializedFallbackBindGroups.delete(key);
+      }
+    }
+  }
+
+  _invalidateSpecializedBindGroupsFor(bindGroupId) {
+    const suffix = `|${bindGroupId}`;
+    for (const key of Array.from(this._specializedFallbackBindGroups.keys())) {
+      if (key.endsWith(suffix)) {
+        this._specializedFallbackBindGroups.delete(key);
+      }
+    }
+  }
+
+  _scanCommandBufferFallbackProfiles(view) {
+    if (!this.shaderFallbackRouter || typeof this.shaderFallbackRouter.resolve !== 'function') {
+      return null;
+    }
+
+    const localPipelines = new Map();
+    const localBindGroups = new Map();
+    const shaderProfileHints = new Map();
+
+    let activePipelineId = null;
+    const boundBindGroups = new Map();
+    const boundVertexBuffers = new Map();
+
+    const recordHint = (shaderId, profile) => {
+      if (!shaderId || profile === FALLBACK_PROFILE.DEFAULT) {
+        return;
+      }
+      const existing = shaderProfileHints.get(shaderId);
+      if (!existing || existing === FALLBACK_PROFILE.DEFAULT) {
+        shaderProfileHints.set(shaderId, profile);
+      }
+    };
+
+    let offset = 0;
+    while (offset + 8 <= view.byteLength) {
+      const opcode = view.getUint16(offset, true);
+      const payloadBytes = view.getUint32(offset + 4, true);
+      const payloadOffset = offset + 8;
+      if (payloadOffset + payloadBytes > view.byteLength) break;
+
+      switch (opcode) {
+        case OPCODES.BEGIN_FRAME:
+        case OPCODES.PRESENT:
+          activePipelineId = null;
+          boundBindGroups.clear();
+          boundVertexBuffers.clear();
+          break;
+        case OPCODES.CREATE_RENDER_PIPELINE:
+          if (payloadBytes >= 24) {
+            const pipeId = view.getUint32(payloadOffset, true);
+            const vsShaderId = view.getUint32(payloadOffset + 4, true);
+            const fsShaderId = view.getUint32(payloadOffset + 8, true);
+            const vertexStride = view.getUint32(payloadOffset + 12, true);
+            localPipelines.set(pipeId, { vsShaderId, fsShaderId, vertexStride });
+          }
+          break;
+        case OPCODES.CREATE_BIND_GROUP:
+          if (payloadBytes >= 16) {
+            const bgId = view.getUint32(payloadOffset, true);
+            const entryCount = view.getUint32(payloadOffset + 12, true);
+            if (16 + entryCount * 32 <= payloadBytes) {
+              let hasCbv = false;
+              let hasTexture = false;
+              let hasSampler = false;
+              for (let i = 0; i < entryCount; i += 1) {
+                const entryOffset = payloadOffset + 16 + i * 32;
+                const resourceType = view.getUint32(entryOffset + 4, true);
+                if (resourceType === BIND_RESOURCE_TYPE.BUFFER) {
+                  hasCbv = true;
+                } else if (resourceType === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
+                  hasTexture = true;
+                } else if (resourceType === BIND_RESOURCE_TYPE.SAMPLER) {
+                  hasSampler = true;
+                }
+              }
+              localBindGroups.set(bgId, { hasCbv, hasTexture, hasSampler });
+            }
+          }
+          break;
+        case OPCODES.SET_PIPELINE:
+          if (payloadBytes >= 4) {
+            activePipelineId = view.getUint32(payloadOffset, true);
+          }
+          break;
+        case OPCODES.SET_BIND_GROUP:
+          if (payloadBytes >= 8) {
+            const groupIndex = view.getUint32(payloadOffset, true);
+            const bgId = view.getUint32(payloadOffset + 4, true);
+            const bgMeta =
+              localBindGroups.get(bgId) ||
+              this._bindGroupMeta.get(bgId) ||
+              this.bindGroups.get(bgId) ||
+              null;
+            if (bgMeta) {
+              boundBindGroups.set(groupIndex, bgMeta);
+            }
+          }
+          break;
+        case OPCODES.SET_VERTEX_BUFFER:
+          if (payloadBytes >= 16) {
+            const slot = view.getUint32(payloadOffset, true);
+            const bufferId = view.getUint32(payloadOffset + 4, true);
+            const existingBuf = this.buffers.get(bufferId);
+            boundVertexBuffers.set(slot, {
+              bufferId,
+              stride:
+                existingBuf && typeof existingBuf.stride === 'number'
+                  ? existingBuf.stride
+                  : existingBuf && typeof existingBuf.arrayStride === 'number'
+                    ? existingBuf.arrayStride
+                    : undefined,
+            });
+          }
+          break;
+        case OPCODES.DRAW:
+        case OPCODES.DRAW_INDEXED: {
+          const minBytes = opcode === OPCODES.DRAW ? 16 : 20;
+          if (payloadBytes >= minBytes && activePipelineId !== null) {
+            const vertexCount = view.getUint32(payloadOffset, true);
+            const instanceCount = view.getUint32(payloadOffset + 4, true);
+            const pipeMeta =
+              localPipelines.get(activePipelineId) || this._pipelineMeta.get(activePipelineId);
+            if (pipeMeta) {
+              const profile = selectFallbackShaderProfile({
+                vertexCount,
+                instanceCount,
+                vertexStride: pipeMeta.vertexStride || 0,
+                bindGroups: boundBindGroups,
+                vertexBuffers: boundVertexBuffers,
+              });
+              if (profile !== FALLBACK_PROFILE.DEFAULT) {
+                recordHint(pipeMeta.vsShaderId, profile);
+                if (pipeMeta.fsShaderId) {
+                  recordHint(pipeMeta.fsShaderId, profile);
+                }
+              }
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+
+      offset = payloadOffset + payloadBytes;
+    }
+
+    return shaderProfileHints.size > 0 ? shaderProfileHints : null;
+  }
+
+  _getOrCreateSpecializedFallbackPipeline(pipeMeta, profile) {
+    if (
+      !pipeMeta ||
+      !this.device ||
+      !this.shaderFallbackRouter ||
+      typeof this.shaderFallbackRouter.resolve !== 'function'
+    ) {
+      return null;
+    }
+    const canonicalProfile = normalizeFallbackProfileName(profile);
+    if (
+      canonicalProfile === FALLBACK_PROFILE.DEFAULT ||
+      canonicalProfile === pipeMeta.fallbackProfile
+    ) {
+      return null;
+    }
+
+    const cacheKey = `${pipeMeta.id}|${canonicalProfile}`;
+    if (this._specializedFallbackPipelines.has(cacheKey)) {
+      return this._specializedFallbackPipelines.get(cacheKey);
+    }
+
+    const vsOrig = this.shaderModules.get(pipeMeta.vsShaderId);
+    const fsOrig = pipeMeta.fsShaderId ? this.shaderModules.get(pipeMeta.fsShaderId) : null;
+    if (!vsOrig) {
+      return null;
+    }
+
+    let vsModule = vsOrig.module;
+    let vsEntryPoint = vsOrig.entryPoint || 'vs_main';
+    let vsCode = vsOrig.code;
+    let changed = false;
+
+    if (vsOrig.source === 'builtin') {
+      const vsHash = vsOrig.requestedHash || vsOrig.hashHex || fnv1a64Hex(`empty:vertex:${pipeMeta.vsShaderId}`);
+      const resolvedVs = callFallbackRouterResolve(
+        this.shaderFallbackRouter,
+        vsHash,
+        'vertex',
+        canonicalProfile
+      );
+      if (resolvedVs && typeof resolvedVs.wgsl === 'string' && resolvedVs.wgsl.length > 0) {
+        if (resolvedVs.wgsl !== vsOrig.code) {
+          vsModule = this.device.createShaderModule({ code: resolvedVs.wgsl });
+          vsCode = resolvedVs.wgsl;
+          vsEntryPoint = resolvedVs.entryPoint || extractWgslEntryPoint(vsCode, SHADER_STAGE.VERTEX) || 'vs_main';
+          changed = true;
+        }
+        this._recordFallbackProfileUsage(resolvedVs.profile || canonicalProfile);
+      }
+    }
+
+    let fsModule = fsOrig ? fsOrig.module : null;
+    let fsEntryPoint = fsOrig ? fsOrig.entryPoint || 'fs_main' : 'fs_main';
+    let fsCode = fsOrig ? fsOrig.code : null;
+
+    if (fsOrig && fsOrig.source === 'builtin') {
+      const fsHash = fsOrig.requestedHash || fsOrig.hashHex || fnv1a64Hex(`empty:fragment:${pipeMeta.fsShaderId}`);
+      const resolvedFs = callFallbackRouterResolve(
+        this.shaderFallbackRouter,
+        fsHash,
+        'fragment',
+        canonicalProfile
+      );
+      if (resolvedFs && typeof resolvedFs.wgsl === 'string' && resolvedFs.wgsl.length > 0) {
+        if (resolvedFs.wgsl !== fsOrig.code) {
+          fsModule = this.device.createShaderModule({ code: resolvedFs.wgsl });
+          fsCode = resolvedFs.wgsl;
+          fsEntryPoint = resolvedFs.entryPoint || extractWgslEntryPoint(fsCode, SHADER_STAGE.FRAGMENT) || 'fs_main';
+          changed = true;
+        }
+        this._recordFallbackProfileUsage(resolvedFs.profile || canonicalProfile);
+      }
+    }
+
+    if (!changed) {
+      const existing = this.pipelines.get(pipeMeta.id) || null;
+      const entry = { pipeline: existing, profile: canonicalProfile, changed: false };
+      this._specializedFallbackPipelines.set(cacheKey, entry);
+      return entry;
+    }
+
+    let vertexBuffers = [];
+    if (canonicalProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B) {
+      vertexBuffers = [
+        {
+          arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
+          stepMode: FALLBACK_VERTEX_LAYOUT_24B.stepMode,
+          attributes: FALLBACK_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+        },
+      ];
+    } else if (canonicalProfile === FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV) {
+      vertexBuffers = [];
+    }
+
+    const descriptor = {
+      layout: 'auto',
+      vertex: {
+        module: vsModule,
+        entryPoint: vsEntryPoint,
+        buffers: vertexBuffers,
+      },
+      primitive: {
+        topology: pipeMeta.topology || 'triangle-list',
+      },
+    };
+    if (fsOrig && fsModule) {
+      descriptor.fragment = {
+        module: fsModule,
+        entryPoint: fsEntryPoint,
+        targets: [{ format: this.format }],
+      };
+    }
+
+    const pipeline = this.device.createRenderPipeline(descriptor);
+    const entry = { pipeline, profile: canonicalProfile, changed: true, vsCode, fsCode };
+    this._specializedFallbackPipelines.set(cacheKey, entry);
+    return entry;
+  }
+
+  _getOrCreateSpecializedBindGroup(pipeId, profile, specPipeline, groupIndex, bgMeta) {
+    if (
+      !specPipeline ||
+      !bgMeta ||
+      !Array.isArray(bgMeta.entries) ||
+      typeof specPipeline.getBindGroupLayout !== 'function' ||
+      !this.device ||
+      typeof this.device.createBindGroup !== 'function'
+    ) {
+      return null;
+    }
+    const key = `${pipeId}|${profile}|${bgMeta.id}`;
+    if (this._specializedFallbackBindGroups.has(key)) {
+      return this._specializedFallbackBindGroups.get(key);
+    }
+    try {
+      const layout = specPipeline.getBindGroupLayout(groupIndex);
+      if (!layout) {
+        return null;
+      }
+      const bg = this.device.createBindGroup({
+        layout,
+        entries: bgMeta.entries,
+      });
+      this._specializedFallbackBindGroups.set(key, bg);
+      return bg;
+    } catch (_) {
+      return null;
+    }
   }
 
   _notifyFirstPresent(info = {}) {
@@ -2041,6 +3240,7 @@ class WgpuCommandProcessor {
       usage,
     });
     this.buffers.set(id, buffer);
+    this._bufferMeta.set(id, { usage, byteSize });
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('buffer', id, buffer, {
         byteSize: Math.max(0, Math.trunc(byteSize)),
@@ -2105,6 +3305,7 @@ class WgpuCommandProcessor {
     let source = 'inline';
     let requestedHash = null;
     let resolvedHash = null;
+    let fallbackProfile = null;
 
     if (trimmed.length === 0 || hashOnlyHex !== null) {
       let lookupHashHex = hashOnlyHex;
@@ -2123,7 +3324,21 @@ class WgpuCommandProcessor {
         this.shaderFallbackRouter &&
         typeof this.shaderFallbackRouter.resolve === 'function'
       ) {
-        const resolved = this.shaderFallbackRouter.resolve(lookupHashHex, stageName);
+        let hintProfile = this._defaultFallbackProfile;
+        if (
+          this._pendingCommandStreamShaderProfiles &&
+          this._pendingCommandStreamShaderProfiles.has(id)
+        ) {
+          hintProfile = this._pendingCommandStreamShaderProfiles.get(id);
+        } else if (this._explicitFallbackDrawContext) {
+          hintProfile = selectFallbackShaderProfile(this._explicitFallbackDrawContext);
+        }
+        const resolved = callFallbackRouterResolve(
+          this.shaderFallbackRouter,
+          lookupHashHex,
+          stageName,
+          hintProfile
+        );
         if (resolved && typeof resolved.wgsl === 'string' && resolved.wgsl.length > 0) {
           code = resolved.wgsl;
           source = resolved.source || 'fallback';
@@ -2131,6 +3346,10 @@ class WgpuCommandProcessor {
           resolvedHash = resolved.resolvedHash !== undefined ? resolved.resolvedHash : null;
           hashHex = resolvedHash || fnv1a64Hex(code);
           entryPoint = resolved.entryPoint || extractWgslEntryPoint(code, stage);
+          if (source === 'builtin') {
+            fallbackProfile = normalizeFallbackProfileName(resolved.profile || hintProfile);
+            this._recordFallbackProfileUsage(fallbackProfile);
+          }
         }
       } else if (this.wgslPackCache) {
         const packHit = lookupFromPackCache(this.wgslPackCache, lookupHashHex);
@@ -2167,6 +3386,7 @@ class WgpuCommandProcessor {
       source,
       requestedHash,
       resolvedHash,
+      fallbackProfile,
     });
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       const byteSize =
@@ -2192,6 +3412,18 @@ class WgpuCommandProcessor {
     if (!vsEntry) return;
     const fsEntry = fsShaderId !== 0 ? this.shaderModules.get(fsShaderId) : null;
 
+    const isFallback = Boolean(
+      (vsEntry && vsEntry.source === 'builtin') || (fsEntry && fsEntry.source === 'builtin')
+    );
+    const effectiveFallbackProfile =
+      vsEntry && vsEntry.fallbackProfile && vsEntry.fallbackProfile !== FALLBACK_PROFILE.DEFAULT
+        ? vsEntry.fallbackProfile
+        : fsEntry && fsEntry.fallbackProfile && fsEntry.fallbackProfile !== FALLBACK_PROFILE.DEFAULT
+          ? fsEntry.fallbackProfile
+          : isFallback
+            ? FALLBACK_PROFILE.DEFAULT
+            : null;
+
     const vsRefl = this._resolveShaderReflection(vsShaderId, vsEntry, 'vertex');
     const fsRefl = fsEntry ? this._resolveShaderReflection(fsShaderId, fsEntry, 'fragment') : null;
     const matchedRefls = [];
@@ -2206,20 +3438,38 @@ class WgpuCommandProcessor {
     }
 
     const topology = TOPOLOGY_NAMES[topologyCode] || 'triangle-list';
-    let vertexBuffers = vertexStride > 0
-      ? [
-          {
-            arrayStride: vertexStride,
-            attributes: [
+    let vertexBuffers;
+    if (effectiveFallbackProfile === FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV && !vsRefl) {
+      vertexBuffers = [];
+    } else if (
+      effectiveFallbackProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B &&
+      vertexStride === TEXTURED_QUAD_24B_STRIDE &&
+      !vsRefl
+    ) {
+      vertexBuffers = [
+        {
+          arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
+          stepMode: FALLBACK_VERTEX_LAYOUT_24B.stepMode,
+          attributes: FALLBACK_VERTEX_LAYOUT_24B.attributes.map((a) => ({ ...a })),
+        },
+      ];
+    } else {
+      vertexBuffers =
+        vertexStride > 0
+          ? [
               {
-                shaderLocation: 0,
-                offset: 0,
-                format: vertexStride >= 12 ? 'float32x3' : vertexStride >= 8 ? 'float32x2' : 'float32',
+                arrayStride: vertexStride,
+                attributes: [
+                  {
+                    shaderLocation: 0,
+                    offset: 0,
+                    format: vertexStride >= 12 ? 'float32x3' : vertexStride >= 8 ? 'float32x2' : 'float32',
+                  },
+                ],
               },
-            ],
-          },
-        ]
-      : [];
+            ]
+          : [];
+    }
 
     if (
       vsRefl &&
@@ -2261,6 +3511,17 @@ class WgpuCommandProcessor {
 
     const pipeline = this.device.createRenderPipeline(descriptor);
     this.pipelines.set(id, pipeline);
+    this._pipelineMeta.set(id, {
+      id,
+      vsShaderId,
+      fsShaderId,
+      vertexStride,
+      topology,
+      hasReflectedLayout: Boolean(reflected),
+      isFallback,
+      fallbackProfile: effectiveFallbackProfile,
+    });
+    this._invalidateSpecializedPipelinesFor(id);
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('renderPipeline', id, pipeline, {
         byteSize: 0,
@@ -2476,10 +3737,25 @@ class WgpuCommandProcessor {
     const renderPipeline = this.pipelines.get(pipelineId);
     const computePipeline = this.computePipelines.get(pipelineId);
     const pipeline = renderPipeline || computePipeline;
-    const layout = this.getBindGroupLayout(pipelineId, groupIndex);
-    if (!pipeline || !layout) return;
+    const pipeMeta = this._pipelineMeta.get(pipelineId) || null;
+    if (!pipeline) return;
+
+    let layout = null;
+    if (pipeMeta && pipeMeta.isFallback) {
+      try {
+        layout = this.getBindGroupLayout(pipelineId, groupIndex);
+      } catch (_) {
+        layout = null;
+      }
+    } else {
+      layout = this.getBindGroupLayout(pipelineId, groupIndex);
+      if (!layout) return;
+    }
 
     const entries = [];
+    let hasCbv = false;
+    let hasTexture = false;
+    let hasSampler = false;
     for (let i = 0; i < entryCount; i++) {
       const entryOffset = payloadOffset + 16 + i * 32;
       const binding = view.getUint32(entryOffset, true);
@@ -2495,6 +3771,7 @@ class WgpuCommandProcessor {
         if (size > 0) {
           resource.size = size;
         }
+        hasCbv = true;
         entries.push({ binding, resource });
       } else if (resourceType === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
         let textureView = this.textureViews.get(resourceId);
@@ -2512,14 +3789,31 @@ class WgpuCommandProcessor {
           }
         }
         if (!textureView) return;
+        hasTexture = true;
         entries.push({ binding, resource: textureView });
       } else if (resourceType === BIND_RESOURCE_TYPE.SAMPLER) {
         const sampler = this.samplers.get(resourceId);
         if (!sampler) return;
+        hasSampler = true;
         entries.push({ binding, resource: sampler });
       } else {
         return;
       }
+    }
+
+    this._bindGroupMeta.set(id, {
+      id,
+      pipelineId,
+      groupIndex,
+      hasCbv,
+      hasTexture,
+      hasSampler,
+      entries,
+    });
+    this._invalidateSpecializedBindGroupsFor(id);
+
+    if (!layout) {
+      return;
     }
 
     const bindGroup = this.device.createBindGroup({
@@ -2542,11 +3836,16 @@ class WgpuCommandProcessor {
     if (this.resourceRegistry && typeof this.resourceRegistry.retireHandle === 'function') {
       this.resourceRegistry.retireHandle(id);
     }
+    this._bufferMeta.delete(id);
     this.samplers.delete(id);
     this.bindGroups.delete(id);
     this._bindGroupKinds.delete(id);
+    this._bindGroupMeta.delete(id);
+    this._invalidateSpecializedBindGroupsFor(id);
     this.shaderModules.delete(id);
     this.pipelines.delete(id);
+    this._pipelineMeta.delete(id);
+    this._invalidateSpecializedPipelinesFor(id);
     this.computePipelines.delete(id);
     this._pipelineBindGroupLayouts.delete(id);
     this._computePipelineBindGroupLayouts.delete(id);
@@ -2640,10 +3939,63 @@ class WgpuCommandProcessor {
       },
     };
 
+    let activePipelineId = null;
+    let specializedActiveKey = null;
+    const boundBindGroups = new Map();
+    const boundVertexBuffers = new Map();
+
+    const maybeSpecializeFallbackPipeline = (pass, vertexCount, instanceCount) => {
+      if (activePipelineId === null || !this.shaderFallbackRouter) {
+        return;
+      }
+      const pipeMeta = this._pipelineMeta.get(activePipelineId);
+      if (!pipeMeta || !pipeMeta.isFallback) {
+        return;
+      }
+      const desiredProfile = selectFallbackShaderProfile({
+        vertexCount,
+        instanceCount,
+        vertexStride: pipeMeta.vertexStride || 0,
+        bindGroups: boundBindGroups,
+        vertexBuffers: boundVertexBuffers,
+      });
+      if (
+        desiredProfile === FALLBACK_PROFILE.DEFAULT ||
+        desiredProfile === pipeMeta.fallbackProfile
+      ) {
+        return;
+      }
+      const spec = this._getOrCreateSpecializedFallbackPipeline(pipeMeta, desiredProfile);
+      if (!spec || !spec.changed || !spec.pipeline) {
+        return;
+      }
+      const key = `${pipeMeta.id}|${desiredProfile}`;
+      if (specializedActiveKey !== key) {
+        pass.setPipeline(spec.pipeline);
+        for (const [groupIndex, boundBg] of boundBindGroups.entries()) {
+          if (boundBg && boundBg.meta) {
+            const specBg = this._getOrCreateSpecializedBindGroup(
+              pipeMeta.id,
+              desiredProfile,
+              spec.pipeline,
+              groupIndex,
+              boundBg.meta
+            );
+            if (specBg) {
+              pass.setBindGroup(groupIndex, specBg);
+            }
+          }
+        }
+        specializedActiveKey = key;
+      }
+    };
+
     for (const cmd of this._passCommands) {
       switch (cmd.type) {
         case 'setPipeline': {
           const pass = ensureRenderPass();
+          activePipelineId = cmd.pipelineId;
+          specializedActiveKey = null;
           const pipeline = this.pipelines.get(cmd.pipelineId);
           if (pipeline) {
             pass.setPipeline(pipeline);
@@ -2654,6 +4006,17 @@ class WgpuCommandProcessor {
           const pass = ensureRenderPass();
           const buffer = this.buffers.get(cmd.bufferId);
           if (buffer) {
+            boundVertexBuffers.set(cmd.slot, {
+              bufferId: cmd.bufferId,
+              buffer,
+              offset: cmd.offset,
+              stride:
+                typeof buffer.stride === 'number'
+                  ? buffer.stride
+                  : typeof buffer.arrayStride === 'number'
+                    ? buffer.arrayStride
+                    : undefined,
+            });
             pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
           }
           break;
@@ -2668,6 +4031,19 @@ class WgpuCommandProcessor {
         }
         case 'setBindGroup': {
           const bindGroup = this.bindGroups.get(cmd.bindGroupId);
+          const bgMeta = this._bindGroupMeta.get(cmd.bindGroupId) || null;
+          if (bindGroup || bgMeta) {
+            boundBindGroups.set(cmd.groupIndex, {
+              bindGroupId: cmd.bindGroupId,
+              bindGroup: bindGroup || null,
+              meta: bgMeta,
+              hasCbv: Boolean(bgMeta && bgMeta.hasCbv),
+              hasTexture: Boolean(bgMeta && bgMeta.hasTexture),
+              hasSampler: Boolean(bgMeta && bgMeta.hasSampler),
+              entries: bgMeta ? bgMeta.entries : null,
+              desc: bindGroup && bindGroup.desc ? bindGroup.desc : null,
+            });
+          }
           if (bindGroup) {
             const pass =
               activePass ||
@@ -2680,12 +4056,14 @@ class WgpuCommandProcessor {
         }
         case 'draw': {
           const pass = ensureRenderPass();
+          maybeSpecializeFallbackPipeline(pass, cmd.vertexCount, cmd.instanceCount);
           pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
           this._drawCallCount += 1;
           break;
         }
         case 'drawIndexed': {
           const pass = ensureRenderPass();
+          maybeSpecializeFallbackPipeline(pass, cmd.indexCount, cmd.instanceCount);
           pass.drawIndexed(
             cmd.indexCount,
             cmd.instanceCount,
@@ -2836,6 +4214,9 @@ class WgpuCommandProcessor {
     let offset = 0;
     let presents = 0;
 
+    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(view);
+    try {
     while (offset + 8 <= view.byteLength) {
       const opcode = view.getUint16(offset, true);
       const payloadBytes = view.getUint32(offset + 4, true);
@@ -3005,6 +4386,9 @@ class WgpuCommandProcessor {
 
       offset = payloadOffset + payloadBytes;
     }
+    } finally {
+      this._pendingCommandStreamShaderProfiles = prevPendingHints;
+    }
 
     return { frameCount: this.frameCount, presents };
   }
@@ -3098,6 +4482,10 @@ class WgpuCommandProcessor {
       reflectionRegistry,
       reflectionShaderCount: reflectionRegistry ? reflectionRegistry.shaderCount : 0,
       shaderFallback,
+      fallbackProfileCounts: { ...this._fallbackProfileCounts },
+      lastFallbackProfile: this._lastFallbackProfile,
+      validationErrorCount: this._validationErrorCount,
+      validationErrorHistorySize: this._validationErrors.length,
       wgslPackCache,
       splashBridge,
       binkPresenter,
@@ -3112,6 +4500,18 @@ class WgpuCommandProcessor {
       return;
     }
     this._destroyed = true;
+    this._unhookDeviceUncapturedError();
+    this._unhookSwapchainValidation();
+    if (
+      this._swapchain &&
+      this._ownsSwapchain &&
+      typeof this._swapchain.destroy === 'function'
+    ) {
+      this._swapchain.destroy();
+    }
+    this._swapchain = null;
+    this._ownsSwapchain = false;
+    this._validationErrorCallbacks.clear();
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
@@ -3142,13 +4542,20 @@ class WgpuCommandProcessor {
     }
 
     this.buffers.clear();
+    this._bufferMeta.clear();
     this.textures.clear();
     this.textureViews.clear();
     this.samplers.clear();
     this.bindGroups.clear();
     this._bindGroupKinds.clear();
+    this._bindGroupMeta.clear();
     this.shaderModules.clear();
     this.pipelines.clear();
+    this._pipelineMeta.clear();
+    this._specializedFallbackPipelines.clear();
+    this._specializedFallbackBindGroups.clear();
+    this._pendingCommandStreamShaderProfiles = null;
+    this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
     this._pipelineBindGroupLayouts.clear();
     this._computePipelineBindGroupLayouts.clear();
@@ -3454,12 +4861,106 @@ function createWgpuWorkerHandler(options = {}) {
   const telemetryNow = typeof options.now === 'function' ? options.now : () => Date.now();
   const onFirstPresent =
     typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
+  const onValidationError =
+    typeof options.onValidationError === 'function' ? options.onValidationError : null;
   let canvas = options.canvas || null;
   let processor = options.processor || null;
+  let swapchain = options.swapchain || (processor && processor.swapchain) || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
   let preloadedInDefaultInit = false;
   let lastTelemetryEmitMs = -Infinity;
   let firstPresentNotified = false;
+  let unbindValidationListener = null;
+
+  function emitValidationError(record, totalCount) {
+    const cleanRecord = {
+      seq: record.seq,
+      type: record.type,
+      message: record.message,
+      timestampMs: record.timestampMs,
+    };
+    const count = toNonNegativeInt(totalCount, cleanRecord.seq);
+    postMessage({
+      type: 'gpu-validation-error',
+      error: cleanRecord,
+      totalCount: count,
+    });
+    if (onValidationError) {
+      try {
+        onValidationError({ ...cleanRecord }, count);
+      } catch (_) {
+        // Non-fatal validation error callback failure.
+      }
+    }
+  }
+
+  function bindProcessorValidationErrors(targetProcessor) {
+    if (unbindValidationListener) {
+      try {
+        unbindValidationListener();
+      } catch (_) {
+        // Ignore cleanup errors on prior processor/device.
+      }
+      unbindValidationListener = null;
+    }
+    if (!targetProcessor) {
+      return;
+    }
+    if (
+      swapchain &&
+      !targetProcessor.swapchain &&
+      typeof targetProcessor.attachSwapchain === 'function'
+    ) {
+      targetProcessor.attachSwapchain(swapchain);
+    }
+    if (typeof targetProcessor.addValidationErrorListener === 'function') {
+      unbindValidationListener = targetProcessor.addValidationErrorListener(
+        (record, totalCount) => {
+          emitValidationError(record, totalCount);
+        }
+      );
+      return;
+    }
+    const dev = targetProcessor.device;
+    if (dev && typeof dev.addEventListener === 'function') {
+      let localSeq = 0;
+      const fallbackHandler = (event) => {
+        const rawError =
+          event && typeof event === 'object' && 'error' in event ? event.error : event;
+        const type = normalizeValidationErrorType(rawError, event);
+        const rawMsg =
+          rawError && typeof rawError === 'object' && typeof rawError.message === 'string'
+            ? rawError.message
+            : event && typeof event === 'object' && typeof event.message === 'string'
+              ? event.message
+              : typeof rawError === 'string'
+                ? rawError
+                : rawError !== null && rawError !== undefined
+                  ? String(rawError)
+                  : '';
+        const message = sanitizeValidationErrorMessage(rawMsg);
+        const tsVal = telemetryNow();
+        const timestampMs =
+          typeof tsVal === 'number' && Number.isFinite(tsVal) ? tsVal : Date.now();
+        localSeq += 1;
+        emitValidationError({ seq: localSeq, type, message, timestampMs }, localSeq);
+      };
+      dev.addEventListener('uncapturederror', fallbackHandler);
+      unbindValidationListener = () => {
+        if (typeof dev.removeEventListener === 'function') {
+          try {
+            dev.removeEventListener('uncapturederror', fallbackHandler);
+          } catch (_) {
+            // Ignore removal failures.
+          }
+        }
+      };
+    }
+  }
+
+  if (processor) {
+    bindProcessorValidationErrors(processor);
+  }
 
   function notifyHandlerFirstPresent(info) {
     if (firstPresentNotified) {
@@ -3626,11 +5127,102 @@ function createWgpuWorkerHandler(options = {}) {
     const device = await adapter.requestDevice();
     const format = navigator.gpu.getPreferredCanvasFormat();
     const ctx = canvas.getContext('webgpu');
-    ctx.configure({ device, format, alphaMode: 'opaque' });
+
+    const enableSwapchain =
+      initPayload.enableSwapchain !== undefined
+        ? initPayload.enableSwapchain !== false
+        : options.enableSwapchain !== false;
+    const injectedSwapchain =
+      initPayload.swapchain && typeof initPayload.swapchain === 'object'
+        ? initPayload.swapchain
+        : options.swapchain && typeof options.swapchain === 'object'
+          ? options.swapchain
+          : null;
+
+    let activeSwapchain = null;
+    let ownsSwapchain = false;
+    if (injectedSwapchain) {
+      activeSwapchain = injectedSwapchain;
+      if (
+        !activeSwapchain.isConfigured &&
+        typeof activeSwapchain.configure === 'function'
+      ) {
+        activeSwapchain.configure({
+          width,
+          height,
+          devicePixelRatio: initPayload.devicePixelRatio || 1,
+          format,
+        });
+      }
+    } else if (enableSwapchain) {
+      const injectedSwapchainCtor =
+        initPayload.WgpuSwapchain !== undefined
+          ? initPayload.WgpuSwapchain
+          : options.WgpuSwapchain;
+      const SwapchainCtor =
+        injectedSwapchainCtor === null || injectedSwapchainCtor === false
+          ? null
+          : resolveSubsystemCtor(
+              injectedSwapchainCtor,
+              'PlayGta6WgpuSwapchain',
+              'WgpuSwapchain',
+              './wgpu_swapchain.js'
+            );
+      if (SwapchainCtor) {
+        try {
+          const swapOpts = {
+            ...(options.swapchainOptions || {}),
+            ...(initPayload.swapchainOptions || {}),
+            canvas,
+            device,
+            context: ctx,
+            format,
+            enableDepth:
+              initPayload.enableDepth !== undefined
+                ? Boolean(initPayload.enableDepth)
+                : options.enableDepth !== undefined
+                  ? Boolean(options.enableDepth)
+                  : false,
+            now: telemetryNow,
+          };
+          activeSwapchain = new SwapchainCtor(swapOpts);
+          activeSwapchain.configure({
+            width,
+            height,
+            devicePixelRatio: initPayload.devicePixelRatio || 1,
+          });
+          ownsSwapchain = true;
+        } catch (_) {
+          if (activeSwapchain && typeof activeSwapchain.destroy === 'function') {
+            try {
+              activeSwapchain.destroy();
+            } catch (_destroyErr) {
+              // Ignore teardown error on fallback.
+            }
+          }
+          activeSwapchain = null;
+          ownsSwapchain = false;
+        }
+      }
+    }
+
+    if (!activeSwapchain) {
+      ctx.configure({ device, format, alphaMode: 'opaque' });
+    }
+    swapchain = activeSwapchain;
+
     processor = new WgpuCommandProcessor(device, ctx, {
       format,
       width,
       height,
+      now: telemetryNow,
+      swapchain: activeSwapchain,
+      ownsSwapchain,
+      captureValidationErrors: true,
+      maxValidationErrorHistory:
+        initPayload.maxValidationErrorHistory ?? options.maxValidationErrorHistory,
+      defaultFallbackProfile:
+        initPayload.defaultFallbackProfile ?? options.defaultFallbackProfile,
       GpuRingBuffer: injectedRingCtor,
       stagingPool: options.stagingPool,
       uniformRing: options.uniformRing,
@@ -3676,6 +5268,7 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.fallbackShaderHashes ?? options.fallbackShaderHashes,
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
     });
+    bindProcessorValidationErrors(processor);
     try {
       if (!globalThis.PlayGta6RenderState && typeof importScripts === 'function') {
         importScripts('./render_state_packets.js');
@@ -3739,8 +5332,10 @@ function createWgpuWorkerHandler(options = {}) {
         );
         if (created && created !== processor) {
           processor = created;
+          swapchain = created.swapchain || swapchain;
           lastTelemetryEmitMs = -Infinity;
           firstPresentNotified = false;
+          bindProcessorValidationErrors(processor);
         }
         if (payload.ringSab || payload.ring) {
           attachRingFromMessage(payload);
@@ -3755,8 +5350,17 @@ function createWgpuWorkerHandler(options = {}) {
       } else if (payload.resize && canvas) {
         const nextW = Math.max(1, payload.width | 0);
         const nextH = Math.max(1, payload.height | 0);
-        canvas.width = nextW;
-        canvas.height = nextH;
+        const activeSwapchain = (processor && processor.swapchain) || swapchain;
+        if (
+          activeSwapchain &&
+          !activeSwapchain.isDestroyed &&
+          typeof activeSwapchain.resize === 'function'
+        ) {
+          activeSwapchain.resize(nextW, nextH, payload.devicePixelRatio || 1);
+        } else {
+          canvas.width = nextW;
+          canvas.height = nextH;
+        }
         if (processor && typeof processor.onResize === 'function') {
           processor.onResize(nextW, nextH);
         }
@@ -3899,9 +5503,18 @@ function createWgpuWorkerHandler(options = {}) {
           maybeEmitFrameTelemetry(prevFrames, framesPresented);
         }
       } else if (payload.destroy && processor) {
+        if (unbindValidationListener) {
+          try {
+            unbindValidationListener();
+          } catch (_) {
+            // Ignore cleanup errors.
+          }
+          unbindValidationListener = null;
+        }
         if (typeof processor.destroy === 'function') {
           processor.destroy();
         }
+        swapchain = null;
         postMessage({ id: payload.id, destroyed: true });
       } else if ((payload.drainRing || payload.type === 'drain-ring') && processor) {
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
@@ -3951,6 +5564,9 @@ function createWgpuWorkerHandler(options = {}) {
     get processor() {
       return processor;
     },
+    get swapchain() {
+      return (processor && processor.swapchain) || swapchain;
+    },
     get ring() {
       return attachedRing;
     },
@@ -3961,6 +5577,12 @@ const exportedApi = {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
   buildGpuTelemetrySnapshot,
+  selectFallbackShaderProfile,
+  sanitizeValidationErrorMessage,
+  normalizeValidationErrorType,
+  FALLBACK_PROFILE,
+  DEFAULT_MAX_VALIDATION_ERROR_HISTORY,
+  MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   DEFAULT_TELEMETRY_INTERVAL_MS,
   DEFAULT_TELEMETRY_MISSING_LIMIT,
   InlineWgslPackCache,
