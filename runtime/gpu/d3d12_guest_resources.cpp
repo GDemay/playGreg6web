@@ -639,6 +639,30 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             r.ever_uploaded = true;
         }
     }
+    // Relocated index / vertex buffers (G58): re-upload ring buffers the title wrote since.
+    {
+        std::lock_guard<std::mutex> lock(ia_relocation_mutex_);
+        std::vector<uint8_t> bytes;
+        for (auto& [key, r] : ia_relocations_) {
+            bytes.assign(static_cast<size_t>(key.second), 0);
+            if (!read_guest_best_effort(cpu_address_for_gpu(key.first), bytes.data(), bytes.size())) {
+                continue;
+            }
+            const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+            if (hash == r.last_hash) {
+                continue;
+            }
+            bytes.resize(static_cast<size_t>(r.buffer_bytes), 0);
+            for (uint64_t off = 0; off < r.buffer_bytes; off += kMaxWriteChunk) {
+                const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, r.buffer_bytes - off);
+                encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(off), bytes.data() + off,
+                                     static_cast<uint32_t>(n));
+            }
+            count_work(Work::BufferUploads);
+            note_upload(r.buffer_bytes);
+            r.last_hash = hash;
+        }
+    }
 }
 
 bool Device::relocate_uniform(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {
@@ -805,6 +829,91 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
 size_t Device::relocated_storage_count() const {
     std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
     return storage_relocations_.size();
+}
+
+bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {
+    constexpr uint64_t kMaxBytes = uint64_t{16u} << 20;
+    constexpr uint64_t kMaxTotalBytes = uint64_t{256u} << 20;
+    constexpr size_t kMaxEntries = 256;
+    // WebGPU wants vertex buffer offsets 4-byte aligned and index offsets aligned to the index
+    // size (2 or 4), so a sub-range is only served from a covering buffer at a 4-byte aligned offset.
+    constexpr uint64_t kOffsetAlignment = 4;
+
+    if (va == 0 || size == 0 || size > kMaxBytes || va + size < va || buffer_id == nullptr || offset == nullptr) {
+        return false;
+    }
+    const uint64_t cpu_va = cpu_address_for_gpu(va);
+    uint8_t probe = 0;
+    if (!com::read_guest(cpu_va, &probe, 1)) {
+        return false;  // unmapped / GPU-only memory: no bytes to copy
+    }
+
+    std::lock_guard<std::mutex> lock(ia_relocation_mutex_);
+    const uint64_t seq = ++ia_relocation_seq_;
+    // A relocation whose [base, base + size) covers the request: the title's ring buffer pointer
+    // advanced within a range already mirrored (keys sort by base VA, so scan those <= va).
+    for (auto it = ia_relocations_.upper_bound(std::make_pair(va, ~uint64_t{0})); it != ia_relocations_.begin();) {
+        --it;
+        const uint64_t base = it->first.first;
+        const uint64_t mirrored = it->first.second;
+        const uint64_t delta = va - base;
+        if (delta % kOffsetAlignment == 0 && delta <= mirrored && size <= mirrored - delta) {
+            it->second.last_used_seq = seq;
+            *buffer_id = it->second.buffer_id;
+            *offset = delta;
+            return true;
+        }
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(size), 0);
+    if (!read_guest_best_effort(cpu_va, bytes.data(), bytes.size())) {
+        return false;
+    }
+    const uint64_t hash = shader_identity(bytes.data(), bytes.size());
+    const uint64_t buffer_bytes = align_up(size, 4u);
+    bytes.resize(static_cast<size_t>(buffer_bytes), 0);
+
+    // Bounded like the storage relocations: the least recently bound mirror is destroyed.
+    CommandEncoder enc;
+    while (!ia_relocations_.empty() &&
+           (ia_relocations_.size() >= kMaxEntries || ia_relocation_bytes_ + buffer_bytes > kMaxTotalBytes)) {
+        auto lru = ia_relocations_.begin();
+        for (auto it = ia_relocations_.begin(); it != ia_relocations_.end(); ++it) {
+            if (it->second.last_used_seq < lru->second.last_used_seq) {
+                lru = it;
+            }
+        }
+        enc.destroy_resource(lru->second.buffer_id);
+        ia_relocation_bytes_ -= lru->second.buffer_bytes;
+        ia_relocations_.erase(lru);
+    }
+
+    const uint32_t id = allocate_id();
+    enc.create_buffer(id, GpuBufferUsage::Vertex | GpuBufferUsage::Index | GpuBufferUsage::CopyDst, buffer_bytes);
+    for (uint64_t off = 0; off < buffer_bytes; off += kMaxWriteChunk) {
+        const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, buffer_bytes - off);
+        enc.write_buffer(id, static_cast<uint32_t>(off), bytes.data() + off, static_cast<uint32_t>(n));
+    }
+    submit(enc);
+    count_work(Work::BufferUploads);
+    note_upload(buffer_bytes);
+
+    RelocatedIa entry;
+    entry.buffer_bytes = buffer_bytes;
+    entry.buffer_id = id;
+    entry.last_hash = hash;
+    entry.last_used_seq = seq;
+    ia_relocations_.emplace(std::make_pair(va, size), entry);
+    ia_relocation_bytes_ += buffer_bytes;
+
+    *buffer_id = id;
+    *offset = 0;
+    return true;
+}
+
+size_t Device::relocated_ia_count() const {
+    std::lock_guard<std::mutex> lock(ia_relocation_mutex_);
+    return ia_relocations_.size();
 }
 
 bool Device::set_back_buffer(uint64_t resource_interface_pointer) {
