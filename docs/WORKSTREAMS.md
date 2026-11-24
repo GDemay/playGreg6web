@@ -66,6 +66,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add `--no-link-opt` to skip high-RAM `wasm-opt` during linking and `--shrink-largest-shards` to recompile the heaviest shards at `-Oz` to stay under browser `.wasm` size limits.
 - [x] **R29 — Jump-Table Recovery Across Control-Flow Merges: Reaching Definitions for Table Base and Index (`recomp/src/jump_table.rs`)** — `DONE` (PR #433, closes #405) *(driven by the native boot; synthetic fixtures only)*
   - Resolve switches whose table base or index reaches the indirect jump through control-flow merges, keeping the existing soundness rules, and measure resolved / unresolved counts before and after.
+- [ ] **R32 — Real-Binary Boot Bring-Up, Phase 4: From a Sustained Frame Loop to the Title's First Real Content** — `IN PROGRESS` (#481, @Timon-ok) *(continues R23; local game files only for local runs)*
+  - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
 
 ---
 
