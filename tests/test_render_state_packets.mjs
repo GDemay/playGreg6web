@@ -3,9 +3,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import vm from 'node:vm';
+import {
+  SHADER_STAGE as WGPK_SHADER_STAGE,
+  buildWgslPackBuffer,
+  fnv1a64,
+  formatHashHex,
+} from '../web/workers/wgsl_pack_loader.js';
 
 const require = createRequire(import.meta.url);
-const { WgpuCommandProcessor, OPCODES } = require('../web/workers/wgpu_worker.js');
+const { WgpuCommandProcessor, OPCODES, buildGpuTelemetrySnapshot } = require('../web/workers/wgpu_worker.js');
 const rs = require('../web/workers/render_state_packets.js');
 const {
   installRenderStatePackets,
@@ -2080,4 +2086,253 @@ test('W89 S22 tight 16-byte & 48-byte CBV @group(0) bindings plus full storage/t
   );
   assert.equal(handler.stats.errors, 1);
   assert.match(handler.lastError, /duplicate binding 0/);
+});
+
+function makeBasicRenderKey({ formatCode = 27, vertexStride = 0 } = {}) {
+  const key = new Uint8Array(376);
+  const v = new DataView(key.buffer);
+  v.setUint32(20, 1, true); // 1 color target
+  key.set([formatCode, 0, 0xf, 0], 24);
+  v.setUint32(160, 1, true); // sampleCount = 1
+  if (vertexStride > 0) {
+    v.setUint32(172, 1, true); // 1 vertex buffer
+    v.setUint32(176, 1, true); // 1 attribute
+    v.setUint32(180, vertexStride, true);
+    key.set([1, 1], 184); // stepMode = vertex, attrCount = 1
+    v.setUint32(244, 0, true);
+    key.set([30, 0, 0], 248); // float32x3 @0 in buffer 0
+  }
+  return key;
+}
+
+test('W93 CreateRenderPipeline2 populates _pipelineMeta directly and destroyResource cleans it up', () => {
+  const gpu = createMockWebGpu();
+  const vsPackWgsl =
+    '@vertex fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsPackWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.7, 0.4, 1.0); }';
+  const vsGroup0PackWgsl =
+    '@group(0) @binding(0) var<uniform> u_frame: vec4<f32>; @vertex fn vs_main() -> @builtin(position) vec4<f32> { return u_frame; }';
+  const fsFallbackWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 1.0, 1.0); }';
+  const vsBuiltinWgsl =
+    '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+
+  const standaloneProcessor = {
+    device: gpu.device,
+    ctx: gpu.ctx,
+    shaderModules: new Map([
+      [1, { module: gpu.device.createShaderModule({ code: vsPackWgsl }), code: vsPackWgsl, source: 'pack' }],
+      [2, { module: gpu.device.createShaderModule({ code: fsPackWgsl }), code: fsPackWgsl, source: 'pack' }],
+      [3, { module: gpu.device.createShaderModule({ code: vsGroup0PackWgsl }), code: vsGroup0PackWgsl, source: 'pack' }],
+      [4, { module: gpu.device.createShaderModule({ code: fsFallbackWgsl }), code: fsFallbackWgsl, source: 'fallback' }],
+      [
+        5,
+        {
+          module: gpu.device.createShaderModule({ code: vsBuiltinWgsl }),
+          code: vsBuiltinWgsl,
+          source: 'builtin',
+          fallbackProfile: 'fullscreen_triangle_cbv',
+        },
+      ],
+    ]),
+    pipelines: new Map(),
+    computePipelines: new Map(),
+    buffers: new Map(),
+    textures: new Map(),
+    samplers: new Map(),
+    bindGroups: new Map(),
+    _pipelineMeta: new Map(),
+    _passCommands: [],
+  };
+
+  const handler = new rs.RenderStatePackets(standaloneProcessor);
+  const dispatchRaw = (pkt) => {
+    const view = new DataView(pkt.buffer, pkt.byteOffset, pkt.byteLength);
+    const opcode = view.getUint16(0, true);
+    const payloadBytes = view.getUint32(4, true);
+    return handler.handlePacket(opcode, view, 8, payloadBytes);
+  };
+
+  const keyNoVb = makeBasicRenderKey({ formatCode: 27, vertexStride: 0 });
+  const keyWithVb = makeBasicRenderKey({ formatCode: 27, vertexStride: 12 });
+
+  // 1. Real-pack VS + FS without @group(0)
+  assert.equal(dispatchRaw(renderPipeline2Packet(10, 1, 2, 0, keyWithVb)), true);
+  // 2. Real-pack VS only (fsId = 0) declaring @group(0)
+  assert.equal(dispatchRaw(renderPipeline2Packet(11, 3, 0, 0, keyNoVb)), true);
+  // 3. Fallback pack FS (source === 'fallback')
+  assert.equal(dispatchRaw(renderPipeline2Packet(12, 1, 4, 0, keyNoVb)), true);
+  // 4. Builtin fallback VS (source === 'builtin')
+  assert.equal(dispatchRaw(renderPipeline2Packet(13, 5, 2, 0, keyNoVb)), true);
+  // 5. Real-pack VS + FS with explicit group-0 pipeline layout
+  assert.equal(
+    dispatchRaw(bindGroupLayoutPacket(50, [{ binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 16 }])),
+    true
+  );
+  assert.equal(dispatchRaw(pipelineLayoutPacket(51, [50])), true);
+  assert.equal(dispatchRaw(renderPipeline2Packet(14, 1, 2, 51, keyNoVb)), true);
+
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  assert.deepEqual(standaloneProcessor._pipelineMeta.get(10), {
+    id: 10,
+    vsShaderId: 1,
+    fsShaderId: 2,
+    layoutId: 0,
+    vertexStride: 12,
+    topology: 'triangle-list',
+    isV2: true,
+    hasReflectedLayout: false,
+    isRealPack: true,
+    isFallback: false,
+    usesFallbackShader: false,
+    expectsGroup0: false,
+    fallbackProfile: null,
+  });
+
+  const meta11 = standaloneProcessor._pipelineMeta.get(11);
+  assert.equal(meta11.isRealPack, true);
+  assert.equal(meta11.isFallback, false);
+  assert.equal(meta11.usesFallbackShader, false);
+  assert.equal(meta11.expectsGroup0, true);
+
+  const meta12 = standaloneProcessor._pipelineMeta.get(12);
+  assert.equal(meta12.isRealPack, false);
+  assert.equal(meta12.isFallback, false);
+  assert.equal(meta12.usesFallbackShader, true);
+  assert.equal(meta12.expectsGroup0, false);
+
+  const meta13 = standaloneProcessor._pipelineMeta.get(13);
+  assert.equal(meta13.isRealPack, false);
+  assert.equal(meta13.isFallback, true);
+  assert.equal(meta13.usesFallbackShader, true);
+  assert.equal(meta13.fallbackProfile, 'fullscreen_triangle_cbv');
+
+  const meta14 = standaloneProcessor._pipelineMeta.get(14);
+  assert.equal(meta14.isRealPack, true);
+  assert.equal(meta14.hasReflectedLayout, true);
+  assert.equal(meta14.expectsGroup0, true);
+
+  // destroyResource removes pipeline metadata from processor._pipelineMeta
+  handler.destroyResource(10);
+  assert.equal(standaloneProcessor._pipelineMeta.has(10), false);
+  assert.equal(standaloneProcessor._pipelineMeta.has(11), true);
+});
+
+test('W93 CreateRenderPipeline2 with real-pack and fallback shaders increments realPackDrawCount, fallbackDrawCount, and telemetry snapshot', () => {
+  const vsWgsl =
+    '@vertex fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.7, 0.4, 1.0); }';
+  const fallbackFsWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.9, 0.1, 0.5, 1.0); }';
+
+  const vsHash = formatHashHex(fnv1a64(vsWgsl));
+  const fsHash = formatHashHex(fnv1a64(fsWgsl));
+  const fallbackFsHash = '0x000000000000f093';
+  const missingFsHash = '0xdeadbeef00009301';
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+    { hash: fallbackFsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fallbackFsWgsl },
+  ]);
+
+  const key = makeBasicRenderKey({ formatCode: 27, vertexStride: 0 });
+
+  // Case 1: Real-pack VS/FS + fallback-pack FS via CreateRenderPipeline2 (opcode 24)
+  const gpu1 = createMockWebGpu();
+  const processor1 = new WgpuCommandProcessor(gpu1.device, gpu1.ctx, {
+    format: 'bgra8unorm',
+    wgslPackBuffer: packBuf,
+    fallbackShaderHashes: { fragment: fallbackFsHash },
+  });
+  const handler1 = installRenderStatePackets(processor1);
+
+  const indexBufPayload = new Uint8Array(16);
+  const indexBufView = new DataView(indexBufPayload.buffer);
+  indexBufView.setUint32(0, 40, true); // bufferId = 40
+  indexBufView.setUint32(4, 1, true); // uint16
+  indexBufView.setBigUint64(8, 0n, true);
+
+  const stream1 = concat(
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .shader(1, 0, vsHash)
+      .shader(2, 1, fsHash)
+      .shader(3, 1, missingFsHash)
+      .buffer(40, 0x10 | 0x08, 16)
+      .bytes(),
+    renderPipeline2Packet(10, 1, 2, 0, key),
+    renderPipeline2Packet(11, 1, 3, 0, key),
+    new Stream()
+      .u32s(OPCODES.SET_PIPELINE, [10])
+      .u32s(OPCODES.DRAW, [3, 1, 0, 0])
+      .packet(OPCODES.SET_INDEX_BUFFER, indexBufPayload)
+      .u32s(OPCODES.DRAW_INDEXED, [3, 1, 0, 0, 0])
+      .u32s(OPCODES.SET_PIPELINE, [11])
+      .u32s(OPCODES.DRAW, [3, 1, 0, 0])
+      .packet(OPCODES.PRESENT)
+      .bytes()
+  );
+
+  const res1 = processor1.executeCommandBuffer(stream1);
+  assert.equal(res1.presents, 1);
+  assert.equal(handler1.stats.errors, 0, handler1.lastError);
+  assert.equal(processor1.shaderModules.get(1).source, 'pack');
+  assert.equal(processor1.shaderModules.get(2).source, 'pack');
+  assert.equal(processor1.shaderModules.get(3).source, 'fallback');
+  assert.equal(processor1._pipelineMeta.get(10).isRealPack, true);
+  assert.equal(processor1._pipelineMeta.get(11).isRealPack, false);
+  assert.equal(processor1._pipelineMeta.get(11).usesFallbackShader, true);
+
+  assert.equal(processor1.realPackDrawCount, 2);
+  assert.equal(processor1.fallbackDrawCount, 1);
+
+  const snap1 = buildGpuTelemetrySnapshot(processor1, { timestamp: 9300 });
+  assert.equal(snap1.frameStats.framesPresented, 1);
+  assert.equal(snap1.frameStats.drawCalls, 3);
+  assert.equal(snap1.frameStats.realPackDrawCount, 2);
+  assert.equal(snap1.frameStats.fallbackDrawCount, 1);
+
+  // DestroyResource cleans up _pipelineMeta
+  processor1.executeCommandBuffer(new Stream().u32s(OPCODES.DESTROY_RESOURCE, [10]).bytes());
+  assert.equal(processor1.pipelines.has(10), false);
+  assert.equal(processor1._pipelineMeta.has(10), false);
+
+  // Case 2: Builtin fallback shader module (no fallbackShaderHashes configured) increments fallbackDrawCount
+  const gpu2 = createMockWebGpu();
+  const processor2 = new WgpuCommandProcessor(gpu2.device, gpu2.ctx, {
+    format: 'bgra8unorm',
+    wgslPackBuffer: packBuf,
+  });
+  const handler2 = installRenderStatePackets(processor2);
+
+  const stream2 = concat(
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .shader(1, 0, vsHash)
+      .shader(2, 1, missingFsHash)
+      .bytes(),
+    renderPipeline2Packet(20, 1, 2, 0, key),
+    new Stream()
+      .u32s(OPCODES.SET_PIPELINE, [20])
+      .u32s(OPCODES.DRAW, [3, 1, 0, 0])
+      .packet(OPCODES.PRESENT)
+      .bytes()
+  );
+
+  processor2.executeCommandBuffer(stream2);
+  assert.equal(handler2.stats.errors, 0, handler2.lastError);
+  assert.equal(processor2.shaderModules.get(2).source, 'builtin');
+  assert.equal(processor2._pipelineMeta.get(20).isRealPack, false);
+  assert.equal(processor2._pipelineMeta.get(20).isFallback, true);
+  assert.equal(processor2._pipelineMeta.get(20).usesFallbackShader, true);
+  assert.equal(processor2.realPackDrawCount, 0);
+  assert.equal(processor2.fallbackDrawCount, 1);
+
+  const snap2 = buildGpuTelemetrySnapshot(processor2, { timestamp: 9301 });
+  assert.equal(snap2.frameStats.realPackDrawCount, 0);
+  assert.equal(snap2.frameStats.fallbackDrawCount, 1);
 });
