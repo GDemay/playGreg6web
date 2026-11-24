@@ -182,6 +182,7 @@ void CommandList::reset(PipelineState* initial_state) {
     deferred_.clear();
     immediate_writes_.clear();
     graphics_root_args_ = {};
+    graphics_root_signature_ = nullptr;
     vertex_buffers_ = {};
     index_buffer_ = {};
     rtv_handles_.clear();
@@ -314,18 +315,32 @@ const char* descriptor_kind_name(d3d::DescriptorKind k) {
 
 // The first skipped draw of each graphics pipeline state, described with counts, formats and
 // sizes only (no bytecode, no identities): what the draw would need to become visible.
-void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32_t instances) {
-    if (graphics_pso_ == nullptr || !device_->claim_skipped_draw_report(graphics_pso_)) {
+void CommandList::describe_dropped_draw(const char* call, uint32_t count, uint32_t instances) {
+    char reason[160];
+    std::snprintf(reason, sizeof(reason), "%s (state bridge diagnostics: state 0x%" PRIx64 ", pipeline 0x%" PRIx64 ")",
+                  graphics_pso_ == nullptr ? "no graphics pipeline state bound" : "dropped by the state bridge",
+                  bridge_.state_diagnostics(), bridge_.pipeline_diagnostics());
+    describe_skipped_draw(call, count, instances, reason);
+}
+
+void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason) {
+    static const char kNoPipeline = 0;
+    const void* key = graphics_pso_ != nullptr ? static_cast<const void*>(graphics_pso_) : &kNoPipeline;
+    if (!device_->claim_skipped_draw_report(key)) {
         return;
     }
     std::string s = std::string("d3d12_xs: skipped ") + call + " (" + std::to_string(count) + " x " +
-                    std::to_string(instances) + "): pipeline state without shader modules;";
-    const GraphicsPsoSource* src = graphics_pso_->graphics_source();
-    if (src == nullptr) {
-        device_->add_skipped_draw_report(s + " no graphics description");
-        return;
+                    std::to_string(instances) + "): " + reason + ";";
+    if (compute_pso_ != nullptr && graphics_pso_ == nullptr) {
+        s += " a compute pipeline state is bound;";
     }
-    const pso::D3D12GraphicsPsoDesc& d = src->desc;
+    const GraphicsPsoSource* src = graphics_pso_ != nullptr ? graphics_pso_->graphics_source() : nullptr;
+    if (graphics_pso_ != nullptr && src == nullptr) {
+        s += std::string(" the bound pipeline state has no graphics description") +
+             (graphics_pso_->unsupported_reason().empty() ? "" : " (" + graphics_pso_->unsupported_reason() + ")") + ";";
+    }
+    static const pso::D3D12GraphicsPsoDesc kNoDesc{};
+    const pso::D3D12GraphicsPsoDesc& d = src != nullptr ? src->desc : kNoDesc;
     const char* stage_names[] = {"VS", "PS", "DS", "HS", "GS", "AS", "MS"};
     const uint64_t stages[] = {d.vs, d.ps, d.ds, d.hs, d.gs, d.as, d.ms};
     s += " shaders";
@@ -352,7 +367,8 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
          std::to_string(d.SampleDesc.Count);
 
     // Root signature layout and what is bound for each parameter.
-    const d3d::RootSignature* rs = src->root_signature ? &src->root_signature->signature() : nullptr;
+    const d3d::RootSignature* rs = src != nullptr && src->root_signature ? &src->root_signature->signature()
+                                                                         : graphics_root_signature_;
     if (rs == nullptr) {
         s += "; no root signature";
     } else {
@@ -458,10 +474,14 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
     }
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
-        describe_skipped_draw("DrawInstanced", vertices, instances);
+        describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
         return;
     }
+    const uint64_t dropped = bridge_.stats().draws_skipped;
     bridge_.DrawInstanced(vertices, instances, start_vertex, start_instance);
+    if (bridge_.stats().draws_skipped != dropped) {
+        describe_dropped_draw("DrawInstanced", vertices, instances);
+    }
 }
 
 void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t start_index, int32_t base_vertex,
@@ -471,10 +491,14 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
     }
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
-        describe_skipped_draw("DrawIndexedInstanced", indices, instances);
+        describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
         return;
     }
+    const uint64_t dropped = bridge_.stats().draws_skipped;
     bridge_.DrawIndexedInstanced(indices, instances, start_index, base_vertex, start_instance);
+    if (bridge_.stats().draws_skipped != dropped) {
+        describe_dropped_draw("DrawIndexedInstanced", indices, instances);
+    }
 }
 
 void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
@@ -889,7 +913,8 @@ void CommandList::SetGraphicsRootSignature(InterfaceArg<IRootSignatureHost> sign
     if (signature) {
         pinned_.push_back(com::Ref<com::ComObject>::share(signature.object()));
     }
-    const d3d::Status s = bridge_.SetGraphicsRootSignature(signature_of(signature));
+    graphics_root_signature_ = signature_of(signature);
+    const d3d::Status s = bridge_.SetGraphicsRootSignature(graphics_root_signature_);
     if (s != d3d::Status::Ok) {
         note(std::string("SetGraphicsRootSignature: ") + d3d::status_name(s));
     }

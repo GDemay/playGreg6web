@@ -1486,6 +1486,18 @@ void test_unresolved_shaders_and_indexed_draws() {
         CHECK(r.find("vertex buffers") != std::string::npos);
         CHECK(r.find("bound render targets") != std::string::npos);
     }
+    // A draw the state bridge drops (no graphics pipeline state bound) is described too, once.
+    const uint64_t bare = scene.new_list();
+    CHECK(hr(fx.vcall(bare, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(bare, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    fx.vcall(bare, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(hr(fx.vcall(bare, Slot2::Close)) == 0);
+    const std::vector<std::string> reports2 = dev->skipped_draw_reports();
+    CHECK(reports2.size() == 2);
+    if (reports2.size() == 2) {
+        CHECK(reports2[1].find("no graphics pipeline state bound") != std::string::npos);
+    }
+    fx.vcall(bare, Slot::Release);
 
     // Registering the modules later resolves PSOs created afterwards.
     dev->register_shader_module(dg::shader_identity(scene.vs_bytes.data(), scene.vs_bytes.size()), Scene::kVsModule);

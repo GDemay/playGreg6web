@@ -330,7 +330,9 @@ private:
     std::vector<uint64_t> rtv_handles_;
     uint64_t dsv_handle_ = 0;
     void record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count);
-    void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances);
+    const d3d::RootSignature* graphics_root_signature_ = nullptr;
+    void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
+    void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);
     struct ImmediateWrite {
         uint64_t address = 0;
         uint64_t value = 0;
