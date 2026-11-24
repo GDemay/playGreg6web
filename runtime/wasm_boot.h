@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+struct Pg6Program;
+
 namespace playgta6::boot {
 
 inline constexpr char kPgimMagic[4] = {'P', 'G', 'I', 'M'};
@@ -58,9 +60,19 @@ std::vector<std::string> extract_pgim_paths_from_manifest(std::string_view json)
 
 bool has_pgim_magic(std::span<const uint8_t> bytes);
 
+// Matches a Pg6ProgramModule::module build name (e.g. "main", "msvcp140", "vcruntime140_1")
+// against manifest `.pgim` paths like "boot/main/image/guest.pgim" or "main/image/guest.pgim",
+// falling back to "boot/<module_name>/image/guest.pgim".
+std::string resolve_module_pgim_path(std::string_view module_name,
+                                     std::span<const std::string> manifest_pgim_paths);
+
+// Multi-module `Pg6Program` HTTPFS boot: validates `program`, streams every module's `.pgim`
+// over HTTPFS, prepares `guest::ProgramBoot`, and invokes `guest::run_boot`.
+WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program& program);
+
 // Streams the manifest / fallback `.pgim` over HTTPFS, validates PGIM magic, emits
-// `PGIM_LOAD`, and either hooks the linked guest boot (`PG6_BOOT_LINKED_GUEST`) or
-// returns a smoke-shell diagnostic when shards are not linked.
+// `PGIM_LOAD`, and either hooks the linked guest boot (`PG6_BOOT_LINKED_GUEST` /
+// `PG6_BOOT_PROGRAM`) or returns a smoke-shell diagnostic when shards are not linked.
 WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg);
 
 }  // namespace playgta6::boot
