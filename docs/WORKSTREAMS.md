@@ -114,6 +114,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement and bind `Fls*`, `InitializeCriticalSectionEx`, `InitOnceExecuteOnce`, `EncodePointer`/`DecodePointer`, SList, `SwitchToThread`, `GetModuleHandleExW`, `RtlCaptureStackBackTrace`, `LCMapStringEx`/`CompareStringEx`/`GetLocaleInfoEx`/`GetStringTypeW`/`GetCPInfo`, `FindFirstFileExW`, `GetFileInformationByHandle`, `GetTempPathW` and the other Win32 imports of `vcruntime140`/`msvcp140` that have no shim.
 - [x] **O27 — XMem CPU/GPU Window Model: GPU Alias Registration & Address-Space Budget for the wasm64 Guest Pool (`runtime/os/xmem_windows.{h,cpp}`)** — `DONE` (PR #284, closes #278) *(driven by the real boot: multi-GiB `XMemVirtualAlloc` reservations after `D3D12ConfigureVirtualMemoryX`; the browser guest pool is 12 GiB)*
   - Model the title's CPU window and its GPU-visible alias (register the alias with the D3D12 layer, apply queue-side page mappings) and design how multi-GiB reservations fit the wasm64 guest pool, backed by measurements of what the title reserves and commits.
+- [ ] **O29 — Honour the Translated CPU Window in the Runtime: Import-Bridge Seam, COM Bridge, Guest Reads/Writes, (pointer, length) Shims & Contiguous-Run Page Allocator** — `IN PROGRESS` (#373, @Timon-ok) *(no game files required for repo tests — follow-up to R19 / #306; off for programs lifted with the default memory model)*
+  - Convert runtime consumers that can receive CPU-window pointers to the shared translation, keep adjacent mapped slots host-contiguous, and let the program descriptor select the memory model at boot.
 
 ---
 
