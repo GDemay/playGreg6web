@@ -357,6 +357,8 @@ pub fn pack_rdna2_blobs(
             stage,
             entry_point: options.translate.entry_point.clone(),
             min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
+            workgroup_size: options.translate.workgroup_size,
+            workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
         };
 
         let output = match translate_rdna2_to_wgsl(&blob.bytes, &translate_opts) {
@@ -1166,5 +1168,84 @@ mod tests {
             ),
             "JSON:\n{json}"
         );
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_packs_mixed_vs_fs_and_compute_storage_lds_shader_into_wgpk() {
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+
+        // Full compute shader using storage buffer load/store, LDS + s_barrier, and image_store:
+        let mut cs_words = Vec::new();
+        cs_words.push(enc_vop2(0x18, 3, 128 + 2, 0)); // v_lshlrev_b32 v3, 2, v0
+        // buffer_load_dword v4, v3, s[4:7], 0 offen (srsrc=1 -> read-only-storage)
+        cs_words.extend_from_slice(&[
+            (0b111000u32 << 26) | (0x0Cu32 << 18) | (1 << 12),
+            (128u32 << 24) | (1u32 << 16) | (4u32 << 8) | 3,
+        ]);
+        // ds_write_b32 v0, v3, v4
+        cs_words.extend_from_slice(&[
+            (0b110110u32 << 26) | (0x0Du32 << 18),
+            (4u32 << 8) | 3,
+        ]);
+        cs_words.push(enc_sopp(0x0A, 0)); // s_barrier
+        // ds_read_b32 v5, v3, v0
+        cs_words.extend_from_slice(&[
+            (0b110110u32 << 26) | (0x36u32 << 18),
+            (5u32 << 24) | 3,
+        ]);
+        // buffer_store_dword v5, v3, s[8:11], 0 offen (srsrc=2 -> storage)
+        cs_words.extend_from_slice(&[
+            (0b111000u32 << 26) | (0x1Cu32 << 18) | (1 << 12),
+            (128u32 << 24) | (2u32 << 16) | (5u32 << 8) | 3,
+        ]);
+        // image_store v[5:8], v[0:1], s[12:19] dmask:0xf dim:1 (srsrc=3 -> storage-texture)
+        cs_words.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 5, 3, 0));
+        cs_words.push(enc_sopp(0x01, 0)); // s_endpgm
+        let cs_bytes = words_to_bytes(&cs_words);
+
+        let blobs = vec![
+            Rdna2BlobInput::new("vs_0000000000000301.rdna2", vs_bytes),
+            Rdna2BlobInput::new("ps_0000000000000302.rdna2", ps_bytes),
+            Rdna2BlobInput::new("cs_0000000000000303.rdna2", cs_bytes),
+        ];
+
+        let result = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default())
+            .expect("mixed vs+fs+cs WGPK pack should succeed");
+        assert_eq!(result.summary.total_blobs, 3);
+        assert_eq!(result.summary.translated_ok, 3);
+        assert_eq!(result.summary.skipped_or_failed, 0);
+        assert_eq!(result.summary.vertex_count, 1);
+        assert_eq!(result.summary.pixel_count, 1);
+        assert_eq!(result.summary.compute_count, 1);
+
+        let decoded = read_pack(&result.pack_bytes).expect("WGPK round-trip should succeed");
+        assert_eq!(decoded.entries.len(), 3);
+        assert_eq!(decoded.entries[0].stage, ShaderStage::Vertex);
+        assert_eq!(decoded.entries[1].stage, ShaderStage::Fragment);
+        assert_eq!(decoded.entries[2].stage, ShaderStage::Compute);
+        for entry in &decoded.entries {
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        let cs_entry = &decoded.entries[2];
+        assert!(cs_entry.wgsl.contains("fn cs_main("));
+        assert!(cs_entry.wgsl.contains("var<workgroup> lds: array<u32, 4096>;"));
+        assert!(cs_entry.wgsl.contains("workgroupBarrier();"));
+        assert!(cs_entry.wgsl.contains("textureStore("));
+        assert!(!cs_entry.wgsl.contains("enable f16"));
+
+        let cs_summary = &result.summary.entries[2];
+        assert_eq!(cs_summary.entry_point, "cs_main");
+        assert_eq!(cs_summary.unsupported_op_count, 0);
+        assert_eq!(cs_summary.bindings.len(), 3);
+        assert_eq!(cs_summary.bindings[0].kind, "read-only-storage");
+        assert_eq!(cs_summary.bindings[1].kind, "storage");
+        assert_eq!(cs_summary.bindings[2].kind, "storage-texture");
+
+        let json = result.summary.to_json();
+        assert!(json.contains("\"kind\": \"read-only-storage\""), "JSON:\n{json}");
+        assert!(json.contains("\"kind\": \"storage\""), "JSON:\n{json}");
+        assert!(json.contains("\"kind\": \"storage-texture\""), "JSON:\n{json}");
     }
 }
