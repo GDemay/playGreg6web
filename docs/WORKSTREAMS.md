@@ -152,6 +152,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
 - [ ] **O35 — Full Sanitizer Sweep of the Runtime Suites (ASan, UBSan, TSan) and Fix What It Finds** — `IN PROGRESS` (#669, @Timon-ok)
   - Run and loop every runtime suite under ASan+UBSan and TSan, fix findings by cause with regression tests, and close the thread-pool submission leak left by O32.
+- [ ] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `IN PROGRESS` (#687, @Timon-ok) *(coordinated with the browser pipeline's owner)*
+  - Run the browser boot end to end locally, compare it with a native run of the same commit, and fix wasm-only runtime gaps; web and build-tool items go to their owner first.
 
 ---
 
