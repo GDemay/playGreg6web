@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -15,7 +15,8 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
 
     python tools/build_guest_wasm.py <recomp-out-dir>
         [--jobs N] [--cache-dir work/wasm_obj_cache] [--out-dir web/dist]
-        [--opt O2|O3] [--runtime-lib path/to/libplaygta6_core.a]
+        [--opt O0|O1|O2|O3|Os|Oz] [--runtime-lib path/to/libplaygta6_core.a]
+        [--strip] [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
 """
@@ -102,13 +103,23 @@ LINK_FLAGS: tuple[str, ...] = (
     "-Wl,--undefined=__playgta6_divide_error",
 )
 
+STRIP_LINK_FLAGS: tuple[str, ...] = (
+    "-Wl,--strip-all",
+    "-sASSERTIONS=0",
+)
+PTHREAD_POOL_SIZE_PREFIX = "-sPTHREAD_POOL_SIZE="
+LINK_OPT_LEVELS: frozenset[str] = frozenset({"Os", "Oz"})
+
+# Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
+V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
+
 VERIFY_FLAGS: tuple[str, ...] = (
     "--require-memory64",
     "--require-shared-memory",
     "--require-host-imports",
 )
 
-OPT_LEVELS: frozenset[str] = frozenset({"O0", "O1", "O2", "O3"})
+OPT_LEVELS: frozenset[str] = frozenset({"O0", "O1", "O2", "O3", "Os", "Oz"})
 
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
@@ -242,6 +253,8 @@ class BuildReport:
     extrapolated: dict[str, Any] | None = None
     compile_seconds: float = 0.0
     object_bytes: int = 0
+    wasm_bytes: int = 0
+    exceeds_v8_1gib_limit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +281,8 @@ class BuildReport:
             "extrapolated": self.extrapolated,
             "compile_seconds": self.compile_seconds,
             "object_bytes": self.object_bytes,
+            "wasm_bytes": self.wasm_bytes,
+            "exceeds_v8_1gib_limit": self.exceeds_v8_1gib_limit,
         }
 
 
@@ -482,9 +497,9 @@ def parse_opt_level(raw: str) -> str:
         text = text[1:]
     if text in OPT_LEVELS:
         return text
-    if text in {"0", "1", "2", "3"}:
+    if text in {"0", "1", "2", "3", "s", "z"}:
         return f"O{text}"
-    raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, or O3")
+    raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, O3, Os, or Oz")
 
 
 def retarget_wasm64_ir(text: str) -> str:
@@ -880,16 +895,89 @@ def write_link_response_file(path: Path, objects: Sequence[Path | str]) -> Path:
     return path
 
 
+def resolve_link_flags(
+    *,
+    opt: str = "O2",
+    strip: bool = False,
+    pthread_pool_size: int | None = None,
+    extra_link_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Compute effective linker flags for em++ from defaults and build options."""
+    if pthread_pool_size is not None:
+        if isinstance(pthread_pool_size, bool) or pthread_pool_size < 1:
+            raise BuildGuestWasmError("--pthread-pool-size must be >= 1")
+
+    flags: list[str] = []
+    replaced_pool = False
+    for flag in LINK_FLAGS:
+        if pthread_pool_size is not None and flag.startswith(PTHREAD_POOL_SIZE_PREFIX):
+            flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
+            replaced_pool = True
+        else:
+            flags.append(flag)
+    if pthread_pool_size is not None and not replaced_pool:
+        flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
+
+    if opt in LINK_OPT_LEVELS:
+        opt_flag = f"-{opt}"
+        if opt_flag not in flags:
+            flags.append(opt_flag)
+
+    if strip:
+        for strip_flag in STRIP_LINK_FLAGS:
+            if strip_flag not in flags:
+                flags.append(strip_flag)
+
+    for extra in extra_link_flags:
+        if extra:
+            flags.append(extra)
+
+    return tuple(flags)
+
+
+def check_v8_wasm_size(
+    wasm_bytes: int,
+    *,
+    limit: int | None = None,
+) -> tuple[bool, str | None]:
+    """Check whether a linked runtime.wasm exceeds Chrome/V8's 1 GiB module cap."""
+    max_bytes = V8_MAX_WASM_MODULE_BYTES if limit is None else limit
+    if wasm_bytes <= max_bytes:
+        return False, None
+    mib = wasm_bytes / (1024 * 1024)
+    over_mib = (wasm_bytes - max_bytes) / (1024 * 1024)
+    warning = (
+        f"{RUNTIME_WASM} size is {wasm_bytes} bytes ({mib:.2f} MiB), exceeding "
+        f"Chrome/V8's 1 GiB ({max_bytes} bytes) WebAssembly.instantiate() module size limit "
+        f"by {over_mib:.2f} MiB; rebuild with --strip and/or --opt Oz (or --opt Os) "
+        f"to keep the module under 1 GiB"
+    )
+    return True, warning
+
+
 def build_link_argv(
     linker: Path | str,
     objects: Sequence[Path],
     *,
     output_js: Path,
     runtime_libs: Sequence[Path] = (),
+    link_flags: Sequence[str] | None = None,
     extra_flags: Sequence[str] = (),
     response_file: Path | None = None,
+    opt: str = "O2",
+    strip: bool = False,
+    pthread_pool_size: int | None = None,
 ) -> tuple[str, ...]:
-    argv: list[str] = [str(linker), *LINK_FLAGS, *extra_flags]
+    if link_flags is None:
+        effective_flags = resolve_link_flags(
+            opt=opt,
+            strip=strip,
+            pthread_pool_size=pthread_pool_size,
+            extra_link_flags=extra_flags,
+        )
+    else:
+        effective_flags = (*link_flags, *extra_flags)
+    argv: list[str] = [str(linker), *effective_flags]
     if response_file is not None:
         rsp_arg = str(response_file).replace("\\", "/")
         argv.append(f"@{rsp_arg}")
@@ -1137,6 +1225,8 @@ def run_build(
     runtime_lib: Path | None = None,
     extra_objects: Sequence[Path] = (),
     extra_link_flags: Sequence[str] = (),
+    strip: bool = False,
+    pthread_pool_size: int | None = None,
     dry_run: bool = False,
     check_only: bool = False,
     verify: bool = False,
@@ -1155,6 +1245,12 @@ def run_build(
         raise BuildGuestWasmError("--jobs must be >= 1")
     if sample < 0:
         raise BuildGuestWasmError("--sample must be >= 0")
+    effective_link_flags = resolve_link_flags(
+        opt=opt_level,
+        strip=strip,
+        pthread_pool_size=pthread_pool_size,
+        extra_link_flags=extra_link_flags,
+    )
 
     runner = run_command or default_run_command
     toolchain = discover_emscripten(repo_root=repo_root, env=env, which_fn=which_fn)
@@ -1173,7 +1269,7 @@ def run_build(
         jobs=worker_count,
         opt=opt_level,
         compile_flags=(*COMPILE_WASM_FLAGS, f"-{opt_level}"),
-        link_flags=LINK_FLAGS,
+        link_flags=effective_link_flags,
         linked_guest_boot=link_guest_boot,
         sample=sample,
     )
@@ -1360,7 +1456,7 @@ def run_build(
         planned_objects,
         output_js=output_js,
         runtime_libs=runtime_libs,
-        extra_flags=extra_link_flags,
+        link_flags=effective_link_flags,
         response_file=rsp_path,
     )
     report.link_argv = tuple(sanitize_argv(raw_link))
@@ -1388,6 +1484,12 @@ def run_build(
         report.ok = False
         report.errors.append("missing link outputs: " + ", ".join(missing_outputs))
         return report
+
+    report.wasm_bytes = _object_bytes(output_wasm)
+    exceeds_limit, size_warning = check_v8_wasm_size(report.wasm_bytes)
+    report.exceeds_v8_1gib_limit = exceeds_limit
+    if size_warning is not None:
+        report.warnings.append(size_warning)
 
     if verify:
         report.verify = run_verify(
@@ -1440,6 +1542,10 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append("  Link: " + " ".join(report.link_argv))
     if report.outputs:
         lines.append("  Outputs: " + ", ".join(report.outputs))
+    if report.wasm_bytes:
+        mib = report.wasm_bytes / (1024 * 1024)
+        limit_note = " [EXCEEDS V8 1 GiB LIMIT]" if report.exceeds_v8_1gib_limit else ""
+        lines.append(f"  Wasm size: {report.wasm_bytes} bytes ({mib:.2f} MiB){limit_note}")
     if report.verify is not None:
         vstat = "PASS" if report.verify.get("ok") else "FAIL"
         lines.append(f"  Verify: {vstat}")
@@ -1503,7 +1609,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--opt",
         default="O2",
-        help="Optimization level: O0, O1, O2 (default), or O3.",
+        help="Optimization level: O0, O1, O2 (default), O3, Os, or Oz.",
     )
     parser.add_argument(
         "--runtime-lib",
@@ -1516,6 +1622,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         dest="extra_objects",
         help="Additional object/archive to pass to the linker (repeatable).",
+    )
+    parser.add_argument(
+        "--strip",
+        action="store_true",
+        help=(
+            "Strip debug/name sections at link time (-Wl,--strip-all -sASSERTIONS=0) "
+            "to reduce runtime.wasm size."
+        ),
+    )
+    parser.add_argument(
+        "--extra-link-flag",
+        action="append",
+        default=[],
+        dest="extra_link_flags",
+        metavar="FLAG",
+        help=(
+            "Additional linker flag passed to em++ (repeatable; e.g. "
+            "--extra-link-flag=-sINITIAL_MEMORY=2GB)."
+        ),
+    )
+    parser.add_argument(
+        "--pthread-pool-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override -sPTHREAD_POOL_SIZE=N on the link line (must be >= 1; default: 4).",
     )
     parser.add_argument(
         "--dry-run",
@@ -1579,9 +1711,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_cli_argv(
+    argv: Sequence[str],
+    parser: argparse.ArgumentParser,
+) -> list[str]:
+    """Allow `--extra-link-flag -Wl,...` in addition to `--extra-link-flag=-Wl,...`."""
+    known_options: set[str] = set()
+    for action in parser._actions:
+        known_options.update(action.option_strings)
+
+    out: list[str] = []
+    idx = 0
+    items = list(argv)
+    while idx < len(items):
+        token = items[idx]
+        if token == "--":
+            out.extend(items[idx:])
+            break
+        if (
+            token == "--extra-link-flag"
+            and idx + 1 < len(items)
+            and items[idx + 1] not in known_options
+            and items[idx + 1] != "--"
+        ):
+            out.append(f"--extra-link-flag={items[idx + 1]}")
+            idx += 2
+            continue
+        out.append(token)
+        idx += 1
+    return out
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(_normalize_cli_argv(raw_argv, parser))
     repo_root = Path(args.repo_root).resolve() if args.repo_root else DEFAULT_REPO_ROOT
 
     source = Path(args.source_dir) if args.source_dir else None
@@ -1610,6 +1774,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             opt=args.opt,
             runtime_lib=runtime_lib,
             extra_objects=extra_objects,
+            extra_link_flags=args.extra_link_flags,
+            strip=args.strip,
+            pthread_pool_size=args.pthread_pool_size,
             dry_run=args.dry_run,
             check_only=args.check_only,
             verify=args.verify,
