@@ -61,7 +61,7 @@
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
-//     (offline: no sandbox, E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
+//     (the configured console sandbox; none: E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
 //     GetAnalyticsInfo are never called.
 //   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h (s4 XLaunchNewGame stub).
 //   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
@@ -726,6 +726,19 @@ public:
 };
 
 // {e349bd1a-...}/{1861cf2e-...}: XSystem.
+std::mutex& sandbox_mutex() {
+    static std::mutex m;
+    return m;
+}
+std::string& sandbox_id_storage() {
+    static std::string s;
+    return s;
+}
+std::string configured_sandbox_id() {
+    std::lock_guard<std::mutex> lock(sandbox_mutex());
+    return sandbox_id_storage();
+}
+
 class SystemApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XSystem";
@@ -743,21 +756,39 @@ public:
         return com::write_guest(buffer, id, sizeof(id)) ? S_OK_HR : E_INVALIDARG_HR;
     }
 
-    // s4 XSystemGetXboxLiveSandboxId(size, buffer, used): the runtime is offline and has no Xbox
-    // Live sandbox, so it reports none: E_NOTIMPL, an empty string and used = 0 (every caller
-    // in the executable takes its failure path; no sandbox name is invented).
+    // s4 XSystemGetXboxLiveSandboxId(size, buffer, used): the emulated console's sandbox
+    // (set_xbox_live_sandbox_id; console environment configuration, not a sign-in result). With
+    // none configured: E_NOTIMPL, an empty string and used = 0. Otherwise used = length + 1 and
+    // the terminated string, or E_NOT_SUFFICIENT_BUFFER when it does not fit.
     int32_t GetXboxLiveSandboxId(uint64_t size, uint64_t buffer, GuestPtr<uint64_t> used) {
-        if (!used.is_null()) {
-            used.write(0);
+        const std::string sandbox = configured_sandbox_id();
+        if (sandbox.empty()) {
+            if (!used.is_null()) {
+                used.write(0);
+            }
+            if (buffer != 0 && size != 0) {
+                const char nul = '\0';
+                com::write_guest(buffer, &nul, 1);
+            }
+            if (!sandbox_logged_.exchange(true)) {
+                os::log("xgameruntime: XSystemGetXboxLiveSandboxId: no sandbox configured; returning E_NOTIMPL");
+            }
+            return com::E_NOTIMPL_HR;
         }
-        if (buffer != 0 && size != 0) {
-            const char nul = '\0';
-            com::write_guest(buffer, &nul, 1);
+        const uint64_t needed = sandbox.size() + 1;
+        if (!used.is_null()) {
+            used.write(needed);
+        }
+        if (buffer == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (size < needed) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
         }
         if (!sandbox_logged_.exchange(true)) {
-            os::log("xgameruntime: XSystemGetXboxLiveSandboxId: offline, no sandbox; returning E_NOTIMPL");
+            os::log("xgameruntime: XSystemGetXboxLiveSandboxId: configured sandbox \"" + sandbox + "\"");
         }
-        return com::E_NOTIMPL_HR;
+        return com::write_guest(buffer, sandbox.c_str(), static_cast<size_t>(needed)) ? S_OK_HR : E_INVALIDARG_HR;
     }
 
 private:
@@ -1481,6 +1512,15 @@ void set_xbox_title_id(uint32_t title_id) {
     g_title_id.store(title_id, std::memory_order_relaxed);
 }
 
+void set_xbox_live_sandbox_id(const std::string& sandbox_id) {
+    std::lock_guard<std::mutex> lock(sandbox_mutex());
+    sandbox_id_storage() = sandbox_id.substr(0, 15);  // XSystemXboxLiveSandboxIdMaxBytes is 16
+}
+
+std::string xbox_live_sandbox_id() {
+    return configured_sandbox_id();
+}
+
 void reset_xgameruntime_provider() {
     ProviderState& st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
@@ -1494,6 +1534,7 @@ void reset_xgameruntime_provider() {
     stores().clear();
     ports().clear();
     g_title_id.store(0, std::memory_order_relaxed);
+    set_xbox_live_sandbox_id("");
 }
 
 }  // namespace playgta6::os::gdk::provider

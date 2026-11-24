@@ -26,6 +26,7 @@
 #include "os/win32_loader.h"
 #include "os/win32_sync.h"
 #include "os/xbox_scarlett.h"
+#include "os/xgameruntime_provider.h"
 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND) || defined(__EXCEPTIONS)
 #define PG6_BOOT_HAS_EXCEPTIONS 1
@@ -2493,6 +2494,7 @@ BootResult run_boot(const BootConfig& config) {
         os::win32::registry_set_value("HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM",
                                       u"ConsoleMode", kRegDword, &mode, sizeof(mode));
     }
+    os::gdk::provider::set_xbox_live_sandbox_id(config.sandbox_id);
     b.active = true;
 
     auto finish = [&]() {
