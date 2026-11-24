@@ -204,6 +204,10 @@ pub const MEMORY_MODEL_CHOICES: &[(&str, &str)] = &[
         "the translated CPU window (docs/wasm_abi.md), branch check, stack accesses flat",
     ),
     (
+        "window-outline",
+        "window with outlined noinline helpers per access width (smaller wasm64 code), stack flat",
+    ),
+    (
         "window-runs",
         "window without straddle checks (the runtime keeps window runs contiguous, or stops)",
     ),
@@ -224,11 +228,25 @@ impl MemoryModel {
         })
     }
 
+    /// The browser target's translated CPU window using [`WindowCheck::Outline`] (outlined
+    /// `noinline cold` window helper per width) for significantly smaller Wasm64 binaries.
+    pub fn translated_window_outline() -> Self {
+        Self::Windowed(Window {
+            flat: GuestBase::default(),
+            base: GUEST_WINDOW_BASE,
+            size: GUEST_WINDOW_SIZE,
+            check: WindowCheck::Outline,
+            stack_flat: true,
+            contiguous_runs: false,
+        })
+    }
+
     /// The model a [`MEMORY_MODEL_CHOICES`] name selects.
     pub fn from_name(name: &str) -> Result<Self, String> {
         match name {
             "base" => Ok(Self::default()),
             "window" => Ok(Self::translated_window(false)),
+            "window-outline" => Ok(Self::translated_window_outline()),
             "window-runs" => Ok(Self::translated_window(true)),
             other => Err(format!(
                 "unknown memory model '{other}' (expected {})",
@@ -304,6 +322,10 @@ pub(crate) enum Decl {
     Write,
     Memmove,
     Memset,
+    /// Outlined cold straddling-store helper of `bytes` bytes (`__playgta6_slow_store<bytes>`).
+    SlowStore {
+        bytes: u8,
+    },
     /// Outlined window load / store of `bytes` bytes for the window at `base`
     /// ([`WindowCheck::Outline`]).
     WindowLoad {
@@ -314,6 +336,22 @@ pub(crate) enum Decl {
         bytes: u8,
         base: u64,
     },
+}
+
+/// Canonical LLVM value type used by outlined window and straddle helpers for `bytes` bytes:
+/// scalar integers for 1..8 bytes, native wasm `v128` (`<2 x i64>`) for 16 bytes, `<4 x i64>` for
+/// 32 bytes (avoiding scalarised `i128`/`i256` parameter passing on wasm64).
+pub(crate) fn helper_value_type(bytes: u64) -> String {
+    match bytes {
+        16 => "<2 x i64>".to_string(),
+        32 => "<4 x i64>".to_string(),
+        _ => format!("i{}", bytes * 8),
+    }
+}
+
+/// Name of an outlined straddle-store helper.
+pub(crate) fn slow_store_helper(bytes: u64) -> String {
+    format!("__playgta6_slow_store{bytes}")
 }
 
 /// Name of an outlined window access helper.
@@ -331,52 +369,77 @@ impl Decl {
             Self::PageTable => {
                 "@__playgta6_page_table = external global [0 x i64], align 8\n".to_string()
             }
-            Self::Read => "declare ptr @__playgta6_guest_read(i64, i64)\n".to_string(),
-            Self::Write => "declare ptr @__playgta6_guest_scratch()\n\
-                            declare void @__playgta6_guest_write(i64, i64)\n"
+            Self::Read => {
+                "declare ptr @__playgta6_guest_read(i64 noundef, i64 noundef) cold\n".to_string()
+            }
+            Self::Write => "declare ptr @__playgta6_guest_scratch() cold\n\
+                            declare void @__playgta6_guest_write(i64 noundef, i64 noundef) cold\n"
                 .to_string(),
-            Self::Memmove => "declare void @__playgta6_guest_memmove(i64, i64, i64)\n".to_string(),
-            Self::Memset => "declare void @__playgta6_guest_memset(i64, i8, i64)\n".to_string(),
+            Self::Memmove => {
+                "declare void @__playgta6_guest_memmove(i64 noundef, i64 noundef, i64 noundef)\n"
+                    .to_string()
+            }
+            Self::Memset => {
+                "declare void @__playgta6_guest_memset(i64 noundef, i8 noundef, i64 noundef)\n"
+                    .to_string()
+            }
+            Self::SlowStore { bytes } => outlined_slow_store(u64::from(bytes)),
             Self::WindowLoad { bytes, base } => outlined(false, u64::from(bytes), base),
             Self::WindowStore { bytes, base } => outlined(true, u64::from(bytes), base),
         }
     }
 }
 
+/// Definition of an outlined cold straddling-store helper: replaces two runtime calls + store at
+/// every straddling store site with a single cold direct call.
+fn outlined_slow_store(bytes: u64) -> String {
+    let name = slow_store_helper(bytes);
+    let vty = helper_value_type(bytes);
+    format!(
+        "define internal void @{name}(i64 noundef %va, {vty} noundef %v) unnamed_addr noinline cold #0 {{\n\
+         entry:\n\
+         \x20 %s = call ptr @{HELPER_GUEST_SCRATCH}()\n\
+         \x20 store {vty} %v, ptr %s, align 1\n\
+         \x20 tail call void @{HELPER_GUEST_WRITE}(i64 %va, i64 {bytes})\n\
+         \x20 ret void\n\
+         }}\n"
+    )
+}
+
 /// Definition of an outlined window access helper (see [`WindowCheck::Outline`]).
 fn outlined(store: bool, bytes: u64, base: u64) -> String {
     let name = window_helper(store, bytes, base);
-    let bits = bytes * 8;
+    let vty = helper_value_type(bytes);
     let sig = if store {
-        format!("void @{name}(i64 %va, i{bits} %v)")
+        format!("void @{name}(i64 noundef %va, {vty} noundef %v)")
     } else {
-        format!("i{bits} @{name}(i64 %va)")
+        format!("{vty} @{name}(i64 noundef %va)")
     };
     let access = |ptr: &str, tag: &str| {
         if store {
-            format!("  store i{bits} %v, ptr {ptr}, align 1\n  ret void\n")
+            format!("  store {vty} %v, ptr {ptr}, align 1\n  ret void\n")
         } else {
-            format!("  %v{tag} = load i{bits}, ptr {ptr}, align 1\n  ret i{bits} %v{tag}\n")
+            format!("  %v{tag} = load {vty}, ptr {ptr}, align 1\n  ret {vty} %v{tag}\n")
         }
     };
-    let mut out = format!(
-        "define internal {sig} noinline {{\nentry:\n  %rel = sub i64 %va, {}\n  %idx = lshr i64 %rel, {SLOT_SHIFT}\n  %e = getelementptr i64, ptr @{WINDOW_TABLE_SYMBOL}, i64 %idx\n  %d = load i64, ptr %e, align 8\n",
-        base as i64
-    );
+    let mut out = format!("define internal {sig} unnamed_addr noinline cold #0 {{\nentry:\n");
     if bytes > 1 {
         out.push_str(&format!(
-            "  %off = and i64 %va, {}\n  %fit = icmp ule i64 %off, {}\n  br i1 %fit, label %fast, label %slow\nfast:\n",
+            "  %off = and i64 %va, {}\n  %fit = icmp ule i64 %off, {}\n  br i1 %fit, label %fast, label %slow, !prof !{{!\"branch_weights\", i32 2000, i32 1}}\nfast:\n",
             SLOT_BYTES - 1,
             SLOT_BYTES - bytes
         ));
     }
-    out.push_str("  %h = add i64 %va, %d\n  %p = inttoptr i64 %h to ptr\n");
+    out.push_str(&format!(
+        "  %rel = sub i64 %va, {}\n  %idx = lshr i64 %rel, {SLOT_SHIFT}\n  %e = getelementptr i64, ptr @{WINDOW_TABLE_SYMBOL}, i64 %idx\n  %d = load i64, ptr %e, align 8\n  %h = add i64 %va, %d\n  %p = inttoptr i64 %h to ptr\n",
+        base as i64
+    ));
     out.push_str(&access("%p", "f"));
     if bytes > 1 {
         out.push_str("slow:\n");
         if store {
             out.push_str(&format!(
-                "  %s = call ptr @{HELPER_GUEST_SCRATCH}()\n  store i{bits} %v, ptr %s, align 1\n  call void @{HELPER_GUEST_WRITE}(i64 %va, i64 {bytes})\n  ret void\n"
+                "  %s = call ptr @{HELPER_GUEST_SCRATCH}()\n  store {vty} %v, ptr %s, align 1\n  tail call void @{HELPER_GUEST_WRITE}(i64 %va, i64 {bytes})\n  ret void\n"
             ));
         } else {
             out.push_str(&format!(

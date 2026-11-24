@@ -19,7 +19,7 @@ use crate::lift::{BitIntrinsic, Support};
 
 /// `pdep`: scatters the low bits of `src` to the set bits of `mask` (lowest first).
 pub(in crate::lift) const PDEP_IR: &str = "\
-define internal i64 @__playgta6_pdep(i64 %src, i64 %mask) {
+define internal i64 @__playgta6_pdep(i64 %src, i64 %mask) unnamed_addr #0 {
 entry:
   br label %loop
 loop:
@@ -45,7 +45,7 @@ exit:
 
 /// `pext`: gathers the bits of `src` at the set bits of `mask` into the low bits.
 pub(in crate::lift) const PEXT_IR: &str = "\
-define internal i64 @__playgta6_pext(i64 %src, i64 %mask) {
+define internal i64 @__playgta6_pext(i64 %src, i64 %mask) unnamed_addr #0 {
 entry:
   br label %loop
 loop:

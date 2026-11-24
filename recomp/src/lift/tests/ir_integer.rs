@@ -103,7 +103,9 @@ fn locked_instructions_become_seq_cst_atomics() {
     assert!(ir.contains(&format!(
         "attributes #0 = {{ \"target-features\"=\"+simd128,{ATOMICS_TARGET_FEATURES}\" }}"
     )));
-    assert!(ir.contains("define void @sub_1000(ptr noalias %state) #0 {"));
+    assert!(
+        ir.contains("define void @sub_1000(ptr noalias noundef %state) unnamed_addr #0 {")
+    );
     assert!(
         ir.lines()
             .filter(|l| l.starts_with("define "))
@@ -154,7 +156,7 @@ fn runtime_helpers_are_declared_only_when_used() {
     });
     for helper in [HELPER_CPUID, HELPER_RDTSC, HELPER_RDTSCP, HELPER_XGETBV] {
         assert!(
-            ir.contains(&format!("declare void @{helper}(ptr)")),
+            ir.contains(&format!("declare void @{helper}(ptr noundef)")),
             "{helper}"
         );
         assert!(
