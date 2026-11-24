@@ -2,7 +2,9 @@
 // into a SharedArrayBuffer using atomic writes + even/odd seqlock framing compatible with
 // both SeqlockMode::MonotonicSeq and SeqlockMode::EvenOddSeqlock in runtime/os/game_input.cpp.
 
+export const INPUT_ABI_VERSION = 1;
 export const INPUT_STATE_BYTES = 40;
+export const INPUT_STATE_WORDS = 10;
 
 export const INPUT_OFFSETS = Object.freeze({
   SEQ: 0,            // uint32_t (u32[0])
@@ -15,6 +17,37 @@ export const INPUT_OFFSETS = Object.freeze({
   RIGHT_STICK_Y: 28, // float32  (f32[7])
   LEFT_TRIGGER: 32,  // float32  (f32[8])
   RIGHT_TRIGGER: 36, // float32  (f32[9])
+});
+
+export const INPUT_WORD_INDICES = Object.freeze({
+  SEQ: 0,
+  BUTTONS: 1,
+  MOUSE_DX: 2,
+  MOUSE_DY: 3,
+  LEFT_STICK_X: 4,
+  LEFT_STICK_Y: 5,
+  RIGHT_STICK_X: 6,
+  RIGHT_STICK_Y: 7,
+  LEFT_TRIGGER: 8,
+  RIGHT_TRIGGER: 9,
+});
+
+export const INPUT_ABI_LAYOUT = Object.freeze({
+  version: INPUT_ABI_VERSION,
+  byteLength: INPUT_STATE_BYTES,
+  wordCount: INPUT_STATE_WORDS,
+  fields: Object.freeze([
+    Object.freeze({ name: 'seq', key: 'SEQ', type: 'uint32', offset: 0, wordIndex: 0, size: 4 }),
+    Object.freeze({ name: 'buttons', key: 'BUTTONS', type: 'uint32', offset: 4, wordIndex: 1, size: 4 }),
+    Object.freeze({ name: 'mouse_dx', key: 'MOUSE_DX', type: 'int32', offset: 8, wordIndex: 2, size: 4 }),
+    Object.freeze({ name: 'mouse_dy', key: 'MOUSE_DY', type: 'int32', offset: 12, wordIndex: 3, size: 4 }),
+    Object.freeze({ name: 'left_stick_x', key: 'LEFT_STICK_X', type: 'float32', offset: 16, wordIndex: 4, size: 4 }),
+    Object.freeze({ name: 'left_stick_y', key: 'LEFT_STICK_Y', type: 'float32', offset: 20, wordIndex: 5, size: 4 }),
+    Object.freeze({ name: 'right_stick_x', key: 'RIGHT_STICK_X', type: 'float32', offset: 24, wordIndex: 6, size: 4 }),
+    Object.freeze({ name: 'right_stick_y', key: 'RIGHT_STICK_Y', type: 'float32', offset: 28, wordIndex: 7, size: 4 }),
+    Object.freeze({ name: 'left_trigger', key: 'LEFT_TRIGGER', type: 'float32', offset: 32, wordIndex: 8, size: 4 }),
+    Object.freeze({ name: 'right_trigger', key: 'RIGHT_TRIGGER', type: 'float32', offset: 36, wordIndex: 9, size: 4 }),
+  ]),
 });
 
 // Button bitmasks matching runtime/os/game_input.h (bits 0..5 & 8..15) plus
@@ -54,17 +87,20 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
   KeyA: INPUT_BUTTONS.MOVE_LEFT,
   KeyD: INPUT_BUTTONS.MOVE_RIGHT,
   Space: INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A,
+  Enter: INPUT_BUTTONS.A,
+  NumpadEnter: INPUT_BUTTONS.A,
   ShiftLeft: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
   ShiftRight: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
   ControlLeft: INPUT_BUTTONS.B,
   ControlRight: INPUT_BUTTONS.B,
+  Backspace: INPUT_BUTTONS.B,
   KeyC: INPUT_BUTTONS.RS,
   KeyR: INPUT_BUTTONS.X,
   KeyF: INPUT_BUTTONS.Y,
   KeyQ: INPUT_BUTTONS.LB,
   KeyE: INPUT_BUTTONS.RB,
   Tab: INPUT_BUTTONS.VIEW,
-  Escape: INPUT_BUTTONS.MENU,
+  Escape: INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
   ArrowUp: INPUT_BUTTONS.DPAD_UP,
   ArrowDown: INPUT_BUTTONS.DPAD_DOWN,
   ArrowLeft: INPUT_BUTTONS.DPAD_LEFT,
@@ -72,7 +108,7 @@ export const DEFAULT_KEY_BINDINGS = Object.freeze({
 });
 
 // W3C Standard Gamepad button index -> INPUT_BUTTONS bitmask (indices 6 & 7 are analog triggers).
-const STANDARD_GAMEPAD_BUTTON_MAP = Object.freeze([
+export const STANDARD_GAMEPAD_BUTTON_MAP = Object.freeze([
   INPUT_BUTTONS.A,          // 0: Bottom face button (A)
   INPUT_BUTTONS.B,          // 1: Right face button (B)
   INPUT_BUTTONS.X,          // 2: Left face button (X)
@@ -94,12 +130,26 @@ const STANDARD_GAMEPAD_BUTTON_MAP = Object.freeze([
 
 const PREVENT_DEFAULT_KEYS = new Set([
   'Space',
+  'Enter',
+  'NumpadEnter',
+  'Backspace',
   'Tab',
   'ArrowUp',
   'ArrowDown',
   'ArrowLeft',
   'ArrowRight',
 ]);
+
+const EMPTY_ARRAY = Object.freeze([]);
+
+const EDITABLE_TAG_NAMES = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+
+function isEditableElement(el) {
+  if (!el || typeof el !== 'object') return false;
+  if (el.isContentEditable) return true;
+  const tag = typeof el.tagName === 'string' ? el.tagName.toUpperCase() : '';
+  return EDITABLE_TAG_NAMES.has(tag);
+}
 
 const _f32ScratchBuf = new ArrayBuffer(4);
 const _f32Scratch = new Float32Array(_f32ScratchBuf);
@@ -123,26 +173,31 @@ function clamp(value, min, max) {
 /**
  * Radial 2D stick deadzone normalization matching playgta6::os::normalize_stick.
  * Maps stick magnitude in [innerDeadzone, outerDeadzone] -> [0, 1] while preserving direction.
+ * Pass a pre-allocated `out` object `{ x, y }` for zero-allocation polling.
  */
-export function applyDeadzone(x, y, innerDeadzone = 0.15, outerDeadzone = 0.98) {
+export function applyDeadzone(x, y, innerDeadzone = 0.15, outerDeadzone = 0.98, out = null) {
+  const target = out || { x: 0, y: 0 };
   if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    return { x: 0, y: 0 };
+    target.x = 0;
+    target.y = 0;
+    return target;
   }
   const inner = clamp(innerDeadzone, 0, 0.99);
   const outer = clamp(outerDeadzone, inner + 1e-4, 1);
 
   const mag = Math.hypot(x, y);
   if (mag <= inner || mag <= 0) {
-    return { x: 0, y: 0 };
+    target.x = 0;
+    target.y = 0;
+    return target;
   }
 
   const clampedMag = Math.min(mag, outer);
   const normalizedMag = clamp((clampedMag - inner) / (outer - inner), 0, 1);
   const scale = normalizedMag / mag;
-  return {
-    x: clamp(x * scale, -1, 1),
-    y: clamp(y * scale, -1, 1),
-  };
+  target.x = clamp(x * scale, -1, 1);
+  target.y = clamp(y * scale, -1, 1);
+  return target;
 }
 
 /**
@@ -224,19 +279,65 @@ export class InputBridge {
           ? navigator
           : null;
 
+    const SabCtor =
+      opts.sharedArrayBufferCtor !== undefined
+        ? opts.sharedArrayBufferCtor
+        : typeof SharedArrayBuffer === 'function'
+          ? SharedArrayBuffer
+          : null;
+
     if (opts.sab) {
-      if (!(opts.sab instanceof SharedArrayBuffer) || opts.sab.byteLength < INPUT_STATE_BYTES) {
-        throw new RangeError(`sab must be a SharedArrayBuffer of at least ${INPUT_STATE_BYTES} bytes`);
+      const isSab = Boolean(SabCtor && opts.sab instanceof SabCtor);
+      const isAb = opts.sab instanceof ArrayBuffer;
+      if ((!isSab && !isAb) || opts.sab.byteLength < INPUT_STATE_BYTES) {
+        throw new RangeError(
+          `sab must be a SharedArrayBuffer or ArrayBuffer of at least ${INPUT_STATE_BYTES} bytes`
+        );
       }
       this.sab = opts.sab;
+      this.isSharedBuffer = isSab;
+    } else if (SabCtor) {
+      try {
+        this.sab = new SabCtor(INPUT_STATE_BYTES);
+        this.isSharedBuffer = true;
+      } catch {
+        this.sab = new ArrayBuffer(INPUT_STATE_BYTES);
+        this.isSharedBuffer = false;
+      }
     } else {
-      this.sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+      this.sab = new ArrayBuffer(INPUT_STATE_BYTES);
+      this.isSharedBuffer = false;
     }
 
-    this.i32 = new Int32Array(this.sab);
-    this.u32 = new Uint32Array(this.sab);
-    this.f32 = new Float32Array(this.sab);
-    this.view = new DataView(this.sab);
+    this.i32 = new Int32Array(this.sab, 0, INPUT_STATE_WORDS);
+    this.u32 = new Uint32Array(this.sab, 0, INPUT_STATE_WORDS);
+    this.f32 = new Float32Array(this.sab, 0, INPUT_STATE_WORDS);
+    this.view = new DataView(this.sab, 0, INPUT_STATE_BYTES);
+
+    let atomicsImpl =
+      opts.atomicsObj !== undefined
+        ? opts.atomicsObj
+        : typeof Atomics === 'object' && Atomics !== null
+          ? Atomics
+          : null;
+    if (atomicsImpl) {
+      if (
+        typeof atomicsImpl.load !== 'function' ||
+        typeof atomicsImpl.store !== 'function' ||
+        typeof atomicsImpl.add !== 'function'
+      ) {
+        atomicsImpl = null;
+      } else if (!this.isSharedBuffer) {
+        // Probe once: older engines throw TypeError for Atomics on non-shared ArrayBuffers.
+        try {
+          atomicsImpl.load(this.u32, INPUT_WORD_INDICES.SEQ);
+        } catch {
+          atomicsImpl = null;
+        }
+      }
+    }
+    this._atomics = atomicsImpl;
+    this.usesAtomics = Boolean(this._atomics);
 
     this._keyBindings = opts.keyBindings
       ? { ...DEFAULT_KEY_BINDINGS, ...opts.keyBindings }
@@ -273,7 +374,11 @@ export class InputBridge {
     this._gpLt = 0;
     this._gpRt = 0;
 
-    // Last committed merged state (for change detection in pollGamepads)
+    // Pre-allocated scratch objects for zero-allocation 60/120Hz gamepad polling.
+    this._leftStickScratch = { x: 0, y: 0 };
+    this._rightStickScratch = { x: 0, y: 0 };
+
+    // Last committed merged state (stored as IEEE-754 int32 bits for fast change detection).
     this.buttons = 0;
     this._lastLx = 0;
     this._lastLy = 0;
@@ -281,6 +386,12 @@ export class InputBridge {
     this._lastRy = 0;
     this._lastLt = 0;
     this._lastRt = 0;
+    this._lastLxBits = 0;
+    this._lastLyBits = 0;
+    this._lastRxBits = 0;
+    this._lastRyBits = 0;
+    this._lastLtBits = 0;
+    this._lastRtBits = 0;
 
     this.pointerLocked = Boolean(
       this._canvas && this._document && this._document.pointerLockElement === this._canvas
@@ -290,12 +401,90 @@ export class InputBridge {
     this.running = false;
     this.disposed = false;
 
+    this._boundTick = () => {
+      if (!this.running || this.disposed) return;
+      this.pollGamepads();
+      if (this.running && !this.disposed && this._window && typeof this._window.requestAnimationFrame === 'function') {
+        this._rafId = this._window.requestAnimationFrame(this._boundTick);
+      }
+    };
+
     this._listeners = [];
     this._bindEvents();
 
     if (opts.autoStart === true) {
       this.start();
     }
+  }
+
+  _atomicAddU32(index, value) {
+    if (this._atomics) {
+      return this._atomics.add(this.u32, index, value);
+    }
+    const prev = this.u32[index];
+    this.u32[index] = (prev + value) >>> 0;
+    return prev;
+  }
+
+  _atomicStoreU32(index, value) {
+    if (this._atomics) {
+      return this._atomics.store(this.u32, index, value);
+    }
+    const next = value >>> 0;
+    this.u32[index] = next;
+    return next;
+  }
+
+  _atomicLoadU32(index) {
+    if (this._atomics) {
+      return this._atomics.load(this.u32, index);
+    }
+    return this.u32[index];
+  }
+
+  _atomicAddI32(index, value) {
+    if (this._atomics) {
+      return this._atomics.add(this.i32, index, value);
+    }
+    const prev = this.i32[index];
+    this.i32[index] = (prev + value) | 0;
+    return prev;
+  }
+
+  _atomicStoreI32(index, value) {
+    if (this._atomics) {
+      return this._atomics.store(this.i32, index, value);
+    }
+    const next = value | 0;
+    this.i32[index] = next;
+    return next;
+  }
+
+  _atomicLoadI32(index) {
+    if (this._atomics) {
+      return this._atomics.load(this.i32, index);
+    }
+    return this.i32[index];
+  }
+
+  _shouldIgnoreKeydown(e, code) {
+    if (this.isPointerLocked()) return false;
+    // Do not hijack browser shortcuts (Ctrl+R, Ctrl+W, Alt+Tab, Cmd+*, etc.) when unlocked.
+    if (e.metaKey || e.altKey) return true;
+    if (e.ctrlKey && code !== 'ControlLeft' && code !== 'ControlRight') return true;
+    // Do not intercept typing in form controls or contentEditable surfaces when unlocked.
+    if (isEditableElement(e.target) || isEditableElement(this._document?.activeElement)) {
+      return true;
+    }
+    // Do not intercept keys while the document itself is unfocused.
+    if (this._document && typeof this._document.hasFocus === 'function') {
+      try {
+        if (!this._document.hasFocus()) return true;
+      } catch {
+        // Ignore host errors from non-standard document mocks.
+      }
+    }
+    return false;
   }
 
   _addListener(target, event, handler, options) {
@@ -348,10 +537,10 @@ export class InputBridge {
 
       // Even/odd seqlock framing around atomic mouse delta accumulation.
       // Matches Atomics.exchange(0) in runtime/os/game_input.cpp::consume_mouse_delta().
-      Atomics.add(this.u32, 0, 1);
-      if (dx !== 0) Atomics.add(this.i32, 2, dx);
-      if (dy !== 0) Atomics.add(this.i32, 3, dy);
-      Atomics.add(this.u32, 0, 1);
+      this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+      if (dx !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DX, dx);
+      if (dy !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DY, dy);
+      this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
     });
 
     this._addListener(this._window, 'mousedown', (e) => {
@@ -391,6 +580,7 @@ export class InputBridge {
       const isWasd = code === 'KeyW' || code === 'KeyS' || code === 'KeyA' || code === 'KeyD';
       const binding = this._keyBindings[code] || 0;
       if (!binding && !isWasd) return;
+      if (this._shouldIgnoreKeydown(e, code)) return;
 
       if (
         this.isPointerLocked() &&
@@ -416,6 +606,10 @@ export class InputBridge {
     });
 
     this._addListener(this._window, 'blur', () => {
+      this._clearTransientInputs();
+    });
+
+    this._addListener(this._window, 'pagehide', () => {
       this._clearTransientInputs();
     });
 
@@ -549,7 +743,7 @@ export class InputBridge {
       return this._commitMergedState(false);
     }
 
-    const buttons = pad.buttons || [];
+    const buttons = pad.buttons || EMPTY_ARRAY;
     let gpMask = 0;
     const maxButtons = Math.min(buttons.length, STANDARD_GAMEPAD_BUTTON_MAP.length);
     for (let i = 0; i < maxButtons; i++) {
@@ -565,15 +759,27 @@ export class InputBridge {
     this._gpLt = applyTriggerDeadzone(rawLt, this._triggerDeadzone, this._triggerOuterDeadzone);
     this._gpRt = applyTriggerDeadzone(rawRt, this._triggerDeadzone, this._triggerOuterDeadzone);
 
-    const axes = pad.axes || [];
+    const axes = pad.axes || EMPTY_ARRAY;
     const ySign = this._invertGamepadY ? -1 : 1;
     const rawLx = Number.isFinite(axes[0]) ? axes[0] : 0;
     const rawLy = Number.isFinite(axes[1]) ? axes[1] * ySign : 0;
     const rawRx = Number.isFinite(axes[2]) ? axes[2] : 0;
     const rawRy = Number.isFinite(axes[3]) ? axes[3] * ySign : 0;
 
-    const left = applyDeadzone(rawLx, rawLy, this._stickDeadzone, this._stickOuterDeadzone);
-    const right = applyDeadzone(rawRx, rawRy, this._stickDeadzone, this._stickOuterDeadzone);
+    const left = applyDeadzone(
+      rawLx,
+      rawLy,
+      this._stickDeadzone,
+      this._stickOuterDeadzone,
+      this._leftStickScratch
+    );
+    const right = applyDeadzone(
+      rawRx,
+      rawRy,
+      this._stickDeadzone,
+      this._stickOuterDeadzone,
+      this._rightStickScratch
+    );
 
     this._gpLx = left.x;
     this._gpLy = left.y;
@@ -606,17 +812,23 @@ export class InputBridge {
     if (
       !force &&
       mergedButtons === this.buttons &&
-      lxBits === f32ToI32(this._lastLx) &&
-      lyBits === f32ToI32(this._lastLy) &&
-      rxBits === f32ToI32(this._lastRx) &&
-      ryBits === f32ToI32(this._lastRy) &&
-      ltBits === f32ToI32(this._lastLt) &&
-      rtBits === f32ToI32(this._lastRt)
+      lxBits === this._lastLxBits &&
+      lyBits === this._lastLyBits &&
+      rxBits === this._lastRxBits &&
+      ryBits === this._lastRyBits &&
+      ltBits === this._lastLtBits &&
+      rtBits === this._lastRtBits
     ) {
       return false;
     }
 
     this.buttons = mergedButtons;
+    this._lastLxBits = lxBits;
+    this._lastLyBits = lyBits;
+    this._lastRxBits = rxBits;
+    this._lastRyBits = ryBits;
+    this._lastLtBits = ltBits;
+    this._lastRtBits = rtBits;
     this._lastLx = i32ToF32(lxBits);
     this._lastLy = i32ToF32(lyBits);
     this._lastRx = i32ToF32(rxBits);
@@ -628,15 +840,15 @@ export class InputBridge {
     // 1. Bump seq to odd before writing fields.
     // 2. Write buttons and all 6 float32 channels atomically (preserving mouse_dx / mouse_dy).
     // 3. Bump seq to even after writing fields.
-    Atomics.add(this.u32, 0, 1);
-    Atomics.store(this.u32, 1, mergedButtons);
-    Atomics.store(this.i32, 4, lxBits);
-    Atomics.store(this.i32, 5, lyBits);
-    Atomics.store(this.i32, 6, rxBits);
-    Atomics.store(this.i32, 7, ryBits);
-    Atomics.store(this.i32, 8, ltBits);
-    Atomics.store(this.i32, 9, rtBits);
-    Atomics.add(this.u32, 0, 1);
+    this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._atomicStoreU32(INPUT_WORD_INDICES.BUTTONS, mergedButtons);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_X, lxBits);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_Y, lyBits);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_STICK_X, rxBits);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_STICK_Y, ryBits);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, ltBits);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, rtBits);
+    this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
 
     return true;
   }
@@ -648,14 +860,7 @@ export class InputBridge {
     if (!this._window || typeof this._window.requestAnimationFrame !== 'function') return;
 
     this.running = true;
-    const tick = () => {
-      if (!this.running || this.disposed) return;
-      this.pollGamepads();
-      if (this.running && !this.disposed) {
-        this._rafId = this._window.requestAnimationFrame(tick);
-      }
-    };
-    this._rafId = this._window.requestAnimationFrame(tick);
+    this._rafId = this._window.requestAnimationFrame(this._boundTick);
   }
 
   start() {
@@ -703,56 +908,63 @@ export class InputBridge {
     this._lastRy = 0;
     this._lastLt = 0;
     this._lastRt = 0;
+    this._lastLxBits = 0;
+    this._lastLyBits = 0;
+    this._lastRxBits = 0;
+    this._lastRyBits = 0;
+    this._lastLtBits = 0;
+    this._lastRtBits = 0;
 
-    Atomics.add(this.u32, 0, 1);
-    Atomics.store(this.u32, 1, 0);
-    Atomics.store(this.i32, 2, 0);
-    Atomics.store(this.i32, 3, 0);
-    Atomics.store(this.i32, 4, 0);
-    Atomics.store(this.i32, 5, 0);
-    Atomics.store(this.i32, 6, 0);
-    Atomics.store(this.i32, 7, 0);
-    Atomics.store(this.i32, 8, 0);
-    Atomics.store(this.i32, 9, 0);
-    Atomics.add(this.u32, 0, 1);
+    this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._atomicStoreU32(INPUT_WORD_INDICES.BUTTONS, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.MOUSE_DX, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.MOUSE_DY, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_X, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_Y, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_STICK_X, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_STICK_Y, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, 0);
+    this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, 0);
+    this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
   }
 
   /**
    * Captures a consistent snapshot from the 40-byte SharedArrayBuffer using the same
    * even/odd seqlock protocol as playgta6::os::GameInputReader::read_snapshot().
+   * Pass a pre-allocated `out` object to avoid per-frame allocations.
    */
-  getSnapshot(maxRetries = 64) {
+  getSnapshot(maxRetries = 64, out = null) {
     const attempts = maxRetries > 0 ? maxRetries : 1;
     for (let i = 0; i < attempts; i++) {
-      const seqBefore = Atomics.load(this.u32, 0);
+      const seqBefore = this._atomicLoadU32(INPUT_WORD_INDICES.SEQ);
       if ((seqBefore & 1) !== 0) continue;
 
-      const buttons = Atomics.load(this.u32, 1);
-      const mouse_dx = Atomics.load(this.i32, 2);
-      const mouse_dy = Atomics.load(this.i32, 3);
-      const lx = i32ToF32(Atomics.load(this.i32, 4));
-      const ly = i32ToF32(Atomics.load(this.i32, 5));
-      const rx = i32ToF32(Atomics.load(this.i32, 6));
-      const ry = i32ToF32(Atomics.load(this.i32, 7));
-      const lt = i32ToF32(Atomics.load(this.i32, 8));
-      const rt = i32ToF32(Atomics.load(this.i32, 9));
+      const buttons = this._atomicLoadU32(INPUT_WORD_INDICES.BUTTONS);
+      const mouse_dx = this._atomicLoadI32(INPUT_WORD_INDICES.MOUSE_DX);
+      const mouse_dy = this._atomicLoadI32(INPUT_WORD_INDICES.MOUSE_DY);
+      const lx = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.LEFT_STICK_X));
+      const ly = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.LEFT_STICK_Y));
+      const rx = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.RIGHT_STICK_X));
+      const ry = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.RIGHT_STICK_Y));
+      const lt = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.LEFT_TRIGGER));
+      const rt = i32ToF32(this._atomicLoadI32(INPUT_WORD_INDICES.RIGHT_TRIGGER));
 
-      const seqAfter = Atomics.load(this.u32, 0);
+      const seqAfter = this._atomicLoadU32(INPUT_WORD_INDICES.SEQ);
       if (seqBefore === seqAfter) {
-        return {
-          seq: seqBefore,
-          buttons,
-          mouse_dx,
-          mouse_dy,
-          lx,
-          ly,
-          rx,
-          ry,
-          lt,
-          rt,
-          pointerLocked: this.isPointerLocked(),
-          wheelDelta: this._wheelDelta,
-        };
+        const snap = out || {};
+        snap.seq = seqBefore;
+        snap.buttons = buttons;
+        snap.mouse_dx = mouse_dx;
+        snap.mouse_dy = mouse_dy;
+        snap.lx = lx;
+        snap.ly = ly;
+        snap.rx = rx;
+        snap.ry = ry;
+        snap.lt = lt;
+        snap.rt = rt;
+        snap.pointerLocked = this.isPointerLocked();
+        snap.wheelDelta = this._wheelDelta;
+        return snap;
       }
     }
 
