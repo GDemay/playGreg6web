@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use playgta6_recomp::lift::MemoryModel;
 use playgta6_recomp::lift::target::LiftTarget;
-use playgta6_recomp::pipeline::{self, program};
+use playgta6_recomp::pipeline::{self, IndirectDispatch, program};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramArgs {
@@ -30,13 +30,16 @@ pub struct ProgramArgs {
     pub codegen: LiftTarget,
     /// Memory model of every module (`--memory-model`).
     pub memory: MemoryModel,
+    /// Indirect-call dispatch mode of every module (`--indirect-dispatch`).
+    pub indirect_dispatch: IndirectDispatch,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
     "  --memory-model <m>     build-program: memory model of every module (as for build), recorded in pg6_program.cpp",
+    "  --indirect-dispatch <m> build-program: indirect-call dispatch mode of every module (table|shard), wired in pg6_program.cpp",
     "  --dll <file>           build-program: offer a DLL as a guest module (used when the program imports it)",
     "  --dll-dir <dir>        build-program: offer every *.dll in <dir>",
     "  --guest-dll <name>     build-program: build <name> as a guest module even if host-only by default or unreferenced",
@@ -67,6 +70,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         shard_instructions: None,
         codegen: LiftTarget::Wasm64,
         memory: MemoryModel::default(),
+        indirect_dispatch: IndirectDispatch::default(),
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -171,6 +175,11 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
                 i += 1;
                 parsed.memory = MemoryModel::from_name(&value(i, flag, "<model>")?)?;
             }
+            "--indirect-dispatch" => {
+                i += 1;
+                parsed.indirect_dispatch =
+                    IndirectDispatch::from_name(&value(i, flag, "<mode>")?)?;
+            }
             other if other.starts_with('-') => {
                 return Err(format!("unknown option '{other}' for 'build-program'"));
             }
@@ -229,6 +238,7 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
     build.emit_obj = args.emit_obj;
     build.target = args.codegen.clone();
     build.memory = args.memory;
+    build.indirect_dispatch = args.indirect_dispatch;
     if let Some(jobs) = args.jobs {
         build.jobs = jobs;
     }
@@ -355,6 +365,40 @@ mod tests {
         );
         assert!(
             parse_program_args(&args(&["a.exe", "--out", "x", "--target-cpu", "znver2"])).is_err()
+        );
+        assert_eq!(parsed.indirect_dispatch, IndirectDispatch::Table);
+        let shard = parse_program_args(&args(&[
+            "a.exe",
+            "--out",
+            "x",
+            "--indirect-dispatch",
+            "shard",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(shard.indirect_dispatch, IndirectDispatch::Shard);
+        let table = parse_program_args(&args(&[
+            "a.exe",
+            "--out",
+            "x",
+            "--indirect-dispatch",
+            "table",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(table.indirect_dispatch, IndirectDispatch::Table);
+        assert!(
+            parse_program_args(&args(&[
+                "a.exe",
+                "--out",
+                "x",
+                "--indirect-dispatch",
+                "invalid",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_program_args(&args(&["a.exe", "--out", "x", "--indirect-dispatch"])).is_err()
         );
     }
 }

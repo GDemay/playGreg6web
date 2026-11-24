@@ -14,7 +14,7 @@ use playgta6_recomp::lift::MemoryModel;
 use playgta6_recomp::lift::memory::MEMORY_MODEL_CHOICES;
 use playgta6_recomp::lift::target::LiftTarget;
 use playgta6_recomp::pe;
-use playgta6_recomp::pipeline::{self, PipelineOptions};
+use playgta6_recomp::pipeline::{self, IndirectDispatch, PipelineOptions};
 use playgta6_recomp::stubs;
 use playgta6_recomp::summary::render_summary_json;
 
@@ -71,6 +71,7 @@ struct BuildArgs {
     shard_instructions: Option<usize>,
     codegen: LiftTarget,
     memory: MemoryModel,
+    indirect_dispatch: IndirectDispatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +102,7 @@ fn print_usage() {
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!(
-        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>]"
+        "  playgta6-recomp build <pe-path>|--from-env --out <dir> [--module <name>] [--shims <header>...] [--entry <va>]... [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard]"
     );
     eprintln!("{}", program_cmd::USAGE);
     eprintln!("{}", export_cmd::USAGE);
@@ -138,6 +139,7 @@ fn print_usage() {
     for (name, what) in MEMORY_MODEL_CHOICES {
         eprintln!("                           {name:<12} {what}");
     }
+    eprintln!("  --indirect-dispatch <m> build, build-program: indirect-call dispatch table: table (default, per-function pointers) or shard (one dispatcher per shard)");
     for line in program_cmd::OPTIONS {
         eprintln!("{line}");
     }
@@ -189,6 +191,7 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
     let mut target_spec: Option<String> = None;
     let mut target_cpu: Option<String> = None;
     let mut memory = MemoryModel::default();
+    let mut indirect_dispatch = IndirectDispatch::default();
 
     let count = |flag: &str, value: Option<&String>| -> Result<usize, String> {
         value
@@ -272,6 +275,13 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
                 };
                 memory = MemoryModel::from_name(value)?;
             }
+            "--indirect-dispatch" => {
+                i += 1;
+                let Some(value) = args.get(i).filter(|v| !v.starts_with('-')) else {
+                    return Err("--indirect-dispatch requires a value ('table' or 'shard')".to_string());
+                };
+                indirect_dispatch = IndirectDispatch::from_name(value)?;
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown option '{flag}' for 'build'"));
             }
@@ -318,6 +328,7 @@ fn parse_build_args(args: &[String]) -> Result<Command, String> {
         shard_instructions,
         codegen,
         memory,
+        indirect_dispatch,
     }))
 }
 
@@ -916,6 +927,7 @@ fn run_build(args: &BuildArgs) -> Result<String, String> {
     options.emit_obj = args.emit_obj;
     options.target = args.codegen.clone();
     options.memory = args.memory;
+    options.indirect_dispatch = args.indirect_dispatch;
     if let Some(jobs) = args.jobs {
         options.jobs = jobs;
     }
@@ -1474,6 +1486,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 shard_instructions: Some(1000),
                 codegen: LiftTarget::Wasm64,
                 memory: MemoryModel::default(),
+                indirect_dispatch: IndirectDispatch::Table,
             }))
         );
         assert_eq!(
@@ -1490,6 +1503,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
                 shard_instructions: None,
                 codegen: LiftTarget::Wasm64,
                 memory: MemoryModel::default(),
+                indirect_dispatch: IndirectDispatch::Table,
             }))
         );
         assert!(parse_cli(&vec_s(&["build", "game.exe"])).is_err(), "--out is required");
@@ -1503,6 +1517,25 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
         let bad_model = ["build", "a.exe", "--out", "w", "--memory-model", "pages"];
         assert!(parse_cli(&vec_s(&bad_model)).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--memory-model"])).is_err());
+        match parse_cli(&vec_s(&[
+            "build", "a.exe", "--out", "w", "--indirect-dispatch", "shard",
+        ])) {
+            Ok(Command::Build(args)) => assert_eq!(args.indirect_dispatch, IndirectDispatch::Shard),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_cli(&vec_s(&[
+            "build", "a.exe", "--out", "w", "--indirect-dispatch", "table",
+        ])) {
+            Ok(Command::Build(args)) => assert_eq!(args.indirect_dispatch, IndirectDispatch::Table),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            parse_cli(&vec_s(&[
+                "build", "a.exe", "--out", "w", "--indirect-dispatch", "bogus",
+            ]))
+            .is_err()
+        );
+        assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--indirect-dispatch"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "--out", "w"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--from-env", "--out", "w"])).is_err());
         assert!(parse_cli(&vec_s(&["build", "a.exe", "--out", "w", "--jobs", "0"])).is_err());
@@ -1558,6 +1591,7 @@ GTA6_GAME_DIR=\"C:/Games/GTA6\"
             shard_instructions: None,
             codegen: LiftTarget::Wasm64,
             memory: MemoryModel::default(),
+            indirect_dispatch: IndirectDispatch::Table,
         })
         .expect("run_build should succeed");
         assert!(report.starts_with("playgta6-recomp build report: module main\n"), "{report}");

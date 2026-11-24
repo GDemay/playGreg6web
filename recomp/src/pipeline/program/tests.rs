@@ -2036,3 +2036,75 @@ fn linked_program_calls_across_modules_through_prefilled_iat_slots() {
     }
     panic!("running the linked program failed:\n{last_error}");
 }
+
+#[test]
+fn shard_dispatch_program_descriptor_and_manifest() {
+    let (exe, a, b) = (exe_main(), dll_a(DLL_BASE), dll_b(DLL_BASE));
+
+    // Default (`Table`) mode stays unchanged (no shard_dispatch declarations or fields).
+    let tmp_table = TempDir::new("prog_table");
+    let table_opts = program_options(tmp_table.path(), &exe, &[&a, &b]);
+    let table_report = build(&table_opts);
+    let table_desc =
+        fs::read_to_string(tmp_table.path().join("out").join(PROGRAM_DESCRIPTOR_FILE)).unwrap();
+    assert!(!table_desc.contains("Pg6ShardDispatchTable"));
+    assert!(!table_desc.contains("__playgta6_shard_dispatch_"));
+    assert!(!table_report.manifest.contains("indirect_dispatch"));
+    assert!(!table_report.manifest.contains("shard_dispatch_symbol"));
+
+    // `Shard` mode wires `&__playgta6_shard_dispatch_<module>` as the 12th field of Pg6ProgramModule.
+    let tmp_shard = TempDir::new("prog_shard");
+    let mut shard_opts = program_options(tmp_shard.path(), &exe, &[&a, &b]);
+    shard_opts.build.indirect_dispatch = IndirectDispatch::Shard;
+    let shard_report = build(&shard_opts);
+    let out = tmp_shard.path().join("out");
+    let desc = fs::read_to_string(out.join(PROGRAM_DESCRIPTOR_FILE)).unwrap();
+
+    assert!(!desc.contains("Pg6LiftedFunctionEntry"), "{desc}");
+    assert!(!desc.contains("__playgta6_lifted_functions_"), "{desc}");
+    for module in ["b", "a", "main"] {
+        assert!(
+            desc.contains(&format!(
+                "extern const Pg6ShardDispatchTable __playgta6_shard_dispatch_{module};"
+            )),
+            "missing extern decl for {module}:\n{desc}"
+        );
+        let funcs = fs::read_to_string(out.join(module).join(LIFT_DIR).join("functions.ll")).unwrap();
+        assert!(
+            !funcs.contains("@sub_"),
+            "module {module} functions.ll must have zero @sub_* references:\n{funcs}"
+        );
+        assert!(funcs.contains(&format!("@__playgta6_shard_dispatch_{module} = constant")));
+    }
+
+    let a_base = shard_report.module("a.dll").unwrap().base;
+    assert!(
+        desc.contains(&format!(
+            "{{\"a.dll\", \"a\", 0x{a_base:x}ull, 0x5000ull, 0x0ull, kPg6ProgramModuleDll, 0u, \
+             nullptr, nullptr,\n     \
+             reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_a), \
+             &pg6_import_thunk_count_a,\n     &__playgta6_shard_dispatch_a}},"
+        )),
+        "unexpected a.dll Pg6ProgramModule initializer:\n{desc}"
+    );
+    assert!(
+        desc.contains("&__playgta6_shard_dispatch_main},"),
+        "missing main shard_dispatch field:\n{desc}"
+    );
+    assert!(shard_report.manifest.contains("\"indirect_dispatch\": \"shard\""));
+    assert!(
+        shard_report
+            .manifest
+            .contains("\"shard_dispatch_symbol\": \"__playgta6_shard_dispatch_main\"")
+    );
+    assert!(
+        shard_report
+            .manifest
+            .contains("\"shard_dispatch_symbol\": \"__playgta6_shard_dispatch_a\"")
+    );
+    assert!(
+        shard_report
+            .manifest
+            .contains("\"shard_dispatch_symbol\": \"__playgta6_shard_dispatch_b\"")
+    );
+}
