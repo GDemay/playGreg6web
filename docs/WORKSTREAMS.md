@@ -46,6 +46,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - `playgta6-recomp survey-interfaces`: for interface pointers obtained from given sources (an import's out-parameter, a parent interface's vtable slot), report the vtable slots called, call-site counts and inferred argument counts (addresses, GUID constants and counts only).
 - [ ] **R17 — Real-Binary Boot Bring-Up: Iterate the Native Boot to the First D3D12 Device Creation** — `IN PROGRESS` (#271, @Timon-ok) *(M2; game files stay local — repo changes are runtime/recompiler fixes with synthetic regression tests)*
   - Run the native boot harness (`R14`) on the real program build in a fix-and-rerun loop: triage each first fault, fix boot/loader/dispatcher/shim defects with regression tests or record the missing piece for its owning task, until the title reaches its first D3D12 device creation.
+- [ ] **R18 — Guest-Callable Thunks for Every Catalogued Shim Export: Dynamic `GetProcAddress` Coverage (`recomp/src/stubs/`, `runtime/guest/`)** — `IN PROGRESS` (#283, @Timon-ok) *(no game files required — observed at boot: `GetProcAddress` returns NULL for host shims that are not statically imported)*
+  - Generate guest-callable marshaling thunks for every audited, bindable shim in the catalogue, register them with the guest runtime, and make dynamic `GetProcAddress` binding return callable guest addresses.
 
 ---
 
