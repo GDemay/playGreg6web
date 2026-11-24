@@ -330,8 +330,8 @@
     X(pg6_mw_hc_settings_get_trace_level, ok, "reports HCTraceLevel::Off") \
     X(pg6_mw_hc_trace_impl_message, deny, "C-variadic: a fixed-signature thunk cannot marshal it") \
     X(pg6_mw_hc_trace_set_etw_enabled, ok, "") \
-    /* ---- Bink2Scarlett (O14: synthetic 640x360 clip, no decode, never blocks) ---- */ \
-    X(pg6_mw_bink_open_with_options, ok, "returns a runtime-owned BINK whose leading fields follow the public layout (round trip pointer, freed by BinkClose)") \
+    /* ---- Bink2Scarlett (no decoder: movies refused at open; per-movie calls tolerate NULL) ---- */ \
+    X(pg6_mw_bink_open_with_options, ok, "no decoder: refuses every movie (returns NULL), the title takes its failure path") \
     X(pg6_mw_bink_close, ok, "") \
     X(pg6_mw_bink_do_frame, ok, "") \
     X(pg6_mw_bink_do_frame_async_multi, ok, "") \
