@@ -41,10 +41,11 @@ use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, 
 
 use crate::cfg::{
     BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
-    Terminator,
+    Terminator, UnresolvedJump,
 };
 use crate::code_image::{CodeImage, Region};
 use crate::jump_table::{self, Step};
+use crate::reach;
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
 /// `int 0x29` is the Windows `__fastfail` trap and never returns.
@@ -55,9 +56,6 @@ const CONTAINING_BLOCK_SCAN: usize = 8;
 
 /// Longest chain of blocks (the jump's block plus sole predecessors) sliced for a jump table.
 const MAX_TRACE_BLOCKS: usize = 4;
-
-/// Blocks visited when looking for the definitions of a register that reach a merge block.
-const MAX_REACH_BLOCKS: usize = 256;
 
 /// Times one resolved jump table may be replaced by a changed resolution.
 const MAX_TABLE_REVISIONS: u32 = 8;
@@ -91,6 +89,9 @@ pub struct Analysis {
     pub relocations: RelocationMap,
     /// Resolved switch jump tables keyed by the VA of their indirect `jmp`.
     pub jump_tables: BTreeMap<u64, JumpTable>,
+    /// Why each indirect `jmp` without an import slot that is left to run-time dispatch did not
+    /// resolve, keyed by its VA.
+    pub unresolved_jumps: BTreeMap<u64, UnresolvedJump>,
 }
 
 impl Analysis {
@@ -121,6 +122,7 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
         state.run();
     }
     state.verify_jump_tables();
+    let unresolved_jumps = state.classify_unresolved_jumps();
 
     let mut relocations = Vec::new();
     for instr in state.blocks.values().flat_map(|b| b.instructions.iter()) {
@@ -136,6 +138,7 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
         functions,
         relocations,
         jump_tables,
+        unresolved_jumps,
     }
 }
 
@@ -575,8 +578,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .then_some(start)
     }
 
-    /// Slice the jump at `site` together with its chain of sole predecessors.
-    fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
+    /// The jump at `site` together with its chain of sole predecessors, and the first block of
+    /// that chain.
+    fn jump_trace(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<(Vec<Step<'_>>, u64)> {
         let start = self.jump_block(site)?;
         let mut chain = vec![(self.blocks.get(&start)?, None)];
         let mut current = start;
@@ -596,7 +600,6 @@ impl<'i, 'a> Discovery<'i, 'a> {
             chain.push((prev, taken));
             current = pred.from;
         }
-        let first_block = current;
         let mut trace = Vec::new();
         for (block, taken) in chain.into_iter().rev() {
             let last = block.instructions.len().saturating_sub(1);
@@ -611,102 +614,105 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     }),
             );
         }
+        Some((trace, current))
+    }
+
+    /// Facts about the registers `trace` reads before writing them that hold on every
+    /// intra-function path into `first_block` ([`reach::reaching_values`]), as synthetic
+    /// instructions to put in front of the trace: `(constants, all)`, where `constants` holds only
+    /// the single in-image values (`lea reg, [rip+X]`, the table bases) and `all` adds the interval
+    /// bounds (`cmp reg, hi` + not-taken `ja`). `None` when nothing reaches or the subgraph is too
+    /// large.
+    #[allow(clippy::type_complexity)]
+    fn reaching_prefix(
+        &self,
+        trace: &[Step<'_>],
+        first_block: u64,
+        preds: &HashMap<u64, Pred>,
+    ) -> Option<(Vec<(Instruction, bool)>, Vec<(Instruction, bool)>)> {
+        let live = live_in_registers(trace);
+        if live.is_empty() {
+            return None;
+        }
+        let preds_of = |b: u64| -> Vec<u64> {
+            preds.get(&b).map_or_else(Vec::new, |p| {
+                let mut v = Vec::with_capacity(1 + p.others.len());
+                v.push(p.from);
+                v.extend(p.others.iter().copied());
+                v
+            })
+        };
+        let is_entry = |b: u64| {
+            self.entries.contains(&b)
+                || self.return_sites.contains(&b)
+                || self.resume_roots.iter().any(|&(_, target)| target == b)
+        };
+        let values =
+            reach::reaching_values(&self.blocks, &preds_of, &is_entry, first_block, &live)?;
+        let contains = |va: u64| self.image.contains(va);
+        let constants: Vec<(Instruction, bool)> = values
+            .iter()
+            .filter(|(_, known)| matches!(known, reach::Known::Range { lo, hi } if lo == hi && contains(*lo)))
+            .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains))
+            .collect();
+        let all: Vec<(Instruction, bool)> = values
+            .iter()
+            .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains))
+            .collect();
+        Some((constants, all))
+    }
+
+    /// Slice the jump at `site` together with its chain of sole predecessors.
+    fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
+        let (trace, first_block) = self.jump_trace(site, preds)?;
         if let Some(table) = jump_table::resolve(self.image, &trace) {
             return Some(table);
         }
-        // The chain stops at a merge (e.g. a loop header): a table base loaded before the merge
-        // is invisible to the slice. Registers the trace reads before writing them whose value
-        // at the merge is one RIP-relative `lea` constant on every incoming path are made
-        // explicit as `lea reg, [rip+X]` in front of the trace, and the slice runs again.
-        let prefix: Vec<Instruction> = live_in_registers(&trace)
-            .into_iter()
-            .filter_map(|reg| {
-                let va = self.reaching_rip_lea(first_block, reg, preds)?;
-                synthetic_rip_lea(reg, va)
-            })
-            .collect();
-        if prefix.is_empty() {
+        // The chain stops at a merge (e.g. a loop header): a table base or an index bound
+        // established before the merge is invisible to the slice. What holds on every path into
+        // the merge is stated in front of the trace and the slice runs again: first only the
+        // constants, then also the bounds, so tables resolved by the base alone keep their
+        // resolution.
+        let (constants, all) = self.reaching_prefix(&trace, first_block, preds)?;
+        if !constants.is_empty()
+            && let Some(table) = jump_table::resolve(self.image, &prefixed(&constants, &trace))
+        {
+            return Some(table);
+        }
+        if all.len() == constants.len() {
             return None;
         }
-        let mut extended: Vec<Step<'_>> = prefix
-            .iter()
-            .map(|instr| Step { instr, taken: None })
-            .collect();
-        extended.extend(trace.iter().copied());
-        jump_table::resolve(self.image, &extended)
+        jump_table::resolve(self.image, &prefixed(&all, &trace))
     }
 
-    /// The constant every intra-function path into `block` leaves in the 64-bit register `reg`,
-    /// when each path's last write to it is `lea reg, [rip+X]` with the same `X` (loops that do
-    /// not write `reg` are followed around). `None` if any path writes `reg` differently,
-    /// crosses a call while `reg` is volatile, reaches a function entry, or the search exceeds
-    /// [`MAX_REACH_BLOCKS`].
-    fn reaching_rip_lea(
-        &self,
-        block: u64,
-        reg: iced_x86::Register,
-        preds: &HashMap<u64, Pred>,
-    ) -> Option<u64> {
-        let volatile = is_volatile_register(reg);
-        let mut info = iced_x86::InstructionInfoFactory::new();
-        let mut value: Option<u64> = None;
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut stack: Vec<u64> = Vec::new();
-        let push_preds = |of: u64, stack: &mut Vec<u64>| -> Option<()> {
-            let pred = preds.get(&of)?;
-            stack.push(pred.from);
-            stack.extend(pred.others.iter().copied());
-            Some(())
-        };
-        if self.entries.contains(&block) {
-            return None;
-        }
-        push_preds(block, &mut stack)?;
-        while let Some(at) = stack.pop() {
-            if !seen.insert(at) {
+    /// Why each indirect jump without an import slot that is left to run-time dispatch did not
+    /// resolve ([`jump_table::classify`] on the same slice and reaching facts the match used).
+    fn classify_unresolved_jumps(&self) -> BTreeMap<u64, UnresolvedJump> {
+        let preds = self.predecessors();
+        let mut out = BTreeMap::new();
+        for block in self.blocks.values() {
+            if block.terminator != Terminator::IndirectJump
+                || !block
+                    .successors
+                    .contains(&Edge::IndirectJump { slot: None })
+            {
                 continue;
             }
-            if seen.len() > MAX_REACH_BLOCKS {
-                return None;
-            }
-            let pred_block = self.blocks.get(&at)?;
-            let mut defined = false;
-            for instr in pred_block.instructions.iter().rev() {
-                if volatile && matches!(instr.flow_control(), FlowControl::Call | FlowControl::IndirectCall) {
-                    return None;
+            let Some(jmp) = block.instructions.last() else {
+                continue;
+            };
+            let Some((trace, first_block)) = self.jump_trace(jmp.ip(), &preds) else {
+                continue;
+            };
+            let kind = match self.reaching_prefix(&trace, first_block, &preds) {
+                Some((_, all)) if !all.is_empty() => {
+                    jump_table::classify(self.image, &prefixed(&all, &trace))
                 }
-                let writes = info.info(instr).used_registers().iter().any(|used| {
-                    used.register().full_register() == reg
-                        && matches!(
-                            used.access(),
-                            iced_x86::OpAccess::Write
-                                | iced_x86::OpAccess::CondWrite
-                                | iced_x86::OpAccess::ReadWrite
-                                | iced_x86::OpAccess::ReadCondWrite
-                        )
-                });
-                if !writes {
-                    continue;
-                }
-                let constant = (instr.mnemonic() == Mnemonic::Lea
-                    && instr.op0_register() == reg
-                    && instr.is_ip_rel_memory_operand())
-                .then(|| instr.ip_rel_memory_address())?;
-                if value.is_some_and(|v| v != constant) {
-                    return None;
-                }
-                value = Some(constant);
-                defined = true;
-                break;
-            }
-            if !defined {
-                if self.entries.contains(&at) {
-                    return None;
-                }
-                push_preds(at, &mut stack)?;
-            }
+                _ => jump_table::classify(self.image, &trace),
+            };
+            out.insert(jmp.ip(), kind);
         }
-        value
+        out
     }
 
     /// Try every jump decoded since the last round. Returns whether any table was resolved.
@@ -898,24 +904,22 @@ impl<'i, 'a> Discovery<'i, 'a> {
     }
 }
 
+/// `prefix` (synthetic instructions, `true` = a branch known not taken) followed by `trace`.
+fn prefixed<'a>(prefix: &'a [(Instruction, bool)], trace: &[Step<'a>]) -> Vec<Step<'a>> {
+    let mut out: Vec<Step<'a>> = prefix
+        .iter()
+        .map(|(instr, not_taken)| Step {
+            instr,
+            taken: not_taken.then_some(false),
+        })
+        .collect();
+    out.extend(trace.iter().copied());
+    out
+}
+
 /// Slot VA read by a RIP-relative indirect `call`/`jmp`.
 /// `lea reg, [rip+X]` with `ip_rel_memory_address() == va`, decoded from its encoding (`disp32`
 /// 0 at `ip = va - 7`), so the slicer sees exactly what such an instruction in the image would be.
-fn synthetic_rip_lea(reg: iced_x86::Register, va: u64) -> Option<Instruction> {
-    let n = reg.number() as u8;
-    let bytes = [0x48 | ((n >> 3) << 2), 0x8D, ((n & 7) << 3) | 0x05, 0, 0, 0, 0];
-    let mut decoder = Decoder::with_ip(64, &bytes, va.wrapping_sub(7), DecoderOptions::NONE);
-    let instr = decoder.decode();
-    (!instr.is_invalid() && instr.op0_register() == reg && instr.ip_rel_memory_address() == va)
-        .then_some(instr)
-}
-
-/// Win64 volatile (caller-saved) general purpose registers: a call may change them.
-fn is_volatile_register(reg: iced_x86::Register) -> bool {
-    use iced_x86::Register as R;
-    matches!(reg, R::RAX | R::RCX | R::RDX | R::R8 | R::R9 | R::R10 | R::R11)
-}
-
 /// 64-bit general purpose registers (other than `rsp`) the trace reads before it writes them.
 fn live_in_registers(trace: &[Step<'_>]) -> Vec<iced_x86::Register> {
     use iced_x86::OpAccess;
