@@ -1929,14 +1929,20 @@ void pg6_mw_bvh_builder_build_batched_2x(void*, void*, uint32_t, const void*) {}
 
 void pg6_mw_bvh_builder_copy(void*, void*, uint64_t, uint64_t, uint32_t) {}
 
+// The runtime builds no acceleration structures (the build, copy and rehydrate entry points
+// write nothing), so any size is an upper bound for what its build writes. Zero is not usable:
+// the title allocates the result buffer from the reported size and treats a null allocation as
+// fatal (int3). The smallest valid D3D12 size is one alignment unit
+// (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT, 256 bytes) for each buffer.
 void pg6_mw_bvh_builder_get_prebuild_info(void*,
                                           const void*,
                                           const void*,
                                           Pg6D3D12RaytracingPrebuildInfo* out_info) {
+    constexpr uint64_t kMinimumSize = 256u;
     if (out_info != nullptr) {
-        out_info->result_data_max_size_in_bytes = 0u;
-        out_info->scratch_data_size_in_bytes = 0u;
-        out_info->update_scratch_data_size_in_bytes = 0u;
+        out_info->result_data_max_size_in_bytes = kMinimumSize;
+        out_info->scratch_data_size_in_bytes = kMinimumSize;
+        out_info->update_scratch_data_size_in_bytes = kMinimumSize;
     }
 }
 
