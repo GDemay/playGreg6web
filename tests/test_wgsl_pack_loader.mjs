@@ -584,3 +584,351 @@ test('WgslPackCache supports loadPackUrl, pack replacement, and shader-index.jso
   assert.notEqual(modNew, modOld);
   assert.equal(modNew.code, updatedVs);
 });
+
+test('G40 WgslPackCache.registerDynamicShader validates inputs, normalizes hashes, and supports stage checks', () => {
+  const cache = new WgslPackCache();
+  const hashBig = 0x00000000cafebaben;
+  const dynWgsl = '@fragment fn fs_live() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.8, 0.4, 1.0); }';
+
+  // Reject invalid hash, stage, wgslSource, and meta shapes
+  assert.throws(() => cache.registerDynamicShader(-1n, 'fragment', dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader(1n << 64n, 'fragment', dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader('0xzzzz', 'fragment', dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'geometry', dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 0, dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 99, dynWgsl), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, null, dynWgsl), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', ''), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', '   \n\t  '), RangeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', null), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', 123), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, 'bad-meta'), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, []), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, { label: 42 }), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, { entryPoint: 42 }), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, { source: '' }), TypeError);
+  assert.throws(() => cache.registerDynamicShader(hashBig, 'fragment', dynWgsl, { tags: [123] }), TypeError);
+
+  // Register via uppercase unprefixed hex string and uppercase stage name
+  const registered = cache.registerDynamicShader('CAFEBABE', 'FRAGMENT', dynWgsl, {
+    label: 'rdna2-live',
+    entryPoint: 'fs_live',
+    source: 'rdna2-translator',
+    tags: ['live', 'rdna2'],
+  });
+
+  assert.equal(registered.hash, hashBig);
+  assert.equal(registered.hashHex, '0x00000000cafebabe');
+  assert.equal(registered.stage, 'fragment');
+  assert.equal(registered.stageCode, SHADER_STAGE.FRAGMENT);
+  assert.equal(registered.wgsl, dynWgsl);
+  assert.equal(registered.length, new TextEncoder().encode(dynWgsl).byteLength);
+  assert.equal(registered.dynamic, true);
+  assert.equal(registered.overridesStatic, false);
+  assert.equal(registered.label, 'rdna2-live');
+  assert.equal(registered.entryPoint, 'fs_live');
+  assert.equal(registered.source, 'rdna2-translator');
+  assert.deepEqual(registered.tags, ['live', 'rdna2']);
+  assert.equal(registered.revision, 1);
+  assert.equal(typeof registered.registeredAt, 'number');
+
+  // Normalized lookups via BigInt, prefixed hex, unprefixed hex, and safe integer
+  assert.equal(cache.hasDynamicShader(hashBig), true);
+  assert.equal(cache.hasDynamicShader('0x00000000cafebabe', 'fragment'), true);
+  assert.equal(cache.hasDynamicShader('cafebabe', SHADER_STAGE.FRAGMENT), true);
+  assert.equal(cache.hasDynamicShader(0xcafebabe, 'FRAGMENT'), true);
+  assert.equal(cache.hasDynamicShader(hashBig, 'vertex'), false);
+  assert.equal(cache.hasDynamicShader(hashBig, SHADER_STAGE.COMPUTE), false);
+  assert.equal(cache.hasDynamicShader(0x1234n), false);
+  assert.throws(() => cache.hasDynamicShader(hashBig, 'tessellation'), RangeError);
+
+  assert.equal(cache.hasShader(hashBig), true);
+  assert.equal(cache.hasShader(hashBig, 'fragment'), true);
+  assert.equal(cache.hasShader(hashBig, 'vertex'), false);
+
+  const viaLookup = cache.lookup('0xCAFEBABE', 'fragment');
+  assert.equal(viaLookup.wgsl, dynWgsl);
+  assert.equal(viaLookup.dynamic, true);
+  const viaGet = cache.get(hashBig);
+  assert.equal(viaGet.wgsl, dynWgsl);
+  assert.equal(cache.get(hashBig, 'vertex'), undefined);
+
+  const stats = cache.getStats();
+  assert.equal(stats.dynamicCount, 1);
+  assert.equal(stats.staticShaderCount, 0);
+  assert.equal(stats.shaderCount, 1);
+  assert.equal(stats.dynamicOverrideCount, 0);
+  assert.equal(stats.dynamicHits, 2); // viaLookup + viaGet (mismatched stage did not count)
+  assert.deepEqual(stats.dynamicStageCounts, { vertex: 0, fragment: 1, compute: 0 });
+  assert.deepEqual(stats.stageCounts, { vertex: 0, fragment: 1, compute: 0 });
+});
+
+test('G40 WgslPackCache hot-overrides static pack entries safely, evicts stale GPUShaderModules, and restores on clearDynamicShaders', () => {
+  const hVs = fnv1a64('static-vs-override-test');
+  const hFs = fnv1a64('static-fs-untouched');
+  const hDynOnly = fnv1a64('dynamic-only-cs');
+
+  const staticPack = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+
+  const cache = new WgslPackCache({ lazyDecode: true });
+  cache.loadPackBuffer(staticPack, 'boot.wgsl.pack');
+
+  const mock1 = createMockGpuDevice();
+  const mock2 = createMockGpuDevice();
+
+  // Compile static VS on two devices before overriding
+  const staticMod1 = cache.getOrCreateShaderModule(mock1.device, hVs, 'gta6');
+  const staticMod2 = cache.getOrCreateShaderModule(mock2.device, hVs, 'gta6');
+  assert.equal(staticMod1.code, SAMPLE_VS_WGSL);
+  assert.equal(staticMod2.code, SAMPLE_VS_WGSL);
+  assert.equal(cache.getStats().dynamicHits, 0);
+
+  // Attempting to register over a static shader without { override: true } must throw
+  const hotVsV1 =
+    '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.5, 0.5, 0.0, 1.0); }';
+  assert.throws(
+    () => cache.registerDynamicShader(hVs, 'vertex', hotVsV1),
+    /already exists in static pack.*override: true/i
+  );
+  assert.equal(cache.hasDynamicShader(hVs), false);
+  assert.equal(cache.getOrCreateShaderModule(mock1.device, hVs), staticMod1);
+
+  // Register dynamic override with { override: true } -> evicts stale modules on both devices
+  const overrideV1 = cache.registerDynamicShader(hVs, 'vertex', hotVsV1, {
+    override: true,
+    label: 'hotfix-v1',
+    entryPoint: 'vs_main',
+    source: 'hot-patch',
+  });
+  assert.equal(overrideV1.overridesStatic, true);
+  assert.equal(overrideV1.revision, 1);
+  assert.equal(cache.getStats().evictions, 2);
+  assert.equal(cache.getStats().cachedModules, 0);
+
+  // Also register a purely dynamic compute shader (no static entry, override flag not required)
+  const dynCs = '@compute @workgroup_size(8, 8, 1) fn cs_live() {}';
+  cache.registerDynamicShader(hDynOnly, SHADER_STAGE.COMPUTE, dynCs, {
+    label: 'rdna2-cs',
+    source: 'rdna2-translator',
+  });
+
+  // Lookups prioritize dynamic over static, while untouched static shaders still resolve from pack
+  assert.equal(cache.getShaderSource(hVs), hotVsV1);
+  assert.equal(cache.getShaderSource(hFs), SAMPLE_FS_WGSL);
+  assert.equal(cache.getShaderSource(hDynOnly), dynCs);
+
+  // getOrCreateShaderModule compiles the hot-patched WGSL and appends dynamic label
+  const hotMod1 = cache.getOrCreateShaderModule(mock1.device, hVs, 'gta6');
+  assert.notEqual(hotMod1, staticMod1);
+  assert.equal(hotMod1.code, hotVsV1);
+  assert.equal(hotMod1.label, `gta6:vertex:${formatHashHex(hVs)}:hotfix-v1`);
+
+  // Second call hits cache AND increments dynamicHits
+  const hitsBefore = cache.getStats().dynamicHits;
+  const hotMod1Cached = cache.getOrCreateShaderModule(mock1.device, hVs, 'gta6');
+  assert.equal(hotMod1Cached, hotMod1);
+  assert.equal(cache.getStats().dynamicHits, hitsBefore + 1);
+
+  // Hot-patching the dynamic shader again bumps revision and evicts stale dynamic module
+  const hotVsV2 =
+    '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.25, 0.75, 0.0, 1.0); }';
+  const overrideV2 = cache.registerDynamicShader(hVs, 'vertex', hotVsV2, {
+    override: true,
+    label: 'hotfix-v2',
+  });
+  assert.equal(overrideV2.revision, 2);
+  const hotMod2 = cache.getOrCreateShaderModule(mock1.device, hVs, 'gta6');
+  assert.notEqual(hotMod2, hotMod1);
+  assert.equal(hotMod2.code, hotVsV2);
+  assert.equal(hotMod2.label, `gta6:vertex:${formatHashHex(hVs)}:hotfix-v2`);
+
+  // Reloading the static pack preserves active dynamic override and its compiled module
+  const updatedStaticPack = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+  cache.loadPackBuffer(updatedStaticPack, 'boot.wgsl.pack');
+  assert.equal(cache.getOrCreateShaderModule(mock1.device, hVs), hotMod2);
+
+  // Verify stats accounting (2 static + 1 new dynamic + 1 overriding dynamic => 3 distinct shaders)
+  const midStats = cache.getStats();
+  assert.equal(midStats.staticShaderCount, 2);
+  assert.equal(midStats.dynamicCount, 2);
+  assert.equal(midStats.dynamicOverrideCount, 1);
+  assert.equal(midStats.shaderCount, 3);
+  assert.equal(
+    midStats.dynamicPayloadBytes,
+    new TextEncoder().encode(hotVsV2).byteLength + new TextEncoder().encode(dynCs).byteLength
+  );
+  assert.ok(midStats.dynamicHits >= 5);
+
+  // clearDynamicShaders removes all dynamic shaders, evicts their compiled modules, and restores static entries
+  const clearedCount = cache.clearDynamicShaders();
+  assert.equal(clearedCount, 2);
+  assert.equal(cache.hasDynamicShader(hVs), false);
+  assert.equal(cache.hasDynamicShader(hDynOnly), false);
+  assert.equal(cache.hasShader(hDynOnly), false);
+  assert.equal(cache.hasShader(hVs), true);
+  assert.equal(cache.hasShader(hFs), true);
+  assert.equal(cache.getShaderSource(hVs), SAMPLE_VS_WGSL);
+
+  // Next compile uses the restored static pack WGSL
+  const restoredMod = cache.getOrCreateShaderModule(mock1.device, hVs, 'gta6');
+  assert.notEqual(restoredMod, hotMod2);
+  assert.equal(restoredMod.code, SAMPLE_VS_WGSL);
+  assert.equal(restoredMod.label, `gta6:vertex:${formatHashHex(hVs)}`);
+
+  const afterClearStats = cache.getStats();
+  assert.equal(afterClearStats.dynamicCount, 0);
+  assert.equal(afterClearStats.dynamicOverrideCount, 0);
+  assert.equal(afterClearStats.staticShaderCount, 2);
+  assert.equal(afterClearStats.shaderCount, 2);
+
+  // clear({ resetStats: true }) resets dynamicHits too
+  cache.clear({ resetStats: true });
+  assert.equal(cache.getStats().dynamicHits, 0);
+  assert.equal(cache.getStats().dynamicCount, 0);
+});
+
+test('G40 WgslPackCache introspection, unregisterDynamicShader, lazy-decode preservation, and prewarm with dynamic shaders', async () => {
+  const hVs = fnv1a64('inspect-vs');
+  const hFs = fnv1a64('inspect-fs');
+  const hDynCs = fnv1a64('inspect-dyn-cs');
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+
+  const cache = new WgslPackCache({ lazyDecode: true });
+  const pack = cache.loadPackBuffer(packBuf, 'main.wgsl.pack');
+  cache.loadShaderIndex({
+    abi_version: 1,
+    pack: 'main.wgsl.pack',
+    shaders: {
+      [formatHashHex(hVs)]: {
+        stage: 'vertex',
+        wgsl: 'shaders/vs.wgsl',
+        entry_point: 'vs_main',
+      },
+    },
+  });
+
+  const hotVs = '@vertex fn vs_hot() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const liveCs = '@compute @workgroup_size(4) fn cs_hot() {}';
+  cache.registerDynamicShader(hVs, 'vertex', hotVs, {
+    override: true,
+    label: 'vs-override',
+    entryPoint: 'vs_hot',
+    source: 'hot-patch',
+  });
+  cache.registerDynamicShader(hDynCs, 'compute', liveCs, {
+    label: 'cs-live',
+    entryPoint: 'cs_hot',
+    source: 'rdna2-translator',
+  });
+
+  // Introspection must NOT trigger lazy UTF-8 decoding on static pack entries
+  assert.equal(pack.stats().decodedCount, 0);
+  const dynList = cache.listDynamicShaders();
+  assert.equal(dynList.length, 2);
+  assert.equal(dynList[0].wgsl, undefined);
+  assert.equal(cache.listDynamicShaders({ stage: 'compute', includeSource: true })[0].wgsl, liveCs);
+
+  const allActive = cache.listShaders();
+  assert.equal(allActive.length, 3);
+  assert.equal(cache.listShaders({ dynamicOnly: true }).length, 2);
+  assert.equal(cache.listShaders({ staticOnly: true }).length, 2);
+  assert.equal(cache.listShaders({ stage: 'fragment' }).length, 1);
+
+  const staticOnlyVs = cache.listShaders({ staticOnly: true }).find((s) => s.hash === hVs);
+  assert.equal(staticOnlyVs.overriddenByDynamic, true);
+
+  const metaVs = cache.getShaderMetadata(hVs);
+  assert.equal(metaVs.dynamic, true);
+  assert.equal(metaVs.overridesStatic, true);
+  assert.equal(metaVs.entryPoint, 'vs_hot');
+  assert.equal(metaVs.wgslPath, 'shaders/vs.wgsl');
+  assert.equal(metaVs.packName, 'main.wgsl.pack');
+
+  const metaFs = cache.getShaderMetadata(hFs);
+  assert.equal(metaFs.dynamic, false);
+  assert.equal(metaFs.overridesStatic, false);
+
+  // inspect() produces a JSON-serializable snapshot without decoding static payloads
+  const snapshot = cache.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+  assert.deepEqual(snapshot.packNames, ['main.wgsl.pack']);
+  assert.equal(snapshot.shaderIndex.count, 1);
+  assert.equal(snapshot.dynamicShaders.length, 2);
+  assert.equal(pack.stats().decodedCount, 0);
+
+  // prewarm() without an explicit hash list compiles static + dynamic shaders (deduplicated)
+  const mock = createMockGpuDevice();
+  const warm = await cache.prewarm(mock.device);
+  assert.equal(warm.total, 3);
+  assert.equal(warm.compiled, 3);
+  assert.equal(warm.modules.get(hVs).code, hotVs);
+  assert.equal(warm.modules.get(hFs).code, SAMPLE_FS_WGSL);
+  assert.equal(warm.modules.get(hDynCs).code, liveCs);
+
+  // unregisterDynamicShader removes only the targeted override and restores its static fallback
+  assert.equal(cache.unregisterDynamicShader(hVs), true);
+  assert.equal(cache.unregisterDynamicShader(hVs), false);
+  assert.equal(cache.hasDynamicShader(hVs), false);
+  assert.equal(cache.hasDynamicShader(hDynCs), true);
+  assert.equal(cache.getShaderSource(hVs), SAMPLE_VS_WGSL);
+  assert.equal(cache.getOrCreateShaderModule(mock.device, hVs).code, SAMPLE_VS_WGSL);
+});
+
+test('G40 WgslPack supports direct dynamic shader registration, overrides, lookup/get, and stats', () => {
+  const hVs = 0x1111222233334444n;
+  const hNew = 0x5555666677778888n;
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+  ]);
+  const pack = parseWgslPack(packBuf, { lazyDecode: true });
+
+  assert.equal(pack.size, 1);
+  assert.equal(pack.getStats().dynamicCount, 0);
+  assert.equal(pack.getStats().dynamicHits, 0);
+
+  // Static collision without override throws
+  const patchedVs = '@vertex fn vs_patched() -> @builtin(position) vec4<f32> { return vec4<f32>(1.0); }';
+  assert.throws(() => pack.registerDynamicShader(hVs, 'vertex', patchedVs), /override: true/i);
+
+  // Register override + brand-new dynamic shader
+  pack.registerDynamicShader(hVs, 'vertex', patchedVs, { override: true, label: 'pack-patch' });
+  pack.registerDynamicShader(hNew, 'compute', SAMPLE_CS_WGSL, { source: 'rdna2-translator' });
+
+  assert.equal(pack.size, 2);
+  assert.equal(pack.has(hNew), true);
+  assert.equal(pack.hasDynamicShader(hVs, 'vertex'), true);
+  assert.equal(pack.hasDynamicShader(hVs, 'fragment'), false);
+  assert.equal(pack.hasDynamicShader(hNew, SHADER_STAGE.COMPUTE), true);
+
+  assert.equal(pack.lookup(hVs, 'vertex').wgsl, patchedVs);
+  assert.equal(pack.get(hNew, 'compute').wgsl, SAMPLE_CS_WGSL);
+  assert.equal(pack.get(hNew, 'vertex'), undefined);
+  assert.equal(pack.getSource(hVs), patchedVs);
+  assert.equal(pack.listDynamicShaders().length, 2);
+
+  // Static pack table stays untouched and un-decoded
+  assert.equal(pack.listEntries().length, 1);
+  assert.equal(pack.getStats().decodedCount, 0);
+  assert.equal(pack.getStats().dynamicCount, 2);
+  assert.equal(pack.getStats().dynamicOverrideCount, 1);
+  assert.equal(pack.getStats().dynamicHits, 3);
+
+  // Clearing dynamic shaders restores static entry cleanly
+  assert.equal(pack.clearDynamicShaders(), 2);
+  assert.equal(pack.size, 1);
+  assert.equal(pack.has(hNew), false);
+  assert.equal(pack.hasDynamicShader(hVs), false);
+  assert.equal(pack.getSource(hVs), SAMPLE_VS_WGSL);
+  assert.equal(pack.getStats().dynamicCount, 0);
+});
