@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const { WgpuCommandProcessor, OPCODES } = require('../web/workers/wgpu_worker.js');
@@ -11,6 +12,9 @@ const {
   clampViewportToTarget,
   clampScissorToTarget,
   decodeRenderPipelineKey,
+  resolveShaderEntryPoint,
+  findWgslStageEntryPoints,
+  validateVertexBufferLayouts,
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
 } = rs;
@@ -1080,4 +1084,438 @@ test('G33 offscreen texture attachment bounds clamp viewport/scissor for color, 
     [512, 512, 512, 512],
     [0, 0, 1280, 800],
   ]);
+});
+
+// ---------------------------------------------------------------------------------------------
+// W81: Frame-1 WebGPU pipeline hardening (entry points, root-sig group-0 layouts, depth24+s8)
+// ---------------------------------------------------------------------------------------------
+
+function buildFrame1PipelineKey({
+  colorFormat = 22, // rgba8unorm
+  depthFormat = 47, // depth24plus-stencil8
+  depthWriteEnabled = 0,
+  depthCompare = 0, // 0 = disabled / unset -> must default to 'always'
+  multisampleCount = 0, // 0 -> must default to 1
+} = {}) {
+  const key = new Uint8Array(376);
+  const v = new DataView(key.buffer);
+  // Color target 0: rgba8unorm, blend off, writeMask 0xf
+  v.setUint32(20, 1, true);
+  key.set([colorFormat, 0, 0x0f, 0], 24);
+  // Depth-stencil state
+  key[120] = depthFormat;
+  key[121] = depthWriteEnabled;
+  key[122] = depthCompare;
+  // Primitive: triangle-list (0), no strip index, ccw (0), cull none (0)
+  key.set([0, 0, 0, 0, 0], 152);
+  // Multisample
+  v.setUint32(160, multisampleCount, true);
+  v.setUint32(164, 0xffffffff, true);
+  key[168] = 0;
+  // Vertex layout: 1 buffer, 24B stride, 3 attributes:
+  //   loc 0: float32x3 (30) @ 0
+  //   loc 1: unorm8x4  (9)  @ 12
+  //   loc 2: float32x2 (29) @ 16
+  v.setUint32(172, 1, true); // vertex_buffer_count
+  v.setUint32(176, 3, true); // vertex_attribute_count
+  v.setUint32(180, 24, true); // buffer[0].array_stride
+  key.set([1, 3], 184); // step_mode = vertex (1), attribute_count = 3
+  // attr 0: offset 0, format 30 (float32x3), loc 0, buf 0
+  v.setUint32(244, 0, true);
+  key.set([30, 0, 0], 248);
+  // attr 1: offset 12, format 9 (unorm8x4), loc 1, buf 0
+  v.setUint32(252, 12, true);
+  key.set([9, 1, 0], 256);
+  // attr 2: offset 16, format 29 (float32x2), loc 2, buf 0
+  v.setUint32(260, 16, true);
+  key.set([29, 2, 0], 264);
+  return key;
+}
+
+test('W81 Frame-1 CreateRenderPipeline2 produces WebGPU-spec-valid rgba8unorm + depth24plus-stencil8 + 24B 3-attribute descriptor', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const frame1Key = buildFrame1PipelineKey({
+    colorFormat: 22, // rgba8unorm
+    depthFormat: 47, // depth24plus-stencil8
+    depthWriteEnabled: 0,
+    depthCompare: 0, // disabled -> must become 'always', never undefined
+    multisampleCount: 0, // unset -> must become 1
+  });
+  const depth32OffKey = buildFrame1PipelineKey({
+    colorFormat: 22,
+    depthFormat: 48, // depth32float
+    depthWriteEnabled: 0,
+    depthCompare: 0,
+    multisampleCount: 1,
+  });
+  const stencilOnlyKey = buildFrame1PipelineKey({
+    colorFormat: 22,
+    depthFormat: 44, // stencil8
+    depthWriteEnabled: 1, // illegal on stencil8 -> must clamp to false
+    depthCompare: 0,
+    multisampleCount: 1,
+  });
+
+  const stream = concat(
+    new Stream()
+      .shader(
+        1,
+        0,
+        '@vertex fn vs_main(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>, @location(2) uv: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 1.0); }'
+      )
+      .shader(2, 1, '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }')
+      .bytes(),
+    renderPipeline2Packet(10, 1, 2, 0, frame1Key),
+    renderPipeline2Packet(11, 1, 2, 0, depth32OffKey),
+    renderPipeline2Packet(12, 1, 2, 0, stencilOnlyKey)
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const pipelines = gpu.results('createRenderPipeline');
+  assert.equal(pipelines.length, 3);
+
+  const d0 = pipelines[0].desc;
+  assert.equal(d0.layout, 'auto');
+  assert.equal(d0.vertex.entryPoint, 'vs_main');
+  assert.equal(d0.fragment.entryPoint, 'fs_main');
+  assert.deepEqual(d0.primitive, { topology: 'triangle-list', frontFace: 'ccw', cullMode: 'none' });
+  assert.deepEqual(d0.multisample, { count: 1, mask: 0xffffffff, alphaToCoverageEnabled: false });
+  assert.deepEqual(d0.fragment.targets, [{ format: 'rgba8unorm', writeMask: 0x0f }]);
+  assert.deepEqual(d0.vertex.buffers, [
+    {
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [
+        { format: 'float32x3', offset: 0, shaderLocation: 0 },
+        { format: 'unorm8x4', offset: 12, shaderLocation: 1 },
+        { format: 'float32x2', offset: 16, shaderLocation: 2 },
+      ],
+    },
+  ]);
+  assert.equal(d0.depthStencil.format, 'depth24plus-stencil8');
+  assert.strictEqual(d0.depthStencil.depthWriteEnabled, false);
+  assert.strictEqual(d0.depthStencil.depthCompare, 'always');
+  assert.deepEqual(d0.depthStencil.stencilFront, {
+    compare: 'always',
+    failOp: 'keep',
+    depthFailOp: 'keep',
+    passOp: 'keep',
+  });
+  assert.deepEqual(d0.depthStencil.stencilBack, {
+    compare: 'always',
+    failOp: 'keep',
+    depthFailOp: 'keep',
+    passOp: 'keep',
+  });
+
+  // depth32float depth-off also receives depthCompare: 'always' and boolean depthWriteEnabled: false
+  const d1 = pipelines[1].desc;
+  assert.equal(d1.depthStencil.format, 'depth32float');
+  assert.strictEqual(d1.depthStencil.depthWriteEnabled, false);
+  assert.strictEqual(d1.depthStencil.depthCompare, 'always');
+
+  // stencil8 clamps depthWriteEnabled to false and omits depthCompare
+  const d2 = pipelines[2].desc;
+  assert.equal(d2.depthStencil.format, 'stencil8');
+  assert.strictEqual(d2.depthStencil.depthWriteEnabled, false);
+  assert.equal('depthCompare' in d2.depthStencil, false);
+
+  assert.equal(handler.telemetry.depthCompareDefaults, 2);
+  assert.equal(handler.telemetry.autoLayoutFallbacks, 3);
+  assert.equal(handler.telemetry.legacyEntryPointRemaps, 0);
+});
+
+test('W81 validateVertexBufferLayouts validates Frame-1 24B layout and rejects invalid/dropped layouts', () => {
+  assert.deepEqual(
+    validateVertexBufferLayouts([
+      {
+        arrayStride: 24,
+        stepMode: 'vertex',
+        attributes: [
+          { format: 'float32x3', offset: 0, shaderLocation: 0 },
+          { format: 'unorm8x4', offset: 12, shaderLocation: 1 },
+          { format: 'float32x2', offset: 16, shaderLocation: 2 },
+        ],
+      },
+    ]),
+    { valid: true }
+  );
+
+  // Unaligned stride (not multiple of 4)
+  assert.equal(
+    validateVertexBufferLayouts([
+      { arrayStride: 22, stepMode: 'vertex', attributes: [{ format: 'float32x3', offset: 0, shaderLocation: 0 }] },
+    ]).valid,
+    false
+  );
+
+  // Attribute extends past arrayStride
+  assert.equal(
+    validateVertexBufferLayouts([
+      { arrayStride: 16, stepMode: 'vertex', attributes: [{ format: 'float32x2', offset: 12, shaderLocation: 0 }] },
+    ]).valid,
+    false
+  );
+
+  // Duplicate shaderLocation
+  assert.equal(
+    validateVertexBufferLayouts([
+      {
+        arrayStride: 24,
+        stepMode: 'vertex',
+        attributes: [
+          { format: 'float32x3', offset: 0, shaderLocation: 1 },
+          { format: 'float32x2', offset: 12, shaderLocation: 1 },
+        ],
+      },
+    ]).valid,
+    false
+  );
+
+  // Orphaned attribute (bufferIndex points to unused slot) is rejected instead of silently dropped
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = installRenderStatePackets(processor);
+  const badKey = buildFrame1PipelineKey();
+  badKey[266] = 3; // attr 2 bufferIndex = 3 (>= bufferCount 1)
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().shader(1, 0, '@vertex fn vs_main() {}').shader(2, 1, '@fragment fn fs_main() {}').bytes(),
+      renderPipeline2Packet(99, 1, 2, 0, badKey)
+    )
+  );
+  assert.equal(handler.stats.errors, 1);
+  assert.match(handler.lastError, /dropped attributes/);
+  assert.equal(gpu.results('createRenderPipeline').length, 0);
+});
+
+test('W81 entry point resolution defaults to fs_main and remaps legacy ps_main with sanitized telemetry', () => {
+  // Pure unit checks for WGSL comment stripping and stage matching
+  const commentedWgsl = [
+    '// @fragment fn commented_out() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }',
+    '/* @fragment /* nested */ fn block_commented() {} */',
+    'fn helper_color() -> vec4<f32> { return vec4<f32>(1.0); }',
+    '@fragment',
+    'fn ps_main() -> @location(0) vec4<f32> { return helper_color(); }',
+  ].join('\n');
+  assert.deepEqual(findWgslStageEntryPoints(commentedWgsl, 'fragment'), ['ps_main']);
+  assert.deepEqual(
+    resolveShaderEntryPoint({ code: commentedWgsl }, 'fragment'),
+    { entryPoint: 'ps_main', defaultEntryPoint: 'fs_main', remapped: true, reason: 'source-inspect' }
+  );
+  // Stale metadata claiming fs_main when WGSL only declares ps_main is corrected to ps_main
+  assert.deepEqual(
+    resolveShaderEntryPoint({ code: commentedWgsl, entryPoint: 'fs_main' }, 'fragment'),
+    { entryPoint: 'ps_main', defaultEntryPoint: 'fs_main', remapped: true, reason: 'source-override' }
+  );
+  // Standard fs_main is NOT remapped
+  assert.deepEqual(
+    resolveShaderEntryPoint({ code: '@fragment fn fs_main() {}', entryPoint: 'fs_main' }, 'fragment'),
+    { entryPoint: 'fs_main', defaultEntryPoint: 'fs_main', remapped: false, reason: 'default' }
+  );
+
+  // End-to-end through CreateRenderPipeline2 & CreateComputePipeline2
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+  const key = buildFrame1PipelineKey();
+
+  // Case 1: Standard vs_main / fs_main -> zero remaps
+  processor.executeCommandBuffer(
+    concat(
+      new Stream()
+        .shader(1, 0, '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }')
+        .shader(2, 1, '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }')
+        .bytes(),
+      renderPipeline2Packet(10, 1, 2, 0, key)
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createRenderPipeline')[0].desc.fragment.entryPoint, 'fs_main');
+  assert.equal(handler.telemetry.legacyEntryPointRemaps, 0);
+  assert.equal(handler.getTelemetry().warnings.length, 0);
+
+  // Case 2: Legacy pack fragment shader with `@fragment fn ps_main`
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().shader(3, 1, commentedWgsl).bytes(),
+      renderPipeline2Packet(11, 1, 3, 0, key)
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createRenderPipeline')[1].desc.vertex.entryPoint, 'vs_main');
+  assert.equal(gpu.results('createRenderPipeline')[1].desc.fragment.entryPoint, 'ps_main');
+  assert.equal(handler.telemetry.legacyEntryPointRemaps, 1);
+  assert.equal(handler.getStats().legacyEntryPointRemaps, 1);
+
+  // Case 3: Shader module carrying explicit entryPoint metadata without WGSL source
+  const metaMod = gpu.device.createShaderModule({ code: '' });
+  processor.shaderModules.set(4, { module: metaMod, stage: 1, entryPoint: 'ps_main' });
+  processor.executeCommandBuffer(renderPipeline2Packet(12, 1, 4, 0, key));
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createRenderPipeline')[2].desc.fragment.entryPoint, 'ps_main');
+  assert.equal(handler.telemetry.legacyEntryPointRemaps, 2);
+
+  // Case 4: Legacy compute shader `@compute @workgroup_size(8, 8, 1) fn main()`
+  const compPayload = new Uint8Array(32);
+  const cv = new DataView(compPayload.buffer);
+  cv.setUint32(0, 20, true);
+  cv.setUint32(4, 5, true);
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().shader(5, 2, '@compute @workgroup_size(8, 8, 1) fn main() {}').bytes(),
+      header(V2_OPCODES.CREATE_COMPUTE_PIPELINE2, compPayload)
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createComputePipeline')[0].desc.compute.entryPoint, 'main');
+  assert.equal(handler.telemetry.legacyEntryPointRemaps, 3);
+
+  // Warnings are sanitized (no raw WGSL or file paths)
+  const warnings = handler.getTelemetry().warnings;
+  assert.equal(warnings.length, 3);
+  assert.match(warnings[0], /stage=fragment default=fs_main resolved=ps_main/);
+  assert.match(warnings[1], /stage=fragment default=fs_main resolved=ps_main/);
+  assert.match(warnings[2], /stage=compute default=cs_main resolved=main/);
+  for (const w of warnings) {
+    assert.equal(w.includes('helper_color'), false);
+    assert.equal(w.includes('file://'), false);
+  }
+});
+
+test('W81 root-signature group-0 sequential binding layouts (cb0@0, tex0@1, samp0@2, non-filtering, storage) + auto fallback', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+  const key = buildFrame1PipelineKey();
+
+  // Matches runtime commit 91ad39f layout_from_root_signature: single group @group(0),
+  // sequential bindings 0..4, tagged Vertex|Fragment (0x3).
+  const rootSigEntries = [
+    { binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 0 }, // cb0: uniform buffer
+    { binding: 1, visibility: 3, type: 2, subtype: 0, dimension: 2 }, // tex0: sampled 2D float texture
+    { binding: 2, visibility: 3, type: 1, subtype: 0 }, // samp0: filtering sampler
+    { binding: 3, visibility: 3, type: 1, subtype: 1 }, // samp1: non-filtering sampler
+    { binding: 4, visibility: 3, type: 0, subtype: 1, minBindingSize: 0 }, // uav0: storage buffer (VERTEX bit must strip to FRAGMENT 0x2!)
+  ];
+
+  const stream = concat(
+    new Stream()
+      .shader(1, 0, '@vertex fn vs_main() {}')
+      .shader(2, 1, '@fragment fn fs_main() {}')
+      .buffer(100, 0x0040 | 0x0008, 256) // cb0
+      .texture(101, 64, 64, 0, 0x04) // tex0
+      .buffer(104, 0x0080 | 0x0008, 256) // uav0
+      .bytes(),
+    header(
+      V2_OPCODES.CREATE_SAMPLER2,
+      (() => {
+        const p = new Uint8Array(24);
+        const dv = new DataView(p.buffer);
+        dv.setUint32(0, 102, true); // samp0 filtering
+        p.set([0, 0, 0, 1, 1, 1, 0], 4);
+        dv.setUint16(12, 1, true);
+        dv.setFloat32(16, 0, true);
+        dv.setFloat32(20, 32, true);
+        return p;
+      })()
+    ),
+    header(
+      V2_OPCODES.CREATE_SAMPLER2,
+      (() => {
+        const p = new Uint8Array(24);
+        const dv = new DataView(p.buffer);
+        dv.setUint32(0, 103, true); // samp1 non-filtering
+        p.set([0, 0, 0, 0, 0, 0, 0], 4);
+        dv.setUint16(12, 1, true);
+        dv.setFloat32(16, 0, true);
+        dv.setFloat32(20, 32, true);
+        return p;
+      })()
+    ),
+    bindGroupLayoutPacket(200, rootSigEntries),
+    pipelineLayoutPacket(201, [200]), // single @group(0) pipeline layout
+    renderPipeline2Packet(300, 1, 2, 201, key), // explicit root-sig layout
+    renderPipeline2Packet(301, 1, 2, 0, key), // layout: 'auto' fallback
+    bindGroup2Packet(400, 200, [
+      { binding: 0, type: 0, id: 100, offset: 0, size: 256 },
+      { binding: 1, type: 1, id: 101 },
+      { binding: 2, type: 2, id: 102 },
+      { binding: 3, type: 2, id: 103 },
+      { binding: 4, type: 0, id: 104, offset: 0, size: 256 },
+    ])
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const [bgl] = gpu.results('createBindGroupLayout');
+  assert.deepEqual(bgl.desc.entries, [
+    { binding: 0, visibility: 3, buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 0 } },
+    { binding: 1, visibility: 3, texture: { sampleType: 'float', viewDimension: '2d', multisampled: false } },
+    { binding: 2, visibility: 3, sampler: { type: 'filtering' } },
+    { binding: 3, visibility: 3, sampler: { type: 'non-filtering' } },
+    { binding: 4, visibility: 2, buffer: { type: 'storage', hasDynamicOffset: false, minBindingSize: 0 } },
+  ]);
+  const [pl] = gpu.results('createPipelineLayout');
+  assert.deepEqual(pl.desc, { bindGroupLayouts: [bgl.result] });
+
+  const pipelines = gpu.results('createRenderPipeline');
+  assert.equal(pipelines.length, 2);
+  assert.equal(pipelines[0].desc.layout, pl.result);
+  assert.equal(pipelines[1].desc.layout, 'auto');
+  assert.equal(pipelines[0].desc.vertex.buffers[0].attributes.length, 3);
+  assert.equal(handler.telemetry.rootSigGroup0Layouts, 1);
+  assert.equal(handler.telemetry.autoLayoutFallbacks, 1);
+
+  const [bg] = gpu.results('createBindGroup');
+  assert.equal(bg.desc.layout, bgl.result);
+  assert.deepEqual(
+    bg.desc.entries.map((e) => e.binding),
+    [0, 1, 2, 3, 4]
+  );
+
+  // Duplicate binding numbers in CreateBindGroupLayout are rejected cleanly
+  processor.executeCommandBuffer(
+    bindGroupLayoutPacket(202, [
+      { binding: 0, visibility: 3, type: 0, subtype: 0 },
+      { binding: 0, visibility: 2, type: 1, subtype: 0 },
+    ])
+  );
+  assert.equal(handler.stats.errors, 1);
+  assert.match(handler.lastError, /duplicate binding 0/);
+});
+
+test('W81 G31 render_state_packets.js has zero ES module syntax and reloads cleanly in classic Worker VM', () => {
+  const source = repoFile('web/workers/render_state_packets.js');
+  assert.equal(/^\s*(?:import|export)\b/m.test(source), false, 'must have zero top-level ES import/export syntax');
+
+  const sandbox = { console };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, ctx, { filename: 'render_state_packets.js' });
+    // Simulate a second importScripts('./render_state_packets.js') call in the same WorkerGlobalScope
+    vm.runInContext(source, ctx, { filename: 'render_state_packets.js' });
+  });
+
+  assert.ok(ctx.PlayGta6RenderState, 'PlayGta6RenderState must be published on WorkerGlobalScope');
+  assert.equal(typeof ctx.PlayGta6RenderState.installRenderStatePackets, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.resolveShaderEntryPoint, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.validateVertexBufferLayouts, 'function');
+
+  // Verify zero leaked top-level lexical declarations
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      'const TEXTURE_FORMAT_NAMES = []; const DEFAULT_ENTRY_POINTS = {}; class RenderStatePackets {}',
+      ctx
+    );
+  });
 });
