@@ -605,6 +605,34 @@ function sanitizeFrameStats(eventData) {
     frameStats.drawCalls = toNonNegativeInt(drawCallsSrc, 0);
   }
 
+  const realPackDrawCountSrc =
+    rawFrameStats &&
+    rawFrameStats.realPackDrawCount !== undefined &&
+    rawFrameStats.realPackDrawCount !== null
+      ? rawFrameStats.realPackDrawCount
+      : rawStats &&
+          rawStats.realPackDrawCount !== undefined &&
+          rawStats.realPackDrawCount !== null
+        ? rawStats.realPackDrawCount
+        : eventData.realPackDrawCount;
+  if (realPackDrawCountSrc !== undefined && realPackDrawCountSrc !== null) {
+    frameStats.realPackDrawCount = toNonNegativeInt(realPackDrawCountSrc, 0);
+  }
+
+  const fallbackDrawCountSrc =
+    rawFrameStats &&
+    rawFrameStats.fallbackDrawCount !== undefined &&
+    rawFrameStats.fallbackDrawCount !== null
+      ? rawFrameStats.fallbackDrawCount
+      : rawStats &&
+          rawStats.fallbackDrawCount !== undefined &&
+          rawStats.fallbackDrawCount !== null
+        ? rawStats.fallbackDrawCount
+        : eventData.fallbackDrawCount;
+  if (fallbackDrawCountSrc !== undefined && fallbackDrawCountSrc !== null) {
+    frameStats.fallbackDrawCount = toNonNegativeInt(fallbackDrawCountSrc, 0);
+  }
+
   const computeSrc =
     rawFrameStats && rawFrameStats.computeDispatches !== undefined
       ? rawFrameStats.computeDispatches
@@ -615,14 +643,30 @@ function sanitizeFrameStats(eventData) {
     frameStats.computeDispatches = toNonNegativeInt(computeSrc, 0);
   }
 
-  const packetSrc =
-    rawFrameStats && rawFrameStats.packetCount !== undefined
+  const packetCountSrc =
+    rawFrameStats && rawFrameStats.packetCount !== undefined && rawFrameStats.packetCount !== null
       ? rawFrameStats.packetCount
-      : rawStats && rawStats.packetCount !== undefined
+      : rawStats && rawStats.packetCount !== undefined && rawStats.packetCount !== null
         ? rawStats.packetCount
-        : eventData.packetCount;
+        : eventData.packetCount !== undefined && eventData.packetCount !== null
+          ? eventData.packetCount
+          : undefined;
+  const packetsProcessedSrc =
+    rawFrameStats &&
+    rawFrameStats.packetsProcessed !== undefined &&
+    rawFrameStats.packetsProcessed !== null
+      ? rawFrameStats.packetsProcessed
+      : rawStats && rawStats.packetsProcessed !== undefined && rawStats.packetsProcessed !== null
+        ? rawStats.packetsProcessed
+        : eventData.packetsProcessed !== undefined && eventData.packetsProcessed !== null
+          ? eventData.packetsProcessed
+          : undefined;
+  const packetSrc = packetCountSrc !== undefined ? packetCountSrc : packetsProcessedSrc;
   if (packetSrc !== undefined && packetSrc !== null) {
     frameStats.packetCount = toNonNegativeInt(packetSrc, 0);
+  }
+  if (packetsProcessedSrc !== undefined) {
+    frameStats.packetsProcessed = toNonNegativeInt(packetsProcessedSrc, 0);
   }
 
   const vramSrc =
