@@ -76,6 +76,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Add the missing fields to the harness's report JSON (additive, versioned) and make the comparison tool use them.
 - [x] **R43 — One-Command Native Boot Runner (`tools/run_native_boot.py`)** — `DONE` (PR #681, closes #680)
   - Rebuild only what is stale, boot with named presets, collect the run folder and compare against a baseline.
+- [ ] **R44 — Recompile the Title's Bink Video Library Instead of Shimming It, So Splash and Intro Movies Decode** — `IN PROGRESS` (#699, @Timon-ok)
+  - Recompile the packaged Bink module like the runtime DLLs, bind its exports as guest code ahead of the shims, and get the first decoded frames of the splash movie.
 
 ---
 
