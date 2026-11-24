@@ -20,6 +20,7 @@ import mimetypes
 import os
 import posixpath
 import re
+import sys
 from datetime import timezone
 from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
@@ -32,6 +33,12 @@ from urllib.parse import unquote, urlsplit
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
 BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
+
+CLIENT_DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
 
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("text/javascript", ".js")
@@ -467,8 +474,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if send_body:
             try:
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            except CLIENT_DISCONNECT_ERRORS:
+                return
 
     def _serve_file(self, url_path: str, send_body: bool) -> None:
         resolved = self._resolve_target(url_path)
@@ -550,8 +557,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except CLIENT_DISCONNECT_ERRORS:
+            return
 
     def _dispatch(self, send_body: bool) -> None:
         url_path = urlsplit(self.path).path
@@ -567,6 +574,16 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self._dispatch(send_body=False)
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that suppresses noisy tracebacks on client disconnects."""
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_DISCONNECT_ERRORS):
+            return
+        super().handle_error(request, client_address)
+
+
 def create_server(
     host: str,
     port: int,
@@ -576,7 +593,7 @@ def create_server(
     game_root: Path | None = None,
     shaders_root: Path | None = None,
     boot_root: Path | None = None,
-) -> ThreadingHTTPServer:
+) -> QuietThreadingHTTPServer:
     handler = partial(
         PlayGta6Handler,
         web_root=web_root,
@@ -585,7 +602,7 @@ def create_server(
         shaders_root=shaders_root,
         boot_root=boot_root,
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return QuietThreadingHTTPServer((host, port), handler)
 
 
 def _load_dotenv_value(repo_root: Path, key: str) -> str | None:
