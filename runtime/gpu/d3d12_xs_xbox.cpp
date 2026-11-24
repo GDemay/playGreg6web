@@ -567,7 +567,7 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         uint64_t after = pacer_now;
         if (type == 2 && in != 0) {
             const uint64_t completed = last_present_token.load(std::memory_order_acquire);
-            after = (completed != 0 && in <= completed) ? 0ull : std::min(in, pacer_now);
+            after = (completed != 0 && in <= completed) ? uint64_t{0} : std::min(in, pacer_now);
         }
         const auto started = std::chrono::steady_clock::now();
         const auto r = pacer_.wait_after(after, timeout_ms, &frame);
@@ -708,7 +708,7 @@ PreparedComputeShader prepare_compute_shader(Device& dev, const GuestComputePipe
     if (pack == nullptr || prep.cs_identity == 0) {
         return prep;
     }
-    for (uint64_t k : {prep.native_cs.identity != 0 ? prep.native_cs.code_identity : 0ull, prep.cs_identity}) {
+    for (uint64_t k : {prep.native_cs.identity != 0 ? prep.native_cs.code_identity : uint64_t{0}, prep.cs_identity}) {
         auto it = k != 0 ? pack->find(k) : pack->end();
         if (it != pack->end() && it->second == PackStage::Compute) {
             prep.pack_key = k;
