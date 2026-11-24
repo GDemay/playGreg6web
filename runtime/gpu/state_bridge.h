@@ -202,6 +202,8 @@ public:
     d3d::DescriptorHeapRegistry& heaps() noexcept { return heaps_; }
     const BridgeOptions& options() const noexcept { return options_; }
     uint32_t allocate_id() { return options_.id_allocator(); }
+    // The registered description of texture `resource_id` (false if it is not a texture).
+    bool texture_info(uint32_t resource_id, TextureInfo* out) const;
 
 private:
     friend class CommandListBridge;
@@ -222,7 +224,6 @@ private:
         bool emitted = false;
     };
 
-    bool texture_info(uint32_t resource_id, TextureInfo* out) const;
     uint32_t intern_view(const ViewRecord& record) const;
     bool resolve_view_descriptor(uint64_t cpu_handle, d3d::DescriptorKind kind, d3d::ViewDescriptor* out) const;
     PipelineLayoutRecord* find_layout(uint64_t first_shader, uint64_t second_shader);

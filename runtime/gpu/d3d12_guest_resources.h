@@ -313,6 +313,26 @@ private:
     PipelineState* compute_pso_ = nullptr;   // current compute PSO
     std::vector<com::Ref<com::ComObject>> pinned_;  // objects referenced by the recording
     std::vector<DeferredWrite> deferred_;
+    // What is bound for graphics, kept for describing skipped draws (describe_skipped_draw).
+    struct RootArgRecord {
+        uint8_t kind = 0;  // 0 unset, 1 descriptor table, 2 constants, 3 CBV, 4 SRV, 5 UAV
+        uint32_t count = 0;
+        uint64_t value = 0;  // table: GPU handle; root descriptors: GPU VA
+    };
+    std::array<RootArgRecord, 64> graphics_root_args_{};
+    struct VertexBufferRecord {
+        uint64_t va = 0;
+        uint32_t size = 0;
+        uint32_t stride = 0;
+    };
+    std::array<VertexBufferRecord, 32> vertex_buffers_{};
+    VertexBufferRecord index_buffer_{};  // stride = DXGI format
+    std::vector<uint64_t> rtv_handles_;
+    uint64_t dsv_handle_ = 0;
+    void record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count);
+    const d3d::RootSignature* graphics_root_signature_ = nullptr;
+    void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
+    void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);
     struct ImmediateWrite {
         uint64_t address = 0;
         uint64_t value = 0;
