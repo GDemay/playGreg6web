@@ -70,8 +70,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
 - [ ] **R40 — Real-Binary Boot, Phase 5: Past the Start Screen — Steady State, Scripted Input, Next Blockers** — `IN PROGRESS` (#663, @Timon-ok) *(continues R32)*
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
-- [ ] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `IN PROGRESS` (#670, @Timon-ok)
+- [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
+- [ ] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `IN PROGRESS` (#673, @Timon-ok) *(R41 follow-up)*
+  - Add the missing fields to the harness's report JSON (additive, versioned) and make the comparison tool use them.
 
 ---
 
