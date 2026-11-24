@@ -433,6 +433,9 @@ void test_boot_links_and_runs_a_program(VirtualMemoryArena& arena) {
     CHECK(pb.config.export_thunks.size() == 2 && pb.config.export_thunks.data() == kExports);
     CHECK(pb.config.modules.size() == 3);
     CHECK(pb.config.modules[0].name == "game.exe" && pb.config.modules[1].name == "b.dll");
+    CHECK(pb.config.modules[0].shard_dispatch_tables.empty());
+    CHECK(pb.config.modules[1].shard_dispatch_tables.empty());
+    CHECK(pb.config.modules[2].shard_dispatch_tables.empty());
     CHECK(pb.config.call_dll_entry_points && pb.config.after_load);
     CHECK(pb.exception_imports == 1);
     const BootImport& capture = pb.config.modules[0].imports[1];
@@ -681,6 +684,127 @@ void test_memory_model(VirtualMemoryArena& arena) {
     CHECK(!window::contiguous_runs_required() && !window::enabled());
 }
 
+// R37c: Pg6ProgramModule::shard_dispatch forwards into BootModule::shard_dispatch_tables and runs
+// a multi-module program (TLS callback, DllMain, cross-module IAT, host imports, export thunks)
+// with zero per-function lifted tables, as well as mixed legacy + shard modules.
+void prog_shard_b(uint32_t local_idx, Pg6GuestState* s) {
+    switch (local_idx) {
+        case 0: b_fb(s); return;
+        case 1: b_f3(s); return;
+        case 2: b_dllmain(s); return;
+        case 3: b_tls_callback(s); return;
+        default: __playgta6_trap(s, kB + kText);
+    }
+}
+
+void prog_shard_a(uint32_t local_idx, Pg6GuestState* s) {
+    switch (local_idx) {
+        case 0: a_fa(s); return;
+        case 1: a_dllmain(s); return;
+        default: __playgta6_trap(s, kA + kText);
+    }
+}
+
+void prog_shard_e(uint32_t local_idx, Pg6GuestState* s) {
+    switch (local_idx) {
+        case 0: e_main(s); return;
+        default: __playgta6_trap(s, kE + kText);
+    }
+}
+
+void test_shard_dispatch_program(VirtualMemoryArena& arena) {
+    (void)arena;
+    static const Pg6ShardDispatchFn kShardsB[] = {&prog_shard_b};
+    static const Pg6ShardFunctionEntry kEntriesB[] = {
+        {kB + kText, 0u, 0u},
+        {kB + kText + 0x10, 0u, 1u},
+        {kB + kText + 0x100, 0u, 2u},
+        {kB + kText + 0x200, 0u, 3u},
+    };
+    static const Pg6ShardDispatchTable kShardTableB{
+        kPg6ShardDispatchVersion, 1u, 4u, kShardsB, kEntriesB,
+    };
+
+    static const Pg6ShardDispatchFn kShardsA[] = {&prog_shard_a};
+    static const Pg6ShardFunctionEntry kEntriesA[] = {
+        {kA + kText, 0u, 0u},
+        {kA + kText + 0x100, 0u, 1u},
+    };
+    static const Pg6ShardDispatchTable kShardTableA{
+        kPg6ShardDispatchVersion, 1u, 2u, kShardsA, kEntriesA,
+    };
+
+    static const Pg6ShardDispatchFn kShardsE[] = {&prog_shard_e};
+    static const Pg6ShardFunctionEntry kEntriesE[] = {{kE + kText, 0u, 0u}};
+    static const Pg6ShardDispatchTable kShardTableE{
+        kPg6ShardDispatchVersion, 1u, 1u, kShardsE, kEntriesE,
+    };
+
+    const auto b = container(spec_b());
+    const auto a = container(spec_a());
+
+    // All modules using Pg6ShardDispatchTable only (null lifted_functions).
+    {
+        const Pg6ProgramModule modules[] = {
+            {"b.dll", "b", kB, kSize, kB + kText + 0x100, kPg6ProgramModuleDll | kPg6ProgramModuleTls,
+             0, nullptr, nullptr, nullptr, nullptr, &kShardTableB},
+            {"A.DLL", "a", kA, kSize, kA + kText + 0x100, kPg6ProgramModuleDll, 0, nullptr, nullptr,
+             &kImportsAPtr, &kImportsACount, &kShardTableA},
+            {"game.exe", "main", kE, kSize, kE + kText, kPg6ProgramModuleMain, 0, nullptr, nullptr,
+             &kImportsEPtr, &kImportsECount, &kShardTableE},
+        };
+        const Pg6Program program{kPg6ProgramVersion, 3, modules, &kExportsPtr, &kExportCount};
+        ProgramBoot pb;
+        CHECK_CODE(prepare_program_boot(program,
+                                        memory_image_source({{"b", b}, {"a", a}, {"main", exe_image()}}),
+                                        ProgramLoadOptions{"D:\\", false}, pb),
+                   ProgramErrorCode::Ok);
+        CHECK(pb.config.modules.size() == 3);
+        CHECK(pb.config.modules[0].lifted_tables.empty());
+        CHECK(pb.config.modules[0].shard_dispatch_tables.size() == 1 &&
+              pb.config.modules[0].shard_dispatch_tables[0] == &kShardTableE);
+        CHECK(pb.config.modules[1].shard_dispatch_tables.size() == 1 &&
+              pb.config.modules[1].shard_dispatch_tables[0] == &kShardTableB);
+        CHECK(pb.config.modules[2].shard_dispatch_tables.size() == 1 &&
+              pb.config.modules[2].shard_dispatch_tables[0] == &kShardTableA);
+
+        const BootResult result = boot(pb);
+        CHECK(result.status == BootStatus::Exited);
+        CHECK(result.stats.exit_code == 11 + 1000 + 77);
+        CHECK(result.stats.functions_registered == 7);
+        CHECK(g_log == "bBAE");
+        reset_boot();
+    }
+
+    // Mixed program: legacy DLLs (per-function lifted_functions, omitted shard_dispatch) +
+    // shard-dispatched executable.
+    {
+        const Pg6ProgramModule modules[] = {
+            {"b.dll", "b", kB, kSize, kB + kText + 0x100, kPg6ProgramModuleDll | kPg6ProgramModuleTls,
+             0, kTableB, &kTableBCount, nullptr, nullptr},
+            {"A.DLL", "a", kA, kSize, kA + kText + 0x100, kPg6ProgramModuleDll, 0, kTableA,
+             &kTableACount, &kImportsAPtr, &kImportsACount},
+            {"game.exe", "main", kE, kSize, kE + kText, kPg6ProgramModuleMain, 0, nullptr, nullptr,
+             &kImportsEPtr, &kImportsECount, &kShardTableE},
+        };
+        const Pg6Program program{kPg6ProgramVersion, 3, modules, &kExportsPtr, &kExportCount};
+        ProgramBoot pb;
+        CHECK_CODE(prepare_program_boot(program,
+                                        memory_image_source({{"b", b}, {"a", a}, {"main", exe_image()}}),
+                                        ProgramLoadOptions{"D:\\", false}, pb),
+                   ProgramErrorCode::Ok);
+        CHECK(pb.config.modules[0].shard_dispatch_tables.size() == 1);
+        CHECK(pb.config.modules[1].shard_dispatch_tables.empty());
+        CHECK(pb.config.modules[2].shard_dispatch_tables.empty());
+        const BootResult result = boot(pb);
+        CHECK(result.status == BootStatus::Exited);
+        CHECK(result.stats.exit_code == 11 + 1000 + 77);
+        CHECK(result.stats.functions_registered == 7);
+        CHECK(g_log == "bBAE");
+        reset_boot();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -696,6 +820,7 @@ int main() {
     test_failures(arena);
     test_guest_module_takes_over_a_virtual_name(arena);
     test_memory_model(arena);
+    test_shard_dispatch_program(arena);
     win32::set_vmem_arena(nullptr);
     if (g_failures != 0) {
         std::fprintf(stderr, "test_program_loader failed with %d failure(s)\n", g_failures);

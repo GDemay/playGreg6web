@@ -38,6 +38,11 @@ public:
     // Returns false if `guest_va` is not registered.
     bool dispatch(uint64_t guest_va, Pg6GuestState* state) const;
 
+    // Finds the highest registered entry with `entry.guest_va <= guest_va` via O(log N) binary
+    // search without allocating (for fault diagnostics / `sub_XXXX+0xYY` formatting).
+    // Returns true and writes `entry_va` if found; otherwise writes 0 and returns false.
+    bool nearest_entry(uint64_t guest_va, uint64_t& entry_va) const noexcept;
+
     size_t entry_count() const noexcept { return entries_.size(); }
     size_t shard_count() const noexcept { return shards_.size(); }
 

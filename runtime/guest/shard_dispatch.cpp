@@ -165,6 +165,22 @@ bool ShardDispatchRegistry::dispatch(uint64_t guest_va, Pg6GuestState* state) co
     return true;
 }
 
+bool ShardDispatchRegistry::nearest_entry(uint64_t guest_va, uint64_t& entry_va) const noexcept {
+    if (entries_.empty() || guest_va < entries_.front().guest_va) {
+        entry_va = 0;
+        return false;
+    }
+    const auto it = std::upper_bound(
+        entries_.begin(), entries_.end(), guest_va,
+        [](uint64_t va, const Pg6ShardFunctionEntry& entry) { return va < entry.guest_va; });
+    if (it == entries_.begin()) {
+        entry_va = 0;
+        return false;
+    }
+    entry_va = (it - 1)->guest_va;
+    return true;
+}
+
 void ShardDispatchRegistry::clear() noexcept {
     entries_.clear();
     shards_.clear();

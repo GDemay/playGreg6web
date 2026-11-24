@@ -77,6 +77,10 @@ struct Pg6ProgramModule {
     // (Pg6ImportThunk has Pg6BootImport's layout). May be null.
     const Pg6BootImport* const* imports;
     const size_t* import_count;
+    // Optional shard-level dispatch table (`__playgta6_shard_dispatch_<module>`, R37).
+    // Added after version 1 shipped: null for legacy descriptors that omit it (the default
+    // member initializer keeps -Wmissing-field-initializers quiet).
+    const Pg6ShardDispatchTable* shard_dispatch = nullptr;
 };
 
 struct Pg6Program {

@@ -57,6 +57,12 @@ struct Registry {
     std::atomic<size_t> table_count{0};
     std::atomic<size_t> function_count{0};
 
+    // Published immutable snapshot for lock-free O(log N) zero-allocation shard dispatch.
+    std::atomic<const ShardDispatchRegistry*> shard_registry{nullptr};
+    std::vector<std::unique_ptr<ShardDispatchRegistry>> owned_shard_registries;
+    std::atomic<size_t> shard_function_count{0};
+    std::atomic<size_t> shard_count{0};
+
     std::atomic<SyntheticEntry*> chunks[kMaxChunks];
     std::vector<std::unique_ptr<SyntheticEntry[]>> owned_chunks;
     std::atomic<uint64_t> synthetic_count{1};  // index 0 is kGuestReturnSentinel
@@ -96,6 +102,12 @@ uint64_t nearest_entry_at_or_below(uint64_t va) {
             t.entries, end, va, [](uint64_t v, const LiftedFunctionEntry& e) { return v < e.va; });
         if (it != t.entries) {
             best = std::max(best, (it - 1)->va);
+        }
+    }
+    if (const ShardDispatchRegistry* shards = reg.shard_registry.load(std::memory_order_acquire)) {
+        uint64_t shard_best = 0;
+        if (shards->nearest_entry(va, shard_best)) {
+            best = std::max(best, shard_best);
         }
     }
     return best;
@@ -267,7 +279,62 @@ LiftedFn find_lifted_function(uint64_t va) {
 }
 
 size_t lifted_function_count() {
-    return registry().function_count.load(std::memory_order_relaxed);
+    const Registry& reg = registry();
+    return reg.function_count.load(std::memory_order_relaxed) +
+           reg.shard_function_count.load(std::memory_order_relaxed);
+}
+
+bool register_shard_dispatch_table(const Pg6ShardDispatchTable& table, std::string* error) {
+    if (table.entry_count > 0 && table.entries != nullptr) {
+        for (uint64_t i = 0; i < table.entry_count; ++i) {
+            if (is_synthetic_address(table.entries[i].guest_va)) {
+                if (error != nullptr) {
+                    char buf[128];
+                    std::snprintf(buf, sizeof(buf),
+                                  "entry %" PRIu64 " uses synthetic guest_va 0x%" PRIx64,
+                                  i, table.entries[i].guest_va);
+                    *error = buf;
+                }
+                return false;
+            }
+        }
+    }
+
+    Registry& reg = registry();
+    std::lock_guard<std::mutex> lock(reg.mutex);
+    const ShardDispatchRegistry* current = reg.shard_registry.load(std::memory_order_relaxed);
+    auto next = current != nullptr ? std::make_unique<ShardDispatchRegistry>(*current)
+                                   : std::make_unique<ShardDispatchRegistry>();
+    if (!next->add_table(table, error)) {
+        return false;
+    }
+    const ShardDispatchRegistry* published = next.get();
+    reg.owned_shard_registries.push_back(std::move(next));
+    reg.shard_function_count.store(published->entry_count(), std::memory_order_relaxed);
+    reg.shard_count.store(published->shard_count(), std::memory_order_relaxed);
+    reg.shard_registry.store(published, std::memory_order_release);
+    return true;
+}
+
+bool find_shard_dispatch_target(uint64_t va, ResolvedShardTarget& out) {
+    const ShardDispatchRegistry* shards = registry().shard_registry.load(std::memory_order_acquire);
+    if (shards == nullptr) {
+        out = ResolvedShardTarget{};
+        return false;
+    }
+    return shards->lookup(va, out);
+}
+
+uint64_t nearest_lifted_function_entry(uint64_t va) {
+    return nearest_entry_at_or_below(va);
+}
+
+size_t shard_dispatch_function_count() {
+    return registry().shard_function_count.load(std::memory_order_relaxed);
+}
+
+size_t shard_dispatch_shard_count() {
+    return registry().shard_count.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +631,10 @@ void reset_guest_runtime() {
     for (auto& t : reg.tables) {
         t = LiftedTable{};
     }
+    reg.shard_registry.store(nullptr, std::memory_order_release);
+    reg.owned_shard_registries.clear();
+    reg.shard_function_count.store(0, std::memory_order_relaxed);
+    reg.shard_count.store(0, std::memory_order_relaxed);
     reg.synthetic_count.store(1, std::memory_order_release);
     for (auto& chunk : reg.chunks) {
         chunk.store(nullptr, std::memory_order_release);
@@ -599,9 +670,17 @@ PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t targe
             entry->thunk(state);
             return;
         }
-    } else if (playgta6::LiftedFn fn = guest::find_lifted_function(target)) {
-        fn(state);
-        return;
+    } else {
+        if (playgta6::LiftedFn fn = guest::find_lifted_function(target)) {
+            fn(state);
+            return;
+        }
+        guest::ResolvedShardTarget shard_target{};
+        if (guest::find_shard_dispatch_target(target, shard_target) &&
+            shard_target.dispatcher != nullptr) {
+            shard_target.dispatcher(shard_target.local_idx, state);
+            return;
+        }
     }
     guest::raise_fault(guest::FaultKind::UnknownTarget, state, target,
                        guest::nearest_entry_at_or_below(target));
@@ -638,6 +717,13 @@ int32_t pg6_guest_register_lifted_functions(const Pg6LiftedFunctionEntry* entrie
     return guest::register_lifted_functions(std::span<const Pg6LiftedFunctionEntry>(entries, count))
                ? 1
                : 0;
+}
+
+int32_t pg6_guest_register_shard_dispatch_table(const Pg6ShardDispatchTable* table) {
+    if (table == nullptr) {
+        return 0;
+    }
+    return guest::register_shard_dispatch_table(*table) ? 1 : 0;
 }
 
 playgta6::LiftedFn pg6_guest_find_lifted_function(uint64_t va) {
