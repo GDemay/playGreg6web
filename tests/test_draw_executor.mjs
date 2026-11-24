@@ -21,6 +21,8 @@ const {
   TEXTURED_QUAD_VERTEX_STRIDE,
   FRAME1_CBV_MIN_BYTES,
   FALLBACK_VERTEX_LAYOUT_24B,
+  FRAME1_SPLASH_VERTEX_LAYOUT_24B,
+  expandRectListVertices24B,
   selectFallbackShaderProfile,
   DrawExecutor,
 } = drawExecutorMod;
@@ -196,12 +198,22 @@ test('UMD export attaches to globalThis.PlayGta6DrawExecutor and module.exports'
     DEFAULT: 'default',
     FULLSCREEN_TRIANGLE_CBV: 'fullscreen_triangle_cbv',
     TEXTURED_QUAD_24B: 'textured_quad_24b',
+    SPLASH_RECT_24B: 'splash_rect_24b',
   });
   assert.equal(FALLBACK_VERTEX_LAYOUT_24B.arrayStride, 24);
   assert.deepEqual(FALLBACK_VERTEX_LAYOUT_24B.attributes, [
     { shaderLocation: 0, offset: 0, format: 'float32x4' },
     { shaderLocation: 1, offset: 16, format: 'float32x2' },
   ]);
+  assert.equal(FRAME1_SPLASH_VERTEX_LAYOUT_24B.arrayStride, 24);
+  assert.equal(FRAME1_SPLASH_VERTEX_LAYOUT_24B.stepMode, 'vertex');
+  assert.deepEqual(FRAME1_SPLASH_VERTEX_LAYOUT_24B.attributes, [
+    { shaderLocation: 0, offset: 0, format: 'float32x3' },
+    { shaderLocation: 1, offset: 12, format: 'unorm8x4' },
+    { shaderLocation: 2, offset: 16, format: 'float32x2' },
+  ]);
+  assert.equal(typeof expandRectListVertices24B, 'function');
+  assert.equal(DrawExecutor.expandRectListVertices24B, expandRectListVertices24B);
 });
 
 test('selectFallbackShaderProfile routes Frame-1 DrawInstanced(3,1)+CBV, 24B textured quad, and default', () => {
@@ -369,6 +381,7 @@ test('DrawExecutor routes Frame-1 DrawInstanced(3,1) with bound CBV to G34 fulls
     default: 0,
     fullscreen_triangle_cbv: 1,
     textured_quad_24b: 0,
+    splash_rect_24b: 0,
   });
   assert.equal(stats.invalidCbvSubstitutions, 0);
   assert.equal(stats.fallbackPipelineCacheMisses, 1);
@@ -440,6 +453,7 @@ test('DrawExecutor routes 24B-stride textured quad draws to G34 textured_quad_24
     default: 0,
     fullscreen_triangle_cbv: 0,
     textured_quad_24b: 1,
+    splash_rect_24b: 0,
   });
 });
 
@@ -468,6 +482,7 @@ test('DrawExecutor routes generic missing-shader draws to default fallback profi
     default: 1,
     fullscreen_triangle_cbv: 0,
     textured_quad_24b: 0,
+    splash_rect_24b: 0,
   });
 });
 
@@ -777,9 +792,11 @@ test('G31 classic Worker importScripts IIFE isolation: double load causes zero g
     vm.runInContext(
       `
       const FALLBACK_PROFILE = {};
+      const FRAME1_SPLASH_VERTEX_LAYOUT_24B = {};
       const BUFFER_USAGE = {};
       const TEXTURE_USAGE = {};
       const exportedApi = {};
+      function expandRectListVertices24B() {}
       class DrawExecutor {}
       `,
       vmCtx
@@ -789,6 +806,8 @@ test('G31 classic Worker importScripts IIFE isolation: double load causes zero g
   assert.ok(vmCtx.PlayGta6DrawExecutor);
   assert.equal(typeof vmCtx.PlayGta6DrawExecutor.DrawExecutor, 'function');
   assert.equal(typeof vmCtx.PlayGta6DrawExecutor.selectFallbackShaderProfile, 'function');
+  assert.equal(typeof vmCtx.PlayGta6DrawExecutor.expandRectListVertices24B, 'function');
+  assert.ok(vmCtx.PlayGta6DrawExecutor.FRAME1_SPLASH_VERTEX_LAYOUT_24B);
   assert.equal(
     vmCtx.PlayGta6DrawExecutor.selectFallbackShaderProfile({
       vertexCount: 3,
@@ -796,4 +815,288 @@ test('G31 classic Worker importScripts IIFE isolation: double load causes zero g
     }),
     'fullscreen_triangle_cbv'
   );
+  assert.equal(
+    vmCtx.PlayGta6DrawExecutor.selectFallbackShaderProfile({
+      vertexCount: 3,
+      vertexStride: 24,
+      topology: 'rect-list',
+    }),
+    'splash_rect_24b'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// G47 Xbox RECTLIST 3->6 vertex expansion & Frame-1 24B splash layout tests
+// ---------------------------------------------------------------------------
+
+function packSplashVertex24B(pos, color, uv) {
+  const buf = new Uint8Array(24);
+  const view = new DataView(buf.buffer);
+  view.setFloat32(0, pos[0], true);
+  view.setFloat32(4, pos[1], true);
+  view.setFloat32(8, pos[2], true);
+  buf[12] = color[0] & 0xff;
+  buf[13] = color[1] & 0xff;
+  buf[14] = color[2] & 0xff;
+  buf[15] = color[3] & 0xff;
+  view.setFloat32(16, uv[0], true);
+  view.setFloat32(20, uv[1], true);
+  return buf;
+}
+
+function packSplashVertices24B(verts) {
+  const out = new Uint8Array(verts.length * 24);
+  for (let i = 0; i < verts.length; i += 1) {
+    out.set(packSplashVertex24B(verts[i].pos, verts[i].color, verts[i].uv), i * 24);
+  }
+  return out;
+}
+
+function unpackSplashVertex24B(bytes, index) {
+  const off = index * 24;
+  const view = new DataView(bytes.buffer, bytes.byteOffset + off, 24);
+  return {
+    pos: [view.getFloat32(0, true), view.getFloat32(4, true), view.getFloat32(8, true)],
+    color: [bytes[off + 12], bytes[off + 13], bytes[off + 14], bytes[off + 15]],
+    uv: [view.getFloat32(16, true), view.getFloat32(20, true)],
+  };
+}
+
+function assertApproxArray(actual, expected, eps = 1e-5) {
+  assert.equal(actual.length, expected.length);
+  for (let i = 0; i < actual.length; i += 1) {
+    assert.ok(
+      Math.abs(actual[i] - expected[i]) <= eps,
+      `index ${i}: expected ${expected[i]}, got ${actual[i]}`
+    );
+  }
+}
+
+test('G47 expandRectListVertices24B expands 3-vertex RECTLIST quad to 6 triangle-list vertices with exact v3 math', () => {
+  const v0 = { pos: [-1.0, 1.0, 0.25], color: [0x11, 0x22, 0x33, 0xff], uv: [0.0, 0.0] };
+  const v1 = { pos: [1.0, 1.0, 0.25], color: [0x44, 0x55, 0x66, 0xfe], uv: [1.0, 0.0] };
+  const v2 = { pos: [-1.0, -1.0, 0.25], color: [0x77, 0x88, 0x99, 0xee], uv: [0.0, 1.0] };
+  const expectedV3 = {
+    pos: [1.0, -1.0, 0.25], // v1 + v2 - v0
+    color: [0x77, 0x88, 0x99, 0xee], // color3 = color2 bytes 12..15
+    uv: [1.0, 1.0], // uv1 + uv2 - uv0
+  };
+
+  const src = packSplashVertices24B([v0, v1, v2]);
+  const out = expandRectListVertices24B(src, 3);
+  assert.ok(out instanceof Uint8Array);
+  assert.equal(out.byteLength, 6 * 24);
+
+  const expectedOrder = [v0, v1, v2, v1, expectedV3, v2];
+  for (let i = 0; i < 6; i += 1) {
+    const actual = unpackSplashVertex24B(out, i);
+    assertApproxArray(actual.pos, expectedOrder[i].pos);
+    assert.deepEqual(actual.color, expectedOrder[i].color);
+    assertApproxArray(actual.uv, expectedOrder[i].uv);
+  }
+});
+
+test('G47 expandRectListVertices24B handles multi-rect batches, skewed/3D coords, partial trailing verts, and subarrays', () => {
+  // 2 complete rects + 2 trailing partial vertices (vertexCount = 8 -> floor(8/3) = 2 rects -> 12 output vertices).
+  const r0 = [
+    { pos: [10.0, 20.0, 0.5], color: [10, 20, 30, 40], uv: [0.1, 0.2] },
+    { pos: [14.0, 21.0, 0.75], color: [50, 60, 70, 80], uv: [0.6, 0.25] },
+    { pos: [11.0, 28.0, 1.0], color: [90, 100, 110, 120], uv: [0.15, 0.85] },
+  ];
+  const r1 = [
+    { pos: [-0.5, 0.5, 0.0], color: [255, 0, 0, 255], uv: [0.25, 0.25] },
+    { pos: [0.5, 0.5, 0.0], color: [0, 255, 0, 255], uv: [0.75, 0.25] },
+    { pos: [-0.5, -0.5, 0.0], color: [0, 0, 255, 200], uv: [0.25, 0.75] },
+  ];
+  const trailing = [
+    { pos: [99.0, 99.0, 99.0], color: [1, 2, 3, 4], uv: [0.0, 0.0] },
+    { pos: [88.0, 88.0, 88.0], color: [5, 6, 7, 8], uv: [1.0, 1.0] },
+  ];
+
+  // Wrap inside a padded buffer with non-zero byteOffset to verify DataView byteOffset handling.
+  const payload = packSplashVertices24B([...r0, ...r1, ...trailing]);
+  const padded = new Uint8Array(16 + payload.byteLength + 8);
+  padded.fill(0xaa);
+  padded.set(payload, 16);
+  const sub = padded.subarray(16, 16 + payload.byteLength);
+
+  const out = expandRectListVertices24B(sub, 8);
+  assert.equal(out.byteLength, 12 * 24);
+
+  // Verify rect 0 v3 (output index 4): pos1 + pos2 - pos0, uv1 + uv2 - uv0, color2
+  const r0v3 = unpackSplashVertex24B(out, 4);
+  assertApproxArray(r0v3.pos, [14.0 + 11.0 - 10.0, 21.0 + 28.0 - 20.0, 0.75 + 1.0 - 0.5]);
+  assert.deepEqual(r0v3.color, [90, 100, 110, 120]);
+  assertApproxArray(r0v3.uv, [0.6 + 0.15 - 0.1, 0.25 + 0.85 - 0.2]);
+
+  // Verify rect 1 v3 (output index 10)
+  const r1v3 = unpackSplashVertex24B(out, 10);
+  assertApproxArray(r1v3.pos, [0.5, -0.5, 0.0]);
+  assert.deepEqual(r1v3.color, [0, 0, 255, 200]);
+  assertApproxArray(r1v3.uv, [0.75, 0.75]);
+
+  // Explicit vertexCount smaller than buffer restricts expansion to floor(3/3) = 1 rect.
+  const oneRect = expandRectListVertices24B(sub, 3);
+  assert.equal(oneRect.byteLength, 6 * 24);
+
+  // Omitted vertexCount infers floor(byteLength / 24) = 8 -> 2 rects.
+  const inferred = expandRectListVertices24B(sub);
+  assert.equal(inferred.byteLength, 12 * 24);
+
+  // Edge cases: < 3 vertices, zero, negative, null/undefined -> empty Uint8Array(0).
+  assert.equal(expandRectListVertices24B(sub, 0).byteLength, 0);
+  assert.equal(expandRectListVertices24B(sub, 1).byteLength, 0);
+  assert.equal(expandRectListVertices24B(sub, 2).byteLength, 0);
+  assert.equal(expandRectListVertices24B(new Uint8Array(48), 2).byteLength, 0);
+  assert.equal(expandRectListVertices24B(new Uint8Array(0), 3).byteLength, 0);
+  assert.equal(expandRectListVertices24B(null, 3).byteLength, 0);
+  assert.equal(expandRectListVertices24B(undefined, 3).byteLength, 0);
+});
+
+test('G47 selectFallbackShaderProfile routes rect-list / isRectList with 24B stride to splash_rect_24b', () => {
+  // topology === 'rect-list' + 24B stride -> splash_rect_24b (even with vertexCount: 3 + CBV)
+  assert.equal(
+    selectFallbackShaderProfile({
+      topology: 'rect-list',
+      vertexCount: 3,
+      vertexStride: 24,
+      hasBoundCbv: true,
+    }),
+    'splash_rect_24b'
+  );
+
+  // topology === 'rect-list' + 24B VB + CBV + texture + sampler -> splash_rect_24b
+  assert.equal(
+    selectFallbackShaderProfile({
+      topology: 'rect-list',
+      vertexCount: 3,
+      vertexBuffers: [{ slot: 0, stride: 24, buffer: { size: 72 } }],
+      hasBoundCbv: true,
+      hasBoundTexture: true,
+      hasBoundSampler: true,
+    }),
+    'splash_rect_24b'
+  );
+
+  // isRectList === true + 24B vertexBufferLayouts -> splash_rect_24b
+  assert.equal(
+    selectFallbackShaderProfile({
+      isRectList: true,
+      vertexCount: 6,
+      vertexBufferLayouts: [{ arrayStride: 24 }],
+    }),
+    'splash_rect_24b'
+  );
+
+  // pipeline.topology === 'RECTLIST' + 24B stride -> splash_rect_24b
+  assert.equal(
+    selectFallbackShaderProfile({
+      pipeline: { topology: 'RECTLIST' },
+      vertexCount: 3,
+      vertexStride: 24,
+    }),
+    'splash_rect_24b'
+  );
+
+  // rect-list WITHOUT 24B stride does NOT route to splash_rect_24b
+  assert.equal(
+    selectFallbackShaderProfile({
+      topology: 'rect-list',
+      vertexCount: 3,
+      vertexStride: 32,
+      hasBoundCbv: true,
+    }),
+    'fullscreen_triangle_cbv'
+  );
+  assert.equal(
+    selectFallbackShaderProfile({
+      isRectList: true,
+      vertexCount: 6,
+      vertexStride: 32,
+    }),
+    'default'
+  );
+});
+
+test('G47 DrawExecutor executes rect-list 24B draws via splash_rect_24b with triangle-list topology, exact 24B layout, and cb0/tex0/samp0 bindings', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter({ now: () => 500 });
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+  const profiles = getBuiltInFallbackProfiles();
+
+  const cbv = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  const vb = device.createBuffer({ size: 6 * 24, usage: BUFFER_USAGE.VERTEX });
+  const tex = device.createTexture({
+    size: { width: 32, height: 32, depthOrArrayLayers: 1 },
+    format: 'rgba8unorm',
+    usage: 0x04,
+  });
+  const texView = tex.createView();
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  executor.beginPass();
+  executor.setPipeline({
+    id: 470,
+    vertexShaderHash: '0x7777777777777777',
+    fragmentShaderHash: '0x8888888888888888',
+    vertexStride: 24,
+    topology: 'rect-list',
+    isFallback: true,
+  });
+  executor.setConstantBuffer(0, cbv, { offset: 0, size: 256 });
+  executor.setTexture(0, texView);
+  executor.setSampler(0, sampler);
+  executor.setVertexBuffer(0, vb, { offset: 0, stride: 24 });
+
+  const res = executor.executeDraw(pass, { vertexCount: 6, instanceCount: 1 });
+  assert.equal(res.executed, true);
+  assert.equal(res.profile, 'splash_rect_24b');
+  assert.equal(res.effectiveProfile, 'splash_rect_24b');
+  assert.equal(res.substitutedCbv, false);
+  assert.equal(res.substitutedTexture, false);
+  assert.equal(res.substitutedSampler, false);
+  assert.equal(res.substitutedVertexBuffer, false);
+
+  // Compiled splash_rect_24b shaders.
+  assert.equal(calls.createShaderModule[0].desc.code, profiles.splash_rect_24b.vertex);
+  assert.equal(calls.createShaderModule[1].desc.code, profiles.splash_rect_24b.fragment);
+
+  // Pipeline normalized 'rect-list' -> 'triangle-list' and used exact Frame-1 24B layout.
+  const pipeDesc = calls.createRenderPipeline[0].desc;
+  assert.equal(pipeDesc.primitive.topology, 'triangle-list');
+  assert.equal(pipeDesc.vertex.buffers.length, 1);
+  assert.equal(pipeDesc.vertex.buffers[0].arrayStride, 24);
+  assert.deepEqual(pipeDesc.vertex.buffers[0].attributes, [
+    { shaderLocation: 0, offset: 0, format: 'float32x3' },
+    { shaderLocation: 1, offset: 12, format: 'unorm8x4' },
+    { shaderLocation: 2, offset: 16, format: 'float32x2' },
+  ]);
+
+  // 3-entry bind group: binding 0 = cb0, binding 1 = tex0, binding 2 = samp0.
+  assert.equal(calls.createBindGroup[0].desc.entries.length, 3);
+  assert.equal(calls.createBindGroup[0].desc.entries[0].binding, 0);
+  assert.equal(calls.createBindGroup[0].desc.entries[0].resource.buffer, cbv);
+  assert.equal(calls.createBindGroup[0].desc.entries[1].binding, 1);
+  assert.equal(calls.createBindGroup[0].desc.entries[1].resource, texView);
+  assert.equal(calls.createBindGroup[0].desc.entries[2].binding, 2);
+  assert.equal(calls.createBindGroup[0].desc.entries[2].resource, sampler);
+
+  assert.equal(executor.getStats().fallbackProfileCounts.splash_rect_24b, 1);
+
+  // Missing CBV/texture/sampler/VB on a 3-vertex rect-list draw hardens cleanly and expands to 6 vertices.
+  executor.beginPass();
+  executor.setPipeline({ vertexStride: 24, topology: 'rect-list', isFallback: true });
+  const hardened = executor.executeDraw(pass, { vertexCount: 3, instanceCount: 1 });
+  assert.equal(hardened.executed, true);
+  assert.equal(hardened.profile, 'splash_rect_24b');
+  assert.equal(hardened.substitutedCbv, true);
+  assert.equal(hardened.substitutedTexture, true);
+  assert.equal(hardened.substitutedSampler, true);
+  assert.equal(hardened.substitutedVertexBuffer, true);
+  assert.equal(hardened.vertexCount, 6);
+  const synthSplashVb = calls.createBuffer.find(
+    (c) => c.desc.label === 'draw_executor:fallback_vb_24b_splash_rect'
+  );
+  assert.ok(synthSplashVb);
+  assert.equal(synthSplashVb.desc.size, 144);
 });

@@ -465,6 +465,7 @@ test('G34 getBuiltInFallbackProfiles returns sanitized, mutation-isolated map of
   assert.deepEqual(Object.keys(profiles).sort(), [
     'default',
     'fullscreen_triangle_cbv',
+    'splash_rect_24b',
     'textured_quad_24b',
   ]);
 
@@ -681,6 +682,7 @@ test('G34 shader_fallback_router.js preserves classic Worker importScripts IIFE 
       const BUILTIN_FALLBACK_WGSL = {};
       const FULLSCREEN_TRIANGLE_CBV_WGSL = {};
       const TEXTURED_QUAD_24B_WGSL = {};
+      const SPLASH_RECT_24B_WGSL = {};
       const BUILTIN_FALLBACK_PROFILES = {};
       const FALLBACK_PROFILE_ALIASES = {};
       const exportedApi = {};
@@ -693,5 +695,87 @@ test('G34 shader_fallback_router.js preserves classic Worker importScripts IIFE 
   assert.ok(vmCtx.PlayGta6ShaderFallbackRouter);
   assert.equal(typeof vmCtx.PlayGta6ShaderFallbackRouter.getBuiltInFallbackProfiles, 'function');
   const profiles = vmCtx.PlayGta6ShaderFallbackRouter.getBuiltInFallbackProfiles();
-  assert.ok(profiles.fullscreen_triangle_cbv && profiles.textured_quad_24b);
+  assert.ok(
+    profiles.fullscreen_triangle_cbv && profiles.textured_quad_24b && profiles.splash_rect_24b
+  );
+});
+
+// ---------------------------------------------------------------------------
+// G47 Frame-1 24B splash RECTLIST fallback profile (splash_rect_24b)
+// ---------------------------------------------------------------------------
+
+test('G47 splash_rect_24b WGSL pair matches exact Frame-1 24B POSITION/COLOR/TEXCOORD layout + cb0/tex0/samp0', () => {
+  const profiles = getBuiltInFallbackProfiles();
+  const pair = profiles.splash_rect_24b;
+  assert.ok(pair, 'splash_rect_24b profile must be exposed in getBuiltInFallbackProfiles()');
+
+  for (const stage of ['vertex', 'fragment', 'compute']) {
+    assertValidWgsl(pair[stage], stage);
+    assertBalancedWgslDelimiters(pair[stage], `splash_rect_24b.${stage}`);
+  }
+
+  // Vertex shader: exact Frame-1 24B attributes + cb0 uniform binding.
+  assert.match(pair.vertex, /struct\s+FrameCbv\s*\{\s*data:\s*array<vec4<f32>,\s*16>,?\s*\};?/);
+  assert.match(pair.vertex, /@group\(0\)\s+@binding\(0\)\s+var<uniform>\s+cb0:\s*FrameCbv;/);
+  assert.match(pair.vertex, /@vertex\b/);
+  assert.match(pair.vertex, /fn\s+vs_main\(/);
+  assert.match(pair.vertex, /@location\(0\)\s+pos:\s*vec3<f32>/);
+  assert.match(pair.vertex, /@location\(1\)\s+color:\s*vec4<f32>/);
+  assert.match(pair.vertex, /@location\(2\)\s+uv:\s*vec2<f32>/);
+  assert.match(pair.vertex, /@builtin\(position\)/);
+  assert.match(pair.vertex, /cb0\.data\[0\]/);
+
+  // Fragment shader: cb0 @ 0 + tex0 @ 1 + samp0 @ 2 + color * textureSample output.
+  assert.match(pair.fragment, /struct\s+FrameCbv\s*\{\s*data:\s*array<vec4<f32>,\s*16>,?\s*\};?/);
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(0\)\s+var<uniform>\s+cb0:\s*FrameCbv;/);
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(1\)\s+var\s+tex0:\s*texture_2d<f32>;/);
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(2\)\s+var\s+samp0:\s*sampler;/);
+  assert.match(pair.fragment, /@fragment\b/);
+  assert.match(pair.fragment, /fn\s+fs_main\(/);
+  assert.match(pair.fragment, /->\s*@location\(0\)\s+vec4<f32>/);
+  assert.match(pair.fragment, /textureSample\(\s*tex0\s*,\s*samp0\s*,/);
+  assert.match(pair.fragment, /input\.color/);
+});
+
+test('G47 normalizeFallbackProfile and resolve() support splash_rect_24b and aliases', () => {
+  assert.equal(normalizeFallbackProfile('splash_rect_24b'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('splash-rect-24b'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('rectlist_24b'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('RECTLIST-24B'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('frame1_splash_24b'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('  FRAME1-SPLASH-24B  '), 'splash_rect_24b');
+
+  const profiles = getBuiltInFallbackProfiles();
+  const router = new ShaderFallbackRouter({ now: () => 4700 });
+
+  const vsCanonical = router.resolve('0x1010101010101010', 'vertex', {
+    profile: 'splash_rect_24b',
+  });
+  assert.equal(vsCanonical.source, 'builtin');
+  assert.equal(vsCanonical.profile, 'splash_rect_24b');
+  assert.equal(vsCanonical.entryPoint, 'vs_main');
+  assert.equal(vsCanonical.wgsl, profiles.splash_rect_24b.vertex);
+
+  const fsRectAlias = router.resolve('0x2020202020202020', 'fragment', {
+    profile: 'rectlist_24b',
+  });
+  assert.equal(fsRectAlias.source, 'builtin');
+  assert.equal(fsRectAlias.profile, 'splash_rect_24b');
+  assert.equal(fsRectAlias.entryPoint, 'fs_main');
+  assert.equal(fsRectAlias.wgsl, profiles.splash_rect_24b.fragment);
+
+  const vsFrame1Alias = router.resolve('0x3030303030303030', SHADER_STAGE.VERTEX, {
+    profile: 'frame1_splash_24b',
+  });
+  assert.equal(vsFrame1Alias.source, 'builtin');
+  assert.equal(vsFrame1Alias.profile, 'splash_rect_24b');
+  assert.equal(vsFrame1Alias.wgsl, profiles.splash_rect_24b.vertex);
+
+  const csSplash = router.resolve('0x4040404040404040', 'compute', {
+    profile: 'splash_rect_24b',
+  });
+  assert.equal(csSplash.source, 'builtin');
+  assert.equal(csSplash.profile, 'splash_rect_24b');
+  assert.equal(csSplash.entryPoint, 'cs_main');
+  assert.equal(csSplash.wgsl, BUILTIN_FALLBACK_WGSL.compute);
 });
