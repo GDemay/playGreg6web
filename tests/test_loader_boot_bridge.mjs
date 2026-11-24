@@ -19,7 +19,9 @@ const {
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
   BOOT_INIT_FORWARD_KEYS,
+  isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
+  createPatchedPthreadEnv,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,
   inspectGpuPacketBatchForPresent,
@@ -914,7 +916,7 @@ test('createRuntimeModuleOptions forwards mainScriptUrlOrBlob and locateFile def
   assert.equal(opts.locateFile('runtime.wasm'), 'http://127.0.0.1:8080/web/dist/runtime.wasm');
 });
 
-test('isEmscriptenPthreadWorker detects em-pthread workers and rejects normal workers', () => {
+test('isEmscriptenPthreadWorker detects em-pthread and em-pthread-<N> workers and rejects normal workers', () => {
   assert.equal(EMSCRIPTEN_PTHREAD_WORKER_NAME, 'em-pthread');
   assert.equal(PTHREAD_WGPU_CHANNEL_NAME, 'playgta6-wgpu-pthread');
   assert.equal(PTHREAD_HTTPFS_SAB_CHANNEL_NAME, 'playgta6-httpfs-sab');
@@ -926,10 +928,26 @@ test('isEmscriptenPthreadWorker detects em-pthread workers and rejects normal wo
     'host_wgpu_submit',
   ]);
 
+  assert.equal(isEmscriptenPthreadWorkerName('em-pthread'), true);
+  assert.equal(isEmscriptenPthreadWorkerName('em-pthread-1'), true);
+  assert.equal(isEmscriptenPthreadWorkerName('em-pthread-2'), true);
+  assert.equal(isEmscriptenPthreadWorkerName('em-pthread-42'), true);
+  assert.equal(isEmscriptenPthreadWorkerName(''), false);
+  assert.equal(isEmscriptenPthreadWorkerName('loader'), false);
+  assert.equal(isEmscriptenPthreadWorkerName('em-pthreadx'), false);
+  assert.equal(isEmscriptenPthreadWorkerName('my-em-pthread-1'), false);
+  assert.equal(isEmscriptenPthreadWorkerName(123), false);
+  assert.equal(isEmscriptenPthreadWorkerName({}), false);
+  assert.equal(isEmscriptenPthreadWorkerName(null), false);
+  assert.equal(isEmscriptenPthreadWorkerName(undefined), false);
+
   assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread' }), true);
+  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread-1' }), true);
+  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread-2' }), true);
   assert.equal(isEmscriptenPthreadWorker({ name: '' }), false);
   assert.equal(isEmscriptenPthreadWorker({ name: 'loader' }), false);
-  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthread-2' }), false);
+  assert.equal(isEmscriptenPthreadWorker({ name: 'em-pthreadx' }), false);
+  assert.equal(isEmscriptenPthreadWorker({ name: 123 }), false);
   assert.equal(isEmscriptenPthreadWorker({}), false);
   assert.equal(isEmscriptenPthreadWorker(null), false);
   assert.equal(isEmscriptenPthreadWorker(undefined), false);
@@ -1977,4 +1995,377 @@ test('loader.js coordinator worker forwards sideModuleUrls to createRuntimeModul
     receivedOpts.locateFile('guest_part_0.wasm'),
     'http://localhost:8080/dist/guest_part_0.wasm',
   );
+});
+
+test('W77 coordinator Worker Proxy redirects em-pthread-<N> workers to self.location.href and posts __playgta6_httpfs_sab', () => {
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+  const spawnedWorkers = [];
+  let throwOnNextPost = false;
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script, opts) {
+      this.script = script;
+      this.opts = opts;
+      this.onmessage = null;
+      this.posted = [];
+      spawnedWorkers.push(this);
+    }
+    postMessage(msg) {
+      if (throwOnNextPost) {
+        throwOnNextPost = false;
+        throw new Error('simulated postMessage failure');
+      }
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    Worker: MockWorker,
+    onmessage: null,
+    postMessage() {},
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(loaderSource, context, { filename: loaderPath });
+
+  // Initialize coordinator so httpfsMailboxSab is created and attached to io_worker.
+  workerSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+
+  const ioWorker = spawnedWorkers.find((w) => w.script === './workers/io_worker.js');
+  assert.ok(ioWorker);
+  const attachMsg = ioWorker.posted.find((m) => m && m.attachMailbox === true);
+  assert.ok(attachMsg && attachMsg.sab instanceof SharedArrayBuffer);
+
+  // Regular coordinator workers must NOT be redirected or receive __playgta6_httpfs_sab.
+  for (const w of spawnedWorkers) {
+    assert.equal(
+      w.posted.some((m) => m && m.__playgta6_httpfs_sab),
+      false,
+    );
+  }
+
+  // Emscripten 7.0.1 spawns `new Worker(pthreadMainJs, { name: "em-pthread-" + id })`.
+  const pthread1 = new workerSelf.Worker('http://127.0.0.1:8080/dist/runtime.js', {
+    name: 'em-pthread-1',
+  });
+  const pthread2 = new sandbox.Worker('./dist/runtime.js', { name: 'em-pthread-2' });
+  const pthreadLegacy = new workerSelf.Worker('./dist/runtime.js', { name: 'em-pthread' });
+  const nonPthread = new workerSelf.Worker('./workers/custom.js', { name: 'em-pthreadx' });
+
+  for (const [worker, expectedName] of [
+    [pthread1, 'em-pthread-1'],
+    [pthread2, 'em-pthread-2'],
+    [pthreadLegacy, 'em-pthread'],
+  ]) {
+    assert.ok(worker instanceof MockWorker);
+    assert.equal(worker.script, 'http://127.0.0.1:8080/loader.js');
+    assert.deepEqual(worker.opts, { name: expectedName });
+    assert.equal(worker.posted.length, 1);
+    assert.equal(worker.posted[0].__playgta6_httpfs_sab, attachMsg.sab);
+  }
+
+  // Non-matching worker names must keep their original script URL and not get the SAB message.
+  assert.equal(nonPthread.script, './workers/custom.js');
+  assert.deepEqual(nonPthread.opts, { name: 'em-pthreadx' });
+  assert.equal(nonPthread.posted.length, 0);
+
+  // postMessage errors during SAB delivery must be swallowed without breaking Worker construction.
+  throwOnNextPost = true;
+  const pthread3 = new workerSelf.Worker('http://127.0.0.1:8080/dist/runtime.js', {
+    name: 'em-pthread-3',
+  });
+  assert.equal(pthread3.script, 'http://127.0.0.1:8080/loader.js');
+  assert.equal(pthread3.posted.length, 0);
+});
+
+test('W77 bootstrapEmscriptenPthreadWorker attaches __playgta6_httpfs_sab via message listener, wires host_httpfs_*, and removes listener on cleanup', () => {
+  const { createHttpfsMailboxBuffer } = require('../web/workers/httpfs_mailbox.js');
+  const bus = createMockBroadcastBus({ rejectSabOnChannel: PTHREAD_HTTPFS_SAB_CHANNEL_NAME });
+
+  const messageListeners = [];
+  const emscriptenReceived = [];
+  let listenerRegisteredBeforeImport = false;
+
+  const mockScope = {
+    name: 'em-pthread-1',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    WebAssembly: { Instance: WebAssembly.Instance },
+    addEventListener(type, fn) {
+      if (type === 'message') {
+        messageListeners.push(fn);
+      }
+    },
+    removeEventListener(type, fn) {
+      if (type === 'message') {
+        const idx = messageListeners.indexOf(fn);
+        if (idx >= 0) {
+          messageListeners.splice(idx, 1);
+        }
+      }
+    },
+  };
+
+  function dispatchMessage(data) {
+    let stopped = false;
+    const ev = {
+      data,
+      stopImmediatePropagation() {
+        stopped = true;
+      },
+    };
+    const snapshot = messageListeners.slice();
+    for (const fn of snapshot) {
+      fn(ev);
+      if (stopped) {
+        break;
+      }
+    }
+    return stopped;
+  }
+
+  const clientOps = [];
+  class MockHttpfsClient {
+    constructor(sab) {
+      this.sab = sab;
+    }
+    open(relPath) {
+      clientOps.push({ op: 'open', relPath, sab: this.sab });
+      return 17;
+    }
+    read(handle, offset, dstView, byteLength) {
+      clientOps.push({ op: 'read', handle, offset, byteLength });
+      const payload = new TextEncoder().encode('GTA6');
+      const n = Math.min(payload.byteLength, byteLength);
+      dstView.set(payload.subarray(0, n));
+      return BigInt(n);
+    }
+    close(handle) {
+      clientOps.push({ op: 'close', handle });
+      return true;
+    }
+  }
+
+  const handle = bootstrapEmscriptenPthreadWorker({
+    scope: mockScope,
+    importScriptsFn: (url) => {
+      assert.equal(url, './dist/runtime.js');
+      listenerRegisteredBeforeImport = messageListeners.length === 1;
+      // Simulate Emscripten registering its own message handler during importScripts.
+      mockScope.addEventListener('message', (ev) => {
+        emscriptenReceived.push(ev.data);
+      });
+    },
+    BroadcastChannelCtor: bus.BusBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+  });
+
+  assert.equal(listenerRegisteredBeforeImport, true);
+  assert.equal(messageListeners.length, 2);
+
+  // Deliver SAB via Worker.postMessage({ __playgta6_httpfs_sab: sab }).
+  const sab = createHttpfsMailboxBuffer(1024);
+  const stoppedForSab = dispatchMessage({ __playgta6_httpfs_sab: sab });
+  assert.equal(stoppedForSab, true);
+  assert.equal(emscriptenReceived.length, 0);
+
+  // Normal Emscripten messages must pass straight through to Emscripten's listener.
+  const stoppedForLoad = dispatchMessage({ cmd: 'load' });
+  assert.equal(stoppedForLoad, false);
+  assert.deepEqual(emscriptenReceived, [{ cmd: 'load' }]);
+
+  // Exercise host_httpfs_open, host_httpfs_read, and host_httpfs_close backed by the attached SAB.
+  const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  handle.hostImports.setMemory(mem);
+  const pathBytes = new TextEncoder().encode('boot/guest.pgim');
+  new Uint8Array(mem.buffer).set(pathBytes, 64);
+
+  const fd = handle.hostImports.env.host_httpfs_open(64n, BigInt(pathBytes.byteLength));
+  assert.equal(fd, 17);
+
+  const bytesRead = handle.hostImports.env.host_httpfs_read(fd, 0n, 256n, 8n);
+  assert.equal(bytesRead, 4n);
+  assert.equal(new TextDecoder().decode(new Uint8Array(mem.buffer, 256, 4)), 'GTA6');
+
+  handle.hostImports.env.host_httpfs_close(fd);
+  assert.deepEqual(clientOps, [
+    { op: 'open', relPath: 'boot/guest.pgim', sab },
+    { op: 'read', handle: 17, offset: 0n, byteLength: 8 },
+    { op: 'close', handle: 17 },
+  ]);
+
+  // cleanup() removes the bootstrap message listener cleanly and is idempotent.
+  handle.cleanup();
+  handle.cleanup();
+  assert.equal(messageListeners.length, 1);
+
+  const stoppedAfterCleanup = dispatchMessage({ __playgta6_httpfs_sab: sab });
+  assert.equal(stoppedAfterCleanup, false);
+  assert.equal(emscriptenReceived.length, 2);
+});
+
+test('W77 createPatchedPthreadEnv and installPthreadHostImportShim overwrite writable .stub === true own properties on baseEnv', () => {
+  const makeStub = (name) => {
+    const fn = () => {
+      throw new Error(`abort("missing function: ${name}")`);
+    };
+    fn.stub = true;
+    return fn;
+  };
+
+  // 1. Direct createPatchedPthreadEnv check on an Emscripten MAIN_MODULE=1 wasmImports object.
+  const logCalls = [];
+  const hostEnv = {
+    host_log: (ptr, len) => {
+      logCalls.push([ptr, len]);
+      return 'ok-log';
+    },
+    host_httpfs_open: () => 9,
+    host_httpfs_read: () => 24n,
+    host_httpfs_close: () => 'real-close',
+    host_wgpu_submit: () => 'ok-wgpu',
+  };
+
+  const memoryBase = new WebAssembly.Global({ value: 'i32', mutable: false }, 128);
+  const tableBase = new WebAssembly.Global({ value: 'i32', mutable: false }, 4);
+  const indirectTable = new WebAssembly.Table({ initial: 2, element: 'anyfunc' });
+  const liftedFn = () => 0x140000100;
+  const customNonStubClose = () => 'custom-close';
+  const nonAbiStub = makeStub('unrelated_emscripten_sym');
+
+  const wasmImports = {
+    __memory_base: memoryBase,
+    __table_base: tableBase,
+    __indirect_function_table: indirectTable,
+    lifted_fn: liftedFn,
+    host_log: makeStub('host_log'),
+    host_httpfs_open: makeStub('host_httpfs_open'),
+    host_httpfs_read: makeStub('host_httpfs_read'),
+    host_httpfs_close: customNonStubClose,
+    host_wgpu_submit: makeStub('host_wgpu_submit'),
+    unrelated_emscripten_sym: nonAbiStub,
+  };
+
+  const patched = createPatchedPthreadEnv(wasmImports, hostEnv, null);
+
+  // Unwrapped wasmImports itself must have writable .stub === true host_* properties overwritten.
+  assert.equal(wasmImports.host_log, hostEnv.host_log);
+  assert.equal(wasmImports.host_httpfs_open, hostEnv.host_httpfs_open);
+  assert.equal(wasmImports.host_httpfs_read, hostEnv.host_httpfs_read);
+  assert.equal(wasmImports.host_wgpu_submit, hostEnv.host_wgpu_submit);
+
+  // Non-stub functions, non-ABI stubs, and dynamic-linking properties stay untouched.
+  assert.equal(wasmImports.host_httpfs_close, customNonStubClose);
+  assert.equal(wasmImports.unrelated_emscripten_sym, nonAbiStub);
+  assert.equal(wasmImports.__memory_base, memoryBase);
+  assert.equal(wasmImports.__table_base, tableBase);
+  assert.equal(wasmImports.__indirect_function_table, indirectTable);
+  assert.equal(wasmImports.lifted_fn, liftedFn);
+
+  // Emscripten MAIN_MODULE=1 JS wrapper reading unwrapped `wasmImports["host_log"]` directly works!
+  function emscriptenGeneratedHostLog(...args) {
+    if (!wasmImports.host_log || wasmImports.host_log.stub) {
+      throw new Error('abort("missing function: host_log")');
+    }
+    return wasmImports.host_log(...args);
+  }
+  assert.equal(emscriptenGeneratedHostLog(16, 5), 'ok-log');
+  assert.deepEqual(logCalls, [[16, 5]]);
+  assert.equal(patched.host_log, hostEnv.host_log);
+  assert.equal(patched.host_httpfs_close, customNonStubClose);
+
+  // Proxy baseEnv that throws on set must still succeed via try/catch + Proxy get interception.
+  const readOnlyProxyEnv = new Proxy(
+    { host_log: makeStub('host_log'), lifted_fn: liftedFn },
+    {
+      set() {
+        throw new TypeError('read-only proxy');
+      },
+    },
+  );
+  const patchedReadOnly = createPatchedPthreadEnv(readOnlyProxyEnv, hostEnv, null);
+  assert.equal(patchedReadOnly.host_log, hostEnv.host_log);
+  assert.equal(patchedReadOnly.lifted_fn, liftedFn);
+
+  // 2. End-to-end check through installPthreadHostImportShim with real WebAssembly.Module.
+  const realLogs = [];
+  const realHostImports = createHostImports({
+    log: (msg) => realLogs.push(msg),
+    report: () => {},
+  });
+  const realScope = {
+    WebAssembly: {
+      Module: WebAssembly.Module,
+      Instance: WebAssembly.Instance,
+    },
+  };
+  const restore = installPthreadHostImportShim(realScope, realHostImports);
+
+  const wasmModule = new WebAssembly.Module(buildMinimalHostLogWasm());
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  const rawEnv = {
+    memory,
+    host_log: makeStub('host_log'),
+    host_httpfs_close: customNonStubClose,
+  };
+  const instance = new realScope.WebAssembly.Instance(wasmModule, { env: rawEnv });
+
+  // Verify rawEnv.host_log was patched in-place while non-stub host_httpfs_close stayed intact.
+  assert.equal(rawEnv.host_log, realHostImports.env.host_log);
+  assert.equal(rawEnv.host_httpfs_close, customNonStubClose);
+
+  const text = 'main-module wrapper ok';
+  const bytes = new TextEncoder().encode(text);
+  new Uint8Array(memory.buffer).set(bytes, 32);
+
+  // Both direct Wasm export AND JS wrapper calling rawEnv["host_log"] succeed.
+  instance.exports.ping(32, bytes.byteLength);
+  if (!rawEnv.host_log || rawEnv.host_log.stub) {
+    throw new Error('stub was not overwritten on rawEnv');
+  }
+  rawEnv.host_log(32, bytes.byteLength);
+  assert.deepEqual(realLogs, [text, text]);
+
+  restore();
 });

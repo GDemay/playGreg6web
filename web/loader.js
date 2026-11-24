@@ -24,7 +24,8 @@ const GPU_PACKET_HEADER_BYTES = 8;
 const GPU_OPCODE_PRESENT = 7;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
-// Emscripten 7.0.1 `-pthread` spawns `new Worker(self.location.href, { name: "em-pthread" })`.
+// Emscripten 7.0.1 `-pthread` spawns `new Worker(pthreadMainJs, { name: "em-pthread-" + id })`
+// (or legacy `{ name: "em-pthread" }`), which our coordinator Worker Proxy redirects to `loader.js`.
 // Detect pthread workers immediately so we bridge `env.host_*` imports and delegate straight
 // to `./dist/runtime.js` without overwriting Emscripten's `self.onmessage = handleMessage`.
 const initialWorkerScope = typeof self !== 'undefined' ? self : globalThis;
@@ -948,8 +949,18 @@ function tryOpenBroadcastChannel(BroadcastChannelCtor, channelName) {
   }
 }
 
+function isEmscriptenPthreadWorkerName(name) {
+  if (typeof name !== 'string') {
+    return false;
+  }
+  return (
+    name === EMSCRIPTEN_PTHREAD_WORKER_NAME ||
+    name.startsWith(`${EMSCRIPTEN_PTHREAD_WORKER_NAME}-`)
+  );
+}
+
 function isEmscriptenPthreadWorker(scope) {
-  return Boolean(scope && scope.name === EMSCRIPTEN_PTHREAD_WORKER_NAME);
+  return Boolean(scope && isEmscriptenPthreadWorkerName(scope.name));
 }
 
 function inspectRequiredHostAbiImports(wasmModule, wasmNs) {
@@ -1017,6 +1028,32 @@ function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
       }
     }
     return cloned;
+  }
+
+  // Emscripten MAIN_MODULE=1 generates JS wrappers (`function _host_log(...args) {
+  //   if (!wasmImports["host_log"] || wasmImports["host_log"].stub) abort(...);
+  //   return wasmImports["host_log"](...args);
+  // }`) that read the unwrapped `wasmImports` object directly rather than our Proxy.
+  // Overwrite writable own `.stub === true` properties in-place so those wrappers resolve.
+  for (let i = 0; i < targetNames.length; i += 1) {
+    const name = targetNames[i];
+    if (typeof hostEnv[name] !== 'function') {
+      continue;
+    }
+    try {
+      const desc = Reflect.getOwnPropertyDescriptor(baseEnv, name);
+      if (
+        desc &&
+        'value' in desc &&
+        desc.writable &&
+        typeof desc.value === 'function' &&
+        desc.value.stub === true
+      ) {
+        baseEnv[name] = hostEnv[name];
+      }
+    } catch {
+      // Ignore non-writable or Proxy-protected targets; the returned Proxy still intercepts reads.
+    }
   }
 
   // Wrap baseEnv in a transparent Proxy so Emscripten MAIN_MODULE=2 / SIDE_MODULE=1
@@ -1334,6 +1371,22 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     attachHttpfsSab(options.httpfsMailboxSab);
   }
 
+  const onPthreadBootstrapMessage = (ev) => {
+    const msg = ev && ev.data;
+    if (msg && typeof msg === 'object' && msg.__playgta6_httpfs_sab) {
+      attachHttpfsSab(msg.__playgta6_httpfs_sab);
+      if (typeof ev.stopImmediatePropagation === 'function') {
+        ev.stopImmediatePropagation();
+      }
+    }
+  };
+
+  let installedBootstrapMessageListener = false;
+  if (scope && typeof scope.addEventListener === 'function') {
+    scope.addEventListener('message', onPthreadBootstrapMessage);
+    installedBootstrapMessageListener = true;
+  }
+
   if (httpfsChannel) {
     httpfsChannel.onmessage = (ev) => {
       const msg = ev && ev.data;
@@ -1375,6 +1428,18 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     },
     cleanup() {
       restoreWasmInstance();
+      if (
+        installedBootstrapMessageListener &&
+        scope &&
+        typeof scope.removeEventListener === 'function'
+      ) {
+        try {
+          scope.removeEventListener('message', onPthreadBootstrapMessage);
+        } catch {
+          // Ignore removeEventListener errors during cleanup.
+        }
+        installedBootstrapMessageListener = false;
+      }
       if (scope && typeof scope === 'object') {
         if (installedScopeModule) {
           delete scope.Module;
@@ -1962,6 +2027,65 @@ async function tryBootWasmRuntime() {
 }
 
 if (typeof self !== 'undefined') {
+  const OriginalWorker =
+    typeof self.Worker === 'function'
+      ? self.Worker
+      : typeof Worker === 'function'
+        ? Worker
+        : null;
+  if (OriginalWorker) {
+    const WrappedWorker = new Proxy(OriginalWorker, {
+      construct(target, args, newTarget) {
+        const nextArgs = Array.prototype.slice.call(args);
+        const workerOpts = nextArgs.length >= 2 ? nextArgs[1] : undefined;
+        const isEmPthread = Boolean(
+          workerOpts &&
+            typeof workerOpts === 'object' &&
+            isEmscriptenPthreadWorkerName(workerOpts.name),
+        );
+        if (
+          isEmPthread &&
+          self.location &&
+          typeof self.location.href === 'string' &&
+          self.location.href.length > 0
+        ) {
+          nextArgs[0] = self.location.href;
+        }
+        const targetNew = newTarget === WrappedWorker ? target : newTarget;
+        const instance = Reflect.construct(target, nextArgs, targetNew);
+        if (
+          isEmPthread &&
+          httpfsMailboxSab &&
+          instance &&
+          typeof instance.postMessage === 'function'
+        ) {
+          try {
+            instance.postMessage({ __playgta6_httpfs_sab: httpfsMailboxSab });
+          } catch {
+            // Non-fatal: BroadcastChannel handshake remains as fallback.
+          }
+        }
+        return instance;
+      },
+    });
+    try {
+      self.Worker = WrappedWorker;
+    } catch {
+      // Ignore if self.Worker is non-writable in a custom harness.
+    }
+    if (
+      typeof globalThis !== 'undefined' &&
+      globalThis !== self &&
+      globalThis.Worker === OriginalWorker
+    ) {
+      try {
+        globalThis.Worker = WrappedWorker;
+      } catch {
+        // Ignore if globalThis.Worker is non-writable.
+      }
+    }
+  }
+
   const postToMain =
     typeof self.postMessage === 'function' ? (payload) => self.postMessage(payload) : null;
 
@@ -2127,7 +2251,9 @@ const exportedApi = {
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
   BOOT_INIT_FORWARD_KEYS,
+  isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
+  createPatchedPthreadEnv,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,
   inspectGpuPacketBatchForPresent,
