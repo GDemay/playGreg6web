@@ -121,12 +121,20 @@ DxgiFormatLayout dxgi_format_layout(uint32_t format) {
     else if (format >= 87 && format <= 93) set(4);
     else if (format >= 94 && format <= 99) set(16, 4, 4);
     else if (format == 115) set(2);
+    // Xbox-only formats (public Xbox DXGI extensions): 116 R10G10B10_7E3_A2_FLOAT and 117
+    // R10G10B10_6E4_A2_FLOAT (4 bytes), 118 D16_UNORM_S8_UINT with its plane views 119
+    // R16_UNORM_X8_TYPELESS and 120 X16_TYPELESS_G8_UINT (a 2-byte depth and a 1-byte stencil plane).
+    else if (format == 116 || format == 117) set(4);
+    else if (format >= 118 && format <= 120) set(2, 1, 1, 2);
     return l;
 }
 
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane) {
     const DxgiFormatLayout l = dxgi_format_layout(format);
     if (l.planes == 2) {
+        if (format >= 118 && format <= 120) {
+            return plane == 0 ? 2u : 1u;  // Xbox D16_UNORM_S8_UINT: 16-bit depth, 8-bit stencil
+        }
         return plane == 0 ? 4u : 1u;  // depth (D32 / D24) plane, then the 8-bit stencil plane
     }
     return l.block_bytes;
