@@ -8,6 +8,8 @@ const { WgpuCommandProcessor, OPCODES } = require('../web/workers/wgpu_worker.js
 const rs = require('../web/workers/render_state_packets.js');
 const {
   installRenderStatePackets,
+  clampViewportToTarget,
+  clampScissorToTarget,
   decodeRenderPipelineKey,
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
@@ -803,4 +805,279 @@ test('v2 packets are skipped by a processor without the extension and malformed 
   processor.executeCommandBuffer(bindGroup2Packet(1, 404, []));
   assert.deepEqual(handler.stats, { packets: 2, errors: 2 });
   assert.match(handler.lastError, /unknown bind group layout 404/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// G33: Swapchain & offscreen render-pass viewport/scissor clamping
+// ---------------------------------------------------------------------------------------------
+
+function beginRenderPassPacket({ colors = [], depthStencil = null } = {}) {
+  const payload = new Uint8Array(368);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, colors.length, true);
+  colors.forEach((c, i) => {
+    if (!c) return;
+    const o = 8 + 40 * i;
+    view.setUint32(o, c.textureId, true);
+    view.setUint8(o + 4, c.loadOp ?? 2); // clear
+    view.setUint8(o + 5, c.storeOp ?? 1); // store
+    if (c.view) payload.set(c.view, o + 8);
+  });
+  if (depthStencil) {
+    const d = 328;
+    view.setUint32(d, depthStencil.textureId, true);
+    view.setUint8(d + 4, depthStencil.depthLoadOp ?? 2); // clear
+    view.setUint8(d + 5, depthStencil.depthStoreOp ?? 1); // store
+    if (depthStencil.view) payload.set(depthStencil.view, d + 8);
+    view.setFloat32(d + 24, depthStencil.depthClearValue ?? 1, true);
+  }
+  return header(V2_OPCODES.BEGIN_RENDER_PASS, payload);
+}
+
+function setViewportPacket(x, y, width, height, minDepth, maxDepth) {
+  const payload = new Uint8Array(24);
+  const view = new DataView(payload.buffer);
+  view.setFloat32(0, x, true);
+  view.setFloat32(4, y, true);
+  view.setFloat32(8, width, true);
+  view.setFloat32(12, height, true);
+  view.setFloat32(16, minDepth, true);
+  view.setFloat32(20, maxDepth, true);
+  return header(V2_OPCODES.SET_VIEWPORT, payload);
+}
+
+function setScissorPacket(x, y, width, height) {
+  return new Stream().u32s(V2_OPCODES.SET_SCISSOR_RECT, [x, y, width, height]).bytes();
+}
+
+test('G33 clampViewportToTarget clamps oversized, offset, negative, and depth-out-of-range viewports', () => {
+  // 4K 3840x2160 guest viewport onto 1280x800 windowed swapchain
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 3840, height: 2160, minDepth: 0, maxDepth: 1 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 1280, height: 800, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Single-axis oversized full-origin viewport
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 3840, height: 600, minDepth: 0, maxDepth: 1 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 1280, height: 600, minDepth: 0, maxDepth: 1 }
+  );
+
+  // In-bounds viewport preserved verbatim
+  assert.deepEqual(
+    clampViewportToTarget({ x: 10, y: 20, width: 640, height: 360, minDepth: 0.125, maxDepth: 0.875 }, { width: 1280, height: 800 }),
+    { x: 10, y: 20, width: 640, height: 360, minDepth: 0.125, maxDepth: 0.875 }
+  );
+
+  // Offset out-of-bounds viewport clamped to exact valid sub-rect
+  assert.deepEqual(
+    clampViewportToTarget({ x: 1000, y: 700, width: 640, height: 360, minDepth: 0, maxDepth: 1 }, { width: 1280, height: 800 }),
+    { x: 1000, y: 700, width: 280, height: 100, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Offset completely beyond target bounds
+  assert.deepEqual(
+    clampViewportToTarget({ x: 2000, y: 1500, width: 640, height: 360, minDepth: 0, maxDepth: 1 }, { width: 1280, height: 800 }),
+    { x: 1280, y: 800, width: 0, height: 0, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Negative origin/dimensions clamped to valid non-negative bounds
+  assert.deepEqual(
+    clampViewportToTarget({ x: -20, y: -10, width: 1400, height: -5, minDepth: 0, maxDepth: 1 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 1280, height: 0, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Depth range clamping: outside [0, 1], reversed min > max, and non-finite inputs
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 640, height: 360, minDepth: -0.5, maxDepth: 2.5 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 640, height: 360, minDepth: 0, maxDepth: 1 }
+  );
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 640, height: 360, minDepth: 0.8, maxDepth: 0.2 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 640, height: 360, minDepth: 0.2, maxDepth: 0.8 }
+  );
+  assert.deepEqual(
+    clampViewportToTarget({ x: Number.NaN, y: -0, width: 640, height: 360, minDepth: Number.NaN, maxDepth: Number.POSITIVE_INFINITY }, null),
+    { x: 0, y: 0, width: 640, height: 360, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Missing or non-positive targetSize preserves positive dimensions while sanitizing depth
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 3840, height: 2160, minDepth: -1, maxDepth: 2 }, null),
+    { x: 0, y: 0, width: 3840, height: 2160, minDepth: 0, maxDepth: 1 }
+  );
+  assert.deepEqual(
+    clampViewportToTarget({ x: 0, y: 0, width: 3840, height: 2160, minDepth: 1, maxDepth: 0 }, { width: 0, height: 800 }),
+    { x: 0, y: 0, width: 3840, height: 2160, minDepth: 0, maxDepth: 1 }
+  );
+});
+
+test('G33 clampScissorToTarget clamps oversized, offset, and fractional scissor rects', () => {
+  // 4K 3840x2160 onto 1280x800 swapchain
+  assert.deepEqual(
+    clampScissorToTarget({ x: 0, y: 0, width: 3840, height: 2160 }, { width: 1280, height: 800 }),
+    { x: 0, y: 0, width: 1280, height: 800 }
+  );
+
+  // In-bounds scissor preserved verbatim
+  assert.deepEqual(
+    clampScissorToTarget({ x: 8, y: 8, width: 1264, height: 704 }, { width: 1280, height: 720 }),
+    { x: 8, y: 8, width: 1264, height: 704 }
+  );
+
+  // Offset out-of-bounds scissor clamped to exact valid sub-rect
+  assert.deepEqual(
+    clampScissorToTarget({ x: 1000, y: 700, width: 500, height: 300 }, { width: 1280, height: 800 }),
+    { x: 1000, y: 700, width: 280, height: 100 }
+  );
+
+  // Completely out-of-bounds offset
+  assert.deepEqual(
+    clampScissorToTarget({ x: 2000, y: 1500, width: 500, height: 300 }, { width: 1280, height: 800 }),
+    { x: 1280, y: 800, width: 0, height: 0 }
+  );
+
+  // Negative/fractional values floored and clamped
+  assert.deepEqual(
+    clampScissorToTarget({ x: -5.4, y: 10.9, width: 1300.7, height: 900.2 }, { width: 1280, height: 800 }),
+    { x: 0, y: 10, width: 1280, height: 790 }
+  );
+
+  // Missing targetSize preserves non-negative integer rect
+  assert.deepEqual(
+    clampScissorToTarget({ x: 0, y: 0, width: 3840, height: 2160 }, null),
+    { x: 0, y: 0, width: 3840, height: 2160 }
+  );
+});
+
+test('G33 swapchain render pass clamps 4K 3840x2160 viewport/scissor to 1280x800 canvas bounds', () => {
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 800 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const stream = concat(
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+    // Oversized 4K guest viewport/scissor + out-of-range depth
+    setViewportPacket(0, 0, 3840, 2160, -0.25, 1.5),
+    setScissorPacket(0, 0, 3840, 2160),
+    // In-bounds viewport/scissor preserved verbatim
+    setViewportPacket(16, 24, 640, 360, 0, 1),
+    setScissorPacket(16, 24, 640, 360),
+    // Offset out-of-bounds viewport/scissor + reversed depth
+    setViewportPacket(1000, 700, 640, 360, 0.75, 0.25),
+    setScissorPacket(1000, 700, 640, 360),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const result = processor.executeCommandBuffer(stream);
+  assert.equal(result.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler._activePassTargetSize, null, 'END_RENDER_PASS must clear active pass bounds');
+
+  const viewports = gpu.passCalls.filter((c) => c.op === 'setViewport').map((c) => c.args);
+  const scissors = gpu.passCalls.filter((c) => c.op === 'setScissorRect').map((c) => c.args);
+  assert.deepEqual(viewports, [
+    [0, 0, 1280, 800, 0, 1],
+    [16, 24, 640, 360, 0, 1],
+    [1000, 700, 280, 100, 0.25, 0.75],
+  ]);
+  assert.deepEqual(scissors, [
+    [0, 0, 1280, 800],
+    [16, 24, 640, 360],
+    [1000, 700, 280, 100],
+  ]);
+});
+
+test('G33 swapchain size resolves via ctl.canvasWidth/canvasHeight, ctl.getCanvasTexture(), processor.canvas, and ctx.getCurrentTexture()', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // 1. ctl.canvasWidth / ctl.canvasHeight
+  assert.deepEqual(handler._resolveSwapchainSize({ canvasWidth: 1280, canvasHeight: 800 }), { width: 1280, height: 800 });
+
+  // 2. ctl.getCanvasTexture()
+  assert.deepEqual(
+    handler._resolveSwapchainSize({ getCanvasTexture: () => ({ width: 1920, height: 1080 }) }),
+    { width: 1920, height: 1080 }
+  );
+
+  // 3. processor.canvas
+  processor.canvas = { width: 1024, height: 768 };
+  assert.deepEqual(handler._resolveSwapchainSize({}), { width: 1024, height: 768 });
+  delete processor.canvas;
+
+  // 4. ctx.getCurrentTexture() returning { width, height }
+  gpu.ctx.getCurrentTexture = () => ({ width: 1600, height: 900, createView: () => gpu.swapchainView });
+  assert.deepEqual(handler._resolveSwapchainSize({}), { width: 1600, height: 900 });
+});
+
+test('G33 offscreen texture attachment bounds clamp viewport/scissor for color, mip, and depth-only passes', () => {
+  const gpu = createMockWebGpu();
+  // Expose WebGPU-spec texture.width / texture.height on created offscreen textures.
+  const origCreateTexture = gpu.device.createTexture.bind(gpu.device);
+  gpu.device.createTexture = (desc) => {
+    const tex = origCreateTexture(desc);
+    tex.width = desc.size.width;
+    tex.height = desc.size.height;
+    return tex;
+  };
+  gpu.ctx.canvas = { width: 1280, height: 800 };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const stream = concat(
+    new Stream()
+      .texture(500, 512, 256, 0) // offscreen color 512x256
+      .texture(501, 1024, 1024, 4) // depth-only shadow map 1024x1024
+      .packet(OPCODES.BEGIN_FRAME)
+      .bytes(),
+    // Pass 1: offscreen color attachment (512x256)
+    beginRenderPassPacket({ colors: [{ textureId: 500 }] }),
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(256, 128, 1024, 512),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass 2: offscreen color attachment at mip level 1 (256x128)
+    beginRenderPassPacket({
+      colors: [{ textureId: 500, view: viewDesc({ baseMip: 1, mipCount: 1 }) }],
+    }),
+    setViewportPacket(0, 0, 512, 256, 0, 1),
+    setScissorPacket(0, 0, 512, 256),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass 3: depth-only pass (1024x1024)
+    beginRenderPassPacket({ colors: [], depthStencil: { textureId: 501 } }),
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(512, 512, 2048, 2048),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass 4: swapchain pass (1280x800) verifies no stale offscreen bounds leaked
+    beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(0, 0, 3840, 2160),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const result = processor.executeCommandBuffer(stream);
+  assert.equal(result.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler._activePassTargetSize, null);
+
+  const viewports = gpu.passCalls.filter((c) => c.op === 'setViewport').map((c) => c.args);
+  const scissors = gpu.passCalls.filter((c) => c.op === 'setScissorRect').map((c) => c.args);
+  assert.deepEqual(viewports, [
+    [0, 0, 512, 256, 0, 1],
+    [0, 0, 256, 128, 0, 1],
+    [0, 0, 1024, 1024, 0, 1],
+    [0, 0, 1280, 800, 0, 1],
+  ]);
+  assert.deepEqual(scissors, [
+    [256, 128, 256, 128],
+    [0, 0, 256, 128],
+    [512, 512, 512, 512],
+    [0, 0, 1280, 800],
+  ]);
 });
