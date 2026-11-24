@@ -24,8 +24,8 @@ use naga::{
     FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass, ImageDimension,
     Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module, Range,
     ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage, Span,
-    Statement, StorageAccess, StorageFormat, StructMember, SwizzleComponent, Type, TypeInner,
-    UnaryOperator, VectorSize,
+    Statement, StorageAccess, StorageFormat, StructMember, SwitchCase, SwitchValue,
+    SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
 };
 
 use crate::convert::{ShaderStage, format_shader_hash};
@@ -34,6 +34,11 @@ use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
     analyze_instructions, decode_program, sop2_src_pair_widths, sopc_src_pair_widths,
     vop2_is_co_ci, vop2_is_madk,
+};
+use crate::rdna2_cfg::{
+    BlockId, BranchKind, ControlFlowGraph, DISPATCH_EXIT_PC, ExecMaskOp, ExecMaskWrite,
+    STRUCTURED_LOOP_MAX_ITERATIONS, StructuredNode, Terminator, classify_exec_mask_op,
+    structure_cfg,
 };
 
 /// Default minimum number of `vec4<u32>` slots in a statically-sized uniform CBV (`cb0`, `cb1`, ...).
@@ -421,6 +426,9 @@ struct ProgramPlan {
     sgprs: BTreeSet<u8>,
     needs_vcc: bool,
     needs_scc: bool,
+    /// Single-lane `exec_mask` model is required (exec-mask SOP1 ops, `exec` SOP1/SOP2
+    /// destinations, or `s_cbranch_execz/execnz`).
+    needs_exec: bool,
 }
 
 fn resolve_stage(inferred: Rdna2InferredStage, override_stage: Rdna2StageOverride) -> ShaderStage {
@@ -1207,6 +1215,7 @@ fn plan_program(
     let mut read_before_write_sgprs: BTreeSet<u8> = BTreeSet::new();
     let mut needs_vcc = false;
     let mut needs_scc = false;
+    let mut needs_exec = false;
 
     // Record a source operand read (register usage, read-before-write, VCC/SCC needs).
     macro_rules! record_src {
@@ -1287,7 +1296,29 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                if matches!(*op, 0x04 | 0x0A) {
+                if *sdst == 126 {
+                    // `exec_lo` / `exec` destination (e.g. `s_mov_b64 exec, s[0:1]`).
+                    needs_exec = true;
+                }
+                if let Some(write) = classify_exec_mask_op(inst) {
+                    // `s_*_saveexec_*` / `s_andn{1,2}_wrexec_*`: read `exec`, write `exec`,
+                    // `sdst` (an SGPR pair for `_b64`) and `scc`.
+                    needs_exec = true;
+                    needs_scc = true;
+                    if write.wave64 {
+                        record_src_pair_hi!(u16::from(*ssrc0));
+                    }
+                    if *sdst <= 105 {
+                        sgprs.insert(*sdst);
+                        written_sgprs.insert(*sdst);
+                        if write.wave64 && *sdst <= 104 {
+                            sgprs.insert(*sdst + 1);
+                            written_sgprs.insert(*sdst + 1);
+                        }
+                    } else if *sdst == 106 {
+                        needs_vcc = true;
+                    }
+                } else if matches!(*op, 0x04 | 0x0A) {
                     // s_mov_b64 / s_wqm_b64: 64-bit SGPR pair source and destination
                     if *ssrc0 <= 104 {
                         let hi = *ssrc0 + 1;
@@ -1371,6 +1402,10 @@ fn plan_program(
                 if matches!(*op, 0x0A | 0x0B) {
                     // s_cselect_b32 / s_cselect_b64 read SCC
                     needs_scc = true;
+                }
+                if *sdst == 126 {
+                    // `exec_lo` / `exec` destination (e.g. `s_or_b32 exec_lo, exec_lo, s0`).
+                    needs_exec = true;
                 }
                 if pair0 && *sdst <= 104 {
                     // 64-bit SGPR pair destination
@@ -1975,9 +2010,14 @@ fn plan_program(
                     _ => {}
                 }
             }
-            Rdna2Detail::Sopp { .. }
-            | Rdna2Detail::Flat { .. }
-            | Rdna2Detail::Unknown { .. } => {}
+            Rdna2Detail::Sopp { op, .. } => match BranchKind::from_sopp_op(*op) {
+                // Branch conditions lifted by `rdna2_cfg` read SCC / VCC / EXEC.
+                Some(BranchKind::Scc0 | BranchKind::Scc1) => needs_scc = true,
+                Some(BranchKind::Vccz | BranchKind::Vccnz) => needs_vcc = true,
+                Some(BranchKind::Execz | BranchKind::Execnz) => needs_exec = true,
+                Some(BranchKind::Unconditional) | None => {}
+            },
+            Rdna2Detail::Flat { .. } | Rdna2Detail::Unknown { .. } => {}
         }
     }
 
@@ -2157,6 +2197,7 @@ fn plan_program(
         sgprs,
         needs_vcc,
         needs_scc,
+        needs_exec,
     }
 }
 
@@ -2208,6 +2249,17 @@ struct IrEmitter {
     sgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     vcc_local: Option<Handle<LocalVariable>>,
     scc_local: Option<Handle<LocalVariable>>,
+    /// Single-lane `exec_mask: u32` (`1u` = this invocation's lane is active).
+    exec_local: Option<Handle<LocalVariable>>,
+    /// `true` when the body is lowered through `rdna2_cfg` structured control flow.
+    structured_cf: bool,
+    /// Nesting depth of structured `if` / `loop` / `switch` bodies currently being lowered.
+    cf_depth: usize,
+    /// Set once a `return` was emitted inside nested control flow: everything after it at the
+    /// top level is non-uniform for WGSL uniformity analysis.
+    cf_nonuniform_return: bool,
+    /// Counter for unique structured-loop / dispatcher local names.
+    cf_local_counter: usize,
     vs_out_local: Option<Handle<LocalVariable>>,
     vs_param_member_index: BTreeMap<u8, u32>,
     ps_out_local: Option<Handle<LocalVariable>>,
@@ -2890,6 +2942,19 @@ impl IrEmitter {
             None
         };
 
+        let exec_local = if plan.needs_exec {
+            Some(func.local_variables.append(
+                LocalVariable {
+                    name: Some("exec_mask".to_string()),
+                    ty: u32_ty,
+                    init: None,
+                },
+                Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
         let mut emitter = Self {
             module,
             types,
@@ -2917,6 +2982,11 @@ impl IrEmitter {
             sgpr_locals,
             vcc_local,
             scc_local,
+            exec_local,
+            structured_cf: false,
+            cf_depth: 0,
+            cf_nonuniform_return: false,
+            cf_local_counter: 0,
             vs_out_local,
             vs_param_member_index,
             ps_out_local,
@@ -3972,6 +4042,27 @@ impl IrEmitter {
     fn store_sgpr_u32(&mut self, reg: u8, val: Handle<Expression>) {
         if let Some(&local) = self.sgpr_locals.get(&reg) {
             self.store_local(local, val);
+        } else if reg == 126 {
+            // `exec_lo` destination: keep this lane's bit.
+            self.store_exec_lane_bit(val);
+        }
+    }
+
+    /// Load the single-lane `exec_mask` (`1u` when the model is inactive: all lanes on).
+    fn load_exec(&mut self) -> Handle<Expression> {
+        if let Some(local) = self.exec_local {
+            self.load_local(local)
+        } else {
+            self.lit_u32(1)
+        }
+    }
+
+    /// `exec_mask = (val & 1u)` (no-op when the shader never needs `exec_mask`).
+    fn store_exec_lane_bit(&mut self, val: Handle<Expression>) {
+        if let Some(local) = self.exec_local {
+            let one = self.lit_u32(1);
+            let bit = self.emit_bin(BinaryOperator::And, val, one);
+            self.store_local(local, bit);
         }
     }
 
@@ -4024,6 +4115,11 @@ impl IrEmitter {
         if let Some(scc) = self.scc_local {
             let f = self.lit_bool(false);
             self.store_local(scc, f);
+        }
+        if let Some(exec) = self.exec_local {
+            // One WGSL invocation models one active wave lane.
+            let one = self.lit_u32(1);
+            self.store_local(exec, one);
         }
 
         // Stage-specific prologue bindings into VGPRs & default output struct values.
@@ -4180,6 +4276,8 @@ impl IrEmitter {
                     reject: f,
                 })
             }
+            126 if self.exec_local.is_some() => self.load_exec(),
+            127 if self.exec_local.is_some() => self.lit_u32(0),
             126 | 127 => self.lit_u32(0xFFFF_FFFF),
             128..=192 => self.lit_u32(u32::from(src - 128)),
             193..=208 => {
@@ -4532,7 +4630,7 @@ impl IrEmitter {
     fn read_lane_mask_bit(&mut self, src: u16, literal: Option<u32>) -> Handle<Expression> {
         match src {
             106 => self.load_vcc(),
-            126 => self.lit_bool(true),
+            126 if self.exec_local.is_none() => self.lit_bool(true),
             _ => {
                 let v = self.read_src_u32(src, literal);
                 let one = self.lit_u32(1);
@@ -4557,6 +4655,7 @@ impl IrEmitter {
             0..=104 => (self.load_sgpr_u32(src), self.load_sgpr_u32(src + 1)),
             105 => (self.load_sgpr_u32(105), self.lit_u32(0)),
             106 => (self.read_src_u32(106, None), self.lit_u32(0)),
+            126 if self.exec_local.is_some() => (self.load_exec(), self.lit_u32(0)),
             126 => (self.lit_u32(0xFFFF_FFFF), self.lit_u32(0xFFFF_FFFF)),
             128..=192 => (self.lit_u32(u32::from(src - 128)), self.lit_u32(0)),
             193..=208 => {
@@ -4610,6 +4709,7 @@ impl IrEmitter {
                 let cond = self.emit_bin(BinaryOperator::NotEqual, bit, zero);
                 self.store_vcc(cond);
             }
+            126 => self.store_exec_lane_bit(lo),
             _ => {}
         }
     }
@@ -4856,7 +4956,16 @@ impl IrEmitter {
             return;
         }
 
+        let exec_write = classify_exec_mask_op(inst);
         let handled = match &inst.detail {
+            Rdna2Detail::Sop1 {
+                sdst,
+                ssrc0,
+                literal,
+                ..
+            } if exec_write.is_some() => {
+                self.translate_exec_mask_write(exec_write.unwrap(), *sdst, *ssrc0, *literal)
+            }
             Rdna2Detail::Sopp { op, .. } => self.translate_sopp(*op, inst.offset),
             Rdna2Detail::Sopc {
                 op,
@@ -5038,10 +5147,19 @@ impl IrEmitter {
             // s_endpgm_saved, s_endpgm_ordered_ps_done, s_code_end,
             // s_inst_prefetch, s_clause, s_wait_idle, s_waitcnt_depctr
             0x00 | 0x01 | 0x0C | 0x0F | 0x1B | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 => true,
+            // s_branch / s_cbranch_{scc0,scc1,vccz,vccnz,execz,execnz}: lifted into structured
+            // WGSL control flow by `rdna2_cfg` (the branch itself emits no statement).
+            0x02 | 0x04..=0x09 => self.structured_cf,
             // s_barrier: `workgroupBarrier()` in compute; WGSL/WebGPU forbids it in vertex and
             // fragment stages (no workgroups there), so it lowers to a documented no-op.
+            // WGSL also requires barriers in uniform control flow, which lifted RDNA2 branches
+            // (conditions on per-invocation `scc` / `vcc` / `exec_mask`) never are.
             0x0A => {
-                if self.stage == ShaderStage::Compute {
+                if self.stage == ShaderStage::Compute && self.in_nonuniform_cf() {
+                    self.note_comments.push(format!(
+                        "// note [0x{offset:04x}] s_barrier skipped inside structured control flow for WGSL uniformity"
+                    ));
+                } else if self.stage == ShaderStage::Compute {
                     self.func.body.push(
                         Statement::ControlBarrier(naga::Barrier::WORK_GROUP),
                         Span::UNDEFINED,
@@ -5187,6 +5305,7 @@ impl IrEmitter {
                         });
                         self.store_vcc(cond);
                     }
+                    126 => self.store_exec_lane_bit(lo),
                     _ => {}
                 }
                 true
@@ -7950,13 +8069,14 @@ impl IrEmitter {
                 });
                 SampleLevel::Gradient { x, y }
             } else if let Some(bias_off) = layout.bias_off {
-                if self.stage == ShaderStage::Fragment {
+                // Implicit-derivative sampling requires uniform control flow in WGSL.
+                if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
                     let bias = self.load_vgpr_f32(vaddr.saturating_add(bias_off));
                     SampleLevel::Bias(bias)
                 } else {
                     SampleLevel::Exact(self.lit_f32(0.0))
                 }
-            } else if self.stage == ShaderStage::Fragment {
+            } else if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
                 SampleLevel::Auto
             } else {
                 SampleLevel::Exact(self.lit_f32(0.0))
@@ -8759,6 +8879,399 @@ impl IrEmitter {
         }
     }
 
+    // -- Exec mask (single-lane model) --
+
+    /// `s_*_saveexec_b32/b64` and `s_andn{1,2}_wrexec_b32/b64` on the single-lane
+    /// `exec_mask` (`0u` / `1u`): `exec_mask = op(src0 & 1u, exec_mask) & 1u`,
+    /// `scc = (exec_mask != 0u)`; `sdst` receives the old mask (saveexec) or the new mask
+    /// (wrexec), with a zero high dword for `_b64`.
+    fn translate_exec_mask_write(
+        &mut self,
+        write: ExecMaskWrite,
+        sdst: u8,
+        ssrc0: u8,
+        literal: Option<u32>,
+    ) -> bool {
+        let src = if write.wave64 {
+            self.read_ssrc_pair(ssrc0, literal).0
+        } else {
+            self.read_src_u32(u16::from(ssrc0), literal)
+        };
+        let one = self.lit_u32(1);
+        let s = self.emit_bin(BinaryOperator::And, src, one);
+        let old = self.load_exec();
+        let (bin, not_s, not_e, not_result) = match write.op {
+            ExecMaskOp::AndSaveExec => (BinaryOperator::And, false, false, false),
+            ExecMaskOp::OrSaveExec => (BinaryOperator::InclusiveOr, false, false, false),
+            ExecMaskOp::XorSaveExec => (BinaryOperator::ExclusiveOr, false, false, false),
+            ExecMaskOp::AndN2SaveExec | ExecMaskOp::AndN2WrExec => {
+                (BinaryOperator::And, false, true, false)
+            }
+            ExecMaskOp::OrN2SaveExec => (BinaryOperator::InclusiveOr, false, true, false),
+            ExecMaskOp::NandSaveExec => (BinaryOperator::And, false, false, true),
+            ExecMaskOp::NorSaveExec => (BinaryOperator::InclusiveOr, false, false, true),
+            ExecMaskOp::XnorSaveExec => (BinaryOperator::ExclusiveOr, false, false, true),
+            ExecMaskOp::AndN1SaveExec | ExecMaskOp::AndN1WrExec => {
+                (BinaryOperator::And, true, false, false)
+            }
+            ExecMaskOp::OrN1SaveExec => (BinaryOperator::InclusiveOr, true, false, false),
+        };
+        let lhs = if not_s { self.emit_bit_not(s) } else { s };
+        let rhs = if not_e { self.emit_bit_not(old) } else { old };
+        let raw = self.emit_bin(bin, lhs, rhs);
+        let raw = if not_result {
+            self.emit_bit_not(raw)
+        } else {
+            raw
+        };
+        let one = self.lit_u32(1);
+        let new = self.emit_bin(BinaryOperator::And, raw, one);
+
+        let saved = if matches!(write.op, ExecMaskOp::AndN1WrExec | ExecMaskOp::AndN2WrExec) {
+            new
+        } else {
+            old
+        };
+        if write.wave64 {
+            let zero = self.lit_u32(0);
+            self.store_sdst_pair(sdst, saved, zero);
+        } else if sdst == 106 {
+            let zero = self.lit_u32(0);
+            let cond = self.emit_bin(BinaryOperator::NotEqual, saved, zero);
+            self.store_vcc(cond);
+        } else {
+            self.store_sgpr_u32(sdst, saved);
+        }
+        if let Some(local) = self.exec_local {
+            self.store_local(local, new);
+        }
+        self.update_scc_nonzero(new);
+        true
+    }
+
+    // -- Structured control flow (rdna2_cfg) --
+
+    /// `true` while lowering code that WGSL uniformity analysis treats as non-uniform:
+    /// any nested structured body, or top-level code after a nested `return`.
+    fn in_nonuniform_cf(&self) -> bool {
+        self.structured_cf && (self.cf_depth > 0 || self.cf_nonuniform_return)
+    }
+
+    /// `true` when the current block already ends in a control transfer, so further
+    /// statements would be unreachable.
+    fn body_terminated(&self) -> bool {
+        matches!(
+            self.func.body.last(),
+            Some(
+                Statement::Return { .. } | Statement::Break | Statement::Continue | Statement::Kill
+            )
+        )
+    }
+
+    fn push_stmt(&mut self, stmt: Statement) {
+        self.func.body.push(stmt, Span::UNDEFINED);
+    }
+
+    /// Emit the stage-correct `return` (`return out;` for vertex/fragment, `return;` for
+    /// compute).
+    fn emit_stage_return(&mut self) {
+        let out_local = match self.stage {
+            ShaderStage::Vertex => self.vs_out_local,
+            ShaderStage::Fragment => self.ps_out_local,
+            ShaderStage::Compute => None,
+        };
+        let value = out_local.map(|local| self.load_local(local));
+        self.push_stmt(Statement::Return { value });
+        if self.cf_depth > 0 {
+            self.cf_nonuniform_return = true;
+        }
+    }
+
+    /// Lower `f` into a fresh nested block (one structured nesting level deeper).
+    fn lower_nested(&mut self, f: impl FnOnce(&mut Self)) -> naga::Block {
+        let saved = std::mem::replace(&mut self.func.body, naga::Block::new());
+        self.cf_depth += 1;
+        f(self);
+        self.cf_depth -= 1;
+        std::mem::replace(&mut self.func.body, saved)
+    }
+
+    fn new_cf_local(&mut self, prefix: &str) -> Handle<LocalVariable> {
+        let name = format!("{prefix}{}", self.cf_local_counter);
+        self.cf_local_counter += 1;
+        self.func.local_variables.append(
+            LocalVariable {
+                name: Some(name),
+                ty: self.types.u32_ty,
+                init: None,
+            },
+            Span::UNDEFINED,
+        )
+    }
+
+    /// WGSL condition for "branch of `kind` is taken" (`scc`/`vcc` are `bool`,
+    /// `exec_mask` is `u32`).
+    fn branch_condition(&mut self, kind: BranchKind) -> Handle<Expression> {
+        match kind {
+            BranchKind::Unconditional => self.lit_bool(true),
+            BranchKind::Scc1 => self.load_scc(),
+            BranchKind::Vccnz => self.load_vcc(),
+            BranchKind::Scc0 | BranchKind::Vccz => {
+                let v = if kind == BranchKind::Scc0 {
+                    self.load_scc()
+                } else {
+                    self.load_vcc()
+                };
+                self.emit_expr(Expression::Unary {
+                    op: UnaryOperator::LogicalNot,
+                    expr: v,
+                })
+            }
+            BranchKind::Execz | BranchKind::Execnz => {
+                let e = self.load_exec();
+                let zero = self.lit_u32(0);
+                let op = if kind == BranchKind::Execz {
+                    BinaryOperator::Equal
+                } else {
+                    BinaryOperator::NotEqual
+                };
+                self.emit_bin(op, e, zero)
+            }
+        }
+    }
+
+    /// Translate every instruction of a basic block, including its trailing control
+    /// instruction (branches count as translated: their control flow is structured).
+    ///
+    /// Register values never carry over between blocks as folded constants: every read
+    /// re-loads the function-scope `var`, so values assigned on one path or loop iteration
+    /// can never leak into a merge block or loop header.
+    fn lower_basic_block(
+        &mut self,
+        id: BlockId,
+        cfg: &ControlFlowGraph,
+        insts: &[Rdna2Instruction],
+    ) {
+        let Some(block) = cfg.blocks.get(id) else {
+            return;
+        };
+        for idx in block.instr_range.clone() {
+            if self.body_terminated() {
+                break;
+            }
+            if let Some(inst) = insts.get(idx) {
+                self.translate_instruction(idx, inst);
+            }
+        }
+    }
+
+    /// Lower a structured control-flow tree from [`structure_cfg`] into naga IR.
+    fn lower_structured(
+        &mut self,
+        node: &StructuredNode,
+        cfg: &ControlFlowGraph,
+        insts: &[Rdna2Instruction],
+    ) {
+        if self.body_terminated() {
+            return;
+        }
+        match node {
+            StructuredNode::Block(id) => self.lower_basic_block(*id, cfg, insts),
+            StructuredNode::Seq(nodes) => {
+                for n in nodes {
+                    if self.body_terminated() {
+                        break;
+                    }
+                    self.lower_structured(n, cfg, insts);
+                }
+            }
+            StructuredNode::If {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let condition = self.branch_condition(*cond);
+                let accept = self.lower_nested(|s| s.lower_structured(then_branch, cfg, insts));
+                let reject = match else_branch {
+                    Some(e) => self.lower_nested(|s| s.lower_structured(e, cfg, insts)),
+                    None => naga::Block::new(),
+                };
+                self.push_stmt(Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                });
+            }
+            StructuredNode::Loop { body } => {
+                let guard = self.new_cf_local("_pg6_loop");
+                let zero = self.lit_u32(0);
+                self.store_local(guard, zero);
+                let body = self.lower_nested(|s| {
+                    s.emit_iteration_guard(guard, STRUCTURED_LOOP_MAX_ITERATIONS);
+                    s.lower_structured(body, cfg, insts);
+                });
+                self.push_stmt(Statement::Loop {
+                    body,
+                    continuing: naga::Block::new(),
+                    break_if: None,
+                });
+            }
+            StructuredNode::Break => self.push_stmt(Statement::Break),
+            StructuredNode::Continue => self.push_stmt(Statement::Continue),
+            StructuredNode::Return => self.emit_stage_return(),
+            StructuredNode::Dispatch {
+                entry,
+                blocks,
+                max_iterations,
+            } => self.lower_dispatch(*entry, blocks, *max_iterations, cfg, insts),
+        }
+    }
+
+    /// `if (guard >= max) { break; } guard = guard + 1u;`
+    fn emit_iteration_guard(&mut self, guard: Handle<LocalVariable>, max: u32) {
+        let g = self.load_local(guard);
+        let limit = self.lit_u32(max);
+        let done = self.emit_bin(BinaryOperator::GreaterEqual, g, limit);
+        let mut brk = naga::Block::new();
+        brk.push(Statement::Break, Span::UNDEFINED);
+        self.push_stmt(Statement::If {
+            condition: done,
+            accept: brk,
+            reject: naga::Block::new(),
+        });
+        let one = self.lit_u32(1);
+        let next = self.emit_bin(BinaryOperator::Add, g, one);
+        self.store_local(guard, next);
+    }
+
+    /// Edge to `target` inside a dispatcher: program exit returns, member blocks set the
+    /// program counter, anything else leaves the dispatcher.
+    fn dispatch_transfer(
+        &mut self,
+        target: BlockId,
+        members: &BTreeSet<BlockId>,
+        pc: Handle<LocalVariable>,
+        cfg: &ControlFlowGraph,
+    ) {
+        if Some(target) == cfg.exit_block {
+            self.emit_stage_return();
+        } else {
+            let next = if members.contains(&target) {
+                u32::try_from(target).unwrap_or(DISPATCH_EXIT_PC)
+            } else {
+                DISPATCH_EXIT_PC
+            };
+            let v = self.lit_u32(next);
+            self.store_local(pc, v);
+        }
+    }
+
+    /// Bounded `loop { switch (pc) { ... } }` fallback for irreducible regions.
+    fn lower_dispatch(
+        &mut self,
+        entry: BlockId,
+        blocks: &[BlockId],
+        max_iterations: u32,
+        cfg: &ControlFlowGraph,
+        insts: &[Rdna2Instruction],
+    ) {
+        let members: BTreeSet<BlockId> = blocks
+            .iter()
+            .copied()
+            .filter(|&b| {
+                b < cfg.blocks.len() && u32::try_from(b).is_ok_and(|v| v != DISPATCH_EXIT_PC)
+            })
+            .collect();
+        let pc = self.new_cf_local("_pg6_pc");
+        let iter = self.new_cf_local("_pg6_iter");
+        let entry_pc = if members.contains(&entry) {
+            u32::try_from(entry).unwrap_or(DISPATCH_EXIT_PC)
+        } else {
+            DISPATCH_EXIT_PC
+        };
+        let v = self.lit_u32(entry_pc);
+        self.store_local(pc, v);
+        let zero = self.lit_u32(0);
+        self.store_local(iter, zero);
+
+        let body = self.lower_nested(|s| {
+            s.emit_iteration_guard(iter, max_iterations);
+            // if (pc == EXIT) { break; }
+            let cur = s.load_local(pc);
+            let exit = s.lit_u32(DISPATCH_EXIT_PC);
+            let leave = s.emit_bin(BinaryOperator::Equal, cur, exit);
+            let mut brk = naga::Block::new();
+            brk.push(Statement::Break, Span::UNDEFINED);
+            s.push_stmt(Statement::If {
+                condition: leave,
+                accept: brk,
+                reject: naga::Block::new(),
+            });
+
+            let selector = s.load_local(pc);
+            let mut cases = Vec::with_capacity(members.len() + 1);
+            for &id in &members {
+                let terminator = cfg.blocks[id].terminator;
+                let case_body = s.lower_nested(|s| {
+                    s.lower_basic_block(id, cfg, insts);
+                    if s.body_terminated() {
+                        return;
+                    }
+                    match terminator {
+                        Terminator::End => s.emit_stage_return(),
+                        Terminator::Fallthrough(t) | Terminator::Branch(t) => {
+                            s.dispatch_transfer(t, &members, pc, cfg);
+                        }
+                        Terminator::CondBranch {
+                            kind,
+                            target,
+                            fallthrough,
+                        } => {
+                            let condition = s.branch_condition(kind);
+                            let accept =
+                                s.lower_nested(|s| s.dispatch_transfer(target, &members, pc, cfg));
+                            let reject = s.lower_nested(|s| {
+                                s.dispatch_transfer(fallthrough, &members, pc, cfg);
+                            });
+                            s.push_stmt(Statement::If {
+                                condition,
+                                accept,
+                                reject,
+                            });
+                        }
+                    }
+                });
+                cases.push(SwitchCase {
+                    value: SwitchValue::U32(u32::try_from(id).unwrap_or(DISPATCH_EXIT_PC)),
+                    body: case_body,
+                    fall_through: false,
+                });
+            }
+            let mut default_body = naga::Block::new();
+            let exit = s.lit_u32(DISPATCH_EXIT_PC);
+            let ptr = s.raw_expr(Expression::LocalVariable(pc));
+            default_body.push(
+                Statement::Store {
+                    pointer: ptr,
+                    value: exit,
+                },
+                Span::UNDEFINED,
+            );
+            cases.push(SwitchCase {
+                value: SwitchValue::Default,
+                body: default_body,
+                fall_through: false,
+            });
+            s.push_stmt(Statement::Switch { selector, cases });
+        });
+        self.push_stmt(Statement::Loop {
+            body,
+            continuing: naga::Block::new(),
+            break_if: None,
+        });
+    }
+
     // -- Finalize function & module --
 
     fn finish(
@@ -8772,29 +9285,10 @@ impl IrEmitter {
         Vec<String>,
         Vec<WgslBindingInfo>,
     ) {
-        // Emit stage return statement.
-        match self.stage {
-            ShaderStage::Vertex => {
-                if let Some(out_local) = self.vs_out_local {
-                    let val = self.load_local(out_local);
-                    self.func
-                        .body
-                        .push(Statement::Return { value: Some(val) }, Span::UNDEFINED);
-                }
-            }
-            ShaderStage::Fragment => {
-                if let Some(out_local) = self.ps_out_local {
-                    let val = self.load_local(out_local);
-                    self.func
-                        .body
-                        .push(Statement::Return { value: Some(val) }, Span::UNDEFINED);
-                }
-            }
-            ShaderStage::Compute => {
-                self.func
-                    .body
-                    .push(Statement::Return { value: None }, Span::UNDEFINED);
-            }
+        // Emit stage return statement (unless structured lowering already ended the body
+        // with one).
+        if !self.body_terminated() {
+            self.emit_stage_return();
         }
 
         let (naga_stage, workgroup_size) = match self.stage {
@@ -8844,8 +9338,23 @@ pub fn translate_rdna2_to_wgsl(
     let plan = plan_program(&summary, &instructions, options);
 
     let mut emitter = IrEmitter::new(&plan);
-    for (inst_idx, inst) in instructions[..plan.active_inst_count].iter().enumerate() {
-        emitter.translate_instruction(inst_idx, inst);
+    let active = &instructions[..plan.active_inst_count];
+    let cfg = ControlFlowGraph::from_instructions(active);
+    let real_block_count = cfg.blocks.iter().filter(|b| !b.synthetic_exit).count();
+    let has_branch = active.iter().any(|inst| {
+        matches!(inst.detail, Rdna2Detail::Sopp { op, .. } if BranchKind::from_sopp_op(op).is_some())
+    });
+    if real_block_count <= 1 && !has_branch {
+        // Fast path: straight-line program.
+        for (inst_idx, inst) in active.iter().enumerate() {
+            emitter.translate_instruction(inst_idx, inst);
+        }
+    } else {
+        // Lift SOPP branches into structured WGSL control flow (if / loop / bounded
+        // dispatcher). Every register is a function-scope `var` declared up front.
+        emitter.structured_cf = true;
+        let tree = structure_cfg(&cfg);
+        emitter.lower_structured(&tree, &cfg, active);
     }
 
     let entry_point = plan.entry_point.clone();
@@ -11846,6 +12355,416 @@ mod tests {
         );
         assert!(
             out.wgsl.contains("s_barrier: no-op in "),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    // -- S30: structured control flow & exec_mask (rdna2_cfg wiring) --
+
+    /// SOPP `simm16` for a branch at byte `from` to byte `to` (`to = from + 4 + simm * 4`).
+    fn branch_simm(from: usize, to: usize) -> u16 {
+        (((to as i64 - from as i64 - 4) / 4) as i16) as u16
+    }
+
+    fn structured_tree(words: &[u32]) -> StructuredNode {
+        let insts = decode_program(&words_to_bytes(words));
+        structure_cfg(&ControlFlowGraph::from_instructions(&insts))
+    }
+
+    fn tree_has_else(node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => else_branch.is_some() || tree_has_else(then_branch),
+            StructuredNode::Seq(nodes) => nodes.iter().any(tree_has_else),
+            StructuredNode::Loop { body } => tree_has_else(body),
+            _ => false,
+        }
+    }
+
+    fn tree_has_loop(node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Loop { .. } => true,
+            StructuredNode::If {
+                then_branch,
+                else_branch,
+                ..
+            } => tree_has_loop(then_branch) || else_branch.as_deref().is_some_and(tree_has_loop),
+            StructuredNode::Seq(nodes) => nodes.iter().any(tree_has_loop),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn s_cbranch_scc0_if_skip_and_s_branch_diamond_lift_to_structured_wgsl() {
+        // If-skip (compute):
+        //   s_mov_b32 s0, 5 ; s_cmp_eq_u32 s0, 3 ; s_cbranch_scc0 L
+        //   v_mov_b32 v1, 1.0
+        // L: v_mov_b32 v2, 2.0 ; s_endpgm
+        let words = vec![
+            enc_sop1(0x03, 0, 133),
+            enc_sopc(0x06, 0, 131),
+            enc_sopp(0x04, branch_simm(8, 16)),
+            enc_vop1(0x01, 1, 242),
+            enc_vop1(0x01, 2, 244),
+            enc_sopp(0x01, 0),
+        ];
+        let tree = structured_tree(&words);
+        assert!(tree.is_fully_structured(), "{tree:?}");
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 6, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("if "), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("switch"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("exec_mask"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // If/else diamond with an `s_branch` merge (pixel):
+        //   s_mov_b32 s0, 5 ; s_cmp_eq_u32 s0, 3 ; s_cbranch_scc1 ELSE
+        //   v_mov_b32 v1, 1.0 ; s_branch MERGE
+        // ELSE: v_mov_b32 v1, 2.0
+        // MERGE: v_add_f32 v2, v1, v1 ; exp mrt0 v2 x4 ; s_endpgm
+        let mut words = vec![
+            enc_sop1(0x03, 0, 133),
+            enc_sopc(0x06, 0, 131),
+            enc_sopp(0x05, branch_simm(8, 20)),
+            enc_vop1(0x01, 1, 242),
+            enc_sopp(0x02, branch_simm(16, 24)),
+            enc_vop1(0x01, 1, 244),
+            enc_vop2(0x03, 2, 257, 1),
+        ];
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [2, 2, 2, 2]));
+        words.push(enc_sopp(0x01, 0));
+        let tree = structured_tree(&words);
+        assert!(tree.is_fully_structured(), "{tree:?}");
+        assert!(tree_has_else(&tree), "{tree:?}");
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 9, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("} else {"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("= ps_out;"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("return;"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s_and_saveexec_b32_execz_if_else_diamond_models_single_lane_exec_mask() {
+        // LLVM-style divergent if/else:
+        //   v_mov_b32 v0, 1.0 ; v_cmp_lt_f32 vcc, 0.5, v0
+        //   s_and_saveexec_b32 s2, vcc_lo ; s_xor_b32 s2, exec_lo, s2
+        //   s_cbranch_execz ELSE
+        //   v_mov_b32 v1, 2.0
+        // ELSE: s_or_saveexec_b32 s2, s2 ; s_xor_b32 exec_lo, exec_lo, s2
+        //   s_cbranch_execz END
+        //   v_mov_b32 v1, 4.0
+        // END: s_or_b32 exec_lo, exec_lo, s2 ; exp mrt0 v1 x4 ; s_endpgm
+        let mut words = vec![
+            enc_vop1(0x01, 0, 242),
+            enc_vopc(0x01, 240, 0),
+            enc_sop1(0x3C, 2, 106),
+            enc_sop2(0x12, 2, 126, 2),
+            enc_sopp(0x08, branch_simm(16, 24)),
+            enc_vop1(0x01, 1, 244),
+            enc_sop1(0x3D, 2, 2),
+            enc_sop2(0x12, 126, 126, 2),
+            enc_sopp(0x08, branch_simm(32, 40)),
+            enc_vop1(0x01, 1, 246),
+            enc_sop2(0x10, 126, 126, 2),
+        ];
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 1, 1, 1]));
+        words.push(enc_sopp(0x01, 0));
+
+        let tree = structured_tree(&words);
+        assert!(tree.is_fully_structured(), "{tree:?}");
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 13, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("var exec_mask: u32;"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("exec_mask = 1u;"), "WGSL:\n{}", out.wgsl);
+        // Both `s_cbranch_execz` skips become `if (exec_mask != 0u) { ... }`.
+        assert_eq!(
+            out.wgsl.matches("!= 0u) {").count(),
+            2,
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        // `s_or_b32 exec_lo, exec_lo, s2` keeps only this lane's bit.
+        assert!(
+            last_assignment(&out.wgsl, "exec_mask").is_some_and(|rhs| rhs.contains("& 1u")),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn backward_s_cbranch_scc1_loop_reloads_accumulators_every_iteration() {
+        //   v_mov_b32 v1, 0 ; s_mov_b32 s0, 0
+        // LOOP: v_add_f32 v1, 1.0, v1 ; s_add_u32 s0, s0, 1
+        //   s_cmp_lt_u32 s0, 4 ; s_cbranch_scc1 LOOP
+        //   exp mrt0 v1 x4 ; s_endpgm
+        let mut words = vec![
+            enc_vop1(0x01, 1, 128),
+            enc_sop1(0x03, 0, 128),
+            enc_vop2(0x03, 1, 242, 1),
+            enc_sop2(0x00, 0, 0, 129),
+            enc_sopc(0x0A, 0, 132),
+            enc_sopp(0x05, branch_simm(20, 8)),
+        ];
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 1, 1, 1]));
+        words.push(enc_sopp(0x01, 0));
+
+        let tree = structured_tree(&words);
+        assert!(tree.is_fully_structured(), "{tree:?}");
+        assert!(tree_has_loop(&tree), "{tree:?}");
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 8, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("loop {"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("_pg6_loop"), "WGSL:\n{}", out.wgsl);
+        // Constant-folding must never carry the pre-loop `0` into the loop body: the
+        // accumulators are re-loaded from their `var`s on every iteration.
+        assert!(!out.wgsl.contains("v_1_ = 1f;"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("s_0_ = 1u;"), "WGSL:\n{}", out.wgsl);
+        let loop_body = &out.wgsl[out.wgsl.find("loop {").unwrap()..];
+        assert!(loop_body.contains("= v_1_;"), "WGSL:\n{}", out.wgsl);
+        assert!(loop_body.contains("= s_0_;"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            last_assignment(&out.wgsl, "v_1_").is_some_and(|rhs| rhs.starts_with("(1f + ")),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn irreducible_cfg_falls_back_to_dispatch_with_stage_correct_returns() {
+        //   v_mov_b32 v1, 0 ; s_cmp_eq_u32 s0, 0 ; s_cbranch_scc1 B
+        // A: v_add_f32 v1, 1.0, v1
+        // B: v_add_f32 v1, 2.0, v1 ; s_add_u32 s1, s1, 1 ; s_cmp_lt_u32 s1, 4
+        //    s_cbranch_scc1 A          (loop A<->B entered at both A and B)
+        //    [exp] ; s_endpgm
+        let body = vec![
+            enc_vop1(0x01, 1, 128),
+            enc_sopc(0x06, 0, 128),
+            enc_sopp(0x05, branch_simm(8, 16)),
+            enc_vop2(0x03, 1, 242, 1),
+            enc_vop2(0x03, 1, 244, 1),
+            enc_sop2(0x00, 1, 1, 129),
+            enc_sopc(0x0A, 1, 132),
+            enc_sopp(0x05, branch_simm(28, 12)),
+        ];
+
+        let mut vs = body.clone();
+        vs.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [1, 1, 1, 1]));
+        vs.push(enc_sopp(0x01, 0));
+        let mut ps = body.clone();
+        ps.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 1, 1, 1]));
+        ps.push(enc_sopp(0x01, 0));
+        let mut cs = body;
+        cs.push(enc_sopp(0x01, 0));
+
+        for (words, stage, ret) in [
+            (&vs, Rdna2StageOverride::Vertex, "= vs_out;"),
+            (&ps, Rdna2StageOverride::Pixel, "= ps_out;"),
+            (&cs, Rdna2StageOverride::Compute, "return;"),
+        ] {
+            let tree = structured_tree(words);
+            assert!(tree.dispatch_count() >= 1, "{stage}: {tree:?}");
+            let out = translate_as(words, stage);
+            assert_eq!(out.unsupported_op_count, 0, "{stage} WGSL:\n{}", out.wgsl);
+            assert!(out.wgsl.contains("switch"), "{stage} WGSL:\n{}", out.wgsl);
+            assert!(out.wgsl.contains("_pg6_pc"), "{stage} WGSL:\n{}", out.wgsl);
+            // One return inside the dispatcher's `s_endpgm` case, one at function end.
+            assert_eq!(
+                out.wgsl.matches(ret).count(),
+                2,
+                "{stage} WGSL:\n{}",
+                out.wgsl
+            );
+            if stage == Rdna2StageOverride::Compute {
+                assert!(!out.wgsl.contains("= vs_out;"), "WGSL:\n{}", out.wgsl);
+                assert!(!out.wgsl.contains("= ps_out;"), "WGSL:\n{}", out.wgsl);
+            } else {
+                // Value-returning entry points must never emit a bare `return;`.
+                assert!(!out.wgsl.contains("return;"), "{stage} WGSL:\n{}", out.wgsl);
+            }
+            assert_naga_wgsl_valid(&out.wgsl);
+        }
+    }
+
+    #[test]
+    fn s_barrier_and_implicit_lod_sampling_inside_branches_pass_uniformity_validation() {
+        // Compute: barrier inside a branch is skipped; the one after the merge stays.
+        //   s_cmp_eq_u32 s0, 0 ; s_cbranch_scc1 L ; s_barrier
+        // L: s_barrier ; s_endpgm
+        let words = vec![
+            enc_sopc(0x06, 0, 128),
+            enc_sopp(0x05, branch_simm(4, 12)),
+            enc_sopp(0x0A, 0),
+            enc_sopp(0x0A, 0),
+            enc_sopp(0x01, 0),
+        ];
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains(
+                "// note [0x0008] s_barrier skipped inside structured control flow for WGSL uniformity"
+            ),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_eq!(
+            out.wgsl.matches("workgroupBarrier()").count(),
+            1,
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Fragment: `image_sample` inside a branch must use an explicit LOD.
+        let mut words = vec![
+            enc_vintrp(0, 2, 0, 0, 0),
+            enc_vintrp(1, 2, 0, 0, 1),
+            enc_vintrp(0, 3, 0, 1, 0),
+            enc_vintrp(1, 3, 0, 1, 1),
+            enc_sopc(0x06, 0, 128),
+            enc_sopp(0x05, branch_simm(20, 32)),
+        ];
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 4, 2, 1));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("textureSampleLevel("),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(!out.wgsl.contains("textureSample("), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s_andn2_wrexec_b32_and_saveexec_b64_with_execz_translate_without_unsupported_ops() {
+        //   v_mov_b32 v0, 1.0 ; v_cmp_lt_f32 vcc, 0.5, v0
+        //   s_andn2_wrexec_b32 s3, vcc_lo ; s_cbranch_execz L
+        //   v_mov_b32 v1, 2.0
+        // L: s_mov_b32 exec_lo, -1 ; s_endpgm
+        let words = vec![
+            enc_vop1(0x01, 0, 242),
+            enc_vopc(0x01, 240, 0),
+            enc_sop1(0x47, 3, 106),
+            enc_sopp(0x08, branch_simm(12, 20)),
+            enc_vop1(0x01, 1, 244),
+            enc_sop1(0x03, 126, 193),
+            enc_sopp(0x01, 0),
+        ];
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.translated_op_count, 7, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("var exec_mask: u32;"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("if ("), "WGSL:\n{}", out.wgsl);
+        // wrexec writes the *new* mask to sdst; `s_mov_b32 exec_lo, -1` re-enables the lane.
+        assert!(
+            last_assignment(&out.wgsl, "s_3_").is_some(),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_eq!(
+            last_assignment(&out.wgsl, "exec_mask").as_deref(),
+            Some("1u"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            last_assignment(&out.wgsl, "scc").is_some(),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Wave64 form: s_and_saveexec_b64 s[4:5], vcc ; s_cbranch_execnz T ; s_branch E
+        // T: v_mov_b32 v1, 2.0
+        // E: s_mov_b64 exec, s[4:5] ; s_endpgm
+        let words = vec![
+            enc_vop1(0x01, 0, 242),
+            enc_vopc(0x01, 240, 0),
+            enc_sop1(0x24, 4, 106),
+            enc_sopp(0x09, branch_simm(12, 20)),
+            enc_sopp(0x02, branch_simm(16, 24)),
+            enc_vop1(0x01, 1, 244),
+            enc_sop1(0x04, 126, 4),
+            enc_sopp(0x01, 0),
+        ];
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("if ("), "WGSL:\n{}", out.wgsl);
+        assert_eq!(
+            last_assignment(&out.wgsl, "s_5_").as_deref(),
+            Some("0u"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn every_saveexec_and_wrexec_opcode_translates_and_validates() {
+        let ops: Vec<u8> = (0x24..=0x2B)
+            .chain(0x37..=0x3A)
+            .chain(0x3C..=0x47)
+            .collect();
+        assert_eq!(ops.len(), 24);
+        for op in ops {
+            let words = vec![
+                enc_vopc(0x01, 240, 0),
+                enc_sop1(op, 2, 106),
+                enc_sopp(0x08, branch_simm(8, 16)),
+                enc_vop1(0x01, 1, 244),
+                enc_sopp(0x01, 0),
+            ];
+            let insts = decode_program(&words_to_bytes(&words));
+            assert!(classify_exec_mask_op(&insts[1]).is_some(), "op {op:#x}");
+            let out = translate_as(&words, Rdna2StageOverride::Compute);
+            assert_eq!(
+                out.unsupported_op_count, 0,
+                "op {op:#x} WGSL:\n{}",
+                out.wgsl
+            );
+            assert!(
+                out.wgsl.contains("exec_mask"),
+                "op {op:#x} WGSL:\n{}",
+                out.wgsl
+            );
+            assert_naga_wgsl_valid(&out.wgsl);
+        }
+    }
+
+    #[test]
+    fn straight_line_programs_keep_the_linear_fast_path() {
+        // No branches and no exec writes: no exec_mask, no structured constructs, and the
+        // compute barrier stays a real `workgroupBarrier()`.
+        let words = vec![enc_vop1(0x01, 1, 242), enc_sopp(0x0A, 0), enc_sopp(0x01, 0)];
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("exec_mask"), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("loop"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("workgroupBarrier()"),
             "WGSL:\n{}",
             out.wgsl
         );
