@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f)."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
@@ -44,6 +44,10 @@ def _fake_emsdk(repo: Path) -> None:
     _write(em_dir / "emcc.bat", "@echo off\r\n")
     _write(em_dir / "em++.bat", "@echo off\r\n")
     _write(em_dir / "emar.bat", "@echo off\r\n")
+    bin_dir = repo / "work" / "emsdk" / "upstream" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    _write(bin_dir / "llvm-nm", "#!/bin/sh\nexit 0\n")
+    _write(bin_dir / "llvm-nm.exe", "MZ")
 
 
 def _layout_sources(root: Path) -> Path:
@@ -66,15 +70,18 @@ class RecordingRunner:
         fail_ids: frozenset[str] | None = None,
         fail_outputs: frozenset[str] | None = None,
         delay: float = 0.0,
+        nm_outputs: Mapping[str, str] | None = None,
     ) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.compile_calls: list[tuple[str, ...]] = []
         self.link_calls: list[tuple[str, ...]] = []
         self.side_link_calls: list[tuple[str, ...]] = []
         self.ar_calls: list[tuple[str, ...]] = []
+        self.nm_calls: list[tuple[str, ...]] = []
         self.fail_ids = fail_ids or frozenset()
         self.fail_outputs = fail_outputs or frozenset()
         self.delay = delay
+        self.nm_outputs = nm_outputs
         self._lock = threading.Lock()
         self.current = 0
         self.peak = 0
@@ -94,6 +101,22 @@ class RecordingRunner:
                     returncode=0,
                     stdout=json.dumps({"ok": True, "errors": []}),
                 )
+            if tokens and Path(tokens[0]).name.lower().startswith("llvm-nm"):
+                with self._lock:
+                    self.nm_calls.append(tokens)
+                if self.nm_outputs is not None:
+                    out_lines: list[str] = []
+                    for tok in tokens[1:]:
+                        if tok.startswith("-"):
+                            continue
+                        for key, val in self.nm_outputs.items():
+                            if key in tok:
+                                out_lines.append(val)
+                    return bgw.CommandResult(
+                        returncode=0,
+                        stdout="\n".join(out_lines) + ("\n" if out_lines else ""),
+                    )
+                return bgw.CommandResult(returncode=0, stdout="")
             if tokens and Path(tokens[0]).name.lower().startswith("emar"):
                 with self._lock:
                     self.ar_calls.append(tokens)
@@ -5986,6 +6009,502 @@ async function boot() { await loadDylibs(); }
             res["got"],
             ["__playgta6_dispatch_shard_main_00000", "__playgta6_shard_dispatch_main"],
         )
+
+
+class TestSideModule2CrossExports(unittest.TestCase):
+    """R37f: llvm-nm cross-module exports for -sSIDE_MODULE=2 and empty side-module guard."""
+
+    def test_compute_side_module_cross_exports_prunes_private_and_keeps_cross_main_and_roots(
+        self,
+    ) -> None:
+        # Three side buckets (part_0 shards, part_1 shards, part_2 registration) + main objects.
+        nm_by_obj = {
+            "shard-00000.o": "\n".join(
+                [
+                    "shard-00000.o:",
+                    "00000000 T sub_140001000",  # called from part_1 -> MUST export
+                    "00000020 T sub_140001010",  # intra-bucket helper called by shard-00001.o -> PRUNE
+                    "00000040 T sub_140001020",  # private only in part_0 -> PRUNE
+                    "00000060 t sub_local_only",  # local (lowercase t) -> NEVER export
+                    "         T sub_main_entry",  # referenced by main.o -> MUST export
+                    "         T __playgta6_dispatch_shard_main_00000",  # referenced by functions.o + required
+                    "00000080 W pg6_entry_bootstrap",  # weak global matching pg6_entry_* -> MUST export
+                    "000000a0 R guest_const_in_p0",  # R data referenced by part_1 -> MUST export
+                    "000000c0 D private_data_in_p0",  # unreferenced data -> PRUNE
+                    "         U sub_140009000",  # cross-call into part_1
+                    "         U __playgta6_indirect_call",  # runtime import (not in any side bucket)
+                ]
+            ),
+            "shard-00001.o": "\n".join(
+                [
+                    "shard-00001.o:",
+                    "         T sub_140001050",  # unreferenced outside part_0 -> PRUNE
+                    "         U sub_140001010",  # intra-bucket call within part_0 -> must NOT export!
+                    "         U weak_cross_helper",  # weak def in part_1 -> MUST export from part_1
+                ]
+            ),
+            "shard-00002.o": "\n".join(
+                [
+                    "shard-00002.o:",
+                    "00000000 T sub_140009000",  # called from part_0 -> MUST export
+                    "00000010 T sub_140009010",  # private in part_1 -> PRUNE
+                    "00000020 W weak_cross_helper",  # weak def called from part_0 -> MUST export
+                    "00000030 B bss_used_by_main",  # BSS symbol referenced by pg6_export_thunks -> MUST export
+                    "         T pg6_dispatch_custom",  # required prefix -> MUST export
+                    "         T __playgta6_dispatch_shard_main_00002",  # referenced by functions.o + required
+                    "         U sub_140001000",  # cross-call into part_0
+                    "         U guest_const_in_p0",  # cross-data ref into part_0
+                ]
+            ),
+            "functions.o": "\n".join(
+                [
+                    "functions.o:",
+                    "00000000 D __playgta6_shard_dispatch_main",  # referenced by pg6_program.o + required
+                    "00000010 T __playgta6_register_lifted_functions_main",  # required registration root
+                    "00000020 T pg6_register_custom_tables",  # required prefix
+                    "00000030 D internal_scratch_table",  # unreferenced outside part_2 -> PRUNE
+                    "         U __playgta6_dispatch_shard_main_00000",
+                    "         U __playgta6_dispatch_shard_main_00002",
+                    "         U sub_140009020",  # defined in part_1? (if not defined anywhere, ignored)
+                ]
+            ),
+            "pg6_program.o": "\n".join(
+                [
+                    "pg6_program.o:",
+                    "00000000 D pg6_program",
+                    "         U __playgta6_shard_dispatch_main",
+                ]
+            ),
+            "pg6_export_thunks.o": "\n".join(
+                [
+                    "pg6_export_thunks.o:",
+                    "         U bss_used_by_main",
+                ]
+            ),
+            "main.o": "\n".join(
+                [
+                    "main.o:",
+                    "00000000 T main",
+                    "         U sub_main_entry",
+                ]
+            ),
+        }
+
+        nm_invocations: list[tuple[str, ...]] = []
+
+        def fake_nm(argv: Sequence[str]) -> bgw.CommandResult:
+            tokens = tuple(str(a) for a in argv)
+            nm_invocations.append(tokens)
+            chunks = [nm_by_obj[Path(tok).name] for tok in tokens[1:] if not tok.startswith("-")]
+            return bgw.CommandResult(returncode=0, stdout="\n".join(chunks) + "\n")
+
+        side_buckets = [
+            [Path("cache/shard-00000.o"), Path("cache/shard-00001.o")],
+            [Path("cache/shard-00002.o")],
+            [Path("cache/functions.o")],
+        ]
+        main_objects = [
+            Path("cache/pg6_program.o"),
+            Path("cache/pg6_export_thunks.o"),
+            Path("cache/main.o"),
+        ]
+
+        exports = bgw.compute_side_module_cross_exports(
+            side_buckets,
+            main_objects,
+            Path("/emsdk/upstream/bin/llvm-nm"),
+            run_command=fake_nm,
+        )
+
+        self.assertEqual(len(exports), 3)
+        self.assertEqual(len(nm_invocations), 4)  # 3 side buckets + 1 main batch
+        for call in nm_invocations:
+            self.assertIn("--extern-only", call)
+            self.assertIn("--no-sort", call)
+
+        # Bucket 0: cross-bucket + main-referenced + required roots kept; intra-bucket pruned.
+        self.assertEqual(
+            exports[0],
+            [
+                "__playgta6_dispatch_shard_main_00000",
+                "guest_const_in_p0",
+                "pg6_entry_bootstrap",
+                "sub_140001000",
+                "sub_main_entry",
+            ],
+        )
+        self.assertNotIn("sub_140001010", exports[0])  # intra-bucket call between shard-0 and shard-1
+        self.assertNotIn("sub_140001020", exports[0])
+        self.assertNotIn("sub_140001050", exports[0])
+        self.assertNotIn("sub_local_only", exports[0])
+        self.assertNotIn("private_data_in_p0", exports[0])
+
+        # Bucket 1: cross-bucket + main-referenced + required roots kept; private sub_* pruned.
+        self.assertEqual(
+            exports[1],
+            [
+                "__playgta6_dispatch_shard_main_00002",
+                "bss_used_by_main",
+                "pg6_dispatch_custom",
+                "sub_140009000",
+                "weak_cross_helper",
+            ],
+        )
+        self.assertNotIn("sub_140009010", exports[1])
+
+        # Bucket 2 (functions.o): registration symbols kept; unreferenced data pruned.
+        self.assertEqual(
+            exports[2],
+            [
+                "__playgta6_register_lifted_functions_main",
+                "__playgta6_shard_dispatch_main",
+                "pg6_register_custom_tables",
+            ],
+        )
+        self.assertNotIn("internal_scratch_table", exports[2])
+
+        # Response file emission uses -Wl,--export=<sym> (no leading-underscore mangling) + ctors.
+        with tempfile.TemporaryDirectory() as tmp:
+            rsp_path = Path(tmp) / "side_part_0_exports.rsp"
+            bgw.write_side_exports_response_file(rsp_path, exports[0])
+            lines = rsp_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], bgw.SIDE_MODULE_CTOR_EXPORT_FLAG)
+            self.assertIn("-Wl,--export=sub_140001000", lines)
+            self.assertIn("-Wl,--export=sub_main_entry", lines)
+            self.assertIn("-Wl,--export=__playgta6_dispatch_shard_main_00000", lines)
+            self.assertNotIn("-Wl,--export=sub_140001010", lines)
+            self.assertNotIn("-sEXPORTED_FUNCTIONS", "\n".join(lines))
+
+    def test_parse_llvm_nm_formats_chunking_and_error_handling(self) -> None:
+        # Both BSD (hex addr, dashes, bare wasm func/undef) and POSIX formats parse cleanly.
+        mixed = "\n".join(
+            [
+                "C:\\cache\\shard.o:",
+                "0000000000000000 T bsd_hex_func",
+                "---------------- D bsd_dash_data",
+                "         T bsd_bare_wasm_func",
+                "         U bsd_bare_undef",
+                "         w bsd_weak_undef",
+                "00000010 t local_ignored",
+                "posix_func T 0 16",
+                "posix_undef U",
+            ]
+        )
+        defined, undefined = bgw.parse_llvm_nm_output(mixed)
+        self.assertEqual(
+            defined,
+            {"bsd_hex_func", "bsd_dash_data", "bsd_bare_wasm_func", "posix_func"},
+        )
+        self.assertEqual(undefined, {"bsd_bare_undef", "bsd_weak_undef", "posix_undef"})
+
+        # Batch chunking splits large object lists below max_cmd_chars.
+        chunk_calls: list[tuple[str, ...]] = []
+
+        def chunk_runner(argv: Sequence[str]) -> bgw.CommandResult:
+            chunk_calls.append(tuple(str(a) for a in argv))
+            return bgw.CommandResult(returncode=0, stdout="")
+
+        many_objs = [Path(f"very_long_cache_directory/shard-{i:05d}.o") for i in range(6)]
+        bgw.compute_side_module_cross_exports(
+            [many_objs],
+            [],
+            Path("llvm-nm"),
+            run_command=chunk_runner,
+            max_cmd_chars=90,
+        )
+        self.assertGreaterEqual(len(chunk_calls), 3)
+
+        # Non-zero llvm-nm exit raises BuildGuestWasmError.
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.compute_side_module_cross_exports(
+                [[Path("a.o")]],
+                [],
+                Path("llvm-nm"),
+                run_command=lambda _argv: bgw.CommandResult(returncode=1, stderr="corrupt object"),
+            )
+
+    def test_discover_emscripten_locates_llvm_nm_alongside_emxx_and_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            tc = bgw.discover_emscripten(repo_root=repo, env={}, which_fn=lambda _n: None)
+            self.assertIsNotNone(tc.nm())
+            assert tc.llvm_nm is not None
+            self.assertEqual(tc.llvm_nm.parent.name, "bin")
+            self.assertTrue(tc.llvm_nm.name.startswith("llvm-nm"))
+            self.assertTrue(tc.to_dict()["llvm_nm_found"])
+
+            # Fallback to PATH when upstream/bin/llvm-nm is absent.
+            for f in (repo / "work" / "emsdk" / "upstream" / "bin").iterdir():
+                f.unlink()
+            fake_path_nm = root / "custom-llvm" / "llvm-nm"
+            _write(fake_path_nm, "#!/bin/sh\n")
+            tc_path = bgw.discover_emscripten(
+                repo_root=repo,
+                env={},
+                which_fn=lambda n: str(fake_path_nm) if n == "llvm-nm" else None,
+            )
+            self.assertEqual(tc_path.nm(), fake_path_nm)
+
+            # Sanitize strips host path from llvm-nm argv.
+            cleaned = bgw.sanitize_argv(
+                [r"C:\Users\someone\emsdk\upstream\bin\llvm-nm.exe", "--extern-only", r"C:\Users\someone\a.o"]
+            )
+            self.assertEqual(cleaned, ["llvm-nm", "--extern-only", "a.o"])
+
+    def test_asymmetric_dry_run_and_mocked_build_pass_cross_export_rsp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            orig_lib = _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+            _write(repo / "runtime" / "wasm_boot.cpp", "void wasm_boot() {}\n")
+
+            src = root / "recomp-r37f"
+            _write(src / "lift" / "shard-00000.ll", "; shard 0\n")
+            _write(src / "lift" / "shard-00001.ll", "; shard 1\n")
+            _write(src / "lift" / "shard-00002.ll", "; shard 2\n")
+            _write(src / "lift" / "functions.ll", "; registration\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            cache = root / "cache"
+            out_dir = root / "dist"
+
+            # 1) Dry-run command lines already include -sSIDE_MODULE=2, ctor flag, and @side_part_<i>_exports.rsp.
+            dry = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                dry_run=True,
+                runtime_lib=orig_lib,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(dry.ok, dry.errors)
+            self.assertEqual(len(dry.side_modules), 3)
+            for idx, side in enumerate(dry.side_modules):
+                expected_rsp = f"side_part_{idx}_exports.rsp"
+                self.assertEqual(side.exports_response_file, expected_rsp)
+                self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, side.link_argv)
+                self.assertIn(bgw.SIDE_MODULE_CTOR_EXPORT_FLAG, side.link_argv)
+                self.assertIn(f"@{expected_rsp}", side.link_argv)
+            dry_json = bgw.report_to_json(dry)
+            self.assertNotIn("\\\\", dry_json)
+            self.assertIn("@side_part_0_exports.rsp", dry_json)
+
+            # 2) Mocked real build computes cross-module exports via llvm-nm and writes response files.
+            nm_outputs = {
+                "shard-00000": "\n".join(
+                    [
+                        "00000000 T sub_cross_0_to_1",
+                        "00000010 T sub_private_in_p0",
+                        "         T __playgta6_dispatch_shard_main_00000",
+                        "         U sub_cross_1_to_0",
+                    ]
+                ),
+                "shard-00001": "\n".join(
+                    [
+                        "00000000 T sub_private_in_p0_b",
+                        "         U sub_private_in_p0",  # same bucket as shard-00000 -> pruned!
+                    ]
+                ),
+                "shard-00002": "\n".join(
+                    [
+                        "00000000 T sub_cross_1_to_0",
+                        "00000010 T sub_private_in_p1",
+                        "         T sub_from_main_thunk",
+                        "         U sub_cross_0_to_1",
+                    ]
+                ),
+                "functions": "\n".join(
+                    [
+                        "00000000 D __playgta6_shard_dispatch_main",
+                        "         U __playgta6_dispatch_shard_main_00000",
+                    ]
+                ),
+                "pg6_import_thunks": "\n".join(
+                    [
+                        "         U sub_from_main_thunk",
+                        "         U __playgta6_shard_dispatch_main",
+                    ]
+                ),
+            }
+            runner = RecordingRunner(nm_outputs=nm_outputs)
+            rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(rep.ok, rep.errors)
+            self.assertEqual(len(runner.nm_calls), 4)  # 3 side buckets + main_objects
+            self.assertEqual(len(runner.side_link_calls), 3)
+
+            # Check actual side_part_0_exports.rsp written on disk and passed to em++.
+            rsp0_path = cache / "side_part_0_exports.rsp"
+            rsp1_path = cache / "side_part_1_exports.rsp"
+            rsp2_path = cache / "side_part_2_exports.rsp"
+            self.assertTrue(rsp0_path.is_file())
+            self.assertTrue(rsp1_path.is_file())
+            self.assertTrue(rsp2_path.is_file())
+
+            rsp0_lines = rsp0_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn(bgw.SIDE_MODULE_CTOR_EXPORT_FLAG, rsp0_lines)
+            self.assertIn("-Wl,--export=sub_cross_0_to_1", rsp0_lines)
+            self.assertIn("-Wl,--export=__playgta6_dispatch_shard_main_00000", rsp0_lines)
+            self.assertNotIn("-Wl,--export=sub_private_in_p0", rsp0_lines)
+            self.assertNotIn("-Wl,--export=sub_private_in_p0_b", rsp0_lines)
+
+            rsp1_lines = rsp1_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("-Wl,--export=sub_cross_1_to_0", rsp1_lines)
+            self.assertIn("-Wl,--export=sub_from_main_thunk", rsp1_lines)
+            self.assertNotIn("-Wl,--export=sub_private_in_p1", rsp1_lines)
+
+            rsp2_lines = rsp2_path.read_text(encoding="utf-8").splitlines()
+            self.assertIn("-Wl,--export=__playgta6_shard_dispatch_main", rsp2_lines)
+
+            for idx, side_call in enumerate(runner.side_link_calls):
+                expected_arg = f"@{(cache / f'side_part_{idx}_exports.rsp').as_posix()}"
+                self.assertIn(expected_arg, side_call)
+                self.assertIn(bgw.SIDE_MODULE_PRUNED_FLAG, side_call)
+                self.assertIn(bgw.SIDE_MODULE_CTOR_EXPORT_FLAG, side_call)
+
+            self.assertEqual(rep.side_modules[0].exported_symbol_count, 2)
+            self.assertEqual(rep.side_modules[1].exported_symbol_count, 2)
+            self.assertEqual(rep.side_modules[2].exported_symbol_count, 1)
+
+            gm = json.loads((out_dir / bgw.GUEST_MANIFEST_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(gm["sideModuleSizes"][0]["exportedSymbolCount"], 2)
+            self.assertEqual(gm["sideModuleSizes"][1]["exportedSymbolCount"], 2)
+            self.assertEqual(gm["sideModuleSizes"][2]["exportedSymbolCount"], 1)
+
+            # 3) Missing llvm-nm in real asymmetric build fails loudly.
+            for f in (repo / "work" / "emsdk" / "upstream" / "bin").iterdir():
+                f.unlink()
+            missing_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-no-nm",
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertFalse(missing_rep.ok)
+            self.assertTrue(any("llvm-nm" in e for e in missing_rep.errors), missing_rep.errors)
+
+    def test_empty_side_module_guard_catches_stripped_676_byte_output(self) -> None:
+        # Unit check on helper thresholds.
+        self.assertIsNone(
+            bgw.check_side_module_not_empty(
+                676,
+                input_object_bytes=1024,  # tiny test inputs <= 64 KiB -> no false positive
+                module_name="guest_part_0.wasm",
+                side_module_mode=2,
+            )
+        )
+        err = bgw.check_side_module_not_empty(
+            676,
+            input_object_bytes=128 * 1024,  # > 64 KiB
+            module_name="guest_part_0.wasm",
+            side_module_mode=2,
+        )
+        self.assertIsNotNone(err)
+        assert err is not None
+        self.assertIn("guest_part_0.wasm", err)
+        self.assertIn("676 bytes", err)
+        self.assertIn("-sSIDE_MODULE=2", err)
+        self.assertIsNone(
+            bgw.check_side_module_not_empty(
+                8192,
+                input_object_bytes=128 * 1024,
+                module_name="guest_part_0.wasm",
+                side_module_mode=2,
+            )
+        )
+
+        # End-to-end build fails loudly when a >64 KiB shard bucket links to a 676-byte wasm.
+        class StrippedSideRunner(RecordingRunner):
+            def __init__(self, *, side_wasm_size: int) -> None:
+                super().__init__()
+                self.side_wasm_size = side_wasm_size
+
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                tokens = tuple(str(a) for a in argv)
+                out_path = _dash_o(tokens)
+                if res.returncode == 0 and out_path is not None:
+                    p = Path(out_path)
+                    if p.suffix.lower() == ".o":
+                        # Write 96 KiB per compiled object so bucket input sum > 64 KiB.
+                        p.write_bytes(b"\x00" * (96 * 1024))
+                    elif p.name.startswith("guest_part_") and p.suffix.lower() == ".wasm":
+                        payload = b"\x00asm\x01\x00\x00\x00"
+                        pad = max(0, self.side_wasm_size - len(payload))
+                        p.write_bytes(payload + b"\x00" * pad)
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            orig_lib = _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            src = root / "recomp-guard"
+            _write(src / "lift" / "shard-00000.ll", "; shard 0\n")
+            _write(src / "lift" / "shard-00001.ll", "; shard 1\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            bad_runner = StrippedSideRunner(side_wasm_size=676)
+            bad_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-bad",
+                out_dir=root / "dist-bad",
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                runtime_lib=orig_lib,
+                run_command=bad_runner,
+                which_fn=lambda _n: None,
+            )
+            self.assertFalse(bad_rep.ok)
+            self.assertTrue(
+                any("guest_part_0.wasm" in e and "676 bytes" in e for e in bad_rep.errors),
+                bad_rep.errors,
+            )
+            # Aborts before linking runtime.js / runtime.wasm.
+            self.assertEqual(bad_runner.link_calls, [])
+
+            # Non-stripped (>= 4 KiB) side module succeeds normally.
+            good_runner = StrippedSideRunner(side_wasm_size=8192)
+            good_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-good",
+                out_dir=root / "dist-good",
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                runtime_lib=orig_lib,
+                run_command=good_runner,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(good_rep.ok, good_rep.errors)
+            self.assertEqual(len(good_runner.link_calls), 1)
 
 
 if __name__ == "__main__":
