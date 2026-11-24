@@ -4811,6 +4811,167 @@ void test_g55_root_sig_layout_caps() {
     scene.release_all({list, cpso, srv_heap, big_rs, blob});
 }
 
+// G58: the title's 2D/UI draws bind dynamic ring buffers in guest RAM by address only (no
+// ID3D12Resource) through IASetVertexBuffers / IASetIndexBuffer. They get runtime-owned
+// Vertex|Index|CopyDst mirrors uploaded at bind time; an advanced ring-buffer pointer inside a
+// mirrored range reuses the buffer at an offset; guest writes are re-uploaded at execute time.
+void test_g58_relocate_ia_vb_ib() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    using W = dg::Work;
+    auto work = [](W w) { return dg::work_total(w); };
+    const uint64_t dropped0 = work(W::DrawsDroppedByBridge), emitted0 = work(W::DrawsEmitted);
+
+    // Raw guest memory, no CreateCommittedResource: a 256-byte vertex ring and a 64-byte R16 index ring.
+    std::vector<uint8_t> vb_bytes(256);
+    for (size_t i = 0; i < vb_bytes.size(); ++i) {
+        vb_bytes[i] = static_cast<uint8_t>(0x10u + i * 3u);
+    }
+    std::vector<uint8_t> ib_bytes(64);
+    for (size_t i = 0; i < ib_bytes.size() / 2; ++i) {
+        const uint16_t index = static_cast<uint16_t>(i % 3u);
+        std::memcpy(ib_bytes.data() + i * 2, &index, sizeof(index));
+    }
+    const uint64_t vb_va = put_aligned(vb_bytes, 256);
+    const uint64_t ib_va = put_aligned(ib_bytes, 256);
+    d3d::GpuVaResolution unresolved;
+    CHECK(!dev->state_bridge().resolve_gpu_va(vb_va, &unresolved));
+    CHECK(!dev->state_bridge().resolve_gpu_va(ib_va, &unresolved));
+    CHECK(dev->relocated_ia_count() == 0);
+
+    constexpr uint64_t kAdvance = 0x80;
+    const uint64_t list = scene.new_list();
+    const auto record = [&](bool both_vb_ranges) {
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+        fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(scene.rs)});
+        fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+        fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 32, 32, 0, 1}))});
+        fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 32, 32}))});
+        fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});  // TRIANGLELIST
+        fx.vcall(list, Slot2::IASetIndexBuffer,
+                 {I(put(dg::GuestIndexBufferView{ib_va, static_cast<uint32_t>(ib_bytes.size()), 57}))});
+        if (both_vb_ranges) {
+            fx.vcall(list, Slot2::IASetVertexBuffers,
+                     {I(0), I(1), I(put(dg::GuestVertexBufferView{vb_va, static_cast<uint32_t>(vb_bytes.size()), 12}))});
+            fx.vcall(list, Slot2::DrawIndexedInstanced, {I(3), I(1), I(0), I(0), I(0)});
+        }
+        // The ring-buffer pointer advanced by 0x80 inside the same allocation.
+        fx.vcall(list, Slot2::IASetVertexBuffers,
+                 {I(0), I(1),
+                  I(put(dg::GuestVertexBufferView{vb_va + kAdvance, static_cast<uint32_t>(vb_bytes.size() - kAdvance),
+                                                  12}))});
+        fx.vcall(list, Slot2::DrawIndexedInstanced, {I(3), I(1), I(0), I(0), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    };
+
+    // a-c) First list: mirrors are created and uploaded at bind time, the draws are emitted.
+    size_t mark = fx.captured.size();
+    record(true);
+    const auto rec = packets_since(fx, mark);
+    CHECK(dev->relocated_ia_count() == 2);  // the advanced range reused the vertex mirror
+    // CreateBuffer packets with the IA mirror usage, by byte size.
+    const auto ia_creates = [](const std::vector<Packet>& ps) {
+        std::vector<GpuCreateBufferPayload> out;
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::CreateBuffer &&
+                payload_as<GpuCreateBufferPayload>(p).usage_flags ==
+                    (GpuBufferUsage::Vertex | GpuBufferUsage::Index | GpuBufferUsage::CopyDst)) {
+                out.push_back(payload_as<GpuCreateBufferPayload>(p));
+            }
+        }
+        return out;
+    };
+    uint32_t vb_id = 0, ib_id = 0;
+    const auto creates = ia_creates(rec);
+    for (const GpuCreateBufferPayload& cb : creates) {
+        if (cb.byte_size == vb_bytes.size()) {
+            vb_id = cb.id;
+        } else if (cb.byte_size == ib_bytes.size()) {
+            ib_id = cb.id;
+        }
+    }
+    CHECK(creates.size() == 2 && vb_id != 0 && ib_id != 0 && vb_id != ib_id);
+    const auto wrote = [](const std::vector<Packet>& ps, uint32_t id, const std::vector<uint8_t>& want) {
+        for (const Packet& p : ps) {
+            if (p.opcode != GpuOpcode::WriteBuffer) {
+                continue;
+            }
+            const auto wb = payload_as<GpuWriteBufferPayload>(p);
+            if (wb.id == id && wb.dst_offset == 0 && wb.data_len == want.size() &&
+                p.payload.size() == sizeof(GpuWriteBufferPayload) + want.size() &&
+                std::memcmp(p.payload.data() + sizeof(GpuWriteBufferPayload), want.data(), want.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(wrote(rec, vb_id, vb_bytes) && wrote(rec, ib_id, ib_bytes));
+
+    mark = fx.captured.size();
+    scene.execute({list});
+    const auto ex1 = packets_since(fx, mark);
+    CHECK(count_op(ex1, GpuOpcode::DrawIndexed) == 2);
+    const Packet* di = find_op(ex1, GpuOpcode::DrawIndexed);
+    CHECK(di != nullptr && payload_as<GpuDrawIndexedPayload>(*di).index_count == 3);
+    const Packet* ibp = find_op(ex1, GpuOpcode::SetIndexBuffer);
+    CHECK(ibp != nullptr && payload_as<GpuSetIndexBufferPayload>(*ibp).buffer_id == ib_id &&
+          payload_as<GpuSetIndexBufferPayload>(*ibp).offset == 0 &&
+          payload_as<GpuSetIndexBufferPayload>(*ibp).index_format == static_cast<uint32_t>(GpuIndexFormat::Uint16));
+    // d) Both vertex bindings use the same mirror: offset 0, then offset 0x80.
+    const Packet* vb0 = find_op(ex1, GpuOpcode::SetVertexBuffer, 0);
+    const Packet* vb1 = find_op(ex1, GpuOpcode::SetVertexBuffer, 1);
+    CHECK(vb0 != nullptr && payload_as<GpuSetVertexBufferPayload>(*vb0).buffer_id == vb_id &&
+          payload_as<GpuSetVertexBufferPayload>(*vb0).offset == 0);
+    CHECK(vb1 != nullptr && payload_as<GpuSetVertexBufferPayload>(*vb1).buffer_id == vb_id &&
+          payload_as<GpuSetVertexBufferPayload>(*vb1).offset == kAdvance);
+    CHECK(ia_creates(ex1).empty());
+    CHECK(!wrote(ex1, vb_id, vb_bytes));  // unchanged guest bytes are not uploaded again
+    CHECK(work(W::DrawsDroppedByBridge) == dropped0 && work(W::DrawsEmitted) == emitted0 + 2);
+
+    // e) The title writes new vertices into the ring; the next submission re-uploads the mirror
+    // before the draw, with no new buffer.
+    for (size_t i = kAdvance; i < vb_bytes.size(); ++i) {
+        vb_bytes[i] = static_cast<uint8_t>(0xA0u ^ i);
+    }
+    CHECK(com::write_guest(vb_va + kAdvance, vb_bytes.data() + kAdvance, vb_bytes.size() - kAdvance));
+    mark = fx.captured.size();
+    record(false);
+    scene.execute({list});
+    const auto ex2 = packets_since(fx, mark);
+    CHECK(dev->relocated_ia_count() == 2);
+    CHECK(ia_creates(ex2).empty());
+    CHECK(wrote(ex2, vb_id, vb_bytes));
+    CHECK(!wrote(ex2, ib_id, ib_bytes));
+    size_t write_at = SIZE_MAX;
+    for (size_t i = 0; i < ex2.size(); ++i) {
+        if (ex2[i].opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(ex2[i]).id == vb_id) {
+            write_at = i;
+            break;
+        }
+    }
+    CHECK(write_at != SIZE_MAX && write_at < index_of(ex2, GpuOpcode::DrawIndexed));
+    const Packet* vb2 = find_op(ex2, GpuOpcode::SetVertexBuffer);
+    CHECK(vb2 != nullptr && payload_as<GpuSetVertexBufferPayload>(*vb2).buffer_id == vb_id &&
+          payload_as<GpuSetVertexBufferPayload>(*vb2).offset == kAdvance);
+    CHECK(work(W::DrawsDroppedByBridge) == dropped0 && work(W::DrawsEmitted) == emitted0 + 3);
+
+    // Unmapped addresses and empty views are still diagnosed (null binding), not relocated.
+    CHECK(!contains(dev->diagnostics(), "IASetIndexBuffer: unknown GPU virtual address"));
+    CHECK(!contains(dev->diagnostics(), "IASetVertexBuffers: unknown GPU virtual address"));
+    uint32_t id = 0;
+    uint64_t off = 0;
+    CHECK(!dev->relocate_ia_buffer(0x0000'0BAD'0000'0000ull, 64, &id, &off));
+    CHECK(!dev->relocate_ia_buffer(vb_va, 0, &id, &off));
+    CHECK(!dev->relocate_ia_buffer(vb_va, (uint64_t{16u} << 20) + 1, &id, &off));
+    // An unaligned sub-range offset gets its own mirror rather than an unbindable offset.
+    CHECK(dev->relocate_ia_buffer(vb_va + 2, 64, &id, &off) && id != vb_id && off == 0);
+    CHECK(dev->relocated_ia_count() == 3);
+
+    CHECK(t_balanced);
+    scene.release_all({list});
+}
+
 }  // namespace
 
 int main() {
@@ -4854,6 +5015,7 @@ int main() {
     test_g53_compute_meta_tail_28_digest_join();
     test_g54_copy_texture_region_x_slot85();
     test_g55_root_sig_layout_caps();
+    test_g58_relocate_ia_vb_ib();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

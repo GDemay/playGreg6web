@@ -749,6 +749,14 @@ public:
     bool relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset,
                                  bool require_zero_offset = false);
     size_t relocated_storage_count() const;
+    // Index / vertex buffer views at address-only GPU VAs (G58: dynamic guest-RAM ring buffers
+    // with no ID3D12Resource): the bytes at [va, va + size) (readable guest/alias memory only, at
+    // most 16 MiB) get a dedicated Vertex|Index|CopyDst buffer at offset 0, uploaded immediately
+    // and refreshed on flush_cpu_buffers when guest bytes change (FNV-1a 64). A request inside an
+    // existing relocation's range (a ring buffer advancing its write pointer) reuses that buffer
+    // at offset va - base when the offset is 4-byte aligned. Bounded LRU (entries and bytes).
+    bool relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset);
+    size_t relocated_ia_count() const;
     // Shader pack resolution (DeviceOptions::shader_pack). Each stage of a graphics pipeline is
     // looked up by the code-only identity of the console-native stage its DXIL joins to, else by
     // its DXIL identity. When every stage has a key, the stages get modules (one CreateShaderModule
@@ -938,6 +946,16 @@ private:
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     uint64_t storage_relocation_seq_ = 0;
+    struct RelocatedIa {
+        uint64_t buffer_bytes = 0;   // WebGPU buffer size (guest size rounded up to 4)
+        uint32_t buffer_id = 0;
+        uint64_t last_hash = 0;
+        uint64_t last_used_seq = 0;
+    };
+    mutable std::mutex ia_relocation_mutex_;
+    std::map<std::pair<uint64_t, uint64_t>, RelocatedIa> ia_relocations_;  // (base GPU VA, size)
+    uint64_t ia_relocation_bytes_ = 0;
+    uint64_t ia_relocation_seq_ = 0;
     std::mutex pack_mutex_;
     std::unordered_map<uint64_t, uint32_t> pack_modules_;                 // pack key -> module id
     std::set<std::pair<uint64_t, uint64_t>> pack_layouts_;                // (vs, ps) identities
