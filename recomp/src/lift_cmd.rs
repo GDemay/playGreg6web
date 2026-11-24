@@ -271,7 +271,7 @@ mod tests {
 
         let ir = fs::read_to_string(out_dir.join(LL_FILE)).expect("read lifted IR");
         assert!(ir.contains("target triple = \"wasm64-unknown-unknown\""));
-        assert!(ir.contains("define void @sub_140001010(ptr noalias %state)"));
+        assert!(ir.contains("define void @sub_140001010(ptr noalias noundef %state) unnamed_addr"));
         assert_eq!(ir.matches("\ndefine void @sub_").count(), 4);
         assert!(summary.starts_with("Lifted 4 functions"), "{summary}");
         assert!(summary.contains("Unsupported instructions: "), "{summary}");

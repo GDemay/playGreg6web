@@ -4,31 +4,16 @@
 
 use super::{FunctionLifter, R, imm};
 use crate::lift::memory::{
-    Decl, HELPER_GUEST_MEMMOVE, HELPER_GUEST_MEMSET, HELPER_GUEST_READ, HELPER_GUEST_SCRATCH,
-    HELPER_GUEST_WRITE, MemoryModel, PAGE_TABLE_SYMBOL, SLOT_BYTES, SLOT_SHIFT,
-    WINDOW_TABLE_SYMBOL, Window, WindowCheck, window_helper,
+    Decl, HELPER_GUEST_MEMMOVE, HELPER_GUEST_MEMSET, HELPER_GUEST_READ, MemoryModel,
+    PAGE_TABLE_SYMBOL, SLOT_BYTES, SLOT_SHIFT, WINDOW_TABLE_SYMBOL, Window, WindowCheck,
+    helper_value_type, slow_store_helper, window_helper,
 };
-use crate::lift::{GUEST_BASE_SYMBOL, GuestBase, Support};
+use crate::lift::{GuestBase, Support};
 
 /// `!prof` of a branch whose first successor is rarely taken.
-const UNLIKELY: &str = "!prof !{!\"branch_weights\", i32 1, i32 2000}";
+pub(super) const UNLIKELY: &str = "!prof !{!\"branch_weights\", i32 1, i32 2000}";
 /// `!prof` of a branch whose first successor is almost always taken.
-const LIKELY: &str = "!prof !{!\"branch_weights\", i32 2000, i32 1}";
-
-/// The block all paths of an access branch to, with the phi inputs of a load.
-struct Join {
-    label: String,
-    incoming: Vec<(String, String)>,
-}
-
-impl Join {
-    fn new(label: String) -> Self {
-        Self {
-            label,
-            incoming: Vec::new(),
-        }
-    }
-}
+pub(super) const LIKELY: &str = "!prof !{!\"branch_weights\", i32 2000, i32 1}";
 
 /// One guest access: what to do with the translated address.
 enum Access<'v> {
@@ -37,17 +22,35 @@ enum Access<'v> {
 }
 
 impl FunctionLifter<'_> {
+    /// Returns the `i64` flat base value for `base`, hoisting the invariant load of
+    /// `@__playgta6_guest_base` once into `entry:` per function.
+    fn flat_base_val(&mut self, base: GuestBase) -> String {
+        match base {
+            GuestBase::Constant(c) => imm(c, 64),
+            GuestBase::Symbol => {
+                self.support.insert(Support::GuestBase);
+                if let Some(name) = &self.guest_base {
+                    return name.clone();
+                }
+                let name = self.fresh_name();
+                self.guest_base = Some(name.clone());
+                name
+            }
+        }
+    }
+
     /// `host = addr + base` as an `i64` (today's translation).
     fn flat_host(&mut self, addr: &str, base: GuestBase) -> String {
         match base {
             GuestBase::Constant(0) => addr.to_string(),
             GuestBase::Constant(base) => self.val(&format!("add i64 {addr}, {}", imm(base, 64))),
             GuestBase::Symbol => {
-                self.support.insert(Support::GuestBase);
-                let base = self.val(&format!(
-                    "load i64, ptr @{GUEST_BASE_SYMBOL}, align 8, !invariant.load !{{}}"
-                ));
-                self.val(&format!("add i64 {addr}, {base}"))
+                let base_val = self.flat_base_val(GuestBase::Symbol);
+                if addr == "0" {
+                    base_val
+                } else {
+                    self.val(&format!("add i64 {addr}, {base_val}"))
+                }
             }
         }
     }
@@ -86,24 +89,22 @@ impl FunctionLifter<'_> {
             }
             MemoryModel::Windowed(w) => {
                 let (inside, rel) = self.window_test(addr, w);
+                let pred = self.current_block.clone();
+                let flat_base = self.flat_base_val(w.flat);
                 let win = self.new_label("gw");
-                let flat = self.new_label("gf");
                 let join = self.new_label("gj");
                 self.emit(&format!(
-                    "br i1 {inside}, label %{win}, label %{flat}, {UNLIKELY}"
+                    "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                 ));
-                self.start_block(&flat);
-                let host_flat = self.flat_host(addr, w.flat);
-                self.emit(&format!("br label %{join}"));
                 self.start_block(&win);
                 let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
-                let host_win = self.val(&format!("add i64 {addr}, {delta}"));
+                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
                 self.emit(&format!("br label %{join}"));
                 self.start_block(&join);
-                self.val(&format!(
-                    "phi i64 [ {host_flat}, %{flat} ], [ {host_win}, %{win} ]"
-                ))
+                let delta = self.val(&format!(
+                    "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{win} ]"
+                ));
+                self.val(&format!("add i64 {addr}, {delta}"))
             }
         };
         self.val(&format!("inttoptr i64 {host} to ptr"))
@@ -117,7 +118,7 @@ impl FunctionLifter<'_> {
         let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
         let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 0"));
         let entry = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
-        let flat = self.flat_host("0", w.flat);
+        let flat = self.flat_base_val(w.flat);
         let delta = self.val(&format!("select i1 {inside}, i64 {entry}, i64 {flat}"));
         (inside, delta)
     }
@@ -130,34 +131,36 @@ impl FunctionLifter<'_> {
         base: u64,
         access: &Access<'_>,
     ) -> Option<String> {
-        let int = format!("i{}", bytes * 8);
+        let vty = helper_value_type(bytes);
         let width = u8::try_from(bytes).unwrap_or(u8::MAX);
-        if bytes > 1 {
-            self.support.insert(Support::Memory(Decl::Read));
-            self.support.insert(Support::Memory(Decl::Write));
-        }
         match access {
             Access::Load { ty } => {
+                if bytes > 1 {
+                    self.support.insert(Support::Memory(Decl::Read));
+                }
                 self.support
                     .insert(Support::Memory(Decl::WindowLoad { bytes: width, base }));
                 let name = window_helper(false, bytes, base);
-                let raw = self.val(&format!("call {int} @{name}(i64 {addr})"));
-                Some(if *ty == int {
+                let raw = self.val(&format!("call {vty} @{name}(i64 {addr})"));
+                Some(if *ty == vty {
                     raw
                 } else {
-                    self.val(&format!("bitcast {int} {raw} to {ty}"))
+                    self.val(&format!("bitcast {vty} {raw} to {ty}"))
                 })
             }
             Access::Store { ty, value } => {
+                if bytes > 1 {
+                    self.support.insert(Support::Memory(Decl::Write));
+                }
                 self.support
                     .insert(Support::Memory(Decl::WindowStore { bytes: width, base }));
                 let name = window_helper(true, bytes, base);
-                let raw = if *ty == int {
+                let raw = if *ty == vty {
                     (*value).to_string()
                 } else {
-                    self.val(&format!("bitcast {ty} {value} to {int}"))
+                    self.val(&format!("bitcast {ty} {value} to {vty}"))
                 };
-                self.emit(&format!("call void @{name}(i64 {addr}, {int} {raw})"));
+                self.emit(&format!("call void @{name}(i64 {addr}, {vty} {raw})"));
                 None
             }
         }
@@ -193,94 +196,85 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// The straddle-safe slow path: through the runtime's per-thread scratch buffer.
-    fn access_slow(&mut self, addr: &str, bytes: u64, access: &Access<'_>) -> Option<String> {
-        match access {
-            Access::Load { .. } => {
-                self.support.insert(Support::Memory(Decl::Read));
-                let scratch = self.val(&format!(
-                    "call ptr @{HELPER_GUEST_READ}(i64 {addr}, i64 {bytes})"
-                ));
-                self.access_at(&scratch, access)
-            }
-            Access::Store { .. } => {
-                self.support.insert(Support::Memory(Decl::Write));
-                let scratch = self.val(&format!("call ptr @{HELPER_GUEST_SCRATCH}()"));
-                self.access_at(&scratch, access);
-                self.emit(&format!(
-                    "call void @{HELPER_GUEST_WRITE}(i64 {addr}, i64 {bytes})"
-                ));
-                None
-            }
-        }
+    /// Straddle-safe slow path for loads: returns the per-thread scratch pointer holding `bytes`.
+    fn slow_read_ptr(&mut self, addr: &str, bytes: u64) -> String {
+        self.support.insert(Support::Memory(Decl::Read));
+        self.val(&format!(
+            "call ptr @{HELPER_GUEST_READ}(i64 {addr}, i64 {bytes})"
+        ))
     }
 
-    /// Table path of an access: `delta` is the slot's delta. Accesses wider than one byte check
-    /// whether they stay inside the slot and take the slow path otherwise. Every path ends in a
-    /// branch to `join` (loads add their value to the phi inputs); `current` is the open block.
-    fn table_access(
-        &mut self,
-        addr: &str,
-        delta: &str,
-        bytes: u64,
-        access: &Access<'_>,
-        join: &mut Join,
-        current: &str,
-    ) {
-        let (incoming, join) = (&mut join.incoming, join.label.as_str());
-        if bytes <= 1 || self.contiguous_runs() {
-            let host = self.val(&format!("add i64 {addr}, {delta}"));
-            let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-            if let Some(v) = self.access_at(&ptr, access) {
-                incoming.push((v, current.to_string()));
-            }
-            self.emit(&format!("br label %{join}"));
-            return;
-        }
-        let fast = self.new_label("gt");
-        let slow = self.new_label("gs");
-        let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
-        let fits = self.val(&format!("icmp ule i64 {offset}, {}", SLOT_BYTES - bytes));
-        self.emit(&format!(
-            "br i1 {fits}, label %{fast}, label %{slow}, {LIKELY}"
-        ));
-        self.start_block(&fast);
-        let host = self.val(&format!("add i64 {addr}, {delta}"));
-        let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-        if let Some(v) = self.access_at(&ptr, access) {
-            incoming.push((v, fast.clone()));
-        }
-        self.emit(&format!("br label %{join}"));
-        self.start_block(&slow);
-        if let Some(v) = self.access_slow(addr, bytes, access) {
-            incoming.push((v, slow.clone()));
-        }
-        self.emit(&format!("br label %{join}"));
+    /// Straddle-safe slow path for stores: one cold direct call to the module's outlined helper.
+    fn slow_store(&mut self, addr: &str, bytes: u64, ty: &str, value: &str) {
+        let width = u8::try_from(bytes).unwrap_or(u8::MAX);
+        self.support.insert(Support::Memory(Decl::Write));
+        self.support
+            .insert(Support::Memory(Decl::SlowStore { bytes: width }));
+        let vty = helper_value_type(bytes);
+        let raw = if ty == vty {
+            value.to_string()
+        } else {
+            self.val(&format!("bitcast {ty} {value} to {vty}"))
+        };
+        let helper = slow_store_helper(bytes);
+        self.emit(&format!("call void @{helper}(i64 {addr}, {vty} {raw})"));
     }
 
     fn guest_access(&mut self, addr: &str, bytes: u64, access: Access<'_>) -> Option<String> {
-        let mut incoming: Vec<(String, String)> = Vec::new();
-        let join = match self.memory {
+        match self.memory {
             MemoryModel::Base(_) => {
                 let ptr = self.guest_ptr(addr);
-                return self.access_at(&ptr, &access);
+                self.access_at(&ptr, &access)
             }
             _ if self.stack_flat().is_some() && self.stack_values.contains(addr) => {
                 let base = self.stack_flat().unwrap_or_default();
                 let host = self.flat_host(addr, base);
                 let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                return self.access_at(&ptr, &access);
+                self.access_at(&ptr, &access)
             }
             MemoryModel::PageTable { pages, .. } => {
+                if bytes <= 1 || self.contiguous_runs() {
+                    let index = self.page_index(addr, pages);
+                    let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
+                    let host = self.val(&format!("add i64 {addr}, {delta}"));
+                    let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    return self.access_at(&ptr, &access);
+                }
+                let fast = self.new_label("gt");
+                let slow = self.new_label("gs");
+                let join = self.new_label("gj");
+                let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
+                let fits = self.val(&format!("icmp ule i64 {offset}, {}", SLOT_BYTES - bytes));
+                self.emit(&format!(
+                    "br i1 {fits}, label %{fast}, label %{slow}, {LIKELY}"
+                ));
+                self.start_block(&fast);
                 let index = self.page_index(addr, pages);
                 let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
-                let pre = self.new_label("gp");
-                let mut join = Join::new(self.new_label("gj"));
-                self.emit(&format!("br label %{pre}"));
-                self.start_block(&pre);
-                self.table_access(addr, &delta, bytes, &access, &mut join, &pre);
-                incoming = join.incoming;
-                join.label
+                let host = self.val(&format!("add i64 {addr}, {delta}"));
+                let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
+                if let Access::Store { .. } = access {
+                    self.access_at(&p_fast, &access);
+                }
+                self.emit(&format!("br label %{join}"));
+                self.start_block(&slow);
+                let p_slow = match access {
+                    Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
+                    Access::Store { ty, value } => {
+                        self.slow_store(addr, bytes, ty, value);
+                        None
+                    }
+                };
+                self.emit(&format!("br label %{join}"));
+                self.start_block(&join);
+                if let Some(p_slow) = p_slow {
+                    let ptr = self.val(&format!(
+                        "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
+                    ));
+                    self.access_at(&ptr, &access)
+                } else {
+                    None
+                }
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
                 let (inside, delta) = self.window_select_delta(addr, w);
@@ -301,20 +295,32 @@ impl FunctionLifter<'_> {
                 ));
                 self.start_block(&fast);
                 let host = self.val(&format!("add i64 {addr}, {delta}"));
-                let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                if let Some(v) = self.access_at(&ptr, &access) {
-                    incoming.push((v, fast.clone()));
+                let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
+                if let Access::Store { .. } = access {
+                    self.access_at(&p_fast, &access);
                 }
                 self.emit(&format!("br label %{join}"));
                 self.start_block(&slow);
-                if let Some(v) = self.access_slow(addr, bytes, &access) {
-                    incoming.push((v, slow.clone()));
-                }
+                let p_slow = match access {
+                    Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
+                    Access::Store { ty, value } => {
+                        self.slow_store(addr, bytes, ty, value);
+                        None
+                    }
+                };
                 self.emit(&format!("br label %{join}"));
-                join
+                self.start_block(&join);
+                if let Some(p_slow) = p_slow {
+                    let ptr = self.val(&format!(
+                        "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
+                    ));
+                    self.access_at(&ptr, &access)
+                } else {
+                    None
+                }
             }
-            MemoryModel::Windowed(w) => {
-                let (inside, rel) = self.window_test(addr, w);
+            MemoryModel::Windowed(w) if w.check == WindowCheck::Outline => {
+                let (inside, _) = self.window_test(addr, w);
                 let win = self.new_label("gw");
                 let flat = self.new_label("gf");
                 let join = self.new_label("gj");
@@ -324,38 +330,89 @@ impl FunctionLifter<'_> {
                 self.start_block(&flat);
                 let host = self.flat_host(addr, w.flat);
                 let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                if let Some(v) = self.access_at(&ptr, &access) {
-                    incoming.push((v, flat.clone()));
-                }
+                let v_flat = self.access_at(&ptr, &access);
                 self.emit(&format!("br label %{join}"));
                 self.start_block(&win);
-                if w.check == WindowCheck::Outline {
-                    if let Some(v) = self.window_outlined(addr, bytes, w.base, &access) {
-                        incoming.push((v, win.clone()));
+                let v_win = self.window_outlined(addr, bytes, w.base, &access);
+                self.emit(&format!("br label %{join}"));
+                self.start_block(&join);
+                match (access, v_flat, v_win) {
+                    (Access::Load { ty }, Some(vf), Some(vw)) => {
+                        Some(self.val(&format!("phi {ty} [ {vf}, %{flat} ], [ {vw}, %{win} ]")))
                     }
-                    self.emit(&format!("br label %{join}"));
-                } else {
-                    let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                    let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
-                    let mut paths = Join {
-                        label: join.clone(),
-                        incoming: std::mem::take(&mut incoming),
-                    };
-                    self.table_access(addr, &delta, bytes, &access, &mut paths, &win);
-                    incoming = paths.incoming;
+                    _ => None,
                 }
-                join
             }
-        };
-        self.start_block(&join);
-        let Access::Load { ty } = access else {
-            return None;
-        };
-        let inputs: Vec<String> = incoming
-            .iter()
-            .map(|(v, block)| format!("[ {v}, %{block} ]"))
-            .collect();
-        Some(self.val(&format!("phi {ty} {}", inputs.join(", "))))
+            MemoryModel::Windowed(w) => {
+                let (inside, rel) = self.window_test(addr, w);
+                let pred = self.current_block.clone();
+                let flat_base = self.flat_base_val(w.flat);
+                if bytes <= 1 || self.contiguous_runs() {
+                    let win = self.new_label("gw");
+                    let join = self.new_label("gj");
+                    self.emit(&format!(
+                        "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
+                    ));
+                    self.start_block(&win);
+                    let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+                    let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+                    self.emit(&format!("br label %{join}"));
+                    self.start_block(&join);
+                    let delta = self.val(&format!(
+                        "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{win} ]"
+                    ));
+                    let host = self.val(&format!("add i64 {addr}, {delta}"));
+                    let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    return self.access_at(&ptr, &access);
+                }
+                let win = self.new_label("gw");
+                let wtbl = self.new_label("gt");
+                let fast = self.new_label("gf");
+                let slow = self.new_label("gs");
+                let join = self.new_label("gj");
+                self.emit(&format!(
+                    "br i1 {inside}, label %{win}, label %{fast}, {UNLIKELY}"
+                ));
+                self.start_block(&win);
+                let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
+                let fits = self.val(&format!("icmp ule i64 {offset}, {}", SLOT_BYTES - bytes));
+                self.emit(&format!(
+                    "br i1 {fits}, label %{wtbl}, label %{slow}, {LIKELY}"
+                ));
+                self.start_block(&wtbl);
+                let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+                self.emit(&format!("br label %{fast}"));
+                self.start_block(&fast);
+                let delta = self.val(&format!(
+                    "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{wtbl} ]"
+                ));
+                let host = self.val(&format!("add i64 {addr}, {delta}"));
+                let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
+                if let Access::Store { .. } = access {
+                    self.access_at(&p_fast, &access);
+                }
+                self.emit(&format!("br label %{join}"));
+                self.start_block(&slow);
+                let p_slow = match access {
+                    Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
+                    Access::Store { ty, value } => {
+                        self.slow_store(addr, bytes, ty, value);
+                        None
+                    }
+                };
+                self.emit(&format!("br label %{join}"));
+                self.start_block(&join);
+                if let Some(p_slow) = p_slow {
+                    let ptr = self.val(&format!(
+                        "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
+                    ));
+                    self.access_at(&ptr, &access)
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// True if the runtime keeps adjacent mapped slots host-contiguous (no straddle check).

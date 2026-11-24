@@ -542,18 +542,24 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
         "{GUEST_STATE_TYPE} = type {{ [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]], [16 x [2 x i64]], i32, [3 x i32], i64, i8, [7 x i8] }}"
     );
     out.push('\n');
-    let _ = writeln!(out, "declare void @{HELPER_INDIRECT_CALL}(ptr, i64)");
     let _ = writeln!(
         out,
-        "declare void @{HELPER_UNIMPLEMENTED}(ptr, i64) noreturn"
+        "declare void @{HELPER_INDIRECT_CALL}(ptr noundef, i64 noundef)"
     );
     let _ = writeln!(
         out,
-        "declare void @{HELPER_DIVIDE_ERROR}(ptr, i64) noreturn"
+        "declare void @{HELPER_UNIMPLEMENTED}(ptr noundef, i64 noundef) noreturn cold"
     );
-    let _ = writeln!(out, "declare void @{HELPER_TRAP}(ptr, i64) noreturn");
+    let _ = writeln!(
+        out,
+        "declare void @{HELPER_DIVIDE_ERROR}(ptr noundef, i64 noundef) noreturn cold"
+    );
+    let _ = writeln!(
+        out,
+        "declare void @{HELPER_TRAP}(ptr noundef, i64 noundef) noreturn cold"
+    );
     for va in &external {
-        let _ = writeln!(out, "declare void @{}(ptr)", function_symbol(*va));
+        let _ = writeln!(out, "declare void @{}(ptr noundef)", function_symbol(*va));
     }
     for item in &support {
         match item {
@@ -585,7 +591,7 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
             }
             Support::Memset => out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"),
             Support::Helper(helper) => {
-                let _ = writeln!(out, "declare void @{}(ptr)", helper.symbol());
+                let _ = writeln!(out, "declare void @{}(ptr noundef)", helper.symbol());
             }
             Support::GuestBase => {
                 let _ = writeln!(out, "@{GUEST_BASE_SYMBOL} = external global i64, align 8");
@@ -631,20 +637,24 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
     };
     let attributes = match extra {
         None => LIFTED_FUNCTION_ATTRIBUTES.to_string(),
-        Some(extra) => {
-            let mut tagged = String::with_capacity(out.len() + 64);
-            for line in out.lines() {
-                tagged.push_str(line);
-                if line.starts_with("define ") && line.ends_with(") {") {
-                    tagged.truncate(tagged.len() - 2);
-                    tagged.push_str(" #0 {");
-                }
-                tagged.push('\n');
-            }
-            out = tagged;
-            module_attributes(extra)
-        }
+        Some(extra) => module_attributes(extra),
     };
+    if out
+        .lines()
+        .any(|l| l.starts_with("define ") && l.ends_with(" {") && !l.ends_with(" #0 {"))
+    {
+        let mut tagged = String::with_capacity(out.len() + 64);
+        for line in out.lines() {
+            if line.starts_with("define ") && line.ends_with(" {") && !line.ends_with(" #0 {") {
+                tagged.push_str(&line[..line.len() - 2]);
+                tagged.push_str(" #0 {");
+            } else {
+                tagged.push_str(line);
+            }
+            tagged.push('\n');
+        }
+        out = tagged;
+    }
     out.push('\n');
     let _ = writeln!(out, "attributes #0 = {{ {attributes} }}");
     Ok(out)

@@ -111,7 +111,7 @@ fn lifted_functions_require_wasm_simd() {
     assert!(
         module
             .ir
-            .contains("define void @sub_1000(ptr noalias %state) #0 {")
+            .contains("define void @sub_1000(ptr noalias noundef %state) unnamed_addr #0 {")
     );
     assert!(module.ir.contains(&format!(
         "attributes #0 = {{ {LIFTED_FUNCTION_ATTRIBUTES} }}"

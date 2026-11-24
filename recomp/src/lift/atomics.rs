@@ -23,8 +23,8 @@
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use super::integer::{RAX, RBX, RCX, RDX};
-use super::{Alu, Flag, FunctionLifter, R, RegRef, imm, reg_ref, unsupported};
-use crate::lift::{HELPER_TRAP, Support};
+use super::{Alu, ColdTrapKind, Flag, FunctionLifter, R, RegRef, reg_ref, unsupported};
+use crate::lift::Support;
 
 /// `{lo, hi, success} = cmpxchg16b(p, expected lo/hi, new lo/hi)` under a spinlock from the
 /// shared lock table (see the module docs for exactly what this guarantees). `linkonce_odr`
@@ -34,7 +34,7 @@ use crate::lift::{HELPER_TRAP, Support};
 pub(in crate::lift) const CMPXCHG16B_IR: &str = "\
 @__playgta6_cmpxchg16b_locks = linkonce_odr hidden global [64 x i32] zeroinitializer, align 4
 
-define internal { i64, i64, i1 } @__playgta6_cmpxchg16b(ptr %lo.p, i64 %cmp_lo, i64 %cmp_hi, i64 %new_lo, i64 %new_hi) {
+define internal { i64, i64, i1 } @__playgta6_cmpxchg16b(ptr %lo.p, i64 %cmp_lo, i64 %cmp_hi, i64 %new_lo, i64 %new_hi) unnamed_addr #0 {
 entry:
   %addr = ptrtoint ptr %lo.p to i64
   %slot = lshr i64 %addr, 4
@@ -101,13 +101,6 @@ impl FunctionLifter<'_> {
         let old = self.val(&format!("extractvalue {{ i{bits}, i1 }} {pair}, 0"));
         let ok = self.val(&format!("extractvalue {{ i{bits}, i1 }} {pair}, 1"));
         (old, ok)
-    }
-
-    /// A new `%tN` name without emitting anything.
-    fn fresh_name(&mut self) -> String {
-        let name = format!("%t{}", self.tmp);
-        self.tmp += 1;
-        name
     }
 
     fn memory_ptr(&mut self, ins: &Instruction) -> R<String> {
@@ -321,17 +314,7 @@ impl FunctionLifter<'_> {
             // #GP for a misaligned operand.
             let low = self.val(&format!("and i64 {ea}, 15"));
             let misaligned = self.val(&format!("icmp ne i64 {low}, 0"));
-            let fault = self.new_label("gp");
-            let ok = self.new_label("cont");
-            self.emit(&format!("br i1 {misaligned}, label %{fault}, label %{ok}"));
-            self.start_block(&fault);
-            self.sync_out();
-            self.emit(&format!(
-                "call void @{HELPER_TRAP}(ptr %state, i64 {})",
-                imm(ins.ip(), 64)
-            ));
-            self.emit("unreachable");
-            self.start_block(&ok);
+            self.cold_trap_branch(&misaligned, ColdTrapKind::Trap, ins.ip());
             let rax = self.load_gpr(RAX)?;
             let rdx = self.load_gpr(RDX)?;
             let rbx = self.load_gpr(RBX)?;

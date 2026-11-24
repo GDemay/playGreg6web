@@ -35,7 +35,7 @@ const RFLAGS_FIXED: u64 = 0x202;
 /// `{crc'} = crc32c(crc, byte)`: one byte of the reflected CRC-32C (Castagnoli, polynomial
 /// `0x82F63B78`) that the SSE4.2 `crc32` instruction computes.
 pub(in crate::lift) const CRC32C_IR: &str = "\
-define internal i32 @__playgta6_crc32c_u8(i32 %crc, i8 %byte) {
+define internal i32 @__playgta6_crc32c_u8(i32 %crc, i8 %byte) unnamed_addr #0 {
 entry:
   %b = zext i8 %byte to i32
   %c0 = xor i32 %crc, %b

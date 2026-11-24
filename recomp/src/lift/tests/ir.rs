@@ -55,11 +55,17 @@ fn raw_bytes_function_lifts_to_a_complete_module() {
         "%playgta6.GuestState = type { [16 x i64], i64, [8 x i8], i64, i64, [16 x [2 x i64]], \
          [16 x [2 x i64]], i32, [3 x i32], i64, i8, [7 x i8] }"
     ));
-    assert!(ir.contains(&format!("declare void @{HELPER_INDIRECT_CALL}(ptr, i64)")));
+    assert!(ir.contains(&format!(
+        "declare void @{HELPER_INDIRECT_CALL}(ptr noundef, i64 noundef)"
+    )));
     for helper in [HELPER_UNIMPLEMENTED, HELPER_DIVIDE_ERROR, HELPER_TRAP] {
-        assert!(ir.contains(&format!("declare void @{helper}(ptr, i64) noreturn")));
+        assert!(ir.contains(&format!(
+            "declare void @{helper}(ptr noundef, i64 noundef) noreturn cold"
+        )));
     }
-    assert!(ir.contains("define void @sub_1000(ptr noalias %state) #0 {\nentry:\n"));
+    assert!(
+        ir.contains("define void @sub_1000(ptr noalias noundef %state) unnamed_addr #0 {\nentry:\n")
+    );
     assert!(ir.contains("  br label %bb_1000\nbb_1000:\n"));
     // Only the registers the function touches get a slot (rax, rcx, rdx + always rsp).
     for reg in ["rax", "rcx", "rdx", "rsp"] {
@@ -94,8 +100,11 @@ fn output_is_deterministic_and_independent_of_input_order() {
     assert_eq!(first.ir, second.ir);
     assert_eq!(first.ir, third.ir);
     // sub_3000 is defined in the module, sub_4000 is only tail-called: declared once.
-    assert!(!first.ir.contains("declare void @sub_3000(ptr)"));
-    assert_eq!(first.ir.matches("declare void @sub_4000(ptr)").count(), 1);
+    assert!(!first.ir.contains("declare void @sub_3000(ptr noundef)"));
+    assert_eq!(
+        first.ir.matches("declare void @sub_4000(ptr noundef)").count(),
+        1
+    );
     assert!(
         first.ir.find("define void @sub_2000").expect("sub_2000")
             < first.ir.find("define void @sub_3000").expect("sub_3000")
@@ -472,11 +481,32 @@ fn unsupported_instructions_trap_and_are_reported() {
         report[1]
     );
     let in_va = report[0].address;
-    let trap = format!("call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 {in_va})\n  unreachable");
-    assert!(module.ir.contains(&trap), "{}", module.ir);
+    let fld_va = report[1].address;
+    // Both unsupported sites share one cold_trap sync-out and call via a phi of their VAs.
+    let cold = block_text(&module.ir, "cold_trap");
+    assert!(
+        cold.contains(&format!("[ {in_va}, %bb_{in_va:X} ]"))
+            && cold.contains(&format!("[ {fld_va}, %bb_{fld_va:X} ]")),
+        "{cold}"
+    );
+    assert_eq!(
+        module
+            .ir
+            .matches(&format!("call void @{HELPER_UNIMPLEMENTED}("))
+            .count(),
+        1,
+        "{}",
+        module.ir
+    );
+    assert!(
+        cold.contains(&format!("call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 %t")),
+        "{cold}"
+    );
+    assert!(cold.trim_end().ends_with("unreachable"), "{cold}");
     // The instruction after the trap in the same block is not lifted.
     let body = block_text(&module.ir, &format!("bb_{in_va:X}"));
     assert!(!body.contains("store i64 1,"), "{body}");
+    assert_eq!(body.trim(), "br label %cold_trap", "{body}");
 }
 
 #[test]
@@ -506,10 +536,13 @@ fn partially_lifted_instructions_are_rolled_back() {
     assert_eq!(lifted.unsupported.len(), 1, "{:?}", lifted.unsupported);
     assert_eq!(lifted.unsupported[0].reason, "EIP-relative addressing");
     let body = block_text(&lifted.ir, "bb_1000");
-    // The only ZF read left is the state sync in front of the trap call.
-    assert_eq!(body.matches("load i1, ptr %zf").count(), 1, "{body}");
+    // No partial cmove IR remains in bb_1000: only the branch to the shared cold trap sink.
+    assert_eq!(body.trim(), "br label %cold_trap", "{body}");
     assert!(!body.contains("select"), "{body}");
-    assert!(body.contains(HELPER_UNIMPLEMENTED), "{body}");
+    let cold = block_text(&lifted.ir, "cold_trap");
+    // The only ZF read left is the state sync in front of the trap call.
+    assert_eq!(cold.matches("load i1, ptr %zf").count(), 1, "{cold}");
+    assert!(cold.contains(HELPER_UNIMPLEMENTED), "{cold}");
 }
 
 #[test]
@@ -521,15 +554,18 @@ fn division_has_a_divide_error_path_and_wide_ops_use_internal_helpers() {
         a.cqo()?;
         a.idiv(r8)?;
         a.rol(eax, 3)?;
+        a.add(eax, ecx)?;
         a.ret()
     });
     let module = lift_module([&func]).expect("lifts");
     let ir = &module.ir;
+    // Both div/idiv divide-error paths branch to the shared cold_trap sink (1 helper call).
     assert_eq!(
         ir.matches(&format!("call void @{HELPER_DIVIDE_ERROR}"))
             .count(),
-        2
+        1
     );
+    assert_eq!(ir.matches("label %cold_trap,").count(), 2, "{ir}");
     for helper in [
         "__playgta6_umul128",
         "__playgta6_udiv128",
@@ -796,4 +832,187 @@ fn state_layout_constants_match_the_ir_type_and_the_import_seam() {
     assert_eq!(stubs::SEAM_XMM_OFFSET, STATE_XMM_OFFSET);
     assert_eq!(stubs::SEAM_XMM_STRIDE, STATE_XMM_STRIDE);
     assert_eq!(stubs::STACK_ARG_OFFSET, CALLEE_STACK_ARG_OFFSET);
+}
+
+#[test]
+fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
+    use crate::lift::MemoryModel;
+    use crate::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
+
+    // 1. Flag-free leaf function: zero flag allocas and zero flag state syncs.
+    let flag_free = asm_function(0x1000, |a| {
+        a.mov(rax, qword_ptr(rcx + 8))?;
+        a.mov(qword_ptr(rdx), rax)?;
+        a.ret()
+    });
+    let flag_free_mod = lift_module_with(
+        [&flag_free],
+        MemoryModel::from_name("window").expect("window model"),
+    )
+    .expect("lifts");
+    for flag in ["%cf", "%pf", "%af", "%zf", "%sf", "%of"] {
+        assert!(
+            !flag_free_mod.ir.contains(&format!("{flag} = alloca")),
+            "flag-free function must not allocate {flag}:\n{}",
+            flag_free_mod.ir
+        );
+    }
+
+    // 2. Representative multi-block windowed function with multiple returns, mixed cold traps
+    //    (int3 + ud2 + div), multiple non-stack loads & stores, immediate shift, xor/test idioms.
+    let multi = asm_function(0x2000, |a| {
+        let mut slow_err = a.create_label();
+        let mut early_ret = a.create_label();
+        let mut second_trap = a.create_label();
+        a.test(rcx, rcx)?;
+        a.jz(early_ret)?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(r8d, dword_ptr(rcx + 8))?;
+        a.shl(rax, 3)?;
+        a.mov(qword_ptr(rdx), rax)?;
+        a.mov(dword_ptr(rdx + 8), r8d)?;
+        a.test(r9, r9)?;
+        a.jz(slow_err)?;
+        a.xor(edx, edx)?;
+        a.div(r9)?;
+        a.test(r10, r10)?;
+        a.jz(second_trap)?;
+        a.ret()?;
+        a.set_label(&mut early_ret)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        a.set_label(&mut slow_err)?;
+        a.int3()?;
+        a.set_label(&mut second_trap)?;
+        a.ud2()
+    });
+    let windowed = lift_module_with(
+        [&multi],
+        MemoryModel::from_name("window").expect("window model"),
+    )
+    .expect("lifts");
+    let ir = &windowed.ir;
+
+    // Attributes: unnamed_addr, noundef, cold noreturn on trap helpers, cold on straddle helpers.
+    assert!(ir.contains("define void @sub_2000(ptr noalias noundef %state) unnamed_addr #0 {"));
+    assert!(ir.contains("declare void @__playgta6_trap(ptr noundef, i64 noundef) noreturn cold"));
+    assert!(ir.contains(
+        "declare void @__playgta6_divide_error(ptr noundef, i64 noundef) noreturn cold"
+    ));
+    assert!(ir.contains("declare ptr @__playgta6_guest_read(i64 noundef, i64 noundef) cold"));
+    assert!(ir.contains("declare ptr @__playgta6_guest_scratch() cold"));
+    assert!(ir.contains("declare void @__playgta6_guest_write(i64 noundef, i64 noundef) cold"));
+
+    // Hoisted @__playgta6_guest_base load: strictly ONCE in entry:, not per memory access!
+    assert_eq!(
+        ir.matches("load i64, ptr @__playgta6_guest_base, align 8, !invariant.load !{}")
+            .count(),
+        1,
+        "guest base must be hoisted once into entry:\n{ir}"
+    );
+    let fn_start = ir.find("define void @sub_2000(").expect("sub_2000");
+    let fn_ir = &ir[fn_start..];
+    let entry = block_text(fn_ir, "entry");
+    assert!(
+        entry.contains("@__playgta6_guest_base, align 8, !invariant.load !{}"),
+        "hoisted base must live in entry:\n{entry}"
+    );
+    assert!(
+        entry.contains("!range !{i8 0, i8 2}"),
+        "flag loads carry binary range metadata:\n{entry}"
+    );
+
+    // Shared cold_trap sink: 1 sync_out shared across int3 + ud2 + div (#DE), 1 call per kind.
+    assert_eq!(ir.matches("\ncold_trap:\n").count(), 1, "{ir}");
+    assert_eq!(ir.matches("call void @__playgta6_trap(").count(), 1, "{ir}");
+    assert_eq!(
+        ir.matches("call void @__playgta6_divide_error(").count(),
+        1,
+        "{ir}"
+    );
+    assert!(ir.contains("switch i8 "), "mixed trap kinds share sync_out:\n{ir}");
+
+    // Shared ret_epilog sink across both `ret` instructions.
+    assert_eq!(ir.matches("\nret_epilog:\n").count(), 1, "{ir}");
+    assert_eq!(ir.matches("br label %ret_epilog").count(), 2, "{ir}");
+
+    // Compact windowed accesses: 2 non-stack loads -> 2 `align 1` loads total (not 6!),
+    // 2 non-stack stores -> 2 `align 1` stores inside sub_2000 + outlined cold slow_store helpers.
+    assert_eq!(
+        fn_ir.matches(", align 1\n").count(),
+        4,
+        "2 loads + 2 stores = 4 align-1 accesses total (no per-path duplication):\n{fn_ir}"
+    );
+    assert!(
+        ir.contains("define internal void @__playgta6_slow_store8(i64 noundef %va, i64 noundef %v) unnamed_addr noinline cold #0 {"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("define internal void @__playgta6_slow_store4(i64 noundef %va, i32 noundef %v) unnamed_addr noinline cold #0 {"),
+        "{ir}"
+    );
+    assert!(
+        !fn_ir.contains("@__playgta6_guest_scratch"),
+        "slow store must be outlined out of lifted functions:\n{fn_ir}"
+    );
+
+    // Immediate shift (`shl rax, 3`) does not emit conditional flag select muxes.
+    assert!(
+        !fn_ir.contains("select i1 "),
+        "constant-count shift must not emit flag selects:\n{fn_ir}"
+    );
+
+    // 3. `window-outline` CLI model emits compact outlined helpers with native v128 for 16-byte ops.
+    let simd_mem = asm_function(0x3000, |a| {
+        a.movdqu(xmm0, xmmword_ptr(rcx))?;
+        a.movdqu(xmmword_ptr(rdx), xmm0)?;
+        a.ret()
+    });
+    let outlined = lift_module_with(
+        [&simd_mem],
+        MemoryModel::from_name("window-outline").expect("window-outline model"),
+    )
+    .expect("lifts");
+    assert!(
+        outlined.ir.contains(
+            "define internal <2 x i64> @__playgta6_wload16_400000000(i64 noundef %va) unnamed_addr noinline cold #0 {"
+        ),
+        "{}",
+        outlined.ir
+    );
+    assert!(
+        outlined.ir.contains(
+            "define internal void @__playgta6_wstore16_400000000(i64 noundef %va, <2 x i64> noundef %v) unnamed_addr noinline cold #0 {"
+        ),
+        "{}",
+        outlined.ir
+    );
+    assert!(
+        !outlined.ir.contains(" i128 ") && !outlined.ir.contains("(i128"),
+        "16-byte outlined helpers use native <2 x i64>, not i128:\n{}",
+        outlined.ir
+    );
+
+    // 4. Verify all three emitted modules compile cleanly to valid wasm64 objects via LLVM.
+    if let Some(tool) = find_llvm_tool() {
+        let dir = std::env::temp_dir().join(format!(
+            "playgta6_r36_ir_size_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (name, text) in [
+            ("flag_free", &flag_free_mod.ir),
+            ("windowed", &windowed.ir),
+            ("outlined", &outlined.ir),
+        ] {
+            let ll = dir.join(format!("{name}.ll"));
+            let obj = dir.join(format!("{name}.o"));
+            std::fs::write(&ll, text).expect("write .ll");
+            compile_to_wasm64_object(&tool, &ll, &obj)
+                .unwrap_or_else(|e| panic!("{name} failed LLVM compilation: {e}"));
+            let bytes = std::fs::metadata(&obj).expect("obj metadata").len();
+            assert!(bytes > 0, "{name} object empty");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

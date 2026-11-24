@@ -52,6 +52,7 @@
 
 use std::fmt::Write as _;
 
+use super::memory_access::UNLIKELY;
 use super::{FunctionLifter, block_label, imm};
 use crate::lift::{GUEST_STATE_TYPE, HELPER_TRAP};
 
@@ -86,7 +87,7 @@ impl FunctionLifter<'_> {
         let taken = self.val(&format!("icmp ne i8 {pending}, 0"));
         let next = self.new_label("after_call");
         self.emit(&format!(
-            "br i1 {taken}, label %{UNWIND_LABEL}, label %{next}"
+            "br i1 {taken}, label %{UNWIND_LABEL}, label %{next}, {UNLIKELY}"
         ));
         self.start_block(&next);
         self.unwind_sites += 1;

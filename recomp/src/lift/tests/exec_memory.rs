@@ -259,6 +259,83 @@ fn remapped_slot_is_reloaded_after_a_call() {
 }
 
 #[test]
+fn multi_return_and_mixed_traps_execute_identically_across_memory_models() {
+    if !exec_or_skip("multi_return_and_mixed_traps_execute_identically_across_memory_models") {
+        return;
+    }
+    // Exercises shared ret_epilog, shared mixed cold_trap (int3 + divide error), hoisted
+    // guest_base, constant-count shifts, same-register xor/test, and windowed/straddling loads &
+    // stores across every memory model.
+    let f = asm_function(CODE_BASE, |a| {
+        let mut early = a.create_label();
+        let mut trap_lbl = a.create_label();
+        a.test(rcx, rcx)?;
+        a.jz(early)?;
+        a.mov(rax, qword_ptr(rcx))?;
+        a.shl(rax, 2)?;
+        a.mov(qword_ptr(rdi), rax)?;
+        a.test(r8, r8)?;
+        a.js(trap_lbl)?;
+        a.xor(edx, edx)?;
+        a.div(r8)?;
+        a.ret()?;
+        a.set_label(&mut early)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        a.set_label(&mut trap_lbl)?;
+        a.int3()
+    });
+    let src = boundary(2) - 3; // straddles slots 1 | 2
+    let dst = boundary(4) - 5; // straddles slots 3 | 4
+    let input = 0x1234_5678u64;
+    for (name, memory) in models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let cases = [
+            // Normal path: loads straddling qword, shifts << 2, stores straddling qword, divides by 4.
+            Case::new(CODE_BASE)
+                .reg(RCX, src)
+                .reg(RDI, dst)
+                .reg(super::exec::R8, 4)
+                .mem(src, &input.to_le_bytes())
+                .read(dst, 8),
+            // Early-return path (shared ret_epilog).
+            Case::new(CODE_BASE).reg(RCX, 0),
+            // Divide-by-zero path (shared cold_trap -> divide_error).
+            Case::new(CODE_BASE)
+                .reg(RCX, src)
+                .reg(RDI, dst)
+                .reg(super::exec::R8, 0)
+                .mem(src, &input.to_le_bytes()),
+            // Trap path (shared cold_trap -> trap).
+            Case::new(CODE_BASE)
+                .reg(RCX, src)
+                .reg(RDI, dst)
+                .reg(super::exec::R8, u64::MAX)
+                .mem(src, &input.to_le_bytes()),
+        ];
+        let o = run(&built, &cases);
+        ok(&o[..2], name);
+        assert_eq!(o[0].regs[RAX], input, "{name}: (input << 2) / 4");
+        assert_eq!(
+            o[0].mem[0],
+            (input << 2).to_le_bytes(),
+            "{name}: straddling store"
+        );
+        assert_eq!(o[1].regs[RAX], 0, "{name}: early return");
+        assert!(
+            o[2].error.contains("divide error"),
+            "{name}: divide error: {:?}",
+            o[2].error
+        );
+        assert!(
+            o[3].error.contains("trap at"),
+            "{name}: int3 trap: {:?}",
+            o[3].error
+        );
+    }
+}
+
+#[test]
 fn atomics_in_a_window_across_threads() {
     // The counters (DATA_ADDR) and the four guest stacks lie inside the harness window.
     atomics_across_threads(

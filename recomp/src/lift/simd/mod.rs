@@ -104,8 +104,8 @@ use std::fmt::Write as _;
 
 use iced_x86::{EncodingKind, Instruction, Mnemonic, OpKind, Register};
 
-use super::super::{GUEST_STATE_TYPE, HELPER_UNIMPLEMENTED, Support};
-use super::{FunctionLifter, R, imm, unsupported};
+use super::super::{GUEST_STATE_TYPE, Support};
+use super::{ColdTrapKind, FunctionLifter, R, imm, unsupported};
 
 /// Canonical type of an XMM register value (allocas and guest state slots).
 pub(super) const XMM_TYPE: &str = "<2 x i64>";
@@ -961,17 +961,7 @@ impl FunctionLifter<'_> {
         // Rounding control (bits 13-14) and the reserved bits 16-31 must be clear.
         let bad = self.val(&format!("and i32 {v}, {}", imm(0xFFFF_6000, 32)));
         let fault = self.val(&format!("icmp ne i32 {bad}, 0"));
-        let trap = self.new_label("mxcsr");
-        let ok = self.new_label("cont");
-        self.emit(&format!("br i1 {fault}, label %{trap}, label %{ok}"));
-        self.start_block(&trap);
-        self.sync_out();
-        self.emit(&format!(
-            "call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 {})",
-            imm(ins.ip(), 64)
-        ));
-        self.emit("unreachable");
-        self.start_block(&ok);
+        self.cold_trap_branch(&fault, ColdTrapKind::Unimplemented, ins.ip());
         let ptr = self.state_mxcsr_ptr();
         self.emit(&format!("store i32 {v}, ptr {ptr}"));
         Ok(())

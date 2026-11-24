@@ -135,7 +135,7 @@ impl Ir {
 /// `@llvm.ctlz.i64` and `@__playgta6_umul128`.
 pub(super) fn fma_f64_ir() -> String {
     let mut f = Ir::new(
-        "define internal double @__playgta6_fma_f64(double %a, double %b, double %c) {\nentry:",
+        "define internal double @__playgta6_fma_f64(double %a, double %b, double %c) unnamed_addr #0 {\nentry:",
     );
     let mut parts = Vec::new();
     for x in ["%a", "%b", "%c"] {
@@ -261,7 +261,7 @@ pub(super) fn fma_f64_ir() -> String {
 
 /// `{lo, hi} = __playgta6_clmul(a, b)`: carry-less 64 x 64 -> 128-bit product.
 pub(super) const CLMUL_IR: &str = "\
-define internal { i64, i64 } @__playgta6_clmul(i64 %a, i64 %b) {
+define internal { i64, i64 } @__playgta6_clmul(i64 %a, i64 %b) unnamed_addr #0 {
 entry:
   br label %loop
 loop:
