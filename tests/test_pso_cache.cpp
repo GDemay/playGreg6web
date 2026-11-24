@@ -299,6 +299,9 @@ void test_texture_format_mapping() {
          FormatDiag::FeatureFallback | FormatDiag::NeedsCpuConversion},
         {D::BC7_UNORM_SRGB, FormatUsage::Sampled, WgpuFeature::TextureCompressionBc, TF::Bc7RgbaUnormSrgb, 0},
         {D::R9G9B9E5_SHAREDEXP, FormatUsage::Sampled, 0, TF::Rgb9e5Ufloat, 0},
+        {D::R9G9B9E5_SHAREDEXP, FormatUsage::RenderTarget, 0, TF::Rgba16Float, FormatDiag::FeatureFallback},
+        {D::R9G9B9E5_SHAREDEXP, FormatUsage::RenderTarget, WgpuFeature::All, TF::Rgba16Float,
+         FormatDiag::FeatureFallback},
         {D::R8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
         {D::R8_UNORM, FormatUsage::RenderTarget, 0, TF::R8Unorm, 0},
         {D::A8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
@@ -308,6 +311,25 @@ void test_texture_format_mapping() {
         const TextureFormatMapping m = map_texture_format(e.dxgi, e.usage, e.features);
         CHECK(m.format == e.format);
         CHECK(m.diagnostics == e.diag);
+    }
+    // R9G9B9E5_SHAREDEXP is sampled-only in WebGPU: Sampled uses rgb9e5ufloat directly, while
+    // RenderTarget falls back to core rgba16float with no extra device features required.
+    {
+        const TextureFormatMapping sampled = map_texture_format(D::R9G9B9E5_SHAREDEXP, FormatUsage::Sampled, 0);
+        CHECK(sampled.supported());
+        CHECK(sampled.format == TF::Rgb9e5Ufloat);
+        CHECK((sampled.diagnostics & FormatDiag::FeatureFallback) == 0);
+        CHECK(sampled.required_features == 0);
+
+        const TextureFormatMapping rt = map_texture_format(D::R9G9B9E5_SHAREDEXP, FormatUsage::RenderTarget, 0);
+        CHECK(rt.supported());
+        CHECK(rt.format == TF::Rgba16Float);
+        CHECK(has(rt.diagnostics, FormatDiag::FeatureFallback));
+        CHECK(rt.required_features == 0);
+
+        const TextureFormatMapping ds = map_texture_format(D::R9G9B9E5_SHAREDEXP, FormatUsage::DepthStencil, 0);
+        CHECK(!ds.supported());
+        CHECK(has(ds.diagnostics, FormatDiag::Unsupported));
     }
     // A8_UNORM maps cleanly to core r8unorm with no extra device features required.
     CHECK(map_texture_format(D::A8_UNORM, FormatUsage::Sampled, 0).required_features == 0);
@@ -330,7 +352,7 @@ void test_texture_format_mapping() {
         {D::R1_UNORM, FormatUsage::Sampled},           {D::B4G4R4A4_UNORM, FormatUsage::Sampled},
         {D::BC1_UNORM, FormatUsage::RenderTarget},     {D::BC7_UNORM, FormatUsage::DepthStencil},
         {D::D32_FLOAT, FormatUsage::RenderTarget},     {D::R32_FLOAT, FormatUsage::DepthStencil},
-        {D::R9G9B9E5_SHAREDEXP, FormatUsage::RenderTarget}, {static_cast<D>(103), FormatUsage::Sampled},
+        {D::R9G9B9E5_SHAREDEXP, FormatUsage::DepthStencil}, {static_cast<D>(103), FormatUsage::Sampled},
         {D::R10G10B10_XR_BIAS_A2_UNORM, FormatUsage::RenderTarget},
     };
     for (const auto& [dxgi, usage] : unsupported) {
@@ -1016,6 +1038,9 @@ void test_diagnostics() {
     GraphicsKeyResult r11 = with([](auto& d) { d.RTVFormats[0] = D::R11G11B10_FLOAT; });
     CHECK(r11.diagnostics == PipelineDiag::TargetFormatFallback);
     CHECK(r11.key.color_targets[0].format == TF::Rgba16Float);
+    GraphicsKeyResult r9 = with([](auto& d) { d.RTVFormats[0] = D::R9G9B9E5_SHAREDEXP; });
+    CHECK(r9.diagnostics == PipelineDiag::TargetFormatFallback);
+    CHECK(r9.key.color_targets[0].format == TF::Rgba16Float);
     GraphicsKeyResult d32s8 = with([](auto& d) { d.DSVFormat = D::D32_FLOAT_S8X24_UINT; });
     CHECK(d32s8.diagnostics == PipelineDiag::TargetFormatFallback);
     CHECK(d32s8.key.depth_stencil.format == TF::Depth24PlusStencil8);
