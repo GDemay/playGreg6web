@@ -221,6 +221,7 @@ struct BootState {
     CaptureHostStackFn capture_host_stack = nullptr;
     HostFunctionStartFn host_function_start = nullptr;
     OffThreadFaultFn off_thread_fault = nullptr;
+    GuestThreadStartedFn guest_thread_started = nullptr;
     std::atomic<bool> off_thread_fault_taken{false};
     bool log_progress = true;
     std::chrono::steady_clock::time_point start;
@@ -1475,6 +1476,9 @@ void boot_thread_init_hook(GuestThread& thread) {
         b.thread_states[raw] = &thread.state;
     }
     activate_guest_thread(raw);
+    if (b.guest_thread_started != nullptr) {
+        b.guest_thread_started(raw->thread_id);
+    }
     for (const size_t mi : callback_order()) {
         const ModuleState& m = b.modules[mi];
         for (const uint64_t callback : m.tls.callbacks) {
@@ -2231,6 +2235,17 @@ const char* boot_status_name(BootStatus status) {
     return "unknown";
 }
 
+std::string guest_thread_last_import(uint32_t thread_id) {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    for (const auto& [thread, entry] : b.thread_last) {
+        if (thread->thread_id == thread_id) {
+            return import_label(b.imports[entry.import_index].import);
+        }
+    }
+    return {};
+}
+
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset) {
     BootState& b = boot();
     build_host_map();
@@ -2527,6 +2542,7 @@ BootResult run_boot(const BootConfig& config) {
     b.arena_observer_installed = true;
     b.host_function_start = config.host_function_start;
     b.off_thread_fault = config.off_thread_fault;
+    b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);
         b.arena_log_limit = config.arena_log_limit;
@@ -2765,6 +2781,9 @@ BootResult run_boot(const BootConfig& config) {
     b.main_thread = main.get();
     b.threads.push_back(std::move(main));
     activate_guest_thread(b.main_thread);
+    if (b.guest_thread_started != nullptr) {
+        b.guest_thread_started(b.main_thread->thread_id);
+    }
     com::set_guest_thread_init_hook(&boot_thread_init_hook);
     b.thread_hook_installed = true;
     size_t callbacks = 0;
