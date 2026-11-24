@@ -934,3 +934,148 @@ test('W45 wires BootTracer, SplashOverlayController, and BootOrchestrator throug
   assert.equal(app.splashOverlay.getState().destroyed, true);
   assert.equal(app.bootOrchestrator.getState().destroyed, true);
 });
+
+test('W49 startWasmRuntime forwards bootBase, shaderPackUrl, reflectionManifestUrl, and pgimUrl from /api/status', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { createWorkerBootInitPayloads } = require('../web/loader.js');
+
+  const clock = createClock(7000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+  webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const workerCalls = [];
+  const postedMessages = [];
+  const mockWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      postedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+
+  const statusPayload = {
+    ok: true,
+    coopCoep: true,
+    dataDirConfigured: true,
+    hasManifest: true,
+    hasBootset: true,
+    hasWasmBinary: true,
+    shaderPackCount: 1,
+    shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    reflectionManifestUrl: '/shaders/reflection-manifest.json',
+    pgimUrl: '/boot/guest.pgim',
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch(statusPayload),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      workerCalls.push(args);
+      return mockWorker;
+    },
+  });
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(workerCalls.length, 1);
+  assert.equal(postedMessages.length, 1);
+
+  assert.equal(workerCalls[0].bootBase, 'https://playgta6.local/boot/');
+  assert.equal(workerCalls[0].shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(workerCalls[0].reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(workerCalls[0].pgimUrl, '/boot/guest.pgim');
+
+  const initPayload = postedMessages[0].payload;
+  assert.equal(initPayload.bootBase, 'https://playgta6.local/boot/');
+  assert.equal(initPayload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(initPayload.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(initPayload.pgimUrl, '/boot/guest.pgim');
+
+  // Verify W47 loader init payload forwarding consumes the exact fields posted by app_bootstrap.
+  const workerInits = createWorkerBootInitPayloads(initPayload);
+  assert.equal(workerInits.ioInit.bootBase, 'https://playgta6.local/boot/');
+  assert.equal(workerInits.ioInit.pgimUrl, '/boot/guest.pgim');
+  assert.equal(workerInits.gpuInit.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(workerInits.gpuInit.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+
+  await app.destroy();
+
+  // Also verify BootOrchestrator discovery path and default '/boot/' fallback when location.origin is absent.
+  const orchWorkerCalls = [];
+  const orchPostedMessages = [];
+  const orchWorker = createFakeEventTarget({
+    postMessage(payload, transfer) {
+      orchPostedMessages.push({ payload, transfer });
+    },
+    terminate() {},
+  });
+  const hostNoOrigin = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  hostNoOrigin.windowObj.location = { origin: 'null' };
+
+  const orchApp = bootstrapPlayGta6App({
+    windowObj: hostNoOrigin.windowObj,
+    documentObj: hostNoOrigin.documentObj,
+    navigatorObj: hostNoOrigin.navigatorObj,
+    fetchImpl: createMockFetch(statusPayload),
+    canvas: webgpu.canvas,
+    hud,
+    enableBootOrchestrator: true,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker(args) {
+      orchWorkerCalls.push(args);
+      return orchWorker;
+    },
+  });
+
+  const orchStarted = await orchApp.start();
+  assert.equal(orchStarted.ok, true);
+  assert.equal(orchStarted.mode, SESSION_MODE.WASM);
+  assert.equal(orchWorkerCalls.length, 1);
+  assert.equal(orchPostedMessages.length, 1);
+
+  assert.equal(orchWorkerCalls[0].bootBase, '/boot/');
+  assert.equal(orchWorkerCalls[0].shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(orchWorkerCalls[0].reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(orchWorkerCalls[0].pgimUrl, '/boot/guest.pgim');
+
+  assert.equal(orchPostedMessages[0].payload.bootBase, '/boot/');
+  assert.equal(orchPostedMessages[0].payload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(orchPostedMessages[0].payload.reflectionManifestUrl, '/shaders/reflection-manifest.json');
+  assert.equal(orchPostedMessages[0].payload.pgimUrl, '/boot/guest.pgim');
+
+  await orchApp.destroy();
+});
