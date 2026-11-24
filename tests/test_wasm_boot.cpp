@@ -992,6 +992,201 @@ void test_program_boot_shader_pack_loading() {
     }
 }
 
+constexpr const char* kValidReflectionJson =
+    R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {
+  "0x0000000000001111": {"stage": "vertex",
+    "vertex_inputs": [{"location": 0, "vb_slot": 0, "byte_offset": 0, "components": 4,
+                       "component_type": "f32"}],
+    "bindings": [{"group": 0, "binding": 0, "kind": "uniform",
+                  "source": {"user_sgpr": 8, "table_byte_offset": 0}}]},
+  "0x0000000000002222": {"stage": "fragment",
+    "bindings": [{"group": 0, "binding": 1, "kind": "sampler", "source": {"static_sampler": 0}}]}
+}})";
+
+bool saw_log(const std::string& expected) {
+    for (const std::string& line : g_logs) {
+        if (line == expected) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool saw_log_prefix(const std::string& prefix) {
+    for (const std::string& line : g_logs) {
+        if (line.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_try_load_stage_reflection() {
+    using playgta6::boot::try_load_stage_reflection;
+    using playgta6::gpu::ReflectedStage;
+    using playgta6::gpu::StageReflectionIndex;
+
+    // 1. Valid sidecar parses into a StageReflectionIndex with the expected stages.
+    {
+        FakeFs fs;
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", kValidReflectionJson);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 64;
+        std::shared_ptr<StageReflectionIndex> reflection;
+        CHECK(try_load_stage_reflection(cfg, "shaders/splash.wgsl.pack", reflection));
+        CHECK(static_cast<bool>(reflection));
+        if (reflection) {
+            CHECK(reflection->size() == 2);
+            auto vs = reflection->find(0x1111ULL);
+            CHECK(vs != reflection->end());
+            if (vs != reflection->end()) {
+                CHECK(vs->second.stage == ReflectedStage::Vertex);
+                CHECK(vs->second.vertex_inputs.size() == 1);
+                CHECK(vs->second.bindings.size() == 1);
+            }
+            auto ps = reflection->find(0x2222ULL);
+            CHECK(ps != reflection->end());
+            if (ps != reflection->end()) {
+                CHECK(ps->second.stage == ReflectedStage::Fragment);
+            }
+        }
+        CHECK(saw_log(
+            "[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json loaded (2 stage(s))"));
+        CHECK(fs.handles.empty());
+    }
+
+    // 2. Missing sidecar: false, no output, no log line.
+    {
+        FakeFs fs;
+        WasmBootConfig cfg = make_cfg(fs);
+        std::shared_ptr<StageReflectionIndex> reflection;
+        CHECK(!try_load_stage_reflection(cfg, "shaders/splash.wgsl.pack", reflection));
+        CHECK(!reflection);
+        CHECK(g_logs.empty());
+        CHECK(fs.opens == 1);
+    }
+
+    // 3. Empty pack path: false without touching HTTPFS.
+    {
+        FakeFs fs;
+        WasmBootConfig cfg = make_cfg(fs);
+        std::shared_ptr<StageReflectionIndex> reflection;
+        CHECK(!try_load_stage_reflection(cfg, "", reflection));
+        CHECK(!reflection);
+        CHECK(fs.opens == 0);
+    }
+
+    // 4. Malformed sidecar: false, output untouched, concise SHADER_PACK warning.
+    {
+        FakeFs fs;
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", "{\"schema\": ");
+        WasmBootConfig cfg = make_cfg(fs);
+        std::shared_ptr<StageReflectionIndex> reflection;
+        CHECK(!try_load_stage_reflection(cfg, "shaders/splash.wgsl.pack", reflection));
+        CHECK(!reflection);
+        CHECK(saw_log_prefix(
+            "[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json invalid: "));
+        CHECK(fs.handles.empty());
+    }
+}
+
+void test_program_boot_stage_reflection_sidecar() {
+    namespace dx = playgta6::gpu::d3d12_xs_exports;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto run = [&](const WasmBootConfig& cfg) -> WasmBootResult {
+        g_test_entry_hook = nullptr;
+        playgta6::os::VirtualMemoryArena arena;
+        playgta6::os::win32::set_vmem_arena(&arena);
+        dx::reset_for_tests();
+        const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+        dx::reset_for_tests();
+        playgta6::guest::com::reset_com_bridge();
+        playgta6::guest::reset_boot();
+        playgta6::os::win32::set_vmem_arena(nullptr);
+        return r;
+    };
+
+    // 1. Primary pack + valid sidecar: sidecar loaded next to the primary pack.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack",
+                  make_synthetic_wgpk({{0x1111ULL, 1}, {0x2222ULL, 2}}));
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", kValidReflectionJson);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        const WasmBootResult r = run(cfg);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(saw_log(
+            "[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json loaded (2 stage(s))"));
+    }
+
+    // 2. Fallback pack: the sidecar is looked up next to the pack that actually loaded.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/fallback.wgsl.pack",
+                  make_synthetic_wgpk({{0x1111ULL, 1}, {0x2222ULL, 2}}));
+        put_file(fs, "shaders/fallback.wgsl.pack.reflect.json", kValidReflectionJson);
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", kValidReflectionJson);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        const WasmBootResult r = run(cfg);
+        CHECK(r.ok);
+        CHECK(saw_log(
+            "[boot] SHADER_PACK: shaders/fallback.wgsl.pack.reflect.json loaded (2 stage(s))"));
+        CHECK(!saw_log_prefix("[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json"));
+    }
+
+    // 3. Pack without sidecar: boot succeeds, no sidecar milestone.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack", make_synthetic_wgpk({{0x1111ULL, 1}}));
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        const WasmBootResult r = run(cfg);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(!saw_log_prefix("[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json"));
+    }
+
+    // 4. Malformed sidecar: warning milestone, boot still succeeds.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack", make_synthetic_wgpk({{0x1111ULL, 1}}));
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", "not json");
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        const WasmBootResult r = run(cfg);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(saw_log_prefix(
+            "[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json invalid: "));
+    }
+
+    // 5. No pack loaded: no sidecar lookup even when a sidecar exists.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_file(fs, "shaders/splash.wgsl.pack.reflect.json", kValidReflectionJson);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        const WasmBootResult r = run(cfg);
+        CHECK(r.ok);
+        CHECK(!saw_log_prefix("[boot] SHADER_PACK: shaders/splash.wgsl.pack.reflect.json"));
+    }
+}
+
 struct ScopedEnvVar {
     std::string name;
     bool had_prev = false;
@@ -1387,6 +1582,8 @@ int main() {
     test_program_boot_scoped_httpfs_bridge();
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
+    test_try_load_stage_reflection();
+    test_program_boot_stage_reflection_sidecar();
     test_program_boot_pipeline_dump_triggers();
     test_wgpu_features_and_dstorage_defaults();
 

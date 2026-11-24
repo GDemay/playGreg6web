@@ -10,6 +10,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/stage_reflection.h"
 #include "guest/boot.h"
 #include "guest/program_loader.h"
 #include "os/httpfs_mailbox.h"
@@ -492,6 +493,32 @@ std::string resolve_pipeline_dump_dir(const WasmBootConfig& cfg) {
 
 }  // namespace
 
+bool try_load_stage_reflection(const WasmBootConfig& cfg,
+                               const std::string& pack_path,
+                               std::shared_ptr<gpu::StageReflectionIndex>& out_reflection) {
+    if (pack_path.empty()) {
+        return false;
+    }
+    const std::string sidecar_path = pack_path + ".reflect.json";
+    std::vector<uint8_t> bytes;
+    std::string read_error;
+    if (!load_file_via_httpfs(cfg, sidecar_path, bytes, read_error)) {
+        return false;  // The sidecar is optional.
+    }
+    const std::string json_str(bytes.begin(), bytes.end());
+    auto reflection = std::make_shared<gpu::StageReflectionIndex>();
+    std::string parse_error;
+    if (!gpu::parse_stage_reflection_json(json_str, reflection.get(), &parse_error)) {
+        emit_boot_milestone(cfg, "SHADER_PACK", sidecar_path + " invalid: " + parse_error);
+        return false;
+    }
+    emit_boot_milestone(cfg, "SHADER_PACK",
+                        sidecar_path + " loaded (" + std::to_string(reflection->size()) +
+                            " stage(s))");
+    out_reflection = std::move(reflection);
+    return true;
+}
+
 bool has_pgim_magic(std::span<const uint8_t> bytes) {
     if (bytes.size() < kPgimMagicBytes) {
         return false;
@@ -713,7 +740,10 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     ScopedDeviceOptions device_options_guard;
 
     std::shared_ptr<gpu::ShaderPackIndex> shader_pack;
-    if (!try_load_shader_pack(cfg, cfg.shader_pack_path, /*is_fallback=*/false, shader_pack)) {
+    std::string loaded_pack_path;
+    if (try_load_shader_pack(cfg, cfg.shader_pack_path, /*is_fallback=*/false, shader_pack)) {
+        loaded_pack_path = cfg.shader_pack_path;
+    } else {
         if (!cfg.fallback_shader_pack_path.empty() &&
             cfg.fallback_shader_pack_path != cfg.shader_pack_path) {
             if (!cfg.shader_pack_path.empty()) {
@@ -722,13 +752,21 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
                                         " unavailable; falling back to " +
                                         cfg.fallback_shader_pack_path);
             }
-            (void)try_load_shader_pack(
-                cfg, cfg.fallback_shader_pack_path, /*is_fallback=*/true, shader_pack);
+            if (try_load_shader_pack(
+                    cfg, cfg.fallback_shader_pack_path, /*is_fallback=*/true, shader_pack)) {
+                loaded_pack_path = cfg.fallback_shader_pack_path;
+            }
         }
         if (!shader_pack &&
             (!cfg.shader_pack_path.empty() || !cfg.fallback_shader_pack_path.empty())) {
             emit_boot_milestone(cfg, "SHADER_PACK", "none loaded (draws will use unresolved PSOs)");
         }
+    }
+
+    // Stage reflection sidecar (G62/G63): `<pack>.reflect.json` next to the pack that loaded.
+    std::shared_ptr<gpu::StageReflectionIndex> stage_reflection;
+    if (shader_pack && !loaded_pack_path.empty()) {
+        (void)try_load_stage_reflection(cfg, loaded_pack_path, stage_reflection);
     }
 
     const std::string dump_dir = resolve_pipeline_dump_dir(cfg);
@@ -738,6 +776,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
 
     gpu::d3d12_guest::DeviceOptions device_options;
     device_options.shader_pack = std::move(shader_pack);
+    device_options.stage_reflection = std::move(stage_reflection);
     device_options.dump_dir = dump_dir;
     device_options.bridge.features = cfg.wgpu_features;
     device_options_guard.install(std::move(device_options));
