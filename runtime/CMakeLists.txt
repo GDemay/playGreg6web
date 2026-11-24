@@ -65,6 +65,7 @@ add_library(playgta6_core STATIC
     guest/guest_memory.cpp
     guest/memory_model.cpp
     guest/boot.cpp
+    guest/input_script.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
     os/xbox_scarlett_guest.cpp
@@ -251,6 +252,10 @@ else()
     # Native first-boot harness without lifted code (tools/build_native_boot.py links the full one).
     add_executable(playgta6_boot guest/boot_main.cpp)
     target_link_libraries(playgta6_boot PRIVATE playgta6_core)
+
+    add_executable(test_input_script ../tests/test_input_script.cpp)
+    target_link_libraries(test_input_script PRIVATE playgta6_core)
+    add_test(NAME playgta6_input_script_tests COMMAND test_input_script)
 
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
