@@ -37,6 +37,9 @@ const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
   'fallback_draw_count',
   'presentCount',
   'present_count',
+  'presents',
+  'framesPresented',
+  'frames_presented',
   'unboundBindGroupCount',
   'unbound_bind_group_count',
   'skippedDrawCount',
@@ -89,6 +92,27 @@ const RUNTIME_INIT_RE =
 const POST_INIT_BOOT_STAGE_RE =
   /\[(?:boot|wasm)\][^\r\n]*\b(TLS_INIT|CRT_INITTERM|ENTRY_CALL|XMEM_INIT|GDK_INIT|D3D12_CREATE_DEVICE|BINK_OPEN|FIRST_PRESENT)\b/i;
 const PROGRESS_LOG_FAILURE_RE = /\b(?:fail(?:ed|s|ure)?|error|abort(?:ed)?)\b/i;
+const BOOT_MILESTONES = Object.freeze([
+  'PGIM_LOAD',
+  'TLS_INIT',
+  'CRT_INITTERM',
+  'ENTRY_CALL',
+  'XMEM_INIT',
+  'GDK_INIT',
+  'D3D12_CREATE_DEVICE',
+  'BINK_OPEN',
+  'FIRST_PRESENT',
+]);
+const BOOT_MILESTONE_INDEX = new Map(BOOT_MILESTONES.map((name, idx) => [name, idx]));
+const BOOT_STATUS_MILESTONE_RE = new RegExp(
+  `\\bBoot\\s+(\\d+(?:\\.\\d+)?)%\\s*:\\s*(${BOOT_MILESTONES.join('|')})\\b`,
+  'i'
+);
+const BOOT_MILESTONE_TOKEN_RE = new RegExp(`\\b(${BOOT_MILESTONES.join('|')})\\b`, 'gi');
+const FPS_WINDOW_MS = 2000;
+const MAX_FPS_SAMPLES = 32;
+const MAX_FPS_CLOCK_JUMP_MS = 60000;
+
 const POST_INIT_BOOT_STAGES = Object.freeze(
   new Set([
     'TLS_INIT',
@@ -130,6 +154,13 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'validationCountEl',
   'validationLatestEl',
   'validationBannerEl',
+  'framesEl',
+  'fpsEl',
+  'pillFpsEl',
+  'bootStageEl',
+  'bootProgressBarEl',
+  'bootProgressFillEl',
+  'bootElapsedEl',
 ]);
 
 export const HUD_ACTIONS = Object.freeze({
@@ -446,6 +477,98 @@ function toNonNegativeInt(value, fallback = 0) {
   return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
 }
 
+function toNonNegativeFiniteNumber(value, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  if (typeof value === 'boolean' || typeof value === 'symbol' || typeof value === 'object') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return n;
+}
+
+/**
+ * Formats an FPS number for HUD display matching `web/index.html` (`0.0` for 0,
+ * one decimal below 10 FPS, rounded integer at or above 10 FPS).
+ *
+ * @param {unknown} fps
+ * @returns {string}
+ */
+export function formatFpsDisplay(fps) {
+  const value = toNonNegativeFiniteNumber(fps, 0);
+  return value >= 10 ? Math.round(value).toString() : value.toFixed(1);
+}
+
+function formatElapsedSeconds(ms) {
+  const clamped = typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : 0;
+  return `${(clamped / 1000).toFixed(1)}s`;
+}
+
+function normalizeBootMilestone(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toUpperCase();
+  if (!normalized || !BOOT_MILESTONE_INDEX.has(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function defaultMilestoneProgressPct(stage) {
+  const idx = BOOT_MILESTONE_INDEX.get(stage);
+  if (idx === undefined) {
+    return 0;
+  }
+  return Math.round(((idx + 1) / BOOT_MILESTONES.length) * 100);
+}
+
+function extractBootMilestoneFromText(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const text = raw.trim();
+  if (!text || PROGRESS_LOG_FAILURE_RE.test(text)) {
+    return null;
+  }
+  const statusMatch = BOOT_STATUS_MILESTONE_RE.exec(text);
+  if (statusMatch) {
+    const stage = normalizeBootMilestone(statusMatch[2]);
+    if (stage) {
+      const pct = toNonNegativeFiniteNumber(statusMatch[1], null);
+      return {
+        stage,
+        progressPct: pct !== null ? Math.min(100, pct) : defaultMilestoneProgressPct(stage),
+      };
+    }
+  }
+  let highestStage = null;
+  let highestIdx = -1;
+  BOOT_MILESTONE_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = BOOT_MILESTONE_TOKEN_RE.exec(text)) !== null) {
+    const stage = normalizeBootMilestone(m[1]);
+    if (stage) {
+      const idx = BOOT_MILESTONE_INDEX.get(stage);
+      if (idx > highestIdx) {
+        highestIdx = idx;
+        highestStage = stage;
+      }
+    }
+  }
+  if (!highestStage) {
+    return null;
+  }
+  return {
+    stage: highestStage,
+    progressPct: defaultMilestoneProgressPct(highestStage),
+  };
+}
+
 function safeGet(obj, key) {
   if (!obj || typeof obj !== 'object') {
     return undefined;
@@ -729,6 +852,17 @@ function safeSetAttribute(el, name, value) {
   }
 }
 
+function safeSetStyleWidth(el, width) {
+  if (!el || typeof el !== 'object') return;
+  try {
+    if (el.style && typeof el.style === 'object') {
+      el.style.width = String(width);
+    }
+  } catch {
+    // Ignore DOM style update errors on lightweight mocks.
+  }
+}
+
 export class HudController {
   /**
    * @param {object} [options]
@@ -801,6 +935,11 @@ export class HudController {
     this._copyToClipboard =
       copyToClipboard === undefined ? createBrowserCopyToClipboard() : copyToClipboard;
     this._now = now;
+    this._hasCustomNow =
+      options !== undefined &&
+      options !== null &&
+      Object.prototype.hasOwnProperty.call(options, 'now') &&
+      options.now !== undefined;
 
     this._lastAction = null;
     this._boundListeners = [];
@@ -821,7 +960,27 @@ export class HudController {
     this._currentSideModule = null;
     this._runtimeInitialized = false;
     this._inOwnHudLog = false;
+    this._inOwnHudMetrics = false;
+    this._inOwnHudStatus = false;
+    this._inOwnUpdateGpuBootTelemetry = false;
     this._hudLogHook = null;
+    this._hudMetricsHook = null;
+    this._hudStatusHook = null;
+
+    this._liveFramesPresented = 0;
+    this._liveFps = 0;
+    this._fpsSamples = [];
+    this._bootStage = null;
+    this._bootStageIndex = -1;
+    this._bootProgressPct = 0;
+    this._bootReadyForSplash = false;
+    this._bootElapsedMs = null;
+    this._lastPushedBootStage = null;
+    this._lastPushedProgressPct = -1;
+    this._lastSeenAppFrames = 0;
+    this._ignoredStaleAppStage = null;
+    this._lastExternalHudStatus = null;
+    this._lastConciseHudStatus = null;
 
     const resolvedMaxErrors =
       typeof maxValidationErrors === 'number' &&
@@ -858,6 +1017,8 @@ export class HudController {
       this.bindDisplayElements(initialDisplayEls);
     }
     this._attachHudLogObserver();
+    this._attachHudMetricsObserver();
+    this._attachHudStatusObserver();
   }
 
   get isExportingMissingShaders() {
@@ -931,6 +1092,183 @@ export class HudController {
       }
     } catch {
       // Ignore teardown errors on frozen/detached HUD objects.
+    }
+  }
+
+  _attachHudMetricsObserver() {
+    const hud = this._hud;
+    if (!hud || typeof hud !== 'object' || typeof hud.updateMetrics !== 'function') {
+      return;
+    }
+    const hasOwn = Object.prototype.hasOwnProperty.call(hud, 'updateMetrics');
+    const desc = hasOwn ? Object.getOwnPropertyDescriptor(hud, 'updateMetrics') : null;
+    if (desc && !desc.writable && !desc.configurable) {
+      return;
+    }
+    if (desc && desc.get && !desc.set) {
+      return;
+    }
+    if (!hasOwn && !Object.isExtensible(hud)) {
+      return;
+    }
+
+    const original = hud.updateMetrics;
+    const self = this;
+    const wrapped = function hudControllerUpdateMetricsObserver(metrics) {
+      if (self._destroyed || self._inOwnHudMetrics) {
+        return original.apply(this, arguments);
+      }
+      let forwarded = metrics;
+      try {
+        forwarded = self._interceptExternalHudMetrics(metrics);
+      } catch {
+        forwarded = metrics;
+      }
+      const prev = self._inOwnHudMetrics;
+      self._inOwnHudMetrics = true;
+      try {
+        return original.call(this, forwarded);
+      } finally {
+        self._inOwnHudMetrics = prev;
+      }
+    };
+
+    try {
+      hud.updateMetrics = wrapped;
+      this._hudMetricsHook = { hud, original, wrapped, hasOwn };
+    } catch {
+      this._hudMetricsHook = null;
+    }
+  }
+
+  _detachHudMetricsObserver() {
+    const hook = this._hudMetricsHook;
+    this._hudMetricsHook = null;
+    if (!hook || !hook.hud) {
+      return;
+    }
+    try {
+      if (hook.hud.updateMetrics === hook.wrapped) {
+        if (hook.hasOwn) {
+          hook.hud.updateMetrics = hook.original;
+        } else {
+          delete hook.hud.updateMetrics;
+        }
+      }
+    } catch {
+      // Ignore teardown errors on frozen/detached HUD objects.
+    }
+  }
+
+  _attachHudStatusObserver() {
+    const hud = this._hud;
+    if (!hud || typeof hud !== 'object' || typeof hud.setStatus !== 'function') {
+      return;
+    }
+    const hasOwn = Object.prototype.hasOwnProperty.call(hud, 'setStatus');
+    const desc = hasOwn ? Object.getOwnPropertyDescriptor(hud, 'setStatus') : null;
+    if (desc && !desc.writable && !desc.configurable) {
+      return;
+    }
+    if (desc && desc.get && !desc.set) {
+      return;
+    }
+    if (!hasOwn && !Object.isExtensible(hud)) {
+      return;
+    }
+
+    const original = hud.setStatus;
+    const self = this;
+    const wrapped = function hudControllerSetStatusObserver(text, level) {
+      const result = original.apply(this, arguments);
+      if (!self._destroyed && !self._inOwnHudStatus) {
+        try {
+          self._observeExternalHudStatus(text, level);
+        } catch {
+          // Status observation must never disrupt HUD status updates.
+        }
+      }
+      return result;
+    };
+
+    try {
+      hud.setStatus = wrapped;
+      this._hudStatusHook = { hud, original, wrapped, hasOwn };
+    } catch {
+      this._hudStatusHook = null;
+    }
+  }
+
+  _detachHudStatusObserver() {
+    const hook = this._hudStatusHook;
+    this._hudStatusHook = null;
+    if (!hook || !hook.hud) {
+      return;
+    }
+    try {
+      if (hook.hud.setStatus === hook.wrapped) {
+        if (hook.hasOwn) {
+          hook.hud.setStatus = hook.original;
+        } else {
+          delete hook.hud.setStatus;
+        }
+      }
+    } catch {
+      // Ignore teardown errors on frozen/detached HUD objects.
+    }
+  }
+
+  _pushHudMetrics(payload) {
+    if (
+      this._destroyed ||
+      this._inOwnHudMetrics ||
+      !payload ||
+      typeof payload !== 'object' ||
+      !this._hud
+    ) {
+      return;
+    }
+    const fn =
+      this._hudMetricsHook && typeof this._hudMetricsHook.original === 'function'
+        ? this._hudMetricsHook.original
+        : typeof this._hud.updateMetrics === 'function'
+          ? this._hud.updateMetrics
+          : null;
+    if (!fn) {
+      return;
+    }
+    const prev = this._inOwnHudMetrics;
+    this._inOwnHudMetrics = true;
+    try {
+      fn.call(this._hud, payload);
+    } catch {
+      // Never allow HUD metric push errors to break controller methods.
+    } finally {
+      this._inOwnHudMetrics = prev;
+    }
+  }
+
+  _setHudStatus(text, level = 'info') {
+    if (this._destroyed || this._inOwnHudStatus || !this._hud) {
+      return;
+    }
+    const fn =
+      this._hudStatusHook && typeof this._hudStatusHook.original === 'function'
+        ? this._hudStatusHook.original
+        : typeof this._hud.setStatus === 'function'
+          ? this._hud.setStatus
+          : null;
+    if (!fn) {
+      return;
+    }
+    const prev = this._inOwnHudStatus;
+    this._inOwnHudStatus = true;
+    try {
+      fn.call(this._hud, String(text ?? ''), level);
+    } catch {
+      // Never allow HUD status update errors to break controller methods.
+    } finally {
+      this._inOwnHudStatus = prev;
     }
   }
 
@@ -1603,38 +1941,63 @@ export class HudController {
    * @returns {object|null}
    */
   updateGpuBootTelemetry(payload) {
-    if (this._destroyed) {
+    if (this._destroyed || this._inOwnUpdateGpuBootTelemetry) {
       return null;
     }
 
-    if (payload && typeof payload === 'object') {
-      this._ingestBootTelemetryPayload(payload);
-    }
+    const prevReentry = this._inOwnUpdateGpuBootTelemetry;
+    this._inOwnUpdateGpuBootTelemetry = true;
+    try {
+      if (payload && typeof payload === 'object') {
+        this._ingestBootTelemetryPayload(payload);
+      }
 
-    const panel = this._getGpuBootPanel();
-    if (!panel || typeof panel.update !== 'function') {
-      return null;
-    }
-    if (!payload || typeof payload !== 'object') {
+      const panel = this._getGpuBootPanel();
+      if (!panel || typeof panel.update !== 'function') {
+        return null;
+      }
+      if (!payload || typeof payload !== 'object') {
+        try {
+          return typeof panel.getState === 'function' ? panel.getState() : null;
+        } catch {
+          return null;
+        }
+      }
       try {
-        return typeof panel.getState === 'function' ? panel.getState() : null;
+        const state = panel.update(payload);
+        return state !== undefined ? state : null;
       } catch {
         return null;
       }
-    }
-    try {
-      const state = panel.update(payload);
-      return state !== undefined ? state : null;
-    } catch {
-      return null;
+    } finally {
+      this._inOwnUpdateGpuBootTelemetry = prevReentry;
     }
   }
 
   _ingestBootTelemetryPayload(payload) {
     let changed = false;
+    let liveMetricsDirty = false;
+    let bootStageChanged = false;
 
     const summary =
       payload.bootSummary && typeof payload.bootSummary === 'object' ? payload.bootSummary : null;
+    if (summary && this._applyBootStage(summary)) {
+      bootStageChanged = true;
+      changed = true;
+    } else if (payload.milestone !== undefined || payload.stage !== undefined) {
+      if (
+        this._applyBootStage({
+          stage: payload.milestone ?? payload.stage,
+          progressPct: payload.progressPct,
+          readyForSplash: payload.readyForSplash,
+          elapsedMs: payload.elapsedMs,
+        })
+      ) {
+        bootStageChanged = true;
+        changed = true;
+      }
+    }
+
     const rawFirstPresentSource =
       payload.firstPresentSource !== undefined
         ? payload.firstPresentSource
@@ -1725,10 +2088,18 @@ export class HudController {
 
     if (this._applyStructuredTelemetryPayload(payload, { includeFrameStatsPresent: true })) {
       changed = true;
+      liveMetricsDirty = true;
     }
 
     if (changed) {
       this._renderBootDiagnostics({ updateHudStatus: false });
+    }
+    if (liveMetricsDirty || bootStageChanged) {
+      this._syncLiveHudReadouts({
+        includeFrames: liveMetricsDirty || this._liveFramesPresented > 0,
+        includeBootSummary: bootStageChanged,
+        updateHudStatus: false,
+      });
     }
   }
 
@@ -1739,6 +2110,584 @@ export class HudController {
     } catch {
       return Date.now();
     }
+  }
+
+  _recordLiveFrames(frameCount, opts = {}) {
+    const parsedFrames = toNonNegativeInt(frameCount, null);
+    const explicitFps = toNonNegativeFiniteNumber(opts.fps, null);
+    let framesChanged = false;
+    let fpsChanged = false;
+
+    if (explicitFps !== null && explicitFps > 0) {
+      const roundedExplicit = Math.round(explicitFps * 10) / 10;
+      if (roundedExplicit !== this._liveFps) {
+        this._liveFps = roundedExplicit;
+        fpsChanged = true;
+      }
+    }
+
+    if (parsedFrames === null) {
+      return { framesChanged, fpsChanged };
+    }
+
+    const effectiveFrames = opts.allowReset
+      ? parsedFrames
+      : Math.max(this._liveFramesPresented, parsedFrames);
+    const deltaFrames = effectiveFrames - this._liveFramesPresented;
+    if (effectiveFrames !== this._liveFramesPresented) {
+      this._liveFramesPresented = effectiveFrames;
+      framesChanged = true;
+    }
+    if (effectiveFrames > this._gpuTelemetry.presentCount) {
+      this._gpuTelemetry.presentCount = effectiveFrames;
+    }
+
+    if (opts.allowReset && effectiveFrames === 0) {
+      this._fpsSamples = [];
+      if (this._liveFps !== 0) {
+        this._liveFps = 0;
+        fpsChanged = true;
+      }
+      return { framesChanged, fpsChanged };
+    }
+
+    if (deltaFrames > 0 || (effectiveFrames > 0 && this._fpsSamples.length === 0)) {
+      const nowMs = this._safeNowMs();
+      const rawExplicitTs = toNonNegativeFiniteNumber(opts.timestampMs, null);
+      let ts = nowMs;
+      if (rawExplicitTs !== null) {
+        if (!this._hasCustomNow) {
+          ts = rawExplicitTs;
+        } else if (
+          this._fpsSamples.length > 0 &&
+          nowMs === this._fpsSamples[this._fpsSamples.length - 1].timestampMs &&
+          rawExplicitTs > this._fpsSamples[this._fpsSamples.length - 1].timestampMs
+        ) {
+          ts = rawExplicitTs;
+        }
+      }
+
+      if (this._fpsSamples.length === 0) {
+        this._fpsSamples.push({ frames: effectiveFrames, timestampMs: ts });
+      } else {
+        const last = this._fpsSamples[this._fpsSamples.length - 1];
+        if (ts < last.timestampMs || ts - last.timestampMs > MAX_FPS_CLOCK_JUMP_MS) {
+          this._fpsSamples = [{ frames: effectiveFrames, timestampMs: ts }];
+        } else if (ts === last.timestampMs) {
+          last.frames = Math.max(last.frames, effectiveFrames);
+        } else {
+          this._fpsSamples.push({ frames: effectiveFrames, timestampMs: ts });
+          while (
+            this._fpsSamples.length > 2 &&
+            (this._fpsSamples.length > MAX_FPS_SAMPLES ||
+              ts - this._fpsSamples[1].timestampMs > FPS_WINDOW_MS)
+          ) {
+            this._fpsSamples.shift();
+          }
+        }
+      }
+
+      if (explicitFps === null || explicitFps <= 0) {
+        const oldest = this._fpsSamples[0];
+        const newest = this._fpsSamples[this._fpsSamples.length - 1];
+        const dtMs = newest.timestampMs - oldest.timestampMs;
+        const df = newest.frames - oldest.frames;
+        if (dtMs > 0 && df > 0) {
+          const computed = (df * 1000) / dtMs;
+          if (Number.isFinite(computed) && computed > 0) {
+            const rounded = Math.round(computed * 10) / 10;
+            if (rounded !== this._liveFps) {
+              this._liveFps = rounded;
+              fpsChanged = true;
+            }
+          }
+        }
+      }
+    }
+
+    return { framesChanged, fpsChanged };
+  }
+
+  _applyBootStage(input, opts = {}) {
+    if (input === null || input === undefined) {
+      return false;
+    }
+    let rawStage = null;
+    let rawPct = null;
+    let rawReady = null;
+    let rawElapsed = null;
+
+    if (typeof input === 'string') {
+      rawStage = input;
+    } else if (isPlainObject(input)) {
+      rawStage = safeGet(input, 'stage') ?? safeGet(input, 'milestone') ?? null;
+      const pctField = safeGet(input, 'progressPct');
+      if (pctField !== undefined && pctField !== null) {
+        rawPct = toNonNegativeFiniteNumber(pctField, null);
+      } else {
+        const reached = toNonNegativeFiniteNumber(safeGet(input, 'milestonesReached'), null);
+        const total = toNonNegativeFiniteNumber(safeGet(input, 'totalMilestones'), null);
+        if (reached !== null && total !== null && total > 0) {
+          rawPct = Math.min(100, (reached / total) * 100);
+        }
+      }
+      const readyField = safeGet(input, 'readyForSplash');
+      if (typeof readyField === 'boolean') {
+        rawReady = readyField;
+      }
+      const elapsedField = safeGet(input, 'elapsedMs');
+      if (elapsedField !== undefined && elapsedField !== null) {
+        rawElapsed = toNonNegativeFiniteNumber(elapsedField, null);
+      }
+    } else {
+      return false;
+    }
+
+    const milestone = normalizeBootMilestone(rawStage);
+    if (!milestone) {
+      if (rawReady === true) {
+        return this._applyBootStage(
+          { stage: 'FIRST_PRESENT', progressPct: 100, readyForSplash: true, elapsedMs: rawElapsed },
+          opts
+        );
+      }
+      return false;
+    }
+
+    const nextIdx = BOOT_MILESTONE_INDEX.get(milestone);
+    if (!opts.allowReset && nextIdx < this._bootStageIndex) {
+      return false;
+    }
+
+    let changed = false;
+    if (milestone !== this._bootStage) {
+      this._bootStage = milestone;
+      this._bootStageIndex = nextIdx;
+      changed = true;
+    }
+
+    const computedPct =
+      rawPct !== null ? Math.min(100, rawPct) : defaultMilestoneProgressPct(milestone);
+    if (opts.allowReset || computedPct > this._bootProgressPct || changed) {
+      const nextPct = opts.allowReset ? computedPct : Math.max(this._bootProgressPct, computedPct);
+      if (nextPct !== this._bootProgressPct) {
+        this._bootProgressPct = nextPct;
+        changed = true;
+      }
+    }
+
+    const nextReady = milestone === 'FIRST_PRESENT' || rawReady === true;
+    if (nextReady && !this._bootReadyForSplash) {
+      this._bootReadyForSplash = true;
+      if (this._bootProgressPct < 100) {
+        this._bootProgressPct = 100;
+      }
+      changed = true;
+    }
+
+    if (rawElapsed !== null && rawElapsed !== this._bootElapsedMs) {
+      this._bootElapsedMs = rawElapsed;
+    }
+
+    if (
+      POST_INIT_BOOT_STAGES.has(milestone) &&
+      !this._isActiveSmokeSession() &&
+      this.getBootMode() !== BOOT_MODE.SMOKE
+    ) {
+      this._runtimeInitialized = true;
+      if (this._sideModuleCount > 0 && this._loadedSideModuleCount < this._sideModuleCount) {
+        this._loadedSideModuleCount = this._sideModuleCount;
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  _buildBootSummaryPayload(force = false) {
+    if (!this._bootStage) {
+      return null;
+    }
+    if (
+      !force &&
+      this._bootStage === this._lastPushedBootStage &&
+      this._bootProgressPct === this._lastPushedProgressPct
+    ) {
+      return null;
+    }
+    this._lastPushedBootStage = this._bootStage;
+    this._lastPushedProgressPct = this._bootProgressPct;
+    const summary = {
+      stage: this._bootStage,
+      progressPct: this._bootProgressPct,
+      readyForSplash: this._bootReadyForSplash,
+    };
+    if (this._bootElapsedMs !== null) {
+      summary.elapsedMs = this._bootElapsedMs;
+    }
+    return summary;
+  }
+
+  _captureAppFramesBaseline() {
+    let appFrames = 0;
+    let appStage = null;
+    const app = this._app;
+    if (!app || typeof app !== 'object') {
+      this._lastSeenAppFrames = 0;
+      this._ignoredStaleAppStage = null;
+      return;
+    }
+    try {
+      if (app.bootTracer && typeof app.bootTracer.reset === 'function') {
+        app.bootTracer.reset();
+      }
+    } catch {
+      // Ignore optional bootTracer reset errors.
+    }
+    try {
+      if (typeof app.getBootTelemetry === 'function') {
+        const bt = app.getBootTelemetry();
+        const p = toNonNegativeInt(bt && (bt.presentCount ?? bt.gpu?.presentCount), 0);
+        if (p > appFrames) appFrames = p;
+        const m = normalizeBootMilestone(bt && bt.milestone);
+        if (m) appStage = m;
+      }
+    } catch {
+      // Ignore optional app telemetry errors.
+    }
+    try {
+      if (typeof app.getDiagnosticsSnapshot === 'function') {
+        const snap = app.getDiagnosticsSnapshot();
+        const f = toNonNegativeInt(snap && snap.framesPresented, 0);
+        if (f > appFrames) appFrames = f;
+        if (!appStage) {
+          const m = normalizeBootMilestone(snap && snap.milestone);
+          if (m) appStage = m;
+        }
+      }
+    } catch {
+      // Ignore optional diagnostics snapshot errors.
+    }
+    this._lastSeenAppFrames = appFrames;
+    this._ignoredStaleAppStage = appStage;
+  }
+
+  _syncFromAppSources() {
+    const app = this._app;
+    if (!app || typeof app !== 'object') {
+      return { bootStageChanged: false, telemetryChanged: false };
+    }
+    let bootStageChanged = false;
+    let telemetryChanged = false;
+
+    try {
+      if (app.bootTracer && typeof app.bootTracer.getSummary === 'function') {
+        const summary = app.bootTracer.getSummary();
+        if (summary && typeof summary === 'object') {
+          const tracerStage = normalizeBootMilestone(summary.stage);
+          if (!tracerStage) {
+            this._ignoredStaleAppStage = null;
+          } else if (tracerStage !== this._ignoredStaleAppStage) {
+            this._ignoredStaleAppStage = null;
+            if (this._applyBootStage(summary)) {
+              bootStageChanged = true;
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore optional bootTracer errors.
+    }
+
+    let appFrames = null;
+    let appGpu = null;
+    let appMilestone = null;
+
+    try {
+      if (typeof app.getBootTelemetry === 'function') {
+        const bt = app.getBootTelemetry();
+        if (bt && typeof bt === 'object') {
+          if (bt.milestone) {
+            appMilestone = bt.milestone;
+          }
+          const present = toNonNegativeInt(bt.presentCount ?? bt.gpu?.presentCount, null);
+          if (present !== null) {
+            appFrames = present;
+          }
+          appGpu = bt.gpu && typeof bt.gpu === 'object' ? bt.gpu : bt;
+        }
+      }
+    } catch {
+      // Ignore optional getBootTelemetry errors.
+    }
+
+    try {
+      if (typeof app.getDiagnosticsSnapshot === 'function') {
+        const snap = app.getDiagnosticsSnapshot();
+        if (snap && typeof snap === 'object') {
+          if (!appMilestone && snap.milestone) {
+            appMilestone = snap.milestone;
+          }
+          const f = toNonNegativeInt(snap.framesPresented, null);
+          if (f !== null && (appFrames === null || f > appFrames)) {
+            appFrames = f;
+          }
+        }
+      }
+    } catch {
+      // Ignore optional getDiagnosticsSnapshot errors.
+    }
+
+    const normalizedAppMilestone = normalizeBootMilestone(appMilestone);
+    if (!normalizedAppMilestone) {
+      this._ignoredStaleAppStage = null;
+    } else if (normalizedAppMilestone !== this._ignoredStaleAppStage) {
+      this._ignoredStaleAppStage = null;
+      if (this._applyBootStage(normalizedAppMilestone)) {
+        bootStageChanged = true;
+      }
+    }
+
+    if (appFrames !== null) {
+      if (appFrames < this._lastSeenAppFrames) {
+        this._lastSeenAppFrames = appFrames;
+      }
+      if (appFrames > this._lastSeenAppFrames) {
+        this._lastSeenAppFrames = appFrames;
+        const { framesChanged, fpsChanged } = this._recordLiveFrames(appFrames);
+        if (framesChanged || fpsChanged) {
+          telemetryChanged = true;
+        }
+        if (appGpu && typeof appGpu === 'object') {
+          const rp = toNonNegativeInt(safeGet(appGpu, 'realPackDrawCount'), null);
+          const fb = toNonNegativeInt(safeGet(appGpu, 'fallbackDrawCount'), null);
+          const ve = toNonNegativeInt(safeGet(appGpu, 'validationErrorCount'), null);
+          if (rp !== null && rp !== this._gpuTelemetry.realPackDrawCount) {
+            this._gpuTelemetry.realPackDrawCount = rp;
+            this._hasGpuTelemetry = true;
+            telemetryChanged = true;
+          }
+          if (fb !== null && fb !== this._gpuTelemetry.fallbackDrawCount) {
+            this._gpuTelemetry.fallbackDrawCount = fb;
+            this._hasGpuTelemetry = true;
+            telemetryChanged = true;
+          }
+          if (ve !== null && ve > this._validationErrorCount) {
+            this._gpuTelemetry.validationErrorCount = ve;
+            this._validationErrorCount = ve;
+            telemetryChanged = true;
+          }
+        }
+      }
+    }
+
+    return { bootStageChanged, telemetryChanged };
+  }
+
+  _buildConciseHudStatus() {
+    const g = this._gpuTelemetry;
+    const validation = this.getValidationSummary();
+    const bootMode = this.getBootMode();
+    const level = validation.hasErrors
+      ? 'error'
+      : bootMode === BOOT_MODE.SMOKE
+        ? 'warn'
+        : 'ok';
+
+    if (g.realPackDrawCount > 0 || g.fallbackDrawCount > 0) {
+      const text =
+        g.fallbackDrawCount > 0
+          ? `Draws: ${g.realPackDrawCount} real, ${g.fallbackDrawCount} fallback`
+          : `Draws: ${g.realPackDrawCount} real`;
+      return { text, level };
+    }
+    if (this._bootStage === 'FIRST_PRESENT') {
+      const text = 'Boot 100%: FIRST_PRESENT';
+      if (this._lastExternalHudStatus && /FIRST_PRESENT/i.test(this._lastExternalHudStatus)) {
+        return null;
+      }
+      return { text, level };
+    }
+    return null;
+  }
+
+  _syncLiveHudReadouts(opts = {}) {
+    if (this._destroyed) {
+      return;
+    }
+    const payload = {};
+    if (opts.includeFrames !== false && (this._liveFramesPresented > 0 || opts.forceFrames === true)) {
+      payload.framesPresented = this._liveFramesPresented;
+      payload.fps = this._liveFps;
+    }
+    const bootSummary = this._buildBootSummaryPayload(opts.forceBootSummary === true);
+    if (bootSummary) {
+      payload.bootSummary = bootSummary;
+    }
+    if (Object.keys(payload).length > 0) {
+      this._pushHudMetrics(payload);
+    }
+
+    if (opts.updateHudStatus === undefined) {
+      const concise = this._buildConciseHudStatus();
+      if (concise && concise.text !== this._lastConciseHudStatus) {
+        this._lastConciseHudStatus = concise.text;
+        this._setHudStatus(concise.text, concise.level);
+      }
+    }
+  }
+
+  _observeExternalHudStatus(text, _level) {
+    if (typeof text !== 'string') {
+      return;
+    }
+    this._lastExternalHudStatus = text;
+    let bootStageChanged = false;
+    const parsed = extractBootMilestoneFromText(text);
+    if (parsed && this._applyBootStage(parsed)) {
+      bootStageChanged = true;
+    }
+    const appSync = this._syncFromAppSources();
+    if (appSync.bootStageChanged) {
+      bootStageChanged = true;
+    }
+    if (bootStageChanged || appSync.telemetryChanged) {
+      this._renderBootDiagnostics({ updateHudStatus: false });
+      const bootSummary = this._buildBootSummaryPayload(false);
+      if (bootSummary || appSync.telemetryChanged) {
+        const metricsPatch = {};
+        if (bootSummary) {
+          metricsPatch.bootSummary = bootSummary;
+        }
+        if (appSync.telemetryChanged && this._liveFramesPresented > 0) {
+          metricsPatch.framesPresented = this._liveFramesPresented;
+          metricsPatch.fps = this._liveFps;
+        }
+        if (Object.keys(metricsPatch).length > 0) {
+          this._pushHudMetrics(metricsPatch);
+        }
+      }
+    }
+  }
+
+  _interceptExternalHudMetrics(metrics) {
+    if (!isPlainObject(metrics)) {
+      return metrics;
+    }
+    let diagChanged = false;
+
+    const appSync = this._syncFromAppSources();
+    if (appSync.bootStageChanged || appSync.telemetryChanged) {
+      diagChanged = true;
+    }
+
+    const incomingBootSummary = safeGet(metrics, 'bootSummary');
+    if (isPlainObject(incomingBootSummary)) {
+      if (this._applyBootStage(incomingBootSummary)) {
+        diagChanged = true;
+      }
+    } else if (safeGet(metrics, 'milestone') !== undefined || safeGet(metrics, 'stage') !== undefined) {
+      if (
+        this._applyBootStage({
+          stage: safeGet(metrics, 'milestone') ?? safeGet(metrics, 'stage'),
+          progressPct: safeGet(metrics, 'progressPct'),
+          readyForSplash: safeGet(metrics, 'readyForSplash'),
+          elapsedMs: safeGet(metrics, 'elapsedMs'),
+        })
+      ) {
+        diagChanged = true;
+      }
+    }
+
+    const frameStats = safeGet(metrics, 'frameStats');
+    const gpuStats = safeGet(metrics, 'gpuStats');
+    const incomingFramesRaw = pickFirstDefined(metrics, [
+      'framesPresented',
+      'frames_presented',
+      'presentCount',
+      'present_count',
+      'totalFrames',
+    ]);
+    const nestedFramesRaw =
+      incomingFramesRaw !== undefined
+        ? incomingFramesRaw
+        : isPlainObject(frameStats)
+          ? pickFirstDefined(frameStats, ['framesPresented', 'presentCount', 'totalFrames'])
+          : isPlainObject(gpuStats)
+            ? pickFirstDefined(gpuStats, ['presentCount', 'framesPresented'])
+            : undefined;
+    const incomingFrames = toNonNegativeInt(nestedFramesRaw, null);
+    const incomingFps = toNonNegativeFiniteNumber(safeGet(metrics, 'fps'), null);
+    const incomingTs = toNonNegativeFiniteNumber(
+      safeGet(metrics, 'timestampMs') ?? safeGet(metrics, 'timestamp'),
+      null
+    );
+
+    if (
+      this._applyStructuredTelemetryPayload(metrics, { includeFrameStatsPresent: true })
+    ) {
+      diagChanged = true;
+    }
+
+    if (incomingFrames !== null || (incomingFps !== null && incomingFps > 0)) {
+      const { framesChanged, fpsChanged } = this._recordLiveFrames(incomingFrames, {
+        fps: incomingFps,
+        timestampMs: incomingTs,
+      });
+      if (framesChanged || fpsChanged) {
+        diagChanged = true;
+      }
+    }
+
+    if (diagChanged) {
+      this._renderBootDiagnostics({ updateHudStatus: false });
+    }
+
+    const patched = { ...metrics };
+    if (this._liveFramesPresented > 0) {
+      const effectiveFrames =
+        incomingFrames !== null
+          ? Math.max(incomingFrames, this._liveFramesPresented)
+          : this._liveFramesPresented;
+      patched.framesPresented = effectiveFrames;
+      if (patched.totalFrames !== undefined) {
+        patched.totalFrames = Math.max(
+          toNonNegativeInt(patched.totalFrames, 0),
+          effectiveFrames
+        );
+      }
+      if (
+        patched.fps === undefined ||
+        patched.fps === null ||
+        (typeof patched.fps === 'number' && (!Number.isFinite(patched.fps) || patched.fps <= 0))
+      ) {
+        patched.fps = this._liveFps;
+      }
+    } else if (incomingFrames !== null && patched.framesPresented === undefined) {
+      patched.framesPresented = incomingFrames;
+    }
+
+    if (patched.bootSummary === undefined) {
+      const pendingBootSummary = this._buildBootSummaryPayload(false);
+      if (pendingBootSummary) {
+        patched.bootSummary = pendingBootSummary;
+      }
+    } else if (isPlainObject(patched.bootSummary) && this._bootStage) {
+      const incomingStage = normalizeBootMilestone(safeGet(patched.bootSummary, 'stage'));
+      const incomingIdx = incomingStage ? BOOT_MILESTONE_INDEX.get(incomingStage) : -1;
+      if (incomingIdx < this._bootStageIndex) {
+        patched.bootSummary = {
+          ...patched.bootSummary,
+          stage: this._bootStage,
+          progressPct: this._bootProgressPct,
+          readyForSplash: this._bootReadyForSplash,
+        };
+      }
+      this._lastPushedBootStage = this._bootStage;
+      this._lastPushedProgressPct = this._bootProgressPct;
+    }
+
+    return patched;
   }
 
   _applyGpuTelemetry(input, outer = null) {
@@ -1778,9 +2727,21 @@ export class HudController {
       'framesPresented',
       'frames_presented',
     ]);
+    const explicitFps = pickTelemetryField(primary, secondary, ['fps']);
+    const explicitTs = pickTelemetryField(primary, secondary, ['timestampMs', 'timestamp']);
     if (present !== undefined) {
-      this._gpuTelemetry.presentCount = toNonNegativeInt(present, 0);
+      const parsedPresent = toNonNegativeInt(present, 0);
+      this._gpuTelemetry.presentCount = parsedPresent;
+      this._recordLiveFrames(parsedPresent, {
+        fps: explicitFps,
+        timestampMs: explicitTs,
+      });
       touched = true;
+    } else if (explicitFps !== undefined) {
+      const { fpsChanged } = this._recordLiveFrames(null, { fps: explicitFps });
+      if (fpsChanged) {
+        touched = true;
+      }
     }
 
     const unbound = pickTelemetryField(primary, secondary, [
@@ -2000,9 +2961,17 @@ export class HudController {
           'framesPresented',
           'frames_presented',
         ]);
+        const frameFps = pickFirstDefined(frameStats, ['fps']);
+        const frameTs = pickFirstDefined(frameStats, ['timestampMs', 'timestamp']);
         if (framePresent !== undefined) {
-          this._gpuTelemetry.presentCount = toNonNegativeInt(framePresent, 0);
+          const parsedPresent = toNonNegativeInt(framePresent, 0);
+          this._gpuTelemetry.presentCount = parsedPresent;
           this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+          this._recordLiveFrames(parsedPresent, {
+            fps: frameFps,
+            timestampMs: frameTs,
+          });
+          changed = true;
         }
       }
     }
@@ -2066,12 +3035,147 @@ export class HudController {
       return this.getTelemetry().gpu;
     }
     const opts = isPlainObject(options) ? options : {};
-    if (this._applyGpuTelemetry(stats)) {
+    const gpuChanged = this._applyGpuTelemetry(stats);
+    const appSync = this._syncFromAppSources();
+    if (gpuChanged || appSync.bootStageChanged || appSync.telemetryChanged) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
       });
+      this._syncLiveHudReadouts({
+        includeFrames: true,
+        updateHudStatus: opts.updateHudStatus,
+      });
     }
     return this.getTelemetry().gpu;
+  }
+
+  /**
+   * Handles `splash-frame-presented` notifications from `app_bootstrap.js` / `wgpu_worker`,
+   * updating live Frames, rolling FPS, and advancing the boot milestone to `FIRST_PRESENT`.
+   *
+   * @param {object|null|undefined} event
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  onSplashFramePresented(event, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().gpu;
+    }
+    if (!isPlainObject(event)) {
+      return this.getTelemetry().gpu;
+    }
+    if (safeGet(event, 'ok') === false) {
+      return this.getTelemetry().gpu;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    const reportedFrames = toNonNegativeInt(
+      pickFirstDefined(event, [
+        'framesPresented',
+        'frames_presented',
+        'presentCount',
+        'present_count',
+        'frameCount',
+      ]),
+      null
+    );
+    const nextFrames =
+      reportedFrames !== null
+        ? Math.max(this._liveFramesPresented, reportedFrames)
+        : this._liveFramesPresented + 1;
+    const explicitFps = toNonNegativeFiniteNumber(safeGet(event, 'fps'), null);
+    const explicitTs = toNonNegativeFiniteNumber(
+      safeGet(event, 'timestampMs') ?? safeGet(event, 'timestamp'),
+      null
+    );
+
+    this._recordLiveFrames(nextFrames, {
+      fps: explicitFps,
+      timestampMs: explicitTs,
+    });
+    this._hasGpuTelemetry = true;
+    this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+
+    const firstPresent =
+      safeGet(event, 'firstPresent') === true || nextFrames >= 1;
+    if (firstPresent) {
+      this._applyBootStage({
+        stage: 'FIRST_PRESENT',
+        progressPct: 100,
+        readyForSplash: true,
+      });
+    }
+    this._syncFromAppSources();
+    this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus === true,
+    });
+    this._syncLiveHudReadouts({
+      includeFrames: true,
+      updateHudStatus: opts.updateHudStatus,
+    });
+    return this.getTelemetry().gpu;
+  }
+
+  recordSplashFramePresented(event, options = {}) {
+    return this.onSplashFramePresented(event, options);
+  }
+
+  handleSplashFramePresented(event, options = {}) {
+    return this.onSplashFramePresented(event, options);
+  }
+
+  /**
+   * Records a presented frame count (or increments by 1 when omitted) and updates
+   * live Frames, rolling FPS, and optional `FIRST_PRESENT` milestone readouts.
+   *
+   * @param {number|object|null|undefined} [input]
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  recordFramePresented(input, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().gpu;
+    }
+    if (typeof input === 'number' || typeof input === 'bigint') {
+      const count = toNonNegativeInt(input, null);
+      return this.onSplashFramePresented(
+        {
+          ok: true,
+          framesPresented: count !== null ? count : this._liveFramesPresented + 1,
+          firstPresent: count === null ? true : count >= 1,
+        },
+        options
+      );
+    }
+    if (isPlainObject(input)) {
+      return this.onSplashFramePresented(input, options);
+    }
+    return this.onSplashFramePresented(
+      {
+        ok: true,
+        framesPresented: this._liveFramesPresented + 1,
+        firstPresent: true,
+      },
+      options
+    );
+  }
+
+  /**
+   * Processes a HUD metrics update (e.g. from `PerfMonitor` or runtime telemetry),
+   * protecting live `Frames` and rolling `FPS` from being overwritten back to `0`
+   * by `PerfMonitor` ticks while `wgpu_worker` presents frames.
+   *
+   * @param {object|null|undefined} metrics
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  updateMetrics(metrics, options = {}) {
+    if (this._destroyed || !isPlainObject(metrics)) {
+      return this.getTelemetry();
+    }
+    const opts = isPlainObject(options) ? options : {};
+    const patched = this._interceptExternalHudMetrics(metrics);
+    if (opts.updateHudStatus === true) {
+      this._renderBootDiagnostics({ updateHudStatus: true });
+    }
+    this._pushHudMetrics(patched);
+    return this.getTelemetry();
   }
 
   /**
@@ -2126,9 +3230,35 @@ export class HudController {
       return this.getTelemetry();
     }
     const opts = isPlainObject(options) ? options : {};
-    if (this._applyStructuredTelemetryPayload(payload, { includeFrameStatsPresent: false })) {
+    let bootStageChanged = false;
+    if (isPlainObject(payload)) {
+      const summary = safeGet(payload, 'bootSummary');
+      if (isPlainObject(summary) && this._applyBootStage(summary)) {
+        bootStageChanged = true;
+      } else if (safeGet(payload, 'milestone') !== undefined || safeGet(payload, 'stage') !== undefined) {
+        if (
+          this._applyBootStage({
+            stage: safeGet(payload, 'milestone') ?? safeGet(payload, 'stage'),
+            progressPct: safeGet(payload, 'progressPct'),
+            readyForSplash: safeGet(payload, 'readyForSplash'),
+            elapsedMs: safeGet(payload, 'elapsedMs'),
+          })
+        ) {
+          bootStageChanged = true;
+        }
+      }
+    }
+    const structuredChanged = this._applyStructuredTelemetryPayload(payload, {
+      includeFrameStatsPresent: true,
+    });
+    const appSync = this._syncFromAppSources();
+    if (structuredChanged || bootStageChanged || appSync.bootStageChanged || appSync.telemetryChanged) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
+      });
+      this._syncLiveHudReadouts({
+        includeFrames: this._liveFramesPresented > 0,
+        updateHudStatus: opts.updateHudStatus,
       });
     }
     return this.getTelemetry();
@@ -2150,6 +3280,10 @@ export class HudController {
     this._hasGpuTelemetry = false;
     this._hasAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
+    this._liveFramesPresented = 0;
+    this._liveFps = 0;
+    this._fpsSamples = [];
+    this._lastConciseHudStatus = null;
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
     });
@@ -2164,6 +3298,7 @@ export class HudController {
     const a = this._audioTelemetry;
     const p = this._pthreadTelemetry;
 
+    const effectivePresentCount = Math.max(g.presentCount, this._liveFramesPresented);
     const totalDrawCount = g.realPackDrawCount + g.fallbackDrawCount;
     const hasRealPackDraws = g.realPackDrawCount > 0;
     const hasFallbackDraws = g.fallbackDrawCount > 0;
@@ -2174,11 +3309,11 @@ export class HudController {
         ? `Draws: ${g.realPackDrawCount} real, ${g.fallbackDrawCount} fallback`
         : `Draws: ${g.realPackDrawCount} real`;
       gpuStatusText =
-        g.presentCount > 0
-          ? `${drawPart} (${g.presentCount} present${g.presentCount === 1 ? '' : 's'})`
+        effectivePresentCount > 0
+          ? `${drawPart} (${effectivePresentCount} present${effectivePresentCount === 1 ? '' : 's'})`
           : drawPart;
-    } else if (this._hasGpuTelemetry && g.presentCount > 0) {
-      gpuStatusText = `Presents: ${g.presentCount} (0 draws)`;
+    } else if (this._hasGpuTelemetry && effectivePresentCount > 0) {
+      gpuStatusText = `Presents: ${effectivePresentCount} (0 draws)`;
     }
 
     let audioStatusText = '';
@@ -2213,7 +3348,9 @@ export class HudController {
       gpu: {
         realPackDrawCount: g.realPackDrawCount,
         fallbackDrawCount: g.fallbackDrawCount,
-        presentCount: g.presentCount,
+        presentCount: effectivePresentCount,
+        framesPresented: effectivePresentCount,
+        fps: this._liveFps,
         unboundBindGroupCount: g.unboundBindGroupCount,
         skippedDrawCount: g.skippedDrawCount,
         validationErrorCount: g.validationErrorCount,
@@ -2568,12 +3705,26 @@ export class HudController {
     if (this._destroyed) {
       return null;
     }
-    const parsed = parseSideModuleProgressLabel(label);
-    if (!parsed) {
-      return null;
-    }
     const opts = isPlainObject(options) ? options : {};
     const updateHudStatus = opts.updateHudStatus === true;
+
+    const milestoneInfo = extractBootMilestoneFromText(label);
+    let milestoneChanged = false;
+    if (milestoneInfo && this._applyBootStage(milestoneInfo)) {
+      milestoneChanged = true;
+    }
+
+    const parsed = parseSideModuleProgressLabel(label);
+    if (!parsed) {
+      if (milestoneChanged) {
+        this._renderBootDiagnostics({ updateHudStatus });
+        this._syncLiveHudReadouts({
+          includeFrames: false,
+          updateHudStatus: false,
+        });
+      }
+      return null;
+    }
 
     if (parsed.kind === 'runtime_starting') {
       if (this._runtimeInitialized) {
@@ -2634,9 +3785,20 @@ export class HudController {
         return null;
       }
       this._runtimeInitialized = true;
+      let rendered = false;
       if (this._sideModuleCount > 0 && this._loadedSideModuleCount < this._sideModuleCount) {
         this._loadedSideModuleCount = this._sideModuleCount;
         this._renderBootDiagnostics({ updateHudStatus });
+        rendered = true;
+      }
+      if (milestoneChanged) {
+        if (!rendered) {
+          this._renderBootDiagnostics({ updateHudStatus });
+        }
+        this._syncLiveHudReadouts({
+          includeFrames: false,
+          updateHudStatus: false,
+        });
       }
       return {
         handled: true,
@@ -2943,6 +4105,12 @@ export class HudController {
       isRealWasm64: bootMode === BOOT_MODE.REAL_WASM64,
       isSmoke: bootMode === BOOT_MODE.SMOKE,
       isIdle: bootMode === BOOT_MODE.IDLE,
+      milestone: this._bootStage,
+      bootStage: this._bootStage || 'BOOTING',
+      progressPct: this._bootProgressPct,
+      readyForSplash: this._bootReadyForSplash,
+      framesPresented: Math.max(telemetry.gpu.presentCount, this._liveFramesPresented),
+      fps: this._liveFps,
       sideModules,
       validation,
       telemetry,
@@ -3075,17 +4243,64 @@ export class HudController {
       }
     }
 
+    const liveFrames = status.framesPresented;
+    const liveFps = status.fps;
+    const formattedFps = formatFpsDisplay(liveFps);
+    const gpuStatus = status.telemetry && status.telemetry.gpu ? status.telemetry.gpu.statusText : '';
+
+    if (els.framesEl) {
+      safeSetText(els.framesEl, String(liveFrames));
+      safeSetDataset(els.framesEl, 'frames', String(liveFrames));
+      safeSetTitle(
+        els.framesEl,
+        gpuStatus || `${liveFrames} frame${liveFrames === 1 ? '' : 's'} presented`
+      );
+    }
+
+    if (els.fpsEl) {
+      safeSetText(els.fpsEl, formattedFps);
+      safeSetDataset(els.fpsEl, 'fps', String(liveFps));
+      safeSetDataset(els.fpsEl, 'state', liveFps >= 30 ? 'ok' : 'info');
+    }
+
+    if (els.pillFpsEl) {
+      safeSetText(els.pillFpsEl, `${formattedFps} fps`);
+    }
+
+    if (els.bootStageEl) {
+      safeSetText(els.bootStageEl, status.bootStage);
+      safeSetDataset(els.bootStageEl, 'stage', status.bootStage);
+      safeSetDataset(
+        els.bootStageEl,
+        'state',
+        status.readyForSplash || status.progressPct >= 100 ? 'ok' : ''
+      );
+    }
+
+    if (els.bootProgressBarEl) {
+      safeSetAttribute(els.bootProgressBarEl, 'aria-valuenow', String(Math.round(status.progressPct)));
+    }
+
+    if (els.bootProgressFillEl) {
+      safeSetStyleWidth(els.bootProgressFillEl, `${status.progressPct.toFixed(1)}%`);
+      safeSetDataset(
+        els.bootProgressFillEl,
+        'state',
+        status.readyForSplash || status.progressPct >= 100 ? 'ok' : ''
+      );
+    }
+
+    if (els.bootElapsedEl && this._bootElapsedMs !== null) {
+      safeSetText(els.bootElapsedEl, formatElapsedSeconds(this._bootElapsedMs));
+    }
+
     if (
       options &&
       options.updateHudStatus === true &&
       this._hud &&
       typeof this._hud.setStatus === 'function'
     ) {
-      try {
-        this._hud.setStatus(status.statusText, status.statusLevel);
-      } catch {
-        // Never allow HUD status update errors to break controller methods.
-      }
+      this._setHudStatus(status.statusText, status.statusLevel);
     }
 
     return status;
@@ -3272,6 +4487,7 @@ export class HudController {
     }
 
     try {
+      this._captureAppFramesBaseline();
       this._loadedSideModuleCount = 0;
       this._loadedSideModuleNames = [];
       this._currentSideModule = null;
@@ -3282,6 +4498,31 @@ export class HudController {
       this._hasGpuTelemetry = false;
       this._hasAudioTelemetry = false;
       this._hasPthreadTelemetry = false;
+      this._liveFramesPresented = 0;
+      this._liveFps = 0;
+      this._fpsSamples = [];
+      this._bootStage = null;
+      this._bootStageIndex = -1;
+      this._bootProgressPct = 0;
+      this._bootReadyForSplash = false;
+      this._bootElapsedMs = 0;
+      this._lastPushedBootStage = null;
+      this._lastPushedProgressPct = -1;
+      this._lastExternalHudStatus = null;
+      this._lastConciseHudStatus = null;
+
+      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._pushHudMetrics({
+        framesPresented: 0,
+        totalFrames: 0,
+        fps: 0,
+        bootSummary: {
+          stage: 'BOOTING',
+          progressPct: 0,
+          readyForSplash: false,
+          elapsedMs: 0,
+        },
+      });
 
       const sessionResult = await this._sessionController.restart({ preferSmoke });
       const state = this._getSessionState();
@@ -3305,6 +4546,21 @@ export class HudController {
 
       this._explicitBootMode = null;
       this._renderBootDiagnostics({ updateHudStatus: false });
+      this._pushHudMetrics({
+        framesPresented: this._liveFramesPresented,
+        totalFrames: this._liveFramesPresented,
+        fps: this._liveFps,
+        ...(this._bootStage
+          ? {}
+          : {
+              bootSummary: {
+                stage: 'BOOTING',
+                progressPct: 0,
+                readyForSplash: false,
+                elapsedMs: 0,
+              },
+            }),
+      });
 
       const summary = `Restarted runtime session (mode: ${mode}, state: ${state}).`;
       return this._finishAction(
@@ -3443,6 +4699,8 @@ export class HudController {
    */
   destroy() {
     this._detachHudLogObserver();
+    this._detachHudMetricsObserver();
+    this._detachHudStatusObserver();
     this.unbindButtons();
     this.unbindDisplayElements();
     this._destroyed = true;
