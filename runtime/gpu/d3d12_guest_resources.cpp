@@ -1198,7 +1198,20 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
 }
 
 HResult Resource::Map(uint32_t subresource, uint64_t, OutPtr data) {
-    if (!is_buffer() || cpu_va_ == 0 || subresource != 0) {
+    // Textures: on the console a texture's memory is ordinary CPU-addressable memory, and Map of
+    // subresource 0 returns its base. Titles add the subresource offsets they take from the XG
+    // layout themselves and write texels in that layout; the dirty-tracked texture-memory upload
+    // (sync_bound_texture_memory) carries those writes to the GPU. Other subresources are refused
+    // and reported rather than guessed.
+    if (!is_buffer() && cpu_va_ != 0 && subresource != 0) {
+        device_->note_bad_argument("ID3D12Resource::Map of texture subresource " + std::to_string(subresource) +
+                                   " (id " + std::to_string(id_) + "): only subresource 0 is mapped");
+        if (data) {
+            data.write(0);
+        }
+        return kEInvalidArg;
+    }
+    if (cpu_va_ == 0 || subresource != 0) {
         device_->note_bad_argument("ID3D12Resource::Map on a resource without CPU access (id " + std::to_string(id_) +
                                    ")");
         if (data) {
