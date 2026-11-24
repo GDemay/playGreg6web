@@ -140,6 +140,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Lift the real program with `--memory-model window`, boot it natively to the default-model boot's milestones, fix every consumer that still assumes identity mapping for window pointers, and measure cost and the contiguous-runs variant.
 - [x] **O32 — Intermittent Heap Corruption in `playgta6_win32_rtl_tests` (0xc0000374): Find and Fix the Cause (`runtime/os/win32_rtl`)** — `DONE` (PR #628, closes #622) *(no game files required)*
   - Reproduce the intermittent heap-corruption failure deterministically, decide whether the defect is in the runtime or the test, fix by cause and add a reliable regression test.
+- [ ] **O33 — Fast Path for Guest Indirect Calls: Measure and Cut the Cost of `__playgta6_indirect_call` (`runtime/guest`)** — `IN PROGRESS` (#666, @Timon-ok)
+  - Measure the lookup's share of frame time on the real boot and add a semantics-preserving per-thread cache for both dispatch modes.
 
 ---
 
@@ -220,6 +222,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Create textures for views that name only a GPU address and a description, upload the data streamed into the GPU-window pages behind them, and convert the console tiled layouts to linear texels using the GPU family's public addressing rules.
 - [ ] **G62 — Bind Translated Stages by Reflection: Vertex-Input and Resource-Binding Contract Between the Shader Pack and the D3D12 Guest Layer (runtime side)** — `IN PROGRESS` (#651, @Timon-ok) *(contract discussed on #482; repo tests synthetic)*
   - Build vertex layouts and bind-group layouts for pack-resolved pipelines from each stage's reflection joined to the D3D12 input layout and root signature, instead of numbering conventions.
+- [ ] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `IN PROGRESS` (#665, @Timon-ok) *(G49 follow-up)*
+  - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 
 ---
 
