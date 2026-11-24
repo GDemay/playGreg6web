@@ -1235,6 +1235,61 @@ async function requestNegotiatedDevice(adapter) {
 // W103: concurrent create{Render,Compute}PipelineAsync compiles allowed in flight (async_pipeline_cache.js).
 const DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES = 4;
 
+// W104: live-resource replay log used to recreate guest GPU resources after device-loss recovery.
+// The guest never learns that the browser lost its GPUDevice, so every live resource creation
+// packet (and a bounded shadow of small/medium buffer contents) is kept and replayed in
+// dependency order on the recovered device.
+const REPLAY_SHADOW_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
+const REPLAY_SHADOW_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
+const REPLAY_LOG_MAX_ENTRIES = 65536;
+const REPLAY_LOG_MAX_BYTES = 128 * 1024 * 1024;
+const REPLAY_PHASE_COUNT = 5;
+
+// opcode -> [resource kind, replay phase (1 = leaf resources ... 5 = bind groups)]
+const REPLAY_CREATE_OPCODES = new Map([
+  [OPCODES.CREATE_BUFFER, ['buffer', 1]],
+  [OPCODES.CREATE_TEXTURE, ['texture', 1]],
+  [OPCODES.CREATE_TEXTURE2, ['texture', 1]],
+  [OPCODES.CREATE_SAMPLER, ['sampler', 1]],
+  [OPCODES.CREATE_SAMPLER2, ['sampler', 1]],
+  [OPCODES.CREATE_SHADER_MODULE, ['shaderModule', 1]],
+  [OPCODES.CREATE_BIND_GROUP_LAYOUT, ['bindGroupLayout', 2]],
+  [OPCODES.CREATE_PIPELINE_LAYOUT, ['pipelineLayout', 3]],
+  [OPCODES.CREATE_RENDER_PIPELINE, ['renderPipeline', 4]],
+  [OPCODES.CREATE_RENDER_PIPELINE2, ['renderPipeline', 4]],
+  [OPCODES.CREATE_COMPUTE_PIPELINE, ['computePipeline', 4]],
+  [OPCODES.CREATE_COMPUTE_PIPELINE2, ['computePipeline', 4]],
+  [OPCODES.CREATE_BIND_GROUP, ['bindGroup', 5]],
+  [OPCODES.CREATE_BIND_GROUP2, ['bindGroup', 5]],
+]);
+
+const REPLAY_RESOURCE_KINDS = Object.freeze([
+  'buffer',
+  'texture',
+  'sampler',
+  'shaderModule',
+  'bindGroupLayout',
+  'pipelineLayout',
+  'renderPipeline',
+  'computePipeline',
+  'bindGroup',
+]);
+
+// ABI v2 opcodes are only meaningful once the packet extension is installed.
+const REPLAY_EXTENSION_OPCODES = new Set([
+  OPCODES.CREATE_BIND_GROUP_LAYOUT,
+  OPCODES.CREATE_PIPELINE_LAYOUT,
+  OPCODES.CREATE_RENDER_PIPELINE2,
+  OPCODES.CREATE_COMPUTE_PIPELINE2,
+  OPCODES.CREATE_BIND_GROUP2,
+  OPCODES.CREATE_SAMPLER2,
+  OPCODES.CREATE_TEXTURE2,
+]);
+
+function resolvePositiveIntOption(value, fallback) {
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 // W100: bounded WebGPU device-loss recovery.
 const MAX_DEVICE_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_DEVICE_RECOVERY_MIN_INTERVAL_MS = 1000;
@@ -1439,6 +1494,33 @@ class WgpuCommandProcessor {
     this._ownedSubsystemFactories = {};
     this._v2BindGroupLayouts = new Map();
     this._v2PipelineLayouts = new Map();
+
+    // W104: live-resource replay log + bounded buffer shadow cache for device-loss recovery.
+    this._resourceReplayEnabled = options.enableResourceReplay !== false;
+    this._replayingResources = false;
+    this._replayLog = new Map(); // '<kind>:<id>' -> { kind, id, opcode, phase, payload: Uint8Array }
+    this._replayLogBytes = 0;
+    this._replayLogMaxEntries = resolvePositiveIntOption(
+      options.replayLogMaxEntries,
+      REPLAY_LOG_MAX_ENTRIES
+    );
+    this._replayLogMaxBytes = resolvePositiveIntOption(options.replayLogMaxBytes, REPLAY_LOG_MAX_BYTES);
+    this._replayLogOverflowCount = 0;
+    this._shadowBuffers = new Map(); // bufferId -> { data: Uint8Array, dirtyEnd } (LRU order)
+    this._shadowBufferBytes = 0;
+    this._shadowBufferMaxBytes = resolvePositiveIntOption(
+      options.shadowBufferMaxBytes,
+      REPLAY_SHADOW_BUFFER_MAX_BYTES
+    );
+    this._shadowBufferTotalMaxBytes = Math.max(
+      this._shadowBufferMaxBytes,
+      resolvePositiveIntOption(options.shadowBufferTotalMaxBytes, REPLAY_SHADOW_TOTAL_MAX_BYTES)
+    );
+    this._shadowBufferEvictions = 0;
+    this._replayedResourceCount = 0;
+    this._replayedBufferWriteCount = 0;
+    this._replayFailedCount = 0;
+    this._lastResourceReplay = null;
 
     // Pending staging upload encoder & frame lifecycle tracking
     this._pendingEncoder = null;
@@ -3501,6 +3583,8 @@ class WgpuCommandProcessor {
       deviceRecovering: this._deviceRecovering,
       deviceLost: this._deviceLost,
       droppedWhileRecovering: this._droppedWhileRecoveringCount,
+      replayedResourceCount: this._replayedResourceCount,
+      replayedBufferWriteCount: this._replayedBufferWriteCount,
     };
   }
 
@@ -3538,6 +3622,295 @@ class WgpuCommandProcessor {
     } else {
       this._deviceRecoveryFailedCount += 1;
     }
+  }
+
+  /**
+   * W104: record one packet into the live-resource replay log. Creation packets are copied
+   * (latest creation of an id wins), DestroyResource forgets every record of the id, and
+   * WriteBuffer updates the bounded shadow copy of the buffer contents. Never records while
+   * `replayRecordedResources()` runs.
+   */
+  _recordReplayPacket(opcode, view, payloadOffset, payloadBytes) {
+    if (!this._resourceReplayEnabled || this._replayingResources || payloadBytes < 4) {
+      return;
+    }
+    if (opcode === OPCODES.WRITE_BUFFER) {
+      this._recordShadowBufferWrite(view, payloadOffset, payloadBytes);
+      return;
+    }
+    if (opcode === OPCODES.DESTROY_RESOURCE) {
+      this._forgetReplayResource(view.getUint32(payloadOffset, true));
+      return;
+    }
+    const spec = REPLAY_CREATE_OPCODES.get(opcode);
+    if (!spec) {
+      return;
+    }
+    const [kind, phase] = spec;
+    const id = view.getUint32(payloadOffset, true);
+    const key = `${kind}:${id}`;
+    const previous = this._replayLog.get(key);
+    if (previous) {
+      this._replayLog.delete(key);
+      this._replayLogBytes -= previous.payload.byteLength;
+    }
+    if (kind === 'buffer') {
+      // A re-created buffer starts zero-filled; its old contents must not be replayed.
+      this._dropShadowBuffer(id);
+    }
+    if (
+      this._replayLog.size >= this._replayLogMaxEntries ||
+      this._replayLogBytes + payloadBytes > this._replayLogMaxBytes
+    ) {
+      this._replayLogOverflowCount += 1;
+      return;
+    }
+    const payload = new Uint8Array(view.buffer, view.byteOffset + payloadOffset, payloadBytes).slice();
+    this._replayLog.set(key, { kind, id, opcode, phase, payload });
+    this._replayLogBytes += payloadBytes;
+  }
+
+  /**
+   * W104: record the resource packets of `view` starting at `offset` without executing them
+   * (command buffers dropped while the device is lost / recovering).
+   */
+  _recordReplayPacketsFrom(view, offset) {
+    if (!this._resourceReplayEnabled || this._replayingResources) {
+      return;
+    }
+    let cursor = offset;
+    while (cursor + 8 <= view.byteLength) {
+      const opcode = view.getUint16(cursor, true);
+      const payloadBytes = view.getUint32(cursor + 4, true);
+      const payloadOffset = cursor + 8;
+      if (payloadOffset + payloadBytes > view.byteLength) {
+        break;
+      }
+      this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
+      cursor = payloadOffset + payloadBytes;
+    }
+  }
+
+  _forgetReplayResource(id) {
+    for (let i = 0; i < REPLAY_RESOURCE_KINDS.length; i += 1) {
+      const key = `${REPLAY_RESOURCE_KINDS[i]}:${id}`;
+      const entry = this._replayLog.get(key);
+      if (entry) {
+        this._replayLog.delete(key);
+        this._replayLogBytes -= entry.payload.byteLength;
+      }
+    }
+    this._dropShadowBuffer(id);
+  }
+
+  _dropShadowBuffer(id) {
+    const shadow = this._shadowBuffers.get(id);
+    if (shadow) {
+      this._shadowBuffers.delete(id);
+      this._shadowBufferBytes -= shadow.data.byteLength;
+    }
+  }
+
+  _recordShadowBufferWrite(view, payloadOffset, payloadBytes) {
+    if (payloadBytes < 16) {
+      return;
+    }
+    const id = view.getUint32(payloadOffset, true);
+    const dstOffset = view.getUint32(payloadOffset + 4, true);
+    const dataLen = view.getUint32(payloadOffset + 8, true);
+    if (16 + dataLen > payloadBytes || dataLen === 0) {
+      return;
+    }
+    const created = this._replayLog.get(`buffer:${id}`);
+    if (!created || created.payload.byteLength < 16) {
+      return;
+    }
+    const createView = new DataView(
+      created.payload.buffer,
+      created.payload.byteOffset,
+      created.payload.byteLength
+    );
+    const usage = createView.getUint32(4, true);
+    const byteSize = Number(createView.getBigUint64(8, true));
+    if (
+      (usage & BUFFER_USAGE.COPY_DST) === 0 ||
+      !Number.isSafeInteger(byteSize) ||
+      byteSize < 4 ||
+      byteSize > this._shadowBufferMaxBytes ||
+      dstOffset >= byteSize
+    ) {
+      return;
+    }
+    let shadow = this._shadowBuffers.get(id);
+    if (shadow) {
+      // LRU: move to the most-recently-written end.
+      this._shadowBuffers.delete(id);
+    } else {
+      shadow = { data: new Uint8Array(byteSize), dirtyEnd: 0 };
+      this._shadowBufferBytes += byteSize;
+    }
+    this._shadowBuffers.set(id, shadow);
+    const copyLen = Math.min(dataLen, byteSize - dstOffset);
+    shadow.data.set(
+      new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, copyLen),
+      dstOffset
+    );
+    shadow.dirtyEnd = Math.max(shadow.dirtyEnd, dstOffset + copyLen);
+
+    while (this._shadowBufferBytes > this._shadowBufferTotalMaxBytes && this._shadowBuffers.size > 1) {
+      const oldestId = this._shadowBuffers.keys().next().value;
+      this._dropShadowBuffer(oldestId);
+      this._shadowBufferEvictions += 1;
+    }
+  }
+
+  /** Total replayable bytes of a shadow (WebGPU writeBuffer sizes must be 4-byte multiples). */
+  _shadowWriteLength(shadow) {
+    const maxLen = shadow.data.byteLength - (shadow.data.byteLength % 4);
+    const aligned = shadow.dirtyEnd + ((4 - (shadow.dirtyEnd % 4)) % 4);
+    return Math.min(aligned, maxLen);
+  }
+
+  /**
+   * W104: recreate every recorded live resource on the current (recovered) device in dependency
+   * order — leaf resources (buffers, textures, samplers, shader modules), shadowed buffer
+   * contents, bind group layouts, pipeline layouts, pipelines, then bind groups. Each packet is
+   * isolated so one stale or invalid record never aborts the rest of the replay. Must run after
+   * `rebindDevice()` and after the ABI v2 packet extensions were reinstalled on the new device.
+   *
+   * @returns {{ replayedResources: number, failedResources: number, replayedBufferWrites: number }}
+   */
+  replayRecordedResources() {
+    const summary = { replayedResources: 0, failedResources: 0, replayedBufferWrites: 0 };
+    if (
+      this._destroyed ||
+      this._replayingResources ||
+      !this.device ||
+      (this._replayLog.size === 0 && this._shadowBuffers.size === 0)
+    ) {
+      return summary;
+    }
+
+    const phases = [];
+    for (let p = 0; p < REPLAY_PHASE_COUNT; p += 1) {
+      phases.push([]);
+    }
+    let streamBytes = 0;
+    for (const entry of this._replayLog.values()) {
+      phases[entry.phase - 1].push(entry);
+      streamBytes += 8 + entry.payload.byteLength;
+    }
+
+    // One contiguous replay stream lets the v1 shader fallback profile scan see the pipelines and
+    // bind groups that reference each shader module, exactly as in the original command buffers.
+    const stream = new Uint8Array(streamBytes);
+    const streamView = new DataView(stream.buffer);
+    const ordered = [];
+    let cursor = 0;
+    for (let p = 0; p < phases.length; p += 1) {
+      for (const entry of phases[p]) {
+        streamView.setUint16(cursor, entry.opcode, true);
+        streamView.setUint32(cursor + 4, entry.payload.byteLength, true);
+        stream.set(entry.payload, cursor + 8);
+        ordered.push({ entry, payloadOffset: cursor + 8 });
+        cursor += 8 + entry.payload.byteLength;
+      }
+    }
+
+    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPassCommands = this._passCommands;
+    this._replayingResources = true;
+    try {
+      try {
+        this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(streamView);
+      } catch (_) {
+        this._pendingCommandStreamShaderProfiles = null;
+      }
+      this._passCommands = [];
+      let shadowWritesDone = false;
+      for (let i = 0; i < ordered.length; i += 1) {
+        const { entry, payloadOffset } = ordered[i];
+        if (!shadowWritesDone && entry.phase > 1) {
+          summary.replayedBufferWrites += this._replayShadowBufferWrites();
+          shadowWritesDone = true;
+        }
+        if (this._replayOnePacket(entry, streamView, payloadOffset)) {
+          summary.replayedResources += 1;
+        } else {
+          summary.failedResources += 1;
+        }
+      }
+      if (!shadowWritesDone) {
+        summary.replayedBufferWrites += this._replayShadowBufferWrites();
+      }
+    } finally {
+      this._passCommands = prevPassCommands;
+      this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._replayingResources = false;
+    }
+
+    this._replayedResourceCount += summary.replayedResources;
+    this._replayedBufferWriteCount += summary.replayedBufferWrites;
+    this._replayFailedCount += summary.failedResources;
+    this._lastResourceReplay = { ...summary, deviceGeneration: this._deviceGeneration };
+    this._logDiagnostic(
+      'info',
+      `[wgpu_worker] replayed ${summary.replayedResources} GPU resources and ${summary.replayedBufferWrites} buffer writes after device recovery` +
+        (summary.failedResources > 0 ? ` (${summary.failedResources} failed)` : '')
+    );
+    return summary;
+  }
+
+  _replayOnePacket(entry, view, payloadOffset) {
+    if (REPLAY_EXTENSION_OPCODES.has(entry.opcode) && !this.extension) {
+      return false;
+    }
+    const errorsBefore = this._validationErrorCount;
+    try {
+      this._dispatchPacket(entry.opcode, view, payloadOffset, entry.payload.byteLength);
+    } catch (_) {
+      return false;
+    }
+    return this._validationErrorCount === errorsBefore;
+  }
+
+  _replayShadowBufferWrites() {
+    const queue = this.device && this.device.queue;
+    if (!queue || typeof queue.writeBuffer !== 'function') {
+      return 0;
+    }
+    let written = 0;
+    for (const [id, shadow] of this._shadowBuffers) {
+      const buffer = this.buffers.get(id);
+      const writeLen = this._shadowWriteLength(shadow);
+      if (!buffer || writeLen <= 0) {
+        continue;
+      }
+      try {
+        queue.writeBuffer(buffer, 0, shadow.data, 0, writeLen);
+        written += 1;
+      } catch (_) {
+        // A stale shadow never aborts the remaining replay.
+      }
+    }
+    return written;
+  }
+
+  /**
+   * W104: replay-log / shadow-cache counters (sanitized integers only).
+   */
+  getResourceReplayStats() {
+    return {
+      recordedResourceCount: this._replayLog.size,
+      recordedResourceBytes: this._replayLogBytes,
+      replayLogOverflowCount: this._replayLogOverflowCount,
+      shadowBufferCount: this._shadowBuffers.size,
+      shadowBufferBytes: this._shadowBufferBytes,
+      shadowBufferEvictions: this._shadowBufferEvictions,
+      replayedResourceCount: this._replayedResourceCount,
+      replayedBufferWriteCount: this._replayedBufferWriteCount,
+      replayFailedCount: this._replayFailedCount,
+    };
   }
 
   /**
@@ -5657,12 +6030,6 @@ class WgpuCommandProcessor {
     if (this._destroyed || !this.device || !this.ctx) {
       return { frameCount: this.frameCount, presents: 0 };
     }
-    if (this._deviceRecovering) {
-      // W100: drop submissions for the lost device while recovery is in flight.
-      this._droppedWhileRecoveringCount += 1;
-      return { frameCount: this.frameCount, presents: 0 };
-    }
-
     let view;
     if (
       input instanceof ArrayBuffer ||
@@ -5671,10 +6038,22 @@ class WgpuCommandProcessor {
       view = new DataView(input);
     } else if (ArrayBuffer.isView(input)) {
       view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+    } else if (this._deviceRecovering) {
+      view = null;
     } else {
       throw new TypeError(
         'WgpuCommandProcessor.executeCommandBuffer expects an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView'
       );
+    }
+
+    if (this._deviceRecovering) {
+      // W100: drop submissions for the lost device while recovery is in flight.
+      this._droppedWhileRecoveringCount += 1;
+      // W104: resources the guest creates meanwhile are still recorded for replay.
+      if (view) {
+        this._recordReplayPacketsFrom(view, 0);
+      }
+      return { frameCount: this.frameCount, presents: 0 };
     }
 
     let offset = 0;
@@ -5698,218 +6077,14 @@ class WgpuCommandProcessor {
       this._packetCount += 1;
       this._bytesProcessed += 8 + payloadBytes;
 
-      switch (opcode) {
-        case OPCODES.NOP:
-          break;
-        case OPCODES.BEGIN_FRAME:
-          if (this._pendingEncoder && this._frameBegunForIndex === -1) {
-            this._flushPendingUploads(true);
-          }
-          this._resetFrameState();
-          this._ensureFrameBegun();
-          break;
-        case OPCODES.CLEAR_COLOR:
-          if (payloadBytes >= 16) {
-            this._clearColor = {
-              r: view.getFloat32(payloadOffset, true),
-              g: view.getFloat32(payloadOffset + 4, true),
-              b: view.getFloat32(payloadOffset + 8, true),
-              a: view.getFloat32(payloadOffset + 12, true),
-            };
-          } else {
-            this._recordOpValidationError('ClearColor', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.CREATE_BUFFER:
-          if (payloadBytes >= 16) {
-            this._handleCreateBuffer(view, payloadOffset);
-          } else {
-            this._recordOpValidationError('CreateBuffer', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.WRITE_BUFFER:
-          if (payloadBytes >= 16) {
-            this._handleWriteBuffer(view, payloadOffset, payloadBytes);
-          } else {
-            this._recordOpValidationError('WriteBuffer', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.CREATE_SHADER_MODULE:
-          if (payloadBytes >= 16) {
-            this._handleCreateShaderModule(view, payloadOffset, payloadBytes);
-          } else {
-            this._recordOpValidationError(
-              'CreateShaderModule',
-              `truncated payload (${payloadBytes}B < 16B)`
-            );
-          }
-          break;
-        case OPCODES.CREATE_RENDER_PIPELINE:
-          if (payloadBytes >= 24) {
-            this._handleCreateRenderPipeline(view, payloadOffset);
-          } else {
-            this._recordOpValidationError(
-              'CreateRenderPipeline',
-              `truncated payload (${payloadBytes}B < 24B)`
-            );
-          }
-          break;
-        case OPCODES.SET_PIPELINE:
-          if (payloadBytes >= 4) {
-            const pipelineId = view.getUint32(payloadOffset, true);
-            this._passCommands.push({
-              type: 'setPipeline',
-              pipelineId,
-              pipeline: this.pipelines.get(pipelineId) || null,
-            });
-          } else {
-            this._recordOpValidationError('SetPipeline', `truncated payload (${payloadBytes}B < 4B)`);
-          }
-          break;
-        case OPCODES.SET_VERTEX_BUFFER:
-          if (payloadBytes >= 16) {
-            this._passCommands.push({
-              type: 'setVertexBuffer',
-              slot: view.getUint32(payloadOffset, true),
-              bufferId: view.getUint32(payloadOffset + 4, true),
-              offset: Number(view.getBigUint64(payloadOffset + 8, true)),
-            });
-          } else {
-            this._recordOpValidationError('SetVertexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.DRAW:
-          if (payloadBytes >= 16) {
-            this._passCommands.push({
-              type: 'draw',
-              vertexCount: view.getUint32(payloadOffset, true),
-              instanceCount: view.getUint32(payloadOffset + 4, true),
-              firstVertex: view.getUint32(payloadOffset + 8, true),
-              firstInstance: view.getUint32(payloadOffset + 12, true),
-            });
-          } else {
-            this._recordOpValidationError('Draw', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.PRESENT:
-          this._flushPresent();
-          presents += 1;
-          break;
-        case OPCODES.DESTROY_RESOURCE:
-          if (payloadBytes >= 4) {
-            this._handleDestroyResource(view.getUint32(payloadOffset, true));
-          }
-          break;
-        case OPCODES.CREATE_TEXTURE:
-          if (payloadBytes >= 32) {
-            this._handleCreateTexture(view, payloadOffset);
-          } else {
-            this._recordOpValidationError('CreateTexture', `truncated payload (${payloadBytes}B < 32B)`);
-          }
-          break;
-        case OPCODES.WRITE_TEXTURE:
-          if (payloadBytes >= 48) {
-            this._handleWriteTexture(view, payloadOffset, payloadBytes);
-          } else {
-            this._recordOpValidationError('WriteTexture', `truncated payload (${payloadBytes}B < 48B)`);
-          }
-          break;
-        case OPCODES.CREATE_SAMPLER:
-          if (payloadBytes >= 32) {
-            this._handleCreateSampler(view, payloadOffset);
-          } else {
-            this._recordOpValidationError('CreateSampler', `truncated payload (${payloadBytes}B < 32B)`);
-          }
-          break;
-        case OPCODES.CREATE_BIND_GROUP:
-          if (payloadBytes >= 16) {
-            this._handleCreateBindGroup(view, payloadOffset, payloadBytes);
-          } else {
-            this._recordOpValidationError(
-              'CreateBindGroup',
-              `truncated payload (${payloadBytes}B < 16B)`
-            );
-          }
-          break;
-        case OPCODES.SET_BIND_GROUP:
-          if (payloadBytes >= 8) {
-            const groupIndex = view.getUint32(payloadOffset, true);
-            const bindGroupId = view.getUint32(payloadOffset + 4, true);
-            this._passCommands.push({
-              type: 'setBindGroup',
-              groupIndex,
-              bindGroupId,
-              bindGroup: this.bindGroups.get(bindGroupId) || null,
-            });
-          } else {
-            this._recordOpValidationError('SetBindGroup', `truncated payload (${payloadBytes}B < 8B)`);
-          }
-          break;
-        case OPCODES.SET_INDEX_BUFFER:
-          if (payloadBytes >= 16) {
-            const formatCode = view.getUint32(payloadOffset + 4, true);
-            this._passCommands.push({
-              type: 'setIndexBuffer',
-              bufferId: view.getUint32(payloadOffset, true),
-              indexFormat: INDEX_FORMAT_NAMES[formatCode] || 'uint16',
-              offset: Number(view.getBigUint64(payloadOffset + 8, true)),
-            });
-          } else {
-            this._recordOpValidationError('SetIndexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
-          }
-          break;
-        case OPCODES.DRAW_INDEXED:
-          if (payloadBytes >= 20) {
-            this._passCommands.push({
-              type: 'drawIndexed',
-              indexCount: view.getUint32(payloadOffset, true),
-              instanceCount: view.getUint32(payloadOffset + 4, true),
-              firstIndex: view.getUint32(payloadOffset + 8, true),
-              baseVertex: view.getInt32(payloadOffset + 12, true),
-              firstInstance: view.getUint32(payloadOffset + 16, true),
-            });
-          } else {
-            this._recordOpValidationError('DrawIndexed', `truncated payload (${payloadBytes}B < 20B)`);
-          }
-          break;
-        case OPCODES.CREATE_COMPUTE_PIPELINE:
-          if (payloadBytes >= 16) {
-            this._handleCreateComputePipeline(view, payloadOffset);
-          } else {
-            this._recordOpValidationError(
-              'CreateComputePipeline',
-              `truncated payload (${payloadBytes}B < 16B)`
-            );
-          }
-          break;
-        case OPCODES.SET_COMPUTE_PIPELINE:
-          if (payloadBytes >= 4) {
-            this._passCommands.push({
-              type: 'setComputePipeline',
-              pipelineId: view.getUint32(payloadOffset, true),
-            });
-          }
-          break;
-        case OPCODES.DISPATCH_COMPUTE:
-          if (payloadBytes >= 12) {
-            this._passCommands.push({
-              type: 'dispatchCompute',
-              workgroupX: view.getUint32(payloadOffset, true),
-              workgroupY: view.getUint32(payloadOffset + 4, true),
-              workgroupZ: view.getUint32(payloadOffset + 8, true),
-            });
-          }
-          break;
-        default:
-          if (this.extension) {
-            this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
-          }
-          break;
-      }
+      this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
+      presents += this._dispatchPacket(opcode, view, payloadOffset, payloadBytes);
 
       offset = payloadOffset + payloadBytes;
       if (this._deviceRecovering) {
         // W100: device loss detected mid-buffer; skip the remaining packets cleanly.
+        // W104: still record the skipped resource packets so recovery can replay them.
+        this._recordReplayPacketsFrom(view, offset);
         break;
       }
     }
@@ -5918,6 +6093,220 @@ class WgpuCommandProcessor {
     }
 
     return { frameCount: this.frameCount, presents };
+  }
+
+  /**
+   * Dispatch one packet of a command stream. Returns the number of presents (0 or 1).
+   */
+  _dispatchPacket(opcode, view, payloadOffset, payloadBytes) {
+    switch (opcode) {
+      case OPCODES.NOP:
+        break;
+      case OPCODES.BEGIN_FRAME:
+        if (this._pendingEncoder && this._frameBegunForIndex === -1) {
+          this._flushPendingUploads(true);
+        }
+        this._resetFrameState();
+        this._ensureFrameBegun();
+        break;
+      case OPCODES.CLEAR_COLOR:
+        if (payloadBytes >= 16) {
+          this._clearColor = {
+            r: view.getFloat32(payloadOffset, true),
+            g: view.getFloat32(payloadOffset + 4, true),
+            b: view.getFloat32(payloadOffset + 8, true),
+            a: view.getFloat32(payloadOffset + 12, true),
+          };
+        } else {
+          this._recordOpValidationError('ClearColor', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.CREATE_BUFFER:
+        if (payloadBytes >= 16) {
+          this._handleCreateBuffer(view, payloadOffset);
+        } else {
+          this._recordOpValidationError('CreateBuffer', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.WRITE_BUFFER:
+        if (payloadBytes >= 16) {
+          this._handleWriteBuffer(view, payloadOffset, payloadBytes);
+        } else {
+          this._recordOpValidationError('WriteBuffer', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.CREATE_SHADER_MODULE:
+        if (payloadBytes >= 16) {
+          this._handleCreateShaderModule(view, payloadOffset, payloadBytes);
+        } else {
+          this._recordOpValidationError(
+            'CreateShaderModule',
+            `truncated payload (${payloadBytes}B < 16B)`
+          );
+        }
+        break;
+      case OPCODES.CREATE_RENDER_PIPELINE:
+        if (payloadBytes >= 24) {
+          this._handleCreateRenderPipeline(view, payloadOffset);
+        } else {
+          this._recordOpValidationError(
+            'CreateRenderPipeline',
+            `truncated payload (${payloadBytes}B < 24B)`
+          );
+        }
+        break;
+      case OPCODES.SET_PIPELINE:
+        if (payloadBytes >= 4) {
+          const pipelineId = view.getUint32(payloadOffset, true);
+          this._passCommands.push({
+            type: 'setPipeline',
+            pipelineId,
+            pipeline: this.pipelines.get(pipelineId) || null,
+          });
+        } else {
+          this._recordOpValidationError('SetPipeline', `truncated payload (${payloadBytes}B < 4B)`);
+        }
+        break;
+      case OPCODES.SET_VERTEX_BUFFER:
+        if (payloadBytes >= 16) {
+          this._passCommands.push({
+            type: 'setVertexBuffer',
+            slot: view.getUint32(payloadOffset, true),
+            bufferId: view.getUint32(payloadOffset + 4, true),
+            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
+          });
+        } else {
+          this._recordOpValidationError('SetVertexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.DRAW:
+        if (payloadBytes >= 16) {
+          this._passCommands.push({
+            type: 'draw',
+            vertexCount: view.getUint32(payloadOffset, true),
+            instanceCount: view.getUint32(payloadOffset + 4, true),
+            firstVertex: view.getUint32(payloadOffset + 8, true),
+            firstInstance: view.getUint32(payloadOffset + 12, true),
+          });
+        } else {
+          this._recordOpValidationError('Draw', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.PRESENT:
+        this._flushPresent();
+        return 1;
+      case OPCODES.DESTROY_RESOURCE:
+        if (payloadBytes >= 4) {
+          this._handleDestroyResource(view.getUint32(payloadOffset, true));
+        }
+        break;
+      case OPCODES.CREATE_TEXTURE:
+        if (payloadBytes >= 32) {
+          this._handleCreateTexture(view, payloadOffset);
+        } else {
+          this._recordOpValidationError('CreateTexture', `truncated payload (${payloadBytes}B < 32B)`);
+        }
+        break;
+      case OPCODES.WRITE_TEXTURE:
+        if (payloadBytes >= 48) {
+          this._handleWriteTexture(view, payloadOffset, payloadBytes);
+        } else {
+          this._recordOpValidationError('WriteTexture', `truncated payload (${payloadBytes}B < 48B)`);
+        }
+        break;
+      case OPCODES.CREATE_SAMPLER:
+        if (payloadBytes >= 32) {
+          this._handleCreateSampler(view, payloadOffset);
+        } else {
+          this._recordOpValidationError('CreateSampler', `truncated payload (${payloadBytes}B < 32B)`);
+        }
+        break;
+      case OPCODES.CREATE_BIND_GROUP:
+        if (payloadBytes >= 16) {
+          this._handleCreateBindGroup(view, payloadOffset, payloadBytes);
+        } else {
+          this._recordOpValidationError(
+            'CreateBindGroup',
+            `truncated payload (${payloadBytes}B < 16B)`
+          );
+        }
+        break;
+      case OPCODES.SET_BIND_GROUP:
+        if (payloadBytes >= 8) {
+          const groupIndex = view.getUint32(payloadOffset, true);
+          const bindGroupId = view.getUint32(payloadOffset + 4, true);
+          this._passCommands.push({
+            type: 'setBindGroup',
+            groupIndex,
+            bindGroupId,
+            bindGroup: this.bindGroups.get(bindGroupId) || null,
+          });
+        } else {
+          this._recordOpValidationError('SetBindGroup', `truncated payload (${payloadBytes}B < 8B)`);
+        }
+        break;
+      case OPCODES.SET_INDEX_BUFFER:
+        if (payloadBytes >= 16) {
+          const formatCode = view.getUint32(payloadOffset + 4, true);
+          this._passCommands.push({
+            type: 'setIndexBuffer',
+            bufferId: view.getUint32(payloadOffset, true),
+            indexFormat: INDEX_FORMAT_NAMES[formatCode] || 'uint16',
+            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
+          });
+        } else {
+          this._recordOpValidationError('SetIndexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
+        }
+        break;
+      case OPCODES.DRAW_INDEXED:
+        if (payloadBytes >= 20) {
+          this._passCommands.push({
+            type: 'drawIndexed',
+            indexCount: view.getUint32(payloadOffset, true),
+            instanceCount: view.getUint32(payloadOffset + 4, true),
+            firstIndex: view.getUint32(payloadOffset + 8, true),
+            baseVertex: view.getInt32(payloadOffset + 12, true),
+            firstInstance: view.getUint32(payloadOffset + 16, true),
+          });
+        } else {
+          this._recordOpValidationError('DrawIndexed', `truncated payload (${payloadBytes}B < 20B)`);
+        }
+        break;
+      case OPCODES.CREATE_COMPUTE_PIPELINE:
+        if (payloadBytes >= 16) {
+          this._handleCreateComputePipeline(view, payloadOffset);
+        } else {
+          this._recordOpValidationError(
+            'CreateComputePipeline',
+            `truncated payload (${payloadBytes}B < 16B)`
+          );
+        }
+        break;
+      case OPCODES.SET_COMPUTE_PIPELINE:
+        if (payloadBytes >= 4) {
+          this._passCommands.push({
+            type: 'setComputePipeline',
+            pipelineId: view.getUint32(payloadOffset, true),
+          });
+        }
+        break;
+      case OPCODES.DISPATCH_COMPUTE:
+        if (payloadBytes >= 12) {
+          this._passCommands.push({
+            type: 'dispatchCompute',
+            workgroupX: view.getUint32(payloadOffset, true),
+            workgroupY: view.getUint32(payloadOffset + 4, true),
+            workgroupZ: view.getUint32(payloadOffset + 8, true),
+          });
+        }
+        break;
+      default:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        }
+        break;
+    }
+    return 0;
   }
 
   execute(input) {
@@ -6054,6 +6443,11 @@ class WgpuCommandProcessor {
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
     this._frameBegunForIndex = -1;
+    // W104: drop the replay log and shadow buffer cache.
+    this._replayLog.clear();
+    this._replayLogBytes = 0;
+    this._shadowBuffers.clear();
+    this._shadowBufferBytes = 0;
 
     // 1. Resource registry destroys all registered active & pending-retirement resources.
     const destroyedByRegistry = new Set();
@@ -6532,12 +6926,18 @@ function resolveDeviceLossTelemetry(processor, stats) {
   if (typeof src.lastDeviceLostReason === 'string' && src.lastDeviceLostReason.length > 0) {
     lastDeviceLostReason = sanitizeGpuErrorDetail({ message: src.lastDeviceLostReason });
   }
-  return {
+  const deviceStats = {
     deviceLostCount: toNonNegativeInt(src.deviceLostCount, 0),
     deviceRecoveredCount: toNonNegativeInt(src.deviceRecoveredCount, 0),
     lastDeviceLostReason,
     deviceRecovering: src.deviceRecovering === true,
   };
+  // W104: live-resource replay counters (only when the processor tracks replay).
+  if (src.replayedResourceCount !== undefined || src.replayedBufferWriteCount !== undefined) {
+    deviceStats.replayedResourceCount = toNonNegativeInt(src.replayedResourceCount, 0);
+    deviceStats.replayedBufferWriteCount = toNonNegativeInt(src.replayedBufferWriteCount, 0);
+  }
+  return deviceStats;
 }
 
 const RENDER_STATE_TELEMETRY_KEYS = Object.freeze([
@@ -7008,6 +7408,18 @@ function createWgpuWorkerHandler(options = {}) {
         alphaMode: 'opaque',
       });
       installPacketExtensions(targetProcessor);
+      // W104: the guest still references its pre-loss resource ids; recreate them on the new
+      // device now that the ABI v2 extensions are bound to it.
+      if (typeof targetProcessor.replayRecordedResources === 'function') {
+        try {
+          targetProcessor.replayRecordedResources();
+        } catch (replayErr) {
+          targetProcessor._logDiagnostic(
+            'warn',
+            `[wgpu_worker] GPU resource replay failed: ${sanitizeGpuErrorDetail(replayErr)}`
+          );
+        }
+      }
       bindProcessorValidationErrors(targetProcessor);
       ok = true;
       targetProcessor._logDiagnostic(
