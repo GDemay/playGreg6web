@@ -4631,6 +4631,156 @@ void test_g54_copy_texture_region_x_slot85() {
     scene.release_all({list, upload, tex});
 }
 
+// G55: Root signatures with oversized descriptor tables (e.g. 240 SRVs + 19 UAVs + 15 CBVs + 22
+// static samplers) must be capped per resource class to WebGPU's core per-stage binding limits
+// (12 uniform buffers, 16 sampled textures, 8 storage buffers, 16 samplers) with strictly
+// sequential binding indices 0..51 so every resource class stays represented and CreateBindGroupLayout
+// never violates WebGPU validation.
+void test_g55_root_sig_layout_caps() {
+    std::array<uint8_t, 16> cs_digest{};
+    for (size_t i = 0; i < cs_digest.size(); ++i) {
+        cs_digest[i] = static_cast<uint8_t>(0x55u + i);
+    }
+    const std::vector<uint8_t> cs_dxil = container_with_hash(cs_digest);
+    const uint64_t cs_dxil_id = dg::shader_identity(cs_dxil.data(), cs_dxil.size());
+
+    auto index = std::make_shared<playgta6::gpu::ShaderPackIndex>();
+    std::string err;
+    const std::vector<uint8_t> pack_bytes = wgpk({{cs_dxil_id, 3}});
+    CHECK(playgta6::gpu::parse_shader_pack_index(pack_bytes.data(), pack_bytes.size(), index.get(), &err));
+
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.shader_pack = index;
+    dx::set_device_options(options);
+    Scene scene(fx, /*register_shaders=*/false);
+    int32_t result = -1;
+
+    // D3D12 root signature v1.1: descriptor table with 240 SRVs + 19 UAVs + 15 CBVs + 22 static samplers.
+    dg::GuestDescriptorRange1 ranges[3] = {
+        {0u, 240u, 0u, 0u, 0u, 0xffffffffu},  // 240 SRVs (t0..t239)
+        {1u, 19u, 0u, 0u, 0u, 0xffffffffu},   // 19 UAVs (u0..u18)
+        {2u, 15u, 0u, 0u, 0u, 0xffffffffu},   // 15 CBVs (b0..b14)
+    };
+    dg::GuestRootParameter param{};
+    param.ParameterType = 0u;  // DESCRIPTOR_TABLE
+    param.w0 = 3u;             // NumDescriptorRanges
+    param.q = put_bytes(ranges, sizeof(ranges));
+    param.ShaderVisibility = 0u;  // ALL
+
+    std::vector<dg::GuestStaticSamplerDesc> samplers(22u);
+    for (uint32_t i = 0; i < 22u; ++i) {
+        samplers[i].Filter = 0x15u;
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = 1u;
+        samplers[i].MaxAnisotropy = 1u;
+        samplers[i].MaxLOD = 1000.0f;
+        samplers[i].ShaderRegister = i;
+        samplers[i].RegisterSpace = 0u;
+        samplers[i].ShaderVisibility = 0u;
+    }
+
+    dg::GuestVersionedRootSignatureDesc rs_desc{};
+    rs_desc.Version = 2u;  // D3D_ROOT_SIGNATURE_VERSION_1_1
+    rs_desc.NumParameters = 1u;
+    rs_desc.pParameters = put(param);
+    rs_desc.NumStaticSamplers = static_cast<uint32_t>(samplers.size());
+    rs_desc.pStaticSamplers = put_bytes(samplers.data(), samplers.size() * sizeof(dg::GuestStaticSamplerDesc));
+    rs_desc.Flags = 0u;
+
+    const uint64_t serialize = dx::export_address("D3D12SerializeVersionedRootSignature");
+    const uint64_t blob_out = put<uint64_t>(0);
+    const uint64_t err_out = put<uint64_t>(0);
+    CHECK(hr(fx.dcall(serialize, {I(put(rs_desc)), I(blob_out), I(err_out)})) == 0);
+    const uint64_t blob = load64(blob_out);
+    CHECK(blob != 0 && load64(err_out) == 0);
+    const uint64_t blob_data = fx.vcall(blob, Slot::GetBufferPointer);
+    const uint64_t blob_size = fx.vcall(blob, Slot::GetBufferSize);
+    CHECK(blob_data != 0 && blob_size > 16);
+
+    const uint64_t big_rs = fx.create(scene.device, Slot::CreateRootSignature,
+                                      {I(0), I(blob_data), I(blob_size)}, dg::IID_ID3D12RootSignature, &result);
+    CHECK(result == 0 && big_rs != 0);
+
+    dg::GuestComputePipelineStateDesc cd{};
+    cd.pRootSignature = big_rs;
+    cd.CS = {put_bytes(cs_dxil.data(), cs_dxil.size()), cs_dxil.size()};
+    const uint64_t cpso = fx.create(scene.device, Slot2::CreateComputePipelineState, {I(put(cd))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && cpso != 0);
+    auto* cstate = object_of<dg::PipelineState>(cpso);
+    CHECK(cstate != nullptr && cstate->is_compute() && cstate->resolved());
+
+    const uint64_t srv_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                        {I(put(dg::GuestDescriptorHeapDesc{0, 512, 1, 0}))},
+                                        dg::IID_ID3D12DescriptorHeap, &result);
+    CHECK(result == 0 && srv_heap != 0);
+    const auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(srv_heap)->heap();
+    const uint64_t heaps_arr = put<uint64_t>(srv_heap);
+
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    fx.vcall(list, 32, {I(1), I(heaps_arr)});  // SetDescriptorHeaps (Xbox slot 32)
+    fx.vcall(list, 33, {I(big_rs)});           // SetComputeRootSignature
+    staged_set_pipeline_state(fx, fx.thread, list, cpso);
+    fx.vcall(list, 35, {I(0), I(host_heap->gpu_handle(0).ptr)});  // SetComputeRootDescriptorTable (Xbox slot 35)
+    fx.vcall(list, 14, {I(1), I(1), I(1)});                       // Dispatch
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto exec_pkts = packets_since(fx, mark);
+
+    const Packet* bgl = find_op(exec_pkts, GpuOpcode::CreateBindGroupLayout);
+    CHECK(bgl != nullptr);
+    if (bgl != nullptr) {
+        const auto hdr = payload_as<GpuCreateBindGroupLayoutPayload>(*bgl);
+        constexpr uint32_t kExpectedTotal = 16u + 8u + 12u + 16u;
+        CHECK(hdr.entry_count == kExpectedTotal);
+        CHECK(bgl->payload.size() ==
+              sizeof(GpuCreateBindGroupLayoutPayload) + hdr.entry_count * sizeof(GpuBindGroupLayoutEntry));
+
+        uint32_t texture_count = 0;
+        uint32_t storage_buffer_count = 0;
+        uint32_t uniform_buffer_count = 0;
+        uint32_t sampler_count = 0;
+        uint32_t unexpected_count = 0;
+        for (uint32_t i = 0; i < hdr.entry_count; ++i) {
+            const auto e = payload_as<GpuBindGroupLayoutEntry>(
+                *bgl, sizeof(GpuCreateBindGroupLayoutPayload) + static_cast<size_t>(i) * sizeof(GpuBindGroupLayoutEntry));
+            CHECK(e.binding == i);
+            CHECK(e.visibility == GpuShaderStageBits::Compute);
+            if (e.type == static_cast<uint8_t>(GpuBindingLayoutType::Texture) &&
+                e.binding_type == static_cast<uint8_t>(GpuTextureSampleType::Float)) {
+                ++texture_count;
+            } else if (e.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                       e.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage)) {
+                ++storage_buffer_count;
+            } else if (e.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                       e.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform)) {
+                ++uniform_buffer_count;
+            } else if (e.type == static_cast<uint8_t>(GpuBindingLayoutType::Sampler) &&
+                       e.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Filtering)) {
+                ++sampler_count;
+            } else {
+                ++unexpected_count;
+            }
+        }
+        CHECK(texture_count == 16u);
+        CHECK(storage_buffer_count == 8u);
+        CHECK(uniform_buffer_count == 12u);
+        CHECK(sampler_count == 16u);
+        CHECK(unexpected_count == 0u);
+    }
+
+    const Packet* bg = find_op(exec_pkts, GpuOpcode::CreateBindGroup2);
+    CHECK(bg != nullptr && payload_as<GpuCreateBindGroup2Payload>(*bg).entry_count == 16u + 8u + 12u + 16u);
+    CHECK(find_op(exec_pkts, GpuOpcode::CreateComputePipeline2) != nullptr);
+    CHECK(find_op(exec_pkts, GpuOpcode::DispatchCompute) != nullptr);
+    CHECK(t_balanced);
+    scene.release_all({list, cpso, srv_heap, big_rs, blob});
+}
+
 }  // namespace
 
 int main() {
@@ -4673,6 +4823,7 @@ int main() {
     test_g51_slot70_address_only_buffer_view();
     test_g53_compute_meta_tail_28_digest_join();
     test_g54_copy_texture_region_x_slot85();
+    test_g55_root_sig_layout_caps();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

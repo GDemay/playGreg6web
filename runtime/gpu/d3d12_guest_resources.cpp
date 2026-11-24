@@ -2078,8 +2078,20 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
 
 // Pipeline layout from a root signature (convention in Device::resolve_with_pack).
 bridge::PipelineLayoutDesc layout_from_root_signature(const d3d::RootSignatureDesc& rs) {
+    // WebGPU core per-stage binding limits per resource class: keep every resource class
+    // represented and every emitted BindGroupLayout valid even when a root signature declares
+    // oversized descriptor tables (e.g. 240 SRVs / 19 UAVs / 17 CBVs / 24 static samplers).
+    constexpr uint32_t kMaxCbvBindingsPerStage = 12u;
+    constexpr uint32_t kMaxSrvBindingsPerStage = 16u;
+    constexpr uint32_t kMaxUavBindingsPerStage = 8u;
+    constexpr uint32_t kMaxSamplerBindingsPerStage = 16u;
+
     bridge::GroupLayoutDesc group;
     uint32_t binding = 0;
+    uint32_t cbv_count = 0;
+    uint32_t srv_count = 0;
+    uint32_t uav_count = 0;
+    uint32_t sampler_count = 0;
     auto add = [&](GpuBindingLayoutType type, uint8_t binding_type, uint8_t view_dimension, d3d::DescriptorRangeType cls,
                    uint32_t reg, uint32_t space, bool root_constants) {
         bridge::LayoutBinding b;
@@ -2099,18 +2111,34 @@ bridge::PipelineLayoutDesc layout_from_root_signature(const d3d::RootSignatureDe
     auto add_class = [&](d3d::DescriptorRangeType cls, uint32_t reg, uint32_t space, bool root_constants) {
         switch (cls) {
             case d3d::DescriptorRangeType::Cbv:
+                if (cbv_count >= kMaxCbvBindingsPerStage) {
+                    return;
+                }
+                ++cbv_count;
                 add(GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Uniform), 0, cls, reg, space,
                     root_constants);
                 break;
             case d3d::DescriptorRangeType::Srv:
+                if (srv_count >= kMaxSrvBindingsPerStage) {
+                    return;
+                }
+                ++srv_count;
                 add(GpuBindingLayoutType::Texture, static_cast<uint8_t>(GpuTextureSampleType::Float),
                     static_cast<uint8_t>(GpuTextureViewDimension::Dim2D), cls, reg, space, false);
                 break;
             case d3d::DescriptorRangeType::Uav:
+                if (uav_count >= kMaxUavBindingsPerStage) {
+                    return;
+                }
+                ++uav_count;
                 add(GpuBindingLayoutType::Buffer, static_cast<uint8_t>(GpuBufferBindingType::Storage), 0, cls, reg, space,
                     false);
                 break;
             case d3d::DescriptorRangeType::Sampler:
+                if (sampler_count >= kMaxSamplerBindingsPerStage) {
+                    return;
+                }
+                ++sampler_count;
                 add(GpuBindingLayoutType::Sampler, static_cast<uint8_t>(GpuSamplerBindingType::Filtering), 0, cls, reg,
                     space, false);
                 break;
