@@ -19,9 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::convert::{ShaderStage, format_shader_hash};
+use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
 use crate::pack::{PackEntry, PackError, write_json_string, write_pack};
 use crate::rdna2_to_wgsl::{
@@ -34,6 +34,33 @@ pub const SUPPORTED_RDNA2_EXTENSIONS: &[&str] = &["bin", "rdna2", "shader"];
 
 /// Minimum byte length of a valid RDNA2 shader blob (one 32-bit instruction dword).
 pub const MIN_RDNA2_BLOB_BYTES: usize = 4;
+
+/// Expected `"schema"` identifier in a `playgta6-pipeline-dump` `manifest.json`.
+pub const PIPELINE_DUMP_SCHEMA: &str = "playgta6-pipeline-dump";
+
+/// Supported `"schema_version"` in a `playgta6-pipeline-dump` `manifest.json`.
+pub const PIPELINE_DUMP_SCHEMA_VERSION: u64 = 1;
+
+/// Maximum nesting depth permitted by the internal zero-dependency JSON parser.
+const MAX_JSON_DEPTH: usize = 64;
+
+/// One entry in `manifest.json`'s `"native_stages"` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineDumpNativeStage {
+    pub code_identity: u64,
+    pub identity: Option<u64>,
+    pub stage: ShaderStage,
+    pub code_file: String,
+    pub code_bytes: Option<u64>,
+}
+
+/// Parsed `playgta6-pipeline-dump` `manifest.json` (fields needed for RDNA2 packing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineDumpManifest {
+    pub schema: String,
+    pub schema_version: u64,
+    pub native_stages: Vec<PipelineDumpNativeStage>,
+}
 
 /// Optional stage and 64-bit hash hints extracted from a shader blob filename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,6 +113,9 @@ pub struct Rdna2PackOptions {
     pub translate: Rdna2TranslateOptions,
     /// `WGPK` v1 header flags word (default `0`).
     pub pack_flags: u32,
+    /// When `true`, skip individual shaders that fail I/O, hash verification, size checks, or
+    /// translation/Naga validation and record them in `summary.failures` instead of aborting.
+    pub best_effort: bool,
 }
 
 /// Strictly sanitized per-shader entry summary for [`Rdna2PackSummary`]
@@ -95,10 +125,20 @@ pub struct Rdna2PackEntrySummary {
     pub hash_fnv1a64: u64,
     pub stage: ShaderStage,
     pub entry_point: String,
+    pub naga_validated: bool,
     pub translated_op_count: usize,
     pub unsupported_op_count: usize,
     pub wgsl_byte_len: usize,
     pub bindings: Vec<WgslBindingInfo>,
+}
+
+/// Strictly sanitized record of an individual shader that failed packing (zero host paths,
+/// zero usernames, zero raw bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rdna2PackFailureSummary {
+    pub code_identity: Option<u64>,
+    pub stage: Option<ShaderStage>,
+    pub reason: String,
 }
 
 /// Strictly sanitized summary of a batch RDNA2 -> WGSL -> `WGPK` pack operation.
@@ -110,11 +150,17 @@ pub struct Rdna2PackSummary {
     pub total_blobs: usize,
     pub translated_ok: usize,
     pub skipped_or_failed: usize,
+    pub failed: usize,
+    pub manifest_duplicates_skipped: usize,
     pub vertex_count: usize,
     pub pixel_count: usize,
     pub compute_count: usize,
+    pub vertex_packed: usize,
+    pub fragment_packed: usize,
+    pub compute_packed: usize,
     pub pack_bytes: usize,
     pub entries: Vec<Rdna2PackEntrySummary>,
+    pub failures: Vec<Rdna2PackFailureSummary>,
 }
 
 impl Rdna2PackSummary {
@@ -127,12 +173,21 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  \"total_blobs\": {},", self.total_blobs);
         let _ = writeln!(out, "  \"translated_ok\": {},", self.translated_ok);
         let _ = writeln!(out, "  \"skipped_or_failed\": {},", self.skipped_or_failed);
+        let _ = writeln!(out, "  \"failed\": {},", self.failed);
+        let _ = writeln!(
+            out,
+            "  \"manifest_duplicates_skipped\": {},",
+            self.manifest_duplicates_skipped
+        );
         let _ = writeln!(out, "  \"vertex_count\": {},", self.vertex_count);
         let _ = writeln!(out, "  \"pixel_count\": {},", self.pixel_count);
         let _ = writeln!(out, "  \"compute_count\": {},", self.compute_count);
+        let _ = writeln!(out, "  \"vertex_packed\": {},", self.vertex_packed);
+        let _ = writeln!(out, "  \"fragment_packed\": {},", self.fragment_packed);
+        let _ = writeln!(out, "  \"compute_packed\": {},", self.compute_packed);
         let _ = writeln!(out, "  \"pack_bytes\": {},", self.pack_bytes);
         if self.entries.is_empty() {
-            out.push_str("  \"entries\": []\n");
+            out.push_str("  \"entries\": [],\n");
         } else {
             out.push_str("  \"entries\": [\n");
             for (i, entry) in self.entries.iter().enumerate() {
@@ -146,6 +201,7 @@ impl Rdna2PackSummary {
                 out.push_str("      \"entry_point\": ");
                 write_json_string(&mut out, &entry.entry_point);
                 out.push_str(",\n");
+                let _ = writeln!(out, "      \"naga_validated\": {},", entry.naga_validated);
                 let _ = writeln!(
                     out,
                     "      \"translated_op_count\": {},",
@@ -166,6 +222,32 @@ impl Rdna2PackSummary {
                     out.push_str("    }\n");
                 }
             }
+            out.push_str("  ],\n");
+        }
+        if self.failures.is_empty() {
+            out.push_str("  \"failures\": []\n");
+        } else {
+            out.push_str("  \"failures\": [\n");
+            for (i, failure) in self.failures.iter().enumerate() {
+                out.push_str("    {");
+                if let Some(id) = failure.code_identity {
+                    out.push_str("\"code_identity\": ");
+                    write_json_string(&mut out, &format_shader_hash(id));
+                    out.push_str(", ");
+                }
+                if let Some(stage) = failure.stage {
+                    out.push_str("\"stage\": ");
+                    write_json_string(&mut out, stage.as_str());
+                    out.push_str(", ");
+                }
+                out.push_str("\"reason\": ");
+                write_json_string(&mut out, &failure.reason);
+                if i + 1 < self.failures.len() {
+                    out.push_str("},\n");
+                } else {
+                    out.push_str("}\n");
+                }
+            }
             out.push_str("  ]\n");
         }
         out.push_str("}\n");
@@ -179,15 +261,40 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  total_blobs:       {}", self.total_blobs);
         let _ = writeln!(out, "  translated_ok:     {}", self.translated_ok);
         let _ = writeln!(out, "  skipped_or_failed: {}", self.skipped_or_failed);
+        let _ = writeln!(out, "  failed:            {}", self.failed);
+        if self.manifest_duplicates_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "  manifest_dups:     {}",
+                self.manifest_duplicates_skipped
+            );
+        }
         let _ = writeln!(out, "  vertex_count:      {}", self.vertex_count);
         let _ = writeln!(out, "  pixel_count:       {}", self.pixel_count);
         let _ = writeln!(out, "  compute_count:     {}", self.compute_count);
+        let _ = writeln!(out, "  vertex_packed:     {}", self.vertex_packed);
+        let _ = writeln!(out, "  fragment_packed:   {}", self.fragment_packed);
+        let _ = writeln!(out, "  compute_packed:    {}", self.compute_packed);
         let _ = writeln!(out, "  pack_bytes:        {}", self.pack_bytes);
+        if !self.failures.is_empty() {
+            let _ = writeln!(out, "  failures ({}):", self.failures.len());
+            for failure in &self.failures {
+                let id_str = failure
+                    .code_identity
+                    .map(format_shader_hash)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let stage_str = failure
+                    .stage
+                    .map(ShaderStage::as_str)
+                    .unwrap_or("unknown");
+                let _ = writeln!(out, "    - {id_str} ({stage_str}): {}", failure.reason);
+            }
+        }
         out
     }
 }
 
-/// Complete output of [`pack_rdna2_blobs`] or [`pack_rdna2_directory`].
+/// Complete output of [`pack_rdna2_blobs`], [`pack_rdna2_directory`], or [`pack_rdna2_manifest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdna2PackResult {
     /// Serialized `WGPK` v1 binary `.wgsl.pack` bytes.
@@ -198,10 +305,21 @@ pub struct Rdna2PackResult {
     pub summary: Rdna2PackSummary,
 }
 
-/// Errors produced when packing RDNA2 shader directories or blobs.
+/// Errors produced when packing RDNA2 shader directories, manifests, or blobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rdna2PackError {
     InvalidInputDir(String),
+    InvalidManifest(String),
+    HashMismatch {
+        expected: u64,
+        actual: u64,
+        stage: ShaderStage,
+    },
+    ShaderFailed {
+        code_identity: Option<u64>,
+        stage: Option<ShaderStage>,
+        reason: String,
+    },
     Io(String),
     Pack(PackError),
 }
@@ -210,6 +328,29 @@ impl fmt::Display for Rdna2PackError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInputDir(msg) => write!(f, "invalid RDNA2 input directory: {msg}"),
+            Self::InvalidManifest(msg) => write!(f, "invalid pipeline-dump manifest: {msg}"),
+            Self::HashMismatch {
+                expected,
+                actual,
+                stage,
+            } => write!(
+                f,
+                "RDNA2 {} shader FNV-1a 64 hash mismatch: expected {}, actual {}",
+                stage.as_str(),
+                format_shader_hash(*expected),
+                format_shader_hash(*actual)
+            ),
+            Self::ShaderFailed {
+                code_identity,
+                stage,
+                reason,
+            } => {
+                let id_str = code_identity
+                    .map(format_shader_hash)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let stage_str = stage.map(ShaderStage::as_str).unwrap_or("unknown");
+                write!(f, "RDNA2 shader {id_str} ({stage_str}) failed: {reason}")
+            }
             Self::Io(msg) => write!(f, "I/O error while packing RDNA2 shaders: {msg}"),
             Self::Pack(err) => write!(f, "failed to serialize WGPK pack: {err}"),
         }
@@ -310,22 +451,648 @@ pub fn parse_filename_hint(name: &str) -> Rdna2FilenameHint {
     Rdna2FilenameHint { stage, hash }
 }
 
-/// Translate and deterministically pack an in-memory slice of raw RDNA2 shader blobs into a
-/// `WGPK` v1 `.wgsl.pack` archive.
+fn stage_to_override(stage: ShaderStage) -> Rdna2StageOverride {
+    match stage {
+        ShaderStage::Vertex => Rdna2StageOverride::Vertex,
+        ShaderStage::Fragment => Rdna2StageOverride::Pixel,
+        ShaderStage::Compute => Rdna2StageOverride::Compute,
+    }
+}
+
+fn override_to_stage(stage: Rdna2StageOverride) -> Option<ShaderStage> {
+    match stage {
+        Rdna2StageOverride::Auto => None,
+        Rdna2StageOverride::Vertex => Some(ShaderStage::Vertex),
+        Rdna2StageOverride::Pixel => Some(ShaderStage::Fragment),
+        Rdna2StageOverride::Compute => Some(ShaderStage::Compute),
+    }
+}
+
+fn parse_manifest_stage(value: &str) -> Option<ShaderStage> {
+    if value.eq_ignore_ascii_case("vertex") {
+        Some(ShaderStage::Vertex)
+    } else if value.eq_ignore_ascii_case("pixel") || value.eq_ignore_ascii_case("fragment") {
+        Some(ShaderStage::Fragment)
+    } else if value.eq_ignore_ascii_case("compute") {
+        Some(ShaderStage::Compute)
+    } else {
+        None
+    }
+}
+
+fn parse_manifest_hex_u64(token: &str) -> Option<u64> {
+    let hex = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))?;
+    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Validate that a `code_file` path from `manifest.json` is strictly relative and contains no
+/// traversal (`..`), root/drive prefixes, or NUL bytes, returning a normalized relative [`PathBuf`].
+fn validate_manifest_relative_path(raw: &str) -> Result<PathBuf, Rdna2PackError> {
+    if raw.is_empty() || raw.bytes().any(|b| b == 0) {
+        return Err(Rdna2PackError::InvalidManifest(
+            "native_stages entry has empty or invalid code_file".to_string(),
+        ));
+    }
+    // Reject explicit leading slashes or Windows drive prefixes like `C:...` on all platforms.
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err(Rdna2PackError::InvalidManifest(
+            "native_stages code_file must be a relative path".to_string(),
+        ));
+    }
+    if raw.len() >= 2 && raw.as_bytes()[0].is_ascii_alphabetic() && raw.as_bytes()[1] == b':' {
+        return Err(Rdna2PackError::InvalidManifest(
+            "native_stages code_file must not contain a drive prefix".to_string(),
+        ));
+    }
+
+    let mut rel = PathBuf::new();
+    let mut normal_segments = 0usize;
+    for segment in raw.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(Rdna2PackError::InvalidManifest(
+                "native_stages code_file must not contain parent directory traversal ('..')"
+                    .to_string(),
+            ));
+        }
+        rel.push(segment);
+        normal_segments += 1;
+    }
+    if normal_segments == 0 {
+        return Err(Rdna2PackError::InvalidManifest(
+            "native_stages code_file must name a file".to_string(),
+        ));
+    }
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Rdna2PackError::InvalidManifest(
+                    "native_stages code_file must remain within the manifest directory".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(rel)
+}
+
+// ---------------------------------------------------------------------------
+// Minimal zero-dependency RFC 8259 JSON parser (for `manifest.json`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JsonValue {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<JsonValue>),
+    Object(Vec<(String, JsonValue)>),
+}
+
+impl JsonValue {
+    fn as_object(&self) -> Option<&[(String, JsonValue)]> {
+        match self {
+            Self::Object(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[JsonValue]> {
+        match self {
+            Self::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Number(raw) => raw.parse::<u64>().ok(),
+            _ => None,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&JsonValue> {
+        self.as_object()?
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        let trimmed = input.strip_prefix('\u{feff}').unwrap_or(input);
+        Self {
+            bytes: trimmed.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn parse_root(mut self) -> Result<JsonValue, String> {
+        self.skip_ws();
+        let val = self.parse_value(0)?;
+        self.skip_ws();
+        if self.pos != self.bytes.len() {
+            return Err(format!("unexpected trailing character at byte {}", self.pos));
+        }
+        Ok(val)
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(b) = self.peek() {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn expect_bytes(&mut self, lit: &[u8]) -> Result<(), String> {
+        let end = self.pos.saturating_add(lit.len());
+        if self.bytes.get(self.pos..end) == Some(lit) {
+            self.pos = end;
+            Ok(())
+        } else {
+            Err(format!("unexpected token at byte {}", self.pos))
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<JsonValue, String> {
+        if depth > MAX_JSON_DEPTH {
+            return Err("JSON nesting depth exceeds safety limit".to_string());
+        }
+        self.skip_ws();
+        let b = self
+            .peek()
+            .ok_or_else(|| format!("unexpected end of JSON at byte {}", self.pos))?;
+        match b {
+            b'{' => self.parse_object(depth + 1),
+            b'[' => self.parse_array(depth + 1),
+            b'"' => self.parse_string().map(JsonValue::String),
+            b't' => {
+                self.expect_bytes(b"true")?;
+                Ok(JsonValue::Bool(true))
+            }
+            b'f' => {
+                self.expect_bytes(b"false")?;
+                Ok(JsonValue::Bool(false))
+            }
+            b'n' => {
+                self.expect_bytes(b"null")?;
+                Ok(JsonValue::Null)
+            }
+            b'-' | b'0'..=b'9' => self.parse_number().map(JsonValue::Number),
+            _ => Err(format!("unexpected byte 0x{b:02x} at byte {}", self.pos)),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<JsonValue, String> {
+        self.pos += 1; // '{'
+        self.skip_ws();
+        let mut entries = Vec::new();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JsonValue::Object(entries));
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(format!("expected object key string at byte {}", self.pos));
+            }
+            let key = self.parse_string()?;
+            self.skip_ws();
+            if self.peek() != Some(b':') {
+                return Err(format!("expected ':' after object key at byte {}", self.pos));
+            }
+            self.pos += 1;
+            let value = self.parse_value(depth)?;
+            entries.push((key, value));
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Object(entries));
+                }
+                _ => {
+                    return Err(format!(
+                        "expected ',' or '}}' in object at byte {}",
+                        self.pos
+                    ));
+                }
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<JsonValue, String> {
+        self.pos += 1; // '['
+        self.skip_ws();
+        let mut items = Vec::new();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(JsonValue::Array(items));
+        }
+        loop {
+            let value = self.parse_value(depth)?;
+            items.push(value);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(JsonValue::Array(items));
+                }
+                _ => {
+                    return Err(format!(
+                        "expected ',' or ']' in array at byte {}",
+                        self.pos
+                    ));
+                }
+            }
+        }
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, String> {
+        let end = self.pos.saturating_add(4);
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or_else(|| "truncated \\uXXXX escape in JSON string".to_string())?;
+        let text = std::str::from_utf8(slice)
+            .map_err(|_| "invalid UTF-8 in \\uXXXX escape".to_string())?;
+        let code = u16::from_str_radix(text, 16)
+            .map_err(|_| format!("invalid hex digits in \\u escape at byte {}", self.pos))?;
+        self.pos = end;
+        Ok(code)
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        if self.peek() != Some(b'"') {
+            return Err(format!("expected '\"' at byte {}", self.pos));
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        while let Some(b) = self.peek() {
+            if b == b'"' {
+                self.pos += 1;
+                return Ok(out);
+            }
+            if b == b'\\' {
+                self.pos += 1;
+                let esc = self
+                    .peek()
+                    .ok_or_else(|| "unterminated escape sequence in JSON string".to_string())?;
+                self.pos += 1;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000c}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let first = self.parse_hex4()?;
+                        if (0xD800..=0xDBFF).contains(&first) {
+                            self.expect_bytes(b"\\u")?;
+                            let second = self.parse_hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&second) {
+                                return Err("invalid UTF-16 low surrogate in JSON string".to_string());
+                            }
+                            let cp = 0x10000
+                                + (((u32::from(first) - 0xD800) << 10)
+                                    | (u32::from(second) - 0xDC00));
+                            let ch = char::from_u32(cp)
+                                .ok_or_else(|| "invalid Unicode scalar in JSON string".to_string())?;
+                            out.push(ch);
+                        } else if (0xDC00..=0xDFFF).contains(&first) {
+                            return Err("unpaired UTF-16 low surrogate in JSON string".to_string());
+                        } else {
+                            let ch = char::from_u32(u32::from(first))
+                                .ok_or_else(|| "invalid Unicode scalar in JSON string".to_string())?;
+                            out.push(ch);
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "invalid escape sequence '\\{}' at byte {}",
+                            esc as char, self.pos
+                        ));
+                    }
+                }
+                continue;
+            }
+            if b < 0x20 {
+                return Err(format!("unescaped control character in JSON string at byte {}", self.pos));
+            }
+            // Copy contiguous safe UTF-8 bytes up to the next '"' or '\' or control char.
+            let start = self.pos;
+            while let Some(next) = self.peek() {
+                if next == b'"' || next == b'\\' || next < 0x20 {
+                    break;
+                }
+                self.pos += 1;
+            }
+            let chunk = std::str::from_utf8(&self.bytes[start..self.pos])
+                .map_err(|_| "invalid UTF-8 inside JSON string".to_string())?;
+            out.push_str(chunk);
+        }
+        Err("unterminated JSON string".to_string())
+    }
+
+    fn parse_number(&mut self) -> Result<String, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(format!("invalid JSON number at byte {}", self.pos)),
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(format!("invalid fraction in JSON number at byte {}", self.pos));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(format!("invalid exponent in JSON number at byte {}", self.pos));
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| "invalid UTF-8 in JSON number".to_string())?;
+        Ok(text.to_string())
+    }
+}
+
+/// Parse a `playgta6-pipeline-dump` `manifest.json` document (schema version 1) with zero
+/// external dependencies.
 ///
-/// Every shader is unconditionally translated and validated by Naga via
-/// [`translate_rdna2_to_wgsl`]. Blobs shorter than [`MIN_RDNA2_BLOB_BYTES`], blobs whose
-/// translation fails, or blobs colliding on an already-packed hash are counted in
-/// `summary.skipped_or_failed` without panicking.
-///
-/// Entries in the resulting `WGPK` binary are deterministically sorted by ascending `u64` hash.
-pub fn pack_rdna2_blobs(
+/// Validates `"schema": "playgta6-pipeline-dump"`, `"schema_version": 1` (if present), and
+/// extracts every entry in `"native_stages"` (`code_identity`, `stage`, `code_file`, and optional
+/// `identity` / `code_bytes`).
+pub fn parse_pipeline_dump_manifest(
+    json_text: &str,
+) -> Result<PipelineDumpManifest, Rdna2PackError> {
+    let root = JsonParser::new(json_text)
+        .parse_root()
+        .map_err(Rdna2PackError::InvalidManifest)?;
+
+    if root.as_object().is_none() {
+        return Err(Rdna2PackError::InvalidManifest(
+            "manifest root must be a JSON object".to_string(),
+        ));
+    }
+
+    let schema = root
+        .get("schema")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            Rdna2PackError::InvalidManifest(
+                "missing string field \"schema\" (expected \"playgta6-pipeline-dump\")".to_string(),
+            )
+        })?;
+    if schema != PIPELINE_DUMP_SCHEMA {
+        return Err(Rdna2PackError::InvalidManifest(format!(
+            "unsupported manifest schema '{schema}' (expected '{PIPELINE_DUMP_SCHEMA}')"
+        )));
+    }
+
+    let schema_version = match root.get("schema_version") {
+        Some(v) => {
+            let ver = v.as_u64().ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(
+                    "\"schema_version\" must be an unsigned integer".to_string(),
+                )
+            })?;
+            if ver != PIPELINE_DUMP_SCHEMA_VERSION {
+                return Err(Rdna2PackError::InvalidManifest(format!(
+                    "unsupported manifest schema_version {ver} (expected {PIPELINE_DUMP_SCHEMA_VERSION})"
+                )));
+            }
+            ver
+        }
+        None => PIPELINE_DUMP_SCHEMA_VERSION,
+    };
+
+    let native_stages_arr = root
+        .get("native_stages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            Rdna2PackError::InvalidManifest("missing array field \"native_stages\"".to_string())
+        })?;
+
+    let mut native_stages = Vec::with_capacity(native_stages_arr.len());
+    for (idx, item) in native_stages_arr.iter().enumerate() {
+        if item.as_object().is_none() {
+            return Err(Rdna2PackError::InvalidManifest(format!(
+                "native_stages[{idx}] must be a JSON object"
+            )));
+        }
+
+        let code_id_raw = item
+            .get("code_identity")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(format!(
+                    "native_stages[{idx}] missing string field \"code_identity\""
+                ))
+            })?;
+        let code_identity = parse_manifest_hex_u64(code_id_raw).ok_or_else(|| {
+            Rdna2PackError::InvalidManifest(format!(
+                "native_stages[{idx}] has invalid hex code_identity '{code_id_raw}'"
+            ))
+        })?;
+
+        let identity = match item.get("identity").and_then(JsonValue::as_str) {
+            Some(s) if !s.is_empty() => Some(parse_manifest_hex_u64(s).ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(format!(
+                    "native_stages[{idx}] has invalid hex identity '{s}'"
+                ))
+            })?),
+            _ => None,
+        };
+
+        let stage_raw = item
+            .get("stage")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(format!(
+                    "native_stages[{idx}] missing string field \"stage\""
+                ))
+            })?;
+        let stage = parse_manifest_stage(stage_raw).ok_or_else(|| {
+            Rdna2PackError::InvalidManifest(format!(
+                "native_stages[{idx}] has unsupported stage '{stage_raw}' (expected 'vertex', 'pixel', or 'compute')"
+            ))
+        })?;
+
+        let code_file = item
+            .get("code_file")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(format!(
+                    "native_stages[{idx}] missing string field \"code_file\""
+                ))
+            })?;
+        let _ = validate_manifest_relative_path(code_file)?;
+
+        let code_bytes = match item.get("code_bytes") {
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                Rdna2PackError::InvalidManifest(format!(
+                    "native_stages[{idx}] field \"code_bytes\" must be an unsigned integer"
+                ))
+            })?),
+            None => None,
+        };
+
+        native_stages.push(PipelineDumpNativeStage {
+            code_identity,
+            identity,
+            stage,
+            code_file: code_file.to_string(),
+            code_bytes,
+        });
+    }
+
+    Ok(PipelineDumpManifest {
+        schema: schema.to_string(),
+        schema_version,
+        native_stages,
+    })
+}
+
+fn build_pack_result(
+    packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
+    total_blobs: usize,
+    skipped_or_failed: usize,
+    failed: usize,
+    manifest_duplicates_skipped: usize,
+    failures: Vec<Rdna2PackFailureSummary>,
+    pack_flags: u32,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    let mut entries: Vec<PackEntry> = Vec::with_capacity(packed_by_hash.len());
+    let mut entry_summaries: Vec<Rdna2PackEntrySummary> = Vec::with_capacity(packed_by_hash.len());
+    for (entry, entry_summary) in packed_by_hash.into_values() {
+        entries.push(entry);
+        entry_summaries.push(entry_summary);
+    }
+
+    let mut vertex_count = 0usize;
+    let mut pixel_count = 0usize;
+    let mut compute_count = 0usize;
+    for entry in &entries {
+        match entry.stage {
+            ShaderStage::Vertex => vertex_count += 1,
+            ShaderStage::Fragment => pixel_count += 1,
+            ShaderStage::Compute => compute_count += 1,
+        }
+    }
+
+    let pack_bytes = write_pack(&entries, pack_flags).map_err(Rdna2PackError::Pack)?;
+    let summary = Rdna2PackSummary {
+        total_blobs,
+        translated_ok: entries.len(),
+        skipped_or_failed,
+        failed,
+        manifest_duplicates_skipped,
+        vertex_count,
+        pixel_count,
+        compute_count,
+        vertex_packed: vertex_count,
+        fragment_packed: pixel_count,
+        compute_packed: compute_count,
+        pack_bytes: pack_bytes.len(),
+        entries: entry_summaries,
+        failures,
+    };
+
+    Ok(Rdna2PackResult {
+        pack_bytes,
+        entries,
+        summary,
+    })
+}
+
+fn write_pack_bytes_to_file(out_path: &Path, pack_bytes: &[u8]) -> Result<(), Rdna2PackError> {
+    let out_label = sanitize_source_path(out_path, None);
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            Rdna2PackError::Io(format!(
+                "failed to create output directory for '{out_label}': {}",
+                err.kind()
+            ))
+        })?;
+    }
+    fs::write(out_path, pack_bytes).map_err(|err| {
+        Rdna2PackError::Io(format!(
+            "failed to write WGPK pack '{out_label}': {}",
+            err.kind()
+        ))
+    })?;
+    Ok(())
+}
+
+fn pack_blobs_into_map(
     blobs: &[Rdna2BlobInput],
     options: &Rdna2PackOptions,
-) -> Result<Rdna2PackResult, Rdna2PackError> {
-    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-    let mut skipped_or_failed = 0usize;
-
+    packed_by_hash: &mut BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
+    skipped_or_failed: &mut usize,
+    failed: &mut usize,
+    failures: &mut Vec<Rdna2PackFailureSummary>,
+) {
     // Sort a view of indices deterministically by blob name then raw content length/bytes
     // so duplicate-hash tie-breaking is independent of caller slice order.
     let mut order: Vec<usize> = (0..blobs.len()).collect();
@@ -339,11 +1106,6 @@ pub fn pack_rdna2_blobs(
 
     for idx in order {
         let blob = &blobs[idx];
-        if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
-            skipped_or_failed += 1;
-            continue;
-        }
-
         let hint = parse_filename_hint(&blob.name);
         let stage = if blob.stage_override != Rdna2StageOverride::Auto {
             blob.stage_override
@@ -352,6 +1114,20 @@ pub fn pack_rdna2_blobs(
         } else {
             options.translate.stage
         };
+
+        if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
+            *skipped_or_failed += 1;
+            *failed += 1;
+            failures.push(Rdna2PackFailureSummary {
+                code_identity: blob.hash_override.or(hint.hash),
+                stage: override_to_stage(stage),
+                reason: format!(
+                    "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
+                    blob.bytes.len()
+                ),
+            });
+            continue;
+        }
 
         let translate_opts = Rdna2TranslateOptions {
             stage,
@@ -363,8 +1139,24 @@ pub fn pack_rdna2_blobs(
 
         let output = match translate_rdna2_to_wgsl(&blob.bytes, &translate_opts) {
             Ok(out) if out.naga_validated => out,
-            _ => {
-                skipped_or_failed += 1;
+            Ok(_) => {
+                *skipped_or_failed += 1;
+                *failed += 1;
+                failures.push(Rdna2PackFailureSummary {
+                    code_identity: blob.hash_override.or(hint.hash).or_else(|| Some(fnv1a_64(&blob.bytes))),
+                    stage: override_to_stage(stage),
+                    reason: "translated WGSL did not pass Naga validation".to_string(),
+                });
+                continue;
+            }
+            Err(err) => {
+                *skipped_or_failed += 1;
+                *failed += 1;
+                failures.push(Rdna2PackFailureSummary {
+                    code_identity: blob.hash_override.or(hint.hash).or_else(|| Some(fnv1a_64(&blob.bytes))),
+                    stage: override_to_stage(stage),
+                    reason: format!("RDNA2->WGSL translation failed: {err}"),
+                });
                 continue;
             }
         };
@@ -375,7 +1167,7 @@ pub fn pack_rdna2_blobs(
             .unwrap_or(output.hash_fnv1a64);
 
         if packed_by_hash.contains_key(&final_hash) {
-            skipped_or_failed += 1;
+            *skipped_or_failed += 1;
             continue;
         }
 
@@ -392,6 +1184,7 @@ pub fn pack_rdna2_blobs(
                     hash_fnv1a64: final_hash,
                     stage: output.stage,
                     entry_point: output.entry_point,
+                    naga_validated: output.naga_validated,
                     translated_op_count: output.translated_op_count,
                     unsupported_op_count: output.unsupported_op_count,
                     wgsl_byte_len,
@@ -400,41 +1193,44 @@ pub fn pack_rdna2_blobs(
             ),
         );
     }
+}
 
-    let mut entries: Vec<PackEntry> = Vec::with_capacity(packed_by_hash.len());
-    let mut entry_summaries: Vec<Rdna2PackEntrySummary> = Vec::with_capacity(packed_by_hash.len());
-    for (entry, entry_summary) in packed_by_hash.into_values() {
-        entries.push(entry);
-        entry_summaries.push(entry_summary);
-    }
-    let mut vertex_count = 0usize;
-    let mut pixel_count = 0usize;
-    let mut compute_count = 0usize;
-    for entry in &entries {
-        match entry.stage {
-            ShaderStage::Vertex => vertex_count += 1,
-            ShaderStage::Fragment => pixel_count += 1,
-            ShaderStage::Compute => compute_count += 1,
-        }
-    }
+/// Translate and deterministically pack an in-memory slice of raw RDNA2 shader blobs into a
+/// `WGPK` v1 `.wgsl.pack` archive.
+///
+/// Every shader is unconditionally translated and validated by Naga via
+/// [`translate_rdna2_to_wgsl`]. Blobs shorter than [`MIN_RDNA2_BLOB_BYTES`], blobs whose
+/// translation fails, or blobs colliding on an already-packed hash are counted in
+/// `summary.skipped_or_failed` without panicking.
+///
+/// Entries in the resulting `WGPK` binary are deterministically sorted by ascending `u64` hash.
+pub fn pack_rdna2_blobs(
+    blobs: &[Rdna2BlobInput],
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
+    let mut skipped_or_failed = 0usize;
+    let mut failed = 0usize;
+    let mut failures = Vec::new();
 
-    let pack_bytes = write_pack(&entries, options.pack_flags).map_err(Rdna2PackError::Pack)?;
-    let summary = Rdna2PackSummary {
-        total_blobs: blobs.len(),
-        translated_ok: entries.len(),
+    pack_blobs_into_map(
+        blobs,
+        options,
+        &mut packed_by_hash,
+        &mut skipped_or_failed,
+        &mut failed,
+        &mut failures,
+    );
+
+    build_pack_result(
+        packed_by_hash,
+        blobs.len(),
         skipped_or_failed,
-        vertex_count,
-        pixel_count,
-        compute_count,
-        pack_bytes: pack_bytes.len(),
-        entries: entry_summaries,
-    };
-
-    Ok(Rdna2PackResult {
-        pack_bytes,
-        entries,
-        summary,
-    })
+        failed,
+        0,
+        failures,
+        options.pack_flags,
+    )
 }
 
 /// Collect regular RDNA2 blob files (`*.bin`, `*.rdna2`, `*.shader`) inside `input_dir`,
@@ -528,15 +1324,9 @@ fn collect_rdna2_blob_paths(input_dir: &Path) -> Result<Vec<(String, PathBuf)>, 
     Ok(files)
 }
 
-/// Scan `input_dir` for raw RDNA2 shader blobs (`*.bin`, `*.rdna2`, `*.shader`),
-/// translate every blob via [`translate_rdna2_to_wgsl`], and build a deterministic
-/// `WGPK` v1 `.wgsl.pack` archive in memory.
-///
-/// Non-files and symlinks resolving outside `input_dir` are safely ignored.
-pub fn pack_rdna2_directory(
+fn collect_directory_blobs(
     input_dir: &Path,
-    options: &Rdna2PackOptions,
-) -> Result<Rdna2PackResult, Rdna2PackError> {
+) -> Result<(Vec<Rdna2BlobInput>, usize), Rdna2PackError> {
     let file_paths = collect_rdna2_blob_paths(input_dir)?;
 
     let mut blobs = Vec::with_capacity(file_paths.len());
@@ -557,10 +1347,25 @@ pub fn pack_rdna2_directory(
         }
     }
 
+    Ok((blobs, read_failures))
+}
+
+/// Scan `input_dir` for raw RDNA2 shader blobs (`*.bin`, `*.rdna2`, `*.shader`),
+/// translate every blob via [`translate_rdna2_to_wgsl`], and build a deterministic
+/// `WGPK` v1 `.wgsl.pack` archive in memory.
+///
+/// Non-files and symlinks resolving outside `input_dir` are safely ignored.
+pub fn pack_rdna2_directory(
+    input_dir: &Path,
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    let (blobs, read_failures) = collect_directory_blobs(input_dir)?;
+
     let mut result = pack_rdna2_blobs(&blobs, options)?;
     if read_failures > 0 {
         result.summary.total_blobs += read_failures;
         result.summary.skipped_or_failed += read_failures;
+        result.summary.failed += read_failures;
     }
     Ok(result)
 }
@@ -573,25 +1378,393 @@ pub fn pack_rdna2_directory_to_file(
     options: &Rdna2PackOptions,
 ) -> Result<Rdna2PackResult, Rdna2PackError> {
     let result = pack_rdna2_directory(input_dir, options)?;
+    write_pack_bytes_to_file(out_path, &result.pack_bytes)?;
+    Ok(result)
+}
 
-    let out_label = sanitize_source_path(out_path, None);
-    if let Some(parent) = out_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            Rdna2PackError::Io(format!(
-                "failed to create output directory for '{out_label}': {}",
-                err.kind()
-            ))
-        })?;
+#[allow(clippy::too_many_arguments)]
+fn pack_manifest_into_map(
+    manifest_path: &Path,
+    options: &Rdna2PackOptions,
+    packed_by_hash: &mut BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
+    total_blobs: &mut usize,
+    skipped_or_failed: &mut usize,
+    failed: &mut usize,
+    manifest_duplicates_skipped: &mut usize,
+    failures: &mut Vec<Rdna2PackFailureSummary>,
+) -> Result<(), Rdna2PackError> {
+    let manifest_label = sanitize_source_path(manifest_path, None);
+    let meta = fs::metadata(manifest_path).map_err(|_| {
+        Rdna2PackError::InvalidManifest(format!(
+            "manifest '{}' does not exist or is unreadable",
+            manifest_label
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(Rdna2PackError::InvalidManifest(format!(
+            "'{}' is not a regular file",
+            manifest_label
+        )));
     }
-    fs::write(out_path, &result.pack_bytes).map_err(|err| {
+
+    let json_text = fs::read_to_string(manifest_path).map_err(|err| {
         Rdna2PackError::Io(format!(
-            "failed to write WGPK pack '{out_label}': {}",
+            "failed to read manifest '{manifest_label}': {}",
             err.kind()
         ))
     })?;
+    let manifest = parse_pipeline_dump_manifest(&json_text)?;
 
+    let parent_dir = match manifest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let canonical_parent = fs::canonicalize(parent_dir).map_err(|_| {
+        Rdna2PackError::Io(format!(
+            "failed to resolve parent directory of manifest '{manifest_label}'"
+        ))
+    })?;
+
+    // Deduplicate native_stages by `code_identity` (multiple PSO metadata blobs may share one
+    // code blob in `playgta6-pipeline-dump`) and sort deterministically by ascending code_identity.
+    let mut seen_code_ids: BTreeSet<u64> = BTreeSet::new();
+    let mut unique_stages: Vec<PipelineDumpNativeStage> =
+        Vec::with_capacity(manifest.native_stages.len());
+    for entry in manifest.native_stages {
+        if !seen_code_ids.insert(entry.code_identity) {
+            *manifest_duplicates_skipped += 1;
+            continue;
+        }
+        unique_stages.push(entry);
+    }
+    unique_stages.sort_by_key(|entry| entry.code_identity);
+
+    *total_blobs += unique_stages.len();
+
+    for entry in unique_stages {
+        let rel_path = match validate_manifest_relative_path(&entry.code_file) {
+            Ok(p) => p,
+            Err(err) => {
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+
+        let joined = canonical_parent.join(&rel_path);
+        let canonical_file = match fs::canonicalize(&joined) {
+            Ok(target) => target,
+            Err(err) => {
+                let reason = format!(
+                    "failed to locate code_file '{}': {}",
+                    sanitize_source_path(&rel_path, None),
+                    err.kind()
+                );
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason,
+                    });
+                    continue;
+                }
+                return Err(Rdna2PackError::ShaderFailed {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+            }
+        };
+
+        if !canonical_file.starts_with(&canonical_parent) {
+            let reason = "code_file resolves outside the manifest directory".to_string();
+            if options.best_effort {
+                *skipped_or_failed += 1;
+                *failed += 1;
+                failures.push(Rdna2PackFailureSummary {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+                continue;
+            }
+            return Err(Rdna2PackError::ShaderFailed {
+                code_identity: Some(entry.code_identity),
+                stage: Some(entry.stage),
+                reason,
+            });
+        }
+
+        let file_meta = match fs::metadata(&canonical_file) {
+            Ok(m) if m.is_file() => m,
+            _ => {
+                let reason = "code_file is not a regular file".to_string();
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason,
+                    });
+                    continue;
+                }
+                return Err(Rdna2PackError::ShaderFailed {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+            }
+        };
+        let _ = file_meta;
+
+        let bytes = match fs::read(&canonical_file) {
+            Ok(b) => b,
+            Err(err) => {
+                let reason = format!("failed to read code_file: {}", err.kind());
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason,
+                    });
+                    continue;
+                }
+                return Err(Rdna2PackError::ShaderFailed {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+            }
+        };
+
+        let actual_hash = fnv1a_64(&bytes);
+        if actual_hash != entry.code_identity {
+            if options.best_effort {
+                *skipped_or_failed += 1;
+                *failed += 1;
+                failures.push(Rdna2PackFailureSummary {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason: format!(
+                        "FNV-1a 64 hash mismatch: expected {}, actual {}",
+                        format_shader_hash(entry.code_identity),
+                        format_shader_hash(actual_hash)
+                    ),
+                });
+                continue;
+            }
+            return Err(Rdna2PackError::HashMismatch {
+                expected: entry.code_identity,
+                actual: actual_hash,
+                stage: entry.stage,
+            });
+        }
+
+        if bytes.len() < MIN_RDNA2_BLOB_BYTES {
+            let reason = format!(
+                "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
+                bytes.len()
+            );
+            if options.best_effort {
+                *skipped_or_failed += 1;
+                *failed += 1;
+                failures.push(Rdna2PackFailureSummary {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+                continue;
+            }
+            return Err(Rdna2PackError::ShaderFailed {
+                code_identity: Some(entry.code_identity),
+                stage: Some(entry.stage),
+                reason,
+            });
+        }
+
+        let translate_opts = Rdna2TranslateOptions {
+            stage: stage_to_override(entry.stage),
+            entry_point: options.translate.entry_point.clone(),
+            min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
+            workgroup_size: options.translate.workgroup_size,
+            workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
+        };
+
+        let output = match translate_rdna2_to_wgsl(&bytes, &translate_opts) {
+            Ok(out) if out.naga_validated => out,
+            Ok(_) => {
+                let reason = "translated WGSL did not pass Naga validation".to_string();
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason,
+                    });
+                    continue;
+                }
+                return Err(Rdna2PackError::ShaderFailed {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+            }
+            Err(err) => {
+                let reason = format!("RDNA2->WGSL translation failed: {err}");
+                if options.best_effort {
+                    *skipped_or_failed += 1;
+                    *failed += 1;
+                    failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(entry.code_identity),
+                        stage: Some(entry.stage),
+                        reason,
+                    });
+                    continue;
+                }
+                return Err(Rdna2PackError::ShaderFailed {
+                    code_identity: Some(entry.code_identity),
+                    stage: Some(entry.stage),
+                    reason,
+                });
+            }
+        };
+
+        let wgsl_byte_len = output.wgsl.len();
+        packed_by_hash.insert(
+            entry.code_identity,
+            (
+                PackEntry {
+                    hash: entry.code_identity,
+                    stage: output.stage,
+                    wgsl: output.wgsl,
+                },
+                Rdna2PackEntrySummary {
+                    hash_fnv1a64: entry.code_identity,
+                    stage: output.stage,
+                    entry_point: output.entry_point,
+                    naga_validated: output.naga_validated,
+                    translated_op_count: output.translated_op_count,
+                    unsupported_op_count: output.unsupported_op_count,
+                    wgsl_byte_len,
+                    bindings: output.bindings,
+                },
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+/// Pack RDNA2 shaders directly from a `playgta6-pipeline-dump` `manifest.json` (`native_stages`).
+///
+/// Deduplicates entries by `code_identity`, verifies whole-file FNV-1a 64 hashes against
+/// `code_identity`, passes explicit `ShaderStage` (`Vertex` / `Fragment` / `Compute`) into
+/// [`translate_rdna2_to_wgsl`], and builds a deterministic `WGPK` v1 `.wgsl.pack` archive.
+///
+/// In strict mode (`options.best_effort == false`), any missing file, escaping symlink, FNV-1a
+/// mismatch, short blob, or translation/Naga failure returns an error. When
+/// `options.best_effort == true`, individual failing shaders are skipped and recorded in
+/// `summary.failures`.
+pub fn pack_rdna2_manifest(
+    manifest_path: &Path,
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    pack_rdna2_sources(None, Some(manifest_path), options)
+}
+
+/// Convenience helper that runs [`pack_rdna2_manifest`] and writes the resulting
+/// `WGPK` v1 `.wgsl.pack` bytes to `out_path` (creating parent directories if needed).
+pub fn pack_rdna2_manifest_to_file(
+    manifest_path: &Path,
+    out_path: &Path,
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    pack_rdna2_sources_to_file(None, Some(manifest_path), out_path, options)
+}
+
+/// Pack RDNA2 shaders from an optional `playgta6-pipeline-dump` `manifest.json`, an optional
+/// raw blob directory, or both combined (manifest entries take precedence on matching hashes).
+pub fn pack_rdna2_sources(
+    input_dir: Option<&Path>,
+    manifest_path: Option<&Path>,
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    if input_dir.is_none() && manifest_path.is_none() {
+        return Err(Rdna2PackError::InvalidInputDir(
+            "at least one input directory or manifest is required".to_string(),
+        ));
+    }
+
+    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
+    let mut total_blobs = 0usize;
+    let mut skipped_or_failed = 0usize;
+    let mut failed = 0usize;
+    let mut manifest_duplicates_skipped = 0usize;
+    let mut failures = Vec::new();
+
+    if let Some(manifest) = manifest_path {
+        pack_manifest_into_map(
+            manifest,
+            options,
+            &mut packed_by_hash,
+            &mut total_blobs,
+            &mut skipped_or_failed,
+            &mut failed,
+            &mut manifest_duplicates_skipped,
+            &mut failures,
+        )?;
+    }
+
+    if let Some(dir) = input_dir {
+        let (blobs, read_failures) = collect_directory_blobs(dir)?;
+        total_blobs += blobs.len() + read_failures;
+        skipped_or_failed += read_failures;
+        failed += read_failures;
+        pack_blobs_into_map(
+            &blobs,
+            options,
+            &mut packed_by_hash,
+            &mut skipped_or_failed,
+            &mut failed,
+            &mut failures,
+        );
+    }
+
+    build_pack_result(
+        packed_by_hash,
+        total_blobs,
+        skipped_or_failed,
+        failed,
+        manifest_duplicates_skipped,
+        failures,
+        options.pack_flags,
+    )
+}
+
+/// Convenience helper that runs [`pack_rdna2_sources`] and writes the resulting
+/// `WGPK` v1 `.wgsl.pack` bytes to `out_path` (creating parent directories if needed).
+pub fn pack_rdna2_sources_to_file(
+    input_dir: Option<&Path>,
+    manifest_path: Option<&Path>,
+    out_path: &Path,
+    options: &Rdna2PackOptions,
+) -> Result<Rdna2PackResult, Rdna2PackError> {
+    let result = pack_rdna2_sources(input_dir, manifest_path, options)?;
+    write_pack_bytes_to_file(out_path, &result.pack_bytes)?;
     Ok(result)
 }
 
@@ -1247,5 +2420,392 @@ mod tests {
         assert!(json.contains("\"kind\": \"read-only-storage\""), "JSON:\n{json}");
         assert!(json.contains("\"kind\": \"storage\""), "JSON:\n{json}");
         assert!(json.contains("\"kind\": \"storage-texture\""), "JSON:\n{json}");
+        assert!(json.contains("\"vertex_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"fragment_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"compute_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"failed\": 0"), "JSON:\n{json}");
+        assert!(json.contains("\"naga_validated\": true"), "JSON:\n{json}");
+    }
+
+    #[test]
+    fn parse_pipeline_dump_manifest_parses_stages_and_rejects_malformed_inputs() {
+        let valid_json = r#"{
+            "schema": "playgta6-pipeline-dump",
+            "schema_version": 1,
+            "native_stages": [
+                {
+                    "code_identity": "0x0123456789abcdef",
+                    "identity": "0xfedcba9876543210",
+                    "stage": "vertex",
+                    "layout": "A",
+                    "code_bytes": 64,
+                    "metadata_bytes": 128,
+                    "code_file": "native/0x0123456789abcdef.bin",
+                    "metadata_file": "native/0x0123456789abcdef.meta"
+                },
+                {
+                    "code_identity": "0x1111222233334444",
+                    "stage": "pixel",
+                    "code_file": "native/0x1111222233334444.bin"
+                },
+                {
+                    "code_identity": "0x5555666677778888",
+                    "stage": "compute",
+                    "code_file": "native/0x5555666677778888.bin"
+                }
+            ],
+            "dxil": [{"identity": "0x0000000000000001", "hash_digest": "", "kind": -1, "bytes": 0, "file": "dxil/0x0000000000000001.dxbc"}],
+            "root_signatures": [],
+            "pipelines": [{"index": 0, "vs": null, "ps": null, "depth_bias": -1, "slope": 1.25e-2, "rect_list": false}]
+        }"#;
+
+        let parsed =
+            parse_pipeline_dump_manifest(valid_json).expect("valid manifest should parse cleanly");
+        assert_eq!(parsed.schema, PIPELINE_DUMP_SCHEMA);
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.native_stages.len(), 3);
+        assert_eq!(parsed.native_stages[0].code_identity, 0x0123_4567_89ab_cdef);
+        assert_eq!(parsed.native_stages[0].identity, Some(0xfedc_ba98_7654_3210));
+        assert_eq!(parsed.native_stages[0].stage, ShaderStage::Vertex);
+        assert_eq!(parsed.native_stages[0].code_file, "native/0x0123456789abcdef.bin");
+        assert_eq!(parsed.native_stages[0].code_bytes, Some(64));
+        assert_eq!(parsed.native_stages[1].stage, ShaderStage::Fragment);
+        assert_eq!(parsed.native_stages[2].stage, ShaderStage::Compute);
+
+        // Reject wrong schema, unsupported version, unknown stage, bad hex, path traversal, and invalid JSON.
+        assert!(parse_pipeline_dump_manifest(r#"{"schema":"other","native_stages":[]}"#).is_err());
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","schema_version":2,"native_stages":[]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","native_stages":[{"code_identity":"0x10","stage":"geometry","code_file":"native/a.bin"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","native_stages":[{"code_identity":"not_hex","stage":"vertex","code_file":"native/a.bin"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","native_stages":[{"code_identity":"0x10","stage":"vertex","code_file":"../secret.bin"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","native_stages":[{"code_identity":"0x10","stage":"vertex","code_file":"/etc/passwd"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_pipeline_dump_manifest(
+                r#"{"schema":"playgta6-pipeline-dump","native_stages":[{"code_identity":"0x10","stage":"vertex","code_file":"C:\\Windows\\win.ini"}]}"#
+            )
+            .is_err()
+        );
+        assert!(parse_pipeline_dump_manifest("{truncated").is_err());
+        // Deeply nested JSON must return a clean error rather than overflowing the stack.
+        let deep = format!("{}{}", "[".repeat(128), "]".repeat(128));
+        assert!(parse_pipeline_dump_manifest(&deep).is_err());
+    }
+
+    #[test]
+    fn pack_rdna2_manifest_packs_vs_ps_cs_verifies_fnv1a_deduplicates_and_passes_naga() {
+        let root = make_temp_dir("playgta6_rdna2_pack_manifest");
+        let native_dir = root.join("native");
+        fs::create_dir_all(&native_dir).unwrap();
+
+        // 1) Synthetic VS (fullscreen triangle)
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let vs_hash = fnv1a_64(&vs_bytes);
+        let vs_id = format_shader_hash(vs_hash);
+
+        // 2) Synthetic PS reading cb0[0..2] (48 B tight CBV) + exp mrt0 -> exercises min_binding_size_bytes
+        let mut ps_words = Vec::new();
+        ps_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x00, false, false));
+        ps_words.extend_from_slice(&enc_smem(0x08, 8, 0, 0x7D, 0x2C, false, false));
+        ps_words.push(enc_vop1(0x01, 0, 4));
+        ps_words.push(enc_vop1(0x01, 1, 8));
+        ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 0, 1]));
+        ps_words.push(enc_sopp(0x01, 0));
+        let ps_bytes = words_to_bytes(&ps_words);
+        let ps_hash = fnv1a_64(&ps_bytes);
+        let ps_id = format_shader_hash(ps_hash);
+
+        // 3) Synthetic Compute shader (s_barrier + s_endpgm)
+        let cs_bytes = build_minimal_compute_rdna2();
+        let cs_hash = fnv1a_64(&cs_bytes);
+        let cs_id = format_shader_hash(cs_hash);
+
+        // 4) Ambiguous bare shader (no EXP / no VINTRP / no s_barrier) declared explicitly as "vertex"
+        //    in manifest.json -> proves explicit stage propagation with zero stage-inference errors!
+        let bare_vs_bytes = words_to_bytes(&[
+            enc_vop1(0x01, 0, 242), // v_mov_b32 v0, 1.0
+            enc_sopp(0x01, 0),      // s_endpgm
+        ]);
+        let bare_vs_hash = fnv1a_64(&bare_vs_bytes);
+        let bare_vs_id = format_shader_hash(bare_vs_hash);
+
+        fs::write(native_dir.join(format!("{vs_id}.bin")), &vs_bytes).unwrap();
+        fs::write(native_dir.join(format!("{ps_id}.bin")), &ps_bytes).unwrap();
+        fs::write(native_dir.join(format!("{cs_id}.bin")), &cs_bytes).unwrap();
+        fs::write(native_dir.join(format!("{bare_vs_id}.bin")), &bare_vs_bytes).unwrap();
+
+        // Include a duplicate `code_identity` entry for `vs_id` (different `identity` & `.meta` file,
+        // matching `PipelineDump::native_stage` when two metadata variants share one code blob).
+        let manifest_json = format!(
+            r#"{{
+  "schema": "playgta6-pipeline-dump",
+  "schema_version": 1,
+  "native_stages": [
+    {{"code_identity": "{ps_id}", "identity": "0xaaaaaaaaaaaaaaaa", "stage": "pixel", "layout": "A", "code_bytes": {}, "metadata_bytes": 0, "code_file": "native/{ps_id}.bin", "metadata_file": "native/{ps_id}.meta"}},
+    {{"code_identity": "{vs_id}", "identity": "0xbbbbbbbbbbbbbbbb", "stage": "vertex", "layout": "A", "code_bytes": {}, "metadata_bytes": 0, "code_file": "native/{vs_id}.bin", "metadata_file": "native/{vs_id}.meta"}},
+    {{"code_identity": "{vs_id}", "identity": "0xcccccccccccccccc", "stage": "vertex", "layout": "B", "code_bytes": {}, "metadata_bytes": 0, "code_file": "native/{vs_id}.bin", "metadata_file": "native/{vs_id}-0xcccccccccccccccc.meta"}},
+    {{"code_identity": "{cs_id}", "identity": "0xdddddddddddddddd", "stage": "compute", "layout": "A", "code_bytes": {}, "metadata_bytes": 0, "code_file": "native/{cs_id}.bin", "metadata_file": "native/{cs_id}.meta"}},
+    {{"code_identity": "{bare_vs_id}", "identity": "0xeeeeeeeeeeeeeeee", "stage": "vertex", "layout": "A", "code_bytes": {}, "metadata_bytes": 0, "code_file": "native/{bare_vs_id}.bin", "metadata_file": "native/{bare_vs_id}.meta"}}
+  ],
+  "dxil": [],
+  "root_signatures": [],
+  "pipelines": []
+}}"#,
+            ps_bytes.len(),
+            vs_bytes.len(),
+            vs_bytes.len(),
+            cs_bytes.len(),
+            bare_vs_bytes.len()
+        );
+        let manifest_path = root.join("manifest.json");
+        fs::write(&manifest_path, &manifest_json).unwrap();
+
+        let result = pack_rdna2_manifest(&manifest_path, &Rdna2PackOptions::default())
+            .expect("pack_rdna2_manifest should succeed");
+
+        assert_eq!(result.summary.total_blobs, 4);
+        assert_eq!(result.summary.translated_ok, 4);
+        assert_eq!(result.summary.skipped_or_failed, 0);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.summary.manifest_duplicates_skipped, 1);
+        assert_eq!(result.summary.vertex_packed, 2);
+        assert_eq!(result.summary.fragment_packed, 1);
+        assert_eq!(result.summary.compute_packed, 1);
+        assert_eq!(result.summary.vertex_count, 2);
+        assert_eq!(result.summary.pixel_count, 1);
+        assert_eq!(result.summary.compute_count, 1);
+        assert!(result.summary.failures.is_empty());
+
+        let decoded = read_pack(&result.pack_bytes).expect("WGPK pack must decode cleanly");
+        assert_eq!(decoded.version, PACK_VERSION);
+        assert_eq!(decoded.entries.len(), 4);
+        for entry in &decoded.entries {
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        let vs_packed = decoded.entries.iter().find(|e| e.hash == vs_hash).unwrap();
+        assert_eq!(vs_packed.stage, ShaderStage::Vertex);
+        assert!(vs_packed.wgsl.contains("fn vs_main("));
+
+        let bare_vs_packed = decoded.entries.iter().find(|e| e.hash == bare_vs_hash).unwrap();
+        assert_eq!(bare_vs_packed.stage, ShaderStage::Vertex);
+        assert!(bare_vs_packed.wgsl.contains("fn vs_main("));
+
+        let ps_packed = decoded.entries.iter().find(|e| e.hash == ps_hash).unwrap();
+        assert_eq!(ps_packed.stage, ShaderStage::Fragment);
+        assert!(ps_packed.wgsl.contains("fn fs_main("));
+
+        let cs_packed = decoded.entries.iter().find(|e| e.hash == cs_hash).unwrap();
+        assert_eq!(cs_packed.stage, ShaderStage::Compute);
+        assert!(cs_packed.wgsl.contains("fn cs_main("));
+
+        let json = result.summary.to_json();
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(json.contains("\"vertex_packed\": 2"), "JSON:\n{json}");
+        assert!(json.contains("\"fragment_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"compute_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"failed\": 0"), "JSON:\n{json}");
+        assert!(json.contains("\"manifest_duplicates_skipped\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"naga_validated\": true"), "JSON:\n{json}");
+        assert!(json.contains("\"entry_point\": \"vs_main\""), "JSON:\n{json}");
+        assert!(json.contains("\"entry_point\": \"fs_main\""), "JSON:\n{json}");
+        assert!(json.contains("\"entry_point\": \"cs_main\""), "JSON:\n{json}");
+        assert!(json.contains("\"min_binding_size_bytes\": 48"), "JSON:\n{json}");
+        assert!(json.contains("\"failures\": []"), "JSON:\n{json}");
+        assert!(!json.contains(&root_str), "JSON must not leak host path");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_rdna2_manifest_strict_fails_on_bad_entries_and_best_effort_skips_cleanly() {
+        let root = make_temp_dir("playgta6_rdna2_manifest_best_effort");
+        let native_dir = root.join("native");
+        fs::create_dir_all(&native_dir).unwrap();
+
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let vs_hash = fnv1a_64(&vs_bytes);
+        let vs_id = format_shader_hash(vs_hash);
+        fs::write(native_dir.join(format!("{vs_id}.bin")), &vs_bytes).unwrap();
+
+        // Corrupt/tampered blob whose actual FNV-1a does NOT match declared code_identity.
+        let bad_hash_id = "0xdeadbeef00000001";
+        fs::write(native_dir.join(format!("{bad_hash_id}.bin")), build_minimal_compute_rdna2())
+            .unwrap();
+
+        // Truncated 2-byte blob whose FNV-1a matches its declared code_identity, but fails MIN_RDNA2_BLOB_BYTES.
+        let short_bytes = [0x01u8, 0x02u8];
+        let short_hash = fnv1a_64(&short_bytes);
+        let short_id = format_shader_hash(short_hash);
+        fs::write(native_dir.join(format!("{short_id}.bin")), short_bytes).unwrap();
+
+        // Missing file entry.
+        let missing_id = "0xdeadbeef00000002";
+
+        // 1) Hash mismatch manifest -> strict returns HashMismatch, best-effort skips & reports.
+        let mismatch_manifest = root.join("mismatch_manifest.json");
+        fs::write(
+            &mismatch_manifest,
+            format!(
+                r#"{{
+  "schema": "playgta6-pipeline-dump",
+  "schema_version": 1,
+  "native_stages": [
+    {{"code_identity": "{vs_id}", "stage": "vertex", "code_file": "native/{vs_id}.bin"}},
+    {{"code_identity": "{bad_hash_id}", "stage": "compute", "code_file": "native/{bad_hash_id}.bin"}}
+  ]
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let strict_err = pack_rdna2_manifest(&mismatch_manifest, &Rdna2PackOptions::default())
+            .expect_err("strict manifest mode must fail on FNV-1a hash mismatch");
+        assert!(matches!(
+            strict_err,
+            Rdna2PackError::HashMismatch {
+                expected: 0xdead_beef_0000_0001,
+                stage: ShaderStage::Compute,
+                ..
+            }
+        ));
+
+        // 2) Mixed manifest with 1 good VS + 3 bad entries (hash mismatch, truncated, missing).
+        let mixed_manifest = root.join("mixed_manifest.json");
+        fs::write(
+            &mixed_manifest,
+            format!(
+                r#"{{
+  "schema": "playgta6-pipeline-dump",
+  "schema_version": 1,
+  "native_stages": [
+    {{"code_identity": "{vs_id}", "stage": "vertex", "code_file": "native/{vs_id}.bin"}},
+    {{"code_identity": "{bad_hash_id}", "stage": "compute", "code_file": "native/{bad_hash_id}.bin"}},
+    {{"code_identity": "{short_id}", "stage": "pixel", "code_file": "native/{short_id}.bin"}},
+    {{"code_identity": "{missing_id}", "stage": "pixel", "code_file": "native/{missing_id}.bin"}}
+  ]
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let best_effort_opts = Rdna2PackOptions {
+            best_effort: true,
+            ..Rdna2PackOptions::default()
+        };
+        let res = pack_rdna2_manifest(&mixed_manifest, &best_effort_opts)
+            .expect("--best-effort manifest mode should pack valid shaders and skip bad ones");
+
+        assert_eq!(res.summary.total_blobs, 4);
+        assert_eq!(res.summary.translated_ok, 1);
+        assert_eq!(res.summary.vertex_packed, 1);
+        assert_eq!(res.summary.fragment_packed, 0);
+        assert_eq!(res.summary.compute_packed, 0);
+        assert_eq!(res.summary.failed, 3);
+        assert_eq!(res.summary.skipped_or_failed, 3);
+        assert_eq!(res.summary.failures.len(), 3);
+
+        let decoded = read_pack(&res.pack_bytes).unwrap();
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].hash, vs_hash);
+        assert_naga_wgsl_valid(&decoded.entries[0].wgsl);
+
+        let json = res.summary.to_json();
+        let text = res.summary.to_text();
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(json.contains("\"vertex_packed\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"failed\": 3"), "JSON:\n{json}");
+        assert!(json.contains("\"failures\": ["), "JSON:\n{json}");
+        assert!(json.contains("FNV-1a 64 hash mismatch"), "JSON:\n{json}");
+        assert!(!json.contains(&root_str), "JSON must never leak host path");
+        assert!(!text.contains(&root_str), "text must never leak host path");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_rdna2_sources_combines_manifest_and_directory_with_manifest_precedence() {
+        let root = make_temp_dir("playgta6_rdna2_sources_combined");
+        let dump_dir = root.join("dump");
+        let native_dir = dump_dir.join("native");
+        let extra_dir = root.join("extra");
+        fs::create_dir_all(&native_dir).unwrap();
+        fs::create_dir_all(&extra_dir).unwrap();
+
+        // Bare shader with no EXP/barrier: manifest explicitly labels it Vertex, while directory
+        // scan without hints would infer Compute. Manifest MUST take precedence!
+        let shared_bytes = words_to_bytes(&[enc_vop1(0x01, 0, 242), enc_sopp(0x01, 0)]);
+        let shared_hash = fnv1a_64(&shared_bytes);
+        let shared_id = format_shader_hash(shared_hash);
+        fs::write(native_dir.join(format!("{shared_id}.bin")), &shared_bytes).unwrap();
+        fs::write(extra_dir.join(format!("{shared_id}.bin")), &shared_bytes).unwrap();
+
+        // Extra PS only in positional directory
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        let ps_hash = fnv1a_64(&ps_bytes);
+        fs::write(extra_dir.join("splash_ps.bin"), &ps_bytes).unwrap();
+
+        let manifest_path = dump_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+  "schema": "playgta6-pipeline-dump",
+  "schema_version": 1,
+  "native_stages": [
+    {{"code_identity": "{shared_id}", "stage": "vertex", "code_file": "native/{shared_id}.bin"}}
+  ]
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let res = pack_rdna2_sources(
+            Some(&extra_dir),
+            Some(&manifest_path),
+            &Rdna2PackOptions::default(),
+        )
+        .expect("combined manifest + directory pack should succeed");
+
+        assert_eq!(res.summary.translated_ok, 2);
+        assert_eq!(res.summary.vertex_packed, 1);
+        assert_eq!(res.summary.fragment_packed, 1);
+        assert_eq!(res.summary.compute_packed, 0);
+        assert_eq!(res.summary.failed, 0);
+        assert_eq!(res.summary.skipped_or_failed, 1); // duplicate hash from extra_dir skipped
+
+        let decoded = read_pack(&res.pack_bytes).unwrap();
+        let shared_entry = decoded.entries.iter().find(|e| e.hash == shared_hash).unwrap();
+        assert_eq!(shared_entry.stage, ShaderStage::Vertex);
+        assert!(shared_entry.wgsl.contains("fn vs_main("));
+        let ps_entry = decoded.entries.iter().find(|e| e.hash == ps_hash).unwrap();
+        assert_eq!(ps_entry.stage, ShaderStage::Fragment);
+        assert!(ps_entry.wgsl.contains("fn fs_main("));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
