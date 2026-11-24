@@ -94,7 +94,7 @@ constexpr WgpuTextureFormatInfo kTextureFormatInfo[] = {
     {"rgba8sint", kR | kM | kA | kI, 0, 0, 0, 4, 1, F::Undefined},
     {"bgra8unorm", kR | kB | kM | kA, 0, 0, 0, 8, 1, F::Undefined},
     {"bgra8unorm-srgb", kR | kB | kM | kA | kG, 0, 0, 0, 8, 1, F::Undefined},
-    {"rgb9e5ufloat", 0, 0, 0, 0, 0, 0, F::Undefined},
+    {"rgb9e5ufloat", 0, 0, 0, 0, 0, 0, F::Rgba16Float},
     {"rgb10a2uint", kR | kM | kA | kI, 0, 0, 0, 8, 4, F::Undefined},
     {"rgb10a2unorm", kR | kB | kM | kA, 0, 0, 0, 8, 4, F::Undefined},
     {"rg11b10ufloat", 0, 0, Feat::Rg11b10UfloatRenderable, Feat::Rg11b10UfloatRenderable, 8, 4,
@@ -513,8 +513,7 @@ TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, ui
 
     if (usage == FormatUsage::RenderTarget && !is_color_renderable(chosen, features)) {
         const auto& cur = texture_format_info(chosen);
-        if (cur.renderable_feature != 0 && (features & cur.renderable_feature) == 0 &&
-            cur.fallback != F::Undefined && is_color_renderable(cur.fallback, features)) {
+        if (cur.fallback != F::Undefined && is_color_renderable(cur.fallback, features)) {
             chosen = cur.fallback;
             m.diagnostics |= FormatDiag::FeatureFallback;
         } else {
