@@ -22,6 +22,9 @@ use playgta6_shaders::pack::{
     SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, read_pack, render_blocker_report_md,
     render_shader_index_json, write_pack_with_layout,
 };
+use playgta6_shaders::rdna2::{
+    analyze_instructions, decode_program, format_disasm_with_summary, to_json_with_disasm,
+};
 use playgta6_shaders::reflect::{
     LAYOUT_MANIFEST_FILE_NAME, ReflectError, RegisterConvention, build_layout_manifest,
     parse_pipeline_list, reflect_spirv_bytes,
@@ -63,6 +66,11 @@ enum Command {
         out_path: Option<PathBuf>,
         json: bool,
     },
+    DisasmRdna2 {
+        file_path: PathBuf,
+        json: bool,
+        max_instructions: Option<usize>,
+    },
 }
 
 fn print_usage() {
@@ -80,6 +88,7 @@ fn print_usage() {
         "  playgta6-shaders reflect --spirv <dir> --out <dir> [--pipelines <list.txt>] [--register-shift <b|t|u|s>=<n>]... [--no-sanitize] [--no-lower]"
     );
     eprintln!("  playgta6-shaders reflect-dxil <file-or-dir> [--out <json>] [--json]");
+    eprintln!("  playgta6-shaders disasm-rdna2 <file> [--json] [--max-instructions <N>]");
     eprintln!();
     eprintln!(
         "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> Naga lower -> WGSL -> .wgsl.pack"
@@ -320,8 +329,52 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 json,
             })
         }
+        "disasm-rdna2" => {
+            let mut file_path: Option<PathBuf> = None;
+            let mut json = false;
+            let mut max_instructions: Option<usize> = None;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--json" => json = true,
+                    "--max-instructions" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --max-instructions".to_string())?;
+                        let parsed = val.parse::<usize>().map_err(|_| {
+                            format!("invalid integer for --max-instructions: {val}")
+                        })?;
+                        max_instructions = Some(parsed);
+                    }
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option for disasm-rdna2: {other}"));
+                    }
+                    path_arg => {
+                        if file_path.is_some() {
+                            return Err(format!(
+                                "unexpected extra argument for disasm-rdna2: {path_arg}"
+                            ));
+                        }
+                        file_path = Some(PathBuf::from(path_arg));
+                    }
+                }
+                i += 1;
+            }
+
+            let file_path = file_path.ok_or_else(|| {
+                "disasm-rdna2 requires <file> [--json] [--max-instructions <N>]".to_string()
+            })?;
+
+            Ok(Command::DisasmRdna2 {
+                file_path,
+                json,
+                max_instructions,
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', or 'reflect-dxil')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', 'reflect-dxil', or 'disasm-rdna2')"
         )),
     }
 }
@@ -873,6 +926,37 @@ fn run_reflect_dxil(target_path: &Path, out_path: Option<&Path>, json_flag: bool
     Ok(())
 }
 
+fn format_disasm_rdna2(
+    file_path: &Path,
+    json: bool,
+    max_instructions: Option<usize>,
+) -> Result<String, String> {
+    let source = sanitize_source_path(file_path, None);
+    let bytes = fs::read(file_path)
+        .map_err(|err| format!("failed to read RDNA2 shader file {source}: {err}"))?;
+    let instructions = decode_program(&bytes);
+    let summary = analyze_instructions(&bytes, &instructions);
+    if json {
+        Ok(to_json_with_disasm(&summary, &instructions, max_instructions))
+    } else {
+        Ok(format_disasm_with_summary(
+            &summary,
+            &instructions,
+            max_instructions,
+        ))
+    }
+}
+
+fn run_disasm_rdna2(
+    file_path: &Path,
+    json: bool,
+    max_instructions: Option<usize>,
+) -> Result<(), String> {
+    let rendered = format_disasm_rdna2(file_path, json, max_instructions)?;
+    print!("{rendered}");
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -979,6 +1063,17 @@ fn main() -> ExitCode {
             out_path,
             json,
         }) => match run_reflect_dxil(&target_path, out_path.as_deref(), json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::DisasmRdna2 {
+            file_path,
+            json,
+            max_instructions,
+        }) => match run_disasm_rdna2(&file_path, json, max_instructions) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1473,6 +1568,89 @@ mod tests {
             !dir_json.contains(&root_str),
             "host path must never appear in directory reflection JSON"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_parses_disasm_rdna2_arguments() {
+        let cmd = parse_args(&[
+            "disasm-rdna2".to_string(),
+            "splash_ps.bin".to_string(),
+            "--json".to_string(),
+            "--max-instructions".to_string(),
+            "64".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::DisasmRdna2 {
+                file_path: PathBuf::from("splash_ps.bin"),
+                json: true,
+                max_instructions: Some(64),
+            }
+        );
+
+        let cmd_min = parse_args(&["disasm-rdna2".to_string(), "vs.bin".to_string()]).unwrap();
+        assert_eq!(
+            cmd_min,
+            Command::DisasmRdna2 {
+                file_path: PathBuf::from("vs.bin"),
+                json: false,
+                max_instructions: None,
+            }
+        );
+
+        assert!(parse_args(&["disasm-rdna2".to_string()]).is_err());
+        assert!(
+            parse_args(&[
+                "disasm-rdna2".to_string(),
+                "vs.bin".to_string(),
+                "--max-instructions".to_string(),
+                "not-a-number".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "disasm-rdna2".to_string(),
+                "vs.bin".to_string(),
+                "--bogus".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn end_to_end_disasm_rdna2_emits_sanitized_text_and_json() {
+        let root = make_temp_dir("playgta6_shaders_disasm_rdna2");
+        let bin_path = root.join("splash_vs.bin");
+
+        // Synthetic VS: v_mov_b32 v0, 1.0; exp pos0 v0, v0, v0, v0 done; s_endpgm
+        let words: Vec<u32> = vec![
+            (0b0111_111u32 << 25) | (0u32 << 17) | (0x01u32 << 9) | 242, // v_mov_b32 v0, 1.0
+            (0b111110u32 << 26) | (1u32 << 11) | (12u32 << 4) | 0xF,     // exp pos0 ... done
+            0x0000_0000,                                                 // v0, v0, v0, v0
+            (0b1011_1111_1u32 << 23) | (0x01u32 << 16),                  // s_endpgm
+        ];
+        fs::write(&bin_path, words_to_bytes(&words)).unwrap();
+
+        let text = format_disasm_rdna2(&bin_path, false, Some(2)).unwrap();
+        assert!(text.contains("; stage:        vertex"));
+        assert!(text.contains("v_mov_b32 v0, 1.0"));
+        assert!(text.contains("exp pos0 v0, v0, v0, v0 done"));
+        assert!(text.contains("1 more instruction(s) omitted"));
+
+        let json = format_disasm_rdna2(&bin_path, true, Some(2)).unwrap();
+        assert!(json.contains("\"isa\": \"rdna2_gfx10_3\""));
+        assert!(json.contains("\"inferred_stage\": \"vertex\""));
+        assert!(json.contains("\"instruction_count\": 3"));
+        assert!(json.contains("\"shown_instructions\": 2"));
+
+        // Strictly sanitized: never leak host directory paths into text or JSON.
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(!text.contains(&root_str));
+        assert!(!json.contains(&root_str));
 
         let _ = fs::remove_dir_all(&root);
     }
