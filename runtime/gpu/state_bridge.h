@@ -93,6 +93,9 @@ struct TextureInfo {
     // Address the texture's descriptor words carry (descriptor_words.h): its memory address on the
     // console model, or a runtime-assigned range; 0 = none.
     uint64_t gpu_va = 0;
+    // Guest D3D12_TEXTURE_LAYOUT / Xbox swizzle layout (0 = unknown/linear, 1 = row-major,
+    // 0x100 = XG linear, >= 0x101 = tiled console swizzle mode).
+    uint32_t layout = 0;
 };
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
@@ -156,6 +159,11 @@ struct BridgeOptions {
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
+    // Guest texture-memory sync hook (G49b): invoked when a texture SRV is bound in a root
+    // descriptor table at draw/dispatch or submission refresh time. Inspects guest memory backing
+    // `resource_id` and emits WriteTexture into `encoder` if mip-0 bytes changed; returns true
+    // when a WriteTexture packet was emitted.
+    std::function<bool(uint32_t resource_id, CommandEncoder& encoder)> sync_texture_memory;
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
@@ -342,6 +350,7 @@ struct BridgeStats {
     uint64_t root_constant_uploads = 0;
     uint64_t clear_fallbacks_dropped = 0;
     uint64_t usage_conflicts = 0;
+    uint64_t texture_memory_syncs = 0;
 };
 
 class CommandListBridge {
@@ -411,6 +420,11 @@ public:
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
 
+    // Emits a WriteTexture packet into this command list's encoder stream (G49b).
+    void WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
+                      uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,
+                      uint32_t bytes_per_row, uint32_t rows_per_image, const void* data, uint32_t data_len);
+
     // ExecuteCommandLists: re-reads the descriptor memory of every bind group this list recorded over
     // memory-backed tables (the GPU reads a table when the draw executes) and rewrites the recorded
     // CreateBindGroup2 entries in place where the words changed. Packets it needs first (samplers)
@@ -453,6 +467,8 @@ private:
     // The CreateBindGroup2 entries for `cached` (samplers are interned through `side`).
     void gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
+    void sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
+                             CommandEncoder& target);
     void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);
     GpuTextureViewDesc texture_view_desc(const d3d::ViewDescriptor& view);
     uint32_t upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index);
