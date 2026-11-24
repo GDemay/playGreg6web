@@ -5,12 +5,15 @@
 #include "gpu/d3d12_xs_xbox.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "gpu/d3d12_guest_resources.h"
+#include "os/os_shim.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -396,7 +399,25 @@ bool FramePacer::is_shut_down() const {
 // Device: frame events
 // ---------------------------------------------------------------------------------------------
 
+namespace {
+std::atomic<uint64_t> g_frame_waits{0};
+std::atomic<uint64_t> g_frame_wait_us{0};
+std::atomic<uint64_t> g_frame_polls{0};
+std::atomic<uint64_t> g_frame_timeouts{0};
+}  // namespace
+
+xbox::FrameWaitTotals xbox::frame_wait_totals() {
+    FrameWaitTotals t;
+    t.waits = g_frame_waits.load(std::memory_order_relaxed);
+    t.wait_us = g_frame_wait_us.load(std::memory_order_relaxed);
+    t.polls = g_frame_polls.load(std::memory_order_relaxed);
+    t.timeouts = g_frame_timeouts.load(std::memory_order_relaxed);
+    return t;
+}
+
 HResult Device::SetFrameIntervalX(uint64_t, uint32_t interval_us, uint32_t period, uint32_t) {
+    os::log("d3d12_xs: frame interval set to " + std::to_string(interval_us) + " us, period " +
+            std::to_string(period));
     pacer_.set_interval(interval_us, period);
     count(xbox::Counter::FrameIntervalChanges);
     return kSOk;
@@ -419,13 +440,21 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
     uint64_t frame = 0;
     if (timeout_ms == 0) {
         // Poll: the current tick, never a failure (the executable traps if this fails).
+        g_frame_polls.fetch_add(1, std::memory_order_relaxed);
         frame = pacer_.current_frame();
     } else {
         // Type 2 with a token waits until that frame is over; otherwise until a tick newer than
         // the last one handed out.
         const uint64_t after = (type == 2 && in != 0) ? in : last_frame_token_.load();
+        const auto started = std::chrono::steady_clock::now();
         const auto r = pacer_.wait_after(after, timeout_ms, &frame);
+        g_frame_waits.fetch_add(1, std::memory_order_relaxed);
+        g_frame_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                            std::chrono::steady_clock::now() - started)
+                                                            .count()),
+                                  std::memory_order_relaxed);
         if (r == xbox::FramePacer::WaitResult::Timeout) {
+            g_frame_timeouts.fetch_add(1, std::memory_order_relaxed);
             count(xbox::Counter::FrameWaitTimeouts);
             token.write(frame);
             return static_cast<HResult>(0x887A0027u);  // DXGI_ERROR_WAIT_TIMEOUT

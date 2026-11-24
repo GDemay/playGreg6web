@@ -44,6 +44,17 @@ bool valid(Handle h) {
 // 1. Semaphores
 // ---------------------------------------------------------------------------
 
+// live_kernel_handles counts dispatcher objects in the handle table until they are closed.
+void test_live_kernel_handle_counts() {
+    const KernelHandleCounts before = live_kernel_handles();
+    const Handle a = CreateSemaphoreW(nullptr, 1, 3, nullptr);
+    const Handle b = CreateSemaphoreW(nullptr, 0, 1, nullptr);
+    CHECK(valid(a) && valid(b));
+    CHECK(live_kernel_handles().dispatcher == before.dispatcher + 2);
+    CHECK(CloseHandle(a) && CloseHandle(b));
+    CHECK(live_kernel_handles().dispatcher == before.dispatcher);
+}
+
 void test_semaphores() {
     // Parameter validation.
     CHECK(CreateSemaphoreW(nullptr, 2, 1, nullptr) == kNullHandle);
@@ -1180,6 +1191,7 @@ void test_critical_section_guest_storage() {
 int main() {
     test_critical_section_guest_storage();
     test_semaphores();
+    test_live_kernel_handle_counts();
     test_mutexes();
     test_events_and_timeouts();
     test_wait_multiple();

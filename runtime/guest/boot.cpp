@@ -167,7 +167,7 @@ struct ArenaRecord {
     uint32_t protect = 0;
 };
 
-constexpr size_t kArenaLogLimit = 4096;
+constexpr size_t kDefaultArenaLogLimit = 4096;
 
 // APIs whose first call is a timeline milestone, with the W40 milestone name where one exists.
 struct TimelineApi {
@@ -278,6 +278,7 @@ struct BootState {
     std::mutex arena_mutex;
     std::vector<ArenaRecord> arena_log;
     uint64_t arena_events = 0;
+    size_t arena_log_limit = kDefaultArenaLogLimit;
     uint64_t arena_failures = 0;
     std::unordered_map<uint64_t, uint64_t> live_reservations;  // base -> requested size
     uint64_t reserved_now = 0;
@@ -1062,7 +1063,7 @@ void boot_arena_observer(const os::VirtualMemoryArena& arena,
                 break;
         }
     }
-    if (b.arena_log.size() < kArenaLogLimit) {
+    if (b.arena_log.size() < b.arena_log_limit) {
         b.arena_log.push_back(ArenaRecord{t_last_import_seq, t_last_import, event, ok, va, size,
                                           static_cast<uint32_t>(protect)});
     }
@@ -2349,6 +2350,10 @@ LiveCounters live_counters() {
     LiveCounters c;
     c.dispatches = b.dispatches.load(std::memory_order_relaxed);
     c.import_calls = b.import_calls.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(b.arena_mutex);
+        c.arena_events = b.arena_events;
+    }
     return c;
 }
 
@@ -2489,6 +2494,10 @@ BootResult run_boot(const BootConfig& config) {
     b.arena_observer_installed = true;
     b.host_function_start = config.host_function_start;
     b.off_thread_fault = config.off_thread_fault;
+    {
+        std::lock_guard<std::mutex> lock(b.arena_mutex);
+        b.arena_log_limit = config.arena_log_limit;
+    }
     b.off_thread_fault_taken = false;
     b.arena = config.arena != nullptr ? config.arena : os::win32::get_vmem_arena();
     // One arena everywhere: O16 bridge objects and lazily created guest threads live in it too.

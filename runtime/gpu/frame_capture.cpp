@@ -253,9 +253,14 @@ void frame_capture_finish() {
         const PresentSample& p = s.presents[i];
         std::fprintf(side,
                      "%s\n    {\"index\": %zu, \"wall_ms\": %.3f, \"dispatches\": %" PRIu64 ", \"import_calls\": %" PRIu64
-                     ", \"reserved_bytes\": %" PRIu64 ", \"committed_bytes\": %" PRIu64 "}",
+                     ", \"reserved_bytes\": %" PRIu64 ", \"committed_bytes\": %" PRIu64 ", \"counters\": {",
                      i == 0 ? "" : ",", i, p.wall_ms, p.counters.dispatches, p.counters.import_calls,
                      p.counters.reserved_bytes, p.counters.committed_bytes);
+        for (size_t k = 0; k < p.counters.counters.size(); ++k) {
+            std::fprintf(side, "%s\"%s\": %" PRIu64, k == 0 ? "" : ", ",
+                         json_escape(p.counters.counters[k].first).c_str(), p.counters.counters[k].second);
+        }
+        std::fprintf(side, "}}");
     }
     std::fprintf(side, "%s],\n  \"omitted\": [", s.presents.empty() ? "" : "\n  ");
     for (size_t i = 0; i < s.omitted.size(); ++i) {

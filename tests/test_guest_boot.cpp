@@ -1024,6 +1024,14 @@ void test_observability() {
         }
     }
     CHECK(image_reserve);
+    // The log keeps at most BootConfig::arena_log_limit events (all are counted).
+    {
+        const Run limited = boot_scenario(Scenario::LastError, [](BootConfig& cfg) { cfg.arena_log_limit = 2; });
+        const Json& s = limited.report["address_space"];
+        CHECK(s["log"].items.size() == 2);
+        CHECK(s["events"].number > 2);
+        CHECK(s["log_truncated"].boolean);
+    }
     CHECK(run.report["first_calls"].type == Json::Array);
     CHECK(run.report["recent_dispatches"].type == Json::Array);
 
