@@ -7,9 +7,13 @@ import {
   HUD_ACTIONS,
   DEFAULT_FILENAMES,
   BOOT_MODE,
+  AUDIO_OUTPUT_STATE,
+  INDIRECT_DISPATCH_MODE,
   DEFAULT_MAX_VALIDATION_ERRORS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   normalizeBootMode,
+  normalizeAudioOutputState,
+  normalizeIndirectDispatchMode,
   sanitizeValidationErrorMessage,
   parseSideModuleProgressLabel,
 } from '../web/ui/hud_controller.js';
@@ -1969,4 +1973,396 @@ test('W78: end-to-end bootstrapPlayGta6App + BroadcastChannel game-progress + Hu
 
   hudController.destroy();
   await app.destroy();
+});
+
+// --- W87: Honest GPU, Audio & 52-Thread Pthread Telemetry ---
+
+test('W87: GPU telemetry keeps realPackDrawCount strictly separate from fallbackDrawCount and syncs validation errors', () => {
+  const bootModeBadge = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+  const validationCountEl = createDisplayMockElement();
+  const validationBannerEl = createDisplayMockElement({ hidden: true });
+  const hud = createMockHud();
+
+  let nowMs = 1700002000000;
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    now: () => nowMs,
+    displayElements: {
+      bootModeBadge,
+      bootStatusEl,
+      validationCountEl,
+      validationBannerEl,
+    },
+  });
+
+  // Initial defaults are zeroed and do not bloat HUD status text.
+  const initial = controller.getTelemetry();
+  assert.equal(initial.gpu.realPackDrawCount, 0);
+  assert.equal(initial.gpu.fallbackDrawCount, 0);
+  assert.equal(initial.gpu.presentCount, 0);
+  assert.equal(initial.gpu.unboundBindGroupCount, 0);
+  assert.equal(initial.gpu.skippedDrawCount, 0);
+  assert.equal(initial.gpu.validationErrorCount, 0);
+  assert.equal(initial.gpu.totalDrawCount, 0);
+  assert.equal(initial.gpu.hasRealPackDraws, false);
+  assert.equal(initial.gpu.hasFallbackDraws, false);
+  assert.equal(initial.gpu.statusText, '');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+
+  // 1. Fallback-only draws must NEVER be conflated into realPackDrawCount.
+  nowMs += 100;
+  const fallbackOnly = controller.updateGpuStats({
+    type: 'gpu-stats',
+    stats: {
+      realPackDrawCount: 0,
+      fallbackDrawCount: 7,
+      presentCount: 2,
+      unboundBindGroupCount: 1,
+      skippedDrawCount: 3,
+      validationErrorCount: 0,
+    },
+  });
+  assert.equal(fallbackOnly.realPackDrawCount, 0);
+  assert.equal(fallbackOnly.fallbackDrawCount, 7);
+  assert.equal(fallbackOnly.presentCount, 2);
+  assert.equal(fallbackOnly.unboundBindGroupCount, 1);
+  assert.equal(fallbackOnly.skippedDrawCount, 3);
+  assert.equal(fallbackOnly.validationErrorCount, 0);
+  assert.equal(fallbackOnly.totalDrawCount, 7);
+  assert.equal(fallbackOnly.hasRealPackDraws, false);
+  assert.equal(fallbackOnly.hasFallbackDraws, true);
+  assert.equal(fallbackOnly.statusText, 'Draws: 0 real, 7 fallback (2 presents)');
+  assert.match(bootStatusEl.textContent, /Draws: 0 real, 7 fallback \(2 presents\)/);
+  assert.equal(bootModeBadge.title, bootStatusEl.textContent);
+
+  // 2. Real-pack + fallback draws with validation errors update validation pill cleanly.
+  nowMs += 100;
+  controller.updateTelemetry({
+    type: 'gpu-stats',
+    realPackDrawCount: 18,
+    fallbackDrawCount: 2,
+    presentCount: 5,
+    unboundBindGroupCount: 0,
+    skippedDrawCount: 1,
+    validationErrorCount: 3,
+  });
+  const snap = controller.getSnapshot();
+  assert.equal(snap.telemetry.gpu.realPackDrawCount, 18);
+  assert.equal(snap.telemetry.gpu.fallbackDrawCount, 2);
+  assert.equal(snap.telemetry.gpu.presentCount, 5);
+  assert.equal(snap.telemetry.gpu.unboundBindGroupCount, 0);
+  assert.equal(snap.telemetry.gpu.skippedDrawCount, 1);
+  assert.equal(snap.telemetry.gpu.validationErrorCount, 3);
+  assert.equal(snap.telemetry.gpu.totalDrawCount, 20);
+  assert.equal(snap.telemetry.gpu.hasRealPackDraws, true);
+  assert.equal(snap.telemetry.gpu.hasFallbackDraws, true);
+  assert.equal(snap.telemetry.gpu.statusText, 'Draws: 18 real, 2 fallback (5 presents)');
+  assert.equal(validationCountEl.textContent, '3');
+  assert.equal(validationCountEl.dataset.count, '3');
+  assert.equal(validationCountEl.dataset.state, 'err');
+  assert.equal(validationBannerEl.hidden, false);
+  assert.equal(snap.bootStatus.statusLevel, 'error');
+  assert.match(snap.bootStatus.statusText, /3 WebGPU validation errors/);
+
+  // 3. Real-pack-only draws (fallback = 0) format concisely without fallback noise.
+  controller.clearValidationErrors();
+  assert.equal(controller.getTelemetry().gpu.validationErrorCount, 0);
+  assert.equal(validationCountEl.textContent, '0');
+  assert.equal(validationCountEl.dataset.state, 'ok');
+
+  controller.updateGpuBootTelemetry({
+    gpuStats: {
+      realPackDrawCount: 24,
+      fallbackDrawCount: 0,
+      presentCount: 6,
+    },
+  });
+  const realOnly = controller.getTelemetry().gpu;
+  assert.equal(realOnly.realPackDrawCount, 24);
+  assert.equal(realOnly.fallbackDrawCount, 0);
+  assert.equal(realOnly.presentCount, 6);
+  assert.equal(realOnly.statusText, 'Draws: 24 real (6 presents)');
+  assert.match(bootStatusEl.textContent, /Draws: 24 real \(6 presents\)/);
+  assert.doesNotMatch(bootStatusEl.textContent, /fallback/i);
+
+  controller.destroy();
+});
+
+test('W87: Audio telemetry tracks outputState (active / suspended / headless-drain) and drain/xrun counters', () => {
+  assert.equal(normalizeAudioOutputState('active'), AUDIO_OUTPUT_STATE.ACTIVE);
+  assert.equal(normalizeAudioOutputState('running'), AUDIO_OUTPUT_STATE.ACTIVE);
+  assert.equal(normalizeAudioOutputState('suspended'), AUDIO_OUTPUT_STATE.SUSPENDED);
+  assert.equal(normalizeAudioOutputState('headless-drain'), AUDIO_OUTPUT_STATE.HEADLESS_DRAIN);
+  assert.equal(normalizeAudioOutputState('headless_drain'), AUDIO_OUTPUT_STATE.HEADLESS_DRAIN);
+  assert.equal(normalizeAudioOutputState('unknown-bogus'), AUDIO_OUTPUT_STATE.SUSPENDED);
+  assert.equal(normalizeAudioOutputState(null), AUDIO_OUTPUT_STATE.SUSPENDED);
+
+  const bootStatusEl = createDisplayMockElement();
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: { bootStatusEl },
+  });
+
+  // Initial audio state defaults to suspended with zero counters and empty status fragment.
+  const initAudio = controller.getTelemetry().audio;
+  assert.equal(initAudio.outputState, 'suspended');
+  assert.equal(initAudio.framesDrained, 0);
+  assert.equal(initAudio.underruns, 0);
+  assert.equal(initAudio.overruns, 0);
+  assert.equal(initAudio.statusText, '');
+
+  // 1. Headless drain mode (e.g. Chrome autoplay suspended -> headless drain ring).
+  const drain = controller.updateAudioStats({
+    type: 'audio-stats',
+    outputState: 'headless-drain',
+    framesDrained: 4096,
+    underruns: 0,
+    overruns: 2,
+  });
+  assert.equal(drain.outputState, 'headless-drain');
+  assert.equal(drain.framesDrained, 4096);
+  assert.equal(drain.underruns, 0);
+  assert.equal(drain.overruns, 2);
+  assert.equal(drain.statusText, 'Audio: headless-drain (4096 drained, 2 overruns)');
+  assert.match(bootStatusEl.textContent, /Audio: headless-drain \(4096 drained, 2 overruns\)/);
+
+  // 2. Transition to active output via unified updateTelemetry + overflows alias.
+  controller.updateTelemetry({
+    type: 'audio-stats',
+    stats: {
+      outputState: 'active',
+      framesDrained: 96000,
+      underruns: 1,
+      overflows: 0,
+    },
+  });
+  const active = controller.getTelemetry().audio;
+  assert.equal(active.outputState, 'active');
+  assert.equal(active.framesDrained, 96000);
+  assert.equal(active.underruns, 1);
+  assert.equal(active.overruns, 0);
+  assert.equal(active.statusText, 'Audio: active (96000 drained, 1 underrun)');
+
+  // 3. Transition back to suspended.
+  controller.updateAudioStats({ outputState: 'suspended', framesDrained: 96000, underruns: 1, overruns: 0 });
+  assert.equal(controller.getTelemetry().audio.outputState, 'suspended');
+
+  controller.destroy();
+});
+
+test('W87: 52-thread Pthread burst telemetry tracks active/peak high-water mark, queue depth, and shard dispatch mode', () => {
+  assert.equal(normalizeIndirectDispatchMode('shard'), INDIRECT_DISPATCH_MODE.SHARD);
+  assert.equal(normalizeIndirectDispatchMode('pg6_shard'), INDIRECT_DISPATCH_MODE.SHARD);
+  assert.equal(normalizeIndirectDispatchMode('table'), INDIRECT_DISPATCH_MODE.TABLE);
+  assert.equal(normalizeIndirectDispatchMode('unknown'), INDIRECT_DISPATCH_MODE.UNKNOWN);
+  assert.equal(normalizeIndirectDispatchMode('invalid'), INDIRECT_DISPATCH_MODE.UNKNOWN);
+  assert.equal(normalizeIndirectDispatchMode(42), INDIRECT_DISPATCH_MODE.UNKNOWN);
+
+  const bootStatusEl = createDisplayMockElement();
+  const sideModuleStatusEl = createDisplayMockElement();
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: { bootStatusEl, sideModuleStatusEl },
+  });
+
+  controller.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 5 });
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 5/5 loaded');
+
+  // 52-thread burst with shard indirect dispatch (W86 / R37).
+  const burst = controller.updatePthreadStats({
+    pthreadSpawnedCount: 52,
+    pthreadActiveCount: 52,
+    pthreadPeakCount: 52,
+    pthreadLoadQueueDepth: 14,
+    indirectDispatch: 'shard',
+  });
+  assert.equal(burst.pthreadSpawnedCount, 52);
+  assert.equal(burst.pthreadActiveCount, 52);
+  assert.equal(burst.pthreadPeakCount, 52);
+  assert.equal(burst.pthreadLoadQueueDepth, 14);
+  assert.equal(burst.indirectDispatch, 'shard');
+  assert.equal(burst.statusText, 'Threads: 52/52 [shard]');
+  assert.match(bootStatusEl.textContent, /Threads: 52\/52 \[shard\]/);
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 5/5 loaded · Threads: 52/52 [shard]');
+  assert.equal(sideModuleStatusEl.dataset.loaded, '5');
+  assert.equal(sideModuleStatusEl.dataset.total, '5');
+
+  // As threads complete, active count drops while peak remains 52.
+  const settled = controller.updateTelemetry({
+    type: 'pthread-stats',
+    pthreadActiveCount: 8,
+    pthreadLoadQueueDepth: 0,
+  });
+  assert.equal(settled.pthread.pthreadSpawnedCount, 52);
+  assert.equal(settled.pthread.pthreadActiveCount, 8);
+  assert.equal(settled.pthread.pthreadPeakCount, 52);
+  assert.equal(settled.pthread.pthreadLoadQueueDepth, 0);
+  assert.equal(settled.pthread.indirectDispatch, 'shard');
+  assert.equal(settled.pthread.statusText, 'Threads: 8/52 [shard]');
+
+  // Table dispatch mode update.
+  controller.updatePthreadStats({ indirectDispatch: 'table' });
+  assert.equal(controller.getTelemetry().pthread.indirectDispatch, 'table');
+  assert.equal(controller.getTelemetry().pthread.statusText, 'Threads: 8/52 [table]');
+
+  controller.destroy();
+});
+
+test('W87: malformed, NaN, negative, and hostile telemetry inputs are safely sanitized without throwing', async () => {
+  const bootStatusEl = createDisplayMockElement();
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: { bootStatusEl },
+  });
+
+  // Non-object / null / primitive inputs never throw.
+  assert.doesNotThrow(() => {
+    controller.updateGpuStats(null);
+    controller.updateGpuStats(undefined);
+    controller.updateGpuStats('hostile');
+    controller.updateGpuStats([]);
+    controller.updateAudioStats(null);
+    controller.updateAudioStats(123);
+    controller.updatePthreadStats(undefined);
+    controller.updateTelemetry(null);
+    controller.updateTelemetry(42);
+    controller.updateTelemetry([]);
+  });
+
+  // Throwing getters, NaN, Infinity, negatives, booleans, Symbols, and hostile paths/strings.
+  const hostileGpu = {
+    realPackDrawCount: Number.NaN,
+    fallbackDrawCount: -99,
+    presentCount: Number.POSITIVE_INFINITY,
+    unboundBindGroupCount: Number.NEGATIVE_INFINITY,
+    skippedDrawCount: true,
+    validationErrorCount: Symbol('bad'),
+    get extraEvil() {
+      throw new Error('getter explosion');
+    },
+  };
+  const hostileAudio = {
+    outputState: 'C:\\Users\\secretuser\\GTA6\\audio.awc',
+    framesDrained: -4096,
+    underruns: 'not-a-number',
+    overruns: { valueOf() { throw new Error('valueOf boom'); } },
+  };
+  const hostilePthread = {
+    pthreadSpawnedCount: -52,
+    pthreadActiveCount: Number.NaN,
+    pthreadPeakCount: -10,
+    pthreadLoadQueueDepth: '1e999',
+    indirectDispatch: '/home/alice/private/guest.wasm<script>alert(1)</script>',
+  };
+
+  assert.doesNotThrow(() => {
+    controller.updateTelemetry({
+      gpu: hostileGpu,
+      audio: hostileAudio,
+      pthread: hostilePthread,
+    });
+  });
+
+  const snap = controller.getSnapshot();
+  assert.equal(snap.telemetry.gpu.realPackDrawCount, 0);
+  assert.equal(snap.telemetry.gpu.fallbackDrawCount, 0);
+  assert.equal(snap.telemetry.gpu.presentCount, 0);
+  assert.equal(snap.telemetry.gpu.unboundBindGroupCount, 0);
+  assert.equal(snap.telemetry.gpu.skippedDrawCount, 0);
+  assert.equal(snap.telemetry.gpu.validationErrorCount, 0);
+
+  assert.equal(snap.telemetry.audio.outputState, 'suspended');
+  assert.equal(snap.telemetry.audio.framesDrained, 0);
+  assert.equal(snap.telemetry.audio.underruns, 0);
+  assert.equal(snap.telemetry.audio.overruns, 0);
+
+  assert.equal(snap.telemetry.pthread.pthreadSpawnedCount, 0);
+  assert.equal(snap.telemetry.pthread.pthreadActiveCount, 0);
+  assert.equal(snap.telemetry.pthread.pthreadPeakCount, 0);
+  assert.equal(snap.telemetry.pthread.pthreadLoadQueueDepth, 0);
+  assert.equal(snap.telemetry.pthread.indirectDispatch, 'unknown');
+
+  // Zero hostile paths, usernames, or game archive strings in serialized snapshot.
+  const serialized = JSON.stringify(snap);
+  assert.doesNotMatch(serialized, /secretuser|alice|audio\.awc|<script>/i);
+
+  // BigInt & float clamping work safely.
+  controller.updateGpuStats({
+    realPackDrawCount: 15n,
+    fallbackDrawCount: -5n,
+    presentCount: 3.9,
+    skippedDrawCount: 999999999999999999999n,
+  });
+  const clamped = controller.getTelemetry().gpu;
+  assert.equal(clamped.realPackDrawCount, 15);
+  assert.equal(clamped.fallbackDrawCount, 0);
+  assert.equal(clamped.presentCount, 3);
+  assert.equal(clamped.skippedDrawCount, Number.MAX_SAFE_INTEGER);
+
+  // Returned snapshots are defensive copies (external mutation does not corrupt internal state).
+  const copy = controller.getTelemetry();
+  copy.gpu.realPackDrawCount = 9999;
+  copy.audio.outputState = 'active';
+  copy.pthread.pthreadPeakCount = 9999;
+  assert.equal(controller.getTelemetry().gpu.realPackDrawCount, 15);
+  assert.equal(controller.getTelemetry().audio.outputState, 'suspended');
+  assert.equal(controller.getTelemetry().pthread.pthreadPeakCount, 0);
+
+  // resetTelemetry clears all domains cleanly.
+  controller.updatePthreadStats({ pthreadSpawnedCount: 52, pthreadActiveCount: 52, indirectDispatch: 'shard' });
+  const reset = controller.resetTelemetry();
+  assert.equal(reset.gpu.realPackDrawCount, 0);
+  assert.equal(reset.audio.outputState, 'suspended');
+  assert.equal(reset.pthread.pthreadPeakCount, 0);
+  assert.equal(reset.pthread.indirectDispatch, 'unknown');
+
+  // After destroy(), telemetry mutators safely no-op.
+  controller.destroy();
+  controller.updateGpuStats({ realPackDrawCount: 42 });
+  controller.updateAudioStats({ outputState: 'active', framesDrained: 1024 });
+  controller.updatePthreadStats({ pthreadSpawnedCount: 52, pthreadActiveCount: 52 });
+  assert.equal(controller.getTelemetry().gpu.realPackDrawCount, 0);
+  assert.equal(controller.getTelemetry().audio.outputState, 'suspended');
+  assert.equal(controller.getTelemetry().pthread.pthreadSpawnedCount, 0);
+});
+
+test('W87: restartSession resets stale GPU, Audio, and Pthread telemetry cleanly', async () => {
+  const sessionController = new RuntimeSessionController({
+    capabilityProbe: async () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    startWasmRuntime: async () => ({ stop() {} }),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const controller = new HudController({
+    hud: createMockHud(),
+    sessionController,
+  });
+
+  controller.updateTelemetry({
+    gpu: { realPackDrawCount: 10, fallbackDrawCount: 2, presentCount: 4 },
+    audio: { outputState: 'active', framesDrained: 2048, underruns: 1, overruns: 0 },
+    pthread: { pthreadSpawnedCount: 52, pthreadActiveCount: 16, pthreadPeakCount: 52, indirectDispatch: 'shard' },
+  });
+  assert.equal(controller.getTelemetry().gpu.realPackDrawCount, 10);
+  assert.equal(controller.getTelemetry().pthread.pthreadPeakCount, 52);
+
+  const res = await controller.restartSession({ preferSmoke: false });
+  assert.equal(res.ok, true);
+
+  const after = controller.getTelemetry();
+  assert.equal(after.gpu.realPackDrawCount, 0);
+  assert.equal(after.gpu.fallbackDrawCount, 0);
+  assert.equal(after.gpu.presentCount, 0);
+  assert.equal(after.audio.outputState, 'suspended');
+  assert.equal(after.audio.framesDrained, 0);
+  assert.equal(after.pthread.pthreadSpawnedCount, 0);
+  assert.equal(after.pthread.pthreadActiveCount, 0);
+  assert.equal(after.pthread.pthreadPeakCount, 0);
+  assert.equal(after.pthread.indirectDispatch, 'unknown');
+
+  await sessionController.stop();
+  controller.destroy();
 });
