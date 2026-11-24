@@ -340,6 +340,16 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(windowed.memory, MemoryModel::translated_window(false));
+        let outlined = parse_program_args(&args(&[
+            "a.exe",
+            "--out",
+            "x",
+            "--memory-model",
+            "window-outline",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(outlined.memory, MemoryModel::translated_window_outline());
         assert!(
             parse_program_args(&args(&["a.exe", "--out", "x", "--memory-model", "flat"])).is_err()
         );

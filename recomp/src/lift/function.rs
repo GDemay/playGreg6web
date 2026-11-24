@@ -9,12 +9,13 @@ use std::fmt::Write as _;
 
 use iced_x86::{
     Code, ConditionCode, FlowControl, Formatter, Instruction, InstructionInfoFactory,
-    IntelFormatter, Mnemonic, OpKind, Register,
+    IntelFormatter, Mnemonic, OpKind, Register, RflagsBits,
 };
 
 use super::{
-    GUEST_STATE_TYPE, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP, HELPER_UNIMPLEMENTED,
-    LiftError, LiftedFunction, MemoryModel, Support, UnsupportedInstruction, function_symbol,
+    GUEST_BASE_SYMBOL, GUEST_STATE_TYPE, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
+    HELPER_UNIMPLEMENTED, LiftError, LiftedFunction, MemoryModel, Support, UnsupportedInstruction,
+    function_symbol,
 };
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
@@ -69,6 +70,43 @@ impl Flag {
             Flag::Zf => "%zf",
             Flag::Sf => "%sf",
             Flag::Of => "%of",
+        }
+    }
+
+    fn rflags_bit(self) -> u32 {
+        match self {
+            Flag::Cf => RflagsBits::CF,
+            Flag::Pf => RflagsBits::PF,
+            Flag::Af => RflagsBits::AF,
+            Flag::Zf => RflagsBits::ZF,
+            Flag::Sf => RflagsBits::SF,
+            Flag::Of => RflagsBits::OF,
+        }
+    }
+}
+
+/// Kind of cold noreturn runtime trap routed through a function's shared `cold_trap` sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ColdTrapKind {
+    Trap,
+    Unimplemented,
+    DivideError,
+}
+
+impl ColdTrapKind {
+    fn helper(self) -> &'static str {
+        match self {
+            Self::Trap => HELPER_TRAP,
+            Self::Unimplemented => HELPER_UNIMPLEMENTED,
+            Self::DivideError => HELPER_DIVIDE_ERROR,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::Trap => 0,
+            Self::Unimplemented => 1,
+            Self::DivideError => 2,
         }
     }
 }
@@ -193,8 +231,10 @@ pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFu
     }
     let mut regs = [false; 16];
     regs[RSP] = true;
+    let mut flags = [false; 6];
     let mut vector_regs = simd::Regs::default();
     let mut faulting_calls = BTreeSet::new();
+    let mut return_blocks = 0usize;
     let mut info = InstructionInfoFactory::new();
     for (&start, block) in &func.blocks {
         let first = block
@@ -210,7 +250,39 @@ pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFu
         if block.instructions.is_empty() && block.terminator != Terminator::Invalid {
             return Err(LiftError::EmptyBlock { block: start });
         }
+        if block.terminator == Terminator::Return {
+            return_blocks += 1;
+        }
         for ins in &block.instructions {
+            let mut touched = ins.rflags_read()
+                | ins.rflags_written()
+                | ins.rflags_cleared()
+                | ins.rflags_set();
+            match ins.mnemonic() {
+                Mnemonic::Rol | Mnemonic::Ror | Mnemonic::Rcl | Mnemonic::Rcr => {
+                    touched |= RflagsBits::CF | RflagsBits::OF;
+                }
+                Mnemonic::Shl
+                | Mnemonic::Sal
+                | Mnemonic::Shr
+                | Mnemonic::Sar
+                | Mnemonic::Shld
+                | Mnemonic::Shrd => {
+                    touched |= RflagsBits::CF
+                        | RflagsBits::OF
+                        | RflagsBits::ZF
+                        | RflagsBits::SF
+                        | RflagsBits::PF;
+                }
+                _ => {}
+            }
+            if touched != 0 {
+                for flag in FLAGS {
+                    if touched & flag.rflags_bit() != 0 {
+                        flags[flag as usize] = true;
+                    }
+                }
+            }
             for used in info.info(ins).used_registers() {
                 let reg = used.register();
                 if reg.is_gpr() && reg.full_register().is_gpr64() {
@@ -240,9 +312,11 @@ pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFu
     let mut lifter = FunctionLifter {
         func,
         regs,
+        flags,
         simd: vector_regs,
         faulting_calls,
         body: String::new(),
+        current_block: String::new(),
         tmp: 0,
         label: 0,
         exits: Vec::new(),
@@ -252,6 +326,10 @@ pub(super) fn lift(func: &cfg::Function, memory: MemoryModel) -> Result<LiftedFu
         ea: None,
         memory,
         stack_values: BTreeSet::new(),
+        guest_base: None,
+        cold_traps: Vec::new(),
+        share_ret: return_blocks > 1,
+        has_shared_ret: false,
         unwind_sites: 0,
     };
     lifter.lift_blocks()?;
@@ -285,12 +363,16 @@ struct FunctionLifter<'a> {
     func: &'a cfg::Function,
     /// GPRs the function touches; only these get an alloca and are synced with the state.
     regs: [bool; 16],
+    /// Arithmetic flags the function reads or writes; untouched flags stay in `%state`.
+    flags: [bool; 6],
     /// Vector registers the function touches (an `alloca <2 x i64>` per XMM register and per
     /// YMM upper half, synced like the GPRs) and the SIMD lifter's per-instruction state.
     simd: simd::Regs,
     /// Sites of direct calls into unmapped or non-executable memory (lifted as traps).
     faulting_calls: BTreeSet<u64>,
     body: String,
+    /// Label of the LLVM basic block currently being emitted (used for phi predecessors).
+    pub(super) current_block: String,
     tmp: u32,
     label: u32,
     /// Targets of edges that leave the function (become tail calls).
@@ -304,14 +386,25 @@ struct FunctionLifter<'a> {
     memory: MemoryModel,
     /// SSA values known to be stack-pointer-relative guest addresses (table models only).
     stack_values: BTreeSet<String>,
+    /// SSA value holding `@__playgta6_guest_base`, loaded once in `entry:` when needed.
+    pub(super) guest_base: Option<String>,
+    /// Incoming edges `(kind, va, pred_block)` into this function's shared `cold_trap` sink.
+    cold_traps: Vec<(ColdTrapKind, u64, String)>,
+    /// True when the function has >1 `ret` blocks and shares a single `ret_epilog` sync-out.
+    share_ret: bool,
+    /// True once at least one `ret` branched to `ret_epilog`.
+    has_shared_ret: bool,
     /// Calls followed by a resume-protocol check (see `unwind`).
     unwind_sites: u32,
 }
 
 struct Checkpoint {
     body: usize,
+    current_block: String,
     exits: usize,
     callees: usize,
+    cold_traps: usize,
+    has_shared_ret: bool,
     support: BTreeSet<Support>,
 }
 
@@ -321,7 +414,8 @@ impl FunctionLifter<'_> {
     fn lift_blocks(&mut self) -> Result<(), LiftError> {
         let func = self.func;
         for (&start, block) in &func.blocks {
-            let _ = writeln!(self.body, "{}:", block_label(start));
+            let label = block_label(start);
+            self.start_block(&label);
             let (body, transfer) = match block.instructions.split_last() {
                 Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
                 _ => (&block.instructions[..], None),
@@ -449,7 +543,8 @@ impl FunctionLifter<'_> {
         exits.sort_unstable();
         exits.dedup();
         for &target in &exits {
-            let _ = writeln!(self.body, "{}:", exit_label(target));
+            let exit = exit_label(target);
+            self.start_block(&exit);
             self.sync_out();
             self.emit(&format!(
                 "tail call void @{}(ptr %state)",
@@ -459,9 +554,20 @@ impl FunctionLifter<'_> {
             self.callees.push(target);
         }
 
+        if self.has_shared_ret {
+            self.start_block("ret_epilog");
+            self.sync_out();
+            self.emit("ret void");
+        }
+
+        self.emit_cold_trap_sink();
+
         let body = std::mem::take(&mut self.body);
         let mut ir = String::new();
-        let _ = writeln!(ir, "define void @{symbol}(ptr noalias %state) #0 {{");
+        let _ = writeln!(
+            ir,
+            "define void @{symbol}(ptr noalias noundef %state) unnamed_addr #0 {{"
+        );
         ir.push_str("entry:\n");
         for (idx, name) in GPR_NAMES.iter().enumerate() {
             if self.regs[idx] {
@@ -469,13 +575,23 @@ impl FunctionLifter<'_> {
             }
         }
         for flag in FLAGS {
-            let _ = writeln!(ir, "  {} = alloca i1", flag.slot());
+            if self.flags[flag as usize] {
+                let _ = writeln!(ir, "  {} = alloca i1", flag.slot());
+            }
         }
         self.xmm_allocas(&mut ir);
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
         self.sync_in();
         self.unwind_entry();
+        if self.support.contains(&Support::GuestBase)
+            && let Some(base_name) = &self.guest_base
+        {
+            let line = format!(
+                "{base_name} = load i64, ptr @{GUEST_BASE_SYMBOL}, align 8, !invariant.load !{{}}"
+            );
+            self.emit(&line);
+        }
         ir.push_str(&std::mem::take(&mut self.body));
         let _ = writeln!(ir, "  br label %{}", block_label(entry));
         ir.push_str(&body);
@@ -493,19 +609,90 @@ impl FunctionLifter<'_> {
         }
     }
 
+    /// Emits the function's shared cold trap sink (`cold_trap:`), deduplicating `sync_out()`
+    /// across all trap, unimplemented, divide-error, misaligned-`cmpxchg16b` and `ldmxcsr` sites.
+    fn emit_cold_trap_sink(&mut self) {
+        let traps = std::mem::take(&mut self.cold_traps);
+        if traps.is_empty() {
+            return;
+        }
+        self.start_block("cold_trap");
+        let first_va = traps[0].1;
+        let va = if traps.iter().all(|(_, va, _)| *va == first_va) {
+            imm(first_va, 64)
+        } else {
+            let inputs: Vec<String> = traps
+                .iter()
+                .map(|(_, va, pred)| format!("[ {}, %{pred} ]", imm(*va, 64)))
+                .collect();
+            self.val(&format!("phi i64 {}", inputs.join(", ")))
+        };
+        let first_kind = traps[0].0;
+        if traps.iter().all(|(kind, _, _)| *kind == first_kind) {
+            self.sync_out();
+            self.emit(&format!(
+                "call void @{}(ptr %state, i64 {va})",
+                first_kind.helper()
+            ));
+            self.emit("unreachable");
+            return;
+        }
+        let kind_inputs: Vec<String> = traps
+            .iter()
+            .map(|(kind, _, pred)| format!("[ {}, %{pred} ]", kind.tag()))
+            .collect();
+        let kind_val = self.val(&format!("phi i8 {}", kind_inputs.join(", ")));
+        self.sync_out();
+        let mut kinds = Vec::new();
+        for (kind, _, _) in &traps {
+            if !kinds.contains(kind) {
+                kinds.push(*kind);
+            }
+        }
+        let default_kind = kinds[0];
+        let mut arms = String::new();
+        for &kind in &kinds[1..] {
+            let _ = write!(
+                arms,
+                " i8 {}, label %cold_trap_{}",
+                kind.tag(),
+                kind.tag()
+            );
+        }
+        self.emit(&format!(
+            "switch i8 {kind_val}, label %cold_trap_{} [{arms} ]",
+            default_kind.tag()
+        ));
+        for kind in kinds {
+            let label = format!("cold_trap_{}", kind.tag());
+            self.start_block(&label);
+            self.emit(&format!(
+                "call void @{}(ptr %state, i64 {va})",
+                kind.helper()
+            ));
+            self.emit("unreachable");
+        }
+    }
+
     fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             body: self.body.len(),
+            current_block: self.current_block.clone(),
             exits: self.exits.len(),
             callees: self.callees.len(),
+            cold_traps: self.cold_traps.len(),
+            has_shared_ret: self.has_shared_ret,
             support: self.support.clone(),
         }
     }
 
     fn rollback(&mut self, checkpoint: Checkpoint) {
         self.body.truncate(checkpoint.body);
+        self.current_block = checkpoint.current_block;
         self.exits.truncate(checkpoint.exits);
         self.callees.truncate(checkpoint.callees);
+        self.cold_traps.truncate(checkpoint.cold_traps);
+        self.has_shared_ret = checkpoint.has_shared_ret;
         self.support = checkpoint.support;
     }
 
@@ -518,22 +705,29 @@ impl FunctionLifter<'_> {
             instruction: text,
             reason,
         });
-        self.sync_out();
-        self.emit(&format!(
-            "call void @{HELPER_UNIMPLEMENTED}(ptr %state, i64 {})",
-            imm(ins.ip(), 64)
-        ));
-        self.emit("unreachable");
+        self.cold_traps
+            .push((ColdTrapKind::Unimplemented, ins.ip(), self.current_block.clone()));
+        self.emit("br label %cold_trap");
     }
 
-    /// Ends the current LLVM block with a call to the guest-trap helper.
+    /// Ends the current LLVM block with a branch to the function's shared cold trap sink.
     fn trap(&mut self, va: u64) {
-        self.sync_out();
+        self.cold_traps
+            .push((ColdTrapKind::Trap, va, self.current_block.clone()));
+        self.emit("br label %cold_trap");
+    }
+
+    /// Branches to the function's shared cold trap sink when `fault` is true (`!prof UNLIKELY`)
+    /// and continues lifting in a fresh continuation block.
+    pub(super) fn cold_trap_branch(&mut self, fault: &str, kind: ColdTrapKind, va: u64) {
+        let ok = self.new_label("cont");
+        self.cold_traps
+            .push((kind, va, self.current_block.clone()));
         self.emit(&format!(
-            "call void @{HELPER_TRAP}(ptr %state, i64 {})",
-            imm(va, 64)
+            "br i1 {fault}, label %cold_trap, label %{ok}, {}",
+            memory_access::UNLIKELY
         ));
-        self.emit("unreachable");
+        self.start_block(&ok);
     }
 
     // ----- IR emission primitives ---------------------------------------------------------------
@@ -544,10 +738,16 @@ impl FunctionLifter<'_> {
         self.body.push('\n');
     }
 
-    /// Emits `%tN = <rhs>` and returns `%tN`.
-    fn val(&mut self, rhs: &str) -> String {
+    /// A new `%tN` name without emitting anything.
+    pub(super) fn fresh_name(&mut self) -> String {
         let name = format!("%t{}", self.tmp);
         self.tmp += 1;
+        name
+    }
+
+    /// Emits `%tN = <rhs>` and returns `%tN`.
+    fn val(&mut self, rhs: &str) -> String {
+        let name = self.fresh_name();
         self.emit(&format!("{name} = {rhs}"));
         name
     }
@@ -559,6 +759,8 @@ impl FunctionLifter<'_> {
     }
 
     fn start_block(&mut self, label: &str) {
+        self.current_block.clear();
+        self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
     }
 
@@ -587,10 +789,12 @@ impl FunctionLifter<'_> {
             }
         }
         for flag in FLAGS {
-            let ptr = self.state_flag_ptr(flag);
-            let byte = self.val(&format!("load i8, ptr {ptr}"));
-            let bit = self.val(&format!("trunc i8 {byte} to i1"));
-            self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
+            if self.flags[flag as usize] {
+                let ptr = self.state_flag_ptr(flag);
+                let byte = self.val(&format!("load i8, ptr {ptr}, !range !{{i8 0, i8 2}}"));
+                let bit = self.val(&format!("trunc i8 {byte} to i1"));
+                self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
+            }
         }
         self.sync_xmm_in();
     }
@@ -605,10 +809,12 @@ impl FunctionLifter<'_> {
             }
         }
         for flag in FLAGS {
-            let bit = self.val(&format!("load i1, ptr {}", flag.slot()));
-            let byte = self.val(&format!("zext i1 {bit} to i8"));
-            let ptr = self.state_flag_ptr(flag);
-            self.emit(&format!("store i8 {byte}, ptr {ptr}"));
+            if self.flags[flag as usize] {
+                let bit = self.val(&format!("load i1, ptr {}", flag.slot()));
+                let byte = self.val(&format!("zext i1 {bit} to i8"));
+                let ptr = self.state_flag_ptr(flag);
+                self.emit(&format!("store i8 {byte}, ptr {ptr}"));
+            }
         }
         self.sync_xmm_out();
     }
@@ -847,10 +1053,12 @@ impl FunctionLifter<'_> {
     // ----- flags ---------------------------------------------------------------------------------
 
     fn set_flag(&mut self, flag: Flag, value: &str) {
+        debug_assert!(self.flags[flag as usize], "flag {flag:?} was not tracked");
         self.emit(&format!("store i1 {value}, ptr {}", flag.slot()));
     }
 
     fn get_flag(&mut self, flag: Flag) -> String {
+        debug_assert!(self.flags[flag as usize], "flag {flag:?} was not tracked");
         self.val(&format!("load i1, ptr {}", flag.slot()))
     }
 
@@ -1142,6 +1350,38 @@ impl FunctionLifter<'_> {
 
     fn alu(&mut self, ins: &Instruction, op: Alu) -> R<()> {
         let bits = self.op_bits(ins, 0)?;
+        if ins.op_kind(0) == OpKind::Register
+            && ins.op_kind(1) == OpKind::Register
+            && ins.op_register(0) == ins.op_register(1)
+        {
+            match op {
+                Alu::Xor | Alu::Sub | Alu::Cmp => {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    if !matches!(op, Alu::Xor) {
+                        self.set_flag(Flag::Af, "false");
+                    }
+                    self.set_flag(Flag::Zf, "true");
+                    self.set_flag(Flag::Sf, "false");
+                    self.set_flag(Flag::Pf, "true");
+                    if !matches!(op, Alu::Cmp) {
+                        self.write_op(ins, 0, "0", bits)?;
+                    }
+                    return Ok(());
+                }
+                Alu::And | Alu::Or | Alu::Test => {
+                    let a = self.read_op(ins, 0, bits)?;
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_zsp(&a, bits);
+                    if !matches!(op, Alu::Test) {
+                        self.write_op(ins, 0, &a, bits)?;
+                    }
+                    return Ok(());
+                }
+                Alu::Add | Alu::Adc | Alu::Sbb => {}
+            }
+        }
         let a = self.read_op(ins, 0, bits)?;
         let b = self.read_op(ins, 1, bits)?;
         let r = self.alu_value(op, &a, &b, bits);
@@ -1288,24 +1528,32 @@ impl FunctionLifter<'_> {
         let count_mask: u64 = if bits == 64 { 63 } else { 31 };
         let a = self.read_op(ins, 0, bits)?;
 
-        // Masked count as i64.
-        let count = match ins.op_kind(1) {
+        // Masked count as i64 (and constant value when immediate).
+        let (count, imm_count) = match ins.op_kind(1) {
             OpKind::Register if ins.op_register(1) == Register::CL => {
                 let (cl, _) = self.read_reg(Register::CL)?;
                 let masked = self.val(&format!("and i8 {cl}, {count_mask}"));
-                self.val(&format!("zext i8 {masked} to i64"))
+                (self.val(&format!("zext i8 {masked} to i64")), None)
             }
             kind if is_immediate(kind) => match ins.try_immediate(1) {
-                Ok(v) => (v & count_mask).to_string(),
+                Ok(v) => {
+                    let c = v & count_mask;
+                    (c.to_string(), Some(c))
+                }
                 Err(_) => return unsupported("unreadable shift count"),
             },
             kind => return unsupported(format!("shift count operand {kind:?}")),
         };
 
+        // A masked immediate count of zero leaves all flags unchanged (still write_op for 32-bit zext).
+        if imm_count == Some(0) {
+            return self.write_op(ins, 0, &a, bits);
+        }
+
         let (r, cf, of) = match kind {
             Shift::Rol | Shift::Ror => {
                 // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
-                let amount = if bits == 64 {
+                let amount = if bits == 64 || imm_count.is_some() {
                     count.clone()
                 } else {
                     self.val(&format!("trunc i64 {count} to {t}"))
@@ -1333,14 +1581,24 @@ impl FunctionLifter<'_> {
             }
             _ => {
                 // count - 1 (masked so a zero count never produces a poison shift amount).
-                let prev = self.val(&format!("add i64 {count}, 63"));
-                let prev = self.val(&format!("and i64 {prev}, 63"));
+                let prev = match imm_count {
+                    Some(c) => (c - 1).to_string(),
+                    None => {
+                        let prev = self.val(&format!("add i64 {count}, 63"));
+                        self.val(&format!("and i64 {prev}, 63"))
+                    }
+                };
                 if bits == 64 {
                     match kind {
                         Shift::Shl => {
                             let r = self.val(&format!("shl i64 {a}, {count}"));
-                            let back = self.val(&format!("sub i64 64, {count}"));
-                            let back = self.val(&format!("and i64 {back}, 63"));
+                            let back = match imm_count {
+                                Some(c) => ((64 - c) & 63).to_string(),
+                                None => {
+                                    let back = self.val(&format!("sub i64 64, {count}"));
+                                    self.val(&format!("and i64 {back}, 63"))
+                                }
+                            };
                             let out = self.val(&format!("lshr i64 {a}, {back}"));
                             let cf = self.val(&format!("trunc i64 {out} to i1"));
                             let msb = self.msb(&r, 64);
@@ -1396,16 +1654,22 @@ impl FunctionLifter<'_> {
         };
 
         // Flags only change when the masked count is non-zero.
-        let nonzero = self.val(&format!("icmp ne i64 {count}, 0"));
         let mut updates = vec![(Flag::Cf, cf), (Flag::Of, of)];
         if !matches!(kind, Shift::Rol | Shift::Ror) {
             let [zf, sf, pf] = self.zsp(&r, bits);
             updates.extend([(Flag::Zf, zf), (Flag::Sf, sf), (Flag::Pf, pf)]);
         }
-        for (flag, new) in updates {
-            let old = self.get_flag(flag);
-            let v = self.val(&format!("select i1 {nonzero}, i1 {new}, i1 {old}"));
-            self.set_flag(flag, &v);
+        if imm_count.is_some() {
+            for (flag, new) in updates {
+                self.set_flag(flag, &new);
+            }
+        } else {
+            let nonzero = self.val(&format!("icmp ne i64 {count}, 0"));
+            for (flag, new) in updates {
+                let old = self.get_flag(flag);
+                let v = self.val(&format!("select i1 {nonzero}, i1 {new}, i1 {old}"));
+                self.set_flag(flag, &v);
+            }
         }
         self.write_op(ins, 0, &r, bits)
     }
@@ -1586,17 +1850,7 @@ impl FunctionLifter<'_> {
             (qn, rn)
         };
 
-        let de = self.new_label("de");
-        let ok = self.new_label("cont");
-        self.emit(&format!("br i1 {fault}, label %{de}, label %{ok}"));
-        self.start_block(&de);
-        self.sync_out();
-        self.emit(&format!(
-            "call void @{HELPER_DIVIDE_ERROR}(ptr %state, i64 {})",
-            imm(ins.ip(), 64)
-        ));
-        self.emit("unreachable");
-        self.start_block(&ok);
+        self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
 
         let (qreg, rreg) = match bits {
             8 => (Register::AL, Register::AH),
@@ -1663,8 +1917,13 @@ impl FunctionLifter<'_> {
         let rsp = self.load_gpr(RSP)?;
         let new_rsp = self.val(&format!("add i64 {rsp}, {}", 8 + extra));
         self.store_gpr(RSP, &new_rsp)?;
-        self.sync_out();
-        self.emit("ret void");
+        if self.share_ret {
+            self.has_shared_ret = true;
+            self.emit("br label %ret_epilog");
+        } else {
+            self.sync_out();
+            self.emit("ret void");
+        }
         Ok(())
     }
 
@@ -1732,7 +1991,7 @@ impl FunctionLifter<'_> {
 /// would otherwise turn a high-half-only use (`mul` for a division by a constant, `mulx` with
 /// equal destinations) back into an `i128` multiply, i.e. a `__multi3` import.
 pub(super) const UMUL128_IR: &str = "\
-define internal { i64, i64 } @__playgta6_umul128(i64 %a, i64 %b) {
+define internal { i64, i64 } @__playgta6_umul128(i64 %a, i64 %b) unnamed_addr #0 {
 entry:
   %a0 = and i64 %a, 4294967295
   %a1.raw = lshr i64 %a, 32
@@ -1766,7 +2025,7 @@ entry:
 /// `{q, r, fault} = (hi:lo) / d` (unsigned 128 / 64). `fault` is set when `d == 0` or the
 /// quotient does not fit in 64 bits (`hi >= d`). Restoring division, no `i128` libcalls.
 pub(super) const UDIV128_IR: &str = "\
-define internal { i64, i64, i1 } @__playgta6_udiv128(i64 %hi, i64 %lo, i64 %d) {
+define internal { i64, i64, i1 } @__playgta6_udiv128(i64 %hi, i64 %lo, i64 %d) unnamed_addr #0 {
 entry:
   %fault = icmp uge i64 %hi, %d
   br i1 %fault, label %fail, label %ok
@@ -1809,7 +2068,7 @@ exit:
 /// `{q, r, fault} = (hi:lo) / d` (signed 128 / 64, truncating). The remainder has the sign of the
 /// dividend; `fault` is set for `d == 0` or a quotient outside the i64 range.
 pub(super) const SDIV128_IR: &str = "\
-define internal { i64, i64, i1 } @__playgta6_sdiv128(i64 %hi, i64 %lo, i64 %d) {
+define internal { i64, i64, i1 } @__playgta6_sdiv128(i64 %hi, i64 %lo, i64 %d) unnamed_addr #0 {
 entry:
   %nneg = icmp slt i64 %hi, 0
   %dneg = icmp slt i64 %d, 0
