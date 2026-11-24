@@ -1,14 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
+const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
 const registryCjs = require('../web/workers/resource_registry.js');
 const {
   DEFAULT_FRAMES_IN_FLIGHT,
   DEFAULT_SOFT_BUDGET_BYTES,
+  CREATE_TEXTURE2_OPCODE,
+  CREATE_TEXTURE2_PAYLOAD_BYTES,
+  MAX_TEXTURE_VIEW_FORMATS,
+  GPU_BUFFER_USAGE,
+  GPU_TEXTURE_USAGE,
+  TEXTURE_FORMAT_NAMES,
+  BC_TEXTURE_FORMATS,
+  BC_FALLBACK_FORMAT,
+  TEXTURE_COMPRESSION_BC_FEATURE,
   RESOURCE_KIND,
   RESOURCE_KINDS,
+  isBcFormat,
+  deviceSupportsBc,
+  computeMaxMipLevels,
+  clampMipLevelCount,
+  clampSampleCount,
+  alignBcDimension,
+  alignBufferSize,
+  padBufferUploadData,
+  estimateTextureBytes,
+  decodeCreateTexture2,
+  sanitizeTextureDescriptor,
   GpuResourceRegistry,
 } = registryCjs;
 
@@ -564,4 +589,726 @@ test('destroyAll() is idempotent and destroys both active and pending resources 
   reg.register(RESOURCE_KIND.BUFFER, 1, recoveredBuf, { byteSize: 128 });
   assert.equal(reg.get(RESOURCE_KIND.BUFFER, 1), recoveredBuf);
   assert.equal(reg.getStats().activeBytes, 128);
+});
+
+// ---------------------------------------------------------------------------
+// G41 Hardening Tests: CreateTexture2 (ABI v2 opcode 35), BC1..BC7 fallback &
+// 4x4 alignment, mip/sampleCount clamping, 4-byte buffer alignment/padding,
+// SharedArrayBuffer upload safety, and classic-worker importScripts isolation.
+// ---------------------------------------------------------------------------
+
+function createMockWebGpuDevice({ features = undefined, throwOnCreateTexture = false } = {}) {
+  const createdTextures = [];
+  const createdBuffers = [];
+  const writeBuffers = [];
+  let nextId = 1;
+
+  const device = {
+    createTexture(desc) {
+      if (throwOnCreateTexture) {
+        throw new Error('simulated WebGPU createTexture failure');
+      }
+      const tex = {
+        kind: 'GPUTexture',
+        internalId: nextId++,
+        desc: {
+          ...desc,
+          size: { ...desc.size },
+          ...(desc.viewFormats ? { viewFormats: desc.viewFormats.slice() } : {}),
+        },
+        destroyCount: 0,
+        createView(viewDesc) {
+          return {
+            kind: 'GPUTextureView',
+            textureInternalId: tex.internalId,
+            viewDesc: viewDesc || null,
+          };
+        },
+        destroy() {
+          this.destroyCount += 1;
+        },
+      };
+      createdTextures.push(tex);
+      return tex;
+    },
+    createBuffer(desc) {
+      const buf = {
+        kind: 'GPUBuffer',
+        internalId: nextId++,
+        size: desc.size,
+        usage: desc.usage,
+        label: desc.label || '',
+        mappedAtCreation: Boolean(desc.mappedAtCreation),
+        destroyCount: 0,
+        destroy() {
+          this.destroyCount += 1;
+        },
+      };
+      createdBuffers.push(buf);
+      return buf;
+    },
+    queue: {
+      writeBuffer(buffer, dstOffset, data) {
+        writeBuffers.push({
+          buffer,
+          dstOffset,
+          data,
+          byteLength: data.byteLength,
+          isShared: typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer,
+          bytesCopy: new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice(),
+        });
+      },
+    },
+  };
+
+  if (features !== undefined) {
+    device.features = features;
+  }
+
+  return { device, createdTextures, createdBuffers, writeBuffers };
+}
+
+function buildCreateTexture2Payload({
+  id = 1,
+  width = 256,
+  height = 256,
+  depthOrLayers = 1,
+  mipLevels = 1,
+  sampleCount = 1,
+  usageFlags = GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  dimension = 1, // 2d
+  format = 22, // rgba8unorm
+  viewFormats = [],
+  viewFormatCount = undefined,
+} = {}) {
+  const buf = new ArrayBuffer(CREATE_TEXTURE2_PAYLOAD_BYTES);
+  const view = new DataView(buf);
+  view.setUint32(0, id, true);
+  view.setUint32(4, width, true);
+  view.setUint32(8, height, true);
+  view.setUint32(12, depthOrLayers, true);
+  view.setUint32(16, mipLevels, true);
+  view.setUint32(20, sampleCount, true);
+  view.setUint32(24, usageFlags, true);
+  view.setUint8(28, dimension);
+  view.setUint8(29, format);
+  view.setUint8(30, viewFormatCount !== undefined ? viewFormatCount : viewFormats.length);
+  view.setUint8(31, 0);
+  for (let i = 0; i < Math.min(viewFormats.length, MAX_TEXTURE_VIEW_FORMATS); i += 1) {
+    view.setUint8(32 + i, viewFormats[i]);
+  }
+  return view;
+}
+
+test('G41 classic-worker importScripts IIFE isolation loads resource_registry.js twice cleanly with zero top-level leaks', () => {
+  const sandbox = { console, TextEncoder, TextDecoder };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      const source = readFileSync(fullPath, 'utf8');
+      vm.runInContext(source, vmCtx, { filename: fullPath });
+    }
+  };
+
+  assert.doesNotThrow(() => {
+    vmCtx.importScripts('./texture_formats.js', './resource_registry.js');
+    vmCtx.importScripts('./resource_registry.js');
+  });
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const TEXTURE_FORMAT_NAMES = [];
+      const TEXTURE_DIMENSION_NAMES = [];
+      const BC_TEXTURE_FORMATS = [];
+      const GPU_BUFFER_USAGE = {};
+      const GPU_TEXTURE_USAGE = {};
+      const RESOURCE_KIND = {};
+      class GpuResourceRegistry {}
+      `,
+      vmCtx
+    );
+  });
+
+  assert.equal(vmCtx.PlayGta6ResourceRegistry.CREATE_TEXTURE2_OPCODE, 35);
+  assert.equal(typeof vmCtx.PlayGta6ResourceRegistry.GpuResourceRegistry, 'function');
+  assert.equal(typeof vmCtx.PlayGta6ResourceRegistry.sanitizeTextureDescriptor, 'function');
+});
+
+test('G41 CreateTexture2 (ABI v2 opcode 35) decodes binary payload & structured descriptors and tracks VRAM + deferred GC', () => {
+  assert.equal(CREATE_TEXTURE2_OPCODE, 35);
+  assert.equal(CREATE_TEXTURE2_PAYLOAD_BYTES, 40);
+
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  // Binary CreateTexture2 payload: 64x32x6 array texture, rgba16float (code 40), 4 mips, sampleCount 1, viewFormats [40]
+  const payload = buildCreateTexture2Payload({
+    id: 77,
+    width: 64,
+    height: 32,
+    depthOrLayers: 6,
+    mipLevels: 4,
+    sampleCount: 1,
+    usageFlags: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+    dimension: 1,
+    format: 40,
+    viewFormats: [40],
+  });
+
+  const res = reg.createTexture2(payload, 0, CREATE_TEXTURE2_PAYLOAD_BYTES);
+  assert.equal(res.error, undefined);
+  assert.equal(res.id, 77);
+  assert.equal(res.texture, createdTextures[0]);
+  assert.equal(reg.get(RESOURCE_KIND.TEXTURE, 77), createdTextures[0]);
+  assert.equal(reg.get(RESOURCE_KIND.TEXTURE_VIEW, 77), res.view);
+
+  assert.deepEqual(createdTextures[0].desc, {
+    size: { width: 64, height: 32, depthOrArrayLayers: 6 },
+    mipLevelCount: 4,
+    sampleCount: 1,
+    dimension: '2d',
+    format: 'rgba16float',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+    viewFormats: ['rgba16float'],
+  });
+  assert.equal(res.meta.isTexture2, true);
+  assert.equal(res.meta.byteSize, estimateTextureBytes(64, 32, 6, 4, 'rgba16float', '2d', 1));
+  assert.equal(reg.getStats().activeBytes, res.meta.byteSize);
+
+  // Structured CreateTexture2 call with flat ABI fields (arrayLayers, mipLevels, sampleCount, numeric format)
+  const tex2 = reg.createTexture2(77, {
+    width: 32,
+    height: 32,
+    arrayLayers: 4,
+    mipLevels: 3,
+    sampleCount: 1,
+    dimension: '2d',
+    format: 22, // rgba8unorm
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(tex2, createdTextures[1]);
+  assert.deepEqual(createdTextures[1].desc.size, { width: 32, height: 32, depthOrArrayLayers: 4 });
+  assert.equal(createdTextures[1].desc.mipLevelCount, 3);
+
+  // Previous texture on handle 77 was cleanly retired (deferred, not immediately destroyed).
+  assert.equal(createdTextures[0].destroyCount, 0);
+  reg.beginFrame(1);
+  assert.equal(createdTextures[0].destroyCount, 0);
+  reg.beginFrame(2);
+  assert.equal(createdTextures[0].destroyCount, 1);
+
+  // Invalid CreateTexture2 binary payloads return structured errors instead of throwing.
+  const truncated = new DataView(new ArrayBuffer(20));
+  assert.match(reg.createTexture2(truncated).error, /payload 20 < 40/);
+
+  const badFmt = buildCreateTexture2Payload({ id: 80, format: 0 });
+  assert.match(reg.createTexture2(badFmt).error, /invalid texture format code 0/);
+
+  const badDim = buildCreateTexture2Payload({ id: 81, dimension: 9 });
+  assert.match(reg.createTexture2(badDim).error, /invalid dimension 9/);
+
+  const badVfCount = buildCreateTexture2Payload({ id: 82, viewFormatCount: 9 });
+  assert.match(reg.createTexture2(badVfCount).error, /view_format_count 9 > 8/);
+
+  const badVfCode = buildCreateTexture2Payload({ id: 83, viewFormats: [0], viewFormatCount: 1 });
+  assert.match(reg.createTexture2(badVfCode).error, /invalid view format code 0/);
+
+  // Device error inside createTexture2FromPacket is captured cleanly.
+  const failing = createMockWebGpuDevice({ throwOnCreateTexture: true });
+  const failingReg = new GpuResourceRegistry({ device: failing.device });
+  const failRes = failingReg.createTexture2(payload);
+  assert.match(failRes.error, /simulated WebGPU createTexture failure/);
+});
+
+test('G41 mipLevelCount clamping for 1D/2D/2D-array/3D textures tracks mipClampCount accurately', () => {
+  assert.equal(computeMaxMipLevels(128, 64, 1, '2d'), 8);
+  assert.equal(computeMaxMipLevels(16, 8, 64, '2d'), 5); // arrayLayers do not increase 2D max mips
+  assert.equal(computeMaxMipLevels(16, 8, 64, '3d'), 7); // 3D depth DOES contribute to max mips
+  assert.equal(computeMaxMipLevels(32, 999, 1, '1d'), 6); // 1D ignores height
+
+  const { device, createdTextures } = createMockWebGpuDevice();
+  const warnings = [];
+  const reg = new GpuResourceRegistry({
+    device,
+    onSanitizeWarning: (w) => warnings.push(w),
+  });
+
+  // 1. Over-limit 2D mips (128x64 -> max 8, requested 12 -> clamped to 8)
+  reg.createTexture(1, {
+    size: { width: 128, height: 64, depthOrArrayLayers: 1 },
+    mipLevelCount: 12,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(createdTextures[0].desc.mipLevelCount, 8);
+  assert.equal(reg.getTextureMeta(1).mipClamped, true);
+  assert.equal(reg.getStats().mipClampCount, 1);
+
+  // 2. Zero / negative mips clamped to 1
+  reg.createTexture(2, {
+    width: 64,
+    height: 64,
+    mipLevels: 0,
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[1].desc.mipLevelCount, 1);
+  assert.equal(reg.getStats().mipClampCount, 2);
+
+  // 3. 3D texture uses max(w, h, d): 16x8x64 -> max 7; requesting 7 is NOT clamped
+  reg.createTexture2(3, {
+    width: 16,
+    height: 8,
+    depth: 64,
+    mipLevels: 7,
+    dimension: '3d',
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[2].desc.mipLevelCount, 7);
+  assert.equal(reg.getTextureMeta(3).mipClamped, false);
+  assert.equal(reg.getStats().mipClampCount, 2);
+
+  // 4. 3D texture requesting 10 -> clamped to 7
+  reg.createTexture2(4, {
+    width: 16,
+    height: 8,
+    depth: 64,
+    mipLevels: 10,
+    dimension: '3d',
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[3].desc.mipLevelCount, 7);
+  assert.equal(reg.getStats().mipClampCount, 3);
+
+  // 5. 2D array texture with 64 layers & 16x16 -> max 5, requesting 7 clamps to 5
+  reg.createTexture2(5, {
+    width: 16,
+    height: 16,
+    arrayLayers: 64,
+    mipLevels: 7,
+    dimension: '2d',
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[4].desc.mipLevelCount, 5);
+  assert.equal(reg.getStats().mipClampCount, 4);
+
+  assert.equal(warnings.filter((w) => w.kind === 'mip_clamp').length, 4);
+});
+
+test('G41 sampleCount clamping enforces {1, 4} and falls back to 1 when multisampling is invalid', () => {
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ device });
+
+  // Valid 4x MSAA 2D single-mip render target
+  reg.createTexture2(1, {
+    width: 1280,
+    height: 720,
+    mipLevels: 1,
+    sampleCount: 4,
+    dimension: '2d',
+    format: 'rgba16float',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+  assert.equal(createdTextures[0].desc.sampleCount, 4);
+  assert.equal(reg.getTextureMeta(1).sampleClamped, false);
+
+  // 8x MSAA clamps to 4x when valid
+  reg.createTexture2(2, {
+    width: 640,
+    height: 360,
+    mipLevels: 1,
+    sampleCount: 8,
+    dimension: '2d',
+    format: 'depth32float',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+  assert.equal(createdTextures[1].desc.sampleCount, 4);
+  assert.equal(reg.getTextureMeta(2).sampleClamped, true);
+
+  // 2x MSAA (unsupported in WebGPU) clamps to 1
+  reg.createTexture2(3, {
+    width: 256,
+    height: 256,
+    sampleCount: 2,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+  assert.equal(createdTextures[2].desc.sampleCount, 1);
+
+  // mipLevelCount > 1 forces sampleCount = 1
+  reg.createTexture2(4, {
+    width: 256,
+    height: 256,
+    mipLevels: 3,
+    sampleCount: 4,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+  assert.equal(createdTextures[3].desc.sampleCount, 1);
+
+  // 3D texture forces sampleCount = 1
+  reg.createTexture2(5, {
+    width: 32,
+    height: 32,
+    depth: 8,
+    sampleCount: 4,
+    dimension: '3d',
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[4].desc.sampleCount, 1);
+
+  // 2D array texture (layers > 1) forces sampleCount = 1
+  reg.createTexture2(6, {
+    width: 64,
+    height: 64,
+    arrayLayers: 2,
+    sampleCount: 4,
+    dimension: '2d',
+    format: 'rgba8unorm',
+  });
+  assert.equal(createdTextures[5].desc.sampleCount, 1);
+
+  // Non-multisampleable formats (BC7, rgba32float, rgb9e5ufloat) force sampleCount = 1
+  reg.createTexture2(7, {
+    width: 64,
+    height: 64,
+    sampleCount: 4,
+    format: 'bc7-rgba-unorm',
+  });
+  assert.equal(createdTextures[6].desc.sampleCount, 1);
+
+  reg.createTexture2(8, {
+    width: 64,
+    height: 64,
+    sampleCount: 4,
+    format: 'rgba32float',
+  });
+  assert.equal(createdTextures[7].desc.sampleCount, 1);
+
+  reg.createTexture2(9, {
+    width: 64,
+    height: 64,
+    sampleCount: 4,
+    format: 'rgb9e5ufloat',
+  });
+  assert.equal(createdTextures[8].desc.sampleCount, 1);
+
+  // STORAGE_BINDING usage forces sampleCount = 1
+  reg.createTexture2(10, {
+    width: 64,
+    height: 64,
+    sampleCount: 4,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.STORAGE_BINDING | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(createdTextures[9].desc.sampleCount, 1);
+
+  assert.equal(reg.getStats().sampleClampCount, 9);
+});
+
+test('G41 BC1..BC7 fallback to rgba8unorm when device.features lacks texture-compression-bc', () => {
+  assert.equal(BC_TEXTURE_FORMATS.length, 14);
+  for (const fmt of BC_TEXTURE_FORMATS) {
+    assert.equal(isBcFormat(fmt), true);
+  }
+  assert.equal(isBcFormat('rgba8unorm'), false);
+
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set(['timestamp-query']),
+  });
+  assert.equal(deviceSupportsBc(device), false);
+
+  const reg = new GpuResourceRegistry({ device });
+
+  BC_TEXTURE_FORMATS.forEach((bcFmt, idx) => {
+    reg.createTexture2(100 + idx, {
+      width: 13, // non-multiple of 4: kept as-is when falling back to rgba8unorm
+      height: 7,
+      mipLevels: 1,
+      format: bcFmt,
+      viewFormats: [bcFmt],
+      usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+    });
+    const desc = createdTextures[idx].desc;
+    assert.equal(desc.format, BC_FALLBACK_FORMAT);
+    assert.equal(desc.size.width, 13);
+    assert.equal(desc.size.height, 7);
+    assert.deepEqual(desc.viewFormats, [
+      bcFmt.endsWith('-srgb') ? 'rgba8unorm-srgb' : 'rgba8unorm',
+    ]);
+    const meta = reg.getTextureMeta(100 + idx);
+    assert.equal(meta.originalFormat, bcFmt);
+    assert.equal(meta.format, 'rgba8unorm');
+    assert.equal(meta.bcFormatFallback, true);
+    assert.equal(meta.bcDimensionAligned, false);
+  });
+
+  const stats = reg.getStats();
+  assert.equal(stats.bcFormatFallbackCount, BC_TEXTURE_FORMATS.length);
+  assert.equal(stats.bcDimensionAlignCount, 0);
+});
+
+test('G41 BC1..BC7 aligns dimensions to multiples of 4 when BC is supported and tracks bcDimensionAlignCount', () => {
+  assert.equal(alignBcDimension(1), 4);
+  assert.equal(alignBcDimension(3), 4);
+  assert.equal(alignBcDimension(4), 4);
+  assert.equal(alignBcDimension(5), 8);
+  assert.equal(alignBcDimension(1366), 1368);
+
+  const { device: bcDevice, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  assert.equal(deviceSupportsBc(bcDevice), true);
+  assert.equal(deviceSupportsBc({ features: [TEXTURE_COMPRESSION_BC_FEATURE] }), true);
+  assert.equal(deviceSupportsBc({ features: { [TEXTURE_COMPRESSION_BC_FEATURE]: true } }), true);
+  assert.equal(deviceSupportsBc({}), true); // no device.features -> assumed supported
+
+  const reg = new GpuResourceRegistry({ device: bcDevice });
+
+  // Non-multiple-of-4 BC7 texture -> aligned to 4x4 multiple (1366x767 -> 1368x768)
+  reg.createTexture2(1, {
+    width: 1366,
+    height: 767,
+    mipLevels: 1,
+    format: 'bc7-rgba-unorm',
+  });
+  assert.equal(createdTextures[0].desc.format, 'bc7-rgba-unorm');
+  assert.equal(createdTextures[0].desc.size.width, 1368);
+  assert.equal(createdTextures[0].desc.size.height, 768);
+  assert.equal(reg.getTextureMeta(1).bcDimensionAligned, true);
+  assert.equal(reg.getStats().bcDimensionAlignCount, 1);
+  assert.equal(reg.getStats().bcFormatFallbackCount, 0);
+
+  // Tiny 1x2 BC1 texture -> aligned to 4x4
+  reg.createTexture2(2, {
+    width: 1,
+    height: 2,
+    mipLevels: 1,
+    format: 'bc1-rgba-unorm-srgb',
+  });
+  assert.equal(createdTextures[1].desc.size.width, 4);
+  assert.equal(createdTextures[1].desc.size.height, 4);
+  assert.equal(reg.getStats().bcDimensionAlignCount, 2);
+
+  // Already-aligned 1920x1080 BC3 texture -> no alignment needed
+  reg.createTexture2(3, {
+    width: 1920,
+    height: 1080,
+    mipLevels: 1,
+    format: 'bc3-rgba-unorm',
+  });
+  assert.equal(createdTextures[2].desc.size.width, 1920);
+  assert.equal(createdTextures[2].desc.size.height, 1080);
+  assert.equal(reg.getTextureMeta(3).bcDimensionAligned, false);
+  assert.equal(reg.getStats().bcDimensionAlignCount, 2);
+
+  // Device without .features property keeps BC format and aligns dimensions
+  const { device: noFeaturesDevice, createdTextures: nfTex } = createMockWebGpuDevice();
+  reg.createTexture2(
+    4,
+    { width: 5, height: 5, format: 'bc5-rg-unorm' },
+    { device: noFeaturesDevice }
+  );
+  assert.equal(nfTex[0].desc.format, 'bc5-rg-unorm');
+  assert.equal(nfTex[0].desc.size.width, 8);
+  assert.equal(nfTex[0].desc.size.height, 8);
+  assert.equal(reg.getStats().bcDimensionAlignCount, 3);
+  assert.equal(reg.getStats().bcFormatFallbackCount, 0);
+});
+
+test('G41 createBuffer aligns sizes to 4 bytes (16 bytes min for UNIFORM) and tracks bufferAlignPadCount', () => {
+  assert.deepEqual(alignBufferSize(0, GPU_BUFFER_USAGE.VERTEX), {
+    requestedSize: 0,
+    alignedSize: 4,
+    padded: true,
+    isUniform: false,
+  });
+  assert.deepEqual(alignBufferSize(5, GPU_BUFFER_USAGE.VERTEX), {
+    requestedSize: 5,
+    alignedSize: 8,
+    padded: true,
+    isUniform: false,
+  });
+  assert.deepEqual(alignBufferSize(8, GPU_BUFFER_USAGE.UNIFORM), {
+    requestedSize: 8,
+    alignedSize: 16,
+    padded: true,
+    isUniform: true,
+  });
+  assert.deepEqual(alignBufferSize(16, GPU_BUFFER_USAGE.UNIFORM), {
+    requestedSize: 16,
+    alignedSize: 16,
+    padded: false,
+    isUniform: true,
+  });
+  assert.deepEqual(alignBufferSize(21n, GPU_BUFFER_USAGE.UNIFORM), {
+    requestedSize: 21,
+    alignedSize: 24,
+    padded: true,
+    isUniform: true,
+  });
+
+  const { device, createdBuffers } = createMockWebGpuDevice();
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  // Descriptor form: non-aligned vertex buffer 5 -> 8
+  const b1 = reg.createBuffer(1, {
+    size: 5,
+    usage: GPU_BUFFER_USAGE.VERTEX | GPU_BUFFER_USAGE.COPY_DST,
+    label: 'tri-vb',
+  });
+  assert.equal(b1, createdBuffers[0]);
+  assert.equal(b1.size, 8);
+  assert.equal(reg.getBufferMeta(1).requestedSize, 5);
+  assert.equal(reg.getBufferMeta(1).alignedSize, 8);
+  assert.equal(reg.getBufferMeta(1).padded, true);
+  assert.equal(reg.getStats().activeBytes, 8);
+  assert.equal(reg.getStats().bufferAlignPadCount, 1);
+
+  // Positional form: UNIFORM buffer 12 -> 16
+  const b2 = reg.createBuffer(2, 12, GPU_BUFFER_USAGE.UNIFORM | GPU_BUFFER_USAGE.COPY_DST);
+  assert.equal(b2.size, 16);
+  assert.equal(reg.getBufferMeta(2).isUniform, true);
+  assert.equal(reg.getStats().bufferAlignPadCount, 2);
+
+  // Already aligned 64-byte UNIFORM buffer -> no pad increment
+  const b3 = reg.createBuffer(3, {
+    size: 64,
+    usage: GPU_BUFFER_USAGE.UNIFORM | GPU_BUFFER_USAGE.COPY_DST,
+  });
+  assert.equal(b3.size, 64);
+  assert.equal(reg.getBufferMeta(3).padded, false);
+  assert.equal(reg.getStats().bufferAlignPadCount, 2);
+
+  // Overwriting handle 1 retires previous buffer safely via deferred GC
+  const b1New = reg.createBuffer(1, { size: 32, usage: GPU_BUFFER_USAGE.VERTEX });
+  assert.equal(reg.get(RESOURCE_KIND.BUFFER, 1), b1New);
+  assert.equal(b1.destroyCount, 0);
+  reg.beginFrame(1);
+  reg.beginFrame(2);
+  assert.equal(b1.destroyCount, 1);
+  assert.equal(b1New.destroyCount, 0);
+});
+
+test('G41 writeBuffer zero-pads non-4-byte payloads and safely copies SharedArrayBuffer views', () => {
+  const { device, writeBuffers } = createMockWebGpuDevice();
+  const reg = new GpuResourceRegistry({ device });
+
+  reg.createBuffer(10, {
+    size: 64,
+    usage: GPU_BUFFER_USAGE.VERTEX | GPU_BUFFER_USAGE.COPY_DST,
+  });
+
+  // 1. Odd-length 5-byte Uint8Array -> zero-padded to 8 bytes
+  const odd5 = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd, 0xee]);
+  assert.equal(reg.writeBuffer(10, 0, odd5), true);
+  assert.equal(writeBuffers.length, 1);
+  assert.equal(writeBuffers[0].dstOffset, 0);
+  assert.equal(writeBuffers[0].byteLength, 8);
+  assert.deepEqual(
+    Array.from(writeBuffers[0].bytesCopy),
+    [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x00, 0x00, 0x00]
+  );
+  assert.equal(reg.getStats().bufferAlignPadCount, 1);
+
+  // 2. Odd-length 3-element Uint16Array (6 bytes) -> zero-padded to 8 bytes
+  const u16 = new Uint16Array([0x0102, 0x0304, 0x0506]);
+  assert.equal(reg.writeBuffer(10, 8, u16), true);
+  assert.equal(writeBuffers.length, 2);
+  assert.equal(writeBuffers[1].byteLength, 8);
+  assert.equal(writeBuffers[1].bytesCopy[6], 0);
+  assert.equal(writeBuffers[1].bytesCopy[7], 0);
+  assert.equal(reg.getStats().bufferAlignPadCount, 2);
+
+  // 3. Aligned 8-byte Uint8Array -> no copy/pad increment
+  const aligned8 = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(reg.writeBuffer(10, 16, aligned8), true);
+  assert.equal(writeBuffers.length, 3);
+  assert.equal(writeBuffers[2].byteLength, 8);
+  assert.equal(writeBuffers[2].data, aligned8);
+  assert.equal(reg.getStats().bufferAlignPadCount, 2);
+
+  // 4. SharedArrayBuffer view (unaligned 5 bytes) -> copied to non-shared & zero-padded to 8 bytes
+  const sab = new SharedArrayBuffer(16);
+  const sabAll = new Uint8Array(sab);
+  sabAll.set([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160]);
+  const sabSlice5 = new Uint8Array(sab, 2, 5); // [30, 40, 50, 60, 70]
+  assert.equal(reg.writeBuffer(10, 24, sabSlice5), true);
+  assert.equal(writeBuffers.length, 4);
+  assert.equal(writeBuffers[3].isShared, false, 'SharedArrayBuffer view must be copied to non-shared buffer');
+  assert.equal(writeBuffers[3].byteLength, 8);
+  assert.deepEqual(Array.from(writeBuffers[3].bytesCopy), [30, 40, 50, 60, 70, 0, 0, 0]);
+  assert.equal(reg.getStats().bufferAlignPadCount, 3);
+
+  // 5. SharedArrayBuffer view (aligned 8 bytes) -> copied to non-shared WITHOUT incrementing bufferAlignPadCount
+  const sabSlice8 = new Uint8Array(sab, 4, 8);
+  assert.equal(reg.writeBuffer(10, 32, sabSlice8), true);
+  assert.equal(writeBuffers.length, 5);
+  assert.equal(writeBuffers[4].isShared, false, 'Aligned SharedArrayBuffer view must still be copied to non-shared buffer');
+  assert.equal(writeBuffers[4].byteLength, 8);
+  assert.deepEqual(Array.from(writeBuffers[4].bytesCopy), [50, 60, 70, 80, 90, 100, 110, 120]);
+  assert.equal(reg.getStats().bufferAlignPadCount, 3);
+
+  // 6. Direct SharedArrayBuffer with dataOffset & size
+  const sabUpload = padBufferUploadData(sab, 1, 3);
+  assert.equal(sabUpload.copiedFromShared, true);
+  assert.equal(sabUpload.padded, true);
+  assert.equal(sabUpload.alignedByteLength, 4);
+  assert.equal(sabUpload.bytes.buffer instanceof SharedArrayBuffer, false);
+  assert.deepEqual(Array.from(sabUpload.bytes), [20, 30, 40, 0]);
+
+  // 7. Empty upload is a safe no-op; missing handle returns false; direct GPUBuffer works
+  assert.equal(reg.writeBuffer(10, 0, new Uint8Array(0)), true);
+  assert.equal(writeBuffers.length, 5);
+  assert.equal(reg.writeBuffer(9999, 0, odd5), false);
+
+  const directBuf = reg.get(RESOURCE_KIND.BUFFER, 10);
+  assert.equal(reg.writeBuffer(directBuf, 40, new Uint8Array([7, 8, 9])), true);
+  assert.equal(writeBuffers.length, 6);
+  assert.equal(writeBuffers[5].byteLength, 4);
+  assert.deepEqual(Array.from(writeBuffers[5].bytesCopy), [7, 8, 9, 0]);
+  assert.equal(reg.getStats().bufferAlignPadCount, 4);
+});
+
+test('G41 setDevice, missing device guards, and getStats() sanitized counters default to 0', () => {
+  const reg = new GpuResourceRegistry();
+  const initialStats = reg.getStats();
+  assert.equal(initialStats.bcFormatFallbackCount, 0);
+  assert.equal(initialStats.bcDimensionAlignCount, 0);
+  assert.equal(initialStats.bufferAlignPadCount, 0);
+  assert.equal(initialStats.mipClampCount, 0);
+  assert.equal(initialStats.sampleClampCount, 0);
+
+  assert.throws(() => reg.createBuffer(1, { size: 16 }), TypeError);
+  assert.throws(() => reg.createTexture(1, { width: 16, height: 16 }), TypeError);
+  assert.throws(() => reg.setDevice('not-a-device'), TypeError);
+  assert.throws(() => new GpuResourceRegistry({ device: 'bad' }), TypeError);
+  assert.throws(() => new GpuResourceRegistry({ onSanitizeWarning: 42 }), TypeError);
+
+  const { device } = createMockWebGpuDevice({ features: new Set() });
+  reg.setDevice(device);
+  const tex = reg.createTexture2(1, { width: 32, height: 32, format: 'bc7-rgba-unorm', mipLevels: 99 });
+  assert.ok(tex);
+  assert.equal(reg.getStats().bcFormatFallbackCount, 1);
+  assert.equal(reg.getStats().mipClampCount, 1);
+
+  // Confirm pure helper validation
+  assert.throws(() => decodeCreateTexture2('not-a-dataview'), TypeError);
+  assert.throws(() => sanitizeTextureDescriptor(null), TypeError);
+  assert.throws(() => padBufferUploadData('not-a-buffer'), TypeError);
+  assert.deepEqual(clampMipLevelCount(undefined, 64, 64), {
+    mipLevelCount: 1,
+    maxMipLevels: 7,
+    clamped: false,
+  });
+  assert.deepEqual(clampSampleCount(undefined), {
+    sampleCount: 1,
+    clamped: false,
+  });
 });
