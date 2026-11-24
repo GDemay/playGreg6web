@@ -7,6 +7,7 @@ pub mod discover;
 pub mod eh;
 pub mod image;
 mod jump_table;
+mod reach;
 pub mod lift;
 pub mod pdata;
 pub mod pe;
