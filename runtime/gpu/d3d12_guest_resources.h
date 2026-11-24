@@ -281,6 +281,7 @@ public:
     void CopyBufferRegion(InterfaceArg<IResourceHost> dst, uint64_t dst_offset, InterfaceArg<IResourceHost> src,
                           uint64_t src_offset, uint64_t bytes) override;
     void CopyTextureRegion(com::CallContext& ctx) override;
+    void CopyTextureRegionX(com::CallContext& ctx) override;
     void CopyResource(InterfaceArg<IResourceHost> dst, InterfaceArg<IResourceHost> src) override;
     void ResolveSubresource(com::CallContext& ctx) override;
     void IASetPrimitiveTopology(uint32_t topology) override;

@@ -126,6 +126,7 @@
 //  49 SOSetTargets, 50 OMSetRenderTargets, 51 ClearDepthStencilView, 52 ClearRenderTargetView,
 //  53/54 ClearUnorderedAccessView, 55 DiscardResource. 56..58 debug markers (inferred), 61
 //  ExecuteIndirect (signature, max 1, args, offset, 0, 0). 70 OMSetDepthBounds (two floats),
+//  85 CopyTextureRegionX (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags),
 //  126 RSSetShadingRate (rate, combiners), 127 RSSetShadingRateImage (resource or 0).
 //  Xbox-only, meaning not established, recorded without effect: 59, 60, 62 (4 args), 72 (5 args,
 //  query related), 75 (1 arg), 86, 128 (&{1, value}), 129 (value, 1, 1), 131 (register-like
