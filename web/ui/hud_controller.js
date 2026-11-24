@@ -19,6 +19,29 @@ export const BOOT_MODE = Object.freeze({
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
 const MAX_SIDE_MODULE_NAMES = 64;
+const SIDE_MODULE_LAYOUT_RE =
+  /\bsplit-module\b[^()\r\n]*?\(\s*(\d+)\s+side\s+modules?\s*\)/i;
+const SIDE_MODULE_LOAD_RE =
+  /\b(?:loading|loaded)\s+wasm\s+side\s+module\s*\(([^)\r\n]+)\)|\bwasm\s+side\s+module\s+loaded\s*\(([^)\r\n]+)\)/i;
+const RUNTIME_STARTING_RE =
+  /\bloading\s+emscripten\s+wasm64\s+runtime\b|\blaunching\s+wasm64\s+runtime\b/i;
+const RUNTIME_INIT_RE =
+  /\b(?:playgta6web\s+)?wasm64\s+runtime\s+initialized\b/i;
+const POST_INIT_BOOT_STAGE_RE =
+  /\[(?:boot|wasm)\][^\r\n]*\b(TLS_INIT|CRT_INITTERM|ENTRY_CALL|XMEM_INIT|GDK_INIT|D3D12_CREATE_DEVICE|BINK_OPEN|FIRST_PRESENT)\b/i;
+const PROGRESS_LOG_FAILURE_RE = /\b(?:fail(?:ed|s|ure)?|error|abort(?:ed)?)\b/i;
+const POST_INIT_BOOT_STAGES = Object.freeze(
+  new Set([
+    'TLS_INIT',
+    'CRT_INITTERM',
+    'ENTRY_CALL',
+    'XMEM_INIT',
+    'GDK_INIT',
+    'D3D12_CREATE_DEVICE',
+    'BINK_OPEN',
+    'FIRST_PRESENT',
+  ])
+);
 
 const BOOT_MODE_META = Object.freeze({
   [BOOT_MODE.REAL_WASM64]: Object.freeze({
@@ -383,6 +406,60 @@ function sanitizeSideModuleName(raw) {
   return candidate;
 }
 
+/**
+ * Parses loader/session progress log labels emitted on `BroadcastChannel('game-progress')`
+ * or `hud.appendLog(...)` to detect split-module layout announcements, individual
+ * `guest_part_*.wasm` loads, runtime restarts, and Wasm64 runtime initialization.
+ *
+ * @param {unknown} raw
+ * @returns {
+ *   | { kind: 'layout', sideModuleCount: number }
+ *   | { kind: 'module', moduleName: string }
+ *   | { kind: 'runtime_initialized' }
+ *   | { kind: 'runtime_starting' }
+ *   | null
+ * }
+ */
+export function parseSideModuleProgressLabel(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const text = raw.trim();
+  if (!text) {
+    return null;
+  }
+
+  const moduleMatch = SIDE_MODULE_LOAD_RE.exec(text);
+  if (moduleMatch) {
+    const rawName = moduleMatch[1] || moduleMatch[2] || '';
+    const moduleName = sanitizeSideModuleName(rawName);
+    if (moduleName) {
+      return { kind: 'module', moduleName };
+    }
+    return null;
+  }
+
+  const layoutMatch = SIDE_MODULE_LAYOUT_RE.exec(text);
+  if (layoutMatch) {
+    return {
+      kind: 'layout',
+      sideModuleCount: toNonNegativeInt(layoutMatch[1], 0),
+    };
+  }
+
+  if (!PROGRESS_LOG_FAILURE_RE.test(text)) {
+    if (RUNTIME_INIT_RE.test(text) || POST_INIT_BOOT_STAGE_RE.test(text)) {
+      return { kind: 'runtime_initialized' };
+    }
+  }
+
+  if (RUNTIME_STARTING_RE.test(text)) {
+    return { kind: 'runtime_starting' };
+  }
+
+  return null;
+}
+
 function safeSetText(el, text) {
   if (!el || typeof el !== 'object') return;
   try {
@@ -520,9 +597,13 @@ export class HudController {
         : null;
 
     this._sideModuleCount = 0;
+    this._sideModuleTotalKnown = false;
     this._loadedSideModuleCount = 0;
     this._loadedSideModuleNames = [];
     this._currentSideModule = null;
+    this._runtimeInitialized = false;
+    this._inOwnHudLog = false;
+    this._hudLogHook = null;
 
     const resolvedMaxErrors =
       typeof maxValidationErrors === 'number' &&
@@ -551,6 +632,7 @@ export class HudController {
     if (initialDisplayEls) {
       this.bindDisplayElements(initialDisplayEls);
     }
+    this._attachHudLogObserver();
   }
 
   get isExportingMissingShaders() {
@@ -569,12 +651,74 @@ export class HudController {
     return null;
   }
 
+  _attachHudLogObserver() {
+    const hud = this._hud;
+    if (!hud || typeof hud !== 'object' || typeof hud.appendLog !== 'function') {
+      return;
+    }
+    const hasOwn = Object.prototype.hasOwnProperty.call(hud, 'appendLog');
+    const desc = hasOwn ? Object.getOwnPropertyDescriptor(hud, 'appendLog') : null;
+    if (desc && !desc.writable && !desc.configurable) {
+      return;
+    }
+    if (desc && desc.get && !desc.set) {
+      return;
+    }
+    if (!hasOwn && !Object.isExtensible(hud)) {
+      return;
+    }
+
+    const original = hud.appendLog;
+    const self = this;
+    const wrapped = function hudControllerAppendLogObserver(message, level) {
+      if (!self._destroyed && !self._inOwnHudLog) {
+        try {
+          self.ingestProgressLog(message, { updateHudStatus: false });
+        } catch {
+          // Progress log parsing must never disrupt HUD logging.
+        }
+      }
+      return original.apply(this, arguments);
+    };
+
+    try {
+      hud.appendLog = wrapped;
+      this._hudLogHook = { hud, original, wrapped, hasOwn };
+    } catch {
+      // Ignore frozen or non-writable HUD objects.
+      this._hudLogHook = null;
+    }
+  }
+
+  _detachHudLogObserver() {
+    const hook = this._hudLogHook;
+    this._hudLogHook = null;
+    if (!hook || !hook.hud) {
+      return;
+    }
+    try {
+      if (hook.hud.appendLog === hook.wrapped) {
+        if (hook.hasOwn) {
+          hook.hud.appendLog = hook.original;
+        } else {
+          delete hook.hud.appendLog;
+        }
+      }
+    } catch {
+      // Ignore teardown errors on frozen/detached HUD objects.
+    }
+  }
+
   _hudLog(message, level = 'info') {
     if (this._hud && typeof this._hud.appendLog === 'function') {
+      const prev = this._inOwnHudLog;
+      this._inOwnHudLog = true;
       try {
         this._hud.appendLog(String(message ?? ''), level);
       } catch {
         // Never allow HUD logging errors to break action execution.
+      } finally {
+        this._inOwnHudLog = prev;
       }
     }
   }
@@ -1330,6 +1474,18 @@ export class HudController {
       };
       this.setSideModuleProgress(progressInput, { updateHudStatus: false });
       changed = false; // setSideModuleProgress already rendered.
+    } else if (
+      summary &&
+      typeof summary.stage === 'string' &&
+      POST_INIT_BOOT_STAGES.has(summary.stage.trim().toUpperCase()) &&
+      !this._isActiveSmokeSession() &&
+      this.getBootMode() !== BOOT_MODE.SMOKE
+    ) {
+      this._runtimeInitialized = true;
+      if (this._sideModuleCount > 0 && this._loadedSideModuleCount < this._sideModuleCount) {
+        this._loadedSideModuleCount = this._sideModuleCount;
+        changed = true;
+      }
     }
 
     if (Array.isArray(payload.validationErrors)) {
@@ -1491,8 +1647,10 @@ export class HudController {
 
     if (explicitTotal !== undefined) {
       this._sideModuleCount = toNonNegativeInt(explicitTotal, 0);
+      this._sideModuleTotalKnown = this._sideModuleCount > 0;
     } else if (rawList !== null) {
       this._sideModuleCount = rawList.length;
+      this._sideModuleTotalKnown = this._sideModuleCount > 0;
     }
 
     if (rawLoadedList !== null) {
@@ -1506,8 +1664,9 @@ export class HudController {
               ? item.name || item.url || item.path
               : null
         );
-        if (name && !seen.has(name)) {
-          seen.add(name);
+        const key = name ? name.toLowerCase() : null;
+        if (name && key && !seen.has(key)) {
+          seen.add(key);
           if (cleaned.length < MAX_SIDE_MODULE_NAMES) {
             cleaned.push(name);
           }
@@ -1530,8 +1689,21 @@ export class HudController {
 
     if (explicitLoaded !== undefined) {
       this._loadedSideModuleCount = toNonNegativeInt(explicitLoaded, 0);
+      if (this._loadedSideModuleCount === 0 && rawLoadedList === null) {
+        this._loadedSideModuleNames = [];
+        this._currentSideModule = null;
+        this._runtimeInitialized = false;
+      }
     } else if (rawLoadedList !== null) {
       this._loadedSideModuleCount = this._loadedSideModuleNames.length;
+    } else if (
+      this._runtimeInitialized &&
+      this._sideModuleCount > 0 &&
+      this._loadedSideModuleCount < this._sideModuleCount &&
+      !this._isActiveSmokeSession() &&
+      this.getBootMode() !== BOOT_MODE.SMOKE
+    ) {
+      this._loadedSideModuleCount = this._sideModuleCount;
     }
 
     if (typeof progress.currentModule === 'string') {
@@ -1545,9 +1717,17 @@ export class HudController {
       this._loadedSideModuleCount = this._sideModuleCount;
     }
     if (this._sideModuleCount === 0 && this._loadedSideModuleCount === 0) {
+      this._sideModuleTotalKnown = false;
       this._loadedSideModuleNames = [];
       this._currentSideModule = null;
     }
+  }
+
+  /**
+   * Alias for `setSideModuleProgress()` matching app_bootstrap preflight hooks.
+   */
+  setSideModules(progress, options = {}) {
+    return this.setSideModuleProgress(progress, options);
   }
 
   /**
@@ -1584,7 +1764,7 @@ export class HudController {
    * sanitizing any host path or query string to its safe basename and deduplicating names.
    *
    * @param {string} moduleName
-   * @param {{ sideModuleCount?: number, updateHudStatus?: boolean }} [options]
+   * @param {{ sideModuleCount?: number, capToTotal?: boolean, updateHudStatus?: boolean }} [options]
    */
   recordSideModuleLoaded(moduleName, options = {}) {
     if (this._destroyed) {
@@ -1596,11 +1776,18 @@ export class HudController {
         this._sideModuleCount,
         toNonNegativeInt(opts.sideModuleCount, 0)
       );
+      if (this._sideModuleCount > 0) {
+        this._sideModuleTotalKnown = true;
+      }
     }
 
     const safeName = sanitizeSideModuleName(moduleName);
     if (safeName) {
-      if (!this._loadedSideModuleNames.includes(safeName)) {
+      const safeLower = safeName.toLowerCase();
+      const alreadyLoaded = this._loadedSideModuleNames.some(
+        (existing) => existing.toLowerCase() === safeLower
+      );
+      if (!alreadyLoaded) {
         if (this._loadedSideModuleNames.length < MAX_SIDE_MODULE_NAMES) {
           this._loadedSideModuleNames.push(safeName);
         }
@@ -1614,7 +1801,11 @@ export class HudController {
       this._loadedSideModuleCount += 1;
     }
 
-    if (this._loadedSideModuleCount > this._sideModuleCount) {
+    if (opts.capToTotal === true && this._sideModuleCount > 0) {
+      if (this._loadedSideModuleCount > this._sideModuleCount) {
+        this._loadedSideModuleCount = this._sideModuleCount;
+      }
+    } else if (this._loadedSideModuleCount > this._sideModuleCount) {
       this._sideModuleCount = this._loadedSideModuleCount;
     }
 
@@ -1622,6 +1813,99 @@ export class HudController {
       updateHudStatus: opts.updateHudStatus === true,
     });
     return this.getSideModuleProgress();
+  }
+
+  /**
+   * Ingests a progress log label (e.g. `Split-module Wasm64 layout detected (5 side modules).`,
+   * `Loading Wasm side module (guest_part_0.wasm)...`, or
+   * `[wasm] playgta6web Wasm64 runtime initialized (ABI v1)`) and updates split-module
+   * progress state and bound HUD display elements accordingly.
+   *
+   * @param {unknown} label
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  ingestProgressLog(label, options = {}) {
+    if (this._destroyed) {
+      return null;
+    }
+    const parsed = parseSideModuleProgressLabel(label);
+    if (!parsed) {
+      return null;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    const updateHudStatus = opts.updateHudStatus === true;
+
+    if (parsed.kind === 'runtime_starting') {
+      if (this._runtimeInitialized) {
+        this._runtimeInitialized = false;
+        this._loadedSideModuleCount = 0;
+        this._loadedSideModuleNames = [];
+        this._currentSideModule = null;
+        if (this._sideModuleCount > 0) {
+          this._renderBootDiagnostics({ updateHudStatus });
+        }
+      }
+      return {
+        handled: true,
+        kind: parsed.kind,
+        progress: this.getSideModuleProgress(),
+      };
+    }
+
+    if (parsed.kind === 'layout') {
+      if (this._runtimeInitialized) {
+        this._runtimeInitialized = false;
+        this._loadedSideModuleCount = 0;
+        this._loadedSideModuleNames = [];
+        this._currentSideModule = null;
+        this._sideModuleCount = parsed.sideModuleCount;
+        this._sideModuleTotalKnown = parsed.sideModuleCount > 0;
+      } else if (parsed.sideModuleCount > 0) {
+        this._sideModuleTotalKnown = true;
+        this._sideModuleCount = Math.max(this._sideModuleCount, parsed.sideModuleCount);
+      } else if (this._loadedSideModuleCount === 0) {
+        this._sideModuleTotalKnown = false;
+        this._sideModuleCount = 0;
+      }
+      this._renderBootDiagnostics({ updateHudStatus });
+      return {
+        handled: true,
+        kind: parsed.kind,
+        sideModuleCount: parsed.sideModuleCount,
+        progress: this.getSideModuleProgress(),
+      };
+    }
+
+    if (parsed.kind === 'module') {
+      const progress = this.recordSideModuleLoaded(parsed.moduleName, {
+        updateHudStatus,
+        capToTotal: this._sideModuleTotalKnown,
+      });
+      return {
+        handled: true,
+        kind: parsed.kind,
+        moduleName: parsed.moduleName,
+        progress,
+      };
+    }
+
+    if (parsed.kind === 'runtime_initialized') {
+      if (this._isActiveSmokeSession() || this.getBootMode() === BOOT_MODE.SMOKE) {
+        return null;
+      }
+      this._runtimeInitialized = true;
+      if (this._sideModuleCount > 0 && this._loadedSideModuleCount < this._sideModuleCount) {
+        this._loadedSideModuleCount = this._sideModuleCount;
+        this._renderBootDiagnostics({ updateHudStatus });
+      }
+      return {
+        handled: true,
+        kind: parsed.kind,
+        progress: this.getSideModuleProgress(),
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -1635,9 +1919,11 @@ export class HudController {
     }
     const opts = isPlainObject(options) ? options : {};
     this._sideModuleCount = 0;
+    this._sideModuleTotalKnown = false;
     this._loadedSideModuleCount = 0;
     this._loadedSideModuleNames = [];
     this._currentSideModule = null;
+    this._runtimeInitialized = false;
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
     });
@@ -2229,6 +2515,11 @@ export class HudController {
     }
 
     try {
+      this._loadedSideModuleCount = 0;
+      this._loadedSideModuleNames = [];
+      this._currentSideModule = null;
+      this._runtimeInitialized = false;
+
       const sessionResult = await this._sessionController.restart({ preferSmoke });
       const state = this._getSessionState();
       const mode = this._getSessionMode();
@@ -2388,6 +2679,7 @@ export class HudController {
    * Tears down all bound DOM listeners and marks this controller destroyed. Idempotent.
    */
   destroy() {
+    this._detachHudLogObserver();
     this.unbindButtons();
     this.unbindDisplayElements();
     this._destroyed = true;
