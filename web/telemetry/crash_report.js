@@ -19,11 +19,38 @@ export const ERROR_CATEGORIES = Object.freeze([
   'runtime',
 ]);
 
+export const BOOT_ERROR_CODES = Object.freeze({
+  WASM_MODULE_TOO_LARGE: 'WASM_MODULE_TOO_LARGE',
+  WASM64_UNSUPPORTED: 'WASM64_UNSUPPORTED',
+  COI_SAB_MISSING: 'COI_SAB_MISSING',
+  WORKER_SCRIPT_COLLISION: 'WORKER_SCRIPT_COLLISION',
+  HTTPFS_PGIM_ERROR: 'HTTPFS_PGIM_ERROR',
+  UNKNOWN_BOOT_ERROR: 'UNKNOWN_BOOT_ERROR',
+});
+
 export const LOG_LEVELS = Object.freeze(['debug', 'info', 'ok', 'warn', 'error']);
 
 const ERROR_CATEGORY_SET = new Set(ERROR_CATEGORIES);
 const LOG_LEVEL_SET = new Set(LOG_LEVELS);
 const MAX_SANITIZE_DEPTH = 16;
+const MAX_BOOT_MILESTONES = 32;
+const MAX_BOOT_TRAPS = 32;
+const MAX_BOOT_UNRESOLVED_IMPORTS = 64;
+const MAX_GPU_MISSING_SHADERS = 64;
+
+const WASM_MODULE_TOO_LARGE_RE =
+  /\b(?:exceeds\s+maximum\s+size\s+of\s+1073741824|buffer\s+source\s+exceeds\s+maximum\s+size|(?:wasm\s+)?module\s+(?:size\s+)?exceeds\s+(?:the\s+)?(?:1\s*gib|1073741824|maximum\s+size))\b/i;
+
+const WASM64_UNSUPPORTED_RE =
+  /\b(?:wasm64|memory64)\b[^.\n]{0,80}\b(?:unsupported|not\s+supported|not\s+enabled|unavailable|disabled|missing|required|failed)\b|\b(?:unsupported|not\s+supported|does\s+not\s+support|unavailable|disabled|missing|no|lacks?)\b[^.\n]{0,80}\b(?:wasm64|memory64)\b|\b(?:invalid|unsupported|unknown)\s+(?:memory\s+)?(?:address|index)(?:\s+type)?\s*[:=]?\s*['"]?i64['"]?|\bi64\s+memory\s+(?:address|index)\b[^.\n]{0,40}\b(?:unsupported|not\s+supported|disabled|invalid)\b/i;
+
+const COI_SAB_MISSING_RE =
+  /\bsharedarraybuffer\b[^.\n]{0,80}\b(?:not\s+defined|undefined|missing|unavailable|disabled|unsupported|not\s+supported|requires?\s+cross[\s-]*origin|cannot\s+be\s+(?:created|used|transferred|cloned))\b|\b(?:missing|no|lacks?|requires?|without|not)\b[^.\n]{0,80}\b(?:sharedarraybuffer|cross[\s-]*origin[\s-]*isolat(?:ed|ion)|coop\s*\/\s*coep)\b|\bcross[\s-]*origin[\s-]*isolat(?:ed|ion)\b[^.\n]{0,80}\b(?:false|missing|required|disabled|unavailable|not\s+enabled|not\s+active)\b|\b(?:coop\s*\/\s*coep|cross-origin-(?:opener|embedder)-policy)\b/i;
+
+const WORKER_SCRIPT_COLLISION_RE =
+  /\bhas\s+already\s+been\s+declared\b|\bredeclaration\s+of\s+(?:const|let|var|class|function)\b/i;
+
+const HTTPFS_PGIM_RE = /\b(?:httpfs|pgim)\b|\.pgim\b/i;
 
 const FILE_URL_RE =
   /\bfile:\/\/[^\s"'`<>)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]}]|$)/gi;
@@ -373,6 +400,500 @@ export function classifyError(errorOrMessage, preferredCategory = null) {
   return 'runtime';
 }
 
+function extractRawBootErrorText(errorOrMessage) {
+  if (errorOrMessage === null || errorOrMessage === undefined) {
+    return { rawName: '', rawMessage: '' };
+  }
+  if (typeof errorOrMessage === 'string') {
+    return { rawName: '', rawMessage: errorOrMessage };
+  }
+  if (typeof errorOrMessage === 'object') {
+    const rawName = typeof errorOrMessage.name === 'string' ? errorOrMessage.name : '';
+    const rawMessage =
+      typeof errorOrMessage.message === 'string'
+        ? errorOrMessage.message
+        : typeof errorOrMessage.reason === 'string'
+          ? errorOrMessage.reason
+          : String(errorOrMessage);
+    return { rawName, rawMessage };
+  }
+  return { rawName: '', rawMessage: String(errorOrMessage) };
+}
+
+/**
+ * Classifies common browser Wasm64 boot failures into a structured diagnostic
+ * `{ code, category, hint, message }` with a sanitized message (zero host paths,
+ * drive letters, usernames, or auth tokens).
+ *
+ * @param {unknown} errorOrMessage
+ * @returns {{ code: string, category: string, hint: string, message: string }}
+ */
+export function classifyBootError(errorOrMessage) {
+  const { rawName, rawMessage } = extractRawBootErrorText(errorOrMessage);
+  const combined = rawName ? `${rawName}: ${rawMessage}` : rawMessage;
+  const message = sanitizeString(rawMessage);
+
+  if (WASM_MODULE_TOO_LARGE_RE.test(combined)) {
+    return {
+      code: BOOT_ERROR_CODES.WASM_MODULE_TOO_LARGE,
+      category: 'wasm_compile',
+      hint: 'Guest Wasm module exceeds V8 1 GiB compile limit (1073741824 bytes). Rebuild with --opt Oz --no-link-opt --strip to shrink the binary.',
+      message,
+    };
+  }
+
+  if (WASM64_UNSUPPORTED_RE.test(combined)) {
+    return {
+      code: BOOT_ERROR_CODES.WASM64_UNSUPPORTED,
+      category: 'capability',
+      hint: 'Browser lacks WebAssembly Memory64 (Wasm64) support. Use Chrome/Edge 133+ or Firefox 134+ with memory64 enabled.',
+      message,
+    };
+  }
+
+  if (COI_SAB_MISSING_RE.test(combined)) {
+    return {
+      code: BOOT_ERROR_CODES.COI_SAB_MISSING,
+      category: 'capability',
+      hint: 'SharedArrayBuffer requires cross-origin isolation. Serve with Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: require-corp headers.',
+      message,
+    };
+  }
+
+  if (WORKER_SCRIPT_COLLISION_RE.test(combined)) {
+    return {
+      code: BOOT_ERROR_CODES.WORKER_SCRIPT_COLLISION,
+      category: 'worker',
+      hint: 'Classic worker importScripts identifier collision detected. Wrap helper scripts in UMD IIFEs so top-level const/let declarations do not collide.',
+      message,
+    };
+  }
+
+  if (HTTPFS_PGIM_RE.test(combined)) {
+    return {
+      code: BOOT_ERROR_CODES.HTTPFS_PGIM_ERROR,
+      category: 'io',
+      hint: 'HTTPFS/PGIM image load failed. Verify the local Range-capable HTTP server is running and /game/boot.pgim (or PGIM segments) are staged.',
+      message,
+    };
+  }
+
+  return {
+    code: BOOT_ERROR_CODES.UNKNOWN_BOOT_ERROR,
+    category: 'runtime',
+    hint: 'Inspect the sanitized error message, stack trace, and bootDiagnostics snapshot for the failing boot stage.',
+    message,
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && !isBinaryBuffer(value));
+}
+
+function clipSanitizedString(value, maxLen = 256) {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const safe = sanitizeString(value);
+  return safe.length > maxLen ? `${safe.slice(0, maxLen - 3)}...` : safe;
+}
+
+function pickNonNegInt(obj, key) {
+  const val = obj[key];
+  if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+    return Math.floor(val);
+  }
+  return undefined;
+}
+
+function pickNonNegNumber(obj, key) {
+  const val = obj[key];
+  if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+    return val;
+  }
+  return undefined;
+}
+
+function pickPct(obj, key) {
+  const val = obj[key];
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return Math.min(100, Math.max(0, val));
+  }
+  return undefined;
+}
+
+function sanitizeTrapRecord(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const out = {};
+  const seq = pickNonNegInt(raw, 'seq');
+  if (seq !== undefined) out.seq = seq;
+  const kind = clipSanitizedString(raw.kind, 64);
+  if (kind !== undefined) out.kind = kind;
+  if (raw.guestVa === null) {
+    out.guestVa = null;
+  } else {
+    const guestVa = clipSanitizedString(raw.guestVa, 32);
+    if (guestVa !== undefined) out.guestVa = guestVa;
+  }
+  if (raw.dll === null) {
+    out.dll = null;
+  } else {
+    const dll = clipSanitizedString(raw.dll, 128);
+    if (dll !== undefined) out.dll = dll;
+  }
+  if (raw.symbol === null) {
+    out.symbol = null;
+  } else {
+    const symbol = clipSanitizedString(raw.symbol, 256);
+    if (symbol !== undefined) out.symbol = symbol;
+  }
+  if (raw.import === null) {
+    out.import = null;
+  } else {
+    const imp = clipSanitizedString(raw.import, 256);
+    if (imp !== undefined) out.import = imp;
+  }
+  const message = clipSanitizedString(raw.message, 512);
+  if (message !== undefined) out.message = message;
+  if (typeof raw.fatal === 'boolean') out.fatal = raw.fatal;
+  const elapsedMs = pickNonNegNumber(raw, 'elapsedMs');
+  if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  const stage = clipSanitizedString(raw.stage, 64);
+  if (stage !== undefined) out.stage = stage;
+  const count = pickNonNegInt(raw, 'count');
+  if (count !== undefined) out.count = count;
+  return out;
+}
+
+function sanitizeUnresolvedImportRecord(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const out = {};
+  const name = clipSanitizedString(raw.name, 256);
+  if (name !== undefined) out.name = name;
+  if (raw.dll === null) {
+    out.dll = null;
+  } else {
+    const dll = clipSanitizedString(raw.dll, 128);
+    if (dll !== undefined) out.dll = dll;
+  }
+  if (raw.symbol === null) {
+    out.symbol = null;
+  } else {
+    const symbol = clipSanitizedString(raw.symbol, 256);
+    if (symbol !== undefined) out.symbol = symbol;
+  }
+  if (raw.ordinal === null) {
+    out.ordinal = null;
+  } else {
+    const ordinal = pickNonNegInt(raw, 'ordinal');
+    if (ordinal !== undefined) out.ordinal = ordinal;
+  }
+  if (raw.guestVa === null) {
+    out.guestVa = null;
+  } else {
+    const guestVa = clipSanitizedString(raw.guestVa, 32);
+    if (guestVa !== undefined) out.guestVa = guestVa;
+  }
+  const count = pickNonNegInt(raw, 'count');
+  if (count !== undefined) out.count = count;
+  const firstElapsedMs = pickNonNegNumber(raw, 'firstElapsedMs');
+  if (firstElapsedMs !== undefined) out.firstElapsedMs = firstElapsedMs;
+  const lastElapsedMs = pickNonNegNumber(raw, 'lastElapsedMs');
+  if (lastElapsedMs !== undefined) out.lastElapsedMs = lastElapsedMs;
+  return out;
+}
+
+function sanitizeMilestoneRecord(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  const out = {};
+  const milestone = clipSanitizedString(raw.milestone, 64);
+  if (milestone !== undefined) out.milestone = milestone;
+  const index = pickNonNegInt(raw, 'index');
+  if (index !== undefined) out.index = index;
+  if (typeof raw.reached === 'boolean') out.reached = raw.reached;
+  if (raw.elapsedMs === null) {
+    out.elapsedMs = null;
+  } else {
+    const elapsedMs = pickNonNegNumber(raw, 'elapsedMs');
+    if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  }
+  if (raw.lastElapsedMs === null) {
+    out.lastElapsedMs = null;
+  } else {
+    const lastElapsedMs = pickNonNegNumber(raw, 'lastElapsedMs');
+    if (lastElapsedMs !== undefined) out.lastElapsedMs = lastElapsedMs;
+  }
+  const count = pickNonNegInt(raw, 'count');
+  if (count !== undefined) out.count = count;
+  if (raw.detail === null) {
+    out.detail = null;
+  } else if (isPlainObject(raw.detail)) {
+    const detail = {};
+    const source = clipSanitizedString(raw.detail.source, 64);
+    if (source !== undefined) detail.source = source;
+    const line = clipSanitizedString(raw.detail.line, 256);
+    if (line !== undefined) detail.line = line;
+    if (Object.keys(detail).length > 0) {
+      out.detail = detail;
+    }
+  }
+  return out;
+}
+
+/**
+ * Strictly allowlists and sanitizes a boot summary snapshot (or BootTracer instance).
+ * Drops unknown keys, binary buffers, and redacts any host paths or secrets in strings.
+ *
+ * @param {unknown} raw
+ * @returns {object|null}
+ */
+function sanitizeBootSnapshot(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getSummary === 'function') {
+    try {
+      source = source.getSummary();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+
+  const out = {};
+
+  const stage = clipSanitizedString(source.stage, 64);
+  if (stage !== undefined) out.stage = stage;
+  const mode = clipSanitizedString(source.mode, 64);
+  if (mode !== undefined) out.mode = mode;
+  const bootMode = clipSanitizedString(source.bootMode, 64);
+  if (bootMode !== undefined) out.bootMode = bootMode;
+  const status = clipSanitizedString(source.status, 64);
+  if (status !== undefined) out.status = status;
+
+  const progressPct = pickPct(source, 'progressPct');
+  if (progressPct !== undefined) out.progressPct = progressPct;
+  if (typeof source.readyForSplash === 'boolean') out.readyForSplash = source.readyForSplash;
+
+  const elapsedMs = pickNonNegNumber(source, 'elapsedMs');
+  if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  const milestonesReached = pickNonNegInt(source, 'milestonesReached');
+  if (milestonesReached !== undefined) out.milestonesReached = milestonesReached;
+
+  if (Array.isArray(source.milestones)) {
+    const milestones = [];
+    for (let i = 0; i < source.milestones.length && milestones.length < MAX_BOOT_MILESTONES; i += 1) {
+      const clean = sanitizeMilestoneRecord(source.milestones[i]);
+      if (clean && Object.keys(clean).length > 0) {
+        milestones.push(clean);
+      }
+    }
+    out.milestones = milestones;
+  }
+
+  const trapCount = pickNonNegInt(source, 'trapCount');
+  if (trapCount !== undefined) out.trapCount = trapCount;
+  const uniqueTrapCount = pickNonNegInt(source, 'uniqueTrapCount');
+  if (uniqueTrapCount !== undefined) out.uniqueTrapCount = uniqueTrapCount;
+
+  if (source.lastTrap === null) {
+    out.lastTrap = null;
+  } else if (source.lastTrap !== undefined) {
+    const cleanTrap = sanitizeTrapRecord(source.lastTrap);
+    if (cleanTrap) {
+      out.lastTrap = cleanTrap;
+    }
+  }
+
+  if (Array.isArray(source.unresolvedImports)) {
+    const unresolvedImports = [];
+    for (
+      let i = 0;
+      i < source.unresolvedImports.length && unresolvedImports.length < MAX_BOOT_UNRESOLVED_IMPORTS;
+      i += 1
+    ) {
+      const clean = sanitizeUnresolvedImportRecord(source.unresolvedImports[i]);
+      if (clean && Object.keys(clean).length > 0) {
+        unresolvedImports.push(clean);
+      }
+    }
+    out.unresolvedImports = unresolvedImports;
+  }
+
+  if (Array.isArray(source.recentTraps)) {
+    const recentTraps = [];
+    for (let i = 0; i < source.recentTraps.length && recentTraps.length < MAX_BOOT_TRAPS; i += 1) {
+      const clean = sanitizeTrapRecord(source.recentTraps[i]);
+      if (clean && Object.keys(clean).length > 0) {
+        recentTraps.push(clean);
+      }
+    }
+    out.recentTraps = recentTraps;
+  }
+
+  const wasmModuleBytes = pickNonNegNumber(source, 'wasmModuleBytes');
+  if (wasmModuleBytes !== undefined) out.wasmModuleBytes = wasmModuleBytes;
+  const wasmSizeBytes = pickNonNegNumber(source, 'wasmSizeBytes');
+  if (wasmSizeBytes !== undefined) out.wasmSizeBytes = wasmSizeBytes;
+  const pgimBytes = pickNonNegNumber(source, 'pgimBytes');
+  if (pgimBytes !== undefined) out.pgimBytes = pgimBytes;
+  const pgimSegments = pickNonNegInt(source, 'pgimSegments');
+  if (pgimSegments !== undefined) out.pgimSegments = pgimSegments;
+  const shaderPackCount = pickNonNegInt(source, 'shaderPackCount');
+  if (shaderPackCount !== undefined) out.shaderPackCount = shaderPackCount;
+
+  if (typeof source.updatedAt === 'string') {
+    const updatedAt = clipSanitizedString(source.updatedAt, 64);
+    if (updatedAt !== undefined) out.updatedAt = updatedAt;
+  } else {
+    const updatedAtNum = pickNonNegNumber(source, 'updatedAt');
+    if (updatedAtNum !== undefined) out.updatedAt = updatedAtNum;
+  }
+
+  return out;
+}
+
+function sanitizeMissingShaderEntry(raw) {
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+  let hash;
+  if (typeof raw.hash === 'bigint' && raw.hash >= 0n) {
+    hash = `0x${raw.hash.toString(16).padStart(16, '0')}`;
+  } else if (typeof raw.hash === 'string') {
+    hash = clipSanitizedString(raw.hash, 64);
+  } else if (typeof raw.hashHex === 'string') {
+    hash = clipSanitizedString(raw.hashHex, 64);
+  }
+  const stage = clipSanitizedString(raw.stage, 32);
+  const hits = pickNonNegInt(raw, 'hits') ?? pickNonNegInt(raw, 'count');
+  const firstSeenFrame = pickNonNegInt(raw, 'firstSeenFrame');
+
+  if (hash === undefined && stage === undefined && hits === undefined) {
+    return null;
+  }
+  const out = {};
+  if (hash !== undefined) out.hash = hash;
+  if (stage !== undefined) out.stage = stage;
+  if (hits !== undefined) out.hits = hits;
+  if (firstSeenFrame !== undefined) out.firstSeenFrame = firstSeenFrame;
+  return out;
+}
+
+/**
+ * Strictly allowlists and sanitizes a GPU telemetry snapshot.
+ * Drops unknown keys, shader sources, and raw binary buffers; redacts host paths/tokens.
+ *
+ * @param {unknown} raw
+ * @returns {object|null}
+ */
+function sanitizeGpuTelemetry(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (!isPlainObject(raw)) {
+    return null;
+  }
+
+  const out = {};
+
+  const timestamp = pickNonNegNumber(raw, 'timestamp');
+  if (timestamp !== undefined) out.timestamp = timestamp;
+  const adapter = clipSanitizedString(raw.adapter, 128);
+  if (adapter !== undefined) out.adapter = adapter;
+  const backend = clipSanitizedString(raw.backend, 64);
+  if (backend !== undefined) out.backend = backend;
+  if (typeof raw.deviceLost === 'boolean') out.deviceLost = raw.deviceLost;
+
+  for (const intKey of [
+    'validationErrors',
+    'shaderPackCount',
+    'loadedShaders',
+    'pipelineCount',
+    'bufferCount',
+    'textureCount',
+    'framesPresented',
+    'droppedFrames',
+    'drawCalls',
+    'computeDispatches',
+    'packetsProcessed',
+  ]) {
+    const val = pickNonNegInt(raw, intKey);
+    if (val !== undefined) out[intKey] = val;
+  }
+
+  if (isPlainObject(raw.frameStats)) {
+    const fs = {};
+    for (const intKey of [
+      'framesPresented',
+      'droppedFrames',
+      'drawCalls',
+      'computeDispatches',
+      'packetsProcessed',
+      'ringBytesDrained',
+      'width',
+      'height',
+    ]) {
+      const val = pickNonNegInt(raw.frameStats, intKey);
+      if (val !== undefined) fs[intKey] = val;
+    }
+    for (const numKey of ['lastFrameMs', 'avgFrameMs']) {
+      const val = pickNonNegNumber(raw.frameStats, numKey);
+      if (val !== undefined) fs[numKey] = val;
+    }
+    out.frameStats = fs;
+  }
+
+  const rawFallback = isPlainObject(raw.fallbackStats)
+    ? raw.fallbackStats
+    : isPlainObject(raw.shaderFallbackStats)
+      ? raw.shaderFallbackStats
+      : null;
+  if (rawFallback) {
+    const fb = {};
+    for (const intKey of [
+      'packHits',
+      'fallbackHits',
+      'builtinHits',
+      'totalLookups',
+      'uniqueMissing',
+      'overflowMissingCount',
+    ]) {
+      const val = pickNonNegInt(rawFallback, intKey);
+      if (val !== undefined) fb[intKey] = val;
+    }
+    const hitRatePct = pickPct(rawFallback, 'hitRatePct');
+    if (hitRatePct !== undefined) fb.hitRatePct = hitRatePct;
+    out.fallbackStats = fb;
+  }
+
+  if (Array.isArray(raw.missingShaders)) {
+    const missingShaders = [];
+    for (
+      let i = 0;
+      i < raw.missingShaders.length && missingShaders.length < MAX_GPU_MISSING_SHADERS;
+      i += 1
+    ) {
+      const clean = sanitizeMissingShaderEntry(raw.missingShaders[i]);
+      if (clean) {
+        missingShaders.push(clean);
+      }
+    }
+    out.missingShaders = missingShaders;
+  }
+
+  return out;
+}
+
 function extractErrorFields(errorOrMessage) {
   if (typeof errorOrMessage === 'string') {
     return {
@@ -517,6 +1038,9 @@ export class CrashReporter {
 
     this._logs = new BoundedRing(maxLogs);
     this._errors = new BoundedRing(maxErrors);
+    this._errorClassifications = new WeakMap();
+    this._bootSnapshot = null;
+    this._gpuTelemetry = null;
 
     this._attachedTarget = null;
     this._boundOnError = null;
@@ -548,11 +1072,57 @@ export class CrashReporter {
   }
 
   /**
-   * Clears all buffered logs and errors without detaching global handlers.
+   * Clears all buffered logs, errors, and attached boot/GPU snapshots without detaching global handlers.
    */
   clear() {
     this._logs.clear();
     this._errors.clear();
+    this._bootSnapshot = null;
+    this._gpuTelemetry = null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized boot summary snapshot (or `BootTracer` instance)
+   * to include under `bootDiagnostics.bootSnapshot` in exported diagnostic bundles.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} summary
+   * @returns {object|null}
+   */
+  setBootSnapshot(summary) {
+    this._bootSnapshot = sanitizeBootSnapshot(summary);
+    return this.getBootSnapshot();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached boot snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getBootSnapshot() {
+    return this._bootSnapshot ? sanitizeValue(this._bootSnapshot) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized GPU telemetry snapshot to include under
+   * `bootDiagnostics.gpuTelemetry` in exported diagnostic bundles.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setGpuTelemetry(snapshot) {
+    this._gpuTelemetry = sanitizeGpuTelemetry(snapshot);
+    return this.getGpuTelemetry();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached GPU telemetry snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getGpuTelemetry() {
+    return this._gpuTelemetry ? sanitizeValue(this._gpuTelemetry) : null;
   }
 
   /**
@@ -616,6 +1186,7 @@ export class CrashReporter {
       context: sanitizedContext,
     };
 
+    this._errorClassifications.set(entry, classifyBootError(errorOrMessage));
     this._errors.push(entry);
     return entry;
   }
@@ -752,10 +1323,21 @@ export class CrashReporter {
    * @param {object} [options.perfSnapshot] A `PerfMonitor.getSnapshot()` object or `PerfMonitor` instance.
    * @param {object} [options.storageSummary]
    * @param {object} [options.serverStatus]
+   * @param {object} [options.bootSnapshot] Optional per-report boot summary override.
+   * @param {object} [options.bootSummary] Alias for `bootSnapshot`.
+   * @param {object} [options.gpuTelemetry] Optional per-report GPU telemetry override.
    * @param {unknown} [options.extra]
    * @returns {object}
    */
-  buildReport({ perfSnapshot, storageSummary, serverStatus, extra } = {}) {
+  buildReport({
+    perfSnapshot,
+    storageSummary,
+    serverStatus,
+    bootSnapshot,
+    bootSummary,
+    gpuTelemetry,
+    extra,
+  } = {}) {
     const ts = this._now();
 
     let resolvedPerf = null;
@@ -767,16 +1349,46 @@ export class CrashReporter {
       }
     }
 
+    const recentErrors = this._errors.toArray();
+    const classifiedErrors = [];
+    const errorCodeCounts = {};
+    for (let i = 0; i < recentErrors.length; i += 1) {
+      const errEntry = recentErrors[i];
+      const classified = this._errorClassifications.get(errEntry) || classifyBootError(errEntry);
+      classifiedErrors.push({
+        timestamp: errEntry.timestamp,
+        timestampMs: errEntry.timestampMs,
+        errorCategory: errEntry.category,
+        code: classified.code,
+        category: classified.category,
+        hint: classified.hint,
+        message: classified.message,
+      });
+      errorCodeCounts[classified.code] = (errorCodeCounts[classified.code] || 0) + 1;
+    }
+
+    const rawBootOverride = bootSnapshot !== undefined ? bootSnapshot : bootSummary;
+    const resolvedBootSnapshot =
+      rawBootOverride !== undefined ? sanitizeBootSnapshot(rawBootOverride) : this._bootSnapshot;
+    const resolvedGpuTelemetry =
+      gpuTelemetry !== undefined ? sanitizeGpuTelemetry(gpuTelemetry) : this._gpuTelemetry;
+
     const report = {
       schemaVersion: SCHEMA_VERSION,
       generatedAt: formatIsoTimestamp(ts),
       appVersion: this._appVersion,
       capabilities: this.collectCapabilities(),
-      errors: this._errors.toArray(),
+      errors: recentErrors,
       recentLogs: this._logs.toArray(),
       perf: resolvedPerf,
       storage: storageSummary !== undefined ? storageSummary : null,
       serverStatus: serverStatus !== undefined ? serverStatus : null,
+      bootDiagnostics: {
+        classifiedErrors,
+        errorCodeCounts,
+        bootSnapshot: resolvedBootSnapshot,
+        gpuTelemetry: resolvedGpuTelemetry,
+      },
     };
 
     if (extra !== undefined) {
