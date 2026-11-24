@@ -553,7 +553,9 @@ test('W100 handler recovers a torn-down device end-to-end and resumes presenting
       assert.equal(processor.isDeviceRecovering, false);
       assert.equal(processor.device, second.device);
       assert.equal(processor.ctx, ctx);
-      assert.equal(processor.buffers.size, 0);
+      // W104: the live buffer is replayed onto the recovered device (stale handle dropped).
+      assert.equal(processor.buffers.size, 1);
+      assert.equal(processor.buffers.get(3).label, 'second');
       assert.ok(processor.extension, 'packet ABI v2 extensions reinstalled');
 
       await handler.handleMessage({ cmdBuffer: framePackets() });
