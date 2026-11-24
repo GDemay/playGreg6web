@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
 `program-manifest.json`, compiles dirty shards in parallel with `emcc`/`em++`, caches
 `.o` files by SHA-256 of content + compiler flags, and links with `libplaygta6_core.a`
-into `web/dist/runtime.js` + `web/dist/runtime.wasm`.
+into `web/dist/runtime.js` + `web/dist/runtime.wasm` (optionally splitting `.ll` shards
+across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC` and `-sMAIN_MODULE=2`).
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -18,7 +19,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--opt O0|O1|O2|O3|Os|Oz] [--runtime-lib path/to/libplaygta6_core.a]
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
-        [--assertions 0|1] [--browser-boot-exports]
+        [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
         [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
@@ -131,6 +132,18 @@ BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
 
 # Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
+
+# Split-module dynamic linking (R28): -fPIC + -sMAIN_MODULE=2 + -sSIDE_MODULE=1.
+PIC_FLAG = "-fPIC"
+MAIN_MODULE_FLAG = "-sMAIN_MODULE=2"
+SIDE_MODULE_FLAG = "-sSIDE_MODULE=1"
+SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
+    "-sMEMORY64=1",
+    "-pthread",
+    SIDE_MODULE_FLAG,
+)
+SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
+SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
 
 VERIFY_FLAGS: tuple[str, ...] = (
     "--require-memory64",
@@ -251,6 +264,29 @@ class UnitBuildResult:
 
 
 @dataclass
+class SideModuleResult:
+    index: int
+    name: str
+    shards: tuple[str, ...] = ()
+    response_file: str | None = None
+    link_argv: tuple[str, ...] = ()
+    wasm_bytes: int = 0
+    exceeds_v8_1gib_limit: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "name": self.name,
+            "shard_count": len(self.shards),
+            "shards": list(self.shards),
+            "response_file": self.response_file,
+            "link_argv": list(self.link_argv),
+            "wasm_bytes": self.wasm_bytes,
+            "exceeds_v8_1gib_limit": self.exceeds_v8_1gib_limit,
+        }
+
+
+@dataclass
 class BuildReport:
     ok: bool
     mode: str
@@ -283,6 +319,8 @@ class BuildReport:
     stack_size: str | None = None
     assertions: int | None = None
     browser_boot_exports: bool = False
+    split_modules: int = 1
+    side_modules: list[SideModuleResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -299,6 +337,8 @@ class BuildReport:
             "stack_size": self.stack_size,
             "assertions": self.assertions,
             "browser_boot_exports": self.browser_boot_exports,
+            "split_modules": self.split_modules,
+            "side_modules": [m.to_dict() for m in self.side_modules],
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -559,6 +599,12 @@ def parse_assertions(raw: int | None) -> int | None:
     return raw
 
 
+def parse_split_modules(raw: int) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise BuildGuestWasmError(f"invalid --split-modules {raw!r}; expected an integer >= 1")
+    return raw
+
+
 def retarget_wasm64_ir(text: str) -> str:
     """Normalize lifted wasm64 LLVM IR for Emscripten 7 / LLVM 24 `emcc`.
 
@@ -591,8 +637,11 @@ def compile_flags_for(
     include_dirs: Sequence[Path] = (),
     extra_flags: Sequence[str] = (),
     wasm_exceptions: bool = False,
+    pic: bool = False,
 ) -> tuple[str, ...]:
     flags: list[str] = [*COMPILE_WASM_FLAGS, f"-{opt}"]
+    if pic and PIC_FLAG not in flags:
+        flags.append(PIC_FLAG)
     flags.extend(extra_flags)
     if kind == "ll":
         if "-msimd128" not in flags:
@@ -790,6 +839,40 @@ def select_shrink_shards(units: Sequence[SourceUnit], count: int) -> frozenset[s
             key=lambda u: (-_object_bytes(u.path), u.unit_id),
         )
     return frozenset(unit.unit_id for unit in ranked[:count])
+
+
+def _partition_weight(item: UnitBuildResult) -> int:
+    obj_size = item.object_bytes or _object_bytes(item.object_path)
+    if obj_size > 0:
+        return obj_size
+    return _object_bytes(item.unit.path)
+
+
+def partition_shard_units(
+    items: Sequence[UnitBuildResult],
+    split_modules: int,
+) -> list[list[UnitBuildResult]]:
+    """Deterministically partition `.ll` shard units into up to `split_modules` balanced buckets.
+
+    Uses greedy LPT bin-packing by compiled `.o` byte size (falling back to source file byte
+    size for dry-runs), tie-broken deterministically by `unit_id`. Emits only non-empty buckets
+    when fewer shards exist than `split_modules`.
+    """
+    bucket_limit = parse_split_modules(split_modules)
+    shards = [item for item in items if is_shard_unit(item.unit)]
+    if not shards:
+        return []
+    bucket_count = min(bucket_limit, len(shards))
+    ranked = sorted(shards, key=lambda item: (-_partition_weight(item), item.unit.unit_id))
+    buckets: list[list[UnitBuildResult]] = [[] for _ in range(bucket_count)]
+    totals: list[int] = [0] * bucket_count
+    for item in ranked:
+        target_idx = min(range(bucket_count), key=lambda idx: (totals[idx], len(buckets[idx]), idx))
+        buckets[target_idx].append(item)
+        totals[target_idx] += _partition_weight(item)
+    for bucket in buckets:
+        bucket.sort(key=lambda item: item.unit.unit_id)
+    return [bucket for bucket in buckets if bucket]
 
 
 def _discover_tree_sources(
@@ -995,6 +1078,7 @@ def resolve_link_flags(
     stack_size: str | None = None,
     assertions: int | None = None,
     browser_boot_exports: bool = False,
+    main_module: bool = False,
 ) -> tuple[str, ...]:
     """Compute effective linker flags for em++ from defaults and build options."""
     if pthread_pool_size is not None:
@@ -1022,6 +1106,9 @@ def resolve_link_flags(
             flags.append(flag)
     if pthread_pool_size is not None and not replaced_pool:
         flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
+
+    if main_module and MAIN_MODULE_FLAG not in flags:
+        flags.append(MAIN_MODULE_FLAG)
 
     if not no_link_opt and opt in LINK_OPT_LEVELS:
         opt_flag = f"-{opt}"
@@ -1068,24 +1155,76 @@ def resolve_link_flags(
     return tuple(flags)
 
 
+def resolve_side_module_link_flags(
+    *,
+    opt: str = "O2",
+    strip: bool = False,
+    no_link_opt: bool = False,
+    wasm_exceptions: bool = False,
+) -> tuple[str, ...]:
+    """Compute em++ linker flags for a `-sSIDE_MODULE=1` guest shard partition."""
+    flags: list[str] = list(SIDE_MODULE_LINK_FLAGS)
+    if not no_link_opt and opt in LINK_OPT_LEVELS:
+        opt_flag = f"-{opt}"
+        if opt_flag not in flags:
+            flags.append(opt_flag)
+    if wasm_exceptions and WASM_EXCEPTIONS_FLAG not in flags:
+        flags.append(WASM_EXCEPTIONS_FLAG)
+    if strip and "-Wl,--strip-all" not in flags:
+        flags.append("-Wl,--strip-all")
+    return tuple(flags)
+
+
 def check_v8_wasm_size(
     wasm_bytes: int,
     *,
     limit: int | None = None,
+    module_name: str = RUNTIME_WASM,
 ) -> tuple[bool, str | None]:
-    """Check whether a linked runtime.wasm exceeds Chrome/V8's 1 GiB module cap."""
+    """Check whether a linked .wasm module exceeds Chrome/V8's 1 GiB module cap."""
     max_bytes = V8_MAX_WASM_MODULE_BYTES if limit is None else limit
     if wasm_bytes <= max_bytes:
         return False, None
     mib = wasm_bytes / (1024 * 1024)
     over_mib = (wasm_bytes - max_bytes) / (1024 * 1024)
     warning = (
-        f"{RUNTIME_WASM} size is {wasm_bytes} bytes ({mib:.2f} MiB), exceeding "
+        f"{module_name} size is {wasm_bytes} bytes ({mib:.2f} MiB), exceeding "
         f"Chrome/V8's 1 GiB ({max_bytes} bytes) WebAssembly.instantiate() module size limit "
-        f"by {over_mib:.2f} MiB; rebuild with --strip and/or --opt Oz (or --opt Os) "
-        f"to keep the module under 1 GiB"
+        f"by {over_mib:.2f} MiB; rebuild with --strip, --opt Oz (or --opt Os), "
+        f"and/or --split-modules N to keep every module under 1 GiB"
     )
     return True, warning
+
+
+def build_side_module_link_argv(
+    linker: Path | str,
+    objects: Sequence[Path],
+    *,
+    output_wasm: Path,
+    side_link_flags: Sequence[str] | None = None,
+    response_file: Path | None = None,
+    opt: str = "O2",
+    strip: bool = False,
+    no_link_opt: bool = False,
+    wasm_exceptions: bool = False,
+) -> tuple[str, ...]:
+    if side_link_flags is None:
+        effective_flags = resolve_side_module_link_flags(
+            opt=opt,
+            strip=strip,
+            no_link_opt=no_link_opt,
+            wasm_exceptions=wasm_exceptions,
+        )
+    else:
+        effective_flags = tuple(side_link_flags)
+    argv: list[str] = [str(linker), *effective_flags]
+    if response_file is not None:
+        rsp_arg = str(response_file).replace("\\", "/")
+        argv.append(f"@{rsp_arg}")
+    else:
+        argv.extend(str(path) for path in objects)
+    argv.extend(["-o", str(output_wasm)])
+    return tuple(argv)
 
 
 def build_link_argv(
@@ -1094,6 +1233,7 @@ def build_link_argv(
     *,
     output_js: Path,
     runtime_libs: Sequence[Path] = (),
+    side_modules: Sequence[Path] = (),
     link_flags: Sequence[str] | None = None,
     extra_flags: Sequence[str] = (),
     response_file: Path | None = None,
@@ -1106,6 +1246,7 @@ def build_link_argv(
     stack_size: str | None = None,
     assertions: int | None = None,
     browser_boot_exports: bool = False,
+    main_module: bool = False,
 ) -> tuple[str, ...]:
     if link_flags is None:
         effective_flags = resolve_link_flags(
@@ -1119,6 +1260,7 @@ def build_link_argv(
             stack_size=stack_size,
             assertions=assertions,
             browser_boot_exports=browser_boot_exports,
+            main_module=main_module,
         )
     else:
         effective_flags = (*link_flags, *extra_flags)
@@ -1129,6 +1271,7 @@ def build_link_argv(
     else:
         argv.extend(str(path) for path in objects)
     argv.extend(str(path) for path in runtime_libs)
+    argv.extend(str(path) for path in side_modules)
     argv.extend(["-o", str(output_js)])
     return tuple(argv)
 
@@ -1389,6 +1532,7 @@ def run_build(
     stack_size: str | None = None,
     assertions: int | None = None,
     browser_boot_exports: bool = False,
+    split_modules: int = 1,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -1399,6 +1543,8 @@ def run_build(
         raise BuildGuestWasmError("--sample must be >= 0")
     if isinstance(shrink_largest_shards, bool) or shrink_largest_shards < 0:
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
+    split_count = parse_split_modules(split_modules)
+    use_split = split_count > 1
     initial_memory_token = (
         parse_size_token(initial_memory, flag_name="--initial-memory")
         if initial_memory is not None
@@ -1421,6 +1567,7 @@ def run_build(
         stack_size=stack_size_token,
         assertions=assertions_val,
         browser_boot_exports=browser_boot_exports,
+        main_module=use_split,
     )
 
     runner = run_command or default_run_command
@@ -1433,13 +1580,18 @@ def run_build(
         mode = "dry-run"
     else:
         mode = "build"
+    base_compile_flags = (
+        (*COMPILE_WASM_FLAGS, f"-{opt_level}", PIC_FLAG)
+        if use_split
+        else (*COMPILE_WASM_FLAGS, f"-{opt_level}")
+    )
     report = BuildReport(
         ok=toolchain.ok,
         mode=mode,
         toolchain=toolchain,
         jobs=worker_count,
         opt=opt_level,
-        compile_flags=(*COMPILE_WASM_FLAGS, f"-{opt_level}"),
+        compile_flags=base_compile_flags,
         link_flags=effective_link_flags,
         linked_guest_boot=link_guest_boot,
         sample=sample,
@@ -1450,6 +1602,7 @@ def run_build(
         stack_size=stack_size_token,
         assertions=assertions_val,
         browser_boot_exports=browser_boot_exports,
+        split_modules=split_count,
     )
 
     if not toolchain.ok:
@@ -1542,6 +1695,7 @@ def run_build(
             include_dirs=include_dirs,
             extra_flags=extra,
             wasm_exceptions=wasm_exceptions,
+            pic=use_split,
         )
         content = unit.path.read_bytes()
         key = cache_key_for(content, flags, kind=unit.kind)
@@ -1630,51 +1784,181 @@ def run_build(
     assert linker is not None
     output_js = output_dir / RUNTIME_JS
     output_wasm = output_dir / RUNTIME_WASM
-    planned_objects = objects if objects else [Path(item.unit.unit_id).with_suffix(".o") for item in ordered]
-    rsp_path: Path | None = None
-    if should_use_response_file(len(planned_objects), response_file):
-        rsp_path = cache_root / RESPONSE_FILE_NAME
-        write_link_response_file(rsp_path, planned_objects)
-        report.response_file = RESPONSE_FILE_NAME
-    raw_link = build_link_argv(
-        linker,
-        planned_objects,
-        output_js=output_js,
-        runtime_libs=runtime_libs,
-        link_flags=effective_link_flags,
-        response_file=rsp_path,
-    )
-    report.link_argv = tuple(sanitize_argv(raw_link))
-    report.outputs = (RUNTIME_JS, RUNTIME_WASM)
 
-    if compile_errors:
-        report.ok = False
-        return report
-
-    if dry_run:
-        report.ok = True
-        return report
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    link_result = runner(raw_link)
-    if link_result.returncode != 0:
-        report.ok = False
-        report.errors.append(
-            sanitize_text((link_result.stderr or link_result.stdout or "link failed").strip())
+    if use_split:
+        buckets = partition_shard_units(ordered, split_count)
+        non_shard_items = [item for item in ordered if not is_shard_unit(item.unit)]
+        side_link_flags = resolve_side_module_link_flags(
+            opt=opt_level,
+            strip=strip,
+            no_link_opt=no_link_opt,
+            wasm_exceptions=wasm_exceptions,
         )
-        return report
+        side_plans: list[
+            tuple[SideModuleResult, Path, list[Path], Path | None, tuple[str, ...]]
+        ] = []
+        side_wasm_paths: list[Path] = []
+        for idx, bucket in enumerate(buckets):
+            side_name = SIDE_MODULE_NAME_TEMPLATE.format(index=idx)
+            side_wasm_path = output_dir / side_name
+            bucket_objects = [
+                item.object_path
+                if item.object_path is not None
+                else Path(item.unit.unit_id).with_suffix(".o")
+                for item in bucket
+            ]
+            side_rsp_name = SIDE_RESPONSE_FILE_TEMPLATE.format(index=idx)
+            side_rsp_path = None if response_file is False else (cache_root / side_rsp_name)
+            raw_side_link = build_side_module_link_argv(
+                linker,
+                bucket_objects,
+                output_wasm=side_wasm_path,
+                side_link_flags=side_link_flags,
+                response_file=side_rsp_path,
+            )
+            side_result = SideModuleResult(
+                index=idx,
+                name=side_name,
+                shards=tuple(item.unit.unit_id for item in bucket),
+                response_file=side_rsp_name if side_rsp_path is not None else None,
+                link_argv=tuple(sanitize_argv(raw_side_link)),
+            )
+            side_plans.append(
+                (side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link)
+            )
+            side_wasm_paths.append(side_wasm_path)
 
-    missing_outputs = [name for name, path in ((RUNTIME_JS, output_js), (RUNTIME_WASM, output_wasm)) if not path.is_file()]
-    if missing_outputs:
-        report.ok = False
-        report.errors.append("missing link outputs: " + ", ".join(missing_outputs))
-        return report
+        main_objects = [
+            item.object_path
+            if item.object_path is not None
+            else Path(item.unit.unit_id).with_suffix(".o")
+            for item in non_shard_items
+        ]
+        rsp_path: Path | None = None
+        if should_use_response_file(len(main_objects), response_file):
+            rsp_path = cache_root / RESPONSE_FILE_NAME
+            report.response_file = RESPONSE_FILE_NAME
+        raw_link = build_link_argv(
+            linker,
+            main_objects,
+            output_js=output_js,
+            runtime_libs=runtime_libs,
+            side_modules=side_wasm_paths,
+            link_flags=effective_link_flags,
+            response_file=rsp_path,
+        )
+        report.side_modules = [plan[0] for plan in side_plans]
+        report.link_argv = tuple(sanitize_argv(raw_link))
+        report.outputs = (RUNTIME_JS, RUNTIME_WASM, *(plan[0].name for plan in side_plans))
 
-    report.wasm_bytes = _object_bytes(output_wasm)
-    exceeds_limit, size_warning = check_v8_wasm_size(report.wasm_bytes)
-    report.exceeds_v8_1gib_limit = exceeds_limit
-    if size_warning is not None:
-        report.warnings.append(size_warning)
+        if compile_errors:
+            report.ok = False
+            return report
+
+        if dry_run:
+            report.ok = True
+            return report
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for side_result, side_wasm_path, bucket_objects, side_rsp_path, raw_side_link in side_plans:
+            if side_rsp_path is not None:
+                write_link_response_file(side_rsp_path, bucket_objects)
+            side_link_result = runner(raw_side_link)
+            if side_link_result.returncode != 0:
+                report.ok = False
+                err = sanitize_text(
+                    (side_link_result.stderr or side_link_result.stdout or "side module link failed").strip()
+                )
+                report.errors.append(f"{side_result.name}: {err}")
+                return report
+            if not side_wasm_path.is_file():
+                report.ok = False
+                report.errors.append(f"missing side module link output: {side_result.name}")
+                return report
+            side_result.wasm_bytes = _object_bytes(side_wasm_path)
+
+        if rsp_path is not None:
+            write_link_response_file(rsp_path, main_objects)
+        link_result = runner(raw_link)
+        if link_result.returncode != 0:
+            report.ok = False
+            report.errors.append(
+                sanitize_text((link_result.stderr or link_result.stdout or "link failed").strip())
+            )
+            return report
+
+        missing_outputs = [
+            name for name, path in ((RUNTIME_JS, output_js), (RUNTIME_WASM, output_wasm)) if not path.is_file()
+        ]
+        if missing_outputs:
+            report.ok = False
+            report.errors.append("missing link outputs: " + ", ".join(missing_outputs))
+            return report
+
+        report.wasm_bytes = _object_bytes(output_wasm)
+        runtime_exceeds, runtime_warning = check_v8_wasm_size(
+            report.wasm_bytes,
+            module_name=RUNTIME_WASM,
+        )
+        if runtime_warning is not None:
+            report.warnings.append(runtime_warning)
+        any_exceeds = runtime_exceeds
+        for side_result in report.side_modules:
+            side_exceeds, side_warning = check_v8_wasm_size(
+                side_result.wasm_bytes,
+                module_name=side_result.name,
+            )
+            side_result.exceeds_v8_1gib_limit = side_exceeds
+            if side_warning is not None:
+                report.warnings.append(side_warning)
+            any_exceeds = any_exceeds or side_exceeds
+        report.exceeds_v8_1gib_limit = any_exceeds
+    else:
+        planned_objects = objects if objects else [Path(item.unit.unit_id).with_suffix(".o") for item in ordered]
+        rsp_path = None
+        if should_use_response_file(len(planned_objects), response_file):
+            rsp_path = cache_root / RESPONSE_FILE_NAME
+            write_link_response_file(rsp_path, planned_objects)
+            report.response_file = RESPONSE_FILE_NAME
+        raw_link = build_link_argv(
+            linker,
+            planned_objects,
+            output_js=output_js,
+            runtime_libs=runtime_libs,
+            link_flags=effective_link_flags,
+            response_file=rsp_path,
+        )
+        report.link_argv = tuple(sanitize_argv(raw_link))
+        report.outputs = (RUNTIME_JS, RUNTIME_WASM)
+
+        if compile_errors:
+            report.ok = False
+            return report
+
+        if dry_run:
+            report.ok = True
+            return report
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        link_result = runner(raw_link)
+        if link_result.returncode != 0:
+            report.ok = False
+            report.errors.append(
+                sanitize_text((link_result.stderr or link_result.stdout or "link failed").strip())
+            )
+            return report
+
+        missing_outputs = [name for name, path in ((RUNTIME_JS, output_js), (RUNTIME_WASM, output_wasm)) if not path.is_file()]
+        if missing_outputs:
+            report.ok = False
+            report.errors.append("missing link outputs: " + ", ".join(missing_outputs))
+            return report
+
+        report.wasm_bytes = _object_bytes(output_wasm)
+        exceeds_limit, size_warning = check_v8_wasm_size(report.wasm_bytes)
+        report.exceeds_v8_1gib_limit = exceeds_limit
+        if size_warning is not None:
+            report.warnings.append(size_warning)
 
     if verify:
         report.verify = run_verify(
@@ -1722,6 +2006,11 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append(f"  Assertions: {report.assertions} (-sASSERTIONS={report.assertions})")
     if report.browser_boot_exports:
         lines.append("  Browser boot exports: yes")
+    if report.split_modules > 1:
+        lines.append(
+            f"  Split modules: {report.split_modules} "
+            f"({PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
+        )
     if report.response_file:
         lines.append(f"  Response file: @{report.response_file}")
     if report.sample:
@@ -1740,6 +2029,17 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
             tag = item.status.upper()
             module = f" [{item.unit.module}]" if item.unit.module else ""
             lines.append(f"    [{tag}] {item.unit.unit_id} ({item.unit.kind}){module}")
+    if report.side_modules:
+        lines.append("  Side modules:")
+        for side in report.side_modules:
+            size_part = ""
+            if side.wasm_bytes:
+                smib = side.wasm_bytes / (1024 * 1024)
+                slimit = " [EXCEEDS V8 1 GiB LIMIT]" if side.exceeds_v8_1gib_limit else ""
+                size_part = f" — {side.wasm_bytes} bytes ({smib:.2f} MiB){slimit}"
+            lines.append(f"    {side.name} ({len(side.shards)} shards){size_part}")
+            if side.link_argv:
+                lines.append("      Link: " + " ".join(side.link_argv))
     if report.link_argv:
         lines.append("  Link: " + " ".join(report.link_argv))
     if report.outputs:
@@ -1890,6 +2190,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Export Emscripten 7.0.1 incoming Module JS API and runtime methods required by "
             "web/loader.js for browser boot."
+        ),
+    )
+    parser.add_argument(
+        "--split-modules",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Split .ll shards into N balanced Emscripten -sSIDE_MODULE=1 modules linked "
+            "into a -sMAIN_MODULE=2 runtime with -fPIC to stay under V8's 1 GiB per-module "
+            "limit (must be >= 1; default: 1 = monolithic module)."
         ),
     )
     parser.add_argument(
@@ -2052,6 +2363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stack_size=args.stack_size,
             assertions=args.assertions,
             browser_boot_exports=args.browser_boot_exports,
+            split_modules=args.split_modules,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)

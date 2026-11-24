@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28)."""
 
 from __future__ import annotations
 
@@ -56,11 +56,19 @@ def _layout_sources(root: Path) -> Path:
 class RecordingRunner:
     """Fake emcc/em++ that writes requested -o outputs and records argv."""
 
-    def __init__(self, *, fail_ids: frozenset[str] | None = None, delay: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        fail_ids: frozenset[str] | None = None,
+        fail_outputs: frozenset[str] | None = None,
+        delay: float = 0.0,
+    ) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.compile_calls: list[tuple[str, ...]] = []
         self.link_calls: list[tuple[str, ...]] = []
+        self.side_link_calls: list[tuple[str, ...]] = []
         self.fail_ids = fail_ids or frozenset()
+        self.fail_outputs = fail_outputs or frozenset()
         self.delay = delay
         self._lock = threading.Lock()
         self.current = 0
@@ -82,12 +90,24 @@ class RecordingRunner:
                     stdout=json.dumps({"ok": True, "errors": []}),
                 )
             out_path = _dash_o(tokens)
+            is_side_link = bgw.SIDE_MODULE_FLAG in tokens or any(
+                t.startswith("-sSIDE_MODULE=") for t in tokens
+            )
             is_link = "-lexports.js" in tokens or any(
                 Path(t).name in {bgw.RUNTIME_JS, bgw.RUNTIME_WASM} for t in tokens
             )
             source_token = _source_token(tokens)
             if source_token and Path(source_token).name in self.fail_ids:
                 return bgw.CommandResult(returncode=1, stderr=f"failed {Path(source_token).name}")
+            if out_path is not None and Path(out_path).name in self.fail_outputs:
+                return bgw.CommandResult(returncode=1, stderr=f"failed {Path(out_path).name}")
+            if is_side_link and out_path is not None and Path(out_path).suffix.lower() == ".wasm":
+                with self._lock:
+                    self.side_link_calls.append(tokens)
+                wasm = Path(out_path)
+                wasm.parent.mkdir(parents=True, exist_ok=True)
+                wasm.write_bytes(b"\x00asm\x01\x00\x00\x00")
+                return bgw.CommandResult(returncode=0)
             if is_link and out_path is not None and Path(out_path).suffix.lower() == ".js":
                 with self._lock:
                     self.link_calls.append(tokens)
@@ -2334,6 +2354,613 @@ class TestBrowserBootFlags(unittest.TestCase):
                     any(err_needle in e for e in payload["errors"]),
                     f"expected {err_needle!r} in {payload['errors']}",
                 )
+
+
+class TestSplitModules(unittest.TestCase):
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    def test_split_modules_default_one_is_backwards_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.split_modules, 1)
+            self.assertEqual(report.side_modules, [])
+            self.assertEqual(report.outputs, (bgw.RUNTIME_JS, bgw.RUNTIME_WASM))
+            self.assertNotIn("-fPIC", report.compile_flags)
+            self.assertNotIn("-sMAIN_MODULE=2", report.link_flags)
+            self.assertEqual(runner.side_link_calls, [])
+            self.assertEqual(len(runner.link_calls), 1)
+            self.assertNotIn("-sMAIN_MODULE=2", runner.link_calls[0])
+            for call in runner.compile_calls:
+                self.assertNotIn("-fPIC", call)
+            self.assertNotIn("-fPIC", bgw.COMPILE_WASM_FLAGS)
+            self.assertNotIn("-sMAIN_MODULE=2", bgw.LINK_FLAGS)
+
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertEqual(payload["split_modules"], 1)
+            self.assertEqual(payload["side_modules"], [])
+
+    def test_split_modules_adds_fpic_and_separate_cache_keys(self) -> None:
+        for kind in ("ll", "c", "cpp"):
+            self.assertNotIn("-fPIC", bgw.compile_flags_for(opt="O2", kind=kind))
+            pic_flags = bgw.compile_flags_for(opt="O2", kind=kind, pic=True)
+            self.assertIn("-fPIC", pic_flags)
+            self.assertEqual(pic_flags.count("-fPIC"), 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            _write(src / "helper.c", "int helper(void) { return 7; }\n")
+            cache = root / "cache"
+
+            # Warm non-PIC cache with split_modules=1.
+            runner1 = RecordingRunner()
+            first = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-single",
+                jobs=2,
+                link_guest_boot=True,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner1,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(first.ok, first.errors)
+            first_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+
+            # Rebuild with split_modules=3 sharing cache: every unit gets a new -fPIC cache key.
+            runner2 = RecordingRunner()
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-split",
+                jobs=2,
+                link_guest_boot=True,
+                split_modules=3,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner2,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second.cache_hits, 0)
+            self.assertEqual(second.cache_misses, len(second.sources))
+            self.assertEqual(len(runner2.compile_calls), len(second.sources))
+            for item in second.sources:
+                self.assertIn("-fPIC", item.argv)
+                self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+            for call in runner2.compile_calls:
+                self.assertIn("-fPIC", call)
+
+            # Repeating split_modules=3 hits cache for every unit.
+            runner3 = RecordingRunner()
+            third = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-split2",
+                jobs=2,
+                link_guest_boot=True,
+                split_modules=3,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner3,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(third.ok, third.errors)
+            self.assertEqual(third.cache_hits, len(third.sources))
+            self.assertEqual(third.cache_misses, 0)
+            self.assertEqual(runner3.compile_calls, [])
+
+    def test_split_modules_three_partitions_links_side_and_main_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            cache = root / "cache"
+            out_dir = root / "dist"
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                strip=True,
+                wasm_exceptions=True,
+                link_guest_boot=True,
+                split_modules=3,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.split_modules, 3)
+            self.assertIn("-fPIC", report.compile_flags)
+            self.assertIn("-sMAIN_MODULE=2", report.link_flags)
+            self.assertEqual(
+                report.outputs,
+                (
+                    "runtime.js",
+                    "runtime.wasm",
+                    "guest_part_0.wasm",
+                    "guest_part_1.wasm",
+                    "guest_part_2.wasm",
+                ),
+            )
+            self.assertEqual(len(report.side_modules), 3)
+            self.assertEqual(len(runner.side_link_calls), 3)
+            self.assertEqual(len(runner.link_calls), 1)
+
+            # Verify every shard appears in exactly one side module and no non-shard appears.
+            expected_shards = {
+                "main/lift/shard-00000.ll",
+                "main/lift/shard-00001.ll",
+                "main/lift/shard-00002.ll",
+                "vcruntime140/lift/shard-00000.ll",
+                "vcruntime140/lift/shard-00001.ll",
+            }
+            seen_shards: list[str] = []
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            for idx, (side, side_call) in enumerate(zip(report.side_modules, runner.side_link_calls)):
+                self.assertEqual(side.index, idx)
+                self.assertEqual(side.name, f"guest_part_{idx}.wasm")
+                self.assertEqual(side.response_file, f"side_part_{idx}.rsp")
+                self.assertEqual(side.wasm_bytes, 8)
+                self.assertFalse(side.exceeds_v8_1gib_limit)
+                self.assertTrue((out_dir / side.name).is_file())
+                seen_shards.extend(side.shards)
+
+                self.assertIn("-sMEMORY64=1", side_call)
+                self.assertIn("-pthread", side_call)
+                self.assertIn("-sSIDE_MODULE=1", side_call)
+                self.assertIn("-fwasm-exceptions", side_call)
+                self.assertIn("-Wl,--strip-all", side_call)
+                self.assertNotIn("-sASSERTIONS=0", side_call)
+                self.assertNotIn("-sMAIN_MODULE=2", side_call)
+                self.assertEqual(side_call[-2], "-o")
+                self.assertEqual(Path(side_call[-1]).name, f"guest_part_{idx}.wasm")
+
+                # Side response file uses POSIX forward slashes and lists exact bucket objects.
+                at_tokens = [t for t in side_call if t.startswith("@")]
+                self.assertEqual(len(at_tokens), 1)
+                self.assertNotIn("\\", at_tokens[0])
+                self.assertTrue(at_tokens[0].endswith(f"/side_part_{idx}.rsp"))
+                rsp_file = cache / f"side_part_{idx}.rsp"
+                self.assertTrue(rsp_file.is_file())
+                rsp_text = rsp_file.read_text(encoding="utf-8")
+                self.assertNotIn("\\", rsp_text)
+                expected_objs = [
+                    str(by_id[shard_id].object_path).replace("\\", "/") for shard_id in side.shards
+                ]
+                self.assertEqual(rsp_text.splitlines(), expected_objs)
+
+                # Sanitized side link argv has @side_part_{idx}.rsp and guest_part_{idx}.wasm.
+                self.assertIn(f"@side_part_{idx}.rsp", side.link_argv)
+                self.assertIn(f"guest_part_{idx}.wasm", side.link_argv)
+                self.assertIn("-sSIDE_MODULE=1", side.link_argv)
+
+            self.assertEqual(len(seen_shards), len(expected_shards))
+            self.assertEqual(set(seen_shards), expected_shards)
+            # Balanced 5 shards across 3 buckets -> sizes (2, 2, 1).
+            self.assertEqual(sorted(len(s.shards) for s in report.side_modules), [1, 2, 2])
+
+            # Main module link has -sMAIN_MODULE=2, all non-shard objects, libplaygta6_core.a,
+            # and all 3 guest_part_*.wasm paths, and ZERO shard .o files.
+            main_call = runner.link_calls[0]
+            self.assertIn("-sMAIN_MODULE=2", main_call)
+            self.assertIn("-sMEMORY64=1", main_call)
+            self.assertIn("-pthread", main_call)
+            self.assertIn("-lexports.js", main_call)
+            self.assertIn("-fwasm-exceptions", main_call)
+            self.assertIn("-Wl,--strip-all", main_call)
+
+            main_names = [Path(t).name for t in main_call]
+            for part_name in ("guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"):
+                self.assertIn(part_name, main_names)
+                self.assertIn(part_name, report.link_argv)
+            self.assertIn("libplaygta6_core.a", main_names)
+            for non_shard_id in (
+                "main/lift/functions.ll",
+                "vcruntime140/lift/functions.ll",
+                "main/stubs/pg6_import_thunks.cpp",
+                "exports/pg6_export_thunks.cpp",
+                "pg6_program.cpp",
+                "program_modules.cpp",
+                "runtime/main.cpp",
+                "runtime/wasm_boot.cpp",
+            ):
+                obj = by_id[non_shard_id].object_path
+                assert obj is not None
+                self.assertIn(obj.name, main_names)
+            for shard_id in expected_shards:
+                obj = by_id[shard_id].object_path
+                assert obj is not None
+                self.assertNotIn(obj.name, main_names)
+
+            # JSON and sanitized text never leak host paths, backslashes, or username.
+            dumped = bgw.report_to_json(report)
+            self.assertNotIn("\\\\", dumped)
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+            if len(user) >= 3:
+                self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+            payload = json.loads(dumped)
+            self.assertEqual(payload["split_modules"], 3)
+            self.assertEqual(len(payload["side_modules"]), 3)
+            self.assertEqual(
+                [m["name"] for m in payload["side_modules"]],
+                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
+            )
+            text = bgw.format_report_text(report, sanitize=True)
+            self.assertIn("Split modules: 3", text)
+            self.assertIn("Side modules:", text)
+            self.assertIn("guest_part_0.wasm", text)
+            self.assertIn("guest_part_2.wasm", text)
+            if len(user) >= 3:
+                self.assertNotRegex(text, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+    def test_split_modules_greedy_bin_packing_fewer_shards_and_side_link_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 6 shards with distinct sizes: 500, 450, 300, 250, 200, 100.
+            # LPT greedy into 3 buckets:
+            #   b0: 500 + 100 = 600
+            #   b1: 450 + 200 = 650
+            #   b2: 300 + 250 = 550
+            sizes = {
+                "lift/shard-00000.ll": 100,
+                "lift/shard-00001.ll": 500,
+                "lift/shard-00002.ll": 250,
+                "lift/shard-00003.ll": 450,
+                "lift/shard-00004.ll": 200,
+                "lift/shard-00005.ll": 300,
+            }
+            items = [
+                bgw.UnitBuildResult(
+                    unit=bgw.SourceUnit(uid, root / uid, "ll"),
+                    cache_key="k",
+                    cache_hit=True,
+                    object_path=root / f"{Path(uid).stem}.o",
+                    argv=(),
+                    status="hit",
+                    object_bytes=sz,
+                )
+                for uid, sz in sizes.items()
+            ]
+            # Add a non-shard unit that must be ignored by partition_shard_units.
+            items.append(
+                bgw.UnitBuildResult(
+                    unit=bgw.SourceUnit("lift/functions.ll", root / "lift/functions.ll", "ll"),
+                    cache_key="k",
+                    cache_hit=True,
+                    object_path=root / "functions.o",
+                    argv=(),
+                    status="hit",
+                    object_bytes=9999,
+                )
+            )
+            buckets = bgw.partition_shard_units(items, 3)
+            self.assertEqual(len(buckets), 3)
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in buckets],
+                [
+                    ["lift/shard-00000.ll", "lift/shard-00001.ll"],
+                    ["lift/shard-00003.ll", "lift/shard-00004.ll"],
+                    ["lift/shard-00002.ll", "lift/shard-00005.ll"],
+                ],
+            )
+            # Identical output on reversed input order (100% deterministic).
+            buckets_rev = bgw.partition_shard_units(list(reversed(items)), 3)
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in buckets_rev],
+                [[it.unit.unit_id for it in b] for b in buckets],
+            )
+
+            # Fewer shards (2) than split_modules (5): emits only 2 non-empty buckets.
+            repo = self._repo(root)
+            small_src = root / "two-shards"
+            _write(small_src / "lift" / "shard-00000.ll", "; s0\n")
+            _write(small_src / "lift" / "shard-00001.ll", "; s1\n")
+            _write(small_src / "lift" / "functions.ll", "; reg\n")
+            runner_two = RecordingRunner()
+            report_two = bgw.run_build(
+                source_dir=small_src,
+                repo_root=repo,
+                cache_dir=root / "cache-two",
+                out_dir=root / "dist-two",
+                jobs=2,
+                split_modules=5,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_two,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_two.ok, report_two.errors)
+            self.assertEqual(report_two.split_modules, 5)
+            self.assertEqual(len(report_two.side_modules), 2)
+            self.assertEqual(
+                [m.name for m in report_two.side_modules],
+                ["guest_part_0.wasm", "guest_part_1.wasm"],
+            )
+            self.assertEqual(len(runner_two.side_link_calls), 2)
+            self.assertEqual(len(runner_two.link_calls), 1)
+
+            # Failing side module link aborts before main module link.
+            runner_fail = RecordingRunner(fail_outputs=frozenset({"guest_part_1.wasm"}))
+            report_fail = bgw.run_build(
+                source_dir=small_src,
+                repo_root=repo,
+                cache_dir=root / "cache-two",
+                out_dir=root / "dist-fail",
+                jobs=2,
+                split_modules=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_fail,
+                which_fn=lambda _name: None,
+            )
+            self.assertFalse(report_fail.ok)
+            self.assertEqual(runner_fail.link_calls, [])
+            self.assertTrue(
+                any("guest_part_1.wasm" in e for e in report_fail.errors),
+                report_fail.errors,
+            )
+
+    def test_split_modules_v8_1gib_limit_checked_per_wasm_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            orig_object_bytes = bgw._object_bytes
+
+            # Case A: total > 1 GiB (500 MiB + 3 * 600 MiB) but EVERY module <= 1 GiB -> no warning.
+            sizes_ok = {
+                "runtime.wasm": 500 * 1024 * 1024,
+                "guest_part_0.wasm": 600 * 1024 * 1024,
+                "guest_part_1.wasm": 600 * 1024 * 1024,
+                "guest_part_2.wasm": 600 * 1024 * 1024,
+            }
+
+            def fake_bytes_ok(path: Path | None) -> int:
+                if path is not None and path.name in sizes_ok:
+                    return sizes_ok[path.name]
+                return orig_object_bytes(path)
+
+            bgw._object_bytes = fake_bytes_ok
+            try:
+                report_ok = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=root / "cache-ok",
+                    out_dir=root / "dist-ok",
+                    jobs=2,
+                    split_modules=3,
+                    runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                    run_command=RecordingRunner(),
+                    which_fn=lambda _name: None,
+                )
+            finally:
+                bgw._object_bytes = orig_object_bytes
+
+            self.assertTrue(report_ok.ok, report_ok.errors)
+            self.assertFalse(report_ok.exceeds_v8_1gib_limit)
+            self.assertEqual(report_ok.warnings, [])
+            self.assertEqual(report_ok.wasm_bytes, 500 * 1024 * 1024)
+            self.assertTrue(all(not s.exceeds_v8_1gib_limit for s in report_ok.side_modules))
+
+            # Case B: guest_part_1.wasm exceeds 1 GiB while runtime.wasm and other parts are under.
+            over_one = bgw.V8_MAX_WASM_MODULE_BYTES + 1
+            sizes_side_over = {
+                "runtime.wasm": 10 * 1024 * 1024,
+                "guest_part_0.wasm": 600 * 1024 * 1024,
+                "guest_part_1.wasm": over_one,
+                "guest_part_2.wasm": 400 * 1024 * 1024,
+            }
+
+            def fake_bytes_side_over(path: Path | None) -> int:
+                if path is not None and path.name in sizes_side_over:
+                    return sizes_side_over[path.name]
+                return orig_object_bytes(path)
+
+            bgw._object_bytes = fake_bytes_side_over
+            try:
+                report_side_over = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=root / "cache-ok",
+                    out_dir=root / "dist-side-over",
+                    jobs=2,
+                    split_modules=3,
+                    runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                    run_command=RecordingRunner(),
+                    which_fn=lambda _name: None,
+                )
+            finally:
+                bgw._object_bytes = orig_object_bytes
+
+            self.assertTrue(report_side_over.ok, report_side_over.errors)
+            self.assertTrue(report_side_over.exceeds_v8_1gib_limit)
+            self.assertEqual(
+                [s.exceeds_v8_1gib_limit for s in report_side_over.side_modules],
+                [False, True, False],
+            )
+            self.assertEqual(len(report_side_over.warnings), 1)
+            self.assertIn("guest_part_1.wasm", report_side_over.warnings[0])
+            self.assertIn(str(over_one), report_side_over.warnings[0])
+            self.assertIn("1073741824", report_side_over.warnings[0])
+            text = bgw.format_report_text(report_side_over)
+            self.assertIn("guest_part_1.wasm", text)
+            self.assertIn("[EXCEEDS V8 1 GiB LIMIT]", text)
+
+            # Case C: runtime.wasm exceeds 1 GiB while side modules are under.
+            sizes_main_over = {
+                "runtime.wasm": over_one,
+                "guest_part_0.wasm": 300 * 1024 * 1024,
+                "guest_part_1.wasm": 300 * 1024 * 1024,
+                "guest_part_2.wasm": 300 * 1024 * 1024,
+            }
+
+            def fake_bytes_main_over(path: Path | None) -> int:
+                if path is not None and path.name in sizes_main_over:
+                    return sizes_main_over[path.name]
+                return orig_object_bytes(path)
+
+            bgw._object_bytes = fake_bytes_main_over
+            try:
+                report_main_over = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=root / "cache-ok",
+                    out_dir=root / "dist-main-over",
+                    jobs=2,
+                    split_modules=3,
+                    runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                    run_command=RecordingRunner(),
+                    which_fn=lambda _name: None,
+                )
+            finally:
+                bgw._object_bytes = orig_object_bytes
+
+            self.assertTrue(report_main_over.ok, report_main_over.errors)
+            self.assertTrue(report_main_over.exceeds_v8_1gib_limit)
+            self.assertTrue(all(not s.exceeds_v8_1gib_limit for s in report_main_over.side_modules))
+            self.assertEqual(len(report_main_over.warnings), 1)
+            self.assertIn("runtime.wasm", report_main_over.warnings[0])
+
+    def test_split_modules_cli_dry_run_sanitization_and_invalid_values(self) -> None:
+        for bad in (0, -1, -7, True, False, "3", 1.5, None):
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"split_modules={bad!r}"):
+                bgw.parse_split_modules(bad)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _program_layout(root)
+            cache = root / "cache-dry"
+
+            for bad in (0, -1, True, False, "2"):
+                with self.assertRaises(bgw.BuildGuestWasmError, msg=f"run_build split_modules={bad!r}"):
+                    bgw.run_build(
+                        source_dir=src,
+                        repo_root=repo,
+                        split_modules=bad,  # type: ignore[arg-type]
+                        dry_run=True,
+                        which_fn=lambda _name: None,
+                    )
+
+            for bad_cli in ("0", "-1"):
+                bad_code, bad_out, _bad_err = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--json",
+                        "--split-modules",
+                        bad_cli,
+                        "--repo-root",
+                        str(repo),
+                    ]
+                )
+                self.assertEqual(bad_code, 2, bad_out)
+                bad_payload = json.loads(bad_out)
+                self.assertFalse(bad_payload["ok"])
+                self.assertTrue(any("split-modules" in e for e in bad_payload["errors"]))
+
+            with self.assertRaises(SystemExit) as exc_ctx:
+                _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--split-modules",
+                        "abc",
+                        "--repo-root",
+                        str(repo),
+                    ]
+                )
+            self.assertEqual(exc_ctx.exception.code, 2)
+
+            # CLI --split-modules 3 --dry-run --json produces clean sanitized JSON without touching disk.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "3",
+                    "--strip",
+                    "--wasm-exceptions",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(cache),
+                    "--out-dir",
+                    str(root / "dist-dry"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            self.assertFalse(cache.exists())
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["split_modules"], 3)
+            self.assertIn("-fPIC", payload["compile_flags"])
+            self.assertIn("-sMAIN_MODULE=2", payload["link_flags"])
+            self.assertIn("-sMAIN_MODULE=2", payload["link_argv"])
+            self.assertEqual(len(payload["side_modules"]), 3)
+            for idx, side in enumerate(payload["side_modules"]):
+                self.assertEqual(side["name"], f"guest_part_{idx}.wasm")
+                self.assertEqual(side["response_file"], f"side_part_{idx}.rsp")
+                self.assertIn("-sSIDE_MODULE=1", side["link_argv"])
+                self.assertIn(f"@side_part_{idx}.rsp", side["link_argv"])
+                self.assertIn(f"guest_part_{idx}.wasm", payload["link_argv"])
+            for unit in payload["sources"]:
+                self.assertIn("-fPIC", unit["argv"])
+
+            dumped = json.dumps(payload)
+            self.assertNotIn("\\\\", dumped)
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+            if len(user) >= 3:
+                self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+            # CLI text mode with --sanitize renders Split modules & Side modules cleanly.
+            code_txt, out_txt, err_txt = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--sanitize",
+                    "--split-modules",
+                    "3",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-txt"),
+                    "--out-dir",
+                    str(root / "dist-txt"),
+                ]
+            )
+            self.assertEqual(code_txt, 0, err_txt)
+            self.assertIn("Split modules: 3", out_txt)
+            self.assertIn("Side modules:", out_txt)
+            self.assertIn("guest_part_0.wasm", out_txt)
+            self.assertIn("guest_part_2.wasm", out_txt)
+            if len(user) >= 3:
+                self.assertNotRegex(out_txt, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
 
 
 class TestLinkFlagContract(unittest.TestCase):
