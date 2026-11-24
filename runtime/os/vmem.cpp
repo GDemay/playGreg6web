@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include "os/vmem_backing.h"
 
@@ -37,6 +38,57 @@ void notify(const VirtualMemoryArena& arena,
 }
 
 }  // namespace
+
+namespace {
+
+// Committed runs, newest last (see take_written_pages): a bounded log, so a caller that falls
+// further behind than kCommitLogSize commits gets `false`.
+struct CommitRecord {
+    uintptr_t start = 0;
+    uint64_t len = 0;
+};
+constexpr uint64_t kCommitLogSize = 16384;
+std::mutex g_commit_log_mutex;
+std::vector<CommitRecord> g_commit_log(kCommitLogSize);
+uint64_t g_commit_seq = 0;  // number of runs ever logged
+
+void log_commit(const uint8_t* p, uint64_t len) {
+    std::lock_guard<std::mutex> lock(g_commit_log_mutex);
+    g_commit_log[static_cast<size_t>(g_commit_seq % kCommitLogSize)] = {reinterpret_cast<uintptr_t>(p), len};
+    ++g_commit_seq;
+}
+
+}  // namespace
+
+void set_write_tracking(bool on) {
+    backing::set_write_watch(on);
+}
+
+bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets) {
+    if (host == nullptr || len == 0 || commit_seq == nullptr || offsets == nullptr) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(host) & ~(uintptr_t{kWrittenPageSize} - 1);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(host) + static_cast<uintptr_t>(len);
+    {
+        std::lock_guard<std::mutex> lock(g_commit_log_mutex);
+        if (*commit_seq > g_commit_seq || g_commit_seq - *commit_seq > kCommitLogSize) {
+            *commit_seq = g_commit_seq;
+            return false;
+        }
+        for (uint64_t s = *commit_seq; s < g_commit_seq; ++s) {
+            const CommitRecord& r = g_commit_log[static_cast<size_t>(s % kCommitLogSize)];
+            const uintptr_t lo = std::max<uintptr_t>(r.start, start);
+            const uintptr_t hi = std::min<uintptr_t>(r.start + static_cast<uintptr_t>(r.len), end);
+            for (uintptr_t page = (lo - start) / kWrittenPageSize * kWrittenPageSize + start; lo < hi && page < hi;
+                 page += kWrittenPageSize) {
+                offsets->push_back(static_cast<uint64_t>(page - start));
+            }
+        }
+        *commit_seq = g_commit_seq;
+    }
+    return backing::take_written_pages(static_cast<const uint8_t*>(host), len, offsets);
+}
 
 ArenaObserver set_arena_observer(ArenaObserver observer) {
     return g_arena_observer.exchange(observer, std::memory_order_acq_rel);
@@ -320,6 +372,7 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
             return false;
         }
         newly_committed_bytes += run_bytes;
+        log_commit(run_ptr(run_start), run_bytes);
     }
 
     // Already committed pages keep their data and take the new protection.

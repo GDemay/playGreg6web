@@ -10,6 +10,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include <algorithm>
+#include <atomic>
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten/heap.h>
 #include <unistd.h>
@@ -30,6 +33,8 @@ namespace playgta6::os::backing {
 
 namespace {
 
+std::atomic<bool> g_write_watch{false};
+
 DWORD win_protect(PageProtect protect) {
     if (is_writable(protect)) {
         return PAGE_READWRITE;
@@ -40,8 +45,11 @@ DWORD win_protect(PageProtect protect) {
 }  // namespace
 
 uint8_t* reserve(uint64_t size, uint64_t preferred) {
+    // MEM_WRITE_WATCH: the memory manager records written pages (take_written_pages), which lets
+    // the GPU layer find changed CPU-visible buffer pages without comparing whole buffers.
+    const DWORD type = MEM_RESERVE | (g_write_watch.load(std::memory_order_relaxed) ? MEM_WRITE_WATCH : 0);
     void* p = VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(preferred)),
-                           static_cast<SIZE_T>(size), MEM_RESERVE, PAGE_NOACCESS);
+                           static_cast<SIZE_T>(size), type, PAGE_NOACCESS);
     if (p != nullptr && preferred != 0 && reinterpret_cast<uintptr_t>(p) != preferred) {
         VirtualFree(p, 0, MEM_RELEASE);
         return nullptr;
@@ -69,6 +77,33 @@ bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
 
 bool enforces_protection() {
     return true;
+}
+
+void set_write_watch(bool on) {
+    g_write_watch.store(on, std::memory_order_relaxed);
+}
+
+bool take_written_pages(const uint8_t* p, uint64_t len, std::vector<uint64_t>* offsets) {
+    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kWrittenPageSize} - 1);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + static_cast<uintptr_t>(len);
+    const uint64_t pages = (end - start + kWrittenPageSize - 1) / kWrittenPageSize;
+    std::vector<PVOID> written(static_cast<size_t>(std::min<uint64_t>(pages, 65536)));
+    for (;;) {
+        ULONG_PTR count = written.size();
+        DWORD granularity = 0;
+        // Each call resets what it reports; a full buffer may leave more pages, so call again.
+        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<PVOID>(start), static_cast<SIZE_T>(end - start),
+                          written.data(), &count, &granularity) != 0 ||
+            granularity != kWrittenPageSize) {
+            return false;
+        }
+        for (ULONG_PTR i = 0; i < count; ++i) {
+            offsets->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(written[i]) - start));
+        }
+        if (count < written.size()) {
+            return true;
+        }
+    }
 }
 
 #elif defined(__EMSCRIPTEN__)
@@ -210,6 +245,12 @@ bool enforces_protection() {
     return false;
 }
 
+bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
+    return false;  // no write tracking in linear memory
+}
+
+void set_write_watch(bool) {}
+
 #else  // POSIX
 
 namespace {
@@ -264,6 +305,12 @@ bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
 bool enforces_protection() {
     return true;
 }
+
+bool take_written_pages(const uint8_t*, uint64_t, std::vector<uint64_t>*) {
+    return false;  // not tracked on POSIX hosts
+}
+
+void set_write_watch(bool) {}
 
 #endif
 

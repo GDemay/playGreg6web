@@ -1483,6 +1483,21 @@ void test_frame_end_to_end() {
     CHECK(count_op(ps3, GpuOpcode::WriteBuffer) == 1);
     CHECK(count_op(ps3, GpuOpcode::Draw) == 1);  // a closed list can be executed again
     CHECK(dev->stats().upload_bytes == 72);
+    // A plain store through the translated pointer (how lifted code writes) is found as well, and
+    // only its page is compared and uploaded.
+    auto* vb_host = static_cast<float*>(com::guest_to_host(scene.vb_cpu, 36));
+    CHECK(vb_host != nullptr);
+    if (vb_host != nullptr) {
+        vb_host[2] = 0.25f;
+        const size_t mark5 = fx.captured.size();
+        scene.execute({list});
+        const auto ps5 = packets_since(fx, mark5);
+        CHECK(count_op(ps5, GpuOpcode::WriteBuffer) == 1);
+        CHECK(dev->stats().upload_bytes == 108);
+        const size_t mark6 = fx.captured.size();
+        scene.execute({list});
+        CHECK(count_op(packets_since(fx, mark6), GpuOpcode::WriteBuffer) == 0);
+    }
 
     // Executing an open list is refused; calls on a closed list are ignored and diagnosed.
     CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
@@ -5113,6 +5128,9 @@ void test_g58_relocate_ia_vb_ib() {
 }  // namespace
 
 int main() {
+    // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
+    // harness turns it on); exercise that path here too.
+    playgta6::os::set_write_tracking(true);
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();

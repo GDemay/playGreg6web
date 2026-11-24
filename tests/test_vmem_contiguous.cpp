@@ -464,6 +464,70 @@ void test_process_arena() {
     CHECK(__playgta6_guest_base == process.guest_base());
 }
 
+// take_written_pages: pages written (or recommitted, i.e. zero-filled again) since the previous
+// call. Windows tracks writes (MEM_WRITE_WATCH); other hosts report "unknown" (false).
+void test_written_pages() {
+    set_write_tracking(true);
+    VirtualMemoryArena arena;
+    set_write_tracking(false);
+    const uint64_t a = arena.reserve(0, 64 * 1024);
+    CHECK(a != 0);
+    CHECK(arena.commit(a, 64 * 1024, PageProtect::ReadWrite));
+    uint8_t* p = arena.host_ptr(a, 64 * 1024);
+    CHECK(p != nullptr);
+    if (p == nullptr) {
+        return;
+    }
+    // A fresh caller (seq 0) may be further behind than the commit log remembers: the first call
+    // can answer "unknown", and it brings `seq` up to date either way.
+    uint64_t seq = 0;
+    std::vector<uint64_t> pages;
+    take_written_pages(p, 64 * 1024, &seq, &pages);
+    pages.clear();
+    const bool tracked = take_written_pages(p, 64 * 1024, &seq, &pages);
+#if defined(_WIN32)
+    CHECK(tracked);
+#endif
+    if (!tracked) {
+        return;
+    }
+    // Primed: nothing new until something is written.
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &seq, &pages) && pages.empty());
+    p[5 * kWrittenPageSize + 3] = 1;  // a plain store (lifted code writes this way)
+    const uint64_t v = 7;
+    CHECK(arena.write(a + 9 * kWrittenPageSize, &v, sizeof(v)));
+    CHECK(take_written_pages(p, 64 * 1024, &seq, &pages));
+    CHECK(pages == (std::vector<uint64_t>{5 * kWrittenPageSize, 9 * kWrittenPageSize}));
+    // Reported once.
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &seq, &pages) && pages.empty());
+    // An unaligned range reports offsets from its page-aligned start; pages outside it are not
+    // consumed for other callers.
+    p[2 * kWrittenPageSize] = 2;
+    p[12 * kWrittenPageSize] = 3;
+    CHECK(take_written_pages(p + 2 * kWrittenPageSize + 100, 100, &seq, &pages));
+    CHECK(pages == (std::vector<uint64_t>{0}));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &seq, &pages));
+    CHECK(pages == (std::vector<uint64_t>{12 * kWrittenPageSize}));
+    // Decommit + recommit zero-fills without a write: still reported.
+    pages.clear();
+    CHECK(arena.decommit(a + 4 * kPageSize, kPageSize));
+    CHECK(arena.commit(a + 4 * kPageSize, kPageSize, PageProtect::ReadWrite));
+    CHECK(take_written_pages(p, 64 * 1024, &seq, &pages));
+    bool recommitted = !pages.empty();
+    for (uint64_t off : pages) {
+        recommitted &= off >= 4 * kPageSize && off < 5 * kPageSize;
+    }
+    CHECK(recommitted);
+    // A caller further behind than the remembered commits gets "unknown".
+    uint64_t stale = seq + 1;
+    pages.clear();
+    CHECK(!take_written_pages(p, 64 * 1024, &stale, &pages));
+    CHECK(arena.release(a));
+}
+
 }  // namespace
 
 int main() {
@@ -478,6 +542,7 @@ int main() {
     test_many_reservations();
     test_concurrent_reservations();
     test_process_arena();
+    test_written_pages();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;

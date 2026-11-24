@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "os/vmem.h"
 
@@ -19,5 +20,10 @@ bool decommit(uint8_t* p, uint64_t len);
 // Applies a protection to committed pages (no-op where protections cannot be enforced).
 bool protect(uint8_t* p, uint64_t len, PageProtect protect);
 bool enforces_protection();
+// See playgta6::os::take_written_pages (vmem.h). Windows reservations carry MEM_WRITE_WATCH;
+// other platforms return false.
+bool take_written_pages(const uint8_t* p, uint64_t len, std::vector<uint64_t>* offsets);
+// Whether later reserve() calls ask for write tracking (where the platform has it).
+void set_write_watch(bool on);
 
 }  // namespace playgta6::os::backing
