@@ -157,6 +157,9 @@ struct GraphicsPsoSource {
     std::vector<pso::D3D12InputElementDesc> input;
     com::Ref<RootSignature> root_signature;
     bool rect_list = false;  // Xbox rectangle topology type (desc says Triangle; d3d12_xs_xbox.h)
+    // The console-native stages the DXIL vertex / pixel shader joins to (identity 0: not joined).
+    Device::NativeStageRecord native_vs, native_ps;
+    Device::DxilDigest vs_digest{}, ps_digest{};  // HASH digests of the DXIL containers (zero: none)
 
     GraphicsPsoSource() = default;
     GraphicsPsoSource(const GraphicsPsoSource& other) { *this = other; }
@@ -199,8 +202,13 @@ public:
         std::vector<uint8_t> header;
         uint64_t vertex_identity = 0;
         uint64_t pixel_identity = 0;  // 0 = no pixel stage
+        uint64_t vertex_code_identity = 0;  // FNV-1a 64 over the code range only
+        uint64_t pixel_code_identity = 0;
     };
     const Native* native() const { return native_.get(); }
+    // Index of this pipeline in the pipeline dump, kNoDumpIndex when not dumped.
+    static constexpr uint32_t kNoDumpIndex = 0xFFFFFFFFu;
+    uint32_t dump_index() const { return dump_index_; }
 
 private:
     friend class Device;
@@ -209,6 +217,7 @@ private:
     std::unique_ptr<bridge::ComputePipelineState> compute_;
     std::unique_ptr<GraphicsPsoSource> source_;
     std::unique_ptr<Native> native_;
+    uint32_t dump_index_ = kNoDumpIndex;
     std::vector<uint64_t> identities_;
     std::string unsupported_;
     bool resolved_ = false;
@@ -348,7 +357,24 @@ private:
     void record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count);
     const d3d::RootSignature* graphics_root_signature_ = nullptr;
     bool rect_list_ = false;  // IASetPrimitiveTopology(xbox::kTopologyRectList)
-    bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances);
+    bool skip_rect_list_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
+    // Rectangle-list expansion (d3d12_xs_xbox.h): each rectangle's three vertices become two
+    // triangles (v0 v1 v2, v2 v3 v0) with v3 = v0 + v2 - v1 for every per-vertex attribute, written
+    // into list-owned vertex buffers at ExecuteCommandLists. False (with `why`) when not possible.
+    bool expand_rect_list_draw(uint32_t vertices, uint32_t instances, uint32_t start_vertex, uint32_t start_instance,
+                               std::string* why);
+    struct RectExpansion {
+        uint32_t buffer_id = 0;
+        uint64_t src = 0;  // guest address of the first source vertex
+        uint32_t stride = 0;
+        uint32_t rects = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> elements;  // (byte offset, DXGI format)
+    };
+    std::vector<RectExpansion> rect_expansions_;
+    std::vector<com::Ref<Resource>> rect_buffers_;  // reused across recordings
+    size_t rect_buffers_used_ = 0;
+    std::array<d3d12_xs::D3D12VertexBufferView, 32> bridge_vb_views_{};  // as last passed to the bridge
+    void note_draw_for_dump();
     void describe_skipped_draw(const char* call, uint32_t count, uint32_t instances, const char* reason);
     void describe_dropped_draw(const char* call, uint32_t count, uint32_t instances);
     struct ImmediateWrite {
