@@ -25,6 +25,9 @@ use playgta6_shaders::pack::{
 use playgta6_shaders::rdna2::{
     analyze_instructions, decode_program, format_disasm_with_summary, to_json_with_disasm,
 };
+use playgta6_shaders::rdna2_to_wgsl::{
+    Rdna2StageOverride, Rdna2TranslateOptions, translate_rdna2_to_wgsl,
+};
 use playgta6_shaders::reflect::{
     LAYOUT_MANIFEST_FILE_NAME, ReflectError, RegisterConvention, build_layout_manifest,
     parse_pipeline_list, reflect_spirv_bytes,
@@ -71,6 +74,12 @@ enum Command {
         json: bool,
         max_instructions: Option<usize>,
     },
+    TranslateRdna2 {
+        file_path: PathBuf,
+        out_path: Option<PathBuf>,
+        stage: Rdna2StageOverride,
+        json: bool,
+    },
 }
 
 fn print_usage() {
@@ -89,6 +98,9 @@ fn print_usage() {
     );
     eprintln!("  playgta6-shaders reflect-dxil <file-or-dir> [--out <json>] [--json]");
     eprintln!("  playgta6-shaders disasm-rdna2 <file> [--json] [--max-instructions <N>]");
+    eprintln!(
+        "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]"
+    );
     eprintln!();
     eprintln!(
         "Pipeline: RDNA2 -> SPIR-V (--mesh-compute, --wave64-emulate) -> compat sanitize -> Naga lower -> WGSL -> .wgsl.pack"
@@ -373,8 +385,58 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 max_instructions,
             })
         }
+        "translate-rdna2" => {
+            let mut file_path: Option<PathBuf> = None;
+            let mut out_path: Option<PathBuf> = None;
+            let mut stage = Rdna2StageOverride::Auto;
+            let mut json = false;
+
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--out" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --out".to_string())?;
+                        out_path = Some(PathBuf::from(val));
+                    }
+                    "--stage" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --stage".to_string())?;
+                        stage = Rdna2StageOverride::parse_str(val)?;
+                    }
+                    "--json" => json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option for translate-rdna2: {other}"));
+                    }
+                    path_arg => {
+                        if file_path.is_some() {
+                            return Err(format!(
+                                "unexpected extra argument for translate-rdna2: {path_arg}"
+                            ));
+                        }
+                        file_path = Some(PathBuf::from(path_arg));
+                    }
+                }
+                i += 1;
+            }
+
+            let file_path = file_path.ok_or_else(|| {
+                "translate-rdna2 requires <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]".to_string()
+            })?;
+
+            Ok(Command::TranslateRdna2 {
+                file_path,
+                out_path,
+                stage,
+                json,
+            })
+        }
         other => Err(format!(
-            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', 'reflect-dxil', or 'disasm-rdna2')"
+            "unknown subcommand '{other}' (expected 'convert', 'audit', 'inspect-pack', 'inspect-dxbc', 'reflect', 'reflect-dxil', 'disasm-rdna2', or 'translate-rdna2')"
         )),
     }
 }
@@ -957,6 +1019,64 @@ fn run_disasm_rdna2(
     Ok(())
 }
 
+fn format_translate_rdna2(
+    file_path: &Path,
+    stage: Rdna2StageOverride,
+    json: bool,
+) -> Result<(String, playgta6_shaders::rdna2_to_wgsl::Rdna2WgslOutput, String), String> {
+    let source = sanitize_source_path(file_path, None);
+    let bytes = fs::read(file_path)
+        .map_err(|err| format!("failed to read RDNA2 shader file {source}: {err}"))?;
+    let options = Rdna2TranslateOptions {
+        stage,
+        ..Rdna2TranslateOptions::default()
+    };
+    let output = translate_rdna2_to_wgsl(&bytes, &options)
+        .map_err(|err| format!("failed to translate RDNA2 shader {source}: {err}"))?;
+    let rendered = if json {
+        output.to_json_with_source(Some(&source))
+    } else {
+        output.wgsl.clone()
+    };
+    Ok((rendered, output, source))
+}
+
+fn run_translate_rdna2(
+    file_path: &Path,
+    out_path: Option<&Path>,
+    stage: Rdna2StageOverride,
+    json: bool,
+) -> Result<(), String> {
+    let (rendered, output, source) = format_translate_rdna2(file_path, stage, json)?;
+    if let Some(dest) = out_path {
+        let dest_label = sanitize_source_path(dest, None);
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!("failed to create output directory for {dest_label}: {err}")
+            })?;
+        }
+        fs::write(dest, output.wgsl.as_bytes())
+            .map_err(|err| format!("failed to write WGSL file {dest_label}: {err}"))?;
+        if json {
+            print!("{rendered}");
+        } else {
+            println!(
+                "Translated {source} -> {dest_label} (stage={}, hash={}, translated_ops={}, unsupported_ops={}, naga_validated={})",
+                output.stage.as_str(),
+                format_shader_hash(output.hash_fnv1a64),
+                output.translated_op_count,
+                output.unsupported_op_count,
+                output.naga_validated,
+            );
+        }
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args) {
@@ -1074,6 +1194,18 @@ fn main() -> ExitCode {
             json,
             max_instructions,
         }) => match run_disasm_rdna2(&file_path, json, max_instructions) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::TranslateRdna2 {
+            file_path,
+            out_path,
+            stage,
+            json,
+        }) => match run_translate_rdna2(&file_path, out_path.as_deref(), stage, json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1650,6 +1782,111 @@ mod tests {
         // Strictly sanitized: never leak host directory paths into text or JSON.
         let root_str = root.to_string_lossy().replace('\\', "/");
         assert!(!text.contains(&root_str));
+        assert!(!json.contains(&root_str));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_parses_translate_rdna2_arguments() {
+        let cmd = parse_args(&[
+            "translate-rdna2".to_string(),
+            "splash_ps.bin".to_string(),
+            "--out".to_string(),
+            "out/splash.wgsl".to_string(),
+            "--stage".to_string(),
+            "pixel".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::TranslateRdna2 {
+                file_path: PathBuf::from("splash_ps.bin"),
+                out_path: Some(PathBuf::from("out/splash.wgsl")),
+                stage: Rdna2StageOverride::Pixel,
+                json: true,
+            }
+        );
+
+        let cmd_min = parse_args(&["translate-rdna2".to_string(), "vs.bin".to_string()]).unwrap();
+        assert_eq!(
+            cmd_min,
+            Command::TranslateRdna2 {
+                file_path: PathBuf::from("vs.bin"),
+                out_path: None,
+                stage: Rdna2StageOverride::Auto,
+                json: false,
+            }
+        );
+
+        assert!(parse_args(&["translate-rdna2".to_string()]).is_err());
+        assert!(
+            parse_args(&[
+                "translate-rdna2".to_string(),
+                "vs.bin".to_string(),
+                "--stage".to_string(),
+                "bogus".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "translate-rdna2".to_string(),
+                "vs.bin".to_string(),
+                "--out".to_string(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn end_to_end_translate_rdna2_emits_validated_wgsl_and_sanitized_json() {
+        let root = make_temp_dir("playgta6_shaders_translate_rdna2");
+        let bin_path = root.join("splash_vs.bin");
+        let out_wgsl = root.join("out/splash_vs.wgsl");
+
+        // Synthetic VS: v_mov_b32 v1, 1.0; exp pos0 v0, v1, v1, v1 done; s_endpgm
+        let words: Vec<u32> = vec![
+            (0b0111_111u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242, // v_mov_b32 v1, 1.0
+            (0b111110u32 << 26) | (1u32 << 11) | (12u32 << 4) | 0xF,     // exp pos0 ... done
+            (1u32 << 24) | (1u32 << 16) | (1u32 << 8),                   // v0, v1, v1, v1
+            (0b1011_1111_1u32 << 23) | (0x01u32 << 16),                  // s_endpgm
+        ];
+        fs::write(&bin_path, words_to_bytes(&words)).unwrap();
+
+        let (wgsl, output, source) =
+            format_translate_rdna2(&bin_path, Rdna2StageOverride::Auto, false).unwrap();
+        assert_eq!(source, "splash_vs.bin");
+        assert!(output.naga_validated);
+        assert!(wgsl.contains("@vertex"));
+        assert!(wgsl.contains("@builtin(position)"));
+
+        let (json, _, _) =
+            format_translate_rdna2(&bin_path, Rdna2StageOverride::Auto, true).unwrap();
+        assert!(json.contains("\"isa\": \"rdna2_gfx10_3\""));
+        assert!(json.contains("\"source\": \"splash_vs.bin\""));
+        assert!(json.contains("\"stage\": \"vertex\""));
+        assert!(json.contains("\"naga_validated\": true"));
+
+        run_translate_rdna2(&bin_path, Some(&out_wgsl), Rdna2StageOverride::Auto, false)
+            .expect("translate-rdna2 --out should write validated WGSL");
+        let written_wgsl = fs::read_to_string(&out_wgsl).unwrap();
+        assert_eq!(written_wgsl, wgsl);
+
+        // Verify round-trip parse with naga WGSL front-end.
+        let parsed = naga::front::wgsl::parse_str(&written_wgsl).expect("written WGSL must parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&parsed)
+            .expect("written WGSL must pass Naga validation");
+
+        // Strictly sanitized: never leak host directory paths into WGSL or JSON.
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(!wgsl.contains(&root_str));
         assert!(!json.contains(&root_str));
 
         let _ = fs::remove_dir_all(&root);
