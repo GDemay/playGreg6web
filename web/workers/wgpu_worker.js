@@ -1089,6 +1089,33 @@ class InlineWgslPackCache {
   }
 }
 
+const OPTIONAL_ADAPTER_FEATURES = Object.freeze([
+  'texture-compression-bc',
+  'depth32float-stencil8',
+  'float32-filterable',
+  'bgra8unorm-storage',
+  'rg11b10ufloat-renderable',
+  'texture-formats-tier1',
+]);
+
+function selectSupportedAdapterFeatures(adapter) {
+  if (!adapter || !adapter.features || typeof adapter.features.has !== 'function') {
+    return [];
+  }
+  const supported = [];
+  for (let i = 0; i < OPTIONAL_ADAPTER_FEATURES.length; i += 1) {
+    const feature = OPTIONAL_ADAPTER_FEATURES[i];
+    try {
+      if (adapter.features.has(feature)) {
+        supported.push(feature);
+      }
+    } catch (_) {
+      // Ignore feature-probe errors from non-standard or mock adapter feature sets.
+    }
+  }
+  return supported;
+}
+
 function deviceSupportsTimestampQuery(device) {
   if (!device || typeof device !== 'object') {
     return false;
@@ -5483,6 +5510,18 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     0
   );
   const drawCalls = toNonNegativeInt(stats && stats.drawCalls, 0);
+  const realPackDrawCount = toNonNegativeInt(
+    stats && stats.realPackDrawCount !== undefined
+      ? stats.realPackDrawCount
+      : processor && processor.realPackDrawCount,
+    0
+  );
+  const fallbackDrawCount = toNonNegativeInt(
+    stats && stats.fallbackDrawCount !== undefined
+      ? stats.fallbackDrawCount
+      : processor && processor.fallbackDrawCount,
+    0
+  );
   const computeDispatches = toNonNegativeInt(stats && stats.computeDispatches, 0);
   const packetsProcessed = toNonNegativeInt(
     stats && stats.packetCount !== undefined
@@ -5538,6 +5577,8 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
       framesPresented,
       droppedFrames,
       drawCalls,
+      realPackDrawCount,
+      fallbackDrawCount,
       computeDispatches,
       packetsProcessed,
     },
@@ -5838,7 +5879,23 @@ function createWgpuWorkerHandler(options = {}) {
       return null;
     }
 
-    const device = await adapter.requestDevice();
+    const requiredFeatures = selectSupportedAdapterFeatures(adapter);
+    let device;
+    let enabledFeatures = [];
+    if (requiredFeatures.length > 0) {
+      try {
+        device = await adapter.requestDevice({ requiredFeatures });
+        enabledFeatures = requiredFeatures.slice();
+      } catch (_) {
+        device = await adapter.requestDevice();
+        enabledFeatures = [];
+      }
+    } else {
+      device = await adapter.requestDevice();
+    }
+    if (device && device.features && typeof device.features.has === 'function') {
+      enabledFeatures = selectSupportedAdapterFeatures(device);
+    }
     const format = navigator.gpu.getPreferredCanvasFormat();
     const ctx = canvas.getContext('webgpu');
 
@@ -6032,7 +6089,7 @@ function createWgpuWorkerHandler(options = {}) {
     const info = adapter.info
       ? `${adapter.info.vendor || 'gpu'} ${adapter.info.architecture || ''}`.trim()
       : 'WebGPU';
-    postMessage({ ready: true, adapter: info });
+    postMessage({ ready: true, adapter: info, features: enabledFeatures });
     return processor;
   }
 
@@ -6341,6 +6398,8 @@ const exportedApi = {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
   buildGpuTelemetrySnapshot,
+  selectSupportedAdapterFeatures,
+  OPTIONAL_ADAPTER_FEATURES,
   selectFallbackShaderProfile,
   sanitizeValidationErrorMessage,
   normalizeValidationErrorType,

@@ -1,11 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import {
+  SHADER_STAGE as WGPK_SHADER_STAGE,
+  buildWgslPackBuffer,
+  fnv1a64,
+  formatHashHex,
+} from '../web/workers/wgsl_pack_loader.js';
 
 const require = createRequire(import.meta.url);
 const wgpuMod = require('../web/workers/wgpu_worker.js');
 const {
   WgpuCommandProcessor,
+  createWgpuWorkerHandler,
+  buildGpuTelemetrySnapshot,
+  selectSupportedAdapterFeatures,
+  OPTIONAL_ADAPTER_FEATURES,
   OPCODES,
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
@@ -1000,4 +1010,303 @@ test('DestroyResource cleans up textures, textureViews, samplers, bindGroups, co
   assert.equal(processor.bindGroups.size, 0);
   assert.equal(processor.shaderModules.size, 0);
   assert.equal(processor.computePipelines.size, 0);
+});
+
+test('W92 selectSupportedAdapterFeatures picks only supported optional features and handles missing adapter.features', () => {
+  assert.equal(Object.isFrozen(OPTIONAL_ADAPTER_FEATURES), true);
+  assert.deepEqual(OPTIONAL_ADAPTER_FEATURES, [
+    'texture-compression-bc',
+    'depth32float-stencil8',
+    'float32-filterable',
+    'bgra8unorm-storage',
+    'rg11b10ufloat-renderable',
+    'texture-formats-tier1',
+  ]);
+  assert.equal(globalThis.PlayGta6Wgpu.OPTIONAL_ADAPTER_FEATURES, OPTIONAL_ADAPTER_FEATURES);
+  assert.equal(
+    globalThis.PlayGta6Wgpu.selectSupportedAdapterFeatures,
+    selectSupportedAdapterFeatures
+  );
+
+  assert.deepEqual(selectSupportedAdapterFeatures(null), []);
+  assert.deepEqual(selectSupportedAdapterFeatures(undefined), []);
+  assert.deepEqual(selectSupportedAdapterFeatures({}), []);
+  assert.deepEqual(selectSupportedAdapterFeatures({ features: null }), []);
+  assert.deepEqual(selectSupportedAdapterFeatures({ features: {} }), []);
+  assert.deepEqual(
+    selectSupportedAdapterFeatures({
+      features: {
+        has() {
+          throw new Error('probe error');
+        },
+      },
+    }),
+    []
+  );
+
+  const partialAdapter = {
+    features: new Set([
+      'texture-compression-bc',
+      'depth32float-stencil8',
+      'rg11b10ufloat-renderable',
+      'indirect-first-instance',
+      'timestamp-query',
+    ]),
+  };
+  assert.deepEqual(selectSupportedAdapterFeatures(partialAdapter), [
+    'texture-compression-bc',
+    'depth32float-stencil8',
+    'rg11b10ufloat-renderable',
+  ]);
+
+  const fullAdapter = {
+    features: new Set(OPTIONAL_ADAPTER_FEATURES),
+  };
+  assert.deepEqual(selectSupportedAdapterFeatures(fullAdapter), [...OPTIONAL_ADAPTER_FEATURES]);
+});
+
+async function withMockNavigatorGpu(gpu, fn) {
+  const prevDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { gpu },
+    configurable: true,
+    writable: true,
+  });
+  try {
+    return await fn();
+  } finally {
+    if (prevDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', prevDescriptor);
+    } else {
+      delete globalThis.navigator;
+    }
+  }
+}
+
+function createMockOffscreenCanvas(ctx) {
+  const configured = [];
+  const webgpuCtx = {
+    ...ctx,
+    configure(desc) {
+      configured.push(desc);
+    },
+  };
+  return {
+    canvas: {
+      width: 0,
+      height: 0,
+      getContext(kind) {
+        assert.equal(kind, 'webgpu');
+        return webgpuCtx;
+      },
+    },
+    configured,
+  };
+}
+
+test('W92 defaultInitGpu requests supported optional adapter features and falls back cleanly if requestDevice rejects', async () => {
+  // 1. Adapter supports optional features -> passes requiredFeatures to requestDevice.
+  {
+    const { device, ctx } = createMockWebGpu();
+    const supported = [
+      'texture-compression-bc',
+      'depth32float-stencil8',
+      'float32-filterable',
+    ];
+    device.features = new Set(supported);
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock-gpu', architecture: 'rdna2' },
+          features: new Set([...supported, 'timestamp-query']),
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 640, height: 360 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 1);
+    assert.deepEqual(requestDeviceCalls[0], { requiredFeatures: supported });
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg, 'expected ready postMessage');
+    assert.equal(readyMsg.adapter, 'mock-gpu rdna2');
+    assert.deepEqual(readyMsg.features, supported);
+  }
+
+  // 2. requestDevice({ requiredFeatures }) rejects -> falls back to requestDevice() with no args.
+  {
+    const { device, ctx } = createMockWebGpu();
+    device.features = new Set();
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'fallback-gpu', architecture: '' },
+          features: new Set(['texture-compression-bc', 'texture-formats-tier1']),
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            if (desc && desc.requiredFeatures) {
+              throw new Error('requested feature rejected by driver');
+            }
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 640, height: 360 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 2);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredFeatures: ['texture-compression-bc', 'texture-formats-tier1'],
+    });
+    assert.equal(requestDeviceCalls[1], undefined);
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg, 'expected ready postMessage after fallback');
+    assert.equal(readyMsg.adapter, 'fallback-gpu');
+    assert.deepEqual(readyMsg.features, []);
+  }
+
+  // 3. Adapter without features -> calls requestDevice() once with no arguments.
+  {
+    const { device, ctx } = createMockWebGpu();
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 320, height: 180 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 1);
+    assert.equal(requestDeviceCalls[0], undefined);
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg);
+    assert.deepEqual(readyMsg.features, []);
+  }
+});
+
+test('W92 buildGpuTelemetrySnapshot exposes realPackDrawCount and fallbackDrawCount in frameStats', () => {
+  const { device, ctx } = createMockWebGpu();
+  const vsWgsl =
+    '@vertex fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.7, 0.4, 1.0); }';
+  const fallbackFsWgsl =
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.9, 0.1, 0.5, 1.0); }';
+
+  const vsHash = formatHashHex(fnv1a64(vsWgsl));
+  const fsHash = formatHashHex(fnv1a64(fsWgsl));
+  const fallbackFsHash = '0x000000000000f001';
+  const missingFsHash = '0xdeadbeef00009201';
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+    { hash: fallbackFsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fallbackFsWgsl },
+  ]);
+
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    wgslPackBuffer: packBuf,
+    fallbackShaderHashes: { fragment: fallbackFsHash },
+  });
+
+  const stream = new BinaryCommandBuilder()
+    .beginFrame()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsHash)
+    .createShaderModule(3, SHADER_STAGE.FRAGMENT, missingFsHash)
+    .createRenderPipeline(10, 1, 2, 0)
+    .createRenderPipeline(11, 1, 3, 0)
+    .setPipeline(10)
+    .draw(3, 1, 0, 0)
+    .draw(3, 1, 0, 0)
+    .setPipeline(11)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  processor.execute(stream);
+
+  const snapshot = buildGpuTelemetrySnapshot(processor, { timestamp: 12345 });
+  assert.equal(snapshot.frameStats.framesPresented, 1);
+  assert.equal(snapshot.frameStats.drawCalls, 3);
+  assert.equal(snapshot.frameStats.realPackDrawCount, 2);
+  assert.equal(snapshot.frameStats.fallbackDrawCount, 1);
+
+  // Fallback to direct processor properties and non-negative integer coercion.
+  const directPropSnap = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({ frameCount: 2, drawCalls: 5 }),
+      realPackDrawCount: 4,
+      fallbackDrawCount: 1,
+    },
+    { timestamp: 200 }
+  );
+  assert.equal(directPropSnap.frameStats.realPackDrawCount, 4);
+  assert.equal(directPropSnap.frameStats.fallbackDrawCount, 1);
+
+  const coercedSnap = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({
+        frameCount: 1,
+        realPackDrawCount: -5,
+        fallbackDrawCount: Number.NaN,
+      }),
+    },
+    { timestamp: 300 }
+  );
+  assert.equal(coercedSnap.frameStats.realPackDrawCount, 0);
+  assert.equal(coercedSnap.frameStats.fallbackDrawCount, 0);
 });
