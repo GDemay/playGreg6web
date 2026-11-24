@@ -12,8 +12,11 @@ const HOST_ABI_IMPORT_NAMES = Object.freeze([
   'host_httpfs_close',
   'host_wgpu_submit',
 ]);
+const HOST_ABI_IMPORT_SET = new Set(HOST_ABI_IMPORT_NAMES);
+const GUEST_SIDE_MODULE_BASENAME_RE = /^guest_part_\d+\.wasm$/i;
 const DEFAULT_RUNTIME_SCRIPT_RELATIVE = './dist/runtime.js';
 const DEFAULT_RUNTIME_SCRIPT_FALLBACK = 'dist/runtime.js';
+const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 
 // GpuPacketHeader / GpuOpcode from runtime/abi/playgta6_abi.h and docs/gpu_commands.md.
 // Present is opcode 7 (ClearColor is 2). Detecting opcode 2 as Present would dismiss splash on clear.
@@ -934,8 +937,6 @@ function encodeTestFramePacket(r, g, b, a) {
   return buf;
 }
 
-const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-
 function tryOpenBroadcastChannel(BroadcastChannelCtor, channelName) {
   if (typeof BroadcastChannelCtor !== 'function') {
     return null;
@@ -951,12 +952,157 @@ function isEmscriptenPthreadWorker(scope) {
   return Boolean(scope && scope.name === EMSCRIPTEN_PTHREAD_WORKER_NAME);
 }
 
+function inspectRequiredHostAbiImports(wasmModule, wasmNs) {
+  const ModuleCtor =
+    (wasmNs && typeof wasmNs.Module === 'function' ? wasmNs.Module : null) ||
+    (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Module === 'function'
+      ? WebAssembly.Module
+      : null);
+  if (!ModuleCtor || typeof ModuleCtor.imports !== 'function') {
+    return null;
+  }
+  if (!(wasmModule instanceof ModuleCtor)) {
+    return null;
+  }
+  try {
+    const entries = ModuleCtor.imports(wasmModule);
+    if (!Array.isArray(entries)) {
+      return null;
+    }
+    const needed = new Set();
+    for (let i = 0; i < entries.length; i += 1) {
+      const imp = entries[i];
+      if (imp && imp.module === 'env' && HOST_ABI_IMPORT_SET.has(imp.name)) {
+        needed.add(imp.name);
+      }
+    }
+    return needed;
+  } catch {
+    return null;
+  }
+}
+
+function createPatchedPthreadEnv(baseEnv, hostEnv, requiredHostNames) {
+  if (!hostEnv) {
+    return baseEnv;
+  }
+  const targetNames = requiredHostNames ? Array.from(requiredHostNames) : HOST_ABI_IMPORT_NAMES;
+  if (targetNames.length === 0) {
+    return baseEnv;
+  }
+
+  // If baseEnv is frozen or has a non-configurable non-writable host_* stub,
+  // a Proxy get-trap cannot return a replacement without throwing TypeError.
+  let needsClone = Object.isFrozen(baseEnv);
+  if (!needsClone) {
+    for (let i = 0; i < targetNames.length; i += 1) {
+      const desc = Reflect.getOwnPropertyDescriptor(baseEnv, targetNames[i]);
+      if (desc && !desc.configurable && 'value' in desc && !desc.writable) {
+        needsClone = true;
+        break;
+      }
+    }
+  }
+
+  if (needsClone) {
+    const cloned = Object.assign({}, baseEnv);
+    for (let i = 0; i < targetNames.length; i += 1) {
+      const name = targetNames[i];
+      if (typeof hostEnv[name] !== 'function') {
+        continue;
+      }
+      const existing = cloned[name];
+      if (typeof existing !== 'function' || existing.stub === true) {
+        cloned[name] = hostEnv[name];
+      }
+    }
+    return cloned;
+  }
+
+  // Wrap baseEnv in a transparent Proxy so Emscripten MAIN_MODULE=2 / SIDE_MODULE=1
+  // dynamic-linking Proxies, __memory_base, __table_base, __indirect_function_table,
+  // and all non-stub lifted/C functions remain completely untouched.
+  return new Proxy(baseEnv, {
+    get(target, prop, receiver) {
+      const isTargetHost =
+        typeof prop === 'string' &&
+        HOST_ABI_IMPORT_SET.has(prop) &&
+        (!requiredHostNames || requiredHostNames.has(prop));
+      let existing;
+      try {
+        existing = Reflect.get(target, prop, receiver);
+      } catch (err) {
+        if (isTargetHost && typeof hostEnv[prop] === 'function') {
+          return hostEnv[prop];
+        }
+        throw err;
+      }
+      if (isTargetHost && typeof hostEnv[prop] === 'function') {
+        if (typeof existing !== 'function' || existing.stub === true) {
+          return hostEnv[prop];
+        }
+      }
+      return existing;
+    },
+  });
+}
+
+function patchPthreadWasmImports(wasmModuleOrBytes, rawImports, wasmNs, hostImports, hostEnv) {
+  if (!rawImports || typeof rawImports !== 'object') {
+    return rawImports;
+  }
+
+  const importedMemory = extractMemoryFromImports(rawImports);
+  if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
+    hostImports.setMemory(importedMemory);
+  }
+
+  if (!hostEnv) {
+    return rawImports;
+  }
+
+  const requiredHostNames = inspectRequiredHostAbiImports(wasmModuleOrBytes, wasmNs);
+  if (requiredHostNames && requiredHostNames.size === 0) {
+    // Side module imports none of the 5 host_* ABI symbols; leave imports & imports.env untouched.
+    return rawImports;
+  }
+
+  const hasEnvObj = Boolean(rawImports.env && typeof rawImports.env === 'object');
+  if (!hasEnvObj) {
+    if (!requiredHostNames || requiredHostNames.size === 0) {
+      return rawImports;
+    }
+    const synthesizedEnv = {};
+    requiredHostNames.forEach((name) => {
+      if (typeof hostEnv[name] === 'function') {
+        synthesizedEnv[name] = hostEnv[name];
+      }
+    });
+    const patchedImports = Object.assign({}, rawImports);
+    patchedImports.env = synthesizedEnv;
+    return patchedImports;
+  }
+
+  const patchedEnv = createPatchedPthreadEnv(rawImports.env, hostEnv, requiredHostNames);
+  if (patchedEnv === rawImports.env) {
+    return rawImports;
+  }
+
+  // Shallow-copy top-level namespace map so GOT.mem, GOT.func, wasi_snapshot_preview1, etc.
+  // keep their exact object/Proxy references untouched.
+  const patchedImports = Object.assign({}, rawImports);
+  patchedImports.env = patchedEnv;
+  return patchedImports;
+}
+
 /**
- * Wrap `globalScope.WebAssembly.Instance` so that inside an Emscripten `em-pthread` worker,
- * `new WebAssembly.Instance(wasmModule, imports)` automatically binds `imports.env.memory`
- * onto `hostImports` and replaces any missing or `.stub === true` entries for the 5 host
- * ABI imports (`host_log`, `host_httpfs_*`, `host_wgpu_submit`) while preserving all
- * non-stub Emscripten imports and `WebAssembly.Instance.prototype` / `instanceof`.
+ * Wrap `globalScope.WebAssembly.Instance` (and `WebAssembly.instantiate` when present) so that
+ * inside an Emscripten `em-pthread` worker, both the main module and `SIDE_MODULE=1` side modules
+ * bind `imports.env.memory` (when present) onto `hostImports` and replace missing or `.stub === true`
+ * entries for the 5 host ABI imports (`host_log`, `host_httpfs_*`, `host_wgpu_submit`) while
+ * preserving `GOT.mem`, `GOT.func`, `env.__memory_base`, `env.__table_base`,
+ * `env.__indirect_function_table`, dynamic-linking Proxies, non-stub functions, and
+ * `WebAssembly.Instance.prototype` / `instanceof`.
  * Returns an idempotent restore function.
  */
 function installPthreadHostImportShim(globalScope, hostImports) {
@@ -970,6 +1116,8 @@ function installPthreadHostImportShim(globalScope, hostImports) {
 
   const wasmNs = globalScope.WebAssembly;
   const OriginalInstance = wasmNs.Instance;
+  const OriginalInstantiate =
+    typeof wasmNs.instantiate === 'function' ? wasmNs.instantiate : null;
   const hostEnv =
     hostImports && typeof hostImports === 'object'
       ? hostImports.env && typeof hostImports.env === 'object'
@@ -977,54 +1125,66 @@ function installPthreadHostImportShim(globalScope, hostImports) {
         : hostImports
       : null;
 
+  const bindExportedMemoryIfNeeded = (rawImports, instance) => {
+    if (
+      (!rawImports || !extractMemoryFromImports(rawImports)) &&
+      instance &&
+      instance.exports &&
+      instance.exports.memory &&
+      hostImports &&
+      typeof hostImports.setMemory === 'function'
+    ) {
+      hostImports.setMemory(instance.exports.memory);
+    }
+  };
+
   const WrappedInstance = new Proxy(OriginalInstance, {
     construct(target, args, newTarget) {
       const nextArgs = Array.prototype.slice.call(args);
       const rawImports = nextArgs.length >= 2 ? nextArgs[1] : undefined;
 
       if (rawImports && typeof rawImports === 'object') {
-        const importedMemory = extractMemoryFromImports(rawImports);
-        if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
-          hostImports.setMemory(importedMemory);
-        }
-
-        const patchedImports = Object.assign({}, rawImports);
-        const baseEnv =
-          patchedImports.env && typeof patchedImports.env === 'object' ? patchedImports.env : {};
-        const patchedEnv = Object.assign({}, baseEnv);
-        if (hostEnv) {
-          for (let i = 0; i < HOST_ABI_IMPORT_NAMES.length; i += 1) {
-            const name = HOST_ABI_IMPORT_NAMES[i];
-            if (typeof hostEnv[name] !== 'function') {
-              continue;
-            }
-            const existing = patchedEnv[name];
-            if (typeof existing !== 'function' || existing.stub === true) {
-              patchedEnv[name] = hostEnv[name];
-            }
-          }
-        }
-        patchedImports.env = patchedEnv;
-        nextArgs[1] = patchedImports;
+        nextArgs[1] = patchPthreadWasmImports(
+          nextArgs[0],
+          rawImports,
+          wasmNs,
+          hostImports,
+          hostEnv,
+        );
       }
 
       const targetNew = newTarget === WrappedInstance ? target : newTarget;
       const instance = Reflect.construct(target, nextArgs, targetNew);
-      if (
-        (!rawImports || !extractMemoryFromImports(rawImports)) &&
-        instance &&
-        instance.exports &&
-        instance.exports.memory &&
-        hostImports &&
-        typeof hostImports.setMemory === 'function'
-      ) {
-        hostImports.setMemory(instance.exports.memory);
-      }
+      bindExportedMemoryIfNeeded(rawImports, instance);
       return instance;
     },
   });
 
   wasmNs.Instance = WrappedInstance;
+
+  let WrappedInstantiate = null;
+  if (OriginalInstantiate) {
+    WrappedInstantiate = function wrappedWasmInstantiate(moduleOrBytes, imports) {
+      const patchedImports =
+        imports && typeof imports === 'object'
+          ? patchPthreadWasmImports(moduleOrBytes, imports, wasmNs, hostImports, hostEnv)
+          : imports;
+      const res =
+        arguments.length >= 2
+          ? OriginalInstantiate.call(wasmNs, moduleOrBytes, patchedImports)
+          : OriginalInstantiate.call(wasmNs, moduleOrBytes);
+      if (res && typeof res.then === 'function') {
+        return res.then((instantiated) => {
+          const instance =
+            instantiated && instantiated.instance ? instantiated.instance : instantiated;
+          bindExportedMemoryIfNeeded(imports, instance);
+          return instantiated;
+        });
+      }
+      return res;
+    };
+    wasmNs.instantiate = WrappedInstantiate;
+  }
 
   let restored = false;
   return function restorePthreadHostImportShim() {
@@ -1035,6 +1195,9 @@ function installPthreadHostImportShim(globalScope, hostImports) {
     if (wasmNs.Instance === WrappedInstance) {
       wasmNs.Instance = OriginalInstance;
     }
+    if (OriginalInstantiate && wasmNs.instantiate === WrappedInstantiate) {
+      wasmNs.instantiate = OriginalInstantiate;
+    }
   };
 }
 
@@ -1043,6 +1206,7 @@ function installPthreadHostImportShim(globalScope, hostImports) {
  * - Streams `host_log` over `BroadcastChannel('game-progress')`.
  * - Relays `host_wgpu_submit` batches over `BroadcastChannel('playgta6-wgpu-pthread')` to the coordinator worker.
  * - Acquires `httpfsMailboxSab` via `BroadcastChannel('playgta6-httpfs-sab')` so pthreads can call `host_httpfs_*`.
+ * - Configures side-module `locateFile` resolution against `dist/` for `guest_part_*.wasm`.
  * - Installs the `WebAssembly.Instance` host-import shim BEFORE `importScripts(runtimeScriptUrl)`.
  */
 function bootstrapEmscriptenPthreadWorker(options = {}) {
@@ -1059,6 +1223,16 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     typeof options.runtimeScriptUrl === 'string' && options.runtimeScriptUrl.trim().length > 0
       ? options.runtimeScriptUrl.trim()
       : DEFAULT_RUNTIME_SCRIPT_RELATIVE;
+  const scopeLocationHref =
+    typeof options.locationHref === 'string' && options.locationHref.trim().length > 0
+      ? options.locationHref.trim()
+      : scope && scope.location && typeof scope.location.href === 'string'
+        ? scope.location.href
+        : '';
+  const resolvedRuntimeScriptUrl = resolveRuntimeScriptUrl(
+    runtimeScriptUrl === DEFAULT_RUNTIME_SCRIPT_RELATIVE ? undefined : runtimeScriptUrl,
+    scopeLocationHref,
+  );
   const BroadcastChannelCtor =
     options.BroadcastChannelCtor !== undefined
       ? options.BroadcastChannelCtor
@@ -1091,6 +1265,39 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       // Progress channel broadcast failures must never crash guest pthreads.
     }
   };
+
+  const pthreadLocateFile = createRuntimeLocateFile(
+    resolvedRuntimeScriptUrl,
+    options.locateFileBase,
+    {
+      reportFn: pthreadReport,
+      sideModuleNames: sanitizeSideModuleUrls(options.sideModuleUrls),
+    },
+  );
+
+  // Ensure Emscripten's pthread bootstrap resolves side modules (`guest_part_*.wasm`)
+  // relative to `dist/` even if the worker's `self.location.href` is `loader.js`.
+  let installedScopeModule = false;
+  let installedLocateFileOnModule = false;
+  let installedMainScriptOnModule = false;
+  if (scope && typeof scope === 'object') {
+    if (!scope.Module || typeof scope.Module !== 'object') {
+      scope.Module = {
+        locateFile: pthreadLocateFile,
+        mainScriptUrlOrBlob: resolvedRuntimeScriptUrl,
+      };
+      installedScopeModule = true;
+    } else {
+      if (typeof scope.Module.locateFile !== 'function') {
+        scope.Module.locateFile = pthreadLocateFile;
+        installedLocateFileOnModule = true;
+      }
+      if (!scope.Module.mainScriptUrlOrBlob) {
+        scope.Module.mainScriptUrlOrBlob = resolvedRuntimeScriptUrl;
+        installedMainScriptOnModule = true;
+      }
+    }
+  }
 
   let pthreadHttpfsClient = null;
   const hostImports = createHostImports({
@@ -1157,6 +1364,8 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
 
   return {
     hostImports,
+    locateFile: pthreadLocateFile,
+    runtimeScriptUrl: resolvedRuntimeScriptUrl,
     restoreWasmInstance,
     attachHttpfsSab,
     channels: {
@@ -1166,6 +1375,21 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     },
     cleanup() {
       restoreWasmInstance();
+      if (scope && typeof scope === 'object') {
+        if (installedScopeModule) {
+          delete scope.Module;
+        } else if (scope.Module && typeof scope.Module === 'object') {
+          if (installedLocateFileOnModule && scope.Module.locateFile === pthreadLocateFile) {
+            delete scope.Module.locateFile;
+          }
+          if (
+            installedMainScriptOnModule &&
+            scope.Module.mainScriptUrlOrBlob === resolvedRuntimeScriptUrl
+          ) {
+            delete scope.Module.mainScriptUrlOrBlob;
+          }
+        }
+      }
       const channels = [progressChannel, wgpuChannel, httpfsChannel];
       for (let i = 0; i < channels.length; i += 1) {
         const ch = channels[i];
@@ -1233,37 +1457,173 @@ function resolveRuntimeScriptUrl(runtimeScriptUrl, locationHref) {
   return rawScript || DEFAULT_RUNTIME_SCRIPT_FALLBACK;
 }
 
-function createRuntimeLocateFile(runtimeScriptUrl, locateFileBase) {
+function extractWasmBasename(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return '';
+  }
+  const clean = value.split(/[?#]/, 1)[0];
+  return basenameOfPath(clean);
+}
+
+function sanitizeSideModuleUrl(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes('\0') || trimmed.includes('\\')) {
+    return null;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!/\.wasm$/i.test(withoutQuery)) {
+    return null;
+  }
+  if (isAbsoluteUrl(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return null;
+    }
+    if (typeof URL === 'function') {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.pathname.split('/').includes('..')) {
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return trimmed;
+  }
+  const segments = withoutQuery.replace(/^\/+/, '').split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    if (segments[i] === '..') {
+      return null;
+    }
+  }
+  return trimmed;
+}
+
+function sanitizeSideModuleUrls(rawList) {
+  if (!Array.isArray(rawList)) {
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < rawList.length; i += 1) {
+    const clean = sanitizeSideModuleUrl(rawList[i]);
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+/**
+ * Resolve a runtime asset or Emscripten `SIDE_MODULE=1` (`guest_part_*.wasm`)
+ * filename/URL relative to `locateFileBase` or the `dist/` directory of
+ * `runtimeScriptUrl`, avoiding duplicate `dist/dist/` prefixes.
+ */
+function resolveSideModuleUrl(file, runtimeScriptUrl, locateFileBase) {
+  if (typeof file !== 'string') {
+    return '';
+  }
+  const trimmed = file.trim();
+  if (trimmed.length === 0) {
+    return '';
+  }
+  if (isAbsoluteUrl(trimmed)) {
+    return trimmed;
+  }
+
   const explicitBase =
     typeof locateFileBase === 'string' && locateFileBase.trim().length > 0
       ? ensureTrailingSlash(locateFileBase.trim())
       : '';
+  const effectiveScriptUrl =
+    typeof runtimeScriptUrl === 'string' && runtimeScriptUrl.trim().length > 0
+      ? runtimeScriptUrl.trim()
+      : DEFAULT_RUNTIME_SCRIPT_FALLBACK;
+
+  if (trimmed.startsWith('/')) {
+    const absBase = isAbsoluteUrl(explicitBase)
+      ? explicitBase
+      : isAbsoluteUrl(effectiveScriptUrl)
+        ? effectiveScriptUrl
+        : '';
+    if (absBase && typeof URL === 'function') {
+      try {
+        return new URL(trimmed, absBase).href;
+      } catch {
+        // Fall through to returning root-relative path.
+      }
+    }
+    return trimmed;
+  }
+
+  const relNoDot = trimmed.replace(/^\.\//, '');
+
+  if (explicitBase) {
+    if (isAbsoluteUrl(explicitBase) && typeof URL === 'function') {
+      try {
+        return new URL(relNoDot, explicitBase).href;
+      } catch {
+        // Fall through to string join.
+      }
+    }
+    return `${explicitBase}${relNoDot}`;
+  }
+
+  const scriptDir = dirnameWithSlash(effectiveScriptUrl);
+  const effectiveRel =
+    (scriptDir === 'dist/' || scriptDir.endsWith('/dist/')) && relNoDot.startsWith('dist/')
+      ? relNoDot.slice('dist/'.length)
+      : relNoDot;
+
+  if (isAbsoluteUrl(effectiveScriptUrl) && typeof URL === 'function') {
+    try {
+      return new URL(effectiveRel, effectiveScriptUrl).href;
+    } catch {
+      // Fall through to relative dist/ join.
+    }
+  }
+  return `${scriptDir}${effectiveRel}`;
+}
+
+function createRuntimeLocateFile(runtimeScriptUrl, locateFileBase, options = {}) {
+  const reportFn = typeof options.reportFn === 'function' ? options.reportFn : null;
+  const knownSideModules = new Set();
+  if (Array.isArray(options.sideModuleNames)) {
+    for (let i = 0; i < options.sideModuleNames.length; i += 1) {
+      const base = extractWasmBasename(options.sideModuleNames[i]);
+      if (base) {
+        knownSideModules.add(base.toLowerCase());
+      }
+    }
+  }
+  const reportedSideModules = new Set();
 
   return function locateFile(file) {
-    if (typeof file !== 'string' || file.length === 0) {
+    const resolved = resolveSideModuleUrl(file, runtimeScriptUrl, locateFileBase);
+    if (!resolved) {
       return '';
     }
-    if (isAbsoluteUrl(file)) {
-      return file;
-    }
-    if (explicitBase) {
-      if (isAbsoluteUrl(explicitBase) && typeof URL === 'function') {
+    if (reportFn) {
+      const base = extractWasmBasename(resolved) || extractWasmBasename(file);
+      const baseLower = base ? base.toLowerCase() : '';
+      if (
+        baseLower &&
+        (GUEST_SIDE_MODULE_BASENAME_RE.test(baseLower) || knownSideModules.has(baseLower)) &&
+        !reportedSideModules.has(baseLower)
+      ) {
+        reportedSideModules.add(baseLower);
         try {
-          return new URL(file, explicitBase).href;
+          reportFn(`Loading Wasm side module (${base})...`);
         } catch {
-          // Fall through to string join.
+          // Progress channel errors must never break locateFile.
         }
       }
-      return `${explicitBase}${file.replace(/^\.\//, '')}`;
     }
-    if (isAbsoluteUrl(runtimeScriptUrl) && typeof URL === 'function') {
-      try {
-        return new URL(file, runtimeScriptUrl).href;
-      } catch {
-        // Fall through to relative dist/ join.
-      }
-    }
-    return `${dirnameWithSlash(runtimeScriptUrl)}${file.replace(/^\.\//, '')}`;
+    return resolved;
   };
 }
 
@@ -1440,7 +1800,36 @@ function buildRuntimeModuleConfig(options = {}) {
     options.runtimeScriptUrl,
     options.locationHref,
   );
-  const locateFile = createRuntimeLocateFile(resolvedRuntimeScriptUrl, options.locateFileBase);
+  const rawDynamicLibraries = sanitizeSideModuleUrls(options.dynamicLibraries);
+  const rawSideModuleUrls = sanitizeSideModuleUrls(options.sideModuleUrls);
+  const combinedDynamicLibraries = [];
+  const seenSideModules = new Set();
+  const addSideModuleEntry = (entry) => {
+    const key = entry.toLowerCase();
+    const baseKey = extractWasmBasename(entry).toLowerCase();
+    if (seenSideModules.has(key) || (baseKey && seenSideModules.has(baseKey))) {
+      return;
+    }
+    seenSideModules.add(key);
+    if (baseKey) {
+      seenSideModules.add(baseKey);
+    }
+    combinedDynamicLibraries.push(entry);
+  };
+  for (let i = 0; i < rawDynamicLibraries.length; i += 1) {
+    addSideModuleEntry(rawDynamicLibraries[i]);
+  }
+  for (let i = 0; i < rawSideModuleUrls.length; i += 1) {
+    addSideModuleEntry(rawSideModuleUrls[i]);
+  }
+  const resolvedSideModuleUrls = combinedDynamicLibraries.map((entry) =>
+    resolveSideModuleUrl(entry, resolvedRuntimeScriptUrl, options.locateFileBase),
+  );
+
+  const locateFile = createRuntimeLocateFile(resolvedRuntimeScriptUrl, options.locateFileBase, {
+    reportFn: activeReportFn,
+    sideModuleNames: combinedDynamicLibraries,
+  });
 
   const preRun = Array.isArray(options.preRun)
     ? options.preRun
@@ -1506,6 +1895,11 @@ function buildRuntimeModuleConfig(options = {}) {
     },
   };
 
+  if (combinedDynamicLibraries.length > 0) {
+    config.dynamicLibraries = combinedDynamicLibraries.slice();
+    config.sideModuleUrls = resolvedSideModuleUrls.slice();
+  }
+
   if (typeof options.instantiateWasm === 'function') {
     config.instantiateWasm = options.instantiateWasm;
   } else if (options.instantiateWasm !== null && options.instantiateWasm !== false) {
@@ -1527,6 +1921,8 @@ function createRuntimeModuleOptions(overrides = {}) {
 }
 
 let coordinatorFirstPresentEmitted = false;
+let configuredSideModuleUrls = null;
+let configuredDynamicLibraries = null;
 
 async function tryBootWasmRuntime() {
   try {
@@ -1540,18 +1936,23 @@ async function tryBootWasmRuntime() {
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
-      await self.createRuntimeModule(
-        createRuntimeModuleOptions({
-          onFirstPresent: () => {
-            coordinatorFirstPresentEmitted = true;
-          },
-          onWasmError: (err) => {
-            if (progress) {
-              progress.postMessage({ error: `runtime wasm: ${err}` });
-            }
-          },
-        }),
-      );
+      const runtimeOptions = {
+        onFirstPresent: () => {
+          coordinatorFirstPresentEmitted = true;
+        },
+        onWasmError: (err) => {
+          if (progress) {
+            progress.postMessage({ error: `runtime wasm: ${err}` });
+          }
+        },
+      };
+      if (configuredSideModuleUrls) {
+        runtimeOptions.sideModuleUrls = configuredSideModuleUrls;
+      }
+      if (configuredDynamicLibraries) {
+        runtimeOptions.dynamicLibraries = configuredDynamicLibraries;
+      }
+      await self.createRuntimeModule(createRuntimeModuleOptions(runtimeOptions));
     }
   } catch (err) {
     if (progress) {
@@ -1656,6 +2057,10 @@ if (typeof self !== 'undefined') {
 
     if (!msg.canvas) return;
     inputSab = msg.inputSab || null;
+    configuredSideModuleUrls = Array.isArray(msg.sideModuleUrls) ? msg.sideModuleUrls : null;
+    configuredDynamicLibraries = Array.isArray(msg.dynamicLibraries)
+      ? msg.dynamicLibraries
+      : null;
 
     if (
       typeof SharedArrayBuffer !== 'undefined' &&
@@ -1732,6 +2137,8 @@ const exportedApi = {
   forwardGpuWorkerMessage,
   createHostImports,
   resolveRuntimeScriptUrl,
+  resolveSideModuleUrl,
+  sanitizeSideModuleUrls,
   buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
