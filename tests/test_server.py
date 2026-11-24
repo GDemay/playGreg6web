@@ -220,6 +220,7 @@ class TestServeLocal(unittest.TestCase):
             "shaderPackCount",
             "splashImage",
             "shaderPackUrl",
+            "preferredShaderPackUrl",
             "reflectionManifestUrl",
             "pgimUrl",
             "programManifestUrl",
@@ -237,6 +238,7 @@ class TestServeLocal(unittest.TestCase):
         self.assertEqual(data["shaderPackCount"], 0)
         self.assertIsNone(data["splashImage"])
         self.assertIsNone(data["shaderPackUrl"])
+        self.assertIsNone(data["preferredShaderPackUrl"])
         self.assertIsNone(data["reflectionManifestUrl"])
         self.assertIsNone(data["pgimUrl"])
         self.assertIsNone(data["programManifestUrl"])
@@ -264,6 +266,8 @@ class TestServeLocal(unittest.TestCase):
         self.assertEqual(data2["sideModuleCount"], 0)
         self.assertEqual(data2["sideModuleUrls"], [])
         self.assertEqual(data2["shaderPackCount"], 2)
+        self.assertEqual(data2["shaderPackUrl"], "/shaders/base.wgsl.pack")
+        self.assertEqual(data2["preferredShaderPackUrl"], "/shaders/base.wgsl.pack")
 
         # Stage side-module .wasm chunks and verify natural-sorted discovery.
         for name in ("guest_part_10.wasm", "guest_part_2.wasm", "guest_part_0.wasm", "guest_part_1.wasm"):

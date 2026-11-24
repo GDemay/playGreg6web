@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import bootstrapDefault, {
   DEFAULT_LOADER_URL,
   DEFAULT_MAX_VALIDATION_ERRORS,
+  DEFAULT_SHADER_PACK_URL,
   PlayGta6AppHandle,
   bootstrapPlayGta6App,
   detectWasm64,
@@ -2181,4 +2182,211 @@ test('W73 globalScope.__playgta6 supports custom globalScope, attachGlobalHook o
   assert.equal(frozenGlobal.__playgta6, undefined);
   assert.equal(frozenApp.getDiagnosticsSnapshot().bootMode, 'idle');
   await frozenApp.destroy();
+});
+
+test('W79 forwards preferredShaderPackUrl from /api/status, honors explicit overrides, and falls back to /shaders/fallback.wgsl.pack', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { createWorkerBootInitPayloads } = require('../web/loader.js');
+
+  assert.equal(DEFAULT_SHADER_PACK_URL, '/shaders/fallback.wgsl.pack');
+
+  // extractBootAssetUrls prefers preferredShaderPackUrl over shaderPackUrl and legacy aliases.
+  assert.deepEqual(
+    extractBootAssetUrls({
+      preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    }),
+    { shaderPackUrl: '/shaders/splash.wgsl.pack' }
+  );
+  assert.deepEqual(
+    extractBootAssetUrls({
+      preferredShaderPackUrl: null,
+      shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    }),
+    { shaderPackUrl: '/shaders/fallback.wgsl.pack' }
+  );
+  assert.deepEqual(
+    extractBootAssetUrls({
+      preferredShaderPackUrl: null,
+      shaderPackUrl: null,
+    }),
+    {}
+  );
+
+  async function runWasmLaunch({ statusPayload, bootstrapOptions = {}, startOpts = undefined }) {
+    const clock = createClock(25000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+
+    const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+    webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+
+    const workerCalls = [];
+    const postedMessages = [];
+    const mockWorker = createFakeEventTarget({
+      postMessage(payload, transfer) {
+        postedMessages.push({ payload, transfer });
+      },
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch(statusPayload),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker(args) {
+        workerCalls.push(args);
+        return mockWorker;
+      },
+      ...bootstrapOptions,
+    });
+
+    try {
+      const started = await app.start(startOpts);
+      assert.equal(started.ok, true);
+      assert.equal(started.mode, SESSION_MODE.WASM);
+      assert.equal(workerCalls.length, 1);
+      assert.equal(postedMessages.length, 1);
+      const initPayload = postedMessages[0].payload;
+      const workerInits = createWorkerBootInitPayloads(initPayload);
+      return {
+        workerCall: workerCalls[0],
+        initPayload,
+        workerInits,
+      };
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // 1. /api/status reports preferredShaderPackUrl -> forwarded to loader.js and wgpu_worker.js.
+  const splashLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      shaderPackCount: 2,
+      preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    },
+  });
+  assert.equal(splashLaunch.workerCall.shaderPackUrl, '/shaders/splash.wgsl.pack');
+  assert.equal(splashLaunch.initPayload.shaderPackUrl, '/shaders/splash.wgsl.pack');
+  assert.equal(splashLaunch.workerInits.gpuInit.shaderPackUrl, '/shaders/splash.wgsl.pack');
+
+  // 2. BootOrchestrator path also preserves status.preferredShaderPackUrl over normalized assets.
+  const orchSplashLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      shaderPackUrl: '/shaders/fallback.wgsl.pack',
+    },
+    bootstrapOptions: {
+      enableBootOrchestrator: true,
+      BootOrchestratorCtor: BootOrchestrator,
+      pgimPreloader: {
+        async preloadBootBundle() {
+          return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+        },
+      },
+    },
+  });
+  assert.equal(orchSplashLaunch.workerCall.shaderPackUrl, '/shaders/splash.wgsl.pack');
+  assert.equal(orchSplashLaunch.initPayload.shaderPackUrl, '/shaders/splash.wgsl.pack');
+  assert.equal(orchSplashLaunch.workerInits.gpuInit.shaderPackUrl, '/shaders/splash.wgsl.pack');
+
+  // 3. Explicit bootstrap options.shaderPackUrl override wins over /api/status.
+  const explicitOptionLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      shaderPackUrl: '/shaders/splash.wgsl.pack',
+    },
+    bootstrapOptions: {
+      shaderPackUrl: '/shaders/custom-override.wgsl.pack',
+    },
+  });
+  assert.equal(explicitOptionLaunch.workerCall.shaderPackUrl, '/shaders/custom-override.wgsl.pack');
+  assert.equal(explicitOptionLaunch.initPayload.shaderPackUrl, '/shaders/custom-override.wgsl.pack');
+  assert.equal(
+    explicitOptionLaunch.workerInits.gpuInit.shaderPackUrl,
+    '/shaders/custom-override.wgsl.pack'
+  );
+
+  // 4. Explicit start({ shaderPackUrl }) override wins over both bootstrap option and /api/status.
+  const explicitStartLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      shaderPackUrl: '/shaders/splash.wgsl.pack',
+    },
+    bootstrapOptions: {
+      shaderPackUrl: '/shaders/custom-override.wgsl.pack',
+    },
+    startOpts: {
+      shaderPackUrl: '/shaders/per-start.wgsl.pack',
+    },
+  });
+  assert.equal(explicitStartLaunch.workerCall.shaderPackUrl, '/shaders/per-start.wgsl.pack');
+  assert.equal(explicitStartLaunch.initPayload.shaderPackUrl, '/shaders/per-start.wgsl.pack');
+  assert.equal(
+    explicitStartLaunch.workerInits.gpuInit.shaderPackUrl,
+    '/shaders/per-start.wgsl.pack'
+  );
+
+  // 5. When /api/status omits or nulls shader pack URLs, degrades safely to /shaders/fallback.wgsl.pack.
+  const fallbackOmittedLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      shaderPackCount: 0,
+    },
+  });
+  assert.equal(fallbackOmittedLaunch.workerCall.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(fallbackOmittedLaunch.initPayload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(
+    fallbackOmittedLaunch.workerInits.gpuInit.shaderPackUrl,
+    '/shaders/fallback.wgsl.pack'
+  );
+
+  const fallbackNullLaunch = await runWasmLaunch({
+    statusPayload: {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      preferredShaderPackUrl: null,
+      shaderPackUrl: null,
+    },
+  });
+  assert.equal(fallbackNullLaunch.workerCall.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(fallbackNullLaunch.initPayload.shaderPackUrl, '/shaders/fallback.wgsl.pack');
+  assert.equal(
+    fallbackNullLaunch.workerInits.gpuInit.shaderPackUrl,
+    '/shaders/fallback.wgsl.pack'
+  );
 });

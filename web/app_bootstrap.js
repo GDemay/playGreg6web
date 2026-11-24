@@ -20,6 +20,7 @@ import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
 import { BootTracer } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
+export const DEFAULT_SHADER_PACK_URL = '/shaders/fallback.wgsl.pack';
 export const DEFAULT_VIEWPORT_WIDTH = 640;
 export const DEFAULT_VIEWPORT_HEIGHT = 360;
 export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
@@ -333,7 +334,12 @@ export function extractBootAssetUrls(source) {
   const out = {};
   const bootBase = pickBootUrl(source.bootBase);
   const gameBase = pickBootUrl(source.gameBase);
-  const shaderPackUrl = pickBootUrl(source.shaderPackUrl, source.shaderPack, source.wgslPack);
+  const shaderPackUrl = pickBootUrl(
+    source.preferredShaderPackUrl,
+    source.shaderPackUrl,
+    source.shaderPack,
+    source.wgslPack
+  );
   const reflectionManifestUrl = pickBootUrl(
     source.reflectionManifestUrl,
     source.reflectionUrl,
@@ -607,6 +613,7 @@ export class PlayGta6AppHandle {
  * @param {string} [options.dataBase]
  * @param {string} [options.bootBase]
  * @param {string} [options.gameBase]
+ * @param {string} [options.shaderPackUrl]
  * @param {string} [options.programManifestUrl]
  * @param {object|null} [options.gpuBootPanel]
  * @param {Element|object|null} [options.gpuBootPanelRoot]
@@ -694,6 +701,13 @@ export function bootstrapPlayGta6App(options = {}) {
   const explicitGameBase =
     typeof options.gameBase === 'string' && options.gameBase.length > 0 ? options.gameBase : null;
   const defaultGameBase = resolveDefaultGameBase(options, windowObj);
+  const explicitShaderPackUrl = pickBootUrl(
+    options.shaderPackUrl,
+    options.preferredShaderPackUrl,
+    options.shaderPack,
+    options.wgslPack
+  );
+  let startOverrideShaderPackUrl = null;
   const initialBootAssets = extractBootAssetUrls(options);
   let latestDiscoveredBootAssets = { ...initialBootAssets };
   let lastNotifiedSideModuleKey = null;
@@ -800,9 +814,9 @@ export function bootstrapPlayGta6App(options = {}) {
       return;
     }
     const fromDirect = extractBootAssetUrls(payload);
-    const fromStatus = extractBootAssetUrls(payload.status || payload.serverStatus);
     const fromAssets = extractBootAssetUrls(payload.assets);
-    const merged = { ...fromDirect, ...fromStatus, ...fromAssets };
+    const fromStatus = extractBootAssetUrls(payload.status || payload.serverStatus);
+    const merged = { ...fromDirect, ...fromAssets, ...fromStatus };
     if (Object.keys(merged).length > 0) {
       latestDiscoveredBootAssets = { ...latestDiscoveredBootAssets, ...merged };
       if (merged.sideModuleUrls !== undefined || merged.sideModuleCount !== undefined) {
@@ -818,8 +832,8 @@ export function bootstrapPlayGta6App(options = {}) {
         const state = bootOrchestrator.getState();
         if (state && typeof state === 'object') {
           fromOrchestrator = {
-            ...extractBootAssetUrls(state.status),
             ...extractBootAssetUrls(state.assets),
+            ...extractBootAssetUrls(state.status),
           };
         }
       } catch {
@@ -836,10 +850,12 @@ export function bootstrapPlayGta6App(options = {}) {
     const fields = {
       bootBase: explicitBootBase || merged.bootBase || defaultBootBase,
       gameBase: explicitGameBase || merged.gameBase || defaultGameBase,
+      shaderPackUrl:
+        startOverrideShaderPackUrl ||
+        explicitShaderPackUrl ||
+        merged.shaderPackUrl ||
+        DEFAULT_SHADER_PACK_URL,
     };
-    if (merged.shaderPackUrl) {
-      fields.shaderPackUrl = merged.shaderPackUrl;
-    }
     if (merged.reflectionManifestUrl) {
       fields.reflectionManifestUrl = merged.reflectionManifestUrl;
     }
@@ -2395,6 +2411,15 @@ export function bootstrapPlayGta6App(options = {}) {
       };
     }
     lastNotifiedSideModuleKey = null;
+    startOverrideShaderPackUrl =
+      startOpts && typeof startOpts === 'object'
+        ? pickBootUrl(
+            startOpts.shaderPackUrl,
+            startOpts.preferredShaderPackUrl,
+            startOpts.shaderPack,
+            startOpts.wgslPack
+          )
+        : null;
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;

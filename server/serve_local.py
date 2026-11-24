@@ -36,6 +36,7 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
 BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
 RUNTIME_WASM_NAME = "runtime.wasm"
+PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
 
 CLIENT_DISCONNECT_ERRORS = (
@@ -233,29 +234,49 @@ def _discover_splash_image_url(game_root: Path | None) -> str | None:
 def _list_shader_pack_names(shaders_root: Path | None) -> list[str]:
     if shaders_root is None or not shaders_root.is_dir():
         return []
+    try:
+        shaders_root_resolved = shaders_root.resolve()
+    except OSError:
+        return []
     names: list[str] = []
     try:
         for entry in shaders_root.iterdir():
             try:
-                if entry.is_file() and entry.name.lower().endswith(".wgsl.pack"):
-                    # Ensure the file stays inside shaders_root (reject external symlinks).
-                    resolved = entry.resolve()
-                    if resolved.is_relative_to(shaders_root.resolve()):
-                        names.append(entry.name)
+                if not entry.name.lower().endswith(".wgsl.pack"):
+                    continue
+                if not entry.is_file():
+                    continue
+                # Ensure the file stays inside shaders_root (reject external symlinks).
+                resolved = entry.resolve(strict=True)
+                if not resolved.is_relative_to(shaders_root_resolved):
+                    continue
+                if not resolved.is_file() or not resolved.name.lower().endswith(".wgsl.pack"):
+                    continue
+                names.append(entry.name)
             except OSError:
                 continue
     except OSError:
         return []
-    return sorted(names, key=lambda name: name.lower())
+    return sorted(names, key=lambda name: (name.lower(), name))
 
 
 def _discover_shader_pack_url(shaders_root: Path | None) -> str | None:
+    """Return the preferred `/shaders/<name>` URL for local `.wgsl.pack` bundles.
+
+    Preference order matches `runtime/wasm_boot.cpp`:
+    1. `splash.wgsl.pack` when present
+    2. `fallback.wgsl.pack` when present
+    3. First sorted `*.wgsl.pack` file if any
+    4. `None` when no `.wgsl.pack` files exist
+    """
     names = _list_shader_pack_names(shaders_root)
     if not names:
         return None
-    preferred = next((name for name in names if name.lower() == "fallback.wgsl.pack"), None)
-    chosen = preferred or names[0]
-    return f"/shaders/{chosen}"
+    for preferred_name in PREFERRED_SHADER_PACK_NAMES:
+        match = next((name for name in names if name.lower() == preferred_name), None)
+        if match is not None:
+            return f"/shaders/{match}"
+    return f"/shaders/{names[0]}"
 
 
 def _discover_reflection_manifest_url(shaders_root: Path | None) -> str | None:
@@ -445,6 +466,7 @@ def build_status_payload(
         has_wasm = bool(side_module_urls)
 
     effective_shaders = shaders_root if shaders_root is not None else (data_root / "shaders")
+    preferred_shader_pack_url = _discover_shader_pack_url(effective_shaders)
 
     return {
         "ok": True,
@@ -457,7 +479,8 @@ def build_status_payload(
         "sideModuleUrls": side_module_urls,
         "shaderPackCount": _count_shader_packs(web_root, data_root, effective_shaders),
         "splashImage": _discover_splash_image_url(game_root),
-        "shaderPackUrl": _discover_shader_pack_url(effective_shaders),
+        "shaderPackUrl": preferred_shader_pack_url,
+        "preferredShaderPackUrl": preferred_shader_pack_url,
         "reflectionManifestUrl": _discover_reflection_manifest_url(effective_shaders),
         "pgimUrl": _discover_pgim_url(boot_root),
         "programManifestUrl": _discover_program_manifest_url(boot_root),

@@ -176,6 +176,7 @@ class TestServeLocalBoot(unittest.TestCase):
         # New boot-discovery fields (relative URLs only).
         self.assertEqual(data["splashImage"], "/game/Assets/xbs_splash.png")
         self.assertEqual(data["shaderPackUrl"], "/shaders/fallback.wgsl.pack")
+        self.assertEqual(data["preferredShaderPackUrl"], "/shaders/fallback.wgsl.pack")
         self.assertEqual(data["reflectionManifestUrl"], "/shaders/reflection-manifest.json")
         self.assertEqual(data["pgimUrl"], "/boot/guest.pgim")
         self.assertIsNone(data["programManifestUrl"])
@@ -221,6 +222,7 @@ class TestServeLocalBoot(unittest.TestCase):
             data = json.loads(raw)
             self.assertIsNone(data["splashImage"])
             self.assertIsNone(data["shaderPackUrl"])
+            self.assertIsNone(data["preferredShaderPackUrl"])
             self.assertIsNone(data["reflectionManifestUrl"])
             self.assertIsNone(data["pgimUrl"])
             self.assertIsNone(data["programManifestUrl"])
@@ -1050,6 +1052,175 @@ class TestServeLocalSideModuleDiscovery(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=2)
+
+
+class TestServeLocalShaderPackDiscovery(unittest.TestCase):
+    """Tests for W79 shader pack preference (`splash.wgsl.pack` > `fallback.wgsl.pack` > sorted)."""
+
+    def test_discover_shader_pack_url_preference_order_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            shaders = data / "shaders"
+            web.mkdir()
+            data.mkdir()
+
+            # Missing or empty shaders directory -> None.
+            self.assertIsNone(serve_local._discover_shader_pack_url(None))
+            self.assertIsNone(serve_local._discover_shader_pack_url(shaders))
+            shaders.mkdir()
+            self.assertIsNone(serve_local._discover_shader_pack_url(shaders))
+            payload_empty = serve_local.build_status_payload(web, data, shaders_root=shaders)
+            self.assertIsNone(payload_empty["shaderPackUrl"])
+            self.assertIsNone(payload_empty["preferredShaderPackUrl"])
+
+            # Non-pack files and directories ending in .wgsl.pack are ignored.
+            (shaders / "readme.txt").write_text("ignore", encoding="utf-8")
+            (shaders / "dir.wgsl.pack").mkdir()
+            self.assertIsNone(serve_local._discover_shader_pack_url(shaders))
+
+            # Arbitrary packs only -> first sorted *.wgsl.pack wins.
+            (shaders / "zeta.wgsl.pack").write_bytes(b"WGPK-zeta")
+            (shaders / "alpha.wgsl.pack").write_bytes(b"WGPK-alpha")
+            self.assertEqual(
+                serve_local._discover_shader_pack_url(shaders),
+                "/shaders/alpha.wgsl.pack",
+            )
+
+            # fallback.wgsl.pack beats arbitrary packs when splash.wgsl.pack is absent.
+            (shaders / "fallback.wgsl.pack").write_bytes(b"WGPK-fallback")
+            self.assertEqual(
+                serve_local._discover_shader_pack_url(shaders),
+                "/shaders/fallback.wgsl.pack",
+            )
+            payload_fallback = serve_local.build_status_payload(web, data, shaders_root=shaders)
+            self.assertEqual(payload_fallback["shaderPackUrl"], "/shaders/fallback.wgsl.pack")
+            self.assertEqual(
+                payload_fallback["preferredShaderPackUrl"], "/shaders/fallback.wgsl.pack"
+            )
+
+            # splash.wgsl.pack takes precedence over fallback.wgsl.pack when both exist.
+            (shaders / "splash.wgsl.pack").write_bytes(b"WGPK-splash")
+            self.assertEqual(
+                serve_local._discover_shader_pack_url(shaders),
+                "/shaders/splash.wgsl.pack",
+            )
+            payload_splash = serve_local.build_status_payload(web, data, shaders_root=shaders)
+            self.assertEqual(payload_splash["shaderPackUrl"], "/shaders/splash.wgsl.pack")
+            self.assertEqual(
+                payload_splash["preferredShaderPackUrl"], "/shaders/splash.wgsl.pack"
+            )
+
+            # Zero host paths or usernames leak into JSON.
+            raw = json.dumps(payload_splash)
+            self.assertNotIn(str(base), raw)
+            self.assertNotIn(str(shaders), raw)
+            self.assertNotRegex(raw, r"[A-Za-z]:\\")
+            for env_key in ("USERNAME", "USER", "LOGNAME"):
+                val = os.environ.get(env_key, "")
+                if val and len(val) > 2:
+                    self.assertNotIn(val, raw)
+
+    def test_live_api_status_prefers_splash_over_fallback_and_degrades_to_null(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web = base / "web"
+            data = base / "data"
+            shaders = data / "shaders"
+            web.mkdir()
+            shaders.mkdir(parents=True)
+            (web / "index.html").write_text("<h1>shaders</h1>", encoding="utf-8")
+
+            splash_bytes = b"WGPK-splash-payload-0123456789"
+            fallback_bytes = b"WGPK-fallback-payload-abcdef"
+            splash_file = shaders / "splash.wgsl.pack"
+            fallback_file = shaders / "fallback.wgsl.pack"
+            splash_file.write_bytes(splash_bytes)
+            fallback_file.write_bytes(fallback_bytes)
+
+            httpd = serve_local.create_server(
+                "127.0.0.1",
+                0,
+                web,
+                data,
+                shaders_root=shaders,
+            )
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def req(method: str, path: str):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        conn.request(method, path)
+                        resp = conn.getresponse()
+                        body = resp.read()
+                        return resp.status, dict(resp.getheaders()), body
+                    finally:
+                        conn.close()
+
+                # 1. Both splash.wgsl.pack and fallback.wgsl.pack exist -> prefers splash.
+                st, hdr, body = req("GET", "/api/status")
+                self.assertEqual(st, 200)
+                raw = body.decode("utf-8")
+                payload = json.loads(raw)
+                self.assertEqual(payload["shaderPackUrl"], "/shaders/splash.wgsl.pack")
+                self.assertEqual(payload["preferredShaderPackUrl"], "/shaders/splash.wgsl.pack")
+                self.assertEqual(payload["shaderPackCount"], 2)
+                self.assertNotIn(str(base), raw)
+                self.assertNotIn(str(shaders), raw)
+
+                # Serving /shaders/splash.wgsl.pack returns exact bytes with COOP/COEP.
+                st_pack, hdr_pack, body_pack = req("GET", "/shaders/splash.wgsl.pack")
+                self.assertEqual(st_pack, 200)
+                self.assertEqual(hdr_pack.get("Cross-Origin-Opener-Policy"), "same-origin")
+                self.assertEqual(hdr_pack.get("Cross-Origin-Embedder-Policy"), "require-corp")
+                self.assertEqual(body_pack, splash_bytes)
+
+                # 2. Only fallback.wgsl.pack exists -> falls back to fallback.
+                splash_file.unlink()
+                st2, _, body2 = req("GET", "/api/status")
+                self.assertEqual(st2, 200)
+                payload2 = json.loads(body2.decode("utf-8"))
+                self.assertEqual(payload2["shaderPackUrl"], "/shaders/fallback.wgsl.pack")
+                self.assertEqual(
+                    payload2["preferredShaderPackUrl"], "/shaders/fallback.wgsl.pack"
+                )
+                self.assertEqual(payload2["shaderPackCount"], 1)
+
+                # 3. No packs exist -> null.
+                fallback_file.unlink()
+                st3, _, body3 = req("GET", "/api/status")
+                self.assertEqual(st3, 200)
+                payload3 = json.loads(body3.decode("utf-8"))
+                self.assertIsNone(payload3["shaderPackUrl"])
+                self.assertIsNone(payload3["preferredShaderPackUrl"])
+                self.assertEqual(payload3["shaderPackCount"], 0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+
+    def test_discover_shader_pack_url_rejects_external_symlink(self) -> None:
+        if os.name == "nt":
+            self.skipTest("symlink escape coverage is POSIX-oriented")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shaders = base / "shaders"
+            shaders.mkdir()
+            outside = base / "outside.wgsl.pack"
+            outside.write_bytes(b"WGPK-OUTSIDE")
+            (shaders / "fallback.wgsl.pack").write_bytes(b"WGPK-LOCAL")
+            try:
+                (shaders / "splash.wgsl.pack").symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"unable to create symlink: {exc}")
+
+            self.assertEqual(
+                serve_local._discover_shader_pack_url(shaders),
+                "/shaders/fallback.wgsl.pack",
+            )
 
 
 if __name__ == "__main__":
