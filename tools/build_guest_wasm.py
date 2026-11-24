@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -23,8 +23,9 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
         [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
-        [--proxy-to-pthread] [--max-concurrent-pthread-loads N]
-        [--node-max-old-space-mb MB] [--pthread-pool-size N] [--extra-link-flag FLAG]
+        [--split-strategy balanced|contiguous] [--proxy-to-pthread]
+        [--max-concurrent-pthread-loads N] [--node-max-old-space-mb MB]
+        [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
 """
@@ -32,6 +33,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left, bisect_right
 import hashlib
 import inspect
 import json
@@ -158,6 +160,8 @@ SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
+SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous"})
+DEFAULT_SPLIT_STRATEGY = "balanced"
 DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB = 16384
 PROXY_TO_PTHREAD_FLAG = "-sPROXY_TO_PTHREAD=1"
 DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2
@@ -354,6 +358,7 @@ class BuildReport:
     assertions: int | None = None
     browser_boot_exports: bool = False
     split_modules: int = 1
+    split_strategy: str = DEFAULT_SPLIT_STRATEGY
     side_modules: list[SideModuleResult] = field(default_factory=list)
     node_max_old_space_mb: int | None = None
     proxy_to_pthread: bool = False
@@ -376,6 +381,7 @@ class BuildReport:
             "assertions": self.assertions,
             "browser_boot_exports": self.browser_boot_exports,
             "split_modules": self.split_modules,
+            "split_strategy": self.split_strategy,
             "side_modules": [m.to_dict() for m in self.side_modules],
             "node_max_old_space_mb": self.node_max_old_space_mb,
             "proxy_to_pthread": self.proxy_to_pthread,
@@ -691,6 +697,19 @@ def parse_split_modules(raw: int) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise BuildGuestWasmError(f"invalid --split-modules {raw!r}; expected an integer >= 1")
     return raw
+
+
+def parse_split_strategy(raw: str) -> str:
+    if not isinstance(raw, str):
+        raise BuildGuestWasmError(
+            f"invalid --split-strategy {raw!r}; expected 'balanced' or 'contiguous'"
+        )
+    token = raw.strip().lower()
+    if token not in SPLIT_STRATEGIES:
+        raise BuildGuestWasmError(
+            f"invalid --split-strategy {raw!r}; expected 'balanced' or 'contiguous'"
+        )
+    return token
 
 
 def parse_node_max_old_space_mb(raw: int | None) -> int | None:
@@ -1044,20 +1063,173 @@ def _partition_weight(item: UnitBuildResult) -> int:
     return _object_bytes(item.unit.path)
 
 
+def _minimax_contiguous_bound(weights: Sequence[int], bucket_count: int) -> int:
+    """Return the exact minimum possible max bucket weight across `bucket_count` contiguous slices."""
+    lo = max(weights)
+    hi = sum(weights)
+    if lo == hi or bucket_count == 1:
+        return hi
+    while lo < hi:
+        mid = (lo + hi) // 2
+        buckets_used = 1
+        current = 0
+        for weight in weights:
+            if current + weight > mid:
+                buckets_used += 1
+                if buckets_used > bucket_count:
+                    break
+                current = weight
+            else:
+                current += weight
+        if buckets_used <= bucket_count:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def partition_shards_contiguous(
+    shard_items: Sequence[UnitBuildResult],
+    bucket_count: int,
+) -> list[list[UnitBuildResult]]:
+    """Partition shards into up to `bucket_count` contiguous slices in ascending `unit_id` order.
+
+    Uses exact minimax contiguous partitioning (binary search for the tightest possible max
+    bucket byte size, followed by exact minimum-variance contiguous DP under that cap) so every
+    bucket is a strictly contiguous slice of sorted `unit_id`s with optimal byte balance and
+    `min(bucket_count, len(shard_items))` non-empty buckets.
+    """
+    bucket_limit = parse_split_modules(bucket_count)
+    if not shard_items:
+        return []
+    ordered = sorted(shard_items, key=lambda item: item.unit.unit_id)
+    n = len(ordered)
+    k = min(bucket_limit, n)
+    if k == 1:
+        return [ordered]
+    if k == n:
+        return [[item] for item in ordered]
+
+    weights = [_partition_weight(item) for item in ordered]
+    prefix = [0] * (n + 1)
+    for idx, weight in enumerate(weights):
+        prefix[idx + 1] = prefix[idx] + weight
+
+    max_cap = _minimax_contiguous_bound(weights, k)
+
+    # Among all k-way contiguous partitions where every bucket has sum <= max_cap, minimize
+    # (sum of squared bucket weights, sum of squared bucket shard counts). Both quadratic
+    # terms satisfy the quadrangle inequality under the per-bucket cap, so divide-and-conquer
+    # DP computes the exact global optimum in O(K * N * log N).
+    max_end = [0] * k
+    max_end[0] = min(n - (k - 1), bisect_right(prefix, max_cap) - 1)
+    for b in range(1, k):
+        prev_max = max_end[b - 1]
+        limit_i = n - (k - 1 - b)
+        reach = bisect_right(prefix, prefix[prev_max] + max_cap) - 1
+        max_end[b] = min(limit_i, reach)
+
+    prev_w = [0] * (n + 1)
+    prev_c = [0] * (n + 1)
+    for i in range(1, max_end[0] + 1):
+        seg = prefix[i]
+        prev_w[i] = seg * seg
+        prev_c[i] = i * i
+
+    split_at: list[list[int]] = [[0] * (n + 1) for _ in range(k)]
+
+    for b in range(1, k):
+        prev_max = max_end[b - 1]
+        if b == k - 1:
+            p_n = prefix[n]
+            j_lo = max(b, bisect_left(prefix, p_n - max_cap))
+            j_hi = min(n - 1, prev_max)
+            best_j = -1
+            best_w = 0
+            best_c = 0
+            for j in range(j_lo, j_hi + 1):
+                seg = p_n - prefix[j]
+                if seg > max_cap:
+                    continue
+                cnt = n - j
+                cand_w = prev_w[j] + seg * seg
+                cand_c = prev_c[j] + cnt * cnt
+                if best_j == -1 or cand_w < best_w or (cand_w == best_w and cand_c < best_c):
+                    best_j = j
+                    best_w = cand_w
+                    best_c = cand_c
+            split_at[b][n] = best_j
+            break
+
+        curr_w = [0] * (n + 1)
+        curr_c = [0] * (n + 1)
+        row_split = split_at[b]
+
+        def _solve(i_lo: int, i_hi: int, opt_lo: int, opt_hi: int) -> None:
+            if i_lo > i_hi:
+                return
+            mid = (i_lo + i_hi) // 2
+            p_mid = prefix[mid]
+            j_start = max(opt_lo, bisect_left(prefix, p_mid - max_cap))
+            j_end = min(opt_hi, mid - 1, prev_max)
+            best_j = -1
+            best_w = 0
+            best_c = 0
+            for j in range(j_start, j_end + 1):
+                seg = p_mid - prefix[j]
+                if seg > max_cap:
+                    continue
+                cnt = mid - j
+                cand_w = prev_w[j] + seg * seg
+                cand_c = prev_c[j] + cnt * cnt
+                if best_j == -1 or cand_w < best_w or (cand_w == best_w and cand_c < best_c):
+                    best_j = j
+                    best_w = cand_w
+                    best_c = cand_c
+            curr_w[mid] = best_w
+            curr_c[mid] = best_c
+            row_split[mid] = best_j
+            _solve(i_lo, mid - 1, opt_lo, best_j)
+            _solve(mid + 1, i_hi, best_j, opt_hi)
+
+        _solve(b + 1, max_end[b], b, prev_max)
+        prev_w = curr_w
+        prev_c = curr_c
+
+    cuts = [0] * (k + 1)
+    cuts[k] = n
+    end = n
+    for b in range(k - 1, 0, -1):
+        start = split_at[b][end]
+        cuts[b] = start
+        end = start
+    return [ordered[cuts[b] : cuts[b + 1]] for b in range(k)]
+
+
 def partition_shard_units(
     items: Sequence[UnitBuildResult],
     split_modules: int,
+    *,
+    strategy: str = DEFAULT_SPLIT_STRATEGY,
 ) -> list[list[UnitBuildResult]]:
-    """Deterministically partition `.ll` shard units into up to `split_modules` balanced buckets.
+    """Deterministically partition `.ll` shard units into up to `split_modules` buckets.
 
-    Uses greedy LPT bin-packing by compiled `.o` byte size (falling back to source file byte
-    size for dry-runs), tie-broken deterministically by `unit_id`. Emits only non-empty buckets
-    when fewer shards exist than `split_modules`.
+    Supports two strategies:
+      - `"balanced"` (default): greedy LPT bin-packing by compiled `.o` byte size (falling
+        back to source file byte size for dry-runs), tie-broken deterministically by `unit_id`.
+      - `"contiguous"`: exact minimax contiguous partition in ascending `unit_id` (guest VA /
+        `.text`) order via `partition_shards_contiguous`, keeping adjacent shards together to
+        minimize cross-module imports and JS stub closures.
+
+    Emits only non-empty buckets when fewer shards exist than `split_modules`.
     """
     bucket_limit = parse_split_modules(split_modules)
+    split_strat = parse_split_strategy(strategy)
     shards = [item for item in items if is_shard_unit(item.unit)]
     if not shards:
         return []
+    if split_strat == "contiguous":
+        return partition_shards_contiguous(shards, bucket_limit)
     bucket_count = min(bucket_limit, len(shards))
     ranked = sorted(shards, key=lambda item: (-_partition_weight(item), item.unit.unit_id))
     buckets: list[list[UnitBuildResult]] = [[] for _ in range(bucket_count)]
@@ -2133,6 +2305,7 @@ def run_build(
     assertions: int | None = None,
     browser_boot_exports: bool = False,
     split_modules: int = 1,
+    split_strategy: str = DEFAULT_SPLIT_STRATEGY,
     node_max_old_space_mb: int | None = None,
     proxy_to_pthread: bool = False,
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
@@ -2147,6 +2320,7 @@ def run_build(
     if isinstance(shrink_largest_shards, bool) or shrink_largest_shards < 0:
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
     split_count = parse_split_modules(split_modules)
+    split_strat = parse_split_strategy(split_strategy)
     use_split = split_count > 1
     max_pthread_loads = parse_max_concurrent_pthread_loads(max_concurrent_pthread_loads)
     explicit_node_mb = parse_node_max_old_space_mb(node_max_old_space_mb)
@@ -2222,6 +2396,7 @@ def run_build(
         assertions=assertions_val,
         browser_boot_exports=browser_boot_exports,
         split_modules=split_count,
+        split_strategy=split_strat,
         node_max_old_space_mb=effective_node_mb,
         proxy_to_pthread=proxy_to_pthread,
         max_concurrent_pthread_loads=max_pthread_loads,
@@ -2409,7 +2584,7 @@ def run_build(
     output_wasm = output_dir / RUNTIME_WASM
 
     if use_split:
-        buckets = partition_shard_units(ordered, split_count)
+        buckets = partition_shard_units(ordered, split_count, strategy=split_strat)
         registration_items = [item for item in ordered if is_registration_unit(item.unit)]
         non_shard_items = [
             item
@@ -2672,7 +2847,7 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
     if report.split_modules > 1:
         lines.append(
             f"  Split modules: {report.split_modules} "
-            f"({PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
+            f"(strategy={report.split_strategy}, {PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
         )
     if report.proxy_to_pthread:
         lines.append(f"  Proxy to pthread: yes ({PROXY_TO_PTHREAD_FLAG})")
@@ -2874,9 +3049,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         metavar="N",
         help=(
-            "Split .ll shards into N balanced Emscripten -sSIDE_MODULE=1 modules (plus an extra "
+            "Split .ll shards into N Emscripten -sSIDE_MODULE=1 modules (plus an extra "
             "side module for functions.ll registration tables) paired with a -sMAIN_MODULE=1 "
             "runtime loaded via Module.dynamicLibraries (must be >= 1; default: 1 = monolithic)."
+        ),
+    )
+    parser.add_argument(
+        "--split-strategy",
+        default=DEFAULT_SPLIT_STRATEGY,
+        metavar="balanced|contiguous",
+        help=(
+            "Shard bucketing strategy when --split-modules > 1: 'balanced' (default, greedy LPT "
+            "size bin-packing) or 'contiguous' (exact minimax contiguous partition in sorted "
+            "unit_id / guest VA order to minimize cross-module imports and JS stub closures)."
         ),
     )
     parser.add_argument(
@@ -3074,6 +3259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             assertions=args.assertions,
             browser_boot_exports=args.browser_boot_exports,
             split_modules=args.split_modules,
+            split_strategy=args.split_strategy,
             node_max_old_space_mb=args.node_max_old_space_mb,
             proxy_to_pthread=args.proxy_to_pthread,
             max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,

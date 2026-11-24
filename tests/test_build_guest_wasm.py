@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35)."""
 
 from __future__ import annotations
 
@@ -4547,6 +4547,426 @@ var PThread = {
             )
             self.assertTrue(rep_dry.ok, rep_dry.errors)
             self.assertIsNone(rep_dry.split_runtime_js_patches)
+
+
+class TestContiguousSplitBucketing(unittest.TestCase):
+    """R35: Contiguous VA-order split-module bucketing (--split-strategy contiguous)."""
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    @staticmethod
+    def _make_shard_items(root: Path, sizes: Sequence[tuple[str, int]]) -> list[bgw.UnitBuildResult]:
+        return [
+            bgw.UnitBuildResult(
+                unit=bgw.SourceUnit(uid, root / uid, "ll"),
+                cache_key="k",
+                cache_hit=True,
+                object_path=root / f"{Path(uid).stem}.o",
+                argv=(),
+                status="hit",
+                object_bytes=sz,
+            )
+            for uid, sz in sizes
+        ]
+
+    @staticmethod
+    def _brute_force_optimal_contiguous(weights: Sequence[int], k: int) -> tuple[int, int, int]:
+        """Return exact (minimax_max, min_sum_sq_w, min_sum_sq_c) over all k-way contiguous splits."""
+        from itertools import combinations
+
+        n = len(weights)
+        best: tuple[int, int, int] | None = None
+        for cuts in combinations(range(1, n), k - 1):
+            bounds = (0, *cuts, n)
+            bucket_sums = [sum(weights[bounds[i] : bounds[i + 1]]) for i in range(k)]
+            bucket_cnts = [bounds[i + 1] - bounds[i] for i in range(k)]
+            score = (
+                max(bucket_sums),
+                sum(s * s for s in bucket_sums),
+                sum(c * c for c in bucket_cnts),
+            )
+            if best is None or score < best:
+                best = score
+        assert best is not None
+        return best
+
+    def _assert_strictly_contiguous(
+        self,
+        buckets: Sequence[Sequence[bgw.UnitBuildResult]],
+        expected_sorted_ids: Sequence[str],
+    ) -> None:
+        flattened: list[str] = []
+        for bucket in buckets:
+            self.assertTrue(bucket, "contiguous partition must not emit empty buckets")
+            ids = [item.unit.unit_id for item in bucket]
+            self.assertEqual(ids, sorted(ids))
+            flattened.extend(ids)
+        # Flattened bucket order equals the exact sorted unit_id sequence => zero interleaving.
+        self.assertEqual(flattened, list(expected_sorted_ids))
+
+    def test_contiguous_partition_strict_va_order_and_exact_optimality_across_2_3_4_buckets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) Compare directly against LPT balanced on a mixed-size sequence:
+            #    balanced interleaves shard-00000 with shard-00001 and shard-00002 with shard-00005,
+            #    while contiguous preserves strict VA/unit_id slices.
+            mixed = [
+                ("lift/shard-00000.ll", 100),
+                ("lift/shard-00001.ll", 500),
+                ("lift/shard-00002.ll", 250),
+                ("lift/shard-00003.ll", 450),
+                ("lift/shard-00004.ll", 200),
+                ("lift/shard-00005.ll", 300),
+            ]
+            items = self._make_shard_items(root, mixed)
+            expected_ids = [uid for uid, _ in mixed]
+
+            buckets_3 = bgw.partition_shards_contiguous(items, 3)
+            self.assertEqual(len(buckets_3), 3)
+            self._assert_strictly_contiguous(buckets_3, expected_ids)
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in buckets_3],
+                [
+                    ["lift/shard-00000.ll", "lift/shard-00001.ll"],
+                    ["lift/shard-00002.ll", "lift/shard-00003.ll"],
+                    ["lift/shard-00004.ll", "lift/shard-00005.ll"],
+                ],
+            )
+            self.assertEqual([sum(it.object_bytes for it in b) for b in buckets_3], [600, 700, 500])
+
+            # Input order independence (reversed input produces identical contiguous buckets).
+            buckets_3_rev = bgw.partition_shards_contiguous(list(reversed(items)), 3)
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in buckets_3_rev],
+                [[it.unit.unit_id for it in b] for b in buckets_3],
+            )
+
+            # 2) Verify exact minimax + min-variance optimality against brute force across
+            #    2, 3, and 4 buckets on diverse distributions (balanced, heavily skewed front/mid/back,
+            #    sawtooth, and zero-weight gaps).
+            distributions: list[tuple[str, list[int]]] = [
+                ("uniform_8", [100, 100, 100, 100, 100, 100, 100, 100]),
+                ("mixed_6", [100, 500, 250, 450, 200, 300]),
+                ("front_skewed", [1000, 100, 100, 100, 100, 100]),
+                ("back_skewed", [50, 60, 70, 80, 90, 1500]),
+                ("middle_spike", [80, 90, 1200, 110, 70, 95, 85]),
+                ("sawtooth_10", [400, 50, 350, 40, 300, 60, 450, 30, 250, 370]),
+                ("with_zeros", [0, 300, 0, 0, 250, 0, 350, 0]),
+                ("all_zeros", [0, 0, 0, 0, 0, 0, 0]),
+            ]
+            for label, weights in distributions:
+                dist_items = self._make_shard_items(
+                    root,
+                    [(f"lift/shard-{idx:05d}.ll", w) for idx, w in enumerate(weights)],
+                )
+                dist_ids = [it.unit.unit_id for it in dist_items]
+                for k in (2, 3, 4):
+                    buckets = bgw.partition_shards_contiguous(dist_items, k)
+                    self.assertEqual(len(buckets), k, f"{label} k={k}")
+                    self._assert_strictly_contiguous(buckets, dist_ids)
+                    got_sums = [sum(it.object_bytes for it in b) for b in buckets]
+                    got_cnts = [len(b) for b in buckets]
+                    got_score = (
+                        max(got_sums),
+                        sum(s * s for s in got_sums),
+                        sum(c * c for c in got_cnts),
+                    )
+                    expected_score = self._brute_force_optimal_contiguous(weights, k)
+                    self.assertEqual(
+                        got_score,
+                        expected_score,
+                        f"{label} k={k}: got sums={got_sums} cnts={got_cnts}",
+                    )
+
+            # 3) Skewed 2-bucket split: [700, 100, 100, 600] -> [700] | [100, 100, 600] (max 800)
+            #    vs [700, 100] (800) | [100, 600] (700) -> minimax 800, smaller variance (800^2+700^2).
+            skew2 = self._make_shard_items(
+                root,
+                [
+                    ("lift/shard-00000.ll", 700),
+                    ("lift/shard-00001.ll", 100),
+                    ("lift/shard-00002.ll", 100),
+                    ("lift/shard-00003.ll", 600),
+                ],
+            )
+            b2 = bgw.partition_shards_contiguous(skew2, 2)
+            self.assertEqual([sum(it.object_bytes for it in b) for b in b2], [800, 700])
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in b2],
+                [
+                    ["lift/shard-00000.ll", "lift/shard-00001.ll"],
+                    ["lift/shard-00002.ll", "lift/shard-00003.ll"],
+                ],
+            )
+
+    def test_contiguous_partition_edge_cases_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Empty shards -> [].
+            self.assertEqual(bgw.partition_shards_contiguous([], 3), [])
+            self.assertEqual(
+                bgw.partition_shard_units([], 3, strategy="contiguous"),
+                [],
+            )
+
+            items = self._make_shard_items(
+                root,
+                [
+                    ("lift/shard-00002.ll", 300),
+                    ("lift/shard-00000.ll", 100),
+                    ("lift/shard-00001.ll", 200),
+                ],
+            )
+
+            # Single bucket returns all shards in sorted unit_id order.
+            single = bgw.partition_shards_contiguous(items, 1)
+            self.assertEqual(len(single), 1)
+            self.assertEqual(
+                [it.unit.unit_id for it in single[0]],
+                ["lift/shard-00000.ll", "lift/shard-00001.ll", "lift/shard-00002.ll"],
+            )
+
+            # Fewer shards (3) than buckets (6) emits 3 non-empty singleton buckets in VA order.
+            fewer = bgw.partition_shards_contiguous(items, 6)
+            self.assertEqual(len(fewer), 3)
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in fewer],
+                [
+                    ["lift/shard-00000.ll"],
+                    ["lift/shard-00001.ll"],
+                    ["lift/shard-00002.ll"],
+                ],
+            )
+
+            # partition_shard_units ignores non-shard units (e.g. functions.ll) under contiguous too.
+            with_reg = list(items) + [
+                bgw.UnitBuildResult(
+                    unit=bgw.SourceUnit("lift/functions.ll", root / "lift/functions.ll", "ll"),
+                    cache_key="k",
+                    cache_hit=True,
+                    object_path=root / "functions.o",
+                    argv=(),
+                    status="hit",
+                    object_bytes=99999,
+                )
+            ]
+            via_wrapper = bgw.partition_shard_units(with_reg, 2, strategy="contiguous")
+            self.assertEqual(
+                [[it.unit.unit_id for it in b] for b in via_wrapper],
+                [
+                    ["lift/shard-00000.ll", "lift/shard-00001.ll"],
+                    ["lift/shard-00002.ll"],
+                ],
+            )
+
+            # Invalid strategy values rejected cleanly.
+            self.assertEqual(bgw.parse_split_strategy("balanced"), "balanced")
+            self.assertEqual(bgw.parse_split_strategy("contiguous"), "contiguous")
+            self.assertEqual(bgw.parse_split_strategy(" CONTIGUOUS "), "contiguous")
+            for bad in ("", "roundrobin", "random", "lpt", None, 123, True):
+                with self.assertRaises(bgw.BuildGuestWasmError, msg=f"strategy={bad!r}"):
+                    bgw.parse_split_strategy(bad)  # type: ignore[arg-type]
+                with self.assertRaises(bgw.BuildGuestWasmError, msg=f"partition strategy={bad!r}"):
+                    bgw.partition_shard_units(items, 2, strategy=bad)  # type: ignore[arg-type]
+            for bad_k in (0, -1, True):
+                with self.assertRaises(bgw.BuildGuestWasmError, msg=f"bucket_count={bad_k!r}"):
+                    bgw.partition_shards_contiguous(items, bad_k)  # type: ignore[arg-type]
+
+    def test_run_build_contiguous_wires_side_rsps_registration_module_and_cli(self) -> None:
+        class SizedCompileRunner(RecordingRunner):
+            """Writes distinct object byte sizes per shard so balanced vs contiguous diverge."""
+
+            def __init__(self, size_by_stem: dict[str, int]) -> None:
+                super().__init__()
+                self.size_by_stem = size_by_stem
+
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                tokens = tuple(str(a) for a in argv)
+                out_path = _dash_o(tokens)
+                src_token = _source_token(tokens)
+                if (
+                    res.returncode == 0
+                    and out_path is not None
+                    and Path(out_path).suffix.lower() == ".o"
+                    and src_token is not None
+                ):
+                    stem = Path(src_token).stem
+                    size = self.size_by_stem.get(stem)
+                    if size is not None:
+                        Path(out_path).write_bytes(b"\x00" * size)
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = root / "recomp-contiguous"
+            # 6 shards whose sizes cause LPT balanced to interleave ([0, 2, 5] vs [1, 3, 4]),
+            # whereas contiguous keeps strict VA slices ([0, 1, 2] | [3, 4, 5]).
+            shard_sizes = {
+                "shard-00000": 500,
+                "shard-00001": 450,
+                "shard-00002": 100,
+                "shard-00003": 100,
+                "shard-00004": 450,
+                "shard-00005": 400,
+            }
+            for name in sorted(shard_sizes):
+                _write(src / "lift" / f"{name}.ll", f"; {name}\n")
+            _write(src / "lift" / "functions.ll", "; registration table\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            cache = root / "cache-contig"
+            out_dir = root / "dist-contig"
+            runner = SizedCompileRunner(shard_sizes)
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="contiguous",
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.split_modules, 2)
+            self.assertEqual(report.split_strategy, "contiguous")
+            # 2 contiguous shard side modules (guest_part_0, guest_part_1) + functions.ll (guest_part_2).
+            self.assertEqual(len(report.side_modules), 3)
+            self.assertEqual(
+                [m.name for m in report.side_modules],
+                ["guest_part_0.wasm", "guest_part_1.wasm", "guest_part_2.wasm"],
+            )
+            self.assertEqual(
+                report.side_modules[0].shards,
+                (
+                    "lift/shard-00000.ll",
+                    "lift/shard-00001.ll",
+                    "lift/shard-00002.ll",
+                ),
+            )
+            self.assertEqual(
+                report.side_modules[1].shards,
+                (
+                    "lift/shard-00003.ll",
+                    "lift/shard-00004.ll",
+                    "lift/shard-00005.ll",
+                ),
+            )
+            self.assertEqual(report.side_modules[2].shards, ("lift/functions.ll",))
+
+            # Verify side_part_0.rsp, side_part_1.rsp, and side_part_2.rsp contain exact object paths.
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            for idx, side in enumerate(report.side_modules):
+                self.assertEqual(side.response_file, f"side_part_{idx}.rsp")
+                rsp_path = cache / f"side_part_{idx}.rsp"
+                self.assertTrue(rsp_path.is_file())
+                expected_objs = [
+                    str(by_id[uid].object_path).replace("\\", "/") for uid in side.shards
+                ]
+                self.assertEqual(rsp_path.read_text(encoding="utf-8").splitlines(), expected_objs)
+
+            # Report JSON & text include split_strategy.
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertEqual(payload["split_strategy"], "contiguous")
+            self.assertEqual(payload["split_modules"], 2)
+            text = bgw.format_report_text(report, sanitize=True)
+            self.assertIn("Split modules: 2 (strategy=contiguous,", text)
+
+            # Contrast with default balanced strategy on the exact same cached objects:
+            # balanced interleaves shard-00000..shard-00005 by descending size.
+            bal_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-bal",
+                jobs=2,
+                split_modules=2,
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(bal_report.ok, bal_report.errors)
+            self.assertEqual(bal_report.split_strategy, "balanced")
+            self.assertNotEqual(bal_report.side_modules[0].shards, report.side_modules[0].shards)
+
+            # CLI --split-strategy contiguous dry-run JSON & text.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "contiguous",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(cache),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            cli_payload = json.loads(out)
+            self.assertTrue(cli_payload["ok"])
+            self.assertEqual(cli_payload["split_strategy"], "contiguous")
+            self.assertEqual(
+                cli_payload["side_modules"][0]["shards"],
+                ["lift/shard-00000.ll", "lift/shard-00001.ll", "lift/shard-00002.ll"],
+            )
+            self.assertEqual(
+                cli_payload["side_modules"][1]["shards"],
+                ["lift/shard-00003.ll", "lift/shard-00004.ll", "lift/shard-00005.ll"],
+            )
+            self.assertEqual(cli_payload["side_modules"][2]["shards"], ["lift/functions.ll"])
+
+            # Invalid --split-strategy rejected with non-zero CLI exit code (2) in JSON & text modes.
+            bad_code, bad_out, _bad_err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "bogus",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2, bad_out)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("split-strategy" in e for e in bad_payload["errors"]))
+
+            bad_code_txt, _bad_out_txt, bad_err_txt = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "bogus",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code_txt, 2)
+            self.assertIn("split-strategy", bad_err_txt)
 
 
 class TestLinkFlagContract(unittest.TestCase):
