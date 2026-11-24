@@ -100,6 +100,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Back the `xmem.dll` shims and the guest-facing CRT `malloc` family with `VirtualMemoryArena` / the Win32 heap layer so the title's allocations live in the guest pool, with one consistent allocator family and tests.
 - [x] **O25 — Local wasm64 Runtime Test Runner (Docker + Node) & wasm64-Only Test Fixes (`tools/run_wasm_tests.py`)** — `DONE` (PR #260, closes #254) *(no game files required — disjoint files `tools/run_wasm_tests.py`, `tests/test_run_wasm_tests.py`; fixes in the affected tests/shims)*
   - Build every runtime test for Emscripten `-sMEMORY64 -pthread` in Docker, run it under a memory64-capable Node with a per-test report, and fix the wasm64-only failures (function-table identity in `GetProcAddress` checks, image-loader tests exceeding the wasm guest pool).
+- [ ] **O26 — Win32 Shims Required by the Recompiled Runtime DLLs: FLS, InitOnce, SList, Pointer Encoding & Locale (`runtime/os/win32_rtl.{h,cpp}`)** — `IN PROGRESS` (#264, @Timon-ok) *(driven by the first real program boot: `vcruntime140.dll` `DllMain` stops at `InitializeCriticalSectionEx`)*
+  - Implement and bind `Fls*`, `InitializeCriticalSectionEx`, `InitOnceExecuteOnce`, `EncodePointer`/`DecodePointer`, SList, `SwitchToThread`, `GetModuleHandleExW`, `RtlCaptureStackBackTrace`, `LCMapStringEx`/`CompareStringEx`/`GetLocaleInfoEx`/`GetStringTypeW`/`GetCPInfo`, `FindFirstFileExW`, `GetFileInformationByHandle`, `GetTempPathW` and the other Win32 imports of `vcruntime140`/`msvcp140` that have no shim.
 
 ---
 
