@@ -1633,3 +1633,64 @@ test('W69: absent, frozen, or throwing optional DOM elements never throw and des
   withBindButtons.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 5 });
   assert.equal(withBindButtons.getSideModuleProgress().sideModuleCount, 0);
 });
+
+test('W76: HudController updates boot progress, frames presented, missing shaders, and deduplicates validation events', () => {
+  const bootStageEl = createDisplayMockElement();
+  const bootMilestonesEl = createDisplayMockElement();
+  const bootProgressBarEl = createDisplayMockElement();
+  const bootProgressFillEl = createDisplayMockElement({ style: {} });
+  const bootElapsedEl = createDisplayMockElement();
+  const framesPresentedEl = createDisplayMockElement();
+  const missingShadersEl = createDisplayMockElement();
+  const validationCountEl = createDisplayMockElement();
+
+  const controller = new HudController({
+    hud: createMockHud(),
+    displayElements: {
+      bootStageEl,
+      bootMilestonesEl,
+      bootProgressBarEl,
+      bootProgressFillEl,
+      bootElapsedEl,
+      framesPresentedEl,
+      missingShadersEl,
+      validationCountEl,
+    },
+  });
+
+  controller.updateGpuBootTelemetry({
+    bootSummary: {
+      stage: 'BINK_OPEN',
+      milestonesReached: 8,
+      totalMilestones: 9,
+      progressPct: 89,
+      elapsedMs: 65400,
+    },
+    frameStats: { framesPresented: 10 },
+    missingShaderCount: 3,
+  });
+
+  assert.equal(bootStageEl.textContent, 'BINK_OPEN');
+  assert.equal(bootMilestonesEl.textContent, '8/9');
+  assert.equal(bootProgressBarEl.getAttribute('aria-valuenow'), '89');
+  assert.equal(bootProgressFillEl.style.width, '89%');
+  assert.equal(bootElapsedEl.textContent, '1m 05s');
+  assert.equal(framesPresentedEl.textContent, '10');
+  assert.equal(missingShadersEl.textContent, '3');
+  assert.equal(missingShadersEl.dataset.state, 'warn');
+
+  controller.onSplashFramePresented({ ok: true, framesPresented: 11 });
+  assert.equal(framesPresentedEl.textContent, '11');
+  assert.equal(controller.getBootProgress().framesPresented, 11);
+
+  controller.setSideModules({ sideModuleCount: 3, loadedCount: 1 });
+  assert.equal(controller.getSideModuleProgress().sideModuleCount, 3);
+  assert.equal(controller.getSideModuleProgress().loadedCount, 1);
+
+  controller.onGpuValidationError({ seq: 42, source: 'wgpu_worker', message: 'Duplicate event test' });
+  controller.onGpuValidationError({ seq: 42, source: 'wgpu_worker', message: 'Duplicate event test' });
+  assert.equal(validationCountEl.textContent, '1');
+  assert.equal(controller.getValidationSummary().count, 1);
+
+  controller.destroy();
+});

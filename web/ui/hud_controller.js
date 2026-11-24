@@ -48,6 +48,13 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'validationCountEl',
   'validationLatestEl',
   'validationBannerEl',
+  'bootStageEl',
+  'bootMilestonesEl',
+  'bootProgressBarEl',
+  'bootProgressFillEl',
+  'bootElapsedEl',
+  'framesPresentedEl',
+  'missingShadersEl',
 ]);
 
 export const HUD_ACTIONS = Object.freeze({
@@ -434,6 +441,41 @@ function safeSetAttribute(el, name, value) {
   }
 }
 
+function safeSetStyleWidth(el, pct) {
+  if (!el || typeof el !== 'object') return;
+  try {
+    if (el.style && typeof el.style === 'object') {
+      const clamped = Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : 0;
+      el.style.width = `${clamped}%`;
+    }
+  } catch {
+    // Ignore DOM style update errors on lightweight mocks.
+  }
+}
+
+function sanitizeBootStageLabel(raw) {
+  if (typeof raw !== 'string') return 'NOT_STARTED';
+  const trimmed = raw.trim().toUpperCase();
+  if (!trimmed) return 'NOT_STARTED';
+  if (/^[A-Z][A-Z0-9_]{0,63}$/.test(trimmed)) {
+    return trimmed;
+  }
+  return 'UNKNOWN';
+}
+
+function formatBootElapsedMs(rawMs) {
+  if (typeof rawMs !== 'number' || !Number.isFinite(rawMs) || rawMs <= 0) {
+    return '0.0s';
+  }
+  const totalSeconds = rawMs / 1000;
+  if (totalSeconds < 60) {
+    return `${totalSeconds.toFixed(1)}s`;
+  }
+  const mins = Math.floor(totalSeconds / 60);
+  const secs = Math.floor(totalSeconds % 60);
+  return `${mins}m ${String(secs).padStart(2, '0')}s`;
+}
+
 export class HudController {
   /**
    * @param {object} [options]
@@ -523,6 +565,15 @@ export class HudController {
     this._loadedSideModuleCount = 0;
     this._loadedSideModuleNames = [];
     this._currentSideModule = null;
+
+    this._bootStage = 'NOT_STARTED';
+    this._milestonesReached = 0;
+    this._totalMilestones = 9;
+    this._bootProgressPct = 0;
+    this._bootElapsedMs = 0;
+    this._framesPresented = 0;
+    this._missingShaderCount = 0;
+    this._seenValidationEventSeqs = new Set();
 
     const resolvedMaxErrors =
       typeof maxValidationErrors === 'number' &&
@@ -1255,6 +1306,38 @@ export class HudController {
     }
     try {
       const state = panel.update(payload);
+      if (state && typeof state === 'object') {
+        let synced = false;
+        if (state.boot && typeof state.boot === 'object') {
+          if (typeof state.boot.stage === 'string') {
+            this._bootStage = sanitizeBootStageLabel(state.boot.stage);
+            synced = true;
+          }
+          if (Number.isFinite(state.boot.milestonesReached)) {
+            this._milestonesReached = toNonNegativeInt(state.boot.milestonesReached, this._milestonesReached);
+            synced = true;
+          }
+          if (Number.isFinite(state.boot.totalMilestones) && state.boot.totalMilestones >= 1) {
+            this._totalMilestones = Math.floor(state.boot.totalMilestones);
+            synced = true;
+          }
+          if (Number.isFinite(state.boot.progressPct)) {
+            this._bootProgressPct = Math.max(0, Math.min(100, Math.round(state.boot.progressPct)));
+            synced = true;
+          }
+        }
+        if (state.frameStats && Number.isFinite(state.frameStats.framesPresented)) {
+          this._framesPresented = toNonNegativeInt(state.frameStats.framesPresented, this._framesPresented);
+          synced = true;
+        }
+        if (Number.isFinite(state.totalMissingShaders)) {
+          this._missingShaderCount = toNonNegativeInt(state.totalMissingShaders, this._missingShaderCount);
+          synced = true;
+        }
+        if (synced) {
+          this._renderBootDiagnostics({ updateHudStatus: false });
+        }
+      }
       return state !== undefined ? state : null;
     } catch {
       return null;
@@ -1266,6 +1349,55 @@ export class HudController {
 
     const summary =
       payload.bootSummary && typeof payload.bootSummary === 'object' ? payload.bootSummary : null;
+    if (summary) {
+      if (typeof summary.stage === 'string') {
+        this._bootStage = sanitizeBootStageLabel(summary.stage);
+        changed = true;
+      }
+      if (Number.isFinite(summary.totalMilestones) && summary.totalMilestones >= 1) {
+        this._totalMilestones = Math.floor(summary.totalMilestones);
+        changed = true;
+      } else if (Array.isArray(summary.milestones) && summary.milestones.length > 0) {
+        this._totalMilestones = summary.milestones.length;
+        changed = true;
+      }
+      if (summary.milestonesReached !== undefined && summary.milestonesReached !== null) {
+        this._milestonesReached = toNonNegativeInt(summary.milestonesReached, this._milestonesReached);
+        changed = true;
+      }
+      if (summary.progressPct !== undefined && summary.progressPct !== null && Number.isFinite(Number(summary.progressPct))) {
+        this._bootProgressPct = Math.max(0, Math.min(100, Math.round(Number(summary.progressPct))));
+        changed = true;
+      } else if (this._totalMilestones > 0 && summary.milestonesReached !== undefined) {
+        this._bootProgressPct = Math.max(
+          0,
+          Math.min(100, Math.round((this._milestonesReached / this._totalMilestones) * 100))
+        );
+        changed = true;
+      }
+      if (typeof summary.elapsedMs === 'number' && Number.isFinite(summary.elapsedMs) && summary.elapsedMs >= 0) {
+        this._bootElapsedMs = summary.elapsedMs;
+        changed = true;
+      }
+    }
+
+    const rawFrames =
+      payload.frameStats && typeof payload.frameStats === 'object' && payload.frameStats.framesPresented !== undefined
+        ? payload.frameStats.framesPresented
+        : payload.framesPresented;
+    if (rawFrames !== undefined && rawFrames !== null) {
+      this._framesPresented = toNonNegativeInt(rawFrames, this._framesPresented);
+      changed = true;
+    }
+
+    if (Array.isArray(payload.missingShaders)) {
+      this._missingShaderCount = payload.missingShaders.length;
+      changed = true;
+    } else if (payload.missingShaderCount !== undefined && payload.missingShaderCount !== null) {
+      this._missingShaderCount = toNonNegativeInt(payload.missingShaderCount, this._missingShaderCount);
+      changed = true;
+    }
+
     const rawFirstPresentSource =
       payload.firstPresentSource !== undefined
         ? payload.firstPresentSource
@@ -1830,6 +1962,62 @@ export class HudController {
     return this.getValidationSummary();
   }
 
+  setSideModules(progress, options = {}) {
+    return this.setSideModuleProgress(progress, options);
+  }
+
+  updateSideModules(progress, options = {}) {
+    return this.setSideModuleProgress(progress, options);
+  }
+
+  onGpuValidationError(record, options = {}) {
+    if (this._destroyed || record === null || record === undefined) {
+      return null;
+    }
+    if (typeof record === 'object' && Number.isInteger(record.seq) && record.seq > 0) {
+      const key = `${record.seq}|${record.source || ''}`;
+      if (this._seenValidationEventSeqs.has(key)) {
+        return null;
+      }
+      this._seenValidationEventSeqs.add(key);
+      if (this._seenValidationEventSeqs.size > 256) {
+        const first = this._seenValidationEventSeqs.values().next().value;
+        if (first !== undefined) {
+          this._seenValidationEventSeqs.delete(first);
+        }
+      }
+    }
+    return this.recordValidationError(record, options);
+  }
+
+  onSplashFramePresented(payload = {}) {
+    if (this._destroyed) {
+      return this.getBootProgress();
+    }
+    if (payload && typeof payload === 'object') {
+      const reported = toNonNegativeInt(payload.framesPresented, null);
+      if (reported !== null) {
+        this._framesPresented = Math.max(this._framesPresented, reported);
+      } else if (payload.ok !== false) {
+        this._framesPresented += 1;
+      }
+    }
+    this._renderBootDiagnostics({ updateHudStatus: false });
+    return this.getBootProgress();
+  }
+
+  getBootProgress() {
+    return {
+      stage: this._bootStage,
+      milestonesReached: this._milestonesReached,
+      totalMilestones: this._totalMilestones,
+      progressPct: this._bootProgressPct,
+      elapsedMs: this._bootElapsedMs,
+      framesPresented: this._framesPresented,
+      missingShaderCount: this._missingShaderCount,
+    };
+  }
+
   /**
    * Clears all recorded live WebGPU validation errors and resets the counter to zero.
    */
@@ -1839,6 +2027,7 @@ export class HudController {
     }
     this._validationErrors = [];
     this._validationErrorCount = 0;
+    this._seenValidationEventSeqs.clear();
     this._renderBootDiagnostics({ updateHudStatus: false });
     return this.getValidationSummary();
   }
@@ -2030,6 +2219,64 @@ export class HudController {
       if (!hasChildren) {
         safeSetText(els.validationBannerEl, validation.statusText);
       }
+    }
+
+    if (els.bootStageEl) {
+      const stageState =
+        this._bootStage === 'FIRST_PRESENT'
+          ? 'ok'
+          : validation.hasErrors
+            ? 'err'
+            : this._milestonesReached > 0
+              ? 'info'
+              : '';
+      safeSetText(els.bootStageEl, this._bootStage);
+      safeSetDataset(els.bootStageEl, 'state', stageState);
+      safeSetTitle(els.bootStageEl, `Boot stage: ${this._bootStage}`);
+    }
+
+    if (els.bootMilestonesEl) {
+      safeSetText(els.bootMilestonesEl, `${this._milestonesReached}/${this._totalMilestones}`);
+    }
+
+    if (els.bootProgressBarEl) {
+      safeSetAttribute(els.bootProgressBarEl, 'aria-valuenow', String(this._bootProgressPct));
+      safeSetAttribute(
+        els.bootProgressBarEl,
+        'aria-valuetext',
+        `${this._bootStage} (${this._milestonesReached}/${this._totalMilestones})`
+      );
+    }
+
+    if (els.bootProgressFillEl) {
+      const fillState =
+        this._bootStage === 'FIRST_PRESENT' || this._bootProgressPct >= 100
+          ? 'ok'
+          : validation.hasErrors
+            ? 'err'
+            : status.isSmoke
+              ? 'warn'
+              : 'info';
+      safeSetStyleWidth(els.bootProgressFillEl, this._bootProgressPct);
+      safeSetDataset(els.bootProgressFillEl, 'state', fillState);
+    }
+
+    if (els.bootElapsedEl) {
+      safeSetText(els.bootElapsedEl, formatBootElapsedMs(this._bootElapsedMs));
+    }
+
+    if (els.framesPresentedEl) {
+      safeSetText(els.framesPresentedEl, String(this._framesPresented));
+      safeSetDataset(els.framesPresentedEl, 'state', this._framesPresented > 0 ? 'ok' : '');
+    }
+
+    if (els.missingShadersEl) {
+      safeSetText(els.missingShadersEl, String(this._missingShaderCount));
+      safeSetDataset(
+        els.missingShadersEl,
+        'state',
+        this._missingShaderCount > 0 ? 'warn' : 'ok'
+      );
     }
 
     if (

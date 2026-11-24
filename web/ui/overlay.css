@@ -1,0 +1,990 @@
+/*
+ * playgta6web — In-Browser Boot Diagnostics Overlay (W76)
+ *
+ * Visual language & token architecture inspired by Astryx (https://astryx.atmeta.com/,
+ * meta/astryx, MIT License), specifically the Astryx Neutral dark theme.
+ *
+ * Self-contained plain CSS with zero external font or stylesheet hotlinks so the page
+ * stays strictly compliant with Cross-Origin Isolation (COOP: same-origin + COEP: require-corp).
+ */
+
+@layer astryx-tokens, astryx-base, astryx-components;
+
+@layer astryx-tokens {
+  :root,
+  [data-astryx-theme="neutral"] {
+    color-scheme: dark;
+
+    /* Astryx Neutral dark surface & border tokens */
+    --astryx-color-canvas: #08090c;
+    --astryx-color-surface: rgba(17, 18, 22, 0.92);
+    --astryx-color-surface-header: rgba(23, 25, 31, 0.94);
+    --astryx-color-surface-raised: #181a20;
+    --astryx-color-surface-sunken: #0d0e12;
+    --astryx-color-surface-interactive: #20232b;
+    --astryx-color-surface-interactive-hover: #2a2e38;
+    --astryx-color-surface-interactive-active: #323744;
+
+    --astryx-color-border: rgba(255, 255, 255, 0.11);
+    --astryx-color-border-subtle: rgba(255, 255, 255, 0.07);
+    --astryx-color-border-emphasized: rgba(255, 255, 255, 0.22);
+
+    /* Astryx Neutral accessible text ramp (all >= 4.5:1 on #111216 / #181a20 / #0d0e12) */
+    --astryx-color-text-primary: #f4f4f6;
+    --astryx-color-text-secondary: #c2c6d2;
+    --astryx-color-text-muted: #9399aa;
+
+    /* Astryx semantic status tokens (contrast-checked foregrounds on tinted surfaces) */
+    --astryx-color-accent: #60a5fa;
+    --astryx-color-accent-fg: #dbeafe;
+    --astryx-color-accent-bg: rgba(59, 130, 246, 0.16);
+    --astryx-color-accent-border: rgba(96, 165, 250, 0.36);
+
+    --astryx-color-positive: #34d399;
+    --astryx-color-positive-fg: #a7f3d0;
+    --astryx-color-positive-bg: rgba(16, 185, 129, 0.15);
+    --astryx-color-positive-border: rgba(52, 211, 153, 0.36);
+
+    --astryx-color-warning: #fbbf24;
+    --astryx-color-warning-fg: #fde68a;
+    --astryx-color-warning-bg: rgba(245, 158, 11, 0.16);
+    --astryx-color-warning-border: rgba(251, 191, 36, 0.38);
+
+    --astryx-color-negative: #f87171;
+    --astryx-color-negative-fg: #fecaca;
+    --astryx-color-negative-bg: rgba(239, 68, 68, 0.17);
+    --astryx-color-negative-border: rgba(248, 113, 113, 0.42);
+
+    --astryx-color-focus-ring: #60a5fa;
+
+    /* Astryx Neutral typography (Figtree primary stack + system monospace) */
+    --astryx-font-sans: "Figtree", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --astryx-font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+
+    --astryx-text-2xs: 10px;
+    --astryx-text-xs: 11px;
+    --astryx-text-sm: 12px;
+    --astryx-text-md: 13px;
+
+    /* Astryx spacing & geometry scale */
+    --astryx-space-1: 4px;
+    --astryx-space-2: 8px;
+    --astryx-space-3: 12px;
+    --astryx-space-4: 16px;
+
+    --astryx-radius-none: 0px;
+    --astryx-radius-sm: 6px;
+    --astryx-radius-md: 8px;
+    --astryx-radius-lg: 12px;
+    --astryx-radius-pill: 9999px;
+
+    --astryx-shadow-overlay: 0 18px 42px -12px rgba(0, 0, 0, 0.72), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+    --astryx-motion-fast: 120ms cubic-bezier(0.2, 0, 0, 1);
+  }
+}
+
+@layer astryx-base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--astryx-color-canvas);
+    color: var(--astryx-color-text-primary);
+    font-family: var(--astryx-font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #viewport {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: radial-gradient(circle at 24% 20%, #121722 0%, var(--astryx-color-canvas) 68%);
+  }
+}
+
+@layer astryx-components {
+  /* Docked left diagnostics surface — compact so it never obscures the center of #viewport */
+  #hud {
+    position: fixed;
+    top: var(--astryx-space-3);
+    left: var(--astryx-space-3);
+    z-index: 10010;
+    width: min(356px, calc(100vw - 24px));
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
+    background: var(--astryx-color-surface);
+    border: 1px solid var(--astryx-color-border);
+    border-radius: var(--astryx-radius-lg);
+    box-shadow: var(--astryx-shadow-overlay);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    color: var(--astryx-color-text-primary);
+    font-size: var(--astryx-text-xs);
+    line-height: 1.4;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  #hud.collapsed {
+    width: auto;
+    min-width: 248px;
+    max-width: min(356px, calc(100vw - 24px));
+  }
+
+  #hud :focus-visible {
+    outline: 2px solid var(--astryx-color-focus-ring);
+    outline-offset: 1px;
+  }
+
+  /* 1. Header */
+  .hud-header {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px var(--astryx-space-3);
+    background: var(--astryx-color-surface-header);
+    border-bottom: 1px solid var(--astryx-color-border-subtle);
+    flex-shrink: 0;
+  }
+
+  #hud.collapsed .hud-header {
+    border-bottom: none;
+    gap: 4px;
+    padding: 8px 10px;
+  }
+
+  .hud-header-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+  }
+
+  .hud-title-group {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .hud-brand {
+    margin: 0;
+    font-family: var(--astryx-font-sans);
+    font-weight: 700;
+    font-size: var(--astryx-text-md);
+    letter-spacing: -0.01em;
+    color: var(--astryx-color-text-primary);
+    white-space: nowrap;
+  }
+
+  .hud-status-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+  }
+
+  .hud-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--astryx-radius-pill);
+    flex-shrink: 0;
+    background: var(--astryx-color-accent);
+    box-shadow: 0 0 0 2px var(--astryx-color-accent-bg);
+  }
+
+  .hud-dot[data-level="ok"] {
+    background: var(--astryx-color-positive);
+    box-shadow: 0 0 0 2px var(--astryx-color-positive-bg);
+  }
+
+  .hud-dot[data-level="warn"] {
+    background: var(--astryx-color-warning);
+    box-shadow: 0 0 0 2px var(--astryx-color-warning-bg);
+  }
+
+  .hud-dot[data-level="error"] {
+    background: var(--astryx-color-negative);
+    box-shadow: 0 0 0 2px var(--astryx-color-negative-bg);
+  }
+
+  #hud-status {
+    color: var(--astryx-color-text-secondary);
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  /* Honest boot-mode pill badge */
+  .boot-mode-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: var(--astryx-radius-pill);
+    border: 1px solid var(--astryx-color-border);
+    background: var(--astryx-color-surface-interactive);
+    color: var(--astryx-color-text-secondary);
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-2xs);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .boot-mode-badge::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: var(--astryx-radius-pill);
+    background: currentColor;
+  }
+
+  .boot-mode-badge[data-boot-mode="real-wasm64"],
+  .boot-mode-badge[data-state="ok"] {
+    background: var(--astryx-color-positive-bg);
+    border-color: var(--astryx-color-positive-border);
+    color: var(--astryx-color-positive-fg);
+  }
+
+  .boot-mode-badge[data-boot-mode="smoke"],
+  .boot-mode-badge[data-state="warn"] {
+    background: var(--astryx-color-warning-bg);
+    border-color: var(--astryx-color-warning-border);
+    color: var(--astryx-color-warning-fg);
+  }
+
+  .boot-mode-badge[data-boot-mode="idle"],
+  .boot-mode-badge[data-state="info"] {
+    background: var(--astryx-color-surface-interactive);
+    border-color: var(--astryx-color-border);
+    color: var(--astryx-color-text-secondary);
+  }
+
+  .hud-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--astryx-space-1);
+    flex-shrink: 0;
+  }
+
+  /* Astryx buttons */
+  .hud-btn {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    border: 1px solid var(--astryx-color-border);
+    background: var(--astryx-color-surface-interactive);
+    color: var(--astryx-color-text-primary);
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-xs);
+    font-weight: 500;
+    line-height: 1.2;
+    padding: 5px 10px;
+    border-radius: var(--astryx-radius-sm);
+    cursor: pointer;
+    transition: background var(--astryx-motion-fast), border-color var(--astryx-motion-fast), color var(--astryx-motion-fast);
+    white-space: nowrap;
+  }
+
+  .hud-btn:hover {
+    background: var(--astryx-color-surface-interactive-hover);
+    border-color: var(--astryx-color-border-emphasized);
+  }
+
+  .hud-btn:active {
+    background: var(--astryx-color-surface-interactive-active);
+  }
+
+  .hud-btn--compact {
+    font-size: var(--astryx-text-2xs);
+    padding: 3px 8px;
+  }
+
+  .hud-btn--ghost {
+    background: transparent;
+    border-color: var(--astryx-color-border-subtle);
+    color: var(--astryx-color-text-secondary);
+  }
+
+  .hud-btn--ghost:hover {
+    background: var(--astryx-color-surface-interactive);
+    border-color: var(--astryx-color-border);
+    color: var(--astryx-color-text-primary);
+  }
+
+  .hud-btn--secondary {
+    background: rgba(255, 255, 255, 0.03);
+    border-color: var(--astryx-color-border-subtle);
+    color: var(--astryx-color-text-muted);
+    font-size: var(--astryx-text-2xs);
+    padding: 5px 9px;
+  }
+
+  .hud-btn--secondary:hover {
+    background: var(--astryx-color-surface-interactive);
+    border-color: var(--astryx-color-border);
+    color: var(--astryx-color-text-secondary);
+  }
+
+  .hud-btn[data-active="true"] {
+    border-color: var(--astryx-color-warning-border);
+    background: var(--astryx-color-warning-bg);
+    color: var(--astryx-color-warning-fg);
+  }
+
+  .hud-btn[data-recording="true"] {
+    border-color: var(--astryx-color-negative-border);
+    background: var(--astryx-color-negative-bg);
+    color: var(--astryx-color-negative-fg);
+  }
+
+  /* Scrollable body */
+  #hud-body {
+    padding: 10px var(--astryx-space-3) var(--astryx-space-3);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  #hud.collapsed #hud-body {
+    display: none;
+  }
+
+  #hud-body::-webkit-scrollbar,
+  #hud-log::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  #hud-body::-webkit-scrollbar-thumb,
+  #hud-log::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: var(--astryx-radius-pill);
+  }
+
+  #hud-body::-webkit-scrollbar-thumb:hover,
+  #hud-log::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.28);
+  }
+
+  /* Sections */
+  .hud-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .hud-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+  }
+
+  .hud-section-title {
+    margin: 0;
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-2xs);
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--astryx-color-text-muted);
+  }
+
+  .hud-section-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--astryx-color-text-secondary);
+  }
+
+  /* 2. Boot Progress */
+  .boot-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-radius: var(--astryx-radius-md);
+    background: var(--astryx-color-surface-raised);
+    border: 1px solid var(--astryx-color-border-subtle);
+  }
+
+  .boot-stage-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+  }
+
+  #boot-stage {
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-xs);
+    font-weight: 600;
+    color: var(--astryx-color-text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #boot-stage[data-state="ok"] {
+    color: var(--astryx-color-positive-fg);
+  }
+
+  #boot-stage[data-state="err"] {
+    color: var(--astryx-color-negative-fg);
+  }
+
+  .boot-milestones-pill {
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--astryx-color-text-secondary);
+    flex-shrink: 0;
+  }
+
+  .boot-progress-track {
+    width: 100%;
+    height: 5px;
+    border-radius: var(--astryx-radius-pill);
+    background: rgba(255, 255, 255, 0.09);
+    overflow: hidden;
+  }
+
+  .boot-progress-fill {
+    height: 5px;
+    width: 0%;
+    border-radius: var(--astryx-radius-pill);
+    background: var(--astryx-color-accent);
+    transition: width 160ms ease, background 160ms ease;
+  }
+
+  .boot-progress-fill[data-state="ok"] {
+    background: var(--astryx-color-positive);
+  }
+
+  .boot-progress-fill[data-state="warn"] {
+    background: var(--astryx-color-warning);
+  }
+
+  .boot-progress-fill[data-state="err"] {
+    background: var(--astryx-color-negative);
+  }
+
+  #side-module-status {
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--astryx-color-accent-fg);
+    padding-top: 4px;
+    border-top: 1px solid var(--astryx-color-border-subtle);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  #side-module-status[data-total="0"][data-loaded="0"] {
+    display: none;
+  }
+
+  #side-module-status[data-state="ok"] {
+    color: var(--astryx-color-positive-fg);
+  }
+
+  /* 3. Frame & GPU metric strip */
+  .metrics-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .metric-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 7px;
+    border-radius: var(--astryx-radius-md);
+    background: var(--astryx-color-surface-raised);
+    border: 1px solid var(--astryx-color-border-subtle);
+    min-width: 0;
+  }
+
+  .metric-cell-label {
+    font-size: 9.5px;
+    font-weight: 500;
+    color: var(--astryx-color-text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .metric-cell-value {
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--astryx-color-text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .metric-cell-value[data-state="ok"] {
+    color: var(--astryx-color-positive-fg);
+  }
+
+  .metric-cell-value[data-state="warn"] {
+    color: var(--astryx-color-warning-fg);
+  }
+
+  .metric-cell-value[data-state="err"] {
+    color: var(--astryx-color-negative-fg);
+  }
+
+  .metric-cell-value[data-state="info"] {
+    color: var(--astryx-color-accent-fg);
+  }
+
+  /* Live GPU validation error alert banner */
+  .validation-alert {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 9px;
+    border-radius: var(--astryx-radius-md);
+    background: var(--astryx-color-negative-bg);
+    border: 1px solid var(--astryx-color-negative-border);
+    border-left: 3px solid var(--astryx-color-negative);
+  }
+
+  .validation-alert[hidden] {
+    display: none;
+  }
+
+  .validation-alert-title {
+    font-size: var(--astryx-text-2xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--astryx-color-negative-fg);
+  }
+
+  #gpu-validation-latest {
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    line-height: 1.4;
+    color: var(--astryx-color-negative-fg);
+    word-break: break-word;
+    user-select: text;
+  }
+
+  /* 4. Runtime Log */
+  #hud-log {
+    margin: 0;
+    padding: 7px 8px;
+    height: 152px;
+    overflow-y: auto;
+    border-radius: var(--astryx-radius-md);
+    background: var(--astryx-color-surface-sunken);
+    border: 1px solid var(--astryx-color-border-subtle);
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    line-height: 1.48;
+    user-select: text;
+  }
+
+  .log-entry {
+    display: flex;
+    gap: 6px;
+    word-break: break-word;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .log-time {
+    color: var(--astryx-color-text-muted);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  .log-msg {
+    color: var(--astryx-color-text-secondary);
+    white-space: pre-wrap;
+    min-width: 0;
+  }
+
+  .log-entry[data-level="ok"] .log-msg {
+    color: var(--astryx-color-positive-fg);
+  }
+
+  .log-entry[data-level="warn"] .log-msg {
+    color: var(--astryx-color-warning-fg);
+  }
+
+  .log-entry[data-level="error"] .log-msg {
+    color: var(--astryx-color-negative-fg);
+  }
+
+  .log-entry[data-fault="true"] {
+    background: var(--astryx-color-negative-bg);
+    border-left: 2px solid var(--astryx-color-negative);
+    padding-left: 6px;
+    margin: 2px 0;
+  }
+
+  .log-entry[data-fault="true"] .log-msg {
+    color: var(--astryx-color-negative-fg);
+    font-weight: 600;
+  }
+
+  /* 5. Compact Capability Chips (one row; red ONLY when missing) */
+  .cap-row {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 4px 6px;
+    border-radius: var(--astryx-radius-sm);
+    border: 1px solid var(--astryx-color-border-subtle);
+    background: var(--astryx-color-surface-raised);
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    font-weight: 500;
+    color: var(--astryx-color-text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .badge-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--astryx-radius-pill);
+    flex-shrink: 0;
+    background: var(--astryx-color-text-muted);
+  }
+
+  .badge[data-state="ok"] {
+    border-color: var(--astryx-color-border-subtle);
+    background: var(--astryx-color-surface-raised);
+    color: var(--astryx-color-text-secondary);
+  }
+
+  .badge[data-state="ok"] .badge-dot {
+    background: var(--astryx-color-positive);
+  }
+
+  .badge[data-state="warn"] {
+    border-color: var(--astryx-color-border-subtle);
+    background: var(--astryx-color-surface-raised);
+    color: var(--astryx-color-text-muted);
+  }
+
+  .badge[data-state="warn"] .badge-dot {
+    background: var(--astryx-color-warning);
+  }
+
+  .badge[data-state="err"] {
+    border-color: var(--astryx-color-negative-border);
+    background: var(--astryx-color-negative-bg);
+    color: var(--astryx-color-negative-fg);
+  }
+
+  .badge[data-state="err"] .badge-dot {
+    background: var(--astryx-color-negative);
+  }
+
+  /* 6. Actions */
+  .controls-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .controls-grid .hud-btn {
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .secondary-action-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+    padding-top: 2px;
+  }
+
+  .secondary-action-hint {
+    font-size: var(--astryx-text-2xs);
+    color: var(--astryx-color-text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* 7. Collapsed "More" disclosure */
+  .hud-more {
+    border-top: 1px solid var(--astryx-color-border-subtle);
+    padding-top: 8px;
+  }
+
+  .hud-more-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    list-style: none;
+    cursor: pointer;
+    padding: 5px 8px;
+    border-radius: var(--astryx-radius-sm);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--astryx-color-border-subtle);
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-xs);
+    font-weight: 500;
+    color: var(--astryx-color-text-secondary);
+    transition: background var(--astryx-motion-fast), border-color var(--astryx-motion-fast);
+  }
+
+  .hud-more-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .hud-more-summary:hover {
+    background: var(--astryx-color-surface-interactive);
+    border-color: var(--astryx-color-border);
+    color: var(--astryx-color-text-primary);
+  }
+
+  .hud-more-summary::after {
+    content: "\25B8";
+    font-size: 11px;
+    color: var(--astryx-color-text-muted);
+    transition: transform var(--astryx-motion-fast);
+  }
+
+  .hud-more[open] .hud-more-summary::after {
+    transform: rotate(90deg);
+  }
+
+  .hud-more-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-top: 10px;
+  }
+
+  .kv-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .kv-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 5px 7px;
+    border-radius: var(--astryx-radius-sm);
+    background: var(--astryx-color-surface-raised);
+    border: 1px solid var(--astryx-color-border-subtle);
+    min-width: 0;
+  }
+
+  .kv-card.span-2 {
+    grid-column: span 2;
+  }
+
+  .kv-label {
+    color: var(--astryx-color-text-muted);
+    font-size: var(--astryx-text-2xs);
+    white-space: nowrap;
+  }
+
+  .kv-value {
+    font-family: var(--astryx-font-mono);
+    font-weight: 600;
+    font-size: var(--astryx-text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--astryx-color-text-primary);
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .kv-value[data-state="ok"] {
+    color: var(--astryx-color-positive-fg);
+  }
+
+  .kv-value[data-state="warn"] {
+    color: var(--astryx-color-warning-fg);
+  }
+
+  .kv-value[data-state="err"] {
+    color: var(--astryx-color-negative-fg);
+  }
+
+  .kv-value[data-state="info"] {
+    color: var(--astryx-color-accent-fg);
+  }
+
+  .control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+    padding: 5px 8px;
+    border-radius: var(--astryx-radius-sm);
+    background: var(--astryx-color-surface-raised);
+    border: 1px solid var(--astryx-color-border-subtle);
+  }
+
+  .hud-select {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--astryx-color-border);
+    background: var(--astryx-color-surface-sunken);
+    color: var(--astryx-color-text-primary);
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+    padding: 4px 6px;
+    border-radius: var(--astryx-radius-sm);
+    cursor: pointer;
+  }
+
+  .more-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 5px;
+  }
+
+  .more-actions-grid .hud-btn {
+    width: 100%;
+    padding: 5px 6px;
+    font-size: var(--astryx-text-2xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .more-cap-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--astryx-space-2);
+  }
+
+  /* Embedded GPU boot panel restyled in Astryx Neutral dark tokens */
+  #gpu-boot-panel-root {
+    width: 100%;
+    border-radius: var(--astryx-radius-md);
+    background: var(--astryx-color-surface-raised);
+    border: 1px solid var(--astryx-color-border-subtle);
+    overflow: hidden;
+  }
+
+  #gpu-boot-panel-root:empty {
+    display: none;
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel {
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    color: var(--astryx-color-text-primary);
+    font-family: var(--astryx-font-mono);
+    font-size: var(--astryx-text-2xs);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__header {
+    background: rgba(255, 255, 255, 0.03);
+    border-bottom-color: var(--astryx-color-border-subtle);
+    padding: 6px 8px;
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__title {
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-xs);
+    color: var(--astryx-color-text-primary);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__summary-badge {
+    background: var(--astryx-color-accent-bg);
+    color: var(--astryx-color-accent-fg);
+    font-size: var(--astryx-text-2xs);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__btn {
+    border-color: var(--astryx-color-border);
+    background: var(--astryx-color-surface-interactive);
+    color: var(--astryx-color-text-primary);
+    font-family: var(--astryx-font-sans);
+    font-size: var(--astryx-text-2xs);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__btn:hover {
+    background: var(--astryx-color-surface-interactive-hover);
+    border-color: var(--astryx-color-border-emphasized);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__body {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__section-title,
+  #gpu-boot-panel-root .pg6-gpu-panel__metric-label,
+  #gpu-boot-panel-root .pg6-gpu-panel__table th,
+  #gpu-boot-panel-root .pg6-gpu-panel__empty-cell {
+    color: var(--astryx-color-text-muted);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__metric {
+    background: var(--astryx-color-surface-sunken);
+    border: 1px solid var(--astryx-color-border-subtle);
+  }
+
+  #gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
+    background: var(--astryx-color-accent);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hud-btn,
+    .boot-progress-fill,
+    .hud-more-summary,
+    .hud-more-summary::after {
+      transition: none;
+    }
+  }
+}
