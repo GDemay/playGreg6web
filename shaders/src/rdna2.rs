@@ -587,6 +587,40 @@ fn format_vop3_src(src: u16, literal: Option<u32>, abs: bool, neg: bool) -> Stri
     }
 }
 
+/// Format an 8-bit scalar source, as a 64-bit SGPR pair (`s[n:n+1]`, `vcc`, `exec`) when
+/// `is_pair` is set and the operand names a register pair; constants/literals stay scalar.
+fn format_ssrc_maybe_pair(src: u8, literal: Option<u32>, is_pair: bool) -> String {
+    if is_pair && (src <= 104 || matches!(src, 106 | 126)) {
+        format_sdst_pair(src)
+    } else {
+        format_src_operand(u16::from(src), literal)
+    }
+}
+
+/// Which SOP2 sources are 64-bit SGPR pairs: `(src0_is_64, src1_is_64)`.
+///
+/// Bitwise/select `*_b64` ops read two pairs; 64-bit shifts and `s_bfe_*64` read a 64-bit
+/// `src0` plus a 32-bit shift/field operand in `src1`; `s_bfm_b64` reads two 32-bit sources.
+pub(crate) const fn sop2_src_pair_widths(op: u8) -> (bool, bool) {
+    match op {
+        0x0B | 0x0F | 0x11 | 0x13 | 0x15 | 0x17 | 0x19 | 0x1B | 0x1D => (true, true),
+        0x1F | 0x21 | 0x23 | 0x29 | 0x2A => (true, false),
+        _ => (false, false),
+    }
+}
+
+/// Which SOPC sources are 64-bit SGPR pairs: `(src0_is_64, src1_is_64)`.
+///
+/// `s_bitcmp{0,1}_b64` test a bit of a 64-bit `src0` (32-bit bit index in `src1`);
+/// `s_cmp_{eq,lg}_u64` compare two 64-bit pairs.
+pub(crate) const fn sopc_src_pair_widths(op: u8) -> (bool, bool) {
+    match op {
+        0x0E | 0x0F => (true, false),
+        0x12 | 0x13 => (true, true),
+        _ => (false, false),
+    }
+}
+
 fn format_waitcnt(simm16: u16) -> String {
     let vmcnt = (simm16 & 0xF) | (((simm16 >> 14) & 0x3) << 4);
     let expcnt = (simm16 >> 4) & 0x7;
@@ -676,8 +710,10 @@ fn sopc_mnemonic(op: u8) -> String {
         0x0D => "s_bitcmp1_b32",
         0x0E => "s_bitcmp0_b64",
         0x0F => "s_bitcmp1_b64",
-        0x10 => "s_cmp_eq_u64",
-        0x11 => "s_cmp_lg_u64",
+        // GFX10 dropped GFX9's `s_setvskip` (0x10) / `s_set_gpr_idx_on` (0x11) but kept the
+        // 64-bit equality compares at their GFX8/GFX9 slots 0x12 / 0x13.
+        0x12 => "s_cmp_eq_u64",
+        0x13 => "s_cmp_lg_u64",
         other => return format!("sopc_op_{other:#04x}"),
     }
     .to_string()
@@ -997,7 +1033,11 @@ fn vopc_mnemonic(op: u8) -> String {
 }
 
 fn vop2_info(op: u8) -> (String, bool) {
-    // Returns (mnemonic, always_has_literal_word)
+    // Returns (mnemonic, always_has_literal_word).
+    //
+    // Opcode numbers follow the AMD RDNA2 (GFX10.3) ISA VOP2 table (identical to GFX10.1 for
+    // every shared slot). `v_madmk_f32` / `v_madak_f32` / `v_fmamk_*` / `v_fmaak_*` always carry
+    // a mandatory trailing 32-bit `K` literal dword, even when `src0 != 0xFF`.
     match op {
         0x00 | 0x01 => ("v_cndmask_b32".to_string(), false),
         0x02 => ("v_dot2c_f32_f16".to_string(), false),
@@ -1020,22 +1060,26 @@ fn vop2_info(op: u8) -> (String, bool) {
         0x13 => ("v_min_u32".to_string(), false),
         0x14 => ("v_max_u32".to_string(), false),
         0x16 => ("v_lshrrev_b32".to_string(), false),
-        0x17 => ("v_ashrrev_i32".to_string(), false),
-        0x18 => ("v_lshlrev_b32".to_string(), false),
-        0x19 => ("v_and_b32".to_string(), false),
-        0x1A => ("v_or_b32".to_string(), false),
-        0x1B => ("v_xor_b32".to_string(), false),
-        0x1C => ("v_xnor_b32".to_string(), false),
-        0x20 => ("v_add_co_ci_u32".to_string(), false),
-        0x21 => ("v_sub_co_ci_u32".to_string(), false),
-        0x22 => ("v_subrev_co_ci_u32".to_string(), false),
+        0x18 => ("v_ashrrev_i32".to_string(), false),
+        0x1A => ("v_lshlrev_b32".to_string(), false),
+        0x1B => ("v_and_b32".to_string(), false),
+        0x1C => ("v_or_b32".to_string(), false),
+        0x1D => ("v_xor_b32".to_string(), false),
+        0x1E => ("v_xnor_b32".to_string(), false),
+        // GFX10.1 MAD/MAC f32 forms (absent on GFX10.3; decoded for robust instruction lengths).
+        0x1F => ("v_mac_f32".to_string(), false),
+        0x20 => ("v_madmk_f32".to_string(), true),
+        0x21 => ("v_madak_f32".to_string(), true),
         0x25 => ("v_add_nc_u32".to_string(), false),
         0x26 => ("v_sub_nc_u32".to_string(), false),
         0x27 => ("v_subrev_nc_u32".to_string(), false),
+        0x28 => ("v_add_co_ci_u32".to_string(), false),
+        0x29 => ("v_sub_co_ci_u32".to_string(), false),
+        0x2A => ("v_subrev_co_ci_u32".to_string(), false),
         0x2B => ("v_fmac_f32".to_string(), false),
         0x2C => ("v_fmamk_f32".to_string(), true),
         0x2D => ("v_fmaak_f32".to_string(), true),
-        0x2E => ("v_cvt_pkrtz_f16_f32".to_string(), false),
+        0x2F => ("v_cvt_pkrtz_f16_f32".to_string(), false),
         0x32 => ("v_add_f16".to_string(), false),
         0x33 => ("v_sub_f16".to_string(), false),
         0x34 => ("v_subrev_f16".to_string(), false),
@@ -1051,6 +1095,17 @@ fn vop2_info(op: u8) -> (String, bool) {
     }
 }
 
+/// Whether a VOP2 opcode is a carry-in/carry-out op (`v_{add,sub,subrev}_co_ci_u32`).
+pub(crate) const fn vop2_is_co_ci(op: u8) -> bool {
+    matches!(op, 0x28..=0x2A)
+}
+
+/// Whether a VOP2 opcode is a `*mk*` / `*ak*` form that only exists as VOP2
+/// (mandatory inline `K` literal dword; there is no VOP3 promotion).
+pub(crate) const fn vop2_is_madk(op: u8) -> bool {
+    matches!(op, 0x20 | 0x21 | 0x2C | 0x2D | 0x37 | 0x38)
+}
+
 fn vop3_info(op: u16) -> (String, u8, bool) {
     // Returns (mnemonic, num_srcs, is_vop3b)
     match op {
@@ -1058,8 +1113,13 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x100..=0x13F => {
             let v2_op = (op - 0x100) as u8;
             let (name, _) = vop2_info(v2_op);
-            let srcs = if matches!(v2_op, 0x00 | 0x01) { 3 } else { 2 };
-            let is_b = matches!(v2_op, 0x20..=0x22);
+            // v_cndmask_b32 and v_*_co_ci_u32 read a third (SGPR lane-mask) source in VOP3 form.
+            let srcs = if matches!(v2_op, 0x00 | 0x01) || vop2_is_co_ci(v2_op) {
+                3
+            } else {
+                2
+            };
+            let is_b = vop2_is_co_ci(v2_op);
             (name, srcs, is_b)
         }
         0x140 => ("v_mad_legacy_f32".to_string(), 3, false),
@@ -1473,10 +1533,11 @@ fn decode_sopc(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
 
     let mnemonic = sopc_mnemonic(op);
+    let (src0_is_64, src1_is_64) = sopc_src_pair_widths(op);
     let operands = format!(
         "{}, {}",
-        format_src_operand(u16::from(ssrc0), literal),
-        format_src_operand(u16::from(ssrc1), literal)
+        format_ssrc_maybe_pair(ssrc0, literal, src0_is_64),
+        format_ssrc_maybe_pair(ssrc1, literal, src1_is_64)
     );
 
     Rdna2Instruction {
@@ -1621,10 +1682,11 @@ fn decode_sop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     } else {
         format_sdst(sdst)
     };
+    let (src0_is_64, src1_is_64) = sop2_src_pair_widths(op);
     let operands = format!(
         "{dst_str}, {}, {}",
-        format_src_operand(u16::from(ssrc0), literal),
-        format_src_operand(u16::from(ssrc1), literal)
+        format_ssrc_maybe_pair(ssrc0, literal, src0_is_64),
+        format_ssrc_maybe_pair(ssrc1, literal, src1_is_64)
     );
 
     Rdna2Instruction {
@@ -1799,14 +1861,14 @@ fn decode_vop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
             Some(lit) => format!("0x{lit:08x}"),
             None => "<lit>".to_string(),
         };
-        if matches!(op, 0x2C | 0x37) {
-            // v_fmamk_f32 / v_fmamk_f16: vdst, src0, K, vsrc1
+        if matches!(op, 0x20 | 0x2C | 0x37) {
+            // v_madmk_f32 / v_fmamk_f32 / v_fmamk_f16: vdst, src0, K, vsrc1
             format!(
                 "v{vdst}, {}, {lit_str}, v{vsrc1}",
                 format_src_operand(src0, None)
             )
         } else {
-            // v_fmaak_f32 / v_fmaak_f16: vdst, src0, vsrc1, K
+            // v_madak_f32 / v_fmaak_f32 / v_fmaak_f16: vdst, src0, vsrc1, K
             format!(
                 "v{vdst}, {}, v{vsrc1}, {lit_str}",
                 format_src_operand(src0, None)
@@ -1816,6 +1878,12 @@ fn decode_vop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
         // v_cndmask_b32 vdst, src0, vsrc1, vcc
         format!(
             "v{vdst}, {}, v{vsrc1}, vcc",
+            format_src_operand(src0, literal)
+        )
+    } else if vop2_is_co_ci(op) {
+        // v_{add,sub,subrev}_co_ci_u32 vdst, vcc, src0, vsrc1, vcc (carry-out, carry-in)
+        format!(
+            "v{vdst}, vcc, {}, v{vsrc1}, vcc",
             format_src_operand(src0, literal)
         )
     } else {
@@ -2823,9 +2891,12 @@ pub fn analyze_instructions(
                     });
                 }
             }
-            Rdna2Detail::Sopc { ssrc0, ssrc1, .. } => {
-                record_sgpr(&mut max_sgpr, *ssrc0);
-                record_sgpr(&mut max_sgpr, *ssrc1);
+            Rdna2Detail::Sopc {
+                op, ssrc0, ssrc1, ..
+            } => {
+                let (src0_64, src1_64) = sopc_src_pair_widths(*op);
+                record_sgpr_range(&mut max_sgpr, *ssrc0, if src0_64 { 2 } else { 1 });
+                record_sgpr_range(&mut max_sgpr, *ssrc1, if src1_64 { 2 } else { 1 });
             }
             Rdna2Detail::Sop1 {
                 op, sdst, ssrc0, ..
@@ -2863,10 +2934,10 @@ pub fn analyze_instructions(
                 ..
             } => {
                 let (_, is_64) = sop2_mnemonic(*op);
-                let width = if is_64 { 2 } else { 1 };
-                record_sgpr_range(&mut max_sgpr, *sdst, width);
-                record_sgpr_range(&mut max_sgpr, *ssrc0, width);
-                record_sgpr_range(&mut max_sgpr, *ssrc1, width);
+                let (src0_64, src1_64) = sop2_src_pair_widths(*op);
+                record_sgpr_range(&mut max_sgpr, *sdst, if is_64 { 2 } else { 1 });
+                record_sgpr_range(&mut max_sgpr, *ssrc0, if src0_64 { 2 } else { 1 });
+                record_sgpr_range(&mut max_sgpr, *ssrc1, if src1_64 { 2 } else { 1 });
             }
             Rdna2Detail::Smem {
                 op,
@@ -4037,6 +4108,183 @@ mod tests {
         assert_eq!(insts[1].format_text(), "v_cndmask_b32 v4, v1, v2, s10");
     }
 
+    #[test]
+    fn decodes_gfx10_vop2_opcode_slots_with_madk_literal_words() {
+        // (VOP2 opcode, expected GFX10.3 mnemonic) — slots verified against the RDNA2 ISA table.
+        let table: [(u8, &str); 27] = [
+            (0x01, "v_cndmask_b32"),
+            (0x02, "v_dot2c_f32_f16"),
+            (0x0A, "v_mul_hi_i32_i24"),
+            (0x0C, "v_mul_hi_u32_u24"),
+            (0x16, "v_lshrrev_b32"),
+            (0x18, "v_ashrrev_i32"),
+            (0x1A, "v_lshlrev_b32"),
+            (0x1B, "v_and_b32"),
+            (0x1C, "v_or_b32"),
+            (0x1D, "v_xor_b32"),
+            (0x1E, "v_xnor_b32"),
+            (0x1F, "v_mac_f32"),
+            (0x25, "v_add_nc_u32"),
+            (0x26, "v_sub_nc_u32"),
+            (0x27, "v_subrev_nc_u32"),
+            (0x28, "v_add_co_ci_u32"),
+            (0x29, "v_sub_co_ci_u32"),
+            (0x2A, "v_subrev_co_ci_u32"),
+            (0x2B, "v_fmac_f32"),
+            (0x2F, "v_cvt_pkrtz_f16_f32"),
+            (0x32, "v_add_f16"),
+            (0x36, "v_fmac_f16"),
+            (0x39, "v_max_f16"),
+            (0x3A, "v_min_f16"),
+            (0x3B, "v_ldexp_f16"),
+            (0x3C, "v_pk_fmac_f16"),
+            (0x17, "vop2_op_0x17"),
+        ];
+        for (op, name) in table {
+            let bytes = words_to_bytes(&[enc_vop2(op, 1, 256 + 2, 3)]);
+            let inst = decode_instruction(&bytes, 0).expect("decodes");
+            assert_eq!(inst.encoding, Rdna2Encoding::Vop2);
+            assert_eq!(inst.mnemonic, name, "VOP2 op {op:#04x}");
+            assert_eq!(inst.size, 4, "{name} must not consume a literal");
+            assert!(!inst.truncated);
+        }
+
+        // *mk*/*ak* forms always carry a trailing K dword, even with a non-literal src0.
+        let words = [
+            enc_vop2(0x20, 4, 256 + 5, 6), // v_madmk_f32 v4, v5, K, v6
+            0x4000_0000,
+            enc_vop2(0x21, 4, 128 + 1, 6), // v_madak_f32 v4, 1, v6, K
+            0x3F80_0000,
+            enc_vop2(0x2C, 7, 256 + 8, 9), // v_fmamk_f32 v7, v8, K, v9
+            0x4040_0000,
+            enc_vop2(0x2D, 7, 242, 9), // v_fmaak_f32 v7, 1.0, v9, K
+            0x4080_0000,
+            enc_vop2(0x28, 1, 256 + 2, 3), // v_add_co_ci_u32 v1, vcc, v2, v3, vcc
+            enc_sopp(0x01, 0),
+        ];
+        let insts = decode_program(&words_to_bytes(&words));
+        let summary: Vec<(usize, usize, String)> = insts
+            .iter()
+            .map(|i| (i.offset, i.size, i.format_text()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (0, 8, "v_madmk_f32 v4, v5, 0x40000000, v6".to_string()),
+                (8, 8, "v_madak_f32 v4, 1, v6, 0x3f800000".to_string()),
+                (16, 8, "v_fmamk_f32 v7, v8, 0x40400000, v9".to_string()),
+                (24, 8, "v_fmaak_f32 v7, 1.0, v9, 0x40800000".to_string()),
+                (32, 4, "v_add_co_ci_u32 v1, vcc, v2, v3, vcc".to_string()),
+                (36, 4, "s_endpgm".to_string()),
+            ]
+        );
+
+        // A *mk* form at the end of the buffer without its K dword is reported truncated.
+        let truncated = decode_program(&words_to_bytes(&[enc_vop2(0x20, 4, 256 + 5, 6)]));
+        assert_eq!(truncated.len(), 1);
+        assert!(truncated[0].truncated);
+    }
+
+    #[test]
+    fn decodes_vop3b_co_ci_sdst_and_64bit_vop3_ops() {
+        // v_add_co_ci_u32_e64 v7, s[4:5], v1, v2, vcc (VOP3B: sdst in bits [14:8], carry-in src2)
+        let w0 = (0b110101u32 << 26) | (0x128u32 << 16) | (4u32 << 8) | 7;
+        let w1 = (106u32 << 18) | ((256u32 + 2) << 9) | (256 + 1);
+        let mut words = vec![w0, w1];
+        words.extend_from_slice(&enc_vop3(0x300, 2, 128 + 4, 256 + 6, 0, false, 0, 0, 0)); // v_lshrrev_b64
+        words.extend_from_slice(&enc_vop3(0x16A, 3, 256 + 1, 256 + 2, 0, false, 0, 0, 0)); // v_mul_hi_u32
+        words.extend_from_slice(&enc_vop3(0x088, 106, 256 + 1, 0xFF, 0, false, 0, 0, 0)); // v_cmp_class_f32
+        words.push(0x3FF);
+        let insts = decode_program(&words_to_bytes(&words));
+        assert_eq!(insts.len(), 4);
+        assert_eq!(insts[0].mnemonic, "v_add_co_ci_u32");
+        assert_eq!(
+            insts[0].format_text(),
+            "v_add_co_ci_u32 v7, s4, v1, v2, vcc_lo"
+        );
+        match insts[0].detail {
+            Rdna2Detail::Vop3 { sdst, src2, .. } => {
+                assert_eq!(sdst, Some(4));
+                assert_eq!(src2, 106);
+            }
+            ref other => panic!("unexpected detail {other:?}"),
+        }
+        assert_eq!(insts[1].mnemonic, "v_lshrrev_b64");
+        assert_eq!(insts[2].mnemonic, "v_mul_hi_u32");
+        assert_eq!(insts[3].mnemonic, "v_cmp_class_f32");
+        assert_eq!(insts[3].size, 12);
+        assert_eq!(
+            insts[3].format_text(),
+            "v_cmp_class_f32 vcc_lo, v1, 0x000003ff"
+        );
+    }
+
+    #[test]
+    fn decodes_sopc_bitcmp_and_gfx10_64bit_compare_slots_with_pair_operands() {
+        let words = [
+            enc_sopc(0x0C, 3, 128 + 5),   // s_bitcmp0_b32 s3, 5
+            enc_sopc(0x0D, 3, 128 + 31),  // s_bitcmp1_b32 s3, 31
+            enc_sopc(0x0E, 4, 128 + 33),  // s_bitcmp0_b64 s[4:5], 33
+            enc_sopc(0x0F, 106, 128 + 1), // s_bitcmp1_b64 vcc, 1
+            enc_sopc(0x12, 4, 6),         // s_cmp_eq_u64 s[4:5], s[6:7]
+            enc_sopc(0x13, 106, 126),     // s_cmp_lg_u64 vcc, exec
+            enc_sopc(0x13, 4, 0xFF),      // s_cmp_lg_u64 s[4:5], lit
+            0x1234_5678,
+            enc_sopc(0x10, 4, 6), // GFX9-only s_setvskip slot: unknown on GFX10
+            enc_sopc(0x11, 4, 6), // GFX9-only s_set_gpr_idx_on slot: unknown on GFX10
+        ];
+        let texts: Vec<String> = decode_program(&words_to_bytes(&words))
+            .iter()
+            .map(Rdna2Instruction::format_text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "s_bitcmp0_b32 s3, 5",
+                "s_bitcmp1_b32 s3, 31",
+                "s_bitcmp0_b64 s[4:5], 33",
+                "s_bitcmp1_b64 vcc, 1",
+                "s_cmp_eq_u64 s[4:5], s[6:7]",
+                "s_cmp_lg_u64 vcc, exec",
+                "s_cmp_lg_u64 s[4:5], 0x12345678",
+                "sopc_op_0x10 s4, s6",
+                "sopc_op_0x11 s4, s6",
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_64bit_sop2_ops_with_sgpr_pair_operands() {
+        let words = [
+            enc_sop2(0x0F, 8, 4, 6),         // s_and_b64 s[8:9], s[4:5], s[6:7]
+            enc_sop2(0x15, 106, 126, 106),   // s_andn2_b64 vcc, exec, vcc
+            enc_sop2(0x11, 126, 126, 0),     // s_or_b64 exec, exec, s[0:1]
+            enc_sop2(0x13, 10, 4, 193),      // s_xor_b64 s[10:11], s[4:5], -1
+            enc_sop2(0x0B, 12, 128 + 1, 4),  // s_cselect_b64 s[12:13], 1, s[4:5]
+            enc_sop2(0x21, 14, 4, 128 + 36), // s_lshr_b64 s[14:15], s[4:5], 36
+            enc_sop2(0x35, 16, 3, 0xFF),     // s_mul_hi_u32 s16, s3, lit
+            0xDEAD_BEEF,
+            enc_sop2(0x36, 17, 3, 4), // s_mul_hi_i32 s17, s3, s4
+        ];
+        let texts: Vec<String> = decode_program(&words_to_bytes(&words))
+            .iter()
+            .map(Rdna2Instruction::format_text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "s_and_b64 s[8:9], s[4:5], s[6:7]",
+                "s_andn2_b64 vcc, exec, vcc",
+                "s_or_b64 exec, exec, s[0:1]",
+                "s_xor_b64 s[10:11], s[4:5], -1",
+                "s_cselect_b64 s[12:13], 1, s[4:5]",
+                "s_lshr_b64 s[14:15], s[4:5], 36",
+                "s_mul_hi_u32 s16, s3, 0xdeadbeef",
+                "s_mul_hi_i32 s17, s3, s4",
+            ]
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn enc_vop3p(
         op: u8,
@@ -4110,9 +4358,9 @@ mod tests {
         // v_pk_min_f16 / v_pk_max_f16
         words.extend_from_slice(&enc_vop3p(0x11, 7, 256 + 4, 256 + 5, 0, false, 0, 0b011, 0, 0));
         words.extend_from_slice(&enc_vop3p(0x12, 8, 256 + 6, 256 + 7, 0, false, 0, 0b011, 0, 0));
-        // v_cvt_pkrtz_f16_f32 (VOP2 0x2E and VOP3 0x12E)
-        words.push(enc_vop2(0x2E, 9, 256 + 1, 2));
-        words.extend_from_slice(&enc_vop3(0x12E, 10, 256 + 3, 256 + 4, 0, true, 0, 0, 0));
+        // v_cvt_pkrtz_f16_f32 (VOP2 0x2F and VOP3 0x12F)
+        words.push(enc_vop2(0x2F, 9, 256 + 1, 2));
+        words.extend_from_slice(&enc_vop3(0x12F, 10, 256 + 3, 256 + 4, 0, true, 0, 0, 0));
         // s_buffer_load_dword / x2 / x4 / x8 / x16
         words.extend_from_slice(&enc_smem(0x08, 4, 0, 0x7D, 0x0, false, false));
         words.extend_from_slice(&enc_smem(0x09, 6, 0, 0x7D, 0x10, false, false));
