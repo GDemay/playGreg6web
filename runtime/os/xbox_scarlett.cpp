@@ -295,8 +295,12 @@ XMemState& xmem_state() {
 
 // Physical page model (O24, reworked in O27 for the title's call shapes)
 // ----------------------------------------------------------------------
-// XMemAllocatePhysicalPages(attributes, &count, pfns) returns opaque page frame numbers for
-// runtime-tracked pages; the pages own no memory until they hold data. Pages are mapped one 64 KiB
+// XMemAllocatePhysicalPages(attributes, &count, pfns) returns page frame numbers for
+// runtime-tracked pages; the pages own no memory until they hold data. Frame numbers count 4 KiB
+// frames, as on the console (O30): a 64 KiB page's number is a multiple of 16 and the next page's
+// is 16 higher. The title relies on it: its streaming code keeps pfn >> 4 per page and passes
+// (pfn >> 4) << 4 to XMemMapPhysicalPagesScatter, so numbers 1 apart would collapse 16 pages
+// into one. Pages are mapped one 64 KiB
 // slot at a time: XMemMapPhysicalPages(va, count, pfns) maps consecutive slots (a null pfn array
 // unmaps them), XMemMapPhysicalPagesScatter(vas, count, pfns) maps one slot per VA (a null array
 // or a 0 pfn unmaps that slot), both into XMemVirtualAlloc reservations (only the mapped pages are
@@ -438,8 +442,19 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
     // The bytes living here (the page's own, or after a frame swap another page's, O29) go to a
     // store before the slot loses its memory.
     if (PhysicalPage* owner = page.home_va == va ? &page : home_owner_locked(st, va)) {
-        save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
-        owner->home_va = 0;
+        // O30: a page that is still mapped at its first real slot (the title's pool view), whose
+        // memory holds nobody else's bytes, goes back there instead of into a new store block:
+        // one copy, and no store per page the title streams through its CPU window.
+        const uint64_t back = owner->pool_va;
+        const auto still = back != 0 && back != va ? st.page_slots.find(back) : st.page_slots.end();
+        if (still != st.page_slots.end() && still->second == owner->handle &&
+            home_owner_locked(st, back) == nullptr) {
+            std::memcpy(host_of(back), host_of(va), static_cast<size_t>(owner->page_size));
+            owner->home_va = back;
+        } else {
+            save_page_contents(*owner, static_cast<const uint8_t*>(host_of(va)));
+            owner->home_va = 0;
+        }
         retarget_window_slots_locked(*owner);
     }
     VirtualRegion* region = st.region_containing_locked(va, ps);
@@ -2492,8 +2507,12 @@ int32_t pg6_xbox_XMemAllocatePhysicalPages(uint64_t attributes, size_t* num_page
 
     auto& st = xmem_state();
     std::lock_guard<std::mutex> lock(st.mutex);
+    // Frame numbers in 4 KiB units: a page of page_size bytes takes page_size / 4 KiB numbers,
+    // aligned to that (O30; see the physical page model above).
+    const uint64_t frames = page_size / kXMemPageSize4K;
     for (size_t i = 0; i < count; ++i) {
-        const uint64_t handle = st.next_page_handle++;
+        const uint64_t handle = align_up_u64(st.next_page_handle, frames);
+        st.next_page_handle = handle + frames;
         created[i]->handle = handle;
         page_array[i] = handle;
         st.physical_pages.emplace(handle, std::move(created[i]));
