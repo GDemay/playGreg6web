@@ -41,6 +41,10 @@
 
   /** S6 reflection manifest schema version accepted by web/workers/reflection_loader.js. */
   const REFLECTION_SCHEMA_VERSION = 1;
+  /** Multi-module program manifest schema produced by `playgta6-recomp build-program`. */
+  const PROGRAM_MANIFEST_SCHEMA = 'playgta6-recomp-program';
+  const PROGRAM_MANIFEST_SCHEMA_VERSION = 1;
+  const DEFAULT_BOOT_MANIFEST_FILE = 'boot-manifest.json';
   const WGPK_MAGIC_BYTES = [0x57, 0x47, 0x50, 0x4b];
   const WGPK_VERSION = 1;
   const WGPK_HEADER_BYTES = 16;
@@ -576,6 +580,679 @@
     return raw;
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Multi-module program-manifest.json & single-module boot-manifest.json parsing and URL safety.
+  // ---------------------------------------------------------------------------------------------
+
+  const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+  const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+  const WINDOWS_DRIVE_RE = /^[a-zA-Z]:/;
+  const SAFE_MODULE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+  function unsafeUrlError(rawUrl, reason, extra = {}) {
+    return new PgimPreloadError('UNSAFE_URL', `unsafe URL "${rawUrl}": ${reason}`, {
+      url: rawUrl,
+      reason,
+      ...extra,
+    });
+  }
+
+  function decodeUrlPasses(raw, label) {
+    const passes = [raw];
+    let current = raw;
+    for (let i = 0; i < 4; i += 1) {
+      let decoded;
+      try {
+        decoded = decodeURIComponent(current);
+      } catch {
+        throw unsafeUrlError(raw, `${label} contains malformed percent-encoding`);
+      }
+      if (decoded === current) break;
+      passes.push(decoded);
+      current = decoded;
+    }
+    return passes;
+  }
+
+  function normalizeSafePathSegments(pathname, rawForError, label) {
+    const leadingSlash = pathname.startsWith('/');
+    const trimmed = leadingSlash ? pathname.slice(1) : pathname;
+    if (trimmed.length === 0) {
+      throw unsafeUrlError(rawForError, `${label} must not be empty`);
+    }
+    const rawSegments = trimmed.split('/');
+    const out = [];
+    for (const seg of rawSegments) {
+      if (seg === '') {
+        throw unsafeUrlError(rawForError, `${label} contains empty path segment`);
+      }
+      if (seg === '..') {
+        throw unsafeUrlError(rawForError, `${label} contains path traversal segment ".."`);
+      }
+      if (seg === '.') continue;
+      out.push(seg);
+    }
+    if (out.length === 0) {
+      throw unsafeUrlError(rawForError, `${label} resolves to an empty path`);
+    }
+    return { leadingSlash, segments: out, normalized: (leadingSlash ? '/' : '') + out.join('/') };
+  }
+
+  function parseManifestBase(baseUrl) {
+    if (baseUrl === null || baseUrl === undefined || baseUrl === '') {
+      return { hasOrigin: false, origin: '', dir: '', isRootRelative: false };
+    }
+    if (typeof baseUrl !== 'string') {
+      throw new TypeError('baseUrl must be a string or null');
+    }
+    if (baseUrl.trim() !== baseUrl || CONTROL_CHAR_RE.test(baseUrl) || baseUrl.includes('\\')) {
+      throw unsafeUrlError(baseUrl, 'manifest base URL contains forbidden characters');
+    }
+    const noHashOrQuery = baseUrl.split(/[?#]/, 1)[0];
+    const passes = decodeUrlPasses(noHashOrQuery, 'manifest base URL');
+    for (const pass of passes) {
+      if (CONTROL_CHAR_RE.test(pass) || pass.includes('\\')) {
+        throw unsafeUrlError(baseUrl, 'manifest base URL contains forbidden characters');
+      }
+      if (WINDOWS_DRIVE_RE.test(pass)) {
+        throw unsafeUrlError(baseUrl, 'manifest base URL must not be a filesystem drive path');
+      }
+    }
+
+    if (SCHEME_RE.test(noHashOrQuery)) {
+      let parsed;
+      try {
+        parsed = new URL(noHashOrQuery);
+      } catch {
+        throw unsafeUrlError(baseUrl, 'manifest base URL is not a valid URL');
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw unsafeUrlError(baseUrl, `unsupported manifest URL scheme "${parsed.protocol}"`);
+      }
+      if (parsed.username || parsed.password) {
+        throw unsafeUrlError(baseUrl, 'manifest base URL must not contain credentials');
+      }
+      for (const pass of passes) {
+        if (pass.split('/').includes('..')) {
+          throw unsafeUrlError(baseUrl, 'manifest base URL contains path traversal');
+        }
+      }
+      const pathname = parsed.pathname;
+      const decodedPathnamePasses = decodeUrlPasses(pathname, 'manifest base URL');
+      for (const pass of decodedPathnamePasses) {
+        if (pass.split('/').includes('..')) {
+          throw unsafeUrlError(baseUrl, 'manifest base URL contains path traversal');
+        }
+      }
+      const lastSlash = pathname.lastIndexOf('/');
+      const dir = lastSlash >= 0 ? pathname.slice(0, lastSlash + 1) : '/';
+      return { hasOrigin: true, origin: parsed.origin, dir, isRootRelative: true };
+    }
+
+    if (noHashOrQuery.startsWith('//')) {
+      throw unsafeUrlError(baseUrl, 'manifest base URL must not be protocol-relative');
+    }
+    for (const pass of passes) {
+      if (pass.startsWith('//') || pass.split('/').includes('..')) {
+        throw unsafeUrlError(baseUrl, 'manifest base URL contains path traversal');
+      }
+    }
+    const isRootRelative = noHashOrQuery.startsWith('/');
+    const lastSlash = noHashOrQuery.lastIndexOf('/');
+    const dir = lastSlash >= 0 ? noHashOrQuery.slice(0, lastSlash + 1) : '';
+    return { hasOrigin: false, origin: '', dir, isRootRelative };
+  }
+
+  function validateManifestEndpointUrl(url, label = 'manifest URL') {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError(`${label} must be a non-empty string`);
+    }
+    if (url.trim() !== url || CONTROL_CHAR_RE.test(url) || url.includes('\\')) {
+      throw unsafeUrlError(url, `${label} contains forbidden characters`);
+    }
+    const noHashOrQuery = url.split(/[?#]/, 1)[0];
+    if (noHashOrQuery.length === 0) {
+      throw unsafeUrlError(url, `${label} must not be empty`);
+    }
+    const passes = decodeUrlPasses(noHashOrQuery, label);
+    for (const pass of passes) {
+      if (CONTROL_CHAR_RE.test(pass) || pass.includes('\\')) {
+        throw unsafeUrlError(url, `${label} contains forbidden characters`);
+      }
+      if (WINDOWS_DRIVE_RE.test(pass)) {
+        throw unsafeUrlError(url, `${label} must not be a filesystem drive path`);
+      }
+    }
+    if (SCHEME_RE.test(noHashOrQuery)) {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        throw unsafeUrlError(url, `${label} is not a valid URL`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw unsafeUrlError(url, `${label} has unsupported scheme "${parsed.protocol}"`);
+      }
+      if (parsed.username || parsed.password) {
+        throw unsafeUrlError(url, `${label} must not contain credentials`);
+      }
+      for (const pass of passes) {
+        if (pass.split('/').includes('..')) {
+          throw unsafeUrlError(url, `${label} contains path traversal`);
+        }
+      }
+      for (const pass of decodeUrlPasses(parsed.pathname, label)) {
+        if (pass.split('/').includes('..')) {
+          throw unsafeUrlError(url, `${label} contains path traversal`);
+        }
+      }
+      return url;
+    }
+    if (noHashOrQuery.startsWith('//')) {
+      throw unsafeUrlError(url, `${label} must not be protocol-relative`);
+    }
+    for (const pass of passes) {
+      if (pass.startsWith('//') || pass.split('/').includes('..') || SCHEME_RE.test(pass)) {
+        throw unsafeUrlError(url, `${label} contains unsafe traversal or scheme`);
+      }
+    }
+    return url;
+  }
+
+  function deriveBootManifestUrl(manifestUrl, bootManifestFile = DEFAULT_BOOT_MANIFEST_FILE) {
+    const base = parseManifestBase(manifestUrl);
+    return (base.hasOrigin ? base.origin : '') + base.dir + bootManifestFile;
+  }
+
+  function validateModuleName(rawName, manifestUrl) {
+    if (typeof rawName !== 'string' || rawName.length === 0) {
+      throw new PgimPreloadError(
+        'BAD_PROGRAM_MANIFEST',
+        `invalid program manifest ${manifestUrl}: module name must be a non-empty string`,
+        { url: manifestUrl }
+      );
+    }
+    if (
+      rawName.trim() !== rawName ||
+      CONTROL_CHAR_RE.test(rawName) ||
+      rawName.includes('/') ||
+      rawName.includes('\\') ||
+      rawName.includes('..') ||
+      rawName.includes('%') ||
+      rawName.includes(':') ||
+      rawName.includes('?') ||
+      rawName.includes('#') ||
+      !SAFE_MODULE_NAME_RE.test(rawName)
+    ) {
+      throw unsafeUrlError(rawName, 'module name contains unsafe path or URL characters');
+    }
+    return rawName;
+  }
+
+  /**
+   * Resolve a manifest-declared asset path against `baseUrl` while strictly rejecting path
+   * traversal, encoded traversal, backslashes, unsafe schemes, cross-origin URLs, and paths
+   * escaping the manifest's base directory.
+   *
+   * @param {string} rawPath
+   * @param {string | null} [baseUrl]
+   * @param {{ requirePgimExtension?: boolean, label?: string }} [options]
+   * @returns {{ url: string, path: string }}
+   */
+  function resolveSafeManifestUrl(rawPath, baseUrl = null, options = {}) {
+    const { requirePgimExtension = true, label = 'module PGIM URL' } = options;
+    if (typeof rawPath !== 'string' || rawPath.length === 0) {
+      throw unsafeUrlError(String(rawPath), `${label} must be a non-empty string`);
+    }
+    if (rawPath.trim() !== rawPath) {
+      throw unsafeUrlError(rawPath, `${label} must not contain leading or trailing whitespace`);
+    }
+    if (CONTROL_CHAR_RE.test(rawPath)) {
+      throw unsafeUrlError(rawPath, `${label} contains control characters`);
+    }
+    if (rawPath.includes('\\')) {
+      throw unsafeUrlError(rawPath, `${label} must not contain backslashes`);
+    }
+    if (rawPath.includes('?') || rawPath.includes('#')) {
+      throw unsafeUrlError(rawPath, `${label} must not contain query strings or fragments`);
+    }
+
+    const base = parseManifestBase(baseUrl);
+    const passes = decodeUrlPasses(rawPath, label);
+    for (const pass of passes) {
+      if (CONTROL_CHAR_RE.test(pass)) {
+        throw unsafeUrlError(rawPath, `${label} contains encoded control characters`);
+      }
+      if (pass.includes('\\')) {
+        throw unsafeUrlError(rawPath, `${label} contains encoded backslashes`);
+      }
+      if (pass.includes('?') || pass.includes('#')) {
+        throw unsafeUrlError(rawPath, `${label} contains encoded query or fragment delimiters`);
+      }
+      if (WINDOWS_DRIVE_RE.test(pass)) {
+        throw unsafeUrlError(rawPath, `${label} must not be a filesystem drive path`);
+      }
+    }
+
+    let resolvedUrl;
+    let relativePath;
+    let lastSegment;
+
+    const hasScheme = passes.some((pass) => SCHEME_RE.test(pass));
+    if (hasScheme) {
+      if (!SCHEME_RE.test(rawPath)) {
+        throw unsafeUrlError(rawPath, `${label} contains an encoded URL scheme`);
+      }
+      let parsed;
+      try {
+        parsed = new URL(rawPath);
+      } catch {
+        throw unsafeUrlError(rawPath, `${label} is not a valid URL`);
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw unsafeUrlError(rawPath, `${label} uses forbidden scheme "${parsed.protocol}"`);
+      }
+      if (parsed.username || parsed.password) {
+        throw unsafeUrlError(rawPath, `${label} must not contain embedded credentials`);
+      }
+      if (!base.hasOrigin || parsed.origin !== base.origin) {
+        throw unsafeUrlError(rawPath, `${label} must not reference a different or external origin`);
+      }
+      for (const pass of passes) {
+        if (pass.split('/').includes('..')) {
+          throw unsafeUrlError(rawPath, `${label} contains path traversal`);
+        }
+      }
+      for (const pass of decodeUrlPasses(parsed.pathname, label)) {
+        if (pass.includes('\\') || pass.split('/').includes('..')) {
+          throw unsafeUrlError(rawPath, `${label} contains path traversal`);
+        }
+      }
+      const { normalized, segments } = normalizeSafePathSegments(parsed.pathname, rawPath, label);
+      if (base.dir && !normalized.startsWith(base.dir)) {
+        throw unsafeUrlError(rawPath, `${label} escapes manifest base directory "${base.dir}"`);
+      }
+      resolvedUrl = parsed.origin + normalized;
+      relativePath = base.dir ? normalized.slice(base.dir.length) : normalized.replace(/^\/+/, '');
+      lastSegment = segments[segments.length - 1];
+    } else {
+      if (passes.some((pass) => pass.startsWith('//'))) {
+        throw unsafeUrlError(rawPath, `${label} must not be protocol-relative`);
+      }
+      for (const pass of passes) {
+        normalizeSafePathSegments(pass, rawPath, label);
+      }
+      const { leadingSlash, normalized, segments } = normalizeSafePathSegments(rawPath, rawPath, label);
+      lastSegment = segments[segments.length - 1];
+      if (leadingSlash) {
+        if (base.dir) {
+          if (!base.isRootRelative || !normalized.startsWith(base.dir)) {
+            throw unsafeUrlError(rawPath, `${label} escapes manifest base directory "${base.dir}"`);
+          }
+          resolvedUrl = base.hasOrigin ? base.origin + normalized : normalized;
+          relativePath = normalized.slice(base.dir.length);
+        } else {
+          resolvedUrl = base.hasOrigin ? base.origin + normalized : normalized;
+          relativePath = segments.join('/');
+        }
+      } else {
+        relativePath = normalized;
+        resolvedUrl = (base.hasOrigin ? base.origin : '') + base.dir + relativePath;
+      }
+    }
+
+    if (requirePgimExtension) {
+      const lowerLast = lastSegment.toLowerCase();
+      if (!lowerLast.endsWith('.pgim') || lowerLast.length <= '.pgim'.length) {
+        throw unsafeUrlError(rawPath, `${label} must reference a .pgim file`);
+      }
+    }
+
+    return { url: resolvedUrl, path: relativePath };
+  }
+
+  function decodeManifestJson(input, errorCode, label, url) {
+    const fail = (reason, cause) =>
+      new PgimPreloadError(errorCode, `invalid ${label} ${url}: ${reason}`, { url, cause });
+    let text;
+    if (typeof input === 'string') {
+      text = input;
+    } else if (
+      input instanceof Uint8Array ||
+      ArrayBuffer.isView(input) ||
+      input instanceof ArrayBuffer ||
+      isSharedArrayBuffer(input)
+    ) {
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(toBytes(input, label));
+      } catch (err) {
+        throw fail(`invalid UTF-8 (${err instanceof Error ? err.message : String(err)})`, err);
+      }
+    } else if (isPlainObject(input)) {
+      return input;
+    } else {
+      throw fail('manifest input must be a JSON object, string, or byte buffer');
+    }
+    let raw;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      throw fail(`malformed JSON (${err instanceof Error ? err.message : String(err)})`, err);
+    }
+    if (!isPlainObject(raw)) {
+      throw fail('manifest root must be a JSON object');
+    }
+    return raw;
+  }
+
+  function extractExplicitPgimField(obj) {
+    if (!isPlainObject(obj)) return null;
+    const directKeys = ['pgimUrl', 'pgim_url', 'pgimPath', 'pgim_path'];
+    for (const key of directKeys) {
+      if (obj[key] !== undefined && obj[key] !== null) {
+        return obj[key];
+      }
+    }
+    if (obj.pgim !== undefined && obj.pgim !== null) {
+      if (typeof obj.pgim === 'string') return obj.pgim;
+      if (isPlainObject(obj.pgim)) {
+        return obj.pgim.url ?? obj.pgim.path ?? null;
+      }
+      return obj.pgim;
+    }
+    if (obj.image !== undefined && obj.image !== null) {
+      if (typeof obj.image === 'string') return obj.image;
+      if (isPlainObject(obj.image)) {
+        const candidate = obj.image.url ?? obj.image.path ?? obj.image.pgim ?? null;
+        if (candidate !== null) return candidate;
+      }
+    }
+    return null;
+  }
+
+  function extractExpectedBytes(entry, matchedFile = null) {
+    const candidates = [
+      entry && entry.pgimSize,
+      entry && entry.pgim_size,
+      entry && entry.containerBytes,
+      entry && entry.container_bytes,
+      entry && isPlainObject(entry.image) ? entry.image.container_bytes : null,
+      entry && isPlainObject(entry.image) ? entry.image.size : null,
+      matchedFile ? matchedFile.size : null,
+    ];
+    for (const value of candidates) {
+      if (Number.isSafeInteger(value) && value >= 0) return value;
+    }
+    return null;
+  }
+
+  function extractManifestPgimFiles(rawFiles, effectiveBase) {
+    if (!Array.isArray(rawFiles)) return [];
+    const results = [];
+    const seen = new Set();
+    for (const item of rawFiles) {
+      let rawPath = null;
+      let size = null;
+      if (typeof item === 'string') {
+        rawPath = item;
+      } else if (isPlainObject(item) && typeof item.path === 'string') {
+        rawPath = item.path;
+        if (Number.isSafeInteger(item.size) && item.size >= 0) size = item.size;
+      }
+      if (!rawPath) continue;
+      const lower = rawPath.toLowerCase();
+      if (!lower.endsWith('.pgim')) continue;
+      const resolved = resolveSafeManifestUrl(rawPath, effectiveBase, {
+        requirePgimExtension: true,
+        label: 'manifest file PGIM path',
+      });
+      if (seen.has(resolved.url)) continue;
+      seen.add(resolved.url);
+      results.push({ url: resolved.url, path: resolved.path, size });
+    }
+    return results;
+  }
+
+  function matchModuleFileEntry(moduleName, fileEntries) {
+    if (fileEntries.length === 0) return null;
+    const target = moduleName.toLowerCase();
+    const canonical = `${target}/image/guest.pgim`;
+    const canonicalSuffix = `/${canonical}`;
+    for (const entry of fileEntries) {
+      const norm = entry.path.toLowerCase();
+      if (norm === canonical || norm.endsWith(canonicalSuffix)) return entry;
+    }
+    const prefix = `${target}/`;
+    for (const entry of fileEntries) {
+      if (entry.path.toLowerCase().startsWith(prefix)) return entry;
+    }
+    const segment = `/${target}/`;
+    for (const entry of fileEntries) {
+      if (entry.path.toLowerCase().includes(segment)) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Parse and validate a multi-module `program-manifest.json` document (produced by
+   * `playgta6-recomp build-program`). Discovers every guest module in initialisation order,
+   * resolves its `.pgim` URL relative to `baseUrl`, and strictly rejects unsafe/traversal URLs.
+   *
+   * @param {object | string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} input
+   * @param {{ baseUrl?: string | null, manifestUrl?: string | null, url?: string | null }} [options]
+   */
+  function parseProgramManifest(input, options = {}) {
+    const effectiveBase = options.baseUrl ?? options.manifestUrl ?? null;
+    const labelUrl = options.url ?? options.manifestUrl ?? options.baseUrl ?? 'program-manifest.json';
+    const fail = (reason) =>
+      new PgimPreloadError('BAD_PROGRAM_MANIFEST', `invalid program manifest ${labelUrl}: ${reason}`, { url: labelUrl });
+
+    const raw = decodeManifestJson(input, 'BAD_PROGRAM_MANIFEST', 'program manifest', labelUrl);
+    if (raw.schema !== undefined && raw.schema !== PROGRAM_MANIFEST_SCHEMA) {
+      throw fail(`unsupported schema ${JSON.stringify(raw.schema)} (expected "${PROGRAM_MANIFEST_SCHEMA}")`);
+    }
+    if (raw.schema_version !== undefined && raw.schema_version !== PROGRAM_MANIFEST_SCHEMA_VERSION) {
+      throw fail(
+        `unsupported schema_version ${JSON.stringify(raw.schema_version)} (expected ${PROGRAM_MANIFEST_SCHEMA_VERSION})`
+      );
+    }
+    if (!Array.isArray(raw.modules) || raw.modules.length === 0) {
+      throw fail('manifest "modules" must be a non-empty array');
+    }
+
+    const base = parseManifestBase(effectiveBase);
+    const fileEntries = extractManifestPgimFiles(raw.files, effectiveBase);
+    const modules = [];
+    const seenNames = new Set();
+
+    for (let i = 0; i < raw.modules.length; i += 1) {
+      const entry = raw.modules[i];
+      let rawName;
+      let explicitPgim = null;
+      let objEntry = null;
+      if (typeof entry === 'string') {
+        rawName = entry;
+      } else if (isPlainObject(entry)) {
+        objEntry = entry;
+        rawName = entry.module ?? entry.name ?? entry.id;
+        explicitPgim = extractExplicitPgimField(entry);
+      } else {
+        throw fail(`modules[${i}] must be a string or object`);
+      }
+
+      const name = validateModuleName(rawName, labelUrl);
+      const key = name.toLowerCase();
+      if (seenNames.has(key)) {
+        throw fail(`duplicate module "${name}"`);
+      }
+      seenNames.add(key);
+
+      const matchedFile = matchModuleFileEntry(name, fileEntries);
+      let resolved;
+      if (explicitPgim !== null) {
+        resolved = resolveSafeManifestUrl(explicitPgim, effectiveBase, {
+          requirePgimExtension: true,
+          label: `module "${name}" PGIM URL`,
+        });
+      } else if (matchedFile) {
+        resolved = { url: matchedFile.url, path: matchedFile.path };
+      } else {
+        resolved = resolveSafeManifestUrl(`${name}/image/guest.pgim`, effectiveBase, {
+          requirePgimExtension: true,
+          label: `module "${name}" PGIM URL`,
+        });
+      }
+
+      let buildManifestUrl = null;
+      if (objEntry && isPlainObject(objEntry.build_manifest) && objEntry.build_manifest.path !== undefined) {
+        buildManifestUrl = resolveSafeManifestUrl(objEntry.build_manifest.path, effectiveBase, {
+          requirePgimExtension: false,
+          label: `module "${name}" build_manifest path`,
+        }).url;
+      }
+
+      modules.push({
+        name,
+        module: name,
+        url: resolved.url,
+        path: resolved.path,
+        role: objEntry && typeof objEntry.role === 'string' ? objEntry.role : null,
+        dll: objEntry && typeof objEntry.dll === 'string' ? objEntry.dll : null,
+        file: objEntry && typeof objEntry.file === 'string' ? objEntry.file : null,
+        base: objEntry && objEntry.base !== undefined ? objEntry.base : null,
+        sizeOfImage:
+          objEntry && (objEntry.size_of_image !== undefined || objEntry.sizeOfImage !== undefined)
+            ? (objEntry.size_of_image ?? objEntry.sizeOfImage)
+            : null,
+        entryPoint:
+          objEntry && (objEntry.entry_point !== undefined || objEntry.entryPoint !== undefined)
+            ? (objEntry.entry_point ?? objEntry.entryPoint)
+            : null,
+        expectedBytes: extractExpectedBytes(objEntry, matchedFile),
+        buildManifestUrl,
+      });
+    }
+
+    return {
+      schema: raw.schema || PROGRAM_MANIFEST_SCHEMA,
+      schemaVersion: raw.schema_version ?? PROGRAM_MANIFEST_SCHEMA_VERSION,
+      baseUrl: (base.hasOrigin ? base.origin : '') + base.dir,
+      modules,
+      initOrder: modules.map((m) => m.name),
+      raw,
+    };
+  }
+
+  /**
+   * Parse and validate a legacy single-module `boot-manifest.json` (or `build-manifest.json`)
+   * fallback manifest when `program-manifest.json` is absent (HTTP 404).
+   *
+   * @param {object | string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView} input
+   * @param {{ baseUrl?: string | null, manifestUrl?: string | null, url?: string | null }} [options]
+   */
+  function parseBootManifest(input, options = {}) {
+    const effectiveBase = options.baseUrl ?? options.manifestUrl ?? null;
+    const labelUrl = options.url ?? options.manifestUrl ?? options.baseUrl ?? DEFAULT_BOOT_MANIFEST_FILE;
+    const fail = (reason) =>
+      new PgimPreloadError('BAD_BOOT_MANIFEST', `invalid boot manifest ${labelUrl}: ${reason}`, { url: labelUrl });
+
+    const raw = decodeManifestJson(input, 'BAD_BOOT_MANIFEST', 'boot manifest', labelUrl);
+    if (raw.schema_version !== undefined && raw.schema_version !== 1) {
+      throw fail(`unsupported schema_version ${JSON.stringify(raw.schema_version)} (expected 1)`);
+    }
+
+    const base = parseManifestBase(effectiveBase);
+    const fileEntries = extractManifestPgimFiles(raw.files, effectiveBase);
+
+    let name = 'main';
+    if (raw.module !== undefined && raw.module !== null) {
+      name = validateModuleName(raw.module, labelUrl);
+    } else if (raw.name !== undefined && raw.name !== null) {
+      name = validateModuleName(raw.name, labelUrl);
+    }
+
+    let explicitPgim = extractExplicitPgimField(raw);
+    let matchedFile = null;
+    let role = typeof raw.role === 'string' ? raw.role : 'exe';
+    let dll = typeof raw.dll === 'string' ? raw.dll : null;
+    let file = typeof raw.file === 'string' ? raw.file : null;
+
+    if (explicitPgim === null && Array.isArray(raw.modules) && raw.modules.length > 0) {
+      const parsed = parseProgramManifest(raw, options);
+      const first = parsed.modules[0];
+      return {
+        ...parsed,
+        pgimUrl: first.url,
+        shaderPackUrl: null,
+        reflectionManifestUrl: null,
+      };
+    }
+
+    let resolved;
+    if (explicitPgim !== null) {
+      resolved = resolveSafeManifestUrl(explicitPgim, effectiveBase, {
+        requirePgimExtension: true,
+        label: 'boot manifest PGIM URL',
+      });
+    } else if (fileEntries.length > 0) {
+      matchedFile = matchModuleFileEntry(name, fileEntries) || fileEntries[0];
+      resolved = { url: matchedFile.url, path: matchedFile.path };
+    } else if (typeof raw.module === 'string') {
+      const defaultPath = raw.schema === 'playgta6-recomp-build' ? 'image/guest.pgim' : `${name}/image/guest.pgim`;
+      resolved = resolveSafeManifestUrl(defaultPath, effectiveBase, {
+        requirePgimExtension: true,
+        label: 'boot manifest PGIM URL',
+      });
+    } else {
+      throw fail('boot manifest does not declare a .pgim image path');
+    }
+
+    let shaderPackUrl = null;
+    const rawShader = raw.shaderPackUrl ?? raw.shader_pack_url ?? raw.shaderPack ?? null;
+    if (rawShader !== null) {
+      shaderPackUrl = resolveSafeManifestUrl(rawShader, effectiveBase, {
+        requirePgimExtension: false,
+        label: 'boot manifest shaderPackUrl',
+      }).url;
+    }
+
+    let reflectionManifestUrl = null;
+    const rawReflection = raw.reflectionManifestUrl ?? raw.reflection_manifest_url ?? raw.reflectionUrl ?? null;
+    if (rawReflection !== null) {
+      reflectionManifestUrl = resolveSafeManifestUrl(rawReflection, effectiveBase, {
+        requirePgimExtension: false,
+        label: 'boot manifest reflectionManifestUrl',
+      }).url;
+    }
+
+    const mod = {
+      name,
+      module: name,
+      url: resolved.url,
+      path: resolved.path,
+      role,
+      dll,
+      file,
+      base: raw.base !== undefined ? raw.base : null,
+      sizeOfImage: raw.size_of_image ?? raw.sizeOfImage ?? null,
+      entryPoint: raw.entry_point ?? raw.entryPoint ?? null,
+      expectedBytes: extractExpectedBytes(raw, matchedFile),
+      buildManifestUrl: null,
+    };
+
+    return {
+      schema: typeof raw.schema === 'string' ? raw.schema : 'boot-manifest',
+      schemaVersion: raw.schema_version ?? 1,
+      baseUrl: (base.hasOrigin ? base.origin : '') + base.dir,
+      modules: [mod],
+      pgimUrl: mod.url,
+      shaderPackUrl,
+      reflectionManifestUrl,
+      initOrder: [mod.name],
+      raw,
+    };
+  }
+
   /**
    * Streams a PGIM guest image (and optional boot shader assets) into memory before guest entry.
    */
@@ -657,14 +1334,31 @@
    *           signal?: AbortSignal, verifyChecksums?: boolean }} [options]
    */
   async preloadGuestImage(url, { onProgress, signal, verifyChecksums = false } = {}) {
+    return this._preloadGuestImageCore(url, {
+      onProgress,
+      signal,
+      verifyChecksums,
+      precomputedProbe: null,
+      emitProbe: true,
+      emitComplete: true,
+    });
+  }
+
+  async _preloadGuestImageCore(
+    url,
+    { onProgress, signal, verifyChecksums = false, precomputedProbe = null, emitProbe = true, emitComplete = true } = {}
+  ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
     throwIfAborted(signal);
     const started = now();
     const emit = makeEmitter(onProgress);
     const ctx = { url, signal, emit, requests: 0 };
 
-    emit('probe', 0, null);
-    const probe = await this._probe(ctx);
+    let probe = precomputedProbe;
+    if (probe === null) {
+      if (emitProbe) emit('probe', 0, null);
+      probe = await this._probe(ctx);
+    }
     let loaded;
     if (this.rangeCache) {
       loaded = await this._loadViaRangeCache(ctx, probe);
@@ -680,7 +1374,7 @@
     const layout = parsePgimLayout(loaded.bytes, { verifyChecksums });
     const totalBytes = loaded.bytes.byteLength;
     const durationMs = now() - started;
-    emit('complete', totalBytes, totalBytes);
+    if (emitComplete) emit('complete', totalBytes, totalBytes);
     return {
       bytes: loaded.bytes,
       buffer: loaded.bytes.buffer,
@@ -691,6 +1385,394 @@
       requests: ctx.requests,
       totalBytes,
       bytesLoaded: totalBytes,
+      timingMs: durationMs,
+      durationMs,
+    };
+  }
+
+  /**
+   * Discover and preload all guest `.pgim` modules listed in a multi-module `program-manifest.json`
+   * with unified aggregate byte-level progress (`loadedBytes`, `totalBytes`, `moduleIndex`,
+   * `moduleCount`, `currentModule`). Gracefully falls back to single-module `boot-manifest.json`
+   * (or an optional `fallbackPgimUrl`) when `program-manifest.json` returns HTTP 404/410.
+   *
+   * @param {string | { programManifestUrl?: string, manifestUrl?: string, bootManifestUrl?: string | null,
+   *                   fallbackPgimUrl?: string | null, onProgress?: Function, signal?: AbortSignal,
+   *                   verifyChecksums?: boolean }} manifestUrl
+   * @param {{ bootManifestUrl?: string | null, fallbackPgimUrl?: string | null,
+   *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean }} [options]
+   */
+  async preloadProgramModules(manifestUrl, options = {}) {
+    let requestedUrl = manifestUrl;
+    let opts = options;
+    if (isPlainObject(manifestUrl)) {
+      opts = manifestUrl;
+      requestedUrl = opts.programManifestUrl ?? opts.manifestUrl;
+    }
+    const {
+      bootManifestUrl = undefined,
+      fallbackPgimUrl = null,
+      onProgress,
+      signal,
+      verifyChecksums = false,
+    } = opts || {};
+
+    validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
+    throwIfAborted(signal);
+
+    const started = now();
+    let totalRequests = 0;
+    const emitEvent = (payload) => {
+      if (typeof onProgress === 'function') onProgress(payload);
+    };
+
+    emitEvent({
+      phase: 'manifest',
+      loadedBytes: 0,
+      totalBytes: null,
+      pct: 0,
+      moduleIndex: 0,
+      moduleCount: 0,
+      currentModule: null,
+      moduleUrl: null,
+      moduleLoadedBytes: 0,
+      moduleTotalBytes: null,
+    });
+
+    const fetchManifestBytes = async (url, label) => {
+      const ctx = { url, signal, emit: () => {}, requests: 0 };
+      const response = await this._request(ctx, { method: 'GET' });
+      totalRequests += ctx.requests;
+      if (!response.ok) throw httpError(url, response.status, label);
+      const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+      throwIfAborted(signal);
+      return bytes;
+    };
+
+    let parsedManifest = null;
+    let source = 'program-manifest';
+    let resolvedManifestUrl = requestedUrl;
+    let usedFallback = false;
+
+    try {
+      const manifestBytes = await fetchManifestBytes(requestedUrl, 'program manifest');
+      parsedManifest = parseProgramManifest(manifestBytes, {
+        baseUrl: requestedUrl,
+        manifestUrl: requestedUrl,
+        url: requestedUrl,
+      });
+    } catch (err) {
+      if (!(err instanceof PgimPreloadError && err.code === 'NOT_FOUND')) {
+        throw err;
+      }
+
+      let resolvedBootUrl = null;
+      if (bootManifestUrl !== null && bootManifestUrl !== false) {
+        resolvedBootUrl =
+          typeof bootManifestUrl === 'string'
+            ? validateManifestEndpointUrl(bootManifestUrl, 'boot manifest URL')
+            : deriveBootManifestUrl(requestedUrl);
+      }
+
+      if (resolvedBootUrl !== null) {
+        emitEvent({
+          phase: 'fallback',
+          loadedBytes: 0,
+          totalBytes: null,
+          pct: 0,
+          moduleIndex: 0,
+          moduleCount: 0,
+          currentModule: null,
+          moduleUrl: null,
+          moduleLoadedBytes: 0,
+          moduleTotalBytes: null,
+          fallbackFrom: requestedUrl,
+          fallbackTo: resolvedBootUrl,
+        });
+        try {
+          const bootBytes = await fetchManifestBytes(resolvedBootUrl, 'boot manifest');
+          parsedManifest = parseBootManifest(bootBytes, {
+            baseUrl: resolvedBootUrl,
+            manifestUrl: resolvedBootUrl,
+            url: resolvedBootUrl,
+          });
+          source = 'boot-manifest';
+          resolvedManifestUrl = resolvedBootUrl;
+          usedFallback = true;
+        } catch (bootErr) {
+          if (
+            bootErr instanceof PgimPreloadError &&
+            bootErr.code === 'NOT_FOUND' &&
+            typeof fallbackPgimUrl === 'string' &&
+            fallbackPgimUrl.length > 0
+          ) {
+            const safeUrl = validateManifestEndpointUrl(fallbackPgimUrl, 'fallback PGIM URL');
+            const fallbackPathPart = safeUrl.split(/[?#]/, 1)[0];
+            if (!fallbackPathPart.toLowerCase().endsWith('.pgim')) {
+              throw unsafeUrlError(fallbackPgimUrl, 'fallback PGIM URL must reference a .pgim file');
+            }
+            parsedManifest = {
+              schema: 'pgim-fallback',
+              schemaVersion: 1,
+              baseUrl: '',
+              modules: [
+                {
+                  name: 'main',
+                  module: 'main',
+                  url: safeUrl,
+                  path: fallbackPathPart.replace(/^\/+/, ''),
+                  role: 'exe',
+                  dll: null,
+                  file: null,
+                  base: null,
+                  sizeOfImage: null,
+                  entryPoint: null,
+                  expectedBytes: null,
+                  buildManifestUrl: null,
+                },
+              ],
+              initOrder: ['main'],
+              raw: null,
+            };
+            source = 'pgim-fallback';
+            resolvedManifestUrl = null;
+            usedFallback = true;
+          } else {
+            throw bootErr;
+          }
+        }
+      } else if (typeof fallbackPgimUrl === 'string' && fallbackPgimUrl.length > 0) {
+        const safeUrl = validateManifestEndpointUrl(fallbackPgimUrl, 'fallback PGIM URL');
+        const fallbackPathPart = safeUrl.split(/[?#]/, 1)[0];
+        if (!fallbackPathPart.toLowerCase().endsWith('.pgim')) {
+          throw unsafeUrlError(fallbackPgimUrl, 'fallback PGIM URL must reference a .pgim file');
+        }
+        emitEvent({
+          phase: 'fallback',
+          loadedBytes: 0,
+          totalBytes: null,
+          pct: 0,
+          moduleIndex: 0,
+          moduleCount: 0,
+          currentModule: null,
+          moduleUrl: null,
+          moduleLoadedBytes: 0,
+          moduleTotalBytes: null,
+          fallbackFrom: requestedUrl,
+          fallbackTo: safeUrl,
+        });
+        parsedManifest = {
+          schema: 'pgim-fallback',
+          schemaVersion: 1,
+          baseUrl: '',
+          modules: [
+            {
+              name: 'main',
+              module: 'main',
+              url: safeUrl,
+              path: fallbackPathPart.replace(/^\/+/, ''),
+              role: 'exe',
+              dll: null,
+              file: null,
+              base: null,
+              sizeOfImage: null,
+              entryPoint: null,
+              expectedBytes: null,
+              buildManifestUrl: null,
+            },
+          ],
+          initOrder: ['main'],
+          raw: null,
+        };
+        source = 'pgim-fallback';
+        resolvedManifestUrl = null;
+        usedFallback = true;
+      } else {
+        throw err;
+      }
+    }
+
+    const descriptors = parsedManifest.modules;
+    const moduleCount = descriptors.length;
+    if (this.targetBuffer !== null && moduleCount > 1) {
+      throw new PgimPreloadError(
+        'ALLOCATION_FAILED',
+        `targetBuffer cannot be shared across ${moduleCount} PGIM modules`
+      );
+    }
+
+    // Pre-probe every module with HEAD (bounded by concurrency) to learn aggregate totalBytes upfront.
+    const probes = new Array(moduleCount);
+    const { controller: probeController, unlink: unlinkProbe } = linkSignal(signal);
+    let nextProbe = 0;
+    let probeFailure = null;
+    const probeWorker = async () => {
+      while (probeFailure === null && nextProbe < moduleCount) {
+        const idx = nextProbe;
+        nextProbe += 1;
+        const pCtx = {
+          url: descriptors[idx].url,
+          signal: probeController.signal,
+          emit: () => {},
+          requests: 0,
+        };
+        try {
+          probes[idx] = await this._probe(pCtx);
+          totalRequests += pCtx.requests;
+        } catch (err) {
+          totalRequests += pCtx.requests;
+          if (probeFailure === null) {
+            probeFailure = err;
+            probeController.abort(err);
+          }
+          return;
+        }
+      }
+    };
+    try {
+      await Promise.all(Array.from({ length: Math.min(this.concurrency, moduleCount) }, probeWorker));
+    } finally {
+      unlinkProbe();
+    }
+    throwIfAborted(signal);
+    if (probeFailure !== null) throw probeFailure;
+
+    const moduleLoaded = new Array(moduleCount).fill(0);
+    const moduleTotals = probes.map((p) => (p && typeof p.totalBytes === 'number' && p.totalBytes > 0 ? p.totalBytes : null));
+
+    const computeAggregate = () => {
+      let loadedBytes = 0;
+      let totalBytes = 0;
+      let allTotalsKnown = true;
+      for (let i = 0; i < moduleCount; i += 1) {
+        loadedBytes += moduleLoaded[i];
+        if (moduleTotals[i] === null) {
+          allTotalsKnown = false;
+        } else {
+          totalBytes += moduleTotals[i];
+        }
+      }
+      const aggTotal = allTotalsKnown ? totalBytes : null;
+      const pct = aggTotal ? Math.min(100, (loadedBytes / aggTotal) * 100) : 0;
+      return { loadedBytes, totalBytes: aggTotal, pct };
+    };
+
+    let maxEmittedLoaded = 0;
+    let maxEmittedPct = 0;
+    const emitAggregate = (phase, moduleIndex, descriptor) => {
+      const agg = computeAggregate();
+      const loadedBytes = Math.max(maxEmittedLoaded, agg.loadedBytes);
+      const pct = agg.totalBytes !== null ? Math.max(maxEmittedPct, agg.pct) : maxEmittedPct;
+      maxEmittedLoaded = loadedBytes;
+      maxEmittedPct = pct;
+      emitEvent({
+        phase,
+        loadedBytes,
+        totalBytes: agg.totalBytes,
+        pct,
+        moduleIndex,
+        moduleCount,
+        currentModule: descriptor.name,
+        moduleUrl: descriptor.url,
+        moduleLoadedBytes: moduleLoaded[moduleIndex],
+        moduleTotalBytes: moduleTotals[moduleIndex],
+      });
+    };
+
+    emitAggregate('probe', 0, descriptors[0]);
+
+    const loadedModules = [];
+    const modulesByName = {};
+
+    for (let i = 0; i < moduleCount; i += 1) {
+      throwIfAborted(signal);
+      const descriptor = descriptors[i];
+      const modResult = await this._preloadGuestImageCore(descriptor.url, {
+        signal,
+        verifyChecksums,
+        precomputedProbe: probes[i],
+        emitProbe: false,
+        emitComplete: false,
+        onProgress: (evt) => {
+          if (typeof evt.loadedBytes === 'number' && evt.loadedBytes > moduleLoaded[i]) {
+            moduleLoaded[i] = evt.loadedBytes;
+          }
+          if (typeof evt.totalBytes === 'number' && evt.totalBytes > 0) {
+            moduleTotals[i] = evt.totalBytes;
+          }
+          emitAggregate(evt.phase, i, descriptor);
+        },
+      });
+      totalRequests += modResult.requests;
+      moduleLoaded[i] = modResult.totalBytes;
+      moduleTotals[i] = modResult.totalBytes;
+
+      const entry = {
+        name: descriptor.name,
+        module: descriptor.name,
+        url: descriptor.url,
+        path: descriptor.path,
+        role: descriptor.role,
+        dll: descriptor.dll,
+        file: descriptor.file,
+        index: i,
+        header: modResult.header,
+        layout: modResult.layout,
+        bytes: modResult.bytes,
+        buffer: modResult.buffer,
+        shared: modResult.shared,
+        transport: modResult.transport,
+        requests: modResult.requests,
+        totalBytes: modResult.totalBytes,
+        bytesLoaded: modResult.bytesLoaded,
+        timingMs: modResult.timingMs,
+        durationMs: modResult.durationMs,
+      };
+      loadedModules.push(entry);
+      Object.defineProperty(modulesByName, descriptor.name, {
+        value: entry,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      emitAggregate('module-complete', i, descriptor);
+    }
+
+    const totalBytes = loadedModules.reduce((acc, m) => acc + m.totalBytes, 0);
+    const durationMs = now() - started;
+    const lastIdx = moduleCount - 1;
+    const lastDescriptor = descriptors[lastIdx];
+    emitEvent({
+      phase: 'complete',
+      loadedBytes: totalBytes,
+      totalBytes,
+      pct: 100,
+      moduleIndex: lastIdx,
+      moduleCount,
+      currentModule: lastDescriptor.name,
+      moduleUrl: lastDescriptor.url,
+      moduleLoadedBytes: loadedModules[lastIdx].totalBytes,
+      moduleTotalBytes: loadedModules[lastIdx].totalBytes,
+    });
+
+    const mainModule =
+      loadedModules.find((m) => m.role === 'exe') ||
+      loadedModules.find((m) => m.name.toLowerCase() === 'main') ||
+      loadedModules[lastIdx];
+
+    return {
+      source,
+      manifestUrl: resolvedManifestUrl,
+      requestedManifestUrl: requestedUrl,
+      usedFallback,
+      manifest: parsedManifest.raw !== null ? parsedManifest : null,
+      modules: loadedModules,
+      modulesByName,
+      moduleCount,
+      mainModule,
+      totalBytes,
+      bytesLoaded: totalBytes,
+      requests: totalRequests,
       timingMs: durationMs,
       durationMs,
     };
@@ -764,22 +1846,30 @@
   }
 
   /**
-   * Preload the PGIM image plus optional `.wgsl.pack` and S6 reflection manifest in parallel.
+   * Preload the PGIM image (or multi-module program via `programManifestUrl`) plus optional
+   * `.wgsl.pack` and S6 reflection manifest in parallel.
    * Omitted URLs and HTTP 404/410 for optional shader/reflection assets resolve to `null`.
    *
-   * @param {{ pgimUrl: string, shaderPackUrl?: string | null, reflectionUrl?: string | null,
+   * @param {{ pgimUrl?: string | null, programManifestUrl?: string | null, bootManifestUrl?: string | null,
+   *           shaderPackUrl?: string | null, reflectionUrl?: string | null,
    *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean }} options
    *   Progress events carry an extra `asset` field: `pgim`, `shaderPack`, `reflection`, or `bundle`.
    */
   async preloadBootBundle({
-    pgimUrl,
+    pgimUrl = null,
+    programManifestUrl = null,
+    bootManifestUrl = undefined,
     shaderPackUrl = null,
     reflectionUrl = null,
     onProgress,
     signal,
     verifyChecksums = false,
   } = {}) {
-    if (typeof pgimUrl !== 'string' || pgimUrl.length === 0) throw new TypeError('pgimUrl must be a non-empty string');
+    const hasProgramManifest = typeof programManifestUrl === 'string' && programManifestUrl.length > 0;
+    const hasPgimUrl = typeof pgimUrl === 'string' && pgimUrl.length > 0;
+    if (!hasProgramManifest && !hasPgimUrl) {
+      throw new TypeError('pgimUrl or programManifestUrl must be a non-empty string');
+    }
     throwIfAborted(signal);
     const started = now();
     const timingMs = { pgim: null, shaderPack: null, reflection: null, total: 0 };
@@ -816,7 +1906,15 @@
 
     const tasks = [
       timed('pgim', () =>
-        this.preloadPgim(pgimUrl, { onProgress: forward('pgim'), signal: inner, verifyChecksums })
+        hasProgramManifest
+          ? this.preloadProgramModules(programManifestUrl, {
+              bootManifestUrl,
+              fallbackPgimUrl: hasPgimUrl ? pgimUrl : null,
+              onProgress: forward('pgim'),
+              signal: inner,
+              verifyChecksums,
+            })
+          : this.preloadPgim(pgimUrl, { onProgress: forward('pgim'), signal: inner, verifyChecksums })
       ),
       optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes),
       optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson),
@@ -838,8 +1936,44 @@
     } finally {
       unlink();
     }
-    const [image, shaderPackBytes, reflectionManifest] = results;
+    const [pgimResult, shaderPackBytes, reflectionManifest] = results;
     timingMs.total = now() - started;
+
+    if (hasProgramManifest) {
+      const primary = pgimResult.mainModule;
+      if (typeof onProgress === 'function') {
+        onProgress({
+          phase: 'complete',
+          asset: 'bundle',
+          loadedBytes: pgimResult.bytesLoaded,
+          totalBytes: pgimResult.bytesLoaded,
+          pct: 100,
+          moduleIndex: pgimResult.moduleCount - 1,
+          moduleCount: pgimResult.moduleCount,
+          currentModule: pgimResult.modules[pgimResult.moduleCount - 1].name,
+        });
+      }
+      return {
+        pgim: primary,
+        pgimBytes: primary.bytes,
+        pgimHeader: primary.header,
+        pgimLayout: primary.layout,
+        buffer: primary.buffer,
+        header: primary.header,
+        shared: primary.shared,
+        program: pgimResult,
+        modules: pgimResult.modules,
+        modulesByName: pgimResult.modulesByName,
+        moduleCount: pgimResult.moduleCount,
+        shaderPackBytes,
+        reflectionManifest,
+        timingMs,
+        durationMs: timingMs.total,
+        bytesLoaded: pgimResult.bytesLoaded,
+      };
+    }
+
+    const image = pgimResult;
     if (typeof onProgress === 'function') {
       onProgress({
         phase: 'complete',
@@ -1179,6 +2313,49 @@
   }
 
 
+  /**
+   * Convenience wrapper around `PgimPreloader.prototype.preloadProgramModules`.
+   *
+   * @param {string | object} manifestUrl
+   * @param {object} [options]
+   */
+  async function preloadProgramModules(manifestUrl, options = {}) {
+    let url = manifestUrl;
+    let opts = options;
+    if (isPlainObject(manifestUrl)) {
+      opts = manifestUrl;
+      url = opts.programManifestUrl ?? opts.manifestUrl;
+    }
+    const {
+      preloader = null,
+      fetchImpl,
+      rangeCache = null,
+      chunkSize,
+      concurrency,
+      maxRetries,
+      baseRetryDelayMs,
+      sleep,
+      useSharedArrayBuffer,
+      targetBuffer,
+      ...callOptions
+    } = opts || {};
+    const instance =
+      preloader instanceof PgimPreloader
+        ? preloader
+        : new PgimPreloader({
+            fetchImpl,
+            rangeCache,
+            ...(chunkSize !== undefined ? { chunkSize } : {}),
+            ...(concurrency !== undefined ? { concurrency } : {}),
+            ...(maxRetries !== undefined ? { maxRetries } : {}),
+            ...(baseRetryDelayMs !== undefined ? { baseRetryDelayMs } : {}),
+            ...(sleep !== undefined ? { sleep } : {}),
+            ...(useSharedArrayBuffer !== undefined ? { useSharedArrayBuffer } : {}),
+            ...(targetBuffer !== undefined ? { targetBuffer } : {}),
+          });
+    return instance.preloadProgramModules(url, callOptions);
+  }
+
   const exportedApi = Object.freeze({
     PGIM_MAGIC,
     PGIM_MAGIC_BYTES,
@@ -1189,10 +2366,16 @@
     PGIM_FLAGS,
     PGIM_SECTION_FLAGS,
     PGIM_PROT,
+    PROGRAM_MANIFEST_SCHEMA,
+    PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,
     pgimFnv1a64,
     parsePgimHeader,
     parsePgimLayout,
+    resolveSafeManifestUrl,
+    parseProgramManifest,
+    parseBootManifest,
+    preloadProgramModules,
     PgimPreloader,
     default: PgimPreloader,
   });
