@@ -23,6 +23,8 @@
   const DEFAULT_ALPHA_MODE = 'opaque';
   const DEFAULT_MAX_DIMENSION = 8192;
   const DEFAULT_FRAME_WINDOW = 60;
+  const DEFAULT_MAX_ERROR_HISTORY = 32;
+  const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 
   // WebGPU GPUTextureUsage.RENDER_ATTACHMENT === 0x10 (fallback for Node/headless tests).
   const TEXTURE_USAGE_RENDER_ATTACHMENT =
@@ -109,6 +111,117 @@
     };
   }
 
+  function classifyGpuErrorType(raw) {
+    if (typeof raw !== 'string') {
+      return null;
+    }
+    const normalized = raw.trim().toLowerCase();
+    if (!normalized) {
+      return null;
+    }
+    if (
+      normalized === 'out-of-memory' ||
+      normalized === 'out_of_memory' ||
+      normalized === 'outofmemory' ||
+      normalized === 'oom' ||
+      normalized.includes('outofmemory') ||
+      normalized.includes('out-of-memory') ||
+      normalized.includes('out_of_memory')
+    ) {
+      return 'out-of-memory';
+    }
+    if (normalized === 'validation' || normalized.includes('validation')) {
+      return 'validation';
+    }
+    if (normalized === 'internal' || normalized.includes('internal')) {
+      return 'internal';
+    }
+    return null;
+  }
+
+  function normalizeValidationErrorType(error, event) {
+    if (error && typeof error === 'object') {
+      if (typeof GPUOutOfMemoryError === 'function' && error instanceof GPUOutOfMemoryError) {
+        return 'out-of-memory';
+      }
+      if (typeof GPUValidationError === 'function' && error instanceof GPUValidationError) {
+        return 'validation';
+      }
+      if (typeof GPUInternalError === 'function' && error instanceof GPUInternalError) {
+        return 'internal';
+      }
+      const fromType = classifyGpuErrorType(error.type);
+      if (fromType) {
+        return fromType;
+      }
+      const fromName = classifyGpuErrorType(error.name);
+      if (fromName) {
+        return fromName;
+      }
+      if (error.constructor && typeof error.constructor.name === 'string') {
+        const fromCtor = classifyGpuErrorType(error.constructor.name);
+        if (fromCtor) {
+          return fromCtor;
+        }
+      }
+    }
+    if (event && typeof event === 'object') {
+      const fromEventType = classifyGpuErrorType(event.errorType);
+      if (fromEventType) {
+        return fromEventType;
+      }
+    }
+    return 'unknown';
+  }
+
+  function sanitizeValidationErrorMessage(rawMessage) {
+    let msg;
+    if (typeof rawMessage === 'string') {
+      msg = rawMessage;
+    } else if (rawMessage === null || rawMessage === undefined) {
+      return '';
+    } else {
+      msg = String(rawMessage);
+    }
+
+    // Normalize line breaks/tabs to spaces and strip control characters.
+    msg = msg.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
+
+    // Strip file:// URLs and host filesystem paths (Windows drive, UNC, and Unix paths).
+    msg = msg.replace(/\bfile:\/\/[^\s"'`<>)\]]+/gi, '<path>');
+    msg = msg.replace(/\\\\[^\s\\"'`<>)\]]+\\[^\s"'`<>)\]]+/g, '<path>');
+    msg = msg.replace(/(["'`])[A-Za-z]:[\\\/][^"'`\r\n]+\1/g, '$1<path>$1');
+    msg = msg.replace(/\b[A-Za-z]:[\\\/][^\s"'`<>)\],;]+/g, '<path>');
+    msg = msg.replace(
+      /(["'`])\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)\/[^"'`\r\n]+\1/gi,
+      '$1<path>$1'
+    );
+    msg = msg.replace(
+      /(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]+/g,
+      '$1<path>'
+    );
+
+    // Strip long embedded buffers (data URIs, byte arrays, hex dumps, base64 blobs).
+    msg = msg.replace(/\bdata:[^\s;,'"`<>]+;base64,[A-Za-z0-9+/=]{16,}/gi, '<buffer>');
+    msg = msg.replace(
+      /(?:\b(?:0x)?[0-9a-fA-F]{1,4}\s*,\s*){16,}(?:0x)?[0-9a-fA-F]{1,4}\b/g,
+      '<buffer>'
+    );
+    msg = msg.replace(/(?:\b[0-9a-fA-F]{2}\s+){16,}[0-9a-fA-F]{2}\b/g, '<buffer>');
+    msg = msg.replace(/\b(?:0x)?[0-9a-fA-F]{48,}\b/g, '<buffer>');
+    msg = msg.replace(
+      /(^|[\s"'`(\[=,:])[A-Za-z0-9+/]{64,}={0,2}(?=$|[\s"'`)\]=,.;:])/g,
+      '$1<buffer>'
+    );
+
+    msg = msg.replace(/\s{2,}/g, ' ').trim();
+
+    if (msg.length > MAX_VALIDATION_ERROR_MESSAGE_LENGTH) {
+      msg = `${msg.slice(0, MAX_VALIDATION_ERROR_MESSAGE_LENGTH - 3)}...`;
+    }
+    return msg;
+  }
+
   /**
    * Manages an OffscreenCanvas WebGPU swapchain:
    * - DPR-aware configuration and dynamic resize with safe clamping
@@ -134,6 +247,8 @@
         enableDepth = true,
         now = defaultNow,
         frameWindowSize = DEFAULT_FRAME_WINDOW,
+        onValidationError = null,
+        maxErrorHistory = DEFAULT_MAX_ERROR_HISTORY,
       } = options;
 
       if (!canvas || typeof canvas !== 'object') {
@@ -161,6 +276,16 @@
       if (!Number.isInteger(frameWindowSize) || frameWindowSize < 1) {
         throw new RangeError(`frameWindowSize must be a positive integer, got ${frameWindowSize}`);
       }
+      if (
+        onValidationError !== null &&
+        onValidationError !== undefined &&
+        typeof onValidationError !== 'function'
+      ) {
+        throw new TypeError('onValidationError must be a function when provided');
+      }
+      if (!Number.isInteger(maxErrorHistory) || maxErrorHistory < 1) {
+        throw new RangeError(`maxErrorHistory must be a positive integer, got ${maxErrorHistory}`);
+      }
 
       const resolvedFormat =
         typeof format === 'string' && format.length > 0
@@ -181,6 +306,8 @@
       this._enableDepth = Boolean(enableDepth);
       this._now = now;
       this._frameWindowSize = frameWindowSize;
+      this._onValidationError = typeof onValidationError === 'function' ? onValidationError : null;
+      this._maxErrorHistory = maxErrorHistory;
 
       this._width = 0;
       this._height = 0;
@@ -198,12 +325,19 @@
       this._deviceLostGeneration = 0;
       this._hookedDevice = null;
 
+      this._errorHookedDevice = null;
+      this._boundUncapturedErrorHandler = null;
+      this._validationErrors = [];
+      this._validationErrorCount = 0;
+      this._validationErrorSeq = 0;
+
       this._totalFrames = 0;
       this._resizeCount = 0;
       this._lastFrameTimestamp = null;
       this._frameDeltas = [];
 
       this._hookDeviceLost(this._device);
+      this._hookUncapturedError(this._device);
     }
 
     get width() {
@@ -360,6 +494,99 @@
           callback(this._lastDeviceLostInfo, this);
         }
       });
+    }
+
+    _unhookUncapturedError() {
+      const prevDevice = this._errorHookedDevice;
+      const prevHandler = this._boundUncapturedErrorHandler;
+      this._errorHookedDevice = null;
+      this._boundUncapturedErrorHandler = null;
+
+      if (
+        prevDevice &&
+        prevHandler &&
+        typeof prevDevice.removeEventListener === 'function'
+      ) {
+        try {
+          prevDevice.removeEventListener('uncapturederror', prevHandler);
+        } catch {
+          // Ignore removal failures on torn-down or mock devices.
+        }
+      }
+    }
+
+    _hookUncapturedError(device) {
+      if (!device) {
+        this._unhookUncapturedError();
+        return;
+      }
+      if (device === this._errorHookedDevice && this._boundUncapturedErrorHandler) {
+        return;
+      }
+
+      this._unhookUncapturedError();
+
+      if (typeof device.addEventListener !== 'function') {
+        return;
+      }
+
+      const handler = (event) => {
+        if (this._destroyed || this._device !== device) {
+          return;
+        }
+        this._handleUncapturedError(event);
+      };
+
+      this._errorHookedDevice = device;
+      this._boundUncapturedErrorHandler = handler;
+      device.addEventListener('uncapturederror', handler);
+    }
+
+    _handleUncapturedError(event) {
+      const rawError =
+        event && typeof event === 'object' && 'error' in event ? event.error : event;
+      const type = normalizeValidationErrorType(rawError, event);
+
+      let rawMessage = '';
+      if (rawError && typeof rawError === 'object' && typeof rawError.message === 'string') {
+        rawMessage = rawError.message;
+      } else if (event && typeof event === 'object' && typeof event.message === 'string') {
+        rawMessage = event.message;
+      } else if (typeof rawError === 'string') {
+        rawMessage = rawError;
+      } else if (rawError !== null && rawError !== undefined) {
+        rawMessage = String(rawError);
+      }
+
+      const message = sanitizeValidationErrorMessage(rawMessage);
+      const nowVal = this._now();
+      const timestampMs =
+        typeof nowVal === 'number' && Number.isFinite(nowVal) ? nowVal : Date.now();
+
+      this._validationErrorSeq += 1;
+      this._validationErrorCount += 1;
+
+      const record = {
+        seq: this._validationErrorSeq,
+        type,
+        message,
+        timestampMs,
+      };
+
+      this._validationErrors.push(record);
+      if (this._validationErrors.length > this._maxErrorHistory) {
+        this._validationErrors.shift();
+      }
+
+      if (typeof this._onValidationError === 'function') {
+        try {
+          this._onValidationError({ ...record });
+        } catch {
+          // Isolate callback exceptions so validation error capture never crashes the worker.
+        }
+      }
+
+      return record;
     }
 
     _applyContextConfiguration() {
@@ -625,6 +852,36 @@
     }
 
     /**
+     * Return swapchain telemetry plus WebGPU validation-error counters.
+     */
+    getStats() {
+      return {
+        ...this.getTelemetry(),
+        validationErrorCount: this._validationErrorCount,
+        validationErrorHistorySize: this._validationErrors.length,
+        maxErrorHistory: this._maxErrorHistory,
+        isDestroyed: this._destroyed,
+      };
+    }
+
+    /**
+     * Return shallow copies of captured WebGPU uncaptured validation/OOM error records
+     * retained in the bounded history ring.
+     *
+     * @returns {Array<{ seq: number, type: string, message: string, timestampMs: number }>}
+     */
+    getValidationErrors() {
+      return this._validationErrors.map((entry) => ({ ...entry }));
+    }
+
+    /**
+     * Clear the bounded WebGPU validation error history ring.
+     */
+    clearValidationErrors() {
+      this._validationErrors.length = 0;
+    }
+
+    /**
      * Register a callback invoked when the active GPUDevice's `device.lost` promise resolves.
      * Returns an unsubscribe function.
      *
@@ -672,6 +929,7 @@
       }
 
       this._deviceLostGeneration += 1;
+      this._unhookUncapturedError();
       this._destroyDepthTexture();
 
       this._device = newDevice;
@@ -681,6 +939,7 @@
       this._lastFrameTimestamp = null;
 
       this._hookDeviceLost(newDevice);
+      this._hookUncapturedError(newDevice);
 
       if (this._configured && this._width > 0 && this._height > 0) {
         const maxDim = this._effectiveMaxDimension();
@@ -709,6 +968,7 @@
 
       this._destroyed = true;
       this._deviceLostGeneration += 1;
+      this._unhookUncapturedError();
       this._destroyDepthTexture();
 
       if (this._context && typeof this._context.unconfigure === 'function') {
@@ -716,6 +976,7 @@
       }
 
       this._deviceLostCallbacks.clear();
+      this._onValidationError = null;
       this._device = null;
       this._context = null;
       this._canvas = null;
@@ -731,6 +992,8 @@
     DEFAULT_ALPHA_MODE,
     DEFAULT_MAX_DIMENSION,
     DEFAULT_FRAME_WINDOW,
+    DEFAULT_MAX_ERROR_HISTORY,
+    MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
     TEXTURE_USAGE_RENDER_ATTACHMENT,
     WgpuSwapchain,
   };
