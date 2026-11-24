@@ -6,6 +6,7 @@
 #include <cstring>
 #include <utility>
 
+#include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
 #include "os/surface_blocks.h"
 #include "os/xbox_scarlett.h"
@@ -94,6 +95,97 @@ bool storage_capable(pso::WgpuTextureFormat f, uint32_t features) {
 
 uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
+}
+
+// Computes the exact mip-0 tiled source byte footprint expected by gfx10::detile_subresource for
+// all supported formats (1B/2B/4B/8B/16B per block, including BC1..BC7) and 2D/3D swizzle modes.
+// Returns 0 for linear or unrecognized formats/modes.
+uint64_t tiled_mip0_footprint_bytes(uint32_t d3d12_layout, uint32_t dxgi_format,
+                                    uint32_t blocks_x, uint32_t blocks_y, uint32_t slices) noexcept {
+    const gfx10::SwizzleMode mode = gfx10::decode_d3d12_layout(d3d12_layout);
+    const gfx10::FormatGeometry fmt = gfx10::format_geometry(dxgi_format);
+    if (!fmt.supported || mode == gfx10::SwizzleMode::Unsupported || mode == gfx10::SwizzleMode::Linear ||
+        blocks_x == 0 || blocks_y == 0 || slices == 0) {
+        return 0;
+    }
+    uint32_t bpp_log2 = 0xFFu;
+    switch (fmt.bytes_per_block) {
+        case 1:  bpp_log2 = 0; break;
+        case 2:  bpp_log2 = 1; break;
+        case 4:  bpp_log2 = 2; break;
+        case 8:  bpp_log2 = 3; break;
+        case 16: bpp_log2 = 4; break;
+        default: return 0;
+    }
+    uint32_t blk_size_log2 = 0;
+    bool is_standard = false;
+    switch (mode) {
+        case gfx10::SwizzleMode::Sw256BS: is_standard = true; blk_size_log2 = 8; break;
+        case gfx10::SwizzleMode::Sw256BD:
+        case gfx10::SwizzleMode::Sw256BR: blk_size_log2 = 8; break;
+        case gfx10::SwizzleMode::Sw4KBS:  is_standard = true; blk_size_log2 = 12; break;
+        case gfx10::SwizzleMode::Sw4KBD:
+        case gfx10::SwizzleMode::Sw4KBR:  blk_size_log2 = 12; break;
+        case gfx10::SwizzleMode::Sw64KBS:
+        case gfx10::SwizzleMode::SwVarS:
+        case gfx10::SwizzleMode::Sw64KBSX:
+        case gfx10::SwizzleMode::SwVarSX: is_standard = true; blk_size_log2 = 16; break;
+        case gfx10::SwizzleMode::Sw64KBD:
+        case gfx10::SwizzleMode::Sw64KBR:
+        case gfx10::SwizzleMode::SwVarD:
+        case gfx10::SwizzleMode::SwVarR:
+        case gfx10::SwizzleMode::Sw64KBDX:
+        case gfx10::SwizzleMode::Sw64KBRX:
+        case gfx10::SwizzleMode::SwVarDX:
+        case gfx10::SwizzleMode::SwVarRX: blk_size_log2 = 16; break;
+        default: return 0;
+    }
+    uint32_t w_log2 = 0;
+    uint32_t h_log2 = 0;
+    uint32_t d_log2 = 0;
+    if (slices > 1u && is_standard && blk_size_log2 >= 12u) {
+        if (blk_size_log2 == 12u) {
+            constexpr uint32_t kW[5] = {4, 4, 4, 3, 3};
+            constexpr uint32_t kH[5] = {4, 4, 3, 3, 3};
+            constexpr uint32_t kD[5] = {4, 3, 3, 3, 2};
+            w_log2 = kW[bpp_log2];
+            h_log2 = kH[bpp_log2];
+            d_log2 = kD[bpp_log2];
+        } else {
+            constexpr uint32_t kW[5] = {6, 5, 5, 5, 4};
+            constexpr uint32_t kH[5] = {5, 5, 5, 4, 4};
+            constexpr uint32_t kD[5] = {5, 5, 4, 4, 4};
+            w_log2 = kW[bpp_log2];
+            h_log2 = kH[bpp_log2];
+            d_log2 = kD[bpp_log2];
+        }
+    } else {
+        constexpr uint32_t kW256[5] = {4, 4, 3, 3, 2};
+        constexpr uint32_t kH256[5] = {4, 3, 3, 2, 2};
+        const uint32_t shift = (blk_size_log2 - 8u) / 2u;
+        w_log2 = kW256[bpp_log2] + shift;
+        h_log2 = kH256[bpp_log2] + shift;
+        d_log2 = 0;
+    }
+    const uint64_t tile_w = uint64_t{1} << w_log2;
+    const uint64_t tile_h = uint64_t{1} << h_log2;
+    const uint64_t tile_d = uint64_t{1} << d_log2;
+    const uint64_t tx = (uint64_t{blocks_x} + tile_w - 1u) >> w_log2;
+    const uint64_t ty = (uint64_t{blocks_y} + tile_h - 1u) >> h_log2;
+    const uint64_t tz = (uint64_t{slices} + tile_d - 1u) >> d_log2;
+    const uint64_t tile_bytes = uint64_t{1} << blk_size_log2;
+    if (tx == 0 || ty == 0 || tz == 0 || tx > UINT64_MAX / ty) {
+        return 0;
+    }
+    const uint64_t txy = tx * ty;
+    if (txy > UINT64_MAX / tz) {
+        return 0;
+    }
+    const uint64_t total_tiles = txy * tz;
+    if (total_tiles > UINT64_MAX / tile_bytes) {
+        return 0;
+    }
+    return total_tiles * tile_bytes;
 }
 
 }  // namespace
@@ -348,18 +440,22 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     std::vector<uint8_t> raw;
     bool read_ok = false;
     if (is_tiled && detile_fn) {
-        GuestResourceDesc tmp{};
-        tmp.Dimension = tt.dimension;
-        tmp.Width = w;
-        tmp.Height = h;
-        tmp.DepthOrArraySize = static_cast<uint16_t>(std::min<uint32_t>(d, 0xFFFFu));
-        tmp.MipLevels = 1;
-        tmp.Format = tt.dxgi_format;
-        tmp.SampleCount = 1;
-        tmp.Layout = tt.layout;
-        const uint64_t tiled_bytes = committed_memory_size(tmp);
-        if (tiled_bytes > tight_mip0_bytes && tiled_bytes <= kMaxSyncTextureBytes) {
-            raw.resize(static_cast<size_t>(tiled_bytes));
+        uint64_t tiled_bytes = tiled_mip0_footprint_bytes(tt.layout, tt.dxgi_format, blocks_x, blocks_y, d);
+        if (tiled_bytes == 0) {
+            GuestResourceDesc tmp{};
+            tmp.Dimension = tt.dimension;
+            tmp.Width = w;
+            tmp.Height = h;
+            tmp.DepthOrArraySize = static_cast<uint16_t>(std::min<uint32_t>(d, 0xFFFFu));
+            tmp.MipLevels = 1;
+            tmp.Format = tt.dxgi_format;
+            tmp.SampleCount = 1;
+            tmp.Layout = tt.layout;
+            tiled_bytes = committed_memory_size(tmp);
+        }
+        const uint64_t read_size = std::max<uint64_t>(tiled_bytes, tight_mip0_bytes);
+        if (read_size > 0 && read_size <= kMaxSyncTextureBytes) {
+            raw.resize(static_cast<size_t>(read_size));
             read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
         }
     }
@@ -429,6 +525,103 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     note_upload(staged.size());
     note_texture_upload();
     return true;
+}
+
+uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, uint32_t width, uint32_t height,
+                                        uint32_t depth, uint32_t mip_levels, uint32_t d3d12_layout,
+                                        GpuTextureDimension dim, bool uav) {
+    if (gpu_va == 0 || width < 1u || height < 1u || width > 16384u || height > 16384u) {
+        return 0;
+    }
+    const uint32_t safe_height = dim == GpuTextureDimension::Dim1D ? 1u : height;
+    const uint32_t safe_depth = std::max<uint32_t>(1u, depth);
+    if (safe_depth > 2048u) {
+        return 0;
+    }
+    uint32_t max_mips = 1u;
+    uint32_t extent = std::max<uint32_t>(width, safe_height);
+    if (dim == GpuTextureDimension::Dim3D) {
+        extent = std::max<uint32_t>(extent, safe_depth);
+    }
+    while (extent > 1u) {
+        extent >>= 1u;
+        ++max_mips;
+    }
+    const uint32_t safe_mips = mip_levels == 0u ? max_mips : std::min<uint32_t>(mip_levels, max_mips);
+
+    const pso::TextureFormatMapping mapping = pso::map_texture_format(
+        static_cast<pso::DxgiFormat>(dxgi_format), pso::FormatUsage::Sampled, bridge_->options().features);
+    if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
+        return 0;
+    }
+
+    AddressTextureKey key{};
+    key.gpu_va = gpu_va;
+    key.dxgi_format = dxgi_format;
+    key.width = width;
+    key.height = safe_height;
+    key.depth = safe_depth;
+    key.mip_levels = safe_mips;
+    key.d3d12_layout = d3d12_layout;
+    key.dim = static_cast<uint8_t>(dim);
+
+    std::lock_guard<std::mutex> lock(address_textures_mutex_);
+    const auto it = address_textures_.find(key);
+    if (it != address_textures_.end()) {
+        return it->second;
+    }
+
+    const uint32_t id = allocate_id();
+    GpuCreateTexture2Payload payload{};
+    payload.id = id;
+    payload.width = width;
+    payload.height = safe_height;
+    payload.depth_or_layers = safe_depth;
+    payload.mip_levels = safe_mips;
+    payload.sample_count = 1;
+    payload.dimension = static_cast<uint8_t>(dim);
+    payload.usage_flags = GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst;
+    if (uav && storage_capable(mapping.format, bridge_->options().features)) {
+        payload.usage_flags |= GpuTextureUsage::StorageBinding;
+    }
+    payload.format = static_cast<uint8_t>(mapping.format);
+
+    CommandEncoder enc;
+    enc.emit_packet(GpuOpcode::CreateTexture2, &payload, sizeof(payload));
+    submit(enc);
+
+    bridge::TextureInfo info{};
+    info.format = static_cast<pso::DxgiFormat>(dxgi_format);
+    info.width = width;
+    info.height = safe_height;
+    info.depth_or_array_size = safe_depth;
+    info.mip_levels = safe_mips;
+    info.sample_count = 1;
+    info.dimension = dim;
+    info.gpu_va = gpu_va;
+    info.layout = d3d12_layout;
+    bridge_->register_texture(id, info);
+
+    if (gpu_va < kFakeGpuVaBase) {
+        TrackedTexture tt{};
+        tt.resource_id = id;
+        tt.gpu_va = gpu_va;
+        tt.dxgi_format = dxgi_format;
+        tt.width = width;
+        tt.height = safe_height;
+        tt.depth = safe_depth;
+        tt.mip_levels = safe_mips;
+        tt.layout = d3d12_layout;
+        tt.dimension = dim == GpuTextureDimension::Dim1D
+                           ? ResourceDimension::Texture1D
+                           : (dim == GpuTextureDimension::Dim3D ? ResourceDimension::Texture3D
+                                                                : ResourceDimension::Texture2D);
+        tt.sample_count = 1;
+        track_guest_texture(tt);
+    }
+
+    address_textures_.emplace(key, id);
+    return id;
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {

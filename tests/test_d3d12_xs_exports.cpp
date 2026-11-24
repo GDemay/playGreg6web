@@ -24,6 +24,7 @@
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/descriptor_words.h"
 #include "gpu/gfx10_descriptors.h"
+#include "gpu/gfx10_detile.h"
 #include "gpu/shader_pack_index.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -2553,7 +2554,8 @@ void test_descriptor_words_in_memory() {
     const hw::SamplerState st = hw::decode_sampler(sw);
     CHECK(st.clamp_x == 2 && st.xy_mag_filter == 1 && st.mip_filter == 2 && st.max_lod == 4u * 256u);
 
-    // A texture view at an address (Xbox slot 70): no resource object; image words carry the address.
+    // A texture view at an address (Xbox slot 70): no ID3D12Resource; creates a tracked GPU texture
+    // and writes image words carrying the address.
     uint8_t srv[48] = {};
     dg::GuestShaderResourceViewDesc td{};
     td.Format = 98;  // BC7_UNORM
@@ -2571,7 +2573,8 @@ void test_descriptor_words_in_memory() {
           ai.max_mip == 8);
     auto* host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap)->heap();
     CHECK(host_heap->view(10) != nullptr && host_heap->view(10)->kind == d3d::DescriptorKind::Srv &&
-          host_heap->view(10)->resource_id == 0);
+          host_heap->view(10)->resource_id != 0 &&
+          dev->state_bridge().texture_at(at) == host_heap->view(10)->resource_id);
     CHECK(counter(dev, dg::xbox::Counter::TextureViewsAtAddress) == 1);
     const auto counts = dev->descriptor_word_counts();
     CHECK(counts[0] == 3 && counts[1] == 1);  // ok: CBV, buffer SRV, texture SRV; null: the null CBV
@@ -3590,6 +3593,416 @@ void test_xbox_wait_frame_event_monotonic_tokens() {
     scene.release_all();
 }
 
+// Helper for G49c end-to-end textured-draw tests: creates a root signature with 1 SRV descriptor
+// table (t0), registers its pipeline layout, creates a graphics PSO using that root signature, and
+// returns a lambda that records & executes one draw bound to a given shader-visible heap slot.
+struct TexturedDrawHarness {
+    Fixture& fx;
+    Scene& scene;
+    dg::Device* dev = nullptr;
+    uint64_t tex_rs = 0;
+    uint64_t tex_pso = 0;
+    uint64_t srv_heap = 0;
+    d3d::DescriptorHeap* host_heap = nullptr;
+    uint64_t heap_cpu0 = 0;
+    uint64_t heap_gpu0 = 0;
+
+    TexturedDrawHarness(Fixture& f, Scene& s) : fx(f), scene(s), dev(host_device(s.device)) {
+        dg::GuestDescriptorRange1 range{};
+        range.RangeType = 0;  // SRV
+        range.NumDescriptors = 1;
+        range.BaseShaderRegister = 0;
+        range.RegisterSpace = 0;
+        range.Flags = 0;
+        range.OffsetInDescriptorsFromTableStart = 0;
+        dg::GuestRootParameter param{};
+        param.ParameterType = 0;  // DescriptorTable
+        param.ShaderVisibility = 0;  // ALL
+        param.w0 = 1;
+        param.q = put(range);
+        dg::GuestVersionedRootSignatureDesc rsd{};
+        rsd.Version = 2;
+        rsd.NumParameters = 1;
+        rsd.pParameters = put(param);
+        rsd.Flags = 1;  // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+        const uint64_t blob_out = put<uint64_t>(0);
+        CHECK(hr(fx.dcall(dx::export_address("D3D12SerializeVersionedRootSignature"), {I(put(rsd)), I(blob_out), I(0)})) == 0);
+        const uint64_t blob = load64(blob_out);
+        tex_rs = fx.create(scene.device, Slot::CreateRootSignature,
+                           {I(0), I(fx.vcall(blob, Slot::GetBufferPointer)), I(fx.vcall(blob, Slot::GetBufferSize))},
+                           dg::IID_ID3D12RootSignature);
+        fx.vcall(blob, Slot::Release);
+        CHECK(tex_rs != 0);
+
+        auto* rs_obj = object_of<dg::RootSignature>(tex_rs);
+        const std::vector<uint8_t> vs_b{'D', 'X', 'B', 'C', 'G', '4', '9', 'V', 1};
+        const std::vector<uint8_t> ps_b{'D', 'X', 'B', 'C', 'G', '4', '9', 'P', 2};
+        const uint64_t vs_id = dg::shader_identity(vs_b.data(), vs_b.size());
+        const uint64_t ps_id = dg::shader_identity(ps_b.data(), ps_b.size());
+        dev->register_shader_module(vs_id, 9491);
+        dev->register_shader_module(ps_id, 9492);
+        dev->state_bridge().register_pipeline_layout(vs_id, ps_id, dg::layout_from_root_signature(rs_obj->signature().desc()));
+
+        dg::GuestGraphicsPipelineStateDesc pd{};
+        pd.pRootSignature = tex_rs;
+        pd.VS = {put_bytes(vs_b.data(), vs_b.size()), vs_b.size()};
+        pd.PS = {put_bytes(ps_b.data(), ps_b.size()), ps_b.size()};
+        for (auto& t : pd.BlendState.RenderTarget) {
+            t.SrcBlend = t.SrcBlendAlpha = 2;
+            t.DestBlend = t.DestBlendAlpha = 1;
+            t.BlendOp = t.BlendOpAlpha = 1;
+            t.LogicOp = 4;
+            t.RenderTargetWriteMask = 0xF;
+        }
+        pd.SampleMask = 0xFFFFFFFFu;
+        pd.RasterizerState.FillMode = 3;
+        pd.RasterizerState.CullMode = 1;
+        pd.RasterizerState.DepthClipEnable = 1;
+        pd.DepthStencilState.DepthFunc = 2;
+        pd.DepthStencilState.FrontFace = pd.DepthStencilState.BackFace = {1, 1, 1, 8};
+        static const char kPos[] = "POSITION";
+        dg::GuestInputElementDesc ie{};
+        ie.SemanticName = put_bytes(kPos, sizeof(kPos));
+        ie.Format = 6;
+        pd.InputLayout = {put(ie), 1};
+        pd.PrimitiveTopologyType = 3;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = 87;
+        pd.SampleCount = 1;
+        int32_t res = -1;
+        tex_pso = fx.create(scene.device, Slot2::CreateGraphicsPipelineState, {I(put(pd))},
+                            dg::IID_ID3D12PipelineState, &res);
+        CHECK(res == 0 && tex_pso != 0);
+
+        srv_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                             {I(put(dg::GuestDescriptorHeapDesc{0, 16, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+        CHECK(srv_heap != 0);
+        host_heap = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(srv_heap)->heap();
+        heap_cpu0 = host_heap->cpu_handle(0).ptr;
+        heap_gpu0 = host_heap->gpu_handle(0).ptr;
+    }
+
+    std::vector<Packet> draw_with_slot(uint32_t slot_index) {
+        const uint64_t list = scene.new_list();
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        const uint64_t heaps_arr = put<uint64_t>(srv_heap);
+        fx.vcall(list, 32, {I(1), I(heaps_arr)});  // SetDescriptorHeaps (Xbox slot 32)
+        fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(tex_rs)});
+        staged_set_pipeline_state(fx, fx.thread, list, tex_pso);
+        fx.vcall(list, 36, {I(0), I(host_heap->gpu_handle(slot_index).ptr)});  // SetGraphicsRootDescriptorTable (Xbox 36)
+        fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(0), I(0)});
+        fx.vcall(list, Slot2::RSSetViewports, {I(1), I(put(dg::GuestViewport{0, 0, 64, 64, 0, 1}))});
+        fx.vcall(list, Slot2::RSSetScissorRects, {I(1), I(put(dg::GuestRect{0, 0, 64, 64}))});
+        fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+        fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+        fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        fx.vcall(list, Slot::Release);
+        return packets_since(fx, mark);
+    }
+
+    void release() {
+        fx.vcall(srv_heap, Slot::Release);
+        fx.vcall(tex_pso, Slot::Release);
+        fx.vcall(tex_rs, Slot::Release);
+    }
+};
+
+// G49c Test 1: Default Device detiles tiled 0x102 (Sw256BD) and 0x109 (Sw64KBS) RGBA8 and BC7
+// textures automatically on draw with NO manual set_detile_fn, emitting exact 256B-aligned linear
+// WriteTexture payloads.
+void test_g49c_default_detile_rgba8_and_bc7() {
+    namespace hw = playgta6::gpu::gfx10;
+    Fixture fx;
+    dg::DeviceOptions opts;
+    opts.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    opts.bridge.features = playgta6::gpu::pso::WgpuFeature::TextureCompressionBc;
+    // Deliberately leave opts.detile_texture empty to verify default GFX10 detiler wiring.
+    dx::set_device_options(opts);
+
+    Scene scene(fx);
+    TexturedDrawHarness harness(fx, scene);
+
+    struct Case {
+        uint32_t dxgi_format;
+        uint32_t width;
+        uint32_t height;
+        uint32_t layout;
+        uint32_t block_w;
+        uint32_t block_h;
+        uint32_t block_bytes;
+        uint8_t seed;
+    };
+    const Case cases[] = {
+        {28u /*R8G8B8A8_UNORM*/, 8u, 8u, 0x102u /*Sw256BD*/, 1u, 1u, 4u, 0x11u},
+        {28u /*R8G8B8A8_UNORM*/, 8u, 8u, 0x109u /*Sw64KBS*/, 1u, 1u, 4u, 0x22u},
+        {98u /*BC7_UNORM*/, 16u, 16u, 0x102u /*Sw256BD*/, 4u, 4u, 16u, 0x33u},
+        {98u /*BC7_UNORM*/, 16u, 16u, 0x109u /*Sw64KBS*/, 4u, 4u, 16u, 0x44u},
+    };
+
+    std::vector<uint64_t> created_resources;
+    uint32_t slot = 0;
+    for (const Case& c : cases) {
+        const uint32_t blocks_x = (c.width + c.block_w - 1u) / c.block_w;
+        const uint32_t blocks_y = (c.height + c.block_h - 1u) / c.block_h;
+        const uint32_t tight_row = blocks_x * c.block_bytes;
+        std::vector<uint8_t> linear(size_t{tight_row} * blocks_y);
+        for (size_t i = 0; i < linear.size(); ++i) {
+            linear[i] = static_cast<uint8_t>((c.seed + i * 13u) | 1u);
+        }
+
+        hw::TextureLayoutDesc layout_desc{};
+        layout_desc.dxgi_format = c.dxgi_format;
+        layout_desc.width = c.width;
+        layout_desc.height = c.height;
+        layout_desc.depth = 1u;
+        layout_desc.mip_levels = 1u;
+        layout_desc.d3d12_layout = c.layout;
+        std::vector<uint8_t> tiled;
+        CHECK(hw::tile_subresource_for_test(layout_desc, 0u, linear.data(), linear.size(), tiled));
+        CHECK(!tiled.empty());
+
+        const uint64_t gpu_va = put_aligned(tiled, 256);
+        dg::GuestResourceDesc rd = texture_desc(c.width, c.height, c.dxgi_format, 0, 1);
+        rd.Layout = c.layout;
+        int32_t res = -1;
+        const uint64_t tex = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                       {I(gpu_va), I(put(rd)), I(0), I(0)}, dg::IID_ID3D12Resource, &res);
+        CHECK(res == 0 && tex != 0);
+        created_resources.push_back(tex);
+        const uint32_t tex_id = object_of<dg::Resource>(tex)->id();
+
+        dg::GuestShaderResourceViewDesc srv{};
+        srv.Format = c.dxgi_format;
+        srv.ViewDimension = 4;  // TEXTURE2D
+        srv.Shader4ComponentMapping = 0x1688;
+        srv.u[1] = 1;
+        fx.vcall(scene.device, Slot2::CreateShaderResourceView,
+                 {I(tex), I(put(srv)), I(harness.heap_cpu0 + uint64_t{slot} * 32u)});
+
+        const auto pkts = harness.draw_with_slot(slot);
+        CHECK(count_op(pkts, GpuOpcode::Draw) == 1);
+        const Packet* wt = find_op(pkts, GpuOpcode::WriteTexture);
+        CHECK(wt != nullptr);
+        if (wt != nullptr) {
+            const auto header = payload_as<GpuWriteTexturePayload>(*wt);
+            CHECK(header.texture_id == tex_id);
+            CHECK(header.width == c.width && header.height == c.height && header.depth_or_layers == 1u);
+            CHECK(header.bytes_per_row == 256u && header.rows_per_image == blocks_y);
+            CHECK(header.data_len == 256u * blocks_y);
+            CHECK(wt->payload.size() == sizeof(GpuWriteTexturePayload) + header.data_len);
+            const uint8_t* dst_rows = wt->payload.data() + sizeof(GpuWriteTexturePayload);
+            for (uint32_t y = 0; y < blocks_y; ++y) {
+                CHECK(std::memcmp(dst_rows + size_t{y} * 256u, linear.data() + size_t{y} * tight_row, tight_row) == 0);
+                for (uint32_t p = tight_row; p < 256u; ++p) {
+                    CHECK(dst_rows[size_t{y} * 256u + p] == 0u);
+                }
+            }
+        }
+        ++slot;
+    }
+
+    CHECK(t_balanced);
+    for (uint64_t r : created_resources) {
+        fx.vcall(r, Slot::Release);
+    }
+    harness.release();
+    scene.release_all();
+}
+
+// G49c Test 2: Slot-70 CreateShaderResourceViewAtAddress for a tiled 2D texture at a GPU VA (no
+// ID3D12Resource) creates & caches a real WebGPU CreateTexture2, detiles guest memory, emits
+// exact linear WriteTexture bytes on draw, and destroys it on Device::~Device().
+void test_g49c_slot70_address_texture_draw() {
+    namespace hw = playgta6::gpu::gfx10;
+    namespace xb = dg::xbox;
+    xb::clear_address_texture_views();
+
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    TexturedDrawHarness harness(fx, scene);
+
+    constexpr uint32_t kW = 16, kH = 8, kFmt = 28 /*R8G8B8A8_UNORM*/, kLayout = 0x102 /*Sw256BD*/;
+    constexpr uint32_t kTightRow = kW * 4u;
+    std::vector<uint8_t> linear(size_t{kTightRow} * kH);
+    for (size_t i = 0; i < linear.size(); ++i) {
+        linear[i] = static_cast<uint8_t>((0x50u + i * 7u) | 1u);
+    }
+    hw::TextureLayoutDesc layout_desc{};
+    layout_desc.dxgi_format = kFmt;
+    layout_desc.width = kW;
+    layout_desc.height = kH;
+    layout_desc.depth = 1u;
+    layout_desc.mip_levels = 1u;
+    layout_desc.d3d12_layout = kLayout;
+    std::vector<uint8_t> tiled;
+    CHECK(hw::tile_subresource_for_test(layout_desc, 0u, linear.data(), linear.size(), tiled));
+    const uint64_t gpu_va = put_aligned(tiled, 256);
+
+    uint8_t srv_buf[48] = {};
+    dg::GuestShaderResourceViewDesc srv{};
+    srv.Format = kFmt;
+    srv.ViewDimension = 4;  // TEXTURE2D
+    srv.Shader4ComponentMapping = 0x1688;
+    srv.u[1] = 1;  // MipLevels
+    std::memcpy(srv_buf, &srv, sizeof(srv));
+    std::memcpy(srv_buf + xb::kViewAtAddressOffset, &gpu_va, sizeof(gpu_va));
+    dg::GuestResourceDesc rd = texture_desc(kW, kH, kFmt, 0, 1);
+    rd.Layout = kLayout;
+
+    // First Slot-70 call creates CreateTexture2 and binds the real resource_id into slot 0.
+    const size_t mark_create = fx.captured.size();
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(rd)), I(put_bytes(srv_buf, sizeof(srv_buf))), I(harness.heap_cpu0)});
+    const auto create_pkts = packets_since(fx, mark_create);
+    CHECK(count_op(create_pkts, GpuOpcode::CreateTexture2) == 1);
+    const d3d::ViewDescriptor* v0 = harness.host_heap->view(0);
+    CHECK(v0 != nullptr && v0->kind == d3d::DescriptorKind::Srv && v0->resource_id != 0);
+    const uint32_t tex_id = v0 != nullptr ? v0->resource_id : 0u;
+
+    dg::TrackedTexture tt{};
+    CHECK(dev->tracked_texture_info(tex_id, &tt));
+    CHECK(tt.gpu_va == gpu_va && tt.layout == kLayout && tt.width == kW && tt.height == kH);
+
+    // Second Slot-70 call at the exact same address/geometry reuses the cached resource_id (0 leaks).
+    const size_t mark_reuse = fx.captured.size();
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(rd)), I(put_bytes(srv_buf, sizeof(srv_buf))), I(harness.heap_cpu0 + 32)});
+    CHECK(count_op(packets_since(fx, mark_reuse), GpuOpcode::CreateTexture2) == 0);
+    const d3d::ViewDescriptor* v1 = harness.host_heap->view(1);
+    CHECK(v1 != nullptr && v1->resource_id == tex_id);
+
+    // Draw bound to slot 0 emits WriteTexture with exact detiled linear rows.
+    const auto draw_pkts = harness.draw_with_slot(0);
+    CHECK(count_op(draw_pkts, GpuOpcode::Draw) == 1);
+    const Packet* wt = find_op(draw_pkts, GpuOpcode::WriteTexture);
+    CHECK(wt != nullptr);
+    if (wt != nullptr) {
+        const auto header = payload_as<GpuWriteTexturePayload>(*wt);
+        CHECK(header.texture_id == tex_id && header.width == kW && header.height == kH);
+        CHECK(header.bytes_per_row == 256u && header.rows_per_image == kH);
+        const uint8_t* dst_rows = wt->payload.data() + sizeof(GpuWriteTexturePayload);
+        for (uint32_t y = 0; y < kH; ++y) {
+            CHECK(std::memcmp(dst_rows + size_t{y} * 256u, linear.data() + size_t{y} * kTightRow, kTightRow) == 0);
+        }
+    }
+
+    // Second draw with unchanged guest memory skips redundant WriteTexture.
+    const auto draw_pkts2 = harness.draw_with_slot(0);
+    CHECK(count_op(draw_pkts2, GpuOpcode::Draw) == 1);
+    CHECK(count_op(draw_pkts2, GpuOpcode::WriteTexture) == 0);
+
+    CHECK(t_balanced);
+    harness.release();
+    // Release device and verify cached address texture is destroyed cleanly on Device::~Device().
+    const size_t mark_destroy = fx.captured.size();
+    scene.release_all();
+    bool saw_destroy = false;
+    for (const Packet& p : packets_since(fx, mark_destroy)) {
+        if (p.opcode == GpuOpcode::DestroyResource && payload_as<GpuDestroyResourcePayload>(p).id == tex_id) {
+            saw_destroy = true;
+        }
+    }
+    CHECK(saw_destroy);
+    xb::clear_address_texture_views();
+}
+
+// G49c Test 3: Raw GFX10 T# image descriptor written directly into shader-visible descriptor heap
+// memory (with sw_mode = 2 / 0x102, no ID3D12Resource, no Slot-70 call) resolves via
+// MemorySlotSource::view -> ensure_address_texture, detiles guest memory, and emits WriteTexture.
+void test_g49c_raw_tsharp_descriptor_memory_draw() {
+    namespace hw = playgta6::gpu::gfx10;
+    dg::xbox::clear_address_texture_views();
+
+    Fixture fx;
+    Scene scene(fx);
+    TexturedDrawHarness harness(fx, scene);
+
+    constexpr uint32_t kW = 8, kH = 8, kFmt = 28 /*R8G8B8A8_UNORM*/, kSwMode = 2 /*Sw256BD*/;
+    constexpr uint32_t kLayout = 0x100u | kSwMode;
+    constexpr uint32_t kTightRow = kW * 4u;
+    std::vector<uint8_t> linear(size_t{kTightRow} * kH);
+    for (size_t i = 0; i < linear.size(); ++i) {
+        linear[i] = static_cast<uint8_t>((0x91u + i * 11u) | 1u);
+    }
+    hw::TextureLayoutDesc layout_desc{};
+    layout_desc.dxgi_format = kFmt;
+    layout_desc.width = kW;
+    layout_desc.height = kH;
+    layout_desc.depth = 1u;
+    layout_desc.mip_levels = 1u;
+    layout_desc.d3d12_layout = kLayout;
+    std::vector<uint8_t> tiled;
+    CHECK(hw::tile_subresource_for_test(layout_desc, 0u, linear.data(), linear.size(), tiled));
+    const uint64_t gpu_va = put_aligned(tiled, 256);
+
+    // Write raw GFX10 T# words directly into shader-visible heap slot 3 (bypassing all D3D12 view APIs).
+    hw::HardwareFormat hf{};
+    CHECK(hw::hardware_format(kFmt, &hf));
+    hw::ImageResource img{};
+    img.base = gpu_va;
+    img.format = hf.format;
+    img.dst_sel = hf.swizzle;
+    img.width = kW;
+    img.height = kH;
+    img.depth = 1u;
+    img.base_level = 0u;
+    img.last_level = 0u;
+    img.max_mip = 0u;
+    img.sw_mode = kSwMode;
+    img.type = hw::ImageType::Tex2D;
+    img.resource_level = true;
+    uint32_t words[hw::kImageDwords] = {};
+    hw::encode(img, words);
+    CHECK(hw::classify_slot(words) == hw::SlotContent::Image);
+    CHECK(com::write_guest(harness.heap_cpu0 + 3ull * 32ull, words, sizeof(words)));
+    CHECK(harness.host_heap->view(3)->kind == d3d::DescriptorKind::Empty);
+
+    // Draw bound to slot 3: MemorySlotSource::view resolves the raw T# via ensure_address_texture!
+    const size_t mark_draw1 = fx.captured.size();
+    const auto draw_pkts1 = harness.draw_with_slot(3);
+    const auto all_pkts1 = packets_since(fx, mark_draw1);
+    CHECK(count_op(draw_pkts1, GpuOpcode::Draw) == 1);
+    CHECK(count_op(all_pkts1, GpuOpcode::CreateTexture2) == 1);
+    const Packet* ct = find_op(all_pkts1, GpuOpcode::CreateTexture2);
+    CHECK(ct != nullptr);
+    const uint32_t tex_id = ct != nullptr ? payload_as<GpuCreateTexture2Payload>(*ct).id : 0u;
+    CHECK(tex_id != 0);
+    if (ct != nullptr) {
+        const auto c = payload_as<GpuCreateTexture2Payload>(*ct);
+        CHECK(c.width == kW && c.height == kH && c.depth_or_layers == 1u);
+        CHECK((c.usage_flags & GpuTextureUsage::TextureBinding) != 0);
+        CHECK((c.usage_flags & GpuTextureUsage::CopyDst) != 0);
+    }
+
+    const Packet* wt = find_op(draw_pkts1, GpuOpcode::WriteTexture);
+    CHECK(wt != nullptr);
+    if (wt != nullptr) {
+        const auto header = payload_as<GpuWriteTexturePayload>(*wt);
+        CHECK(header.texture_id == tex_id && header.width == kW && header.height == kH);
+        CHECK(header.bytes_per_row == 256u && header.rows_per_image == kH);
+        const uint8_t* dst_rows = wt->payload.data() + sizeof(GpuWriteTexturePayload);
+        for (uint32_t y = 0; y < kH; ++y) {
+            CHECK(std::memcmp(dst_rows + size_t{y} * 256u, linear.data() + size_t{y} * kTightRow, kTightRow) == 0);
+        }
+    }
+
+    // Second draw reuses the exact same cached texture (0 extra CreateTexture2, 0 extra WriteTexture).
+    const size_t mark_draw2 = fx.captured.size();
+    const auto draw_pkts2 = harness.draw_with_slot(3);
+    const auto all_pkts2 = packets_since(fx, mark_draw2);
+    CHECK(count_op(draw_pkts2, GpuOpcode::Draw) == 1);
+    CHECK(count_op(all_pkts2, GpuOpcode::CreateTexture2) == 0);
+    CHECK(count_op(draw_pkts2, GpuOpcode::WriteTexture) == 0);
+
+    CHECK(t_balanced);
+    harness.release();
+    scene.release_all();
+}
+
 }  // namespace
 
 int main() {
@@ -3625,6 +4038,9 @@ int main() {
     test_xbox_compute_pipeline_dump_and_pack_resolve();
     test_slot70_71_address_texture_view_registry();
     test_xbox_wait_frame_event_monotonic_tokens();
+    test_g49c_default_detile_rgba8_and_bc7();
+    test_g49c_slot70_address_texture_draw();
+    test_g49c_raw_tsharp_descriptor_memory_draw();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

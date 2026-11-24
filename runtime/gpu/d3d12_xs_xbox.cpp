@@ -1121,18 +1121,28 @@ void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDe
         const bridge::WordsStatus ws = bridge::image_words_at_address(va, t, words_record(kind, desc), words);
         tex_view_info.gpu_va = va;
         tex_view_info.dxgi_format = desc.format != 0 ? desc.format : rd.Format;
-        tex_view_info.width = static_cast<uint32_t>(rd.Width);
+        tex_view_info.width = static_cast<uint32_t>(std::min<uint64_t>(rd.Width, uint64_t{0xFFFFFFFFu}));
         tex_view_info.height = rd.Height;
         tex_view_info.depth = rd.DepthOrArraySize == 0 ? 1u : static_cast<uint32_t>(rd.DepthOrArraySize);
         tex_view_info.mip_levels = t.mip_levels;
         tex_view_info.d3d12_layout = rd.Layout;
         tex_view_info.is_uav = uav;
         has_texture_view_info = true;
+        if (rd.Dimension != ResourceDimension::Buffer && rd.SampleCount <= 1) {
+            const GpuTextureDimension tex_dim =
+                rd.Dimension == ResourceDimension::Texture1D
+                    ? GpuTextureDimension::Dim1D
+                    : (rd.Dimension == ResourceDimension::Texture3D ? GpuTextureDimension::Dim3D
+                                                                    : GpuTextureDimension::Dim2D);
+            id = ensure_address_texture(va, tex_view_info.dxgi_format, tex_view_info.width, tex_view_info.height,
+                                        tex_view_info.depth, tex_view_info.mip_levels, tex_view_info.d3d12_layout,
+                                        tex_dim, uav);
+        }
         if (count_texture_view_at_address() == 1) {
             os::log(std::string("d3d12_xs: ") + what + ": first texture view at an address (" + hex(va) + ", format " +
                     std::to_string(rd.Format) + ", " + std::to_string(rd.Width) + "x" + std::to_string(rd.Height) +
                     ", layout " + std::to_string(rd.Layout) + "): image words written (" + bridge::words_status_name(ws) +
-                    "), no GPU texture");
+                    (id != 0 ? "), GPU texture id " + std::to_string(id) : "), no GPU texture"));
         }
     }
     const d3d::Status s = uav ? heaps_.create_unordered_access_view(id, 0, &vd, d3d::CpuDescriptorHandle{dest})
