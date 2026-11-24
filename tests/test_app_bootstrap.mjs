@@ -798,3 +798,139 @@ test('graceful handling of corrupt persisted input profiles and session probe/la
   assert.equal(documentObj.listenerCount(), 0);
   assert.equal(webgpu.canvas.listenerCount(), 0);
 });
+
+test('W45 wires BootTracer, SplashOverlayController, and BootOrchestrator through /api/status discovery and FIRST_PRESENT dismissal', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  const clock = createClock(1000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const listeners = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        listeners.get(type)?.delete(fn);
+      },
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  const splashContainer = makeMockNode('div');
+  const head = makeMockNode('head');
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+  });
+  documentObj.head = head;
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      hasWasmBinary: false,
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpu.canvas,
+    splashContainer,
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    splashOverlayOptions: { fadeMs: 0 },
+    hud,
+    webgpuAdapterFactory: async () => webgpu.adapter,
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+
+  assert.ok(app.bootTracer, 'bootTracer must be exposed');
+  assert.ok(app.splashOverlay, 'splashOverlay must be mounted when splashContainer is provided');
+  assert.ok(app.bootOrchestrator, 'bootOrchestrator must be wired when splashOverlay is active');
+  assert.equal(app.splashOverlay.getState().visible, true);
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.SMOKE);
+
+  // Splash image discovered from /api/status must be applied and dismissed on smoke FIRST_PRESENT.
+  const splashState = app.splashOverlay.getState();
+  assert.equal(splashState.splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(splashState.dismissed, true);
+  assert.equal(splashState.visible, false);
+  assert.equal(app.bootTracer.getSummary().readyForSplash, true);
+
+  await app.destroy();
+  assert.equal(app.splashOverlay.getState().destroyed, true);
+  assert.equal(app.bootOrchestrator.getState().destroyed, true);
+});

@@ -52,7 +52,7 @@
       position: fixed;
       top: 12px;
       left: 12px;
-      z-index: 20;
+      z-index: 10010;
       width: min(410px, calc(100vw - 24px));
       background: var(--surface);
       border: 1px solid var(--border);
@@ -403,6 +403,7 @@
 </head>
 <body>
   <canvas id="viewport"></canvas>
+  <div id="splash-overlay-root"></div>
 
   <div id="hud" role="region" aria-label="playgta6web diagnostics HUD">
     <div class="hud-header">
@@ -512,11 +513,15 @@
     </div>
   </div>
 
+  <script src="./runtime/pgim_preloader.js"></script>
+  <script src="./ui/splash_overlay.js"></script>
+  <script src="./runtime/boot_orchestrator.js"></script>
   <script type="module">
     import { bootstrapPlayGta6App } from './app_bootstrap.js';
     import { HudController } from './ui/hud_controller.js';
 
     const canvas = document.getElementById('viewport');
+    const splashOverlayRoot = document.getElementById('splash-overlay-root');
     const hudEl = document.getElementById('hud');
     const statusDotEl = document.getElementById('hud-status-dot');
     const statusEl = document.getElementById('hud-status');
@@ -805,6 +810,7 @@
     } else {
       const app = bootstrapPlayGta6App({
         canvas,
+        splashContainer: splashOverlayRoot,
         hud: hudApi,
         dataBase: `${location.origin}/data/`,
       });
@@ -872,6 +878,8 @@
 
       window.playgta6App = app;
       window.playgta6HudController = hudController;
+      window.playgta6SplashOverlay = app.splashOverlay;
+      window.playgta6BootOrchestrator = app.bootOrchestrator;
 
       const syncControlStates = () => {
         const isSmoke = app.session.getState() === 'running_smoke';
