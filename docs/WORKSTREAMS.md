@@ -210,6 +210,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Establish the route that makes the title's graphics pipelines renderable (a DXIL path in the title, or a join from native stages to archive DXIL plus state recovered from the register image) and build the guest-layer side of it.
 - [ ] **G47 — First Real Pixels: Resolve the Per-Frame Pass's Shaders by Stage Identity, Emit Its Draw, and Replay the Native Capture Through the WebGPU Path** — `IN PROGRESS` (#483, @Timon-ok) *(follow-up to G37; uses the shader track's tools unmodified; repo tests synthetic)*
   - Connect the pipeline dump, a shader pack keyed by stage identity, draw emission with rect-list expansion, a payload capture and the capture replayer into one rendered frame of the title's per-frame pass.
+- [ ] **G48 — Read the Hardware Descriptors the Title Writes Directly into Its Descriptor Heap (`runtime/gpu/d3d12_xs*`)** — `IN PROGRESS` (#497, @Timon-ok) *(found by G47: table slots written outside the descriptor API bind nothing today; repo tests synthetic)*
+  - Decode directly written buffer, image and sampler descriptor slots with the GPU family's public descriptor-word definitions, resolve their addresses to tracked resources, and bind them at draw and dispatch time.
 
 ---
 
