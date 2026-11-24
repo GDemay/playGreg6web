@@ -648,6 +648,31 @@
     }
 
     /**
+     * Dynamically set or clear the local splash image URL (e.g. after `/api/status`
+     * discovers `/game/xbs_splash.png`). Resets prior image-error state when URL changes.
+     *
+     * @param {string|null|undefined} url
+     * @returns {object} Current controller state.
+     */
+    setSplashImageUrl(url) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      const nextUrl = typeof url === 'string' && url.trim().length > 0 ? url.trim() : null;
+      if (nextUrl !== this._splashImageUrl) {
+        this._splashImageUrl = nextUrl;
+        this._imageFailed = false;
+        this._syncImage();
+      }
+      return this.getState();
+    }
+
+    /** Alias used by BootOrchestrator (W44). */
+    setSplashImage(url) {
+      return this.setSplashImageUrl(url);
+    }
+
+    /**
      * Signal that the first WebGPU / Bink frame has been presented and start the dismiss fade.
      *
      * @param {{ fadeMs?: number }} [options]
