@@ -2866,3 +2866,293 @@ test('W97 render pipeline: RS-4 mismatch falls back to layout:auto and remaps gr
   // PSO #50450 received original bind group 410 WITH dynamic offset [0] untouched
   assert.deepEqual(renderSetBgs[1].args, [0, bgs[1].result, [0]]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// W98: Bind group resource-kind guard & runtime shape/format guards in auto-layout remapper
+// ---------------------------------------------------------------------------------------------
+
+test('W98 BUFFER bound to layoutEntry.texture/storageTexture substitutes dummy view for record.layout while preserving real buffer for W97 auto-layout remap', () => {
+  const gpu = createMockWebGpu();
+  const autoBglMap = new Map();
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    const autoBgl = { kind: 'GPUBindGroupLayout', autoFor: pipe.handle };
+    autoBglMap.set(pipe, autoBgl);
+    pipe.getBindGroupLayout = (groupIndex) => {
+      if (groupIndex !== 0) throw new Error(`invalid group ${groupIndex}`);
+      return autoBgl;
+    };
+    return pipe;
+  };
+
+  // Strict WebGPU createBindGroup validator mimicking Dawn's resource-kind checks.
+  const origCreateBg = gpu.device.createBindGroup.bind(gpu.device);
+  gpu.device.createBindGroup = (desc) => {
+    const layoutEntries = (desc.layout && desc.layout.desc && desc.layout.desc.entries) || [];
+    for (const e of desc.entries) {
+      const le = layoutEntries.find((x) => x.binding === e.binding);
+      if (!le) continue;
+      if (le.texture || le.storageTexture) {
+        if (!e.resource || (typeof e.resource === 'object' && 'buffer' in e.resource) || e.resource.kind !== 'GPUTextureView') {
+          throw new Error(`Binding entry textureView not set at binding ${e.binding}`);
+        }
+      } else if (le.buffer) {
+        if (!e.resource || typeof e.resource !== 'object' || !('buffer' in e.resource) || !e.resource.buffer) {
+          throw new Error(`Binding entry buffer not set at binding ${e.binding}`);
+        }
+      } else if (le.sampler) {
+        if (!e.resource || e.resource.kind !== 'GPUSampler') {
+          throw new Error(`Binding entry sampler not set at binding ${e.binding}`);
+        }
+      }
+    }
+    return origCreateBg(desc);
+  };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // Compute WGSL with read-only storage buffer @0, texture_2d<f32> sampled via textureLoad @1,
+  // and uniform buffer @2.
+  const csWgsl = [
+    '@group(0) @binding(0) var<storage, read> structured_srv: array<u32>;',
+    '@group(0) @binding(1) var tex_unfilt: texture_2d<f32>;',
+    '@group(0) @binding(2) var<uniform> cb0: vec4<f32>;',
+    '@compute @workgroup_size(8, 1, 1)',
+    'fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {',
+    '  let v = structured_srv[gid.x];',
+    '  let t = textureLoad(tex_unfilt, vec2<i32>(i32(v), 0), 0);',
+    '  _ = t + cb0;',
+    '}',
+  ].join('\n');
+
+  // Root-signature layout declares SRV binding 4 as texture_2d (matching D3D12 SRV -> texture_2d)
+  // and binding 5 as storageTexture, plus binding 0 as uniform buffer.
+  const bglEntries = [
+    { binding: 0, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 }, // uniform buffer
+    { binding: 4, visibility: 4, type: 2, subtype: 0, dimension: 2 }, // texture (StructuredBuffer SRV bound here!)
+    { binding: 5, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: formatCodeOf('rgba8unorm') }, // storageTexture (RWStructuredBuffer UAV bound here!)
+  ];
+
+  const stream = concat(
+    new Stream()
+      .shader(10, 2, csWgsl)
+      .buffer(101, 0x0080 | 0x0008, 512) // STORAGE-only StructuredBuffer SRV
+      .buffer(102, 0x0040 | 0x0080 | 0x0008, 256) // UNIFORM | STORAGE buffer
+      .buffer(103, 0x0080 | 0x0008, 128) // STORAGE-only buffer bound to uniform slot 0 (usage mismatch!)
+      .bytes(),
+    bindGroupLayoutPacket(200, bglEntries),
+    pipelineLayoutPacket(201, [200]),
+    createComputePipeline2Packet(300, 10, 201),
+    // Bind STORAGE-only buffer 103 to uniform@0 (usage mismatch),
+    // StructuredBuffer SRV 101 to texture@4 (kind mismatch!),
+    // UNIFORM|STORAGE buffer 102 to storageTexture@5 (kind mismatch!).
+    bindGroup2Packet(400, 200, [
+      { binding: 0, type: 0, id: 103, offset: 0, size: 128 },
+      { binding: 4, type: 0, id: 101, offset: 0, size: 512 },
+      { binding: 5, type: 0, id: 102, offset: 0, size: 256 },
+    ]),
+    new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [300]).bytes(),
+    setBindGroup2Packet(0, 400, []),
+    new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 2, 'expected original bind group + auto-layout remapped bind group');
+
+  // 1) Original bind group against record.layout must have substituted dummies for all mismatched slots!
+  const origBg = bgs[0];
+  assert.notEqual(
+    origBg.desc.entries[0].resource.buffer,
+    processor.buffers.get(103),
+    'STORAGE-only buffer bound to uniform layout slot must receive dummy buffer'
+  );
+  assert.equal(
+    origBg.desc.entries[1].resource.kind,
+    'GPUTextureView',
+    'BUFFER bound to layoutEntry.texture slot must receive dummy GPUTextureView, never { buffer }'
+  );
+  assert.equal('buffer' in origBg.desc.entries[1].resource, false);
+  assert.equal(
+    origBg.desc.entries[2].resource.kind,
+    'GPUTextureView',
+    'BUFFER bound to layoutEntry.storageTexture slot must receive dummy GPUTextureView'
+  );
+
+  // 2) descriptorResources must preserve the real buffers classified by their ACTUAL type/usage!
+  const bgDesc = handler.bindGroupDescriptors.get(400);
+  assert.ok(bgDesc);
+  assert.equal(bgDesc.resources.length, 3);
+  assert.equal(bgDesc.resources[0].kind, 'storage');
+  assert.equal(bgDesc.resources[0].isDummy, false);
+  assert.equal(bgDesc.resources[0].resource.buffer, processor.buffers.get(103));
+  assert.equal(bgDesc.resources[1].kind, 'storage');
+  assert.equal(bgDesc.resources[1].isDummy, false);
+  assert.equal(bgDesc.resources[1].resource.buffer, processor.buffers.get(101));
+  assert.equal(bgDesc.resources[2].kind, 'uniform');
+  assert.equal(bgDesc.resources[2].isDummy, false);
+  assert.equal(bgDesc.resources[2].resource.buffer, processor.buffers.get(102));
+
+  // 3) W97 auto-layout remapped bind group:
+  //    - binding 0 (var<storage, read>) gets a real STORAGE buffer (103 or 101)
+  //    - binding 1 (texture_2d<f32>) NEVER gets { buffer }; receives a valid dummy GPUTextureView!
+  //    - binding 2 (var<uniform>) gets real UNIFORM|STORAGE buffer 102!
+  const remappedBg = bgs[1];
+  assert.equal(remappedBg.desc.layout, autoBglMap.get(gpu.results('createComputePipeline')[0].result));
+  assert.equal(remappedBg.desc.entries[0].resource.buffer, processor.buffers.get(103));
+  assert.equal(remappedBg.desc.entries[1].resource.kind, 'GPUTextureView');
+  assert.equal('buffer' in remappedBg.desc.entries[1].resource, false);
+  assert.equal(remappedBg.desc.entries[2].resource.buffer, processor.buffers.get(102));
+
+  // Deduplicated telemetry warnings emitted for kind mismatch and buffer usage mismatch
+  const warnings = handler.getTelemetry().warnings;
+  assert.ok(warnings.some((w) => /binding 4 buffer resource mismatches layout entry/.test(w)));
+  assert.ok(warnings.some((w) => /binding 0 buffer usage .* lacks required uniform usage/.test(w)));
+});
+
+test('W98 TEXTURE_VIEW and SAMPLER bound to layoutEntry.buffer substitute dummy buffers while preserving real texture/sampler for auto-layout remap', () => {
+  const gpu = createMockWebGpu();
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    pipe.getBindGroupLayout = () => ({ kind: 'GPUBindGroupLayout', autoFor: pipe.handle });
+    return pipe;
+  };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const csWgsl = [
+    '@group(0) @binding(0) var tex0: texture_2d<f32>;',
+    '@group(0) @binding(1) var samp0: sampler;',
+    '@compute @workgroup_size(1, 1, 1)',
+    'fn cs_main() { let c = textureSampleLevel(tex0, samp0, vec2<f32>(0.5), 0.0); _ = c; }',
+  ].join('\n');
+
+  // Layout expects two uniform buffers at 0 and 1, but packet binds a TEXTURE_VIEW at 0 and SAMPLER at 1.
+  const bglEntries = [
+    { binding: 0, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 },
+    { binding: 1, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 },
+  ];
+
+  const stream = concat(
+    new Stream().shader(10, 2, csWgsl).bytes(),
+    createTexture2Packet({ id: 50, width: 16, height: 16, format: formatCodeOf('rgba8unorm'), usage: 0x04 }),
+    createSampler2Packet(51, { filter: 1 }),
+    bindGroupLayoutPacket(200, bglEntries),
+    pipelineLayoutPacket(201, [200]),
+    createComputePipeline2Packet(300, 10, 201),
+    bindGroup2Packet(400, 200, [
+      { binding: 0, type: 1, id: 50 },
+      { binding: 1, type: 2, id: 51 },
+    ]),
+    new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [300]).bytes(),
+    setBindGroup2Packet(0, 400, []),
+    new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const [origBg, remappedBg] = gpu.results('createBindGroup');
+  // Original bind group received dummy { buffer } objects at both buffer slots
+  assert.ok(origBg.desc.entries[0].resource && 'buffer' in origBg.desc.entries[0].resource);
+  assert.ok(origBg.desc.entries[1].resource && 'buffer' in origBg.desc.entries[1].resource);
+
+  // descriptorResources preserved real GPUTextureView as 'texture' and real GPUSampler as 'sampler'
+  const bgDesc = handler.bindGroupDescriptors.get(400);
+  assert.equal(bgDesc.resources[0].kind, 'texture');
+  assert.equal(bgDesc.resources[0].isDummy, false);
+  assert.equal(bgDesc.resources[0].resource.textureHandle, processor.textures.get(50).handle);
+  assert.equal(bgDesc.resources[1].kind, 'sampler');
+  assert.equal(bgDesc.resources[1].isDummy, false);
+  assert.equal(bgDesc.resources[1].resource, processor.samplers.get(51));
+
+  // Remapped bind group bound the REAL texture 50 and REAL sampler 51!
+  assert.equal(remappedBg.desc.entries[0].resource.textureHandle, processor.textures.get(50).handle);
+  assert.equal(remappedBg.desc.entries[1].resource, processor.samplers.get(51));
+});
+
+test('W98 pickResourceForBinding shape guards reject poisoned resources and enforce texture format/sampleType compatibility', () => {
+  const gpu = createMockWebGpu();
+  gpu.device.features = new Set(); // no float32-filterable
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const bufObj = gpu.device.createBuffer({ size: 256, usage: 0x0040 | 0x0080 | 0x0008 });
+  const texR32F = gpu.device.createTexture({
+    size: { width: 8, height: 8, depthOrArrayLayers: 1 },
+    format: 'r32float',
+    usage: 0x04,
+  });
+  const texDepth = gpu.device.createTexture({
+    size: { width: 8, height: 8, depthOrArrayLayers: 1 },
+    format: 'depth32float',
+    usage: 0x04,
+  });
+  const texUint = gpu.device.createTexture({
+    size: { width: 8, height: 8, depthOrArrayLayers: 1 },
+    format: 'r32uint',
+    usage: 0x04,
+  });
+  const viewR32F = texR32F.createView({ dimension: '2d' });
+  const viewDepth = texDepth.createView({ dimension: '2d' });
+  const viewUint = texUint.createView({ dimension: '2d' });
+  const samplerObj = gpu.device.createSampler({});
+
+  const autoBgl = { kind: 'GPUBindGroupLayout', autoFor: 'poison-test' };
+  const fakePipe = { getBindGroupLayout: () => autoBgl };
+
+  // Poisoned descriptor: a { buffer } tagged as 'texture', a textureView tagged as 'storage',
+  // a { buffer } tagged as 'sampler', plus unfilterable r32float / depth32float / r32uint views.
+  const poisonedDesc = {
+    id: 777,
+    layoutId: 1,
+    resources: [
+      { binding: 0, kind: 'texture', resource: { buffer: bufObj, offset: 0, size: 256 }, isDummy: false },
+      { binding: 1, kind: 'storage', resource: viewR32F, bufferUsage: 0x0080, isDummy: false },
+      { binding: 2, kind: 'sampler', resource: { buffer: bufObj, offset: 0, size: 256 }, isDummy: false },
+      { binding: 3, kind: 'uniform', resource: samplerObj, bufferUsage: 0x0040, isDummy: false },
+      { binding: 4, kind: 'texture', resource: viewR32F, textureUsage: 0x04, textureFormat: 'r32float', viewDimension: '2d', isDummy: false },
+      { binding: 5, kind: 'texture', resource: viewDepth, textureUsage: 0x04, textureFormat: 'depth32float', viewDimension: '2d', isDummy: false },
+      { binding: 6, kind: 'texture', resource: viewUint, textureUsage: 0x04, textureFormat: 'r32uint', viewDimension: '2d', isDummy: false },
+    ],
+  };
+
+  const wgslBindings = [
+    { binding: 0, kind: 'texture', viewDimension: '2d' }, // f32 texture: must reject { buffer }, r32float (unfilterable), depth32float, r32uint -> dummy rgba8unorm!
+    { binding: 1, kind: 'read-only-storage' }, // must reject viewR32F -> dummy buffer!
+    { binding: 2, kind: 'sampler' }, // must reject { buffer } -> dummy sampler!
+    { binding: 3, kind: 'uniform' }, // must reject samplerObj -> dummy buffer!
+    { binding: 4, kind: 'texture', viewDimension: '2d', sampleType: 'depth' }, // matches real viewDepth!
+    { binding: 5, kind: 'texture', viewDimension: '2d', sampleType: 'uint' }, // matches real viewUint!
+  ];
+
+  const remapped = handler._getOrCreateRemappedBindGroup(true, 999, fakePipe, wgslBindings, 777, poisonedDesc);
+  assert.equal(remapped.status, 'ok');
+
+  const [bg] = gpu.results('createBindGroup');
+  // binding 0: dummy rgba8unorm GPUTextureView (NEVER { buffer }, NEVER r32float/depth/uint!)
+  assert.equal(bg.desc.entries[0].resource.kind, 'GPUTextureView');
+  assert.equal('buffer' in bg.desc.entries[0].resource, false);
+  assert.notEqual(bg.desc.entries[0].resource, viewR32F);
+  assert.notEqual(bg.desc.entries[0].resource, viewDepth);
+  assert.notEqual(bg.desc.entries[0].resource, viewUint);
+  // binding 1: dummy { buffer } (NEVER viewR32F!)
+  assert.ok(bg.desc.entries[1].resource && 'buffer' in bg.desc.entries[1].resource && bg.desc.entries[1].resource.buffer);
+  assert.notEqual(bg.desc.entries[1].resource, viewR32F);
+  // binding 2: dummy GPUSampler (NEVER { buffer }!)
+  assert.equal(bg.desc.entries[2].resource.kind, 'GPUSampler');
+  assert.equal('buffer' in bg.desc.entries[2].resource, false);
+  // binding 3: dummy { buffer } (NEVER samplerObj!)
+  assert.ok(bg.desc.entries[3].resource && 'buffer' in bg.desc.entries[3].resource && bg.desc.entries[3].resource.buffer);
+  assert.notEqual(bg.desc.entries[3].resource, samplerObj);
+  // binding 4: real depth32float view matched sampleType:'depth'
+  assert.equal(bg.desc.entries[4].resource, viewDepth);
+  // binding 5: real r32uint view matched sampleType:'uint'
+  assert.equal(bg.desc.entries[5].resource, viewUint);
+});
