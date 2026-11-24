@@ -1064,3 +1064,33 @@ test('W86 regression: bare manifest runtimeJs resolves under dist/ so runtime.wa
     'http://127.0.0.1:8080/dist/guest_part_0.wasm',
   );
 });
+
+test('W94 buildRuntimeModuleConfig preRun publishes bound module to globalThis.__playgta6RuntimeModule', () => {
+  const hadPrev = Object.prototype.hasOwnProperty.call(globalThis, '__playgta6RuntimeModule');
+  const prevValue = globalThis.__playgta6RuntimeModule;
+  try {
+    delete globalThis.__playgta6RuntimeModule;
+
+    const cfg = buildRuntimeModuleConfig({
+      locationHref: 'http://127.0.0.1:8080/loader.js',
+    });
+    assert.ok(Array.isArray(cfg.preRun) && cfg.preRun.length >= 1);
+    assert.equal(typeof cfg.preRun[0], 'function');
+
+    const mockModule = {
+      wasmMemory: new WebAssembly.Memory({ initial: 1 }),
+      exports: { _start: () => {} },
+    };
+    cfg.preRun[0](mockModule);
+    assert.equal(globalThis.__playgta6RuntimeModule, mockModule);
+
+    cfg.preRun[0](null);
+    assert.equal(globalThis.__playgta6RuntimeModule, null);
+  } finally {
+    if (hadPrev) {
+      globalThis.__playgta6RuntimeModule = prevValue;
+    } else {
+      delete globalThis.__playgta6RuntimeModule;
+    }
+  }
+});

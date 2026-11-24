@@ -2433,6 +2433,9 @@ function buildRuntimeModuleConfig(options = {}) {
     : [
         (mod) => {
           boundModule = mod || null;
+          if (typeof globalThis !== 'undefined') {
+            globalThis.__playgta6RuntimeModule = boundModule;
+          }
           if (
             mod &&
             (mod.wasmMemory || (mod.HEAPU8 && mod.HEAPU8.buffer)) &&
