@@ -2191,28 +2191,44 @@ fn lower_stage_io(
 // ---------------------------------------------------------------------------
 
 /// Sanitize a file path into a relative forward-slash path or basename only (zero host paths).
+///
+/// Normalizes both `\` and `/` separators before prefix stripping so Windows and POSIX paths
+/// sanitize identically regardless of host OS.
 pub fn sanitize_source_path(path: &Path, base_dir: Option<&Path>) -> String {
-    let candidate = if let Some(base) = base_dir {
-        match path.strip_prefix(base) {
-            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
-            _ => path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown.dxil".to_string()),
+    let norm_path = path.to_string_lossy().replace('\\', "/");
+
+    let relative_opt = base_dir.and_then(|base| {
+        let norm_base = base.to_string_lossy().replace('\\', "/");
+        let trimmed_base = norm_base.trim_end_matches('/');
+        if trimmed_base.is_empty() {
+            return None;
         }
-    } else {
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown.dxil".to_string())
-    };
-    let normalized = candidate.replace('\\', "/");
-    let trimmed = normalized.trim_start_matches('/');
-    // Guard against Windows drive prefixes (e.g. "C:/...") ever leaking through.
-    let without_drive = if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
-        trimmed
+        let rest = norm_path.strip_prefix(trimmed_base)?;
+        if let Some(after_sep) = rest.strip_prefix('/')
+            && !after_sep.is_empty()
+        {
+            Some(after_sep.to_string())
+        } else {
+            None
+        }
+    });
+
+    let candidate = relative_opt.unwrap_or_else(|| {
+        norm_path
+            .trim_end_matches('/')
             .rsplit('/')
             .next()
             .unwrap_or("unknown.dxil")
+            .to_string()
+    });
+
+    let trimmed = candidate.trim_start_matches('/');
+    // Guard against Windows drive prefixes (e.g. "C:/..." or "C:") ever leaking through.
+    let without_drive = if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
+        match trimmed.rsplit_once('/') {
+            Some((_, tail)) if !tail.is_empty() => tail,
+            _ => "unknown.dxil",
+        }
     } else {
         trimmed
     };
@@ -3637,9 +3653,13 @@ mod tests {
         assert_eq!(s6.pipeline_layouts, m_ab.pipeline_layouts);
         assert_eq!(s6.shaders.len(), 2);
 
-        // Verify path sanitization strips host paths & drive letters completely
+        // Verify path sanitization strips host paths & drive letters identically on POSIX and Windows
         assert_eq!(
             sanitize_source_path(Path::new("/Users/alice/secret/shaders/sky.dxil"), None),
+            "sky.dxil"
+        );
+        assert_eq!(
+            sanitize_source_path(Path::new(r"C:\Games\SecretTitle\shaders\sky.dxil"), None),
             "sky.dxil"
         );
         assert_eq!(
@@ -3648,6 +3668,20 @@ mod tests {
                 Some(Path::new(r"C:\Games\SecretTitle\shaders")),
             ),
             "nested/sky.dxil"
+        );
+        assert_eq!(
+            sanitize_source_path(
+                Path::new("/home/runner/work/shaders/nested/sky.dxil"),
+                Some(Path::new("/home/runner/work/shaders/")),
+            ),
+            "nested/sky.dxil"
+        );
+        assert_eq!(
+            sanitize_source_path(
+                Path::new("/home/runner/shaders_other/sky.dxil"),
+                Some(Path::new("/home/runner/shaders")),
+            ),
+            "sky.dxil"
         );
     }
 
