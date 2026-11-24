@@ -2523,15 +2523,295 @@ class WgpuCommandProcessor {
   }
 }
 
+const DEFAULT_TELEMETRY_INTERVAL_MS = 250;
+const DEFAULT_TELEMETRY_MISSING_LIMIT = 64;
+
+function toNonNegativeInt(value, fallback = 0) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function toNonNegativeFinite(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return n;
+}
+
+function sanitizeTelemetryStage(stage) {
+  if (typeof stage === 'number') {
+    return WGPK_STAGE_NAMES[stage] || 'unknown';
+  }
+  if (typeof stage === 'string') {
+    const key = stage.trim().toLowerCase();
+    if (key === 'vertex' || key === 'vs' || key === 'vert' || key === '1') {
+      return 'vertex';
+    }
+    if (
+      key === 'fragment' ||
+      key === 'fs' ||
+      key === 'frag' ||
+      key === 'pixel' ||
+      key === 'ps' ||
+      key === '2'
+    ) {
+      return 'fragment';
+    }
+    if (key === 'compute' || key === 'cs' || key === 'comp' || key === '3') {
+      return 'compute';
+    }
+  }
+  return 'unknown';
+}
+
+function sanitizeMissingShaderRecord(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+  const rawHash =
+    entry.hash !== undefined
+      ? entry.hash
+      : entry.shaderHash !== undefined
+        ? entry.shaderHash
+        : entry.hashHex;
+  const hashBigInt = normalizeShaderHashBigInt(rawHash);
+  if (hashBigInt === null) {
+    return null;
+  }
+  const hash = formatShaderHashHex(hashBigInt);
+  const stage = sanitizeTelemetryStage(entry.stage);
+  const rawHits =
+    entry.hitCount !== undefined
+      ? entry.hitCount
+      : entry.hits !== undefined
+        ? entry.hits
+        : entry.drawCount !== undefined
+          ? entry.drawCount
+          : entry.count;
+  const hitCount = rawHits === undefined || rawHits === null ? 1 : toNonNegativeInt(rawHits, 0);
+  const firstSeenMs = toNonNegativeFinite(entry.firstSeenMs);
+  const lastSeenMs = toNonNegativeFinite(entry.lastSeenMs);
+
+  const sanitized = {
+    hash,
+    stage,
+    hits: hitCount,
+    hitCount,
+  };
+  if (firstSeenMs !== null) {
+    sanitized.firstSeenMs = firstSeenMs;
+  }
+  if (lastSeenMs !== null) {
+    sanitized.lastSeenMs = lastSeenMs;
+  }
+  return sanitized;
+}
+
+/**
+ * Build a sanitized `{ type: 'gpu-telemetry', frameStats, fallbackStats, missingShaders, timestamp }`
+ * payload matching `GpuBootPanelController.update(...)` (zero host paths, zero raw bytes).
+ *
+ * @param {WgpuCommandProcessor | object | null | undefined} processor
+ * @param {{ limit?: number, missingShaderLimit?: number, timestamp?: number, now?: () => number }} [options]
+ */
+function buildGpuTelemetrySnapshot(processor, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const rawLimit =
+    opts.limit !== undefined
+      ? opts.limit
+      : opts.missingShaderLimit !== undefined
+        ? opts.missingShaderLimit
+        : DEFAULT_TELEMETRY_MISSING_LIMIT;
+  const limit =
+    Number.isInteger(rawLimit) && rawLimit >= 0 ? rawLimit : DEFAULT_TELEMETRY_MISSING_LIMIT;
+
+  let stats = null;
+  if (processor && typeof processor.getStats === 'function') {
+    try {
+      stats = processor.getStats();
+    } catch (_) {
+      stats = null;
+    }
+  }
+
+  let rawFallback = null;
+  if (processor && typeof processor.getShaderFallbackStats === 'function') {
+    try {
+      rawFallback = processor.getShaderFallbackStats();
+    } catch (_) {
+      rawFallback = null;
+    }
+  } else if (stats && stats.shaderFallback && typeof stats.shaderFallback === 'object') {
+    rawFallback = stats.shaderFallback;
+  }
+
+  let rawMissing = [];
+  if (processor && typeof processor.getMissingShaders === 'function') {
+    try {
+      const list = processor.getMissingShaders({ limit });
+      if (Array.isArray(list)) {
+        rawMissing = list;
+      }
+    } catch (_) {
+      rawMissing = [];
+    }
+  }
+
+  const missingShaders = [];
+  for (let i = 0; i < rawMissing.length && missingShaders.length < limit; i += 1) {
+    const clean = sanitizeMissingShaderRecord(rawMissing[i]);
+    if (clean) {
+      missingShaders.push(clean);
+    }
+  }
+
+  const framesPresented = toNonNegativeInt(
+    stats && stats.frameCount !== undefined
+      ? stats.frameCount
+      : stats && stats.framesPresented !== undefined
+        ? stats.framesPresented
+        : processor && processor.frameCount,
+    0
+  );
+  const droppedFrames = toNonNegativeInt(stats && stats.droppedFrames, 0);
+  const drawCalls = toNonNegativeInt(stats && stats.drawCalls, 0);
+  const computeDispatches = toNonNegativeInt(stats && stats.computeDispatches, 0);
+  const packetsProcessed = toNonNegativeInt(
+    stats && stats.packetCount !== undefined
+      ? stats.packetCount
+      : stats && stats.packetsProcessed,
+    0
+  );
+
+  const packHits = toNonNegativeInt(rawFallback && rawFallback.packHits, 0);
+  const fallbackHits = toNonNegativeInt(rawFallback && rawFallback.fallbackHits, 0);
+  const builtinHits = toNonNegativeInt(rawFallback && rawFallback.builtinHits, 0);
+  const sumHits = packHits + fallbackHits + builtinHits;
+  const totalLookups =
+    rawFallback && rawFallback.totalLookups !== undefined && rawFallback.totalLookups !== null
+      ? toNonNegativeInt(rawFallback.totalLookups, sumHits)
+      : rawFallback && rawFallback.totalResolves !== undefined && rawFallback.totalResolves !== null
+        ? toNonNegativeInt(rawFallback.totalResolves, sumHits)
+        : sumHits;
+  const uniqueMissing =
+    rawFallback && rawFallback.uniqueMissing !== undefined && rawFallback.uniqueMissing !== null
+      ? toNonNegativeInt(rawFallback.uniqueMissing, missingShaders.length)
+      : rawFallback && rawFallback.missingCount !== undefined && rawFallback.missingCount !== null
+        ? toNonNegativeInt(rawFallback.missingCount, missingShaders.length)
+        : missingShaders.length;
+  const overflowMissingCount = toNonNegativeInt(rawFallback && rawFallback.overflowMissingCount, 0);
+
+  let hitRatePct;
+  if (
+    rawFallback &&
+    rawFallback.hitRatePct !== undefined &&
+    rawFallback.hitRatePct !== null &&
+    Number.isFinite(Number(rawFallback.hitRatePct))
+  ) {
+    const clamped = Math.min(100, Math.max(0, Number(rawFallback.hitRatePct)));
+    hitRatePct = Math.round(clamped * 100) / 100;
+  } else {
+    hitRatePct = totalLookups > 0 ? Math.round((packHits / totalLookups) * 10000) / 100 : 0;
+  }
+
+  let timestamp;
+  if (typeof opts.timestamp === 'number' && Number.isFinite(opts.timestamp)) {
+    timestamp = opts.timestamp;
+  } else if (typeof opts.now === 'function') {
+    const t = opts.now();
+    timestamp = typeof t === 'number' && Number.isFinite(t) ? t : Date.now();
+  } else {
+    timestamp = Date.now();
+  }
+
+  return {
+    type: 'gpu-telemetry',
+    frameStats: {
+      framesPresented,
+      droppedFrames,
+      drawCalls,
+      computeDispatches,
+      packetsProcessed,
+    },
+    fallbackStats: {
+      totalLookups,
+      totalResolves: totalLookups,
+      packHits,
+      fallbackHits,
+      builtinHits,
+      hitRatePct,
+      uniqueMissing,
+      missingCount: uniqueMissing,
+      overflowMissingCount,
+    },
+    missingShaders,
+    timestamp,
+  };
+}
+
 function createWgpuWorkerHandler(options = {}) {
   const postMessage =
     typeof options.postMessage === 'function' ? options.postMessage : () => {};
   const injectedRingCtor =
     typeof options.GpuRingBuffer === 'function' ? options.GpuRingBuffer : null;
+  const telemetryIntervalMs =
+    typeof options.telemetryIntervalMs === 'number' &&
+    Number.isFinite(options.telemetryIntervalMs) &&
+    options.telemetryIntervalMs >= 0
+      ? options.telemetryIntervalMs
+      : DEFAULT_TELEMETRY_INTERVAL_MS;
+  const telemetryMissingLimit =
+    Number.isInteger(options.telemetryMissingLimit) && options.telemetryMissingLimit >= 0
+      ? options.telemetryMissingLimit
+      : DEFAULT_TELEMETRY_MISSING_LIMIT;
+  const telemetryNow = typeof options.now === 'function' ? options.now : () => Date.now();
   let canvas = options.canvas || null;
   let processor = options.processor || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
   let preloadedInDefaultInit = false;
+  let lastTelemetryEmitMs = -Infinity;
+
+  function emitTelemetry(overrideOptions = {}) {
+    const ts = telemetryNow();
+    const snap = buildGpuTelemetrySnapshot(processor, {
+      limit:
+        overrideOptions.limit !== undefined ? overrideOptions.limit : telemetryMissingLimit,
+      timestamp: ts,
+    });
+    if (overrideOptions.id !== undefined) {
+      snap.id = overrideOptions.id;
+    }
+    postMessage(snap);
+    return snap;
+  }
+
+  function maybeEmitFrameTelemetry(prevFrameCount, nextFrameCount) {
+    if (nextFrameCount <= prevFrameCount) {
+      return false;
+    }
+    const nowMs = telemetryNow();
+    const reachedFirstFrame = prevFrameCount === 0 && nextFrameCount >= 1;
+    const isFrameOne = nextFrameCount === 1;
+    const throttleElapsed =
+      lastTelemetryEmitMs === -Infinity || nowMs - lastTelemetryEmitMs >= telemetryIntervalMs;
+
+    if (reachedFirstFrame || isFrameOne || throttleElapsed) {
+      lastTelemetryEmitMs = nowMs;
+      emitTelemetry();
+      return true;
+    }
+    return false;
+  }
 
   async function preloadBootShaderAssets(targetProcessor, initPayload = {}) {
     const summary = {
@@ -2743,6 +3023,7 @@ function createWgpuWorkerHandler(options = {}) {
         );
         if (created && created !== processor) {
           processor = created;
+          lastTelemetryEmitMs = -Infinity;
         }
         if (payload.ringSab || payload.ring) {
           attachRingFromMessage(payload);
@@ -2772,6 +3053,11 @@ function createWgpuWorkerHandler(options = {}) {
           reflectionLoaded: true,
           shaderCount: stats.reflectionShaderCount,
         });
+      } else if (payload.type === 'request-gpu-telemetry') {
+        emitTelemetry({
+          id: payload.id,
+          limit: payload.limit,
+        });
       } else if (payload.missingShaders && processor) {
         const missingOpts =
           payload.limit !== undefined ? { limit: payload.limit } : undefined;
@@ -2796,15 +3082,26 @@ function createWgpuWorkerHandler(options = {}) {
           processor.destroy();
         }
         postMessage({ id: payload.id, destroyed: true });
-      } else if (payload.drainRing && processor) {
+      } else if ((payload.drainRing || payload.type === 'drain-ring') && processor) {
+        const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.drainRing();
         if (result.presents > 0) {
           postMessage({ frame: result.frameCount });
+          maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
-      } else if (payload.cmdBuffer && processor) {
-        const result = processor.executeCommandBuffer(payload.cmdBuffer);
+      } else if (
+        processor &&
+        (payload.cmdBuffer ||
+          ((payload.type === 'submit' || payload.type === 'executeBatch') &&
+            (payload.buffer || payload.commands || payload.data)))
+      ) {
+        const batchBuffer =
+          payload.cmdBuffer || payload.buffer || payload.commands || payload.data;
+        const prevFrames = toNonNegativeInt(processor.frameCount, 0);
+        const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
           postMessage({ frame: result.frameCount });
+          maybeEmitFrameTelemetry(prevFrames, result.frameCount);
         }
       }
     } catch (err) {
@@ -2826,6 +3123,9 @@ function createWgpuWorkerHandler(options = {}) {
 const exportedApi = {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
+  buildGpuTelemetrySnapshot,
+  DEFAULT_TELEMETRY_INTERVAL_MS,
+  DEFAULT_TELEMETRY_MISSING_LIMIT,
   InlineWgslPackCache,
   parseHashOnlyShaderPayload,
   resolveGpuRingBuffer,
