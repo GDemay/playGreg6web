@@ -236,8 +236,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Build vertex layouts and bind-group layouts for pack-resolved pipelines from each stage's reflection joined to the D3D12 input layout and root signature, instead of numbering conventions.
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
-- [ ] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `IN PROGRESS` (#678, @Timon-ok) *(G64 follow-up)*
+- [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
   - Settle the linear multi-mip rule with a boot probe and make allocation info, XG GetResourceLayout and uploads agree.
+- [ ] **G66 — Where Streamed Texture Data Lands: DirectStorage Destinations, Decompression and the Textures the Steady-State Passes Sample** — `IN PROGRESS` (#691, @Timon-ok)
+  - Trace DirectStorage requests to their destinations and the textures the steady-state draws bind; fix runtime gaps, report formats that need a decoder.
 
 ---
 
