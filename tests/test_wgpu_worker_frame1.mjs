@@ -12,7 +12,12 @@ const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
 const wgpuMod = require('../web/workers/wgpu_worker.js');
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const fallbackMod = require('../web/workers/shader_fallback_router.js');
+const renderStateMod = require('../web/workers/render_state_packets.js');
 const { default: RuntimeSessionController } = await import('../web/runtime/session_controller.js');
+const {
+  SHADER_STAGE: WGPK_SHADER_STAGE,
+  buildWgslPackBuffer,
+} = await import('../web/workers/wgsl_pack_loader.js');
 
 const {
   WgpuCommandProcessor,
@@ -34,6 +39,7 @@ const {
 
 const { WgpuSwapchain } = swapchainMod;
 const { ShaderFallbackRouter, BUILTIN_FALLBACK_PROFILES } = fallbackMod;
+const { installRenderStatePackets, SWAPCHAIN_TEXTURE_ID } = renderStateMod;
 
 class PacketBuilder {
   constructor() {
@@ -190,6 +196,128 @@ class PacketBuilder {
     return this;
   }
 
+  createBindGroupLayout(id, entries = [], { flags = 0, contentId = 0n } = {}) {
+    const buf = new ArrayBuffer(24 + entries.length * 24);
+    const view = new DataView(buf);
+    view.setUint32(0, id, true);
+    view.setUint32(4, entries.length, true);
+    view.setUint32(8, flags, true);
+    view.setBigUint64(16, contentId, true);
+    for (let i = 0; i < entries.length; i += 1) {
+      const e = entries[i];
+      const o = 24 + i * 24;
+      view.setUint32(o, e.binding, true);
+      view.setUint32(o + 4, e.visibility ?? 3, true);
+      view.setUint8(o + 8, e.type);
+      view.setUint8(o + 9, e.subtype || 0);
+      view.setUint8(o + 10, e.dimension || 0);
+      view.setUint8(o + 11, e.flags || 0);
+      view.setUint8(o + 12, e.storageFormat || 0);
+      view.setBigUint64(o + 16, BigInt(e.minBindingSize || 0), true);
+    }
+    this._push(OPCODES.CREATE_BIND_GROUP_LAYOUT, new Uint8Array(buf));
+    return this;
+  }
+
+  createPipelineLayout(id, groupLayoutIds = [], { flags = 0, contentId = 0n } = {}) {
+    const buf = new ArrayBuffer(24 + groupLayoutIds.length * 4);
+    const view = new DataView(buf);
+    view.setUint32(0, id, true);
+    view.setUint32(4, groupLayoutIds.length, true);
+    view.setUint32(8, flags, true);
+    view.setBigUint64(16, contentId, true);
+    for (let i = 0; i < groupLayoutIds.length; i += 1) {
+      view.setUint32(24 + i * 4, groupLayoutIds[i], true);
+    }
+    this._push(OPCODES.CREATE_PIPELINE_LAYOUT, new Uint8Array(buf));
+    return this;
+  }
+
+  createRenderPipeline2(id, vsId, fsId, layoutId, keyBytes) {
+    const payload = new Uint8Array(392);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, id, true);
+    view.setUint32(4, vsId, true);
+    view.setUint32(8, fsId, true);
+    view.setUint32(12, layoutId, true);
+    payload.set(keyBytes, 16);
+    this._push(OPCODES.CREATE_RENDER_PIPELINE2, payload);
+    return this;
+  }
+
+  createBindGroup2(id, layoutId, entries = []) {
+    const payload = new Uint8Array(16 + entries.length * 48);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, id, true);
+    view.setUint32(4, layoutId, true);
+    view.setUint32(8, entries.length, true);
+    for (let i = 0; i < entries.length; i += 1) {
+      const e = entries[i];
+      const o = 16 + i * 48;
+      view.setUint32(o, e.binding, true);
+      view.setUint32(o + 4, e.resourceType, true);
+      view.setUint32(o + 8, e.resourceId, true);
+      view.setBigUint64(o + 16, BigInt(e.offset || 0), true);
+      view.setBigUint64(o + 24, BigInt(e.size || 0), true);
+    }
+    this._push(OPCODES.CREATE_BIND_GROUP2, payload);
+    return this;
+  }
+
+  setBindGroup2(groupIndex, bindGroupId, dynamicOffsets = []) {
+    const payload = new Uint8Array(16 + dynamicOffsets.length * 4);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, groupIndex, true);
+    view.setUint32(4, bindGroupId, true);
+    view.setUint32(8, dynamicOffsets.length, true);
+    for (let i = 0; i < dynamicOffsets.length; i += 1) {
+      view.setUint32(16 + i * 4, dynamicOffsets[i], true);
+    }
+    this._push(OPCODES.SET_BIND_GROUP2, payload);
+    return this;
+  }
+
+  beginRenderPass({ colors = [], depthStencil = null } = {}) {
+    const payload = new Uint8Array(368);
+    const view = new DataView(payload.buffer);
+    view.setUint32(0, colors.length, true);
+    for (let i = 0; i < colors.length; i += 1) {
+      const c = colors[i];
+      if (!c) continue;
+      const o = 8 + 40 * i;
+      view.setUint32(o, c.textureId, true);
+      view.setUint8(o + 4, c.loadOp ?? 2);
+      view.setUint8(o + 5, c.storeOp ?? 1);
+      const cv = c.clearValue || { r: 0, g: 0, b: 0, a: 1 };
+      view.setFloat32(o + 24, cv.r, true);
+      view.setFloat32(o + 28, cv.g, true);
+      view.setFloat32(o + 32, cv.b, true);
+      view.setFloat32(o + 36, cv.a, true);
+    }
+    if (depthStencil) {
+      const d = 328;
+      view.setUint32(d, depthStencil.textureId, true);
+      view.setUint8(d + 4, depthStencil.depthLoadOp ?? 2);
+      view.setUint8(d + 5, depthStencil.depthStoreOp ?? 1);
+      view.setUint8(d + 6, depthStencil.stencilLoadOp ?? 2);
+      view.setUint8(d + 7, depthStencil.stencilStoreOp ?? 1);
+      view.setFloat32(d + 24, depthStencil.depthClearValue ?? 1.0, true);
+      view.setUint32(d + 28, depthStencil.stencilClearValue ?? 0, true);
+    }
+    this._push(OPCODES.BEGIN_RENDER_PASS, payload);
+    return this;
+  }
+
+  endRenderPass() {
+    this._push(OPCODES.END_RENDER_PASS, new Uint8Array(0));
+    return this;
+  }
+
+  rawPacket(opcode, payloadBytes) {
+    this._push(opcode, payloadBytes);
+    return this;
+  }
+
   finish() {
     const total = this.chunks.reduce((sum, c) => sum + c.byteLength, 0);
     const out = new Uint8Array(total);
@@ -203,15 +331,23 @@ class PacketBuilder {
 }
 
 function createMockWebGpuEnv(options = {}) {
-  const { strictAutoLayoutForMissingGroup0 = false } = options;
+  const {
+    strictAutoLayoutForMissingGroup0 = false,
+    onCreateShaderModule = null,
+    onCreateRenderPipeline = null,
+    onCreateBindGroup = null,
+  } = options;
   let nextHandle = 1;
   const calls = {
     createBuffer: [],
     createTexture: [],
     createSampler: [],
     createShaderModule: [],
+    createBindGroupLayout: [],
+    createPipelineLayout: [],
     createRenderPipeline: [],
     createBindGroup: [],
+    beginRenderPass: [],
     passOps: [],
     submit: 0,
     configure: [],
@@ -293,11 +429,31 @@ function createMockWebGpuEnv(options = {}) {
       return sampler;
     },
     createShaderModule(desc) {
+      if (typeof onCreateShaderModule === 'function') {
+        const custom = onCreateShaderModule(desc);
+        if (custom !== undefined) {
+          calls.createShaderModule.push({ desc, result: custom });
+          return custom;
+        }
+      }
       const mod = { kind: 'GPUShaderModule', handle: nextHandle++, code: desc.code };
       calls.createShaderModule.push({ desc, result: mod });
       return mod;
     },
+    createBindGroupLayout(desc) {
+      const bgl = { kind: 'GPUBindGroupLayout', handle: nextHandle++, desc };
+      calls.createBindGroupLayout.push({ desc, result: bgl });
+      return bgl;
+    },
+    createPipelineLayout(desc) {
+      const pl = { kind: 'GPUPipelineLayout', handle: nextHandle++, desc };
+      calls.createPipelineLayout.push({ desc, result: pl });
+      return pl;
+    },
     createRenderPipeline(desc) {
+      if (typeof onCreateRenderPipeline === 'function') {
+        onCreateRenderPipeline(desc);
+      }
       const vsCode = desc && desc.vertex && desc.vertex.module ? desc.vertex.module.code || '' : '';
       const fsCode =
         desc && desc.fragment && desc.fragment.module ? desc.fragment.module.code || '' : '';
@@ -317,13 +473,17 @@ function createMockWebGpuEnv(options = {}) {
       return pipe;
     },
     createBindGroup(desc) {
+      if (typeof onCreateBindGroup === 'function') {
+        onCreateBindGroup(desc);
+      }
       const bg = { kind: 'GPUBindGroup', handle: nextHandle++, desc };
       calls.createBindGroup.push({ desc, result: bg });
       return bg;
     },
     createCommandEncoder() {
       return {
-        beginRenderPass() {
+        beginRenderPass(desc) {
+          calls.beginRenderPass.push(desc);
           return {
             setPipeline(pipeline) {
               calls.passOps.push({ op: 'setPipeline', pipeline });
@@ -334,8 +494,12 @@ function createMockWebGpuEnv(options = {}) {
             setIndexBuffer(buffer, format, offset) {
               calls.passOps.push({ op: 'setIndexBuffer', buffer, format, offset });
             },
-            setBindGroup(index, bindGroup) {
-              calls.passOps.push({ op: 'setBindGroup', index, bindGroup });
+            setBindGroup(index, bindGroup, dynamicOffsets) {
+              calls.passOps.push(
+                dynamicOffsets !== undefined
+                  ? { op: 'setBindGroup', index, bindGroup, dynamicOffsets }
+                  : { op: 'setBindGroup', index, bindGroup }
+              );
             },
             draw(vertexCount, instanceCount, firstVertex, firstInstance) {
               calls.passOps.push({
@@ -1100,4 +1264,457 @@ test('G44 classic WorkerGlobalScope loads wgpu_swapchain.js & shader_fallback_ro
 
   // Check exported sanitization helper works cleanly too.
   assert.equal(sanitizeValidationErrorMessage('ok'), 'ok');
+});
+
+// ---------------------------------------------------------------------------
+// 6. W83: Real-pack Frame-1 @group(0) CreateRenderPipeline2 + Present flush + honest counters
+// ---------------------------------------------------------------------------
+
+function buildFrame1RealPackPipelineKey() {
+  // 376-byte GpuRenderPipelineKey matching docs/gpu_commands.md:
+  // - 1 color target: rgba8unorm (22), writeMask 0xf
+  // - depthStencil: depth24plus-stencil8 (47), depthWriteEnabled = false, depthCompare = always (8)
+  // - primitive: triangle-list (0), frontFace ccw (0), cullMode none (0)
+  // - multisample: count = 1, mask = 0xffffffff
+  // - vertex buffer 0: arrayStride = 24, stepMode = vertex (1)
+  //   - attr 0: offset 0,  format float32x3 (30), location 0, bufferIndex 0
+  //   - attr 1: offset 12, format unorm8x4  (9),  location 1, bufferIndex 0
+  //   - attr 2: offset 16, format float32x2 (29), location 2, bufferIndex 0
+  const key = new Uint8Array(376);
+  const v = new DataView(key.buffer);
+  v.setUint32(20, 1, true); // colorTargetCount
+  key.set([22, 0, 0xf, 0], 24); // rgba8unorm, no blend, RGBA write mask
+  key.set([47, 0, 8, 0, 8, 0, 0, 0, 8, 0, 0, 0], 120); // depth24plus-stencil8
+  v.setUint32(132, 0xff, true); // stencilReadMask
+  v.setUint32(136, 0xff, true); // stencilWriteMask
+  key.set([0, 0, 0, 0, 0], 152); // triangle-list, ccw, none
+  v.setUint32(160, 1, true); // multisample.count
+  v.setUint32(164, 0xffffffff, true); // multisample.mask
+  v.setUint32(172, 1, true); // bufferCount = 1
+  v.setUint32(176, 3, true); // attributeCount = 3
+  v.setUint32(180, 24, true); // buffer[0].arrayStride = 24
+  key.set([1, 0], 184); // stepMode = vertex
+  // attr 0: float32x3 @ offset 0, shaderLocation 0, bufferIndex 0
+  v.setUint32(244, 0, true);
+  key.set([30, 0, 0], 248);
+  // attr 1: unorm8x4 @ offset 12, shaderLocation 1, bufferIndex 0
+  v.setUint32(252, 12, true);
+  key.set([9, 1, 0], 256);
+  // attr 2: float32x2 @ offset 16, shaderLocation 2, bufferIndex 0
+  v.setUint32(260, 16, true);
+  key.set([29, 2, 0], 264);
+  return key;
+}
+
+const REAL_PACK_FRAME1_VS = [
+  'struct FrameCbv { data: array<vec4<f32>, 16> };',
+  '@group(0) @binding(0) var<uniform> cb0: FrameCbv;',
+  'struct VsOut {',
+  '  @builtin(position) position: vec4<f32>,',
+  '  @location(0) color: vec4<f32>,',
+  '  @location(1) uv: vec2<f32>,',
+  '};',
+  '@vertex fn vs_main(@location(0) pos: vec3<f32>, @location(1) color: vec4<f32>, @location(2) uv: vec2<f32>) -> VsOut {',
+  '  var out: VsOut;',
+  '  out.position = vec4<f32>(pos + cb0.data[0].xyz * 0.0, 1.0);',
+  '  out.color = color;',
+  '  out.uv = uv;',
+  '  return out;',
+  '}',
+  '',
+].join('\n');
+
+const REAL_PACK_FRAME1_FS = [
+  'struct FrameCbv { data: array<vec4<f32>, 16> };',
+  '@group(0) @binding(0) var<uniform> cb0: FrameCbv;',
+  '@group(0) @binding(1) var tex0: texture_2d<f32>;',
+  '@group(0) @binding(2) var samp0: sampler;',
+  '@fragment fn fs_main(@location(0) color: vec4<f32>, @location(1) uv: vec2<f32>) -> @location(0) vec4<f32> {',
+  '  let t = textureSample(tex0, samp0, uv);',
+  '  return t * color + cb0.data[0] * 0.0;',
+  '}',
+  '',
+].join('\n');
+
+test('W83 single-batch real-pack CreateShaderModule -> CreateBindGroupLayout -> CreateBindGroup -> CreateRenderPipeline2 -> BeginFrame -> BeginRenderPass -> SetPipeline -> SetBindGroup(0) -> SetVertexBuffer -> Draw(6,1) -> EndRenderPass -> Present executes cleanly with honest counters', async () => {
+  const mock = createMockWebGpuEnv();
+  const vsHash = '0x1122334455667701';
+  const fsHash = '0x1122334455667702';
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: REAL_PACK_FRAME1_VS },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: REAL_PACK_FRAME1_FS },
+  ]);
+
+  const posted = [];
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'rgba8unorm',
+    width: 1280,
+    height: 720,
+    wgslPackBuffer: packBuf,
+    captureValidationErrors: true,
+  });
+  const rsHandler = installRenderStatePackets(processor);
+  const workerHandler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    now: () => 9000,
+  });
+
+  const pipelineKey = buildFrame1RealPackPipelineKey();
+
+  // Single host_wgpu_submit batch covering full real-pack Frame-1 sequence!
+  const singleBatch = new PacketBuilder()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    .createBuffer(2, BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST, 24 * 6)
+    .createTexture(3, 64, 64, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST)
+    .createTexture(4, 1280, 720, TEXTURE_FORMAT.DEPTH24_PLUS, TEXTURE_USAGE.RENDER_ATTACHMENT)
+    .createSampler(5)
+    .createShaderModule(10, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(11, SHADER_STAGE.FRAGMENT, fsHash)
+    .createBindGroupLayout(20, [
+      { binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 256 },
+      { binding: 1, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+      { binding: 2, visibility: 2, type: 1, subtype: 0 },
+    ])
+    .createPipelineLayout(21, [20])
+    .createBindGroup(22, 20, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+      { binding: 1, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 3 },
+      { binding: 2, resourceType: BIND_RESOURCE_TYPE.SAMPLER, resourceId: 5 },
+    ])
+    .createRenderPipeline2(30, 10, 11, 21, pipelineKey)
+    .beginFrame()
+    .beginRenderPass({
+      colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1, clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+      depthStencil: { textureId: 4, depthLoadOp: 2, depthStoreOp: 1, stencilLoadOp: 2, stencilStoreOp: 1 },
+    })
+    .setPipeline(30)
+    .setBindGroup(0, 22)
+    .setVertexBuffer(0, 2, 0)
+    .draw(6, 1, 0, 0)
+    .endRenderPass()
+    .present()
+    .finish();
+
+  await workerHandler.handleMessage({ cmdBuffer: singleBatch });
+
+  assert.equal(rsHandler.stats.errors, 0, rsHandler.lastError || '');
+  assert.equal(mock.calls.submit, 1, 'Present must flush the real render pass to device.queue.submit');
+  assert.equal(mock.calls.beginRenderPass.length, 1);
+
+  // Verify real-pack WGSL was compiled (never fallback!)
+  assert.equal(processor.shaderModules.get(10).source, 'pack');
+  assert.equal(processor.shaderModules.get(11).source, 'pack');
+  assert.equal(processor.shaderModules.get(10).code, REAL_PACK_FRAME1_VS);
+  assert.equal(processor.shaderModules.get(11).code, REAL_PACK_FRAME1_FS);
+
+  // Verify 24B 3-attribute layout, rgba8unorm, depth24plus-stencil8 on CreateRenderPipeline2
+  assert.equal(mock.calls.createRenderPipeline.length, 1);
+  const rpDesc = mock.calls.createRenderPipeline[0].desc;
+  assert.equal(rpDesc.layout, mock.calls.createPipelineLayout[0].result);
+  assert.deepEqual(rpDesc.vertex.buffers, [
+    {
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [
+        { format: 'float32x3', offset: 0, shaderLocation: 0 },
+        { format: 'unorm8x4', offset: 12, shaderLocation: 1 },
+        { format: 'float32x2', offset: 16, shaderLocation: 2 },
+      ],
+    },
+  ]);
+  assert.deepEqual(rpDesc.fragment.targets, [{ format: 'rgba8unorm', writeMask: 15 }]);
+  assert.equal(rpDesc.depthStencil.format, 'depth24plus-stencil8');
+
+  // Verify pass operations executed in exact order against the active GPURenderPassEncoder
+  assert.deepEqual(
+    mock.calls.passOps.map((o) => o.op),
+    ['setPipeline', 'setBindGroup', 'setVertexBuffer', 'draw', 'end']
+  );
+  assert.equal(mock.calls.passOps[1].index, 0);
+  assert.equal(mock.calls.passOps[1].bindGroup, mock.calls.createBindGroup[0].result);
+  assert.equal(mock.calls.passOps[3].vertexCount, 6);
+  assert.equal(mock.calls.passOps[3].instanceCount, 1);
+
+  // Verify honest real-vs-fallback draw counters and stats
+  const stats = processor.getStats();
+  assert.equal(stats.realPackDrawCount, 1);
+  assert.equal(stats.fallbackDrawCount, 0);
+  assert.equal(stats.drawCalls, 1);
+  assert.equal(stats.framesPresented, 1);
+  assert.equal(stats.presentCount, 1);
+  assert.equal(stats.validationErrorCount, 0);
+  assert.equal(stats.unboundBindGroupCount, 0);
+  assert.equal(stats.skippedDrawCount, 0);
+
+  // Verify gpu-stats worker message exposes the same authentic counters
+  await workerHandler.handleMessage({ id: 'w83-stats', type: 'request-gpu-stats' });
+  const gpuStatsMsg = posted.find((m) => m && m.type === 'gpu-stats' && m.id === 'w83-stats');
+  assert.ok(gpuStatsMsg, 'must reply to request-gpu-stats with type: gpu-stats');
+  assert.equal(gpuStatsMsg.realPackDrawCount, 1);
+  assert.equal(gpuStatsMsg.fallbackDrawCount, 0);
+  assert.equal(gpuStatsMsg.framesPresented, 1);
+  assert.equal(gpuStatsMsg.presentCount, 1);
+  assert.equal(gpuStatsMsg.validationErrorCount, 0);
+  assert.equal(posted.filter((m) => m && m.type === 'gpu-validation-error').length, 0);
+});
+
+test('W83 realPackDrawCount vs fallbackDrawCount cleanly separates real-pack draws from fallback draws', () => {
+  const mock = createMockWebGpuEnv();
+  const vsHash = '0x1122334455667711';
+  const fsHash = '0x1122334455667712';
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: REAL_PACK_FRAME1_VS },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: REAL_PACK_FRAME1_FS },
+  ]);
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'rgba8unorm',
+    wgslPackBuffer: packBuf,
+  });
+  installRenderStatePackets(processor);
+
+  const key = buildFrame1RealPackPipelineKey();
+  const batch = new PacketBuilder()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    .createBuffer(2, BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST, 24 * 6)
+    .createTexture(3, 16, 16)
+    .createSampler(4)
+    // Real-pack pipeline (v2)
+    .createShaderModule(10, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(11, SHADER_STAGE.FRAGMENT, fsHash)
+    .createBindGroupLayout(20, [
+      { binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 256 },
+      { binding: 1, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+      { binding: 2, visibility: 2, type: 1, subtype: 0 },
+    ])
+    .createPipelineLayout(21, [20])
+    .createBindGroup2(22, 20, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+      { binding: 1, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 3 },
+      { binding: 2, resourceType: BIND_RESOURCE_TYPE.SAMPLER, resourceId: 4 },
+    ])
+    .createRenderPipeline2(30, 10, 11, 21, key)
+    // Fallback pipeline (missing hashes -> builtin fallback profile)
+    .createShaderModule(40, SHADER_STAGE.VERTEX, '0xdeadbeef00000001')
+    .createShaderModule(41, SHADER_STAGE.FRAGMENT, '0xdeadbeef00000002')
+    .createRenderPipeline(42, 40, 41, 0)
+    .createBindGroup(43, 42, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+    ])
+    .beginFrame()
+    .beginRenderPass({
+      colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1 }],
+    })
+    .setPipeline(30)
+    .setBindGroup2(0, 22)
+    .setVertexBuffer(0, 2, 0)
+    .draw(6, 1, 0, 0)
+    .endRenderPass()
+    .beginRenderPass({
+      colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 1, storeOp: 1 }],
+    })
+    .setPipeline(42)
+    .setBindGroup(0, 43)
+    .draw(3, 1, 0, 0)
+    .endRenderPass()
+    .present()
+    .finish();
+
+  const res = processor.executeCommandBuffer(batch);
+  assert.deepEqual(res, { frameCount: 1, presents: 1 });
+
+  const stats = processor.getStats();
+  assert.equal(stats.drawCalls, 2);
+  assert.equal(stats.realPackDrawCount, 1);
+  assert.equal(stats.fallbackDrawCount, 1);
+  assert.equal(stats.presentCount, 1);
+  assert.equal(stats.framesPresented, 1);
+  assert.equal(stats.validationErrorCount, 0);
+});
+
+test('W83 unbound @group(0) on CreateRenderPipeline2 degrades cleanly with deduplicated diagnostic telemetry without throwing or dropping Present', async () => {
+  const mock = createMockWebGpuEnv();
+  const vsHash = '0x1122334455667721';
+  const fsHash = '0x1122334455667722';
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: REAL_PACK_FRAME1_VS },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: REAL_PACK_FRAME1_FS },
+  ]);
+
+  const posted = [];
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'rgba8unorm',
+    wgslPackBuffer: packBuf,
+    captureValidationErrors: true,
+  });
+  installRenderStatePackets(processor);
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    now: () => 12345,
+  });
+
+  const key = buildFrame1RealPackPipelineKey();
+  const stream = new PacketBuilder()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    .createBuffer(2, BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST, 24 * 6)
+    .createTexture(3, 32, 32)
+    .createSampler(4)
+    .createShaderModule(10, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(11, SHADER_STAGE.FRAGMENT, fsHash)
+    .createBindGroupLayout(20, [
+      { binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 256 },
+      { binding: 1, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+      { binding: 2, visibility: 2, type: 1, subtype: 0 },
+    ])
+    .createPipelineLayout(21, [20])
+    .createBindGroup(22, 20, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+      { binding: 1, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 3 },
+      { binding: 2, resourceType: BIND_RESOURCE_TYPE.SAMPLER, resourceId: 4 },
+    ])
+    .createRenderPipeline2(30, 10, 11, 21, key)
+    .beginFrame()
+    // Pass 1: properly bound @group(0) -> authentic draw executes
+    .beginRenderPass({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1 }] })
+    .setPipeline(30)
+    .setBindGroup(0, 22)
+    .setVertexBuffer(0, 2, 0)
+    .draw(6, 1, 0, 0)
+    .endRenderPass()
+    // Pass 2: guest forgot SetBindGroup(0) -> diagnosed & skipped cleanly, repeated draw deduplicated!
+    .beginRenderPass({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 1, storeOp: 1 }] })
+    .setPipeline(30)
+    .setVertexBuffer(0, 2, 0)
+    .draw(6, 1, 0, 0)
+    .draw(6, 1, 0, 0)
+    .endRenderPass()
+    .present()
+    .finish();
+
+  await handler.handleMessage({ cmdBuffer: stream });
+
+  // No uncaught worker error message; frame still presented cleanly!
+  assert.equal(posted.filter((m) => m && m.error && m.type !== 'gpu-validation-error').length, 0);
+  assert.equal(mock.calls.submit, 1);
+
+  const stats = processor.getStats();
+  assert.equal(stats.framesPresented, 1);
+  assert.equal(stats.presentCount, 1);
+  assert.equal(stats.realPackDrawCount, 1, 'only Pass 1 bound draw must count as executed');
+  assert.equal(stats.drawCalls, 1);
+  assert.equal(stats.unboundBindGroupCount, 2);
+  assert.equal(stats.skippedDrawCount, 2);
+  assert.equal(stats.validationErrorCount, 2);
+  assert.equal(stats.validationErrorSuppressedCount, 1, 'identical repeat error must be deduplicated');
+
+  const valMsgs = posted.filter((m) => m && m.type === 'gpu-validation-error');
+  assert.equal(valMsgs.length, 1, 'deduplication must emit only one gpu-validation-error per unique message');
+  assert.match(valMsgs[0].error.message, /@group\(0\)/);
+});
+
+test('W83 CreateRenderPipeline2 / CreateShaderModule / CreateBindGroup validation errors & truncated packets surface sanitized gpu-validation-error without killing worker', async () => {
+  let failPipelineOnce = true;
+  let failBindGroupOnce = true;
+  const mock = createMockWebGpuEnv({
+    onCreateShaderModule(desc) {
+      if (desc.code.includes('BROKEN_WGSL')) {
+        return {
+          kind: 'GPUShaderModule',
+          handle: 999,
+          code: desc.code,
+          async getCompilationInfo() {
+            return {
+              messages: [
+                {
+                  type: 'error',
+                  lineNum: 4,
+                  message: 'WGSL syntax error while compiling C:\\Users\\secret\\shader.wgsl',
+                },
+              ],
+            };
+          },
+        };
+      }
+      return undefined;
+    },
+    onCreateRenderPipeline() {
+      if (failPipelineOnce) {
+        failPipelineOnce = false;
+        throw new Error('CreateRenderPipeline2 mismatch at /Users/dev/private/pso.bin');
+      }
+    },
+    onCreateBindGroup() {
+      if (failBindGroupOnce) {
+        failBindGroupOnce = false;
+        throw new Error('BindGroup entry mismatch from file:///C:/secret/game.rpf');
+      }
+    },
+  });
+
+  const posted = [];
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'rgba8unorm',
+    captureValidationErrors: true,
+    maxValidationErrorPosts: 10,
+  });
+  installRenderStatePackets(processor);
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    now: () => 5555,
+  });
+
+  const key = buildFrame1RealPackPipelineKey();
+  const validBatch = new PacketBuilder()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    // 1) Shader module with async compilation error
+    .createShaderModule(10, SHADER_STAGE.VERTEX, 'BROKEN_WGSL fn vs_main() {}')
+    .createShaderModule(11, SHADER_STAGE.FRAGMENT, '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }')
+    // 2) CreateBindGroupLayout + CreateBindGroup that throws synchronously in device.createBindGroup
+    .createBindGroupLayout(20, [{ binding: 0, visibility: 3, type: 0, subtype: 0, minBindingSize: 256 }])
+    .createPipelineLayout(21, [20])
+    .createBindGroup(22, 20, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+    ])
+    // 3) CreateRenderPipeline2 that throws synchronously in device.createRenderPipeline
+    .createRenderPipeline2(30, 10, 11, 21, key)
+    // 4) Malformed short CreateBindGroup packet (4 bytes < 16 bytes)
+    .rawPacket(OPCODES.CREATE_BIND_GROUP, new Uint8Array(4))
+    // 5) Present still completes cleanly despite earlier errors!
+    .beginFrame()
+    .present()
+    .finish();
+
+  // Append a truncated trailing packet header claiming 100 payload bytes when only 2 exist.
+  const combined = new Uint8Array(validBatch.byteLength + 10);
+  combined.set(new Uint8Array(validBatch), 0);
+  const tailView = new DataView(combined.buffer, validBatch.byteLength);
+  tailView.setUint16(0, OPCODES.CREATE_RENDER_PIPELINE2, true);
+  tailView.setUint32(4, 100, true);
+
+  await handler.handleMessage({ cmdBuffer: combined });
+  // Flush microtask queue so getCompilationInfo() resolves.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // Worker stayed alive (zero uncaught fatal { error } messages) and still presented!
+  assert.equal(posted.filter((m) => m && typeof m.error === 'string').length, 0);
+  assert.equal(processor.getStats().framesPresented, 1);
+  assert.equal(processor.getStats().presentCount, 1);
+
+  const valMsgs = posted.filter((m) => m && m.type === 'gpu-validation-error');
+  assert.ok(valMsgs.length >= 4, `expected >= 4 sanitized gpu-validation-error messages, got ${valMsgs.length}`);
+
+  const allText = valMsgs.map((m) => m.error.message).join('\n');
+  assert.match(allText, /CreateShaderModule:/);
+  assert.match(allText, /CreateBindGroup:/);
+  assert.match(allText, /CreateRenderPipeline2:/);
+  assert.match(allText, /CommandStream:.*truncated packet/i);
+
+  // Zero host paths leaked anywhere!
+  assert.equal(allText.includes('secret'), false, `host path leaked: ${allText}`);
+  assert.equal(allText.includes('/Users/dev'), false, `unix path leaked: ${allText}`);
+  assert.equal(allText.includes('game.rpf'), false, `file URL leaked: ${allText}`);
 });
