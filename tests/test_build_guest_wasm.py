@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24)."""
 
 from __future__ import annotations
 
@@ -742,15 +742,25 @@ class TestResponseFileLinking(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rsp = Path(tmp) / "link_objects.rsp"
             win_objects = [
-                r"C:\Users\someone\work\wasm_obj_cache\aa\shard-00000.o",
+                r"C:\work\cache\aa\shard-00000.o",
                 r"C:\Users\someone\work\wasm_obj_cache\bb\shard-00001.o",
+                r"C:\Program Files\playgta6\cache\cc\shard 00002.o",
             ]
             bgw.write_link_response_file(rsp, win_objects)
             text = rsp.read_text(encoding="utf-8")
-            self.assertEqual(text.splitlines(), win_objects)
+            self.assertEqual(
+                text.splitlines(),
+                [
+                    "C:/work/cache/aa/shard-00000.o",
+                    "C:/Users/someone/work/wasm_obj_cache/bb/shard-00001.o",
+                    '"C:/Program Files/playgta6/cache/cc/shard 00002.o"',
+                ],
+            )
+            self.assertNotIn("\\", text)
             cleaned = bgw.sanitize_text(text)
             self.assertNotIn("someone", cleaned)
             self.assertNotIn("C:\\", cleaned)
+            self.assertNotIn("C:/", cleaned)
             argv = [
                 r"C:\Users\someone\emsdk\upstream\emscripten\em++.bat",
                 "-sMEMORY64=1",
@@ -763,6 +773,17 @@ class TestResponseFileLinking(unittest.TestCase):
             self.assertEqual(sanitized[2], "@link_objects.rsp")
             self.assertEqual(sanitized[-1], "runtime.js")
             self.assertNotIn("someone", " ".join(sanitized))
+
+            link_argv = bgw.build_link_argv(
+                "em++",
+                [Path("a.o")],
+                output_js=Path("web/dist/runtime.js"),
+                response_file=Path(r"C:\work\cache\link_objects.rsp"),
+            )
+            at_tokens = [t for t in link_argv if t.startswith("@")]
+            self.assertEqual(len(at_tokens), 1)
+            self.assertNotIn("\\", at_tokens[0])
+            self.assertEqual(bgw.sanitize_argv(link_argv)[link_argv.index(at_tokens[0])], "@link_objects.rsp")
 
     def test_auto_response_file_when_over_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -926,8 +947,11 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             root = Path(tmp)
             repo = root / "repo"
             _fake_emsdk(repo)
-            boot = repo / "runtime" / "guest" / "boot_main.cpp"
-            _write(boot, "int main() { return 0; }\n")
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            main_cpp = repo / "runtime" / "main.cpp"
+            wasm_boot_cpp = repo / "runtime" / "wasm_boot.cpp"
+            _write(main_cpp, "int main() { return 0; }\n")
+            _write(wasm_boot_cpp, "void run_wasm_guest_boot() {}\n")
             src = _layout_sources(root)
             runner = RecordingRunner()
             report = bgw.run_build(
@@ -942,17 +966,152 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             )
             self.assertTrue(report.ok, report.errors)
             self.assertTrue(report.linked_guest_boot)
-            ids = [u.unit.unit_id for u in report.sources]
-            self.assertTrue(any(i.endswith("boot_main.cpp") for i in ids))
-            define_seen = False
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            self.assertIn("runtime/main.cpp", by_id)
+            self.assertIn("runtime/wasm_boot.cpp", by_id)
+            self.assertEqual(by_id["runtime/main.cpp"].unit.module, "boot")
+            self.assertEqual(by_id["runtime/wasm_boot.cpp"].unit.module, "boot")
+
+            seen_boot: set[str] = set()
             for argv in runner.compile_calls:
-                joined = " ".join(argv)
-                if "boot_main.cpp" in joined.replace("\\", "/"):
-                    self.assertIn("-DPG6_BOOT_LINKED_GUEST=1", argv)
-                    define_seen = True
-            self.assertTrue(define_seen)
+                src_token = _source_token(argv)
+                assert src_token is not None
+                name = Path(src_token).name
+                if name in {"main.cpp", "wasm_boot.cpp"}:
+                    self.assertIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                    self.assertNotIn(bgw.BOOT_PROGRAM_DEFINE, argv)
+                    seen_boot.add(name)
+                else:
+                    self.assertNotIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                    self.assertNotIn(bgw.BOOT_PROGRAM_DEFINE, argv)
+            self.assertEqual(seen_boot, {"main.cpp", "wasm_boot.cpp"})
+
+            # Boot object files must precede libplaygta6_core.a on the link line so
+            # linked wasm_boot.o overrides the archive's non-linked stub.
+            self.assertEqual(len(runner.link_calls), 1)
+            link_names = [Path(t).name for t in runner.link_calls[0]]
+            lib_idx = link_names.index("libplaygta6_core.a")
+            wasm_boot_obj_name = by_id["runtime/wasm_boot.cpp"].object_path.name
+            main_obj_name = by_id["runtime/main.cpp"].object_path.name
+            self.assertLess(link_names.index(wasm_boot_obj_name), lib_idx)
+            self.assertLess(link_names.index(main_obj_name), lib_idx)
+
             payload = json.loads(bgw.report_to_json(report))
             self.assertTrue(payload["linked_guest_boot"])
+
+    def test_link_guest_boot_program_build_passes_boot_program_define(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+            _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+            prog_src = _program_layout(root)
+            cache = root / "cache"
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=prog_src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist",
+                jobs=2,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                link_guest_boot=True,
+            )
+            self.assertTrue(report.ok, report.errors)
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            self.assertIn("runtime/main.cpp", by_id)
+            self.assertIn("runtime/wasm_boot.cpp", by_id)
+
+            seen_boot: set[str] = set()
+            for argv in runner.compile_calls:
+                src_token = _source_token(argv)
+                assert src_token is not None
+                name = Path(src_token).name
+                if name in {"main.cpp", "wasm_boot.cpp"}:
+                    self.assertIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                    self.assertIn(bgw.BOOT_PROGRAM_DEFINE, argv)
+                    seen_boot.add(name)
+                else:
+                    self.assertNotIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                    self.assertNotIn(bgw.BOOT_PROGRAM_DEFINE, argv)
+            self.assertEqual(seen_boot, {"main.cpp", "wasm_boot.cpp"})
+
+            # Single-module build sharing the same cache must not reuse program boot objects.
+            single_src = _layout_sources(root)
+            runner_single = RecordingRunner()
+            single_report = bgw.run_build(
+                source_dir=single_src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-single",
+                jobs=2,
+                run_command=runner_single,
+                which_fn=lambda _name: None,
+                link_guest_boot=True,
+            )
+            self.assertTrue(single_report.ok, single_report.errors)
+            single_by_id = {u.unit.unit_id: u for u in single_report.sources}
+            self.assertNotEqual(
+                by_id["runtime/wasm_boot.cpp"].cache_key,
+                single_by_id["runtime/wasm_boot.cpp"].cache_key,
+            )
+            self.assertFalse(single_by_id["runtime/wasm_boot.cpp"].cache_hit)
+            for argv in runner_single.compile_calls:
+                src_token = _source_token(argv)
+                assert src_token is not None
+                if Path(src_token).name in {"main.cpp", "wasm_boot.cpp"}:
+                    self.assertIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                    self.assertNotIn(bgw.BOOT_PROGRAM_DEFINE, argv)
+
+            # Dry-run JSON remains sanitized.
+            dry = bgw.run_build(
+                source_dir=prog_src,
+                repo_root=repo,
+                cache_dir=root / "cache-dry",
+                out_dir=root / "dist-dry",
+                jobs=2,
+                dry_run=True,
+                which_fn=lambda _name: None,
+                link_guest_boot=True,
+            )
+            self.assertTrue(dry.ok, dry.errors)
+            dumped = bgw.report_to_json(dry)
+            self.assertNotIn("\\\\", dumped)
+            self.assertIn(bgw.BOOT_PROGRAM_DEFINE, dumped)
+
+    def test_link_guest_boot_pg6_program_cpp_without_manifest_sets_boot_program(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+            _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+            src = _layout_sources(root)
+            _write(src / "pg6_program.cpp", "int pg6_program_marker = 1;\n")
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=1,
+                run_command=runner,
+                which_fn=lambda _name: None,
+                link_guest_boot=True,
+            )
+            self.assertTrue(report.ok, report.errors)
+            boot_calls = [
+                argv
+                for argv in runner.compile_calls
+                if Path(_source_token(argv) or "").name in {"main.cpp", "wasm_boot.cpp"}
+            ]
+            self.assertEqual(len(boot_calls), 2)
+            for argv in boot_calls:
+                self.assertIn(bgw.BOOT_LINKED_GUEST_DEFINE, argv)
+                self.assertIn(bgw.BOOT_PROGRAM_DEFINE, argv)
 
     def test_link_guest_boot_custom_entry_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,7 +1140,8 @@ class TestSampleAndGuestBoot(unittest.TestCase):
             self.assertEqual(code, 0, err)
             payload = json.loads(out)
             self.assertTrue(payload["linked_guest_boot"])
-            self.assertTrue(any(u["id"].endswith("wasm_boot.cpp") for u in payload["sources"]))
+            wasm_boot_units = [u for u in payload["sources"] if u["id"].endswith("wasm_boot.cpp")]
+            self.assertEqual(len(wasm_boot_units), 1)
 
 
 class TestWasm64IrRetargetAndFlags(unittest.TestCase):
