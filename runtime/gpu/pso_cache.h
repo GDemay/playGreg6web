@@ -162,8 +162,12 @@ enum class DxgiFormat : uint32_t {
     BC7_TYPELESS = 97,
     BC7_UNORM = 98,
     BC7_UNORM_SRGB = 99,
-    // 100..115 are video/palettized formats (AYUV .. B4G4R4A4_UNORM); none has a WebGPU equivalent.
+    // 100..114 are video/palettized formats (AYUV .. P8/A8P8); none has a WebGPU equivalent.
     B4G4R4A4_UNORM = 115,
+    // Xbox-only (d3d12_x / d3d12_xs) 16-bit depth + 8-bit stencil family.
+    D16_UNORM_S8_UINT = 118,
+    R16_UNORM_X8_TYPELESS = 119,
+    X16_TYPELESS_G8_UINT = 120,
 };
 
 enum class D3D12Blend : uint32_t {
@@ -624,7 +628,8 @@ inline constexpr uint32_t Float32Blendable = 1u << 3;        // "float32-blendab
 inline constexpr uint32_t Rg11b10UfloatRenderable = 1u << 4; // "rg11b10ufloat-renderable"
 inline constexpr uint32_t DualSourceBlending = 1u << 5;      // "dual-source-blending"
 inline constexpr uint32_t TextureFormatsTier1 = 1u << 6;     // "texture-formats-tier1"
-inline constexpr uint32_t All = (1u << 7) - 1u;
+inline constexpr uint32_t Bgra8UnormStorage = 1u << 7;       // "bgra8unorm-storage"
+inline constexpr uint32_t All = (1u << 8) - 1u;
 }  // namespace WgpuFeature
 
 const char* texture_format_name(WgpuTextureFormat format) noexcept;
@@ -713,6 +718,10 @@ struct TextureFormatMapping {
 // * BC formats require "texture-compression-bc"; without it they fall back to an uncompressed format
 //   (NeedsCpuConversion). BC formats are never renderable.
 // * Formats whose renderability or existence depends on a feature fall back to a wider format.
+// * Packed 16-bit B5G5R5A1_UNORM / B4G4R4A4_UNORM have no WebGPU format: Sampled / RenderTarget promote to
+//   rgba8unorm (FeatureFallback | NeedsCpuConversion: uploads widen 16bpp -> 32bpp, channels swizzled).
+// * Xbox D16_UNORM_S8_UINT (and its R16_UNORM_X8 / X16_G8 views) has no 16-bit depth + stencil WebGPU format:
+//   it promotes to depth24plus-stencil8 (FeatureFallback), with the depth/stencil aspect for the views.
 TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, uint32_t features) noexcept;
 
 struct VertexFormatMapping {

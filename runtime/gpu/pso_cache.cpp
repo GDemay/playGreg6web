@@ -202,6 +202,7 @@ struct DxgiDescription {
     WgpuTextureAspect depth_view_aspect = WgpuTextureAspect::All;
     bool typeless = false;
     bool alpha_ignored = false;
+    bool promoted = false;  // no exact WebGPU format: `color` / `depth` is a wider substitute
 };
 
 DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
@@ -288,6 +289,22 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
             r.depth = F::Depth24PlusStencil8;
             r.depth_view_aspect = WgpuTextureAspect::StencilOnly;
             return r;
+        // Xbox 16-bit depth + 8-bit stencil: WebGPU has no depth16unorm-stencil8, so promote to the
+        // depth24plus-stencil8 family (depth precision only grows; the stencil aspect is preserved).
+        case D::D16_UNORM_S8_UINT:
+            r.depth = F::Depth24PlusStencil8;
+            r.promoted = true;
+            return r;
+        case D::R16_UNORM_X8_TYPELESS:
+            r.depth = F::Depth24PlusStencil8;
+            r.depth_view_aspect = WgpuTextureAspect::DepthOnly;
+            r.promoted = true;
+            return r;
+        case D::X16_TYPELESS_G8_UINT:
+            r.depth = F::Depth24PlusStencil8;
+            r.depth_view_aspect = WgpuTextureAspect::StencilOnly;
+            r.promoted = true;
+            return r;
         case D::R8G8_TYPELESS: return typeless_color(F::Rg8Unorm);
         case D::R8G8_UNORM: return color(F::Rg8Unorm);
         case D::R8G8_UINT: return color(F::Rg8Uint);
@@ -328,6 +345,11 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::BC5_TYPELESS: return typeless_color(F::Bc5RgUnorm);
         case D::BC5_UNORM: return color(F::Bc5RgUnorm);
         case D::BC5_SNORM: return color(F::Bc5RgSnorm);
+        // Packed 16-bit RGBA has no WebGPU format: promote to rgba8unorm (uploads must be widened).
+        case D::B5G5R5A1_UNORM:
+        case D::B4G4R4A4_UNORM:
+            r.promoted = true;
+            return color(F::Rgba8Unorm);
         case D::B8G8R8A8_UNORM: return color(F::Bgra8Unorm);
         case D::B8G8R8X8_UNORM:
             r.alpha_ignored = true;
@@ -347,8 +369,8 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::BC7_UNORM: return color(F::Bc7RgbaUnorm);
         case D::BC7_UNORM_SRGB: return color(F::Bc7RgbaUnormSrgb);
         default:
-            // UNKNOWN, 3-component 32-bit formats, R1, packed 4:2:2, B5G6R5/B5G5R5A1/B4G4R4A4,
-            // XR_BIAS and video formats: no WebGPU equivalent.
+            // UNKNOWN, 3-component 32-bit formats, R1, packed 4:2:2, B5G6R5, XR_BIAS and video
+            // formats: no WebGPU equivalent.
             return r;
     }
 }
@@ -404,6 +426,7 @@ const char* feature_name(uint32_t single_feature_bit) noexcept {
         case WgpuFeature::Rg11b10UfloatRenderable: return "rg11b10ufloat-renderable";
         case WgpuFeature::DualSourceBlending: return "dual-source-blending";
         case WgpuFeature::TextureFormatsTier1: return "texture-formats-tier1";
+        case WgpuFeature::Bgra8UnormStorage: return "bgra8unorm-storage";
         default: return nullptr;
     }
 }
@@ -491,6 +514,12 @@ TextureFormatMapping map_texture_format(DxgiFormat format, FormatUsage usage, ui
     }
     if (d.alpha_ignored) {
         m.diagnostics |= FormatDiag::AlphaIgnored;
+    }
+    if (d.promoted) {
+        m.diagnostics |= FormatDiag::FeatureFallback;
+        if (!has_depth_aspect(chosen)) {
+            m.diagnostics |= FormatDiag::NeedsCpuConversion;  // widen packed 16-bit texels on upload
+        }
     }
 
     const auto& info = texture_format_info(chosen);
