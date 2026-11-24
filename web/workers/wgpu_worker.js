@@ -1116,6 +1116,55 @@ function selectSupportedAdapterFeatures(adapter) {
   return supported;
 }
 
+const OPTIONAL_ADAPTER_LIMIT_SPECS = Object.freeze([
+  Object.freeze({ name: 'maxSampledTexturesPerShaderStage', defaultMin: 16, cap: 256 }),
+  Object.freeze({ name: 'maxSamplersPerShaderStage', defaultMin: 16, cap: 64 }),
+  Object.freeze({ name: 'maxStorageBuffersPerShaderStage', defaultMin: 8, cap: 32 }),
+  Object.freeze({ name: 'maxUniformBuffersPerShaderStage', defaultMin: 12, cap: 32 }),
+  Object.freeze({ name: 'maxStorageTexturesPerShaderStage', defaultMin: 4, cap: 16 }),
+  Object.freeze({ name: 'maxBindingsPerBindGroup', defaultMin: 1000, cap: 4096 }),
+  Object.freeze({ name: 'maxBufferSize', defaultMin: 256 * 1024 * 1024, cap: 1024 * 1024 * 1024 }),
+  Object.freeze({
+    name: 'maxStorageBufferBindingSize',
+    defaultMin: 128 * 1024 * 1024,
+    cap: 512 * 1024 * 1024,
+  }),
+  Object.freeze({ name: 'maxComputeWorkgroupStorageSize', defaultMin: 16384, cap: 65536 }),
+]);
+
+function selectSupportedAdapterLimits(adapter) {
+  if (!adapter || typeof adapter !== 'object') {
+    return {};
+  }
+  let limits;
+  try {
+    limits = adapter.limits;
+  } catch (_) {
+    return {};
+  }
+  if (!limits || typeof limits !== 'object') {
+    return {};
+  }
+  const requiredLimits = {};
+  for (let i = 0; i < OPTIONAL_ADAPTER_LIMIT_SPECS.length; i += 1) {
+    const { name, defaultMin, cap } = OPTIONAL_ADAPTER_LIMIT_SPECS[i];
+    let supported;
+    try {
+      supported = limits[name];
+    } catch (_) {
+      continue;
+    }
+    if (typeof supported !== 'number' || !Number.isFinite(supported)) {
+      continue;
+    }
+    const clamped = Math.min(Math.floor(supported), cap);
+    if (clamped > defaultMin) {
+      requiredLimits[name] = clamped;
+    }
+  }
+  return requiredLimits;
+}
+
 function deviceSupportsTimestampQuery(device) {
   if (!device || typeof device !== 'object') {
     return false;
@@ -5880,15 +5929,35 @@ function createWgpuWorkerHandler(options = {}) {
     }
 
     const requiredFeatures = selectSupportedAdapterFeatures(adapter);
+    const requiredLimits = selectSupportedAdapterLimits(adapter);
+    const hasRequiredFeatures = requiredFeatures.length > 0;
+    const hasRequiredLimits = Object.keys(requiredLimits).length > 0;
     let device;
     let enabledFeatures = [];
-    if (requiredFeatures.length > 0) {
+    if (hasRequiredFeatures || hasRequiredLimits) {
+      const deviceDesc = {};
+      if (hasRequiredFeatures) {
+        deviceDesc.requiredFeatures = requiredFeatures;
+      }
+      if (hasRequiredLimits) {
+        deviceDesc.requiredLimits = requiredLimits;
+      }
       try {
-        device = await adapter.requestDevice({ requiredFeatures });
-        enabledFeatures = requiredFeatures.slice();
+        device = await adapter.requestDevice(deviceDesc);
+        enabledFeatures = hasRequiredFeatures ? requiredFeatures.slice() : [];
       } catch (_) {
-        device = await adapter.requestDevice();
-        enabledFeatures = [];
+        if (hasRequiredFeatures && hasRequiredLimits) {
+          try {
+            device = await adapter.requestDevice({ requiredFeatures });
+            enabledFeatures = requiredFeatures.slice();
+          } catch (_featureErr) {
+            device = await adapter.requestDevice();
+            enabledFeatures = [];
+          }
+        } else {
+          device = await adapter.requestDevice();
+          enabledFeatures = [];
+        }
       }
     } else {
       device = await adapter.requestDevice();
@@ -6400,6 +6469,8 @@ const exportedApi = {
   buildGpuTelemetrySnapshot,
   selectSupportedAdapterFeatures,
   OPTIONAL_ADAPTER_FEATURES,
+  selectSupportedAdapterLimits,
+  OPTIONAL_ADAPTER_LIMIT_SPECS,
   selectFallbackShaderProfile,
   sanitizeValidationErrorMessage,
   normalizeValidationErrorType,

@@ -16,6 +16,8 @@ const {
   buildGpuTelemetrySnapshot,
   selectSupportedAdapterFeatures,
   OPTIONAL_ADAPTER_FEATURES,
+  selectSupportedAdapterLimits,
+  OPTIONAL_ADAPTER_LIMIT_SPECS,
   OPCODES,
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
@@ -1309,4 +1311,391 @@ test('W92 buildGpuTelemetrySnapshot exposes realPackDrawCount and fallbackDrawCo
   );
   assert.equal(coercedSnap.frameStats.realPackDrawCount, 0);
   assert.equal(coercedSnap.frameStats.fallbackDrawCount, 0);
+});
+
+test('W96 selectSupportedAdapterLimits picks elevated limits clamped to caps and ignores core defaults or missing limits', () => {
+  assert.equal(Object.isFrozen(OPTIONAL_ADAPTER_LIMIT_SPECS), true);
+  assert.equal(globalThis.PlayGta6Wgpu.OPTIONAL_ADAPTER_LIMIT_SPECS, OPTIONAL_ADAPTER_LIMIT_SPECS);
+  assert.equal(
+    globalThis.PlayGta6Wgpu.selectSupportedAdapterLimits,
+    selectSupportedAdapterLimits
+  );
+
+  // Missing / invalid / throwing adapter.limits all yield an empty object.
+  assert.deepEqual(selectSupportedAdapterLimits(null), {});
+  assert.deepEqual(selectSupportedAdapterLimits(undefined), {});
+  assert.deepEqual(selectSupportedAdapterLimits({}), {});
+  assert.deepEqual(selectSupportedAdapterLimits({ limits: null }), {});
+  assert.deepEqual(selectSupportedAdapterLimits({ limits: {} }), {});
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      get limits() {
+        throw new Error('limits getter error');
+      },
+    }),
+    {}
+  );
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      limits: {
+        get maxSampledTexturesPerShaderStage() {
+          throw new Error('property getter error');
+        },
+        maxSamplersPerShaderStage: Number.NaN,
+        maxStorageBuffersPerShaderStage: Number.POSITIVE_INFINITY,
+        maxUniformBuffersPerShaderStage: Number.NEGATIVE_INFINITY,
+        maxBufferSize: '1073741824',
+      },
+    }),
+    {}
+  );
+
+  // Adapter at or below WebGPU core minimums -> returns {} (no keys requested).
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      limits: {
+        maxSampledTexturesPerShaderStage: 16,
+        maxSamplersPerShaderStage: 16,
+        maxStorageBuffersPerShaderStage: 8,
+        maxUniformBuffersPerShaderStage: 12,
+        maxStorageTexturesPerShaderStage: 4,
+        maxBindingsPerBindGroup: 1000,
+        maxBufferSize: 256 * 1024 * 1024,
+        maxStorageBufferBindingSize: 128 * 1024 * 1024,
+        maxComputeWorkgroupStorageSize: 16384,
+        maxTextureDimension2D: 16384,
+      },
+    }),
+    {}
+  );
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      limits: {
+        maxSampledTexturesPerShaderStage: 8,
+        maxBindingsPerBindGroup: 640,
+        maxBufferSize: 128 * 1024 * 1024,
+      },
+    }),
+    {}
+  );
+
+  // Partial adapter with values between core default and cap -> preserves exact supported values.
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      limits: {
+        maxSampledTexturesPerShaderStage: 64,
+        maxSamplersPerShaderStage: 16,
+        maxStorageBuffersPerShaderStage: 16,
+        maxUniformBuffersPerShaderStage: 24,
+        maxStorageTexturesPerShaderStage: 8,
+        maxBindingsPerBindGroup: 1000,
+        maxBufferSize: 512 * 1024 * 1024,
+        maxStorageBufferBindingSize: 256 * 1024 * 1024,
+        maxComputeWorkgroupStorageSize: 32768,
+        maxColorAttachments: 8,
+      },
+    }),
+    {
+      maxSampledTexturesPerShaderStage: 64,
+      maxStorageBuffersPerShaderStage: 16,
+      maxUniformBuffersPerShaderStage: 24,
+      maxStorageTexturesPerShaderStage: 8,
+      maxBufferSize: 512 * 1024 * 1024,
+      maxStorageBufferBindingSize: 256 * 1024 * 1024,
+      maxComputeWorkgroupStorageSize: 32768,
+    }
+  );
+
+  // High-end adapter exceeding all caps -> clamps every key to its configured cap.
+  assert.deepEqual(
+    selectSupportedAdapterLimits({
+      limits: {
+        maxSampledTexturesPerShaderStage: 1024,
+        maxSamplersPerShaderStage: 512,
+        maxStorageBuffersPerShaderStage: 128,
+        maxUniformBuffersPerShaderStage: 128,
+        maxStorageTexturesPerShaderStage: 64,
+        maxBindingsPerBindGroup: 65536,
+        maxBufferSize: 4 * 1024 * 1024 * 1024,
+        maxStorageBufferBindingSize: 2 * 1024 * 1024 * 1024,
+        maxComputeWorkgroupStorageSize: 131072,
+      },
+    }),
+    {
+      maxSampledTexturesPerShaderStage: 256,
+      maxSamplersPerShaderStage: 64,
+      maxStorageBuffersPerShaderStage: 32,
+      maxUniformBuffersPerShaderStage: 32,
+      maxStorageTexturesPerShaderStage: 16,
+      maxBindingsPerBindGroup: 4096,
+      maxBufferSize: 1024 * 1024 * 1024,
+      maxStorageBufferBindingSize: 512 * 1024 * 1024,
+      maxComputeWorkgroupStorageSize: 65536,
+    }
+  );
+});
+
+test('W96 defaultInitGpu passes requiredLimits when supported and falls back cleanly on rejection', async () => {
+  // 1. Adapter supports both optional features and elevated limits -> single requestDevice({ requiredFeatures, requiredLimits }).
+  {
+    const { device, ctx } = createMockWebGpu();
+    const supportedFeatures = ['texture-compression-bc', 'float32-filterable'];
+    device.features = new Set(supportedFeatures);
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock-gpu', architecture: 'rdna3' },
+          features: new Set(supportedFeatures),
+          limits: {
+            maxSampledTexturesPerShaderStage: 512,
+            maxStorageBuffersPerShaderStage: 16,
+            maxBufferSize: 2 * 1024 * 1024 * 1024,
+            maxBindingsPerBindGroup: 1000,
+          },
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 640, height: 360 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 1);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredFeatures: supportedFeatures,
+      requiredLimits: {
+        maxSampledTexturesPerShaderStage: 256,
+        maxStorageBuffersPerShaderStage: 16,
+        maxBufferSize: 1024 * 1024 * 1024,
+      },
+    });
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg, 'expected ready postMessage');
+    assert.deepEqual(readyMsg.features, supportedFeatures);
+  }
+
+  // 2. Adapter supports elevated limits only (no optional features) -> passes only { requiredLimits }.
+  {
+    const { device, ctx } = createMockWebGpu();
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'limits-only-gpu', architecture: '' },
+          limits: {
+            maxUniformBuffersPerShaderStage: 64,
+            maxComputeWorkgroupStorageSize: 32768,
+          },
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 320, height: 180 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 1);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredLimits: {
+        maxUniformBuffersPerShaderStage: 32,
+        maxComputeWorkgroupStorageSize: 32768,
+      },
+    });
+    assert.equal('requiredFeatures' in requestDeviceCalls[0], false);
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg);
+    assert.deepEqual(readyMsg.features, []);
+  }
+
+  // 3. Adapter rejects requiredLimits but accepts requiredFeatures -> falls back to { requiredFeatures }.
+  {
+    const { device, ctx } = createMockWebGpu();
+    const supportedFeatures = ['texture-compression-bc', 'depth32float-stencil8'];
+    device.features = new Set(supportedFeatures);
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'strict-limits-gpu', architecture: '' },
+          features: new Set(supportedFeatures),
+          limits: {
+            maxSampledTexturesPerShaderStage: 128,
+            maxBufferSize: 1024 * 1024 * 1024,
+          },
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            if (desc && desc.requiredLimits) {
+              throw new Error('driver rejected elevated requiredLimits');
+            }
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 640, height: 360 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 2);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredFeatures: supportedFeatures,
+      requiredLimits: {
+        maxSampledTexturesPerShaderStage: 128,
+        maxBufferSize: 1024 * 1024 * 1024,
+      },
+    });
+    assert.deepEqual(requestDeviceCalls[1], {
+      requiredFeatures: supportedFeatures,
+    });
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg);
+    assert.deepEqual(readyMsg.features, supportedFeatures);
+  }
+
+  // 4. Adapter rejects both { requiredFeatures, requiredLimits } and { requiredFeatures } -> falls back to bare requestDevice().
+  {
+    const { device, ctx } = createMockWebGpu();
+    device.features = new Set();
+    const supportedFeatures = ['texture-compression-bc'];
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'bare-fallback-gpu', architecture: '' },
+          features: new Set(supportedFeatures),
+          limits: {
+            maxStorageBufferBindingSize: 512 * 1024 * 1024,
+          },
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            if (desc) {
+              throw new Error('driver rejected device descriptor');
+            }
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 320, height: 180 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 3);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredFeatures: supportedFeatures,
+      requiredLimits: {
+        maxStorageBufferBindingSize: 512 * 1024 * 1024,
+      },
+    });
+    assert.deepEqual(requestDeviceCalls[1], {
+      requiredFeatures: supportedFeatures,
+    });
+    assert.equal(requestDeviceCalls[2], undefined);
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg);
+    assert.deepEqual(readyMsg.features, []);
+  }
+
+  // 5. Adapter rejects { requiredLimits } when no features are supported -> falls back directly to bare requestDevice().
+  {
+    const { device, ctx } = createMockWebGpu();
+    const requestDeviceCalls = [];
+
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          limits: {
+            maxSamplersPerShaderStage: 64,
+          },
+          async requestDevice(desc) {
+            requestDeviceCalls.push(desc);
+            if (desc && desc.requiredLimits) {
+              throw new Error('limits rejected');
+            }
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 320, height: 180 });
+    });
+
+    assert.equal(requestDeviceCalls.length, 2);
+    assert.deepEqual(requestDeviceCalls[0], {
+      requiredLimits: {
+        maxSamplersPerShaderStage: 64,
+      },
+    });
+    assert.equal(requestDeviceCalls[1], undefined);
+    const readyMsg = posted.find((m) => m && m.ready === true);
+    assert.ok(readyMsg);
+    assert.deepEqual(readyMsg.features, []);
+  }
 });
