@@ -64,6 +64,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -157,6 +158,8 @@ struct Options {
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
+    std::string profile;            // --profile: per-thread host PC samples (Windows)
+    uint64_t profile_interval_us = 2000;  // --profile-interval-us
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool tls_callbacks = true;
@@ -217,7 +220,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" ||
-                   a == "--user-age-group") {
+                   a == "--user-age-group" || a == "--profile") {
             if (!value(v)) {
                 return false;
             }
@@ -227,6 +230,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--dump-pipelines" ? o.dump_pipelines
                                   : a == "--shader-pack" ? o.shader_pack
                                   : a == "--user-age-group" ? o.user_age_group
+                                  : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
                                   : a == "--game-dir" ? o.game_dir
@@ -239,7 +243,7 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
                    a == "--console-mode" || a == "--gpu-capture-frames" || a == "--arena-log-limit" ||
-                   a == "--dstorage-workers") {
+                   a == "--dstorage-workers" || a == "--profile-interval-us") {
             if (!value(v)) {
                 return false;
             }
@@ -248,6 +252,7 @@ bool parse(int argc, char** argv, Options& o) {
                                : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
+                               : a == "--profile-interval-us" ? o.profile_interval_us
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
                                : a == "--import-trace-limit" ? o.import_trace_limit
@@ -425,8 +430,126 @@ void write_text(const std::string& path, const std::string& text) {
     }
 }
 
+// ---- --profile: where the guest threads spend their time ---------------------------------------
+// A sampler thread suspends every guest thread each interval, reads its host instruction pointer
+// and resumes it; the PC is classified after the resume (no lock is taken while a thread is
+// suspended): a lifted function ("guest sub_X"), a system module ("os <module>", i.e. blocked or
+// running in the OS: waits, file I/O, allocation) or the runtime ("runtime"); the last two carry
+// the thread's last import, i.e. the shim it is in. Written per thread, by share of samples.
+#ifdef _WIN32
+struct SampledThread {
+    uint32_t id;
+    HANDLE handle;
+};
+std::mutex g_profile_mutex;
+std::vector<SampledThread> g_profile_threads;
+std::atomic<bool> g_profile_stop{false};
+std::thread g_profile_thread;
+std::map<uint32_t, std::map<std::string, uint64_t>> g_profile_labels;  // sampler thread, then writer
+
+void profile_thread_started(uint32_t thread_id) {
+    HANDLE h = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        g_profile_threads.push_back({thread_id, h});
+    }
+}
+
+std::string profile_label(uint64_t pc, uint32_t thread_id) {
+    uint64_t offset = 0;
+    if (const uint64_t fn = guest::guest_function_for_host_pc(pc, &offset)) {
+        char text[40];
+        std::snprintf(text, sizeof(text), "guest sub_%" PRIX64, fn);
+        return text;
+    }
+    HMODULE module = nullptr;
+    std::string where = "runtime";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(static_cast<uintptr_t>(pc)), &module) &&
+        module != GetModuleHandleW(nullptr)) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(module, path, MAX_PATH);
+        const char* base = std::strrchr(path, '\\');
+        where = std::string("os ") + (base != nullptr ? base + 1 : path);
+    }
+    const std::string last = guest::guest_thread_last_import(thread_id);
+    return where + " (last import " + (last.empty() ? "none" : last) + ")";
+}
+
+void profile_loop(uint64_t interval_us) {
+    while (!g_profile_stop.load(std::memory_order_relaxed)) {
+        std::vector<SampledThread> threads;
+        {
+            std::lock_guard<std::mutex> lock(g_profile_mutex);
+            threads = g_profile_threads;
+        }
+        for (const SampledThread& t : threads) {
+            if (SuspendThread(t.handle) == static_cast<DWORD>(-1)) {
+                continue;
+            }
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_CONTROL;
+            const bool ok = GetThreadContext(t.handle, &ctx) != 0;
+            ResumeThread(t.handle);
+            if (ok) {
+                ++g_profile_labels[t.id][profile_label(ctx.Rip, t.id)];
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+    }
+}
+
+void start_profile() {
+    if (!g_options.profile.empty()) {
+        g_profile_thread = std::thread(profile_loop, std::max<uint64_t>(100, g_options.profile_interval_us));
+    }
+}
+
+void finish_profile() {
+    if (g_options.profile.empty() || !g_profile_thread.joinable() || g_profile_stop.exchange(true)) {
+        return;
+    }
+    g_profile_thread.join();
+    std::string out;
+    for (const auto& [id, labels] : g_profile_labels) {
+        uint64_t total = 0;
+        std::map<std::string, uint64_t> kinds;
+        for (const auto& [label, n] : labels) {
+            total += n;
+            kinds[label.substr(0, label.find(' '))] += n;
+        }
+        std::vector<std::pair<uint64_t, std::string>> top;
+        for (const auto& [label, n] : labels) {
+            top.emplace_back(n, label);
+        }
+        std::sort(top.rbegin(), top.rend());
+        char line[512];
+        std::snprintf(line, sizeof(line), "thread %u: %" PRIu64 " samples;", id, total);
+        out += line;
+        for (const auto& [kind, n] : kinds) {
+            std::snprintf(line, sizeof(line), " %s %.1f%%", kind.c_str(), 100.0 * n / std::max<uint64_t>(1, total));
+            out += line;
+        }
+        out += "\n";
+        for (size_t i = 0; i < top.size() && i < 12; ++i) {
+            std::snprintf(line, sizeof(line), "  %5.1f%%  %s\n", 100.0 * top[i].first / std::max<uint64_t>(1, total),
+                          top[i].second.c_str());
+            out += line;
+        }
+    }
+    write_text(g_options.profile, out);
+    std::fprintf(stderr, "[harness] thread profile written to %s\n", g_options.profile.c_str());
+}
+#else
+void profile_thread_started(uint32_t) {}
+void start_profile() {}
+void finish_profile() {}
+#endif
+
 // The boot logs its summary itself unless --quiet; host faults happen outside its logging.
 void write_outputs(bool print_summary) {
+    finish_profile();
     if (!g_options.gpu_capture.empty()) {
         gpu::frame_capture_finish();
         std::fprintf(stderr, "[harness] GPU capture: %u frame(s) written to %s\n", gpu::frame_capture_frames(),
@@ -651,6 +774,7 @@ void run_boot_thread() {
     cfg.sandbox_id = g_options.sandbox_id;
     playgta6::os::gdk::provider::parse_user_age_group(g_options.user_age_group, &cfg.user_age_group);
     cfg.off_thread_fault = &off_thread_fault;
+    cfg.guest_thread_started = &profile_thread_started;
     const guest::BootResult result = guest::run_boot(cfg);
     if (!g_finishing.exchange(true)) {
         write_outputs(g_options.quiet);
@@ -801,6 +925,7 @@ int main(int argc, char** argv) {
         });
     }
     start_watchdog();
+    start_profile();
 
     const uint64_t host_stack = g_options.host_stack_mb << 20;
 #ifdef _WIN32

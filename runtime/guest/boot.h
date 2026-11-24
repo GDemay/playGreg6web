@@ -382,6 +382,9 @@ const char* boot_status_name(BootStatus status);
 using CaptureHostStackFn = size_t (*)(void** frames, size_t max_frames);
 using HostFunctionStartFn = uint64_t (*)(uint64_t host_pc);
 using OffThreadFaultFn = void (*)();
+// Called on a guest thread's own host thread when it becomes a guest thread (the boot thread
+// for the main thread), with its guest thread id: lets a harness keep host handles for sampling.
+using GuestThreadStartedFn = void (*)(uint32_t thread_id);
 
 struct BootModule {
     os::pgim::ImageReader* image = nullptr;  // required
@@ -441,6 +444,7 @@ struct BootConfig {
     // calls the hook, which must not return (the harness writes its outputs and terminates).
     // nullptr: such faults go to the default fault handler (log and abort).
     OffThreadFaultFn off_thread_fault = nullptr;
+    GuestThreadStartedFn guest_thread_started = nullptr;
     bool log_progress = true;       // phase lines through os::log
     // The generated export table (`pg6_export_thunks`, guest/export_thunks.h): guest-callable
     // entries for every shim export, registered after the IAT slots are bound so that
@@ -526,6 +530,9 @@ LiveCounters live_counters();
 // Lifted function containing a host code address (exact only for natively compiled lifted code:
 // nearest lifted function pointer at or below `host_pc`). 0 if unknown.
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr);
+
+// "dll!symbol" of the last import the guest thread `thread_id` called ("" if none or unknown).
+std::string guest_thread_last_import(uint32_t thread_id);
 
 }  // namespace playgta6::guest
 

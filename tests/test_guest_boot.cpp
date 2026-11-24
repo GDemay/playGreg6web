@@ -1073,6 +1073,20 @@ void test_observability() {
                   [](BootConfig& cfg) { cfg.user_age_group = os::gdk::provider::UserAgeGroup::Child; });
     CHECK(os::gdk::provider::user_age_group() == os::gdk::provider::UserAgeGroup::Child);
     os::gdk::provider::set_user_age_group(os::gdk::provider::UserAgeGroup::Unknown);
+
+    // The thread hook sees the main guest thread, on the thread that runs it.
+    static uint32_t started_id = 0;
+    static int started_calls = 0;
+    started_id = 0;
+    started_calls = 0;
+    boot_scenario(Scenario::LastError, [](BootConfig& cfg) {
+        cfg.guest_thread_started = [](uint32_t id) {
+            started_id = id;
+            ++started_calls;
+        };
+    });
+    CHECK(started_calls >= 1 && started_id != 0);
+    CHECK(guest::guest_thread_last_import(0xFFFFFFF0u).empty());
 }
 
 // host_callable_calls counts calls to named host callables in first-call order; com_stub_hits
