@@ -166,6 +166,7 @@ private:
     uint64_t owned_guest_memory_ = 0;
     bool gpu_texture_ = false;
     bool tracked_ = false;
+    bool texture_tracked_ = false;
     std::atomic<bool> back_buffer_{false};
     std::vector<uint8_t> shadow_;
     friend TextureProbeTotals probe_texture_contents(size_t budget);

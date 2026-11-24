@@ -13,10 +13,15 @@
 
 #include "abi/playgta6_abi.h"
 #include "gpu/cmd_encoder.h"
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_guest_resources.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/descriptor_words.h"
 #include "gpu/pso_cache.h"
 #include "gpu/state_bridge.h"
+#include "guest/com_bridge.h"
+#include "os/vmem.h"
+#include "os/win32_kernel.h"
 
 #ifndef PG6_TEST_FIXTURE_DIR
 #define PG6_TEST_FIXTURE_DIR "tests/fixtures"
@@ -1191,6 +1196,528 @@ void test_memory_backed_tables() {
     CHECK(e.offset == 0x300);
 }
 
+// ------------------------------------------------------------------------------------------------
+// G49b: Dirty-tracked guest texture memory upload (WriteTexture) & detile hook
+// ------------------------------------------------------------------------------------------------
+
+std::vector<Packet> decode_bytes(const std::vector<uint8_t>& buf) {
+    std::vector<Packet> out;
+    size_t off = 0;
+    while (off + sizeof(GpuPacketHeader) <= buf.size()) {
+        GpuPacketHeader h{};
+        std::memcpy(&h, buf.data() + off, sizeof(h));
+        off += sizeof(h);
+        Packet p;
+        p.opcode = static_cast<GpuOpcode>(h.opcode);
+        p.payload.assign(buf.data() + off, buf.data() + off + h.payload_bytes);
+        off += h.payload_bytes;
+        out.push_back(std::move(p));
+    }
+    CHECK(off == buf.size());
+    return out;
+}
+
+void test_dirty_texture_memory_upload() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+
+    {
+        std::vector<uint8_t> submitted;
+        dg::DeviceOptions dev_opts;
+        dev_opts.sink = [&submitted](const uint8_t* data, size_t size) {
+            submitted.insert(submitted.end(), data, data + size);
+        };
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        auto make_tex_desc = [](uint32_t w, uint32_t h, uint32_t fmt, uint32_t layout, uint32_t flags = 0) {
+            dg::GuestResourceDesc d{};
+            d.Dimension = dg::ResourceDimension::Texture2D;
+            d.Width = w;
+            d.Height = h;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = fmt;
+            d.SampleCount = 1;
+            d.Layout = layout;
+            d.Flags = flags;
+            return d;
+        };
+
+        // 1) Allocate guest memory for a 4x4 RGBA8 linear texture (layout 0) and create address-backed Resource.
+        const uint64_t tex_mem =
+            arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(tex_mem != 0);
+        dg::Resource::Placement pl_addr{};
+        pl_addr.address = tex_mem;
+        auto tex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+                                                    make_tex_desc(4, 4, 28 /*R8G8B8A8_UNORM*/, 0), pl_addr, 0u);
+        CHECK(tex && tex->initialize());
+
+        // Verify CreateTexture2 emitted with TEXTURE_BINDING | COPY_DST usage.
+        bool saw_create_tex2 = false;
+        for (const Packet& pk : decode_bytes(submitted)) {
+            if (pk.opcode == GpuOpcode::CreateTexture2) {
+                const auto ct = pod<GpuCreateTexture2Payload>(pk);
+                if (ct.id == tex->id()) {
+                    saw_create_tex2 = true;
+                    CHECK((ct.usage_flags & GpuTextureUsage::TextureBinding) != 0);
+                    CHECK((ct.usage_flags & GpuTextureUsage::CopyDst) != 0);
+                }
+            }
+        }
+        CHECK(saw_create_tex2);
+
+        // Set up a render target, SRV heap, root signature, pipeline layout, and PSO on the device's state bridge.
+        dg::Resource::Placement pl_rt{};
+        pl_rt.heap.Type = dg::HeapType::Default;
+        auto rt = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(64, 64, 87 /*B8G8R8A8_UNORM*/, 0, dg::ResourceFlags::AllowRenderTarget), pl_rt, 0u);
+        CHECK(rt && rt->initialize());
+
+        d3d::DescriptorHeap* rtv_heap = make_heap(device->heaps(), d3d::DescriptorHeapType::Rtv, 2, false);
+        d3d::DescriptorHeap* srv_heap = make_heap(device->heaps(), d3d::DescriptorHeapType::CbvSrvUav, 8, true);
+        CHECK(device->heaps().create_render_target_view(rt->id(), nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::ViewDesc srv{};
+        srv.format = 28;
+        srv.dimension = d3d::ViewDimension::Texture2D;
+        srv.first_mip = 0;
+        srv.mip_levels = 1;
+        CHECK(device->heaps().create_shader_resource_view(tex->id(), &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        constexpr uint64_t kVs = 0x49B1, kPs = 0x49B2, kCs = 0x49B3;
+        device->register_shader_module(kVs, 11);
+        device->register_shader_module(kPs, 12);
+        device->register_shader_module(kCs, 13);
+
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Srv;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs_desc.parameters.push_back(table);
+        d3d::RootSignature root_sig;
+        CHECK(d3d::RootSignature::build(rs_desc, &root_sig).ok());
+
+        bridge::PipelineLayoutDesc gfx_layout;
+        bridge::GroupLayoutDesc gfx_group;
+        gfx_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                                   static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                                   static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                      join(0, d3d::DescriptorRangeType::Srv, 0)});
+        gfx_layout.groups.push_back(gfx_group);
+        device->state_bridge().register_pipeline_layout(kVs, kPs, gfx_layout);
+
+        bridge::PipelineLayoutDesc cmp_layout;
+        bridge::GroupLayoutDesc cmp_group;
+        cmp_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture,
+                                                   static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                                   static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                      join(0, d3d::DescriptorRangeType::Srv, 0)});
+        cmp_layout.groups.push_back(cmp_group);
+        device->state_bridge().register_pipeline_layout(kCs, 0, cmp_layout);
+
+        pso::D3D12GraphicsPsoDesc pso_d = Scene::pso_desc();
+        pso_d.vs = kVs;
+        pso_d.ps = kPs;
+        pso_d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+        auto gfx_pso = device->state_bridge().create_graphics_pipeline_state(pso_d, &root_sig);
+        CHECK(gfx_pso && gfx_pso->diagnostics() == 0);
+
+        pso::D3D12ComputePsoDesc cpso_d{};
+        cpso_d.cs = kCs;
+        cpso_d.root_signature_id = 77;
+        auto cmp_pso = device->state_bridge().create_compute_pipeline_state(cpso_d, &root_sig);
+        CHECK(cmp_pso && cmp_pso->diagnostics() == 0);
+
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device->state_bridge(), enc);
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&root_sig) == d3d::Status::Ok);
+        list.SetPipelineState(gfx_pso.get());
+        CHECK(list.SetGraphicsRootDescriptorTable(0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{200, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        auto count_write_textures = [&](size_t from) {
+            std::vector<Packet> out;
+            for (const Packet& pk : decode(enc, from)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    out.push_back(pk);
+                }
+            }
+            return out;
+        };
+
+        // Case A1: All-zero guest texture memory that has never been uploaded -> 0 WriteTexture packets.
+        size_t mark = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(count_write_textures(mark).empty());
+        CHECK(device->stats().textures_uploaded == 0);
+        CHECK(device->stats().upload_bytes == 0);
+
+        // Case A2: Write non-zero 4x4 RGBA8 texels -> 1 WriteTexture packet with 256-byte aligned row pitch.
+        std::array<uint8_t, 64> texels{};
+        for (size_t i = 0; i < texels.size(); ++i) {
+            texels[i] = static_cast<uint8_t>(0x10u + i);
+        }
+        CHECK(com::write_guest(tex_mem, texels.data(), texels.size()));
+        mark = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        auto wt1 = count_write_textures(mark);
+        CHECK(wt1.size() == 1);
+        if (wt1.size() == 1) {
+            const auto wt = pod<GpuWriteTexturePayload>(wt1[0]);
+            CHECK(wt.texture_id == tex->id());
+            CHECK(wt.mip_level == 0 && wt.origin_x == 0 && wt.origin_y == 0 && wt.origin_z == 0);
+            CHECK(wt.width == 4 && wt.height == 4 && wt.depth_or_layers == 1);
+            CHECK(wt.bytes_per_row == 256 && (wt.bytes_per_row % 256) == 0);
+            CHECK(wt.rows_per_image == 4 && wt.data_len == 1024);
+            CHECK(wt1[0].payload.size() == sizeof(GpuWriteTexturePayload) + 1024);
+            const uint8_t* rows = wt1[0].payload.data() + sizeof(GpuWriteTexturePayload);
+            CHECK(std::memcmp(rows + 0 * 256, texels.data() + 0 * 16, 16) == 0);
+            CHECK(std::memcmp(rows + 3 * 256, texels.data() + 3 * 16, 16) == 0);
+        }
+        CHECK(device->stats().textures_uploaded == 1);
+        CHECK(device->stats().upload_bytes == 1024);
+        dg::TrackedTexture info{};
+        CHECK(device->tracked_texture_info(tex->id(), &info) && info.ever_uploaded && info.last_upload_hash != 0);
+
+        // Case A3: Unchanged memory on subsequent draw -> skips re-upload.
+        mark = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(count_write_textures(mark).empty());
+        CHECK(device->stats().textures_uploaded == 1);
+
+        // Case A4: Modified guest memory -> triggers a 2nd WriteTexture upload.
+        texels[0] = 0xFE;
+        CHECK(com::write_guest(tex_mem, texels.data(), texels.size()));
+        mark = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        auto wt2 = count_write_textures(mark);
+        CHECK(wt2.size() == 1);
+        if (wt2.size() == 1) {
+            const uint8_t* rows = wt2[0].payload.data() + sizeof(GpuWriteTexturePayload);
+            CHECK(rows[0] == 0xFE);
+        }
+        CHECK(device->stats().textures_uploaded == 2);
+        CHECK(device->stats().upload_bytes == 2048);
+
+        // Case B: Compute dispatch with modified texture triggers WriteTexture as well.
+        texels[1] = 0xCC;
+        CHECK(com::write_guest(tex_mem, texels.data(), texels.size()));
+        CHECK(list.SetComputeRootSignature(&root_sig) == d3d::Status::Ok);
+        list.SetComputePipelineState(cmp_pso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+        mark = enc.size();
+        list.Dispatch(1, 1, 1);
+        CHECK(count_write_textures(mark).size() == 1);
+        CHECK(device->stats().textures_uploaded == 3);
+        mark = enc.size();
+        list.Dispatch(1, 1, 1);
+        CHECK(count_write_textures(mark).empty());
+        list.Close();
+
+        // Case C: GPU-window alias translation + guard-page / unmapped safety.
+        const uint64_t cpu_win =
+            arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        const uint64_t gpu_win = 0x0000'5000'0000'0000ull;
+        device->register_gpu_alias(gpu_win, cpu_win, 65536);
+        dg::Resource::Placement pl_alias{};
+        pl_alias.address = gpu_win;
+        auto alias_tex = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(2, 2, 28, 0), pl_alias, 0u);
+        CHECK(alias_tex && alias_tex->initialize());
+        const uint32_t px[4] = {0xFF0000FFu, 0xFF00FF00u, 0xFFFF0000u, 0xFFFFFFFFu};
+        CHECK(com::write_guest(cpu_win, px, sizeof(px)));
+        gpu::CommandEncoder alias_enc;
+        CHECK(device->sync_bound_texture_memory(alias_tex->id(), alias_enc));
+        CHECK(decode(alias_enc).size() == 1 && decode(alias_enc)[0].opcode == GpuOpcode::WriteTexture);
+
+        // Guard / PAGE_NOACCESS page: must safely skip without crashing.
+        const uint64_t guard_mem =
+            arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::NoAccess);
+        CHECK(guard_mem != 0);
+        dg::Resource::Placement pl_guard{};
+        pl_guard.address = guard_mem;
+        auto guard_tex = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(4, 4, 28, 0), pl_guard, 0u);
+        CHECK(guard_tex && guard_tex->initialize());
+        gpu::CommandEncoder guard_enc;
+        CHECK(!device->sync_bound_texture_memory(guard_tex->id(), guard_enc));
+        CHECK(guard_enc.size() == 0);
+
+        // Case D: Tiled console layouts (layout >= 0x101) — tiny 2x2 uploads immediately; 4x4 uses DetileFn hook.
+        const uint64_t tiled_mem =
+            arena.virtual_alloc(0, 65536, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(com::write_guest(tiled_mem, texels.data(), texels.size()));
+
+        dg::Resource::Placement pl_tiled_tiny{};
+        pl_tiled_tiny.address = tiled_mem;
+        auto tiled_tiny = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(2, 2, 28, 0x102), pl_tiled_tiny, 0u);
+        CHECK(tiled_tiny && tiled_tiny->initialize());
+        gpu::CommandEncoder tiny_enc;
+        CHECK(device->sync_bound_texture_memory(tiled_tiny->id(), tiny_enc));
+        CHECK(decode(tiny_enc).size() == 1 && decode(tiny_enc)[0].opcode == GpuOpcode::WriteTexture);
+
+        dg::Resource::Placement pl_tiled_4x4{};
+        pl_tiled_4x4.address = tiled_mem;
+        auto tiled_4x4 = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(4, 4, 28, 0x102), pl_tiled_4x4, 0u);
+        CHECK(tiled_4x4 && tiled_4x4->initialize());
+        gpu::CommandEncoder tiled_enc1;
+        CHECK(!device->sync_bound_texture_memory(tiled_4x4->id(), tiled_enc1));
+        CHECK(tiled_enc1.size() == 0);
+
+        // Install pluggable DetileFn hook (G49a integration point).
+        int detile_calls = 0;
+        device->set_detile_fn([&](const dg::TextureDetileRequest& req, const uint8_t* src, size_t src_bytes,
+                                  uint8_t* dst, size_t dst_bytes) {
+            ++detile_calls;
+            CHECK(req.layout == 0x102 && req.width == 4 && req.height == 4 && req.dst_row_pitch == 256);
+            CHECK(src_bytes >= 64 && dst_bytes >= 1024);
+            for (uint32_t y = 0; y < req.height; ++y) {
+                for (uint32_t b = 0; b < 16; ++b) {
+                    dst[y * req.dst_row_pitch + b] = static_cast<uint8_t>(src[y * 16 + b] ^ 0x5Au);
+                }
+            }
+            return true;
+        });
+        gpu::CommandEncoder tiled_enc2;
+        CHECK(device->sync_bound_texture_memory(tiled_4x4->id(), tiled_enc2));
+        CHECK(detile_calls == 1);
+        const auto tiled_pkts = decode(tiled_enc2);
+        CHECK(tiled_pkts.size() == 1 && tiled_pkts[0].opcode == GpuOpcode::WriteTexture);
+        if (tiled_pkts.size() == 1) {
+            const uint8_t* rows = tiled_pkts[0].payload.data() + sizeof(GpuWriteTexturePayload);
+            CHECK(rows[0] == static_cast<uint8_t>(texels[0] ^ 0x5Au));
+        }
+
+        // Case E: Committed CPU-visible texture gets guest memory backing and uploads on sync.
+        dg::Resource::Placement pl_committed{};
+        pl_committed.heap.Type = dg::HeapType::Custom;
+        pl_committed.heap.CPUPageProperty = 2;  // WRITE_COMBINE
+        auto comm_tex = com::create_object<dg::Resource>(
+            com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+            make_tex_desc(4, 2, 28, 1), pl_committed, 0u);
+        CHECK(comm_tex && comm_tex->initialize() && comm_tex->gpu_va() != 0);
+        CHECK(com::write_guest(comm_tex->gpu_va(), texels.data(), 32));
+        gpu::CommandEncoder comm_enc;
+        CHECK(device->sync_bound_texture_memory(comm_tex->id(), comm_enc));
+        CHECK(decode(comm_enc).size() == 1 && decode(comm_enc)[0].opcode == GpuOpcode::WriteTexture);
+
+        // Destroy resources and verify untrack cleans up.
+        const uint32_t tex_id = tex->id();
+        tex.reset();
+        CHECK(!device->tracked_texture_info(tex_id, nullptr));
+    }
+
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// ------------------------------------------------------------------------------------------------
+// G49b: GPU Fence completion audit & ExecuteCommandLists / PresentX com::Ref lifetime audit
+// ------------------------------------------------------------------------------------------------
+
+void test_fence_completion_and_ref_lifetime() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+
+    {
+        dg::DeviceOptions dev_opts;
+        dev_opts.sink = [](const uint8_t*, size_t) {};
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        dg::GuestCommandQueueDesc qdesc{};
+        qdesc.Type = 0;  // DIRECT
+        auto queue = com::create_object<dg::CommandQueue>(com::implements(dg::kID3D12CommandQueue),
+                                                          dg::device_ref(device.get()), qdesc);
+        auto fence = com::create_object<dg::Fence>(com::implements(dg::kID3D12Fence), dg::device_ref(device.get()),
+                                                   10ull, 0u);
+        CHECK(queue && fence);
+        const uint64_t fence_ptr = fence->interface_pointer(dg::kID3D12Fence);
+        const uint64_t word_va = fence->CompletedValueAddress();
+        CHECK(word_va != 0);
+        uint64_t published = 0;
+        CHECK(com::read_guest(word_va, published) && published == 10ull);
+
+        // 1) Pre-signalled SetEventOnCompletion: immediately signals event & null handle returns immediately.
+        const Pg6Handle ev_pre = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+        CHECK(ev_pre != 0);
+        CHECK(fence->SetEventOnCompletion(10, ev_pre) == dg::kSOk);
+        CHECK(pg6_win32_wait_for_single_object(ev_pre, 0) == os::win32::WAIT_OBJECT_0);
+        CHECK(fence->SetEventOnCompletion(5, 0) == dg::kSOk);
+        pg6_win32_close_handle(ev_pre);
+
+        // 2) Post-signalled multi-waiter: <= value wake up, > value stay pending until later signal.
+        const Pg6Handle ev_15a = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+        const Pg6Handle ev_15b = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+        const Pg6Handle ev_12 = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+        const Pg6Handle ev_20 = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+        CHECK(fence->SetEventOnCompletion(15, ev_15a) == dg::kSOk);
+        CHECK(fence->SetEventOnCompletion(15, ev_15b) == dg::kSOk);
+        CHECK(fence->SetEventOnCompletion(12, ev_12) == dg::kSOk);
+        CHECK(fence->SetEventOnCompletion(20, ev_20) == dg::kSOk);
+        CHECK(pg6_win32_wait_for_single_object(ev_12, 0) == os::win32::WAIT_TIMEOUT);
+
+        auto fence_arg = com::InterfaceArg<dg::IFenceHost>::resolve(fence_ptr);
+        CHECK(fence_arg && queue->Signal(fence_arg, 15) == dg::kSOk);
+        CHECK(fence->GetCompletedValue() == 15);
+        CHECK(com::read_guest(word_va, published) && published == 15ull);
+        CHECK(pg6_win32_wait_for_single_object(ev_12, 0) == os::win32::WAIT_OBJECT_0);
+        CHECK(pg6_win32_wait_for_single_object(ev_15a, 0) == os::win32::WAIT_OBJECT_0);
+        CHECK(pg6_win32_wait_for_single_object(ev_15b, 0) == os::win32::WAIT_OBJECT_0);
+        CHECK(pg6_win32_wait_for_single_object(ev_20, 0) == os::win32::WAIT_TIMEOUT);
+
+        // Out-of-order lower CommandQueue::Signal must not regress completed value.
+        CHECK(queue->Signal(fence_arg, 11) == dg::kSOk);
+        CHECK(fence->GetCompletedValue() == 15);
+        CHECK(queue->Signal(fence_arg, 20) == dg::kSOk);
+        CHECK(fence->GetCompletedValue() == 20);
+        CHECK(pg6_win32_wait_for_single_object(ev_20, 0) == os::win32::WAIT_OBJECT_0);
+        pg6_win32_close_handle(ev_15a);
+        pg6_win32_close_handle(ev_15b);
+        pg6_win32_close_handle(ev_12);
+        pg6_win32_close_handle(ev_20);
+
+        // 3) 64-thread multi-waiter + concurrent CommandQueue::Signal stress test (event + null-handle waiters).
+        constexpr uint64_t kBase = 100;
+        constexpr uint32_t kEventWaiters = 32;
+        constexpr uint32_t kSyncWaiters = 16;
+        constexpr uint32_t kSignallers = 16;
+        std::atomic<uint32_t> woken_events{0};
+        std::atomic<uint32_t> woken_sync{0};
+        std::vector<std::thread> threads;
+        threads.reserve(kEventWaiters + kSyncWaiters + kSignallers);
+
+        for (uint32_t i = 0; i < kEventWaiters; ++i) {
+            threads.emplace_back([&, i] {
+                const uint64_t target = kBase + (i % kSignallers) + 1;
+                const Pg6Handle ev = pg6_win32_create_event_w(nullptr, 1, 0, nullptr);
+                CHECK(ev != 0);
+                CHECK(fence->SetEventOnCompletion(target, ev) == dg::kSOk);
+                const uint32_t wait_rc = pg6_win32_wait_for_single_object(ev, 5000);
+                CHECK(wait_rc == os::win32::WAIT_OBJECT_0);
+                CHECK(fence->GetCompletedValue() >= target);
+                pg6_win32_close_handle(ev);
+                woken_events.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        for (uint32_t i = 0; i < kSyncWaiters; ++i) {
+            threads.emplace_back([&, i] {
+                const uint64_t target = kBase + i + 1;
+                CHECK(fence->SetEventOnCompletion(target, 0) == dg::kSOk);
+                CHECK(fence->GetCompletedValue() >= target);
+                woken_sync.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        for (uint32_t i = 0; i < kSignallers; ++i) {
+            threads.emplace_back([&, i] {
+                // Deliberately signal in scrambled order to verify monotonic advance across threads.
+                const uint64_t val = kBase + ((i * 7 + 3) % kSignallers) + 1;
+                auto arg = com::InterfaceArg<dg::IFenceHost>::resolve(fence_ptr);
+                CHECK(arg && queue->Signal(arg, val) == dg::kSOk);
+            });
+        }
+        for (std::thread& th : threads) {
+            th.join();
+        }
+        CHECK(woken_events.load() == kEventWaiters);
+        CHECK(woken_sync.load() == kSyncWaiters);
+        CHECK(fence->GetCompletedValue() == kBase + kSignallers);
+        CHECK(com::read_guest(word_va, published) && published == kBase + kSignallers);
+
+        // 4) Zero com::Ref leaks across repeated ExecuteCommandLists + PresentX cycles.
+        {
+            dg::GuestResourceDesc rt_desc{};
+            rt_desc.Dimension = dg::ResourceDimension::Texture2D;
+            rt_desc.Width = 64;
+            rt_desc.Height = 64;
+            rt_desc.DepthOrArraySize = 1;
+            rt_desc.MipLevels = 1;
+            rt_desc.Format = 87;  // B8G8R8A8_UNORM
+            rt_desc.SampleCount = 1;
+            rt_desc.Flags = dg::ResourceFlags::AllowRenderTarget;
+            dg::Resource::Placement pl{};
+            pl.heap.Type = dg::HeapType::Default;
+            auto back_buf = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                             dg::device_ref(device.get()), rt_desc, pl, 0u);
+            CHECK(back_buf && back_buf->initialize());
+
+            auto alloc = com::create_object<dg::CommandAllocator>(com::implements(dg::kID3D12CommandAllocator),
+                                                                  dg::device_ref(device.get()), 0u);
+            auto cmd = com::create_object<dg::CommandList>(com::implements(dg::kID3D12GraphicsCommandList),
+                                                           dg::device_ref(device.get()), 0u);
+            CHECK(alloc && cmd);
+            cmd->initialize_guest_payload();
+            cmd->reset(nullptr);
+
+            const uint64_t bb_ptr = back_buf->interface_pointer(dg::kID3D12Resource);
+            const uint64_t cmd_ptr = cmd->interface_pointer(dg::kID3D12GraphicsCommandList);
+            const uint64_t alloc_ptr = alloc->interface_pointer(dg::kID3D12CommandAllocator);
+            const uint64_t bb_slot = com::guest_alloc(sizeof(uint64_t));
+            CHECK(bb_slot != 0 && com::write_guest(bb_slot, bb_ptr));
+
+            dg::xbox::GuestPresentPlaneX plane{};
+            plane.Token = 1;
+            plane.ResourceCount = 1;
+            plane.ppResources = bb_slot;
+            const uint64_t plane_va = com::guest_alloc(sizeof(plane));
+            CHECK(plane_va != 0 && com::write_guest(plane_va, plane));
+
+            const uint32_t bb_refs_before = back_buf->ref_count();
+            const uint32_t cmd_refs_before = cmd->ref_count();
+            const uint32_t fence_refs_before = fence->ref_count();
+
+            for (uint32_t iter = 0; iter < 16; ++iter) {
+                CHECK(cmd->Close() == dg::kSOk);
+                queue->execute({cmd_ptr});
+                plane.Token = iter + 1;
+                CHECK(com::write_guest(plane_va, plane));
+                CHECK(queue->PresentX(1, plane_va, 0) == dg::kSOk);
+                CHECK(queue->Signal(com::InterfaceArg<dg::IFenceHost>::resolve(fence_ptr), 200 + iter) == dg::kSOk);
+                CHECK(cmd->Reset(com::InterfaceArg<dg::ICommandAllocatorHost>::resolve(alloc_ptr), {}) == dg::kSOk);
+                CHECK(back_buf->ref_count() == bb_refs_before);
+                CHECK(cmd->ref_count() == cmd_refs_before);
+                CHECK(fence->ref_count() == fence_refs_before);
+            }
+            CHECK(back_buf->is_back_buffer());
+            com::guest_free(plane_va);
+            com::guest_free(bb_slot);
+        }
+        CHECK(device->stats().resources == 0);
+        CHECK(device->stats().command_lists == 0);
+    }
+
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 int main() {
     test_seam_conversions();
     test_memory_backed_tables();
@@ -1204,6 +1731,8 @@ int main() {
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
     test_concurrent_command_lists();
+    test_dirty_texture_memory_upload();
+    test_fence_completion_and_ref_lifetime();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
