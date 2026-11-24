@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26)."""
 
 from __future__ import annotations
 
@@ -1619,6 +1619,360 @@ class TestStripPthreadOptAndV8SizeLimit(unittest.TestCase):
             self.assertIn(f"Wasm size: {oversized_bytes} bytes", big_text)
             self.assertIn("[EXCEEDS V8 1 GiB LIMIT]", big_text)
             self.assertIn("--opt Oz", big_text)
+
+
+class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        (repo / "runtime").mkdir(exist_ok=True)
+        return repo
+
+    def test_no_link_opt_omits_link_opt_while_compiling_shards_at_opt(self) -> None:
+        # Direct helper checks for Oz, Os, and O2.
+        for opt_level in ("Oz", "Os", "O2"):
+            flags = bgw.resolve_link_flags(opt=opt_level, strip=True, no_link_opt=True)
+            self.assertFalse(
+                any(f.startswith("-O") for f in flags),
+                f"unexpected -O* flag in {flags}",
+            )
+            self.assertIn("-Wl,--strip-all", flags)
+            self.assertIn("-sASSERTIONS=0", flags)
+
+        # Backwards compatibility: no_link_opt=False (default) still appends -Oz/-Os.
+        self.assertIn("-Oz", bgw.resolve_link_flags(opt="Oz"))
+        self.assertIn("-Os", bgw.resolve_link_flags(opt="Os"))
+
+        # build_link_argv forwards no_link_opt to resolve_link_flags.
+        link_argv = bgw.build_link_argv(
+            "em++",
+            [Path("a.o")],
+            output_js=Path("web/dist/runtime.js"),
+            opt="Oz",
+            strip=True,
+            no_link_opt=True,
+        )
+        self.assertFalse(any(t.startswith("-O") for t in link_argv), link_argv)
+        self.assertIn("-Wl,--strip-all", link_argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                opt="Oz",
+                strip=True,
+                no_link_opt=True,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertTrue(report.no_link_opt)
+            self.assertEqual(report.shrink_largest_shards, 0)
+            self.assertIn("-Oz", report.compile_flags)
+            self.assertTrue(all("-Oz" in call for call in runner.compile_calls))
+            self.assertEqual(len(runner.link_calls), 1)
+            link = runner.link_calls[0]
+            self.assertFalse(any(t.startswith("-O") for t in link), link)
+            self.assertFalse(any(t.startswith("-O") for t in report.link_flags), report.link_flags)
+            self.assertFalse(any(t.startswith("-O") for t in report.link_argv), report.link_argv)
+            self.assertIn("-Wl,--strip-all", link)
+            self.assertIn("-sASSERTIONS=0", link)
+
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertTrue(payload["no_link_opt"])
+            self.assertEqual(payload["shrink_largest_shards"], 0)
+            self.assertIn("-Oz", payload["compile_flags"])
+            self.assertNotIn("-Oz", payload["link_flags"])
+            self.assertNotIn("-Oz", payload["link_argv"])
+
+            text = bgw.format_report_text(report)
+            self.assertIn("No link opt: yes", text)
+
+            # CLI --opt Oz --no-link-opt --strip in dry-run JSON mode.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--opt",
+                    "Oz",
+                    "--no-link-opt",
+                    "--strip",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-cli"),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            cli_payload = json.loads(out)
+            self.assertTrue(cli_payload["ok"])
+            self.assertTrue(cli_payload["no_link_opt"])
+            self.assertEqual(cli_payload["shrink_largest_shards"], 0)
+            self.assertIn("-Oz", cli_payload["compile_flags"])
+            self.assertFalse(any(t.startswith("-O") for t in cli_payload["link_flags"]))
+            self.assertFalse(any(t.startswith("-O") for t in cli_payload["link_argv"]))
+            self.assertIn("-Wl,--strip-all", cli_payload["link_argv"])
+            for unit in cli_payload["sources"]:
+                self.assertIn("-Oz", unit["argv"])
+
+    def test_shrink_largest_shards_by_file_size_tiebreak_and_warm_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = root / "recomp-out"
+            # Distinct sizes with a tie on shard-00000 and shard-00002 (both 200 bytes).
+            # functions.ll and .cpp are larger on disk but must NOT be chosen over shard-*.ll.
+            _write(src / "lift" / "shard-00000.ll", ";" + "a" * 198 + "\n")
+            _write(src / "lift" / "shard-00001.ll", ";" + "b" * 498 + "\n")
+            _write(src / "lift" / "shard-00002.ll", ";" + "c" * 198 + "\n")
+            _write(src / "lift" / "shard-00003.ll", ";" + "d" * 48 + "\n")
+            _write(src / "lift" / "functions.ll", ";" + "f" * 998 + "\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "//" + "t" * 997 + "\n")
+
+            units = bgw.discover_sources(src)
+            picked = bgw.select_shrink_shards(units, 2)
+            # Top-2: shard-00001.ll (500 B), then shard-00000.ll (200 B, tie-broken before shard-00002.ll).
+            self.assertEqual(picked, frozenset({"lift/shard-00001.ll", "lift/shard-00000.ll"}))
+
+            cache = root / "cache"
+
+            # Step 1: Warm the cache at -O1 (shrink_largest_shards=0).
+            runner_o1 = RecordingRunner()
+            first = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-o1",
+                jobs=2,
+                opt="O1",
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_o1,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(first.ok, first.errors)
+            self.assertEqual(first.cache_misses, 6)
+            self.assertEqual(first.cache_hits, 0)
+            self.assertTrue(all("-O1" in call for call in runner_o1.compile_calls))
+            o1_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+
+            # Step 2: Re-run with --opt O1 --shrink-largest-shards 2 using the same cache.
+            # Only the top-2 largest shards should recompile (at -Oz with new cache keys);
+            # the other 4 units reuse their cached -O1 objects!
+            runner_shrink = RecordingRunner()
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-shrink",
+                jobs=2,
+                opt="O1",
+                shrink_largest_shards=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_shrink,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second.shrink_largest_shards, 2)
+            self.assertEqual(second.cache_hits, 4)
+            self.assertEqual(second.cache_misses, 2)
+            self.assertEqual(len(runner_shrink.compile_calls), 2)
+
+            by_id = {u.unit.unit_id: u for u in second.sources}
+            for unit_id in ("lift/shard-00000.ll", "lift/shard-00001.ll"):
+                item = by_id[unit_id]
+                self.assertEqual(item.status, "compiled")
+                self.assertIn("-Oz", item.argv)
+                self.assertNotIn("-O1", item.argv)
+                self.assertNotEqual(item.cache_key, o1_keys[unit_id])
+            for unit_id in (
+                "lift/shard-00002.ll",
+                "lift/shard-00003.ll",
+                "lift/functions.ll",
+                "stubs/pg6_import_thunks.cpp",
+            ):
+                item = by_id[unit_id]
+                self.assertEqual(item.status, "hit")
+                self.assertIn("-O1", item.argv)
+                self.assertNotIn("-Oz", item.argv)
+                self.assertEqual(item.cache_key, o1_keys[unit_id])
+
+            for call in runner_shrink.compile_calls:
+                self.assertIn("-Oz", call)
+                self.assertNotIn("-O1", call)
+            self.assertFalse(any(t.startswith("-O") for t in runner_shrink.link_calls[0]))
+
+            payload = json.loads(bgw.report_to_json(second))
+            self.assertEqual(payload["shrink_largest_shards"], 2)
+            self.assertFalse(payload["no_link_opt"])
+            text = bgw.format_report_text(second)
+            self.assertIn("Shrink largest shards: 2", text)
+
+            # Step 3: Repeating --opt O1 --shrink-largest-shards 2 hits the cache for all 6 units.
+            runner_warm = RecordingRunner()
+            third = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist-warm",
+                jobs=2,
+                opt="O1",
+                shrink_largest_shards=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_warm,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(third.ok, third.errors)
+            self.assertEqual(third.cache_hits, 6)
+            self.assertEqual(third.cache_misses, 0)
+            self.assertEqual(runner_warm.compile_calls, [])
+
+    def test_shrink_largest_shards_manifest_instructions_oz_noop_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            prog_src = _program_layout(root)
+
+            # In _program_layout:
+            #   main/lift/shard-00002.ll: 30 instructions
+            #   main/lift/shard-00001.ll: 20 instructions
+            #   vcruntime140/lift/shard-00001.ll: 20 instructions
+            #   main/lift/shard-00000.ll: 10 instructions
+            #   vcruntime140/lift/shard-00000.ll: 10 instructions
+            # Tie on 20 instructions breaks deterministically by unit_id ("main/..." < "vcruntime140/...").
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=prog_src,
+                repo_root=repo,
+                cache_dir=root / "cache-prog",
+                out_dir=root / "dist-prog",
+                jobs=2,
+                opt="O1",
+                shrink_largest_shards=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            expected_oz = {"main/lift/shard-00002.ll", "main/lift/shard-00001.ll"}
+            for item in report.sources:
+                if item.unit.unit_id in expected_oz:
+                    self.assertIn("-Oz", item.argv, item.unit.unit_id)
+                    self.assertNotIn("-O1", item.argv, item.unit.unit_id)
+                else:
+                    self.assertIn("-O1", item.argv, item.unit.unit_id)
+                    self.assertNotIn("-Oz", item.argv, item.unit.unit_id)
+
+            # When opt is already Oz, shrink_largest_shards is a clean no-op (single -Oz flag).
+            runner_oz = RecordingRunner()
+            report_oz = bgw.run_build(
+                source_dir=prog_src,
+                repo_root=repo,
+                cache_dir=root / "cache-oz",
+                out_dir=root / "dist-oz",
+                jobs=2,
+                opt="Oz",
+                no_link_opt=True,
+                shrink_largest_shards=2,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner_oz,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report_oz.ok, report_oz.errors)
+            self.assertEqual(report_oz.shrink_largest_shards, 2)
+            for item in report_oz.sources:
+                self.assertEqual(item.argv.count("-Oz"), 1, item.argv)
+
+            # Fallback for non-`shard-*` .ll layouts: picks largest .ll file and skips .cpp.
+            plain_src = root / "plain-out"
+            _write(plain_src / "shards" / "small.ll", "; s\n")
+            _write(plain_src / "shards" / "big.ll", ";" + "x" * 300 + "\n")
+            _write(plain_src / "thunks.cpp", "//" + "y" * 600 + "\n")
+            plain_units = bgw.discover_sources(plain_src)
+            self.assertEqual(bgw.select_shrink_shards(plain_units, 1), frozenset({"shards/big.ll"}))
+
+    def test_shrink_largest_shards_cli_and_negative_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = root / "recomp-out"
+            _write(src / "lift" / "shard-00000.ll", "; tiny\n")
+            _write(src / "lift" / "shard-00001.ll", ";" + "z" * 400 + "\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void t() {}\n")
+
+            with self.assertRaises(bgw.BuildGuestWasmError):
+                bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    shrink_largest_shards=-1,
+                    dry_run=True,
+                    which_fn=lambda _name: None,
+                )
+            with self.assertRaises(bgw.BuildGuestWasmError):
+                bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    shrink_largest_shards=True,  # type: ignore[arg-type]
+                    dry_run=True,
+                    which_fn=lambda _name: None,
+                )
+
+            bad_code, bad_out, _bad_err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--shrink-largest-shards",
+                    "-3",
+                    "--repo-root",
+                    str(repo),
+                ]
+            )
+            self.assertEqual(bad_code, 2)
+            bad_payload = json.loads(bad_out)
+            self.assertFalse(bad_payload["ok"])
+            self.assertTrue(any("shrink-largest-shards" in e for e in bad_payload["errors"]))
+
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--opt",
+                    "O1",
+                    "--no-link-opt",
+                    "--shrink-largest-shards",
+                    "1",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-cli"),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["no_link_opt"])
+            self.assertEqual(payload["shrink_largest_shards"], 1)
+            by_id = {u["id"]: u for u in payload["sources"]}
+            self.assertIn("-Oz", by_id["lift/shard-00001.ll"]["argv"])
+            self.assertNotIn("-O1", by_id["lift/shard-00001.ll"]["argv"])
+            self.assertIn("-O1", by_id["lift/shard-00000.ll"]["argv"])
+            self.assertNotIn("-Oz", by_id["lift/shard-00000.ll"]["argv"])
+            self.assertIn("-O1", by_id["stubs/pg6_import_thunks.cpp"]["argv"])
 
 
 class TestLinkFlagContract(unittest.TestCase):

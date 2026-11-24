@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -16,7 +16,8 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
     python tools/build_guest_wasm.py <recomp-out-dir>
         [--jobs N] [--cache-dir work/wasm_obj_cache] [--out-dir web/dist]
         [--opt O0|O1|O2|O3|Os|Oz] [--runtime-lib path/to/libplaygta6_core.a]
-        [--strip] [--pthread-pool-size N] [--extra-link-flag FLAG]
+        [--strip] [--no-link-opt] [--shrink-largest-shards N]
+        [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
 """
@@ -255,6 +256,8 @@ class BuildReport:
     object_bytes: int = 0
     wasm_bytes: int = 0
     exceeds_v8_1gib_limit: bool = False
+    no_link_opt: bool = False
+    shrink_largest_shards: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -264,6 +267,8 @@ class BuildReport:
             "toolchain": self.toolchain.to_dict() if self.toolchain else None,
             "jobs": self.jobs,
             "opt": self.opt,
+            "no_link_opt": self.no_link_opt,
+            "shrink_largest_shards": self.shrink_largest_shards,
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -704,6 +709,34 @@ def sample_units(units: Sequence[SourceUnit], count: int) -> list[SourceUnit]:
     return picked
 
 
+def select_shrink_shards(units: Sequence[SourceUnit], count: int) -> frozenset[str]:
+    """Return unit_ids of the top-`count` largest `.ll` shard units to compile at `-Oz`.
+
+    Prefers `shard-*.ll` units when present (excluding registration/thunks) and falls back
+    to all `.ll` units otherwise. Ranks by manifest instruction count when available,
+    otherwise by source file byte size, deterministically tie-broken by `unit_id`.
+    """
+    if count <= 0:
+        return frozenset()
+    candidates = [unit for unit in units if is_shard_unit(unit)]
+    if not candidates:
+        candidates = [unit for unit in units if unit.kind == "ll"]
+    if not candidates:
+        return frozenset()
+    use_instructions = any(unit.instructions > 0 for unit in candidates)
+    if use_instructions:
+        ranked = sorted(
+            candidates,
+            key=lambda u: (-u.instructions, u.unit_id),
+        )
+    else:
+        ranked = sorted(
+            candidates,
+            key=lambda u: (-_object_bytes(u.path), u.unit_id),
+        )
+    return frozenset(unit.unit_id for unit in ranked[:count])
+
+
 def _discover_tree_sources(
     root: Path,
     *,
@@ -901,6 +934,7 @@ def resolve_link_flags(
     strip: bool = False,
     pthread_pool_size: int | None = None,
     extra_link_flags: Sequence[str] = (),
+    no_link_opt: bool = False,
 ) -> tuple[str, ...]:
     """Compute effective linker flags for em++ from defaults and build options."""
     if pthread_pool_size is not None:
@@ -918,7 +952,7 @@ def resolve_link_flags(
     if pthread_pool_size is not None and not replaced_pool:
         flags.append(f"{PTHREAD_POOL_SIZE_PREFIX}{pthread_pool_size}")
 
-    if opt in LINK_OPT_LEVELS:
+    if not no_link_opt and opt in LINK_OPT_LEVELS:
         opt_flag = f"-{opt}"
         if opt_flag not in flags:
             flags.append(opt_flag)
@@ -967,6 +1001,7 @@ def build_link_argv(
     opt: str = "O2",
     strip: bool = False,
     pthread_pool_size: int | None = None,
+    no_link_opt: bool = False,
 ) -> tuple[str, ...]:
     if link_flags is None:
         effective_flags = resolve_link_flags(
@@ -974,6 +1009,7 @@ def build_link_argv(
             strip=strip,
             pthread_pool_size=pthread_pool_size,
             extra_link_flags=extra_flags,
+            no_link_opt=no_link_opt,
         )
     else:
         effective_flags = (*link_flags, *extra_flags)
@@ -1237,6 +1273,8 @@ def run_build(
     response_file: bool | None = None,
     link_guest_boot: bool = False,
     guest_boot_entry: Path | None = None,
+    no_link_opt: bool = False,
+    shrink_largest_shards: int = 0,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -1245,11 +1283,14 @@ def run_build(
         raise BuildGuestWasmError("--jobs must be >= 1")
     if sample < 0:
         raise BuildGuestWasmError("--sample must be >= 0")
+    if isinstance(shrink_largest_shards, bool) or shrink_largest_shards < 0:
+        raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
     effective_link_flags = resolve_link_flags(
         opt=opt_level,
         strip=strip,
         pthread_pool_size=pthread_pool_size,
         extra_link_flags=extra_link_flags,
+        no_link_opt=no_link_opt,
     )
 
     runner = run_command or default_run_command
@@ -1272,6 +1313,8 @@ def run_build(
         link_flags=effective_link_flags,
         linked_guest_boot=link_guest_boot,
         sample=sample,
+        no_link_opt=no_link_opt,
+        shrink_largest_shards=shrink_largest_shards,
     )
 
     if not toolchain.ok:
@@ -1343,6 +1386,11 @@ def run_build(
         if program_build
         else (BOOT_LINKED_GUEST_DEFINE,)
     )
+    shrink_ids: frozenset[str] = (
+        select_shrink_shards(units, shrink_largest_shards)
+        if shrink_largest_shards > 0 and opt_level != "Oz"
+        else frozenset()
+    )
     planned: list[UnitBuildResult] = []
     compile_tasks: list[tuple[SourceUnit, Path, tuple[str, ...]]] = []
     for unit in units:
@@ -1351,9 +1399,10 @@ def run_build(
             report.ok = False
             report.errors.append(f"no compiler for {unit.unit_id} ({unit.kind})")
             continue
+        unit_opt = "Oz" if unit.unit_id in shrink_ids else opt_level
         extra = boot_defines if link_guest_boot and unit.module == "boot" else ()
         flags = compile_flags_for(
-            opt=opt_level,
+            opt=unit_opt,
             kind=unit.kind,
             include_dirs=include_dirs,
             extra_flags=extra,
@@ -1520,6 +1569,10 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
     ]
     if report.linked_guest_boot:
         lines.append("  Linked guest boot: yes")
+    if report.no_link_opt:
+        lines.append("  No link opt: yes (skipping link-time -Os/-Oz wasm-opt)")
+    if report.shrink_largest_shards:
+        lines.append(f"  Shrink largest shards: {report.shrink_largest_shards} (compiled at -Oz)")
     if report.response_file:
         lines.append(f"  Response file: @{report.response_file}")
     if report.sample:
@@ -1629,6 +1682,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Strip debug/name sections at link time (-Wl,--strip-all -sASSERTIONS=0) "
             "to reduce runtime.wasm size."
+        ),
+    )
+    parser.add_argument(
+        "--no-link-opt",
+        action="store_true",
+        help=(
+            "Do not pass -Os/-Oz (or any -O* opt level) on the em++ link line, skipping "
+            "full-module Binaryen wasm-opt while still compiling shards with --opt."
+        ),
+    )
+    parser.add_argument(
+        "--shrink-largest-shards",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Compile the top-N largest .ll shards at -Oz instead of --opt (must be >= 0; "
+            "no-op when --opt is already Oz)."
         ),
     )
     parser.add_argument(
@@ -1784,6 +1855,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             response_file=response_file,
             link_guest_boot=args.link_guest_boot,
             guest_boot_entry=guest_boot_entry,
+            no_link_opt=args.no_link_opt,
+            shrink_largest_shards=args.shrink_largest_shards,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)
