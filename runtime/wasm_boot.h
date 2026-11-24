@@ -33,6 +33,9 @@ struct WasmBootConfig {
     HttpfsReadFn read_fn;   // empty: playgta6::os::httpfs_read
     HttpfsCloseFn close_fn; // empty: playgta6::os::httpfs_close
     LogFn log_fn;           // empty: playgta6::os::log
+    // Opt-in pipeline dump directory (empty: disabled unless PG6_DUMP_PIPELINES env
+    // or HTTPFS `shaders/dump_pipelines.flag` is present). Kept trailing for ABI safety.
+    std::string dump_pipelines_dir;
 };
 
 struct WasmBootResult {

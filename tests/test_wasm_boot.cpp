@@ -1,11 +1,14 @@
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -892,12 +895,17 @@ void test_program_boot_shader_pack_loading() {
         CHECK(ps_key == 0x2222ULL);
         CHECK(!unknown_resolved);
         bool saw_pack_log = false;
+        bool saw_gpu_stats = false;
         for (const std::string& line : g_logs) {
-            if (line == "[boot] SHADER_PACK: shaders/splash.wgsl.pack loaded (2 key(s))") {
+            if (line == "[boot] SHADER_PACK: shaders/splash.wgsl.pack loaded (2 key(s), primary)") {
                 saw_pack_log = true;
+            }
+            if (line.find("[boot] GPU_STATS: ") == 0) {
+                saw_gpu_stats = true;
             }
         }
         CHECK(saw_pack_log);
+        CHECK(saw_gpu_stats);
     }
 
     // 2. Missing preferred pack falls back to `shaders/fallback.wgsl.pack`.
@@ -921,12 +929,20 @@ void test_program_boot_shader_pack_loading() {
         CHECK(vs_key == 0x3333ULL);
         CHECK(ps_key == 0x4444ULL);
         CHECK(!unknown_resolved);
+        bool saw_fallback_notice = false;
         bool saw_pack_log = false;
         for (const std::string& line : g_logs) {
-            if (line == "[boot] SHADER_PACK: shaders/fallback.wgsl.pack loaded (2 key(s))") {
+            if (line ==
+                "[boot] SHADER_PACK: primary shaders/splash.wgsl.pack unavailable; falling back to "
+                "shaders/fallback.wgsl.pack") {
+                saw_fallback_notice = true;
+            }
+            if (line ==
+                "[boot] SHADER_PACK: shaders/fallback.wgsl.pack loaded (2 key(s), fallback)") {
                 saw_pack_log = true;
             }
         }
+        CHECK(saw_fallback_notice);
         CHECK(saw_pack_log);
     }
 
@@ -947,6 +963,13 @@ void test_program_boot_shader_pack_loading() {
         CHECK(r.exit_code == 42);
         CHECK(!resolved);
         CHECK(!unknown_resolved);
+        bool saw_none_log = false;
+        for (const std::string& line : g_logs) {
+            if (line == "[boot] SHADER_PACK: none loaded (draws will use unresolved PSOs)") {
+                saw_none_log = true;
+            }
+        }
+        CHECK(saw_none_log);
     }
 
     // 4. Malformed shader pack degrades cleanly without failing boot.
@@ -966,6 +989,241 @@ void test_program_boot_shader_pack_loading() {
         CHECK(r.ok);
         CHECK(r.exit_code == 42);
         CHECK(!resolved);
+    }
+}
+
+struct ScopedEnvVar {
+    std::string name;
+    bool had_prev = false;
+    std::string prev_value;
+
+    explicit ScopedEnvVar(const char* var_name) : name(var_name) {
+        if (const char* cur = std::getenv(var_name); cur != nullptr) {
+            had_prev = true;
+            prev_value = cur;
+        }
+    }
+
+    void set(const std::string& val) const {
+#ifdef _WIN32
+        _putenv_s(name.c_str(), val.c_str());
+#else
+        setenv(name.c_str(), val.c_str(), 1);
+#endif
+    }
+
+    void unset() const {
+#ifdef _WIN32
+        _putenv_s(name.c_str(), "");
+#else
+        unsetenv(name.c_str());
+#endif
+    }
+
+    ~ScopedEnvVar() {
+        if (had_prev) {
+            set(prev_value);
+        } else {
+            unset();
+        }
+    }
+
+    ScopedEnvVar(const ScopedEnvVar&) = delete;
+    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+};
+
+void test_program_boot_pipeline_dump_triggers() {
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace dx = playgta6::gpu::d3d12_xs_exports;
+
+    // Verify trailing-field aggregate initialization compatibility (without dump_pipelines_dir).
+    {
+        WasmBootConfig legacy_init{"boot/program-manifest.json",
+                                   "boot/guest.pgim",
+                                   "shaders/splash.wgsl.pack",
+                                   "shaders/fallback.wgsl.pack",
+                                   4096,
+                                   1024 * 1024,
+                                   {},
+                                   {},
+                                   {},
+                                   {}};
+        CHECK(legacy_init.dump_pipelines_dir.empty());
+    }
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto run_boot_with_hook = [&](const WasmBootConfig& cfg,
+                                  std::function<void()> hook) -> WasmBootResult {
+        g_test_entry_hook = std::move(hook);
+        playgta6::os::VirtualMemoryArena arena;
+        playgta6::os::win32::set_vmem_arena(&arena);
+        dx::reset_for_tests();
+        const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+        g_test_entry_hook = nullptr;
+        dx::reset_for_tests();
+        playgta6::guest::com::reset_com_bridge();
+        playgta6::guest::reset_boot();
+        playgta6::os::win32::set_vmem_arena(nullptr);
+        return r;
+    };
+
+    ScopedEnvVar env_guard("PG6_DUMP_PIPELINES");
+
+    // 1. Default WasmBootConfig does NOT enable pipeline dumping when flag & env are absent.
+    {
+        env_guard.unset();
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool device_created = false;
+        bool dump_active = true;
+        const WasmBootResult r = run_boot_with_hook(cfg, [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            auto dev = dx::current_device();
+            device_created = static_cast<bool>(dev);
+            if (dev) {
+                dump_active = (dev->pipeline_dump() != nullptr);
+            }
+        });
+        CHECK(r.ok);
+        CHECK(device_created);
+        CHECK(!dump_active);
+        CHECK(fs.handles.empty());
+        bool saw_dump_log = false;
+        for (const std::string& line : g_logs) {
+            if (line.find("[boot] PIPELINE_DUMP") == 0) {
+                saw_dump_log = true;
+            }
+        }
+        CHECK(!saw_dump_log);
+    }
+
+    // 2. Explicit cfg.dump_pipelines_dir enables dumping and emits PIPELINE_DUMP milestone.
+    {
+        env_guard.unset();
+        const std::filesystem::path temp_dir =
+            std::filesystem::temp_directory_path() / "pg6_test_wasm_boot_explicit_dump";
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir, ec);
+
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+        cfg.dump_pipelines_dir = temp_dir.string();
+
+        bool dump_active = false;
+        std::string observed_dir;
+        const WasmBootResult r = run_boot_with_hook(cfg, [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            auto dev = dx::current_device();
+            if (dev && dev->pipeline_dump() != nullptr) {
+                dump_active = true;
+                observed_dir = dev->pipeline_dump()->dir();
+            }
+        });
+        CHECK(r.ok);
+        CHECK(dump_active);
+        CHECK(observed_dir == cfg.dump_pipelines_dir);
+        CHECK(std::filesystem::exists(temp_dir / "manifest.json", ec));
+
+        bool saw_dump_log = false;
+        const std::string expected_line = "[boot] PIPELINE_DUMP: " + cfg.dump_pipelines_dir;
+        for (const std::string& line : g_logs) {
+            if (line == expected_line) {
+                saw_dump_log = true;
+            }
+        }
+        CHECK(saw_dump_log);
+
+        std::filesystem::remove_all(temp_dir, ec);
+    }
+
+    // 3. PG6_DUMP_PIPELINES environment variable activates dumping when config dir is empty.
+    {
+        const std::filesystem::path temp_dir =
+            std::filesystem::temp_directory_path() / "pg6_test_wasm_boot_env_dump";
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir, ec);
+        env_guard.set(temp_dir.string());
+
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool dump_active = false;
+        std::string observed_dir;
+        const WasmBootResult r = run_boot_with_hook(cfg, [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            auto dev = dx::current_device();
+            if (dev && dev->pipeline_dump() != nullptr) {
+                dump_active = true;
+                observed_dir = dev->pipeline_dump()->dir();
+            }
+        });
+        CHECK(r.ok);
+        CHECK(dump_active);
+        CHECK(observed_dir == temp_dir.string());
+
+        bool saw_dump_log = false;
+        const std::string expected_line = "[boot] PIPELINE_DUMP: " + temp_dir.string();
+        for (const std::string& line : g_logs) {
+            if (line == expected_line) {
+                saw_dump_log = true;
+            }
+        }
+        CHECK(saw_dump_log);
+
+        env_guard.unset();
+        std::filesystem::remove_all(temp_dir, ec);
+    }
+
+    // 4. HTTPFS `shaders/dump_pipelines.flag` triggers `PIPELINE_DUMP: /pg6_dump` and
+    //    immediately closes the probed handle.
+    {
+        env_guard.unset();
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_file(fs, "shaders/dump_pipelines.flag", "1");
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool handles_empty_at_entry = false;
+        int closes_at_entry = 0;
+        const WasmBootResult r = run_boot_with_hook(cfg, [&]() {
+            handles_empty_at_entry = fs.handles.empty();
+            closes_at_entry = fs.closes;
+        });
+        CHECK(r.ok);
+        CHECK(handles_empty_at_entry);
+        CHECK(closes_at_entry >= 3);  // manifest + main pgim + dump_pipelines.flag
+        CHECK(fs.handles.empty());
+
+        bool saw_dump_log = false;
+        for (const std::string& line : g_logs) {
+            if (line == "[boot] PIPELINE_DUMP: /pg6_dump") {
+                saw_dump_log = true;
+            }
+        }
+        CHECK(saw_dump_log);
     }
 }
 
@@ -993,6 +1251,7 @@ int main() {
     test_program_boot_scoped_httpfs_bridge();
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
+    test_program_boot_pipeline_dump_triggers();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);
