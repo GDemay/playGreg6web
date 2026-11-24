@@ -136,6 +136,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Establish the scatter-mapping call's real page-array semantics from the title's call sites, fix the shim and the window model (CPU and GPU side), and check the neighbouring physical-page shims for the same unit error.
 - [x] **O31 — Boot the Real Program Natively Under the Translated-Window Memory Model and Fix What It Reveals** — `DONE` (PRs #498, #505, #525, closes #475) *(follow-up to O29/O30; repo tests synthetic, local game files only for local runs)*
   - Lift the real program with `--memory-model window`, boot it natively to the default-model boot's milestones, fix every consumer that still assumes identity mapping for window pointers, and measure cost and the contiguous-runs variant.
+- [ ] **O32 — Intermittent Heap Corruption in `playgta6_win32_rtl_tests` (0xc0000374): Find and Fix the Cause (`runtime/os/win32_rtl`)** — `IN PROGRESS` (#622, @Timon-ok) *(no game files required)*
+  - Reproduce the intermittent heap-corruption failure deterministically, decide whether the defect is in the runtime or the test, fix by cause and add a reliable regression test.
 
 ---
 
