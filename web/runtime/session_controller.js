@@ -32,17 +32,45 @@ const VALID_CAPABILITY_KEYS = Object.freeze([
   'audioWorklet',
 ]);
 
-function detectWasm64() {
-  if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Memory !== 'function') {
+export function detectWasm64(wasmApi) {
+  const api =
+    arguments.length === 0
+      ? typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null
+      : wasmApi;
+  if (!api || typeof api.Memory !== 'function') {
     return false;
   }
-  try {
-    // eslint-disable-next-line no-new
-    new WebAssembly.Memory({ initial: 1n, maximum: 2n, index: 'i64' });
-    return true;
-  } catch {
-    return false;
+  // Probe spec-standard `{ address: 'i64' }` (Chrome 133+, Firefox 134+, Node 22+)
+  // first, then fall back to legacy proposal `{ index: 'i64' }`. Passing BigInt
+  // `initial`/`maximum` ensures non-Wasm64 engines (or mocks) that silently ignore
+  // unknown descriptor keys still throw a TypeError on BigInt-to-Number coercion.
+  for (const key of ['address', 'index']) {
+    try {
+      const mem = new api.Memory({ initial: 1n, maximum: 2n, [key]: 'i64' });
+      if (!mem || typeof mem !== 'object') {
+        continue;
+      }
+      if (typeof mem.type === 'function') {
+        try {
+          const info = mem.type();
+          if (info && typeof info === 'object') {
+            const addr = info.address ?? info.index;
+            if (addr !== undefined && addr !== 'i64') {
+              continue;
+            }
+          }
+        } catch {
+          // Ignore optional type-reflection errors.
+        }
+      }
+      return true;
+    } catch {
+      // Try next descriptor key or report unsupported below.
+    }
   }
+  return false;
 }
 
 /**
@@ -65,12 +93,18 @@ export function probeBrowserCapabilities() {
   const hasAudioContext =
     typeof g.AudioContext === 'function' || typeof g.webkitAudioContext === 'function';
   const hasAudioWorkletNode = typeof g.AudioWorkletNode === 'function';
+  const wasmApi =
+    'WebAssembly' in g
+      ? g.WebAssembly
+      : typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null;
 
   return {
     crossOriginIsolated: g.crossOriginIsolated === true,
     sharedArrayBuffer: typeof SharedArrayBuffer === 'function',
     webgpu: Boolean(nav && 'gpu' in nav && nav.gpu),
-    wasm64: detectWasm64(),
+    wasm64: detectWasm64(wasmApi),
     opfs: Boolean(nav && nav.storage && typeof nav.storage.getDirectory === 'function'),
     gamepad: Boolean(nav && typeof nav.getGamepads === 'function'),
     audioWorklet: Boolean(hasAudioContext && hasAudioWorkletNode),
