@@ -99,8 +99,11 @@ void Device::note_unresolved_shader(uint64_t identity, ShaderStage stage) {
         ++unresolved_by_stage_[index];
         char name[24];
         std::snprintf(name, sizeof(name), "0x%016" PRIx64, identity);
+        auto facts = shader_sizes_.find(identity);
+        const int kind = facts != shader_sizes_.end() ? facts->second.kind : -1;
         os::log(std::string("d3d12_xs: no shader module for DXIL identity ") + name + " (" + kStageNames[index] +
-                " shader; " + (stage == ShaderStage::Compute ? "dispatches" : "draws") + " with it are skipped)");
+                " shader, DXIL kind " + std::to_string(kind) + "; " +
+                (stage == ShaderStage::Compute ? "dispatches" : "draws") + " with it are skipped)");
     }
 }
 
@@ -114,15 +117,21 @@ std::array<uint32_t, 3> Device::root_signature_versions() const {
     return root_signature_versions_;
 }
 
-void Device::note_shader_size(uint64_t identity, uint64_t bytes) {
+void Device::note_shader_size(uint64_t identity, uint64_t bytes, int kind) {
     std::lock_guard<std::mutex> lock(shader_mutex_);
-    shader_sizes_[identity] = bytes;
+    shader_sizes_[identity] = ShaderFacts{bytes, kind};
 }
 
 uint64_t Device::shader_size(uint64_t identity) const {
     std::lock_guard<std::mutex> lock(shader_mutex_);
     auto it = shader_sizes_.find(identity);
-    return it != shader_sizes_.end() ? it->second : 0;
+    return it != shader_sizes_.end() ? it->second.bytes : 0;
+}
+
+int Device::shader_kind(uint64_t identity) const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    auto it = shader_sizes_.find(identity);
+    return it != shader_sizes_.end() ? it->second.kind : -1;
 }
 
 bool Device::claim_skipped_draw_report(const void* pipeline_state) {
@@ -945,6 +954,35 @@ HResult PipelineState::GetCachedBlob(OutPtr blob) {
 
 namespace {
 
+// The shader kind a DXIL container declares (DXIL part, program header: kind = version >> 16:
+// 0 pixel, 1 vertex, 2 geometry, 3 hull, 4 domain, 5 compute, 13 mesh, 14 amplification, ...),
+// or -1 when the bytes are not a DXBC container with a DXIL part.
+int dxil_shader_kind(const uint8_t* p, size_t n) {
+    auto u32 = [&](size_t at) {
+        uint32_t v = 0;
+        std::memcpy(&v, p + at, 4);
+        return v;
+    };
+    if (n < 32 || u32(0) != 0x43425844u) {  // "DXBC"
+        return -1;
+    }
+    const uint32_t parts = u32(28);
+    if (parts > 64 || 32 + uint64_t{parts} * 4 > n) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < parts; ++i) {
+        const uint32_t off = u32(32 + i * 4);
+        if (uint64_t{off} + 12 > n) {
+            return -1;
+        }
+        const uint32_t fourcc = u32(off);
+        if (fourcc == 0x4C495844u) {  // "DXIL"
+            return static_cast<int>(u32(off + 8) >> 16);
+        }
+    }
+    return -1;
+}
+
 // Reads a shader's bytecode and returns its identity (0 = no shader). False on unreadable input.
 bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage, uint64_t* identity) {
     *identity = 0;
@@ -961,7 +999,7 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
         return false;
     }
     *identity = shader_identity(bytes.data(), bytes.size());
-    dev.note_shader_size(*identity, bytes.size());
+    dev.note_shader_size(*identity, bytes.size(), dxil_shader_kind(bytes.data(), bytes.size()));
     return true;
 }
 

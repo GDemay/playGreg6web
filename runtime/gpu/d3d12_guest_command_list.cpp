@@ -332,7 +332,12 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
     std::string s = std::string("d3d12_xs: skipped ") + call + " (" + std::to_string(count) + " x " +
                     std::to_string(instances) + "): " + reason + ";";
     if (compute_pso_ != nullptr && graphics_pso_ == nullptr) {
-        s += " a compute pipeline state is bound;";
+        s += " a compute pipeline state is bound";
+        for (uint64_t id : compute_pso_->shader_identities()) {
+            s += " (CS " + std::to_string(device_->shader_size(id)) + " B, DXIL kind " +
+                 std::to_string(device_->shader_kind(id)) + ")";
+        }
+        s += ";";
     }
     const GraphicsPsoSource* src = graphics_pso_ != nullptr ? graphics_pso_->graphics_source() : nullptr;
     if (graphics_pso_ != nullptr && src == nullptr) {
@@ -346,7 +351,8 @@ void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32
     s += " shaders";
     for (size_t i = 0; i < 7; ++i) {
         if (stages[i] != 0) {
-            s += std::string(" ") + stage_names[i] + " " + std::to_string(device_->shader_size(stages[i])) + " B" +
+            s += std::string(" ") + stage_names[i] + " " + std::to_string(device_->shader_size(stages[i])) +
+                 " B DXIL kind " + std::to_string(device_->shader_kind(stages[i])) +
                  (device_->shader_known(stages[i]) ? "" : " (no module)");
         }
     }

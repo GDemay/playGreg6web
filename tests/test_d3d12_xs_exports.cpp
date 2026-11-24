@@ -1478,8 +1478,8 @@ void test_unresolved_shaders_and_indexed_draws() {
     if (!reports.empty()) {
         const std::string& r = reports[0];
         CHECK(r.find("skipped DrawInstanced") != std::string::npos);
-        CHECK(r.find("VS " + std::to_string(scene.vs_bytes.size()) + " B (no module)") != std::string::npos);
-        CHECK(r.find("PS " + std::to_string(scene.ps_bytes.size()) + " B (no module)") != std::string::npos);
+        CHECK(r.find("VS " + std::to_string(scene.vs_bytes.size()) + " B DXIL kind -1 (no module)") != std::string::npos);
+        CHECK(r.find("PS " + std::to_string(scene.ps_bytes.size()) + " B DXIL kind -1 (no module)") != std::string::npos);
         CHECK(r.find("input layout") != std::string::npos);
         CHECK(r.find("render targets 1") != std::string::npos);
         CHECK(r.find("root signature 1.") != std::string::npos);
@@ -1659,6 +1659,30 @@ void test_compute_views_and_public_list() {
     const Packet* d = find_op(ps, GpuOpcode::DispatchCompute);
     CHECK(d != nullptr && payload_as<GpuDispatchComputePayload>(*d).workgroup_x == 4);
     CHECK(find_op(ps, GpuOpcode::CreateComputePipeline2) != nullptr);
+
+    // The device records each shader's size and the kind its DXIL container declares (a
+    // synthetic container: "DXBC", digest, version, size, one part "DXIL" whose program header
+    // says vertex shader, kind 1).
+    std::vector<uint8_t> dxbc(48, 0);
+    auto put32 = [&](size_t at, uint32_t v) { std::memcpy(dxbc.data() + at, &v, 4); };
+    put32(0, 0x43425844u);    // "DXBC"
+    put32(24, 48);            // total size
+    put32(28, 1);             // one part
+    put32(32, 36);            // at offset 36
+    put32(36, 0x4C495844u);   // "DXIL"
+    put32(40, 8);             // part size
+    put32(44, (1u << 16) | 0x60);  // program version: vertex shader 6.0
+    dg::GuestComputePipelineStateDesc vd{};
+    vd.pRootSignature = scene.rs;
+    vd.CS = {put_bytes(dxbc.data(), dxbc.size()), dxbc.size()};
+    const uint64_t vpso = fx.create(scene.device, Slot2::CreateComputePipelineState, {I(put(vd))},
+                                    dg::IID_ID3D12PipelineState, &result);
+    CHECK(result == 0 && vpso != 0);
+    const uint64_t vid = dg::shader_identity(dxbc.data(), dxbc.size());
+    CHECK(dev->shader_size(vid) == dxbc.size());
+    CHECK(dev->shader_kind(vid) == 1);
+    CHECK(dev->shader_kind(dg::shader_identity(cs.data(), cs.size())) == -1);  // not a container
+    fx.vcall(vpso, Slot::Release);
 
     // A PSO without a vertex shader or with an invalid root signature is rejected.
     dg::GuestGraphicsPipelineStateDesc empty{};
