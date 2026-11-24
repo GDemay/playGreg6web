@@ -1,7 +1,7 @@
-// GPU packet ABI v2 (opcodes 22..34, docs/gpu_commands.md "Opcodes (v2)") for WgpuCommandProcessor:
+// GPU packet ABI v2 (opcodes 22..35, docs/gpu_commands.md "Opcodes (v2)") for WgpuCommandProcessor:
 // explicit bind group / pipeline layouts, pipelines built from the 376-byte render pipeline key,
 // explicit render passes, dynamic render state, bind groups with texture view descriptors and
-// dynamic offsets, and comparison samplers.
+// dynamic offsets, comparison samplers, v2 textures (CreateTexture2), and hardened compute dispatches.
 //
 // Install with installRenderStatePackets(processor). Objects land in the processor's own tables
 // (pipelines, computePipelines, samplers, bindGroups) so v1 SetPipeline / SetComputePipeline /
@@ -85,20 +85,33 @@ const V2_OPCODES = Object.freeze({
   CREATE_BIND_GROUP2: 32,
   SET_BIND_GROUP2: 33,
   CREATE_SAMPLER2: 34,
+  CREATE_TEXTURE2: 35,
 });
+
+const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
 
 const SWAPCHAIN_TEXTURE_ID = 0xffffffff;
 const MANIFEST_REFERENCE_FLAG = 0x1;
 const KEY_OFFSET = 16; // CreateRenderPipeline2: header, then the 376-byte key
 const KEY_SIZE = 376;
+const CREATE_TEXTURE2_BYTES = 40;
+const MAX_TEXTURE_VIEW_FORMATS = 8;
 const GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST = 0x0040 | 0x0080 | 0x0008;
+const GPU_TEXTURE_USAGE_COPY_SRC = 0x0001;
+const GPU_TEXTURE_USAGE_COPY_DST = 0x0002;
 const GPU_TEXTURE_USAGE_TEXTURE_BINDING = 0x0004;
 const GPU_TEXTURE_USAGE_STORAGE_BINDING = 0x0008;
+const GPU_TEXTURE_USAGE_RENDER_ATTACHMENT = 0x0010;
 const EMPTY_FRAGMENT_WGSL = '@fragment fn fs_main() {}\n';
 const GPU_SHADER_STAGE_VERTEX = 0x1;
 const GPU_SHADER_STAGE_ALL_MASK = 0x7;
 const MAX_TELEMETRY_WARNINGS = 32;
+const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const HOOK_ORIG_FLUSH_PRESENT = '__playgta6RsOrigFlushPresent';
+const HOOK_ORIG_CREATE_COMPUTE_PIPELINE = '__playgta6RsOrigCreateComputePipeline';
+const HOOK_ACTIVE_HANDLER = '__playgta6RsActiveHandler';
 
 const DEFAULT_ENTRY_POINTS = Object.freeze({
   vertex: 'vs_main',
@@ -113,6 +126,83 @@ const DEPTH_TEXTURE_FORMATS = Object.freeze(
     'depth24plus-stencil8',
     'depth32float',
     'depth32float-stencil8',
+  ])
+);
+
+const FLOAT32_TEXTURE_FORMATS = Object.freeze(
+  new Set(['r32float', 'rg32float', 'rgba32float'])
+);
+
+// Core WebGPU storage-compatible texture formats ("Texture Format Capabilities").
+const CORE_STORAGE_TEXTURE_FORMATS = Object.freeze(
+  new Set([
+    'rgba8unorm',
+    'rgba8snorm',
+    'rgba8uint',
+    'rgba8sint',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'r32uint',
+    'r32sint',
+    'r32float',
+    'rg32uint',
+    'rg32sint',
+    'rg32float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+  ])
+);
+
+const TIER1_STORAGE_TEXTURE_FORMATS = Object.freeze(
+  new Set([
+    'r8unorm',
+    'r8snorm',
+    'r8uint',
+    'r8sint',
+    'r16unorm',
+    'r16snorm',
+    'r16uint',
+    'r16sint',
+    'r16float',
+    'rg8unorm',
+    'rg8snorm',
+    'rg8uint',
+    'rg8sint',
+    'rg16unorm',
+    'rg16snorm',
+    'rg16uint',
+    'rg16sint',
+    'rg16float',
+    'rgb10a2uint',
+    'rgb10a2unorm',
+    'rg11b10ufloat',
+    'rgba16unorm',
+    'rgba16snorm',
+  ])
+);
+
+const NON_RENDERABLE_CORE_FORMATS = Object.freeze(
+  new Set(['rgb9e5ufloat', 'r8snorm', 'rg8snorm', 'rgba8snorm'])
+);
+
+const TIER1_RENDERABLE_FORMATS = Object.freeze(
+  new Set(['r16unorm', 'r16snorm', 'rg16unorm', 'rg16snorm', 'rgba16unorm', 'rgba16snorm'])
+);
+
+const NON_MULTISAMPLEABLE_CORE_FORMATS = Object.freeze(
+  new Set([
+    'r32uint',
+    'r32sint',
+    'r32float',
+    'rg32uint',
+    'rg32sint',
+    'rg32float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+    'rgb10a2uint',
   ])
 );
 
@@ -162,6 +252,323 @@ const VERTEX_FORMAT_BYTE_SIZES = Object.freeze({
 
 function isDepthTextureFormat(format) {
   return typeof format === 'string' && DEPTH_TEXTURE_FORMATS.has(format);
+}
+
+function isDepthOrStencilTextureFormat(format) {
+  return typeof format === 'string' && (DEPTH_TEXTURE_FORMATS.has(format) || format === 'stencil8');
+}
+
+function isBcCompressedFormat(format) {
+  return typeof format === 'string' && format.startsWith('bc');
+}
+
+function isSrgbTextureFormat(format) {
+  return typeof format === 'string' && format.endsWith('-srgb');
+}
+
+function isFloat32TextureFormat(format) {
+  return typeof format === 'string' && FLOAT32_TEXTURE_FORMATS.has(format);
+}
+
+function deviceHasFeature(device, featureName) {
+  const features = device && device.features;
+  if (!features || !featureName) return false;
+  if (typeof features.has === 'function') return Boolean(features.has(featureName));
+  if (Array.isArray(features)) return features.includes(featureName);
+  if (typeof features[Symbol.iterator] === 'function') {
+    for (const item of features) {
+      if (item === featureName) return true;
+    }
+    return false;
+  }
+  if (typeof features === 'object') return Boolean(features[featureName]);
+  return false;
+}
+
+function isStorageBindingSupported(format, device) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return false;
+  if (
+    isSrgbTextureFormat(format) ||
+    isDepthOrStencilTextureFormat(format) ||
+    isBcCompressedFormat(format) ||
+    format === 'rgb9e5ufloat'
+  ) {
+    return false;
+  }
+  if (CORE_STORAGE_TEXTURE_FORMATS.has(format)) return true;
+  if (format === 'bgra8unorm') return deviceHasFeature(device, 'bgra8unorm-storage');
+  if (TIER1_STORAGE_TEXTURE_FORMATS.has(format)) {
+    return deviceHasFeature(device, 'texture-formats-tier1');
+  }
+  return false;
+}
+
+function isRenderAttachmentSupported(format, device) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return false;
+  if (isBcCompressedFormat(format) || NON_RENDERABLE_CORE_FORMATS.has(format)) return false;
+  if (format === 'rg11b10ufloat') return deviceHasFeature(device, 'rg11b10ufloat-renderable');
+  if (TIER1_RENDERABLE_FORMATS.has(format)) {
+    return deviceHasFeature(device, 'texture-formats-tier1');
+  }
+  return true;
+}
+
+function isMultisampleSupported(format, device) {
+  if (!isRenderAttachmentSupported(format, device)) return false;
+  if (NON_MULTISAMPLEABLE_CORE_FORMATS.has(format)) return false;
+  return true;
+}
+
+// Resolves the WebGPU GPUTextureSampleType compatible with `format` on `device`.
+// Notably maps rgba32float / rg32float / r32float to 'unfilterable-float' when 'float32-filterable' is absent.
+function resolveTextureSampleType(format, device) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return 'float';
+  if (isDepthTextureFormat(format)) return 'depth';
+  if (format === 'stencil8' || format.endsWith('uint')) return 'uint';
+  if (format.endsWith('sint')) return 'sint';
+  if (isFloat32TextureFormat(format)) {
+    return deviceHasFeature(device, 'float32-filterable') ? 'float' : 'unfilterable-float';
+  }
+  return 'float';
+}
+
+function computeMaxMipLevels(width, height, depthOrArrayLayers = 1, dimension = '2d') {
+  if (dimension === '1d') return 1;
+  const w = Math.max(1, Math.floor(Number(width) || 1));
+  const h = Math.max(1, Math.floor(Number(height) || 1));
+  const d = Math.max(1, Math.floor(Number(depthOrArrayLayers) || 1));
+  const maxDim = dimension === '3d' ? Math.max(w, h, d) : Math.max(w, h);
+  return Math.floor(Math.log2(maxDim)) + 1;
+}
+
+function getMaxComputeWorkgroupsPerDimension(deviceOrLimits) {
+  const limits =
+    deviceOrLimits && typeof deviceOrLimits === 'object'
+      ? deviceOrLimits.limits && typeof deviceOrLimits.limits === 'object'
+        ? deviceOrLimits.limits
+        : deviceOrLimits
+      : null;
+  const raw = limits ? limits.maxComputeWorkgroupsPerDimension : undefined;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1) {
+    return Math.floor(raw);
+  }
+  return DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION;
+}
+
+// Validates and clamps compute dispatch workgroup counts against WebGPU limits.
+// Zero or invalid dimensions are skipped; oversized dimensions are clamped to maxComputeWorkgroupsPerDimension.
+function validateComputeDispatch(x, y, z, deviceOrLimits) {
+  const maxDim = getMaxComputeWorkgroupsPerDimension(deviceOrLimits);
+  const fx = typeof x === 'number' && Number.isFinite(x) ? Math.floor(x) : 0;
+  const fy = typeof y === 'number' && Number.isFinite(y) ? Math.floor(y) : 0;
+  const fz = typeof z === 'number' && Number.isFinite(z) ? Math.floor(z) : 0;
+  if (fx <= 0 || fy <= 0 || fz <= 0) {
+    return {
+      skip: true,
+      clamped: false,
+      x: 0,
+      y: 0,
+      z: 0,
+      maxWorkgroupsPerDimension: maxDim,
+      reason: 'zero-dimension',
+    };
+  }
+  if (fx > maxDim || fy > maxDim || fz > maxDim) {
+    return {
+      skip: false,
+      clamped: true,
+      x: Math.min(fx, maxDim),
+      y: Math.min(fy, maxDim),
+      z: Math.min(fz, maxDim),
+      maxWorkgroupsPerDimension: maxDim,
+      reason: 'exceeds-limit',
+    };
+  }
+  return {
+    skip: false,
+    clamped: false,
+    x: fx,
+    y: fy,
+    z: fz,
+    maxWorkgroupsPerDimension: maxDim,
+    reason: null,
+  };
+}
+
+// Decodes an ABI v2 CreateTexture2 payload (opcode 35, 40-byte GpuCreateTexture2Payload).
+function decodeCreateTexture2(view, offset = 0, payloadBytes) {
+  const available = payloadBytes !== undefined ? payloadBytes : view.byteLength - offset;
+  if (
+    offset < 0 ||
+    available < CREATE_TEXTURE2_BYTES ||
+    offset + CREATE_TEXTURE2_BYTES > view.byteLength
+  ) {
+    return { id: 0, error: `CreateTexture2: payload ${available} < ${CREATE_TEXTURE2_BYTES} bytes` };
+  }
+  const id = view.getUint32(offset, true);
+  const rawWidth = view.getUint32(offset + 4, true);
+  const rawHeight = view.getUint32(offset + 8, true);
+  const rawDepth = view.getUint32(offset + 12, true);
+  const rawMipLevels = view.getUint32(offset + 16, true);
+  const rawSampleCount = view.getUint32(offset + 20, true);
+  const usage = view.getUint32(offset + 24, true);
+  const dimensionCode = view.getUint8(offset + 28);
+  const formatCode = view.getUint8(offset + 29);
+  const viewFormatCount = view.getUint8(offset + 30);
+
+  const format = nameOf(TEXTURE_FORMAT_NAMES, formatCode);
+  if (formatCode === 0 || !format || format === 'undefined') {
+    return { id, error: `CreateTexture2 ${id}: invalid texture format code ${formatCode}` };
+  }
+  const dimension = nameOf(TEXTURE_DIMENSION_NAMES, dimensionCode);
+  if (!dimension) {
+    return { id, error: `CreateTexture2 ${id}: invalid dimension ${dimensionCode}` };
+  }
+  if (viewFormatCount > MAX_TEXTURE_VIEW_FORMATS) {
+    return {
+      id,
+      error: `CreateTexture2 ${id}: view_format_count ${viewFormatCount} > ${MAX_TEXTURE_VIEW_FORMATS}`,
+    };
+  }
+  const viewFormats = [];
+  for (let i = 0; i < viewFormatCount; i += 1) {
+    const code = view.getUint8(offset + 32 + i);
+    const vf = nameOf(TEXTURE_FORMAT_NAMES, code);
+    if (code === 0 || !vf || vf === 'undefined') {
+      return { id, error: `CreateTexture2 ${id}: invalid view format code ${code}` };
+    }
+    viewFormats.push(vf);
+  }
+
+  const width = Math.max(1, rawWidth);
+  const height = dimension === '1d' ? 1 : Math.max(1, rawHeight);
+  const depthOrArrayLayers = dimension === '1d' ? 1 : Math.max(1, rawDepth);
+  const maxMips = computeMaxMipLevels(width, height, depthOrArrayLayers, dimension);
+  const mipLevelCount =
+    Number.isFinite(rawMipLevels) && rawMipLevels >= 1
+      ? Math.min(maxMips, Math.floor(rawMipLevels))
+      : 1;
+  const geometryAllowsMsaa =
+    dimension === '2d' && mipLevelCount <= 1 && depthOrArrayLayers === 1;
+  const sampleCount = rawSampleCount >= 4 && geometryAllowsMsaa ? 4 : 1;
+
+  const descriptor = {
+    size: { width, height, depthOrArrayLayers },
+    mipLevelCount,
+    sampleCount,
+    dimension,
+    format,
+    usage,
+  };
+  if (viewFormats.length > 0) descriptor.viewFormats = viewFormats;
+  return { id, descriptor };
+}
+
+// Sanitizes a GPUTextureDescriptor against WebGPU format & device capability constraints
+// (stripping illegal STORAGE_BINDING / RENDER_ATTACHMENT usages and falling back cleanly on
+// unsupported BC compressed or optional depth formats).
+function sanitizeTextureDescriptor(rawDescriptor, device) {
+  const originalFormat = rawDescriptor.format;
+  const wasBc = isBcCompressedFormat(originalFormat);
+  let effectiveFormat = originalFormat;
+  let usage = rawDescriptor.usage >>> 0;
+  let sampleCount = rawDescriptor.sampleCount || 1;
+  let bcFallback = false;
+  let formatFallback = false;
+  const strippedUsages = [];
+  const warnings = [];
+
+  if (wasBc && !deviceHasFeature(device, 'texture-compression-bc')) {
+    bcFallback = true;
+    formatFallback = true;
+    effectiveFormat = isSrgbTextureFormat(originalFormat) ? 'rgba8unorm-srgb' : 'rgba8unorm';
+    warnings.push({
+      key: `bc-unsupported:${originalFormat}`,
+      message: `texture format ${originalFormat} unavailable without texture-compression-bc; falling back to ${effectiveFormat}`,
+    });
+  } else if (
+    originalFormat === 'depth32float-stencil8' &&
+    !deviceHasFeature(device, 'depth32float-stencil8')
+  ) {
+    formatFallback = true;
+    effectiveFormat = 'depth24plus-stencil8';
+    warnings.push({
+      key: 'depth32float-stencil8-unsupported',
+      message: 'texture format depth32float-stencil8 unavailable; falling back to depth24plus-stencil8',
+    });
+  }
+
+  if (
+    (usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
+    (wasBc || !isStorageBindingSupported(effectiveFormat, device))
+  ) {
+    usage &= ~GPU_TEXTURE_USAGE_STORAGE_BINDING;
+    strippedUsages.push('STORAGE_BINDING');
+    warnings.push({
+      key: `strip-storage:${originalFormat}`,
+      message: `stripped unsupported STORAGE_BINDING usage for texture format ${originalFormat}`,
+    });
+  }
+
+  if (
+    (usage & GPU_TEXTURE_USAGE_RENDER_ATTACHMENT) !== 0 &&
+    (wasBc || !isRenderAttachmentSupported(effectiveFormat, device))
+  ) {
+    usage &= ~GPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+    strippedUsages.push('RENDER_ATTACHMENT');
+    warnings.push({
+      key: `strip-render-attachment:${originalFormat}`,
+      message: `stripped unsupported RENDER_ATTACHMENT usage for texture format ${originalFormat}`,
+    });
+  }
+
+  if (usage === 0) {
+    usage = GPU_TEXTURE_USAGE_TEXTURE_BINDING;
+  }
+
+  if (sampleCount > 1 && (wasBc || !isMultisampleSupported(effectiveFormat, device))) {
+    sampleCount = 1;
+  }
+
+  const descriptor = {
+    size: { ...rawDescriptor.size },
+    mipLevelCount: rawDescriptor.mipLevelCount || 1,
+    sampleCount,
+    dimension: rawDescriptor.dimension || '2d',
+    format: effectiveFormat,
+    usage,
+  };
+
+  if (Array.isArray(rawDescriptor.viewFormats) && rawDescriptor.viewFormats.length > 0) {
+    const cleanViewFormats = [];
+    for (let i = 0; i < rawDescriptor.viewFormats.length; i += 1) {
+      let vf = rawDescriptor.viewFormats[i];
+      if (bcFallback && isBcCompressedFormat(vf)) {
+        vf = isSrgbTextureFormat(vf) ? 'rgba8unorm-srgb' : 'rgba8unorm';
+      } else if (
+        vf === 'depth32float-stencil8' &&
+        effectiveFormat === 'depth24plus-stencil8'
+      ) {
+        vf = 'depth24plus-stencil8';
+      }
+      if (!cleanViewFormats.includes(vf)) {
+        cleanViewFormats.push(vf);
+      }
+    }
+    if (cleanViewFormats.length > 0) {
+      descriptor.viewFormats = cleanViewFormats;
+    }
+  }
+
+  return {
+    descriptor,
+    originalFormat,
+    effectiveFormat,
+    strippedUsages,
+    bcFallback,
+    formatFallback,
+    warnings,
+  };
 }
 
 // Strips WGSL line (//) and nestable block (/* ... */) comments so commented-out entry points are ignored.
@@ -707,8 +1114,10 @@ class RenderStatePackets {
     this.bindGroupLayouts = new Map(); // id -> { layout, entries, sequentialBindings }
     this.pipelineLayouts = new Map(); // id -> GPUPipelineLayout
     this.pipelineLayoutMeta = new Map(); // id -> { groupCount, isSingleGroup0, sequentialGroup0 }
+    this.computePipelineMeta = new Map(); // id -> { id, csId, layoutId, entryPoint, hasComputeAttr }
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
+    this.textureMeta = new Map(); // textureId -> { id, requestedFormat, format, bcFallback, usage, width, height }
     this.dummies = new Map();
     this.emptyLayout = null;
     this.emptyFragment = null;
@@ -718,8 +1127,17 @@ class RenderStatePackets {
       depthCompareDefaults: 0,
       rootSigGroup0Layouts: 0,
       autoLayoutFallbacks: 0,
+      computePipelineCount: 0,
+      computeDispatchCount: 0,
+      skippedComputeDispatchCount: 0,
+      clampedComputeDispatchCount: 0,
+      texture2Count: 0,
+      bcFormatFallbacks: 0,
+      usageStrips: 0,
+      unfilterableFloatFallbacks: 0,
       warnings: [],
     };
+    this._seenWarningKeys = new Set();
     this.lastError = null;
     this._packetError = null;
     this._activePass = null;
@@ -734,6 +1152,14 @@ class RenderStatePackets {
       depthCompareDefaults: this.telemetry.depthCompareDefaults,
       rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
       autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+      computePipelineCount: this.telemetry.computePipelineCount,
+      computeDispatchCount: this.telemetry.computeDispatchCount,
+      skippedComputeDispatchCount: this.telemetry.skippedComputeDispatchCount,
+      clampedComputeDispatchCount: this.telemetry.clampedComputeDispatchCount,
+      texture2Count: this.telemetry.texture2Count,
+      bcFormatFallbacks: this.telemetry.bcFormatFallbacks,
+      usageStrips: this.telemetry.usageStrips,
+      unfilterableFloatFallbacks: this.telemetry.unfilterableFloatFallbacks,
     };
   }
 
@@ -743,6 +1169,14 @@ class RenderStatePackets {
       depthCompareDefaults: this.telemetry.depthCompareDefaults,
       rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
       autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+      computePipelineCount: this.telemetry.computePipelineCount,
+      computeDispatchCount: this.telemetry.computeDispatchCount,
+      skippedComputeDispatchCount: this.telemetry.skippedComputeDispatchCount,
+      clampedComputeDispatchCount: this.telemetry.clampedComputeDispatchCount,
+      texture2Count: this.telemetry.texture2Count,
+      bcFormatFallbacks: this.telemetry.bcFormatFallbacks,
+      usageStrips: this.telemetry.usageStrips,
+      unfilterableFloatFallbacks: this.telemetry.unfilterableFloatFallbacks,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -753,6 +1187,14 @@ class RenderStatePackets {
       this.telemetry.warnings.shift();
     }
     this.telemetry.warnings.push(message);
+  }
+
+  _recordTelemetryWarningOnce(key, message) {
+    if (typeof key === 'string' && key.length > 0) {
+      if (this._seenWarningKeys.has(key)) return;
+      this._seenWarningKeys.add(key);
+    }
+    this._recordTelemetryWarning(message);
   }
 
   _resolveEntryPoint(shaderEntry, stage) {
@@ -837,6 +1279,8 @@ class RenderStatePackets {
         return this._count(this._setBindGroup(view, offset, payloadBytes));
       case V2_OPCODES.CREATE_SAMPLER2:
         return this._count(payloadBytes >= 24 && this._createSampler(view, offset));
+      case V2_OPCODES.CREATE_TEXTURE2:
+        return this._count(this._createTexture2(view, offset, payloadBytes));
       default:
         return false;
     }
@@ -851,12 +1295,14 @@ class RenderStatePackets {
     return true;
   }
 
-  // DestroyResource hook: forget layouts and cached views of `id`.
+  // DestroyResource hook: forget layouts, metadata and cached views of `id`.
   destroyResource(id) {
     this.bindGroupLayouts.delete(id);
     this.pipelineLayouts.delete(id);
     this.pipelineLayoutMeta.delete(id);
+    this.computePipelineMeta.delete(id);
     this.textureViews.delete(id);
+    this.textureMeta.delete(id);
   }
 
   _queue(run) {
@@ -897,6 +1343,27 @@ class RenderStatePackets {
         this._packetError = `bind group layout ${id}: duplicate binding ${entry.binding}`;
         return false;
       }
+      if (entry.storageTexture) {
+        if (!isStorageBindingSupported(entry.storageTexture.format, this.device)) {
+          const origFmt = entry.storageTexture.format;
+          entry.storageTexture.format = 'rgba8unorm';
+          this._recordTelemetryWarningOnce(
+            `bgl-storage-format:${origFmt}`,
+            `bind group layout storageTexture format ${origFmt} unsupported; falling back to rgba8unorm`
+          );
+        }
+        if (
+          entry.storageTexture.viewDimension === 'cube' ||
+          entry.storageTexture.viewDimension === 'cube-array'
+        ) {
+          const origDim = entry.storageTexture.viewDimension;
+          entry.storageTexture.viewDimension = '2d-array';
+          this._recordTelemetryWarningOnce(
+            `bgl-storage-dim:${origDim}`,
+            `bind group layout storageTexture dimension ${origDim} unsupported; remapping to 2d-array`
+          );
+        }
+      }
       seenBindings.add(entry.binding);
       if (entry.binding !== i) sequentialBindings = false;
       entries.push(entry);
@@ -904,7 +1371,12 @@ class RenderStatePackets {
     const contentKey = contentId !== 0n ? `bgl:${contentId.toString(16)}` : null;
     let layout = contentKey ? this.layoutsByContent.get(contentKey) : undefined;
     if (!layout) {
-      layout = this.device.createBindGroupLayout({ entries });
+      try {
+        layout = this.device.createBindGroupLayout({ entries });
+      } catch (err) {
+        this._packetError = `bind group layout ${id}: ${String(err && err.message ? err.message : err)}`;
+        return false;
+      }
       if (contentKey) this.layoutsByContent.set(contentKey, layout);
     }
     this.bindGroupLayouts.set(id, { layout, entries, sequentialBindings });
@@ -944,7 +1416,12 @@ class RenderStatePackets {
         if (g === 0) group0Record = record;
         bindGroupLayouts.push(record ? record.layout : this._emptyBindGroupLayout());
       }
-      layout = this.device.createPipelineLayout({ bindGroupLayouts });
+      try {
+        layout = this.device.createPipelineLayout({ bindGroupLayouts });
+      } catch (err) {
+        this._packetError = `pipeline layout ${id}: ${String(err && err.message ? err.message : err)}`;
+        return false;
+      }
       meta = {
         groupCount: count,
         isSingleGroup0: count === 1 && group0Record !== null,
@@ -1043,8 +1520,32 @@ class RenderStatePackets {
   _createRenderPipeline(view, offset) {
     const descriptor = this.buildRenderPipelineDescriptor(view, offset);
     if (!descriptor) return false;
-    this.processor.pipelines.set(view.getUint32(offset, true), this.device.createRenderPipeline(descriptor));
+    let pipeline;
+    try {
+      pipeline = this.device.createRenderPipeline(descriptor);
+    } catch (err) {
+      this._packetError = `render pipeline ${view.getUint32(offset, true)}: ${String(
+        err && err.message ? err.message : err
+      )}`;
+      return false;
+    }
+    this.processor.pipelines.set(view.getUint32(offset, true), pipeline);
     return true;
+  }
+
+  _inspectComputeShaderEntryPoint(cs, csId) {
+    const sourceText = getShaderSourceText(cs);
+    const declared = sourceText ? findWgslStageEntryPoints(sourceText, 'compute') : [];
+    const hasComputeAttr = declared.length > 0;
+    if (sourceText && !hasComputeAttr) {
+      this._recordTelemetryWarningOnce(
+        `missing-compute-entry:${csId}`,
+        `compute shader module ${csId} lacks @compute / cs_main declaration; defaulting to ${DEFAULT_ENTRY_POINTS.compute}`
+      );
+      return { entryPoint: DEFAULT_ENTRY_POINTS.compute, hasComputeAttr: false };
+    }
+    const csEntryPoint = this._resolveEntryPoint(cs, 'compute');
+    return { entryPoint: csEntryPoint, hasComputeAttr };
   }
 
   _createComputePipeline(view, offset) {
@@ -1057,23 +1558,279 @@ class RenderStatePackets {
       if (!cs) this._packetError = `unknown compute shader module ${csId}`;
       return false;
     }
+    const { entryPoint: csEntryPoint, hasComputeAttr } = this._inspectComputeShaderEntryPoint(cs, csId);
+    let pipeline;
+    try {
+      pipeline = this.device.createComputePipeline({
+        layout,
+        compute: { module: cs.module, entryPoint: csEntryPoint },
+      });
+    } catch (err) {
+      this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
+      return false;
+    }
     if (layoutId === 0) {
       this.telemetry.autoLayoutFallbacks += 1;
+    } else {
+      const layoutMeta = this.pipelineLayoutMeta.get(layoutId);
+      if (layoutMeta && layoutMeta.isSingleGroup0) {
+        this.telemetry.rootSigGroup0Layouts += 1;
+      }
     }
-    const csEntryPoint = this._resolveEntryPoint(cs, 'compute');
-    this.processor.computePipelines.set(
+    this.processor.computePipelines.set(id, pipeline);
+    this.computePipelineMeta.set(id, {
       id,
-      this.device.createComputePipeline({ layout, compute: { module: cs.module, entryPoint: csEntryPoint } })
-    );
+      csId,
+      layoutId,
+      entryPoint: csEntryPoint,
+      hasComputeAttr,
+    });
+    this.telemetry.computePipelineCount += 1;
     return true;
+  }
+
+  _handleV1CreateComputePipeline(origHandler, view, payloadOffset) {
+    const id = view.getUint32(payloadOffset, true);
+    const csId = view.getUint32(payloadOffset + 4, true);
+    const cs = this.processor && this.processor.shaderModules ? this.processor.shaderModules.get(csId) : null;
+    let inspected = null;
+    if (cs) {
+      inspected = this._inspectComputeShaderEntryPoint(cs, csId);
+    }
+    const prevPipeline =
+      this.processor && this.processor.computePipelines ? this.processor.computePipelines.get(id) : undefined;
+    try {
+      origHandler.call(this.processor, view, payloadOffset);
+    } catch (err) {
+      this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
+      this._recordTelemetryWarningOnce(
+        `v1-compute-create-fail:${id}`,
+        `compute pipeline ${id} creation failed`
+      );
+      return;
+    }
+    const nextPipeline =
+      this.processor && this.processor.computePipelines ? this.processor.computePipelines.get(id) : undefined;
+    if (nextPipeline && nextPipeline !== prevPipeline) {
+      this.computePipelineMeta.set(id, {
+        id,
+        csId,
+        layoutId: 0,
+        entryPoint: inspected ? inspected.entryPoint : DEFAULT_ENTRY_POINTS.compute,
+        hasComputeAttr: Boolean(inspected && inspected.hasComputeAttr),
+      });
+      this.telemetry.computePipelineCount += 1;
+    }
+  }
+
+  // Guards queued compute dispatches against zero/oversized workgroup dimensions and missing
+  // compute pipelines immediately before WgpuCommandProcessor._flushPresent() executes them.
+  _preparePassCommandsForFlush() {
+    const cmds = this.processor && this.processor._passCommands;
+    if (!Array.isArray(cmds) || cmds.length === 0) return;
+
+    let activeComputePipelineId = null;
+    let activeComputePipelineValid = false;
+    let hadExplicitSetComputePipeline = false;
+    let modified = false;
+    const filtered = [];
+
+    for (let i = 0; i < cmds.length; i += 1) {
+      const cmd = cmds[i];
+      if (!cmd) continue;
+
+      if (
+        cmd.type === 'setPipeline' ||
+        cmd.type === 'draw' ||
+        cmd.type === 'drawIndexed' ||
+        (cmd._wgpuMeta &&
+          (cmd._wgpuMeta.kind === 'beginRenderPass' || cmd._wgpuMeta.kind === 'endRenderPass'))
+      ) {
+        activeComputePipelineId = null;
+        activeComputePipelineValid = false;
+        hadExplicitSetComputePipeline = false;
+        filtered.push(cmd);
+        continue;
+      }
+
+      if (cmd.type === 'setComputePipeline') {
+        hadExplicitSetComputePipeline = true;
+        activeComputePipelineId = cmd.pipelineId;
+        activeComputePipelineValid = Boolean(
+          this.processor.computePipelines && this.processor.computePipelines.has(cmd.pipelineId)
+        );
+        if (!activeComputePipelineValid) {
+          this._recordTelemetryWarningOnce(
+            `missing-compute-pipeline:${cmd.pipelineId}`,
+            `compute pipeline ${cmd.pipelineId} unavailable; subsequent dispatches will be skipped`
+          );
+          modified = true;
+          continue;
+        }
+        filtered.push(cmd);
+        continue;
+      }
+
+      if (cmd.type === 'dispatchCompute') {
+        if (hadExplicitSetComputePipeline && !activeComputePipelineValid) {
+          this.telemetry.skippedComputeDispatchCount += 1;
+          this._recordTelemetryWarningOnce(
+            `skip-dispatch-no-pipeline:${activeComputePipelineId}`,
+            `skipped compute dispatch: compute pipeline ${activeComputePipelineId} is unavailable`
+          );
+          modified = true;
+          continue;
+        }
+        const rawX = cmd.workgroupX;
+        const rawY = cmd.workgroupY;
+        const rawZ = cmd.workgroupZ;
+        const check = validateComputeDispatch(rawX, rawY, rawZ, this.device);
+        if (check.skip) {
+          this.telemetry.skippedComputeDispatchCount += 1;
+          this._recordTelemetryWarningOnce(
+            `skip-dispatch-zero:${rawX}x${rawY}x${rawZ}`,
+            `skipped compute dispatch with zero or invalid workgroups (${rawX}x${rawY}x${rawZ})`
+          );
+          modified = true;
+          continue;
+        }
+        if (check.clamped) {
+          cmd.workgroupX = check.x;
+          cmd.workgroupY = check.y;
+          cmd.workgroupZ = check.z;
+          this.telemetry.clampedComputeDispatchCount += 1;
+          this._recordTelemetryWarningOnce(
+            `clamp-dispatch:${rawX}x${rawY}x${rawZ}:${check.maxWorkgroupsPerDimension}`,
+            `clamped compute dispatch from ${rawX}x${rawY}x${rawZ} to ${check.x}x${check.y}x${check.z} (limit=${check.maxWorkgroupsPerDimension})`
+          );
+        }
+        this.telemetry.computeDispatchCount += 1;
+        filtered.push(cmd);
+        continue;
+      }
+
+      filtered.push(cmd);
+    }
+
+    if (modified) {
+      this.processor._passCommands = filtered;
+    }
   }
 
   // ---- Textures and views ----
 
+  _createTexture2(view, offset, payloadBytes) {
+    const decoded = decodeCreateTexture2(view, offset, payloadBytes);
+    if (decoded.error) {
+      this._packetError = decoded.error;
+      return false;
+    }
+    const sanitized = sanitizeTextureDescriptor(decoded.descriptor, this.device);
+    for (let i = 0; i < sanitized.warnings.length; i += 1) {
+      const w = sanitized.warnings[i];
+      this._recordTelemetryWarningOnce(w.key, w.message);
+    }
+    if (sanitized.bcFallback) {
+      this.telemetry.bcFormatFallbacks += 1;
+    }
+    if (sanitized.strippedUsages.length > 0) {
+      this.telemetry.usageStrips += sanitized.strippedUsages.length;
+    }
+
+    const id = decoded.id;
+    if (typeof this.processor._destroyTextureIfPresent === 'function') {
+      this.processor._destroyTextureIfPresent(id);
+    }
+    this.textureViews.delete(id);
+    this.textureMeta.delete(id);
+
+    let texture;
+    try {
+      texture = this.device.createTexture(sanitized.descriptor);
+    } catch (err) {
+      this._packetError = `CreateTexture2 ${id}: ${String(err && err.message ? err.message : err)}`;
+      return false;
+    }
+    this.processor.textures.set(id, texture);
+    let defaultView = null;
+    if (texture && typeof texture.createView === 'function') {
+      try {
+        defaultView = texture.createView();
+      } catch (_) {
+        defaultView = null;
+      }
+      if (defaultView && this.processor.textureViews) {
+        this.processor.textureViews.set(id, defaultView);
+      }
+    }
+    if (this.processor.resourceRegistry && typeof this.processor.resourceRegistry.register === 'function') {
+      this.processor.resourceRegistry.register('texture', id, texture, {
+        byteSize: 0,
+        label: `texture:${id}`,
+      });
+      if (defaultView) {
+        this.processor.resourceRegistry.register('textureView', id, defaultView, {
+          byteSize: 0,
+          label: `textureView:${id}`,
+        });
+      }
+    }
+    this.textureMeta.set(id, {
+      id,
+      requestedFormat: sanitized.originalFormat,
+      format: sanitized.effectiveFormat,
+      bcFallback: sanitized.bcFallback,
+      formatFallback: sanitized.formatFallback,
+      usage: sanitized.descriptor.usage,
+      width: sanitized.descriptor.size.width,
+      height: sanitized.descriptor.size.height,
+    });
+    this.telemetry.texture2Count += 1;
+    return true;
+  }
+
+  _resolveTextureFormat(textureId, viewDesc) {
+    if (viewDesc && typeof viewDesc.format === 'string' && viewDesc.format !== 'undefined') {
+      const meta = this.textureMeta.get(textureId);
+      if (meta && meta.bcFallback && isBcCompressedFormat(viewDesc.format)) {
+        return meta.format;
+      }
+      if (
+        meta &&
+        meta.formatFallback &&
+        viewDesc.format === 'depth32float-stencil8' &&
+        meta.format === 'depth24plus-stencil8'
+      ) {
+        return meta.format;
+      }
+      return viewDesc.format;
+    }
+    const meta = this.textureMeta.get(textureId);
+    if (meta && meta.format) return meta.format;
+    const texture = this.processor.textures.get(textureId);
+    if (!texture) return null;
+    if (typeof texture.format === 'string') return texture.format;
+    if (texture.desc && typeof texture.desc.format === 'string') return texture.desc.format;
+    return null;
+  }
+
   _textureView(textureId, desc) {
     const texture = this.processor.textures.get(textureId);
     if (!texture || typeof texture.createView !== 'function') return null;
-    const key = JSON.stringify(desc);
+    let effectiveDesc = desc;
+    const meta = this.textureMeta.get(textureId);
+    if (effectiveDesc && typeof effectiveDesc.format === 'string' && meta) {
+      if (meta.bcFallback && isBcCompressedFormat(effectiveDesc.format)) {
+        effectiveDesc = { ...effectiveDesc, format: meta.format };
+      } else if (
+        meta.formatFallback &&
+        effectiveDesc.format === 'depth32float-stencil8' &&
+        meta.format === 'depth24plus-stencil8'
+      ) {
+        effectiveDesc = { ...effectiveDesc, format: meta.format };
+      }
+    }
+    const key = JSON.stringify(effectiveDesc);
     let views = this.textureViews.get(textureId);
     if (!views) {
       views = new Map();
@@ -1081,7 +1838,14 @@ class RenderStatePackets {
     }
     let textureView = views.get(key);
     if (!textureView) {
-      textureView = texture.createView(desc);
+      try {
+        textureView = texture.createView(effectiveDesc);
+      } catch (err) {
+        this._packetError = `texture ${textureId} createView: ${String(
+          err && err.message ? err.message : err
+        )}`;
+        return null;
+      }
       views.set(key, textureView);
     }
     return textureView;
@@ -1269,6 +2033,9 @@ class RenderStatePackets {
         tex.sampleType
       ];
     }
+    if (layoutEntry.storageTexture && !isStorageBindingSupported(format, this.device)) {
+      format = 'rgba8unorm';
+    }
     const multisampled = Boolean(layoutEntry.texture && layoutEntry.texture.multisampled);
     const key = `texture:${format}:${viewDimension}:${multisampled}:${Boolean(layoutEntry.storageTexture)}`;
     if (!this.dummies.has(key)) {
@@ -1297,24 +2064,96 @@ class RenderStatePackets {
       return false;
     }
     const entries = [];
+    const seenBindings = new Set();
     for (let i = 0; i < count; i++) {
       const o = offset + 16 + i * 48;
       const binding = view.getUint32(o, true);
+      if (seenBindings.has(binding)) {
+        this._packetError = `bind group ${id}: duplicate binding ${binding}`;
+        return false;
+      }
+      seenBindings.add(binding);
       const type = view.getUint32(o + 4, true);
       const resourceId = view.getUint32(o + 8, true);
+      const layoutEntry = record.entries ? record.entries.find((e) => e.binding === binding) : null;
       let resource = null;
       if (resourceId === 0) {
-        const layoutEntry = record.entries && record.entries.find((e) => e.binding === binding);
         resource = layoutEntry ? this._dummyResource(layoutEntry) : null;
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.processor.buffers.get(resourceId);
         if (buffer) {
-          resource = { buffer, offset: Number(view.getBigUint64(o + 16, true)) };
-          const size = Number(view.getBigUint64(o + 24, true));
-          if (size > 0) resource.size = size;
+          const bufOffset = Number(view.getBigUint64(o + 16, true));
+          const requestedSize = Number(view.getBigUint64(o + 24, true));
+          const bufferSize =
+            typeof buffer.size === 'number' && Number.isFinite(buffer.size) && buffer.size > 0
+              ? buffer.size
+              : null;
+          const minBindingSize =
+            layoutEntry &&
+            layoutEntry.buffer &&
+            typeof layoutEntry.buffer.minBindingSize === 'number' &&
+            layoutEntry.buffer.minBindingSize > 0
+              ? layoutEntry.buffer.minBindingSize
+              : 0;
+
+          if (bufferSize !== null && bufOffset >= bufferSize) {
+            if (layoutEntry) {
+              this._recordTelemetryWarningOnce(
+                `bg-buffer-oob:${layoutId}:${binding}`,
+                `bind group ${id}: binding ${binding} offset ${bufOffset} exceeds buffer size ${bufferSize}; using dummy buffer`
+              );
+              resource = this._dummyResource(layoutEntry);
+            }
+          } else {
+            let effectiveSize = requestedSize;
+            if (bufferSize !== null && effectiveSize > 0 && bufOffset + effectiveSize > bufferSize) {
+              effectiveSize = bufferSize - bufOffset;
+            }
+            const remaining = bufferSize !== null ? bufferSize - bufOffset : null;
+            if (minBindingSize > 0) {
+              const boundSize = effectiveSize > 0 ? effectiveSize : remaining;
+              if (boundSize !== null && boundSize < minBindingSize) {
+                if (remaining !== null && remaining >= minBindingSize) {
+                  effectiveSize = minBindingSize;
+                  this._recordTelemetryWarningOnce(
+                    `bg-buffer-widen:${layoutId}:${binding}:${minBindingSize}`,
+                    `bind group ${id}: binding ${binding} size widened to layout minBindingSize ${minBindingSize}`
+                  );
+                } else if (layoutEntry) {
+                  this._recordTelemetryWarningOnce(
+                    `bg-buffer-undersized:${layoutId}:${binding}:${minBindingSize}`,
+                    `bind group ${id}: binding ${binding} buffer smaller than minBindingSize ${minBindingSize}; using dummy buffer`
+                  );
+                  resource = this._dummyResource(layoutEntry);
+                }
+              }
+            }
+            if (!resource) {
+              resource = { buffer, offset: bufOffset };
+              if (effectiveSize > 0) resource.size = effectiveSize;
+            }
+          }
         }
       } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
-        resource = this._textureView(resourceId, decodeTextureViewDesc(view, o + 32));
+        const viewDesc = decodeTextureViewDesc(view, o + 32);
+        const texFormat = this._resolveTextureFormat(resourceId, viewDesc);
+        if (
+          layoutEntry &&
+          layoutEntry.texture &&
+          layoutEntry.texture.sampleType === 'float' &&
+          texFormat &&
+          isFloat32TextureFormat(texFormat) &&
+          !deviceHasFeature(this.device, 'float32-filterable')
+        ) {
+          this.telemetry.unfilterableFloatFallbacks += 1;
+          this._recordTelemetryWarningOnce(
+            `bg-unfilterable-float:${texFormat}:${binding}`,
+            `bind group ${id}: binding ${binding} format ${texFormat} requires unfilterable-float without float32-filterable; substituting filterable fallback`
+          );
+          resource = this._dummyResource(layoutEntry);
+        } else {
+          resource = this._textureView(resourceId, viewDesc);
+        }
       } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
         resource = this.processor.samplers.get(resourceId) || null;
       }
@@ -1324,7 +2163,14 @@ class RenderStatePackets {
       }
       entries.push({ binding, resource });
     }
-    this.processor.bindGroups.set(id, this.device.createBindGroup({ layout: record.layout, entries }));
+    let bindGroup;
+    try {
+      bindGroup = this.device.createBindGroup({ layout: record.layout, entries });
+    } catch (err) {
+      this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
+      return false;
+    }
+    this.processor.bindGroups.set(id, bindGroup);
     return true;
   }
 
@@ -1363,7 +2209,14 @@ class RenderStatePackets {
     };
     const compare = view.getUint8(offset + 10);
     if (compare !== 0) desc.compare = nameOf(COMPARE_FUNCTION_NAMES, compare);
-    this.processor.samplers.set(id, this.device.createSampler(desc));
+    let sampler;
+    try {
+      sampler = this.device.createSampler(desc);
+    } catch (err) {
+      this._packetError = `sampler ${id}: ${String(err && err.message ? err.message : err)}`;
+      return false;
+    }
+    this.processor.samplers.set(id, sampler);
     return true;
   }
 }
@@ -1371,6 +2224,42 @@ class RenderStatePackets {
 function installRenderStatePackets(processor, options = {}) {
   const handler = new RenderStatePackets(processor, options);
   processor.extension = handler;
+
+  if (processor && typeof processor === 'object') {
+    processor[HOOK_ACTIVE_HANDLER] = handler;
+
+    if (typeof processor._flushPresent === 'function' && !processor[HOOK_ORIG_FLUSH_PRESENT]) {
+      const origFlushPresent = processor._flushPresent;
+      processor[HOOK_ORIG_FLUSH_PRESENT] = origFlushPresent;
+      processor._flushPresent = function hardenedFlushPresent() {
+        const activeHandler = this[HOOK_ACTIVE_HANDLER];
+        if (activeHandler && typeof activeHandler._preparePassCommandsForFlush === 'function') {
+          activeHandler._preparePassCommandsForFlush();
+        }
+        return origFlushPresent.call(this);
+      };
+    }
+
+    if (
+      typeof processor._handleCreateComputePipeline === 'function' &&
+      !processor[HOOK_ORIG_CREATE_COMPUTE_PIPELINE]
+    ) {
+      const origCreateComputePipeline = processor._handleCreateComputePipeline;
+      processor[HOOK_ORIG_CREATE_COMPUTE_PIPELINE] = origCreateComputePipeline;
+      processor._handleCreateComputePipeline = function hardenedHandleCreateComputePipeline(
+        view,
+        payloadOffset
+      ) {
+        const activeHandler = this[HOOK_ACTIVE_HANDLER];
+        if (activeHandler && typeof activeHandler._handleV1CreateComputePipeline === 'function') {
+          activeHandler._handleV1CreateComputePipeline(origCreateComputePipeline, view, payloadOffset);
+          return;
+        }
+        origCreateComputePipeline.call(this, view, payloadOffset);
+      };
+    }
+  }
+
   return handler;
 }
 
@@ -1383,6 +2272,20 @@ const exportedApi = {
   decodeBeginRenderPass,
   decodeTextureViewDesc,
   decodeBindGroupLayoutEntry,
+  decodeCreateTexture2,
+  sanitizeTextureDescriptor,
+  validateComputeDispatch,
+  getMaxComputeWorkgroupsPerDimension,
+  deviceHasFeature,
+  isBcCompressedFormat,
+  isSrgbTextureFormat,
+  isDepthOrStencilTextureFormat,
+  isFloat32TextureFormat,
+  isStorageBindingSupported,
+  isRenderAttachmentSupported,
+  isMultisampleSupported,
+  resolveTextureSampleType,
+  computeMaxMipLevels,
   resolveShaderEntryPoint,
   findWgslStageEntryPoints,
   validateVertexBufferLayouts,
@@ -1392,6 +2295,7 @@ const exportedApi = {
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
   TEXTURE_FORMAT_NAMES,
+  TEXTURE_DIMENSION_NAMES,
   VERTEX_FORMAT_NAMES,
   BLEND_FACTOR_NAMES,
   BLEND_OPERATION_NAMES,

@@ -1510,6 +1510,10 @@ test('W81 G31 render_state_packets.js has zero ES module syntax and reloads clea
   assert.equal(typeof ctx.PlayGta6RenderState.installRenderStatePackets, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.resolveShaderEntryPoint, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.validateVertexBufferLayouts, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeCreateTexture2, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.sanitizeTextureDescriptor, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.validateComputeDispatch, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.resolveTextureSampleType, 'function');
 
   // Verify zero leaked top-level lexical declarations
   assert.doesNotThrow(() => {
@@ -1518,4 +1522,562 @@ test('W81 G31 render_state_packets.js has zero ES module syntax and reloads clea
       ctx
     );
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// W89: Compute dispatches (cs_main), @group(0) storage/S22 bindings, and G48/R32 texture formats
+// ---------------------------------------------------------------------------------------------
+
+function createTexture2Packet({
+  id,
+  width,
+  height,
+  depthOrLayers = 1,
+  mipLevels = 1,
+  sampleCount = 1,
+  usage = 0x04,
+  dimension = 1, // 2d
+  format,
+  viewFormats = [],
+}) {
+  const payload = new Uint8Array(40);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, id, true);
+  view.setUint32(4, width, true);
+  view.setUint32(8, height, true);
+  view.setUint32(12, depthOrLayers, true);
+  view.setUint32(16, mipLevels, true);
+  view.setUint32(20, sampleCount, true);
+  view.setUint32(24, usage, true);
+  view.setUint8(28, dimension);
+  view.setUint8(29, format);
+  view.setUint8(30, viewFormats.length);
+  viewFormats.forEach((f, i) => view.setUint8(32 + i, f));
+  return header(V2_OPCODES.CREATE_TEXTURE2, payload);
+}
+
+function createComputePipeline2Packet(id, csModuleId, layoutId = 0, csShaderHash = 0n, rootSigId = 0) {
+  const payload = new Uint8Array(32);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, id, true);
+  view.setUint32(4, csModuleId, true);
+  view.setUint32(8, layoutId, true);
+  view.setBigUint64(16, csShaderHash, true);
+  view.setUint32(24, rootSigId, true);
+  return header(V2_OPCODES.CREATE_COMPUTE_PIPELINE2, payload);
+}
+
+function createSampler2Packet(id, { filter = 0, compare = 0 } = {}) {
+  const payload = new Uint8Array(24);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, id, true);
+  payload.set([0, 0, 0, filter, filter, filter, compare], 4);
+  view.setUint16(12, 1, true);
+  view.setFloat32(16, 0, true);
+  view.setFloat32(20, 32, true);
+  return header(V2_OPCODES.CREATE_SAMPLER2, payload);
+}
+
+function formatCodeOf(name) {
+  const idx = rs.TEXTURE_FORMAT_NAMES.indexOf(name);
+  assert.ok(idx > 0, `expected format ${name} in TEXTURE_FORMAT_NAMES`);
+  return idx;
+}
+
+test('W89 CreateComputePipeline2 (cs_main) + @group(0) storage/uniform/texture bind group + Dispatch(8,4,1) + zero/oversized guards', () => {
+  const gpu = createMockWebGpu();
+  gpu.device.limits = { maxComputeWorkgroupsPerDimension: 256 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const computeWgsl = [
+    '@group(0) @binding(0) var<uniform> cb0: vec4<f32>;',
+    '@group(0) @binding(1) var<storage, read> srcBuf: array<u32>;',
+    '@group(0) @binding(2) var<storage, read_write> dstBuf: array<u32>;',
+    '@group(0) @binding(3) var inTex: texture_2d<f32>;',
+    '@group(0) @binding(4) var inSamp: sampler;',
+    '@group(0) @binding(5) var outTex: texture_storage_2d<rgba32float, write>;',
+    '@compute @workgroup_size(8, 8, 1)',
+    'fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {}',
+  ].join('\n');
+
+  const group0Entries = [
+    { binding: 0, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 }, // uniform (16B tight S22 CBV)
+    { binding: 1, visibility: 4, type: 0, subtype: 2, minBindingSize: 64 }, // read-only-storage
+    { binding: 2, visibility: 4, type: 0, subtype: 1, minBindingSize: 64 }, // storage
+    { binding: 3, visibility: 4, type: 2, subtype: 1, dimension: 2 }, // unfilterable-float 2d
+    { binding: 4, visibility: 4, type: 1, subtype: 1 }, // non-filtering sampler
+    { binding: 5, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: formatCodeOf('rgba32float') }, // write-only storage texture
+  ];
+
+  const stream = concat(
+    new Stream()
+      .shader(10, 2, computeWgsl)
+      .shader(11, 2, 'fn not_a_compute_entry() {}') // lacks @compute / cs_main -> sanitized warning
+      .buffer(100, 0x0040 | 0x0008, 16) // tight 16B CBV
+      .buffer(101, 0x0080 | 0x0008, 256) // read-only storage
+      .buffer(102, 0x0080 | 0x0008, 256) // read-write storage
+      .bytes(),
+    createTexture2Packet({
+      id: 103,
+      width: 64,
+      height: 64,
+      format: formatCodeOf('rgba32float'),
+      usage: 0x04 | 0x02, // TEXTURE_BINDING | COPY_DST
+    }),
+    createSampler2Packet(104, { filter: 0 }),
+    createTexture2Packet({
+      id: 105,
+      width: 64,
+      height: 64,
+      format: formatCodeOf('rgba32float'),
+      usage: 0x08 | 0x04, // STORAGE_BINDING | TEXTURE_BINDING
+    }),
+    bindGroupLayoutPacket(200, group0Entries),
+    pipelineLayoutPacket(201, [200]),
+    createComputePipeline2Packet(300, 10, 201, 0xdeadbeefn, 7),
+    createComputePipeline2Packet(301, 11, 0), // missing @compute warning
+    bindGroup2Packet(400, 200, [
+      { binding: 0, type: 0, id: 100, offset: 0, size: 16 },
+      { binding: 1, type: 0, id: 101, offset: 0, size: 256 },
+      { binding: 2, type: 0, id: 102, offset: 0, size: 256 },
+      { binding: 3, type: 1, id: 103 },
+      { binding: 4, type: 2, id: 104 },
+      { binding: 5, type: 1, id: 105 },
+    ]),
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .u32s(OPCODES.SET_COMPUTE_PIPELINE, [300])
+      .bytes(),
+    setBindGroup2Packet(0, 400, []),
+    new Stream()
+      .u32s(OPCODES.DISPATCH_COMPUTE, [8, 4, 1]) // valid dispatch
+      .u32s(OPCODES.DISPATCH_COMPUTE, [0, 4, 1]) // zero X -> skipped
+      .u32s(OPCODES.DISPATCH_COMPUTE, [8, 0, 1]) // zero Y -> skipped
+      .u32s(OPCODES.DISPATCH_COMPUTE, [8, 4, 0]) // zero Z -> skipped
+      .u32s(OPCODES.DISPATCH_COMPUTE, [1024, 4, 512]) // exceeds limit 256 -> clamped to 256x4x256
+      .u32s(OPCODES.SET_COMPUTE_PIPELINE, [9999]) // missing pipeline -> skipped
+      .u32s(OPCODES.DISPATCH_COMPUTE, [2, 2, 1]) // dispatch on missing pipeline -> skipped
+      .packet(OPCODES.PRESENT)
+      .bytes()
+  );
+
+  const result = processor.executeCommandBuffer(stream);
+  assert.equal(result.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const [cp0, cp1] = gpu.results('createComputePipeline');
+  const [pl] = gpu.results('createPipelineLayout');
+  const [bg] = gpu.results('createBindGroup');
+  assert.equal(cp0.desc.layout, pl.result);
+  assert.equal(cp0.desc.compute.entryPoint, 'cs_main');
+  assert.equal(cp1.desc.layout, 'auto');
+  assert.equal(cp1.desc.compute.entryPoint, 'cs_main');
+
+  // Verify exact compute pass call sequence: beginComputePass -> setPipeline -> setBindGroup(0) -> dispatchWorkgroups -> end
+  const computeCalls = gpu.passCalls.filter((c) => c.pass === 'compute');
+  assert.deepEqual(
+    computeCalls.map((c) => c.op),
+    ['beginComputePass', 'setPipeline', 'setBindGroup', 'dispatchWorkgroups', 'dispatchWorkgroups', 'end']
+  );
+  assert.equal(computeCalls[1].args[0], cp0.result);
+  assert.equal(computeCalls[2].args[0], 0);
+  assert.equal(computeCalls[2].args[1], bg.result);
+  assert.deepEqual(computeCalls[3].args, [8, 4, 1]);
+  assert.deepEqual(computeCalls[4].args, [256, 4, 256]);
+
+  // Verify compute telemetry counters in extension stats snapshot
+  const stats = handler.getStats();
+  assert.equal(stats.computePipelineCount, 2);
+  assert.equal(stats.computeDispatchCount, 2);
+  assert.equal(stats.skippedComputeDispatchCount, 4);
+  assert.equal(stats.clampedComputeDispatchCount, 1);
+  assert.equal(stats.rootSigGroup0Layouts, 1);
+
+  // Verify sanitized warnings (no raw WGSL identifiers leaked)
+  const warnings = handler.getTelemetry().warnings;
+  assert.ok(warnings.some((w) => /lacks @compute/.test(w)), 'must warn when compute shader lacks @compute');
+  assert.ok(warnings.some((w) => /zero or invalid workgroups/.test(w)), 'must warn on zero dispatch');
+  assert.ok(warnings.some((w) => /clamped compute dispatch.*256x4x256/.test(w)), 'must warn on oversized clamp');
+  assert.ok(warnings.some((w) => /compute pipeline 9999/.test(w)), 'must warn on missing compute pipeline');
+  for (const w of warnings) {
+    assert.equal(w.includes('not_a_compute_entry'), false, 'warning must not leak WGSL identifiers');
+  }
+
+  // Pure validateComputeDispatch checks
+  assert.deepEqual(rs.validateComputeDispatch(8, 4, 1, gpu.device), {
+    skip: false,
+    clamped: false,
+    x: 8,
+    y: 4,
+    z: 1,
+    maxWorkgroupsPerDimension: 256,
+    reason: null,
+  });
+  assert.equal(rs.validateComputeDispatch(0, 4, 1, gpu.device).skip, true);
+  assert.equal(rs.validateComputeDispatch(1, -2, 1, gpu.device).skip, true);
+  assert.deepEqual(rs.validateComputeDispatch(70000, 1, 1, null), {
+    skip: false,
+    clamped: true,
+    x: 65535,
+    y: 1,
+    z: 1,
+    maxWorkgroupsPerDimension: 65535,
+    reason: 'exceeds-limit',
+  });
+});
+
+test('W89 R32G32B32A32_FLOAT (rgba32float) texture creation & unfilterable-float binding without WebGPU validation errors', () => {
+  // Strict WebGPU mock enforcing float32-filterable rules on createBindGroup
+  function createStrictFloat32Mock(enableFloat32Filterable) {
+    const gpu = createMockWebGpu();
+    gpu.device.features = enableFloat32Filterable ? new Set(['float32-filterable']) : new Set();
+    const origCreateBg = gpu.device.createBindGroup.bind(gpu.device);
+    const origCreateTex = gpu.device.createTexture.bind(gpu.device);
+    const viewFormats = new Map();
+    gpu.device.createTexture = (desc) => {
+      const tex = origCreateTex(desc);
+      tex.format = desc.format;
+      const origView = tex.createView.bind(tex);
+      tex.createView = (viewDesc) => {
+        const v = origView(viewDesc);
+        viewFormats.set(v, (viewDesc && viewDesc.format) || desc.format);
+        return v;
+      };
+      return tex;
+    };
+    gpu.device.createBindGroup = (desc) => {
+      const layoutEntries = (desc.layout && desc.layout.desc && desc.layout.desc.entries) || [];
+      for (const e of desc.entries) {
+        const le = layoutEntries.find((x) => x.binding === e.binding);
+        if (le && le.texture && le.texture.sampleType === 'float') {
+          const fmt = viewFormats.get(e.resource);
+          if (
+            (fmt === 'rgba32float' || fmt === 'rg32float' || fmt === 'r32float') &&
+            !gpu.device.features.has('float32-filterable')
+          ) {
+            throw new Error(`GPUValidationError: texture format ${fmt} is not filterable`);
+          }
+        }
+      }
+      return origCreateBg(desc);
+    };
+    return { gpu, viewFormats };
+  }
+
+  // Case 1: Device WITHOUT float32-filterable
+  assert.equal(rs.resolveTextureSampleType('rgba32float', { features: new Set() }), 'unfilterable-float');
+  assert.equal(rs.resolveTextureSampleType('r32float', { features: new Set() }), 'unfilterable-float');
+  assert.equal(rs.resolveTextureSampleType('rg32float', { features: new Set() }), 'unfilterable-float');
+  assert.equal(rs.resolveTextureSampleType('r32uint', { features: new Set() }), 'uint');
+  assert.equal(rs.resolveTextureSampleType('depth24plus-stencil8', { features: new Set() }), 'depth');
+  assert.equal(rs.resolveTextureSampleType('rgba16float', { features: new Set() }), 'float');
+  assert.equal(
+    rs.resolveTextureSampleType('rgba32float', { features: new Set(['float32-filterable']) }),
+    'float'
+  );
+
+  const strictNoF32 = createStrictFloat32Mock(false);
+  const procNoF32 = new WgpuCommandProcessor(strictNoF32.gpu.device, strictNoF32.gpu.ctx);
+  const handlerNoF32 = installRenderStatePackets(procNoF32);
+
+  procNoF32.executeCommandBuffer(
+    concat(
+      createTexture2Packet({
+        id: 50,
+        width: 128,
+        height: 128,
+        format: formatCodeOf('rgba32float'),
+        usage: 0x04 | 0x08 | 0x10 | 0x02, // TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | COPY_DST (all valid for rgba32float!)
+      }),
+      // Layout A: unfilterable-float (matches rgba32float directly)
+      bindGroupLayoutPacket(10, [{ binding: 0, visibility: 6, type: 2, subtype: 1, dimension: 2 }]),
+      bindGroup2Packet(20, 10, [{ binding: 0, type: 1, id: 50 }]),
+      // Layout B: filterable float (must NOT trigger GPUValidationError without float32-filterable!)
+      bindGroupLayoutPacket(11, [{ binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 }]),
+      bindGroup2Packet(21, 11, [{ binding: 0, type: 1, id: 50 }])
+    )
+  );
+  assert.equal(handlerNoF32.stats.errors, 0, handlerNoF32.lastError);
+
+  const createdTex = strictNoF32.gpu.results('createTexture')[0];
+  assert.equal(createdTex.desc.format, 'rgba32float');
+  assert.equal(createdTex.desc.usage, 0x04 | 0x08 | 0x10 | 0x02);
+
+  const [bgUnfilt, bgFilt] = strictNoF32.gpu.results('createBindGroup');
+  // Unfilterable layout binds the real rgba32float texture view directly!
+  assert.equal(strictNoF32.viewFormats.get(bgUnfilt.desc.entries[0].resource), 'rgba32float');
+  // Filterable layout substituted a filterable fallback instead of failing WebGPU validation!
+  assert.equal(strictNoF32.viewFormats.get(bgFilt.desc.entries[0].resource), 'rgba8unorm');
+  assert.equal(handlerNoF32.getStats().unfilterableFloatFallbacks, 1);
+
+  // Case 2: Device WITH float32-filterable binds real rgba32float to 'float' directly
+  const strictWithF32 = createStrictFloat32Mock(true);
+  const procWithF32 = new WgpuCommandProcessor(strictWithF32.gpu.device, strictWithF32.gpu.ctx);
+  const handlerWithF32 = installRenderStatePackets(procWithF32);
+  procWithF32.executeCommandBuffer(
+    concat(
+      createTexture2Packet({ id: 50, width: 64, height: 64, format: formatCodeOf('rgba32float'), usage: 0x04 }),
+      bindGroupLayoutPacket(11, [{ binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 }]),
+      bindGroup2Packet(21, 11, [{ binding: 0, type: 1, id: 50 }])
+    )
+  );
+  assert.equal(handlerWithF32.stats.errors, 0, handlerWithF32.lastError);
+  const [bgDirect] = strictWithF32.gpu.results('createBindGroup');
+  assert.equal(strictWithF32.viewFormats.get(bgDirect.desc.entries[0].resource), 'rgba32float');
+  assert.equal(handlerWithF32.getStats().unfilterableFloatFallbacks, 0);
+});
+
+test('W89 G48/R32 texture format & usage compatibility strips invalid STORAGE_BINDING / RENDER_ATTACHMENT and falls back cleanly without texture-compression-bc', () => {
+  const allG48Formats = [
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'bgra8unorm',
+    'rgba16float',
+    'rgba32float',
+    'r32float',
+    'rg32float',
+    'r32uint',
+    'rg11b10ufloat',
+    'rgb10a2unorm',
+    'depth24plus-stencil8',
+    'depth32float',
+    'bc1-rgba-unorm',
+    'bc3-rgba-unorm',
+    'bc4-r-unorm',
+    'bc5-rg-unorm',
+    'bc6h-rgb-ufloat',
+    'bc7-rgba-unorm',
+  ];
+
+  // 1. Device WITHOUT texture-compression-bc / bgra8unorm-storage / rg11b10ufloat-renderable
+  const gpuNoFeatures = createMockWebGpu();
+  gpuNoFeatures.device.features = new Set();
+  const origCreateTex = gpuNoFeatures.device.createTexture.bind(gpuNoFeatures.device);
+  gpuNoFeatures.device.createTexture = (desc) => {
+    if (desc.format.startsWith('bc')) {
+      throw new Error(`GPUValidationError: ${desc.format} requires texture-compression-bc`);
+    }
+    return origCreateTex(desc);
+  };
+
+  const processor = new WgpuCommandProcessor(gpuNoFeatures.device, gpuNoFeatures.ctx);
+  const handler = installRenderStatePackets(processor);
+
+  const packets = allG48Formats.map((fmt, idx) =>
+    createTexture2Packet({
+      id: 1000 + idx,
+      width: 64,
+      height: 64,
+      format: formatCodeOf(fmt),
+      usage: 0x04 | 0x08 | 0x10 | 0x02, // TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | COPY_DST
+    })
+  );
+  // Also emit a second bc7-rgba-unorm texture to verify warning deduplication, plus a view with bc7 format code
+  packets.push(
+    createTexture2Packet({
+      id: 2000,
+      width: 32,
+      height: 32,
+      format: formatCodeOf('bc7-rgba-unorm'),
+      usage: 0x04 | 0x08 | 0x10,
+      viewFormats: [formatCodeOf('bc7-rgba-unorm')],
+    }),
+    bindGroupLayoutPacket(50, [{ binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 }]),
+    bindGroup2Packet(51, 50, [
+      { binding: 0, type: 1, id: 2000, view: viewDesc({ format: formatCodeOf('bc7-rgba-unorm'), dimension: 2 }) },
+    ])
+  );
+
+  processor.executeCommandBuffer(concat(...packets));
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const created = gpuNoFeatures.results('createTexture');
+  const byIndex = (name) => created[allG48Formats.indexOf(name)].desc;
+
+  // sRGB: STORAGE_BINDING stripped, RENDER_ATTACHMENT kept
+  assert.equal(byIndex('rgba8unorm-srgb').format, 'rgba8unorm-srgb');
+  assert.equal(byIndex('rgba8unorm-srgb').usage & 0x08, 0);
+  assert.equal(byIndex('rgba8unorm-srgb').usage & 0x10, 0x10);
+
+  // bgra8unorm without bgra8unorm-storage: STORAGE_BINDING stripped, RENDER_ATTACHMENT kept
+  assert.equal(byIndex('bgra8unorm').format, 'bgra8unorm');
+  assert.equal(byIndex('bgra8unorm').usage & 0x08, 0);
+  assert.equal(byIndex('bgra8unorm').usage & 0x10, 0x10);
+
+  // depth formats: STORAGE_BINDING stripped, RENDER_ATTACHMENT kept
+  assert.equal(byIndex('depth24plus-stencil8').usage & 0x08, 0);
+  assert.equal(byIndex('depth24plus-stencil8').usage & 0x10, 0x10);
+  assert.equal(byIndex('depth32float').usage & 0x08, 0);
+  assert.equal(byIndex('depth32float').usage & 0x10, 0x10);
+
+  // core storage+render formats: both STORAGE_BINDING and RENDER_ATTACHMENT kept
+  for (const fmt of ['rgba8unorm', 'rgba16float', 'rgba32float', 'r32float', 'rg32float', 'r32uint']) {
+    assert.equal(byIndex(fmt).format, fmt);
+    assert.equal(byIndex(fmt).usage & 0x08, 0x08, `${fmt} must preserve STORAGE_BINDING`);
+    assert.equal(byIndex(fmt).usage & 0x10, 0x10, `${fmt} must preserve RENDER_ATTACHMENT`);
+  }
+
+  // rg11b10ufloat without feature: both STORAGE_BINDING and RENDER_ATTACHMENT stripped
+  assert.equal(byIndex('rg11b10ufloat').usage & 0x08, 0);
+  assert.equal(byIndex('rg11b10ufloat').usage & 0x10, 0);
+
+  // rgb10a2unorm: STORAGE_BINDING stripped (tier1), RENDER_ATTACHMENT kept
+  assert.equal(byIndex('rgb10a2unorm').usage & 0x08, 0);
+  assert.equal(byIndex('rgb10a2unorm').usage & 0x10, 0x10);
+
+  // BC formats without texture-compression-bc: fell back to rgba8unorm with STORAGE_BINDING & RENDER_ATTACHMENT stripped
+  for (const bcFmt of ['bc1-rgba-unorm', 'bc3-rgba-unorm', 'bc4-r-unorm', 'bc5-rg-unorm', 'bc6h-rgb-ufloat', 'bc7-rgba-unorm']) {
+    assert.equal(byIndex(bcFmt).format, 'rgba8unorm', `${bcFmt} must fall back to rgba8unorm`);
+    assert.equal(byIndex(bcFmt).usage & 0x08, 0, `${bcFmt} must strip STORAGE_BINDING`);
+    assert.equal(byIndex(bcFmt).usage & 0x10, 0, `${bcFmt} must strip RENDER_ATTACHMENT`);
+  }
+
+  // View on fallback BC7 texture remaps requested bc7-rgba-unorm view format to rgba8unorm
+  const bc7ViewCall = gpuNoFeatures
+    .results('texture.createView')
+    .find((v) => v.desc && v.desc.dimension === '2d');
+  assert.equal(bc7ViewCall.desc.format, 'rgba8unorm');
+
+  // Telemetry counts & deduplicated BC7 diagnostic (two bc7 textures -> only ONE bc7-unsupported warning)
+  const stats = handler.getStats();
+  assert.equal(stats.texture2Count, allG48Formats.length + 1);
+  assert.equal(stats.bcFormatFallbacks, 7);
+  assert.ok(stats.usageStrips > 0);
+  const bc7Warnings = handler
+    .getTelemetry()
+    .warnings.filter((w) => w.includes('bc7-rgba-unorm unavailable'));
+  assert.equal(bc7Warnings.length, 1, 'BC7 fallback diagnostic must be deduplicated');
+
+  // 2. Device WITH texture-compression-bc and bgra8unorm-storage keeps native BC formats & bgra8 storage,
+  //    while still stripping STORAGE_BINDING and RENDER_ATTACHMENT on BC formats!
+  const gpuWithBc = createMockWebGpu();
+  gpuWithBc.device.features = new Set(['texture-compression-bc', 'bgra8unorm-storage']);
+  const procWithBc = new WgpuCommandProcessor(gpuWithBc.device, gpuWithBc.ctx);
+  const handlerWithBc = installRenderStatePackets(procWithBc);
+  procWithBc.executeCommandBuffer(
+    concat(
+      createTexture2Packet({
+        id: 1,
+        width: 128,
+        height: 128,
+        format: formatCodeOf('bc7-rgba-unorm'),
+        usage: 0x04 | 0x08 | 0x10,
+      }),
+      createTexture2Packet({
+        id: 2,
+        width: 128,
+        height: 128,
+        format: formatCodeOf('bgra8unorm'),
+        usage: 0x04 | 0x08 | 0x10,
+      })
+    )
+  );
+  assert.equal(handlerWithBc.stats.errors, 0, handlerWithBc.lastError);
+  const [bcNative, bgraStorage] = gpuWithBc.results('createTexture');
+  assert.equal(bcNative.desc.format, 'bc7-rgba-unorm');
+  assert.equal(bcNative.desc.usage, 0x04); // STORAGE_BINDING & RENDER_ATTACHMENT stripped even with BC feature
+  assert.equal(bgraStorage.desc.format, 'bgra8unorm');
+  assert.equal(bgraStorage.desc.usage, 0x04 | 0x08 | 0x10);
+  assert.equal(handlerWithBc.getStats().bcFormatFallbacks, 0);
+});
+
+test('W89 S22 tight 16-byte & 48-byte CBV @group(0) bindings plus full storage/texture/sampler layout alignment', () => {
+  const gpu = createMockWebGpu();
+  gpu.device.features = new Set();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // Full S22 @group(0) layout: 16B CBV, 48B CBV, read-only storage, read-write storage,
+  // float 2D texture, unfilterable-float 2D texture, uint 2D texture, depth 2D texture,
+  // filtering/non-filtering/comparison samplers, and write-only storage texture.
+  const s22Entries = [
+    { binding: 0, visibility: 7, type: 0, subtype: 0, minBindingSize: 16 }, // tight 16B CBV
+    { binding: 1, visibility: 7, type: 0, subtype: 0, minBindingSize: 48 }, // tight 48B CBV
+    { binding: 2, visibility: 7, type: 0, subtype: 2, minBindingSize: 32 }, // read-only-storage
+    { binding: 3, visibility: 7, type: 0, subtype: 1, minBindingSize: 64 }, // storage (VERTEX stripped -> 6)
+    { binding: 4, visibility: 6, type: 2, subtype: 0, dimension: 2 }, // float 2d
+    { binding: 5, visibility: 6, type: 2, subtype: 1, dimension: 2 }, // unfilterable-float 2d
+    { binding: 6, visibility: 6, type: 2, subtype: 4, dimension: 2 }, // uint 2d
+    { binding: 7, visibility: 6, type: 2, subtype: 2, dimension: 2 }, // depth 2d
+    { binding: 8, visibility: 6, type: 1, subtype: 0 }, // filtering sampler
+    { binding: 9, visibility: 6, type: 1, subtype: 1 }, // non-filtering sampler
+    { binding: 10, visibility: 6, type: 1, subtype: 2 }, // comparison sampler
+    { binding: 11, visibility: 7, type: 3, subtype: 0, dimension: 2, storageFormat: formatCodeOf('rgba8unorm') }, // write-only storage texture (VERTEX stripped -> 6)
+  ];
+
+  const stream = concat(
+    new Stream()
+      .buffer(1, 0x0040 | 0x0008, 16) // exact 16B tight CBV buffer
+      .buffer(2, 0x0040 | 0x0008, 48) // exact 48B tight CBV buffer
+      .buffer(3, 0x0080 | 0x0008, 128) // read-only storage
+      .buffer(4, 0x0080 | 0x0008, 128) // read-write storage
+      .buffer(5, 0x0040 | 0x0008, 256) // larger buffer bound with undersized range (16B < 48B) -> widened to 48B
+      .bytes(),
+    createTexture2Packet({ id: 10, width: 16, height: 16, format: formatCodeOf('rgba8unorm'), usage: 0x04 }),
+    createTexture2Packet({ id: 11, width: 16, height: 16, format: formatCodeOf('rgba32float'), usage: 0x04 }),
+    createTexture2Packet({ id: 12, width: 16, height: 16, format: formatCodeOf('r32uint'), usage: 0x04 }),
+    createTexture2Packet({ id: 13, width: 16, height: 16, format: formatCodeOf('depth32float'), usage: 0x04 }),
+    createTexture2Packet({ id: 14, width: 16, height: 16, format: formatCodeOf('rgba8unorm'), usage: 0x08 }),
+    createSampler2Packet(20, { filter: 1 }),
+    createSampler2Packet(21, { filter: 0 }),
+    createSampler2Packet(22, { filter: 1, compare: 2 }), // less
+    bindGroupLayoutPacket(100, s22Entries),
+    bindGroup2Packet(200, 100, [
+      { binding: 0, type: 0, id: 1, offset: 0, size: 16 },
+      { binding: 1, type: 0, id: 2, offset: 0, size: 48 },
+      { binding: 2, type: 0, id: 3, offset: 0, size: 128 },
+      { binding: 3, type: 0, id: 4, offset: 0, size: 128 },
+      { binding: 4, type: 1, id: 10 },
+      { binding: 5, type: 1, id: 11 },
+      { binding: 6, type: 1, id: 12 },
+      { binding: 7, type: 1, id: 13 },
+      { binding: 8, type: 2, id: 20 },
+      { binding: 9, type: 2, id: 21 },
+      { binding: 10, type: 2, id: 22 },
+      { binding: 11, type: 1, id: 14 },
+    ]),
+    // Second bind group tests widening a 16B range on a 256B buffer up to the 48B layout minBindingSize
+    bindGroupLayoutPacket(101, [{ binding: 0, visibility: 7, type: 0, subtype: 0, minBindingSize: 48 }]),
+    bindGroup2Packet(201, 101, [{ binding: 0, type: 0, id: 5, offset: 0, size: 16 }])
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const [bgl] = gpu.results('createBindGroupLayout');
+  assert.deepEqual(bgl.desc.entries[0], {
+    binding: 0,
+    visibility: 7,
+    buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 16 },
+  });
+  assert.deepEqual(bgl.desc.entries[1], {
+    binding: 1,
+    visibility: 7,
+    buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 48 },
+  });
+  assert.equal(bgl.desc.entries[3].visibility, 6); // VERTEX stripped from read-write storage
+  assert.equal(bgl.desc.entries[11].visibility, 6); // VERTEX stripped from write-only storageTexture
+  assert.deepEqual(bgl.desc.entries[11].storageTexture, {
+    access: 'write-only',
+    format: 'rgba8unorm',
+    viewDimension: '2d',
+  });
+
+  const [bg0, bg1] = gpu.results('createBindGroup');
+  assert.equal(bg0.desc.entries[0].resource.size, 16);
+  assert.equal(bg0.desc.entries[1].resource.size, 48);
+  assert.equal(bg0.desc.entries.length, 12);
+  // Widened to minBindingSize 48 so WebGPU never rejects the binding
+  assert.equal(bg1.desc.entries[0].resource.size, 48);
+
+  // Duplicate binding in CreateBindGroup2 is rejected cleanly
+  processor.executeCommandBuffer(
+    bindGroup2Packet(202, 101, [
+      { binding: 0, type: 0, id: 5, offset: 0, size: 48 },
+      { binding: 0, type: 0, id: 5, offset: 0, size: 48 },
+    ])
+  );
+  assert.equal(handler.stats.errors, 1);
+  assert.match(handler.lastError, /duplicate binding 0/);
 });
