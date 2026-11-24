@@ -2,6 +2,48 @@
 
 // Main runtime coordinator worker (keeps the browser DOM thread completely free).
 (function initPlayGta6Loader() {
+const EMSCRIPTEN_PTHREAD_WORKER_NAME = 'em-pthread';
+const PTHREAD_WGPU_CHANNEL_NAME = 'playgta6-wgpu-pthread';
+const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
+const HOST_ABI_IMPORT_NAMES = Object.freeze([
+  'host_log',
+  'host_httpfs_open',
+  'host_httpfs_read',
+  'host_httpfs_close',
+  'host_wgpu_submit',
+]);
+const DEFAULT_RUNTIME_SCRIPT_RELATIVE = './dist/runtime.js';
+const DEFAULT_RUNTIME_SCRIPT_FALLBACK = 'dist/runtime.js';
+
+// GpuPacketHeader / GpuOpcode from runtime/abi/playgta6_abi.h and docs/gpu_commands.md.
+// Present is opcode 7 (ClearColor is 2). Detecting opcode 2 as Present would dismiss splash on clear.
+const GPU_PACKET_HEADER_BYTES = 8;
+const GPU_OPCODE_PRESENT = 7;
+const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
+
+// Emscripten 7.0.1 `-pthread` spawns `new Worker(self.location.href, { name: "em-pthread" })`.
+// Detect pthread workers immediately so we bridge `env.host_*` imports and delegate straight
+// to `./dist/runtime.js` without overwriting Emscripten's `self.onmessage = handleMessage`.
+const initialWorkerScope = typeof self !== 'undefined' ? self : globalThis;
+if (isEmscriptenPthreadWorker(initialWorkerScope) && typeof importScripts === 'function') {
+  try {
+    importScripts('./workers/httpfs_mailbox.js');
+  } catch {
+    // Degrade safely if httpfs_mailbox.js cannot be loaded inside a pthread worker.
+  }
+  const pthreadHttpfsMailboxApi =
+    (initialWorkerScope && initialWorkerScope.PlayGta6HttpfsMailbox) ||
+    (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
+    null;
+  bootstrapEmscriptenPthreadWorker({
+    scope: initialWorkerScope,
+    importScriptsFn: importScripts,
+    runtimeScriptUrl: DEFAULT_RUNTIME_SCRIPT_RELATIVE,
+    httpfsMailboxApi: pthreadHttpfsMailboxApi,
+  });
+  return;
+}
+
 if (typeof importScripts === 'function') {
   importScripts('./workers/userdata.js');
   importScripts('./workers/httpfs_mailbox.js');
@@ -20,13 +62,6 @@ const httpfsMailboxApi =
   (typeof require === 'function' ? require('./workers/httpfs_mailbox.js') : null);
 
 const userdataStore = userdataApi ? new userdataApi.UserdataStore() : null;
-
-const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
-
-// GpuPacketHeader / GpuOpcode from runtime/abi/playgta6_abi.h and docs/gpu_commands.md.
-// Present is opcode 7 (ClearColor is 2). Detecting opcode 2 as Present would dismiss splash on clear.
-const GPU_PACKET_HEADER_BYTES = 8;
-const GPU_OPCODE_PRESENT = 7;
 const BOOT_INIT_FORWARD_KEYS = Object.freeze([
   'shaderPackUrl',
   'reflectionManifestUrl',
@@ -704,13 +739,19 @@ function createHostImports(options = {}) {
     typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
   const reportFn = typeof options.report === 'function' ? options.report : report;
   const emitFirstPresentLog = options.emitFirstPresentLog === true;
-  const fsClient = options.httpfsClient || null;
+  let currentHttpfsClient = options.httpfsClient || null;
+  const getHttpfsClient =
+    typeof options.getHttpfsClient === 'function' ? options.getHttpfsClient : null;
   const store = options.userdataStore || null;
   let firstPresentEmitted = false;
 
   function activeBuffer() {
     const raw = getMemory ? getMemory() || currentMemory : currentMemory;
     return resolveBuffer(raw);
+  }
+
+  function activeHttpfsClient() {
+    return getHttpfsClient ? getHttpfsClient() || currentHttpfsClient : currentHttpfsClient;
   }
 
   function host_log(ptr, len) {
@@ -764,6 +805,7 @@ function createHostImports(options = {}) {
   }
 
   function host_httpfs_open(ptr, len) {
+    const fsClient = activeHttpfsClient();
     if (!fsClient || typeof fsClient.open !== 'function') {
       return -1;
     }
@@ -780,6 +822,7 @@ function createHostImports(options = {}) {
   }
 
   function host_httpfs_read(handle, offset, dstPtr, len) {
+    const fsClient = activeHttpfsClient();
     if (!fsClient || typeof fsClient.read !== 'function') {
       return -1n;
     }
@@ -808,6 +851,7 @@ function createHostImports(options = {}) {
   }
 
   function host_httpfs_close(handle) {
+    const fsClient = activeHttpfsClient();
     if (!fsClient || typeof fsClient.close !== 'function') {
       return;
     }
@@ -860,6 +904,9 @@ function createHostImports(options = {}) {
     setMemory(mem) {
       currentMemory = mem || null;
     },
+    setHttpfsClient(client) {
+      currentHttpfsClient = client || null;
+    },
   };
 }
 
@@ -888,8 +935,251 @@ function encodeTestFramePacket(r, g, b, a) {
 }
 
 const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-const DEFAULT_RUNTIME_SCRIPT_RELATIVE = './dist/runtime.js';
-const DEFAULT_RUNTIME_SCRIPT_FALLBACK = 'dist/runtime.js';
+
+function tryOpenBroadcastChannel(BroadcastChannelCtor, channelName) {
+  if (typeof BroadcastChannelCtor !== 'function') {
+    return null;
+  }
+  try {
+    return new BroadcastChannelCtor(channelName);
+  } catch {
+    return null;
+  }
+}
+
+function isEmscriptenPthreadWorker(scope) {
+  return Boolean(scope && scope.name === EMSCRIPTEN_PTHREAD_WORKER_NAME);
+}
+
+/**
+ * Wrap `globalScope.WebAssembly.Instance` so that inside an Emscripten `em-pthread` worker,
+ * `new WebAssembly.Instance(wasmModule, imports)` automatically binds `imports.env.memory`
+ * onto `hostImports` and replaces any missing or `.stub === true` entries for the 5 host
+ * ABI imports (`host_log`, `host_httpfs_*`, `host_wgpu_submit`) while preserving all
+ * non-stub Emscripten imports and `WebAssembly.Instance.prototype` / `instanceof`.
+ * Returns an idempotent restore function.
+ */
+function installPthreadHostImportShim(globalScope, hostImports) {
+  if (
+    !globalScope ||
+    !globalScope.WebAssembly ||
+    typeof globalScope.WebAssembly.Instance !== 'function'
+  ) {
+    return function noopRestore() {};
+  }
+
+  const wasmNs = globalScope.WebAssembly;
+  const OriginalInstance = wasmNs.Instance;
+  const hostEnv =
+    hostImports && typeof hostImports === 'object'
+      ? hostImports.env && typeof hostImports.env === 'object'
+        ? hostImports.env
+        : hostImports
+      : null;
+
+  const WrappedInstance = new Proxy(OriginalInstance, {
+    construct(target, args, newTarget) {
+      const nextArgs = Array.prototype.slice.call(args);
+      const rawImports = nextArgs.length >= 2 ? nextArgs[1] : undefined;
+
+      if (rawImports && typeof rawImports === 'object') {
+        const importedMemory = extractMemoryFromImports(rawImports);
+        if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
+          hostImports.setMemory(importedMemory);
+        }
+
+        const patchedImports = Object.assign({}, rawImports);
+        const baseEnv =
+          patchedImports.env && typeof patchedImports.env === 'object' ? patchedImports.env : {};
+        const patchedEnv = Object.assign({}, baseEnv);
+        if (hostEnv) {
+          for (let i = 0; i < HOST_ABI_IMPORT_NAMES.length; i += 1) {
+            const name = HOST_ABI_IMPORT_NAMES[i];
+            if (typeof hostEnv[name] !== 'function') {
+              continue;
+            }
+            const existing = patchedEnv[name];
+            if (typeof existing !== 'function' || existing.stub === true) {
+              patchedEnv[name] = hostEnv[name];
+            }
+          }
+        }
+        patchedImports.env = patchedEnv;
+        nextArgs[1] = patchedImports;
+      }
+
+      const targetNew = newTarget === WrappedInstance ? target : newTarget;
+      const instance = Reflect.construct(target, nextArgs, targetNew);
+      if (
+        (!rawImports || !extractMemoryFromImports(rawImports)) &&
+        instance &&
+        instance.exports &&
+        instance.exports.memory &&
+        hostImports &&
+        typeof hostImports.setMemory === 'function'
+      ) {
+        hostImports.setMemory(instance.exports.memory);
+      }
+      return instance;
+    },
+  });
+
+  wasmNs.Instance = WrappedInstance;
+
+  let restored = false;
+  return function restorePthreadHostImportShim() {
+    if (restored) {
+      return;
+    }
+    restored = true;
+    if (wasmNs.Instance === WrappedInstance) {
+      wasmNs.Instance = OriginalInstance;
+    }
+  };
+}
+
+/**
+ * Bootstrap an Emscripten `em-pthread` worker spawned via `new Worker(self.location.href, { name: "em-pthread" })`:
+ * - Streams `host_log` over `BroadcastChannel('game-progress')`.
+ * - Relays `host_wgpu_submit` batches over `BroadcastChannel('playgta6-wgpu-pthread')` to the coordinator worker.
+ * - Acquires `httpfsMailboxSab` via `BroadcastChannel('playgta6-httpfs-sab')` so pthreads can call `host_httpfs_*`.
+ * - Installs the `WebAssembly.Instance` host-import shim BEFORE `importScripts(runtimeScriptUrl)`.
+ */
+function bootstrapEmscriptenPthreadWorker(options = {}) {
+  const scope =
+    options.scope ||
+    (typeof self !== 'undefined' ? self : typeof globalThis !== 'undefined' ? globalThis : null);
+  const importScriptsFn =
+    typeof options.importScriptsFn === 'function'
+      ? options.importScriptsFn
+      : typeof importScripts === 'function'
+        ? importScripts
+        : null;
+  const runtimeScriptUrl =
+    typeof options.runtimeScriptUrl === 'string' && options.runtimeScriptUrl.trim().length > 0
+      ? options.runtimeScriptUrl.trim()
+      : DEFAULT_RUNTIME_SCRIPT_RELATIVE;
+  const BroadcastChannelCtor =
+    options.BroadcastChannelCtor !== undefined
+      ? options.BroadcastChannelCtor
+      : scope && typeof scope.BroadcastChannel === 'function'
+        ? scope.BroadcastChannel
+        : typeof BroadcastChannel === 'function'
+          ? BroadcastChannel
+          : null;
+  const mailboxApi =
+    options.httpfsMailboxApi !== undefined
+      ? options.httpfsMailboxApi
+      : (scope && scope.PlayGta6HttpfsMailbox) ||
+        (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
+        null;
+
+  const progressChannel = tryOpenBroadcastChannel(BroadcastChannelCtor, 'game-progress');
+  const wgpuChannel = tryOpenBroadcastChannel(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME);
+  const httpfsChannel = tryOpenBroadcastChannel(
+    BroadcastChannelCtor,
+    PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  );
+
+  const pthreadReport = (label) => {
+    if (!progressChannel || typeof progressChannel.postMessage !== 'function') {
+      return;
+    }
+    try {
+      progressChannel.postMessage({ label });
+    } catch {
+      // Progress channel broadcast failures must never crash guest pthreads.
+    }
+  };
+
+  let pthreadHttpfsClient = null;
+  const hostImports = createHostImports({
+    log: (msg) => pthreadReport(`[wasm] ${msg}`),
+    report: () => {},
+    wgpuSubmit: (bytes) => {
+      if (!wgpuChannel || typeof wgpuChannel.postMessage !== 'function') {
+        return;
+      }
+      const copy = bytes.slice();
+      try {
+        wgpuChannel.postMessage({ type: 'wgpu-submit', cmdBuffer: copy.buffer });
+      } catch {
+        // Non-fatal GPU command relay failure.
+      }
+    },
+    getHttpfsClient: () => pthreadHttpfsClient,
+  });
+
+  const attachHttpfsSab = (sab) => {
+    if (!sab || !mailboxApi || typeof mailboxApi.HttpfsMailboxClient !== 'function') {
+      return false;
+    }
+    try {
+      pthreadHttpfsClient = new mailboxApi.HttpfsMailboxClient(sab);
+      hostImports.setHttpfsClient(pthreadHttpfsClient);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (options.httpfsMailboxSab) {
+    attachHttpfsSab(options.httpfsMailboxSab);
+  }
+
+  if (httpfsChannel) {
+    httpfsChannel.onmessage = (ev) => {
+      const msg = ev && ev.data;
+      if (msg && msg.type === 'httpfs-sab' && msg.sab) {
+        attachHttpfsSab(msg.sab);
+      }
+    };
+    try {
+      if (typeof httpfsChannel.postMessage === 'function') {
+        httpfsChannel.postMessage({ type: 'request-httpfs-sab' });
+      }
+    } catch {
+      // Ignore runtimes where BroadcastChannel messaging is restricted.
+    }
+  }
+
+  const wasmTargetScope =
+    scope && scope.WebAssembly
+      ? scope
+      : typeof globalThis !== 'undefined' && globalThis.WebAssembly
+        ? globalThis
+        : scope;
+  const restoreWasmInstance = installPthreadHostImportShim(wasmTargetScope, hostImports);
+
+  if (importScriptsFn) {
+    importScriptsFn(runtimeScriptUrl);
+  }
+
+  return {
+    hostImports,
+    restoreWasmInstance,
+    attachHttpfsSab,
+    channels: {
+      progress: progressChannel,
+      wgpu: wgpuChannel,
+      httpfs: httpfsChannel,
+    },
+    cleanup() {
+      restoreWasmInstance();
+      const channels = [progressChannel, wgpuChannel, httpfsChannel];
+      for (let i = 0; i < channels.length; i += 1) {
+        const ch = channels[i];
+        if (ch && typeof ch.close === 'function') {
+          try {
+            ch.close();
+          } catch {
+            // Ignore BroadcastChannel close errors.
+          }
+        }
+      }
+    },
+  };
+}
 
 function isAbsoluteUrl(value) {
   return typeof value === 'string' && ABSOLUTE_URL_RE.test(value);
@@ -1236,6 +1526,8 @@ function createRuntimeModuleOptions(overrides = {}) {
   return buildRuntimeModuleConfig(overrides);
 }
 
+let coordinatorFirstPresentEmitted = false;
+
 async function tryBootWasmRuntime() {
   try {
     const head = await fetch('./dist/runtime.js', { method: 'HEAD' });
@@ -1250,6 +1542,9 @@ async function tryBootWasmRuntime() {
     if (typeof self.createRuntimeModule === 'function') {
       await self.createRuntimeModule(
         createRuntimeModuleOptions({
+          onFirstPresent: () => {
+            coordinatorFirstPresentEmitted = true;
+          },
           onWasmError: (err) => {
             if (progress) {
               progress.postMessage({ error: `runtime wasm: ${err}` });
@@ -1268,6 +1563,69 @@ async function tryBootWasmRuntime() {
 if (typeof self !== 'undefined') {
   const postToMain =
     typeof self.postMessage === 'function' ? (payload) => self.postMessage(payload) : null;
+
+  const wgpuPthreadChannel =
+    typeof BroadcastChannel === 'function'
+      ? tryOpenBroadcastChannel(BroadcastChannel, PTHREAD_WGPU_CHANNEL_NAME)
+      : null;
+  const httpfsSabChannel =
+    typeof BroadcastChannel === 'function'
+      ? tryOpenBroadcastChannel(BroadcastChannel, PTHREAD_HTTPFS_SAB_CHANNEL_NAME)
+      : null;
+
+  const broadcastHttpfsSab = () => {
+    if (
+      !httpfsSabChannel ||
+      !httpfsMailboxSab ||
+      typeof httpfsSabChannel.postMessage !== 'function'
+    ) {
+      return;
+    }
+    try {
+      httpfsSabChannel.postMessage({ type: 'httpfs-sab', sab: httpfsMailboxSab });
+    } catch {
+      // Some runtimes reject SharedArrayBuffer over BroadcastChannel; degrade safely.
+    }
+  };
+
+  if (wgpuPthreadChannel) {
+    wgpuPthreadChannel.onmessage = (ev) => {
+      const data = ev && ev.data;
+      const raw =
+        data &&
+        typeof data === 'object' &&
+        !(data instanceof ArrayBuffer) &&
+        !ArrayBuffer.isView(data)
+          ? data.cmdBuffer || data.bytes || null
+          : data;
+      const view = asDataView(raw);
+      if (!view || view.byteLength === 0) {
+        return;
+      }
+      const copyBytes = new Uint8Array(view.byteLength);
+      copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      if (!coordinatorFirstPresentEmitted) {
+        const info = inspectGpuPacketBatchForPresent(copyBytes);
+        if (info.hasPresent) {
+          coordinatorFirstPresentEmitted = true;
+          report('[boot] FIRST_PRESENT');
+        }
+      }
+      if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
+        const copyBuf = copyBytes.buffer;
+        gpuWorker.postMessage({ cmdBuffer: copyBuf }, [copyBuf]);
+      }
+    };
+  }
+
+  if (httpfsSabChannel) {
+    httpfsSabChannel.onmessage = (ev) => {
+      const msg = ev && ev.data;
+      if (msg && msg.type === 'request-httpfs-sab') {
+        broadcastHttpfsSab();
+      }
+    };
+  }
 
   self.onmessage = (ev) => {
     const msg = ev.data || {};
@@ -1306,6 +1664,7 @@ if (typeof self !== 'undefined') {
     ) {
       httpfsMailboxSab = httpfsMailboxApi.createHttpfsMailboxBuffer();
       httpfsClient = new httpfsMailboxApi.HttpfsMailboxClient(httpfsMailboxSab);
+      broadcastHttpfsSab();
     } else {
       httpfsMailboxSab = null;
       httpfsClient = null;
@@ -1356,9 +1715,16 @@ if (typeof self !== 'undefined') {
 }
 
 const exportedApi = {
+  EMSCRIPTEN_PTHREAD_WORKER_NAME,
+  PTHREAD_WGPU_CHANNEL_NAME,
+  PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
   BOOT_INIT_FORWARD_KEYS,
+  isEmscriptenPthreadWorker,
+  installPthreadHostImportShim,
+  bootstrapEmscriptenPthreadWorker,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
