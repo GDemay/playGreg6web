@@ -16,6 +16,65 @@ export const BOOT_MODE = Object.freeze({
   REAL_WASM64: 'real-wasm64',
 });
 
+export const AUDIO_OUTPUT_STATE = Object.freeze({
+  ACTIVE: 'active',
+  SUSPENDED: 'suspended',
+  HEADLESS_DRAIN: 'headless-drain',
+});
+
+export const INDIRECT_DISPATCH_MODE = Object.freeze({
+  SHARD: 'shard',
+  TABLE: 'table',
+  UNKNOWN: 'unknown',
+});
+
+const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'realPackDrawCount',
+  'real_pack_draw_count',
+  'realDrawCount',
+  'packDrawCount',
+  'fallbackDrawCount',
+  'fallback_draw_count',
+  'presentCount',
+  'present_count',
+  'unboundBindGroupCount',
+  'unbound_bind_group_count',
+  'skippedDrawCount',
+  'skipped_draw_count',
+  'validationErrorCount',
+  'validation_error_count',
+]);
+
+const AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'outputState',
+  'output_state',
+  'framesDrained',
+  'frames_drained',
+  'drainedFrames',
+  'underruns',
+  'underrunCount',
+  'underrun_count',
+  'overruns',
+  'overrunCount',
+  'overrun_count',
+  'overflows',
+]);
+
+const PTHREAD_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'pthreadSpawnedCount',
+  'pthread_spawned_count',
+  'pthreadActiveCount',
+  'pthread_active_count',
+  'pthreadPeakCount',
+  'pthread_peak_count',
+  'pthreadLoadQueueDepth',
+  'pthread_load_queue_depth',
+  'indirectDispatch',
+  'indirect_dispatch',
+  'dispatchMode',
+  'dispatch_mode',
+]);
+
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
 const MAX_SIDE_MODULE_NAMES = 64;
@@ -371,11 +430,170 @@ function toNonNegativeInt(value, fallback = 0) {
   if (value === undefined || value === null || value === '') {
     return fallback;
   }
+  if (typeof value === 'boolean' || typeof value === 'symbol' || typeof value === 'object') {
+    return fallback;
+  }
+  if (typeof value === 'bigint') {
+    if (value < 0n) {
+      return fallback;
+    }
+    return value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value);
+  }
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n) || n < 0) {
     return fallback;
   }
-  return Math.floor(n);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
+}
+
+function safeGet(obj, key) {
+  if (!obj || typeof obj !== 'object') {
+    return undefined;
+  }
+  try {
+    return obj[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function pickFirstDefined(obj, keys) {
+  if (!obj || typeof obj !== 'object') {
+    return undefined;
+  }
+  for (let i = 0; i < keys.length; i += 1) {
+    const val = safeGet(obj, keys[i]);
+    if (val !== undefined) {
+      return val;
+    }
+  }
+  return undefined;
+}
+
+function pickTelemetryField(primary, secondary, keys) {
+  const fromPrimary = pickFirstDefined(primary, keys);
+  if (fromPrimary !== undefined) {
+    return fromPrimary;
+  }
+  if (secondary && secondary !== primary) {
+    return pickFirstDefined(secondary, keys);
+  }
+  return undefined;
+}
+
+function hasAnyDefinedKey(obj, keys) {
+  return pickFirstDefined(obj, keys) !== undefined;
+}
+
+/**
+ * Normalizes an AudioContext/mixer output state into one of:
+ * `'active'`, `'suspended'`, or `'headless-drain'`.
+ * Unknown or hostile values safely fall back to `'suspended'`.
+ *
+ * @param {unknown} raw
+ * @returns {'active'|'suspended'|'headless-drain'}
+ */
+export function normalizeAudioOutputState(raw) {
+  if (typeof raw !== 'string') {
+    return AUDIO_OUTPUT_STATE.SUSPENDED;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return AUDIO_OUTPUT_STATE.SUSPENDED;
+  }
+  if (normalized === 'active' || normalized === 'running' || normalized === 'playing') {
+    return AUDIO_OUTPUT_STATE.ACTIVE;
+  }
+  if (
+    normalized === 'headless-drain' ||
+    normalized === 'headless_drain' ||
+    normalized === 'headless' ||
+    normalized === 'drain' ||
+    normalized === 'draining'
+  ) {
+    return AUDIO_OUTPUT_STATE.HEADLESS_DRAIN;
+  }
+  if (
+    normalized === 'suspended' ||
+    normalized === 'paused' ||
+    normalized === 'closed' ||
+    normalized === 'idle' ||
+    normalized === 'muted'
+  ) {
+    return AUDIO_OUTPUT_STATE.SUSPENDED;
+  }
+  return AUDIO_OUTPUT_STATE.SUSPENDED;
+}
+
+/**
+ * Normalizes a Wasm64 indirect-call dispatch mode into one of:
+ * `'shard'`, `'table'`, or `'unknown'`.
+ * Unknown or hostile values safely fall back to `'unknown'`.
+ *
+ * @param {unknown} raw
+ * @returns {'shard'|'table'|'unknown'}
+ */
+export function normalizeIndirectDispatchMode(raw) {
+  if (typeof raw !== 'string') {
+    return INDIRECT_DISPATCH_MODE.UNKNOWN;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return INDIRECT_DISPATCH_MODE.UNKNOWN;
+  }
+  if (
+    normalized === 'shard' ||
+    normalized === 'sharded' ||
+    normalized === 'shard-dispatch' ||
+    normalized === 'shard_dispatch' ||
+    normalized === 'pg6-shard' ||
+    normalized === 'pg6_shard'
+  ) {
+    return INDIRECT_DISPATCH_MODE.SHARD;
+  }
+  if (
+    normalized === 'table' ||
+    normalized === 'indirect-table' ||
+    normalized === 'indirect_table' ||
+    normalized === 'wasm-table' ||
+    normalized === 'wasm_table'
+  ) {
+    return INDIRECT_DISPATCH_MODE.TABLE;
+  }
+  return INDIRECT_DISPATCH_MODE.UNKNOWN;
+}
+
+function createInitialGpuTelemetry() {
+  return {
+    realPackDrawCount: 0,
+    fallbackDrawCount: 0,
+    presentCount: 0,
+    unboundBindGroupCount: 0,
+    skippedDrawCount: 0,
+    validationErrorCount: 0,
+    updatedAtMs: null,
+  };
+}
+
+function createInitialAudioTelemetry() {
+  return {
+    outputState: AUDIO_OUTPUT_STATE.SUSPENDED,
+    framesDrained: 0,
+    underruns: 0,
+    overruns: 0,
+    updatedAtMs: null,
+  };
+}
+
+function createInitialPthreadTelemetry() {
+  return {
+    pthreadSpawnedCount: 0,
+    pthreadActiveCount: 0,
+    pthreadPeakCount: 0,
+    pthreadLoadQueueDepth: 0,
+    indirectDispatch: INDIRECT_DISPATCH_MODE.UNKNOWN,
+    updatedAtMs: null,
+  };
 }
 
 function sanitizeSideModuleName(raw) {
@@ -623,6 +841,13 @@ export class HudController {
     this._validationErrors = [];
     this._validationErrorCount = 0;
     this._validationErrorSeq = 0;
+
+    this._gpuTelemetry = createInitialGpuTelemetry();
+    this._audioTelemetry = createInitialAudioTelemetry();
+    this._pthreadTelemetry = createInitialPthreadTelemetry();
+    this._hasGpuTelemetry = false;
+    this._hasAudioTelemetry = false;
+    this._hasPthreadTelemetry = false;
 
     const initialDisplayEls = isPlainObject(displayElements)
       ? displayElements
@@ -1498,9 +1723,524 @@ export class HudController {
       changed = false;
     }
 
+    if (this._applyStructuredTelemetryPayload(payload, { includeFrameStatsPresent: true })) {
+      changed = true;
+    }
+
     if (changed) {
       this._renderBootDiagnostics({ updateHudStatus: false });
     }
+  }
+
+  _safeNowMs() {
+    try {
+      const val = this._now();
+      return typeof val === 'number' && Number.isFinite(val) ? val : Date.now();
+    } catch {
+      return Date.now();
+    }
+  }
+
+  _applyGpuTelemetry(input, outer = null) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    let touched = false;
+
+    const realPack = pickTelemetryField(primary, secondary, [
+      'realPackDrawCount',
+      'real_pack_draw_count',
+      'realDrawCount',
+      'packDrawCount',
+    ]);
+    if (realPack !== undefined) {
+      this._gpuTelemetry.realPackDrawCount = toNonNegativeInt(realPack, 0);
+      touched = true;
+    }
+
+    const fallback = pickTelemetryField(primary, secondary, [
+      'fallbackDrawCount',
+      'fallback_draw_count',
+    ]);
+    if (fallback !== undefined) {
+      this._gpuTelemetry.fallbackDrawCount = toNonNegativeInt(fallback, 0);
+      touched = true;
+    }
+
+    const present = pickTelemetryField(primary, secondary, [
+      'presentCount',
+      'present_count',
+      'presents',
+      'framesPresented',
+      'frames_presented',
+    ]);
+    if (present !== undefined) {
+      this._gpuTelemetry.presentCount = toNonNegativeInt(present, 0);
+      touched = true;
+    }
+
+    const unbound = pickTelemetryField(primary, secondary, [
+      'unboundBindGroupCount',
+      'unbound_bind_group_count',
+    ]);
+    if (unbound !== undefined) {
+      this._gpuTelemetry.unboundBindGroupCount = toNonNegativeInt(unbound, 0);
+      touched = true;
+    }
+
+    const skipped = pickTelemetryField(primary, secondary, [
+      'skippedDrawCount',
+      'skipped_draw_count',
+    ]);
+    if (skipped !== undefined) {
+      this._gpuTelemetry.skippedDrawCount = toNonNegativeInt(skipped, 0);
+      touched = true;
+    }
+
+    const validationErrs = pickTelemetryField(primary, secondary, [
+      'validationErrorCount',
+      'validation_error_count',
+    ]);
+    if (validationErrs !== undefined) {
+      const sanitizedValErrs = toNonNegativeInt(validationErrs, 0);
+      this._gpuTelemetry.validationErrorCount = sanitizedValErrs;
+      if (sanitizedValErrs > this._validationErrorCount) {
+        this._validationErrorCount = sanitizedValErrs;
+      }
+      touched = true;
+    }
+
+    if (touched) {
+      this._hasGpuTelemetry = true;
+      this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    return touched;
+  }
+
+  _applyAudioTelemetry(input, outer = null) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    let touched = false;
+
+    const outputState = pickTelemetryField(primary, secondary, [
+      'outputState',
+      'output_state',
+      'state',
+      'contextState',
+    ]);
+    if (outputState !== undefined) {
+      this._audioTelemetry.outputState = normalizeAudioOutputState(outputState);
+      touched = true;
+    }
+
+    const framesDrained = pickTelemetryField(primary, secondary, [
+      'framesDrained',
+      'frames_drained',
+      'drainedFrames',
+      'totalPulledFrames',
+    ]);
+    if (framesDrained !== undefined) {
+      this._audioTelemetry.framesDrained = toNonNegativeInt(framesDrained, 0);
+      touched = true;
+    }
+
+    const underruns = pickTelemetryField(primary, secondary, [
+      'underruns',
+      'underrunCount',
+      'underrun_count',
+    ]);
+    if (underruns !== undefined) {
+      this._audioTelemetry.underruns = toNonNegativeInt(underruns, 0);
+      touched = true;
+    }
+
+    const overruns = pickTelemetryField(primary, secondary, [
+      'overruns',
+      'overrunCount',
+      'overrun_count',
+      'overflows',
+    ]);
+    if (overruns !== undefined) {
+      this._audioTelemetry.overruns = toNonNegativeInt(overruns, 0);
+      touched = true;
+    }
+
+    if (touched) {
+      this._hasAudioTelemetry = true;
+      this._audioTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    return touched;
+  }
+
+  _applyPthreadTelemetry(input, outer = null) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    let touched = false;
+
+    const spawned = pickTelemetryField(primary, secondary, [
+      'pthreadSpawnedCount',
+      'pthread_spawned_count',
+      'spawnedCount',
+      'spawned',
+    ]);
+    if (spawned !== undefined) {
+      this._pthreadTelemetry.pthreadSpawnedCount = toNonNegativeInt(spawned, 0);
+      touched = true;
+    }
+
+    const active = pickTelemetryField(primary, secondary, [
+      'pthreadActiveCount',
+      'pthread_active_count',
+      'activeCount',
+      'active',
+    ]);
+    if (active !== undefined) {
+      this._pthreadTelemetry.pthreadActiveCount = toNonNegativeInt(active, 0);
+      touched = true;
+    }
+
+    const peak = pickTelemetryField(primary, secondary, [
+      'pthreadPeakCount',
+      'pthread_peak_count',
+      'peakCount',
+      'peak',
+    ]);
+    if (peak !== undefined) {
+      const sanitizedPeak = toNonNegativeInt(peak, 0);
+      this._pthreadTelemetry.pthreadPeakCount = Math.max(
+        this._pthreadTelemetry.pthreadPeakCount,
+        sanitizedPeak,
+        this._pthreadTelemetry.pthreadActiveCount
+      );
+      touched = true;
+    } else if (active !== undefined) {
+      this._pthreadTelemetry.pthreadPeakCount = Math.max(
+        this._pthreadTelemetry.pthreadPeakCount,
+        this._pthreadTelemetry.pthreadActiveCount
+      );
+    }
+
+    const queueDepth = pickTelemetryField(primary, secondary, [
+      'pthreadLoadQueueDepth',
+      'pthread_load_queue_depth',
+      'loadQueueDepth',
+      'queueDepth',
+    ]);
+    if (queueDepth !== undefined) {
+      this._pthreadTelemetry.pthreadLoadQueueDepth = toNonNegativeInt(queueDepth, 0);
+      touched = true;
+    }
+
+    const dispatch = pickTelemetryField(primary, secondary, [
+      'indirectDispatch',
+      'indirect_dispatch',
+      'dispatchMode',
+      'dispatch_mode',
+    ]);
+    if (dispatch !== undefined) {
+      this._pthreadTelemetry.indirectDispatch = normalizeIndirectDispatchMode(dispatch);
+      touched = true;
+    }
+
+    if (touched) {
+      this._hasPthreadTelemetry = true;
+      this._pthreadTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    return touched;
+  }
+
+  _applyStructuredTelemetryPayload(payload, opts = {}) {
+    if (!isPlainObject(payload)) {
+      return false;
+    }
+    let changed = false;
+
+    const rawType = safeGet(payload, 'type');
+    const msgType = typeof rawType === 'string' ? rawType.trim().toLowerCase() : '';
+
+    const gpuNested =
+      (isPlainObject(safeGet(payload, 'gpu')) && safeGet(payload, 'gpu')) ||
+      (isPlainObject(safeGet(payload, 'gpuStats')) && safeGet(payload, 'gpuStats')) ||
+      (isPlainObject(safeGet(payload, 'gpu-stats')) && safeGet(payload, 'gpu-stats')) ||
+      null;
+
+    if (gpuNested) {
+      if (this._applyGpuTelemetry(gpuNested)) {
+        changed = true;
+      }
+    } else if (
+      msgType === 'gpu-stats' ||
+      msgType === 'gpu-telemetry' ||
+      msgType === 'frame-presented' ||
+      hasAnyDefinedKey(payload, GPU_TELEMETRY_FIELD_KEYS)
+    ) {
+      if (this._applyGpuTelemetry(payload)) {
+        changed = true;
+      }
+    } else if (opts.includeFrameStatsPresent === true) {
+      const frameStats = safeGet(payload, 'frameStats');
+      if (isPlainObject(frameStats)) {
+        const framePresent = pickFirstDefined(frameStats, [
+          'presentCount',
+          'present_count',
+          'framesPresented',
+          'frames_presented',
+        ]);
+        if (framePresent !== undefined) {
+          this._gpuTelemetry.presentCount = toNonNegativeInt(framePresent, 0);
+          this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+        }
+      }
+    }
+
+    const audioNested =
+      (isPlainObject(safeGet(payload, 'audio')) && safeGet(payload, 'audio')) ||
+      (isPlainObject(safeGet(payload, 'audioStats')) && safeGet(payload, 'audioStats')) ||
+      (isPlainObject(safeGet(payload, 'audio-stats')) && safeGet(payload, 'audio-stats')) ||
+      null;
+
+    if (audioNested) {
+      if (this._applyAudioTelemetry(audioNested)) {
+        changed = true;
+      }
+    } else if (
+      msgType === 'audio-stats' ||
+      msgType === 'audio-telemetry' ||
+      hasAnyDefinedKey(payload, AUDIO_TELEMETRY_FIELD_KEYS)
+    ) {
+      if (this._applyAudioTelemetry(payload)) {
+        changed = true;
+      }
+    }
+
+    const pthreadNested =
+      (isPlainObject(safeGet(payload, 'pthread')) && safeGet(payload, 'pthread')) ||
+      (isPlainObject(safeGet(payload, 'pthreads')) && safeGet(payload, 'pthreads')) ||
+      (isPlainObject(safeGet(payload, 'pthreadStats')) && safeGet(payload, 'pthreadStats')) ||
+      (isPlainObject(safeGet(payload, 'pthread-stats')) && safeGet(payload, 'pthread-stats')) ||
+      (isPlainObject(safeGet(payload, 'wasmLoader')) && safeGet(payload, 'wasmLoader')) ||
+      null;
+
+    if (pthreadNested) {
+      if (this._applyPthreadTelemetry(pthreadNested)) {
+        changed = true;
+      }
+    } else if (
+      msgType === 'pthread-stats' ||
+      msgType === 'pthread-telemetry' ||
+      msgType === 'wasm-stats' ||
+      msgType === 'loader-stats' ||
+      hasAnyDefinedKey(payload, PTHREAD_TELEMETRY_FIELD_KEYS)
+    ) {
+      if (this._applyPthreadTelemetry(payload)) {
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  /**
+   * Updates honest GPU worker telemetry (`gpu-stats` / W83) keeping real-pack draws
+   * strictly separate from fallback draws, sanitizing all counters to non-negative integers.
+   *
+   * @param {object|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  updateGpuStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().gpu;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (this._applyGpuTelemetry(stats)) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+      });
+    }
+    return this.getTelemetry().gpu;
+  }
+
+  /**
+   * Updates honest Audio worker telemetry (`audio-stats` / W84) with normalized
+   * `outputState` (`'active' | 'suspended' | 'headless-drain'`) and sanitized counters.
+   *
+   * @param {object|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  updateAudioStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().audio;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (this._applyAudioTelemetry(stats)) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+      });
+    }
+    return this.getTelemetry().audio;
+  }
+
+  /**
+   * Updates honest Pthread / Wasm Loader telemetry (W86 / R37) including active/peak
+   * thread counts, load queue depth, and normalized indirect dispatch mode.
+   *
+   * @param {object|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  updatePthreadStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().pthread;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (this._applyPthreadTelemetry(stats)) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+      });
+    }
+    return this.getTelemetry().pthread;
+  }
+
+  /**
+   * Ingests a unified telemetry update or worker stats message (`gpu-stats`,
+   * `audio-stats`, `pthread-stats`, or a combined `{ gpu, audio, pthread }` object).
+   *
+   * @param {object|null|undefined} payload
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  updateTelemetry(payload, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry();
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (this._applyStructuredTelemetryPayload(payload, { includeFrameStatsPresent: false })) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+      });
+    }
+    return this.getTelemetry();
+  }
+
+  /**
+   * Resets tracked GPU, Audio, and Pthread telemetry back to clean initial defaults.
+   *
+   * @param {{ updateHudStatus?: boolean }} [options]
+   */
+  resetTelemetry(options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry();
+    }
+    const opts = isPlainObject(options) ? options : {};
+    this._gpuTelemetry = createInitialGpuTelemetry();
+    this._audioTelemetry = createInitialAudioTelemetry();
+    this._pthreadTelemetry = createInitialPthreadTelemetry();
+    this._hasGpuTelemetry = false;
+    this._hasAudioTelemetry = false;
+    this._hasPthreadTelemetry = false;
+    this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus === true,
+    });
+    return this.getTelemetry();
+  }
+
+  /**
+   * Returns a defensive snapshot of sanitized GPU, Audio, and Pthread telemetry.
+   */
+  getTelemetry() {
+    const g = this._gpuTelemetry;
+    const a = this._audioTelemetry;
+    const p = this._pthreadTelemetry;
+
+    const totalDrawCount = g.realPackDrawCount + g.fallbackDrawCount;
+    const hasRealPackDraws = g.realPackDrawCount > 0;
+    const hasFallbackDraws = g.fallbackDrawCount > 0;
+
+    let gpuStatusText = '';
+    if (hasRealPackDraws || hasFallbackDraws) {
+      const drawPart = hasFallbackDraws
+        ? `Draws: ${g.realPackDrawCount} real, ${g.fallbackDrawCount} fallback`
+        : `Draws: ${g.realPackDrawCount} real`;
+      gpuStatusText =
+        g.presentCount > 0
+          ? `${drawPart} (${g.presentCount} present${g.presentCount === 1 ? '' : 's'})`
+          : drawPart;
+    } else if (this._hasGpuTelemetry && g.presentCount > 0) {
+      gpuStatusText = `Presents: ${g.presentCount} (0 draws)`;
+    }
+
+    let audioStatusText = '';
+    if (this._hasAudioTelemetry) {
+      const details = [];
+      if (a.framesDrained > 0) {
+        details.push(`${a.framesDrained} drained`);
+      }
+      if (a.underruns > 0) {
+        details.push(`${a.underruns} underrun${a.underruns === 1 ? '' : 's'}`);
+      }
+      if (a.overruns > 0) {
+        details.push(`${a.overruns} overrun${a.overruns === 1 ? '' : 's'}`);
+      }
+      audioStatusText =
+        details.length > 0
+          ? `Audio: ${a.outputState} (${details.join(', ')})`
+          : `Audio: ${a.outputState}`;
+    }
+
+    let pthreadStatusText = '';
+    if (p.pthreadActiveCount > 0 || p.pthreadPeakCount > 0 || p.pthreadSpawnedCount > 0) {
+      const peak = Math.max(p.pthreadPeakCount, p.pthreadActiveCount);
+      const base = `Threads: ${p.pthreadActiveCount}/${peak}`;
+      pthreadStatusText =
+        p.indirectDispatch !== INDIRECT_DISPATCH_MODE.UNKNOWN
+          ? `${base} [${p.indirectDispatch}]`
+          : base;
+    }
+
+    return {
+      gpu: {
+        realPackDrawCount: g.realPackDrawCount,
+        fallbackDrawCount: g.fallbackDrawCount,
+        presentCount: g.presentCount,
+        unboundBindGroupCount: g.unboundBindGroupCount,
+        skippedDrawCount: g.skippedDrawCount,
+        validationErrorCount: g.validationErrorCount,
+        totalDrawCount,
+        hasRealPackDraws,
+        hasFallbackDraws,
+        updatedAtMs: g.updatedAtMs,
+        statusText: gpuStatusText,
+      },
+      audio: {
+        outputState: a.outputState,
+        framesDrained: a.framesDrained,
+        underruns: a.underruns,
+        overruns: a.overruns,
+        updatedAtMs: a.updatedAtMs,
+        statusText: audioStatusText,
+      },
+      pthread: {
+        pthreadSpawnedCount: p.pthreadSpawnedCount,
+        pthreadActiveCount: p.pthreadActiveCount,
+        pthreadPeakCount: p.pthreadPeakCount,
+        pthreadLoadQueueDepth: p.pthreadLoadQueueDepth,
+        indirectDispatch: p.indirectDispatch,
+        updatedAtMs: p.updatedAtMs,
+        statusText: pthreadStatusText,
+      },
+    };
   }
 
   // --- Boot Mode, Split-Module Progress & Live WebGPU Validation Errors (W69) ---
@@ -2125,6 +2865,7 @@ export class HudController {
     }
     this._validationErrors = [];
     this._validationErrorCount = 0;
+    this._gpuTelemetry.validationErrorCount = 0;
     this._renderBootDiagnostics({ updateHudStatus: false });
     return this.getValidationSummary();
   }
@@ -2170,10 +2911,20 @@ export class HudController {
     const meta = BOOT_MODE_META[bootMode] || BOOT_MODE_META[BOOT_MODE.IDLE];
     const sideModules = this.getSideModuleProgress();
     const validation = this.getValidationSummary();
+    const telemetry = this.getTelemetry();
 
     const parts = [meta.baseStatusText];
     if (sideModules.active && sideModules.statusText) {
       parts.push(sideModules.statusText);
+    }
+    if (telemetry.gpu.statusText) {
+      parts.push(telemetry.gpu.statusText);
+    }
+    if (telemetry.pthread.statusText) {
+      parts.push(telemetry.pthread.statusText);
+    }
+    if (telemetry.audio.statusText) {
+      parts.push(telemetry.audio.statusText);
     }
     if (validation.hasErrors) {
       parts.push(
@@ -2194,6 +2945,7 @@ export class HudController {
       isIdle: bootMode === BOOT_MODE.IDLE,
       sideModules,
       validation,
+      telemetry,
     };
   }
 
@@ -2279,7 +3031,12 @@ export class HudController {
 
     if (els.sideModuleStatusEl) {
       const sm = status.sideModules;
-      const smText = sm.active ? sm.statusText : 'No split modules';
+      const pthreadText = status.telemetry && status.telemetry.pthread.statusText;
+      const smText = sm.active
+        ? pthreadText
+          ? `${sm.statusText} · ${pthreadText}`
+          : sm.statusText
+        : 'No split modules';
       const smState = !sm.active ? '' : sm.complete ? 'ok' : 'info';
       safeSetText(els.sideModuleStatusEl, smText);
       safeSetDataset(els.sideModuleStatusEl, 'loaded', String(sm.loadedCount));
@@ -2519,6 +3276,12 @@ export class HudController {
       this._loadedSideModuleNames = [];
       this._currentSideModule = null;
       this._runtimeInitialized = false;
+      this._gpuTelemetry = createInitialGpuTelemetry();
+      this._audioTelemetry = createInitialAudioTelemetry();
+      this._pthreadTelemetry = createInitialPthreadTelemetry();
+      this._hasGpuTelemetry = false;
+      this._hasAudioTelemetry = false;
+      this._hasPthreadTelemetry = false;
 
       const sessionResult = await this._sessionController.restart({ preferSmoke });
       const state = this._getSessionState();
@@ -2700,6 +3463,18 @@ export class HudController {
       lastAction: this._lastAction ? { ...this._lastAction } : null,
       boundControlCount: this._boundListeners.length,
       destroyed: this._destroyed,
+    };
+  }
+
+  /**
+   * Returns a complete defensive HUD snapshot including control state, boot
+   * diagnostics, and honest GPU/Audio/Pthread telemetry.
+   */
+  getSnapshot() {
+    return {
+      ...this.getState(),
+      bootStatus: this.getBootStatus(),
+      telemetry: this.getTelemetry(),
     };
   }
 }
