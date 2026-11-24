@@ -452,28 +452,26 @@ def _find_manifest_files(recomp_dir: Path) -> dict[str, Path | None]:
 
 
 def _count_pgim_files(recomp_dir: Path) -> tuple[int, list[str]]:
-    names: list[str] = []
-    stack = [recomp_dir]
-    depth = 0
-    while stack and depth < 4:
-        current = stack.pop()
-        depth += 1
-        try:
-            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
-        except OSError:
-            continue
-        for entry in entries:
+    """Recursively discover `.pgim` guest images under `recomp_dir`.
+
+    Returns `(count, sorted_relative_posix_paths)` with host paths stripped so
+    nested `playgta6-recomp build-program` outputs (`<module>/image/guest.pgim`)
+    and flat layouts (`guest.pgim`) are both discovered deterministically.
+    """
+    rel_paths: list[str] = []
+    try:
+        for entry in recomp_dir.rglob("*.pgim"):
             try:
-                if entry.is_symlink():
+                if entry.is_symlink() or not entry.is_file():
                     continue
-                if entry.is_file() and entry.name.lower().endswith(".pgim"):
-                    names.append(entry.name)
-                elif entry.is_dir() and depth < 4:
-                    stack.append(entry)
-            except OSError:
+                rel = entry.relative_to(recomp_dir).as_posix()
+                rel_paths.append(sanitize_text(rel))
+            except (OSError, ValueError):
                 continue
-    names.sort(key=str.lower)
-    return len(names), names
+    except OSError:
+        return 0, []
+    rel_paths.sort(key=lambda item: (item.lower(), item))
+    return len(rel_paths), rel_paths
 
 
 def _lift_stats_from_manifest(doc: Mapping[str, Any]) -> dict[str, Any]:

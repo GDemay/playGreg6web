@@ -517,6 +517,93 @@ class TestVerifyBrowserBoot(unittest.TestCase):
             self.assertEqual(gate.status, "fail")
             self.assertIn(".pgim", gate.summary)
 
+    def test_recomp_artifacts_discovers_nested_program_pgims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            recomp_dir = repo / "work" / "recomp_program"
+            recomp_dir.mkdir(parents=True)
+            # Create >= 4 unrelated sibling directories before module dirs to guard
+            # against regressions of the old non-recursive directory-count limit.
+            for sibling in ("a_exports", "b_stubs", "c_tables", "d_logs", "exports"):
+                (recomp_dir / sibling).mkdir()
+                (recomp_dir / sibling / "placeholder.txt").write_text("ok\n", encoding="utf-8")
+
+            program_manifest = {
+                "schema": "playgta6-recomp-program",
+                "schema_version": 1,
+                "modules": [
+                    {
+                        "module": "main",
+                        "dll": "game.exe",
+                        "lift": {"functions": 120, "instructions": 1000, "unsupported": 10},
+                    },
+                    {
+                        "module": "vcruntime140",
+                        "dll": "vcruntime140.dll",
+                        "lift": {"functions": 30, "instructions": 200, "unsupported": 0},
+                    },
+                ],
+            }
+            (recomp_dir / "program-manifest.json").write_text(
+                json.dumps(program_manifest),
+                encoding="utf-8",
+            )
+            for mod_name in ("main", "vcruntime140"):
+                img_dir = recomp_dir / mod_name / "image"
+                img_dir.mkdir(parents=True)
+                (img_dir / "guest.pgim").write_bytes(b"PGIM" + b"\x00" * 32)
+                (recomp_dir / mod_name / "build-manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": "playgta6-recomp-build",
+                            "schema_version": 1,
+                            "module": mod_name,
+                            "lift": {
+                                "functions": 60,
+                                "instructions": 500,
+                                "unsupported_instructions": 5,
+                                "shards": [{"index": 0}, {"index": 1}],
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            gate = vbb.check_recomp_artifacts_gate(repo, recomp_dir=recomp_dir)
+            self.assertEqual(gate.status, "pass")
+            self.assertEqual(gate.details["pgimCount"], 2)
+            self.assertEqual(
+                gate.details["pgimNames"],
+                ["main/image/guest.pgim", "vcruntime140/image/guest.pgim"],
+            )
+            payload = json.dumps(gate.to_dict())
+            self.assertNotRegex(payload, r"[A-Za-z]:\\")
+            self.assertNotRegex(payload, r"[A-Za-z]:/")
+            self.assertNotIn("/Users/", payload)
+            self.assertNotIn("/home/", payload)
+
+    def test_count_pgim_files_deterministic_and_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "recomp_out"
+            (root / "zeta" / "image").mkdir(parents=True)
+            (root / "alpha" / "nested" / "image").mkdir(parents=True)
+            (root / "zeta" / "image" / "guest.pgim").write_bytes(b"PGIM")
+            (root / "alpha" / "nested" / "image" / "guest.pgim").write_bytes(b"PGIM")
+            (root / "root.pgim").write_bytes(b"PGIM")
+            count, rels = vbb._count_pgim_files(root)
+            self.assertEqual(count, 3)
+            self.assertEqual(
+                rels,
+                [
+                    "alpha/nested/image/guest.pgim",
+                    "root.pgim",
+                    "zeta/image/guest.pgim",
+                ],
+            )
+            for rel in rels:
+                self.assertNotIn("\\", rel)
+                self.assertFalse(Path(rel).is_absolute())
+
     def test_import_coverage_100_percent_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = _create_repo_skeleton(Path(tmp), include_server=False)
