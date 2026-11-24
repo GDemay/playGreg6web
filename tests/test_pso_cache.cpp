@@ -299,12 +299,19 @@ void test_texture_format_mapping() {
          FormatDiag::FeatureFallback | FormatDiag::NeedsCpuConversion},
         {D::BC7_UNORM_SRGB, FormatUsage::Sampled, WgpuFeature::TextureCompressionBc, TF::Bc7RgbaUnormSrgb, 0},
         {D::R9G9B9E5_SHAREDEXP, FormatUsage::Sampled, 0, TF::Rgb9e5Ufloat, 0},
+        {D::R8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
+        {D::R8_UNORM, FormatUsage::RenderTarget, 0, TF::R8Unorm, 0},
+        {D::A8_UNORM, FormatUsage::Sampled, 0, TF::R8Unorm, 0},
+        {D::A8_UNORM, FormatUsage::RenderTarget, 0, TF::R8Unorm, 0},
     };
     for (const Expect& e : expects) {
         const TextureFormatMapping m = map_texture_format(e.dxgi, e.usage, e.features);
         CHECK(m.format == e.format);
         CHECK(m.diagnostics == e.diag);
     }
+    // A8_UNORM maps cleanly to core r8unorm with no extra device features required.
+    CHECK(map_texture_format(D::A8_UNORM, FormatUsage::Sampled, 0).required_features == 0);
+    CHECK(map_texture_format(D::A8_UNORM, FormatUsage::RenderTarget, 0).required_features == 0);
     // Depth-sampling views carry the aspect.
     CHECK(map_texture_format(D::R24_UNORM_X8_TYPELESS, FormatUsage::Sampled, 0).aspect ==
           WgpuTextureAspect::DepthOnly);
@@ -319,7 +326,7 @@ void test_texture_format_mapping() {
     const std::pair<D, FormatUsage> unsupported[] = {
         {D::UNKNOWN, FormatUsage::RenderTarget},       {D::R32G32B32_FLOAT, FormatUsage::RenderTarget},
         {D::R32G32B32_FLOAT, FormatUsage::Sampled},    {D::B5G6R5_UNORM, FormatUsage::Sampled},
-        {D::B5G5R5A1_UNORM, FormatUsage::RenderTarget},{D::A8_UNORM, FormatUsage::Sampled},
+        {D::B5G5R5A1_UNORM, FormatUsage::RenderTarget},{D::A8_UNORM, FormatUsage::DepthStencil},
         {D::R1_UNORM, FormatUsage::Sampled},           {D::B4G4R4A4_UNORM, FormatUsage::Sampled},
         {D::BC1_UNORM, FormatUsage::RenderTarget},     {D::BC7_UNORM, FormatUsage::DepthStencil},
         {D::D32_FLOAT, FormatUsage::RenderTarget},     {D::R32_FLOAT, FormatUsage::DepthStencil},

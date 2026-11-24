@@ -143,6 +143,7 @@ void test_format_geometry() {
     check_fmt(41u, 1, 1, 4, false);   // R32_FLOAT
     check_fmt(42u, 1, 1, 4, false);   // R32_UINT
     check_fmt(61u, 1, 1, 1, false);   // R8_UNORM
+    check_fmt(65u, 1, 1, 1, false);   // A8_UNORM
     check_fmt(87u, 1, 1, 4, false);   // B8G8R8A8_UNORM
     check_fmt(91u, 1, 1, 4, false);   // B8G8R8A8_UNORM_SRGB
 
@@ -267,9 +268,14 @@ void test_required_formats_and_modes() {
     verify_round_trip({98u, 100u, 60u, 1u, 1u, 0x109u, 0u}, 0u, 5006u);
     verify_round_trip({98u, 100u, 60u, 1u, 1u, 0x119u, 0u}, 0u, 5007u);
 
-    // BC1_UNORM (8B block) and R8_UNORM (1B) + mip level > 0.
+    // BC1_UNORM (8B block) and R8_UNORM / A8_UNORM (1B) + mip level > 0.
     verify_round_trip({71u, 96u, 48u, 1u, 4u, 0x10Au, 0u}, 2u, 5100u);
     verify_round_trip({61u, 50u, 30u, 1u, 3u, 0x10Eu, 0u}, 1u, 5101u);
+    verify_round_trip({65u, 64u, 64u, 1u, 1u, 0u, 0u}, 0u, 5200u, /*expect_scrambled=*/false);
+    verify_round_trip({65u, 64u, 48u, 1u, 1u, 0x102u, 0u}, 0u, 5201u);
+    verify_round_trip({65u, 64u, 48u, 1u, 1u, 0x106u, 0u}, 0u, 5202u);
+    verify_round_trip({65u, 128u, 96u, 1u, 1u, 0x10Au, 0u}, 0u, 5203u);
+    verify_round_trip({65u, 50u, 30u, 1u, 3u, 0x11Au, 0u}, 1u, 5204u);
 }
 
 void test_small_3d_16x16x4() {
