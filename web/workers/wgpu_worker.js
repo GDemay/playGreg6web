@@ -1183,6 +1183,113 @@ function deviceSupportsTimestampQuery(device) {
   return typeof device.createQuerySet === 'function' && typeof device.createBuffer === 'function';
 }
 
+/**
+ * Request a GPUDevice from `adapter` using the optional feature / elevated limit negotiation
+ * (features + limits, then features only, then a bare device). Shared by initial init and W100
+ * device-loss recovery so a recovered device exposes the same capabilities.
+ *
+ * @param {GPUAdapter} adapter
+ * @returns {Promise<{ device: GPUDevice, enabledFeatures: string[] }>}
+ */
+async function requestNegotiatedDevice(adapter) {
+  const requiredFeatures = selectSupportedAdapterFeatures(adapter);
+  const requiredLimits = selectSupportedAdapterLimits(adapter);
+  const hasRequiredFeatures = requiredFeatures.length > 0;
+  const hasRequiredLimits = Object.keys(requiredLimits).length > 0;
+  let device;
+  let enabledFeatures = [];
+  if (hasRequiredFeatures || hasRequiredLimits) {
+    const deviceDesc = {};
+    if (hasRequiredFeatures) {
+      deviceDesc.requiredFeatures = requiredFeatures;
+    }
+    if (hasRequiredLimits) {
+      deviceDesc.requiredLimits = requiredLimits;
+    }
+    try {
+      device = await adapter.requestDevice(deviceDesc);
+      enabledFeatures = hasRequiredFeatures ? requiredFeatures.slice() : [];
+    } catch (_) {
+      if (hasRequiredFeatures && hasRequiredLimits) {
+        try {
+          device = await adapter.requestDevice({ requiredFeatures });
+          enabledFeatures = requiredFeatures.slice();
+        } catch (_featureErr) {
+          device = await adapter.requestDevice();
+          enabledFeatures = [];
+        }
+      } else {
+        device = await adapter.requestDevice();
+        enabledFeatures = [];
+      }
+    }
+  } else {
+    device = await adapter.requestDevice();
+  }
+  if (device && device.features && typeof device.features.has === 'function') {
+    enabledFeatures = selectSupportedAdapterFeatures(device);
+  }
+  return { device, enabledFeatures };
+}
+
+// W100: bounded WebGPU device-loss recovery.
+const MAX_DEVICE_RECOVERY_ATTEMPTS = 3;
+const DEFAULT_DEVICE_RECOVERY_MIN_INTERVAL_MS = 1000;
+const DEVICE_LOST_ERROR_PATTERN =
+  /valid external instance reference no longer exists|instance (?:was |has been |is )?(?:lost|destroyed|dropped)|device (?:is |was |has been )?(?:lost|destroyed)/i;
+
+/**
+ * True when `err` looks like a lost GPUDevice / torn-down WebGPU instance (`OperationError`,
+ * `A valid external Instance reference no longer exists.`, `... device is lost`).
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDeviceLostError(err) {
+  if (err === null || err === undefined) {
+    return false;
+  }
+  let name = '';
+  let message = '';
+  try {
+    if (typeof err === 'object') {
+      name = typeof err.name === 'string' ? err.name : '';
+      message = typeof err.message === 'string' ? err.message : '';
+    } else if (typeof err === 'string') {
+      message = err;
+    }
+  } catch (_) {
+    return false;
+  }
+  return name === 'OperationError' || DEVICE_LOST_ERROR_PATTERN.test(message);
+}
+
+/**
+ * Reduce a `GPUDeviceLostInfo` (`{ reason, message }`) to a sanitized single-line string.
+ *
+ * @param {unknown} info
+ * @returns {string}
+ */
+function sanitizeDeviceLostInfo(info) {
+  let reason = '';
+  let message = '';
+  try {
+    if (info && typeof info === 'object') {
+      reason = typeof info.reason === 'string' ? info.reason : '';
+      message = typeof info.message === 'string' ? info.message : '';
+    } else if (typeof info === 'string') {
+      message = info;
+    }
+  } catch (_) {
+    // Fall through with empty fields.
+  }
+  const safeReason = /^[A-Za-z_-]{1,32}$/.test(reason) ? reason : 'unknown';
+  return sanitizeGpuErrorDetail({
+    name: `DeviceLost(${safeReason})`,
+    message: message || 'device lost',
+  });
+}
+
 function resolveGpuRingBuffer(injectedCtor) {
   if (typeof injectedCtor === 'function') {
     return injectedCtor;
@@ -1311,6 +1418,22 @@ class WgpuCommandProcessor {
     // W99: torn-down/lost GPU instance hardening counters (fence + present submit failures).
     this._workDoneFenceFailures = 0;
     this._presentSubmitFailures = 0;
+    // W100: device-loss detection / recovery state (hooked at the end of the constructor).
+    this._deviceGeneration = 0;
+    this._deviceLostGeneration = -1;
+    this._deviceLostHookedDevice = null;
+    this._deviceLostCount = 0;
+    this._deviceRecoveredCount = 0;
+    this._deviceRecoveryFailedCount = 0;
+    this._lastDeviceLostReason = null;
+    this._deviceLost = false;
+    this._deviceRecovering = false;
+    this._droppedWhileRecoveringCount = 0;
+    this._deviceLossListener =
+      typeof options.onDeviceLost === 'function' ? options.onDeviceLost : null;
+    this._logger =
+      options.logger !== undefined ? options.logger : typeof console !== 'undefined' ? console : null;
+    this._ownedSubsystemFactories = {};
     this._v2BindGroupLayouts = new Map();
     this._v2PipelineLayouts = new Map();
 
@@ -1348,10 +1471,9 @@ class WgpuCommandProcessor {
         './staging_pool.js'
       );
       if (StagingCtor) {
-        this.stagingPool = new StagingCtor({
-          ...(options.stagingPoolOptions || {}),
-          device,
-        });
+        this._ownedSubsystemFactories.stagingPool = (dev) =>
+          new StagingCtor({ ...(options.stagingPoolOptions || {}), device: dev });
+        this.stagingPool = this._ownedSubsystemFactories.stagingPool(device);
         this._ownsStagingPool = true;
       }
     }
@@ -1373,10 +1495,9 @@ class WgpuCommandProcessor {
         './uniform_ring.js'
       );
       if (UniformRingCtor) {
-        this.uniformRing = new UniformRingCtor({
-          ...(options.uniformRingOptions || {}),
-          device,
-        });
+        this._ownedSubsystemFactories.uniformRing = (dev) =>
+          new UniformRingCtor({ ...(options.uniformRingOptions || {}), device: dev });
+        this.uniformRing = this._ownedSubsystemFactories.uniformRing(device);
         this._ownsUniformRing = true;
       }
     }
@@ -1397,10 +1518,9 @@ class WgpuCommandProcessor {
         './gpu_timer.js'
       );
       if (PassTimerCtor) {
-        this.passTimer = new PassTimerCtor({
-          ...(options.passTimerOptions || {}),
-          device,
-        });
+        this._ownedSubsystemFactories.passTimer = (dev) =>
+          new PassTimerCtor({ ...(options.passTimerOptions || {}), device: dev });
+        this.passTimer = this._ownedSubsystemFactories.passTimer(device);
         this._ownsPassTimer = true;
       }
     }
@@ -1458,10 +1578,9 @@ class WgpuCommandProcessor {
         './rt_pool.js'
       );
       if (RtPoolCtor) {
-        this.rtPool = new RtPoolCtor({
-          ...(options.rtPoolOptions || {}),
-          device,
-        });
+        this._ownedSubsystemFactories.rtPool = (dev) =>
+          new RtPoolCtor({ ...(options.rtPoolOptions || {}), device: dev });
+        this.rtPool = this._ownedSubsystemFactories.rtPool(device);
         this._ownsRtPool = true;
       }
     }
@@ -1615,6 +1734,9 @@ class WgpuCommandProcessor {
     } else if (this._captureValidationErrors) {
       this._hookDeviceUncapturedError(this.device);
     }
+
+    // W100: observe `device.lost` for the initial device.
+    this._hookDeviceLost(this.device);
 
     this._resetFrameState();
   }
@@ -3079,7 +3201,12 @@ class WgpuCommandProcessor {
    */
   _noteWorkDoneFenceFailure(err) {
     this._workDoneFenceFailures += 1;
-    if (this._workDoneFenceFailures !== 1 || this._destroyed) {
+    if (this._destroyed) {
+      return;
+    }
+    // W100: a torn-down instance / lost device on the fence path triggers recovery.
+    this._maybeSignalDeviceLostFromError(err, 'work-done-fence');
+    if (this._workDoneFenceFailures !== 1) {
       return;
     }
     try {
@@ -3102,6 +3229,376 @@ class WgpuCommandProcessor {
     } catch (_) {
       // Never let telemetry recording escape from the present path.
     }
+    // W100: a torn-down instance / lost device on the present path triggers recovery.
+    this._maybeSignalDeviceLostFromError(err, 'present');
+  }
+
+  /**
+   * W100: emit a concise diagnostic line through the configured logger (default `console`).
+   *
+   * @param {'info' | 'warn' | 'error'} level
+   * @param {string} message
+   */
+  _logDiagnostic(level, message) {
+    const logger = this._logger;
+    if (!logger) {
+      return;
+    }
+    try {
+      if (typeof logger === 'function') {
+        logger(level, message);
+      } else if (typeof logger[level] === 'function') {
+        logger[level](message);
+      } else if (typeof logger.log === 'function') {
+        logger.log(message);
+      }
+    } catch (_) {
+      // Logging must never break the render loop.
+    }
+  }
+
+  /**
+   * W100: attach a `device.lost` observer to `device` once. Losses of a device that is no longer
+   * current (replaced by recovery) and intentional `device.destroy()` (`reason: 'destroyed'`) or
+   * processor teardown are ignored.
+   *
+   * @param {GPUDevice | null | undefined} device
+   * @returns {boolean}
+   */
+  _hookDeviceLost(device) {
+    if (!device || typeof device !== 'object' || device === this._deviceLostHookedDevice) {
+      return false;
+    }
+    let lost;
+    try {
+      lost = device.lost;
+    } catch (_) {
+      return false;
+    }
+    if (!lost || typeof lost.then !== 'function') {
+      return false;
+    }
+    this._deviceLostHookedDevice = device;
+    const generation = this._deviceGeneration;
+    try {
+      Promise.resolve(lost).then(
+        (info) => {
+          this._handleDeviceLostInfo(info, device, generation);
+        },
+        () => {
+          // A rejected `lost` promise carries no actionable information.
+        }
+      );
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
+  _handleDeviceLostInfo(info, device, generation) {
+    if (this._destroyed || generation !== this._deviceGeneration || this.device !== device) {
+      return;
+    }
+    let reason = null;
+    try {
+      reason = info && typeof info === 'object' ? info.reason : null;
+    } catch (_) {
+      reason = null;
+    }
+    if (reason === 'destroyed') {
+      // `device.destroy()` was called intentionally by the host; do not recover.
+      return;
+    }
+    this._signalDeviceLost(sanitizeDeviceLostInfo(info), 'device.lost');
+  }
+
+  /**
+   * W100: signal device loss when `err` is a torn-down instance / lost device error.
+   *
+   * @param {unknown} err
+   * @param {string} source
+   * @returns {boolean}
+   */
+  _maybeSignalDeviceLostFromError(err, source) {
+    try {
+      if (!isDeviceLostError(err)) {
+        return false;
+      }
+      return this._signalDeviceLost(sanitizeGpuErrorDetail(err), source);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * W100: record a device loss (counted once per device generation) and notify the registered
+   * device-loss listener (the worker handler schedules bounded recovery). Never throws.
+   *
+   * @param {string} reason Sanitized reason string.
+   * @param {string} source
+   * @returns {boolean}
+   */
+  _signalDeviceLost(reason, source) {
+    if (this._destroyed || this._deviceRecovering) {
+      return false;
+    }
+    const firstForGeneration = this._deviceLostGeneration !== this._deviceGeneration;
+    if (firstForGeneration) {
+      this._deviceLostGeneration = this._deviceGeneration;
+      this._deviceLost = true;
+      this._deviceLostCount += 1;
+      this._lastDeviceLostReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
+      this._logDiagnostic(
+        'warn',
+        `[wgpu_worker] WebGPU device lost (${source}): ${this._lastDeviceLostReason || 'unknown'}`
+      );
+    }
+    const listener = this._deviceLossListener;
+    if (listener) {
+      try {
+        listener({
+          reason: this._lastDeviceLostReason,
+          source,
+          generation: this._deviceGeneration,
+          firstForGeneration,
+        });
+      } catch (_) {
+        // Listener failures must not escape into the render loop.
+      }
+    }
+    return true;
+  }
+
+  /**
+   * W100: register the device-loss listener (called synchronously on loss; `null` clears it).
+   *
+   * @param {((event: { reason: string | null, source: string, generation: number, firstForGeneration: boolean }) => void) | null} listener
+   */
+  setDeviceLossListener(listener) {
+    this._deviceLossListener = typeof listener === 'function' ? listener : null;
+  }
+
+  get isDeviceLost() {
+    return this._deviceLost;
+  }
+
+  get isDeviceRecovering() {
+    return this._deviceRecovering;
+  }
+
+  /**
+   * W100: sanitized device-loss telemetry counters.
+   */
+  getDeviceLossStats() {
+    return {
+      deviceLostCount: this._deviceLostCount,
+      deviceRecoveredCount: this._deviceRecoveredCount,
+      deviceRecoveryFailedCount: this._deviceRecoveryFailedCount,
+      lastDeviceLostReason: this._lastDeviceLostReason,
+      deviceRecovering: this._deviceRecovering,
+      deviceLost: this._deviceLost,
+      droppedWhileRecovering: this._droppedWhileRecoveringCount,
+    };
+  }
+
+  /**
+   * W100: enter recovery mode. Submissions are dropped (no throw, no frameCount bump) until
+   * `endDeviceRecovery()` is called.
+   *
+   * @returns {boolean}
+   */
+  beginDeviceRecovery() {
+    if (this._destroyed) {
+      return false;
+    }
+    this._deviceRecovering = true;
+    this._pendingEncoder = null;
+    this._hasPendingUploadCommands = false;
+    this._passCommands = [];
+    return true;
+  }
+
+  /**
+   * W100: leave recovery mode and update recovered / failed counters.
+   *
+   * @param {boolean} success
+   */
+  endDeviceRecovery(success) {
+    const wasRecovering = this._deviceRecovering;
+    this._deviceRecovering = false;
+    if (!wasRecovering) {
+      return;
+    }
+    if (success && !this._destroyed) {
+      this._deviceRecoveredCount += 1;
+      this._deviceLost = false;
+    } else {
+      this._deviceRecoveryFailedCount += 1;
+    }
+  }
+
+  /**
+   * W100: release every GPU resource handle that belongs to the (dead) current device. IDs that
+   * the guest references afterwards resolve to `null` and are skipped by the existing lookup
+   * paths instead of throwing. Shader WGSL sources in the pack cache are preserved.
+   */
+  _resetDeviceResources() {
+    this._pendingEncoder = null;
+    this._hasPendingUploadCommands = false;
+    this._passCommands = [];
+    this._frameBegunForIndex = -1;
+
+    const safeDestroy = (resource) => {
+      if (resource && typeof resource.destroy === 'function') {
+        try {
+          resource.destroy();
+        } catch (_) {
+          // Destroying objects of a lost device may throw; they are released either way.
+        }
+      }
+    };
+
+    if (this.resourceRegistry && typeof this.resourceRegistry.destroyAll === 'function') {
+      try {
+        this.resourceRegistry.destroyAll();
+      } catch (_) {
+        // Ignore registry teardown failures on a lost device.
+      }
+    }
+    for (const buffer of this.buffers.values()) {
+      safeDestroy(buffer);
+    }
+    for (const texture of this.textures.values()) {
+      safeDestroy(texture);
+    }
+
+    this.buffers.clear();
+    this._bufferMeta.clear();
+    this.textures.clear();
+    this.textureViews.clear();
+    this.samplers.clear();
+    this.bindGroups.clear();
+    this._bindGroupKinds.clear();
+    this._bindGroupMeta.clear();
+    this._v2BindGroupLayouts.clear();
+    this._v2PipelineLayouts.clear();
+    this.shaderModules.clear();
+    this.pipelines.clear();
+    this._pipelineMeta.clear();
+    this._specializedFallbackPipelines.clear();
+    this._specializedFallbackBindGroups.clear();
+    this._pendingCommandStreamShaderProfiles = null;
+    this._explicitFallbackDrawContext = null;
+    this.computePipelines.clear();
+    this._pipelineBindGroupLayouts.clear();
+    this._computePipelineBindGroupLayouts.clear();
+    this._shaderReflectionKeys.clear();
+    this._pendingTimerReadbacks.clear();
+    this._lastPassTimings = null;
+
+    // Packet ABI v2 extensions own device objects too; the worker handler reinstalls them.
+    this.extension = null;
+    if (Object.prototype.hasOwnProperty.call(this, '__playgta6RsActiveHandler')) {
+      this.__playgta6RsActiveHandler = null;
+    }
+
+    // Owned splash/Bink presenters are rebuilt lazily by `_ensureSplashBridge()`.
+    if (this.splashFrameBridge && this._ownsSplashFrameBridge) {
+      safeDestroy(this.splashFrameBridge);
+      this.splashFrameBridge = null;
+      this._ownsSplashFrameBridge = false;
+    }
+    if (this.binkPresenter && this._ownsBinkPresenter) {
+      safeDestroy(this.binkPresenter);
+      this.binkPresenter = null;
+      this._ownsBinkPresenter = false;
+    }
+  }
+
+  /**
+   * W100: rebuild owned device-bound subsystems (staging pool, uniform ring, pass timer, RT pool)
+   * on `device`. A subsystem that fails to rebuild is disabled instead of throwing.
+   *
+   * @param {GPUDevice} device
+   */
+  _recreateOwnedSubsystems(device) {
+    const specs = [
+      ['stagingPool', '_ownsStagingPool'],
+      ['uniformRing', '_ownsUniformRing'],
+      ['passTimer', '_ownsPassTimer'],
+      ['rtPool', '_ownsRtPool'],
+    ];
+    for (let i = 0; i < specs.length; i += 1) {
+      const [key, ownsKey] = specs[i];
+      const factory = this._ownedSubsystemFactories[key];
+      if (!this[ownsKey] || typeof factory !== 'function') {
+        continue;
+      }
+      const prev = this[key];
+      if (prev && typeof prev.destroy === 'function') {
+        try {
+          prev.destroy();
+        } catch (_) {
+          // Ignore teardown failures of subsystems bound to the lost device.
+        }
+      }
+      try {
+        this[key] = factory(device);
+      } catch (err) {
+        this[key] = null;
+        this[ownsKey] = false;
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] ${key} unavailable after device recovery: ${sanitizeGpuErrorDetail(err)}`
+        );
+      }
+    }
+  }
+
+  /**
+   * W100: bind a recovered GPUDevice (and re-acquired canvas context) after device loss. Clears
+   * every resource handle owned by the dead device, rebuilds owned subsystems, re-configures the
+   * swapchain (via `recover()`) or the raw canvas context, and re-hooks `device.lost`. Telemetry
+   * counters, frameCount, the ring and shader pack sources are preserved.
+   *
+   * @param {GPUDevice} newDevice
+   * @param {GPUCanvasContext | null | undefined} newCtx
+   * @param {{ format?: string, alphaMode?: string, recoverSwapchain?: boolean }} [opts]
+   */
+  rebindDevice(newDevice, newCtx, opts = {}) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    if (!newDevice || typeof newDevice !== 'object') {
+      throw new TypeError('rebindDevice requires a GPUDevice');
+    }
+    const options = opts && typeof opts === 'object' ? opts : {};
+    this._deviceGeneration += 1;
+    this._resetDeviceResources();
+    if (newCtx && typeof newCtx === 'object') {
+      this.ctx = newCtx;
+    }
+    const swapchainRecovers = Boolean(
+      this._swapchain &&
+        !this._swapchain.isDestroyed &&
+        typeof this._swapchain.recover === 'function' &&
+        options.recoverSwapchain !== false
+    );
+    this.bindDevice(newDevice, {
+      format: options.format,
+      recoverSwapchain: options.recoverSwapchain,
+    });
+    if (!swapchainRecovers && this.ctx && typeof this.ctx.configure === 'function') {
+      this.ctx.configure({
+        device: newDevice,
+        format: this.format,
+        alphaMode: typeof options.alphaMode === 'string' ? options.alphaMode : 'opaque',
+      });
+    }
+    this._recreateOwnedSubsystems(newDevice);
+    this._hookDeviceLost(newDevice);
+    this._deviceLost = false;
+    return true;
   }
 
   /**
@@ -5009,6 +5506,11 @@ class WgpuCommandProcessor {
     if (this._destroyed || !this.device || !this.ctx) {
       return { frameCount: this.frameCount, presents: 0 };
     }
+    if (this._deviceRecovering) {
+      // W100: drop submissions for the lost device while recovery is in flight.
+      this._droppedWhileRecoveringCount += 1;
+      return { frameCount: this.frameCount, presents: 0 };
+    }
 
     let view;
     if (
@@ -5255,6 +5757,10 @@ class WgpuCommandProcessor {
       }
 
       offset = payloadOffset + payloadBytes;
+      if (this._deviceRecovering) {
+        // W100: device loss detected mid-buffer; skip the remaining packets cleanly.
+        break;
+      }
     }
     } finally {
       this._pendingCommandStreamShaderProfiles = prevPendingHints;
@@ -5376,6 +5882,9 @@ class WgpuCommandProcessor {
       return;
     }
     this._destroyed = true;
+    // W100: intentional teardown — never treat the subsequent `device.lost` as a loss.
+    this._deviceLossListener = null;
+    this._deviceRecovering = false;
     this._unhookDeviceUncapturedError();
     this._unhookSwapchainValidation();
     if (
@@ -5789,8 +6298,46 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
   // Omitted for a null processor so the empty snapshot shape stays unchanged.
   if (processor && typeof processor === 'object') {
     snapshot.renderStateStats = renderStateStats;
+    // W100: WebGPU device-loss / recovery counters (zeros when the processor lacks them).
+    snapshot.deviceStats = resolveDeviceLossTelemetry(processor, stats);
   }
   return snapshot;
+}
+
+/**
+ * W100: read sanitized device-loss counters from `processor.getDeviceLossStats()` (or a
+ * `stats.deviceLoss` object), defaulting to zeros / null / false.
+ *
+ * @returns {{ deviceLostCount: number, deviceRecoveredCount: number, lastDeviceLostReason: string | null, deviceRecovering: boolean }}
+ */
+function resolveDeviceLossTelemetry(processor, stats) {
+  let raw = null;
+  if (processor && typeof processor.getDeviceLossStats === 'function') {
+    try {
+      raw = processor.getDeviceLossStats();
+    } catch (_) {
+      raw = null;
+    }
+  }
+  if (
+    (!raw || typeof raw !== 'object') &&
+    stats &&
+    stats.deviceLoss &&
+    typeof stats.deviceLoss === 'object'
+  ) {
+    raw = stats.deviceLoss;
+  }
+  const src = raw && typeof raw === 'object' ? raw : {};
+  let lastDeviceLostReason = null;
+  if (typeof src.lastDeviceLostReason === 'string' && src.lastDeviceLostReason.length > 0) {
+    lastDeviceLostReason = sanitizeGpuErrorDetail({ message: src.lastDeviceLostReason });
+  }
+  return {
+    deviceLostCount: toNonNegativeInt(src.deviceLostCount, 0),
+    deviceRecoveredCount: toNonNegativeInt(src.deviceRecoveredCount, 0),
+    lastDeviceLostReason,
+    deviceRecovering: src.deviceRecovering === true,
+  };
 }
 
 const RENDER_STATE_TELEMETRY_KEYS = Object.freeze([
@@ -5892,6 +6439,28 @@ function createWgpuWorkerHandler(options = {}) {
   let firstPresentNotified = false;
   let unbindValidationListener = null;
 
+  // W100: bounded device-loss recovery state (per worker session).
+  const deviceRecoveryEnabled = options.enableDeviceRecovery !== false;
+  const maxDeviceRecoveries =
+    Number.isInteger(options.maxDeviceRecoveries) && options.maxDeviceRecoveries >= 0
+      ? options.maxDeviceRecoveries
+      : MAX_DEVICE_RECOVERY_ATTEMPTS;
+  const deviceRecoveryMinIntervalMs =
+    typeof options.deviceRecoveryMinIntervalMs === 'number' &&
+    Number.isFinite(options.deviceRecoveryMinIntervalMs) &&
+    options.deviceRecoveryMinIntervalMs >= 0
+      ? options.deviceRecoveryMinIntervalMs
+      : DEFAULT_DEVICE_RECOVERY_MIN_INTERVAL_MS;
+  const recoverGpuDevice =
+    typeof options.recoverGpuDevice === 'function'
+      ? options.recoverGpuDevice
+      : (targetProcessor) => defaultRecoverGpuDevice(targetProcessor);
+  let deviceRecoveryAttempts = 0;
+  let deviceRecoveryInFlight = null;
+  let deviceRecoveryExhaustedLogged = false;
+  let lastDeviceRecoveryStartMs = -Infinity;
+  let boundDeviceLossProcessor = null;
+
   function emitValidationError(record, totalCount) {
     const cleanRecord = {
       seq: record.seq,
@@ -5923,6 +6492,7 @@ function createWgpuWorkerHandler(options = {}) {
       }
       unbindValidationListener = null;
     }
+    bindProcessorDeviceLoss(targetProcessor);
     if (!targetProcessor) {
       return;
     }
@@ -6128,6 +6698,214 @@ function createWgpuWorkerHandler(options = {}) {
     return summary;
   }
 
+  /**
+   * Install the packet ABI v2 render-state + texture packet extensions on `targetProcessor`.
+   * Also used after W100 device recovery, since extensions own device-bound objects.
+   *
+   * @returns {boolean} True when installation did not throw.
+   */
+  function installPacketExtensions(targetProcessor) {
+    try {
+      let renderStateApi =
+        typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
+          ? globalThis.PlayGta6RenderState
+          : null;
+      if (!renderStateApi && typeof importScripts === 'function') {
+        importScripts('./render_state_packets.js');
+        renderStateApi =
+          typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
+            ? globalThis.PlayGta6RenderState
+            : null;
+      } else if (!renderStateApi && typeof require === 'function') {
+        renderStateApi = require('./render_state_packets.js');
+      }
+      if (renderStateApi && typeof renderStateApi.installRenderStatePackets === 'function') {
+        renderStateApi.installRenderStatePackets(targetProcessor);
+      }
+      let texturePacketsApi =
+        typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
+          ? globalThis.PlayGta6TexturePackets
+          : null;
+      if (!texturePacketsApi && typeof importScripts === 'function') {
+        importScripts('./texture_packets.js');
+        texturePacketsApi =
+          typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
+            ? globalThis.PlayGta6TexturePackets
+            : null;
+      } else if (!texturePacketsApi && typeof require === 'function') {
+        texturePacketsApi = require('./texture_packets.js');
+      }
+      if (texturePacketsApi && typeof texturePacketsApi.installTexturePackets === 'function') {
+        texturePacketsApi.installTexturePackets(targetProcessor);
+      }
+      return true;
+    } catch (err) {
+      postMessage({ error: `packet ABI v2 unavailable: ${String(err)}` });
+      return false;
+    }
+  }
+
+  /**
+   * W100 default device re-acquisition: re-request adapter + device with the same feature /
+   * limit negotiation as init and re-acquire the OffscreenCanvas `webgpu` context.
+   *
+   * @returns {Promise<{ device: GPUDevice, ctx: GPUCanvasContext | null, format: string }>}
+   */
+  async function defaultRecoverGpuDevice(targetProcessor) {
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
+      throw new Error('navigator.gpu unavailable in worker');
+    }
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) {
+      throw new Error('no WebGPU adapter available');
+    }
+    const { device } = await requestNegotiatedDevice(adapter);
+    if (!device || typeof device !== 'object') {
+      throw new Error('requestDevice returned no device');
+    }
+    let format = targetProcessor && targetProcessor.format ? targetProcessor.format : 'bgra8unorm';
+    try {
+      const preferred = navigator.gpu.getPreferredCanvasFormat();
+      if (typeof preferred === 'string' && preferred.length > 0) {
+        format = preferred;
+      }
+    } catch (_) {
+      // Keep the previous format.
+    }
+    let ctx = targetProcessor ? targetProcessor.ctx : null;
+    if (canvas && typeof canvas.getContext === 'function') {
+      try {
+        const nextCtx = canvas.getContext('webgpu');
+        if (nextCtx) {
+          ctx = nextCtx;
+        }
+      } catch (_) {
+        // Fall back to the existing context object.
+      }
+    }
+    return { device, ctx, format };
+  }
+
+  /**
+   * W100: one async recovery attempt. Never rejects; always leaves recovery mode.
+   */
+  async function runDeviceRecovery(targetProcessor, attempt) {
+    // Synchronous before the first await so submissions are dropped immediately.
+    targetProcessor.beginDeviceRecovery();
+    let ok = false;
+    let acquiredDevice = null;
+    try {
+      const acquired = await recoverGpuDevice(targetProcessor, { canvas, attempt });
+      if (!acquired || !acquired.device) {
+        throw new Error('device recovery returned no device');
+      }
+      acquiredDevice = acquired.device;
+      if (targetProcessor !== processor || targetProcessor.destroyed) {
+        throw new Error('processor replaced or destroyed during recovery');
+      }
+      targetProcessor.rebindDevice(acquired.device, acquired.ctx, {
+        format: acquired.format,
+        alphaMode: 'opaque',
+      });
+      installPacketExtensions(targetProcessor);
+      bindProcessorValidationErrors(targetProcessor);
+      ok = true;
+      targetProcessor._logDiagnostic(
+        'info',
+        `[wgpu_worker] WebGPU device recovered (attempt ${attempt}/${maxDeviceRecoveries})`
+      );
+    } catch (err) {
+      if (acquiredDevice && acquiredDevice !== targetProcessor.device) {
+        try {
+          if (typeof acquiredDevice.destroy === 'function') {
+            acquiredDevice.destroy();
+          }
+        } catch (_) {
+          // Ignore cleanup failure of an unused device.
+        }
+      }
+      if (typeof targetProcessor._logDiagnostic === 'function') {
+        targetProcessor._logDiagnostic(
+          'error',
+          `[wgpu_worker] WebGPU device recovery failed (attempt ${attempt}/${maxDeviceRecoveries}): ${sanitizeGpuErrorDetail(err)}`
+        );
+      }
+    } finally {
+      try {
+        targetProcessor.endDeviceRecovery(ok);
+      } catch (_) {
+        // Never let bookkeeping escape.
+      }
+      try {
+        if (targetProcessor === processor) {
+          emitTelemetry();
+        }
+      } catch (_) {
+        // Telemetry is best-effort.
+      }
+    }
+    return ok;
+  }
+
+  /**
+   * W100: device-loss listener. Re-entrancy guarded, rate limited (min interval between
+   * attempts) and bounded (`maxDeviceRecoveries` attempts per worker session).
+   */
+  function handleProcessorDeviceLost(targetProcessor) {
+    if (!deviceRecoveryEnabled || targetProcessor !== processor || deviceRecoveryInFlight) {
+      return;
+    }
+    if (deviceRecoveryAttempts >= maxDeviceRecoveries) {
+      if (!deviceRecoveryExhaustedLogged) {
+        deviceRecoveryExhaustedLogged = true;
+        targetProcessor._logDiagnostic(
+          'error',
+          `[wgpu_worker] WebGPU device recovery budget exhausted (${maxDeviceRecoveries} attempts); rendering stays disabled`
+        );
+      }
+      return;
+    }
+    const nowVal = telemetryNow();
+    const now = typeof nowVal === 'number' && Number.isFinite(nowVal) ? nowVal : Date.now();
+    if (now - lastDeviceRecoveryStartMs < deviceRecoveryMinIntervalMs) {
+      return;
+    }
+    lastDeviceRecoveryStartMs = now;
+    deviceRecoveryAttempts += 1;
+    const pending = runDeviceRecovery(targetProcessor, deviceRecoveryAttempts);
+    deviceRecoveryInFlight = pending;
+    pending.then(
+      () => {
+        if (deviceRecoveryInFlight === pending) {
+          deviceRecoveryInFlight = null;
+        }
+      },
+      () => {
+        if (deviceRecoveryInFlight === pending) {
+          deviceRecoveryInFlight = null;
+        }
+      }
+    );
+  }
+
+  function bindProcessorDeviceLoss(targetProcessor) {
+    if (boundDeviceLossProcessor && boundDeviceLossProcessor !== targetProcessor) {
+      try {
+        boundDeviceLossProcessor.setDeviceLossListener(null);
+      } catch (_) {
+        // Ignore cleanup errors on prior processor.
+      }
+    }
+    boundDeviceLossProcessor = null;
+    if (!targetProcessor || typeof targetProcessor.setDeviceLossListener !== 'function') {
+      return;
+    }
+    targetProcessor.setDeviceLossListener(() => {
+      handleProcessorDeviceLost(targetProcessor);
+    });
+    boundDeviceLossProcessor = targetProcessor;
+  }
+
   async function defaultInitGpu(offscreen, width, height, initPayload = {}) {
     canvas = offscreen;
     canvas.width = width;
@@ -6144,43 +6922,7 @@ function createWgpuWorkerHandler(options = {}) {
       return null;
     }
 
-    const requiredFeatures = selectSupportedAdapterFeatures(adapter);
-    const requiredLimits = selectSupportedAdapterLimits(adapter);
-    const hasRequiredFeatures = requiredFeatures.length > 0;
-    const hasRequiredLimits = Object.keys(requiredLimits).length > 0;
-    let device;
-    let enabledFeatures = [];
-    if (hasRequiredFeatures || hasRequiredLimits) {
-      const deviceDesc = {};
-      if (hasRequiredFeatures) {
-        deviceDesc.requiredFeatures = requiredFeatures;
-      }
-      if (hasRequiredLimits) {
-        deviceDesc.requiredLimits = requiredLimits;
-      }
-      try {
-        device = await adapter.requestDevice(deviceDesc);
-        enabledFeatures = hasRequiredFeatures ? requiredFeatures.slice() : [];
-      } catch (_) {
-        if (hasRequiredFeatures && hasRequiredLimits) {
-          try {
-            device = await adapter.requestDevice({ requiredFeatures });
-            enabledFeatures = requiredFeatures.slice();
-          } catch (_featureErr) {
-            device = await adapter.requestDevice();
-            enabledFeatures = [];
-          }
-        } else {
-          device = await adapter.requestDevice();
-          enabledFeatures = [];
-        }
-      }
-    } else {
-      device = await adapter.requestDevice();
-    }
-    if (device && device.features && typeof device.features.has === 'function') {
-      enabledFeatures = selectSupportedAdapterFeatures(device);
-    }
+    const { device, enabledFeatures } = await requestNegotiatedDevice(adapter);
     const format = navigator.gpu.getPreferredCanvasFormat();
     const ctx = canvas.getContext('webgpu');
 
@@ -6274,6 +7016,7 @@ function createWgpuWorkerHandler(options = {}) {
       now: telemetryNow,
       swapchain: activeSwapchain,
       ownsSwapchain,
+      logger: options.logger,
       captureValidationErrors: true,
       maxValidationErrorHistory:
         initPayload.maxValidationErrorHistory ?? options.maxValidationErrorHistory,
@@ -6328,42 +7071,7 @@ function createWgpuWorkerHandler(options = {}) {
       reflectionManifest: initPayload.reflectionManifest ?? options.reflectionManifest,
     });
     bindProcessorValidationErrors(processor);
-    try {
-      let renderStateApi =
-        typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
-          ? globalThis.PlayGta6RenderState
-          : null;
-      if (!renderStateApi && typeof importScripts === 'function') {
-        importScripts('./render_state_packets.js');
-        renderStateApi =
-          typeof globalThis !== 'undefined' && globalThis.PlayGta6RenderState
-            ? globalThis.PlayGta6RenderState
-            : null;
-      } else if (!renderStateApi && typeof require === 'function') {
-        renderStateApi = require('./render_state_packets.js');
-      }
-      if (renderStateApi && typeof renderStateApi.installRenderStatePackets === 'function') {
-        renderStateApi.installRenderStatePackets(processor);
-      }
-      let texturePacketsApi =
-        typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
-          ? globalThis.PlayGta6TexturePackets
-          : null;
-      if (!texturePacketsApi && typeof importScripts === 'function') {
-        importScripts('./texture_packets.js');
-        texturePacketsApi =
-          typeof globalThis !== 'undefined' && globalThis.PlayGta6TexturePackets
-            ? globalThis.PlayGta6TexturePackets
-            : null;
-      } else if (!texturePacketsApi && typeof require === 'function') {
-        texturePacketsApi = require('./texture_packets.js');
-      }
-      if (texturePacketsApi && typeof texturePacketsApi.installTexturePackets === 'function') {
-        texturePacketsApi.installTexturePackets(processor);
-      }
-    } catch (err) {
-      postMessage({ error: `packet ABI v2 unavailable: ${String(err)}` });
-    }
+    installPacketExtensions(processor);
     if (attachedRing) {
       processor.attachRing(attachedRing);
     }
@@ -6541,6 +7249,23 @@ function createWgpuWorkerHandler(options = {}) {
           return;
         }
 
+        if (processor.isDeviceRecovering === true) {
+          // W100: drop splash/Bink frames cleanly while the lost device is being re-acquired.
+          const recoveringReply = {
+            type: 'splash-frame-presented',
+            frameIndex: requestedFrameIndex,
+            framesPresented: toNonNegativeInt(processor.frameCount, 0),
+            ok: false,
+            reason: 'device-recovering',
+            error: 'WebGPU device recovery in progress',
+          };
+          if (payload.id !== undefined) {
+            recoveringReply.id = payload.id;
+          }
+          postMessage(recoveringReply);
+          return;
+        }
+
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const presentOpts = {};
         if (payload.nowMs !== undefined) {
@@ -6617,6 +7342,8 @@ function createWgpuWorkerHandler(options = {}) {
           }
           unbindValidationListener = null;
         }
+        // W100: intentional host destroy must never trigger device-loss recovery.
+        bindProcessorDeviceLoss(null);
         if (typeof processor.destroy === 'function') {
           processor.destroy();
         }
