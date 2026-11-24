@@ -98,7 +98,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Wrap the host objects behind `DStorageGetFactory`, `GameInputCreate` and `XGCreateTextureComputer` as guest COM-bridge interfaces with evidence-based slot layouts, logging stubs elsewhere, and the DirectStorage read path on the runtime file layer.
 - [x] **O24 — Route XMem and Guest-Facing CRT Heap Allocations into the Guest Address Space (`runtime/os/`)** — `DONE` (PR #251, closes #243) *(no game files required — follow-up to O18: the runtime heap is fenced below 4 GiB on wasm64)*
   - Back the `xmem.dll` shims and the guest-facing CRT `malloc` family with `VirtualMemoryArena` / the Win32 heap layer so the title's allocations live in the guest pool, with one consistent allocator family and tests.
-- [ ] **O25 — Local wasm64 Runtime Test Runner (Docker + Node) & wasm64-Only Test Fixes (`tools/run_wasm_tests.py`)** — `IN PROGRESS` (#254, @Timon-ok) *(no game files required — disjoint files `tools/run_wasm_tests.py`, `tests/test_run_wasm_tests.py`; fixes in the affected tests/shims)*
+- [x] **O25 — Local wasm64 Runtime Test Runner (Docker + Node) & wasm64-Only Test Fixes (`tools/run_wasm_tests.py`)** — `DONE` (PR #260, closes #254) *(no game files required — disjoint files `tools/run_wasm_tests.py`, `tests/test_run_wasm_tests.py`; fixes in the affected tests/shims)*
   - Build every runtime test for Emscripten `-sMEMORY64 -pthread` in Docker, run it under a memory64-capable Node with a per-test report, and fix the wasm64-only failures (function-table identity in `GetProcAddress` checks, image-loader tests exceeding the wasm guest pool).
 
 ---
