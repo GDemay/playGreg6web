@@ -152,12 +152,14 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Pools transient color/depth/shadow/post-FX `GPUTexture` + view attachments by descriptor key with per-frame reuse and idle/budget LRU eviction.
 - [x] **G23 — Wire `GpuStagingPool` (`G14`), `DynamicUniformRing` (`G18`), `GpuPassTimer` (`G16`) & `ReflectionLoader` (`G17`) into `web/workers/wgpu_worker.js`** — `DONE` (PR #180, closes #172) *(no game files required — disjoint files `web/workers/wgpu_worker.js`, `tests/test_wgpu_worker_integration.mjs`)*
   - Integrate pooled staging uploads, dynamic uniform batching, optional timestamp profiling, reflected bind-group layouts, resource registry, and render-target pool into the main WebGPU command processor.
-- [ ] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `IN PROGRESS` (#168, @Timon-ok) *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
+- [x] **G24 — `d3d12_xs.dll` C-ABI Entrypoints & COM Vtable Bridge (`runtime/gpu/d3d12_xs_exports.{h,cpp}`)** — `DONE` (PRs #244, #256, #261, closes #168) *(driven by M2 `docs/imports_required.md`: `D3D12XboxCreateDevice`, `D3D12ConfigureVirtualMemoryX`, `D3D12SerializeVersionedRootSignature`)*
   - Expose the exact 3 `d3d12_xs.dll` exports with Win64-ABI COM vtables (`ID3D12Device`, `ID3D12CommandQueue`, `ID3D12GraphicsCommandList`, `ID3D12Resource`, `ID3D12DescriptorHeap`, `ID3D12PipelineState`) bridged to `G6`/`G7`/`G20`.
 - [ ] **G25 — Upgrade `tools/gpu_trace.py` Disassembler for GPU Packet ABI v2 Opcodes `22..34`** — `IN PROGRESS` (#191, @MarcBlattmann) *(disjoint files `tools/gpu_trace.py`, `tests/test_gpu_trace.py`)*
   - Full typed payload decoding, summaries, and validation for all ABI v2 render-pass, pipeline-key, layout, and dynamic-state packets (`22..34`).
 - [ ] **G26 — Worker Splash & Bink2 Frame Presentation Bridge (`web/workers/splash_frame_bridge.js`)** — `IN PROGRESS` (#218, @MarcBlattmann) *(no game files required — disjoint files `web/workers/splash_frame_bridge.js`, `tests/test_splash_frame_bridge.mjs`)*
   - Bridges raw RGBA8/YUV420p/ImageBitmap splash & Bink2 frames into `BinkVideoPresenter` (`W38`) and emits `FIRST_PRESENT` telemetry.
+- [ ] **G27 — Xbox-Specific D3D12 Device & Queue Slots on the Startup Path (`runtime/gpu/d3d12_xs_xbox.{h,cpp}`)** — `IN PROGRESS` (#262, @Timon-ok) *(no game files required for repo tests — follow-up to G24)*
+  - Establish from call-site evidence and implement the Xbox-only device/queue/command-list methods the title's device initialisation and submission thread call (device slots 49, 61/62, 70, 78–80, 101; queue 23/24/31; list 131/132), and contribute the survey improvements used.
 
 ---
 
