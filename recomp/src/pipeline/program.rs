@@ -180,9 +180,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    Input, Json, ModuleLink, OutputFile, PipelineError, PipelineOptions, PipelineReport,
-    check_options, hex, io_error, load_input, memory_model_json, num, obj,
-    register_function_symbol, registration_symbols, run_module, write_file,
+    IndirectDispatch, Input, Json, ModuleLink, OutputFile, PipelineError, PipelineOptions,
+    PipelineReport, check_options, hex, io_error, load_input, memory_model_json, num, obj,
+    register_function_symbol, registration_symbols, run_module, shard_dispatch_table_symbol,
+    write_file,
 };
 use crate::image::fnv1a_64;
 use crate::lift::MemoryModel;
@@ -523,6 +524,8 @@ pub struct ProgramReport {
     pub diagnostics: Vec<Diagnostic>,
     /// How every module's lifted code translates guest addresses (`ProgramOptions::build`).
     pub memory: MemoryModel,
+    /// Indirect-call dispatch mode of every module (`ProgramOptions::build`).
+    pub indirect_dispatch: IndirectDispatch,
     /// Program-level files except the manifest.
     pub files: Vec<OutputFile>,
     pub report: String,
@@ -1055,6 +1058,7 @@ pub fn build_program(
         allocator,
         diagnostics,
         memory: options.build.memory,
+        indirect_dispatch: options.build.indirect_dispatch,
         files: Vec::new(),
         report: String::new(),
         manifest: String::new(),
@@ -1800,16 +1804,28 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                 ),
                 (
                     "registration",
-                    obj([
-                        (
-                            "register_function",
-                            Json::Str(register_function_symbol(&m.module)),
-                        ),
-                        ("table_symbol", Json::Str(table)),
-                        ("count", num(m.functions)),
-                        ("first", opt_hex(m.first_function)),
-                        ("last", opt_hex(m.last_function)),
-                    ]),
+                    {
+                        let reg = obj([
+                            (
+                                "register_function",
+                                Json::Str(register_function_symbol(&m.module)),
+                            ),
+                            ("table_symbol", Json::Str(table)),
+                            ("count", num(m.functions)),
+                            ("first", opt_hex(m.first_function)),
+                            ("last", opt_hex(m.last_function)),
+                        ]);
+                        match (r.indirect_dispatch, reg) {
+                            (IndirectDispatch::Shard, Json::Obj(mut fields)) => {
+                                fields.push((
+                                    "shard_dispatch_symbol".to_string(),
+                                    Json::Str(shard_dispatch_table_symbol(&m.module)),
+                                ));
+                                Json::Obj(fields)
+                            }
+                            (_, reg) => reg,
+                        }
+                    },
                 ),
                 (
                     "bridge",
@@ -1956,9 +1972,20 @@ pub fn render_manifest(r: &ProgramReport, options: &ProgramOptions) -> String {
                         ),
                     ]);
                     // Only another memory model than the default is recorded.
-                    match (memory_model_json(&b.memory), build) {
+                    let build = match (memory_model_json(&b.memory), build) {
                         (Some(memory), Json::Obj(mut fields)) => {
                             fields.push(("memory_model".to_string(), memory));
+                            Json::Obj(fields)
+                        }
+                        (_, build) => build,
+                    };
+                    // And non-default indirect-call dispatch mode.
+                    match (b.indirect_dispatch, build) {
+                        (IndirectDispatch::Shard, Json::Obj(mut fields)) => {
+                            fields.push((
+                                "indirect_dispatch".to_string(),
+                                Json::Str(b.indirect_dispatch.as_str().into()),
+                            ));
                             Json::Obj(fields)
                         }
                         (_, build) => build,
@@ -2115,11 +2142,19 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
          \x20             \"the export thunk table is read as Pg6BootExport\");\n\nextern \"C\" {\n",
     );
     for m in &r.modules {
-        let (table, count) = registration_symbols(&m.module);
-        let _ = writeln!(
-            out,
-            "extern const Pg6LiftedFunctionEntry {table}[];\nextern const uint64_t {count};"
-        );
+        match r.indirect_dispatch {
+            IndirectDispatch::Table => {
+                let (table, count) = registration_symbols(&m.module);
+                let _ = writeln!(
+                    out,
+                    "extern const Pg6LiftedFunctionEntry {table}[];\nextern const uint64_t {count};"
+                );
+            }
+            IndirectDispatch::Shard => {
+                let shard_table = shard_dispatch_table_symbol(&m.module);
+                let _ = writeln!(out, "extern const Pg6ShardDispatchTable {shard_table};");
+            }
+        }
     }
     out.push_str("}  // extern \"C\"\n\nnamespace {\n\nconst Pg6ProgramModule kModules[] = {\n");
     for m in &r.modules {
@@ -2131,22 +2166,44 @@ pub fn render_descriptor(r: &ProgramReport) -> String {
         if m.tls.is_some() {
             flags.push("kPg6ProgramModuleTls");
         }
-        let (table, count) = registration_symbols(&m.module);
-        let _ = writeln!(
-            out,
-            "    {{{}, {}, 0x{:x}ull, 0x{:x}ull, 0x{:x}ull, {}, {}u, {table}, &{count},\n     \
-             reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_{}), \
-             &pg6_import_thunk_count_{}}},",
-            c_str(&m.file),
-            c_str(&m.module),
-            m.base,
-            m.size_of_image,
-            m.entry_point,
-            flags.join(" | "),
-            m.tls.as_ref().map_or(0, |t| t.index),
-            m.module,
-            m.module
-        );
+        match r.indirect_dispatch {
+            IndirectDispatch::Table => {
+                let (table, count) = registration_symbols(&m.module);
+                let _ = writeln!(
+                    out,
+                    "    {{{}, {}, 0x{:x}ull, 0x{:x}ull, 0x{:x}ull, {}, {}u, {table}, &{count},\n     \
+                     reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_{}), \
+                     &pg6_import_thunk_count_{}}},",
+                    c_str(&m.file),
+                    c_str(&m.module),
+                    m.base,
+                    m.size_of_image,
+                    m.entry_point,
+                    flags.join(" | "),
+                    m.tls.as_ref().map_or(0, |t| t.index),
+                    m.module,
+                    m.module
+                );
+            }
+            IndirectDispatch::Shard => {
+                let shard_table = shard_dispatch_table_symbol(&m.module);
+                let _ = writeln!(
+                    out,
+                    "    {{{}, {}, 0x{:x}ull, 0x{:x}ull, 0x{:x}ull, {}, {}u, nullptr, nullptr,\n     \
+                     reinterpret_cast<const Pg6BootImport* const*>(&pg6_import_thunks_{}), \
+                     &pg6_import_thunk_count_{},\n     &{shard_table}}},",
+                    c_str(&m.file),
+                    c_str(&m.module),
+                    m.base,
+                    m.size_of_image,
+                    m.entry_point,
+                    flags.join(" | "),
+                    m.tls.as_ref().map_or(0, |t| t.index),
+                    m.module,
+                    m.module
+                );
+            }
+        }
     }
     out.push_str("};\n");
     // The memory model record exists only for another model than the default (whose descriptor

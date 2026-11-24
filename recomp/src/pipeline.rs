@@ -116,7 +116,7 @@ mod hygiene;
 pub mod program;
 pub mod refine;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
@@ -127,7 +127,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
-use crate::cfg::{DiagnosticKind, Function, Terminator};
+use crate::cfg::{CallTarget, DiagnosticKind, Function, Terminator};
 use crate::code_image::CodeImage;
 use crate::discover::Analysis;
 use crate::eh::EhMetadata;
@@ -136,7 +136,8 @@ use crate::lift::compile::{LlvmTool, compile_to_object, find_llvm_tool};
 use crate::lift::memory::{Window, WindowCheck};
 use crate::lift::target::LiftTarget;
 use crate::lift::{
-    self, GuestBase, LiftError, MemoryModel, WASM64_DATALAYOUT, WASM64_TRIPLE, function_symbol,
+    self, GuestBase, LiftError, MemoryModel, ShardDispatch, WASM64_DATALAYOUT, WASM64_TRIPLE,
+    function_symbol,
 };
 use crate::pdata::ExceptionDirectory;
 use crate::pe::Pe64;
@@ -176,6 +177,17 @@ pub const REGISTER_FUNCTION_PREFIX: &str = "__playgta6_register_lifted_functions
 /// The guest runtime's bulk registration entry point (`runtime/guest/guest_runtime.h`):
 /// `int32_t pg6_guest_register_lifted_functions(const Pg6LiftedFunctionEntry*, size_t)`.
 pub const RUNTIME_REGISTER_FUNCTION: &str = "pg6_guest_register_lifted_functions";
+/// Symbol prefix of a shard's exported indirect-call dispatcher (`Pg6ShardDispatchFn`, module and
+/// zero-padded shard index appended).
+pub const SHARD_DISPATCHER_PREFIX: &str = "__playgta6_dispatch_shard_";
+/// Symbol prefix of a module's `Pg6ShardDispatchTable` (module name appended).
+pub const SHARD_DISPATCH_TABLE_PREFIX: &str = "__playgta6_shard_dispatch_";
+/// ABI version of `Pg6ShardDispatchTable` (`kPg6ShardDispatchVersion` in `runtime/abi/playgta6_abi.h`).
+pub const SHARD_DISPATCH_VERSION: u32 = 1;
+/// LLVM type of one shard-dispatch function entry (`Pg6ShardFunctionEntry`).
+pub const SHARD_ENTRY_TYPE: &str = "%Pg6ShardFunctionEntry";
+/// LLVM type of the shard-dispatch table header (`Pg6ShardDispatchTable`).
+pub const SHARD_TABLE_TYPE: &str = "%Pg6ShardDispatchTable";
 /// Manifest schema name and version.
 pub const MANIFEST_SCHEMA: &str = "playgta6-recomp-build";
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -218,6 +230,43 @@ const DIAGNOSTIC_KINDS: [DiagnosticKind; 5] = [
 // Options and errors
 // ---------------------------------------------------------------------------------------------
 
+/// How indirect calls (`__playgta6_indirect_call`) dispatch to lifted functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndirectDispatch {
+    /// One `Pg6LiftedFunctionEntry { guest_va, LiftedFn }` per lifted function (default).
+    #[default]
+    Table,
+    /// One exported `Pg6ShardDispatchFn` per lifted shard and a `Pg6ShardDispatchTable`
+    /// (`runtime/abi/playgta6_abi.h`) with pure-data `(guest_va, shard_idx, local_idx)` entries.
+    Shard,
+}
+
+impl IndirectDispatch {
+    /// Parses a CLI mode name (`"table"` or `"shard"`).
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "table" => Ok(Self::Table),
+            "shard" => Ok(Self::Shard),
+            other => Err(format!(
+                "unknown indirect dispatch mode '{other}' (expected 'table' or 'shard')"
+            )),
+        }
+    }
+
+    /// Stable lowercase mode name (`"table"` or `"shard"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Shard => "shard",
+        }
+    }
+
+    /// Whether this is the default (`Table`) mode.
+    pub fn is_default(self) -> bool {
+        self == Self::Table
+    }
+}
+
 /// Everything [`run`] needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineOptions {
@@ -249,6 +298,8 @@ pub struct PipelineOptions {
     /// How lifted code translates guest addresses ([`MemoryModel::default`]: unchanged output;
     /// another model is recorded in the manifests and the program descriptor).
     pub memory: MemoryModel,
+    /// How indirect calls reach lifted functions ([`IndirectDispatch::Table`] by default).
+    pub indirect_dispatch: IndirectDispatch,
 }
 
 impl PipelineOptions {
@@ -269,6 +320,7 @@ impl PipelineOptions {
             image: ImageOptions::default(),
             target: LiftTarget::Wasm64,
             memory: MemoryModel::default(),
+            indirect_dispatch: IndirectDispatch::default(),
         }
     }
 
@@ -312,6 +364,55 @@ pub fn registration_symbols(module: &str) -> (String, String) {
 /// Symbol of the generated function registering `module`'s table with the guest runtime.
 pub fn register_function_symbol(module: &str) -> String {
     format!("{REGISTER_FUNCTION_PREFIX}{module}")
+}
+
+/// Symbol of shard `index`'s exported indirect-call dispatcher for `module`.
+pub fn shard_dispatcher_symbol(module: &str, index: usize) -> String {
+    format!("{SHARD_DISPATCHER_PREFIX}{module}_{index:05}")
+}
+
+/// Symbol of `module`'s `Pg6ShardDispatchTable`.
+pub fn shard_dispatch_table_symbol(module: &str) -> String {
+    format!("{SHARD_DISPATCH_TABLE_PREFIX}{module}")
+}
+
+/// Computes the set of lifted function entry VAs that are called or tail-called directly from a
+/// different shard. Only these functions need external linkage in [`IndirectDispatch::Shard`] mode;
+/// every other lifted function can be emitted with `internal` linkage.
+pub fn compute_cross_shard_callees(
+    functions: &[&Function],
+    shards: &[Range<usize>],
+) -> HashSet<u64> {
+    let mut shard_of: HashMap<u64, usize> = HashMap::with_capacity(functions.len());
+    for (shard_idx, range) in shards.iter().enumerate() {
+        for func in &functions[range.clone()] {
+            shard_of.insert(func.entry, shard_idx);
+        }
+    }
+    let mut cross_shard = HashSet::new();
+    for (caller_shard, range) in shards.iter().enumerate() {
+        for func in &functions[range.clone()] {
+            let direct_calls = func.calls().filter_map(|c| match c.target {
+                CallTarget::Direct(target) => Some(target),
+                CallTarget::Indirect { .. } => None,
+            });
+            for target in func
+                .callees
+                .iter()
+                .copied()
+                .chain(func.tail_calls())
+                .chain(direct_calls)
+            {
+                if shard_of
+                    .get(&target)
+                    .is_some_and(|&callee_shard| callee_shard != caller_shard)
+                {
+                    cross_shard.insert(target);
+                }
+            }
+        }
+    }
+    cross_shard
 }
 
 /// Why a build failed. Messages carry names, addresses and the user's own paths only.
@@ -628,6 +729,36 @@ pub fn lift_shards_for(
     tool: Option<&LlvmTool>,
     jobs: usize,
 ) -> Result<Vec<ShardRecord>, PipelineError> {
+    lift_shards_with_dispatch(
+        target,
+        memory,
+        DEFAULT_MODULE,
+        IndirectDispatch::Table,
+        functions,
+        shards,
+        out_dir,
+        tool,
+        jobs,
+    )
+}
+
+/// [`lift_shards_for`] with explicit module name and indirect-call dispatch mode.
+#[allow(clippy::too_many_arguments)]
+pub fn lift_shards_with_dispatch(
+    target: &LiftTarget,
+    memory: &MemoryModel,
+    module: &str,
+    indirect_dispatch: IndirectDispatch,
+    functions: &[&Function],
+    shards: &[Range<usize>],
+    out_dir: &Path,
+    tool: Option<&LlvmTool>,
+    jobs: usize,
+) -> Result<Vec<ShardRecord>, PipelineError> {
+    let cross_shard_callees = match indirect_dispatch {
+        IndirectDispatch::Table => None,
+        IndirectDispatch::Shard => Some(compute_cross_shard_callees(functions, shards)),
+    };
     let lift_dir = out_dir.join(LIFT_DIR);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
@@ -640,9 +771,20 @@ pub fn lift_shards_for(
                     let Some(range) = shards.get(index) else {
                         break;
                     };
+                    let dispatcher_symbol =
+                        (indirect_dispatch == IndirectDispatch::Shard).then(|| {
+                            shard_dispatcher_symbol(module, index)
+                        });
+                    let dispatch = dispatcher_symbol.as_deref().map(|sym| ShardDispatch {
+                        dispatcher_symbol: sym,
+                        external_entries: cross_shard_callees
+                            .as_ref()
+                            .expect("cross-shard callees computed in Shard mode"),
+                    });
                     let result = lift_shard(
                         target,
                         memory,
+                        dispatch,
                         index,
                         &functions[range.clone()],
                         &lift_dir,
@@ -667,6 +809,7 @@ pub fn lift_shards_for(
 fn lift_shard(
     target: &LiftTarget,
     memory: &MemoryModel,
+    dispatch: Option<ShardDispatch<'_>>,
     index: usize,
     functions: &[&Function],
     lift_dir: &Path,
@@ -687,10 +830,12 @@ fn lift_shard(
     for u in lifted.iter().flat_map(|f| f.unsupported.iter()) {
         *unsupported.entry(u.mnemonic.clone()).or_insert(0) += 1;
     }
-    let ir = lift::emit_module(&lifted).map(|ir| target.retarget(ir)).map_err(|error| PipelineError::Lift {
-        entry: lifted.first().map_or(0, |f| f.entry),
-        error,
-    })?;
+    let ir = lift::emit_module_with_dispatch(&lifted, dispatch)
+        .map(|ir| target.retarget(ir))
+        .map_err(|error| PipelineError::Lift {
+            entry: lifted.first().map_or(0, |f| f.entry),
+            error,
+        })?;
     drop(lifted);
     let ll_name = shard_file_name(index, "ll");
     let ll_path = lift_dir.join(&ll_name);
@@ -797,6 +942,128 @@ pub fn write_registration_table(
     writeln!(
         out,
         "  %ok = call i32 @{RUNTIME_REGISTER_FUNCTION}(ptr @{table}, i64 {count})"
+    )?;
+    writeln!(out, "  ret i32 %ok")?;
+    writeln!(out, "}}")
+}
+
+/// Writes the shard-level dispatch registration table (`Pg6ShardDispatchTable`,
+/// `runtime/abi/playgta6_abi.h`) for `shard_count` shard dispatchers and `entries` of
+/// `(guest_va, shard_idx, local_idx)` sorted strictly ascending by `guest_va`.
+///
+/// Emits zero `@sub_*` declarations or per-function relocations, plus empty legacy symbols so
+/// any remaining references to `__playgta6_lifted_functions_<module>` still link cleanly.
+pub fn write_shard_registration_table(
+    module: &str,
+    shard_count: usize,
+    entries: &[(u64, u32, u32)],
+    out: &mut impl Write,
+) -> io::Result<()> {
+    debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
+    debug_assert!(entries.iter().all(|&(_, s, _)| (s as usize) < shard_count));
+    let dispatch_table = shard_dispatch_table_symbol(module);
+    let dispatchers = format!("__playgta6_shard_dispatchers_{module}");
+    let shard_entries = format!("__playgta6_shard_entries_{module}");
+    let (legacy_table, legacy_count) = registration_symbols(module);
+    writeln!(
+        out,
+        "; playgta6 recomp: shard-level lifted function dispatch table (generated file)"
+    )?;
+    writeln!(
+        out,
+        "; @{dispatch_table}: Pg6ShardDispatchTable (version {SHARD_DISPATCH_VERSION})"
+    )?;
+    writeln!(out, "target datalayout = \"{WASM64_DATALAYOUT}\"")?;
+    writeln!(out, "target triple = \"{WASM64_TRIPLE}\"")?;
+    writeln!(out)?;
+    writeln!(out, "{SHARD_ENTRY_TYPE} = type {{ i64, i32, i32 }}")?;
+    writeln!(
+        out,
+        "{SHARD_TABLE_TYPE} = type {{ i32, i32, i64, ptr, ptr }}"
+    )?;
+    writeln!(out, "{REGISTRATION_ENTRY_TYPE} = type {{ i64, ptr }}")?;
+    writeln!(out)?;
+    for idx in 0..shard_count {
+        writeln!(
+            out,
+            "declare void @{}(i32, ptr)",
+            shard_dispatcher_symbol(module, idx)
+        )?;
+    }
+    if shard_count > 0 {
+        writeln!(out)?;
+    }
+    if shard_count == 0 {
+        writeln!(
+            out,
+            "@{dispatchers} = internal constant [0 x ptr] zeroinitializer, align 8"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "@{dispatchers} = internal constant [{shard_count} x ptr] ["
+        )?;
+        for idx in 0..shard_count {
+            let sep = if idx + 1 == shard_count { "" } else { "," };
+            writeln!(
+                out,
+                "  ptr @{}{sep}",
+                shard_dispatcher_symbol(module, idx)
+            )?;
+        }
+        writeln!(out, "], align 8")?;
+    }
+    writeln!(out)?;
+    let entry_count = entries.len();
+    if entries.is_empty() {
+        writeln!(
+            out,
+            "@{shard_entries} = internal constant [0 x {SHARD_ENTRY_TYPE}] zeroinitializer, align 8"
+        )?;
+    } else {
+        writeln!(
+            out,
+            "@{shard_entries} = internal constant [{entry_count} x {SHARD_ENTRY_TYPE}] ["
+        )?;
+        for (i, &(va, shard_idx, local_idx)) in entries.iter().enumerate() {
+            let sep = if i + 1 == entry_count { "" } else { "," };
+            writeln!(
+                out,
+                "  {SHARD_ENTRY_TYPE} {{ i64 {}, i32 {shard_idx}, i32 {local_idx} }}{sep}",
+                va as i64
+            )?;
+        }
+        writeln!(out, "], align 8")?;
+    }
+    writeln!(out)?;
+    let shards_ptr = if shard_count == 0 {
+        "null".to_string()
+    } else {
+        format!("@{dispatchers}")
+    };
+    let entries_ptr = if entries.is_empty() {
+        "null".to_string()
+    } else {
+        format!("@{shard_entries}")
+    };
+    writeln!(
+        out,
+        "@{dispatch_table} = constant {SHARD_TABLE_TYPE} {{ i32 {SHARD_DISPATCH_VERSION}, i32 {shard_count}, i64 {entry_count}, ptr {shards_ptr}, ptr {entries_ptr} }}, align 8"
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "@{legacy_table} = constant [0 x {REGISTRATION_ENTRY_TYPE}] zeroinitializer, align 8"
+    )?;
+    writeln!(out, "@{legacy_count} = constant i64 0, align 8")?;
+    writeln!(out)?;
+    writeln!(out, "declare i32 @{RUNTIME_REGISTER_FUNCTION}(ptr, i64)")?;
+    writeln!(out)?;
+    writeln!(out, "define i32 @{}() {{", register_function_symbol(module))?;
+    writeln!(out, "entry:")?;
+    writeln!(
+        out,
+        "  %ok = call i32 @{RUNTIME_REGISTER_FUNCTION}(ptr @{legacy_table}, i64 0)"
     )?;
     writeln!(out, "  ret i32 %ok")?;
     writeln!(out, "}}")
@@ -1136,6 +1403,7 @@ pub struct PipelineReport {
     pub image_options: ImageOptions,
     pub target: LiftTarget,
     pub memory: MemoryModel,
+    pub indirect_dispatch: IndirectDispatch,
     /// Every output file except the manifest, sorted by path.
     pub files: Vec<OutputFile>,
     /// Entry VA of every lifted function (sorted; the registration table's entries).
@@ -1244,9 +1512,11 @@ pub fn run_module(
     let functions: Vec<&Function> = analysis.functions.values().collect();
     let weights: Vec<usize> = functions.iter().map(|f| f.instruction_count()).collect();
     let shard_ranges = plan_shards(&weights, options.shard_size, options.shard_instructions);
-    let shards = lift_shards_for(
+    let shards = lift_shards_with_dispatch(
         &options.target,
         &options.memory,
+        &options.module,
+        options.indirect_dispatch,
         &functions,
         &shard_ranges,
         out,
@@ -1261,9 +1531,27 @@ pub fn run_module(
         let context = format!("failed to write '{}'", registration_path.display());
         let file = fs::File::create(&registration_path).map_err(io_error(context.clone()))?;
         let mut writer = BufWriter::new(file);
-        write_registration_table(&options.module, &entries, &mut writer)
-            .and_then(|()| writer.flush())
-            .map_err(io_error(context.clone()))?;
+        match options.indirect_dispatch {
+            IndirectDispatch::Table => {
+                write_registration_table(&options.module, &entries, &mut writer)
+            }
+            IndirectDispatch::Shard => {
+                let mut shard_entries: Vec<(u64, u32, u32)> = Vec::with_capacity(functions.len());
+                for (shard_idx, range) in shard_ranges.iter().enumerate() {
+                    for (local_idx, func) in functions[range.clone()].iter().enumerate() {
+                        shard_entries.push((func.entry, shard_idx as u32, local_idx as u32));
+                    }
+                }
+                write_shard_registration_table(
+                    &options.module,
+                    shard_ranges.len(),
+                    &shard_entries,
+                    &mut writer,
+                )
+            }
+        }
+        .and_then(|()| writer.flush())
+        .map_err(io_error(context.clone()))?;
         drop(writer);
         if options.target.is_native() {
             let text = fs::read_to_string(&registration_path).map_err(io_error(context.clone()))?;
@@ -1392,6 +1680,7 @@ pub fn run_module(
         image_options: options.image,
         target: options.target.clone(),
         memory: options.memory,
+        indirect_dispatch: options.indirect_dispatch,
         files: Vec::new(),
         function_entries: entries,
         report: String::new(),
@@ -1930,6 +2219,17 @@ pub fn render_manifest(r: &PipelineReport) -> String {
         }
         (_, options) => options,
     };
+    // And non-default indirect-call dispatch mode.
+    let options = match (r.indirect_dispatch, options) {
+        (IndirectDispatch::Shard, Json::Obj(mut fields)) => {
+            fields.push((
+                "indirect_dispatch".to_string(),
+                Json::Str(r.indirect_dispatch.as_str().to_string()),
+            ));
+            Json::Obj(fields)
+        }
+        (_, options) => options,
+    };
     let image = obj([
         ("image_base", hex(r.image.image_base)),
         ("entry_point", hex(r.image.entry_point)),
@@ -2146,18 +2446,30 @@ pub fn render_manifest(r: &PipelineReport) -> String {
         ),
         (
             "registration",
-            obj([
-                ("table_symbol", Json::Str(table_symbol)),
-                ("count_symbol", Json::Str(count_symbol)),
-                (
-                    "register_function",
-                    Json::Str(register_function_symbol(&r.module)),
-                ),
-                ("entry_type", Json::Str(REGISTRATION_ENTRY_TYPE.to_string())),
-                ("count", num(d.functions)),
-                ("ll", Json::Str(l.registration_ll.path.clone())),
-                ("obj", opt_file(&l.registration_obj)),
-            ]),
+            {
+                let reg = obj([
+                    ("table_symbol", Json::Str(table_symbol)),
+                    ("count_symbol", Json::Str(count_symbol)),
+                    (
+                        "register_function",
+                        Json::Str(register_function_symbol(&r.module)),
+                    ),
+                    ("entry_type", Json::Str(REGISTRATION_ENTRY_TYPE.to_string())),
+                    ("count", num(d.functions)),
+                    ("ll", Json::Str(l.registration_ll.path.clone())),
+                    ("obj", opt_file(&l.registration_obj)),
+                ]);
+                match (r.indirect_dispatch, reg) {
+                    (IndirectDispatch::Shard, Json::Obj(mut fields)) => {
+                        fields.push((
+                            "shard_dispatch_symbol".to_string(),
+                            Json::Str(shard_dispatch_table_symbol(&r.module)),
+                        ));
+                        Json::Obj(fields)
+                    }
+                    (_, reg) => reg,
+                }
+            },
         ),
     ]);
     let imports = obj([
