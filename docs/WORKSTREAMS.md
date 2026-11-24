@@ -44,12 +44,14 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Analyzes `R9` `build-manifest.json` / `discover --json` outputs to rank top unlifted x86-64 mnemonics and compute entry-point + TLS-callback reachable boot-path coverage.
 - [x] **R16 — Interface-Call Survey Subcommand: Vtable Slot Usage per COM Interface (`recomp/src/survey.rs`)** — `DONE` (PR #249, closes #238) *(no game files required — disjoint file `recomp/src/survey.rs`)*
   - `playgta6-recomp survey-interfaces`: for interface pointers obtained from given sources (an import's out-parameter, a parent interface's vtable slot), report the vtable slots called, call-site counts and inferred argument counts (addresses, GUID constants and counts only).
-- [ ] **R17 — Real-Binary Boot Bring-Up: Iterate the Native Boot to the First D3D12 Device Creation** — `IN PROGRESS` (#271, @Timon-ok) *(M2; game files stay local — repo changes are runtime/recompiler fixes with synthetic regression tests)*
+- [x] **R17 — Real-Binary Boot Bring-Up: Iterate the Native Boot to the First D3D12 Device Creation** — `DONE` (PRs #274–#295, closes #271) *(M2; game files stay local — repo changes are runtime/recompiler fixes with synthetic regression tests)*
   - Run the native boot harness (`R14`) on the real program build in a fix-and-rerun loop: triage each first fault, fix boot/loader/dispatcher/shim defects with regression tests or record the missing piece for its owning task, until the title reaches its first D3D12 device creation.
 - [x] **R18 — Guest-Callable Thunks for Every Catalogued Shim Export: Dynamic `GetProcAddress` Coverage (`recomp/src/stubs/`, `runtime/guest/`)** — `DONE` (PR #289, closes #283) *(no game files required — observed at boot: `GetProcAddress` returns NULL for host shims that are not statically imported)*
   - Generate guest-callable marshaling thunks for every audited, bindable shim in the catalogue, register them with the guest runtime, and make dynamic `GetProcAddress` binding return callable guest addresses.
 - [ ] **R19 — Windowed Guest-Memory Translation: Fit a 16 GiB CPU Window into the wasm64 Guest Pool (prototype + measurements)** — `IN PROGRESS` (#285, @Timon-ok) *(follow-up to O27: the title's CPU window cannot be identity-mapped into the 12 GiB browser pool; option off by default, no ABI change until measured)*
   - Prototype a second translation for one registered address range in the lifter's `guest_ptr` seam (per-64 KiB page table) with pool-backed window pages in the arena, and measure code-size and run-time cost.
+- [ ] **R20 — Real-Binary Boot Bring-Up, Phase 2: Native Boot from Device Creation to the First Presented Frame** — `IN PROGRESS` (#296, @Timon-ok) *(continues R17; local game files only for local runs)*
+  - Iterate the native boot past `D3D12XboxCreateDevice` until the title presents its first frame, fixing each blocker by cause with a synthetic regression test.
 
 ---
 
