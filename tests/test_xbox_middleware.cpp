@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -375,63 +377,60 @@ void test_bink2() {
     CHECK(pg6_mw_bink_start_async_thread(0, nullptr) == 1);
     CHECK(pg6_mw_bink_start_async_thread(1, nullptr) == 1);
 
+    // No decoder. A movie by name is refused (no handle); so is a memory image without a valid
+    // Bink 2 header. The per-movie calls tolerate the null handle a title may still pass.
     Pg6BinkOptions opts{};
     opts.total_size = 123456u;
-    Pg6HBink bink = pg6_mw_bink_open_with_options("movies/intro.bk2", &opts, 0x10u);
-    CHECK(bink != nullptr);
-    CHECK(bink->width == kDefaultBinkWidth);
-    CHECK(bink->height == kDefaultBinkHeight);
-    CHECK(bink->frames == kDefaultBinkFrames);
-    CHECK(bink->frame_num == 1u);
-    CHECK(bink->size == 123456u);
-
+    CHECK(pg6_mw_bink_open_with_options("movies/intro.bk2", &opts, 0x10u) == nullptr);
+    static const uint8_t junk[64] = {'K', 'B', '1', 'j'};
+    CHECK(pg6_mw_bink_open_with_options(reinterpret_cast<const char*>(junk), nullptr, 0x04000000u) == nullptr);
     Pg6BinkFrameBuffers fb{};
-    pg6_mw_bink_get_frame_buffers_info(bink, &fb);
-    CHECK(fb.total_frames == 2);
-    CHECK(fb.ya_buffer_width == bink->width);
-    CHECK(fb.crcb_buffer_width == bink->width / 2u);
-    pg6_mw_bink_register_frame_buffers(bink, &fb);
+    fb.total_frames = 7;
+    pg6_mw_bink_get_frame_buffers_info(nullptr, &fb);
+    CHECK(fb.total_frames == 0);
+    CHECK(pg6_mw_bink_wait(nullptr) == 0);
+    CHECK(pg6_mw_bink_do_frame(nullptr) == 0);
+    pg6_mw_bink_next_frame(nullptr);
+    pg6_mw_bink_close(nullptr);
 
-    // Non-blocking frame advance (sync + async).
-    CHECK(pg6_mw_bink_wait(bink) == 0);
-    CHECK(pg6_mw_bink_should_skip(bink) == 0);
-    CHECK(pg6_mw_bink_do_frame(bink) == 0);
-    CHECK(bink->last_frame_num == 1u);
-    pg6_mw_bink_next_frame(bink);
-    CHECK(bink->frame_num == 2u);
-
-    CHECK(pg6_mw_bink_do_frame_async_multi(bink, threads, 2) == 1);
-    CHECK(pg6_mw_bink_do_frame_async_wait(bink, 1000) == 1);
-    CHECK(bink->last_frame_num == 2u);
-    pg6_mw_bink_next_frame(bink);
-    CHECK(bink->frame_num == 3u);
-
-    // Pause blocks frame advancement and makes BinkWait return 1.
-    CHECK(pg6_mw_bink_pause(bink, 1) == 1);
-    CHECK(pg6_mw_bink_wait(bink) == 1);
-    pg6_mw_bink_next_frame(bink);
-    CHECK(bink->frame_num == 3u);
-    CHECK(pg6_mw_bink_pause(bink, 0) == 0);
-    CHECK(pg6_mw_bink_wait(bink) == 0);
-
-    // Goto + looping vs non-looping end-of-movie behavior.
-    pg6_mw_bink_set_volume(bink, 0u, 16384);
-    CHECK(bink->volume == 16384);
-    CHECK(pg6_mw_bink_get_key_frame(bink, 10u, 0) == 10u);
-    pg6_mw_bink_goto(bink, bink->frames, 0);
-    CHECK(bink->frame_num == bink->frames);
-
-    // Looping enabled: NextFrame wraps back to 1.
-    pg6_mw_bink_set_will_loop(bink, 1);
-    pg6_mw_bink_next_frame(bink);
-    CHECK(bink->frame_num == 1u);
-
-    // Looping disabled: NextFrame clamps at final frame and sets finished.
-    pg6_mw_bink_set_will_loop(bink, 0);
-    pg6_mw_bink_goto(bink, bink->frames, 0);
-    pg6_mw_bink_next_frame(bink);
-    CHECK(bink->frame_num == bink->frames);
-    CHECK(bink->finished == 1);
+    // A movie in memory (BINKFROMMEMORY) opens with its own header: 320x180, 3 frames at 10 fps.
+    // It is not decoded; BinkWait paces it at the real frame rate.
+    uint32_t header[16] = {};
+    std::memcpy(header, "KB2j", 4);
+    header[1] = 1000 - 8;  // file size - 8
+    header[2] = 3;         // frames
+    header[5] = 320;       // width
+    header[6] = 180;       // height
+    header[7] = 10;        // frame rate
+    header[8] = 1;         // frame rate divisor
+    Pg6HBink bink = pg6_mw_bink_open_with_options(reinterpret_cast<const char*>(header), nullptr, 0x04000000u);
+    CHECK(bink != nullptr);
+    if (bink != nullptr) {
+        CHECK(bink->width == 320u && bink->height == 180u && bink->frames == 3u);
+        CHECK(bink->frame_rate == 10u && bink->frame_rate_div == 1u && bink->size == 1000u);
+        CHECK(bink->frame_num == 1u);
+        CHECK(pg6_mw_bink_wait(bink) == 0);  // frame 1 is due at once
+        CHECK(pg6_mw_bink_do_frame(bink) == 0);
+        pg6_mw_bink_set_will_loop(bink, 0);
+        pg6_mw_bink_next_frame(bink);
+        CHECK(bink->frame_num == 2u);
+        CHECK(pg6_mw_bink_wait(bink) == 1);  // frame 2 is due 100 ms after frame 1
+        std::this_thread::sleep_for(std::chrono::milliseconds(130));
+        CHECK(pg6_mw_bink_wait(bink) == 0);
+        // Paused time does not count.
+        CHECK(pg6_mw_bink_pause(bink, 1) == 1);
+        CHECK(pg6_mw_bink_wait(bink) == 1);
+        pg6_mw_bink_next_frame(bink);
+        CHECK(bink->frame_num == 2u);  // no advance while paused
+        CHECK(pg6_mw_bink_pause(bink, 0) == 0);
+        pg6_mw_bink_next_frame(bink);
+        CHECK(bink->frame_num == 3u);
+        CHECK(pg6_mw_bink_wait(bink) == 1);  // frame 3 is due 200 ms after the start
+        // Not looping: the movie ends at its last frame.
+        pg6_mw_bink_next_frame(bink);
+        CHECK(bink->frame_num == 3u && bink->finished == 1);
+        pg6_mw_bink_close(bink);
+    }
 
     uint64_t platform_info = 0xDEADBEEFULL;
     CHECK(pg6_mw_bink_get_platform_info(0, &platform_info) == 1);
@@ -440,7 +439,6 @@ void test_bink2() {
     CHECK(pg6_mw_bink_request_stop_async_threads_multi(threads, 2) == 1);
     CHECK(pg6_mw_bink_wait_stop_async_threads_multi(threads, 2) == 1);
 
-    pg6_mw_bink_close(bink);
     pg6_mw_bink_free_globals();
 }
 

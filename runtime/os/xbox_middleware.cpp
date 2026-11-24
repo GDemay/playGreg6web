@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -187,6 +188,47 @@ std::shared_ptr<HttpCallState> find_hc_call_locked(HttpClientGlobals& g, Pg6HCCa
 // 2. Bink2Scarlett.dll state machine
 // ---------------------------------------------------------------------------
 
+constexpr uint32_t kBinkFromMemory = 0x04000000u;  // BINKFROMMEMORY: `name` is the file image
+
+// The leading fields of a Bink 2 file ("KB2" + version letter), little-endian 32-bit words.
+struct BinkHeader {
+    uint32_t file_size = 0;
+    uint32_t frames = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t frame_rate = 0;
+    uint32_t frame_rate_div = 0;
+};
+
+bool parse_bink2_header(const char* image, BinkHeader* out) {
+    uint32_t w[10] = {};
+    std::memcpy(w, image, sizeof(w));
+    if (std::memcmp(image, "KB2", 3) != 0) {
+        return false;
+    }
+    BinkHeader h;
+    h.file_size = w[1] + 8u;
+    h.frames = w[2];
+    h.width = w[5];
+    h.height = w[6];
+    h.frame_rate = w[7];
+    h.frame_rate_div = w[8];
+    if (h.frames == 0 || h.frames > 10000000u || h.width == 0 || h.width > 16384u || h.height == 0 ||
+        h.height > 16384u || h.frame_rate == 0 || h.frame_rate_div == 0) {
+        return false;
+    }
+    *out = h;
+    return true;
+}
+
+// Real-time pacing of a movie that is not decoded: frame n is due (n - 1) frame periods after
+// `start`, not counting paused time.
+struct BinkClock {
+    std::chrono::steady_clock::time_point start;
+    std::chrono::steady_clock::time_point paused_at;
+    bool paused = false;
+};
+
 struct BinkGlobals {
     std::mutex mutex;
     void* alloc_fn = nullptr;
@@ -196,11 +238,28 @@ struct BinkGlobals {
     uintptr_t sound_param = 0;
     std::unordered_set<int32_t> active_threads;
     std::unordered_set<Pg6HBink> live_handles;
+    uint64_t refused_opens = 0;  // BinkOpenWithOptions calls answered with no movie
+    std::unordered_map<Pg6HBink, BinkClock> clocks;  // playback clock per open movie
 };
 
 BinkGlobals& bink_globals() {
     static BinkGlobals g;
     return g;
+}
+
+// Frame `frame_num` of `bink` becomes due now (after a goto or a loop back to the first frame).
+void restart_clock_locked(BinkGlobals& g, Pg6HBink bink) {
+    const auto it = g.clocks.find(bink);
+    if (it == g.clocks.end() || bink->frame_rate == 0) {
+        return;
+    }
+    const double period = static_cast<double>(bink->frame_rate_div) / static_cast<double>(bink->frame_rate);
+    const auto back = std::chrono::duration<double>(static_cast<double>(bink->frame_num - 1u) * period);
+    it->second.start = std::chrono::steady_clock::now() -
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(back);
+    if (bink->paused != 0) {
+        it->second.paused_at = std::chrono::steady_clock::now();
+    }
 }
 
 bool is_live_bink_locked(const BinkGlobals& g, Pg6HBink bink) {
@@ -1181,29 +1240,43 @@ void pg6_mw_hc_trace_set_etw_enabled(bool enabled) {
 Pg6HBink pg6_mw_bink_open_with_options(const char* name,
                                        const Pg6BinkOptions* options,
                                        uint32_t flags) {
-    if (name == nullptr) {
+    // There is no Bink decoder. A movie handed over in memory (BINKFROMMEMORY) is opened with the
+    // dimensions, frame count and frame rate of its own header and plays out its real duration
+    // (BinkWait paces it); its frame buffers stay blank: nothing is decoded into them. A movie by
+    // file name, or memory without a valid Bink 2 header, is refused as Bink refuses a file it
+    // cannot open: no handle (the title checks it).
+    mw::BinkHeader h{};
+    const bool from_memory = (flags & mw::kBinkFromMemory) != 0;
+    if (name == nullptr || !from_memory || !mw::parse_bink2_header(name, &h)) {
+        auto& g = mw::bink_globals();
+        std::lock_guard<std::mutex> lock(g.mutex);
+        ++g.refused_opens;
+        if (g.refused_opens <= 4) {
+            std::fprintf(stderr, "Bink2: BinkOpenWithOptions(flags 0x%x): %s, movie not opened\n",
+                         static_cast<unsigned>(flags),
+                         from_memory ? "no Bink 2 header in the memory image" : "no decoder for movie files");
+        }
         return nullptr;
     }
     auto* bink = new (std::nothrow) Pg6Bink{};
     if (bink == nullptr) {
         return nullptr;
     }
-    bink->width = mw::kDefaultBinkWidth;
-    bink->height = mw::kDefaultBinkHeight;
-    bink->frames = mw::kDefaultBinkFrames;
+    bink->width = h.width;
+    bink->height = h.height;
+    bink->frames = h.frames;
     bink->frame_num = 1u;
     bink->last_frame_num = 0u;
-    bink->frame_rate = mw::kDefaultBinkFrameRate;
-    bink->frame_rate_div = mw::kDefaultBinkFrameRateDiv;
+    bink->frame_rate = h.frame_rate;
+    bink->frame_rate_div = h.frame_rate_div;
     bink->read_error = 0u;
     bink->open_flags = flags | (options != nullptr ? options->flags : 0u);
-    bink->size = (options != nullptr && options->total_size != 0u) ? options->total_size : 65536u;
+    bink->size = h.file_size;
     bink->paused = 0;
     bink->will_loop = 1;
     bink->finished = 0;
     bink->async_in_progress = 0;
     bink->volume = 32768;
-
     bink->frame_buffers.total_frames = 2;
     bink->frame_buffers.ya_buffer_width = bink->width;
     bink->frame_buffers.ya_buffer_height = bink->height;
@@ -1214,6 +1287,9 @@ Pg6HBink pg6_mw_bink_open_with_options(const char* name,
     auto& g = mw::bink_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
     g.live_handles.insert(bink);
+    g.clocks[bink] = mw::BinkClock{std::chrono::steady_clock::now(), {}, false};
+    std::fprintf(stderr, "Bink2: opened an in-memory movie: %ux%u, %u frames at %u/%u fps (not decoded)\n",
+                 h.width, h.height, h.frames, h.frame_rate, h.frame_rate_div);
     return bink;
 }
 
@@ -1226,6 +1302,7 @@ void pg6_mw_bink_close(Pg6HBink bink) {
     auto it = g.live_handles.find(bink);
     if (it != g.live_handles.end()) {
         g.live_handles.erase(it);
+        g.clocks.erase(bink);
         delete bink;
     }
 }
@@ -1280,6 +1357,7 @@ void pg6_mw_bink_next_frame(Pg6HBink bink) {
         ++bink->frame_num;
     } else if (bink->will_loop != 0) {
         bink->frame_num = 1u;
+        mw::restart_clock_locked(g, bink);
     } else {
         bink->frame_num = bink->frames;
         bink->finished = 1;
@@ -1292,8 +1370,18 @@ int32_t pg6_mw_bink_wait(Pg6HBink bink) {
     if (!mw::is_live_bink_locked(g, bink)) {
         return 0;
     }
-    // Wait only when explicitly paused; otherwise ready immediately so cutscenes never stall.
-    return bink->paused != 0 ? 1 : 0;
+    if (bink->paused != 0) {
+        return 1;
+    }
+    // The next frame is due once its time has come (real time at the movie's frame rate).
+    const auto it = g.clocks.find(bink);
+    if (it == g.clocks.end() || bink->frame_rate == 0) {
+        return 0;
+    }
+    const double period = static_cast<double>(bink->frame_rate_div) / static_cast<double>(bink->frame_rate);
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - it->second.start).count();
+    const double due = static_cast<double>(bink->frame_num > 0 ? bink->frame_num - 1 : 0) * period;
+    return elapsed >= due ? 0 : 1;
 }
 
 int32_t pg6_mw_bink_pause(Pg6HBink bink, int32_t pause) {
@@ -1302,7 +1390,16 @@ int32_t pg6_mw_bink_pause(Pg6HBink bink, int32_t pause) {
     if (!mw::is_live_bink_locked(g, bink)) {
         return 0;
     }
-    bink->paused = (pause != 0) ? 1 : 0;
+    const int32_t now_paused = (pause != 0) ? 1 : 0;
+    if (const auto it = g.clocks.find(bink); it != g.clocks.end() && now_paused != bink->paused) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now_paused != 0) {
+            it->second.paused_at = now;
+        } else {
+            it->second.start += now - it->second.paused_at;
+        }
+    }
+    bink->paused = now_paused;
     return bink->paused;
 }
 
@@ -1319,6 +1416,7 @@ void pg6_mw_bink_goto(Pg6HBink bink, uint32_t frame, int32_t) {
     }
     bink->frame_num = frame;
     bink->finished = 0;
+    mw::restart_clock_locked(g, bink);
 }
 
 uint32_t pg6_mw_bink_get_key_frame(Pg6HBink bink, uint32_t frame, int32_t) {
