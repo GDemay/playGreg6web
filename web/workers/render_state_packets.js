@@ -1402,6 +1402,10 @@ class RenderStatePackets {
         ? options.remappedBindGroupCacheLimit
         : REMAPPED_BIND_GROUP_CACHE_LIMIT;
     this._lastBuiltRenderPipelineAutoLayout = null;
+    // W103: pipeline id -> token for compiles still running in processor.asyncPipelineCache. A
+    // pipeline stays "pending" here until its result is installed, so flushes never see a gap.
+    this.pendingAsyncRenderPipelines = new Map();
+    this.pendingAsyncComputePipelines = new Map();
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
     this.textureMeta = new Map(); // textureId -> { id, requestedFormat, format, bcFallback, usage, width, height }
@@ -1425,6 +1429,9 @@ class RenderStatePackets {
       dynamicOffsetRemaps: 0,
       dynamicOffsetClamps: 0,
       remappedBindGroupEvictions: 0,
+      asyncPipelineCompiles: 0,
+      asyncPipelineFailures: 0,
+      pendingAsyncPipelineSkips: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -1470,6 +1477,9 @@ class RenderStatePackets {
       dynamicOffsetRemaps: this.telemetry.dynamicOffsetRemaps,
       dynamicOffsetClamps: this.telemetry.dynamicOffsetClamps,
       remappedBindGroupEvictions: this.telemetry.remappedBindGroupEvictions,
+      asyncPipelineCompiles: this.telemetry.asyncPipelineCompiles,
+      asyncPipelineFailures: this.telemetry.asyncPipelineFailures,
+      pendingAsyncPipelineSkips: this.telemetry.pendingAsyncPipelineSkips,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -1634,6 +1644,8 @@ class RenderStatePackets {
     this.pipelineLayoutMeta.delete(id);
     this.computePipelineMeta.delete(id);
     this.renderPipelineAutoLayoutMeta.delete(id);
+    this.pendingAsyncRenderPipelines.delete(id);
+    this.pendingAsyncComputePipelines.delete(id);
     this.bindGroupDescriptors.delete(id);
     this._invalidateRemappedBindGroupsForPipeline(id, true);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
@@ -1873,6 +1885,8 @@ class RenderStatePackets {
         `auto-layout-remap:render:${pipeId}:${layoutId}`,
         `render pipeline ${pipeId}: explicit layout ${layoutId} incompatible with WGSL @group(0) bindings; falling back to layout:'auto'`
       );
+    } else {
+      this._lastBuiltRenderPipelineAutoLayout = { autoLayoutRemap: false, wgslBindings };
     }
 
     if (layoutId === 0 || autoLayoutRemap) {
@@ -1908,6 +1922,17 @@ class RenderStatePackets {
     const vsId = view.getUint32(offset + 4, true);
     const fsId = view.getUint32(offset + 8, true);
     const layoutId = view.getUint32(offset + 12, true);
+    const info = {
+      vsId,
+      fsId,
+      layoutId,
+      autoLayoutRemap: Boolean(autoLayoutInfo && autoLayoutInfo.autoLayoutRemap),
+      wgslBindings: autoLayoutInfo && Array.isArray(autoLayoutInfo.wgslBindings) ? autoLayoutInfo.wgslBindings : [],
+    };
+    const asyncCache = this._asyncPipelineCacheFor('render');
+    if (asyncCache) {
+      return this._compileRenderPipelineAsync(asyncCache, id, descriptor, info);
+    }
     let pipeline;
     try {
       pipeline = this.device.createRenderPipeline(descriptor);
@@ -1917,14 +1942,122 @@ class RenderStatePackets {
       )}`;
       return false;
     }
+    this._installRenderPipeline(id, pipeline, descriptor, info);
+    return true;
+  }
+
+  // ---- W103: async pipeline compilation (processor.asyncPipelineCache) ----
+
+  /**
+   * The processor's AsyncPipelineCache when `kind` pipelines can compile asynchronously on this
+   * device, else null (mock devices without create*PipelineAsync keep the synchronous path).
+   */
+  _asyncPipelineCacheFor(kind) {
+    const cache = this.processor && this.processor.asyncPipelineCache;
+    if (!cache || typeof cache.compileRenderPipeline !== 'function' || typeof cache.compileComputePipeline !== 'function') {
+      return null;
+    }
+    const method = kind === 'compute' ? 'createComputePipelineAsync' : 'createRenderPipelineAsync';
+    return this.device && typeof this.device[method] === 'function' ? cache : null;
+  }
+
+  isAsyncPipelinePending(id, isCompute) {
+    return (isCompute ? this.pendingAsyncComputePipelines : this.pendingAsyncRenderPipelines).has(id);
+  }
+
+  /**
+   * Queue `descriptor` on the async cache; the pipeline is installed when the compile resolves.
+   * Returns true: the packet is well formed and compile failures are reported asynchronously.
+   *
+   * @param {object} asyncCache
+   * @param {'render' | 'compute'} kind
+   * @param {number} id
+   * @param {object} descriptor
+   * @param {object | null} fallbackDescriptor - retried once (layout:'auto') if `descriptor` rejects.
+   * @param {(pipeline: object, retried: boolean) => void} install
+   */
+  _compilePipelineAsync(asyncCache, kind, id, descriptor, fallbackDescriptor, install) {
+    const isCompute = kind === 'compute';
+    const pending = isCompute ? this.pendingAsyncComputePipelines : this.pendingAsyncRenderPipelines;
+    const live = isCompute ? this.processor.computePipelines : this.processor.pipelines;
+    // A re-created id must never draw with its previous pipeline or receive an older compile.
+    if (typeof asyncCache.delete === 'function') asyncCache.delete(id);
+    if (live && typeof live.delete === 'function') live.delete(id);
+    const token = {};
+    pending.set(id, token);
+    this.telemetry.asyncPipelineCompiles += 1;
+    const compile = isCompute ? asyncCache.compileComputePipeline : asyncCache.compileRenderPipeline;
+    let promise;
+    try {
+      promise = Promise.resolve(compile.call(asyncCache, id, descriptor, { fallbackDescriptor }));
+    } catch (err) {
+      promise = Promise.resolve({ id, status: 'failed', error: err });
+    }
+    promise.then(
+      (result) => this._onAsyncPipelineSettled(kind, id, token, result, install),
+      (err) => this._onAsyncPipelineSettled(kind, id, token, { id, status: 'failed', error: err }, install)
+    );
+    return true;
+  }
+
+  _onAsyncPipelineSettled(kind, id, token, result, install) {
+    const pending = kind === 'compute' ? this.pendingAsyncComputePipelines : this.pendingAsyncRenderPipelines;
+    if (pending.get(id) !== token) return; // destroyed or re-created meanwhile
+    pending.delete(id);
+    const status = result && result.status;
+    if (status === 'stale' || status === 'deleted') return; // device reset / resource destroyed
+    if (status === 'ready' && result.pipeline) {
+      try {
+        install(result.pipeline, Boolean(result.retried));
+      } catch (err) {
+        this._recordAsyncPipelineFailure(kind, id, err);
+      }
+      return;
+    }
+    this._recordAsyncPipelineFailure(kind, id, result && result.error);
+  }
+
+  _recordAsyncPipelineFailure(kind, id, err) {
+    const message = `${kind} pipeline ${id}: ${String(err && err.message ? err.message : err || 'async compile failed')}`;
+    this.telemetry.asyncPipelineFailures += 1;
+    this.stats.errors += 1;
+    this.lastError = message;
+    this._recordTelemetryWarningOnce(`async-pipeline-failed:${kind}:${id}`, message);
+  }
+
+  _compileRenderPipelineAsync(asyncCache, id, descriptor, info) {
+    // Explicit root-signature layout first; if Dawn rejects it asynchronously, retry with
+    // layout:'auto' and remap group 0 at flush time like the synchronous mismatch path does.
+    const fallbackDescriptor =
+      !info.autoLayoutRemap && descriptor.layout !== 'auto' && info.wgslBindings.length > 0
+        ? { ...descriptor, layout: 'auto' }
+        : null;
+    return this._compilePipelineAsync(asyncCache, 'render', id, descriptor, fallbackDescriptor, (pipeline, retried) => {
+      const usedFallback = retried && fallbackDescriptor !== null;
+      if (usedFallback) {
+        this.telemetry.autoLayoutFallbacks += 1;
+        this._recordTelemetryWarningOnce(
+          `async-auto-layout:render:${id}:${info.layoutId}`,
+          `render pipeline ${id}: explicit layout ${info.layoutId} rejected by async compile; using layout:'auto'`
+        );
+      }
+      this._installRenderPipeline(id, pipeline, usedFallback ? fallbackDescriptor : descriptor, {
+        ...info,
+        autoLayoutRemap: info.autoLayoutRemap || usedFallback,
+      });
+    });
+  }
+
+  _installRenderPipeline(id, pipeline, descriptor, info) {
+    const { vsId, fsId, layoutId } = info;
     this.processor.pipelines.set(id, pipeline);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
-    if (autoLayoutInfo && autoLayoutInfo.autoLayoutRemap) {
+    if (info.autoLayoutRemap) {
       this.renderPipelineAutoLayoutMeta.set(id, {
         id,
         layoutId,
         autoLayoutRemap: true,
-        wgslBindings: autoLayoutInfo.wgslBindings,
+        wgslBindings: info.wgslBindings,
       });
     } else {
       this.renderPipelineAutoLayoutMeta.delete(id);
@@ -1986,7 +2119,6 @@ class RenderStatePackets {
     if (typeof this.processor._invalidateSpecializedPipelinesFor === 'function') {
       this.processor._invalidateSpecializedPipelinesFor(id);
     }
-    return true;
   }
 
   _inspectComputeShaderEntryPoint(cs, csId) {
@@ -2031,34 +2163,62 @@ class RenderStatePackets {
         `compute pipeline ${id}: explicit layout ${layoutId} incompatible with WGSL @group(0) bindings; falling back to layout:'auto'`
       );
     }
-    let pipeline;
-    try {
-      pipeline = this.device.createComputePipeline({
-        layout,
-        compute: { module: cs.module, entryPoint: csEntryPoint },
-      });
-    } catch (err) {
-      this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
-      return false;
-    }
-    if (layoutId === 0 || autoLayoutRemap) {
-      this.telemetry.autoLayoutFallbacks += 1;
-    } else if (layoutMeta && layoutMeta.isSingleGroup0) {
-      this.telemetry.rootSigGroup0Layouts += 1;
-    }
-    this.processor.computePipelines.set(id, pipeline);
-    this._invalidateRemappedBindGroupsForPipeline(id, true);
-    this.computePipelineMeta.set(id, {
-      id,
+    const descriptor = { layout, compute: { module: cs.module, entryPoint: csEntryPoint } };
+    const info = {
       csId,
       layoutId,
       entryPoint: csEntryPoint,
       hasComputeAttr,
       autoLayoutRemap,
       wgslBindings,
+      isSingleGroup0Layout: Boolean(layoutMeta && layoutMeta.isSingleGroup0),
+    };
+    const asyncCache = this._asyncPipelineCacheFor('compute');
+    if (asyncCache) {
+      const fallbackDescriptor =
+        !autoLayoutRemap && layout !== 'auto' && wgslBindings.length > 0
+          ? { ...descriptor, layout: 'auto' }
+          : null;
+      return this._compilePipelineAsync(asyncCache, 'compute', id, descriptor, fallbackDescriptor, (pipeline, retried) => {
+        const usedFallback = retried && fallbackDescriptor !== null;
+        if (usedFallback) {
+          this._recordTelemetryWarningOnce(
+            `async-auto-layout:compute:${id}:${layoutId}`,
+            `compute pipeline ${id}: explicit layout ${layoutId} rejected by async compile; using layout:'auto'`
+          );
+        }
+        this._installComputePipeline(id, pipeline, { ...info, autoLayoutRemap: autoLayoutRemap || usedFallback });
+      });
+    }
+    let pipeline;
+    try {
+      pipeline = this.device.createComputePipeline(descriptor);
+    } catch (err) {
+      this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
+      return false;
+    }
+    this._installComputePipeline(id, pipeline, info);
+    return true;
+  }
+
+  _installComputePipeline(id, pipeline, info) {
+    if (info.layoutId === 0 || info.autoLayoutRemap) {
+      this.telemetry.autoLayoutFallbacks += 1;
+    } else if (info.isSingleGroup0Layout) {
+      this.telemetry.rootSigGroup0Layouts += 1;
+    }
+    this.processor.computePipelines.set(id, pipeline);
+    this._invalidateRemappedBindGroupsForPipeline(id, true);
+    this.computePipelineMeta.set(id, {
+      id,
+      csId: info.csId,
+      layoutId: info.layoutId,
+      entryPoint: info.entryPoint,
+      hasComputeAttr: info.hasComputeAttr,
+      autoLayoutRemap: info.autoLayoutRemap,
+      wgslBindings: info.wgslBindings,
     });
     this.telemetry.computePipelineCount += 1;
-    return true;
   }
 
   _handleV1CreateComputePipeline(origHandler, view, payloadOffset) {
@@ -2068,6 +2228,9 @@ class RenderStatePackets {
     let inspected = null;
     if (cs) {
       inspected = this._inspectComputeShaderEntryPoint(cs, csId);
+    }
+    if (cs && this._handleV1CreateComputePipelineAsync(id, csId, cs, inspected, view, payloadOffset)) {
+      return;
     }
     const prevPipeline =
       this.processor && this.processor.computePipelines ? this.processor.computePipelines.get(id) : undefined;
@@ -2096,6 +2259,61 @@ class RenderStatePackets {
       });
       this.telemetry.computePipelineCount += 1;
     }
+  }
+
+  /**
+   * W103: compile a v1 CreateComputePipeline through the async cache. Only pipelines with a
+   * reflected explicit layout go async (v1 CreateBindGroup resolves their layouts while pending);
+   * 'auto'-layout ones stay synchronous. Returns true when the packet was handled here.
+   */
+  _handleV1CreateComputePipelineAsync(id, csId, cs, inspected, view, payloadOffset) {
+    const proc = this.processor;
+    const asyncCache = this._asyncPipelineCacheFor('compute');
+    if (
+      !asyncCache ||
+      typeof proc._buildComputePipelineDescriptorV1 !== 'function' ||
+      typeof proc._registerComputePipelineV1 !== 'function'
+    ) {
+      return false;
+    }
+    let built;
+    try {
+      built = proc._buildComputePipelineDescriptorV1(view, payloadOffset);
+    } catch (err) {
+      this._packetError = `compute pipeline ${id}: ${String(err && err.message ? err.message : err)}`;
+      this._recordTelemetryWarningOnce(`v1-compute-create-fail:${id}`, `compute pipeline ${id} creation failed`);
+      return true;
+    }
+    if (!built || !built.reflected) return false;
+    const csSource = getShaderSourceText(cs);
+    const wgslBindings = csSource ? parseWgslGroup0Bindings(csSource) : [];
+    const descriptor = built.descriptor;
+    const fallbackDescriptor = wgslBindings.length > 0 ? { ...descriptor, layout: 'auto' } : null;
+    this._compilePipelineAsync(asyncCache, 'compute', id, descriptor, fallbackDescriptor, (pipeline, retried) => {
+      const usedFallback = retried && fallbackDescriptor !== null;
+      if (usedFallback) {
+        // The reflected layouts no longer describe this pipeline; use its 'auto' layouts.
+        if (proc._computePipelineBindGroupLayouts) proc._computePipelineBindGroupLayouts.delete(id);
+        this.telemetry.autoLayoutFallbacks += 1;
+        this._recordTelemetryWarningOnce(
+          `async-auto-layout:compute:${id}:v1`,
+          `compute pipeline ${id}: reflected layout rejected by async compile; using layout:'auto'`
+        );
+      }
+      proc._registerComputePipelineV1(id, pipeline);
+      this._invalidateRemappedBindGroupsForPipeline(id, true);
+      this.computePipelineMeta.set(id, {
+        id,
+        csId,
+        layoutId: 0,
+        entryPoint: inspected ? inspected.entryPoint : DEFAULT_ENTRY_POINTS.compute,
+        hasComputeAttr: Boolean(inspected && inspected.hasComputeAttr),
+        autoLayoutRemap: usedFallback,
+        wgslBindings: usedFallback ? wgslBindings : [],
+      });
+      this.telemetry.computePipelineCount += 1;
+    });
+    return true;
   }
 
   _resolveBindGroupDescriptor(bindGroupId) {
@@ -2431,6 +2649,9 @@ class RenderStatePackets {
     let activeRenderAutoLayout = null;
     let group0BoundForRender = false;
     let lastRenderGroup0 = null;
+    // W103: the bound pipeline is still compiling asynchronously; skip its draws/dispatches.
+    let activeRenderPending = false;
+    let activeComputePending = false;
 
     let modified = false;
     const filtered = [];
@@ -2475,6 +2696,8 @@ class RenderStatePackets {
         activeRenderAutoLayout = null;
         group0BoundForRender = false;
         lastRenderGroup0 = null;
+        activeRenderPending = false;
+        activeComputePending = false;
         filtered.push(cmd);
         continue;
       }
@@ -2487,7 +2710,16 @@ class RenderStatePackets {
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
         lastComputeGroup0 = null;
+        activeComputePending = false;
         activeRenderPipelineId = cmd.pipelineId;
+        activeRenderPending = this.isAsyncPipelinePending(cmd.pipelineId, false);
+        if (activeRenderPending) {
+          // Never bind an undefined pipeline; its draws are dropped until the compile resolves.
+          activeRenderAutoLayout = null;
+          group0BoundForRender = false;
+          modified = true;
+          continue;
+        }
         const rMeta = this.renderPipelineAutoLayoutMeta.get(cmd.pipelineId) || null;
         activeRenderAutoLayout = rMeta && rMeta.autoLayoutRemap ? rMeta : null;
         group0BoundForRender = false;
@@ -2501,8 +2733,17 @@ class RenderStatePackets {
         activeRenderAutoLayout = null;
         group0BoundForRender = false;
         lastRenderGroup0 = null;
+        activeRenderPending = false;
         hadExplicitSetComputePipeline = true;
         activeComputePipelineId = cmd.pipelineId;
+        activeComputePending = this.isAsyncPipelinePending(cmd.pipelineId, true);
+        if (activeComputePending) {
+          activeComputePipelineValid = false;
+          activeComputeAutoLayout = null;
+          group0BoundForCompute = false;
+          modified = true;
+          continue;
+        }
         activeComputePipelineValid = Boolean(
           this.processor.computePipelines && this.processor.computePipelines.has(cmd.pipelineId)
         );
@@ -2619,6 +2860,12 @@ class RenderStatePackets {
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
         lastComputeGroup0 = null;
+        activeComputePending = false;
+        if (activeRenderPending) {
+          this.telemetry.pendingAsyncPipelineSkips += 1;
+          modified = true;
+          continue;
+        }
         if (activeRenderAutoLayout && !group0BoundForRender) {
           const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
           const src = lastRenderGroup0 || { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: [] };
@@ -2645,6 +2892,11 @@ class RenderStatePackets {
       }
 
       if (cmd.type === 'dispatchCompute') {
+        if (activeComputePending) {
+          this.telemetry.pendingAsyncPipelineSkips += 1;
+          modified = true;
+          continue;
+        }
         if (hadExplicitSetComputePipeline && !activeComputePipelineValid) {
           this.telemetry.skippedComputeDispatchCount += 1;
           this._recordTelemetryWarningOnce(

@@ -1232,6 +1232,9 @@ async function requestNegotiatedDevice(adapter) {
   return { device, enabledFeatures };
 }
 
+// W103: concurrent create{Render,Compute}PipelineAsync compiles allowed in flight (async_pipeline_cache.js).
+const DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES = 4;
+
 // W100: bounded WebGPU device-loss recovery.
 const MAX_DEVICE_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_DEVICE_RECOVERY_MIN_INTERVAL_MS = 1000;
@@ -1446,6 +1449,33 @@ class WgpuCommandProcessor {
 
     // Optional WebGpuPipelineCache for reflection layout deduplication
     this.pipelineCache = options.pipelineCache || null;
+
+    // W103: bounded-concurrency async PSO compilation. render_state_packets.js routes
+    // CreateRenderPipeline2 / CreateComputePipeline2 / v1 CreateComputePipeline through it when the
+    // device exposes create*PipelineAsync, so a burst of pipelines no longer stalls the GPU process.
+    this._pendingAsyncPipelineSkips = 0;
+    this.asyncPipelineCache = null;
+    if (options.asyncPipelineCache && typeof options.asyncPipelineCache === 'object') {
+      this.asyncPipelineCache = options.asyncPipelineCache;
+    } else if (options.enableAsyncPipelines !== false) {
+      const AsyncPipelineCacheCtor = resolveSubsystemCtor(
+        options.AsyncPipelineCache,
+        'PlayGta6AsyncPipelineCache',
+        'AsyncPipelineCache',
+        './async_pipeline_cache.js'
+      );
+      if (AsyncPipelineCacheCtor) {
+        this.asyncPipelineCache = new AsyncPipelineCacheCtor({
+          device,
+          maxConcurrent:
+            Number.isInteger(options.maxConcurrentPipelineCompiles) &&
+            options.maxConcurrentPipelineCompiles >= 1
+              ? options.maxConcurrentPipelineCompiles
+              : DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
+          logger: this._logger ? this._createAsyncPipelineLogger() : null,
+        });
+      }
+    }
 
     // Saved subsystem options / constructors for lazy construction where supported
     this._reflectionRegistryOptions = options.reflectionRegistryOptions || null;
@@ -1970,6 +2000,9 @@ class WgpuCommandProcessor {
     this.device = newDevice;
     if (opts && typeof opts.format === 'string' && opts.format.length > 0) {
       this.format = opts.format;
+    }
+    if (this.asyncPipelineCache && this.asyncPipelineCache.device !== newDevice) {
+      this._resetAsyncPipelineCache(newDevice);
     }
     this._specializedFallbackPipelines.clear();
     this._specializedFallbackBindGroups.clear();
@@ -3386,6 +3419,76 @@ class WgpuCommandProcessor {
     return this._deviceRecovering;
   }
 
+  /** W103: adapt the processor logger to AsyncPipelineCache's { warn, debug }(message, detail). */
+  _createAsyncPipelineLogger() {
+    const log = (level) => (message, detail) => {
+      const suffix = detail && typeof detail.message === 'string' ? `: ${detail.message}` : '';
+      this._logDiagnostic(level, `[wgpu_worker] ${message}${suffix}`);
+    };
+    return { warn: log('warn'), debug: log('debug') };
+  }
+
+  /** W103: point the async pipeline cache at `device`, settling pending compiles as stale. */
+  _resetAsyncPipelineCache(device) {
+    const cache = this.asyncPipelineCache;
+    if (!cache || typeof cache.reset !== 'function') {
+      return;
+    }
+    try {
+      cache.reset(device || null);
+    } catch (err) {
+      this._logDiagnostic(
+        'warn',
+        `[wgpu_worker] async pipeline cache reset failed: ${sanitizeGpuErrorDetail(err)}`
+      );
+    }
+  }
+
+  /**
+   * W103: whether pipeline `id` is still compiling asynchronously (draws/dispatches that use it
+   * are skipped without a validation error until it is ready).
+   *
+   * @param {number} id
+   * @returns {boolean}
+   */
+  isAsyncPipelinePending(id) {
+    const cache = this.asyncPipelineCache;
+    if (!cache || typeof cache.isPending !== 'function') {
+      return false;
+    }
+    try {
+      return cache.isPending(id) === true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * W103: AsyncPipelineCache counters plus draws/dispatches skipped while a pipeline compiled,
+   * or null when async pipeline compilation is disabled.
+   */
+  getAsyncPipelineStats() {
+    const cache = this.asyncPipelineCache;
+    if (!cache || typeof cache.getStats !== 'function') {
+      return null;
+    }
+    let stats;
+    try {
+      stats = cache.getStats();
+    } catch (_) {
+      return null;
+    }
+    let renderStateSkips = 0;
+    const ext = this.extension;
+    if (ext && ext.telemetry && Number.isInteger(ext.telemetry.pendingAsyncPipelineSkips)) {
+      renderStateSkips = ext.telemetry.pendingAsyncPipelineSkips;
+    }
+    return {
+      ...(stats && typeof stats === 'object' ? stats : {}),
+      pendingAsyncPipelineSkips: this._pendingAsyncPipelineSkips + renderStateSkips,
+    };
+  }
+
   /**
    * W100: sanitized device-loss telemetry counters.
    */
@@ -3575,6 +3678,8 @@ class WgpuCommandProcessor {
     const options = opts && typeof opts === 'object' ? opts : {};
     this._deviceGeneration += 1;
     this._resetDeviceResources();
+    // W103: drop in-flight compiles of the dead device; late results are discarded as stale.
+    this._resetAsyncPipelineCache(newDevice);
     if (newCtx && typeof newCtx === 'object') {
       this.ctx = newCtx;
     }
@@ -4553,12 +4658,25 @@ class WgpuCommandProcessor {
   }
 
   _handleCreateComputePipeline(view, payloadOffset) {
+    const built = this._buildComputePipelineDescriptorV1(view, payloadOffset);
+    if (!built) return;
+    const pipeline = this.device.createComputePipeline(built.descriptor);
+    this._registerComputePipelineV1(built.id, pipeline);
+  }
+
+  /**
+   * Decode a v1 CreateComputePipeline payload into a descriptor (reflected explicit layout when
+   * available, else 'auto'). Records the reflected bind group layouts for getBindGroupLayout().
+   *
+   * @returns {{ id: number, csShaderId: number, reflected: boolean, descriptor: GPUComputePipelineDescriptor } | null}
+   */
+  _buildComputePipelineDescriptorV1(view, payloadOffset) {
     const id = view.getUint32(payloadOffset, true);
     const csShaderId = view.getUint32(payloadOffset + 4, true);
     // Reserved flags at payloadOffset + 8 and reserved at payloadOffset + 12.
 
     const csEntry = this.shaderModules.get(csShaderId);
-    if (!csEntry) return;
+    if (!csEntry) return null;
 
     const csRefl = this._resolveShaderReflection(csShaderId, csEntry, 'compute');
     const reflected = csRefl
@@ -4570,13 +4688,21 @@ class WgpuCommandProcessor {
       this._computePipelineBindGroupLayouts.delete(id);
     }
 
-    const pipeline = this.device.createComputePipeline({
-      layout: reflected ? reflected.pipelineLayout : 'auto',
-      compute: {
-        module: csEntry.module,
-        entryPoint: csRefl && csRefl.entryPoint ? csRefl.entryPoint : 'cs_main',
+    return {
+      id,
+      csShaderId,
+      reflected: Boolean(reflected),
+      descriptor: {
+        layout: reflected ? reflected.pipelineLayout : 'auto',
+        compute: {
+          module: csEntry.module,
+          entryPoint: csRefl && csRefl.entryPoint ? csRefl.entryPoint : 'cs_main',
+        },
       },
-    });
+    };
+  }
+
+  _registerComputePipelineV1(id, pipeline) {
     this.computePipelines.set(id, pipeline);
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('computePipeline', id, pipeline, {
@@ -4611,8 +4737,14 @@ class WgpuCommandProcessor {
         renderStateExt && renderStateExt.bindGroupLayouts
           ? renderStateExt.bindGroupLayouts.get(pipelineId)
           : null;
+      const pendingLayout =
+        bglRec && bglRec.layout
+          ? null
+          : this._pendingAsyncPipelineBindGroupLayout(pipelineId, groupIndex);
       if (bglRec && bglRec.layout) {
         layout = bglRec.layout;
+      } else if (pendingLayout) {
+        layout = pendingLayout;
       } else {
         this._recordOpValidationError(
           'CreateBindGroup',
@@ -4999,7 +5131,21 @@ class WgpuCommandProcessor {
     this._pipelineBindGroupLayouts.delete(id);
     this._computePipelineBindGroupLayouts.delete(id);
     this._shaderReflectionKeys.delete(id);
+    if (this.asyncPipelineCache && typeof this.asyncPipelineCache.delete === 'function') {
+      this.asyncPipelineCache.delete(id);
+    }
     if (this.extension) this.extension.destroyResource(id);
+  }
+
+  /** W103: reflected bind group layout of a pipeline that is still compiling asynchronously. */
+  _pendingAsyncPipelineBindGroupLayout(pipelineId, groupIndex) {
+    if (!this.isAsyncPipelinePending(pipelineId)) {
+      return null;
+    }
+    const reflected =
+      this._pipelineBindGroupLayouts.get(pipelineId) ||
+      this._computePipelineBindGroupLayouts.get(pipelineId);
+    return reflected && reflected[groupIndex] ? reflected[groupIndex] : null;
   }
 
   _flushPresent() {
@@ -5180,6 +5326,11 @@ class WgpuCommandProcessor {
       const activePipeline =
         activePipelineId !== null ? this.pipelines.get(activePipelineId) || null : null;
       if (activePipelineId !== null && !activePipeline && specializedActiveKey === null) {
+        if (this.isAsyncPipelinePending(activePipelineId)) {
+          // W103: still compiling; draw normally on a later frame once it is ready.
+          this._pendingAsyncPipelineSkips += 1;
+          return;
+        }
         this._skippedDrawCount += 1;
         this._recordOpValidationError(
           drawOpName,
@@ -5232,7 +5383,7 @@ class WgpuCommandProcessor {
             } catch (err) {
               this._recordOpValidationError('SetPipeline', err);
             }
-          } else {
+          } else if (!this.isAsyncPipelinePending(cmd.pipelineId)) {
             this._recordOpValidationError(
               'SetPipeline',
               `render pipeline ${cmd.pipelineId} not found`
@@ -5882,6 +6033,8 @@ class WgpuCommandProcessor {
       return;
     }
     this._destroyed = true;
+    // W103: settle queued/in-flight pipeline compiles so nothing writes into a torn-down processor.
+    this._resetAsyncPipelineCache(null);
     // W100: intentional teardown — never treat the subsequent `device.lost` as a loss.
     this._deviceLossListener = null;
     this._deviceRecovering = false;
@@ -6300,8 +6453,55 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     snapshot.renderStateStats = renderStateStats;
     // W100: WebGPU device-loss / recovery counters (zeros when the processor lacks them).
     snapshot.deviceStats = resolveDeviceLossTelemetry(processor, stats);
+    // W103: async pipeline compile queue counters (null when async compilation is disabled).
+    snapshot.asyncPipelineStats = resolveAsyncPipelineTelemetry(processor);
   }
   return snapshot;
+}
+
+const ASYNC_PIPELINE_TELEMETRY_KEYS = Object.freeze([
+  'generation',
+  'maxConcurrent',
+  'queued',
+  'inFlight',
+  'peakQueueDepth',
+  'compiled',
+  'failed',
+  'dedupeHits',
+  'syncFallbacks',
+  'autoLayoutRetries',
+  'discardedStale',
+  'pendingAsyncPipelineSkips',
+]);
+
+/**
+ * W103: sanitized AsyncPipelineCache counters, or null when the processor has no async cache.
+ *
+ * @returns {object | null}
+ */
+function resolveAsyncPipelineTelemetry(processor) {
+  let raw = null;
+  try {
+    if (typeof processor.getAsyncPipelineStats === 'function') {
+      raw = processor.getAsyncPipelineStats();
+    } else if (
+      processor.asyncPipelineCache &&
+      typeof processor.asyncPipelineCache.getStats === 'function'
+    ) {
+      raw = processor.asyncPipelineCache.getStats();
+    }
+  } catch (_) {
+    raw = null;
+  }
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const out = {};
+  for (let i = 0; i < ASYNC_PIPELINE_TELEMETRY_KEYS.length; i += 1) {
+    const key = ASYNC_PIPELINE_TELEMETRY_KEYS[i];
+    out[key] = toNonNegativeInt(raw[key], 0);
+  }
+  return out;
 }
 
 /**
