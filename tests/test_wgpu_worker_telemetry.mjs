@@ -376,6 +376,8 @@ test('G30 buildGpuTelemetrySnapshot returns exact shape compatible with GpuBootP
     framesPresented: 1,
     droppedFrames: 0,
     drawCalls: 1,
+    realPackDrawCount: 0,
+    fallbackDrawCount: 1,
     computeDispatches: 1,
     packetsProcessed: 12,
   });
@@ -443,6 +445,8 @@ test('G30 buildGpuTelemetrySnapshot sanitizes missingShaders, enforces limit, an
       framesPresented: 0,
       droppedFrames: 0,
       drawCalls: 0,
+      realPackDrawCount: 0,
+      fallbackDrawCount: 0,
       computeDispatches: 0,
       packetsProcessed: 0,
     },
