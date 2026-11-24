@@ -1,19 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const routerMod = require('../web/workers/shader_fallback_router.js');
+const ROUTER_PATH = fileURLToPath(new URL('../web/workers/shader_fallback_router.js', import.meta.url));
 
 const {
   SHADER_STAGE,
   STAGE_NAMES,
   BUILTIN_FALLBACK_WGSL,
+  BUILTIN_FALLBACK_PROFILES,
   DEFAULT_ENTRY_POINTS,
   DEFAULT_MAX_TRACKED_MISSING,
   normalizeShaderHash,
   formatShaderHash,
   normalizeStage,
+  normalizeFallbackProfile,
+  getBuiltInFallbackProfiles,
   ShaderFallbackRouter,
 } = routerMod;
 
@@ -427,4 +434,264 @@ test('constructor validates options and setPackLoader / setFallbackHashes update
   router.setFallbackHashes(null);
   hit = router.resolve('0x0303030303030303', 'vertex');
   assert.equal(hit.source, 'builtin');
+});
+
+// ---------------------------------------------------------------------------
+// G34 Frame-1 fallback WGSL profiles (fullscreen_triangle_cbv & textured_quad_24b)
+// ---------------------------------------------------------------------------
+
+function assertBalancedWgslDelimiters(wgsl, label) {
+  let braces = 0;
+  let parens = 0;
+  for (let i = 0; i < wgsl.length; i += 1) {
+    const ch = wgsl[i];
+    if (ch === '{') braces += 1;
+    else if (ch === '}') braces -= 1;
+    else if (ch === '(') parens += 1;
+    else if (ch === ')') parens -= 1;
+    assert.ok(braces >= 0, `${label}: unmatched '}' at index ${i}`);
+    assert.ok(parens >= 0, `${label}: unmatched ')' at index ${i}`);
+  }
+  assert.equal(braces, 0, `${label}: unbalanced curly braces`);
+  assert.equal(parens, 0, `${label}: unbalanced parentheses`);
+}
+
+test('G34 getBuiltInFallbackProfiles returns sanitized, mutation-isolated map of all fallback profiles', () => {
+  assert.equal(typeof getBuiltInFallbackProfiles, 'function');
+  assert.equal(typeof ShaderFallbackRouter.getBuiltInFallbackProfiles, 'function');
+  assert.ok(BUILTIN_FALLBACK_PROFILES && Object.isFrozen(BUILTIN_FALLBACK_PROFILES));
+
+  const profiles = getBuiltInFallbackProfiles();
+  assert.deepEqual(Object.keys(profiles).sort(), [
+    'default',
+    'fullscreen_triangle_cbv',
+    'textured_quad_24b',
+  ]);
+
+  // Default profile matches legacy BUILTIN_FALLBACK_WGSL verbatim.
+  assert.equal(profiles.default.vertex, BUILTIN_FALLBACK_WGSL.vertex);
+  assert.equal(profiles.default.fragment, BUILTIN_FALLBACK_WGSL.fragment);
+  assert.equal(profiles.default.compute, BUILTIN_FALLBACK_WGSL.compute);
+
+  // Every profile provides valid WGSL for every stage and is JSON-serializable.
+  for (const [name, stages] of Object.entries(profiles)) {
+    for (const stage of ['vertex', 'fragment', 'compute']) {
+      assertValidWgsl(stages[stage], stage);
+      assertBalancedWgslDelimiters(stages[stage], `${name}.${stage}`);
+    }
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(profiles)), profiles);
+
+  // Instance method returns the same catalog and mutating returned copy does not corrupt router state.
+  const router = new ShaderFallbackRouter();
+  const instanceProfiles = router.getBuiltInFallbackProfiles();
+  assert.deepEqual(instanceProfiles, profiles);
+  instanceProfiles.fullscreen_triangle_cbv.vertex = 'CORRUPTED';
+  instanceProfiles.injected = { vertex: 'bad' };
+
+  const fresh = getBuiltInFallbackProfiles();
+  assert.equal(fresh.injected, undefined);
+  assert.equal(fresh.fullscreen_triangle_cbv.vertex, profiles.fullscreen_triangle_cbv.vertex);
+  assert.equal(
+    router.resolve('0x123456789abcdef0', 'vertex', { profile: 'fullscreen_cbv' }).wgsl,
+    profiles.fullscreen_triangle_cbv.vertex
+  );
+});
+
+test('G34 fullscreen_triangle_cbv WGSL pair matches Frame-1 DrawInstanced(3,1) + group(0) binding(0) CBV', () => {
+  const { fullscreen_triangle_cbv: pair } = getBuiltInFallbackProfiles();
+
+  // Vertex shader: @builtin(vertex_index) vid: u32 + FrameCbv uniform at group(0) binding(0).
+  assert.match(pair.vertex, /struct\s+FrameCbv\s*\{\s*data:\s*array<vec4<f32>,\s*16>,?\s*\};?/);
+  assert.match(pair.vertex, /@group\(0\)\s+@binding\(0\)\s+var<uniform>\s+frame_cbv:\s*FrameCbv;/);
+  assert.match(pair.vertex, /@vertex\b/);
+  assert.match(pair.vertex, /fn\s+vs_main\(@builtin\(vertex_index\)\s+vid:\s*u32\)/);
+  assert.match(pair.vertex, /@builtin\(position\)/);
+  assert.match(pair.vertex, /@location\(0\)\s+uv:\s*vec2<f32>/);
+  // Statically references frame_cbv so WebGPU auto-layout preserves group(0) binding(0).
+  assert.match(pair.vertex, /frame_cbv\.data\[0\]/);
+  // Wraps vertex_index modulo 3 so draws with >3 vertices never OOB-index.
+  assert.match(pair.vertex, /vid\s*%\s*3u/);
+
+  // Fragment shader: matching FrameCbv uniform + @location(0) uv + NaN-safe CBV modulation + alpha 1.0.
+  assert.match(pair.fragment, /struct\s+FrameCbv\s*\{\s*data:\s*array<vec4<f32>,\s*16>,?\s*\};?/);
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(0\)\s+var<uniform>\s+frame_cbv:\s*FrameCbv;/);
+  assert.match(pair.fragment, /@fragment\b/);
+  assert.match(pair.fragment, /fn\s+fs_main\(/);
+  assert.match(pair.fragment, /@location\(0\)\s+uv:\s*vec2<f32>/);
+  assert.match(pair.fragment, /->\s*@location\(0\)\s+vec4<f32>/);
+  assert.match(pair.fragment, /bitcast<u32>\(frame_cbv\.data\[0\]/);
+  assert.match(pair.fragment, /return\s+vec4<f32>\([^;]+,\s*1\.0\);/);
+});
+
+test('G34 textured_quad_24b WGSL pair matches 24-byte vertex stride + group(0) texture/sampler', () => {
+  const { textured_quad_24b: pair } = getBuiltInFallbackProfiles();
+
+  // Vertex shader: @location(0) pos: vec4<f32> (16B) + @location(1) uv: vec2<f32> (8B) = 24B stride.
+  assert.match(pair.vertex, /@vertex\b/);
+  assert.match(pair.vertex, /fn\s+vs_main\(/);
+  assert.match(pair.vertex, /@location\(0\)\s+pos:\s*vec4<f32>/);
+  assert.match(pair.vertex, /@location\(1\)\s+uv:\s*vec2<f32>/);
+  assert.match(pair.vertex, /@builtin\(position\)/);
+  assert.match(pair.vertex, /@location\(0\)\s+uv:\s*vec2<f32>/);
+
+  // Fragment shader: group(0) binding(0) texture_2d<f32> + binding(1) sampler.
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(0\)\s+var\s+[A-Za-z_][A-Za-z0-9_]*:\s*texture_2d<f32>;/);
+  assert.match(pair.fragment, /@group\(0\)\s+@binding\(1\)\s+var\s+[A-Za-z_][A-Za-z0-9_]*:\s*sampler;/);
+  assert.match(pair.fragment, /@fragment\b/);
+  assert.match(pair.fragment, /fn\s+fs_main\(@location\(0\)\s+uv:\s*vec2<f32>\)\s*->\s*@location\(0\)\s+vec4<f32>/);
+  assert.match(pair.fragment, /textureSample\(/);
+});
+
+test('G34 normalizeFallbackProfile and resolve(hash, stage, { profile }) select profiles and preserve defaults', () => {
+  assert.equal(normalizeFallbackProfile(undefined), 'default');
+  assert.equal(normalizeFallbackProfile(null), 'default');
+  assert.equal(normalizeFallbackProfile(''), 'default');
+  assert.equal(normalizeFallbackProfile('default'), 'default');
+  assert.equal(normalizeFallbackProfile('unknown-profile'), 'default');
+  assert.equal(normalizeFallbackProfile('fullscreen_cbv'), 'fullscreen_triangle_cbv');
+  assert.equal(normalizeFallbackProfile('fullscreen_triangle_cbv'), 'fullscreen_triangle_cbv');
+  assert.equal(normalizeFallbackProfile('  FULLSCREEN-CBV  '), 'fullscreen_triangle_cbv');
+  assert.equal(normalizeFallbackProfile('textured_24b'), 'textured_quad_24b');
+  assert.equal(normalizeFallbackProfile('textured_quad_24b'), 'textured_quad_24b');
+  assert.equal(normalizeFallbackProfile('TEXTURED-QUAD-24B'), 'textured_quad_24b');
+
+  const profiles = getBuiltInFallbackProfiles();
+  const router = new ShaderFallbackRouter({ now: () => 1234 });
+
+  // Default 2-arg call remains 100% backwards compatible.
+  const defVs = router.resolve('0x0000000000000001', 'vertex');
+  assert.equal(defVs.source, 'builtin');
+  assert.equal(defVs.wgsl, BUILTIN_FALLBACK_WGSL.vertex);
+  assert.equal(defVs.entryPoint, 'vs_main');
+  assert.equal(defVs.profile, 'default');
+
+  // fullscreen_cbv alias & canonical name.
+  const cbvVs = router.resolve('0x0000000000000002', 'vertex', { profile: 'fullscreen_cbv' });
+  assert.equal(cbvVs.source, 'builtin');
+  assert.equal(cbvVs.wgsl, profiles.fullscreen_triangle_cbv.vertex);
+  assert.equal(cbvVs.entryPoint, 'vs_main');
+  assert.equal(cbvVs.profile, 'fullscreen_triangle_cbv');
+
+  const cbvFs = router.resolve('0x0000000000000003', SHADER_STAGE.FRAGMENT, {
+    profile: 'fullscreen_triangle_cbv',
+  });
+  assert.equal(cbvFs.source, 'builtin');
+  assert.equal(cbvFs.wgsl, profiles.fullscreen_triangle_cbv.fragment);
+  assert.equal(cbvFs.entryPoint, 'fs_main');
+  assert.equal(cbvFs.profile, 'fullscreen_triangle_cbv');
+
+  // textured_24b alias & canonical name.
+  const texVs = router.resolve('0x0000000000000004', 'vs', { profile: 'textured_24b' });
+  assert.equal(texVs.source, 'builtin');
+  assert.equal(texVs.wgsl, profiles.textured_quad_24b.vertex);
+  assert.equal(texVs.entryPoint, 'vs_main');
+  assert.equal(texVs.profile, 'textured_quad_24b');
+
+  const texFs = router.resolve('0x0000000000000005', 'ps', { profile: 'textured_quad_24b' });
+  assert.equal(texFs.source, 'builtin');
+  assert.equal(texFs.wgsl, profiles.textured_quad_24b.fragment);
+  assert.equal(texFs.entryPoint, 'fs_main');
+  assert.equal(texFs.profile, 'textured_quad_24b');
+
+  // Compute stage with render profile still resolves cleanly to valid compute WGSL.
+  const cs = router.resolve('0x0000000000000006', 'compute', { profile: 'fullscreen_cbv' });
+  assert.equal(cs.source, 'builtin');
+  assert.equal(cs.wgsl, BUILTIN_FALLBACK_WGSL.compute);
+  assert.equal(cs.entryPoint, 'cs_main');
+  assert.equal(cs.profile, 'fullscreen_triangle_cbv');
+
+  // Unknown profile gracefully falls back to default built-in WGSL.
+  const unknown = router.resolve('0x0000000000000007', 'fragment', { profile: 'does_not_exist' });
+  assert.equal(unknown.source, 'builtin');
+  assert.equal(unknown.wgsl, BUILTIN_FALLBACK_WGSL.fragment);
+  assert.equal(unknown.profile, 'default');
+
+  // Telemetry accurately records every profiled built-in fallback miss.
+  const stats = router.getStats();
+  assert.equal(stats.totalLookups, 7);
+  assert.equal(stats.builtinHits, 7);
+  assert.equal(stats.uniqueMissing, 7);
+  assert.equal(router.getMissingReport().length, 7);
+});
+
+test('G34 pack hits and S9 fallback hashes retain precedence over options.profile and defaultProfile', () => {
+  const packHash = '0xaaaaaaaaaaaaaaaa';
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({
+      [packHash]: PACK_VS_WGSL,
+      [S9_FALLBACK_HASHES.fragment]: S9_FALLBACK_WGSL.fragment,
+    }),
+    fallbackHashes: { fragment: S9_FALLBACK_HASHES.fragment },
+    defaultProfile: 'fullscreen_cbv',
+    now: () => 500,
+  });
+
+  // 1) Exact pack hit wins even when profile is specified, and records zero missing telemetry.
+  const packRes = router.resolve(packHash, 'vertex', { profile: 'textured_24b' });
+  assert.equal(packRes.source, 'pack');
+  assert.equal(packRes.wgsl, PACK_VS_WGSL);
+  assert.equal(router.getMissingReport().length, 0);
+
+  // 2) Stage-matched S9 fallback hash wins over built-in profile while recording missing telemetry.
+  const s9Res = router.resolve('0xbbbbbbbbbbbbbbbb', 'fragment', { profile: 'fullscreen_cbv' });
+  assert.equal(s9Res.source, 'fallback');
+  assert.equal(s9Res.wgsl, S9_FALLBACK_WGSL.fragment);
+  assert.equal(s9Res.resolvedHash, S9_FALLBACK_HASHES.fragment);
+
+  // 3) Unmatched stage falls through to constructor defaultProfile ('fullscreen_triangle_cbv').
+  const defaultProfileRes = router.resolve('0xcccccccccccccccc', 'vertex');
+  assert.equal(defaultProfileRes.source, 'builtin');
+  assert.equal(defaultProfileRes.profile, 'fullscreen_triangle_cbv');
+  assert.equal(
+    defaultProfileRes.wgsl,
+    getBuiltInFallbackProfiles().fullscreen_triangle_cbv.vertex
+  );
+
+  // 4) Per-call profile overrides constructor defaultProfile.
+  const overrideRes = router.resolve('0xdddddddddddddddd', 'vertex', { profile: 'textured_24b' });
+  assert.equal(overrideRes.source, 'builtin');
+  assert.equal(overrideRes.profile, 'textured_quad_24b');
+  assert.equal(overrideRes.wgsl, getBuiltInFallbackProfiles().textured_quad_24b.vertex);
+
+  const stats = router.getStats();
+  assert.equal(stats.totalLookups, 4);
+  assert.equal(stats.packHits, 1);
+  assert.equal(stats.fallbackHits, 1);
+  assert.equal(stats.builtinHits, 2);
+  assert.equal(stats.uniqueMissing, 3);
+});
+
+test('G34 shader_fallback_router.js preserves classic Worker importScripts IIFE isolation with zero global leaks', () => {
+  const source = readFileSync(ROUTER_PATH, 'utf8');
+  const sandbox = { console, performance };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+
+  // Execute twice as in repeated classic-worker importScripts() calls.
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+    vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+  });
+
+  // Verify zero top-level const/let/class declarations leaked into WorkerGlobalScope.
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const BUILTIN_FALLBACK_WGSL = {};
+      const FULLSCREEN_TRIANGLE_CBV_WGSL = {};
+      const TEXTURED_QUAD_24B_WGSL = {};
+      const BUILTIN_FALLBACK_PROFILES = {};
+      const FALLBACK_PROFILE_ALIASES = {};
+      const exportedApi = {};
+      class ShaderFallbackRouter {}
+      `,
+      vmCtx
+    );
+  });
+
+  assert.ok(vmCtx.PlayGta6ShaderFallbackRouter);
+  assert.equal(typeof vmCtx.PlayGta6ShaderFallbackRouter.getBuiltInFallbackProfiles, 'function');
+  const profiles = vmCtx.PlayGta6ShaderFallbackRouter.getBuiltInFallbackProfiles();
+  assert.ok(profiles.fullscreen_triangle_cbv && profiles.textured_quad_24b);
 });
