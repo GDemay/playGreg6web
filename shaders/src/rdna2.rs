@@ -1130,6 +1130,13 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
     }
 }
 
+fn vop3p_num_srcs(op: u8) -> u8 {
+    match op {
+        0x01..=0x08 | 0x0A..=0x0D | 0x0F..=0x12 => 2,
+        _ => 3,
+    }
+}
+
 fn vop3p_mnemonic(op: u8) -> String {
     match op {
         0x00 => "v_pk_mad_i16",
@@ -1949,7 +1956,8 @@ fn decode_vop3p(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let src1 = ((w1 >> 9) & 0x1FF) as u16;
     let src0 = (w1 & 0x1FF) as u16;
 
-    let uses_lit = !truncated && (src0 == 0xFF || src1 == 0xFF || src2 == 0xFF);
+    let num_srcs = vop3p_num_srcs(op);
+    let uses_lit = !truncated && (src0 == 0xFF || src1 == 0xFF || (num_srcs >= 3 && src2 == 0xFF));
     let literal = if uses_lit {
         match read_u32_le(bytes, offset.saturating_add(8)) {
             Some(lit) => {
@@ -1969,11 +1977,92 @@ fn decode_vop3p(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     if !truncated {
         let _ = write!(
             operands,
-            ", {}, {}, {}",
+            ", {}, {}",
             format_src_operand(src0, literal),
             format_src_operand(src1, literal),
-            format_src_operand(src2, literal)
         );
+        if num_srcs >= 3 {
+            let _ = write!(operands, ", {}", format_src_operand(src2, literal));
+        }
+        let src_mask = if num_srcs >= 3 { 0x7u8 } else { 0x3u8 };
+        let eff_op_sel = op_sel & src_mask;
+        if eff_op_sel != 0 {
+            if num_srcs >= 3 {
+                let _ = write!(
+                    operands,
+                    " op_sel:[{},{},{}]",
+                    eff_op_sel & 1,
+                    (eff_op_sel >> 1) & 1,
+                    (eff_op_sel >> 2) & 1
+                );
+            } else {
+                let _ = write!(
+                    operands,
+                    " op_sel:[{},{}]",
+                    eff_op_sel & 1,
+                    (eff_op_sel >> 1) & 1
+                );
+            }
+        }
+        let eff_op_sel_hi = op_sel_hi & src_mask;
+        let is_fma_mix = matches!(op, 0x20..=0x22);
+        let default_hi = if is_fma_mix { 0 } else { src_mask };
+        if eff_op_sel_hi != default_hi {
+            if num_srcs >= 3 {
+                let _ = write!(
+                    operands,
+                    " op_sel_hi:[{},{},{}]",
+                    eff_op_sel_hi & 1,
+                    (eff_op_sel_hi >> 1) & 1,
+                    (eff_op_sel_hi >> 2) & 1
+                );
+            } else {
+                let _ = write!(
+                    operands,
+                    " op_sel_hi:[{},{}]",
+                    eff_op_sel_hi & 1,
+                    (eff_op_sel_hi >> 1) & 1
+                );
+            }
+        }
+        let eff_neg_lo = neg_lo & src_mask;
+        if eff_neg_lo != 0 {
+            if num_srcs >= 3 {
+                let _ = write!(
+                    operands,
+                    " neg_lo:[{},{},{}]",
+                    eff_neg_lo & 1,
+                    (eff_neg_lo >> 1) & 1,
+                    (eff_neg_lo >> 2) & 1
+                );
+            } else {
+                let _ = write!(
+                    operands,
+                    " neg_lo:[{},{}]",
+                    eff_neg_lo & 1,
+                    (eff_neg_lo >> 1) & 1
+                );
+            }
+        }
+        let eff_neg_hi = neg_hi & src_mask;
+        if eff_neg_hi != 0 {
+            if num_srcs >= 3 {
+                let _ = write!(
+                    operands,
+                    " neg_hi:[{},{},{}]",
+                    eff_neg_hi & 1,
+                    (eff_neg_hi >> 1) & 1,
+                    (eff_neg_hi >> 2) & 1
+                );
+            } else {
+                let _ = write!(
+                    operands,
+                    " neg_hi:[{},{}]",
+                    eff_neg_hi & 1,
+                    (eff_neg_hi >> 1) & 1
+                );
+            }
+        }
         if clamp {
             operands.push_str(" clamp");
         }
@@ -2816,6 +2905,7 @@ pub fn analyze_instructions(
                 }
             }
             Rdna2Detail::Vop3P {
+                op,
                 vdst,
                 src0,
                 src1,
@@ -2826,7 +2916,9 @@ pub fn analyze_instructions(
                 if !inst.truncated {
                     record_src_reg(&mut max_sgpr, &mut max_vgpr, *src0);
                     record_src_reg(&mut max_sgpr, &mut max_vgpr, *src1);
-                    record_src_reg(&mut max_sgpr, &mut max_vgpr, *src2);
+                    if vop3p_num_srcs(*op) >= 3 {
+                        record_src_reg(&mut max_sgpr, &mut max_vgpr, *src2);
+                    }
                 }
             }
             Rdna2Detail::Vintrp { op, vdst, vsrc, .. } => {
@@ -3870,5 +3962,149 @@ mod tests {
         assert_eq!(insts[0].format_text(), "v_cndmask_b32 v3, v1, v2, vcc");
         assert_eq!(insts[1].mnemonic, "v_cndmask_b32");
         assert_eq!(insts[1].format_text(), "v_cndmask_b32 v4, v1, v2, s10");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_vop3p(
+        op: u8,
+        vdst: u8,
+        src0: u16,
+        src1: u16,
+        src2: u16,
+        clamp: bool,
+        op_sel: u8,
+        op_sel_hi: u8,
+        neg_lo: u8,
+        neg_hi: u8,
+    ) -> [u32; 2] {
+        let w0 = (0b110011u32 << 26)
+            | (u32::from(op & 0x7F) << 16)
+            | (u32::from(clamp) << 15)
+            | (u32::from((op_sel_hi >> 2) & 0x1) << 14)
+            | (u32::from(op_sel & 0x7) << 11)
+            | (u32::from(neg_hi & 0x7) << 8)
+            | u32::from(vdst);
+        let w1 = (u32::from(neg_lo & 0x7) << 29)
+            | (u32::from(op_sel_hi & 0x3) << 27)
+            | (u32::from(src2 & 0x1FF) << 18)
+            | (u32::from(src1 & 0x1FF) << 9)
+            | u32::from(src0 & 0x1FF);
+        [w0, w1]
+    }
+
+    #[test]
+    fn decodes_vop3p_packed_f16_s_buffer_load_and_mimg_sample_variants() {
+        let mut words = Vec::new();
+        // v_pk_fma_f16 v4, v1, v2, v3 op_sel:[1,0,0] op_sel_hi:[1,0,1] neg_lo:[1,0,0] neg_hi:[0,1,0] clamp
+        words.extend_from_slice(&enc_vop3p(
+            0x0E,
+            4,
+            256 + 1,
+            256 + 2,
+            256 + 3,
+            true,
+            0b001,
+            0b101,
+            0b001,
+            0b010,
+        ));
+        // v_pk_mul_f16 v5, v1, v2 (2-source VOP3P with default op_sel_hi=0b11; unused src2=0xFF must NOT trigger literal!)
+        words.extend_from_slice(&enc_vop3p(
+            0x10,
+            5,
+            256 + 1,
+            256 + 2,
+            0xFF,
+            false,
+            0,
+            0b011,
+            0,
+            0,
+        ));
+        // v_pk_add_f16 v6, v4, v5
+        words.extend_from_slice(&enc_vop3p(
+            0x0F,
+            6,
+            256 + 4,
+            256 + 5,
+            0,
+            false,
+            0,
+            0b011,
+            0,
+            0,
+        ));
+        // v_pk_min_f16 / v_pk_max_f16
+        words.extend_from_slice(&enc_vop3p(0x11, 7, 256 + 4, 256 + 5, 0, false, 0, 0b011, 0, 0));
+        words.extend_from_slice(&enc_vop3p(0x12, 8, 256 + 6, 256 + 7, 0, false, 0, 0b011, 0, 0));
+        // v_cvt_pkrtz_f16_f32 (VOP2 0x2E and VOP3 0x12E)
+        words.push(enc_vop2(0x2E, 9, 256 + 1, 2));
+        words.extend_from_slice(&enc_vop3(0x12E, 10, 256 + 3, 256 + 4, 0, true, 0, 0, 0));
+        // s_buffer_load_dword / x2 / x4 / x8 / x16
+        words.extend_from_slice(&enc_smem(0x08, 4, 0, 0x7D, 0x0, false, false));
+        words.extend_from_slice(&enc_smem(0x09, 6, 0, 0x7D, 0x10, false, false));
+        words.extend_from_slice(&enc_smem(0x0A, 8, 0, 0x7D, 0x20, false, false));
+        words.extend_from_slice(&enc_smem(0x0B, 16, 0, 0x7D, 0x40, false, false));
+        words.extend_from_slice(&enc_smem(0x0C, 32, 0, 0x7D, 0x80, false, false));
+        // MIMG variants: image_sample_lz (0x27), image_sample_l (0x24), image_sample_b (0x25),
+        // image_sample_c (0x28), image_load (0x00), image_load_mip (0x01)
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 12, 2, 1));
+        words.extend_from_slice(&enc_mimg(0x24, 0x7, 1, 2, 16, 2, 1));
+        words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 2, 20, 2, 1));
+        words.extend_from_slice(&enc_mimg(0x28, 0x1, 1, 2, 24, 2, 1));
+        words.extend_from_slice(&enc_mimg(0x00, 0xF, 1, 2, 25, 2, 0));
+        words.extend_from_slice(&enc_mimg(0x01, 0x3, 1, 2, 29, 2, 0));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 19);
+        assert_eq!(
+            insts[0].format_text(),
+            "v_pk_fma_f16 v4, v1, v2, v3 op_sel:[1,0,0] op_sel_hi:[1,0,1] neg_lo:[1,0,0] neg_hi:[0,1,0] clamp"
+        );
+        assert_eq!(insts[1].size, 8);
+        assert_eq!(insts[1].format_text(), "v_pk_mul_f16 v5, v1, v2");
+        assert_eq!(insts[2].format_text(), "v_pk_add_f16 v6, v4, v5");
+        assert_eq!(insts[3].format_text(), "v_pk_min_f16 v7, v4, v5");
+        assert_eq!(insts[4].format_text(), "v_pk_max_f16 v8, v6, v7");
+        assert_eq!(insts[5].format_text(), "v_cvt_pkrtz_f16_f32 v9, v1, v2");
+        assert_eq!(
+            insts[6].format_text(),
+            "v_cvt_pkrtz_f16_f32 v10, v3, v4 clamp"
+        );
+        assert_eq!(
+            insts[7].format_text(),
+            "s_buffer_load_dword s4, s[0:3], 0x0"
+        );
+        assert_eq!(
+            insts[8].format_text(),
+            "s_buffer_load_dwordx2 s[6:7], s[0:3], 0x10"
+        );
+        assert_eq!(
+            insts[9].format_text(),
+            "s_buffer_load_dwordx4 s[8:11], s[0:3], 0x20"
+        );
+        assert_eq!(
+            insts[10].format_text(),
+            "s_buffer_load_dwordx8 s[16:23], s[0:3], 0x40"
+        );
+        assert_eq!(
+            insts[11].format_text(),
+            "s_buffer_load_dwordx16 s[32:47], s[0:3], 0x80"
+        );
+        assert_eq!(insts[12].mnemonic, "image_sample_lz");
+        assert_eq!(insts[13].mnemonic, "image_sample_l");
+        assert_eq!(insts[14].mnemonic, "image_sample_b");
+        assert_eq!(insts[15].mnemonic, "image_sample_c");
+        assert_eq!(insts[16].mnemonic, "image_load");
+        assert_eq!(insts[17].mnemonic, "image_load_mip");
+        assert_eq!(insts[18].mnemonic, "s_endpgm");
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.truncated_instructions, 0);
+        assert_eq!(summary.smem_refs.len(), 5);
+        assert!(summary.smem_refs.iter().all(|r| r.is_buffer));
+        assert_eq!(summary.resource_refs.len(), 6);
     }
 }
