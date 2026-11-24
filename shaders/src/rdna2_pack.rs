@@ -21,10 +21,13 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::convert::ShaderStage;
+use crate::convert::{ShaderStage, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
-use crate::pack::{PackEntry, PackError, write_pack};
-use crate::rdna2_to_wgsl::{Rdna2StageOverride, Rdna2TranslateOptions, translate_rdna2_to_wgsl};
+use crate::pack::{PackEntry, PackError, write_json_string, write_pack};
+use crate::rdna2_to_wgsl::{
+    Rdna2StageOverride, Rdna2TranslateOptions, WgslBindingInfo, translate_rdna2_to_wgsl,
+    write_wgsl_bindings_json,
+};
 
 /// File extensions recognized as raw RDNA2 shader blobs (ASCII case-insensitive).
 pub const SUPPORTED_RDNA2_EXTENSIONS: &[&str] = &["bin", "rdna2", "shader"];
@@ -85,10 +88,23 @@ pub struct Rdna2PackOptions {
     pub pack_flags: u32,
 }
 
+/// Strictly sanitized per-shader entry summary for [`Rdna2PackSummary`]
+/// (zero host paths, zero filenames, zero raw bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rdna2PackEntrySummary {
+    pub hash_fnv1a64: u64,
+    pub stage: ShaderStage,
+    pub entry_point: String,
+    pub translated_op_count: usize,
+    pub unsupported_op_count: usize,
+    pub wgsl_byte_len: usize,
+    pub bindings: Vec<WgslBindingInfo>,
+}
+
 /// Strictly sanitized summary of a batch RDNA2 -> WGSL -> `WGPK` pack operation.
 ///
-/// Contains only deterministic aggregate metrics: zero host paths, zero usernames,
-/// and zero raw shader bytes.
+/// Contains only deterministic aggregate and per-entry metrics: zero host paths,
+/// zero usernames, zero filenames, and zero raw shader bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Rdna2PackSummary {
     pub total_blobs: usize,
@@ -98,12 +114,13 @@ pub struct Rdna2PackSummary {
     pub pixel_count: usize,
     pub compute_count: usize,
     pub pack_bytes: usize,
+    pub entries: Vec<Rdna2PackEntrySummary>,
 }
 
 impl Rdna2PackSummary {
     /// Render a strictly sanitized deterministic JSON summary.
     pub fn to_json(&self) -> String {
-        let mut out = String::with_capacity(256);
+        let mut out = String::with_capacity(512);
         out.push_str("{\n");
         out.push_str("  \"format\": \"wgpk_v1\",\n");
         out.push_str("  \"isa\": \"rdna2_gfx10_3\",\n");
@@ -113,7 +130,44 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  \"vertex_count\": {},", self.vertex_count);
         let _ = writeln!(out, "  \"pixel_count\": {},", self.pixel_count);
         let _ = writeln!(out, "  \"compute_count\": {},", self.compute_count);
-        let _ = writeln!(out, "  \"pack_bytes\": {}", self.pack_bytes);
+        let _ = writeln!(out, "  \"pack_bytes\": {},", self.pack_bytes);
+        if self.entries.is_empty() {
+            out.push_str("  \"entries\": []\n");
+        } else {
+            out.push_str("  \"entries\": [\n");
+            for (i, entry) in self.entries.iter().enumerate() {
+                out.push_str("    {\n");
+                out.push_str("      \"hash_fnv1a64\": ");
+                write_json_string(&mut out, &format_shader_hash(entry.hash_fnv1a64));
+                out.push_str(",\n");
+                out.push_str("      \"stage\": ");
+                write_json_string(&mut out, entry.stage.as_str());
+                out.push_str(",\n");
+                out.push_str("      \"entry_point\": ");
+                write_json_string(&mut out, &entry.entry_point);
+                out.push_str(",\n");
+                let _ = writeln!(
+                    out,
+                    "      \"translated_op_count\": {},",
+                    entry.translated_op_count
+                );
+                let _ = writeln!(
+                    out,
+                    "      \"unsupported_op_count\": {},",
+                    entry.unsupported_op_count
+                );
+                let _ = writeln!(out, "      \"wgsl_byte_len\": {},", entry.wgsl_byte_len);
+                out.push_str("      \"bindings\": ");
+                write_wgsl_bindings_json(&mut out, &entry.bindings, "      ");
+                out.push('\n');
+                if i + 1 < self.entries.len() {
+                    out.push_str("    },\n");
+                } else {
+                    out.push_str("    }\n");
+                }
+            }
+            out.push_str("  ]\n");
+        }
         out.push_str("}\n");
         out
     }
@@ -269,7 +323,7 @@ pub fn pack_rdna2_blobs(
     blobs: &[Rdna2BlobInput],
     options: &Rdna2PackOptions,
 ) -> Result<Rdna2PackResult, Rdna2PackError> {
-    let mut packed_by_hash: BTreeMap<u64, PackEntry> = BTreeMap::new();
+    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
     let mut skipped_or_failed = 0usize;
 
     // Sort a view of indices deterministically by blob name then raw content length/bytes
@@ -323,17 +377,34 @@ pub fn pack_rdna2_blobs(
             continue;
         }
 
+        let wgsl_byte_len = output.wgsl.len();
         packed_by_hash.insert(
             final_hash,
-            PackEntry {
-                hash: final_hash,
-                stage: output.stage,
-                wgsl: output.wgsl,
-            },
+            (
+                PackEntry {
+                    hash: final_hash,
+                    stage: output.stage,
+                    wgsl: output.wgsl,
+                },
+                Rdna2PackEntrySummary {
+                    hash_fnv1a64: final_hash,
+                    stage: output.stage,
+                    entry_point: output.entry_point,
+                    translated_op_count: output.translated_op_count,
+                    unsupported_op_count: output.unsupported_op_count,
+                    wgsl_byte_len,
+                    bindings: output.bindings,
+                },
+            ),
         );
     }
 
-    let entries: Vec<PackEntry> = packed_by_hash.into_values().collect();
+    let mut entries: Vec<PackEntry> = Vec::with_capacity(packed_by_hash.len());
+    let mut entry_summaries: Vec<Rdna2PackEntrySummary> = Vec::with_capacity(packed_by_hash.len());
+    for (entry, entry_summary) in packed_by_hash.into_values() {
+        entries.push(entry);
+        entry_summaries.push(entry_summary);
+    }
     let mut vertex_count = 0usize;
     let mut pixel_count = 0usize;
     let mut compute_count = 0usize;
@@ -354,6 +425,7 @@ pub fn pack_rdna2_blobs(
         pixel_count,
         compute_count,
         pack_bytes: pack_bytes.len(),
+        entries: entry_summaries,
     };
 
     Ok(Rdna2PackResult {
@@ -827,9 +899,28 @@ mod tests {
             .expect("PS entry must exist");
         assert_eq!(ps_entry.stage, ShaderStage::Fragment);
         assert!(ps_entry.wgsl.contains("@fragment"));
+        assert!(ps_entry.wgsl.contains("fn fs_main("));
         assert!(ps_entry.wgsl.contains("texture_2d<f32>"));
         assert!(ps_entry.wgsl.contains("textureSample("));
         assert_naga_wgsl_valid(&ps_entry.wgsl);
+
+        // Per-entry summary + explicit bindings in pack summary JSON.
+        assert_eq!(result.summary.entries.len(), 3);
+        let ps_summary = result
+            .summary
+            .entries
+            .iter()
+            .find(|e| e.hash_fnv1a64 == 0x2000_0000_0000_0002)
+            .expect("PS summary must exist");
+        assert_eq!(ps_summary.entry_point, "fs_main");
+        assert_eq!(ps_summary.bindings.len(), 2);
+        let summary_json = result.summary.to_json();
+        assert!(summary_json.contains("\"entries\": ["), "JSON:\n{summary_json}");
+        assert!(summary_json.contains("\"entry_point\": \"fs_main\""), "JSON:\n{summary_json}");
+        assert!(
+            summary_json.contains("{\"group\": 0, \"binding\": 1, \"kind\": \"texture_2d\", \"name\": \"tex0\"}"),
+            "JSON:\n{summary_json}"
+        );
 
         let cs_entry = decoded
             .entries
