@@ -1016,3 +1016,111 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn shard_dispatch_emits_switch_internal_linkage_and_empty_shard_trap() {
+    use std::collections::HashSet;
+
+    use crate::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
+    use crate::lift::{ShardDispatch, emit_module_with_dispatch};
+
+    let f0 = asm_function(0x1000, |a| {
+        a.mov(eax, 1)?;
+        a.ret()
+    });
+    let f1 = asm_function(0x2000, |a| {
+        a.mov(eax, 2)?;
+        a.ret()
+    });
+    // Pass unsorted to confirm ascending VA ordering determines local_idx.
+    let lifted = vec![
+        lift_function(&f1).expect("lift f1"),
+        lift_function(&f0).expect("lift f0"),
+    ];
+
+    // `None` is byte-identical to `emit_module`.
+    assert_eq!(
+        emit_module(&lifted).expect("emit_module"),
+        emit_module_with_dispatch(&lifted, None).expect("emit_module_with_dispatch(None)")
+    );
+
+    // Only 0x2000 is cross-shard external; 0x1000 becomes `internal`.
+    let mut external = HashSet::new();
+    external.insert(0x2000);
+    let shard_ir = emit_module_with_dispatch(
+        &lifted,
+        Some(ShardDispatch {
+            dispatcher_symbol: "__playgta6_dispatch_shard_main_00000",
+            external_entries: &external,
+        }),
+    )
+    .expect("emit shard");
+    assert!(
+        shard_ir.contains("define internal void @sub_1000(ptr noalias noundef %state) unnamed_addr #0 {"),
+        "shard-local function should have internal linkage:\n{shard_ir}"
+    );
+    assert!(
+        shard_ir.contains("\ndefine void @sub_2000(ptr noalias noundef %state) unnamed_addr #0 {"),
+        "cross-shard callee must keep external linkage:\n{shard_ir}"
+    );
+    assert!(
+        shard_ir.contains(
+            "define void @__playgta6_dispatch_shard_main_00000(i32 noundef %local_idx, ptr noundef %state) #0 {\n\
+             entry:\n  \
+               switch i32 %local_idx, label %invalid [\n    \
+                 i32 0, label %f0\n    \
+                 i32 1, label %f1\n  \
+               ]\n\
+             f0:\n  \
+               tail call void @sub_1000(ptr noundef %state)\n  \
+               ret void\n\
+             f1:\n  \
+               tail call void @sub_2000(ptr noundef %state)\n  \
+               ret void\n\
+             invalid:\n  \
+               tail call void @__playgta6_trap(ptr noundef %state, i64 noundef 0)\n  \
+               unreachable\n\
+             }\n"
+        ),
+        "unexpected dispatcher IR:\n{shard_ir}"
+    );
+
+    // Empty shard emits a direct trap without a switch.
+    let empty_ir = emit_module_with_dispatch(
+        &[],
+        Some(ShardDispatch {
+            dispatcher_symbol: "__playgta6_dispatch_shard_main_00001",
+            external_entries: &external,
+        }),
+    )
+    .expect("emit empty shard");
+    assert!(!empty_ir.contains("switch i32"), "{empty_ir}");
+    assert!(
+        empty_ir.contains(
+            "define void @__playgta6_dispatch_shard_main_00001(i32 noundef %local_idx, ptr noundef %state) #0 {\n\
+             entry:\n  \
+               tail call void @__playgta6_trap(ptr noundef %state, i64 noundef 0)\n  \
+               unreachable\n\
+             }\n"
+        ),
+        "unexpected empty shard dispatcher IR:\n{empty_ir}"
+    );
+
+    // Compile both through LLVM when available.
+    if let Some(tool) = find_llvm_tool() {
+        let dir = std::env::temp_dir().join(format!(
+            "playgta6_r37b_shard_ir_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (name, text) in [("shard", &shard_ir), ("empty_shard", &empty_ir)] {
+            let ll = dir.join(format!("{name}.ll"));
+            let obj = dir.join(format!("{name}.o"));
+            std::fs::write(&ll, text).expect("write .ll");
+            compile_to_wasm64_object(&tool, &ll, &obj)
+                .unwrap_or_else(|e| panic!("{name} failed LLVM compilation: {e}"));
+            assert!(std::fs::metadata(&obj).expect("obj metadata").len() > 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

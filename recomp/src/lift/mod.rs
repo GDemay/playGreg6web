@@ -189,7 +189,7 @@ pub mod target;
 
 pub use memory::MemoryModel;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::{self, Write as _};
 
 use crate::cfg;
@@ -503,12 +503,37 @@ pub fn lift_module_with<'a>(
     })
 }
 
+/// Configuration for shard-level indirect-call dispatch emission.
+///
+/// When passed to [`emit_module_with_dispatch`], functions whose entry VA is not in
+/// `external_entries` are emitted with `internal` linkage (keeping them out of the object's
+/// exported symbol table), and one exported `Pg6ShardDispatchFn` dispatcher function switching on
+/// `local_idx` (matching ascending entry VA order) is emitted at the end of the module.
+#[derive(Debug, Clone, Copy)]
+pub struct ShardDispatch<'a> {
+    /// Exported symbol name of this shard's dispatcher (`Pg6ShardDispatchFn`).
+    pub dispatcher_symbol: &'a str,
+    /// Function entry VAs that must retain external linkage (e.g. cross-shard direct callees).
+    pub external_entries: &'a HashSet<u64>,
+}
+
 /// Emits a complete `.ll` module: target info, guest state type, runtime helper declarations,
 /// declarations for called functions that are not part of the module, required intrinsics and
 /// internal helpers, then all function definitions sorted by entry address.
 ///
 /// The output depends only on the set of functions (not their order): same input, same bytes.
 pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
+    emit_module_with_dispatch(functions, None)
+}
+
+/// [`emit_module`], optionally emitting shard-local `internal` linkage and an exported
+/// [`ShardDispatch`] dispatcher function (`Pg6ShardDispatchFn`) at the end of the module.
+///
+/// Passing `None` produces output byte-identical to [`emit_module`].
+pub fn emit_module_with_dispatch(
+    functions: &[LiftedFunction],
+    dispatch: Option<ShardDispatch<'_>>,
+) -> Result<String, LiftError> {
     let mut sorted: Vec<&LiftedFunction> = functions.iter().collect();
     sorted.sort_by_key(|f| f.entry);
     let mut defined = BTreeSet::new();
@@ -623,7 +648,55 @@ pub fn emit_module(functions: &[LiftedFunction]) -> Result<String, LiftError> {
     }
     for func in &sorted {
         out.push('\n');
-        out.push_str(&func.ir);
+        match dispatch {
+            Some(d) if !d.external_entries.contains(&func.entry) => {
+                if let Some(rest) = func.ir.strip_prefix("define ") {
+                    out.push_str("define internal ");
+                    out.push_str(rest);
+                } else {
+                    out.push_str(&func.ir);
+                }
+            }
+            _ => out.push_str(&func.ir),
+        }
+    }
+    if let Some(d) = dispatch {
+        out.push('\n');
+        let _ = writeln!(
+            out,
+            "define void @{}(i32 noundef %local_idx, ptr noundef %state) #0 {{",
+            d.dispatcher_symbol
+        );
+        out.push_str("entry:\n");
+        if sorted.is_empty() {
+            let _ = writeln!(
+                out,
+                "  tail call void @{HELPER_TRAP}(ptr noundef %state, i64 noundef 0)"
+            );
+            out.push_str("  unreachable\n");
+        } else {
+            out.push_str("  switch i32 %local_idx, label %invalid [\n");
+            for i in 0..sorted.len() {
+                let _ = writeln!(out, "    i32 {i}, label %f{i}");
+            }
+            out.push_str("  ]\n");
+            for (i, func) in sorted.iter().enumerate() {
+                let _ = writeln!(out, "f{i}:");
+                let _ = writeln!(
+                    out,
+                    "  tail call void @{}(ptr noundef %state)",
+                    func.symbol
+                );
+                out.push_str("  ret void\n");
+            }
+            out.push_str("invalid:\n");
+            let _ = writeln!(
+                out,
+                "  tail call void @{HELPER_TRAP}(ptr noundef %state, i64 noundef 0)"
+            );
+            out.push_str("  unreachable\n");
+        }
+        out.push_str("}\n");
     }
     // Target features are a function attribute in LLVM IR. Every definition gets `#0`: the
     // lifted functions already name it, internal helpers are tagged here (the wasm backend unifies

@@ -1481,3 +1481,369 @@ fn bench_large_fixture() {
         elapsed
     );
 }
+
+// ----- R37b: shard-level indirect-call dispatch --------------------------------------------------
+
+#[test]
+fn indirect_dispatch_mode_and_symbols() {
+    assert_eq!(IndirectDispatch::default(), IndirectDispatch::Table);
+    assert_eq!(IndirectDispatch::from_name("table"), Ok(IndirectDispatch::Table));
+    assert_eq!(IndirectDispatch::from_name("shard"), Ok(IndirectDispatch::Shard));
+    assert!(IndirectDispatch::from_name("unknown").is_err());
+    assert_eq!(IndirectDispatch::Table.as_str(), "table");
+    assert_eq!(IndirectDispatch::Shard.as_str(), "shard");
+    assert!(IndirectDispatch::Table.is_default());
+    assert!(!IndirectDispatch::Shard.is_default());
+    assert_eq!(
+        shard_dispatcher_symbol("main", 7),
+        "__playgta6_dispatch_shard_main_00007"
+    );
+    assert_eq!(
+        shard_dispatch_table_symbol("game"),
+        "__playgta6_shard_dispatch_game"
+    );
+}
+
+#[test]
+fn shard_registration_table_abi_layout_and_empty_cases() {
+    let mut out = Vec::new();
+    write_shard_registration_table(
+        "main",
+        2,
+        &[
+            (0x1_4000_1000, 0, 0),
+            (0x1_4000_1020, 0, 1),
+            (0x1_4000_2000, 1, 0),
+        ],
+        &mut out,
+    )
+    .expect("render shard table");
+    let text = String::from_utf8(out).expect("utf-8");
+    assert!(!text.contains("@sub_"), "must emit zero sub_* symbols:\n{text}");
+    assert!(text.contains("%Pg6ShardFunctionEntry = type { i64, i32, i32 }"));
+    assert!(text.contains("%Pg6ShardDispatchTable = type { i32, i32, i64, ptr, ptr }"));
+    assert!(text.contains("declare void @__playgta6_dispatch_shard_main_00000(i32, ptr)"));
+    assert!(text.contains("declare void @__playgta6_dispatch_shard_main_00001(i32, ptr)"));
+    assert!(text.contains(
+        "@__playgta6_shard_dispatchers_main = internal constant [2 x ptr] [\n  \
+           ptr @__playgta6_dispatch_shard_main_00000,\n  \
+           ptr @__playgta6_dispatch_shard_main_00001\n\
+         ], align 8"
+    ));
+    assert!(text.contains(
+        "@__playgta6_shard_entries_main = internal constant [3 x %Pg6ShardFunctionEntry] [\n  \
+           %Pg6ShardFunctionEntry { i64 5368713216, i32 0, i32 0 },\n  \
+           %Pg6ShardFunctionEntry { i64 5368713248, i32 0, i32 1 },\n  \
+           %Pg6ShardFunctionEntry { i64 5368717312, i32 1, i32 0 }\n\
+         ], align 8"
+    ));
+    assert!(text.contains(
+        "@__playgta6_shard_dispatch_main = constant %Pg6ShardDispatchTable { i32 1, i32 2, i64 3, ptr @__playgta6_shard_dispatchers_main, ptr @__playgta6_shard_entries_main }, align 8"
+    ));
+    assert!(text.contains(
+        "@__playgta6_lifted_functions_main = constant [0 x %Pg6LiftedFunctionEntry] zeroinitializer, align 8"
+    ));
+    assert!(text.contains("@__playgta6_lifted_function_count_main = constant i64 0, align 8"));
+
+    // Empty module (0 shards, 0 entries): null pointers and zeroinitializer arrays.
+    let mut empty = Vec::new();
+    write_shard_registration_table("empty", 0, &[], &mut empty).expect("render empty shard table");
+    let empty_text = String::from_utf8(empty).expect("utf-8");
+    assert!(!empty_text.contains("@sub_"));
+    assert!(!empty_text.contains("declare void @__playgta6_dispatch_shard_"));
+    assert!(empty_text.contains(
+        "@__playgta6_shard_dispatchers_empty = internal constant [0 x ptr] zeroinitializer, align 8"
+    ));
+    assert!(empty_text.contains(
+        "@__playgta6_shard_entries_empty = internal constant [0 x %Pg6ShardFunctionEntry] zeroinitializer, align 8"
+    ));
+    assert!(empty_text.contains(
+        "@__playgta6_shard_dispatch_empty = constant %Pg6ShardDispatchTable { i32 1, i32 0, i64 0, ptr null, ptr null }, align 8"
+    ));
+
+    // Shards present, 0 entries: non-null shards pointer, null entries pointer.
+    let mut zero_entries = Vec::new();
+    write_shard_registration_table("zero", 1, &[], &mut zero_entries).expect("render zero entries");
+    let zero_text = String::from_utf8(zero_entries).expect("utf-8");
+    assert!(zero_text.contains(
+        "@__playgta6_shard_dispatch_zero = constant %Pg6ShardDispatchTable { i32 1, i32 1, i64 0, ptr @__playgta6_shard_dispatchers_zero, ptr null }, align 8"
+    ));
+}
+
+#[test]
+fn shard_dispatch_pipeline_linkage_manifest_and_table_byte_identity() {
+    // 6 functions across 3 shards (shard_size = 2):
+    //   Shard 0: f0 -> direct call f1 (intra-shard), f1 -> direct call f2 (cross-shard)
+    //   Shard 1: f2 -> direct tail call (jmp) f4 (cross-shard), f3 (address-taken only)
+    //   Shard 2: f4 -> direct tail call (jmp) f5 (intra-shard), f5 (leaf)
+    // Cross-shard callees: ONLY f2 (via direct call from f1) and f4 (via tail call from f2).
+    // f0, f1, f3, f5 must all have `internal` linkage!
+    let (f0, f1, f2, f3, f4, f5) = (T, T + 0x20, T + 0x40, T + 0x60, T + 0x80, T + 0xA0);
+    let mut a = Asm::new(T);
+    a.call(f1).lea_rax(f3).ret().pad_to(0x20); // f0
+    a.call(f2).ret().pad_to(0x40); // f1
+    a.rel32(&[0xE9], f4).pad_to(0x60); // f2: jmp f4 (tail call across shards)
+    a.mov_eax(33).ret().pad_to(0x80); // f3: indirect target only
+    a.rel32(&[0xE9], f5).pad_to(0xA0); // f4: jmp f5 (intra-shard tail call)
+    a.mov_eax(55).ret().pad_to(0xC0); // f5: leaf
+    let pe = TestPe {
+        text: a.bytes,
+        pdata: vec![
+            (f0, f1),
+            (f1, f2),
+            (f2, f3),
+            (f3, f4),
+            (f4, f5),
+            (f5, f5 + 0x20),
+        ],
+        ..TestPe::default()
+    }
+    .build();
+
+    let tmp = TempDir::new("shard_linkage");
+    // Default (`Table`) vs explicit `Table` are 100% byte-identical.
+    let mut table_opts = options_for(tmp.path(), &pe);
+    table_opts.shard_size = 2;
+    table_opts.out_dir = tmp.path().join("table_default");
+    let table_default = run(&table_opts).expect("table default");
+    assert!(!table_default.manifest.contains("indirect_dispatch"));
+    assert!(!table_default.manifest.contains("shard_dispatch_symbol"));
+    table_opts.out_dir = tmp.path().join("table_explicit");
+    table_opts.indirect_dispatch = IndirectDispatch::Table;
+    run(&table_opts).expect("table explicit");
+    assert_eq!(
+        read_tree(&tmp.path().join("table_default").join(DEFAULT_MODULE)),
+        read_tree(&tmp.path().join("table_explicit").join(DEFAULT_MODULE)),
+        "default and explicit Table mode must be byte-identical"
+    );
+
+    // `Shard` mode.
+    let mut shard_opts = options_for(tmp.path(), &pe);
+    shard_opts.out_dir = tmp.path().join("shard");
+    shard_opts.shard_size = 2;
+    shard_opts.indirect_dispatch = IndirectDispatch::Shard;
+    let report = run(&shard_opts).expect("shard run");
+    assert_eq!(report.lift.shards.len(), 3);
+    assert!(report.manifest.contains("\"indirect_dispatch\": \"shard\""));
+    assert!(report.manifest.contains("\"shard_dispatch_symbol\": \"__playgta6_shard_dispatch_main\""));
+
+    let lift_dir = shard_opts.module_dir().join(LIFT_DIR);
+    let s0 = fs::read_to_string(lift_dir.join("shard-00000.ll")).unwrap();
+    let s1 = fs::read_to_string(lift_dir.join("shard-00001.ll")).unwrap();
+    let s2 = fs::read_to_string(lift_dir.join("shard-00002.ll")).unwrap();
+    let funcs = fs::read_to_string(lift_dir.join("functions.ll")).unwrap();
+
+    // Shard 0: f0 and f1 are both shard-local -> internal.
+    assert!(s0.contains(&format!("define internal void @{}(", function_symbol(f0))), "{s0}");
+    assert!(s0.contains(&format!("define internal void @{}(", function_symbol(f1))), "{s0}");
+    assert!(s0.contains("define void @__playgta6_dispatch_shard_main_00000(i32 noundef %local_idx, ptr noundef %state) #0 {"));
+
+    // Shard 1: f2 is called directly from shard 0 -> external; f3 is address-taken only -> internal!
+    assert!(s1.contains(&format!("\ndefine void @{}(", function_symbol(f2))), "{s1}");
+    assert!(s1.contains(&format!("define internal void @{}(", function_symbol(f3))), "{s1}");
+    assert!(s1.contains("define void @__playgta6_dispatch_shard_main_00001(i32 noundef %local_idx, ptr noundef %state) #0 {"));
+
+    // Shard 2: f4 is tail-called from shard 1 -> external; f5 is intra-shard tail-called -> internal!
+    assert!(s2.contains(&format!("\ndefine void @{}(", function_symbol(f4))), "{s2}");
+    assert!(s2.contains(&format!("define internal void @{}(", function_symbol(f5))), "{s2}");
+    assert!(s2.contains("define void @__playgta6_dispatch_shard_main_00002(i32 noundef %local_idx, ptr noundef %state) #0 {"));
+
+    // functions.ll: zero sub_* declarations or references, exact 3 shard dispatchers and 6 entries.
+    assert!(!funcs.contains("@sub_"), "functions.ll must have zero @sub_* references:\n{funcs}");
+    assert_eq!(funcs.matches("declare void @__playgta6_dispatch_shard_main_").count(), 3);
+    assert_eq!(funcs.matches("%Pg6ShardFunctionEntry { i64 ").count(), 6);
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 0, i32 0 }}", f0 as i64)));
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 0, i32 1 }}", f1 as i64)));
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 1, i32 0 }}", f2 as i64)));
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 1, i32 1 }}", f3 as i64)));
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 2, i32 0 }}", f4 as i64)));
+    assert!(funcs.contains(&format!("{{ i64 {}, i32 2, i32 1 }}", f5 as i64)));
+
+    // Native target retargets both shards and functions.ll cleanly.
+    shard_opts.out_dir = tmp.path().join("shard_native");
+    shard_opts.target = LiftTarget::native_host();
+    run(&shard_opts).expect("shard native run");
+    let native_funcs =
+        fs::read_to_string(shard_opts.module_dir().join(LIFT_DIR).join("functions.ll")).unwrap();
+    assert!(!native_funcs.contains("target datalayout = "));
+    assert!(native_funcs.contains(&format!("target triple = \"{}\"", shard_opts.target.triple())));
+    assert!(!native_funcs.contains("@sub_"));
+}
+
+const SHARD_RUNNER_JS: &str = r#"'use strict';
+// Executes a linked wasm64 module built with `--indirect-dispatch shard` by reading
+// `Pg6ShardDispatchTable` (`runtime/abi/playgta6_abi.h`) directly from linear memory and
+// dispatching both entry and `__playgta6_indirect_call` through `shards[shard_idx](local_idx, state)`.
+const fs = require('fs');
+const [wasmPath, tableSymbol, entryVaHex] = process.argv.slice(2);
+const STATE = 0x100000, STACK_TOP = 0x1F0000, RSP = 4;
+let ex;
+const byVa = new Map();
+const dispatchers = [];
+const fail = (what, va) => { throw new Error(what + ' 0x' + BigInt(va).toString(16)); };
+const view = () => new DataView(ex.memory.buffer);
+const getFn = (i) => { try { return ex.__indirect_function_table.get(Number(i)); } catch (e) { return ex.__indirect_function_table.get(BigInt(i)); } };
+const instance = new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(wasmPath)), { env: {
+  pg6_guest_register_lifted_functions() { return 1; },
+  __playgta6_indirect_call(state, target) {
+    const entry = byVa.get(BigInt(target));
+    if (!entry) fail('no shard entry for', target);
+    dispatchers[entry.shardIdx](entry.localIdx, state);
+  },
+  __playgta6_unimplemented(state, va) { fail('unimplemented', va); },
+  __playgta6_divide_error(state, va) { fail('divide error', va); },
+  __playgta6_trap(state, va) { fail('trap', va); },
+} });
+ex = instance.exports;
+const tableGlobal = ex[tableSymbol];
+const tableAddr = Number(typeof tableGlobal === 'object' ? tableGlobal.value : tableGlobal);
+let v = view();
+const version = v.getUint32(tableAddr, true);
+const shardCount = v.getUint32(tableAddr + 4, true);
+const entryCount = Number(v.getBigUint64(tableAddr + 8, true));
+const shardsPtr = Number(v.getBigUint64(tableAddr + 16, true));
+const entriesPtr = Number(v.getBigUint64(tableAddr + 24, true));
+if (version !== 1) throw new Error('unexpected version ' + version);
+for (let s = 0; s < shardCount; s++) {
+  const fnIdx = v.getBigUint64(shardsPtr + 8 * s, true);
+  dispatchers.push(getFn(fnIdx));
+}
+let prevVa = -1n;
+for (let i = 0; i < entryCount; i++) {
+  const va = v.getBigUint64(entriesPtr + 16 * i, true);
+  const shardIdx = v.getUint32(entriesPtr + 16 * i + 8, true);
+  const localIdx = v.getUint32(entriesPtr + 16 * i + 12, true);
+  if (va <= prevVa) throw new Error('entries not strictly ascending');
+  prevVa = va;
+  byVa.set(va, { shardIdx, localIdx });
+}
+for (let i = 0; i < 16; i++) v.setBigUint64(STATE + 8 * i, 0n, true);
+v.setBigUint64(STACK_TOP - 8, 0xC0DEC0DEn, true);
+v.setBigUint64(STATE + 8 * RSP, BigInt(STACK_TOP - 8), true);
+const entry = byVa.get(BigInt(entryVaHex));
+if (!entry) throw new Error('missing entry ' + entryVaHex);
+dispatchers[entry.shardIdx](entry.localIdx, BigInt(STATE));
+v = view();
+const tableLen = ex.__indirect_function_table.length;
+process.stdout.write(`${shardCount} ${entryCount} ${tableLen} ${v.getBigUint64(STATE, true)} ${v.getBigUint64(STATE + 8 * RSP, true) - BigInt(STACK_TOP)}\n`);
+"#;
+
+#[test]
+fn shard_dispatch_compiles_links_and_executes_with_shrunk_wasm_table() {
+    let skip = |reason: String| {
+        println!("SKIP shard_dispatch_compiles_links_and_executes_with_shrunk_wasm_table: {reason}")
+    };
+    if let Err(reason) = llvm_tool() {
+        return skip(reason);
+    }
+    let Some(node) = find_on_path("node") else {
+        return skip("node not found on PATH".into());
+    };
+    // 8 functions across 2 shards (shard_size = 4):
+    //   Shard 0: f0 -> call f1 (intra), f1 -> call f2 (intra), f2 -> call f4 (cross-shard), f3 (unused leaf)
+    //   Shard 1: f4 -> lea rax, f5; call rax (indirect via shard dispatcher!) + add 100,
+    //            f5 -> jmp f6 (intra-shard tail call), f6 -> mov eax, 1000; ret, f7 (unused leaf)
+    let f: Vec<u64> = (0..8).map(|i| T + i * 0x20).collect();
+    let mut a = Asm::new(T);
+    a.call(f[1]).add_rax(1).ret().pad_to(0x20); // f0 (+1)
+    a.call(f[2]).add_rax(10).ret().pad_to(0x40); // f1 (+10)
+    a.call(f[4]).add_rax(20).ret().pad_to(0x60); // f2 (+20)
+    a.mov_eax(999).ret().pad_to(0x80); // f3
+    a.lea_rax(f[5])
+        .raw(&[0xFF, 0xD0]) // call rax (indirect)
+        .add_rax(100)
+        .ret()
+        .pad_to(0xA0); // f4 (+100)
+    a.rel32(&[0xE9], f[6]).pad_to(0xC0); // f5: tail call f6
+    a.mov_eax(1000).ret().pad_to(0xE0); // f6 (=1000)
+    a.mov_eax(888).ret().pad_to(0x100); // f7
+    let pdata: Vec<(u64, u64)> = f.iter().map(|&va| (va, va + 0x20)).collect();
+    let pe = TestPe {
+        text: a.bytes,
+        pdata,
+        ..TestPe::default()
+    }
+    .build();
+
+    let tmp = TempDir::new("shard_exec");
+    let mut options = options_for(tmp.path(), &pe);
+    options.emit_obj = true;
+    options.shard_size = 4;
+    options.module = "sdisp".to_string();
+    options.indirect_dispatch = IndirectDispatch::Shard;
+    let report = run(&options).expect("shard build");
+    assert_eq!(report.lift.shards.len(), 2, "8 functions / 4 per shard = 2 shards");
+    let mut objects: Vec<PathBuf> = report
+        .lift
+        .shards
+        .iter()
+        .map(|s| options.module_dir().join(&s.obj.as_ref().unwrap().path))
+        .collect();
+    objects.push(
+        options
+            .module_dir()
+            .join(&report.lift.registration_obj.as_ref().unwrap().path),
+    );
+
+    let table_sym = shard_dispatch_table_symbol("sdisp");
+    let exports = [table_sym.as_str()];
+    let wasm = tmp.path().join("sdisp.wasm");
+    let mut failures = Vec::new();
+    let linked = linkers().into_iter().any(|linker| {
+        link(&linker, &objects, &exports, &wasm)
+            .map_err(|e| {
+                failures.push(format!(
+                    "{}: {}",
+                    linker.0.display(),
+                    e.lines().next().unwrap_or("")
+                ))
+            })
+            .is_ok()
+    });
+    if !linked {
+        return skip(format!(
+            "no wasm linker could link the shard-dispatch objects ({})",
+            failures.join("; ")
+        ));
+    }
+    let script = tmp.path().join("shard_runner.js");
+    fs::write(&script, SHARD_RUNNER_JS).expect("write shard runner");
+    let mut last_error = String::new();
+    for flags in [&[][..], &["--experimental-wasm-memory64"][..]] {
+        let output = Command::new(&node)
+            .args(flags)
+            .arg(&script)
+            .arg(&wasm)
+            .arg(&table_sym)
+            .arg(format!("0x{:x}", f[0]))
+            .output()
+            .expect("run node");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parts: Vec<&str> = stdout.trim().split(' ').collect();
+            assert_eq!(parts.len(), 5, "unexpected runner output: {stdout}");
+            assert_eq!(parts[0], "2", "shard_count");
+            assert_eq!(parts[1], "8", "entry_count");
+            let wasm_table_len: usize = parts[2].parse().expect("table len");
+            // wasmTable holds only the 2 shard dispatchers (+ slot 0 null sentinel), NOT the 8 functions!
+            assert!(
+                wasm_table_len <= 3,
+                "wasmTable must only hold shard dispatchers, got length {wasm_table_len}"
+            );
+            assert_eq!(parts[3], "1131", "1000 + 100 + 20 + 10 + 1");
+            assert_eq!(parts[4], "0", "balanced guest stack");
+            return;
+        }
+        last_error = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !last_error.contains("memory64") && !last_error.contains("Memory64") {
+            break;
+        }
+    }
+    if last_error.contains("memory64") || last_error.contains("Memory64") {
+        return skip(format!(
+            "node cannot run wasm64: {}",
+            last_error.lines().next().unwrap_or("")
+        ));
+    }
+    panic!("running shard-dispatched wasm failed:\n{last_error}");
+}
