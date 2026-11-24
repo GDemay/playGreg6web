@@ -11,7 +11,9 @@ import {
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   normalizeBootMode,
   sanitizeValidationErrorMessage,
+  parseSideModuleProgressLabel,
 } from '../web/ui/hud_controller.js';
+import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
 import {
   BrowserStorageManager,
   DEFAULT_OPFS_CACHE_DIR,
@@ -1632,4 +1634,339 @@ test('W69: absent, frozen, or throwing optional DOM elements never throw and des
   assert.equal(withBindButtons.getBootMode(), 'idle');
   withBindButtons.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 5 });
   assert.equal(withBindButtons.getSideModuleProgress().sideModuleCount, 0);
+});
+
+// --- W78: Track Loaded Split Wasm Side Modules from Progress Labels ---
+
+test('W78: parseSideModuleProgressLabel parses layout, side-module loads, runtime init, and ignores unrelated/error lines', () => {
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Split-module Wasm64 layout detected (5 side modules).'),
+    { kind: 'layout', sideModuleCount: 5 }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Split-module Wasm64 layout detected (1 side module).'),
+    { kind: 'layout', sideModuleCount: 1 }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Loading Wasm side module (guest_part_0.wasm)...'),
+    { kind: 'module', moduleName: 'guest_part_0.wasm' }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel(
+      'Loading Wasm side module (C:\\Users\\secretuser\\playgta6web\\web\\dist\\guest_part_2.wasm?token=abc)...'
+    ),
+    { kind: 'module', moduleName: 'guest_part_2.wasm' }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Loaded Wasm side module (guest_part_3.wasm)'),
+    { kind: 'module', moduleName: 'guest_part_3.wasm' }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Wasm side module loaded (guest_part_4.wasm)'),
+    { kind: 'module', moduleName: 'guest_part_4.wasm' }
+  );
+  assert.deepEqual(
+    parseSideModuleProgressLabel('[wasm] playgta6web Wasm64 runtime initialized (ABI v1)'),
+    { kind: 'runtime_initialized' }
+  );
+  assert.deepEqual(parseSideModuleProgressLabel('[boot] XMEM_INIT reached'), {
+    kind: 'runtime_initialized',
+  });
+  assert.deepEqual(
+    parseSideModuleProgressLabel('Loading Emscripten Wasm64 runtime (dist/runtime.js)...'),
+    { kind: 'runtime_starting' }
+  );
+
+  // Pre-init PGIM_LOAD, failure lines, and unrelated messages must return null.
+  assert.equal(parseSideModuleProgressLabel('[boot] PGIM_LOAD mapped'), null);
+  assert.equal(parseSideModuleProgressLabel('[boot] XMEM_INIT failed: out of memory'), null);
+  assert.equal(parseSideModuleProgressLabel('wgpu_worker ready (Adapter)'), null);
+  assert.equal(parseSideModuleProgressLabel(''), null);
+  assert.equal(parseSideModuleProgressLabel(null), null);
+});
+
+test('W78: HudController observes hud.appendLog progress labels, deduplicates pthread replays, caps total, and detaches on destroy', () => {
+  const sideModuleStatusEl = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+  const hud = createMockHud();
+  const originalAppendLog = hud.appendLog;
+
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    displayElements: { sideModuleStatusEl, bootStatusEl },
+  });
+
+  // Live Chrome Test #25 progress sequence through hud.appendLog:
+  hud.appendLog('Split-module Wasm64 layout detected (5 side modules).', 'info');
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 0/5 (0%)');
+  assert.equal(sideModuleStatusEl.dataset.loaded, '0');
+  assert.equal(sideModuleStatusEl.dataset.total, '5');
+  assert.equal(sideModuleStatusEl.dataset.state, 'info');
+
+  const expectedSteps = [
+    ['guest_part_0.wasm', 1, 'Side modules: 1/5 (20%)', 'info'],
+    ['guest_part_1.wasm', 2, 'Side modules: 2/5 (40%)', 'info'],
+    ['guest_part_2.wasm', 3, 'Side modules: 3/5 (60%)', 'info'],
+    ['guest_part_3.wasm', 4, 'Side modules: 4/5 (80%)', 'info'],
+    ['guest_part_4.wasm', 5, 'Side modules: 5/5 loaded', 'ok'],
+  ];
+
+  for (const [name, expectedLoaded, expectedText, expectedState] of expectedSteps) {
+    hud.appendLog(`Loading Wasm side module (${name})...`, 'info');
+    const prog = controller.getSideModuleProgress();
+    assert.equal(prog.sideModuleCount, 5);
+    assert.equal(prog.loadedCount, expectedLoaded);
+    assert.equal(sideModuleStatusEl.textContent, expectedText);
+    assert.equal(sideModuleStatusEl.dataset.loaded, String(expectedLoaded));
+    assert.equal(sideModuleStatusEl.dataset.total, '5');
+    assert.equal(sideModuleStatusEl.dataset.state, expectedState);
+  }
+
+  // Pthread workers re-emitting the same side module names (including case variants/paths) must not double-count.
+  hud.appendLog('Loading Wasm side module (guest_part_0.wasm)...', 'info');
+  hud.appendLog('Loading Wasm side module (./dist/GUEST_PART_1.WASM?v=2)...', 'info');
+  // Stray extra module beyond announced 5 side modules stays capped at 5/5.
+  hud.appendLog('Loading Wasm side module (guest_part_99.wasm)...', 'info');
+  hud.appendLog('[wasm] playgta6web Wasm64 runtime initialized (ABI v1)', 'info');
+
+  const finalProg = controller.getSideModuleProgress();
+  assert.equal(finalProg.sideModuleCount, 5);
+  assert.equal(finalProg.loadedCount, 5);
+  assert.equal(finalProg.progressPct, 100);
+  assert.equal(finalProg.complete, true);
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 5/5 loaded');
+  assert.equal(sideModuleStatusEl.dataset.state, 'ok');
+
+  // All messages still reached the underlying HUD log array untouched.
+  assert.equal(hud.logs.length, 10);
+
+  // Subsequent reboot cycle resets progress cleanly on next layout announcement.
+  hud.appendLog('Split-module Wasm64 layout detected (5 side modules).', 'info');
+  assert.equal(controller.getSideModuleProgress().loadedCount, 0);
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 0/5 (0%)');
+
+  // destroy() restores original hud.appendLog and stops observing future logs.
+  controller.destroy();
+  assert.equal(hud.appendLog, originalAppendLog);
+  hud.appendLog('Loading Wasm side module (guest_part_0.wasm)...', 'info');
+  assert.equal(controller.getSideModuleProgress().loadedCount, 0);
+  assert.equal(hud.logs.length, 12);
+});
+
+test('W78: runtime initialization and post-init milestones mark pending side modules complete without affecting monolithic or smoke builds', () => {
+  // 1. Missed side-module log lines complete cleanly on runtime initialization.
+  const sideEl = createDisplayMockElement();
+  const hud = createMockHud();
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    displayElements: { sideModuleStatusEl: sideEl },
+  });
+
+  controller.setSideModules({ sideModuleCount: 5 });
+  assert.equal(sideEl.textContent, 'Side modules: 0/5 (0%)');
+
+  // PGIM_LOAD happens during preload before side modules load -> must stay 0/5.
+  controller.updateGpuBootTelemetry({ bootSummary: { stage: 'PGIM_LOAD' } });
+  assert.equal(controller.getSideModuleProgress().loadedCount, 0);
+  assert.equal(sideEl.textContent, 'Side modules: 0/5 (0%)');
+
+  // Partial load (2/5) followed by runtime init completes to 5/5.
+  hud.appendLog('Loading Wasm side module (guest_part_0.wasm)...', 'info');
+  hud.appendLog('Loading Wasm side module (guest_part_1.wasm)...', 'info');
+  assert.equal(sideEl.textContent, 'Side modules: 2/5 (40%)');
+
+  hud.appendLog('[wasm] playgta6web Wasm64 runtime initialized (ABI v1)', 'info');
+  assert.equal(controller.getSideModuleProgress().loadedCount, 5);
+  assert.equal(controller.getSideModuleProgress().complete, true);
+  assert.equal(sideEl.textContent, 'Side modules: 5/5 loaded');
+
+  // 2. XMEM_INIT via updateGpuBootTelemetry also marks pending side modules complete (e.g. frozen hud).
+  const sideEl2 = createDisplayMockElement();
+  const frozenHud = Object.freeze({ appendLog() {} });
+  const controller2 = new HudController({
+    hud: frozenHud,
+    bootMode: 'real-wasm64',
+    displayElements: { sideModuleStatusEl: sideEl2 },
+  });
+  controller2.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 0 });
+  controller2.updateGpuBootTelemetry({ bootSummary: { stage: 'XMEM_INIT' } });
+  assert.equal(controller2.getSideModuleProgress().loadedCount, 5);
+  assert.equal(controller2.getSideModuleProgress().complete, true);
+  assert.equal(sideEl2.textContent, 'Side modules: 5/5 loaded');
+
+  // 3. Monolithic build (0 side modules) stays inactive after runtime init.
+  const monoEl = createDisplayMockElement();
+  const monoHud = createMockHud();
+  const monoController = new HudController({
+    hud: monoHud,
+    bootMode: 'real-wasm64',
+    displayElements: { sideModuleStatusEl: monoEl },
+  });
+  monoHud.appendLog('[wasm] playgta6web Wasm64 runtime initialized (ABI v1)', 'info');
+  assert.equal(monoController.getSideModuleProgress().active, false);
+  assert.equal(monoEl.textContent, 'No split modules');
+
+  // 4. Smoke mode never marks side modules complete from runtime-init logs or FIRST_PRESENT telemetry.
+  const smokeEl = createDisplayMockElement();
+  const smokeHud = createMockHud();
+  const smokeController = new HudController({
+    hud: smokeHud,
+    bootMode: 'smoke',
+    displayElements: { sideModuleStatusEl: smokeEl },
+  });
+  smokeController.setSideModuleProgress({ sideModuleCount: 5, loadedCount: 0 });
+  smokeHud.appendLog('[wasm] playgta6web Wasm64 runtime initialized (ABI v1)', 'info');
+  smokeController.updateGpuBootTelemetry({ bootSummary: { stage: 'FIRST_PRESENT' } });
+  assert.equal(smokeController.getSideModuleProgress().loadedCount, 0);
+  assert.equal(smokeEl.textContent, 'Side modules: 0/5 (0%)');
+
+  controller.destroy();
+  controller2.destroy();
+  monoController.destroy();
+  smokeController.destroy();
+});
+
+test('W78: end-to-end bootstrapPlayGta6App + BroadcastChannel game-progress + HudController updates HUD to 5/5 loaded', async () => {
+  const channels = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this.closed = false;
+      channels.push(this);
+    }
+    emit(data) {
+      if (!this.closed && typeof this.onmessage === 'function') {
+        this.onmessage({ data });
+      }
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  const sideModuleStatusEl = createDisplayMockElement();
+  const bootModeBadge = createDisplayMockElement();
+  let hudController = null;
+
+  const hudApi = {
+    logs: [],
+    statuses: [],
+    metrics: [],
+    appendLog(message, level = 'info') {
+      this.logs.push({ message, level });
+    },
+    setStatus(text, level = 'info') {
+      this.statuses.push({ text, level });
+    },
+    updateMetrics(payload) {
+      this.metrics.push({ ...payload });
+    },
+    setBootMode(mode, opts) {
+      if (hudController) {
+        hudController.setBootMode(mode, { ...opts, updateHudStatus: false });
+      }
+    },
+    updateBootStatus(snapshot) {
+      if (hudController && snapshot) {
+        if (snapshot.sideModuleCount !== undefined || Array.isArray(snapshot.sideModuleUrls)) {
+          hudController.setSideModuleProgress(
+            {
+              sideModuleCount: snapshot.sideModuleCount,
+              sideModules: snapshot.sideModuleUrls,
+              loadedCount: snapshot.loadedSideModules ?? snapshot.loadedSideModuleCount,
+            },
+            { updateHudStatus: false }
+          );
+        }
+        if (snapshot.bootMode !== undefined) {
+          hudController.setBootMode(snapshot.bootMode, { updateHudStatus: false });
+        }
+      }
+    },
+    setSideModules(progress) {
+      if (hudController) {
+        hudController.setSideModuleProgress(progress, { updateHudStatus: false });
+      }
+    },
+  };
+
+  const mockWindow = {
+    crossOriginIsolated: true,
+    SharedArrayBuffer,
+    BroadcastChannel: MockBroadcastChannel,
+    location: { origin: 'http://127.0.0.1:8080' },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  const sideUrls = [
+    '/dist/guest_part_0.wasm',
+    '/dist/guest_part_1.wasm',
+    '/dist/guest_part_2.wasm',
+    '/dist/guest_part_3.wasm',
+    '/dist/guest_part_4.wasm',
+  ];
+
+  const app = bootstrapPlayGta6App({
+    windowObj: mockWindow,
+    documentObj: null,
+    navigatorObj: { gpu: {} },
+    canvas: { width: 640, height: 360 },
+    hud: hudApi,
+    capabilityProbe: () => createFullCapabilities(),
+    fetchImpl: createMockFetch({
+      hasWasmBinary: true,
+      sideModuleCount: 5,
+      sideModuleUrls: sideUrls,
+    }),
+    createWasmWorker: async () => ({
+      postMessage() {},
+      addEventListener() {},
+      removeEventListener() {},
+      terminate() {},
+    }),
+    attachGlobalErrorHandlers: false,
+    attachGlobalHook: false,
+    autoResize: false,
+  });
+
+  hudController = new HudController({
+    app,
+    sessionController: app.session,
+    hud: hudApi,
+    displayElements: { bootModeBadge, sideModuleStatusEl },
+  });
+
+  await app.start();
+  assert.equal(bootModeBadge.textContent, 'Real Wasm64');
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 0/5 (0%)');
+
+  const progressChannel = channels.find((ch) => ch.name === 'game-progress');
+  assert.ok(progressChannel, 'expected game-progress BroadcastChannel to be opened');
+
+  progressChannel.emit({ label: 'Loading Wasm side module (guest_part_0.wasm)...' });
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 1/5 (20%)');
+
+  progressChannel.emit({ label: 'Loading Wasm side module (guest_part_1.wasm)...' });
+  progressChannel.emit({ label: 'Loading Wasm side module (guest_part_2.wasm)...' });
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 3/5 (60%)');
+
+  progressChannel.emit({ label: 'Loading Wasm side module (guest_part_3.wasm)...' });
+  progressChannel.emit({ label: 'Loading Wasm side module (guest_part_4.wasm)...' });
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 5/5 loaded');
+  assert.equal(sideModuleStatusEl.dataset.loaded, '5');
+  assert.equal(sideModuleStatusEl.dataset.total, '5');
+  assert.equal(sideModuleStatusEl.dataset.state, 'ok');
+
+  progressChannel.emit({ label: '[wasm] playgta6web Wasm64 runtime initialized (ABI v1)' });
+  progressChannel.emit({ label: '[boot] XMEM_INIT' });
+  assert.equal(hudController.getSideModuleProgress().loadedCount, 5);
+  assert.equal(hudController.getSideModuleProgress().progressPct, 100);
+  assert.equal(sideModuleStatusEl.textContent, 'Side modules: 5/5 loaded');
+
+  hudController.destroy();
+  await app.destroy();
 });
