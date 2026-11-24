@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27)."""
 
 from __future__ import annotations
 
@@ -1973,6 +1973,367 @@ class TestNoLinkOptAndShrinkLargestShards(unittest.TestCase):
             self.assertIn("-O1", by_id["lift/shard-00000.ll"]["argv"])
             self.assertNotIn("-Oz", by_id["lift/shard-00000.ll"]["argv"])
             self.assertIn("-O1", by_id["stubs/pg6_import_thunks.cpp"]["argv"])
+
+
+class TestBrowserBootFlags(unittest.TestCase):
+    EXPECTED_INCOMING_API = (
+        "-sINCOMING_MODULE_JS_API=locateFile,instantiateWasm,mainScriptUrlOrBlob,"
+        "print,printErr,preRun,onRuntimeInitialized,noInitialRun,setStatus,onExit"
+    )
+    EXPECTED_RUNTIME_METHODS = (
+        "-sEXPORTED_RUNTIME_METHODS=wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
+    )
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void run_wasm_guest_boot() {}\n")
+        return repo
+
+    def test_wasm_exceptions_applies_to_cpp_and_link_not_ll_or_c_and_updates_cache_keys(self) -> None:
+        # compile_flags_for only adds -fwasm-exceptions to C++ units.
+        cpp_flags = bgw.compile_flags_for(opt="O2", kind="cpp", wasm_exceptions=True)
+        ll_flags = bgw.compile_flags_for(opt="O2", kind="ll", wasm_exceptions=True)
+        c_flags = bgw.compile_flags_for(opt="O2", kind="c", wasm_exceptions=True)
+        self.assertIn("-fwasm-exceptions", cpp_flags)
+        self.assertNotIn("-fwasm-exceptions", ll_flags)
+        self.assertNotIn("-fwasm-exceptions", c_flags)
+        self.assertNotIn("-fwasm-exceptions", bgw.compile_flags_for(opt="O2", kind="cpp"))
+
+        # resolve_link_flags & build_link_argv include -fwasm-exceptions when enabled.
+        self.assertIn("-fwasm-exceptions", bgw.resolve_link_flags(wasm_exceptions=True))
+        self.assertNotIn("-fwasm-exceptions", bgw.resolve_link_flags())
+        self.assertIn(
+            "-fwasm-exceptions",
+            bgw.build_link_argv(
+                "em++",
+                [Path("a.o")],
+                output_js=Path("web/dist/runtime.js"),
+                wasm_exceptions=True,
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            _write(src / "helper.c", "int helper(void) { return 1; }\n")
+            cache = root / "cache"
+
+            # Warm cache without wasm_exceptions.
+            runner1 = RecordingRunner()
+            first = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist1",
+                jobs=2,
+                link_guest_boot=True,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner1,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(first.ok, first.errors)
+            self.assertFalse(first.wasm_exceptions)
+            self.assertNotIn("-fwasm-exceptions", runner1.link_calls[0])
+            first_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+
+            # Rebuild with wasm_exceptions=True sharing the same cache:
+            # 2 .ll shards + 1 .c unit must be cache hits; 5 .cpp units (3 layout + 2 boot) recompile.
+            runner2 = RecordingRunner()
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist2",
+                jobs=2,
+                link_guest_boot=True,
+                wasm_exceptions=True,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner2,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertTrue(second.wasm_exceptions)
+            self.assertEqual(second.cache_hits, 3)
+            self.assertEqual(second.cache_misses, 5)
+            self.assertEqual(len(runner2.compile_calls), 5)
+
+            for item in second.sources:
+                if item.unit.kind == "cpp":
+                    self.assertEqual(item.status, "compiled")
+                    self.assertIn("-fwasm-exceptions", item.argv)
+                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+                else:
+                    self.assertEqual(item.status, "hit")
+                    self.assertNotIn("-fwasm-exceptions", item.argv)
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+            for call in runner2.compile_calls:
+                src_token = _source_token(call)
+                assert src_token is not None
+                self.assertEqual(Path(src_token).suffix.lower(), ".cpp")
+                self.assertIn("-fwasm-exceptions", call)
+
+            self.assertIn("-fwasm-exceptions", runner2.link_calls[0])
+            self.assertIn("-fwasm-exceptions", second.link_flags)
+            self.assertIn("-fwasm-exceptions", second.link_argv)
+            self.assertNotIn("-fwasm-exceptions", bgw.LINK_FLAGS)
+
+            payload = json.loads(bgw.report_to_json(second))
+            self.assertTrue(payload["wasm_exceptions"])
+            text = bgw.format_report_text(second)
+            self.assertIn("Wasm exceptions: yes", text)
+
+    def test_initial_memory_and_stack_size_flags(self) -> None:
+        flags = bgw.resolve_link_flags(initial_memory=" 64MB ", stack_size="8MB")
+        self.assertIn("-sINITIAL_MEMORY=64MB", flags)
+        self.assertIn("-sSTACK_SIZE=8MB", flags)
+        self.assertIn("-sDEFAULT_PTHREAD_STACK_SIZE=8MB", flags)
+
+        # Numeric byte counts are also valid alphanumeric size tokens.
+        byte_flags = bgw.resolve_link_flags(initial_memory="67108864", stack_size="8388608")
+        self.assertIn("-sINITIAL_MEMORY=67108864", byte_flags)
+        self.assertIn("-sSTACK_SIZE=8388608", byte_flags)
+        self.assertIn("-sDEFAULT_PTHREAD_STACK_SIZE=8388608", byte_flags)
+
+        link_argv = bgw.build_link_argv(
+            "em++",
+            [Path("a.o")],
+            output_js=Path("web/dist/runtime.js"),
+            initial_memory="64MB",
+            stack_size="8MB",
+        )
+        self.assertIn("-sINITIAL_MEMORY=64MB", link_argv)
+        self.assertIn("-sSTACK_SIZE=8MB", link_argv)
+        self.assertIn("-sDEFAULT_PTHREAD_STACK_SIZE=8MB", link_argv)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=2,
+                initial_memory="64MB",
+                stack_size="8MB",
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.initial_memory, "64MB")
+            self.assertEqual(report.stack_size, "8MB")
+            link = runner.link_calls[0]
+            self.assertIn("-sINITIAL_MEMORY=64MB", link)
+            self.assertIn("-sSTACK_SIZE=8MB", link)
+            self.assertIn("-sDEFAULT_PTHREAD_STACK_SIZE=8MB", link)
+
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertEqual(payload["initial_memory"], "64MB")
+            self.assertEqual(payload["stack_size"], "8MB")
+            text = bgw.format_report_text(report)
+            self.assertIn("Initial memory: 64MB", text)
+            self.assertIn("Stack size: 8MB", text)
+
+    def test_assertions_flag_and_strip_precedence(self) -> None:
+        # Standalone assertions=0 and assertions=1.
+        flags0 = bgw.resolve_link_flags(assertions=0)
+        self.assertIn("-sASSERTIONS=0", flags0)
+        self.assertNotIn("-sASSERTIONS=1", flags0)
+
+        flags1 = bgw.resolve_link_flags(assertions=1)
+        self.assertIn("-sASSERTIONS=1", flags1)
+        self.assertNotIn("-sASSERTIONS=0", flags1)
+
+        # Explicit assertions=1 overrides --strip's -sASSERTIONS=0 while keeping --strip-all.
+        strip_and_assert1 = bgw.resolve_link_flags(strip=True, assertions=1)
+        self.assertIn("-Wl,--strip-all", strip_and_assert1)
+        self.assertIn("-sASSERTIONS=1", strip_and_assert1)
+        self.assertNotIn("-sASSERTIONS=0", strip_and_assert1)
+
+        # Explicit assertions=0 with --strip does not duplicate -sASSERTIONS=0.
+        strip_and_assert0 = bgw.resolve_link_flags(strip=True, assertions=0)
+        self.assertIn("-Wl,--strip-all", strip_and_assert0)
+        self.assertEqual(strip_and_assert0.count("-sASSERTIONS=0"), 1)
+
+        # Default strip=True, assertions=None retains backwards-compatible -sASSERTIONS=0.
+        strip_only = bgw.resolve_link_flags(strip=True)
+        self.assertIn("-Wl,--strip-all", strip_only)
+        self.assertIn("-sASSERTIONS=0", strip_only)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            runner = RecordingRunner()
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=root / "dist",
+                jobs=1,
+                strip=True,
+                assertions=1,
+                runtime_lib=repo / "runtime" / "build-wasm64" / "libplaygta6_core.a",
+                run_command=runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.assertions, 1)
+            link = runner.link_calls[0]
+            self.assertIn("-Wl,--strip-all", link)
+            self.assertIn("-sASSERTIONS=1", link)
+            self.assertNotIn("-sASSERTIONS=0", link)
+            payload = json.loads(bgw.report_to_json(report))
+            self.assertEqual(payload["assertions"], 1)
+            self.assertIn("Assertions: 1", bgw.format_report_text(report))
+
+    def test_browser_boot_exports_and_full_cli_combination(self) -> None:
+        default_flags = bgw.resolve_link_flags()
+        self.assertNotIn(self.EXPECTED_INCOMING_API, default_flags)
+        self.assertNotIn(self.EXPECTED_RUNTIME_METHODS, default_flags)
+
+        boot_flags = bgw.resolve_link_flags(browser_boot_exports=True)
+        self.assertIn(self.EXPECTED_INCOMING_API, boot_flags)
+        self.assertIn(self.EXPECTED_RUNTIME_METHODS, boot_flags)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--link-guest-boot",
+                    "--wasm-exceptions",
+                    "--initial-memory",
+                    "64MB",
+                    "--stack-size",
+                    "8MB",
+                    "--strip",
+                    "--assertions",
+                    "1",
+                    "--browser-boot-exports",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache"),
+                    "--out-dir",
+                    str(root / "dist"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["wasm_exceptions"])
+            self.assertEqual(payload["initial_memory"], "64MB")
+            self.assertEqual(payload["stack_size"], "8MB")
+            self.assertEqual(payload["assertions"], 1)
+            self.assertTrue(payload["browser_boot_exports"])
+
+            for expected in (
+                "-fwasm-exceptions",
+                "-sINITIAL_MEMORY=64MB",
+                "-sSTACK_SIZE=8MB",
+                "-sDEFAULT_PTHREAD_STACK_SIZE=8MB",
+                "-Wl,--strip-all",
+                "-sASSERTIONS=1",
+                self.EXPECTED_INCOMING_API,
+                self.EXPECTED_RUNTIME_METHODS,
+            ):
+                self.assertIn(expected, payload["link_flags"])
+                self.assertIn(expected, payload["link_argv"])
+            self.assertNotIn("-sASSERTIONS=0", payload["link_flags"])
+            self.assertNotIn("-sASSERTIONS=0", payload["link_argv"])
+
+            for unit in payload["sources"]:
+                if unit["kind"] == "cpp":
+                    self.assertIn("-fwasm-exceptions", unit["argv"])
+                else:
+                    self.assertNotIn("-fwasm-exceptions", unit["argv"])
+
+            # Sanitized JSON output contains no raw backslashes or host username.
+            dumped = json.dumps(payload)
+            self.assertNotIn("\\\\", dumped)
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+            if len(user) >= 3:
+                self.assertNotRegex(dumped, rf"(?<![A-Za-z0-9_]){user}(?![A-Za-z0-9_])")
+
+            # Verify text summary includes browser boot exports line.
+            code_txt, out_txt, err_txt = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--browser-boot-exports",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache2"),
+                    "--out-dir",
+                    str(root / "dist2"),
+                ]
+            )
+            self.assertEqual(code_txt, 0, err_txt)
+            self.assertIn("Browser boot exports: yes", out_txt)
+
+    def test_invalid_browser_boot_flag_values_rejected(self) -> None:
+        bad_sizes = ("", "   ", "0", "0MB", "-64MB", "64 MB", "abc", "64MB;rm", "8.5MB", "64MB/x")
+        for bad in bad_sizes:
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"initial_memory={bad!r}"):
+                bgw.resolve_link_flags(initial_memory=bad)
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"stack_size={bad!r}"):
+                bgw.resolve_link_flags(stack_size=bad)
+
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.resolve_link_flags(initial_memory=64)  # type: ignore[arg-type]
+        with self.assertRaises(bgw.BuildGuestWasmError):
+            bgw.resolve_link_flags(stack_size=8)  # type: ignore[arg-type]
+
+        for bad_assert in (-1, 2, 99, True, False, "1"):
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=f"assertions={bad_assert!r}"):
+                bgw.resolve_link_flags(assertions=bad_assert)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            src = _layout_sources(root)
+
+            for cli_flag, bad_val, err_needle in (
+                ("--initial-memory", "", "initial-memory"),
+                ("--initial-memory", "64 MB", "initial-memory"),
+                ("--initial-memory", "0MB", "initial-memory"),
+                ("--stack-size", "abc", "stack-size"),
+                ("--stack-size", "8MB;bad", "stack-size"),
+                ("--assertions", "2", "assertions"),
+                ("--assertions", "-1", "assertions"),
+            ):
+                code, out, _err = _run_cli(
+                    [
+                        str(src),
+                        "--dry-run",
+                        "--json",
+                        cli_flag,
+                        bad_val,
+                        "--repo-root",
+                        str(repo),
+                    ]
+                )
+                self.assertEqual(code, 2, f"{cli_flag} {bad_val!r} -> {out}")
+                payload = json.loads(out)
+                self.assertFalse(payload["ok"])
+                self.assertTrue(
+                    any(err_needle in e for e in payload["errors"]),
+                    f"expected {err_needle!r} in {payload['errors']}",
+                )
 
 
 class TestLinkFlagContract(unittest.TestCase):
