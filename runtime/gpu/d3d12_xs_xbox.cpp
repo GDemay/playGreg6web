@@ -646,122 +646,6 @@ HResult Device::RegisterPagePool_unverified(uint64_t, uint32_t, GuestPtr<uint64_
     return kSOk;
 }
 
-namespace {
-
-constexpr uint64_t kMaxComputeShaderBytes = 64u << 20;
-
-// Extracts the 16-byte DXBC HASH part digest (after its u32 flags), or false if absent.
-bool extract_dxil_hash_digest(const uint8_t* p, size_t n, Device::DxilDigest* out) {
-    auto u32 = [&](size_t at) {
-        uint32_t v = 0;
-        std::memcpy(&v, p + at, 4);
-        return v;
-    };
-    if (n < 32 || u32(0) != 0x43425844u) {  // "DXBC"
-        return false;
-    }
-    const uint32_t parts = u32(28);
-    if (parts > 64 || 32 + uint64_t{parts} * 4 > n) {
-        return false;
-    }
-    for (uint32_t i = 0; i < parts; ++i) {
-        const uint32_t off = u32(32 + i * 4);
-        if (uint64_t{off} + 8 > n) {
-            return false;
-        }
-        if (u32(off) == 0x48534148u && u32(off + 4) >= 20 && uint64_t{off} + 8 + 20 <= n) {  // "HASH"
-            std::memcpy(out->data(), p + off + 12, 16);
-            return true;
-        }
-    }
-    return false;
-}
-
-struct PreparedComputeShader {
-    uint64_t cs_identity = 0;
-    Device::DxilDigest cs_digest{};
-    Device::NativeStageRecord native_cs{};
-    uint64_t pack_key = 0;
-};
-
-// Reads the compute shader bytes, joins any slot-67 native compute stage by HASH digest, and
-// resolves against ShaderPackIndex (PackStage::Compute, entry point cs_main).
-PreparedComputeShader prepare_compute_shader(Device& dev, const GuestComputePipelineStateDesc& g,
-                                             const ShaderPackIndex* pack, std::mutex& pack_mutex,
-                                             std::unordered_map<uint64_t, uint32_t>& pack_modules,
-                                             std::set<std::pair<uint64_t, uint64_t>>& pack_layouts) {
-    PreparedComputeShader prep{};
-    if (g.CS.pShaderBytecode == 0 || g.CS.BytecodeLength == 0 || g.CS.BytecodeLength > kMaxComputeShaderBytes) {
-        return prep;
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(g.CS.BytecodeLength));
-    if (!com::read_guest(g.CS.pShaderBytecode, bytes.data(), bytes.size())) {
-        return prep;
-    }
-    prep.cs_identity = shader_identity(bytes.data(), bytes.size());
-    static const Device::DxilDigest kZero{};
-    if (extract_dxil_hash_digest(bytes.data(), bytes.size(), &prep.cs_digest) && dev.native_index_size() != 0 &&
-        prep.cs_digest != kZero) {
-        dev.count(dev.find_native_stage(prep.cs_digest, &prep.native_cs) ? xbox::Counter::DxilStagesJoined
-                                                                         : xbox::Counter::DxilStagesNotJoined);
-    }
-    if (pack == nullptr || prep.cs_identity == 0) {
-        return prep;
-    }
-    for (uint64_t k : {prep.native_cs.identity != 0 ? prep.native_cs.code_identity : uint64_t{0}, prep.cs_identity}) {
-        auto it = k != 0 ? pack->find(k) : pack->end();
-        if (it != pack->end() && it->second == PackStage::Compute) {
-            prep.pack_key = k;
-            break;
-        }
-    }
-    if (prep.pack_key == 0) {
-        return prep;
-    }
-    std::lock_guard<std::mutex> lock(pack_mutex);
-    uint32_t module_id = 0;
-    auto it = pack_modules.find(prep.pack_key);
-    if (it != pack_modules.end()) {
-        module_id = it->second;
-    } else {
-        module_id = dev.allocate_id();
-        CommandEncoder enc;
-        enc.create_shader_module(module_id, GpuShaderStage::Compute, pack_key_code(prep.pack_key));
-        dev.submit(enc);
-        pack_modules.emplace(prep.pack_key, module_id);
-    }
-    dev.register_shader_module(prep.cs_identity, module_id);
-    if (g.pRootSignature != 0) {
-        auto rs_arg = InterfaceArg<IRootSignatureHost>::resolve(g.pRootSignature);
-        if (rs_arg && pack_layouts.insert({prep.cs_identity, 0}).second) {
-            auto* rs = static_cast<RootSignature*>(rs_arg.get());
-            bridge::PipelineLayoutDesc layout = layout_from_root_signature(rs->signature().desc());
-            for (bridge::GroupLayoutDesc& group : layout.groups) {
-                for (bridge::LayoutBinding& b : group.bindings) {
-                    b.entry.visibility = GpuShaderStageBits::Compute;
-                }
-            }
-            dev.state_bridge().register_pipeline_layout(prep.cs_identity, 0, std::move(layout));
-        }
-    }
-    return prep;
-}
-
-uint32_t record_compute_dump(PipelineDump& dump, const GuestComputePipelineStateDesc& g,
-                             const PreparedComputeShader& prep) {
-    RootSignature* rs = nullptr;
-    if (g.pRootSignature != 0) {
-        auto rs_arg = InterfaceArg<IRootSignatureHost>::resolve(g.pRootSignature);
-        if (rs_arg) {
-            rs = static_cast<RootSignature*>(rs_arg.get());
-        }
-    }
-    return dump.compute_pipeline(prep.cs_identity, prep.cs_digest, prep.native_cs.code_identity,
-                                 prep.native_cs.identity, rs, rs != nullptr ? &rs->signature().desc() : nullptr);
-}
-
-}  // namespace
-
 HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
     // Slot 62: (desc, a, b, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (DXIL compute
     // shader). a and b were always 0; other values are recorded and otherwise ignored.
@@ -781,20 +665,9 @@ HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
         note_bad_argument("CreateComputePipelineState (Xbox slot 62): unknown arguments " + hex(a) + ", " + hex(b) +
                           " ignored");
     }
-    const PreparedComputeShader prep =
-        prepare_compute_shader(*this, g, options_.shader_pack.get(), pack_mutex_, pack_modules_, pack_layouts_);
     const HResult hr = create_compute_pso(g, riid, out);
     if (hr >= 0) {
         count(xbox::Counter::ComputePipelineStatesX);
-        if (dump_ && prep.cs_identity != 0) {
-            const uint32_t dump_idx = record_compute_dump(*dump_, g, prep);
-            uint64_t pso_va = 0;
-            if (hr == kSOk && !out.is_null() && com::read_guest(out.va(), pso_va)) {
-                if (auto pso_arg = InterfaceArg<IPipelineStateHost>::resolve(pso_va)) {
-                    static_cast<PipelineState*>(pso_arg.get())->dump_index_ = dump_idx;
-                }
-            }
-        }
     } else if (out) {
         out.write(0);  // the caller frees the bytecode and takes its failure path
     }
@@ -850,6 +723,13 @@ HResult Device::CreatePipelineStateFromBlob_unverified(com::CallContext& ctx) {
                             native_by_digest_.emplace(dig, rec);
                         }
                     }
+                    if (meta.size() >= 28) {
+                        DxilDigest dig;
+                        std::memcpy(dig.data(), meta.data() + meta.size() - 28, 16);
+                        if (dig != kZero) {
+                            native_by_digest_.emplace(dig, rec);
+                        }
+                    }
                 }
             }
         }
@@ -898,22 +778,8 @@ HResult Device::CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& 
     }
     count(xbox::Counter::StreamPipelineStates);
     switch (p.kind) {
-    case xbox::StreamPipelineKind::Compute: {
-        const PreparedComputeShader prep =
-            prepare_compute_shader(*this, p.compute, options_.shader_pack.get(), pack_mutex_, pack_modules_,
-                                   pack_layouts_);
-        const HResult hr = create_compute_pso(p.compute, riid, out);
-        if (hr >= 0 && dump_ && prep.cs_identity != 0) {
-            const uint32_t dump_idx = record_compute_dump(*dump_, p.compute, prep);
-            uint64_t pso_va = 0;
-            if (hr == kSOk && !out.is_null() && com::read_guest(out.va(), pso_va)) {
-                if (auto pso_arg = InterfaceArg<IPipelineStateHost>::resolve(pso_va)) {
-                    static_cast<PipelineState*>(pso_arg.get())->dump_index_ = dump_idx;
-                }
-            }
-        }
-        return hr;
-    }
+    case xbox::StreamPipelineKind::Compute:
+        return create_compute_pso(p.compute, riid, out);
     case xbox::StreamPipelineKind::Mesh:
         count(xbox::Counter::PlaceholderPipelineStates);
         return create_placeholder_pso("mesh/amplification shaders", riid, out);
