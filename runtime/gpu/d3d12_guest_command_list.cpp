@@ -1492,9 +1492,17 @@ void CommandList::IASetIndexBuffer(uint64_t view) {
     index_buffer_ = VertexBufferRecord{g.BufferLocation, g.SizeInBytes, g.Format};
     d3d::GpuVaResolution res;
     if (!device_->state_bridge().resolve_gpu_va(g.BufferLocation, &res)) {
-        note("IASetIndexBuffer: unknown GPU virtual address " + hex(g.BufferLocation));
-        bridge_.IASetIndexBuffer(nullptr);
-        return;
+        // Address-only guest memory (G58: the title's dynamic ring buffers): a runtime-owned mirror.
+        uint32_t buf_id = 0;
+        uint64_t buf_off = 0;
+        if (g.BufferLocation == 0 || g.SizeInBytes == 0 ||
+            !device_->relocate_ia_buffer(g.BufferLocation, g.SizeInBytes, &buf_id, &buf_off)) {
+            note("IASetIndexBuffer: unknown GPU virtual address " + hex(g.BufferLocation));
+            bridge_.IASetIndexBuffer(nullptr);
+            return;
+        }
+        res.resource_id = buf_id;
+        res.offset = buf_off;
     }
     if (g.Format != 57 && g.Format != 42) {
         note("IASetIndexBuffer: invalid index format " + std::to_string(g.Format));
@@ -1537,7 +1545,16 @@ void CommandList::IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t vi
             v[i].buffer_id = res.resource_id;
             v[i].offset = res.offset;
         } else if (g[i].BufferLocation != 0) {
-            note("IASetVertexBuffers: unknown GPU virtual address " + hex(g[i].BufferLocation));
+            // Address-only guest memory (G58: the title's dynamic ring buffers): a runtime-owned mirror.
+            uint32_t buf_id = 0;
+            uint64_t buf_off = 0;
+            if (g[i].SizeInBytes != 0 &&
+                device_->relocate_ia_buffer(g[i].BufferLocation, g[i].SizeInBytes, &buf_id, &buf_off)) {
+                v[i].buffer_id = buf_id;
+                v[i].offset = buf_off;
+            } else {
+                note("IASetVertexBuffers: unknown GPU virtual address " + hex(g[i].BufferLocation));
+            }
         }
         v[i].size_in_bytes = g[i].SizeInBytes;
         v[i].stride_in_bytes = g[i].StrideInBytes;
