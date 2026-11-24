@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
-translation units, compiles dirty shards in parallel with `emcc`/`em++`, caches `.o`
-files by SHA-256 of content + compiler flags, and links with `libplaygta6_core.a`
+translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
+`program-manifest.json`, compiles dirty shards in parallel with `emcc`/`em++`, caches
+`.o` files by SHA-256 of content + compiler flags, and links with `libplaygta6_core.a`
 into `web/dist/runtime.js` + `web/dist/runtime.wasm`.
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
@@ -15,6 +16,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
     python tools/build_guest_wasm.py <recomp-out-dir>
         [--jobs N] [--cache-dir work/wasm_obj_cache] [--out-dir web/dist]
         [--opt O2|O3] [--runtime-lib path/to/libplaygta6_core.a]
+        [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
 """
 
@@ -29,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +45,17 @@ DEFAULT_RUNTIME_LIB_REL = Path("runtime") / "build-wasm64" / "libplaygta6_core.a
 EMSDK_UPSTREAM_REL = Path("work") / "emsdk" / "upstream" / "emscripten"
 RUNTIME_JS = "runtime.js"
 RUNTIME_WASM = "runtime.wasm"
+BUILD_MANIFEST_FILE = "build-manifest.json"
+PROGRAM_MANIFEST_FILE = "program-manifest.json"
+RESPONSE_FILE_NAME = "link_objects.rsp"
+RESPONSE_FILE_THRESHOLD = 32
+BOOT_LINKED_GUEST_DEFINE = "-DPG6_BOOT_LINKED_GUEST=1"
+DEFAULT_GUEST_BOOT_ENTRY_REL = Path("runtime") / "guest" / "boot_main.cpp"
+PROGRAM_LEVEL_UNITS: tuple[str, ...] = (
+    "exports/pg6_export_thunks.cpp",
+    "program_modules.cpp",
+    "pg6_program.cpp",
+)
 
 SOURCE_SUFFIXES: frozenset[str] = frozenset({".ll", ".c", ".cc", ".cpp", ".cxx"})
 IR_SUFFIXES: frozenset[str] = frozenset({".ll"})
@@ -122,9 +136,16 @@ class SourceUnit:
     unit_id: str
     path: Path
     kind: str  # "ll" | "c" | "cpp"
+    module: str | None = None
+    instructions: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.unit_id, "kind": self.kind}
+        out: dict[str, Any] = {"id": self.unit_id, "kind": self.kind}
+        if self.module:
+            out["module"] = self.module
+        if self.instructions:
+            out["instructions"] = self.instructions
+        return out
 
 
 @dataclass(frozen=True)
@@ -166,6 +187,8 @@ class UnitBuildResult:
     status: str  # "hit" | "compiled" | "planned" | "error"
     returncode: int = 0
     error: str | None = None
+    seconds: float = 0.0
+    object_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -177,6 +200,8 @@ class UnitBuildResult:
             "returncode": self.returncode,
             "argv": list(self.argv),
         }
+        if self.unit.module:
+            out["module"] = self.unit.module
         if self.error:
             out["error"] = self.error
         return out
@@ -200,6 +225,12 @@ class BuildReport:
     verify: dict[str, Any] | None = None
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    linked_guest_boot: bool = False
+    response_file: str | None = None
+    sample: int = 0
+    extrapolated: dict[str, Any] | None = None
+    compile_seconds: float = 0.0
+    object_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,6 +251,12 @@ class BuildReport:
             "verify": self.verify,
             "errors": list(self.errors),
             "warnings": list(self.warnings),
+            "linked_guest_boot": self.linked_guest_boot,
+            "response_file": self.response_file,
+            "sample": self.sample,
+            "extrapolated": self.extrapolated,
+            "compile_seconds": self.compile_seconds,
+            "object_bytes": self.object_bytes,
         }
 
 
@@ -265,7 +302,14 @@ def sanitize_argv(argv: Sequence[str]) -> list[str]:
     """Keep flag tokens; replace filesystem operands with basenames / labels."""
     out: list[str] = []
     skip_next_as_file = False
-    file_flags = {"-o", "-I", "--cache-dir", "--out-dir", "--runtime-lib"}
+    file_flags = {
+        "-o",
+        "-I",
+        "--cache-dir",
+        "--out-dir",
+        "--runtime-lib",
+        "--guest-boot-entry",
+    }
     for idx, token in enumerate(argv):
         if skip_next_as_file:
             out.append(_sanitize_fs_token(token))
@@ -300,15 +344,19 @@ def _tool_label(token: str) -> str:
 
 
 def _sanitize_fs_token(token: str) -> str:
-    normalized = token.replace("\\", "/")
+    rsp_prefix = token.startswith("@")
+    body = token[1:] if rsp_prefix else token
+    normalized = body.replace("\\", "/")
     name = normalized.rsplit("/", 1)[-1]
-    if name in {RUNTIME_JS, RUNTIME_WASM, "libplaygta6_core.a"}:
-        return name
+    if name in {RUNTIME_JS, RUNTIME_WASM, "libplaygta6_core.a", RESPONSE_FILE_NAME}:
+        return f"@{name}" if rsp_prefix else name
     suffix = Path(name).suffix.lower()
-    if suffix in {".o", ".a", ".ll", ".c", ".cc", ".cpp", ".cxx", ".js", ".wasm", ".h"}:
-        return name
-    if suffix or "/" in normalized or (len(token) >= 2 and token[1] == ":"):
-        return name or "<path>"
+    if suffix in {".o", ".a", ".ll", ".c", ".cc", ".cpp", ".cxx", ".js", ".wasm", ".h", ".rsp"}:
+        return f"@{name}" if rsp_prefix else name
+    drive = len(body) >= 2 and body[1] == ":"
+    if suffix or "/" in normalized or drive:
+        label = name or "<path>"
+        return f"@{label}" if rsp_prefix else label
     return token
 
 
@@ -428,8 +476,15 @@ def parse_opt_level(raw: str) -> str:
     raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, or O3")
 
 
-def compile_flags_for(*, opt: str, kind: str, include_dirs: Sequence[Path] = ()) -> tuple[str, ...]:
+def compile_flags_for(
+    *,
+    opt: str,
+    kind: str,
+    include_dirs: Sequence[Path] = (),
+    extra_flags: Sequence[str] = (),
+) -> tuple[str, ...]:
     flags: list[str] = [*COMPILE_WASM_FLAGS, f"-{opt}"]
+    flags.extend(extra_flags)
     if kind == "ll":
         flags.extend(["-x", "ir"])
     elif kind == "cpp":
@@ -468,12 +523,12 @@ def _collect_manifest_paths(data: Any) -> list[str]:
 
     def take(item: Any) -> None:
         if isinstance(item, str) and item.strip():
-            paths.append(item.strip())
+            paths.append(item.strip().replace("\\", "/"))
         elif isinstance(item, Mapping):
             for key in ("path", "file", "source", "ll", "cpp", "c"):
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
-                    paths.append(value.strip())
+                    paths.append(value.strip().replace("\\", "/"))
                     return
 
     if isinstance(data, list):
@@ -516,13 +571,82 @@ def load_build_manifest(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def discover_sources(source_dir: Path, *, manifest_name: str = "build-manifest.json") -> list[SourceUnit]:
-    """Discover sharded `.ll` / `.c` / `.cpp` units from a recomp output directory."""
-    if not source_dir.is_dir():
-        raise BuildGuestWasmError(f"source directory not found: {source_dir.name}")
+def resolve_source_root(source: Path) -> Path:
+    """Accept a recomp output directory or a direct path to a manifest JSON file."""
+    if source.is_file() and source.name in {BUILD_MANIFEST_FILE, PROGRAM_MANIFEST_FILE}:
+        return source.parent
+    return source
 
-    root = source_dir.resolve()
+
+def _instruction_counts(data: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not isinstance(data, Mapping):
+        return counts
+    lift = data.get("lift")
+    if not isinstance(lift, Mapping):
+        return counts
+    shards = lift.get("shards")
+    if not isinstance(shards, list):
+        return counts
+    for shard in shards:
+        if not isinstance(shard, Mapping):
+            continue
+        rel = shard.get("ll") or shard.get("path")
+        instr = shard.get("instructions")
+        if isinstance(rel, str) and isinstance(instr, int):
+            counts[rel.replace("\\", "/")] = instr
+    return counts
+
+
+def _module_name_from_entry(item: Any) -> str | None:
+    if isinstance(item, str) and item.strip():
+        return item.strip().replace("\\", "/").rstrip("/")
+    if not isinstance(item, Mapping):
+        return None
+    for key in ("module", "name", "dir"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip().replace("\\", "/").rstrip("/")
+            if text.endswith(f"/{BUILD_MANIFEST_FILE}"):
+                text = text[: -len(BUILD_MANIFEST_FILE)].rstrip("/")
+            return text
+    return None
+
+
+def is_shard_unit(unit: SourceUnit) -> bool:
+    name = Path(unit.unit_id.replace("\\", "/")).name
+    return unit.kind == "ll" and name.startswith("shard-")
+
+
+def sample_units(units: Sequence[SourceUnit], count: int) -> list[SourceUnit]:
+    """`count` shards spread evenly over the set (registration / thunks are not sampled)."""
+    shards = [unit for unit in units if is_shard_unit(unit)]
+    if count <= 0:
+        return list(units)
+    if not shards:
+        return []
+    if count >= len(shards):
+        return list(shards)
+    step = len(shards) / count
+    picked: list[SourceUnit] = []
+    seen: set[str] = set()
+    for index in range(count):
+        unit = shards[int(index * step)]
+        if unit.unit_id in seen:
+            continue
+        seen.add(unit.unit_id)
+        picked.append(unit)
+    return picked
+
+
+def _discover_tree_sources(
+    root: Path,
+    *,
+    manifest_name: str = BUILD_MANIFEST_FILE,
+    module: str | None = None,
+) -> list[SourceUnit]:
     found: dict[str, SourceUnit] = {}
+    instructions: dict[str, int] = {}
 
     def add_file(path: Path) -> None:
         if not path.is_file():
@@ -536,7 +660,14 @@ def discover_sources(source_dir: Path, *, manifest_name: str = "build-manifest.j
         except ValueError:
             return
         unit_id = posix_rel(resolved, root)
-        found[unit_id] = SourceUnit(unit_id=unit_id, path=resolved, kind=kind)
+        instr = instructions.get(unit_id, 0)
+        found[unit_id] = SourceUnit(
+            unit_id=unit_id,
+            path=resolved,
+            kind=kind,
+            module=module,
+            instructions=instr,
+        )
 
     manifest_path = root / manifest_name
     if manifest_path.is_file():
@@ -544,6 +675,7 @@ def discover_sources(source_dir: Path, *, manifest_name: str = "build-manifest.j
             data = load_build_manifest(manifest_path)
         except (OSError, json.JSONDecodeError) as exc:
             raise BuildGuestWasmError(f"invalid {manifest_name}: {exc}") from exc
+        instructions.update(_instruction_counts(data))
         for rel in _collect_manifest_paths(data):
             add_file((root / rel).resolve() if not Path(rel).is_absolute() else Path(rel))
 
@@ -555,6 +687,89 @@ def discover_sources(source_dir: Path, *, manifest_name: str = "build-manifest.j
     units = list(found.values())
     units.sort(key=lambda u: u.unit_id)
     return units
+
+
+def discover_program_sources(root: Path, data: Any) -> list[SourceUnit]:
+    """Discover every module plus program-level export / descriptor sources."""
+    found: dict[str, SourceUnit] = {}
+    modules: list[str] = []
+    if isinstance(data, Mapping):
+        raw_modules = data.get("modules")
+        if isinstance(raw_modules, list):
+            for item in raw_modules:
+                name = _module_name_from_entry(item)
+                if name and name not in modules:
+                    modules.append(name)
+
+    for name in modules:
+        module_dir = root / name
+        if not module_dir.is_dir():
+            continue
+        for unit in _discover_tree_sources(module_dir.resolve(), module=name):
+            unit_id = f"{name}/{unit.unit_id}"
+            found[unit_id] = SourceUnit(
+                unit_id=unit_id,
+                path=unit.path,
+                kind=unit.kind,
+                module=name,
+                instructions=unit.instructions,
+            )
+
+    program_rels: list[str] = []
+    for rel in PROGRAM_LEVEL_UNITS:
+        if rel not in program_rels:
+            program_rels.append(rel)
+    if isinstance(data, Mapping):
+        module_prefixes = tuple(f"{name}/" for name in modules)
+        for rel in _collect_manifest_paths(data):
+            if rel in modules or rel.startswith(module_prefixes):
+                continue
+            if rel not in program_rels:
+                program_rels.append(rel)
+
+    resolved_root = root.resolve()
+    for rel in program_rels:
+        path = (root / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
+        if not path.is_file():
+            continue
+        kind = _kind_for_suffix(path.suffix)
+        if kind is None:
+            continue
+        try:
+            path.relative_to(resolved_root)
+        except ValueError:
+            continue
+        unit_id = posix_rel(path, resolved_root)
+        found[unit_id] = SourceUnit(
+            unit_id=unit_id,
+            path=path,
+            kind=kind,
+            module="program",
+        )
+
+    units = list(found.values())
+    units.sort(key=lambda u: u.unit_id)
+    return units
+
+
+def discover_sources(source_dir: Path, *, manifest_name: str = BUILD_MANIFEST_FILE) -> list[SourceUnit]:
+    """Discover sharded `.ll` / `.c` / `.cpp` units from a recomp output directory."""
+    root = resolve_source_root(source_dir)
+    if not root.is_dir():
+        raise BuildGuestWasmError(f"source directory not found: {root.name}")
+
+    resolved = root.resolve()
+    program_path = resolved / PROGRAM_MANIFEST_FILE
+    if source_dir.is_file() and source_dir.name == PROGRAM_MANIFEST_FILE:
+        program_path = source_dir.resolve()
+    if program_path.is_file():
+        try:
+            data = load_build_manifest(program_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BuildGuestWasmError(f"invalid {PROGRAM_MANIFEST_FILE}: {exc}") from exc
+        return discover_program_sources(resolved, data)
+
+    return _discover_tree_sources(resolved, manifest_name=manifest_name)
 
 
 def cache_object_path(cache_dir: Path, key: str, unit_id: str) -> Path:
@@ -571,6 +786,24 @@ def build_compile_argv(
     return (str(compiler), *flags, str(source), "-o", str(output))
 
 
+def should_use_response_file(object_count: int, requested: bool | None) -> bool:
+    if requested is False:
+        return False
+    if requested is True:
+        return True
+    return object_count > RESPONSE_FILE_THRESHOLD
+
+
+def write_link_response_file(path: Path, objects: Sequence[Path | str]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [str(item) for item in objects]
+    text = "\n".join(lines)
+    if lines:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def build_link_argv(
     linker: Path | str,
     objects: Sequence[Path],
@@ -578,9 +811,13 @@ def build_link_argv(
     output_js: Path,
     runtime_libs: Sequence[Path] = (),
     extra_flags: Sequence[str] = (),
+    response_file: Path | None = None,
 ) -> tuple[str, ...]:
     argv: list[str] = [str(linker), *LINK_FLAGS, *extra_flags]
-    argv.extend(str(path) for path in objects)
+    if response_file is not None:
+        argv.append(f"@{response_file}")
+    else:
+        argv.extend(str(path) for path in objects)
     argv.extend(str(path) for path in runtime_libs)
     argv.extend(["-o", str(output_js)])
     return tuple(argv)
@@ -600,11 +837,20 @@ def compile_unit(
     dry_run: bool,
     run_command: CommandRunner,
 ) -> UnitBuildResult:
+    started = time.monotonic()
     content = unit.path.read_bytes()
     key = cache_key_for(content, flags, kind=unit.kind)
     object_path = cache_object_path(cache_dir, key, unit.unit_id)
     argv = build_compile_argv(compiler, unit.path, object_path, flags)
     display_argv = tuple(sanitize_argv(argv))
+
+    def _bytes(path: Path | None) -> int:
+        if path is None or not path.is_file():
+            return 0
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
 
     if object_path.is_file():
         return UnitBuildResult(
@@ -614,6 +860,8 @@ def compile_unit(
             object_path=object_path,
             argv=display_argv,
             status="hit",
+            seconds=time.monotonic() - started,
+            object_bytes=_bytes(object_path),
         )
 
     if dry_run:
@@ -624,10 +872,12 @@ def compile_unit(
             object_path=object_path,
             argv=display_argv,
             status="planned",
+            seconds=time.monotonic() - started,
         )
 
     object_path.parent.mkdir(parents=True, exist_ok=True)
     result = run_command(argv)
+    elapsed = time.monotonic() - started
     if result.returncode != 0:
         err = sanitize_text((result.stderr or result.stdout or "compile failed").strip())
         return UnitBuildResult(
@@ -639,6 +889,7 @@ def compile_unit(
             status="error",
             returncode=result.returncode,
             error=f"{unit.unit_id}: {err}",
+            seconds=elapsed,
         )
     if not object_path.is_file():
         return UnitBuildResult(
@@ -650,6 +901,7 @@ def compile_unit(
             status="error",
             returncode=1,
             error=f"{unit.unit_id}: compiler exited 0 but did not write object file",
+            seconds=elapsed,
         )
     return UnitBuildResult(
         unit=unit,
@@ -658,6 +910,8 @@ def compile_unit(
         object_path=object_path,
         argv=display_argv,
         status="compiled",
+        seconds=elapsed,
+        object_bytes=_bytes(object_path),
     )
 
 
@@ -741,6 +995,43 @@ def resolve_runtime_libs(
     return libs
 
 
+def _object_bytes(path: Path | None) -> int:
+    if path is None or not path.is_file():
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def extrapolate_sample(
+    all_units: Sequence[SourceUnit],
+    sampled: Sequence[UnitBuildResult],
+    *,
+    jobs: int,
+) -> dict[str, Any]:
+    all_shards = [unit for unit in all_units if is_shard_unit(unit)]
+    sampled_shards = [item for item in sampled if is_shard_unit(item.unit)]
+    sample_count = len(sampled_shards) or 1
+    total_shards = len(all_shards)
+    sample_bytes = sum(item.object_bytes or _object_bytes(item.object_path) for item in sampled_shards)
+    sample_cpu = sum(item.seconds for item in sampled_shards)
+    all_instr = sum(unit.instructions for unit in all_shards)
+    sample_instr = sum(item.unit.instructions for item in sampled_shards)
+    if all_instr > 0 and sample_instr > 0:
+        factor = all_instr / sample_instr
+    else:
+        factor = total_shards / sample_count if total_shards else 1.0
+    cpu = sample_cpu * factor
+    return {
+        "sample_units": len(sampled_shards),
+        "total_shards": total_shards,
+        "object_bytes": int(sample_bytes * factor),
+        "compile_seconds": round(cpu, 3),
+        "wall_seconds_at_jobs": round(cpu / max(1, jobs), 3),
+    }
+
+
 def run_build(
     *,
     source_dir: Path | None,
@@ -758,16 +1049,29 @@ def run_build(
     run_command: CommandRunner | None = None,
     which_fn: WhichFn | None = None,
     env: Mapping[str, str] | None = None,
+    sample: int = 0,
+    response_file: bool | None = None,
+    link_guest_boot: bool = False,
+    guest_boot_entry: Path | None = None,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
     worker_count = jobs if jobs is not None else (os.cpu_count() or 1)
     if worker_count < 1:
         raise BuildGuestWasmError("--jobs must be >= 1")
+    if sample < 0:
+        raise BuildGuestWasmError("--sample must be >= 0")
 
     runner = run_command or default_run_command
     toolchain = discover_emscripten(repo_root=repo_root, env=env, which_fn=which_fn)
-    mode = "check-only" if check_only else ("dry-run" if dry_run else "build")
+    if check_only:
+        mode = "check-only"
+    elif sample > 0:
+        mode = "sample"
+    elif dry_run:
+        mode = "dry-run"
+    else:
+        mode = "build"
     report = BuildReport(
         ok=toolchain.ok,
         mode=mode,
@@ -776,6 +1080,8 @@ def run_build(
         opt=opt_level,
         compile_flags=(*COMPILE_WASM_FLAGS, f"-{opt_level}"),
         link_flags=LINK_FLAGS,
+        linked_guest_boot=link_guest_boot,
+        sample=sample,
     )
 
     if not toolchain.ok:
@@ -794,15 +1100,41 @@ def run_build(
         report.errors.append("missing source directory (recomp build output)")
         return report
 
-    units = discover_sources(source_dir)
-    if not units:
+    source_root = resolve_source_root(source_dir)
+    all_units = discover_sources(source_dir)
+    if link_guest_boot:
+        entry = guest_boot_entry or (repo_root / DEFAULT_GUEST_BOOT_ENTRY_REL)
+        if not entry.is_file():
+            report.ok = False
+            report.errors.append(f"guest boot entrypoint not found: {entry.name}")
+            return report
+        boot_id = posix_rel(entry.resolve(), repo_root.resolve())
+        if boot_id == entry.name and entry.resolve() != (repo_root / entry.name).resolve():
+            boot_id = "runtime/guest/" + entry.name
+        all_units.append(
+            SourceUnit(
+                unit_id=boot_id.replace("\\", "/"),
+                path=entry.resolve(),
+                kind="cpp",
+                module="boot",
+            )
+        )
+        all_units.sort(key=lambda u: u.unit_id)
+
+    if not all_units:
         report.ok = False
         report.errors.append("no .ll/.c/.cpp translation units found")
         return report
 
+    units = sample_units(all_units, sample) if sample > 0 else all_units
+    if sample > 0 and not units:
+        report.ok = False
+        report.errors.append("no shard-*.ll units available to sample")
+        return report
+
     cache_root = (cache_dir or (repo_root / DEFAULT_CACHE_DIR_REL)).resolve()
     output_dir = (out_dir or (repo_root / DEFAULT_OUT_DIR_REL)).resolve()
-    include_dirs = [repo_root / "runtime", source_dir.resolve()]
+    include_dirs = [repo_root / "runtime", source_root.resolve()]
     include_dirs = [p for p in include_dirs if p.is_dir()]
 
     planned: list[UnitBuildResult] = []
@@ -813,7 +1145,13 @@ def run_build(
             report.ok = False
             report.errors.append(f"no compiler for {unit.unit_id} ({unit.kind})")
             continue
-        flags = compile_flags_for(opt=opt_level, kind=unit.kind, include_dirs=include_dirs)
+        extra = (BOOT_LINKED_GUEST_DEFINE,) if link_guest_boot and unit.module == "boot" else ()
+        flags = compile_flags_for(
+            opt=opt_level,
+            kind=unit.kind,
+            include_dirs=include_dirs,
+            extra_flags=extra,
+        )
         content = unit.path.read_bytes()
         key = cache_key_for(content, flags, kind=unit.kind)
         object_path = cache_object_path(cache_root, key, unit.unit_id)
@@ -827,6 +1165,7 @@ def run_build(
                     object_path=object_path,
                     argv=argv,
                     status="hit",
+                    object_bytes=_object_bytes(object_path),
                 )
             )
         else:
@@ -844,6 +1183,7 @@ def run_build(
 
     compiled_by_id: dict[str, UnitBuildResult] = {item.unit.unit_id: item for item in planned}
 
+    compile_started = time.monotonic()
     if not dry_run and compile_tasks:
         lock = threading.Lock()
 
@@ -866,13 +1206,25 @@ def run_build(
                 with lock:
                     compiled_by_id[result.unit.unit_id] = result
 
-    ordered = [compiled_by_id[u.unit_id] for u in units]
+    ordered = [compiled_by_id[u.unit_id] for u in units if u.unit_id in compiled_by_id]
     report.sources = ordered
     report.cache_hits = sum(1 for item in ordered if item.cache_hit)
     report.cache_misses = sum(1 for item in ordered if not item.cache_hit)
+    report.compile_seconds = round(time.monotonic() - compile_started, 3)
+    report.object_bytes = sum(
+        item.object_bytes or _object_bytes(item.object_path) for item in ordered
+    )
 
     compile_errors = [item.error for item in ordered if item.status == "error" and item.error]
     report.errors.extend(compile_errors)
+
+    if sample > 0:
+        report.extrapolated = extrapolate_sample(all_units, ordered, jobs=worker_count)
+        if compile_errors:
+            report.ok = False
+            return report
+        report.ok = True
+        return report
 
     objects = [item.object_path for item in ordered if item.object_path is not None]
     runtime_libs = resolve_runtime_libs(
@@ -887,12 +1239,19 @@ def run_build(
     assert linker is not None
     output_js = output_dir / RUNTIME_JS
     output_wasm = output_dir / RUNTIME_WASM
+    planned_objects = objects if objects else [Path(item.unit.unit_id).with_suffix(".o") for item in ordered]
+    rsp_path: Path | None = None
+    if should_use_response_file(len(planned_objects), response_file):
+        rsp_path = cache_root / RESPONSE_FILE_NAME
+        write_link_response_file(rsp_path, planned_objects)
+        report.response_file = RESPONSE_FILE_NAME
     raw_link = build_link_argv(
         linker,
-        objects if objects else [Path(item.unit.unit_id).with_suffix(".o") for item in ordered],
+        planned_objects,
         output_js=output_js,
         runtime_libs=runtime_libs,
         extra_flags=extra_link_flags,
+        response_file=rsp_path,
     )
     report.link_argv = tuple(sanitize_argv(raw_link))
     report.outputs = (RUNTIME_JS, RUNTIME_WASM)
@@ -947,11 +1306,26 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         f"  Link flags: {' '.join(report.link_flags)}",
         f"  Sources: {len(report.sources)} (cache hits {report.cache_hits}, misses {report.cache_misses})",
     ]
+    if report.linked_guest_boot:
+        lines.append("  Linked guest boot: yes")
+    if report.response_file:
+        lines.append(f"  Response file: @{report.response_file}")
+    if report.sample:
+        lines.append(f"  Sample: {report.sample} shards")
+    if report.extrapolated:
+        extra = report.extrapolated
+        lines.append(
+            "  Extrapolated: "
+            f"{extra.get('compile_seconds', 0)}s compile, "
+            f"{extra.get('object_bytes', 0)} bytes .o "
+            f"(from {extra.get('sample_units', 0)} of {extra.get('total_shards', 0)} shards)"
+        )
     if report.sources:
         lines.append("  Units:")
         for item in report.sources:
             tag = item.status.upper()
-            lines.append(f"    [{tag}] {item.unit.unit_id} ({item.unit.kind})")
+            module = f" [{item.unit.module}]" if item.unit.module else ""
+            lines.append(f"    [{tag}] {item.unit.unit_id} ({item.unit.kind}){module}")
     if report.link_argv:
         lines.append("  Link: " + " ".join(report.link_argv))
     if report.outputs:
@@ -1059,6 +1433,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Sanitize host paths and usernames in text output (JSON is always sanitized).",
     )
+    parser.add_argument(
+        "--response-file",
+        action="store_true",
+        help=(
+            f"Pass objects to the linker via @{RESPONSE_FILE_NAME} "
+            f"(auto-enabled when linking more than {RESPONSE_FILE_THRESHOLD} objects)."
+        ),
+    )
+    parser.add_argument(
+        "--no-response-file",
+        action="store_true",
+        help="Put every object path on the em++ command line even for large links.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Compile N evenly spaced shard-*.ll units, skip linking, and extrapolate time/size.",
+    )
+    parser.add_argument(
+        "--link-guest-boot",
+        action="store_true",
+        help=(
+            f"Compile runtime/guest/boot_main.cpp with {BOOT_LINKED_GUEST_DEFINE} "
+            "and include it in the wasm64 link."
+        ),
+    )
+    parser.add_argument(
+        "--guest-boot-entry",
+        default=None,
+        help="Entrypoint source for --link-guest-boot (default: runtime/guest/boot_main.cpp).",
+    )
     return parser
 
 
@@ -1072,6 +1479,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir = Path(args.out_dir) if args.out_dir else repo_root / DEFAULT_OUT_DIR_REL
     runtime_lib = Path(args.runtime_lib) if args.runtime_lib else None
     extra_objects = [Path(p) for p in args.extra_objects]
+    if args.response_file and args.no_response_file:
+        parser.error("use either --response-file or --no-response-file, not both")
+    response_file: bool | None
+    if args.response_file:
+        response_file = True
+    elif args.no_response_file:
+        response_file = False
+    else:
+        response_file = None
+    guest_boot_entry = Path(args.guest_boot_entry) if args.guest_boot_entry else None
 
     try:
         report = run_build(
@@ -1086,6 +1503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             check_only=args.check_only,
             verify=args.verify,
+            sample=args.sample,
+            response_file=response_file,
+            link_guest_boot=args.link_guest_boot,
+            guest_boot_entry=guest_boot_entry,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)
