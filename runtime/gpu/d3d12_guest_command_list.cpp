@@ -181,6 +181,11 @@ void CommandList::reset(PipelineState* initial_state) {
     encoder_.clear();
     deferred_.clear();
     immediate_writes_.clear();
+    graphics_root_args_ = {};
+    vertex_buffers_ = {};
+    index_buffer_ = {};
+    rtv_handles_.clear();
+    dsv_handle_ = 0;
     pinned_.clear();
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
@@ -265,12 +270,195 @@ void CommandList::SetPipelineState(InterfaceArg<IPipelineStateHost> state) {
     bind_pipeline(static_cast<PipelineState*>(state.get()));
 }
 
+void CommandList::record_root_arg(uint32_t index, uint8_t kind, uint64_t value, uint32_t count) {
+    if (index < graphics_root_args_.size()) {
+        RootArgRecord& r = graphics_root_args_[index];
+        r.kind = kind;
+        r.value = value;
+        r.count = kind == 2 ? std::max(r.count, count) : count;
+    }
+}
+
+namespace {
+const char* range_type_name(d3d::DescriptorRangeType t) {
+    switch (t) {
+        case d3d::DescriptorRangeType::Srv:
+            return "SRV";
+        case d3d::DescriptorRangeType::Uav:
+            return "UAV";
+        case d3d::DescriptorRangeType::Cbv:
+            return "CBV";
+        default:
+            return "Sampler";
+    }
+}
+const char* descriptor_kind_name(d3d::DescriptorKind k) {
+    switch (k) {
+        case d3d::DescriptorKind::Cbv:
+            return "CBV";
+        case d3d::DescriptorKind::Srv:
+            return "SRV";
+        case d3d::DescriptorKind::Uav:
+            return "UAV";
+        case d3d::DescriptorKind::Sampler:
+            return "sampler";
+        case d3d::DescriptorKind::Rtv:
+            return "RTV";
+        case d3d::DescriptorKind::Dsv:
+            return "DSV";
+        default:
+            return "empty";
+    }
+}
+}  // namespace
+
+// The first skipped draw of each graphics pipeline state, described with counts, formats and
+// sizes only (no bytecode, no identities): what the draw would need to become visible.
+void CommandList::describe_skipped_draw(const char* call, uint32_t count, uint32_t instances) {
+    if (graphics_pso_ == nullptr || !device_->claim_skipped_draw_report(graphics_pso_)) {
+        return;
+    }
+    std::string s = std::string("d3d12_xs: skipped ") + call + " (" + std::to_string(count) + " x " +
+                    std::to_string(instances) + "): pipeline state without shader modules;";
+    const GraphicsPsoSource* src = graphics_pso_->graphics_source();
+    if (src == nullptr) {
+        device_->add_skipped_draw_report(s + " no graphics description");
+        return;
+    }
+    const pso::D3D12GraphicsPsoDesc& d = src->desc;
+    const char* stage_names[] = {"VS", "PS", "DS", "HS", "GS", "AS", "MS"};
+    const uint64_t stages[] = {d.vs, d.ps, d.ds, d.hs, d.gs, d.as, d.ms};
+    s += " shaders";
+    for (size_t i = 0; i < 7; ++i) {
+        if (stages[i] != 0) {
+            s += std::string(" ") + stage_names[i] + " " + std::to_string(device_->shader_size(stages[i])) + " B" +
+                 (device_->shader_known(stages[i]) ? "" : " (no module)");
+        }
+    }
+    s += "; topology type " + std::to_string(static_cast<uint32_t>(d.PrimitiveTopologyType));
+    s += "; input layout " + std::to_string(d.NumInputElements) + " element(s)";
+    for (uint32_t i = 0; i < d.NumInputElements && d.pInputElementDescs != nullptr; ++i) {
+        const pso::D3D12InputElementDesc& e = d.pInputElementDescs[i];
+        s += std::string(i == 0 ? " [" : ", ") + (e.SemanticName != nullptr ? e.SemanticName : "?") +
+             std::to_string(e.SemanticIndex) + " fmt " + std::to_string(static_cast<uint32_t>(e.Format)) + " slot " +
+             std::to_string(e.InputSlot) + (i + 1 == d.NumInputElements ? "]" : "");
+    }
+    s += "; render targets " + std::to_string(d.NumRenderTargets);
+    for (uint32_t i = 0; i < d.NumRenderTargets && i < pso::kD3D12SimultaneousRenderTargetCount; ++i) {
+        s += std::string(i == 0 ? " [fmt " : ", ") + std::to_string(static_cast<uint32_t>(d.RTVFormats[i])) +
+             (i + 1 == d.NumRenderTargets ? "]" : "");
+    }
+    s += " depth fmt " + std::to_string(static_cast<uint32_t>(d.DSVFormat)) + " samples " +
+         std::to_string(d.SampleDesc.Count);
+
+    // Root signature layout and what is bound for each parameter.
+    const d3d::RootSignature* rs = src->root_signature ? &src->root_signature->signature() : nullptr;
+    if (rs == nullptr) {
+        s += "; no root signature";
+    } else {
+        const d3d::RootSignatureDesc& rd = rs->desc();
+        s += "; root signature 1." + std::to_string(static_cast<uint32_t>(rd.version) - 1) + ", " +
+             std::to_string(rd.parameters.size()) + " parameter(s), " + std::to_string(rd.static_samplers.size()) +
+             " static sampler(s)";
+        for (size_t p = 0; p < rd.parameters.size(); ++p) {
+            const d3d::RootParameterDesc& param = rd.parameters[p];
+            s += "; [" + std::to_string(p) + " vis " + std::to_string(static_cast<uint32_t>(param.shader_visibility)) +
+                 "] ";
+            const RootArgRecord arg = p < graphics_root_args_.size() ? graphics_root_args_[p] : RootArgRecord{};
+            switch (param.parameter_type) {
+                case d3d::RootParameterType::DescriptorTable: {
+                    s += "table";
+                    uint32_t total = 0;
+                    for (const d3d::DescriptorRangeDesc& r : param.ranges) {
+                        s += std::string(" ") + range_type_name(r.range_type) + " x" +
+                             (r.num_descriptors == d3d::kUnboundedDescriptorCount ? std::string("unbounded")
+                                                                                  : std::to_string(r.num_descriptors));
+                        total += r.num_descriptors == d3d::kUnboundedDescriptorCount ? 4 : r.num_descriptors;
+                    }
+                    if (arg.kind != 1) {
+                        s += " -> not set";
+                        break;
+                    }
+                    d3d::ResolvedDescriptor res;
+                    if (device_->heaps().resolve_gpu(d3d::GpuDescriptorHandle{arg.value}, &res) != d3d::Status::Ok) {
+                        s += " -> unresolvable handle";
+                        break;
+                    }
+                    s += " ->";
+                    for (uint32_t i = 0; i < std::min<uint32_t>(total, 8); ++i) {
+                        if (const d3d::ViewDescriptor* v = res.heap->view(res.index + i)) {
+                            s += std::string(" ") + descriptor_kind_name(v->kind) + " dim " + std::to_string(v->dimension) +
+                                 " fmt " + std::to_string(v->format);
+                            bridge::TextureInfo t;
+                            if (v->resource_id != 0 &&
+                                device_->state_bridge().texture_info(v->resource_id, &t)) {
+                                s += " tex " + std::to_string(t.width) + "x" + std::to_string(t.height) + " fmt " +
+                                     std::to_string(static_cast<uint32_t>(t.format));
+                            } else if (v->kind == d3d::DescriptorKind::Cbv) {
+                                s += " " + std::to_string(v->num_elements_or_size) + " B";
+                            } else if (v->resource_id != 0) {
+                                s += " buffer " + std::to_string(v->num_elements_or_size) + " x " +
+                                     std::to_string(v->structure_byte_stride) + " B";
+                            }
+                        } else if (res.heap->sampler(res.index + i) != nullptr) {
+                            s += " sampler";
+                        }
+                    }
+                    break;
+                }
+                case d3d::RootParameterType::Constants32Bit:
+                    s += std::to_string(param.num_32bit_values) + " root constants" +
+                         (arg.kind == 2 ? "" : " (not set)");
+                    break;
+                default:
+                    s += std::string(param.parameter_type == d3d::RootParameterType::Cbv   ? "root CBV"
+                                     : param.parameter_type == d3d::RootParameterType::Srv ? "root SRV"
+                                                                                           : "root UAV") +
+                         (arg.kind >= 3 ? "" : " (not set)");
+                    break;
+            }
+        }
+    }
+
+    // Vertex / index buffers and render targets bound now.
+    uint32_t vbs = 0;
+    for (const VertexBufferRecord& v : vertex_buffers_) {
+        if (v.va != 0) {
+            s += std::string(vbs++ == 0 ? "; vertex buffers" : ",") + " " + std::to_string(v.size) + " B stride " +
+                 std::to_string(v.stride);
+        }
+    }
+    if (vbs == 0) {
+        s += "; no vertex buffers";
+    }
+    s += index_buffer_.va != 0
+             ? "; index buffer " + std::to_string(index_buffer_.size) + " B fmt " + std::to_string(index_buffer_.stride)
+             : "; no index buffer";
+    for (size_t i = 0; i < rtv_handles_.size(); ++i) {
+        d3d::ResolvedDescriptor res;
+        const d3d::ViewDescriptor* v = nullptr;
+        if (device_->heaps().resolve_cpu(d3d::CpuDescriptorHandle{rtv_handles_[i]}, &res) == d3d::Status::Ok) {
+            v = res.heap->view(res.index);
+        }
+        bridge::TextureInfo t;
+        s += std::string(i == 0 ? "; bound render targets" : ",");
+        if (v != nullptr && v->resource_id != 0 && device_->state_bridge().texture_info(v->resource_id, &t)) {
+            s += " " + std::to_string(t.width) + "x" + std::to_string(t.height) + " fmt " +
+                 std::to_string(static_cast<uint32_t>(t.format)) + (t.swapchain ? " (back buffer)" : "");
+        } else {
+            s += " unresolved";
+        }
+    }
+    device_->add_skipped_draw_report(s);
+}
+
 void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t start_vertex, uint32_t start_instance) {
     if (!usable()) {
         return;
     }
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
+        describe_skipped_draw("DrawInstanced", vertices, instances);
         return;
     }
     bridge_.DrawInstanced(vertices, instances, start_vertex, start_instance);
@@ -283,6 +471,7 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
     }
     if (graphics_pso_ != nullptr && !graphics_pso_->resolved()) {
         device_->note_skipped_draw();
+        describe_skipped_draw("DrawIndexedInstanced", indices, instances);
         return;
     }
     bridge_.DrawIndexedInstanced(indices, instances, start_index, base_vertex, start_instance);
@@ -722,6 +911,7 @@ void CommandList::SetComputeRootDescriptorTable(uint32_t index, uint64_t base) {
 }
 
 void CommandList::SetGraphicsRootDescriptorTable(uint32_t index, uint64_t base) {
+    record_root_arg(index, 1, base, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootDescriptorTable(index, d3d::GpuDescriptorHandle{base}), "SetGraphicsRootDescriptorTable");
 }
 
@@ -730,6 +920,7 @@ void CommandList::SetComputeRoot32BitConstant(uint32_t index, uint32_t value, ui
 }
 
 void CommandList::SetGraphicsRoot32BitConstant(uint32_t index, uint32_t value, uint32_t offset) {
+    record_root_arg(index, 2, 0, offset + 1);
     PG6_ROOT_CALL(bridge_.SetGraphicsRoot32BitConstants(index, 1, &value, offset), "SetGraphicsRoot32BitConstant");
 }
 
@@ -748,6 +939,7 @@ void CommandList::SetGraphicsRoot32BitConstants(uint32_t index, uint32_t count, 
         note("SetGraphicsRoot32BitConstants: unreadable values");
         return;
     }
+    record_root_arg(index, 2, 0, offset + count);
     PG6_ROOT_CALL(bridge_.SetGraphicsRoot32BitConstants(index, count, v.data(), offset), "SetGraphicsRoot32BitConstants");
 }
 
@@ -756,6 +948,7 @@ void CommandList::SetComputeRootConstantBufferView(uint32_t index, uint64_t va) 
 }
 
 void CommandList::SetGraphicsRootConstantBufferView(uint32_t index, uint64_t va) {
+    record_root_arg(index, 3, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootConstantBufferView(index, va), "SetGraphicsRootConstantBufferView");
 }
 
@@ -766,6 +959,7 @@ void CommandList::SetComputeRootShaderResourceView(uint32_t, uint64_t) {
 }
 
 void CommandList::SetGraphicsRootShaderResourceView(uint32_t index, uint64_t va) {
+    record_root_arg(index, 4, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootShaderResourceView(index, va), "SetGraphicsRootShaderResourceView");
 }
 
@@ -776,6 +970,7 @@ void CommandList::SetComputeRootUnorderedAccessView(uint32_t, uint64_t) {
 }
 
 void CommandList::SetGraphicsRootUnorderedAccessView(uint32_t index, uint64_t va) {
+    record_root_arg(index, 5, va, 0);
     PG6_ROOT_CALL(bridge_.SetGraphicsRootUnorderedAccessView(index, va), "SetGraphicsRootUnorderedAccessView");
 }
 
@@ -796,6 +991,7 @@ void CommandList::IASetIndexBuffer(uint64_t view) {
         note("IASetIndexBuffer: unreadable view");
         return;
     }
+    index_buffer_ = VertexBufferRecord{g.BufferLocation, g.SizeInBytes, g.Format};
     d3d::GpuVaResolution res;
     if (!device_->state_bridge().resolve_gpu_va(g.BufferLocation, &res)) {
         note("IASetIndexBuffer: unknown GPU virtual address " + hex(g.BufferLocation));
@@ -823,6 +1019,9 @@ void CommandList::IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t vi
         return;
     }
     if (views == 0) {
+        for (uint32_t i = 0; i < count; ++i) {
+            vertex_buffers_[start + i] = VertexBufferRecord{};
+        }
         bridge_.IASetVertexBuffers(start, count, nullptr);
         return;
     }
@@ -833,6 +1032,7 @@ void CommandList::IASetVertexBuffers(uint32_t start, uint32_t count, uint64_t vi
     }
     std::vector<d3d12_xs::D3D12VertexBufferView> v(count);
     for (uint32_t i = 0; i < count; ++i) {
+        vertex_buffers_[start + i] = VertexBufferRecord{g[i].BufferLocation, g[i].SizeInBytes, g[i].StrideInBytes};
         d3d::GpuVaResolution res;
         if (g[i].BufferLocation != 0 && device_->state_bridge().resolve_gpu_va(g[i].BufferLocation, &res)) {
             v[i].buffer_id = res.resource_id;
@@ -872,6 +1072,13 @@ void CommandList::OMSetRenderTargets(uint32_t count, uint64_t rtvs, bool single_
         note("OMSetRenderTargets: unreadable depth-stencil handle");
         return;
     }
+    rtv_handles_.clear();
+    for (uint32_t i = 0; i < count; ++i) {
+        rtv_handles_.push_back(single_range ? handles[0].ptr + uint64_t{i} * d3d::descriptor_handle_increment_size(
+                                                                    d3d::DescriptorHeapType::Rtv)
+                                            : handles[i].ptr);
+    }
+    dsv_handle_ = dsv != 0 ? depth.ptr : 0;
     bridge_.OMSetRenderTargets(count, handles.empty() ? nullptr : handles.data(), single_range,
                                dsv != 0 ? &depth : nullptr);
 }

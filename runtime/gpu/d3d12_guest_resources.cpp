@@ -114,6 +114,35 @@ std::array<uint32_t, 3> Device::root_signature_versions() const {
     return root_signature_versions_;
 }
 
+void Device::note_shader_size(uint64_t identity, uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    shader_sizes_[identity] = bytes;
+}
+
+uint64_t Device::shader_size(uint64_t identity) const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    auto it = shader_sizes_.find(identity);
+    return it != shader_sizes_.end() ? it->second : 0;
+}
+
+bool Device::claim_skipped_draw_report(const void* pipeline_state) {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return described_pipelines_.insert(pipeline_state).second;
+}
+
+void Device::add_skipped_draw_report(const std::string& text) {
+    os::log(text);
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    if (skipped_draw_reports_.size() < 64) {
+        skipped_draw_reports_.push_back(text);
+    }
+}
+
+std::vector<std::string> Device::skipped_draw_reports() const {
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    return skipped_draw_reports_;
+}
+
 std::vector<uint64_t> Device::unresolved_shaders() const {
     std::lock_guard<std::mutex> lock(shader_mutex_);
     return unresolved_shaders_;
@@ -932,6 +961,7 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
         return false;
     }
     *identity = shader_identity(bytes.data(), bytes.size());
+    dev.note_shader_size(*identity, bytes.size());
     return true;
 }
 

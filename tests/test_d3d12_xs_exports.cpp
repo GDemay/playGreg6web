@@ -1471,6 +1471,21 @@ void test_unresolved_shaders_and_indexed_draws() {
     CHECK(count_op(ps, GpuOpcode::Draw) == 0);
     CHECK(count_op(ps, GpuOpcode::CreateRenderPipeline2) == 0);  // never a pipeline with module 0
     CHECK(dev->stats().skipped_draws == 2);
+    // The first skipped draw of the pipeline state is described once: shader sizes, layout,
+    // targets, root signature and what is bound (counts, formats, sizes).
+    const std::vector<std::string> reports = dev->skipped_draw_reports();
+    CHECK(reports.size() == 1);
+    if (!reports.empty()) {
+        const std::string& r = reports[0];
+        CHECK(r.find("skipped DrawInstanced") != std::string::npos);
+        CHECK(r.find("VS " + std::to_string(scene.vs_bytes.size()) + " B (no module)") != std::string::npos);
+        CHECK(r.find("PS " + std::to_string(scene.ps_bytes.size()) + " B (no module)") != std::string::npos);
+        CHECK(r.find("input layout") != std::string::npos);
+        CHECK(r.find("render targets 1") != std::string::npos);
+        CHECK(r.find("root signature 1.") != std::string::npos);
+        CHECK(r.find("vertex buffers") != std::string::npos);
+        CHECK(r.find("bound render targets") != std::string::npos);
+    }
 
     // Registering the modules later resolves PSOs created afterwards.
     dev->register_shader_module(dg::shader_identity(scene.vs_bytes.data(), scene.vs_bytes.size()), Scene::kVsModule);
