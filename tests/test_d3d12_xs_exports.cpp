@@ -4003,6 +4003,322 @@ void test_g49c_raw_tsharp_descriptor_memory_draw() {
     scene.release_all();
 }
 
+// G51 Test 1: Unaligned Slot-70 buffer SRVs inside an enclosing ring buffer (both stride=48 where
+// 256 % 48 != 0 -> dedicated offset-0 buffer, and stride=64 where 0x1fed0 % 64 != 0 -> 256B-aligned
+// chunk) write hardware V# words, create Storage|CopyDst buffers, upload exact guest bytes, incur
+// zero bad_arguments, resolve cleanly through MemorySlotSource::view, flush dirty mutations on
+// ExecuteCommandLists, and destroy buffers on Device::~Device().
+void test_g51_slot70_unaligned_buffer_views() {
+    namespace hw = playgta6::gpu::gfx10;
+    namespace xb = dg::xbox;
+
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const d3d::DescriptorSlotSource* source = dev->state_bridge().options().slot_source;
+    CHECK(source != nullptr);
+
+    // 192 KiB upload/CPU-visible ring buffer so offsets 0xfed0 and 0x1fed0 lie well inside it.
+    const uint64_t ring = committed(fx, scene.device, 2, buffer_desc(192u << 10), 0xAC3);
+    CHECK(ring != 0);
+    const uint32_t ring_id = object_of<dg::Resource>(ring)->id();
+    const uint64_t ring_va = fx.vcall(ring, Slot2::GetGPUVirtualAddress);
+    CHECK(ring_va != 0);
+
+    const uint64_t va48 = ring_va + 0x1fee0u;  // 0x1fee0 % 48 == 32 != 0, and 256 % 48 != 0 -> dedicated offset-0 buffer
+    const uint64_t va64 = ring_va + 0xfed0u;   // 0xfed0 % 64 == 16 != 0 (live ring offset), 256 % 64 == 0 -> 256B chunk
+    std::vector<uint8_t> data48(4u * 48u);
+    std::vector<uint8_t> data64(4u * 64u);
+    for (size_t i = 0; i < data48.size(); ++i) {
+        data48[i] = static_cast<uint8_t>(0x31u + i * 3u);
+    }
+    for (size_t i = 0; i < data64.size(); ++i) {
+        data64[i] = static_cast<uint8_t>(0x73u + i * 5u);
+    }
+    CHECK(com::write_guest(va48, data48.data(), data48.size()));
+    CHECK(com::write_guest(va64, data64.data(), data64.size()));
+
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                    {I(put(dg::GuestDescriptorHeapDesc{0, 8, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    CHECK(heap != 0);
+    const auto* visible = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap)->heap();
+    const uint64_t cpu0 = visible->cpu_handle(0).ptr;
+
+    auto read_slot_words = [&](uint32_t idx) {
+        std::array<uint32_t, 8> w{};
+        CHECK(com::read_guest(cpu0 + uint64_t{idx} * 32u, w.data(), 32));
+        return w;
+    };
+    auto find_create_buffer = [](const std::vector<Packet>& ps, uint32_t id) -> const Packet* {
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::CreateBuffer && payload_as<GpuCreateBufferPayload>(p).id == id) {
+                return &p;
+            }
+        }
+        return nullptr;
+    };
+    auto writes_for = [](const std::vector<Packet>& ps, uint32_t id) {
+        std::vector<std::pair<uint32_t, std::vector<uint8_t>>> out;
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::WriteBuffer) {
+                const auto hdr = payload_as<GpuWriteBufferPayload>(p);
+                if (hdr.id == id) {
+                    out.emplace_back(hdr.dst_offset,
+                                     std::vector<uint8_t>(p.payload.begin() + sizeof(GpuWriteBufferPayload),
+                                                          p.payload.end()));
+                }
+            }
+        }
+        return out;
+    };
+
+    const uint64_t bad_before = dev->stats().bad_arguments;
+
+    // Case A: stride = 48 (256 % 48 != 0) at unaligned offset 0xfed0 -> dedicated offset-0 buffer.
+    uint8_t srv48[48] = {};
+    dg::GuestShaderResourceViewDesc d48{};
+    d48.ViewDimension = 1;  // BUFFER
+    d48.Shader4ComponentMapping = 0x1688;
+    d48.u[0] = 0;   // FirstElement
+    d48.u[2] = 4;   // NumElements (192 bytes)
+    d48.u[3] = 48;  // StructureByteStride
+    std::memcpy(srv48, &d48, sizeof(d48));
+    std::memcpy(srv48 + xb::kViewAtAddressOffset, &va48, sizeof(va48));
+    const size_t mark_a = fx.captured.size();
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(buffer_desc(192))), I(put_bytes(srv48, sizeof(srv48))), I(cpu0)});
+    const auto pkts_a = packets_since(fx, mark_a);
+
+    CHECK(dev->stats().bad_arguments == bad_before);
+    const auto w0 = read_slot_words(0);
+    CHECK(hw::classify_slot(w0.data()) == hw::SlotContent::Buffer);
+    const hw::BufferResource b0 = hw::decode_buffer(w0.data());
+    CHECK(b0.base == va48 && b0.stride == 48 && b0.num_records == 4);
+
+    const d3d::ViewDescriptor* v0 = visible->view(0);
+    CHECK(v0 != nullptr && v0->kind == d3d::DescriptorKind::Srv && v0->dimension == d3d::ViewDimension::Buffer);
+    CHECK(v0 != nullptr && v0->resource_id != 0 && v0->resource_id != ring_id);
+    CHECK(v0 != nullptr && v0->first_element_or_address == 0);
+    const uint32_t id48 = v0 != nullptr ? v0->resource_id : 0u;
+    CHECK(dev->state_bridge().buffer_gpu_va(id48) != 0);
+
+    const Packet* cb48 = find_create_buffer(pkts_a, id48);
+    CHECK(cb48 != nullptr);
+    if (cb48 != nullptr) {
+        const auto p = payload_as<GpuCreateBufferPayload>(*cb48);
+        CHECK((p.usage_flags & GpuBufferUsage::Storage) != 0 && (p.usage_flags & GpuBufferUsage::CopyDst) != 0);
+        CHECK(p.byte_size >= data48.size());
+    }
+    const auto w48 = writes_for(pkts_a, id48);
+    CHECK(w48.size() == 1 && w48[0].first == 0u && w48[0].second.size() == data48.size() &&
+          std::memcmp(w48[0].second.data(), data48.data(), data48.size()) == 0);
+
+    // MemorySlotSource::view decodes the V# words at slot 0 and reuses the same offset-0 buffer.
+    const d3d::ViewDescriptor mem0 = source->view(*visible, 0, d3d::DescriptorRangeType::Srv);
+    CHECK(mem0.kind == d3d::DescriptorKind::Srv && mem0.dimension == d3d::ViewDimension::Buffer &&
+          mem0.resource_id == id48 && mem0.first_element_or_address == 0 &&
+          mem0.num_elements_or_size == data48.size());
+
+    // Case B: stride = 64 (0x1fed0 % 64 != 0, 256 % 64 == 0) -> 256B-aligned shared chunk.
+    uint8_t srv64[48] = {};
+    dg::GuestShaderResourceViewDesc d64{};
+    d64.ViewDimension = 1;  // BUFFER
+    d64.Shader4ComponentMapping = 0x1688;
+    d64.u[0] = 0;   // FirstElement
+    d64.u[2] = 4;   // NumElements (256 bytes)
+    d64.u[3] = 64;  // StructureByteStride
+    std::memcpy(srv64, &d64, sizeof(d64));
+    std::memcpy(srv64 + xb::kViewAtAddressOffset, &va64, sizeof(va64));
+    const size_t mark_b = fx.captured.size();
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(buffer_desc(256))), I(put_bytes(srv64, sizeof(srv64))), I(cpu0 + 32)});
+    const auto pkts_b = packets_since(fx, mark_b);
+
+    CHECK(dev->stats().bad_arguments == bad_before);
+    const auto w1 = read_slot_words(1);
+    CHECK(hw::classify_slot(w1.data()) == hw::SlotContent::Buffer);
+    const hw::BufferResource b1 = hw::decode_buffer(w1.data());
+    CHECK(b1.base == va64 && b1.stride == 64 && b1.num_records == 4);
+
+    const d3d::ViewDescriptor* v1 = visible->view(1);
+    CHECK(v1 != nullptr && v1->kind == d3d::DescriptorKind::Srv && v1->dimension == d3d::ViewDimension::Buffer);
+    CHECK(v1 != nullptr && v1->resource_id != 0 && v1->resource_id != ring_id);
+    const uint32_t id64 = v1 != nullptr ? v1->resource_id : 0u;
+    const uint64_t off64 = v1 != nullptr ? v1->first_element_or_address * 64u : 1u;
+    CHECK(off64 % 256u == 0);
+    CHECK(dev->state_bridge().buffer_gpu_va(id64) != 0);
+
+    const Packet* cb64 = find_create_buffer(pkts_b, id64);
+    CHECK(cb64 != nullptr);
+    if (cb64 != nullptr) {
+        const auto p = payload_as<GpuCreateBufferPayload>(*cb64);
+        CHECK((p.usage_flags & GpuBufferUsage::Storage) != 0 && (p.usage_flags & GpuBufferUsage::CopyDst) != 0);
+    }
+    const auto w64 = writes_for(pkts_b, id64);
+    CHECK(w64.size() == 1 && w64[0].first == static_cast<uint32_t>(off64) && w64[0].second.size() == data64.size() &&
+          std::memcmp(w64[0].second.data(), data64.data(), data64.size()) == 0);
+
+    const d3d::ViewDescriptor mem1 = source->view(*visible, 1, d3d::DescriptorRangeType::Srv);
+    CHECK(mem1.kind == d3d::DescriptorKind::Srv && mem1.dimension == d3d::ViewDimension::Buffer &&
+          mem1.resource_id == id64 && mem1.first_element_or_address == off64 &&
+          mem1.num_elements_or_size == data64.size());
+    CHECK(dev->relocated_storage_count() == 2);
+
+    // Dirty tracking across ExecuteCommandLists: unchanged -> 0 writes; mutated -> exact re-upload.
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+
+    size_t mark = fx.captured.size();
+    scene.execute({list});
+    auto pkts_clean = packets_since(fx, mark);
+    CHECK(writes_for(pkts_clean, id48).empty());
+    CHECK(writes_for(pkts_clean, id64).empty());
+
+    data48[0] ^= 0xFFu;
+    data48.back() ^= 0x5Au;
+    data64[16] ^= 0xA5u;
+    CHECK(com::write_guest(va48, data48.data(), data48.size()));
+    CHECK(com::write_guest(va64, data64.data(), data64.size()));
+
+    mark = fx.captured.size();
+    scene.execute({list});
+    auto pkts_dirty = packets_since(fx, mark);
+    const auto wd48 = writes_for(pkts_dirty, id48);
+    const auto wd64 = writes_for(pkts_dirty, id64);
+    CHECK(wd48.size() == 1 && wd48[0].first == 0u && wd48[0].second.size() == data48.size() &&
+          std::memcmp(wd48[0].second.data(), data48.data(), data48.size()) == 0);
+    CHECK(wd64.size() == 1 && wd64[0].first == static_cast<uint32_t>(off64) && wd64[0].second.size() == data64.size() &&
+          std::memcmp(wd64[0].second.data(), data64.data(), data64.size()) == 0);
+
+    mark = fx.captured.size();
+    scene.execute({list});
+    auto pkts_clean2 = packets_since(fx, mark);
+    CHECK(writes_for(pkts_clean2, id48).empty());
+    CHECK(writes_for(pkts_clean2, id64).empty());
+
+    CHECK(t_balanced);
+    const size_t mark_destroy = fx.captured.size();
+    scene.release_all({list, heap, ring});
+    bool destroyed48 = false;
+    bool destroyed64 = false;
+    for (const Packet& p : packets_since(fx, mark_destroy)) {
+        if (p.opcode == GpuOpcode::DestroyResource) {
+            const uint32_t did = payload_as<GpuDestroyResourcePayload>(p).id;
+            if (did == id48) destroyed48 = true;
+            if (did == id64) destroyed64 = true;
+        }
+    }
+    CHECK(destroyed48 && destroyed64);
+}
+
+// G51 Test 2: Address-only Slot-70 buffer SRV (readable guest / GPU-alias memory with no matching
+// ID3D12Resource) writes V# words, creates & uploads a relocated Storage|CopyDst buffer, resolves
+// through MemorySlotSource::view without UnresolvedAddress, and keeps unmapped addresses failing
+// cleanly with null descriptor + diagnostic.
+void test_g51_slot70_address_only_buffer_view() {
+    namespace hw = playgta6::gpu::gfx10;
+    namespace xb = dg::xbox;
+
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const d3d::DescriptorSlotSource* source = dev->state_bridge().options().slot_source;
+    CHECK(source != nullptr);
+
+    // Raw guest memory with no ID3D12Resource, accessed through a registered GPU alias window.
+    std::vector<uint8_t> raw_bytes(8u * 32u);
+    for (size_t i = 0; i < raw_bytes.size(); ++i) {
+        raw_bytes[i] = static_cast<uint8_t>(0x41u + i * 7u);
+    }
+    const uint64_t cpu_va = put_aligned(raw_bytes, 64);
+    const uint64_t gpu_alias_base = 0x0000'0001'D709'0000ull;
+    const uint64_t gpu_va = gpu_alias_base + 0x580u;
+    dev->register_gpu_alias(gpu_alias_base, cpu_va - 0x580u, 0x10000u);
+
+    const uint64_t heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                    {I(put(dg::GuestDescriptorHeapDesc{0, 8, 1, 0}))}, dg::IID_ID3D12DescriptorHeap);
+    CHECK(heap != 0);
+    const auto* visible = host_object<dg::DescriptorHeap, dg::IDescriptorHeapHost>(heap)->heap();
+    const uint64_t cpu0 = visible->cpu_handle(0).ptr;
+
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    uint8_t srv[48] = {};
+    dg::GuestShaderResourceViewDesc bd{};
+    bd.ViewDimension = 1;  // BUFFER
+    bd.Shader4ComponentMapping = 0x1688;
+    bd.u[0] = 0;   // FirstElement
+    bd.u[2] = 8;   // NumElements (256 bytes)
+    bd.u[3] = 32;  // StructureByteStride
+    std::memcpy(srv, &bd, sizeof(bd));
+    std::memcpy(srv + xb::kViewAtAddressOffset, &gpu_va, sizeof(gpu_va));
+
+    const size_t mark = fx.captured.size();
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(buffer_desc(256))), I(put_bytes(srv, sizeof(srv))), I(cpu0)});
+    const auto pkts = packets_since(fx, mark);
+
+    CHECK(dev->stats().bad_arguments == bad_before);
+    std::array<uint32_t, 8> w0{};
+    CHECK(com::read_guest(cpu0, w0.data(), 32));
+    CHECK(hw::classify_slot(w0.data()) == hw::SlotContent::Buffer);
+    const hw::BufferResource b0 = hw::decode_buffer(w0.data());
+    CHECK(b0.base == gpu_va && b0.stride == 32 && b0.num_records == 8);
+
+    const d3d::ViewDescriptor* v0 = visible->view(0);
+    CHECK(v0 != nullptr && v0->kind == d3d::DescriptorKind::Srv && v0->dimension == d3d::ViewDimension::Buffer &&
+          v0->resource_id != 0);
+    const uint32_t reloc_id = v0 != nullptr ? v0->resource_id : 0u;
+    const uint64_t reloc_off = v0 != nullptr ? v0->first_element_or_address * 32u : 1u;
+    CHECK(reloc_off % 256u == 0);
+    CHECK(dev->state_bridge().buffer_gpu_va(reloc_id) != 0);
+
+    bool saw_create = false;
+    bool saw_write = false;
+    for (const Packet& p : pkts) {
+        if (p.opcode == GpuOpcode::CreateBuffer) {
+            const auto cb = payload_as<GpuCreateBufferPayload>(p);
+            if (cb.id == reloc_id && (cb.usage_flags & GpuBufferUsage::Storage) != 0 &&
+                (cb.usage_flags & GpuBufferUsage::CopyDst) != 0) {
+                saw_create = true;
+            }
+        } else if (p.opcode == GpuOpcode::WriteBuffer) {
+            const auto wb = payload_as<GpuWriteBufferPayload>(p);
+            if (wb.id == reloc_id && wb.dst_offset == static_cast<uint32_t>(reloc_off) &&
+                p.payload.size() == sizeof(GpuWriteBufferPayload) + raw_bytes.size() &&
+                std::memcmp(p.payload.data() + sizeof(GpuWriteBufferPayload), raw_bytes.data(), raw_bytes.size()) == 0) {
+                saw_write = true;
+            }
+        }
+    }
+    CHECK(saw_create && saw_write);
+
+    // Simulate title memcpy of V# words into another shader-visible slot (slot 4) and decode via MemorySlotSource.
+    CHECK(com::write_guest(cpu0 + 4u * 32u, w0.data(), 32));
+    CHECK(visible->view(4)->kind == d3d::DescriptorKind::Empty);
+    const d3d::ViewDescriptor mem4 = source->view(*visible, 4, d3d::DescriptorRangeType::Srv);
+    CHECK(mem4.kind == d3d::DescriptorKind::Srv && mem4.dimension == d3d::ViewDimension::Buffer &&
+          mem4.resource_id == reloc_id && mem4.first_element_or_address == reloc_off &&
+          mem4.num_elements_or_size == raw_bytes.size());
+    const auto reads = dev->descriptor_slot_reads();
+    CHECK(reads[1][static_cast<size_t>(playgta6::gpu::bridge::DecodeStatus::Ok)] == 1);
+    CHECK(reads[1][static_cast<size_t>(playgta6::gpu::bridge::DecodeStatus::UnresolvedAddress)] == 0);
+
+    // Unmapped GPU-only address still writes V# words, binds null, and diagnoses once.
+    const uint64_t unmapped = 0x0000'0BAD'0000'0000ull;
+    std::memcpy(srv + xb::kViewAtAddressOffset, &unmapped, sizeof(unmapped));
+    fx.vcall(scene.device, XSlot::SrvAtAddress,
+             {I(put(buffer_desc(256))), I(put_bytes(srv, sizeof(srv))), I(cpu0 + 32)});
+    CHECK(dev->stats().bad_arguments == bad_before + 1);
+    CHECK(visible->view(1) != nullptr && visible->view(1)->resource_id == 0);
+    std::array<uint32_t, 8> w1{};
+    CHECK(com::read_guest(cpu0 + 32, w1.data(), 32));
+    CHECK(hw::classify_slot(w1.data()) == hw::SlotContent::Buffer && hw::decode_buffer(w1.data()).base == unmapped);
+
+    CHECK(t_balanced);
+    scene.release_all({heap});
+}
+
 }  // namespace
 
 int main() {
@@ -4041,6 +4357,8 @@ int main() {
     test_g49c_default_detile_rgba8_and_bc7();
     test_g49c_slot70_address_texture_draw();
     test_g49c_raw_tsharp_descriptor_memory_draw();
+    test_g51_slot70_unaligned_buffer_views();
+    test_g51_slot70_address_only_buffer_view();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

@@ -1084,18 +1084,37 @@ void Device::view_at_address(bool uav, uint64_t resource_desc, const d3d::ViewDe
     xbox::AddressTextureViewInfo tex_view_info{};
     if (vd.dimension == d3d::ViewDimension::Buffer) {
         bridge::buffer_words_at_address(va, words_record(kind, desc), words);
+        const bool raw = (vd.flags & d3d::BufferViewFlags::Raw) != 0;
+        const uint32_t elem = buffer_element_size(vd.format, vd.structure_byte_stride, raw);
         d3d::GpuVaResolution res;
-        if (state_bridge().resolve_gpu_va(va, &res)) {
-            const uint32_t elem = buffer_element_size(vd.format, vd.structure_byte_stride,
-                                                      (vd.flags & d3d::BufferViewFlags::Raw) != 0);
-            if (elem == 0 || res.offset % elem != 0) {
-                note_bad_argument(std::string(what) + ": address " + hex(va) + " is not element-aligned inside its buffer");
-                return;
-            }
+        const bool resolved = state_bridge().resolve_gpu_va(va, &res);
+        if (resolved && elem != 0 && res.offset % elem == 0) {
             id = res.resource_id;
             vd.first_element += res.offset / elem;
         } else {
-            note_bad_argument(std::string(what) + ": unknown GPU address " + hex(va) + " (null descriptor written)");
+            const uint32_t safe_elem = elem != 0 ? elem : 1u;
+            const uint64_t view_va = va + vd.first_element * uint64_t{safe_elem};
+            uint64_t raw_bytes = vd.num_elements != 0
+                                     ? uint64_t{vd.num_elements} * uint64_t{safe_elem}
+                                     : (uint64_t{64u} << 10);
+            if (vd.num_elements == 0 && resolved && res.resource_size > res.offset) {
+                raw_bytes = std::min<uint64_t>(raw_bytes, res.resource_size - res.offset);
+            }
+            const uint64_t byte_size = std::clamp<uint64_t>(raw_bytes, uint64_t{4u}, uint64_t{16u} << 20);
+            const bool is_typed = vd.structure_byte_stride == 0 && !raw;
+            const bool require_zero_offset = is_typed || elem == 0 || (uint64_t{256u} % elem != 0);
+            uint32_t reloc_id = 0;
+            uint64_t reloc_offset = 0;
+            if (relocate_storage_buffer(view_va, byte_size, &reloc_id, &reloc_offset, require_zero_offset) &&
+                (elem == 0 || reloc_offset % elem == 0)) {
+                id = reloc_id;
+                vd.first_element = elem != 0 ? reloc_offset / elem : uint64_t{0};
+            } else if (resolved) {
+                note_bad_argument(std::string(what) + ": address " + hex(va) +
+                                  " is not element-aligned inside its buffer and could not be relocated (null descriptor written)");
+            } else {
+                note_bad_argument(std::string(what) + ": unknown GPU address " + hex(va) + " (null descriptor written)");
+            }
         }
         count(xbox::Counter::ViewsAtAddress);
     } else {
