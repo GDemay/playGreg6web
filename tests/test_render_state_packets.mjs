@@ -3156,3 +3156,283 @@ test('W98 pickResourceForBinding shape guards reject poisoned resources and enfo
   // binding 5: real r32uint view matched sampleType:'uint'
   assert.equal(bg.desc.entries[5].resource, viewUint);
 });
+
+// ---------------------------------------------------------------------------------------------
+// W101: root-constant dynamicOffsets survive layout:'auto' bind group remapping
+// ---------------------------------------------------------------------------------------------
+
+const W101_VS = [
+  'struct Rdna2Cbv { m: vec4<f32> };',
+  '@group(0) @binding(0)',
+  'var<uniform> cb0_: Rdna2Cbv;',
+  '@vertex fn vs_main(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>, @location(2) uv: vec2<f32>) -> @builtin(position) vec4<f32> {',
+  '  return vec4<f32>(p + cb0_.m.xyz, 1.0);',
+  '}',
+].join('\n');
+const W101_FS = [
+  '@group(0) @binding(1)',
+  'var tex0_: texture_2d<f32>;',
+  '@group(0) @binding(2)',
+  'var samp0_: sampler;',
+  '@fragment fn fs_main() -> @location(0) vec4<f32> {',
+  '  return textureSample(tex0_, samp0_, vec2<f32>(0.5, 0.5));',
+  '}',
+].join('\n');
+
+// Root-constant ring (buffer 100, `ringSize` bytes) bound through an RS-4-style layout whose only
+// entry is a dynamic-offset CBV, used by PSOs 600/601 which fall back to layout:'auto'.
+function w101RenderSetup({ ringSize = 1024, bindingSize = 256, options = {} } = {}) {
+  const gpu = createMockWebGpu();
+  const autoBglMap = new Map();
+  const origCreateRender = gpu.device.createRenderPipeline.bind(gpu.device);
+  gpu.device.createRenderPipeline = (desc) => {
+    const pipe = origCreateRender(desc);
+    const autoBgl = { kind: 'GPUBindGroupLayout', autoFor: pipe.handle };
+    autoBglMap.set(pipe, autoBgl);
+    pipe.getBindGroupLayout = (groupIndex) => {
+      if (groupIndex !== 0) throw new Error(`invalid group ${groupIndex}`);
+      return autoBgl;
+    };
+    return pipe;
+  };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor, options);
+  const key = buildFrame1PipelineKey();
+  processor.executeCommandBuffer(
+    concat(
+      new Stream()
+        .shader(1, 0, W101_VS)
+        .shader(2, 1, W101_FS)
+        .buffer(100, 0x0040 | 0x0008, ringSize)
+        .bytes(),
+      bindGroupLayoutPacket(200, [
+        { binding: 0, visibility: 3, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 },
+      ]),
+      pipelineLayoutPacket(201, [200]),
+      renderPipeline2Packet(600, 1, 2, 201, key),
+      renderPipeline2Packet(601, 1, 2, 201, key),
+      bindGroup2Packet(400, 200, [{ binding: 0, type: 0, id: 100, offset: 0, size: bindingSize }])
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.renderPipelineAutoLayoutMeta.get(600).autoLayoutRemap, true);
+  return { gpu, processor, handler, autoBglMap };
+}
+
+function w101DrawFrame(processor, draws) {
+  const parts = [
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+  ];
+  for (const d of draws) {
+    if (d.pipeline !== undefined) parts.push(new Stream().u32s(OPCODES.SET_PIPELINE, [d.pipeline]).bytes());
+    if (d.offsets !== undefined) parts.push(setBindGroup2Packet(0, 400, d.offsets));
+    parts.push(new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes());
+  }
+  parts.push(header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)));
+  parts.push(new Stream().packet(OPCODES.PRESENT).bytes());
+  return processor.executeCommandBuffer(concat(...parts));
+}
+
+test('W101 bind group layouts/descriptors record dynamicOffsetIndex in ascending binding order', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = installRenderStatePackets(processor);
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().buffer(100, 0x0040 | 0x0008, 1024).buffer(101, 0x0040 | 0x0008, 512).bytes(),
+      // Declared out of order: binding 3 (dynamic), 1 (dynamic), 2 (static).
+      bindGroupLayoutPacket(200, [
+        { binding: 3, visibility: 3, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 },
+        { binding: 1, visibility: 3, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 },
+        { binding: 2, visibility: 3, type: 0, subtype: 0, flags: 0, minBindingSize: 16 },
+      ]),
+      bindGroup2Packet(400, 200, [
+        { binding: 3, type: 0, id: 100, offset: 0, size: 256 },
+        { binding: 1, type: 0, id: 101, offset: 0, size: 256 },
+        { binding: 2, type: 0, id: 100, offset: 256, size: 256 },
+      ])
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.deepEqual([...handler.bindGroupLayouts.get(200).dynamicOffsetIndices], [
+    [1, 0],
+    [3, 1],
+  ]);
+  const byBinding = new Map(handler.bindGroupDescriptors.get(400).resources.map((r) => [r.binding, r]));
+  assert.equal(byBinding.get(1).hasDynamicOffset, true);
+  assert.equal(byBinding.get(1).dynamicOffsetIndex, 0);
+  assert.equal(byBinding.get(1).bufferSize, 512);
+  assert.equal(byBinding.get(3).hasDynamicOffset, true);
+  assert.equal(byBinding.get(3).dynamicOffsetIndex, 1);
+  assert.equal(byBinding.get(3).bufferSize, 1024);
+  assert.equal(byBinding.get(2).hasDynamicOffset, undefined);
+  assert.equal(byBinding.get(2).dynamicOffsetIndex, undefined);
+});
+
+test('W101 auto-layout remap folds per-draw root-constant dynamicOffsets into the static buffer offset', () => {
+  const { gpu, processor, handler, autoBglMap } = w101RenderSetup();
+  const ring = processor.buffers.get(100);
+  const res = w101DrawFrame(processor, [
+    { pipeline: 600, offsets: [0] },
+    { offsets: [256] },
+    { offsets: [256] }, // same offset -> cached remapped bind group reused
+    { offsets: [0] }, // back to 0 -> cached base-key bind group reused
+  ]);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(processor.skippedDrawCount, 0);
+
+  const pipe600 = gpu.results('createRenderPipeline')[0];
+  const bgs = gpu.results('createBindGroup');
+  // [0] = bg 400 (explicit RS-4 layout), [1] = remap @0, [2] = remap @256.
+  assert.equal(bgs.length, 3);
+  const [, remap0, remap256] = bgs;
+  for (const bg of [remap0, remap256]) {
+    assert.equal(bg.desc.layout, autoBglMap.get(pipe600.result));
+    assert.deepEqual(bg.desc.entries.map((e) => e.binding), [0, 1, 2]);
+  }
+  assert.deepEqual(remap0.desc.entries[0].resource, { buffer: ring, offset: 0, size: 256 });
+  assert.deepEqual(remap256.desc.entries[0].resource, { buffer: ring, offset: 256, size: 256 });
+
+  // Each draw binds the remapped group matching its own offset (no dynamic offsets on auto layout).
+  const renderSetBgs = gpu.passCalls.filter((c) => c.pass === 'render' && c.op === 'setBindGroup');
+  assert.deepEqual(
+    renderSetBgs.map((c) => c.args),
+    [
+      [0, remap0.result],
+      [0, remap256.result],
+      [0, remap256.result],
+      [0, remap0.result],
+    ]
+  );
+  assert.equal(handler.remappedBindGroups.has('r:600:400'), true);
+  assert.equal(handler.remappedBindGroups.has('r:600:400@0=256'), true);
+  assert.equal(handler.getTelemetry().dynamicOffsetRemaps, 1);
+
+  // Destroying bind group 400 invalidates every dynamic-offset variant too.
+  handler.destroyResource(400);
+  assert.equal(handler.remappedBindGroups.size, 0);
+});
+
+test('W101 last group-0 dynamicOffsets are preserved when re-binding across a pipeline change', () => {
+  const { gpu, processor, handler } = w101RenderSetup();
+  const ring = processor.buffers.get(100);
+  // setBindGroup(0, 400, [512]) under PSO 600, then switch to PSO 601 and draw without re-binding.
+  w101DrawFrame(processor, [{ pipeline: 600, offsets: [512] }, { pipeline: 601 }]);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 3);
+  assert.deepEqual(bgs[1].desc.entries[0].resource, { buffer: ring, offset: 512, size: 256 });
+  assert.deepEqual(bgs[2].desc.entries[0].resource, { buffer: ring, offset: 512, size: 256 });
+  assert.equal(handler.remappedBindGroups.has('r:601:400@0=512'), true);
+});
+
+test('W101 dynamic offsets are clamped to the GPUBuffer size and out-of-bounds offsets bind a dummy buffer', () => {
+  const { gpu, processor, handler } = w101RenderSetup({ ringSize: 1024, bindingSize: 256 });
+  const ring = processor.buffers.get(100);
+  w101DrawFrame(processor, [
+    { pipeline: 600, offsets: [768] }, // 768 + 256 == 1024: fits exactly
+    { offsets: [896] }, // 896 + 256 > 1024 -> size shrinks to 128
+    { offsets: [1024] }, // offset == buffer size -> dummy buffer
+  ]);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 4);
+  assert.deepEqual(bgs[1].desc.entries[0].resource, { buffer: ring, offset: 768, size: 256 });
+  assert.deepEqual(bgs[2].desc.entries[0].resource, { buffer: ring, offset: 896, size: 128 });
+  const oob = bgs[3].desc.entries[0].resource;
+  assert.notEqual(oob.buffer, ring, 'out-of-bounds dynamic offset must fall back to a dummy buffer');
+  for (const bg of bgs.slice(1)) {
+    const r = bg.desc.entries[0].resource;
+    if (r.buffer === ring) assert.ok(r.offset + r.size <= ring.size);
+  }
+  const t = handler.getTelemetry();
+  assert.equal(t.dynamicOffsetRemaps, 2);
+  assert.equal(t.dynamicOffsetClamps, 2);
+  assert.ok(t.warnings.some((w) => w.includes('size clamped to 128')));
+  assert.ok(t.warnings.some((w) => w.includes('exceeds buffer size 1024')));
+});
+
+test('W101 remappedBindGroups cache is LRU-bounded so rotating ring offsets never leak bind groups', () => {
+  const { gpu, processor, handler } = w101RenderSetup({
+    ringSize: 4096,
+    options: { remappedBindGroupCacheLimit: 3 },
+  });
+  assert.equal(handler.remappedBindGroupCacheLimit, 3);
+  const draws = [{ pipeline: 600, offsets: [0] }];
+  for (let i = 1; i < 8; i += 1) draws.push({ offsets: [i * 256] });
+  w101DrawFrame(processor, draws);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createBindGroup').length, 1 + 8);
+  assert.equal(handler.remappedBindGroups.size, 3);
+  assert.equal(handler.getTelemetry().remappedBindGroupEvictions, 5);
+  assert.deepEqual(
+    [...handler.remappedBindGroups.keys()],
+    ['r:600:400@0=1280', 'r:600:400@0=1536', 'r:600:400@0=1792']
+  );
+
+  // A cache hit refreshes recency: re-using 1280 then adding 0 evicts 1536 (the LRU entry).
+  w101DrawFrame(processor, [{ pipeline: 600, offsets: [1280] }, { offsets: [0] }]);
+  assert.equal(gpu.results('createBindGroup').length, 1 + 8 + 1);
+  assert.deepEqual(
+    [...handler.remappedBindGroups.keys()],
+    ['r:600:400@0=1792', 'r:600:400@0=1280', 'r:600:400']
+  );
+
+  // Default limit applies when no option is passed.
+  const dflt = installRenderStatePackets(new WgpuCommandProcessor(gpu.device, gpu.ctx));
+  assert.equal(dflt.remappedBindGroupCacheLimit, 2048);
+});
+
+test('W101 compute auto-layout remap honours root-constant dynamicOffsets on dispatch', () => {
+  const gpu = createMockWebGpu();
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    pipe.getBindGroupLayout = () => ({ kind: 'GPUBindGroupLayout', autoFor: pipe.handle });
+    return pipe;
+  };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = installRenderStatePackets(processor);
+  const cs = [
+    '@group(0) @binding(0) var<uniform> cb0: vec4<f32>;',
+    '@group(0) @binding(1) var<storage, read_write> out0: array<vec4<f32>>;',
+    '@compute @workgroup_size(1, 1, 1) fn cs_main() { out0[0] = cb0; }',
+  ].join('\n');
+  processor.executeCommandBuffer(
+    concat(
+      new Stream()
+        .shader(1, 2, cs)
+        .buffer(10, 0x0040 | 0x0008, 1024)
+        .bytes(),
+      // Root-signature layout only carries the dynamic CBV -> WGSL storage@1 forces layout:'auto'.
+      bindGroupLayoutPacket(20, [
+        { binding: 0, visibility: 4, type: 0, subtype: 0, flags: 0x1, minBindingSize: 16 },
+      ]),
+      pipelineLayoutPacket(21, [20]),
+      createComputePipeline2Packet(30, 1, 21),
+      bindGroup2Packet(40, 20, [{ binding: 0, type: 0, id: 10, offset: 0, size: 256 }]),
+      new Stream().packet(OPCODES.BEGIN_FRAME).u32s(OPCODES.SET_COMPUTE_PIPELINE, [30]).bytes(),
+      setBindGroup2Packet(0, 40, [256]),
+      new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).bytes(),
+      setBindGroup2Packet(0, 40, [512]),
+      new Stream().u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1]).packet(OPCODES.PRESENT).bytes()
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.computePipelineMeta.get(30).autoLayoutRemap, true);
+  const bgs = gpu.results('createBindGroup');
+  assert.equal(bgs.length, 3);
+  const ring = processor.buffers.get(10);
+  assert.deepEqual(bgs[1].desc.entries[0].resource, { buffer: ring, offset: 256, size: 256 });
+  assert.deepEqual(bgs[2].desc.entries[0].resource, { buffer: ring, offset: 512, size: 256 });
+  const computeSetBgs = gpu.passCalls.filter((c) => c.pass === 'compute' && c.op === 'setBindGroup');
+  assert.deepEqual(
+    computeSetBgs.map((c) => c.args),
+    [
+      [0, bgs[1].result],
+      [0, bgs[2].result],
+    ]
+  );
+});
