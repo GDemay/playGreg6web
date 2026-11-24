@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R31).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
 `program-manifest.json`, compiles dirty shards in parallel with `emcc`/`em++`, caches
-`.o` files by SHA-256 of content + compiler flags, and links with `libplaygta6_core.a`
-into `web/dist/runtime.js` + `web/dist/runtime.wasm` (optionally splitting `.ll` shards
-and `functions.ll` registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1`
-modules with `-fPIC`, `-sMAIN_MODULE=1`, filtered whole-archive, and runtime
-`Module.dynamicLibraries` loading).
+`.o` files by SHA-256 of content + compiler flags (plus sibling `.h`/`.hpp` headers for
+C/C++ units), and links with `libplaygta6_core.a` into `web/dist/runtime.js` +
+`web/dist/runtime.wasm` (optionally splitting `.ll` shards and `functions.ll`
+registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC`,
+`-sMAIN_MODULE=1`, filtered whole-archive, and runtime `Module.dynamicLibraries` loading).
 
 Flags match `runtime/CMakeLists.txt` and `runtime/build_wasm.{sh,ps1}`:
 
@@ -22,7 +22,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
         [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
-        [--pthread-pool-size N] [--extra-link-flag FLAG]
+        [--node-max-old-space-mb MB] [--pthread-pool-size N] [--extra-link-flag FLAG]
         [--response-file] [--sample N] [--link-guest-boot]
         [--dry-run] [--check-only] [--verify] [--json] [--sanitize]
 """
@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -69,6 +70,7 @@ PROGRAM_LEVEL_UNITS: tuple[str, ...] = (
 SOURCE_SUFFIXES: frozenset[str] = frozenset({".ll", ".c", ".cc", ".cpp", ".cxx"})
 IR_SUFFIXES: frozenset[str] = frozenset({".ll"})
 CXX_SUFFIXES: frozenset[str] = frozenset({".cc", ".cpp", ".cxx"})
+HEADER_SUFFIXES: frozenset[str] = frozenset({".h", ".hpp"})
 SKIP_DIR_NAMES: frozenset[str] = frozenset(
     {
         ".git",
@@ -154,6 +156,7 @@ SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
+DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB = 16384
 
 VERIFY_FLAGS: tuple[str, ...] = (
     "--require-memory64",
@@ -164,6 +167,9 @@ VERIFY_FLAGS: tuple[str, ...] = (
 OPT_LEVELS: frozenset[str] = frozenset({"O0", "O1", "O2", "O3", "Os", "Oz"})
 
 _SIZE_TOKEN_RE = re.compile(r"^([0-9]+)([A-Za-z]*)$")
+_NODE_MAX_OLD_SPACE_RE = re.compile(
+    r"(?:^|\s+)--max[-_]old[-_]space[-_]size(?:=\S+|\s+\S+)(?=\s|$)"
+)
 
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
@@ -175,7 +181,7 @@ _TARGET_TRIPLE_WASM64_RE = re.compile(
     r'^([ \t]*target[ \t]+triple[ \t]*=[ \t]*)"wasm64-unknown-unknown"([ \t]*(?:;.*)?)$'
 )
 
-CommandRunner = Callable[[Sequence[str]], "CommandResult"]
+CommandRunner = Callable[..., "CommandResult"]
 WhichFn = Callable[[str], str | None]
 
 
@@ -344,6 +350,7 @@ class BuildReport:
     browser_boot_exports: bool = False
     split_modules: int = 1
     side_modules: list[SideModuleResult] = field(default_factory=list)
+    node_max_old_space_mb: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -362,6 +369,7 @@ class BuildReport:
             "browser_boot_exports": self.browser_boot_exports,
             "split_modules": self.split_modules,
             "side_modules": [m.to_dict() for m in self.side_modules],
+            "node_max_old_space_mb": self.node_max_old_space_mb,
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
             "sources": [u.to_dict() for u in self.sources],
@@ -574,7 +582,11 @@ def discover_emscripten(
     return Toolchain(emcc=emcc_path, emxx=emxx_path, origin=origin, emar=emar_path)
 
 
-def default_run_command(argv: Sequence[str]) -> CommandResult:
+def default_run_command(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> CommandResult:
     if not argv:
         return CommandResult(returncode=1, stderr="empty command")
     try:
@@ -583,6 +595,7 @@ def default_run_command(argv: Sequence[str]) -> CommandResult:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
+            env=dict(env) if env is not None else None,
             check=False,
         )
     except OSError as exc:
@@ -592,6 +605,33 @@ def default_run_command(argv: Sequence[str]) -> CommandResult:
         stdout=proc.stdout or "",
         stderr=proc.stderr or "",
     )
+
+
+def _runner_accepts_env(runner: CommandRunner) -> bool:
+    try:
+        sig = inspect.signature(runner)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "env" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def _invoke_runner(
+    runner: CommandRunner,
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> CommandResult:
+    if env is not None and _runner_accepts_env(runner):
+        return runner(argv, env=env)
+    return runner(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -636,6 +676,58 @@ def parse_split_modules(raw: int) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise BuildGuestWasmError(f"invalid --split-modules {raw!r}; expected an integer >= 1")
     return raw
+
+
+def parse_node_max_old_space_mb(raw: int | None) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise BuildGuestWasmError(
+            f"invalid --node-max-old-space-mb {raw!r}; expected an integer >= 1"
+        )
+    return raw
+
+
+def _has_node_max_old_space_size(node_options: str) -> bool:
+    return _NODE_MAX_OLD_SPACE_RE.search(node_options) is not None
+
+
+def _strip_node_max_old_space_size(node_options: str) -> str:
+    return _NODE_MAX_OLD_SPACE_RE.sub("", node_options).strip()
+
+
+def build_link_env(
+    base_env: Mapping[str, str] | None,
+    *,
+    split_modules: int = 1,
+    node_max_old_space_mb: int | None = None,
+) -> dict[str, str]:
+    """Return a copy of `base_env` with `NODE_OPTIONS` scaled for large Emscripten links.
+
+    - When `node_max_old_space_mb` is explicitly set, merges/replaces
+      `--max-old-space-size=<N>` into `NODE_OPTIONS` while preserving other flags.
+    - Otherwise, when `split_modules > 1` and `NODE_OPTIONS` does not already set
+      `--max-old-space-size`, merges `--max-old-space-size=16384` without clobbering
+      existing flags.
+    - When `split_modules == 1` and `node_max_old_space_mb` is None, leaves
+      `NODE_OPTIONS` completely untouched/unset.
+    """
+    split_count = parse_split_modules(split_modules)
+    explicit_mb = parse_node_max_old_space_mb(node_max_old_space_mb)
+    env_out = dict(os.environ if base_env is None else base_env)
+    existing = env_out.get("NODE_OPTIONS", "")
+
+    if explicit_mb is not None:
+        cleaned = _strip_node_max_old_space_size(existing)
+        flag = f"--max-old-space-size={explicit_mb}"
+        env_out["NODE_OPTIONS"] = f"{cleaned} {flag}" if cleaned else flag
+        return env_out
+
+    if split_count > 1 and not _has_node_max_old_space_size(existing):
+        flag = f"--max-old-space-size={DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB}"
+        stripped = existing.strip()
+        env_out["NODE_OPTIONS"] = f"{stripped} {flag}" if stripped else flag
+    return env_out
 
 
 def retarget_wasm64_ir(text: str) -> str:
@@ -691,12 +783,47 @@ def compile_flags_for(
     return tuple(flags)
 
 
+def sibling_headers_fingerprint(source_path: Path) -> bytes:
+    """Return a deterministic SHA-256 digest of same-directory `.h`/`.hpp` headers, or `b""`."""
+    parent = source_path.parent
+    if not parent.is_dir():
+        return b""
+    headers = sorted(
+        (
+            entry
+            for entry in parent.iterdir()
+            if entry.is_file() and entry.suffix.lower() in HEADER_SUFFIXES
+        ),
+        key=lambda p: p.name,
+    )
+    if not headers:
+        return b""
+    digest = hashlib.sha256()
+    digest.update(b"playgta6-sibling-headers-v1\0")
+    for header in headers:
+        data = header.read_bytes()
+        digest.update(header.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.digest()
+
+
+def _extra_fingerprint_for_unit(unit: SourceUnit) -> bytes:
+    if unit.kind in {"c", "cpp"}:
+        return sibling_headers_fingerprint(unit.path)
+    return b""
+
+
 def cache_key_for(
     content: bytes,
     flags: Sequence[str],
     *,
     kind: str,
     retarget_version: int | str | None = None,
+    extra_fingerprint: bytes = b"",
 ) -> str:
     digest = hashlib.sha256()
     digest.update(b"playgta6-guest-wasm-v1\0")
@@ -709,6 +836,12 @@ def cache_key_for(
         digest.update(b"\0")
     for flag in flags:
         digest.update(flag.encode("utf-8"))
+        digest.update(b"\0")
+    if extra_fingerprint:
+        digest.update(b"extra\0")
+        digest.update(str(len(extra_fingerprint)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(extra_fingerprint)
         digest.update(b"\0")
     digest.update(content)
     return digest.hexdigest()
@@ -1394,7 +1527,8 @@ def compile_unit(
 ) -> UnitBuildResult:
     started = time.monotonic()
     content = unit.path.read_bytes()
-    key = cache_key_for(content, flags, kind=unit.kind)
+    extra_fp = _extra_fingerprint_for_unit(unit)
+    key = cache_key_for(content, flags, kind=unit.kind, extra_fingerprint=extra_fp)
     object_path = cache_object_path(cache_dir, key, unit.unit_id)
     argv = build_compile_argv(compiler, unit.path, object_path, flags)
     display_argv = tuple(sanitize_argv(argv))
@@ -1635,6 +1769,7 @@ def run_build(
     assertions: int | None = None,
     browser_boot_exports: bool = False,
     split_modules: int = 1,
+    node_max_old_space_mb: int | None = None,
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
@@ -1647,6 +1782,20 @@ def run_build(
         raise BuildGuestWasmError("--shrink-largest-shards must be >= 0")
     split_count = parse_split_modules(split_modules)
     use_split = split_count > 1
+    explicit_node_mb = parse_node_max_old_space_mb(node_max_old_space_mb)
+    base_link_env: Mapping[str, str] = os.environ if env is None else env
+    link_env = build_link_env(
+        base_link_env,
+        split_modules=split_count,
+        node_max_old_space_mb=explicit_node_mb,
+    )
+    effective_node_mb: int | None
+    if explicit_node_mb is not None:
+        effective_node_mb = explicit_node_mb
+    elif use_split and not _has_node_max_old_space_size(base_link_env.get("NODE_OPTIONS", "")):
+        effective_node_mb = DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB
+    else:
+        effective_node_mb = None
     initial_memory_token = (
         parse_size_token(initial_memory, flag_name="--initial-memory")
         if initial_memory is not None
@@ -1705,6 +1854,7 @@ def run_build(
         assertions=assertions_val,
         browser_boot_exports=browser_boot_exports,
         split_modules=split_count,
+        node_max_old_space_mb=effective_node_mb,
     )
 
     if not toolchain.ok:
@@ -1800,7 +1950,8 @@ def run_build(
             pic=use_split,
         )
         content = unit.path.read_bytes()
-        key = cache_key_for(content, flags, kind=unit.kind)
+        extra_fp = _extra_fingerprint_for_unit(unit)
+        key = cache_key_for(content, flags, kind=unit.kind, extra_fingerprint=extra_fp)
         object_path = cache_object_path(cache_root, key, unit.unit_id)
         argv = tuple(sanitize_argv(build_compile_argv(compiler, unit.path, object_path, flags)))
         if object_path.is_file():
@@ -2016,7 +2167,7 @@ def run_build(
 
         if rsp_path is not None:
             write_link_response_file(rsp_path, main_objects)
-        link_result = runner(raw_link)
+        link_result = _invoke_runner(runner, raw_link, env=link_env)
         if link_result.returncode != 0:
             report.ok = False
             report.errors.append(
@@ -2077,7 +2228,7 @@ def run_build(
             return report
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        link_result = runner(raw_link)
+        link_result = _invoke_runner(runner, raw_link, env=link_env)
         if link_result.returncode != 0:
             report.ok = False
             report.errors.append(
@@ -2147,6 +2298,11 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append(
             f"  Split modules: {report.split_modules} "
             f"({PIC_FLAG}, {MAIN_MODULE_FLAG}, {SIDE_MODULE_FLAG})"
+        )
+    if report.node_max_old_space_mb is not None:
+        lines.append(
+            f"  Node max old space: {report.node_max_old_space_mb} MB "
+            f"(NODE_OPTIONS=--max-old-space-size={report.node_max_old_space_mb})"
         )
     if report.response_file:
         lines.append(f"  Response file: @{report.response_file}")
@@ -2341,6 +2497,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--node-max-old-space-mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help=(
+            f"Set NODE_OPTIONS=--max-old-space-size=MB for the main em++ link "
+            f"(defaults to {DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB} automatically when "
+            f"--split-modules > 1 and NODE_OPTIONS does not already set "
+            f"--max-old-space-size; untouched for --split-modules 1 unless set)."
+        ),
+    )
+    parser.add_argument(
         "--extra-link-flag",
         action="append",
         default=[],
@@ -2504,6 +2672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             assertions=args.assertions,
             browser_boot_exports=args.browser_boot_exports,
             split_modules=args.split_modules,
+            node_max_old_space_mb=args.node_max_old_space_mb,
         )
     except BuildGuestWasmError as exc:
         err = sanitize_text(str(exc)) if (args.as_json or args.sanitize) else str(exc)
