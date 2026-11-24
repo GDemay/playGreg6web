@@ -6,6 +6,7 @@ import RuntimeSessionControllerDefault, {
   SESSION_MODE,
   SESSION_STATE,
   RuntimeSessionController,
+  detectWasm64,
   probeBrowserCapabilities,
 } from '../web/runtime/session_controller.js';
 import { PerfMonitor } from '../web/telemetry/perf_monitor.js';
@@ -827,5 +828,195 @@ test('restart() while an earlier start() is in flight cancels the first and laun
   assert.equal(firstRes.aborted, true);
   assert.equal(firstDisposed, true);
   assert.equal(controller.getState(), SESSION_STATE.RUNNING_SMOKE);
+});
+
+test('W60 detectWasm64 supports spec-standard address: i64, legacy index: i64, BigInt rejection, and type reflection', () => {
+  // Simulates WebIDL ToNumber coercion on i32 memory limits, which throws TypeError on BigInt.
+  function assertI32Limit(value) {
+    return +value;
+  }
+
+  // 1. Modern Chrome/V8/Firefox/Node engine accepting only `{ address: 'i64' }` with BigInt limits.
+  const modernCalls = [];
+  const modernWasmApi = {
+    Memory: class MockModernMemory {
+      constructor(desc) {
+        modernCalls.push(desc);
+        if (desc.address === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        assertI32Limit(desc.initial);
+      }
+      type() {
+        return { minimum: 1n, maximum: 2n, address: 'i64' };
+      }
+    },
+  };
+  assert.equal(detectWasm64(modernWasmApi), true);
+  assert.equal(modernCalls.length, 1);
+  assert.equal(modernCalls[0].address, 'i64');
+  assert.equal(modernCalls[0].initial, 1n);
+  assert.equal(modernCalls[0].maximum, 2n);
+
+  // 2. Older memory64 proposal engine accepting only legacy `{ index: 'i64' }`.
+  const legacyCalls = [];
+  const legacyWasmApi = {
+    Memory: class MockLegacyMemory {
+      constructor(desc) {
+        legacyCalls.push(desc);
+        if (desc.index === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        // Unknown `address` key is ignored -> treated as i32 -> BigInt throws TypeError.
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(legacyWasmApi), true);
+  assert.equal(legacyCalls.length, 2);
+  assert.equal(legacyCalls[0].address, 'i64');
+  assert.equal(legacyCalls[1].index, 'i64');
+
+  // 3. Non-Wasm64 engine that ignores both keys and throws on BigInt initial/maximum.
+  const wasm32Calls = [];
+  const wasm32OnlyApi = {
+    Memory: class MockWasm32Memory {
+      constructor(desc) {
+        wasm32Calls.push(desc);
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  assert.equal(detectWasm64(wasm32OnlyApi), false);
+  assert.equal(wasm32Calls.length, 2);
+  assert.equal(wasm32Calls[0].address, 'i64');
+  assert.equal(wasm32Calls[1].index, 'i64');
+
+  // 4. Non-i64 type reflection must be rejected (both `address` and `index` fields).
+  assert.equal(
+    detectWasm64({
+      Memory: class MockI32AddressReflectingMemory {
+        type() {
+          return { minimum: 1, maximum: 2, address: 'i32' };
+        }
+      },
+    }),
+    false
+  );
+  assert.equal(
+    detectWasm64({
+      Memory: class MockI32IndexReflectingMemory {
+        type() {
+          return { minimum: 1, maximum: 2, index: 'i32' };
+        }
+      },
+    }),
+    false
+  );
+
+  // If `address` probe reflects i32, detectWasm64 still falls back to `index` probe.
+  assert.equal(
+    detectWasm64({
+      Memory: class MockReflectFallbackMemory {
+        constructor(desc) {
+          this._addr = desc.index === 'i64' ? 'i64' : 'i32';
+        }
+        type() {
+          return { minimum: 1n, maximum: 2n, index: this._addr };
+        }
+      },
+    }),
+    true
+  );
+
+  // Optional type-reflection errors are ignored once memory construction succeeds.
+  assert.equal(
+    detectWasm64({
+      Memory: class MockThrowingReflectMemory {
+        type() {
+          throw new Error('type reflection unsupported');
+        }
+      },
+    }),
+    true
+  );
+
+  // 5. Defensive edge cases: missing/invalid API and zero-argument global probe.
+  assert.equal(detectWasm64(null), false);
+  assert.equal(detectWasm64(undefined), false);
+  assert.equal(detectWasm64({}), false);
+  assert.equal(detectWasm64({ Memory: 'not-a-function' }), false);
+  assert.equal(typeof detectWasm64(), 'boolean');
+});
+
+test('W60 probeBrowserCapabilities reflects detectWasm64 across address: i64, legacy index: i64, and non-Wasm64 engines', () => {
+  const originalWebAssembly = globalThis.WebAssembly;
+  const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebAssembly');
+
+  const setGlobalWebAssembly = (value) => {
+    Object.defineProperty(globalThis, 'WebAssembly', {
+      value,
+      configurable: true,
+      writable: true,
+      enumerable: false,
+    });
+  };
+
+  try {
+    setGlobalWebAssembly({
+      Memory: class MockModernMemory {
+        constructor(desc) {
+          if (desc.address !== 'i64') {
+            return +desc.initial;
+          }
+        }
+      },
+    });
+    assert.equal(probeBrowserCapabilities().wasm64, true);
+
+    setGlobalWebAssembly({
+      Memory: class MockLegacyMemory {
+        constructor(desc) {
+          if (desc.index !== 'i64') {
+            return +desc.initial;
+          }
+        }
+      },
+    });
+    assert.equal(probeBrowserCapabilities().wasm64, true);
+
+    setGlobalWebAssembly({
+      Memory: class MockWasm32Memory {
+        constructor(desc) {
+          return +desc.initial;
+        }
+      },
+    });
+    assert.equal(probeBrowserCapabilities().wasm64, false);
+
+    setGlobalWebAssembly({
+      Memory: class MockNonI64ReflectMemory {
+        type() {
+          return { address: 'i32' };
+        }
+      },
+    });
+    assert.equal(probeBrowserCapabilities().wasm64, false);
+
+    setGlobalWebAssembly(null);
+    assert.equal(probeBrowserCapabilities().wasm64, false);
+  } finally {
+    if (originalDescriptor) {
+      Object.defineProperty(globalThis, 'WebAssembly', originalDescriptor);
+    } else {
+      globalThis.WebAssembly = originalWebAssembly;
+    }
+  }
 });
 
