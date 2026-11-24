@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const rtPoolMod = require('../web/workers/rt_pool.js');
@@ -8,9 +11,14 @@ const rtPoolMod = require('../web/workers/rt_pool.js');
 const {
   DEFAULT_MAX_POOL_BYTES,
   DEFAULT_IDLE_FRAME_TTL,
+  DEFAULT_MAX_TEXTURE_DIMENSION_2D,
   TEXTURE_USAGE,
   DEFAULT_TEXTURE_USAGE,
   FORMAT_BYTES_PER_PIXEL,
+  DXGI_FORMAT_ALIASES,
+  normalizeRenderTargetFormat,
+  normalizeSampleCount,
+  sanitizeRenderTargetDesc,
   normalizeRenderTargetDesc,
   makeRenderTargetKey,
   estimateRenderTargetBytes,
@@ -27,6 +35,7 @@ function createMockGpuDevice(options = {}) {
   const createdTextures = [];
 
   const device = {
+    ...(options.limits !== undefined ? { limits: options.limits } : {}),
     createdTextures,
     createTexture(descriptor) {
       const texId = nextTexId++;
@@ -55,6 +64,9 @@ function createMockGpuDevice(options = {}) {
         destroy() {
           this.destroyed = true;
           this.destroyCount += 1;
+          if (options.throwOnDestroy) {
+            throw new Error('simulated device-lost destroy error');
+          }
         },
       };
       createdTextures.push(texture);
@@ -753,4 +765,437 @@ test('constructor validation and texture cleanup when createView throws', () => 
   assert.equal(pool.getStats().misses, 0);
 
   pool.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// G45: Xbox Series 4K/Windowed Hardening, Format Normalization & Resize Safety
+// ---------------------------------------------------------------------------
+
+test('G45 clamps malformed, zero, negative, and oversized dimensions to [1, maxTextureDimension2D] and tracks dimensionClampCount', () => {
+  assert.equal(DEFAULT_MAX_TEXTURE_DIMENSION_2D, 8192);
+  assert.equal(typeof sanitizeRenderTargetDesc, 'function');
+
+  // 1. Device without limits defaults to maxTextureDimension2D = 8192.
+  {
+    const { device, createdTextures } = createMockGpuDevice();
+    const pool = new RenderTargetPool({ device, maxPoolBytes: Infinity });
+    assert.equal(pool.maxTextureDimension2D, 8192);
+    assert.equal(pool.getStats().maxTextureDimension2D, 8192);
+    assert.equal(pool.getStats().dimensionClampCount, 0);
+
+    // Valid 4K (3840x2160) & windowed (1280x720) do NOT clamp.
+    const rt4k = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' });
+    assert.equal(rt4k.desc.width, 3840);
+    assert.equal(rt4k.desc.height, 2160);
+    assert.equal(createdTextures[0].descriptor.size.width, 3840);
+    assert.equal(createdTextures[0].descriptor.size.height, 2160);
+    assert.equal(pool.getStats().dimensionClampCount, 0);
+
+    // Zero width/height clamped to 1x1, mipLevelCount clamped to 1.
+    const rtZero = pool.acquire({ width: 0, height: 0, format: 'rgba8unorm', mipLevelCount: 6 });
+    assert.equal(rtZero.desc.width, 1);
+    assert.equal(rtZero.desc.height, 1);
+    assert.equal(rtZero.desc.mipLevelCount, 1);
+    assert.equal(createdTextures[1].descriptor.size.width, 1);
+    assert.equal(createdTextures[1].descriptor.size.height, 1);
+    assert.equal(pool.getStats().dimensionClampCount, 1);
+
+    // Negative / NaN / Infinity dimensions clamped safely to 1.
+    const rtMalformed = pool.acquire({ width: -640, height: Number.NaN, format: 'bgra8unorm' });
+    assert.equal(rtMalformed.desc.width, 1);
+    assert.equal(rtMalformed.desc.height, 1);
+    assert.equal(pool.getStats().dimensionClampCount, 2);
+
+    // Oversized > 8192 clamped to 8192.
+    const rtOversized = pool.acquire({ size: [16384, 12000], format: 'r8unorm' });
+    assert.equal(rtOversized.desc.width, 8192);
+    assert.equal(rtOversized.desc.height, 8192);
+    assert.equal(pool.getStats().dimensionClampCount, 3);
+
+    // Fractional dimensions floored and counted as clamped.
+    const rtFrac = pool.acquire({ size: { width: 1280.9, height: 720.2 }, format: 'rgba8unorm' });
+    assert.equal(rtFrac.desc.width, 1280);
+    assert.equal(rtFrac.desc.height, 720);
+    assert.equal(pool.getStats().dimensionClampCount, 4);
+
+    // Releasing rtZero (1x1 rgba8unorm) and re-acquiring with malformed { width: -5, height: 0 }
+    // reuses the pooled 1x1 texture AND increments dimensionClampCount + hits.
+    pool.release(rtZero);
+    const rtZeroHit = pool.acquire({ width: -5, height: 0, format: 'rgba8unorm' });
+    assert.equal(rtZeroHit.reused, true);
+    assert.equal(rtZeroHit.texture, rtZero.texture);
+    assert.equal(pool.getStats().hits, 1);
+    assert.equal(pool.getStats().dimensionClampCount, 5);
+
+    pool.destroy();
+    // getStats() remains safe after destroy and retains counters & maxTextureDimension2D.
+    const postDestroy = pool.getStats();
+    assert.equal(postDestroy.dimensionClampCount, 5);
+    assert.equal(postDestroy.maxTextureDimension2D, 8192);
+  }
+
+  // 2. Device with explicit limits.maxTextureDimension2D = 4096 clamps 4K-oversized requests to 4096.
+  {
+    const { device } = createMockGpuDevice({ limits: { maxTextureDimension2D: 4096 } });
+    const pool = new RenderTargetPool({ device, maxPoolBytes: Infinity });
+    assert.equal(pool.maxTextureDimension2D, 4096);
+
+    const rtClamped = pool.acquire({ width: 7680, height: 4320, format: 'rgba8unorm' });
+    assert.equal(rtClamped.desc.width, 4096);
+    assert.equal(rtClamped.desc.height, 4096);
+    assert.equal(pool.getStats().dimensionClampCount, 1);
+
+    // 3840x2160 fits within 4096 without clamping.
+    const rt4k = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' });
+    assert.equal(rt4k.desc.width, 3840);
+    assert.equal(rt4k.desc.height, 2160);
+    assert.equal(pool.getStats().dimensionClampCount, 1);
+
+    pool.destroy();
+  }
+});
+
+test('G45 normalizes DXGI/Xbox color & depth-stencil formats while preserving valid WebGPU formats untouched', () => {
+  assert.ok(Object.isFrozen(DXGI_FORMAT_ALIASES));
+  assert.equal(typeof normalizeRenderTargetFormat, 'function');
+
+  // Required DXGI/Xbox format normalizations.
+  const requiredMappings = [
+    ['r8g8b8a8_unorm', 'rgba8unorm'],
+    ['R8G8B8A8_UNORM', 'rgba8unorm'],
+    ['DXGI_FORMAT_R8G8B8A8_UNORM', 'rgba8unorm'],
+    ['b8g8r8a8_unorm', 'bgra8unorm'],
+    ['DXGI_FORMAT_B8G8R8A8_UNORM', 'bgra8unorm'],
+    ['d32_float', 'depth32float'],
+    ['DXGI_FORMAT_D32_FLOAT', 'depth32float'],
+    ['d24_unorm_s8_uint', 'depth24plus-stencil8'],
+    ['DXGI_FORMAT_D24_UNORM_S8_UINT', 'depth24plus-stencil8'],
+    ['d32_float_s8x24_uint', 'depth32float-stencil8'],
+    ['DXGI_FORMAT_D32_FLOAT_S8X24_UINT', 'depth32float-stencil8'],
+    // Additional Xbox Series HDR/color/depth aliases.
+    ['r16g16b16a16_float', 'rgba16float'],
+    ['r11g11b10_float', 'rg11b10ufloat'],
+    ['r10g10b10a2_unorm', 'rgb10a2unorm'],
+    ['b8g8r8a8_unorm_srgb', 'bgra8unorm-srgb'],
+    ['r8g8b8a8_unorm_srgb', 'rgba8unorm-srgb'],
+    ['d16_unorm', 'depth16unorm'],
+  ];
+
+  for (const [input, expected] of requiredMappings) {
+    assert.equal(
+      normalizeRenderTargetFormat(input),
+      expected,
+      `expected ${input} -> ${expected}`
+    );
+  }
+
+  // Valid WebGPU formats pass through untouched.
+  const validWebGpuFormats = [
+    'rgba8unorm',
+    'bgra8unorm',
+    'rgba16float',
+    'depth32float',
+    'depth24plus-stencil8',
+    'depth32float-stencil8',
+  ];
+  for (const fmt of validWebGpuFormats) {
+    assert.equal(normalizeRenderTargetFormat(fmt), fmt);
+  }
+
+  // Byte estimation works seamlessly with DXGI aliases.
+  assert.equal(estimateRenderTargetBytes({ width: 3840, height: 2160, format: 'r8g8b8a8_unorm' }), 3840 * 2160 * 4);
+  assert.equal(estimateRenderTargetBytes({ width: 3840, height: 2160, format: 'd32_float' }), 3840 * 2160 * 4);
+  assert.equal(estimateRenderTargetBytes({ width: 3840, height: 2160, format: 'd24_unorm_s8_uint' }), 3840 * 2160 * 4);
+  assert.equal(estimateRenderTargetBytes({ width: 3840, height: 2160, format: 'd32_float_s8x24_uint' }), 3840 * 2160 * 8);
+
+  // Pool acquisition normalizes DXGI formats, shares pooled textures with canonical WebGPU formats,
+  // and only increments formatNormalizeCount when a format alias rewrite occurs.
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // 1. Acquire with canonical WebGPU formats -> formatNormalizeCount stays 0.
+  const webgpuColor = pool.acquire({ width: 1280, height: 720, format: 'rgba8unorm' });
+  const webgpuDepth = pool.acquire({ width: 1280, height: 720, format: 'depth24plus-stencil8' });
+  assert.equal(webgpuColor.desc.format, 'rgba8unorm');
+  assert.equal(webgpuDepth.desc.format, 'depth24plus-stencil8');
+  assert.equal(pool.getStats().formatNormalizeCount, 0);
+  pool.release(webgpuColor);
+  pool.release(webgpuDepth);
+
+  // 2. Re-acquire using DXGI aliases -> HITS the exact same pooled textures AND increments formatNormalizeCount!
+  const dxgiColor = pool.acquire({ width: 1280, height: 720, format: 'r8g8b8a8_unorm' });
+  assert.equal(dxgiColor.reused, true);
+  assert.equal(dxgiColor.desc.format, 'rgba8unorm');
+  assert.equal(dxgiColor.texture, webgpuColor.texture);
+  assert.equal(pool.getStats().formatNormalizeCount, 1);
+
+  const dxgiDepth = pool.acquire({ width: 1280, height: 720, format: 'd24_unorm_s8_uint' });
+  assert.equal(dxgiDepth.reused, true);
+  assert.equal(dxgiDepth.desc.format, 'depth24plus-stencil8');
+  assert.equal(dxgiDepth.texture, webgpuDepth.texture);
+  assert.equal(pool.getStats().formatNormalizeCount, 2);
+
+  // 3. Acquire new targets with remaining required DXGI aliases -> device.createTexture receives canonical WebGPU format.
+  const dxgiBgra = pool.acquire({ width: 1920, height: 1080, format: 'b8g8r8a8_unorm' });
+  const dxgiD32 = pool.acquire({ width: 1920, height: 1080, format: 'd32_float' });
+  const dxgiD32S8 = pool.acquire({ width: 1920, height: 1080, format: 'd32_float_s8x24_uint' });
+
+  assert.equal(dxgiBgra.desc.format, 'bgra8unorm');
+  assert.equal(dxgiD32.desc.format, 'depth32float');
+  assert.equal(dxgiD32S8.desc.format, 'depth32float-stencil8');
+  assert.equal(createdTextures[2].descriptor.format, 'bgra8unorm');
+  assert.equal(createdTextures[3].descriptor.format, 'depth32float');
+  assert.equal(createdTextures[4].descriptor.format, 'depth32float-stencil8');
+  assert.equal(createdTextures.length, 5);
+
+  const stats = pool.getStats();
+  assert.equal(stats.formatNormalizeCount, 5);
+  assert.equal(stats.hits, 2);
+  assert.equal(stats.misses, 5);
+
+  pool.destroy();
+});
+
+test('G45 normalizes sampleCount strictly to {1, 4} and enforces WebGPU multisampling constraints', () => {
+  assert.equal(typeof normalizeSampleCount, 'function');
+
+  assert.deepEqual(normalizeSampleCount(undefined), { sampleCount: 1, normalized: false });
+  assert.deepEqual(normalizeSampleCount(1), { sampleCount: 1, normalized: false });
+  assert.deepEqual(normalizeSampleCount(4), { sampleCount: 4, normalized: false });
+  assert.deepEqual(normalizeSampleCount(0), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(-4), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(Number.NaN), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(2), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(3), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(8), { sampleCount: 4, normalized: true });
+  assert.deepEqual(normalizeSampleCount(16), { sampleCount: 4, normalized: true });
+
+  // WebGPU constraints disallow MSAA for mip chains, 3D textures, texture arrays, or STORAGE_BINDING.
+  assert.deepEqual(normalizeSampleCount(4, { mipLevelCount: 2 }), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(4, { dimension: '3d' }), { sampleCount: 1, normalized: true });
+  assert.deepEqual(normalizeSampleCount(4, { depthOrArrayLayers: 2 }), { sampleCount: 1, normalized: true });
+  assert.deepEqual(
+    normalizeSampleCount(4, { usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.STORAGE_BINDING }),
+    { sampleCount: 1, normalized: true }
+  );
+
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // Request 8x MSAA -> clamped to 4x MSAA.
+  const msaa8 = pool.acquire({ width: 640, height: 360, format: 'rgba8unorm', sampleCount: 8 });
+  assert.equal(msaa8.desc.sampleCount, 4);
+  assert.equal(createdTextures[0].descriptor.sampleCount, 4);
+  assert.equal(pool.getStats().sampleCountNormalizeCount, 1);
+
+  // Release & re-acquire with canonical 4x MSAA -> pool HIT!
+  pool.release(msaa8);
+  const msaa4 = pool.acquire({ width: 640, height: 360, format: 'rgba8unorm', sampleCount: 4 });
+  assert.equal(msaa4.reused, true);
+  assert.equal(msaa4.texture, msaa8.texture);
+  assert.equal(pool.getStats().sampleCountNormalizeCount, 1);
+
+  // Request 2x MSAA -> normalized to 1x; release & re-acquire with 1x -> pool HIT!
+  const msaa2 = pool.acquire({ width: 640, height: 360, format: 'rgba8unorm', sampleCount: 2 });
+  assert.equal(msaa2.desc.sampleCount, 1);
+  assert.equal(createdTextures[1].descriptor.sampleCount, 1);
+  pool.release(msaa2);
+
+  const msaa1 = pool.acquire({ width: 640, height: 360, format: 'rgba8unorm', sampleCount: 1 });
+  assert.equal(msaa1.reused, true);
+  assert.equal(msaa1.texture, msaa2.texture);
+
+  // Request 4x MSAA with mipLevelCount: 3 -> normalized to 1x so WebGPU createTexture stays valid.
+  const msaaMip = pool.acquire({
+    width: 256,
+    height: 256,
+    format: 'rgba8unorm',
+    sampleCount: 4,
+    mipLevelCount: 3,
+  });
+  assert.equal(msaaMip.desc.sampleCount, 1);
+  assert.equal(msaaMip.desc.mipLevelCount, 3);
+  assert.equal(pool.getStats().sampleCountNormalizeCount, 3);
+
+  pool.destroy();
+});
+
+test('G45 resize & eviction destroy old textures safely without double-destroy or stale GPUTextureViews', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // Simulate Xbox Series 4K Frame-1 splash + depth passes.
+  const color4k = pool.acquire({ width: 3840, height: 2160, format: 'r8g8b8a8_unorm' }, 'splash-4k-color');
+  const depth4k = pool.acquire({ width: 3840, height: 2160, format: 'd32_float_s8x24_uint' }, 'splash-4k-depth');
+  const inFlight4k = pool.acquire({ width: 3840, height: 2160, format: 'b8g8r8a8_unorm' }, 'inflight-4k-ui');
+
+  assert.ok(color4k.view !== null);
+  assert.ok(depth4k.view !== null);
+  assert.ok(inFlight4k.view !== null);
+  assert.equal(color4k.destroyed, false);
+
+  // Release the two completed 4K targets; keep inFlight4k active across resize.
+  assert.equal(pool.release(color4k), true);
+  assert.equal(pool.release(depth4k), true);
+
+  // Resize from 4K to 1280x720 windowed.
+  const destroyedIdle = pool.resize(1280, 720);
+  assert.equal(destroyedIdle, 2);
+
+  // Evicted idle textures are destroyed exactly once and their handles NEVER return stale GPUTextureViews!
+  assert.equal(createdTextures[0].destroyed, true);
+  assert.equal(createdTextures[0].destroyCount, 1);
+  assert.equal(createdTextures[1].destroyed, true);
+  assert.equal(createdTextures[1].destroyCount, 1);
+  assert.equal(color4k.destroyed, true);
+  assert.equal(color4k.texture.destroyed, true);
+  assert.equal(color4k.view, null);
+  assert.equal(depth4k.destroyed, true);
+  assert.equal(depth4k.texture.destroyed, true);
+  assert.equal(depth4k.view, null);
+
+  // In-flight target stays valid while still active.
+  assert.equal(createdTextures[2].destroyed, false);
+  assert.equal(inFlight4k.destroyed, false);
+  assert.ok(inFlight4k.view !== null);
+
+  // Second resize while idle is empty is a safe no-op with zero double-destroy.
+  assert.equal(pool.resize(1280, 720), 0);
+  assert.equal(createdTextures[0].destroyCount, 1);
+  assert.equal(createdTextures[1].destroyCount, 1);
+
+  // Releasing inFlight4k after resize immediately retires & destroys it instead of putting stale 4K back in idle pool!
+  assert.equal(pool.release(inFlight4k), true);
+  assert.equal(createdTextures[2].destroyed, true);
+  assert.equal(createdTextures[2].destroyCount, 1);
+  assert.equal(inFlight4k.destroyed, true);
+  assert.equal(inFlight4k.texture.destroyed, true);
+  assert.equal(inFlight4k.view, null);
+  assert.equal(pool.getStats().idleCount, 0);
+  assert.equal(pool.getStats().activeCount, 0);
+  assert.equal(pool.getStats().evictions, 3);
+
+  // Duplicate release on retired handle is a safe no-op with zero double-destroy.
+  assert.equal(pool.release(inFlight4k), false);
+  assert.equal(createdTextures[2].destroyCount, 1);
+
+  // Subsequent windowed acquire allocates a fresh target (never reuses retired 4K target).
+  const winRt = pool.acquire({ width: 1280, height: 720, format: 'bgra8unorm' }, 'windowed-ui');
+  assert.equal(winRt.reused, false);
+  assert.ok(winRt.view !== null);
+  assert.equal(winRt.destroyed, false);
+
+  // Full teardown + idempotent second destroy() never double-destroys any texture.
+  pool.destroy();
+  pool.destroy();
+  assert.equal(winRt.destroyed, true);
+  assert.equal(winRt.texture.destroyed, true);
+  assert.equal(winRt.view, null);
+  for (const tex of createdTextures) {
+    assert.equal(tex.destroyed, true);
+    assert.equal(tex.destroyCount, 1, `texture #${tex.mockId} must be destroyed exactly once`);
+  }
+});
+
+test('G45 guards against externally-destroyed pooled textures and device-lost destroy() errors', () => {
+  // 1. Externally destroyed idle texture must be skipped on acquire (no stale GPUTextureView, no double-destroy).
+  {
+    const { device, createdTextures } = createMockGpuDevice();
+    const pool = new RenderTargetPool({ device });
+
+    const desc = { width: 512, height: 512, format: 'rgba8unorm' };
+    const first = pool.acquire(desc);
+    const firstTex = createdTextures[0];
+    pool.release(first);
+
+    // Simulate external destruction (e.g. device loss or swapchain reset destroying underlying texture).
+    firstTex.destroy();
+    assert.equal(firstTex.destroyCount, 1);
+    assert.equal(first.view, null, 'handle view must immediately become null when underlying texture is destroyed');
+    assert.equal(first.destroyed, true);
+
+    // Next acquire must detect the destroyed idle entry, skip it without double-destroying, and allocate fresh.
+    const second = pool.acquire(desc);
+    assert.equal(second.reused, false);
+    assert.notEqual(second.texture, firstTex);
+    assert.ok(second.view !== null);
+    assert.equal(firstTex.destroyCount, 1, 'externally-destroyed texture must not be double-destroyed');
+    assert.equal(pool.getStats().evictions, 1);
+    assert.equal(pool.getStats().misses, 2);
+
+    pool.destroy();
+    assert.equal(firstTex.destroyCount, 1);
+    assert.equal(createdTextures[1].destroyCount, 1);
+  }
+
+  // 2. texture.destroy() throwing on device loss does not crash invalidateAll(), eviction, or destroy().
+  {
+    const { device, createdTextures } = createMockGpuDevice({ throwOnDestroy: true });
+    const pool = new RenderTargetPool({ device });
+
+    const rt = pool.acquire({ width: 128, height: 128, format: 'rgba8unorm' });
+    pool.release(rt);
+    assert.doesNotThrow(() => pool.invalidateAll());
+    assert.equal(createdTextures[0].destroyCount, 1);
+    assert.equal(rt.view, null);
+    assert.doesNotThrow(() => pool.destroy());
+    assert.equal(createdTextures[0].destroyCount, 1);
+  }
+
+  // 3. In-flight active target flagged by invalidateAll() is retired cleanly on endFrame() auto-release.
+  {
+    const { device, createdTextures } = createMockGpuDevice();
+    const pool = new RenderTargetPool({ device, autoReleaseLeaked: true });
+
+    const leaked = pool.acquire({ width: 640, height: 360, format: 'd32_float' });
+    pool.invalidateAll();
+    assert.equal(createdTextures[0].destroyed, false);
+
+    const endRes = pool.endFrame();
+    assert.equal(endRes.leakedCount, 1);
+    assert.equal(endRes.autoReleasedCount, 1);
+    assert.equal(endRes.evictedCount, 1);
+    assert.equal(endRes.idleCount, 0);
+    assert.equal(createdTextures[0].destroyed, true);
+    assert.equal(createdTextures[0].destroyCount, 1);
+    assert.equal(leaked.view, null);
+
+    pool.destroy();
+    assert.equal(createdTextures[0].destroyCount, 1);
+  }
+});
+
+test('G45 preserves G31 classic-worker importScripts IIFE isolation without top-level lexical collisions', () => {
+  const rtPoolPath = fileURLToPath(new URL('../web/workers/rt_pool.js', import.meta.url));
+  const source = readFileSync(rtPoolPath, 'utf8');
+
+  const sandbox = { console };
+  const ctx = vm.createContext(sandbox);
+  ctx.self = ctx;
+
+  // Loading rt_pool.js twice in the same WorkerGlobalScope must throw zero SyntaxErrors.
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+  });
+
+  // Top-level lexical names must not leak into WorkerGlobalScope.
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 1;
+      const DXGI_FORMAT_ALIASES = {};
+      const FORMAT_BYTES_PER_PIXEL = {};
+      class RenderTargetPool {}
+      `,
+      ctx
+    );
+  });
+
+  assert.ok(ctx.PlayGta6RenderTargetPool);
+  assert.equal(ctx.PlayGta6RenderTargetPool.DEFAULT_MAX_TEXTURE_DIMENSION_2D, 8192);
+  assert.equal(
+    ctx.PlayGta6RenderTargetPool.normalizeRenderTargetFormat('d24_unorm_s8_uint'),
+    'depth24plus-stencil8'
+  );
 });
