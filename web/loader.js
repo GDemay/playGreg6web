@@ -2372,8 +2372,16 @@ function buildRuntimeModuleConfig(options = {}) {
       ? parseGuestManifest(rawManifestInput)
       : null;
 
+  const manifestRuntimeScriptUrl =
+    manifestSummary && manifestSummary.runtimeScriptUrl
+      ? resolveSideModuleUrl(
+          manifestSummary.runtimeScriptUrl,
+          DEFAULT_RUNTIME_SCRIPT_RELATIVE,
+          options.locateFileBase,
+        )
+      : undefined;
   const resolvedRuntimeScriptUrl = resolveRuntimeScriptUrl(
-    options.runtimeScriptUrl || (manifestSummary && manifestSummary.runtimeScriptUrl) || undefined,
+    options.runtimeScriptUrl || manifestRuntimeScriptUrl || undefined,
     options.locationHref,
   );
   const rawDynamicLibraries = sanitizeSideModuleUrls(options.dynamicLibraries);
