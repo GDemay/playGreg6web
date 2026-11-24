@@ -6,6 +6,8 @@ const require = createRequire(import.meta.url);
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const {
   DEFAULT_DEPTH_FORMAT,
+  DEFAULT_MAX_ERROR_HISTORY,
+  MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   SUPPORTED_DEPTH_FORMATS,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
   WgpuSwapchain,
@@ -513,4 +515,377 @@ test('constructor validates invalid options cleanly', () => {
     () => new WgpuSwapchain({ canvas, device, context, maxDimension: 0 }),
     RangeError
   );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, onValidationError: 'not-a-fn' }),
+    TypeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, maxErrorHistory: 0 }),
+    RangeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, maxErrorHistory: -5 }),
+    RangeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, maxErrorHistory: 2.5 }),
+    RangeError
+  );
+});
+
+function attachMockEventTarget(device, { withRemove = true } = {}) {
+  const listeners = new Map();
+  const addCalls = [];
+  const removeCalls = [];
+
+  device.addEventListener = function addEventListener(type, fn) {
+    addCalls.push({ type, fn });
+    let set = listeners.get(type);
+    if (!set) {
+      set = new Set();
+      listeners.set(type, set);
+    }
+    set.add(fn);
+  };
+
+  if (withRemove) {
+    device.removeEventListener = function removeEventListener(type, fn) {
+      removeCalls.push({ type, fn });
+      const set = listeners.get(type);
+      if (set) {
+        set.delete(fn);
+      }
+    };
+  }
+
+  device.dispatchUncapturedError = function dispatchUncapturedError(error, extra = {}) {
+    const event = { type: 'uncapturederror', error, ...extra };
+    const set = listeners.get('uncapturederror');
+    if (set) {
+      for (const fn of Array.from(set)) {
+        fn(event);
+      }
+    }
+    return event;
+  };
+
+  device.listenerCount = function listenerCount(type = 'uncapturederror') {
+    const set = listeners.get(type);
+    return set ? set.size : 0;
+  };
+
+  device.addCalls = addCalls;
+  device.removeCalls = removeCalls;
+  return device;
+}
+
+test('G35 uncapturederror listener attaches, captures normalized errors, updates getStats(), and invokes onValidationError safely', () => {
+  assert.equal(DEFAULT_MAX_ERROR_HISTORY, 32);
+  assert.equal(MAX_VALIDATION_ERROR_MESSAGE_LENGTH, 512);
+
+  const { canvas, context, device } = createMockWebGpuEnv();
+  attachMockEventTarget(device);
+
+  let clockMs = 5000;
+  const callbackRecords = [];
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    now: () => clockMs,
+    onValidationError(record) {
+      callbackRecords.push({ ...record });
+      // Mutate received object to prove internal state is isolated.
+      record.message = 'MUTATED_BY_CALLBACK';
+      if (record.seq === 2) {
+        throw new Error('user callback failure should be isolated');
+      }
+    },
+  });
+
+  assert.equal(device.listenerCount('uncapturederror'), 1);
+  assert.equal(device.addCalls.length, 1);
+  assert.equal(device.addCalls[0].type, 'uncapturederror');
+
+  let stats = swapchain.getStats();
+  assert.equal(stats.validationErrorCount, 0);
+  assert.equal(stats.validationErrorHistorySize, 0);
+  assert.equal(stats.maxErrorHistory, 32);
+  assert.equal(stats.isDestroyed, false);
+  assert.deepEqual(swapchain.getValidationErrors(), []);
+
+  class GPUValidationErrorMock {
+    constructor(message) {
+      this.message = message;
+    }
+  }
+  Object.defineProperty(GPUValidationErrorMock, 'name', { value: 'GPUValidationError' });
+
+  class GPUOutOfMemoryErrorMock {
+    constructor(message) {
+      this.message = message;
+    }
+  }
+  Object.defineProperty(GPUOutOfMemoryErrorMock, 'name', { value: 'GPUOutOfMemoryError' });
+
+  // 1. Validation error
+  clockMs = 5010;
+  device.dispatchUncapturedError(
+    new GPUValidationErrorMock('BindGroupLayout mismatch on pipeline 0x123456789abcdef0')
+  );
+
+  // 2. Out-of-memory error (callback throws, must not disrupt capture)
+  clockMs = 5025;
+  assert.doesNotThrow(() => {
+    device.dispatchUncapturedError(
+      new GPUOutOfMemoryErrorMock('Allocation of 256MB texture failed')
+    );
+  });
+
+  // 3. Internal error via explicit type
+  clockMs = 5040;
+  device.dispatchUncapturedError({ type: 'internal', message: 'Dawn internal backend error' });
+
+  // 4. Unknown error object
+  clockMs = 5055;
+  device.dispatchUncapturedError({ message: 'Unclassified GPU failure' });
+
+  stats = swapchain.getStats();
+  assert.equal(stats.validationErrorCount, 4);
+  assert.equal(stats.validationErrorHistorySize, 4);
+
+  const history = swapchain.getValidationErrors();
+  assert.deepEqual(history, [
+    {
+      seq: 1,
+      type: 'validation',
+      message: 'BindGroupLayout mismatch on pipeline 0x123456789abcdef0',
+      timestampMs: 5010,
+    },
+    {
+      seq: 2,
+      type: 'out-of-memory',
+      message: 'Allocation of 256MB texture failed',
+      timestampMs: 5025,
+    },
+    {
+      seq: 3,
+      type: 'internal',
+      message: 'Dawn internal backend error',
+      timestampMs: 5040,
+    },
+    {
+      seq: 4,
+      type: 'unknown',
+      message: 'Unclassified GPU failure',
+      timestampMs: 5055,
+    },
+  ]);
+
+  assert.equal(callbackRecords.length, 4);
+  assert.equal(callbackRecords[0].seq, 1);
+  assert.equal(callbackRecords[1].type, 'out-of-memory');
+
+  // Mutating returned shallow copies must not corrupt internal history.
+  history[0].message = 'CORRUPTED';
+  history.push({ seq: 999, type: 'validation', message: 'fake', timestampMs: 0 });
+  const freshHistory = swapchain.getValidationErrors();
+  assert.equal(freshHistory.length, 4);
+  assert.equal(
+    freshHistory[0].message,
+    'BindGroupLayout mismatch on pipeline 0x123456789abcdef0'
+  );
+});
+
+test('G35 ring evicts oldest entries at maxErrorHistory and clearValidationErrors() resets ring while keeping monotonic seq/count', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  attachMockEventTarget(device);
+
+  let clockMs = 100;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    now: () => clockMs,
+    maxErrorHistory: 3,
+  });
+
+  for (let i = 1; i <= 5; i += 1) {
+    clockMs = 100 + i * 10;
+    device.dispatchUncapturedError({
+      name: 'GPUValidationError',
+      message: `validation error #${i}`,
+    });
+  }
+
+  assert.equal(swapchain.getStats().validationErrorCount, 5);
+  assert.equal(swapchain.getStats().validationErrorHistorySize, 3);
+  assert.equal(swapchain.getStats().maxErrorHistory, 3);
+
+  const retained = swapchain.getValidationErrors();
+  assert.deepEqual(
+    retained.map((r) => r.seq),
+    [3, 4, 5]
+  );
+  assert.deepEqual(
+    retained.map((r) => r.message),
+    ['validation error #3', 'validation error #4', 'validation error #5']
+  );
+
+  // Clear history ring; cumulative count stays intact and next seq continues monotonically.
+  swapchain.clearValidationErrors();
+  assert.deepEqual(swapchain.getValidationErrors(), []);
+  assert.equal(swapchain.getStats().validationErrorHistorySize, 0);
+  assert.equal(swapchain.getStats().validationErrorCount, 5);
+
+  clockMs = 200;
+  device.dispatchUncapturedError({
+    name: 'GPUValidationError',
+    message: 'post-clear error',
+  });
+  const afterClear = swapchain.getValidationErrors();
+  assert.equal(afterClear.length, 1);
+  assert.deepEqual(afterClear[0], {
+    seq: 6,
+    type: 'validation',
+    message: 'post-clear error',
+    timestampMs: 200,
+  });
+  assert.equal(swapchain.getStats().validationErrorCount, 6);
+});
+
+test('G35 sanitizes host paths, long buffers, control characters, and caps message length to 512 chars', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  attachMockEventTarget(device);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    now: () => 42,
+  });
+
+  // 1. Host paths (Windows drive, quoted path with spaces, UNC, file://, Unix paths)
+  device.dispatchUncapturedError({
+    name: 'GPUValidationError',
+    message:
+      'Shader failed at C:\\Users\\alice\\local-data\\gta6\\shader.wgsl and "D:\\My Games\\GTA6\\x.rpf" and \\\\host01\\share\\dump.bin and file:///Users/alice/secret/a.wgsl and /home/alice/dev/pipeline.wgsl (format rgba8unorm/bgra8unorm)',
+  });
+
+  // 2. Long buffers (hex dump, byte array, base64 data URI, raw base64)
+  const hexBlob = 'ab'.repeat(40);
+  const spacedHex = Array.from({ length: 24 }, (_, i) => i.toString(16).padStart(2, '0')).join(' ');
+  const byteArray = Array.from({ length: 24 }, (_, i) => String(i)).join(', ');
+  const b64Blob = 'QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB';
+  device.dispatchUncapturedError({
+    name: 'GPUValidationError',
+    message: `Buffer mismatch:\nhex=${hexBlob}\tbytes=[${byteArray}] dump=${spacedHex} uri=data:application/octet-stream;base64,${b64Blob} raw=${b64Blob}\x00\x07`,
+  });
+
+  // 3. Overly long message capped strictly to 512 characters
+  const longText = `Validation failure: ${'texture_binding_mismatch '.repeat(40)}`;
+  assert.ok(longText.length > 512);
+  device.dispatchUncapturedError({
+    name: 'GPUValidationError',
+    message: longText,
+  });
+
+  const errors = swapchain.getValidationErrors();
+  assert.equal(errors.length, 3);
+
+  // Verify host paths stripped while preserving WebGPU format slash token.
+  const pathMsg = errors[0].message;
+  assert.doesNotMatch(pathMsg, /alice/i);
+  assert.doesNotMatch(pathMsg, /C:\\/);
+  assert.doesNotMatch(pathMsg, /D:\\/);
+  assert.doesNotMatch(pathMsg, /\\\\host01/);
+  assert.doesNotMatch(pathMsg, /file:\/\//);
+  assert.doesNotMatch(pathMsg, /\/home\//);
+  assert.match(pathMsg, /<path>/);
+  assert.match(pathMsg, /rgba8unorm\/bgra8unorm/);
+
+  // Verify long buffers & control chars stripped.
+  const bufMsg = errors[1].message;
+  assert.doesNotMatch(bufMsg, new RegExp(hexBlob));
+  assert.doesNotMatch(bufMsg, new RegExp(b64Blob));
+  assert.doesNotMatch(bufMsg, /[\x00-\x1F\x7F]/);
+  assert.match(bufMsg, /<buffer>/);
+
+  // Verify 512-char cap.
+  const cappedMsg = errors[2].message;
+  assert.equal(cappedMsg.length, MAX_VALIDATION_ERROR_MESSAGE_LENGTH);
+  assert.ok(cappedMsg.endsWith('...'));
+});
+
+test('G35 removes uncapturederror listener cleanly on recover(newDevice) and destroy() with zero leaks', () => {
+  const { canvas, context, device, makeDevice } = createMockWebGpuEnv();
+  attachMockEventTarget(device);
+
+  const seen = [];
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    onValidationError: (rec) => seen.push(rec),
+  });
+  swapchain.configure({ width: 640, height: 360 });
+
+  assert.equal(device.listenerCount('uncapturederror'), 1);
+  const firstRegisteredFn = device.addCalls[0].fn;
+
+  // Re-bind to a new device via recover(): old listener must be removed, new one attached.
+  const newDevice = attachMockEventTarget(makeDevice('device-1'));
+  swapchain.recover(newDevice);
+
+  assert.equal(device.listenerCount('uncapturederror'), 0);
+  assert.equal(device.removeCalls.length, 1);
+  assert.equal(device.removeCalls[0].type, 'uncapturederror');
+  assert.equal(device.removeCalls[0].fn, firstRegisteredFn);
+
+  assert.equal(newDevice.listenerCount('uncapturederror'), 1);
+  const secondRegisteredFn = newDevice.addCalls[0].fn;
+
+  // Dispatching on old device does nothing; dispatching on new device is captured.
+  device.dispatchUncapturedError({ name: 'GPUValidationError', message: 'stale device error' });
+  assert.equal(swapchain.getStats().validationErrorCount, 0);
+
+  newDevice.dispatchUncapturedError({ name: 'GPUValidationError', message: 'recovered device error' });
+  assert.equal(swapchain.getStats().validationErrorCount, 1);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].message, 'recovered device error');
+
+  // Destroy removes listener from active device and is idempotent.
+  swapchain.destroy();
+  assert.equal(newDevice.listenerCount('uncapturederror'), 0);
+  assert.equal(newDevice.removeCalls.length, 1);
+  assert.equal(newDevice.removeCalls[0].type, 'uncapturederror');
+  assert.equal(newDevice.removeCalls[0].fn, secondRegisteredFn);
+  assert.equal(swapchain.getStats().isDestroyed, true);
+
+  // Calling destroy again does not double-remove.
+  swapchain.destroy();
+  assert.equal(newDevice.removeCalls.length, 1);
+
+  // Events fired after destroy are ignored; previously captured history remains inspectable.
+  newDevice.dispatchUncapturedError({ name: 'GPUValidationError', message: 'post-destroy error' });
+  assert.equal(swapchain.getStats().validationErrorCount, 1);
+  assert.equal(swapchain.getValidationErrors().length, 1);
+
+  // Also test device without removeEventListener: stale handler still guards on destroyed/device mismatch.
+  const env2 = createMockWebGpuEnv();
+  attachMockEventTarget(env2.device, { withRemove: false });
+  const sc2 = new WgpuSwapchain({
+    canvas: env2.canvas,
+    device: env2.device,
+    context: env2.context,
+    format: 'bgra8unorm',
+  });
+  sc2.destroy();
+  env2.device.dispatchUncapturedError({ name: 'GPUValidationError', message: 'ignored after destroy' });
+  assert.equal(sc2.getStats().validationErrorCount, 0);
 });
