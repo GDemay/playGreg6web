@@ -216,6 +216,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Decode directly written buffer, image and sampler descriptor slots with the GPU family's public descriptor-word definitions, resolve their addresses to tracked resources, and bind them at draw and dispatch time.
 - [x] **G49 — Textures the Title Creates by View Alone: Back Slot-70 Views with GPU Textures and Decode Their Console Layouts** — `DONE` (PRs #607, #608, #613, #618, #619, closes #551) *(found by G48; repo tests synthetic)*
   - Create textures for views that name only a GPU address and a description, upload the data streamed into the GPU-window pages behind them, and convert the console tiled layouts to linear texels using the GPU family's public addressing rules.
+- [ ] **G62 — Bind Translated Stages by Reflection: Vertex-Input and Resource-Binding Contract Between the Shader Pack and the D3D12 Guest Layer (runtime side)** — `IN PROGRESS` (#651, @Timon-ok) *(contract discussed on #482; repo tests synthetic)*
+  - Build vertex layouts and bind-group layouts for pack-resolved pipelines from each stage's reflection joined to the D3D12 input layout and root signature, instead of numbering conventions.
 
 ---
 
