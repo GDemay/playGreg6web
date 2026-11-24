@@ -133,6 +133,55 @@ function resolveDefaultDataBase(options, windowObj) {
   return '/data/';
 }
 
+function resolveDefaultBootBase(options, windowObj) {
+  if (typeof options.bootBase === 'string' && options.bootBase.length > 0) {
+    return options.bootBase;
+  }
+  const origin = windowObj && windowObj.location && windowObj.location.origin;
+  if (typeof origin === 'string' && origin.length > 0 && origin !== 'null') {
+    return `${origin}/boot/`;
+  }
+  return '/boot/';
+}
+
+function pickBootUrl(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+    } else if (candidate && typeof candidate === 'object') {
+      for (const prop of ['url', 'path', 'href']) {
+        if (typeof candidate[prop] === 'string' && candidate[prop].trim().length > 0) {
+          return candidate[prop].trim();
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function extractBootAssetUrls(source) {
+  if (!source || typeof source !== 'object') {
+    return {};
+  }
+  const out = {};
+  const bootBase = pickBootUrl(source.bootBase);
+  const shaderPackUrl = pickBootUrl(source.shaderPackUrl, source.shaderPack, source.wgslPack);
+  const reflectionManifestUrl = pickBootUrl(
+    source.reflectionManifestUrl,
+    source.reflectionUrl,
+    source.reflectionManifest
+  );
+  const pgimUrl = pickBootUrl(source.pgimUrl, source.pgim, source.pgimImage);
+  if (bootBase) out.bootBase = bootBase;
+  if (shaderPackUrl) out.shaderPackUrl = shaderPackUrl;
+  if (reflectionManifestUrl) out.reflectionManifestUrl = reflectionManifestUrl;
+  if (pgimUrl) out.pgimUrl = pgimUrl;
+  return out;
+}
+
 function resolveViewportMetrics(canvas, windowObj, overrides = {}) {
   const dpr = isPositiveFinite(overrides.devicePixelRatio)
     ? overrides.devicePixelRatio
@@ -366,6 +415,7 @@ export class PlayGta6AppHandle {
  * @param {string} [options.statusUrl='/api/status']
  * @param {string} [options.loaderUrl]
  * @param {string} [options.dataBase]
+ * @param {string} [options.bootBase]
  * @param {string} [options.appVersion]
  * @param {string} [options.activeProfileId]
  * @param {boolean} [options.attachGlobalErrorHandlers=true]
@@ -441,6 +491,61 @@ export function bootstrapPlayGta6App(options = {}) {
       ? options.statusUrl
       : DEFAULT_STATUS_URL;
   const dataBase = resolveDefaultDataBase(options, windowObj);
+  const explicitBootBase =
+    typeof options.bootBase === 'string' && options.bootBase.length > 0 ? options.bootBase : null;
+  const defaultBootBase = resolveDefaultBootBase(options, windowObj);
+  const initialBootAssets = extractBootAssetUrls(options);
+  let latestDiscoveredBootAssets = { ...initialBootAssets };
+
+  function recordDiscoveredBootAssets(payload) {
+    if (!payload || typeof payload !== 'object') {
+      return;
+    }
+    const fromDirect = extractBootAssetUrls(payload);
+    const fromStatus = extractBootAssetUrls(payload.status || payload.serverStatus);
+    const fromAssets = extractBootAssetUrls(payload.assets);
+    const merged = { ...fromDirect, ...fromStatus, ...fromAssets };
+    if (Object.keys(merged).length > 0) {
+      latestDiscoveredBootAssets = { ...latestDiscoveredBootAssets, ...merged };
+    }
+  }
+
+  function resolveBootForwardFields(launchContext) {
+    let fromOrchestrator = {};
+    if (bootOrchestrator && typeof bootOrchestrator.getState === 'function') {
+      try {
+        const state = bootOrchestrator.getState();
+        if (state && typeof state === 'object') {
+          fromOrchestrator = {
+            ...extractBootAssetUrls(state.status),
+            ...extractBootAssetUrls(state.assets),
+          };
+        }
+      } catch {
+        // Ignore orchestrator state errors.
+      }
+    }
+    const fromLaunchStatus = extractBootAssetUrls(launchContext && launchContext.serverStatus);
+    const merged = {
+      ...initialBootAssets,
+      ...latestDiscoveredBootAssets,
+      ...fromOrchestrator,
+      ...fromLaunchStatus,
+    };
+    const fields = {
+      bootBase: explicitBootBase || merged.bootBase || defaultBootBase,
+    };
+    if (merged.shaderPackUrl) {
+      fields.shaderPackUrl = merged.shaderPackUrl;
+    }
+    if (merged.reflectionManifestUrl) {
+      fields.reflectionManifestUrl = merged.reflectionManifestUrl;
+    }
+    if (merged.pgimUrl) {
+      fields.pgimUrl = merged.pgimUrl;
+    }
+    return fields;
+  }
 
   // 1. CrashReporter (sanitized diagnostics + global window error handlers).
   const crashReporterOptions =
@@ -815,6 +920,10 @@ export function bootstrapPlayGta6App(options = {}) {
 
     const pixelWidth = Math.max(1, Math.round(viewportWidth * viewportDpr));
     const pixelHeight = Math.max(1, Math.round(viewportHeight * viewportDpr));
+    if (launchContext && launchContext.serverStatus) {
+      recordDiscoveredBootAssets(launchContext.serverStatus);
+    }
+    const bootForwardFields = resolveBootForwardFields(launchContext);
 
     let worker;
     if (createWasmWorker) {
@@ -829,6 +938,7 @@ export function bootstrapPlayGta6App(options = {}) {
         inputSab: inputBridge.sab,
         audioSab: audioEngine.sab,
         dataBase,
+        ...bootForwardFields,
         launchContext,
       });
     } else {
@@ -967,6 +1077,7 @@ export function bootstrapPlayGta6App(options = {}) {
         inputSab: inputBridge.sab,
         audioSab: audioEngine.sab,
         dataBase,
+        ...bootForwardFields,
       };
       if (transferList) {
         worker.postMessage(initPayload, transferList);
@@ -1225,10 +1336,12 @@ export function bootstrapPlayGta6App(options = {}) {
       splashOverlay: splashAdapter,
       preloader: pgimPreloader,
       bootTracer,
-      onLaunchRuntime: async () => {
+      onLaunchRuntime: async (bootPayload) => {
+        recordDiscoveredBootAssets(bootPayload);
         lastBootSessionResult = await session.start(pendingStartOpts);
       },
-      onFallbackSmokeDemo: async () => {
+      onFallbackSmokeDemo: async (bootPayload) => {
+        recordDiscoveredBootAssets(bootPayload);
         const fallbackOpts =
           pendingStartOpts && typeof pendingStartOpts === 'object'
             ? { preferSmoke: true, ...pendingStartOpts }
@@ -1301,7 +1414,9 @@ export function bootstrapPlayGta6App(options = {}) {
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;
+      latestDiscoveredBootAssets = { ...initialBootAssets };
       const bootResult = await bootOrchestrator.start();
+      recordDiscoveredBootAssets(bootResult);
       if (lastBootSessionResult) {
         return lastBootSessionResult;
       }
@@ -1310,6 +1425,7 @@ export function bootstrapPlayGta6App(options = {}) {
       }
       return session.start(startOpts);
     }
+    latestDiscoveredBootAssets = { ...initialBootAssets };
     return session.start(startOpts);
   }
 
