@@ -1308,6 +1308,9 @@ class WgpuCommandProcessor {
     this._skippedDrawCount = 0;
     this._computeDispatchCount = 0;
     this._bytesProcessed = 0;
+    // W99: torn-down/lost GPU instance hardening counters (fence + present submit failures).
+    this._workDoneFenceFailures = 0;
+    this._presentSubmitFailures = 0;
     this._v2BindGroupLayouts = new Map();
     this._v2PipelineLayouts = new Map();
 
@@ -3024,22 +3027,81 @@ class WgpuCommandProcessor {
     this._frameBegunForIndex = -1;
   }
 
+  /**
+   * Return a work-done fence for the most recent submission, or null when the queue fence is
+   * unavailable. The returned promise never rejects: a torn-down/lost GPU instance
+   * (`OperationError: A valid external Instance reference no longer exists.`) either throws
+   * synchronously or rejects the fence, and both are recorded as a sanitized validation event
+   * instead of escaping as an uncaught worker exception or unhandled rejection.
+   *
+   * @returns {Promise<void> | null}
+   */
   _getWorkDoneFence() {
-    if (
-      this.device &&
-      this.device.queue &&
-      typeof this.device.queue.onSubmittedWorkDone === 'function'
-    ) {
-      try {
-        const fence = this.device.queue.onSubmittedWorkDone();
-        if (fence && typeof fence.then === 'function') {
-          return fence;
-        }
-      } catch (_) {
-        // Ignore unavailable/lost queue fence.
-      }
+    let queue = null;
+    try {
+      queue = this.device ? this.device.queue : null;
+    } catch (err) {
+      this._noteWorkDoneFenceFailure(err);
+      return null;
     }
-    return null;
+    if (!queue || typeof queue.onSubmittedWorkDone !== 'function') {
+      return null;
+    }
+    let fence;
+    try {
+      fence = queue.onSubmittedWorkDone();
+    } catch (err) {
+      this._noteWorkDoneFenceFailure(err);
+      return null;
+    }
+    if (!fence || typeof fence.then !== 'function') {
+      return null;
+    }
+    try {
+      return Promise.resolve(fence).then(
+        () => undefined,
+        (err) => {
+          this._noteWorkDoneFenceFailure(err);
+          return undefined;
+        }
+      );
+    } catch (err) {
+      this._noteWorkDoneFenceFailure(err);
+      return null;
+    }
+  }
+
+  /**
+   * Record a failed/rejected `onSubmittedWorkDone()` fence once per processor lifetime as a
+   * sanitized validation event; subsequent failures only bump the counter.
+   *
+   * @param {unknown} err
+   */
+  _noteWorkDoneFenceFailure(err) {
+    this._workDoneFenceFailures += 1;
+    if (this._workDoneFenceFailures !== 1 || this._destroyed) {
+      return;
+    }
+    try {
+      this._recordOpValidationError('OnSubmittedWorkDone', sanitizeGpuErrorDetail(err));
+    } catch (_) {
+      // Never let telemetry recording escape from fence handling.
+    }
+  }
+
+  /**
+   * Record a failed present encode/submit (e.g. torn-down WebGPU instance) as a sanitized
+   * `Present:` validation event without throwing.
+   *
+   * @param {unknown} err
+   */
+  _notePresentSubmitFailure(err) {
+    this._presentSubmitFailures += 1;
+    try {
+      this._recordOpValidationError('Present', sanitizeGpuErrorDetail(err));
+    } catch (_) {
+      // Never let telemetry recording escape from the present path.
+    }
   }
 
   /**
@@ -4444,15 +4506,28 @@ class WgpuCommandProcessor {
   }
 
   _flushPresent() {
-    const encoder = this._pendingEncoder || this.device.createCommandEncoder();
+    const pendingEncoder = this._pendingEncoder;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
 
-    const swapchainTexture = this.ctx.getCurrentTexture();
-    const swapchainView =
-      swapchainTexture && typeof swapchainTexture.createView === 'function'
-        ? swapchainTexture.createView()
-        : swapchainTexture;
+    // W99: a torn-down WebGPU instance throws `OperationError` from createCommandEncoder /
+    // getCurrentTexture; record it and drop the frame instead of crashing the message loop.
+    let encoder;
+    let swapchainTexture;
+    let swapchainView;
+    try {
+      encoder = pendingEncoder || this.device.createCommandEncoder();
+      swapchainTexture = this.ctx.getCurrentTexture();
+      swapchainView =
+        swapchainTexture && typeof swapchainTexture.createView === 'function'
+          ? swapchainTexture.createView()
+          : swapchainTexture;
+    } catch (err) {
+      this._notePresentSubmitFailure(err);
+      this._endSubsystemsForFrame(null);
+      this._resetFrameState();
+      return;
+    }
     let activePass = null;
     let activePassKind = null;
     let renderPassOpened = false;
@@ -4809,7 +4884,11 @@ class WgpuCommandProcessor {
 
     endActivePass();
     if (!renderPassOpened) {
-      ensureRenderPass();
+      try {
+        ensureRenderPass();
+      } catch (err) {
+        this._recordOpValidationError('BeginRenderPass', sanitizeGpuErrorDetail(err));
+      }
       endActivePass();
     }
 
@@ -4836,12 +4915,22 @@ class WgpuCommandProcessor {
       this.stagingPool.prepareSubmit();
     }
 
+    // W99: guard encoder.finish() and queue.submit() separately so a torn-down WebGPU instance
+    // (`OperationError`) is recorded as a sanitized Present event without crashing the worker.
     let submitted = false;
+    let commandBuffer = null;
     try {
-      this.device.queue.submit([encoder.finish()]);
-      submitted = true;
+      commandBuffer = encoder.finish();
     } catch (err) {
-      this._recordOpValidationError('Present', err);
+      this._notePresentSubmitFailure(err);
+    }
+    if (commandBuffer !== null) {
+      try {
+        this.device.queue.submit([commandBuffer]);
+        submitted = true;
+      } catch (err) {
+        this._notePresentSubmitFailure(err);
+      }
     }
 
     if (submitted) {
@@ -5395,6 +5484,41 @@ class WgpuCommandProcessor {
 const DEFAULT_TELEMETRY_INTERVAL_MS = 250;
 const DEFAULT_TELEMETRY_MISSING_LIMIT = 64;
 
+const MAX_GPU_ERROR_DETAIL_CHARS = 256;
+
+/**
+ * Reduce a thrown/rejected WebGPU error to a single-line `Name: message` string with URLs
+ * stripped and length capped, suitable for validation telemetry.
+ *
+ * @param {unknown} err
+ * @returns {string}
+ */
+function sanitizeGpuErrorDetail(err) {
+  let name = '';
+  let message = '';
+  try {
+    if (err && typeof err === 'object') {
+      name = typeof err.name === 'string' ? err.name : '';
+      message = typeof err.message === 'string' ? err.message : '';
+    } else if (err !== undefined && err !== null) {
+      message = String(err);
+    }
+  } catch (_) {
+    message = '';
+  }
+  message = message
+    .replace(/\b(?:https?|file|blob):\/\/\S+/gi, '<url>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (message.length === 0) {
+    message = 'operation failed';
+  }
+  const detail = name && name !== 'Error' ? `${name}: ${message}` : message;
+  return detail.length > MAX_GPU_ERROR_DETAIL_CHARS
+    ? `${detail.slice(0, MAX_GPU_ERROR_DETAIL_CHARS - 3)}...`
+    : detail;
+}
+
 function toNonNegativeInt(value, fallback = 0) {
   if (value === undefined || value === null || value === '') {
     return fallback;
@@ -5487,7 +5611,7 @@ function sanitizeMissingShaderRecord(entry) {
 }
 
 /**
- * Build a sanitized `{ type: 'gpu-telemetry', frameStats, fallbackStats, missingShaders, timestamp }`
+ * Build a sanitized `{ type: 'gpu-telemetry', frameStats, fallbackStats, missingShaders, timestamp, renderStateStats? }`
  * payload matching `GpuBootPanelController.update(...)` (zero host paths, zero raw bytes).
  *
  * @param {WgpuCommandProcessor | object | null | undefined} processor
@@ -5610,6 +5734,22 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     hitRatePct = totalLookups > 0 ? Math.round((packHits / totalLookups) * 10000) / 100 : 0;
   }
 
+  const renderStateTelemetry = resolveRenderStateTelemetry(processor, stats);
+  const renderStateStats = {
+    computeDispatchCount: toNonNegativeInt(
+      renderStateTelemetry && renderStateTelemetry.computeDispatchCount,
+      0
+    ),
+    computePipelineCount: toNonNegativeInt(
+      renderStateTelemetry && renderStateTelemetry.computePipelineCount,
+      0
+    ),
+    autoLayoutFallbacks: toNonNegativeInt(
+      renderStateTelemetry && renderStateTelemetry.autoLayoutFallbacks,
+      0
+    ),
+  };
+
   let timestamp;
   if (typeof opts.timestamp === 'number' && Number.isFinite(opts.timestamp)) {
     timestamp = opts.timestamp;
@@ -5620,7 +5760,7 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     timestamp = Date.now();
   }
 
-  return {
+  const snapshot = {
     type: 'gpu-telemetry',
     frameStats: {
       framesPresented,
@@ -5645,6 +5785,82 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     missingShaders,
     timestamp,
   };
+  // W99: live render_state_packets.js compute/auto-layout counters (0 when not installed).
+  // Omitted for a null processor so the empty snapshot shape stays unchanged.
+  if (processor && typeof processor === 'object') {
+    snapshot.renderStateStats = renderStateStats;
+  }
+  return snapshot;
+}
+
+const RENDER_STATE_TELEMETRY_KEYS = Object.freeze([
+  'computeDispatchCount',
+  'computePipelineCount',
+  'autoLayoutFallbacks',
+]);
+
+function hasRenderStateTelemetryKeys(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return false;
+  }
+  for (let i = 0; i < RENDER_STATE_TELEMETRY_KEYS.length; i += 1) {
+    if (obj[RENDER_STATE_TELEMETRY_KEYS[i]] !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readRenderStateTelemetry(source) {
+  if (!source || typeof source !== 'object') {
+    return null;
+  }
+  try {
+    if (typeof source.getTelemetry === 'function') {
+      const t = source.getTelemetry();
+      if (hasRenderStateTelemetryKeys(t)) return t;
+    }
+    if (hasRenderStateTelemetryKeys(source.telemetry)) {
+      return source.telemetry;
+    }
+    if (typeof source.getStats === 'function') {
+      const s = source.getStats();
+      if (hasRenderStateTelemetryKeys(s)) return s;
+    }
+  } catch (_) {
+    return null;
+  }
+  return hasRenderStateTelemetryKeys(source) ? source : null;
+}
+
+/**
+ * Locate the live render_state_packets.js telemetry (compute dispatch / compute pipeline /
+ * auto-layout fallback counters) attached to a processor, or null when absent.
+ *
+ * @param {object | null | undefined} processor
+ * @param {object | null} stats
+ * @returns {object | null}
+ */
+function resolveRenderStateTelemetry(processor, stats) {
+  if (stats && typeof stats === 'object') {
+    const fromStats = readRenderStateTelemetry(stats.renderState);
+    if (fromStats) return fromStats;
+  }
+  if (processor && typeof processor === 'object') {
+    const candidates = [processor.renderStateProcessor, processor._renderStatePackets];
+    if (typeof processor._getRenderStateExtension === 'function') {
+      try {
+        candidates.push(processor._getRenderStateExtension());
+      } catch (_) {
+        // ignore
+      }
+    }
+    for (let i = 0; i < candidates.length; i += 1) {
+      const t = readRenderStateTelemetry(candidates[i]);
+      if (t) return t;
+    }
+  }
+  return hasRenderStateTelemetryKeys(stats) ? stats : null;
 }
 
 function createWgpuWorkerHandler(options = {}) {
