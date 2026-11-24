@@ -14,10 +14,16 @@ const {
   PGIM_FLAGS,
   PGIM_SECTION_FLAGS,
   PGIM_PROT,
+  PROGRAM_MANIFEST_SCHEMA,
+  PROGRAM_MANIFEST_SCHEMA_VERSION,
   PgimPreloadError,
   PgimPreloader,
   parsePgimHeader,
   parsePgimLayout,
+  resolveSafeManifestUrl,
+  parseProgramManifest,
+  parseBootManifest,
+  preloadProgramModules,
   pgimFnv1a64,
 } = pgimMod;
 import { buildWgslPackBuffer, parseWgslPack } from '../web/workers/wgsl_pack_loader.js';
@@ -863,4 +869,641 @@ test('preloadPgim honors AbortSignal during retry backoff', async () => {
   }).preloadPgim('x.pgim', { signal: controller.signal });
   setTimeout(() => controller.abort(), 10);
   await assert.rejects(pending, (err) => err.name === 'AbortError');
+});
+
+// ---------------------------------------------------------------------------------------------
+// W70: Multi-module program-manifest.json parsing, URL safety, preloading & boot-manifest fallback.
+// ---------------------------------------------------------------------------------------------
+
+function jsonBytes(obj) {
+  return new TextEncoder().encode(JSON.stringify(obj));
+}
+
+function buildModulePgim(seed, { imageBase = 0x140000000n, textBytes = 0xe00, dataBytes = 0x1800 } = {}) {
+  const textVSize = alignUp(Math.max(0x1000, textBytes), 0x1000);
+  const dataRva = 0x1000 + textVSize;
+  const dataVSize = alignUp(Math.max(0x1000, dataBytes), 0x1000);
+  const sizeOfImage = dataRva + dataVSize;
+  return buildPgim({
+    imageBase,
+    sizeOfImage,
+    entryPointRva: 0x1010,
+    sections: [
+      { name: '<headers>', rva: 0, virtualSize: 0x400, protection: PGIM_PROT.READ, flags: PGIM_SECTION_FLAGS.HEADERS, data: filled(0x400, seed) },
+      {
+        name: '.text',
+        rva: 0x1000,
+        virtualSize: textVSize,
+        protection: PGIM_PROT.READ | PGIM_PROT.EXECUTE,
+        data: filled(textBytes, seed + 1),
+      },
+      {
+        name: '.data',
+        rva: dataRva,
+        virtualSize: dataVSize,
+        protection: PGIM_PROT.READ | PGIM_PROT.WRITE,
+        data: filled(dataBytes, seed + 2),
+      },
+    ],
+    dir64: [dataRva],
+    highlow: [],
+  });
+}
+
+function sampleProgramManifest() {
+  return {
+    schema: 'playgta6-recomp-program',
+    schema_version: 1,
+    modules: [
+      {
+        file: 'vcruntime140.dll',
+        dll: 'vcruntime140.dll',
+        module: 'vcruntime140',
+        role: 'dll',
+        base: '0x100000000',
+        size_of_image: '0x4000',
+        entry_point: '0x100001010',
+        build_manifest: { path: 'vcruntime140/build-manifest.json', fnv1a64: '0x0000000000000001' },
+      },
+      {
+        file: 'vcruntime140_1.dll',
+        dll: 'vcruntime140_1.dll',
+        module: 'vcruntime140_1',
+        role: 'dll',
+        base: '0x100010000',
+        size_of_image: '0x4000',
+        entry_point: '0x100011010',
+        build_manifest: { path: 'vcruntime140_1/build-manifest.json', fnv1a64: '0x0000000000000002' },
+      },
+      {
+        file: 'msvcp140.dll',
+        dll: 'msvcp140.dll',
+        module: 'msvcp140',
+        role: 'dll',
+        base: '0x100020000',
+        size_of_image: '0x6000',
+        entry_point: '0x100021010',
+        build_manifest: { path: 'msvcp140/build-manifest.json', fnv1a64: '0x0000000000000003' },
+      },
+      {
+        file: 'game_scarlett_master.exe',
+        dll: 'game_scarlett_master.exe',
+        module: 'main',
+        role: 'exe',
+        base: '0x140000000',
+        size_of_image: '0x10000',
+        entry_point: '0x140001010',
+        build_manifest: { path: 'main/build-manifest.json', fnv1a64: '0x0000000000000004' },
+      },
+    ],
+    init_order: ['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'game_scarlett_master.exe'],
+    files: [
+      { path: 'pg6_program.cpp', size: 1200 },
+      { path: 'program-report.txt', size: 400 },
+    ],
+  };
+}
+
+test('W70 exports multi-module manifest helpers on UMD global and module.exports', () => {
+  assert.equal(PROGRAM_MANIFEST_SCHEMA, 'playgta6-recomp-program');
+  assert.equal(PROGRAM_MANIFEST_SCHEMA_VERSION, 1);
+  assert.equal(typeof parseProgramManifest, 'function');
+  assert.equal(typeof parseBootManifest, 'function');
+  assert.equal(typeof resolveSafeManifestUrl, 'function');
+  assert.equal(typeof preloadProgramModules, 'function');
+  assert.equal(typeof PgimPreloader.prototype.preloadProgramModules, 'function');
+  assert.equal(globalThis.PlayGta6PgimPreloader.parseProgramManifest, parseProgramManifest);
+  assert.equal(globalThis.PlayGta6PgimPreloader.preloadProgramModules, preloadProgramModules);
+});
+
+test('parseProgramManifest discovers all 4 guest modules in init order from object, string, or bytes', () => {
+  const manifest = sampleProgramManifest();
+  for (const input of [manifest, JSON.stringify(manifest), jsonBytes(manifest), jsonBytes(manifest).buffer]) {
+    const parsed = parseProgramManifest(input, { baseUrl: '/boot/program-manifest.json' });
+    assert.equal(parsed.schema, 'playgta6-recomp-program');
+    assert.equal(parsed.schemaVersion, 1);
+    assert.equal(parsed.baseUrl, '/boot/');
+    assert.deepEqual(parsed.initOrder, ['vcruntime140', 'vcruntime140_1', 'msvcp140', 'main']);
+    assert.deepEqual(
+      parsed.modules.map((m) => [m.name, m.url, m.path, m.role]),
+      [
+        ['vcruntime140', '/boot/vcruntime140/image/guest.pgim', 'vcruntime140/image/guest.pgim', 'dll'],
+        ['vcruntime140_1', '/boot/vcruntime140_1/image/guest.pgim', 'vcruntime140_1/image/guest.pgim', 'dll'],
+        ['msvcp140', '/boot/msvcp140/image/guest.pgim', 'msvcp140/image/guest.pgim', 'dll'],
+        ['main', '/boot/main/image/guest.pgim', 'main/image/guest.pgim', 'exe'],
+      ]
+    );
+    assert.equal(parsed.modules[3].buildManifestUrl, '/boot/main/build-manifest.json');
+    assert.equal(parsed.modules[3].base, '0x140000000');
+    assert.equal(parsed.modules[3].entryPoint, '0x140001010');
+  }
+});
+
+test('parseProgramManifest handles arbitrary module lists, explicit pgim paths, files[] lookup, and origin bases', () => {
+  // String module list.
+  const simple = parseProgramManifest(
+    { schema: 'playgta6-recomp-program', modules: ['alpha', 'beta', 'gamma'] },
+    { baseUrl: 'boot/program-manifest.json' }
+  );
+  assert.deepEqual(
+    simple.modules.map((m) => [m.name, m.url]),
+    [
+      ['alpha', 'boot/alpha/image/guest.pgim'],
+      ['beta', 'boot/beta/image/guest.pgim'],
+      ['gamma', 'boot/gamma/image/guest.pgim'],
+    ]
+  );
+
+  // Explicit per-module paths and files[] fallback (ignoring .pgim.json).
+  const custom = parseProgramManifest(
+    {
+      schema: 'playgta6-recomp-program',
+      schema_version: 1,
+      modules: [
+        { module: 'helper', pgimPath: './helper/custom.pgim' },
+        { module: 'core' },
+        { name: 'entry', image: { path: '/boot/entry/bin/game.pgim', container_bytes: 8192 } },
+      ],
+      files: [
+        { path: 'core/image/core_module.pgim', size: 4096 },
+        { path: 'core/image/core_module.pgim.json', size: 256 },
+      ],
+    },
+    { baseUrl: 'http://127.0.0.1:8080/boot/program-manifest.json' }
+  );
+  assert.deepEqual(
+    custom.modules.map((m) => [m.name, m.url, m.expectedBytes]),
+    [
+      ['helper', 'http://127.0.0.1:8080/boot/helper/custom.pgim', null],
+      ['core', 'http://127.0.0.1:8080/boot/core/image/core_module.pgim', 4096],
+      ['entry', 'http://127.0.0.1:8080/boot/entry/bin/game.pgim', 8192],
+    ]
+  );
+
+  // Same-origin full URL inside base dir is accepted.
+  const sameOrigin = resolveSafeManifestUrl(
+    'http://127.0.0.1:8080/boot/main/image/guest.pgim',
+    'http://127.0.0.1:8080/boot/program-manifest.json'
+  );
+  assert.equal(sameOrigin.url, 'http://127.0.0.1:8080/boot/main/image/guest.pgim');
+  assert.equal(sameOrigin.path, 'main/image/guest.pgim');
+});
+
+test('parseProgramManifest rejects malformed manifests, unsupported schema, and duplicate modules', () => {
+  assert.throws(() => parseProgramManifest('{not valid json'), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(() => parseProgramManifest('[]'), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(() => parseProgramManifest({ schema: 'other-schema', modules: ['main'] }), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(() => parseProgramManifest({ schema: 'playgta6-recomp-program', schema_version: 2, modules: ['main'] }), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(() => parseProgramManifest({ schema: 'playgta6-recomp-program', modules: [] }), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(() => parseProgramManifest({ schema: 'playgta6-recomp-program' }), expectCode('BAD_PROGRAM_MANIFEST'));
+  assert.throws(
+    () => parseProgramManifest({ schema: 'playgta6-recomp-program', modules: ['main', 'MAIN'] }),
+    (e) => e.code === 'BAD_PROGRAM_MANIFEST' && /duplicate/.test(e.message)
+  );
+});
+
+test('parseProgramManifest and resolveSafeManifestUrl strictly reject unsafe and traversal URLs', () => {
+  const unsafePaths = [
+    '../secret/guest.pgim',
+    'main/../../secret.pgim',
+    '%2e%2e/secret.pgim',
+    '%2e%2e%2fsecret.pgim',
+    '%252e%252e/secret.pgim',
+    'main\\..\\..\\secret.pgim',
+    'main%5cimage%5cguest.pgim',
+    'C:\\game\\guest.pgim',
+    '//evil.example/main/image/guest.pgim',
+    'https://evil.example/boot/main/image/guest.pgim',
+    'http://127.0.0.1:9999/boot/main/image/guest.pgim',
+    'http://127.0.0.1:8080/boot/sub/../main/image/guest.pgim',
+    'http://user:pass@127.0.0.1:8080/boot/main/image/guest.pgim',
+    'javascript:alert(1)//.pgim',
+    'data:application/octet-stream,PGIM.pgim',
+    'file:///etc/passwd.pgim',
+    '/etc/secret.pgim',
+    '/other/main/image/guest.pgim',
+    'main/image/guest.pgim\0.pgim',
+    'main/image/guest%00.pgim',
+    'main/image/guest.pgim?cache=1',
+    'main/image/guest.pgim#frag',
+    'main/image/guest.exe',
+    'main/image/.pgim',
+    'main//image/guest.pgim',
+    ' main/image/guest.pgim',
+    '%E0%A4%A/guest.pgim',
+  ];
+
+  for (const badPath of unsafePaths) {
+    assert.throws(
+      () =>
+        parseProgramManifest(
+          { schema: 'playgta6-recomp-program', modules: [{ module: 'main', pgimUrl: badPath }] },
+          { baseUrl: 'http://127.0.0.1:8080/boot/program-manifest.json' }
+        ),
+      expectCode('UNSAFE_URL'),
+      `expected UNSAFE_URL for pgimUrl=${JSON.stringify(badPath)}`
+    );
+  }
+
+  // Unsafe module names.
+  for (const badMod of ['../evil', 'main/sub', 'main\\sub', '..main', 'mod%2e%2e', 'http://evil', 'a b', '.hidden']) {
+    assert.throws(
+      () => parseProgramManifest({ schema: 'playgta6-recomp-program', modules: [badMod] }, { baseUrl: '/boot/program-manifest.json' }),
+      expectCode('UNSAFE_URL'),
+      `expected UNSAFE_URL for module=${JSON.stringify(badMod)}`
+    );
+  }
+
+  // Unsafe files[] .pgim path and unsafe build_manifest.path.
+  assert.throws(
+    () =>
+      parseProgramManifest(
+        {
+          schema: 'playgta6-recomp-program',
+          modules: [{ module: 'main' }],
+          files: [{ path: '../escape.pgim' }],
+        },
+        { baseUrl: '/boot/program-manifest.json' }
+      ),
+    expectCode('UNSAFE_URL')
+  );
+  assert.throws(
+    () =>
+      parseProgramManifest(
+        {
+          schema: 'playgta6-recomp-program',
+          modules: [{ module: 'main', build_manifest: { path: '../../etc/passwd' } }],
+        },
+        { baseUrl: '/boot/program-manifest.json' }
+      ),
+    expectCode('UNSAFE_URL')
+  );
+  // Root-relative path escaping a relative base directory.
+  assert.throws(
+    () => resolveSafeManifestUrl('/boot/main/image/guest.pgim', 'boot/program-manifest.json'),
+    expectCode('UNSAFE_URL')
+  );
+});
+
+test('parseBootManifest supports single-module boot-manifest.json shapes and rejects traversal', () => {
+  const fromDirect = parseBootManifest(
+    { pgim: 'main/image/guest.pgim', shaderPackUrl: 'shaders/boot.wgsl.pack' },
+    { baseUrl: '/boot/boot-manifest.json' }
+  );
+  assert.equal(fromDirect.modules.length, 1);
+  assert.equal(fromDirect.pgimUrl, '/boot/main/image/guest.pgim');
+  assert.equal(fromDirect.shaderPackUrl, '/boot/shaders/boot.wgsl.pack');
+
+  const fromBuildSchema = parseBootManifest(
+    {
+      schema: 'playgta6-recomp-build',
+      schema_version: 1,
+      module: 'main',
+      files: [{ path: 'image/guest.pgim', size: 12345 }],
+    },
+    { baseUrl: '/boot/boot-manifest.json' }
+  );
+  assert.equal(fromBuildSchema.pgimUrl, '/boot/image/guest.pgim');
+  assert.equal(fromBuildSchema.modules[0].expectedBytes, 12345);
+
+  assert.throws(() => parseBootManifest({ pgim: '../evil.pgim' }, { baseUrl: '/boot/boot-manifest.json' }), expectCode('UNSAFE_URL'));
+  assert.throws(() => parseBootManifest({ schema_version: 1 }), expectCode('BAD_BOOT_MANIFEST'));
+});
+
+test('preloadProgramModules preloads all 4 guest modules with unified aggregate byte-level progress', async () => {
+  const vcruntime = buildModulePgim(10, { imageBase: 0x100000000n, textBytes: 0x1400, dataBytes: 0x1200 });
+  const vcruntime1 = buildModulePgim(20, { imageBase: 0x100010000n, textBytes: 0x1000, dataBytes: 0x1000 });
+  const msvcp = buildModulePgim(30, { imageBase: 0x100020000n, textBytes: 0x2600, dataBytes: 0x1e00 });
+  const mainImg = buildModulePgim(40, { imageBase: 0x140000000n, textBytes: 0x4200, dataBytes: 0x2800 });
+  const expectedTotal = vcruntime.byteLength + vcruntime1.byteLength + msvcp.byteLength + mainImg.byteLength;
+
+  const server = createServer(
+    {
+      '/boot/program-manifest.json': jsonBytes(sampleProgramManifest()),
+      '/boot/vcruntime140/image/guest.pgim': vcruntime,
+      '/boot/vcruntime140_1/image/guest.pgim': vcruntime1,
+      '/boot/msvcp140/image/guest.pgim': msvcp,
+      '/boot/main/image/guest.pgim': mainImg,
+    },
+    { delayMs: 2 }
+  );
+
+  const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkSize: 4096, concurrency: 3 });
+  const events = [];
+  const result = await preloader.preloadProgramModules('/boot/program-manifest.json', {
+    onProgress: (e) => events.push(e),
+    verifyChecksums: true,
+  });
+
+  assert.equal(result.source, 'program-manifest');
+  assert.equal(result.manifestUrl, '/boot/program-manifest.json');
+  assert.equal(result.usedFallback, false);
+  assert.equal(result.moduleCount, 4);
+  assert.equal(result.totalBytes, expectedTotal);
+  assert.equal(result.bytesLoaded, expectedTotal);
+  assert.deepEqual(
+    result.modules.map((m) => m.name),
+    ['vcruntime140', 'vcruntime140_1', 'msvcp140', 'main']
+  );
+  assert.deepEqual(result.modulesByName.vcruntime140.bytes, vcruntime);
+  assert.deepEqual(result.modulesByName.vcruntime140_1.bytes, vcruntime1);
+  assert.deepEqual(result.modulesByName.msvcp140.bytes, msvcp);
+  assert.deepEqual(result.modulesByName.main.bytes, mainImg);
+  assert.equal(result.mainModule, result.modulesByName.main);
+  assert.equal(result.mainModule.header.imageBase, 0x140000000n);
+
+  // Exactly 1 HEAD per module (no duplicate probes).
+  const heads = server.log.filter((r) => r.method === 'HEAD');
+  assert.equal(heads.length, 4);
+
+  // Unified aggregate progress assertions.
+  assert.equal(events[0].phase, 'manifest');
+  assert.equal(events[1].phase, 'probe');
+  assert.equal(events[1].totalBytes, expectedTotal);
+  assert.equal(events[1].moduleCount, 4);
+  assert.equal(events[1].moduleIndex, 0);
+  assert.equal(events[1].currentModule, 'vcruntime140');
+
+  let prevLoaded = -1;
+  let prevPct = -1;
+  for (const e of events) {
+    assert.ok(e.loadedBytes >= prevLoaded, `loadedBytes regressed: ${e.loadedBytes} < ${prevLoaded}`);
+    assert.ok(e.pct >= prevPct, `pct regressed: ${e.pct} < ${prevPct}`);
+    assert.ok(e.pct >= 0 && e.pct <= 100);
+    if (e.phase !== 'manifest') {
+      assert.equal(e.totalBytes, expectedTotal);
+      assert.equal(e.moduleCount, 4);
+      assert.ok(e.moduleIndex >= 0 && e.moduleIndex < 4);
+      assert.equal(typeof e.currentModule, 'string');
+    }
+    prevLoaded = e.loadedBytes;
+    prevPct = e.pct;
+  }
+
+  const moduleCompletes = events.filter((e) => e.phase === 'module-complete');
+  assert.deepEqual(
+    moduleCompletes.map((e) => [e.moduleIndex, e.currentModule]),
+    [
+      [0, 'vcruntime140'],
+      [1, 'vcruntime140_1'],
+      [2, 'msvcp140'],
+      [3, 'main'],
+    ]
+  );
+  // Only ONE terminal 'complete' event at the very end.
+  const completes = events.filter((e) => e.phase === 'complete');
+  assert.equal(completes.length, 1);
+  assert.equal(events[events.length - 1], completes[0]);
+  assert.equal(completes[0].loadedBytes, expectedTotal);
+  assert.equal(completes[0].totalBytes, expectedTotal);
+  assert.equal(completes[0].pct, 100);
+  assert.equal(completes[0].moduleIndex, 3);
+  assert.equal(completes[0].currentModule, 'main');
+});
+
+test('preloadProgramModules warms OPFS RangeCache and supports SharedArrayBuffer and top-level helper', async () => {
+  const m1 = buildModulePgim(51, { imageBase: 0x100000000n });
+  const m2 = buildModulePgim(52, { imageBase: 0x140000000n });
+  const files = {
+    '/boot/program-manifest.json': jsonBytes({ schema: 'playgta6-recomp-program', modules: ['dep', 'main'] }),
+    '/boot/dep/image/guest.pgim': m1,
+    '/boot/main/image/guest.pgim': m2,
+  };
+  const server = createServer(files);
+  const reads = [];
+  const rangeCache = {
+    async read(path, offset, length) {
+      reads.push([path, offset, length]);
+      const data = files[path];
+      return data.slice(offset, Math.min(data.byteLength, offset + length));
+    },
+  };
+
+  const res = await preloadProgramModules('/boot/program-manifest.json', {
+    fetchImpl: server.fetchImpl,
+    rangeCache,
+    chunkSize: 4096,
+    useSharedArrayBuffer: true,
+  });
+
+  assert.equal(res.moduleCount, 2);
+  assert.equal(res.modulesByName.dep.transport, 'range-cache');
+  assert.equal(res.modulesByName.main.transport, 'range-cache');
+  assert.ok(res.modulesByName.dep.bytes.buffer instanceof SharedArrayBuffer);
+  assert.ok(res.modulesByName.main.bytes.buffer instanceof SharedArrayBuffer);
+  assert.ok(reads.some(([p]) => p === '/boot/dep/image/guest.pgim'));
+  assert.ok(reads.some(([p]) => p === '/boot/main/image/guest.pgim'));
+  // Only manifest GET + 2 module HEADs hit HTTP directly; all chunk reads went through rangeCache.
+  assert.deepEqual(
+    server.log.map((r) => [r.method, r.url]),
+    [
+      ['GET', '/boot/program-manifest.json'],
+      ['HEAD', '/boot/dep/image/guest.pgim'],
+      ['HEAD', '/boot/main/image/guest.pgim'],
+    ]
+  );
+});
+
+test('preloadProgramModules gracefully falls back to boot-manifest.json when program-manifest.json returns 404', async () => {
+  const mainImg = buildModulePgim(61, { imageBase: 0x140000000n });
+  const server = createServer({
+    '/boot/boot-manifest.json': jsonBytes({ module: 'main', pgim: 'main/image/guest.pgim' }),
+    '/boot/main/image/guest.pgim': mainImg,
+  });
+
+  const events = [];
+  const result = await new PgimPreloader({ fetchImpl: server.fetchImpl, chunkSize: 4096 }).preloadProgramModules(
+    '/boot/program-manifest.json',
+    { onProgress: (e) => events.push(e) }
+  );
+
+  assert.equal(result.source, 'boot-manifest');
+  assert.equal(result.requestedManifestUrl, '/boot/program-manifest.json');
+  assert.equal(result.manifestUrl, '/boot/boot-manifest.json');
+  assert.equal(result.usedFallback, true);
+  assert.equal(result.moduleCount, 1);
+  assert.deepEqual(result.mainModule.bytes, mainImg);
+  assert.equal(result.totalBytes, mainImg.byteLength);
+  assert.ok(events.some((e) => e.phase === 'fallback' && e.fallbackTo === '/boot/boot-manifest.json'));
+  assert.equal(events[events.length - 1].phase, 'complete');
+  assert.equal(events[events.length - 1].pct, 100);
+});
+
+test('preloadProgramModules falls back to fallbackPgimUrl when both manifests 404, and does not mask 500 or corrupt manifests', async () => {
+  const mainImg = buildModulePgim(71, { imageBase: 0x140000000n });
+  const server = createServer({
+    '/boot/guest.pgim': mainImg,
+    '/err/program-manifest.json': new TextEncoder().encode('{broken'),
+    '/err/boot-manifest.json': jsonBytes({ pgim: '/boot/guest.pgim' }),
+  });
+
+  const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, maxRetries: 0 });
+  const fallbackRes = await preloader.preloadProgramModules('/boot/program-manifest.json', {
+    fallbackPgimUrl: '/boot/guest.pgim',
+  });
+  assert.equal(fallbackRes.source, 'pgim-fallback');
+  assert.equal(fallbackRes.usedFallback, true);
+  assert.equal(fallbackRes.moduleCount, 1);
+  assert.deepEqual(fallbackRes.mainModule.bytes, mainImg);
+
+  // Without fallbackPgimUrl, double-404 rejects with NOT_FOUND.
+  await assert.rejects(
+    preloader.preloadProgramModules('/boot/program-manifest.json'),
+    expectCode('NOT_FOUND')
+  );
+
+  // Malformed program-manifest.json must NOT fall back to boot-manifest.json.
+  await assert.rejects(
+    preloader.preloadProgramModules('/err/program-manifest.json'),
+    expectCode('BAD_PROGRAM_MANIFEST')
+  );
+
+  // HTTP 500 on program-manifest.json must NOT fall back to boot-manifest.json.
+  const s500 = createServer(
+    {
+      '/boot/program-manifest.json': jsonBytes(sampleProgramManifest()),
+      '/boot/boot-manifest.json': jsonBytes({ pgim: 'guest.pgim' }),
+      '/boot/guest.pgim': mainImg,
+    },
+    { failStatuses: { '/boot/program-manifest.json': [500] } }
+  );
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: s500.fetchImpl, maxRetries: 0 }).preloadProgramModules('/boot/program-manifest.json'),
+    (e) => e.code === 'HTTP_ERROR' && e.status === 500
+  );
+});
+
+test('preloadProgramModules works when HEAD is 405 and handles AbortSignal, missing modules, and targetBuffer guard', async () => {
+  const m1 = buildModulePgim(81, { imageBase: 0x100000000n });
+  const m2 = buildModulePgim(82, { imageBase: 0x140000000n });
+  const manifestBytes = jsonBytes({ schema: 'playgta6-recomp-program', modules: ['vcruntime140', 'main'] });
+
+  // HEAD 405 fallback (size discovered during first Range chunk per module).
+  const s405 = createServer(
+    {
+      '/boot/program-manifest.json': manifestBytes,
+      '/boot/vcruntime140/image/guest.pgim': m1,
+      '/boot/main/image/guest.pgim': m2,
+    },
+    { headStatus: 405 }
+  );
+  const events405 = [];
+  const r405 = await new PgimPreloader({ fetchImpl: s405.fetchImpl, chunkSize: 4096 }).preloadProgramModules(
+    '/boot/program-manifest.json',
+    { onProgress: (e) => events405.push(e) }
+  );
+  assert.equal(r405.totalBytes, m1.byteLength + m2.byteLength);
+  assert.equal(events405[events405.length - 1].phase, 'complete');
+  assert.equal(events405[events405.length - 1].pct, 100);
+
+  // Mid-transfer AbortSignal stops remaining modules.
+  const sSlow = createServer(
+    {
+      '/boot/program-manifest.json': manifestBytes,
+      '/boot/vcruntime140/image/guest.pgim': m1,
+      '/boot/main/image/guest.pgim': m2,
+    },
+    { delayMs: 4 }
+  );
+  const controller = new AbortController();
+  const abortEvents = [];
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: sSlow.fetchImpl, chunkSize: 4096 }).preloadProgramModules('/boot/program-manifest.json', {
+      signal: controller.signal,
+      onProgress: (e) => {
+        abortEvents.push(e);
+        if (e.phase === 'module-complete' && e.moduleIndex === 0) controller.abort();
+      },
+    }),
+    (err) => err.name === 'AbortError'
+  );
+  assert.ok(!abortEvents.some((e) => e.phase === 'complete'));
+  assert.equal(
+    sSlow.log.filter((r) => r.method === 'GET' && r.url === '/boot/main/image/guest.pgim').length,
+    0,
+    'aborted preload must not start GETs for subsequent modules'
+  );
+
+  // Missing module fails fast during HEAD probe before downloading module 0.
+  const sMissing = createServer({
+    '/boot/program-manifest.json': manifestBytes,
+    '/boot/vcruntime140/image/guest.pgim': m1,
+  });
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: sMissing.fetchImpl }).preloadProgramModules('/boot/program-manifest.json'),
+    expectCode('NOT_FOUND')
+  );
+  assert.equal(
+    sMissing.log.filter((r) => r.method === 'GET' && r.url.endsWith('.pgim')).length,
+    0,
+    'missing module probe should fail before streaming PGIM chunks'
+  );
+
+  // targetBuffer cannot be shared across multiple modules.
+  const sBuf = createServer({
+    '/boot/program-manifest.json': manifestBytes,
+    '/boot/vcruntime140/image/guest.pgim': m1,
+    '/boot/main/image/guest.pgim': m2,
+  });
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: sBuf.fetchImpl, targetBuffer: new ArrayBuffer(1024 * 1024) }).preloadProgramModules(
+      '/boot/program-manifest.json'
+    ),
+    expectCode('ALLOCATION_FAILED')
+  );
+
+  // Unsafe manifestUrl / bootManifestUrl rejected.
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: sBuf.fetchImpl }).preloadProgramModules('../secret/program-manifest.json'),
+    expectCode('UNSAFE_URL')
+  );
+  await assert.rejects(
+    new PgimPreloader({ fetchImpl: sBuf.fetchImpl }).preloadProgramModules('/missing/program-manifest.json', {
+      bootManifestUrl: 'javascript:alert(1)',
+    }),
+    expectCode('UNSAFE_URL')
+  );
+});
+
+test('preloadBootBundle integrates multi-module programManifestUrl alongside shader pack and reflection manifest', async () => {
+  const vcruntime = buildModulePgim(91, { imageBase: 0x100000000n });
+  const mainImg = buildModulePgim(92, { imageBase: 0x140000000n });
+  const pack = new Uint8Array(
+    buildWgslPackBuffer([{ hash: 0x1234n, stage: 'vertex', wgsl: '@vertex fn main() -> @builtin(position) vec4f { return vec4f(); }' }])
+  );
+  const reflection = s6Manifest();
+  const server = createServer({
+    '/boot/program-manifest.json': jsonBytes({
+      schema: 'playgta6-recomp-program',
+      schema_version: 1,
+      modules: [
+        { module: 'vcruntime140', role: 'dll' },
+        { module: 'main', role: 'exe' },
+      ],
+    }),
+    '/boot/vcruntime140/image/guest.pgim': vcruntime,
+    '/boot/main/image/guest.pgim': mainImg,
+    '/shaders/boot.wgsl.pack': pack,
+    '/shaders/reflection-manifest.json': jsonBytes(reflection),
+  });
+
+  const events = [];
+  const bundle = await new PgimPreloader({ fetchImpl: server.fetchImpl, chunkSize: 4096 }).preloadBootBundle({
+    programManifestUrl: '/boot/program-manifest.json',
+    shaderPackUrl: '/shaders/boot.wgsl.pack',
+    reflectionUrl: '/shaders/reflection-manifest.json',
+    onProgress: (e) => events.push(e),
+  });
+
+  assert.equal(bundle.moduleCount, 2);
+  assert.equal(bundle.bytesLoaded, vcruntime.byteLength + mainImg.byteLength);
+  assert.deepEqual(bundle.pgimBytes, mainImg);
+  assert.deepEqual(bundle.modulesByName.vcruntime140.bytes, vcruntime);
+  assert.deepEqual(bundle.modulesByName.main.bytes, mainImg);
+  assert.deepEqual(bundle.shaderPackBytes, pack);
+  assert.deepEqual(bundle.reflectionManifest, reflection);
+  assert.equal(events[events.length - 1].asset, 'bundle');
+  assert.equal(events[events.length - 1].phase, 'complete');
+  assert.equal(events[events.length - 1].moduleCount, 2);
+  assert.equal(events[events.length - 1].loadedBytes, vcruntime.byteLength + mainImg.byteLength);
 });
