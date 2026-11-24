@@ -189,10 +189,81 @@
     compute: BUILTIN_FALLBACK_WGSL.compute,
   });
 
+  /**
+   * Real Frame-1 24-byte splash pass fallback WGSL pair for expanded Xbox RECTLIST quads.
+   * Vertex attributes (24 B stride):
+   *   `@location(0) pos: vec3<f32>` (float32x3 @ offset 0)
+   *   `@location(1) color: vec4<f32>` (unorm8x4 @ offset 12)
+   *   `@location(2) uv: vec2<f32>` (float32x2 @ offset 16)
+   * Bindings:
+   *   `@group(0) @binding(0)` uniform FrameCbv (`cb0`)
+   *   `@group(0) @binding(1)` texture_2d<f32> (`tex0`)
+   *   `@group(0) @binding(2)` sampler (`samp0`)
+   */
+  const SPLASH_RECT_24B_WGSL = Object.freeze({
+    vertex: [
+      'struct FrameCbv {',
+      '    data: array<vec4<f32>, 16>,',
+      '};',
+      '',
+      '@group(0) @binding(0) var<uniform> cb0: FrameCbv;',
+      '',
+      'struct VsOut {',
+      '    @builtin(position) position: vec4<f32>,',
+      '    @location(0) color: vec4<f32>,',
+      '    @location(1) uv: vec2<f32>,',
+      '};',
+      '',
+      '@vertex',
+      'fn vs_main(',
+      '    @location(0) pos: vec3<f32>,',
+      '    @location(1) color: vec4<f32>,',
+      '    @location(2) uv: vec2<f32>,',
+      ') -> VsOut {',
+      '    let cbv_keep = f32(bitcast<u32>(cb0.data[0].x) & 0xffu) * 0.0;',
+      '    var out: VsOut;',
+      '    out.position = vec4<f32>(pos.xy, pos.z + cbv_keep, 1.0);',
+      '    out.color = color;',
+      '    out.uv = uv;',
+      '    return out;',
+      '}',
+      '',
+    ].join('\n'),
+    fragment: [
+      'struct FrameCbv {',
+      '    data: array<vec4<f32>, 16>,',
+      '};',
+      '',
+      '@group(0) @binding(0) var<uniform> cb0: FrameCbv;',
+      '@group(0) @binding(1) var tex0: texture_2d<f32>;',
+      '@group(0) @binding(2) var samp0: sampler;',
+      '',
+      'struct FsIn {',
+      '    @location(0) color: vec4<f32>,',
+      '    @location(1) uv: vec2<f32>,',
+      '};',
+      '',
+      '@fragment',
+      'fn fs_main(input: FsIn) -> @location(0) vec4<f32> {',
+      '    let texel = textureSample(tex0, samp0, input.uv);',
+      '    let cbv_keep = f32(bitcast<u32>(cb0.data[0].x) & 0xffu) * 0.0;',
+      '    let tinted = texel * input.color;',
+      '    return clamp(',
+      '        vec4<f32>(tinted.rgb + vec3<f32>(cbv_keep, cbv_keep, cbv_keep), tinted.a),',
+      '        vec4<f32>(0.0, 0.0, 0.0, 0.0),',
+      '        vec4<f32>(1.0, 1.0, 1.0, 1.0),',
+      '    );',
+      '}',
+      '',
+    ].join('\n'),
+    compute: BUILTIN_FALLBACK_WGSL.compute,
+  });
+
   const BUILTIN_FALLBACK_PROFILES = Object.freeze({
     default: BUILTIN_FALLBACK_WGSL,
     fullscreen_triangle_cbv: FULLSCREEN_TRIANGLE_CBV_WGSL,
     textured_quad_24b: TEXTURED_QUAD_24B_WGSL,
+    splash_rect_24b: SPLASH_RECT_24B_WGSL,
   });
 
   const FALLBACK_PROFILE_ALIASES = Object.freeze({
@@ -206,6 +277,12 @@
     textured_24b: 'textured_quad_24b',
     'textured-quad-24b': 'textured_quad_24b',
     'textured-24b': 'textured_quad_24b',
+    splash_rect_24b: 'splash_rect_24b',
+    'splash-rect-24b': 'splash_rect_24b',
+    rectlist_24b: 'splash_rect_24b',
+    'rectlist-24b': 'splash_rect_24b',
+    frame1_splash_24b: 'splash_rect_24b',
+    'frame1-splash-24b': 'splash_rect_24b',
   });
 
   /**
@@ -213,7 +290,7 @@
    * Unknown or omitted values safely resolve to `'default'`.
    *
    * @param {string | null | undefined} profile
-   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b'}
+   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b'}
    */
   function normalizeFallbackProfile(profile) {
     if (typeof profile !== 'string') {
@@ -510,7 +587,7 @@
      *   resolvedHash: string | null,
      *   stage: 'vertex' | 'fragment' | 'compute',
      *   entryPoint: string | null,
-     *   profile?: 'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b',
+     *   profile?: 'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b',
      * }}
      */
     resolve(hash, stage, options) {
