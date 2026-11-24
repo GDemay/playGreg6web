@@ -24,7 +24,8 @@ use naga::{
     FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass, ImageDimension,
     Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module, Range,
     ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage, Span,
-    Statement, StructMember, SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
+    Statement, StorageAccess, StorageFormat, StructMember, SwizzleComponent, Type, TypeInner,
+    UnaryOperator, VectorSize,
 };
 
 use crate::convert::{ShaderStage, format_shader_hash};
@@ -92,6 +93,15 @@ impl fmt::Display for Rdna2StageOverride {
     }
 }
 
+/// Default compute workgroup dimensions (`@workgroup_size(64, 1, 1)`).
+pub const DEFAULT_COMPUTE_WORKGROUP_SIZE: [u32; 3] = [64, 1, 1];
+
+/// LDS workgroup shared memory size in 32-bit dwords (`4096 * 4 = 16 KiB`).
+const LDS_WORKGROUP_DWORDS: u32 = 4096;
+
+/// Mask applied to LDS dword indices (`4095 = 0x0FFF`) so workgroup memory accesses never trap.
+const LDS_WORKGROUP_INDEX_MASK: u32 = LDS_WORKGROUP_DWORDS - 1;
+
 /// Options controlling RDNA2 -> WGSL translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdna2TranslateOptions {
@@ -101,6 +111,11 @@ pub struct Rdna2TranslateOptions {
     pub entry_point: Option<String>,
     /// Minimum number of `vec4<u32>` entries emitted when `cb0` uniform buffer is needed.
     pub min_cbv_vec4_count: u32,
+    /// Workgroup size `(X, Y, Z)` for `ShaderStage::Compute` (defaults to `[64, 1, 1]`).
+    pub workgroup_size: [u32; 3],
+    /// Optional base SGPR index for seeding `(wg_id.x, wg_id.y, wg_id.z)` in compute shaders.
+    /// When `None`, defaults to `s0`/`s1`/`s2` for SGPRs read before being written.
+    pub workgroup_id_sgpr_base: Option<u8>,
 }
 
 impl Default for Rdna2TranslateOptions {
@@ -109,6 +124,8 @@ impl Default for Rdna2TranslateOptions {
             stage: Rdna2StageOverride::Auto,
             entry_point: None,
             min_cbv_vec4_count: DEFAULT_MIN_CBV_VEC4_COUNT,
+            workgroup_size: DEFAULT_COMPUTE_WORKGROUP_SIZE,
+            workgroup_id_sgpr_base: None,
         }
     }
 }
@@ -172,6 +189,9 @@ pub struct Rdna2BindingSummary {
     pub cbv_vec4_count: u32,
     pub has_texture_2d: bool,
     pub has_sampler: bool,
+    pub has_storage_buffer: bool,
+    pub has_storage_texture: bool,
+    pub has_lds: bool,
     pub vertex_input_mode: String,
     pub fragment_input_locations: Vec<u32>,
     pub output_locations: Vec<u32>,
@@ -243,6 +263,13 @@ impl Rdna2WgslOutput {
         let _ = writeln!(out, "    \"cbv_vec4_count\": {},", bs.cbv_vec4_count);
         let _ = writeln!(out, "    \"has_texture_2d\": {},", bs.has_texture_2d);
         let _ = writeln!(out, "    \"has_sampler\": {},", bs.has_sampler);
+        let _ = writeln!(out, "    \"has_storage_buffer\": {},", bs.has_storage_buffer);
+        let _ = writeln!(
+            out,
+            "    \"has_storage_texture\": {},",
+            bs.has_storage_texture
+        );
+        let _ = writeln!(out, "    \"has_lds\": {},", bs.has_lds);
         out.push_str("    \"vertex_input_mode\": ");
         write_json_string(&mut out, &bs.vertex_input_mode);
         out.push_str(",\n");
@@ -337,9 +364,17 @@ struct CbvSlotPlan {
     highest_vec4_offset: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageBufSlotPlan {
+    srsrc: u8,
+    writable: bool,
+}
+
 struct ProgramPlan {
     stage: ShaderStage,
     entry_point: String,
+    workgroup_size: [u32; 3],
+    compute_seed_wg_sgprs: Vec<(u8, u32)>,
     active_inst_count: usize,
     vertex_input_mode: VertexInputMode,
     vertex_attrs: Vec<VertexInputAttr>,
@@ -349,6 +384,9 @@ struct ProgramPlan {
     cbv_vec4_count: u32,
     tex_slots: Vec<u8>,
     samp_slots: Vec<u8>,
+    storage_buf_slots: Vec<StorageBufSlotPlan>,
+    storage_tex_slots: Vec<u8>,
+    uses_lds: bool,
     frag_attrs: Vec<u8>,
     vs_params: Vec<u8>,
     ps_mrts: Vec<u8>,
@@ -422,6 +460,7 @@ struct MimgAddrLayout {
     lod_off: Option<u8>,
     is_zero_lod: bool,
     is_load: bool,
+    is_store: bool,
 }
 
 /// Decode GFX10.3 2D MIMG address VGPR layout (`[offset], [bias], [z_compare], [grad], u, v, [lod/clamp]`).
@@ -435,6 +474,7 @@ fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
         lod_off: None,
         is_zero_lod: false,
         is_load: false,
+        is_store: false,
     };
     match op {
         // image_load: (x, y)
@@ -447,6 +487,18 @@ fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
             total_vgprs: 3,
             lod_off: Some(2),
             is_load: true,
+            ..base
+        }),
+        // image_store / image_store_pck: (x, y)
+        0x08 | 0x0A => Some(MimgAddrLayout {
+            is_store: true,
+            ..base
+        }),
+        // image_store_mip / image_store_mip_pck: (x, y, mip)
+        0x09 | 0x0B => Some(MimgAddrLayout {
+            total_vgprs: 3,
+            lod_off: Some(2),
+            is_store: true,
             ..base
         }),
         // image_sample: (u, v)
@@ -582,18 +634,118 @@ fn mtbuf_load_components(op: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageBufOpKind {
+    LoadUbyte,
+    LoadSbyte,
+    LoadUshort,
+    LoadSshort,
+    LoadDwords(u8),
+    StoreDwords(u8),
+}
+
+impl StorageBufOpKind {
+    const fn is_store(self) -> bool {
+        matches!(self, Self::StoreDwords(_))
+    }
+
+    const fn vdata_count(self) -> u8 {
+        match self {
+            Self::LoadUbyte | Self::LoadSbyte | Self::LoadUshort | Self::LoadSshort => 1,
+            Self::LoadDwords(n) | Self::StoreDwords(n) => n,
+        }
+    }
+
+    const fn elem_stride_bytes(self) -> u32 {
+        match self {
+            Self::LoadUbyte | Self::LoadSbyte => 1,
+            Self::LoadUshort | Self::LoadSshort => 2,
+            Self::LoadDwords(n) | Self::StoreDwords(n) => (n as u32) * 4,
+        }
+    }
+}
+
+fn mubuf_storage_op(op: u8) -> Option<StorageBufOpKind> {
+    match op {
+        0x00 | 0x0C => Some(StorageBufOpKind::LoadDwords(1)),
+        0x01 | 0x0D => Some(StorageBufOpKind::LoadDwords(2)),
+        0x02 | 0x0F => Some(StorageBufOpKind::LoadDwords(3)),
+        0x03 | 0x0E => Some(StorageBufOpKind::LoadDwords(4)),
+        0x08 => Some(StorageBufOpKind::LoadUbyte),
+        0x09 => Some(StorageBufOpKind::LoadSbyte),
+        0x0A => Some(StorageBufOpKind::LoadUshort),
+        0x0B => Some(StorageBufOpKind::LoadSshort),
+        0x04 | 0x1C => Some(StorageBufOpKind::StoreDwords(1)),
+        0x05 | 0x1D => Some(StorageBufOpKind::StoreDwords(2)),
+        0x06 | 0x1F => Some(StorageBufOpKind::StoreDwords(3)),
+        0x07 | 0x1E => Some(StorageBufOpKind::StoreDwords(4)),
+        _ => None,
+    }
+}
+
+const fn mubuf_is_atomic(op: u8) -> bool {
+    matches!(op, 0x32..=0x3A)
+}
+
+fn mtbuf_storage_op(op: u8) -> Option<StorageBufOpKind> {
+    match op {
+        0x00 => Some(StorageBufOpKind::LoadDwords(1)),
+        0x01 => Some(StorageBufOpKind::LoadDwords(2)),
+        0x02 => Some(StorageBufOpKind::LoadDwords(3)),
+        0x03 => Some(StorageBufOpKind::LoadDwords(4)),
+        0x04 => Some(StorageBufOpKind::StoreDwords(1)),
+        0x05 => Some(StorageBufOpKind::StoreDwords(2)),
+        0x06 => Some(StorageBufOpKind::StoreDwords(3)),
+        0x07 => Some(StorageBufOpKind::StoreDwords(4)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DsLdsOp {
+    ReadContiguous(u8),
+    WriteContiguous(u8),
+    Read2 { stride_bytes: u32 },
+    Write2 { stride_bytes: u32 },
+}
+
+fn ds_lds_op(op: u8) -> Option<DsLdsOp> {
+    match op {
+        0x0D => Some(DsLdsOp::WriteContiguous(1)),
+        0x0E => Some(DsLdsOp::Write2 { stride_bytes: 4 }),
+        0x0F => Some(DsLdsOp::Write2 { stride_bytes: 256 }),
+        0x36 => Some(DsLdsOp::ReadContiguous(1)),
+        0x37 => Some(DsLdsOp::Read2 { stride_bytes: 4 }),
+        0x38 => Some(DsLdsOp::Read2 { stride_bytes: 256 }),
+        0x4D => Some(DsLdsOp::WriteContiguous(2)),
+        0x76 => Some(DsLdsOp::ReadContiguous(2)),
+        0xDE => Some(DsLdsOp::WriteContiguous(3)),
+        0xDF => Some(DsLdsOp::WriteContiguous(4)),
+        0xFE => Some(DsLdsOp::ReadContiguous(3)),
+        0xFF => Some(DsLdsOp::ReadContiguous(4)),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_src_usage(
     src: u16,
     vgprs: &mut BTreeSet<u8>,
     sgprs: &mut BTreeSet<u8>,
     written_vgprs: &BTreeSet<u8>,
     read_before_write_vgprs: &mut BTreeSet<u8>,
+    written_sgprs: &BTreeSet<u8>,
+    read_before_write_sgprs: &mut BTreeSet<u8>,
     needs_vcc: &mut bool,
     needs_scc: &mut bool,
 ) {
     match src {
         0..=105 => {
-            sgprs.insert(src as u8);
+            let s = src as u8;
+            sgprs.insert(s);
+            if !written_sgprs.contains(&s) {
+                read_before_write_sgprs.insert(s);
+            }
         }
         106 => {
             *needs_vcc = true;
@@ -649,6 +801,9 @@ fn plan_program(
     let mut cbv_usage: BTreeMap<u8, CbvUsage> = BTreeMap::new();
     let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
     let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
+    let mut storage_buf_usage: BTreeMap<u8, bool> = BTreeMap::new();
+    let mut storage_tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
+    let mut uses_lds = false;
     let mut has_buffer_fetch = false;
     let mut vertex_buf_fetches: BTreeMap<u16, u8> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
@@ -660,6 +815,8 @@ fn plan_program(
     let mut sgprs: BTreeSet<u8> = BTreeSet::new();
     let mut written_vgprs: BTreeSet<u8> = BTreeSet::new();
     let mut read_before_write_vgprs: BTreeSet<u8> = BTreeSet::new();
+    let mut written_sgprs: BTreeSet<u8> = BTreeSet::new();
+    let mut read_before_write_sgprs: BTreeSet<u8> = BTreeSet::new();
     let mut needs_vcc = false;
     let mut needs_scc = false;
 
@@ -675,6 +832,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -684,6 +843,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -698,34 +859,54 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
                 if matches!(*op, 0x04 | 0x0A) {
                     // s_mov_b64 / s_wqm_b64: 64-bit SGPR pair source and destination
                     if *ssrc0 <= 104 {
-                        sgprs.insert(*ssrc0 + 1);
+                        let hi = *ssrc0 + 1;
+                        sgprs.insert(hi);
+                        if !written_sgprs.contains(&hi) {
+                            read_before_write_sgprs.insert(hi);
+                        }
                     }
                     if *sdst <= 104 {
                         sgprs.insert(*sdst);
                         sgprs.insert(*sdst + 1);
+                        written_sgprs.insert(*sdst);
+                        written_sgprs.insert(*sdst + 1);
                     } else if *sdst == 105 {
                         sgprs.insert(105);
+                        written_sgprs.insert(105);
                     } else if *sdst == 106 {
                         needs_vcc = true;
                     }
                 } else {
                     if *op == 0x05 {
                         needs_scc = true;
+                        if *sdst <= 105 {
+                            sgprs.insert(*sdst);
+                            if !written_sgprs.contains(sdst) {
+                                read_before_write_sgprs.insert(*sdst);
+                            }
+                        }
                     }
                     if *sdst <= 105 {
                         sgprs.insert(*sdst);
+                        written_sgprs.insert(*sdst);
                     }
                 }
             }
-            Rdna2Detail::Sopk { sdst, .. } => {
+            Rdna2Detail::Sopk { op, sdst, .. } => {
                 if *sdst <= 105 {
+                    if matches!(*op, 0x0F | 0x10) && !written_sgprs.contains(sdst) {
+                        read_before_write_sgprs.insert(*sdst);
+                    }
                     sgprs.insert(*sdst);
+                    written_sgprs.insert(*sdst);
                 }
             }
             Rdna2Detail::Sop2 {
@@ -741,6 +922,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -750,6 +933,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -758,6 +943,7 @@ fn plan_program(
                 }
                 if *sdst <= 105 {
                     sgprs.insert(*sdst);
+                    written_sgprs.insert(*sdst);
                 }
             }
             Rdna2Detail::Smem {
@@ -772,6 +958,9 @@ fn plan_program(
                     let is_dynamic = *soffset != 0x7D && *soffset <= 105;
                     if is_dynamic {
                         sgprs.insert(*soffset);
+                        if !written_sgprs.contains(soffset) {
+                            read_before_write_sgprs.insert(*soffset);
+                        }
                     }
                     let base_word = if *offset > 0 {
                         (*offset as u32) / 4
@@ -800,6 +989,7 @@ fn plan_program(
                         let reg = sdata.saturating_add(k);
                         if reg <= 105 {
                             sgprs.insert(reg);
+                            written_sgprs.insert(reg);
                         }
                     }
                 }
@@ -812,6 +1002,8 @@ fn plan_program(
                         &mut sgprs,
                         &written_vgprs,
                         &mut read_before_write_vgprs,
+                        &written_sgprs,
+                        &mut read_before_write_sgprs,
                         &mut needs_vcc,
                         &mut needs_scc,
                     );
@@ -819,6 +1011,7 @@ fn plan_program(
                         let sd = *vdst & 0x7F;
                         if sd <= 105 {
                             sgprs.insert(sd);
+                            written_sgprs.insert(sd);
                         }
                     } else {
                         vgprs.insert(*vdst);
@@ -833,6 +1026,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -842,6 +1037,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -860,6 +1057,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -869,6 +1068,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -880,6 +1081,8 @@ fn plan_program(
                         &mut sgprs,
                         &written_vgprs,
                         &mut read_before_write_vgprs,
+                        &written_sgprs,
+                        &mut read_before_write_sgprs,
                         &mut needs_vcc,
                         &mut needs_scc,
                     );
@@ -905,6 +1108,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -916,6 +1121,8 @@ fn plan_program(
                         &mut sgprs,
                         &written_vgprs,
                         &mut read_before_write_vgprs,
+                        &written_sgprs,
+                        &mut read_before_write_sgprs,
                         &mut needs_vcc,
                         &mut needs_scc,
                     );
@@ -936,6 +1143,8 @@ fn plan_program(
                         &mut sgprs,
                         &written_vgprs,
                         &mut read_before_write_vgprs,
+                        &written_sgprs,
+                        &mut read_before_write_sgprs,
                         &mut needs_vcc,
                         &mut needs_scc,
                     );
@@ -944,6 +1153,7 @@ fn plan_program(
                     let sd7 = *sd & 0x7F;
                     if sd7 <= 105 {
                         sgprs.insert(sd7);
+                        written_sgprs.insert(sd7);
                     } else if sd7 == 106 {
                         needs_vcc = true;
                     }
@@ -952,6 +1162,7 @@ fn plan_program(
                     let sd = *vdst & 0x7F;
                     if sd <= 105 {
                         sgprs.insert(sd);
+                        written_sgprs.insert(sd);
                     } else if sd == 106 {
                         needs_vcc = true;
                     }
@@ -974,6 +1185,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -983,6 +1196,8 @@ fn plan_program(
                     &mut sgprs,
                     &written_vgprs,
                     &mut read_before_write_vgprs,
+                    &written_sgprs,
+                    &mut read_before_write_sgprs,
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
@@ -993,6 +1208,8 @@ fn plan_program(
                         &mut sgprs,
                         &written_vgprs,
                         &mut read_before_write_vgprs,
+                        &written_sgprs,
+                        &mut read_before_write_sgprs,
                         &mut needs_vcc,
                         &mut needs_scc,
                     );
@@ -1017,55 +1234,230 @@ fn plan_program(
                 ..
             } => {
                 if let Some(layout) = mimg_addr_layout(*op) {
-                    tex_rsrc_set.insert(*srsrc);
-                    if !layout.is_load {
-                        samp_rsrc_set.insert(*ssamp);
-                    }
-                    for a in 0..layout.total_vgprs {
-                        let reg = vaddr.saturating_add(a);
-                        vgprs.insert(reg);
-                        if !written_vgprs.contains(&reg) {
-                            read_before_write_vgprs.insert(reg);
+                    if layout.is_store {
+                        if stage != ShaderStage::Vertex {
+                            storage_tex_rsrc_set.insert(*srsrc);
+                            for a in 0..layout.total_vgprs {
+                                let reg = vaddr.saturating_add(a);
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
+                            }
+                            let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
+                            let in_cnt = eff_mask.count_ones() as u8;
+                            for d in 0..in_cnt {
+                                let reg = vdata.saturating_add(d);
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
+                            }
                         }
-                    }
-                    let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
-                    let out_cnt = eff_mask.count_ones() as u8;
-                    for d in 0..out_cnt {
-                        let reg = vdata.saturating_add(d);
-                        vgprs.insert(reg);
-                        written_vgprs.insert(reg);
+                    } else {
+                        tex_rsrc_set.insert(*srsrc);
+                        if !layout.is_load {
+                            samp_rsrc_set.insert(*ssamp);
+                        }
+                        for a in 0..layout.total_vgprs {
+                            let reg = vaddr.saturating_add(a);
+                            vgprs.insert(reg);
+                            if !written_vgprs.contains(&reg) {
+                                read_before_write_vgprs.insert(reg);
+                            }
+                        }
+                        let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
+                        let out_cnt = eff_mask.count_ones() as u8;
+                        for d in 0..out_cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
                     }
                 }
             }
             Rdna2Detail::Mubuf {
-                op, offset, vdata, ..
+                op,
+                offset,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                srsrc,
+                soffset,
+                ..
             } => {
-                if let Some(comps) = mubuf_load_components(*op) {
-                    has_buffer_fetch = true;
-                    vertex_buf_fetches
-                        .entry(*offset)
-                        .and_modify(|c| *c = (*c).max(comps))
-                        .or_insert(comps);
-                    for d in 0..comps {
-                        let reg = vdata.saturating_add(d);
-                        vgprs.insert(reg);
-                        written_vgprs.insert(reg);
+                if stage == ShaderStage::Vertex {
+                    if let Some(comps) = mubuf_load_components(*op) {
+                        has_buffer_fetch = true;
+                        vertex_buf_fetches
+                            .entry(*offset)
+                            .and_modify(|c| *c = (*c).max(comps))
+                            .or_insert(comps);
+                        for d in 0..comps {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
                     }
+                } else if let Some(buf_op) = mubuf_storage_op(*op) {
+                    storage_buf_usage
+                        .entry(*srsrc)
+                        .and_modify(|w| *w |= buf_op.is_store())
+                        .or_insert(buf_op.is_store());
+                    if *offen || *idxen {
+                        vgprs.insert(*vaddr);
+                        if !written_vgprs.contains(vaddr) {
+                            read_before_write_vgprs.insert(*vaddr);
+                        }
+                    }
+                    if *offen && *idxen {
+                        let v1 = vaddr.saturating_add(1);
+                        vgprs.insert(v1);
+                        if !written_vgprs.contains(&v1) {
+                            read_before_write_vgprs.insert(v1);
+                        }
+                    }
+                    if *soffset <= 105 {
+                        sgprs.insert(*soffset);
+                        if !written_sgprs.contains(soffset) {
+                            read_before_write_sgprs.insert(*soffset);
+                        }
+                    }
+                    let cnt = buf_op.vdata_count();
+                    if buf_op.is_store() {
+                        for d in 0..cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            if !written_vgprs.contains(&reg) {
+                                read_before_write_vgprs.insert(reg);
+                            }
+                        }
+                    } else {
+                        for d in 0..cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
+                    }
+                } else if mubuf_is_atomic(*op) {
+                    storage_buf_usage.insert(*srsrc, true);
                 }
             }
             Rdna2Detail::Mtbuf {
-                op, offset, vdata, ..
+                op,
+                offset,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                srsrc,
+                soffset,
+                ..
             } => {
-                if let Some(comps) = mtbuf_load_components(*op) {
-                    has_buffer_fetch = true;
-                    vertex_buf_fetches
-                        .entry(*offset)
-                        .and_modify(|c| *c = (*c).max(comps))
-                        .or_insert(comps);
-                    for d in 0..comps {
-                        let reg = vdata.saturating_add(d);
-                        vgprs.insert(reg);
-                        written_vgprs.insert(reg);
+                if stage == ShaderStage::Vertex {
+                    if let Some(comps) = mtbuf_load_components(*op) {
+                        has_buffer_fetch = true;
+                        vertex_buf_fetches
+                            .entry(*offset)
+                            .and_modify(|c| *c = (*c).max(comps))
+                            .or_insert(comps);
+                        for d in 0..comps {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
+                    }
+                } else if let Some(buf_op) = mtbuf_storage_op(*op) {
+                    storage_buf_usage
+                        .entry(*srsrc)
+                        .and_modify(|w| *w |= buf_op.is_store())
+                        .or_insert(buf_op.is_store());
+                    if *offen || *idxen {
+                        vgprs.insert(*vaddr);
+                        if !written_vgprs.contains(vaddr) {
+                            read_before_write_vgprs.insert(*vaddr);
+                        }
+                    }
+                    if *offen && *idxen {
+                        let v1 = vaddr.saturating_add(1);
+                        vgprs.insert(v1);
+                        if !written_vgprs.contains(&v1) {
+                            read_before_write_vgprs.insert(v1);
+                        }
+                    }
+                    if *soffset <= 105 {
+                        sgprs.insert(*soffset);
+                        if !written_sgprs.contains(soffset) {
+                            read_before_write_sgprs.insert(*soffset);
+                        }
+                    }
+                    let cnt = buf_op.vdata_count();
+                    if buf_op.is_store() {
+                        for d in 0..cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            if !written_vgprs.contains(&reg) {
+                                read_before_write_vgprs.insert(reg);
+                            }
+                        }
+                    } else {
+                        for d in 0..cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Ds {
+                op,
+                addr,
+                data0,
+                data1,
+                vdst,
+                ..
+            } => {
+                if stage == ShaderStage::Compute
+                    && let Some(lds_op) = ds_lds_op(*op)
+                {
+                    uses_lds = true;
+                    vgprs.insert(*addr);
+                    if !written_vgprs.contains(addr) {
+                        read_before_write_vgprs.insert(*addr);
+                    }
+                    match lds_op {
+                        DsLdsOp::ReadContiguous(n) => {
+                            for k in 0..n {
+                                let reg = vdst.saturating_add(k);
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
+                        }
+                        DsLdsOp::Read2 { .. } => {
+                            for k in 0..2u8 {
+                                let reg = vdst.saturating_add(k);
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
+                        }
+                        DsLdsOp::WriteContiguous(n) => {
+                            for k in 0..n {
+                                let reg = data0.saturating_add(k);
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
+                            }
+                        }
+                        DsLdsOp::Write2 { .. } => {
+                            for &reg in &[data0, data1] {
+                                vgprs.insert(*reg);
+                                if !written_vgprs.contains(reg) {
+                                    read_before_write_vgprs.insert(*reg);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1117,7 +1509,6 @@ fn plan_program(
             }
             Rdna2Detail::Sopp { .. }
             | Rdna2Detail::Flat { .. }
-            | Rdna2Detail::Ds { .. }
             | Rdna2Detail::Unknown { .. } => {}
         }
     }
@@ -1208,8 +1599,25 @@ fn plan_program(
         VertexInputMode::None
     };
 
+    let workgroup_size = [
+        options.workgroup_size[0].max(1),
+        options.workgroup_size[1].max(1),
+        options.workgroup_size[2].max(1),
+    ];
+    let mut compute_seed_wg_sgprs: Vec<(u8, u32)> = Vec::new();
     if stage == ShaderStage::Compute {
         vgprs.insert(0);
+        let wg_base = options.workgroup_id_sgpr_base.unwrap_or(0);
+        for c in 0..3u8 {
+            let reg = wg_base.saturating_add(c);
+            if reg <= 105
+                && sgprs.contains(&reg)
+                && (options.workgroup_id_sgpr_base.is_some()
+                    || read_before_write_sgprs.contains(&reg))
+            {
+                compute_seed_wg_sgprs.push((reg, u32::from(c)));
+            }
+        }
     }
 
     let mut ps_mrts: Vec<u8> = ps_mrt_set.into_iter().collect();
@@ -1242,6 +1650,11 @@ fn plan_program(
         .collect();
     let tex_slots: Vec<u8> = tex_rsrc_set.into_iter().collect();
     let samp_slots: Vec<u8> = samp_rsrc_set.into_iter().collect();
+    let storage_buf_slots: Vec<StorageBufSlotPlan> = storage_buf_usage
+        .into_iter()
+        .map(|(srsrc, writable)| StorageBufSlotPlan { srsrc, writable })
+        .collect();
+    let storage_tex_slots: Vec<u8> = storage_tex_rsrc_set.into_iter().collect();
 
     let cbv_vec4_count = cbv_slots
         .iter()
@@ -1252,6 +1665,8 @@ fn plan_program(
     ProgramPlan {
         stage,
         entry_point,
+        workgroup_size,
+        compute_seed_wg_sgprs,
         active_inst_count,
         vertex_input_mode,
         vertex_attrs,
@@ -1261,6 +1676,9 @@ fn plan_program(
         cbv_vec4_count,
         tex_slots,
         samp_slots,
+        storage_buf_slots,
+        storage_tex_slots,
+        uses_lds,
         frag_attrs: frag_attr_set.into_iter().collect(),
         vs_params: vs_param_set.into_iter().collect(),
         ps_mrts,
@@ -1288,8 +1706,13 @@ struct IrEmitter {
     cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)>,
     tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
     samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
+    storage_tex_globals: BTreeMap<u8, Handle<GlobalVariable>>,
+    lds_global: Option<Handle<GlobalVariable>>,
     emitted_bindings: Vec<WgslBindingInfo>,
     stage: ShaderStage,
+    workgroup_size: [u32; 3],
+    compute_seed_wg_sgprs: Vec<(u8, u32)>,
     func: Function,
     vgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     sgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
@@ -1395,6 +1818,8 @@ impl IrEmitter {
         let mut cb_globals: BTreeMap<u8, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
         let mut tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
+        let mut storage_tex_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
         let mut next_extra_binding: u32 = 3;
 
@@ -1552,6 +1977,131 @@ impl IrEmitter {
                 });
             }
         }
+
+        if !plan.storage_buf_slots.is_empty() {
+            let u32_runtime_arr_ty = insert_type(
+                &mut module,
+                None,
+                TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            );
+            let mut srv_idx = 0u32;
+            let mut uav_idx = 0u32;
+            for slot in &plan.storage_buf_slots {
+                let binding_num = next_extra_binding;
+                next_extra_binding += 1;
+                let (name, access, kind) = if slot.writable {
+                    let n = format!("uav_buf{uav_idx}");
+                    uav_idx += 1;
+                    (
+                        n,
+                        StorageAccess::LOAD | StorageAccess::STORE,
+                        "storage",
+                    )
+                } else {
+                    let n = format!("sbuf{srv_idx}");
+                    srv_idx += 1;
+                    (n, StorageAccess::LOAD, "read-only-storage")
+                };
+                let g = module.global_variables.append(
+                    GlobalVariable {
+                        name: Some(name.clone()),
+                        space: AddressSpace::Storage { access },
+                        binding: Some(ResourceBinding {
+                            group: 0,
+                            binding: binding_num,
+                        }),
+                        ty: u32_runtime_arr_ty,
+                        init: None,
+                        memory_decorations: MemoryDecorations::empty(),
+                    },
+                    Span::UNDEFINED,
+                );
+                storage_buf_globals.insert(slot.srsrc, (g, slot.writable));
+                emitted_bindings.push(WgslBindingInfo {
+                    group: 0,
+                    binding: binding_num,
+                    kind,
+                    name,
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                });
+            }
+        }
+
+        if !plan.storage_tex_slots.is_empty() {
+            let storage_tex_ty = insert_type(
+                &mut module,
+                None,
+                TypeInner::Image {
+                    dim: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::Storage {
+                        format: StorageFormat::Rgba8Unorm,
+                        access: StorageAccess::STORE,
+                    },
+                },
+            );
+            for (idx, &srsrc) in plan.storage_tex_slots.iter().enumerate() {
+                let binding_num = next_extra_binding;
+                next_extra_binding += 1;
+                let name = format!("uav_tex{idx}");
+                let g = module.global_variables.append(
+                    GlobalVariable {
+                        name: Some(name.clone()),
+                        space: AddressSpace::Handle,
+                        binding: Some(ResourceBinding {
+                            group: 0,
+                            binding: binding_num,
+                        }),
+                        ty: storage_tex_ty,
+                        init: None,
+                        memory_decorations: MemoryDecorations::empty(),
+                    },
+                    Span::UNDEFINED,
+                );
+                storage_tex_globals.insert(srsrc, g);
+                emitted_bindings.push(WgslBindingInfo {
+                    group: 0,
+                    binding: binding_num,
+                    kind: "storage-texture",
+                    name,
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                });
+            }
+        }
+
+        let lds_global = if plan.uses_lds && plan.stage == ShaderStage::Compute {
+            let lds_arr_ty = insert_type(
+                &mut module,
+                None,
+                TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Constant(
+                        NonZeroU32::new(LDS_WORKGROUP_DWORDS).unwrap_or(NonZeroU32::MIN),
+                    ),
+                    stride: 4,
+                },
+            );
+            Some(module.global_variables.append(
+                GlobalVariable {
+                    name: Some("lds".to_string()),
+                    space: AddressSpace::WorkGroup,
+                    binding: None,
+                    ty: lds_arr_ty,
+                    init: None,
+                    memory_decorations: MemoryDecorations::empty(),
+                },
+                Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
         emitted_bindings.sort_by_key(|b| (b.group, b.binding));
 
         let mut func = Function {
@@ -1774,7 +2324,17 @@ impl IrEmitter {
             }
             ShaderStage::Compute => {
                 func.arguments.push(FunctionArgument {
-                    name: Some("gid".to_string()),
+                    name: Some("local_id".to_string()),
+                    ty: vec3_u32_ty,
+                    binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationId)),
+                });
+                func.arguments.push(FunctionArgument {
+                    name: Some("wg_id".to_string()),
+                    ty: vec3_u32_ty,
+                    binding: Some(Binding::BuiltIn(BuiltIn::WorkGroupId)),
+                });
+                func.arguments.push(FunctionArgument {
+                    name: Some("global_id".to_string()),
                     ty: vec3_u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::GlobalInvocationId)),
                 });
@@ -1840,8 +2400,13 @@ impl IrEmitter {
             cb_globals,
             tex_globals,
             samp_globals,
+            storage_buf_globals,
+            storage_tex_globals,
+            lds_global,
             emitted_bindings,
             stage: plan.stage,
+            workgroup_size: plan.workgroup_size,
+            compute_seed_wg_sgprs: plan.compute_seed_wg_sgprs.clone(),
             func,
             vgpr_locals,
             sgpr_locals,
@@ -2229,15 +2794,31 @@ impl IrEmitter {
                 }
             }
             ShaderStage::Compute => {
-                let gid = self.raw_expr(Expression::FunctionArgument(0));
+                // Seed GFX10.3 compute thread ID VGPRs: v0 = local_id.x, v1 = local_id.y, v2 = local_id.z.
+                // (For 1D workgroups `(X, 1, 1)`, `local_id.x` is identical to the packed 1D thread ID.)
+                let local_id = self.raw_expr(Expression::FunctionArgument(0));
                 for c in 0..3u32 {
                     let reg = c as u8;
                     if self.vgpr_locals.contains_key(&reg) {
                         let comp = self.emit_expr(Expression::AccessIndex {
-                            base: gid,
+                            base: local_id,
                             index: c,
                         });
                         self.store_vgpr_u32(reg, comp);
+                    }
+                }
+                // Seed compute workgroup ID SGPRs (`s0`/`s1`/`s2` or configured base) when not overwritten.
+                if !self.compute_seed_wg_sgprs.is_empty() {
+                    let wg_id = self.raw_expr(Expression::FunctionArgument(1));
+                    let seed_list = self.compute_seed_wg_sgprs.clone();
+                    for (reg, comp_idx) in seed_list {
+                        if self.sgpr_locals.contains_key(&reg) {
+                            let comp = self.emit_expr(Expression::AccessIndex {
+                                base: wg_id,
+                                index: comp_idx,
+                            });
+                            self.store_sgpr_u32(reg, comp);
+                        }
                     }
                 }
             }
@@ -2743,11 +3324,41 @@ impl IrEmitter {
                 ..
             } => self.translate_mimg(*op, *dmask, *vaddr, *vdata, *srsrc, *ssamp),
             Rdna2Detail::Mubuf {
-                op, offset, vdata, ..
-            } => self.translate_vertex_buf_fetch(false, *op, *offset, *vdata),
+                op,
+                offset,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                srsrc,
+                soffset,
+                ..
+            } => self.translate_mubuf_or_mtbuf(
+                false, *op, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+            ),
             Rdna2Detail::Mtbuf {
-                op, offset, vdata, ..
-            } => self.translate_vertex_buf_fetch(true, *op, *offset, *vdata),
+                op,
+                offset,
+                offen,
+                idxen,
+                vaddr,
+                vdata,
+                srsrc,
+                soffset,
+                ..
+            } => self.translate_mubuf_or_mtbuf(
+                true, *op, *offset, *offen, *idxen, *vaddr, *vdata, *srsrc, *soffset,
+            ),
+            Rdna2Detail::Ds {
+                op,
+                offset0,
+                offset1,
+                addr,
+                data0,
+                data1,
+                vdst,
+                ..
+            } => self.translate_ds(*op, *offset0, *offset1, *addr, *data0, *data1, *vdst),
             Rdna2Detail::Exp {
                 target,
                 en,
@@ -2755,9 +3366,7 @@ impl IrEmitter {
                 vsrc,
                 ..
             } => self.translate_exp(*target, *en, *compr, *vsrc),
-            Rdna2Detail::Flat { .. }
-            | Rdna2Detail::Ds { .. }
-            | Rdna2Detail::Unknown { .. } => false,
+            Rdna2Detail::Flat { .. } | Rdna2Detail::Unknown { .. } => false,
         };
 
         if handled {
@@ -5356,6 +5965,55 @@ impl IrEmitter {
         let Some(layout) = mimg_addr_layout(op) else {
             return false;
         };
+
+        if layout.is_store {
+            if self.stage == ShaderStage::Vertex {
+                return false;
+            }
+            let Some(&uav_tex_global) = self
+                .storage_tex_globals
+                .get(&srsrc)
+                .or_else(|| self.storage_tex_globals.values().next())
+            else {
+                return false;
+            };
+            let image = self.raw_expr(Expression::GlobalVariable(uav_tex_global));
+            let ux = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
+            let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let ix = self.bitcast_f32_to_i32(ux);
+            let iy = self.bitcast_f32_to_i32(uy);
+            let coord = self.emit_expr(Expression::Compose {
+                ty: self.types.vec2_i32_ty,
+                components: vec![ix, iy],
+            });
+
+            let eff_mask = if dmask == 0 { 0xF } else { dmask };
+            let mut src_offset = 0u8;
+            let mut comps = Vec::with_capacity(4);
+            for ch in 0..4u32 {
+                if (eff_mask & (1 << ch)) != 0 {
+                    comps.push(self.load_vgpr_f32(vdata.saturating_add(src_offset)));
+                    src_offset = src_offset.saturating_add(1);
+                } else {
+                    comps.push(self.lit_f32(if ch == 3 { 1.0 } else { 0.0 }));
+                }
+            }
+            let val = self.emit_expr(Expression::Compose {
+                ty: self.types.vec4_f32_ty,
+                components: comps,
+            });
+            self.func.body.push(
+                Statement::ImageStore {
+                    image,
+                    coordinate: coord,
+                    array_index: None,
+                    value: val,
+                },
+                Span::UNDEFINED,
+            );
+            return true;
+        }
+
         let Some(&tex_global) = self
             .tex_globals
             .get(&srsrc)
@@ -5496,7 +6154,486 @@ impl IrEmitter {
         true
     }
 
-    // -- MUBUF / MTBUF vertex attribute fetch helper --
+    // -- MUBUF / MTBUF vertex attribute fetch & storage buffer load/store helpers --
+
+    #[allow(clippy::too_many_arguments)]
+    fn translate_mubuf_or_mtbuf(
+        &mut self,
+        is_mtbuf: bool,
+        op: u8,
+        byte_offset: u16,
+        offen: bool,
+        idxen: bool,
+        vaddr: u8,
+        vdata: u8,
+        srsrc: u8,
+        soffset: u8,
+    ) -> bool {
+        if self.stage == ShaderStage::Vertex {
+            return self.translate_vertex_buf_fetch(is_mtbuf, op, byte_offset, vdata);
+        }
+        self.translate_storage_buf_op(
+            is_mtbuf,
+            op,
+            byte_offset,
+            offen,
+            idxen,
+            vaddr,
+            vdata,
+            srsrc,
+            soffset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn translate_storage_buf_op(
+        &mut self,
+        is_mtbuf: bool,
+        op: u8,
+        byte_offset: u16,
+        offen: bool,
+        idxen: bool,
+        vaddr: u8,
+        vdata: u8,
+        srsrc: u8,
+        soffset: u8,
+    ) -> bool {
+        let Some(buf_op) = (if is_mtbuf {
+            mtbuf_storage_op(op)
+        } else {
+            mubuf_storage_op(op)
+        }) else {
+            return false;
+        };
+        let Some(&(buf_global, writable)) = self
+            .storage_buf_globals
+            .get(&srsrc)
+            .or_else(|| self.storage_buf_globals.values().next())
+        else {
+            return false;
+        };
+        if buf_op.is_store() && !writable {
+            return false;
+        }
+
+        // Compute effective byte address: vaddr_contrib + soffset + imm_offset
+        let mut byte_addr: Option<Handle<Expression>> = None;
+        let stride = buf_op.elem_stride_bytes();
+        if offen && idxen {
+            let idx_f = self.load_vgpr_f32(vaddr);
+            let idx_u = self.bitcast_f32_to_u32(idx_f);
+            let stride_lit = self.lit_u32(stride);
+            let idx_bytes = self.emit_expr(Expression::Binary {
+                op: BinaryOperator::Multiply,
+                left: idx_u,
+                right: stride_lit,
+            });
+            let off_f = self.load_vgpr_f32(vaddr.saturating_add(1));
+            let off_u = self.bitcast_f32_to_u32(off_f);
+            let sum = self.emit_expr(Expression::Binary {
+                op: BinaryOperator::Add,
+                left: idx_bytes,
+                right: off_u,
+            });
+            byte_addr = Some(sum);
+        } else if offen {
+            let off_f = self.load_vgpr_f32(vaddr);
+            byte_addr = Some(self.bitcast_f32_to_u32(off_f));
+        } else if idxen {
+            let idx_f = self.load_vgpr_f32(vaddr);
+            let idx_u = self.bitcast_f32_to_u32(idx_f);
+            if stride == 1 {
+                byte_addr = Some(idx_u);
+            } else {
+                let stride_lit = self.lit_u32(stride);
+                byte_addr = Some(self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Multiply,
+                    left: idx_u,
+                    right: stride_lit,
+                }));
+            }
+        }
+
+        let soff_expr = if soffset <= 105 {
+            Some(self.load_sgpr_u32(soffset))
+        } else if (129..=208).contains(&soffset) {
+            Some(self.read_src_u32(u16::from(soffset), None))
+        } else {
+            None
+        };
+        if let Some(se) = soff_expr {
+            byte_addr = Some(match byte_addr {
+                Some(cur) => self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: cur,
+                    right: se,
+                }),
+                None => se,
+            });
+        }
+
+        if byte_offset != 0 {
+            let imm = self.lit_u32(u32::from(byte_offset));
+            byte_addr = Some(match byte_addr {
+                Some(cur) => self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::Add,
+                    left: cur,
+                    right: imm,
+                }),
+                None => imm,
+            });
+        }
+
+        let eff_byte_addr = byte_addr.unwrap_or_else(|| self.lit_u32(0));
+        let two = self.lit_u32(2);
+        let base_dword = self.emit_expr(Expression::Binary {
+            op: BinaryOperator::ShiftRight,
+            left: eff_byte_addr,
+            right: two,
+        });
+
+        let buf_ptr = self.raw_expr(Expression::GlobalVariable(buf_global));
+        let buf_len = self.emit_expr(Expression::ArrayLength(buf_ptr));
+        let one = self.lit_u32(1);
+        let clamped_len = self.emit_expr(Expression::Math {
+            fun: MathFunction::Max,
+            arg: buf_len,
+            arg1: Some(one),
+            arg2: None,
+            arg3: None,
+        });
+        let max_idx = self.emit_expr(Expression::Binary {
+            op: BinaryOperator::Subtract,
+            left: clamped_len,
+            right: one,
+        });
+
+        match buf_op {
+            StorageBufOpKind::LoadUbyte | StorageBufOpKind::LoadSbyte => {
+                let safe_idx = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Min,
+                    arg: base_dword,
+                    arg1: Some(max_idx),
+                    arg2: None,
+                    arg3: None,
+                });
+                let elem_ptr = self.emit_expr(Expression::Access {
+                    base: buf_ptr,
+                    index: safe_idx,
+                });
+                let word = self.emit_expr(Expression::Load { pointer: elem_ptr });
+                let mask3 = self.lit_u32(3);
+                let byte_lane = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: eff_byte_addr,
+                    right: mask3,
+                });
+                let three = self.lit_u32(3);
+                let bit_shift = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: byte_lane,
+                    right: three,
+                });
+                let shifted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: word,
+                    right: bit_shift,
+                });
+                if buf_op == StorageBufOpKind::LoadUbyte {
+                    let mask_ff = self.lit_u32(0xFF);
+                    let val = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: shifted,
+                        right: mask_ff,
+                    });
+                    self.store_vgpr_u32(vdata, val);
+                } else {
+                    let s_raw = self.bitcast_u32_to_i32(shifted);
+                    let sh24 = self.lit_u32(24);
+                    let shl = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftLeft,
+                        left: s_raw,
+                        right: sh24,
+                    });
+                    let sext = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftRight,
+                        left: shl,
+                        right: sh24,
+                    });
+                    self.store_vgpr_i32(vdata, sext);
+                }
+                true
+            }
+            StorageBufOpKind::LoadUshort | StorageBufOpKind::LoadSshort => {
+                let safe_idx = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Min,
+                    arg: base_dword,
+                    arg1: Some(max_idx),
+                    arg2: None,
+                    arg3: None,
+                });
+                let elem_ptr = self.emit_expr(Expression::Access {
+                    base: buf_ptr,
+                    index: safe_idx,
+                });
+                let word = self.emit_expr(Expression::Load { pointer: elem_ptr });
+                let mask2 = self.lit_u32(2);
+                let half_lane = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::And,
+                    left: eff_byte_addr,
+                    right: mask2,
+                });
+                let three = self.lit_u32(3);
+                let bit_shift = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftLeft,
+                    left: half_lane,
+                    right: three,
+                });
+                let shifted = self.emit_expr(Expression::Binary {
+                    op: BinaryOperator::ShiftRight,
+                    left: word,
+                    right: bit_shift,
+                });
+                if buf_op == StorageBufOpKind::LoadUshort {
+                    let mask_ffff = self.lit_u32(0xFFFF);
+                    let val = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: shifted,
+                        right: mask_ffff,
+                    });
+                    self.store_vgpr_u32(vdata, val);
+                } else {
+                    let s_raw = self.bitcast_u32_to_i32(shifted);
+                    let sh16 = self.lit_u32(16);
+                    let shl = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftLeft,
+                        left: s_raw,
+                        right: sh16,
+                    });
+                    let sext = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftRight,
+                        left: shl,
+                        right: sh16,
+                    });
+                    self.store_vgpr_i32(vdata, sext);
+                }
+                true
+            }
+            StorageBufOpKind::LoadDwords(comps) => {
+                let mut loaded = Vec::with_capacity(usize::from(comps));
+                for k in 0..comps {
+                    let idx_k = if k == 0 {
+                        base_dword
+                    } else {
+                        let k_lit = self.lit_u32(u32::from(k));
+                        self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: base_dword,
+                            right: k_lit,
+                        })
+                    };
+                    let safe_idx = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: idx_k,
+                        arg1: Some(max_idx),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    let elem_ptr = self.emit_expr(Expression::Access {
+                        base: buf_ptr,
+                        index: safe_idx,
+                    });
+                    loaded.push(self.emit_expr(Expression::Load { pointer: elem_ptr }));
+                }
+                for (k, word) in loaded.into_iter().enumerate() {
+                    self.store_vgpr_u32(vdata.saturating_add(k as u8), word);
+                }
+                true
+            }
+            StorageBufOpKind::StoreDwords(comps) => {
+                for k in 0..comps {
+                    let idx_k = if k == 0 {
+                        base_dword
+                    } else {
+                        let k_lit = self.lit_u32(u32::from(k));
+                        self.emit_expr(Expression::Binary {
+                            op: BinaryOperator::Add,
+                            left: base_dword,
+                            right: k_lit,
+                        })
+                    };
+                    let safe_idx = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: idx_k,
+                        arg1: Some(max_idx),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    let elem_ptr = self.emit_expr(Expression::Access {
+                        base: buf_ptr,
+                        index: safe_idx,
+                    });
+                    let vf = self.load_vgpr_f32(vdata.saturating_add(k));
+                    let vu = self.bitcast_f32_to_u32(vf);
+                    self.func.body.push(
+                        Statement::Store {
+                            pointer: elem_ptr,
+                            value: vu,
+                        },
+                        Span::UNDEFINED,
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    // -- DS (LDS Workgroup Shared Memory) --
+
+    fn lds_masked_dword_index(
+        &mut self,
+        base_addr_u32: Handle<Expression>,
+        byte_offset: u32,
+    ) -> Handle<Expression> {
+        let eff_addr = if byte_offset == 0 {
+            base_addr_u32
+        } else {
+            let off_lit = self.lit_u32(byte_offset);
+            self.emit_expr(Expression::Binary {
+                op: BinaryOperator::Add,
+                left: base_addr_u32,
+                right: off_lit,
+            })
+        };
+        let two = self.lit_u32(2);
+        let dword_idx = self.emit_expr(Expression::Binary {
+            op: BinaryOperator::ShiftRight,
+            left: eff_addr,
+            right: two,
+        });
+        let mask = self.lit_u32(LDS_WORKGROUP_INDEX_MASK);
+        self.emit_expr(Expression::Binary {
+            op: BinaryOperator::And,
+            left: dword_idx,
+            right: mask,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn translate_ds(
+        &mut self,
+        op: u8,
+        offset0: u8,
+        offset1: u8,
+        addr: u8,
+        data0: u8,
+        data1: u8,
+        vdst: u8,
+    ) -> bool {
+        if self.stage != ShaderStage::Compute {
+            return false;
+        }
+        let Some(lds_global) = self.lds_global else {
+            return false;
+        };
+        let Some(lds_op) = ds_lds_op(op) else {
+            return false;
+        };
+
+        let lds_ptr = self.raw_expr(Expression::GlobalVariable(lds_global));
+        let addr_f = self.load_vgpr_f32(addr);
+        let addr_u = self.bitcast_f32_to_u32(addr_f);
+
+        match lds_op {
+            DsLdsOp::ReadContiguous(n) => {
+                let imm16 = u32::from(offset0) | (u32::from(offset1) << 8);
+                let mut loaded = Vec::with_capacity(usize::from(n));
+                for k in 0..n {
+                    let idx = self.lds_masked_dword_index(addr_u, imm16.saturating_add(u32::from(k) * 4));
+                    let elem_ptr = self.emit_expr(Expression::Access {
+                        base: lds_ptr,
+                        index: idx,
+                    });
+                    loaded.push(self.emit_expr(Expression::Load { pointer: elem_ptr }));
+                }
+                for (k, word) in loaded.into_iter().enumerate() {
+                    self.store_vgpr_u32(vdst.saturating_add(k as u8), word);
+                }
+                true
+            }
+            DsLdsOp::WriteContiguous(n) => {
+                let imm16 = u32::from(offset0) | (u32::from(offset1) << 8);
+                for k in 0..n {
+                    let idx = self.lds_masked_dword_index(addr_u, imm16.saturating_add(u32::from(k) * 4));
+                    let elem_ptr = self.emit_expr(Expression::Access {
+                        base: lds_ptr,
+                        index: idx,
+                    });
+                    let vf = self.load_vgpr_f32(data0.saturating_add(k));
+                    let vu = self.bitcast_f32_to_u32(vf);
+                    self.func.body.push(
+                        Statement::Store {
+                            pointer: elem_ptr,
+                            value: vu,
+                        },
+                        Span::UNDEFINED,
+                    );
+                }
+                true
+            }
+            DsLdsOp::Read2 { stride_bytes } => {
+                let idx0 = self.lds_masked_dword_index(addr_u, u32::from(offset0) * stride_bytes);
+                let ptr0 = self.emit_expr(Expression::Access {
+                    base: lds_ptr,
+                    index: idx0,
+                });
+                let w0 = self.emit_expr(Expression::Load { pointer: ptr0 });
+
+                let idx1 = self.lds_masked_dword_index(addr_u, u32::from(offset1) * stride_bytes);
+                let ptr1 = self.emit_expr(Expression::Access {
+                    base: lds_ptr,
+                    index: idx1,
+                });
+                let w1 = self.emit_expr(Expression::Load { pointer: ptr1 });
+
+                self.store_vgpr_u32(vdst, w0);
+                self.store_vgpr_u32(vdst.saturating_add(1), w1);
+                true
+            }
+            DsLdsOp::Write2 { stride_bytes } => {
+                let idx0 = self.lds_masked_dword_index(addr_u, u32::from(offset0) * stride_bytes);
+                let ptr0 = self.emit_expr(Expression::Access {
+                    base: lds_ptr,
+                    index: idx0,
+                });
+                let vf0 = self.load_vgpr_f32(data0);
+                let vu0 = self.bitcast_f32_to_u32(vf0);
+                self.func.body.push(
+                    Statement::Store {
+                        pointer: ptr0,
+                        value: vu0,
+                    },
+                    Span::UNDEFINED,
+                );
+
+                let idx1 = self.lds_masked_dword_index(addr_u, u32::from(offset1) * stride_bytes);
+                let ptr1 = self.emit_expr(Expression::Access {
+                    base: lds_ptr,
+                    index: idx1,
+                });
+                let vf1 = self.load_vgpr_f32(data1);
+                let vu1 = self.bitcast_f32_to_u32(vf1);
+                self.func.body.push(
+                    Statement::Store {
+                        pointer: ptr1,
+                        value: vu1,
+                    },
+                    Span::UNDEFINED,
+                );
+                true
+            }
+        }
+    }
 
     fn translate_vertex_buf_fetch(
         &mut self,
@@ -5788,7 +6925,7 @@ impl IrEmitter {
         let (naga_stage, workgroup_size) = match self.stage {
             ShaderStage::Vertex => (NagaStage::Vertex, [0, 0, 0]),
             ShaderStage::Fragment => (NagaStage::Fragment, [0, 0, 0]),
-            ShaderStage::Compute => (NagaStage::Compute, [64, 1, 1]),
+            ShaderStage::Compute => (NagaStage::Compute, self.workgroup_size),
         };
 
         self.module.entry_points.push(EntryPoint {
@@ -5895,6 +7032,9 @@ pub fn translate_rdna2_to_wgsl(
         cbv_vec4_count: plan.cbv_vec4_count,
         has_texture_2d: !plan.tex_slots.is_empty(),
         has_sampler: !plan.samp_slots.is_empty(),
+        has_storage_buffer: !plan.storage_buf_slots.is_empty(),
+        has_storage_texture: !plan.storage_tex_slots.is_empty(),
+        has_lds: plan.uses_lds,
         vertex_input_mode: plan.vertex_input_mode.as_str().to_string(),
         fragment_input_locations: plan.frag_attrs.iter().map(|&a| u32::from(a)).collect(),
         output_locations,
@@ -7449,5 +8589,289 @@ mod tests {
             out_large.wgsl
         );
         assert_naga_wgsl_valid(&out_large.wgsl);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_mubuf_full(
+        op: u8,
+        offset: u16,
+        offen: bool,
+        idxen: bool,
+        vaddr: u8,
+        vdata: u8,
+        srsrc: u8,
+        soffset: u8,
+    ) -> [u32; 2] {
+        let w0 = (0b111000u32 << 26)
+            | (u32::from(op & 0x7F) << 18)
+            | (u32::from(idxen) << 13)
+            | (u32::from(offen) << 12)
+            | u32::from(offset & 0xFFF);
+        let w1 = (u32::from(soffset) << 24)
+            | (u32::from(srsrc & 0x1F) << 16)
+            | (u32::from(vdata) << 8)
+            | u32::from(vaddr);
+        [w0, w1]
+    }
+
+    fn enc_ds(op: u8, offset0: u8, offset1: u8, addr: u8, data0: u8, data1: u8, vdst: u8) -> [u32; 2] {
+        let w0 = (0b110110u32 << 26)
+            | (u32::from(op) << 18)
+            | (u32::from(offset1) << 8)
+            | u32::from(offset0);
+        let w1 = (u32::from(vdst) << 24)
+            | (u32::from(data1) << 16)
+            | (u32::from(data0) << 8)
+            | u32::from(addr);
+        [w0, w1]
+    }
+
+    #[test]
+    fn translates_compute_buffer_copy_transform_with_storage_bindings_and_bounds_clamping() {
+        // Compute shader: global_idx = (wg_id.x << 6) + local_id.x, byte_off = global_idx << 4
+        //   v_lshl_add_u32 v3, s0, 6, v0          ; s0 seeded from wg_id.x, v0 from local_id.x
+        //   v_lshlrev_b32  v3, 4, v3              ; byte offset = global_idx * 16
+        //   buffer_load_dwordx4 v[4:7], v3, s[4:7], 0 offen          (srsrc=1 -> read-only-storage)
+        //   buffer_load_ubyte   v8,     v3, s[4:7], 0 offen offset:2 (srsrc=1 -> read-only-storage)
+        //   buffer_load_ushort  v9,     v3, s[4:7], 0 offen offset:4 (srsrc=1 -> read-only-storage)
+        //   v_add_f32 v4, v4, 1.0
+        //   v_mul_f32 v5, v5, 2.0
+        //   v_add_nc_u32 v6, v6, v8
+        //   v_add_nc_u32 v7, v7, v9
+        //   buffer_store_dwordx4 v[4:7], v3, s[8:11], 0 offen        (srsrc=2 -> storage)
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_vop3(0x346, 3, 0, 128 + 6, 256 + 0, false, 0, 0, 0)); // v_lshl_add_u32 v3, s0, 6, v0
+        words.push(enc_vop2(0x18, 3, 128 + 4, 3)); // v_lshlrev_b32 v3, 4, v3
+        words.extend_from_slice(&enc_mubuf_full(0x0E, 0, true, false, 3, 4, 1, 128)); // buffer_load_dwordx4
+        words.extend_from_slice(&enc_mubuf_full(0x08, 2, true, false, 3, 8, 1, 128)); // buffer_load_ubyte
+        words.extend_from_slice(&enc_mubuf_full(0x0A, 4, true, false, 3, 9, 1, 128)); // buffer_load_ushort
+        words.push(enc_vop2(0x03, 4, 242, 4)); // v_add_f32 v4, 1.0, v4
+        words.push(enc_vop2(0x08, 5, 244, 5)); // v_mul_f32 v5, 2.0, v5
+        words.push(enc_vop2(0x25, 6, 256 + 8, 6)); // v_add_nc_u32 v6, v8, v6
+        words.push(enc_vop2(0x25, 7, 256 + 9, 7)); // v_add_nc_u32 v7, v9, v7
+        words.extend_from_slice(&enc_mubuf_full(0x1E, 0, true, false, 3, 4, 2, 128)); // buffer_store_dwordx4
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("compute buffer copy/transform shader must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.entry_point, "cs_main");
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.binding_summary.has_storage_buffer);
+        assert!(!out.binding_summary.has_storage_texture);
+        assert!(!out.binding_summary.has_lds);
+        assert_eq!(
+            out.bindings,
+            vec![
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 3,
+                    kind: "read-only-storage",
+                    name: "sbuf0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 4,
+                    kind: "storage",
+                    name: "uav_buf0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                },
+            ]
+        );
+
+        assert!(out.wgsl.contains("@compute @workgroup_size(64, 1, 1)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@builtin(local_invocation_id) local_id: vec3<u32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@builtin(workgroup_id) wg_id: vec3<u32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@builtin(global_invocation_id) global_id: vec3<u32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("var<storage> sbuf0_: array<u32>") || out.wgsl.contains("var<storage, read> sbuf0_: array<u32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("var<storage, read_write> uav_buf0_: array<u32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("arrayLength("), "expected bounds clamping via arrayLength:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("var<workgroup>"), "must NOT emit LDS when no DS ops exist:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("enable f16"), "must not emit enable f16");
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        let json = out.to_json();
+        assert!(json.contains("\"kind\": \"read-only-storage\""), "JSON:\n{json}");
+        assert!(json.contains("\"kind\": \"storage\""), "JSON:\n{json}");
+        assert!(json.contains("\"has_storage_buffer\": true"), "JSON:\n{json}");
+    }
+
+    #[test]
+    fn translates_compute_texture_filter_with_image_sample_lz_and_image_store() {
+        // Compute 2D texture filter (workgroup_size 8x8x1):
+        //   v_cvt_f32_u32 v4, v0   ; u = f32(local_id.x)
+        //   v_cvt_f32_u32 v5, v1   ; v = f32(local_id.y)
+        //   image_sample_lz v[6:9], v[4:5], s[8:15], s[4:7] dmask:0xf dim:1
+        //   s_waitcnt vmcnt(0)
+        //   v_mul_f32 v6, v6, 0.5
+        //   image_store v[6:9], v[0:1], s[16:23] dmask:0xf dim:1
+        //   image_store_mip v[6:9], v[0:2], s[16:23] dmask:0xf dim:1
+        //   s_endpgm
+        let mut words = Vec::new();
+        words.push(enc_vop1(0x06, 4, 256 + 0));
+        words.push(enc_vop1(0x06, 5, 256 + 1));
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 4, 6, 2, 1)); // image_sample_lz -> tex0@1, samp0@2
+        words.push(enc_sopp(0x0C, 0x3F70));
+        words.push(enc_vop2(0x08, 6, 240, 6));
+        words.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 6, 4, 0)); // image_store -> uav_tex0@3
+        words.extend_from_slice(&enc_mimg(0x09, 0xF, 1, 0, 6, 4, 0)); // image_store_mip -> uav_tex0@3
+        words.push(enc_sopp(0x01, 0));
+
+        let opts = Rdna2TranslateOptions {
+            workgroup_size: [8, 8, 1],
+            ..Rdna2TranslateOptions::default()
+        };
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &opts)
+            .expect("compute texture filter shader must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.entry_point, "cs_main");
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.binding_summary.has_texture_2d);
+        assert!(out.binding_summary.has_sampler);
+        assert!(out.binding_summary.has_storage_texture);
+        assert!(!out.binding_summary.has_lds);
+        assert_eq!(
+            out.bindings,
+            vec![
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 1,
+                    kind: "texture_2d",
+                    name: "tex0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 2,
+                    kind: "sampler",
+                    name: "samp0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                },
+                WgslBindingInfo {
+                    group: 0,
+                    binding: 3,
+                    kind: "storage-texture",
+                    name: "uav_tex0".to_string(),
+                    min_binding_size_bytes: None,
+                    highest_vec4_offset: None,
+                },
+            ]
+        );
+
+        assert!(out.wgsl.contains("@compute @workgroup_size(8, 8, 1)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("texture_2d<f32>"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("texture_storage_2d<rgba8unorm,write>")
+                || out.wgsl.contains("texture_storage_2d<rgba8unorm, write>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("textureSampleLevel("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("textureStore("), "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("enable f16"));
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        let json = out.to_json();
+        assert!(json.contains("\"kind\": \"storage-texture\""), "JSON:\n{json}");
+        assert!(json.contains("\"has_storage_texture\": true"), "JSON:\n{json}");
+    }
+
+    #[test]
+    fn translates_compute_lds_reduction_exchange_with_barrier_and_buffer_store() {
+        // Compute LDS reduction/exchange covering ds_write_b32, ds_write2_b32, ds_write_b64,
+        // ds_write_b128, s_barrier, ds_read_b32, ds_read2_b32, ds_read_b64, ds_read_b128,
+        // and buffer_store_dword{,x2,x3,x4}:
+        let mut words = Vec::new();
+        words.push(enc_vop2(0x18, 3, 128 + 2, 0)); // v_lshlrev_b32 v3, 2, v0 (byte addr = local_id.x * 4)
+        words.push(enc_vop1(0x01, 4, 242)); // v4 = 1.0
+        words.push(enc_vop1(0x01, 5, 244)); // v5 = 2.0
+        words.push(enc_vop1(0x01, 6, 240)); // v6 = 0.5
+        words.push(enc_vop1(0x01, 7, 246)); // v7 = 4.0
+        words.extend_from_slice(&enc_ds(0x0D, 0, 0, 3, 4, 0, 0)); // ds_write_b32
+        words.extend_from_slice(&enc_ds(0x0E, 1, 2, 3, 4, 5, 0)); // ds_write2_b32
+        words.extend_from_slice(&enc_ds(0x4D, 16, 0, 3, 4, 0, 0)); // ds_write_b64
+        words.extend_from_slice(&enc_ds(0xDF, 32, 0, 3, 4, 0, 0)); // ds_write_b128
+        words.push(enc_sopp(0x0A, 0)); // s_barrier
+        words.extend_from_slice(&enc_ds(0x36, 0, 0, 3, 0, 0, 8)); // ds_read_b32 -> v8
+        words.extend_from_slice(&enc_ds(0x37, 1, 2, 3, 0, 0, 9)); // ds_read2_b32 -> v9..v10
+        words.extend_from_slice(&enc_ds(0x76, 16, 0, 3, 0, 0, 11)); // ds_read_b64 -> v11..v12
+        words.extend_from_slice(&enc_ds(0xFF, 32, 0, 3, 0, 0, 13)); // ds_read_b128 -> v13..v16
+        words.push(enc_vop2(0x03, 8, 256 + 9, 8)); // v_add_f32 v8, v9, v8
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 3, 8, 1, 128)); // buffer_store_dword
+        words.extend_from_slice(&enc_mubuf_full(0x1D, 16, true, false, 3, 11, 1, 128)); // buffer_store_dwordx2
+        words.extend_from_slice(&enc_mubuf_full(0x1F, 32, true, false, 3, 13, 1, 128)); // buffer_store_dwordx3
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 3, 17, 1, 128)); // buffer_load_dword on same UAV
+        words.extend_from_slice(&enc_mubuf_full(0x0D, 8, true, false, 3, 18, 2, 128)); // buffer_load_dwordx2 on SRV
+        words.extend_from_slice(&enc_mubuf_full(0x0F, 16, true, false, 3, 20, 2, 128)); // buffer_load_dwordx3 on SRV
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let out = translate_rdna2_to_wgsl(&bytes, &Rdna2TranslateOptions::default())
+            .expect("compute LDS reduction shader must translate cleanly");
+
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.entry_point, "cs_main");
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.binding_summary.has_lds);
+        assert!(out.binding_summary.has_storage_buffer);
+        // srsrc=1 has both loads and stores -> merged into a single read_write `storage` binding.
+        // srsrc=2 has only loads -> `read-only-storage` binding.
+        assert_eq!(out.bindings.len(), 2);
+        assert_eq!(out.bindings[0].kind, "storage");
+        assert_eq!(out.bindings[1].kind, "read-only-storage");
+
+        assert!(out.wgsl.contains("var<workgroup> lds: array<u32, 4096>;"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("workgroupBarrier();"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("4095u"), "expected safe 4095u LDS index mask:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("enable f16"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn compute_workgroup_id_sgprs_respect_user_data_overwrite_and_custom_base() {
+        // Case A: s0 overwritten by s_mov_b32 before read -> must NOT seed s_0 = wg_id.x,
+        // while s1 is read before write -> MUST seed s_1 = wg_id.y.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 0, 128 + 42)); // s_mov_b32 s0, 42 (overwrites s0)
+        words.push(enc_sop2(0x00, 3, 0, 1)); // s_add_u32 s3, s0, s1 (reads s1 before write)
+        words.push(enc_vop1(0x01, 4, 3)); // v_mov_b32 v4, s3
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 4, 1, 128));
+        words.push(enc_sopp(0x01, 0));
+
+        let out_a = translate_rdna2_to_wgsl(&words_to_bytes(&words), &Rdna2TranslateOptions::default())
+            .expect("compute shader should translate cleanly");
+        assert!(out_a.naga_validated);
+        assert!(!out_a.wgsl.contains("s_0_ = wg_id.x"), "WGSL:\n{}", out_a.wgsl);
+        assert!(out_a.wgsl.contains("s_1_ = wg_id.y"), "WGSL:\n{}", out_a.wgsl);
+        assert_naga_wgsl_valid(&out_a.wgsl);
+
+        // Case B: Custom workgroup_id_sgpr_base = Some(4) -> seeds s4 = wg_id.x.
+        let mut words_b = Vec::new();
+        words_b.push(enc_vop2(0x25, 4, 4, 0)); // v_add_nc_u32 v4, s4, v0
+        words_b.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 4, 1, 128));
+        words_b.push(enc_sopp(0x01, 0));
+
+        let opts_b = Rdna2TranslateOptions {
+            workgroup_id_sgpr_base: Some(4),
+            ..Rdna2TranslateOptions::default()
+        };
+        let out_b = translate_rdna2_to_wgsl(&words_to_bytes(&words_b), &opts_b)
+            .expect("custom wg_id sgpr base compute shader should translate cleanly");
+        assert!(out_b.naga_validated);
+        assert!(out_b.wgsl.contains("s_4_ = wg_id.x"), "WGSL:\n{}", out_b.wgsl);
+        assert_naga_wgsl_valid(&out_b.wgsl);
     }
 }

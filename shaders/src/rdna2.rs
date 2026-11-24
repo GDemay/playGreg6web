@@ -2609,7 +2609,11 @@ fn decode_ds(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
 
     let mut operands = String::new();
     if !truncated {
-        let _ = write!(operands, "v{vdst}, v{addr}, v{data0}");
+        if matches!(op, 0x0E | 0x0F) {
+            let _ = write!(operands, "v{vdst}, v{addr}, v{data0}, v{data1}");
+        } else {
+            let _ = write!(operands, "v{vdst}, v{addr}, v{data0}");
+        }
         if offset0 != 0 {
             let _ = write!(operands, " offset0:{offset0}");
         }
@@ -2970,6 +2974,7 @@ pub fn analyze_instructions(
                 });
             }
             Rdna2Detail::Mubuf {
+                op,
                 vaddr,
                 vdata,
                 srsrc,
@@ -2987,8 +2992,16 @@ pub fn analyze_instructions(
                     let srsrc_sgpr = srsrc.saturating_mul(4);
                     record_sgpr_range(&mut max_sgpr, srsrc_sgpr, 4);
                     record_sgpr(&mut max_sgpr, *soffset);
-                    record_vgpr(&mut max_vgpr, *vdata);
-                    if *offen || *idxen {
+                    let data_count = match *op {
+                        0x01 | 0x05 | 0x0D | 0x1D => 2,
+                        0x02 | 0x06 | 0x0F | 0x1F => 3,
+                        0x03 | 0x07 | 0x0E | 0x1E => 4,
+                        _ => 1,
+                    };
+                    record_vgpr_range(&mut max_vgpr, *vdata, data_count);
+                    if *offen && *idxen {
+                        record_vgpr_range(&mut max_vgpr, *vaddr, 2);
+                    } else if *offen || *idxen {
                         record_vgpr(&mut max_vgpr, *vaddr);
                     }
                     resource_refs.push(Rdna2ResourceRef {
@@ -3043,6 +3056,9 @@ pub fn analyze_instructions(
                 ssamp,
                 ..
             } => {
+                if matches!(*op, 0x08..=0x0B | 0x10..=0x13) {
+                    has_compute_mem = true;
+                }
                 if !inst.truncated {
                     let (_, uses_sampler) = mimg_info(*op);
                     let srsrc_sgpr = srsrc.saturating_mul(4);
@@ -3097,13 +3113,21 @@ pub fn analyze_instructions(
                 }
             }
             Rdna2Detail::Ds {
-                addr, data0, vdst, ..
+                op,
+                addr,
+                data0,
+                data1,
+                vdst,
+                ..
             } => {
                 has_lds = true;
                 has_compute_mem = true;
                 if !inst.truncated {
                     record_vgpr(&mut max_vgpr, *addr);
                     record_vgpr(&mut max_vgpr, *data0);
+                    if matches!(*op, 0x0E | 0x0F) {
+                        record_vgpr(&mut max_vgpr, *data1);
+                    }
                     record_vgpr(&mut max_vgpr, *vdst);
                 }
             }
@@ -4106,5 +4130,68 @@ mod tests {
         assert_eq!(summary.smem_refs.len(), 5);
         assert!(summary.smem_refs.iter().all(|r| r.is_buffer));
         assert_eq!(summary.resource_refs.len(), 6);
+    }
+
+    #[test]
+    fn decodes_compute_storage_buffer_image_store_lds_and_barrier_ops() {
+        let mut words = Vec::new();
+        // buffer_load_dwordx4 v4, v0, s[4:7], 0 offen offset:16
+        let bld_w0 = (0b111000u32 << 26) | (0x0Eu32 << 18) | (1 << 12) | 16;
+        let bld_w1 = (128u32 << 24) | (1u32 << 16) | (4u32 << 8) | 0;
+        words.extend_from_slice(&[bld_w0, bld_w1]);
+        // buffer_load_ubyte v8, v0, s[4:7], 0 offen
+        let bub_w0 = (0b111000u32 << 26) | (0x08u32 << 18) | (1 << 12);
+        let bub_w1 = (128u32 << 24) | (1u32 << 16) | (8u32 << 8) | 0;
+        words.extend_from_slice(&[bub_w0, bub_w1]);
+        // buffer_load_ushort v9, v0, s[4:7], 0 offen
+        let bus_w0 = (0b111000u32 << 26) | (0x0Au32 << 18) | (1 << 12);
+        let bus_w1 = (128u32 << 24) | (1u32 << 16) | (9u32 << 8) | 0;
+        words.extend_from_slice(&[bus_w0, bus_w1]);
+        // ds_write2_b32 v0, v1, v4, v5 offset0:0 offset1:4
+        let dsw2_w0 = (0b110110u32 << 26) | (0x0Eu32 << 18) | (4u32 << 8);
+        let dsw2_w1 = (5u32 << 16) | (4u32 << 8) | 1;
+        words.extend_from_slice(&[dsw2_w0, dsw2_w1]);
+        // s_barrier
+        words.push(enc_sopp(0x0A, 0));
+        // ds_read_b128 v10, v1, v0 offset0:0
+        let dsr128_w0 = (0b110110u32 << 26) | (0xFFu32 << 18);
+        let dsr128_w1 = (10u32 << 24) | 1;
+        words.extend_from_slice(&[dsr128_w0, dsr128_w1]);
+        // buffer_store_dwordx4 v10, v0, s[8:11], 0 offen
+        let bst_w0 = (0b111000u32 << 26) | (0x1Eu32 << 18) | (1 << 12);
+        let bst_w1 = (128u32 << 24) | (2u32 << 16) | (10u32 << 8) | 0;
+        words.extend_from_slice(&[bst_w0, bst_w1]);
+        // image_store v10, v0, s[12:19] dmask:0xf dim:1
+        words.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 10, 3, 0));
+        // image_store_mip v10, v0, s[12:19] dmask:0xf dim:1
+        words.extend_from_slice(&enc_mimg(0x09, 0xF, 1, 0, 10, 3, 0));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 10);
+        assert_eq!(insts[0].mnemonic, "buffer_load_dwordx4");
+        assert_eq!(insts[1].mnemonic, "buffer_load_ubyte");
+        assert_eq!(insts[2].mnemonic, "buffer_load_ushort");
+        assert_eq!(insts[3].mnemonic, "ds_write2_b32");
+        assert!(insts[3].format_text().contains("v4, v5"));
+        assert_eq!(insts[4].mnemonic, "s_barrier");
+        assert_eq!(insts[5].mnemonic, "ds_read_b128");
+        assert_eq!(insts[6].mnemonic, "buffer_store_dwordx4");
+        assert_eq!(insts[7].mnemonic, "image_store");
+        assert_eq!(insts[8].mnemonic, "image_store_mip");
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.inferred_stage, Rdna2InferredStage::Compute);
+        assert!(summary.has_barriers);
+        assert!(summary.has_lds);
+        assert_eq!(summary.truncated_instructions, 0);
+
+        // Standalone image_store-only program must also infer Compute stage.
+        let mut img_only = Vec::new();
+        img_only.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 4, 2, 0));
+        img_only.push(enc_sopp(0x01, 0));
+        let img_summary = analyze_program(&words_to_bytes(&img_only));
+        assert_eq!(img_summary.inferred_stage, Rdna2InferredStage::Compute);
     }
 }
