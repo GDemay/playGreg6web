@@ -619,7 +619,8 @@ public:
         return hr;
     }
 
-    // 10 (D3D12 GetResourceTiling shape; standard 64 KiB tiles)
+    // 10 (D3D12 GetResourceTiling shape; standard 64 KiB tiles, numbered in GFX10 memory order for
+    // the 64KB swizzle modes)
     void GetResourceTiling(GuestPtr<uint32_t> num_tiles, GuestPtr<XgPackedMipInfo> packed,
                            GuestPtr<XgTileShape> shape, GuestPtr<uint32_t> num_tilings, uint32_t first,
                            uint64_t tilings) {
@@ -652,7 +653,24 @@ public:
             per_mip[m] = XgSubresourceTiling{0, 0, 0, kXgPackedTile};
             packed_bytes += layout_.mips[m].slice_size_bytes * (desc_.dimension == 4 ? layout_.mips[m].depth : 1u);
         }
-        const uint32_t packed_tiles = standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, 65536)) : 0;
+        uint32_t packed_tiles = standard < mips ? std::max<uint32_t>(1, ceil_div(packed_bytes, 65536)) : 0;
+        uint32_t packed_start = tiles_per_slice;
+        // GFX10 64KB modes (verified placement): a tile is one 64 KiB block, and the tiles are
+        // numbered in memory order. addrlib puts the mip tail (one block) first and the larger
+        // mips after it smallest-first, so mip 0 has the highest start tile; the title assumes
+        // the tail at tile 0 and reads each mip at its start tile.
+        if (tiled_ && tiled_block_bytes_ == 65536) {
+            namespace gfx10 = playgta6::gpu::gfx10;
+            for (uint32_t m = 0; m < standard; ++m) {
+                per_mip[m].start_tile_index_in_overall_resource =
+                    static_cast<uint32_t>(gfx10::mip_placement(tiled_desc_, m).macro_block_offset / 65536);
+            }
+            if (standard < mips) {
+                packed_tiles = 1;
+                packed_start =
+                    static_cast<uint32_t>(gfx10::mip_placement(tiled_desc_, standard).macro_block_offset / 65536);
+            }
+        }
         const uint32_t slice_tiles = tiles_per_slice + packed_tiles;
 
         if (!num_tiles.is_null()) {
@@ -663,7 +681,7 @@ public:
             p.num_standard_mips = static_cast<uint8_t>(standard);
             p.num_packed_mips = static_cast<uint8_t>(mips - standard);
             p.num_tiles_for_packed_mips = packed_tiles;
-            p.start_tile_index_in_overall_resource = tiles_per_slice;
+            p.start_tile_index_in_overall_resource = packed_start;
             packed.write(p);
         }
         if (!shape.is_null()) {
