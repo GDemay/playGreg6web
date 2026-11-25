@@ -34,7 +34,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # Constants matching shaders/src/dxbc.rs, tools/inspect_wgsl_pack.py,
@@ -187,12 +187,26 @@ _SEARCH_MAGICS: tuple[tuple[bytes, str], ...] = (
     (RAGE_FXC_MAGIC, "rage_fxc"),
 )
 
-# Sanitization patterns (matching tools/preflight.py)
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
-_UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
-_POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+# FNV-1a 64-bit constants (matching shaders/src/pack.rs & tools/inspect_wgsl_pack.py)
+FNV1A_64_OFFSET_BASIS = 0xCBF29CE484222325
+FNV1A_64_PRIME = 0x00000100000001B3
+U64_MAX = 0xFFFFFFFFFFFFFFFF
+
+# Sanitization patterns (matching tools/preflight.py & tools/repo_health.py)
+_WINDOWS_PATH_RE = re.compile(
+    r"[A-Za-z]:[\\/](?:[^\s\"'<>|,;()\[\]:]+(?: +[^\s\"'<>|,;()\[\]:]+)*(?=[\\/])[\\/])*[^\s\"'<>|,;()\[\]:]*"
 )
+_UNC_PATH_RE = re.compile(
+    r"\\\\[^\s\"'<>|,;()\[\]:\\]+(?:[\\/](?:[^\s\"'<>|,;()\[\]:]+(?: +[^\s\"'<>|,;()\[\]:]+)*(?=[\\/])[\\/])*[^\s\"'<>|,;()\[\]:]*)?"
+)
+_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|cygdrive|run)(?:/(?:[^\s\"'<>|,;()\[\]:]+(?: +[^\s\"'<>|,;()\[\]:]+)*(?=/)/)*[^\s\"'<>|,;()\[\]:]*)?"
+)
+_FILE_URI_RE = re.compile(r"file://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_SAFE_SENTINEL_LABELS: frozenset[str] = frozenset(
+    {"<memory>", "<unknown>", "<GTA6_GAME_DIR>", "<path>", "<user>"}
+)
+_HEX_HASH_RE = re.compile(r"^(?:0[xX])?([0-9a-fA-F]+)$")
 _SIZE_SUFFIX_RE = re.compile(r"^\s*(\d+)\s*([kKmMgG](?:i?[bB])?|[bB])?\s*$")
 
 
@@ -259,18 +273,122 @@ def _current_usernames() -> list[str]:
     return names
 
 
-def _scrub_sensitive_text(text: str) -> str:
-    """Remove host absolute paths and current OS usernames from arbitrary text."""
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
-    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
-    for username in _current_usernames():
-        pattern = re.compile(
-            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+def _sensitive_host_paths(extra_paths: Sequence[Path | str] = ()) -> list[str]:
+    """Collect absolute host-specific path prefixes that must never leak in output."""
+    raw_candidates: list[Path] = []
+    for base_fn in (Path.home, Path.cwd):
+        try:
+            p = base_fn()
+            raw_candidates.append(p)
+            raw_candidates.append(p.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+    raw_candidates.append(REPO_ROOT)
+    for item in extra_paths:
+        if not item:
+            continue
+        p = Path(item)
+        if p.is_absolute():
+            raw_candidates.append(p)
+        try:
+            resolved = p.resolve()
+            if resolved.is_absolute():
+                raw_candidates.append(resolved)
+        except (OSError, RuntimeError):
+            pass
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for path in raw_candidates:
+        if not path.is_absolute():
+            continue
+        for text in (str(path), str(path).replace("\\", "/")):
+            cleaned = text.rstrip("\\/")
+            if len(cleaned) < 4 or not any(sep in cleaned for sep in ("/", "\\", ":")):
+                continue
+            key = cleaned.lower() if os.name == "nt" else cleaned
+            if key not in seen:
+                seen.add(key)
+                variants.append(cleaned)
+    variants.sort(key=len, reverse=True)
+    return variants
+
+
+def _compile_host_prefix_patterns(
+    extra_paths: Sequence[Path | str] = (),
+) -> list[re.Pattern[str]]:
+    patterns: list[re.Pattern[str]] = []
+    for host_prefix in _sensitive_host_paths(extra_paths):
+        flags = re.IGNORECASE if (os.name == "nt" or re.match(r"^[A-Za-z]:", host_prefix)) else 0
+        patterns.append(
+            re.compile(
+                rf"{re.escape(host_prefix)}(?:[\\/](?:[^\s\"'<>|,;()\[\]:]+(?: +[^\s\"'<>|,;()\[\]:]+)*(?=[\\/])[\\/])*[^\s\"'<>|,;()\[\]:]*)?",
+                flags,
+            )
+        )
+    return patterns
+
+
+def _compile_username_patterns() -> list[re.Pattern[str]]:
+    return [
+        re.compile(
+            rf"(?<![A-Za-z0-9]){re.escape(username)}(?![A-Za-z0-9])",
             re.IGNORECASE,
         )
-        sanitized = pattern.sub("<user>", sanitized)
+        for username in _current_usernames()
+    ]
+
+
+def _sanitize_text_with_patterns(
+    text: str,
+    prefix_patterns: Sequence[re.Pattern[str]],
+    username_patterns: Sequence[re.Pattern[str]],
+) -> str:
+    if text in _SAFE_SENTINEL_LABELS:
+        return text
+    sanitized = _FILE_URI_RE.sub("<path>", text)
+    for prefix_re in prefix_patterns:
+        sanitized = prefix_re.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    for user_re in username_patterns:
+        sanitized = user_re.sub("<user>", sanitized)
     return sanitized
+
+
+def sanitize_text(text: str, *, extra_paths: Sequence[Path | str] = ()) -> str:
+    """Remove host absolute paths, file URIs, and current OS usernames from text."""
+    return _sanitize_text_with_patterns(
+        text,
+        _compile_host_prefix_patterns(extra_paths),
+        _compile_username_patterns(),
+    )
+
+
+def _scrub_sensitive_text(text: str) -> str:
+    """Remove host absolute paths and current OS usernames from arbitrary text."""
+    return sanitize_text(text)
+
+
+def sanitize_json_payload(value: Any, *, extra_paths: Sequence[Path | str] = ()) -> Any:
+    """Recursively sanitize every string value in a JSON payload before serialization."""
+    prefix_patterns = _compile_host_prefix_patterns(extra_paths)
+    username_patterns = _compile_username_patterns()
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return _sanitize_text_with_patterns(node, prefix_patterns, username_patterns)
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, tuple):
+            return [_walk(item) for item in node]
+        if isinstance(node, dict):
+            return {key: _walk(val) for key, val in node.items()}
+        return node
+
+    return _walk(value)
 
 
 def sanitize_source_label(source: str | Path | None) -> str:
@@ -280,7 +398,7 @@ def sanitize_source_label(source: str | Path | None) -> str:
     raw = str(source).strip()
     if not raw:
         return "<unknown>"
-    if raw.startswith("<") and raw.endswith(">"):
+    if raw in _SAFE_SENTINEL_LABELS:
         return raw
     stripped = raw.rstrip("/\\")
     if not stripped:
@@ -295,13 +413,18 @@ def sanitize_source_label(source: str | Path | None) -> str:
 def sanitize_relative_path(path: Path, base_dir: Path | None) -> str:
     """Return a strictly sanitized POSIX relative path under `base_dir` or basename."""
     if base_dir is not None:
+        rel: Path | None = None
         try:
             rel = path.resolve().relative_to(base_dir.resolve())
+        except (ValueError, OSError):
+            try:
+                rel = path.relative_to(base_dir)
+            except ValueError:
+                rel = None
+        if rel is not None:
             parts = [p for p in rel.parts if p not in ("", ".", "..")]
             if parts and not (len(parts[0]) == 2 and parts[0][1] == ":"):
                 return _scrub_sensitive_text("/".join(parts))
-        except (ValueError, OSError):
-            pass
     return sanitize_source_label(path)
 
 
@@ -309,10 +432,90 @@ def sanitize_error_message(source: str | Path, exc: BaseException) -> str:
     """Format an error message without ever leaking host absolute paths or usernames."""
     label = sanitize_source_label(source)
     if isinstance(exc, OSError):
-        reason = exc.strerror or type(exc).__name__
+        reason = _scrub_sensitive_text(exc.strerror or type(exc).__name__)
     else:
         reason = _scrub_sensitive_text(str(exc)) or type(exc).__name__
     return f"failed to read {label}: {reason}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic hashing, canonical sorting & zero-division-safe percentages
+# ---------------------------------------------------------------------------
+
+
+def fnv1a_64(data: bytes | bytearray | memoryview) -> int:
+    """Compute FNV-1a 64-bit hash matching shaders/src/pack.rs & inspect_wgsl_pack.py."""
+    h = FNV1A_64_OFFSET_BASIS
+    for byte in data:
+        h ^= byte
+        h = (h * FNV1A_64_PRIME) & U64_MAX
+    return h
+
+
+def format_shader_hash(value: int) -> str:
+    """Format an integer shader hash as canonical lowercase 64-bit `0x%016x` hex."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"shader hash must be a non-negative integer, got {value!r}")
+    return f"0x{value & U64_MAX:016x}"
+
+
+def canonicalize_shader_hash(raw: int | str) -> str:
+    """Normalize an int or hex string shader hash into canonical lowercase `0x...` form."""
+    if isinstance(raw, bool):
+        raise ValueError(f"invalid shader hash: {raw!r}")
+    if isinstance(raw, int):
+        return format_shader_hash(raw)
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        match = _HEX_HASH_RE.fullmatch(cleaned)
+        if not match:
+            raise ValueError(f"invalid hex shader hash: {raw!r}")
+        digits = match.group(1).lower()
+        if len(digits) <= 16:
+            return f"0x{int(digits, 16):016x}"
+        return f"0x{digits}"
+    raise TypeError(f"unsupported shader hash type: {type(raw).__name__}")
+
+
+def sort_shader_hashes(
+    hashes: Iterable[int | str],
+    *,
+    deduplicate: bool = True,
+) -> tuple[str, ...]:
+    """Canonicalize and deterministically sort shader hashes in ascending numeric order."""
+    canonical = [canonicalize_shader_hash(item) for item in hashes]
+    if deduplicate:
+        canonical = list(set(canonical))
+    canonical.sort(key=lambda h: (int(h, 16), h))
+    return tuple(canonical)
+
+
+def safe_percentage(numerator: int, denominator: int, *, ndigits: int = 2) -> float:
+    """Compute `(numerator / denominator) * 100` rounded to `ndigits`, returning `0.0` if `denominator <= 0`."""
+    if denominator <= 0 or numerator <= 0:
+        return 0.0
+    return round((numerator / denominator) * 100.0, ndigits)
+
+
+def compute_stage_breakdown(
+    stage_hint_counts: Mapping[str, int],
+    *,
+    total_hits: int = 0,
+) -> dict[str, dict[str, Any]]:
+    """Compute a canonically sorted, zero-division-safe stage breakdown with percentages."""
+    normalized: dict[str, int] = {
+        str(stage): max(0, int(count)) for stage, count in sorted(stage_hint_counts.items())
+    }
+    total_stage_hints = sum(normalized.values())
+    effective_hits = max(0, int(total_hits))
+    breakdown: dict[str, dict[str, Any]] = {}
+    for stage, count in normalized.items():
+        breakdown[stage] = {
+            "count": count,
+            "pct": safe_percentage(count, total_stage_hints),
+            "pct_of_hits": safe_percentage(count, effective_hits),
+        }
+    return breakdown
 
 
 def parse_byte_size(raw: str | int) -> int:
@@ -370,6 +573,8 @@ class ShaderHit:
     wgpk_entry_count: int | None = None
     wgpk_stage_counts: dict[str, int] | None = None
     confidence: str = "validated"
+    shader_hash: str | None = None
+    wgpk_shader_hashes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -379,6 +584,8 @@ class ShaderHit:
             "confidence": self.confidence,
             "stage_hints": list(self.stage_hints),
         }
+        if self.shader_hash is not None:
+            payload["shader_hash"] = canonicalize_shader_hash(self.shader_hash)
         if self.version is not None:
             payload["version"] = self.version
         if self.shader_kind is not None:
@@ -396,8 +603,67 @@ class ShaderHit:
         if self.wgpk_entry_count is not None:
             payload["wgpk_entry_count"] = self.wgpk_entry_count
         if self.wgpk_stage_counts is not None:
-            payload["wgpk_stage_counts"] = dict(self.wgpk_stage_counts)
+            payload["wgpk_stage_counts"] = dict(sorted(self.wgpk_stage_counts.items()))
+        if self.wgpk_shader_hashes:
+            payload["wgpk_shader_hashes"] = list(
+                sort_shader_hashes(self.wgpk_shader_hashes, deduplicate=False)
+            )
         return payload
+
+
+def canonical_hit_sort_key(hit: ShaderHit) -> tuple[Any, ...]:
+    """Canonical total-order sort key for `ShaderHit` instances."""
+    return (
+        hit.offset,
+        hit.format,
+        canonicalize_shader_hash(hit.shader_hash) if hit.shader_hash is not None else "",
+        hit.size if hit.size is not None else -1,
+        hit.version or "",
+        hit.shader_kind or "",
+        hit.shader_model or "",
+        hit.confidence,
+        hit.stage_hints,
+        hit.chunks,
+        sort_shader_hashes(hit.wgpk_shader_hashes, deduplicate=False)
+        if hit.wgpk_shader_hashes
+        else (),
+    )
+
+
+def _normalize_hit(hit: ShaderHit) -> ShaderHit:
+    norm_hash = canonicalize_shader_hash(hit.shader_hash) if hit.shader_hash is not None else None
+    norm_wgpk_hashes = (
+        sort_shader_hashes(hit.wgpk_shader_hashes, deduplicate=False)
+        if hit.wgpk_shader_hashes
+        else ()
+    )
+    norm_wgpk_stages = (
+        dict(sorted(hit.wgpk_stage_counts.items())) if hit.wgpk_stage_counts is not None else None
+    )
+    if (
+        norm_hash == hit.shader_hash
+        and norm_wgpk_hashes == hit.wgpk_shader_hashes
+        and norm_wgpk_stages == hit.wgpk_stage_counts
+    ):
+        return hit
+    return ShaderHit(
+        format=hit.format,
+        offset=hit.offset,
+        size=hit.size,
+        version=hit.version,
+        shader_kind=hit.shader_kind,
+        shader_model=hit.shader_model,
+        stage_hints=hit.stage_hints,
+        chunks=hit.chunks,
+        has_llvm_bitcode=hit.has_llvm_bitcode,
+        endianness=hit.endianness,
+        spirv_bound=hit.spirv_bound,
+        wgpk_entry_count=hit.wgpk_entry_count,
+        wgpk_stage_counts=norm_wgpk_stages,
+        confidence=hit.confidence,
+        shader_hash=norm_hash,
+        wgpk_shader_hashes=norm_wgpk_hashes,
+    )
 
 
 @dataclass(frozen=True)
@@ -410,9 +676,9 @@ class SkippedFile:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "path": self.path,
+            "path": _scrub_sensitive_text(self.path),
             "file_size": self.file_size,
-            "reason": self.reason,
+            "reason": _scrub_sensitive_text(self.reason),
         }
 
 
@@ -444,23 +710,50 @@ class FileScanResult:
         return tuple(sorted(stages))
 
     def to_dict(self) -> dict[str, Any]:
+        sorted_hits = sorted((_normalize_hit(hit) for hit in self.hits), key=canonical_hit_sort_key)
         payload: dict[str, Any] = {
-            "path": self.path,
+            "path": _scrub_sensitive_text(self.path),
             "file_size": self.file_size,
             "bytes_scanned": self.bytes_scanned,
             "truncated": self.truncated,
-            "hit_count": len(self.hits),
+            "hit_count": len(sorted_hits),
             "format_counts": self.format_counts,
             "stage_hints": list(self.stage_hints),
-            "hits": [hit.to_dict() for hit in self.hits],
+            "hits": [hit.to_dict() for hit in sorted_hits],
         }
         if self.extension_hint is not None:
             payload["extension_hint"] = self.extension_hint
         if self.error is not None:
-            payload["error"] = self.error
+            payload["error"] = _scrub_sensitive_text(self.error)
         if self.skipped_reason is not None:
-            payload["skipped_reason"] = self.skipped_reason
+            payload["skipped_reason"] = _scrub_sensitive_text(self.skipped_reason)
         return payload
+
+
+def canonical_file_sort_key(result: FileScanResult) -> tuple[Any, ...]:
+    """Canonical total-order sort key for `FileScanResult` entries."""
+    return (
+        _scrub_sensitive_text(result.path),
+        result.file_size,
+        result.bytes_scanned,
+        _scrub_sensitive_text(result.error) if result.error is not None else "",
+        _scrub_sensitive_text(result.skipped_reason) if result.skipped_reason is not None else "",
+    )
+
+
+def canonical_skipped_sort_key(entry: SkippedFile) -> tuple[Any, ...]:
+    """Canonical total-order sort key for `SkippedFile` entries."""
+    return (_scrub_sensitive_text(entry.path), entry.file_size, _scrub_sensitive_text(entry.reason))
+
+
+def _collect_discovered_hashes(files: Sequence[FileScanResult]) -> tuple[str, ...]:
+    hashes: list[str] = []
+    for entry in files:
+        for hit in entry.hits:
+            if hit.shader_hash is not None:
+                hashes.append(hit.shader_hash)
+            hashes.extend(hit.wgpk_shader_hashes)
+    return sort_shader_hashes(hashes, deduplicate=True)
 
 
 @dataclass(frozen=True)
@@ -484,11 +777,33 @@ class DirectoryScanReport:
     dxbc_chunk_counts: dict[str, int]
     files: tuple[FileScanResult, ...] = field(default_factory=tuple)
     skipped_incomplete: tuple[SkippedFile, ...] = field(default_factory=tuple)
+    stage_breakdown: dict[str, dict[str, Any]] = field(default_factory=dict)
+    discovered_hashes: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        sorted_files = sorted(self.files, key=canonical_file_sort_key)
+        sorted_skipped = sorted(self.skipped_incomplete, key=canonical_skipped_sort_key)
+        sorted_stage_hints = dict(sorted(self.stage_hint_counts.items()))
+        stage_breakdown = (
+            {
+                stage: {
+                    "count": max(0, int(info.get("count", 0))),
+                    "pct": float(info.get("pct", 0.0)),
+                    "pct_of_hits": float(info.get("pct_of_hits", 0.0)),
+                }
+                for stage, info in sorted(self.stage_breakdown.items())
+            }
+            if self.stage_breakdown
+            else compute_stage_breakdown(sorted_stage_hints, total_hits=self.total_hits)
+        )
+        discovered_hashes = (
+            sort_shader_hashes(self.discovered_hashes, deduplicate=True)
+            if self.discovered_hashes
+            else _collect_discovered_hashes(sorted_files)
+        )
+        payload = {
             "schema_version": self.schema_version,
-            "target": self.target_label,
+            "target": _scrub_sensitive_text(self.target_label),
             "target_kind": self.target_kind,
             "max_bytes_per_file": self.max_bytes_per_file,
             "skip_incomplete": self.skip_incomplete,
@@ -500,13 +815,16 @@ class DirectoryScanReport:
                 "total_file_bytes": self.total_file_bytes,
                 "total_bytes_scanned": self.total_bytes_scanned,
                 "total_hits": self.total_hits,
-                "format_counts": dict(self.format_counts),
-                "stage_hint_counts": dict(self.stage_hint_counts),
-                "dxbc_chunk_counts": dict(self.dxbc_chunk_counts),
+                "format_counts": dict(sorted(self.format_counts.items())),
+                "stage_hint_counts": sorted_stage_hints,
+                "stage_breakdown": stage_breakdown,
+                "dxbc_chunk_counts": dict(sorted(self.dxbc_chunk_counts.items())),
+                "discovered_hashes": list(discovered_hashes),
             },
-            "files": [entry.to_dict() for entry in self.files],
-            "skipped_incomplete": [entry.to_dict() for entry in self.skipped_incomplete],
+            "files": [entry.to_dict() for entry in sorted_files],
+            "skipped_incomplete": [entry.to_dict() for entry in sorted_skipped],
         }
+        return sanitize_json_payload(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +997,7 @@ def _validate_dxbc_at(
         chunks=tuple(chunk_tags),
         has_llvm_bitcode=has_llvm_bc if container_format == "DXIL_SM6" else None,
         confidence="validated",
+        shader_hash=format_shader_hash(fnv1a_64(buf[rel_offset : rel_offset + table_end])),
     )
 
 
@@ -746,6 +1065,9 @@ def _validate_spirv_at(
         endianness=endian,
         spirv_bound=bound,
         confidence="validated",
+        shader_hash=format_shader_hash(
+            fnv1a_64(buf[rel_offset : rel_offset + SPIRV_HEADER_BYTES])
+        ),
     )
 
 
@@ -783,8 +1105,12 @@ def _validate_wgpk_at(
             version=str(version),
             stage_hints=(),
             wgpk_entry_count=0,
-            wgpk_stage_counts=stage_counts,
+            wgpk_stage_counts=dict(sorted(stage_counts.items())),
             confidence="validated",
+            shader_hash=format_shader_hash(
+                fnv1a_64(buf[rel_offset : rel_offset + WGPK_HEADER_BYTES])
+            ),
+            wgpk_shader_hashes=(),
         )
 
     # Require at least the first entry record to be readable and structurally valid.
@@ -793,6 +1119,7 @@ def _validate_wgpk_at(
 
     max_end = data_start
     non_empty_ranges: list[tuple[int, int]] = []
+    entry_hashes: list[int] = []
     inspected = 0
     inspect_limit = min(entry_count, WGPK_MAX_INSPECT_ENTRIES)
 
@@ -800,7 +1127,7 @@ def _validate_wgpk_at(
         entry_pos = rel_offset + WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES
         if entry_pos + WGPK_ENTRY_BYTES > buf_len:
             break
-        _shader_hash, stage_raw, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(
+        shader_hash_u64, stage_raw, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(
             buf, entry_pos
         )
         stage_name = WGPK_STAGE_NAMES.get(stage_raw)
@@ -815,6 +1142,7 @@ def _validate_wgpk_at(
             max_end = end
         if length > 0:
             non_empty_ranges.append((offset, end))
+        entry_hashes.append(shader_hash_u64)
         stage_counts[stage_name] += 1
         inspected += 1
 
@@ -830,6 +1158,11 @@ def _validate_wgpk_at(
 
     stage_hints = tuple(name for name in ("vertex", "fragment", "compute") if stage_counts[name] > 0)
     known_size = max_end if inspected == entry_count else None
+    sorted_entry_hashes = sort_shader_hashes(entry_hashes, deduplicate=False)
+    pack_identity_bytes = (
+        WGPK_HEADER_STRUCT.pack(magic, version, entry_count, flags)
+        + b"".join(h.encode("ascii") for h in sorted_entry_hashes)
+    )
 
     return ShaderHit(
         format="WGPK",
@@ -838,8 +1171,10 @@ def _validate_wgpk_at(
         version=str(version),
         stage_hints=stage_hints,
         wgpk_entry_count=entry_count,
-        wgpk_stage_counts=stage_counts if inspected == entry_count else None,
+        wgpk_stage_counts=dict(sorted(stage_counts.items())) if inspected == entry_count else None,
         confidence="validated",
+        shader_hash=format_shader_hash(fnv1a_64(pack_identity_bytes)),
+        wgpk_shader_hashes=sorted_entry_hashes,
     )
 
 
@@ -875,6 +1210,9 @@ def _validate_rage_at(
         offset=abs_offset,
         size=None,
         confidence="validated",
+        shader_hash=format_shader_hash(
+            fnv1a_64(buf[rel_offset : rel_offset + RAGE_MIN_HEADER_BYTES])
+        ),
     )
 
 
@@ -910,7 +1248,7 @@ def _scan_window(
     if not candidates:
         return
 
-    candidates.sort(key=lambda item: item[0])
+    candidates.sort(key=lambda item: (item[0], item[1]))
 
     for rel_offset, kind in candidates:
         if max_hits is not None and len(hits) >= max_hits:
@@ -1014,6 +1352,7 @@ def scan_bytes(
             tail = b""
             window_file_offset += len(window)
 
+    hits.sort(key=canonical_hit_sort_key)
     return hits
 
 
@@ -1159,6 +1498,7 @@ def scan_file(
             )
         )
 
+    hits.sort(key=canonical_hit_sort_key)
     return FileScanResult(
         path=rel_label,
         file_size=file_size,
@@ -1190,8 +1530,26 @@ def _build_report(
     total_bytes_scanned = 0
     total_hits = 0
     reported_files: list[FileScanResult] = []
+    collected_hashes: list[str] = []
 
-    for res in all_results:
+    for raw_res in all_results:
+        sorted_hits = tuple(
+            sorted((_normalize_hit(hit) for hit in raw_res.hits), key=canonical_hit_sort_key)
+        )
+        res = FileScanResult(
+            path=_scrub_sensitive_text(raw_res.path),
+            file_size=raw_res.file_size,
+            bytes_scanned=raw_res.bytes_scanned,
+            truncated=raw_res.truncated,
+            hits=sorted_hits,
+            extension_hint=raw_res.extension_hint,
+            error=_scrub_sensitive_text(raw_res.error) if raw_res.error is not None else None,
+            skipped_reason=(
+                _scrub_sensitive_text(raw_res.skipped_reason)
+                if raw_res.skipped_reason is not None
+                else None
+            ),
+        )
         files_scanned += 1
         total_file_bytes += res.file_size
         total_bytes_scanned += res.bytes_scanned
@@ -1208,28 +1566,49 @@ def _build_report(
                     stage_hint_counts[stage] += 1
                 for chunk in hit.chunks:
                     dxbc_chunk_counts[chunk] += 1
+                if hit.shader_hash is not None:
+                    collected_hashes.append(hit.shader_hash)
+                collected_hashes.extend(hit.wgpk_shader_hashes)
 
         if include_empty or target_kind == "file" or res.hits or res.error is not None:
             reported_files.append(res)
 
+    reported_files.sort(key=canonical_file_sort_key)
+    normalized_skipped = sorted(
+        (
+            SkippedFile(
+                path=_scrub_sensitive_text(entry.path),
+                file_size=entry.file_size,
+                reason=_scrub_sensitive_text(entry.reason),
+            )
+            for entry in skipped_files
+        ),
+        key=canonical_skipped_sort_key,
+    )
+    sorted_stage_hints = dict(sorted(stage_hint_counts.items()))
+    stage_breakdown = compute_stage_breakdown(sorted_stage_hints, total_hits=total_hits)
+    discovered_hashes = sort_shader_hashes(collected_hashes, deduplicate=True)
+
     return DirectoryScanReport(
         schema_version=SCHEMA_VERSION,
-        target_label=target_label,
+        target_label=_scrub_sensitive_text(target_label),
         target_kind=target_kind,
         max_bytes_per_file=max_bytes_per_file,
         skip_incomplete=skip_incomplete,
         files_scanned=files_scanned,
         files_with_shaders=files_with_shaders,
-        files_skipped_incomplete=len(skipped_files),
+        files_skipped_incomplete=len(normalized_skipped),
         files_errored=files_errored,
         total_file_bytes=total_file_bytes,
         total_bytes_scanned=total_bytes_scanned,
         total_hits=total_hits,
         format_counts=dict(sorted(format_counts.items())),
-        stage_hint_counts=dict(sorted(stage_hint_counts.items())),
+        stage_hint_counts=sorted_stage_hints,
         dxbc_chunk_counts=dict(sorted(dxbc_chunk_counts.items())),
         files=tuple(reported_files),
-        skipped_incomplete=tuple(skipped_files),
+        skipped_incomplete=tuple(normalized_skipped),
+        stage_breakdown=stage_breakdown,
+        discovered_hashes=discovered_hashes,
     )
 
 
@@ -1269,7 +1648,7 @@ def scan_directory(
         for fname in filenames:
             discovered_files.append(base / fname)
 
-    discovered_files.sort(key=lambda p: sanitize_relative_path(p, root))
+    discovered_files.sort(key=lambda p: (sanitize_relative_path(p, root), p.as_posix()))
 
     all_results: list[FileScanResult] = []
     skipped_files: list[SkippedFile] = []
@@ -1385,15 +1764,21 @@ def _escape_md_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
-def render_json(report: DirectoryScanReport) -> str:
+def render_json(
+    report: DirectoryScanReport,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+) -> str:
     """Render a strictly sanitized deterministic JSON report."""
-    return json.dumps(report.to_dict(), indent=2) + "\n"
+    sanitized = sanitize_json_payload(report.to_dict(), extra_paths=extra_paths)
+    return json.dumps(sanitized, indent=2, sort_keys=True) + "\n"
 
 
 def render_markdown(report: DirectoryScanReport) -> str:
     """Render a strictly sanitized Markdown summary report."""
+    safe_target = _scrub_sensitive_text(report.target_label)
     lines: list[str] = [
-        f"# Shader Container Scan Report: `{_escape_md_cell(report.target_label)}`",
+        f"# Shader Container Scan Report: `{_escape_md_cell(safe_target)}`",
         "",
         "| Metric | Value |",
         "| :--- | ---: |",
@@ -1416,21 +1801,32 @@ def render_markdown(report: DirectoryScanReport) -> str:
                 "| :--- | ---: |",
             ]
         )
-        for fmt, count in report.format_counts.items():
+        for fmt, count in sorted(report.format_counts.items()):
             lines.append(f"| `{_escape_md_cell(fmt)}` | {count} |")
         lines.append("")
 
     if report.stage_hint_counts:
+        stage_breakdown = (
+            report.stage_breakdown
+            if report.stage_breakdown
+            else compute_stage_breakdown(report.stage_hint_counts, total_hits=report.total_hits)
+        )
+        total_stage_hints = sum(max(0, int(v)) for v in report.stage_hint_counts.values())
         lines.extend(
             [
                 "## Stage Hints",
                 "",
-                "| Stage | Hits |",
-                "| :--- | ---: |",
+                "| Stage | Hits | Share |",
+                "| :--- | ---: | ---: |",
             ]
         )
-        for stage, count in report.stage_hint_counts.items():
-            lines.append(f"| `{_escape_md_cell(stage)}` | {count} |")
+        for stage, count in sorted(report.stage_hint_counts.items()):
+            pct = (
+                float(stage_breakdown[stage]["pct"])
+                if stage in stage_breakdown and "pct" in stage_breakdown[stage]
+                else safe_percentage(count, total_stage_hints)
+            )
+            lines.append(f"| `{_escape_md_cell(stage)}` | {count} | {pct:.2f}% |")
         lines.append("")
 
     if report.dxbc_chunk_counts:
@@ -1442,11 +1838,14 @@ def render_markdown(report: DirectoryScanReport) -> str:
                 "| :--- | ---: |",
             ]
         )
-        for tag, count in report.dxbc_chunk_counts.items():
+        for tag, count in sorted(report.dxbc_chunk_counts.items()):
             lines.append(f"| `{_escape_md_cell(tag)}` | {count} |")
         lines.append("")
 
-    matched_or_errored = [f for f in report.files if f.hits or f.error]
+    matched_or_errored = sorted(
+        (f for f in report.files if f.hits or f.error),
+        key=canonical_file_sort_key,
+    )
     if matched_or_errored:
         lines.extend(
             [
@@ -1460,12 +1859,12 @@ def render_markdown(report: DirectoryScanReport) -> str:
             fmts = ", ".join(f"{k}:{v}" for k, v in entry.format_counts.items()) or "-"
             stages = ", ".join(entry.stage_hints) or "-"
             status = (
-                f"error: {entry.error}"
+                f"error: {_scrub_sensitive_text(entry.error)}"
                 if entry.error
                 else ("truncated" if entry.truncated else "ok")
             )
             lines.append(
-                f"| `{_escape_md_cell(entry.path)}` | {entry.bytes_scanned}/{entry.file_size} "
+                f"| `{_escape_md_cell(_scrub_sensitive_text(entry.path))}` | {entry.bytes_scanned}/{entry.file_size} "
                 f"| `{_escape_md_cell(fmts)}` | `{_escape_md_cell(stages)}` | {_escape_md_cell(status)} |"
             )
         lines.append("")
@@ -1557,7 +1956,7 @@ def main(
         return 1
 
     if args.json:
-        sys.stdout.write(render_json(report))
+        sys.stdout.write(render_json(report, extra_paths=(target,)))
     else:
         sys.stdout.write(render_markdown(report))
     return 0

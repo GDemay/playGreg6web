@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import json
 import os
 import random
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOOLS_DIR = REPO_ROOT / "tools"
@@ -518,6 +520,459 @@ class TestDirectoryCliAndSanitization(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("GTA6_GAME_DIR is not set", stderr.getvalue())
             self.assertNotIn(tmp, stderr.getvalue())
+
+
+class TestCanonicalSortingAndHashes(unittest.TestCase):
+    def test_sort_shader_hashes_canonicalizes_and_orders_permuted_inputs(self) -> None:
+        raw_inputs = [
+            "0xFFFFFFFF00000001",
+            0x000000000000000A,
+            "0x000000000000000a",
+            "deadbeef",
+            "0X00000000DEADBEEF",
+            0x0123456789ABCDEF,
+        ]
+        expected = (
+            "0x000000000000000a",
+            "0x00000000deadbeef",
+            "0x0123456789abcdef",
+            "0xffffffff00000001",
+        )
+        for perm in itertools.islice(itertools.permutations(raw_inputs), 24):
+            self.assertEqual(scanner.sort_shader_hashes(perm), expected)
+
+        with self.assertRaises(ValueError):
+            scanner.canonicalize_shader_hash("not-a-hex-hash")
+        with self.assertRaises(ValueError):
+            scanner.canonicalize_shader_hash(True)
+
+    def test_wgpk_entry_order_permutation_yields_identical_canonical_hashes(self) -> None:
+        entries = [
+            (0xCAFEBABE00000003, "compute", "@compute @workgroup_size(1) fn cs() {}"),
+            (0x0000000000000010, "vertex", "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+            (0x1122334455667788, "fragment", "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+        ]
+        pack_a = wgpk.build_wgpk(entries)
+        pack_b = wgpk.build_wgpk(list(reversed(entries)))
+
+        hits_a = scanner.scan_bytes(pack_a)
+        hits_b = scanner.scan_bytes(pack_b)
+        self.assertEqual(len(hits_a), 1)
+        self.assertEqual(len(hits_b), 1)
+
+        expected_hashes = (
+            "0x0000000000000010",
+            "0x1122334455667788",
+            "0xcafebabe00000003",
+        )
+        self.assertEqual(hits_a[0].wgpk_shader_hashes, expected_hashes)
+        self.assertEqual(hits_b[0].wgpk_shader_hashes, expected_hashes)
+        self.assertEqual(hits_a[0].shader_hash, hits_b[0].shader_hash)
+        self.assertEqual(hits_a[0].to_dict()["wgpk_shader_hashes"], list(expected_hashes))
+
+    def test_report_building_is_canonical_across_permuted_results_and_hits(self) -> None:
+        hit_late = scanner.ShaderHit(
+            format="SPIRV",
+            offset=512,
+            stage_hints=("fragment",),
+            shader_hash="0xBBBB000000000002",
+        )
+        hit_early = scanner.ShaderHit(
+            format="DXIL_SM6",
+            offset=64,
+            stage_hints=("vertex",),
+            shader_hash="0xAAAA000000000001",
+        )
+        hit_wgpk = scanner.ShaderHit(
+            format="WGPK",
+            offset=0,
+            stage_hints=("compute",),
+            shader_hash="0xCCCC000000000003",
+            wgpk_entry_count=2,
+            wgpk_stage_counts={"compute": 2, "vertex": 0, "fragment": 0},
+            wgpk_shader_hashes=("0x00000000000000ff", "0x0000000000000005"),
+        )
+
+        file_a = scanner.FileScanResult(
+            path="a/alpha.bin",
+            file_size=1024,
+            bytes_scanned=1024,
+            truncated=False,
+            hits=(hit_late, hit_early),
+        )
+        file_b = scanner.FileScanResult(
+            path="b/beta.wgsl.pack",
+            file_size=256,
+            bytes_scanned=256,
+            truncated=False,
+            hits=(hit_wgpk,),
+        )
+        file_c = scanner.FileScanResult(
+            path="c/gamma.bin",
+            file_size=512,
+            bytes_scanned=512,
+            truncated=False,
+            hits=(hit_early, hit_late),
+        )
+        skipped_1 = scanner.SkippedFile(path="z_partial.rpf.!qB", file_size=100, reason="temp_suffix")
+        skipped_2 = scanner.SkippedFile(path="a_empty.rpf", file_size=0, reason="empty_file")
+
+        baseline_json: str | None = None
+        for file_perm in itertools.permutations([file_a, file_b, file_c]):
+            for skip_perm in itertools.permutations([skipped_1, skipped_2]):
+                report = scanner._build_report(
+                    target_label="perm_test",
+                    target_kind="directory",
+                    max_bytes_per_file=None,
+                    skip_incomplete=True,
+                    all_results=file_perm,
+                    skipped_files=skip_perm,
+                    include_empty=False,
+                )
+                rendered = scanner.render_json(report)
+                if baseline_json is None:
+                    baseline_json = rendered
+                else:
+                    self.assertEqual(rendered, baseline_json)
+
+        assert baseline_json is not None
+        parsed = json.loads(baseline_json)
+        self.assertEqual(
+            [f["path"] for f in parsed["files"]],
+            ["a/alpha.bin", "b/beta.wgsl.pack", "c/gamma.bin"],
+        )
+        self.assertEqual(
+            [h["offset"] for h in parsed["files"][0]["hits"]],
+            [64, 512],
+        )
+        self.assertEqual(
+            parsed["files"][1]["hits"][0]["wgpk_shader_hashes"],
+            ["0x0000000000000005", "0x00000000000000ff"],
+        )
+        self.assertEqual(
+            [s["path"] for s in parsed["skipped_incomplete"]],
+            ["a_empty.rpf", "z_partial.rpf.!qB"],
+        )
+        self.assertEqual(
+            parsed["summary"]["discovered_hashes"],
+            [
+                "0x0000000000000005",
+                "0x00000000000000ff",
+                "0xaaaa000000000001",
+                "0xbbbb000000000002",
+                "0xcccc000000000003",
+            ],
+        )
+
+    def test_directory_scan_produces_identical_json_regardless_of_file_creation_order(self) -> None:
+        fixtures = [
+            (
+                "z_dir/compute.dxil",
+                build_dxbc_container([(b"DXIL", build_dxil_payload(shader_kind=5, sm_major=6, sm_minor=6))]),
+            ),
+            (
+                "a_dir/frag.spv",
+                build_spirv_module(endian="little", major=1, minor=5, execution_models=(4,)),
+            ),
+            (
+                "m_dir/pack.wgsl.pack",
+                wgpk.build_wgpk(
+                    [
+                        (0x99, "vertex", "@vertex fn vs() {}"),
+                        (0x11, "fragment", "@fragment fn fs() {}"),
+                    ]
+                ),
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            dir_fwd = Path(tmp) / "forward"
+            dir_rev = Path(tmp) / "reverse"
+            for rel, payload in fixtures:
+                dest = dir_fwd / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(payload)
+            for rel, payload in reversed(fixtures):
+                dest = dir_rev / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(payload)
+
+            rep_fwd = scanner.scan_directory(dir_fwd, target_label="canonical_target")
+            rep_rev = scanner.scan_directory(dir_rev, target_label="canonical_target")
+            self.assertEqual(scanner.render_json(rep_fwd), scanner.render_json(rep_rev))
+            self.assertEqual(scanner.render_markdown(rep_fwd), scanner.render_markdown(rep_rev))
+
+
+class TestStageBreakdownZeroDivisionGuards(unittest.TestCase):
+    def test_safe_percentage_and_compute_stage_breakdown_zero_guards(self) -> None:
+        self.assertEqual(scanner.safe_percentage(0, 0), 0.0)
+        self.assertEqual(scanner.safe_percentage(10, 0), 0.0)
+        self.assertEqual(scanner.safe_percentage(10, -5), 0.0)
+        self.assertEqual(scanner.safe_percentage(-3, 10), 0.0)
+        self.assertEqual(scanner.safe_percentage(1, 4), 25.0)
+        self.assertEqual(scanner.safe_percentage(1, 3), 33.33)
+
+        self.assertEqual(scanner.compute_stage_breakdown({}, total_hits=0), {})
+        zero_counts = scanner.compute_stage_breakdown({"vertex": 0, "fragment": 0}, total_hits=0)
+        self.assertEqual(list(zero_counts.keys()), ["fragment", "vertex"])
+        self.assertEqual(zero_counts["vertex"], {"count": 0, "pct": 0.0, "pct_of_hits": 0.0})
+        self.assertEqual(zero_counts["fragment"], {"count": 0, "pct": 0.0, "pct_of_hits": 0.0})
+
+        nonzero = scanner.compute_stage_breakdown(
+            {"vertex": 1, "fragment": 2, "compute": 1},
+            total_hits=2,
+        )
+        self.assertEqual(list(nonzero.keys()), ["compute", "fragment", "vertex"])
+        self.assertEqual(nonzero["compute"], {"count": 1, "pct": 25.0, "pct_of_hits": 50.0})
+        self.assertEqual(nonzero["fragment"], {"count": 2, "pct": 50.0, "pct_of_hits": 100.0})
+        self.assertEqual(nonzero["vertex"], {"count": 1, "pct": 25.0, "pct_of_hits": 50.0})
+
+    def test_empty_directory_and_stageless_hits_avoid_zero_division(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_dir = Path(tmp) / "empty_game"
+            empty_dir.mkdir()
+            empty_report = scanner.scan_directory(empty_dir)
+            empty_json = json.loads(scanner.render_json(empty_report))
+            self.assertEqual(empty_json["summary"]["total_hits"], 0)
+            self.assertEqual(empty_json["summary"]["stage_hint_counts"], {})
+            self.assertEqual(empty_json["summary"]["stage_breakdown"], {})
+            self.assertEqual(empty_json["summary"]["discovered_hashes"], [])
+            self.assertIn("No shader containers detected.", scanner.render_markdown(empty_report))
+
+            # Directory with non-shader files only
+            plain_dir = Path(tmp) / "plain_files"
+            plain_dir.mkdir()
+            (plain_dir / "readme.txt").write_text("no shaders here", encoding="utf-8")
+            plain_report = scanner.scan_directory(plain_dir)
+            plain_json = json.loads(scanner.render_json(plain_report))
+            self.assertEqual(plain_json["summary"]["files_scanned"], 1)
+            self.assertEqual(plain_json["summary"]["total_hits"], 0)
+            self.assertEqual(plain_json["summary"]["stage_breakdown"], {})
+
+            # Directory with shader containers that carry zero stage hints (RTS0 root signature)
+            stageless_dir = Path(tmp) / "stageless"
+            stageless_dir.mkdir()
+            (stageless_dir / "rootsig.dxbc").write_bytes(
+                build_dxbc_container([(b"RTS0", b"\x01\x00\x00\x00" + b"\x00" * 16)])
+            )
+            stageless_report = scanner.scan_directory(stageless_dir)
+            stageless_json = json.loads(scanner.render_json(stageless_report))
+            self.assertEqual(stageless_json["summary"]["total_hits"], 1)
+            self.assertEqual(stageless_json["summary"]["stage_hint_counts"], {})
+            self.assertEqual(stageless_json["summary"]["stage_breakdown"], {})
+            self.assertEqual(len(stageless_json["summary"]["discovered_hashes"]), 1)
+
+    def test_stage_breakdown_rendered_in_json_and_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "stages"
+            root.mkdir()
+            (root / "a.spv").write_bytes(build_spirv_module(execution_models=(0, 4)))
+            (root / "b.spv").write_bytes(build_spirv_module(execution_models=(4,)))
+            (root / "c.dxil").write_bytes(
+                build_dxbc_container([(b"DXIL", build_dxil_payload(shader_kind=5, sm_major=6, sm_minor=6))])
+            )
+
+            report = scanner.scan_directory(root)
+            parsed = json.loads(scanner.render_json(report))
+            breakdown = parsed["summary"]["stage_breakdown"]
+            self.assertEqual(list(breakdown.keys()), ["compute", "fragment", "vertex"])
+            self.assertEqual(breakdown["compute"]["count"], 1)
+            self.assertEqual(breakdown["compute"]["pct"], 25.0)
+            self.assertEqual(breakdown["fragment"]["count"], 2)
+            self.assertEqual(breakdown["fragment"]["pct"], 50.0)
+            self.assertEqual(breakdown["vertex"]["count"], 1)
+            self.assertEqual(breakdown["vertex"]["pct"], 25.0)
+
+            md = scanner.render_markdown(report)
+            self.assertIn("| Stage | Hits | Share |", md)
+            self.assertIn("| `compute` | 1 | 25.00% |", md)
+            self.assertIn("| `fragment` | 2 | 50.00% |", md)
+            self.assertIn("| `vertex` | 1 | 25.00% |", md)
+
+
+class TestStrictHostPathJsonSanitization(unittest.TestCase):
+    def test_render_json_recursively_sanitizes_host_paths_uris_and_usernames(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"USERNAME": "AliceDev99", "USER": "AliceDev99", "LOGNAME": "AliceDev99"},
+            clear=False,
+        ):
+            dirty_report = scanner.DirectoryScanReport(
+                schema_version=1,
+                target_label=r"C:\Users\Alice Smith\My Games\GTA6_Secret",
+                target_kind="directory",
+                max_bytes_per_file=None,
+                skip_incomplete=True,
+                files_scanned=3,
+                files_with_shaders=1,
+                files_skipped_incomplete=2,
+                files_errored=1,
+                total_file_bytes=2048,
+                total_bytes_scanned=1024,
+                total_hits=1,
+                format_counts={"SPIRV": 1},
+                stage_hint_counts={"fragment": 1},
+                dxbc_chunk_counts={},
+                files=(
+                    scanner.FileScanResult(
+                        path=r"D:/PrivateBuild/AliceDev99_shaders/post.spv",
+                        file_size=1024,
+                        bytes_scanned=1024,
+                        truncated=False,
+                        hits=(
+                            scanner.ShaderHit(
+                                format="SPIRV",
+                                offset=0,
+                                stage_hints=("fragment",),
+                                shader_hash="0x0000000000001234",
+                            ),
+                        ),
+                    ),
+                    scanner.FileScanResult(
+                        path="x64/tmp/mesh.dxil",
+                        file_size=512,
+                        bytes_scanned=0,
+                        truncated=False,
+                        error=r"failed to read \\fileserver\private share\builds\mesh.dxil and file:///C:/Users/AliceDev99/a.bin: denied",
+                    ),
+                    scanner.FileScanResult(
+                        path="/home/bob/My Secret Dir/AliceDev99_extra.bin",
+                        file_size=512,
+                        bytes_scanned=512,
+                        truncated=False,
+                        skipped_reason="found in /Users/Alice Smith/Downloads/partial.bin",
+                    ),
+                ),
+                skipped_incomplete=(
+                    scanner.SkippedFile(
+                        path=r"C:\Users\AliceDev99\Downloads\huge.rpf.!qB",
+                        file_size=4096,
+                        reason="temp_suffix",
+                    ),
+                    scanner.SkippedFile(
+                        path="AliceDev99_partial.rpf",
+                        file_size=0,
+                        reason="empty_file",
+                    ),
+                ),
+            )
+
+            raw_json = scanner.render_json(
+                dirty_report,
+                extra_paths=(r"C:\Users\Alice Smith\My Games",),
+            )
+            parsed = json.loads(raw_json)
+
+            # No host paths, drive letters, UNC paths, file URIs, or usernames may appear anywhere.
+            for forbidden in (
+                "C:\\",
+                "C:/",
+                "D:/",
+                "\\\\fileserver",
+                "private share",
+                "Alice Smith",
+                "My Games",
+                "GTA6_Secret",
+                "PrivateBuild",
+                "/home/bob",
+                "My Secret Dir",
+                "/Users/",
+                "file://",
+                "alicedev99",
+            ):
+                self.assertNotIn(forbidden.lower(), raw_json.lower(), f"leaked {forbidden!r}")
+
+            # Legitimate relative paths containing directory names like `tmp` must stay intact.
+            paths = [entry["path"] for entry in parsed["files"]]
+            self.assertIn("x64/tmp/mesh.dxil", paths)
+            self.assertIn("<user>_partial.rpf", [s["path"] for s in parsed["skipped_incomplete"]])
+
+    def test_cli_json_sanitizes_username_embedded_in_target_and_filenames(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"USERNAME": "SecretTester99", "USER": "SecretTester99", "LOGNAME": "SecretTester99"},
+            clear=False,
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "SecretTester99_Vault"
+                sub = root / "shaders"
+                sub.mkdir(parents=True)
+                (sub / "SecretTester99_pass.spv").write_bytes(
+                    build_spirv_module(execution_models=(4,))
+                )
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    rc = scanner.main(["--path", str(root), "--json"])
+                self.assertEqual(rc, 0, stderr.getvalue())
+                raw_json = stdout.getvalue()
+                parsed = json.loads(raw_json)
+
+                self.assertNotIn("secrettester99", raw_json.lower())
+                self.assertNotIn(str(Path(tmp).resolve()).lower(), raw_json.lower())
+                self.assertEqual(parsed["target"], "<user>_Vault")
+                self.assertEqual(parsed["files"][0]["path"], "shaders/<user>_pass.spv")
+
+    def test_sanitize_source_label_scrubs_angle_bracketed_host_paths_but_keeps_sentinels(self) -> None:
+        self.assertEqual(scanner.sanitize_source_label("<GTA6_GAME_DIR>"), "<GTA6_GAME_DIR>")
+        self.assertEqual(scanner.sanitize_source_label("<memory>"), "<memory>")
+        scrubbed = scanner.sanitize_source_label(r"<C:\Users\alice\secret_dir>")
+        self.assertNotIn("Users", scrubbed)
+        self.assertNotIn("C:", scrubbed)
+
+
+class TestBackwardsCompatibility(unittest.TestCase):
+    def test_legacy_dataclass_construction_and_existing_json_schema_fields(self) -> None:
+        # Constructing ShaderHit and DirectoryScanReport without T87 optional fields must keep working.
+        legacy_hit = scanner.ShaderHit(
+            format="DXBC_SM5",
+            offset=128,
+            size=64,
+            version="1.0",
+            shader_kind="pixel",
+            shader_model="5.0",
+            stage_hints=("pixel",),
+            chunks=("SHEX",),
+        )
+        legacy_file = scanner.FileScanResult(
+            path="shaders/legacy.dxbc",
+            file_size=256,
+            bytes_scanned=256,
+            truncated=False,
+            hits=(legacy_hit,),
+        )
+        legacy_report = scanner.DirectoryScanReport(
+            schema_version=1,
+            target_label="legacy_game",
+            target_kind="directory",
+            max_bytes_per_file=None,
+            skip_incomplete=False,
+            files_scanned=1,
+            files_with_shaders=1,
+            files_skipped_incomplete=0,
+            files_errored=0,
+            total_file_bytes=256,
+            total_bytes_scanned=256,
+            total_hits=1,
+            format_counts={"DXBC_SM5": 1},
+            stage_hint_counts={"pixel": 1},
+            dxbc_chunk_counts={"SHEX": 1},
+            files=(legacy_file,),
+            skipped_incomplete=(),
+        )
+        payload = json.loads(scanner.render_json(legacy_report))
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["target"], "legacy_game")
+        self.assertEqual(payload["target_kind"], "directory")
+        self.assertEqual(payload["summary"]["format_counts"], {"DXBC_SM5": 1})
+        self.assertEqual(payload["summary"]["stage_hint_counts"], {"pixel": 1})
+        self.assertEqual(
+            payload["summary"]["stage_breakdown"],
+            {"pixel": {"count": 1, "pct": 100.0, "pct_of_hits": 100.0}},
+        )
+        self.assertEqual(payload["summary"]["discovered_hashes"], [])
+        self.assertNotIn("shader_hash", payload["files"][0]["hits"][0])
+        self.assertNotIn("wgpk_shader_hashes", payload["files"][0]["hits"][0])
 
 
 if __name__ == "__main__":
