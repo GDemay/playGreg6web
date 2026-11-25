@@ -681,6 +681,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       return this._usage;
     }
 
+    get hasCopySrcUsage() {
+      return (this._usage & TEXTURE_USAGE_COPY_SRC) !== 0;
+    }
+
     get frameIntervalUs() {
       return this._frameIntervalUs;
     }
@@ -1606,6 +1610,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const prevUsesBlit = this._usesBlitFallback;
       const prevDepthFormat = this._depthFormat;
       const prevEnableDepth = this._enableDepth;
+      const prevExplicitUsage = this._explicitUsage;
+      const prevUsage = this._usage;
 
       if (isReplacingDevice) {
         this._replaceDevice(config.device);
@@ -1742,7 +1748,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           this._skippedRedundantReconfigures += 1;
         }
       } else {
-        this._applyContextConfiguration();
+        try {
+          this._applyContextConfiguration();
+        } catch (err) {
+          this._explicitUsage = prevExplicitUsage;
+          this._usage = prevUsage;
+          throw err;
+        }
         if (dimensionsChanged) {
           this._resizeCount += 1;
         }
@@ -2161,6 +2173,67 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
 
       return this._pendingFrameVisible;
+    }
+
+    /**
+     * Confirm that an already-presented frame contained verified non-black visible pixels
+     * (e.g. after an async GPU swapchain luminance readback completes) without double-counting
+     * `presentCount` / `totalFrames`. Latches `hasVisibleContent`, `firstVisiblePresentIndex`,
+     * `firstVisiblePresentMs`, and fires `onFirstVisibleFrame` once.
+     *
+     * @param {{ timestampMs?: number, realPackDraws?: number | boolean }} [meta]
+     * @returns {boolean} True if this call transitioned the swapchain into its first visible frame.
+     */
+    confirmVisibleFrame(meta = {}) {
+      if (this._destroyed) {
+        return false;
+      }
+      const opts = meta && typeof meta === 'object' ? meta : {};
+      const nowMs =
+        typeof opts.timestampMs === 'number' && Number.isFinite(opts.timestampMs)
+          ? opts.timestampMs
+          : this._now();
+      const realPackDraws = sanitizeNonNegativeDrawCount(opts.realPackDraws);
+      const wasFirstVisible = !this._firstVisibleFired;
+
+      this._hasVisibleContent = true;
+      this._consecutiveBlackPresents = 0;
+      if (this._visiblePresentsTotal === 0) {
+        this._visiblePresentsTotal = 1;
+        if (this._blackPresentsTotal > 0) {
+          this._blackPresentsTotal -= 1;
+        }
+      }
+
+      if (!this._firstVisibleFired) {
+        this._firstVisiblePresentIndex = Math.max(1, this._presentCount);
+        this._firstVisiblePresentMs =
+          typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : 0;
+        this._firstVisibleFired = true;
+
+        if (typeof this._onFirstVisibleFrame === 'function') {
+          try {
+            this._onFirstVisibleFrame({
+              presentIndex: this._firstVisiblePresentIndex,
+              firstVisiblePresentIndex: this._firstVisiblePresentIndex,
+              timestampMs: this._firstVisiblePresentMs,
+              firstVisiblePresentMs: this._firstVisiblePresentMs,
+              blackPresentsTotal: this._blackPresentsTotal,
+              consecutiveBlackPresents: 0,
+              visiblePresentsTotal: this._visiblePresentsTotal,
+              realPackDraws,
+              hasVisibleContent: true,
+              width: this._width,
+              height: this._height,
+            });
+          } catch {
+            // Isolate callback exceptions so readiness notifications never break rendering.
+          }
+        }
+      }
+
+      this._fillTelemetry(this._liveTelemetry);
+      return wasFirstVisible;
     }
 
     /**

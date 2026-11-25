@@ -3995,3 +3995,240 @@ test('W346: createWgpuWorkerHandler forwards init.enableResourceReplay: false an
     handler.processor.destroy();
   }
 });
+
+test('W348 black frames on COPY_SRC device with WgpuSwapchain never leak firstVisibleFrame in postMessage, getStats, swapchainStats, or gpu-telemetry across resizes, clear frames, and throttle windows', async () => {
+  const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+  const prevGpuTextureUsage = Object.getOwnPropertyDescriptor(globalThis, 'GPUTextureUsage');
+  const mockUsage = Object.freeze({
+    COPY_SRC: 0x01,
+    COPY_DST: 0x02,
+    TEXTURE_BINDING: 0x04,
+    STORAGE_BINDING: 0x08,
+    RENDER_ATTACHMENT: 0x10,
+  });
+
+  try {
+    Object.defineProperty(globalThis, 'GPUTextureUsage', {
+      configurable: true,
+      writable: true,
+      value: mockUsage,
+    });
+
+    const env = createProbeCapableMockWebGpu({
+      width: 1280,
+      height: 720,
+      format: 'bgra8unorm',
+      textureUsage: mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC,
+    });
+
+    // Make mock ctx dynamically track configured usage & support transient usage override.
+    let activeConfiguredUsage = mockUsage.RENDER_ATTACHMENT;
+    let overrideTextureUsage = null;
+    env.ctx.configure = (cfg) => {
+      env.ctx.configured.push({ ...cfg });
+      activeConfiguredUsage =
+        typeof cfg.usage === 'number' ? cfg.usage : mockUsage.RENDER_ATTACHMENT;
+    };
+    const origGetCurrentTexture = env.ctx.getCurrentTexture.bind(env.ctx);
+    env.ctx.getCurrentTexture = () => {
+      const tex = origGetCurrentTexture();
+      tex.usage = overrideTextureUsage !== null ? overrideTextureUsage : activeConfiguredUsage;
+      return tex;
+    };
+
+    const canvas = {
+      width: 0,
+      height: 0,
+      getContext(kind) {
+        assert.equal(kind, 'webgpu');
+        return env.ctx;
+      },
+    };
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock', architecture: 'w348-probe' },
+          async requestDevice() {
+            return env.device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+
+    let fakeNow = 1000;
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: true,
+      now: () => fakeNow,
+      telemetryIntervalMs: 0,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 1280, height: 720 });
+    });
+
+    const processor = handler.processor;
+    const swapchain = handler.swapchain;
+    assert.ok(processor, 'processor initialized');
+    assert.ok(swapchain, 'WgpuSwapchain attached');
+    assert.equal(
+      swapchain.usage,
+      mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC,
+      'initial configure must enable COPY_SRC'
+    );
+    processor.loadWgslPack(packBuffer);
+
+    const assertStillNotVisible = (label) => {
+      const stats = processor.getStats();
+      const snap = buildGpuTelemetrySnapshot(processor, { timestamp: fakeNow });
+      assert.equal(processor.firstVisibleFrame, false, `${label}: processor.firstVisibleFrame`);
+      assert.equal(swapchain.hasVisibleContent, false, `${label}: swapchain.hasVisibleContent`);
+      assert.equal(
+        swapchain.visiblePresentsTotal,
+        0,
+        `${label}: swapchain.visiblePresentsTotal`
+      );
+      assert.equal(
+        swapchain.firstVisiblePresentMs,
+        null,
+        `${label}: swapchain.firstVisiblePresentMs`
+      );
+      assert.equal(stats.firstVisibleFrame, false, `${label}: getStats().firstVisibleFrame`);
+      assert.equal(
+        stats.swapchain.hasVisibleContent,
+        false,
+        `${label}: getStats().swapchain.hasVisibleContent`
+      );
+      assert.equal(
+        stats.swapchain.visiblePresentsTotal,
+        0,
+        `${label}: getStats().swapchain.visiblePresentsTotal`
+      );
+      assert.equal(snap.firstVisibleFrame, false, `${label}: gpu-telemetry.firstVisibleFrame`);
+      assert.equal(
+        snap.firstVisibleFrameMs,
+        null,
+        `${label}: gpu-telemetry.firstVisibleFrameMs`
+      );
+      assert.equal(
+        posted.filter((m) => m.type === 'first-visible-frame').length,
+        0,
+        `${label}: no first-visible-frame postMessage`
+      );
+      const telemetryMsgs = posted.filter((m) => m.type === 'gpu-telemetry');
+      assert.ok(
+        telemetryMsgs.every((m) => m.firstVisibleFrame === false),
+        `${label}: every posted gpu-telemetry must have firstVisibleFrame === false`
+      );
+    };
+
+    // Frame 1: real-pack draw onto 100% black (0,0,0,255) canvas -> probe suppresses, zero leaks.
+    fakeNow = 1100;
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }),
+    });
+    await flushMicrotasks();
+    assert.equal(processor.swapchainProbeCount, 1);
+    assert.equal(processor.suppressedBlackFrames, 1);
+    assertStillNotVisible('after black real-pack draw #1');
+
+    // Resize swapchain -> COPY_SRC must be preserved across resize!
+    await handler.handleMessage({ resize: true, width: 1280, height: 720 });
+    await handler.handleMessage({ resize: true, width: 1280, height: 718 });
+    assert.equal(
+      swapchain.usage,
+      mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC,
+      'resize must preserve COPY_SRC'
+    );
+    await handler.handleMessage({ resize: true, width: 1280, height: 720 });
+    assert.equal(
+      swapchain.usage,
+      mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC,
+      'second resize must preserve COPY_SRC'
+    );
+
+    // Frame 2: real-pack black draw inside 250ms throttle window -> must NOT bypass probe!
+    fakeNow = 1116;
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+    assertStillNotVisible('after throttled black draw #2');
+
+    // Frame 3: clear-only frame after black draws -> must NOT bypass probe!
+    fakeNow = 1200;
+    await handler.handleMessage({
+      cmdBuffer: new BinaryCommandBuilder().beginFrame().clearColor(0, 0, 0, 1).present().finish(),
+    });
+    await flushMicrotasks();
+    assertStillNotVisible('after clear-only frame #3');
+
+    // Frame 4: transient missing-COPY_SRC texture glitch with real-pack draw -> sticky probe MUST hold!
+    fakeNow = 1400;
+    overrideTextureUsage = mockUsage.RENDER_ATTACHMENT;
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+    overrideTextureUsage = null;
+    assertStillNotVisible('after transient missing-COPY_SRC frame #4');
+
+    // Frame 5: dim near-black frame (12,12,12,255) at default threshold 12 -> still held!
+    fakeNow = 1700;
+    env.clearPixels(12, 12, 12, 255);
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+    assert.equal(processor.lastSampledMaxLuma, 12);
+    assertStillNotVisible('after luma=12 dim frame #5');
+
+    // Also request explicit gpu-stats while black -> must report firstVisibleFrame: false and swapchain.hasVisibleContent: false.
+    await handler.handleMessage({ type: 'gpu-stats', id: 'w348-black-stats' });
+    const blackStatsMsg = posted.find((m) => m.id === 'w348-black-stats');
+    assert.ok(blackStatsMsg, 'gpu-stats reply received');
+    assert.equal(blackStatsMsg.firstVisibleFrame, false);
+    assert.equal(blackStatsMsg.stats.firstVisibleFrame, false);
+    assert.equal(blackStatsMsg.stats.swapchain.hasVisibleContent, false);
+
+    // Frame 6: Start Screen draws bright pixel (> 12) in bottom-right bar -> fires promptly & destroys staging buffer!
+    fakeNow = 2000;
+    env.clearPixels(0, 0, 0, 255);
+    const barY = Math.floor(720 * 0.92);
+    const barX = Math.floor((1280 - 64) * 0.9) + 10;
+    env.setPixel(barX, barY, 0, 0, 220, 255);
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(processor.lastSampledMaxLuma, 220);
+    assert.equal(swapchain.hasVisibleContent, true);
+    assert.equal(swapchain.firstVisiblePresentMs, 2000);
+    assert.equal(env.probeBuffers.length, 1);
+    assert.equal(env.probeBuffers[0].destroyed, true, 'staging buffer must be destroyed once visible');
+
+    const visMsgs = posted.filter((m) => m.type === 'first-visible-frame');
+    assert.equal(visMsgs.length, 1);
+    assert.equal(visMsgs[0].source, 'swapchain-probe');
+    assert.equal(visMsgs[0].maxLuma, 220);
+    assert.equal(visMsgs[0].firstVisibleFrameMs, 2000);
+
+    const visibleSnap = buildGpuTelemetrySnapshot(processor, { timestamp: 2050 });
+    assert.equal(visibleSnap.firstVisibleFrame, true);
+    assert.equal(visibleSnap.firstVisibleFrameMs, 2000);
+
+    processor.destroy();
+  } finally {
+    if (prevGpuTextureUsage) {
+      Object.defineProperty(globalThis, 'GPUTextureUsage', prevGpuTextureUsage);
+    } else {
+      delete globalThis.GPUTextureUsage;
+    }
+  }
+});
