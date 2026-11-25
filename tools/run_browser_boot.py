@@ -9,6 +9,7 @@
         [--mp4-skip-black] [--hide-hud] [--baseline NAME|DIR]
         [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
         [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
+        [--quiet-server]
 
 What it does, in order:
 
@@ -121,6 +122,7 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "legal-notices": "legal-notices",
     "chrome-menu-flow": "chrome-menu-flow",
     "chrome-full-boot": "chrome-full-boot",
+    "menu-to-ingame": "menu-to-ingame",
 }
 INPUT_SCRIPT_ALIASES: dict[str, str] = ALLOWED_INPUT_SCRIPT_PRESETS
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -1246,6 +1248,7 @@ def build_server_cmd(
     boot_dir: Path | None,
     game_dir: Path | None,
     shaders_dir: Path | None,
+    quiet: bool = False,
 ) -> list[str]:
     """Build the `server/serve_local.py` launch command."""
     cmd = [
@@ -1266,6 +1269,8 @@ def build_server_cmd(
         cmd += ["--game", str(game_dir)]
     if shaders_dir is not None:
         cmd += ["--shaders", str(shaders_dir)]
+    if quiet:
+        cmd.append("--quiet")
     return cmd
 
 
@@ -1751,6 +1756,7 @@ class BrowserSessionResult:
     js_heap_total_mb: float | None = None
     audio_ring_attached: bool | None = None
     audio_frames_drained: int | None = None
+    present_fps_avg: float | None = None
 
 
 def _format_console_event(params: Mapping[str, Any], elapsed_s: float) -> tuple[str, bool]:
@@ -2359,6 +2365,61 @@ def _extract_audio_ring_summary(
     return attached, frames_drained
 
 
+def compute_present_fps_avg(
+    presents: Sequence[Mapping[str, Any]] | None,
+    *,
+    present_count: int | None = None,
+    first_present_ms: float | None = None,
+) -> float | None:
+    """Compute average presents/sec from FIRST_PRESENT to last present wall time.
+
+    Returns ``None`` when fewer than 2 presents were observed, when no valid last
+    present wall timestamp exists, or when the elapsed duration is <= 0 ms.
+    """
+    walls: list[float] = []
+    if presents:
+        for sample in presents:
+            if isinstance(sample, Mapping):
+                wall_ms = _sanitize_non_negative_float(sample.get("wall_ms"))
+                if wall_ms is not None:
+                    walls.append(wall_ms)
+
+    clean_count = _sanitize_optional_non_negative_int(present_count)
+    total_presents = max(clean_count, len(walls)) if clean_count is not None else len(walls)
+    if total_presents < 2 or not walls:
+        return None
+
+    start_ms = _sanitize_non_negative_float(first_present_ms)
+    if start_ms is None:
+        start_ms = walls[0]
+    end_ms = walls[-1]
+    delta_ms = end_ms - start_ms
+    if not math.isfinite(delta_ms) or delta_ms <= 0.0:
+        return None
+
+    fps = (float(total_presents) - 1.0) * 1000.0 / delta_ms
+    return _sanitize_non_negative_float(fps, digits=2)
+
+
+def _extract_present_fps_avg(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> float | None:
+    """Resolve `present_fps_avg` from session override or recorded present timestamps."""
+    direct = _sanitize_non_negative_float(session.present_fps_avg, digits=2)
+    if direct is not None:
+        return direct
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    present_count = max(len(session.presents), _extract_present_count(probe_map))
+    return compute_present_fps_avg(
+        session.presents,
+        present_count=present_count,
+        first_present_ms=session.first_present_ms,
+    )
+
+
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
     counts = _extract_gpu_counts(probe)
     return {
@@ -2647,6 +2708,7 @@ def run_browser_session(
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
+    quiet_server: bool = False,
     runner: CommandRunner = run_command,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     cdp_factory: Callable[[str], CdpClient] = CdpClient,
@@ -2731,6 +2793,7 @@ def run_browser_session(
         boot_dir=effective_boot_dir,
         game_dir=effective_game_dir,
         shaders_dir=shaders_dir,
+        quiet=bool(quiet_server),
     )
     chrome_cmd = build_chrome_args(
         chrome_path,
@@ -2978,6 +3041,7 @@ def run_browser_session(
         result.first_visible_frame_s, result.black_loading_s = _extract_visible_frame_timing(result)
         result.js_heap_used_mb, result.js_heap_total_mb = _extract_js_heap_mb(result)
         result.audio_ring_attached, result.audio_frames_drained = _extract_audio_ring_summary(result)
+        result.present_fps_avg = _extract_present_fps_avg(result)
         if result.crashed:
             result.ok = False
             result.exit_code = 1
@@ -3063,6 +3127,7 @@ def build_boot_report(
     effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
     effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
+    effective_present_fps_avg = _extract_present_fps_avg(session, probe)
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -3147,6 +3212,8 @@ def build_boot_report(
         summary["audio_ring_attached"] = effective_audio_ring_attached
     if effective_audio_frames_drained is not None:
         summary["audio_frames_drained"] = effective_audio_frames_drained
+    if effective_present_fps_avg is not None:
+        summary["present_fps_avg"] = effective_present_fps_avg
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -3163,6 +3230,7 @@ def build_boot_report(
         "js_heap_total_mb": effective_js_heap_total_mb,
         "audio_ring_attached": effective_audio_ring_attached,
         "audio_frames_drained": effective_audio_frames_drained,
+        "present_fps_avg": effective_present_fps_avg,
         "status": status,
         "phase": phase,
         "exit_code": session.exit_code,
@@ -3231,6 +3299,7 @@ def build_telemetry_payload(
     effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
     effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
+    effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_hide_hud = bool(hide_hud or session.hide_hud)
     effective_mp4_fps = mp4_fps if mp4_fps is not None else session.mp4_fps
     effective_mp4_skip_black = bool(mp4_skip_black or session.mp4_skip_black)
@@ -3263,6 +3332,8 @@ def build_telemetry_payload(
         summary["audio_ring_attached"] = effective_audio_ring_attached
     if effective_audio_frames_drained is not None:
         summary["audio_frames_drained"] = effective_audio_frames_drained
+    if effective_present_fps_avg is not None:
+        summary["present_fps_avg"] = effective_present_fps_avg
     return sanitize_value(
         {
             "schema": "playgta6-browser-telemetry",
@@ -3279,6 +3350,7 @@ def build_telemetry_payload(
             "js_heap_total_mb": effective_js_heap_total_mb,
             "audio_ring_attached": effective_audio_ring_attached,
             "audio_frames_drained": effective_audio_frames_drained,
+            "present_fps_avg": effective_present_fps_avg,
             "stream_shaders": effective_stream_shaders,
             "stream_threshold_mb": effective_stream_threshold_mb,
             "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
@@ -3354,6 +3426,11 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
         f"page_errors={counters.get('page_errors', 0)}"
     )
     summary = report.get("summary") if isinstance(report.get("summary"), Mapping) else {}
+    present_fps_avg = _sanitize_non_negative_float(report.get("present_fps_avg"), digits=2)
+    if present_fps_avg is None:
+        present_fps_avg = _sanitize_non_negative_float(summary.get("present_fps_avg"), digits=2)
+    if present_fps_avg is not None:
+        lines.append(f"present_fps_avg: {present_fps_avg:.2f}")
     gpu_adapter = sanitize_gpu_adapter(report.get("gpu_adapter") or summary.get("gpu_adapter"))
     if gpu_adapter:
         lines.append(f"gpu_adapter: {gpu_adapter}")
@@ -3553,7 +3630,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "sanitized scripted-input preset appended as ?inputScript=<preset> "
             "(allowed: start-screen, menu-flow, calibration-skip, intro-watch, "
-            "legal-notices, chrome-menu-flow, chrome-full-boot)"
+            "legal-notices, chrome-menu-flow, chrome-full-boot, menu-to-ingame)"
         ),
     )
     p.add_argument(
@@ -3590,6 +3667,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dump-pipelines",
         action="store_true",
         help=f'set dump_pipelines_dir="{DEFAULT_DUMP_PIPELINES_DIR}" in validated boot-options.json',
+    )
+    p.add_argument(
+        "--quiet-server",
+        action="store_true",
+        help="pass --quiet to server/serve_local.py to suppress per-request access logs during long captures",
     )
     return p
 
@@ -3659,6 +3741,7 @@ def _run(
     mp4_fps = validate_mp4_fps(args.mp4_fps)
     mp4_skip_black = bool(args.mp4_skip_black)
     hide_hud = bool(args.hide_hud)
+    quiet_server = bool(args.quiet_server)
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
 
@@ -3751,6 +3834,7 @@ def _run(
             boot_dir=None if args.smoke else boot_dir,
             game_dir=game_dir,
             shaders_dir=effective_shaders_dir,
+            quiet=quiet_server,
         )
         boot_options_staging_preview: dict[str, Any] | None = None
         if resolved_boot_options is not None:
@@ -3807,6 +3891,7 @@ def _run(
                 "mp4": bool(args.mp4),
                 "mp4_fps": mp4_fps,
                 "mp4_skip_black": mp4_skip_black,
+                "quiet_server": quiet_server,
                 "trust_build": bool(args.trust_build),
                 "port": preview_port,
                 "chrome_found": chrome_path is not None,
@@ -3883,6 +3968,7 @@ def _run(
         stream_shaders=stream_shaders,
         stream_threshold_mb=stream_threshold_mb,
         boot_options=resolved_boot_options,
+        quiet_server=quiet_server,
         runner=runner,
     )
 
@@ -3937,6 +4023,7 @@ def _run(
             "mp4": bool(args.mp4),
             "mp4_fps": mp4_fps,
             "mp4_skip_black": mp4_skip_black,
+            "quiet_server": quiet_server,
             "trust_build": bool(args.trust_build),
             "chrome": basename_label(chrome_path),
             "plan": sanitized_plan,
