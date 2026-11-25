@@ -15,6 +15,7 @@
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
+#include "gpu/shader_pack_index.h"
 #include "guest/boot.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -1671,6 +1672,356 @@ void test_wasm_input_state_and_game_input_wiring() {
     std::memset(cpp_ptr, 0, sizeof(playgta6::InputState));
 }
 
+struct SyntheticTocEntry {
+    uint64_t hash;
+    uint8_t stage;
+    uint32_t offset;
+    uint32_t length;
+};
+
+std::vector<uint8_t> make_synthetic_wgpk_toc(const std::vector<SyntheticTocEntry>& entries,
+                                             uint32_t version = 1,
+                                             uint32_t declared_count = UINT32_MAX) {
+    const uint32_t count =
+        declared_count == UINT32_MAX ? static_cast<uint32_t>(entries.size()) : declared_count;
+    std::vector<uint8_t> out(
+        playgta6::gpu::kShaderPackHeaderBytes + entries.size() * playgta6::gpu::kShaderPackEntryBytes,
+        0);
+    std::memcpy(out.data(), "WGPK", 4);
+    const uint32_t flags = 0;
+    std::memcpy(out.data() + 4, &version, 4);
+    std::memcpy(out.data() + 8, &count, 4);
+    std::memcpy(out.data() + 12, &flags, 4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint8_t* entry = out.data() + playgta6::gpu::kShaderPackHeaderBytes +
+                         i * playgta6::gpu::kShaderPackEntryBytes;
+        std::memcpy(entry, &entries[i].hash, 8);
+        entry[8] = entries[i].stage;
+        std::memcpy(entry + 12, &entries[i].offset, 4);
+        std::memcpy(entry + 16, &entries[i].length, 4);
+    }
+    return out;
+}
+
+void test_shader_pack_index_toc_unit() {
+    namespace gpu = playgta6::gpu;
+
+    // 1. Header parser: valid (0 entries and 18,504 entries) and malformed headers.
+    {
+        const std::vector<uint8_t> empty_toc = make_synthetic_wgpk_toc({});
+        uint32_t count = 99;
+        std::string err;
+        CHECK(gpu::parse_shader_pack_header(empty_toc.data(), empty_toc.size(), &count, &err));
+        CHECK(count == 0);
+
+        const std::vector<uint8_t> full_hdr = make_synthetic_wgpk_toc({}, 1, 18504u);
+        CHECK(gpu::parse_shader_pack_header(full_hdr.data(), full_hdr.size(), &count, &err));
+        CHECK(count == 18504u);
+
+        CHECK(!gpu::parse_shader_pack_header(nullptr, 16, &count, &err));
+        CHECK(err.find("not a WGPK") != std::string::npos);
+
+        CHECK(!gpu::parse_shader_pack_header(empty_toc.data(), 15, &count, &err));
+        CHECK(err.find("not a WGPK") != std::string::npos);
+
+        std::vector<uint8_t> bad_magic = empty_toc;
+        bad_magic[0] = 'X';
+        CHECK(!gpu::parse_shader_pack_header(bad_magic.data(), bad_magic.size(), &count, &err));
+        CHECK(err.find("not a WGPK") != std::string::npos);
+
+        const std::vector<uint8_t> bad_ver = make_synthetic_wgpk_toc({}, 2, 0);
+        CHECK(!gpu::parse_shader_pack_header(bad_ver.data(), bad_ver.size(), &count, &err));
+        CHECK(err.find("unsupported WGPK version 2") != std::string::npos);
+    }
+
+    // 2. TOC-only parsing with payload offsets > 1.83 GiB (0x75200000 > 1,965,031,424 bytes),
+    //    all 3 stages, a zero-length entry at offset 0, and duplicate-key first-wins semantics.
+    {
+        constexpr uint32_t kOffset183GiB = 0x75200000u;  // ~1.83 GiB
+        constexpr uint32_t kOffset185GiB = 0x76800000u;  // ~1.85 GiB
+        const std::vector<uint8_t> toc = make_synthetic_wgpk_toc({
+            {0x1001ULL, 1, kOffset183GiB, 65536u},
+            {0x2002ULL, 2, kOffset185GiB, 131072u},
+            {0x3003ULL, 3, 0x77000000u, 4096u},
+            {0x4004ULL, 1, 0u, 0u},            // length == 0 permitted even with offset < toc_bytes
+            {0x1001ULL, 2, 0x77010000u, 128u}, // duplicate hash: keeps first (Vertex)
+        });
+
+        gpu::ShaderPackIndex idx;
+        std::string err;
+        CHECK(gpu::parse_shader_pack_index_toc(toc.data(), toc.size(), 0, &idx, &err));
+        CHECK(idx.size() == 4);
+        CHECK(idx.at(0x1001ULL) == gpu::PackStage::Vertex);
+        CHECK(idx.at(0x2002ULL) == gpu::PackStage::Fragment);
+        CHECK(idx.at(0x3003ULL) == gpu::PackStage::Compute);
+        CHECK(idx.at(0x4004ULL) == gpu::PackStage::Vertex);
+
+        // Explicit total_file_size >= max(offset + length) succeeds; one byte short fails.
+        constexpr uint64_t kExactFileSize = 0x77010000ULL + 128ULL;
+        CHECK(gpu::parse_shader_pack_index_toc(toc.data(), toc.size(), kExactFileSize, &idx, &err));
+        CHECK(idx.size() == 4);
+        CHECK(!gpu::parse_shader_pack_index_toc(
+            toc.data(), toc.size(), kExactFileSize - 1, &idx, &err));
+        CHECK(err.find("exceeds the file") != std::string::npos);
+        CHECK(idx.empty());
+
+        // Legacy parse_shader_pack_index enforces total_file_size == buffer size and rejects
+        // TOC-only buffers whose payloads lie past the buffer end.
+        CHECK(!gpu::parse_shader_pack_index(toc.data(), toc.size(), &idx, &err));
+        CHECK(err.find("exceeds the file") != std::string::npos);
+    }
+
+    // 3. Rejection cases: truncated TOC, invalid stages, 32-bit offset+length overflow,
+    //    and non-zero payload overlapping the header/TOC.
+    {
+        gpu::ShaderPackIndex idx;
+        std::string err;
+
+        // Truncated entry table (declares 3 entries, only 2 present).
+        const std::vector<uint8_t> trunc = make_synthetic_wgpk_toc(
+            {{0x1ULL, 1, 100u, 16u}, {0x2ULL, 2, 116u, 16u}}, 1, 3u);
+        CHECK(!gpu::parse_shader_pack_index_toc(trunc.data(), trunc.size(), 0, &idx, &err));
+        CHECK(err.find("entry table exceeds") != std::string::npos);
+
+        // Invalid stages: 0 and 4.
+        for (uint8_t bad_stage : {uint8_t{0}, uint8_t{4}, uint8_t{255}}) {
+            const std::vector<uint8_t> bad = make_synthetic_wgpk_toc(
+                {{0x1ULL, 1, 100u, 16u}, {0x2ULL, bad_stage, 116u, 16u}});
+            CHECK(!gpu::parse_shader_pack_index_toc(bad.data(), bad.size(), 0, &idx, &err));
+            CHECK(err.find("stage " + std::to_string(bad_stage)) != std::string::npos);
+            CHECK(idx.empty());
+        }
+
+        // 32-bit offset + length overflow (0xFFFFFF00 + 0x200 > UINT32_MAX).
+        const std::vector<uint8_t> overflow = make_synthetic_wgpk_toc(
+            {{0x1ULL, 1, 0xFFFF'FF00u, 0x200u}});
+        CHECK(!gpu::parse_shader_pack_index_toc(overflow.data(), overflow.size(), 0, &idx, &err));
+        CHECK(err.find("overflow") != std::string::npos);
+        CHECK(idx.empty());
+
+        // Non-zero payload overlapping header/TOC (1 entry => toc_bytes == 36, offset == 35).
+        const std::vector<uint8_t> overlap = make_synthetic_wgpk_toc(
+            {{0x1ULL, 1, 35u, 16u}});
+        CHECK(!gpu::parse_shader_pack_index_toc(overlap.data(), overlap.size(), 0, &idx, &err));
+        CHECK(err.find("overlaps") != std::string::npos);
+        CHECK(idx.empty());
+    }
+}
+
+void test_program_boot_shader_pack_toc_only_loading() {
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace dx = playgta6::gpu::d3d12_xs_exports;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    auto run_and_probe = [&](const WasmBootConfig& cfg,
+                             uint64_t vs_id,
+                             uint64_t ps_id,
+                             bool& resolved_out,
+                             uint64_t& vs_key_out,
+                             uint64_t& ps_key_out) -> WasmBootResult {
+        resolved_out = false;
+        vs_key_out = 0;
+        ps_key_out = 0;
+
+        g_test_entry_hook = [&]() {
+            uint64_t dev_ptr = 0;
+            const int32_t hr = pg6_d3d12_d3d12_xbox_create_device(
+                nullptr, nullptr, &dg::IID_ID3D12Device, &dev_ptr);
+            CHECK(hr == dg::kSOk);
+            auto dev = dx::current_device();
+            CHECK(static_cast<bool>(dev));
+            if (!dev) {
+                return;
+            }
+            dg::GraphicsPsoSource src;
+            src.desc.vs = vs_id;
+            src.desc.ps = ps_id;
+            resolved_out = dev->resolve_with_pack(src, &vs_key_out, &ps_key_out);
+        };
+
+        playgta6::os::VirtualMemoryArena arena;
+        playgta6::os::win32::set_vmem_arena(&arena);
+        dx::reset_for_tests();
+        const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+        g_test_entry_hook = nullptr;
+        dx::reset_for_tests();
+        playgta6::guest::com::reset_com_bridge();
+        playgta6::guest::reset_boot();
+        playgta6::os::win32::set_vmem_arena(nullptr);
+        return r;
+    };
+
+    // 1. TOC-only HTTPFS load on a pack with payload offsets > 1.83 GiB and trailing payload bytes
+    //    in the file: verifies ONLY the 16-byte header + entry_count*20 TOC bytes are ever read,
+    //    even with tiny unaligned chunks (read_chunk_bytes = 7) and a tight max_file_bytes cap.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        std::vector<SyntheticTocEntry> entries;
+        entries.push_back({0xA001ULL, 1, 0x75200000u, 32768u});  // > 1.83 GiB
+        entries.push_back({0xB002ULL, 2, 0x75208000u, 65536u});  // > 1.83 GiB
+        entries.push_back({0xC003ULL, 3, 0x75300000u, 16384u});  // > 1.83 GiB
+        std::vector<uint8_t> toc = make_synthetic_wgpk_toc(entries);
+        const size_t expected_toc_bytes = toc.size();
+        // Append 128 KiB of synthetic WGSL payload bytes after the TOC; wasm_boot must NEVER read
+        // a single byte past `expected_toc_bytes`.
+        std::vector<uint8_t> pack_with_payload = toc;
+        pack_with_payload.resize(expected_toc_bytes + 128 * 1024, 0x55);
+        put_bytes(fs, "shaders/splash.wgsl.pack", std::move(pack_with_payload));
+
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 7;          // exercise multi-chunk header + TOC assembly
+        cfg.max_file_bytes = 64 * 1024;    // smaller than the 128 KiB file, plenty for PGIM & TOC
+
+        uint64_t pack_max_end_offset = 0;
+        uint64_t pack_total_bytes_read = 0;
+        int32_t pack_handle = -1;
+        bool pack_closed_before_entry = false;
+        cfg.open_fn = [&](std::string_view rel_path) -> int32_t {
+            const int32_t h = fake_open(rel_path);
+            if (rel_path == "shaders/splash.wgsl.pack" && h >= 0) {
+                pack_handle = h;
+            }
+            return h;
+        };
+        cfg.read_fn = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+            const int64_t n = fake_read(handle, offset, dst, len);
+            if (handle == pack_handle && n > 0) {
+                pack_total_bytes_read += static_cast<uint64_t>(n);
+                const uint64_t end = offset + static_cast<uint64_t>(n);
+                if (end > pack_max_end_offset) {
+                    pack_max_end_offset = end;
+                }
+            }
+            return n;
+        };
+        cfg.close_fn = [&](int32_t handle) {
+            if (handle == pack_handle) {
+                pack_closed_before_entry = true;
+            }
+            fake_close(handle);
+        };
+
+        bool resolved = false;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        const WasmBootResult r =
+            run_and_probe(cfg, 0xA001ULL, 0xB002ULL, resolved, vs_key, ps_key);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(resolved);
+        CHECK(vs_key == 0xA001ULL);
+        CHECK(ps_key == 0xB002ULL);
+        CHECK(pack_handle >= 0);
+        CHECK(pack_closed_before_entry);
+        CHECK(pack_max_end_offset == expected_toc_bytes);
+        CHECK(pack_total_bytes_read == expected_toc_bytes);
+        CHECK(fs.handles.empty());
+        CHECK(saw_log("[boot] SHADER_PACK: shaders/splash.wgsl.pack loaded (3 key(s), primary)"));
+    }
+
+    // 2. Corrupt/truncated primary packs fall back cleanly to `shaders/fallback.wgsl.pack`:
+    //    (a) truncated header, (b) unsupported version, (c) truncated TOC,
+    //    (d) oversized TOC entry_count guard, (e) invalid entry stage.
+    struct BadPrimaryCase {
+        const char* name;
+        std::vector<uint8_t> bytes;
+        const char* expected_log_substr;
+    };
+    const std::vector<BadPrimaryCase> bad_cases = {
+        {"truncated_header", {'W', 'G', 'P', 'K', 1, 0, 0, 0}, "not a WGPK shader pack"},
+        {"bad_version", make_synthetic_wgpk_toc({}, 9, 0), "unsupported WGPK version 9"},
+        {"truncated_toc",
+         make_synthetic_wgpk_toc({{0x11ULL, 1, 100u, 16u}}, 1, 4u),
+         "WGPK entry table exceeds the file"},
+        {"oversized_toc",
+         make_synthetic_wgpk_toc({}, 1, 0x10000000u),
+         "exceeds"},
+        {"invalid_stage",
+         make_synthetic_wgpk_toc({{0x11ULL, 9, 100u, 16u}}),
+         "has stage 9"},
+    };
+
+    for (const BadPrimaryCase& tc : bad_cases) {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack", tc.bytes);
+        put_bytes(fs, "shaders/fallback.wgsl.pack",
+                  make_synthetic_wgpk_toc({{0x5555ULL, 1, 0x75200000u, 4096u},
+                                           {0x6666ULL, 2, 0x75201000u, 4096u}}));
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        bool resolved = false;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        const WasmBootResult r =
+            run_and_probe(cfg, 0x5555ULL, 0x6666ULL, resolved, vs_key, ps_key);
+        CHECK(r.ok);
+        CHECK(r.exit_code == 42);
+        CHECK(resolved);
+        CHECK(vs_key == 0x5555ULL);
+        CHECK(ps_key == 0x6666ULL);
+        CHECK(fs.handles.empty());
+
+        bool saw_invalid = false;
+        for (const std::string& line : g_logs) {
+            if (line.find("[boot] SHADER_PACK: shaders/splash.wgsl.pack invalid: ") == 0 &&
+                line.find(tc.expected_log_substr) != std::string::npos) {
+                saw_invalid = true;
+            }
+        }
+        CHECK(saw_invalid);
+        CHECK(saw_log("[boot] SHADER_PACK: shaders/fallback.wgsl.pack loaded (2 key(s), fallback)"));
+    }
+
+    // 3. HTTPFS read error on primary shader pack closes its handle and falls back cleanly.
+    {
+        FakeFs fs;
+        setup_synthetic_program_fs(fs);
+        put_bytes(fs, "shaders/splash.wgsl.pack",
+                  make_synthetic_wgpk_toc({{0x1111ULL, 1, 100u, 16u}}));
+        put_bytes(fs, "shaders/fallback.wgsl.pack",
+                  make_synthetic_wgpk_toc({{0x7777ULL, 1, 0x75200000u, 2048u},
+                                           {0x8888ULL, 2, 0x75200800u, 2048u}}));
+        WasmBootConfig cfg = make_cfg(fs);
+        cfg.read_chunk_bytes = 4096;
+
+        int32_t primary_handle = -1;
+        cfg.open_fn = [&](std::string_view rel_path) -> int32_t {
+            const int32_t h = fake_open(rel_path);
+            if (rel_path == "shaders/splash.wgsl.pack") {
+                primary_handle = h;
+            }
+            return h;
+        };
+        cfg.read_fn = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+            if (handle == primary_handle && offset > 0) {
+                return -5;  // simulate I/O error while reading TOC body
+            }
+            return fake_read(handle, offset, dst, len);
+        };
+
+        bool resolved = false;
+        uint64_t vs_key = 0;
+        uint64_t ps_key = 0;
+        const WasmBootResult r =
+            run_and_probe(cfg, 0x7777ULL, 0x8888ULL, resolved, vs_key, ps_key);
+        CHECK(r.ok);
+        CHECK(resolved);
+        CHECK(vs_key == 0x7777ULL);
+        CHECK(ps_key == 0x8888ULL);
+        CHECK(fs.handles.empty());
+        CHECK(saw_log("[boot] SHADER_PACK: shaders/fallback.wgsl.pack loaded (2 key(s), fallback)"));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1695,6 +2046,8 @@ int main() {
     test_program_boot_scoped_httpfs_bridge();
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
+    test_shader_pack_index_toc_unit();
+    test_program_boot_shader_pack_toc_only_loading();
     test_try_load_stage_reflection();
     test_program_boot_stage_reflection_sidecar();
     test_program_boot_pipeline_dump_triggers();
