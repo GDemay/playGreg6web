@@ -8,7 +8,7 @@ handling of unknown/future opcodes >= 35).
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
 
-    python tools/gpu_trace.py <trace.bin> [--json] [--stats] [--strict] [--shader-summary] [--binding-audit] [--bink-video-audit] [--start-screen-skips]
+    python tools/gpu_trace.py <trace.bin|timings.json> [--json] [--stats] [--strict] [--shader-summary] [--binding-audit] [--bink-video-audit] [--start-screen-skips] [--analyze-30fps] [--budget-ms 33.333] [--top-n 10]
 """
 
 from __future__ import annotations
@@ -87,6 +87,18 @@ SWAPCHAIN_TEXTURE_ID = 0xFFFFFFFF
 MANIFEST_REFERENCE_FLAG = 0x1
 
 DEFAULT_PREVIEW_BYTES = 16
+DEFAULT_30FPS_BUDGET_MS = 33.333
+DEFAULT_TOP_N = 10
+SPIKE_ANALYSIS_SCHEMA_VERSION = 1
+
+SPIKE_CAUSES: tuple[str, ...] = (
+    "pso_compile",
+    "staging_upload",
+    "draw_burst",
+    "rt_alloc",
+    "sync_stall",
+    "unknown",
+)
 
 FNV1A_64_OFFSET_BASIS = 0xCBF29CE484222325
 FNV1A_64_PRIME = 0x100000001B3
@@ -737,6 +749,9 @@ class DecodedTrace:
         binding_audit: bool = False,
         bink_video_audit: bool = False,
         start_screen_skips: bool = False,
+        analyze_30fps: bool = False,
+        budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+        top_n: int = DEFAULT_TOP_N,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "abi_version": self.abi_version,
@@ -783,6 +798,12 @@ class DecodedTrace:
             result["bink_video_audit"] = audit_bink_video(self)
         if start_screen_skips:
             result["start_screen_skips"] = audit_start_screen_skips(self)
+        if analyze_30fps:
+            result["fps30_analysis"] = analyze_30fps_trace(
+                self,
+                budget_ms=budget_ms,
+                top_n=top_n,
+            )
         return result
 
 
@@ -5528,6 +5549,1606 @@ def format_start_screen_skips_text(audit: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 30 FPS Frame-Budget Spike & Hotspot Analyzer (T67 / #1211)
+# ---------------------------------------------------------------------------
+
+_TIMING_LOG_EXTENSIONS: frozenset[str] = frozenset(
+    {".json", ".jsonl", ".ndjson", ".log", ".txt"}
+)
+
+_EXPLICIT_CAUSE_ALIASES: dict[str, str] = {
+    "pso_compile": "pso_compile",
+    "pso": "pso_compile",
+    "pipeline_compile": "pso_compile",
+    "pipeline_creation": "pso_compile",
+    "shader_compile": "pso_compile",
+    "shader_module": "pso_compile",
+    "compile": "pso_compile",
+    "staging_upload": "staging_upload",
+    "upload": "staging_upload",
+    "staging": "staging_upload",
+    "texture_upload": "staging_upload",
+    "buffer_upload": "staging_upload",
+    "write_texture": "staging_upload",
+    "write_buffer": "staging_upload",
+    "copy_upload": "staging_upload",
+    "vram_upload": "staging_upload",
+    "draw_burst": "draw_burst",
+    "draw": "draw_burst",
+    "draws": "draw_burst",
+    "draw_calls": "draw_burst",
+    "render_pass": "draw_burst",
+    "geometry": "draw_burst",
+    "compute_burst": "draw_burst",
+    "dispatch_burst": "draw_burst",
+    "rt_alloc": "rt_alloc",
+    "render_target_alloc": "rt_alloc",
+    "rt_pool": "rt_alloc",
+    "texture_alloc": "rt_alloc",
+    "resource_alloc": "rt_alloc",
+    "alloc": "rt_alloc",
+    "allocation": "rt_alloc",
+    "resize": "rt_alloc",
+    "swapchain_resize": "rt_alloc",
+    "sync_stall": "sync_stall",
+    "sync": "sync_stall",
+    "stall": "sync_stall",
+    "fence": "sync_stall",
+    "fence_wait": "sync_stall",
+    "readback": "sync_stall",
+    "map_async": "sync_stall",
+    "wait": "sync_stall",
+    "present_wait": "sync_stall",
+    "backpressure": "sync_stall",
+    "ring_stall": "sync_stall",
+    "gpu_wait": "sync_stall",
+    "barrier": "sync_stall",
+    "unknown": "unknown",
+}
+
+_CAUSE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "pso_compile",
+        re.compile(
+            r"(?:^|_)(?:pso|pipeline|compile|compiled|compiling|shader|wgsl|naga|tint|"
+            r"create_render_pipeline\d*|create_compute_pipeline\d*|create_shader_module)(?:$|_)"
+        ),
+    ),
+    (
+        "staging_upload",
+        re.compile(
+            r"(?:^|_)(?:staging|upload|uploads|uploading|write_texture|write_buffer|"
+            r"copy_buffer_to_texture|copy_buffer_to_buffer|texel_upload|slab|bink_upload)(?:$|_)"
+        ),
+    ),
+    (
+        "rt_alloc",
+        re.compile(
+            r"(?:^|_)(?:rt_alloc|rt_pool|render_target|create_texture\d*|create_buffer|"
+            r"alloc_rt|reallocate|alloc|allocation|resize|depth_target|create_view)(?:$|_)"
+        ),
+    ),
+    (
+        "sync_stall",
+        re.compile(
+            r"(?:^|_)(?:sync|stall|fence|map_async|readback|submitted_work_done|"
+            r"present_wait|backpressure|ring_wait|barrier|wait|flush|lock|bind_group_setup)(?:$|_)"
+        ),
+    ),
+    (
+        "draw_burst",
+        re.compile(
+            r"(?:^|_)(?:draw|draws|draw_indexed|dispatch|dispatch_compute|render_pass|"
+            r"compute_pass|shadow|gbuffer|lighting|postprocess|post_process|geometry|"
+            r"opaque|transparent|particles|terrain|foliage|sky|hud|ui|blit|composite|"
+            r"bink_draw|present|pass)(?:$|_)"
+        ),
+    ),
+)
+
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+_TOKEN_SEP_RE = re.compile(r"[^a-z0-9]+")
+_SHADER_SOURCE_RE = re.compile(
+    r"(?:@vertex|@fragment|@compute|@group\s*\(|@binding\s*\(|@location\s*\(|"
+    r"@builtin\s*\(|\bvar<|\bfn\s+[A-Za-z_]\w*\s*\(|\bstruct\s+[A-Za-z_]\w*\s*\{|"
+    r"\bcbuffer\b|\bTexture2D\b|#version\b|#pragma\b|[{};])"
+)
+_HOST_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\|file://|(?:^|[\s'\"(])/(?:Users|home|var|tmp|etc|opt|mnt|Volumes|root|private|proc)/|"
+    r"(?:^|[\s'\"(])(?:Users|home|local-data|work)[\\/]|"
+    r"\.(?:wgsl|rpf|xvd|xvc|ttpf|awc|pg6trace|bin|exe|dll|pdb)\b)",
+    re.IGNORECASE,
+)
+_CHROME_FRAME_NAME_RE = re.compile(
+    r"^(?:frame|gpu_?frame|render_?frame|main_?frame|present_?frame|begin_?frame)$",
+    re.IGNORECASE,
+)
+
+
+def _validate_budget_and_top_n(budget_ms: float, top_n: int) -> tuple[float, int]:
+    if isinstance(budget_ms, bool) or not isinstance(budget_ms, (int, float)):
+        raise ValueError(f"budget_ms must be a positive finite number, got {budget_ms!r}")
+    budget = float(budget_ms)
+    if not math.isfinite(budget) or budget <= 0.0:
+        raise ValueError(f"budget_ms must be a positive finite number, got {budget_ms!r}")
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n < 1:
+        raise ValueError(f"top_n must be a positive integer, got {top_n!r}")
+    return budget, top_n
+
+
+def _as_non_negative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    fval = float(value)
+    if not math.isfinite(fval) or fval < 0.0:
+        return None
+    return fval
+
+
+def _as_non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value >= 0.0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _normalize_identifier_tokens(text: str) -> str:
+    spaced = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", text)
+    return _TOKEN_SEP_RE.sub("_", spaced.lower()).strip("_")
+
+
+def _sanitize_marker_name(raw: Any, fallback: str = "unnamed_pass") -> str:
+    """Sanitize pass/marker names so host paths and raw shader source can never leak."""
+    if not isinstance(raw, str):
+        return fallback
+    trimmed = raw.strip()
+    if not trimmed:
+        return fallback
+    if _SHADER_SOURCE_RE.search(trimmed):
+        return "shader_event_redacted"
+    if _HOST_PATH_RE.search(trimmed) or "\\" in trimmed or trimmed.startswith("/"):
+        return "path_redacted"
+    if ".." in trimmed:
+        return "path_redacted"
+    cleaned = re.sub(r"[\x00-\x1f\x7f]+", " ", trimmed)
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("_")
+    cleaned = re.sub(r"[^A-Za-z0-9_.:#-]+", "_", cleaned).strip("_")
+    if not cleaned:
+        return fallback
+    return cleaned[:64]
+
+
+def _sanitize_phase_name(raw: Any) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    if not trimmed or _SHADER_SOURCE_RE.search(trimmed) or _HOST_PATH_RE.search(trimmed):
+        return None
+    if "\\" in trimmed or "/" in trimmed or ".." in trimmed:
+        return None
+    norm = _TOKEN_SEP_RE.sub("_", trimmed.lower()).strip("_")
+    if not norm:
+        return None
+    return norm[:32]
+
+
+def _nearest_rank_percentile(sorted_values: Sequence[float], fraction: float) -> float:
+    count = len(sorted_values)
+    if count <= 0:
+        return 0.0
+    idx = min(count - 1, max(0, math.ceil(fraction * count) - 1))
+    return float(sorted_values[idx])
+
+
+def classify_spike_cause(
+    marker: str | None = None,
+    *,
+    explicit_cause: str | None = None,
+    counters: dict[str, Any] | None = None,
+) -> str:
+    """Classify a pass/event marker or frame counter set into a canonical spike cause.
+
+    Canonical causes: `pso_compile`, `staging_upload`, `draw_burst`, `rt_alloc`,
+    `sync_stall`, `unknown`.
+    """
+    if isinstance(explicit_cause, str) and explicit_cause.strip():
+        norm_explicit = _normalize_identifier_tokens(explicit_cause)
+        mapped = _EXPLICIT_CAUSE_ALIASES.get(norm_explicit)
+        if mapped is not None and mapped != "unknown":
+            return mapped
+
+    if isinstance(marker, str) and marker.strip():
+        if _SHADER_SOURCE_RE.search(marker):
+            return "pso_compile"
+        norm_marker = _normalize_identifier_tokens(marker)
+        if norm_marker in _EXPLICIT_CAUSE_ALIASES and _EXPLICIT_CAUSE_ALIASES[norm_marker] != "unknown":
+            return _EXPLICIT_CAUSE_ALIASES[norm_marker]
+        for cause, pattern in _CAUSE_PATTERNS:
+            if pattern.search(norm_marker):
+                return cause
+
+    if counters:
+        # 1. Explicit per-cause millisecond breakdowns win when provided.
+        ms_scores: dict[str, float] = {
+            "pso_compile": (
+                (_as_non_negative_float(counters.get("pso_compile_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("compile_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("shader_compile_ms")) or 0.0)
+            ),
+            "staging_upload": (
+                (_as_non_negative_float(counters.get("staging_upload_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("upload_ms")) or 0.0)
+            ),
+            "rt_alloc": (
+                (_as_non_negative_float(counters.get("rt_alloc_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("alloc_ms")) or 0.0)
+            ),
+            "sync_stall": (
+                (_as_non_negative_float(counters.get("sync_stall_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("stall_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("fence_wait_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("readback_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("wait_ms")) or 0.0)
+            ),
+            "draw_burst": (
+                (_as_non_negative_float(counters.get("draw_burst_ms")) or 0.0)
+                + (_as_non_negative_float(counters.get("draw_ms")) or 0.0)
+            ),
+        }
+        best_ms_cause = max(
+            SPIKE_CAUSES[:-1],
+            key=lambda c: (ms_scores[c], -SPIKE_CAUSES.index(c)),
+        )
+        if ms_scores[best_ms_cause] > 0.0:
+            return best_ms_cause
+
+        # 2. Weighted counter heuristic fallback.
+        pso_compiles = (
+            (_as_non_negative_int(counters.get("pso_compiles")) or 0)
+            + (_as_non_negative_int(counters.get("pipelines_compiled")) or 0)
+            + (_as_non_negative_int(counters.get("pipelines_created")) or 0)
+        )
+        shaders_compiled = (
+            (_as_non_negative_int(counters.get("shaders_compiled")) or 0)
+            + (_as_non_negative_int(counters.get("shader_modules_created")) or 0)
+        )
+        upload_bytes = (
+            (_as_non_negative_int(counters.get("upload_bytes")) or 0)
+            + (_as_non_negative_int(counters.get("staging_bytes")) or 0)
+            + (_as_non_negative_int(counters.get("staging_upload_bytes")) or 0)
+        )
+        staging_uploads = (
+            (_as_non_negative_int(counters.get("staging_uploads")) or 0)
+            + (_as_non_negative_int(counters.get("upload_count")) or 0)
+        )
+        rt_allocs = (
+            (_as_non_negative_int(counters.get("rt_allocs")) or 0)
+            + (_as_non_negative_int(counters.get("render_targets_created")) or 0)
+            + (_as_non_negative_int(counters.get("textures_created")) or 0)
+        )
+        buffer_allocs = _as_non_negative_int(counters.get("buffer_allocs")) or 0
+        sync_stalls = (
+            (_as_non_negative_int(counters.get("sync_stalls")) or 0)
+            + (_as_non_negative_int(counters.get("fence_waits")) or 0)
+        )
+        draw_calls = _as_non_negative_int(counters.get("draw_calls")) or 0
+        compute_dispatches = _as_non_negative_int(counters.get("compute_dispatches")) or 0
+
+        weighted_scores: dict[str, float] = {
+            "pso_compile": pso_compiles * 8.0 + shaders_compiled * 3.5,
+            "staging_upload": (upload_bytes / (1024.0 * 1024.0)) * 2.5 + staging_uploads * 0.5,
+            "rt_alloc": rt_allocs * 4.5 + buffer_allocs * 0.15,
+            "sync_stall": sync_stalls * 5.0,
+            "draw_burst": draw_calls * 0.04 + compute_dispatches * 0.15,
+        }
+        best_cnt_cause = max(
+            SPIKE_CAUSES[:-1],
+            key=lambda c: (weighted_scores[c], -SPIKE_CAUSES.index(c)),
+        )
+        if weighted_scores[best_cnt_cause] > 0.0:
+            return best_cnt_cause
+
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class _PassSample:
+    name: str
+    duration_ms: float
+    cause: str
+
+
+@dataclass(frozen=True)
+class _FrameSample:
+    frame_index: int
+    frame_ms: float
+    cause: str
+    top_pass: str | None
+    top_pass_ms: float
+    phase: str | None
+    draw_calls: int
+    compute_dispatches: int
+    pso_compiles: int
+    upload_bytes: int
+    rt_allocs: int
+    sync_stall_ms: float
+    passes: tuple[_PassSample, ...]
+
+
+def _extract_duration_ms(obj: dict[str, Any], *, allow_chrome_dur_us: bool = False) -> float | None:
+    for key in (
+        "frame_ms",
+        "frameMs",
+        "duration_ms",
+        "durationMs",
+        "frame_time_ms",
+        "frameTimeMs",
+        "dt_ms",
+        "dtMs",
+        "total_ms",
+        "totalMs",
+        "elapsed_ms",
+        "elapsedMs",
+        "gpu_ms",
+        "gpuMs",
+        "time_ms",
+        "timeMs",
+        "ms",
+    ):
+        if key in obj and obj[key] is not None:
+            return _as_non_negative_float(obj[key])
+    for key in ("frame_us", "duration_us", "durationUs", "us"):
+        if key in obj and obj[key] is not None:
+            us = _as_non_negative_float(obj[key])
+            return None if us is None else us / 1000.0
+    if allow_chrome_dur_us and "dur" in obj and obj["dur"] is not None:
+        us = _as_non_negative_float(obj["dur"])
+        return None if us is None else us / 1000.0
+    for key in ("frame_ns", "duration_ns", "durationNs", "ns"):
+        if key in obj and obj[key] is not None:
+            ns = _as_non_negative_float(obj[key])
+            return None if ns is None else ns / 1_000_000.0
+    for start_k, end_k in (("start_ms", "end_ms"), ("startMs", "endMs")):
+        if start_k in obj and end_k in obj:
+            s = _as_non_negative_float(obj[start_k])
+            e = _as_non_negative_float(obj[end_k])
+            if s is not None and e is not None and e >= s:
+                return e - s
+            return None
+    return None
+
+
+def _extract_frame_counters(obj: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    int_aliases: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("draw_calls", ("draw_calls", "drawCalls", "draws")),
+        ("compute_dispatches", ("compute_dispatches", "computeDispatches", "dispatches")),
+        ("pso_compiles", ("pso_compiles", "psoCompiles", "pipelines_compiled", "pipelinesCompiled", "pipelines_created", "pipelinesCreated")),
+        ("shaders_compiled", ("shaders_compiled", "shadersCompiled", "shader_modules_created", "shaderModulesCreated")),
+        ("upload_bytes", ("upload_bytes", "uploadBytes", "staging_bytes", "stagingBytes", "staging_upload_bytes", "stagingUploadBytes")),
+        ("staging_uploads", ("staging_uploads", "stagingUploads", "upload_count", "uploadCount")),
+        ("rt_allocs", ("rt_allocs", "rtAllocs", "render_targets_created", "renderTargetsCreated", "textures_created", "texturesCreated")),
+        ("buffer_allocs", ("buffer_allocs", "bufferAllocs", "buffers_created", "buffersCreated")),
+        ("sync_stalls", ("sync_stalls", "syncStalls", "fence_waits", "fenceWaits")),
+    )
+    for canonical, keys in int_aliases:
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                v = _as_non_negative_int(obj[k])
+                if v is not None:
+                    out[canonical] = v
+                    break
+
+    float_aliases: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("pso_compile_ms", ("pso_compile_ms", "psoCompileMs", "compile_ms", "compileMs", "shader_compile_ms")),
+        ("staging_upload_ms", ("staging_upload_ms", "stagingUploadMs", "upload_ms", "uploadMs")),
+        ("rt_alloc_ms", ("rt_alloc_ms", "rtAllocMs", "alloc_ms", "allocMs")),
+        ("sync_stall_ms", ("sync_stall_ms", "syncStallMs", "stall_ms", "stallMs", "fence_wait_ms", "fenceWaitMs", "readback_ms", "readbackMs", "wait_ms")),
+        ("draw_ms", ("draw_burst_ms", "drawBurstMs", "draw_ms", "drawMs")),
+    )
+    for canonical, keys in float_aliases:
+        for k in keys:
+            if k in obj and obj[k] is not None:
+                v = _as_non_negative_float(obj[k])
+                if v is not None:
+                    out[canonical] = v
+                    break
+    return out
+
+
+def _parse_pass_entries(
+    raw_passes: Any,
+    diagnostics: list[dict[str, Any]],
+    record_index: int,
+) -> tuple[list[_PassSample], int]:
+    samples: list[_PassSample] = []
+    malformed = 0
+    if raw_passes is None:
+        return samples, 0
+
+    if isinstance(raw_passes, dict):
+        for raw_name, raw_val in raw_passes.items():
+            if isinstance(raw_val, dict):
+                dur = _extract_duration_ms(raw_val, allow_chrome_dur_us=True)
+                if dur is None:
+                    # Also accept GpuPassTimer passStats shape ({avgMs, maxMs, lastMs}).
+                    for k in ("lastMs", "avgMs", "maxMs", "totalMs"):
+                        if k in raw_val:
+                            dur = _as_non_negative_float(raw_val[k])
+                            if dur is not None:
+                                break
+                if dur is None:
+                    malformed += 1
+                    diagnostics.append(
+                        {
+                            "severity": "warning",
+                            "code": "invalid_pass_duration",
+                            "record_index": record_index,
+                            "message": f"Frame record {record_index} has a pass entry with an invalid duration.",
+                        }
+                    )
+                    continue
+                explicit = raw_val.get("cause") or raw_val.get("category") or raw_val.get("bottleneck")
+                cause = classify_spike_cause(
+                    str(raw_name),
+                    explicit_cause=explicit if isinstance(explicit, str) else None,
+                    counters=_extract_frame_counters(raw_val),
+                )
+                samples.append(
+                    _PassSample(
+                        name=_sanitize_marker_name(str(raw_name)),
+                        duration_ms=dur,
+                        cause=cause,
+                    )
+                )
+            else:
+                dur = _as_non_negative_float(raw_val)
+                if dur is None:
+                    malformed += 1
+                    diagnostics.append(
+                        {
+                            "severity": "warning",
+                            "code": "invalid_pass_duration",
+                            "record_index": record_index,
+                            "message": f"Frame record {record_index} has a pass entry with an invalid duration.",
+                        }
+                    )
+                    continue
+                cause = classify_spike_cause(str(raw_name))
+                samples.append(
+                    _PassSample(
+                        name=_sanitize_marker_name(str(raw_name)),
+                        duration_ms=dur,
+                        cause=cause,
+                    )
+                )
+        return samples, malformed
+
+    if not isinstance(raw_passes, list):
+        return samples, 0
+
+    for item in raw_passes:
+        if not isinstance(item, dict):
+            malformed += 1
+            diagnostics.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_pass_entry",
+                    "record_index": record_index,
+                    "message": f"Frame record {record_index} contains a non-object pass entry.",
+                }
+            )
+            continue
+        dur = _extract_duration_ms(item, allow_chrome_dur_us=True)
+        if dur is None:
+            malformed += 1
+            diagnostics.append(
+                {
+                    "severity": "warning",
+                    "code": "invalid_pass_duration",
+                    "record_index": record_index,
+                    "message": f"Frame record {record_index} contains a pass entry with a missing or invalid duration.",
+                }
+            )
+            continue
+        raw_name = (
+            item.get("name")
+            or item.get("label")
+            or item.get("pass")
+            or item.get("op")
+            or item.get("marker")
+            or item.get("event")
+            or ""
+        )
+        raw_name_str = raw_name if isinstance(raw_name, str) else ""
+        explicit = item.get("cause") or item.get("category") or item.get("bottleneck") or item.get("cat")
+        cause = classify_spike_cause(
+            raw_name_str,
+            explicit_cause=explicit if isinstance(explicit, str) else None,
+            counters=_extract_frame_counters(item),
+        )
+        samples.append(
+            _PassSample(
+                name=_sanitize_marker_name(raw_name_str),
+                duration_ms=dur,
+                cause=cause,
+            )
+        )
+    return samples, malformed
+
+
+def _build_frame_sample_from_dict(
+    obj: dict[str, Any],
+    fallback_index: int,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[_FrameSample | None, int]:
+    malformed = 0
+    idx_val: int | None = None
+    for k in ("frame_index", "frameIndex", "frame", "frame_id", "frameId", "seq", "index"):
+        if k in obj and obj[k] is not None:
+            idx_val = _as_non_negative_int(obj[k])
+            if idx_val is not None:
+                break
+    frame_index = fallback_index if idx_val is None else idx_val
+
+    raw_passes = None
+    for k in ("passes", "events", "markers", "spans", "ops"):
+        if k in obj and obj[k] is not None:
+            raw_passes = obj[k]
+            break
+    passes, pass_malformed = _parse_pass_entries(raw_passes, diagnostics, fallback_index)
+    malformed += pass_malformed
+
+    frame_ms = _extract_duration_ms(obj, allow_chrome_dur_us=False)
+    if frame_ms is None:
+        if passes:
+            frame_ms = sum(p.duration_ms for p in passes)
+        else:
+            malformed += 1
+            diagnostics.append(
+                {
+                    "severity": "warning",
+                    "code": "invalid_frame_duration",
+                    "record_index": fallback_index,
+                    "message": f"Frame record {fallback_index} is missing a valid non-negative duration.",
+                }
+            )
+            return None, malformed
+
+    counters = _extract_frame_counters(obj)
+    explicit = obj.get("cause") or obj.get("category") or obj.get("bottleneck") or obj.get("spike_cause")
+    explicit_str = explicit if isinstance(explicit, str) else None
+    raw_marker = obj.get("marker") or obj.get("label") or obj.get("name") or obj.get("op")
+    marker_str = raw_marker if isinstance(raw_marker, str) else None
+
+    # Determine dominant cause: explicit cause > timed passes > marker/counters > unknown.
+    cause = "unknown"
+    if explicit_str:
+        cause = classify_spike_cause(explicit_cause=explicit_str)
+    if cause == "unknown" and passes:
+        cause_ms: dict[str, float] = {c: 0.0 for c in SPIKE_CAUSES}
+        for p in passes:
+            cause_ms[p.cause] += p.duration_ms
+        best_pass_cause = max(
+            SPIKE_CAUSES[:-1],
+            key=lambda c: (cause_ms[c], -SPIKE_CAUSES.index(c)),
+        )
+        if cause_ms[best_pass_cause] > 0.0:
+            cause = best_pass_cause
+    if cause == "unknown":
+        cause = classify_spike_cause(marker_str, counters=counters)
+
+    top_pass: str | None = None
+    top_pass_ms = 0.0
+    if passes:
+        best_p = max(passes, key=lambda p: (p.duration_ms, -SPIKE_CAUSES.index(p.cause), p.name))
+        top_pass = best_p.name
+        top_pass_ms = best_p.duration_ms
+
+    return (
+        _FrameSample(
+            frame_index=frame_index,
+            frame_ms=frame_ms,
+            cause=cause,
+            top_pass=top_pass,
+            top_pass_ms=top_pass_ms,
+            phase=_sanitize_phase_name(obj.get("phase")),
+            draw_calls=int(counters.get("draw_calls", 0)),
+            compute_dispatches=int(counters.get("compute_dispatches", 0)),
+            pso_compiles=int(counters.get("pso_compiles", 0)),
+            upload_bytes=int(counters.get("upload_bytes", 0)),
+            rt_allocs=int(counters.get("rt_allocs", 0)),
+            sync_stall_ms=float(counters.get("sync_stall_ms", 0.0)),
+            passes=tuple(passes),
+        ),
+        malformed,
+    )
+
+
+def _looks_like_chrome_events(items: list[Any]) -> bool:
+    for item in items:
+        if isinstance(item, dict) and "ph" in item and ("ts" in item or "dur" in item):
+            return True
+    return False
+
+
+def _parse_chrome_trace_events(
+    events: list[Any],
+    diagnostics: list[dict[str, Any]],
+) -> tuple[list[_FrameSample], int]:
+    malformed = 0
+    completed: list[tuple[float, float, str, str, dict[str, Any]]] = []
+    open_stacks: dict[tuple[Any, Any, str], list[tuple[float, str, dict[str, Any]]]] = {}
+
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            malformed += 1
+            diagnostics.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_trace_event",
+                    "record_index": i,
+                    "message": f"Chrome trace event {i} is not a JSON object.",
+                }
+            )
+            continue
+        ph = str(ev.get("ph", "")).upper()
+        name = ev.get("name")
+        name_str = name if isinstance(name, str) else ""
+        cat = ev.get("cat")
+        cat_str = cat if isinstance(cat, str) else ""
+        args = ev.get("args") if isinstance(ev.get("args"), dict) else {}
+
+        if ph == "X":
+            ts = _as_non_negative_float(ev.get("ts"))
+            dur = _as_non_negative_float(ev.get("dur"))
+            if dur is None:
+                malformed += 1
+                diagnostics.append(
+                    {
+                        "severity": "warning",
+                        "code": "invalid_event_duration",
+                        "record_index": i,
+                        "message": f"Chrome trace event {i} has an invalid 'dur' value.",
+                    }
+                )
+                continue
+            start_ms = 0.0 if ts is None else ts / 1000.0
+            completed.append((start_ms, dur / 1000.0, name_str, cat_str, args))
+        elif ph == "B":
+            ts = _as_non_negative_float(ev.get("ts"))
+            if ts is None:
+                malformed += 1
+                continue
+            key = (ev.get("pid", 0), ev.get("tid", 0), name_str)
+            open_stacks.setdefault(key, []).append((ts / 1000.0, cat_str, args))
+        elif ph == "E":
+            ts = _as_non_negative_float(ev.get("ts"))
+            if ts is None:
+                malformed += 1
+                continue
+            key = (ev.get("pid", 0), ev.get("tid", 0), name_str)
+            stack = open_stacks.get(key)
+            if stack:
+                start_ms, b_cat, b_args = stack.pop()
+                end_ms = ts / 1000.0
+                if end_ms >= start_ms:
+                    merged_args = dict(b_args)
+                    merged_args.update(args)
+                    completed.append((start_ms, end_ms - start_ms, name_str, b_cat or cat_str, merged_args))
+
+    if not completed:
+        return [], malformed
+
+    frame_spans: list[tuple[int, float, float, str, dict[str, Any]]] = []
+    pass_events: list[tuple[float, float, str, str, dict[str, Any]]] = []
+
+    for start_ms, dur_ms, name_str, cat_str, args in completed:
+        is_frame = bool(
+            args.get("is_frame")
+            or _CHROME_FRAME_NAME_RE.match(name_str.strip())
+            or "frame" in _normalize_identifier_tokens(cat_str).split("_")
+        )
+        if is_frame:
+            idx = _as_non_negative_int(args.get("frame_index") if "frame_index" in args else args.get("frame"))
+            frame_spans.append((len(frame_spans) if idx is None else idx, start_ms, dur_ms, cat_str, args))
+        else:
+            pass_events.append((start_ms, dur_ms, name_str, cat_str, args))
+
+    frames: list[_FrameSample] = []
+    if frame_spans:
+        span_passes: list[list[_PassSample]] = [[] for _ in frame_spans]
+        index_to_pos = {span[0]: pos for pos, span in enumerate(frame_spans)}
+        for start_ms, dur_ms, name_str, cat_str, args in pass_events:
+            explicit = args.get("cause") or args.get("category") or cat_str
+            cause = classify_spike_cause(
+                name_str,
+                explicit_cause=explicit if isinstance(explicit, str) else None,
+                counters=_extract_frame_counters(args),
+            )
+            ps = _PassSample(name=_sanitize_marker_name(name_str), duration_ms=dur_ms, cause=cause)
+            target_pos: int | None = None
+            arg_idx = _as_non_negative_int(args.get("frame_index") if "frame_index" in args else args.get("frame"))
+            if arg_idx is not None and arg_idx in index_to_pos:
+                target_pos = index_to_pos[arg_idx]
+            else:
+                for pos, (_, f_start, f_dur, _, _) in enumerate(frame_spans):
+                    if f_start <= start_ms <= (f_start + f_dur + 1e-6):
+                        target_pos = pos
+                        break
+            if target_pos is not None:
+                span_passes[target_pos].append(ps)
+
+        for pos, (f_idx, _, f_dur, _, args) in enumerate(frame_spans):
+            passes = span_passes[pos]
+            counters = _extract_frame_counters(args)
+            explicit = args.get("cause") or args.get("bottleneck")
+            cause = "unknown"
+            if isinstance(explicit, str) and explicit.strip():
+                cause = classify_spike_cause(explicit_cause=explicit)
+            if cause == "unknown" and passes:
+                cause_ms: dict[str, float] = {c: 0.0 for c in SPIKE_CAUSES}
+                for p in passes:
+                    cause_ms[p.cause] += p.duration_ms
+                best_c = max(SPIKE_CAUSES[:-1], key=lambda c: (cause_ms[c], -SPIKE_CAUSES.index(c)))
+                if cause_ms[best_c] > 0.0:
+                    cause = best_c
+            if cause == "unknown":
+                cause = classify_spike_cause(counters=counters)
+            top_pass = None
+            top_pass_ms = 0.0
+            if passes:
+                best_p = max(passes, key=lambda p: (p.duration_ms, -SPIKE_CAUSES.index(p.cause), p.name))
+                top_pass = best_p.name
+                top_pass_ms = best_p.duration_ms
+            frames.append(
+                _FrameSample(
+                    frame_index=f_idx,
+                    frame_ms=f_dur,
+                    cause=cause,
+                    top_pass=top_pass,
+                    top_pass_ms=top_pass_ms,
+                    phase=_sanitize_phase_name(args.get("phase")),
+                    draw_calls=int(counters.get("draw_calls", 0)),
+                    compute_dispatches=int(counters.get("compute_dispatches", 0)),
+                    pso_compiles=int(counters.get("pso_compiles", 0)),
+                    upload_bytes=int(counters.get("upload_bytes", 0)),
+                    rt_allocs=int(counters.get("rt_allocs", 0)),
+                    sync_stall_ms=float(counters.get("sync_stall_ms", 0.0)),
+                    passes=tuple(passes),
+                )
+            )
+        return frames, malformed
+
+    # No explicit frame events: group by args.frame_index / args.frame if available.
+    grouped: dict[int, list[tuple[float, str, str, dict[str, Any]]]] = {}
+    ungrouped: list[tuple[float, str, str, dict[str, Any]]] = []
+    for _, dur_ms, name_str, cat_str, args in pass_events:
+        arg_idx = _as_non_negative_int(args.get("frame_index") if "frame_index" in args else args.get("frame"))
+        if arg_idx is not None:
+            grouped.setdefault(arg_idx, []).append((dur_ms, name_str, cat_str, args))
+        else:
+            ungrouped.append((dur_ms, name_str, cat_str, args))
+
+    if grouped:
+        for f_idx in sorted(grouped):
+            items = grouped[f_idx]
+            passes = []
+            for dur_ms, name_str, cat_str, args in items:
+                explicit = args.get("cause") or args.get("category") or cat_str
+                cause = classify_spike_cause(
+                    name_str,
+                    explicit_cause=explicit if isinstance(explicit, str) else None,
+                    counters=_extract_frame_counters(args),
+                )
+                passes.append(_PassSample(name=_sanitize_marker_name(name_str), duration_ms=dur_ms, cause=cause))
+            total_ms = sum(p.duration_ms for p in passes)
+            cause_ms = {c: 0.0 for c in SPIKE_CAUSES}
+            for p in passes:
+                cause_ms[p.cause] += p.duration_ms
+            best_c = max(SPIKE_CAUSES[:-1], key=lambda c: (cause_ms[c], -SPIKE_CAUSES.index(c)))
+            cause = best_c if cause_ms[best_c] > 0.0 else "unknown"
+            best_p = max(passes, key=lambda p: (p.duration_ms, -SPIKE_CAUSES.index(p.cause), p.name))
+            frames.append(
+                _FrameSample(
+                    frame_index=f_idx,
+                    frame_ms=total_ms,
+                    cause=cause,
+                    top_pass=best_p.name,
+                    top_pass_ms=best_p.duration_ms,
+                    phase=None,
+                    draw_calls=0,
+                    compute_dispatches=0,
+                    pso_compiles=0,
+                    upload_bytes=0,
+                    rt_allocs=0,
+                    sync_stall_ms=0.0,
+                    passes=tuple(passes),
+                )
+            )
+        return frames, malformed
+
+    for idx, (dur_ms, name_str, cat_str, args) in enumerate(ungrouped):
+        explicit = args.get("cause") or args.get("category") or cat_str
+        cause = classify_spike_cause(
+            name_str,
+            explicit_cause=explicit if isinstance(explicit, str) else None,
+            counters=_extract_frame_counters(args),
+        )
+        sanitized = _sanitize_marker_name(name_str)
+        ps = _PassSample(name=sanitized, duration_ms=dur_ms, cause=cause)
+        frames.append(
+            _FrameSample(
+                frame_index=idx,
+                frame_ms=dur_ms,
+                cause=cause,
+                top_pass=sanitized,
+                top_pass_ms=dur_ms,
+                phase=_sanitize_phase_name(args.get("phase")),
+                draw_calls=0,
+                compute_dispatches=0,
+                pso_compiles=0,
+                upload_bytes=0,
+                rt_allocs=0,
+                sync_stall_ms=0.0,
+                passes=(ps,),
+            )
+        )
+    return frames, malformed
+
+
+def _parse_frame_records_from_obj(
+    payload: Any,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[list[_FrameSample], int]:
+    frames: list[_FrameSample] = []
+    malformed = 0
+
+    if isinstance(payload, dict):
+        if "traceEvents" in payload and isinstance(payload["traceEvents"], list):
+            return _parse_chrome_trace_events(payload["traceEvents"], diagnostics)
+        for key in ("frames", "frame_timings", "frameTimings", "frame_times_ms", "frameTimesMs", "timings", "samples"):
+            if key in payload:
+                sub = payload[key]
+                if isinstance(sub, list):
+                    return _parse_frame_records_from_obj(sub, diagnostics)
+                if isinstance(sub, dict):
+                    # Support summary-only dict or invalid container gracefully.
+                    break
+        # Single frame dict?
+        if _extract_duration_ms(payload, allow_chrome_dur_us=False) is not None or any(
+            k in payload for k in ("passes", "events", "markers", "spans")
+        ):
+            sample, bad = _build_frame_sample_from_dict(payload, 0, diagnostics)
+            malformed += bad
+            if sample is not None:
+                frames.append(sample)
+            return frames, malformed
+        if not payload:
+            return [], 0
+        malformed += 1
+        diagnostics.append(
+            {
+                "severity": "warning",
+                "code": "unrecognized_timing_payload",
+                "record_index": None,
+                "message": "JSON object does not contain a recognized frames or traceEvents collection.",
+            }
+        )
+        return [], malformed
+
+    if isinstance(payload, list):
+        if _looks_like_chrome_events(payload):
+            return _parse_chrome_trace_events(payload, diagnostics)
+        for idx, item in enumerate(payload):
+            if isinstance(item, dict):
+                sample, bad = _build_frame_sample_from_dict(item, idx, diagnostics)
+                malformed += bad
+                if sample is not None:
+                    frames.append(sample)
+            else:
+                dur = _as_non_negative_float(item)
+                if dur is None:
+                    malformed += 1
+                    diagnostics.append(
+                        {
+                            "severity": "warning",
+                            "code": "invalid_frame_duration",
+                            "record_index": idx,
+                            "message": f"Frame entry {idx} is not a valid non-negative duration.",
+                        }
+                    )
+                    continue
+                frames.append(
+                    _FrameSample(
+                        frame_index=idx,
+                        frame_ms=dur,
+                        cause="unknown",
+                        top_pass=None,
+                        top_pass_ms=0.0,
+                        phase=None,
+                        draw_calls=0,
+                        compute_dispatches=0,
+                        pso_compiles=0,
+                        upload_bytes=0,
+                        rt_allocs=0,
+                        sync_stall_ms=0.0,
+                        passes=(),
+                    )
+                )
+        return frames, malformed
+
+    malformed += 1
+    diagnostics.append(
+        {
+            "severity": "error",
+            "code": "unsupported_timing_payload",
+            "record_index": None,
+            "message": "Top-level timing payload must be a JSON object or array.",
+        }
+    )
+    return [], malformed
+
+
+def _parse_timing_text(
+    text: str,
+    diagnostics: list[dict[str, Any]],
+) -> tuple[list[_FrameSample], int]:
+    stripped = text.lstrip("\ufeff").strip()
+    if not stripped:
+        return [], 0
+
+    try:
+        parsed = json.loads(stripped)
+        return _parse_frame_records_from_obj(parsed, diagnostics)
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: parse as NDJSON / JSON Lines (one JSON object/number per non-empty line).
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    frames: list[_FrameSample] = []
+    malformed = 0
+    any_valid_json_line = False
+    for line_no, line in enumerate(lines, start=1):
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            diagnostics.append(
+                {
+                    "severity": "warning",
+                    "code": "malformed_ndjson_line",
+                    "record_index": line_no - 1,
+                    "message": f"Line {line_no} could not be parsed as JSON.",
+                }
+            )
+            continue
+        any_valid_json_line = True
+        if isinstance(obj, dict):
+            sample, bad = _build_frame_sample_from_dict(obj, len(frames), diagnostics)
+            malformed += bad
+            if sample is not None:
+                frames.append(sample)
+        else:
+            dur = _as_non_negative_float(obj)
+            if dur is None:
+                malformed += 1
+                diagnostics.append(
+                    {
+                        "severity": "warning",
+                        "code": "invalid_frame_duration",
+                        "record_index": line_no - 1,
+                        "message": f"Line {line_no} does not contain a valid frame duration.",
+                    }
+                )
+            else:
+                frames.append(
+                    _FrameSample(
+                        frame_index=len(frames),
+                        frame_ms=dur,
+                        cause="unknown",
+                        top_pass=None,
+                        top_pass_ms=0.0,
+                        phase=None,
+                        draw_calls=0,
+                        compute_dispatches=0,
+                        pso_compiles=0,
+                        upload_bytes=0,
+                        rt_allocs=0,
+                        sync_stall_ms=0.0,
+                        passes=(),
+                    )
+                )
+
+    if not any_valid_json_line:
+        diagnostics.clear()
+        diagnostics.append(
+            {
+                "severity": "error",
+                "code": "malformed_json",
+                "record_index": None,
+                "message": "Input could not be parsed as JSON or NDJSON.",
+            }
+        )
+        return [], max(1, malformed)
+
+    return frames, malformed
+
+
+def _summarize_frame_samples(
+    samples: Sequence[_FrameSample],
+    *,
+    budget_ms: float,
+    top_n: int,
+    source_kind: str,
+    timing_source: str,
+    malformed_records: int,
+    diagnostics: Sequence[dict[str, Any]],
+    strict: bool = False,
+) -> dict[str, Any]:
+    total_frames = len(samples)
+    sorted_ms = sorted(s.frame_ms for s in samples)
+
+    within = sum(1 for s in samples if s.frame_ms <= budget_ms)
+    over = total_frames - within
+    compliance_rate = round(within / total_frames, 6) if total_frames > 0 else 0.0
+
+    avg_ms = round(sum(sorted_ms) / total_frames, 3) if total_frames > 0 else 0.0
+    min_ms = round(sorted_ms[0], 3) if total_frames > 0 else 0.0
+    p50_ms = round(_nearest_rank_percentile(sorted_ms, 0.50), 3)
+    p95_ms = round(_nearest_rank_percentile(sorted_ms, 0.95), 3)
+    p99_ms = round(_nearest_rank_percentile(sorted_ms, 0.99), 3)
+    max_ms = round(sorted_ms[-1], 3) if total_frames > 0 else 0.0
+
+    over_excess_values = [max(0.0, s.frame_ms - budget_ms) for s in samples if s.frame_ms > budget_ms]
+    total_over_budget_ms = round(sum(over_excess_values), 3)
+    max_over_budget_ms = round(max(over_excess_values), 3) if over_excess_values else 0.0
+
+    # Cause counts & breakdown over all over-budget (spike) frames.
+    spike_by_cause: dict[str, list[_FrameSample]] = {c: [] for c in SPIKE_CAUSES}
+    for s in samples:
+        if s.frame_ms > budget_ms:
+            c = s.cause if s.cause in spike_by_cause else "unknown"
+            spike_by_cause[c].append(s)
+
+    spike_causes: dict[str, int] = {c: len(spike_by_cause[c]) for c in SPIKE_CAUSES}
+    cause_breakdown: dict[str, dict[str, Any]] = {}
+    for c in SPIKE_CAUSES:
+        group = spike_by_cause[c]
+        cnt = len(group)
+        if cnt > 0:
+            group_ms = [s.frame_ms for s in group]
+            group_excess = [max(0.0, s.frame_ms - budget_ms) for s in group]
+            tot_c_ms = sum(group_ms)
+            cause_breakdown[c] = {
+                "frame_count": cnt,
+                "share_of_spikes": round(cnt / over, 6) if over > 0 else 0.0,
+                "total_ms": round(tot_c_ms, 3),
+                "avg_ms": round(tot_c_ms / cnt, 3),
+                "max_ms": round(max(group_ms), 3),
+                "over_budget_ms": round(sum(group_excess), 3),
+            }
+        else:
+            cause_breakdown[c] = {
+                "frame_count": 0,
+                "share_of_spikes": 0.0,
+                "total_ms": 0.0,
+                "avg_ms": 0.0,
+                "max_ms": 0.0,
+                "over_budget_ms": 0.0,
+            }
+
+    # Top N slowest frames (deterministic tie-break: frame_index ascending).
+    ranked_frames = sorted(samples, key=lambda s: (-s.frame_ms, s.frame_index))[:top_n]
+    top_slow_frames: list[dict[str, Any]] = []
+    for rank, s in enumerate(ranked_frames, start=1):
+        is_over = s.frame_ms > budget_ms
+        top_slow_frames.append(
+            {
+                "rank": rank,
+                "frame_index": s.frame_index,
+                "frame_ms": round(s.frame_ms, 3),
+                "over_budget": is_over,
+                "over_budget_ms": round(max(0.0, s.frame_ms - budget_ms), 3),
+                "cause": s.cause,
+                "top_pass": s.top_pass,
+                "top_pass_ms": round(s.top_pass_ms, 3),
+                "phase": s.phase,
+                "draw_calls": s.draw_calls,
+                "compute_dispatches": s.compute_dispatches,
+                "pso_compiles": s.pso_compiles,
+                "upload_bytes": s.upload_bytes,
+                "rt_allocs": s.rt_allocs,
+                "sync_stall_ms": round(s.sync_stall_ms, 3),
+            }
+        )
+
+    # Aggregate pass hotspots across all frames.
+    pass_agg: dict[tuple[str, str], dict[str, Any]] = {}
+    for s in samples:
+        is_over = s.frame_ms > budget_ms
+        for p in s.passes:
+            key = (p.name, p.cause)
+            rec = pass_agg.get(key)
+            if rec is None:
+                rec = {
+                    "name": p.name,
+                    "cause": p.cause,
+                    "durations": [],
+                    "over_budget_occurrences": 0,
+                    "max_ms": -1.0,
+                    "worst_frame_index": s.frame_index,
+                }
+                pass_agg[key] = rec
+            rec["durations"].append(p.duration_ms)
+            if is_over:
+                rec["over_budget_occurrences"] += 1
+            if p.duration_ms > rec["max_ms"] or (
+                p.duration_ms == rec["max_ms"] and s.frame_index < rec["worst_frame_index"]
+            ):
+                rec["max_ms"] = p.duration_ms
+                rec["worst_frame_index"] = s.frame_index
+
+    pass_rows: list[dict[str, Any]] = []
+    for rec in pass_agg.values():
+        durs = sorted(rec["durations"])
+        tot_p_ms = sum(durs)
+        occ = len(durs)
+        pass_rows.append(
+            {
+                "name": rec["name"],
+                "cause": rec["cause"],
+                "occurrences": occ,
+                "over_budget_frame_occurrences": rec["over_budget_occurrences"],
+                "total_ms": round(tot_p_ms, 3),
+                "avg_ms": round(tot_p_ms / occ, 3),
+                "p95_ms": round(_nearest_rank_percentile(durs, 0.95), 3),
+                "max_ms": round(durs[-1], 3),
+                "worst_frame_index": rec["worst_frame_index"],
+            }
+        )
+
+    pass_rows.sort(
+        key=lambda row: (
+            -float(row["max_ms"]),
+            -float(row["total_ms"]),
+            SPIKE_CAUSES.index(row["cause"]) if row["cause"] in SPIKE_CAUSES else len(SPIKE_CAUSES),
+            str(row["name"]),
+        )
+    )
+    top_slow_passes: list[dict[str, Any]] = []
+    for rank, row in enumerate(pass_rows[:top_n], start=1):
+        top_slow_passes.append({"rank": rank, **row})
+
+    has_error = any(d.get("severity") == "error" for d in diagnostics)
+    if strict:
+        ok = (not has_error) and malformed_records == 0 and len(diagnostics) == 0
+    else:
+        ok = not has_error
+
+    return {
+        "schema_version": SPIKE_ANALYSIS_SCHEMA_VERSION,
+        "source_kind": source_kind,
+        "timing_source": timing_source,
+        "ok": ok,
+        "budget_ms": round(budget_ms, 3),
+        "target_fps": round(1000.0 / budget_ms, 3),
+        "total_frames": total_frames,
+        "frames_within_budget": within,
+        "frames_over_budget": over,
+        "fps30_compliance_rate": compliance_rate,
+        "avg_frame_ms": avg_ms,
+        "min_frame_ms": min_ms,
+        "p50_ms": p50_ms,
+        "p95_ms": p95_ms,
+        "p99_ms": p99_ms,
+        "max_frame_ms": max_ms,
+        "total_over_budget_ms": total_over_budget_ms,
+        "max_over_budget_ms": max_over_budget_ms,
+        "top_n": top_n,
+        "spike_causes": spike_causes,
+        "cause_breakdown": cause_breakdown,
+        "top_slow_frames": top_slow_frames,
+        "top_slow_passes": top_slow_passes,
+        "malformed_records": malformed_records,
+        "diagnostics": list(diagnostics),
+    }
+
+
+def analyze_30fps_frames(
+    frames_or_payload: Any,
+    *,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Analyze frame timing logs (JSON/NDJSON/Chrome trace or Python structures) against a frame budget.
+
+    Output is deterministic and strictly sanitized (zero host paths, zero raw shader source).
+    """
+    budget, limit = _validate_budget_and_top_n(budget_ms, top_n)
+    diagnostics: list[dict[str, Any]] = []
+
+    if isinstance(frames_or_payload, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(frames_or_payload).decode("utf-8")
+        except UnicodeDecodeError:
+            diagnostics.append(
+                {
+                    "severity": "error",
+                    "code": "invalid_utf8",
+                    "record_index": None,
+                    "message": "Input timing log is not valid UTF-8.",
+                }
+            )
+            return _summarize_frame_samples(
+                (),
+                budget_ms=budget,
+                top_n=limit,
+                source_kind="timing_log",
+                timing_source="measured",
+                malformed_records=1,
+                diagnostics=diagnostics,
+                strict=strict,
+            )
+        samples, malformed = _parse_timing_text(text, diagnostics)
+    elif isinstance(frames_or_payload, str):
+        samples, malformed = _parse_timing_text(frames_or_payload, diagnostics)
+    else:
+        samples, malformed = _parse_frame_records_from_obj(frames_or_payload, diagnostics)
+
+    return _summarize_frame_samples(
+        samples,
+        budget_ms=budget,
+        top_n=limit,
+        source_kind="timing_log",
+        timing_source="measured",
+        malformed_records=malformed,
+        diagnostics=diagnostics,
+        strict=strict,
+    )
+
+
+def analyze_30fps_trace(
+    trace: DecodedTrace,
+    *,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
+) -> dict[str, Any]:
+    """Analyze a binary DecodedTrace for 30 FPS frame-budget spikes and GPU command hotspots.
+
+    Binary `.pg6trace` command streams do not carry wall-clock GPU timestamps, so per-frame
+    and per-pass durations are derived from a deterministic packet workload model
+    (`timing_source="estimated"`). Output is strictly sanitized.
+    """
+    budget, limit = _validate_budget_and_top_n(budget_ms, top_n)
+    samples: list[_FrameSample] = []
+
+    for frame in trace.frames:
+        frame_pkts = trace.packets[frame.start_packet_index : frame.end_packet_index + 1]
+
+        pso_compile_ms = 0.0
+        pso_compiles = 0
+        staging_upload_ms = 0.0
+        upload_bytes = 0
+        rt_alloc_ms = 0.0
+        rt_allocs = 0
+        sync_stall_ms = 0.0
+        draw_calls = 0
+        compute_dispatches = 0
+        pass_list: list[_PassSample] = []
+
+        render_pass_idx = 0
+        in_render_pass = False
+        cur_rp_ms = 0.0
+        standalone_draw_ms = 0.0
+        compute_pass_ms = 0.0
+
+        def _flush_render_pass() -> None:
+            nonlocal in_render_pass, cur_rp_ms, render_pass_idx
+            if in_render_pass:
+                pass_list.append(
+                    _PassSample(
+                        name=f"render_pass_{render_pass_idx}",
+                        duration_ms=cur_rp_ms,
+                        cause="draw_burst",
+                    )
+                )
+                in_render_pass = False
+                cur_rp_ms = 0.0
+
+        for pkt in frame_pkts:
+            if not pkt.valid:
+                continue
+            op = pkt.opcode
+            f = pkt.fields
+            if op == GpuOpcode.CreateShaderModule:
+                pso_compiles += 1
+                pso_compile_ms += 3.5
+            elif op in (GpuOpcode.CreateRenderPipeline, GpuOpcode.CreateRenderPipeline2):
+                pso_compiles += 1
+                pso_compile_ms += 8.0
+            elif op in (GpuOpcode.CreateComputePipeline, GpuOpcode.CreateComputePipeline2):
+                pso_compiles += 1
+                pso_compile_ms += 6.0
+            elif op in (GpuOpcode.WriteBuffer, GpuOpcode.WriteTexture):
+                nbytes = int(f.get("data_len", 0))
+                upload_bytes += nbytes
+                staging_upload_ms += 0.02 + (nbytes / (1024.0 * 1024.0)) * 2.5
+            elif op in (GpuOpcode.CreateTexture, GpuOpcode.CreateTexture2):
+                usage_names = f.get("usage_names") or ()
+                usage_flags = int(f.get("usage_flags", 0))
+                is_rt = ("RENDER_ATTACHMENT" in usage_names) or bool(usage_flags & 0x0010)
+                if is_rt:
+                    rt_allocs += 1
+                    rt_alloc_ms += 4.5
+                else:
+                    rt_allocs += 1
+                    rt_alloc_ms += 0.5
+            elif op == GpuOpcode.CreateBuffer:
+                rt_alloc_ms += 0.15
+            elif op in (GpuOpcode.CreateBindGroupLayout, GpuOpcode.CreatePipelineLayout):
+                sync_stall_ms += 0.25
+            elif op in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2):
+                sync_stall_ms += 0.08
+            elif op == GpuOpcode.BeginRenderPass:
+                _flush_render_pass()
+                render_pass_idx += 1
+                in_render_pass = True
+                cur_rp_ms = 0.35
+            elif op == GpuOpcode.EndRenderPass:
+                _flush_render_pass()
+            elif op in (GpuOpcode.Draw, GpuOpcode.DrawIndexed):
+                draw_calls += 1
+                if in_render_pass:
+                    cur_rp_ms += 0.04
+                else:
+                    standalone_draw_ms += 0.04
+            elif op == GpuOpcode.DispatchCompute:
+                compute_dispatches += 1
+                compute_pass_ms += 0.15
+
+        _flush_render_pass()
+
+        if standalone_draw_ms > 0.0:
+            pass_list.append(_PassSample(name="draw_calls", duration_ms=standalone_draw_ms, cause="draw_burst"))
+        if compute_pass_ms > 0.0:
+            pass_list.append(_PassSample(name="compute_dispatch", duration_ms=compute_pass_ms, cause="draw_burst"))
+        if pso_compile_ms > 0.0:
+            pass_list.append(_PassSample(name="pso_compile", duration_ms=pso_compile_ms, cause="pso_compile"))
+        if staging_upload_ms > 0.0:
+            pass_list.append(_PassSample(name="staging_upload", duration_ms=staging_upload_ms, cause="staging_upload"))
+        if rt_alloc_ms > 0.0:
+            pass_list.append(_PassSample(name="rt_alloc", duration_ms=rt_alloc_ms, cause="rt_alloc"))
+        if sync_stall_ms > 0.0:
+            pass_list.append(_PassSample(name="bind_group_setup", duration_ms=sync_stall_ms, cause="sync_stall"))
+
+        base_ms = 0.5 if frame.complete else 0.2
+        total_ms = base_ms + sum(p.duration_ms for p in pass_list)
+
+        cause_ms: dict[str, float] = {c: 0.0 for c in SPIKE_CAUSES}
+        for p in pass_list:
+            cause_ms[p.cause] += p.duration_ms
+        best_c = max(SPIKE_CAUSES[:-1], key=lambda c: (cause_ms[c], -SPIKE_CAUSES.index(c)))
+        cause = best_c if cause_ms[best_c] > 0.0 else "unknown"
+
+        top_pass: str | None = None
+        top_pass_ms = 0.0
+        if pass_list:
+            best_p = max(pass_list, key=lambda p: (p.duration_ms, -SPIKE_CAUSES.index(p.cause), p.name))
+            top_pass = best_p.name
+            top_pass_ms = best_p.duration_ms
+
+        samples.append(
+            _FrameSample(
+                frame_index=frame.frame_index,
+                frame_ms=total_ms,
+                cause=cause,
+                top_pass=top_pass,
+                top_pass_ms=top_pass_ms,
+                phase=None,
+                draw_calls=draw_calls,
+                compute_dispatches=compute_dispatches,
+                pso_compiles=pso_compiles,
+                upload_bytes=upload_bytes,
+                rt_allocs=rt_allocs,
+                sync_stall_ms=sync_stall_ms,
+                passes=tuple(pass_list),
+            )
+        )
+
+    trace_diags = [
+        {
+            "severity": d.severity,
+            "code": d.code,
+            "record_index": d.packet_index,
+            "message": d.message,
+        }
+        for d in trace.diagnostics
+    ]
+    malformed_pkts = sum(1 for p in trace.packets if not p.valid) + sum(
+        1 for d in trace.diagnostics if d.severity == "error" and d.packet_index is None
+    )
+
+    return _summarize_frame_samples(
+        samples,
+        budget_ms=budget,
+        top_n=limit,
+        source_kind="binary_trace",
+        timing_source="estimated",
+        malformed_records=malformed_pkts,
+        diagnostics=trace_diags,
+        strict=trace.strict,
+    )
+
+
+def _is_timing_log_input(raw_bytes: bytes | bytearray | memoryview, source_hint: str | None = None) -> bool:
+    if source_hint:
+        if Path(source_hint).suffix.lower() in _TIMING_LOG_EXTENSIONS:
+            return True
+    raw = bytes(raw_bytes)
+    if not raw:
+        return True
+    trimmed = raw.removeprefix(b"\xef\xbb\xbf").lstrip(b" \t\r\n")
+    if not trimmed:
+        return True
+    if trimmed[:1] in (b"{", b"["):
+        return True
+    if len(raw) >= HEADER_SIZE:
+        opcode, _flags, payload_bytes = HEADER_STRUCT.unpack_from(raw, 0)
+        if opcode <= GpuOpcode.CreateTexture2 and (HEADER_SIZE + payload_bytes) <= len(raw):
+            return False
+        if (HEADER_SIZE + payload_bytes) <= len(raw):
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+    try:
+        raw.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def analyze_30fps_bytes(
+    raw_bytes: bytes | bytearray | memoryview,
+    *,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
+    strict: bool = False,
+    preview_bytes: int = DEFAULT_PREVIEW_BYTES,
+    source_hint: str | None = None,
+) -> dict[str, Any]:
+    """Auto-detect JSON/NDJSON timing log vs binary `.pg6trace` stream and run 30 FPS analysis."""
+    budget, limit = _validate_budget_and_top_n(budget_ms, top_n)
+    if _is_timing_log_input(raw_bytes, source_hint=source_hint):
+        return analyze_30fps_frames(
+            raw_bytes,
+            budget_ms=budget,
+            top_n=limit,
+            strict=strict,
+        )
+    trace = decode_stream(raw_bytes, strict=strict, preview_bytes=preview_bytes)
+    return analyze_30fps_trace(trace, budget_ms=budget, top_n=limit)
+
+
+def format_30fps_analysis_text(report: dict[str, Any]) -> str:
+    """Format a 30 FPS spike analysis dictionary as a sanitized human-readable table report."""
+    budget_ms = float(report["budget_ms"])
+    target_fps = float(report["target_fps"])
+    total = int(report["total_frames"])
+    within = int(report["frames_within_budget"])
+    over = int(report["frames_over_budget"])
+    compliance_pct = float(report["fps30_compliance_rate"]) * 100.0
+    timing_src = str(report["timing_source"])
+
+    if total == 0:
+        status = f"NO FRAMES (0/0 frames | compliance=0.00% | timing={timing_src})"
+    elif over == 0:
+        status = (
+            f"WITHIN BUDGET ({within}/{total} frames within budget | "
+            f"compliance={compliance_pct:.2f}% | timing={timing_src})"
+        )
+    else:
+        status = (
+            f"OVER BUDGET ({over}/{total} frames over budget | "
+            f"compliance={compliance_pct:.2f}% | timing={timing_src})"
+        )
+
+    cause_parts: list[str] = []
+    spike_causes = report.get("spike_causes") or {}
+    for cause in SPIKE_CAUSES:
+        cnt = int(spike_causes.get(cause, 0))
+        if cnt > 0:
+            pct = (cnt / over * 100.0) if over > 0 else 0.0
+            cause_parts.append(f"{cause}={cnt} ({pct:.1f}%)")
+    causes_str = ", ".join(cause_parts) if cause_parts else "(none)"
+
+    lines: list[str] = [
+        f"30 FPS Frame-Budget Spike Analysis (budget={budget_ms:.3f} ms, target={target_fps:.1f} FPS):",
+        f"  Status: {status}",
+        (
+            f"  Frame Time (ms): min={float(report['min_frame_ms']):.3f} | "
+            f"avg={float(report['avg_frame_ms']):.3f} | "
+            f"p50={float(report['p50_ms']):.3f} | "
+            f"p95={float(report['p95_ms']):.3f} | "
+            f"p99={float(report['p99_ms']):.3f} | "
+            f"max={float(report['max_frame_ms']):.3f}"
+        ),
+        (
+            f"  Budget Excess: total={float(report['total_over_budget_ms']):.3f} ms | "
+            f"max={float(report['max_over_budget_ms']):.3f} ms | "
+            f"malformed_records={int(report['malformed_records'])}"
+        ),
+        f"  Spike Causes: {causes_str}",
+    ]
+
+    top_frames = report.get("top_slow_frames") or []
+    lines.append("")
+    if not top_frames:
+        lines.append("  Top Slowest Frames: (none)")
+    else:
+        lines.append(f"  Top Slowest Frames (top {len(top_frames)}):")
+        lines.append(
+            f"    {'Rank':>4s}  {'Frame':>6s}  {'Time (ms)':>9s}  {'Budget':<6s}  "
+            f"{'Excess (ms)':>11s}  {'Cause':<14s}  {'Top Pass'}"
+        )
+        lines.append(
+            f"    {'-' * 4}  {'-' * 6}  {'-' * 9}  {'-' * 6}  "
+            f"{'-' * 11}  {'-' * 14}  {'-' * 24}"
+        )
+        for row in top_frames:
+            budget_lbl = "OVER" if row["over_budget"] else "OK"
+            top_pass = row["top_pass"] if row["top_pass"] else "-"
+            lines.append(
+                f"    {int(row['rank']):4d}  {int(row['frame_index']):6d}  "
+                f"{float(row['frame_ms']):9.3f}  {budget_lbl:<6s}  "
+                f"{float(row['over_budget_ms']):11.3f}  {str(row['cause']):<14s}  {top_pass}"
+            )
+
+    top_passes = report.get("top_slow_passes") or []
+    lines.append("")
+    if not top_passes:
+        lines.append("  Top Slowest Passes: (none)")
+    else:
+        lines.append(f"  Top Slowest Passes (top {len(top_passes)}):")
+        lines.append(
+            f"    {'Rank':>4s}  {'Pass':<28s}  {'Cause':<14s}  {'Count':>5s}  "
+            f"{'Avg (ms)':>9s}  {'P95 (ms)':>9s}  {'Max (ms)':>9s}  {'Total (ms)':>10s}  {'Worst':>6s}"
+        )
+        lines.append(
+            f"    {'-' * 4}  {'-' * 28}  {'-' * 14}  {'-' * 5}  "
+            f"{'-' * 9}  {'-' * 9}  {'-' * 9}  {'-' * 10}  {'-' * 6}"
+        )
+        for row in top_passes:
+            lines.append(
+                f"    {int(row['rank']):4d}  {str(row['name'])[:28]:<28s}  "
+                f"{str(row['cause']):<14s}  {int(row['occurrences']):5d}  "
+                f"{float(row['avg_ms']):9.3f}  {float(row['p95_ms']):9.3f}  "
+                f"{float(row['max_ms']):9.3f}  {float(row['total_ms']):10.3f}  "
+                f"#{int(row['worst_frame_index']):<5d}"
+            )
+
+    diags = report.get("diagnostics") or []
+    if diags:
+        lines.append("")
+        lines.append("  Diagnostics:")
+        for d in diags:
+            rec_str = f" record=#{d['record_index']}" if d.get("record_index") is not None else ""
+            lines.append(f"    [{str(d['severity']).upper()}] {d['code']}{rec_str}: {d['message']}")
+
+    return "\n".join(lines)
+
+
+def fps30_analysis_to_json(report: dict[str, Any], *, indent: int = 2) -> str:
+    """Serialize a 30 FPS spike analysis dictionary to deterministic formatted JSON."""
+    return json.dumps(report, indent=indent, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
 # Formatting & JSON serialization
 # ---------------------------------------------------------------------------
 
@@ -5784,6 +7405,9 @@ def format_trace_text(
     binding_audit: bool = False,
     bink_video_audit: bool = False,
     start_screen_skips: bool = False,
+    analyze_30fps: bool = False,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
 ) -> str:
     """Format a DecodedTrace as human-readable disassembly and/or statistics."""
     lines: list[str] = [
@@ -5909,6 +7533,14 @@ def format_trace_text(
         lines.append("")
         lines.append(format_start_screen_skips_text(audit_start_screen_skips(trace)))
 
+    if analyze_30fps:
+        lines.append("")
+        lines.append(
+            format_30fps_analysis_text(
+                analyze_30fps_trace(trace, budget_ms=budget_ms, top_n=top_n)
+            )
+        )
+
     return "\n".join(lines)
 
 
@@ -5920,6 +7552,9 @@ def trace_to_json(
     binding_audit: bool = False,
     bink_video_audit: bool = False,
     start_screen_skips: bool = False,
+    analyze_30fps: bool = False,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
     indent: int = 2,
 ) -> str:
     """Serialize a DecodedTrace to formatted JSON."""
@@ -5930,6 +7565,9 @@ def trace_to_json(
             binding_audit=binding_audit,
             bink_video_audit=bink_video_audit,
             start_screen_skips=start_screen_skips,
+            analyze_30fps=analyze_30fps,
+            budget_ms=budget_ms,
+            top_n=top_n,
         ),
         indent=indent,
     )
@@ -5942,11 +7580,11 @@ def trace_to_json(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Disassemble and inspect a playgta6 binary GPU command stream."
+        description="Disassemble and inspect a playgta6 binary GPU command stream or frame timing log."
     )
     parser.add_argument(
         "trace_file",
-        help="Path to raw binary GPU command stream (or '-' to read from stdin).",
+        help="Path to raw binary GPU command stream or JSON/NDJSON timing log (or '-' to read from stdin).",
     )
     parser.add_argument(
         "--json",
@@ -5964,7 +7602,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Fail with non-zero exit code on unknown opcodes (>= 35), "
-            "size mismatches, or malformed/truncated packets."
+            "size mismatches, or malformed/truncated packets or timing records."
         ),
     )
     parser.add_argument(
@@ -6000,6 +7638,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--analyze-30fps",
+        action="store_true",
+        help=(
+            "Analyze GPU trace or JSON/NDJSON frame timing logs against a 30 FPS (33.333 ms) "
+            "frame budget, reporting p50/p95/p99/max frame times and categorized spike hotspots."
+        ),
+    )
+    parser.add_argument(
+        "--budget-ms",
+        type=float,
+        default=None,
+        metavar="MS",
+        help=(
+            "Frame budget threshold in milliseconds for --analyze-30fps "
+            f"(default: {DEFAULT_30FPS_BUDGET_MS}; passing --budget-ms enables analyzer mode)."
+        ),
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=DEFAULT_TOP_N,
+        metavar="N",
+        help=(
+            "Maximum number of slowest frames and passes to report in --analyze-30fps mode "
+            f"(default: {DEFAULT_TOP_N})."
+        ),
+    )
+    parser.add_argument(
         "--preview-bytes",
         type=int,
         default=DEFAULT_PREVIEW_BYTES,
@@ -6016,14 +7682,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    run_analyze_30fps = bool(args.analyze_30fps or args.budget_ms is not None)
+    budget_ms = DEFAULT_30FPS_BUDGET_MS if args.budget_ms is None else float(args.budget_ms)
+    if run_analyze_30fps:
+        try:
+            budget_ms, top_n = _validate_budget_and_top_n(budget_ms, args.top_n)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+    else:
+        top_n = args.top_n
+
     if args.trace_file == "-":
         raw_bytes = sys.stdin.buffer.read()
+        source_hint: str | None = None
     else:
         path = Path(args.trace_file)
         if not path.is_file():
             print(f"Error: trace file not found: {path}", file=sys.stderr)
             return 2
         raw_bytes = path.read_bytes()
+        source_hint = args.trace_file
+
+    if run_analyze_30fps:
+        has_binary_flags = bool(
+            args.stats
+            or args.shader_summary
+            or args.binding_audit
+            or args.bink_video_audit
+            or args.start_screen_skips
+        )
+        is_timing_log = _is_timing_log_input(raw_bytes, source_hint=source_hint)
+        if is_timing_log or not has_binary_flags:
+            report = analyze_30fps_bytes(
+                raw_bytes,
+                budget_ms=budget_ms,
+                top_n=top_n,
+                strict=args.strict,
+                preview_bytes=args.preview_bytes,
+                source_hint=source_hint,
+            )
+            if args.as_json:
+                print(fps30_analysis_to_json(report))
+            else:
+                print(format_30fps_analysis_text(report))
+            if args.strict and not report["ok"]:
+                return 1
+            return 0
 
     trace = decode_stream(
         raw_bytes,
@@ -6040,6 +7745,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binding_audit=args.binding_audit,
                 bink_video_audit=args.bink_video_audit,
                 start_screen_skips=args.start_screen_skips,
+                analyze_30fps=run_analyze_30fps,
+                budget_ms=budget_ms,
+                top_n=top_n,
             )
         )
     else:
@@ -6051,6 +7759,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binding_audit=args.binding_audit,
                 bink_video_audit=args.bink_video_audit,
                 start_screen_skips=args.start_screen_skips,
+                analyze_30fps=run_analyze_30fps,
+                budget_ms=budget_ms,
+                top_n=top_n,
             )
         )
 
