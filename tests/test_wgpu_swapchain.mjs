@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const {
   BLIT_FULLSCREEN_WGSL,
+  COMPATIBLE_VIEW_FORMATS,
   DEFAULT_DEPTH_FORMAT,
   DEFAULT_MAX_ERROR_HISTORY,
   INTERMEDIATE_TEXTURE_USAGE,
@@ -16,6 +17,7 @@ const {
   TEXTURE_USAGE_TEXTURE_BINDING,
   VALID_CANVAS_FORMATS,
   WgpuSwapchain,
+  getCompatibleViewFormats,
   isValidCanvasFormat,
 } = swapchainMod;
 
@@ -151,6 +153,7 @@ test('initial configure applies DPR scaling, clamps to [1, maxDimension], and la
     device,
     format: 'bgra8unorm',
     alphaMode: 'opaque',
+    viewFormats: ['bgra8unorm-srgb'],
   });
   assert.equal(device.createdTextures.length, 1);
   assert.deepEqual(device.createdTextures[0].desc, {
@@ -334,6 +337,10 @@ test('rolling FPS and frame-time telemetry uses injectable clock and evicts old 
     maxFrameTimeMs: 0,
     totalFrames: 0,
     resizeCount: 0,
+    reconfigureCount: 1,
+    skippedRedundantReconfigures: 0,
+    lastPresentIntervalMs: 0,
+    avgPresentIntervalMs: 0,
     width: 1280,
     height: 720,
     format: 'bgra8unorm',
@@ -435,6 +442,7 @@ test('device.lost handler destroys stale depth texture and recover(newDevice) re
     device: newDevice,
     format: 'rgba8unorm',
     alphaMode: 'opaque',
+    viewFormats: ['rgba8unorm-srgb'],
   });
 
   // Fresh depth texture created on the new device and usable in render pass descriptors.
@@ -1387,4 +1395,425 @@ test('W112 destroy() cleanly destroys intermediate texture, is idempotent, and p
   assert.equal(swapchain.blitToCanvasIfNeeded(createMockCommandEncoder()), false);
   assert.equal(swapchain.configureForStreamFormat('rgba8unorm'), false);
   assert.equal(swapchain.getStats().blitCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// W169 (#876): 1080p <-> 4K plane transitions, sRGB/linear viewFormats,
+// graceful viewFormats fallback, and present-cadence telemetry
+// ---------------------------------------------------------------------------
+
+test('W169 compatible linear/sRGB sibling viewFormats for bgra8unorm/rgba8unorm and omitted for rgba16float', () => {
+  assert.ok(Object.isFrozen(COMPATIBLE_VIEW_FORMATS));
+  assert.deepEqual(getCompatibleViewFormats('bgra8unorm'), ['bgra8unorm-srgb']);
+  assert.deepEqual(getCompatibleViewFormats('rgba8unorm'), ['rgba8unorm-srgb']);
+  assert.deepEqual(getCompatibleViewFormats('bgra8unorm-srgb'), ['bgra8unorm']);
+  assert.deepEqual(getCompatibleViewFormats('rgba8unorm-srgb'), ['rgba8unorm']);
+  assert.deepEqual(getCompatibleViewFormats('rgba16float'), []);
+  assert.deepEqual(getCompatibleViewFormats(''), []);
+  assert.deepEqual(getCompatibleViewFormats(null), []);
+
+  const { canvas, context, device } = createMockWebGpuEnv();
+  const createdViewDescriptors = [];
+  context.getCurrentTexture = () => ({
+    createView(desc) {
+      createdViewDescriptors.push(desc);
+      return { kind: 'GPUTextureView', format: desc ? desc.format : 'default' };
+    },
+  });
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+  });
+
+  swapchain.configure({ width: 1920, height: 1080 });
+  assert.deepEqual(context.configurations[0], {
+    device,
+    format: 'bgra8unorm',
+    alphaMode: 'opaque',
+    viewFormats: ['bgra8unorm-srgb'],
+  });
+  assert.deepEqual(swapchain.viewFormats, ['bgra8unorm-srgb']);
+  assert.deepEqual(swapchain.getStats().viewFormats, ['bgra8unorm-srgb']);
+  assert.equal(swapchain.getStats().viewFormatsFallbackCount, 0);
+
+  // Acquiring an sRGB view directly works seamlessly.
+  const srgbView = swapchain.getRenderTargetView({ format: 'bgra8unorm-srgb' });
+  assert.equal(srgbView.format, 'bgra8unorm-srgb');
+  assert.deepEqual(createdViewDescriptors[0], { format: 'bgra8unorm-srgb' });
+
+  // Switching to rgba8unorm automatically configures rgba8unorm-srgb sibling viewFormat.
+  assert.equal(swapchain.setFormat('rgba8unorm'), true);
+  assert.deepEqual(context.configurations[1], {
+    device,
+    format: 'rgba8unorm',
+    alphaMode: 'opaque',
+    viewFormats: ['rgba8unorm-srgb'],
+  });
+  assert.deepEqual(swapchain.viewFormats, ['rgba8unorm-srgb']);
+
+  // Redundant setFormat with the same effective sibling viewFormats is skipped.
+  assert.equal(swapchain.setFormat('rgba8unorm', ['rgba8unorm-srgb']), false);
+  assert.equal(context.configurations.length, 2);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 1);
+
+  // Switching to rgba16float omits viewFormats (no sRGB sibling).
+  assert.equal(swapchain.setFormat('rgba16float'), true);
+  assert.deepEqual(context.configurations[2], {
+    device,
+    format: 'rgba16float',
+    alphaMode: 'opaque',
+  });
+  assert.equal('viewFormats' in context.configurations[2], false);
+  assert.deepEqual(swapchain.viewFormats, []);
+});
+
+test('W169 gracefully retries context.configure without viewFormats when mock or device rejects them', () => {
+  const { canvas, context, device, makeDevice } = createMockWebGpuEnv();
+  const attempts = [];
+  let rejectViewFormats = true;
+
+  context.configure = function configureWithOptionalReject(cfg) {
+    attempts.push({ ...cfg, viewFormats: cfg.viewFormats ? cfg.viewFormats.slice() : undefined });
+    if (rejectViewFormats && Array.isArray(cfg.viewFormats) && cfg.viewFormats.length > 0) {
+      throw new TypeError('Simulated device rejecting canvas viewFormats');
+    }
+    this.configurations.push({ ...cfg });
+  };
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+  });
+
+  // Initial configure attempts viewFormats, catches rejection, retries cleanly without viewFormats.
+  const result = swapchain.configure({ width: 1920, height: 1080 });
+  assert.equal(result.width, 1920);
+  assert.equal(result.height, 1080);
+  assert.equal(swapchain.isConfigured, true);
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts[0].viewFormats, ['bgra8unorm-srgb']);
+  assert.equal('viewFormats' in attempts[1] && attempts[1].viewFormats !== undefined, false);
+  assert.equal(context.configurations.length, 1);
+  assert.deepEqual(context.configurations[0], {
+    device,
+    format: 'bgra8unorm',
+    alphaMode: 'opaque',
+  });
+  assert.deepEqual(swapchain.viewFormats, []);
+  assert.equal(swapchain.getStats().viewFormatsFallbackCount, 1);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+
+  // Redundant configure after fallback is still recognized and skipped without calling configure() again.
+  swapchain.configure({ width: 1920, height: 1080, format: 'bgra8unorm' });
+  assert.equal(attempts.length, 2);
+  assert.equal(context.configurations.length, 1);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 1);
+
+  // Recovering onto a new device that supports viewFormats restores sibling viewFormats.
+  rejectViewFormats = false;
+  const newDevice = makeDevice('device-with-srgb-views');
+  swapchain.recover(newDevice, 'rgba8unorm');
+  assert.deepEqual(swapchain.viewFormats, ['rgba8unorm-srgb']);
+  assert.deepEqual(context.configurations[context.configurations.length - 1], {
+    device: newDevice,
+    format: 'rgba8unorm',
+    alphaMode: 'opaque',
+    viewFormats: ['rgba8unorm-srgb'],
+  });
+
+  // If retry without viewFormats also throws, the error propagates cleanly.
+  const env2 = createMockWebGpuEnv();
+  env2.context.configure = () => {
+    throw new Error('Fatal canvas configure error');
+  };
+  const failingSwapchain = new WgpuSwapchain({
+    canvas: env2.canvas,
+    device: env2.device,
+    context: env2.context,
+    format: 'bgra8unorm',
+  });
+  assert.throws(
+    () => failingSwapchain.configure({ width: 1280, height: 720 }),
+    /Fatal canvas configure error/
+  );
+});
+
+test('W169 1080p UI plane 0 <-> 4K (3840x2160) Bink2/scene plane 1 transitions skip redundant reconfigures, avoid blanking, and preserve presented frames', () => {
+  const { context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  // Track canvas.width/height setter writes to verify zero redundant backing-store clears.
+  let widthWrites = 0;
+  let heightWrites = 0;
+  let backingWidth = 0;
+  let backingHeight = 0;
+  const canvas = {
+    get width() {
+      return backingWidth;
+    },
+    set width(v) {
+      widthWrites += 1;
+      backingWidth = v;
+    },
+    get height() {
+      return backingHeight;
+    },
+    set height(v) {
+      heightWrites += 1;
+      backingHeight = v;
+    },
+    getContext(kind) {
+      return kind === 'webgpu' ? context : null;
+    },
+  };
+
+  let clockMs = 1000;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+  });
+
+  // Plane 0: 1080p UI boot.
+  swapchain.configure({ width: 1920, height: 1080, devicePixelRatio: 1 });
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(widthWrites, 1);
+  assert.equal(heightWrites, 1);
+  assert.equal(context.configurations.length, 1);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+  assert.equal(swapchain.getTelemetry().resizeCount, 0);
+
+  // Present 3 frames on 1080p UI plane 0.
+  swapchain.recordFramePresented();
+  clockMs += 16.5;
+  swapchain.recordFramePresented();
+  clockMs += 16.5;
+  swapchain.recordFramePresented();
+  assert.equal(swapchain.getTelemetry().totalFrames, 3);
+
+  // Redundant configure() and resize() at 1080p must be skipped with zero context.configure calls.
+  swapchain.configure({ width: 1920, height: 1080, devicePixelRatio: 1, format: 'bgra8unorm' });
+  assert.equal(swapchain.resize(1920, 1080, 1), false);
+  assert.equal(swapchain.resize(960, 540, 2), false);
+  assert.equal(context.configurations.length, 1);
+  assert.equal(widthWrites, 1);
+  assert.equal(heightWrites, 1);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 3);
+  assert.equal(swapchain.getTelemetry().resizeCount, 0);
+
+  // Transition to Plane 1: 4K (3840x2160) Bink2 intro video / 3D scene.
+  events.length = 0;
+  const depth1080p = device.createdTextures[0];
+  assert.equal(swapchain.resize(3840, 2160, 1), true);
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+  assert.equal(widthWrites, 2);
+  assert.equal(heightWrites, 2);
+  assert.equal(depth1080p.destroyed, true);
+  assert.equal(device.createdTextures.length, 2);
+  assert.deepEqual(device.createdTextures[1].desc.size, {
+    width: 3840,
+    height: 2160,
+    depthOrArrayLayers: 1,
+  });
+
+  // Verify old 1080p depth texture was destroyed BEFORE allocating the 4K depth texture.
+  const destroy1080Idx = events.findIndex((e) => e.op === 'depthTexture.destroy' && e.id === depth1080p.id);
+  const create4kIdx = events.findIndex((e) => e.op === 'device.createTexture' && e.id === device.createdTextures[1].id);
+  assert.ok(destroy1080Idx !== -1 && create4kIdx !== -1 && destroy1080Idx < create4kIdx);
+
+  // DPR-equivalent 4K calls (1920x1080 @ 2x) are skipped as redundant.
+  assert.equal(swapchain.resize(1920, 1080, 2), false);
+  swapchain.configure({ width: 3840, height: 2160, devicePixelRatio: 1 });
+  assert.equal(context.configurations.length, 2);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 2);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 5);
+  assert.equal(swapchain.getTelemetry().resizeCount, 1);
+
+  // Present 2 frames at 4K; totalFrames must continue seamlessly without dropping counts.
+  clockMs += 33.0;
+  swapchain.recordFramePresented();
+  clockMs += 33.0;
+  swapchain.recordFramePresented();
+  assert.equal(swapchain.getTelemetry().totalFrames, 5);
+
+  // Format-only change at 4K does not needlessly rewrite canvas.width / canvas.height.
+  assert.equal(swapchain.setFormat('rgba8unorm'), true);
+  assert.equal(widthWrites, 2);
+  assert.equal(heightWrites, 2);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 3);
+  assert.equal(swapchain.getTelemetry().resizeCount, 1);
+
+  // Transition back to Plane 0: 1080p UI.
+  const depth4k = device.createdTextures[1];
+  assert.equal(swapchain.resize(1920, 1080, 1), true);
+  assert.equal(depth4k.destroyed, true);
+  assert.equal(canvas.width, 1920);
+  assert.equal(canvas.height, 1080);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 4);
+  assert.equal(swapchain.getTelemetry().resizeCount, 2);
+  assert.equal(swapchain.getTelemetry().totalFrames, 5);
+
+  // Present another frame after transitioning back to 1080p.
+  clockMs += 16.5;
+  const t = swapchain.recordFramePresented();
+  assert.equal(t.totalFrames, 6);
+  assert.equal(t.resizeCount, 2);
+  assert.equal(t.lastPresentIntervalMs, 16.5);
+});
+
+test('W169 resize safely rejects invalid/zero/negative/NaN dimensions and clamps oversized dimensions without dropping state', () => {
+  const { canvas, context, device } = createMockWebGpuEnv({
+    limits: { maxTextureDimension2D: 4096 },
+  });
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    maxDimension: 8192,
+  });
+
+  // Before initial configure, invalid resize returns false safely.
+  assert.equal(swapchain.resize(0, 0), false);
+  assert.equal(swapchain.isConfigured, false);
+
+  // Configure valid 4K (3840x2160) within 4096 device limit.
+  swapchain.configure({ width: 3840, height: 2160 });
+  const activeDepth = device.createdTextures[0];
+  assert.equal(swapchain.width, 3840);
+  assert.equal(swapchain.height, 2160);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+
+  // Invalid / zero / negative / NaN / non-number resize inputs must be safely rejected (no blanking).
+  for (const [w, h] of [
+    [0, 0],
+    [0, 2160],
+    [3840, 0],
+    [-1920, 1080],
+    [1920, -1080],
+    [NaN, 1080],
+    [1920, NaN],
+    [-Infinity, 1080],
+    [undefined, 1080],
+    ['1920', 1080],
+  ]) {
+    assert.equal(swapchain.resize(w, h), false, `expected resize(${w}, ${h}) to be rejected`);
+  }
+
+  assert.equal(swapchain.width, 3840);
+  assert.equal(swapchain.height, 2160);
+  assert.equal(canvas.width, 3840);
+  assert.equal(canvas.height, 2160);
+  assert.equal(activeDepth.destroyed, false);
+  assert.equal(context.configurations.length, 1);
+  assert.equal(swapchain.getTelemetry().resizeCount, 0);
+  assert.equal(swapchain.getTelemetry().reconfigureCount, 1);
+
+  // Non-positive / NaN DPR falls back safely to 1 instead of collapsing 1920x1080 to 1x1.
+  assert.equal(swapchain.resize(1920, 1080, 0), true);
+  assert.equal(swapchain.width, 1920);
+  assert.equal(swapchain.height, 1080);
+  assert.equal(swapchain.resize(1920, 1080, -2), false);
+  assert.equal(swapchain.resize(1920, 1080, NaN), false);
+  assert.equal(swapchain.width, 1920);
+  assert.equal(swapchain.height, 1080);
+
+  // Oversized positive dimensions clamp safely to device.limits.maxTextureDimension2D (4096).
+  assert.equal(swapchain.resize(16384, 9216, 1), true);
+  assert.equal(swapchain.width, 4096);
+  assert.equal(swapchain.height, 4096);
+  assert.equal(swapchain.getTelemetry().resizeCount, 2);
+});
+
+test('W169 present-cadence telemetry tracks lastPresentIntervalMs, avgPresentIntervalMs, frameIntervalUs, and injectable nowFn', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  let clockMs = 500;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    frameWindowSize: 4,
+  });
+  swapchain.configure({ width: 1920, height: 1080 });
+
+  // frameIntervalUs is omitted when not provided.
+  let t = swapchain.getTelemetry();
+  assert.equal('frameIntervalUs' in t, false);
+  assert.equal(t.reconfigureCount, 1);
+  assert.equal(t.skippedRedundantReconfigures, 0);
+  assert.equal(t.lastPresentIntervalMs, 0);
+  assert.equal(t.avgPresentIntervalMs, 0);
+
+  // Frame 1 establishes baseline timestamp with declared 60Hz target interval (16667 us).
+  t = swapchain.recordFramePresented({ frameIntervalUs: 16667 });
+  assert.equal(t.totalFrames, 1);
+  assert.equal(t.lastPresentIntervalMs, 0);
+  assert.equal(t.avgPresentIntervalMs, 0);
+  assert.equal(t.frameIntervalUs, 16667);
+  assert.equal(swapchain.frameIntervalUs, 16667);
+
+  // Frame 2 (+16ms) and Frame 3 (+20ms) -> last=20, avg=18.
+  clockMs += 16;
+  t = swapchain.recordFramePresented();
+  assert.equal(t.lastPresentIntervalMs, 16);
+  assert.equal(t.avgPresentIntervalMs, 16);
+
+  clockMs += 20;
+  t = swapchain.recordFramePresented();
+  assert.equal(t.lastPresentIntervalMs, 20);
+  assert.equal(t.avgPresentIntervalMs, 18);
+  assert.equal(t.frameIntervalUs, 16667);
+
+  // Update declared frameIntervalUs to 30Hz (33333 us) during 4K transition via recordFramePresented metadata.
+  clockMs += 34;
+  t = swapchain.recordFramePresented(undefined, { frameIntervalUs: 33333 });
+  assert.equal(t.lastPresentIntervalMs, 34);
+  assert.ok(Math.abs(t.avgPresentIntervalMs - (16 + 20 + 34) / 3) < 1e-9);
+  assert.equal(t.frameIntervalUs, 33333);
+  assert.equal(swapchain.getStats().frameIntervalUs, 33333);
+
+  // Explicit timestamp + numeric frameIntervalUs + rolling window eviction (window=4).
+  t = swapchain.recordFramePresented(clockMs + 30, 33333); // deltas: [16, 20, 34, 30] -> avg 25
+  assert.equal(t.lastPresentIntervalMs, 30);
+  assert.equal(t.avgPresentIntervalMs, 25);
+
+  t = swapchain.recordFramePresented(clockMs + 62); // +32ms -> deltas: [20, 34, 30, 32] -> avg 29
+  assert.equal(t.lastPresentIntervalMs, 32);
+  assert.equal(t.avgPresentIntervalMs, 29);
+
+  // Clearing frameIntervalUs removes it from telemetry again.
+  swapchain.setFrameIntervalUs(null);
+  assert.equal('frameIntervalUs' in swapchain.getTelemetry(), false);
+  assert.equal(swapchain.frameIntervalUs, null);
+
+  // Constructor validates nowFn, frameIntervalUs, and viewFormats cleanly.
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, nowFn: 'bad' }),
+    TypeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, frameIntervalUs: -1 }),
+    RangeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, frameIntervalUs: NaN }),
+    RangeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, viewFormats: 'bgra8unorm-srgb' }),
+    TypeError
+  );
 });
