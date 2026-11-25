@@ -29,6 +29,7 @@
   const DEFAULT_MAX_CONCURRENCY = 6;
   const DEFAULT_MAX_RETRIES = 2;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
+  const DEFAULT_AGING_THRESHOLD_MS = 0;
 
   const RETRYABLE_ERROR_CODES = new Set([
     'ECONNRESET',
@@ -50,6 +51,13 @@
 
   function defaultSleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function defaultNow() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
   }
 
   function isValidPriority(priority) {
@@ -217,7 +225,12 @@
         Number.isFinite(options.baseRetryDelayMs) && options.baseRetryDelayMs >= 0
           ? options.baseRetryDelayMs
           : DEFAULT_BASE_RETRY_DELAY_MS;
+      this.agingThresholdMs =
+        Number.isFinite(options.agingThresholdMs) && options.agingThresholdMs > 0
+          ? options.agingThresholdMs
+          : DEFAULT_AGING_THRESHOLD_MS;
       this.sleep = typeof options.sleep === 'function' ? options.sleep : defaultSleep;
+      this.nowFn = typeof options.nowFn === 'function' ? options.nowFn : defaultNow;
 
       this._queues = PRIORITY_LEVELS.map(() => []);
       this._inFlight = 0;
@@ -228,6 +241,8 @@
         failed: 0,
         cancelled: 0,
         retries: 0,
+        agedPromotions: 0,
+        maxQueueWaitMs: 0,
       };
 
       this._byPriority = PRIORITY_LEVELS.map(() => ({
@@ -236,6 +251,10 @@
         failed: 0,
         cancelled: 0,
         retries: 0,
+        dispatched: 0,
+        totalQueueWaitMs: 0,
+        maxQueueWaitMs: 0,
+        agedPromotions: 0,
       }));
     }
 
@@ -271,6 +290,7 @@
           length,
           priority,
           signal,
+          enqueuedAtMs: this._now(),
           resolve,
           reject,
           settled: false,
@@ -362,8 +382,38 @@
       return count;
     }
 
+    clear(reason = 'Scheduler cleared') {
+      let cancelledCount = 0;
+      for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+        const queue = this._queues[PRIORITY_LEVELS[i]];
+        if (queue.length === 0) {
+          continue;
+        }
+        const queuedTasks = queue.splice(0, queue.length);
+        for (let j = 0; j < queuedTasks.length; j += 1) {
+          const task = queuedTasks[j];
+          this._detachQueuedAbortListener(task);
+          if (!task.settled) {
+            task.settled = true;
+            task.reject(createAbortError(reason));
+            cancelledCount += 1;
+          }
+        }
+      }
+      this._resetCounters();
+      if (this._inFlight === 0) {
+        this._nextSeq = 1;
+      }
+      return cancelledCount;
+    }
+
+    reset() {
+      return this.clear('Scheduler reset');
+    }
+
     getStats() {
       const byPriority = {};
+      const avgQueueWaitMsByPriority = {};
       let queued = 0;
 
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
@@ -371,7 +421,10 @@
         const name = PRIORITY_NAMES[level];
         const levelQueued = this._queues[level].length;
         const counters = this._byPriority[level];
+        const avgQueueWaitMs =
+          counters.dispatched > 0 ? counters.totalQueueWaitMs / counters.dispatched : 0;
         queued += levelQueued;
+        avgQueueWaitMsByPriority[name] = avgQueueWaitMs;
         byPriority[name] = {
           priority: level,
           queued: levelQueued,
@@ -380,6 +433,10 @@
           failed: counters.failed,
           cancelled: counters.cancelled,
           retries: counters.retries,
+          dispatched: counters.dispatched,
+          avgQueueWaitMs,
+          maxQueueWaitMs: counters.maxQueueWaitMs,
+          agedPromotions: counters.agedPromotions,
         };
       }
 
@@ -390,8 +447,37 @@
         failed: this._stats.failed,
         cancelled: this._stats.cancelled,
         retries: this._stats.retries,
+        agedPromotions: this._stats.agedPromotions,
+        maxQueueWaitMs: this._stats.maxQueueWaitMs,
+        avgQueueWaitMsByPriority,
         byPriority,
       };
+    }
+
+    _now() {
+      const value = this.nowFn();
+      return Number.isFinite(value) ? value : 0;
+    }
+
+    _resetCounters() {
+      this._stats.completed = 0;
+      this._stats.failed = 0;
+      this._stats.cancelled = 0;
+      this._stats.retries = 0;
+      this._stats.agedPromotions = 0;
+      this._stats.maxQueueWaitMs = 0;
+
+      for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+        const counters = this._byPriority[PRIORITY_LEVELS[i]];
+        counters.completed = 0;
+        counters.failed = 0;
+        counters.cancelled = 0;
+        counters.retries = 0;
+        counters.dispatched = 0;
+        counters.totalQueueWaitMs = 0;
+        counters.maxQueueWaitMs = 0;
+        counters.agedPromotions = 0;
+      }
     }
 
     _detachQueuedAbortListener(task) {
@@ -438,22 +524,69 @@
       task.reject(err);
     }
 
-    _dequeueNext() {
+    _dequeueNext(nowMs) {
+      let strictLevel = -1;
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
-        const queue = this._queues[PRIORITY_LEVELS[i]];
-        if (queue.length > 0) {
-          return queue.shift();
+        const level = PRIORITY_LEVELS[i];
+        if (this._queues[level].length > 0) {
+          strictLevel = level;
+          break;
         }
       }
-      return null;
+      if (strictLevel === -1) {
+        return null;
+      }
+
+      if (this.agingThresholdMs > 0) {
+        let bestStarvedLevel = -1;
+        let bestStarvedEnqueuedAtMs = Infinity;
+        let bestStarvedSeq = Infinity;
+
+        for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+          const level = PRIORITY_LEVELS[i];
+          const queue = this._queues[level];
+          if (queue.length === 0) {
+            continue;
+          }
+          const head = queue[0];
+          const waitMs = nowMs - head.enqueuedAtMs;
+          if (waitMs >= this.agingThresholdMs) {
+            if (
+              bestStarvedLevel === -1 ||
+              head.enqueuedAtMs < bestStarvedEnqueuedAtMs ||
+              (head.enqueuedAtMs === bestStarvedEnqueuedAtMs &&
+                (level < bestStarvedLevel ||
+                  (level === bestStarvedLevel && head.seq < bestStarvedSeq)))
+            ) {
+              bestStarvedLevel = level;
+              bestStarvedEnqueuedAtMs = head.enqueuedAtMs;
+              bestStarvedSeq = head.seq;
+            }
+          }
+        }
+
+        if (bestStarvedLevel !== -1) {
+          return {
+            task: this._queues[bestStarvedLevel].shift(),
+            promoted: bestStarvedLevel > strictLevel,
+          };
+        }
+      }
+
+      return {
+        task: this._queues[strictLevel].shift(),
+        promoted: false,
+      };
     }
 
     _drain() {
       while (this._inFlight < this.maxConcurrency) {
-        const task = this._dequeueNext();
-        if (!task) {
+        const nowMs = this._now();
+        const dequeued = this._dequeueNext(nowMs);
+        if (!dequeued) {
           return;
         }
+        const { task, promoted } = dequeued;
         this._detachQueuedAbortListener(task);
         if (task.settled) {
           continue;
@@ -463,8 +596,23 @@
           continue;
         }
 
+        const waitMs = Math.max(0, nowMs - task.enqueuedAtMs);
+        const prioStats = this._byPriority[task.priority];
+        prioStats.dispatched += 1;
+        prioStats.totalQueueWaitMs += waitMs;
+        if (waitMs > prioStats.maxQueueWaitMs) {
+          prioStats.maxQueueWaitMs = waitMs;
+        }
+        if (waitMs > this._stats.maxQueueWaitMs) {
+          this._stats.maxQueueWaitMs = waitMs;
+        }
+        if (promoted) {
+          this._stats.agedPromotions += 1;
+          prioStats.agedPromotions += 1;
+        }
+
         this._inFlight += 1;
-        this._byPriority[task.priority].inFlight += 1;
+        prioStats.inFlight += 1;
         this._runTask(task);
       }
     }
@@ -614,6 +762,7 @@
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
     DEFAULT_BASE_RETRY_DELAY_MS,
+    DEFAULT_AGING_THRESHOLD_MS,
     isRetryableError,
     isAbortError,
     createAbortError,
