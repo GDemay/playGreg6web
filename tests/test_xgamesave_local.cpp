@@ -194,6 +194,25 @@ void test_display_name(const fs::path& base) {
     CHECK(count_temps(base / "d") == 0);
 }
 
+void test_container_info(const fs::path& base) {
+    gs::Store store((base / "i").string());
+    gs::ContainerInfo info;
+    CHECK(store.get_container_info("", &info) == gs::E_GS_INVALID_CONTAINER_NAME);
+    CHECK(store.get_container_info("Nope", &info) == gs::E_GS_NO_SUCH_CONTAINER);
+    CHECK(store.create_container("Slot") == S_OK_HR);
+    CHECK(store.get_container_info("Slot", &info) == S_OK_HR && info.name == "Slot" && info.blob_count == 0 &&
+          info.total_size == 0 && info.display_name.empty());
+    CHECK(store.submit_update("Slot", {{"a", bytes("12")}, {"b", bytes("345")}}, {}) == S_OK_HR);
+    CHECK(store.set_display_name("Slot", "Save 1") == S_OK_HR);
+    CHECK(store.get_container_info("Slot", &info) == S_OK_HR && info.blob_count == 2 && info.total_size == 5 &&
+          info.display_name == "Save 1" && info.last_modified != 0);
+    std::vector<gs::ContainerInfo> all;
+    CHECK(store.enumerate_containers("Slot", &all) == S_OK_HR && all.size() == 1 &&
+          all[0].total_size == info.total_size && all[0].blob_count == info.blob_count);
+    CHECK(store.delete_container("Slot") == S_OK_HR);
+    CHECK(store.get_container_info("Slot", &info) == gs::E_GS_NO_SUCH_CONTAINER);
+}
+
 }  // namespace
 
 int main() {
@@ -205,6 +224,7 @@ int main() {
     test_quota_and_atomicity(base);
     test_persistence_and_stale_temps(base);
     test_display_name(base);
+    test_container_info(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
