@@ -5,11 +5,17 @@ import bootstrapDefault, {
   DEFAULT_LOADER_URL,
   DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_SHADER_PACK_URL,
+  DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+  DEFAULT_STREAM_SHADERS_THRESHOLD_MB,
+  MAX_STREAM_THRESHOLD_BYTES,
+  MAX_STREAM_THRESHOLD_MB,
   PlayGta6AppHandle,
   bootstrapPlayGta6App,
   detectWasm64,
   extractBootAssetUrls,
+  parseBootUrlOptions,
   resolveDefaultGameBase,
+  sanitizeInputScriptPreset,
   sanitizeSideModuleUrls,
 } from '../web/app_bootstrap.js';
 import { SESSION_MODE, SESSION_STATE } from '../web/runtime/session_controller.js';
@@ -2389,4 +2395,421 @@ test('W79 forwards preferredShaderPackUrl from /api/status, honors explicit over
     fallbackNullLaunch.workerInits.gpuInit.shaderPackUrl,
     '/shaders/fallback.wgsl.pack'
   );
+});
+
+test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options and reject unsafe inputs', () => {
+  assert.equal(DEFAULT_STREAM_SHADERS_THRESHOLD_MB, 64);
+  assert.equal(DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES, 64 * 1024 * 1024);
+  assert.equal(MAX_STREAM_THRESHOLD_MB, 4096);
+  assert.equal(MAX_STREAM_THRESHOLD_BYTES, 4096 * 1024 * 1024);
+
+  // Empty / missing inputs return frozen defaults.
+  for (const empty of [undefined, null, '', '?', '?foo=bar', {}, { search: '' }]) {
+    const parsed = parseBootUrlOptions(empty);
+    assert.equal(Object.isFrozen(parsed), true);
+    assert.deepEqual(parsed, {
+      inputScript: null,
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+    });
+  }
+
+  // Valid inputScript preset (exact, uppercase, mixed-case, whitespace, URL, URLSearchParams).
+  assert.equal(sanitizeInputScriptPreset('start-screen'), 'start-screen');
+  assert.equal(sanitizeInputScriptPreset('START-SCREEN'), 'start-screen');
+  assert.equal(sanitizeInputScriptPreset('  Start-Screen  '), 'start-screen');
+  assert.equal(parseBootUrlOptions('?inputScript=start-screen').inputScript, 'start-screen');
+  assert.equal(parseBootUrlOptions('?inputscript=START-SCREEN').inputScript, 'start-screen');
+  assert.equal(
+    parseBootUrlOptions('https://playgta6.local/?inputScript=Start-Screen#top').inputScript,
+    'start-screen'
+  );
+  assert.equal(
+    parseBootUrlOptions(new URLSearchParams('inputScript=start-screen')).inputScript,
+    'start-screen'
+  );
+  assert.equal(
+    parseBootUrlOptions({ search: '?inputScript=start-screen' }).inputScript,
+    'start-screen'
+  );
+
+  // Invalid / unsafe inputScript values are strictly rejected.
+  const unsafePresets = [
+    '../../evil',
+    '../start-screen',
+    'start-screen/../../evil',
+    'start-screen\\evil',
+    '<script>alert(1)</script>',
+    '__proto__',
+    'constructor',
+    'toString',
+    'valueOf',
+    'unknown-preset',
+    'start screen',
+    'a\0b',
+    '',
+    '   ',
+    'a'.repeat(128),
+  ];
+  for (const bad of unsafePresets) {
+    assert.equal(sanitizeInputScriptPreset(bad), null, `Expected reject for ${JSON.stringify(bad)}`);
+    assert.equal(
+      parseBootUrlOptions(`?inputScript=${encodeURIComponent(bad)}`).inputScript,
+      null,
+      `Expected URL reject for ${JSON.stringify(bad)}`
+    );
+  }
+  assert.equal(sanitizeInputScriptPreset(null), null);
+  assert.equal(sanitizeInputScriptPreset(123), null);
+
+  // streamShaders=1 / true enables default 64 MiB threshold.
+  for (const q of ['?streamShaders=1', '?streamShaders=true', '?streamShaders=TRUE', '?streamshaders=yes']) {
+    assert.deepEqual(parseBootUrlOptions(q), {
+      inputScript: null,
+      streamShaders: true,
+      streamThresholdMb: 64,
+      streamThresholdBytes: 64 * 1024 * 1024,
+    });
+  }
+
+  // streamThresholdMb=32 resolves to exact 32 MiB bytes (both with and without streamShaders=1).
+  assert.deepEqual(parseBootUrlOptions('?streamShaders=1&streamThresholdMb=32'), {
+    inputScript: null,
+    streamShaders: true,
+    streamThresholdMb: 32,
+    streamThresholdBytes: 32 * 1024 * 1024,
+  });
+  assert.deepEqual(parseBootUrlOptions('?streamThresholdMb=32'), {
+    inputScript: null,
+    streamShaders: true,
+    streamThresholdMb: 32,
+    streamThresholdBytes: 32 * 1024 * 1024,
+  });
+
+  // Fractional MB and boundary clamping.
+  assert.deepEqual(parseBootUrlOptions('?streamThresholdMb=0.5'), {
+    inputScript: null,
+    streamShaders: true,
+    streamThresholdMb: 0.5,
+    streamThresholdBytes: 512 * 1024,
+  });
+  assert.deepEqual(parseBootUrlOptions('?streamThresholdMb=999999'), {
+    inputScript: null,
+    streamShaders: true,
+    streamThresholdMb: MAX_STREAM_THRESHOLD_MB,
+    streamThresholdBytes: MAX_STREAM_THRESHOLD_BYTES,
+  });
+  const tiny = parseBootUrlOptions('?streamThresholdMb=0.00000001');
+  assert.equal(tiny.streamShaders, true);
+  assert.equal(tiny.streamThresholdBytes, 1);
+
+  // Explicit streamShaders=0 / false disables streaming even when streamThresholdMb is set.
+  assert.deepEqual(parseBootUrlOptions('?streamShaders=0&streamThresholdMb=32'), {
+    inputScript: null,
+    streamShaders: false,
+    streamThresholdMb: null,
+    streamThresholdBytes: null,
+  });
+  assert.deepEqual(parseBootUrlOptions('?streamShaders=false'), {
+    inputScript: null,
+    streamShaders: false,
+    streamThresholdMb: null,
+    streamThresholdBytes: null,
+  });
+
+  // Invalid streamThresholdMb values are ignored without crashing.
+  for (const badMb of ['0', '-5', 'NaN', 'Infinity', '-Infinity', 'abc', '0x10', '1e309', '']) {
+    assert.deepEqual(parseBootUrlOptions(`?streamThresholdMb=${encodeURIComponent(badMb)}`), {
+      inputScript: null,
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+    });
+  }
+  // Invalid streamThresholdMb with valid streamShaders=1 falls back to default 64 MiB.
+  assert.deepEqual(parseBootUrlOptions('?streamShaders=1&streamThresholdMb=-10'), {
+    inputScript: null,
+    streamShaders: true,
+    streamThresholdMb: 64,
+    streamThresholdBytes: 64 * 1024 * 1024,
+  });
+
+  // Combined inputScript + streamShaders + streamThresholdMb.
+  assert.deepEqual(parseBootUrlOptions('?inputScript=START-SCREEN&streamShaders=1&streamThresholdMb=32'), {
+    inputScript: 'start-screen',
+    streamShaders: true,
+    streamThresholdMb: 32,
+    streamThresholdBytes: 32 * 1024 * 1024,
+  });
+});
+
+test('W117 ?inputScript=start-screen auto-starts inputBridge.startScript on boot and stops on stop() and destroy()', async () => {
+  const clock = createClock(30000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = {
+    origin: 'https://playgta6.local',
+    search: '?inputScript=START-SCREEN',
+  };
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  assert.equal(app.bootUrlOptions.inputScript, 'start-screen');
+
+  const startScriptCalls = [];
+  let stopScriptCalls = 0;
+  const origStartScript = app.inputBridge.startScript.bind(app.inputBridge);
+  const origStopScript = app.inputBridge.stopScript.bind(app.inputBridge);
+  app.inputBridge.startScript = (...args) => {
+    startScriptCalls.push(args);
+    return origStartScript(...args);
+  };
+  app.inputBridge.stopScript = (...args) => {
+    stopScriptCalls += 1;
+    return origStopScript(...args);
+  };
+
+  // Not started before app.start().
+  assert.equal(startScriptCalls.length, 0);
+  assert.equal(app.inputBridge.getScriptState().active, false);
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(started.mode, SESSION_MODE.WASM);
+  assert.equal(startScriptCalls.length, 1);
+  assert.deepEqual(startScriptCalls[0], ['start-screen']);
+  assert.equal(app.inputBridge.getScriptState().active, true);
+  assert.equal(app.inputBridge.getScriptState().preset, 'start-screen');
+
+  // stop() cleanly invokes stopScript() and halts active playback.
+  const stopped = await app.stop();
+  assert.equal(stopped.ok, true);
+  assert.ok(stopScriptCalls >= 1);
+  assert.equal(app.inputBridge.getScriptState().active, false);
+
+  // Restarting starts the preset again; destroy() invokes stopScript() directly on teardown.
+  const stopCountBeforeRestart = stopScriptCalls;
+  const restarted = await app.start();
+  assert.equal(restarted.ok, true);
+  assert.equal(startScriptCalls.length, 2);
+  assert.deepEqual(startScriptCalls[1], ['start-screen']);
+  assert.equal(app.inputBridge.getScriptState().active, true);
+
+  await app.destroy();
+  assert.ok(stopScriptCalls > stopCountBeforeRestart);
+  assert.equal(app.inputBridge.getScriptState().active, false);
+  assert.equal(app.inputBridge.disposed, true);
+});
+
+test('W117 invalid/unsafe ?inputScript=../../evil is rejected and never passed to startScript', async () => {
+  const clock = createClock(31000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = {
+    origin: 'https://playgta6.local',
+    search: '?inputScript=../../evil',
+  };
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  assert.equal(app.bootUrlOptions.inputScript, null);
+
+  const startScriptCalls = [];
+  app.inputBridge.startScript = (...args) => {
+    startScriptCalls.push(args);
+  };
+
+  const started = await app.start();
+  assert.equal(started.ok, true);
+  assert.equal(startScriptCalls.length, 0);
+
+  // Unsafe per-start override is also rejected and never reaches startScript.
+  await app.stop();
+  const restarted = await app.start({ inputScript: '../../evil' });
+  assert.equal(restarted.ok, true);
+  assert.equal(startScriptCalls.length, 0);
+
+  await app.destroy();
+});
+
+test('W117 ?streamShaders=1 and ?streamThresholdMb=32 forward streamThresholdBytes into boot options while omitted params keep defaults untouched', async () => {
+  async function launchWithUrl({ search, bootstrapOptions = {}, startOpts = undefined } = {}) {
+    const clock = createClock(32000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+
+    const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+    webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    if (search !== undefined) {
+      windowObj.location = { origin: 'https://playgta6.local', search };
+    }
+
+    const workerCalls = [];
+    const postedMessages = [];
+    const mockWorker = createFakeEventTarget({
+      postMessage(payload, transfer) {
+        postedMessages.push({ payload, transfer });
+      },
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({
+        ok: true,
+        coopCoep: true,
+        hasWasmBinary: true,
+        preferredShaderPackUrl: '/shaders/splash.wgsl.pack',
+      }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker(args) {
+        workerCalls.push(args);
+        return mockWorker;
+      },
+      ...bootstrapOptions,
+    });
+
+    try {
+      const started = await app.start(startOpts);
+      assert.equal(started.ok, true);
+      assert.equal(started.mode, SESSION_MODE.WASM);
+      assert.equal(workerCalls.length, 1);
+      assert.equal(postedMessages.length, 1);
+      return {
+        bootUrlOptions: app.bootUrlOptions,
+        workerCall: workerCalls[0],
+        initPayload: postedMessages[0].payload,
+      };
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // 1. Omitted params leave default boot options completely untouched.
+  const defaultLaunch = await launchWithUrl({ search: '' });
+  assert.equal(defaultLaunch.bootUrlOptions.streamShaders, false);
+  assert.equal(defaultLaunch.bootUrlOptions.streamThresholdBytes, null);
+  assert.equal('streamShaders' in defaultLaunch.workerCall, false);
+  assert.equal('streamThresholdBytes' in defaultLaunch.workerCall, false);
+  assert.equal('streamShaders' in defaultLaunch.initPayload, false);
+  assert.equal('streamThresholdBytes' in defaultLaunch.initPayload, false);
+
+  // 2. ?streamShaders=1 forwards streamShaders: true and default 64 MiB streamThresholdBytes.
+  const defaultThresholdLaunch = await launchWithUrl({ search: '?streamShaders=1' });
+  assert.equal(defaultThresholdLaunch.bootUrlOptions.streamShaders, true);
+  assert.equal(defaultThresholdLaunch.bootUrlOptions.streamThresholdBytes, 64 * 1024 * 1024);
+  assert.equal(defaultThresholdLaunch.workerCall.streamShaders, true);
+  assert.equal(defaultThresholdLaunch.workerCall.streamThresholdBytes, 64 * 1024 * 1024);
+  assert.equal(defaultThresholdLaunch.initPayload.streamShaders, true);
+  assert.equal(defaultThresholdLaunch.initPayload.streamThresholdBytes, 64 * 1024 * 1024);
+
+  // 3. ?streamShaders=1&streamThresholdMb=32 forwards exact 32 MiB streamThresholdBytes.
+  const customThresholdLaunch = await launchWithUrl({
+    search: '?streamShaders=1&streamThresholdMb=32',
+  });
+  assert.equal(customThresholdLaunch.bootUrlOptions.streamShaders, true);
+  assert.equal(customThresholdLaunch.bootUrlOptions.streamThresholdMb, 32);
+  assert.equal(customThresholdLaunch.bootUrlOptions.streamThresholdBytes, 32 * 1024 * 1024);
+  assert.equal(customThresholdLaunch.workerCall.streamShaders, true);
+  assert.equal(customThresholdLaunch.workerCall.streamThresholdBytes, 32 * 1024 * 1024);
+  assert.equal(customThresholdLaunch.initPayload.streamShaders, true);
+  assert.equal(customThresholdLaunch.initPayload.streamThresholdBytes, 32 * 1024 * 1024);
+
+  // 4. ?streamThresholdMb=32 alone also enables streaming with 32 MiB threshold.
+  const thresholdOnlyLaunch = await launchWithUrl({ search: '?streamThresholdMb=32' });
+  assert.equal(thresholdOnlyLaunch.workerCall.streamShaders, true);
+  assert.equal(thresholdOnlyLaunch.workerCall.streamThresholdBytes, 32 * 1024 * 1024);
+  assert.equal(thresholdOnlyLaunch.initPayload.streamShaders, true);
+  assert.equal(thresholdOnlyLaunch.initPayload.streamThresholdBytes, 32 * 1024 * 1024);
+
+  // 5. Explicit bootstrap option streamShaders: false overrides URL query params.
+  const disabledOverrideLaunch = await launchWithUrl({
+    search: '?streamShaders=1&streamThresholdMb=32',
+    bootstrapOptions: { streamShaders: false },
+  });
+  assert.equal(disabledOverrideLaunch.bootUrlOptions.streamShaders, false);
+  assert.equal('streamShaders' in disabledOverrideLaunch.initPayload, false);
+  assert.equal('streamThresholdBytes' in disabledOverrideLaunch.initPayload, false);
+
+  // 6. Per-start override updates streamThresholdBytes cleanly.
+  const perStartLaunch = await launchWithUrl({
+    search: '?streamShaders=1&streamThresholdMb=32',
+    startOpts: { streamThresholdMb: 16 },
+  });
+  assert.equal(perStartLaunch.workerCall.streamShaders, true);
+  assert.equal(perStartLaunch.workerCall.streamThresholdBytes, 16 * 1024 * 1024);
+  assert.equal(perStartLaunch.initPayload.streamShaders, true);
+  assert.equal(perStartLaunch.initPayload.streamThresholdBytes, 16 * 1024 * 1024);
 });
