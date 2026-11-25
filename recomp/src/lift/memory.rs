@@ -445,9 +445,20 @@ fn outlined(store: bool, bytes: u64, base: u64) -> String {
         base as i64
     ));
     if store {
-        // O37: mark the slot after the store (the slow path's runtime helper marks itself).
+        // O37/R57: check-before-atomic-store mark after the store (the slow path's runtime helper
+        // marks itself). On wasm64 this avoids a serializing `LOCK XCHG` whenever the slot is
+        // already dirty.
         out.push_str(&format!(
-            "  store {vty} %v, ptr %p, align 1\n  %m = getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 %idx\n  store atomic i8 1, ptr %m release, align 1\n  ret void\n"
+            "  store {vty} %v, ptr %p, align 1\n\
+             \x20 %m = getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 %idx\n\
+             \x20 %cur = load atomic i8, ptr %m monotonic, align 1\n\
+             \x20 %clean = icmp eq i8 %cur, 0\n\
+             \x20 br i1 %clean, label %wm_set, label %wm_done, !prof !{{!\"branch_weights\", i32 1, i32 2000}}\n\
+             wm_set:\n\
+             \x20 store atomic i8 1, ptr %m release, align 1\n\
+             \x20 br label %wm_done\n\
+             wm_done:\n\
+             \x20 ret void\n"
         ));
     } else {
         out.push_str(&access("%p", "f"));

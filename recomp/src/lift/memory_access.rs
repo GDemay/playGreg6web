@@ -79,16 +79,35 @@ impl FunctionLifter<'_> {
         self.val(&format!("select i1 {inside}, i64 {raw}, i64 {pages}"))
     }
 
-    /// O37: marks window slot `index` written (`__playgta6_window_dirty[index] = 1`, an atomic
-    /// release store of one byte). Emitted after the store it reports.
-    fn window_mark(&mut self, index: &str) {
+    /// O37/R57: marks window slot `index` written (`__playgta6_window_dirty[index] = 1`, an atomic
+    /// release store of one byte), skipping the atomic store when the slot is already marked.
+    /// On wasm64, `store atomic i8 release` lowers to `i32.atomic.store8` (`LOCK XCHG` in V8
+    /// TurboFan), while `load atomic i8 monotonic` lowers to a 1-cycle `movzx`, cutting serializing
+    /// fences to at most once per 64 KiB slot per flush. Emitted after the store it reports;
+    /// terminates the current block by branching to `done`.
+    fn window_mark_then_br(&mut self, index: &str, done: &str) {
         self.support.insert(Support::Memory(Decl::WindowDirty));
-        // An atomic store: the module needs the atomics target feature (shared memory).
+        // Atomic load/store: the module needs the atomics target feature (shared memory).
         self.support.insert(Support::Atomics);
         let m = self.val(&format!(
             "getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 {index}"
         ));
+        let cur = self.val(&format!("load atomic i8, ptr {m} monotonic, align 1"));
+        let clean = self.val(&format!("icmp eq i8 {cur}, 0"));
+        let set = self.new_label("gms");
+        self.emit(&format!(
+            "br i1 {clean}, label %{set}, label %{done}, {UNLIKELY}"
+        ));
+        self.start_block(&set);
         self.emit(&format!("store atomic i8 1, ptr {m} release, align 1"));
+        self.emit(&format!("br label %{done}"));
+    }
+
+    /// O37/R57: marks window slot `index` written and continues in a fresh join block.
+    fn window_mark(&mut self, index: &str) {
+        let done = self.new_label("gmd");
+        self.window_mark_then_br(index, &done);
+        self.start_block(&done);
     }
 
     /// O37: [`Self::guest_ptr`] for an access that writes (atomics, `lock`ed bit operations).
@@ -129,8 +148,7 @@ impl FunctionLifter<'_> {
                     "br i1 {inside}, label %{mark_block}, label %{cont}, {UNLIKELY}"
                 ));
                 self.start_block(&mark_block);
-                self.window_mark(&index);
-                self.emit(&format!("br label %{cont}"));
+                self.window_mark_then_br(&index, &cont);
                 self.start_block(&cont);
             }
         }
@@ -531,11 +549,11 @@ impl FunctionLifter<'_> {
         let host = self.val(&format!("add i64 {addr}, {delta}"));
         let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
         self.access_at(&ptr, access);
-        self.window_mark(&index);
         if bytes > 1 && self.contiguous_runs() {
+            self.window_mark(&index);
             // The slot of the last byte needs its own mark only when the store crosses into it
-            // (rare). Re-marking the same slot is a second atomic store (an `xchg` on x86 hosts)
-            // that the consumer cannot tell apart from the first: skip it behind a cold branch.
+            // (rare). Re-marking the same slot is an extra dirty check/mark that the consumer
+            // cannot tell apart from the first: skip it behind a cold branch.
             let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
             let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
             let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
@@ -544,9 +562,10 @@ impl FunctionLifter<'_> {
                 "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
             ));
             self.start_block(&mark_last);
-            self.window_mark(&last_index);
+            self.window_mark_then_br(&last_index, &join);
+        } else {
+            self.window_mark_then_br(&index, &join);
         }
-        self.emit(&format!("br label %{join}"));
         if let (Some(slow), Access::Store { ty, value }) = (slow, access) {
             self.start_block(&slow);
             self.slow_store(addr, bytes, ty, value);
