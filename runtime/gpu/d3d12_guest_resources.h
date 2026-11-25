@@ -77,6 +77,12 @@ bool same_bytes(const uint8_t* a, const uint8_t* b, size_t n);
 
 // FNV-1a 64 over `size` bytes (shader identity, see the header comment).
 uint64_t shader_identity(const void* data, size_t size);
+// Change detection for guest memory the device mirrors (textures, relocated buffers): a 64-bit
+// hash taking 32 bytes per step, roughly 10x faster than shader_identity. In-memory only (never
+// persisted or compared with shader identities).
+uint64_t content_hash(const void* data, size_t size);
+// True when all `size` bytes are zero (word-wise).
+bool all_zero_bytes(const void* data, size_t size);
 // D3D12_SHADER_RESOURCE_VIEW_DESC / D3D12_UNORDERED_ACCESS_VIEW_DESC -> registry view description
 // (false for an invalid view dimension). Also used by the Xbox views at an address (slots 70 / 71).
 bool parse_srv_desc(const GuestShaderResourceViewDesc& g, d3d::ViewDesc* out);
