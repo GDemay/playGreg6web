@@ -38,7 +38,43 @@
   const U64_MAX = 0xffffffffffffffffn;
   const DEFAULT_MAX_TRACKED_MISSING = 512;
   const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
+  const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 8192;
   const DEFAULT_TOP_MISSING_LIMIT = 16;
+  const DEFAULT_MISSING_SUMMARY_TOP_LIMIT = 32;
+
+  /**
+   * Canonical missing-shader failure categories for live Chrome triage telemetry (W179).
+   */
+  const MISSING_SHADER_REASONS = Object.freeze({
+    NOT_IN_PACK: 'not_in_pack',
+    REFLECTION_FAILED: 'reflection_failed',
+    COMPILE_FAILED: 'compile_failed',
+    OTHER: 'other',
+  });
+
+  const MISSING_SHADER_REASON_ORDER = Object.freeze([
+    MISSING_SHADER_REASONS.NOT_IN_PACK,
+    MISSING_SHADER_REASONS.REFLECTION_FAILED,
+    MISSING_SHADER_REASONS.COMPILE_FAILED,
+    MISSING_SHADER_REASONS.OTHER,
+  ]);
+
+  const MISSING_SHADER_REASON_ALIASES = Object.freeze({
+    not_in_pack: MISSING_SHADER_REASONS.NOT_IN_PACK,
+    missing: MISSING_SHADER_REASONS.NOT_IN_PACK,
+    missing_from_pack: MISSING_SHADER_REASONS.NOT_IN_PACK,
+    pack_miss: MISSING_SHADER_REASONS.NOT_IN_PACK,
+    reflection_failed: MISSING_SHADER_REASONS.REFLECTION_FAILED,
+    reflection_error: MISSING_SHADER_REASONS.REFLECTION_FAILED,
+    reflection_miss: MISSING_SHADER_REASONS.REFLECTION_FAILED,
+    no_reflection: MISSING_SHADER_REASONS.REFLECTION_FAILED,
+    compile_failed: MISSING_SHADER_REASONS.COMPILE_FAILED,
+    compilation_failed: MISSING_SHADER_REASONS.COMPILE_FAILED,
+    compile_error: MISSING_SHADER_REASONS.COMPILE_FAILED,
+    wgsl_compile_failed: MISSING_SHADER_REASONS.COMPILE_FAILED,
+    shader_compile_failed: MISSING_SHADER_REASONS.COMPILE_FAILED,
+    other: MISSING_SHADER_REASONS.OTHER,
+  });
 
   /**
    * Minimal original WebGPU WGSL fallbacks used when no pack (and no S9 fallback hash)
@@ -406,6 +442,65 @@
     throw new TypeError('Shader stage must be a stage code (1..3) or stage name');
   }
 
+  /**
+   * Normalize a missing-shader reason string to one of:
+   * `'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other'`.
+   *
+   * @param {string | null | undefined} reason
+   * @returns {'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other'}
+   */
+  function normalizeMissingReason(reason) {
+    if (typeof reason !== 'string') {
+      return MISSING_SHADER_REASONS.OTHER;
+    }
+    const key = reason
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_');
+    if (key.length === 0) {
+      return MISSING_SHADER_REASONS.OTHER;
+    }
+    if (Object.prototype.hasOwnProperty.call(MISSING_SHADER_REASON_ALIASES, key)) {
+      return MISSING_SHADER_REASON_ALIASES[key];
+    }
+    return MISSING_SHADER_REASONS.OTHER;
+  }
+
+  function compareLex(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  function createEmptyReasonCounts() {
+    return {
+      not_in_pack: 0,
+      reflection_failed: 0,
+      compile_failed: 0,
+      other: 0,
+    };
+  }
+
+  function createEmptyStageCounts() {
+    return {
+      vertex: 0,
+      fragment: 0,
+      compute: 0,
+    };
+  }
+
+  function getDominantMissingReason(row) {
+    let bestReason = row.lastReason || MISSING_SHADER_REASONS.OTHER;
+    let bestCount = row.reasons[bestReason] || 0;
+    for (let i = 0; i < MISSING_SHADER_REASON_ORDER.length; i += 1) {
+      const candidate = MISSING_SHADER_REASON_ORDER[i];
+      const count = row.reasons[candidate] || 0;
+      if (count > bestCount) {
+        bestCount = count;
+        bestReason = candidate;
+      }
+    }
+    return bestReason;
+  }
+
   function extractEntryPoint(wgsl, stageName) {
     if (typeof wgsl !== 'string' || wgsl.length === 0) {
       return DEFAULT_ENTRY_POINTS[stageName] || null;
@@ -424,10 +519,10 @@
       return undefined;
     }
     if (typeof raw === 'string') {
-      return { wgsl: raw, entryPoint: null };
+      return raw.trim().length > 0 ? { wgsl: raw, entryPoint: null } : undefined;
     }
     if (typeof raw === 'object') {
-      if (typeof raw.wgsl === 'string') {
+      if (typeof raw.wgsl === 'string' && raw.wgsl.trim().length > 0) {
         return {
           wgsl: raw.wgsl,
           entryPoint:
@@ -438,10 +533,10 @@
                 : null,
         };
       }
-      if (typeof raw.source === 'string') {
+      if (typeof raw.source === 'string' && raw.source.trim().length > 0) {
         return { wgsl: raw.source, entryPoint: null };
       }
-      if (typeof raw.code === 'string') {
+      if (typeof raw.code === 'string' && raw.code.trim().length > 0) {
         return { wgsl: raw.code, entryPoint: null };
       }
     }
@@ -514,7 +609,9 @@
      *   fallbackHashes?: Record<string, bigint | string | number> | null,
      *   maxTrackedMissingHashes?: number,
      *   maxTrackedMissing?: number,
+     *   maxCategorizedMissingHashes?: number,
      *   defaultProfile?: string | null,
+     *   realShaders?: Iterable<any> | Map<any, any> | Record<string, any> | null,
      *   now?: () => number,
      * }} [options]
      */
@@ -531,6 +628,7 @@
           : {};
 
       let maxTracked = DEFAULT_MAX_TRACKED_MISSING_HASHES;
+      let hasExplicitLegacyCap = false;
       if (opts.maxTrackedMissingHashes !== undefined) {
         if (
           !Number.isInteger(opts.maxTrackedMissingHashes) ||
@@ -541,6 +639,7 @@
           );
         }
         maxTracked = opts.maxTrackedMissingHashes;
+        hasExplicitLegacyCap = true;
       } else if (opts.maxTrackedMissing !== undefined) {
         if (!Number.isInteger(opts.maxTrackedMissing) || opts.maxTrackedMissing < 0) {
           throw new RangeError(
@@ -548,8 +647,25 @@
           );
         }
         maxTracked = opts.maxTrackedMissing;
+        hasExplicitLegacyCap = true;
       }
       this._maxTrackedMissing = maxTracked;
+
+      let maxCategorized = hasExplicitLegacyCap
+        ? maxTracked
+        : DEFAULT_MAX_CATEGORIZED_MISSING_HASHES;
+      if (opts.maxCategorizedMissingHashes !== undefined) {
+        if (
+          !Number.isInteger(opts.maxCategorizedMissingHashes) ||
+          opts.maxCategorizedMissingHashes < 0
+        ) {
+          throw new RangeError(
+            `maxCategorizedMissingHashes must be a non-negative integer, got ${opts.maxCategorizedMissingHashes}`
+          );
+        }
+        maxCategorized = opts.maxCategorizedMissingHashes;
+      }
+      this._maxCategorizedMissing = maxCategorized;
 
       this._now = typeof opts.now === 'function' ? opts.now : defaultNow;
       this._defaultProfile = normalizeFallbackProfile(opts.defaultProfile);
@@ -561,6 +677,362 @@
         packHits: 0,
         fallbackHits: 0,
         builtinHits: 0,
+      };
+
+      // W179: Categorized missing-shader telemetry (bounded unique hash+stage entries).
+      this._categorizedMissing = new Map();
+      this._categorizedOverflowCount = 0;
+      this._categorizedTotals = {
+        total: 0,
+        byReason: createEmptyReasonCounts(),
+        byStage: createEmptyStageCounts(),
+      };
+
+      // W179: Real-shader override guard (protects real pack, menu, and Bink2 YUV shaders).
+      this._realShaders = new Map();
+      this._blockedOverrides = new Map();
+      this._blockedOverrideCount = 0;
+      this._blockedOverflowCount = 0;
+
+      if (opts.realShaders !== undefined && opts.realShaders !== null) {
+        this._registerInitialRealShaders(opts.realShaders);
+      }
+    }
+
+    _registerInitialRealShaders(realShaders) {
+      if (realShaders instanceof Map) {
+        for (const [hash, meta] of realShaders.entries()) {
+          if (meta && typeof meta === 'object' && meta.stage !== undefined) {
+            this.registerRealShader(hash, meta.stage, meta);
+          } else {
+            this.registerRealShader(hash, '*', meta);
+          }
+        }
+        return;
+      }
+      if (realShaders instanceof Set || Array.isArray(realShaders)) {
+        for (const entry of realShaders) {
+          if (
+            typeof entry === 'string' ||
+            typeof entry === 'bigint' ||
+            typeof entry === 'number'
+          ) {
+            this.registerRealShader(entry, '*');
+          } else if (entry && typeof entry === 'object' && entry.hash !== undefined) {
+            this.registerRealShader(
+              entry.hash,
+              entry.stage !== undefined ? entry.stage : '*',
+              entry
+            );
+          }
+        }
+        return;
+      }
+      if (typeof realShaders === 'object') {
+        const keys = Object.keys(realShaders);
+        for (let i = 0; i < keys.length; i += 1) {
+          const hash = keys[i];
+          const meta = realShaders[hash];
+          if (meta && typeof meta === 'object' && meta.stage !== undefined) {
+            this.registerRealShader(hash, meta.stage, meta);
+          } else {
+            this.registerRealShader(hash, '*', meta);
+          }
+        }
+      }
+    }
+
+    _isConfiguredFallbackHash(hashBigInt) {
+      const stages = ['vertex', 'fragment', 'compute'];
+      for (let i = 0; i < stages.length; i += 1) {
+        try {
+          const fb = resolveFallbackHashForStage(this._fallbackHashes, stages[i]);
+          if (fb !== null && fb === hashBigInt) {
+            return true;
+          }
+        } catch (_err) {
+          // Ignore malformed fallback hash entry during predicate check.
+        }
+      }
+      return false;
+    }
+
+    _lookupRealShader(hashHex, stageName) {
+      const exact = this._realShaders.get(`${hashHex}|${stageName}`);
+      if (exact) {
+        return exact;
+      }
+      return this._realShaders.get(`${hashHex}|*`) || null;
+    }
+
+    _recordBlockedOverride(hashHex, stageName, reason, nowMs) {
+      this._blockedOverrideCount += 1;
+      const key = `${hashHex}|${stageName}`;
+      const existing = this._blockedOverrides.get(key);
+      if (existing) {
+        existing.count += 1;
+        existing.lastReason = reason;
+        existing.lastSeenMs = nowMs;
+        return;
+      }
+      if (this._blockedOverrides.size >= this._maxCategorizedMissing) {
+        this._blockedOverflowCount += 1;
+        return;
+      }
+      this._blockedOverrides.set(key, {
+        hashHex,
+        stage: stageName,
+        count: 1,
+        lastReason: reason,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+      });
+    }
+
+    /**
+     * Register a real shader module (e.g. pack shader, menu shader, or Bink2 YUV shader)
+     * so fallback resolution can never silently overwrite it with an opaque fallback.
+     *
+     * @param {bigint | string | number} hash
+     * @param {number | string | object | null} [stageOrMeta]
+     * @param {string | {
+     *   wgsl?: string | null,
+     *   code?: string | null,
+     *   entryPoint?: string | null,
+     *   entry_point?: string | null,
+     *   module?: object | null,
+     *   source?: 'pack' | 'real',
+     *   label?: string | null,
+     *   stage?: number | string | null,
+     * } | null} [maybeMeta]
+     * @returns {{ hashHex: string, stage: string, hasWgsl: boolean, hasModule: boolean }}
+     */
+    registerRealShader(hash, stageOrMeta, maybeMeta) {
+      const hashHex = formatShaderHash(normalizeShaderHash(hash));
+      let stageArg = stageOrMeta;
+      let meta = maybeMeta;
+
+      if (
+        maybeMeta === undefined &&
+        stageOrMeta !== null &&
+        typeof stageOrMeta === 'object'
+      ) {
+        meta = stageOrMeta;
+        stageArg = stageOrMeta.stage !== undefined ? stageOrMeta.stage : '*';
+      }
+
+      const stageKey =
+        stageArg === undefined || stageArg === null || stageArg === '*'
+          ? '*'
+          : normalizeStage(stageArg);
+
+      let wgsl = null;
+      let entryPoint = null;
+      let moduleRef = null;
+      let source = 'real';
+      let label = null;
+
+      if (typeof meta === 'string') {
+        if (meta.trim().length > 0) {
+          wgsl = meta;
+        }
+      } else if (meta && typeof meta === 'object') {
+        if (typeof meta.wgsl === 'string' && meta.wgsl.trim().length > 0) {
+          wgsl = meta.wgsl;
+        } else if (typeof meta.code === 'string' && meta.code.trim().length > 0) {
+          wgsl = meta.code;
+        }
+        if (typeof meta.entryPoint === 'string' && meta.entryPoint.length > 0) {
+          entryPoint = meta.entryPoint;
+        } else if (typeof meta.entry_point === 'string' && meta.entry_point.length > 0) {
+          entryPoint = meta.entry_point;
+        }
+        if (meta.module !== undefined && meta.module !== null) {
+          moduleRef = meta.module;
+        }
+        if (meta.source === 'pack' || meta.source === 'real') {
+          source = meta.source;
+        }
+        if (typeof meta.label === 'string' && meta.label.length > 0) {
+          label = meta.label;
+        }
+      }
+
+      const record = {
+        hashHex,
+        stage: stageKey,
+        wgsl,
+        entryPoint,
+        module: moduleRef,
+        source,
+        label,
+        registeredAtMs: this._now(),
+      };
+      this._realShaders.set(`${hashHex}|${stageKey}`, record);
+
+      return {
+        hashHex,
+        stage: stageKey,
+        hasWgsl: wgsl !== null,
+        hasModule: moduleRef !== null,
+      };
+    }
+
+    /**
+     * Unregister a previously registered real shader for `(hash, stage)`.
+     * When `stage` is omitted, removes all stage entries registered for `hash`.
+     *
+     * @param {bigint | string | number} hash
+     * @param {number | string | null} [stage]
+     * @returns {boolean}
+     */
+    unregisterRealShader(hash, stage) {
+      const hashHex = formatShaderHash(normalizeShaderHash(hash));
+      if (stage === undefined || stage === null) {
+        let removed = false;
+        const prefix = `${hashHex}|`;
+        for (const key of Array.from(this._realShaders.keys())) {
+          if (key.startsWith(prefix)) {
+            this._realShaders.delete(key);
+            removed = true;
+          }
+        }
+        return removed;
+      }
+      const stageKey = stage === '*' ? '*' : normalizeStage(stage);
+      return this._realShaders.delete(`${hashHex}|${stageKey}`);
+    }
+
+    /**
+     * Clear all explicitly registered real shaders.
+     */
+    clearRealShaders() {
+      this._realShaders.clear();
+    }
+
+    /**
+     * Return true if a real shader module exists for `(hash, stage)` either in the
+     * explicit real-shader registry or as a non-fallback entry in the active pack loader.
+     *
+     * @param {bigint | string | number} hash
+     * @param {number | string | null} [stage]
+     * @returns {boolean}
+     */
+    hasRealShader(hash, stage) {
+      const hashBigInt = normalizeShaderHash(hash);
+      const hashHex = formatShaderHash(hashBigInt);
+
+      if (stage === undefined || stage === null || stage === '*') {
+        if (this._realShaders.has(`${hashHex}|*`)) {
+          return true;
+        }
+        const prefix = `${hashHex}|`;
+        for (const key of this._realShaders.keys()) {
+          if (key.startsWith(prefix)) {
+            return true;
+          }
+        }
+      } else {
+        const stageName = normalizeStage(stage);
+        if (this._lookupRealShader(hashHex, stageName) !== null) {
+          return true;
+        }
+      }
+
+      if (!this._isConfiguredFallbackHash(hashBigInt)) {
+        const packHit = lookupPackSource(this._packLoader, hashBigInt);
+        if (packHit) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * Guard predicate returning `false` whenever a real shader exists for `(hash, stage)`
+     * or is supplied in `context`, ensuring callers never silently overwrite real menu/video
+     * shaders with fallback shaders.
+     *
+     * @param {bigint | string | number} hash
+     * @param {number | string | null} [stage]
+     * @param {object | null} [context]
+     * @returns {boolean}
+     */
+    canFallbackOverride(hash, stage, context) {
+      if (this.hasRealShader(hash, stage)) {
+        return false;
+      }
+      if (context && typeof context === 'object') {
+        const existingShader =
+          context.existingShader && typeof context.existingShader === 'object'
+            ? context.existingShader
+            : null;
+        const src =
+          context.existingSource ||
+          context.source ||
+          (existingShader && existingShader.source) ||
+          null;
+        if (
+          context.isRealShader === true ||
+          src === 'pack' ||
+          src === 'real' ||
+          (existingShader && existingShader.isRealShader === true)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    /**
+     * Return JSON-safe real-shader override guard telemetry (zero raw WGSL or host paths).
+     *
+     * @param {{ limit?: number }} [options]
+     * @returns {{
+     *   registeredRealShaders: number,
+     *   blockedOverrideCount: number,
+     *   overflowBlockedCount: number,
+     *   blockedShaders: Array<{
+     *     hashHex: string,
+     *     stage: string,
+     *     count: number,
+     *     lastReason: string,
+     *     firstSeenMs: number,
+     *     lastSeenMs: number,
+     *   }>
+     * }}
+     */
+    getRealShaderGuardStats(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      let limit = opts.limit;
+      if (limit === undefined || limit === null) {
+        limit = this._blockedOverrides.size;
+      }
+      if (!Number.isInteger(limit) || limit < 0) {
+        throw new RangeError(`limit must be a non-negative integer, got ${limit}`);
+      }
+
+      const blockedShaders = Array.from(this._blockedOverrides.values(), (row) => ({
+        hashHex: row.hashHex,
+        stage: row.stage,
+        count: row.count,
+        lastReason: row.lastReason,
+        firstSeenMs: row.firstSeenMs,
+        lastSeenMs: row.lastSeenMs,
+      }));
+
+      blockedShaders.sort(
+        (a, b) =>
+          b.count - a.count ||
+          compareLex(a.hashHex, b.hashHex) ||
+          compareLex(a.stage, b.stage)
+      );
+
+      return {
+        registeredRealShaders: this._realShaders.size,
+        blockedOverrideCount: this._blockedOverrideCount,
+        overflowBlockedCount: this._blockedOverflowCount,
+        blockedShaders: blockedShaders.slice(0, limit),
       };
     }
 
@@ -591,19 +1063,41 @@
 
     /**
      * Resolve a requested shader hash for a stage:
-     * 1) exact pack hit, 2) stage-matched S9 fallback hash in pack, 3) built-in WGSL.
+     * 1) exact pack hit (never silently overwritten by fallbacks),
+     * 2) registered / caller-supplied real shader guard (never silently overwritten by fallbacks),
+     * 3) stage-matched S9 fallback hash in pack,
+     * 4) built-in WGSL.
      *
      * @param {bigint | string | number} hash
      * @param {number | string} stage
-     * @param {{ profile?: string | null }} [options]
+     * @param {{
+     *   profile?: string | null,
+     *   forceFallback?: boolean,
+     *   isRealShader?: boolean,
+     *   existingSource?: string | null,
+     *   existingShader?: {
+     *     wgsl?: string | null,
+     *     code?: string | null,
+     *     entryPoint?: string | null,
+     *     module?: object | null,
+     *     source?: string | null,
+     *     isRealShader?: boolean,
+     *   } | null,
+     *   reason?: string | null,
+     *   missingReason?: string | null,
+     * }} [options]
      * @returns {{
-     *   wgsl: string,
-     *   source: 'pack' | 'fallback' | 'builtin',
+     *   wgsl: string | null,
+     *   source: 'pack' | 'real' | 'fallback' | 'builtin',
      *   requestedHash: string,
      *   resolvedHash: string | null,
      *   stage: 'vertex' | 'fragment' | 'compute',
      *   entryPoint: string | null,
      *   profile?: 'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b',
+     *   fallbackBlocked?: boolean,
+     *   guardReason?: string,
+     *   module?: object,
+     *   label?: string,
      * }}
      */
     resolve(hash, stage, options) {
@@ -611,12 +1105,10 @@
       const requested = normalizeShaderHash(hash);
       const requestedHex = formatShaderHash(requested);
       const nowMs = this._now();
+      const opts = options && typeof options === 'object' ? options : null;
       const profileName =
-        options &&
-        typeof options === 'object' &&
-        options.profile !== undefined &&
-        options.profile !== null
-          ? normalizeFallbackProfile(options.profile)
+        opts && opts.profile !== undefined && opts.profile !== null
+          ? normalizeFallbackProfile(opts.profile)
           : this._defaultProfile;
 
       this._stats.totalLookups += 1;
@@ -624,7 +1116,7 @@
       const exact = lookupPackSource(this._packLoader, requested);
       if (exact) {
         this._stats.packHits += 1;
-        return {
+        const result = {
           wgsl: exact.wgsl,
           source: 'pack',
           requestedHash: requestedHex,
@@ -632,10 +1124,99 @@
           stage: stageName,
           entryPoint: exact.entryPoint || extractEntryPoint(exact.wgsl, stageName),
         };
+        if (opts && opts.forceFallback === true && !this._isConfiguredFallbackHash(requested)) {
+          this._recordBlockedOverride(requestedHex, stageName, 'pack_shader_protected', nowMs);
+          result.fallbackBlocked = true;
+          result.guardReason = 'pack_shader_protected';
+        }
+        return result;
       }
 
-      // Exact miss — record Frame-1 missing-shader telemetry.
+      // W179: Real-shader override guard — never silently replace a registered real shader
+      // (e.g. menu or Bink2 YUV shader) with an S9 or built-in opaque fallback.
+      const registeredReal = this._lookupRealShader(requestedHex, stageName);
+      if (registeredReal) {
+        this._recordBlockedOverride(requestedHex, stageName, 'real_shader_registered', nowMs);
+        if (registeredReal.source === 'pack') {
+          this._stats.packHits += 1;
+        }
+        const guarded = {
+          wgsl: registeredReal.wgsl,
+          source: registeredReal.source,
+          requestedHash: requestedHex,
+          resolvedHash: requestedHex,
+          stage: stageName,
+          entryPoint:
+            registeredReal.entryPoint ||
+            (registeredReal.wgsl
+              ? extractEntryPoint(registeredReal.wgsl, stageName)
+              : DEFAULT_ENTRY_POINTS[stageName] || null),
+          fallbackBlocked: true,
+          guardReason: 'real_shader_registered',
+        };
+        if (registeredReal.module !== null) {
+          guarded.module = registeredReal.module;
+        }
+        if (registeredReal.label !== null) {
+          guarded.label = registeredReal.label;
+        }
+        return guarded;
+      }
+
+      // W179: Caller-indicated existing real shader guard.
+      if (opts) {
+        const existingShader =
+          opts.existingShader && typeof opts.existingShader === 'object'
+            ? opts.existingShader
+            : null;
+        const existingSource =
+          opts.existingSource || (existingShader && existingShader.source) || null;
+        const callerClaimsReal =
+          opts.isRealShader === true ||
+          existingSource === 'pack' ||
+          existingSource === 'real' ||
+          (existingShader !== null && existingShader.isRealShader === true);
+
+        if (callerClaimsReal) {
+          this._recordBlockedOverride(requestedHex, stageName, 'existing_real_shader', nowMs);
+          const existingWgsl =
+            existingShader && typeof existingShader.wgsl === 'string' && existingShader.wgsl.trim().length > 0
+              ? existingShader.wgsl
+              : existingShader && typeof existingShader.code === 'string' && existingShader.code.trim().length > 0
+                ? existingShader.code
+                : null;
+          const resolvedSource = existingSource === 'pack' ? 'pack' : 'real';
+          if (resolvedSource === 'pack') {
+            this._stats.packHits += 1;
+          }
+          const guarded = {
+            wgsl: existingWgsl,
+            source: resolvedSource,
+            requestedHash: requestedHex,
+            resolvedHash: requestedHex,
+            stage: stageName,
+            entryPoint:
+              (existingShader && typeof existingShader.entryPoint === 'string' && existingShader.entryPoint) ||
+              (existingWgsl
+                ? extractEntryPoint(existingWgsl, stageName)
+                : DEFAULT_ENTRY_POINTS[stageName] || null),
+            fallbackBlocked: true,
+            guardReason: 'existing_real_shader',
+          };
+          if (existingShader && existingShader.module !== undefined && existingShader.module !== null) {
+            guarded.module = existingShader.module;
+          }
+          return guarded;
+        }
+      }
+
+      // Exact miss — record Frame-1 & categorized missing-shader telemetry.
       this._trackMissing(requestedHex, stageName, nowMs);
+      const missReason =
+        opts && (opts.reason !== undefined || opts.missingReason !== undefined)
+          ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
+          : MISSING_SHADER_REASONS.NOT_IN_PACK;
+      this._recordCategorizedMissing(requestedHex, stageName, missReason, nowMs);
 
       const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
       if (fallbackHash !== null) {
@@ -689,6 +1270,227 @@
         firstSeenMs: nowMs,
         lastSeenMs: nowMs,
       });
+    }
+
+    _recordCategorizedMissing(hashHex, stageName, reason, nowMs) {
+      this._categorizedTotals.total += 1;
+      this._categorizedTotals.byReason[reason] += 1;
+      this._categorizedTotals.byStage[stageName] += 1;
+
+      const key = `${hashHex}|${stageName}`;
+      const existing = this._categorizedMissing.get(key);
+      if (existing) {
+        existing.hitCount += 1;
+        existing.reasons[reason] += 1;
+        existing.lastReason = reason;
+        existing.lastSeenMs = nowMs;
+        return {
+          hashHex,
+          stage: stageName,
+          reason,
+          hitCount: existing.hitCount,
+          tracked: true,
+          overflowed: false,
+        };
+      }
+
+      if (this._categorizedMissing.size >= this._maxCategorizedMissing) {
+        this._categorizedOverflowCount += 1;
+        return {
+          hashHex,
+          stage: stageName,
+          reason,
+          hitCount: 0,
+          tracked: false,
+          overflowed: true,
+        };
+      }
+
+      const reasons = createEmptyReasonCounts();
+      reasons[reason] = 1;
+      this._categorizedMissing.set(key, {
+        hashHex,
+        stage: stageName,
+        hitCount: 1,
+        reasons,
+        lastReason: reason,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+      });
+
+      return {
+        hashHex,
+        stage: stageName,
+        reason,
+        hitCount: 1,
+        tracked: true,
+        overflowed: false,
+      };
+    }
+
+    /**
+     * Record a categorized missing or failed shader event for live Chrome triage.
+     * Supports `'not_in_pack'`, `'reflection_failed'`, `'compile_failed'`, and `'other'`.
+     * Bounded to `maxCategorizedMissingHashes` (default 8192) unique `(hashHex, stage)` entries.
+     *
+     * @param {bigint | string | number} hashHex
+     * @param {number | string} stage
+     * @param {string} [reason='other']
+     * @returns {{
+     *   hashHex: string,
+     *   stage: 'vertex' | 'fragment' | 'compute',
+     *   reason: 'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other',
+     *   hitCount: number,
+     *   tracked: boolean,
+     *   overflowed: boolean,
+     * }}
+     */
+    recordMissingShader(hashHex, stage, reason = MISSING_SHADER_REASONS.OTHER) {
+      const canonicalHash = formatShaderHash(normalizeShaderHash(hashHex));
+      const stageName = normalizeStage(stage);
+      const canonicalReason = normalizeMissingReason(reason);
+      return this._recordCategorizedMissing(
+        canonicalHash,
+        stageName,
+        canonicalReason,
+        this._now()
+      );
+    }
+
+    /**
+     * Export a JSON-safe summary of categorized missing shaders:
+     * total & unique counts per category/stage, overflow counter, real-shader guard stats,
+     * and top hit-count hashes sorted descending (deterministic hashHex/stage tie-breaking).
+     *
+     * @param {number | { limit?: number | null, reason?: string | null, stage?: number | string | null } | null} [options]
+     * @returns {{
+     *   totalMissingEvents: number,
+     *   uniqueMissingHashes: number,
+     *   maxTrackedHashes: number,
+     *   overflowCount: number,
+     *   countsByReason: { not_in_pack: number, reflection_failed: number, compile_failed: number, other: number },
+     *   countsByStage: { vertex: number, fragment: number, compute: number },
+     *   uniqueCountsByReason: { not_in_pack: number, reflection_failed: number, compile_failed: number, other: number },
+     *   uniqueCountsByStage: { vertex: number, fragment: number, compute: number },
+     *   realShaderGuard: {
+     *     registeredRealShaders: number,
+     *     blockedOverrideCount: number,
+     *     overflowBlockedCount: number,
+     *   },
+     *   topMissing: Array<{
+     *     hashHex: string,
+     *     stage: 'vertex' | 'fragment' | 'compute',
+     *     reason: 'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other',
+     *     lastReason: 'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other',
+     *     hitCount: number,
+     *     reasons: { not_in_pack: number, reflection_failed: number, compile_failed: number, other: number },
+     *     firstSeenMs: number,
+     *     lastSeenMs: number,
+     *   }>
+     * }}
+     */
+    getMissingShaderSummary(options) {
+      let limit = DEFAULT_MISSING_SUMMARY_TOP_LIMIT;
+      let filterReason = null;
+      let filterStage = null;
+
+      if (typeof options === 'number') {
+        limit = options;
+      } else if (options !== undefined && options !== null) {
+        if (typeof options !== 'object') {
+          throw new RangeError(`options must be an object or non-negative integer limit, got ${options}`);
+        }
+        if (options.limit !== undefined && options.limit !== null) {
+          limit = options.limit;
+        }
+        if (options.reason !== undefined && options.reason !== null) {
+          filterReason = normalizeMissingReason(options.reason);
+        }
+        if (options.stage !== undefined && options.stage !== null) {
+          filterStage = normalizeStage(options.stage);
+        }
+      }
+
+      if (!Number.isInteger(limit) || limit < 0) {
+        throw new RangeError(`limit must be a non-negative integer, got ${limit}`);
+      }
+
+      const uniqueCountsByReason = createEmptyReasonCounts();
+      const uniqueCountsByStage = createEmptyStageCounts();
+      const filteredRows = [];
+
+      for (const row of this._categorizedMissing.values()) {
+        uniqueCountsByStage[row.stage] += 1;
+        for (let i = 0; i < MISSING_SHADER_REASON_ORDER.length; i += 1) {
+          const r = MISSING_SHADER_REASON_ORDER[i];
+          if (row.reasons[r] > 0) {
+            uniqueCountsByReason[r] += 1;
+          }
+        }
+
+        if (filterStage !== null && row.stage !== filterStage) {
+          continue;
+        }
+        if (filterReason !== null && !(row.reasons[filterReason] > 0)) {
+          continue;
+        }
+
+        filteredRows.push({
+          hashHex: row.hashHex,
+          stage: row.stage,
+          reason: filterReason !== null ? filterReason : getDominantMissingReason(row),
+          lastReason: row.lastReason,
+          hitCount: row.hitCount,
+          reasons: {
+            not_in_pack: row.reasons.not_in_pack,
+            reflection_failed: row.reasons.reflection_failed,
+            compile_failed: row.reasons.compile_failed,
+            other: row.reasons.other,
+          },
+          firstSeenMs: row.firstSeenMs,
+          lastSeenMs: row.lastSeenMs,
+        });
+      }
+
+      filteredRows.sort((a, b) => {
+        if (filterReason !== null) {
+          const diffReason = b.reasons[filterReason] - a.reasons[filterReason];
+          if (diffReason !== 0) {
+            return diffReason;
+          }
+        }
+        return (
+          b.hitCount - a.hitCount ||
+          compareLex(a.hashHex, b.hashHex) ||
+          compareLex(a.stage, b.stage)
+        );
+      });
+
+      return {
+        totalMissingEvents: this._categorizedTotals.total,
+        uniqueMissingHashes: this._categorizedMissing.size,
+        maxTrackedHashes: this._maxCategorizedMissing,
+        overflowCount: this._categorizedOverflowCount,
+        countsByReason: {
+          not_in_pack: this._categorizedTotals.byReason.not_in_pack,
+          reflection_failed: this._categorizedTotals.byReason.reflection_failed,
+          compile_failed: this._categorizedTotals.byReason.compile_failed,
+          other: this._categorizedTotals.byReason.other,
+        },
+        countsByStage: {
+          vertex: this._categorizedTotals.byStage.vertex,
+          fragment: this._categorizedTotals.byStage.fragment,
+          compute: this._categorizedTotals.byStage.compute,
+        },
+        uniqueCountsByReason,
+        uniqueCountsByStage,
+        realShaderGuard: {
+          registeredRealShaders: this._realShaders.size,
+          blockedOverrideCount: this._blockedOverrideCount,
+          overflowBlockedCount: this._blockedOverflowCount,
+        },
+        topMissing: limit === 0 ? [] : filteredRows.slice(0, limit),
+      };
     }
 
     /**
@@ -783,7 +1585,8 @@
     }
 
     /**
-     * Clear missing-shader telemetry and lookup counters.
+     * Clear missing-shader telemetry, categorized summary, guard counters, and lookup counters.
+     * Preserves configured `packLoader`, `fallbackHashes`, and registered real shaders.
      */
     reset() {
       this._missing.clear();
@@ -792,6 +1595,16 @@
       this._stats.packHits = 0;
       this._stats.fallbackHits = 0;
       this._stats.builtinHits = 0;
+
+      this._categorizedMissing.clear();
+      this._categorizedOverflowCount = 0;
+      this._categorizedTotals.total = 0;
+      this._categorizedTotals.byReason = createEmptyReasonCounts();
+      this._categorizedTotals.byStage = createEmptyStageCounts();
+
+      this._blockedOverrides.clear();
+      this._blockedOverrideCount = 0;
+      this._blockedOverflowCount = 0;
     }
   }
 
@@ -800,15 +1613,19 @@
   const exportedApi = Object.freeze({
     SHADER_STAGE,
     STAGE_NAMES,
+    MISSING_SHADER_REASONS,
     BUILTIN_FALLBACK_WGSL,
     BUILTIN_FALLBACK_PROFILES,
     DEFAULT_ENTRY_POINTS,
     DEFAULT_MAX_TRACKED_MISSING,
     DEFAULT_MAX_TRACKED_MISSING_HASHES,
+    DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
     DEFAULT_TOP_MISSING_LIMIT,
+    DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
     normalizeShaderHash,
     formatShaderHash,
     normalizeStage,
+    normalizeMissingReason,
     normalizeFallbackProfile,
     getBuiltInFallbackProfiles,
     ShaderFallbackRouter,
