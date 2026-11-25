@@ -28,6 +28,54 @@ export const INDIRECT_DISPATCH_MODE = Object.freeze({
   UNKNOWN: 'unknown',
 });
 
+export const DOMINANT_BOTTLENECK = Object.freeze({
+  WITHIN_BUDGET: 'within_budget',
+  IO_BOUND: 'io_bound',
+  SHADER_COMPILE_BOUND: 'shader_compile_bound',
+  GPU_BOUND: 'gpu_bound',
+  CPU_BOUND: 'cpu_bound',
+});
+
+const DOMINANT_BOTTLENECK_SET = new Set(Object.values(DOMINANT_BOTTLENECK));
+
+const BYTES_PER_MIB = 1024 * 1024;
+
+const FRAME_BUDGET_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'fps30ComplianceRate',
+  'fps30_compliance_rate',
+  'complianceRate30Fps',
+  'compliance_rate_30fps',
+  'fps30Compliance',
+  'fps30_compliance',
+  'dominantBottleneck',
+  'dominant_bottleneck',
+  'bottleneck',
+]);
+
+const MEMORY_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'jsHeapUsedMb',
+  'js_heap_used_mb',
+  'heapUsedMb',
+  'heap_used_mb',
+  'jsHeapTotalMb',
+  'js_heap_total_mb',
+  'heapTotalMb',
+  'heap_total_mb',
+  'usedJSHeapSize',
+  'totalJSHeapSize',
+  'jsHeapUsedBytes',
+  'js_heap_used_bytes',
+  'jsHeapTotalBytes',
+  'js_heap_total_bytes',
+]);
+
+const IO_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'mailboxLanes',
+  'mailbox_lanes',
+  'ioMailboxLanes',
+  'io_mailbox_lanes',
+]);
+
 const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
   'realPackDrawCount',
   'real_pack_draw_count',
@@ -239,6 +287,17 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'firstVisibleFrameEl',
   'audioStatusEl',
   'guestAudioStatusEl',
+  'frameBudgetEl',
+  'fps30BudgetEl',
+  'dominantBottleneckEl',
+  'bottleneckEl',
+  'memoryStatsEl',
+  'jsHeapEl',
+  'ioMailboxLanesEl',
+  'mailboxLanesEl',
+  'diagnosticsSummaryEl',
+  'diagnosticsPanelEl',
+  'diagnosticsContainerEl',
 ]);
 
 export const HUD_ACTIONS = Object.freeze({
@@ -575,6 +634,252 @@ function toUnitIntervalNumber(value, fallback = 0) {
     return fallback;
   }
   return Math.min(1, n);
+}
+
+/**
+ * Sanitizes a 30 FPS frame-budget compliance rate into a finite number clamped
+ * to `[0, 1]`, returning `null` for non-finite, missing, or non-numeric inputs.
+ *
+ * @param {unknown} raw
+ * @returns {number|null}
+ */
+export function sanitizeFps30ComplianceRate(raw) {
+  if (raw === undefined || raw === null || raw === '') {
+    return null;
+  }
+  if (
+    typeof raw === 'boolean' ||
+    typeof raw === 'symbol' ||
+    typeof raw === 'object' ||
+    typeof raw === 'bigint'
+  ) {
+    return null;
+  }
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) {
+    return null;
+  }
+  const clamped = Math.min(1, Math.max(0, n));
+  return clamped === 0 ? 0 : clamped;
+}
+
+/**
+ * Strictly allowlists a dominant frame-budget bottleneck label to one of:
+ * `'within_budget' | 'io_bound' | 'shader_compile_bound' | 'gpu_bound' | 'cpu_bound'`,
+ * returning `null` for any unknown, empty, or hostile input.
+ *
+ * @param {unknown} raw
+ * @returns {'within_budget'|'io_bound'|'shader_compile_bound'|'gpu_bound'|'cpu_bound'|null}
+ */
+export function normalizeDominantBottleneck(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!normalized || !DOMINANT_BOTTLENECK_SET.has(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+/**
+ * Sanitizes an HTTPFS I/O mailbox lane count to a positive integer (`>= 1`),
+ * returning `null` for zero, negative, non-finite, or invalid inputs.
+ *
+ * @param {unknown} raw
+ * @returns {number|null}
+ */
+export function sanitizeMailboxLanes(raw) {
+  if (raw === undefined || raw === null || raw === '') {
+    return null;
+  }
+  if (typeof raw === 'boolean' || typeof raw === 'symbol' || typeof raw === 'object') {
+    return null;
+  }
+  if (typeof raw === 'bigint') {
+    if (raw < 1n) {
+      return null;
+    }
+    return raw > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(raw);
+  }
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 1) {
+    return null;
+  }
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
+}
+
+function formatRoundedMbValue(mb) {
+  const rounded = Math.round(mb * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}` : rounded.toFixed(1);
+}
+
+function formatCompliancePct(rate) {
+  const pct = Math.round(rate * 1000) / 10;
+  return Number.isInteger(pct) ? `${pct}%` : `${pct.toFixed(1)}%`;
+}
+
+function resolveFrameBudgetState(rate, bottleneck) {
+  if (rate === null && bottleneck === null) {
+    return '';
+  }
+  if (rate !== null && rate < 0.75) {
+    return 'err';
+  }
+  if (
+    (rate !== null && rate < 0.95) ||
+    (bottleneck !== null && bottleneck !== DOMINANT_BOTTLENECK.WITHIN_BUDGET)
+  ) {
+    return 'warn';
+  }
+  return 'ok';
+}
+
+function resolveMemoryState(usedMb, totalMb) {
+  if (usedMb === null && totalMb === null) {
+    return '';
+  }
+  if (usedMb !== null && usedMb >= 1024) {
+    return 'warn';
+  }
+  return 'ok';
+}
+
+function resolveIoMailboxState(lanes) {
+  if (lanes === null) {
+    return '';
+  }
+  return lanes > 1 ? 'ok' : 'warn';
+}
+
+function formatFrameBudgetValueText(rate, bottleneck) {
+  if (rate !== null && bottleneck !== null) {
+    return `${formatCompliancePct(rate)} (${bottleneck})`;
+  }
+  if (rate !== null) {
+    return formatCompliancePct(rate);
+  }
+  if (bottleneck !== null) {
+    return bottleneck;
+  }
+  return '';
+}
+
+function formatMemoryValueText(usedMb, totalMb) {
+  if (usedMb !== null && totalMb !== null) {
+    return `${formatRoundedMbValue(usedMb)} / ${formatRoundedMbValue(totalMb)} MB`;
+  }
+  if (usedMb !== null) {
+    return `${formatRoundedMbValue(usedMb)} MB`;
+  }
+  if (totalMb !== null) {
+    return `-- / ${formatRoundedMbValue(totalMb)} MB`;
+  }
+  return '';
+}
+
+/**
+ * Formats 30 FPS frame-budget compliance and dominant bottleneck for Diagnostics
+ * display (e.g. `'30 FPS budget: 96.4% (gpu_bound)'`). Returns `''` when unset.
+ *
+ * @param {object|null|undefined} input
+ * @returns {string}
+ */
+export function formatFrameBudgetStatus(input) {
+  if (!isPlainObject(input)) {
+    return '';
+  }
+  const source = isPlainObject(safeGet(input, 'frameBudget'))
+    ? safeGet(input, 'frameBudget')
+    : input;
+  const rate = sanitizeFps30ComplianceRate(
+    pickFirstDefined(source, [
+      'fps30ComplianceRate',
+      'fps30_compliance_rate',
+      'complianceRate30Fps',
+      'compliance_rate_30fps',
+      'fps30Compliance',
+      'fps30_compliance',
+    ])
+  );
+  const bottleneck = normalizeDominantBottleneck(
+    pickFirstDefined(source, ['dominantBottleneck', 'dominant_bottleneck', 'bottleneck'])
+  );
+  const valueText = formatFrameBudgetValueText(rate, bottleneck);
+  return valueText ? `30 FPS budget: ${valueText}` : '';
+}
+
+/**
+ * Formats JS heap memory usage in MB for Diagnostics display
+ * (e.g. `'JS heap: 256 / 512 MB'`, `'JS heap: 42.5 MB'`). Returns `''` when unset.
+ *
+ * @param {object|null|undefined} input
+ * @returns {string}
+ */
+export function formatMemoryStats(input) {
+  if (!isPlainObject(input)) {
+    return '';
+  }
+  const source = isPlainObject(safeGet(input, 'memory')) ? safeGet(input, 'memory') : input;
+  const usedMb = toNonNegativeFiniteNumber(
+    pickFirstDefined(source, ['jsHeapUsedMb', 'js_heap_used_mb', 'heapUsedMb', 'heap_used_mb']),
+    null
+  );
+  const totalMb = toNonNegativeFiniteNumber(
+    pickFirstDefined(source, ['jsHeapTotalMb', 'js_heap_total_mb', 'heapTotalMb', 'heap_total_mb']),
+    null
+  );
+  const valueText = formatMemoryValueText(usedMb, totalMb);
+  return valueText ? `JS heap: ${valueText}` : '';
+}
+
+/**
+ * Formats HTTPFS I/O mailbox lane count for Diagnostics display
+ * (e.g. `'I/O lanes: 4'`). Returns `''` when unset or invalid.
+ *
+ * @param {unknown} lanes
+ * @returns {string}
+ */
+export function formatIoMailboxLanes(lanes) {
+  const raw = isPlainObject(lanes)
+    ? pickFirstDefined(lanes, [
+        'mailboxLanes',
+        'mailbox_lanes',
+        'ioMailboxLanes',
+        'io_mailbox_lanes',
+        'lanes',
+      ])
+    : lanes;
+  const count = sanitizeMailboxLanes(raw);
+  return count !== null ? `I/O lanes: ${count}` : '';
+}
+
+/**
+ * Formats a concise combined Diagnostics line covering 30 FPS budget, JS heap MB,
+ * and HTTPFS mailbox lanes, cleanly omitting any unset metrics.
+ *
+ * @param {object|null|undefined} input
+ * @returns {string}
+ */
+export function formatDiagnosticsSummary(input) {
+  if (!isPlainObject(input)) {
+    return '';
+  }
+  const parts = [];
+  const budgetText = formatFrameBudgetStatus(input);
+  if (budgetText) {
+    parts.push(budgetText);
+  }
+  const memoryText = formatMemoryStats(input);
+  if (memoryText) {
+    parts.push(memoryText);
+  }
+  const ioSource = isPlainObject(safeGet(input, 'io')) ? safeGet(input, 'io') : input;
+  const lanesText = formatIoMailboxLanes(ioSource);
+  if (lanesText) {
+    parts.push(lanesText);
+  }
+  return parts.join(' · ');
 }
 
 /**
@@ -1125,6 +1430,29 @@ function createInitialPthreadTelemetry() {
   };
 }
 
+function createInitialFrameBudgetTelemetry() {
+  return {
+    fps30ComplianceRate: null,
+    dominantBottleneck: null,
+    updatedAtMs: null,
+  };
+}
+
+function createInitialMemoryTelemetry() {
+  return {
+    jsHeapUsedMb: null,
+    jsHeapTotalMb: null,
+    updatedAtMs: null,
+  };
+}
+
+function createInitialIoTelemetry() {
+  return {
+    mailboxLanes: null,
+    updatedAtMs: null,
+  };
+}
+
 function sanitizeSideModuleName(raw) {
   if (typeof raw !== 'string') {
     return null;
@@ -1484,6 +1812,9 @@ export class HudController {
       visible = true,
       scriptedInputPreset = null,
       gpuAdapter = null,
+      frameBudget = null,
+      memory = null,
+      mailboxLanes = undefined,
       enableToggleShortcut = false,
       toggleShortcutTarget = undefined,
       keyTarget = undefined,
@@ -1609,15 +1940,35 @@ export class HudController {
     this._gpuTelemetry = createInitialGpuTelemetry();
     this._audioTelemetry = createInitialAudioTelemetry();
     this._pthreadTelemetry = createInitialPthreadTelemetry();
+    this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
+    this._memoryTelemetry = createInitialMemoryTelemetry();
+    this._ioTelemetry = createInitialIoTelemetry();
     this._hasGpuTelemetry = false;
     this._hasAudioTelemetry = false;
     this._hasGuestAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
+    this._hasFrameBudgetTelemetry = false;
+    this._hasMemoryTelemetry = false;
+    this._hasIoTelemetry = false;
+    this._mountedDiagnosticsSection = null;
 
     const initialGpuAdapter = sanitizeGpuAdapterLabel(gpuAdapter);
     if (initialGpuAdapter !== null) {
       this._gpuTelemetry.gpuAdapter = initialGpuAdapter;
       this._hasGpuTelemetry = true;
+    }
+    if (isPlainObject(frameBudget)) {
+      this._applyFrameBudgetTelemetry(frameBudget);
+    }
+    if (isPlainObject(memory)) {
+      this._applyMemoryTelemetry(memory);
+    }
+    if (mailboxLanes !== undefined) {
+      const initialLanes = sanitizeMailboxLanes(mailboxLanes);
+      if (initialLanes !== null) {
+        this._ioTelemetry.mailboxLanes = initialLanes;
+        this._hasIoTelemetry = true;
+      }
     }
 
     const resolvedMinRenderIntervalMs =
@@ -3762,6 +4113,135 @@ export class HudController {
     return touched;
   }
 
+  _applyFrameBudgetTelemetry(input, outer = null) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    let touched = false;
+
+    const rawRate = pickTelemetryField(primary, secondary, [
+      'fps30ComplianceRate',
+      'fps30_compliance_rate',
+      'complianceRate30Fps',
+      'compliance_rate_30fps',
+      'fps30Compliance',
+      'fps30_compliance',
+    ]);
+    if (rawRate !== undefined) {
+      this._frameBudgetTelemetry.fps30ComplianceRate = sanitizeFps30ComplianceRate(rawRate);
+      touched = true;
+    }
+
+    const rawBottleneck = pickTelemetryField(primary, secondary, [
+      'dominantBottleneck',
+      'dominant_bottleneck',
+      'bottleneck',
+    ]);
+    if (rawBottleneck !== undefined) {
+      this._frameBudgetTelemetry.dominantBottleneck = normalizeDominantBottleneck(rawBottleneck);
+      touched = true;
+    }
+
+    if (touched) {
+      this._hasFrameBudgetTelemetry =
+        this._frameBudgetTelemetry.fps30ComplianceRate !== null ||
+        this._frameBudgetTelemetry.dominantBottleneck !== null;
+      this._frameBudgetTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    return touched;
+  }
+
+  _applyMemoryTelemetry(input, outer = null) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    let touched = false;
+
+    const rawUsedMb = pickTelemetryField(primary, secondary, [
+      'jsHeapUsedMb',
+      'js_heap_used_mb',
+      'heapUsedMb',
+      'heap_used_mb',
+    ]);
+    if (rawUsedMb !== undefined) {
+      this._memoryTelemetry.jsHeapUsedMb = toNonNegativeFiniteNumber(rawUsedMb, null);
+      touched = true;
+    } else {
+      const rawUsedBytes = pickTelemetryField(primary, secondary, [
+        'usedJSHeapSize',
+        'jsHeapUsedBytes',
+        'js_heap_used_bytes',
+      ]);
+      if (rawUsedBytes !== undefined) {
+        const bytes = toNonNegativeFiniteNumber(rawUsedBytes, null);
+        this._memoryTelemetry.jsHeapUsedMb =
+          bytes !== null ? Math.round((bytes / BYTES_PER_MIB) * 100) / 100 : null;
+        touched = true;
+      }
+    }
+
+    const rawTotalMb = pickTelemetryField(primary, secondary, [
+      'jsHeapTotalMb',
+      'js_heap_total_mb',
+      'heapTotalMb',
+      'heap_total_mb',
+    ]);
+    if (rawTotalMb !== undefined) {
+      this._memoryTelemetry.jsHeapTotalMb = toNonNegativeFiniteNumber(rawTotalMb, null);
+      touched = true;
+    } else {
+      const rawTotalBytes = pickTelemetryField(primary, secondary, [
+        'totalJSHeapSize',
+        'jsHeapTotalBytes',
+        'js_heap_total_bytes',
+      ]);
+      if (rawTotalBytes !== undefined) {
+        const bytes = toNonNegativeFiniteNumber(rawTotalBytes, null);
+        this._memoryTelemetry.jsHeapTotalMb =
+          bytes !== null ? Math.round((bytes / BYTES_PER_MIB) * 100) / 100 : null;
+        touched = true;
+      }
+    }
+
+    if (touched) {
+      this._hasMemoryTelemetry =
+        this._memoryTelemetry.jsHeapUsedMb !== null ||
+        this._memoryTelemetry.jsHeapTotalMb !== null;
+      this._memoryTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    return touched;
+  }
+
+  _applyIoTelemetry(input, outer = null, opts = {}) {
+    if (!isPlainObject(input)) {
+      return false;
+    }
+    const nestedStats = safeGet(input, 'stats');
+    const primary = isPlainObject(nestedStats) ? nestedStats : input;
+    const secondary = primary === input ? outer : input;
+
+    const keys = opts.allowLanesAlias
+      ? ['mailboxLanes', 'mailbox_lanes', 'ioMailboxLanes', 'io_mailbox_lanes', 'lanes']
+      : ['mailboxLanes', 'mailbox_lanes', 'ioMailboxLanes', 'io_mailbox_lanes'];
+
+    const rawLanes = pickTelemetryField(primary, secondary, keys);
+    if (rawLanes === undefined) {
+      return false;
+    }
+    this._ioTelemetry.mailboxLanes = sanitizeMailboxLanes(rawLanes);
+    this._hasIoTelemetry = this._ioTelemetry.mailboxLanes !== null;
+    this._ioTelemetry.updatedAtMs = this._safeNowMs();
+    return true;
+  }
+
   _applyStructuredTelemetryPayload(payload, opts = {}) {
     if (!isPlainObject(payload)) {
       return false;
@@ -3928,6 +4408,93 @@ export class HudController {
       }
     }
 
+    const frameBudgetNested =
+      (isPlainObject(safeGet(payload, 'frameBudget')) && safeGet(payload, 'frameBudget')) ||
+      (isPlainObject(safeGet(payload, 'frame_budget')) && safeGet(payload, 'frame_budget')) ||
+      (isPlainObject(safeGet(payload, 'budget')) && safeGet(payload, 'budget')) ||
+      null;
+    if (frameBudgetNested) {
+      if (this._applyFrameBudgetTelemetry(frameBudgetNested, payload)) {
+        changed = true;
+      }
+    } else {
+      if (framesNested && hasAnyDefinedKey(framesNested, FRAME_BUDGET_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyFrameBudgetTelemetry(framesNested)) {
+          changed = true;
+        }
+      }
+      if (gpuNested && hasAnyDefinedKey(gpuNested, FRAME_BUDGET_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyFrameBudgetTelemetry(gpuNested)) {
+          changed = true;
+        }
+      }
+      if (
+        msgType === 'frame-budget' ||
+        msgType === 'perf-stats' ||
+        hasAnyDefinedKey(payload, FRAME_BUDGET_TELEMETRY_FIELD_KEYS)
+      ) {
+        if (this._applyFrameBudgetTelemetry(payload)) {
+          changed = true;
+        }
+      }
+    }
+
+    const memoryNested =
+      (isPlainObject(safeGet(payload, 'memory')) && safeGet(payload, 'memory')) ||
+      (isPlainObject(safeGet(payload, 'memoryStats')) && safeGet(payload, 'memoryStats')) ||
+      (isPlainObject(safeGet(payload, 'memory_stats')) && safeGet(payload, 'memory_stats')) ||
+      (isPlainObject(safeGet(payload, 'heap')) && safeGet(payload, 'heap')) ||
+      null;
+    if (memoryNested) {
+      if (this._applyMemoryTelemetry(memoryNested, payload)) {
+        changed = true;
+      }
+    } else {
+      if (framesNested && hasAnyDefinedKey(framesNested, MEMORY_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyMemoryTelemetry(framesNested)) {
+          changed = true;
+        }
+      }
+      if (
+        msgType === 'memory-stats' ||
+        msgType === 'perf-stats' ||
+        hasAnyDefinedKey(payload, MEMORY_TELEMETRY_FIELD_KEYS)
+      ) {
+        if (this._applyMemoryTelemetry(payload)) {
+          changed = true;
+        }
+      }
+    }
+
+    const ioNested =
+      (isPlainObject(safeGet(payload, 'io')) && safeGet(payload, 'io')) ||
+      (isPlainObject(safeGet(payload, 'ioStats')) && safeGet(payload, 'ioStats')) ||
+      (isPlainObject(safeGet(payload, 'io_stats')) && safeGet(payload, 'io_stats')) ||
+      (isPlainObject(safeGet(payload, 'httpfs')) && safeGet(payload, 'httpfs')) ||
+      (isPlainObject(safeGet(payload, 'httpfsStats')) && safeGet(payload, 'httpfsStats')) ||
+      (isPlainObject(safeGet(payload, 'httpfs_stats')) && safeGet(payload, 'httpfs_stats')) ||
+      null;
+    if (ioNested) {
+      if (this._applyIoTelemetry(ioNested, payload, { allowLanesAlias: true })) {
+        changed = true;
+      }
+    } else {
+      if (framesNested && hasAnyDefinedKey(framesNested, IO_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyIoTelemetry(framesNested)) {
+          changed = true;
+        }
+      }
+      if (
+        msgType === 'io-stats' ||
+        msgType === 'httpfs-stats' ||
+        hasAnyDefinedKey(payload, IO_TELEMETRY_FIELD_KEYS)
+      ) {
+        if (this._applyIoTelemetry(payload)) {
+          changed = true;
+        }
+      }
+    }
+
     return changed;
   }
 
@@ -3978,7 +4545,50 @@ export class HudController {
       return this.getTelemetry().gpu;
     }
     const opts = isPlainObject(options) ? options : {};
-    const gpuChanged = this._applyGpuTelemetry(stats);
+    let gpuChanged = this._applyGpuTelemetry(stats);
+    if (isPlainObject(stats)) {
+      const fbNested =
+        (isPlainObject(safeGet(stats, 'frameBudget')) && safeGet(stats, 'frameBudget')) ||
+        (isPlainObject(safeGet(stats, 'frame_budget')) && safeGet(stats, 'frame_budget')) ||
+        null;
+      if (fbNested) {
+        if (this._applyFrameBudgetTelemetry(fbNested, stats)) {
+          gpuChanged = true;
+        }
+      } else if (hasAnyDefinedKey(stats, FRAME_BUDGET_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyFrameBudgetTelemetry(stats)) {
+          gpuChanged = true;
+        }
+      }
+
+      const memNested =
+        (isPlainObject(safeGet(stats, 'memory')) && safeGet(stats, 'memory')) ||
+        (isPlainObject(safeGet(stats, 'memoryStats')) && safeGet(stats, 'memoryStats')) ||
+        null;
+      if (memNested) {
+        if (this._applyMemoryTelemetry(memNested, stats)) {
+          gpuChanged = true;
+        }
+      } else if (hasAnyDefinedKey(stats, MEMORY_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyMemoryTelemetry(stats)) {
+          gpuChanged = true;
+        }
+      }
+
+      const ioNested =
+        (isPlainObject(safeGet(stats, 'io')) && safeGet(stats, 'io')) ||
+        (isPlainObject(safeGet(stats, 'ioStats')) && safeGet(stats, 'ioStats')) ||
+        null;
+      if (ioNested) {
+        if (this._applyIoTelemetry(ioNested, stats, { allowLanesAlias: true })) {
+          gpuChanged = true;
+        }
+      } else if (hasAnyDefinedKey(stats, IO_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyIoTelemetry(stats)) {
+          gpuChanged = true;
+        }
+      }
+    }
     const appSync = this._syncFromAppSources();
     if (gpuChanged || appSync.bootStageChanged || appSync.telemetryChanged) {
       this._renderBootDiagnostics({
@@ -3991,6 +4601,139 @@ export class HudController {
       });
     }
     return this.getTelemetry().gpu;
+  }
+
+  /**
+   * Updates 30 FPS frame-budget diagnostics (`fps30ComplianceRate` clamped `[0, 1]`,
+   * `dominantBottleneck` allowlisted) and re-renders the Diagnostics panel.
+   *
+   * @param {{ fps30ComplianceRate?: number|null, dominantBottleneck?: string|null }|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   */
+  setFrameBudgetStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().frameBudget;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    let changed = false;
+    if (stats === null) {
+      this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
+      this._hasFrameBudgetTelemetry = false;
+      this._frameBudgetTelemetry.updatedAtMs = this._safeNowMs();
+      changed = true;
+    } else if (isPlainObject(stats)) {
+      changed = this._applyFrameBudgetTelemetry(stats);
+    }
+    if (changed || opts.force === true) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
+      });
+    }
+    return this.getTelemetry().frameBudget;
+  }
+
+  /**
+   * Updates JS heap memory diagnostics (`jsHeapUsedMb`, `jsHeapTotalMb`, non-negative
+   * finite MB) and re-renders the Diagnostics panel.
+   *
+   * @param {{ jsHeapUsedMb?: number|null, jsHeapTotalMb?: number|null }|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   */
+  setMemoryStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().memory;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    let changed = false;
+    if (stats === null) {
+      this._memoryTelemetry = createInitialMemoryTelemetry();
+      this._hasMemoryTelemetry = false;
+      this._memoryTelemetry.updatedAtMs = this._safeNowMs();
+      changed = true;
+    } else if (isPlainObject(stats)) {
+      changed = this._applyMemoryTelemetry(stats);
+    }
+    if (changed || opts.force === true) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
+      });
+    }
+    return this.getTelemetry().memory;
+  }
+
+  /**
+   * Updates HTTPFS I/O mailbox lane count (`lanes` sanitized to a positive integer
+   * or `null`) and re-renders the Diagnostics panel.
+   *
+   * @param {number|object|null|undefined} lanes
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   */
+  setIoMailboxLanes(lanes, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry().io;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (isPlainObject(lanes)) {
+      const applied = this._applyIoTelemetry(lanes, null, { allowLanesAlias: true });
+      if (!applied) {
+        this._ioTelemetry.mailboxLanes = null;
+        this._hasIoTelemetry = false;
+        this._ioTelemetry.updatedAtMs = this._safeNowMs();
+      }
+    } else {
+      const sanitized = sanitizeMailboxLanes(lanes);
+      this._ioTelemetry.mailboxLanes = sanitized;
+      this._hasIoTelemetry = sanitized !== null;
+      this._ioTelemetry.updatedAtMs = this._safeNowMs();
+    }
+    this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
+    });
+    return this.getTelemetry().io;
+  }
+
+  /**
+   * Ingests performance & frame-budget telemetry (30 FPS compliance rate, dominant
+   * bottleneck, JS heap MB, HTTPFS mailbox lanes, plus 1%-low FPS / p99 frame time /
+   * FPS) without bloating the compact primary HUD card.
+   *
+   * @param {object|null|undefined} stats
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   */
+  updatePerfStats(stats, options = {}) {
+    if (this._destroyed) {
+      return this.getTelemetry();
+    }
+    const opts = isPlainObject(options) ? options : {};
+    let changed = false;
+    if (isPlainObject(stats)) {
+      if (this._applyStructuredTelemetryPayload(stats, { includeFrameStatsPresent: true })) {
+        changed = true;
+      }
+      const explicitFps = toNonNegativeFiniteNumber(safeGet(stats, 'fps'), null);
+      if (explicitFps !== null && explicitFps > 0) {
+        const { fpsChanged } = this._recordLiveFrames(null, { fps: explicitFps });
+        if (fpsChanged) {
+          changed = true;
+        }
+      }
+    }
+    if (changed || opts.force === true) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
+      });
+      if (this._liveFramesPresented > 0) {
+        this._syncLiveHudReadouts({
+          includeFrames: true,
+          updateHudStatus: opts.updateHudStatus,
+        });
+      }
+    }
+    return this.getTelemetry();
   }
 
   /**
@@ -4292,10 +5035,16 @@ export class HudController {
     this._gpuTelemetry = createInitialGpuTelemetry();
     this._audioTelemetry = createInitialAudioTelemetry();
     this._pthreadTelemetry = createInitialPthreadTelemetry();
+    this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
+    this._memoryTelemetry = createInitialMemoryTelemetry();
+    this._ioTelemetry = createInitialIoTelemetry();
     this._hasGpuTelemetry = false;
     this._hasAudioTelemetry = false;
     this._hasGuestAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
+    this._hasFrameBudgetTelemetry = false;
+    this._hasMemoryTelemetry = false;
+    this._hasIoTelemetry = false;
     this._liveFramesPresented = 0;
     this._liveFps = 0;
     this._fpsSamples = [];
@@ -4314,6 +5063,9 @@ export class HudController {
     const g = this._gpuTelemetry;
     const a = this._audioTelemetry;
     const p = this._pthreadTelemetry;
+    const fb = this._frameBudgetTelemetry;
+    const m = this._memoryTelemetry;
+    const io = this._ioTelemetry;
 
     const effectivePresentCount = Math.max(g.presentCount, this._liveFramesPresented);
     const totalDrawCount = g.realPackDrawCount + g.fallbackDrawCount;
@@ -4376,6 +5128,29 @@ export class HudController {
     const firstVisibleFrameText = formatFirstVisibleFrameMs(g.firstVisibleFrameMs);
     const loadingStatusText = formatLoadingStatus(g);
 
+    const frameBudgetStatusText = formatFrameBudgetStatus(fb);
+    const frameBudgetValueText = formatFrameBudgetValueText(
+      fb.fps30ComplianceRate,
+      fb.dominantBottleneck
+    );
+    const frameBudgetState = resolveFrameBudgetState(
+      fb.fps30ComplianceRate,
+      fb.dominantBottleneck
+    );
+
+    const memoryStatusText = formatMemoryStats(m);
+    const memoryValueText = formatMemoryValueText(m.jsHeapUsedMb, m.jsHeapTotalMb);
+    const memoryState = resolveMemoryState(m.jsHeapUsedMb, m.jsHeapTotalMb);
+
+    const ioMailboxStatusText = formatIoMailboxLanes(io.mailboxLanes);
+    const ioMailboxState = resolveIoMailboxState(io.mailboxLanes);
+
+    const diagnosticsSummaryText = formatDiagnosticsSummary({
+      frameBudget: fb,
+      memory: m,
+      io,
+    });
+
     return {
       gpu: {
         realPackDrawCount: g.realPackDrawCount,
@@ -4429,6 +5204,29 @@ export class HudController {
         updatedAtMs: p.updatedAtMs,
         statusText: pthreadStatusText,
       },
+      frameBudget: {
+        fps30ComplianceRate: fb.fps30ComplianceRate,
+        dominantBottleneck: fb.dominantBottleneck,
+        valueText: frameBudgetValueText,
+        statusText: frameBudgetStatusText,
+        state: frameBudgetState,
+        updatedAtMs: fb.updatedAtMs,
+      },
+      memory: {
+        jsHeapUsedMb: m.jsHeapUsedMb,
+        jsHeapTotalMb: m.jsHeapTotalMb,
+        valueText: memoryValueText,
+        statusText: memoryStatusText,
+        state: memoryState,
+        updatedAtMs: m.updatedAtMs,
+      },
+      io: {
+        mailboxLanes: io.mailboxLanes,
+        statusText: ioMailboxStatusText,
+        state: ioMailboxState,
+        updatedAtMs: io.updatedAtMs,
+      },
+      diagnosticsSummaryText,
     };
   }
 
@@ -5196,6 +5994,12 @@ export class HudController {
       guestUnderruns: telemetry.audio.guestUnderruns,
       guestPeakLevel: telemetry.audio.guestPeakLevel,
       guestAudioStatusText: telemetry.audio.guestStatusText,
+      fps30ComplianceRate: telemetry.frameBudget.fps30ComplianceRate,
+      dominantBottleneck: telemetry.frameBudget.dominantBottleneck,
+      jsHeapUsedMb: telemetry.memory.jsHeapUsedMb,
+      jsHeapTotalMb: telemetry.memory.jsHeapTotalMb,
+      mailboxLanes: telemetry.io.mailboxLanes,
+      diagnosticsSummaryText: telemetry.diagnosticsSummaryText,
       sideModules,
       validation,
       telemetry,
@@ -5221,6 +6025,7 @@ export class HudController {
       throw new TypeError('bindDisplayElements expects an object mapping display keys to elements');
     }
 
+    this._unmountDiagnosticsSection();
     this._displayElements = {};
     const map = elementMap || {};
     for (const key of SUPPORTED_DISPLAY_ELEMENTS) {
@@ -5248,7 +6053,122 @@ export class HudController {
    * Detaches all bound display elements. Idempotent.
    */
   unbindDisplayElements() {
+    this._unmountDiagnosticsSection();
     this._displayElements = {};
+  }
+
+  _unmountDiagnosticsSection() {
+    const mounted = this._mountedDiagnosticsSection;
+    this._mountedDiagnosticsSection = null;
+    if (!mounted || !mounted.section) {
+      return;
+    }
+    try {
+      if (mounted.section.parentNode && typeof mounted.section.parentNode.removeChild === 'function') {
+        mounted.section.parentNode.removeChild(mounted.section);
+      }
+    } catch {
+      // Ignore teardown errors on lightweight or detached mock DOM nodes.
+    }
+  }
+
+  _resolveDiagnosticsPanelTarget() {
+    const els = this._displayElements;
+    const explicit = els.diagnosticsPanelEl || els.diagnosticsContainerEl || null;
+    if (explicit) {
+      return { container: explicit, explicit: true };
+    }
+    const rootEl = this._getHudRootElement();
+    if (rootEl && typeof rootEl.querySelector === 'function') {
+      try {
+        const collapsibleContent =
+          rootEl.querySelector('#hud-diagnostics-disclosure .astryx-collapsible-content') ||
+          rootEl.querySelector('#hud-diagnostics-disclosure');
+        if (collapsibleContent && typeof collapsibleContent === 'object') {
+          return { container: collapsibleContent, explicit: false };
+        }
+      } catch {
+        // Ignore querySelector errors on synthetic mocks.
+      }
+    }
+    return { container: null, explicit: false };
+  }
+
+  _ensureDiagnosticsSection(container) {
+    if (!container || typeof container !== 'object' || typeof container.appendChild !== 'function') {
+      return null;
+    }
+    if (this._mountedDiagnosticsSection && this._mountedDiagnosticsSection.container === container) {
+      return this._mountedDiagnosticsSection;
+    }
+
+    const doc =
+      (container.ownerDocument && typeof container.ownerDocument.createElement === 'function'
+        ? container.ownerDocument
+        : null) ||
+      (typeof document !== 'undefined' && document && typeof document.createElement === 'function'
+        ? document
+        : null);
+    if (!doc) {
+      return null;
+    }
+
+    this._unmountDiagnosticsSection();
+
+    try {
+      const section = doc.createElement('section');
+      section.className = 'diag-group';
+      if (typeof section.setAttribute === 'function') {
+        section.setAttribute('data-hud-section', 'w289-diagnostics');
+        section.setAttribute('aria-label', '30 FPS budget, memory, and I/O');
+      }
+
+      const head = doc.createElement('div');
+      head.className = 'diag-group-head';
+      const headTitle = doc.createElement('span');
+      headTitle.textContent = '30 FPS Budget & Memory';
+      head.appendChild(headTitle);
+      section.appendChild(head);
+
+      const kvList = doc.createElement('div');
+      kvList.className = 'kv-list';
+
+      const makeRow = (labelText, valueKey) => {
+        const row = doc.createElement('div');
+        row.className = 'kv-row';
+        const labelEl = doc.createElement('span');
+        labelEl.className = 'kv-label';
+        labelEl.textContent = labelText;
+        const valueEl = doc.createElement('span');
+        valueEl.className = 'kv-value';
+        valueEl.textContent = '--';
+        if (typeof valueEl.setAttribute === 'function') {
+          valueEl.setAttribute('data-hud-metric', valueKey);
+        }
+        row.appendChild(labelEl);
+        row.appendChild(valueEl);
+        kvList.appendChild(row);
+        return valueEl;
+      };
+
+      const budgetValueEl = makeRow('30 FPS Budget', 'frame-budget');
+      const memoryValueEl = makeRow('JS Heap', 'js-heap');
+      const lanesValueEl = makeRow('I/O Lanes', 'mailbox-lanes');
+
+      section.appendChild(kvList);
+      container.appendChild(section);
+
+      this._mountedDiagnosticsSection = {
+        container,
+        section,
+        budgetValueEl,
+        memoryValueEl,
+        lanesValueEl,
+      };
+      return this._mountedDiagnosticsSection;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -5684,6 +6604,220 @@ export class HudController {
 
     if (els.bootElapsedEl && this._bootElapsedMs !== null) {
       safeSetText(els.bootElapsedEl, formatElapsedSeconds(this._bootElapsedMs), domStats);
+    }
+
+    const frameBudgetTelemetry =
+      status.telemetry && status.telemetry.frameBudget ? status.telemetry.frameBudget : null;
+    const memoryTelemetry =
+      status.telemetry && status.telemetry.memory ? status.telemetry.memory : null;
+    const ioTelemetry = status.telemetry && status.telemetry.io ? status.telemetry.io : null;
+    const diagSummaryText =
+      status.telemetry && typeof status.telemetry.diagnosticsSummaryText === 'string'
+        ? status.telemetry.diagnosticsSummaryText
+        : '';
+
+    const frameBudgetEl = els.frameBudgetEl || els.fps30BudgetEl || null;
+    if (frameBudgetEl && frameBudgetTelemetry) {
+      safeSetText(frameBudgetEl, frameBudgetTelemetry.statusText || '--', domStats);
+      safeSetDataset(
+        frameBudgetEl,
+        'fps30ComplianceRate',
+        frameBudgetTelemetry.fps30ComplianceRate !== null
+          ? String(frameBudgetTelemetry.fps30ComplianceRate)
+          : '',
+        domStats
+      );
+      safeSetDataset(
+        frameBudgetEl,
+        'dominantBottleneck',
+        frameBudgetTelemetry.dominantBottleneck || '',
+        domStats
+      );
+      safeSetDataset(frameBudgetEl, 'state', frameBudgetTelemetry.state, domStats);
+      safeSetTitle(frameBudgetEl, frameBudgetTelemetry.statusText, domStats);
+    }
+
+    const bottleneckEl = els.dominantBottleneckEl || els.bottleneckEl || null;
+    if (bottleneckEl && frameBudgetTelemetry) {
+      const bn = frameBudgetTelemetry.dominantBottleneck;
+      safeSetText(bottleneckEl, bn || '--', domStats);
+      safeSetDataset(bottleneckEl, 'dominantBottleneck', bn || '', domStats);
+      safeSetDataset(
+        bottleneckEl,
+        'state',
+        bn === null
+          ? ''
+          : bn === DOMINANT_BOTTLENECK.WITHIN_BUDGET
+            ? 'ok'
+            : 'warn',
+        domStats
+      );
+      safeSetTitle(bottleneckEl, bn ? `Bottleneck: ${bn}` : '', domStats);
+    }
+
+    const memoryStatsEl = els.memoryStatsEl || els.jsHeapEl || null;
+    if (memoryStatsEl && memoryTelemetry) {
+      safeSetText(memoryStatsEl, memoryTelemetry.statusText || '--', domStats);
+      safeSetDataset(
+        memoryStatsEl,
+        'jsHeapUsedMb',
+        memoryTelemetry.jsHeapUsedMb !== null ? String(memoryTelemetry.jsHeapUsedMb) : '',
+        domStats
+      );
+      safeSetDataset(
+        memoryStatsEl,
+        'jsHeapTotalMb',
+        memoryTelemetry.jsHeapTotalMb !== null ? String(memoryTelemetry.jsHeapTotalMb) : '',
+        domStats
+      );
+      safeSetDataset(memoryStatsEl, 'state', memoryTelemetry.state, domStats);
+      safeSetTitle(memoryStatsEl, memoryTelemetry.statusText, domStats);
+    }
+
+    const ioMailboxLanesEl = els.ioMailboxLanesEl || els.mailboxLanesEl || null;
+    if (ioMailboxLanesEl && ioTelemetry) {
+      safeSetText(ioMailboxLanesEl, ioTelemetry.statusText || '--', domStats);
+      safeSetDataset(
+        ioMailboxLanesEl,
+        'mailboxLanes',
+        ioTelemetry.mailboxLanes !== null ? String(ioTelemetry.mailboxLanes) : '',
+        domStats
+      );
+      safeSetDataset(ioMailboxLanesEl, 'state', ioTelemetry.state, domStats);
+      safeSetTitle(ioMailboxLanesEl, ioTelemetry.statusText, domStats);
+    }
+
+    if (els.diagnosticsSummaryEl && frameBudgetTelemetry && memoryTelemetry && ioTelemetry) {
+      safeSetText(els.diagnosticsSummaryEl, diagSummaryText || '--', domStats);
+      safeSetDataset(
+        els.diagnosticsSummaryEl,
+        'fps30ComplianceRate',
+        frameBudgetTelemetry.fps30ComplianceRate !== null
+          ? String(frameBudgetTelemetry.fps30ComplianceRate)
+          : '',
+        domStats
+      );
+      safeSetDataset(
+        els.diagnosticsSummaryEl,
+        'dominantBottleneck',
+        frameBudgetTelemetry.dominantBottleneck || '',
+        domStats
+      );
+      safeSetDataset(
+        els.diagnosticsSummaryEl,
+        'jsHeapUsedMb',
+        memoryTelemetry.jsHeapUsedMb !== null ? String(memoryTelemetry.jsHeapUsedMb) : '',
+        domStats
+      );
+      safeSetDataset(
+        els.diagnosticsSummaryEl,
+        'mailboxLanes',
+        ioTelemetry.mailboxLanes !== null ? String(ioTelemetry.mailboxLanes) : '',
+        domStats
+      );
+      const summaryState =
+        frameBudgetTelemetry.state === 'err'
+          ? 'err'
+          : frameBudgetTelemetry.state === 'warn' ||
+              memoryTelemetry.state === 'warn' ||
+              ioTelemetry.state === 'warn'
+            ? 'warn'
+            : diagSummaryText
+              ? 'ok'
+              : '';
+      safeSetDataset(els.diagnosticsSummaryEl, 'state', summaryState, domStats);
+      safeSetTitle(els.diagnosticsSummaryEl, diagSummaryText, domStats);
+    }
+
+    const diagTarget = this._resolveDiagnosticsPanelTarget();
+    if (diagTarget.container && frameBudgetTelemetry && memoryTelemetry && ioTelemetry) {
+      const hasW289Data =
+        this._hasFrameBudgetTelemetry || this._hasMemoryTelemetry || this._hasIoTelemetry;
+      if (diagTarget.explicit || hasW289Data || this._mountedDiagnosticsSection) {
+        const mounted = this._ensureDiagnosticsSection(diagTarget.container);
+        if (mounted) {
+          safeSetText(
+            mounted.budgetValueEl,
+            frameBudgetTelemetry.valueText || '--',
+            domStats
+          );
+          safeSetDataset(
+            mounted.budgetValueEl,
+            'fps30ComplianceRate',
+            frameBudgetTelemetry.fps30ComplianceRate !== null
+              ? String(frameBudgetTelemetry.fps30ComplianceRate)
+              : '',
+            domStats
+          );
+          safeSetDataset(
+            mounted.budgetValueEl,
+            'dominantBottleneck',
+            frameBudgetTelemetry.dominantBottleneck || '',
+            domStats
+          );
+          safeSetDataset(mounted.budgetValueEl, 'state', frameBudgetTelemetry.state, domStats);
+          safeSetTitle(mounted.budgetValueEl, frameBudgetTelemetry.statusText, domStats);
+
+          safeSetText(mounted.memoryValueEl, memoryTelemetry.valueText || '--', domStats);
+          safeSetDataset(
+            mounted.memoryValueEl,
+            'jsHeapUsedMb',
+            memoryTelemetry.jsHeapUsedMb !== null ? String(memoryTelemetry.jsHeapUsedMb) : '',
+            domStats
+          );
+          safeSetDataset(
+            mounted.memoryValueEl,
+            'jsHeapTotalMb',
+            memoryTelemetry.jsHeapTotalMb !== null ? String(memoryTelemetry.jsHeapTotalMb) : '',
+            domStats
+          );
+          safeSetDataset(mounted.memoryValueEl, 'state', memoryTelemetry.state, domStats);
+          safeSetTitle(mounted.memoryValueEl, memoryTelemetry.statusText, domStats);
+
+          safeSetText(
+            mounted.lanesValueEl,
+            ioTelemetry.mailboxLanes !== null ? String(ioTelemetry.mailboxLanes) : '--',
+            domStats
+          );
+          safeSetDataset(
+            mounted.lanesValueEl,
+            'mailboxLanes',
+            ioTelemetry.mailboxLanes !== null ? String(ioTelemetry.mailboxLanes) : '',
+            domStats
+          );
+          safeSetDataset(mounted.lanesValueEl, 'state', ioTelemetry.state, domStats);
+          safeSetTitle(mounted.lanesValueEl, ioTelemetry.statusText, domStats);
+        } else if (diagTarget.explicit) {
+          safeSetText(diagTarget.container, diagSummaryText || '--', domStats);
+          safeSetDataset(
+            diagTarget.container,
+            'fps30ComplianceRate',
+            frameBudgetTelemetry.fps30ComplianceRate !== null
+              ? String(frameBudgetTelemetry.fps30ComplianceRate)
+              : '',
+            domStats
+          );
+          safeSetDataset(
+            diagTarget.container,
+            'dominantBottleneck',
+            frameBudgetTelemetry.dominantBottleneck || '',
+            domStats
+          );
+          safeSetDataset(
+            diagTarget.container,
+            'jsHeapUsedMb',
+            memoryTelemetry.jsHeapUsedMb !== null ? String(memoryTelemetry.jsHeapUsedMb) : '',
+            domStats
+          );
+          safeSetDataset(
+            diagTarget.container,
+            'mailboxLanes',
+            ioTelemetry.mailboxLanes !== null ? String(ioTelemetry.mailboxLanes) : '',
+            domStats
+          );
+          safeSetTitle(diagTarget.container, diagSummaryText, domStats);
+        }
+      }
     }
 
     this._renderVisibility();
@@ -6146,10 +7280,16 @@ export class HudController {
       this._gpuTelemetry = createInitialGpuTelemetry();
       this._audioTelemetry = createInitialAudioTelemetry();
       this._pthreadTelemetry = createInitialPthreadTelemetry();
+      this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
+      this._memoryTelemetry = createInitialMemoryTelemetry();
+      this._ioTelemetry = createInitialIoTelemetry();
       this._hasGpuTelemetry = false;
       this._hasAudioTelemetry = false;
       this._hasGuestAudioTelemetry = false;
       this._hasPthreadTelemetry = false;
+      this._hasFrameBudgetTelemetry = false;
+      this._hasMemoryTelemetry = false;
+      this._hasIoTelemetry = false;
       this._liveFramesPresented = 0;
       this._liveFps = 0;
       this._fpsSamples = [];
@@ -6403,6 +7543,15 @@ export class HudController {
       guestFramesDrained: telemetry.audio.guestFramesDrained,
       guestUnderruns: telemetry.audio.guestUnderruns,
       guestPeakLevel: telemetry.audio.guestPeakLevel,
+      fps30ComplianceRate: telemetry.frameBudget.fps30ComplianceRate,
+      dominantBottleneck: telemetry.frameBudget.dominantBottleneck,
+      jsHeapUsedMb: telemetry.memory.jsHeapUsedMb,
+      jsHeapTotalMb: telemetry.memory.jsHeapTotalMb,
+      mailboxLanes: telemetry.io.mailboxLanes,
+      diagnosticsSummaryText: telemetry.diagnosticsSummaryText,
+      frameBudget: telemetry.frameBudget,
+      memory: telemetry.memory,
+      io: telemetry.io,
       domWrites: this._domWriteStats.domWrites,
       domWritesElided: this._domWriteStats.domWritesElided,
       minRenderIntervalMs: this._minRenderIntervalMs,
@@ -6410,6 +7559,31 @@ export class HudController {
       renderStats: this.getRenderStats(),
       bootStatus,
       telemetry,
+    };
+  }
+
+  /**
+   * Returns a defensive diagnostics snapshot surfacing 30 FPS frame-budget status,
+   * dominant bottleneck, JS heap memory MB, HTTPFS I/O mailbox lanes, and full
+   * HUD telemetry & boot status.
+   */
+  getDiagnosticsSnapshot() {
+    const snapshot = this.getSnapshot();
+    const { frameBudget, memory, io } = snapshot.telemetry;
+    return {
+      ...snapshot,
+      fps30ComplianceRate: frameBudget.fps30ComplianceRate,
+      dominantBottleneck: frameBudget.dominantBottleneck,
+      frameBudgetStatusText: frameBudget.statusText,
+      jsHeapUsedMb: memory.jsHeapUsedMb,
+      jsHeapTotalMb: memory.jsHeapTotalMb,
+      memoryStatusText: memory.statusText,
+      mailboxLanes: io.mailboxLanes,
+      ioMailboxStatusText: io.statusText,
+      diagnosticsSummaryText: snapshot.telemetry.diagnosticsSummaryText,
+      frameBudget: { ...frameBudget },
+      memory: { ...memory },
+      io: { ...io },
     };
   }
 }
