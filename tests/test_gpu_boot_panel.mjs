@@ -10,12 +10,15 @@ import { BootTracer } from '../web/telemetry/boot_tracer.js';
 const {
   DEFAULT_MAX_ROWS,
   DEFAULT_MAX_TOP_MISSING_SHADERS,
+  MAX_GPU_ADAPTER_LENGTH,
   EXPORT_FORMAT,
   EXPORT_SCHEMA_VERSION,
   BOOT_STAGE_ORDER,
   STAGE_NAMES,
   ALLOWED_SWAPCHAIN_FORMATS,
   sanitizeSwapchainFormat,
+  sanitizeGpuAdapter,
+  formatDurationMs,
   formatOnePercentLowFps,
   formatP99FrameMs,
   normalizeTopMissingShaders,
@@ -23,6 +26,7 @@ const {
   formatMissingShaderRow,
   buildMissingShaderExport,
   GpuBootPanelController,
+  GpuBootPanel,
 } = panelMod;
 
 const { ShaderFallbackRouter, SHADER_STAGE } = fallbackRouterMod;
@@ -1386,6 +1390,452 @@ test('W212 dirty-checked DOM updates skip redundant textContent writes and table
   assert.equal(fpsEl.textContentWrites, before.fps + 1);
   assert.equal(zeroCopyEl.textContentWrites, before.zeroCopy + 1);
   assert.equal(p99El.textContentWrites, before.p99);
+
+  controller.destroy();
+});
+
+test('W240 exports adapter/duration helpers, GpuBootPanel alias, and clean default state/DOM/snapshot', () => {
+  assert.equal(MAX_GPU_ADAPTER_LENGTH, 96);
+  assert.equal(typeof sanitizeGpuAdapter, 'function');
+  assert.equal(typeof formatDurationMs, 'function');
+  assert.equal(GpuBootPanel, GpuBootPanelController);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.MAX_GPU_ADAPTER_LENGTH, 96);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.sanitizeGpuAdapter, sanitizeGpuAdapter);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatDurationMs, formatDurationMs);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.GpuBootPanel, GpuBootPanelController);
+
+  // Pure sanitizeGpuAdapter checks
+  assert.equal(sanitizeGpuAdapter('NVIDIA / Turing'), 'nvidia / turing');
+  assert.equal(sanitizeGpuAdapter('  Intel/Gen-12LP  '), 'intel / gen-12lp');
+  assert.equal(sanitizeGpuAdapter({ vendor: 'AMD', architecture: 'RDNA2' }), 'amd / rdna2');
+  assert.equal(sanitizeGpuAdapter({ vendor: 'Intel', arch: 'Xe-LPG' }), 'intel / xe-lpg');
+  assert.equal(sanitizeGpuAdapter({ vendor: 'Apple' }), 'apple');
+  assert.equal(sanitizeGpuAdapter({ architecture: 'Metal-3' }), 'metal-3');
+  assert.equal(sanitizeGpuAdapter('amd / gfx10.3'), 'amd / gfx10.3');
+  assert.equal(sanitizeGpuAdapter('\x1b[32mNVIDIA\x1b[0m / Turing\r\n\0'), 'nvidia / turing');
+  assert.equal(
+    sanitizeGpuAdapter('NVIDIA / Turing (C:\\Users\\alice\\driver.dll)'),
+    'nvidia / turing'
+  );
+
+  // Max 96 chars enforced without trailing slash or whitespace
+  const longAdapter = `nvidia / ${'a'.repeat(120)}`;
+  const sanitizedLong = sanitizeGpuAdapter(longAdapter);
+  assert.equal(sanitizedLong.length, 96);
+  assert.ok(sanitizedLong.startsWith('nvidia / a'));
+  assert.equal(sanitizeGpuAdapter(`${'a'.repeat(94)} / bbb`), 'a'.repeat(94));
+
+  // Host paths, URLs, raw bytes, and invalid types are rejected cleanly
+  assert.equal(sanitizeGpuAdapter('C:\\Users\\alice\\GTA6\\game.exe'), null);
+  assert.equal(sanitizeGpuAdapter('C:\\Program Files\\NVIDIA\\driver.dll'), null);
+  assert.equal(sanitizeGpuAdapter('D:/Games/GTA6/shader.bin'), null);
+  assert.equal(sanitizeGpuAdapter('\\\\fileserver\\share\\gpu.dll'), null);
+  assert.equal(sanitizeGpuAdapter('/home/alice/secret/gpu.bin'), null);
+  assert.equal(sanitizeGpuAdapter('/Users/alice/Library/Application Support/gpu'), null);
+  assert.equal(sanitizeGpuAdapter('/etc/passwd'), null);
+  assert.equal(sanitizeGpuAdapter('../../etc/passwd'), null);
+  assert.equal(sanitizeGpuAdapter('file:///C:/Users/alice/nvidia'), null);
+  assert.equal(sanitizeGpuAdapter('https://user:pass@example.test/gpu'), null);
+  assert.equal(sanitizeGpuAdapter(new Uint8Array([1, 2, 3])), null);
+  assert.equal(sanitizeGpuAdapter(new ArrayBuffer(16)), null);
+  assert.equal(sanitizeGpuAdapter(['nvidia', 'turing']), null);
+  assert.equal(sanitizeGpuAdapter(12345), null);
+  assert.equal(sanitizeGpuAdapter(null), null);
+  assert.equal(sanitizeGpuAdapter(undefined), null);
+  assert.equal(sanitizeGpuAdapter('   ///   '), null);
+  assert.equal(
+    sanitizeGpuAdapter({
+      get vendor() {
+        throw new Error('hostile getter');
+      },
+    }),
+    null
+  );
+
+  // Pure formatDurationMs checks
+  assert.equal(formatDurationMs(0), '0.0 ms');
+  assert.equal(formatDurationMs(1420.56), '1420.6 ms');
+  assert.equal(formatDurationMs('350.25'), '350.3 ms');
+  assert.equal(formatDurationMs(null), '—');
+  assert.equal(formatDurationMs(undefined), '—');
+  assert.equal(formatDurationMs(-5), '—');
+  assert.equal(formatDurationMs(Number.NaN), '—');
+  assert.equal(formatDurationMs(Infinity), '—');
+  assert.equal(formatDurationMs(true), '—');
+  assert.equal(formatDurationMs('C:\\Users\\alice\\time.txt'), '—');
+
+  // Default panel state, getSnapshot(), DOM, and export
+  const { controller } = createPanel();
+  const state = controller.getState();
+  const snapshot = controller.getSnapshot();
+  const root = state.root;
+
+  assert.deepEqual(snapshot, state);
+  assert.equal(state.gpuAdapter, null);
+  assert.equal(state.firstVisibleFrameMs, null);
+  assert.equal(state.blackLoadingMs, null);
+  assert.equal(state.blackPresentsTotal, 0);
+  assert.equal(state.reflectedStages, 0);
+  assert.equal(state.inlineSamplerStages, 0);
+  assert.equal(state.resourceHeapBindings, 0);
+  assert.deepEqual(state.visibilityStats, {
+    firstVisibleFrameMs: null,
+    blackLoadingMs: null,
+    blackPresentsTotal: 0,
+  });
+  assert.deepEqual(state.reflectionStats, {
+    reflectedStages: 0,
+    inlineSamplerStages: 0,
+    resourceHeapBindings: 0,
+  });
+
+  const section = root.querySelector('.pg6-gpu-panel__adapter-reflection');
+  assert.equal(section.getAttribute('role'), 'group');
+  assert.equal(section.getAttribute('aria-label'), 'Adapter, Visibility & Shader Reflection');
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__first-visible-frame-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-loading-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-presents-total').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__inline-sampler-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__resource-heap-bindings').textContent, '0');
+
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.equal(exported.gpu.gpuAdapter, null);
+  assert.equal(exported.gpu.firstVisibleFrameMs, null);
+  assert.equal(exported.gpu.blackLoadingMs, null);
+  assert.equal(exported.gpu.blackPresentsTotal, 0);
+  assert.deepEqual(exported.reflection, {
+    reflectedStages: 0,
+    inlineSamplerStages: 0,
+    resourceHeapBindings: 0,
+  });
+
+  controller.destroy();
+});
+
+test('W240 update() ingests gpuAdapter, visibility timings, and S44 shader reflection breakdown from top-level and nested sources', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  // 1. Top-level fields
+  controller.update({
+    gpuAdapter: 'NVIDIA / Turing',
+    firstVisibleFrameMs: 1842.4,
+    blackLoadingMs: 412.75,
+    blackPresentsTotal: 19,
+    reflectedStages: 248,
+    inlineSamplerStages: 64,
+    resourceHeapBindings: 512,
+  });
+
+  const s1 = controller.getSnapshot();
+  assert.equal(s1.gpuAdapter, 'nvidia / turing');
+  assert.equal(s1.firstVisibleFrameMs, 1842.4);
+  assert.equal(s1.blackLoadingMs, 412.75);
+  assert.equal(s1.blackPresentsTotal, 19);
+  assert.equal(s1.reflectedStages, 248);
+  assert.equal(s1.inlineSamplerStages, 64);
+  assert.equal(s1.resourceHeapBindings, 512);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, 'nvidia / turing');
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__first-visible-frame-ms').textContent,
+    '1842.4 ms'
+  );
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-loading-ms').textContent, '412.8 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-presents-total').textContent, '19');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '248');
+  assert.equal(root.querySelector('.pg6-gpu-panel__inline-sampler-stages').textContent, '64');
+  assert.equal(root.querySelector('.pg6-gpu-panel__resource-heap-bindings').textContent, '512');
+
+  // 2. Partial BootTracer summary with null optional fields must NOT clobber existing values.
+  controller.update({
+    bootSummary: {
+      stage: 'D3D12_CREATE_DEVICE',
+      gpuAdapter: null,
+      firstVisibleFrameMs: null,
+      blackLoadingMs: null,
+    },
+  });
+  assert.equal(controller.getState().gpuAdapter, 'nvidia / turing');
+  assert.equal(controller.getState().firstVisibleFrameMs, 1842.4);
+  assert.equal(controller.getState().blackLoadingMs, 412.75);
+
+  // 3. Nested W236 bootSummary + W231 swapchainStats + S44 reflectionStats (stageCount alias)
+  controller.update({
+    bootSummary: {
+      stage: 'FIRST_VISIBLE_FRAME',
+      gpuAdapter: { vendor: 'Intel', architecture: 'Gen-12LP' },
+      firstVisibleFrameMs: 2150,
+      blackLoadingMs: 605.5,
+    },
+    swapchainStats: {
+      blackPresentsTotal: 27,
+    },
+    reflectionStats: {
+      stageCount: 310,
+      inlineSamplerStages: 92,
+      resourceHeapBindings: 1024,
+    },
+  });
+
+  const s2 = controller.getState();
+  assert.equal(s2.boot.stage, 'FIRST_VISIBLE_FRAME');
+  assert.equal(s2.boot.readyForSplash, true);
+  assert.equal(s2.gpuAdapter, 'intel / gen-12lp');
+  assert.equal(s2.firstVisibleFrameMs, 2150);
+  assert.equal(s2.blackLoadingMs, 605.5);
+  assert.equal(s2.blackPresentsTotal, 27);
+  assert.equal(s2.reflectedStages, 310);
+  assert.equal(s2.inlineSamplerStages, 92);
+  assert.equal(s2.resourceHeapBindings, 1024);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, 'intel / gen-12lp');
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__first-visible-frame-ms').textContent,
+    '2150.0 ms'
+  );
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-loading-ms').textContent, '605.5 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-presents-total').textContent, '27');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '310');
+  assert.equal(root.querySelector('.pg6-gpu-panel__inline-sampler-stages').textContent, '92');
+  assert.equal(root.querySelector('.pg6-gpu-panel__resource-heap-bindings').textContent, '1024');
+
+  // Verify JSON export contains all W240 sanitized fields
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.equal(exported.gpu.gpuAdapter, 'intel / gen-12lp');
+  assert.equal(exported.gpu.firstVisibleFrameMs, 2150);
+  assert.equal(exported.gpu.blackLoadingMs, 605.5);
+  assert.equal(exported.gpu.blackPresentsTotal, 27);
+  assert.deepEqual(exported.reflection, {
+    reflectedStages: 310,
+    inlineSamplerStages: 92,
+    resourceHeapBindings: 1024,
+  });
+
+  // Explicit top-level / sub-object null clears individual sections cleanly
+  controller.update({ gpuAdapter: null, visibilityStats: null, reflectionStats: null });
+  const s3 = controller.getSnapshot();
+  assert.equal(s3.gpuAdapter, null);
+  assert.equal(s3.firstVisibleFrameMs, null);
+  assert.equal(s3.blackLoadingMs, null);
+  assert.equal(s3.blackPresentsTotal, 0);
+  assert.equal(s3.reflectedStages, 0);
+  assert.equal(s3.inlineSamplerStages, 0);
+  assert.equal(s3.resourceHeapBindings, 0);
+
+  controller.destroy();
+});
+
+test('W240 sanitizes hostile adapter paths, invalid timings/counts, and strips leaks from DOM and export', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  controller.update({
+    gpuAdapter: 'C:\\Users\\alice\\AppData\\Local\\GTA6\\secret_gpu.dll',
+    firstVisibleFrameMs: '/home/alice/secret/frame.bin',
+    blackLoadingMs: -42,
+    blackPresentsTotal: Number.NaN,
+    reflectedStages: 'file:///C:/Users/alice/stages.json',
+    inlineSamplerStages: -7,
+    resourceHeapBindings: Infinity,
+    reflectionStats: {
+      hostPath: 'D:\\Games\\Secret\\manifest.json',
+      rawBytes: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    },
+  });
+
+  const state = controller.getSnapshot();
+  assert.equal(state.gpuAdapter, null);
+  assert.equal(state.firstVisibleFrameMs, null);
+  assert.equal(state.blackLoadingMs, null);
+  assert.equal(state.blackPresentsTotal, 0);
+  assert.equal(state.reflectedStages, 0);
+  assert.equal(state.inlineSamplerStages, 0);
+  assert.equal(state.resourceHeapBindings, 0);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__first-visible-frame-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-loading-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-presents-total').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__inline-sampler-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__resource-heap-bindings').textContent, '0');
+
+  const exportedJson = controller.exportMissingShadersJson();
+  assert.doesNotMatch(
+    exportedJson,
+    /Users|alice|AppData|secret_gpu|home|file:\/\/|Games|Secret|hostPath|rawBytes/i
+  );
+
+  // Direct buildMissingShaderExport also sanitizes hostile W240 fields
+  const direct = buildMissingShaderExport({
+    gpuAdapter: '/Users/bob/Library/Application Support/GTA6/adapter',
+    firstVisibleFrameMs: 'not-a-number',
+    blackLoadingMs: -1,
+    blackPresentsTotal: 'C:\\secret',
+    reflectedStages: 14.9,
+    inlineSamplerStages: 3.2,
+    resourceHeapBindings: 88.7,
+    exportedAt: Date.UTC(2026, 7, 1, 0, 0, 0),
+  });
+  assert.equal(direct.gpu.gpuAdapter, null);
+  assert.equal(direct.gpu.firstVisibleFrameMs, null);
+  assert.equal(direct.gpu.blackLoadingMs, null);
+  assert.equal(direct.gpu.blackPresentsTotal, 0);
+  assert.deepEqual(direct.reflection, {
+    reflectedStages: 14,
+    inlineSamplerStages: 3,
+    resourceHeapBindings: 88,
+  });
+  assert.doesNotMatch(JSON.stringify(direct), /Users|bob|Library|secret/i);
+
+  controller.destroy();
+});
+
+test('W240 reset() cleanly resets all W240 and existing telemetry state and DOM while keeping panel mounted', () => {
+  const { controller, container } = createPanel();
+  const root = controller.getState().root;
+
+  controller.update({
+    bootSummary: {
+      stage: 'FIRST_VISIBLE_FRAME',
+      milestonesReached: 9,
+      progressPct: 100,
+      readyForSplash: true,
+    },
+    frameStats: { framesPresented: 50, droppedFrames: 2 },
+    fallbackStats: { packHits: 40, fallbackHits: 5, builtinHits: 5 },
+    compatStats: {
+      bindGroupKindMismatches: 2,
+      swapchainFormat: 'bgra8unorm',
+      usesBlitFallback: true,
+      blitCount: 5,
+    },
+    ioStats: { pgimFullFetches: 1, slabCacheHits: 10, slabCacheMisses: 2, syncFastPathHits: 8 },
+    perfStats: {
+      onePercentLowFps: 59.0,
+      p99FrameMs: 16.8,
+      zeroCopyUploads: 12,
+      totalElidedStateCalls: 300,
+      bindGroupCacheHits: 120,
+      topMissingShaders: [{ hash: '0x1234', stage: 'fragment', hits: 4 }],
+    },
+    missingShaders: [{ hash: '0x1234', stage: 'fragment', hits: 4 }],
+    gpuAdapter: 'AMD / RDNA2',
+    firstVisibleFrameMs: 950.5,
+    blackLoadingMs: 210.2,
+    blackPresentsTotal: 8,
+    reflectedStages: 180,
+    inlineSamplerStages: 44,
+    resourceHeapBindings: 612,
+  });
+  controller.exportMissingShadersJson();
+  assert.equal(controller.getState().exportCount, 1);
+
+  const afterReset = controller.reset();
+  assert.equal(afterReset.destroyed, false);
+  assert.equal(afterReset.visible, true);
+  assert.equal(afterReset.root, root);
+  assert.equal(root.parentNode, container);
+  assert.equal(afterReset.exportCount, 0);
+  assert.equal(afterReset.boot.stage, 'NOT_STARTED');
+  assert.equal(afterReset.boot.milestonesReached, 0);
+  assert.equal(afterReset.boot.progressPct, 0);
+  assert.equal(afterReset.boot.readyForSplash, false);
+  assert.equal(afterReset.frameStats.framesPresented, 0);
+  assert.equal(afterReset.fallbackStats.packHits, 0);
+  assert.equal(afterReset.compatStats.swapchainFormat, null);
+  assert.equal(afterReset.ioStats.slabCacheHits, 0);
+  assert.equal(afterReset.perfStats.onePercentLowFps, null);
+  assert.equal(afterReset.totalMissingShaders, 0);
+
+  // All W240 fields cleanly reset in getState(), getSnapshot(), and DOM
+  assert.equal(afterReset.gpuAdapter, null);
+  assert.equal(afterReset.firstVisibleFrameMs, null);
+  assert.equal(afterReset.blackLoadingMs, null);
+  assert.equal(afterReset.blackPresentsTotal, 0);
+  assert.equal(afterReset.reflectedStages, 0);
+  assert.equal(afterReset.inlineSamplerStages, 0);
+  assert.equal(afterReset.resourceHeapBindings, 0);
+  assert.deepEqual(controller.getSnapshot(), afterReset);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__first-visible-frame-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-loading-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__black-presents-total').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__inline-sampler-stages').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__resource-heap-bindings').textContent, '0');
+
+  // Panel remains fully usable after reset()
+  controller.update({ gpuAdapter: 'nvidia / ampere', reflectedStages: 12 });
+  assert.equal(controller.getSnapshot().gpuAdapter, 'nvidia / ampere');
+  assert.equal(controller.getSnapshot().reflectedStages, 12);
+  assert.equal(root.querySelector('.pg6-gpu-panel__gpu-adapter').textContent, 'nvidia / ampere');
+  assert.equal(root.querySelector('.pg6-gpu-panel__reflected-stages').textContent, '12');
+
+  // Safe no-op after destroy()
+  controller.destroy();
+  assert.doesNotThrow(() => controller.reset());
+  assert.equal(controller.getSnapshot().destroyed, true);
+});
+
+test('W240 dirty-checked DOM updates skip redundant writes for adapter, visibility, and reflection fields', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  const snapshot = {
+    gpuAdapter: 'nvidia / turing',
+    firstVisibleFrameMs: 1200.5,
+    blackLoadingMs: 300.2,
+    blackPresentsTotal: 11,
+    reflectedStages: 200,
+    inlineSamplerStages: 50,
+    resourceHeapBindings: 400,
+  };
+  controller.update(snapshot);
+
+  const adapterEl = root.querySelector('.pg6-gpu-panel__gpu-adapter');
+  const firstVisEl = root.querySelector('.pg6-gpu-panel__first-visible-frame-ms');
+  const blackLoadEl = root.querySelector('.pg6-gpu-panel__black-loading-ms');
+  const blackPresEl = root.querySelector('.pg6-gpu-panel__black-presents-total');
+  const reflStagesEl = root.querySelector('.pg6-gpu-panel__reflected-stages');
+  const inlineSampEl = root.querySelector('.pg6-gpu-panel__inline-sampler-stages');
+  const heapBindEl = root.querySelector('.pg6-gpu-panel__resource-heap-bindings');
+
+  const before = {
+    adapter: adapterEl.textContentWrites,
+    firstVis: firstVisEl.textContentWrites,
+    blackLoad: blackLoadEl.textContentWrites,
+    blackPres: blackPresEl.textContentWrites,
+    reflStages: reflStagesEl.textContentWrites,
+    inlineSamp: inlineSampEl.textContentWrites,
+    heapBind: heapBindEl.textContentWrites,
+  };
+
+  // Identical repeated updates produce zero DOM writes
+  controller.update(snapshot);
+  controller.update({ ...snapshot, gpuAdapter: '  NVIDIA / TURING  ' });
+  assert.equal(adapterEl.textContentWrites, before.adapter);
+  assert.equal(firstVisEl.textContentWrites, before.firstVis);
+  assert.equal(blackLoadEl.textContentWrites, before.blackLoad);
+  assert.equal(blackPresEl.textContentWrites, before.blackPres);
+  assert.equal(reflStagesEl.textContentWrites, before.reflStages);
+  assert.equal(inlineSampEl.textContentWrites, before.inlineSamp);
+  assert.equal(heapBindEl.textContentWrites, before.heapBind);
+
+  // Updating a single field touches ONLY that DOM node
+  controller.update({ resourceHeapBindings: 401 });
+  assert.equal(heapBindEl.textContent, '401');
+  assert.equal(heapBindEl.textContentWrites, before.heapBind + 1);
+  assert.equal(adapterEl.textContentWrites, before.adapter);
+  assert.equal(firstVisEl.textContentWrites, before.firstVis);
+  assert.equal(blackLoadEl.textContentWrites, before.blackLoad);
+  assert.equal(blackPresEl.textContentWrites, before.blackPres);
+  assert.equal(reflStagesEl.textContentWrites, before.reflStages);
+  assert.equal(inlineSampEl.textContentWrites, before.inlineSamp);
 
   controller.destroy();
 });
