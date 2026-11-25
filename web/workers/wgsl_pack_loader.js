@@ -23,6 +23,15 @@ export const DEFAULT_INITIAL_RANGE_BYTES = 64 * 1024;
 /** Default bounded in-memory LRU cache budget for on-demand WGSL strings in ranged mode (32 MiB). */
 export const DEFAULT_MAX_CACHED_WGSL_BYTES = 32 * 1024 * 1024;
 
+/** Default maximum concurrent HTTP 206 Range payload fetches per ranged pack (`0` = unlimited). */
+export const DEFAULT_MAX_CONCURRENT_RANGE_FETCHES = 8;
+
+/** Default maximum retries on transient HTTP 206 Range fetch failures (`0` = no retries). */
+export const DEFAULT_MAX_RANGE_FETCH_RETRIES = 2;
+
+/** Default base backoff delay in milliseconds before retrying a transient Range fetch failure. */
+export const DEFAULT_RANGE_RETRY_DELAY_MS = 25;
+
 /** Shader index ABI version matching shaders/src/pack.rs and docs/gpu_commands.md. */
 export const SHADER_INDEX_ABI_VERSION = 1;
 
@@ -255,6 +264,96 @@ function validateStreamThresholdBytes(value, defaultValue = 0) {
   return value;
 }
 
+function validateMaxConcurrentRangeFetches(
+  value,
+  defaultValue = DEFAULT_MAX_CONCURRENT_RANGE_FETCHES
+) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(
+      `maxConcurrentRangeFetches must be a non-negative integer, got: ${value}`
+    );
+  }
+  return value;
+}
+
+function validateMaxRangeFetchRetries(
+  value,
+  defaultValue = DEFAULT_MAX_RANGE_FETCH_RETRIES
+) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`maxRangeFetchRetries must be a non-negative integer, got: ${value}`);
+  }
+  return value;
+}
+
+function validateRangeRetryDelayMs(value, defaultValue = DEFAULT_RANGE_RETRY_DELAY_MS) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(
+      `rangeRetryDelayMs must be a non-negative finite number, got: ${value}`
+    );
+  }
+  return value;
+}
+
+function validateSleepFn(value, defaultValue = null) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'function') {
+    throw new TypeError('sleepFn must be a function');
+  }
+  return value;
+}
+
+function defaultSleep(ms) {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeRangeRetryDelayMs(baseDelayMs, attemptIndex) {
+  if (baseDelayMs <= 0) {
+    return 0;
+  }
+  const factor = 1 << Math.min(attemptIndex, 4);
+  return baseDelayMs * factor;
+}
+
+function isRetryableRangeFetchError(err, fetchInit) {
+  if (fetchInit && fetchInit.signal && fetchInit.signal.aborted) {
+    return false;
+  }
+  if (!err) {
+    return false;
+  }
+  if (err.name === 'AbortError' || err.code === 'ABORT_ERR') {
+    return false;
+  }
+  if (err.name === 'AssertionError' || err.code === 'ERR_ASSERTION') {
+    return false;
+  }
+  if (err instanceof RangeError) {
+    return false;
+  }
+  if (typeof err.httpStatus === 'number') {
+    const status = err.httpStatus;
+    return status === 429 || status === 408 || (status >= 500 && status <= 599);
+  }
+  // Network / transport errors thrown by fetch() or response.arrayBuffer()
+  // (e.g. TypeError: Failed to fetch, ECONNRESET, premature connection close).
+  return true;
+}
+
 function parseWgpkHeader(bytes) {
   if (bytes.byteLength < WGPK_HEADER_BYTES) {
     throw new Error(
@@ -381,9 +480,11 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
   if (!response || (!response.ok && response.status !== 206)) {
     const status = response ? response.status : 'unknown';
     const statusText = response && response.statusText ? ` ${response.statusText}` : '';
-    throw new Error(
+    const err = new Error(
       `Failed to fetch WGSL pack range (${rangeHeader}) from "${url}": HTTP ${status}${statusText}`
     );
+    err.httpStatus = response && typeof response.status === 'number' ? response.status : 0;
+    throw err;
   }
 
   const buffer = await response.arrayBuffer();
@@ -397,6 +498,37 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
     contentRange,
     contentLength,
   };
+}
+
+async function fetchRangeChunkWithRetry(fetcher, url, start, end, fetchInit, retryOptions = {}) {
+  const maxRetries = validateMaxRangeFetchRetries(retryOptions.maxRangeFetchRetries);
+  const baseDelayMs = validateRangeRetryDelayMs(retryOptions.rangeRetryDelayMs);
+  const sleep = validateSleepFn(retryOptions.sleepFn) || defaultSleep;
+  const onAttempt = typeof retryOptions.onAttempt === 'function' ? retryOptions.onAttempt : null;
+  const onRetry = typeof retryOptions.onRetry === 'function' ? retryOptions.onRetry : null;
+
+  let attempt = 0;
+  for (;;) {
+    if (onAttempt) {
+      onAttempt();
+    }
+    try {
+      return await fetchRangeChunk(fetcher, url, start, end, fetchInit);
+    } catch (err) {
+      if (attempt >= maxRetries || !isRetryableRangeFetchError(err, fetchInit)) {
+        throw err;
+      }
+      if (onRetry) {
+        onRetry(err, attempt);
+      }
+      const delayMs = computeRangeRetryDelayMs(baseDelayMs, attempt);
+      attempt += 1;
+      await sleep(delayMs);
+      if (fetchInit && fetchInit.signal && fetchInit.signal.aborted) {
+        throw err;
+      }
+    }
+  }
 }
 
 /**
@@ -678,8 +810,13 @@ export class WgslPack {
     fetchImpl = null,
     fetchInit = undefined,
     maxCachedWgslBytes = DEFAULT_MAX_CACHED_WGSL_BYTES,
+    maxConcurrentRangeFetches = DEFAULT_MAX_CONCURRENT_RANGE_FETCHES,
+    maxRangeFetchRetries = DEFAULT_MAX_RANGE_FETCH_RETRIES,
+    rangeRetryDelayMs = DEFAULT_RANGE_RETRY_DELAY_MS,
+    sleepFn = null,
     initialRangeFetches = 0,
     initialRangeBytesFetched = 0,
+    initialRangeFetchRetries = 0,
     wgslCache = null,
     rangedDecodeCounter = null,
   }) {
@@ -699,16 +836,28 @@ export class WgslPack {
     this._dynamicEntries = new Map();
     this._dynamicHits = 0;
 
-    // Ranged streaming state (bounded LRU cache + concurrent in-flight deduplication).
+    // Ranged streaming state (bounded LRU cache, FIFO concurrency semaphore, transient retry,
+    // and concurrent in-flight deduplication).
     this._fetch = fetchImpl;
     this._fetchInit = fetchInit;
     this._maxCachedWgslBytes =
       mode === 'ranged' ? validateMaxCachedWgslBytes(maxCachedWgslBytes) : null;
+    this._maxConcurrentRangeFetches =
+      mode === 'ranged' ? validateMaxConcurrentRangeFetches(maxConcurrentRangeFetches) : null;
+    this._maxRangeFetchRetries =
+      mode === 'ranged' ? validateMaxRangeFetchRetries(maxRangeFetchRetries) : null;
+    this._rangeRetryDelayMs =
+      mode === 'ranged' ? validateRangeRetryDelayMs(rangeRetryDelayMs) : null;
+    this._sleepFn = mode === 'ranged' ? validateSleepFn(sleepFn) : null;
     this._wgslCache = wgslCache || new Map();
     this._cachedWgslBytes = 0;
     this._inFlightFetches = new Map();
+    this._rangeFetchWaiters = [];
+    this._activeRangeFetches = 0;
+    this._peakConcurrentRangeFetches = 0;
     this._rangeFetches = sanitizeNonNegativeInt(initialRangeFetches, 0);
     this._rangeBytesFetched = sanitizeNonNegativeInt(initialRangeBytesFetched, 0);
+    this._rangeFetchRetries = sanitizeNonNegativeInt(initialRangeFetchRetries, 0);
     this._cacheHits = 0;
     this._cacheMisses = 0;
     this._wgslCacheEvictions = 0;
@@ -974,11 +1123,79 @@ export class WgslPack {
     return count;
   }
 
+  _acquireRangeFetchSlot() {
+    const limit = this._maxConcurrentRangeFetches;
+    if (limit === null || limit === 0 || this._activeRangeFetches < limit) {
+      this._activeRangeFetches += 1;
+      if (this._activeRangeFetches > this._peakConcurrentRangeFetches) {
+        this._peakConcurrentRangeFetches = this._activeRangeFetches;
+      }
+      return null;
+    }
+    return new Promise((resolve) => {
+      this._rangeFetchWaiters.push(resolve);
+    });
+  }
+
+  _releaseRangeFetchSlot() {
+    const limit = this._maxConcurrentRangeFetches;
+    if (limit !== null && limit > 0 && this._rangeFetchWaiters.length > 0) {
+      // Transfer the slot directly to the next FIFO waiter so _activeRangeFetches never
+      // exceeds the configured limit and new arrivals cannot jump ahead in the queue.
+      const next = this._rangeFetchWaiters.shift();
+      next();
+      return;
+    }
+    if (this._activeRangeFetches > 0) {
+      this._activeRangeFetches -= 1;
+    }
+  }
+
+  async _withRangeFetchSlot(fn) {
+    const waitPromise = this._acquireRangeFetchSlot();
+    if (waitPromise !== null) {
+      await waitPromise;
+    }
+    try {
+      return await fn();
+    } finally {
+      this._releaseRangeFetchSlot();
+    }
+  }
+
+  async _fetchRangeChunkBounded(fetcher, start, end) {
+    const maxRetries = this._maxRangeFetchRetries ?? 0;
+    const baseDelayMs = this._rangeRetryDelayMs ?? DEFAULT_RANGE_RETRY_DELAY_MS;
+    const sleep = this._sleepFn || defaultSleep;
+
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this._withRangeFetchSlot(() => {
+          this._rangeFetches += 1;
+          return fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
+        });
+      } catch (err) {
+        if (attempt >= maxRetries || !isRetryableRangeFetchError(err, this._fetchInit)) {
+          throw err;
+        }
+        this._rangeFetchRetries += 1;
+        const delayMs = computeRangeRetryDelayMs(baseDelayMs, attempt);
+        attempt += 1;
+        await sleep(delayMs);
+        if (this._fetchInit && this._fetchInit.signal && this._fetchInit.signal.aborted) {
+          throw err;
+        }
+      }
+    }
+  }
+
   /**
    * Asynchronously resolve the WGSL source string for a shader hash.
    * Works in both full-buffer mode (returns immediately) and ranged index mode
-   * (checks bounded LRU cache, deduplicates concurrent in-flight requests, and fetches
-   * only the exact `[offset, offset + length - 1]` byte slice via HTTP `206 Range`).
+   * (checks bounded LRU cache, deduplicates concurrent in-flight requests, enforces
+   * bounded HTTP Range concurrency + transient retry, and fetches only the exact
+   * `[offset, offset + length - 1]` byte slice via HTTP `206 Range`).
    *
    * @param {bigint | string | number} hash
    * @returns {Promise<string | null>}
@@ -1020,7 +1237,7 @@ export class WgslPack {
       return '';
     }
 
-    // Deduplicate concurrent in-flight fetches for the same shader hash.
+    // Deduplicate concurrent in-flight fetches for the same shader hash before acquiring a slot.
     const existingPromise = this._inFlightFetches.get(key);
     if (existingPromise !== undefined) {
       this._inFlightCoalesced += 1;
@@ -1038,11 +1255,11 @@ export class WgslPack {
     const start = staticEntry.offset >>> 0;
     const end = start + length - 1;
 
+    let settled = false;
     let fetchPromise;
     fetchPromise = (async () => {
       try {
-        this._rangeFetches += 1;
-        const chunk = await fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
+        const chunk = await this._fetchRangeChunkBounded(fetcher, start, end);
         this._rangeBytesFetched += sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
 
         let payloadBytes;
@@ -1078,13 +1295,16 @@ export class WgslPack {
         this._putWgslCache(key, wgsl, length);
         return wgsl;
       } finally {
+        settled = true;
         if (this._inFlightFetches.get(key) === fetchPromise) {
           this._inFlightFetches.delete(key);
         }
       }
     })();
 
-    this._inFlightFetches.set(key, fetchPromise);
+    if (!settled) {
+      this._inFlightFetches.set(key, fetchPromise);
+    }
     return fetchPromise;
   }
 
@@ -1179,6 +1399,9 @@ export class WgslPack {
 
     const rangeFetchCount = sanitizeNonNegativeInt(this._rangeFetches, 0);
     const rangeBytesFetched = sanitizeNonNegativeInt(this._rangeBytesFetched, 0);
+    const rangeFetchRetries = sanitizeNonNegativeInt(this._rangeFetchRetries, 0);
+    const activeRangeFetches = sanitizeNonNegativeInt(this._activeRangeFetches, 0);
+    const peakConcurrentRangeFetches = sanitizeNonNegativeInt(this._peakConcurrentRangeFetches, 0);
     const cacheHits = sanitizeNonNegativeInt(this._cacheHits, 0);
     const cacheMisses = sanitizeNonNegativeInt(this._cacheMisses, 0);
     const cachedWgslBytes = sanitizeNonNegativeInt(this._cachedWgslBytes, 0);
@@ -1207,6 +1430,11 @@ export class WgslPack {
       rangeFetches: rangeFetchCount,
       rangeFetchCount,
       rangeBytesFetched,
+      rangeFetchRetries,
+      activeRangeFetches,
+      peakConcurrentRangeFetches,
+      maxConcurrentRangeFetches: this._maxConcurrentRangeFetches,
+      maxRangeFetchRetries: this._maxRangeFetchRetries,
       cacheHits,
       cacheMisses,
       cachedWgslBytes,
@@ -1390,12 +1618,26 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
   const maxCachedWgslBytes = validateMaxCachedWgslBytes(
     options ? options.maxCachedWgslBytes : undefined
   );
+  const maxConcurrentRangeFetches = validateMaxConcurrentRangeFetches(
+    options ? options.maxConcurrentRangeFetches : undefined
+  );
+  const maxRangeFetchRetries = validateMaxRangeFetchRetries(
+    options ? options.maxRangeFetchRetries : undefined
+  );
+  const rangeRetryDelayMs = validateRangeRetryDelayMs(
+    options ? options.rangeRetryDelayMs : undefined
+  );
+  const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
   const initialRangeFetches = sanitizeNonNegativeInt(
     options ? options.initialRangeFetches : 0,
     0
   );
   const initialRangeBytesFetched = sanitizeNonNegativeInt(
     options ? options.initialRangeBytesFetched : 0,
+    0
+  );
+  const initialRangeFetchRetries = sanitizeNonNegativeInt(
+    options ? options.initialRangeFetchRetries : 0,
     0
   );
 
@@ -1416,8 +1658,13 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     fetchImpl: options && typeof options.fetch === 'function' ? options.fetch : null,
     fetchInit: options ? options.fetchInit : undefined,
     maxCachedWgslBytes,
+    maxConcurrentRangeFetches,
+    maxRangeFetchRetries,
+    rangeRetryDelayMs,
+    sleepFn,
     initialRangeFetches,
     initialRangeBytesFetched,
+    initialRangeFetchRetries,
     wgslCache,
     rangedDecodeCounter,
   });
@@ -1428,6 +1675,16 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   const maxCachedWgslBytes = validateMaxCachedWgslBytes(
     options ? options.maxCachedWgslBytes : undefined
   );
+  const maxConcurrentRangeFetches = validateMaxConcurrentRangeFetches(
+    options ? options.maxConcurrentRangeFetches : undefined
+  );
+  const maxRangeFetchRetries = validateMaxRangeFetchRetries(
+    options ? options.maxRangeFetchRetries : undefined
+  );
+  const rangeRetryDelayMs = validateRangeRetryDelayMs(
+    options ? options.rangeRetryDelayMs : undefined
+  );
+  const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
 
   // If the server returned 200 OK instead of 206 Partial Content, fall back seamlessly to buffer mode.
   if (initialChunk.status !== 206) {
@@ -1441,7 +1698,16 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   }
 
   let totalBytes = initialChunk.contentRange ? initialChunk.contentRange.total : null;
-  let rangeFetches = 1;
+  let rangeFetches = sanitizeNonNegativeInt(
+    options && options.initialRangeFetches !== undefined ? options.initialRangeFetches : 1,
+    1
+  );
+  let rangeFetchRetries = sanitizeNonNegativeInt(
+    options && options.initialRangeFetchRetries !== undefined
+      ? options.initialRangeFetchRetries
+      : 0,
+    0
+  );
   let rangeBytesFetched = sanitizeNonNegativeInt(initialChunk.bytes.byteLength, 0);
 
   const header = parseWgpkHeader(initialChunk.bytes);
@@ -1465,8 +1731,24 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     let have = initialChunk.bytes.byteLength;
 
     while (have < tableEnd) {
-      rangeFetches += 1;
-      const remainder = await fetchRangeChunk(fetcher, url, have, tableEnd - 1, options.fetchInit);
+      const remainder = await fetchRangeChunkWithRetry(
+        fetcher,
+        url,
+        have,
+        tableEnd - 1,
+        options.fetchInit,
+        {
+          maxRangeFetchRetries,
+          rangeRetryDelayMs,
+          sleepFn,
+          onAttempt: () => {
+            rangeFetches += 1;
+          },
+          onRetry: () => {
+            rangeFetchRetries += 1;
+          },
+        }
+      );
 
       // Server fell back to 200 OK on the continuation request: switch seamlessly to full buffer mode.
       if (remainder.status !== 206) {
@@ -1504,8 +1786,13 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     fetch: fetcher,
     fetchInit: options.fetchInit,
     maxCachedWgslBytes,
+    maxConcurrentRangeFetches,
+    maxRangeFetchRetries,
+    rangeRetryDelayMs,
+    sleepFn,
     initialRangeFetches: rangeFetches,
     initialRangeBytesFetched: rangeBytesFetched,
+    initialRangeFetchRetries: rangeFetchRetries,
   });
 }
 
@@ -1519,6 +1806,10 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
  *   fetchInit?: RequestInit,
  *   initialRangeBytes?: number,
  *   maxCachedWgslBytes?: number,
+ *   maxConcurrentRangeFetches?: number,
+ *   maxRangeFetchRetries?: number,
+ *   rangeRetryDelayMs?: number,
+ *   sleepFn?: (ms: number) => Promise<void>,
  *   lazyDecode?: boolean,
  * }} [fetchImplOrOptions]
  * @param {object} [maybeOptions]
@@ -1535,15 +1826,36 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
 
   const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
   validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
+  validateMaxConcurrentRangeFetches(options.maxConcurrentRangeFetches);
+  const maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
+  const rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
+  const sleepFn = validateSleepFn(options.sleepFn);
 
-  const initialChunk = await fetchRangeChunk(
+  let initialRangeFetches = 0;
+  let initialRangeFetchRetries = 0;
+  const initialChunk = await fetchRangeChunkWithRetry(
     fetcher,
     url,
     0,
     initialRangeBytes - 1,
-    options.fetchInit
+    options.fetchInit,
+    {
+      maxRangeFetchRetries,
+      rangeRetryDelayMs,
+      sleepFn,
+      onAttempt: () => {
+        initialRangeFetches += 1;
+      },
+      onRetry: () => {
+        initialRangeFetchRetries += 1;
+      },
+    }
   );
-  return finishPackIndexFromInitialChunk(url, fetcher, initialChunk, options);
+  return finishPackIndexFromInitialChunk(url, fetcher, initialChunk, {
+    ...options,
+    initialRangeFetches,
+    initialRangeFetchRetries,
+  });
 }
 
 /**
@@ -1580,6 +1892,10 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
   if (streamThresholdBytes > 0) {
     const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
     validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
+    validateMaxConcurrentRangeFetches(options.maxConcurrentRangeFetches);
+    const maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
+    const rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
+    const sleepFn = validateSleepFn(options.sleepFn);
 
     // 1. Prefer lightweight HEAD probe for Content-Length & Accept-Ranges.
     let headResolved = false;
@@ -1615,12 +1931,25 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
 
     if (!headResolved && !useFullGet) {
       // 2. Fallback probe when HEAD is unsupported or lacks Content-Length: initial byte range.
-      const probe = await fetchRangeChunk(
+      let probeFetches = 0;
+      let probeRetries = 0;
+      const probe = await fetchRangeChunkWithRetry(
         fetcher,
         url,
         0,
         initialRangeBytes - 1,
-        options.fetchInit
+        options.fetchInit,
+        {
+          maxRangeFetchRetries,
+          rangeRetryDelayMs,
+          sleepFn,
+          onAttempt: () => {
+            probeFetches += 1;
+          },
+          onRetry: () => {
+            probeRetries += 1;
+          },
+        }
       );
       if (probe.status !== 206) {
         return parseWgslPack(probe.bytes, { lazyDecode });
@@ -1635,7 +1964,11 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
         }
         // Small pack larger than initialRangeBytes: fall through to full GET below.
       } else {
-        return finishPackIndexFromInitialChunk(url, fetcher, probe, options);
+        return finishPackIndexFromInitialChunk(url, fetcher, probe, {
+          ...options,
+          initialRangeFetches: probeFetches,
+          initialRangeFetchRetries: probeRetries,
+        });
       }
     }
   }
@@ -1686,6 +2019,12 @@ export class WgslPackCache {
     this._maxCachedWgslBytes = validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
     this._initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
     this._streamThresholdBytes = validateStreamThresholdBytes(options.streamThresholdBytes, 0);
+    this._maxConcurrentRangeFetches = validateMaxConcurrentRangeFetches(
+      options.maxConcurrentRangeFetches
+    );
+    this._maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
+    this._rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
+    this._sleepFn = validateSleepFn(options.sleepFn);
 
     this._packs = new Map();
     this._shaderEntries = new Map();
@@ -1799,6 +2138,11 @@ export class WgslPackCache {
       fetchInit: options.fetchInit,
       initialRangeBytes: options.initialRangeBytes ?? this._initialRangeBytes,
       maxCachedWgslBytes: options.maxCachedWgslBytes ?? this._maxCachedWgslBytes,
+      maxConcurrentRangeFetches:
+        options.maxConcurrentRangeFetches ?? this._maxConcurrentRangeFetches,
+      maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
+      rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
+      sleepFn: options.sleepFn ?? this._sleepFn,
       lazyDecode: options.lazyDecode !== undefined ? options.lazyDecode : this._lazyDecode,
     });
     const name = options.packName ?? url;
@@ -1859,6 +2203,11 @@ export class WgslPackCache {
         streamThresholdBytes,
         initialRangeBytes: options.initialRangeBytes ?? this._initialRangeBytes,
         maxCachedWgslBytes: options.maxCachedWgslBytes ?? this._maxCachedWgslBytes,
+        maxConcurrentRangeFetches:
+          options.maxConcurrentRangeFetches ?? this._maxConcurrentRangeFetches,
+        maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
+        rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
+        sleepFn: options.sleepFn ?? this._sleepFn,
       });
       return this._registerPack(pack, name);
     }
@@ -2734,6 +3083,9 @@ export class WgslPackCache {
     let totalPackBytes = 0;
     let rangeFetches = 0;
     let rangeBytesFetched = 0;
+    let rangeFetchRetries = 0;
+    let activeRangeFetches = 0;
+    let peakConcurrentRangeFetches = 0;
     let cacheHits = 0;
     let cacheMisses = 0;
     let cachedWgslBytes = 0;
@@ -2749,6 +3101,12 @@ export class WgslPackCache {
       totalPackBytes += sanitizeNonNegativeInt(s.byteLength, 0);
       rangeFetches += sanitizeNonNegativeInt(s.rangeFetchCount, 0);
       rangeBytesFetched += sanitizeNonNegativeInt(s.rangeBytesFetched, 0);
+      rangeFetchRetries += sanitizeNonNegativeInt(s.rangeFetchRetries, 0);
+      activeRangeFetches += sanitizeNonNegativeInt(s.activeRangeFetches, 0);
+      const packPeak = sanitizeNonNegativeInt(s.peakConcurrentRangeFetches, 0);
+      if (packPeak > peakConcurrentRangeFetches) {
+        peakConcurrentRangeFetches = packPeak;
+      }
       cacheHits += sanitizeNonNegativeInt(s.cacheHits, 0);
       cacheMisses += sanitizeNonNegativeInt(s.cacheMisses, 0);
       cachedWgslBytes += sanitizeNonNegativeInt(s.cachedWgslBytes, 0);
@@ -2762,6 +3120,9 @@ export class WgslPackCache {
         hasBufferPack = true;
       }
       packs[name] = s;
+    }
+    if (activeRangeFetches > peakConcurrentRangeFetches) {
+      peakConcurrentRangeFetches = activeRangeFetches;
     }
 
     const mode =
@@ -2816,6 +3177,9 @@ export class WgslPackCache {
       rangeFetches,
       rangeFetchCount: rangeFetches,
       rangeBytesFetched,
+      rangeFetchRetries,
+      activeRangeFetches,
+      peakConcurrentRangeFetches,
       cacheHits,
       cacheMisses,
       cachedWgslBytes,
