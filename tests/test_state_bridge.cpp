@@ -932,6 +932,46 @@ void test_indexed_draw_and_layout_dedup() {
     CHECK(list.stats().draws == 2);
 }
 
+// G66: N identical draws create exactly the objects one draw does; every later draw is a cache hit.
+void test_identical_draws_create_no_new_objects() {
+    struct Result {
+        size_t creates = 0;
+        bridge::BridgeStats stats;
+    };
+    auto run = [](uint32_t n) {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        for (uint32_t i = 0; i < n; ++i) {
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        list.Close();
+        Result r;
+        for (const Packet& pk : decode(enc)) {
+            using O = GpuOpcode;
+            r.creates += (pk.opcode == O::CreateBuffer || pk.opcode == O::CreateSampler2 ||
+                          pk.opcode == O::CreateBindGroup2 || pk.opcode == O::CreateBindGroupLayout ||
+                          pk.opcode == O::CreatePipelineLayout || pk.opcode == O::CreateRenderPipeline2)
+                             ? 1
+                             : 0;
+        }
+        r.stats = list.stats();
+        return r;
+    };
+    const Result one = run(1);
+    const Result many = run(64);
+    CHECK(one.creates > 0);
+    CHECK(many.creates == one.creates);
+    CHECK(many.stats.draws == 64);
+    CHECK(many.stats.pipelines_created == one.stats.pipelines_created);
+    CHECK(many.stats.bind_groups_created == one.stats.bind_groups_created);
+    CHECK(many.stats.bind_group_cache_misses == one.stats.bind_group_cache_misses);
+    CHECK(many.stats.bind_group_cache_hits == one.stats.bind_group_cache_hits + 63);
+}
+
 // Several recording threads share one device: pipelines, layouts, samplers and the root constant ring
 // are created exactly once across all streams.
 void test_concurrent_command_lists() {
@@ -2921,6 +2961,7 @@ int main() {
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
+    test_identical_draws_create_no_new_objects();
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();
