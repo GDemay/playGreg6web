@@ -3796,3 +3796,495 @@ test('W239 WgslPackLoader handles 1+ GiB (16,226-entry) ranged pack with pinHash
   loader.clear({ resetStats: true });
   assert.equal(loader.getStats().pinnedCount, 0);
 });
+
+// ---------------------------------------------------------------------------
+// W259: Ranged WGPK ETag / Last-Modified / total-size validation,
+//       cache: 'no-store', and bounded 1x stale-index auto-reload (#1120)
+// ---------------------------------------------------------------------------
+
+function createMutableRangePackMock(initialState) {
+  const state = {
+    bytes:
+      initialState.bytes instanceof Uint8Array
+        ? initialState.bytes
+        : new Uint8Array(initialState.bytes),
+    etag: initialState.etag ?? null,
+    lastModified: initialState.lastModified ?? null,
+    includeContentRangeTotal:
+      initialState.includeContentRangeTotal !== undefined
+        ? Boolean(initialState.includeContentRangeTotal)
+        : true,
+    beforeRequest: initialState.beforeRequest || null,
+  };
+
+  const requests = [];
+
+  const mockFetch = async (url, init = {}) => {
+    const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+    const headersIn = init && init.headers ? { ...init.headers } : {};
+    const range = headersIn.Range || headersIn.range || null;
+    const cacheMode = init ? init.cache : undefined;
+
+    if (typeof state.beforeRequest === 'function') {
+      const override = await state.beforeRequest({
+        url,
+        method,
+        range,
+        init,
+        cache: cacheMode,
+        requests,
+        state,
+      });
+      if (override) {
+        requests.push({
+          url,
+          method,
+          range,
+          cache: cacheMode,
+          headers: headersIn,
+          credentials: init ? init.credentials : undefined,
+          status: override.status,
+        });
+        return override;
+      }
+    }
+
+    const total = state.bytes.byteLength;
+    const respHeaders = new Headers({ 'Accept-Ranges': 'bytes' });
+    if (state.etag !== null) {
+      respHeaders.set('ETag', state.etag);
+    }
+    if (state.lastModified !== null) {
+      respHeaders.set('Last-Modified', state.lastModified);
+    }
+
+    if (method === 'HEAD') {
+      respHeaders.set('Content-Length', String(total));
+      requests.push({
+        url,
+        method,
+        range: null,
+        cache: cacheMode,
+        headers: headersIn,
+        credentials: init ? init.credentials : undefined,
+        status: 200,
+      });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: respHeaders,
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    if (range) {
+      const match = /^bytes=(\d+)-(\d+)$/i.exec(range.trim());
+      const reqStart = Number(match[1]);
+      const reqEnd = Number(match[2]);
+      if (reqStart >= total || reqEnd < reqStart) {
+        respHeaders.set('Content-Range', `bytes */${total}`);
+        requests.push({
+          url,
+          method,
+          range,
+          cache: cacheMode,
+          headers: headersIn,
+          credentials: init ? init.credentials : undefined,
+          status: 416,
+        });
+        return {
+          ok: false,
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: respHeaders,
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      const clampedEnd = Math.min(reqEnd, total - 1);
+      const slice = state.bytes.slice(reqStart, clampedEnd + 1);
+      respHeaders.set(
+        'Content-Range',
+        `bytes ${reqStart}-${clampedEnd}/${state.includeContentRangeTotal ? total : '*'}`
+      );
+      respHeaders.set('Content-Length', String(slice.byteLength));
+      requests.push({
+        url,
+        method,
+        range,
+        cache: cacheMode,
+        headers: headersIn,
+        credentials: init ? init.credentials : undefined,
+        status: 206,
+      });
+      return {
+        ok: true,
+        status: 206,
+        statusText: 'Partial Content',
+        headers: respHeaders,
+        async arrayBuffer() {
+          return slice.buffer;
+        },
+      };
+    }
+
+    const copy = state.bytes.slice();
+    respHeaders.set('Content-Length', String(copy.byteLength));
+    requests.push({
+      url,
+      method,
+      range: null,
+      cache: cacheMode,
+      headers: headersIn,
+      credentials: init ? init.credentials : undefined,
+      status: 200,
+    });
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: respHeaders,
+      async arrayBuffer() {
+        return copy.buffer;
+      },
+    };
+  };
+
+  return { fetch: mockFetch, requests, state };
+}
+
+test('W259 normal ranged fetch captures ETag/Last-Modified/totalSize, sends cache: no-store, preserves fetchInit, and performs 0 reloads', async () => {
+  const hVs = fnv1a64('w259-normal-vs');
+  const hFs = fnv1a64('w259-normal-fs');
+  const packBuf = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES;
+
+  const mock = createMutableRangePackMock({
+    bytes: packBuf,
+    etag: '"splash-v1"',
+    lastModified: 'Wed, 25 Nov 2026 17:00:00 GMT',
+  });
+
+  const controller = new AbortController();
+  const pack = await loadIndexFromUrl('/packs/splash.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    fetchInit: {
+      signal: controller.signal,
+      credentials: 'same-origin',
+      headers: { 'X-Custom-Token': 'abc123' },
+    },
+  });
+
+  assert.equal(pack.mode, 'ranged');
+  assert.equal(pack.etag, '"splash-v1"');
+  assert.equal(pack.lastModified, 'Wed, 25 Nov 2026 17:00:00 GMT');
+  assert.equal(pack.totalSize, packBuf.byteLength);
+  assert.equal(pack.getStats().staleIndexReloads, 0);
+  assert.equal(pack.getStats().etag, '"splash-v1"');
+  assert.equal(pack.getStats().lastModified, 'Wed, 25 Nov 2026 17:00:00 GMT');
+  assert.equal(pack.getStats().totalSize, packBuf.byteLength);
+
+  assert.equal(await pack.getWgslAsync(hVs), SAMPLE_VS_WGSL);
+  assert.equal(await pack.getWgslAsync(hFs), SAMPLE_FS_WGSL);
+
+  assert.equal(mock.requests.length, 3); // 1 header + 2 entry fetches, 0 reloads
+  assert.equal(pack.getStats().staleIndexReloads, 0);
+  for (const req of mock.requests) {
+    assert.equal(req.cache, 'no-store', 'every ranged header and entry fetch must pass cache: no-store');
+    assert.equal(req.headers['X-Custom-Token'], 'abc123', 'caller headers must be preserved');
+    assert.equal(req.credentials, 'same-origin', 'caller fetchInit fields must be preserved');
+  }
+
+  // loadFromUrl with streamThresholdBytes also sends cache: 'no-store' on HEAD + Range probes
+  const autoMock = createMutableRangePackMock({
+    bytes: packBuf,
+    etag: '"splash-v1"',
+  });
+  const autoPack = await loadFromUrl('/packs/splash.wgsl.pack', {
+    fetch: autoMock.fetch,
+    streamThresholdBytes: 32,
+    initialRangeBytes: tableEnd,
+  });
+  assert.equal(autoPack.mode, 'ranged');
+  assert.equal(autoMock.requests[0].method, 'HEAD');
+  assert.equal(autoMock.requests[0].cache, 'no-store');
+  assert.equal(autoMock.requests[1].status, 206);
+  assert.equal(autoMock.requests[1].cache, 'no-store');
+  assert.equal(autoPack.getStats().staleIndexReloads, 0);
+});
+
+test('W259 getWgslAsync auto-reloads stale WGPK index on ETag, total-size, mid-shader corruption, and HTTP 416/412 mismatches', async () => {
+  const hA = fnv1a64('w259-swap-a');
+  const hB = fnv1a64('w259-swap-b');
+  const hC = fnv1a64('w259-swap-c');
+
+  const wgslA_v1 = '@vertex fn vs_v1() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const wgslB_v1 = '@fragment fn fs_v1() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }';
+  const wgslC_v1 = '@compute @workgroup_size(1) fn cs_v1() {}';
+
+  // In V2, shader A grows so that V1's byte offset for shader B lands right on a function-body
+  // `let ...` statement (the exact CreateShaderModule: module-scope 'let' failure!), while
+  // shader B shifts to a later offset with updated source.
+  const enc = new TextEncoder();
+  const wgslA_v1_len = enc.encode(wgslA_v1).byteLength;
+  const v2Prefix = '@vertex fn vs_v2() -> @builtin(position) vec4<f32> { ';
+  const padToOldBOffset = Math.max(0, wgslA_v1_len - enc.encode(v2Prefix).byteLength);
+  const wgslA_v2 =
+    `${v2Prefix}${' '.repeat(padToOldBOffset)}` +
+    `let spliced_local = vec4<f32>(0.5, 0.5, 0.0, 1.0); return spliced_local; }`;
+  const wgslB_v2 = '@fragment fn fs_v2() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.25, 1.0); }';
+  const wgslC_v2 = '@compute @workgroup_size(8) fn cs_v2() {}';
+
+  const packV1 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v1 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v1 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC_v1 },
+  ]);
+  const packV2 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v2 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v2 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC_v2 },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES;
+
+  // Confirm that reading V1's offset for hB directly out of V2 would produce mid-shader `let ...` garbage!
+  const parsedV1 = parseWgslPack(packV1);
+  const oldBMeta = parsedV1.getByHash(hB);
+  const splicedGarbage = new TextDecoder().decode(
+    new Uint8Array(packV2).subarray(oldBMeta.offset, oldBMeta.offset + oldBMeta.length)
+  );
+  assert.ok(splicedGarbage.startsWith('let spliced_local'), `expected spliced 'let' garbage, got: ${splicedGarbage}`);
+
+  // 1. ETag + size mismatch through WgslPackCache (verifies cache sync + GPUShaderModule eviction + pin preservation)
+  const mock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"splash-v1"',
+    lastModified: 'Wed, 25 Nov 2026 17:00:00 GMT',
+  });
+  const cache = new WgslPackCache({
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  const pack = await cache.loadIndexFromUrl('/packs/splash.wgsl.pack');
+  const gpu = createMockGpuDevice();
+
+  // Pin & compile hA from V1 so it lives in both LRU pinned cache and GPUShaderModule cache.
+  cache.pinHashes([hA]);
+  const modA_v1 = await cache.getOrCreateShaderModuleAsync(gpu.device, hA, 'gta6');
+  assert.equal(modA_v1.code, wgslA_v1);
+  assert.equal(pack.getStats().staleIndexReloads, 0);
+
+  // Swap splash.wgsl.pack on disk to V2 with a new ETag & shifted offsets!
+  mock.state.bytes = new Uint8Array(packV2);
+  mock.state.etag = '"splash-v2"';
+  mock.state.lastModified = 'Wed, 25 Nov 2026 17:05:00 GMT';
+
+  // Fetching hB detects the ETag/size mismatch, reloads the header ONCE, clears stale LRU,
+  // updates baseline metadata, and returns valid wgslB_v2 from the refreshed offset!
+  const gotB = await cache.getWgslAsync(hB);
+  assert.equal(gotB, wgslB_v2);
+  assert.equal(pack.etag, '"splash-v2"');
+  assert.equal(pack.lastModified, 'Wed, 25 Nov 2026 17:05:00 GMT');
+  assert.equal(pack.totalSize, packV2.byteLength);
+  assert.equal(pack.getStats().staleIndexReloads, 1);
+  assert.equal(cache.getStats().staleIndexReloads, 1);
+
+  // Old cached hA WGSL and GPUShaderModule were invalidated, while hA stays pinned!
+  assert.equal(pack.isPinned(hA), true);
+  const modA_v2 = await cache.getOrCreateShaderModuleAsync(gpu.device, hA, 'gta6');
+  assert.notEqual(modA_v2, modA_v1);
+  assert.equal(modA_v2.code, wgslA_v2);
+  assert.equal(pack.getStats().staleIndexReloads, 1, 'subsequent fetches against V2 must perform 0 extra reloads');
+
+  // 2. Total-size mismatch only (no ETag / no Last-Modified headers)
+  const sizeOnlyMock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: null,
+    lastModified: null,
+  });
+  const sizeOnlyPack = await loadIndexFromUrl('/packs/size-only.wgsl.pack', {
+    fetch: sizeOnlyMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  assert.equal(sizeOnlyPack.etag, null);
+  assert.equal(sizeOnlyPack.totalSize, packV1.byteLength);
+
+  sizeOnlyMock.state.bytes = new Uint8Array(packV2);
+  assert.equal(await sizeOnlyPack.getWgslAsync(hB), wgslB_v2);
+  assert.equal(sizeOnlyPack.totalSize, packV2.byteLength);
+  assert.equal(sizeOnlyPack.getStats().staleIndexReloads, 1);
+
+  // 3. Same-size pack swap with NO ETag/Last-Modified/totalSize -> mid-shader `let ...` corruption triggers 1x reload!
+  const sameSizePad = enc.encode(wgslA_v2).byteLength - wgslA_v1_len;
+  const wgslB_sameSizeV1 = `${wgslB_v1}${' '.repeat(sameSizePad)}`;
+  const sameSizePackV1 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v1 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_sameSizeV1 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC_v1 },
+  ]);
+  const sameSizePackV2 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v2 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v1 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC_v1 },
+  ]);
+  assert.equal(sameSizePackV1.byteLength, sameSizePackV2.byteLength);
+
+  const corruptDetectMock = createMutableRangePackMock({
+    bytes: sameSizePackV1,
+    etag: null,
+    lastModified: null,
+    includeContentRangeTotal: false,
+  });
+  const corruptDetectPack = await loadIndexFromUrl('/packs/same-size.wgsl.pack', {
+    fetch: corruptDetectMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  corruptDetectMock.state.bytes = new Uint8Array(sameSizePackV2);
+  assert.equal(await corruptDetectPack.getWgslAsync(hB), wgslB_v1);
+  assert.equal(corruptDetectPack.getStats().staleIndexReloads, 1);
+
+  // 4. Shrunk pack causing HTTP 416 Range Not Satisfiable (with Content-Range: bytes */<newTotal>) recovers via 1x reload
+  const bigWgslA = `@vertex fn vs_big() -> @builtin(position) vec4<f32> { /* ${'a'.repeat(400)} */ return vec4<f32>(0.0); }`;
+  const bigPack = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: bigWgslA },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v1 },
+  ]);
+  const smallPack = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v1 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v2 },
+  ]);
+  const shrinkMock = createMutableRangePackMock({
+    bytes: bigPack,
+    etag: '"big-v1"',
+  });
+  const shrinkPack = await loadIndexFromUrl('/packs/shrink.wgsl.pack', {
+    fetch: shrinkMock.fetch,
+    initialRangeBytes: WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES,
+  });
+  shrinkMock.state.bytes = new Uint8Array(smallPack);
+  shrinkMock.state.etag = '"small-v2"';
+  // Old offset of hB is past the end of smallPack -> server responds HTTP 416 with bytes */<smallPack.byteLength>
+  assert.equal(await shrinkPack.getWgslAsync(hB), wgslB_v2);
+  assert.ok(shrinkMock.requests.some((r) => r.status === 416), 'expected initial 416 before reload');
+  assert.equal(shrinkPack.getStats().staleIndexReloads, 1);
+
+  // 5. HTTP 412 Precondition Failed triggers 1x reload and recovers cleanly
+  let send412Once = true;
+  const mock412 = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"v1"',
+    beforeRequest: ({ range, state }) => {
+      if (send412Once && range && !range.startsWith('bytes=0-')) {
+        send412Once = false;
+        state.bytes = new Uint8Array(packV2);
+        state.etag = '"v2"';
+        return {
+          ok: false,
+          status: 412,
+          statusText: 'Precondition Failed',
+          headers: new Headers({ ETag: '"v2"' }),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      return null;
+    },
+  });
+  const pack412 = await loadIndexFromUrl('/packs/412.wgsl.pack', {
+    fetch: mock412.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  assert.equal(await pack412.getWgslAsync(hC), wgslC_v2);
+  assert.equal(pack412.getStats().staleIndexReloads, 1);
+});
+
+test('W259 guards against infinite reload loops when ETag keeps changing and coalesces concurrent stale reloads', async () => {
+  const hA = fnv1a64('w259-loop-a');
+  const hB = fnv1a64('w259-loop-b');
+  const hC = fnv1a64('w259-loop-c');
+
+  const packV1 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES;
+
+  // 1. Server mutates ETag on EVERY single request -> must reload at most ONCE and throw (no infinite loop!)
+  let etagCounter = 0;
+  const flappingMock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"rev-0"',
+    beforeRequest: ({ state }) => {
+      etagCounter += 1;
+      state.etag = `"rev-${etagCounter}"`;
+      return null;
+    },
+  });
+
+  const flappingPack = await loadIndexFromUrl('/packs/flapping.wgsl.pack', {
+    fetch: flappingMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxRangeFetchRetries: 0,
+  });
+  assert.equal(flappingPack.etag, '"rev-1"');
+  assert.equal(flappingMock.requests.length, 1);
+
+  await assert.rejects(
+    () => flappingPack.getWgslAsync(hA),
+    /stale pack mismatch.*persisted after index reload/i
+  );
+
+  // Exactly 4 HTTP calls: initial index ("rev-1") + stale entry ("rev-2") + 1 reload ("rev-3") + 1 retry ("rev-4")
+  assert.equal(flappingMock.requests.length, 4);
+  assert.equal(flappingPack.getStats().staleIndexReloads, 1);
+  assert.equal(flappingPack.getStats().inFlightCount, 0);
+  assert.equal(flappingPack.getStats().cachedWgslEntries, 0, 'mismatched payload must never be cached');
+
+  // 2. Concurrent fetches hitting a single pack swap coalesce onto exactly 1 header reload!
+  const wgslA_v2 = `@vertex fn vs_v2_conc() -> @builtin(position) vec4<f32> { /* ${'z'.repeat(80)} */ return vec4<f32>(1.0); }`;
+  const wgslB_v2 = '@fragment fn fs_v2_conc() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.4, 0.6, 1.0); }';
+  const wgslC_v2 = '@compute @workgroup_size(4) fn cs_v2_conc() {}';
+  const packV2 = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA_v2 },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB_v2 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC_v2 },
+  ]);
+
+  const concMock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"conc-v1"',
+  });
+  const concPack = await loadIndexFromUrl('/packs/concurrent-swap.wgsl.pack', {
+    fetch: concMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+
+  // Swap pack on disk before 3 concurrent fetches fire
+  concMock.state.bytes = new Uint8Array(packV2);
+  concMock.state.etag = '"conc-v2"';
+
+  const [resA, resB, resC] = await Promise.all([
+    concPack.getWgslAsync(hA),
+    concPack.getWgslAsync(hB),
+    concPack.getWgslAsync(hC),
+  ]);
+  assert.equal(resA, wgslA_v2);
+  assert.equal(resB, wgslB_v2);
+  assert.equal(resC, wgslC_v2);
+  assert.equal(
+    concPack.getStats().staleIndexReloads,
+    1,
+    'concurrent stale fetches must coalesce onto a single index reload'
+  );
+  assert.equal(concPack.getStats().inFlightCount, 0);
+});
