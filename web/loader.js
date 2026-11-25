@@ -6,6 +6,8 @@ const EMSCRIPTEN_PTHREAD_WORKER_NAME = 'em-pthread';
 const PROGRESS_CHANNEL_NAME = 'game-progress';
 const PTHREAD_WGPU_CHANNEL_NAME = 'playgta6-wgpu-pthread';
 const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
+const PTHREAD_TX_MSG_WGPU_SUBMIT = 'wgpu-submit';
+const PTHREAD_TX_MSG_PROGRESS = 'progress';
 const PTHREAD_CMD_LOAD = 'load';
 const PTHREAD_CMD_LOADED = 'loaded';
 const PTHREAD_CMD_RUN = 'run';
@@ -1151,6 +1153,40 @@ function closeBroadcastChannel(ch) {
   }
 }
 
+function resolveMessageChannelCtor(explicitCtor, scope) {
+  if (explicitCtor !== undefined) {
+    return typeof explicitCtor === 'function' ? explicitCtor : null;
+  }
+  if (scope && typeof scope.MessageChannel === 'function') {
+    return scope.MessageChannel;
+  }
+  if (typeof self !== 'undefined' && self && typeof self.MessageChannel === 'function') {
+    return self.MessageChannel;
+  }
+  if (typeof MessageChannel === 'function') {
+    return MessageChannel;
+  }
+  return null;
+}
+
+function closeMessagePort(port) {
+  if (!port || typeof port !== 'object') {
+    return;
+  }
+  try {
+    port.onmessage = null;
+  } catch {
+    // Ignore errors clearing MessagePort handler.
+  }
+  if (typeof port.close === 'function') {
+    try {
+      port.close();
+    } catch {
+      // Ignore MessagePort close errors.
+    }
+  }
+}
+
 /**
  * Send one payload on a short-lived BroadcastChannel and close it immediately in `finally`.
  * Keeps send-only threads (especially Emscripten pthreads running Wasm or `Atomics.wait`) from
@@ -1534,8 +1570,11 @@ function installPthreadHostImportShim(globalScope, hostImports) {
 
 /**
  * Bootstrap an Emscripten `em-pthread` worker spawned via `new Worker(self.location.href, { name: "em-pthread" })`:
- * - Streams `host_log` over short-lived send-only `BroadcastChannel('game-progress')` instances.
- * - Relays `host_wgpu_submit` batches over short-lived send-only `BroadcastChannel('playgta6-wgpu-pthread')` instances to the coordinator worker.
+ * - Sends `host_log`, side-module progress, and `host_wgpu_submit` batches over a dedicated
+ *   send-only `MessagePort` transferred from the coordinator at spawn (`__playgta6_tx_port`),
+ *   eliminating per-message `BroadcastChannel` construction/close overhead and cross-pthread fan-out.
+ * - Falls back gracefully to short-lived send-only `BroadcastChannel` instances when no `MessagePort`
+ *   is available or if the port is detached/closed.
  * - Acquires `httpfsMailboxSab` via `Worker.postMessage` or temporary `BroadcastChannel('playgta6-httpfs-sab')` (closed immediately once SAB arrives) so pthreads can call `host_httpfs_*` without keeping any open BroadcastChannels.
  * - Configures side-module `locateFile` resolution against `dist/` for `guest_part_*.wasm`.
  * - Installs the `WebAssembly.Instance` host-import shim BEFORE `importScripts(runtimeScriptUrl)`.
@@ -1579,8 +1618,47 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
         (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
         null;
 
+  let txPort = null;
+  let txPortClosed = false;
+
+  const closeTxPort = () => {
+    const port = txPort;
+    txPort = null;
+    txPortClosed = true;
+    closeMessagePort(port);
+  };
+
+  const attachTxPort = (port) => {
+    if (!port || typeof port.postMessage !== 'function') {
+      return false;
+    }
+    if (txPort === port) {
+      txPortClosed = false;
+      return true;
+    }
+    if (txPort && txPort !== port) {
+      closeMessagePort(txPort);
+    }
+    txPort = port;
+    txPortClosed = false;
+    return true;
+  };
+
+  if (options.txPort) {
+    attachTxPort(options.txPort);
+  }
+
   const pthreadReport = (label) => {
-    postBroadcastOnce(BroadcastChannelCtor, PROGRESS_CHANNEL_NAME, { label });
+    const payload = { label };
+    if (txPort && !txPortClosed) {
+      try {
+        txPort.postMessage({ type: PTHREAD_TX_MSG_PROGRESS, payload });
+        return true;
+      } catch {
+        closeTxPort();
+      }
+    }
+    return postBroadcastOnce(BroadcastChannelCtor, PROGRESS_CHANNEL_NAME, payload);
   };
 
   const pthreadLocateFile = createRuntimeLocateFile(
@@ -1638,12 +1716,25 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
     wgpuSubmit: (bytes) => {
+      if (txPort && !txPortClosed) {
+        const copy = bytes.slice();
+        const cmdBuffer = copy.buffer;
+        try {
+          txPort.postMessage(
+            { type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer },
+            [cmdBuffer],
+          );
+          return;
+        } catch {
+          closeTxPort();
+        }
+      }
       if (typeof BroadcastChannelCtor !== 'function') {
         return;
       }
       const copy = bytes.slice();
       postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, {
-        type: 'wgpu-submit',
+        type: PTHREAD_TX_MSG_WGPU_SUBMIT,
         cmdBuffer: copy.buffer,
       });
     },
@@ -1675,11 +1766,20 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
 
   const onPthreadBootstrapMessage = (ev) => {
     const msg = ev && ev.data;
-    if (msg && typeof msg === 'object' && msg.__playgta6_httpfs_sab) {
+    if (!msg || typeof msg !== 'object') {
+      return;
+    }
+    let handled = false;
+    if (msg.__playgta6_httpfs_sab) {
       attachHttpfsSab(msg.__playgta6_httpfs_sab);
-      if (typeof ev.stopImmediatePropagation === 'function') {
-        ev.stopImmediatePropagation();
-      }
+      handled = true;
+    }
+    if (msg.__playgta6_tx_port) {
+      attachTxPort(msg.__playgta6_tx_port);
+      handled = true;
+    }
+    if (handled && typeof ev.stopImmediatePropagation === 'function') {
+      ev.stopImmediatePropagation();
     }
   };
 
@@ -1733,15 +1833,21 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     restoreWasmInstance,
     attachHttpfsSab,
     hasHttpfsSab: () => Boolean(pthreadHttpfsClient),
+    attachTxPort,
+    hasTxPort: () => Boolean(txPort && !txPortClosed),
     channels: {
       progress: null,
       wgpu: null,
       get httpfs() {
         return httpfsChannel;
       },
+      get txPort() {
+        return txPort;
+      },
     },
     cleanup() {
       restoreWasmInstance();
+      closeTxPort();
       attachedHttpfsSab = null;
       pthreadHttpfsClient = null;
       if (hostImports && typeof hostImports.setHttpfsClient === 'function') {
@@ -4080,8 +4186,12 @@ function isPthreadPostLoadMessage(msg) {
   );
 }
 
-function isHttpfsSabControlMessage(msg) {
-  return Boolean(msg && typeof msg === 'object' && msg.__playgta6_httpfs_sab);
+function isPthreadBootstrapControlMessage(msg) {
+  return Boolean(
+    msg &&
+      typeof msg === 'object' &&
+      (msg.__playgta6_httpfs_sab || msg.__playgta6_tx_port),
+  );
 }
 
 function hookWorkerEventProperty(worker, propName, observer) {
@@ -4204,6 +4314,9 @@ function createPthreadPoolCoordinator(options = {}) {
     typeof options.getHttpfsMailboxSab === 'function'
       ? options.getHttpfsMailboxSab
       : () => options.httpfsMailboxSab || null;
+  const onPthreadTxMessage =
+    typeof options.onPthreadTxMessage === 'function' ? options.onPthreadTxMessage : null;
+  const explicitMessageChannelCtor = options.MessageChannelCtor;
   const onTelemetryChange =
     typeof options.onTelemetryChange === 'function' ? options.onTelemetryChange : null;
 
@@ -4220,6 +4333,7 @@ function createPthreadPoolCoordinator(options = {}) {
   let pthreadFailedCount = 0;
   let pthreadLoadedCount = 0;
   let peakConcurrentLoads = 0;
+  let pthreadActiveTxPorts = 0;
 
   function getTelemetry() {
     return {
@@ -4232,6 +4346,7 @@ function createPthreadPoolCoordinator(options = {}) {
       pthreadActiveLoads: activeLoads,
       pthreadPeakConcurrentLoads: peakConcurrentLoads,
       maxConcurrentPthreadLoads: maxConcurrentLoads,
+      pthreadActiveTxPorts,
     };
   }
 
@@ -4300,6 +4415,16 @@ function createPthreadPoolCoordinator(options = {}) {
     }
   }
 
+  function detachEntryTxPort(entry) {
+    if (!entry || !entry.txPort) {
+      return;
+    }
+    const port = entry.txPort;
+    entry.txPort = null;
+    pthreadActiveTxPorts = Math.max(0, pthreadActiveTxPorts - 1);
+    closeMessagePort(port);
+  }
+
   function cleanupEntry(entry, finalState) {
     if (!entry || entry.cleanedUp) {
       return;
@@ -4322,6 +4447,7 @@ function createPthreadPoolCoordinator(options = {}) {
     entry.pendingMessages.length = 0;
     entry.loadArgs = null;
 
+    detachEntryTxPort(entry);
     detachMessageObservers(entry);
     const hooks = entry.cleanupHooks;
     entry.cleanupHooks = [];
@@ -4449,13 +4575,78 @@ function createPthreadPoolCoordinator(options = {}) {
     const origTerminate = typeof worker.terminate === 'function' ? worker.terminate : null;
     const hasOwnTerminate = Object.prototype.hasOwnProperty.call(worker, 'terminate');
 
+    const workerName =
+      meta && typeof meta.name === 'string' ? meta.name : EMSCRIPTEN_PTHREAD_WORKER_NAME;
     const sab =
       meta && meta.httpfsMailboxSab !== undefined ? meta.httpfsMailboxSab : getHttpfsMailboxSab();
-    if (sab && origPostMessage) {
+
+    let coordPort = null;
+    let pthreadPort = null;
+    if (onPthreadTxMessage && origPostMessage) {
+      const mcCtor = resolveMessageChannelCtor(explicitMessageChannelCtor);
+      if (mcCtor) {
+        try {
+          const mc = new mcCtor();
+          if (mc && mc.port1 && mc.port2 && typeof mc.port2.postMessage === 'function') {
+            coordPort = mc.port1;
+            pthreadPort = mc.port2;
+            coordPort.onmessage = (ev) => {
+              try {
+                onPthreadTxMessage(ev && ev.data !== undefined ? ev.data : ev, workerName);
+              } catch {
+                // Pthread TX handler errors must never disrupt the coordinator worker loop.
+              }
+            };
+            if (typeof coordPort.unref === 'function') {
+              try {
+                coordPort.unref();
+              } catch {
+                // Ignore unref failures on non-Node MessagePort implementations.
+              }
+            }
+          } else {
+            closeMessagePort(mc && mc.port1);
+            closeMessagePort(mc && mc.port2);
+          }
+        } catch {
+          closeMessagePort(coordPort);
+          closeMessagePort(pthreadPort);
+          coordPort = null;
+          pthreadPort = null;
+        }
+      }
+    }
+
+    if (origPostMessage && (sab || pthreadPort)) {
+      const bootstrapMsg = {};
+      const transferList = [];
+      if (sab) {
+        bootstrapMsg.__playgta6_httpfs_sab = sab;
+      }
+      if (pthreadPort) {
+        bootstrapMsg.__playgta6_tx_port = pthreadPort;
+        transferList.push(pthreadPort);
+      }
       try {
-        origPostMessage.call(worker, { __playgta6_httpfs_sab: sab });
+        if (transferList.length > 0) {
+          origPostMessage.call(worker, bootstrapMsg, transferList);
+        } else {
+          origPostMessage.call(worker, bootstrapMsg);
+        }
       } catch {
-        // Non-fatal: BroadcastChannel handshake remains as fallback.
+        if (coordPort || pthreadPort) {
+          closeMessagePort(coordPort);
+          closeMessagePort(pthreadPort);
+          coordPort = null;
+          pthreadPort = null;
+          if (sab) {
+            try {
+              origPostMessage.call(worker, { __playgta6_httpfs_sab: sab });
+            } catch {
+              // Non-fatal: BroadcastChannel handshake remains as fallback.
+            }
+          }
+        }
       }
     }
 
@@ -4464,10 +4655,13 @@ function createPthreadPoolCoordinator(options = {}) {
     if (pthreadActiveCount > pthreadPeakCount) {
       pthreadPeakCount = pthreadActiveCount;
     }
+    if (coordPort) {
+      pthreadActiveTxPorts += 1;
+    }
 
     const entry = {
       worker,
-      name: meta && typeof meta.name === 'string' ? meta.name : EMSCRIPTEN_PTHREAD_WORKER_NAME,
+      name: workerName,
       state: 'spawned',
       cleanedUp: false,
       queueIndex: -1,
@@ -4475,6 +4669,7 @@ function createPthreadPoolCoordinator(options = {}) {
       pendingMessages: [],
       origPostMessage,
       origTerminate,
+      txPort: coordPort,
       messageCleanupHooks: [],
       cleanupHooks: [],
     };
@@ -4528,7 +4723,7 @@ function createPthreadPoolCoordinator(options = {}) {
         if (entry.cleanedUp || entry.state === 'terminated' || entry.state === 'failed') {
           return undefined;
         }
-        if (isHttpfsSabControlMessage(msg)) {
+        if (isPthreadBootstrapControlMessage(msg)) {
           return origPostMessage.apply(worker, callArgs);
         }
         if (entry.state === 'loaded') {
@@ -4624,6 +4819,12 @@ function createPthreadPoolCoordinator(options = {}) {
         cleanupEntry(entry, 'terminated');
       }
     },
+    closeTxPorts() {
+      trackedWorkers.forEach((entry) => {
+        detachEntryTxPort(entry);
+      });
+      emitTelemetry();
+    },
   };
 }
 
@@ -4686,8 +4887,65 @@ let activeCoordinatorPipelineDumpSyncer = null;
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
 
+function handlePthreadWgpuSubmit(data, options = {}) {
+  const raw =
+    data &&
+    typeof data === 'object' &&
+    !(data instanceof ArrayBuffer) &&
+    !ArrayBuffer.isView(data)
+      ? data.cmdBuffer || data.bytes || null
+      : data;
+  const view = asDataView(raw);
+  if (!view || view.byteLength === 0) {
+    return false;
+  }
+  let transferBuf;
+  let inspectBytes;
+  if (options.ownedArrayBuffer && raw instanceof ArrayBuffer) {
+    transferBuf = raw;
+    inspectBytes = new Uint8Array(raw);
+  } else {
+    const copyBytes = new Uint8Array(view.byteLength);
+    copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+    transferBuf = copyBytes.buffer;
+    inspectBytes = copyBytes;
+  }
+  if (!coordinatorFirstPresentEmitted) {
+    const info = inspectGpuPacketBatchForPresent(inspectBytes);
+    if (info.hasPresent) {
+      coordinatorFirstPresentEmitted = true;
+      report('[boot] FIRST_PRESENT');
+    }
+  }
+  if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
+    gpuWorker.postMessage({ cmdBuffer: transferBuf }, [transferBuf]);
+    return true;
+  }
+  return false;
+}
+
+function handlePthreadTxMessage(data) {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  if (data.type === PTHREAD_TX_MSG_WGPU_SUBMIT) {
+    return handlePthreadWgpuSubmit(data, { ownedArrayBuffer: true });
+  }
+  if (data.type === PTHREAD_TX_MSG_PROGRESS) {
+    if (data.payload && typeof data.payload === 'object') {
+      return postProgress(data.payload);
+    }
+    if (typeof data.label === 'string') {
+      return postProgress({ label: data.label });
+    }
+    return false;
+  }
+  return false;
+}
+
 const coordinatorPthreadPool = createPthreadPoolCoordinator({
   getHttpfsMailboxSab: () => httpfsMailboxSab,
+  onPthreadTxMessage: handlePthreadTxMessage,
 });
 
 function getPthreadTelemetry() {
@@ -4796,6 +5054,9 @@ async function tryBootWasmRuntime() {
       const runtimeOptions = {
         onFirstPresent: () => {
           coordinatorFirstPresentEmitted = true;
+        },
+        onExit: () => {
+          coordinatorPthreadPool.closeTxPorts();
         },
         onWasmError: (err) => {
           postProgress({ error: `runtime wasm: ${err}` });
@@ -4930,31 +5191,7 @@ if (typeof self !== 'undefined') {
 
   if (wgpuPthreadChannel) {
     wgpuPthreadChannel.onmessage = (ev) => {
-      const data = ev && ev.data;
-      const raw =
-        data &&
-        typeof data === 'object' &&
-        !(data instanceof ArrayBuffer) &&
-        !ArrayBuffer.isView(data)
-          ? data.cmdBuffer || data.bytes || null
-          : data;
-      const view = asDataView(raw);
-      if (!view || view.byteLength === 0) {
-        return;
-      }
-      const copyBytes = new Uint8Array(view.byteLength);
-      copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-      if (!coordinatorFirstPresentEmitted) {
-        const info = inspectGpuPacketBatchForPresent(copyBytes);
-        if (info.hasPresent) {
-          coordinatorFirstPresentEmitted = true;
-          report('[boot] FIRST_PRESENT');
-        }
-      }
-      if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
-        const copyBuf = copyBytes.buffer;
-        gpuWorker.postMessage({ cmdBuffer: copyBuf }, [copyBuf]);
-      }
+      handlePthreadWgpuSubmit(ev && ev.data);
     };
   }
 
@@ -5011,6 +5248,7 @@ if (typeof self !== 'undefined') {
     }
 
     if (!msg.canvas) return;
+    coordinatorPthreadPool.closeTxPorts();
     if (activeCoordinatorInputBridge) {
       try {
         activeCoordinatorInputBridge.stop();
@@ -5114,6 +5352,8 @@ const exportedApi = {
   PROGRESS_CHANNEL_NAME,
   PTHREAD_WGPU_CHANNEL_NAME,
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  PTHREAD_TX_MSG_WGPU_SUBMIT,
+  PTHREAD_TX_MSG_PROGRESS,
   PTHREAD_CMD_LOAD,
   PTHREAD_CMD_LOADED,
   PTHREAD_CMD_RUN,
