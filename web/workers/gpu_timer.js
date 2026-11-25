@@ -3,7 +3,8 @@
 (function (root) {
   const DEFAULT_MAX_PASSES_PER_FRAME = 32;
   const DEFAULT_READBACK_SLOTS = 3;
-  const DEFAULT_HISTORY_SIZE = 60;
+  const DEFAULT_HISTORY_SIZE = 120;
+  const DEFAULT_FRAME_BUDGET_MS = 16.67;
   const TIMESTAMP_BYTE_SIZE = 8;
   const NS_PER_MS = 1e6;
 
@@ -42,6 +43,91 @@
       throw new RangeError(`${name} must be a positive integer, got ${value}`);
     }
     return value;
+  }
+
+  function normalizePositiveNumber(value, fallback, name) {
+    if (value === undefined) {
+      return fallback;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`${name} must be a positive finite number, got ${value}`);
+    }
+    return value;
+  }
+
+  function percentileFromSorted(sorted, count, fraction) {
+    if (count <= 0) {
+      return 0;
+    }
+    const idx = Math.min(count - 1, Math.max(0, Math.ceil(fraction * count) - 1));
+    return sorted[idx];
+  }
+
+  /**
+   * Pure helper computing deterministic nearest-rank percentile statistics over
+   * numeric duration samples (ms) without mutating the input collection.
+   *
+   * @param {ArrayLike<number> | Iterable<number> | null | undefined} samples
+   * @returns {{ count: number, avgMs: number, minMs: number, p50Ms: number, p95Ms: number, p99Ms: number, maxMs: number }}
+   */
+  function computePercentiles(samples) {
+    if (!samples || typeof samples !== 'object') {
+      return {
+        count: 0,
+        avgMs: 0,
+        minMs: 0,
+        p50Ms: 0,
+        p95Ms: 0,
+        p99Ms: 0,
+        maxMs: 0,
+      };
+    }
+
+    const values = [];
+    if (typeof samples.length === 'number') {
+      for (let i = 0; i < samples.length; i += 1) {
+        const v = samples[i];
+        if (typeof v === 'number' && Number.isFinite(v)) {
+          values.push(v);
+        }
+      }
+    } else if (typeof samples[Symbol.iterator] === 'function') {
+      for (const v of samples) {
+        if (typeof v === 'number' && Number.isFinite(v)) {
+          values.push(v);
+        }
+      }
+    }
+
+    const count = values.length;
+    if (count === 0) {
+      return {
+        count: 0,
+        avgMs: 0,
+        minMs: 0,
+        p50Ms: 0,
+        p95Ms: 0,
+        p99Ms: 0,
+        maxMs: 0,
+      };
+    }
+
+    values.sort((a, b) => a - b);
+
+    let sum = 0;
+    for (let i = 0; i < count; i += 1) {
+      sum += values[i];
+    }
+
+    return {
+      count,
+      avgMs: sum / count,
+      minMs: values[0],
+      p50Ms: percentileFromSorted(values, count, 0.5),
+      p95Ms: percentileFromSorted(values, count, 0.95),
+      p99Ms: percentileFromSorted(values, count, 0.99),
+      maxMs: values[count - 1],
+    };
   }
 
   function hasTimestampQueryFeature(device) {
@@ -118,7 +204,8 @@
      * @param {GPUDevice} [options.device]
      * @param {number} [options.maxPassesPerFrame=32]
      * @param {number} [options.readbackSlots=3]
-     * @param {number} [options.historySize=60]
+     * @param {number} [options.historySize=120]
+     * @param {number} [options.frameBudgetMs=16.67]
      */
     constructor(options = {}) {
       const opts = options && typeof options === 'object' ? options : {};
@@ -138,6 +225,11 @@
         opts.historySize,
         DEFAULT_HISTORY_SIZE,
         'historySize'
+      );
+      this._frameBudgetMs = normalizePositiveNumber(
+        opts.frameBudgetMs,
+        DEFAULT_FRAME_BUDGET_MS,
+        'frameBudgetMs'
       );
 
       this._device = device;
@@ -159,6 +251,7 @@
       this._skippedFrames = 0;
       this._droppedPasses = 0;
       this._lastFrameGpuMs = 0;
+      this._resetGeneration = 0;
       this._passHistories = new Map();
 
       if (hasTimestampQueryFeature(device)) {
@@ -206,6 +299,7 @@
             passes: null,
             queryCount: 0,
             copyBytes: 0,
+            generation: 0,
           });
         }
 
@@ -258,6 +352,10 @@
 
     get historySize() {
       return this._historySize;
+    }
+
+    get frameBudgetMs() {
+      return this._frameBudgetMs;
     }
 
     get isDestroyed() {
@@ -365,6 +463,7 @@
       freeSlot.passes = this._framePasses.slice();
       freeSlot.queryCount = queryCount;
       freeSlot.copyBytes = copyBytes;
+      freeSlot.generation = this._resetGeneration;
       this._pendingQueue.push(freeSlot);
 
       this._framePasses = [];
@@ -373,6 +472,11 @@
     }
 
     _recordPassSample(name, durationMs) {
+      const safeDurationMs =
+        typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0
+          ? durationMs
+          : 0;
+
       let entry = this._passHistories.get(name);
       if (!entry) {
         entry = {
@@ -381,17 +485,21 @@
           windowCount: 0,
           count: 0,
           lastMs: 0,
+          budgetExceedCount: 0,
         };
         this._passHistories.set(name, entry);
       }
 
-      entry.samples[entry.writeIdx] = durationMs;
+      entry.samples[entry.writeIdx] = safeDurationMs;
       entry.writeIdx = (entry.writeIdx + 1) % this._historySize;
       if (entry.windowCount < this._historySize) {
         entry.windowCount += 1;
       }
       entry.count += 1;
-      entry.lastMs = durationMs;
+      entry.lastMs = safeDurationMs;
+      if (safeDurationMs > this._frameBudgetMs) {
+        entry.budgetExceedCount += 1;
+      }
     }
 
     /**
@@ -418,6 +526,7 @@
       const recordedPasses = slot.passes || [];
       const queryCount = slot.queryCount;
       const copyBytes = slot.copyBytes;
+      const slotGeneration = slot.generation;
 
       slot.state = 'mapping';
 
@@ -426,7 +535,11 @@
         await buffer.mapAsync(MAP_MODE.READ);
         mapped = true;
 
-        if (this._destroyed || slot.buffer !== buffer) {
+        if (
+          this._destroyed ||
+          slot.buffer !== buffer ||
+          slotGeneration !== this._resetGeneration
+        ) {
           return null;
         }
 
@@ -465,8 +578,128 @@
           slot.passes = null;
           slot.queryCount = 0;
           slot.copyBytes = 0;
+          slot.generation = this._resetGeneration;
         }
       }
+    }
+
+    /**
+     * Returns rolling percentile statistics and budget-exceedance spike count for
+     * a single pass label, or `null` if no samples have been recorded for it.
+     *
+     * @param {string} label
+     * @returns {{
+     *   count: number,
+     *   totalCount: number,
+     *   lastMs: number,
+     *   avgMs: number,
+     *   minMs: number,
+     *   p50Ms: number,
+     *   p95Ms: number,
+     *   p99Ms: number,
+     *   maxMs: number,
+     *   budgetExceedCount: number
+     * } | null}
+     */
+    getPassPercentiles(label) {
+      if (typeof label !== 'string' || label.length === 0) {
+        return null;
+      }
+      const entry = this._passHistories.get(label);
+      if (!entry || entry.windowCount === 0) {
+        return null;
+      }
+      const windowSamples = entry.samples.subarray(0, entry.windowCount);
+      const percentiles = computePercentiles(windowSamples);
+      return {
+        count: percentiles.count,
+        totalCount: entry.count,
+        lastMs: entry.lastMs,
+        avgMs: percentiles.avgMs,
+        minMs: percentiles.minMs,
+        p50Ms: percentiles.p50Ms,
+        p95Ms: percentiles.p95Ms,
+        p99Ms: percentiles.p99Ms,
+        maxMs: percentiles.maxMs,
+        budgetExceedCount: entry.budgetExceedCount,
+      };
+    }
+
+    /**
+     * Returns a sanitized numeric telemetry summary including budget configuration,
+     * rolling window capacity, per-pass percentile breakdowns, and total spike count.
+     *
+     * @returns {{
+     *   supported: boolean,
+     *   frameBudgetMs: number,
+     *   historySize: number,
+     *   resolvedFrames: number,
+     *   skippedFrames: number,
+     *   droppedPasses: number,
+     *   lastFrameGpuMs: number,
+     *   budgetExceedCount: number,
+     *   passes: Record<string, {
+     *     count: number,
+     *     totalCount: number,
+     *     lastMs: number,
+     *     avgMs: number,
+     *     minMs: number,
+     *     p50Ms: number,
+     *     p95Ms: number,
+     *     p99Ms: number,
+     *     maxMs: number,
+     *     budgetExceedCount: number
+     *   }>
+     * }}
+     */
+    getSummary() {
+      const passes = {};
+      let budgetExceedCount = 0;
+
+      for (const name of this._passHistories.keys()) {
+        const passStats = this.getPassPercentiles(name);
+        if (passStats) {
+          passes[name] = passStats;
+          budgetExceedCount += passStats.budgetExceedCount;
+        }
+      }
+
+      return {
+        supported: this._supported,
+        frameBudgetMs: this._frameBudgetMs,
+        historySize: this._historySize,
+        resolvedFrames: this._resolvedFrames,
+        skippedFrames: this._skippedFrames,
+        droppedPasses: this._droppedPasses,
+        lastFrameGpuMs: this._lastFrameGpuMs,
+        budgetExceedCount,
+        passes,
+      };
+    }
+
+    /**
+     * Clears rolling per-pass histories, percentile samples, and budget spike counters
+     * while keeping GPU resources intact for subsequent frames.
+     */
+    reset() {
+      this._resetGeneration += 1;
+      this._resolvedFrames = 0;
+      this._skippedFrames = 0;
+      this._droppedPasses = 0;
+      this._lastFrameGpuMs = 0;
+      this._passHistories.clear();
+      this._framePasses = [];
+      this._queryCursor = 0;
+      for (const slot of this._pendingQueue) {
+        if (slot && slot.state === 'pending') {
+          slot.state = 'idle';
+          slot.passes = null;
+          slot.queryCount = 0;
+          slot.copyBytes = 0;
+          slot.generation = this._resetGeneration;
+        }
+      }
+      this._pendingQueue = [];
     }
 
     /**
@@ -555,8 +788,7 @@
       }
       this._readbackSlots = [];
       this._pendingQueue = [];
-      this._framePasses = [];
-      this._queryCursor = 0;
+      this.reset();
       this._device = null;
     }
   }
@@ -565,9 +797,11 @@
     DEFAULT_MAX_PASSES_PER_FRAME,
     DEFAULT_READBACK_SLOTS,
     DEFAULT_HISTORY_SIZE,
+    DEFAULT_FRAME_BUDGET_MS,
     TIMESTAMP_BYTE_SIZE,
     BUFFER_USAGE,
     MAP_MODE,
+    computePercentiles,
     GpuPassTimer,
   };
 
