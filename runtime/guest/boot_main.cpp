@@ -173,6 +173,7 @@ struct Options {
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
+    bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
@@ -201,7 +202,7 @@ void usage() {
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
-                 "                     [--native-pipelines] [--dump-pipelines <dir under work/>]\n"
+                 "                     [--native-pipelines] [--no-fence-lag] [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
                  "                     [--wgpu-features <mask>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
@@ -239,6 +240,8 @@ bool parse(int argc, char** argv, Options& o) {
             playgta6::os::win32::set_process_shared_zone(false);
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
+        } else if (a == "--no-fence-lag") {
+            o.no_fence_lag = true;
         } else if (a == "--native-pipelines") {
             o.native_pipelines = true;
         } else if (a == "-h" || a == "--help") {
@@ -920,6 +923,7 @@ int main(int argc, char** argv) {
     {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;
+        device_options.fence_publish_lag = !g_options.no_fence_lag;
         // The features of the WebGPU device that replays the run (by default the browser player's):
         // without them BC and 16-bit normalized textures get substitute formats and their guest
         // texels are never uploaded.
