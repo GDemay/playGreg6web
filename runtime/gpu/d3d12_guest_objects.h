@@ -566,7 +566,13 @@ struct TrackedTexture {
     // Per subresource (mip + array_slice * mip_levels): hash of the last uploaded linear texels,
     // 0 = never uploaded (the GPU texture is still zero there).
     std::vector<uint64_t> subresource_hashes;
+    // Per subresource: hashes of its bands of kUploadBandRows block rows at the last upload (2D
+    // subresources taller than one band; empty otherwise). A changed subresource writes only the
+    // bands whose hash changed (#691).
+    std::vector<std::vector<uint64_t>> subresource_bands;
 };
+// Block rows per dirty-tracked band of a 2D texture upload (TrackedTexture::subresource_bands).
+constexpr uint32_t kUploadBandRows = 64;
 
 struct DeviceOptions {
     PacketSink sink;                    // empty: os::wgpu_submit
