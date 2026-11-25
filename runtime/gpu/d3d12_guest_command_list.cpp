@@ -54,6 +54,7 @@ const char* work_name(Work w) {
     case Work::BindGroupsCreated: return "bind_groups_created";
     case Work::PipelinesCreated: return "pipelines_created";
     case Work::ReflectionRootDescriptorTables: return "reflection_root_descriptor_tables";
+    case Work::ReflectionVertexInputsDefaulted: return "reflection_vertex_inputs_defaulted";
     case Work::Count: break;
     }
     return "?";

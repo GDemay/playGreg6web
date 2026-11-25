@@ -1191,11 +1191,25 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
     }
 
     // Reflected vertex stage (G62): the stage's fetches are the attributes.
+    std::vector<Attr> defaults;
     if (desc.vs_input_fetches != nullptr) {
         attrs.clear();
         location_mask = 0;
         for (uint32_t i = 0; i < desc.vs_input_fetch_count; ++i) {
             const VertexInputFetch& f = desc.vs_input_fetches[i];
+            if (f.constant_default) {
+                if (f.location >= kMaxVertexAttributes) {
+                    diag |= PipelineDiag::TooManyVertexAttributes;
+                    continue;
+                }
+                if (f.format == WgpuVertexFormat::Undefined || (location_mask & (1u << f.location)) != 0) {
+                    diag |= PipelineDiag::VertexLayoutInvalid;
+                    continue;
+                }
+                defaults.push_back(Attr{0, f.offset, f.location, f.format});
+                location_mask |= 1u << f.location;
+                continue;
+            }
             if (f.slot >= kMaxVertexBuffers) {
                 diag |= PipelineDiag::VertexSlotOutOfRange;
                 continue;
@@ -1213,6 +1227,28 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
             }
             location_mask |= 1u << f.location;
             attrs.push_back(Attr{f.slot, f.offset, f.location, f.format});
+        }
+    }
+
+    if (!defaults.empty()) {
+        uint32_t spare = 0;
+        uint32_t taken = 0;
+        for (const Attr& a : attrs) {
+            taken |= 1u << a.slot;
+        }
+        while (spare < kMaxVertexBuffers && (taken & (1u << spare)) != 0) {
+            ++spare;
+        }
+        if (spare >= kMaxVertexBuffers) {
+            diag |= PipelineDiag::VertexSlotOutOfRange;
+        } else {
+            for (Attr& a : defaults) {
+                a.slot = spare;
+                attrs.push_back(a);
+            }
+            slot_step[spare] = WgpuVertexStepMode::Instance;
+            t.instance_stride_zero_slots |= 1u << spare;
+            t.default_vertex_slot_mask = 1u << spare;
         }
     }
 

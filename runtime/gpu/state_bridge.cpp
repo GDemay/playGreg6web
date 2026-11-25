@@ -435,6 +435,20 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
     return ring_buffer_id_;
 }
 
+uint32_t StateBridgeDevice::ensure_default_vertex_buffer(CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    if (default_vertex_buffer_id_ == 0) {
+        default_vertex_buffer_id_ = allocate_id();
+        encoder.create_buffer(default_vertex_buffer_id_, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst,
+                              pso::kDefaultVertexBufferBytes);
+        const float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        const uint32_t u[4] = {0, 0, 0, 1};
+        encoder.write_buffer(default_vertex_buffer_id_, 0, f, sizeof(f));
+        encoder.write_buffer(default_vertex_buffer_id_, pso::kDefaultVertexIntOffset, u, sizeof(u));
+    }
+    return default_vertex_buffer_id_;
+}
+
 uint32_t StateBridgeDevice::allocate_root_constants(uint32_t bytes, bool* wrapped) {
     std::lock_guard lock(objects_mutex_);
     const uint32_t size = align_up(std::max(bytes, 1u), kRootConstantAlignment);
@@ -2069,6 +2083,14 @@ bool CommandListBridge::prepare_render_draw() {
 }
 
 void CommandListBridge::apply_input_assembler(bool indexed) {
+    if (graphics_pso_ != nullptr) {
+        const uint32_t mask = graphics_pso_->pso().translation().default_vertex_slot_mask;
+        for (uint32_t slot = 0; mask != 0 && slot < pso::kMaxVertexBuffers; ++slot) {
+            if ((mask & (1u << slot)) != 0) {
+                encoder_.set_vertex_buffer(slot, device_.ensure_default_vertex_buffer(encoder_), 0);
+            }
+        }
+    }
     for (uint32_t slot = 0; slot < pso::kMaxVertexBuffers; ++slot) {
         if ((vertex_dirty_ & (1u << slot)) != 0 && vertex_buffers_[slot].buffer_id != 0) {
             encoder_.set_vertex_buffer(slot, vertex_buffers_[slot].buffer_id, vertex_buffers_[slot].offset);
