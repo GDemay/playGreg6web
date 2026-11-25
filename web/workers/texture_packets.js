@@ -8,13 +8,20 @@
 // - WebGPU 256-byte bytesPerRow alignment & row-pitch repacking helpers (`alignBytesPerRow256`,
 //   `repackRowsTo256`) backed by a bounded persistent per-handler scratch `Uint8Array` (e.g.,
 //   reused across 4K Bink2 `1920x1080` `r8unorm` Cr/Cb planes where `1920 -> 2048`).
+// - Zero-alloc WebGPU upload descriptor reuse: pre-allocated `GPUTexelCopyTextureInfo`,
+//   `GPUTexelCopyBufferLayout` / `GPUTexelCopyBufferInfo`, `GPUExtent3DDict`, and staging layout
+//   structs are reused across hot `writeTexture` / `copyBufferToTexture` / `handleWriteTexture`
+//   calls with every field cleanly overwritten on each upload (W303).
+// - Sub-region dirty-rect bounds clamping & validation against mip dimensions (respecting 4x4
+//   physical mip sizes for BC1..BC7 tail mips) to prevent WebGPU out-of-bounds validation errors.
 // - Safe `SharedArrayBuffer`-backed view copying before `queue.writeTexture` /
 //   `copyBufferToTexture`.
 // - Sanitized telemetry counters (`createTexture2Count`, `rowPitchRepackCount`, `sabCopyCount`,
-//   `uploadCount`, `uploadBytes`, `zeroCopyUploads`, `scratchRepackUploads`,
+//   `uploadCount`, `uploadsCount`, `uploadBytes`, `uploadBytesTotal`, `reusedDescriptorCount`,
+//   `clampedSubRegionCount`, `zeroCopyUploads`, `scratchRepackUploads`,
 //   `directZeroCopyUploads`, `repackedUploads`, `scratchBufferReuses`, `r8unormUploads`,
 //   `bytesUploaded`, `srgbSiblingViewFormatsAdded`) exposed via `getStats()`, `getUploadStats()`,
-//   and the `uploadStats` getter.
+//   the `uploadStats` getter, and cleanly reset via `resetStats()` / `reset()` / `destroy()`.
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js):
 // it chains in front of processor.extension and forwards every other opcode to it.
@@ -1231,6 +1238,370 @@
     throw new TypeError('copySize must be a GPUExtent3D object or [width, height, depth] array');
   }
 
+  function calcMipDimension(baseDim, mipLevel) {
+    const dim = Number.isFinite(baseDim) ? Math.floor(baseDim) : 1;
+    if (dim <= 1) {
+      return 1;
+    }
+    const mip = Number.isFinite(mipLevel) ? Math.floor(mipLevel) : 0;
+    if (mip <= 0) {
+      return dim;
+    }
+    if (mip >= 32) {
+      return 1;
+    }
+    return Math.max(1, Math.floor(dim / Math.pow(2, mip)));
+  }
+
+  function extractTextureGeometry(texture, trackedMeta) {
+    if (trackedMeta) {
+      return trackedMeta;
+    }
+    if (!texture || typeof texture !== 'object') {
+      return null;
+    }
+    const desc = texture.desc && typeof texture.desc === 'object' ? texture.desc : null;
+    const size = desc && desc.size && typeof desc.size === 'object' ? desc.size : null;
+    const width =
+      Number.isInteger(texture.width) && texture.width >= 1
+        ? texture.width
+        : size && Number.isInteger(size.width) && size.width >= 1
+          ? size.width
+          : 0;
+    const height =
+      Number.isInteger(texture.height) && texture.height >= 1
+        ? texture.height
+        : size && Number.isInteger(size.height) && size.height >= 1
+          ? size.height
+          : 0;
+    if (width < 1 || height < 1) {
+      return null;
+    }
+    const depthOrArrayLayers =
+      Number.isInteger(texture.depthOrArrayLayers) && texture.depthOrArrayLayers >= 1
+        ? texture.depthOrArrayLayers
+        : size && Number.isInteger(size.depthOrArrayLayers) && size.depthOrArrayLayers >= 1
+          ? size.depthOrArrayLayers
+          : 1;
+    const dimension =
+      typeof texture.dimension === 'string' && texture.dimension
+        ? texture.dimension
+        : desc && typeof desc.dimension === 'string' && desc.dimension
+          ? desc.dimension
+          : '2d';
+    const mipLevelCount =
+      Number.isInteger(texture.mipLevelCount) && texture.mipLevelCount >= 1
+        ? texture.mipLevelCount
+        : desc && Number.isInteger(desc.mipLevelCount) && desc.mipLevelCount >= 1
+          ? desc.mipLevelCount
+          : computeMaxMipLevels(width, height, depthOrArrayLayers, dimension);
+    const format =
+      typeof texture.format === 'string' && texture.format
+        ? texture.format
+        : desc && typeof desc.format === 'string' && desc.format
+          ? desc.format
+          : null;
+    return { width, height, depthOrArrayLayers, mipLevelCount, dimension, format };
+  }
+
+  /**
+   * Zero-alloc in-place sub-region dirty-rect bounds clamping & validation
+   * against mip dimensions (using physical 4x4 block-aligned mip sizes for
+   * BC1..BC7 compressed textures so W265 1x1/2x2/3x3 tail mips stay valid).
+   */
+  function clampSubRegionToMipBoundsInto(
+    target,
+    texMeta,
+    mipLevel,
+    originX,
+    originY,
+    originZ,
+    width,
+    height,
+    depthOrArrayLayers,
+    blockInfo
+  ) {
+    const isCompressed = Boolean(blockInfo && blockInfo.isCompressed);
+    const bw = isCompressed ? blockInfo.blockWidth : 1;
+    const bh = isCompressed ? blockInfo.blockHeight : 1;
+
+    let clamped = false;
+    let ox = Number.isFinite(originX) ? Math.floor(originX) : 0;
+    let oy = Number.isFinite(originY) ? Math.floor(originY) : 0;
+    let oz = Number.isFinite(originZ) ? Math.floor(originZ) : 0;
+    if (ox < 0) {
+      ox = 0;
+      clamped = true;
+    }
+    if (oy < 0) {
+      oy = 0;
+      clamped = true;
+    }
+    if (oz < 0) {
+      oz = 0;
+      clamped = true;
+    }
+
+    if (isCompressed) {
+      const alignedOx = Math.floor(ox / bw) * bw;
+      const alignedOy = Math.floor(oy / bh) * bh;
+      if (alignedOx !== ox) {
+        ox = alignedOx;
+        clamped = true;
+      }
+      if (alignedOy !== oy) {
+        oy = alignedOy;
+        clamped = true;
+      }
+    }
+
+    let w = Number.isFinite(width) ? Math.floor(width) : 0;
+    let h = Number.isFinite(height) ? Math.floor(height) : 0;
+    let d = Number.isFinite(depthOrArrayLayers) ? Math.floor(depthOrArrayLayers) : 1;
+
+    if (w <= 0 || h <= 0 || d <= 0) {
+      target.valid = false;
+      target.clamped = clamped || w < 0 || h < 0 || d < 0;
+      target.outOfBounds = true;
+      target.invalidMipLevel = false;
+      target.mipLevel = Number.isFinite(mipLevel) ? Math.floor(mipLevel) : 0;
+      target.originX = ox;
+      target.originY = oy;
+      target.originZ = oz;
+      target.width = 0;
+      target.height = 0;
+      target.depthOrArrayLayers = 0;
+      target.mipWidth = 0;
+      target.mipHeight = 0;
+      target.mipDepth = 0;
+      return target;
+    }
+
+    if (isCompressed) {
+      w = Math.ceil(w / bw) * bw;
+      h = Math.ceil(h / bh) * bh;
+    }
+
+    const mip = Number.isFinite(mipLevel) ? Math.floor(mipLevel) : -1;
+    if (!texMeta) {
+      if (mip < 0) {
+        target.valid = false;
+        target.clamped = false;
+        target.outOfBounds = true;
+        target.invalidMipLevel = true;
+        target.mipLevel = mip;
+        target.originX = ox;
+        target.originY = oy;
+        target.originZ = oz;
+        target.width = 0;
+        target.height = 0;
+        target.depthOrArrayLayers = 0;
+        target.mipWidth = 0;
+        target.mipHeight = 0;
+        target.mipDepth = 0;
+        return target;
+      }
+      target.valid = true;
+      target.clamped = clamped;
+      target.outOfBounds = false;
+      target.invalidMipLevel = false;
+      target.mipLevel = mip;
+      target.originX = ox;
+      target.originY = oy;
+      target.originZ = oz;
+      target.width = w;
+      target.height = h;
+      target.depthOrArrayLayers = d;
+      target.mipWidth = ox + w;
+      target.mipHeight = oy + h;
+      target.mipDepth = oz + d;
+      return target;
+    }
+
+    const mipCount =
+      Number.isInteger(texMeta.mipLevelCount) && texMeta.mipLevelCount >= 1
+        ? texMeta.mipLevelCount
+        : 1;
+    if (mip < 0 || mip >= mipCount) {
+      target.valid = false;
+      target.clamped = false;
+      target.outOfBounds = true;
+      target.invalidMipLevel = true;
+      target.mipLevel = mip;
+      target.originX = ox;
+      target.originY = oy;
+      target.originZ = oz;
+      target.width = 0;
+      target.height = 0;
+      target.depthOrArrayLayers = 0;
+      target.mipWidth = 0;
+      target.mipHeight = 0;
+      target.mipDepth = 0;
+      return target;
+    }
+
+    const dimension = texMeta.dimension || '2d';
+    const baseW = Math.max(1, Math.floor(Number(texMeta.width) || 1));
+    const baseH = dimension === '1d' ? 1 : Math.max(1, Math.floor(Number(texMeta.height) || 1));
+    const baseD =
+      dimension === '1d' ? 1 : Math.max(1, Math.floor(Number(texMeta.depthOrArrayLayers) || 1));
+    const logicalMipW = calcMipDimension(baseW, mip);
+    const logicalMipH = dimension === '1d' ? 1 : calcMipDimension(baseH, mip);
+    const mipD =
+      dimension === '1d'
+        ? 1
+        : dimension === '3d'
+          ? calcMipDimension(baseD, mip)
+          : baseD;
+    const mipW = isCompressed ? Math.ceil(logicalMipW / bw) * bw : logicalMipW;
+    const mipH = isCompressed ? Math.ceil(logicalMipH / bh) * bh : logicalMipH;
+
+    if (ox >= mipW || oy >= mipH || oz >= mipD) {
+      target.valid = false;
+      target.clamped = true;
+      target.outOfBounds = true;
+      target.invalidMipLevel = false;
+      target.mipLevel = mip;
+      target.originX = ox;
+      target.originY = oy;
+      target.originZ = oz;
+      target.width = 0;
+      target.height = 0;
+      target.depthOrArrayLayers = 0;
+      target.mipWidth = mipW;
+      target.mipHeight = mipH;
+      target.mipDepth = mipD;
+      return target;
+    }
+
+    const maxW = mipW - ox;
+    const maxH = mipH - oy;
+    const maxD = mipD - oz;
+
+    if (w > maxW) {
+      w = isCompressed ? Math.floor(maxW / bw) * bw : maxW;
+      clamped = true;
+    }
+    if (h > maxH) {
+      h = isCompressed ? Math.floor(maxH / bh) * bh : maxH;
+      clamped = true;
+    }
+    if (d > maxD) {
+      d = maxD;
+      clamped = true;
+    }
+
+    if (w <= 0 || h <= 0 || d <= 0) {
+      target.valid = false;
+      target.clamped = true;
+      target.outOfBounds = true;
+      target.invalidMipLevel = false;
+      target.mipLevel = mip;
+      target.originX = ox;
+      target.originY = oy;
+      target.originZ = oz;
+      target.width = 0;
+      target.height = 0;
+      target.depthOrArrayLayers = 0;
+      target.mipWidth = mipW;
+      target.mipHeight = mipH;
+      target.mipDepth = mipD;
+      return target;
+    }
+
+    target.valid = true;
+    target.clamped = clamped;
+    target.outOfBounds = false;
+    target.invalidMipLevel = false;
+    target.mipLevel = mip;
+    target.originX = ox;
+    target.originY = oy;
+    target.originZ = oz;
+    target.width = w;
+    target.height = h;
+    target.depthOrArrayLayers = d;
+    target.mipWidth = mipW;
+    target.mipHeight = mipH;
+    target.mipDepth = mipD;
+    return target;
+  }
+
+  /**
+   * Pure helper: validate and clamp a texture sub-region dirty rect against mip
+   * dimensions, returning a fresh result object.
+   *
+   * @param {{ width: number, height?: number, depthOrArrayLayers?: number, mipLevelCount?: number, dimension?: string, format?: string }} texMeta
+   * @param {number} mipLevel
+   * @param {{ x?: number, y?: number, z?: number } | number[] | null | undefined} origin
+   * @param {{ width: number, height?: number, depthOrArrayLayers?: number } | number[]} size
+   * @param {string | object | null | undefined} [formatOrBlockInfo]
+   */
+  function clampSubRegionToMipBounds(texMeta, mipLevel, origin, size, formatOrBlockInfo) {
+    let ox = 0;
+    let oy = 0;
+    let oz = 0;
+    if (Array.isArray(origin)) {
+      ox = origin[0] !== undefined ? origin[0] : 0;
+      oy = origin[1] !== undefined ? origin[1] : 0;
+      oz = origin[2] !== undefined ? origin[2] : 0;
+    } else if (origin && typeof origin === 'object') {
+      ox = origin.x !== undefined ? origin.x : 0;
+      oy = origin.y !== undefined ? origin.y : 0;
+      oz = origin.z !== undefined ? origin.z : 0;
+    }
+
+    let w = 0;
+    let h = 1;
+    let d = 1;
+    if (Array.isArray(size)) {
+      w = size[0] !== undefined ? size[0] : 0;
+      h = size[1] !== undefined ? size[1] : 1;
+      d = size[2] !== undefined ? size[2] : 1;
+    } else if (size && typeof size === 'object') {
+      w = size.width !== undefined ? size.width : 0;
+      h = size.height !== undefined ? size.height : 1;
+      d =
+        size.depthOrArrayLayers !== undefined
+          ? size.depthOrArrayLayers
+          : size.depthOrLayers !== undefined
+            ? size.depthOrLayers
+            : 1;
+    } else {
+      throw new TypeError('size must be a GPUExtent3D object or [width, height, depth] array');
+    }
+
+    const fmt = formatOrBlockInfo !== undefined ? formatOrBlockInfo : texMeta && texMeta.format;
+    const blockInfo = getTextureFormatBlockInfo(fmt);
+    const out = {
+      valid: false,
+      clamped: false,
+      outOfBounds: false,
+      invalidMipLevel: false,
+      mipLevel: 0,
+      originX: 0,
+      originY: 0,
+      originZ: 0,
+      width: 0,
+      height: 0,
+      depthOrArrayLayers: 0,
+      mipWidth: 0,
+      mipHeight: 0,
+      mipDepth: 0,
+    };
+    return clampSubRegionToMipBoundsInto(
+      out,
+      texMeta || null,
+      mipLevel,
+      ox,
+      oy,
+      oz,
+      w,
+      h,
+      d,
+      blockInfo
+    );
+  }
+
   class TexturePackets {
     constructor(processor, next, options = {}) {
       this.processor = processor;
@@ -1239,6 +1610,8 @@
       this._bc3dFallbackTextureObjs = new WeakSet();
       this._textureFormats = new Map();
       this._textureObjFormats = new WeakMap();
+      this._textureMeta = new Map();
+      this._textureObjMeta = new WeakMap();
       const rawMaxScratch =
         options && typeof options === 'object' ? options.maxScratchBytes : undefined;
       this._maxScratchBytes =
@@ -1246,6 +1619,60 @@
           ? rawMaxScratch
           : DEFAULT_MAX_SCRATCH_BYTES;
       this._scratchPool = new TextureScratchPool({ maxBytes: this._maxScratchBytes });
+
+      // Pre-allocated WebGPU descriptor structs reused on hot writeTexture /
+      // copyBufferToTexture / stageTextureUpload paths (zero per-upload heap churn).
+      this._reusableOrigin = { x: 0, y: 0, z: 0 };
+      this._reusableCopyTexture = {
+        texture: null,
+        mipLevel: 0,
+        origin: this._reusableOrigin,
+        aspect: 'all',
+      };
+      this._reusableDataLayout = {
+        offset: 0,
+        bytesPerRow: undefined,
+        rowsPerImage: undefined,
+      };
+      this._reusableBufferSource = {
+        buffer: null,
+        offset: 0,
+        bytesPerRow: undefined,
+        rowsPerImage: undefined,
+      };
+      this._reusableCopySize = {
+        width: 1,
+        height: 1,
+        depthOrArrayLayers: 1,
+      };
+      this._reusableStageOrigin = { x: 0, y: 0, z: 0 };
+      this._reusableStageLayout = {
+        width: 1,
+        height: 1,
+        depthOrArrayLayers: 1,
+        mipLevel: 0,
+        origin: this._reusableStageOrigin,
+        bytesPerRow: 0,
+        rowsPerImage: 1,
+        aspect: undefined,
+      };
+      this._reusableClampResult = {
+        valid: true,
+        clamped: false,
+        outOfBounds: false,
+        invalidMipLevel: false,
+        mipLevel: 0,
+        originX: 0,
+        originY: 0,
+        originZ: 0,
+        width: 1,
+        height: 1,
+        depthOrArrayLayers: 1,
+        mipWidth: 1,
+        mipHeight: 1,
+        mipDepth: 1,
+      };
+
       this.stats = this._createEmptyStats();
       this.lastError = null;
     }
@@ -1268,7 +1695,11 @@
         bc3dFallbacks: 0,
         bc3dFallbackUploadsSkipped: 0,
         uploadCount: 0,
+        uploadsCount: 0,
         uploadBytes: 0,
+        uploadBytesTotal: 0,
+        reusedDescriptorCount: 0,
+        clampedSubRegionCount: 0,
         zeroCopyUploads: 0,
         scratchRepackUploads: 0,
         directZeroCopyUploads: 0,
@@ -1281,10 +1712,113 @@
       };
     }
 
+    _recordUploadCount() {
+      this.stats.uploadCount += 1;
+      this.stats.uploadsCount += 1;
+    }
+
     _recordUploadBytes(byteLength) {
       const bytes = toNonNegativeInt(byteLength);
       this.stats.bytesUploaded += bytes;
       this.stats.uploadBytes += bytes;
+      this.stats.uploadBytesTotal += bytes;
+    }
+
+    _clearReusableDescriptorRefs() {
+      this._reusableOrigin.x = 0;
+      this._reusableOrigin.y = 0;
+      this._reusableOrigin.z = 0;
+      this._reusableCopyTexture.texture = null;
+      this._reusableCopyTexture.mipLevel = 0;
+      this._reusableCopyTexture.origin = this._reusableOrigin;
+      this._reusableCopyTexture.aspect = 'all';
+      this._reusableDataLayout.offset = 0;
+      this._reusableDataLayout.bytesPerRow = undefined;
+      this._reusableDataLayout.rowsPerImage = undefined;
+      this._reusableBufferSource.buffer = null;
+      this._reusableBufferSource.offset = 0;
+      this._reusableBufferSource.bytesPerRow = undefined;
+      this._reusableBufferSource.rowsPerImage = undefined;
+      this._reusableCopySize.width = 1;
+      this._reusableCopySize.height = 1;
+      this._reusableCopySize.depthOrArrayLayers = 1;
+      this._reusableStageOrigin.x = 0;
+      this._reusableStageOrigin.y = 0;
+      this._reusableStageOrigin.z = 0;
+      this._reusableStageLayout.width = 1;
+      this._reusableStageLayout.height = 1;
+      this._reusableStageLayout.depthOrArrayLayers = 1;
+      this._reusableStageLayout.mipLevel = 0;
+      this._reusableStageLayout.origin = this._reusableStageOrigin;
+      this._reusableStageLayout.bytesPerRow = 0;
+      this._reusableStageLayout.rowsPerImage = 1;
+      this._reusableStageLayout.aspect = undefined;
+    }
+
+    _fillCopyTexture(texture, mipLevel, originX, originY, originZ, aspect) {
+      const origin = this._reusableOrigin;
+      origin.x = originX;
+      origin.y = originY;
+      origin.z = originZ;
+      const dst = this._reusableCopyTexture;
+      dst.texture = texture;
+      dst.mipLevel = mipLevel;
+      dst.origin = origin;
+      dst.aspect = aspect !== undefined ? aspect : 'all';
+      return dst;
+    }
+
+    _fillDataLayout(offset, bytesPerRow, rowsPerImage) {
+      const layout = this._reusableDataLayout;
+      layout.offset = offset;
+      layout.bytesPerRow = bytesPerRow;
+      layout.rowsPerImage = rowsPerImage;
+      return layout;
+    }
+
+    _fillBufferSource(buffer, offset, bytesPerRow, rowsPerImage) {
+      const src = this._reusableBufferSource;
+      src.buffer = buffer;
+      src.offset = offset;
+      src.bytesPerRow = bytesPerRow;
+      src.rowsPerImage = rowsPerImage;
+      return src;
+    }
+
+    _fillCopySize(width, height, depthOrArrayLayers) {
+      const sz = this._reusableCopySize;
+      sz.width = width;
+      sz.height = height;
+      sz.depthOrArrayLayers = depthOrArrayLayers;
+      return sz;
+    }
+
+    _fillStageLayout(
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevel,
+      originX,
+      originY,
+      originZ,
+      bytesPerRow,
+      rowsPerImage,
+      aspect
+    ) {
+      const origin = this._reusableStageOrigin;
+      origin.x = originX;
+      origin.y = originY;
+      origin.z = originZ;
+      const layout = this._reusableStageLayout;
+      layout.width = width;
+      layout.height = height;
+      layout.depthOrArrayLayers = depthOrArrayLayers;
+      layout.mipLevel = mipLevel;
+      layout.origin = origin;
+      layout.bytesPerRow = bytesPerRow;
+      layout.rowsPerImage = rowsPerImage;
+      layout.aspect = aspect;
+      return layout;
     }
 
     /**
@@ -1301,7 +1835,11 @@
         bc3dFallbacks: toNonNegativeInt(this.stats.bc3dFallbacks),
         bc3dFallbackUploadsSkipped: toNonNegativeInt(this.stats.bc3dFallbackUploadsSkipped),
         uploadCount: toNonNegativeInt(this.stats.uploadCount),
+        uploadsCount: toNonNegativeInt(this.stats.uploadsCount),
         uploadBytes: toNonNegativeInt(this.stats.uploadBytes),
+        uploadBytesTotal: toNonNegativeInt(this.stats.uploadBytesTotal),
+        reusedDescriptorCount: toNonNegativeInt(this.stats.reusedDescriptorCount),
+        clampedSubRegionCount: toNonNegativeInt(this.stats.clampedSubRegionCount),
         zeroCopyUploads: toNonNegativeInt(this.stats.zeroCopyUploads),
         scratchRepackUploads: toNonNegativeInt(this.stats.scratchRepackUploads),
         directZeroCopyUploads: toNonNegativeInt(this.stats.directZeroCopyUploads),
@@ -1315,6 +1853,15 @@
         bytesUploaded: toNonNegativeInt(this.stats.bytesUploaded),
         srgbSiblingViewFormatsAdded: toNonNegativeInt(this.stats.srgbSiblingViewFormatsAdded),
       };
+    }
+
+    /**
+     * Reset all telemetry counters to zero while preserving live texture
+     * metadata, fallback tracking, and reusable scratch/descriptor pools.
+     */
+    resetStats() {
+      this.stats = this._createEmptyStats();
+      this.lastError = null;
     }
 
     /**
@@ -1350,7 +1897,10 @@
       this._bc3dFallbackTextureObjs = new WeakSet();
       this._textureFormats.clear();
       this._textureObjFormats = new WeakMap();
+      this._textureMeta.clear();
+      this._textureObjMeta = new WeakMap();
       this._scratchPool.reset();
+      this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
       this.lastError = null;
       if (this.next && typeof this.next.reset === 'function') {
@@ -1367,7 +1917,10 @@
       this._bc3dFallbackTextureObjs = new WeakSet();
       this._textureFormats.clear();
       this._textureObjFormats = new WeakMap();
+      this._textureMeta.clear();
+      this._textureObjMeta = new WeakMap();
       this._scratchPool.destroy();
+      this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
       this.lastError = null;
       if (this.next && typeof this.next.destroy === 'function') {
@@ -1455,6 +2008,47 @@
       return null;
     }
 
+    _getTextureMeta(texture, textureId) {
+      if (textureId !== undefined && this._textureMeta.has(textureId)) {
+        return this._textureMeta.get(textureId);
+      }
+      if (texture && typeof texture === 'object') {
+        const tracked = this._textureObjMeta.get(texture);
+        if (tracked) {
+          return tracked;
+        }
+        return extractTextureGeometry(texture, null);
+      }
+      return null;
+    }
+
+    _clampSubRegion(
+      texture,
+      textureId,
+      mipLevel,
+      originX,
+      originY,
+      originZ,
+      width,
+      height,
+      depthOrArrayLayers,
+      blockInfo
+    ) {
+      const meta = this._getTextureMeta(texture, textureId);
+      return clampSubRegionToMipBoundsInto(
+        this._reusableClampResult,
+        meta,
+        mipLevel,
+        originX,
+        originY,
+        originZ,
+        width,
+        height,
+        depthOrArrayLayers,
+        blockInfo
+      );
+    }
+
     _isR8UnormTexture(texture, textureId) {
       return this._getTextureFormat(texture, textureId) === 'r8unorm';
     }
@@ -1505,6 +2099,7 @@
     destroyResource(id) {
       this._bc3dFallbackTextures.delete(id);
       this._textureFormats.delete(id);
+      this._textureMeta.delete(id);
       if (this.next && typeof this.next.destroyResource === 'function') {
         this.next.destroyResource(id);
       }
@@ -1512,15 +2107,13 @@
 
     /**
      * Safe `queue.writeTexture` wrapper that takes a zero-copy direct upload path
-     * for non-shared views and copies `SharedArrayBuffer`-backed views into a
-     * reusable non-shared scratch `Uint8Array` before uploading.
+     * for non-shared views, copies `SharedArrayBuffer`-backed views into a
+     * reusable non-shared scratch `Uint8Array`, clamps sub-region dirty rects
+     * against mip bounds, and reuses pre-allocated WebGPU descriptor structs.
      */
     writeTexture(destination, data, dataLayout, size, textureId) {
-      if (
-        destination &&
-        destination.texture &&
-        this._bc3dFallbackTextureObjs.has(destination.texture)
-      ) {
+      const texture = destination && destination.texture ? destination.texture : null;
+      if (texture && this._bc3dFallbackTextureObjs.has(texture)) {
         this.stats.bc3dFallbackUploadsSkipped += 1;
         return { uploaded: false, copiedFromSab: false, skippedBc3dFallback: true };
       }
@@ -1531,21 +2124,139 @@
         return { uploaded: false, copiedFromSab: false };
       }
 
+      // Snapshot caller fields into locals first so passing reusable structs is aliasing-safe.
+      const dstMipLevel =
+        destination && destination.mipLevel !== undefined ? destination.mipLevel : 0;
+      const dstAspect = destination ? destination.aspect : undefined;
+      const dstOrigin = destination ? destination.origin : null;
+      let ox = 0;
+      let oy = 0;
+      let oz = 0;
+      if (Array.isArray(dstOrigin)) {
+        ox = dstOrigin[0] !== undefined ? dstOrigin[0] : 0;
+        oy = dstOrigin[1] !== undefined ? dstOrigin[1] : 0;
+        oz = dstOrigin[2] !== undefined ? dstOrigin[2] : 0;
+      } else if (dstOrigin && typeof dstOrigin === 'object') {
+        ox = dstOrigin.x !== undefined ? dstOrigin.x : 0;
+        oy = dstOrigin.y !== undefined ? dstOrigin.y : 0;
+        oz = dstOrigin.z !== undefined ? dstOrigin.z : 0;
+      }
+
+      let rawW = 0;
+      let rawH = 1;
+      let rawD = 1;
+      let hasSize = false;
+      if (Array.isArray(size)) {
+        hasSize = true;
+        rawW = size[0] !== undefined ? size[0] : 0;
+        rawH = size[1] !== undefined ? size[1] : 1;
+        rawD = size[2] !== undefined ? size[2] : 1;
+      } else if (size && typeof size === 'object') {
+        hasSize = true;
+        rawW = size.width !== undefined ? size.width : 0;
+        rawH = size.height !== undefined ? size.height : 1;
+        rawD =
+          size.depthOrArrayLayers !== undefined
+            ? size.depthOrArrayLayers
+            : size.depthOrLayers !== undefined
+              ? size.depthOrLayers
+              : 1;
+      }
+
+      const layoutOffset =
+        dataLayout && dataLayout.offset !== undefined ? dataLayout.offset : 0;
+      const layoutBytesPerRow =
+        dataLayout && dataLayout.bytesPerRow !== undefined ? dataLayout.bytesPerRow : undefined;
+      let layoutRowsPerImage =
+        dataLayout && dataLayout.rowsPerImage !== undefined ? dataLayout.rowsPerImage : undefined;
+
+      const textureFormat = this._getTextureFormat(texture, textureId);
+      const blockInfo = getTextureFormatBlockInfo(textureFormat);
+
+      let effMipLevel = dstMipLevel;
+      let effOx = ox;
+      let effOy = oy;
+      let effOz = oz;
+      let effW = rawW;
+      let effH = rawH;
+      let effD = rawD;
+      let clampedSubRegion = false;
+
+      if (hasSize) {
+        const clamped = this._clampSubRegion(
+          texture,
+          textureId,
+          dstMipLevel,
+          ox,
+          oy,
+          oz,
+          rawW,
+          rawH,
+          rawD,
+          blockInfo
+        );
+        if (clamped.invalidMipLevel) {
+          this._error(`writeTexture: mipLevel ${dstMipLevel} out of bounds`);
+          return {
+            uploaded: false,
+            copiedFromSab: false,
+            outOfBounds: true,
+            error: this.lastError,
+          };
+        }
+        if (clamped.clamped) {
+          clampedSubRegion = true;
+          this.stats.clampedSubRegionCount += 1;
+        }
+        if (!clamped.valid) {
+          return {
+            uploaded: false,
+            copiedFromSab: false,
+            clamped: clampedSubRegion,
+            outOfBounds: true,
+          };
+        }
+        effMipLevel = clamped.mipLevel;
+        effOx = clamped.originX;
+        effOy = clamped.originY;
+        effOz = clamped.originZ;
+        effW = clamped.width;
+        effH = clamped.height;
+        effD = clamped.depthOrArrayLayers;
+
+        if (effD === 1 && layoutRowsPerImage !== undefined) {
+          const bh = blockInfo && blockInfo.isCompressed ? blockInfo.blockHeight : 1;
+          const clampedBlocksY = Math.ceil(effH / bh);
+          if (layoutRowsPerImage > clampedBlocksY) {
+            layoutRowsPerImage = clampedBlocksY;
+          }
+        }
+      }
+
       const prepared = this._prepareDirectWriteData(data);
       if (prepared.copiedFromSab) {
         this.stats.sabCopyCount += 1;
       }
 
-      const textureFormat = this._getTextureFormat(destination && destination.texture, textureId);
-      const blockInfo = getTextureFormatBlockInfo(textureFormat);
-      let effectiveSize = size;
-      if (blockInfo && blockInfo.isCompressed && size) {
-        effectiveSize = alignCopySizeForFormat(blockInfo, size);
-      }
+      const reusedDest = this._fillCopyTexture(
+        texture,
+        effMipLevel,
+        effOx,
+        effOy,
+        effOz,
+        dstAspect
+      );
+      const reusedLayout = this._fillDataLayout(
+        layoutOffset,
+        layoutBytesPerRow,
+        layoutRowsPerImage
+      );
+      const reusedSize = hasSize ? this._fillCopySize(effW, effH, effD) : size;
 
-      p.device.queue.writeTexture(destination, prepared.data, dataLayout, effectiveSize);
+      p.device.queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
 
-      this.stats.uploadCount += 1;
+      this.stats.reusedDescriptorCount += 1;
+      this._recordUploadCount();
       this._recordUploadBytes(prepared.data.byteLength);
       if (!prepared.copiedFromSab) {
         this.stats.directZeroCopyUploads += 1;
@@ -1560,6 +2271,7 @@
         copiedFromSab: prepared.copiedFromSab,
         zeroCopy: !prepared.copiedFromSab,
         reusedScratch: prepared.reusedScratch,
+        clamped: clampedSubRegion,
       };
     }
 
@@ -1596,7 +2308,85 @@
       }
 
       const opts = options && typeof options === 'object' ? options : {};
-      const normSize = normalizeCopySize(size);
+      let rawW;
+      let rawH;
+      let rawD;
+      if (Array.isArray(size)) {
+        rawW = Math.max(1, Math.floor(Number(size[0]) || 1));
+        rawH = Math.max(1, Math.floor(Number(size[1] !== undefined ? size[1] : 1) || 1));
+        rawD = Math.max(1, Math.floor(Number(size[2] !== undefined ? size[2] : 1) || 1));
+      } else if (size && typeof size === 'object') {
+        rawW = Math.max(1, Math.floor(Number(size.width) || 1));
+        rawH = Math.max(1, Math.floor(Number(size.height !== undefined ? size.height : 1) || 1));
+        rawD = Math.max(
+          1,
+          Math.floor(
+            Number(
+              size.depthOrArrayLayers !== undefined
+                ? size.depthOrArrayLayers
+                : size.depthOrLayers !== undefined
+                  ? size.depthOrLayers
+                  : 1
+            ) || 1
+          )
+        );
+      } else {
+        throw new TypeError('copySize must be a GPUExtent3D object or [width, height, depth] array');
+      }
+
+      const dstMipLevel = destination.mipLevel !== undefined ? destination.mipLevel : 0;
+      const dstAspect = destination.aspect;
+      const dstOrigin = destination.origin;
+      let ox = 0;
+      let oy = 0;
+      let oz = 0;
+      if (Array.isArray(dstOrigin)) {
+        ox = dstOrigin[0] !== undefined ? dstOrigin[0] : 0;
+        oy = dstOrigin[1] !== undefined ? dstOrigin[1] : 0;
+        oz = dstOrigin[2] !== undefined ? dstOrigin[2] : 0;
+      } else if (dstOrigin && typeof dstOrigin === 'object') {
+        ox = dstOrigin.x !== undefined ? dstOrigin.x : 0;
+        oy = dstOrigin.y !== undefined ? dstOrigin.y : 0;
+        oz = dstOrigin.z !== undefined ? dstOrigin.z : 0;
+      }
+
+      const clamped = this._clampSubRegion(
+        destination.texture,
+        opts.textureId,
+        dstMipLevel,
+        ox,
+        oy,
+        oz,
+        rawW,
+        rawH,
+        rawD,
+        null
+      );
+      if (clamped.invalidMipLevel) {
+        this._error(`writeA8Texture: mipLevel ${dstMipLevel} out of bounds`);
+        return { uploaded: false, copiedFromSab: false, outOfBounds: true, error: this.lastError };
+      }
+      if (clamped.clamped) {
+        this.stats.clampedSubRegionCount += 1;
+      }
+      if (!clamped.valid) {
+        return {
+          uploaded: false,
+          copiedFromSab: false,
+          clamped: clamped.clamped,
+          outOfBounds: true,
+        };
+      }
+
+      const effW = clamped.width;
+      const effH = clamped.height;
+      const effD = clamped.depthOrArrayLayers;
+      const effMip = clamped.mipLevel;
+      const effOx = clamped.originX;
+      const effOy = clamped.originY;
+      const effOz = clamped.originZ;
+      const clampedSubRegion = clamped.clamped;
+
       const useStaging = Boolean(
         !opts.preferDirect &&
         p.stagingPool &&
@@ -1606,15 +2396,15 @@
       );
       const alignBytesPerRow =
         useStaging || opts.alignTo256 ? WEBGPU_BYTES_PER_ROW_ALIGNMENT : 1;
-      const unalignedDstBpr = normSize.width * 4;
+      const unalignedDstBpr = effW * 4;
       const alignedDstBpr = Math.ceil(unalignedDstBpr / alignBytesPerRow) * alignBytesPerRow;
-      const totalDstBytes = alignedDstBpr * normSize.height * normSize.depthOrArrayLayers;
+      const totalDstBytes = alignedDstBpr * effH * effD;
 
       const acquired = this._acquireScratchBuffer(totalDstBytes);
-      const expanded = expandA8ToRgba8(a8Bytes, normSize.width, normSize.height, {
-        depthOrLayers: normSize.depthOrArrayLayers,
-        srcBytesPerRow: opts.srcBytesPerRow,
-        srcRowsPerImage: opts.srcRowsPerImage,
+      const expanded = expandA8ToRgba8(a8Bytes, effW, effH, {
+        depthOrLayers: effD,
+        srcBytesPerRow: opts.srcBytesPerRow !== undefined ? opts.srcBytesPerRow : rawW,
+        srcRowsPerImage: opts.srcRowsPerImage !== undefined ? opts.srcRowsPerImage : rawH,
         alignBytesPerRow,
         scratchBuffer: acquired.buffer,
       });
@@ -1633,28 +2423,29 @@
               this.stats.scratchRepackUploads += 1;
             }
           }
-          const layout = {
-            width: normSize.width,
-            height: normSize.height,
-            depthOrArrayLayers: normSize.depthOrArrayLayers,
-            mipLevel: destination.mipLevel || 0,
-            origin: destination.origin || { x: 0, y: 0, z: 0 },
-            bytesPerRow: expanded.bytesPerRow,
-            rowsPerImage: expanded.rowsPerImage,
-          };
-          if (destination.aspect !== undefined) {
-            layout.aspect = destination.aspect;
-          }
-          p.stagingPool.stageTextureUpload(encoder, destination.texture, expanded.data, layout);
+          const stageLayout = this._fillStageLayout(
+            effW,
+            effH,
+            effD,
+            effMip,
+            effOx,
+            effOy,
+            effOz,
+            expanded.bytesPerRow,
+            expanded.rowsPerImage,
+            dstAspect
+          );
+          p.stagingPool.stageTextureUpload(encoder, destination.texture, expanded.data, stageLayout);
           p._hasPendingUploadCommands = true;
-          this.stats.uploadCount += 1;
+          this.stats.reusedDescriptorCount += 1;
+          this._recordUploadCount();
           this._recordUploadBytes(expanded.data.byteLength);
           return {
             uploaded: true,
             staged: true,
-            width: normSize.width,
-            height: normSize.height,
-            depthOrArrayLayers: normSize.depthOrArrayLayers,
+            width: effW,
+            height: effH,
+            depthOrArrayLayers: effD,
             bytesPerRow: expanded.bytesPerRow,
             unalignedBytesPerRow: expanded.unalignedBytesPerRow,
             rowsPerImage: expanded.rowsPerImage,
@@ -1662,6 +2453,7 @@
             copiedFromSab: expanded.copiedFromSab,
             reusedScratch: acquired.reused,
             pooledScratch: acquired.buffer !== null,
+            clamped: clampedSubRegion,
           };
         }
         if (!p._hasPendingUploadCommands) {
@@ -1682,21 +2474,27 @@
         }
       }
 
-      const dataLayout = {
-        offset: 0,
-        bytesPerRow: expanded.bytesPerRow,
-        rowsPerImage: expanded.rowsPerImage,
-      };
-      p.device.queue.writeTexture(destination, expanded.data, dataLayout, normSize);
-      this.stats.uploadCount += 1;
+      const reusedDest = this._fillCopyTexture(
+        destination.texture,
+        effMip,
+        effOx,
+        effOy,
+        effOz,
+        dstAspect
+      );
+      const reusedLayout = this._fillDataLayout(0, expanded.bytesPerRow, expanded.rowsPerImage);
+      const reusedSize = this._fillCopySize(effW, effH, effD);
+      p.device.queue.writeTexture(reusedDest, expanded.data, reusedLayout, reusedSize);
+      this.stats.reusedDescriptorCount += 1;
+      this._recordUploadCount();
       this._recordUploadBytes(expanded.data.byteLength);
 
       return {
         uploaded: true,
         staged: false,
-        width: normSize.width,
-        height: normSize.height,
-        depthOrArrayLayers: normSize.depthOrArrayLayers,
+        width: effW,
+        height: effH,
+        depthOrArrayLayers: effD,
         bytesPerRow: expanded.bytesPerRow,
         unalignedBytesPerRow: expanded.unalignedBytesPerRow,
         rowsPerImage: expanded.rowsPerImage,
@@ -1704,6 +2502,7 @@
         copiedFromSab: expanded.copiedFromSab,
         reusedScratch: acquired.reused,
         pooledScratch: acquired.buffer !== null,
+        clamped: clampedSubRegion,
       };
     }
 
@@ -1744,11 +2543,63 @@
       const textureFormat = this._getTextureFormat(destination.texture);
       const blockInfo = getTextureFormatBlockInfo(textureFormat);
       const isCompressed = Boolean(blockInfo && blockInfo.isCompressed);
-      const rawNormSize = normalizeCopySize(copySize);
-      const normSize = isCompressed ? alignCopySizeForFormat(blockInfo, rawNormSize) : rawNormSize;
-      const blocksX = isCompressed ? Math.ceil(normSize.width / blockInfo.blockWidth) : normSize.width;
-      const blocksY = isCompressed ? Math.ceil(normSize.height / blockInfo.blockHeight) : normSize.height;
-      const minRowBytes = isCompressed ? blocksX * blockInfo.bytesPerBlock : 0;
+      const bw = isCompressed ? blockInfo.blockWidth : 1;
+      const bh = isCompressed ? blockInfo.blockHeight : 1;
+
+      // Extract raw copySize without allocating temporary objects.
+      let rawW;
+      let rawH;
+      let rawD;
+      if (Array.isArray(copySize)) {
+        rawW = Math.max(1, Math.floor(Number(copySize[0]) || 1));
+        rawH = Math.max(1, Math.floor(Number(copySize[1] !== undefined ? copySize[1] : 1) || 1));
+        rawD = Math.max(1, Math.floor(Number(copySize[2] !== undefined ? copySize[2] : 1) || 1));
+      } else if (copySize && typeof copySize === 'object') {
+        rawW = Math.max(1, Math.floor(Number(copySize.width) || 1));
+        rawH = Math.max(1, Math.floor(Number(copySize.height !== undefined ? copySize.height : 1) || 1));
+        rawD = Math.max(
+          1,
+          Math.floor(
+            Number(
+              copySize.depthOrArrayLayers !== undefined
+                ? copySize.depthOrArrayLayers
+                : copySize.depthOrLayers !== undefined
+                  ? copySize.depthOrLayers
+                  : 1
+            ) || 1
+          )
+        );
+      } else {
+        throw new TypeError('copySize must be a GPUExtent3D object or [width, height, depth] array');
+      }
+
+      const dstTexture = destination.texture;
+      const dstMipLevel = destination.mipLevel !== undefined ? destination.mipLevel : 0;
+      const dstAspect = destination.aspect;
+      const dstOrigin = destination.origin;
+      let ox = 0;
+      let oy = 0;
+      let oz = 0;
+      if (Array.isArray(dstOrigin)) {
+        ox = dstOrigin[0] !== undefined ? dstOrigin[0] : 0;
+        oy = dstOrigin[1] !== undefined ? dstOrigin[1] : 0;
+        oz = dstOrigin[2] !== undefined ? dstOrigin[2] : 0;
+      } else if (dstOrigin && typeof dstOrigin === 'object') {
+        ox = dstOrigin.x !== undefined ? dstOrigin.x : 0;
+        oy = dstOrigin.y !== undefined ? dstOrigin.y : 0;
+        oz = dstOrigin.z !== undefined ? dstOrigin.z : 0;
+      }
+
+      // Preserve source layout fields before any reusable struct mutations.
+      const srcBuffer = source.buffer;
+      const srcOffset = source.offset !== undefined ? source.offset : 0;
+      const srcBytesPerRow = source.bytesPerRow;
+      const srcRowsPerImage = source.rowsPerImage;
+
+      // Compute original source row geometry before clamping copy extent.
+      const origBlocksX = isCompressed ? Math.ceil(rawW / bw) : rawW;
+      const origBlocksY = isCompressed ? Math.ceil(rawH / bh) : rawH;
+      const origMinRowBytes = isCompressed ? origBlocksX * blockInfo.bytesPerBlock : 0;
 
       const cpuInput = sourceBytes !== undefined ? sourceBytes : source.data;
       const rawBytesForCheck =
@@ -1756,55 +2607,115 @@
           ? toUint8Array(cpuInput, 'copyBufferToTexture')
           : null;
 
-      let rowsPerImage;
-      if (Number.isInteger(source.rowsPerImage) && source.rowsPerImage > 0) {
+      let origRowsPerImage;
+      if (Number.isInteger(srcRowsPerImage) && srcRowsPerImage > 0) {
         if (
           isCompressed &&
-          source.rowsPerImage === rawNormSize.height &&
-          source.rowsPerImage > blocksY &&
+          srcRowsPerImage === rawH &&
+          srcRowsPerImage > origBlocksY &&
           rawBytesForCheck
         ) {
           const candidateBpr =
-            Number.isInteger(source.bytesPerRow) && source.bytesPerRow > 0
-              ? source.bytesPerRow
-              : minRowBytes;
+            Number.isInteger(srcBytesPerRow) && srcBytesPerRow > 0
+              ? srcBytesPerRow
+              : origMinRowBytes;
           if (
             candidateBpr > 0 &&
-            rawBytesForCheck.byteLength <
-              candidateBpr * source.rowsPerImage * normSize.depthOrArrayLayers &&
-            rawBytesForCheck.byteLength >=
-              candidateBpr * blocksY * normSize.depthOrArrayLayers
+            rawBytesForCheck.byteLength < candidateBpr * srcRowsPerImage * rawD &&
+            rawBytesForCheck.byteLength >= candidateBpr * origBlocksY * rawD
           ) {
-            rowsPerImage = blocksY;
+            origRowsPerImage = origBlocksY;
           } else {
-            rowsPerImage = source.rowsPerImage;
+            origRowsPerImage = srcRowsPerImage;
           }
         } else {
-          rowsPerImage = isCompressed ? Math.max(blocksY, source.rowsPerImage) : source.rowsPerImage;
+          origRowsPerImage = isCompressed ? Math.max(origBlocksY, srcRowsPerImage) : srcRowsPerImage;
         }
       } else {
-        rowsPerImage = isCompressed ? blocksY : normSize.height;
+        origRowsPerImage = isCompressed ? origBlocksY : rawH;
+      }
+      const origTotalRows = origRowsPerImage * rawD;
+
+      // Validate and clamp sub-region dirty rect against mip dimensions.
+      const clamped = this._clampSubRegion(
+        dstTexture,
+        undefined,
+        dstMipLevel,
+        ox,
+        oy,
+        oz,
+        rawW,
+        rawH,
+        rawD,
+        blockInfo
+      );
+      if (clamped.invalidMipLevel) {
+        this._error(`copyBufferToTexture: mipLevel ${dstMipLevel} out of bounds`);
+        return {
+          repacked: false,
+          copiedFromSab: false,
+          bytesPerRow: 0,
+          originalBytesPerRow: Number.isInteger(srcBytesPerRow) ? srcBytesPerRow : 0,
+          staged: false,
+          outOfBounds: true,
+          error: this.lastError,
+        };
+      }
+      if (clamped.clamped) {
+        this.stats.clampedSubRegionCount += 1;
+      }
+      if (!clamped.valid) {
+        return {
+          repacked: false,
+          copiedFromSab: false,
+          bytesPerRow: 0,
+          originalBytesPerRow: Number.isInteger(srcBytesPerRow) ? srcBytesPerRow : 0,
+          staged: false,
+          clamped: clamped.clamped,
+          outOfBounds: true,
+        };
       }
 
-      const totalRows = rowsPerImage * normSize.depthOrArrayLayers;
+      const effW = clamped.width;
+      const effH = clamped.height;
+      const effD = clamped.depthOrArrayLayers;
+      const effMip = clamped.mipLevel;
+      const effOx = clamped.originX;
+      const effOy = clamped.originY;
+      const effOz = clamped.originZ;
+      const clampedSubRegion = clamped.clamped;
+
+      const blocksX = isCompressed ? Math.ceil(effW / bw) : effW;
+      const blocksY = isCompressed ? Math.ceil(effH / bh) : effH;
+      const minRowBytes = isCompressed ? blocksX * blockInfo.bytesPerBlock : 0;
+
+      let rowsPerImage = origRowsPerImage;
+      if (effD === 1 && rowsPerImage > blocksY) {
+        rowsPerImage = blocksY;
+      } else if (rowsPerImage < blocksY) {
+        rowsPerImage = blocksY;
+      }
+
+      const totalRows = rowsPerImage * effD;
       const p = this.processor;
       const device = p && p.device ? p.device : null;
 
       if (rawBytesForCheck !== null) {
         const rawBytes = rawBytesForCheck;
-        let rawBytesPerRow = source.bytesPerRow;
+        let rawBytesPerRow = srcBytesPerRow;
         if (!Number.isInteger(rawBytesPerRow) || rawBytesPerRow <= 0) {
-          if (isCompressed && totalRows > 0 && rawBytes.byteLength >= minRowBytes * totalRows) {
+          if (isCompressed && origTotalRows > 0 && rawBytes.byteLength >= origMinRowBytes * origTotalRows) {
             rawBytesPerRow =
-              rawBytes.byteLength % totalRows === 0 && rawBytes.byteLength / totalRows >= minRowBytes
-                ? rawBytes.byteLength / totalRows
-                : minRowBytes;
+              rawBytes.byteLength % origTotalRows === 0 &&
+              rawBytes.byteLength / origTotalRows >= origMinRowBytes
+                ? rawBytes.byteLength / origTotalRows
+                : origMinRowBytes;
           } else if (
-            totalRows > 0 &&
+            origTotalRows > 0 &&
             rawBytes.byteLength > 0 &&
-            rawBytes.byteLength % totalRows === 0
+            rawBytes.byteLength % origTotalRows === 0
           ) {
-            rawBytesPerRow = rawBytes.byteLength / totalRows;
+            rawBytesPerRow = rawBytes.byteLength / origTotalRows;
           } else {
             this._error('copyBufferToTexture: unable to infer positive bytesPerRow');
             return {
@@ -1833,7 +2744,7 @@
           rawBytes,
           rawBytesPerRow,
           rowsPerImage,
-          normSize.depthOrArrayLayers
+          effD
         );
         if (packed.repacked) {
           this.stats.rowPitchRepackCount += 1;
@@ -1845,7 +2756,7 @@
         if (packed.copiedFromSab) {
           this.stats.sabCopyCount += 1;
         }
-        const isR8 = this._isR8UnormTexture(destination.texture);
+        const isR8 = this._isR8UnormTexture(dstTexture);
 
         if (
           p &&
@@ -1853,20 +2764,21 @@
           !p.stagingPool._destroyed &&
           typeof p.stagingPool.stageTextureUpload === 'function'
         ) {
-          const stageLayout = {
-            width: normSize.width,
-            height: normSize.height,
-            depthOrArrayLayers: normSize.depthOrArrayLayers,
-            mipLevel: destination.mipLevel || 0,
-            origin: destination.origin || { x: 0, y: 0, z: 0 },
-            bytesPerRow: packed.bytesPerRow,
+          const stageLayout = this._fillStageLayout(
+            effW,
+            effH,
+            effD,
+            effMip,
+            effOx,
+            effOy,
+            effOz,
+            packed.bytesPerRow,
             rowsPerImage,
-          };
-          if (destination.aspect !== undefined) {
-            stageLayout.aspect = destination.aspect;
-          }
-          p.stagingPool.stageTextureUpload(encoder, destination.texture, packed.data, stageLayout);
-          this.stats.uploadCount += 1;
+            dstAspect
+          );
+          p.stagingPool.stageTextureUpload(encoder, dstTexture, packed.data, stageLayout);
+          this.stats.reusedDescriptorCount += 1;
+          this._recordUploadCount();
           this._recordUploadBytes(packed.data.byteLength);
           if (!packed.repacked && !packed.copiedFromSab) {
             this.stats.zeroCopyUploads += 1;
@@ -1881,25 +2793,32 @@
             bytesPerRow: packed.bytesPerRow,
             originalBytesPerRow: rawBytesPerRow,
             staged: true,
+            clamped: clampedSubRegion,
           };
         }
 
-        if (!packed.repacked && source.buffer) {
-          const offset = source.offset || 0;
+        if (!packed.repacked && srcBuffer) {
           if (device && device.queue && typeof device.queue.writeBuffer === 'function') {
-            device.queue.writeBuffer(source.buffer, offset, packed.data);
+            device.queue.writeBuffer(srcBuffer, srcOffset, packed.data);
           }
-          encoder.copyBufferToTexture(
-            {
-              buffer: source.buffer,
-              offset,
-              bytesPerRow: packed.bytesPerRow,
-              rowsPerImage,
-            },
-            destination,
-            normSize
+          const reusedSrc = this._fillBufferSource(
+            srcBuffer,
+            srcOffset,
+            packed.bytesPerRow,
+            rowsPerImage
           );
-          this.stats.uploadCount += 1;
+          const reusedDest = this._fillCopyTexture(
+            dstTexture,
+            effMip,
+            effOx,
+            effOy,
+            effOz,
+            dstAspect
+          );
+          const reusedSize = this._fillCopySize(effW, effH, effD);
+          encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
+          this.stats.reusedDescriptorCount += 1;
+          this._recordUploadCount();
           this._recordUploadBytes(packed.data.byteLength);
           if (!packed.copiedFromSab) {
             this.stats.zeroCopyUploads += 1;
@@ -1914,6 +2833,7 @@
             bytesPerRow: packed.bytesPerRow,
             originalBytesPerRow: rawBytesPerRow,
             staged: false,
+            clamped: clampedSubRegion,
           };
         }
 
@@ -1941,17 +2861,24 @@
           usage: GPU_BUFFER_USAGE_COPY_SRC_DST,
         });
         device.queue.writeBuffer(stagingBuffer, 0, packed.data);
-        encoder.copyBufferToTexture(
-          {
-            buffer: stagingBuffer,
-            offset: 0,
-            bytesPerRow: packed.bytesPerRow,
-            rowsPerImage,
-          },
-          destination,
-          normSize
+        const reusedSrc = this._fillBufferSource(
+          stagingBuffer,
+          0,
+          packed.bytesPerRow,
+          rowsPerImage
         );
-        this.stats.uploadCount += 1;
+        const reusedDest = this._fillCopyTexture(
+          dstTexture,
+          effMip,
+          effOx,
+          effOy,
+          effOz,
+          dstAspect
+        );
+        const reusedSize = this._fillCopySize(effW, effH, effD);
+        encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
+        this.stats.reusedDescriptorCount += 1;
+        this._recordUploadCount();
         this._recordUploadBytes(packed.data.byteLength);
         if (!packed.repacked && !packed.copiedFromSab) {
           this.stats.zeroCopyUploads += 1;
@@ -1967,15 +2894,32 @@
           originalBytesPerRow: rawBytesPerRow,
           stagingBuffer,
           staged: true,
+          clamped: clampedSubRegion,
         };
       }
 
       // GPU-buffer-only copy path (no CPU bytes supplied).
-      const rawBytesPerRow = Number.isInteger(source.bytesPerRow) ? source.bytesPerRow : 0;
-      const isR8 = this._isR8UnormTexture(destination.texture);
+      const rawBytesPerRow = Number.isInteger(srcBytesPerRow) ? srcBytesPerRow : 0;
+      const isR8 = this._isR8UnormTexture(dstTexture);
       if (rawBytesPerRow === 0 || rawBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0) {
-        encoder.copyBufferToTexture(source, destination, normSize);
-        this.stats.uploadCount += 1;
+        const reusedSrc = this._fillBufferSource(
+          srcBuffer,
+          srcOffset,
+          srcBytesPerRow,
+          srcRowsPerImage !== undefined ? rowsPerImage : undefined
+        );
+        const reusedDest = this._fillCopyTexture(
+          dstTexture,
+          effMip,
+          effOx,
+          effOy,
+          effOz,
+          dstAspect
+        );
+        const reusedSize = this._fillCopySize(effW, effH, effD);
+        encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
+        this.stats.reusedDescriptorCount += 1;
+        this._recordUploadCount();
         if (rawBytesPerRow > 0) {
           this._recordUploadBytes(rawBytesPerRow * totalRows);
         }
@@ -1988,13 +2932,14 @@
           bytesPerRow: rawBytesPerRow,
           originalBytesPerRow: rawBytesPerRow,
           staged: false,
+          clamped: clampedSubRegion,
         };
       }
 
       const alignedBytesPerRow = alignBytesPerRow256(rawBytesPerRow);
       const repackedTotalBytes = alignedBytesPerRow * totalRows;
       if (
-        source.buffer &&
+        srcBuffer &&
         rawBytesPerRow % 4 === 0 &&
         typeof encoder.copyBufferToBuffer === 'function' &&
         device &&
@@ -2022,27 +2967,33 @@
           });
         }
 
-        const srcBaseOffset = source.offset || 0;
         for (let row = 0; row < totalRows; row += 1) {
           encoder.copyBufferToBuffer(
-            source.buffer,
-            srcBaseOffset + row * rawBytesPerRow,
+            srcBuffer,
+            srcOffset + row * rawBytesPerRow,
             dstBuffer,
             dstOffset + row * alignedBytesPerRow,
             rawBytesPerRow
           );
         }
-        encoder.copyBufferToTexture(
-          {
-            buffer: dstBuffer,
-            offset: dstOffset,
-            bytesPerRow: alignedBytesPerRow,
-            rowsPerImage,
-          },
-          destination,
-          normSize
+        const reusedSrc = this._fillBufferSource(
+          dstBuffer,
+          dstOffset,
+          alignedBytesPerRow,
+          rowsPerImage
         );
-        this.stats.uploadCount += 1;
+        const reusedDest = this._fillCopyTexture(
+          dstTexture,
+          effMip,
+          effOx,
+          effOy,
+          effOz,
+          dstAspect
+        );
+        const reusedSize = this._fillCopySize(effW, effH, effD);
+        encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
+        this.stats.reusedDescriptorCount += 1;
+        this._recordUploadCount();
         this.stats.rowPitchRepackCount += 1;
         this.stats.repackedUploads += 1;
         this._recordUploadBytes(repackedTotalBytes);
@@ -2056,6 +3007,7 @@
           originalBytesPerRow: rawBytesPerRow,
           stagingBuffer: dstBuffer,
           staged: true,
+          clamped: clampedSubRegion,
         };
       }
 
@@ -2122,47 +3074,87 @@
       const isCompressed = Boolean(blockInfo && blockInfo.isCompressed);
       const blockWidth = isCompressed ? blockInfo.blockWidth : 1;
       const blockHeight = isCompressed ? blockInfo.blockHeight : 1;
-      const blocksX = width > 0 ? Math.ceil(width / blockWidth) : 0;
-      const blocksY = height > 0 ? Math.ceil(height / blockHeight) : 0;
-      const copyWidth = isCompressed ? blocksX * blockWidth : width;
-      const copyHeight = isCompressed ? blocksY * blockHeight : height;
-      const minRowBytes = isCompressed ? blocksX * blockInfo.bytesPerBlock : 0;
+      const origBlocksX = width > 0 ? Math.ceil(width / blockWidth) : 0;
+      const origBlocksY = height > 0 ? Math.ceil(height / blockHeight) : 0;
+      const origMinRowBytes = isCompressed ? origBlocksX * blockInfo.bytesPerBlock : 0;
 
       let effectiveRowsPerImage;
       if (rowsPerImage > 0) {
-        if (isCompressed && rowsPerImage === height && rowsPerImage > blocksY) {
-          const candidateBpr = bytesPerRow > 0 ? bytesPerRow : minRowBytes;
+        if (isCompressed && rowsPerImage === height && rowsPerImage > origBlocksY) {
+          const candidateBpr = bytesPerRow > 0 ? bytesPerRow : origMinRowBytes;
           if (
             candidateBpr > 0 &&
             dataLen < candidateBpr * rowsPerImage * depthOrArrayLayers &&
-            dataLen >= candidateBpr * blocksY * depthOrArrayLayers
+            dataLen >= candidateBpr * origBlocksY * depthOrArrayLayers
           ) {
-            effectiveRowsPerImage = blocksY;
+            effectiveRowsPerImage = origBlocksY;
           } else {
             effectiveRowsPerImage = rowsPerImage;
           }
         } else {
-          effectiveRowsPerImage = isCompressed ? Math.max(blocksY, rowsPerImage) : rowsPerImage;
+          effectiveRowsPerImage = isCompressed ? Math.max(origBlocksY, rowsPerImage) : rowsPerImage;
         }
       } else {
-        effectiveRowsPerImage = isCompressed ? blocksY : height;
+        effectiveRowsPerImage = isCompressed ? origBlocksY : height;
       }
 
-      const totalRows = effectiveRowsPerImage * depthOrArrayLayers;
+      const origTotalRows = effectiveRowsPerImage * depthOrArrayLayers;
       let effectiveBytesPerRow = 0;
       if (bytesPerRow > 0) {
         effectiveBytesPerRow = bytesPerRow;
-      } else if (totalRows > 0 && dataLen > 0) {
+      } else if (origTotalRows > 0 && dataLen > 0) {
         if (isCompressed) {
-          if (dataLen % totalRows === 0 && dataLen / totalRows >= minRowBytes) {
-            effectiveBytesPerRow = dataLen / totalRows;
-          } else if (dataLen >= minRowBytes * totalRows) {
-            effectiveBytesPerRow = minRowBytes;
+          if (dataLen % origTotalRows === 0 && dataLen / origTotalRows >= origMinRowBytes) {
+            effectiveBytesPerRow = dataLen / origTotalRows;
+          } else if (dataLen >= origMinRowBytes * origTotalRows) {
+            effectiveBytesPerRow = origMinRowBytes;
           }
-        } else if (dataLen % totalRows === 0) {
-          effectiveBytesPerRow = dataLen / totalRows;
+        } else if (dataLen % origTotalRows === 0) {
+          effectiveBytesPerRow = dataLen / origTotalRows;
         }
       }
+
+      // Clamp sub-region dirty rect against mip dimensions before dispatching GPU work.
+      const clamped = this._clampSubRegion(
+        texture,
+        textureId,
+        mipLevel,
+        originX,
+        originY,
+        originZ,
+        width,
+        height,
+        depthOrArrayLayers,
+        blockInfo
+      );
+      if (clamped.invalidMipLevel) {
+        this._error(`WriteTexture ${textureId}: mipLevel ${mipLevel} out of bounds`);
+        return;
+      }
+      if (clamped.clamped) {
+        this.stats.clampedSubRegionCount += 1;
+      }
+      if (!clamped.valid) {
+        return;
+      }
+
+      const effMipLevel = clamped.mipLevel;
+      const effOriginX = clamped.originX;
+      const effOriginY = clamped.originY;
+      const effOriginZ = clamped.originZ;
+      const copyWidth = clamped.width;
+      const copyHeight = clamped.height;
+      const effDepth = clamped.depthOrArrayLayers;
+      const clampedBlocksX = Math.ceil(copyWidth / blockWidth);
+      const clampedBlocksY = Math.ceil(copyHeight / blockHeight);
+      const minRowBytes = isCompressed ? clampedBlocksX * blockInfo.bytesPerBlock : 0;
+
+      if (effDepth === 1 && effectiveRowsPerImage > clampedBlocksY) {
+        effectiveRowsPerImage = clampedBlocksY;
+      } else if (effectiveRowsPerImage < clampedBlocksY) {
+        effectiveRowsPerImage = clampedBlocksY;
+      }
+      const totalRows = effectiveRowsPerImage * effDepth;
 
       if (isCompressed && effectiveBytesPerRow > 0 && minRowBytes > 0 && effectiveBytesPerRow < minRowBytes) {
         this._error(
@@ -2182,27 +3174,19 @@
       // 3840x2160 r8unorm Y plane where 3840 % 256 === 0, or 64x64 BC7 / 128x128 BC1),
       // upload directly via queue.writeTexture without staging pool churn or scratch repacking.
       if (isRowAligned256 && hasDirectQueueWrite && copyWidth > 0 && copyHeight > 0 && dataLen > 0) {
-        const directLayout = { offset: 0, bytesPerRow: effectiveBytesPerRow };
-        if (rowsPerImage > 0) {
-          directLayout.rowsPerImage = effectiveRowsPerImage;
-        } else if (totalRows > 1) {
-          directLayout.rowsPerImage = effectiveRowsPerImage;
-        }
-        this.writeTexture(
-          {
-            texture,
-            mipLevel,
-            origin: { x: originX, y: originY, z: originZ },
-          },
-          rawData,
-          directLayout,
-          {
-            width: copyWidth,
-            height: copyHeight,
-            depthOrArrayLayers,
-          },
-          textureId
+        const directRpi =
+          rowsPerImage > 0 || totalRows > 1 ? effectiveRowsPerImage : undefined;
+        const reusedDest = this._fillCopyTexture(
+          texture,
+          effMipLevel,
+          effOriginX,
+          effOriginY,
+          effOriginZ,
+          'all'
         );
+        const reusedLayout = this._fillDataLayout(0, effectiveBytesPerRow, directRpi);
+        const reusedSize = this._fillCopySize(copyWidth, copyHeight, effDepth);
+        this.writeTexture(reusedDest, rawData, reusedLayout, reusedSize, textureId);
         return;
       }
 
@@ -2225,7 +3209,7 @@
               rawData,
               effectiveBytesPerRow,
               effectiveRowsPerImage,
-              depthOrArrayLayers
+              effDepth
             );
             if (packed.repacked) {
               this.stats.rowPitchRepackCount += 1;
@@ -2238,18 +3222,22 @@
               this.stats.sabCopyCount += 1;
             }
 
-            const layout = {
-              width: copyWidth,
-              height: copyHeight,
-              depthOrArrayLayers,
-              mipLevel,
-              origin: { x: originX, y: originY, z: originZ },
-              bytesPerRow: packed.bytesPerRow,
-              rowsPerImage: effectiveRowsPerImage,
-            };
-            p.stagingPool.stageTextureUpload(encoder, texture, packed.data, layout);
+            const stageLayout = this._fillStageLayout(
+              copyWidth,
+              copyHeight,
+              effDepth,
+              effMipLevel,
+              effOriginX,
+              effOriginY,
+              effOriginZ,
+              packed.bytesPerRow,
+              effectiveRowsPerImage,
+              undefined
+            );
+            p.stagingPool.stageTextureUpload(encoder, texture, packed.data, stageLayout);
             p._hasPendingUploadCommands = true;
-            this.stats.uploadCount += 1;
+            this.stats.reusedDescriptorCount += 1;
+            this._recordUploadCount();
             this._recordUploadBytes(packed.data.byteLength);
             if (!packed.repacked && !packed.copiedFromSab) {
               this.stats.zeroCopyUploads += 1;
@@ -2265,39 +3253,37 @@
         }
       }
 
-      const dataLayout = { offset: 0 };
-      if (bytesPerRow > 0) {
-        dataLayout.bytesPerRow = bytesPerRow;
-      } else if (effectiveBytesPerRow > 0 && (totalRows > 1 || isCompressed)) {
-        dataLayout.bytesPerRow = effectiveBytesPerRow;
-      }
-      if (rowsPerImage > 0) {
-        dataLayout.rowsPerImage = effectiveRowsPerImage;
-      } else if (depthOrArrayLayers > 1 && effectiveRowsPerImage > 0) {
-        dataLayout.rowsPerImage = effectiveRowsPerImage;
-      }
+      const fallbackBpr =
+        bytesPerRow > 0
+          ? bytesPerRow
+          : effectiveBytesPerRow > 0 && (totalRows > 1 || isCompressed)
+            ? effectiveBytesPerRow
+            : undefined;
+      const fallbackRpi =
+        rowsPerImage > 0
+          ? effectiveRowsPerImage
+          : effDepth > 1 && effectiveRowsPerImage > 0
+            ? effectiveRowsPerImage
+            : undefined;
 
-      this.writeTexture(
-        {
-          texture,
-          mipLevel,
-          origin: { x: originX, y: originY, z: originZ },
-        },
-        rawData,
-        dataLayout,
-        {
-          width: copyWidth,
-          height: copyHeight,
-          depthOrArrayLayers,
-        },
-        textureId
+      const reusedDest = this._fillCopyTexture(
+        texture,
+        effMipLevel,
+        effOriginX,
+        effOriginY,
+        effOriginZ,
+        'all'
       );
+      const reusedLayout = this._fillDataLayout(0, fallbackBpr, fallbackRpi);
+      const reusedSize = this._fillCopySize(copyWidth, copyHeight, effDepth);
+      this.writeTexture(reusedDest, rawData, reusedLayout, reusedSize, textureId);
     }
 
     _create(id, descriptor, isV2 = true) {
       const p = this.processor;
       this._bc3dFallbackTextures.delete(id);
       this._textureFormats.delete(id);
+      this._textureMeta.delete(id);
       if (typeof p._destroyTextureIfPresent === 'function') {
         p._destroyTextureIfPresent(id);
       }
@@ -2372,6 +3358,23 @@
         this._textureFormats.set(id, effectiveDescriptor.format);
         if (texture && typeof texture === 'object') {
           this._textureObjFormats.set(texture, effectiveDescriptor.format);
+        }
+      }
+      if (effectiveDescriptor && effectiveDescriptor.size) {
+        const meta = {
+          width: Math.max(1, Math.floor(Number(effectiveDescriptor.size.width) || 1)),
+          height: Math.max(1, Math.floor(Number(effectiveDescriptor.size.height) || 1)),
+          depthOrArrayLayers: Math.max(
+            1,
+            Math.floor(Number(effectiveDescriptor.size.depthOrArrayLayers) || 1)
+          ),
+          mipLevelCount: Math.max(1, Math.floor(Number(effectiveDescriptor.mipLevelCount) || 1)),
+          dimension: effectiveDescriptor.dimension || '2d',
+          format: effectiveDescriptor.format || null,
+        };
+        this._textureMeta.set(id, meta);
+        if (texture && typeof texture === 'object') {
+          this._textureObjMeta.set(texture, meta);
         }
       }
       if (srgbSiblingAdded) {
@@ -2493,8 +3496,10 @@
     decodeCreateTexture,
     decodeCreateTexture2,
     computeMaxMipLevels,
+    calcMipDimension,
     clampMipLevels,
     clampSampleCount,
+    clampSubRegionToMipBounds,
     alignBytesPerRow256,
     repackRowsTo256,
     expandA8ToRgba8,
