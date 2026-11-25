@@ -414,6 +414,12 @@ else()
     add_executable(bench_xmem_map ../tests/bench_xmem_map.cpp)
     target_link_libraries(bench_xmem_map PRIVATE playgta6_core)
     add_test(NAME bench_xmem_map_smoke COMMAND bench_xmem_map)
+
+    # XMem write-tracking contention stress test (O33); CTest runs the smoke variant
+    # (`bench_xmem_contention --full [--threads N]` for numbers).
+    add_executable(bench_xmem_contention ../tests/bench_xmem_contention.cpp)
+    target_link_libraries(bench_xmem_contention PRIVATE playgta6_core)
+    add_test(NAME bench_xmem_contention_smoke COMMAND bench_xmem_contention)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)

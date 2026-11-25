@@ -15,6 +15,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten/heap.h>
@@ -105,11 +106,12 @@ const PlaceholderApi& placeholder_api() {
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
 #endif
 
-std::mutex g_zone_mutex;
+// O33: the zone table is read on every fault that is not a tracked view: a reader/writer lock.
+std::shared_mutex g_zone_mutex;
 std::map<uintptr_t, std::pair<uintptr_t, uintptr_t>> g_zones;  // reservation base -> [zone start, end)
 
 bool in_zone(uintptr_t addr) {
-    std::lock_guard<std::mutex> lock(g_zone_mutex);
+    std::shared_lock<std::shared_mutex> lock(g_zone_mutex);
     for (const auto& [base, zone] : g_zones) {
         if (addr >= zone.first && addr < zone.second) {
             return true;
@@ -125,54 +127,67 @@ bool in_zone(uintptr_t addr) {
 // makes them writable again (one fault per page and taking interval, none for pages no caller
 // tracks). A write is stamped on every view of the page (a write through one changes what the
 // others show) with a clock each caller compares with its own (WriteCursor::view_clock), so callers
-// whose ranges overlap all see it. Lock order: the arena's mutex, then g_track_mutex (a leaf:
-// nothing here writes guest memory while holding it).
+// whose ranges overlap all see it.
+//
+// O33: two lock levels instead of one global mutex, so the write-fault handler, takes (flush and
+// re-arm), host-write pins and maps of other pages no longer serialise on each other:
+//   g_track_mutex (reader/writer): the view and page tables. Exclusive only to add or remove a
+//     view (map/unmap); faults, takes, pins and guest protections hold it shared.
+//   TrackedPage::mutex: one page's state (armed, pins, untracked) and its views' stamps.
+// Lock order: the arena's mutex, then g_track_mutex, then one TrackedPage::mutex at a time (leaves:
+// nothing here writes guest memory while holding them). The clock is atomic; see
+// take_written_pages for why a take reports against the clock read before it starts.
+struct TrackedPage;
 struct TrackedView {
     uint64_t size = 0;
     void* page = nullptr;
-    uint64_t stamp = 0;  // g_track_clock at the last write seen (or mapping: new contents)
+    TrackedPage* tracked = nullptr;  // g_tracked_pages[page] (map nodes are stable)
+    uint64_t stamp = 0;  // g_track_clock at the last write seen (or mapping: new contents); page mutex
 };
 struct TrackedPage {
-    std::vector<uintptr_t> views;
+    std::mutex mutex;
+    std::vector<uintptr_t> views;  // (changed with g_track_mutex held exclusively)
     bool armed = false;      // its views are read-only: the next write faults
     bool untracked = false;  // a view got a guest protection: always reported written, never armed
     uint32_t pins = 0;       // host writes in flight (pin_views): never armed, reported written
 };
-std::mutex g_track_mutex;
+std::shared_mutex g_track_mutex;
 std::map<uintptr_t, TrackedView> g_views;  // view base -> view, guarded by g_track_mutex
 std::map<void*, TrackedPage> g_tracked_pages;
-uint64_t g_track_clock = 1;  // guarded by g_track_mutex
+std::atomic<uint64_t> g_track_clock{1};
 std::once_flag g_track_handler_once;
 std::atomic<uint64_t> g_track_faults{0};
 
-void protect_views_locked(const TrackedPage& page, DWORD protect) {
+// The `*_page_locked` helpers: g_track_mutex held (either way) and the page's mutex held.
+void protect_views_page_locked(const TrackedPage& page, DWORD protect) {
     for (uintptr_t v : page.views) {
         DWORD old = 0;
-        VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views[v].size), protect, &old);
+        VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views.find(v)->second.size), protect, &old);
     }
 }
 
 // The page's views become writable, each stamped written.
-void disarm_locked(TrackedPage& page) {
-    ++g_track_clock;
+void disarm_page_locked(TrackedPage& page) {
+    const uint64_t stamp = g_track_clock.fetch_add(1) + 1;
     for (uintptr_t v : page.views) {
-        g_views[v].stamp = g_track_clock;
+        g_views.find(v)->second.stamp = stamp;
     }
     if (page.armed) {
         page.armed = false;
-        protect_views_locked(page, PAGE_READWRITE);
+        protect_views_page_locked(page, PAGE_READWRITE);
     }
 }
 
-void arm_locked(TrackedPage& page) {
+void arm_page_locked(TrackedPage& page) {
     if (page.pins != 0) {
         return;  // a host write is in flight: the kernel cannot fault into track_fault
     }
     for (uintptr_t v : page.views) {
         DWORD old = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views[v].size), PAGE_READONLY, &old)) {
+        if (!VirtualProtect(reinterpret_cast<void*>(v), static_cast<SIZE_T>(g_views.find(v)->second.size),
+                            PAGE_READONLY, &old)) {
             page.armed = true;  // (so disarm restores the views armed so far)
-            disarm_locked(page);
+            disarm_page_locked(page);
             page.untracked = true;
             return;
         }
@@ -187,28 +202,37 @@ LONG CALLBACK track_fault(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const uintptr_t addr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+    bool view = false;
     {
-        std::lock_guard<std::mutex> lock(g_track_mutex);
+        std::shared_lock<std::shared_mutex> lock(g_track_mutex);
         auto it = g_views.upper_bound(addr);
         if (it != g_views.begin() && addr - std::prev(it)->first < std::prev(it)->second.size) {
-            auto pit = g_tracked_pages.find(std::prev(it)->second.page);
-            if (pit != g_tracked_pages.end() && pit->second.armed) {
-                disarm_locked(pit->second);
+            view = true;
+            TrackedPage& page = *std::prev(it)->second.tracked;
+            std::lock_guard<std::mutex> page_lock(page.mutex);
+            if (page.armed) {
+                disarm_page_locked(page);
                 g_track_faults.fetch_add(1, std::memory_order_relaxed);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if (!page.untracked) {
+                // O33 fast path: another thread disarmed the page first, so its views are writable
+                // (a take re-arming them meanwhile only faults the write in again).
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
     }
-    // Another thread disarmed the page (or unmapped the view after disarming it) meanwhile: the
-    // write goes through now. Anything else is a real fault.
+    // A view with a guest protection, or a view unmapped after it was disarmed: the write goes
+    // through when the page is writable now. Anything else is a real fault.
     MEMORY_BASIC_INFORMATION mbi{};
-    if (in_zone(addr) && VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != 0 &&
+    if ((view || in_zone(addr)) && VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) != 0 &&
         mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// g_track_mutex held exclusively.
 void forget_view_locked(uintptr_t at) {
     auto it = g_views.find(at);
     if (it == g_views.end()) {
@@ -216,9 +240,14 @@ void forget_view_locked(uintptr_t at) {
     }
     if (auto pit = g_tracked_pages.find(it->second.page); pit != g_tracked_pages.end()) {
         TrackedPage& page = pit->second;
-        disarm_locked(page);  // a write racing with the unmap reaches the page's other views
-        page.views.erase(std::remove(page.views.begin(), page.views.end(), at), page.views.end());
-        if (page.views.empty()) {
+        bool empty = false;
+        {
+            std::lock_guard<std::mutex> page_lock(page.mutex);
+            disarm_page_locked(page);  // a write racing with the unmap reaches the page's other views
+            page.views.erase(std::remove(page.views.begin(), page.views.end(), at), page.views.end());
+            empty = page.views.empty();
+        }
+        if (empty) {
             g_tracked_pages.erase(pit);
         }
     }
@@ -227,21 +256,22 @@ void forget_view_locked(uintptr_t at) {
 
 void track_view(uint8_t* at, void* page, uint64_t size) {
     const uintptr_t v = reinterpret_cast<uintptr_t>(at);
-    std::lock_guard<std::mutex> lock(g_track_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_track_mutex);
     forget_view_locked(v);
     TrackedPage& tp = g_tracked_pages[page];
+    std::lock_guard<std::mutex> page_lock(tp.mutex);
     tp.views.push_back(v);
-    g_views[v] = TrackedView{size, page, 0};
-    disarm_locked(tp);  // the new view is writable: so are the others until the next take
+    g_views[v] = TrackedView{size, page, &tp, 0};
+    disarm_page_locked(tp);  // the new view is writable: so are the others until the next take
 }
 
 void untrack_view(uint8_t* at) {
-    std::lock_guard<std::mutex> lock(g_track_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_track_mutex);
     forget_view_locked(reinterpret_cast<uintptr_t>(at));
 }
 
 void untrack_range(uintptr_t lo, uintptr_t hi) {
-    std::lock_guard<std::mutex> lock(g_track_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_track_mutex);
     for (auto it = g_views.lower_bound(lo); it != g_views.end() && it->first < hi;) {
         const uintptr_t v = it->first;
         ++it;
@@ -254,7 +284,7 @@ void untrack_range(uintptr_t lo, uintptr_t hi) {
 void track_protect(uint8_t* p, uint64_t len, bool read_write) {
     const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
     const uintptr_t hi = lo + static_cast<uintptr_t>(len);
-    std::lock_guard<std::mutex> lock(g_track_mutex);
+    std::shared_lock<std::shared_mutex> lock(g_track_mutex);
     auto it = g_views.upper_bound(lo);
     if (it != g_views.begin()) {
         --it;
@@ -263,10 +293,10 @@ void track_protect(uint8_t* p, uint64_t len, bool read_write) {
         if (it->first + it->second.size <= lo) {
             continue;
         }
-        if (auto pit = g_tracked_pages.find(it->second.page); pit != g_tracked_pages.end()) {
-            disarm_locked(pit->second);
-            pit->second.untracked = pit->second.untracked || !read_write;
-        }
+        TrackedPage& page = *it->second.tracked;
+        std::lock_guard<std::mutex> page_lock(page.mutex);
+        disarm_page_locked(page);
+        page.untracked = page.untracked || !read_write;
     }
 }
 
@@ -283,7 +313,7 @@ uint64_t tracked_view_faults() {
 }
 
 void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
-    std::lock_guard<std::mutex> lock(g_track_mutex);
+    std::shared_lock<std::shared_mutex> lock(g_track_mutex);
     if (g_views.empty()) {
         return;
     }
@@ -297,11 +327,8 @@ void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
             continue;
         }
         last = it->second.page;
-        auto pit = g_tracked_pages.find(it->second.page);
-        if (pit == g_tracked_pages.end()) {
-            continue;
-        }
-        TrackedPage& page = pit->second;
+        TrackedPage& page = *it->second.tracked;
+        std::lock_guard<std::mutex> page_lock(page.mutex);
         if (pin) {
             ++page.pins;
         } else if (page.pins != 0) {
@@ -309,14 +336,14 @@ void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
         }
         // Writable for the kernel before the write, stamped written again after it (a take
         // between the two saw the page pinned, i.e. written, and left it unarmed).
-        disarm_locked(page);
+        disarm_page_locked(page);
     }
 }
 
 void release(uint8_t* base, uint64_t /*size*/) {
     std::pair<uintptr_t, uintptr_t> zone{0, 0};
     {
-        std::lock_guard<std::mutex> lock(g_zone_mutex);
+        std::unique_lock<std::shared_mutex> lock(g_zone_mutex);
         if (auto it = g_zones.find(reinterpret_cast<uintptr_t>(base)); it != g_zones.end()) {
             zone = it->second;
             g_zones.erase(it);
@@ -390,7 +417,7 @@ uint8_t* reserve_with_shared_zone(uint64_t size, uint64_t preferred, uint64_t zo
             return nullptr;
         }
     }
-    std::lock_guard<std::mutex> lock(g_zone_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_zone_mutex);
     g_zones[reinterpret_cast<uintptr_t>(base)] = {reinterpret_cast<uintptr_t>(base + zone_offset),
                                                   reinterpret_cast<uintptr_t>(base + size)};
     return base;
@@ -517,7 +544,12 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
         // previous call, and the pages they show armed for the next interval. Pieces of the range
         // between views (unmapped zone slots, or arena memory) are taken from MEM_WRITE_WATCH
         // where it covers them, else reported written.
-        std::lock_guard<std::mutex> lock(g_track_mutex);
+        // O33: the tables shared (faults and other takes run meanwhile), each page under its own
+        // lock. The caller's new position is the clock read before any page is looked at: a write
+        // that disarms a page after this take armed it stamps a later value, so the next take
+        // reports it (a write stamped meanwhile may be reported twice, never missed).
+        const uint64_t clock = g_track_clock.load();
+        std::shared_lock<std::shared_mutex> lock(g_track_mutex);
         auto it = g_views.upper_bound(start);
         if (it != g_views.begin() && std::prev(it)->first + std::prev(it)->second.size > start) {
             --it;
@@ -533,14 +565,14 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
                 if (at < lo && !written_pages_by_watch(at, lo, start, offsets)) {
                     all_written(at, lo, start, offsets);
                 }
-                auto pit = g_tracked_pages.find(it->second.page);
-                const bool untracked =
-                    pit == g_tracked_pages.end() || pit->second.untracked || pit->second.pins != 0;
+                TrackedPage& page = *it->second.tracked;
+                std::lock_guard<std::mutex> page_lock(page.mutex);
+                const bool untracked = page.untracked || page.pins != 0;
                 if (view_clock == nullptr || it->second.stamp > *view_clock || untracked) {
                     all_written(lo, hi, start, offsets);
                 }
-                if (!untracked && !pit->second.armed) {
-                    arm_locked(pit->second);
+                if (!untracked && !page.armed) {
+                    arm_page_locked(page);
                 }
                 at = hi;
             }
@@ -548,7 +580,7 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
                 all_written(at, end, start, offsets);
             }
             if (view_clock != nullptr) {
-                *view_clock = g_track_clock;
+                *view_clock = clock;
             }
             return true;
         }
