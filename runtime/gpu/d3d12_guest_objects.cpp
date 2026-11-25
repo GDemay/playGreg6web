@@ -456,12 +456,20 @@ DeviceStats Device::stats() const {
 }
 
 void Device::note_bad_argument(const std::string& message) {
-    bad_arguments_.fetch_add(1, std::memory_order_relaxed);
+    bad_arguments_.fetch_add(1, std::memory_order_relaxed);  // exact, whatever is logged
     const std::string line = "d3d12_xs: " + message;
-    os::log(line);
-    std::lock_guard<std::mutex> lock(diag_mutex_);
-    if (diags_.size() < kMaxDiagnostics) {
-        diags_.push_back(line);
+    LogRateLimiter::Decision decision;
+    {
+        std::lock_guard<std::mutex> lock(diag_mutex_);
+        decision = bad_arg_log_.note(message);
+        if (diags_.size() < kMaxDiagnostics) {
+            diags_.push_back(line);
+        }
+    }
+    if (decision.log) {
+        os::log(decision.count > LogRateLimiter::kFirst
+                    ? line + " (occurrence " + std::to_string(decision.count) + " of this reason)"
+                    : line);
     }
 }
 
