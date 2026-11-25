@@ -9,8 +9,10 @@
   const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
   const DEFAULT_MAX_POOL_BYTES = 64 * 1024 * 1024; // 64 MiB
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
+  const DEFAULT_MAX_FRAMES_IN_FLIGHT = DEFAULT_FRAMES_IN_FLIGHT;
   const DEFAULT_MIN_WARM_CHUNKS = 1;
   const DEFAULT_IDLE_EVICT_FRAMES = 0;
+  const DEFAULT_IDLE_SHRINK_FRAMES = 120; // ~4 seconds at 30 FPS for transient oversized slabs
   const DEFAULT_LARGE_SLAB_THRESHOLD = 2 * 1024 * 1024; // 2 MiB
   const DEFAULT_MAX_LARGE_SLABS = 12;
   const DEFAULT_POW2_MIN_SLAB_BYTES = 1 * 1024 * 1024; // 1 MiB
@@ -406,10 +408,12 @@
         chunkSize,
         maxPoolBytes,
         maxPooledBytes,
-        framesInFlight = DEFAULT_FRAMES_IN_FLIGHT,
+        framesInFlight,
+        maxFramesInFlight,
         mode = STAGING_MODE.WRITE_BUFFER,
         minWarmChunks = DEFAULT_MIN_WARM_CHUNKS,
         idleEvictFrames = DEFAULT_IDLE_EVICT_FRAMES,
+        idleShrinkFrames = DEFAULT_IDLE_SHRINK_FRAMES,
         maxLargeSlabs = DEFAULT_MAX_LARGE_SLABS,
         maxSlabsPerBucket,
         maxPerBucket,
@@ -447,9 +451,31 @@
             ? maxPooledBytes
             : DEFAULT_MAX_POOL_BYTES;
 
-      assertPositiveInteger(framesInFlight, 'framesInFlight');
+      if (framesInFlight !== undefined) {
+        assertPositiveInteger(framesInFlight, 'framesInFlight');
+      }
+      if (maxFramesInFlight !== undefined) {
+        assertPositiveInteger(maxFramesInFlight, 'maxFramesInFlight');
+      }
+      if (
+        framesInFlight !== undefined &&
+        maxFramesInFlight !== undefined &&
+        framesInFlight !== maxFramesInFlight
+      ) {
+        throw new RangeError(
+          `Conflicting framesInFlight (${framesInFlight}) and maxFramesInFlight (${maxFramesInFlight})`
+        );
+      }
+      const resolvedFramesInFlight =
+        maxFramesInFlight !== undefined
+          ? maxFramesInFlight
+          : framesInFlight !== undefined
+            ? framesInFlight
+            : DEFAULT_FRAMES_IN_FLIGHT;
+
       assertNonNegativeInteger(minWarmChunks, 'minWarmChunks');
       assertNonNegativeInteger(idleEvictFrames, 'idleEvictFrames');
+      assertNonNegativeInteger(idleShrinkFrames, 'idleShrinkFrames');
       assertNonNegativeInteger(maxLargeSlabs, 'maxLargeSlabs');
       assertPositiveInteger(maxBucketBytes, 'maxBucketBytes');
 
@@ -570,10 +596,12 @@
       this.chunkSize = resolvedChunkSize;
       this.maxPoolBytes = resolvedMaxPoolBytes;
       this.maxPooledBytes = resolvedMaxPoolBytes;
-      this.framesInFlight = framesInFlight;
+      this.framesInFlight = resolvedFramesInFlight;
+      this.maxFramesInFlight = resolvedFramesInFlight;
       this.mode = mode;
       this.minWarmChunks = minWarmChunks;
       this.idleEvictFrames = idleEvictFrames;
+      this.idleShrinkFrames = idleShrinkFrames;
       this.maxLargeSlabs = maxLargeSlabs;
       this.maxSlabsPerBucket = resolvedMaxSlabsPerBucket;
       this.bucketStrategy = resolvedBucketStrategy;
@@ -626,6 +654,9 @@
       this._alignPadCount = initialAlignPads;
       this._sabCopyCount = 0;
       this._doubleReleaseIgnored = 0;
+      this._subAllocCoalesced = 0;
+      this._idleSlabShrinks = 0;
+      this._stallAvoidedCount = 0;
 
       // Upload throughput & per-frame telemetry.
       this._framesCompleted = 0;
@@ -683,6 +714,7 @@
 
     _putIntoRecycled(chunk) {
       chunk.cursor = 0;
+      chunk.subAllocCount = 0;
       chunk.retiredAtFrame = -1;
       chunk.gpuDone = false;
       chunk.readyToRecycle = false;
@@ -821,6 +853,7 @@
         buffer,
         size: allocSize,
         cursor: 0,
+        subAllocCount: 0,
         oversized,
         isLargeSlab,
         slabBucketSize,
@@ -992,10 +1025,104 @@
     recycleCompleted() {
       this._assertNotDestroyed();
       const recycled = this._reclaimCompletedInFlight(true);
+      if (this.idleShrinkFrames > 0) {
+        this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+      }
       if (this.idleEvictFrames > 0) {
         this.reclaimIdleChunks(this.idleEvictFrames);
       }
       return recycled;
+    }
+
+    /**
+     * Destroy and remove idle recycled oversized / large staging slabs
+     * (`chunk.oversized || chunk.isLargeSlab`) whose
+     * `currentFrame - chunk.lastUsedFrame >= maxIdleFrames`.
+     *
+     * Keeps standard steady-state bump-allocation chunks warm while releasing
+     * transient boot-time or cutscene oversized slabs to keep GPU process RAM bounded.
+     * Never touches active or in-flight slabs.
+     *
+     * @param {number} [maxIdleFrames]
+     * @returns {{ shrunkSlabs: number, shrunkBytes: number }}
+     */
+    shrinkIdleOversizedSlabs(maxIdleFrames) {
+      this._assertNotDestroyed();
+
+      let threshold;
+      if (maxIdleFrames === undefined) {
+        if (this.idleShrinkFrames <= 0) {
+          return { shrunkSlabs: 0, shrunkBytes: 0 };
+        }
+        threshold = this.idleShrinkFrames;
+      } else {
+        assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+        threshold = maxIdleFrames;
+      }
+
+      const currentFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+      const candidates = [];
+
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        const chunk = this._recycledChunks[i];
+        if (
+          chunk &&
+          !chunk.destroyed &&
+          chunk.state === 'recycled' &&
+          (chunk.oversized || chunk.isLargeSlab) &&
+          currentFrame - chunk.lastUsedFrame >= threshold
+        ) {
+          candidates.push(chunk);
+        }
+      }
+
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const slab = bucket[i];
+          if (
+            slab &&
+            !slab.destroyed &&
+            slab.state === 'recycled' &&
+            (slab.oversized || slab.isLargeSlab) &&
+            currentFrame - slab.lastUsedFrame >= threshold
+          ) {
+            candidates.push(slab);
+          }
+        }
+      }
+
+      if (candidates.length === 0) {
+        return { shrunkSlabs: 0, shrunkBytes: 0 };
+      }
+
+      candidates.sort(compareEvictionLru);
+
+      let shrunkSlabs = 0;
+      let shrunkBytes = 0;
+      for (let i = 0; i < candidates.length; i += 1) {
+        const chunk = candidates[i];
+        if (chunk.destroyed || chunk.state !== 'recycled') {
+          continue;
+        }
+        const byteSize = chunk.size;
+        const wasLargeSlab = chunk.isLargeSlab;
+        this._destroyChunk(chunk);
+        if (wasLargeSlab) {
+          this._largeSlabEvictions += 1;
+        }
+        this._evictedCount += 1;
+        this._evictedBytes += byteSize;
+        this._idleSlabShrinks += 1;
+        shrunkSlabs += 1;
+        shrunkBytes += byteSize;
+      }
+
+      if (shrunkSlabs > 0) {
+        this._reclaimedChunks += shrunkSlabs;
+        this._reclaimedBytes += shrunkBytes;
+      }
+
+      return { shrunkSlabs, shrunkBytes };
     }
 
     /**
@@ -1170,6 +1297,7 @@
         }
         if (slab && !slab.destroyed && slab.state === 'recycled') {
           slab.cursor = 0;
+          slab.subAllocCount = 0;
           slab.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
           slab.lastUsedSeq = ++this._lruSeq;
           slab.retiredAtFrame = -1;
@@ -1196,6 +1324,9 @@
         this._bytesReused += recycled.size;
         this._activeChunks.push(recycled);
         this._lastAcquireFresh = false;
+        if (this._inFlightChunks.length > 0) {
+          this._stallAvoidedCount += 1;
+        }
         return recycled;
       }
 
@@ -1204,6 +1335,9 @@
       this._largeSlabMisses += 1;
       this._activeChunks.push(created);
       this._lastAcquireFresh = true;
+      if (this._inFlightChunks.length > 0) {
+        this._stallAvoidedCount += 1;
+      }
       return created;
     }
 
@@ -1257,6 +1391,7 @@
       }
       this._recycledChunks.pop();
       chunk.cursor = 0;
+      chunk.subAllocCount = 0;
       chunk.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
       chunk.lastUsedSeq = ++this._lruSeq;
       chunk.retiredAtFrame = -1;
@@ -1283,6 +1418,9 @@
         this._bytesReused += recycled.size;
         this._activeChunks.push(recycled);
         this._lastAcquireFresh = false;
+        if (this._inFlightChunks.length > 0) {
+          this._stallAvoidedCount += 1;
+        }
         return recycled;
       }
 
@@ -1290,6 +1428,9 @@
       this._bufferReuseMisses += 1;
       this._activeChunks.push(created);
       this._lastAcquireFresh = true;
+      if (this._inFlightChunks.length > 0) {
+        this._stallAvoidedCount += 1;
+      }
       return created;
     }
 
@@ -1446,6 +1587,10 @@
       this._inFlightChunks = stillInFlight;
 
       const capReclaim = this._enforceLargeSlabCap();
+      let shrinkReclaim = { shrunkSlabs: 0, shrunkBytes: 0 };
+      if (this.idleShrinkFrames > 0) {
+        shrinkReclaim = this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+      }
       let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
       if (this.idleEvictFrames > 0) {
         idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
@@ -1456,8 +1601,12 @@
         recycledCount,
         recycledChunks: this._getRecycledCount(),
         inFlightChunks: this._inFlightChunks.length,
-        reclaimedChunks: capReclaim.reclaimedChunks + idleReclaim.reclaimedChunks,
-        reclaimedBytes: capReclaim.reclaimedBytes + idleReclaim.reclaimedBytes,
+        reclaimedChunks:
+          capReclaim.reclaimedChunks + shrinkReclaim.shrunkSlabs + idleReclaim.reclaimedChunks,
+        reclaimedBytes:
+          capReclaim.reclaimedBytes + shrinkReclaim.shrunkBytes + idleReclaim.reclaimedBytes,
+        shrunkSlabs: shrinkReclaim.shrunkSlabs,
+        shrunkBytes: shrinkReclaim.shrunkBytes,
       };
     }
 
@@ -1594,6 +1743,10 @@
       this._attachWorkDoneFence(retiredChunks);
 
       const capReclaim = this._enforceLargeSlabCap();
+      let shrinkReclaim = { shrunkSlabs: 0, shrunkBytes: 0 };
+      if (this.idleShrinkFrames > 0) {
+        shrinkReclaim = this.shrinkIdleOversizedSlabs(this.idleShrinkFrames);
+      }
       let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
       if (this.idleEvictFrames > 0) {
         idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
@@ -1607,8 +1760,12 @@
         bytesUploaded: this._frameBytesUploaded,
         inFlightChunks: this._inFlightChunks.length,
         recycledChunks: this._getRecycledCount(),
-        reclaimedChunks: capReclaim.reclaimedChunks + idleReclaim.reclaimedChunks,
-        reclaimedBytes: capReclaim.reclaimedBytes + idleReclaim.reclaimedBytes,
+        reclaimedChunks:
+          capReclaim.reclaimedChunks + shrinkReclaim.shrunkSlabs + idleReclaim.reclaimedChunks,
+        reclaimedBytes:
+          capReclaim.reclaimedBytes + shrinkReclaim.shrunkBytes + idleReclaim.reclaimedBytes,
+        shrunkSlabs: shrinkReclaim.shrunkSlabs,
+        shrunkBytes: shrinkReclaim.shrunkBytes,
       };
 
       this._inFrame = false;
@@ -1654,12 +1811,14 @@
         isFreshBuffer = this._lastAcquireFresh;
         offset = 0;
         chunk.cursor = alignedSize;
+        chunk.subAllocCount = 1;
       } else if (isOversized) {
         // Dedicated oversized chunk; preserve _currentChunk for smaller allocations.
         chunk = this._acquireChunk(alignedSize, true);
         isFreshBuffer = this._lastAcquireFresh;
         offset = 0;
         chunk.cursor = alignedSize;
+        chunk.subAllocCount = 1;
       } else {
         if (this._currentChunk && !this._currentChunk.destroyed && this._currentChunk.state === 'active') {
           const candidateOffset = alignUp(this._currentChunk.cursor, effectiveAlignment);
@@ -1667,7 +1826,9 @@
             chunk = this._currentChunk;
             offset = candidateOffset;
             chunk.cursor = offset + alignedSize;
+            chunk.subAllocCount += 1;
             isFreshBuffer = false;
+            this._subAllocCoalesced += 1;
           }
         }
 
@@ -1676,6 +1837,7 @@
           isFreshBuffer = this._lastAcquireFresh;
           offset = 0;
           chunk.cursor = alignedSize;
+          chunk.subAllocCount = 1;
           this._currentChunk = chunk;
         }
       }
@@ -2068,6 +2230,11 @@
         alignPadCount: sanitizeNonNegativeCounter(this._alignPadCount),
         sabCopyCount: sanitizeNonNegativeCounter(this._sabCopyCount),
         doubleReleaseIgnored: sanitizeNonNegativeCounter(this._doubleReleaseIgnored),
+        maxFramesInFlight: this.maxFramesInFlight,
+        idleShrinkFrames: this.idleShrinkFrames,
+        subAllocCoalesced: sanitizeNonNegativeCounter(this._subAllocCoalesced),
+        idleSlabShrinks: sanitizeNonNegativeCounter(this._idleSlabShrinks),
+        stallAvoidedCount: sanitizeNonNegativeCounter(this._stallAvoidedCount),
         destroyed: this._destroyed,
       };
     }
@@ -2102,6 +2269,9 @@
       this._alignPadCount = 0;
       this._sabCopyCount = 0;
       this._doubleReleaseIgnored = 0;
+      this._subAllocCoalesced = 0;
+      this._idleSlabShrinks = 0;
+      this._stallAvoidedCount = 0;
       this._framesCompleted = 0;
       this._lastFrameBytesUploaded = 0;
       this._peakFrameBytesUploaded = 0;
@@ -2146,8 +2316,10 @@
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_POOL_BYTES,
     DEFAULT_FRAMES_IN_FLIGHT,
+    DEFAULT_MAX_FRAMES_IN_FLIGHT,
     DEFAULT_MIN_WARM_CHUNKS,
     DEFAULT_IDLE_EVICT_FRAMES,
+    DEFAULT_IDLE_SHRINK_FRAMES,
     DEFAULT_LARGE_SLAB_THRESHOLD,
     DEFAULT_MAX_LARGE_SLABS,
     DEFAULT_POW2_MIN_SLAB_BYTES,
