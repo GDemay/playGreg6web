@@ -672,3 +672,544 @@ test('W88 respects attachGlobalHook opt-out, frozen globalScope, and preserves r
   // Clean up test sentinel from globalThis.
   delete globalThis.__playgta6Telemetry;
 });
+
+test('W296 forwards 30 FPS frame timing, VRAM/bind-group/mailbox/JS heap telemetry into PerfMonitor, HudController, and GpuBootPanel', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { GpuBootPanelController } = require('../web/ui/gpu_boot_panel.js');
+  const { HudController } = await import('../web/ui/hud_controller.js');
+
+  const clock = createClock(40000);
+  const hudController = new HudController({ now: clock.now });
+
+  // Spy wrapper around a real HudController to confirm individual W289 methods are invoked.
+  const hookCalls = {
+    setFrameBudgetStats: [],
+    setMemoryStats: [],
+    setIoMailboxLanes: [],
+    updatePerfStats: [],
+  };
+  const origSetFrameBudget = hudController.setFrameBudgetStats.bind(hudController);
+  const origSetMemory = hudController.setMemoryStats.bind(hudController);
+  const origSetMailbox = hudController.setIoMailboxLanes.bind(hudController);
+  const origUpdatePerf = hudController.updatePerfStats.bind(hudController);
+  hudController.setFrameBudgetStats = (stats, opts) => {
+    hookCalls.setFrameBudgetStats.push(stats);
+    return origSetFrameBudget(stats, opts);
+  };
+  hudController.setMemoryStats = (stats, opts) => {
+    hookCalls.setMemoryStats.push(stats);
+    return origSetMemory(stats, opts);
+  };
+  hudController.setIoMailboxLanes = (lanes, opts) => {
+    hookCalls.setIoMailboxLanes.push(lanes);
+    return origSetMailbox(lanes, opts);
+  };
+  hudController.updatePerfStats = (stats, opts) => {
+    hookCalls.updatePerfStats.push(stats);
+    return origUpdatePerf(stats, opts);
+  };
+
+  const makeDomNode = (tag = 'div') => {
+    const attrs = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      children: [],
+      parentNode: null,
+      style: {},
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  };
+  const panelDocument = {
+    head: makeDomNode('head'),
+    createElement: (tag) => makeDomNode(tag),
+    querySelector: () => null,
+  };
+  const gpuBootPanel = new GpuBootPanelController({
+    container: makeDomNode('div'),
+    documentObj: panelDocument,
+    now: clock.now,
+  });
+
+  const { app, mockWorker } = createTestHost(
+    {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+    },
+    {
+      hudController,
+      gpuBootPanel,
+      performanceObj: {
+        memory: {
+          usedJSHeapSize: 128 * 1024 * 1024,
+          totalJSHeapSize: 256 * 1024 * 1024,
+          jsHeapSizeLimit: 2048 * 1024 * 1024,
+        },
+      },
+    }
+  );
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+
+    // 1. Within-budget frame + GPU VRAM/bind-group/mailbox metrics via gpu-stats.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        realPackDrawCount: 12,
+        presentCount: 1,
+        frameMs: 24.0,
+        gpuMs: 11.0,
+        cpuMs: 9.0,
+        ioWaitMs: 2.0,
+        shaderCompileMs: 2.0,
+        frameJitterMs: 1.45,
+        vramBudgetUtilization: 0.62,
+        bindGroupHitRate: 0.94,
+        mailboxLanes: 8,
+      },
+    });
+
+    assert.equal(app.perfMonitor.getSnapshot().fps30ComplianceRate, 1);
+    assert.equal(app.perfMonitor.getSnapshot().dominantBottleneck, 'within_budget');
+    assert.equal(hudController.getTelemetry().frameBudget.fps30ComplianceRate, 1);
+    assert.equal(hudController.getTelemetry().frameBudget.dominantBottleneck, 'within_budget');
+    assert.equal(hudController.getTelemetry().memory.jsHeapUsedMb, 128);
+    assert.equal(hudController.getTelemetry().memory.jsHeapTotalMb, 256);
+    assert.equal(hudController.getTelemetry().io.mailboxLanes, 8);
+
+    let panelState = gpuBootPanel.getState();
+    assert.equal(panelState.fps30ComplianceRate, 1);
+    assert.equal(panelState.frameJitterMs, 1.45);
+    assert.equal(panelState.jsHeapUsedMb, 128);
+    assert.equal(panelState.vramBudgetUtilization, 0.62);
+    assert.equal(panelState.bindGroupHitRate, 0.94);
+    assert.equal(panelState.mailboxLanes, 8);
+
+    // 2. Over-budget I/O-bound frame via perf-stats -> PerfMonitor computes 50% 30 FPS compliance & io_bound.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'perf-stats',
+        frameMs: 44.0,
+        ioWaitMs: 30.0,
+        gpuMs: 8.0,
+        cpuMs: 6.0,
+      },
+    });
+
+    assert.equal(app.perfMonitor.getSnapshot().fps30ComplianceRate, 0.5);
+    assert.equal(app.perfMonitor.getSnapshot().dominantBottleneck, 'io_bound');
+    assert.equal(hudController.getTelemetry().frameBudget.fps30ComplianceRate, 0.5);
+    assert.equal(hudController.getTelemetry().frameBudget.dominantBottleneck, 'io_bound');
+    assert.equal(gpuBootPanel.getState().fps30ComplianceRate, 0.5);
+
+    // 3. Dedicated io-stats and gpu-telemetry updates flow cleanly to HudController and GpuBootPanel.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'io-stats',
+        httpfsMailboxLanes: 6,
+      },
+    });
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameJitterMs: 2.1,
+        vramBudgetUtilization: 0.78,
+        bindGroupHitRate: 0.97,
+      },
+    });
+
+    assert.equal(hudController.getTelemetry().io.mailboxLanes, 6);
+    panelState = gpuBootPanel.getState();
+    assert.equal(panelState.frameJitterMs, 2.1);
+    assert.equal(panelState.vramBudgetUtilization, 0.78);
+    assert.equal(panelState.bindGroupHitRate, 0.97);
+    assert.equal(panelState.mailboxLanes, 6);
+
+    assert.ok(hookCalls.setFrameBudgetStats.length >= 2);
+    assert.ok(hookCalls.setMemoryStats.length >= 1);
+    assert.ok(hookCalls.setIoMailboxLanes.includes(8));
+    assert.ok(hookCalls.setIoMailboxLanes.includes(6));
+    assert.ok(hookCalls.updatePerfStats.length >= 3);
+
+    const snap = app.getBootTelemetry();
+    assert.equal(Object.isFrozen(snap.perf), true);
+    assert.equal(snap.fps30ComplianceRate, 0.5);
+    assert.equal(snap.dominantBottleneck, 'io_bound');
+    assert.equal(snap.frameJitterMs, 2.1);
+    assert.equal(snap.jsHeapUsedMb, 128);
+    assert.equal(snap.jsHeapTotalMb, 256);
+    assert.equal(snap.vramBudgetUtilization, 0.78);
+    assert.equal(snap.bindGroupHitRate, 0.97);
+    assert.equal(snap.mailboxLanes, 6);
+    assert.equal(snap.perf.fps30ComplianceRate, 0.5);
+    assert.equal(snap.perf.dominantBottleneck, 'io_bound');
+    assert.equal(snap.perf.vramBudgetUtilization, 0.78);
+    assert.equal(snap.perf.bindGroupHitRate, 0.97);
+    assert.equal(snap.perf.mailboxLanes, 6);
+
+    const diag = app.getDiagnosticsSnapshot();
+    assert.equal(diag.fps30ComplianceRate, 0.5);
+    assert.equal(diag.dominantBottleneck, 'io_bound');
+    assert.equal(diag.frameJitterMs, 2.1);
+    assert.equal(diag.jsHeapUsedMb, 128);
+    assert.equal(diag.vramBudgetUtilization, 0.78);
+    assert.equal(diag.bindGroupHitRate, 0.97);
+    assert.equal(diag.mailboxLanes, 6);
+  } finally {
+    hudController.destroy();
+    gpuBootPanel.destroy();
+    await app.destroy();
+  }
+});
+
+test('W296 ingests BootTracer fast-boot milestones (START_SCREEN, INTRO_VIDEO, MAIN_MENU, IN_GAME) from logs and worker events', async () => {
+  const clock = createClock(50000);
+  const panelUpdates = [];
+  const mockGpuBootPanel = {
+    update(payload) {
+      panelUpdates.push(payload);
+    },
+  };
+
+  const { app, mockWorker, broadcastInstances } = createTestHost(
+    {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+    },
+    {
+      now: clock.now,
+      gpuBootPanel: mockGpuBootPanel,
+    }
+  );
+
+  try {
+    await app.start();
+
+    // Reach FIRST_PRESENT via BroadcastChannel log.
+    clock.advance(500);
+    broadcastInstances[0].onmessage({
+      data: { label: '[boot] FIRST_PRESENT' },
+    });
+
+    // Failure log containing MAIN_MENU must NOT falsely record MAIN_MENU.
+    mockWorker.dispatch('message', {
+      data: { type: 'log', message: 'MAIN_MENU failed to initialize: timeout error' },
+    });
+    assert.equal(app.bootTracer.getSummary().bootToMainMenuMs, null);
+
+    // 1. Tagged log -> START_SCREEN (and PerfMonitor transitions to 'menu').
+    clock.advance(700);
+    mockWorker.dispatch('message', {
+      data: { type: 'log', message: '[boot] START_SCREEN ready (press any button)' },
+    });
+    assert.equal(app.bootTracer.getSummary().bootToStartScreenMs, 1200);
+    assert.equal(app.perfMonitor.currentPhase, 'menu');
+
+    // 2. Untagged BroadcastChannel label -> INTRO_VIDEO.
+    clock.advance(800);
+    broadcastInstances[0].onmessage({
+      data: { label: 'Opening intro video playback started' },
+    });
+    assert.equal(app.bootTracer.getSummary().bootToIntroVideoMs, 2000);
+
+    // 3. Explicit worker event -> MAIN_MENU with explicit elapsedMs.
+    mockWorker.dispatch('message', {
+      data: { type: 'main-menu', elapsedMs: 4200 },
+    });
+    assert.equal(app.bootTracer.getSummary().bootToMainMenuMs, 4200);
+    assert.equal(app.perfMonitor.currentPhase, 'menu');
+
+    // 4. Structured boot-milestone worker event -> IN_GAME (and PerfMonitor transitions to 'gameplay').
+    mockWorker.dispatch('message', {
+      data: { type: 'boot-milestone', milestone: 'IN_GAME', elapsedMs: 7500 },
+    });
+    assert.equal(app.bootTracer.getSummary().bootToInGameMs, 7500);
+    assert.equal(app.perfMonitor.currentPhase, 'gameplay');
+
+    // Verify all 4 fast-boot milestones surface in getBootTelemetry() and getDiagnosticsSnapshot().
+    const snap = app.getBootTelemetry();
+    assert.equal(snap.milestone, 'IN_GAME');
+    assert.equal(snap.bootToStartScreenMs, 1200);
+    assert.equal(snap.bootToIntroVideoMs, 2000);
+    assert.equal(snap.bootToMainMenuMs, 4200);
+    assert.equal(snap.bootToInGameMs, 7500);
+    assert.equal(Object.isFrozen(snap.fastBootMilestones), true);
+    assert.deepEqual(snap.fastBootMilestones, {
+      START_SCREEN: 1200,
+      INTRO_VIDEO: 2000,
+      MAIN_MENU: 4200,
+      IN_GAME: 7500,
+    });
+
+    const diag = app.getDiagnosticsSnapshot();
+    assert.equal(diag.bootToStartScreenMs, 1200);
+    assert.equal(diag.bootToIntroVideoMs, 2000);
+    assert.equal(diag.bootToMainMenuMs, 4200);
+    assert.equal(diag.bootToInGameMs, 7500);
+
+    // Panel received updates for fast-boot milestone progression.
+    assert.ok(panelUpdates.some((u) => u.bootSummary && u.bootSummary.stage === 'IN_GAME'));
+  } finally {
+    await app.destroy();
+  }
+});
+
+test('W296 queries StorageManager.getFastBootPlan() during boot and triggers runQuotaPressureEviction() when shouldEvictColdChunks is true', async () => {
+  const { BrowserStorageManager } = await import('../web/storage/storage_manager.js');
+
+  // Case A: Healthy storage plan (shouldEvictColdChunks: false) -> exposes plan, skips eviction.
+  {
+    const planCalls = [];
+    let evictionCalls = 0;
+    const postedMessages = [];
+    const customWorker = createFakeEventTarget({
+      postMessage(msg) {
+        postedMessages.push(msg);
+      },
+      terminate() {},
+    });
+
+    const mockStorageManager = {
+      async getFastBootPlan(opts) {
+        planCalls.push(opts);
+        return {
+          warmCacheReady: true,
+          recommendedSlabMaxBytes: 192 * 1024 * 1024,
+          recommendedOpfsBudgetBytes: 512 * 1024 * 1024,
+          quotaHeadroomBytes: 2 * 1024 * 1024 * 1024,
+          pressureLevel: 'low',
+          shouldEvictColdChunks: false,
+        };
+      },
+      async runQuotaPressureEviction() {
+        evictionCalls += 1;
+        return { evictedBytes: 0, evictedEntries: 0, ok: true };
+      },
+    };
+
+    const { app } = createTestHost(
+      { ok: true, coopCoep: true, hasWasmBinary: true },
+      {
+        storageManager: mockStorageManager,
+        createWasmWorker() {
+          return customWorker;
+        },
+      }
+    );
+
+    try {
+      const started = await app.start();
+      assert.equal(started.ok, true);
+      assert.equal(planCalls.length, 1);
+      assert.equal(evictionCalls, 0);
+
+      const plan = app.getFastBootPlan();
+      assert.equal(Object.isFrozen(plan), true);
+      assert.equal(plan.warmCacheReady, true);
+      assert.equal(plan.recommendedSlabMaxBytes, 192 * 1024 * 1024);
+      assert.equal(plan.pressureLevel, 'low');
+      assert.equal(plan.shouldEvictColdChunks, false);
+
+      const snap = app.getBootTelemetry();
+      assert.deepEqual(snap.fastBootPlan, plan);
+      assert.equal(snap.quotaEviction, null);
+      assert.equal(Object.isFrozen(snap.storage), true);
+      assert.deepEqual(snap.storage.fastBootPlan, plan);
+      assert.equal(snap.storage.quotaEviction, null);
+      assert.equal(postedMessages[0].recommendedSlabMaxBytes, 192 * 1024 * 1024);
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // Case B: Real BrowserStorageManager under high quota pressure -> triggers runQuotaPressureEviction() cleanly.
+  {
+    let evictToTargetBytes = null;
+    const mockOpfsCache = {
+      getStats() {
+        return {
+          initialized: true,
+          totalBytes: 200 * 1024 * 1024,
+          entryCount: 12,
+          shaderPackCount: 1,
+          rpfChunkCount: 11,
+        };
+      },
+      async evictToTarget(targetBytes) {
+        evictToTargetBytes = targetBytes;
+        return { evictedBytes: 64 * 1024 * 1024, evictedEntries: 4, ok: true };
+      },
+    };
+
+    const realStorageManager = new BrowserStorageManager({
+      storageObj: {
+        async estimate() {
+          return {
+            usage: 900 * 1024 * 1024,
+            quota: 1000 * 1024 * 1024,
+          };
+        },
+        async persisted() {
+          return true;
+        },
+        async getDirectory() {
+          return null;
+        },
+      },
+      opfsRoot: null,
+    });
+    realStorageManager.attachOpfsCache(mockOpfsCache);
+    // Simulate OPFS supported via warmBootReadiness while delegating eviction to attached opfsCache.
+    const origGetFastBootPlan = realStorageManager.getFastBootPlan.bind(realStorageManager);
+    realStorageManager.getFastBootPlan = (opts) =>
+      origGetFastBootPlan({
+        ...opts,
+        warmBootReadiness: {
+          opfsSupported: true,
+          warmBootReady: true,
+          quotaBytes: 1000 * 1024 * 1024,
+          usageBytes: 900 * 1024 * 1024,
+          cachedBytes: 200 * 1024 * 1024,
+        },
+      });
+
+    const { app } = createTestHost(
+      { ok: true, coopCoep: true, hasWasmBinary: true },
+      { storageManager: realStorageManager }
+    );
+
+    try {
+      const started = await app.start();
+      assert.equal(started.ok, true);
+
+      const plan = app.getFastBootPlan();
+      assert.equal(plan.pressureLevel, 'critical');
+      assert.equal(plan.shouldEvictColdChunks, true);
+      assert.ok(evictToTargetBytes > 0);
+
+      const snap = app.getBootTelemetry();
+      assert.equal(Object.isFrozen(snap.quotaEviction), true);
+      assert.deepEqual(snap.quotaEviction, {
+        triggered: true,
+        ok: true,
+        evictedBytes: 64 * 1024 * 1024,
+        evictedEntries: 4,
+      });
+      assert.deepEqual(snap.storage.quotaEviction, snap.quotaEviction);
+    } finally {
+      await app.destroy();
+    }
+  }
+});
+
+test('W296 defensive feature checks tolerate legacy mocks and sanitize hostile/NaN telemetry safely', async () => {
+  const legacyPerfMonitor = {};
+  const markedMilestones = [];
+  const legacyBootTracer = {
+    markMilestone(name) {
+      markedMilestones.push(name);
+    },
+    getSummary() {
+      return { stage: 'FIRST_PRESENT' };
+    },
+  };
+  const throwingStorageManager = {
+    async getFastBootPlan() {
+      throw new Error('quota API exploded');
+    },
+  };
+  const throwingHudController = {
+    setFrameBudgetStats() {
+      throw new Error('frameBudget HUD crash');
+    },
+    setMemoryStats() {
+      throw new Error('memory HUD crash');
+    },
+    setIoMailboxLanes() {
+      throw new Error('mailbox HUD crash');
+    },
+    updatePerfStats() {
+      throw new Error('perf HUD crash');
+    },
+  };
+
+  const { app, mockWorker } = createTestHost(
+    { ok: true, coopCoep: true, hasWasmBinary: true },
+    {
+      perfMonitor: legacyPerfMonitor,
+      bootTracer: legacyBootTracer,
+      storageManager: throwingStorageManager,
+      hudController: throwingHudController,
+    }
+  );
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    assert.equal(app.getFastBootPlan(), null);
+
+    // Hostile / out-of-range / NaN telemetry must sanitize safely without throwing.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'perf-stats',
+        fps30ComplianceRate: 99,
+        dominantBottleneck: '<script>alert(1)</script>',
+        frameJitterMs: Number.POSITIVE_INFINITY,
+        vramBudgetUtilization: -5,
+        bindGroupHitRate: Number.NaN,
+        jsHeapUsedMb: -100,
+        mailboxLanes: 0,
+      },
+    });
+
+    // Legacy bootTracer without recordMainMenu falls back to markMilestone('MAIN_MENU').
+    mockWorker.dispatch('message', {
+      data: { type: 'main-menu', elapsedMs: 3100 },
+    });
+    assert.ok(markedMilestones.includes('MAIN_MENU'));
+
+    const snap = app.getBootTelemetry();
+    assert.equal(snap.fps30ComplianceRate, 1);
+    assert.equal(snap.dominantBottleneck, null);
+    assert.equal(snap.frameJitterMs, null);
+    assert.equal(snap.vramBudgetUtilization, 0);
+    assert.equal(snap.bindGroupHitRate, null);
+    assert.equal(snap.jsHeapUsedMb, null);
+    assert.equal(snap.mailboxLanes, null);
+    assert.equal(snap.bootToMainMenuMs, 3100);
+  } finally {
+    await app.destroy();
+  }
+});
