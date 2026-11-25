@@ -343,6 +343,7 @@ pub(super) fn lift(
         dead_after: flag_liveness::dead_after(func, flag_summaries),
         dead_flags: 0,
         known: Known::default(),
+        edge_known: Vec::new(),
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -491,6 +492,9 @@ struct FunctionLifter<'a> {
     /// to the function and never escape, so a later load in the same block reads exactly that
     /// value; every store is still emitted. Cleared at each new block (see [`Self::start_block`]).
     known: Known,
+    /// [`Self::known`] at each branch emitted so far into a block of this function, as
+    /// `(target, known)`: a block whose only predecessor is such an edge starts with it.
+    edge_known: Vec<(u64, Known)>,
 }
 
 /// See [`FunctionLifter::known`].
@@ -509,6 +513,7 @@ struct Checkpoint {
     has_shared_ret: bool,
     support: BTreeSet<Support>,
     known: Known,
+    edge_known: usize,
 }
 
 impl FunctionLifter<'_> {
@@ -527,9 +532,26 @@ impl FunctionLifter<'_> {
                     .filter_map(move |edge| edge.intra_target().filter(|&target| target <= start))
             })
             .collect();
+        // Incoming edges per block: CFG edges, the function entry and resume-protocol re-entry.
+        let mut preds: BTreeMap<u64, usize> = BTreeMap::new();
+        for block in func.blocks.values() {
+            for target in block.successors.iter().filter_map(Edge::intra_target) {
+                *preds.entry(target).or_default() += 1;
+            }
+        }
+        for &target in std::iter::once(&func.entry).chain(&func.resume_targets) {
+            *preds.entry(target).or_default() += 1;
+        }
         for (&start, block) in &func.blocks {
             let label = block_label(start);
             self.start_block(&label);
+            // Extended basic block: with a single incoming edge, already lifted, the values the
+            // predecessor's branch knew dominate this block and the allocas still hold them.
+            if preds.get(&start) == Some(&1)
+                && let Some(at) = self.edge_known.iter().position(|(t, _)| *t == start)
+            {
+                self.known = self.edge_known.swap_remove(at).1;
+            }
             if loop_heads.contains(&start) {
                 self.emit(crate::lift::LOOP_BARRIER);
             }
@@ -636,7 +658,10 @@ impl FunctionLifter<'_> {
             return Ok(exit_label(target));
         }
         match edge.intra_target() {
-            Some(target) if self.func.blocks.contains_key(&target) => Ok(block_label(target)),
+            Some(target) if self.func.blocks.contains_key(&target) => {
+                self.edge_known.push((target, self.known.clone()));
+                Ok(block_label(target))
+            }
             Some(target) => Err(InsnError::Cfg(LiftError::UnknownSuccessor {
                 block: block.start,
                 target,
@@ -815,6 +840,7 @@ impl FunctionLifter<'_> {
             has_shared_ret: self.has_shared_ret,
             support: self.support.clone(),
             known: self.known.clone(),
+            edge_known: self.edge_known.len(),
         }
     }
 
@@ -827,6 +853,7 @@ impl FunctionLifter<'_> {
         self.has_shared_ret = checkpoint.has_shared_ret;
         self.support = checkpoint.support;
         self.known = checkpoint.known;
+        self.edge_known.truncate(checkpoint.edge_known);
     }
 
     fn trap_unsupported(&mut self, ins: &Instruction, reason: String) {
@@ -2207,6 +2234,7 @@ impl FunctionLifter<'_> {
                     }));
                 }
                 let _ = write!(arms, " i64 {}, label %{}", imm(case, 64), block_label(case));
+                self.edge_known.push((case, self.known.clone()));
             }
             let dispatch = self.new_label("dispatch");
             self.emit(&format!("switch i64 {target}, label %{dispatch} [{arms} ]"));

@@ -661,6 +661,34 @@ fn register_and_flag_allocas_are_forwarded_within_a_block() {
     assert!(ir.contains("i32 0, i64 0\n"), "{ir}");
 }
 
+#[test]
+fn register_values_are_forwarded_into_single_predecessor_blocks() {
+    let func = asm_function(0x1000, |a| {
+        let mut skip = a.create_label();
+        a.add(rax, rcx)?;
+        a.test(rax, rax)?;
+        a.jz(skip)?;
+        a.add(rax, rdx)?;
+        a.set_label(&mut skip)?;
+        a.add(rax, 1)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    let rax_loads = |body: &str| body.matches(" = load i64, ptr %rax\n").count();
+    // The fall-through block has the `jz` block as its only predecessor and reuses its rax.
+    let labels: Vec<&str> = ir
+        .lines()
+        .filter_map(|l| l.strip_suffix(':'))
+        .filter(|l| l.starts_with("bb_"))
+        .collect();
+    assert_eq!(labels.len(), 3, "{ir}");
+    assert_eq!(rax_loads(&block_text(ir, labels[0])), 1, "{ir}");
+    assert_eq!(rax_loads(&block_text(ir, labels[1])), 0, "{ir}");
+    // The join has two predecessors and reloads the alloca.
+    assert_eq!(rax_loads(&block_text(ir, labels[2])), 1, "{ir}");
+}
+
 /// A block built by hand (for CFG shapes discovery never produces).
 fn block(
     start: u64,
