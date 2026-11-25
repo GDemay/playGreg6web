@@ -4,6 +4,8 @@
 
 export const DEFAULT_WINDOW_SIZE = 120;
 export const DEFAULT_JANK_THRESHOLD_MS = 33.34;
+export const DEFAULT_TARGET_FPS = 30;
+export const DEFAULT_FRAME_BUDGET_MS = 33.333;
 export const DEFAULT_HUD_INTERVAL_MS = 250;
 export const BYTES_PER_MB = 1024 * 1024;
 export const PERF_PHASES = Object.freeze({
@@ -11,6 +13,13 @@ export const PERF_PHASES = Object.freeze({
   LOADING_ASSETS: 'loading_assets',
   GAMEPLAY: 'gameplay',
   MENU: 'menu',
+});
+export const FRAME_BOTTLENECKS = Object.freeze({
+  WITHIN_BUDGET: 'within_budget',
+  IO_BOUND: 'io_bound',
+  SHADER_COMPILE_BOUND: 'shader_compile_bound',
+  GPU_BOUND: 'gpu_bound',
+  CPU_BOUND: 'cpu_bound',
 });
 
 const PERF_PHASE_VALUES = Object.freeze(Object.values(PERF_PHASES));
@@ -54,6 +63,82 @@ function sanitizeNonNegativeNumber(value, fallback = 0) {
   return value;
 }
 
+function classifyFrameBottleneckComponents(
+  frameMs,
+  ioWaitMs,
+  shaderCompileMs,
+  gpuMs,
+  cpuMs,
+  budgetMs
+) {
+  if (frameMs <= budgetMs) {
+    return FRAME_BOTTLENECKS.WITHIN_BUDGET;
+  }
+
+  // Deterministic tie-breaking priority:
+  // io_bound > shader_compile_bound > gpu_bound > cpu_bound.
+  // Over-budget frames with no positive stage breakdown fall back to cpu_bound.
+  let winner = FRAME_BOTTLENECKS.CPU_BOUND;
+  let bestMs = cpuMs;
+
+  if (gpuMs > 0 && gpuMs >= bestMs) {
+    winner = FRAME_BOTTLENECKS.GPU_BOUND;
+    bestMs = gpuMs;
+  }
+  if (shaderCompileMs > 0 && shaderCompileMs >= bestMs) {
+    winner = FRAME_BOTTLENECKS.SHADER_COMPILE_BOUND;
+    bestMs = shaderCompileMs;
+  }
+  if (ioWaitMs > 0 && ioWaitMs >= bestMs) {
+    winner = FRAME_BOTTLENECKS.IO_BOUND;
+    bestMs = ioWaitMs;
+  }
+
+  return winner;
+}
+
+/**
+ * Deterministically classifies why a frame exceeded the target frame budget (default 33.333 ms / 30 FPS).
+ * Sanitizes NaN, Infinity, negative, or missing fields safely to 0.
+ *
+ * @param {object} [sample]
+ * @param {number} [sample.frameMs] Total wall-clock frame duration in milliseconds.
+ * @param {number} [sample.ioWaitMs] Time spent waiting on HTTP Range / OPFS / VFS I/O in ms.
+ * @param {number} [sample.shaderCompileMs] Time spent compiling WGSL shaders or WebGPU pipelines in ms.
+ * @param {number} [sample.gpuMs] GPU execution / submission time in ms.
+ * @param {number} [sample.cpuMs] CPU / Wasm simulation & command encoding time in ms.
+ * @param {number} [budgetMs=33.333] Target frame budget in milliseconds (defaults to 33.333 ms for 30 FPS).
+ * @returns {'within_budget'|'io_bound'|'shader_compile_bound'|'gpu_bound'|'cpu_bound'}
+ */
+export function classifyFrameBottleneck(sample, budgetMs = DEFAULT_FRAME_BUDGET_MS) {
+  const effectiveBudgetMs =
+    typeof budgetMs === 'number' && Number.isFinite(budgetMs) && budgetMs > 0
+      ? budgetMs
+      : DEFAULT_FRAME_BUDGET_MS;
+
+  if (!sample || typeof sample !== 'object') {
+    return FRAME_BOTTLENECKS.WITHIN_BUDGET;
+  }
+
+  const ioWaitMs = sanitizeNonNegativeNumber(sample.ioWaitMs, 0);
+  const shaderCompileMs = sanitizeNonNegativeNumber(sample.shaderCompileMs, 0);
+  const gpuMs = sanitizeNonNegativeNumber(sample.gpuMs, 0);
+  const cpuMs = sanitizeNonNegativeNumber(sample.cpuMs, 0);
+  const frameMs =
+    sample.frameMs !== undefined
+      ? sanitizeNonNegativeNumber(sample.frameMs, 0)
+      : ioWaitMs + shaderCompileMs + gpuMs + cpuMs;
+
+  return classifyFrameBottleneckComponents(
+    frameMs,
+    ioWaitMs,
+    shaderCompileMs,
+    gpuMs,
+    cpuMs,
+    effectiveBudgetMs
+  );
+}
+
 function percentileFromSorted(sorted, count, fraction) {
   if (count <= 0) {
     return 0;
@@ -75,6 +160,8 @@ export class PerfMonitor {
    * @param {object} [options]
    * @param {number} [options.windowSize=120] Fixed ring capacity for rolling frame statistics.
    * @param {number} [options.jankThresholdMs=33.34] Frame delta threshold above which a frame counts as jank.
+   * @param {number} [options.targetFps=30] Target frame rate for budget compliance tracking.
+   * @param {number} [options.budgetMs=33.333] Target per-frame budget in milliseconds.
    * @param {number} [options.gpuWindowSize] Fixed ring capacity for GPU batch rate aggregation (defaults to windowSize).
    * @param {number} [options.ioWindowSize] Fixed ring capacity for I/O throughput aggregation (defaults to windowSize).
    * @param {string} [options.initialPhase='boot'] Initial telemetry phase (`PERF_PHASES`).
@@ -90,6 +177,8 @@ export class PerfMonitor {
     const {
       windowSize = DEFAULT_WINDOW_SIZE,
       jankThresholdMs = DEFAULT_JANK_THRESHOLD_MS,
+      targetFps,
+      budgetMs,
       gpuWindowSize = windowSize,
       ioWindowSize = windowSize,
       initialPhase = PERF_PHASES.BOOT,
@@ -103,6 +192,27 @@ export class PerfMonitor {
     }
     if (typeof jankThresholdMs !== 'number' || !Number.isFinite(jankThresholdMs) || jankThresholdMs <= 0) {
       throw new RangeError(`jankThresholdMs must be a positive finite number, got ${jankThresholdMs}`);
+    }
+    let resolvedTargetFps = DEFAULT_TARGET_FPS;
+    let resolvedBudgetMs = DEFAULT_FRAME_BUDGET_MS;
+    if (targetFps !== undefined) {
+      if (typeof targetFps !== 'number' || !Number.isFinite(targetFps) || targetFps <= 0) {
+        throw new RangeError(`targetFps must be a positive finite number, got ${targetFps}`);
+      }
+      resolvedTargetFps = targetFps;
+      resolvedBudgetMs = Math.round((1000 / resolvedTargetFps) * 1000) / 1000;
+    }
+    if (budgetMs !== undefined) {
+      if (typeof budgetMs !== 'number' || !Number.isFinite(budgetMs) || budgetMs <= 0) {
+        throw new RangeError(`budgetMs must be a positive finite number, got ${budgetMs}`);
+      }
+      resolvedBudgetMs = budgetMs;
+      if (targetFps === undefined) {
+        resolvedTargetFps =
+          resolvedBudgetMs === DEFAULT_FRAME_BUDGET_MS
+            ? DEFAULT_TARGET_FPS
+            : 1000 / resolvedBudgetMs;
+      }
     }
     if (!Number.isInteger(gpuWindowSize) || gpuWindowSize < 1) {
       throw new RangeError(`gpuWindowSize must be a positive integer, got ${gpuWindowSize}`);
@@ -122,6 +232,8 @@ export class PerfMonitor {
 
     this._windowSize = windowSize;
     this._jankThresholdMs = jankThresholdMs;
+    this._targetFps = resolvedTargetFps;
+    this._budgetMs = resolvedBudgetMs;
     this._gpuWindowSize = gpuWindowSize;
     this._ioWindowSize = ioWindowSize;
     this._initialPhase = sanitizePhase(initialPhase, PERF_PHASES.BOOT);
@@ -133,6 +245,15 @@ export class PerfMonitor {
     this._frameDeltas = new Float64Array(windowSize);
     this._scratchSorted = new Float64Array(windowSize);
     this._frameDrawCalls = new Float64Array(windowSize);
+
+    // Pre-allocated bottleneck counter map (mutated in place on hot path).
+    this._bottleneckCounts = {
+      within_budget: 0,
+      io_bound: 0,
+      shader_compile_bound: 0,
+      gpu_bound: 0,
+      cpu_bound: 0,
+    };
 
     // Per-phase frame timing ring buffers (pre-allocated, zero allocations on hot path).
     this._phaseBuckets = Object.create(null);
@@ -167,6 +288,14 @@ export class PerfMonitor {
 
   get jankThresholdMs() {
     return this._jankThresholdMs;
+  }
+
+  get targetFps() {
+    return this._targetFps;
+  }
+
+  get budgetMs() {
+    return this._budgetMs;
   }
 
   get isHudAttached() {
@@ -210,6 +339,15 @@ export class PerfMonitor {
     this._jankFrames = 0;
     this._lastFrameTimestamp = null;
 
+    this._framesWithin30FpsBudget = 0;
+    this._framesOver30FpsBudget = 0;
+    this._bottleneckCounts.within_budget = 0;
+    this._bottleneckCounts.io_bound = 0;
+    this._bottleneckCounts.shader_compile_bound = 0;
+    this._bottleneckCounts.gpu_bound = 0;
+    this._bottleneckCounts.cpu_bound = 0;
+    this._lastBottleneck = FRAME_BOTTLENECKS.WITHIN_BUDGET;
+
     this._currentPhase = this._initialPhase;
     for (let i = 0; i < PERF_PHASE_VALUES.length; i += 1) {
       const bucket = this._phaseBuckets[PERF_PHASE_VALUES[i]];
@@ -249,10 +387,13 @@ export class PerfMonitor {
   }
 
   /**
-   * Internal zero-allocation helper to commit a frame delta to global and active-phase rings.
+   * Internal zero-allocation helper to commit a frame delta to global, active-phase,
+   * and 30 FPS budget / bottleneck counters.
    * @param {number} dtMs
+   * @param {object|null} [breakdown]
+   * @returns {'within_budget'|'io_bound'|'shader_compile_bound'|'gpu_bound'|'cpu_bound'}
    */
-  _pushFrameDelta(dtMs) {
+  _pushFrameDelta(dtMs, breakdown = null) {
     const safeDtMs = sanitizeNonNegativeNumber(dtMs, 0);
     this._frameDeltas[this._frameWriteIdx] = safeDtMs;
     this._frameWriteIdx += 1;
@@ -265,6 +406,40 @@ export class PerfMonitor {
     if (safeDtMs > this._jankThresholdMs) {
       this._jankFrames += 1;
     }
+
+    const ioWaitMs =
+      breakdown && typeof breakdown === 'object'
+        ? sanitizeNonNegativeNumber(breakdown.ioWaitMs, 0)
+        : 0;
+    const shaderCompileMs =
+      breakdown && typeof breakdown === 'object'
+        ? sanitizeNonNegativeNumber(breakdown.shaderCompileMs, 0)
+        : 0;
+    const gpuMs =
+      breakdown && typeof breakdown === 'object'
+        ? sanitizeNonNegativeNumber(breakdown.gpuMs, 0)
+        : 0;
+    const cpuMs =
+      breakdown && typeof breakdown === 'object'
+        ? sanitizeNonNegativeNumber(breakdown.cpuMs, 0)
+        : 0;
+
+    const bottleneck = classifyFrameBottleneckComponents(
+      safeDtMs,
+      ioWaitMs,
+      shaderCompileMs,
+      gpuMs,
+      cpuMs,
+      this._budgetMs
+    );
+
+    if (bottleneck === FRAME_BOTTLENECKS.WITHIN_BUDGET) {
+      this._framesWithin30FpsBudget += 1;
+    } else {
+      this._framesOver30FpsBudget += 1;
+    }
+    this._bottleneckCounts[bottleneck] += 1;
+    this._lastBottleneck = bottleneck;
 
     const phase = sanitizePhase(this._currentPhase, PERF_PHASES.BOOT);
     const bucket = this._phaseBuckets[phase];
@@ -279,6 +454,8 @@ export class PerfMonitor {
       }
       bucket.frameCount += 1;
     }
+
+    return bottleneck;
   }
 
   /**
@@ -308,9 +485,10 @@ export class PerfMonitor {
    * into the fixed-capacity Float64Array ring without heap allocations.
    *
    * @param {number} [timestampMs] Optional explicit timestamp (defaults to `now()`).
+   * @param {object} [breakdown] Optional stage breakdown `{ ioWaitMs, shaderCompileMs, gpuMs, cpuMs }` for bottleneck classification.
    * @returns {number|null} Recorded frame delta in ms, or null on the initial baseline frame.
    */
-  recordFrame(timestampMs) {
+  recordFrame(timestampMs, breakdown = null) {
     const ts =
       typeof timestampMs === 'number' && Number.isFinite(timestampMs)
         ? timestampMs
@@ -323,7 +501,7 @@ export class PerfMonitor {
     if (this._lastFrameTimestamp !== null) {
       const rawDelta = ts - this._lastFrameTimestamp;
       deltaMs = Number.isFinite(rawDelta) && rawDelta > 0 ? rawDelta : 0;
-      this._pushFrameDelta(deltaMs);
+      this._pushFrameDelta(deltaMs, breakdown);
     }
 
     this._lastFrameTimestamp = ts;
@@ -335,21 +513,69 @@ export class PerfMonitor {
    * Zero heap allocations on the hot path.
    *
    * @param {number} dtMs Non-negative finite frame duration in milliseconds.
+   * @param {object} [breakdown] Optional stage breakdown `{ ioWaitMs, shaderCompileMs, gpuMs, cpuMs }` for bottleneck classification.
    * @returns {number} Recorded frame delta in ms.
    */
-  recordFrameTimeMs(dtMs) {
+  recordFrameTimeMs(dtMs, breakdown = null) {
     if (typeof dtMs !== 'number' || !Number.isFinite(dtMs) || dtMs < 0) {
       throw new RangeError(`dtMs must be a non-negative finite number, got ${dtMs}`);
     }
 
     this._totalFrames += 1;
     this._commitFrameDrawCalls();
-    this._pushFrameDelta(dtMs);
+    this._pushFrameDelta(dtMs, breakdown);
 
     if (this._lastFrameTimestamp !== null) {
       this._lastFrameTimestamp += dtMs;
     }
     return dtMs;
+  }
+
+  /**
+   * Records a frame along with per-stage timing breakdown (`ioWaitMs`, `shaderCompileMs`,
+   * `gpuMs`, `cpuMs`) for 30 FPS budget compliance tracking and automatic bottleneck classification.
+   * Zero heap allocations on the hot path; NaN/negative values are safely sanitized to 0.
+   *
+   * @param {object} sample
+   * @param {number} [sample.frameMs] Total frame duration in ms.
+   * @param {number} [sample.timestampMs] Optional monotonic frame timestamp when `frameMs` is omitted.
+   * @param {number} [sample.ioWaitMs] Time spent waiting on I/O in ms.
+   * @param {number} [sample.shaderCompileMs] Time spent compiling shaders/pipelines in ms.
+   * @param {number} [sample.gpuMs] GPU time in ms.
+   * @param {number} [sample.cpuMs] CPU/Wasm time in ms.
+   * @returns {'within_budget'|'io_bound'|'shader_compile_bound'|'gpu_bound'|'cpu_bound'|null}
+   */
+  recordDetailedFrame(sample) {
+    if (!sample || typeof sample !== 'object') {
+      return null;
+    }
+
+    if (
+      sample.frameMs === undefined &&
+      typeof sample.timestampMs === 'number' &&
+      Number.isFinite(sample.timestampMs)
+    ) {
+      const deltaMs = this.recordFrame(sample.timestampMs, sample);
+      return deltaMs === null ? null : this._lastBottleneck;
+    }
+
+    const ioWaitMs = sanitizeNonNegativeNumber(sample.ioWaitMs, 0);
+    const shaderCompileMs = sanitizeNonNegativeNumber(sample.shaderCompileMs, 0);
+    const gpuMs = sanitizeNonNegativeNumber(sample.gpuMs, 0);
+    const cpuMs = sanitizeNonNegativeNumber(sample.cpuMs, 0);
+    const frameMs =
+      sample.frameMs !== undefined
+        ? sanitizeNonNegativeNumber(sample.frameMs, 0)
+        : ioWaitMs + shaderCompileMs + gpuMs + cpuMs;
+
+    this._totalFrames += 1;
+    this._commitFrameDrawCalls();
+    const bottleneck = this._pushFrameDelta(frameMs, sample);
+
+    if (this._lastFrameTimestamp !== null) {
+      this._lastFrameTimestamp += frameMs;
+    }
+    return bottleneck;
   }
 
   /**
@@ -556,7 +782,59 @@ export class PerfMonitor {
   }
 
   /**
-   * Computes a structured telemetry snapshot across frames, phases, GPU, I/O, and audio.
+   * Returns a fresh sanitized copy of cumulative bottleneck counts.
+   */
+  _copyBottleneckCounts() {
+    return {
+      within_budget: sanitizeNonNegativeNumber(this._bottleneckCounts.within_budget, 0),
+      io_bound: sanitizeNonNegativeNumber(this._bottleneckCounts.io_bound, 0),
+      shader_compile_bound: sanitizeNonNegativeNumber(this._bottleneckCounts.shader_compile_bound, 0),
+      gpu_bound: sanitizeNonNegativeNumber(this._bottleneckCounts.gpu_bound, 0),
+      cpu_bound: sanitizeNonNegativeNumber(this._bottleneckCounts.cpu_bound, 0),
+    };
+  }
+
+  /**
+   * Computes the dominant over-budget bottleneck, or `'within_budget'` when no
+   * over-budget frames have been observed.
+   *
+   * @param {{ io_bound: number, shader_compile_bound: number, gpu_bound: number, cpu_bound: number }} counts
+   * @returns {'within_budget'|'io_bound'|'shader_compile_bound'|'gpu_bound'|'cpu_bound'}
+   */
+  _computeDominantBottleneck(counts) {
+    const io = counts.io_bound;
+    const shader = counts.shader_compile_bound;
+    const gpu = counts.gpu_bound;
+    const cpu = counts.cpu_bound;
+
+    if (io === 0 && shader === 0 && gpu === 0 && cpu === 0) {
+      return FRAME_BOTTLENECKS.WITHIN_BUDGET;
+    }
+
+    // Deterministic tie-breaking matching classifyFrameBottleneck priority:
+    // io_bound > shader_compile_bound > gpu_bound > cpu_bound.
+    let winner = FRAME_BOTTLENECKS.CPU_BOUND;
+    let best = cpu;
+
+    if (gpu > 0 && gpu >= best) {
+      winner = FRAME_BOTTLENECKS.GPU_BOUND;
+      best = gpu;
+    }
+    if (shader > 0 && shader >= best) {
+      winner = FRAME_BOTTLENECKS.SHADER_COMPILE_BOUND;
+      best = shader;
+    }
+    if (io > 0 && io >= best) {
+      winner = FRAME_BOTTLENECKS.IO_BOUND;
+      best = io;
+    }
+
+    return winner;
+  }
+
+  /**
+   * Computes a structured telemetry snapshot across frames, 30 FPS budget/bottlenecks,
+   * phases, GPU, I/O, and audio.
    */
   getSnapshot() {
     const count = this._frameCount;
@@ -648,12 +926,41 @@ export class PerfMonitor {
       phases[phase] = this._computePhaseStats(this._phaseBuckets[phase]);
     }
 
+    const bottleneckCounts = this._copyBottleneckCounts();
+    const framesWithin30FpsBudget = sanitizeNonNegativeNumber(this._framesWithin30FpsBudget, 0);
+    const framesOver30FpsBudget = sanitizeNonNegativeNumber(this._framesOver30FpsBudget, 0);
+    const totalBudgetFrames = framesWithin30FpsBudget + framesOver30FpsBudget;
+    const rawComplianceRate =
+      totalBudgetFrames > 0 ? framesWithin30FpsBudget / totalBudgetFrames : 0;
+    const fps30ComplianceRate = Math.min(
+      1,
+      Math.max(0, sanitizeNonNegativeNumber(rawComplianceRate, 0))
+    );
+    const dominantBottleneck = this._computeDominantBottleneck(bottleneckCounts);
+
     return {
       timestampMs: this._now(),
       windowSize: this._windowSize,
       jankThresholdMs: this._jankThresholdMs,
+      targetFps: this._targetFps,
+      budgetMs: this._budgetMs,
+      framesWithin30FpsBudget,
+      framesOver30FpsBudget,
+      fps30ComplianceRate,
+      dominantBottleneck,
+      bottleneckCounts,
       currentPhase,
       phases,
+      budget: {
+        targetFps: this._targetFps,
+        budgetMs: this._budgetMs,
+        framesWithin30FpsBudget,
+        framesOver30FpsBudget,
+        fps30ComplianceRate,
+        dominantBottleneck,
+        lastBottleneck: this._lastBottleneck,
+        bottleneckCounts: { ...bottleneckCounts },
+      },
       frames: {
         fps,
         onePercentLowFps,
@@ -675,6 +982,13 @@ export class PerfMonitor {
         jankFrameCount: this._jankFrames,
         windowJankFrames,
         sampleCount: count,
+        targetFps: this._targetFps,
+        budgetMs: this._budgetMs,
+        framesWithin30FpsBudget,
+        framesOver30FpsBudget,
+        fps30ComplianceRate,
+        dominantBottleneck,
+        bottleneckCounts: { ...bottleneckCounts },
       },
       gpu: {
         gpuPacketsPerSec,
@@ -704,8 +1018,15 @@ export class PerfMonitor {
   }
 
   /**
+   * Alias for `getSnapshot()`, returning the complete sanitized telemetry & 30 FPS budget stats.
+   */
+  getStats() {
+    return this.getSnapshot();
+  }
+
+  /**
    * Returns a flat frame-pacing summary including rolling P50/P95/P99 frame times,
-   * average and 1% low FPS, and jank counters.
+   * average and 1% low FPS, jank counters, and 30 FPS budget / bottleneck metrics.
    */
   getSummary() {
     const snap = this.getSnapshot();
@@ -713,6 +1034,8 @@ export class PerfMonitor {
       timestampMs: snap.timestampMs,
       windowSize: snap.windowSize,
       jankThresholdMs: snap.jankThresholdMs,
+      targetFps: snap.targetFps,
+      budgetMs: snap.budgetMs,
       sampleCount: snap.frames.sampleCount,
       totalFrames: snap.frames.totalFrames,
       fps: snap.frames.fps,
@@ -733,6 +1056,11 @@ export class PerfMonitor {
       jankFrames: snap.frames.jankFrames,
       jankFrameCount: snap.frames.jankFrameCount,
       windowJankFrames: snap.frames.windowJankFrames,
+      framesWithin30FpsBudget: snap.framesWithin30FpsBudget,
+      framesOver30FpsBudget: snap.framesOver30FpsBudget,
+      fps30ComplianceRate: snap.fps30ComplianceRate,
+      dominantBottleneck: snap.dominantBottleneck,
+      bottleneckCounts: { ...snap.bottleneckCounts },
     };
   }
 
@@ -766,6 +1094,13 @@ export class PerfMonitor {
       jankFrames: snap.frames.jankFrames,
       jankFrameCount: snap.frames.jankFrameCount,
       windowJankFrames: snap.frames.windowJankFrames,
+      targetFps: snap.targetFps,
+      budgetMs: snap.budgetMs,
+      framesWithin30FpsBudget: snap.framesWithin30FpsBudget,
+      framesOver30FpsBudget: snap.framesOver30FpsBudget,
+      fps30ComplianceRate: snap.fps30ComplianceRate,
+      dominantBottleneck: snap.dominantBottleneck,
+      bottleneckCounts: { ...snap.bottleneckCounts },
       gpuPacketsPerSec: snap.gpu.gpuPacketsPerSec,
       drawCallsPerFrame: snap.gpu.drawCallsPerFrame,
       cacheHitRate: snap.io.cacheHitRate,
