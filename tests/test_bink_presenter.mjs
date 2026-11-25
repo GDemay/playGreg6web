@@ -40,6 +40,7 @@ function createMockWebGpuDevice() {
   let nextSamplerId = 1;
 
   const createdTextures = [];
+  const createdViews = [];
   const createdBuffers = [];
   const createdShaderModules = [];
   const createdBindGroupLayouts = [];
@@ -78,6 +79,7 @@ function createMockWebGpuDevice() {
         buffer,
         bufferOffset,
         data: bytes,
+        rawData: data,
       });
     },
     onSubmittedWorkDone() {
@@ -88,6 +90,7 @@ function createMockWebGpuDevice() {
   const device = {
     queue,
     createdTextures,
+    createdViews,
     createdBuffers,
     createdShaderModules,
     createdBindGroupLayouts,
@@ -107,9 +110,12 @@ function createMockWebGpuDevice() {
         label: desc.label,
         desc: { ...desc, size: { ...desc.size } },
         view,
+        createViewCalls: 0,
         destroyed: false,
         destroyCalls: 0,
         createView() {
+          this.createViewCalls += 1;
+          createdViews.push(view);
           return view;
         },
         destroy() {
@@ -1687,6 +1693,295 @@ test('W165: option validation rejects invalid chromaOrder, loadOp, storeOp, and 
       }),
     RangeError
   );
+
+  presenter.destroy();
+});
+
+test('W192: steady-state 4K (3840x2160) YUV420P frames perform 0 createTexture, 0 createView, 0 createBindGroup, and 0 uniform writeBuffer calls', () => {
+  const width = 3840;
+  const height = 2160;
+  const uvW = 1920;
+  const uvH = 1080;
+
+  const y = new Uint8Array(width * height);
+  const cr = new Uint8Array(uvW * uvH);
+  const cb = new Uint8Array(uvW * uvH);
+  const targetView = { kind: 'GPUTextureView', id: 'swap-4k-w192' };
+
+  // 1) Single-buffered steady-state over 8 consecutive 4K frames.
+  const singleDevice = createMockWebGpuDevice();
+  const singlePresenter = new BinkVideoPresenter({
+    device: singleDevice,
+    doubleBuffer: false,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+
+  // Frame 0 warms Y/U/V + dummy textures, views, bind group, and initial uniform write.
+  singlePresenter.uploadYuv420Frame({ y, u: cr, v: cb, width, height, chromaOrder: 'yvu' });
+  singlePresenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+
+  const warmTexSingle = singleDevice.createdTextures.length;
+  const warmViewSingle = singleDevice.createdViews.length;
+  const warmBgSingle = singleDevice.createdBindGroups.length;
+  const warmUniformSingle = singleDevice.writeBufferCalls.length;
+  assert.equal(warmTexSingle, 4); // Y, U, V + 1x1 dummy
+  assert.equal(warmViewSingle, 4);
+  assert.equal(warmBgSingle, 1);
+  assert.equal(warmUniformSingle, 1);
+  assert.equal(singlePresenter.bindGroupCacheHits, 0);
+  assert.equal(singlePresenter.bindGroupCacheMisses, 1);
+  assert.equal(singlePresenter.uniformWritesSkipped, 0);
+  assert.equal(singlePresenter.framesPresented, 1);
+
+  // Frames 1..7: strictly 0 texture, 0 view, 0 bindGroup, and 0 uniform writeBuffer calls.
+  for (let i = 1; i < 8; i += 1) {
+    singlePresenter.uploadYuv420Frame({ y, u: cr, v: cb, width, height, chromaOrder: 'yvu' });
+    const res = singlePresenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+    assert.equal(res.presented, true);
+    assert.equal(res.framesPresented, i + 1);
+  }
+
+  assert.equal(singleDevice.createdTextures.length, warmTexSingle);
+  assert.equal(singleDevice.createdViews.length, warmViewSingle);
+  assert.equal(singleDevice.createdBindGroups.length, warmBgSingle);
+  assert.equal(singleDevice.writeBufferCalls.length, warmUniformSingle);
+  for (const tex of singleDevice.createdTextures) {
+    assert.equal(tex.createViewCalls, 1);
+  }
+
+  const singleStats = singlePresenter.getStats();
+  assert.equal(singleStats.framesPresented, 8);
+  assert.equal(singleStats.bindGroupCacheHits, 7);
+  assert.equal(singleStats.bindGroupCacheMisses, 1);
+  assert.equal(singleStats.uniformWritesSkipped, 7);
+  assert.equal(singlePresenter.framesPresented, 8);
+  assert.equal(singlePresenter.bindGroupCacheHits, 7);
+  assert.equal(singlePresenter.bindGroupCacheMisses, 1);
+  assert.equal(singlePresenter.uniformWritesSkipped, 7);
+  singlePresenter.destroy();
+
+  // 2) Double-buffered steady-state over 10 consecutive 4K frames.
+  const doubleDevice = createMockWebGpuDevice();
+  const doublePresenter = new BinkVideoPresenter({
+    device: doubleDevice,
+    doubleBuffer: true,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+
+  // Frames 0 & 1 warm slot 0 and slot 1.
+  for (let i = 0; i < 2; i += 1) {
+    doublePresenter.uploadYuv420Frame({ y, u: cr, v: cb, width, height, chromaOrder: 'yvu' });
+    doublePresenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  }
+
+  const warmTexDouble = doubleDevice.createdTextures.length;
+  const warmViewDouble = doubleDevice.createdViews.length;
+  const warmBgDouble = doubleDevice.createdBindGroups.length;
+  const warmUniformDouble = doubleDevice.writeBufferCalls.length;
+  assert.equal(warmTexDouble, 7); // 2 slots * 3 planes + 1x1 dummy
+  assert.equal(warmViewDouble, 7);
+  assert.equal(warmBgDouble, 2);
+  assert.equal(warmUniformDouble, 1);
+  assert.equal(doublePresenter.bindGroupCacheHits, 0);
+  assert.equal(doublePresenter.bindGroupCacheMisses, 2);
+  assert.equal(doublePresenter.uniformWritesSkipped, 1);
+
+  // Frames 2..9: strictly 0 texture, 0 view, 0 bindGroup, and 0 uniform writeBuffer calls.
+  for (let i = 2; i < 10; i += 1) {
+    doublePresenter.uploadYuv420Frame({ y, u: cr, v: cb, width, height, chromaOrder: 'yvu' });
+    doublePresenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  }
+
+  assert.equal(doubleDevice.createdTextures.length, warmTexDouble);
+  assert.equal(doubleDevice.createdViews.length, warmViewDouble);
+  assert.equal(doubleDevice.createdBindGroups.length, warmBgDouble);
+  assert.equal(doubleDevice.writeBufferCalls.length, warmUniformDouble);
+
+  const doubleStats = doublePresenter.getStats();
+  assert.equal(doubleStats.framesPresented, 10);
+  assert.equal(doubleStats.bindGroupCacheHits, 8);
+  assert.equal(doubleStats.bindGroupCacheMisses, 2);
+  assert.equal(doubleStats.uniformWritesSkipped, 9);
+  assert.equal(doublePresenter.bindGroupCacheHits, 8);
+  assert.equal(doublePresenter.bindGroupCacheMisses, 2);
+  assert.equal(doublePresenter.uniformWritesSkipped, 9);
+  doublePresenter.destroy();
+});
+
+test('W192: bindGroup cache invalidates cleanly on chromaOrder and dimension changes while reusing cached texture views', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    doubleBuffer: false,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-invalidate' };
+
+  const y4k = new Uint8Array(3840 * 2160);
+  const c4k = new Uint8Array(1920 * 1080);
+
+  // Warm 4K YVU and verify 2 steady-state hits.
+  for (let i = 0; i < 3; i += 1) {
+    presenter.uploadYuv420Frame({ y: y4k, u: c4k, v: c4k, width: 3840, height: 2160 });
+    presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  }
+  assert.equal(device.createdTextures.length, 4);
+  assert.equal(device.createdViews.length, 4);
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(device.writeBufferCalls.length, 1);
+  assert.equal(presenter.bindGroupCacheHits, 2);
+  assert.equal(presenter.bindGroupCacheMisses, 1);
+  assert.equal(presenter.uniformWritesSkipped, 2);
+
+  // Switch chromaOrder from 'yvu' -> 'yuv' via per-frame option:
+  // 0 createTexture, 0 createView (reuses cached Y/U/V views), 1 new bindGroup, 1 uniform write.
+  presenter.uploadYuv420Frame({
+    y: y4k,
+    u: c4k,
+    v: c4k,
+    width: 3840,
+    height: 2160,
+    chromaOrder: BINK_CHROMA_ORDER.YUV,
+  });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  assert.equal(device.createdTextures.length, 4);
+  assert.equal(device.createdViews.length, 4);
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(device.writeBufferCalls.length, 2);
+  assert.equal(presenter.bindGroupCacheMisses, 2);
+  assert.equal(presenter.bindGroupCacheHits, 2);
+
+  // Verify the recreated bindGroup still binds the cached 4K Y/U/V views and cleared swap flag.
+  const bgAfterChroma = device.createdBindGroups[1].desc.entries;
+  assert.equal(bgAfterChroma.find((e) => e.binding === 2).resource, device.createdTextures[0].view);
+  assert.equal(bgAfterChroma.find((e) => e.binding === 3).resource, device.createdTextures[1].view);
+  assert.equal(bgAfterChroma.find((e) => e.binding === 4).resource, device.createdTextures[2].view);
+  const u32Yuv = new Uint32Array(
+    device.writeBufferCalls[1].data.buffer,
+    device.writeBufferCalls[1].data.byteOffset,
+    device.writeBufferCalls[1].data.byteLength / 4
+  );
+  assert.equal(u32Yuv[3] & UNIFORM_FLAG_SWAP_CHROMA, 0);
+
+  // Subsequent 'yuv' frame hits cache again (0 allocs, 0 uniform write).
+  presenter.uploadYuv420Frame({ y: y4k, u: c4k, v: c4k, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  assert.equal(device.createdTextures.length, 4);
+  assert.equal(device.createdViews.length, 4);
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(device.writeBufferCalls.length, 2);
+  assert.equal(presenter.bindGroupCacheHits, 3);
+  assert.equal(presenter.uniformWritesSkipped, 3);
+
+  // Switch chromaOrder via setChromaOrder('yvu') -> invalidates bindGroup cache without touching textures/views.
+  presenter.setChromaOrder(BINK_CHROMA_ORDER.YVU);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  assert.equal(device.createdTextures.length, 4);
+  assert.equal(device.createdViews.length, 4);
+  assert.equal(device.createdBindGroups.length, 3);
+  assert.equal(device.writeBufferCalls.length, 3);
+  assert.equal(presenter.bindGroupCacheMisses, 3);
+  assert.equal(presenter.bindGroupCacheHits, 3);
+
+  // Change dimensions 3840x2160 -> 1920x1080 with unchanged format & chromaOrder:
+  // Old 4K textures destroyed, 3 new textures + 3 new views + 1 new bindGroup, uniform write STILL skipped!
+  const oldY = device.createdTextures[0];
+  const oldU = device.createdTextures[1];
+  const oldV = device.createdTextures[2];
+  const y1080 = new Uint8Array(1920 * 1080);
+  const c1080 = new Uint8Array(960 * 540);
+
+  presenter.uploadYuv420Frame({ y: y1080, u: c1080, v: c1080, width: 1920, height: 1080 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+
+  assert.equal(oldY.destroyed, true);
+  assert.equal(oldU.destroyed, true);
+  assert.equal(oldV.destroyed, true);
+  assert.equal(device.createdTextures.length, 7);
+  assert.equal(device.createdViews.length, 7);
+  assert.equal(device.createdBindGroups.length, 4);
+  assert.equal(device.writeBufferCalls.length, 3); // uniform params unchanged -> write skipped!
+  assert.equal(presenter.bindGroupCacheMisses, 4);
+  assert.equal(presenter.uniformWritesSkipped, 4);
+
+  const bg1080 = device.createdBindGroups[3].desc.entries;
+  assert.equal(bg1080.find((e) => e.binding === 2).resource, device.createdTextures[4].view);
+  assert.equal(bg1080.find((e) => e.binding === 3).resource, device.createdTextures[5].view);
+  assert.equal(bg1080.find((e) => e.binding === 4).resource, device.createdTextures[6].view);
+
+  // Steady-state at 1920x1080 hits cache with 0 allocations and 0 uniform writes.
+  presenter.uploadYuv420Frame({ y: y1080, u: c1080, v: c1080, width: 1920, height: 1080 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  assert.equal(device.createdTextures.length, 7);
+  assert.equal(device.createdViews.length, 7);
+  assert.equal(device.createdBindGroups.length, 4);
+  assert.equal(device.writeBufferCalls.length, 3);
+  assert.equal(presenter.bindGroupCacheHits, 4);
+  assert.equal(presenter.uniformWritesSkipped, 5);
+  assert.equal(presenter.framesPresented, 8);
+
+  const stats = presenter.getStats();
+  assert.equal(stats.bindGroupCacheHits, 4);
+  assert.equal(stats.bindGroupCacheMisses, 4);
+  assert.equal(stats.uniformWritesSkipped, 5);
+  assert.equal(stats.framesPresented, 8);
+
+  presenter.destroy();
+});
+
+test('W192: uniform scratch Float32Array is pre-allocated and reused across updates while redundant writes are skipped', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, doubleBuffer: false });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-uniform-scratch' };
+
+  const y = new Uint8Array(16 * 8).fill(180);
+  const u = new Uint8Array(8 * 4).fill(128);
+  const v = new Uint8Array(8 * 4).fill(128);
+
+  // Frame 0: writes initial uniforms using pre-allocated Float32Array(24).
+  presenter.uploadYuv420Frame({ y, u, v, width: 16, height: 8 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device.writeBufferCalls.length, 1);
+  const scratchRef = device.writeBufferCalls[0].rawData;
+  assert.ok(scratchRef instanceof Float32Array);
+  assert.equal(scratchRef.length, UNIFORM_BUFFER_SIZE / 4);
+  assert.equal(scratchRef.byteLength, UNIFORM_BUFFER_SIZE);
+
+  // No-op setUvTransform(1, 1, 0, 0) + unchanged present -> skipped.
+  presenter.setUvTransform(1, 1, 0, 0);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device.writeBufferCalls.length, 1);
+  assert.equal(presenter.uniformWritesSkipped, 1);
+
+  // Toggle chromaOrder away and back before presenting -> bitwise match skips writeBuffer!
+  presenter.setChromaOrder(BINK_CHROMA_ORDER.YVU);
+  presenter.setChromaOrder(BINK_CHROMA_ORDER.YUV);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device.writeBufferCalls.length, 1);
+  assert.equal(presenter.uniformWritesSkipped, 2);
+
+  // Real parameter updates (opacity, colorSpace, colorRange, uvTransform) reuse the exact same Float32Array scratch instance.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { opacity: 0.75 });
+  presenter.setColorSpace(YUV_COLOR_SPACE.BT601, YUV_COLOR_RANGE.FULL);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { opacity: 0.75 });
+  presenter.setUvTransform(0.5, 0.5, 0.25, 0.25);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { opacity: 0.75 });
+
+  assert.equal(device.writeBufferCalls.length, 4);
+  for (let i = 1; i < device.writeBufferCalls.length; i += 1) {
+    assert.equal(
+      device.writeBufferCalls[i].rawData,
+      scratchRef,
+      `writeBuffer call ${i} should reuse the exact pre-allocated Float32Array scratch buffer`
+    );
+  }
+
+  // Subsequent frame with same opacity (0.75) skips writeBuffer again.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { opacity: 0.75 });
+  assert.equal(device.writeBufferCalls.length, 4);
+  assert.equal(presenter.uniformWritesSkipped, 3);
+  assert.equal(presenter.getStats().uniformWritesSkipped, 3);
+  assert.equal(presenter.getStats().framesPresented, 7);
 
   presenter.destroy();
 });
