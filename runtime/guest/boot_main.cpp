@@ -86,6 +86,7 @@
 #include "gpu/frame_capture.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
+#include "guest/host_input.h"
 #include "guest/input_script.h"
 #include "gpu/gpu_va_watch.h"
 #include "os/guest_heap.h"
@@ -185,7 +186,8 @@ struct Options {
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
-    std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
+    bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
+    std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
     std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
     // --wgpu-features: pso::WgpuFeature bits of the WebGPU device that replays the run. The bridge
     // picks texture formats (and whether guest texels can be uploaded as they are) by them; the
@@ -211,7 +213,7 @@ void usage() {
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
                  "                     [--native-pipelines] [--no-fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir under work/>]\n"
-                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
+                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
@@ -252,6 +254,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.no_fence_lag = true;
         } else if (a == "--eager-gpu-objects") {
             o.eager_gpu_objects = true;
+        } else if (a == "--host-input") {
+            o.host_input = true;
         } else if (a == "--native-pipelines") {
             o.native_pipelines = true;
         } else if (a == "-h" || a == "--help") {
@@ -1172,6 +1176,12 @@ int main(int argc, char** argv) {
         playgta6::os::scarlett::set_game_input_state(&script_input);
         script_player = std::make_unique<playgta6::guest::InputScriptPlayer>(std::move(events), &script_input);
         script_player->start();
+    } else if (g_options.host_input) {
+        static playgta6::InputState host_state{};
+        static playgta6::guest::host_input::HostInputSource host_source(&host_state);
+        playgta6::os::scarlett::set_game_input_state(&host_state);
+        host_source.start();
+        std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
     }
     start_watchdog();
     start_profile();

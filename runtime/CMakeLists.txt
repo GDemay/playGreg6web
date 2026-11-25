@@ -68,6 +68,7 @@ add_library(playgta6_core STATIC
     guest/memory_model.cpp
     guest/boot.cpp
     guest/input_script.cpp
+    guest/host_input.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
     os/xgamesave_local.cpp
@@ -305,6 +306,9 @@ else()
     add_executable(test_input_script ../tests/test_input_script.cpp)
     target_link_libraries(test_input_script PRIVATE playgta6_core)
     add_test(NAME playgta6_input_script_tests COMMAND test_input_script)
+    add_executable(test_host_input ../tests/test_host_input.cpp)
+    target_link_libraries(test_host_input PRIVATE playgta6_core)
+    add_test(NAME playgta6_host_input_tests COMMAND test_host_input)
 
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
