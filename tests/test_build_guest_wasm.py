@@ -447,7 +447,7 @@ class TestBuildOrchestrator(unittest.TestCase):
             self.assertEqual(report.outputs, (bgw.RUNTIME_JS, bgw.RUNTIME_WASM))
             self.assertTrue((root / "dist" / "runtime.js").is_file())
             self.assertTrue((root / "dist" / "runtime.wasm").is_file())
-            self.assertEqual(bgw.LINK_FLAGS, report.link_flags)
+            self.assertEqual((*bgw.LINK_FLAGS, "-sASSERTIONS=0", "-sSAFE_HEAP=0"), report.link_flags)
 
             compile_cmd = runner.compile_calls[0]
             self.assertIn("-sMEMORY64=1", compile_cmd)
@@ -4074,7 +4074,7 @@ var PThread = {
     def test_proxy_to_pthread_flag_api_and_cli_backwards_compatibility(self) -> None:
         # Default preserves existing flags identically (no -sPROXY_TO_PTHREAD=1).
         default_flags = bgw.resolve_link_flags()
-        self.assertEqual(default_flags, bgw.LINK_FLAGS)
+        self.assertEqual(default_flags, (*bgw.LINK_FLAGS, "-sASSERTIONS=0", "-sSAFE_HEAP=0"))
         self.assertNotIn("-sPROXY_TO_PTHREAD=1", default_flags)
         self.assertNotIn("-sPROXY_TO_PTHREAD=1", bgw.LINK_FLAGS)
 
