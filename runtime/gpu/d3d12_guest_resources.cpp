@@ -1259,23 +1259,41 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
     std::lock_guard<std::mutex> lock(relocation_mutex_);
     auto it = relocations_.find({va, size, need});
     if (it == relocations_.end()) {
-        // A fresh home: the chunk is zero-initialised and homes are never reused, so the bytes
-        // past `size` stay zero (zero-extension for WebGPU's minimum binding size, not data).
-        if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
-            relocation_buffer_ = allocate_id();
-            CommandEncoder enc;
-            enc.create_buffer(relocation_buffer_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, kChunk);
-            submit(enc);
-            relocation_used_ = 0;
+        constexpr size_t kMaxEntries = 8192;  // O36: per-draw VAs (ring-allocated constants) must not grow this forever
+        if (relocations_.size() >= kMaxEntries) {
+            auto lru = relocations_.begin();
+            for (auto i = relocations_.begin(); i != relocations_.end(); ++i) {
+                if (i->second.last_used_seq < lru->second.last_used_seq) lru = i;
+            }
+            relocation_free_[{lru->second.size, std::get<2>(lru->first)}].emplace_back(lru->second.buffer_id,
+                                                                                         lru->second.offset);
+            relocations_.erase(lru);
         }
         RelocatedUniform r;
         r.va = va;
         r.size = size;
-        r.buffer_id = relocation_buffer_;
-        r.offset = relocation_used_;
-        relocation_used_ += need;
+        auto& free_homes = relocation_free_[{size, need}];
+        if (!free_homes.empty()) {
+            r.buffer_id = free_homes.back().first;
+            r.offset = free_homes.back().second;
+            free_homes.pop_back();
+        } else {
+            // A fresh home: the chunk is zero-initialised, so the bytes past `size` stay zero
+            // (zero-extension for WebGPU's minimum binding size, not data).
+            if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
+                relocation_buffer_ = allocate_id();
+                CommandEncoder enc;
+                enc.create_buffer(relocation_buffer_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, kChunk);
+                submit(enc);
+                relocation_used_ = 0;
+            }
+            r.buffer_id = relocation_buffer_;
+            r.offset = relocation_used_;
+            relocation_used_ += need;
+        }
         it = relocations_.emplace(std::make_tuple(va, size, need), std::move(r)).first;
     }
+    it->second.last_used_seq = ++relocation_seq_;
     *buffer_id = it->second.buffer_id;
     *offset = it->second.offset;
     return true;
