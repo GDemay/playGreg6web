@@ -16,6 +16,7 @@ import argparse
 import http.client
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -30,6 +31,15 @@ from typing import Any, Callable, Mapping
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 WASM_MAGIC = b"\x00asm"
+DEFAULT_MIN_FREE_GB = 5.0
+BYTES_PER_GIB = 1024**3
+REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
+REFLECT_STAGE_ALIASES: Mapping[str, str] = {
+    "vertex": "vertex",
+    "fragment": "fragment",
+    "pixel": "fragment",
+    "compute": "compute",
+}
 
 TOOLCHAIN_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python", ("python", "python3")),
@@ -275,6 +285,105 @@ def check_local_env(
     }
 
 
+def _nearest_existing_dir(path: Path, fallback: Path) -> Path:
+    for candidate in (path, *path.parents):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return fallback
+
+
+def _probe_disk_target(
+    path: Path,
+    fallback: Path,
+    *,
+    min_free_gb: float,
+    disk_usage_fn: Callable[[Path], Any],
+) -> dict[str, Any]:
+    target = _nearest_existing_dir(path, fallback)
+    try:
+        usage = disk_usage_fn(target)
+        total_bytes = int(usage.total)
+        used_bytes = int(usage.used)
+        free_bytes = int(usage.free)
+    except OSError:
+        return {
+            "checked": False,
+            "totalBytes": None,
+            "usedBytes": None,
+            "freeBytes": None,
+            "freeGb": None,
+            "minFreeGb": round(float(min_free_gb), 2),
+            "lowSpace": False,
+            "ok": False,
+            "error": "disk usage unavailable",
+        }
+
+    free_gb = free_bytes / BYTES_PER_GIB
+    low_space = free_gb < min_free_gb
+    return {
+        "checked": True,
+        "totalBytes": total_bytes,
+        "usedBytes": used_bytes,
+        "freeBytes": free_bytes,
+        "freeGb": round(free_gb, 2),
+        "minFreeGb": round(float(min_free_gb), 2),
+        "lowSpace": low_space,
+        "ok": not low_space,
+        "error": None,
+    }
+
+
+def check_disk_space(
+    repo_root: Path,
+    work_dir: Path | None = None,
+    *,
+    min_free_gb: float = DEFAULT_MIN_FREE_GB,
+    disk_usage_fn: Callable[[Path], Any] | None = None,
+) -> dict[str, Any]:
+    """Check free disk space on the workspace and work drives (sanitized; never leaks paths)."""
+    if not math.isfinite(min_free_gb) or min_free_gb < 0:
+        raise ValueError("min_free_gb must be a finite non-negative number")
+
+    usage_fn = shutil.disk_usage if disk_usage_fn is None else disk_usage_fn
+    resolved_work = work_dir if work_dir is not None else (repo_root / "work")
+
+    workspace_info = _probe_disk_target(
+        repo_root,
+        repo_root,
+        min_free_gb=min_free_gb,
+        disk_usage_fn=usage_fn,
+    )
+    work_info = _probe_disk_target(
+        resolved_work,
+        repo_root,
+        min_free_gb=min_free_gb,
+        disk_usage_fn=usage_fn,
+    )
+
+    checked_free = [
+        info["freeBytes"]
+        for info in (workspace_info, work_info)
+        if info["checked"] and isinstance(info["freeBytes"], int)
+    ]
+    min_free_bytes = min(checked_free) if checked_free else None
+    min_free_gb_val = round(min_free_bytes / BYTES_PER_GIB, 2) if min_free_bytes is not None else None
+    low_space = bool(workspace_info["lowSpace"] or work_info["lowSpace"])
+
+    return {
+        "minFreeGb": round(float(min_free_gb), 2),
+        "ok": bool(workspace_info["ok"] and work_info["ok"]),
+        "warning": low_space,
+        "lowSpace": low_space,
+        "freeBytes": min_free_bytes,
+        "freeGb": min_free_gb_val,
+        "workspace": workspace_info,
+        "work": work_info,
+    }
+
+
 def _check_binary_artifact(path: Path, *, check_wasm_magic: bool = False) -> dict[str, Any]:
     present = path.is_file()
     size_bytes = 0
@@ -410,7 +519,7 @@ def _check_bootset(path: Path) -> dict[str, Any]:
     return result
 
 
-def _count_shader_packs(web_root: Path, data_dir: Path) -> dict[str, Any]:
+def _shader_candidate_dirs(web_root: Path, data_dir: Path) -> list[Path]:
     candidate_dirs = (
         data_dir,
         data_dir / "shaders",
@@ -418,9 +527,7 @@ def _count_shader_packs(web_root: Path, data_dir: Path) -> dict[str, Any]:
         web_root / "shaders",
     )
     seen: set[Path] = set()
-    count = 0
-    non_empty_count = 0
-
+    existing: list[Path] = []
     for directory in candidate_dirs:
         if not directory.is_dir():
             continue
@@ -431,23 +538,294 @@ def _count_shader_packs(web_root: Path, data_dir: Path) -> dict[str, Any]:
         if resolved in seen:
             continue
         seen.add(resolved)
-        try:
-            for entry in directory.iterdir():
-                if entry.is_file() and entry.name.lower().endswith(".wgsl.pack"):
-                    count += 1
-                    try:
-                        if entry.stat().st_size > 0:
-                            non_empty_count += 1
-                    except OSError:
-                        pass
-        except OSError:
+        existing.append(directory)
+    return existing
+
+
+def _inline_sampler_ok(source: Mapping[str, Any]) -> bool | None:
+    """Return None if not an inline_sampler source, else whether sdwords has 4 u32 ints."""
+    if "inline_sampler" not in source:
+        return None
+    sampler = source["inline_sampler"]
+    words = sampler.get("sdwords") if isinstance(sampler, dict) else None
+    return (
+        isinstance(words, list)
+        and len(words) == 4
+        and all(
+            isinstance(w, int) and not isinstance(w, bool) and 0 <= w <= 0xFFFFFFFF
+            for w in words
+        )
+    )
+
+
+def _find_adjacent_sidecar(pack_path: Path) -> Path | None:
+    primary = pack_path.with_name(f"{pack_path.name}.reflect.json")
+    if primary.is_file():
+        return primary
+    alt = pack_path.with_suffix(".reflect.json")
+    if alt.is_file():
+        return alt
+    return None
+
+
+def _inspect_reflect_sidecar(path: Path) -> dict[str, Any]:
+    """Validate one `.reflect.json` sidecar and return strictly sanitized counts/errors."""
+    stage_counts: dict[str, int] = {"vertex": 0, "fragment": 0, "compute": 0}
+    errors: list[str] = []
+    stage_count = 0
+    binding_count = 0
+    inline_sampler_count = 0
+    inline_sampler_stage_count = 0
+    invalid_inline_sampler_count = 0
+
+    def _add_error(msg: str) -> None:
+        if msg not in errors:
+            errors.append(msg)
+
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": ["unreadable file"],
+        }
+
+    if size_bytes == 0:
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": ["empty file"],
+        }
+
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError:
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": ["invalid JSON"],
+        }
+    except (OSError, UnicodeDecodeError):
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": ["unreadable file"],
+        }
+
+    if not isinstance(parsed, dict):
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": ["expected JSON object"],
+        }
+
+    if "schema" in parsed and parsed["schema"] != REFLECT_SIDECAR_SCHEMA:
+        _add_error("invalid schema")
+
+    if "version" in parsed:
+        ver = parsed["version"]
+        if type(ver) is not int or ver < 1:
+            _add_error("invalid version")
+
+    stages = parsed.get("stages")
+    if not isinstance(stages, dict):
+        _add_error("missing or invalid stages object")
+        return {
+            "valid": False,
+            "stageCount": 0,
+            "stageCounts": stage_counts,
+            "bindingCount": 0,
+            "inlineSamplerCount": 0,
+            "inlineSamplerStageCount": 0,
+            "invalidInlineSamplerCount": 0,
+            "errors": errors,
+        }
+
+    for stage_key, stage_entry in stages.items():
+        if not isinstance(stage_key, str) or not stage_key.strip() or not isinstance(stage_entry, dict):
+            _add_error("invalid stage entry")
             continue
 
+        raw_stage = stage_entry.get("stage")
+        normalized_stage = REFLECT_STAGE_ALIASES.get(raw_stage) if isinstance(raw_stage, str) else None
+        if normalized_stage is None:
+            _add_error("invalid stage kind")
+            continue
+
+        bindings = stage_entry.get("bindings")
+        if not isinstance(bindings, list):
+            _add_error("invalid bindings list")
+            continue
+
+        stage_count += 1
+        stage_counts[normalized_stage] += 1
+        stage_has_inline_sampler = False
+
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                _add_error("invalid binding entry")
+                continue
+            binding_count += 1
+            source = binding.get("source")
+            if isinstance(source, dict):
+                sampler_state = _inline_sampler_ok(source)
+                if sampler_state is True:
+                    inline_sampler_count += 1
+                    stage_has_inline_sampler = True
+                elif sampler_state is False:
+                    invalid_inline_sampler_count += 1
+                    _add_error("malformed inline_sampler")
+
+        if stage_has_inline_sampler:
+            inline_sampler_stage_count += 1
+
     return {
-        "present": count > 0,
-        "count": count,
-        "nonEmptyCount": non_empty_count,
+        "valid": len(errors) == 0,
+        "stageCount": stage_count,
+        "stageCounts": stage_counts,
+        "bindingCount": binding_count,
+        "inlineSamplerCount": inline_sampler_count,
+        "inlineSamplerStageCount": inline_sampler_stage_count,
+        "invalidInlineSamplerCount": invalid_inline_sampler_count,
+        "errors": errors,
     }
+
+
+def _inspect_shader_packs_and_sidecars(
+    web_root: Path,
+    data_dir: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate_dirs = _shader_candidate_dirs(web_root, data_dir)
+    pack_paths: list[Path] = []
+    sidecar_paths: list[Path] = []
+    seen_sidecars: set[Path] = set()
+    non_empty_count = 0
+
+    for directory in candidate_dirs:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            lower_name = entry.name.lower()
+            if lower_name.endswith(".wgsl.pack"):
+                pack_paths.append(entry)
+                try:
+                    if entry.stat().st_size > 0:
+                        non_empty_count += 1
+                except OSError:
+                    pass
+            elif lower_name.endswith(".reflect.json"):
+                try:
+                    resolved = entry.resolve()
+                except OSError:
+                    resolved = entry
+                if resolved not in seen_sidecars:
+                    seen_sidecars.add(resolved)
+                    sidecar_paths.append(entry)
+
+    paired_pack_count = 0
+    for pack_path in pack_paths:
+        adjacent = _find_adjacent_sidecar(pack_path)
+        if adjacent is not None:
+            paired_pack_count += 1
+            try:
+                resolved = adjacent.resolve()
+            except OSError:
+                resolved = adjacent
+            if resolved not in seen_sidecars:
+                seen_sidecars.add(resolved)
+                sidecar_paths.append(adjacent)
+
+    pack_count = len(pack_paths)
+    unpaired_pack_count = pack_count - paired_pack_count
+
+    valid_count = 0
+    invalid_count = 0
+    stage_count = 0
+    stage_counts: dict[str, int] = {"vertex": 0, "fragment": 0, "compute": 0}
+    binding_count = 0
+    inline_sampler_count = 0
+    inline_sampler_stage_count = 0
+    invalid_inline_sampler_count = 0
+    errors: list[str] = []
+
+    for sidecar_path in sidecar_paths:
+        info = _inspect_reflect_sidecar(sidecar_path)
+        if info["valid"]:
+            valid_count += 1
+        else:
+            invalid_count += 1
+        stage_count += info["stageCount"]
+        for stage_kind in ("vertex", "fragment", "compute"):
+            stage_counts[stage_kind] += info["stageCounts"][stage_kind]
+        binding_count += info["bindingCount"]
+        inline_sampler_count += info["inlineSamplerCount"]
+        inline_sampler_stage_count += info["inlineSamplerStageCount"]
+        invalid_inline_sampler_count += info["invalidInlineSamplerCount"]
+        for err in info["errors"]:
+            if err not in errors:
+                errors.append(err)
+
+    shader_packs: dict[str, Any] = {
+        "present": pack_count > 0,
+        "count": pack_count,
+        "nonEmptyCount": non_empty_count,
+        "pairedSidecarCount": paired_pack_count,
+    }
+    shader_sidecars: dict[str, Any] = {
+        "present": len(sidecar_paths) > 0,
+        "count": len(sidecar_paths),
+        "validCount": valid_count,
+        "invalidCount": invalid_count,
+        "pairedPackCount": paired_pack_count,
+        "unpairedPackCount": unpaired_pack_count,
+        "ok": invalid_count == 0,
+        "stageCount": stage_count,
+        "stageCounts": stage_counts,
+        "bindingCount": binding_count,
+        "inlineSamplerCount": inline_sampler_count,
+        "inlineSamplerStageCount": inline_sampler_stage_count,
+        "invalidInlineSamplerCount": invalid_inline_sampler_count,
+        "errors": errors,
+    }
+    return shader_packs, shader_sidecars
+
+
+def _count_shader_packs(web_root: Path, data_dir: Path) -> dict[str, Any]:
+    shader_packs, _ = _inspect_shader_packs_and_sidecars(web_root, data_dir)
+    return shader_packs
 
 
 def check_artifacts(repo_root: Path, data_dir: Path | None = None) -> dict[str, Any]:
@@ -455,13 +833,15 @@ def check_artifacts(repo_root: Path, data_dir: Path | None = None) -> dict[str, 
     web_root = repo_root / "web"
     resolved_data_dir = data_dir if data_dir is not None else (repo_root / "local-data")
     dist_dir = web_root / "dist"
+    shader_packs, shader_sidecars = _inspect_shader_packs_and_sidecars(web_root, resolved_data_dir)
 
     return {
         "runtimeJs": _check_binary_artifact(dist_dir / "runtime.js", check_wasm_magic=False),
         "runtimeWasm": _check_binary_artifact(dist_dir / "runtime.wasm", check_wasm_magic=True),
         "dataManifest": _check_data_manifest(resolved_data_dir / "data-manifest.json"),
         "bootset": _check_bootset(resolved_data_dir / "bootset.json"),
-        "shaderPacks": _count_shader_packs(web_root, resolved_data_dir),
+        "shaderPacks": shader_packs,
+        "shaderSidecars": shader_sidecars,
     }
 
 
@@ -635,6 +1015,7 @@ def compute_milestones(
     manifest = artifacts.get("dataManifest", {})
     bootset = artifacts.get("bootset", {})
     shader_packs = artifacts.get("shaderPacks", {})
+    shader_sidecars = artifacts.get("shaderSidecars", {})
 
     if not rt_js.get("nonEmpty"):
         m1_missing.append("web/dist/runtime.js")
@@ -658,6 +1039,8 @@ def compute_milestones(
         m2_missing.append("local-data/bootset.json")
     if not shader_packs.get("present"):
         m2_missing.append("shaders:*.wgsl.pack")
+    if shader_sidecars.get("present") and not shader_sidecars.get("ok"):
+        m2_missing.append("shaders:*.reflect.json (invalid)")
     m2_ready = len(m2_missing) == 0
 
     # M3: Wasm64 recompilation & OS/GDK build surface
@@ -731,14 +1114,23 @@ def run_preflight(
     which_fn: Callable[[str], str | None] = shutil.which,
     version_fn: Callable[[str], str | None] | None = None,
     skip_server_check: bool = False,
+    min_free_gb: float = DEFAULT_MIN_FREE_GB,
+    disk_usage_fn: Callable[[Path], Any] | None = None,
 ) -> dict[str, Any]:
     """Run all preflight checks against `repo_root` and return a sanitized JSON-safe dict."""
     root = Path(repo_root).resolve()
     resolved_env = _resolve_env_paths(root, env=env)
     data_dir: Path = resolved_env["data_path"]
+    work_dir: Path = resolved_env["work_path"]
 
     toolchains = check_toolchains(which_fn=which_fn, version_fn=version_fn)
     local_env = check_local_env(root, env=env)
+    disk_space = check_disk_space(
+        root,
+        work_dir=work_dir,
+        min_free_gb=min_free_gb,
+        disk_usage_fn=disk_usage_fn,
+    )
     artifacts = check_artifacts(root, data_dir=data_dir)
     if skip_server_check:
         server: dict[str, Any] = {
@@ -764,6 +1156,7 @@ def run_preflight(
         "ok": bool(milestones["M1"]["ready"]),
         "toolchains": toolchains,
         "localEnv": local_env,
+        "diskSpace": disk_space,
         "artifacts": artifacts,
         "server": server,
         "milestones": milestones,
@@ -773,6 +1166,10 @@ def run_preflight(
 
 def _tag(ok: bool) -> str:
     return "[OK]  " if ok else "[MISS]"
+
+
+def _warn_tag(ok: bool) -> str:
+    return "[OK]  " if ok else "[WARN]"
 
 
 def format_report_text(report: Mapping[str, Any]) -> str:
@@ -810,6 +1207,28 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"{'exists' if le.get('workDirExists') else ('configured (not created yet)' if le.get('workDirConfigured') else 'not configured')}"
     )
 
+    disk = report.get("diskSpace")
+    if isinstance(disk, Mapping):
+        threshold = disk.get("minFreeGb", DEFAULT_MIN_FREE_GB)
+        lines.append("")
+        lines.append(f"Disk Space (warning threshold: {threshold:.2f} GB):")
+        for label, key in (("workspace drive", "workspace"), ("work drive", "work")):
+            target = disk.get(key, {})
+            if not target.get("checked"):
+                lines.append(
+                    f"  [WARN] {label:<16} {target.get('error') or 'disk usage unavailable'}"
+                )
+            elif target.get("lowSpace"):
+                lines.append(
+                    f"  [WARN] {label:<16} {target.get('freeGb', 0.0):.2f} GB free "
+                    f"(below {threshold:.2f} GB warning threshold)"
+                )
+            else:
+                lines.append(
+                    f"  {_warn_tag(True)} {label:<16} {target.get('freeGb', 0.0):.2f} GB free "
+                    f"(>= {threshold:.2f} GB)"
+                )
+
     lines.append("")
     lines.append("Build & Runtime Artifacts:")
     art = report["artifacts"]
@@ -818,6 +1237,7 @@ def format_report_text(report: Mapping[str, Any]) -> str:
     manifest = art["dataManifest"]
     bootset = art["bootset"]
     packs = art["shaderPacks"]
+    sidecars = art.get("shaderSidecars")
 
     js_note = f"{rt_js['sizeBytes']} bytes" if rt_js["present"] else "missing"
     lines.append(f"  {_tag(bool(rt_js['nonEmpty']))} web/dist/runtime.js       {js_note}")
@@ -853,6 +1273,28 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"  {_tag(bool(packs['present']))} *.wgsl.pack bundles       "
         f"{packs['count']} found ({packs['nonEmptyCount']} non-empty)"
     )
+
+    if isinstance(sidecars, Mapping):
+        if not sidecars.get("present"):
+            lines.append(
+                "  [SKIP] *.reflect.json sidecars   none staged (optional until shaders are packed)"
+            )
+        elif sidecars.get("ok"):
+            sc = sidecars.get("stageCounts", {})
+            lines.append(
+                f"  {_warn_tag(True)} *.reflect.json sidecars   "
+                f"{sidecars['count']} found (stages={sidecars['stageCount']}: "
+                f"vs={sc.get('vertex', 0)}, fs={sc.get('fragment', 0)}, cs={sc.get('compute', 0)}; "
+                f"inline_samplers={sidecars['inlineSamplerCount']} in "
+                f"{sidecars['inlineSamplerStageCount']} stages)"
+            )
+        else:
+            err_summary = ", ".join(sidecars.get("errors", [])) or "invalid sidecar"
+            lines.append(
+                f"  {_warn_tag(False)} *.reflect.json sidecars   "
+                f"{sidecars['count']} found ({sidecars['invalidCount']} invalid, "
+                f"invalid_inline_samplers={sidecars['invalidInlineSamplerCount']}: {err_summary})"
+            )
 
     lines.append("")
     lines.append("Server COOP/COEP Self-Check:")
@@ -912,16 +1354,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the local COOP/COEP server header self-check.",
     )
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_GB,
+        help=(
+            f"Minimum free disk space in GB on the workspace/work drive before emitting "
+            f"a low-space warning (default: {DEFAULT_MIN_FREE_GB:g})."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        parser.error("--min-free-gb must be a finite non-negative number")
 
     report = run_preflight(
         repo_root=args.repo_root,
         skip_server_check=args.skip_server,
+        min_free_gb=args.min_free_gb,
     )
 
     if args.json:
