@@ -49,11 +49,12 @@ GPU/draw/frame-pacing metrics (including `FIRST_VISIBLE_FRAME` and `black_loadin
 `blackLoadingMs`) are present in both reports, an additive, strictly-sanitized `gpu_delta` summary
 is included without altering pass/fail verdicts or exit codes. When Chrome boot telemetry metrics
 (`first_visible_frame_s`, `black_loading_s`, `js_heap_used_mb`, `js_heap_total_mb`,
-`audio_ring_attached`, `audio_frames_drained`) are present in either report, an additive,
-strictly-sanitized `telemetry_delta` summary is included without altering pass/fail verdicts or
-exit codes. When sanitized `gpu_adapter` labels differ between baseline and candidate, an
-informational warning note is emitted without altering pass/fail verdicts or exit codes. Exit code:
-0 pass, 1 differences, 2 usage error (missing or malformed input).
+`audio_ring_attached`, `audio_frames_drained`, `present_fps_avg`) are present in either report, an
+additive, strictly-sanitized `telemetry_delta` summary is included without altering pass/fail
+verdicts or exit codes (unless `--min-fps-ratio` is passed to flag `present_fps_avg` regressions).
+When sanitized `gpu_adapter` labels differ between baseline and candidate, an informational warning
+note is emitted without altering pass/fail verdicts or exit codes. Exit code: 0 pass, 1
+differences, 2 usage error (missing or malformed input).
 
     python tools/compare_boot_reports.py a.json b.json
     python tools/compare_boot_reports.py a.json b.json --capture a.pg6trace b.pg6trace --json
@@ -98,6 +99,7 @@ class Tolerances:
 class Comparison:
     tol: Tolerances
     ignore: list[str]
+    min_fps_ratio: float | None = None
     entries: list[dict[str, Any]] = field(default_factory=list)
     gpu_delta: dict[str, dict[str, int | float | None]] = field(default_factory=dict)
     telemetry_delta: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -790,6 +792,7 @@ TELEMETRY_DELTA_METRICS: tuple[str, ...] = (
     "js_heap_total_mb",
     "audio_ring_attached",
     "audio_frames_drained",
+    "present_fps_avg",
 )
 
 _TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
@@ -799,6 +802,7 @@ _TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
     "js_heap_total_mb": {"kind": "float", "unit": " MB", "better": "lower"},
     "audio_ring_attached": {"kind": "bool", "unit": "", "better": "true"},
     "audio_frames_drained": {"kind": "int", "unit": "", "better": "higher"},
+    "present_fps_avg": {"kind": "float", "unit": " fps", "better": "higher"},
 }
 
 _BYTES_PER_MIB = 1024.0 * 1024.0
@@ -848,8 +852,28 @@ def _format_telemetry_signed_delta(metric: str, delta: Any) -> str | None:
     return f"{_format_decimal(float(delta), signed=True)}{unit}"
 
 
+def extract_present_fps_avg(report: dict[str, Any]) -> float | None:
+    """Extract sanitized non-negative T73 `present_fps_avg` from a boot report, or None."""
+    telemetry = _dict_or_empty(report.get("telemetry"))
+    summary = _dict_or_empty(report.get("summary"))
+    counters = _dict_or_empty(report.get("counters"))
+    val = _first_non_negative_number(
+        report.get("present_fps_avg"),
+        report.get("presentFpsAvg"),
+        telemetry.get("present_fps_avg"),
+        telemetry.get("presentFpsAvg"),
+        summary.get("present_fps_avg"),
+        summary.get("presentFpsAvg"),
+        counters.get("present_fps_avg"),
+        counters.get("presentFpsAvg"),
+    )
+    if val is None:
+        return None
+    return round(float(val), 2)
+
+
 def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float | bool]:
-    """Extract sanitized Chrome boot telemetry (visible frame, black loading, JS heap, audio ring)."""
+    """Extract sanitized Chrome boot telemetry (visible frame, black loading, JS heap, audio ring, FPS)."""
     telemetry = _dict_or_empty(report.get("telemetry"))
     summary = _dict_or_empty(report.get("summary"))
     counters = _dict_or_empty(report.get("counters"))
@@ -1114,6 +1138,11 @@ def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float |
         else:
             metrics["audio_frames_drained"] = round(float(frames_drained), 2)
 
+    # 7. present_fps_avg (T73 average presents/sec; omitted when absent on older reports)
+    present_fps_avg = extract_present_fps_avg(report)
+    if present_fps_avg is not None:
+        metrics["present_fps_avg"] = present_fps_avg
+
     return metrics
 
 
@@ -1210,6 +1239,28 @@ def compute_telemetry_delta(
     return out
 
 
+def compare_present_fps_ratio(c: Comparison, ra: dict[str, Any], rb: dict[str, Any]) -> None:
+    """Optional T74 regression check: fail if candidate present_fps_avg < baseline * min_fps_ratio."""
+    if c.min_fps_ratio is None:
+        return
+    fps_a = extract_present_fps_avg(ra)
+    fps_b = extract_present_fps_avg(rb)
+    if fps_a is None or fps_b is None:
+        if fps_a is None and fps_b is None:
+            missing = "baseline and candidate"
+        elif fps_a is None:
+            missing = "baseline"
+        else:
+            missing = "candidate"
+        c.warnings.append(
+            f"min_fps_ratio check skipped: present_fps_avg missing from {missing}"
+        )
+        return
+    threshold = fps_a * c.min_fps_ratio
+    ok = (fps_b >= threshold) or math.isclose(fps_b, threshold, rel_tol=1e-9, abs_tol=1e-12)
+    c.record("telemetry.present_fps_avg", fps_a, fps_b, ok, "min_fps_ratio")
+
+
 def compare(
     ra: dict[str, Any],
     rb: dict[str, Any],
@@ -1217,8 +1268,18 @@ def compare(
     ignore: Sequence[str] = (),
     captures: tuple[Capture, Capture] | None = None,
     import_traces: tuple[list, list] | None = None,
+    min_fps_ratio: float | None = None,
 ) -> Comparison:
-    c = Comparison(tol, list(ignore))
+    if min_fps_ratio is not None:
+        if (
+            isinstance(min_fps_ratio, bool)
+            or not isinstance(min_fps_ratio, (int, float))
+            or not math.isfinite(float(min_fps_ratio))
+            or float(min_fps_ratio) <= 0.0
+        ):
+            raise ValueError("min_fps_ratio must be a positive finite number")
+        min_fps_ratio = float(min_fps_ratio)
+    c = Comparison(tol, list(ignore), min_fps_ratio=min_fps_ratio)
     compare_milestones(c, ra, rb)
     compare_stop(c, ra, rb)
     compare_imports(c, ra, rb)
@@ -1235,6 +1296,7 @@ def compare(
         compare_presents(c, pa, pb)
     if captures:
         compare_captures(c, *captures)
+    compare_present_fps_ratio(c, ra, rb)
     c.gpu_adapter, adapter_warning = compare_gpu_adapter(ra, rb)
     if adapter_warning is not None:
         c.warnings.append(adapter_warning)
@@ -1250,15 +1312,18 @@ def compare(
 
 def to_result(c: Comparison) -> dict[str, Any]:
     bad = c.failures()
+    tolerances: dict[str, float] = {
+        "time_rel": c.tol.time_rel,
+        "time_floor_ms": c.tol.time_floor_ms,
+        "count_rel": c.tol.count_rel,
+    }
+    if c.min_fps_ratio is not None:
+        tolerances["min_fps_ratio"] = c.min_fps_ratio
     result: dict[str, Any] = {
         "verdict": "fail" if bad else "pass",
         "checked": len(c.entries),
         "differences": len(bad),
-        "tolerances": {
-            "time_rel": c.tol.time_rel,
-            "time_floor_ms": c.tol.time_floor_ms,
-            "count_rel": c.tol.count_rel,
-        },
+        "tolerances": tolerances,
         "ignore": c.ignore,
         "entries": bad,
     }
@@ -1428,6 +1493,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="absolute tolerance floor for timings in ms (default 100)")
     p.add_argument("--count-tolerance", type=float, default=0.05, metavar="REL",
                    help="relative tolerance for wall-clock dependent counts (default 0.05)")
+    p.add_argument("--min-fps-ratio", type=float, default=None, metavar="RATIO",
+                   help="fail if candidate present_fps_avg < baseline * RATIO (e.g. 0.85; disabled by default)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the result as JSON")
     p.add_argument("--markdown", dest="as_markdown", action="store_true", help="print the result as Markdown")
     p.add_argument("-v", "--verbose", action="store_true", help="also list the matching fields (text/Markdown mode)")
@@ -1449,6 +1516,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if min(args.time_tolerance, args.time_floor_ms, args.count_tolerance) < 0:
         print("error: tolerances must not be negative", file=sys.stderr)
         return 2
+    if args.min_fps_ratio is not None and (
+        not math.isfinite(args.min_fps_ratio) or args.min_fps_ratio <= 0.0
+    ):
+        print("error: --min-fps-ratio must be a positive finite number", file=sys.stderr)
+        return 2
     try:
         ra = load_json(args.report_a, REPORT_SCHEMA)
         rb = load_json(args.report_b, REPORT_SCHEMA)
@@ -1458,7 +1530,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     tol = Tolerances(args.time_tolerance, args.time_floor_ms, args.count_tolerance)
-    c = compare(ra, rb, tol, args.ignore, captures, traces)  # type: ignore[arg-type]
+    c = compare(
+        ra,
+        rb,
+        tol,
+        args.ignore,
+        captures,  # type: ignore[arg-type]
+        traces,  # type: ignore[arg-type]
+        min_fps_ratio=args.min_fps_ratio,
+    )
     if args.as_json:
         print(json.dumps(to_result(c), indent=2))
     elif args.as_markdown:
