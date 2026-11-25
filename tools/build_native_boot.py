@@ -29,7 +29,8 @@ Linker notes for multi-GB object sets: the MSVC link uses `/INCREMENTAL:NO`, `/O
 (`/BASE:0x7E0000000000 /DYNAMICBASE:NO`) so it never sits in the guest address space
 (the game wants 0x1'4000'0000, MSVC's default EXE base; the runtime's guest space starts at
 4 GiB). Objects are passed as CMake external-object sources (MSBuild hands them to `link`
-through its own response file).
+through its own response file). C++ sources compile with `/MP` (MSBuild is otherwise serial
+within a project), and `--delete-ir` drops the IR of cache hits too.
 
 Object cache: `--cache-dir`, else `PLAYGTA6_OBJ_CACHE`, else `%LOCALAPPDATA%/playgta6/objcache`
 on Windows and `$XDG_CACHE_HOME/playgta6/objcache` (`~/.cache/...`) elsewhere: outside every
@@ -605,6 +606,9 @@ def _compile_keyed(unit: Unit, cfg: CompileConfig, runner: CommandRunner, key: s
             break
         time.sleep(LOCK_POLL_S)
     mark_used(obj)
+    # --delete-ir also on a hit: the object is cached, the IR (GiBs per program) is dead weight.
+    if cfg.delete_ir and unit.manifest_hash is not None:
+        unit.ll.unlink(missing_ok=True)
     return UnitResult(unit, obj, True, time.monotonic() - start)
 
 
@@ -818,6 +822,11 @@ cmake_minimum_required(VERSION 3.24)
 project(playgta6_native_boot LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# MSBuild compiles the sources of one project serially unless cl gets /MP: without it the
+# runtime (~70 translation units) is a ~3 minute single-core compile in a fresh build dir.
+if(MSVC)
+    add_compile_options(/MP)
+endif()
 
 add_subdirectory("{_cmake_path(repo_root / 'runtime')}" runtime EXCLUDE_FROM_ALL)
 
