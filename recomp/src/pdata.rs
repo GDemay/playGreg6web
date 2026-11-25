@@ -145,13 +145,21 @@ impl UnwindInfo {
             .ok_or(UnwindError::Truncated)?;
         let flags = header[0] >> 3;
         let count = usize::from(header[2]);
-        let mut len = UNWIND_HEADER_LEN + 2 * (count + (count & 1));
-        if flags & UNW_FLAG_CHAININFO != 0 {
-            len += RUNTIME_FUNCTION_LEN;
+        let padded_slots = count.checked_add(count & 1).ok_or(UnwindError::Truncated)?;
+        let codes_bytes = padded_slots
+            .checked_mul(2)
+            .ok_or(UnwindError::Truncated)?;
+        let trailer_len = if flags & UNW_FLAG_CHAININFO != 0 {
+            RUNTIME_FUNCTION_LEN
         } else if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
-            len += 4;
-        }
-        Ok(len)
+            4
+        } else {
+            0
+        };
+        UNWIND_HEADER_LEN
+            .checked_add(codes_bytes)
+            .and_then(|n| n.checked_add(trailer_len))
+            .ok_or(UnwindError::Truncated)
     }
 
     /// Decode an `UNWIND_INFO` located at `rva` from `bytes` (which may extend past it).
@@ -164,25 +172,42 @@ impl UnwindInfo {
         }
         let flags = bytes[0] >> 3;
         let count = usize::from(bytes[2]);
-        let slots = &bytes[UNWIND_HEADER_LEN..UNWIND_HEADER_LEN + 2 * count];
+        let codes_end = count
+            .checked_mul(2)
+            .and_then(|n| UNWIND_HEADER_LEN.checked_add(n))
+            .ok_or(UnwindError::Truncated)?;
+        let slots = bytes
+            .get(UNWIND_HEADER_LEN..codes_end)
+            .ok_or(UnwindError::Truncated)?;
         let codes = decode_codes(slots, version)?;
 
-        let trailer = UNWIND_HEADER_LEN + 2 * (count + (count & 1));
+        let padded_slots = count.checked_add(count & 1).ok_or(UnwindError::Truncated)?;
+        let trailer = padded_slots
+            .checked_mul(2)
+            .and_then(|n| UNWIND_HEADER_LEN.checked_add(n))
+            .ok_or(UnwindError::Truncated)?;
         let (mut handler, mut chained) = (None, None);
         if flags & UNW_FLAG_CHAININFO != 0 {
-            chained = RuntimeFunction::parse(&bytes[trailer..]);
+            let trailer_bytes = bytes.get(trailer..).ok_or(UnwindError::Truncated)?;
+            chained = Some(RuntimeFunction::parse(trailer_bytes).ok_or(UnwindError::Truncated)?);
         } else if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
-            let data_rva = (trailer as u32 + 4)
-                .checked_add(rva)
+            let data_rva = u32::try_from(trailer)
+                .ok()
+                .and_then(|t| t.checked_add(4))
+                .and_then(|t| t.checked_add(rva))
                 .ok_or(UnwindError::Truncated)?;
-            handler = le_u32(bytes, trailer).map(|rva| ExceptionHandler { rva, data_rva });
+            let handler_rva = le_u32(bytes, trailer).ok_or(UnwindError::Truncated)?;
+            handler = Some(ExceptionHandler {
+                rva: handler_rva,
+                data_rva,
+            });
         }
         Ok(Self {
             version,
             flags,
             prolog_size: bytes[1],
             frame_register: bytes[3] & 0xf,
-            frame_offset: (bytes[3] >> 4) * 16,
+            frame_offset: (bytes[3] >> 4).saturating_mul(16),
             codes,
             handler,
             chained,
@@ -194,13 +219,22 @@ impl UnwindInfo {
 /// version-1 meanings of 6 and 7 and the reserved 7, 11..15 are rejected.
 fn decode_codes(slots: &[u8], version: u8) -> Result<Vec<UnwindCode>, UnwindError> {
     let count = slots.len() / 2;
-    let slot = |i: usize| u16::from_le_bytes([slots[2 * i], slots[2 * i + 1]]);
+    let slot = |i: usize| -> Option<u16> {
+        let off = i.checked_mul(2)?;
+        let pair = slots.get(off..off.checked_add(2)?)?;
+        Some(u16::from_le_bytes([pair[0], pair[1]]))
+    };
     let mut codes = Vec::with_capacity(count);
-    let mut i = 0;
+    let mut i = 0usize;
     while i < count {
-        let (prolog_offset, op_byte) = (slots[2 * i], slots[2 * i + 1]);
+        let off = i.checked_mul(2).ok_or(UnwindError::Truncated)?;
+        let pair = slots
+            .get(off..off.checked_add(2).ok_or(UnwindError::Truncated)?)
+            .ok_or(UnwindError::Truncated)?;
+        let (prolog_offset, op_byte) = (pair[0], pair[1]);
         let (op, info) = (op_byte & 0xf, op_byte >> 4);
-        let invalid = UnwindError::InvalidCode { slot: i as u8, op };
+        let slot_idx = u8::try_from(i).unwrap_or(u8::MAX);
+        let invalid = UnwindError::InvalidCode { slot: slot_idx, op };
         let used = match op {
             1 if info == 1 => 3,
             1 if info == 0 => 2,
@@ -210,27 +244,40 @@ fn decode_codes(slots: &[u8], version: u8) -> Result<Vec<UnwindCode>, UnwindErro
             6 if version == 2 => 1,
             _ => return Err(invalid),
         };
-        if i + used > count {
+        let next_i = i.checked_add(used).ok_or(invalid)?;
+        if next_i > count {
             return Err(invalid);
         }
-        let far = || u32::from(slot(i + 1)) | (u32::from(slot(i + 2)) << 16);
+        let read_slot = |idx: usize| slot(idx).ok_or(invalid);
+        let far = || -> Result<u32, UnwindError> {
+            let lo = u32::from(read_slot(i + 1)?);
+            let hi = u32::from(read_slot(i + 2)?);
+            Ok(lo | (hi << 16))
+        };
         let op = match op {
             0 => UnwindOp::PushNonVolatile { register: info },
             1 if info == 0 => UnwindOp::Alloc {
-                size: u32::from(slot(i + 1)) * 8,
+                size: u32::from(read_slot(i + 1)?)
+                    .checked_mul(8)
+                    .ok_or(invalid)?,
             },
-            1 => UnwindOp::Alloc { size: far() },
+            1 => UnwindOp::Alloc { size: far()? },
             2 => UnwindOp::Alloc {
-                size: u32::from(info) * 8 + 8,
+                size: u32::from(info)
+                    .checked_mul(8)
+                    .and_then(|v| v.checked_add(8))
+                    .ok_or(invalid)?,
             },
             3 => UnwindOp::SetFramePointer,
             4 => UnwindOp::SaveNonVolatile {
                 register: info,
-                offset: u32::from(slot(i + 1)) * 8,
+                offset: u32::from(read_slot(i + 1)?)
+                    .checked_mul(8)
+                    .ok_or(invalid)?,
             },
             5 => UnwindOp::SaveNonVolatile {
                 register: info,
-                offset: far(),
+                offset: far()?,
             },
             6 => UnwindOp::Epilog {
                 code_offset: prolog_offset,
@@ -238,11 +285,13 @@ fn decode_codes(slots: &[u8], version: u8) -> Result<Vec<UnwindCode>, UnwindErro
             },
             8 => UnwindOp::SaveXmm128 {
                 register: info,
-                offset: u32::from(slot(i + 1)) * 16,
+                offset: u32::from(read_slot(i + 1)?)
+                    .checked_mul(16)
+                    .ok_or(invalid)?,
             },
             9 => UnwindOp::SaveXmm128 {
                 register: info,
-                offset: far(),
+                offset: far()?,
             },
             10 if info <= 1 => UnwindOp::PushMachineFrame {
                 error_code: info == 1,
@@ -250,7 +299,7 @@ fn decode_codes(slots: &[u8], version: u8) -> Result<Vec<UnwindCode>, UnwindErro
             _ => return Err(invalid),
         };
         codes.push(UnwindCode { prolog_offset, op });
-        i += used;
+        i = next_i;
     }
     Ok(codes)
 }
@@ -270,7 +319,7 @@ pub enum PdataDiagnosticKind {
     EmptyRange,
     /// `EndAddress` is past `SizeOfImage`; record dropped.
     OutsideImage,
-    /// `BeginAddress` is not inside an executable section; record dropped.
+    /// `BeginAddress..EndAddress` is not contained inside an executable section; record dropped.
     NotExecutable,
     /// The range overlaps an earlier record; record dropped.
     Overlap,
@@ -350,19 +399,61 @@ struct Reader<'p, 'f> {
 }
 
 impl<'f> Reader<'_, 'f> {
-    /// `len` bytes at `rva`, only if they are contiguous file bytes of one mapping.
-    fn read(&self, rva: u32, len: usize) -> Option<&'f [u8]> {
-        let offset = self.pe.rva_to_file_offset(rva)?;
-        if len > 1 {
-            let last = rva.checked_add(u32::try_from(len - 1).ok()?)?;
-            if self.pe.rva_to_file_offset(last)? != offset.checked_add(len - 1)? {
-                return None;
+    /// Contiguous initialized file bytes mapped from `rva` within a single PE section (or the
+    /// PE headers), clamped to the file length and to non-wrapping `u32` RVAs.
+    fn mapped_slice_from(&self, rva: u32) -> Option<&'f [u8]> {
+        let file_limit = self.file.len().min(self.pe.file_size);
+        let max_rva_span = u64::from(u32::MAX - rva) + 1;
+        for section in &self.pe.sections {
+            let virt_extent = if section.virtual_size == 0 {
+                section.raw_size
+            } else {
+                section.virtual_size
+            };
+            let mapped_extent = virt_extent.min(section.raw_size);
+            if let Some(delta) = rva.checked_sub(section.virtual_address)
+                && delta < mapped_extent
+            {
+                let raw_offset = usize::try_from(section.raw_offset).ok()?;
+                let delta_usize = usize::try_from(delta).ok()?;
+                let start = raw_offset.checked_add(delta_usize)?;
+                if start >= file_limit {
+                    return None;
+                }
+                let remaining =
+                    usize::try_from(u64::from(mapped_extent - delta).min(max_rva_span))
+                        .unwrap_or(usize::MAX);
+                let end = start.saturating_add(remaining).min(file_limit);
+                return self.file.get(start..end);
             }
         }
-        self.file.get(offset..offset.checked_add(len)?)
+        if rva < self.pe.optional.size_of_headers {
+            let start = usize::try_from(rva).ok()?;
+            if start >= file_limit {
+                return None;
+            }
+            let remaining =
+                usize::try_from(u64::from(self.pe.optional.size_of_headers - rva).min(max_rva_span))
+                    .unwrap_or(usize::MAX);
+            let end = start.saturating_add(remaining).min(file_limit);
+            return self.file.get(start..end);
+        }
+        None
+    }
+
+    /// `len` bytes at `rva`, only if they are contiguous file bytes of one mapping.
+    fn read(&self, rva: u32, len: usize) -> Option<&'f [u8]> {
+        if len > 0 {
+            let last_off = u32::try_from(len.checked_sub(1)?).ok()?;
+            rva.checked_add(last_off)?;
+        }
+        self.mapped_slice_from(rva)?.get(..len)
     }
 
     fn unwind_info(&self, rva: u32) -> Result<UnwindInfo, UnwindError> {
+        if rva == 0 {
+            return Err(UnwindError::Unmapped);
+        }
         let header = self
             .read(rva, UNWIND_HEADER_LEN)
             .ok_or(UnwindError::Unmapped)?;
@@ -373,7 +464,11 @@ impl<'f> Reader<'_, 'f> {
 
     /// Record pointed to by an indirect `UnwindInfoAddress`.
     fn indirect(&self, unwind: u32) -> Option<RuntimeFunction> {
-        RuntimeFunction::parse(self.read(unwind - 1, RUNTIME_FUNCTION_LEN)?)
+        let target = unwind.checked_sub(RUNTIME_FUNCTION_INDIRECT)?;
+        if target == 0 {
+            return None;
+        }
+        RuntimeFunction::parse(self.read(target, RUNTIME_FUNCTION_LEN)?)
     }
 
     fn is_executable(&self, rva: u32) -> bool {
@@ -387,6 +482,27 @@ impl<'f> Reader<'_, 'f> {
                 && rva
                     .checked_sub(s.virtual_address)
                     .is_some_and(|delta| delta < extent)
+        })
+    }
+
+    /// Whether `[begin, end)` is non-empty and contained within one executable section.
+    fn is_executable_range(&self, begin: u32, end: u32) -> bool {
+        let Some(len) = end.checked_sub(begin) else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        self.pe.sections.iter().any(|s| {
+            let extent = if s.virtual_size == 0 {
+                s.raw_size
+            } else {
+                s.virtual_size
+            };
+            s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+                && begin
+                    .checked_sub(s.virtual_address)
+                    .is_some_and(|delta| delta < extent && len <= extent - delta)
         })
     }
 
@@ -404,7 +520,11 @@ impl<'f> Reader<'_, 'f> {
                     Err(_) => None,
                 }
             };
-            link = next.ok_or(PdataDiagnosticKind::ChainBroken)?;
+            let parent = next.ok_or(PdataDiagnosticKind::ChainBroken)?;
+            if parent.begin >= parent.end || parent.end > self.pe.optional.size_of_image {
+                return Err(PdataDiagnosticKind::ChainBroken);
+            }
+            link = parent;
         }
         Err(PdataDiagnosticKind::ChainTooDeep)
     }
@@ -421,28 +541,28 @@ impl ExceptionDirectory {
         let reader = Reader { pe, file };
         let mut diag = |rva, kind| out.diagnostics.push(PdataDiagnostic { rva, kind });
 
-        let size = dir.size as usize;
+        let size = usize::try_from(dir.size).unwrap_or(usize::MAX);
         if !size.is_multiple_of(RUNTIME_FUNCTION_LEN) {
             diag(dir.virtual_address, PdataDiagnosticKind::TrailingBytes);
         }
-        let mut records = Vec::new();
-        for i in 0..size / RUNTIME_FUNCTION_LEN {
-            let record = u32::try_from(i * RUNTIME_FUNCTION_LEN)
-                .ok()
-                .and_then(|offset| dir.virtual_address.checked_add(offset))
-                .and_then(|rva| reader.read(rva, RUNTIME_FUNCTION_LEN))
-                .and_then(RuntimeFunction::parse);
-            match record {
-                Some(record) => records.push(record),
-                None => {
-                    let kind = if i == 0 {
-                        PdataDiagnosticKind::DirectoryUnmapped
-                    } else {
-                        PdataDiagnosticKind::DirectoryTruncated
-                    };
-                    diag(dir.virtual_address, kind);
-                    break;
-                }
+        let Some(mapped) = reader.mapped_slice_from(dir.virtual_address) else {
+            diag(dir.virtual_address, PdataDiagnosticKind::DirectoryUnmapped);
+            return out;
+        };
+        if mapped.len() < size {
+            diag(dir.virtual_address, PdataDiagnosticKind::DirectoryTruncated);
+        }
+        let readable = mapped.len().min(size);
+        let full_records = readable / RUNTIME_FUNCTION_LEN;
+        let record_bytes = full_records.saturating_mul(RUNTIME_FUNCTION_LEN);
+        let mut records = Vec::with_capacity(full_records);
+        for chunk in mapped
+            .get(..record_bytes)
+            .unwrap_or(&[])
+            .chunks_exact(RUNTIME_FUNCTION_LEN)
+        {
+            if let Some(record) = RuntimeFunction::parse(chunk) {
+                records.push(record);
             }
         }
         out.record_count = records.len();
@@ -457,7 +577,7 @@ impl ExceptionDirectory {
                 PdataDiagnosticKind::EmptyRange
             } else if record.end > pe.optional.size_of_image {
                 PdataDiagnosticKind::OutsideImage
-            } else if !reader.is_executable(record.begin) {
+            } else if !reader.is_executable_range(record.begin, record.end) {
                 PdataDiagnosticKind::NotExecutable
             } else {
                 valid.push(record);
@@ -526,15 +646,18 @@ impl ExceptionDirectory {
     }
 
     /// Exact function chunk ranges as absolute VAs, each mapped to its primary function.
+    /// Entries whose VA arithmetic overflows `u64` are skipped rather than saturated.
     pub fn function_table(&self, image_base: u64) -> FunctionTable {
-        let va = |rva: u32| image_base.saturating_add(u64::from(rva));
+        let va = |rva: u32| image_base.checked_add(u64::from(rva));
         FunctionTable::new(
             self.entries
                 .iter()
-                .map(|e| FunctionRange {
-                    start: va(e.function.begin),
-                    end: va(e.function.end),
-                    function: va(e.primary),
+                .filter_map(|e| {
+                    Some(FunctionRange {
+                        start: va(e.function.begin)?,
+                        end: va(e.function.end)?,
+                        function: va(e.primary)?,
+                    })
                 })
                 .collect(),
         )
@@ -561,7 +684,7 @@ impl ExceptionDirectory {
         let handlers = self
             .handler_rvas()
             .into_iter()
-            .map(|rva| base.saturating_add(u64::from(rva)));
+            .filter_map(|rva| base.checked_add(u64::from(rva)));
         let seeds: Vec<u64> = image
             .function_table
             .function_entries()
@@ -1218,5 +1341,329 @@ pub(crate) mod tests {
             &unwind_bytes(UNW_FLAG_EHANDLER, &[0x10, 0x10, 0, 0]),
         );
         assert_eq!(parse(&file), parse(&file));
+    }
+
+    #[test]
+    fn inverted_and_cross_section_ranges_are_dropped() {
+        let mut file = pe_with_pdata(&[
+            (0x1050, 0x1020, UNWIND_A), // inverted (begin > end)
+            (0x1030, 0x1030, UNWIND_A), // empty (begin == end)
+            (0x1010, 0x2010, UNWIND_A), // starts in .text, crosses into .rdata (still <= SizeOfImage)
+            (0x1060, 0x1070, UNWIND_A), // valid interior function (must not be swallowed)
+            (0x11f0, 0x1200, UNWIND_A), // valid function ending exactly at .text end
+            (0x11f8, 0x1201, UNWIND_A), // 1 byte past .text end
+        ]);
+        put(&mut file, UNWIND_A, &unwind_bytes(0, &[]));
+        let dir = parse(&file);
+        assert_eq!(
+            kinds(&dir),
+            [
+                (PDATA_RVA, PdataDiagnosticKind::Unsorted),
+                (0x1050, PdataDiagnosticKind::EmptyRange),
+                (0x1030, PdataDiagnosticKind::EmptyRange),
+                (0x1010, PdataDiagnosticKind::NotExecutable),
+                (0x11f8, PdataDiagnosticKind::NotExecutable),
+            ]
+        );
+        let ranges: Vec<(u32, u32)> = dir
+            .entries
+            .iter()
+            .map(|e| (e.function.begin, e.function.end))
+            .collect();
+        assert_eq!(ranges, [(0x1060, 0x1070), (0x11f0, 0x1200)]);
+    }
+
+    #[test]
+    fn unsorted_and_overlapping_permutations_are_deterministic() {
+        let sorted = [
+            (0x1010, 0x1020, UNWIND_A),
+            (0x1010, 0x1020, UNWIND_B), // same range, different unwind -> dropped as overlap
+            (0x1010, 0x1030, UNWIND_A), // same begin, wider end -> dropped as overlap
+            (0x1018, 0x1028, UNWIND_A), // partial overlap -> dropped
+            (0x1020, 0x1040, UNWIND_B), // adjacent -> kept
+            (0x1028, 0x1038, UNWIND_A), // nested inside 0x1020..0x1040 -> dropped
+            (0x1060, 0x1070, UNWIND_A), // disjoint -> kept
+            (0x1060, 0x1070, UNWIND_A), // exact duplicate -> merged
+        ];
+        let permutations: [Vec<(u32, u32, u32)>; 3] = [
+            sorted.to_vec(),
+            sorted.iter().copied().rev().collect(),
+            vec![
+                sorted[6], sorted[2], sorted[4], sorted[0], sorted[7], sorted[5], sorted[1],
+                sorted[3],
+            ],
+        ];
+
+        let mut baseline_entries = None;
+        let mut baseline_table = None;
+        let mut baseline_handlers = None;
+        for (idx, records) in permutations.iter().enumerate() {
+            let mut file = pe_with_pdata(records);
+            put(&mut file, UNWIND_A, &unwind_bytes(0, &[]));
+            put(
+                &mut file,
+                UNWIND_B,
+                &unwind_bytes(UNW_FLAG_EHANDLER, &[0x80, 0x10, 0, 0]),
+            );
+            let dir = parse(&file);
+            assert_eq!(
+                dir.diagnostics
+                    .iter()
+                    .any(|d| d.kind == PdataDiagnosticKind::Unsorted),
+                idx != 0,
+                "permutation {idx}"
+            );
+            assert!(
+                dir.entries
+                    .windows(2)
+                    .all(|w| w[0].function.end <= w[1].function.begin)
+            );
+            let kept: Vec<(u32, u32, u32)> = dir
+                .entries
+                .iter()
+                .map(|e| (e.function.begin, e.function.end, e.function.unwind))
+                .collect();
+            assert_eq!(
+                kept,
+                [
+                    (0x1010, 0x1020, UNWIND_A),
+                    (0x1020, 0x1040, UNWIND_B),
+                    (0x1060, 0x1070, UNWIND_A),
+                ]
+            );
+            let table = dir.function_table(BASE);
+            let handlers = dir.handler_rvas();
+            if let Some(ref prev) = baseline_entries {
+                assert_eq!(&dir.entries, prev);
+                assert_eq!(&table, baseline_table.as_ref().unwrap());
+                assert_eq!(&handlers, baseline_handlers.as_ref().unwrap());
+            } else {
+                baseline_entries = Some(dir.entries);
+                baseline_table = Some(table);
+                baseline_handlers = Some(handlers);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_directory_and_huge_sizes_never_panic() {
+        // Sub-record directory on a mapped RVA (< 12 bytes).
+        let mut file = pe_with_pdata(&[]);
+        set_pdata_dir(&mut file, PDATA_RVA, 5);
+        let dir = parse(&file);
+        assert_eq!(dir.record_count, 0);
+        assert_eq!(
+            kinds(&dir),
+            [(PDATA_RVA, PdataDiagnosticKind::TrailingBytes)]
+        );
+
+        // Sub-record directory on an unmapped RVA (< 12 bytes).
+        let mut file = pe_with_pdata(&[]);
+        set_pdata_dir(&mut file, 0x9000, 5);
+        let dir = parse(&file);
+        assert_eq!(dir.record_count, 0);
+        assert_eq!(
+            kinds(&dir),
+            [
+                (0x9000, PdataDiagnosticKind::TrailingBytes),
+                (0x9000, PdataDiagnosticKind::DirectoryUnmapped),
+            ]
+        );
+
+        // Mapped directory RVA with fewer than 12 bytes remaining in .rdata.
+        let mut file = pe_with_pdata(&[]);
+        set_pdata_dir(&mut file, 0x27fc, 24);
+        let dir = parse(&file);
+        assert_eq!(dir.record_count, 0);
+        assert_eq!(
+            kinds(&dir),
+            [(0x27fc, PdataDiagnosticKind::DirectoryTruncated)]
+        );
+
+        // Full record fits, but trailing bytes run past .rdata end.
+        let mut file = pe_with_pdata(&[]);
+        put(&mut file, UNWIND_A, &unwind_bytes(0, &[]));
+        set_pdata_dir(&mut file, 0x27f4, 15);
+        put(
+            &mut file,
+            0x27f4,
+            &[0x10, 0x10, 0, 0, 0x20, 0x10, 0, 0, 0x00, 0x27, 0, 0],
+        );
+        let dir = parse(&file);
+        assert_eq!(dir.record_count, 1);
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(
+            kinds(&dir),
+            [
+                (0x27f4, PdataDiagnosticKind::TrailingBytes),
+                (0x27f4, PdataDiagnosticKind::DirectoryTruncated),
+            ]
+        );
+
+        // Malicious u32::MAX directory size must not OOM or wrap u32.
+        let mut file = pe_with_pdata(&[]);
+        put(&mut file, UNWIND_A, &unwind_bytes(0, &[]));
+        set_pdata_dir(&mut file, 0x27f4, u32::MAX);
+        put(
+            &mut file,
+            0x27f4,
+            &[0x10, 0x10, 0, 0, 0x20, 0x10, 0, 0, 0x00, 0x27, 0, 0],
+        );
+        let dir = parse(&file);
+        assert_eq!(dir.record_count, 1);
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(
+            kinds(&dir),
+            [
+                (0x27f4, PdataDiagnosticKind::TrailingBytes),
+                (0x27f4, PdataDiagnosticKind::DirectoryTruncated),
+            ]
+        );
+
+        // Truncating the backing file at every byte around the directory and unwind info never panics.
+        let mut full = pe_with_pdata(&[
+            (0x1010, 0x1020, UNWIND_A),
+            (0x1030, 0x1040, UNWIND_B),
+            (0x1050, 0x1060, PDATA_RVA + 1),
+        ]);
+        put(&mut full, UNWIND_A, &unwind_bytes(0, &[]));
+        put(
+            &mut full,
+            UNWIND_B,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &[0x10, 0x10, 0, 0]),
+        );
+        let pe = Pe64::parse(&full).expect("parses");
+        for cut in [
+            0usize,
+            file_offset(PDATA_RVA),
+            file_offset(PDATA_RVA) + 1,
+            file_offset(PDATA_RVA) + 11,
+            file_offset(PDATA_RVA) + 12,
+            file_offset(PDATA_RVA) + 23,
+            file_offset(UNWIND_A),
+            file_offset(UNWIND_A) + 3,
+            file_offset(UNWIND_A) + 4,
+            file_offset(UNWIND_B) + 10,
+            full.len(),
+        ] {
+            let dir = ExceptionDirectory::from_pe(&pe, &full[..cut]);
+            assert!(
+                dir.entries
+                    .windows(2)
+                    .all(|w| w[0].function.end <= w[1].function.begin),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn bss_gap_cannot_be_bridged_across_sections() {
+        // Shrink .rdata raw_size to 0x600 while virtual_size remains 0x800, leaving an unmapped
+        // BSS gap at 0x2600..0x2800. A record starting at 0x25fc crosses into that BSS gap and
+        // must not read raw bytes past .rdata's initialized extent.
+        let mut file = pe_with_pdata(&[(0x1010, 0x1020, 0x25fe)]);
+        // .rdata section header starts at 0x1b0; SizeOfRawData is at +16 (0x1c0).
+        file[0x1c0..0x1c4].copy_from_slice(&0x600u32.to_le_bytes());
+        put(&mut file, 0x25fc, &unwind_bytes(0, &[]));
+        let dir = parse(&file);
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!(dir.entries[0].unwind, None);
+        assert_eq!(
+            kinds(&dir),
+            [(0x1010, PdataDiagnosticKind::Unwind(UnwindError::Unmapped))]
+        );
+    }
+
+    #[test]
+    fn checked_arithmetic_guards_unwind_chains_and_va_overflow() {
+        // Handler data_rva overflow near u32::MAX.
+        let bytes = unwind_bytes(UNW_FLAG_EHANDLER, &[0x10, 0x10, 0, 0]);
+        assert_eq!(
+            UnwindInfo::parse(&bytes, u32::MAX - 4),
+            Err(UnwindError::Truncated)
+        );
+        // Maximum CountOfCodes (255) on a short buffer returns Truncated without overflow.
+        assert_eq!(
+            UnwindInfo::parse(&[0x01, 0, u8::MAX, 0], 0x2000),
+            Err(UnwindError::Truncated)
+        );
+
+        // Null unwind RVA (0) and indirect-to-0 (1) must not read the MZ DOS header;
+        // chained parent with inverted begin > end must be rejected as ChainBroken.
+        let mut file = pe_with_pdata(&[
+            (0x1010, 0x1020, 0),        // null unwind RVA
+            (0x1030, 0x1040, 1),        // indirect to RVA 0
+            (0x1050, 0x1060, UNWIND_A), // chained to inverted parent
+            (0x1070, 0x1080, UNWIND_B), // valid primary
+        ]);
+        let inverted_parent = [
+            0x1070u32.to_le_bytes(),
+            0x1060u32.to_le_bytes(), // inverted: begin > end
+            UNWIND_B.to_le_bytes(),
+        ]
+        .concat();
+        put(
+            &mut file,
+            UNWIND_A,
+            &unwind_bytes(UNW_FLAG_CHAININFO, &inverted_parent),
+        );
+        put(&mut file, UNWIND_B, &unwind_bytes(0, &[]));
+        let dir = parse(&file);
+        assert_eq!(
+            kinds(&dir),
+            [
+                (0x1010, PdataDiagnosticKind::Unwind(UnwindError::Unmapped)),
+                (0x1030, PdataDiagnosticKind::ChainBroken),
+                (0x1050, PdataDiagnosticKind::ChainBroken),
+            ]
+        );
+        assert!(dir.entries.iter().all(|e| e.primary == e.function.begin));
+
+        // Near-u64::MAX image base skips overflowing ranges cleanly instead of saturating.
+        let near_max_base = u64::MAX - 0x1038;
+        let table = dir.function_table(near_max_base);
+        assert_eq!(
+            table.ranges(),
+            &[FunctionRange {
+                start: near_max_base + 0x1010,
+                end: near_max_base + 0x1020,
+                function: near_max_base + 0x1010,
+            }]
+        );
+    }
+
+    #[test]
+    fn function_table_boundaries_and_gap_lookup() {
+        let r = |start, end, function| FunctionRange {
+            start,
+            end,
+            function,
+        };
+        let ranges = vec![
+            r(u64::MAX - 0x10, u64::MAX, u64::MAX - 0x10),
+            r(0x40, 0x20, 0x40), // inverted: dropped
+            r(0x20, 0x20, 0x20), // empty: dropped
+            r(0x0, 0x10, 0x0),
+            r(0x10, 0x20, 0x0), // adjacent to [0, 0x10)
+            r(0x30, 0x40, 0x30),
+        ];
+        let mut reversed = ranges.clone();
+        reversed.reverse();
+        let table = FunctionTable::new(ranges);
+        assert_eq!(table, FunctionTable::new(reversed));
+
+        assert_eq!(table.function_at(0), Some(0));
+        assert_eq!(table.function_at(0x10), Some(0));
+        assert_eq!(table.function_at(u64::MAX - 1), Some(u64::MAX - 0x10));
+        assert_eq!(table.function_at(u64::MAX), None);
+
+        // Adjacent ranges have no gap; disjoint ranges report exact gap bounds.
+        assert_eq!(table.gap_at(0), None);
+        assert_eq!(table.gap_at(0x10), None);
+        assert_eq!(table.gap_at(0x20), Some((0x20, 0x30)));
+        assert_eq!(table.gap_at(0x2f), Some((0x20, 0x30)));
+        assert_eq!(table.gap_at(0x30), None);
+        assert_eq!(table.gap_at(0x40), Some((0x40, u64::MAX - 0x10)));
+        assert_eq!(table.gap_at(u64::MAX), None);
     }
 }
