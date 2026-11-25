@@ -12,15 +12,19 @@ const ROUTER_PATH = fileURLToPath(new URL('../web/workers/shader_fallback_router
 const {
   SHADER_STAGE,
   STAGE_NAMES,
+  MISSING_SHADER_REASONS,
   BUILTIN_FALLBACK_WGSL,
   BUILTIN_FALLBACK_PROFILES,
   DEFAULT_ENTRY_POINTS,
   DEFAULT_MAX_TRACKED_MISSING,
   DEFAULT_MAX_TRACKED_MISSING_HASHES,
+  DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
   DEFAULT_TOP_MISSING_LIMIT,
+  DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
   normalizeShaderHash,
   formatShaderHash,
   normalizeStage,
+  normalizeMissingReason,
   normalizeFallbackProfile,
   getBuiltInFallbackProfiles,
   ShaderFallbackRouter,
@@ -984,4 +988,464 @@ test('W133 getStats exposes accurate hitRatio in [0, 1] across empty, miss, mixe
   stats = router.getStats();
   assert.equal(stats.hitRatio, 1);
   assert.equal(stats.hitRatePct, 100);
+});
+
+// ---------------------------------------------------------------------------
+// W179 Real-shader override guard & categorized missing-shader telemetry
+// ---------------------------------------------------------------------------
+
+const BINK2_YUV_PS_WGSL = [
+  '@group(0) @binding(0) var y_tex: texture_2d<f32>;',
+  '@group(0) @binding(1) var cbcr_tex: texture_2d<f32>;',
+  '@group(0) @binding(2) var yuv_sampler: sampler;',
+  '@fragment fn fs_bink2_yuv(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {',
+  '    let y = textureSample(y_tex, yuv_sampler, uv).r;',
+  '    let cbcr = textureSample(cbcr_tex, yuv_sampler, uv).rg - vec2<f32>(0.5, 0.5);',
+  '    let r = y + 1.402 * cbcr.y;',
+  '    let g = y - 0.344136 * cbcr.x - 0.714136 * cbcr.y;',
+  '    let b = y + 1.772 * cbcr.x;',
+  '    return vec4<f32>(clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);',
+  '}',
+].join('\n');
+
+const MENU_UI_PS_WGSL = [
+  '@group(0) @binding(0) var ui_atlas: texture_2d<f32>;',
+  '@group(0) @binding(1) var ui_sampler: sampler;',
+  '@fragment fn fs_menu_ui(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {',
+  '    return textureSample(ui_atlas, ui_sampler, uv);',
+  '}',
+].join('\n');
+
+test('W179 MISSING_SHADER_REASONS and normalizeMissingReason normalize canonical categories and aliases', () => {
+  assert.deepEqual(MISSING_SHADER_REASONS, {
+    NOT_IN_PACK: 'not_in_pack',
+    REFLECTION_FAILED: 'reflection_failed',
+    COMPILE_FAILED: 'compile_failed',
+    OTHER: 'other',
+  });
+  assert.equal(Object.isFrozen(MISSING_SHADER_REASONS), true);
+  assert.equal(DEFAULT_MAX_CATEGORIZED_MISSING_HASHES, 8192);
+  assert.equal(DEFAULT_MISSING_SUMMARY_TOP_LIMIT, 32);
+
+  assert.equal(normalizeMissingReason('not_in_pack'), 'not_in_pack');
+  assert.equal(normalizeMissingReason('  NOT-IN-PACK  '), 'not_in_pack');
+  assert.equal(normalizeMissingReason('pack_miss'), 'not_in_pack');
+  assert.equal(normalizeMissingReason('missing_from_pack'), 'not_in_pack');
+
+  assert.equal(normalizeMissingReason('reflection_failed'), 'reflection_failed');
+  assert.equal(normalizeMissingReason('REFLECTION-FAILED'), 'reflection_failed');
+  assert.equal(normalizeMissingReason('reflection error'), 'reflection_failed');
+  assert.equal(normalizeMissingReason('no_reflection'), 'reflection_failed');
+
+  assert.equal(normalizeMissingReason('compile_failed'), 'compile_failed');
+  assert.equal(normalizeMissingReason('COMPILE-FAILED'), 'compile_failed');
+  assert.equal(normalizeMissingReason('compilation_failed'), 'compile_failed');
+  assert.equal(normalizeMissingReason('wgsl_compile_failed'), 'compile_failed');
+
+  assert.equal(normalizeMissingReason('other'), 'other');
+  assert.equal(normalizeMissingReason('unknown_reason'), 'other');
+  assert.equal(normalizeMissingReason(''), 'other');
+  assert.equal(normalizeMissingReason(null), 'other');
+  assert.equal(normalizeMissingReason(undefined), 'other');
+  assert.equal(normalizeMissingReason(123), 'other');
+});
+
+test('W179 real-pack shaders (menu & Bink2 YUV) are never overwritten by fallback profiles, S9 hashes, or forceFallback', () => {
+  const binkHash = '0xb1a2000000000001';
+  const menuHash = '0xae00000000000002';
+  const missingHash = '0xdead000000000003';
+  let clock = 1000;
+
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({
+      [binkHash]: BINK2_YUV_PS_WGSL,
+      [menuHash]: MENU_UI_PS_WGSL,
+      [S9_FALLBACK_HASHES.fragment]: S9_FALLBACK_WGSL.fragment,
+    }),
+    fallbackHashes: S9_FALLBACK_HASHES,
+    defaultProfile: 'splash_rect_24b',
+    now: () => {
+      clock += 5;
+      return clock;
+    },
+  });
+
+  // Real pack shaders are detected as real shaders; S9 fallback hash is not.
+  assert.equal(router.hasRealShader(binkHash, 'fragment'), true);
+  assert.equal(router.hasRealShader(menuHash, 'fragment'), true);
+  assert.equal(router.hasRealShader(S9_FALLBACK_HASHES.fragment, 'fragment'), false);
+  assert.equal(router.hasRealShader(missingHash, 'fragment'), false);
+
+  assert.equal(router.canFallbackOverride(binkHash, 'fragment'), false);
+  assert.equal(router.canFallbackOverride(menuHash, 'fragment'), false);
+  assert.equal(router.canFallbackOverride(S9_FALLBACK_HASHES.fragment, 'fragment'), true);
+  assert.equal(router.canFallbackOverride(missingHash, 'fragment'), true);
+
+  // Even when a fallback profile or forceFallback is passed, real pack shaders always win.
+  const binkRes = router.resolve(binkHash, 'fragment', {
+    profile: 'splash_rect_24b',
+    forceFallback: true,
+  });
+  assert.equal(binkRes.source, 'pack');
+  assert.equal(binkRes.wgsl, BINK2_YUV_PS_WGSL);
+  assert.equal(binkRes.entryPoint, 'fs_bink2_yuv');
+  assert.equal(binkRes.fallbackBlocked, true);
+  assert.equal(binkRes.guardReason, 'pack_shader_protected');
+
+  const menuRes = router.resolve(menuHash, 'fragment', {
+    profile: 'fullscreen_triangle_cbv',
+  });
+  assert.equal(menuRes.source, 'pack');
+  assert.equal(menuRes.wgsl, MENU_UI_PS_WGSL);
+  assert.equal(menuRes.entryPoint, 'fs_menu_ui');
+  assert.equal(menuRes.fallbackBlocked, undefined);
+
+  // Zero missing telemetry recorded for protected real pack shaders.
+  assert.equal(router.getMissingReport().length, 0);
+  const summary = router.getMissingShaderSummary();
+  assert.equal(summary.totalMissingEvents, 0);
+  assert.equal(summary.realShaderGuard.blockedOverrideCount, 1);
+
+  const guardStats = router.getRealShaderGuardStats();
+  assert.equal(guardStats.blockedOverrideCount, 1);
+  assert.equal(guardStats.blockedShaders.length, 1);
+  assert.equal(guardStats.blockedShaders[0].hashHex, binkHash);
+  assert.equal(guardStats.blockedShaders[0].stage, 'fragment');
+  assert.equal(guardStats.blockedShaders[0].count, 1);
+  assert.equal(guardStats.blockedShaders[0].lastReason, 'pack_shader_protected');
+  // Sanitized: no WGSL leaked in guard stats.
+  assert.equal(JSON.stringify(guardStats).includes('fs_bink2_yuv'), false);
+});
+
+test('W179 registerRealShader and caller existingShader guard protect compiled real modules from silent fallback overwrite', () => {
+  const binkHash = '0xb1a2000000000010';
+  const menuHash = '0xae00000000000020';
+  const inlineHash = '0x1a1a000000000030';
+  const fakeBinkModule = { __kind: 'GPUShaderModule', label: 'bink2_yuv' };
+
+  const router = new ShaderFallbackRouter({
+    packLoader: createS9PackLoader(),
+    fallbackHashes: S9_FALLBACK_HASHES,
+    defaultProfile: 'splash_rect_24b',
+    realShaders: [
+      {
+        hash: menuHash,
+        stage: 'fragment',
+        wgsl: MENU_UI_PS_WGSL,
+        label: 'menu_ui_ps',
+      },
+    ],
+    now: () => 500,
+  });
+
+  // Register a real Bink2 YUV shader module handle (without WGSL text in pack).
+  const regInfo = router.registerRealShader(binkHash, 'fragment', {
+    module: fakeBinkModule,
+    entryPoint: 'fs_bink2_yuv',
+    label: 'bink2_yuv_ps',
+  });
+  assert.deepEqual(regInfo, {
+    hashHex: binkHash,
+    stage: 'fragment',
+    hasWgsl: false,
+    hasModule: true,
+  });
+
+  assert.equal(router.hasRealShader(binkHash, 'fragment'), true);
+  assert.equal(router.hasRealShader(binkHash, 'vertex'), false);
+  assert.equal(router.hasRealShader(menuHash, 'fragment'), true);
+
+  // Attempting to resolve Bink2 YUV fragment shader must NOT return S9 or builtin fallback.
+  const guardedBink = router.resolve(binkHash, 'fragment', { profile: 'splash_rect_24b' });
+  assert.equal(guardedBink.source, 'real');
+  assert.equal(guardedBink.wgsl, null);
+  assert.equal(guardedBink.module, fakeBinkModule);
+  assert.equal(guardedBink.entryPoint, 'fs_bink2_yuv');
+  assert.equal(guardedBink.label, 'bink2_yuv_ps');
+  assert.equal(guardedBink.fallbackBlocked, true);
+  assert.equal(guardedBink.guardReason, 'real_shader_registered');
+
+  // Registered menu shader with WGSL returns preserved real WGSL instead of opaque fallback.
+  const guardedMenu = router.resolve(menuHash, 'fragment', { profile: 'fullscreen_triangle_cbv' });
+  assert.equal(guardedMenu.source, 'real');
+  assert.equal(guardedMenu.wgsl, MENU_UI_PS_WGSL);
+  assert.equal(guardedMenu.entryPoint, 'fs_menu_ui');
+  assert.equal(guardedMenu.fallbackBlocked, true);
+  assert.equal(guardedMenu.guardReason, 'real_shader_registered');
+
+  // Caller-provided existingShader with source: 'pack' or isRealShader: true is also guarded.
+  assert.equal(
+    router.canFallbackOverride(inlineHash, 'fragment', { existingSource: 'pack' }),
+    false
+  );
+  assert.equal(
+    router.canFallbackOverride(inlineHash, 'fragment', { isRealShader: true }),
+    false
+  );
+  assert.equal(
+    router.canFallbackOverride(inlineHash, 'fragment', { source: 'builtin' }),
+    true
+  );
+
+  const guardedInline = router.resolve(inlineHash, 'fragment', {
+    profile: 'textured_quad_24b',
+    existingShader: {
+      source: 'pack',
+      wgsl: BINK2_YUV_PS_WGSL,
+      entryPoint: 'fs_bink2_yuv',
+    },
+  });
+  assert.equal(guardedInline.source, 'pack');
+  assert.equal(guardedInline.wgsl, BINK2_YUV_PS_WGSL);
+  assert.equal(guardedInline.fallbackBlocked, true);
+  assert.equal(guardedInline.guardReason, 'existing_real_shader');
+
+  // None of the guarded lookups counted as fallbackHits, builtinHits, or missing shaders.
+  const stats = router.getStats();
+  assert.equal(stats.fallbackHits, 0);
+  assert.equal(stats.builtinHits, 0);
+  assert.equal(stats.uniqueMissing, 0);
+
+  const guardStats = router.getRealShaderGuardStats();
+  assert.equal(guardStats.registeredRealShaders, 2);
+  assert.equal(guardStats.blockedOverrideCount, 3);
+  assert.equal(guardStats.blockedShaders.length, 3);
+  // Ensure JSON-safe and free of module/WGSL leaks.
+  const guardJson = JSON.stringify(guardStats);
+  assert.deepEqual(JSON.parse(guardJson), guardStats);
+  assert.equal(guardJson.includes('GPUShaderModule'), false);
+  assert.equal(guardJson.includes('textureSample'), false);
+
+  // reset() clears blocked counters while keeping registered real shaders protected.
+  router.reset();
+  assert.equal(router.getRealShaderGuardStats().blockedOverrideCount, 0);
+  assert.equal(router.getRealShaderGuardStats().registeredRealShaders, 2);
+  assert.equal(router.hasRealShader(binkHash, 'fragment'), true);
+
+  // Explicit unregisterRealShader / clearRealShaders re-enables fallback resolution.
+  assert.equal(router.unregisterRealShader(binkHash, 'fragment'), true);
+  assert.equal(router.unregisterRealShader(binkHash, 'fragment'), false);
+  assert.equal(router.hasRealShader(binkHash, 'fragment'), false);
+  const afterUnreg = router.resolve(binkHash, 'fragment');
+  assert.equal(afterUnreg.source, 'fallback');
+
+  router.clearRealShaders();
+  assert.equal(router.hasRealShader(menuHash, 'fragment'), false);
+});
+
+test('W179 recordMissingShader categorizes reasons & stages and getMissingShaderSummary exports JSON-safe sorted triage data', () => {
+  let tick = 100;
+  const router = new ShaderFallbackRouter({
+    now: () => {
+      tick += 10;
+      return tick;
+    },
+  });
+
+  const hMenuPs = '0x000000000000aa01';
+  const hBinkPs = '0x000000000000bb02';
+  const hMenuVs = '0x000000000000cc03';
+  const hComputeCs = '0x000000000000dd04';
+
+  // resolve() miss automatically records 'not_in_pack' in categorized summary.
+  router.resolve(hMenuPs, 'fragment');
+  router.resolve(hMenuPs, 'ps');
+
+  // Explicit recordMissingShader across all 4 categories and all 3 stages.
+  const rec1 = router.recordMissingShader(hBinkPs, 'fragment', 'compile_failed');
+  assert.equal(rec1.hashHex, hBinkPs);
+  assert.equal(rec1.stage, 'fragment');
+  assert.equal(rec1.reason, 'compile_failed');
+  assert.equal(rec1.hitCount, 1);
+  assert.equal(rec1.tracked, true);
+  assert.equal(rec1.overflowed, false);
+
+  router.recordMissingShader(0xbb02n, SHADER_STAGE.FRAGMENT, 'compile_failed');
+  router.recordMissingShader('bb02', 'fs', 'compile_failed');
+  router.recordMissingShader(hBinkPs, 'fragment', 'reflection_failed');
+
+  router.recordMissingShader(hMenuVs, 'vertex', 'reflection_failed');
+  router.recordMissingShader(hMenuVs, 1, 'reflection_failed');
+  router.recordMissingShader(hComputeCs, 'compute', 'other');
+  router.recordMissingShader(hComputeCs, 'cs', 'unrecognized_custom_tag');
+
+  const summary = router.getMissingShaderSummary();
+  assert.equal(summary.totalMissingEvents, 10);
+  assert.equal(summary.uniqueMissingHashes, 4);
+  assert.equal(summary.maxTrackedHashes, DEFAULT_MAX_CATEGORIZED_MISSING_HASHES);
+  assert.equal(summary.overflowCount, 0);
+
+  assert.deepEqual(summary.countsByReason, {
+    not_in_pack: 2,
+    reflection_failed: 3,
+    compile_failed: 3,
+    other: 2,
+  });
+  assert.deepEqual(summary.countsByStage, {
+    vertex: 2,
+    fragment: 6,
+    compute: 2,
+  });
+  assert.deepEqual(summary.uniqueCountsByReason, {
+    not_in_pack: 1,
+    reflection_failed: 2,
+    compile_failed: 1,
+    other: 1,
+  });
+  assert.deepEqual(summary.uniqueCountsByStage, {
+    vertex: 1,
+    fragment: 2,
+    compute: 1,
+  });
+
+  // Sorted by hitCount descending, ties broken deterministically by hashHex ascending.
+  assert.equal(summary.topMissing.length, 4);
+  assert.equal(summary.topMissing[0].hashHex, hBinkPs);
+  assert.equal(summary.topMissing[0].hitCount, 4);
+  assert.equal(summary.topMissing[0].reason, 'compile_failed'); // dominant (3 vs 1)
+  assert.equal(summary.topMissing[0].lastReason, 'reflection_failed');
+  assert.deepEqual(summary.topMissing[0].reasons, {
+    not_in_pack: 0,
+    reflection_failed: 1,
+    compile_failed: 3,
+    other: 0,
+  });
+
+  // Remaining 3 entries all have hitCount === 2 -> ordered lexicographically by hashHex.
+  assert.deepEqual(
+    summary.topMissing.slice(1).map((r) => ({ hashHex: r.hashHex, stage: r.stage, hitCount: r.hitCount, reason: r.reason })),
+    [
+      { hashHex: hMenuPs, stage: 'fragment', hitCount: 2, reason: 'not_in_pack' },
+      { hashHex: hMenuVs, stage: 'vertex', hitCount: 2, reason: 'reflection_failed' },
+      { hashHex: hComputeCs, stage: 'compute', hitCount: 2, reason: 'other' },
+    ]
+  );
+
+  // Filter by reason, stage, and numeric/object limit.
+  const reflOnly = router.getMissingShaderSummary({ reason: 'reflection_failed' });
+  assert.equal(reflOnly.topMissing.length, 2);
+  // hMenuVs has 2 reflection_failed hits vs hBinkPs 1 reflection_failed hit.
+  assert.equal(reflOnly.topMissing[0].hashHex, hMenuVs);
+  assert.equal(reflOnly.topMissing[1].hashHex, hBinkPs);
+
+  const fragOnly = router.getMissingShaderSummary({ stage: 'fragment', limit: 1 });
+  assert.equal(fragOnly.topMissing.length, 1);
+  assert.equal(fragOnly.topMissing[0].hashHex, hBinkPs);
+
+  assert.equal(router.getMissingShaderSummary(2).topMissing.length, 2);
+  assert.deepEqual(router.getMissingShaderSummary(0).topMissing, []);
+
+  // Strictly JSON-safe and mutation-isolated.
+  const serialized = JSON.stringify(summary);
+  assert.deepEqual(JSON.parse(serialized), summary);
+  summary.countsByReason.compile_failed = 9999;
+  summary.topMissing[0].hitCount = 9999;
+  const fresh = router.getMissingShaderSummary();
+  assert.equal(fresh.countsByReason.compile_failed, 3);
+  assert.equal(fresh.topMissing[0].hitCount, 4);
+
+  // Validation errors on bad inputs.
+  assert.throws(() => router.getMissingShaderSummary(-1), RangeError);
+  assert.throws(() => router.getMissingShaderSummary({ limit: 1.5 }), RangeError);
+  assert.throws(() => router.getMissingShaderSummary('bad'), RangeError);
+  assert.throws(() => router.recordMissingShader('0xzz', 'vertex', 'not_in_pack'), RangeError);
+  assert.throws(() => router.recordMissingShader('0x1', 'geometry', 'not_in_pack'), RangeError);
+});
+
+test('W179 categorized missing-shader tracking is bounded at 8192 by default and handles overflow cleanly', () => {
+  const defaultRouter = new ShaderFallbackRouter({ now: () => 1 });
+  for (let i = 1; i <= 8192; i += 1) {
+    const rec = defaultRouter.recordMissingShader(BigInt(i), 'fragment', 'not_in_pack');
+    assert.equal(rec.tracked, true);
+    assert.equal(rec.overflowed, false);
+  }
+
+  let summary = defaultRouter.getMissingShaderSummary({ limit: 3 });
+  assert.equal(summary.uniqueMissingHashes, 8192);
+  assert.equal(summary.maxTrackedHashes, 8192);
+  assert.equal(summary.overflowCount, 0);
+  assert.equal(summary.totalMissingEvents, 8192);
+  assert.equal(summary.topMissing.length, 3);
+
+  // 8193rd unseen hash overflows without growing unique map, while aggregate counters stay exact.
+  const overflowed = defaultRouter.recordMissingShader(BigInt(8193), 'fragment', 'compile_failed');
+  assert.equal(overflowed.tracked, false);
+  assert.equal(overflowed.overflowed, true);
+
+  // Already-tracked hash still increments hitCount without overflowing.
+  const repeated = defaultRouter.recordMissingShader(BigInt(1), 'fragment', 'reflection_failed');
+  assert.equal(repeated.tracked, true);
+  assert.equal(repeated.overflowed, false);
+  assert.equal(repeated.hitCount, 2);
+
+  summary = defaultRouter.getMissingShaderSummary({ limit: 1 });
+  assert.equal(summary.uniqueMissingHashes, 8192);
+  assert.equal(summary.overflowCount, 1);
+  assert.equal(summary.totalMissingEvents, 8194);
+  assert.equal(summary.countsByReason.not_in_pack, 8192);
+  assert.equal(summary.countsByReason.compile_failed, 1);
+  assert.equal(summary.countsByReason.reflection_failed, 1);
+  assert.equal(summary.topMissing[0].hashHex, '0x0000000000000001');
+  assert.equal(summary.topMissing[0].hitCount, 2);
+
+  // Custom maxCategorizedMissingHashes validation & zero cap.
+  const zeroCap = new ShaderFallbackRouter({ maxCategorizedMissingHashes: 0, now: () => 2 });
+  const z = zeroCap.recordMissingShader('0x1234', 'vertex', 'compile_failed');
+  assert.equal(z.tracked, false);
+  assert.equal(z.overflowed, true);
+  const zSum = zeroCap.getMissingShaderSummary();
+  assert.equal(zSum.uniqueMissingHashes, 0);
+  assert.equal(zSum.overflowCount, 1);
+  assert.equal(zSum.countsByReason.compile_failed, 1);
+
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxCategorizedMissingHashes: -1 }),
+    /maxCategorizedMissingHashes/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxCategorizedMissingHashes: 4.2 }),
+    /maxCategorizedMissingHashes/
+  );
+
+  // reset() clears categorized missing map and totals.
+  defaultRouter.reset();
+  const afterReset = defaultRouter.getMissingShaderSummary();
+  assert.equal(afterReset.totalMissingEvents, 0);
+  assert.equal(afterReset.uniqueMissingHashes, 0);
+  assert.equal(afterReset.overflowCount, 0);
+  assert.deepEqual(afterReset.topMissing, []);
+});
+
+test('W179 classic Worker importScripts isolation exposes new APIs with zero global leaks', () => {
+  const source = readFileSync(ROUTER_PATH, 'utf8');
+  const sandbox = { console, performance };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const MISSING_SHADER_REASONS = {};
+      const MISSING_SHADER_REASON_ORDER = [];
+      const MISSING_SHADER_REASON_ALIASES = {};
+      const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 0;
+      const DEFAULT_MISSING_SUMMARY_TOP_LIMIT = 0;
+      `,
+      vmCtx
+    );
+  });
+
+  const api = vmCtx.PlayGta6ShaderFallbackRouter;
+  assert.ok(api.MISSING_SHADER_REASONS);
+  assert.equal(api.DEFAULT_MAX_CATEGORIZED_MISSING_HASHES, 8192);
+  assert.equal(typeof api.normalizeMissingReason, 'function');
+  const r = new api.ShaderFallbackRouter();
+  assert.equal(typeof r.recordMissingShader, 'function');
+  assert.equal(typeof r.getMissingShaderSummary, 'function');
+  assert.equal(typeof r.registerRealShader, 'function');
+  assert.equal(typeof r.hasRealShader, 'function');
+  assert.equal(typeof r.canFallbackOverride, 'function');
 });
