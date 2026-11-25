@@ -115,8 +115,15 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
           calls.push({
             op: 'copyBufferToTexture',
             source: { ...source },
-            destination: { ...destination },
+            destination: {
+              ...destination,
+              origin: destination.origin ? { ...destination.origin } : destination.origin,
+            },
             copySize: { ...copySize },
+            sourceRef: source,
+            destinationRef: destination,
+            originRef: destination.origin,
+            copySizeRef: copySize,
             bytes: snapshot,
           });
         },
@@ -159,9 +166,16 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
         const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         calls.push({
           op: 'writeTexture',
-          destination: { ...destination },
+          destination: {
+            ...destination,
+            origin: destination.origin ? { ...destination.origin } : destination.origin,
+          },
           dataLayout: { ...dataLayout },
           size: { ...size },
+          destinationRef: destination,
+          originRef: destination.origin,
+          dataLayoutRef: dataLayout,
+          sizeRef: size,
           isSab: typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer,
           dataRef: data,
           bufferRef: data.buffer,
@@ -327,7 +341,11 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 0,
+    uploadsCount: 0,
     uploadBytes: 0,
+    uploadBytesTotal: 0,
+    reusedDescriptorCount: 0,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 0,
     scratchRepackUploads: 0,
     directZeroCopyUploads: 0,
@@ -616,7 +634,11 @@ test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 1,
+    uploadsCount: 1,
     uploadBytes: 1024,
+    uploadBytesTotal: 1024,
+    reusedDescriptorCount: 1,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 0,
     scratchRepackUploads: 1,
     directZeroCopyUploads: 0,
@@ -682,7 +704,11 @@ test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 2,
+    uploadsCount: 2,
     uploadBytes: 32,
+    uploadBytesTotal: 32,
+    reusedDescriptorCount: 2,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 1,
     scratchRepackUploads: 0,
     directZeroCopyUploads: 1,
@@ -767,7 +793,11 @@ test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only un
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 3,
+    uploadsCount: 3,
     uploadBytes: 1536,
+    uploadBytesTotal: 1536,
+    reusedDescriptorCount: 3,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 0,
     scratchRepackUploads: 1,
     directZeroCopyUploads: 0,
@@ -831,6 +861,8 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
       const expandA8ToRgba8 = null;
       const alignCopySizeForFormat = null;
       const calcMipUploadLayout = null;
+      const calcMipDimension = null;
+      const clampSubRegionToMipBounds = null;
       class TexturePackets {}
       class TextureScratchPool {}
       `,
@@ -841,6 +873,8 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
   assert.equal(typeof ctx.PlayGta6TexturePackets.alignBytesPerRow256, 'function');
   assert.equal(typeof ctx.PlayGta6TexturePackets.repackRowsTo256, 'function');
   assert.equal(typeof ctx.PlayGta6TexturePackets.expandA8ToRgba8, 'function');
+  assert.equal(typeof ctx.PlayGta6TexturePackets.clampSubRegionToMipBounds, 'function');
+  assert.equal(typeof ctx.PlayGta6TexturePackets.calcMipDimension, 'function');
   assert.equal(typeof ctx.PlayGta6TexturePackets.TextureScratchPool, 'function');
   assert.equal(typeof ctx.PlayGta6TextureFormats.expandA8ToRgba8, 'function');
   assert.equal(typeof ctx.PlayGta6TextureFormats.TextureScratchPool, 'function');
@@ -973,7 +1007,11 @@ test('W108 (#734): 3D BC textures fall back to rgba8unorm without bc-sliced-3d a
     bc3dFallbacks: 3,
     bc3dFallbackUploadsSkipped: 3,
     uploadCount: 0,
+    uploadsCount: 0,
     uploadBytes: 0,
+    uploadBytesTotal: 0,
+    reusedDescriptorCount: 0,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 0,
     scratchRepackUploads: 0,
     directZeroCopyUploads: 0,
@@ -1214,7 +1252,11 @@ test('W164 (#871): 4K Bink2 3840x2160 r8unorm Y plane takes zero-copy direct que
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 1,
+    uploadsCount: 1,
     uploadBytes: W * H,
+    uploadBytesTotal: W * H,
+    reusedDescriptorCount: 1,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 1,
     scratchRepackUploads: 0,
     directZeroCopyUploads: 1,
@@ -1346,7 +1388,11 @@ test('W164 (#871): 4K Bink2 1920x1080 r8unorm Cr/Cb planes reuse persistent scra
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: FRAMES * 3,
+    uploadsCount: FRAMES * 3,
     uploadBytes: expectedBytes,
+    uploadBytesTotal: expectedBytes,
+    reusedDescriptorCount: FRAMES * 3,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: FRAMES,
     scratchRepackUploads: FRAMES * 2,
     directZeroCopyUploads: FRAMES,
@@ -1593,7 +1639,11 @@ test('W164 (#871): telemetry resets cleanly on reset(), destroy(), and processor
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
     uploadCount: 0,
+    uploadsCount: 0,
     uploadBytes: 0,
+    uploadBytesTotal: 0,
+    reusedDescriptorCount: 0,
+    clampedSubRegionCount: 0,
     zeroCopyUploads: 0,
     scratchRepackUploads: 0,
     directZeroCopyUploads: 0,
@@ -2467,4 +2517,502 @@ test('W265 (#1127): TextureScratchPool enforces upper cap, multi-slot isolation,
   assert.equal(pool.currentBuffer, null);
   assert.equal(pool.retainedBytes, 0);
   assert.equal(multiPool.retainedBytes, 0);
+});
+
+test('W303 (#1219): pre-allocated WebGPU descriptor structs are reused across consecutive writeTexture & copyBufferToTexture uploads with every field overwritten', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 901, width: 64, height: 64, layers: 4, mips: 4, usage: 0x06, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 902, width: 128, height: 128, layers: 1, mips: 1, usage: 0x06, format: 1 })
+  );
+  const texA = processor.textures.get(901);
+  const texB = processor.textures.get(902);
+
+  // 1) Consecutive direct queue.writeTexture calls with differing fields (including aspect & rowsPerImage).
+  const res1 = handler.writeTexture(
+    { texture: texA, mipLevel: 2, origin: { x: 4, y: 8, z: 2 }, aspect: 'depth-only' },
+    new Uint8Array(256 * 4),
+    { offset: 16, bytesPerRow: 256, rowsPerImage: 4 },
+    { width: 8, height: 4, depthOrArrayLayers: 1 },
+    901
+  );
+  const res2 = handler.writeTexture(
+    { texture: texB, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    new Uint8Array(128),
+    { offset: 0, bytesPerRow: 128 },
+    { width: 128, height: 1, depthOrArrayLayers: 1 },
+    902
+  );
+  assert.equal(res1.uploaded, true);
+  assert.equal(res2.uploaded, true);
+
+  // Also issue two consecutive WriteTexture command packets on the fast path.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 901,
+      mipLevel: 0,
+      originX: 0,
+      originY: 0,
+      originZ: 1,
+      width: 64,
+      height: 2,
+      layers: 1,
+      bytesPerRow: 256,
+      rowsPerImage: 2,
+      data: new Uint8Array(512),
+    })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 901,
+      mipLevel: 1,
+      originX: 8,
+      originY: 4,
+      originZ: 0,
+      width: 16,
+      height: 2,
+      layers: 1,
+      bytesPerRow: 256,
+      rowsPerImage: 0,
+      data: new Uint8Array(512),
+    })
+  );
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 4);
+
+  // Every writeTexture call reuses the exact same pre-allocated descriptor instances.
+  for (let i = 1; i < wtCalls.length; i += 1) {
+    assert.equal(wtCalls[i].destinationRef, wtCalls[0].destinationRef, 'GPUTexelCopyTextureInfo must be reused');
+    assert.equal(wtCalls[i].originRef, wtCalls[0].originRef, 'GPUOrigin3D must be reused');
+    assert.equal(wtCalls[i].dataLayoutRef, wtCalls[0].dataLayoutRef, 'GPUTexelCopyBufferLayout must be reused');
+    assert.equal(wtCalls[i].sizeRef, wtCalls[0].sizeRef, 'GPUExtent3DDict must be reused');
+  }
+
+  // Verify every field was overwritten cleanly on call 2 (no stale aspect, mipLevel, origin, offset, or rowsPerImage).
+  assert.equal(wtCalls[0].destination.texture, texA);
+  assert.equal(wtCalls[0].destination.mipLevel, 2);
+  assert.deepEqual(wtCalls[0].destination.origin, { x: 4, y: 8, z: 2 });
+  assert.equal(wtCalls[0].destination.aspect, 'depth-only');
+  assert.equal(wtCalls[0].dataLayout.offset, 16);
+  assert.equal(wtCalls[0].dataLayout.bytesPerRow, 256);
+  assert.equal(wtCalls[0].dataLayout.rowsPerImage, 4);
+  assert.deepEqual(wtCalls[0].size, { width: 8, height: 4, depthOrArrayLayers: 1 });
+
+  assert.equal(wtCalls[1].destination.texture, texB);
+  assert.equal(wtCalls[1].destination.mipLevel, 0);
+  assert.deepEqual(wtCalls[1].destination.origin, { x: 0, y: 0, z: 0 });
+  assert.equal(wtCalls[1].destination.aspect, 'all');
+  assert.equal(wtCalls[1].dataLayout.offset, 0);
+  assert.equal(wtCalls[1].dataLayout.bytesPerRow, 128);
+  assert.equal(wtCalls[1].dataLayout.rowsPerImage, undefined);
+  assert.deepEqual(wtCalls[1].size, { width: 128, height: 1, depthOrArrayLayers: 1 });
+
+  assert.equal(wtCalls[3].destination.mipLevel, 1);
+  assert.deepEqual(wtCalls[3].destination.origin, { x: 8, y: 4, z: 0 });
+  assert.deepEqual(wtCalls[3].size, { width: 16, height: 2, depthOrArrayLayers: 1 });
+
+  // 2) Consecutive copyBufferToTexture calls reuse GPUTexelCopyBufferInfo, GPUTexelCopyTextureInfo, and GPUExtent3DDict.
+  const encoder = gpu.device.createCommandEncoder();
+  const buf1 = gpu.device.createBuffer({ size: 1024, usage: 0x0004 | 0x0008 });
+  const buf2 = gpu.device.createBuffer({ size: 1024, usage: 0x0004 | 0x0008 });
+
+  handler.copyBufferToTexture(
+    encoder,
+    { buffer: buf1, offset: 256, bytesPerRow: 256, rowsPerImage: 2 },
+    { texture: texA, mipLevel: 1, origin: { x: 4, y: 4, z: 1 }, aspect: 'stencil-only' },
+    { width: 8, height: 2, depthOrArrayLayers: 1 }
+  );
+  handler.copyBufferToTexture(
+    encoder,
+    { buffer: buf2, offset: 0, bytesPerRow: 256, rowsPerImage: 1 },
+    { texture: texB, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 64, height: 1, depthOrArrayLayers: 1 }
+  );
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 2);
+  assert.equal(c2tCalls[1].sourceRef, c2tCalls[0].sourceRef, 'GPUTexelCopyBufferInfo must be reused');
+  assert.equal(c2tCalls[1].destinationRef, c2tCalls[0].destinationRef, 'GPUTexelCopyTextureInfo must be reused');
+  assert.equal(c2tCalls[1].originRef, c2tCalls[0].originRef, 'GPUOrigin3D must be reused');
+  assert.equal(c2tCalls[1].copySizeRef, c2tCalls[0].copySizeRef, 'GPUExtent3DDict must be reused');
+
+  assert.equal(c2tCalls[0].source.buffer, buf1);
+  assert.equal(c2tCalls[0].source.offset, 256);
+  assert.equal(c2tCalls[0].destination.aspect, 'stencil-only');
+  assert.deepEqual(c2tCalls[0].destination.origin, { x: 4, y: 4, z: 1 });
+  assert.equal(c2tCalls[1].source.buffer, buf2);
+  assert.equal(c2tCalls[1].source.offset, 0);
+  assert.equal(c2tCalls[1].destination.aspect, 'all');
+  assert.deepEqual(c2tCalls[1].destination.origin, { x: 0, y: 0, z: 0 });
+  assert.deepEqual(c2tCalls[1].copySize, { width: 64, height: 1, depthOrArrayLayers: 1 });
+
+  const stats = handler.getStats();
+  assert.equal(stats.uploadsCount, 6);
+  assert.equal(stats.uploadCount, 6);
+  assert.equal(stats.reusedDescriptorCount, 6);
+  assert.equal(stats.clampedSubRegionCount, 0);
+  assert.equal(stats.uploadBytesTotal, stats.uploadBytes);
+  assert.equal(stats.uploadBytesTotal, stats.bytesUploaded);
+});
+
+test('W303 (#1219): sub-region dirty-rect bounds clamping validates mip dimensions across 1D/2D/2D-array/3D/UI-atlas paths without WebGPU out-of-bounds errors', () => {
+  // 1) Pure helper checks for calcMipDimension & clampSubRegionToMipBounds.
+  assert.equal(tp.calcMipDimension(256, 0), 256);
+  assert.equal(tp.calcMipDimension(256, 2), 64);
+  assert.equal(tp.calcMipDimension(256, 12), 1);
+  assert.equal(tp.calcMipDimension(256, 40), 1);
+
+  // 2D mip 2 of 256x128 -> 64x32; dirty rect at (48, 24) size 32x16 -> clamped to 16x8.
+  const c2d = tp.clampSubRegionToMipBounds(
+    { width: 256, height: 128, depthOrArrayLayers: 1, mipLevelCount: 9, dimension: '2d', format: 'rgba8unorm' },
+    2,
+    { x: 48, y: 24, z: 0 },
+    { width: 32, height: 16, depthOrArrayLayers: 1 }
+  );
+  assert.equal(c2d.valid, true);
+  assert.equal(c2d.clamped, true);
+  assert.equal(c2d.outOfBounds, false);
+  assert.equal(c2d.width, 16);
+  assert.equal(c2d.height, 8);
+  assert.equal(c2d.depthOrArrayLayers, 1);
+  assert.equal(c2d.mipWidth, 64);
+  assert.equal(c2d.mipHeight, 32);
+
+  // 2D array: layers (6) do NOT shrink at mip 2, so z=4 depth=4 clamps to depth=2.
+  const cArr = tp.clampSubRegionToMipBounds(
+    { width: 64, height: 64, depthOrArrayLayers: 6, mipLevelCount: 5, dimension: '2d', format: 'rgba8unorm' },
+    2,
+    { x: 0, y: 0, z: 4 },
+    { width: 16, height: 16, depthOrArrayLayers: 4 }
+  );
+  assert.equal(cArr.valid, true);
+  assert.equal(cArr.clamped, true);
+  assert.equal(cArr.depthOrArrayLayers, 2);
+  assert.equal(cArr.mipDepth, 6);
+
+  // 3D texture: depth (8) DOES shrink at mip 2 -> mipDepth=2; z=1 depth=4 clamps to depth=1.
+  const c3d = tp.clampSubRegionToMipBounds(
+    { width: 64, height: 64, depthOrArrayLayers: 8, mipLevelCount: 5, dimension: '3d', format: 'rgba8unorm' },
+    2,
+    { x: 0, y: 0, z: 1 },
+    { width: 16, height: 16, depthOrArrayLayers: 4 }
+  );
+  assert.equal(c3d.valid, true);
+  assert.equal(c3d.clamped, true);
+  assert.equal(c3d.depthOrArrayLayers, 1);
+  assert.equal(c3d.mipDepth, 2);
+
+  // Completely out-of-bounds dirty rect (origin.x >= mipWidth) -> valid=false, clamped=true, outOfBounds=true.
+  const cOob = tp.clampSubRegionToMipBounds(
+    { width: 64, height: 64, depthOrArrayLayers: 1, mipLevelCount: 4, dimension: '2d', format: 'rgba8unorm' },
+    1,
+    { x: 32, y: 0, z: 0 },
+    { width: 8, height: 8, depthOrArrayLayers: 1 }
+  );
+  assert.equal(cOob.valid, false);
+  assert.equal(cOob.clamped, true);
+  assert.equal(cOob.outOfBounds, true);
+  assert.equal(cOob.invalidMipLevel, false);
+
+  // Invalid mipLevel >= mipLevelCount -> invalidMipLevel=true.
+  const cBadMip = tp.clampSubRegionToMipBounds(
+    { width: 64, height: 64, depthOrArrayLayers: 1, mipLevelCount: 3, dimension: '2d', format: 'rgba8unorm' },
+    5,
+    { x: 0, y: 0, z: 0 },
+    { width: 4, height: 4, depthOrArrayLayers: 1 }
+  );
+  assert.equal(cBadMip.valid, false);
+  assert.equal(cBadMip.invalidMipLevel, true);
+
+  // 2) End-to-end strict WebGPU bounds validation across WriteTexture (direct + staged),
+  //    copyBufferToTexture, and writeA8Texture.
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const assertInMipBounds = (destination, size, label) => {
+    const desc = destination.texture.desc;
+    const mip = destination.mipLevel || 0;
+    assert.ok(mip >= 0 && mip < desc.mipLevelCount, `${label}: mipLevel ${mip} out of range`);
+    const info = tp.getTextureFormatBlockInfo(desc.format);
+    const bw = info && info.isCompressed ? info.blockWidth : 1;
+    const bh = info && info.isCompressed ? info.blockHeight : 1;
+    const mipW = Math.ceil(tp.calcMipDimension(desc.size.width, mip) / bw) * bw;
+    const mipH = desc.dimension === '1d' ? 1 : Math.ceil(tp.calcMipDimension(desc.size.height, mip) / bh) * bh;
+    const mipD =
+      desc.dimension === '1d'
+        ? 1
+        : desc.dimension === '3d'
+          ? tp.calcMipDimension(desc.size.depthOrArrayLayers, mip)
+          : desc.size.depthOrArrayLayers;
+    const ox = (destination.origin && destination.origin.x) || 0;
+    const oy = (destination.origin && destination.origin.y) || 0;
+    const oz = (destination.origin && destination.origin.z) || 0;
+    assert.ok(ox >= 0 && size.width >= 1 && ox + size.width <= mipW, `${label}: X ${ox}+${size.width} > ${mipW}`);
+    assert.ok(oy >= 0 && size.height >= 1 && oy + size.height <= mipH, `${label}: Y ${oy}+${size.height} > ${mipH}`);
+    assert.ok(oz >= 0 && size.depthOrArrayLayers >= 1 && oz + size.depthOrArrayLayers <= mipD, `${label}: Z ${oz}+${size.depthOrArrayLayers} > ${mipD}`);
+  };
+  const origWt = gpu.device.queue.writeTexture;
+  gpu.device.queue.writeTexture = (dest, data, layout, size) => {
+    assertInMipBounds(dest, size, 'writeTexture');
+    return origWt(dest, data, layout, size);
+  };
+  const origEnc = gpu.device.createCommandEncoder;
+  gpu.device.createCommandEncoder = () => {
+    const enc = origEnc();
+    const origC2t = enc.copyBufferToTexture;
+    enc.copyBufferToTexture = (src, dest, size) => {
+      assertInMipBounds(dest, size, 'copyBufferToTexture');
+      return origC2t(src, dest, size);
+    };
+    return enc;
+  };
+
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 128 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // Create 64x64 4-mip rgba8unorm UI atlas (mip 0 = 64x64, mip 1 = 32x32, mip 2 = 16x16, mip 3 = 8x8).
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 920, width: 64, height: 64, mips: 4, usage: 0x06, format: 22 })
+  );
+  const atlasTex = processor.textures.get(920);
+
+  // (a) Staged WriteTexture packet: partial UI dirty rect at (48, 48) size 32x32 (overflows 64x64 -> clamps to 16x16).
+  const dirtyPixels = new Uint8Array(32 * 32 * 4);
+  for (let y = 0; y < 32; y += 1) {
+    dirtyPixels[y * 128] = 0x10 + y;
+  }
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 920,
+      mipLevel: 0,
+      originX: 48,
+      originY: 48,
+      width: 32,
+      height: 32,
+      bytesPerRow: 128,
+      rowsPerImage: 32,
+      data: dirtyPixels,
+    })
+  );
+
+  // (b) Direct 256B-aligned WriteTexture packet at mip 1 (32x32): origin (20, 20), size 64x20 -> clamps to 12x12.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 920,
+      mipLevel: 1,
+      originX: 20,
+      originY: 20,
+      width: 64,
+      height: 20,
+      bytesPerRow: 256,
+      rowsPerImage: 20,
+      data: new Uint8Array(256 * 20),
+    })
+  );
+
+  // (c) Completely out-of-bounds dirty rect at mip 2 (16x16): origin (24, 0) -> cleanly skipped, no GPU call, no error.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 920,
+      mipLevel: 2,
+      originX: 24,
+      originY: 0,
+      width: 8,
+      height: 8,
+      bytesPerRow: 32,
+      rowsPerImage: 8,
+      data: new Uint8Array(256),
+    })
+  );
+
+  // (d) Direct writeA8Texture partial glyph dirty rect at (56, 56) size 16x16 -> clamps to 8x8 preserving row stride 16.
+  const glyphSrc = new Uint8Array(16 * 16);
+  glyphSrc[0] = 0xa1;
+  glyphSrc[7] = 0xa7;
+  glyphSrc[16] = 0xb1; // row 1 col 0 at stride 16
+  const a8Res = handler.writeA8Texture(
+    { texture: atlasTex, mipLevel: 0, origin: { x: 56, y: 56, z: 0 } },
+    glyphSrc,
+    { width: 16, height: 16, depthOrArrayLayers: 1 },
+    { preferDirect: true }
+  );
+  assert.equal(a8Res.uploaded, true);
+  assert.equal(a8Res.clamped, true);
+  assert.equal(a8Res.width, 8);
+  assert.equal(a8Res.height, 8);
+
+  // (e) GPU-buffer copyBufferToTexture partial dirty rect at mip 2 (16x16): origin (10, 12) size 12x8 -> clamps to 6x4.
+  const encoder = gpu.device.createCommandEncoder();
+  const srcBuf = gpu.device.createBuffer({ size: 256 * 8, usage: 0x0004 });
+  const c2tRes = handler.copyBufferToTexture(
+    encoder,
+    { buffer: srcBuf, offset: 0, bytesPerRow: 256, rowsPerImage: 8 },
+    { texture: atlasTex, mipLevel: 2, origin: { x: 10, y: 12, z: 0 } },
+    { width: 12, height: 8, depthOrArrayLayers: 1 }
+  );
+  assert.equal(c2tRes.clamped, true);
+
+  // (f) Invalid mipLevel = 9 (>= mipLevelCount 4) -> counted as error, zero GPU calls.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 920,
+      mipLevel: 9,
+      width: 4,
+      height: 4,
+      bytesPerRow: 16,
+      rowsPerImage: 4,
+      data: new Uint8Array(64),
+    })
+  );
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(c2tCalls.length, 2);
+  assert.deepEqual(c2tCalls[0].copySize, { width: 16, height: 16, depthOrArrayLayers: 1 });
+  assert.deepEqual(c2tCalls[0].destination.origin, { x: 48, y: 48, z: 0 });
+  assert.equal(c2tCalls[0].bytes[0], 0x10);
+  assert.equal(c2tCalls[0].bytes[256], 0x11);
+  assert.deepEqual(c2tCalls[1].copySize, { width: 6, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(c2tCalls[1].destination.origin, { x: 10, y: 12, z: 0 });
+
+  assert.equal(wtCalls.length, 2);
+  assert.deepEqual(wtCalls[0].size, { width: 12, height: 12, depthOrArrayLayers: 1 });
+  assert.deepEqual(wtCalls[0].destination.origin, { x: 20, y: 20, z: 0 });
+  assert.deepEqual(wtCalls[1].size, { width: 8, height: 8, depthOrArrayLayers: 1 });
+  assert.deepEqual(wtCalls[1].destination.origin, { x: 56, y: 56, z: 0 });
+  // Verify A8 row 0 col 0, row 0 col 7, and row 1 col 0 (using preserved srcBytesPerRow=16).
+  assert.deepEqual(Array.from(wtCalls[1].bytes.subarray(0, 4)), [0, 0, 0, 0xa1]);
+  assert.deepEqual(Array.from(wtCalls[1].bytes.subarray(7 * 4, 8 * 4)), [0, 0, 0, 0xa7]);
+  assert.deepEqual(Array.from(wtCalls[1].bytes.subarray(8 * 4, 9 * 4)), [0, 0, 0, 0xb1]);
+
+  const stats = handler.getStats();
+  assert.equal(stats.uploadsCount, 4);
+  assert.equal(stats.reusedDescriptorCount, 4);
+  assert.equal(stats.clampedSubRegionCount, 5); // (a) + (b) + (c OOB) + (d) + (e)
+  assert.equal(stats.errors, 1); // (f) invalid mipLevel
+});
+
+test('W303 (#1219): BC1-BC7 tail-mip parity preserved alongside block-aligned BC sub-region clamping and resetStats()', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // 16x16 5-mip BC7 texture (mips: 16x16, 8x8, 4x4, 2x2->phys 4x4, 1x1->phys 4x4).
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 940, width: 16, height: 16, mips: 5, usage: 0x06, format: 62 })
+  );
+  const bc7Tex = processor.textures.get(940);
+
+  // 1) Normal W265 2x2 (mip 3) and 1x1 (mip 4) BC7 tail mips must upload as 4x4 with clampedSubRegionCount === 0.
+  const singleBlock = new Uint8Array(16).fill(0x5c);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 940,
+      mipLevel: 3,
+      width: 2,
+      height: 2,
+      bytesPerRow: 16,
+      rowsPerImage: 1,
+      data: singleBlock,
+    })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 940,
+      mipLevel: 4,
+      width: 1,
+      height: 1,
+      bytesPerRow: 0,
+      rowsPerImage: 0,
+      data: singleBlock,
+    })
+  );
+  assert.equal(handler.getStats().clampedSubRegionCount, 0, 'W265 BC tail mips must not count as OOB clamps');
+  assert.equal(handler.getStats().uploadsCount, 2);
+  assert.equal(handler.getStats().reusedDescriptorCount, 2);
+  assert.equal(handler.getStats().uploadBytesTotal, 512);
+  assert.equal(handler.getStats().scratchBufferAllocations, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 1);
+
+  // 2) Oversized BC7 dirty rect on mip 0 with non-block-aligned origin (10, 14) -> snaps to (8, 12) and clamps to 8x4!
+  const bcBlocks = new Uint8Array(3 * 2 * 16).fill(0x7e); // 3x2 blocks (12x8 texels)
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 940,
+      mipLevel: 0,
+      originX: 10,
+      originY: 14,
+      width: 12,
+      height: 8,
+      bytesPerRow: 48,
+      rowsPerImage: 2,
+      data: bcBlocks,
+    })
+  );
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 3);
+  assert.deepEqual(c2tCalls[0].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(c2tCalls[1].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(c2tCalls[2].destination.origin, { x: 8, y: 12, z: 0 });
+  assert.deepEqual(c2tCalls[2].copySize, { width: 8, height: 4, depthOrArrayLayers: 1 });
+  assert.equal(handler.getStats().clampedSubRegionCount, 1);
+  assert.equal(handler.getStats().uploadsCount, 3);
+  assert.equal(handler.getStats().reusedDescriptorCount, 3);
+
+  // 3) resetStats() zeroes all telemetry counters cleanly while preserving live texture metadata & scratch pool.
+  const scratchRefBefore = handler._scratchBuffer;
+  assert.ok(scratchRefBefore instanceof Uint8Array);
+
+  handler.resetStats();
+  const afterResetStats = handler.getStats();
+  assert.equal(afterResetStats.uploadsCount, 0);
+  assert.equal(afterResetStats.uploadCount, 0);
+  assert.equal(afterResetStats.uploadBytesTotal, 0);
+  assert.equal(afterResetStats.uploadBytes, 0);
+  assert.equal(afterResetStats.bytesUploaded, 0);
+  assert.equal(afterResetStats.reusedDescriptorCount, 0);
+  assert.equal(afterResetStats.clampedSubRegionCount, 0);
+  assert.equal(afterResetStats.created, 0);
+  assert.equal(afterResetStats.errors, 0);
+  assert.equal(afterResetStats.scratchBufferAllocations, 0);
+  assert.equal(afterResetStats.scratchBufferReuses, 0);
+  assert.equal(handler._scratchBuffer, scratchRefBefore, 'resetStats() must preserve persistent scratch buffer');
+  for (const [key, val] of Object.entries(afterResetStats)) {
+    assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
+    assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
+  }
+
+  // Subsequent upload to already-created texture 940 STILL knows its BC7 mip bounds and reuses scratch!
+  const postResetRes = handler.writeTexture(
+    { texture: bc7Tex, mipLevel: 2, origin: { x: 0, y: 0, z: 0 } },
+    new Uint8Array(64),
+    { offset: 0, bytesPerRow: 32, rowsPerImage: 2 },
+    { width: 8, height: 8, depthOrArrayLayers: 1 }, // mip 2 is 4x4 -> clamps to 4x4!
+    940
+  );
+  assert.equal(postResetRes.uploaded, true);
+  assert.equal(postResetRes.clamped, true);
+  assert.equal(handler.getStats().uploadsCount, 1);
+  assert.equal(handler.getStats().uploadBytesTotal, 64);
+  assert.equal(handler.getStats().reusedDescriptorCount, 1);
+  assert.equal(handler.getStats().clampedSubRegionCount, 1);
+
+  // 4) reset() and destroy() clear reusable descriptor object references so GPU resources can be GC'd.
+  assert.equal(handler._reusableCopyTexture.texture, bc7Tex);
+  handler.reset();
+  assert.equal(handler._reusableCopyTexture.texture, null);
+  assert.equal(handler._reusableBufferSource.buffer, null);
+  assert.equal(handler._scratchBuffer, null);
+  assert.equal(handler.getStats().uploadsCount, 0);
+  assert.equal(handler.getStats().reusedDescriptorCount, 0);
+  assert.equal(handler.getStats().clampedSubRegionCount, 0);
 });
