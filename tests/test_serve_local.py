@@ -438,6 +438,352 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
                 self.assertEqual(hdr_r.get("Content-Range"), f"bytes {start}-{end}/{self.large_size}")
                 self.assertEqual(body_r, expected)
 
+    def test_http11_keep_alive_sequential_range_get_head_404_status_and_conditionals(self) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            def send(method: str, path: str, headers: dict[str, str] | None = None):
+                conn.request(method, path, headers=headers or {})
+                resp = conn.getresponse()
+                data = resp.read()
+                return resp, dict(resp.getheaders()), data
+
+            # 1. Range GET (206)
+            resp1, hdr1, body1 = send("GET", "/data/splash.wgsl.pack", {"Range": "bytes=0-4095"})
+            self.assertEqual(resp1.version, 11)
+            self.assertEqual(resp1.status, 206)
+            self.assertFalse(resp1.will_close)
+            self._assert_coop_coep(hdr1)
+            self.assertEqual(hdr1.get("Content-Length"), "4096")
+            self.assertEqual(body1, self.large_payload[:4096])
+            sock = conn.sock
+            self.assertIsNotNone(sock)
+            etag = hdr1["ETag"]
+
+            # 2. Full GET (200) on the same socket
+            resp2, hdr2, body2 = send("GET", "/index.html")
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp2.version, 11)
+            self.assertEqual(resp2.status, 200)
+            self.assertFalse(resp2.will_close)
+            self._assert_coop_coep(hdr2)
+            self.assertEqual(hdr2.get("Content-Length"), str(len(body2)))
+            self.assertEqual(body2, b"<h1>playgta6web</h1>")
+
+            # 3. HEAD (200, 0 body bytes) on the same socket
+            resp3, hdr3, body3 = send("HEAD", "/runtime.wasm")
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp3.version, 11)
+            self.assertEqual(resp3.status, 200)
+            self.assertFalse(resp3.will_close)
+            self._assert_coop_coep(hdr3)
+            self.assertEqual(hdr3.get("Content-Length"), "8")
+            self.assertEqual(body3, b"")
+
+            # 4. 404 Not Found (Content-Length: 0) on the same socket
+            resp4, hdr4, body4 = send("GET", "/data/missing-archive.rpf")
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp4.version, 11)
+            self.assertEqual(resp4.status, 404)
+            self.assertFalse(resp4.will_close)
+            self._assert_coop_coep(hdr4)
+            self.assertEqual(hdr4.get("Content-Length"), "0")
+            self.assertEqual(body4, b"")
+
+            # 5. /api/status JSON (200) on the same socket
+            resp5, hdr5, body5 = send("GET", "/api/status")
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp5.version, 11)
+            self.assertEqual(resp5.status, 200)
+            self.assertFalse(resp5.will_close)
+            self._assert_coop_coep(hdr5)
+            self.assertEqual(hdr5.get("Content-Length"), str(len(body5)))
+            self.assertTrue(json.loads(body5.decode("utf-8"))["ok"])
+
+            # 6. 412 Precondition Failed + 304 Not Modified + 416 + OPTIONS still keep socket alive
+            resp6, hdr6, body6 = send(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"Range": "bytes=0-15", "If-Match": '"stale-etag"'},
+            )
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp6.status, 412)
+            self.assertFalse(resp6.will_close)
+            self._assert_coop_coep(hdr6)
+            self.assertEqual(hdr6.get("Content-Length"), "0")
+            self.assertEqual(hdr6.get("ETag"), etag)
+            self.assertEqual(body6, b"")
+
+            resp7, hdr7, body7 = send(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"If-None-Match": etag},
+            )
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp7.status, 304)
+            self.assertFalse(resp7.will_close)
+            self._assert_coop_coep(hdr7)
+            self.assertEqual(body7, b"")
+
+            resp8, hdr8, body8 = send(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"Range": f"bytes={self.large_size + 100}-"},
+            )
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp8.status, 416)
+            self.assertFalse(resp8.will_close)
+            self.assertEqual(hdr8.get("Content-Length"), "0")
+            self.assertEqual(body8, b"")
+
+            resp9, hdr9, body9 = send("OPTIONS", "/data/splash.wgsl.pack")
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp9.status, 204)
+            self.assertFalse(resp9.will_close)
+            self._assert_coop_coep(hdr9)
+            self.assertEqual(body9, b"")
+
+            # Final Range GET proves keep-alive framing stayed synchronized throughout.
+            resp10, hdr10, body10 = send(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"Range": "bytes=4096-8191", "If-Match": etag},
+            )
+            self.assertIs(conn.sock, sock)
+            self.assertEqual(resp10.status, 206)
+            self.assertFalse(resp10.will_close)
+            self.assertEqual(body10, self.large_payload[4096:8192])
+        finally:
+            conn.close()
+
+    def test_etag_if_match_and_if_range_validation(self) -> None:
+        pack_path = self.data_root / "tiny.wgsl.pack"
+        v1 = b"WGPK0123456789abcdef"
+        pack_path.write_bytes(v1)
+        expected_etag_v1 = serve_local.compute_etag(pack_path.stat())
+
+        st_head, hdr_head, body_head = self._request("HEAD", "/data/tiny.wgsl.pack")
+        self.assertEqual(st_head, 200)
+        self._assert_coop_coep(hdr_head)
+        self.assertEqual(hdr_head.get("ETag"), expected_etag_v1)
+        self.assertEqual(body_head, b"")
+
+        # If-Match matching ETag / wildcard / list -> 206 Partial Content
+        for if_match in (expected_etag_v1, "*", f'"other-tag", {expected_etag_v1}'):
+            with self.subTest(if_match=if_match):
+                st, hdr, body = self._request(
+                    "GET",
+                    "/data/tiny.wgsl.pack",
+                    {"Range": "bytes=4-11", "If-Match": if_match},
+                )
+                self.assertEqual(st, 206)
+                self._assert_coop_coep(hdr)
+                self.assertEqual(hdr.get("ETag"), expected_etag_v1)
+                self.assertEqual(hdr.get("Content-Range"), f"bytes 4-11/{len(v1)}")
+                self.assertEqual(body, v1[4:12])
+
+        # If-Match mismatch or weak ETag -> 412 Precondition Failed with Content-Length: 0
+        for method in ("GET", "HEAD"):
+            for bad_if_match in ('"wrong-etag"', f"W/{expected_etag_v1}", ""):
+                with self.subTest(method=method, bad_if_match=bad_if_match):
+                    st, hdr, body = self._request(
+                        method,
+                        "/data/tiny.wgsl.pack",
+                        {"Range": "bytes=4-11", "If-Match": bad_if_match},
+                    )
+                    self.assertEqual(st, 412)
+                    self._assert_coop_coep(hdr)
+                    self.assertEqual(hdr.get("Content-Length"), "0")
+                    self.assertEqual(hdr.get("ETag"), expected_etag_v1)
+                    self.assertEqual(body, b"")
+
+        # If-Range matching strong ETag -> 206; mismatched or weak ETag -> 200 full file
+        st_ir_ok, hdr_ir_ok, body_ir_ok = self._request(
+            "GET",
+            "/data/tiny.wgsl.pack",
+            {"Range": "bytes=4-11", "If-Range": expected_etag_v1},
+        )
+        self.assertEqual(st_ir_ok, 206)
+        self.assertEqual(hdr_ir_ok.get("Content-Range"), f"bytes 4-11/{len(v1)}")
+        self.assertEqual(body_ir_ok, v1[4:12])
+
+        for stale_if_range in ('"stale-etag"', f"W/{expected_etag_v1}"):
+            with self.subTest(stale_if_range=stale_if_range):
+                st_ir_miss, hdr_ir_miss, body_ir_miss = self._request(
+                    "GET",
+                    "/data/tiny.wgsl.pack",
+                    {"Range": "bytes=4-11", "If-Range": stale_if_range},
+                )
+                self.assertEqual(st_ir_miss, 200)
+                self._assert_coop_coep(hdr_ir_miss)
+                self.assertIsNone(hdr_ir_miss.get("Content-Range"))
+                self.assertEqual(hdr_ir_miss.get("Content-Length"), str(len(v1)))
+                self.assertEqual(body_ir_miss, v1)
+
+        # Updating file on disk immediately turns previous ETag stale for both If-Match and If-Range.
+        v2 = b"WGPK-UPDATED-PAYLOAD-0123456789"
+        pack_path.write_bytes(v2)
+        expected_etag_v2 = serve_local.compute_etag(pack_path.stat())
+        self.assertNotEqual(expected_etag_v2, expected_etag_v1)
+
+        st_412, hdr_412, body_412 = self._request(
+            "GET",
+            "/data/tiny.wgsl.pack",
+            {"Range": "bytes=0-7", "If-Match": expected_etag_v1},
+        )
+        self.assertEqual(st_412, 412)
+        self.assertEqual(hdr_412.get("ETag"), expected_etag_v2)
+        self.assertEqual(hdr_412.get("Content-Length"), "0")
+        self.assertEqual(body_412, b"")
+
+        st_200, hdr_200, body_200 = self._request(
+            "GET",
+            "/data/tiny.wgsl.pack",
+            {"Range": "bytes=0-7", "If-Range": expected_etag_v1},
+        )
+        self.assertEqual(st_200, 200)
+        self.assertEqual(hdr_200.get("ETag"), expected_etag_v2)
+        self.assertEqual(body_200, v2)
+
+    def test_concurrent_8_thread_rpf_range_reads_and_disk_update_invalidation(self) -> None:
+        rpf_path = self.data_root / "common.rpf"
+        payload_v1 = _make_deterministic_bytes(256 * 1024)
+        rpf_path.write_bytes(payload_v1)
+
+        slices = [(i * 4096, i * 4096 + 8191) for i in range(32)]
+
+        def fetch_slice(bounds: tuple[int, int]) -> tuple[int, int, bytes, str]:
+            lo, hi = bounds
+            st, hdr, body = self._request(
+                "GET",
+                "/data/common.rpf",
+                {"Range": f"bytes={lo}-{hi}"},
+            )
+            self.assertEqual(st, 206)
+            self._assert_coop_coep(hdr)
+            return lo, hi, body, hdr["ETag"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results_v1 = list(pool.map(fetch_slice, slices))
+
+        etag_v1 = serve_local.compute_etag(rpf_path.stat())
+        for lo, hi, body, etag in results_v1:
+            self.assertEqual(etag, etag_v1)
+            self.assertEqual(body, payload_v1[lo : hi + 1])
+
+        cache = self.httpd.file_handle_cache
+        self.assertIsNotNone(cache)
+        assert cache is not None
+        stats_v1 = cache.stats()
+        self.assertGreater(stats_v1["hits"], 0)
+        self.assertGreaterEqual(stats_v1["entries"], 1)
+
+        # Update file on disk (different size) -> cached handle invalidates cleanly.
+        payload_v2 = bytes(((b ^ 0x5A) for b in _make_deterministic_bytes(320 * 1024)))
+        rpf_path.write_bytes(payload_v2)
+        etag_v2 = serve_local.compute_etag(rpf_path.stat())
+        self.assertNotEqual(etag_v2, etag_v1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results_v2 = list(pool.map(fetch_slice, slices))
+
+        for lo, hi, body, etag in results_v2:
+            self.assertEqual(etag, etag_v2)
+            self.assertEqual(body, payload_v2[lo : hi + 1])
+
+        stats_v2 = cache.stats()
+        self.assertGreaterEqual(stats_v2["invalidations"], 1)
+
+        # Same-size overwrite with bumped mtime_ns also invalidates cached handle.
+        prev_st = rpf_path.stat()
+        payload_v3 = bytes(((b ^ 0xA5) for b in payload_v2))
+        self.assertEqual(len(payload_v3), len(payload_v2))
+        rpf_path.write_bytes(payload_v3)
+        os.utime(rpf_path, ns=(prev_st.st_atime_ns, prev_st.st_mtime_ns + 5_000_000_000))
+        etag_v3 = serve_local.compute_etag(rpf_path.stat())
+        self.assertNotEqual(etag_v3, etag_v2)
+
+        st_v3, hdr_v3, body_v3 = self._request(
+            "GET",
+            "/data/common.rpf",
+            {"Range": "bytes=0-16383", "If-Match": etag_v3},
+        )
+        self.assertEqual(st_v3, 206)
+        self.assertEqual(hdr_v3.get("ETag"), etag_v3)
+        self.assertEqual(body_v3, payload_v3[:16384])
+        self.assertGreaterEqual(cache.stats()["invalidations"], stats_v2["invalidations"] + 1)
+
+        # Deleting the cached file works cleanly (including on Windows) and yields 404.
+        rpf_path.unlink()
+        st_404, _, body_404 = self._request("GET", "/data/common.rpf")
+        self.assertEqual(st_404, 404)
+        self.assertEqual(body_404, b"")
+
+    def test_file_handle_cache_bounded_lru_eviction_and_shutdown_cleanup(self) -> None:
+        with self.assertRaises(ValueError):
+            serve_local.create_server(
+                "127.0.0.1",
+                0,
+                self.web_root,
+                self.data_root,
+                file_handle_cache_size=-1,
+            )
+
+        files = {
+            "a.rpf": b"RPF-AAAA-0123456789",
+            "b.pack": b"PACK-BBBB-0123456789",
+            "c.pgim": b"PGIM-CCCC-0123456789",
+            "d.wasm": b"\x00asm\x01\x00\x00\x00DDDD",
+        }
+        for name, data in files.items():
+            (self.data_root / name).write_bytes(data)
+
+        httpd = serve_local.create_server(
+            "127.0.0.1",
+            0,
+            self.web_root,
+            self.data_root,
+            file_handle_cache_size=2,
+        )
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        cache = httpd.file_handle_cache
+        self.assertIsNotNone(cache)
+        assert cache is not None
+        try:
+            # Non-cacheable .html file should never enter the FD cache.
+            st_html, _, body_html = self._request("GET", "/index.html", port=port)
+            self.assertEqual(st_html, 200)
+            self.assertEqual(body_html, b"<h1>playgta6web</h1>")
+            self.assertEqual(len(cache), 0)
+            self.assertEqual(cache.stats()["open_handles"], 0)
+
+            for name, expected in files.items():
+                st, _, body = self._request(
+                    "GET",
+                    f"/data/{name}",
+                    {"Range": "bytes=0-7"},
+                    port=port,
+                )
+                self.assertEqual(st, 206)
+                self.assertEqual(body, expected[:8])
+                self.assertLessEqual(len(cache), 2)
+                self.assertLessEqual(cache.stats()["open_handles"], 2)
+
+            stats = cache.stats()
+            self.assertEqual(stats["entries"], 2)
+            self.assertEqual(stats["open_handles"], 2)
+            self.assertGreaterEqual(stats["evictions"], 2)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        # Shutdown / server_close must close every cached handle with zero FD leaks.
+        final_stats = cache.stats()
+        self.assertEqual(final_stats["entries"], 0)
+        self.assertEqual(final_stats["open_handles"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
