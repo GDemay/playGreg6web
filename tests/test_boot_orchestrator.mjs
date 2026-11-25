@@ -12,6 +12,7 @@ const {
   BootOrchestrator,
   DEFAULT_STATUS_URL,
   DEFAULT_STAGE_TIMEOUT_MS,
+  DEFAULT_PARALLEL_PRELOAD,
   discoverBootAssets,
   isRealGuestBoot,
 } = orchestratorMod;
@@ -203,6 +204,8 @@ function createOrchestrator(overrides = {}) {
     onStageStall: overrides.onStageStall,
     nowFn: overrides.nowFn,
     stageTimeoutMs: overrides.stageTimeoutMs,
+    parallelPreload: overrides.parallelPreload,
+    preloadTasks: overrides.preloadTasks,
   });
   return { orchestrator, overlay, bootTracer, phases, launches, fallbacks, firstPresents };
 }
@@ -1312,4 +1315,672 @@ test('W146 getDiagnosticSnapshot exports JSON-safe sanitized telemetry without l
   // Must serialize cleanly to JSON without throwing.
   const roundTripped = JSON.parse(JSON.stringify(snapshot));
   assert.deepEqual(roundTripped.stageDurationsMs, { DISCOVERING: 90 });
+});
+
+// ---------------------------------------------------------------------------
+// W225: Parallel preload coordination & phase timing telemetry
+// ---------------------------------------------------------------------------
+
+test('W225 validates parallelPreload and preloadTasks options and discovers sidecar URLs', () => {
+  assert.equal(DEFAULT_PARALLEL_PRELOAD, true);
+
+  assert.throws(() => new BootOrchestrator({ parallelPreload: 'yes' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ parallelPreload: 1 }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: 'nope' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: [null] }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: [{ name: '', run: () => {} }] }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: [{ name: '__proto__', run: () => {} }] }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: [{ name: 'a', run: 'bad' }] }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadTasks: [{ name: 'a', run: () => {}, optional: 'yes' }] }), TypeError);
+  assert.throws(
+    () =>
+      new BootOrchestrator({
+        preloadTasks: [
+          { name: 'dup', run: () => {} },
+          { name: 'dup', run: () => {} },
+        ],
+      }),
+    TypeError
+  );
+
+  const discovered = discoverBootAssets(
+    readyStatus({
+      shaderPackHeaderUrl: '/data/shaders/boot.wgsl.idx',
+      stageReflectionSidecarUrl: '/data/shaders/stage-reflection.json',
+    })
+  );
+  assert.equal(discovered.shaderPackIndexUrl, '/data/shaders/boot.wgsl.idx');
+  assert.equal(discovered.reflectionSidecarUrl, '/data/shaders/stage-reflection.json');
+
+  const withoutSidecars = discoverBootAssets(readyStatus());
+  assert.equal(withoutSidecars.shaderPackIndexUrl, null);
+  assert.equal(withoutSidecars.reflectionSidecarUrl, null);
+
+  const orch = new BootOrchestrator({ fetchImpl: async () => ({}) });
+  const stats = orch.getTimingStats();
+  assert.equal(stats.parallelPreloadEnabled, true);
+  assert.equal(stats.parallelPreloadSavedMs, 0);
+  assert.equal(stats.totalBootMs, 0);
+  assert.deepEqual(stats.phaseTimingsMs, {});
+  assert.deepEqual(stats.preloadTaskTimingsMs, {});
+});
+
+test('W225 overlaps independent pgim, shader pack, header/index, and reflection sidecar preloads with deterministic phases and savings stats', async () => {
+  let now = 1000;
+  const nowFn = () => now;
+
+  const events = [];
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const resolvers = {};
+
+  function makeDeferredTask(name, resultFn) {
+    return (url, { onProgress, signal } = {}) => {
+      events.push(`start:${name}`);
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      return new Promise((resolve, reject) => {
+        const onAbort = () => {
+          inFlight -= 1;
+          const err = new Error(`Aborted ${name}`);
+          err.name = 'AbortError';
+          reject(err);
+        };
+        if (signal) {
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+        resolvers[name] = () => {
+          if (signal) signal.removeEventListener('abort', onAbort);
+          inFlight -= 1;
+          events.push(`end:${name}`);
+          if (typeof onProgress === 'function') {
+            onProgress({ phase: 'complete', loadedBytes: 16, totalBytes: 16, pct: 100 });
+          }
+          resolve(resultFn(url));
+        };
+      });
+    };
+  }
+
+  const granularPreloader = {
+    preloadPgim: makeDeferredTask('pgim', (url) => ({ header: { magic: 'PGIM' }, url, bytesLoaded: 64 })),
+    preloadShaderPack: makeDeferredTask('shaderPack', (url) => ({ bytes: new Uint8Array([1, 2, 3]), url, bytesLoaded: 32 })),
+    preloadShaderPackHeader: makeDeferredTask('shaderPackIndex', (url) => ({ entryCount: 12, url, bytesLoaded: 16 })),
+    preloadReflectionManifest: makeDeferredTask('reflection', (url) => ({ schema_version: 1, url, bytesLoaded: 24 })),
+    preloadReflectionSidecar: makeDeferredTask('reflectionSidecar', (url) => ({ stages: 4, url, bytesLoaded: 20 })),
+  };
+
+  const fetchImpl = async () => {
+    now += 50; // DISCOVERING = 50ms (1000 -> 1050)
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus({
+          shaderPackIndexUrl: '/data/shaders/boot.wgsl.idx',
+          reflectionSidecarUrl: '/data/shaders/stage-reflection.json',
+        });
+      },
+    };
+  };
+
+  const phaseEvents = [];
+  const { orchestrator, phases, launches, bootTracer } = createOrchestrator({
+    fetchImpl,
+    preloader: granularPreloader,
+    nowFn,
+    parallelPreload: true,
+    onPhaseChange: (ev) => {
+      phases.push(ev.phase);
+      phaseEvents.push(ev);
+    },
+  });
+
+  const pendingStart = orchestrator.start();
+  await new Promise((r) => setTimeout(r, 0));
+
+  // All 5 independent preload tasks must be in flight concurrently!
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.PRELOADING);
+  assert.equal(peakInFlight, 5);
+  assert.equal(inFlight, 5);
+  assert.equal(launches.length, 0);
+
+  // Resolve out-of-order at distinct deterministic timestamps, flushing microtasks between settlements.
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  now = 1090; // reflection: 40ms
+  resolvers.reflection();
+  await flush();
+  now = 1110; // reflectionSidecar: 60ms
+  resolvers.reflectionSidecar();
+  await flush();
+  now = 1130; // shaderPackIndex: 80ms
+  resolvers.shaderPackIndex();
+  await flush();
+  now = 1150; // shaderPack: 100ms
+  resolvers.shaderPack();
+  await flush();
+  now = 1200; // pgim: 150ms (wallTimeMs = 150ms, sequential sum = 430ms, saved = 280ms)
+  resolvers.pgim();
+
+  const result = await pendingStart;
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.deepEqual(phases, [BOOT_PHASE.DISCOVERING, BOOT_PHASE.PRELOADING, BOOT_PHASE.LAUNCHING_RUNTIME]);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].bundle.pgim.header.magic, 'PGIM');
+  assert.equal(launches[0].bundle.shaderPackIndex.entryCount, 12);
+  assert.equal(launches[0].bundle.reflectionManifest.schema_version, 1);
+  assert.equal(launches[0].bundle.reflectionSidecar.stages, 4);
+  assert.equal(launches[0].bundle.bytesLoaded, 64 + 32 + 16 + 24 + 20);
+  assert.equal(bootTracer.getSummary().milestones.find((m) => m.milestone === 'PGIM_LOAD').reached, true);
+
+  // Verify timing stats on start() return, getState(), and getTimingStats().
+  assert.deepEqual(result.phaseTimingsMs, { DISCOVERING: 50, PRELOADING: 150 });
+  assert.equal(result.parallelPreloadSavedMs, 280);
+  assert.equal(result.totalBootMs, 200);
+
+  // Advance clock into LAUNCHING_RUNTIME and reach FIRST_PRESENT.
+  now = 1300; // LAUNCHING_RUNTIME = 100ms
+  orchestrator.notifyFirstPresent({ frameIndex: 1 });
+  assert.deepEqual(phases, [
+    BOOT_PHASE.DISCOVERING,
+    BOOT_PHASE.PRELOADING,
+    BOOT_PHASE.LAUNCHING_RUNTIME,
+    BOOT_PHASE.PRESENTING,
+  ]);
+
+  const stats = orchestrator.getTimingStats();
+  assert.deepEqual(stats.phaseTimingsMs, {
+    DISCOVERING: 50,
+    PRELOADING: 150,
+    LAUNCHING_RUNTIME: 100,
+  });
+  assert.equal(stats.totalBootMs, 300);
+  assert.equal(stats.parallelPreloadEnabled, true);
+  assert.equal(stats.parallelPreloadSavedMs, 280);
+  assert.deepEqual(stats.preloadTaskTimingsMs, {
+    pgim: 150,
+    shaderPack: 100,
+    shaderPackIndex: 80,
+    reflection: 40,
+    reflectionSidecar: 60,
+  });
+  assert.equal(stats.preloadStats.maxConcurrency, 5);
+  assert.equal(stats.preloadStats.taskCount, 5);
+  assert.equal(stats.preloadStats.completedCount, 5);
+  assert.equal(stats.preloadStats.optionalMissingCount, 0);
+  assert.equal(stats.preloadStats.wallTimeMs, 150);
+  assert.equal(stats.preloadStats.sequentialTimeMs, 430);
+
+  const presentingEvent = phaseEvents.find((ev) => ev.phase === BOOT_PHASE.PRESENTING);
+  assert.deepEqual(presentingEvent.phaseTimingsMs, {
+    DISCOVERING: 50,
+    PRELOADING: 150,
+    LAUNCHING_RUNTIME: 100,
+  });
+  assert.equal(presentingEvent.parallelPreloadSavedMs, 280);
+  assert.equal(presentingEvent.totalBootMs, 300);
+});
+
+test('W225 parallelPreload=false runs preload tasks strictly sequentially with parallelPreloadSavedMs=0', async () => {
+  let now = 2000;
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const order = [];
+
+  function makeSequentialTask(name, durationMs, result) {
+    return async () => {
+      order.push(`start:${name}`);
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await Promise.resolve();
+      now += durationMs;
+      inFlight -= 1;
+      order.push(`end:${name}`);
+      return result;
+    };
+  }
+
+  const preloader = {
+    preloadPgim: makeSequentialTask('pgim', 150, { header: { magic: 'PGIM' }, bytesLoaded: 64 }),
+    preloadShaderPack: makeSequentialTask('shaderPack', 100, { bytes: new Uint8Array([1]), bytesLoaded: 16 }),
+    preloadReflectionManifest: makeSequentialTask('reflection', 40, { schema_version: 1, bytesLoaded: 12 }),
+  };
+
+  const fetchImpl = async () => {
+    now += 50;
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus();
+      },
+    };
+  };
+
+  const { orchestrator } = createOrchestrator({
+    fetchImpl,
+    preloader,
+    nowFn: () => now,
+    parallelPreload: false,
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(peakInFlight, 1);
+  assert.deepEqual(order, [
+    'start:pgim',
+    'end:pgim',
+    'start:shaderPack',
+    'end:shaderPack',
+    'start:reflection',
+    'end:reflection',
+  ]);
+  assert.deepEqual(result.phaseTimingsMs, { DISCOVERING: 50, PRELOADING: 290 });
+  assert.equal(result.parallelPreloadSavedMs, 0);
+  assert.equal(result.totalBootMs, 340);
+  assert.equal(orchestrator.getTimingStats().preloadStats.maxConcurrency, 1);
+  assert.equal(orchestrator.getTimingStats().parallelPreloadEnabled, false);
+});
+
+test('W225 overlaps preloadBootBundle with extra sidecars and custom preloadTasks, and aggregates preloadBootBundle timingMs', async () => {
+  let now = 500;
+  let active = 0;
+  let peak = 0;
+  let resolveBundle;
+  let resolveIndex;
+  let resolveCustom;
+
+  const preloader = {
+    preloadBootBundle: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      return new Promise((resolve) => {
+        resolveBundle = () => {
+          active -= 1;
+          resolve({
+            pgim: { header: { magic: 'PGIM' }, bytesLoaded: 100 },
+            shaderPackBytes: new Uint8Array([1, 2]),
+            reflectionManifest: { schema_version: 1 },
+            bytesLoaded: 100,
+            timingMs: { pgim: 120, shaderPack: 70, reflection: 30, total: 120 },
+          });
+        };
+      });
+    },
+    preloadShaderPackIndex: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      return new Promise((resolve) => {
+        resolveIndex = () => {
+          active -= 1;
+          resolve({ indexEntries: 8, bytesLoaded: 16 });
+        };
+      });
+    },
+  };
+
+  const customTask = {
+    name: 'shaderCacheWarmup',
+    optional: true,
+    run: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      return new Promise((resolve) => {
+        resolveCustom = () => {
+          active -= 1;
+          resolve({ warmed: true, bytesLoaded: 8 });
+        };
+      });
+    },
+  };
+
+  const fetchImpl = async () => {
+    now += 20;
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus({ shaderPackIndexUrl: '/data/shaders/boot.wgsl.idx' });
+      },
+    };
+  };
+
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl,
+    preloader,
+    nowFn: () => now,
+    parallelPreload: true,
+    preloadTasks: [customTask],
+  });
+
+  const pending = orchestrator.start();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(peak, 3);
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+  now = 570; // 50ms into preload
+  resolveCustom();
+  await flush();
+  now = 590; // 70ms into preload
+  resolveIndex();
+  await flush();
+  now = 640; // 120ms into preload
+  resolveBundle();
+
+  const res = await pending;
+  assert.equal(res.ok, true);
+  assert.equal(launches[0].bundle.shaderPackIndex.indexEntries, 8);
+  assert.equal(launches[0].bundle.sidecars.shaderCacheWarmup.warmed, true);
+  assert.equal(launches[0].bundle.bytesLoaded, 124);
+
+  const stats = orchestrator.getTimingStats();
+  // Subtasks: pgim (120) + shaderPack (70) + reflection (30) + shaderPackIndex (70) + shaderCacheWarmup (50) = 340
+  // Wall time: 120ms -> saved = 220ms
+  assert.equal(stats.preloadStats.sequentialTimeMs, 340);
+  assert.equal(stats.preloadStats.wallTimeMs, 120);
+  assert.equal(stats.parallelPreloadSavedMs, 220);
+  assert.deepEqual(stats.phaseTimingsMs, { DISCOVERING: 20, PRELOADING: 120 });
+  assert.equal(stats.totalBootMs, 140);
+});
+
+test('W225 propagates AbortSignal cancellation across all concurrent preload tasks including non-cooperative tasks', async () => {
+  let now = 100;
+  const abortedTasks = [];
+  const signals = [];
+
+  function makeAbortableTask(name) {
+    return (_url, { signal } = {}) => {
+      signals.push({ name, signal });
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            abortedTasks.push(name);
+            const err = new Error(`aborted ${name}`);
+            err.name = 'AbortError';
+            reject(err);
+          },
+          { once: true }
+        );
+      });
+    };
+  }
+
+  const preloader = {
+    preloadPgim: makeAbortableTask('pgim'),
+    preloadShaderPack: makeAbortableTask('shaderPack'),
+    preloadReflectionManifest: makeAbortableTask('reflection'),
+  };
+
+  // Also include a custom task that ignores signal to verify raceAbort still unblocks cancellation.
+  const hangingTask = {
+    name: 'slowSidecar',
+    optional: true,
+    run: ({ signal }) => {
+      signals.push({ name: 'slowSidecar', signal });
+      return new Promise(() => {});
+    },
+  };
+
+  const controller = new AbortController();
+  const { orchestrator, launches, fallbacks, phases } = createOrchestrator({
+    fetchImpl: async () => {
+      now += 25;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return readyStatus();
+        },
+      };
+    },
+    preloader,
+    nowFn: () => now,
+    parallelPreload: true,
+    preloadTasks: [hangingTask],
+  });
+
+  const pending = orchestrator.start({ signal: controller.signal });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.PRELOADING);
+  assert.equal(signals.length, 4);
+
+  now += 40;
+  controller.abort();
+  const result = await pending;
+
+  assert.equal(result.ok, false);
+  assert.equal(result.aborted, true);
+  assert.equal(result.phase, BOOT_PHASE.CANCELLED);
+  assert.equal(launches.length, 0);
+  assert.equal(fallbacks.length, 0);
+  assert.deepEqual(phases, [BOOT_PHASE.DISCOVERING, BOOT_PHASE.PRELOADING, BOOT_PHASE.CANCELLED]);
+  assert.equal(signals.every((entry) => entry.signal.aborted === true), true);
+  assert.deepEqual(abortedTasks.sort(), ['pgim', 'reflection', 'shaderPack']);
+  assert.equal(result.parallelPreloadSavedMs, 0);
+  assert.deepEqual(result.phaseTimingsMs, { DISCOVERING: 25, PRELOADING: 40 });
+  assert.equal(result.totalBootMs, 65);
+  assert.equal(orchestrator.getTimingStats().preloadStats.abortedCount, 4);
+});
+
+test('W225 required preload failure aborts in-flight sibling tasks and surfaces the root fatal error', async () => {
+  let now = 300;
+  const siblingAborts = [];
+  let failPgim;
+
+  const preloader = {
+    preloadPgim: () =>
+      new Promise((_resolve, reject) => {
+        failPgim = () => reject(new Error('PGIM HTTP 500 server failure'));
+      }),
+    preloadShaderPack: (_url, { signal }) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            siblingAborts.push('shaderPack');
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          },
+          { once: true }
+        );
+      }),
+    preloadReflectionManifest: (_url, { signal }) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () => {
+            siblingAborts.push('reflection');
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          },
+          { once: true }
+        );
+      }),
+  };
+
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl: createMockFetch(readyStatus()),
+    preloader,
+    nowFn: () => now,
+    parallelPreload: true,
+  });
+
+  const pending = orchestrator.start();
+  await new Promise((r) => setTimeout(r, 0));
+
+  now += 35;
+  failPgim();
+  const result = await pending;
+
+  assert.equal(result.ok, false);
+  assert.equal(result.phase, BOOT_PHASE.ERROR);
+  assert.match(result.error.message, /PGIM HTTP 500/);
+  assert.equal(launches.length, 0);
+  assert.deepEqual(siblingAborts.sort(), ['reflection', 'shaderPack']);
+  assert.equal(orchestrator.getTimingStats().preloadStats.failedCount, 1);
+  assert.equal(orchestrator.getTimingStats().preloadStats.abortedCount, 2);
+  assert.equal(orchestrator.getTimingStats().parallelPreloadSavedMs, 0);
+});
+
+test('W225 falls back cleanly when optional reflection/index sidecars are missing while rejecting corrupt sidecars', async () => {
+  let now = 1000;
+  const progressEvents = [];
+
+  const notFoundErr = new Error('Reflection sidecar not found at C:\\Users\\bob\\secret\\sidecar.json?token=xyz (HTTP 404)');
+  notFoundErr.status = 404;
+  notFoundErr.code = 'NOT_FOUND';
+
+  const indexMissingErr = new Error('Shader pack index missing');
+  indexMissingErr.code = 'ENOENT';
+
+  const preloader = {
+    preloadPgim: async () => {
+      await Promise.resolve();
+      now += 60;
+      return { header: { magic: 'PGIM' }, bytesLoaded: 128 };
+    },
+    preloadShaderPack: async () => {
+      await Promise.resolve();
+      return { bytes: new Uint8Array([9, 8, 7]), bytesLoaded: 3 };
+    },
+    preloadShaderPackHeader: async () => {
+      await Promise.resolve();
+      throw indexMissingErr;
+    },
+    preloadReflectionManifest: async () => {
+      await Promise.resolve();
+      throw notFoundErr;
+    },
+  };
+
+  const bootTracer = new BootTracer();
+  bootTracer.recordProgress = (ev) => progressEvents.push(ev);
+
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl: createMockFetch(
+      readyStatus({
+        shaderPackIndexUrl: '/data/shaders/boot.wgsl.idx',
+      })
+    ),
+    preloader,
+    bootTracer,
+    nowFn: () => now,
+    parallelPreload: true,
+    preloadTasks: [
+      {
+        name: 'optionalAudioSidecar',
+        optional: true,
+        run: async () => {
+          throw new Error('optional sidecar unavailable');
+        },
+      },
+    ],
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].bundle.pgim.header.magic, 'PGIM');
+  assert.equal(launches[0].bundle.shaderPackBytes.bytesLoaded, 3);
+  assert.equal(launches[0].bundle.shaderPackIndex, null);
+  assert.equal(launches[0].bundle.reflectionManifest, null);
+  assert.equal(launches[0].bundle.sidecars.optionalAudioSidecar, null);
+
+  assert.ok(progressEvents.some((ev) => ev.phase === 'optional-missing' && ev.asset === 'reflection'));
+  assert.ok(progressEvents.some((ev) => ev.phase === 'optional-missing' && ev.asset === 'shaderPackIndex'));
+  assert.ok(progressEvents.some((ev) => ev.phase === 'optional-missing' && ev.asset === 'optionalAudioSidecar'));
+
+  const snapshot = orchestrator.getDiagnosticSnapshot();
+  assert.equal(snapshot.preloadStats.optionalMissingCount, 3);
+  assert.equal(snapshot.preloadStats.tasks.reflection.status, 'missing');
+  assert.equal(snapshot.preloadStats.tasks.shaderPackIndex.status, 'missing');
+  assert.equal(snapshot.preloadStats.tasks.optionalAudioSidecar.status, 'fallback');
+  // Verify sensitive path and query token in optional sidecar error are redacted in diagnostics.
+  assert.equal(snapshot.preloadStats.tasks.reflection.error.includes('bob'), false);
+  assert.equal(snapshot.preloadStats.tasks.reflection.error.includes('token=xyz'), false);
+  assert.match(snapshot.preloadStats.tasks.reflection.error, /\[REDACTED_PATH\]/);
+  assert.equal('bundle' in snapshot, false);
+  assert.equal('status' in snapshot, false);
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(snapshot)));
+
+  // Corrupt sidecar (BAD_* validation error) MUST fail boot rather than silently falling back.
+  const corruptErr = new Error('corrupt reflection JSON');
+  corruptErr.code = 'BAD_REFLECTION_MANIFEST';
+  const corruptOrch = createOrchestrator({
+    fetchImpl: createMockFetch(readyStatus()),
+    preloader: {
+      preloadPgim: async () => ({ header: { magic: 'PGIM' }, bytesLoaded: 64 }),
+      preloadReflectionManifest: async () => {
+        throw corruptErr;
+      },
+    },
+    parallelPreload: true,
+  });
+  const corruptRes = await corruptOrch.orchestrator.start();
+  assert.equal(corruptRes.ok, false);
+  assert.equal(corruptRes.phase, BOOT_PHASE.ERROR);
+  assert.match(corruptRes.error.message, /corrupt reflection JSON/);
+});
+
+test('W225 overlaps non-PGIM shaderPack + reflection preload and records positive real-clock parallelPreloadSavedMs', async () => {
+  let inFlight = 0;
+  let peakInFlight = 0;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const preloader = {
+    preloadShaderPack: async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await sleep(35);
+      inFlight -= 1;
+      return { bytes: new Uint8Array([1, 2, 3]), bytesLoaded: 3 };
+    },
+    preloadReflectionManifest: async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await sleep(35);
+      inFlight -= 1;
+      return { schema_version: 1, bytesLoaded: 10 };
+    },
+  };
+
+  const { orchestrator, fallbacks } = createOrchestrator({
+    fetchImpl: createMockFetch(
+      readyStatus({
+        pgimUrl: null,
+        runtimeWasm: null,
+        hasWasmBinary: false,
+      })
+    ),
+    preloader,
+    parallelPreload: true,
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.fallback, true);
+  assert.equal(result.phase, BOOT_PHASE.FALLBACK_SMOKE_DEMO);
+  assert.equal(fallbacks.length, 1);
+  assert.equal(peakInFlight, 2);
+  assert.equal(result.parallelPreloadSavedMs > 0, true);
+  assert.equal(result.totalBootMs >= result.phaseTimingsMs.PRELOADING, true);
+  assert.equal(orchestrator.getState().parallelPreloadSavedMs > 0, true);
+
+  // reset() clears all W225 preload and timing stats cleanly.
+  orchestrator.reset();
+  const resetStats = orchestrator.getTimingStats();
+  assert.equal(resetStats.parallelPreloadSavedMs, 0);
+  assert.equal(resetStats.totalBootMs, 0);
+  assert.deepEqual(resetStats.phaseTimingsMs, {});
+  assert.deepEqual(resetStats.preloadTaskTimingsMs, {});
+  assert.equal(resetStats.preloadStats.taskCount, 0);
 });
