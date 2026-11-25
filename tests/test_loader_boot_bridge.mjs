@@ -3481,3 +3481,263 @@ test('W345 coordinator wgpuSubmit transfers standalone ArrayBuffer with zero ext
   assert.deepEqual(new Uint8Array(posted[2].msg.cmdBuffer), new Uint8Array([7, 0, 0, 0, 0, 0, 0, 0]));
   assert.deepEqual(posted[2].transfer, [posted[2].msg.cmdBuffer]);
 });
+
+test('W349 forwardGpuWorkerMessage forwards first-visible-frame/visible-frame and preserves firstVisibleFrame fields on gpu-telemetry', () => {
+  const posted = [];
+  const post = (msg) => posted.push(msg);
+
+  // 1. Explicit first-visible-frame message from wgpu_worker is forwarded verbatim with all probe fields.
+  const adapterObj = {
+    vendor: 'nvidia',
+    architecture: 'turing',
+    device: 'geforce',
+    description: 'NVIDIA GeForce',
+    label: 'nvidia turing',
+    isFallbackAdapter: false,
+  };
+  const visibleMsg = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 45120.5,
+      firstPresentMs: 320.25,
+      blackLoadingMs: 44800.25,
+      presentCount: 2700,
+      realPackDrawsThisFrame: 18,
+      fallbackDrawsThisFrame: 2,
+      drawsThisFrame: 20,
+      source: 'swapchain_probe',
+      maxLuma: 235,
+      suppressedBlackFrames: 2699,
+      gpuAdapter: adapterObj,
+    },
+    post,
+  );
+  assert.equal(posted.length, 1);
+  assert.deepEqual(visibleMsg, posted[0]);
+  assert.equal(visibleMsg.type, 'first-visible-frame');
+  assert.equal(visibleMsg.firstVisibleFrame, true);
+  assert.equal(visibleMsg.firstVisibleFrameMs, 45120.5);
+  assert.equal(visibleMsg.firstPresentMs, 320.25);
+  assert.equal(visibleMsg.blackLoadingMs, 44800.25);
+  assert.equal(visibleMsg.presentCount, 2700);
+  assert.equal(visibleMsg.realPackDrawsThisFrame, 18);
+  assert.equal(visibleMsg.fallbackDrawsThisFrame, 2);
+  assert.equal(visibleMsg.drawsThisFrame, 20);
+  assert.equal(visibleMsg.source, 'swapchain_probe');
+  assert.equal(visibleMsg.maxLuma, 235);
+  assert.equal(visibleMsg.suppressedBlackFrames, 2699);
+  assert.deepEqual(visibleMsg.gpuAdapter, adapterObj);
+
+  // 2. visible-frame alias is also forwarded preserving string gpuAdapter & timing fields.
+  const visibleAlias = forwardGpuWorkerMessage(
+    {
+      type: 'visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 1200,
+      firstPresentMs: 100,
+      blackLoadingMs: 1100,
+      presentCount: 60,
+      source: 'pixel_readback',
+      maxLuma: 192,
+      suppressedBlackFrames: 59,
+      gpuAdapter: 'amd rdna2',
+    },
+    post,
+  );
+  assert.equal(posted.length, 2);
+  assert.equal(visibleAlias.type, 'visible-frame');
+  assert.equal(visibleAlias.firstVisibleFrame, true);
+  assert.equal(visibleAlias.firstVisibleFrameMs, 1200);
+  assert.equal(visibleAlias.firstPresentMs, 100);
+  assert.equal(visibleAlias.blackLoadingMs, 1100);
+  assert.equal(visibleAlias.presentCount, 60);
+  assert.equal(visibleAlias.source, 'pixel_readback');
+  assert.equal(visibleAlias.maxLuma, 192);
+  assert.equal(visibleAlias.suppressedBlackFrames, 59);
+  assert.equal(visibleAlias.gpuAdapter, 'amd rdna2');
+
+  // 3. gpu-telemetry from nested wgpu_worker { id, stats } preserves explicit firstVisibleFrame: false!
+  const blackLoadingStats = forwardGpuWorkerMessage(
+    {
+      id: 11,
+      stats: {
+        frameCount: 45,
+        drawCalls: 120,
+        realPackDrawCount: 42,
+        firstVisibleFrame: false,
+        firstVisibleFrameMs: null,
+        blackLoadingMs: null,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 45,
+        gpuAdapter: adapterObj,
+      },
+      gpuAdapter: adapterObj,
+      timestamp: 1700000010000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 3);
+  assert.equal(blackLoadingStats.type, 'gpu-telemetry');
+  assert.equal(blackLoadingStats.frameStats.realPackDrawCount, 42);
+  assert.equal(blackLoadingStats.firstVisibleFrame, false);
+  assert.equal(blackLoadingStats.firstVisibleFrameMs, null);
+  assert.equal(blackLoadingStats.blackLoadingMs, null);
+  assert.equal(blackLoadingStats.maxLuma, 0);
+  assert.equal(blackLoadingStats.suppressedBlackFrames, 45);
+  assert.deepEqual(blackLoadingStats.gpuAdapter, adapterObj);
+
+  // 4. Flat gpu-stats / gpu-telemetry with firstVisibleFrame: true preserves timing & adapter fields.
+  const visibleStats = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-stats',
+      framesPresented: 90,
+      realPackDrawCount: 250,
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 8400,
+      blackLoadingMs: 8100,
+      maxLuma: 224,
+      suppressedBlackFrames: 89,
+      gpuAdapter: 'nvidia turing',
+      timestamp: 1700000020000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 4);
+  assert.equal(visibleStats.type, 'gpu-telemetry');
+  assert.equal(visibleStats.firstVisibleFrame, true);
+  assert.equal(visibleStats.firstVisibleFrameMs, 8400);
+  assert.equal(visibleStats.blackLoadingMs, 8100);
+  assert.equal(visibleStats.maxLuma, 224);
+  assert.equal(visibleStats.suppressedBlackFrames, 89);
+  assert.equal(visibleStats.gpuAdapter, 'nvidia turing');
+});
+
+test('W349 loader.js gpuWorker.onmessage forwards firstVisibleFrame: false telemetry and first-visible-frame events end-to-end', () => {
+  const mainMessages = [];
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker && typeof gpuWorker.onmessage === 'function');
+
+  // 1. Black-frame stats reply preserves explicit firstVisibleFrame: false despite realPackDrawCount > 0.
+  gpuWorker.onmessage({
+    data: {
+      id: 1,
+      stats: {
+        frameCount: 15,
+        realPackDrawCount: 42,
+        firstVisibleFrame: false,
+        firstVisibleFrameMs: null,
+        blackLoadingMs: null,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 15,
+      },
+      gpuAdapter: { vendor: 'nvidia', architecture: 'turing', label: 'nvidia turing' },
+    },
+  });
+
+  // 2. First non-black frame event from wgpu_worker arrives verbatim on mainMessages.
+  gpuWorker.onmessage({
+    data: {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 45100,
+      firstPresentMs: 250,
+      blackLoadingMs: 44850,
+      presentCount: 2700,
+      source: 'swapchain_probe',
+      maxLuma: 235,
+      suppressedBlackFrames: 2699,
+      gpuAdapter: { vendor: 'nvidia', architecture: 'turing', label: 'nvidia turing' },
+    },
+  });
+
+  assert.equal(mainMessages.length, 2);
+  assert.equal(mainMessages[0].type, 'gpu-telemetry');
+  assert.equal(mainMessages[0].firstVisibleFrame, false);
+  assert.equal(mainMessages[0].frameStats.realPackDrawCount, 42);
+  assert.equal(mainMessages[0].suppressedBlackFrames, 15);
+  assert.equal(mainMessages[0].maxLuma, 0);
+  assert.equal(mainMessages[0].gpuAdapter.label, 'nvidia turing');
+
+  assert.equal(mainMessages[1].type, 'first-visible-frame');
+  assert.equal(mainMessages[1].firstVisibleFrame, true);
+  assert.equal(mainMessages[1].firstVisibleFrameMs, 45100);
+  assert.equal(mainMessages[1].firstPresentMs, 250);
+  assert.equal(mainMessages[1].blackLoadingMs, 44850);
+  assert.equal(mainMessages[1].presentCount, 2700);
+  assert.equal(mainMessages[1].source, 'swapchain_probe');
+  assert.equal(mainMessages[1].maxLuma, 235);
+  assert.equal(mainMessages[1].suppressedBlackFrames, 2699);
+  assert.equal(mainMessages[1].gpuAdapter.label, 'nvidia turing');
+});
