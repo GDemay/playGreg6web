@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
@@ -27,8 +29,9 @@ use crate::pack::{
     PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry, PackError, write_json_string, write_pack,
 };
 use crate::rdna2_to_wgsl::{
-    Rdna2StageOverride, Rdna2TranslateOptions, WgslBindingInfo, WgslVertexInputInfo,
-    translate_rdna2_to_wgsl, write_wgsl_bindings_json, write_wgsl_vertex_inputs_json,
+    Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
+    WgslVertexInputInfo, translate_rdna2_to_wgsl, write_wgsl_bindings_json,
+    write_wgsl_vertex_inputs_json,
 };
 
 /// File extensions recognized as raw RDNA2 shader blobs (ASCII case-insensitive).
@@ -127,6 +130,23 @@ pub struct Rdna2PackOptions {
     /// (header + entry table + payloads) to exceed `min(limit, u32::MAX as u64)`, counting
     /// skipped stages in `summary.skipped_budget`.
     pub max_pack_bytes: Option<u64>,
+    /// Optional worker thread count for parallel RDNA2 -> WGSL stage translation.
+    /// When `None`, defaults to `std::thread::available_parallelism()` (falling back to `1`).
+    /// Values `< 1` are clamped to `1`. Use `Some(1)` for single-threaded execution.
+    pub jobs: Option<usize>,
+}
+
+impl Rdna2PackOptions {
+    /// Resolve the effective worker thread count (`>= 1`).
+    pub fn effective_jobs(&self) -> usize {
+        self.jobs
+            .unwrap_or_else(|| {
+                thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .max(1)
+    }
 }
 
 /// Strictly sanitized per-shader entry summary for [`Rdna2PackSummary`]
@@ -1230,6 +1250,206 @@ fn write_pack_bytes_to_file(out_path: &Path, pack_bytes: &[u8]) -> Result<(), Rd
     Ok(())
 }
 
+const fn stage_override_key(stage: Rdna2StageOverride) -> u8 {
+    match stage {
+        Rdna2StageOverride::Auto => 0,
+        Rdna2StageOverride::Vertex => 1,
+        Rdna2StageOverride::Pixel => 2,
+        Rdna2StageOverride::Compute => 3,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TranslatedStageData {
+    stage: ShaderStage,
+    wgsl: String,
+    entry_point: String,
+    naga_validated: bool,
+    translated_op_count: usize,
+    unsupported_op_count: usize,
+    vertex_input_mode: String,
+    bindings: Vec<WgslBindingInfo>,
+    vertex_inputs: Vec<WgslVertexInputInfo>,
+}
+
+impl TranslatedStageData {
+    fn from_output(output: Rdna2WgslOutput) -> Self {
+        Self {
+            stage: output.stage,
+            wgsl: output.wgsl,
+            entry_point: output.entry_point,
+            naga_validated: output.naga_validated,
+            translated_op_count: output.translated_op_count,
+            unsupported_op_count: output.unsupported_op_count,
+            vertex_input_mode: output.binding_summary.vertex_input_mode,
+            bindings: output.bindings,
+            vertex_inputs: output.vertex_inputs,
+        }
+    }
+
+    fn into_pack_parts(self, hash: u64) -> (PackEntry, Rdna2PackEntrySummary) {
+        let wgsl_byte_len = self.wgsl.len();
+        let entry = PackEntry {
+            hash,
+            stage: self.stage,
+            wgsl: self.wgsl,
+        };
+        let summary = Rdna2PackEntrySummary {
+            hash_fnv1a64: hash,
+            stage: self.stage,
+            entry_point: self.entry_point,
+            naga_validated: self.naga_validated,
+            translated_op_count: self.translated_op_count,
+            unsupported_op_count: self.unsupported_op_count,
+            wgsl_byte_len,
+            vertex_input_mode: self.vertex_input_mode,
+            bindings: self.bindings,
+            vertex_inputs: self.vertex_inputs,
+        };
+        (entry, summary)
+    }
+}
+
+enum TranslatedStageOutcome {
+    Translated(TranslatedStageData),
+    Oversize,
+    Failed {
+        error: Option<Rdna2PackError>,
+        reason: String,
+    },
+}
+
+/// Execute `translate_one` across up to `jobs` worker threads using dynamic `AtomicUsize`
+/// work-stealing and collect outcomes into a pre-allocated indexed `Vec<Option<R>>` so callers
+/// can aggregate results in exact deterministic input order.
+///
+/// When `should_abort(&outcome)` returns `true` at index `k`, workers stop picking up indices
+/// `>= k` while guaranteeing every index `< k` (and `k` itself) still completes.
+fn run_parallel_indexed<T, R, F, P>(
+    items: &[T],
+    jobs: usize,
+    translate_one: F,
+    should_abort: P,
+) -> Vec<Option<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(usize, &T) -> R + Sync,
+    P: Fn(&R) -> bool + Sync,
+{
+    let count = items.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let worker_count = jobs.clamp(1, count);
+    let mut slots: Vec<Option<R>> = std::iter::repeat_with(|| None).take(count).collect();
+    if worker_count <= 1 {
+        for (idx, item) in items.iter().enumerate() {
+            let outcome = translate_one(idx, item);
+            let abort = should_abort(&outcome);
+            slots[idx] = Some(outcome);
+            if abort {
+                break;
+            }
+        }
+        return slots;
+    }
+
+    let next_idx = AtomicUsize::new(0);
+    let abort_index = AtomicUsize::new(usize::MAX);
+
+    let all_batches: Vec<Vec<(usize, R)>> = thread::scope(|scope| {
+        let worker = || {
+            let mut local = Vec::new();
+            loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= count || idx >= abort_index.load(Ordering::Relaxed) {
+                    break;
+                }
+                let outcome = translate_one(idx, &items[idx]);
+                if should_abort(&outcome) {
+                    abort_index.fetch_min(idx, Ordering::Relaxed);
+                }
+                local.push((idx, outcome));
+            }
+            local
+        };
+
+        let mut handles = Vec::with_capacity(worker_count - 1);
+        for _ in 0..(worker_count - 1) {
+            handles.push(scope.spawn(worker));
+        }
+
+        // Calling thread participates as worker #0 to avoid leaving it idle.
+        let main_batch = worker();
+
+        let mut batches = Vec::with_capacity(worker_count);
+        batches.push(main_batch);
+        for handle in handles {
+            match handle.join() {
+                Ok(batch) => batches.push(batch),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        batches
+    });
+
+    for batch in all_batches {
+        for (idx, outcome) in batch {
+            slots[idx] = Some(outcome);
+        }
+    }
+
+    slots
+}
+
+struct BlobCandidate<'a> {
+    blob: &'a Rdna2BlobInput,
+    stage: Rdna2StageOverride,
+    explicit_hash: Option<u64>,
+    final_hash: u64,
+    work_idx: Option<usize>,
+}
+
+struct BlobTranslateTask<'a> {
+    bytes: &'a [u8],
+    stage: Rdna2StageOverride,
+}
+
+fn translate_blob_task(
+    task: &BlobTranslateTask<'_>,
+    options: &Rdna2PackOptions,
+) -> TranslatedStageOutcome {
+    let translate_opts = Rdna2TranslateOptions {
+        stage: task.stage,
+        entry_point: options.translate.entry_point.clone(),
+        min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
+        workgroup_size: options.translate.workgroup_size,
+        workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
+    };
+
+    match translate_rdna2_to_wgsl(task.bytes, &translate_opts) {
+        Ok(out) if out.naga_validated => {
+            if let Some(max_wgsl) = options.max_wgsl_bytes
+                && out.wgsl.len() > max_wgsl
+            {
+                TranslatedStageOutcome::Oversize
+            } else {
+                TranslatedStageOutcome::Translated(TranslatedStageData::from_output(out))
+            }
+        }
+        Ok(_) => TranslatedStageOutcome::Failed {
+            error: None,
+            reason: "translated WGSL did not pass Naga validation".to_string(),
+        },
+        Err(err) => TranslatedStageOutcome::Failed {
+            error: None,
+            reason: format!("RDNA2->WGSL translation failed: {err}"),
+        },
+    }
+}
+
 fn pack_blobs_into_map(
     blobs: &[Rdna2BlobInput],
     options: &Rdna2PackOptions,
@@ -1246,16 +1466,76 @@ fn pack_blobs_into_map(
             .then_with(|| blobs[a].bytes.cmp(&blobs[b].bytes))
     });
 
+    // Collect candidates in deterministic order and deduplicate identical `(bytes, stage)`
+    // translation inputs so duplicate shader blobs are translated at most once.
+    let mut candidates: Vec<BlobCandidate<'_>> = Vec::with_capacity(order.len());
+    let mut unique_tasks: Vec<BlobTranslateTask<'_>> = Vec::new();
+    let mut task_uses: Vec<usize> = Vec::new();
+    let mut dedup_map: BTreeMap<(u64, u8), Vec<usize>> = BTreeMap::new();
+
     for idx in order {
         let blob = &blobs[idx];
         let hint = parse_filename_hint(&blob.name);
+        let stage = if blob.stage_override != Rdna2StageOverride::Auto {
+            blob.stage_override
+        } else if hint.stage != Rdna2StageOverride::Auto {
+            hint.stage
+        } else {
+            options.translate.stage
+        };
+        let explicit_hash = blob.hash_override.or(hint.hash);
+        let content_hash = fnv1a_64(&blob.bytes);
+        let final_hash = explicit_hash.unwrap_or(content_hash);
 
+        let work_idx = if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
+            None
+        } else {
+            let key = (content_hash, stage_override_key(stage));
+            let bucket = dedup_map.entry(key).or_default();
+            let existing = bucket
+                .iter()
+                .copied()
+                .find(|&task_idx| unique_tasks[task_idx].bytes == blob.bytes.as_slice());
+            let assigned = match existing {
+                Some(task_idx) => task_idx,
+                None => {
+                    let task_idx = unique_tasks.len();
+                    unique_tasks.push(BlobTranslateTask {
+                        bytes: &blob.bytes,
+                        stage,
+                    });
+                    task_uses.push(0);
+                    bucket.push(task_idx);
+                    task_idx
+                }
+            };
+            task_uses[assigned] += 1;
+            Some(assigned)
+        };
+
+        candidates.push(BlobCandidate {
+            blob,
+            stage,
+            explicit_hash,
+            final_hash,
+            work_idx,
+        });
+    }
+
+    let mut outcomes: Vec<Option<TranslatedStageOutcome>> = if state.budget_exhausted {
+        Vec::new()
+    } else {
+        run_parallel_indexed(
+            &unique_tasks,
+            options.effective_jobs(),
+            |_idx, task| translate_blob_task(task, options),
+            |_| false,
+        )
+    };
+
+    for candidate in candidates {
         if state.budget_exhausted {
-            let known_hash = blob
-                .hash_override
-                .or(hint.hash)
-                .unwrap_or_else(|| fnv1a_64(&blob.bytes));
-            if state.packed_by_hash.contains_key(&known_hash) {
+            if state.packed_by_hash.contains_key(&candidate.final_hash) {
                 state.skipped_or_failed += 1;
             } else {
                 state.skipped_budget += 1;
@@ -1264,98 +1544,62 @@ fn pack_blobs_into_map(
             continue;
         }
 
-        let stage = if blob.stage_override != Rdna2StageOverride::Auto {
-            blob.stage_override
-        } else if hint.stage != Rdna2StageOverride::Auto {
-            hint.stage
-        } else {
-            options.translate.stage
-        };
-
-        if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
+        let Some(work_idx) = candidate.work_idx else {
             state.skipped_or_failed += 1;
             state.failed += 1;
             state.failures.push(Rdna2PackFailureSummary {
-                code_identity: blob.hash_override.or(hint.hash),
-                stage: override_to_stage(stage),
+                code_identity: candidate.explicit_hash,
+                stage: override_to_stage(candidate.stage),
                 reason: format!(
                     "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
-                    blob.bytes.len()
+                    candidate.blob.bytes.len()
                 ),
             });
             continue;
-        }
-
-        let translate_opts = Rdna2TranslateOptions {
-            stage,
-            entry_point: options.translate.entry_point.clone(),
-            min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
-            workgroup_size: options.translate.workgroup_size,
-            workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
         };
 
-        let output = match translate_rdna2_to_wgsl(&blob.bytes, &translate_opts) {
-            Ok(out) if out.naga_validated => out,
-            Ok(_) => {
+        task_uses[work_idx] = task_uses[work_idx].saturating_sub(1);
+        let remaining_uses = task_uses[work_idx];
+
+        match outcomes[work_idx].as_ref() {
+            Some(TranslatedStageOutcome::Failed { reason, .. }) => {
                 state.skipped_or_failed += 1;
                 state.failed += 1;
                 state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: blob
-                        .hash_override
-                        .or(hint.hash)
-                        .or_else(|| Some(fnv1a_64(&blob.bytes))),
-                    stage: override_to_stage(stage),
-                    reason: "translated WGSL did not pass Naga validation".to_string(),
+                    code_identity: Some(candidate.final_hash),
+                    stage: override_to_stage(candidate.stage),
+                    reason: reason.clone(),
                 });
-                continue;
             }
-            Err(err) => {
-                state.skipped_or_failed += 1;
-                state.failed += 1;
-                state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: blob
-                        .hash_override
-                        .or(hint.hash)
-                        .or_else(|| Some(fnv1a_64(&blob.bytes))),
-                    stage: override_to_stage(stage),
-                    reason: format!("RDNA2->WGSL translation failed: {err}"),
-                });
-                continue;
+            Some(TranslatedStageOutcome::Oversize) => {
+                if state.packed_by_hash.contains_key(&candidate.final_hash) {
+                    state.skipped_or_failed += 1;
+                } else {
+                    state.skipped_oversize += 1;
+                    state.skipped_or_failed += 1;
+                }
             }
-        };
-
-        let final_hash = blob
-            .hash_override
-            .or(hint.hash)
-            .unwrap_or(output.hash_fnv1a64);
-
-        if state.packed_by_hash.contains_key(&final_hash) {
-            state.skipped_or_failed += 1;
-            continue;
+            Some(TranslatedStageOutcome::Translated(_)) => {
+                if state.packed_by_hash.contains_key(&candidate.final_hash) {
+                    state.skipped_or_failed += 1;
+                    continue;
+                }
+                let data = if remaining_uses == 0 {
+                    match outcomes[work_idx].take() {
+                        Some(TranslatedStageOutcome::Translated(d)) => d,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match outcomes[work_idx].as_ref() {
+                        Some(TranslatedStageOutcome::Translated(d)) => d.clone(),
+                        _ => unreachable!(),
+                    }
+                };
+                let (entry, entry_summary) = data.into_pack_parts(candidate.final_hash);
+                state.try_insert_translated(candidate.final_hash, entry, entry_summary, options);
+            }
+            None => unreachable!("all blob translation tasks must produce an outcome"),
         }
-
-        let wgsl_byte_len = output.wgsl.len();
-        state.try_insert_translated(
-            final_hash,
-            PackEntry {
-                hash: final_hash,
-                stage: output.stage,
-                wgsl: output.wgsl,
-            },
-            Rdna2PackEntrySummary {
-                hash_fnv1a64: final_hash,
-                stage: output.stage,
-                entry_point: output.entry_point,
-                naga_validated: output.naga_validated,
-                translated_op_count: output.translated_op_count,
-                unsupported_op_count: output.unsupported_op_count,
-                wgsl_byte_len,
-                vertex_input_mode: output.binding_summary.vertex_input_mode,
-                bindings: output.bindings,
-                vertex_inputs: output.vertex_inputs,
-            },
-            options,
-        );
     }
 }
 
@@ -1527,6 +1771,111 @@ pub fn pack_rdna2_directory_to_file(
     Ok(result)
 }
 
+fn translate_manifest_stage(
+    entry: &PipelineDumpNativeStage,
+    canonical_parent: &Path,
+    options: &Rdna2PackOptions,
+) -> TranslatedStageOutcome {
+    let make_shader_failure = |reason: String| -> TranslatedStageOutcome {
+        TranslatedStageOutcome::Failed {
+            error: Some(Rdna2PackError::ShaderFailed {
+                code_identity: Some(entry.code_identity),
+                stage: Some(entry.stage),
+                reason: reason.clone(),
+            }),
+            reason,
+        }
+    };
+
+    let rel_path = match validate_manifest_relative_path(&entry.code_file) {
+        Ok(p) => p,
+        Err(err) => {
+            let reason = err.to_string();
+            return TranslatedStageOutcome::Failed {
+                error: Some(err),
+                reason,
+            };
+        }
+    };
+
+    let joined = canonical_parent.join(&rel_path);
+    let canonical_file = match fs::canonicalize(&joined) {
+        Ok(target) => target,
+        Err(err) => {
+            return make_shader_failure(format!(
+                "failed to locate code_file '{}': {}",
+                sanitize_source_path(&rel_path, None),
+                err.kind()
+            ));
+        }
+    };
+
+    if !canonical_file.starts_with(canonical_parent) {
+        return make_shader_failure(
+            "code_file resolves outside the manifest directory".to_string(),
+        );
+    }
+
+    match fs::metadata(&canonical_file) {
+        Ok(m) if m.is_file() => {}
+        _ => {
+            return make_shader_failure("code_file is not a regular file".to_string());
+        }
+    }
+
+    let bytes = match fs::read(&canonical_file) {
+        Ok(b) => b,
+        Err(err) => {
+            return make_shader_failure(format!("failed to read code_file: {}", err.kind()));
+        }
+    };
+
+    let actual_hash = fnv1a_64(&bytes);
+    if actual_hash != entry.code_identity {
+        return TranslatedStageOutcome::Failed {
+            error: Some(Rdna2PackError::HashMismatch {
+                expected: entry.code_identity,
+                actual: actual_hash,
+                stage: entry.stage,
+            }),
+            reason: format!(
+                "FNV-1a 64 hash mismatch: expected {}, actual {}",
+                format_shader_hash(entry.code_identity),
+                format_shader_hash(actual_hash)
+            ),
+        };
+    }
+
+    if bytes.len() < MIN_RDNA2_BLOB_BYTES {
+        return make_shader_failure(format!(
+            "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
+            bytes.len()
+        ));
+    }
+
+    let translate_opts = Rdna2TranslateOptions {
+        stage: stage_to_override(entry.stage),
+        entry_point: options.translate.entry_point.clone(),
+        min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
+        workgroup_size: options.translate.workgroup_size,
+        workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
+    };
+
+    match translate_rdna2_to_wgsl(&bytes, &translate_opts) {
+        Ok(out) if out.naga_validated => {
+            if let Some(max_wgsl) = options.max_wgsl_bytes
+                && out.wgsl.len() > max_wgsl
+            {
+                TranslatedStageOutcome::Oversize
+            } else {
+                TranslatedStageOutcome::Translated(TranslatedStageData::from_output(out))
+            }
+        }
+        Ok(_) => make_shader_failure("translated WGSL did not pass Naga validation".to_string()),
+        Err(err) => make_shader_failure(format!("RDNA2->WGSL translation failed: {err}")),
+    }
+}
+
 fn pack_manifest_into_map(
     manifest_path: &Path,
     options: &Rdna2PackOptions,
@@ -1580,236 +1929,58 @@ fn pack_manifest_into_map(
 
     state.total_blobs += unique_stages.len();
 
-    for entry in unique_stages {
+    if state.budget_exhausted {
+        state.skipped_budget += unique_stages.len();
+        state.skipped_or_failed += unique_stages.len();
+        return Ok(());
+    }
+
+    let outcomes: Vec<Option<TranslatedStageOutcome>> = run_parallel_indexed(
+        &unique_stages,
+        options.effective_jobs(),
+        |_idx, entry| translate_manifest_stage(entry, &canonical_parent, options),
+        |outcome| {
+            !options.best_effort && matches!(outcome, TranslatedStageOutcome::Failed { .. })
+        },
+    );
+
+    for (entry, outcome_opt) in unique_stages.into_iter().zip(outcomes.into_iter()) {
         if state.budget_exhausted {
             state.skipped_budget += 1;
             state.skipped_or_failed += 1;
             continue;
         }
 
-        let rel_path = match validate_manifest_relative_path(&entry.code_file) {
-            Ok(p) => p,
-            Err(err) => {
+        match outcome_opt.expect("manifest stage before strict abort must have an outcome") {
+            TranslatedStageOutcome::Failed { error, reason } => {
                 if options.best_effort {
                     state.skipped_or_failed += 1;
                     state.failed += 1;
                     state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
-                        reason: err.to_string(),
+                        reason,
                     });
-                    continue;
+                } else {
+                    return Err(
+                        error.expect("manifest stage failure must include Rdna2PackError")
+                    );
                 }
-                return Err(err);
             }
-        };
-
-        let joined = canonical_parent.join(&rel_path);
-        let canonical_file = match fs::canonicalize(&joined) {
-            Ok(target) => target,
-            Err(err) => {
-                let reason = format!(
-                    "failed to locate code_file '{}': {}",
-                    sanitize_source_path(&rel_path, None),
-                    err.kind()
+            TranslatedStageOutcome::Oversize => {
+                state.skipped_oversize += 1;
+                state.skipped_or_failed += 1;
+            }
+            TranslatedStageOutcome::Translated(data) => {
+                let (pack_entry, entry_summary) = data.into_pack_parts(entry.code_identity);
+                state.try_insert_translated(
+                    entry.code_identity,
+                    pack_entry,
+                    entry_summary,
+                    options,
                 );
-                if options.best_effort {
-                    state.skipped_or_failed += 1;
-                    state.failed += 1;
-                    state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(entry.code_identity),
-                        stage: Some(entry.stage),
-                        reason,
-                    });
-                    continue;
-                }
-                return Err(Rdna2PackError::ShaderFailed {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
             }
-        };
-
-        if !canonical_file.starts_with(&canonical_parent) {
-            let reason = "code_file resolves outside the manifest directory".to_string();
-            if options.best_effort {
-                state.skipped_or_failed += 1;
-                state.failed += 1;
-                state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-                continue;
-            }
-            return Err(Rdna2PackError::ShaderFailed {
-                code_identity: Some(entry.code_identity),
-                stage: Some(entry.stage),
-                reason,
-            });
         }
-
-        let file_meta = match fs::metadata(&canonical_file) {
-            Ok(m) if m.is_file() => m,
-            _ => {
-                let reason = "code_file is not a regular file".to_string();
-                if options.best_effort {
-                    state.skipped_or_failed += 1;
-                    state.failed += 1;
-                    state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(entry.code_identity),
-                        stage: Some(entry.stage),
-                        reason,
-                    });
-                    continue;
-                }
-                return Err(Rdna2PackError::ShaderFailed {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-            }
-        };
-        let _ = file_meta;
-
-        let bytes = match fs::read(&canonical_file) {
-            Ok(b) => b,
-            Err(err) => {
-                let reason = format!("failed to read code_file: {}", err.kind());
-                if options.best_effort {
-                    state.skipped_or_failed += 1;
-                    state.failed += 1;
-                    state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(entry.code_identity),
-                        stage: Some(entry.stage),
-                        reason,
-                    });
-                    continue;
-                }
-                return Err(Rdna2PackError::ShaderFailed {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-            }
-        };
-
-        let actual_hash = fnv1a_64(&bytes);
-        if actual_hash != entry.code_identity {
-            if options.best_effort {
-                state.skipped_or_failed += 1;
-                state.failed += 1;
-                state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason: format!(
-                        "FNV-1a 64 hash mismatch: expected {}, actual {}",
-                        format_shader_hash(entry.code_identity),
-                        format_shader_hash(actual_hash)
-                    ),
-                });
-                continue;
-            }
-            return Err(Rdna2PackError::HashMismatch {
-                expected: entry.code_identity,
-                actual: actual_hash,
-                stage: entry.stage,
-            });
-        }
-
-        if bytes.len() < MIN_RDNA2_BLOB_BYTES {
-            let reason = format!(
-                "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
-                bytes.len()
-            );
-            if options.best_effort {
-                state.skipped_or_failed += 1;
-                state.failed += 1;
-                state.failures.push(Rdna2PackFailureSummary {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-                continue;
-            }
-            return Err(Rdna2PackError::ShaderFailed {
-                code_identity: Some(entry.code_identity),
-                stage: Some(entry.stage),
-                reason,
-            });
-        }
-
-        let translate_opts = Rdna2TranslateOptions {
-            stage: stage_to_override(entry.stage),
-            entry_point: options.translate.entry_point.clone(),
-            min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
-            workgroup_size: options.translate.workgroup_size,
-            workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
-        };
-
-        let output = match translate_rdna2_to_wgsl(&bytes, &translate_opts) {
-            Ok(out) if out.naga_validated => out,
-            Ok(_) => {
-                let reason = "translated WGSL did not pass Naga validation".to_string();
-                if options.best_effort {
-                    state.skipped_or_failed += 1;
-                    state.failed += 1;
-                    state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(entry.code_identity),
-                        stage: Some(entry.stage),
-                        reason,
-                    });
-                    continue;
-                }
-                return Err(Rdna2PackError::ShaderFailed {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-            }
-            Err(err) => {
-                let reason = format!("RDNA2->WGSL translation failed: {err}");
-                if options.best_effort {
-                    state.skipped_or_failed += 1;
-                    state.failed += 1;
-                    state.failures.push(Rdna2PackFailureSummary {
-                        code_identity: Some(entry.code_identity),
-                        stage: Some(entry.stage),
-                        reason,
-                    });
-                    continue;
-                }
-                return Err(Rdna2PackError::ShaderFailed {
-                    code_identity: Some(entry.code_identity),
-                    stage: Some(entry.stage),
-                    reason,
-                });
-            }
-        };
-
-        let wgsl_byte_len = output.wgsl.len();
-        state.try_insert_translated(
-            entry.code_identity,
-            PackEntry {
-                hash: entry.code_identity,
-                stage: output.stage,
-                wgsl: output.wgsl,
-            },
-            Rdna2PackEntrySummary {
-                hash_fnv1a64: entry.code_identity,
-                stage: output.stage,
-                entry_point: output.entry_point,
-                naga_validated: output.naga_validated,
-                translated_op_count: output.translated_op_count,
-                unsupported_op_count: output.unsupported_op_count,
-                wgsl_byte_len,
-                vertex_input_mode: output.binding_summary.vertex_input_mode,
-                bindings: output.bindings,
-                vertex_inputs: output.vertex_inputs,
-            },
-            options,
-        );
     }
 
     Ok(())
@@ -3210,5 +3381,315 @@ mod tests {
             "err: {msg}"
         );
         assert!(msg.contains("largest_wgsl_bytes=2097152"), "err: {msg}");
+    }
+
+    #[test]
+    fn effective_jobs_resolves_default_and_clamps_zero() {
+        assert!(Rdna2PackOptions::default().effective_jobs() >= 1);
+        assert_eq!(
+            Rdna2PackOptions {
+                jobs: Some(0),
+                ..Rdna2PackOptions::default()
+            }
+            .effective_jobs(),
+            1
+        );
+        assert_eq!(
+            Rdna2PackOptions {
+                jobs: Some(1),
+                ..Rdna2PackOptions::default()
+            }
+            .effective_jobs(),
+            1
+        );
+        assert_eq!(
+            Rdna2PackOptions {
+                jobs: Some(4),
+                ..Rdna2PackOptions::default()
+            }
+            .effective_jobs(),
+            4
+        );
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_parallel_jobs_4_matches_jobs_1_bit_for_bit() {
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        let cs_bytes = build_minimal_compute_rdna2();
+
+        // Build several distinct valid shaders of varying sizes plus one oversize shader.
+        let make_alu_ps = |iters: usize, dst_reg: u8| -> Vec<u8> {
+            let mut words = Vec::with_capacity(iters * 2 + 4);
+            for _ in 0..iters {
+                words.push(enc_vop1(0x01, dst_reg, 242)); // v_mov_b32 v<dst>, 1.0
+                words.push(enc_vop2(0x18, dst_reg + 1, 128 + 1, dst_reg));
+            }
+            words.extend_from_slice(&enc_exp(
+                0,
+                0xF,
+                false,
+                true,
+                true,
+                [dst_reg, dst_reg + 1, dst_reg, dst_reg + 1],
+            ));
+            words.push(enc_sopp(0x01, 0));
+            words_to_bytes(&words)
+        };
+
+        let med_ps_a = make_alu_ps(6, 1);
+        let med_ps_b = make_alu_ps(12, 2);
+        let med_ps_c = make_alu_ps(18, 3);
+        let oversize_ps = make_alu_ps(90, 4);
+
+        let blobs = vec![
+            Rdna2BlobInput::new("a_vs_0000000000004001.rdna2", vs_bytes.clone()),
+            Rdna2BlobInput::new("b_ps_0000000000004002.rdna2", ps_bytes.clone()),
+            Rdna2BlobInput::new("c_cs_0000000000004003.rdna2", cs_bytes.clone()),
+            // Duplicate hash with identical bytes (exercises dedup + duplicate-hash skip)
+            Rdna2BlobInput::new("d_vs_dup_0000000000004001.rdna2", vs_bytes.clone()),
+            // Identical bytes under a distinct hash (exercises dedup reuse under new hash)
+            Rdna2BlobInput::new("e_cs_alias_0000000000004004.rdna2", cs_bytes.clone()),
+            Rdna2BlobInput::new("f_ps_0000000000004005.rdna2", med_ps_a),
+            Rdna2BlobInput::new("g_ps_0000000000004006.rdna2", med_ps_b),
+            Rdna2BlobInput::new("h_ps_0000000000004007.rdna2", med_ps_c),
+            // Oversize stage
+            Rdna2BlobInput::new("i_ps_0000000000004008.rdna2", oversize_ps),
+            // Invalid / too-short blobs (best-effort failures)
+            Rdna2BlobInput::new("j_empty.bin", vec![]),
+            Rdna2BlobInput::new("k_short_0000000000004009.rdna2", vec![0xDE, 0xAD]),
+        ];
+
+        // Measure the oversize threshold from a baseline pass.
+        let baseline = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                jobs: Some(1),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect("baseline blobs pack should succeed");
+        let oversize_len = baseline
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x4008)
+            .unwrap()
+            .wgsl
+            .len();
+        let max_other_len = baseline
+            .entries
+            .iter()
+            .filter(|e| e.hash != 0x4008)
+            .map(|e| e.wgsl.len())
+            .max()
+            .unwrap();
+        assert!(oversize_len > max_other_len);
+
+        let opts_j1 = Rdna2PackOptions {
+            best_effort: true,
+            max_wgsl_bytes: Some(max_other_len),
+            jobs: Some(1),
+            ..Rdna2PackOptions::default()
+        };
+        let opts_j4 = Rdna2PackOptions {
+            jobs: Some(4),
+            ..opts_j1.clone()
+        };
+
+        let res_j1 = pack_rdna2_blobs(&blobs, &opts_j1).expect("jobs=1 pack should succeed");
+        let res_j4 = pack_rdna2_blobs(&blobs, &opts_j4).expect("jobs=4 pack should succeed");
+
+        assert_eq!(res_j1.pack_bytes, res_j4.pack_bytes);
+        assert_eq!(res_j1.summary.to_json(), res_j4.summary.to_json());
+        assert_eq!(res_j1.summary.to_text(), res_j4.summary.to_text());
+        assert_eq!(res_j1.summary, res_j4.summary);
+        assert_eq!(res_j4.summary.total_blobs, blobs.len());
+        assert_eq!(res_j4.summary.translated_ok, 7);
+        assert_eq!(res_j4.summary.skipped_oversize, 1);
+        assert_eq!(res_j4.summary.failed, 2);
+        assert_eq!(res_j4.summary.skipped_or_failed, 4); // 1 dup + 1 oversize + 2 short
+
+        // Also verify reversed input order + tight max_pack_bytes budget match bit-for-bit.
+        let mut blobs_rev = blobs.clone();
+        blobs_rev.reverse();
+        let tight_budget = (res_j1.pack_bytes.len() as u64).saturating_sub(1);
+        let budget_j1 = Rdna2PackOptions {
+            max_pack_bytes: Some(tight_budget),
+            ..opts_j1
+        };
+        let budget_j4 = Rdna2PackOptions {
+            jobs: Some(4),
+            ..budget_j1.clone()
+        };
+        let res_b1 = pack_rdna2_blobs(&blobs, &budget_j1).unwrap();
+        let res_b4 = pack_rdna2_blobs(&blobs_rev, &budget_j4).unwrap();
+        assert_eq!(res_b1.pack_bytes, res_b4.pack_bytes);
+        assert_eq!(res_b1.summary.to_json(), res_b4.summary.to_json());
+        assert_eq!(res_b1.summary.to_text(), res_b4.summary.to_text());
+        assert!(res_b4.summary.skipped_budget >= 1);
+    }
+
+    #[test]
+    fn pack_rdna2_manifest_parallel_jobs_4_matches_jobs_1_bit_for_bit() {
+        let root = make_temp_dir("playgta6_rdna2_manifest_parallel");
+        let native_dir = root.join("native");
+        fs::create_dir_all(&native_dir).unwrap();
+
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        let cs_bytes = build_minimal_compute_rdna2();
+
+        let make_alu_ps = |iters: usize, dst_reg: u8| -> Vec<u8> {
+            let mut words = Vec::with_capacity(iters * 2 + 4);
+            for _ in 0..iters {
+                words.push(enc_vop1(0x01, dst_reg, 242));
+                words.push(enc_vop2(0x18, dst_reg + 1, 128 + 1, dst_reg));
+            }
+            words.extend_from_slice(&enc_exp(
+                0,
+                0xF,
+                false,
+                true,
+                true,
+                [dst_reg, dst_reg + 1, dst_reg, dst_reg + 1],
+            ));
+            words.push(enc_sopp(0x01, 0));
+            words_to_bytes(&words)
+        };
+
+        let med_a = make_alu_ps(5, 1);
+        let med_b = make_alu_ps(10, 2);
+        let med_c = make_alu_ps(15, 3);
+        let oversize = make_alu_ps(90, 4);
+
+        let valid_blobs: Vec<(&str, Vec<u8>)> = vec![
+            ("vertex", vs_bytes),
+            ("pixel", ps_bytes),
+            ("compute", cs_bytes),
+            ("pixel", med_a),
+            ("pixel", med_b),
+            ("pixel", med_c),
+            ("pixel", oversize.clone()),
+        ];
+
+        let mut stage_entries = Vec::new();
+        let mut first_valid_entry = String::new();
+        for (idx, (stage, bytes)) in valid_blobs.iter().enumerate() {
+            let hash = fnv1a_64(bytes);
+            let id = format_shader_hash(hash);
+            fs::write(native_dir.join(format!("{id}.bin")), bytes).unwrap();
+            let item = format!(
+                r#"{{"code_identity": "{id}", "stage": "{stage}", "code_file": "native/{id}.bin"}}"#
+            );
+            if idx == 0 {
+                first_valid_entry = item.clone();
+            }
+            stage_entries.push(item);
+        }
+        // Add duplicate manifest entry referencing the same `code_identity`.
+        stage_entries.push(first_valid_entry);
+
+        // Add invalid entries: hash mismatch, truncated blob, and missing file.
+        let bad_hash_id = "0xdeadbeef00001111";
+        fs::write(
+            native_dir.join(format!("{bad_hash_id}.bin")),
+            build_minimal_compute_rdna2(),
+        )
+        .unwrap();
+        stage_entries.push(format!(
+            r#"{{"code_identity": "{bad_hash_id}", "stage": "compute", "code_file": "native/{bad_hash_id}.bin"}}"#
+        ));
+
+        let short_bytes = [0xAAu8, 0xBBu8];
+        let short_id = format_shader_hash(fnv1a_64(&short_bytes));
+        fs::write(native_dir.join(format!("{short_id}.bin")), short_bytes).unwrap();
+        stage_entries.push(format!(
+            r#"{{"code_identity": "{short_id}", "stage": "pixel", "code_file": "native/{short_id}.bin"}}"#
+        ));
+
+        let missing_id = "0xdeadbeef00002222";
+        stage_entries.push(format!(
+            r#"{{"code_identity": "{missing_id}", "stage": "vertex", "code_file": "native/{missing_id}.bin"}}"#
+        ));
+
+        let manifest_path = root.join("manifest.json");
+        let manifest_json = format!(
+            "{{\n  \"schema\": \"playgta6-pipeline-dump\",\n  \"schema_version\": 1,\n  \"native_stages\": [\n    {}\n  ]\n}}\n",
+            stage_entries.join(",\n    ")
+        );
+        fs::write(&manifest_path, &manifest_json).unwrap();
+
+        let oversize_hash = fnv1a_64(&oversize);
+        let baseline = pack_rdna2_manifest(
+            &manifest_path,
+            &Rdna2PackOptions {
+                best_effort: true,
+                jobs: Some(1),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect("baseline best-effort manifest pack should succeed");
+        let max_non_oversize = baseline
+            .entries
+            .iter()
+            .filter(|e| e.hash != oversize_hash)
+            .map(|e| e.wgsl.len())
+            .max()
+            .unwrap();
+
+        let opts_j1 = Rdna2PackOptions {
+            best_effort: true,
+            max_wgsl_bytes: Some(max_non_oversize),
+            jobs: Some(1),
+            ..Rdna2PackOptions::default()
+        };
+        let opts_j4 = Rdna2PackOptions {
+            jobs: Some(4),
+            ..opts_j1.clone()
+        };
+
+        let res_j1 = pack_rdna2_manifest(&manifest_path, &opts_j1)
+            .expect("manifest jobs=1 pack should succeed");
+        let res_j4 = pack_rdna2_manifest(&manifest_path, &opts_j4)
+            .expect("manifest jobs=4 pack should succeed");
+
+        assert_eq!(res_j1.pack_bytes, res_j4.pack_bytes);
+        assert_eq!(res_j1.summary.to_json(), res_j4.summary.to_json());
+        assert_eq!(res_j1.summary.to_text(), res_j4.summary.to_text());
+        assert_eq!(res_j1.summary, res_j4.summary);
+        assert_eq!(res_j4.summary.translated_ok, 6);
+        assert_eq!(res_j4.summary.manifest_duplicates_skipped, 1);
+        assert_eq!(res_j4.summary.skipped_oversize, 1);
+        assert_eq!(res_j4.summary.failed, 3);
+        assert_eq!(res_j4.summary.failures.len(), 3);
+
+        let decoded = read_pack(&res_j4.pack_bytes).expect("WGPK round-trip must succeed");
+        assert_eq!(decoded.entries.len(), 6);
+        for entry in &decoded.entries {
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        // Strict mode must return the exact same deterministic earliest error under jobs=1 and jobs=4.
+        let strict_err_j1 = pack_rdna2_manifest(
+            &manifest_path,
+            &Rdna2PackOptions {
+                best_effort: false,
+                jobs: Some(1),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect_err("strict manifest pack must fail on bad entries");
+        let strict_err_j4 = pack_rdna2_manifest(
+            &manifest_path,
+            &Rdna2PackOptions {
+                best_effort: false,
+                jobs: Some(4),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect_err("strict manifest pack must fail on bad entries");
+        assert_eq!(strict_err_j1, strict_err_j4);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

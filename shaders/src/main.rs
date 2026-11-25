@@ -90,6 +90,7 @@ enum Command {
         best_effort: bool,
         max_wgsl_bytes: Option<usize>,
         max_pack_bytes: Option<u64>,
+        jobs: Option<usize>,
         json: bool,
     },
 }
@@ -114,7 +115,7 @@ fn print_usage() {
         "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]"
     );
     eprintln!(
-        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--json]"
+        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--jobs <N>] [--json]"
     );
     eprintln!();
     eprintln!(
@@ -457,6 +458,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut best_effort = false;
             let mut max_wgsl_bytes: Option<usize> = None;
             let mut max_pack_bytes: Option<u64> = None;
+            let mut jobs: Option<usize> = None;
             let mut json = false;
 
             let mut i = 1;
@@ -500,6 +502,19 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                         })?;
                         max_pack_bytes = Some(parsed);
                     }
+                    flag @ ("--jobs" | "-j") => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| format!("missing value for {flag}"))?;
+                        let parsed = val
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid integer for {flag}: {val}"))?;
+                        if parsed == 0 {
+                            return Err(format!("{flag} must be >= 1 (got 0)"));
+                        }
+                        jobs = Some(parsed);
+                    }
                     "--json" => json = true,
                     other if other.starts_with('-') => {
                         return Err(format!("unknown option for pack-rdna2: {other}"));
@@ -518,7 +533,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
             if input_dir.is_none() && manifest_path.is_none() {
                 return Err(
-                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--json]"
+                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--jobs <N>] [--json]"
                         .to_string(),
                 );
             }
@@ -533,6 +548,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
+                jobs,
                 json,
             })
         }
@@ -1365,12 +1381,14 @@ fn main() -> ExitCode {
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
+            jobs,
             json,
         }) => {
             let options = Rdna2PackOptions {
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
+                jobs,
                 ..Rdna2PackOptions::default()
             };
             match run_pack_rdna2(
@@ -2087,6 +2105,7 @@ mod tests {
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
+                jobs: None,
                 json: true,
             }
         );
@@ -2107,11 +2126,12 @@ mod tests {
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
+                jobs: None,
                 json: false,
             }
         );
 
-        // Standalone --manifest mode with size controls
+        // Standalone --manifest mode with size controls and --jobs
         let cmd_manifest = parse_args(&[
             "pack-rdna2".to_string(),
             "--manifest".to_string(),
@@ -2123,6 +2143,8 @@ mod tests {
             "262144".to_string(),
             "--max-pack-bytes".to_string(),
             "536870912".to_string(),
+            "--jobs".to_string(),
+            "4".to_string(),
             "--json".to_string(),
         ])
         .unwrap();
@@ -2135,7 +2157,55 @@ mod tests {
                 best_effort: true,
                 max_wgsl_bytes: Some(262_144),
                 max_pack_bytes: Some(536_870_912),
+                jobs: Some(4),
                 json: true,
+            }
+        );
+
+        // Single-threaded --jobs 1 and short -j 4 alias
+        let cmd_jobs_one = parse_args(&[
+            "pack-rdna2".to_string(),
+            "rdna2_blobs".to_string(),
+            "--out".to_string(),
+            "out/single.wgsl.pack".to_string(),
+            "--jobs".to_string(),
+            "1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd_jobs_one,
+            Command::PackRdna2 {
+                input_dir: Some(PathBuf::from("rdna2_blobs")),
+                manifest_path: None,
+                out_path: PathBuf::from("out/single.wgsl.pack"),
+                best_effort: false,
+                max_wgsl_bytes: None,
+                max_pack_bytes: None,
+                jobs: Some(1),
+                json: false,
+            }
+        );
+
+        let cmd_jobs_short = parse_args(&[
+            "pack-rdna2".to_string(),
+            "rdna2_blobs".to_string(),
+            "--out".to_string(),
+            "out/short.wgsl.pack".to_string(),
+            "-j".to_string(),
+            "4".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd_jobs_short,
+            Command::PackRdna2 {
+                input_dir: Some(PathBuf::from("rdna2_blobs")),
+                manifest_path: None,
+                out_path: PathBuf::from("out/short.wgsl.pack"),
+                best_effort: false,
+                max_wgsl_bytes: None,
+                max_pack_bytes: None,
+                jobs: Some(4),
+                json: false,
             }
         );
 
@@ -2158,6 +2228,7 @@ mod tests {
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
+                jobs: None,
                 json: false,
             }
         );
@@ -2274,6 +2345,64 @@ mod tests {
                 "extra_dir".to_string(),
                 "--out".to_string(),
                 "out.wgsl.pack".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--jobs".to_string(),
+            ])
+            .unwrap_err()
+            .contains("--jobs")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--jobs".to_string(),
+                "0".to_string(),
+            ])
+            .unwrap_err()
+            .contains("--jobs")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "-j".to_string(),
+                "0".to_string(),
+            ])
+            .unwrap_err()
+            .contains("-j")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--jobs".to_string(),
+                "abc".to_string(),
+            ])
+            .unwrap_err()
+            .contains("--jobs")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--jobs".to_string(),
+                "-2".to_string(),
             ])
             .is_err()
         );
@@ -2629,6 +2758,7 @@ mod tests {
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
+            jobs,
             json,
         } = parsed_cmd
         else {
@@ -2639,6 +2769,7 @@ mod tests {
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
+            jobs,
             ..Rdna2PackOptions::default()
         };
         let (json_out, result) = format_and_write_pack_rdna2_sources(
@@ -2814,6 +2945,7 @@ mod tests {
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
+            jobs,
             json,
         } = parsed
         else {
@@ -2823,6 +2955,7 @@ mod tests {
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
+            jobs,
             ..Rdna2PackOptions::default()
         };
         let (json_out, res) = format_and_write_pack_rdna2_sources(
@@ -2873,6 +3006,87 @@ mod tests {
         let root_str = root.to_string_lossy().replace('\\', "/");
         assert!(!tight_json.contains(&root_str));
         assert_eq!(read_pack(&fs::read(&out_pack).unwrap()).unwrap().entries.len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn end_to_end_pack_rdna2_cli_jobs_4_matches_jobs_1_bit_for_bit() {
+        let root = make_temp_dir("playgta6_shaders_pack_rdna2_jobs_cli");
+        let in_dir = root.join("blobs");
+        let out_j1 = root.join("out/j1.wgsl.pack");
+        let out_j4 = root.join("out/j4.wgsl.pack");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        let cs_bytes = words_to_bytes(&[
+            (0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242,
+            (0b1_0111_1111_u32 << 23) | (0x0Au32 << 16),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ]);
+        let mut big_cs_words = Vec::new();
+        for _ in 0..80 {
+            big_cs_words.push((0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242);
+            big_cs_words.push((0x18u32 << 25) | (2u32 << 17) | (1u32 << 9) | (128 + 1));
+        }
+        big_cs_words.push((0b1_0111_1111_u32 << 23) | (0x0Au32 << 16));
+        big_cs_words.push((0b1_0111_1111_u32 << 23) | (0x01u32 << 16));
+        let big_cs_bytes = words_to_bytes(&big_cs_words);
+
+        fs::write(in_dir.join("a_cs_0000000000005001.rdna2"), &cs_bytes).unwrap();
+        fs::write(in_dir.join("b_cs_0000000000005002.rdna2"), &cs_bytes).unwrap();
+        fs::write(in_dir.join("c_cs_dup_0000000000005001.rdna2"), &cs_bytes).unwrap();
+        fs::write(in_dir.join("d_cs_0000000000005003.rdna2"), &big_cs_bytes).unwrap();
+        fs::write(in_dir.join("e_truncated.bin"), &[0x01, 0x02]).unwrap();
+
+        let run_cli = |jobs_arg: &str, out_file: &Path| -> (String, Vec<u8>) {
+            let cmd = parse_args(&[
+                "pack-rdna2".to_string(),
+                in_dir.to_string_lossy().into_owned(),
+                "--out".to_string(),
+                out_file.to_string_lossy().into_owned(),
+                "--best-effort".to_string(),
+                "--jobs".to_string(),
+                jobs_arg.to_string(),
+                "--json".to_string(),
+            ])
+            .expect("pack-rdna2 --jobs CLI args should parse");
+            let Command::PackRdna2 {
+                input_dir,
+                manifest_path,
+                out_path,
+                best_effort,
+                max_wgsl_bytes,
+                max_pack_bytes,
+                jobs,
+                json,
+            } = cmd
+            else {
+                panic!("expected Command::PackRdna2");
+            };
+            let opts = Rdna2PackOptions {
+                best_effort,
+                max_wgsl_bytes,
+                max_pack_bytes,
+                jobs,
+                ..Rdna2PackOptions::default()
+            };
+            let (json_out, _) = format_and_write_pack_rdna2_sources(
+                input_dir.as_deref(),
+                manifest_path.as_deref(),
+                &out_path,
+                &opts,
+                json,
+            )
+            .expect("pack-rdna2 should succeed");
+            let bytes = fs::read(out_file).unwrap();
+            (json_out, bytes)
+        };
+
+        let (json_j1, bytes_j1) = run_cli("1", &out_j1);
+        let (json_j4, bytes_j4) = run_cli("4", &out_j4);
+        assert_eq!(bytes_j1, bytes_j4);
+        assert_eq!(json_j1, json_j4);
+        assert_eq!(read_pack(&bytes_j4).unwrap().entries.len(), 3);
 
         let _ = fs::remove_dir_all(&root);
     }
