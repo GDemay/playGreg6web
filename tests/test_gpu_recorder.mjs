@@ -19,9 +19,12 @@ const {
   FRAME_CAPTURE_SCHEMA,
   FRAME_CAPTURE_SCHEMA_VERSION,
   PACKET_HEADER_BYTES,
+  WRITE_TEXTURE_HEADER_BYTES,
   DEFAULT_START_FRAME,
   DEFAULT_MAX_FRAMES,
   DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_RECORDED_BYTES,
+  DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES,
   OPCODES,
   OPCODE_NAMES,
   getOpcodeName,
@@ -155,6 +158,42 @@ class BinaryPacketBuilder {
 
   present(flags = 0) {
     return this.packet(OPCODES.PRESENT, new Uint8Array(0), flags);
+  }
+
+  writeTexture(
+    textureId,
+    width,
+    height,
+    data,
+    {
+      mipLevel = 0,
+      originX = 0,
+      originY = 0,
+      originZ = 0,
+      depthOrLayers = 1,
+      bytesPerRow = 0,
+      rowsPerImage = 0,
+      reserved = 0,
+      flags = 0,
+    } = {}
+  ) {
+    const src = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const buf = new ArrayBuffer(WRITE_TEXTURE_HEADER_BYTES + src.byteLength);
+    const view = new DataView(buf);
+    view.setUint32(0, textureId, true);
+    view.setUint32(4, mipLevel, true);
+    view.setUint32(8, originX, true);
+    view.setUint32(12, originY, true);
+    view.setUint32(16, originZ, true);
+    view.setUint32(20, width, true);
+    view.setUint32(24, height, true);
+    view.setUint32(28, depthOrLayers, true);
+    view.setUint32(32, bytesPerRow, true);
+    view.setUint32(36, rowsPerImage, true);
+    view.setUint32(40, src.byteLength, true);
+    view.setUint32(44, reserved, true);
+    new Uint8Array(buf, WRITE_TEXTURE_HEADER_BYTES).set(src);
+    return this.packet(OPCODES.WRITE_TEXTURE, new Uint8Array(buf), flags);
   }
 
   dispatchCompute(x, y, z, flags = 0) {
@@ -1568,4 +1607,372 @@ test('W124: default behavior without options remains 100% backwards-compatible a
     rec.exportTraceBytes({ frameStart: DEFAULT_MAX_FRAMES - 1, frameCount: 1 }),
     frames[frames.length - 1]
   );
+});
+
+test('W216: full capture default (skipWriteTextureAboveBytes = 0), option validation, and alias support', () => {
+  assert.equal(WRITE_TEXTURE_HEADER_BYTES, 48);
+  assert.equal(DEFAULT_MAX_RECORDED_BYTES, DEFAULT_MAX_BYTES);
+  assert.equal(DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES, 0);
+  assert.equal(GpuFrameRecorder.WRITE_TEXTURE_HEADER_BYTES, 48);
+  assert.equal(GpuFrameRecorder.DEFAULT_MAX_RECORDED_BYTES, DEFAULT_MAX_BYTES);
+  assert.equal(GpuFrameRecorder.DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES, 0);
+
+  // Default recorder retains large WriteTexture payloads verbatim.
+  const rec = new GpuFrameRecorder({ autoStart: true });
+  const initialStats = rec.getStats();
+  assert.equal(initialStats.skipWriteTextureAboveBytes, 0);
+  assert.equal(initialStats.maxRecordedBytes, DEFAULT_MAX_BYTES);
+  assert.equal(initialStats.recordedPackets, 0);
+  assert.equal(initialStats.recordedBytes, 0);
+  assert.equal(initialStats.skippedLargeUploadPackets, 0);
+  assert.equal(initialStats.skippedLargeUploadBytes, 0);
+  assert.equal(initialStats.droppedRingPackets, 0);
+
+  const largeTexels = new Uint8Array(512 * 1024);
+  largeTexels.fill(0x5a);
+  const fullFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.1, 0.2, 0.3, 1.0)
+    .writeTexture(42, 1024, 512, largeTexels, { bytesPerRow: 1024, rowsPerImage: 512 })
+    .draw(6, 1, 0, 0)
+    .present()
+    .finish();
+
+  const chunkRes = rec.recordChunk(fullFrame);
+  assert.equal(chunkRes.completedFrames, 1);
+  assert.equal(chunkRes.skippedLargeUploadPackets, 0);
+  assert.equal(chunkRes.skippedLargeUploadBytes, 0);
+
+  const stats = rec.getStats();
+  assert.equal(stats.recordedPackets, 5);
+  assert.equal(stats.recordedBytes, fullFrame.byteLength);
+  assert.equal(stats.skippedLargeUploadPackets, 0);
+  assert.equal(stats.skippedLargeUploadBytes, 0);
+  assert.equal(stats.droppedRingPackets, 0);
+  assert.deepEqual(rec.exportTraceBytes(), fullFrame);
+
+  // Alias skipLargeWriteTextureBytes works identically to skipWriteTextureAboveBytes.
+  const aliasRec = new GpuFrameRecorder({
+    autoStart: true,
+    skipLargeWriteTextureBytes: 64 * 1024,
+  });
+  assert.equal(aliasRec.getStats().skipWriteTextureAboveBytes, 64 * 1024);
+  aliasRec.recordChunk(fullFrame);
+  assert.equal(aliasRec.getStats().skippedLargeUploadPackets, 1);
+  assert.equal(aliasRec.getStats().recordedPackets, 4);
+
+  // Option validation in constructor and startCapture leaves existing state untouched.
+  assert.throws(() => new GpuFrameRecorder({ maxRecordedBytes: 0 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ maxRecordedBytes: -100 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ maxRecordedBytes: 12.5 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ skipWriteTextureAboveBytes: -1 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ skipWriteTextureAboveBytes: 1.5 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ skipLargeWriteTextureBytes: -8 }), RangeError);
+  assert.throws(() => rec.startCapture({ maxRecordedBytes: 0 }), RangeError);
+  assert.throws(() => rec.startCapture({ skipWriteTextureAboveBytes: -4 }), RangeError);
+  assert.throws(() => rec.startCapture({ skipLargeWriteTextureBytes: 'bad' }), RangeError);
+  assert.equal(rec.getStats().recordedPackets, 5);
+  assert.equal(rec.getStats().recordedBytes, fullFrame.byteLength);
+});
+
+test('W216: skipWriteTextureAboveBytes elides 8.3 MiB 4K Y planes while preserving UI uploads, pipelines, draws, and replayability', (t) => {
+  const Y_WIDTH = 3840;
+  const Y_HEIGHT = 2160;
+  const Y_PLANE_BYTES = Y_WIDTH * Y_HEIGHT; // 8,294,400 bytes (~8.3 MB)
+  const CHROMA_WIDTH = 1920;
+  const CHROMA_HEIGHT = 1080;
+  const CHROMA_PLANE_BYTES = CHROMA_WIDTH * CHROMA_HEIGHT; // 2,073,600 bytes
+  const THRESHOLD_BYTES = 256 * 1024; // 256 KiB
+
+  const yPlaneData = new Uint8Array(Y_PLANE_BYTES);
+  yPlaneData[0] = 0x10;
+  yPlaneData[Y_PLANE_BYTES - 1] = 0xeb;
+  const uPlaneData = new Uint8Array(CHROMA_PLANE_BYTES);
+  const vPlaneData = new Uint8Array(CHROMA_PLANE_BYTES);
+  // Exact-threshold UI atlas (256 KiB) must be preserved; threshold + 1 must be skipped.
+  const exactThresholdData = new Uint8Array(THRESHOLD_BYTES);
+  exactThresholdData.fill(0x7f);
+  const overThresholdByOneData = new Uint8Array(THRESHOLD_BYTES + 1);
+
+  const vsWgsl = '@vertex fn vs_main(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 1.0); }\n';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }\n';
+
+  const binkFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.0, 0.0, 0.0, 1.0)
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsWgsl)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsWgsl)
+    .createRenderPipeline(3, 1, 2, 12, PRIMITIVE_TOPOLOGY.TRIANGLE_LIST, 0)
+    .writeTexture(100, 256, 256, exactThresholdData, { bytesPerRow: 1024, rowsPerImage: 256 })
+    .writeTexture(101, Y_WIDTH, Y_HEIGHT, yPlaneData, { bytesPerRow: Y_WIDTH, rowsPerImage: Y_HEIGHT })
+    .writeTexture(102, CHROMA_WIDTH, CHROMA_HEIGHT, uPlaneData, {
+      bytesPerRow: CHROMA_WIDTH,
+      rowsPerImage: CHROMA_HEIGHT,
+    })
+    .writeTexture(103, CHROMA_WIDTH, CHROMA_HEIGHT, vPlaneData, {
+      bytesPerRow: CHROMA_WIDTH,
+      rowsPerImage: CHROMA_HEIGHT,
+    })
+    .writeTexture(104, 256, 257, overThresholdByOneData, { bytesPerRow: 1024, rowsPerImage: 257 })
+    .setPipeline(3)
+    .draw(6, 1, 0, 0)
+    .present()
+    .finish();
+
+  const expectedFilteredFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.0, 0.0, 0.0, 1.0)
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsWgsl)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsWgsl)
+    .createRenderPipeline(3, 1, 2, 12, PRIMITIVE_TOPOLOGY.TRIANGLE_LIST, 0)
+    .writeTexture(100, 256, 256, exactThresholdData, { bytesPerRow: 1024, rowsPerImage: 256 })
+    .setPipeline(3)
+    .draw(6, 1, 0, 0)
+    .present()
+    .finish();
+
+  const expectedSkippedBytes =
+    (PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES + Y_PLANE_BYTES) +
+    (PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES + CHROMA_PLANE_BYTES) * 2 +
+    (PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES + THRESHOLD_BYTES + 1);
+
+  assert.equal(expectedFilteredFrame.byteLength + expectedSkippedBytes, binkFrame.byteLength);
+
+  // 1) Single-chunk capture
+  const rec = new GpuFrameRecorder({
+    autoStart: true,
+    maxRecordedBytes: 512 * 1024, // far smaller than a single 8.3 MiB Y plane!
+    skipWriteTextureAboveBytes: THRESHOLD_BYTES,
+  });
+
+  const res = rec.recordChunk(binkFrame);
+  assert.equal(res.completedFrames, 1);
+  assert.equal(res.droppedFrames, 0);
+  assert.equal(res.skippedLargeUploadPackets, 4);
+  assert.equal(res.skippedLargeUploadBytes, expectedSkippedBytes);
+
+  const stats = rec.getStats();
+  assert.equal(stats.frameCount, 1);
+  assert.equal(stats.recordedPackets, 9);
+  assert.equal(stats.totalPackets, 9);
+  assert.equal(stats.recordedBytes, expectedFilteredFrame.byteLength);
+  assert.equal(stats.totalBytes, expectedFilteredFrame.byteLength);
+  assert.ok(stats.recordedBytes < binkFrame.byteLength / 20);
+  assert.equal(stats.skippedLargeUploadPackets, 4);
+  assert.equal(stats.skippedLargeUploadBytes, expectedSkippedBytes);
+  assert.equal(stats.droppedRingPackets, 0);
+  assert.equal(stats.skipWriteTextureAboveBytes, THRESHOLD_BYTES);
+  assert.equal(stats.maxRecordedBytes, 512 * 1024);
+  assert.deepEqual(stats.opcodeCounts, {
+    BeginFrame: 1,
+    ClearColor: 1,
+    CreateShaderModule: 2,
+    CreateRenderPipeline: 1,
+    WriteTexture: 1, // exact-threshold UI upload preserved
+    SetPipeline: 1,
+    Draw: 1,
+    Present: 1,
+  });
+
+  const exported = rec.exportTraceBytes();
+  assert.deepEqual(exported, expectedFilteredFrame);
+
+  // Metadata records details of skipped large uploads and is JSON-safe & isolated.
+  const meta = rec.exportMetadata();
+  assert.deepEqual(JSON.parse(JSON.stringify(meta)), meta);
+  assert.equal(meta.frames.length, 1);
+  assert.equal(meta.frames[0].skippedLargeUploadPackets, 4);
+  assert.equal(meta.frames[0].skippedLargeUploadBytes, expectedSkippedBytes);
+  assert.equal(meta.skippedLargeUploads.length, 4);
+  assert.deepEqual(meta.skippedLargeUploads[0], {
+    frameSequence: 0,
+    textureId: 101,
+    mipLevel: 0,
+    width: Y_WIDTH,
+    height: Y_HEIGHT,
+    depthOrArrayLayers: 1,
+    bytesPerRow: Y_WIDTH,
+    rowsPerImage: Y_HEIGHT,
+    dataLen: Y_PLANE_BYTES,
+    texelBytes: Y_PLANE_BYTES,
+    packetBytes: PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES + Y_PLANE_BYTES,
+  });
+  meta.skippedLargeUploads[0].textureId = 99999;
+  assert.equal(rec.exportMetadata().skippedLargeUploads[0].textureId, 101);
+
+  // 2) Streaming / arbitrary split chunks across packet header & WriteTexture payload boundaries
+  const recSplit = new GpuFrameRecorder({
+    autoStart: true,
+    maxRecordedBytes: 512 * 1024,
+    skipWriteTextureAboveBytes: THRESHOLD_BYTES,
+  });
+  // Deliberately split across tiny header fragments first, then 64 KiB chunks.
+  const firstCutPoints = [3, 8, 12, 50, 90, 200, 1024];
+  let pos = 0;
+  for (const step of firstCutPoints) {
+    if (pos >= binkFrame.byteLength) break;
+    const end = Math.min(pos + step, binkFrame.byteLength);
+    recSplit.recordChunk(binkFrame.subarray(pos, end));
+    pos = end;
+  }
+  const chunkStep = 65536;
+  while (pos < binkFrame.byteLength) {
+    // Also split right around a WriteTexture packet header (odd stride).
+    const step = (pos % 3 === 0) ? 19 : chunkStep;
+    const end = Math.min(pos + step, binkFrame.byteLength);
+    recSplit.recordChunk(binkFrame.subarray(pos, end));
+    pos = end;
+  }
+
+  assert.deepEqual(recSplit.exportTraceBytes(), expectedFilteredFrame);
+  assert.equal(recSplit.getStats().recordedPackets, 9);
+  assert.equal(recSplit.getStats().recordedBytes, expectedFilteredFrame.byteLength);
+  assert.equal(recSplit.getStats().skippedLargeUploadPackets, 4);
+  assert.equal(recSplit.getStats().skippedLargeUploadBytes, expectedSkippedBytes);
+  assert.deepEqual(recSplit.exportMetadata().skippedLargeUploads, rec.exportMetadata().skippedLargeUploads);
+
+  // 3) Replay filtered trace through GpuTraceReplayer -> WgpuCommandProcessor
+  const { device, ctx, calls } = createMockWebGpu();
+  device.createShaderModule = (desc) => ({ kind: 'GPUShaderModule', code: desc.code });
+  device.createRenderPipeline = (desc) => ({ kind: 'GPURenderPipeline', desc });
+  const processor = new WgpuCommandProcessor(device, ctx);
+  const replayer = new GpuTraceReplayer().loadTrace(exported);
+  const replayRun = replayer.replayAll(processor);
+  assert.equal(replayRun.ok, true);
+  assert.equal(replayRun.succeededFrames, 1);
+  assert.equal(replayRun.failedFrames, 0);
+  assert.equal(calls.filter((c) => c.op === 'draw').length, 1);
+  assert.equal(calls.filter((c) => c.op === 'submit').length, 1);
+
+  // 4) Disassemble filtered trace with tools/gpu_trace.py --strict
+  const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+  const probe = spawnSync(pythonCmd, ['--version'], { encoding: 'utf-8' });
+  if (probe.error || probe.status !== 0) {
+    t.skip('python interpreter unavailable for gpu_trace.py cross-check');
+    return;
+  }
+  const traceScript = path.join(REPO_ROOT, 'tools', 'gpu_trace.py');
+  const proc = spawnSync(pythonCmd, [traceScript, '-', '--json', '--strict'], {
+    input: Buffer.from(exported),
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  assert.equal(proc.status, 0, `gpu_trace.py failed: ${proc.stderr.toString('utf-8')}`);
+  const parsed = JSON.parse(proc.stdout.toString('utf-8'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.diagnostics, []);
+  assert.equal(parsed.frame_count, 1);
+  assert.equal(parsed.packet_count, stats.recordedPackets);
+  assert.equal(parsed.draw_calls, 1);
+  assert.deepEqual(parsed.opcode_histogram, stats.opcodeCounts);
+});
+
+test('W216: maxRecordedBytes bounded ring-buffer eviction, droppedRingPackets, stopOnBudget, and clear()', () => {
+  const frameA = buildSimpleFrame(0.1, 3); // 4 packets, 64 bytes
+  const frameB = buildSimpleFrame(0.2, 6); // 4 packets, 64 bytes
+  const frameC = buildSimpleFrame(0.3, 9); // 4 packets, 64 bytes
+  const frameD = buildSimpleFrame(0.4, 12); // 4 packets, 64 bytes
+  assert.equal(frameA.byteLength, 64);
+
+  // 1) Rolling ring buffer bounded by maxRecordedBytes = 128 (holds 2 frames = 8 packets)
+  const ringRec = new GpuFrameRecorder({
+    maxFrames: 100,
+    maxRecordedBytes: 128,
+    autoStart: true,
+  });
+
+  ringRec.recordChunk(frameA);
+  ringRec.recordChunk(frameB);
+  let stats = ringRec.getStats();
+  assert.equal(stats.frameCount, 2);
+  assert.equal(stats.recordedPackets, 8);
+  assert.equal(stats.recordedBytes, 128);
+  assert.equal(stats.droppedFrames, 0);
+  assert.equal(stats.droppedRingPackets, 0);
+
+  // Pushing frameC and frameD evicts frameA and frameB (4 packets each -> 8 droppedRingPackets).
+  ringRec.recordChunk(frameC);
+  ringRec.recordChunk(frameD);
+  stats = ringRec.getStats();
+  assert.equal(stats.frameCount, 2);
+  assert.equal(stats.recordedPackets, 8);
+  assert.equal(stats.recordedBytes, 128);
+  assert.ok(stats.recordedBytes <= stats.maxRecordedBytes);
+  assert.equal(stats.droppedFrames, 2);
+  assert.equal(stats.droppedRingPackets, 8);
+  assert.deepEqual(ringRec.exportTraceBytes(), concatUint8Arrays([frameC, frameD]));
+
+  // 2) Single oversized frame (> maxRecordedBytes) is dropped without evicting retained frames,
+  //    and its packets are accounted in droppedRingPackets.
+  const oversized = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(1, 0, new Uint8Array(200))
+    .draw(3)
+    .present()
+    .finish(); // 4 packets, > 128 bytes
+  ringRec.recordChunk(oversized);
+  stats = ringRec.getStats();
+  assert.equal(stats.frameCount, 2);
+  assert.equal(stats.recordedPackets, 8);
+  assert.equal(stats.recordedBytes, 128);
+  assert.equal(stats.droppedFrames, 3);
+  assert.equal(stats.droppedRingPackets, 12);
+
+  // 3) Combined maxRecordedBytes + skipWriteTextureAboveBytes in startCapture (stopOnBudget: true):
+  //    4K 8.3 MiB Y-plane frames fit inside a 200-byte budget instead of tripping budgetReached on frame 0!
+  const yPlane = new Uint8Array(3840 * 2160);
+  const binkLightFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.2, 0.4, 0.6, 1.0)
+    .writeTexture(77, 3840, 2160, yPlane, { bytesPerRow: 3840, rowsPerImage: 2160 })
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+  const expectedCompactFrame = buildSimpleFrame(0.2, 3);
+  // Make clearColor match (0.2, 0.4, 0.6, 1.0)
+  const expectedCompact = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.2, 0.4, 0.6, 1.0)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+  assert.equal(expectedCompact.byteLength, expectedCompactFrame.byteLength); // 64 bytes
+
+  const capRec = new GpuFrameRecorder();
+  capRec.startCapture({
+    maxFrames: 10,
+    maxRecordedBytes: 150, // fits 2 compact frames (128B), stops cleanly on 3rd (192B > 150B)
+    skipWriteTextureAboveBytes: 1024 * 1024,
+  });
+
+  capRec.recordChunk(binkLightFrame);
+  capRec.recordChunk(binkLightFrame);
+  assert.equal(capRec.isRecording(), true);
+  assert.equal(capRec.getStats().frameCount, 2);
+  assert.equal(capRec.getStats().recordedBytes, 128);
+  assert.equal(capRec.getStats().recordedPackets, 8);
+  assert.equal(capRec.getStats().skippedLargeUploadPackets, 2);
+  assert.equal(
+    capRec.getStats().skippedLargeUploadBytes,
+    2 * (PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES + yPlane.byteLength)
+  );
+
+  // 3rd frame trips 150B cap cleanly without corrupting the 2 captured frames.
+  capRec.recordChunk(binkLightFrame);
+  const capStats = capRec.getStats();
+  assert.equal(capStats.budgetReached, true);
+  assert.equal(capStats.recording, false);
+  assert.equal(capStats.frameCount, 2);
+  assert.equal(capStats.recordedBytes, 128);
+  assert.equal(capStats.recordedPackets, 8);
+  assert.deepEqual(capRec.exportTraceBytes(), concatUint8Arrays([expectedCompact, expectedCompact]));
+
+  // 4) clear() resets all W216 counters and skippedLargeUploads metadata.
+  ringRec.clear();
+  const cleared = ringRec.exportMetadata();
+  assert.equal(cleared.recordedPackets, 0);
+  assert.equal(cleared.recordedBytes, 0);
+  assert.equal(cleared.skippedLargeUploadPackets, 0);
+  assert.equal(cleared.skippedLargeUploadBytes, 0);
+  assert.equal(cleared.droppedRingPackets, 0);
+  assert.deepEqual(cleared.skippedLargeUploads, []);
 });
