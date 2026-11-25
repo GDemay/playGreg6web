@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
@@ -97,10 +99,19 @@
 //     --save-dir, never any cloud sync; s5/s6 by public header order), s13
 //     EnumerateContainerInfoByName(provider, prefix, context, callback) and s14
 //     EnumerateContainerInfo(provider, context, callback) (the title calls s13 with "Player" and
-//     "SettingsProfileSettings", s14 once; the callback is a code address). The other slots the
-//     title has wrappers for (arguments excluding this: s8 2, s9 2, s11 3, s12 1, s16 3, s17 1,
-//     s19 4, s20 5, s21 4 with a 32-bit third, s22 4, s23 3, s24 1, s25 4, s28 2, s29 1) were
-//     never reached and stay logging stubs until a boot calls them.
+//     "SettingsProfileSettings", s14 once; the callback is a code address and compares the name).
+//     R40, from the title's save manager (container handle at +0xc0, update handle at +0xc8,
+//     provider at +0x88): s16 CreateContainer(provider, name, handle*) h (also called before every
+//     read and write), s17 CloseContainer(handle) h (the manager's reset), s19
+//     EnumerateBlobInfoByName(container, "Save Game Header", context, callback) h (the callback
+//     sizes the read buffer as 24 + strlen(name) + 1 + size, i.e. XGameSaveBlob is {name, size,
+//     data}), s20 ReadBlobData(container, names, &count, size, blobs) h, s21/s22
+//     ReadBlobDataAsync(container, names, u32 count, block) / Result(block, size, blobs, &count) h,
+//     s23 CreateUpdate(container, displayName, handle*) h, s24 CloseUpdate h, s25
+//     SubmitBlobWrite(update, name, data, size) h (header 0x128 bytes + payload), s28/s29
+//     SubmitUpdateAsync(update, block) / Result(block) h, s8/s9 GetRemainingQuotaAsync/Result h,
+//     s11/s12 DeleteContainerAsync/Result h; s7, s10, s18, s26, s27 (no title wrappers) by the
+//     same order m. s15 (no wrapper; GetContainerInfo) stays a logging stub.
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
 //     XGameEventWrite {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped
 //     {a4f1aee2-...}, {dfcd4649-...}.
@@ -1174,40 +1185,199 @@ struct SaveProvider {
     std::string configuration_id;
 };
 
-class SaveProviders {
+// XGameSaveContainerHandle: a name in a provider. Like the GDK, creating the handle does not create
+// the container in storage; the first submitted update does.
+struct SaveContainer {
+    std::shared_ptr<SaveProvider> provider;
+    std::string name;
+};
+
+// XGameSaveUpdateHandle: blob writes and deletes collected until one submit applies them all.
+struct SaveUpdate {
+    std::shared_ptr<SaveProvider> provider;
+    std::string container;
+    std::string display_name;
+    std::mutex mutex;
+    std::vector<gamesave::BlobWrite> writes;
+    std::vector<std::string> deletes;
+    bool submitted = false;
+};
+
+// Opaque guest handle values -> host objects (one table per handle type, distinct ranges).
+template <typename T>
+class SaveHandles {
 public:
-    uint64_t add(const std::string& configuration_id) {
-        auto provider = std::make_shared<SaveProvider>(
-            SaveProvider{gamesave::open_store(configuration_id), configuration_id});
+    explicit constexpr SaveHandles(uint64_t first) : first_(first) {}
+    uint64_t add(std::shared_ptr<T> object) {
         std::lock_guard<std::mutex> lock(mutex_);
-        const uint64_t id = kFirst + next_++;
-        providers_.emplace(id, std::move(provider));
+        const uint64_t id = first_ + next_++;
+        objects_.emplace(id, std::move(object));
         return id;
     }
-    std::shared_ptr<SaveProvider> find(uint64_t id) const {
+    std::shared_ptr<T> find(uint64_t id) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = providers_.find(id);
-        return it == providers_.end() ? nullptr : it->second;
+        auto it = objects_.find(id);
+        return it == objects_.end() ? nullptr : it->second;
     }
     bool remove(uint64_t id) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return providers_.erase(id) != 0;
+        return objects_.erase(id) != 0;
     }
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
-        providers_.clear();
+        objects_.clear();
     }
 
 private:
-    static constexpr uint64_t kFirst = 0x5047530000000ULL;
+    uint64_t first_;
     mutable std::mutex mutex_;
-    std::map<uint64_t, std::shared_ptr<SaveProvider>> providers_;
+    std::map<uint64_t, std::shared_ptr<T>> objects_;
     uint64_t next_ = 1;
 };
 
-SaveProviders& save_providers() {
-    static SaveProviders p;
-    return p;
+SaveHandles<SaveProvider>& save_providers() {
+    static SaveHandles<SaveProvider> h(0x5047530000000ULL);
+    return h;
+}
+SaveHandles<SaveContainer>& save_containers() {
+    static SaveHandles<SaveContainer> h(0x5047430000000ULL);
+    return h;
+}
+SaveHandles<SaveUpdate>& save_updates() {
+    static SaveHandles<SaveUpdate> h(0x5047550000000ULL);
+    return h;
+}
+
+uint64_t add_save_provider(const std::string& configuration_id) {
+    return save_providers().add(std::make_shared<SaveProvider>(
+        SaveProvider{gamesave::open_store(configuration_id), configuration_id}));
+}
+
+// Blobs read for XGameSaveReadBlobData(Async).
+struct ReadBlobs {
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> blobs;
+    // Each XGameSaveBlob entry plus its name and data, packed (what the title sizes its buffer to:
+    // sizeof(XGameSaveBlob) + strlen(name) + 1 + size).
+    size_t required() const;
+};
+
+// XGameSaveBlobInfo / XGameSaveBlob (x64).
+struct GuestBlobInfo {
+    uint64_t name;  // const char*
+    uint32_t size;
+    uint32_t pad;
+};
+struct GuestBlob {
+    GuestBlobInfo info;
+    uint64_t data;  // uint8_t*
+};
+static_assert(sizeof(GuestBlobInfo) == 16 && sizeof(GuestBlob) == 24);
+
+size_t ReadBlobs::required() const {
+    size_t total = 0;
+    for (const auto& blob : blobs) {
+        total += sizeof(GuestBlob) + blob.first.size() + 1 + blob.second.size();
+    }
+    return total;
+}
+
+// Reads the named blobs (all blobs when `names` is empty) of a container. A container that was
+// never submitted has no blobs.
+HResult read_blobs(const SaveContainer& container, std::vector<std::string> names, ReadBlobs* out) {
+    out->blobs.clear();
+    if (names.empty()) {
+        std::vector<gamesave::BlobInfo> infos;
+        const HResult hr = container.provider->store.enumerate_blobs(container.name, &infos);
+        if (hr < 0 && hr != gamesave::E_GS_NO_SUCH_CONTAINER) {
+            return hr;
+        }
+        for (const gamesave::BlobInfo& info : infos) {
+            names.push_back(info.name);
+        }
+    }
+    for (const std::string& name : names) {
+        std::vector<uint8_t> data;
+        HResult hr = container.provider->store.read_blob(container.name, name, &data);
+        if (hr == gamesave::E_GS_NO_SUCH_CONTAINER) {
+            hr = gamesave::E_GS_BLOB_NOT_FOUND;
+        }
+        if (hr < 0) {
+            out->blobs.clear();
+            return hr;
+        }
+        out->blobs.emplace_back(name, std::move(data));
+    }
+    return S_OK_HR;
+}
+
+// Lays out the XGameSaveBlob array at `buffer`, followed by each blob's data and name.
+bool write_blobs(uint64_t buffer, const ReadBlobs& read) {
+    uint64_t cursor = buffer + read.blobs.size() * sizeof(GuestBlob);
+    for (size_t i = 0; i < read.blobs.size(); ++i) {
+        const auto& [name, data] = read.blobs[i];
+        GuestBlob entry{};
+        entry.data = cursor;
+        entry.info.size = static_cast<uint32_t>(data.size());
+        if (!data.empty() && !com::write_guest(cursor, data.data(), data.size())) {
+            return false;
+        }
+        cursor += data.size();
+        entry.info.name = cursor;
+        if (!com::write_guest(cursor, name.c_str(), name.size() + 1)) {
+            return false;
+        }
+        cursor += name.size() + 1;
+        if (!com::write_guest(buffer + i * sizeof(GuestBlob), entry)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Applies an update: the container is created by its first update; a failing update leaves no new
+// container behind.
+HResult submit_update(SaveUpdate& update) {
+    std::vector<gamesave::BlobWrite> writes;
+    std::vector<std::string> deletes;
+    {
+        std::lock_guard<std::mutex> lock(update.mutex);
+        if (update.submitted) {
+            return E_ILLEGAL_METHOD_CALL_HR;
+        }
+        update.submitted = true;
+        writes = std::move(update.writes);
+        deletes = std::move(update.deletes);
+    }
+    gamesave::Store& store = update.provider->store;
+    std::vector<gamesave::BlobInfo> existing;
+    const bool is_new = store.enumerate_blobs(update.container, &existing) == gamesave::E_GS_NO_SUCH_CONTAINER;
+    HResult hr = store.create_container(update.container);
+    if (hr >= 0) {
+        hr = store.submit_update(update.container, writes, deletes);
+    }
+    if (hr >= 0 && !update.display_name.empty()) {
+        hr = store.set_display_name(update.container, update.display_name);
+    }
+    if (hr < 0 && is_new) {
+        store.delete_container(update.container);
+    }
+    return hr;
+}
+
+// Guest blob-name array (const char* names[count]).
+bool guest_names(uint64_t names, uint32_t count, std::vector<std::string>* out) {
+    out->clear();
+    if (count > 4096 || (count != 0 && names == 0)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t ptr = 0;
+        if (!com::read_guest(names + 8ull * i, ptr) || ptr == 0) {
+            return false;
+        }
+        out->push_back(guest_string(ptr, 256));
+    }
+    return true;
 }
 
 // XGameSaveInitializeProviderAsync: the provider is created in DoWork and handed over by Result.
@@ -1219,7 +1389,7 @@ public:
         case XAsyncOp::Begin:
             return XAsyncSchedule(block, 0);
         case XAsyncOp::DoWork:
-            handle_ = save_providers().add(configuration_id_);
+            handle_ = add_save_provider(configuration_id_);
             XAsyncComplete(block, S_OK_HR, sizeof(uint64_t));
             return E_PENDING_HR;
         case XAsyncOp::GetResult:
@@ -1233,6 +1403,44 @@ private:
     std::string configuration_id_;
     uint64_t handle_ = 0;
 };
+
+// An XGameSave async operation whose work runs on the queue's work port: `work` returns the
+// HRESULT and the result size, `result` writes the result into the guest buffer.
+class SaveWorkOp final : public XAsyncProviderImpl {
+public:
+    using Work = std::function<HResult(size_t* required)>;
+    using Result = std::function<HResult(uint64_t buffer)>;
+    SaveWorkOp(Work work, Result result) : work_(std::move(work)), result_(std::move(result)) {}
+    HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
+        switch (op) {
+        case XAsyncOp::Begin:
+            return XAsyncSchedule(block, 0);
+        case XAsyncOp::DoWork: {
+            size_t required = 0;
+            const HResult hr = work_(&required);
+            XAsyncComplete(block, hr, hr < 0 ? 0 : required);
+            return E_PENDING_HR;
+        }
+        case XAsyncOp::GetResult:
+            return result_ ? result_(buffer) : S_OK_HR;
+        default:
+            return S_OK_HR;
+        }
+    }
+
+private:
+    Work work_;
+    Result result_;
+};
+
+// ReadBlobDataAsync results by guest XAsyncBlock until ReadBlobDataResult hands them over (the
+// blob count is an output of Result, next to the buffer the framework fills).
+struct PendingRead {
+    std::mutex mutex;
+    ReadBlobs read;
+};
+std::mutex g_pending_reads_mutex;
+std::map<uint64_t, std::shared_ptr<PendingRead>> g_pending_reads;
 
 class GameSaveApi : public com::ComObject {
 public:
@@ -1249,7 +1457,7 @@ public:
             return E_INVALIDARG_HR;
         }
         log_once("XGameSaveInitializeProvider");
-        provider.write(save_providers().add(guest_string(configuration_id, 256)));
+        provider.write(add_save_provider(guest_string(configuration_id, 256)));
         return S_OK_HR;
     }
 
@@ -1274,30 +1482,87 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(provider, uint64_t{0});
-        Pg6XAsyncBlock* shadow = find_async(async);
-        if (shadow == nullptr) {
+        return finish_async(async, sizeof(uint64_t), provider);
+    }
+
+    // s7: XGameSaveGetRemainingQuota(provider, int64_t* remainingQuota).
+    int32_t GetRemainingQuota(uint64_t provider_handle, uint64_t remaining) {
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || remaining == 0) {
             return E_INVALIDARG_HR;
         }
-        size_t used = 0;
-        const int32_t hr = XAsyncGetResultWith(shadow, 0, sizeof(uint64_t), provider, &used);
-        if (hr != E_PENDING_HR) {
-            cbk::async_shadow_end(async);
-        }
+        int64_t value = 0;
+        const int32_t hr = provider->store.remaining_quota(&value);
+        com::write_guest(remaining, hr < 0 ? int64_t{0} : value);
         return hr;
     }
 
-    // XGameSaveContainerInfo as handed to the enumeration callback (x64; field order from the
-    // public documentation: name, totalSize, blobCount, lastModifiedTime, needsSync).
+    // s8: XGameSaveGetRemainingQuotaAsync(provider, XAsyncBlock*).
+    int32_t GetRemainingQuotaAsync(uint64_t provider_handle, uint64_t async) {
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        auto value = std::make_shared<int64_t>(0);
+        return begin_work(async, "XGameSaveGetRemainingQuotaAsync",
+                          [provider, value](size_t* required) {
+                              *required = sizeof(int64_t);
+                              return provider->store.remaining_quota(value.get());
+                          },
+                          [value](uint64_t buffer) {
+                              return com::write_guest(buffer, *value) ? S_OK_HR : E_INVALIDARG_HR;
+                          });
+    }
+
+    // s9: XGameSaveGetRemainingQuotaResult(XAsyncBlock*, int64_t* remainingQuota).
+    int32_t GetRemainingQuotaResult(uint64_t async, uint64_t remaining) {
+        if (remaining == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(remaining, int64_t{0});
+        return finish_async(async, sizeof(int64_t), remaining);
+    }
+
+    // s10: XGameSaveDeleteContainer(provider, containerName).
+    int32_t DeleteContainer(uint64_t provider_handle, uint64_t name) {
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || name == 0) {
+            return E_INVALIDARG_HR;
+        }
+        return provider->store.delete_container(guest_string(name, 512));
+    }
+
+    // s11: XGameSaveDeleteContainerAsync(provider, containerName, XAsyncBlock*).
+    int32_t DeleteContainerAsync(uint64_t provider_handle, uint64_t name, uint64_t async) {
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || name == 0 || async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        const std::string container = guest_string(name, 512);
+        if (!gamesave::valid_container_name(container)) {
+            return gamesave::E_GS_INVALID_CONTAINER_NAME;
+        }
+        return begin_work(async, "XGameSaveDeleteContainerAsync",
+                          [provider, container](size_t*) { return provider->store.delete_container(container); },
+                          nullptr);
+    }
+
+    // s12: XGameSaveDeleteContainerResult(XAsyncBlock*).
+    int32_t DeleteContainerResult(uint64_t async) { return finish_async(async, 0, 0); }
+
+    // XGameSaveContainerInfo as handed to the enumeration callback (x64; GDK field order: name,
+    // displayName, blobCount, totalSize, lastModifiedTime, needsSync).
     struct GuestContainerInfo {
         uint64_t name;
-        uint64_t total_size;
+        uint64_t display_name;
         uint32_t blob_count;
         uint32_t pad;
+        uint64_t total_size;
         uint64_t last_modified;  // time_t (seconds since 1970)
         uint8_t needs_sync;      // never: nothing is synchronised
         uint8_t pad2[7];
     };
-    static_assert(sizeof(GuestContainerInfo) == 40);
+    static_assert(sizeof(GuestContainerInfo) == 48);
 
     // Calls bool callback(const XGameSaveContainerInfo*, void* context) for every container whose
     // name starts with `prefix`, until the callback returns false.
@@ -1314,17 +1579,20 @@ public:
         }
         const com::GuestFunction<uint64_t(uint64_t, uint64_t)> cb(callback);
         for (const gamesave::ContainerInfo& info : containers) {
-            const uint64_t block = com::guest_alloc(sizeof(GuestContainerInfo) + info.name.size() + 1);
+            const uint64_t size = sizeof(GuestContainerInfo) + info.name.size() + 1 + info.display_name.size() + 1;
+            const uint64_t block = com::guest_alloc(size);
             if (block == 0) {
                 return E_OUTOFMEMORY_HR;
             }
             GuestContainerInfo guest{};
             guest.name = block + sizeof(GuestContainerInfo);
+            guest.display_name = guest.name + info.name.size() + 1;
             guest.total_size = info.total_size;
             guest.blob_count = info.blob_count;
             guest.last_modified = info.last_modified / 10000000ull - 11644473600ull;
             com::write_guest(block, guest);
             com::write_guest(guest.name, info.name.c_str(), info.name.size() + 1);
+            com::write_guest(guest.display_name, info.display_name.c_str(), info.display_name.size() + 1);
             const bool keep_going = (cb.call(com::current_guest_state(), block, context) & 0xFF) != 0;
             com::guest_free(block);
             if (!keep_going) {
@@ -1345,6 +1613,255 @@ public:
         return EnumerateContainers(provider, std::string(), context, callback);
     }
 
+    // s16: XGameSaveCreateContainer(provider, containerName, XGameSaveContainerHandle*). The title
+    // opens every container it reads or writes this way (handle kept in its save manager, closed
+    // through s17 before the next one is opened).
+    int32_t CreateContainer(uint64_t provider_handle, uint64_t name, uint64_t container) {
+        if (container == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(container, uint64_t{0});
+        auto provider = save_providers().find(provider_handle);
+        if (!provider || name == 0) {
+            return E_INVALIDARG_HR;
+        }
+        std::string text = guest_string(name, 512);
+        if (!gamesave::valid_container_name(text)) {
+            return gamesave::E_GS_INVALID_CONTAINER_NAME;
+        }
+        const uint64_t handle =
+            save_containers().add(std::make_shared<SaveContainer>(SaveContainer{provider, std::move(text)}));
+        com::write_guest(container, handle);
+        return S_OK_HR;
+    }
+
+    // s17: XGameSaveCloseContainer(XGameSaveContainerHandle).
+    void CloseContainer(uint64_t container) {
+        if (!save_containers().remove(container)) {
+            com::detail::log_bad_pointer("XGameSaveContainerHandle", container);
+        }
+    }
+
+    // Calls bool callback(const XGameSaveBlobInfo*, void* context) for every blob whose name starts
+    // with `prefix`, until the callback returns false. A container never submitted has no blobs.
+    int32_t EnumerateBlobs(uint64_t container_handle, const std::string& prefix, uint64_t context, uint64_t callback) {
+        auto container = save_containers().find(container_handle);
+        if (!container || callback == 0) {
+            return E_INVALIDARG_HR;
+        }
+        std::vector<gamesave::BlobInfo> blobs;
+        const int32_t hr = container->provider->store.enumerate_blobs(container->name, &blobs);
+        if (hr < 0 && hr != gamesave::E_GS_NO_SUCH_CONTAINER) {
+            return hr;
+        }
+        const com::GuestFunction<uint64_t(uint64_t, uint64_t)> cb(callback);
+        for (const gamesave::BlobInfo& info : blobs) {
+            if (info.name.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            const uint64_t block = com::guest_alloc(sizeof(GuestBlobInfo) + info.name.size() + 1);
+            if (block == 0) {
+                return E_OUTOFMEMORY_HR;
+            }
+            GuestBlobInfo guest{};
+            guest.name = block + sizeof(GuestBlobInfo);
+            guest.size = info.size;
+            com::write_guest(block, guest);
+            com::write_guest(guest.name, info.name.c_str(), info.name.size() + 1);
+            const bool keep_going = (cb.call(com::current_guest_state(), block, context) & 0xFF) != 0;
+            com::guest_free(block);
+            if (!keep_going) {
+                break;
+            }
+        }
+        return S_OK_HR;
+    }
+
+    // s18: XGameSaveEnumerateBlobInfo(container, context, callback).
+    int32_t EnumerateBlobInfo(uint64_t container, uint64_t context, uint64_t callback) {
+        return EnumerateBlobs(container, std::string(), context, callback);
+    }
+
+    // s19: XGameSaveEnumerateBlobInfoByName(container, blobNamePrefix, context, callback). The title
+    // looks up "Save Game Header" this way and sizes its read buffer from the reported size.
+    int32_t EnumerateBlobInfoByName(uint64_t container, uint64_t prefix, uint64_t context, uint64_t callback) {
+        return prefix == 0 ? E_INVALIDARG_HR : EnumerateBlobs(container, guest_string(prefix, 256), context, callback);
+    }
+
+    // s20: XGameSaveReadBlobData(container, const char** blobNames, uint32_t* countOfBlobs,
+    // size_t blobsSize, XGameSaveBlob* blobData). No names (count 0) reads every blob.
+    int32_t ReadBlobData(uint64_t container_handle, uint64_t names, uint64_t count_ptr, uint64_t size,
+                         uint64_t buffer) {
+        auto container = save_containers().find(container_handle);
+        uint32_t count = 0;
+        if (!container || count_ptr == 0 || !com::read_guest(count_ptr, count)) {
+            return E_INVALIDARG_HR;
+        }
+        com::write_guest(count_ptr, uint32_t{0});
+        std::vector<std::string> wanted;
+        if (!guest_names(names, count, &wanted)) {
+            return E_INVALIDARG_HR;
+        }
+        ReadBlobs read;
+        const int32_t hr = read_blobs(*container, std::move(wanted), &read);
+        if (hr < 0) {
+            return hr;
+        }
+        if (size < read.required()) {
+            return gamesave::E_GS_PROVIDED_BUFFER_TOO_SMALL;
+        }
+        if (!read.blobs.empty() && (buffer == 0 || !write_blobs(buffer, read))) {
+            return E_INVALIDARG_HR;
+        }
+        com::write_guest(count_ptr, static_cast<uint32_t>(read.blobs.size()));
+        return S_OK_HR;
+    }
+
+    // s21: XGameSaveReadBlobDataAsync(container, const char** blobNames, uint32_t countOfBlobs,
+    // XAsyncBlock*). The result size (XAsyncGetResultSize) is what s22 needs as its buffer.
+    int32_t ReadBlobDataAsync(uint64_t container_handle, uint64_t names, uint32_t count, uint64_t async) {
+        auto container = save_containers().find(container_handle);
+        std::vector<std::string> wanted;
+        if (!container || async == 0 || !guest_names(names, count, &wanted)) {
+            return E_INVALIDARG_HR;
+        }
+        auto pending = std::make_shared<PendingRead>();
+        {
+            std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
+            g_pending_reads[async] = pending;
+        }
+        const int32_t hr = begin_work(
+            async, "XGameSaveReadBlobDataAsync",
+            [container, wanted, pending](size_t* required) {
+                std::lock_guard<std::mutex> lock(pending->mutex);
+                const HResult r = read_blobs(*container, wanted, &pending->read);
+                *required = pending->read.required();
+                return r;
+            },
+            [pending](uint64_t buffer) {
+                std::lock_guard<std::mutex> lock(pending->mutex);
+                return write_blobs(buffer, pending->read) ? S_OK_HR : E_INVALIDARG_HR;
+            });
+        if (hr < 0) {
+            take_pending_read(async);
+        }
+        return hr;
+    }
+
+    // s22: XGameSaveReadBlobDataResult(XAsyncBlock*, size_t blobsSize, XGameSaveBlob* blobData,
+    // uint32_t* countOfBlobs).
+    int32_t ReadBlobDataResult(uint64_t async, uint64_t size, uint64_t buffer, uint64_t count_ptr) {
+        if (count_ptr == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(count_ptr, uint32_t{0});
+        int32_t hr = finish_async(async, size, buffer);
+        if (hr == E_NOT_SUFFICIENT_BUFFER_HR) {
+            return gamesave::E_GS_PROVIDED_BUFFER_TOO_SMALL;
+        }
+        if (hr == E_PENDING_HR) {
+            return hr;
+        }
+        auto pending = take_pending_read(async);
+        if (hr >= 0 && pending) {
+            std::lock_guard<std::mutex> lock(pending->mutex);
+            com::write_guest(count_ptr, static_cast<uint32_t>(pending->read.blobs.size()));
+        }
+        return hr;
+    }
+
+    // s23: XGameSaveCreateUpdate(container, containerDisplayName, XGameSaveUpdateHandle*).
+    int32_t CreateUpdate(uint64_t container_handle, uint64_t display_name, uint64_t update) {
+        if (update == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(update, uint64_t{0});
+        auto container = save_containers().find(container_handle);
+        if (!container) {
+            return E_INVALIDARG_HR;
+        }
+        auto state = std::make_shared<SaveUpdate>();
+        state->provider = container->provider;
+        state->container = container->name;
+        state->display_name = guest_string(display_name, gamesave::kMaxDisplayNameChars);
+        com::write_guest(update, save_updates().add(std::move(state)));
+        return S_OK_HR;
+    }
+
+    // s24: XGameSaveCloseUpdate(XGameSaveUpdateHandle). An unsubmitted update is dropped.
+    void CloseUpdate(uint64_t update) {
+        if (!save_updates().remove(update)) {
+            com::detail::log_bad_pointer("XGameSaveUpdateHandle", update);
+        }
+    }
+
+    // s25: XGameSaveSubmitBlobWrite(update, blobName, const uint8_t* data, size_t size). The data is
+    // copied now; a second write of the same blob replaces the first.
+    int32_t SubmitBlobWrite(uint64_t update_handle, uint64_t name, uint64_t data, uint64_t size) {
+        auto update = save_updates().find(update_handle);
+        if (!update || name == 0 || (data == 0 && size != 0) || size > gamesave::kMaxBlobBytes) {
+            return E_INVALIDARG_HR;
+        }
+        gamesave::BlobWrite write;
+        write.name = guest_string(name, 256);
+        if (!gamesave::valid_blob_name(write.name)) {
+            return E_INVALIDARG_HR;
+        }
+        write.data.resize(static_cast<size_t>(size));
+        if (size != 0 && !com::read_guest(data, write.data.data(), write.data.size())) {
+            return E_INVALIDARG_HR;
+        }
+        std::lock_guard<std::mutex> lock(update->mutex);
+        if (update->submitted) {
+            return E_ILLEGAL_METHOD_CALL_HR;
+        }
+        std::erase(update->deletes, write.name);
+        std::erase_if(update->writes, [&](const gamesave::BlobWrite& w) { return w.name == write.name; });
+        update->writes.push_back(std::move(write));
+        return S_OK_HR;
+    }
+
+    // s26: XGameSaveSubmitBlobDelete(update, blobName).
+    int32_t SubmitBlobDelete(uint64_t update_handle, uint64_t name) {
+        auto update = save_updates().find(update_handle);
+        if (!update || name == 0) {
+            return E_INVALIDARG_HR;
+        }
+        std::string blob = guest_string(name, 256);
+        if (!gamesave::valid_blob_name(blob)) {
+            return E_INVALIDARG_HR;
+        }
+        std::lock_guard<std::mutex> lock(update->mutex);
+        if (update->submitted) {
+            return E_ILLEGAL_METHOD_CALL_HR;
+        }
+        std::erase_if(update->writes, [&](const gamesave::BlobWrite& w) { return w.name == blob; });
+        if (std::find(update->deletes.begin(), update->deletes.end(), blob) == update->deletes.end()) {
+            update->deletes.push_back(std::move(blob));
+        }
+        return S_OK_HR;
+    }
+
+    // s27: XGameSaveSubmitUpdate(update): all writes and deletes, or nothing.
+    int32_t SubmitUpdate(uint64_t update_handle) {
+        auto update = save_updates().find(update_handle);
+        return update ? submit_update(*update) : E_INVALIDARG_HR;
+    }
+
+    // s28: XGameSaveSubmitUpdateAsync(update, XAsyncBlock*). The title submits its header and
+    // payload blobs this way and reads the outcome in the completion callback (s29).
+    int32_t SubmitUpdateAsync(uint64_t update_handle, uint64_t async) {
+        auto update = save_updates().find(update_handle);
+        if (!update || async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        return begin_work(async, "XGameSaveSubmitUpdateAsync",
+                          [update](size_t*) { return submit_update(*update); }, nullptr);
+    }
+
+    // s29: XGameSaveSubmitUpdateResult(XAsyncBlock*).
+    int32_t SubmitUpdateResult(uint64_t async) { return finish_async(async, 0, 0); }
+
     // s6: XGameSaveCloseProvider(XGameSaveProviderHandle).
     void CloseProvider(uint64_t provider) {
         if (!save_providers().remove(provider)) {
@@ -1353,6 +1870,40 @@ public:
     }
 
 private:
+    int32_t begin_work(uint64_t async, const char* name, SaveWorkOp::Work work, SaveWorkOp::Result result) {
+        Pg6XAsyncBlock* shadow = begin_async(async);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        return XAsyncBeginWith(shadow, std::make_unique<SaveWorkOp>(std::move(work), std::move(result)), 0, name);
+    }
+
+    // Result half of an async call: copies the result (size bytes) to `buffer` and ends the
+    // shadow block once the operation is no longer pending.
+    static int32_t finish_async(uint64_t async, uint64_t size, uint64_t buffer) {
+        Pg6XAsyncBlock* shadow = find_async(async);
+        if (shadow == nullptr) {
+            return E_INVALIDARG_HR;
+        }
+        size_t used = 0;
+        const int32_t hr = XAsyncGetResultWith(shadow, 0, static_cast<size_t>(size), buffer, &used);
+        if (hr != E_PENDING_HR && hr != E_NOT_SUFFICIENT_BUFFER_HR) {  // a larger buffer may follow
+            cbk::async_shadow_end(async);
+        }
+        return hr;
+    }
+
+    static std::shared_ptr<PendingRead> take_pending_read(uint64_t async) {
+        std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
+        auto it = g_pending_reads.find(async);
+        if (it == g_pending_reads.end()) {
+            return nullptr;
+        }
+        auto pending = std::move(it->second);
+        g_pending_reads.erase(it);
+        return pending;
+    }
+
     void log_once(const char* api) {
         if (!logged_.exchange(true)) {
             os::log(std::string("xgameruntime: ") + api + ": local game-save provider (dir " +
@@ -1575,13 +2126,33 @@ constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPac
                                                               kPackageTable.slots, {.slot_count = 48});
 
 using GS = M<GameSaveApi>;
-constexpr auto kGameSaveTable = slot_table<12>({
+constexpr auto kGameSaveTable = slot_table<27>({
     {3, GS::method<&GameSaveApi::InitializeProvider>("XGameSaveInitializeProvider")},
     {4, GS::method<&GameSaveApi::InitializeProviderAsync>("XGameSaveInitializeProviderAsync")},
     {5, GS::method<&GameSaveApi::InitializeProviderResult>("XGameSaveInitializeProviderResult")},
     {6, GS::method<&GameSaveApi::CloseProvider>("XGameSaveCloseProvider")},
+    {7, GS::method<&GameSaveApi::GetRemainingQuota>("XGameSaveGetRemainingQuota")},
+    {8, GS::method<&GameSaveApi::GetRemainingQuotaAsync>("XGameSaveGetRemainingQuotaAsync")},
+    {9, GS::method<&GameSaveApi::GetRemainingQuotaResult>("XGameSaveGetRemainingQuotaResult")},
+    {10, GS::method<&GameSaveApi::DeleteContainer>("XGameSaveDeleteContainer")},
+    {11, GS::method<&GameSaveApi::DeleteContainerAsync>("XGameSaveDeleteContainerAsync")},
+    {12, GS::method<&GameSaveApi::DeleteContainerResult>("XGameSaveDeleteContainerResult")},
     {13, GS::method<&GameSaveApi::EnumerateContainerInfoByName>("XGameSaveEnumerateContainerInfoByName")},
     {14, GS::method<&GameSaveApi::EnumerateContainerInfo>("XGameSaveEnumerateContainerInfo")},
+    {16, GS::method<&GameSaveApi::CreateContainer>("XGameSaveCreateContainer")},
+    {17, GS::method<&GameSaveApi::CloseContainer>("XGameSaveCloseContainer")},
+    {18, GS::method<&GameSaveApi::EnumerateBlobInfo>("XGameSaveEnumerateBlobInfo")},
+    {19, GS::method<&GameSaveApi::EnumerateBlobInfoByName>("XGameSaveEnumerateBlobInfoByName")},
+    {20, GS::method<&GameSaveApi::ReadBlobData>("XGameSaveReadBlobData")},
+    {21, GS::method<&GameSaveApi::ReadBlobDataAsync>("XGameSaveReadBlobDataAsync")},
+    {22, GS::method<&GameSaveApi::ReadBlobDataResult>("XGameSaveReadBlobDataResult")},
+    {23, GS::method<&GameSaveApi::CreateUpdate>("XGameSaveCreateUpdate")},
+    {24, GS::method<&GameSaveApi::CloseUpdate>("XGameSaveCloseUpdate")},
+    {25, GS::method<&GameSaveApi::SubmitBlobWrite>("XGameSaveSubmitBlobWrite")},
+    {26, GS::method<&GameSaveApi::SubmitBlobDelete>("XGameSaveSubmitBlobDelete")},
+    {27, GS::method<&GameSaveApi::SubmitUpdate>("XGameSaveSubmitUpdate")},
+    {28, GS::method<&GameSaveApi::SubmitUpdateAsync>("XGameSaveSubmitUpdateAsync")},
+    {29, GS::method<&GameSaveApi::SubmitUpdateResult>("XGameSaveSubmitUpdateResult")},
 });
 constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
                                                                kGameSaveTable.slots, {.slot_count = 40});
@@ -1885,6 +2456,12 @@ void reset_xgameruntime_provider() {
     stores().clear();
     ports().clear();
     save_providers().clear();
+    save_containers().clear();
+    save_updates().clear();
+    {
+        std::lock_guard<std::mutex> reads(g_pending_reads_mutex);
+        g_pending_reads.clear();
+    }
     g_title_id.store(0, std::memory_order_relaxed);
     set_xbox_live_sandbox_id("");
     set_user_age_group(UserAgeGroup::Unknown);

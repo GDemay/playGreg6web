@@ -80,6 +80,17 @@ bool valid_name(const std::string& name, size_t max_chars) {
     return encode(name).size() <= kMaxEncodedChars;
 }
 
+constexpr const char* kDisplayNameFile = ".display-name";
+
+std::string read_display_name(const fs::path& container) {
+    std::ifstream in(container / kDisplayNameFile, std::ios::binary);
+    std::string text;
+    if (in) {
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    return text.size() > kMaxDisplayNameChars ? std::string() : text;
+}
+
 fs::path container_path(const std::string& root, const std::string& name) {
     return fs::path(root) / ("c-" + encode(name));
 }
@@ -134,6 +145,14 @@ void remove_stale_temps(const fs::path& container) {
 }
 
 }  // namespace
+
+bool valid_container_name(const std::string& name) {
+    return valid_name(name, kMaxContainerNameChars);
+}
+
+bool valid_blob_name(const std::string& name) {
+    return valid_name(name, kMaxBlobNameChars);
+}
 
 void set_save_dir(const std::string& dir) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -197,6 +216,7 @@ HResult Store::enumerate_containers(const std::string& prefix, std::vector<Conta
             info.name.compare(0, prefix.size(), prefix) != 0) {
             continue;
         }
+        info.display_name = read_display_name(it->path());
         for (const auto& entry : list_blobs(it->path(), &info.last_modified)) {
             ++info.blob_count;
             info.total_size += entry.second;
@@ -320,6 +340,41 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     }
     for (const std::string& d : deletes) {
         fs::remove(blob_path(dir, d), ec);
+    }
+    return S_OK_HR;
+}
+
+HResult Store::set_display_name(const std::string& container, const std::string& display_name) {
+    if (!valid_name(container, kMaxContainerNameChars)) {
+        return E_GS_INVALID_CONTAINER_NAME;
+    }
+    if (display_name.size() > kMaxDisplayNameChars) {
+        return E_INVALIDARG_HR;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const fs::path dir = container_path(root_, container);
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        return E_GS_NO_SUCH_CONTAINER;
+    }
+    if (read_display_name(dir) == display_name) {
+        return S_OK_HR;
+    }
+    const fs::path temp = dir / (".tmp-" + std::to_string(g_temp_counter.fetch_add(1)));
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out.write(display_name.data(), static_cast<std::streamsize>(display_name.size()));
+        out.flush();
+        if (!out) {
+            out.close();
+            fs::remove(temp, ec);
+            return E_FAIL_HR;
+        }
+    }
+    fs::rename(temp, dir / kDisplayNameFile, ec);
+    if (ec) {
+        fs::remove(temp, ec);
+        return E_FAIL_HR;
     }
     return S_OK_HR;
 }
