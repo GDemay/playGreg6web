@@ -172,7 +172,9 @@ MAIN_MODULE_FLAG = "-sMAIN_MODULE=1"
 SIDE_MODULE_FLAG = "-sSIDE_MODULE=1"
 SIDE_MODULE_PRUNED_FLAG = "-sSIDE_MODULE=2"
 SPLIT_DEFAULT_INITIAL_MEMORY = "64MB"
-SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 8
+# Pre-warm enough em-pthread workers for the game's 43+ guest threads so split-module
+# browser builds avoid cold worker spawns and side-module re-instantiation boot timeouts.
+SPLIT_DEFAULT_PTHREAD_POOL_SIZE = 48
 SPLIT_RUNTIME_ARCHIVE_EXCLUDES: tuple[str, ...] = ("wasm_boot.cpp.o", "main.cpp.o")
 SIDE_MODULE_CTOR_EXPORT_FLAG = "-Wl,--export-if-defined=__wasm_call_ctors"
 SIDE_MODULE_LINK_FLAGS: tuple[str, ...] = (
@@ -4897,7 +4899,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="N",
         help=(
             "Override -sPTHREAD_POOL_SIZE=N on the link line (must be >= 1; "
-            "default: 4 monolithic, 8 when --split-modules > 1)."
+            f"default: 4 monolithic, {SPLIT_DEFAULT_PTHREAD_POOL_SIZE} when --split-modules > 1)."
         ),
     )
     parser.add_argument(
