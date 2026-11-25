@@ -48,6 +48,15 @@
   const DEFAULT_MAX_FILL_RATIO = 1.0;
   const DEFAULT_UNDERRUN_RECOVERY_FRAMES = 0;
 
+  // W235: Host stereo PCM ring defaults mirroring runtime/os/audio_downmix.h (Playgta6AudioRing).
+  const GUEST_PCM_RING_DEFAULT_SAMPLE_RATE = 48000;
+  const GUEST_PCM_RING_CHANNELS = 2;
+  const GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES = 1 << 17; // 131072 floats = 65536 stereo frames
+  const GUEST_PCM_RING_MIN_CAPACITY_SAMPLES = 2;
+  const GUEST_PCM_RING_MAX_CAPACITY_SAMPLES = 1 << 24;
+  const GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES = 480; // 10 ms @ 48 kHz
+  const GUEST_PCM_RING_MAX_QUANTUM_FRAMES = 65536;
+
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   const HDR_WRITE_CURSOR = 0;
   const HDR_READ_CURSOR = 1;
@@ -1534,6 +1543,16 @@
     const overflowPolicy = normalizeOverflowPolicy(s.overflowPolicy, DEFAULT_OVERFLOW_POLICY);
     const maxFillRatio = sanitizeFillRatio(s.maxFillRatio, DEFAULT_MAX_FILL_RATIO);
     const outputState = normalizeOutputState(s.outputState, OUTPUT_STATES.HEADLESS_DRAIN);
+    const guestRingAttached = Boolean(s.guestRingAttached);
+    const guestFramesDrained = sanitizeNonNegInt(s.guestFramesDrained, 0);
+    const guestUnderruns = sanitizeNonNegInt(s.guestUnderruns, 0);
+    const guestOverruns = sanitizeNonNegInt(s.guestOverruns, 0);
+    const rawGuestPeakLevel =
+      typeof s.guestPeakLevel === 'number' && Number.isFinite(s.guestPeakLevel)
+        ? s.guestPeakLevel
+        : 0.0;
+    const guestPeakLevel =
+      rawGuestPeakLevel < 0 ? 0.0 : rawGuestPeakLevel > 1 ? 1.0 : rawGuestPeakLevel;
 
     return {
       type: 'audio-stats',
@@ -1581,8 +1600,417 @@
         activeVoicePeak,
         scratchAllocations,
         scratchReuses,
+        guestRingAttached,
+        guestFramesDrained,
+        guestUnderruns,
+        guestOverruns,
+        guestPeakLevel,
       },
     };
+  }
+
+  function isPowerOfTwo(value) {
+    return Number.isInteger(value) && value > 0 && (value & (value - 1)) === 0;
+  }
+
+  function sanitizeAlignedByteOffset(value, name) {
+    let num = value;
+    if (typeof num === 'bigint') {
+      if (num < 0n || num > 9007199254740991n) {
+        throw new RangeError(`${name} byte offset is out of safe range`);
+      }
+      num = Number(num);
+    }
+    if (typeof num !== 'number' || !Number.isFinite(num) || !Number.isInteger(num) || num < 0) {
+      throw new RangeError(`${name} must be a non-negative integer byte offset, got ${value}`);
+    }
+    if (num % 4 !== 0) {
+      throw new RangeError(`${name} (${num}) must be 4-byte aligned`);
+    }
+    return num;
+  }
+
+  function resolveGuestRingSab(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor)) {
+      throw new TypeError('Guest PCM ring descriptor must be an object');
+    }
+    const candidate =
+      descriptor.sab !== undefined
+        ? descriptor.sab
+        : descriptor.buffer !== undefined
+          ? descriptor.buffer
+          : descriptor.memory && typeof descriptor.memory === 'object'
+            ? descriptor.memory.buffer
+            : undefined;
+    if (!isSharedArrayBuffer(candidate)) {
+      throw new TypeError('Guest PCM ring requires a SharedArrayBuffer');
+    }
+    return candidate;
+  }
+
+  /**
+   * Lock-free SPSC reader for the runtime's stereo interleaved float32 PCM ring
+   * (`Playgta6AudioRing` in `runtime/os/audio_downmix.h`).
+   *
+   * - Free-running uint32 sample cursors wrapping at 2^32.
+   * - Power-of-two float32 sample capacity (slot = index & (capacity - 1)).
+   * - Zero per-quantum heap allocation during `readInto`.
+   * - Non-finite sanitization, smooth soft-clipping into [-1, 1], underrun
+   *   silence fill, and overrun drop accounting.
+   */
+  class GuestPcmRingReader {
+    constructor(descriptor) {
+      const sab = resolveGuestRingSab(descriptor);
+
+      const channels =
+        descriptor.channels !== undefined ? descriptor.channels : GUEST_PCM_RING_CHANNELS;
+      if (!Number.isInteger(channels) || channels !== GUEST_PCM_RING_CHANNELS) {
+        throw new RangeError(
+          `Guest PCM ring requires stereo (${GUEST_PCM_RING_CHANNELS}) channels, got ${channels}`
+        );
+      }
+
+      const rawSampleRate =
+        descriptor.sampleRate !== undefined
+          ? descriptor.sampleRate
+          : descriptor.sample_rate !== undefined
+            ? descriptor.sample_rate
+            : GUEST_PCM_RING_DEFAULT_SAMPLE_RATE;
+      if (
+        typeof rawSampleRate !== 'number' ||
+        !Number.isFinite(rawSampleRate) ||
+        rawSampleRate < MIN_SAMPLE_RATE ||
+        rawSampleRate > MAX_SAMPLE_RATE
+      ) {
+        throw new RangeError(
+          `Guest PCM ring sampleRate must be in [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}], got ${rawSampleRate}`
+        );
+      }
+      const sampleRate = Math.floor(rawSampleRate);
+
+      const rawBase =
+        descriptor.dataByteOffset !== undefined
+          ? descriptor.dataByteOffset
+          : descriptor.base !== undefined
+            ? descriptor.base
+            : descriptor.dataOffset;
+      const dataByteOffset = sanitizeAlignedByteOffset(rawBase, 'dataByteOffset');
+
+      let capacitySamples;
+      if (descriptor.capacitySamples !== undefined) {
+        capacitySamples = descriptor.capacitySamples;
+      } else if (descriptor.capacity !== undefined) {
+        capacitySamples = descriptor.capacity;
+      } else if (descriptor.capacityFrames !== undefined) {
+        if (!Number.isInteger(descriptor.capacityFrames) || descriptor.capacityFrames <= 0) {
+          throw new RangeError(
+            `Guest PCM ring capacityFrames must be a positive integer, got ${descriptor.capacityFrames}`
+          );
+        }
+        capacitySamples = descriptor.capacityFrames * channels;
+      } else {
+        throw new RangeError(
+          'Guest PCM ring requires capacity, capacitySamples, or capacityFrames'
+        );
+      }
+
+      if (
+        !isPowerOfTwo(capacitySamples) ||
+        capacitySamples < GUEST_PCM_RING_MIN_CAPACITY_SAMPLES ||
+        capacitySamples > GUEST_PCM_RING_MAX_CAPACITY_SAMPLES
+      ) {
+        throw new RangeError(
+          `Guest PCM ring capacitySamples must be a power of two in [${GUEST_PCM_RING_MIN_CAPACITY_SAMPLES}, ${GUEST_PCM_RING_MAX_CAPACITY_SAMPLES}], got ${capacitySamples}`
+        );
+      }
+
+      const dataByteLength = capacitySamples * Float32Array.BYTES_PER_ELEMENT;
+      if (dataByteOffset + dataByteLength > sab.byteLength) {
+        throw new RangeError(
+          `Guest PCM ring data region [${dataByteOffset}, ${dataByteOffset + dataByteLength}) exceeds SharedArrayBuffer byteLength (${sab.byteLength})`
+        );
+      }
+
+      const rawReadOffset =
+        descriptor.readIndexByteOffset !== undefined
+          ? descriptor.readIndexByteOffset
+          : descriptor.read_index_ptr !== undefined
+            ? descriptor.read_index_ptr
+            : descriptor.readIndexPtr !== undefined
+              ? descriptor.readIndexPtr
+              : descriptor.readIndexOffset;
+      const rawWriteOffset =
+        descriptor.writeIndexByteOffset !== undefined
+          ? descriptor.writeIndexByteOffset
+          : descriptor.write_index_ptr !== undefined
+            ? descriptor.write_index_ptr
+            : descriptor.writeIndexPtr !== undefined
+              ? descriptor.writeIndexPtr
+              : descriptor.writeIndexOffset;
+
+      const readIndexByteOffset = sanitizeAlignedByteOffset(rawReadOffset, 'readIndexByteOffset');
+      const writeIndexByteOffset = sanitizeAlignedByteOffset(rawWriteOffset, 'writeIndexByteOffset');
+
+      if (readIndexByteOffset + Int32Array.BYTES_PER_ELEMENT > sab.byteLength) {
+        throw new RangeError(
+          `Guest PCM ring readIndexByteOffset (${readIndexByteOffset}) exceeds SharedArrayBuffer byteLength (${sab.byteLength})`
+        );
+      }
+      if (writeIndexByteOffset + Int32Array.BYTES_PER_ELEMENT > sab.byteLength) {
+        throw new RangeError(
+          `Guest PCM ring writeIndexByteOffset (${writeIndexByteOffset}) exceeds SharedArrayBuffer byteLength (${sab.byteLength})`
+        );
+      }
+      if (readIndexByteOffset === writeIndexByteOffset) {
+        throw new RangeError(
+          'Guest PCM ring readIndexByteOffset and writeIndexByteOffset must not alias'
+        );
+      }
+      const dataEnd = dataByteOffset + dataByteLength;
+      if (readIndexByteOffset >= dataByteOffset && readIndexByteOffset < dataEnd) {
+        throw new RangeError('Guest PCM ring readIndexByteOffset overlaps PCM sample data');
+      }
+      if (writeIndexByteOffset >= dataByteOffset && writeIndexByteOffset < dataEnd) {
+        throw new RangeError('Guest PCM ring writeIndexByteOffset overlaps PCM sample data');
+      }
+
+      this._sab = sab;
+      this._dataByteOffset = dataByteOffset;
+      this._readIndexByteOffset = readIndexByteOffset;
+      this._writeIndexByteOffset = writeIndexByteOffset;
+      this._capacitySamples = capacitySamples;
+      this._capacityFrames = capacitySamples >>> 1;
+      this._mask = capacitySamples - 1;
+      this._channels = channels;
+      this._sampleRate = sampleRate;
+
+      // Pre-allocated views: zero per-quantum allocations during steady-state reads.
+      this._data = new Float32Array(sab, dataByteOffset, capacitySamples);
+      this._readCtrl = new Int32Array(sab, readIndexByteOffset, 1);
+      this._writeCtrl = new Int32Array(sab, writeIndexByteOffset, 1);
+      this._reusableResult = {
+        framesRead: 0,
+        underrun: false,
+        underrunFrames: 0,
+        overrun: false,
+        overrunDroppedFrames: 0,
+        clippedSamples: 0,
+        sanitizedSamples: 0,
+        peakLevel: 0.0,
+      };
+    }
+
+    get sab() {
+      return this._sab;
+    }
+
+    get dataByteOffset() {
+      return this._dataByteOffset;
+    }
+
+    get readIndexByteOffset() {
+      return this._readIndexByteOffset;
+    }
+
+    get writeIndexByteOffset() {
+      return this._writeIndexByteOffset;
+    }
+
+    get capacitySamples() {
+      return this._capacitySamples;
+    }
+
+    get capacityFrames() {
+      return this._capacityFrames;
+    }
+
+    get channels() {
+      return this._channels;
+    }
+
+    get sampleRate() {
+      return this._sampleRate;
+    }
+
+    readCursor() {
+      return Atomics.load(this._readCtrl, 0) >>> 0;
+    }
+
+    writeCursor() {
+      return Atomics.load(this._writeCtrl, 0) >>> 0;
+    }
+
+    readableSamples() {
+      const write = Atomics.load(this._writeCtrl, 0) >>> 0;
+      const read = Atomics.load(this._readCtrl, 0) >>> 0;
+      return (write - read) >>> 0;
+    }
+
+    availableFrames() {
+      const readable = this.readableSamples();
+      if (readable >= 0x80000000) {
+        return 0;
+      }
+      const clamped = readable > this._capacitySamples ? this._capacitySamples : readable;
+      return clamped >>> 1;
+    }
+
+    /**
+     * Reads up to `requestedFrames` interleaved stereo float32 frames into `output`.
+     * Performs zero TypedArray/heap allocations and updates the atomic read cursor.
+     *
+     * @param {Float32Array} output Pre-allocated destination buffer (>= requestedFrames * 2).
+     * @param {number} requestedFrames Stereo frames to read.
+     * @param {{ softClip?: boolean, limiterKnee?: number, fillSilence?: boolean }} [options]
+     * @param {object} [outResult] Optional reusable result object to populate in place.
+     */
+    readInto(output, requestedFrames, options, outResult) {
+      if (!(output instanceof Float32Array)) {
+        throw new TypeError('GuestPcmRingReader.readInto target must be a Float32Array');
+      }
+      if (!isSharedArrayBuffer(output.buffer) && isDetachedArrayBuffer(output.buffer)) {
+        throw new TypeError('GuestPcmRingReader.readInto target buffer is detached');
+      }
+      const reqFrames = sanitizeNonNegInt(requestedFrames, 0);
+      if (output.length < reqFrames * GUEST_PCM_RING_CHANNELS) {
+        throw new RangeError(
+          `GuestPcmRingReader.readInto output length (${output.length}) < requested stereo samples (${reqFrames * GUEST_PCM_RING_CHANNELS})`
+        );
+      }
+
+      const res = outResult || this._reusableResult;
+      res.framesRead = 0;
+      res.underrun = false;
+      res.underrunFrames = 0;
+      res.overrun = false;
+      res.overrunDroppedFrames = 0;
+      res.clippedSamples = 0;
+      res.sanitizedSamples = 0;
+      res.peakLevel = 0.0;
+
+      if (reqFrames <= 0) {
+        return res;
+      }
+
+      const opts = options && typeof options === 'object' ? options : null;
+      const softClip = opts && opts.softClip !== undefined ? Boolean(opts.softClip) : true;
+      const rawKnee = opts && opts.limiterKnee !== undefined ? opts.limiterKnee : DEFAULT_SOFT_CLIP_KNEE;
+      const knee =
+        typeof rawKnee === 'number' && Number.isFinite(rawKnee) && rawKnee >= 0 && rawKnee < 1.0
+          ? rawKnee
+          : DEFAULT_SOFT_CLIP_KNEE;
+      const fillSilence = opts && opts.fillSilence !== undefined ? Boolean(opts.fillSilence) : true;
+
+      let read = Atomics.load(this._readCtrl, 0) >>> 0;
+      const write = Atomics.load(this._writeCtrl, 0) >>> 0;
+      let readableSamples = (write - read) >>> 0;
+      let overrun = false;
+      let overrunDroppedFrames = 0;
+
+      if (readableSamples > this._capacitySamples) {
+        overrun = true;
+        if (readableSamples >= 0x80000000) {
+          // Read cursor got ahead of write cursor (e.g. out-of-band reset anomaly): resync to write.
+          read = write;
+          readableSamples = 0;
+        } else {
+          const excessSamples = readableSamples - this._capacitySamples;
+          overrunDroppedFrames = Math.ceil(excessSamples / GUEST_PCM_RING_CHANNELS);
+          const skipSamples = overrunDroppedFrames * GUEST_PCM_RING_CHANNELS;
+          read = (read + skipSamples) >>> 0;
+          readableSamples = (write - read) >>> 0;
+        }
+      }
+
+      const availFrames = readableSamples >>> 1;
+      const framesToRead = reqFrames <= availFrames ? reqFrames : availFrames;
+      const samplesToRead = framesToRead * GUEST_PCM_RING_CHANNELS;
+
+      let clippedSamples = 0;
+      let sanitizedSamples = 0;
+      let peakLevel = 0.0;
+
+      if (samplesToRead > 0) {
+        const startSlot = read & this._mask;
+        const tailRoom = this._capacitySamples - startSlot;
+        const firstSamples = samplesToRead <= tailRoom ? samplesToRead : tailRoom;
+        const secondSamples = samplesToRead - firstSamples;
+        const ringData = this._data;
+
+        for (let i = 0; i < firstSamples; i++) {
+          let v = ringData[startSlot + i];
+          if (!Number.isFinite(v)) {
+            v = 0.0;
+            sanitizedSamples += 1;
+          }
+          if (softClip) {
+            if (v > knee || v < -knee) {
+              clippedSamples += 1;
+              v = softClipSample(v, knee);
+            }
+          } else if (v > 1.0) {
+            v = 1.0;
+            clippedSamples += 1;
+          } else if (v < -1.0) {
+            v = -1.0;
+            clippedSamples += 1;
+          }
+          const absV = v < 0 ? -v : v;
+          if (absV > peakLevel) {
+            peakLevel = absV;
+          }
+          output[i] = v;
+        }
+
+        for (let i = 0; i < secondSamples; i++) {
+          let v = ringData[i];
+          if (!Number.isFinite(v)) {
+            v = 0.0;
+            sanitizedSamples += 1;
+          }
+          if (softClip) {
+            if (v > knee || v < -knee) {
+              clippedSamples += 1;
+              v = softClipSample(v, knee);
+            }
+          } else if (v > 1.0) {
+            v = 1.0;
+            clippedSamples += 1;
+          } else if (v < -1.0) {
+            v = -1.0;
+            clippedSamples += 1;
+          }
+          const absV = v < 0 ? -v : v;
+          if (absV > peakLevel) {
+            peakLevel = absV;
+          }
+          output[firstSamples + i] = v;
+        }
+
+        read = (read + samplesToRead) >>> 0;
+      }
+
+      if (samplesToRead > 0 || overrun) {
+        Atomics.store(this._readCtrl, 0, read | 0);
+      }
+
+      if (framesToRead < reqFrames) {
+        const missingFrames = reqFrames - framesToRead;
+        if (fillSilence) {
+          output.fill(0, samplesToRead, reqFrames * GUEST_PCM_RING_CHANNELS);
+        }
+        res.underrun = true;
+        res.underrunFrames = missingFrames;
+      }
+
+      res.framesRead = framesToRead;
+      res.overrun = overrun;
+      res.overrunDroppedFrames = overrunDroppedFrames;
+      res.clippedSamples = clippedSamples;
+      res.sanitizedSamples = sanitizedSamples;
+      res.peakLevel = peakLevel;
+      return res;
+    }
   }
 
   /**
@@ -2635,6 +3063,35 @@
       this._drainTimer = null;
       this._lastDrainMs = null;
 
+      // W235: Attached R40 host stereo PCM ring reader state & telemetry.
+      this._guestRing = null;
+      this._guestRingSoftClip = true;
+      this._guestRingLimiterKnee = this._limiterKnee;
+      this._guestRingQuantumFrames = GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES;
+      this._guestRingAutoPump = false;
+      this._guestResamplerState = { phase: 0.0 };
+      this._guestFramesDrained = 0;
+      this._guestUnderruns = 0;
+      this._guestUnderrunFrames = 0;
+      this._guestOverruns = 0;
+      this._guestOverrunFrames = 0;
+      this._guestPeakLevel = 0.0;
+      this._guestReadOpts = {
+        softClip: true,
+        limiterKnee: this._limiterKnee,
+        fillSilence: true,
+      };
+      this._guestReadScratch = {
+        framesRead: 0,
+        underrun: false,
+        underrunFrames: 0,
+        overrun: false,
+        overrunDroppedFrames: 0,
+        clippedSamples: 0,
+        sanitizedSamples: 0,
+        peakLevel: 0.0,
+      };
+
       if (typeof opts.initialScratchFrames === 'number' && opts.initialScratchFrames > 0) {
         const initFrames = sanitizeNonNegInt(opts.initialScratchFrames, 0);
         if (initFrames > 0) {
@@ -2755,6 +3212,9 @@
         timeBudgetFrames = 1;
       }
       const maxFrames = Math.min(timeBudgetFrames, this._effectiveMaxDrainFramesPerTick());
+      if (this._guestRing && this._guestRingAutoPump && maxFrames > 0) {
+        this.drainGuestPcmRing(maxFrames);
+      }
       const drained = maxFrames > 0 ? this.ring.discardFrames(maxFrames) : 0;
       this._drainTicks += 1;
       this.framesDrained += drained;
@@ -2931,6 +3391,458 @@
       return this._activeVoicePeak;
     }
 
+    /**
+     * Attaches the runtime's stereo interleaved float32 PCM ring (`Playgta6AudioRing`)
+     * backed by a SharedArrayBuffer. Pre-warms reusable scratch memory so steady-state
+     * `drainGuestPcmRing` calls perform zero per-quantum heap allocations.
+     *
+     * @param {object} descriptor
+     */
+    attachGuestPcmRing(descriptor) {
+      const reader = new GuestPcmRingReader(descriptor);
+
+      const rateRatio = reader.sampleRate / this.sampleRate;
+      if (rateRatio > MAX_RESAMPLE_RATIO || 1.0 / rateRatio > MAX_RESAMPLE_RATIO) {
+        throw new RangeError(
+          `Guest PCM ring sampleRate ratio (${reader.sampleRate} -> ${this.sampleRate}) exceeds ${MAX_RESAMPLE_RATIO}x guard`
+        );
+      }
+
+      const softClip =
+        descriptor.softClip !== undefined ? Boolean(descriptor.softClip) : true;
+      const rawKnee =
+        descriptor.limiterKnee !== undefined
+          ? descriptor.limiterKnee
+          : descriptor.softClipKnee !== undefined
+            ? descriptor.softClipKnee
+            : this._limiterKnee;
+      if (typeof rawKnee !== 'number' || !Number.isFinite(rawKnee) || rawKnee < 0 || rawKnee >= 1.0) {
+        throw new RangeError(`Guest PCM ring limiterKnee must be in [0, 1), got ${rawKnee}`);
+      }
+
+      const maxScratchFrames = Math.max(
+        1,
+        Math.floor(this._scratchPool._maxSamples / GUEST_PCM_RING_CHANNELS)
+      );
+      const quantumCap = Math.min(GUEST_PCM_RING_MAX_QUANTUM_FRAMES, maxScratchFrames);
+      const quantumFrames = sanitizePositiveInt(
+        descriptor.quantumFrames !== undefined
+          ? descriptor.quantumFrames
+          : descriptor.defaultQuantumFrames,
+        Math.min(GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES, quantumCap),
+        1,
+        quantumCap
+      );
+
+      this._guestRing = reader;
+      this._guestRingSoftClip = softClip;
+      this._guestRingLimiterKnee = rawKnee;
+      this._guestRingQuantumFrames = quantumFrames;
+      this._guestRingAutoPump = Boolean(descriptor.autoPump);
+      this._guestResamplerState = { phase: 0.0 };
+
+      if (descriptor.resetStats === true) {
+        this._guestFramesDrained = 0;
+        this._guestUnderruns = 0;
+        this._guestUnderrunFrames = 0;
+        this._guestOverruns = 0;
+        this._guestOverrunFrames = 0;
+        this._guestPeakLevel = 0.0;
+      }
+
+      // Pre-warm the guest drain scratch buffer once on attach for zero-alloc quanta.
+      this._scratchPool.acquireFloat32('guestDrain', quantumFrames * GUEST_PCM_RING_CHANNELS);
+
+      return {
+        attached: true,
+        guestRingAttached: true,
+        sampleRate: reader.sampleRate,
+        channels: reader.channels,
+        capacitySamples: reader.capacitySamples,
+        capacityFrames: reader.capacityFrames,
+        quantumFrames,
+      };
+    }
+
+    /**
+     * Detaches the currently attached guest PCM ring, releasing SAB views cleanly.
+     */
+    detachGuestPcmRing() {
+      const wasAttached = this._guestRing !== null;
+      this._guestRing = null;
+      this._guestRingAutoPump = false;
+      this._guestResamplerState = { phase: 0.0 };
+      return {
+        detached: true,
+        wasAttached,
+        guestRingAttached: false,
+      };
+    }
+
+    /**
+     * Reads stereo interleaved float32 PCM frames from the attached guest PCM ring
+     * with atomic cursor handling, soft-clipping into [-1, 1], optional resampling,
+     * graceful underrun silence fill, and overrun drop accounting.
+     *
+     * Supports two zero-allocation modes:
+     * 1. Direct output mode: pass a pre-allocated `Float32Array` (or `{ output }`)
+     *    to fill directly (always zero-filling any underrun tail).
+     * 2. Pump mode: pass `maxFrames` or `{ maxFrames, fillSilence }` to pump frames
+     *    into `this.ring` (respecting headless/suspended pre-drain & overflow drops).
+     *
+     * @param {Float32Array|number|object} [targetOrOptions]
+     * @param {object} [maybeOptions]
+     */
+    drainGuestPcmRing(targetOrOptions, maybeOptions) {
+      let output = null;
+      let opts = null;
+      let maxFramesOpt;
+
+      if (targetOrOptions instanceof Float32Array) {
+        output = targetOrOptions;
+        opts = maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : null;
+        if (opts && opts.maxFrames !== undefined) {
+          maxFramesOpt = opts.maxFrames;
+        }
+      } else if (typeof targetOrOptions === 'number') {
+        maxFramesOpt = targetOrOptions;
+        opts = maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : null;
+      } else if (targetOrOptions && typeof targetOrOptions === 'object') {
+        opts = targetOrOptions;
+        if (opts.output instanceof Float32Array) {
+          output = opts.output;
+        }
+        if (opts.maxFrames !== undefined) {
+          maxFramesOpt = opts.maxFrames;
+        } else if (opts.frameCount !== undefined) {
+          maxFramesOpt = opts.frameCount;
+        }
+      }
+
+      if (output !== null && !isSharedArrayBuffer(output.buffer) && isDetachedArrayBuffer(output.buffer)) {
+        throw new TypeError('drainGuestPcmRing output buffer is detached');
+      }
+
+      const maxScratchFrames = Math.max(
+        1,
+        Math.floor(this._scratchPool._maxSamples / GUEST_PCM_RING_CHANNELS)
+      );
+      let requestedFrames;
+      if (output !== null) {
+        const outputMaxFrames = Math.floor(output.length / GUEST_PCM_RING_CHANNELS);
+        requestedFrames =
+          maxFramesOpt !== undefined
+            ? Math.min(sanitizeNonNegInt(maxFramesOpt, outputMaxFrames), outputMaxFrames)
+            : outputMaxFrames;
+      } else {
+        const upper = Math.min(GUEST_PCM_RING_MAX_QUANTUM_FRAMES, maxScratchFrames);
+        requestedFrames =
+          maxFramesOpt !== undefined
+            ? sanitizePositiveInt(maxFramesOpt, this._guestRingQuantumFrames, 1, upper)
+            : Math.min(this._guestRingQuantumFrames, upper);
+      }
+
+      if (!this._guestRing || requestedFrames <= 0) {
+        if (output !== null && requestedFrames > 0) {
+          const fillSil = opts && opts.fillSilence !== undefined ? Boolean(opts.fillSilence) : true;
+          if (fillSil) {
+            output.fill(0, 0, requestedFrames * GUEST_PCM_RING_CHANNELS);
+          }
+        }
+        return {
+          framesDrained: 0,
+          requestedFrames,
+          pushedFrames: 0,
+          droppedFrames: 0,
+          underrun: false,
+          underrunFrames: 0,
+          overrun: false,
+          overrunDroppedFrames: 0,
+          peakLevel: 0.0,
+        };
+      }
+
+      const reader = this._guestRing;
+      const softClip =
+        opts && opts.softClip !== undefined ? Boolean(opts.softClip) : this._guestRingSoftClip;
+      const rawKnee =
+        opts && opts.limiterKnee !== undefined
+          ? opts.limiterKnee
+          : opts && opts.softClipKnee !== undefined
+            ? opts.softClipKnee
+            : this._guestRingLimiterKnee;
+      const limiterKnee =
+        typeof rawKnee === 'number' && Number.isFinite(rawKnee) && rawKnee >= 0 && rawKnee < 1.0
+          ? rawKnee
+          : this._guestRingLimiterKnee;
+      const fillSilence =
+        opts && opts.fillSilence !== undefined
+          ? Boolean(opts.fillSilence)
+          : output !== null;
+
+      const guestRate = reader.sampleRate;
+      const targetRate = this.sampleRate;
+      const needsResample = guestRate !== targetRate;
+      const readOpts = this._guestReadOpts;
+      readOpts.softClip = softClip;
+      readOpts.limiterKnee = limiterKnee;
+
+      if (output !== null) {
+        // Direct output buffer mode (zero per-quantum allocation).
+        if (!needsResample) {
+          readOpts.fillSilence = fillSilence;
+          const readRes = reader.readInto(output, requestedFrames, readOpts, this._guestReadScratch);
+          this._guestFramesDrained += readRes.framesRead;
+          if (readRes.underrun) {
+            this._guestUnderruns += 1;
+            this._guestUnderrunFrames += readRes.underrunFrames;
+          }
+          if (readRes.overrun) {
+            this._guestOverruns += 1;
+            this._guestOverrunFrames += readRes.overrunDroppedFrames;
+          }
+          if (readRes.peakLevel > this._guestPeakLevel) {
+            this._guestPeakLevel = readRes.peakLevel;
+          }
+          this._clippedSamples += readRes.clippedSamples;
+          this._sanitizedSamples += readRes.sanitizedSamples;
+          if (readRes.framesRead > 0) {
+            this.recordActiveVoices(1);
+          }
+          return {
+            framesDrained: readRes.framesRead,
+            requestedFrames,
+            pushedFrames: 0,
+            droppedFrames: 0,
+            underrun: readRes.underrun,
+            underrunFrames: readRes.underrunFrames,
+            overrun: readRes.overrun,
+            overrunDroppedFrames: readRes.overrunDroppedFrames,
+            peakLevel: readRes.peakLevel,
+          };
+        }
+
+        // Direct output mode with sample-rate conversion.
+        const step = guestRate / targetRate;
+        const startPhase = this._guestResamplerState.phase || 0.0;
+        const neededSrcFrames = Math.min(
+          maxScratchFrames,
+          Math.max(1, Math.ceil(startPhase + (requestedFrames - 1) * step + 1e-9))
+        );
+        const srcScratch = this._scratchPool.acquireFloat32(
+          'guestDrain',
+          neededSrcFrames * GUEST_PCM_RING_CHANNELS
+        );
+        readOpts.fillSilence = false;
+        const readRes = reader.readInto(srcScratch, neededSrcFrames, readOpts, this._guestReadScratch);
+
+        this._guestFramesDrained += readRes.framesRead;
+        if (readRes.overrun) {
+          this._guestOverruns += 1;
+          this._guestOverrunFrames += readRes.overrunDroppedFrames;
+        }
+        this._clippedSamples += readRes.clippedSamples;
+        this._sanitizedSamples += readRes.sanitizedSamples;
+
+        let outFramesWritten = 0;
+        let peakLevel = readRes.peakLevel;
+        if (readRes.framesRead > 0) {
+          const rsStats = this._rsStats;
+          rsStats.resampledFrames = 0;
+          rsStats.nanSanitizedSamples = 0;
+          rsStats.clippedSamples = 0;
+          const exactSrc =
+            readRes.framesRead === neededSrcFrames
+              ? srcScratch
+              : this._scratchPool.acquireFloat32(
+                  'guestDrain',
+                  readRes.framesRead * GUEST_PCM_RING_CHANNELS
+                );
+          const resampled = resampleLinear(
+            exactSrc,
+            GUEST_PCM_RING_CHANNELS,
+            guestRate,
+            targetRate,
+            {
+              state: this._guestResamplerState,
+              maxOutputFrames: maxScratchFrames,
+              scratch: this._scratchPool,
+              stats: rsStats,
+              softClip,
+              limiterKnee,
+            }
+          );
+          this._resampledFrames += rsStats.resampledFrames;
+          this._sanitizedSamples += rsStats.nanSanitizedSamples;
+          this._clippedSamples += rsStats.clippedSamples;
+
+          const resampledFrames = Math.floor(resampled.length / GUEST_PCM_RING_CHANNELS);
+          outFramesWritten =
+            resampledFrames <= requestedFrames ? resampledFrames : requestedFrames;
+          const samplesToCopy = outFramesWritten * GUEST_PCM_RING_CHANNELS;
+          for (let i = 0; i < samplesToCopy; i++) {
+            const v = resampled[i];
+            output[i] = v;
+            const absV = v < 0 ? -v : v;
+            if (absV > peakLevel) {
+              peakLevel = absV;
+            }
+          }
+          if (outFramesWritten > 0) {
+            this.recordActiveVoices(1);
+          }
+        }
+
+        if (peakLevel > this._guestPeakLevel) {
+          this._guestPeakLevel = peakLevel;
+        }
+
+        let underrun = false;
+        let underrunFrames = 0;
+        if (outFramesWritten < requestedFrames) {
+          underrun = true;
+          underrunFrames = requestedFrames - outFramesWritten;
+          if (fillSilence) {
+            output.fill(
+              0,
+              outFramesWritten * GUEST_PCM_RING_CHANNELS,
+              requestedFrames * GUEST_PCM_RING_CHANNELS
+            );
+          }
+          this._guestUnderruns += 1;
+          this._guestUnderrunFrames += underrunFrames;
+        }
+
+        return {
+          framesDrained: readRes.framesRead,
+          requestedFrames,
+          outputFrames: outFramesWritten,
+          pushedFrames: 0,
+          droppedFrames: 0,
+          underrun,
+          underrunFrames,
+          overrun: readRes.overrun,
+          overrunDroppedFrames: readRes.overrunDroppedFrames,
+          peakLevel,
+        };
+      }
+
+      // Pump mode: drain from guest PCM ring into worker output ring (`this.ring`).
+      if (this.ring && this.ring.channels !== GUEST_PCM_RING_CHANNELS) {
+        throw new RangeError(
+          `Cannot pump stereo guest PCM ring into ${this.ring.channels}-channel worker ring`
+        );
+      }
+
+      const scratchBuf = this._scratchPool.acquireFloat32(
+        'guestDrain',
+        requestedFrames * GUEST_PCM_RING_CHANNELS
+      );
+      readOpts.fillSilence = fillSilence;
+      const readRes = reader.readInto(scratchBuf, requestedFrames, readOpts, this._guestReadScratch);
+
+      this._guestFramesDrained += readRes.framesRead;
+      if (readRes.underrun) {
+        this._guestUnderruns += 1;
+        this._guestUnderrunFrames += readRes.underrunFrames;
+      }
+      if (readRes.overrun) {
+        this._guestOverruns += 1;
+        this._guestOverrunFrames += readRes.overrunDroppedFrames;
+      }
+      if (readRes.peakLevel > this._guestPeakLevel) {
+        this._guestPeakLevel = readRes.peakLevel;
+      }
+      this._clippedSamples += readRes.clippedSamples;
+      this._sanitizedSamples += readRes.sanitizedSamples;
+
+      const sourceFramesToPump = fillSilence ? requestedFrames : readRes.framesRead;
+      let pcmToPush = scratchBuf;
+      let framesToPush = sourceFramesToPump;
+
+      if (needsResample && sourceFramesToPump > 0) {
+        const exactSrc =
+          sourceFramesToPump === requestedFrames
+            ? scratchBuf
+            : this._scratchPool.acquireFloat32(
+                'guestDrain',
+                sourceFramesToPump * GUEST_PCM_RING_CHANNELS
+              );
+        const rsStats = this._rsStats;
+        rsStats.resampledFrames = 0;
+        rsStats.nanSanitizedSamples = 0;
+        rsStats.clippedSamples = 0;
+        pcmToPush = resampleLinear(exactSrc, GUEST_PCM_RING_CHANNELS, guestRate, targetRate, {
+          state: this._guestResamplerState,
+          maxOutputFrames: maxScratchFrames,
+          scratch: this._scratchPool,
+          stats: rsStats,
+          softClip,
+          limiterKnee,
+        });
+        framesToPush = Math.floor(pcmToPush.length / GUEST_PCM_RING_CHANNELS);
+        this._resampledFrames += rsStats.resampledFrames;
+        this._sanitizedSamples += rsStats.nanSanitizedSamples;
+        this._clippedSamples += rsStats.clippedSamples;
+      }
+
+      let pushedFrames = 0;
+      let droppedFrames = 0;
+      let overrun = readRes.overrun;
+      let overrunDroppedFrames = readRes.overrunDroppedFrames;
+
+      if (this.ring && framesToPush > 0) {
+        this._packetsReceived += 1;
+        this._framesDecoded += framesToPush;
+        this.recordActiveVoices(1);
+
+        if (this._shouldDrain()) {
+          const free = this.ring.freeFrames();
+          if (framesToPush > free) {
+            const deficit = framesToPush - free;
+            const drainCap = this._effectiveMaxDrainFramesPerTick();
+            const drainBudget =
+              this._explicitMaxDrainFramesPerTick !== null
+                ? Math.min(deficit, drainCap)
+                : Math.min(deficit, Math.max(drainCap, this.ring.capacityFrames));
+            const preDrained = this.ring.discardFrames(drainBudget);
+            if (preDrained > 0) {
+              this.framesDrained += preDrained;
+            }
+          }
+        }
+
+        this._pushOpts.frameCount = framesToPush;
+        this._pushOpts.overflowPolicy = this._overflowPolicy;
+        this._pushOpts.maxFillFrames = this._effectiveMaxFillFrames();
+
+        pushedFrames = this.ring.pushSamples(pcmToPush, this._pushOpts);
+        droppedFrames = this.ring._lastPushDroppedFrames;
+        const pushOverflowed = this.ring._lastPushOverflowed;
+        this.totalPushedFrames += pushedFrames;
+
+        if (pushOverflowed || droppedFrames > 0) {
+          this._droppedPackets += 1;
+          this._guestOverruns += 1;
+          this._guestOverrunFrames += droppedFrames;
+          overrun = true;
+          overrunDroppedFrames += droppedFrames;
+        }
+      }
+
+      return {
+        framesDrained: readRes.framesRead,
+        requestedFrames,
+        pushedFrames,
+        droppedFrames,
+        underrun: readRes.underrun,
+        underrunFrames: readRes.underrunFrames,
+        overrun,
+        overrunDroppedFrames,
+        peakLevel: readRes.peakLevel,
+      };
+    }
+
     _resetTelemetryAndCounters() {
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
@@ -2950,6 +3862,13 @@
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
+      this._guestResamplerState = { phase: 0.0 };
+      this._guestFramesDrained = 0;
+      this._guestUnderruns = 0;
+      this._guestUnderrunFrames = 0;
+      this._guestOverruns = 0;
+      this._guestOverrunFrames = 0;
+      this._guestPeakLevel = 0.0;
       this._scratchPool.resetStats();
     }
 
@@ -2967,6 +3886,7 @@
 
     destroy() {
       this._stopDrainTimer();
+      this.detachGuestPcmRing();
     }
 
     effectiveGain() {
@@ -3066,6 +3986,11 @@
         activeVoicePeak: this._activeVoicePeak,
         scratchAllocations: this._scratchPool.allocations,
         scratchReuses: this._scratchPool.reuses,
+        guestRingAttached: this._guestRing !== null,
+        guestFramesDrained: this._guestFramesDrained,
+        guestUnderruns: this._guestUnderruns,
+        guestOverruns: this._guestOverruns,
+        guestPeakLevel: this._guestPeakLevel,
       };
     }
 
@@ -3591,6 +4516,85 @@
           return;
         }
 
+        if (msg.attachGuestPcmRing || msg.type === 'attach-guest-pcm-ring') {
+          const desc =
+            msg.ring && typeof msg.ring === 'object'
+              ? msg.ring
+              : msg.descriptor && typeof msg.descriptor === 'object'
+                ? msg.descriptor
+                : typeof msg.attachGuestPcmRing === 'object' && msg.attachGuestPcmRing !== null
+                  ? msg.attachGuestPcmRing
+                  : msg;
+          try {
+            const info = this.attachGuestPcmRing(desc);
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                attached: true,
+                guestRingAttached: true,
+                sampleRate: info.sampleRate,
+                channels: info.channels,
+                capacitySamples: info.capacitySamples,
+                capacityFrames: info.capacityFrames,
+                quantumFrames: info.quantumFrames,
+              });
+            }
+          } catch (attachErr) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                attached: false,
+                guestRingAttached: this._guestRing !== null,
+                error: sanitizeErrorMessage(attachErr),
+              });
+            }
+          }
+          return;
+        }
+
+        if (msg.drainGuestPcmRing || msg.type === 'drain-guest-pcm-ring') {
+          const drainArg =
+            typeof msg.drainGuestPcmRing === 'object' && msg.drainGuestPcmRing !== null
+              ? msg.drainGuestPcmRing
+              : msg;
+          const res = this.drainGuestPcmRing(drainArg);
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              guestRingAttached: this._guestRing !== null,
+              framesDrained: res.framesDrained,
+              requestedFrames: res.requestedFrames,
+              pushedFrames: res.pushedFrames,
+              droppedFrames: res.droppedFrames,
+              underrun: res.underrun,
+              underrunFrames: res.underrunFrames,
+              overrun: res.overrun,
+              overrunDroppedFrames: res.overrunDroppedFrames,
+              peakLevel: res.peakLevel,
+              guestFramesDrained: this._guestFramesDrained,
+              guestUnderruns: this._guestUnderruns,
+              guestOverruns: this._guestOverruns,
+              guestPeakLevel: this._guestPeakLevel,
+              availableFrames: this.ring ? this.ring.availableFrames() : 0,
+            });
+          }
+          return;
+        }
+
+        if (msg.detachGuestPcmRing || msg.type === 'detach-guest-pcm-ring') {
+          const res = this.detachGuestPcmRing();
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              detached: true,
+              wasAttached: res.wasAttached,
+              guestRingAttached: false,
+            });
+          }
+          return;
+        }
+
         if (msg.drain || msg.drainRing) {
           const drainedFrames = this.drain(msg.maxFrames, {
             force: Boolean(msg.force),
@@ -3716,6 +4720,7 @@
   const exportsObj = {
     AudioRingBuffer,
     AudioMixerWorker,
+    GuestPcmRingReader,
     PcmScratchPool,
     OUTPUT_STATES,
     OVERFLOW_POLICIES,
@@ -3732,6 +4737,10 @@
     DEFAULT_OVERFLOW_POLICY,
     DEFAULT_MAX_FILL_RATIO,
     DEFAULT_UNDERRUN_RECOVERY_FRAMES,
+    GUEST_PCM_RING_DEFAULT_SAMPLE_RATE,
+    GUEST_PCM_RING_CHANNELS,
+    GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES,
+    GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES,
     ITU_BS775_CENTER_GAIN,
     ITU_BS775_SURROUND_GAIN,
     ITU_BS775_LFE_GAIN,
