@@ -709,6 +709,37 @@
       this._destroyCount = 0;
       this._errors = 0;
       this._lastError = null;
+
+      // Sanitized occupancy, overwrite & lookup telemetry counters.
+      this._peakLiveHandles = 0;
+      this._overwrites = 0;
+      this._missingLookups = 0;
+      this._totalInserts = 0;
+      this._totalDeletes = 0;
+    }
+
+    _getLiveHandleCount() {
+      return (
+        this.buffers.size +
+        this.textures.size +
+        this.samplers.size +
+        this.shaderModules.size
+      );
+    }
+
+    _updatePeakLiveHandles() {
+      const live = this._getLiveHandleCount();
+      if (live > this._peakLiveHandles) {
+        this._peakLiveHandles = live;
+      }
+    }
+
+    _recordInsert(wasOverwrite) {
+      this._totalInserts += 1;
+      if (wasOverwrite) {
+        this._overwrites += 1;
+      }
+      this._updatePeakLiveHandles();
     }
 
     _warn(kind, id, detail) {
@@ -768,7 +799,10 @@
         );
       }
 
-      this.destroyBuffer(id);
+      const existed = this.buffers.has(id);
+      if (existed) {
+        this._destroyBufferInternal(id, false);
+      }
 
       const createDesc = {
         size: aligned.alignedSize,
@@ -781,7 +815,15 @@
         createDesc.label = label;
       }
 
-      const buffer = this.device.createBuffer(createDesc);
+      let buffer;
+      try {
+        buffer = this.device.createBuffer(createDesc);
+      } catch (err) {
+        if (existed) {
+          this._totalDeletes += 1;
+        }
+        throw err;
+      }
       this.buffers.set(id, buffer);
       this._bufferMeta.set(id, {
         id,
@@ -801,6 +843,7 @@
       }
 
       this._buffersCreated += 1;
+      this._recordInsert(existed);
       return buffer;
     }
 
@@ -821,6 +864,9 @@
       if (typeof idOrBuffer === 'number') {
         resourceId = idOrBuffer;
         buffer = this.buffers.get(idOrBuffer) || null;
+        if (!buffer) {
+          this._missingLookups += 1;
+        }
       } else if (idOrBuffer && typeof idOrBuffer === 'object') {
         buffer = idOrBuffer;
       }
@@ -895,9 +941,18 @@
         );
       }
 
-      this.destroyTexture(id);
+      const existed = this.textures.has(id);
+      this._destroyTextureInternal(id, false);
 
-      const texture = this.device.createTexture(sanitized.descriptor);
+      let texture;
+      try {
+        texture = this.device.createTexture(sanitized.descriptor);
+      } catch (err) {
+        if (existed) {
+          this._totalDeletes += 1;
+        }
+        throw err;
+      }
       this.textures.set(id, texture);
 
       let textureView = null;
@@ -945,6 +1000,7 @@
       if (options.isTexture2) {
         this._texture2Created += 1;
       }
+      this._recordInsert(existed);
       return texture;
     }
 
@@ -1008,6 +1064,7 @@
     }
 
     createSampler(id, descriptor = {}) {
+      const existed = this.samplers.has(id);
       const sampler = this.device.createSampler(descriptor);
       this.samplers.set(id, sampler);
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
@@ -1017,10 +1074,12 @@
         });
       }
       this._samplersCreated += 1;
+      this._recordInsert(existed);
       return sampler;
     }
 
     createShaderModule(id, descriptor) {
+      const existed = this.shaderModules.has(id);
       const mod = this.device.createShaderModule(descriptor);
       this.shaderModules.set(id, mod);
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
@@ -1030,16 +1089,25 @@
         });
       }
       this._shaderModulesCreated += 1;
+      this._recordInsert(existed);
       return mod;
     }
 
     getBuffer(id) {
-      return this.buffers.get(id);
+      const value = this.buffers.get(id);
+      if (value === undefined) {
+        this._missingLookups += 1;
+      }
+      return value;
     }
 
     getBufferMeta(id) {
       const meta = this._bufferMeta.get(id);
-      return meta ? { ...meta } : undefined;
+      if (meta === undefined) {
+        this._missingLookups += 1;
+        return undefined;
+      }
+      return { ...meta };
     }
 
     hasBuffer(id) {
@@ -1047,16 +1115,28 @@
     }
 
     getTexture(id) {
-      return this.textures.get(id);
+      const value = this.textures.get(id);
+      if (value === undefined) {
+        this._missingLookups += 1;
+      }
+      return value;
     }
 
     getTextureView(id) {
-      return this.textureViews.get(id);
+      const value = this.textureViews.get(id);
+      if (value === undefined) {
+        this._missingLookups += 1;
+      }
+      return value;
     }
 
     getTextureMeta(id) {
       const meta = this._textureMeta.get(id);
-      return meta ? { ...meta, viewFormats: meta.viewFormats.slice() } : undefined;
+      if (meta === undefined) {
+        this._missingLookups += 1;
+        return undefined;
+      }
+      return { ...meta, viewFormats: meta.viewFormats.slice() };
     }
 
     hasTexture(id) {
@@ -1064,14 +1144,22 @@
     }
 
     getSampler(id) {
-      return this.samplers.get(id);
+      const value = this.samplers.get(id);
+      if (value === undefined) {
+        this._missingLookups += 1;
+      }
+      return value;
     }
 
     getShaderModule(id) {
-      return this.shaderModules.get(id);
+      const value = this.shaderModules.get(id);
+      if (value === undefined) {
+        this._missingLookups += 1;
+      }
+      return value;
     }
 
-    destroyBuffer(id) {
+    _destroyBufferInternal(id, countDelete) {
       const existing = this.buffers.get(id);
       if (!existing) {
         return false;
@@ -1087,10 +1175,17 @@
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
       this._destroyCount += 1;
+      if (countDelete) {
+        this._totalDeletes += 1;
+      }
       return true;
     }
 
-    destroyTexture(id) {
+    destroyBuffer(id) {
+      return this._destroyBufferInternal(id, true);
+    }
+
+    _destroyTextureInternal(id, countDelete) {
       const existing = this.textures.get(id);
       if (!existing) {
         this.textureViews.delete(id);
@@ -1110,7 +1205,14 @@
       this.textureViews.delete(id);
       this._textureMeta.delete(id);
       this._destroyCount += 1;
+      if (countDelete) {
+        this._totalDeletes += 1;
+      }
       return true;
+    }
+
+    destroyTexture(id) {
+      return this._destroyTextureInternal(id, true);
     }
 
     destroy(id) {
@@ -1122,6 +1224,7 @@
           this.resourceRegistry.retire('sampler', id);
         }
         this._destroyCount += 1;
+        this._totalDeletes += 1;
         count += 1;
       }
       if (this.shaderModules.delete(id)) {
@@ -1129,6 +1232,7 @@
           this.resourceRegistry.retire('shaderModule', id);
         }
         this._destroyCount += 1;
+        this._totalDeletes += 1;
         count += 1;
       }
       return count;
@@ -1146,6 +1250,22 @@
       }
       for (const id of Array.from(this.shaderModules.keys())) {
         this.destroy(id);
+      }
+    }
+
+    /**
+     * Destroy all tracked GPU resources and clear internal handle/metadata maps.
+     * Pass `{ resetStats: true }` to also reset telemetry counters.
+     *
+     * @param {{ resetStats?: boolean }} [options]
+     */
+    clear(options = {}) {
+      this.destroyAll();
+      this._bufferMeta.clear();
+      this.textureViews.clear();
+      this._textureMeta.clear();
+      if (options && options.resetStats) {
+        this.resetStats();
       }
     }
 
@@ -1172,6 +1292,12 @@
         shaderModulesActive: this.shaderModules.size,
         destroyCount: this._destroyCount,
         errors: this._errors,
+        liveHandles: this._getLiveHandleCount(),
+        peakLiveHandles: this._peakLiveHandles,
+        overwrites: this._overwrites,
+        missingLookups: this._missingLookups,
+        totalInserts: this._totalInserts,
+        totalDeletes: this._totalDeletes,
       };
     }
 
@@ -1190,6 +1316,11 @@
       this._destroyCount = 0;
       this._errors = 0;
       this._lastError = null;
+      this._peakLiveHandles = this._getLiveHandleCount();
+      this._overwrites = 0;
+      this._missingLookups = 0;
+      this._totalInserts = 0;
+      this._totalDeletes = 0;
     }
   }
 
