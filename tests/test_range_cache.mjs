@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { OpfsChunkCache } from '../web/storage/opfs_cache.js';
 
 const require = createRequire(import.meta.url);
 const {
@@ -9,6 +10,9 @@ const {
   DEFAULT_COALESCE_MAX_MERGED_BYTES,
   DEFAULT_MAX_READ_AHEAD_BYTES,
   DEFAULT_SEQUENTIAL_STREAK_THRESHOLD,
+  DEFAULT_MAX_PENDING_OPFS_WRITES,
+  DEFAULT_MAX_OPFS_WRITE_CONCURRENCY,
+  buildFileFingerprint,
   opfsChunkFileName,
   isQuotaExceededError,
   coalesceAdjacentRanges,
@@ -233,6 +237,11 @@ test('RangeCache getStats exposes additive resilience counters and isQuotaExceed
   assert.equal(stats.hits, 0);
   assert.equal(stats.misses, 0);
   assert.equal(stats.opfsHits, 0);
+  assert.equal(stats.opfsMisses, 0);
+  assert.equal(stats.opfsWrites, 0);
+  assert.equal(stats.opfsWriteErrors, 0);
+  assert.equal(stats.opfsStaleInvalidations, 0);
+  assert.equal(stats.opfsHitRate, 0);
   assert.equal(stats.evictions, 0);
   assert.equal(stats.quotaEvictions, 0);
   assert.equal(stats.quotaRetrySuccesses, 0);
@@ -275,9 +284,13 @@ test('RangeCache QuotaExceededError triggers LRU eviction and succeeds on single
 
   // Populate chunks 0, 1, 2, 3 -> OPFS is at 64/64 bytes.
   await cache.read('world.rpf', 0, 16);
+  await cache.flushOpfsWrites();
   await cache.read('world.rpf', 16, 16);
+  await cache.flushOpfsWrites();
   await cache.read('world.rpf', 32, 16);
+  await cache.flushOpfsWrites();
   await cache.read('world.rpf', 48, 16);
+  await cache.flushOpfsWrites();
   assert.equal(opfsDir.files.size, 4);
 
   // Touch chunk 0 so LRU order becomes [1, 2, 3, 0].
@@ -286,6 +299,7 @@ test('RangeCache QuotaExceededError triggers LRU eviction and succeeds on single
   // Reading chunk 4 triggers QuotaExceededError on OPFS write, evicts oldest entry (chunk 1),
   // and retries once cleanly.
   const chunk4 = await cache.read('world.rpf', 64, 16);
+  await cache.flushOpfsWrites();
   assert.deepEqual(chunk4, fileBytes.subarray(64, 80));
 
   const stats = cache.getStats();
@@ -352,11 +366,13 @@ test('RangeCache QuotaExceededError frees at least 25% of maxBytes on KV backing
 
   for (let i = 0; i < 6; i += 1) {
     await cache.read('big.rpf', i * 16, 16);
+    await cache.flushOpfsWrites();
   }
   assert.equal(kvFiles.size, 6);
 
   // Chunk 6 overflows the 96-byte KV quota -> evicts >= 64 bytes (4 oldest chunks), retries once.
   const chunk6 = await cache.read('big.rpf', 6 * 16, 16);
+  await cache.flushOpfsWrites();
   assert.deepEqual(chunk6, fileBytes.subarray(96, 112));
   assert.equal(cache.getStats().quotaEvictions, 4);
   assert.equal(cache.getStats().quotaRetrySuccesses, 1);
@@ -375,8 +391,11 @@ test('RangeCache QuotaExceededError frees at least 25% of maxBytes on KV backing
     opfsDir: syncOpfs,
   });
   await syncCache.read('big.rpf', 0, 16);
+  await syncCache.flushOpfsWrites();
   await syncCache.read('big.rpf', 16, 16);
+  await syncCache.flushOpfsWrites();
   const chunk2 = await syncCache.read('big.rpf', 32, 16);
+  await syncCache.flushOpfsWrites();
   assert.deepEqual(chunk2, fileBytes.subarray(32, 48));
   assert.equal(syncCache.getStats().quotaEvictions, 1);
   assert.equal(syncCache.getStats().quotaRetrySuccesses, 1);
@@ -399,6 +418,7 @@ test('RangeCache evicts untracked prior-session OPFS files on QuotaExceededError
   });
 
   const out = await cache.read('session.rpf', 0, 16);
+  await cache.flushOpfsWrites();
   assert.deepEqual(out, fileBytes.subarray(0, 16));
   assert.equal(cache.getStats().quotaEvictions, 1);
   assert.equal(cache.getStats().quotaRetrySuccesses, 1);
@@ -419,10 +439,13 @@ test('RangeCache persistent QuotaExceededError degrades gracefully without throw
 
   // Must not throw and must return exact fetched bytes despite persistent OPFS quota failure.
   const slice = await cache.read('persistent.rpf', 4, 24);
+  await cache.flushOpfsWrites();
   assert.deepEqual(slice, fileBytes.subarray(4, 28));
 
   const stats = cache.getStats();
   assert.equal(stats.quotaRetrySuccesses, 0);
+  assert.equal(stats.opfsWriteErrors, 2);
+  assert.equal(stats.opfsWrites, 0);
   assert.equal(stats.misses, 2);
 
   // Each chunk write should be attempted at most twice (initial + 1 retry), leaving no partial files.
@@ -456,6 +479,7 @@ test('RangeCache self-heals truncated OPFS slice on warm cache and increments co
 
   // Reading across chunks 0 and 1 must evict truncated chunk 0, re-fetch it cleanly, and use chunk 1 from OPFS.
   const out = await cache.read('corrupt.rpf', 0, 32);
+  await cache.flushOpfsWrites();
   assert.deepEqual(out, fileBytes.subarray(0, 32));
   assert.equal(mockFetch.calls.length, 1, 'Only the truncated chunk 0 should be re-fetched');
   assert.equal(mockFetch.calls[0].rangeHeader, 'bytes=0-15');
@@ -532,6 +556,7 @@ test('RangeCache self-heals corrupt in-memory entry and preserves legitimate EOF
 
   // Read across tail chunk past EOF -> 10 bytes, zero corruptEvictions.
   const tail1 = await cache.read('tail.rpf', 40, 30);
+  await cache.flushOpfsWrites();
   assert.deepEqual(tail1, fileBytes.subarray(40, 50));
   assert.equal(cache.getStats().corruptEvictions, 0);
 
@@ -1050,4 +1075,344 @@ test('RangeCache prefetchBootset with coalesce merges adjacent bootset entries a
   assert.deepEqual(out, archive.subarray(0, 224 * KiB));
   assert.equal(mock.calls.length, 1);
   assert.equal(cache.getStats().prefetchHits, 4);
+});
+
+// --- W262: Versioned OPFS L2 write-through persistence & fingerprint invalidation tests ---
+
+test('W262: buildFileFingerprint and opfsChunkFileName preserve legacy format and support versioned size/ETag keys', () => {
+  assert.equal(DEFAULT_MAX_PENDING_OPFS_WRITES, 64);
+  assert.equal(DEFAULT_MAX_OPFS_WRITE_CONCURRENCY, 4);
+
+  // Backward compatibility when no fingerprint is provided.
+  const legacy = opfsChunkFileName('game/shaders.rpf', 2, 262144);
+  assert.equal(legacy, opfsChunkFileName('game/shaders.rpf', 2, 262144, null));
+  assert.match(legacy, /^c_262144_2_[0-9a-f]+\.bin$/);
+
+  // Size-only fingerprint: <size>.
+  const fpSize = buildFileFingerprint(1048576);
+  assert.equal(fpSize, '1048576');
+  const sizeKey = opfsChunkFileName('game/shaders.rpf', 2, 262144, fpSize);
+  assert.match(sizeKey, /^c_262144_2_[0-9a-f]+_fp_1048576\.bin$/);
+  assert.match(sizeKey, /^c_\d+_\d+_.*\.bin$/);
+
+  // Size + ETag fingerprint: <size>_<etagHash>.
+  const fpEtag1 = buildFileFingerprint({ size: 1048576, etag: '"rpf-v1"' });
+  const fpEtag2 = buildFileFingerprint({ size: 1048576, etag: '"rpf-v2"' });
+  assert.match(fpEtag1, /^1048576_[0-9a-f]{16}$/);
+  assert.notEqual(fpEtag1, fpEtag2);
+  assert.equal(fpEtag1, buildFileFingerprint(1048576, '"rpf-v1"'));
+  const etagKey = opfsChunkFileName('game/shaders.rpf', 2, 262144, fpEtag1);
+  assert.match(etagKey, /^c_262144_2_[0-9a-f]+_fp_1048576_[0-9a-f]{16}\.bin$/);
+});
+
+test('W262: cold HTTP fetch triggers non-blocking background OPFS L2 write and warm reload hits OPFS with 0 HTTP fetches', async () => {
+  const shadersBytes = makePatternBytes(64, 11);
+  const bvhBytes = makePatternBytes(48, 22);
+  const moviesBytes = makePatternBytes(80, 33);
+
+  const filesMap = new Map([
+    ['game/shaders.rpf', shadersBytes],
+    ['game/core_bvh4.rpf', bvhBytes],
+    ['game/movies.rpf', moviesBytes],
+  ]);
+
+  const fingerprints = {
+    'game/shaders.rpf': buildFileFingerprint(shadersBytes.byteLength, '"shaders-v1"'),
+    'game/core_bvh4.rpf': buildFileFingerprint(bvhBytes.byteLength),
+    'game/movies.rpf': buildFileFingerprint(moviesBytes.byteLength, '"movies-v1"'),
+  };
+
+  // Wrap OPFS mock with a manual gate on writes to PROVE read() never blocks on OPFS write-through!
+  const baseOpfs = createQuotaMockOpfsDir();
+  let gateWrites = true;
+  const pendingWriteGates = [];
+  const gatedOpfs = {
+    files: baseOpfs.files,
+    async getFileHandle(name, opts = {}) {
+      const inner = await baseOpfs.getFileHandle(name, opts);
+      if (!opts.create) return inner;
+      return {
+        getFile: inner.getFile.bind(inner),
+        async createWritable() {
+          const writable = await inner.createWritable();
+          return {
+            async write(chunk) {
+              if (gateWrites) {
+                await new Promise((resolve) => pendingWriteGates.push(resolve));
+              }
+              return writable.write(chunk);
+            },
+            close: writable.close.bind(writable),
+            abort: writable.abort.bind(writable),
+          };
+        },
+      };
+    },
+    removeEntry: baseOpfs.removeEntry.bind(baseOpfs),
+    entries: baseOpfs.entries.bind(baseOpfs),
+  };
+
+  const coldFetch = createMockRangeFetch(filesMap);
+  const coldCache = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 256,
+    fetchImpl: coldFetch.fetchImpl,
+    opfsDir: gatedOpfs,
+    fileFingerprints: fingerprints,
+  });
+
+  // Cold HTTP reads resolve IMMEDIATELY even though OPFS writes are gated/blocked!
+  const s0 = await coldCache.read('game/shaders.rpf', 0, 32);
+  const b0 = await coldCache.read('game/core_bvh4.rpf', 0, 16);
+  const m0 = await coldCache.read('game/movies.rpf', 16, 32);
+
+  assert.deepEqual(s0, shadersBytes.subarray(0, 32));
+  assert.deepEqual(b0, bvhBytes.subarray(0, 16));
+  assert.deepEqual(m0, moviesBytes.subarray(16, 48));
+  assert.equal(coldFetch.calls.length, 5);
+  // OPFS writes have not completed yet because gateWrites === true -> proves non-blocking return!
+  assert.equal(coldCache.getStats().opfsWrites, 0);
+
+  // Unblock background OPFS writes and drain.
+  gateWrites = false;
+  while (pendingWriteGates.length > 0) {
+    pendingWriteGates.shift()();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  await coldCache.flushOpfsWrites();
+
+  const coldStats = coldCache.getStats();
+  assert.equal(coldStats.opfsHits, 0);
+  assert.equal(coldStats.opfsMisses, 5);
+  assert.equal(coldStats.opfsWrites, 5);
+  assert.equal(coldStats.opfsWriteErrors, 0);
+  assert.equal(coldStats.opfsStaleInvalidations, 0);
+  assert.equal(coldStats.opfsHitRate, 0);
+
+  // Brand-new RangeCache instance (simulating page reload with empty RAM LRU) -> 0 HTTP fetches!
+  const warmFetch = createMockRangeFetch(filesMap);
+  const warmCache = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 256,
+    fetchImpl: warmFetch.fetchImpl,
+    opfsDir: baseOpfs,
+    fileFingerprints: fingerprints,
+  });
+
+  assert.deepEqual(await warmCache.read('game/shaders.rpf', 0, 32), shadersBytes.subarray(0, 32));
+  assert.deepEqual(await warmCache.read('game/core_bvh4.rpf', 0, 16), bvhBytes.subarray(0, 16));
+  assert.deepEqual(await warmCache.read('game/movies.rpf', 16, 32), moviesBytes.subarray(16, 48));
+  assert.equal(warmFetch.calls.length, 0, 'Warm reload must serve all hot RPF ranges from OPFS with 0 HTTP fetches');
+
+  const warmStats = warmCache.getStats();
+  assert.equal(warmStats.opfsHits, 5);
+  assert.equal(warmStats.opfsMisses, 0);
+  assert.equal(warmStats.opfsHitRate, 1);
+  assert.equal(warmStats.opfsStaleInvalidations, 0);
+});
+
+test('W262: changing file size or ETag fingerprint invalidates stale OPFS entries and fetches fresh bytes', async () => {
+  const v1Bytes = makePatternBytes(64, 10);
+  const v2Bytes = makePatternBytes(96, 99);
+  const v3Bytes = makePatternBytes(96, 200); // same size as v2, different ETag!
+  const opfsDir = createQuotaMockOpfsDir();
+
+  // Session 1: persist shaders.rpf v1 (size 64, ETag "v1").
+  const fpV1 = buildFileFingerprint(64, '"v1"');
+  const fetchV1 = createMockRangeFetch(new Map([['game/shaders.rpf', v1Bytes]]));
+  const cacheV1 = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 256,
+    fetchImpl: fetchV1.fetchImpl,
+    opfsDir,
+    fileFingerprints: { 'game/shaders.rpf': fpV1 },
+  });
+  assert.deepEqual(await cacheV1.read('game/shaders.rpf', 0, 32), v1Bytes.subarray(0, 32));
+  await cacheV1.flushOpfsWrites();
+  const v1Chunk0File = opfsChunkFileName('game/shaders.rpf', 0, 16, fpV1);
+  const v1Chunk1File = opfsChunkFileName('game/shaders.rpf', 1, 16, fpV1);
+  assert.equal(opfsDir.files.has(v1Chunk0File), true);
+  assert.equal(opfsDir.files.has(v1Chunk1File), true);
+
+  // Session 2: archive changes size (64 -> 96) and ETag ("v1" -> "v2").
+  const fpV2 = buildFileFingerprint(96, '"v2"');
+  const fetchV2 = createMockRangeFetch(new Map([['game/shaders.rpf', v2Bytes]]));
+  const cacheV2 = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 256,
+    fetchImpl: fetchV2.fetchImpl,
+    opfsDir,
+    fileFingerprints: { 'game/shaders.rpf': fpV2 },
+  });
+  const freshV2 = await cacheV2.read('game/shaders.rpf', 0, 32);
+  await cacheV2.flushOpfsWrites();
+  assert.deepEqual(freshV2, v2Bytes.subarray(0, 32));
+  assert.equal(fetchV2.calls.length, 2, 'Stale fingerprint must re-fetch fresh chunks over HTTP');
+
+  const statsV2 = cacheV2.getStats();
+  assert.equal(statsV2.opfsStaleInvalidations, 2);
+  assert.equal(statsV2.opfsMisses, 2);
+  assert.equal(statsV2.opfsHits, 0);
+  assert.equal(statsV2.opfsWrites, 2);
+  assert.equal(opfsDir.files.has(v1Chunk0File), false, 'Stale v1 chunk 0 must be deleted from OPFS');
+  assert.equal(opfsDir.files.has(v1Chunk1File), false, 'Stale v1 chunk 1 must be deleted from OPFS');
+  assert.equal(opfsDir.files.has(opfsChunkFileName('game/shaders.rpf', 0, 16, fpV2)), true);
+
+  // Session 3: same size (96) but different ETag ("v2" -> "v3") via setFileFingerprint on same instance!
+  const fpV3 = buildFileFingerprint(96, '"v3"');
+  const fetchV3 = createMockRangeFetch(new Map([['game/shaders.rpf', v3Bytes]]));
+  cacheV2.fetchImpl = fetchV3.fetchImpl;
+  cacheV2.setFileFingerprint('game/shaders.rpf', fpV3);
+
+  const freshV3 = await cacheV2.read('game/shaders.rpf', 0, 16);
+  await cacheV2.flushOpfsWrites();
+  assert.deepEqual(freshV3, v3Bytes.subarray(0, 16));
+  assert.equal(fetchV3.calls.length, 1);
+  assert.equal(cacheV2.getStats().opfsStaleInvalidations, 3);
+  assert.equal(opfsDir.files.has(opfsChunkFileName('game/shaders.rpf', 0, 16, fpV2)), false);
+  assert.equal(opfsDir.files.has(opfsChunkFileName('game/shaders.rpf', 0, 16, fpV3)), true);
+});
+
+test('W262: throwing OPFS mock and bounded background write queue degrade gracefully without failing HTTP reads', async () => {
+  const fileBytes = makePatternBytes(128, 63);
+  const mockFetch = createMockRangeFetch(new Map([['game/levels.rpf', fileBytes]]));
+
+  // 1. Throwing non-quota OPFS mock (e.g., SecurityError / NotAllowedError) degrades cleanly.
+  const throwingOpfs = {
+    async getFileHandle(_name, opts = {}) {
+      if (!opts.create) {
+        const err = new Error('NotFoundError');
+        err.name = 'NotFoundError';
+        throw err;
+      }
+      const err = new Error('OPFS access denied');
+      err.name = 'NotAllowedError';
+      throw err;
+    },
+    async removeEntry() {},
+  };
+
+  const errCache = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 128,
+    fetchImpl: mockFetch.fetchImpl,
+    opfsDir: throwingOpfs,
+  });
+
+  const out = await errCache.read('game/levels.rpf', 0, 32);
+  await errCache.flushOpfsWrites();
+  assert.deepEqual(out, fileBytes.subarray(0, 32));
+  const errStats = errCache.getStats();
+  assert.equal(errStats.opfsWriteErrors, 2);
+  assert.equal(errStats.opfsWrites, 0);
+  assert.equal(errStats.opfsHits, 0);
+  assert.equal(errStats.opfsMisses, 2);
+  assert.equal(errStats.opfsHitRate, 0);
+
+  // 2. Bounded queue (maxPendingOpfsWrites = 2, maxOpfsWriteConcurrency = 1) drops oldest queued writes under backpressure without blocking reads.
+  const baseOpfs = createQuotaMockOpfsDir();
+  const gates = [];
+  const slowOpfs = {
+    files: baseOpfs.files,
+    async getFileHandle(name, opts = {}) {
+      const inner = await baseOpfs.getFileHandle(name, opts);
+      if (!opts.create) return inner;
+      return {
+        getFile: inner.getFile.bind(inner),
+        async createWritable() {
+          const w = await inner.createWritable();
+          return {
+            async write(chunk) {
+              await new Promise((resolve) => gates.push(resolve));
+              return w.write(chunk);
+            },
+            close: w.close.bind(w),
+            abort: w.abort.bind(w),
+          };
+        },
+      };
+    },
+    removeEntry: baseOpfs.removeEntry.bind(baseOpfs),
+    entries: baseOpfs.entries.bind(baseOpfs),
+  };
+
+  const boundedFetch = createMockRangeFetch(new Map([['game/levels.rpf', fileBytes]]));
+  const boundedCache = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 256,
+    maxPendingOpfsWrites: 2,
+    maxOpfsWriteConcurrency: 1,
+    fetchImpl: boundedFetch.fetchImpl,
+    opfsDir: slowOpfs,
+  });
+
+  // Burst 6 reads while OPFS writes are stalled: all 6 reads return exact bytes immediately!
+  for (let i = 0; i < 6; i += 1) {
+    const slice = await boundedCache.read('game/levels.rpf', i * 16, 16);
+    assert.deepEqual(slice, fileBytes.subarray(i * 16, (i + 1) * 16));
+  }
+  // At most 1 active + 2 queued = 3 writes should persist after draining!
+  while (boundedCache._activeOpfsWrites.size > 0 || boundedCache._opfsWriteQueue.size > 0) {
+    if (gates.length > 0) {
+      gates.shift()();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  await boundedCache.flushOpfsWrites();
+  assert.ok(
+    boundedCache.getStats().opfsWrites <= 3,
+    `Expected bounded queue to cap persisted writes to <= 3, got ${boundedCache.getStats().opfsWrites}`,
+  );
+  assert.ok(boundedCache.getStats().opfsWrites >= 1);
+});
+
+test('W262: RangeCache interoperates with OpfsChunkCache L2 backend including versioned fingerprint validation', async () => {
+  const v1 = makePatternBytes(48, 5);
+  const v2 = makePatternBytes(48, 88);
+  const memDir = createQuotaMockOpfsDir();
+
+  const opfsCache = new OpfsChunkCache({ cacheDir: memDir, indexFlushDelayMs: 0 });
+  const fp1 = buildFileFingerprint(48, '"etag-1"');
+  const fetch1 = createMockRangeFetch(new Map([['game/core_bvh4.rpf', v1]]));
+
+  const cold = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 128,
+    fetchImpl: fetch1.fetchImpl,
+    opfsCache,
+    fileFingerprints: { 'game/core_bvh4.rpf': fp1 },
+  });
+  assert.deepEqual(await cold.read('game/core_bvh4.rpf', 0, 32), v1.subarray(0, 32));
+  await cold.flushOpfsWrites();
+  assert.equal(cold.getStats().opfsWrites, 2);
+
+  // Warm reload with matching fingerprint hits OpfsChunkCache with 0 HTTP fetches!
+  const fetch2 = createMockRangeFetch(new Map([['game/core_bvh4.rpf', v1]]));
+  const warm = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 128,
+    fetchImpl: fetch2.fetchImpl,
+    opfsCache,
+    fileFingerprints: { 'game/core_bvh4.rpf': fp1 },
+  });
+  assert.deepEqual(await warm.read('game/core_bvh4.rpf', 0, 32), v1.subarray(0, 32));
+  assert.equal(fetch2.calls.length, 0);
+  assert.equal(warm.getStats().opfsHits, 2);
+  assert.equal(warm.getStats().opfsHitRate, 1);
+
+  // Reload with updated fingerprint invalidates stale OpfsChunkCache entry and fetches v2!
+  const fp2 = buildFileFingerprint(48, '"etag-2"');
+  const fetch3 = createMockRangeFetch(new Map([['game/core_bvh4.rpf', v2]]));
+  const stale = new RangeCache({
+    chunkSize: 16,
+    maxBytes: 128,
+    fetchImpl: fetch3.fetchImpl,
+    opfsCache,
+    fileFingerprints: { 'game/core_bvh4.rpf': fp2 },
+  });
+  assert.deepEqual(await stale.read('game/core_bvh4.rpf', 0, 32), v2.subarray(0, 32));
+  await stale.flushOpfsWrites();
+  assert.equal(fetch3.calls.length, 2);
+  assert.equal(stale.getStats().opfsStaleInvalidations, 2);
+  await opfsCache.close();
 });
