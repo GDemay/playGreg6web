@@ -2,10 +2,11 @@
 
 // WebGPU Bink2 / splash video frame presenter.
 // Zero external dependencies; UMD export for Web Workers (globalThis.PlayGta6BinkPresenter)
-// and Node.js (module.exports). Renders decoded RGBA8, YUV420P, and YUVA420P frames onto
-// a WebGPU swapchain target with aspect-ratio-preserving letterboxing, double-buffered
-// plane textures, 256-byte-aligned uploads (direct or via GpuStagingPool), and zero
-// per-frame pipeline or bind-group churn.
+// and Node.js (module.exports). Renders decoded RGBA8, YUV420P, YUVA420P, and NV12 frames onto
+// a WebGPU swapchain target with aspect-ratio-preserving letterboxing, reusable plane textures,
+// 256-byte-aligned uploads (direct with reusable scratch buffer or via GpuStagingPool),
+// selectable BT.709/BT.601 limited/full-range conversion, and zero per-frame pipeline or
+// bind-group churn.
 
 (function (root) {
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
@@ -13,11 +14,13 @@
   const DEFAULT_PRESENTATION_FORMAT = 'bgra8unorm';
   const DEFAULT_TARGET_FPS = 30;
   const DOUBLE_BUFFER_SLOTS = 2;
+  const UNIFORM_FLAG_FULL_RANGE = 1;
 
   const BINK_PIXEL_FORMAT = Object.freeze({
     RGBA8: 'rgba8',
     YUV420P: 'yuv420p',
     YUVA420P: 'yuva420p',
+    NV12: 'nv12',
   });
 
   const YUV_COLOR_SPACE = Object.freeze({
@@ -25,10 +28,16 @@
     BT601: 'bt601',
   });
 
+  const YUV_COLOR_RANGE = Object.freeze({
+    LIMITED: 'limited',
+    FULL: 'full',
+  });
+
   const PIXEL_FORMAT_MODE = Object.freeze({
     [BINK_PIXEL_FORMAT.RGBA8]: 0,
     [BINK_PIXEL_FORMAT.YUV420P]: 1,
     [BINK_PIXEL_FORMAT.YUVA420P]: 2,
+    [BINK_PIXEL_FORMAT.NV12]: 3,
   });
 
   const COLOR_SPACE_ID = Object.freeze({
@@ -38,6 +47,8 @@
 
   // Limited-range ITU-R YCbCr -> RGB conversion matrices (Y in [16..235], U/V in [16..240]).
   const YUV_LIMITED_OFFSET = Object.freeze([16 / 255, 128 / 255, 128 / 255, 0]);
+  // Full-range ITU-R YCbCr -> RGB conversion offset (Y in [0..255], U/V in [0..255]).
+  const YUV_FULL_OFFSET = Object.freeze([0, 128 / 255, 128 / 255, 0]);
 
   const YUV_MATRICES = Object.freeze({
     [YUV_COLOR_SPACE.BT709]: Object.freeze({
@@ -52,6 +63,26 @@
       row2: Object.freeze([1.16438356, 2.01723214, 0.0, 0.0]),
       offset: YUV_LIMITED_OFFSET,
     }),
+  });
+
+  const YUV_FULL_RANGE_MATRICES = Object.freeze({
+    [YUV_COLOR_SPACE.BT709]: Object.freeze({
+      row0: Object.freeze([1.0, 0.0, 1.5748, 0.0]),
+      row1: Object.freeze([1.0, -0.18732427, -0.46812427, 0.0]),
+      row2: Object.freeze([1.0, 1.8556, 0.0, 0.0]),
+      offset: YUV_FULL_OFFSET,
+    }),
+    [YUV_COLOR_SPACE.BT601]: Object.freeze({
+      row0: Object.freeze([1.0, 0.0, 1.402, 0.0]),
+      row1: Object.freeze([1.0, -0.34413629, -0.71413629, 0.0]),
+      row2: Object.freeze([1.0, 1.772, 0.0, 0.0]),
+      offset: YUV_FULL_OFFSET,
+    }),
+  });
+
+  const YUV_RANGE_MATRICES = Object.freeze({
+    [YUV_COLOR_RANGE.LIMITED]: YUV_MATRICES,
+    [YUV_COLOR_RANGE.FULL]: YUV_FULL_RANGE_MATRICES,
   });
 
   // WebGPU bitmask constants with headless/Node fallbacks.
@@ -141,7 +172,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   let clamped_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
 
   let primary = textureSample(plane_primary, video_sampler, clamped_uv);
-  let u_sample = textureSample(plane_u, video_sampler, clamped_uv).r;
+  let uv_sample = textureSample(plane_u, video_sampler, clamped_uv);
   let v_sample = textureSample(plane_v, video_sampler, clamped_uv).r;
   let a_sample = textureSample(plane_a, video_sampler, clamped_uv).r;
 
@@ -154,7 +185,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(primary.rgb, primary.a * uniforms.opacity);
   }
 
-  let yuv = vec3<f32>(primary.r, u_sample, v_sample) - uniforms.yuv_offset.xyz;
+  let chroma_u = uv_sample.r;
+  let chroma_v = select(v_sample, uv_sample.g, uniforms.mode == 3u);
+  let yuv = vec3<f32>(primary.r, chroma_u, chroma_v) - uniforms.yuv_offset.xyz;
   let rgb = clamp(
     vec3<f32>(
       dot(uniforms.yuv_row0.xyz, yuv),
@@ -195,14 +228,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
   }
 
+  function validateColorRange(colorRange) {
+    if (colorRange !== YUV_COLOR_RANGE.LIMITED && colorRange !== YUV_COLOR_RANGE.FULL) {
+      throw new RangeError(
+        `Unsupported colorRange "${colorRange}"; expected "${YUV_COLOR_RANGE.LIMITED}" or "${YUV_COLOR_RANGE.FULL}"`
+      );
+    }
+  }
+
   function validatePixelFormat(format) {
     if (
       format !== BINK_PIXEL_FORMAT.RGBA8 &&
       format !== BINK_PIXEL_FORMAT.YUV420P &&
-      format !== BINK_PIXEL_FORMAT.YUVA420P
+      format !== BINK_PIXEL_FORMAT.YUVA420P &&
+      format !== BINK_PIXEL_FORMAT.NV12
     ) {
       throw new RangeError(`Unsupported pixel format "${format}"`);
     }
+  }
+
+  function getYuvMatrix(
+    colorSpace = YUV_COLOR_SPACE.BT709,
+    colorRange = YUV_COLOR_RANGE.LIMITED
+  ) {
+    validateColorSpace(colorSpace);
+    validateColorRange(colorRange);
+    return YUV_RANGE_MATRICES[colorRange][colorSpace];
   }
 
   function alignUp(value, alignment) {
@@ -307,6 +358,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
    * @param {{
    *   pixelFormat?: string,
    *   colorSpace?: string,
+   *   colorRange?: string,
    *   opacity?: number,
    *   flags?: number,
    *   uvTransform?: number[],
@@ -316,23 +368,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   function packPresenterUniforms(params = {}) {
     const pixelFormat = params.pixelFormat ?? BINK_PIXEL_FORMAT.RGBA8;
     const colorSpace = params.colorSpace ?? YUV_COLOR_SPACE.BT709;
+    const colorRange = params.colorRange ?? YUV_COLOR_RANGE.LIMITED;
     const opacity = params.opacity ?? 1.0;
     const flags = params.flags ?? 0;
     const uvTransform = params.uvTransform ?? DEFAULT_UV_TRANSFORM;
 
     validatePixelFormat(pixelFormat);
     validateColorSpace(colorSpace);
+    validateColorRange(colorRange);
 
-    const matrix = YUV_MATRICES[colorSpace];
+    const matrix = YUV_RANGE_MATRICES[colorRange][colorSpace];
     const buffer = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
     const u32 = new Uint32Array(buffer);
     const f32 = new Float32Array(buffer);
+
+    const packedFlags =
+      ((flags >>> 0) | (colorRange === YUV_COLOR_RANGE.FULL ? UNIFORM_FLAG_FULL_RANGE : 0)) >>> 0;
 
     // Header (bytes 0..15)
     u32[0] = PIXEL_FORMAT_MODE[pixelFormat];
     u32[1] = COLOR_SPACE_ID[colorSpace];
     f32[2] = opacity;
-    u32[3] = flags >>> 0;
+    u32[3] = packedFlags;
 
     // uv_transform (bytes 16..31)
     f32[4] = uvTransform[0] ?? 1.0;
@@ -367,17 +424,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return new Uint8Array(buffer);
   }
 
-  /**
-   * Prepare a plane's pixel rows with 256-byte `bytesPerRow` alignment.
-   *
-   * @param {Uint8Array} src
-   * @param {number} tightRowBytes
-   * @param {number} height
-   * @param {number} srcStride
-   * @param {string} label
-   * @returns {{ data: Uint8Array, bytesPerRow: number, totalBytes: number, padded: boolean }}
-   */
-  function prepareAlignedPlaneData(src, tightRowBytes, height, srcStride, label) {
+  function validatePlaneBuffer(src, tightRowBytes, height, srcStride, label) {
     assertPositiveInteger(tightRowBytes, `${label} tightRowBytes`);
     assertPositiveInteger(height, `${label} height`);
     assertPositiveInteger(srcStride, `${label} stride`);
@@ -394,6 +441,35 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         `${label} buffer too small (${src.byteLength} bytes; need at least ${minRequiredBytes} bytes)`
       );
     }
+  }
+
+  /**
+   * Prepare a plane's pixel rows with 256-byte `bytesPerRow` alignment, optionally reusing a
+   * caller-supplied scratch `Uint8Array` to avoid per-frame allocations.
+   *
+   * @param {Uint8Array} src
+   * @param {number} tightRowBytes
+   * @param {number} height
+   * @param {number} srcStride
+   * @param {string} label
+   * @param {Uint8Array | null} [scratchBuffer]
+   * @returns {{
+   *   data: Uint8Array,
+   *   bytesPerRow: number,
+   *   totalBytes: number,
+   *   padded: boolean,
+   *   usesScratch: boolean,
+   * }}
+   */
+  function prepareAlignedPlaneData(
+    src,
+    tightRowBytes,
+    height,
+    srcStride,
+    label,
+    scratchBuffer = null
+  ) {
+    validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
 
     const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
     const totalBytes = alignedBytesPerRow * height;
@@ -405,21 +481,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         bytesPerRow: alignedBytesPerRow,
         totalBytes,
         padded: false,
+        usesScratch: false,
       };
     }
 
-    const padded = new Uint8Array(totalBytes);
+    const canReuseScratch =
+      scratchBuffer instanceof Uint8Array && scratchBuffer.byteLength >= totalBytes;
+    const dst = canReuseScratch
+      ? scratchBuffer.subarray(0, totalBytes)
+      : new Uint8Array(totalBytes);
+    const hasPaddingTail = alignedBytesPerRow > tightRowBytes;
+
     for (let row = 0; row < height; row += 1) {
       const srcOffset = row * srcStride;
       const dstOffset = row * alignedBytesPerRow;
-      padded.set(src.subarray(srcOffset, srcOffset + tightRowBytes), dstOffset);
+      dst.set(src.subarray(srcOffset, srcOffset + tightRowBytes), dstOffset);
+      if (canReuseScratch && hasPaddingTail) {
+        dst.fill(0, dstOffset + tightRowBytes, dstOffset + alignedBytesPerRow);
+      }
     }
 
     return {
-      data: padded,
+      data: dst,
       bytesPerRow: alignedBytesPerRow,
       totalBytes,
       padded: true,
+      usesScratch: canReuseScratch,
     };
   }
 
@@ -434,6 +521,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       y: null,
       u: null,
       v: null,
+      uv: null,
       a: null,
       bindGroup: null,
     };
@@ -450,11 +538,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     destroyPlaneResource(slot.y);
     destroyPlaneResource(slot.u);
     destroyPlaneResource(slot.v);
+    destroyPlaneResource(slot.uv);
     destroyPlaneResource(slot.a);
     slot.rgba = null;
     slot.y = null;
     slot.u = null;
     slot.v = null;
+    slot.uv = null;
     slot.a = null;
     slot.bindGroup = null;
     slot.format = null;
@@ -465,7 +555,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   }
 
   /**
-   * WebGPU video & splash frame presenter for Bink2 (`YUV420P`, `YUVA420P`) and `RGBA8` frames.
+   * WebGPU video & splash frame presenter for Bink2 (`YUV420P`, `YUVA420P`, `NV12`) and `RGBA8` frames.
    */
   class BinkVideoPresenter {
     constructor(options = {}) {
@@ -478,7 +568,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         presentationFormat = DEFAULT_PRESENTATION_FORMAT,
         stagingPool = null,
         colorSpace = YUV_COLOR_SPACE.BT709,
+        colorRange = YUV_COLOR_RANGE.LIMITED,
         targetFps = DEFAULT_TARGET_FPS,
+        doubleBuffer = true,
+        slotCount,
       } = options;
 
       if (!device || typeof device.createTexture !== 'function') {
@@ -495,21 +588,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         throw new TypeError('stagingPool must be null or provide stageTextureUpload()');
       }
       validateColorSpace(colorSpace);
+      validateColorRange(colorRange);
       assertPositiveFinite(targetFps, 'targetFps');
+
+      const resolvedSlotCount =
+        slotCount !== undefined ? slotCount : doubleBuffer ? DOUBLE_BUFFER_SLOTS : 1;
+      assertPositiveInteger(resolvedSlotCount, 'slotCount');
 
       this._device = device;
       this._presentationFormat = presentationFormat;
       this._stagingPool = stagingPool || null;
       this._colorSpace = colorSpace;
+      this._colorRange = colorRange;
       this._targetFps = targetFps;
 
-      // Double-buffered plane texture slots.
+      // Reusable plane texture slots (double-buffered by default).
       this._slots = [];
-      for (let i = 0; i < DOUBLE_BUFFER_SLOTS; i += 1) {
+      for (let i = 0; i < resolvedSlotCount; i += 1) {
         this._slots.push(createEmptySlot());
       }
       this._activeSlotIndex = 0;
       this._hasFrame = false;
+      this._unpresentedFrame = false;
 
       // Current video stream state.
       this._pixelFormat = null;
@@ -519,6 +619,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       // Deferred staging uploads queued when upload*Frame is called without a commandEncoder.
       this._pendingUploads = [];
+
+      // Reusable scratch buffer for 256-byte row-pitch alignment.
+      this._uploadScratch = null;
+      this._scratchAllocations = 0;
 
       // Lazily constructed GPU pipeline resources.
       this._shaderModule = null;
@@ -541,7 +645,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       // Telemetry.
       this._uploadedFrames = 0;
       this._presentedFrames = 0;
+      this._droppedFrames = 0;
       this._resizeCount = 0;
+      this._planeReallocations = 0;
       this._bytesUploaded = 0;
       this._destroyed = false;
     }
@@ -552,6 +658,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     get colorSpace() {
       return this._colorSpace;
+    }
+
+    get colorRange() {
+      return this._colorRange;
     }
 
     get targetFps() {
@@ -622,11 +732,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Destroy stale textures across all slots immediately on resolution/format change.
         this._destroyAllSlots();
         this._resizeCount += 1;
+        this._planeReallocations += 1;
         this._uniformsDirty = true;
         return 0;
       }
 
       if (!this._hasFrame) {
+        this._planeReallocations += 1;
         return 0;
       }
 
@@ -644,10 +756,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         slot.height === height &&
         (format === BINK_PIXEL_FORMAT.RGBA8
           ? slot.rgba !== null
-          : slot.y !== null &&
-            slot.u !== null &&
-            slot.v !== null &&
-            (format !== BINK_PIXEL_FORMAT.YUVA420P || slot.a !== null));
+          : format === BINK_PIXEL_FORMAT.NV12
+            ? slot.y !== null && slot.uv !== null
+            : slot.y !== null &&
+              slot.u !== null &&
+              slot.v !== null &&
+              (format !== BINK_PIXEL_FORMAT.YUVA420P || slot.a !== null));
 
       if (matches) {
         return slot;
@@ -661,6 +775,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           height,
           'rgba8unorm',
           `playgta6-bink-rgba-slot${slotIndex}`
+        );
+      } else if (format === BINK_PIXEL_FORMAT.NV12) {
+        slot.y = this._createPlaneTexture(
+          width,
+          height,
+          'r8unorm',
+          `playgta6-bink-y-slot${slotIndex}`
+        );
+        slot.uv = this._createPlaneTexture(
+          uvWidth,
+          uvHeight,
+          'rg8unorm',
+          `playgta6-bink-uv-slot${slotIndex}`
         );
       } else {
         slot.y = this._createPlaneTexture(
@@ -700,6 +827,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return slot;
     }
 
+    _preparePlaneForUpload(src, tightRowBytes, height, srcStride, label) {
+      validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
+
+      const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
+      const totalBytes = alignedBytesPerRow * height;
+
+      if (srcStride === alignedBytesPerRow && src.byteLength >= totalBytes) {
+        return prepareAlignedPlaneData(src, tightRowBytes, height, srcStride, label);
+      }
+
+      if (!this._uploadScratch || this._uploadScratch.byteLength < totalBytes) {
+        this._uploadScratch = new Uint8Array(totalBytes);
+        this._scratchAllocations += 1;
+      }
+
+      return prepareAlignedPlaneData(
+        src,
+        tightRowBytes,
+        height,
+        srcStride,
+        label,
+        this._uploadScratch
+      );
+    }
+
     _uploadPlane(slotIndex, dstTexture, prepared, width, height, commandEncoder) {
       if (this._stagingPool) {
         const layout = {
@@ -711,8 +863,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (commandEncoder) {
           this._stagingPool.stageTextureUpload(commandEncoder, dstTexture, prepared.data, layout);
         } else {
-          // Copy if non-padded view so caller reuse before presentFrame cannot corrupt data.
-          const ownedData = prepared.padded ? prepared.data : new Uint8Array(prepared.data);
+          // Clone non-owned or scratch-backed data so subsequent plane uploads cannot overwrite it.
+          const ownedData =
+            prepared.padded && !prepared.usesScratch ? prepared.data : new Uint8Array(prepared.data);
           this._pendingUploads.push({
             slotIndex,
             texture: dstTexture,
@@ -797,12 +950,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const strideBytes = options && options.strideBytes !== undefined ? options.strideBytes : tightRowBytes;
       const commandEncoder = options ? options.commandEncoder || options.encoder || null : null;
 
-      const prepared = prepareAlignedPlaneData(src, tightRowBytes, height, strideBytes, 'RGBA8');
+      validatePlaneBuffer(src, tightRowBytes, height, strideBytes, 'RGBA8');
+
+      if (this._unpresentedFrame) {
+        this._droppedFrames += 1;
+      }
 
       const writeSlotIndex = this._selectWriteSlot(BINK_PIXEL_FORMAT.RGBA8, width, height);
       const slot = this._ensureSlotTextures(writeSlotIndex, BINK_PIXEL_FORMAT.RGBA8, width, height);
       this._dropPendingUploadsForSlot(writeSlotIndex);
 
+      const prepared = this._preparePlaneForUpload(src, tightRowBytes, height, strideBytes, 'RGBA8');
       this._uploadPlane(writeSlotIndex, slot.rgba.texture, prepared, width, height, commandEncoder);
 
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.RGBA8) {
@@ -813,6 +971,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._frameHeight = height;
       this._activeSlotIndex = writeSlotIndex;
       this._hasFrame = true;
+      this._unpresentedFrame = true;
       this._uploadedFrames += 1;
 
       return {
@@ -828,7 +987,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     /**
      * Upload a planar YUV420P or YUVA420P (with optional alpha plane) video frame into
-     * the next double-buffered plane texture slot.
+     * the next reusable plane texture slot.
      *
      * @param {{
      *   y: Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer,
@@ -841,6 +1000,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      *   uvStride?: number,
      *   aStride?: number,
      *   colorSpace?: string,
+     *   colorRange?: string,
      *   commandEncoder?: GPUCommandEncoder,
      *   encoder?: GPUCommandEncoder,
      * }} frame
@@ -862,6 +1022,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         uvStride,
         aStride,
         colorSpace,
+        colorRange,
       } = frame;
       const commandEncoder = frame.commandEncoder || frame.encoder || null;
 
@@ -870,6 +1031,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       if (colorSpace !== undefined && colorSpace !== null) {
         validateColorSpace(colorSpace);
+      }
+      if (colorRange !== undefined && colorRange !== null) {
+        validateColorRange(colorRange);
       }
 
       const uvWidth = Math.ceil(width / 2);
@@ -882,42 +1046,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const vSrc = toUint8Array(v, 'uploadYuv420Frame.v');
       const aSrc = hasAlpha ? toUint8Array(a, 'uploadYuv420Frame.a') : null;
 
-      const preparedY = prepareAlignedPlaneData(
-        ySrc,
-        width,
-        height,
-        yStride !== undefined ? yStride : width,
-        'Y plane'
-      );
-      const preparedU = prepareAlignedPlaneData(
-        uSrc,
-        uvWidth,
-        uvHeight,
-        uvStride !== undefined ? uvStride : uvWidth,
-        'U plane'
-      );
-      const preparedV = prepareAlignedPlaneData(
-        vSrc,
-        uvWidth,
-        uvHeight,
-        uvStride !== undefined ? uvStride : uvWidth,
-        'V plane'
-      );
-      const preparedA = hasAlpha
-        ? prepareAlignedPlaneData(
-            aSrc,
-            width,
-            height,
-            aStride !== undefined ? aStride : width,
-            'A plane'
-          )
-        : null;
+      const resolvedYStride = yStride !== undefined ? yStride : width;
+      const resolvedUvStride = uvStride !== undefined ? uvStride : uvWidth;
+      const resolvedAStride = aStride !== undefined ? aStride : width;
+
+      validatePlaneBuffer(ySrc, width, height, resolvedYStride, 'Y plane');
+      validatePlaneBuffer(uSrc, uvWidth, uvHeight, resolvedUvStride, 'U plane');
+      validatePlaneBuffer(vSrc, uvWidth, uvHeight, resolvedUvStride, 'V plane');
+      if (hasAlpha && aSrc) {
+        validatePlaneBuffer(aSrc, width, height, resolvedAStride, 'A plane');
+      }
+
+      if (this._unpresentedFrame) {
+        this._droppedFrames += 1;
+      }
 
       const writeSlotIndex = this._selectWriteSlot(format, width, height);
       const slot = this._ensureSlotTextures(writeSlotIndex, format, width, height);
       this._dropPendingUploadsForSlot(writeSlotIndex);
 
+      const preparedY = this._preparePlaneForUpload(
+        ySrc,
+        width,
+        height,
+        resolvedYStride,
+        'Y plane'
+      );
       this._uploadPlane(writeSlotIndex, slot.y.texture, preparedY, width, height, commandEncoder);
+
+      const preparedU = this._preparePlaneForUpload(
+        uSrc,
+        uvWidth,
+        uvHeight,
+        resolvedUvStride,
+        'U plane'
+      );
       this._uploadPlane(
         writeSlotIndex,
         slot.u.texture,
@@ -925,6 +1088,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         uvWidth,
         uvHeight,
         commandEncoder
+      );
+
+      const preparedV = this._preparePlaneForUpload(
+        vSrc,
+        uvWidth,
+        uvHeight,
+        resolvedUvStride,
+        'V plane'
       );
       this._uploadPlane(
         writeSlotIndex,
@@ -934,12 +1105,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         uvHeight,
         commandEncoder
       );
-      if (hasAlpha && preparedA) {
+
+      let preparedA = null;
+      if (hasAlpha && aSrc) {
+        preparedA = this._preparePlaneForUpload(
+          aSrc,
+          width,
+          height,
+          resolvedAStride,
+          'A plane'
+        );
         this._uploadPlane(writeSlotIndex, slot.a.texture, preparedA, width, height, commandEncoder);
       }
 
       if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
         this._colorSpace = colorSpace;
+        this._uniformsDirty = true;
+      }
+      if (colorRange !== undefined && colorRange !== null && colorRange !== this._colorRange) {
+        this._colorRange = colorRange;
         this._uniformsDirty = true;
       }
       if (this._pixelFormat !== format) {
@@ -951,6 +1135,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._frameHeight = height;
       this._activeSlotIndex = writeSlotIndex;
       this._hasFrame = true;
+      this._unpresentedFrame = true;
       this._uploadedFrames += 1;
 
       const bytesUploaded =
@@ -962,6 +1147,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return {
         format,
         colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
         width,
         height,
         uvWidth,
@@ -973,6 +1159,165 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
       };
+    }
+
+    /**
+     * Upload a semi-planar NV12 (`r8unorm` Y plane + interleaved `rg8unorm` UV plane) video frame
+     * into the next reusable plane texture slot.
+     *
+     * @param {{
+     *   y: Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer,
+     *   uv: Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer,
+     *   width: number,
+     *   height: number,
+     *   yStride?: number,
+     *   uvStride?: number,
+     *   colorSpace?: string,
+     *   colorRange?: string,
+     *   commandEncoder?: GPUCommandEncoder,
+     *   encoder?: GPUCommandEncoder,
+     * }} frame
+     */
+    uploadNv12Frame(frame) {
+      this._assertNotDestroyed();
+      if (!frame || typeof frame !== 'object') {
+        throw new TypeError('uploadNv12Frame expects a frame descriptor object');
+      }
+
+      const {
+        y,
+        uv,
+        width,
+        height,
+        yStride,
+        uvStride,
+        colorSpace,
+        colorRange,
+      } = frame;
+      const commandEncoder = frame.commandEncoder || frame.encoder || null;
+
+      assertPositiveInteger(width, 'width');
+      assertPositiveInteger(height, 'height');
+
+      if (colorSpace !== undefined && colorSpace !== null) {
+        validateColorSpace(colorSpace);
+      }
+      if (colorRange !== undefined && colorRange !== null) {
+        validateColorRange(colorRange);
+      }
+
+      const uvWidth = Math.ceil(width / 2);
+      const uvHeight = Math.ceil(height / 2);
+      const uvTightRowBytes = uvWidth * 2;
+      const resolvedYStride = yStride !== undefined ? yStride : width;
+      const resolvedUvStride = uvStride !== undefined ? uvStride : uvTightRowBytes;
+
+      const ySrc = toUint8Array(y, 'uploadNv12Frame.y');
+      const uvSrc = toUint8Array(uv, 'uploadNv12Frame.uv');
+
+      validatePlaneBuffer(ySrc, width, height, resolvedYStride, 'Y plane');
+      validatePlaneBuffer(uvSrc, uvTightRowBytes, uvHeight, resolvedUvStride, 'UV plane');
+
+      if (this._unpresentedFrame) {
+        this._droppedFrames += 1;
+      }
+
+      const writeSlotIndex = this._selectWriteSlot(BINK_PIXEL_FORMAT.NV12, width, height);
+      const slot = this._ensureSlotTextures(writeSlotIndex, BINK_PIXEL_FORMAT.NV12, width, height);
+      this._dropPendingUploadsForSlot(writeSlotIndex);
+
+      const preparedY = this._preparePlaneForUpload(
+        ySrc,
+        width,
+        height,
+        resolvedYStride,
+        'Y plane'
+      );
+      this._uploadPlane(writeSlotIndex, slot.y.texture, preparedY, width, height, commandEncoder);
+
+      const preparedUv = this._preparePlaneForUpload(
+        uvSrc,
+        uvTightRowBytes,
+        uvHeight,
+        resolvedUvStride,
+        'UV plane'
+      );
+      this._uploadPlane(
+        writeSlotIndex,
+        slot.uv.texture,
+        preparedUv,
+        uvWidth,
+        uvHeight,
+        commandEncoder
+      );
+
+      if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
+        this._colorSpace = colorSpace;
+        this._uniformsDirty = true;
+      }
+      if (colorRange !== undefined && colorRange !== null && colorRange !== this._colorRange) {
+        this._colorRange = colorRange;
+        this._uniformsDirty = true;
+      }
+      if (this._pixelFormat !== BINK_PIXEL_FORMAT.NV12) {
+        this._uniformsDirty = true;
+      }
+
+      this._pixelFormat = BINK_PIXEL_FORMAT.NV12;
+      this._frameWidth = width;
+      this._frameHeight = height;
+      this._activeSlotIndex = writeSlotIndex;
+      this._hasFrame = true;
+      this._unpresentedFrame = true;
+      this._uploadedFrames += 1;
+
+      const bytesUploaded = preparedY.totalBytes + preparedUv.totalBytes;
+
+      return {
+        format: BINK_PIXEL_FORMAT.NV12,
+        colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
+        width,
+        height,
+        uvWidth,
+        uvHeight,
+        yBytesPerRow: preparedY.bytesPerRow,
+        uvBytesPerRow: preparedUv.bytesPerRow,
+        bytesUploaded,
+        slotIndex: writeSlotIndex,
+        uploadedFrames: this._uploadedFrames,
+      };
+    }
+
+    /**
+     * Dispatch a frame descriptor to `uploadRgbaFrame`, `uploadYuv420Frame`, or `uploadNv12Frame`.
+     *
+     * @param {object} frame
+     */
+    uploadFrame(frame) {
+      this._assertNotDestroyed();
+      if (!frame || typeof frame !== 'object') {
+        throw new TypeError('uploadFrame expects a frame descriptor object');
+      }
+      const format = frame.format;
+      if (format === BINK_PIXEL_FORMAT.NV12 || (!format && frame.y && frame.uv && !frame.u && !frame.v)) {
+        return this.uploadNv12Frame(frame);
+      }
+      if (
+        format === BINK_PIXEL_FORMAT.YUV420P ||
+        format === BINK_PIXEL_FORMAT.YUVA420P ||
+        (!format && frame.y && frame.u && frame.v)
+      ) {
+        return this.uploadYuv420Frame(frame);
+      }
+      if (format === BINK_PIXEL_FORMAT.RGBA8 || (!format && (frame.rgba || frame.data))) {
+        return this.uploadRgbaFrame(frame.rgba || frame.data, frame.width, frame.height, {
+          strideBytes: frame.strideBytes,
+          commandEncoder: frame.commandEncoder || frame.encoder || null,
+        });
+      }
+      validatePixelFormat(format);
+      throw new TypeError('uploadFrame could not determine pixel format from frame descriptor');
     }
 
     _ensurePipelineResources() {
@@ -1112,9 +1457,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const primaryView =
         slot.format === BINK_PIXEL_FORMAT.RGBA8 ? slot.rgba.view : slot.y.view;
       const uView =
-        slot.format === BINK_PIXEL_FORMAT.RGBA8 ? this._dummyTextureView : slot.u.view;
+        slot.format === BINK_PIXEL_FORMAT.RGBA8
+          ? this._dummyTextureView
+          : slot.format === BINK_PIXEL_FORMAT.NV12
+            ? slot.uv.view
+            : slot.u.view;
       const vView =
-        slot.format === BINK_PIXEL_FORMAT.RGBA8 ? this._dummyTextureView : slot.v.view;
+        slot.format === BINK_PIXEL_FORMAT.YUV420P ||
+        slot.format === BINK_PIXEL_FORMAT.YUVA420P
+          ? slot.v.view
+          : this._dummyTextureView;
       const aView =
         slot.format === BINK_PIXEL_FORMAT.YUVA420P && slot.a
           ? slot.a.view
@@ -1143,6 +1495,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const packed = packPresenterUniforms({
         pixelFormat: this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8,
         colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
         opacity,
         uvTransform: this._uvTransform,
       });
@@ -1215,8 +1568,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           viewport: null,
           format: this._pixelFormat,
           colorSpace: this._colorSpace,
+          colorRange: this._colorRange,
           slotIndex: this._activeSlotIndex,
           presentedFrames: this._presentedFrames,
+          framesPresented: this._presentedFrames,
         };
       }
 
@@ -1244,14 +1599,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       pass.end();
 
       this._presentedFrames += 1;
+      this._unpresentedFrame = false;
 
       return {
         presented: true,
         viewport,
         format: this._pixelFormat,
         colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
         slotIndex: this._activeSlotIndex,
         presentedFrames: this._presentedFrames,
+        framesPresented: this._presentedFrames,
       };
     }
 
@@ -1265,15 +1623,44 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     /**
-     * Switch active YUV color space (`BT709` or `BT601`).
+     * Switch active YUV color space (`bt709` or `bt601`) and optionally color range
+     * (`limited` or `full`).
      */
-    setColorSpace(colorSpace) {
+    setColorSpace(colorSpace, colorRange) {
       this._assertNotDestroyed();
       validateColorSpace(colorSpace);
+      if (colorRange !== undefined && colorRange !== null) {
+        validateColorRange(colorRange);
+      }
       if (colorSpace !== this._colorSpace) {
         this._colorSpace = colorSpace;
         this._uniformsDirty = true;
       }
+      if (colorRange !== undefined && colorRange !== null && colorRange !== this._colorRange) {
+        this._colorRange = colorRange;
+        this._uniformsDirty = true;
+      }
+    }
+
+    /**
+     * Switch active YUV color range (`limited` or `full`).
+     */
+    setColorRange(colorRange) {
+      this._assertNotDestroyed();
+      validateColorRange(colorRange);
+      if (colorRange !== this._colorRange) {
+        this._colorRange = colorRange;
+        this._uniformsDirty = true;
+      }
+    }
+
+    /**
+     * Record dropped frames detected by an external playback driver.
+     */
+    recordDroppedFrame(count = 1) {
+      this._assertNotDestroyed();
+      assertPositiveInteger(count, 'count');
+      this._droppedFrames += count;
     }
 
     /**
@@ -1351,6 +1738,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const elapsed = nowMs - this._lastAdvanceMs;
       if (elapsed + 1e-6 >= intervalMs) {
         if (elapsed >= intervalMs * 2) {
+          const missedIntervals = Math.floor((elapsed + 1e-6) / intervalMs) - 1;
+          if (missedIntervals > 0) {
+            this._droppedFrames += missedIntervals;
+          }
           this._lastAdvanceMs = nowMs;
         } else {
           this._lastAdvanceMs += intervalMs;
@@ -1368,15 +1759,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return {
         pixelFormat: this._pixelFormat,
         colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
         presentationFormat: this._presentationFormat,
         frameWidth: this._frameWidth,
         frameHeight: this._frameHeight,
+        lastFrameWidth: this._frameWidth,
+        lastFrameHeight: this._frameHeight,
         targetFps: this._targetFps,
         frameIntervalMs: 1000 / this._targetFps,
         uploadedFrames: this._uploadedFrames,
         presentedFrames: this._presentedFrames,
+        framesPresented: this._presentedFrames,
+        droppedFrames: this._droppedFrames,
         resizeCount: this._resizeCount,
+        planeReallocations: this._planeReallocations,
+        scratchAllocations: this._scratchAllocations,
         bytesUploaded: this._bytesUploaded,
+        slotCount: this._slots.length,
         activeSlotIndex: this._activeSlotIndex,
         hasFrame: this._hasFrame,
         paused: this._paused,
@@ -1411,31 +1810,46 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       this._uniformBuffer = null;
 
+      this._uploadScratch = null;
       this._shaderModule = null;
       this._bindGroupLayout = null;
       this._pipelineLayout = null;
       this._pipeline = null;
       this._sampler = null;
       this._hasFrame = false;
+      this._unpresentedFrame = false;
       this._lastAdvanceMs = null;
       this._device = null;
       this._stagingPool = null;
+    }
+
+    /**
+     * Alias for `destroy()` for callers expecting a `dispose()` lifecycle hook.
+     */
+    dispose() {
+      this.destroy();
     }
   }
 
   const exportedApi = Object.freeze({
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     UNIFORM_BUFFER_SIZE,
+    UNIFORM_FLAG_FULL_RANGE,
     DEFAULT_PRESENTATION_FORMAT,
     DEFAULT_TARGET_FPS,
     BINK_PIXEL_FORMAT,
     YUV_COLOR_SPACE,
+    YUV_COLOR_RANGE,
     YUV_MATRICES,
+    YUV_FULL_RANGE_MATRICES,
+    YUV_RANGE_MATRICES,
     TEXTURE_USAGE,
     BUFFER_USAGE,
     SHADER_STAGE,
     BINK_PRESENTER_WGSL,
     alignUp,
+    getYuvMatrix,
+    prepareAlignedPlaneData,
     computeLetterboxViewport,
     packPresenterUniforms,
     BinkVideoPresenter,

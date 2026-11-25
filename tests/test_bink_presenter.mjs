@@ -9,12 +9,18 @@ const stagingMod = require('../web/workers/staging_pool.js');
 const {
   WEBGPU_BYTES_PER_ROW_ALIGNMENT,
   UNIFORM_BUFFER_SIZE,
+  UNIFORM_FLAG_FULL_RANGE,
   BINK_PIXEL_FORMAT,
   YUV_COLOR_SPACE,
+  YUV_COLOR_RANGE,
   YUV_MATRICES,
+  YUV_FULL_RANGE_MATRICES,
+  YUV_RANGE_MATRICES,
   TEXTURE_USAGE,
   BUFFER_USAGE,
   BINK_PRESENTER_WGSL,
+  getYuvMatrix,
+  prepareAlignedPlaneData,
   computeLetterboxViewport,
   packPresenterUniforms,
   BinkVideoPresenter,
@@ -852,4 +858,415 @@ test('destroy() destroys all textures and uniform buffers idempotently and block
     () => presenter.presentFrame(createMockCommandEncoder(), { kind: 'GPUTextureView' }, 640, 360),
     /destroyed/i
   );
+});
+
+test('W115: 5 consecutive YUV420p frames reuse plane textures, bind groups, and scratch buffer', () => {
+  // Single-slot mode: literally 3 plane textures + 1 dummy texture + 1 bind group across 5 frames.
+  const deviceSingle = createMockWebGpuDevice();
+  const presenterSingle = new BinkVideoPresenter({
+    device: deviceSingle,
+    doubleBuffer: false,
+  });
+
+  const width = 64;
+  const height = 36;
+  const uvW = width / 2;
+  const uvH = height / 2;
+  const targetView = { kind: 'GPUTextureView', id: 'swap-yuv-single' };
+
+  for (let i = 0; i < 5; i += 1) {
+    const y = new Uint8Array(width * height).fill((40 + i * 20) & 0xff);
+    const u = new Uint8Array(uvW * uvH).fill(128);
+    const v = new Uint8Array(uvW * uvH).fill(128);
+    presenterSingle.uploadYuv420Frame({ y, u, v, width, height });
+    const res = presenterSingle.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+    assert.equal(res.presented, true);
+    assert.equal(res.framesPresented, i + 1);
+  }
+
+  const singleStats = presenterSingle.getStats();
+  assert.equal(singleStats.framesPresented, 5);
+  assert.equal(singleStats.presentedFrames, 5);
+  assert.equal(singleStats.planeReallocations, 1);
+  assert.equal(singleStats.resizeCount, 0);
+  assert.equal(singleStats.scratchAllocations, 1);
+  assert.equal(singleStats.droppedFrames, 0);
+  assert.equal(singleStats.lastFrameWidth, width);
+  assert.equal(singleStats.lastFrameHeight, height);
+  // 3 plane textures (Y/U/V) + 1 neutral dummy texture = 4 total textures, 1 bind group.
+  assert.equal(deviceSingle.createdTextures.length, 4);
+  assert.equal(deviceSingle.createdBindGroups.length, 1);
+  assert.equal(deviceSingle.createdRenderPipelines.length, 1);
+
+  // Default double-buffered mode: 2 slots warmed once (6 plane + 1 dummy = 7), 2 bind groups, planeReallocations === 1.
+  const deviceDouble = createMockWebGpuDevice();
+  const presenterDouble = new BinkVideoPresenter({ device: deviceDouble });
+
+  for (let i = 0; i < 5; i += 1) {
+    const y = new Uint8Array(width * height).fill((50 + i * 10) & 0xff);
+    const u = new Uint8Array(uvW * uvH).fill(120);
+    const v = new Uint8Array(uvW * uvH).fill(136);
+    presenterDouble.uploadYuv420Frame({ y, u, v, width, height });
+    presenterDouble.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  }
+
+  const doubleStats = presenterDouble.getStats();
+  assert.equal(doubleStats.framesPresented, 5);
+  assert.equal(doubleStats.planeReallocations, 1);
+  assert.equal(doubleStats.scratchAllocations, 1);
+  assert.equal(doubleStats.droppedFrames, 0);
+  assert.equal(doubleStats.lastFrameWidth, width);
+  assert.equal(doubleStats.lastFrameHeight, height);
+  assert.equal(deviceDouble.createdTextures.length, 7);
+  assert.equal(deviceDouble.createdBindGroups.length, 2);
+
+  presenterSingle.destroy();
+  presenterDouble.destroy();
+});
+
+test('W115: 5 consecutive NV12 frames reuse r8unorm Y + rg8unorm UV planes and bind groups, and reallocate on resolution change', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, doubleBuffer: false });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-nv12' };
+
+  assert.equal(BINK_PIXEL_FORMAT.NV12, 'nv12');
+  assert.match(BINK_PRESENTER_WGSL, /uniforms\.mode\s*==\s*3u/);
+
+  const w1 = 48;
+  const h1 = 24;
+  const uvW1 = 24;
+  const uvH1 = 12;
+
+  for (let i = 0; i < 5; i += 1) {
+    const y = new Uint8Array(w1 * h1).fill((30 + i * 15) & 0xff);
+    const uv = new Uint8Array(uvW1 * uvH1 * 2).fill((100 + i) & 0xff);
+    const up =
+      i === 0
+        ? presenter.uploadNv12Frame({ y, uv, width: w1, height: h1 })
+        : presenter.uploadFrame({ format: BINK_PIXEL_FORMAT.NV12, y, uv, width: w1, height: h1 });
+    assert.equal(up.format, BINK_PIXEL_FORMAT.NV12);
+    assert.equal(up.uvWidth, uvW1);
+    assert.equal(up.uvHeight, uvH1);
+    assert.equal(up.yBytesPerRow, 256);
+    assert.equal(up.uvBytesPerRow, 256);
+
+    const res = presenter.presentFrame(createMockCommandEncoder(), targetView, 960, 540);
+    assert.equal(res.presented, true);
+    assert.equal(res.format, BINK_PIXEL_FORMAT.NV12);
+    assert.equal(res.framesPresented, i + 1);
+  }
+
+  // Created once: Y (r8unorm), UV (rg8unorm), plus 1 dummy texture = 3 textures total, 1 bind group.
+  assert.equal(device.createdTextures.length, 3);
+  const oldY = device.createdTextures[0];
+  const oldUv = device.createdTextures[1];
+  const dummyTex = device.createdTextures[2];
+  assert.equal(oldY.desc.format, 'r8unorm');
+  assert.deepEqual(oldY.desc.size, { width: 48, height: 24, depthOrArrayLayers: 1 });
+  assert.equal(oldUv.desc.format, 'rg8unorm');
+  assert.deepEqual(oldUv.desc.size, { width: 24, height: 12, depthOrArrayLayers: 1 });
+
+  // Bindings: 2 = Y, 3 = UV, 4 = dummy, 5 = dummy; uniform mode = 3 (NV12).
+  assert.equal(device.createdBindGroups.length, 1);
+  const bg0Entries = device.createdBindGroups[0].desc.entries;
+  assert.equal(bg0Entries.find((e) => e.binding === 2).resource, oldY.view);
+  assert.equal(bg0Entries.find((e) => e.binding === 3).resource, oldUv.view);
+  assert.equal(bg0Entries.find((e) => e.binding === 4).resource, dummyTex.view);
+  assert.equal(bg0Entries.find((e) => e.binding === 5).resource, dummyTex.view);
+
+  const uniformWrite0 = device.writeBufferCalls[device.writeBufferCalls.length - 1];
+  const u32Mode = new Uint32Array(
+    uniformWrite0.data.buffer,
+    uniformWrite0.data.byteOffset,
+    uniformWrite0.data.byteLength / 4
+  );
+  assert.equal(u32Mode[0], 3);
+
+  let stats = presenter.getStats();
+  assert.equal(stats.framesPresented, 5);
+  assert.equal(stats.planeReallocations, 1);
+  assert.equal(stats.scratchAllocations, 1);
+  assert.equal(stats.lastFrameWidth, w1);
+  assert.equal(stats.lastFrameHeight, h1);
+
+  // Change resolution -> destroys old Y & UV planes, recreates new planes, planeReallocations === 2.
+  const w2 = 96;
+  const h2 = 54;
+  presenter.uploadNv12Frame({
+    y: new Uint8Array(w2 * h2).fill(180),
+    uv: new Uint8Array((w2 / 2) * (h2 / 2) * 2).fill(128),
+    width: w2,
+    height: h2,
+  });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 960, 540);
+
+  assert.equal(oldY.destroyed, true);
+  assert.equal(oldY.destroyCalls, 1);
+  assert.equal(oldUv.destroyed, true);
+  assert.equal(oldUv.destroyCalls, 1);
+  assert.equal(dummyTex.destroyed, false);
+  assert.equal(device.createdTextures.length, 5);
+  assert.equal(device.createdBindGroups.length, 2);
+
+  const newY = device.createdTextures[3];
+  const newUv = device.createdTextures[4];
+  assert.equal(newY.desc.format, 'r8unorm');
+  assert.deepEqual(newY.desc.size, { width: 96, height: 54, depthOrArrayLayers: 1 });
+  assert.equal(newUv.desc.format, 'rg8unorm');
+  assert.deepEqual(newUv.desc.size, { width: 48, height: 27, depthOrArrayLayers: 1 });
+
+  stats = presenter.getStats();
+  assert.equal(stats.framesPresented, 6);
+  assert.equal(stats.planeReallocations, 2);
+  assert.equal(stats.resizeCount, 1);
+  assert.equal(stats.lastFrameWidth, w2);
+  assert.equal(stats.lastFrameHeight, h2);
+
+  // dispose() alias destroys remaining cached planes, dummy texture, and uniform buffer idempotently.
+  presenter.dispose();
+  assert.equal(presenter.isDestroyed, true);
+  assert.equal(newY.destroyed, true);
+  assert.equal(newY.destroyCalls, 1);
+  assert.equal(newUv.destroyed, true);
+  assert.equal(newUv.destroyCalls, 1);
+  assert.equal(dummyTex.destroyed, true);
+  assert.equal(device.createdBuffers[0].destroyed, true);
+  presenter.dispose();
+  assert.equal(newY.destroyCalls, 1);
+  assert.throws(
+    () =>
+      presenter.uploadNv12Frame({
+        y: new Uint8Array(16),
+        uv: new Uint8Array(8),
+        width: 4,
+        height: 4,
+      }),
+    /destroyed/i
+  );
+});
+
+test('W115: BT.709 vs BT.601 and limited vs full color range selection updates conversion uniforms cleanly', () => {
+  assert.equal(YUV_COLOR_RANGE.LIMITED, 'limited');
+  assert.equal(YUV_COLOR_RANGE.FULL, 'full');
+  assert.ok(Object.isFrozen(YUV_COLOR_RANGE));
+  assert.ok(Object.isFrozen(YUV_FULL_RANGE_MATRICES));
+  assert.ok(Object.isFrozen(YUV_RANGE_MATRICES));
+
+  // Verify getYuvMatrix and packPresenterUniforms for all 4 combinations.
+  const bt709Lim = getYuvMatrix(YUV_COLOR_SPACE.BT709, YUV_COLOR_RANGE.LIMITED);
+  const bt709Full = getYuvMatrix(YUV_COLOR_SPACE.BT709, YUV_COLOR_RANGE.FULL);
+  const bt601Lim = getYuvMatrix(YUV_COLOR_SPACE.BT601, YUV_COLOR_RANGE.LIMITED);
+  const bt601Full = getYuvMatrix(YUV_COLOR_SPACE.BT601, YUV_COLOR_RANGE.FULL);
+
+  assertNear(bt709Lim.row0[0], 1.16438356, 1e-6);
+  assertNear(bt709Full.row0[0], 1.0, 1e-6);
+  assertNear(bt709Full.row0[2], 1.5748, 1e-6);
+  assertNear(bt601Full.row0[2], 1.402, 1e-6);
+  assertNear(bt709Lim.offset[0], 16 / 255, 1e-6);
+  assertNear(bt709Full.offset[0], 0, 1e-6);
+  assertNear(bt601Full.offset[1], 128 / 255, 1e-6);
+
+  const packedFull = packPresenterUniforms({
+    pixelFormat: BINK_PIXEL_FORMAT.NV12,
+    colorSpace: YUV_COLOR_SPACE.BT601,
+    colorRange: YUV_COLOR_RANGE.FULL,
+  });
+  const u32Full = new Uint32Array(packedFull.buffer);
+  const f32Full = new Float32Array(packedFull.buffer);
+  assert.equal(u32Full[0], 3); // NV12
+  assert.equal(u32Full[1], 1); // BT601
+  assert.equal(u32Full[3] & UNIFORM_FLAG_FULL_RANGE, UNIFORM_FLAG_FULL_RANGE);
+  assertNear(f32Full[8], 1.0, 1e-5);
+  assertNear(f32Full[10], 1.402, 1e-5);
+  assertNear(f32Full[20], 0, 1e-5);
+
+  // Verify presenter defaults, constructor options, and setColorSpace(space, range).
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    colorSpace: YUV_COLOR_SPACE.BT709,
+    colorRange: YUV_COLOR_RANGE.LIMITED,
+  });
+  assert.equal(presenter.colorSpace, 'bt709');
+  assert.equal(presenter.colorRange, 'limited');
+  assert.equal(presenter.getStats().colorSpace, 'bt709');
+  assert.equal(presenter.getStats().colorRange, 'limited');
+
+  const y = new Uint8Array(16 * 8).fill(200);
+  const uv = new Uint8Array(8 * 4 * 2).fill(128);
+  const targetView = { kind: 'GPUTextureView', id: 'swap-cs' };
+
+  presenter.uploadNv12Frame({ y, uv, width: 16, height: 8 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  const writesBefore = device.writeBufferCalls.length;
+
+  // Switching to BT.601 + full range via setColorSpace(space, range) marks uniforms dirty and updates GPU buffer.
+  presenter.setColorSpace(YUV_COLOR_SPACE.BT601, YUV_COLOR_RANGE.FULL);
+  assert.equal(presenter.colorSpace, 'bt601');
+  assert.equal(presenter.colorRange, 'full');
+  assert.equal(presenter.getStats().colorSpace, 'bt601');
+  assert.equal(presenter.getStats().colorRange, 'full');
+
+  const presRes = presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(presRes.colorSpace, 'bt601');
+  assert.equal(presRes.colorRange, 'full');
+  assert.equal(device.writeBufferCalls.length, writesBefore + 1);
+
+  const latestUniform = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const latestU32 = new Uint32Array(
+    latestUniform.buffer,
+    latestUniform.byteOffset,
+    latestUniform.byteLength / 4
+  );
+  const latestF32 = new Float32Array(
+    latestUniform.buffer,
+    latestUniform.byteOffset,
+    latestUniform.byteLength / 4
+  );
+  assert.equal(latestU32[1], 1); // BT601
+  assert.equal(latestU32[3] & UNIFORM_FLAG_FULL_RANGE, UNIFORM_FLAG_FULL_RANGE);
+  assertNear(latestF32[8], bt601Full.row0[0], 1e-5);
+  assertNear(latestF32[10], bt601Full.row0[2], 1e-5);
+  assertNear(latestF32[20], 0, 1e-5);
+
+  // Switch back to limited range via setColorRange('limited') and BT.709 via setColorSpace('bt709').
+  presenter.setColorRange(YUV_COLOR_RANGE.LIMITED);
+  presenter.setColorSpace(YUV_COLOR_SPACE.BT709);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  const backUniform = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const backU32 = new Uint32Array(
+    backUniform.buffer,
+    backUniform.byteOffset,
+    backUniform.byteLength / 4
+  );
+  const backF32 = new Float32Array(
+    backUniform.buffer,
+    backUniform.byteOffset,
+    backUniform.byteLength / 4
+  );
+  assert.equal(backU32[1], 0); // BT709
+  assert.equal(backU32[3] & UNIFORM_FLAG_FULL_RANGE, 0);
+  assertNear(backF32[8], bt709Lim.row0[0], 1e-5);
+  assertNear(backF32[20], 16 / 255, 1e-5);
+
+  // Invalid colorSpace / colorRange reject clearly.
+  assert.throws(() => presenter.setColorSpace('bt2020'), RangeError);
+  assert.throws(() => presenter.setColorSpace('bt709', 'studio'), RangeError);
+  assert.throws(() => presenter.setColorRange('narrow'), RangeError);
+  assert.throws(() => new BinkVideoPresenter({ device, colorRange: 'invalid' }), RangeError);
+
+  presenter.destroy();
+});
+
+test('W115: odd / non-256-aligned widths pad rows cleanly with reusable scratch buffer and zero tail bleed', () => {
+  // Direct helper test with pre-dirtied scratch buffer.
+  const dirtyScratch = new Uint8Array(256 * 10).fill(0xfe);
+  const oddSrc = new Uint8Array(19 * 5).map((_, i) => ((i * 7 + 3) & 0xff) || 1);
+  const aligned = prepareAlignedPlaneData(oddSrc, 19, 5, 19, 'odd-plane', dirtyScratch);
+  assert.equal(aligned.bytesPerRow, 256);
+  assert.equal(aligned.totalBytes, 256 * 5);
+  assert.equal(aligned.padded, true);
+  assert.equal(aligned.usesScratch, true);
+  assert.equal(aligned.data.buffer, dirtyScratch.buffer);
+
+  for (let row = 0; row < 5; row += 1) {
+    const dstStart = row * 256;
+    assert.deepEqual(
+      aligned.data.subarray(dstStart, dstStart + 19),
+      oddSrc.subarray(row * 19, row * 19 + 19)
+    );
+    // Every padding byte must be cleanly zeroed even though dirtyScratch was filled with 0xfe.
+    for (let p = 19; p < 256; p += 1) {
+      assert.equal(aligned.data[dstStart + p], 0, `row ${row} pad byte ${p} not zeroed`);
+    }
+  }
+
+  // End-to-end NV12 odd dimensions: 19x7 -> Y=19x7 (stride 23), UV=10x4 (tightRow=20, stride 24).
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, doubleBuffer: false });
+
+  const width = 19;
+  const height = 7;
+  const uvW = 10;
+  const uvH = 4;
+  const yStride = 23;
+  const uvStride = 24;
+
+  const y = new Uint8Array(yStride * height).fill(0xdd);
+  for (let row = 0; row < height; row += 1) {
+    for (let col = 0; col < width; col += 1) {
+      y[row * yStride + col] = ((row * 31 + col + 1) & 0xff) || 1;
+    }
+  }
+
+  const uv = new Uint8Array(uvStride * uvH).fill(0xcc);
+  for (let row = 0; row < uvH; row += 1) {
+    for (let col = 0; col < uvW * 2; col += 1) {
+      uv[row * uvStride + col] = ((row * 41 + col + 5) & 0xff) || 2;
+    }
+  }
+
+  presenter.uploadNv12Frame({ y, uv, width, height, yStride, uvStride });
+  presenter.uploadNv12Frame({ y, uv, width, height, yStride, uvStride });
+
+  // Scratch buffer allocated ONCE across both Y & UV planes and both frames!
+  assert.equal(presenter.getStats().scratchAllocations, 1);
+  assert.equal(device.writeTextureCalls.length, 4);
+
+  const yCall = device.writeTextureCalls[2];
+  const uvCall = device.writeTextureCalls[3];
+  assert.equal(yCall.dataLayout.bytesPerRow, 256);
+  assert.equal(uvCall.dataLayout.bytesPerRow, 256);
+
+  for (let row = 0; row < height; row += 1) {
+    assert.deepEqual(
+      yCall.data.subarray(row * 256, row * 256 + width),
+      y.subarray(row * yStride, row * yStride + width)
+    );
+    assert.equal(yCall.data[row * 256 + width], 0);
+  }
+  for (let row = 0; row < uvH; row += 1) {
+    assert.deepEqual(
+      uvCall.data.subarray(row * 256, row * 256 + uvW * 2),
+      uv.subarray(row * uvStride, row * uvStride + uvW * 2)
+    );
+    assert.equal(uvCall.data[row * 256 + uvW * 2], 0);
+  }
+
+  presenter.destroy();
+});
+
+test('W115: droppedFrames tracks frame-pacing hitches and overwritten unpresented frames', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, targetFps: 30 });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-drop' };
+
+  assert.equal(presenter.getStats().droppedFrames, 0);
+
+  // Normal pacing does not drop frames.
+  assert.equal(presenter.shouldAdvance(0), true);
+  assert.equal(presenter.shouldAdvance(34), true);
+  assert.equal(presenter.getStats().droppedFrames, 0);
+
+  // 100ms jump at 30fps (33.33ms interval) misses 2 frame intervals -> droppedFrames += 2.
+  assert.equal(presenter.shouldAdvance(134), true);
+  assert.equal(presenter.getStats().droppedFrames, 2);
+
+  // Uploading two frames without presenting the first supersedes 1 frame -> droppedFrames += 1.
+  const rgba = new Uint8Array(8 * 4 * 4).fill(255);
+  presenter.uploadRgbaFrame(rgba, 8, 4);
+  assert.equal(presenter.getStats().droppedFrames, 2);
+  presenter.uploadRgbaFrame(rgba, 8, 4);
+  assert.equal(presenter.getStats().droppedFrames, 3);
+
+  // Presenting clears the unpresented flag, so the next upload does not drop.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 320, 180);
+  presenter.uploadRgbaFrame(rgba, 8, 4);
+  assert.equal(presenter.getStats().droppedFrames, 3);
+
+  // Explicit driver drop recording also increments droppedFrames.
+  presenter.recordDroppedFrame(2);
+  assert.equal(presenter.getStats().droppedFrames, 5);
+
+  presenter.destroy();
 });
