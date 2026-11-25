@@ -11,6 +11,7 @@ import {
   INDIRECT_DISPATCH_MODE,
   DEFAULT_MAX_VALIDATION_ERRORS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
+  MAX_GPU_ADAPTER_LABEL_LENGTH,
   DEFAULT_TOGGLE_KEY,
   DEFAULT_MIN_RENDER_INTERVAL_MS,
   normalizeBootMode,
@@ -18,12 +19,18 @@ import {
   normalizeIndirectDispatchMode,
   sanitizeValidationErrorMessage,
   sanitizeScriptedInputPreset,
+  sanitizeGpuAdapterLabel,
   parseSideModuleProgressLabel,
   formatFpsDisplay,
   formatOnePercentLowFps,
   formatP99FrameMs,
   formatZeroCopyUploads,
   formatPerfMetricsSummary,
+  formatGpuAdapter,
+  formatBlackLoadingMs,
+  formatFirstVisibleFrameMs,
+  formatLoadingStatus,
+  formatGuestAudioStatus,
   setTextIfChanged,
 } from '../web/ui/hud_controller.js';
 import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
@@ -3610,5 +3617,514 @@ test('W210: formats onePercentLowFps, p99FrameMs, and zeroCopyUploads across tel
   assert.equal(p99FrameMsEl.textContent, '--');
   assert.equal(zeroCopyUploadsEl.textContent, '--');
 
+  controller.destroy();
+});
+
+// --- W237: Sanitized gpuAdapter, blackLoadingMs / loadingAssets, and Guest Audio PCM Ring Status ---
+
+test('W237: sanitizeGpuAdapterLabel and setGpuAdapter sanitize lowercase vendor/arch labels, cap at 96 chars, strip host paths/HTML/secrets, and update DOM + snapshots', () => {
+  assert.equal(MAX_GPU_ADAPTER_LABEL_LENGTH, 96);
+
+  // Direct sanitizer checks.
+  assert.equal(sanitizeGpuAdapterLabel('NVIDIA / Turing'), 'nvidia / turing');
+  assert.equal(sanitizeGpuAdapterLabel('  Intel / Gen-12LP  '), 'intel / gen-12lp');
+  assert.equal(sanitizeGpuAdapterLabel('AMD/RDNA 2 (GFX10.3)'), 'amd / rdna 2 (gfx10.3)');
+  assert.equal(
+    sanitizeGpuAdapterLabel({ vendor: 'NVIDIA', architecture: 'Turing' }),
+    'nvidia / turing'
+  );
+  assert.equal(
+    sanitizeGpuAdapterLabel({ info: { vendor: 'Apple', architecture: 'Metal-3' } }),
+    'apple / metal-3'
+  );
+  assert.equal(
+    sanitizeGpuAdapterLabel({ vendor: 'Intel', architecture: 'intel' }),
+    'intel'
+  );
+  assert.equal(
+    sanitizeGpuAdapterLabel({ description: 'Qualcomm Adreno 740' }),
+    'qualcomm adreno 740'
+  );
+
+  // Max length 96 enforcement.
+  const longInput = `nvidia / ${'x'.repeat(140)}`;
+  const capped = sanitizeGpuAdapterLabel(longInput);
+  assert.equal(capped.length, 96);
+  assert.equal(capped.startsWith('nvidia / x'), true);
+  assert.equal(sanitizeGpuAdapterLabel('nvidia / turing', 6), 'nvidia');
+
+  // Host paths, file URLs, secrets, query strings, HTML/scripts, and control chars are stripped.
+  assert.equal(sanitizeGpuAdapterLabel('C:\\Users\\secretuser\\GTA6\\nvgpu.dll'), null);
+  assert.equal(sanitizeGpuAdapterLabel('\\\\fileserver\\share\\driver.dll'), null);
+  assert.equal(sanitizeGpuAdapterLabel('/home/secretuser/mesa/radeonsi_dri.so'), null);
+  assert.equal(sanitizeGpuAdapterLabel('/opt/drivers/vulkan/icd.json'), null);
+  assert.equal(sanitizeGpuAdapterLabel('file:///Users/bob/gpu/driver.so'), null);
+  assert.equal(sanitizeGpuAdapterLabel('<script>alert(1)</script>'), null);
+  assert.equal(
+    sanitizeGpuAdapterLabel('NVIDIA / Turing (/home/secretuser/libvulkan.so)'),
+    'nvidia / turing'
+  );
+  assert.equal(
+    sanitizeGpuAdapterLabel('NVIDIA / Turing?token=supersecret123'),
+    'nvidia / turing'
+  );
+  assert.equal(sanitizeGpuAdapterLabel('NVIDIA\n\t / \x00Turing'), 'nvidia / turing');
+
+  // Empty or non-string/non-object values return null.
+  assert.equal(sanitizeGpuAdapterLabel(null), null);
+  assert.equal(sanitizeGpuAdapterLabel(undefined), null);
+  assert.equal(sanitizeGpuAdapterLabel(''), null);
+  assert.equal(sanitizeGpuAdapterLabel('   '), null);
+  assert.equal(sanitizeGpuAdapterLabel(42), null);
+  assert.equal(sanitizeGpuAdapterLabel(true), null);
+  assert.equal(sanitizeGpuAdapterLabel(Symbol('gpu')), null);
+  assert.equal(sanitizeGpuAdapterLabel([]), null);
+
+  assert.equal(formatGpuAdapter('NVIDIA / Turing'), 'GPU: nvidia / turing');
+  assert.equal(formatGpuAdapter('C:\\Users\\alice\\gpu.dll'), '');
+  assert.equal(formatGpuAdapter(null), '');
+
+  // Integrated HudController DOM & snapshot tests.
+  const gpuAdapterEl = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: { gpuAdapterEl, bootStatusEl },
+  });
+
+  // Initial state: null adapter, clean bootStatusEl without GPU clutter.
+  assert.equal(controller.getGpuAdapter(), null);
+  assert.equal(controller.getSnapshot().gpuAdapter, null);
+  assert.equal(controller.getBootStatus().gpuAdapter, null);
+  assert.equal(controller.getTelemetry().gpu.gpuAdapter, null);
+  assert.equal(controller.getTelemetry().gpu.gpuAdapterText, '');
+  assert.equal(gpuAdapterEl.textContent, '--');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+
+  // setGpuAdapter updates state, snapshot, bootStatus, and DOM cleanly.
+  const setRes = controller.setGpuAdapter('NVIDIA / Turing');
+  assert.equal(setRes, 'nvidia / turing');
+  assert.equal(controller.getGpuAdapter(), 'nvidia / turing');
+  assert.equal(controller.getSnapshot().gpuAdapter, 'nvidia / turing');
+  assert.equal(controller.getBootStatus().gpuAdapter, 'nvidia / turing');
+  assert.equal(controller.getTelemetry().gpu.gpuAdapter, 'nvidia / turing');
+  assert.equal(controller.getTelemetry().gpu.gpuAdapterText, 'GPU: nvidia / turing');
+  assert.equal(gpuAdapterEl.textContent, 'nvidia / turing');
+  assert.equal(gpuAdapterEl.dataset.gpuAdapter, 'nvidia / turing');
+  assert.equal(gpuAdapterEl.dataset.state, 'ok');
+  assert.equal(gpuAdapterEl.title, 'GPU: nvidia / turing');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — GPU: nvidia / turing');
+
+  // Dirty-check elides redundant DOM writes when setting identical adapter label.
+  const textWritesBefore = gpuAdapterEl.counts.textWrites;
+  controller.setGpuAdapter('  nvidia / TURING  ');
+  assert.equal(gpuAdapterEl.counts.textWrites, textWritesBefore);
+
+  // updateTelemetry({ gpuAdapter }) & nested updateTelemetry({ gpu: { gpu_adapter } }) work.
+  controller.updateTelemetry({ gpuAdapter: 'Intel / Gen-12LP' });
+  assert.equal(controller.getGpuAdapter(), 'intel / gen-12lp');
+  assert.equal(gpuAdapterEl.textContent, 'intel / gen-12lp');
+  assert.equal(controller.getSnapshot().gpuAdapter, 'intel / gen-12lp');
+
+  controller.updateTelemetry({ gpu: { gpu_adapter: 'AMD / RDNA 2' } });
+  assert.equal(controller.getGpuAdapter(), 'amd / rdna 2');
+  assert.equal(gpuAdapterEl.textContent, 'amd / rdna 2');
+
+  // Hostile path update sanitizes to null and never leaks into DOM or serialized snapshot.
+  controller.updateTelemetry({ gpuAdapter: 'C:\\Users\\secretuser\\GTA6\\driver.dll' });
+  assert.equal(controller.getGpuAdapter(), null);
+  assert.equal(gpuAdapterEl.textContent, '--');
+  assert.equal(gpuAdapterEl.dataset.gpuAdapter, undefined);
+  assert.doesNotMatch(JSON.stringify(controller.getSnapshot()), /secretuser|driver\.dll/i);
+
+  // Constructor gpuAdapter option initializes sanitized adapter label.
+  const withInitialAdapter = new HudController({
+    gpuAdapter: 'NVIDIA / Ampere',
+    displayElements: { gpuAdapterBadgeEl: createSpyDisplayElement() },
+  });
+  assert.equal(withInitialAdapter.getGpuAdapter(), 'nvidia / ampere');
+  assert.equal(withInitialAdapter.getSnapshot().gpuAdapter, 'nvidia / ampere');
+  withInitialAdapter.destroy();
+
+  // After destroy(), setGpuAdapter safely no-ops.
+  controller.setGpuAdapter('nvidia / turing');
+  controller.destroy();
+  assert.equal(controller.setGpuAdapter('intel / arc'), 'nvidia / turing');
+  assert.equal(controller.getGpuAdapter(), 'nvidia / turing');
+});
+
+test('W237: blackLoadingMs, firstVisibleFrameMs, and loadingAssets indicator track transitions, format cleanly, sanitize hostile inputs, and render DOM badges', () => {
+  // Direct formatter checks.
+  assert.equal(formatBlackLoadingMs(450), 'Black loading: 450ms');
+  assert.equal(formatBlackLoadingMs(2450), 'Black loading: 2.5s');
+  assert.equal(formatBlackLoadingMs(0), 'Black loading: 0ms');
+  assert.equal(formatBlackLoadingMs(null), '');
+  assert.equal(formatBlackLoadingMs(-100), '');
+  assert.equal(formatBlackLoadingMs(Number.NaN), '');
+
+  assert.equal(formatFirstVisibleFrameMs(850), 'First visible frame: 850ms');
+  assert.equal(formatFirstVisibleFrameMs(4120), 'First visible frame: 4.1s');
+  assert.equal(formatFirstVisibleFrameMs(null), '');
+  assert.equal(formatFirstVisibleFrameMs(-1), '');
+
+  assert.equal(
+    formatLoadingStatus({ loadingAssets: true, blackLoadingMs: 2450, firstVisibleFrameMs: null }),
+    'Loading assets (2.5s)'
+  );
+  assert.equal(
+    formatLoadingStatus({ loadingAssets: true, blackLoadingMs: null, firstVisibleFrameMs: null }),
+    'Loading assets'
+  );
+  assert.equal(
+    formatLoadingStatus({ loadingAssets: false, blackLoadingMs: 2450, firstVisibleFrameMs: 4120 }),
+    'First visible frame: 4.1s'
+  );
+  assert.equal(
+    formatLoadingStatus({ loadingAssets: false, blackLoadingMs: 1200, firstVisibleFrameMs: null }),
+    'Black loading: 1.2s'
+  );
+  assert.equal(
+    formatLoadingStatus({ loadingAssets: false, blackLoadingMs: null, firstVisibleFrameMs: null }),
+    ''
+  );
+  assert.equal(formatLoadingStatus(null), '');
+
+  const loadingAssetsBadgeEl = createSpyDisplayElement({ hidden: true });
+  const firstVisibleFrameEl = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: {
+      loadingAssetsBadgeEl,
+      firstVisibleFrameEl,
+      bootStatusEl,
+    },
+  });
+
+  // Initial defaults are unset and badge stays hidden without cluttering bootStatusEl.
+  const initSnap = controller.getSnapshot();
+  assert.equal(initSnap.blackLoadingMs, null);
+  assert.equal(initSnap.firstVisibleFrameMs, null);
+  assert.equal(initSnap.loadingAssets, false);
+  assert.equal(loadingAssetsBadgeEl.hidden, true);
+  assert.equal(loadingAssetsBadgeEl.getAttribute('aria-hidden'), 'true');
+  assert.equal(firstVisibleFrameEl.textContent, '--');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+
+  // 1. Active black-loading / loading-assets phase.
+  controller.updateTelemetry({
+    loadingAssets: true,
+    blackLoadingMs: 2450,
+  });
+  const loadingSnap = controller.getSnapshot();
+  assert.equal(loadingSnap.loadingAssets, true);
+  assert.equal(loadingSnap.blackLoadingMs, 2450);
+  assert.equal(loadingSnap.firstVisibleFrameMs, null);
+  assert.equal(loadingSnap.telemetry.gpu.loadingAssets, true);
+  assert.equal(loadingSnap.telemetry.gpu.blackLoadingMs, 2450);
+  assert.equal(loadingSnap.telemetry.gpu.loadingStatusText, 'Loading assets (2.5s)');
+  assert.equal(loadingAssetsBadgeEl.hidden, false);
+  assert.equal(loadingAssetsBadgeEl.getAttribute('aria-hidden'), 'false');
+  assert.equal(loadingAssetsBadgeEl.textContent, 'Loading assets (2.5s)');
+  assert.equal(loadingAssetsBadgeEl.dataset.loadingAssets, 'true');
+  assert.equal(loadingAssetsBadgeEl.dataset.blackLoadingMs, '2450');
+  assert.equal(loadingAssetsBadgeEl.dataset.state, 'info');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — Loading assets (2.5s)');
+
+  // 2. First visible frame arrives -> automatically clears loadingAssets and shows first visible frame duration.
+  controller.updateTelemetry({
+    firstVisibleFrameMs: 4100,
+  });
+  const visibleSnap = controller.getSnapshot();
+  assert.equal(visibleSnap.loadingAssets, false);
+  assert.equal(visibleSnap.blackLoadingMs, 2450);
+  assert.equal(visibleSnap.firstVisibleFrameMs, 4100);
+  assert.equal(visibleSnap.bootStatus.firstVisibleFrameMs, 4100);
+  assert.equal(visibleSnap.bootStatus.loadingAssets, false);
+  assert.equal(loadingAssetsBadgeEl.hidden, false);
+  assert.equal(loadingAssetsBadgeEl.textContent, 'First visible frame: 4.1s');
+  assert.equal(loadingAssetsBadgeEl.dataset.loadingAssets, 'false');
+  assert.equal(loadingAssetsBadgeEl.dataset.firstVisibleFrameMs, '4100');
+  assert.equal(loadingAssetsBadgeEl.dataset.state, 'ok');
+  assert.equal(firstVisibleFrameEl.textContent, 'First visible frame: 4.1s');
+  assert.equal(firstVisibleFrameEl.dataset.firstVisibleFrameMs, '4100');
+  assert.equal(firstVisibleFrameEl.dataset.state, 'ok');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — First visible frame: 4.1s');
+
+  // 3. Snake-case aliases & onSplashFramePresented support.
+  controller.updateTelemetry({
+    loading_assets: true,
+    black_loading_ms: 900,
+    first_visible_frame_ms: null,
+  });
+  assert.equal(controller.getSnapshot().loadingAssets, true);
+  assert.equal(controller.getSnapshot().blackLoadingMs, 900);
+  assert.equal(controller.getSnapshot().firstVisibleFrameMs, null);
+  assert.equal(loadingAssetsBadgeEl.textContent, 'Loading assets (900ms)');
+
+  controller.onSplashFramePresented({
+    ok: true,
+    framesPresented: 1,
+    firstVisibleFrameMs: 1250,
+  });
+  assert.equal(controller.getSnapshot().loadingAssets, false);
+  assert.equal(controller.getSnapshot().firstVisibleFrameMs, 1250);
+  assert.equal(firstVisibleFrameEl.textContent, 'First visible frame: 1.3s');
+
+  // 4. Hostile inputs sanitize safely to null / false without throwing or leaking.
+  assert.doesNotThrow(() => {
+    controller.updateTelemetry({
+      blackLoadingMs: -999,
+      firstVisibleFrameMs: Number.POSITIVE_INFINITY,
+      loadingAssets: 'C:\\Users\\secretuser\\assets.rpf',
+    });
+  });
+  const hostileSnap = controller.getSnapshot();
+  assert.equal(hostileSnap.blackLoadingMs, null);
+  assert.equal(hostileSnap.firstVisibleFrameMs, null);
+  assert.equal(hostileSnap.loadingAssets, false);
+  assert.equal(loadingAssetsBadgeEl.hidden, true);
+  assert.equal(firstVisibleFrameEl.textContent, '--');
+  assert.doesNotMatch(JSON.stringify(hostileSnap), /secretuser|assets\.rpf/i);
+
+  // 5. resetTelemetry clears loading indicators cleanly.
+  controller.updateTelemetry({ loadingAssets: true, blackLoadingMs: 5000, firstVisibleFrameMs: 6000 });
+  controller.resetTelemetry();
+  assert.equal(controller.getSnapshot().loadingAssets, false);
+  assert.equal(controller.getSnapshot().blackLoadingMs, null);
+  assert.equal(controller.getSnapshot().firstVisibleFrameMs, null);
+  assert.equal(loadingAssetsBadgeEl.hidden, true);
+  assert.equal(firstVisibleFrameEl.textContent, '--');
+
+  controller.destroy();
+});
+
+test('W237: guest audio PCM ring counters update via updateAudioStats and updateTelemetry, sanitize hostile values, render DOM, and reset on restartSession', async () => {
+  // Direct formatter checks.
+  assert.equal(
+    formatGuestAudioStatus({
+      guestRingAttached: true,
+      guestFramesDrained: 4800,
+      guestUnderruns: 1,
+      guestPeakLevel: 0.42,
+    }),
+    'Guest PCM: attached (4800 drained, 1 underrun, peak 42%)'
+  );
+  assert.equal(
+    formatGuestAudioStatus({
+      guestRingAttached: true,
+      guestFramesDrained: 9600,
+      guestUnderruns: 3,
+      guestPeakLevel: 1.5, // clamps to 100%
+    }),
+    'Guest PCM: attached (9600 drained, 3 underruns, peak 100%)'
+  );
+  assert.equal(
+    formatGuestAudioStatus({
+      guestRingAttached: false,
+      guestFramesDrained: 0,
+      guestUnderruns: 0,
+      guestPeakLevel: 0,
+    }),
+    'Guest PCM: detached'
+  );
+  assert.equal(formatGuestAudioStatus(null), '');
+
+  const audioStatusEl = createSpyDisplayElement();
+  const guestAudioStatusEl = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+  const hudRootEl = createSpyDisplayElement();
+  const keyTarget = createMockElement();
+
+  const sessionController = new RuntimeSessionController({
+    capabilityProbe: async () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    startWasmRuntime: async () => ({ stop() {} }),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const controller = new HudController({
+    hud: createMockHud(),
+    sessionController,
+    bootMode: 'real-wasm64',
+    enableToggleShortcut: true,
+    toggleShortcutTarget: keyTarget,
+    displayElements: {
+      hudRootEl,
+      audioStatusEl,
+      guestAudioStatusEl,
+      bootStatusEl,
+    },
+  });
+
+  // Initial defaults: detached, zeroed counters, no status clutter.
+  const initSnap = controller.getSnapshot();
+  assert.equal(initSnap.guestRingAttached, false);
+  assert.equal(initSnap.guestFramesDrained, 0);
+  assert.equal(initSnap.guestUnderruns, 0);
+  assert.equal(initSnap.guestPeakLevel, 0);
+  assert.equal(initSnap.telemetry.audio.guestRingAttached, false);
+  assert.equal(initSnap.telemetry.audio.guestFramesDrained, 0);
+  assert.equal(initSnap.telemetry.audio.guestUnderruns, 0);
+  assert.equal(initSnap.telemetry.audio.guestPeakLevel, 0);
+  assert.equal(initSnap.telemetry.audio.guestStatusText, '');
+  assert.equal(guestAudioStatusEl.textContent, '--');
+
+  // 1. Update via updateAudioStats with host + guest PCM ring counters.
+  const audioRes = controller.updateAudioStats({
+    outputState: 'active',
+    framesDrained: 9600,
+    underruns: 0,
+    overruns: 0,
+    guestRingAttached: true,
+    guestFramesDrained: 4800,
+    guestUnderruns: 1,
+    guestPeakLevel: 0.42,
+  });
+  assert.equal(audioRes.outputState, 'active');
+  assert.equal(audioRes.guestRingAttached, true);
+  assert.equal(audioRes.guestFramesDrained, 4800);
+  assert.equal(audioRes.guestUnderruns, 1);
+  assert.equal(audioRes.guestPeakLevel, 0.42);
+  assert.equal(
+    audioRes.guestStatusText,
+    'Guest PCM: attached (4800 drained, 1 underrun, peak 42%)'
+  );
+  assert.equal(
+    audioRes.statusText,
+    'Audio: active (9600 drained) · Guest PCM: attached (4800 drained, 1 underrun, peak 42%)'
+  );
+
+  const snap1 = controller.getSnapshot();
+  assert.equal(snap1.guestRingAttached, true);
+  assert.equal(snap1.guestFramesDrained, 4800);
+  assert.equal(snap1.guestUnderruns, 1);
+  assert.equal(snap1.guestPeakLevel, 0.42);
+  assert.equal(snap1.bootStatus.guestRingAttached, true);
+  assert.equal(snap1.bootStatus.guestFramesDrained, 4800);
+  assert.equal(snap1.bootStatus.guestUnderruns, 1);
+  assert.equal(snap1.bootStatus.guestPeakLevel, 0.42);
+  assert.equal(
+    audioStatusEl.textContent,
+    'Audio: active (9600 drained) · Guest PCM: attached (4800 drained, 1 underrun, peak 42%)'
+  );
+  assert.equal(audioStatusEl.dataset.guestRingAttached, 'true');
+  assert.equal(audioStatusEl.dataset.guestFramesDrained, '4800');
+  assert.equal(audioStatusEl.dataset.guestUnderruns, '1');
+  assert.equal(audioStatusEl.dataset.guestPeakLevel, '0.42');
+  assert.equal(
+    guestAudioStatusEl.textContent,
+    'Guest PCM: attached (4800 drained, 1 underrun, peak 42%)'
+  );
+  assert.equal(guestAudioStatusEl.dataset.state, 'warn');
+  assert.match(bootStatusEl.textContent, /Guest PCM: attached \(4800 drained, 1 underrun, peak 42%\)/);
+
+  // 2. Update via unified updateTelemetry (top-level fields + snake_case + hybrid audio wrapper).
+  controller.updateTelemetry({
+    guest_ring_attached: true,
+    guest_frames_drained: 19200n,
+    guest_underruns: 0,
+    guest_peak_level: 0.75,
+  });
+  const snap2 = controller.getSnapshot();
+  assert.equal(snap2.guestRingAttached, true);
+  assert.equal(snap2.guestFramesDrained, 19200);
+  assert.equal(snap2.guestUnderruns, 0);
+  assert.equal(snap2.guestPeakLevel, 0.75);
+  assert.equal(guestAudioStatusEl.dataset.state, 'ok');
+  assert.equal(
+    guestAudioStatusEl.textContent,
+    'Guest PCM: attached (19200 drained, peak 75%)'
+  );
+
+  controller.updateTelemetry({
+    audio: { outputState: 'headless-drain' },
+    guestRingAttached: true,
+    guestFramesDrained: 24000,
+    guestPeakLevel: 1.8, // clamped to 1
+  });
+  assert.equal(controller.getTelemetry().audio.outputState, 'headless-drain');
+  assert.equal(controller.getSnapshot().guestFramesDrained, 24000);
+  assert.equal(controller.getSnapshot().guestPeakLevel, 1);
+
+  // 3. Hostile / invalid inputs sanitize safely without throwing or leaking.
+  assert.doesNotThrow(() => {
+    controller.updateAudioStats({
+      guestRingAttached: 'C:\\Users\\secretuser\\audio.awc',
+      guestFramesDrained: -5000,
+      guestUnderruns: Number.NaN,
+      guestPeakLevel: -0.5,
+      get evil() {
+        throw new Error('getter boom');
+      },
+    });
+  });
+  const hostileAudioSnap = controller.getSnapshot();
+  assert.equal(hostileAudioSnap.guestRingAttached, false);
+  assert.equal(hostileAudioSnap.guestFramesDrained, 0);
+  assert.equal(hostileAudioSnap.guestUnderruns, 0);
+  assert.equal(hostileAudioSnap.guestPeakLevel, 0);
+  assert.doesNotMatch(JSON.stringify(hostileAudioSnap), /secretuser|audio\.awc/i);
+
+  // Non-finite peak level sanitizes to 0.
+  controller.updateAudioStats({ guestPeakLevel: Number.POSITIVE_INFINITY });
+  assert.equal(controller.getSnapshot().guestPeakLevel, 0);
+
+  // 4. Existing F3 toggle and exact getState() control shape remain 100% intact.
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    target: { tagName: 'BODY' },
+    preventDefault() {},
+  });
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    target: { tagName: 'BODY' },
+    preventDefault() {},
+  });
+  assert.equal(controller.isVisible(), true);
+  assert.deepEqual(Object.keys(controller.getState()).sort(), [
+    'activeProfileId',
+    'boundControlCount',
+    'destroyed',
+    'isRecording',
+    'lastAction',
+    'sessionMode',
+    'sessionState',
+  ]);
+
+  // 5. restartSession resets gpuAdapter, blackLoadingMs, firstVisibleFrameMs, loadingAssets, and guest audio ring counters.
+  controller.updateTelemetry({
+    gpuAdapter: 'nvidia / turing',
+    loadingAssets: true,
+    blackLoadingMs: 3200,
+    firstVisibleFrameMs: 4500,
+    audio: {
+      outputState: 'active',
+      guestRingAttached: true,
+      guestFramesDrained: 12000,
+      guestUnderruns: 2,
+      guestPeakLevel: 0.6,
+    },
+  });
+  const restartRes = await controller.restartSession({ preferSmoke: false });
+  assert.equal(restartRes.ok, true);
+  const afterRestart = controller.getSnapshot();
+  assert.equal(afterRestart.gpuAdapter, null);
+  assert.equal(afterRestart.blackLoadingMs, null);
+  assert.equal(afterRestart.firstVisibleFrameMs, null);
+  assert.equal(afterRestart.loadingAssets, false);
+  assert.equal(afterRestart.guestRingAttached, false);
+  assert.equal(afterRestart.guestFramesDrained, 0);
+  assert.equal(afterRestart.guestUnderruns, 0);
+  assert.equal(afterRestart.guestPeakLevel, 0);
+  assert.equal(afterRestart.telemetry.audio.guestStatusText, '');
+  assert.equal(guestAudioStatusEl.textContent, '--');
+
+  await sessionController.stop();
   controller.destroy();
 });
