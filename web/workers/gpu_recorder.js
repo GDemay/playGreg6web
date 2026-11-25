@@ -308,8 +308,10 @@
       this._frames = [];
       this._frameHead = 0;
       this._totalBytes = 0;
+      this._peakRecordedBytes = 0;
       this._totalPackets = 0;
       this._opcodeCounts = {};
+      this._evictedFrames = 0;
       this._droppedFrames = 0;
       this._droppedRingPackets = 0;
       this._droppedBudgetFrames = 0;
@@ -449,8 +451,10 @@
       this._frames = [];
       this._frameHead = 0;
       this._totalBytes = 0;
+      this._peakRecordedBytes = 0;
       this._totalPackets = 0;
       this._opcodeCounts = {};
+      this._evictedFrames = 0;
       this._droppedFrames = 0;
       this._droppedRingPackets = 0;
       this._droppedBudgetFrames = 0;
@@ -464,6 +468,26 @@
       this._nextFrameSeq = 0;
       this._resetPartialState();
       return this;
+    }
+
+    /**
+     * Resets cumulative recorder telemetry counters (evictions, drops, skipped
+     * large uploads) and re-baselines `peakRecordedBytes` to current live
+     * `recordedBytes` without discarding retained frames.
+     *
+     * @returns {object} Fresh `getStats()` snapshot after reset.
+     */
+    resetStats() {
+      this._peakRecordedBytes = this._totalBytes;
+      this._evictedFrames = 0;
+      this._droppedFrames = 0;
+      this._droppedRingPackets = 0;
+      this._droppedBudgetFrames = 0;
+      this._skippedFrames = 0;
+      this._skippedLargeUploadPackets = 0;
+      this._skippedLargeUploadBytes = 0;
+      this._skippedLargeUploads = [];
+      return this.getStats();
     }
 
     isRecording() {
@@ -497,6 +521,7 @@
         }
       }
 
+      this._evictedFrames += 1;
       this._droppedFrames += 1;
       this._droppedRingPackets += evicted.packetCount;
       return true;
@@ -510,6 +535,14 @@
       }
 
       this._observedFrames += 1;
+
+      if (active.oversized) {
+        this._nextFrameSeq += 1;
+        this._capturedFrames += 1;
+        this._droppedFrames += 1;
+        this._droppedRingPackets += active.packetCount;
+        return { completed: 1, dropped: 1 };
+      }
 
       if (this._stopOnBudget) {
         if (
@@ -539,25 +572,28 @@
         return { completed: 1, dropped: 1 };
       }
 
-      this._frames.push(frame);
-      this._totalBytes += frame.byteLength;
-      this._totalPackets += frame.packetCount;
-
-      const keys = Object.keys(frame.opcodeCounts);
-      for (let i = 0; i < keys.length; i++) {
-        const key = keys[i];
-        this._opcodeCounts[key] = (this._opcodeCounts[key] || 0) + frame.opcodeCounts[key];
-      }
-
       let droppedNow = 0;
       while (
-        this._retainedFrameCount() > this._maxFrames ||
-        this._totalBytes > this._maxBytes
+        this._retainedFrameCount() >= this._maxFrames ||
+        this._totalBytes + frame.byteLength > this._maxBytes
       ) {
         if (!this._evictOldestFrame()) {
           break;
         }
         droppedNow += 1;
+      }
+
+      this._frames.push(frame);
+      this._totalBytes += frame.byteLength;
+      this._totalPackets += frame.packetCount;
+      if (this._totalBytes > this._peakRecordedBytes) {
+        this._peakRecordedBytes = this._totalBytes;
+      }
+
+      const keys = Object.keys(frame.opcodeCounts);
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        this._opcodeCounts[key] = (this._opcodeCounts[key] || 0) + frame.opcodeCounts[key];
       }
 
       return { completed: 1, dropped: droppedNow };
@@ -570,6 +606,7 @@
         this._activeFrame = skip
           ? {
               skip: true,
+              oversized: false,
               chunks: null,
               byteLength: 0,
               packetCount: 0,
@@ -579,6 +616,7 @@
             }
           : {
               skip: false,
+              oversized: false,
               chunks: [],
               byteLength: 0,
               packetCount: 0,
@@ -780,6 +818,41 @@
               };
             }
           }
+        } else if (opcode !== OPCODES.BEGIN_FRAME) {
+          if (this._activeFrame && !this._activeFrame.skip) {
+            if (
+              !this._activeFrame.oversized &&
+              this._activeFrame.byteLength + packetLen > this._maxBytes
+            ) {
+              // Release buffered chunks immediately so an oversized or unclosed frame
+              // can never grow beyond maxRecordedBytes in renderer RAM.
+              this._activeFrame.oversized = true;
+              this._activeFrame.chunks = null;
+            }
+            if (this._activeFrame.oversized) {
+              this._activeFrame.byteLength += packetLen;
+              this._activeFrame.packetCount += 1;
+              packetsParsed += 1;
+              if (opcode === OPCODES.PRESENT) {
+                const res = this._commitActiveFrame();
+                completedFrames += res.completed;
+                droppedFrames += res.dropped;
+              }
+              if (offset + packetLen > len) {
+                this._skipBytesRemaining = packetLen - (len - offset);
+                offset = len;
+                break;
+              }
+              offset += packetLen;
+              continue;
+            }
+          } else if (offset + packetLen > len && opcode !== OPCODES.PRESENT) {
+            // Skip oversized out-of-frame or startFrame-skipped packets without buffering payload RAM.
+            packetsParsed += 1;
+            this._skipBytesRemaining = packetLen - (len - offset);
+            offset = len;
+            break;
+          }
         }
 
         if (offset + packetLen > len) {
@@ -902,8 +975,10 @@
         totalBytes: this._totalBytes,
         totalPackets: this._totalPackets,
         recordedBytes: this._totalBytes,
+        peakRecordedBytes: this._peakRecordedBytes,
         recordedPackets: this._totalPackets,
         opcodeCounts: cloneCounts(this._opcodeCounts),
+        evictedFrames: this._evictedFrames,
         droppedFrames: this._droppedFrames,
         droppedRingPackets: this._droppedRingPackets,
         capturedFrames: this._capturedFrames,

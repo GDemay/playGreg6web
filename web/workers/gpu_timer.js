@@ -149,7 +149,7 @@
   }
 
   function isSlotAvailable(slot) {
-    if (!slot || slot.state !== 'idle' || !slot.buffer) {
+    if (!slot || slot.state !== 'idle' || !slot.buffer || slot.buffer.destroyed) {
       return false;
     }
     const mapState = slot.buffer.mapState;
@@ -253,6 +253,7 @@
 
       this._supported = false;
       this._destroyed = false;
+      this._deviceLost = false;
 
       this._querySet = null;
       this._resolveBuffer = null;
@@ -283,6 +284,11 @@
       this._frameTotalWindowCount = 0;
       this._frameSeq = 0;
 
+      // Pre-allocated rolling pass duration ring for global p50PassMs / p95PassMs stats.
+      this._passDurations = new Float64Array(this._historySize);
+      this._passDurationWriteIdx = 0;
+      this._passDurationWindowCount = 0;
+
       // Open CPU fallback frame accumulators (active only when !supported and beginPass/endPass are used).
       this._cpuFrameOpen = false;
       this._cpuFrameSeq = 0;
@@ -292,6 +298,8 @@
       this._resolvedFrames = 0;
       this._skippedFrames = 0;
       this._droppedPasses = 0;
+      this._droppedQueryFrames = 0;
+      this._mapErrors = 0;
       this._lastFrameGpuMs = 0;
       this._resetGeneration = 0;
       this._passHistories = new Map();
@@ -362,6 +370,17 @@
         this._readbackSlots = readbackSlots;
         this._timestampWriteDescriptors = timestampWriteDescriptors;
         this._supported = true;
+
+        if (device && device.lost && typeof device.lost.then === 'function') {
+          device.lost.then(
+            () => {
+              this._deviceLost = true;
+            },
+            () => {
+              this._deviceLost = true;
+            }
+          );
+        }
       } catch (_) {
         if (querySet && typeof querySet.destroy === 'function') {
           try {
@@ -652,6 +671,14 @@
         return false;
       }
 
+      if (this._deviceLost) {
+        this._droppedQueryFrames += 1;
+        this._framePassCount = 0;
+        this._queryCursor = 0;
+        this._activePassDepth = 0;
+        return false;
+      }
+
       let freeSlot = null;
       for (let i = 0; i < this._readbackSlots.length; i += 1) {
         if (isSlotAvailable(this._readbackSlots[i])) {
@@ -662,6 +689,7 @@
 
       if (!freeSlot) {
         this._skippedFrames += 1;
+        this._droppedQueryFrames += 1;
         this._framePassCount = 0;
         this._queryCursor = 0;
         this._activePassDepth = 0;
@@ -671,8 +699,16 @@
       const queryCount = this._queryCursor;
       const copyBytes = queryCount * TIMESTAMP_BYTE_SIZE;
 
-      encoder.resolveQuerySet(this._querySet, 0, queryCount, this._resolveBuffer, 0);
-      encoder.copyBufferToBuffer(this._resolveBuffer, 0, freeSlot.buffer, 0, copyBytes);
+      try {
+        encoder.resolveQuerySet(this._querySet, 0, queryCount, this._resolveBuffer, 0);
+        encoder.copyBufferToBuffer(this._resolveBuffer, 0, freeSlot.buffer, 0, copyBytes);
+      } catch (_) {
+        this._droppedQueryFrames += 1;
+        this._framePassCount = 0;
+        this._queryCursor = 0;
+        this._activePassDepth = 0;
+        return false;
+      }
 
       freeSlot.state = 'pending';
       for (let i = 0; i < passCount; i += 1) {
@@ -700,6 +736,12 @@
         typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0
           ? durationMs
           : 0;
+
+      this._passDurations[this._passDurationWriteIdx] = safeDurationMs;
+      this._passDurationWriteIdx = (this._passDurationWriteIdx + 1) % this._historySize;
+      if (this._passDurationWindowCount < this._historySize) {
+        this._passDurationWindowCount += 1;
+      }
 
       let entry = this._passHistories.get(name);
       if (!entry) {
@@ -769,6 +811,9 @@
       this._pendingCount -= 1;
 
       if (!slot || !slot.buffer || slot.state !== 'pending') {
+        if (!this._destroyed) {
+          this._droppedQueryFrames += 1;
+        }
         return null;
       }
 
@@ -781,7 +826,15 @@
       slot.state = 'mapping';
 
       let mapped = false;
+      let unmapAttempted = false;
       try {
+        if (buffer.destroyed) {
+          throw new Error('Readback buffer was destroyed before mapAsync');
+        }
+        if (typeof buffer.mapAsync !== 'function') {
+          throw new TypeError('Readback buffer does not implement mapAsync');
+        }
+
         await buffer.mapAsync(MAP_MODE.READ);
         mapped = true;
 
@@ -793,11 +846,15 @@
           return null;
         }
 
-        const range = buffer.getMappedRange(0, copyBytes);
-        const timestamps = readTimestampsView(range, queryCount);
+        if (typeof buffer.getMappedRange !== 'function') {
+          throw new TypeError('Readback buffer does not implement getMappedRange');
+        }
 
-        const frameSeq = this._frameSeq + 1;
-        this._frameSeq = frameSeq;
+        const range = buffer.getMappedRange(0, copyBytes);
+        if (!range) {
+          throw new Error('Readback buffer getMappedRange returned empty range');
+        }
+        const timestamps = readTimestampsView(range, queryCount);
 
         let totalGpuMs = 0;
         const passes = new Array(passCount);
@@ -811,7 +868,21 @@
           const durationMs = computeDurationMs(startNs, endNs);
           totalGpuMs += durationMs;
           passes[i] = { name: passName, durationMs };
-          this._recordPassSample(passName, durationMs, frameSeq);
+        }
+
+        if (typeof buffer.unmap === 'function') {
+          unmapAttempted = true;
+          mapped = false;
+          buffer.unmap();
+        } else {
+          mapped = false;
+        }
+
+        const frameSeq = this._frameSeq + 1;
+        this._frameSeq = frameSeq;
+
+        for (let i = 0; i < passCount; i += 1) {
+          this._recordPassSample(passes[i].name, passes[i].durationMs, frameSeq);
         }
 
         this._recordFrameTotal(totalGpuMs, frameSeq);
@@ -820,18 +891,28 @@
 
         return { totalGpuMs, passes };
       } catch (_) {
+        if (!this._destroyed && slotGeneration === this._resetGeneration) {
+          this._mapErrors += 1;
+          this._droppedQueryFrames += 1;
+        }
         return null;
       } finally {
-        if (mapped && !this._destroyed && typeof buffer.unmap === 'function') {
+        const stillMapped =
+          !unmapAttempted &&
+          buffer &&
+          !buffer.destroyed &&
+          (mapped || buffer.mapState === 'mapped');
+        if (stillMapped && typeof buffer.unmap === 'function') {
           try {
             buffer.unmap();
           } catch (_) {
-            // ignore unmap errors if buffer was destroyed or device was lost
+            // ignore secondary unmap errors if buffer was destroyed or device was lost
           }
         }
         if (!this._destroyed && slot.buffer === buffer) {
           slot.state = 'idle';
           slot.passCount = 0;
+          slot.passNames.fill(undefined);
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
@@ -1075,8 +1156,13 @@
       this._resolvedFrames = 0;
       this._skippedFrames = 0;
       this._droppedPasses = 0;
+      this._droppedQueryFrames = 0;
+      this._mapErrors = 0;
       this._lastFrameGpuMs = 0;
       this._passHistories.clear();
+      this._passDurations.fill(0);
+      this._passDurationWriteIdx = 0;
+      this._passDurationWindowCount = 0;
       this._framePassCount = 0;
       this._framePassNames.fill(undefined);
       this._queryCursor = 0;
@@ -1111,6 +1197,15 @@
     }
 
     /**
+     * Resets profiler counters, error counts, and rolling pass-duration windows
+     * while keeping GPU resources intact, returning the fresh `getStats()` snapshot.
+     */
+    resetStats() {
+      this.reset();
+      return this.getStats();
+    }
+
+    /**
      * Returns a snapshot of overall profiler counters and per-pass rolling stats.
      *
      * @returns {{
@@ -1118,7 +1213,11 @@
      *   resolvedFrames: number,
      *   skippedFrames: number,
      *   droppedPasses: number,
+     *   droppedQueryFrames: number,
+     *   mapErrors: number,
      *   lastFrameGpuMs: number,
+     *   p50PassMs: number,
+     *   p95PassMs: number,
      *   passStats: Record<string, { count: number, lastMs: number, avgMs: number, maxMs: number }>
      * }}
      */
@@ -1143,12 +1242,20 @@
         };
       }
 
+      const rollingPassPercentiles = computePercentiles(
+        this._passDurations.subarray(0, this._passDurationWindowCount)
+      );
+
       return {
         supported: this._supported,
         resolvedFrames: this._resolvedFrames,
         skippedFrames: this._skippedFrames,
         droppedPasses: this._droppedPasses,
+        droppedQueryFrames: this._droppedQueryFrames,
+        mapErrors: this._mapErrors,
         lastFrameGpuMs: this._lastFrameGpuMs,
+        p50PassMs: rollingPassPercentiles.p50Ms,
+        p95PassMs: rollingPassPercentiles.p95Ms,
         passStats,
       };
     }
