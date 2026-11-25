@@ -6,6 +6,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { OpfsChunkCache } from '../web/storage/opfs_cache.js';
 
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
@@ -14,6 +15,7 @@ const repoRoot = path.resolve(__dirname, '..');
 
 const ioWorkerMod = require('../web/workers/io_worker.js');
 const mailboxMod = require('../web/workers/httpfs_mailbox.js');
+const rangeCacheMod = require('../web/workers/range_cache.js');
 
 const {
   IO_PRIORITY,
@@ -32,16 +34,24 @@ const {
   VIDEO_STREAM_SLAB_PRESET,
   DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES,
   DEFAULT_BATCH_COALESCE_MAX_BYTES,
+  DEFAULT_HOT_OPFS_RPF_ALLOWLIST,
+  DEFAULT_OPFS_L2_MAX_PENDING_WRITES,
+  DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY,
   ImmutableHttpfsCache,
   IoWorkerController,
   coalesceBatchReadRequests,
   collectTransferableBuffers,
   createSlabCacheTuningProfile,
   emptyStats,
+  emptyImmutableCacheStats,
   emptyStreamingStats,
   isDumpVirtualPath,
   isImmutableHttpfsPath,
   isVideoStreamPath,
+  buildFileFingerprint,
+  normalizeOpfsL2Path,
+  isHotOpfsL2Path,
+  opfsL2RangeFileName,
   parseContentRangeHeader,
   resolveDumpConfig,
   resolveDumpWriteRoute,
@@ -2713,4 +2723,866 @@ test('W255: shaders.rpf random working set fits inside enlarged 192 MiB slab LRU
   const u1 = await undersizedCache.read('/game/tiny_cap.rpf', 0, 512);
   assert.deepEqual(u1, shadersBytes.subarray(0, 512));
   assert.equal(undersizedMock.requests.length, 1, 'Fallback chunk cache must retain fetched chunk 0');
+});
+
+// ---------------------------------------------------------------------------
+// 11. W298 (#1205 / Refs #1015, #1077): Versioned OPFS L2 write-through for
+//     hot .rpf ranges in ImmutableHttpfsCache & IoWorkerController
+// ---------------------------------------------------------------------------
+
+function createMockEtagRangeFetch(urlEntriesMap, options = {}) {
+  // urlEntriesMap: Map<url, { bytes: Uint8Array, etag?: string|null, omitTotal?: boolean }>
+  const requests = [];
+  const delayMs = options.delayMs || 0;
+
+  async function fetchImpl(url, init = {}) {
+    const method = (init && init.method) || 'GET';
+    const rangeHeader = (init && init.headers && (init.headers.Range || init.headers.range)) || null;
+    requests.push({ method, url, rangeHeader });
+
+    if (delayMs > 0) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+
+    const rec = urlEntriesMap.get(url);
+    if (!rec || !rec.bytes) {
+      return {
+        ok: false,
+        status: 404,
+        headers: new Map(),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+        async json() {
+          throw new Error('HTTP 404');
+        },
+      };
+    }
+
+    const data = rec.bytes;
+    const headers = new Map();
+    if (typeof rec.etag === 'string' && rec.etag.length > 0) {
+      headers.set('ETag', rec.etag);
+    }
+
+    if (!rangeHeader) {
+      headers.set('Content-Length', String(data.byteLength));
+      return {
+        ok: true,
+        status: 200,
+        headers,
+        async arrayBuffer() {
+          return data.slice().buffer;
+        },
+        async json() {
+          return JSON.parse(new TextDecoder().decode(data));
+        },
+      };
+    }
+
+    const match = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+    assert.ok(match, `Unexpected Range header: ${rangeHeader}`);
+    const reqStart = Number(match[1]);
+    const reqEnd = Number(match[2]);
+
+    if (reqStart >= data.byteLength) {
+      headers.set('Content-Range', `bytes */${data.byteLength}`);
+      return {
+        ok: false,
+        status: 416,
+        headers,
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    const actualEnd = Math.min(reqEnd, data.byteLength - 1);
+    const slice = data.slice(reqStart, actualEnd + 1);
+    const totalToken = rec.omitTotal ? '*' : String(data.byteLength);
+    headers.set('Content-Range', `bytes ${reqStart}-${actualEnd}/${totalToken}`);
+    headers.set('Content-Length', String(slice.byteLength));
+    return {
+      ok: true,
+      status: 206,
+      headers,
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  }
+
+  return { fetchImpl, requests };
+}
+
+function createMockOpfsL2Store(options = {}) {
+  const entries = new Map(); // `${normalizedPath}::${offset}::${length}` -> { bytes, fileFingerprint }
+  const readCalls = [];
+  const writeCalls = [];
+  const invalidateCalls = [];
+  let gateWrites = Boolean(options.gateWrites);
+  const writeGates = [];
+  let throwOnRead = options.throwOnRead || null;
+  let throwOnWrite = options.throwOnWrite || null;
+
+  function makeKey(normalizedPath, offset, length) {
+    return `${normalizedPath}::${offset}::${length}`;
+  }
+
+  return {
+    entries,
+    readCalls,
+    writeCalls,
+    invalidateCalls,
+    setGateWrites(val) {
+      gateWrites = Boolean(val);
+    },
+    releaseAllWriteGates() {
+      gateWrites = false;
+      while (writeGates.length > 0) {
+        writeGates.shift()();
+      }
+    },
+    releaseOneWriteGate() {
+      if (writeGates.length > 0) {
+        writeGates.shift()();
+        return true;
+      }
+      return false;
+    },
+    pendingWriteGateCount() {
+      return writeGates.length;
+    },
+    setThrowOnRead(err) {
+      throwOnRead = err || null;
+    },
+    setThrowOnWrite(err) {
+      throwOnWrite = err || null;
+    },
+    async readRange(normalizedPath, offset, length, fileFingerprint) {
+      readCalls.push({ normalizedPath, offset, length, fileFingerprint });
+      if (throwOnRead) {
+        throw typeof throwOnRead === 'function' ? throwOnRead() : throwOnRead;
+      }
+      const k = makeKey(normalizedPath, offset, length);
+      const rec = entries.get(k);
+      if (!rec) {
+        return null;
+      }
+      if (fileFingerprint && rec.fileFingerprint !== fileFingerprint) {
+        entries.delete(k);
+        return { hit: false, invalidated: true, bytes: null };
+      }
+      return { hit: true, bytes: rec.bytes.slice(), fileFingerprint: rec.fileFingerprint };
+    },
+    async writeRange(normalizedPath, offset, length, bytes, fileFingerprint) {
+      writeCalls.push({ normalizedPath, offset, length, byteLength: bytes.byteLength, fileFingerprint });
+      if (gateWrites) {
+        await new Promise((resolve) => writeGates.push(resolve));
+      }
+      if (throwOnWrite) {
+        throw typeof throwOnWrite === 'function' ? throwOnWrite() : throwOnWrite;
+      }
+      const k = makeKey(normalizedPath, offset, length);
+      entries.set(k, { bytes: bytes.slice(), fileFingerprint });
+      return { stored: true };
+    },
+    async invalidateFingerprint(normalizedPath, expectedFingerprint) {
+      invalidateCalls.push({ normalizedPath, expectedFingerprint });
+      const prefix = `${normalizedPath}::`;
+      let invalidatedCount = 0;
+      for (const [k, rec] of Array.from(entries.entries())) {
+        if (k.startsWith(prefix) && rec.fileFingerprint !== expectedFingerprint) {
+          entries.delete(k);
+          invalidatedCount += 1;
+        }
+      }
+      return { invalidatedCount };
+    },
+  };
+}
+
+function createMockOpfsDirHandle(options = {}) {
+  const files = new Map();
+  const maxQuotaBytes = Number.isFinite(options.maxQuotaBytes) ? options.maxQuotaBytes : Infinity;
+  const removed = [];
+
+  function usedBytes(excludeName = null) {
+    let total = 0;
+    for (const [name, buf] of files.entries()) {
+      if (name === excludeName) continue;
+      total += buf.byteLength;
+    }
+    return total;
+  }
+
+  function makeHandle(name) {
+    return {
+      kind: 'file',
+      name,
+      async getFile() {
+        const cur = files.get(name) || new Uint8Array(0);
+        return {
+          size: cur.byteLength,
+          lastModified: 1,
+          async arrayBuffer() {
+            return cur.slice().buffer;
+          },
+        };
+      },
+      async createWritable() {
+        let pending = new Uint8Array(0);
+        let aborted = false;
+        return {
+          async write(chunk) {
+            const bytes = chunk instanceof Uint8Array ? chunk.slice() : new Uint8Array(chunk);
+            if (usedBytes(name) + bytes.byteLength > maxQuotaBytes) {
+              const err = new Error('The quota has been exceeded.');
+              err.name = 'QuotaExceededError';
+              throw err;
+            }
+            pending = bytes;
+          },
+          async close() {
+            if (!aborted) {
+              files.set(name, pending);
+            }
+          },
+          async abort() {
+            aborted = true;
+          },
+        };
+      },
+    };
+  }
+
+  return {
+    files,
+    removed,
+    async getFileHandle(name, opts = {}) {
+      if (!files.has(name)) {
+        if (!opts.create) {
+          const err = new Error(`NotFoundError: ${name}`);
+          err.name = 'NotFoundError';
+          throw err;
+        }
+        files.set(name, new Uint8Array(0));
+      }
+      return makeHandle(name);
+    },
+    async removeEntry(name) {
+      removed.push(name);
+      if (!files.delete(name)) {
+        const err = new Error(`NotFoundError: ${name}`);
+        err.name = 'NotFoundError';
+        throw err;
+      }
+    },
+    async *entries() {
+      for (const name of files.keys()) {
+        yield [name, makeHandle(name)];
+      }
+    },
+    async *keys() {
+      for (const name of files.keys()) {
+        yield name;
+      }
+    },
+  };
+}
+
+test('W298: fingerprint helpers, hot RPF allowlist, and zeroed OPFS L2 telemetry match W262 contracts', () => {
+  assert.deepEqual(DEFAULT_HOT_OPFS_RPF_ALLOWLIST, ['shaders.rpf', 'core_bvh4.rpf']);
+  assert.equal(DEFAULT_OPFS_L2_MAX_PENDING_WRITES, 64);
+  assert.equal(DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY, 4);
+
+  // Bit-for-bit fingerprint parity with W262 range_cache.js.
+  assert.equal(
+    buildFileFingerprint(4194304, '"shaders-v1"'),
+    rangeCacheMod.buildFileFingerprint(4194304, '"shaders-v1"'),
+  );
+  assert.equal(buildFileFingerprint(4194304), rangeCacheMod.buildFileFingerprint(4194304));
+  assert.equal(buildFileFingerprint(null, '"etag-only"'), rangeCacheMod.buildFileFingerprint(null, '"etag-only"'));
+  assert.equal(buildFileFingerprint(null, null), null);
+
+  // Path normalization strips origin, query, and Xbox drive prefix while blocking traversal.
+  assert.equal(normalizeOpfsL2Path('/game/shaders.rpf'), 'game/shaders.rpf');
+  assert.equal(normalizeOpfsL2Path('http://127.0.0.1:8080/game/core_bvh4.rpf?v=1'), 'game/core_bvh4.rpf');
+  assert.equal(normalizeOpfsL2Path('G:\\x64\\shaders.rpf'), 'x64/shaders.rpf');
+  assert.equal(normalizeOpfsL2Path('../escape/shaders.rpf'), null);
+  assert.equal(normalizeOpfsL2Path('game/bad\0.rpf'), null);
+
+  // Default hot allowlist matches shaders.rpf and core_bvh4.rpf only.
+  assert.equal(isHotOpfsL2Path('/game/shaders.rpf'), true);
+  assert.equal(isHotOpfsL2Path('http://127.0.0.1:8080/game/CORE_BVH4.RPF'), true);
+  assert.equal(isHotOpfsL2Path('/game/audio.rpf'), false);
+  assert.equal(isHotOpfsL2Path('/game/movies.rpf'), false);
+
+  // Custom allowlist configurations (array, path suffix, RegExp, predicate, wildcard, empty).
+  assert.equal(isHotOpfsL2Path('/game/movies.rpf', ['movies.rpf']), true);
+  assert.equal(isHotOpfsL2Path('/game/x64/levels.rpf', ['x64/levels.rpf']), true);
+  assert.equal(isHotOpfsL2Path('/game/x64/levels.rpf', [/levels\.rpf$/i]), true);
+  assert.equal(isHotOpfsL2Path('/game/audio.rpf', (p) => p.endsWith('audio.rpf')), true);
+  assert.equal(isHotOpfsL2Path('/game/anything.rpf', '*'), true);
+  assert.equal(isHotOpfsL2Path('/game/shaders.rpf', []), false);
+  assert.equal(isHotOpfsL2Path('/game/shaders.rpf', false), false);
+
+  // Versioned range filename matches opfs_cache.js `r_<offset>_<length>_<pathToken>_fp_<fp>.bin`.
+  const fp = buildFileFingerprint(4096, '"etag-1"');
+  const rangeFile = opfsL2RangeFileName('game/shaders.rpf', 0, 2048, fp);
+  assert.match(rangeFile, /^r_0_2048_[0-9a-f]+_fp_4096_[0-9a-f]{16}\.bin$/);
+
+  // Zeroed additive telemetry in emptyStats() & emptyImmutableCacheStats().
+  const eTop = emptyStats();
+  const eImm = emptyImmutableCacheStats();
+  for (const field of ['opfsL2Hits', 'opfsL2Misses', 'opfsL2Writes', 'opfsL2Invalidations']) {
+    assert.equal(eTop[field], 0, `emptyStats().${field} must default to 0`);
+    assert.equal(eTop.immutableCache[field], 0, `emptyStats().immutableCache.${field} must default to 0`);
+    assert.equal(eImm[field], 0, `emptyImmutableCacheStats().${field} must default to 0`);
+  }
+});
+
+test('W298: cold boot populates OPFS L2 asynchronously (non-blocking) for hot RPFs and warm boot hits OPFS L2 skipping HTTP', async () => {
+  const slabSize = 4096;
+  const shadersBytes = makePatternBytes(slabSize * 2, 0x11); // 2 slabs
+  const bvhBytes = makePatternBytes(slabSize, 0x22); // 1 slab
+  const audioBytes = makePatternBytes(slabSize, 0x33); // non-hot RPF (not in allowlist)
+
+  const shadersEtag = '"shaders-rpf-v1"';
+  const bvhEtag = '"bvh4-rpf-v1"';
+  const audioEtag = '"audio-rpf-v1"';
+
+  const serverMap = new Map([
+    ['/game/shaders.rpf', { bytes: shadersBytes, etag: shadersEtag }],
+    ['/game/core_bvh4.rpf', { bytes: bvhBytes, etag: bvhEtag }],
+    ['/game/audio.rpf', { bytes: audioBytes, etag: audioEtag }],
+  ]);
+
+  // Gate OPFS L2 writes to PROVE active cold reads never block on OPFS disk persistence!
+  const l2Store = createMockOpfsL2Store({ gateWrites: true });
+  const coldFetch = createMockEtagRangeFetch(serverMap);
+  const coldController = new IoWorkerController({
+    fetchImpl: coldFetch.fetchImpl,
+    opfsDir: null,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 16,
+  });
+
+  await coldController.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+  const reqsAfterInit = coldFetch.requests.length;
+
+  const hShaders = await coldController.openHandle('G:\\shaders.rpf');
+  const hBvh = await coldController.openHandle('G:\\core_bvh4.rpf');
+  const hAudio = await coldController.openHandle('G:\\audio.rpf');
+  assert.ok(hShaders >= 1 && hBvh >= 1 && hAudio >= 1);
+
+  const s0 = await coldController.readHandle(hShaders, 0, 512);
+  const s1 = await coldController.readHandle(hShaders, slabSize + 128, 512);
+  const b0 = await coldController.readHandle(hBvh, 64, 256);
+  const a0 = await coldController.readHandle(hAudio, 0, 256);
+
+  assert.deepEqual(s0, shadersBytes.subarray(0, 512));
+  assert.deepEqual(s1, shadersBytes.subarray(slabSize + 128, slabSize + 640));
+  assert.deepEqual(b0, bvhBytes.subarray(64, 320));
+  assert.deepEqual(a0, audioBytes.subarray(0, 256));
+
+  // All reads completed IMMEDIATELY even while OPFS L2 writes remain gated!
+  assert.equal(coldController.getStats().opfsL2Writes, 0);
+  assert.equal(l2Store.pendingWriteGateCount(), 3, 'Expected 2 shaders.rpf slabs + 1 core_bvh4.rpf slab queued');
+  assert.equal(coldFetch.requests.length - reqsAfterInit, 4);
+
+  // Release write gates and drain background OPFS L2 queue.
+  l2Store.releaseAllWriteGates();
+  await coldController.flushOpfsL2Writes();
+
+  const coldStats = coldController.getStats();
+  assert.equal(coldStats.opfsL2Hits, 0);
+  assert.equal(coldStats.opfsL2Misses, 3);
+  assert.equal(coldStats.opfsL2Writes, 3);
+  assert.equal(coldStats.opfsL2Invalidations, 0);
+  assert.equal(coldStats.immutableCache.opfsL2Writes, 3);
+  assert.equal(coldStats.immutableCache.opfsL2WriteErrors, 0);
+
+  // Verify non-hot audio.rpf was NEVER written to OPFS L2.
+  assert.equal(
+    l2Store.writeCalls.some((w) => w.normalizedPath.includes('audio.rpf')),
+    false,
+    'Non-allowlisted audio.rpf must not pollute OPFS L2',
+  );
+  // Verify stored fingerprints match buildFileFingerprint(size, etag).
+  const expectedShadersFp = buildFileFingerprint(shadersBytes.byteLength, shadersEtag);
+  const expectedBvhFp = buildFileFingerprint(bvhBytes.byteLength, bvhEtag);
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::0::${slabSize}`).fileFingerprint, expectedShadersFp);
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::${slabSize}::${slabSize}`).fileFingerprint, expectedShadersFp);
+  assert.equal(l2Store.entries.get(`game/core_bvh4.rpf::0::${slabSize}`).fileFingerprint, expectedBvhFp);
+
+  // --- Warm Boot #1: Pre-seeded fingerprints -> 100% OPFS L2 hits, ZERO HTTP fetches! ---
+  const warmFetch1 = createMockEtagRangeFetch(serverMap);
+  const warmController1 = new IoWorkerController({
+    fetchImpl: warmFetch1.fetchImpl,
+    opfsDir: null,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 16,
+    fileFingerprints: {
+      'game/shaders.rpf': expectedShadersFp,
+      'game/core_bvh4.rpf': expectedBvhFp,
+    },
+  });
+  await warmController1.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+  const warm1ReqsAfterInit = warmFetch1.requests.length;
+
+  const whShaders = await warmController1.openHandle('G:\\shaders.rpf');
+  const whBvh = await warmController1.openHandle('G:\\core_bvh4.rpf');
+  assert.equal(warmController1.getHandleInfo(whShaders).size, shadersBytes.byteLength);
+  assert.equal(warmController1.getHandleInfo(whBvh).size, bvhBytes.byteLength);
+
+  assert.deepEqual(await warmController1.readHandle(whShaders, 0, 512), shadersBytes.subarray(0, 512));
+  assert.deepEqual(
+    await warmController1.readHandle(whShaders, slabSize + 128, 512),
+    shadersBytes.subarray(slabSize + 128, slabSize + 640),
+  );
+  assert.deepEqual(await warmController1.readHandle(whBvh, 64, 256), bvhBytes.subarray(64, 320));
+
+  assert.equal(
+    warmFetch1.requests.length - warm1ReqsAfterInit,
+    0,
+    'Warm boot with matching OPFS L2 fingerprints must skip all HTTP Range fetches',
+  );
+  const warm1Stats = warmController1.getStats();
+  assert.equal(warm1Stats.opfsL2Hits, 3);
+  assert.equal(warm1Stats.opfsL2Misses, 0);
+  assert.equal(warm1Stats.opfsL2Writes, 0);
+  assert.equal(warm1Stats.opfsL2Invalidations, 0);
+  assert.equal(warm1Stats.immutableCache.networkFetches, 0);
+  assert.ok(warm1Stats.slabCacheHits >= 2, 'Repeat reads on L2-warmed slabs must hit RAM L1');
+
+  // Telemetry sanitization check: zero paths, URLs, or ETag strings leaked.
+  const statsJson = JSON.stringify(warm1Stats);
+  assert.equal(statsJson.includes('shaders.rpf'), false);
+  assert.equal(statsJson.includes('core_bvh4.rpf'), false);
+  assert.equal(statsJson.includes('shaders-rpf-v1'), false);
+
+  // --- Warm Boot #2: No pre-seeded fingerprints -> slab 0 probes HTTP to learn ETag+size, slab 1 hits OPFS L2! ---
+  const warmFetch2 = createMockEtagRangeFetch(serverMap);
+  const warmController2 = new IoWorkerController({
+    fetchImpl: warmFetch2.fetchImpl,
+    opfsDir: null,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 16,
+  });
+  await warmController2.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+  const warm2ReqsAfterInit = warmFetch2.requests.length;
+
+  const wh2 = await warmController2.openHandle('G:\\shaders.rpf');
+  assert.deepEqual(await warmController2.readHandle(wh2, 0, 256), shadersBytes.subarray(0, 256));
+  assert.deepEqual(
+    await warmController2.readHandle(wh2, slabSize, 256),
+    shadersBytes.subarray(slabSize, slabSize + 256),
+  );
+  await warmController2.flushOpfsL2Writes();
+
+  assert.equal(
+    warmFetch2.requests.length - warm2ReqsAfterInit,
+    1,
+    'Only slab 0 probes HTTP to learn ETag+size; slab 1 must hit OPFS L2 with 0 HTTP fetches',
+  );
+  const warm2Stats = warmController2.getStats();
+  assert.equal(warm2Stats.opfsL2Hits, 1);
+  assert.equal(warm2Stats.opfsL2Misses, 1);
+  assert.equal(warm2Stats.opfsL2Invalidations, 0);
+});
+
+test('W298: ETag and size fileFingerprint mismatches automatically invalidate stale OPFS L2 entries and re-fetch fresh bytes', async () => {
+  const slabSize = 2048;
+  const v1Bytes = makePatternBytes(slabSize * 2, 0x10);
+  const v2Bytes = makePatternBytes(slabSize * 2, 0x20); // same size, different ETag!
+  const v3Bytes = makePatternBytes(slabSize * 2 + 512, 0x30); // different size + different ETag!
+  const v4Bytes = makePatternBytes(slabSize * 2 + 512, 0x40); // mid-session ETag rotation!
+
+  const l2Store = createMockOpfsL2Store();
+  const fpV1 = buildFileFingerprint(v1Bytes.byteLength, '"rpf-v1"');
+  const fpV2 = buildFileFingerprint(v2Bytes.byteLength, '"rpf-v2"');
+  const fpV3 = buildFileFingerprint(v3Bytes.byteLength, '"rpf-v3"');
+  const fpV4 = buildFileFingerprint(v4Bytes.byteLength, '"rpf-v4"');
+
+  // 1. Cold seed v1 into OPFS L2.
+  const fetchV1 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: v1Bytes, etag: '"rpf-v1"' }]]),
+  );
+  const cacheV1 = new ImmutableHttpfsCache({
+    fetchImpl: fetchV1.fetchImpl,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+  });
+  assert.deepEqual(await cacheV1.read('/game/shaders.rpf', 0, slabSize * 2), v1Bytes);
+  await cacheV1.flushOpfsL2Writes();
+  assert.equal(cacheV1.getStats().opfsL2Writes, 2);
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::0::${slabSize}`).fileFingerprint, fpV1);
+
+  // 2. Warm boot with same size but NEW ETag (v2) pre-seeded -> readRange detects stale v1 & invalidates!
+  const fetchV2 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: v2Bytes, etag: '"rpf-v2"' }]]),
+  );
+  const cacheV2 = new ImmutableHttpfsCache({
+    fetchImpl: fetchV2.fetchImpl,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+    fileFingerprints: { 'game/shaders.rpf': fpV2 },
+  });
+  const gotV2 = await cacheV2.read('/game/shaders.rpf', 0, slabSize * 2);
+  await cacheV2.flushOpfsL2Writes();
+  assert.deepEqual(gotV2, v2Bytes);
+  assert.equal(fetchV2.requests.length, 2, 'Mismatched ETag fingerprint must re-fetch both slabs over HTTP');
+  const statsV2 = cacheV2.getStats();
+  assert.equal(statsV2.opfsL2Hits, 0);
+  assert.equal(statsV2.opfsL2Misses, 2);
+  assert.equal(statsV2.opfsL2Invalidations, 2);
+  assert.equal(statsV2.opfsL2Writes, 2);
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::0::${slabSize}`).fileFingerprint, fpV2);
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::${slabSize}::${slabSize}`).fileFingerprint, fpV2);
+
+  // 3. Warm boot WITHOUT pre-seeded fingerprint when archive size+ETag changed (v2 -> v3):
+  //    slab 0 learns fpV3 from HTTP and calls invalidateFingerprint removing stale v2 entries!
+  const fetchV3 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: v3Bytes, etag: '"rpf-v3"' }]]),
+  );
+  const cacheV3 = new ImmutableHttpfsCache({
+    fetchImpl: fetchV3.fetchImpl,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+  });
+  const s0V3 = await cacheV3.read('/game/shaders.rpf', 0, 512);
+  await cacheV3.flushOpfsL2Writes();
+  assert.deepEqual(s0V3, v3Bytes.subarray(0, 512));
+  assert.ok(
+    cacheV3.getStats().opfsL2Invalidations >= 2,
+    `Expected stale v2 entries invalidated on v3 learn, got ${cacheV3.getStats().opfsL2Invalidations}`,
+  );
+  assert.equal(
+    l2Store.entries.has(`game/shaders.rpf::${slabSize}::${slabSize}`),
+    false,
+    'Stale v2 slab 1 must have been purged by invalidateFingerprint',
+  );
+  const s1V3 = await cacheV3.read('/game/shaders.rpf', slabSize, slabSize + 512);
+  await cacheV3.flushOpfsL2Writes();
+  assert.deepEqual(s1V3, v3Bytes.subarray(slabSize, v3Bytes.byteLength));
+  assert.equal(l2Store.entries.get(`game/shaders.rpf::0::${slabSize}`).fileFingerprint, fpV3);
+
+  // 4. Mid-session ETag rotation (v3 -> v4) on live server evicts stale RAM slabs and invalidates OPFS L2!
+  const dynamicEntries = new Map([['/game/shaders.rpf', { bytes: v3Bytes, etag: '"rpf-v3"' }]]);
+  const dynamicFetch = createMockEtagRangeFetch(dynamicEntries);
+  const liveCache = new ImmutableHttpfsCache({
+    fetchImpl: dynamicFetch.fetchImpl,
+    opfsL2: l2Store,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+  });
+  // Read slab 0 from v3 (hits OPFS L2 -> populates RAM L1).
+  liveCache.setFileFingerprint('game/shaders.rpf', fpV3);
+  assert.deepEqual(await liveCache.read('/game/shaders.rpf', 0, 256), v3Bytes.subarray(0, 256));
+  assert.equal(liveCache.getStats().opfsL2Hits, 1);
+
+  // Server rotates file to v4; remove slab 1 from OPFS L2 so slab 1 hits HTTP and observes ETag "rpf-v4".
+  dynamicEntries.set('/game/shaders.rpf', { bytes: v4Bytes, etag: '"rpf-v4"' });
+  l2Store.entries.delete(`game/shaders.rpf::${slabSize}::${slabSize}`);
+  assert.deepEqual(await liveCache.read('/game/shaders.rpf', slabSize, 256), v4Bytes.subarray(slabSize, slabSize + 256));
+  await liveCache.flushOpfsL2Writes();
+  assert.ok(liveCache.getStats().opfsL2Invalidations >= 1);
+  assert.equal(liveCache.getFileFingerprint('/game/shaders.rpf'), fpV4);
+
+  // Re-reading slab 0 must NOT return evicted stale v3 RAM bytes; it must fetch fresh v4 bytes!
+  assert.deepEqual(await liveCache.read('/game/shaders.rpf', 0, 256), v4Bytes.subarray(0, 256));
+});
+
+test('W298: graceful fallback on OPFS quota/read/write errors, missing ETag, and bounded write backpressure', async () => {
+  const slabSize = 2048;
+  const rpfBytes = makePatternBytes(slabSize * 6, 0x5a);
+
+  // 1. Throwing OPFS L2 store (QuotaExceededError on write, SecurityError on read) never fails HTTP reads.
+  const quotaErr = new Error('The quota has been exceeded.');
+  quotaErr.name = 'QuotaExceededError';
+  const secErr = new Error('OPFS read denied');
+  secErr.name = 'SecurityError';
+  const failingL2 = createMockOpfsL2Store({ throwOnRead: secErr, throwOnWrite: quotaErr });
+  const fetch1 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: rpfBytes, etag: '"q-v1"' }]]),
+  );
+  const cache1 = new ImmutableHttpfsCache({
+    fetchImpl: fetch1.fetchImpl,
+    opfsL2: failingL2,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+    fileFingerprints: { 'game/shaders.rpf': buildFileFingerprint(rpfBytes.byteLength, '"q-v1"') },
+  });
+
+  const got = await cache1.read('/game/shaders.rpf', 0, slabSize * 2);
+  await cache1.flushOpfsL2Writes();
+  assert.deepEqual(got, rpfBytes.subarray(0, slabSize * 2));
+  const st1 = cache1.getStats();
+  assert.equal(st1.opfsL2Hits, 0);
+  assert.equal(st1.opfsL2Misses, 2);
+  assert.equal(st1.opfsL2Writes, 0);
+  assert.equal(st1.opfsL2WriteErrors, 2);
+
+  // 2. Missing ETag fallback:
+  //    (a) Default mode falls back safely to size-only fingerprint when size is known.
+  const noEtagL2 = createMockOpfsL2Store();
+  const noEtagFetch = createMockEtagRangeFetch(
+    new Map([['/game/core_bvh4.rpf', { bytes: rpfBytes.subarray(0, slabSize), etag: null }]]),
+  );
+  const noEtagCache = new ImmutableHttpfsCache({
+    fetchImpl: noEtagFetch.fetchImpl,
+    opfsL2: noEtagL2,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+  });
+  assert.deepEqual(
+    await noEtagCache.read('/game/core_bvh4.rpf', 0, 512),
+    rpfBytes.subarray(0, 512),
+  );
+  await noEtagCache.flushOpfsL2Writes();
+  assert.equal(noEtagCache.getFileFingerprint('/game/core_bvh4.rpf'), String(slabSize));
+  assert.equal(noEtagCache.getStats().opfsL2Writes, 1);
+
+  //    (b) Strict opfsL2RequireEtag: true OR unknown total (`bytes 0-N/*`) with no ETag -> skips OPFS L2 safely!
+  const strictL2 = createMockOpfsL2Store();
+  const strictCache = new ImmutableHttpfsCache({
+    fetchImpl: noEtagFetch.fetchImpl,
+    opfsL2: strictL2,
+    opfsL2RequireEtag: true,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+  });
+  assert.deepEqual(
+    await strictCache.read('/game/core_bvh4.rpf', 0, 512),
+    rpfBytes.subarray(0, 512),
+  );
+  await strictCache.flushOpfsL2Writes();
+  assert.equal(strictCache.getFileFingerprint('/game/core_bvh4.rpf'), null);
+  assert.equal(strictCache.getStats().opfsL2Writes, 0);
+
+  const unknownTotalL2 = createMockOpfsL2Store();
+  const unknownTotalFetch = createMockEtagRangeFetch(
+    new Map([['/game/core_bvh4.rpf', { bytes: rpfBytes.subarray(0, slabSize), etag: null, omitTotal: true }]]),
+  );
+  const unknownTotalCache = new ImmutableHttpfsCache({
+    fetchImpl: unknownTotalFetch.fetchImpl,
+    opfsL2: unknownTotalL2,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+  });
+  assert.deepEqual(
+    await unknownTotalCache.read('/game/core_bvh4.rpf', 0, 512),
+    rpfBytes.subarray(0, 512),
+  );
+  await unknownTotalCache.flushOpfsL2Writes();
+  assert.equal(unknownTotalCache.getFileFingerprint('/game/core_bvh4.rpf'), null);
+  assert.equal(unknownTotalCache.getStats().opfsL2Writes, 0);
+
+  // 3. Bounded background write queue drops oldest writes under backpressure without stalling reads.
+  const boundedL2 = createMockOpfsL2Store({ gateWrites: true });
+  const boundedFetch = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: rpfBytes, etag: '"burst-v1"' }]]),
+  );
+  const boundedCache = new ImmutableHttpfsCache({
+    fetchImpl: boundedFetch.fetchImpl,
+    opfsL2: boundedL2,
+    slabSize,
+    slabMaxBytes: slabSize * 8,
+    maxPendingOpfsL2Writes: 2,
+    maxOpfsL2WriteConcurrency: 1,
+  });
+
+  // Burst 6 slab reads while OPFS writes are stalled: all 6 reads complete immediately!
+  for (let s = 0; s < 6; s += 1) {
+    const out = await boundedCache.read('/game/shaders.rpf', s * slabSize, 256);
+    assert.deepEqual(out, rpfBytes.subarray(s * slabSize, s * slabSize + 256));
+  }
+  boundedL2.releaseAllWriteGates();
+  await boundedCache.flushOpfsL2Writes();
+  const boundedStats = boundedCache.getStats();
+  assert.ok(
+    boundedStats.opfsL2Writes >= 1 && boundedStats.opfsL2Writes <= 3,
+    `Expected bounded queue (1 active + 2 queued) to cap persisted writes to 1..3, got ${boundedStats.opfsL2Writes}`,
+  );
+});
+
+test('W298: interoperates with OpfsChunkCache, raw opfsDir (with quota eviction), chunk mode, and W260 8-lane mailbox pool', async () => {
+  const slabSize = 2048;
+  const shadersV1 = makePatternBytes(slabSize * 2, 0x71);
+  const shadersV2 = makePatternBytes(slabSize * 2, 0x72);
+  const fpV1 = buildFileFingerprint(shadersV1.byteLength, '"opfs-v1"');
+  const fpV2 = buildFileFingerprint(shadersV2.byteLength, '"opfs-v2"');
+
+  // --- Part A: OpfsChunkCache (web/storage/opfs_cache.js) interoperability ---
+  const backingDir = createMockOpfsDirHandle();
+  const opfsCache = new OpfsChunkCache({ cacheDir: backingDir, indexFlushDelayMs: 0 });
+  const fetchA1 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: shadersV1, etag: '"opfs-v1"' }]]),
+  );
+  const coldA = new ImmutableHttpfsCache({
+    fetchImpl: fetchA1.fetchImpl,
+    opfsCache,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+  });
+  assert.deepEqual(await coldA.read('/game/shaders.rpf', 0, slabSize * 2), shadersV1);
+  await coldA.flushOpfsL2Writes();
+  assert.equal(coldA.getStats().opfsL2Writes, 2);
+
+  // Warm hit from OpfsChunkCache with 0 HTTP fetches.
+  const fetchA2 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: shadersV1, etag: '"opfs-v1"' }]]),
+  );
+  const warmA = new ImmutableHttpfsCache({
+    fetchImpl: fetchA2.fetchImpl,
+    opfsCache,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+    fileFingerprints: { 'game/shaders.rpf': fpV1 },
+  });
+  assert.deepEqual(await warmA.read('/game/shaders.rpf', 0, slabSize * 2), shadersV1);
+  assert.equal(fetchA2.requests.length, 0);
+  assert.equal(warmA.getStats().opfsL2Hits, 2);
+
+  // Stale fingerprint invalidation through OpfsChunkCache.
+  const fetchA3 = createMockEtagRangeFetch(
+    new Map([['/game/shaders.rpf', { bytes: shadersV2, etag: '"opfs-v2"' }]]),
+  );
+  const staleA = new ImmutableHttpfsCache({
+    fetchImpl: fetchA3.fetchImpl,
+    opfsCache,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+    fileFingerprints: { 'game/shaders.rpf': fpV2 },
+  });
+  assert.deepEqual(await staleA.read('/game/shaders.rpf', 0, slabSize * 2), shadersV2);
+  await staleA.flushOpfsL2Writes();
+  assert.equal(fetchA3.requests.length, 2);
+  assert.equal(staleA.getStats().opfsL2Invalidations, 2);
+  await opfsCache.close();
+
+  // --- Part B: Raw opfsDir handle (with quota eviction retry) + chunk mode ---
+  const rawDir = createMockOpfsDirHandle({ maxQuotaBytes: 256 });
+  const chunkFile = makePatternBytes(192, 0x83); // 3 x 64B chunks
+  const chunkFp = buildFileFingerprint(chunkFile.byteLength, '"chunk-v1"');
+  const fetchB1 = createMockEtagRangeFetch(
+    new Map([['/game/core_bvh4.rpf', { bytes: chunkFile, etag: '"chunk-v1"' }]]),
+  );
+  const chunkCold = new ImmutableHttpfsCache({
+    fetchImpl: fetchB1.fetchImpl,
+    opfsDir: rawDir,
+    chunkSize: 64,
+    maxBytes: 512,
+    slabCacheEnabled: false,
+  });
+  assert.deepEqual(await chunkCold.read('/game/core_bvh4.rpf', 0, 192), chunkFile);
+  await chunkCold.flushOpfsL2Writes();
+  assert.equal(chunkCold.getStats().opfsL2Writes, 3);
+
+  const fetchB2 = createMockEtagRangeFetch(
+    new Map([['/game/core_bvh4.rpf', { bytes: chunkFile, etag: '"chunk-v1"' }]]),
+  );
+  const chunkWarm = new ImmutableHttpfsCache({
+    fetchImpl: fetchB2.fetchImpl,
+    opfsDir: rawDir,
+    chunkSize: 64,
+    maxBytes: 512,
+    slabCacheEnabled: false,
+    fileFingerprints: { 'game/core_bvh4.rpf': chunkFp },
+  });
+  assert.deepEqual(await chunkWarm.read('/game/core_bvh4.rpf', 0, 192), chunkFile);
+  assert.equal(fetchB2.requests.length, 0, 'Chunk mode warm read must hit raw opfsDir with 0 HTTP fetches');
+  assert.equal(chunkWarm.getStats().opfsL2Hits, 3);
+
+  // Tight quota on raw opfsDir (fits 2 x 64B chunks, writing 3 sequentially) evicts oldest and retries cleanly!
+  const tightDir = createMockOpfsDirHandle({ maxQuotaBytes: 128 });
+  const tightFetch = createMockEtagRangeFetch(
+    new Map([['/game/core_bvh4.rpf', { bytes: chunkFile, etag: '"chunk-q"' }]]),
+  );
+  const tightCache = new ImmutableHttpfsCache({
+    fetchImpl: tightFetch.fetchImpl,
+    opfsDir: tightDir,
+    chunkSize: 64,
+    maxBytes: 512,
+    slabCacheEnabled: false,
+    maxOpfsL2WriteConcurrency: 1,
+  });
+  for (let c = 0; c < 3; c += 1) {
+    assert.deepEqual(
+      await tightCache.read('/game/core_bvh4.rpf', c * 64, 64),
+      chunkFile.subarray(c * 64, (c + 1) * 64),
+    );
+    await tightCache.flushOpfsL2Writes();
+  }
+  assert.equal(tightCache.getStats().opfsL2Writes, 3);
+  assert.equal(tightCache.getStats().opfsL2WriteErrors, 0);
+  assert.ok(tightDir.removed.length >= 1, 'QuotaExceededError on raw opfsDir must evict oldest entry and retry');
+
+  // --- Part C: W260 8-lane HttpfsMailboxPoolHost sharing warm OPFS L2 with 0 HTTP fetches ---
+  const poolL2 = createMockOpfsL2Store();
+  const poolServer = new Map([['/game/shaders.rpf', { bytes: shadersV1, etag: '"opfs-v1"' }]]);
+  const seedFetch = createMockEtagRangeFetch(poolServer);
+  const seeder = new IoWorkerController({
+    fetchImpl: seedFetch.fetchImpl,
+    opfsDir: null,
+    opfsL2: poolL2,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+  });
+  await seeder.init({ dataBase: '/data/', gameBase: '/game/' });
+  const hSeed = await seeder.openHandle('G:\\shaders.rpf');
+  await seeder.readHandle(hSeed, 0, slabSize * 2);
+  await seeder.flushOpfsL2Writes();
+
+  const warmPoolFetch = createMockEtagRangeFetch(poolServer);
+  const poolController = new IoWorkerController({
+    fetchImpl: warmPoolFetch.fetchImpl,
+    opfsDir: null,
+    opfsL2: poolL2,
+    slabSize,
+    slabMaxBytes: slabSize * 4,
+    fileFingerprints: { 'game/shaders.rpf': fpV1 },
+  });
+  const laneSabs = Array.from({ length: 8 }, () => createHttpfsMailboxBuffer(8192));
+  const laneClients = laneSabs.map((sab) => new HttpfsMailboxClient(sab));
+
+  try {
+    await poolController.init({ dataBase: '/data/', gameBase: '/game/' });
+    await poolController.attachMailboxPool(laneSabs);
+    assert.equal(poolController.mailboxLanes, 8);
+    const reqsAfterPoolInit = warmPoolFetch.requests.length;
+
+    // All 8 lanes concurrently open & read shaders.rpf from warm OPFS L2 with ZERO HTTP requests!
+    await Promise.all(
+      laneClients.map(async (client, idx) => {
+        const handle = await client.openAsync('G:\\shaders.rpf');
+        assert.ok(handle >= 1);
+        const offset = (idx % 2) * slabSize + idx * 32;
+        const dst = new Uint8Array(128);
+        const gotLen = await client.readAsync(handle, BigInt(offset), dst, 128);
+        assert.equal(gotLen, 128);
+        assert.deepEqual(dst, shadersV1.subarray(offset, offset + 128));
+        assert.equal(await client.closeAsync(handle), true);
+      }),
+    );
+
+    assert.equal(
+      warmPoolFetch.requests.length - reqsAfterPoolInit,
+      0,
+      '8-lane warm OPFS L2 mailbox reads must trigger 0 HTTP fetches',
+    );
+    const poolStats = poolController.getStats();
+    assert.equal(poolStats.mailboxLanes, 8);
+    assert.equal(poolStats.opfsL2Hits, 2, 'Concurrent 8-lane reads must coalesce onto 2 slab OPFS L2 hits');
+    assert.equal(poolStats.immutableCache.networkFetches, 0);
+  } finally {
+    await poolController.detachMailbox();
+  }
 });
