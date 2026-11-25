@@ -25,14 +25,162 @@ export const HDR_DROPPED_FRAMES = 7;
 export const RING_HEADER_INT32_COUNT = 8;
 export const RING_HEADER_BYTES = RING_HEADER_INT32_COUNT * Int32Array.BYTES_PER_ELEMENT;
 
-export function clampVolume(value) {
+export const DEFAULT_MAX_RESUME_RETRIES = 5;
+export const MAX_ERROR_MESSAGE_LENGTH = 256;
+
+const KNOWN_OUTPUT_STATES = new Set([
+  'idle',
+  'initializing',
+  'suspended',
+  'running',
+  'interrupted',
+  'closed',
+  'unsupported',
+  'error',
+]);
+
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]+/g;
+const FILE_URL_RE = /file:\/\/[^\s'")]+/gi;
+const URL_USERINFO_RE = /\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi;
+const URL_QUERY_RE = /(\b(?:https?|wss?):\/\/[^\s?#]+)\?[^\s#'")]*/gi;
+const AUTH_SCHEME_RE = /\b(Bearer|Basic)\s+[^\s'"]+/gi;
+const SECRET_KV_RE =
+  /\b(token|api[_-]?key|password|passwd|secret|authorization)(\s*[:=]\s*)[^\s,;'"&)]+/gi;
+const WIN_DRIVE_PATH_RE = /\b[A-Za-z]:\\[^\s'")]+/g;
+const WIN_UNC_PATH_RE = /(^|[\s('"])\\\\[^\s'")]+/g;
+const POSIX_HOST_PATH_RE =
+  /(^|[\s('"])\/(?:Users|home|var|etc|tmp|private|root|opt)\/[^\s'")]+/g;
+
+function sanitizeFiniteNonNegInt(value, fallback = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  const floored = Math.floor(value);
+  return floored === 0 ? 0 : floored;
+}
+
+function sanitizePositiveFiniteNumber(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return value;
+}
+
+function sanitizeOutputState(state) {
+  if (typeof state !== 'string') {
+    return 'unknown';
+  }
+  const normalized = state.trim().toLowerCase();
+  if (KNOWN_OUTPUT_STATES.has(normalized)) {
+    return normalized;
+  }
+  return 'unknown';
+}
+
+/**
+ * Sanitizes an error or string for safe telemetry snapshots:
+ * strips control characters, redacts host paths, file:// URLs, URL credentials/queries,
+ * and auth tokens, and bounds length to MAX_ERROR_MESSAGE_LENGTH.
+ *
+ * @param {unknown} err
+ * @returns {string|null}
+ */
+export function sanitizeResumeError(err) {
+  if (err === null || err === undefined) {
+    return null;
+  }
+
+  let raw = '';
+  if (typeof err === 'string') {
+    raw = err;
+  } else if (typeof err === 'object') {
+    let name = '';
+    let message = '';
+    try {
+      if (typeof err.name === 'string') {
+        name = err.name.trim();
+      }
+    } catch {
+      // Ignore hostile property getters.
+    }
+    try {
+      if (typeof err.message === 'string') {
+        message = err.message.trim();
+      }
+    } catch {
+      // Ignore hostile property getters.
+    }
+
+    if (name && message && name !== 'Error' && !message.startsWith(name)) {
+      raw = `${name}: ${message}`;
+    } else if (message) {
+      raw = message;
+    } else if (name) {
+      raw = name;
+    } else {
+      try {
+        raw = String(err);
+      } catch {
+        raw = '';
+      }
+    }
+  } else {
+    try {
+      raw = String(err);
+    } catch {
+      raw = '';
+    }
+  }
+
+  let out = raw
+    .replace(CONTROL_CHARS_RE, ' ')
+    .replace(FILE_URL_RE, '[REDACTED_FILE_URL]')
+    .replace(URL_USERINFO_RE, '$1[REDACTED]@')
+    .replace(URL_QUERY_RE, '$1?[REDACTED]')
+    .replace(AUTH_SCHEME_RE, '$1 [REDACTED]')
+    .replace(SECRET_KV_RE, '$1$2[REDACTED]')
+    .replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]')
+    .replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]')
+    .replace(POSIX_HOST_PATH_RE, '$1[REDACTED_PATH]')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (out.length === 0) {
+    return 'AudioContext resume failed';
+  }
+  if (out.length > MAX_ERROR_MESSAGE_LENGTH) {
+    return `${out.slice(0, MAX_ERROR_MESSAGE_LENGTH - 3)}...`;
+  }
+  return out;
+}
+
+/**
+ * Clamps a volume/gain input to a finite number in [0, 1].
+ * Non-number and non-finite inputs (NaN, ±Infinity) resolve to the sanitized fallback.
+ *
+ * @param {unknown} value
+ * @param {number} [fallback=1.0]
+ * @returns {number}
+ */
+export function clampVolume(value, fallback = 1.0) {
+  const safeFallback =
+    typeof fallback === 'number' && Number.isFinite(fallback)
+      ? fallback <= 0.0
+        ? 0.0
+        : fallback >= 1.0
+          ? 1.0
+          : fallback
+      : 1.0;
+
   if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return 1.0;
+    return safeFallback;
   }
   if (value <= 0.0) return 0.0;
   if (value >= 1.0) return 1.0;
   return value;
 }
+
+export const clampGain = clampVolume;
 
 export function audioRingByteLength(
   capacityFrames = DEFAULT_CAPACITY_FRAMES,
@@ -98,9 +246,11 @@ export class AudioEngine {
    * @param {string} [options.workletUrl]
    * @param {string} [options.processorName='playgta6-audio-processor']
    * @param {number} [options.volume=1.0]
+   * @param {number} [options.gain]
    * @param {boolean} [options.muted=false]
    * @param {number} [options.smoothingFrames]
    * @param {string|number} [options.latencyHint='interactive']
+   * @param {number} [options.maxResumeRetries=5]
    * @param {Function} [options.AudioContextCtor]
    * @param {Function} [options.AudioWorkletNodeCtor]
    * @param {(err: Error) => void} [options.onError]
@@ -108,46 +258,54 @@ export class AudioEngine {
    * @param {(data: any) => void} [options.onWorkletMessage]
    */
   constructor(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+
     this._requestedSampleRate =
-      typeof options.sampleRate === 'number' && Number.isFinite(options.sampleRate) && options.sampleRate > 0
-        ? options.sampleRate
+      typeof opts.sampleRate === 'number' && Number.isFinite(opts.sampleRate) && opts.sampleRate > 0
+        ? opts.sampleRate
         : DEFAULT_SAMPLE_RATE;
     this._requestedChannels =
-      Number.isInteger(options.channels) && options.channels > 0
-        ? options.channels
+      Number.isInteger(opts.channels) && opts.channels > 0
+        ? opts.channels
         : DEFAULT_CHANNELS;
     this._requestedCapacityFrames =
-      Number.isInteger(options.capacityFrames) && options.capacityFrames > 0
-        ? options.capacityFrames
+      Number.isInteger(opts.capacityFrames) && opts.capacityFrames > 0
+        ? opts.capacityFrames
         : DEFAULT_CAPACITY_FRAMES;
 
     this._workletUrl =
-      typeof options.workletUrl === 'string' && options.workletUrl.length > 0
-        ? options.workletUrl
+      typeof opts.workletUrl === 'string' && opts.workletUrl.length > 0
+        ? opts.workletUrl
         : DEFAULT_WORKLET_URL;
     this._processorName =
-      typeof options.processorName === 'string' && options.processorName.length > 0
-        ? options.processorName
+      typeof opts.processorName === 'string' && opts.processorName.length > 0
+        ? opts.processorName
         : PROCESSOR_NAME;
-    this._latencyHint = options.latencyHint !== undefined ? options.latencyHint : 'interactive';
-    this._smoothingFrames = options.smoothingFrames;
+    this._latencyHint = opts.latencyHint !== undefined ? opts.latencyHint : 'interactive';
+    this._smoothingFrames = opts.smoothingFrames;
+    this._maxResumeRetries = sanitizeFiniteNonNegInt(
+      opts.maxResumeRetries,
+      DEFAULT_MAX_RESUME_RETRIES
+    );
 
     this._AudioContextCtor =
-      options.AudioContextCtor !== undefined
-        ? options.AudioContextCtor
+      opts.AudioContextCtor !== undefined
+        ? opts.AudioContextCtor
         : resolveDefaultAudioContextCtor();
     this._AudioWorkletNodeCtor =
-      options.AudioWorkletNodeCtor !== undefined
-        ? options.AudioWorkletNodeCtor
+      opts.AudioWorkletNodeCtor !== undefined
+        ? opts.AudioWorkletNodeCtor
         : resolveDefaultAudioWorkletNodeCtor();
 
-    this._onError = typeof options.onError === 'function' ? options.onError : null;
-    this._onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : null;
+    this._onError = typeof opts.onError === 'function' ? opts.onError : null;
+    this._onStateChange = typeof opts.onStateChange === 'function' ? opts.onStateChange : null;
     this._onWorkletMessage =
-      typeof options.onWorkletMessage === 'function' ? options.onWorkletMessage : null;
+      typeof opts.onWorkletMessage === 'function' ? opts.onWorkletMessage : null;
 
-    this._volume = clampVolume(options.volume !== undefined ? options.volume : 1.0);
-    this._muted = Boolean(options.muted);
+    const rawInitialVolume =
+      opts.volume !== undefined ? opts.volume : opts.gain !== undefined ? opts.gain : 1.0;
+    this._volume = clampVolume(rawInitialVolume, 1.0);
+    this._muted = Boolean(opts.muted);
 
     this._sab = null;
     this._ctrl = null;
@@ -160,11 +318,20 @@ export class AudioEngine {
     this._error = null;
     this._destroyed = false;
     this._startPromise = null;
+    this._resumePromise = null;
     this._gestureCleanup = null;
     this._boundContextStateChange = null;
 
-    const initialSab =
-      options.sab || (options.ringBuffer && options.ringBuffer.sab) || null;
+    this._resumeAttempts = 0;
+    this._resumeSuccesses = 0;
+    this._resumeFailures = 0;
+    this._stateTransitions = 0;
+    this._lastResumeError = null;
+    this._lastTrackedState = 'idle';
+    this._gainClamps = 0;
+    this._invalidGainInputs = 0;
+
+    const initialSab = opts.sab || (opts.ringBuffer && opts.ringBuffer.sab) || null;
     if (initialSab) {
       this.attachSab(initialSab);
     } else if (typeof SharedArrayBuffer !== 'undefined') {
@@ -190,6 +357,10 @@ export class AudioEngine {
     return this._volume;
   }
 
+  get gain() {
+    return this._volume;
+  }
+
   get muted() {
     return this._muted;
   }
@@ -205,14 +376,27 @@ export class AudioEngine {
     if (this._status === 'unsupported' || this._status === 'error') {
       return this._status;
     }
-    if (this._context && typeof this._context.state === 'string') {
+    if (
+      this._context &&
+      typeof this._context.state === 'string' &&
+      this._context.state.length > 0
+    ) {
       return this._context.state;
     }
     return this._status;
   }
 
+  get outputState() {
+    return sanitizeOutputState(this.state);
+  }
+
   get sampleRate() {
-    if (this._context && typeof this._context.sampleRate === 'number') {
+    if (
+      this._context &&
+      typeof this._context.sampleRate === 'number' &&
+      Number.isFinite(this._context.sampleRate) &&
+      this._context.sampleRate > 0
+    ) {
       return this._context.sampleRate;
     }
     return this._requestedSampleRate;
@@ -299,10 +483,20 @@ export class AudioEngine {
     };
   }
 
+  _recordStateTransition(nextState) {
+    const normalized = sanitizeOutputState(nextState);
+    if (normalized !== this._lastTrackedState) {
+      this._lastTrackedState = normalized;
+      this._stateTransitions += 1;
+    }
+  }
+
   _emitStateChange() {
+    const currentState = this.state;
+    this._recordStateTransition(currentState);
     if (this._onStateChange) {
       try {
-        this._onStateChange(this.state);
+        this._onStateChange(currentState);
       } catch {
         // Ignore callback exceptions.
       }
@@ -530,48 +724,125 @@ export class AudioEngine {
 
   /**
    * Resumes a suspended AudioContext (typically triggered by a user gesture).
+   * Optionally retries failed attempts when `options.maxRetries > 0`.
+   *
+   * @param {object} [options]
+   * @param {number} [options.maxRetries=0] Additional retry attempts after an initial failure.
+   * @param {number} [options.retryDelayMs=0] Delay in ms between retry attempts.
    * @returns {Promise<boolean>} True if context is running after resume.
    */
-  async resume() {
+  resume(options = {}) {
     if (this._destroyed || !this._context) {
-      return false;
+      return Promise.resolve(false);
     }
     if (this._context.state === 'running') {
-      return true;
+      return Promise.resolve(true);
     }
-    if (typeof this._context.resume !== 'function') {
-      return false;
+    if (this._resumePromise) {
+      return this._resumePromise;
     }
-    try {
-      await this._context.resume();
-      if (!this._destroyed && this._context) {
-        this._status = this._context.state || 'running';
-        this._emitStateChange();
-        return this._context.state === 'running';
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxRetries = sanitizeFiniteNonNegInt(opts.maxRetries, 0);
+    const retryDelayMs = sanitizeFiniteNonNegInt(opts.retryDelayMs, 0);
+
+    const promise = this._resumeInternal(maxRetries, retryDelayMs).finally(() => {
+      if (this._resumePromise === promise) {
+        this._resumePromise = null;
       }
-      return false;
-    } catch (err) {
-      this._error = err instanceof Error ? err : new Error(String(err));
-      if (this._onError) {
-        try {
-          this._onError(this._error);
-        } catch {
-          // Ignore.
+    });
+    this._resumePromise = promise;
+    return promise;
+  }
+
+  async _resumeInternal(maxRetries, retryDelayMs) {
+    const totalAttempts = 1 + maxRetries;
+
+    for (let attempt = 0; attempt < totalAttempts; attempt++) {
+      if (this._destroyed || !this._context) {
+        return false;
+      }
+      if (this._context.state === 'running') {
+        return true;
+      }
+
+      this._resumeAttempts += 1;
+
+      if (typeof this._context.resume !== 'function') {
+        const msg = 'AudioContext.resume is unavailable';
+        this._resumeFailures += 1;
+        this._lastResumeError = sanitizeResumeError(msg);
+        this._error = new Error(msg);
+        if (this._onError) {
+          try {
+            this._onError(this._error);
+          } catch {
+            // Ignore.
+          }
+        }
+        return false;
+      }
+
+      try {
+        await this._context.resume();
+        if (this._destroyed || !this._context) {
+          this._resumeFailures += 1;
+          this._lastResumeError = sanitizeResumeError('AudioEngine was destroyed during resume');
+          return false;
+        }
+
+        const nextState = sanitizeOutputState(this._context.state || 'running');
+        this._status = nextState;
+        this._emitStateChange();
+
+        if (this._context.state === 'running') {
+          this._resumeSuccesses += 1;
+          this._lastResumeError = null;
+          this._error = null;
+          return true;
+        }
+
+        this._resumeFailures += 1;
+        this._lastResumeError = sanitizeResumeError(
+          `AudioContext remained in state "${nextState}" after resume`
+        );
+      } catch (err) {
+        this._resumeFailures += 1;
+        const sanitized = sanitizeResumeError(err);
+        this._lastResumeError = sanitized;
+        this._error =
+          err instanceof Error ? err : new Error(sanitized || 'AudioContext resume failed');
+        if (this._onError) {
+          try {
+            this._onError(this._error);
+          } catch {
+            // Ignore.
+          }
         }
       }
-      return false;
+
+      if (attempt + 1 < totalAttempts && !this._destroyed && this._context) {
+        if (retryDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+        }
+      }
     }
+
+    return false;
   }
 
   /**
-   * Attaches once-only `pointerdown` and `keydown` listeners to `target` to
-   * unlock a suspended AudioContext on the first user gesture, and cleans up
-   * both listeners as soon as either fires (or when `destroy()` is called).
+   * Attaches `pointerdown` and `keydown` listeners to `target` to unlock a
+   * suspended AudioContext on user gesture. Cleans up both listeners once
+   * running (or when `destroy()` is called). If a gesture resume attempt fails,
+   * listeners automatically re-arm up to `options.maxRetries` times.
    *
    * @param {EventTarget} [target] Defaults to `window` when available.
+   * @param {object} [options]
+   * @param {number} [options.maxRetries] Maximum gesture retry re-arms after an initial failure.
    * @returns {() => void} Manual cleanup function.
    */
-  resumeOnUserGesture(target) {
+  resumeOnUserGesture(target, options = {}) {
     const resolvedTarget =
       target ||
       (typeof window !== 'undefined'
@@ -599,44 +870,93 @@ export class AudioEngine {
       this._gestureCleanup = null;
     }
 
-    let cleaned = false;
+    const opts = options && typeof options === 'object' ? options : {};
+    let retriesRemaining = sanitizeFiniteNonNegInt(opts.maxRetries, this._maxResumeRetries);
+    let disposed = false;
+    let activeCleanup = null;
     const events = ['pointerdown', 'keydown'];
 
+    const removeListeners = () => {
+      if (activeCleanup) {
+        const fn = activeCleanup;
+        activeCleanup = null;
+        fn();
+      }
+    };
+
     const cleanup = () => {
-      if (cleaned) {
+      if (disposed) {
         return;
       }
-      cleaned = true;
-      if (typeof resolvedTarget.removeEventListener === 'function') {
-        for (const evt of events) {
-          resolvedTarget.removeEventListener(evt, onGesture);
-        }
-      }
+      disposed = true;
+      removeListeners();
       if (this._gestureCleanup === cleanup) {
         this._gestureCleanup = null;
       }
     };
 
-    const onGesture = () => {
-      cleanup();
-      void this.resume();
+    const arm = () => {
+      if (disposed || this._destroyed) {
+        return;
+      }
+
+      const onGesture = () => {
+        removeListeners();
+        Promise.resolve(this.resume()).then((resumed) => {
+          if (
+            !resumed &&
+            !disposed &&
+            !this._destroyed &&
+            this._context &&
+            this._context.state !== 'running' &&
+            retriesRemaining > 0
+          ) {
+            retriesRemaining -= 1;
+            arm();
+          } else if (resumed || this._destroyed || retriesRemaining <= 0) {
+            cleanup();
+          }
+        });
+      };
+
+      for (const evt of events) {
+        resolvedTarget.addEventListener(evt, onGesture, { once: true, passive: true });
+      }
+
+      activeCleanup = () => {
+        if (typeof resolvedTarget.removeEventListener === 'function') {
+          for (const evt of events) {
+            resolvedTarget.removeEventListener(evt, onGesture);
+          }
+        }
+      };
     };
 
-    for (const evt of events) {
-      resolvedTarget.addEventListener(evt, onGesture, { once: true, passive: true });
-    }
-
+    arm();
     this._gestureCleanup = cleanup;
     return cleanup;
   }
 
   /**
    * Sets master output volume clamped to [0, 1] and forwards to the worklet.
+   * Rejects non-finite (`NaN`, `±Infinity`) and non-number inputs without
+   * mutating the active gain.
+   *
    * @param {number} volume
-   * @returns {number} Clamped volume.
+   * @returns {number} Active sanitized volume in [0, 1].
    */
   setVolume(volume) {
-    this._volume = clampVolume(volume);
+    if (typeof volume !== 'number' || !Number.isFinite(volume)) {
+      this._invalidGainInputs += 1;
+      return this._volume;
+    }
+
+    const clamped = clampVolume(volume, this._volume);
+    if (clamped !== volume || Object.is(volume, -0)) {
+      this._gainClamps += 1;
+    }
+
+    this._volume = clamped;
     if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
       this._node.port.postMessage({ type: 'setGain', gain: this._volume });
     }
@@ -644,7 +964,17 @@ export class AudioEngine {
   }
 
   /**
-   * Sets mute state and forwards to the worklet.
+   * Alias for `setVolume(gain)` with identical `[0, 1]` finite clamping guardrails.
+   *
+   * @param {number} gain
+   * @returns {number} Active sanitized gain in [0, 1].
+   */
+  setGain(gain) {
+    return this.setVolume(gain);
+  }
+
+  /**
+   * Sets mute state (strictly coerced to boolean) and forwards to the worklet.
    * @param {boolean} muted
    * @returns {boolean}
    */
@@ -674,27 +1004,73 @@ export class AudioEngine {
       if (used < 0) {
         used += this._capacityFrames * 2;
       }
-      bufferedFrames = used;
-      underruns = Atomics.load(this._ctrl, HDR_UNDERRUNS);
-      underrunFrames = Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES);
-      overflows = Atomics.load(this._ctrl, HDR_OVERFLOWS);
-      droppedFrames = Atomics.load(this._ctrl, HDR_DROPPED_FRAMES);
+      bufferedFrames = sanitizeFiniteNonNegInt(used, 0);
+      underruns = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_UNDERRUNS), 0);
+      underrunFrames = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES), 0);
+      overflows = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_OVERFLOWS), 0);
+      droppedFrames = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_DROPPED_FRAMES), 0);
     }
 
+    const outputState = sanitizeOutputState(this.state);
+    const gain = clampVolume(this._volume, 1.0);
+    const muted = Boolean(this._muted);
+    const effectiveGain = muted ? 0.0 : gain;
+
     return {
-      sampleRate: this.sampleRate,
+      sampleRate: sanitizePositiveFiniteNumber(this.sampleRate, this._requestedSampleRate),
       state: this.state,
-      channels: this._channels,
-      capacityFrames: this._capacityFrames,
+      outputState,
+      channels: sanitizeFiniteNonNegInt(this._channels, this._requestedChannels),
+      capacityFrames: sanitizeFiniteNonNegInt(this._capacityFrames, this._requestedCapacityFrames),
       bufferedFrames,
       underruns,
       underrunFrames,
       overflows,
       droppedFrames,
-      volume: this._volume,
-      muted: this._muted,
-      effectiveGain: this._muted ? 0.0 : this._volume,
-      error: this._error ? this._error.message : null,
+      volume: gain,
+      gain,
+      muted,
+      effectiveGain,
+      gainClamps: sanitizeFiniteNonNegInt(this._gainClamps, 0),
+      invalidGainInputs: sanitizeFiniteNonNegInt(this._invalidGainInputs, 0),
+      resumeAttempts: sanitizeFiniteNonNegInt(this._resumeAttempts, 0),
+      resumeSuccesses: sanitizeFiniteNonNegInt(this._resumeSuccesses, 0),
+      resumeFailures: sanitizeFiniteNonNegInt(this._resumeFailures, 0),
+      stateTransitions: sanitizeFiniteNonNegInt(this._stateTransitions, 0),
+      lastResumeError: this._lastResumeError,
+      error: this._error ? sanitizeResumeError(this._error) : null,
+    };
+  }
+
+  /**
+   * Returns a sanitized, finite diagnostic snapshot of AudioContext resume/state
+   * telemetry, clamped gain/mute controls, and live SAB ring counters.
+   */
+  getStats() {
+    const telemetry = this.getTelemetry();
+    return {
+      outputState: telemetry.outputState,
+      state: telemetry.outputState,
+      sampleRate: telemetry.sampleRate,
+      channels: telemetry.channels,
+      capacityFrames: telemetry.capacityFrames,
+      bufferedFrames: telemetry.bufferedFrames,
+      underruns: telemetry.underruns,
+      underrunFrames: telemetry.underrunFrames,
+      overflows: telemetry.overflows,
+      droppedFrames: telemetry.droppedFrames,
+      gain: telemetry.gain,
+      volume: telemetry.volume,
+      muted: telemetry.muted,
+      effectiveGain: telemetry.effectiveGain,
+      gainClamps: telemetry.gainClamps,
+      invalidGainInputs: telemetry.invalidGainInputs,
+      resumeAttempts: telemetry.resumeAttempts,
+      resumeSuccesses: telemetry.resumeSuccesses,
+      resumeFailures: telemetry.resumeFailures,
+      stateTransitions: telemetry.stateTransitions,
+      lastResumeError: telemetry.lastResumeError,
+      error: telemetry.error,
     };
   }
 
