@@ -6,7 +6,7 @@
 // Designed for RAGE deferred color/depth/shadow/post-FX passes in web/workers/wgpu_worker.js.
 
 (function (root) {
-  const DEFAULT_MAX_POOL_BYTES = 256 * 1024 * 1024; // 256 MiB
+  const DEFAULT_MAX_POOL_BYTES = 512 * 1024 * 1024; // 512 MiB (accommodates simultaneous 4K scene plane 1 + 1080p UI plane 0)
   const DEFAULT_IDLE_FRAME_TTL = 8;
   const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 8192;
   const DEFAULT_MAX_TEXTURE_ARRAY_LAYERS = 256;
@@ -172,6 +172,19 @@
     rgba32sint: 16,
   });
 
+  /**
+   * WebGPU compatible alternate `viewFormats` for render-target formats (sRGB / linear pairs).
+   * A texture can always be viewed in its own base `format` without listing it in `viewFormats`.
+   */
+  const COMPATIBLE_VIEW_FORMATS = Object.freeze({
+    rgba8unorm: Object.freeze(['rgba8unorm-srgb']),
+    'rgba8unorm-srgb': Object.freeze(['rgba8unorm']),
+    bgra8unorm: Object.freeze(['bgra8unorm-srgb']),
+    'bgra8unorm-srgb': Object.freeze(['bgra8unorm']),
+  });
+
+  const EMPTY_VIEW_FORMATS = Object.freeze([]);
+
   function assertPositiveInteger(value, name) {
     if (!Number.isInteger(value) || value < 1) {
       throw new RangeError(`${name} must be a positive integer, got ${value}`);
@@ -282,6 +295,103 @@
    */
   function normalizeRenderTargetFormat(format) {
     return _normalizeFormatWithMeta(format).format;
+  }
+
+  /**
+   * Return true if `viewFormat` is a WebGPU-compatible texture view format for `baseFormat`
+   * (either the same canonical format or its compatible sRGB/linear counterpart).
+   *
+   * @param {string} baseFormat
+   * @param {string} viewFormat
+   * @returns {boolean}
+   */
+  function isCompatibleViewFormat(baseFormat, viewFormat) {
+    const base = _normalizeFormatWithMeta(baseFormat).format;
+    const vf = _normalizeFormatWithMeta(viewFormat).format;
+    if (vf === base) {
+      return true;
+    }
+    const compatible = COMPATIBLE_VIEW_FORMATS[base];
+    return Array.isArray(compatible) && compatible.includes(vf);
+  }
+
+  function _normalizeViewFormatsWithMeta(rawViewFormats, baseFormat, options = {}) {
+    if (rawViewFormats === undefined || rawViewFormats === null) {
+      return {
+        viewFormats: EMPTY_VIEW_FORMATS,
+        formatNormalized: false,
+        viewFormatsNormalized: false,
+      };
+    }
+    if (
+      typeof rawViewFormats === 'string' ||
+      typeof rawViewFormats[Symbol.iterator] !== 'function'
+    ) {
+      throw new TypeError('desc.viewFormats must be an iterable of WebGPU GPUTextureFormat strings');
+    }
+
+    const filterIncompatible = Boolean(options.filterIncompatible);
+    const compatibleList = COMPATIBLE_VIEW_FORMATS[baseFormat] || EMPTY_VIEW_FORMATS;
+    const unique = new Set();
+    let formatNormalized = false;
+    let viewFormatsNormalized = false;
+    let seenCount = 0;
+
+    for (const rawFmt of rawViewFormats) {
+      seenCount += 1;
+      const fmtRes = _normalizeFormatWithMeta(rawFmt);
+      if (fmtRes.normalized) {
+        formatNormalized = true;
+      }
+      const vf = fmtRes.format;
+      if (vf === baseFormat) {
+        // WebGPU always allows creating a view with the texture's own base format.
+        viewFormatsNormalized = true;
+        continue;
+      }
+      if (!compatibleList.includes(vf)) {
+        if (filterIncompatible) {
+          viewFormatsNormalized = true;
+          continue;
+        }
+        throw new RangeError(
+          `Incompatible viewFormat "${vf}" for base texture format "${baseFormat}"`
+        );
+      }
+      if (unique.has(vf)) {
+        viewFormatsNormalized = true;
+        continue;
+      }
+      unique.add(vf);
+    }
+
+    if (unique.size === 0) {
+      return {
+        viewFormats: EMPTY_VIEW_FORMATS,
+        formatNormalized,
+        viewFormatsNormalized: viewFormatsNormalized || seenCount > 0,
+      };
+    }
+
+    const sorted = Array.from(unique).sort();
+    return {
+      viewFormats: Object.freeze(sorted),
+      formatNormalized,
+      viewFormatsNormalized,
+    };
+  }
+
+  /**
+   * Normalize, deduplicate, and canonically sort `viewFormats` for a base texture format.
+   *
+   * @param {Iterable<string> | null | undefined} viewFormats
+   * @param {string} baseFormat
+   * @param {{ filterIncompatible?: boolean }} [options]
+   * @returns {readonly string[]}
+   */
+  function normalizeViewFormats(viewFormats, baseFormat, options = {}) {
+    const canonicalBase = _normalizeFormatWithMeta(baseFormat).format;
+    return _normalizeViewFormatsWithMeta(viewFormats, canonicalBase, options).viewFormats;
   }
 
   /**
@@ -429,6 +539,11 @@
       widthResult.clamped || heightResult.clamped || depthResult.clamped;
 
     const formatResult = _normalizeFormatWithMeta(desc.format);
+    const viewFormatsResult = _normalizeViewFormatsWithMeta(
+      desc.viewFormats,
+      formatResult.format,
+      { filterIncompatible: true }
+    );
 
     const usage = desc.usage === undefined ? DEFAULT_TEXTURE_USAGE : desc.usage;
     assertPositiveInteger(usage, 'usage');
@@ -471,10 +586,12 @@
         mipLevelCount,
         depthOrArrayLayers: depthResult.value,
         dimension,
+        viewFormats: viewFormatsResult.viewFormats,
       }),
       dimensionClamped,
-      formatNormalized: formatResult.normalized,
+      formatNormalized: formatResult.normalized || viewFormatsResult.formatNormalized,
       sampleCountNormalized: sampleResult.normalized,
+      viewFormatsNormalized: viewFormatsResult.viewFormatsNormalized,
     };
   }
 
@@ -533,6 +650,9 @@
     assertPositiveInteger(depthOrArrayLayers, 'depthOrArrayLayers');
 
     const format = _normalizeFormatWithMeta(desc.format).format;
+    const viewFormats = _normalizeViewFormatsWithMeta(desc.viewFormats, format, {
+      filterIncompatible: false,
+    }).viewFormats;
 
     const usage = desc.usage === undefined ? DEFAULT_TEXTURE_USAGE : desc.usage;
     assertPositiveInteger(usage, 'usage');
@@ -554,6 +674,7 @@
       mipLevelCount,
       depthOrArrayLayers,
       dimension,
+      viewFormats,
     });
   }
 
@@ -565,10 +686,10 @@
    */
   function makeRenderTargetKey(desc) {
     const n = normalizeRenderTargetDesc(desc);
-    return (
+    const base =
       `${n.dimension}|${n.width}x${n.height}x${n.depthOrArrayLayers}|` +
-      `${n.format}|u${n.usage}|s${n.sampleCount}|m${n.mipLevelCount}`
-    );
+      `${n.format}|u${n.usage}|s${n.sampleCount}|m${n.mipLevelCount}`;
+    return n.viewFormats.length > 0 ? `${base}|vf${n.viewFormats.join(',')}` : base;
   }
 
   /**
@@ -811,6 +932,42 @@
       return false;
     }
 
+    _evictIdleToBudget(targetBytes = this._maxPoolBytes, reserveBytes = 0) {
+      let evictedCount = 0;
+      let evictedBytes = 0;
+      while (
+        this._activeBytes + this._idleBytes + reserveBytes > targetBytes &&
+        this._idleLru.size > 0
+      ) {
+        const oldest = this._idleLru.values().next().value;
+        const bytes = oldest.byteSize;
+        if (this._evictIdleRecord(oldest, 'budget')) {
+          evictedCount += 1;
+          evictedBytes += bytes;
+        }
+      }
+      return { evictedCount, evictedBytes };
+    }
+
+    /**
+     * Reconfigure the pool's GPU memory budget (`maxPoolBytes`) at runtime and
+     * LRU-evict excess idle targets if current pooled bytes exceed the new budget.
+     * Never destroys currently checked-out/active targets.
+     *
+     * @param {number} maxPoolBytes Positive integer or Infinity.
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    setMaxPoolBytes(maxPoolBytes) {
+      this._assertNotDestroyed();
+      if (maxPoolBytes !== Infinity && (!Number.isInteger(maxPoolBytes) || maxPoolBytes < 1)) {
+        throw new RangeError(
+          `maxPoolBytes must be a positive integer or Infinity, got ${maxPoolBytes}`
+        );
+      }
+      this._maxPoolBytes = maxPoolBytes;
+      return this._evictIdleToBudget(this._maxPoolBytes, 0);
+    }
+
     _retireActiveRecord(record) {
       record.active = false;
       record.leaseToken = 0;
@@ -952,13 +1109,8 @@
       }
 
       // 3. LRU-evict idle targets until totalBytes + byteSize <= maxPoolBytes (or no idle left).
-      while (
-        this._activeBytes + this._idleBytes + byteSize > this._maxPoolBytes &&
-        this._idleLru.size > 0
-      ) {
-        const oldest = this._idleLru.values().next().value;
-        this._evictIdleRecord(oldest, 'budget');
-      }
+      //    Checked-out / active targets are never destroyed by budget eviction.
+      this._evictIdleToBudget(this._maxPoolBytes, byteSize);
 
       // 4. Allocate new GPUTexture + cached default GPUTextureView.
       const id = this._nextId++;
@@ -967,7 +1119,7 @@
           ? label
           : `playgta6-rt-${id}-${normalizedDesc.width}x${normalizedDesc.height}-${normalizedDesc.format}`;
 
-      const texture = this._device.createTexture({
+      const textureDesc = {
         label: resolvedLabel,
         size: {
           width: normalizedDesc.width,
@@ -979,7 +1131,11 @@
         dimension: normalizedDesc.dimension,
         format: normalizedDesc.format,
         usage: normalizedDesc.usage,
-      });
+      };
+      if (normalizedDesc.viewFormats.length > 0) {
+        textureDesc.viewFormats = normalizedDesc.viewFormats.slice();
+      }
+      const texture = this._device.createTexture(textureDesc);
 
       let view = null;
       try {
@@ -1173,6 +1329,13 @@
         }
       }
 
+      // Trim any excess idle targets back within maxPoolBytes (e.g. after a strictBudget=false burst)
+      // without ever destroying checked-out/active targets.
+      if (this._activeBytes + this._idleBytes > this._maxPoolBytes && this._idleLru.size > 0) {
+        const trimmed = this._evictIdleToBudget(this._maxPoolBytes, 0);
+        evictedCount += trimmed.evictedCount;
+      }
+
       return {
         frame: this._currentFrame,
         evictedCount,
@@ -1265,15 +1428,22 @@
       return {
         hits: this._hits,
         misses: this._misses,
+        poolHits: this._hits,
+        poolMisses: this._misses,
         hitRate,
         reuseRatio: hitRate,
         activeCount: this._activeEntries.size,
         idleCount: this._idleLru.size,
+        activeTargets: this._activeEntries.size,
+        idleTargets: this._idleLru.size,
         activeBytes: this._activeBytes,
         idleBytes: this._idleBytes,
         totalBytes,
+        estimatedBytes: totalBytes,
         peakBytes: this._peakBytes,
         peakPooledBytes: this._peakBytes,
+        peakEstimatedBytes: this._peakBytes,
+        maxPoolBytes: this._maxPoolBytes,
         evictions: this._evictions,
         budgetEvictions: this._budgetEvictions,
         idleEvictions: this._idleEvictions,
@@ -1320,7 +1490,10 @@
     DEFAULT_TEXTURE_USAGE,
     FORMAT_BYTES_PER_PIXEL,
     DXGI_FORMAT_ALIASES,
+    COMPATIBLE_VIEW_FORMATS,
     normalizeRenderTargetFormat,
+    isCompatibleViewFormat,
+    normalizeViewFormats,
     normalizeSampleCount,
     sanitizeRenderTargetDesc,
     normalizeRenderTargetDesc,
