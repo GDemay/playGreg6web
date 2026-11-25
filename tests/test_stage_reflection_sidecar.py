@@ -88,93 +88,6 @@ class SidecarTests(unittest.TestCase):
             self.assertEqual(doc["stages"], {}, source)
             self.assertEqual(skipped, {"malformed heap source": 1}, source)
 
-    def test_cbv_indexed_heap_sources_are_kept(self):
-        # G62 (#482): the heap index is a dword of a root CBV, a table CBV or root constants.
-        sources = [
-            {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 10, "root_descriptor": True},
-                                           "byte_offset": 16, "shift": 5, "stride": 32}},
-            {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 8, "table_byte_offset": 64},
-                                           "byte_offset": 4, "shift": 5, "bit_offset": 16, "mask": 0xFFFF}},
-            {"cbv_indexed_sampler_heap": {"cbv": {"user_sgpr": 12, "root_constants": True},
-                                          "byte_offset": 0, "shift": 4}},
-        ]
-        entry = {"hash_fnv1a64": "0x00000000000000c4", "stage": "fragment", "bindings": [
-            {"group": 0, "binding": 0, "kind": "texture", "source": sources[0]},
-            {"group": 0, "binding": 1, "kind": "texture", "source": sources[1]},
-            {"group": 0, "binding": 2, "kind": "sampler", "source": sources[2]}]}
-        doc, skipped = sidecar.build([entry])
-        self.assertEqual(skipped, {})
-        bindings = doc["stages"]["0x00000000000000c4"]["bindings"]
-        self.assertEqual([b["source"] for b in bindings], sources)
-        summary = sidecar.summarize_stages(doc["stages"])
-        self.assertEqual(summary["cbv_indexed_heap_stages"], 1)
-        self.assertEqual(summary["cbv_indexed_heap_bindings"], 3)
-        self.assertEqual(summary["resource_heap_bindings"], 0)
-
-    def test_malformed_cbv_indexed_heap_source_is_skipped(self):
-        root_cbv = {"user_sgpr": 10, "root_descriptor": True}
-        bad = [
-            {"cbv_indexed_resource_heap": {"byte_offset": 0, "shift": 5}},
-            {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 10}, "byte_offset": 0, "shift": 5}},
-            {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 10, "root_descriptor": True, "table_byte_offset": 0},
-                                           "byte_offset": 0, "shift": 5}},
-            {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 8, "table_byte_offset": 40}, "byte_offset": 0, "shift": 5}},
-            {"cbv_indexed_resource_heap": {"cbv": root_cbv, "byte_offset": 6, "shift": 5}},
-            {"cbv_indexed_resource_heap": {"cbv": root_cbv, "byte_offset": 0, "shift": 32}},
-            {"cbv_indexed_resource_heap": {"cbv": root_cbv, "byte_offset": 0, "shift": 5, "bit_offset": 32}},
-            {"cbv_indexed_resource_heap": {"cbv": root_cbv, "byte_offset": 0, "shift": 5, "mask": 0}},
-            {"cbv_indexed_resource_heap": {"cbv": root_cbv, "byte_offset": "0", "shift": 5}},
-            {"cbv_indexed_sampler_heap": 3},
-        ]
-        for i, source in enumerate(bad):
-            entry = {"hash_fnv1a64": f"0x{i + 32:016x}", "stage": "fragment",
-                     "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": source}]}
-            doc, skipped = sidecar.build([entry])
-            self.assertEqual(doc["stages"], {}, source)
-            self.assertEqual(skipped, {"malformed CB-indexed heap source": 1}, source)
-
-    def test_lane_indexed_heap_sources_are_kept(self):
-        # G62 (#482): per-lane bindless, a window of max_count descriptors, base 0 or a CB dword.
-        sources = [
-            {"lane_indexed_resource_heap": {"max_count": 64, "shift": 5, "stride": 32}},
-            {"lane_indexed_sampler_heap": {"max_count": 16, "shift": 4, "window_base": {
-                "cbv": {"user_sgpr": 10, "root_descriptor": True}, "byte_offset": 8, "bit_offset": 8, "mask": 0xFF}}},
-        ]
-        entry = {"hash_fnv1a64": "0x00000000000000c5", "stage": "fragment", "bindings": [
-            {"group": 0, "binding": 0, "kind": "texture", "source": sources[0]},
-            {"group": 0, "binding": 1, "kind": "sampler", "source": sources[1]}]}
-        doc, skipped = sidecar.build([entry])
-        self.assertEqual(skipped, {})
-        bindings = doc["stages"]["0x00000000000000c5"]["bindings"]
-        self.assertEqual([b["source"] for b in bindings], sources)
-        summary = sidecar.summarize_stages(doc["stages"])
-        self.assertEqual(summary["lane_indexed_heap_stages"], 1)
-        self.assertEqual(summary["lane_indexed_heap_bindings"], 2)
-        self.assertEqual(summary["cbv_indexed_heap_bindings"], 0)
-
-    def test_malformed_lane_indexed_heap_source_is_skipped(self):
-        root_cbv = {"user_sgpr": 10, "root_descriptor": True}
-        bad = [
-            {"lane_indexed_resource_heap": {"shift": 5}},
-            {"lane_indexed_resource_heap": {"max_count": 0, "shift": 5}},
-            {"lane_indexed_resource_heap": {"max_count": 257, "shift": 5}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 32}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "stride": -1}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "window_base": 0}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "window_base": {"byte_offset": 0}}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5,
-                                            "window_base": {"cbv": root_cbv, "byte_offset": 6}}},
-            {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5,
-                                            "window_base": {"cbv": root_cbv, "byte_offset": 0, "mask": 0}}},
-            {"lane_indexed_sampler_heap": 3},
-        ]
-        for i, source in enumerate(bad):
-            entry = {"hash_fnv1a64": f"0x{i + 64:016x}", "stage": "fragment",
-                     "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": source}]}
-            doc, skipped = sidecar.build([entry])
-            self.assertEqual(doc["stages"], {}, source)
-            self.assertEqual(skipped, {"malformed lane-indexed heap source": 1}, source)
-
     def test_inline_sampler_is_kept(self):
         # Hand-made GFX10 S#: clamp-to-edge bilinear, linear mips, max LOD 15.
         source = {"inline_sampler": {"sdwords": [0x92, 0x00F00000, 0x08500000, 0]}}
@@ -270,10 +183,6 @@ class SidecarTests(unittest.TestCase):
             "inline_sampler_bindings": 0,
             "resource_heap_stages": 0,
             "resource_heap_bindings": 0,
-            "cbv_indexed_heap_stages": 0,
-            "cbv_indexed_heap_bindings": 0,
-            "lane_indexed_heap_stages": 0,
-            "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
         })
         self.assertEqual(set(written["stages"].keys()), {
@@ -324,10 +233,6 @@ class SidecarTests(unittest.TestCase):
                 "inline_sampler_bindings": 0,
                 "resource_heap_stages": 0,
                 "resource_heap_bindings": 0,
-                "cbv_indexed_heap_stages": 0,
-                "cbv_indexed_heap_bindings": 0,
-                "lane_indexed_heap_stages": 0,
-                "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
             })
 
@@ -345,10 +250,6 @@ class SidecarTests(unittest.TestCase):
                 "inline_sampler_bindings": 0,
                 "resource_heap_stages": 0,
                 "resource_heap_bindings": 0,
-                "cbv_indexed_heap_stages": 0,
-                "cbv_indexed_heap_bindings": 0,
-                "lane_indexed_heap_stages": 0,
-                "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
             })
             written = json.loads(out.read_text(encoding="utf-8"))
@@ -410,10 +311,6 @@ class SidecarTests(unittest.TestCase):
             "inline_sampler_bindings": 0,
             "resource_heap_stages": 0,
             "resource_heap_bindings": 0,
-            "cbv_indexed_heap_stages": 0,
-            "cbv_indexed_heap_bindings": 0,
-            "lane_indexed_heap_stages": 0,
-            "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
         })
         self.assertNotIn("merged_existing", summary)
@@ -662,10 +559,6 @@ class SidecarTests(unittest.TestCase):
             "inline_sampler_bindings": 3,
             "resource_heap_stages": 2,
             "resource_heap_bindings": 3,
-            "cbv_indexed_heap_stages": 0,
-            "cbv_indexed_heap_bindings": 0,
-            "lane_indexed_heap_stages": 0,
-            "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 2,
         })
 
@@ -676,10 +569,6 @@ class SidecarTests(unittest.TestCase):
             "inline_sampler_bindings": 0,
             "resource_heap_stages": 0,
             "resource_heap_bindings": 0,
-            "cbv_indexed_heap_stages": 0,
-            "cbv_indexed_heap_bindings": 0,
-            "lane_indexed_heap_stages": 0,
-            "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
         })
         stages = {

@@ -31,7 +31,6 @@
 // the XApu model (acp_hal_guest.cpp) neither decodes nor sends such results.
 
 #include "os/audio_downmix.h"
-#include "os/audio_report.h"
 
 #include <algorithm>
 #include <atomic>
@@ -648,11 +647,9 @@ public:
         if (buffer != 0 && frames != 0) {
             std::vector<float> stereo(static_cast<size_t>(frames) * 2);
             if (com::read_guest(buffer, stereo.data(), stereo.size() * sizeof(float))) {
-                const bool nonzero = any_nonzero(stereo.data(), stereo.size(), nullptr);
-                if (nonzero) {
+                if (any_nonzero(stereo.data(), stereo.size(), nullptr)) {
                     g_render_nonzero_frames.fetch_add(frames);
                 }
-                audio_report::windows().record(frames, nonzero);
                 audio_downmix::push_render_stereo(stereo.data(), frames);
             }
         }
@@ -1406,7 +1403,6 @@ void reset_audio_endpoint() {
     g_spatial_object_buffers = 0;
     g_spatial_nonzero_buffers = 0;
     g_render_nonzero_frames = 0;
-    audio_report::windows().reset();
     g_render_silent_releases = 0;
 }
 

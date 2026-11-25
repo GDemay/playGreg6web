@@ -285,7 +285,16 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
                              record->entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
                 const bool same_joins = std::equal(
                     existing->joins.begin(), existing->joins.end(), record->joins.begin(),
-                    [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) { return d3d::same_join(a, b); });
+                    [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) {
+                        return a.binding == b.binding && a.register_class == b.register_class &&
+                               a.shader_register == b.shader_register && a.register_space == b.register_space &&
+                               a.root_constants == b.root_constants && a.heap == b.heap &&
+                               a.heap_index_parameter == b.heap_index_parameter &&
+                               a.heap_index_dword == b.heap_index_dword && a.heap_shift == b.heap_shift &&
+                               a.table_parameter == b.table_parameter && a.table_slot == b.table_slot &&
+                               a.inline_sampler == b.inline_sampler &&
+                               std::memcmp(&a.sampler, &b.sampler, sizeof(a.sampler)) == 0;
+                    });
                 if (same_joins) {
                     found = existing.get();
                     break;
@@ -1438,11 +1447,9 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             bind_group_id = it->second;
         } else {
             const uint64_t heap_misses_before = bind_groups_.heap_index_misses();
-            const uint64_t cb_misses_before = bind_groups_.cb_index_misses();
             const d3d::BindGroupLookup lookup = bind_groups_.get_or_build(
                 root_args_, bind_point, plans[g], group.id, &StateBridgeDevice::gpu_va_trampoline, &device_);
             stats_.heap_index_misses += bind_groups_.heap_index_misses() - heap_misses_before;
-            stats_.cb_index_misses += bind_groups_.cb_index_misses() - cb_misses_before;
             if (lookup.status != d3d::Status::Ok || lookup.bind_group == nullptr) {
                 diagnostics_ |= lookup.status == d3d::Status::RootArgumentNotSet ? BridgeDiag::RootArgumentNotSet
                                                                                   : BridgeDiag::BindGroupBuildFailed;

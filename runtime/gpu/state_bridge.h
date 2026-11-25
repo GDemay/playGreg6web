@@ -393,8 +393,6 @@ struct BridgeStats {
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;
-    // ... of those, CB-indexed bindings (G62) whose index could not be read from the constant buffer.
-    uint64_t cb_index_misses = 0;
 };
 
 class CommandListBridge {

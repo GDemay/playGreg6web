@@ -1179,9 +1179,6 @@ private:
         d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t index,
                                  d3d::DescriptorRangeType range) const override;
         bool sampler(const d3d::DescriptorHeap& heap, uint32_t index, d3d::SamplerDesc* out) const override;
-        // Constant-buffer contents for CB-indexed heap bindings (G62): guest memory at the CPU
-        // address the GPU address aliases (cpu_address_for_gpu).
-        bool read_gpu_memory(uint64_t gpu_address, void* out, size_t bytes) const override;
 
     private:
         void note(uint32_t kind, uint32_t status, uint64_t address) const;
@@ -1447,10 +1444,6 @@ enum class Work : size_t {
     GpuObjectsDeferred,
     GpuObjectsCreatedOnUse,
     GpuObjectsNeverCreated,
-    // Lane-indexed heap bindings (VGPR / waterfall bindless, stage_reflection.h, G62 #482) that
-    // failed their pipeline's reflection join because the bridge has no descriptor arrays yet, per
-    // pipeline state created.
-    ReflectionLaneIndexedUnbound,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

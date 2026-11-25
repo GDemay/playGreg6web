@@ -140,22 +140,6 @@ _RESULT_RX = re.compile(r"RESULT:\s*replayed\s+(\d+)\s+frame\(s\)(?:,\s*(\d+)\s+
 _FRAME_MS_RX = re.compile(r"(?:present_ms|frame_ms|dt_ms)\s*[=:]\s*([\d.]+)", re.IGNORECASE)
 
 
-AUTO_TRIM_MAX_BYTES = 1536 * 1048576  # Chrome fails to fetch() traces much beyond ~2 GB
-AUTO_TRIM_EVERY = 100
-AUTO_TRIM_LARGEST = 12
-
-
-def resolve_trim(trace_size, trim_every, trim_largest, max_trace_mb=1536):
-    """Decide the trim parameters. An explicit --trim-every wins; otherwise traces larger than
-    max_trace_mb (0 = never) are auto-trimmed with AUTO_TRIM_EVERY / max(trim_largest, AUTO_TRIM_LARGEST).
-    Returns (every, largest, auto)."""
-    if trim_every > 0:
-        return trim_every, trim_largest, False
-    if max_trace_mb > 0 and trace_size > max_trace_mb * 1048576:
-        return AUTO_TRIM_EVERY, max(trim_largest, AUTO_TRIM_LARGEST), True
-    return 0, trim_largest, False
-
-
 def parse_replay_log(text):
     """Extract per-frame stats from the page log lines."""
     return [{"frame": int(m[1]), "width": int(m[2]), "height": int(m[3]), "format": m[4],
@@ -656,9 +640,6 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=900, help="seconds to wait for the replay (default 900)")
     p.add_argument("--trim-every", type=int, default=0, help="keep every Nth upload of the largest textures (0 = no trim)")
     p.add_argument("--trim-largest", type=int, default=3, help="how many largest textures to trim (default 3)")
-    p.add_argument("--max-trace-mb", type=int, default=1536,
-                   help="auto-trim (every 100th upload, 12 largest textures) when the trace is bigger than this, "
-                        "since Chrome cannot fetch ~2 GB traces; 0 disables (default 1536)")
     p.add_argument("--web-root", default=str(REPO_ROOT / "web"), help="web/ dir to serve (default repo web/)")
     p.add_argument("--canvas", default="", help="canvas format override, e.g. rgba8unorm")
     p.add_argument("--verify-non-black", action="store_true",
@@ -680,19 +661,13 @@ def main(argv=None):
     replay_dir = Path(args.replay_dir).resolve()
     trace = args.trace
     trim_info = None
-    trim_every, trim_largest, auto = resolve_trim((replay_dir / trace).stat().st_size, args.trim_every,
-                                                  args.trim_largest, args.max_trace_mb)
-    if auto:
-        print(f"trace is {(replay_dir / trace).stat().st_size // 1048576} MiB (> {args.max_trace_mb} MiB): "
-              f"auto-trimming with --trim-every {trim_every} --trim-largest {trim_largest}", file=sys.stderr)
-    if trim_every > 0:
+    if args.trim_every > 0:
         with open(replay_dir / trace, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
-            ids = largest_textures(d, trim_largest)
-            data, frames, dropped = trim_trace(d, trim_every, ids)
+            ids = largest_textures(d, args.trim_largest)
+            data, frames, dropped = trim_trace(d, args.trim_every, ids)
         trace += ".trimmed"
         (replay_dir / trace).write_bytes(data)
         trim_info = {
-            "auto": auto,
             "trimmed_texture_ids": ids,
             "frames": frames,
             "dropped_bytes": dropped,

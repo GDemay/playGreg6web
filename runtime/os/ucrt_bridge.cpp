@@ -1850,10 +1850,7 @@ int32_t pg6_crt_setvbuf(FILE* stream, char* buffer, int32_t mode, size_t size) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
-    // R40: a guest-supplied stdio buffer may sit in XMem memory, and the CRT fills it with kernel
-    // reads (ReadFile), which fail on an armed (write-tracked) page. Let the CRT own the buffer.
-    (void)buffer;
-    return std::setvbuf(stream, nullptr, mode, size);
+    return std::setvbuf(stream, buffer, mode, size);
 }
 
 int32_t pg6_crt_ungetc(int32_t ch, FILE* stream) {

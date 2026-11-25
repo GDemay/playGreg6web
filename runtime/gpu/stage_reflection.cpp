@@ -273,27 +273,6 @@ bool view_dimension_from_name(std::string_view name, GpuTextureViewDimension* ou
     return false;
 }
 
-// The CB dword of a CB-indexed index or a lane-indexed window base (G62): "cbv" {user_sgpr,
-// root_descriptor | table_byte_offset | root_constants}, "byte_offset", optional "bit_offset" and
-// "mask" in `body`. False when malformed.
-bool parse_cb_dword(const Json& body, ReflectedBinding* r) {
-    const Json* cbv = body.get("cbv");
-    bool ok = cbv != nullptr && cbv->type == Json::Type::Object && get_u32(*cbv, "user_sgpr", &r->user_sgpr) &&
-              get_u32(body, "byte_offset", &r->cb_byte_offset) && get_u32(body, "bit_offset", &r->cb_bit_offset, false) &&
-              get_u32(body, "mask", &r->cb_mask, false);
-    if (ok) {
-        if (get_bool(*cbv, "root_descriptor")) {
-            r->cbv = ReflectedCbv::RootDescriptor;
-        } else if (get_bool(*cbv, "root_constants")) {
-            r->cbv = ReflectedCbv::RootConstants;
-        } else {
-            r->cbv = ReflectedCbv::Table;
-            ok = get_u32(*cbv, "table_byte_offset", &r->table_byte_offset);
-        }
-    }
-    return ok && r->cb_bit_offset < 32 && r->cb_mask != 0 && r->cb_byte_offset % 4 == 0;
-}
-
 bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
     const std::string stage = get_string(s, "stage");
     if (stage == "vertex") {
@@ -396,43 +375,6 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                              " needs base_user_sgpr, stride and index {user_sgpr, shift}";
                     return false;
                 }
-            } else if (const Json* cb_heap = src->get("cbv_indexed_sampler_heap") != nullptr
-                                                 ? src->get("cbv_indexed_sampler_heap")
-                                                 : src->get("cbv_indexed_resource_heap");
-                       cb_heap != nullptr) {
-                const bool sampler_cb = src->get("cbv_indexed_sampler_heap") != nullptr;
-                const char* name = sampler_cb ? "cbv_indexed_sampler_heap" : "cbv_indexed_resource_heap";
-                r.source = sampler_cb ? ReflectedSource::CbvIndexedSamplerHeap : ReflectedSource::CbvIndexedResourceHeap;
-                const bool ok = cb_heap->type == Json::Type::Object && parse_cb_dword(*cb_heap, &r) &&
-                                get_u32(*cb_heap, "shift", &r.heap_shift) &&
-                                get_u32(*cb_heap, "stride", &r.heap_stride, false);
-                if (!ok || r.heap_shift >= 32) {
-                    *error = std::string(name) +
-                             " needs cbv {user_sgpr, root_descriptor | table_byte_offset | root_constants}, a dword-aligned "
-                             "byte_offset, shift < 32 and (optional) bit_offset < 32, non-zero mask, stride";
-                    return false;
-                }
-            } else if (const Json* lane = src->get("lane_indexed_sampler_heap") != nullptr
-                                              ? src->get("lane_indexed_sampler_heap")
-                                              : src->get("lane_indexed_resource_heap");
-                       lane != nullptr) {
-                const bool sampler_lane = src->get("lane_indexed_sampler_heap") != nullptr;
-                const char* name = sampler_lane ? "lane_indexed_sampler_heap" : "lane_indexed_resource_heap";
-                r.source = sampler_lane ? ReflectedSource::LaneIndexedSamplerHeap : ReflectedSource::LaneIndexedResourceHeap;
-                bool ok = lane->type == Json::Type::Object && get_u32(*lane, "max_count", &r.lane_max_count) &&
-                          get_u32(*lane, "shift", &r.heap_shift) && get_u32(*lane, "stride", &r.heap_stride, false) &&
-                          r.lane_max_count != 0 && r.lane_max_count <= kMaxLaneIndexedWindow && r.heap_shift < 32;
-                if (const Json* base = ok ? lane->get("window_base") : nullptr; base != nullptr) {
-                    r.lane_has_window_base = true;
-                    ok = base->type == Json::Type::Object && parse_cb_dword(*base, &r);
-                }
-                if (!ok) {
-                    *error = std::string(name) + " needs max_count in 1.." + std::to_string(kMaxLaneIndexedWindow) +
-                             ", shift < 32, (optional) stride and (optional) window_base {cbv {user_sgpr, "
-                             "root_descriptor | table_byte_offset | root_constants}, a dword-aligned byte_offset, "
-                             "bit_offset < 32, non-zero mask}";
-                    return false;
-                }
             } else if (const Json* inline_sampler = src->get("inline_sampler"); inline_sampler != nullptr) {
                 r.source = ReflectedSource::InlineSampler;
                 const Json* words =
@@ -518,28 +460,6 @@ std::string binding_key(const ReflectedBinding& b) {
             k += std::string(" <- ") + (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") +
                  " heap[s" + std::to_string(b.heap_index_sgpr) + " << " + std::to_string(b.heap_shift) + "]";
             break;
-        case ReflectedSource::CbvIndexedSamplerHeap:
-        case ReflectedSource::CbvIndexedResourceHeap:
-            k += std::string(" <- ") + (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") +
-                 " heap[cb(" +
-                 (b.cbv == ReflectedCbv::RootDescriptor ? "root CBV"
-                  : b.cbv == ReflectedCbv::RootConstants ? "root constants"
-                                                          : "table + " + std::to_string(b.table_byte_offset)) +
-                 " at s" + std::to_string(b.user_sgpr) + ")[" + std::to_string(b.cb_byte_offset) + "] << " +
-                 std::to_string(b.heap_shift) + "]";
-            break;
-        case ReflectedSource::LaneIndexedSamplerHeap:
-        case ReflectedSource::LaneIndexedResourceHeap:
-            k += std::string(" <- ") + (b.source == ReflectedSource::LaneIndexedSamplerHeap ? "sampler" : "resource") +
-                 " heap[(" +
-                 (!b.lane_has_window_base ? std::string("0")
-                  : "cb(" +
-                        (b.cbv == ReflectedCbv::RootDescriptor ? std::string("root CBV")
-                         : b.cbv == ReflectedCbv::RootConstants ? std::string("root constants")
-                                                                 : "table + " + std::to_string(b.table_byte_offset)) +
-                        " at s" + std::to_string(b.user_sgpr) + ")[" + std::to_string(b.cb_byte_offset) + "]") +
-                 " + lane) << " + std::to_string(b.heap_shift) + "] x " + std::to_string(b.lane_max_count);
-            break;
     }
     return k;
 }
@@ -606,7 +526,12 @@ bool same_binding(const bridge::LayoutBinding& a, const bridge::LayoutBinding& b
     return a.entry.type == b.entry.type && a.entry.binding_type == b.entry.binding_type &&
            a.entry.view_dimension == b.entry.view_dimension && a.join.register_class == b.join.register_class &&
            a.join.shader_register == b.join.shader_register && a.join.register_space == b.join.register_space &&
-           d3d::same_join(a.join, b.join);
+           a.join.root_constants == b.join.root_constants && a.join.heap == b.join.heap &&
+           a.join.heap_index_parameter == b.join.heap_index_parameter &&
+           a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift &&
+           a.join.table_parameter == b.join.table_parameter && a.join.table_slot == b.join.table_slot &&
+           a.join.inline_sampler == b.join.inline_sampler &&
+           std::memcmp(&a.join.sampler, &b.join.sampler, sizeof(a.join.sampler)) == 0;
 }
 
 pso::WgpuVertexFormat element_class(pso::WgpuVertexFormat f, ReflectedComponentType* cls) {
@@ -681,63 +606,10 @@ int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute,
     return -1;
 }
 
-namespace {
-
-// The constant buffer a CB-indexed index or a lane-indexed window base is read from (G62): the
-// root parameter at b.user_sgpr, checked against b.cbv. False with the reason when it does not fit.
-bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const ReflectedBinding& b, int* pi_out,
-                   d3d::HeapIndexSource* from, uint32_t* cb_table_slot, std::string* why) {
-    const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
-    if (pi < 0) {
-        *why = "no root parameter starts at s" + std::to_string(b.user_sgpr);
-        return false;
-    }
-    const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
-    const std::string pname = "root parameter " + std::to_string(pi);
-    switch (b.cbv) {
-        case ReflectedCbv::RootDescriptor:
-            if (p.parameter_type != d3d::RootParameterType::Cbv) {
-                *why = pname + " is not a root CBV";
-                return false;
-            }
-            *from = d3d::HeapIndexSource::CbRootDescriptor;
-            break;
-        case ReflectedCbv::RootConstants:
-            if (p.parameter_type != d3d::RootParameterType::Constants32Bit || b.cb_byte_offset / 4 >= p.num_32bit_values) {
-                *why = pname + " is not root constants covering byte " + std::to_string(b.cb_byte_offset);
-                return false;
-            }
-            *from = d3d::HeapIndexSource::CbRootConstants;
-            break;
-        case ReflectedCbv::Table: {
-            bool sampler_table = false;
-            for (const d3d::DescriptorRangeDesc& r : p.ranges) {
-                sampler_table = sampler_table || r.range_type == d3d::DescriptorRangeType::Sampler;
-            }
-            if (p.parameter_type != d3d::RootParameterType::DescriptorTable || sampler_table) {
-                *why = pname + " is not a CBV_SRV_UAV descriptor table";
-                return false;
-            }
-            if (b.table_byte_offset % kTableSlotBytes != 0) {
-                *why = pname + ": byte offset " + std::to_string(b.table_byte_offset) + " is not a descriptor boundary";
-                return false;
-            }
-            *from = d3d::HeapIndexSource::CbTable;
-            *cb_table_slot = b.table_byte_offset / kTableSlotBytes;
-            break;
-        }
-    }
-    *pi_out = pi;
-    return true;
-}
-
-}  // namespace
-
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
                           bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats) {
     std::map<std::pair<uint32_t, uint32_t>, bridge::LayoutBinding> joined;
     uint64_t outside_rs = 0;
-    uint64_t lane_indexed = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -778,62 +650,6 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
                 lb.join.heap_index_dword = dword;
                 lb.join.heap_shift = b.heap_shift;
-            } else if (b.source == ReflectedSource::CbvIndexedSamplerHeap ||
-                       b.source == ReflectedSource::CbvIndexedResourceHeap) {
-                // CB-indexed heap (G62): the CB is the root parameter at user_sgpr; the index is read
-                // from it at draw time, the class follows the kind.
-                int pi = -1;
-                d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
-                std::string why;
-                if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &why)) {
-                    fail(b, why);
-                    continue;
-                }
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if ((b.source == ReflectedSource::CbvIndexedSamplerHeap) != sampler_kind) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
-                                (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") + " heap");
-                    continue;
-                }
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
-                          ? d3d::DescriptorRangeType::Uav
-                          : d3d::DescriptorRangeType::Srv;
-                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
-                lb.join.heap_index_source = from;
-                lb.join.heap_shift = b.heap_shift;
-                lb.join.cb_byte_offset = b.cb_byte_offset;
-                lb.join.cb_bit_offset = b.cb_bit_offset;
-                lb.join.cb_mask = b.cb_mask;
-            } else if (b.source == ReflectedSource::LaneIndexedSamplerHeap ||
-                       b.source == ReflectedSource::LaneIndexedResourceHeap) {
-                // Lane-indexed heap window (G62): validated like a CB-indexed source, then refused
-                // with its own reason: the bridge cannot bind a binding_array of descriptors yet.
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if ((b.source == ReflectedSource::LaneIndexedSamplerHeap) != sampler_kind) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
-                                (b.source == ReflectedSource::LaneIndexedSamplerHeap ? "sampler" : "resource") +
-                                " heap");
-                    continue;
-                }
-                if (b.lane_has_window_base) {
-                    int pi = -1;
-                    d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
-                    uint32_t slot = 0;
-                    std::string why;
-                    if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why)) {
-                        fail(b, "window base: " + why);
-                        continue;
-                    }
-                }
-                ++lane_indexed;
-                fail(b, "lane-indexed heap window of " + std::to_string(b.lane_max_count) +
-                            " descriptors needs a binding array; the bridge cannot bind descriptor arrays yet");
-                continue;
             } else if (b.source == ReflectedSource::InlineSampler) {
                 if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
                     fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
@@ -947,10 +763,6 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     case ReflectedSource::SamplerHeap:
                     case ReflectedSource::ResourceHeap:
                     case ReflectedSource::InlineSampler:
-                    case ReflectedSource::CbvIndexedSamplerHeap:
-                    case ReflectedSource::CbvIndexedResourceHeap:
-                    case ReflectedSource::LaneIndexedSamplerHeap:
-                    case ReflectedSource::LaneIndexedResourceHeap:
                         break;
                 }
             }
@@ -1028,9 +840,6 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     std::max(it->second.entry.min_binding_size, lb.entry.min_binding_size);
             }
         }
-    }
-    if (stats != nullptr) {
-        stats->lane_indexed_bindings += lane_indexed;
     }
     if (!ok) {
         return false;

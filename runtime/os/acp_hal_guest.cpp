@@ -25,12 +25,8 @@
 #include <deque>
 #include <map>
 #include <mutex>
-#include <memory>
 #include <string>
-#include <utility>
-#include <vector>
 
-#include "os/xapu_opus.h"
 #include "os/xbox_scarlett_guest.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -240,7 +236,7 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 // xapu.dll: the audio processing unit's command / result queues. Call shapes:
 //   XApuConnect(const params*, p2*, XApuHandle* out) -> HRESULT (>= 0 is success)
 //   XApuEnqueueCommand(handle, const command*, u32 0) -> HRESULT (ignored by every caller);
-//       a command starts {u32 type, u32 voice index}; types 1, 2, 3 and 5 are sent.
+//       a command starts {u32 type, u32 voice index}; types 1, 2 and 5 are sent.
 //   XApuGetResultCount(handle, u32 0) -> u32 count (returned directly, not an HRESULT)
 //   XApuDequeueResult(handle, result* (0x38 bytes)) -> HRESULT, called count times
 //   XApuDisconnect(handle) at shutdown
@@ -250,46 +246,19 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 // state 4 it stores the result's u32 at +0x34 (bytes of float32 output written to the voice's
 // output slot) and moves it to state 5, after which the stream decoder (0x144E64B10) converts
 // that many bytes to int16 PCM. Without these results the title's decoded streams stay silent.
-//
-// Command 3 is a decode request, built by 0x144F20AD0 (0x40 bytes):
-//   +0x00 u32 3            +0x04 u32 voice index     +0x08..+0x1B zero
-//   +0x1C f32 sample rate  +0x20 u32 frames to drop from the start of this packet's output (the
-//                            stream's pending trim, cleared by the title once sent)
-//   +0x24 u32 960 (frames per packet)
-//   +0x28 u32 packet bytes +0x2C u64 packet address (the voice's input slot, base + s * 0x280)
-//   +0x34 u32 output capacity in bytes (channels * 0xF00)
-//   +0x38 u64 output address (the voice's output slot, base + 0x14000 + s * 0x1E00)
-// The packet is one Opus packet: the title walks its streams as {i16 length, payload} records
-// (0x144E64480), accepts payloads of at most 0x280 bytes (0x144E64710) and copies a record minus
-// its length prefix into the input slot; 960 float32 frames per channel per packet is Opus's
-// 20 ms frame at 48 kHz. The channel count is capacity / 0xF00.
 // Model: no processing hardware, but every command of types 1, 2 and 5 is acknowledged with a
 // result {type, voice index} (the rest zero) in submission order, so voices move through their
-// states and are freed. Command 3 is decoded synchronously (os/xapu_opus.h; per-voice decoder
-// state, reset by commands 1 and 2), the float32 PCM written to the output address, and a result
-// {3, voice index, zeros, +0x34 bytes written} queued (0 bytes when the packet does not decode).
-// Other command types are accepted without a result (counted, the first logged).
+// states and are freed; other command types are accepted without a result (counted, the first
+// logged). No type-3 notifications are produced.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kXApuResultBytes = 0x38;
-constexpr size_t kXApuDecodeCommandBytes = 0x40;
-constexpr uint32_t kXApuChannelBytes = 0xF00;     // 960 float32 frames of one channel
-constexpr uint32_t kXApuMaxPacketBytes = 0x280;   // one input slot
-constexpr uint32_t kXApuMaxOutputBytes = 0x1E00;  // one output slot
-
-using XApuResult = std::array<uint8_t, kXApuResultBytes>;
 
 struct XApuState {
     std::mutex mutex;
-    std::map<uint64_t, std::deque<XApuResult>> queues;  // handle -> pending results
-    std::map<uint32_t, uint64_t> commands;              // command type -> count
-    std::map<uint64_t, uint64_t> memory;                // handle -> shared memory
-    std::map<std::pair<uint64_t, uint32_t>, std::unique_ptr<xapu_opus::VoiceDecoder>> decoders;  // (handle, voice)
-    uint64_t decoded_packets = 0;
-    uint64_t failed_packets = 0;
-    uint64_t decoded_bytes = 0;
-    bool decode_logged = false;
-    bool failure_logged = false;
+    std::map<uint64_t, std::deque<std::array<uint32_t, 2>>> queues;  // handle -> pending results
+    std::map<uint32_t, uint64_t> commands;                            // command type -> count
+    std::map<uint64_t, uint64_t> memory;                              // handle -> shared memory
 };
 XApuState& xapu() {
     static XApuState s;
@@ -352,8 +321,6 @@ HResult xapu_disconnect(uint64_t handle) {
         }
         memory = xapu().memory[handle];
         xapu().memory.erase(handle);
-        auto& decoders = xapu().decoders;
-        decoders.erase(decoders.lower_bound({handle, 0u}), decoders.upper_bound({handle, ~0u}));
     }
     com::guest_free(handle);
     if (memory != 0) {
@@ -362,88 +329,9 @@ HResult xapu_disconnect(uint64_t handle) {
     return kOk;
 }
 
-XApuResult make_result(uint32_t type, uint32_t voice, uint32_t bytes_written = 0) {
-    XApuResult r{};
-    std::memcpy(r.data(), &type, sizeof(type));
-    std::memcpy(r.data() + 0x04, &voice, sizeof(voice));
-    std::memcpy(r.data() + 0x34, &bytes_written, sizeof(bytes_written));
-    return r;
-}
-
-template <typename T>
-T field(const uint8_t* bytes, size_t offset) {
-    T v;
-    std::memcpy(&v, bytes + offset, sizeof(v));
-    return v;
-}
-
-// Command 3 (the caller holds the lock): decodes the packet into the output area and returns the
-// result to queue.
-XApuResult decode_command(uint64_t handle, const uint8_t* cmd) {
-    const uint32_t voice = field<uint32_t>(cmd, 0x04);
-    const float rate = field<float>(cmd, 0x1C);
-    const uint32_t skip = field<uint32_t>(cmd, 0x20);
-    const uint32_t frames_per_packet = field<uint32_t>(cmd, 0x24);
-    const uint32_t packet_bytes = field<uint32_t>(cmd, 0x28);
-    const uint64_t packet_va = field<uint64_t>(cmd, 0x2C);
-    const uint32_t capacity = std::min(field<uint32_t>(cmd, 0x34), kXApuMaxOutputBytes);
-    const uint64_t output_va = field<uint64_t>(cmd, 0x38);
-    const uint32_t channels = capacity / kXApuChannelBytes;
-    auto& s = xapu();
-
-    uint8_t packet[kXApuMaxPacketBytes];
-    const bool readable = packet_bytes != 0 && packet_bytes <= sizeof(packet) && packet_va != 0 &&
-                          com::read_guest(packet_va, packet, packet_bytes);
-    if (readable && channels != 0 && output_va != 0) {
-        auto& decoder = s.decoders[{handle, voice}];
-        if (!decoder) {
-            decoder = std::make_unique<xapu_opus::VoiceDecoder>();
-        }
-        const size_t max_frames = capacity / (channels * sizeof(float));
-        std::vector<float> pcm(max_frames * channels);
-        const uint32_t sample_rate = rate >= 1.0f && rate < 1.0e6f ? static_cast<uint32_t>(rate) : 48000u;
-        const int frames = decoder->decode(packet, packet_bytes, sample_rate, channels, pcm.data(), max_frames);
-        if (frames >= 0) {
-            const uint32_t dropped = std::min<uint32_t>(skip, static_cast<uint32_t>(frames));
-            const uint32_t bytes = (static_cast<uint32_t>(frames) - dropped) * channels * sizeof(float);
-            if (bytes == 0 || com::write_guest(output_va, pcm.data() + size_t{dropped} * channels, bytes)) {
-                ++s.decoded_packets;
-                s.decoded_bytes += bytes;
-                if (!s.decode_logged) {
-                    s.decode_logged = true;
-                    char line[256];
-                    std::snprintf(line, sizeof(line),
-                                  "XApu: first decode: voice %u, %u bytes (TOC 0x%02x), %u Hz, %u channel(s), "
-                                  "%u frames/packet, skip %u -> %u bytes of float32%s",
-                                  voice, packet_bytes, packet[0], sample_rate, channels, frames_per_packet, skip,
-                                  bytes, xapu_opus::available() ? "" : " (silence: built without libopus)");
-                    diag(line);
-                }
-                return make_result(3, voice, bytes);
-            }
-        }
-    }
-    ++s.failed_packets;
-    if (!s.failure_logged) {
-        s.failure_logged = true;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "XApu: decode failed: voice %u, packet 0x%" PRIx64 " (%u bytes), capacity %u, output 0x%" PRIx64
-                      "; result posted with 0 bytes",
-                      voice, packet_va, packet_bytes, capacity, output_va);
-        diag(line);
-    }
-    return make_result(3, voice, 0);
-}
-
 HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags*/) {
     uint32_t head[2] = {};
     if (command == 0 || !com::read_guest(command, head, sizeof(head))) {
-        return com::E_INVALIDARG_HR;
-    }
-    const uint32_t type = head[0];
-    uint8_t decode[kXApuDecodeCommandBytes] = {};
-    if (type == 3 && !com::read_guest(command, decode, sizeof(decode))) {
         return com::E_INVALIDARG_HR;
     }
     std::lock_guard<std::mutex> lock(xapu().mutex);
@@ -451,22 +339,14 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (it == xapu().queues.end()) {
         return com::E_INVALIDARG_HR;
     }
-    const bool acknowledged = type == 1 || type == 2 || type == 3 || type == 5;
+    const uint32_t type = head[0];
+    const bool acknowledged = type == 1 || type == 2 || type == 5;
     if (++xapu().commands[type] == 1) {
         diag("XApu: first command of type " + std::to_string(type) +
              (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
     }
-    if (type == 1 || type == 2) {
-        // The voice starts or is freed: its next packet begins a new stream.
-        auto d = xapu().decoders.find({handle, head[1]});
-        if (d != xapu().decoders.end()) {
-            d->second->reset();
-        }
-    }
-    if (type == 3) {
-        it->second.push_back(decode_command(handle, decode));
-    } else if (acknowledged) {
-        it->second.push_back(make_result(type, head[1]));
+    if (acknowledged) {
+        it->second.push_back({type, head[1]});
     }
     return kOk;
 }
@@ -481,7 +361,7 @@ HResult xapu_dequeue_result(uint64_t handle, uint64_t result) {
     if (result == 0) {
         return com::E_POINTER_HR;
     }
-    XApuResult bytes{};
+    std::array<uint32_t, 2> head{};
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         auto it = xapu().queues.find(handle);
@@ -491,10 +371,12 @@ HResult xapu_dequeue_result(uint64_t handle, uint64_t result) {
         if (it->second.empty()) {
             return com::E_FAIL_HR;
         }
-        bytes = it->second.front();
+        head = it->second.front();
         it->second.pop_front();
     }
-    return com::write_guest(result, bytes.data(), bytes.size()) ? kOk : com::E_POINTER_HR;
+    uint8_t bytes[kXApuResultBytes] = {};
+    std::memcpy(bytes, head.data(), sizeof(uint32_t) * 2);
+    return com::write_guest(result, bytes, sizeof(bytes)) ? kOk : com::E_POINTER_HR;
 }
 
 }  // namespace
@@ -508,12 +390,6 @@ XApuStats xapu_stats() {
     }
     for (const auto& [handle, queue] : xapu().queues) {
         s.pending_results += queue.size();
-    }
-    s.decoded_packets = xapu().decoded_packets;
-    s.failed_packets = xapu().failed_packets;
-    s.decoded_bytes = xapu().decoded_bytes;
-    if (const auto t3 = xapu().commands.find(3); t3 != xapu().commands.end()) {
-        s.type3_results = t3->second;
     }
     return s;
 }

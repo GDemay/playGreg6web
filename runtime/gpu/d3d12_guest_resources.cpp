@@ -3044,7 +3044,6 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
             JoinStats join_stats;
             ok = join_pipeline_layout(src.root_signature->signature().desc(), /*compute=*/false, stages,
                                       &reflected_layout, &report, &join_stats) && ok;
-            count_work(Work::ReflectionLaneIndexedUnbound, join_stats.lane_indexed_bindings);
             if (ok) {
                 count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
             }
@@ -3278,7 +3277,6 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                                 join_pipeline_layout(rs->signature().desc(), /*compute=*/true,
                                                      {{GpuShaderStageBits::Compute, &rit->second}}, &reflected_layout,
                                                      &report, &join_stats);
-                count_work(Work::ReflectionLaneIndexedUnbound, join_stats.lane_indexed_bindings);
                 if (ok) {
                     reflected = true;
                     count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);

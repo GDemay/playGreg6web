@@ -134,13 +134,6 @@ export const UNIFORM_BYTE_SIZE = 64; // 4 x vec4<f32>
 export const STORAGE_BYTE_SIZE = 48; // 3 x vec4<f32>
 export const VERTEX_STRIDE_BYTES = 12; // vec3<f32> matching wgpu_worker.js float32x3 layout
 export const DEFAULT_TEXTURE_SIZE = 64; // 64x64 RGBA8 => bytesPerRow=256, 16 KiB total
-export const DEFAULT_TARGET_FPS = 30;
-export const DEFAULT_FRAME_BUDGET_MS = 33.333;
-export const DEFAULT_NON_BLACK_THRESHOLD = 4;
-
-const OPCODE_NAMES = Object.freeze(
-  Object.fromEntries(Object.entries(GPU_OPCODES).map(([name, code]) => [code, name]))
-);
 
 // Real WebGPU WGSL compute shader updating transform & color state in a storage buffer.
 export const SMOKE_COMPUTE_WGSL = `struct SmokeUniforms {
@@ -755,313 +748,6 @@ export function submitToRing(gpuRingBuffer, bytes) {
   return Boolean(gpuRingBuffer.writeBytes(payload));
 }
 
-function toRgbaByteSequence(rgba) {
-  if (rgba == null) {
-    return null;
-  }
-  if (rgba instanceof Uint8Array || rgba instanceof Uint8ClampedArray) {
-    return rgba;
-  }
-  if (ArrayBuffer.isView(rgba)) {
-    return new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength);
-  }
-  if (
-    rgba instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer !== 'undefined' && rgba instanceof SharedArrayBuffer)
-  ) {
-    return new Uint8Array(rgba);
-  }
-  if (Array.isArray(rgba)) {
-    return rgba;
-  }
-  return null;
-}
-
-/**
- * Evaluate deterministic 30 FPS (or custom budget) frame-pacing metrics
- * from an array, typed array, or iterable of frame durations in milliseconds.
- *
- * @param {Iterable<number>|ArrayLike<number>|null|undefined} frameTimesMs
- * @param {number} [budgetMs=33.333]
- * @returns {{
- *   sampleCount: number,
- *   droppedSamples: number,
- *   budgetMs: number,
- *   targetFps: number,
- *   avgMs: number,
- *   minMs: number,
- *   maxMs: number,
- *   p50Ms: number,
- *   p95Ms: number,
- *   p99Ms: number,
- *   jitterMs: number,
- *   avgFps: number,
- *   overBudgetCount: number,
- *   overBudgetRatio: number,
- *   withinBudgetRatio: number,
- *   withinBudget: boolean,
- *   meetsTarget: boolean,
- * }}
- */
-export function evaluateFramePacing(frameTimesMs, budgetMs = DEFAULT_FRAME_BUDGET_MS) {
-  const resolvedBudgetMs = budgetMs === undefined ? DEFAULT_FRAME_BUDGET_MS : budgetMs;
-  if (typeof resolvedBudgetMs !== 'number' || !Number.isFinite(resolvedBudgetMs) || resolvedBudgetMs <= 0) {
-    throw new RangeError(`budgetMs must be a positive finite number, got ${budgetMs}`);
-  }
-  const targetFps = 1000 / resolvedBudgetMs;
-
-  const valid = [];
-  let droppedSamples = 0;
-  if (frameTimesMs != null) {
-    if (Array.isArray(frameTimesMs) || ArrayBuffer.isView(frameTimesMs)) {
-      for (let i = 0; i < frameTimesMs.length; i++) {
-        const v = frameTimesMs[i];
-        if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
-          valid.push(v);
-        } else {
-          droppedSamples += 1;
-        }
-      }
-    } else if (typeof frameTimesMs[Symbol.iterator] === 'function') {
-      for (const v of frameTimesMs) {
-        if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
-          valid.push(v);
-        } else {
-          droppedSamples += 1;
-        }
-      }
-    }
-  }
-
-  const sampleCount = valid.length;
-  if (sampleCount === 0) {
-    return {
-      sampleCount: 0,
-      droppedSamples,
-      budgetMs: resolvedBudgetMs,
-      targetFps,
-      avgMs: 0,
-      minMs: 0,
-      maxMs: 0,
-      p50Ms: 0,
-      p95Ms: 0,
-      p99Ms: 0,
-      jitterMs: 0,
-      avgFps: 0,
-      overBudgetCount: 0,
-      overBudgetRatio: 0,
-      withinBudgetRatio: 0,
-      withinBudget: false,
-      meetsTarget: false,
-    };
-  }
-
-  let sum = 0;
-  let overBudgetCount = 0;
-  let deltaSum = 0;
-  for (let i = 0; i < sampleCount; i++) {
-    const v = valid[i];
-    sum += v;
-    if (v > resolvedBudgetMs) {
-      overBudgetCount += 1;
-    }
-    if (i > 0) {
-      deltaSum += Math.abs(v - valid[i - 1]);
-    }
-  }
-
-  const sorted = valid.slice().sort((a, b) => a - b);
-  const percentile = (p) => {
-    const idx = Math.min(sampleCount - 1, Math.max(0, Math.ceil((p / 100) * sampleCount) - 1));
-    return sorted[idx];
-  };
-
-  const avgMs = sum / sampleCount;
-  const minMs = sorted[0];
-  const maxMs = sorted[sampleCount - 1];
-  const p50Ms = percentile(50);
-  const p95Ms = percentile(95);
-  const p99Ms = percentile(99);
-  const jitterMs = sampleCount > 1 ? deltaSum / (sampleCount - 1) : 0;
-  const avgFps = avgMs > 0 ? 1000 / avgMs : 0;
-  const overBudgetRatio = overBudgetCount / sampleCount;
-  const withinBudgetRatio = (sampleCount - overBudgetCount) / sampleCount;
-  const withinBudget = overBudgetCount === 0;
-  const meetsTarget = avgMs <= resolvedBudgetMs && p95Ms <= resolvedBudgetMs;
-
-  return {
-    sampleCount,
-    droppedSamples,
-    budgetMs: resolvedBudgetMs,
-    targetFps,
-    avgMs,
-    minMs,
-    maxMs,
-    p50Ms,
-    p95Ms,
-    p99Ms,
-    jitterMs,
-    avgFps,
-    overBudgetCount,
-    overBudgetRatio,
-    withinBudgetRatio,
-    withinBudget,
-    meetsTarget,
-  };
-}
-
-/**
- * Deterministic check confirming an RGBA8 pixel buffer contains at least one
- * pixel whose R, G, or B channel strictly exceeds `threshold` (ignoring alpha).
- *
- * @param {Uint8Array|Uint8ClampedArray|ArrayBufferView|ArrayBuffer|SharedArrayBuffer|number[]|null|undefined} rgba
- * @param {number} [threshold=4]
- * @returns {boolean}
- */
-export function hasNonBlackRgbaPixels(rgba, threshold = DEFAULT_NON_BLACK_THRESHOLD) {
-  const bytes = toRgbaByteSequence(rgba);
-  if (!bytes || bytes.length < 4) {
-    return false;
-  }
-  const minThreshold = Math.max(0, finiteOr(threshold, DEFAULT_NON_BLACK_THRESHOLD));
-  const limit = bytes.length - (bytes.length % 4);
-  for (let i = 0; i < limit; i += 4) {
-    if (
-      bytes[i] > minThreshold ||
-      bytes[i + 1] > minThreshold ||
-      bytes[i + 2] > minThreshold
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Summarize a binary GpuPacketHeader command stream into deterministic
- * draw-batch metadata without mutating the input buffer.
- *
- * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer|null|undefined} bytes
- * @returns {{
- *   byteLength: number,
- *   packetCount: number,
- *   truncated: boolean,
- *   beginFrameCount: number,
- *   presentCount: number,
- *   clearColorCount: number,
- *   computeDispatchCount: number,
- *   drawCallCount: number,
- *   drawCount: number,
- *   drawIndexedCount: number,
- *   totalVertices: number,
- *   totalIndices: number,
- *   totalInstances: number,
- *   hasRenderWork: boolean,
- *   opcodeCounts: Record<string, number>,
- * }}
- */
-export function summarizeDrawBatch(bytes) {
-  const summary = {
-    byteLength: 0,
-    packetCount: 0,
-    truncated: false,
-    beginFrameCount: 0,
-    presentCount: 0,
-    clearColorCount: 0,
-    computeDispatchCount: 0,
-    drawCallCount: 0,
-    drawCount: 0,
-    drawIndexedCount: 0,
-    totalVertices: 0,
-    totalIndices: 0,
-    totalInstances: 0,
-    hasRenderWork: false,
-    opcodeCounts: {},
-  };
-
-  if (bytes == null) {
-    return summary;
-  }
-
-  let raw;
-  try {
-    raw = toUint8Array(bytes, 'summarizeDrawBatch bytes');
-  } catch {
-    return summary;
-  }
-
-  summary.byteLength = raw.byteLength;
-  if (raw.byteLength === 0) {
-    return summary;
-  }
-
-  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
-  let offset = 0;
-
-  while (offset < raw.byteLength) {
-    if (offset + 8 > raw.byteLength) {
-      summary.truncated = true;
-      break;
-    }
-    const opcode = view.getUint16(offset, true);
-    const payloadLen = view.getUint32(offset + 4, true);
-    const payloadOffset = offset + 8;
-    const nextOffset = payloadOffset + payloadLen;
-    if (nextOffset > raw.byteLength) {
-      summary.truncated = true;
-      break;
-    }
-
-    summary.packetCount += 1;
-    const name = OPCODE_NAMES[opcode] || `UNKNOWN_${opcode}`;
-    summary.opcodeCounts[name] = (summary.opcodeCounts[name] || 0) + 1;
-
-    switch (opcode) {
-      case GPU_OPCODES.BEGIN_FRAME:
-        summary.beginFrameCount += 1;
-        break;
-      case GPU_OPCODES.CLEAR_COLOR:
-        summary.clearColorCount += 1;
-        break;
-      case GPU_OPCODES.DISPATCH_COMPUTE:
-        summary.computeDispatchCount += 1;
-        break;
-      case GPU_OPCODES.PRESENT:
-        summary.presentCount += 1;
-        break;
-      case GPU_OPCODES.DRAW: {
-        summary.drawCount += 1;
-        summary.drawCallCount += 1;
-        if (payloadLen >= 8) {
-          const vertexCount = view.getUint32(payloadOffset, true);
-          const instanceCount = view.getUint32(payloadOffset + 4, true);
-          summary.totalVertices += vertexCount * instanceCount;
-          summary.totalInstances += instanceCount;
-        }
-        break;
-      }
-      case GPU_OPCODES.DRAW_INDEXED: {
-        summary.drawIndexedCount += 1;
-        summary.drawCallCount += 1;
-        if (payloadLen >= 8) {
-          const indexCount = view.getUint32(payloadOffset, true);
-          const instanceCount = view.getUint32(payloadOffset + 4, true);
-          summary.totalIndices += indexCount * instanceCount;
-          summary.totalInstances += instanceCount;
-        }
-        break;
-      }
-      default:
-        break;
-    }
-
-    offset = nextOffset;
-  }
-
-  summary.hasRenderWork = summary.drawCallCount > 0 && summary.presentCount > 0;
-  return summary;
-}
-
 function buildQuadVertices() {
   // 4 vertices * vec3<f32> = 48 bytes (stride = 12 bytes)
   return new Float32Array([
@@ -1127,7 +813,6 @@ export class SmokeSceneController {
 
     this.initialized = false;
     this.frameCount = 0;
-    this._lastBatchSummary = null;
   }
 
   _packUniforms(frameIndex, timeSec, inputState) {
@@ -1328,34 +1013,12 @@ export class SmokeSceneController {
    * @param {number} frameIndex
    * @param {number} timeSec
    * @param {object|ArrayBuffer|SharedArrayBuffer|ArrayBufferView|null} [inputState]
-   * @param {{ drawBatchCount?: number, instanceCount?: number }|null} [options]
    * @returns {Uint8Array}
    */
-  buildFrameCommandBuffer(frameIndex = 0, timeSec = 0, inputState = null, options = null) {
+  buildFrameCommandBuffer(frameIndex = 0, timeSec = 0, inputState = null) {
     const ids = this.resourceIds;
     const t = finiteOr(timeSec, 0);
     const { bytes: uniformBytes, input } = this._packUniforms(frameIndex, t, inputState);
-
-    let drawBatchCount = 1;
-    let instanceCount = 1;
-    if (options && typeof options === 'object') {
-      if (options.drawBatchCount !== undefined) {
-        if (!Number.isInteger(options.drawBatchCount) || options.drawBatchCount < 1) {
-          throw new RangeError(
-            `drawBatchCount must be a positive integer, got ${options.drawBatchCount}`
-          );
-        }
-        drawBatchCount = options.drawBatchCount;
-      }
-      if (options.instanceCount !== undefined) {
-        if (!Number.isInteger(options.instanceCount) || options.instanceCount < 1) {
-          throw new RangeError(
-            `instanceCount must be a positive integer, got ${options.instanceCount}`
-          );
-        }
-        instanceCount = options.instanceCount;
-      }
-    }
 
     const triggerBoost = Math.max(0, Math.min(1, input.rightTrigger)) * 0.12;
     const clearR = 0.06 + 0.04 * Math.sin(t * 0.8) + triggerBoost;
@@ -1373,40 +1036,12 @@ export class SmokeSceneController {
       .setPipeline(ids.RENDER_PIPELINE)
       .setBindGroup(0, ids.RENDER_BIND_GROUP)
       .setVertexBuffer(0, ids.VERTEX_BUFFER, 0)
-      .setIndexBuffer(ids.INDEX_BUFFER, GPU_INDEX_FORMAT.UINT16, 0);
+      .setIndexBuffer(ids.INDEX_BUFFER, GPU_INDEX_FORMAT.UINT16, 0)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present();
 
-    for (let i = 0; i < drawBatchCount; i++) {
-      builder.drawIndexed(6, instanceCount, 0, 0, 0);
-    }
-
-    builder.present();
-
-    const bytes = builder.finish();
     this.frameCount += 1;
-    this._lastBatchSummary = {
-      frameIndex: finiteOr(frameIndex, 0),
-      timeSec: t,
-      packetCount: builder.packetCount,
-      byteLength: bytes.byteLength,
-      drawBatchCount,
-      drawCallCount: drawBatchCount,
-      instanceCount,
-      totalIndices: 6 * drawBatchCount * instanceCount,
-      totalInstances: drawBatchCount * instanceCount,
-      computeDispatchCount: 1,
-      presentCount: 1,
-    };
-    return bytes;
-  }
-
-  /**
-   * Return the optional batch-draw metadata summary captured for the most recent
-   * frame built by `buildFrameCommandBuffer()`, or `null` if no frame has been built.
-   *
-   * @returns {object|null}
-   */
-  getLastBatchSummary() {
-    return this._lastBatchSummary ? { ...this._lastBatchSummary } : null;
+    return builder.finish();
   }
 
   /**

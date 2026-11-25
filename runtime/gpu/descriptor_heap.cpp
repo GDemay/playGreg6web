@@ -1810,43 +1810,16 @@ BindGroupPlan BindGroupPlan::build(
             continue;
         }
         if (b.heap != HeapAccess::None) {
-            // Heap-indexed: the index is a root constant or a constant-buffer dword; the descriptor
-            // comes from the bound heap.
-            bool index_ok = false;
-            if (b.heap_index_parameter < signature.parameter_count()) {
-                const auto& ip = signature.parameter(b.heap_index_parameter);
-                switch (b.heap_index_source) {
-                case HeapIndexSource::RootConstantIndex:
-                    index_ok = ip.type == RootParameterType::Constants32Bit && b.heap_index_dword < ip.num_32bit_values;
-                    break;
-                case HeapIndexSource::CbRootConstants:
-                    index_ok = ip.type == RootParameterType::Constants32Bit && b.cb_byte_offset % 4 == 0 &&
-                               b.cb_byte_offset / 4 < ip.num_32bit_values;
-                    break;
-                case HeapIndexSource::CbRootDescriptor:
-                    index_ok = ip.type == RootParameterType::Cbv && b.cb_byte_offset % 4 == 0;
-                    break;
-                case HeapIndexSource::CbTable:
-                    index_ok = ip.type == RootParameterType::DescriptorTable &&
-                               ip.table_heap_type == DescriptorHeapType::CbvSrvUav && b.cb_byte_offset % 4 == 0;
-                    break;
-                }
-                index_ok = index_ok && (b.heap_index_source == HeapIndexSource::RootConstantIndex ||
-                                        (b.cb_bit_offset < 32 && b.cb_mask != 0));
-            }
-            if (index_ok && b.heap_shift < 32 &&
+            // Heap-indexed: the index is a root constant; the descriptor comes from the bound heap.
+            if (b.heap_index_parameter < signature.parameter_count() &&
+                signature.parameter(b.heap_index_parameter).type == RootParameterType::Constants32Bit &&
+                b.heap_index_dword < signature.parameter(b.heap_index_parameter).num_32bit_values &&
+                b.heap_shift < 32 &&
                 (b.heap == HeapAccess::Sampler) == (b.register_class == DescriptorRangeType::Sampler)) {
                 e.source = PlanSource::HeapIndexed;
                 e.root_parameter_index = b.heap_index_parameter;
-                e.heap_dword = b.heap_index_source == HeapIndexSource::RootConstantIndex ? b.heap_index_dword : 0;
+                e.heap_dword = b.heap_index_dword;
                 e.heap_shift = b.heap_shift;
-                e.heap_index_source = b.heap_index_source;
-                if (b.heap_index_source != HeapIndexSource::RootConstantIndex) {
-                    e.table_offset = b.heap_index_source == HeapIndexSource::CbTable ? b.cb_table_slot : 0;
-                    e.cb_byte_offset = b.cb_byte_offset;
-                    e.cb_bit_offset = b.cb_bit_offset;
-                    e.cb_mask = b.cb_mask;
-                }
                 plan.parameter_mask_ |= 1ull << e.root_parameter_index;
             } else {
                 ++plan.unresolved_;
@@ -1921,17 +1894,13 @@ BindGroupPlan BindGroupPlan::build(
         }
         uint32_t lo = 0xffffffffu;
         uint32_t hi = 0;
-        bool any = false;
         for (const PlanEntry& e : plan.entries_) {
             if (e.source == PlanSource::DescriptorTable && e.root_parameter_index == i) {
                 lo = std::min(lo, e.table_offset);
                 hi = std::max(hi, e.table_offset);
-                any = true;
             }
         }
-        if (any) {  // a table only a CB-indexed entry reads its index through binds no slot
-            plan.windows_.push_back(TableWindow{i, lo, hi - lo + 1});
-        }
+        plan.windows_.push_back(TableWindow{i, lo, hi - lo + 1});
     }
 
     Fnv64 h;
@@ -1945,10 +1914,6 @@ BindGroupPlan BindGroupPlan::build(
         h.u32(e.table_offset);
         h.u32(e.heap_dword);
         h.u32(e.heap_shift);
-        h.u32(static_cast<uint32_t>(e.heap_index_source));
-        h.u32(e.cb_byte_offset);
-        h.u32(e.cb_bit_offset);
-        h.u32(e.cb_mask);
         if (e.source == PlanSource::InlineSampler) {
             uint32_t words[sizeof(SamplerDesc) / 4] = {};
             std::memcpy(words, &e.sampler, sizeof(words));
@@ -1963,88 +1928,20 @@ BindGroupPlan BindGroupPlan::build(
 
 namespace {
 
-// The 32-bit index dword of a CB-indexed plan entry (HeapIndexSource) under the current arguments:
-// read from the root constants, or from guest memory at the root CBV / the table slot's CBV address
-// through `source`. False when there is no such dword (no CBV, unreadable, offset outside the CBV).
-bool cb_index_dword(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p,
-                    const DescriptorSlotSource* source, uint32_t* dword) {
-    switch (p.heap_index_source) {
-    case HeapIndexSource::RootConstantIndex:
-        return false;
-    case HeapIndexSource::CbRootConstants: {
-        const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
-        if (p.cb_byte_offset / 4 >= values.size()) {
-            return false;
-        }
-        *dword = values[p.cb_byte_offset / 4];
-        return true;
-    }
-    case HeapIndexSource::CbRootDescriptor: {
-        const RootArgument& arg = state.argument(bind_point, p.root_parameter_index);
-        return arg.is_set && arg.gpu_address != 0 && source != nullptr &&
-               source->read_gpu_memory(arg.gpu_address + p.cb_byte_offset, dword, 4);
-    }
-    case HeapIndexSource::CbTable: {
-        const RootArgument& arg = state.argument(bind_point, p.root_parameter_index);
-        if (!arg.is_set || arg.heap == nullptr) {
-            return false;
-        }
-        const uint64_t slot = static_cast<uint64_t>(arg.base_index) + p.table_offset;
-        if (slot >= arg.heap->capacity()) {
-            return false;
-        }
-        ViewDescriptor v;
-        if (source != nullptr && source->reads(*arg.heap)) {
-            v = source->view(*arg.heap, static_cast<uint32_t>(slot), DescriptorRangeType::Cbv);
-        } else if (const ViewDescriptor* r = arg.heap->view(static_cast<uint32_t>(slot))) {
-            v = *r;
-        }
-        if (v.kind != DescriptorKind::Cbv || v.first_element_or_address == 0 ||
-            (v.num_elements_or_size != 0 && uint64_t{p.cb_byte_offset} + 4 > v.num_elements_or_size)) {
-            return false;
-        }
-        return source != nullptr && source->read_gpu_memory(v.first_element_or_address + p.cb_byte_offset, dword, 4);
-    }
-    }
-    return false;
-}
-
-// The heap byte offset a heap-indexed plan entry selects under the current arguments: false when
-// the index is not available (*cb_miss set when it is a CB index that could not be read).
-bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p,
-                      const DescriptorSlotSource* source, uint64_t* byte_offset, bool* cb_miss = nullptr) {
-    if (p.heap_index_source == HeapIndexSource::RootConstantIndex) {
-        const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
-        if (p.heap_dword >= values.size()) {
-            return false;
-        }
-        // RDNA2 scalar-load soffset is 32-bit: the shifted index wraps in hardware.
-        *byte_offset = static_cast<uint32_t>(values[p.heap_dword] << p.heap_shift);
-        return true;
-    }
-    uint32_t dword = 0;
-    if (!cb_index_dword(state, bind_point, p, source, &dword)) {
-        if (cb_miss != nullptr) {
-            *cb_miss = true;
-        }
-        return false;
-    }
-    *byte_offset = static_cast<uint32_t>(((dword >> p.cb_bit_offset) & p.cb_mask) << p.heap_shift);  // 32-bit, as above
-    return true;
-}
-
-// The heap slot a heap-indexed plan entry reads under the current root arguments: false (and
-// nothing set) when no heap of that type is bound, the index is not available, or the byte offset
-// is not a whole descriptor inside the heap.
-bool heap_slot(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p,
-               const DescriptorSlotSource* source, DescriptorHeap** heap, uint32_t* index, bool* cb_miss = nullptr) {
+// The heap slot a heap-indexed plan entry reads under the current root constants: false (and
+// nothing set) when no heap of that type is bound, or the byte offset is not a whole descriptor
+// inside the heap.
+bool heap_slot(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p, DescriptorHeap** heap,
+               uint32_t* index) {
     const DescriptorHeap* h = state.bound_heap(p.register_class == DescriptorRangeType::Sampler
                                                    ? DescriptorHeapType::Sampler
                                                    : DescriptorHeapType::CbvSrvUav);
-    uint64_t byte_offset = 0;
-    if (!heap_byte_offset(state, bind_point, p, source, &byte_offset, cb_miss) || h == nullptr) {
+    const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
+    if (h == nullptr || p.heap_dword >= values.size()) {
         return false;
     }
+    // RDNA2 scalar-load soffset is 32-bit: the shifted index wraps in hardware.
+    const uint64_t byte_offset = static_cast<uint32_t>(values[p.heap_dword] << p.heap_shift);
     const uint64_t increment = h->increment();
     if (increment == 0 || byte_offset % increment != 0 || byte_offset / increment >= h->capacity()) {
         return false;
@@ -2132,14 +2029,12 @@ void BindGroupCache::build_entries(
             uint32_t index = 0;
             CachedBindGroup::HeapSlot slot;
             slot.entry = static_cast<uint32_t>(out->entries.size());
-            bool cb_miss = false;
-            if (heap_slot(state, bind_point, p, slot_source_, &heap, &index, &cb_miss)) {
+            if (heap_slot(state, bind_point, p, &heap, &index)) {
                 slot.gpu_handle = heap->gpu_handle(index).ptr;
                 slot.generation = heap->generation();
                 table_entry(slot_source_, *heap, index, p.register_class, resolver, resolver_user, &e);
             } else {
                 ++heap_index_misses_;  // index outside the bound heap: bound as null, counted
-                cb_index_misses_ += cb_miss ? 1u : 0u;
             }
             out->heap_slots.push_back(slot);
             break;
@@ -2195,17 +2090,16 @@ BindGroupLookup BindGroupCache::get_or_build(
             break;
         }
     }
-    // Heap-indexed entries: the bound heap and the byte offset the root constant (or the constant-
-    // buffer dword, read now: G62 CB-indexed heaps) selects.
+    // Heap-indexed entries: the bound heap and the byte offset the root constant selects.
     for (const PlanEntry& p : plan.entries()) {
         if (p.source != PlanSource::HeapIndexed) {
             continue;
         }
         const DescriptorHeap* heap = state.bound_heap(
             p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
-        uint64_t byte_offset = 0;
+        const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
         scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
-        scratch_key_.push_back(heap_byte_offset(state, bind_point, p, slot_source_, &byte_offset) ? byte_offset : ~0ull);
+        scratch_key_.push_back(p.heap_dword < values.size() ? uint64_t{static_cast<uint32_t>(values[p.heap_dword] << p.heap_shift)} : ~0ull);
     }
     const uint64_t h = hash_key(scratch_key_);
     auto it = entries_.find(h);
@@ -2225,7 +2119,7 @@ BindGroupLookup BindGroupCache::get_or_build(
             DescriptorHeap* heap = nullptr;
             uint32_t index = 0;
             if (!changed && s.gpu_handle != 0 && s.entry < plan.entries().size() &&
-                heap_slot(state, bind_point, plan.entries()[s.entry], slot_source_, &heap, &index)) {
+                heap_slot(state, bind_point, plan.entries()[s.entry], &heap, &index)) {
                 changed = heap->range_changed_since(index, 1, s.generation);
             }
         }
@@ -2286,7 +2180,7 @@ bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind
     for (const PlanEntry& p : plan.entries()) {
         DescriptorHeap* heap = nullptr;
         uint32_t index = 0;
-        if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, slot_source_, &heap, &index) ||
+        if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, &heap, &index) ||
             !slot_source_->reads(*heap)) {
             continue;
         }

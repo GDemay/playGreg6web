@@ -48,7 +48,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -800,17 +799,6 @@ private:
 // bound heap of that type.
 enum class HeapAccess : uint8_t { None = 0, Sampler = 1, Resource = 2 };
 
-// Where a heap-indexed descriptor's index comes from (G62, #482). RootConstantIndex: S34, the index
-// is a root constant the stage holds in an SGPR. The others read the 32-bit index from a constant
-// buffer at draw time (SM 6.6 ResourceDescriptorHeap[cb.index]): the dword at `cb_byte_offset` of
-// the root constants of a constants parameter, of the root CBV, or of the CBV in a table slot.
-enum class HeapIndexSource : uint8_t {
-    RootConstantIndex = 0,
-    CbRootConstants = 1,
-    CbRootDescriptor = 2,
-    CbTable = 3,
-};
-
 struct ShaderBinding {
     uint32_t binding = 0;  // WebGPU @binding inside the group
     DescriptorRangeType register_class = DescriptorRangeType::Srv;  // b=Cbv, t=Srv, u=Uav, s=Sampler
@@ -824,15 +812,6 @@ struct ShaderBinding {
     uint32_t heap_index_parameter = kNoIndex;
     uint32_t heap_index_dword = 0;
     uint32_t heap_shift = 0;
-    // CB-indexed heap descriptor (heap_index_source != RootConstantIndex): heap_index_parameter is
-    // the root parameter holding (constants) or pointing at (root CBV, table) the constant buffer;
-    // the index is ((dword at cb_byte_offset) >> cb_bit_offset) & cb_mask, the byte offset in the
-    // heap that index << heap_shift. CbTable: the CBV is descriptor cb_table_slot of the table.
-    HeapIndexSource heap_index_source = HeapIndexSource::RootConstantIndex;
-    uint32_t cb_table_slot = 0;
-    uint32_t cb_byte_offset = 0;
-    uint32_t cb_bit_offset = 0;
-    uint32_t cb_mask = 0xffffffffu;
     // Direct table slot (register/space unused): descriptor `table_slot` of descriptor-table
     // parameter `table_parameter`, whether or not the root signature declares a range there. Console
     // stages read their tables as memory, past the ranges a title's root signature declares (G62).
@@ -843,18 +822,6 @@ struct ShaderBinding {
     bool inline_sampler = false;
     SamplerDesc sampler{};
 };
-
-// Two joins bind the same descriptor.
-inline bool same_join(const ShaderBinding& a, const ShaderBinding& b) noexcept {
-    return a.binding == b.binding && a.register_class == b.register_class && a.shader_register == b.shader_register &&
-           a.register_space == b.register_space && a.root_constants == b.root_constants && a.heap == b.heap &&
-           a.heap_index_parameter == b.heap_index_parameter && a.heap_index_dword == b.heap_index_dword &&
-           a.heap_shift == b.heap_shift && a.heap_index_source == b.heap_index_source &&
-           a.cb_table_slot == b.cb_table_slot && a.cb_byte_offset == b.cb_byte_offset &&
-           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.table_parameter == b.table_parameter &&
-           a.table_slot == b.table_slot && a.inline_sampler == b.inline_sampler &&
-           std::memcmp(&a.sampler, &b.sampler, sizeof(a.sampler)) == 0;
-}
 
 enum class PlanSource : uint32_t {
     Unresolved = 0,  // no matching root-signature slot: compiles to a Null entry
@@ -874,12 +841,6 @@ struct PlanEntry {
     uint32_t table_offset = 0;                 // DescriptorTable: descriptor offset from the table start
     uint32_t heap_dword = 0;                   // HeapIndexed: the index constant within the parameter
     uint32_t heap_shift = 0;                   // HeapIndexed: byte offset = index << heap_shift
-    // HeapIndexed with a CB index (ShaderBinding::heap_index_source): root_parameter_index is the
-    // CB's parameter, table_offset the CBV's slot for CbTable, heap_dword unused.
-    HeapIndexSource heap_index_source = HeapIndexSource::RootConstantIndex;
-    uint32_t cb_byte_offset = 0;
-    uint32_t cb_bit_offset = 0;
-    uint32_t cb_mask = 0xffffffffu;
     SamplerDesc sampler{};                     // InlineSampler
 };
 
@@ -965,14 +926,6 @@ public:
     virtual ViewDescriptor view(const DescriptorHeap& heap, uint32_t index, DescriptorRangeType range) const = 0;
     // The sampler slot `index` holds; false when none.
     virtual bool sampler(const DescriptorHeap& heap, uint32_t index, SamplerDesc* out) const = 0;
-    // `bytes` bytes of guest memory at GPU address `gpu_address` (constant-buffer contents for
-    // CB-indexed heap bindings, HeapIndexSource); false when unreadable. Default: none readable.
-    virtual bool read_gpu_memory(uint64_t gpu_address, void* out, size_t bytes) const {
-        (void)gpu_address;
-        (void)out;
-        (void)bytes;
-        return false;
-    }
 };
 
 struct CachedBindGroup {
@@ -1044,9 +997,6 @@ public:
     // Heap-indexed bindings whose index fell outside the bound heap (or no heap was bound, or the
     // byte offset is not a whole descriptor): bound as null, counted.
     uint64_t heap_index_misses() const noexcept { return heap_index_misses_; }
-    // CB-indexed bindings (HeapIndexSource) whose index could not be read: no constant buffer, an
-    // unreadable one, or byte offset outside it (also counted in heap_index_misses).
-    uint64_t cb_index_misses() const noexcept { return cb_index_misses_; }
 
 private:
     void build_entries(
@@ -1069,7 +1019,6 @@ private:
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
     uint64_t heap_index_misses_ = 0;
-    uint64_t cb_index_misses_ = 0;
 };
 
 // ---------------------------------------------------------------------------
