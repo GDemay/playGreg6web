@@ -7,6 +7,28 @@
 const DEFAULT_CHUNK_SIZE = 256 * 1024; // 256 KiB
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
 const DEFAULT_PREFETCH_CONCURRENCY = 4;
+const MAX_TRACKED_CHUNK_LENGTHS = 65536;
+const MAX_TRACKED_FILE_SIZES = 4096;
+
+function isQuotaExceededError(err) {
+  return Boolean(
+    err &&
+      (err.name === 'QuotaExceededError' ||
+        err.code === 22 ||
+        err.code === 1014 ||
+        /quota/i.test(String(err.message || ''))),
+  );
+}
+
+function isNotFoundError(err) {
+  return Boolean(
+    err &&
+      (err.name === 'NotFoundError' ||
+        err.code === 'ENOENT' ||
+        err.code === 8 ||
+        /not\s*found/i.test(String(err.message || ''))),
+  );
+}
 
 function normalizeDataBase(base) {
   const raw = typeof base === 'string' && base.length > 0 ? base : '/data/';
@@ -121,21 +143,111 @@ class RangeCache {
 
     this._memCache = new Map();
     this._inFlight = new Map();
+    this._opfsEntries = new Map();
+    this._keyToOpfsFile = new Map();
+    this._expectedChunkLengths = new Map();
+    this._fileSizes = new Map();
     this._bytesCached = 0;
     this._stats = {
       hits: 0,
       misses: 0,
       opfsHits: 0,
       evictions: 0,
+      quotaEvictions: 0,
+      quotaRetrySuccesses: 0,
+      corruptEvictions: 0,
     };
   }
 
   setOpfsDir(opfsDir) {
-    this.opfsDir = opfsDir || null;
+    const nextDir = opfsDir || null;
+    if (nextDir !== this.opfsDir) {
+      this._opfsEntries.clear();
+      this._keyToOpfsFile.clear();
+    }
+    this.opfsDir = nextDir;
   }
 
   _chunkKey(relPath, chunkIndex) {
     return `${relPath}::${chunkIndex}`;
+  }
+
+  _recordOpfsEntry(fileName, key, relPath, chunkIndex, byteLength) {
+    if (!fileName) return;
+    if (this._opfsEntries.has(fileName)) {
+      this._opfsEntries.delete(fileName);
+    }
+    this._opfsEntries.set(fileName, { key, relPath, chunkIndex, byteLength });
+    if (key) {
+      this._keyToOpfsFile.set(key, fileName);
+    }
+  }
+
+  _touchOpfsEntryByKey(key) {
+    const fileName = this._keyToOpfsFile.get(key);
+    if (!fileName || !this._opfsEntries.has(fileName)) return;
+    const meta = this._opfsEntries.get(fileName);
+    this._opfsEntries.delete(fileName);
+    this._opfsEntries.set(fileName, meta);
+  }
+
+  _recordExpectedChunkLength(key, byteLength) {
+    if (!Number.isInteger(byteLength) || byteLength <= 0) return;
+    if (this._expectedChunkLengths.has(key)) {
+      this._expectedChunkLengths.delete(key);
+    } else if (this._expectedChunkLengths.size >= MAX_TRACKED_CHUNK_LENGTHS) {
+      const oldest = this._expectedChunkLengths.keys().next().value;
+      if (oldest !== undefined) {
+        this._expectedChunkLengths.delete(oldest);
+      }
+    }
+    this._expectedChunkLengths.set(key, byteLength);
+  }
+
+  _recordFileSize(relPath, totalSize) {
+    if (!Number.isSafeInteger(totalSize) || totalSize < 0) return;
+    if (this._fileSizes.has(relPath)) {
+      this._fileSizes.delete(relPath);
+    } else if (this._fileSizes.size >= MAX_TRACKED_FILE_SIZES) {
+      const oldest = this._fileSizes.keys().next().value;
+      if (oldest !== undefined) {
+        this._fileSizes.delete(oldest);
+      }
+    }
+    this._fileSizes.set(relPath, totalSize);
+  }
+
+  _getExpectedChunkLength(key, relPath, chunkIndex) {
+    if (this._expectedChunkLengths.has(key)) {
+      return this._expectedChunkLengths.get(key);
+    }
+    if (this._fileSizes.has(relPath)) {
+      const total = this._fileSizes.get(relPath);
+      const chunkStart = chunkIndex * this.chunkSize;
+      return Math.max(0, Math.min(this.chunkSize, total - chunkStart));
+    }
+    return null;
+  }
+
+  _validateCachedChunk(key, relPath, chunkIndex, bytes, requiredEndInChunk) {
+    if (!(bytes instanceof Uint8Array)) {
+      return 'corrupt';
+    }
+    if (bytes.byteLength === 0 || bytes.byteLength > this.chunkSize) {
+      return 'corrupt';
+    }
+    const expected = this._getExpectedChunkLength(key, relPath, chunkIndex);
+    if (expected !== null) {
+      return bytes.byteLength === expected ? 'valid' : 'corrupt';
+    }
+    if (
+      Number.isInteger(requiredEndInChunk) &&
+      requiredEndInChunk > 0 &&
+      bytes.byteLength < requiredEndInChunk
+    ) {
+      return 'suspect';
+    }
+    return 'valid';
   }
 
   _touchMemory(key) {
@@ -143,6 +255,7 @@ class RangeCache {
     const bytes = this._memCache.get(key);
     this._memCache.delete(key);
     this._memCache.set(key, bytes);
+    this._touchOpfsEntryByKey(key);
     return bytes;
   }
 
@@ -150,7 +263,9 @@ class RangeCache {
     if (!(bytes instanceof Uint8Array)) return;
     if (this._memCache.has(key)) {
       const existing = this._memCache.get(key);
-      this._bytesCached -= existing.byteLength;
+      if (existing && Number.isFinite(existing.byteLength)) {
+        this._bytesCached = Math.max(0, this._bytesCached - existing.byteLength);
+      }
       this._memCache.delete(key);
     }
 
@@ -162,7 +277,9 @@ class RangeCache {
       const oldestKey = this._memCache.keys().next().value;
       const oldestBytes = this._memCache.get(oldestKey);
       this._memCache.delete(oldestKey);
-      this._bytesCached -= oldestBytes.byteLength;
+      if (oldestBytes && Number.isFinite(oldestBytes.byteLength)) {
+        this._bytesCached = Math.max(0, this._bytesCached - oldestBytes.byteLength);
+      }
       this._stats.evictions += 1;
     }
 
@@ -170,54 +287,275 @@ class RangeCache {
     this._bytesCached += bytes.byteLength;
   }
 
-  async _readOpfs(relPath, chunkIndex) {
-    if (!this.opfsDir) return null;
-    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+  async _deleteOpfsFile(fileName) {
+    if (!this.opfsDir || !fileName) return false;
     try {
-      if (typeof this.opfsDir.getFileHandle === 'function') {
-        const handle = await this.opfsDir.getFileHandle(fileName, { create: false });
-        const file = await handle.getFile();
-        const buf = await file.arrayBuffer();
-        return new Uint8Array(buf);
+      if (typeof this.opfsDir.removeEntry === 'function') {
+        await this.opfsDir.removeEntry(fileName);
+        return true;
       }
-      if (typeof this.opfsDir.get === 'function') {
-        const val = await this.opfsDir.get(fileName);
-        if (val instanceof Uint8Array) return val.slice();
-        if (val instanceof ArrayBuffer) return new Uint8Array(val.slice(0));
+      if (typeof this.opfsDir.delete === 'function') {
+        return Boolean(await this.opfsDir.delete(fileName));
+      }
+      if (typeof this.opfsDir.remove === 'function') {
+        await this.opfsDir.remove(fileName);
+        return true;
       }
     } catch {
-      // Cache miss or OPFS unavailable/corrupt -> gracefully fall back to network.
+      // Ignore NotFoundError or unsupported delete failures.
     }
-    return null;
+    return false;
+  }
+
+  async _listOpfsEntries() {
+    if (!this.opfsDir) return [];
+    const results = [];
+    try {
+      if (typeof this.opfsDir.entries === 'function') {
+        for await (const pair of this.opfsDir.entries()) {
+          if (!Array.isArray(pair) || typeof pair[0] !== 'string') continue;
+          const name = pair[0];
+          const val = pair[1];
+          let byteLength = 0;
+          if (val instanceof Uint8Array || val instanceof ArrayBuffer) {
+            byteLength = val.byteLength;
+          } else if (val && typeof val.getFile === 'function') {
+            try {
+              const file = await val.getFile();
+              if (file && Number.isFinite(file.size)) {
+                byteLength = file.size;
+              }
+            } catch {
+              // Fall back to chunkSize estimate.
+            }
+          }
+          results.push({ name, byteLength });
+        }
+        return results;
+      }
+      if (typeof this.opfsDir.keys === 'function') {
+        for await (const name of this.opfsDir.keys()) {
+          if (typeof name === 'string') {
+            results.push({ name, byteLength: 0 });
+          }
+        }
+      }
+    } catch {
+      // Ignore directory enumeration failures.
+    }
+    return results;
+  }
+
+  async _evictCorruptEntry(key, relPath, chunkIndex, countEviction = true) {
+    if (this._memCache.has(key)) {
+      const existing = this._memCache.get(key);
+      this._memCache.delete(key);
+      if (existing && Number.isFinite(existing.byteLength)) {
+        this._bytesCached = Math.max(0, this._bytesCached - existing.byteLength);
+      }
+    }
+    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+    this._opfsEntries.delete(fileName);
+    this._keyToOpfsFile.delete(key);
+    await this._deleteOpfsFile(fileName);
+    if (countEviction) {
+      this._stats.corruptEvictions += 1;
+    }
+  }
+
+  async _evictForQuota(excludeKey, excludeFileName, targetBytes) {
+    let freedBytes = 0;
+    let evictedEntries = 0;
+    const evictedFileNames = new Set();
+    if (excludeFileName) {
+      evictedFileNames.add(excludeFileName);
+    }
+
+    // 1. Evict oldest tracked OPFS/backing-store entries first (LRU order).
+    if (this._opfsEntries.size > 0) {
+      const opfsSnapshot = Array.from(this._opfsEntries.entries());
+      for (let i = 0; i < opfsSnapshot.length && freedBytes < targetBytes; i += 1) {
+        const [fileName, meta] = opfsSnapshot[i];
+        if (fileName === excludeFileName || meta.key === excludeKey) {
+          continue;
+        }
+        if (!this._opfsEntries.has(fileName)) {
+          continue;
+        }
+        this._opfsEntries.delete(fileName);
+        if (meta.key && this._keyToOpfsFile.get(meta.key) === fileName) {
+          this._keyToOpfsFile.delete(meta.key);
+        }
+        evictedFileNames.add(fileName);
+
+        const entryBytes = Number.isFinite(meta.byteLength) ? meta.byteLength : 0;
+        await this._deleteOpfsFile(fileName);
+        freedBytes += entryBytes > 0 ? entryBytes : this.chunkSize;
+        evictedEntries += 1;
+        this._stats.quotaEvictions += 1;
+      }
+    }
+
+    // 2. If target still not reached, enumerate untracked OPFS cache files (e.g. from prior sessions).
+    if (freedBytes < targetBytes && this.opfsDir) {
+      const existingEntries = await this._listOpfsEntries();
+      for (let i = 0; i < existingEntries.length && freedBytes < targetBytes; i += 1) {
+        const entry = existingEntries[i];
+        if (evictedFileNames.has(entry.name)) {
+          continue;
+        }
+        if (!/^c_\d+_\d+_.*\.bin$/.test(entry.name)) {
+          continue;
+        }
+        evictedFileNames.add(entry.name);
+        this._opfsEntries.delete(entry.name);
+        await this._deleteOpfsFile(entry.name);
+
+        freedBytes += entry.byteLength > 0 ? entry.byteLength : this.chunkSize;
+        evictedEntries += 1;
+        this._stats.quotaEvictions += 1;
+      }
+    }
+
+    return { freedBytes, evictedEntries };
+  }
+
+  async _readOpfsDetailed(relPath, chunkIndex) {
+    if (!this.opfsDir) return { bytes: null, corrupt: false };
+    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+    if (typeof this.opfsDir.getFileHandle === 'function') {
+      let handle;
+      try {
+        handle = await this.opfsDir.getFileHandle(fileName, { create: false });
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return { bytes: null, corrupt: false };
+        }
+        return { bytes: null, corrupt: true };
+      }
+      try {
+        const file = await handle.getFile();
+        const buf = await file.arrayBuffer();
+        return { bytes: new Uint8Array(buf), corrupt: false };
+      } catch {
+        return { bytes: null, corrupt: true };
+      }
+    }
+    if (typeof this.opfsDir.get === 'function') {
+      try {
+        const val = await this.opfsDir.get(fileName);
+        if (val === undefined || val === null) {
+          return { bytes: null, corrupt: false };
+        }
+        if (val instanceof Uint8Array) {
+          return { bytes: val.slice(), corrupt: false };
+        }
+        if (val instanceof ArrayBuffer) {
+          return { bytes: new Uint8Array(val.slice(0)), corrupt: false };
+        }
+        return { bytes: null, corrupt: true };
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return { bytes: null, corrupt: false };
+        }
+        return { bytes: null, corrupt: true };
+      }
+    }
+    return { bytes: null, corrupt: false };
+  }
+
+  async _readOpfs(relPath, chunkIndex) {
+    const res = await this._readOpfsDetailed(relPath, chunkIndex);
+    return res.bytes;
+  }
+
+  async _writeOpfsOnce(fileName, bytes) {
+    if (typeof this.opfsDir.getFileHandle === 'function') {
+      const handle = await this.opfsDir.getFileHandle(fileName, { create: true });
+      if (typeof handle.createWritable === 'function') {
+        const writable = await handle.createWritable();
+        try {
+          await writable.write(bytes);
+          await writable.close();
+        } catch (err) {
+          if (typeof writable.abort === 'function') {
+            try {
+              await writable.abort();
+            } catch {
+              // Ignore abort failures during error cleanup.
+            }
+          }
+          throw err;
+        }
+        return true;
+      }
+      if (typeof handle.createSyncAccessHandle === 'function') {
+        const syncHandle = await handle.createSyncAccessHandle();
+        try {
+          syncHandle.truncate(0);
+          syncHandle.write(bytes, { at: 0 });
+          syncHandle.flush();
+        } finally {
+          syncHandle.close();
+        }
+        return true;
+      }
+      return false;
+    }
+    if (typeof this.opfsDir.set === 'function') {
+      await this.opfsDir.set(fileName, bytes.slice());
+      return true;
+    }
+    return false;
   }
 
   async _writeOpfs(relPath, chunkIndex, bytes) {
     if (!this.opfsDir || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
-      return;
+      return false;
     }
+    const key = this._chunkKey(relPath, chunkIndex);
     const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+
     try {
-      if (typeof this.opfsDir.getFileHandle === 'function') {
-        const handle = await this.opfsDir.getFileHandle(fileName, { create: true });
-        if (typeof handle.createWritable === 'function') {
-          const writable = await handle.createWritable();
-          await writable.write(bytes);
-          await writable.close();
-        } else if (typeof handle.createSyncAccessHandle === 'function') {
-          const syncHandle = await handle.createSyncAccessHandle();
-          try {
-            syncHandle.truncate(0);
-            syncHandle.write(bytes, { at: 0 });
-            syncHandle.flush();
-          } finally {
-            syncHandle.close();
-          }
-        }
-      } else if (typeof this.opfsDir.set === 'function') {
-        await this.opfsDir.set(fileName, bytes.slice());
+      const wrote = await this._writeOpfsOnce(fileName, bytes);
+      if (wrote) {
+        this._recordOpfsEntry(fileName, key, relPath, chunkIndex, bytes.byteLength);
       }
-    } catch {
-      // Ignore OPFS write failures (e.g. quota exceeded) and continue memory-only.
+      return wrote;
+    } catch (err) {
+      // Remove any partial/0-byte file left behind by the failed write.
+      this._opfsEntries.delete(fileName);
+      if (this._keyToOpfsFile.get(key) === fileName) {
+        this._keyToOpfsFile.delete(key);
+      }
+      await this._deleteOpfsFile(fileName);
+
+      if (!isQuotaExceededError(err)) {
+        // Ignore non-quota OPFS write failures and continue memory-only.
+        return false;
+      }
+
+      // QuotaExceededError: evict oldest entries until freeing at least
+      // max(entryBytes, ceil(maxBytes * 0.25)) (or all evictable entries), then retry ONCE.
+      const targetBytes = Math.max(bytes.byteLength, Math.ceil(this.maxBytes * 0.25));
+      await this._evictForQuota(key, fileName, targetBytes);
+
+      try {
+        const retryWrote = await this._writeOpfsOnce(fileName, bytes);
+        if (retryWrote) {
+          this._recordOpfsEntry(fileName, key, relPath, chunkIndex, bytes.byteLength);
+          this._stats.quotaRetrySuccesses += 1;
+        }
+        return retryWrote;
+      } catch {
+        // Quota remains exhausted: clean up any partial file and degrade gracefully.
+        this._opfsEntries.delete(fileName);
+        if (this._keyToOpfsFile.get(key) === fileName) {
+          this._keyToOpfsFile.delete(key);
+        }
+        await this._deleteOpfsFile(fileName);
+        return false;
+      }
     }
   }
 
@@ -250,6 +588,9 @@ class RangeCache {
           : null;
       const parsed = parseContentRange(contentRangeHeader);
       if (parsed) {
+        if (Number.isSafeInteger(parsed.total) && parsed.total >= 0) {
+          this._recordFileSize(relPath, parsed.total);
+        }
         const expectedLen = parsed.end - parsed.start + 1;
         const relOffset = chunkStart >= parsed.start ? chunkStart - parsed.start : 0;
         const available = Math.min(raw.byteLength, expectedLen);
@@ -266,38 +607,93 @@ class RangeCache {
     }
 
     // 200 OK fallback (server returned full resource instead of 206 Partial Content).
+    this._recordFileSize(relPath, raw.byteLength);
     if (chunkStart >= raw.byteLength) {
       return new Uint8Array(0);
     }
     return raw.slice(chunkStart, Math.min(raw.byteLength, chunkStart + this.chunkSize));
   }
 
-  async _getChunk(relPath, chunkIndex) {
+  async _getChunk(relPath, chunkIndex, requiredEndInChunk = 0) {
     const key = this._chunkKey(relPath, chunkIndex);
+    let suspectByteLength = null;
 
     const memHit = this._touchMemory(key);
     if (memHit !== null) {
-      this._stats.hits += 1;
-      return memHit;
+      const verdict = this._validateCachedChunk(key, relPath, chunkIndex, memHit, requiredEndInChunk);
+      if (verdict === 'valid') {
+        this._stats.hits += 1;
+        return memHit;
+      }
+      if (verdict === 'corrupt') {
+        await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+      } else {
+        suspectByteLength = memHit.byteLength;
+        await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+      }
     }
 
     const existingFlight = this._inFlight.get(key);
     if (existingFlight) {
-      return existingFlight;
+      const inflightBytes = await existingFlight;
+      if (inflightBytes instanceof Uint8Array && inflightBytes.byteLength === 0) {
+        return inflightBytes;
+      }
+      const verdict = this._validateCachedChunk(
+        key,
+        relPath,
+        chunkIndex,
+        inflightBytes,
+        requiredEndInChunk,
+      );
+      if (verdict === 'valid') {
+        return inflightBytes;
+      }
+      if (verdict === 'corrupt') {
+        await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+      } else {
+        suspectByteLength = inflightBytes.byteLength;
+        await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+      }
     }
 
     const loadPromise = (async () => {
-      const opfsBytes = await this._readOpfs(relPath, chunkIndex);
-      if (opfsBytes !== null) {
-        this._stats.opfsHits += 1;
-        this._stats.hits += 1;
-        this._putMemory(key, opfsBytes);
-        return opfsBytes;
+      if (suspectByteLength === null) {
+        const opfsResult = await this._readOpfsDetailed(relPath, chunkIndex);
+        if (opfsResult.corrupt) {
+          await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+        } else if (opfsResult.bytes !== null) {
+          const verdict = this._validateCachedChunk(
+            key,
+            relPath,
+            chunkIndex,
+            opfsResult.bytes,
+            requiredEndInChunk,
+          );
+          if (verdict === 'valid') {
+            const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+            this._recordOpfsEntry(fileName, key, relPath, chunkIndex, opfsResult.bytes.byteLength);
+            this._stats.opfsHits += 1;
+            this._stats.hits += 1;
+            this._putMemory(key, opfsResult.bytes);
+            return opfsResult.bytes;
+          }
+          if (verdict === 'corrupt') {
+            await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+          } else {
+            suspectByteLength = opfsResult.bytes.byteLength;
+            await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+          }
+        }
       }
 
       this._stats.misses += 1;
       const netBytes = await this._fetchChunkFromNetwork(relPath, chunkIndex);
+      if (suspectByteLength !== null && netBytes.byteLength !== suspectByteLength) {
+        this._stats.corruptEvictions += 1;
+      }
       if (netBytes.byteLength > 0) {
+        this._recordExpectedChunkLength(key, netBytes.byteLength);
         this._putMemory(key, netBytes);
         await this._writeOpfs(relPath, chunkIndex, netBytes);
       }
@@ -326,12 +722,23 @@ class RangeCache {
       return new Uint8Array(0);
     }
 
+    let effectiveLength = length;
+    if (this._fileSizes.has(cleanPath)) {
+      const knownTotal = this._fileSizes.get(cleanPath);
+      if (offset >= knownTotal) {
+        return new Uint8Array(0);
+      }
+      effectiveLength = Math.min(length, knownTotal - offset);
+    }
+
     const firstChunk = Math.floor(offset / this.chunkSize);
-    const lastChunk = Math.floor((offset + length - 1) / this.chunkSize);
+    const lastChunk = Math.floor((offset + effectiveLength - 1) / this.chunkSize);
 
     const chunkPromises = [];
     for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
-      chunkPromises.push(this._getChunk(cleanPath, idx));
+      const chunkStart = idx * this.chunkSize;
+      const requiredEndInChunk = Math.min(this.chunkSize, offset + effectiveLength - chunkStart);
+      chunkPromises.push(this._getChunk(cleanPath, idx, requiredEndInChunk));
     }
     const chunks = await Promise.all(chunkPromises);
 
@@ -382,7 +789,7 @@ class RangeCache {
         : this.maxPrefetchConcurrency;
 
     const tasks = [];
-    const seen = new Set();
+    const taskIndexByKey = new Map();
 
     for (const entry of rawList) {
       if (!entry || typeof entry.path !== 'string') continue;
@@ -400,10 +807,17 @@ class RangeCache {
       const firstChunk = Math.floor(offset / this.chunkSize);
       const lastChunk = Math.floor((offset + length - 1) / this.chunkSize);
       for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+        const chunkStart = idx * this.chunkSize;
+        const requiredEndInChunk = Math.min(this.chunkSize, offset + length - chunkStart);
         const key = this._chunkKey(cleanPath, idx);
-        if (!seen.has(key)) {
-          seen.add(key);
-          tasks.push({ path: cleanPath, chunkIndex: idx });
+        if (!taskIndexByKey.has(key)) {
+          taskIndexByKey.set(key, tasks.length);
+          tasks.push({ path: cleanPath, chunkIndex: idx, requiredEndInChunk });
+        } else {
+          const existingTask = tasks[taskIndexByKey.get(key)];
+          if (requiredEndInChunk > existingTask.requiredEndInChunk) {
+            existingTask.requiredEndInChunk = requiredEndInChunk;
+          }
         }
       }
     }
@@ -419,7 +833,7 @@ class RangeCache {
         nextIndex += 1;
         const task = tasks[current];
         try {
-          await this._getChunk(task.path, task.chunkIndex);
+          await this._getChunk(task.path, task.chunkIndex, task.requiredEndInChunk);
           prefetched += 1;
         } catch {
           failed += 1;
@@ -453,6 +867,9 @@ class RangeCache {
       misses: this._stats.misses,
       opfsHits: this._stats.opfsHits,
       evictions: this._stats.evictions,
+      quotaEvictions: this._stats.quotaEvictions,
+      quotaRetrySuccesses: this._stats.quotaRetrySuccesses,
+      corruptEvictions: this._stats.corruptEvictions,
       bytesCached: this._bytesCached,
       entries: this._memCache.size,
     };
@@ -468,6 +885,7 @@ const exportedApi = {
   opfsChunkFileName,
   parseContentRange,
   openOpfsCacheDir,
+  isQuotaExceededError,
 };
 
 if (typeof globalThis !== 'undefined') {
