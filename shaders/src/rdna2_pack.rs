@@ -16,7 +16,7 @@
 //! * Ignores non-files and symlinks that resolve outside the input directory.
 //! * Strictly sanitized JSON and text summaries (zero host paths, zero usernames, zero raw bytes).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -183,6 +183,10 @@ pub struct Rdna2PackOptions {
     /// Candidate selection ordering applied when `max_pack_bytes` limits how many translated
     /// stages fit in the `WGPK` v1 archive. Defaults to [`BudgetOrder::HashOrder`].
     pub budget_order: BudgetOrder,
+    /// Optional ordered list of 64-bit shader hashes (`hash_fnv1a64`) that are always prioritized
+    /// ahead of `budget_order` when `max_pack_bytes` limits how many translated stages fit in the
+    /// `WGPK` v1 archive. Duplicate hashes preserve their first-seen priority order.
+    pub priority_hashes: Vec<u64>,
     /// Optional worker thread count for parallel RDNA2 -> WGSL stage translation.
     /// When `None`, defaults to `std::thread::available_parallelism()` (falling back to `1`).
     /// Values `< 1` are clamped to `1`. Use `Some(1)` for single-threaded execution.
@@ -242,6 +246,8 @@ pub struct Rdna2PackSummary {
     pub skipped_oversize: usize,
     pub skipped_budget: usize,
     pub omitted_by_budget: usize,
+    pub priority_hashes_requested: usize,
+    pub priority_hashes_packed: usize,
     pub largest_wgsl_bytes: usize,
     pub total_wgsl_bytes: u64,
     pub vertex_count: usize,
@@ -277,6 +283,16 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  \"skipped_oversize\": {},", self.skipped_oversize);
         let _ = writeln!(out, "  \"skipped_budget\": {},", self.skipped_budget);
         let _ = writeln!(out, "  \"omitted_by_budget\": {},", self.omitted_by_budget);
+        let _ = writeln!(
+            out,
+            "  \"priority_hashes_requested\": {},",
+            self.priority_hashes_requested
+        );
+        let _ = writeln!(
+            out,
+            "  \"priority_hashes_packed\": {},",
+            self.priority_hashes_packed
+        );
         let _ = writeln!(
             out,
             "  \"largest_wgsl_bytes\": {},",
@@ -385,6 +401,18 @@ impl Rdna2PackSummary {
         let _ = writeln!(out, "  skipped_oversize:  {}", self.skipped_oversize);
         let _ = writeln!(out, "  skipped_budget:    {}", self.skipped_budget);
         let _ = writeln!(out, "  omitted_by_budget: {}", self.omitted_by_budget);
+        if self.priority_hashes_requested > 0 {
+            let _ = writeln!(
+                out,
+                "  priority_hashes_requested: {}",
+                self.priority_hashes_requested
+            );
+            let _ = writeln!(
+                out,
+                "  priority_hashes_packed:    {}",
+                self.priority_hashes_packed
+            );
+        }
         let _ = writeln!(out, "  vertex_count:      {}", self.vertex_count);
         let _ = writeln!(out, "  pixel_count:       {}", self.pixel_count);
         let _ = writeln!(out, "  compute_count:     {}", self.compute_count);
@@ -428,6 +456,7 @@ pub struct Rdna2PackResult {
 pub enum Rdna2PackError {
     InvalidInputDir(String),
     InvalidManifest(String),
+    InvalidPriorityHashes(String),
     HashMismatch {
         expected: u64,
         actual: u64,
@@ -447,6 +476,7 @@ impl fmt::Display for Rdna2PackError {
         match self {
             Self::InvalidInputDir(msg) => write!(f, "invalid RDNA2 input directory: {msg}"),
             Self::InvalidManifest(msg) => write!(f, "invalid pipeline-dump manifest: {msg}"),
+            Self::InvalidPriorityHashes(msg) => write!(f, "invalid priority hashes list: {msg}"),
             Self::HashMismatch {
                 expected,
                 actual,
@@ -514,6 +544,60 @@ fn parse_exact_hex_u64(token: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(hex, 16).ok()
+}
+
+/// Parse an ordered, deduplicated list of 64-bit shader hashes from newline-delimited text.
+///
+/// Each non-empty line (after stripping `#` comments and surrounding whitespace) must contain
+/// a single 16-hex-digit 64-bit hash with an optional `0x` / `0X` prefix (ASCII
+/// case-insensitive). Blank lines and `#` comment lines are ignored. Duplicate hashes preserve
+/// their first-seen priority order.
+pub fn parse_priority_hashes(text: &str) -> Result<Vec<u64>, Rdna2PackError> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_num = idx + 1;
+        let without_comment = raw_line.split('#').next().unwrap_or("");
+        let token = without_comment.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some(hash) = parse_exact_hex_u64(token) else {
+            let preview: String = token.chars().take(64).collect();
+            return Err(Rdna2PackError::InvalidPriorityHashes(format!(
+                "line {line_num}: invalid 64-bit hex hash '{preview}' (expected 16 hex digits with optional '0x' prefix)"
+            )));
+        };
+        if seen.insert(hash) {
+            hashes.push(hash);
+        }
+    }
+
+    Ok(hashes)
+}
+
+/// Read and parse a `--priority-hashes` file from disk via [`parse_priority_hashes`].
+pub fn load_priority_hashes_file(path: &Path) -> Result<Vec<u64>, Rdna2PackError> {
+    let label = sanitize_source_path(path, None);
+    let meta = fs::metadata(path).map_err(|_| {
+        Rdna2PackError::InvalidPriorityHashes(format!(
+            "priority hashes file '{label}' does not exist or is unreadable"
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(Rdna2PackError::InvalidPriorityHashes(format!(
+            "priority hashes path '{label}' is not a regular file"
+        )));
+    }
+    let text = fs::read_to_string(path).map_err(|err| {
+        Rdna2PackError::Io(format!(
+            "failed to read priority hashes file '{label}': {}",
+            err.kind()
+        ))
+    })?;
+    parse_priority_hashes(&text)
 }
 
 /// Parse optional pipeline stage and 64-bit hex hash hints from a shader blob filename.
@@ -1212,23 +1296,42 @@ fn build_pack_result(
     mut state: PackBuildState,
     options: &Rdna2PackOptions,
 ) -> Result<Rdna2PackResult, Rdna2PackError> {
+    let mut priority_rank: HashMap<u64, usize> =
+        HashMap::with_capacity(options.priority_hashes.len());
+    for &hash in &options.priority_hashes {
+        let rank = priority_rank.len();
+        priority_rank.entry(hash).or_insert(rank);
+    }
+    let priority_hashes_requested = priority_rank.len();
+
     let (selected_by_hash, expected_pack_bytes): (
         BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
         u64,
     ) = if let Some(max_pack) = options.max_pack_bytes {
         let effective_budget = max_pack.min(u64::from(u32::MAX));
-        let mut candidates: Vec<(u64, usize, PackEntry, Rdna2PackEntrySummary)> = state
-            .candidates_by_hash
-            .into_iter()
-            .map(|(hash, (source_order, entry, summary))| (hash, source_order, entry, summary))
-            .collect();
+        let mut priority_candidates: Vec<(usize, u64, usize, PackEntry, Rdna2PackEntrySummary)> =
+            Vec::new();
+        let mut regular_candidates: Vec<(u64, usize, PackEntry, Rdna2PackEntrySummary)> =
+            Vec::with_capacity(state.candidates_by_hash.len());
 
+        for (hash, (source_order, entry, summary)) in state.candidates_by_hash {
+            if let Some(&rank) = priority_rank.get(&hash) {
+                priority_candidates.push((rank, hash, source_order, entry, summary));
+            } else {
+                regular_candidates.push((hash, source_order, entry, summary));
+            }
+        }
+
+        // Priority shaders are always selected first in priority-file order.
+        priority_candidates.sort_by_key(|(rank, ..)| *rank);
+
+        // Remaining non-priority shaders follow the configured `budget_order`.
         match options.budget_order {
             BudgetOrder::HashOrder => {
                 // Already sorted by ascending 64-bit hash from `BTreeMap`.
             }
             BudgetOrder::SmallestFirst => {
-                candidates.sort_by(|a, b| {
+                regular_candidates.sort_by(|a, b| {
                     a.2.wgsl
                         .len()
                         .cmp(&b.2.wgsl.len())
@@ -1236,15 +1339,31 @@ fn build_pack_result(
                 });
             }
             BudgetOrder::ManifestOrder => {
-                candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                regular_candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             }
         }
 
         let mut current_pack_bytes = PACK_HEADER_BYTES as u64;
         let mut selected: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-        let mut budget_exhausted = false;
 
-        for (hash, _source_order, entry, summary) in candidates {
+        // Phase 1: pack priority-listed shaders first in priority-file order.
+        // A priority shader that exceeds remaining budget is skipped without halting smaller
+        // subsequent priority or non-priority shaders.
+        for (_rank, hash, _source_order, entry, summary) in priority_candidates {
+            let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(entry.wgsl.len() as u64);
+            let projected = current_pack_bytes.saturating_add(entry_cost);
+            if projected <= effective_budget {
+                current_pack_bytes = projected;
+                selected.insert(hash, (entry, summary));
+            } else {
+                state.skipped_budget += 1;
+                state.skipped_or_failed += 1;
+            }
+        }
+
+        // Phase 2: fill remaining budget with non-priority shaders according to `budget_order`.
+        let mut budget_exhausted = false;
+        for (hash, _source_order, entry, summary) in regular_candidates {
             let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(entry.wgsl.len() as u64);
             let projected = current_pack_bytes.saturating_add(entry_cost);
             if !budget_exhausted && projected <= effective_budget {
@@ -1286,6 +1405,15 @@ fn build_pack_result(
         entry_summaries.push(entry_summary);
     }
 
+    let priority_hashes_packed = if priority_rank.is_empty() {
+        0
+    } else {
+        entries
+            .iter()
+            .filter(|entry| priority_rank.contains_key(&entry.hash))
+            .count()
+    };
+
     let mut vertex_count = 0usize;
     let mut pixel_count = 0usize;
     let mut compute_count = 0usize;
@@ -1326,6 +1454,8 @@ fn build_pack_result(
         skipped_oversize: state.skipped_oversize,
         skipped_budget: state.skipped_budget,
         omitted_by_budget: state.skipped_budget,
+        priority_hashes_requested,
+        priority_hashes_packed,
         largest_wgsl_bytes,
         total_wgsl_bytes,
         vertex_count,
@@ -4208,5 +4338,355 @@ mod tests {
                 .to_json()
                 .contains("\"omitted_by_budget\": 2")
         );
+        assert_eq!(default_res.summary.priority_hashes_requested, 0);
+        assert_eq!(default_res.summary.priority_hashes_packed, 0);
+        assert!(
+            default_res
+                .summary
+                .to_json()
+                .contains("\"priority_hashes_requested\": 0")
+        );
+        assert!(
+            default_res
+                .summary
+                .to_json()
+                .contains("\"priority_hashes_packed\": 0")
+        );
+    }
+
+    #[test]
+    fn parse_priority_hashes_accepts_prefixes_case_comments_dedup_and_rejects_invalid_lines() {
+        let text = "\u{feff}\
+# Live-observed hot boot & menu shaders\r\n\
+\r\n\
+  0x0011223344556677   # Start Screen VS\n\
+FEDCBA9876543210\n\
+0X0011223344556677  # duplicate with uppercase prefix -> ignored\n\
+00000000000000aa # inline comment\n\
+   # indented comment\n\
+fedcba9876543210\n";
+
+        let parsed = parse_priority_hashes(text).expect("valid priority hash list should parse");
+        assert_eq!(
+            parsed,
+            vec![
+                0x0011_2233_4455_6677,
+                0xfedc_ba98_7654_3210,
+                0x0000_0000_0000_00aa,
+            ]
+        );
+
+        // Empty / comments-only input produces an empty priority list.
+        assert_eq!(
+            parse_priority_hashes("\n  # just a comment\r\n\t\n").unwrap(),
+            Vec::<u64>::new()
+        );
+
+        // Invalid hex lines must return a clean `InvalidPriorityHashes` error with line number.
+        let short_err = parse_priority_hashes("0x0011223344556677\n0x1234\n")
+            .expect_err("short hex hash must be rejected");
+        match &short_err {
+            Rdna2PackError::InvalidPriorityHashes(msg) => {
+                assert!(msg.contains("line 2"), "msg: {msg}");
+                assert!(msg.contains("0x1234"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidPriorityHashes, got {other:?}"),
+        }
+
+        let too_long_err = parse_priority_hashes("0x00112233445566778\n")
+            .expect_err("17-digit hex hash must be rejected");
+        assert!(matches!(
+            too_long_err,
+            Rdna2PackError::InvalidPriorityHashes(_)
+        ));
+
+        let non_hex_err = parse_priority_hashes("0x001122334455667g\n")
+            .expect_err("non-hex char must be rejected");
+        assert!(matches!(
+            non_hex_err,
+            Rdna2PackError::InvalidPriorityHashes(_)
+        ));
+
+        let two_tokens_err = parse_priority_hashes("0x0011223344556677 0x8899aabbccddeeff\n")
+            .expect_err("two tokens on one line must be rejected");
+        assert!(matches!(
+            two_tokens_err,
+            Rdna2PackError::InvalidPriorityHashes(_)
+        ));
+
+        // File loader round-trip & sanitized error checks.
+        let root = make_temp_dir("playgta6_rdna2_priority_hashes_file");
+        let file_path = root.join("priority.txt");
+        fs::write(&file_path, text).unwrap();
+        assert_eq!(load_priority_hashes_file(&file_path).unwrap(), parsed);
+
+        let missing = root.join("does_not_exist.txt");
+        let missing_err = load_priority_hashes_file(&missing)
+            .expect_err("missing priority file must error")
+            .to_string();
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(!missing_err.contains(&root_str), "err leaked host path: {missing_err}");
+
+        let dir_err = load_priority_hashes_file(&root)
+            .expect_err("directory path must error")
+            .to_string();
+        assert!(!dir_err.contains(&root_str), "err leaked host path: {dir_err}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_rdna2_priority_hashes_packs_larger_priority_shader_ahead_of_smaller_non_priority_under_tight_budget()
+    {
+        // Build one large high-hash shader (`0xf000...0001`) and three compact lower-hash shaders.
+        let mut large_words = Vec::new();
+        for _ in 0..140 {
+            large_words.push(enc_vop1(0x01, 1, 242)); // v_mov_b32 v1, 1.0
+            large_words.push(enc_vop2(0x18, 2, 128 + 1, 1)); // v_lshlrev_b32 v2, 1, v1
+        }
+        large_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 2, 1, 2]));
+        large_words.push(enc_sopp(0x01, 0));
+        let large_ps_bytes = words_to_bytes(&large_words);
+
+        let small_vs_bytes = build_fullscreen_triangle_vs_rdna2();
+        let small_ps_bytes = build_textured_splash_ps_rdna2();
+        let small_cs_bytes = build_minimal_compute_rdna2();
+
+        let priority_hash = 0xf000_0000_0000_0001u64;
+        let small_a = 0x0000_0000_0000_0010u64;
+        let small_b = 0x0000_0000_0000_0020u64;
+        let small_c = 0x0000_0000_0000_0030u64;
+
+        let blobs = vec![
+            Rdna2BlobInput::new("ps_f000000000000001.rdna2", large_ps_bytes),
+            Rdna2BlobInput::new("cs_0000000000000010.rdna2", small_cs_bytes),
+            Rdna2BlobInput::new("ps_0000000000000020.rdna2", small_ps_bytes),
+            Rdna2BlobInput::new("vs_0000000000000030.rdna2", small_vs_bytes),
+        ];
+
+        let full = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default()).unwrap();
+        let cost_of = |hash: u64| -> u64 {
+            PACK_ENTRY_BYTES as u64
+                + full
+                    .entries
+                    .iter()
+                    .find(|e| e.hash == hash)
+                    .unwrap()
+                    .wgsl
+                    .len() as u64
+        };
+
+        let large_cost = cost_of(priority_hash);
+        let cost_a = cost_of(small_a);
+        let cost_b = cost_of(small_b);
+        let cost_c = cost_of(small_c);
+        let mut small_costs = [(small_a, cost_a), (small_b, cost_b), (small_c, cost_c)];
+        small_costs.sort_by_key(|&(_, c)| c);
+        let smallest_non_priority_hash = small_costs[0].0;
+        let smallest_non_priority_cost = small_costs[0].1;
+        assert!(
+            large_cost > cost_a + cost_b + cost_c,
+            "large priority shader must exceed sum of all three small shaders"
+        );
+
+        // Tight budget that fits `large + smallest_non_priority`, OR all 3 small shaders without `large`.
+        let tight_budget = PACK_HEADER_BYTES as u64 + large_cost + smallest_non_priority_cost;
+
+        // Without priority hashes under `smallest-first`: packs all 3 small shaders and omits `large`.
+        let without_priority = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(tight_budget),
+                budget_order: BudgetOrder::SmallestFirst,
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(without_priority.summary.translated_ok, 3);
+        assert_eq!(without_priority.summary.omitted_by_budget, 1);
+        assert_eq!(without_priority.summary.priority_hashes_requested, 0);
+        assert_eq!(without_priority.summary.priority_hashes_packed, 0);
+        assert!(
+            without_priority
+                .entries
+                .iter()
+                .all(|e| e.hash != priority_hash),
+            "without --priority-hashes, smallest-first should omit the large shader"
+        );
+
+        // With priority hashes listing `priority_hash` (plus an absent hash to verify requested vs packed):
+        let absent_hash = 0xdead_beef_cafe_babeu64;
+        let with_priority_j1 = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(tight_budget),
+                budget_order: BudgetOrder::SmallestFirst,
+                priority_hashes: vec![priority_hash, absent_hash],
+                jobs: Some(1),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut blobs_rev = blobs.clone();
+        blobs_rev.reverse();
+        let with_priority_j4 = pack_rdna2_blobs(
+            &blobs_rev,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(tight_budget),
+                budget_order: BudgetOrder::SmallestFirst,
+                priority_hashes: vec![priority_hash, absent_hash, priority_hash],
+                jobs: Some(4),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(with_priority_j1.pack_bytes, with_priority_j4.pack_bytes);
+        assert_eq!(with_priority_j1.summary, with_priority_j4.summary);
+        assert_eq!(
+            with_priority_j1.summary.to_json(),
+            with_priority_j4.summary.to_json()
+        );
+        assert_eq!(with_priority_j1.summary.priority_hashes_requested, 2);
+        assert_eq!(with_priority_j1.summary.priority_hashes_packed, 1);
+        assert_eq!(with_priority_j1.summary.translated_ok, 2);
+        assert_eq!(with_priority_j1.summary.omitted_by_budget, 2);
+        assert_eq!(with_priority_j1.pack_bytes.len() as u64, tight_budget);
+
+        // Packed entries must be `{smallest_non_priority_hash, priority_hash}` in canonical ascending hash order.
+        let decoded = read_pack(&with_priority_j1.pack_bytes).expect("WGPK decode must succeed");
+        let packed_hashes: Vec<u64> = decoded.entries.iter().map(|e| e.hash).collect();
+        assert_eq!(packed_hashes, vec![smallest_non_priority_hash, priority_hash]);
+        for entry in &decoded.entries {
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        let json = with_priority_j1.summary.to_json();
+        let text = with_priority_j1.summary.to_text();
+        assert!(
+            json.contains("\"priority_hashes_requested\": 2"),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains("\"priority_hashes_packed\": 1"),
+            "JSON:\n{json}"
+        );
+        assert!(
+            text.contains("priority_hashes_requested: 2"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("priority_hashes_packed:    1"),
+            "text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn pack_rdna2_priority_hashes_respects_priority_order_and_skips_oversize_priority_cleanly() {
+        let make_alu_ps = |iters: usize, dst_reg: u8| -> Vec<u8> {
+            let mut words = Vec::with_capacity(iters * 2 + 4);
+            for _ in 0..iters {
+                words.push(enc_vop1(0x01, dst_reg, 242));
+                words.push(enc_vop2(0x18, dst_reg + 1, 128 + 1, dst_reg));
+            }
+            words.extend_from_slice(&enc_exp(
+                0,
+                0xF,
+                false,
+                true,
+                true,
+                [dst_reg, dst_reg + 1, dst_reg, dst_reg + 1],
+            ));
+            words.push(enc_sopp(0x01, 0));
+            words_to_bytes(&words)
+        };
+
+        // Three same-size priority candidates with distinct hashes, plus one huge priority shader
+        // and one compact non-priority shader.
+        let p_first = 0xc000_0000_0000_0003u64;
+        let p_second = 0x8000_0000_0000_0002u64;
+        let p_third = 0x1000_0000_0000_0001u64;
+        let p_huge = 0xd000_0000_0000_0004u64;
+        let non_prio = 0x0000_0000_0000_0005u64;
+
+        let same_size_a = make_alu_ps(6, 1);
+        let same_size_b = make_alu_ps(6, 2);
+        let same_size_c = make_alu_ps(6, 3);
+        let huge_ps = make_alu_ps(160, 4);
+        let tiny_cs = build_minimal_compute_rdna2();
+
+        let blobs = vec![
+            Rdna2BlobInput::new("ps_c000000000000003.rdna2", same_size_a),
+            Rdna2BlobInput::new("ps_8000000000000002.rdna2", same_size_b),
+            Rdna2BlobInput::new("ps_1000000000000001.rdna2", same_size_c),
+            Rdna2BlobInput::new("ps_d000000000000004.rdna2", huge_ps),
+            Rdna2BlobInput::new("cs_0000000000000005.rdna2", tiny_cs),
+        ];
+
+        let full = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default()).unwrap();
+        let cost_of = |hash: u64| -> u64 {
+            PACK_ENTRY_BYTES as u64
+                + full
+                    .entries
+                    .iter()
+                    .find(|e| e.hash == hash)
+                    .unwrap()
+                    .wgsl
+                    .len() as u64
+        };
+
+        // 1) Budget fits only `p_first + p_second` (strictly less than adding `p_third` or `non_prio`?
+        // Actually exact fit for `p_first + p_second` leaves 0 bytes remaining).
+        let order_budget = PACK_HEADER_BYTES as u64 + cost_of(p_first) + cost_of(p_second);
+        let order_res = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(order_budget),
+                budget_order: BudgetOrder::HashOrder,
+                priority_hashes: vec![p_first, p_second, p_third],
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        let packed_hashes: Vec<u64> = order_res.entries.iter().map(|e| e.hash).collect();
+        // Priority order picks `p_first` (0xc000...) and `p_second` (0x8000...), NOT `p_third` (0x1000...)!
+        assert_eq!(packed_hashes, vec![p_second, p_first]);
+        assert_eq!(order_res.summary.priority_hashes_requested, 3);
+        assert_eq!(order_res.summary.priority_hashes_packed, 2);
+        assert_eq!(order_res.summary.omitted_by_budget, 3);
+
+        // 2) If the first priority shader (`p_huge`) exceeds the total budget, it must be skipped
+        // cleanly WITHOUT blocking the second priority shader (`p_first`) or smaller non-priority (`non_prio`).
+        let skip_huge_budget = PACK_HEADER_BYTES as u64 + cost_of(p_first) + cost_of(non_prio);
+        assert!(cost_of(p_huge) > skip_huge_budget);
+        let skip_res = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(skip_huge_budget),
+                budget_order: BudgetOrder::SmallestFirst,
+                priority_hashes: vec![p_huge, p_first],
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        let skip_packed: Vec<u64> = skip_res.entries.iter().map(|e| e.hash).collect();
+        assert_eq!(skip_packed, vec![non_prio, p_first]);
+        assert_eq!(skip_res.summary.priority_hashes_requested, 2);
+        assert_eq!(skip_res.summary.priority_hashes_packed, 1);
+        assert_eq!(skip_res.summary.omitted_by_budget, 3);
+
+        // 3) Unbounded pack (no `--max-pack-bytes`) still reports priority metrics accurately.
+        let unbounded = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                priority_hashes: vec![p_first, p_second, 0x9999_9999_9999_9999],
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(unbounded.entries.len(), 5);
+        assert_eq!(unbounded.summary.priority_hashes_requested, 3);
+        assert_eq!(unbounded.summary.priority_hashes_packed, 2);
     }
 }
