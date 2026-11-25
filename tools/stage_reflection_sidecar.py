@@ -14,7 +14,7 @@ sidecar only when its reflection carries the join keys the runtime needs:
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
 
-    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--report-missing-sources <report.json>] [--json]
+    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--json]
 
 The sidecar is derived from the title's shaders: write it under work/, never into the repository.
 """
@@ -139,39 +139,182 @@ def _sanitize_hash(value: Any) -> str:
     return "<redacted>"
 
 
-def load_existing_sidecar(path: Path) -> dict[str, Any]:
-    """Load and validate an existing v1 sidecar JSON; returns {} if the file does not exist."""
+def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
+    """Load and validate a v1 sidecar JSON file."""
     if not path.exists():
-        return {}
+        if allow_missing:
+            return {}
+        raise ValueError(f"{label} file does not exist")
     if path.is_dir():
-        raise ValueError("existing sidecar path is a directory")
+        raise ValueError(f"{label} path is a directory")
     try:
         with path.open(encoding="utf-8-sig") as f:
             doc = json.load(f)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON in existing sidecar: {exc.msg}") from exc
+        raise ValueError(f"invalid JSON in {label}: {exc.msg}") from exc
     if not isinstance(doc, dict):
-        raise ValueError("existing sidecar must be a JSON object")
+        raise ValueError(f"{label} must be a JSON object")
     if doc.get("schema") != SCHEMA:
-        raise ValueError(f"existing sidecar schema must be {SCHEMA!r}, got {doc.get('schema')!r}")
+        raise ValueError(f"{label} schema must be {SCHEMA!r}, got {_sanitize_label(doc.get('schema'), fallback='<invalid>')!r}")
     version = doc.get("version")
     if type(version) is not int or version != VERSION:
-        raise ValueError(f"existing sidecar version must be {VERSION}, got {version!r}")
+        raise ValueError(f"{label} version must be {VERSION}, got {version!r}")
     stages = doc.get("stages")
     if not isinstance(stages, dict):
-        raise ValueError("existing sidecar 'stages' must be an object")
+        raise ValueError(f"{label} 'stages' must be an object")
     validated: dict[str, Any] = {}
     for k, v in stages.items():
         if not isinstance(k, str) or not k:
-            raise ValueError("existing sidecar stage keys must be non-empty strings")
+            raise ValueError(f"{label} stage keys must be non-empty strings")
+        safe_k = _sanitize_hash(k)
         if not isinstance(v, dict):
-            raise ValueError(f"existing sidecar stage {k!r} must be an object")
+            raise ValueError(f"{label} stage {safe_k!r} must be an object")
         if v.get("stage") not in STAGES:
-            raise ValueError(f"existing sidecar stage {k!r} has invalid stage {v.get('stage')!r}")
+            raise ValueError(
+                f"{label} stage {safe_k!r} has invalid stage "
+                f"{_sanitize_label(v.get('stage'), fallback='<invalid>')!r}"
+            )
         if not isinstance(v.get("bindings"), list):
-            raise ValueError(f"existing sidecar stage {k!r} must have a 'bindings' list")
+            raise ValueError(f"{label} stage {safe_k!r} must have a 'bindings' list")
         validated[k] = v
     return validated
+
+
+def load_existing_sidecar(path: Path) -> dict[str, Any]:
+    """Load and validate an existing v1 sidecar JSON; returns {} if the file does not exist."""
+    return _load_sidecar(path, label="existing sidecar", allow_missing=True)
+
+
+def load_baseline_sidecar(path: Path) -> dict[str, Any]:
+    """Load and validate a baseline v1 sidecar JSON; raises ValueError if missing or invalid."""
+    return _load_sidecar(path, label="baseline sidecar", allow_missing=False)
+
+
+def _is_vertex_index_stage(stage_obj: dict[str, Any]) -> bool:
+    """Return True when a vertex stage uses vertex_index (no vertex attribute inputs)."""
+    if stage_obj.get("stage") != "vertex":
+        return False
+    raw_mode = stage_obj.get("vertex_input_mode")
+    if isinstance(raw_mode, str) and raw_mode.strip():
+        return raw_mode.strip().lower() == "vertex_index"
+    inputs = stage_obj.get("vertex_inputs")
+    return not isinstance(inputs, list) or len(inputs) == 0
+
+
+def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
+    """Compute sanitized breakdown telemetry for a sidecar's stages map."""
+    by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    inline_sampler_stages = 0
+    inline_sampler_bindings = 0
+    resource_heap_stages = 0
+    resource_heap_bindings = 0
+    vertex_index_stages = 0
+
+    for stage_obj in stages.values():
+        if not isinstance(stage_obj, dict):
+            continue
+        stage = stage_obj.get("stage")
+        if stage in by_stage:
+            by_stage[stage] += 1
+
+        has_inline_sampler = False
+        has_resource_heap = False
+        bindings = stage_obj.get("bindings")
+        if isinstance(bindings, list):
+            for binding in bindings:
+                if not isinstance(binding, dict):
+                    continue
+                source = binding.get("source")
+                if not isinstance(source, dict):
+                    continue
+                if "inline_sampler" in source:
+                    inline_sampler_bindings += 1
+                    has_inline_sampler = True
+                if "resource_heap" in source:
+                    resource_heap_bindings += 1
+                    has_resource_heap = True
+
+        if has_inline_sampler:
+            inline_sampler_stages += 1
+        if has_resource_heap:
+            resource_heap_stages += 1
+        if _is_vertex_index_stage(stage_obj):
+            vertex_index_stages += 1
+
+    return {
+        "by_stage": by_stage,
+        "inline_sampler_stages": inline_sampler_stages,
+        "inline_sampler_bindings": inline_sampler_bindings,
+        "resource_heap_stages": resource_heap_stages,
+        "resource_heap_bindings": resource_heap_bindings,
+        "vertex_index_stages": vertex_index_stages,
+    }
+
+
+def _stage_canonical_json(stage_obj: dict[str, Any]) -> str:
+    return json.dumps(stage_obj, sort_keys=True, separators=(",", ":"))
+
+
+def _sample_hashes(keys: list[str], *, max_samples: int = DEFAULT_MAX_SAMPLE_HASHES) -> list[str]:
+    seen: set[str] = set()
+    samples: list[str] = []
+    for key in keys:
+        safe_hash = _sanitize_hash(key)
+        if safe_hash not in seen and len(samples) < max_samples:
+            seen.add(safe_hash)
+            samples.append(safe_hash)
+    return samples
+
+
+def diff_sidecars(
+    baseline_stages: dict[str, Any],
+    current_stages: dict[str, Any],
+    *,
+    max_samples: int = DEFAULT_MAX_SAMPLE_HASHES,
+) -> dict[str, Any]:
+    """Compare baseline and current sidecar stage maps and return a sanitized diff summary."""
+    baseline_keys = set(baseline_stages.keys())
+    current_keys = set(current_stages.keys())
+    added_keys = sorted(current_keys - baseline_keys)
+    removed_keys = sorted(baseline_keys - current_keys)
+    common_keys = sorted(baseline_keys & current_keys)
+
+    changed_keys: list[str] = []
+    unchanged_count = 0
+    for key in common_keys:
+        if _stage_canonical_json(baseline_stages[key]) == _stage_canonical_json(current_stages[key]):
+            unchanged_count += 1
+        else:
+            changed_keys.append(key)
+
+    added_by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    for key in added_keys:
+        stage = current_stages[key].get("stage")
+        if stage in added_by_stage:
+            added_by_stage[stage] += 1
+
+    removed_by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    for key in removed_keys:
+        stage = baseline_stages[key].get("stage")
+        if stage in removed_by_stage:
+            removed_by_stage[stage] += 1
+
+    baseline_count = len(baseline_stages)
+    current_count = len(current_stages)
+    return {
+        "baseline_stages": baseline_count,
+        "current_stages": current_count,
+        "net_delta": current_count - baseline_count,
+        "added_count": len(added_keys),
+        "removed_count": len(removed_keys),
+        "changed_count": len(changed_keys),
+        "unchanged_count": unchanged_count,
+        "added_by_stage": added_by_stage,
+        "removed_by_stage": removed_by_stage,
+        "added_sample_hashes": _sample_hashes(added_keys, max_samples=max_samples),
+        "removed_sample_hashes": _sample_hashes(removed_keys, max_samples=max_samples),
+        "changed_sample_hashes": _sample_hashes(changed_keys, max_samples=max_samples),
+    }
 
 
 def build(docs: list[Any], existing_stages: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, int]]:
@@ -259,6 +402,17 @@ def main(argv: list[str] | None = None) -> int:
         help="load an existing v1 sidecar JSON (if present) and merge newly converted stages on top",
     )
     parser.add_argument(
+        "--diff-baseline",
+        type=Path,
+        default=None,
+        help="compare the newly generated sidecar against a previous v1 sidecar JSON",
+    )
+    parser.add_argument(
+        "--fail-on-regressions",
+        action="store_true",
+        help="with --diff-baseline, exit with code 2 if any previously reflected stage is removed",
+    )
+    parser.add_argument(
         "--report-missing-sources",
         type=Path,
         default=None,
@@ -267,12 +421,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print the counts as JSON")
     args = parser.parse_args(argv)
 
+    if args.fail_on_regressions and args.diff_baseline is None:
+        print("error: --fail-on-regressions requires --diff-baseline", file=sys.stderr)
+        return 1
+
     existing_stages: dict[str, Any] = {}
     if args.merge_existing is not None:
         try:
             existing_stages = load_existing_sidecar(args.merge_existing)
         except (OSError, ValueError) as exc:
             print(f"error: failed to load --merge-existing: {exc}", file=sys.stderr)
+            return 1
+
+    baseline_stages: dict[str, Any] | None = None
+    if args.diff_baseline is not None:
+        try:
+            baseline_stages = load_baseline_sidecar(args.diff_baseline)
+        except (OSError, ValueError) as exc:
+            print(f"error: failed to load --diff-baseline: {exc}", file=sys.stderr)
             return 1
 
     docs = []
@@ -292,16 +458,37 @@ def main(argv: list[str] | None = None) -> int:
     counts: dict[str, Any] = {"stages_written": len(sidecar["stages"]), "skipped": skipped}
     if args.merge_existing is not None:
         counts["merged_existing"] = len(existing_stages)
+    counts.update(summarize_stages(sidecar["stages"]))
+
+    diff: dict[str, Any] | None = None
+    if baseline_stages is not None:
+        diff = diff_sidecars(baseline_stages, sidecar["stages"])
+        counts["diff"] = diff
 
     if args.json:
         print(json.dumps(counts))
-    elif args.merge_existing is not None:
-        print(
-            f"{counts['stages_written']} stage(s) written "
-            f"(merged {counts['merged_existing']} existing); skipped: {skipped or 'none'}"
-        )
     else:
-        print(f"{counts['stages_written']} stage(s) written; skipped: {skipped or 'none'}")
+        if args.merge_existing is not None:
+            line = (
+                f"{counts['stages_written']} stage(s) written "
+                f"(merged {counts['merged_existing']} existing); skipped: {skipped or 'none'}"
+            )
+        else:
+            line = f"{counts['stages_written']} stage(s) written; skipped: {skipped or 'none'}"
+        if diff is not None:
+            line += (
+                f"; diff: +{diff['added_count']}/-{diff['removed_count']}"
+                f"/~{diff['changed_count']}/={diff['unchanged_count']}"
+                f" (net {diff['net_delta']:+d})"
+            )
+        print(line)
+
+    if args.fail_on_regressions and diff is not None and diff["removed_count"] > 0:
+        print(
+            f"error: regression detected: {diff['removed_count']} stage(s) removed compared to baseline",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

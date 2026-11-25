@@ -178,6 +178,12 @@ class SidecarTests(unittest.TestCase):
             "stages_written": 3,
             "skipped": {"binding without source": 1},
             "merged_existing": 2,
+            "by_stage": {"vertex": 1, "fragment": 1, "compute": 1},
+            "inline_sampler_stages": 0,
+            "inline_sampler_bindings": 0,
+            "resource_heap_stages": 0,
+            "resource_heap_bindings": 0,
+            "vertex_index_stages": 0,
         })
         self.assertEqual(set(written["stages"].keys()), {
             "0x0000000000000001",
@@ -222,6 +228,12 @@ class SidecarTests(unittest.TestCase):
                 "stages_written": 1,
                 "skipped": {},
                 "merged_existing": 0,
+                "by_stage": {"vertex": 1, "fragment": 0, "compute": 0},
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "resource_heap_stages": 0,
+                "resource_heap_bindings": 0,
+                "vertex_index_stages": 0,
             })
 
             # Second run: in-place merge onto the file written in run 1
@@ -233,6 +245,12 @@ class SidecarTests(unittest.TestCase):
                 "stages_written": 2,
                 "skipped": {},
                 "merged_existing": 1,
+                "by_stage": {"vertex": 1, "fragment": 1, "compute": 0},
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "resource_heap_stages": 0,
+                "resource_heap_bindings": 0,
+                "vertex_index_stages": 0,
             })
             written = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(set(written["stages"].keys()), {"0x00000000000000a1", "0x00000000000000b2"})
@@ -285,8 +303,18 @@ class SidecarTests(unittest.TestCase):
                 rc = sidecar.main([str(src), "--out", str(out), "--json"])
             self.assertEqual(rc, 0)
             summary = json.loads(stdout.getvalue())
-        self.assertEqual(summary, {"stages_written": 1, "skipped": {}})
+        self.assertEqual(summary, {
+            "stages_written": 1,
+            "skipped": {},
+            "by_stage": {"vertex": 1, "fragment": 0, "compute": 0},
+            "inline_sampler_stages": 0,
+            "inline_sampler_bindings": 0,
+            "resource_heap_stages": 0,
+            "resource_heap_bindings": 0,
+            "vertex_index_stages": 0,
+        })
         self.assertNotIn("merged_existing", summary)
+        self.assertNotIn("diff", summary)
 
     def test_report_missing_sources_counts_sorting_and_sample_cap(self):
         entries = []
@@ -454,6 +482,412 @@ class SidecarTests(unittest.TestCase):
         self.assertIn(("fragment", "texture", "<redacted>"), by_stage_kind)
         self.assertIn(("compute", "<redacted>", "safe_name_0"), by_stage_kind)
         self.assertEqual(by_stage_kind[("compute", "<redacted>", "safe_name_0")]["sample_hashes"], ["<redacted>"])
+
+    def test_json_breakdown_telemetry_counts_all_categories(self):
+        inline_src_a = {"inline_sampler": {"sdwords": [0x92, 0x00F00000, 0x08500000, 0]}}
+        inline_src_b = {"inline_sampler": {"sdwords": [0x00, 0x00F00000, 0x00000000, 0]}}
+        res_heap_a = {"resource_heap": {"base_user_sgpr": 4, "stride": 32, "index": {"user_sgpr": 5, "shift": 5}}}
+        res_heap_b = {"resource_heap": {"base_user_sgpr": 6, "stride": 32, "index": {"user_sgpr": 7, "shift": 5}}}
+        samp_heap = {"sampler_heap": {"base_user_sgpr": 11, "stride": 16, "index": {"user_sgpr": 9, "shift": 4}}}
+
+        entries = [
+            # Vertex stage with attributes (NOT vertex_index)
+            vertex_entry(True),
+            # Vertex stage using vertex_index + 1 resource_heap binding
+            {
+                "hash_fnv1a64": "0x00000000000000a2",
+                "stage": "vertex",
+                "binding_summary": {"vertex_input_mode": "vertex_index"},
+                "bindings": [
+                    {"group": 0, "binding": 0, "kind": "storage", "source": res_heap_a},
+                ],
+            },
+            # Vertex stage with omitted binding_summary & no vertex_inputs (buffer-pulling -> vertex_index)
+            {
+                "hash_fnv1a64": "0x00000000000000a3",
+                "stage": "vertex",
+                "bindings": [
+                    {"group": 0, "binding": 0, "kind": "uniform",
+                     "source": {"user_sgpr": 2, "table_byte_offset": 0}},
+                ],
+            },
+            # Fragment stage with 2 inline_samplers, 2 resource_heap bindings, and 1 sampler_heap
+            # (sampler_heap must NOT be counted as resource_heap)
+            {
+                "hash_fnv1a64": "0x00000000000000b1",
+                "stage": "pixel",
+                "bindings": [
+                    {"group": 0, "binding": 0, "kind": "texture", "source": res_heap_a},
+                    {"group": 0, "binding": 1, "kind": "texture", "source": res_heap_b},
+                    {"group": 0, "binding": 2, "kind": "sampler", "source": samp_heap},
+                    {"group": 0, "binding": 3, "kind": "sampler", "source": inline_src_a},
+                    {"group": 0, "binding": 4, "kind": "sampler", "source": inline_src_b},
+                ],
+            },
+            # Compute stage with 1 inline_sampler
+            {
+                "hash_fnv1a64": "0x00000000000000c1",
+                "stage": "compute",
+                "bindings": [
+                    {"group": 0, "binding": 0, "kind": "sampler", "source": inline_src_a},
+                ],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack.json"
+            out = Path(tmp) / "pack.reflect.json"
+            src.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            written = json.loads(out.read_text(encoding="utf-8"))
+
+        # Sidecar JSON v1 schema must remain strictly unchanged
+        self.assertEqual(set(written.keys()), {"schema", "version", "stages"})
+        self.assertEqual(written["schema"], "playgta6-stage-reflection")
+        self.assertEqual(written["version"], 1)
+
+        self.assertEqual(summary, {
+            "stages_written": 5,
+            "skipped": {},
+            "by_stage": {"vertex": 3, "fragment": 1, "compute": 1},
+            "inline_sampler_stages": 2,
+            "inline_sampler_bindings": 3,
+            "resource_heap_stages": 2,
+            "resource_heap_bindings": 3,
+            "vertex_index_stages": 2,
+        })
+
+    def test_summarize_stages_empty_and_explicit_vertex_input_mode(self):
+        self.assertEqual(sidecar.summarize_stages({}), {
+            "by_stage": {"vertex": 0, "fragment": 0, "compute": 0},
+            "inline_sampler_stages": 0,
+            "inline_sampler_bindings": 0,
+            "resource_heap_stages": 0,
+            "resource_heap_bindings": 0,
+            "vertex_index_stages": 0,
+        })
+        stages = {
+            "0x1": {"stage": "vertex", "bindings": [], "vertex_inputs": []},
+            "0x2": {"stage": "vertex", "bindings": [], "vertex_input_mode": "vertex_index"},
+            "0x3": {"stage": "vertex", "bindings": [], "vertex_input_mode": "attributes"},
+        }
+        summary = sidecar.summarize_stages(stages)
+        self.assertEqual(summary["by_stage"], {"vertex": 3, "fragment": 0, "compute": 0})
+        self.assertEqual(summary["vertex_index_stages"], 2)
+
+    def test_diff_sidecars_unit_counts_key_order_and_sample_caps(self):
+        # Identical stage with different dict key ordering must be unchanged
+        baseline = {
+            "0x0000000000000001": {
+                "bindings": [{"source": {"static_sampler": 0}, "kind": "sampler", "binding": 0, "group": 0}],
+                "stage": "fragment",
+            },
+            "0x0000000000000002": {
+                "stage": "vertex",
+                "bindings": [{"group": 0, "binding": 0, "kind": "uniform",
+                              "source": {"user_sgpr": 2, "table_byte_offset": 0}}],
+            },
+            # 6 removed stages (4 fragment, 2 compute) to test cap at 5
+            **{
+                f"0x000000000000010{i}": {
+                    "stage": "fragment" if i < 4 else "compute",
+                    "bindings": [],
+                }
+                for i in range(6)
+            },
+        }
+        current = {
+            "0x0000000000000001": {
+                "stage": "fragment",
+                "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+            },
+            # Changed binding source
+            "0x0000000000000002": {
+                "stage": "vertex",
+                "bindings": [{"group": 0, "binding": 0, "kind": "uniform",
+                              "source": {"user_sgpr": 4, "table_byte_offset": 16}}],
+            },
+            # 2 added stages (1 vertex, 1 compute)
+            "0x0000000000000201": {"stage": "vertex", "bindings": []},
+            "0x0000000000000202": {"stage": "compute", "bindings": []},
+        }
+
+        diff = sidecar.diff_sidecars(baseline, current)
+        self.assertEqual(diff, {
+            "baseline_stages": 8,
+            "current_stages": 4,
+            "net_delta": -4,
+            "added_count": 2,
+            "removed_count": 6,
+            "changed_count": 1,
+            "unchanged_count": 1,
+            "added_by_stage": {"vertex": 1, "fragment": 0, "compute": 1},
+            "removed_by_stage": {"vertex": 0, "fragment": 4, "compute": 2},
+            "added_sample_hashes": ["0x0000000000000201", "0x0000000000000202"],
+            "removed_sample_hashes": [f"0x000000000000010{i}" for i in range(5)],
+            "changed_sample_hashes": ["0x0000000000000002"],
+        })
+
+    def test_diff_baseline_cli_and_fail_on_regressions(self):
+        baseline_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 1,
+            "stages": {
+                # Will remain unchanged
+                "0x00000000000000a1": {
+                    "stage": "vertex",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "uniform",
+                                  "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                                  "min_binding_size_bytes": 16}],
+                    "vertex_inputs": [{"location": 0, "vb_slot": 0, "byte_offset": 8,
+                                       "components": 2, "component_type": "f32"}],
+                },
+                # Will be changed
+                "0x00000000000000b1": {
+                    "stage": "fragment",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+                # Will be removed (regression)
+                "0x00000000000000c1": {
+                    "stage": "compute",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "storage",
+                                  "source": {"user_sgpr": 2, "table_byte_offset": 0}}],
+                },
+            },
+        }
+        current_entries = {
+            "entries": [
+                # Unchanged
+                vertex_entry(True),
+                # Changed (static_sampler 0 -> 1)
+                {
+                    "hash_fnv1a64": "0x00000000000000b1",
+                    "stage": "fragment",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 1}}],
+                },
+                # Added
+                {
+                    "hash_fnv1a64": "0x00000000000000d1",
+                    "stage": "fragment",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler",
+                                  "source": {"inline_sampler": {"sdwords": [1, 2, 3, 4]}}}],
+                },
+                # Skipped (for missing-sources report check)
+                {
+                    "hash_fnv1a64": "0x00000000000000e1",
+                    "stage": "compute",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "storage", "name": "buf0"}],
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_path = Path(tmp) / "prev.reflect.json"
+            src_path = Path(tmp) / "new.json"
+            out_path = Path(tmp) / "curr.reflect.json"
+            report_path = Path(tmp) / "missing.json"
+            baseline_path.write_text(json.dumps(baseline_doc), encoding="utf-8")
+            src_path.write_text(json.dumps(current_entries), encoding="utf-8")
+
+            # Without --fail-on-regressions: exits 0 even though 1 stage was removed
+            stdout_ok = io.StringIO()
+            with redirect_stdout(stdout_ok):
+                rc_ok = sidecar.main([
+                    str(src_path),
+                    "--out", str(out_path),
+                    "--diff-baseline", str(baseline_path),
+                    "--json",
+                ])
+            self.assertEqual(rc_ok, 0)
+            summary_ok = json.loads(stdout_ok.getvalue())
+            self.assertEqual(summary_ok["diff"], {
+                "baseline_stages": 3,
+                "current_stages": 3,
+                "net_delta": 0,
+                "added_count": 1,
+                "removed_count": 1,
+                "changed_count": 1,
+                "unchanged_count": 1,
+                "added_by_stage": {"vertex": 0, "fragment": 1, "compute": 0},
+                "removed_by_stage": {"vertex": 0, "fragment": 0, "compute": 1},
+                "added_sample_hashes": ["0x00000000000000d1"],
+                "removed_sample_hashes": ["0x00000000000000c1"],
+                "changed_sample_hashes": ["0x00000000000000b1"],
+            })
+
+            # With --fail-on-regressions: exits 2, still writes sidecar, report, and full JSON summary
+            out_fail = Path(tmp) / "curr_fail.reflect.json"
+            stdout_fail = io.StringIO()
+            stderr_fail = io.StringIO()
+            with redirect_stdout(stdout_fail), redirect_stderr(stderr_fail):
+                rc_fail = sidecar.main([
+                    str(src_path),
+                    "--out", str(out_fail),
+                    "--diff-baseline", str(baseline_path),
+                    "--fail-on-regressions",
+                    "--report-missing-sources", str(report_path),
+                    "--json",
+                ])
+            self.assertEqual(rc_fail, 2)
+            self.assertTrue(out_fail.exists())
+            self.assertTrue(report_path.exists())
+            self.assertIn("regression detected", stderr_fail.getvalue())
+            self.assertEqual(json.loads(stdout_fail.getvalue()), summary_ok)
+            written = json.loads(out_fail.read_text(encoding="utf-8"))
+            self.assertEqual(set(written["stages"].keys()), {
+                "0x00000000000000a1",
+                "0x00000000000000b1",
+                "0x00000000000000d1",
+            })
+
+            # Human-readable output includes concise diff summary
+            stdout_text = io.StringIO()
+            with redirect_stdout(stdout_text):
+                rc_text = sidecar.main([
+                    str(src_path),
+                    "--out", str(out_path),
+                    "--diff-baseline", str(baseline_path),
+                ])
+            self.assertEqual(rc_text, 0)
+            self.assertIn("diff: +1/-1/~1/=1 (net +0)", stdout_text.getvalue())
+
+    def test_fail_on_regressions_exits_zero_when_no_stages_removed_and_inplace_baseline(self):
+        entry1 = vertex_entry(True)
+        entry2 = {
+            "hash_fnv1a64": "0x00000000000000b2",
+            "stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 2}}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            in1 = Path(tmp) / "in1.json"
+            in2 = Path(tmp) / "in2.json"
+            out = Path(tmp) / "pack.reflect.json"
+            in1.write_text(json.dumps(entry1), encoding="utf-8")
+            in2.write_text(json.dumps({"entries": [entry1, entry2]}), encoding="utf-8")
+
+            # Seed initial sidecar
+            self.assertEqual(sidecar.main([str(in1), "--out", str(out)]), 0)
+
+            # In-place overwrite with --diff-baseline pointing to --out itself + --fail-on-regressions
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(in2),
+                    "--out", str(out),
+                    "--diff-baseline", str(out),
+                    "--fail-on-regressions",
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["diff"]["baseline_stages"], 1)
+            self.assertEqual(summary["diff"]["current_stages"], 2)
+            self.assertEqual(summary["diff"]["net_delta"], 1)
+            self.assertEqual(summary["diff"]["added_count"], 1)
+            self.assertEqual(summary["diff"]["removed_count"], 0)
+            self.assertEqual(summary["diff"]["unchanged_count"], 1)
+
+    def test_diff_baseline_errors_and_fail_on_regressions_without_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+
+            # --fail-on-regressions without --diff-baseline fails cleanly with code 1
+            out_no_base = Path(tmp) / "no_base.reflect.json"
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc = sidecar.main([str(src), "--out", str(out_no_base), "--fail-on-regressions", "--json"])
+            self.assertEqual(rc, 1)
+            self.assertIn("--fail-on-regressions requires --diff-baseline", stderr.getvalue())
+            self.assertFalse(out_no_base.exists())
+
+            # Missing --diff-baseline file fails cleanly with code 1
+            missing = Path(tmp) / "does_not_exist.reflect.json"
+            out_missing = Path(tmp) / "out_missing.reflect.json"
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc = sidecar.main([str(src), "--out", str(out_missing), "--diff-baseline", str(missing), "--json"])
+            self.assertEqual(rc, 1)
+            self.assertIn("error: failed to load --diff-baseline", stderr.getvalue())
+            self.assertFalse(out_missing.exists())
+
+            # Invalid schema in --diff-baseline fails cleanly with code 1
+            bad_base = Path(tmp) / "bad.reflect.json"
+            out_bad = Path(tmp) / "out_bad.reflect.json"
+            bad_base.write_text(json.dumps({"schema": "wrong", "version": 1, "stages": {}}), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc = sidecar.main([str(src), "--out", str(out_bad), "--diff-baseline", str(bad_base), "--json"])
+            self.assertEqual(rc, 1)
+            self.assertIn("error: failed to load --diff-baseline", stderr.getvalue())
+            self.assertFalse(out_bad.exists())
+
+    def test_json_summary_and_diff_sanitize_hostile_keys_and_paths(self):
+        baseline_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 1,
+            "stages": {
+                r"C:\Users\secret_user\games\removed.wgsl": {
+                    "stage": "fragment",
+                    "bindings": [],
+                },
+                "/home/secret_user/changed.wgsl": {
+                    "stage": "compute",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+            },
+        }
+        current_entries = {
+            "input_path": r"C:\Users\secret_user\games\shaders.bin",
+            "entries": [
+                {
+                    "hash_fnv1a64": "/home/secret_user/changed.wgsl",
+                    "stage": "compute",
+                    "wgsl": "@compute fn cs_main() {}",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 1}}],
+                },
+                {
+                    "hash_fnv1a64": "/home/secret_user/added.wgsl",
+                    "stage": "vertex",
+                    "wgsl": "@vertex fn vs_main() {}",
+                    "bindings": [],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_path = Path(tmp) / "base.reflect.json"
+            src_path = Path(tmp) / "in.json"
+            out_path = Path(tmp) / "out.reflect.json"
+            baseline_path.write_text(json.dumps(baseline_doc), encoding="utf-8")
+            src_path.write_text(json.dumps(current_entries), encoding="utf-8")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = sidecar.main([
+                    str(src_path),
+                    "--out", str(out_path),
+                    "--diff-baseline", str(baseline_path),
+                    "--fail-on-regressions",
+                    "--json",
+                ])
+            self.assertEqual(rc, 2)
+            raw_out = stdout.getvalue()
+            raw_err = stderr.getvalue()
+
+        for forbidden in ("secret_user", "cs_main", "vs_main", "@compute", "@vertex", "/home/", "C:\\Users", str(tmp)):
+            self.assertNotIn(forbidden, raw_out)
+            self.assertNotIn(forbidden, raw_err)
+
+        summary = json.loads(raw_out)
+        self.assertEqual(summary["diff"]["added_sample_hashes"], ["<redacted>"])
+        self.assertEqual(summary["diff"]["removed_sample_hashes"], ["<redacted>"])
+        self.assertEqual(summary["diff"]["changed_sample_hashes"], ["<redacted>"])
 
 
 if __name__ == "__main__":
