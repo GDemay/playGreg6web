@@ -9,6 +9,10 @@
   /** Supported S6 layout-manifest.json schema_version (shaders/src/reflect.rs). */
   const LAYOUT_MANIFEST_SCHEMA_VERSION = 1;
 
+  /** Supported stage-reflection sidecar (`*.reflect.json`) schema & version (runtime/gpu/stage_reflection.h). */
+  const STAGE_REFLECTION_SCHEMA = 'playgta6-stage-reflection';
+  const STAGE_REFLECTION_VERSION = 1;
+
   /** WebGPU baseline maxBindGroups (groups 0..3). */
   const MAX_WEBGPU_BIND_GROUPS = 4;
 
@@ -17,6 +21,9 @@
 
   /** Maximum valid bit-shift for S34 dynamic descriptor-heap index calculations (0..31). */
   const MAX_HEAP_INDEX_SHIFT = 31;
+
+  /** Exact GFX10 S# dword count for #950 / S43 inline sampler sources. */
+  const INLINE_SAMPLER_SDWORD_COUNT = 4;
 
   /** Console ABI user-data SGPR bases & descriptor-table slot size (runtime/gpu/stage_reflection.h). */
   const GRAPHICS_USER_DATA_BASE = 8;
@@ -317,6 +324,104 @@
   function formatShaderHash(hash) {
     const value = normalizeShaderHash(hash);
     return `0x${value.toString(16).padStart(16, '0')}`;
+  }
+
+  function isHexString(str) {
+    for (let i = 0; i < str.length; i += 1) {
+      const code = str.charCodeAt(i);
+      const isDigit = code >= 48 && code <= 57;
+      const isLowerHex = code >= 97 && code <= 102;
+      const isUpperHex = code >= 65 && code <= 70;
+      if (!isDigit && !isLowerHex && !isUpperHex) {
+        return false;
+      }
+    }
+    return str.length > 0;
+  }
+
+  /**
+   * Fast O(1) lookup by normalized 64-bit hash across `'0x...'` hex strings, bare 16-hex-char
+   * keys, short/uppercase hex strings, `BigInt`, safe integers, and optional shader names.
+   * Avoids regexes and `BigInt` allocations on canonical `'0x...'` and bare 16-hex-char keys.
+   *
+   * @param {unknown} query
+   * @param {Map<string, any>} byHex
+   * @param {Map<string, any>} byBareHex
+   * @param {Map<bigint, any>} byHash
+   * @param {Map<string, any> | null} [byName]
+   * @returns {any}
+   */
+  function lookupByNormalizedHash(query, byHex, byBareHex, byHash, byName = null) {
+    if (typeof query === 'string') {
+      // Zero-allocation O(1) fast paths for already-canonical 0x+16 or bare 16-char lowercase keys.
+      if (query.length === 18 && query.charCodeAt(0) === 48) {
+        const c1 = query.charCodeAt(1);
+        if (c1 === 120 || c1 === 88) {
+          const direct = byHex.get(query);
+          if (direct !== undefined) return direct;
+          return byHex.get(query.toLowerCase());
+        }
+      }
+      if (query.length === 16) {
+        if (byName) {
+          const named = byName.get(query);
+          if (named !== undefined) return named;
+        }
+        const bareDirect = byBareHex.get(query);
+        if (bareDirect !== undefined) return bareDirect;
+        return byBareHex.get(query.toLowerCase());
+      }
+
+      const trimmed = query.trim();
+      const len = trimmed.length;
+      if (len === 0) {
+        return undefined;
+      }
+
+      if (len >= 2 && trimmed.charCodeAt(0) === 48 && (trimmed.charCodeAt(1) === 120 || trimmed.charCodeAt(1) === 88)) {
+        const bodyLen = len - 2;
+        if (bodyLen === 16) {
+          return byBareHex.get(trimmed.slice(2).toLowerCase());
+        }
+        if (bodyLen >= 1 && bodyLen < 16) {
+          const body = trimmed.slice(2);
+          if (isHexString(body)) {
+            return byBareHex.get(body.toLowerCase().padStart(16, '0'));
+          }
+        }
+        return undefined;
+      }
+
+      // Check name/entry_point first so names like "fade" are not mistaken for bare hex.
+      if (byName) {
+        const named = byName.get(trimmed);
+        if (named !== undefined) return named;
+      }
+
+      if (len === 16) {
+        return byBareHex.get(trimmed.toLowerCase());
+      }
+      if (len < 16 && isHexString(trimmed)) {
+        return byBareHex.get(trimmed.toLowerCase().padStart(16, '0'));
+      }
+      return undefined;
+    }
+
+    if (typeof query === 'bigint') {
+      if (query >= 0n && query <= U64_MAX) {
+        return byHash.get(query);
+      }
+      return undefined;
+    }
+
+    if (typeof query === 'number') {
+      if (Number.isSafeInteger(query) && query >= 0) {
+        return byHash.get(BigInt(query));
+      }
+      return undefined;
+    }
+
+    return undefined;
   }
 
   function getLayoutMemberKind(entry) {
@@ -726,11 +831,41 @@
     };
   }
 
+  function parseInlineSamplerBindingSource(rawInlineSampler, path) {
+    if (!isPlainObject(rawInlineSampler)) {
+      throw new ManifestValidationError('inline_sampler must be an object', path);
+    }
+    const rawWords = rawInlineSampler.sdwords;
+    if (!Array.isArray(rawWords) || rawWords.length !== INLINE_SAMPLER_SDWORD_COUNT) {
+      throw new ManifestValidationError(
+        `inline_sampler.sdwords must be an array of ${INLINE_SAMPLER_SDWORD_COUNT} unsigned 32-bit integers`,
+        `${path}.sdwords`
+      );
+    }
+    const sdwords = new Array(INLINE_SAMPLER_SDWORD_COUNT);
+    for (let i = 0; i < INLINE_SAMPLER_SDWORD_COUNT; i += 1) {
+      const w = rawWords[i];
+      if (!isNonNegativeInt(w)) {
+        throw new ManifestValidationError(
+          `inline_sampler.sdwords[${i}] must be an unsigned 32-bit integer (0..0xFFFFFFFF), got ${JSON.stringify(w)}`,
+          `${path}.sdwords[${i}]`
+        );
+      }
+      sdwords[i] = w;
+    }
+    return {
+      kind: 'inline_sampler',
+      sdwords,
+    };
+  }
+
   /**
    * Parse and normalize a binding `source` entry matching `WgslBindingSource` in
-   * `shaders/src/rdna2_to_wgsl.rs` and `tools/stage_reflection_sidecar.py`:
+   * `shaders/src/rdna2_to_wgsl.rs`, `runtime/gpu/stage_reflection.cpp`, and
+   * `tools/stage_reflection_sidecar.py`:
    * - `{"sampler_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
    * - `{"resource_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
+   * - `{"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}`
    * - `{"user_sgpr", "table_byte_offset"}`
    * - `{"user_sgpr", "root_constants": true}`
    * - `{"user_sgpr", "root_descriptor": true}`
@@ -752,6 +887,7 @@
 
     const hasSamplerHeap = hasOwn(rawSource, 'sampler_heap');
     const hasResourceHeap = hasOwn(rawSource, 'resource_heap');
+    const hasInlineSampler = hasOwn(rawSource, 'inline_sampler');
     const hasStaticSampler = hasOwn(rawSource, 'static_sampler');
     const hasUserSgpr = hasOwn(rawSource, 'user_sgpr');
     const hasTableByteOffset = hasOwn(rawSource, 'table_byte_offset');
@@ -768,6 +904,7 @@
     if (hasSamplerHeap || hasResourceHeap) {
       const heapKey = hasSamplerHeap ? 'sampler_heap' : 'resource_heap';
       if (
+        hasInlineSampler ||
         hasStaticSampler ||
         hasUserSgpr ||
         hasTableByteOffset ||
@@ -780,6 +917,22 @@
         );
       }
       return parseHeapBindingSource(heapKey, rawSource[heapKey], `${path}.${heapKey}`);
+    }
+
+    if (hasInlineSampler) {
+      if (
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          'inline_sampler source cannot be combined with other binding source fields',
+          path
+        );
+      }
+      return parseInlineSamplerBindingSource(rawSource.inline_sampler, `${path}.inline_sampler`);
     }
 
     if (hasStaticSampler) {
@@ -865,7 +1018,7 @@
     }
 
     throw new ManifestValidationError(
-      'unrecognized binding source (expected sampler_heap, resource_heap, static_sampler, or user_sgpr)',
+      'unrecognized binding source (expected sampler_heap, resource_heap, inline_sampler, static_sampler, or user_sgpr)',
       path
     );
   }
@@ -1090,6 +1243,40 @@
     };
   }
 
+  function resolveVertexInputMode(rawStage, stage, vertexInputs, path) {
+    let rawMode;
+    if (rawStage.vertex_input_mode !== undefined) {
+      rawMode = rawStage.vertex_input_mode;
+    } else if (rawStage.vertexInputMode !== undefined) {
+      rawMode = rawStage.vertexInputMode;
+    } else if (
+      isPlainObject(rawStage.binding_summary) &&
+      rawStage.binding_summary.vertex_input_mode !== undefined
+    ) {
+      rawMode = rawStage.binding_summary.vertex_input_mode;
+    } else if (
+      isPlainObject(rawStage.bindingSummary) &&
+      rawStage.bindingSummary.vertexInputMode !== undefined
+    ) {
+      rawMode = rawStage.bindingSummary.vertexInputMode;
+    }
+
+    if (rawMode !== undefined && rawMode !== null) {
+      if (typeof rawMode !== 'string' || rawMode.trim().length === 0) {
+        throw new ManifestValidationError(
+          `vertex_input_mode must be a non-empty string, got ${JSON.stringify(rawMode)}`,
+          `${path}.vertex_input_mode`
+        );
+      }
+      return rawMode.trim().toLowerCase();
+    }
+
+    if (stage === 'vertex') {
+      return vertexInputs.length === 0 ? 'vertex_index' : 'attributes';
+    }
+    return null;
+  }
+
   /**
    * Parse and validate an S6 reflection manifest (`layout-manifest.json` emitted by
    * `shaders/src/reflect.rs`). Normalizes all 64-bit hashes (`0x...` hex and `BigInt`)
@@ -1209,13 +1396,18 @@
 
     const shaders = new Map();
     const shadersByHash = new Map();
+    const shadersByBareHex = new Map();
     const shadersByName = new Map();
     let totalSamplerHeapBindings = 0;
     let totalResourceHeapBindings = 0;
+    let totalInlineSamplerStages = 0;
+    let totalInlineSamplerBindings = 0;
+    let totalVertexIndexStages = 0;
 
     for (const [rawHash, rawShader] of Object.entries(raw.shaders)) {
       const shPath = `shaders[${JSON.stringify(rawHash)}]`;
       const { hash, hashHex } = validateHashKey(rawHash, shPath);
+      const bareHashHex = hashHex.slice(2);
       if (shadersByHash.has(hash)) {
         throw new ManifestValidationError(`duplicate shader hash ${hashHex}`, shPath);
       }
@@ -1323,6 +1515,7 @@
       const bindings = [];
       let shaderSamplerHeapBindings = 0;
       let shaderResourceHeapBindings = 0;
+      let shaderInlineSamplerBindings = 0;
       if (rawShader.bindings !== undefined) {
         if (!Array.isArray(rawShader.bindings)) {
           throw new ManifestValidationError('bindings must be an array', `${shPath}.bindings`);
@@ -1341,6 +1534,8 @@
               shaderSamplerHeapBindings += 1;
             } else if (rec.source.kind === 'resource_heap') {
               shaderResourceHeapBindings += 1;
+            } else if (rec.source.kind === 'inline_sampler') {
+              shaderInlineSamplerBindings += 1;
             }
           }
           bindings.push(rec);
@@ -1348,6 +1543,11 @@
       }
       totalSamplerHeapBindings += shaderSamplerHeapBindings;
       totalResourceHeapBindings += shaderResourceHeapBindings;
+      totalInlineSamplerBindings += shaderInlineSamplerBindings;
+      const hasInlineSampler = shaderInlineSamplerBindings > 0;
+      if (hasInlineSampler) {
+        totalInlineSamplerStages += 1;
+      }
 
       // Parse vertex_inputs
       const vertexInputs = [];
@@ -1416,9 +1616,16 @@
         }
       }
 
+      const vertexInputMode = resolveVertexInputMode(rawShader, stage, vertexInputs, shPath);
+      const isVertexIndexStage = stage === 'vertex' && vertexInputMode === 'vertex_index';
+      if (isVertexIndexStage) {
+        totalVertexIndexStages += 1;
+      }
+
       const shaderRecord = {
         hash,
         hashHex,
+        bareHashHex,
         stage,
         visibility,
         entryPoint: rawEntryPoint,
@@ -1436,6 +1643,9 @@
         bindings,
         vertexInputs,
         vertex_inputs: vertexInputs,
+        vertexInputMode,
+        vertex_input_mode: vertexInputMode,
+        isVertexIndexStage,
         fragmentOutputs,
         fragment_outputs: fragmentOutputs,
         requiresLowering,
@@ -1444,10 +1654,13 @@
         limit_violations: limitViolations,
         samplerHeapBindings: shaderSamplerHeapBindings,
         resourceHeapBindings: shaderResourceHeapBindings,
+        inlineSamplerBindings: shaderInlineSamplerBindings,
+        hasInlineSampler,
       };
 
       shaders.set(hashHex, shaderRecord);
       shadersByHash.set(hash, shaderRecord);
+      shadersByBareHex.set(bareHashHex, shaderRecord);
 
       const indexName = (key) => {
         let list = shadersByName.get(key);
@@ -1589,11 +1802,15 @@
 
     const summary = {
       shaderCount: shaders.size,
+      stageCount: shaders.size,
       bindGroupLayoutCount: bindGroupLayouts.size,
       pipelineLayoutCount: pipelineLayouts.size,
       pipelineCount: pipelines.size,
       samplerHeapBindings: totalSamplerHeapBindings,
       resourceHeapBindings: totalResourceHeapBindings,
+      inlineSamplerStages: totalInlineSamplerStages,
+      inlineSamplerBindings: totalInlineSamplerBindings,
+      vertexIndexStages: totalVertexIndexStages,
     };
 
     return {
@@ -1607,11 +1824,597 @@
       pipelineLayoutsByBigInt,
       shaders,
       shadersByHash,
+      shadersByBareHex,
       shadersByName,
       pipelines,
+      stageCount: shaders.size,
+      samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapBindings: totalResourceHeapBindings,
+      inlineSamplerStages: totalInlineSamplerStages,
+      inlineSamplerBindings: totalInlineSamplerBindings,
+      vertexIndexStages: totalVertexIndexStages,
+      summary,
+    };
+  }
+
+  function normalizeSidecarViewDimension(rawDim, isStorage, path) {
+    if (rawDim === undefined || rawDim === null) {
+      return '2d';
+    }
+    if (typeof rawDim !== 'string') {
+      throw new ManifestValidationError(
+        `view_dimension must be a string, got ${JSON.stringify(rawDim)}`,
+        path
+      );
+    }
+    const normalized = rawDim.trim().toLowerCase().replace(/_/g, '-');
+    const validSet = isStorage ? VALID_STORAGE_TEXTURE_VIEW_DIMENSIONS : VALID_TEXTURE_VIEW_DIMENSIONS;
+    if (!validSet.has(normalized)) {
+      throw new ManifestValidationError(
+        `invalid view_dimension ${JSON.stringify(rawDim)}`,
+        path
+      );
+    }
+    return normalized;
+  }
+
+  function normalizeSidecarSampleType(rawSampleType, path) {
+    if (rawSampleType === undefined || rawSampleType === null) {
+      return 'float';
+    }
+    if (typeof rawSampleType !== 'string') {
+      throw new ManifestValidationError(
+        `sample_type must be a string, got ${JSON.stringify(rawSampleType)}`,
+        path
+      );
+    }
+    const normalized = rawSampleType.trim().toLowerCase().replace(/_/g, '-');
+    if (!VALID_TEXTURE_SAMPLE_TYPES.has(normalized)) {
+      throw new ManifestValidationError(
+        `invalid sample_type ${JSON.stringify(rawSampleType)}`,
+        path
+      );
+    }
+    return normalized;
+  }
+
+  function parseSidecarVertexInput(raw, path) {
+    if (!isPlainObject(raw)) {
+      throw new ManifestValidationError('vertex_input must be an object', path);
+    }
+    if (!isNonNegativeInt(raw.location)) {
+      throw new ManifestValidationError(
+        `invalid location ${JSON.stringify(raw.location)}`,
+        `${path}.location`
+      );
+    }
+    const rawVbSlot = raw.vb_slot !== undefined ? raw.vb_slot : raw.vbSlot;
+    if (rawVbSlot !== undefined && !isNonNegativeInt(rawVbSlot)) {
+      throw new ManifestValidationError(
+        `vb_slot must be a non-negative uint32 integer, got ${JSON.stringify(rawVbSlot)}`,
+        `${path}.vb_slot`
+      );
+    }
+    const rawByteOffset = raw.byte_offset !== undefined ? raw.byte_offset : raw.byteOffset;
+    if (rawByteOffset !== undefined && !isNonNegativeInt(rawByteOffset)) {
+      throw new ManifestValidationError(
+        `byte_offset must be a non-negative uint32 integer, got ${JSON.stringify(rawByteOffset)}`,
+        `${path}.byte_offset`
+      );
+    }
+    let components = null;
+    if (raw.components !== undefined && raw.components !== null) {
+      if (!isNonNegativeInt(raw.components)) {
+        throw new ManifestValidationError(
+          `components must be a non-negative uint32 integer, got ${JSON.stringify(raw.components)}`,
+          `${path}.components`
+        );
+      }
+      components = raw.components;
+    }
+    const rawComponentType =
+      raw.component_type !== undefined ? raw.component_type : raw.componentType;
+    if (rawComponentType !== undefined && rawComponentType !== null && typeof rawComponentType !== 'string') {
+      throw new ManifestValidationError('component_type must be a string or null', `${path}.component_type`);
+    }
+    const rawFetchFormat = raw.fetch_format !== undefined ? raw.fetch_format : raw.fetchFormat;
+    if (rawFetchFormat !== undefined && rawFetchFormat !== null && typeof rawFetchFormat !== 'string') {
+      throw new ManifestValidationError('fetch_format must be a string or null', `${path}.fetch_format`);
+    }
+    if (raw.format !== undefined && raw.format !== null && typeof raw.format !== 'string') {
+      throw new ManifestValidationError('format must be a string or null', `${path}.format`);
+    }
+    const fetchFormat = rawFetchFormat !== undefined ? rawFetchFormat : null;
+    const format = raw.format !== undefined && raw.format !== null ? raw.format : fetchFormat;
+    const componentType = rawComponentType !== undefined ? rawComponentType : null;
+    return {
+      location: raw.location,
+      vb_slot: rawVbSlot !== undefined ? rawVbSlot : null,
+      vbSlot: rawVbSlot !== undefined ? rawVbSlot : null,
+      byte_offset: rawByteOffset !== undefined ? rawByteOffset : null,
+      byteOffset: rawByteOffset !== undefined ? rawByteOffset : null,
+      components,
+      component_type: componentType,
+      componentType,
+      fetch_format: fetchFormat,
+      fetchFormat,
+      type: typeof raw.type === 'string' ? raw.type : componentType || 'unknown',
+      format,
+    };
+  }
+
+  function buildSidecarLayoutEntry(rec, visibility) {
+    if (rec.kind === 'uniform') {
+      return {
+        binding: rec.binding,
+        visibility,
+        buffer: {
+          type: 'uniform',
+          hasDynamicOffset: false,
+          minBindingSize: rec.minBindingSizeBytes || 0,
+        },
+      };
+    }
+    if (rec.kind === 'storage') {
+      return {
+        binding: rec.binding,
+        visibility,
+        buffer: {
+          type: 'storage',
+          hasDynamicOffset: false,
+          minBindingSize: rec.minBindingSizeBytes || 0,
+        },
+      };
+    }
+    if (rec.kind === 'read_only_storage') {
+      return {
+        binding: rec.binding,
+        visibility,
+        buffer: {
+          type: 'read-only-storage',
+          hasDynamicOffset: false,
+          minBindingSize: rec.minBindingSizeBytes || 0,
+        },
+      };
+    }
+    if (rec.kind === 'texture') {
+      return {
+        binding: rec.binding,
+        visibility,
+        texture: {
+          sampleType: rec.sampleType || 'float',
+          viewDimension: rec.viewDimension || '2d',
+          multisampled: Boolean(rec.multisampled),
+        },
+      };
+    }
+    if (rec.kind === 'storage_texture') {
+      if (typeof rec.storageFormat === 'string' && rec.storageFormat.length > 0) {
+        return {
+          binding: rec.binding,
+          visibility,
+          storageTexture: {
+            access: 'write-only',
+            format: rec.storageFormat,
+            viewDimension: rec.viewDimension || '2d',
+          },
+        };
+      }
+      return null;
+    }
+    if (rec.kind === 'sampler') {
+      return {
+        binding: rec.binding,
+        visibility,
+        sampler: { type: 'filtering' },
+      };
+    }
+    if (rec.kind === 'comparison_sampler') {
+      return {
+        binding: rec.binding,
+        visibility,
+        sampler: { type: 'comparison' },
+      };
+    }
+    return null;
+  }
+
+  function sidecarKindToResource(kind) {
+    if (kind === 'uniform' || kind === 'storage' || kind === 'read_only_storage') return 'buffer';
+    if (kind === 'texture') return 'texture';
+    if (kind === 'storage_texture') return 'storageTexture';
+    if (kind === 'sampler' || kind === 'comparison_sampler') return 'sampler';
+    return 'buffer';
+  }
+
+  /**
+   * Parse and validate a `playgta6-stage-reflection` v1 sidecar JSON document
+   * (e.g., `splash.wgsl.pack.reflect.json` emitted by `tools/stage_reflection_sidecar.py`
+   * and consumed by `runtime/gpu/stage_reflection.cpp`).
+   *
+   * Validates all binding sources including `#950` / `S43` `inline_sampler: { sdwords: [d0, d1, d2, d3] }`,
+   * builds O(1) normalized-hash lookup maps (`'0x...'`, bare 16-hex-char, and `BigInt`),
+   * and exposes lightweight telemetry (`stageCount`, `inlineSamplerStages`, `inlineSamplerBindings`,
+   * `vertexIndexStages`, `lookupHits`, `lookupMisses`).
+   *
+   * @param {string | object} jsonOrObject
+   * @returns {object}
+   */
+  function parseStageReflectionSidecar(jsonOrObject) {
+    let raw;
+    if (typeof jsonOrObject === 'string') {
+      try {
+        raw = JSON.parse(jsonOrObject);
+      } catch (err) {
+        throw new ManifestValidationError(
+          `malformed JSON: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    } else {
+      raw = jsonOrObject;
+    }
+
+    if (!isPlainObject(raw)) {
+      throw new ManifestValidationError('stage reflection sidecar root must be a JSON object');
+    }
+    if (raw.schema !== STAGE_REFLECTION_SCHEMA) {
+      throw new ManifestValidationError(
+        `unsupported stage reflection schema ${JSON.stringify(raw.schema)} (expected ${JSON.stringify(STAGE_REFLECTION_SCHEMA)})`,
+        'schema'
+      );
+    }
+    if (raw.version !== STAGE_REFLECTION_VERSION) {
+      throw new ManifestValidationError(
+        `unsupported stage reflection version ${JSON.stringify(raw.version)} (expected ${STAGE_REFLECTION_VERSION})`,
+        'version'
+      );
+    }
+    if (!isPlainObject(raw.stages)) {
+      throw new ManifestValidationError('stages must be an object', 'stages');
+    }
+
+    const stages = new Map();
+    const stagesByHash = new Map();
+    const stagesByBareHex = new Map();
+    let totalSamplerHeapBindings = 0;
+    let totalResourceHeapBindings = 0;
+    let totalInlineSamplerStages = 0;
+    let totalInlineSamplerBindings = 0;
+    let totalVertexIndexStages = 0;
+
+    for (const [rawHash, rawStage] of Object.entries(raw.stages)) {
+      const stPath = `stages[${JSON.stringify(rawHash)}]`;
+      const { hash, hashHex } = validateHashKey(rawHash, stPath);
+      const bareHashHex = hashHex.slice(2);
+      if (stagesByHash.has(hash)) {
+        throw new ManifestValidationError(`duplicate stage hash ${hashHex}`, stPath);
+      }
+      if (!isPlainObject(rawStage)) {
+        throw new ManifestValidationError('stage record must be an object', stPath);
+      }
+
+      const stage = normalizeDiagnosticStage(rawStage.stage);
+      if (!stage) {
+        throw new ManifestValidationError(
+          `unsupported shader stage ${JSON.stringify(rawStage.stage)} (expected "vertex", "fragment", "pixel", or "compute")`,
+          `${stPath}.stage`
+        );
+      }
+      const visibility = STAGE_TO_VISIBILITY[stage];
+
+      if (!Array.isArray(rawStage.bindings)) {
+        throw new ManifestValidationError('bindings must be an array', `${stPath}.bindings`);
+      }
+
+      const bindings = [];
+      const seenSlots = new Set();
+      const groupEntriesMap = new Map();
+      let maxGroupSeen = -1;
+      let stageSamplerHeapBindings = 0;
+      let stageResourceHeapBindings = 0;
+      let stageInlineSamplerBindings = 0;
+      let layoutComplete = true;
+
+      for (let i = 0; i < rawStage.bindings.length; i += 1) {
+        const b = rawStage.bindings[i];
+        const bPath = `${stPath}.bindings[${i}]`;
+        if (!isPlainObject(b)) {
+          throw new ManifestValidationError('binding record must be an object', bPath);
+        }
+        if (!isNonNegativeInt(b.group)) {
+          throw new ManifestValidationError(`invalid group ${JSON.stringify(b.group)}`, `${bPath}.group`);
+        }
+        if (!isNonNegativeInt(b.binding)) {
+          throw new ManifestValidationError(`invalid binding ${JSON.stringify(b.binding)}`, `${bPath}.binding`);
+        }
+        const slotKey = `${b.group}:${b.binding}`;
+        if (seenSlots.has(slotKey)) {
+          throw new ManifestValidationError(
+            `duplicate binding at @group(${b.group}) @binding(${b.binding})`,
+            bPath
+          );
+        }
+        seenSlots.add(slotKey);
+        if (b.name !== undefined && b.name !== null && typeof b.name !== 'string') {
+          throw new ManifestValidationError('name must be a string or null', `${bPath}.name`);
+        }
+        if (typeof b.kind !== 'string') {
+          throw new ManifestValidationError(
+            `kind must be a string, got ${JSON.stringify(b.kind)}`,
+            `${bPath}.kind`
+          );
+        }
+        const kind = STAGE_REFLECTION_KIND_MAP[b.kind.trim().toLowerCase()];
+        if (!kind) {
+          throw new ManifestValidationError(
+            `unknown binding kind ${JSON.stringify(b.kind)}`,
+            `${bPath}.kind`
+          );
+        }
+        if (b.source === undefined || b.source === null) {
+          throw new ManifestValidationError('binding source is required in stage reflection sidecar', `${bPath}.source`);
+        }
+        const source = parseBindingSource(b.source, `${bPath}.source`);
+
+        let minBindingSizeBytes = null;
+        const rawMinSize =
+          b.min_binding_size_bytes !== undefined
+            ? b.min_binding_size_bytes
+            : b.minBindingSizeBytes;
+        if (rawMinSize !== undefined && rawMinSize !== null) {
+          if (!isNonNegativeInt(rawMinSize)) {
+            throw new ManifestValidationError(
+              `min_binding_size_bytes must be a non-negative uint32 safe integer, got ${JSON.stringify(rawMinSize)}`,
+              `${bPath}.min_binding_size_bytes`
+            );
+          }
+          minBindingSizeBytes = rawMinSize;
+        }
+
+        let storageFormat = null;
+        const rawStorageFormat =
+          b.storage_format !== undefined ? b.storage_format : b.storageFormat;
+        if (rawStorageFormat !== undefined && rawStorageFormat !== null) {
+          if (
+            (typeof rawStorageFormat !== 'string' || rawStorageFormat.length === 0) &&
+            !isNonNegativeInt(rawStorageFormat)
+          ) {
+            throw new ManifestValidationError(
+              `storage_format must be a non-empty string or non-negative integer, got ${JSON.stringify(rawStorageFormat)}`,
+              `${bPath}.storage_format`
+            );
+          }
+          storageFormat = rawStorageFormat;
+        }
+
+        const rawViewDim = b.view_dimension !== undefined ? b.view_dimension : b.viewDimension;
+        const viewDimension =
+          kind === 'texture' || kind === 'storage_texture'
+            ? normalizeSidecarViewDimension(rawViewDim, kind === 'storage_texture', `${bPath}.view_dimension`)
+            : null;
+        const rawSampleType = b.sample_type !== undefined ? b.sample_type : b.sampleType;
+        const sampleType =
+          kind === 'texture'
+            ? normalizeSidecarSampleType(rawSampleType, `${bPath}.sample_type`)
+            : null;
+        if (b.multisampled !== undefined && typeof b.multisampled !== 'boolean') {
+          throw new ManifestValidationError('multisampled must be a boolean', `${bPath}.multisampled`);
+        }
+        const multisampled = Boolean(b.multisampled);
+        if (kind === 'texture' && multisampled && viewDimension !== '2d') {
+          throw new ManifestValidationError(
+            `multisampled texture must have view_dimension "2d", got ${JSON.stringify(viewDimension)}`,
+            `${bPath}.view_dimension`
+          );
+        }
+
+        if (source.kind === 'sampler_heap') {
+          stageSamplerHeapBindings += 1;
+        } else if (source.kind === 'resource_heap') {
+          stageResourceHeapBindings += 1;
+        } else if (source.kind === 'inline_sampler') {
+          stageInlineSamplerBindings += 1;
+        }
+
+        const rec = {
+          group: b.group,
+          binding: b.binding,
+          name: b.name !== undefined ? b.name : null,
+          kind,
+          resource: sidecarKindToResource(kind),
+          in_layout: true,
+          inLayout: true,
+          register: null,
+          spirv: null,
+          root_constants: source.kind === 'root_constants',
+          rootConstants: source.kind === 'root_constants',
+          binding_array: null,
+          bindingArray: null,
+          source,
+          view_dimension: viewDimension,
+          viewDimension,
+          sample_type: sampleType,
+          sampleType,
+          multisampled,
+          min_binding_size_bytes: minBindingSizeBytes,
+          minBindingSizeBytes,
+          storage_format: storageFormat,
+          storageFormat,
+          layoutEntry: null,
+        };
+
+        const layoutEntry = buildSidecarLayoutEntry(rec, visibility);
+        rec.layoutEntry = layoutEntry;
+        if (layoutEntry) {
+          if (rec.group > maxGroupSeen) {
+            maxGroupSeen = rec.group;
+          }
+          let gEntries = groupEntriesMap.get(rec.group);
+          if (!gEntries) {
+            gEntries = [];
+            groupEntriesMap.set(rec.group, gEntries);
+          }
+          gEntries.push(cloneLayoutEntry(layoutEntry));
+        } else {
+          layoutComplete = false;
+        }
+
+        bindings.push(rec);
+      }
+
+      const resolvedGroupLayouts = [];
+      const bindGroupLayoutIds = [];
+      if (maxGroupSeen >= 0) {
+        if (maxGroupSeen >= MAX_REFLECTED_GROUPS) {
+          throw new ManifestValidationError(
+            `bind group index ${maxGroupSeen} exceeds reflection limit ${MAX_REFLECTED_GROUPS}`,
+            `${stPath}.bindings`
+          );
+        }
+        for (let g = 0; g <= maxGroupSeen; g += 1) {
+          const entries = (groupEntriesMap.get(g) || []).sort((a, b) => a.binding - b.binding);
+          const idHex = computeBindGroupLayoutHash({ entries });
+          const id = normalizeShaderHash(idHex);
+          bindGroupLayoutIds.push(idHex);
+          resolvedGroupLayouts.push({ group: g, id, idHex, entries });
+        }
+      }
+
+      const vertexInputs = [];
+      const rawVertexInputs =
+        rawStage.vertex_inputs !== undefined ? rawStage.vertex_inputs : rawStage.vertexInputs;
+      if (rawVertexInputs !== undefined && rawVertexInputs !== null) {
+        if (!Array.isArray(rawVertexInputs)) {
+          throw new ManifestValidationError('vertex_inputs must be an array', `${stPath}.vertex_inputs`);
+        }
+        for (let i = 0; i < rawVertexInputs.length; i += 1) {
+          vertexInputs.push(
+            parseSidecarVertexInput(rawVertexInputs[i], `${stPath}.vertex_inputs[${i}]`)
+          );
+        }
+        vertexInputs.sort((a, b) => a.location - b.location);
+      }
+
+      const vertexInputMode = resolveVertexInputMode(rawStage, stage, vertexInputs, stPath);
+      const isVertexIndexStage = stage === 'vertex' && vertexInputMode === 'vertex_index';
+      const hasInlineSampler = stageInlineSamplerBindings > 0;
+
+      totalSamplerHeapBindings += stageSamplerHeapBindings;
+      totalResourceHeapBindings += stageResourceHeapBindings;
+      totalInlineSamplerBindings += stageInlineSamplerBindings;
+      if (hasInlineSampler) {
+        totalInlineSamplerStages += 1;
+      }
+      if (isVertexIndexStage) {
+        totalVertexIndexStages += 1;
+      }
+
+      const entryPoint =
+        typeof rawStage.entry_point === 'string' && rawStage.entry_point.length > 0
+          ? rawStage.entry_point
+          : typeof rawStage.entryPoint === 'string' && rawStage.entryPoint.length > 0
+            ? rawStage.entryPoint
+            : stage === 'vertex'
+              ? 'vs_main'
+              : stage === 'fragment'
+                ? 'fs_main'
+                : 'cs_main';
+
+      const stageRecord = {
+        hash,
+        hashHex,
+        bareHashHex,
+        stage,
+        visibility,
+        entryPoint,
+        entry_point: entryPoint,
+        name: typeof rawStage.name === 'string' && rawStage.name.length > 0 ? rawStage.name : null,
+        pipelineLayoutId:
+          bindGroupLayoutIds.length > 0 ? computePipelineLayoutHash(bindGroupLayoutIds) : null,
+        pipeline_layout:
+          bindGroupLayoutIds.length > 0 ? computePipelineLayoutHash(bindGroupLayoutIds) : null,
+        bindGroupLayoutIds,
+        bind_group_layouts: bindGroupLayoutIds.slice(),
+        bindGroupLayouts: resolvedGroupLayouts,
+        layoutComplete,
+        layout_complete: layoutComplete,
+        workgroupSize: null,
+        workgroup_size: null,
+        bindings,
+        vertexInputs,
+        vertex_inputs: vertexInputs,
+        vertexInputMode,
+        vertex_input_mode: vertexInputMode,
+        isVertexIndexStage,
+        fragmentOutputs: [],
+        fragment_outputs: [],
+        requiresLowering: [],
+        requires_lowering: [],
+        limitViolations: [],
+        limit_violations: [],
+        samplerHeapBindings: stageSamplerHeapBindings,
+        resourceHeapBindings: stageResourceHeapBindings,
+        inlineSamplerBindings: stageInlineSamplerBindings,
+        hasInlineSampler,
+      };
+
+      stages.set(hashHex, stageRecord);
+      stagesByHash.set(hash, stageRecord);
+      stagesByBareHex.set(bareHashHex, stageRecord);
+    }
+
+    const lookupStats = {
+      lookupHits: 0,
+      lookupMisses: 0,
+    };
+
+    const summary = {
+      stageCount: stages.size,
+      inlineSamplerStages: totalInlineSamplerStages,
+      inlineSamplerBindings: totalInlineSamplerBindings,
+      vertexIndexStages: totalVertexIndexStages,
+      samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapBindings: totalResourceHeapBindings,
+    };
+
+    return {
+      schema: STAGE_REFLECTION_SCHEMA,
+      version: STAGE_REFLECTION_VERSION,
+      stages,
+      stagesByHash,
+      stagesByHex: stages,
+      stagesByBareHex,
+      stageCount: stages.size,
+      inlineSamplerStages: totalInlineSamplerStages,
+      inlineSamplerBindings: totalInlineSamplerBindings,
+      vertexIndexStages: totalVertexIndexStages,
       samplerHeapBindings: totalSamplerHeapBindings,
       resourceHeapBindings: totalResourceHeapBindings,
       summary,
+      getStage(hashKey) {
+        const found = lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null);
+        if (found !== undefined) {
+          lookupStats.lookupHits += 1;
+        } else {
+          lookupStats.lookupMisses += 1;
+        }
+        return found;
+      },
+      hasStage(hashKey) {
+        return lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null) !== undefined;
+      },
+      getStats() {
+        return {
+          stageCount: stages.size,
+          inlineSamplerStages: totalInlineSamplerStages,
+          inlineSamplerBindings: totalInlineSamplerBindings,
+          vertexIndexStages: totalVertexIndexStages,
+          samplerHeapBindings: totalSamplerHeapBindings,
+          resourceHeapBindings: totalResourceHeapBindings,
+          lookupHits: lookupStats.lookupHits,
+          lookupMisses: lookupStats.lookupMisses,
+        };
+      },
     };
   }
 
@@ -2550,6 +3353,12 @@
         return isNonNegativeInt(rawSource.userSgpr);
       case 'static_sampler':
         return isNonNegativeInt(rawSource.index);
+      case 'inline_sampler':
+        return (
+          Array.isArray(rawSource.sdwords) &&
+          rawSource.sdwords.length === INLINE_SAMPLER_SDWORD_COUNT &&
+          rawSource.sdwords.every(isNonNegativeInt)
+        );
       case 'sampler_heap':
       case 'resource_heap':
         return (
@@ -2650,6 +3459,12 @@
         return `${base} <- root descriptor at s${source.userSgpr}`;
       case 'static_sampler':
         return `${base} <- static sampler ${source.index}`;
+      case 'inline_sampler': {
+        const hexWords = source.sdwords
+          .map((w) => (w >>> 0).toString(16).padStart(8, '0'))
+          .join(' ');
+        return `${base} <- inline sampler ${hexWords}`;
+      }
       case 'sampler_heap':
         return `${base} <- sampler heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
       case 'resource_heap':
@@ -3032,7 +3847,7 @@
           binding,
           kind || 'unknown',
           DIAGNOSTIC_CODES.MISSING_SOURCE,
-          'binding source (table, root_constants, root_descriptor, static_sampler, sampler_heap, or resource_heap)',
+          'binding source (table, root_constants, root_descriptor, static_sampler, inline_sampler, sampler_heap, or resource_heap)',
           null,
           `@group(${group}) @binding(${binding}): missing binding source`,
           name,
@@ -3182,6 +3997,7 @@
       let resolvedSpace = 0;
       let resolvedRootConstants = false;
       let resolvedHeap = null;
+      let resolvedInlineSampler = false;
       let synthesizedFallback = null;
       let joinFailed = false;
 
@@ -3241,6 +4057,25 @@
             stride: source.stride,
             shift: source.indexShift,
           };
+        }
+      } else if (source.kind === 'inline_sampler') {
+        const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+        if (!samplerKind) {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+            ACCEPTED_DESCRIPTOR_CLASSES[kind].map(formatDescriptorClass),
+            formatDescriptorClass('sampler'),
+            `${key}: a ${kind} binding cannot take an inline sampler`,
+            name,
+            source
+          );
+        } else {
+          resolvedClass = 'sampler';
+          resolvedInlineSampler = true;
         }
       } else if (source.kind === 'static_sampler') {
         const idx = source.index;
@@ -3518,6 +4353,8 @@
           registerSpace: resolvedSpace,
           rootConstants: resolvedRootConstants,
           heap: resolvedHeap,
+          inlineSampler: resolvedInlineSampler,
+          inlineSamplerSdwords: resolvedInlineSampler ? source.sdwords.slice() : null,
           minBindingSizeBytes: minBindingSizeBytes !== null ? minBindingSizeBytes : 0,
           synthesizedStaticSampler: Boolean(synthesizedFallback),
           fallbackDescriptor: synthesizedFallback ? synthesizedFallback.fallbackDescriptor : null,
@@ -3576,6 +4413,7 @@
 
       this._shadersByHash = new Map();
       this._shadersByHex = new Map();
+      this._shadersByBareHex = new Map();
       this._shadersByName = new Map();
       this._bindGroupLayouts = new Map();
       this._pipelineLayouts = new Map();
@@ -3583,9 +4421,13 @@
       this._registerConvention = { source: 'dxc-spirv', shifts: { b: 0, t: 0, u: 0, s: 0 } };
       this._samplerHeapBindings = 0;
       this._resourceHeapBindings = 0;
+      this._inlineSamplerStages = 0;
+      this._inlineSamplerBindings = 0;
+      this._vertexIndexStages = 0;
 
       this._stats = {
         manifestsLoaded: 0,
+        sidecarsLoaded: 0,
         layoutsBuilt: 0,
         pipelineLayoutsBuilt: 0,
         vertexLayoutsBuilt: 0,
@@ -3595,15 +4437,74 @@
       };
     }
 
+    _registerShaderRecord(shader, indexEntryNames = true) {
+      const previous = this._shadersByHash.get(shader.hash);
+      if (previous) {
+        this._samplerHeapBindings -= previous.samplerHeapBindings || 0;
+        this._resourceHeapBindings -= previous.resourceHeapBindings || 0;
+        this._inlineSamplerBindings -= previous.inlineSamplerBindings || 0;
+        if (previous.hasInlineSampler) {
+          this._inlineSamplerStages -= 1;
+        }
+        if (previous.isVertexIndexStage) {
+          this._vertexIndexStages -= 1;
+        }
+      }
+
+      this._samplerHeapBindings += shader.samplerHeapBindings || 0;
+      this._resourceHeapBindings += shader.resourceHeapBindings || 0;
+      this._inlineSamplerBindings += shader.inlineSamplerBindings || 0;
+      if (shader.hasInlineSampler) {
+        this._inlineSamplerStages += 1;
+      }
+      if (shader.isVertexIndexStage) {
+        this._vertexIndexStages += 1;
+      }
+
+      const bareHex = shader.bareHashHex || shader.hashHex.slice(2);
+      this._shadersByHash.set(shader.hash, shader);
+      this._shadersByHex.set(shader.hashHex, shader);
+      this._shadersByBareHex.set(bareHex, shader);
+
+      if (indexEntryNames) {
+        this._indexShaderName(shader.entryPoint, shader);
+        this._indexShaderName(`${shader.stage}:${shader.entryPoint}`, shader);
+        if (shader.name && shader.name !== shader.entryPoint) {
+          this._indexShaderName(shader.name, shader);
+        }
+      } else if (shader.name) {
+        this._indexShaderName(shader.name, shader);
+      }
+    }
+
     /**
-     * Parse and register an S6 reflection manifest (JSON string or parsed object).
-     * Multiple manifests may be loaded; later manifests overwrite entries with the same hash.
+     * Parse and register an S6 reflection manifest (`layout-manifest.json`) or a
+     * `playgta6-stage-reflection` v1 sidecar (`*.reflect.json`).
+     * Multiple manifests/sidecars may be loaded; later entries overwrite matching hashes.
      *
      * @param {string | object} jsonOrObject
-     * @returns {object} Parsed manifest
+     * @returns {object} Parsed manifest or stage-reflection sidecar
      */
     loadManifest(jsonOrObject) {
-      const parsed = parseReflectionManifest(jsonOrObject);
+      let input = jsonOrObject;
+      if (typeof jsonOrObject === 'string') {
+        try {
+          input = JSON.parse(jsonOrObject);
+        } catch (err) {
+          throw new ManifestValidationError(
+            `malformed JSON: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+      if (
+        isPlainObject(input) &&
+        input.schema === STAGE_REFLECTION_SCHEMA &&
+        input.schema_version === undefined
+      ) {
+        return this.loadStageReflection(input);
+      }
+
+      const parsed = parseReflectionManifest(input);
       this._registerConvention = parsed.registerConvention;
 
       for (const [idHex, bgl] of parsed.bindGroupLayouts.entries()) {
@@ -3612,21 +4513,8 @@
       for (const [idHex, pl] of parsed.pipelineLayouts.entries()) {
         this._pipelineLayouts.set(idHex, pl);
       }
-      for (const [hashHex, shader] of parsed.shaders.entries()) {
-        const previous = this._shadersByHash.get(shader.hash);
-        if (previous) {
-          this._samplerHeapBindings -= previous.samplerHeapBindings || 0;
-          this._resourceHeapBindings -= previous.resourceHeapBindings || 0;
-        }
-        this._samplerHeapBindings += shader.samplerHeapBindings || 0;
-        this._resourceHeapBindings += shader.resourceHeapBindings || 0;
-        this._shadersByHash.set(shader.hash, shader);
-        this._shadersByHex.set(hashHex, shader);
-        this._indexShaderName(shader.entryPoint, shader);
-        this._indexShaderName(`${shader.stage}:${shader.entryPoint}`, shader);
-        if (shader.name && shader.name !== shader.entryPoint) {
-          this._indexShaderName(shader.name, shader);
-        }
+      for (const shader of parsed.shaders.values()) {
+        this._registerShaderRecord(shader, true);
       }
       for (const [key, pipeline] of parsed.pipelines.entries()) {
         this._pipelines.set(key, pipeline);
@@ -3636,17 +4524,33 @@
       return parsed;
     }
 
+    /**
+     * Parse and register a `playgta6-stage-reflection` v1 sidecar (`*.reflect.json`).
+     *
+     * @param {string | object} jsonOrObject
+     * @returns {object} Parsed stage reflection sidecar
+     */
+    loadStageReflection(jsonOrObject) {
+      const parsed = parseStageReflectionSidecar(jsonOrObject);
+      for (const stage of parsed.stages.values()) {
+        this._registerShaderRecord(stage, false);
+      }
+      this._stats.manifestsLoaded += 1;
+      this._stats.sidecarsLoaded += 1;
+      return parsed;
+    }
+
     _indexShaderName(name, shader) {
       this._shadersByName.set(name, shader);
     }
 
     /**
-     * Fetch an S6 `layout-manifest.json` from a URL and register it.
+     * Fetch an S6 `layout-manifest.json` or `*.reflect.json` sidecar from a URL and register it.
      *
      * @param {string} url
      * @param {typeof fetch} [fetchImpl]
      * @param {RequestInit} [fetchInit]
-     * @returns {Promise<object>} Parsed manifest
+     * @returns {Promise<object>} Parsed manifest or sidecar
      */
     async loadManifestUrl(url, fetchImpl, fetchInit) {
       if (typeof url !== 'string' || url.length === 0) {
@@ -3674,47 +4578,57 @@
     }
 
     /**
-     * Look up a registered shader reflection by `BigInt` hash, safe integer, `0x...` hex string,
-     * bare hex string, or shader `name` / `entry_point` / `"<stage>:<entry_point>"`.
+     * Fetch a `playgta6-stage-reflection` v1 sidecar (`*.reflect.json`) from a URL and register it.
+     *
+     * @param {string} url
+     * @param {typeof fetch} [fetchImpl]
+     * @param {RequestInit} [fetchInit]
+     * @returns {Promise<object>} Parsed stage reflection sidecar
+     */
+    async loadStageReflectionUrl(url, fetchImpl, fetchInit) {
+      if (typeof url !== 'string' || url.length === 0) {
+        throw new TypeError('url must be a non-empty string');
+      }
+      const fetcher = fetchImpl || this._fetch || globalThis.fetch;
+      if (typeof fetcher !== 'function') {
+        throw new ReflectionError(
+          'No fetch implementation available for loadStageReflectionUrl',
+          'NO_FETCH'
+        );
+      }
+
+      const response = await fetcher(url, fetchInit);
+      if (!response || !response.ok) {
+        const status = response ? response.status : 'unknown';
+        const statusText = response && response.statusText ? ` ${response.statusText}` : '';
+        throw new ReflectionError(
+          `Failed to fetch stage reflection sidecar from "${url}": HTTP ${status}${statusText}`,
+          'FETCH_FAILED',
+          { url, status }
+        );
+      }
+
+      const payload =
+        typeof response.text === 'function' ? await response.text() : await response.json();
+      return this.loadStageReflection(payload);
+    }
+
+    /**
+     * Fast O(1) lookup of a registered shader/stage reflection by `BigInt` hash, safe integer,
+     * `'0x...'` hex string, bare 16-hex-char string, short hex string, or shader `name` /
+     * `entry_point` / `"<stage>:<entry_point>"`.
      *
      * @param {bigint | string | number} hashOrName
      * @returns {object | undefined}
      */
     getShaderReflection(hashOrName) {
-      let found;
-
-      if (typeof hashOrName === 'bigint' || typeof hashOrName === 'number') {
-        try {
-          found = this._shadersByHash.get(normalizeShaderHash(hashOrName));
-        } catch (_err) {
-          found = undefined;
-        }
-      } else if (typeof hashOrName === 'string') {
-        const trimmed = hashOrName.trim();
-        if (trimmed.length > 0) {
-          if (trimmed.startsWith('0x') || trimmed.startsWith('0X')) {
-            const lower = trimmed.toLowerCase();
-            found = this._shadersByHex.get(lower);
-            if (!found) {
-              try {
-                found = this._shadersByHash.get(normalizeShaderHash(trimmed));
-              } catch (_err) {
-                found = undefined;
-              }
-            }
-          } else {
-            // Check name/entry_point first so names like "fade" are not mistaken for bare hex.
-            found = this._shadersByName.get(trimmed);
-            if (!found && /^[0-9a-fA-F]{1,16}$/.test(trimmed)) {
-              try {
-                found = this._shadersByHash.get(normalizeShaderHash(trimmed));
-              } catch (_err) {
-                found = undefined;
-              }
-            }
-          }
-        }
-      }
+      const found = lookupByNormalizedHash(
+        hashOrName,
+        this._shadersByHex,
+        this._shadersByBareHex,
+        this._shadersByHash,
+        this._shadersByName
+      );
 
       if (found !== undefined) {
         this._stats.lookupHits += 1;
@@ -3722,6 +4636,17 @@
         this._stats.lookupMisses += 1;
       }
       return found;
+    }
+
+    /**
+     * Fast O(1) lookup of a registered stage reflection by normalized hash or name.
+     * Alias for `getShaderReflection(hashOrName)`.
+     *
+     * @param {bigint | string | number} hashOrName
+     * @returns {object | undefined}
+     */
+    getStageReflection(hashOrName) {
+      return this.getShaderReflection(hashOrName);
     }
 
     /**
@@ -3938,15 +4863,20 @@
     clear(options = {}) {
       this._shadersByHash.clear();
       this._shadersByHex.clear();
+      this._shadersByBareHex.clear();
       this._shadersByName.clear();
       this._bindGroupLayouts.clear();
       this._pipelineLayouts.clear();
       this._pipelines.clear();
       this._samplerHeapBindings = 0;
       this._resourceHeapBindings = 0;
+      this._inlineSamplerStages = 0;
+      this._inlineSamplerBindings = 0;
+      this._vertexIndexStages = 0;
 
       if (options && options.resetStats) {
         this._stats.manifestsLoaded = 0;
+        this._stats.sidecarsLoaded = 0;
         this._stats.layoutsBuilt = 0;
         this._stats.pipelineLayoutsBuilt = 0;
         this._stats.vertexLayoutsBuilt = 0;
@@ -3962,7 +4892,9 @@
     getStats() {
       return {
         manifestsLoaded: this._stats.manifestsLoaded,
+        sidecarsLoaded: this._stats.sidecarsLoaded,
         shaderCount: this._shadersByHash.size,
+        stageCount: this._shadersByHash.size,
         bindGroupLayoutCount: this._bindGroupLayouts.size,
         pipelineLayoutCount: this._pipelineLayouts.size,
         pipelineCount: this._pipelines.size,
@@ -3974,14 +4906,20 @@
         bindingConflicts: this._stats.bindingConflicts,
         samplerHeapBindings: this._samplerHeapBindings,
         resourceHeapBindings: this._resourceHeapBindings,
+        inlineSamplerStages: this._inlineSamplerStages,
+        inlineSamplerBindings: this._inlineSamplerBindings,
+        vertexIndexStages: this._vertexIndexStages,
       };
     }
   }
 
   const exportedApi = {
     LAYOUT_MANIFEST_SCHEMA_VERSION,
+    STAGE_REFLECTION_SCHEMA,
+    STAGE_REFLECTION_VERSION,
     MAX_WEBGPU_BIND_GROUPS,
     MAX_HEAP_INDEX_SHIFT,
+    INLINE_SAMPLER_SDWORD_COUNT,
     GRAPHICS_USER_DATA_BASE,
     COMPUTE_USER_DATA_BASE,
     TABLE_SLOT_BYTES,
@@ -4002,6 +4940,7 @@
     computePipelineLayoutHash,
     parseBindingSource,
     parseReflectionManifest,
+    parseStageReflectionSidecar,
     buildBindGroupLayoutDescriptors,
     buildVertexBufferLayouts,
     diagnoseStageBindings,
