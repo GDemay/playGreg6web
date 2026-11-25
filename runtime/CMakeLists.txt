@@ -78,10 +78,41 @@ add_library(playgta6_core STATIC
     os/acp_hal_guest.cpp
     os/mmdevice_guest.cpp
     os/audio_downmix.cpp
+    os/xapu_opus.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# XApu decode commands carry Opus packets (os/xapu_opus.h). libopus (BSD-3-Clause, Xiph.Org
+# Foundation) is fetched at configure time from the release tarball, pinned by hash; with the
+# option off the XApu model posts silence instead.
+option(PLAYGTA6_OPUS "Decode XApu Opus packets with libopus (fetched at configure time)" ON)
+if(PLAYGTA6_OPUS)
+    include(FetchContent)
+    set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+    if(EMSCRIPTEN)
+        set(OPUS_DISABLE_INTRINSICS ON CACHE BOOL "" FORCE)
+        set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "" FORCE)
+        set(OPUS_FORTIFY_SOURCE OFF CACHE BOOL "" FORCE)
+    endif()
+    FetchContent_Declare(opus
+        URL https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz
+            https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
+        URL_HASH SHA256=65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(opus)
+    if(EMSCRIPTEN)
+        target_compile_options(opus PRIVATE -pthread -sMEMORY64=1)
+    endif()
+    target_link_libraries(playgta6_core PRIVATE opus)
+    target_compile_definitions(playgta6_core PUBLIC PLAYGTA6_HAVE_OPUS=1)
+endif()
 
 # Local-only wasm64 test build (tools/run_wasm_tests.py): keeps the CTest executables below enabled
 # under Emscripten instead of building the browser `runtime` target. Off by default.
@@ -306,6 +337,9 @@ else()
 
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
+    if(PLAYGTA6_OPUS)
+        target_link_libraries(test_xbox_scarlett_guest PRIVATE opus)  # encodes the test packets
+    endif()
     add_test(NAME playgta6_xbox_scarlett_guest_tests COMMAND test_xbox_scarlett_guest)
 
     add_executable(test_frame_capture ../tests/test_frame_capture.cpp)
