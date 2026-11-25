@@ -5,9 +5,9 @@
         [--smoke] [--boot-dir DIR] [--game-dir DIR] [--shader-pack FILE] [--out-dir DIR]
         [--runs-dir DIR] [--port PORT] [--duration-s N] [--headless | --headed]
         [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run]
-        [--capture-frames] [--mp4] [--baseline NAME|DIR]
+        [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--baseline NAME|DIR]
         [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
-        [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS]
+        [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
 
 What it does, in order:
 
@@ -57,6 +57,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import io
 import json
 import math
 import os
@@ -103,6 +104,8 @@ INPUT_START_S = 5.0
 INPUT_PERIOD_S = 1.0
 INPUT_HOLD_S = 0.1
 DEFAULT_FRAME_INTERVAL_S = 1.0
+DEFAULT_CAPTURE_INTERVAL_SEC = 2.0
+CANVAS_MIN_X = 410
 DEFAULT_POLL_INTERVAL_S = 0.5
 SERVER_READY_TIMEOUT_S = 15.0
 CDP_READY_TIMEOUT_S = 15.0
@@ -111,10 +114,14 @@ COPY_CHUNK_BYTES = 256 * 1024
 
 ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "start-screen": "start-screen",
+    "menu-flow": "menu-flow",
+    "calibration-skip": "calibration-skip",
+    "intro-watch": "intro-watch",
 }
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 BOOT_OPTIONS_NAME = "boot-options.json"
+DEFAULT_DUMP_PIPELINES_DIR = "/pg6_dump"
 BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
     {
         "max_wall_ms",
@@ -129,7 +136,14 @@ BOOT_OPTIONS_BOOL_KEYS: frozenset[str] = frozenset(
         "verify_window_marks",
     }
 )
-BOOT_OPTIONS_ALLOWED_KEYS: frozenset[str] = BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS
+BOOT_OPTIONS_STR_KEYS: frozenset[str] = frozenset(
+    {
+        "dump_pipelines_dir",
+    }
+)
+BOOT_OPTIONS_ALLOWED_KEYS: frozenset[str] = (
+    BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS | BOOT_OPTIONS_STR_KEYS
+)
 _UINT64_MAX = (1 << 64) - 1
 
 _UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
@@ -778,23 +792,79 @@ def build_target_url(
     return f"{base}?{urlencode(params)}"
 
 
-def validate_boot_dir_safety(boot_dir: Path, repo_root: Path) -> None:
-    """Refuse writing `boot-options.json` into tracked repository directories."""
+def validate_capture_interval_sec(raw: float | int) -> float:
+    """Validate `--capture-interval-sec` as a positive finite number."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise RunnerError("--capture-interval-sec must be a positive finite number")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise RunnerError("--capture-interval-sec must be a positive finite number")
+    return value
+
+
+def _validate_untracked_output_dir(target_dir: Path, repo_root: Path, artifact_name: str) -> None:
+    """Refuse writing artifacts into tracked repository directories."""
     resolved_repo = repo_root.resolve()
-    resolved_boot = boot_dir.resolve()
-    if not resolved_boot.is_relative_to(resolved_repo):
+    resolved_target = target_dir.resolve()
+    if not resolved_target.is_relative_to(resolved_repo):
         return
     allowed_roots = (
         resolved_repo / "work",
         resolved_repo / "local-data",
     )
-    if any(resolved_boot.is_relative_to(allowed) for allowed in allowed_roots):
+    if any(resolved_target.is_relative_to(allowed) for allowed in allowed_roots):
         return
-    label = repo_relative_label(resolved_boot, resolved_repo) or "<repo>"
+    label = repo_relative_label(resolved_target, resolved_repo) or "<repo>"
     raise RunnerError(
-        f"refusing to write {BOOT_OPTIONS_NAME} into tracked repository directory '{label}' "
+        f"refusing to write {artifact_name} into tracked repository directory '{label}' "
         "(must be under work/, local-data/, or outside the repository)"
     )
+
+
+def validate_boot_dir_safety(boot_dir: Path, repo_root: Path) -> None:
+    """Refuse writing `boot-options.json` into tracked repository directories."""
+    _validate_untracked_output_dir(boot_dir, repo_root, BOOT_OPTIONS_NAME)
+
+
+def validate_capture_frames_dir_safety(capture_dir: Path, repo_root: Path) -> None:
+    """Refuse writing captured frames into tracked repository directories."""
+    _validate_untracked_output_dir(capture_dir, repo_root, "captured frames")
+
+
+def validate_capture_frames_arg(raw: Any, repo_root: Path) -> tuple[bool, Path | None]:
+    """Validate `--capture-frames [DIR]` and return `(enabled, capture_dir_or_none)`."""
+    if raw is None or raw is False:
+        return False, None
+    if raw is True:
+        return True, None
+    if isinstance(raw, (str, Path)):
+        text = str(raw).strip()
+        if not text:
+            raise RunnerError("--capture-frames directory path must not be empty")
+        capture_dir = resolve_against_repo(text, repo_root)
+        validate_capture_frames_dir_safety(capture_dir, repo_root)
+        if capture_dir.exists() and not capture_dir.is_dir():
+            raise RunnerError(f"--capture-frames path is not a directory: {basename_label(capture_dir)}")
+        return True, capture_dir
+    raise RunnerError("invalid --capture-frames value")
+
+
+def _validate_dump_pipelines_dir(value: Any) -> str:
+    if not isinstance(value, str):
+        raise RunnerError("invalid boot-options: 'dump_pipelines_dir' must be a non-empty string")
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 256
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+        or "\\" in cleaned
+        or re.match(r"^[A-Za-z]:", cleaned)
+        or ".." in cleaned.split("/")
+    ):
+        raise RunnerError(
+            "invalid boot-options: 'dump_pipelines_dir' must be a safe non-empty virtual path (e.g. '/pg6_dump')"
+        )
+    return cleaned
 
 
 def parse_and_validate_boot_options(
@@ -802,10 +872,11 @@ def parse_and_validate_boot_options(
     boot_options: Mapping[str, Any] | str | Path | None = None,
     report_to_log: bool = False,
     max_wall_ms: int | None = None,
+    dump_pipelines: bool = False,
     repo_root: Path = REPO_ROOT,
 ) -> dict[str, Any] | None:
-    """Parse and schema-validate `--boot-options`, `--report-to-log`, and `--max-wall-ms`."""
-    if boot_options is None and not report_to_log and max_wall_ms is None:
+    """Parse and schema-validate `--boot-options`, `--report-to-log`, `--max-wall-ms`, and `--dump-pipelines`."""
+    if boot_options is None and not report_to_log and max_wall_ms is None and not dump_pipelines:
         return None
 
     resolved_repo = repo_root.resolve()
@@ -893,6 +964,8 @@ def parse_and_validate_boot_options(
             if not isinstance(value, bool):
                 raise RunnerError(f"invalid boot-options: '{key}' must be a boolean")
             validated[key] = value
+        elif key in BOOT_OPTIONS_STR_KEYS:
+            validated[key] = _validate_dump_pipelines_dir(value)
 
     if report_to_log:
         validated["report_to_log"] = True
@@ -901,6 +974,9 @@ def parse_and_validate_boot_options(
         if isinstance(max_wall_ms, bool) or not isinstance(max_wall_ms, int) or max_wall_ms < 0 or max_wall_ms > _UINT64_MAX:
             raise RunnerError("--max-wall-ms must be a non-negative uint64 integer")
         validated["max_wall_ms"] = int(max_wall_ms)
+
+    if dump_pipelines:
+        validated["dump_pipelines_dir"] = DEFAULT_DUMP_PIPELINES_DIR
 
     return {key: validated[key] for key in sorted(validated)}
 
@@ -1558,6 +1634,9 @@ class BrowserSessionResult:
     presents: list[dict[str, Any]] = field(default_factory=list)
     first_present_ms: float | None = None
     captured_frames: list[str] = field(default_factory=list)
+    capture_frames_enabled: bool = False
+    capture_frames_dir: str | None = None
+    non_black_canvas_frames: int | None = None
     scripted_inputs_sent: int = 0
     mp4_path: str | None = None
     warnings: list[str] = field(default_factory=list)
@@ -1700,6 +1779,56 @@ def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float)
     }
 
 
+def _import_pil_image() -> Any:
+    """Return `PIL.Image` module if Pillow is installed, else `None`."""
+    try:
+        from PIL import Image  # type: ignore[import-not-found]
+
+        return Image
+    except ImportError:
+        return None
+
+
+def check_canvas_non_black(
+    image_bytes: bytes,
+    *,
+    canvas_min_x: int = CANVAS_MIN_X,
+    pil_image_mod: Any | None = None,
+    _auto_import_pil: bool = True,
+) -> bool | None:
+    """Check whether RGB pixels at `x >= canvas_min_x` have any non-zero channel.
+
+    Returns `True` when at least one pixel in `x >= canvas_min_x` has a non-zero
+    RGB value, `False` when all pixels in that region are pure black (or the image
+    width is `<= canvas_min_x`), and `None` when Pillow is unavailable or the
+    image bytes cannot be decoded.
+    """
+    img_mod = pil_image_mod
+    if img_mod is None and _auto_import_pil:
+        img_mod = _import_pil_image()
+    if img_mod is None:
+        return None
+    try:
+        with img_mod.open(io.BytesIO(image_bytes)) as img:
+            rgb = img.convert("RGB")
+            width, height = rgb.size
+            if width <= canvas_min_x or height <= 0:
+                return False
+            cropped = rgb.crop((canvas_min_x, 0, width, height))
+            extrema = cropped.getextrema()
+    except Exception:
+        return None
+    if not extrema:
+        return False
+    for channel in extrema:
+        if isinstance(channel, (tuple, list)) and len(channel) >= 2:
+            if channel[1] > 0:
+                return True
+        elif isinstance(channel, (int, float)) and channel > 0:
+            return True
+    return False
+
+
 def encode_frames_to_mp4(
     frames_dir: Path,
     out_mp4: Path,
@@ -1708,11 +1837,17 @@ def encode_frames_to_mp4(
     runner: CommandRunner = run_command,
     which_fn: WhichFn = shutil.which,
 ) -> tuple[bool, str | None]:
-    """Encode captured `frame_0001.jpg` screenshots into an H.264 MP4 using `ffmpeg`."""
+    """Encode captured `frame_0001.jpg` / `frame_0001.png` screenshots into an H.264 MP4 using `ffmpeg`."""
     ffmpeg = which_fn("ffmpeg")
     if not ffmpeg:
         return False, "ffmpeg not found on PATH; skipping MP4 encoding"
-    if not frames_dir.is_dir() or not any(frames_dir.glob("frame_*.jpg")):
+    if not frames_dir.is_dir():
+        return False, "no captured JPEG frames found for MP4 encoding"
+    if any(frames_dir.glob("frame_*.jpg")):
+        pattern = "frame_%04d.jpg"
+    elif any(frames_dir.glob("frame_*.png")):
+        pattern = "frame_%04d.png"
+    else:
         return False, "no captured JPEG frames found for MP4 encoding"
     rate = max(1.0, round(fps, 3))
     cmd = [
@@ -1721,7 +1856,7 @@ def encode_frames_to_mp4(
         "-framerate",
         str(rate),
         "-i",
-        str(frames_dir / "frame_%04d.jpg"),
+        str(frames_dir / pattern),
         "-c:v",
         "libx264",
         "-pix_fmt",
@@ -1747,9 +1882,11 @@ def run_browser_session(
     headless: bool,
     smoke: bool,
     send_input: bool,
-    capture_frames: bool,
+    capture_frames: bool | Path | str | None,
     frame_interval_s: float,
     encode_mp4: bool,
+    capture_frames_dir: Path | None = None,
+    capture_interval_sec: float | None = None,
     input_script: str | None = None,
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
@@ -1775,6 +1912,26 @@ def run_browser_session(
         stream_shaders=stream_shaders,
         stream_threshold_mb=clean_threshold_mb,
     )
+
+    if capture_frames_dir is not None:
+        resolved_capture_dir: Path | None = resolve_against_repo(capture_frames_dir, repo)
+        validate_capture_frames_dir_safety(resolved_capture_dir, repo)
+        capture_enabled = True
+    else:
+        capture_enabled, resolved_capture_dir = validate_capture_frames_arg(capture_frames, repo)
+
+    use_png_capture = resolved_capture_dir is not None
+    if use_png_capture:
+        assert resolved_capture_dir is not None
+        frames_dir = resolved_capture_dir
+        effective_frame_interval = validate_capture_interval_sec(
+            DEFAULT_CAPTURE_INTERVAL_SEC if capture_interval_sec is None else capture_interval_sec
+        )
+    else:
+        frames_dir = run_dir / "frames"
+        effective_frame_interval = float(frame_interval_s)
+
+    want_frames = capture_enabled or encode_mp4
 
     profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-profile-"))
     smoke_boot_dir: Path | None = None
@@ -1828,6 +1985,8 @@ def run_browser_session(
         stream_shaders=bool(stream_shaders or clean_threshold_mb is not None),
         stream_threshold_mb=clean_threshold_mb,
         boot_options=dict(boot_options) if boot_options is not None else None,
+        capture_frames_enabled=want_frames,
+        capture_frames_dir=repo_relative_label(frames_dir, repo) if want_frames else None,
     )
     server_proc: Any = None
     chrome_proc: Any = None
@@ -1835,10 +1994,15 @@ def run_browser_session(
     server_log_fh = None
     chrome_log_fh = None
 
-    frames_dir = run_dir / "frames"
-    want_frames = capture_frames or encode_mp4
+    pil_image_mod: Any = None
     if want_frames:
         frames_dir.mkdir(parents=True, exist_ok=True)
+        pil_image_mod = _import_pil_image()
+        if pil_image_mod is not None:
+            result.non_black_canvas_frames = 0
+        else:
+            result.non_black_canvas_frames = None
+            result.warnings.append("Pillow (PIL) not installed; skipping non-black canvas extrema check")
 
     start_mono = time.monotonic()
     try:
@@ -1879,10 +2043,37 @@ def run_browser_session(
         nav_start = time.monotonic()
         end_time = nav_start + duration_s
         next_poll = nav_start + min(DEFAULT_POLL_INTERVAL_S, duration_s)
-        next_frame = nav_start + min(frame_interval_s, duration_s) if want_frames else float("inf")
+        next_frame = nav_start + min(effective_frame_interval, duration_s) if want_frames else float("inf")
         next_input = nav_start + INPUT_START_S if send_input else float("inf")
         last_present_count = 0
         smoke_triggered = False
+
+        def capture_one_frame() -> None:
+            assert cdp is not None
+            try:
+                cdp_params: dict[str, Any] = (
+                    {"format": "png"} if use_png_capture else {"format": "jpeg", "quality": 85}
+                )
+                shot = cdp.send("Page.captureScreenshot", cdp_params, timeout=8.0)
+                b64_data = shot.get("data")
+                if isinstance(b64_data, str) and b64_data:
+                    raw_bytes = base64.b64decode(b64_data)
+                    idx = len(result.captured_frames) + 1
+                    ext = "png" if use_png_capture else "jpg"
+                    fname = f"frame_{idx:04d}.{ext}"
+                    (frames_dir / fname).write_bytes(raw_bytes)
+                    result.captured_frames.append(fname)
+                    if pil_image_mod is not None:
+                        non_black = check_canvas_non_black(
+                            raw_bytes,
+                            canvas_min_x=CANVAS_MIN_X,
+                            pil_image_mod=pil_image_mod,
+                            _auto_import_pil=False,
+                        )
+                        if non_black is True:
+                            result.non_black_canvas_frames = (result.non_black_canvas_frames or 0) + 1
+            except (CdpError, ValueError, OSError):
+                pass
 
         def process_events(events: Sequence[dict[str, Any]]) -> None:
             now_s = max(0.0, time.monotonic() - nav_start)
@@ -1981,21 +2172,14 @@ def run_browser_session(
                 next_input = now + INPUT_PERIOD_S
 
             if want_frames and now >= next_frame:
-                try:
-                    shot = cdp.send("Page.captureScreenshot", {"format": "jpeg", "quality": 85}, timeout=8.0)
-                    b64_data = shot.get("data")
-                    if isinstance(b64_data, str) and b64_data:
-                        idx = len(result.captured_frames) + 1
-                        fname = f"frame_{idx:04d}.jpg"
-                        (frames_dir / fname).write_bytes(base64.b64decode(b64_data))
-                        result.captured_frames.append(fname)
-                except (CdpError, ValueError, OSError):
-                    pass
-                next_frame = now + frame_interval_s
+                capture_one_frame()
+                next_frame = now + effective_frame_interval
 
         # Final telemetry sample + drain
         if not result.crashed:
             process_events(cdp.drain_events(timeout=0.05))
+            if want_frames and not result.captured_frames:
+                capture_one_frame()
             final_probe = evaluate_probe()
             if final_probe:
                 result.final_probe = final_probe
@@ -2014,7 +2198,7 @@ def run_browser_session(
             result.exit_code = 0
 
         if encode_mp4:
-            fps = 1.0 / max(frame_interval_s, 0.1)
+            fps = 1.0 / max(effective_frame_interval, 0.1)
             ok_mp4, mp4_warn = encode_frames_to_mp4(
                 frames_dir,
                 run_dir / "capture.mp4",
@@ -2145,6 +2329,9 @@ def build_boot_report(
         summary["streamShaders"] = True
     if effective_stream_threshold_mb is not None:
         summary["streamThresholdMb"] = effective_stream_threshold_mb
+    if session.capture_frames_enabled or session.captured_frames or session.non_black_canvas_frames is not None:
+        summary["capturedFrames"] = len(session.captured_frames)
+        summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -2225,6 +2412,9 @@ def build_telemetry_payload(
         summary["streamShaders"] = True
     if effective_stream_threshold_mb is not None:
         summary["streamThresholdMb"] = effective_stream_threshold_mb
+    if session.capture_frames_enabled or session.captured_frames or session.non_black_canvas_frames is not None:
+        summary["capturedFrames"] = len(session.captured_frames)
+        summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
     return sanitize_value(
         {
             "schema": "playgta6-browser-telemetry",
@@ -2250,6 +2440,9 @@ def build_telemetry_payload(
             "first_present_ms": session.first_present_ms,
             "scripted_inputs_sent": session.scripted_inputs_sent,
             "captured_frames": list(session.captured_frames),
+            "capturedFrames": len(session.captured_frames),
+            "nonBlackCanvasFrames": session.non_black_canvas_frames,
+            "capture_frames_dir": session.capture_frames_dir,
             "mp4": session.mp4_path,
             "page_error_count": len(session.page_errors),
             "warnings": list(session.warnings),
@@ -2306,6 +2499,10 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
     input_script = report.get("inputScript") or summary.get("inputScript")
     if input_script:
         lines.append(f"input_script: {input_script}")
+    if "capturedFrames" in summary:
+        non_black = summary.get("nonBlackCanvasFrames")
+        nb_label = "skipped" if non_black is None else str(non_black)
+        lines.append(f"captured_frames: {summary['capturedFrames']} (non_black_canvas={nb_label})")
     fault = report.get("fault")
     if isinstance(fault, dict):
         lines.append(f"stop: {fault.get('kind')} at {fault.get('va')} ({fault.get('detail')})")
@@ -2383,7 +2580,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true", help="force rebuilding all real-game stages")
     p.add_argument("--no-build", action="store_true", help="fail instead of building any stale stage")
     p.add_argument("--dry-run", action="store_true", help="print sanitized build/launch plan as JSON and exit")
-    p.add_argument("--capture-frames", action="store_true", help="capture periodic JPEG screenshots into frames/")
+    p.add_argument(
+        "--capture-frames",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="DIR",
+        help=(
+            "capture periodic CDP screenshots: pass DIR to write PNGs into DIR "
+            "(at --capture-interval-sec), or omit DIR to write JPEGs into <run-dir>/frames/"
+        ),
+    )
+    p.add_argument(
+        "--capture-interval-sec",
+        type=float,
+        default=DEFAULT_CAPTURE_INTERVAL_SEC,
+        metavar="SEC",
+        help="positive finite seconds between PNG screenshots when --capture-frames <dir> is set (default 2.0)",
+    )
     p.add_argument("--mp4", action="store_true", help="encode captured frames to capture.mp4 via ffmpeg")
     p.add_argument("--baseline", help="earlier run (name in runs-dir or directory path) to compare against")
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
@@ -2393,7 +2607,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--input-script",
         default=None,
         metavar="PRESET",
-        help="sanitized scripted-input preset appended as ?inputScript=<preset> (e.g. start-screen)",
+        help=(
+            "sanitized scripted-input preset appended as ?inputScript=<preset> "
+            "(allowed: start-screen, menu-flow, calibration-skip, intro-watch)"
+        ),
     )
     p.add_argument(
         "--stream-shaders",
@@ -2424,6 +2641,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MS",
         help="set max_wall_ms=<uint64> in validated boot-options.json",
+    )
+    p.add_argument(
+        "--dump-pipelines",
+        action="store_true",
+        help=f'set dump_pipelines_dir="{DEFAULT_DUMP_PIPELINES_DIR}" in validated boot-options.json',
     )
     return p
 
@@ -2486,18 +2708,22 @@ def _run(
         raise RunnerError(f"invalid --port {args.port} (expected 0..65535)")
     if args.duration_s is not None and args.duration_s <= 0:
         raise RunnerError("--duration-s must be > 0")
-    if args.frame_interval_s <= 0:
+    if not math.isfinite(args.frame_interval_s) or args.frame_interval_s <= 0:
         raise RunnerError("--frame-interval-s must be > 0")
+    capture_interval_sec = validate_capture_interval_sec(args.capture_interval_sec)
+    capture_frames_enabled, capture_frames_dir = validate_capture_frames_arg(args.capture_frames, repo)
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
 
     input_script = validate_input_script_preset(args.input_script)
     stream_shaders = bool(args.stream_shaders)
     stream_threshold_mb = validate_stream_threshold_mb(args.stream_threshold_mb)
+    dump_pipelines = bool(args.dump_pipelines)
     resolved_boot_options = parse_and_validate_boot_options(
         boot_options=args.boot_options,
         report_to_log=bool(args.report_to_log),
         max_wall_ms=args.max_wall_ms,
+        dump_pipelines=dump_pipelines,
         repo_root=repo,
     )
 
@@ -2624,7 +2850,11 @@ def _run(
                 "stream_threshold_mb": stream_threshold_mb,
                 "boot_options": resolved_boot_options,
                 "boot_options_staging": boot_options_staging_preview,
-                "capture_frames": bool(args.capture_frames or args.mp4),
+                "dump_pipelines": dump_pipelines,
+                "dumpPipelines": dump_pipelines,
+                "capture_frames": bool(capture_frames_enabled or args.mp4),
+                "capture_frames_dir": repo_relative_label(capture_frames_dir, repo) if capture_frames_dir is not None else None,
+                "capture_interval_sec": capture_interval_sec,
                 "mp4": bool(args.mp4),
                 "trust_build": bool(args.trust_build),
                 "port": preview_port,
@@ -2690,7 +2920,9 @@ def _run(
         headless=args.headless,
         smoke=args.smoke,
         send_input=send_input,
-        capture_frames=bool(args.capture_frames),
+        capture_frames=capture_frames_enabled,
+        capture_frames_dir=capture_frames_dir,
+        capture_interval_sec=capture_interval_sec,
         frame_interval_s=float(args.frame_interval_s),
         encode_mp4=bool(args.mp4),
         input_script=input_script,
@@ -2737,7 +2969,13 @@ def _run(
             "stream_threshold_mb": stream_threshold_mb,
             "boot_options": resolved_boot_options,
             "staged_boot_options": staged_boot_options,
-            "capture_frames": bool(args.capture_frames or args.mp4),
+            "dump_pipelines": dump_pipelines,
+            "dumpPipelines": dump_pipelines,
+            "capture_frames": bool(capture_frames_enabled or args.mp4),
+            "capture_frames_dir": repo_relative_label(capture_frames_dir, repo) if capture_frames_dir is not None else None,
+            "capture_interval_sec": capture_interval_sec,
+            "capturedFrames": len(session.captured_frames),
+            "nonBlackCanvasFrames": session.non_black_canvas_frames,
             "mp4": bool(args.mp4),
             "trust_build": bool(args.trust_build),
             "chrome": basename_label(chrome_path),
