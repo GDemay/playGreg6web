@@ -1673,6 +1673,9 @@ function buildMergedBinkPresenterOptions(baseOptions, extraOptions) {
   if (extraOptions && typeof extraOptions === 'object') {
     Object.assign(merged, extraOptions);
   }
+  if (merged.enableTripleBuffering === undefined) {
+    merged.enableTripleBuffering = true;
+  }
   if (merged.chromaOrder !== undefined && merged.chromaOrder !== null) {
     const norm = normalizeBinkChromaOrderInput(merged.chromaOrder);
     if (norm === 'yuv' || norm === 'yvu') {
@@ -1686,6 +1689,41 @@ function buildMergedBinkPresenterOptions(baseOptions, extraOptions) {
     }
   }
   return Object.keys(merged).length > 0 ? merged : null;
+}
+
+function resolveHasVisibleNonBlackPixelsFn() {
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6SplashFrameBridge &&
+    typeof globalThis.PlayGta6SplashFrameBridge.hasVisibleNonBlackPixels === 'function'
+  ) {
+    return globalThis.PlayGta6SplashFrameBridge.hasVisibleNonBlackPixels;
+  }
+  if (typeof require === 'function') {
+    try {
+      const mod = require('./splash_frame_bridge.js');
+      if (mod && typeof mod.hasVisibleNonBlackPixels === 'function') {
+        return mod.hasVisibleNonBlackPixels;
+      }
+    } catch (_) {
+      // Optional helper unavailable.
+    }
+  }
+  if (typeof importScripts === 'function') {
+    try {
+      importScripts('./splash_frame_bridge.js');
+    } catch (_) {
+      // Optional helper unavailable in worker environment.
+    }
+    if (
+      typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6SplashFrameBridge &&
+      typeof globalThis.PlayGta6SplashFrameBridge.hasVisibleNonBlackPixels === 'function'
+    ) {
+      return globalThis.PlayGta6SplashFrameBridge.hasVisibleNonBlackPixels;
+    }
+  }
+  return null;
 }
 
 const DEFAULT_FALLBACK_SAMPLER_DESCRIPTORS = Object.freeze({
@@ -1834,6 +1872,35 @@ class WgpuCommandProcessor {
     this._firstVisibleFrameNotified = false;
     this._firstVisibleFrameMs = null;
     this._blackLoadingMs = null;
+    this._requireNonBlackFrame = Boolean(
+      options.requireNonBlackFrame === true || options.requireNonBlackPixels === true
+    );
+    this._minVisibleLuma =
+      typeof options.minVisibleLuma === 'number' &&
+      Number.isFinite(options.minVisibleLuma) &&
+      options.minVisibleLuma >= 0 &&
+      options.minVisibleLuma <= 255
+        ? options.minVisibleLuma
+        : 8;
+    this._minVisiblePixels = resolvePositiveIntOption(options.minVisiblePixels, 4);
+    this._nonBlackPixelProbe =
+      typeof options.nonBlackPixelProbe === 'function'
+        ? options.nonBlackPixelProbe
+        : typeof options.pixelProbe === 'function'
+          ? options.pixelProbe
+          : null;
+    this._suppressedBlackFrames = 0;
+    this._lastSampledMaxLuma = 0;
+    this._pendingFrameLuminance = null;
+    this._lumaProbeScratch = {
+      visible: false,
+      maxLuma: 0,
+      visiblePixels: 0,
+      sampledPixels: 0,
+    };
+    this._uniformRingFrameIndex = -1;
+    this._stagingSceneTransitionTrimBytes = 0;
+    this._frameStartMs = null;
     this._gpuAdapter =
       options.gpuAdapter && typeof options.gpuAdapter === 'object'
         ? sanitizeGpuAdapterInfo(options.gpuAdapter)
@@ -2100,14 +2167,23 @@ class WgpuCommandProcessor {
       }
     }
 
-    // 3. GpuPassTimer (G16)
+    // 3. GpuPassTimer (G16 / W324)
     this._ownsPassTimer = false;
     this.passTimer = null;
-    if (options.passTimer && typeof options.passTimer === 'object') {
-      this.passTimer = options.passTimer;
+    const injectedPassTimer =
+      options.passTimer && typeof options.passTimer === 'object'
+        ? options.passTimer
+        : options.gpuTimer && typeof options.gpuTimer === 'object'
+          ? options.gpuTimer
+          : null;
+    const enablePassTimerOpt =
+      options.enablePassTimer !== undefined ? options.enablePassTimer : options.enableGpuTimer;
+    const passTimerOpts = options.passTimerOptions || options.gpuTimerOptions || null;
+    if (injectedPassTimer) {
+      this.passTimer = injectedPassTimer;
     } else if (
-      options.enablePassTimer === true ||
-      (options.enablePassTimer !== false && deviceSupportsTimestampQuery(device))
+      enablePassTimerOpt === true ||
+      (enablePassTimerOpt !== false && deviceSupportsTimestampQuery(device))
     ) {
       const PassTimerCtor = resolveSubsystemCtor(
         options.GpuPassTimer,
@@ -2117,9 +2193,29 @@ class WgpuCommandProcessor {
       );
       if (PassTimerCtor) {
         this._ownedSubsystemFactories.passTimer = (dev) =>
-          new PassTimerCtor({ ...(options.passTimerOptions || {}), device: dev });
+          new PassTimerCtor({ ...(passTimerOpts || {}), device: dev });
         this.passTimer = this._ownedSubsystemFactories.passTimer(device);
         this._ownsPassTimer = true;
+      }
+    }
+
+    // 3b. GpuFrameRecorder (W325 30 FPS spike auto-capture)
+    this._ownsGpuRecorder = false;
+    this.gpuRecorder = null;
+    if (options.gpuRecorder && typeof options.gpuRecorder === 'object') {
+      this.gpuRecorder = options.gpuRecorder;
+    } else if (options.recorder && typeof options.recorder === 'object') {
+      this.gpuRecorder = options.recorder;
+    } else if (options.enableGpuRecorder === true) {
+      const RecorderCtor = resolveSubsystemCtor(
+        options.GpuFrameRecorder,
+        'PlayGta6GpuRecorder',
+        'GpuFrameRecorder',
+        './gpu_recorder.js'
+      );
+      if (RecorderCtor) {
+        this.gpuRecorder = new RecorderCtor(options.gpuRecorderOptions || {});
+        this._ownsGpuRecorder = true;
       }
     }
 
@@ -2288,6 +2384,9 @@ class WgpuCommandProcessor {
     if (initBinkLoadOp !== undefined && initBinkLoadOp !== null) {
       topLevelBinkOpts.loadOp = initBinkLoadOp;
     }
+    if (options.enableTripleBuffering !== undefined) {
+      topLevelBinkOpts.enableTripleBuffering = Boolean(options.enableTripleBuffering);
+    }
     this._binkPresenterOptions = buildMergedBinkPresenterOptions(
       topLevelBinkOpts,
       options.binkPresenterOptions
@@ -2449,6 +2548,30 @@ class WgpuCommandProcessor {
 
   get blackLoadingMs() {
     return this._blackLoadingMs;
+  }
+
+  get gpuTimer() {
+    return this.passTimer;
+  }
+
+  set gpuTimer(timer) {
+    this.passTimer = timer;
+  }
+
+  get requireNonBlackFrame() {
+    return this._requireNonBlackFrame;
+  }
+
+  get suppressedBlackFrames() {
+    return this._suppressedBlackFrames;
+  }
+
+  get lastSampledMaxLuma() {
+    return this._lastSampledMaxLuma;
+  }
+
+  setFrameLuminanceMeta(meta) {
+    this._pendingFrameLuminance = meta !== undefined ? meta : null;
   }
 
   get gpuAdapter() {
@@ -3467,6 +3590,77 @@ class WgpuCommandProcessor {
             }
           }
         };
+        if (this._requireNonBlackFrame) {
+          if (bridgeOpts.requireNonBlackPixels === undefined) {
+            bridgeOpts.requireNonBlackPixels = true;
+          }
+          if (bridgeOpts.minVisibleLuma === undefined) {
+            bridgeOpts.minVisibleLuma = this._minVisibleLuma;
+          }
+          if (bridgeOpts.minVisiblePixels === undefined) {
+            bridgeOpts.minVisiblePixels = this._minVisiblePixels;
+          }
+          const userOnFirstVisible =
+            typeof bridgeOpts.onFirstVisibleFrame === 'function'
+              ? bridgeOpts.onFirstVisibleFrame
+              : null;
+          bridgeOpts.onFirstVisibleFrame = (info) => {
+            const visibleTs = this._getNowMs();
+            const firstPresentMs = this._firstPresentMs !== null ? this._firstPresentMs : visibleTs;
+            const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
+            const infoLuma =
+              info && typeof info.maxLuma === 'number' && Number.isFinite(info.maxLuma)
+                ? info.maxLuma
+                : info &&
+                    typeof info.lastSampledMaxLuma === 'number' &&
+                    Number.isFinite(info.lastSampledMaxLuma)
+                  ? info.lastSampledMaxLuma
+                  : info &&
+                      typeof info.sampledMaxLuma === 'number' &&
+                      Number.isFinite(info.sampledMaxLuma)
+                    ? info.sampledMaxLuma
+                    : null;
+            if (infoLuma !== null) {
+              this._lastSampledMaxLuma = Math.max(0, Math.min(255, Math.floor(infoLuma)));
+            }
+            if (
+              info &&
+              typeof info.suppressedBlackFrames === 'number' &&
+              Number.isFinite(info.suppressedBlackFrames)
+            ) {
+              this._suppressedBlackFrames = Math.max(
+                this._suppressedBlackFrames,
+                Math.floor(info.suppressedBlackFrames)
+              );
+            }
+            if (!this._firstVisibleFrameNotified) {
+              this._firstVisibleFrameMs = visibleTs;
+              this._blackLoadingMs = blackLoadingMs;
+              this._notifyFirstVisibleFrame({
+                type: 'first-visible-frame',
+                firstVisibleFrame: true,
+                firstVisibleFrameMs: visibleTs,
+                firstPresentMs,
+                blackLoadingMs,
+                presentCount: this._presentCount,
+                realPackDrawsThisFrame: 0,
+                fallbackDrawsThisFrame: 0,
+                drawsThisFrame: 0,
+                source: (info && info.source) || 'bink2',
+                maxLuma: this._lastSampledMaxLuma,
+                suppressedBlackFrames: this._suppressedBlackFrames,
+                gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+              });
+            }
+            if (userOnFirstVisible) {
+              try {
+                userOnFirstVisible(info);
+              } catch (_) {
+                // User callback failures must not break presentation.
+              }
+            }
+          };
+        }
         this.splashFrameBridge = new BridgeCtor(bridgeOpts);
         this._ownsSplashFrameBridge = true;
       }
@@ -3843,7 +4037,7 @@ class WgpuCommandProcessor {
             this._lastPresentHeight = targetHeight;
           }
           if (splashSceneTransition || splashResChanged) {
-            this.reclaimOversizedRenderTargets(this._oversizedRtReclaimIdleFrames);
+            this.trimTransientMemory({ maxIdleFrames: this._oversizedRtReclaimIdleFrames });
           }
           const prevFrameCount = this.frameCount;
           this.frameCount += 1;
@@ -3858,6 +4052,75 @@ class WgpuCommandProcessor {
               source: renderResult.source || 'splash',
               timestampMs: renderResult.timestampMs,
             });
+          }
+          if (this._requireNonBlackFrame && !this._firstVisibleFrameNotified) {
+            if (
+              typeof renderResult.lastSampledMaxLuma === 'number' &&
+              Number.isFinite(renderResult.lastSampledMaxLuma)
+            ) {
+              this._lastSampledMaxLuma = Math.max(
+                0,
+                Math.min(255, Math.floor(renderResult.lastSampledMaxLuma))
+              );
+            }
+            if (
+              typeof renderResult.suppressedBlackFrames === 'number' &&
+              Number.isFinite(renderResult.suppressedBlackFrames)
+            ) {
+              this._suppressedBlackFrames = Math.max(
+                this._suppressedBlackFrames,
+                Math.floor(renderResult.suppressedBlackFrames)
+              );
+            }
+            if (renderResult.suppressedBlackFrame === true) {
+              if (this._suppressedBlackFrames === 0) {
+                this._suppressedBlackFrames = 1;
+              }
+            } else {
+              const bridgeAlreadyVerified =
+                renderResult.firstVisibleFrameEmitted === true ||
+                renderResult.firstVisibleFrame === true;
+              const splashCheck = bridgeAlreadyVerified
+                ? { evaluated: true, visible: true, maxLuma: this._lastSampledMaxLuma }
+                : isDiagnostic
+                  ? { evaluated: true, visible: true, maxLuma: 235 }
+                  : this._evaluateNonBlackLuminance(
+                      framePayload,
+                      renderResult.width || targetWidth,
+                      renderResult.height || targetHeight
+                    );
+              if (splashCheck.evaluated) {
+                this._lastSampledMaxLuma = Math.max(
+                  0,
+                  Math.min(255, Math.floor(splashCheck.maxLuma || 0))
+                );
+              }
+              if (splashCheck.visible) {
+                const visibleTs = this._getNowMs();
+                const firstPresentMs =
+                  this._firstPresentMs !== null ? this._firstPresentMs : visibleTs;
+                const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
+                this._firstVisibleFrameMs = visibleTs;
+                this._blackLoadingMs = blackLoadingMs;
+                this._notifyFirstVisibleFrame({
+                  type: 'first-visible-frame',
+                  firstVisibleFrame: true,
+                  firstVisibleFrameMs: visibleTs,
+                  firstPresentMs,
+                  blackLoadingMs,
+                  presentCount: this._presentCount,
+                  realPackDrawsThisFrame: 0,
+                  fallbackDrawsThisFrame: 0,
+                  drawsThisFrame: 0,
+                  source: renderResult.source || 'bink2',
+                  maxLuma: this._lastSampledMaxLuma,
+                  suppressedBlackFrames: this._suppressedBlackFrames,
+                  gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+                });
+              } else {
+                this._suppressedBlackFrames += 1;
+              }
+            }
           }
           const finalPresenter = this.binkPresenter || bridge.presenter || null;
           return {
@@ -4039,6 +4302,42 @@ class WgpuCommandProcessor {
             timestampMs,
           });
         }
+        if (this._requireNonBlackFrame && !this._firstVisibleFrameNotified) {
+          const directCheck = isDiagnostic
+            ? { evaluated: true, visible: true, maxLuma: 235 }
+            : this._evaluateNonBlackLuminance(framePayload, width, height);
+          if (directCheck.evaluated) {
+            this._lastSampledMaxLuma = Math.max(
+              0,
+              Math.min(255, Math.floor(directCheck.maxLuma || 0))
+            );
+          }
+          if (directCheck.visible) {
+            const visibleTs = this._getNowMs();
+            const firstPresentMs =
+              this._firstPresentMs !== null ? this._firstPresentMs : visibleTs;
+            const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
+            this._firstVisibleFrameMs = visibleTs;
+            this._blackLoadingMs = blackLoadingMs;
+            this._notifyFirstVisibleFrame({
+              type: 'first-visible-frame',
+              firstVisibleFrame: true,
+              firstVisibleFrameMs: visibleTs,
+              firstPresentMs,
+              blackLoadingMs,
+              presentCount: this._presentCount,
+              realPackDrawsThisFrame: 0,
+              fallbackDrawsThisFrame: 0,
+              drawsThisFrame: 0,
+              source: framePayload.source || 'bink2',
+              maxLuma: this._lastSampledMaxLuma,
+              suppressedBlackFrames: this._suppressedBlackFrames,
+              gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+            });
+          } else {
+            this._suppressedBlackFrames += 1;
+          }
+        }
         return {
           ok: true,
           presented: true,
@@ -4138,7 +4437,250 @@ class WgpuCommandProcessor {
     return true;
   }
 
+  _advanceUniformRingForFrame(frameIndex) {
+    if (!this.uniformRing || this.uniformRing._destroyed) {
+      return false;
+    }
+    if (this._uniformRingFrameIndex === frameIndex) {
+      return false;
+    }
+    if (typeof this.uniformRing.advanceFrame === 'function') {
+      try {
+        this.uniformRing.advanceFrame(frameIndex);
+        this._uniformRingFrameIndex = frameIndex;
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+    if (typeof this.uniformRing.beginFrame === 'function') {
+      try {
+        this.uniformRing.beginFrame(frameIndex);
+        this._uniformRingFrameIndex = frameIndex;
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  _evaluateNonBlackLuminance(input, fallbackWidth, fallbackHeight, extraOpts = null) {
+    if (input === null || input === undefined) {
+      return { evaluated: false, visible: false, maxLuma: 0 };
+    }
+    if (typeof input === 'boolean') {
+      return { evaluated: true, visible: input, maxLuma: input ? 255 : 0 };
+    }
+
+    const opts = extraOpts && typeof extraOpts === 'object' ? extraOpts : null;
+    const minVisibleLuma =
+      opts && typeof opts.minVisibleLuma === 'number' && Number.isFinite(opts.minVisibleLuma)
+        ? opts.minVisibleLuma
+        : this._minVisibleLuma;
+    const minVisiblePixels =
+      opts && Number.isInteger(opts.minVisiblePixels) && opts.minVisiblePixels >= 1
+        ? opts.minVisiblePixels
+        : this._minVisiblePixels;
+
+    const runPixelCheck = (pixels, width, height, probeOverrides) => {
+      const checkFn = resolveHasVisibleNonBlackPixelsFn();
+      if (!checkFn || !pixels) {
+        return { evaluated: false, visible: false, maxLuma: 0 };
+      }
+      const scratch = this._lumaProbeScratch;
+      scratch.visible = false;
+      scratch.maxLuma = 0;
+      scratch.visiblePixels = 0;
+      scratch.sampledPixels = 0;
+      try {
+        const probeOpts = {
+          minVisibleLuma,
+          minVisiblePixels,
+          earlyExit: false,
+          out: scratch,
+          ...(probeOverrides || {}),
+        };
+        const visible = Boolean(checkFn(pixels, width, height, probeOpts));
+        return {
+          evaluated: scratch.sampledPixels > 0 || visible,
+          visible,
+          maxLuma: scratch.maxLuma,
+        };
+      } catch (_) {
+        return { evaluated: false, visible: false, maxLuma: 0 };
+      }
+    };
+
+    if (
+      input instanceof Uint8Array ||
+      input instanceof Uint8ClampedArray ||
+      ArrayBuffer.isView(input) ||
+      input instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer)
+    ) {
+      return runPixelCheck(input, fallbackWidth, fallbackHeight, opts);
+    }
+
+    if (typeof input === 'object') {
+      if (
+        typeof input.hasVisibleNonBlackPixels === 'boolean' ||
+        typeof input.visible === 'boolean' ||
+        typeof input.nonBlack === 'boolean'
+      ) {
+        const visible =
+          typeof input.hasVisibleNonBlackPixels === 'boolean'
+            ? input.hasVisibleNonBlackPixels
+            : typeof input.visible === 'boolean'
+              ? input.visible
+              : input.nonBlack;
+        const maxLuma =
+          typeof input.maxLuma === 'number' && Number.isFinite(input.maxLuma)
+            ? Math.max(0, Math.min(255, Math.floor(input.maxLuma)))
+            : visible
+              ? 255
+              : 0;
+        return { evaluated: true, visible, maxLuma };
+      }
+
+      const w =
+        typeof input.width === 'number' && Number.isFinite(input.width) && input.width > 0
+          ? Math.floor(input.width)
+          : fallbackWidth;
+      const h =
+        typeof input.height === 'number' && Number.isFinite(input.height) && input.height > 0
+          ? Math.floor(input.height)
+          : fallbackHeight;
+
+      const planes = input.planes && typeof input.planes === 'object' ? input.planes : null;
+      const rawRgba =
+        (planes && (planes.rgba !== undefined ? planes.rgba : planes.data)) ??
+        (input.rgba !== undefined
+          ? input.rgba
+          : input.pixels !== undefined
+            ? input.pixels
+            : input.pixelData !== undefined
+              ? input.pixelData
+              : input.data);
+      if (rawRgba !== undefined && rawRgba !== null) {
+        const overrides = { bytesPerPixel: 4 };
+        if (input.strideBytes !== undefined) {
+          overrides.strideBytes = input.strideBytes;
+        }
+        if (input.bgra === true || input.format === 'bgra8' || input.format === 'bgra8unorm') {
+          overrides.bgra = true;
+        }
+        return runPixelCheck(rawRgba, w, h, overrides);
+      }
+
+      const rawY =
+        (planes && (planes.y !== undefined ? planes.y : planes.yPlane)) ??
+        (input.y !== undefined ? input.y : input.yPlane);
+      if (rawY !== undefined && rawY !== null) {
+        const overrides = { bytesPerPixel: 1 };
+        if (input.yStride !== undefined) {
+          overrides.strideBytes = input.yStride;
+        }
+        if (input.colorRange === 'limited' || input.colorRange === 'full') {
+          overrides.colorRange = input.colorRange;
+        }
+        return runPixelCheck(rawY, w, h, overrides);
+      }
+
+      const extImg = input.image || input.imageBitmap || input.bitmap || null;
+      if (extImg && typeof extImg === 'object' && extImg.data !== undefined && extImg.data !== null) {
+        return runPixelCheck(extImg.data, extImg.width || w, extImg.height || h, {
+          bytesPerPixel: 4,
+        });
+      }
+
+      if (typeof input.maxLuma === 'number' && Number.isFinite(input.maxLuma)) {
+        const maxLuma = Math.max(0, Math.min(255, Math.floor(input.maxLuma)));
+        const visiblePixels =
+          typeof input.visiblePixels === 'number' && Number.isFinite(input.visiblePixels)
+            ? Math.floor(input.visiblePixels)
+            : null;
+        const visible =
+          maxLuma >= minVisibleLuma &&
+          (visiblePixels === null || visiblePixels >= minVisiblePixels);
+        return { evaluated: true, visible, maxLuma };
+      }
+    }
+
+    return { evaluated: false, visible: false, maxLuma: 0 };
+  }
+
+  _evaluateCommandBufferNonBlackGate(markResult, activeSwapchain, width, height, summary) {
+    const pendingMeta = this._pendingFrameLuminance;
+    this._pendingFrameLuminance = null;
+
+    if (pendingMeta !== null && pendingMeta !== undefined) {
+      const res = this._evaluateNonBlackLuminance(pendingMeta, width, height);
+      if (res.evaluated) {
+        return res;
+      }
+    }
+
+    if (markResult && typeof markResult === 'object') {
+      const res = this._evaluateNonBlackLuminance(markResult, width, height);
+      if (res.evaluated) {
+        return res;
+      }
+    }
+
+    if (activeSwapchain && typeof activeSwapchain === 'object') {
+      if (typeof activeSwapchain.getLastFrameLuminance === 'function') {
+        try {
+          const swapMeta = activeSwapchain.getLastFrameLuminance();
+          const res = this._evaluateNonBlackLuminance(swapMeta, width, height);
+          if (res.evaluated) {
+            return res;
+          }
+        } catch (_) {
+          // Ignore throwing swapchain luminance probes.
+        }
+      }
+      if (
+        typeof activeSwapchain.hasVisibleNonBlackPixels === 'boolean' ||
+        typeof activeSwapchain.lastSampledMaxLuma === 'number'
+      ) {
+        const res = this._evaluateNonBlackLuminance(
+          {
+            hasVisibleNonBlackPixels: activeSwapchain.hasVisibleNonBlackPixels,
+            maxLuma: activeSwapchain.lastSampledMaxLuma,
+          },
+          width,
+          height
+        );
+        if (res.evaluated) {
+          return res;
+        }
+      }
+    }
+
+    if (typeof this._nonBlackPixelProbe === 'function') {
+      try {
+        const probeOut = this._nonBlackPixelProbe({
+          width,
+          height,
+          frameCount: this.frameCount,
+          presentCount: this._presentCount,
+          summary,
+        });
+        const res = this._evaluateNonBlackLuminance(probeOut, width, height);
+        if (res.evaluated) {
+          return res;
+        }
+      } catch (_) {
+        // Probe failures must not crash presentation.
+      }
+    }
+
+    return { evaluated: false, visible: false, maxLuma: 0 };
+  }
+
   _beginSubsystemsForFrame(frameIndex) {
+    this._frameStartMs = this._getNowMs();
     if (
       this.stagingPool &&
       !this.stagingPool._destroyed &&
@@ -4146,19 +4688,25 @@ class WgpuCommandProcessor {
     ) {
       this.stagingPool.beginFrame(frameIndex);
     }
-    if (
-      this.uniformRing &&
-      !this.uniformRing._destroyed &&
-      typeof this.uniformRing.beginFrame === 'function'
-    ) {
-      this.uniformRing.beginFrame(frameIndex);
-    }
+    this._advanceUniformRingForFrame(frameIndex);
     if (
       this.passTimer &&
       !this.passTimer.isDestroyed &&
       typeof this.passTimer.beginFrame === 'function'
     ) {
       this.passTimer.beginFrame();
+    }
+    if (
+      this.gpuRecorder &&
+      typeof this.gpuRecorder.isSpikeTriggerEnabled === 'function' &&
+      this.gpuRecorder.isSpikeTriggerEnabled() &&
+      typeof this.gpuRecorder.beginFrame === 'function'
+    ) {
+      try {
+        this.gpuRecorder.beginFrame();
+      } catch (_) {
+        // Recorder telemetry must never break frame begin.
+      }
     }
     if (
       this.resourceRegistry &&
@@ -4196,6 +4744,21 @@ class WgpuCommandProcessor {
       this.stagingPool.endFrame();
     }
     if (
+      this.uniformRing &&
+      !this.uniformRing._destroyed &&
+      typeof this.uniformRing.endFrame === 'function'
+    ) {
+      try {
+        if (workDoneFence && typeof workDoneFence.then === 'function') {
+          this.uniformRing.endFrame({ fence: workDoneFence });
+        } else {
+          this.uniformRing.endFrame();
+        }
+      } catch (_) {
+        // UniformRing endFrame errors must not break presentation.
+      }
+    }
+    if (
       this.resourceRegistry &&
       typeof this.resourceRegistry.endFrame === 'function'
     ) {
@@ -4208,14 +4771,16 @@ class WgpuCommandProcessor {
     ) {
       this.rtPool.endFrame();
     }
-    if (
+    const hints = frameHints && typeof frameHints === 'object' ? frameHints : null;
+    if (hints && (hints.sceneTransition || hints.resolutionChanged)) {
+      this.trimTransientMemory({ maxIdleFrames: this._oversizedRtReclaimIdleFrames });
+    } else if (
       this.rtPool &&
       !this.rtPool.isDestroyed &&
       typeof this.rtPool.reclaimOversizedIdle === 'function'
     ) {
-      const hints = frameHints && typeof frameHints === 'object' ? frameHints : null;
       const shouldReclaim = Boolean(
-        (hints && (hints.sceneTransition || hints.resolutionChanged || hints.isIdleFrame)) ||
+        (hints && hints.isIdleFrame) ||
           (this.frameCount > 0 &&
             this.frameCount % this._oversizedRtReclaimIntervalFrames === 0)
       );
@@ -5108,6 +5673,7 @@ class WgpuCommandProcessor {
         );
       }
     }
+    this._uniformRingFrameIndex = -1;
   }
 
   /**
@@ -5960,15 +6526,127 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * W285: Mark an explicit scene transition (e.g. Intro Video -> Main Menu -> In-Game)
-   * and immediately reclaim idle oversized render targets from RenderTargetPool.
+   * W332 / W319 / W285: Soft memory pressure & scene-transition transient memory trim.
+   * Safely trims oversized idle staging slabs via `stagingPool.trimForSceneTransition?.()`
+   * and reclaims unused / oversized idle render targets via `rtPool.reclaimUnused?.()` or
+   * `rtPool.reclaimOversizedIdle?.()`, returning combined and per-subsystem reclaimed stats.
+   *
+   * @param {number | { maxIdleFrames?: number, stagingOptions?: object }} [options]
+   * @returns {{
+   *   reclaimedCount: number,
+   *   reclaimedBytes: number,
+   *   stagingReclaimedSlabs: number,
+   *   stagingReclaimedBytes: number,
+   *   rtReclaimedCount: number,
+   *   rtReclaimedBytes: number,
+   * }}
+   */
+  trimTransientMemory(options = {}) {
+    if (this._destroyed) {
+      return {
+        reclaimedCount: 0,
+        reclaimedBytes: 0,
+        stagingReclaimedSlabs: 0,
+        stagingReclaimedBytes: 0,
+        rtReclaimedCount: 0,
+        rtReclaimedBytes: 0,
+      };
+    }
+
+    const opts =
+      options && typeof options === 'object'
+        ? options
+        : typeof options === 'number' && Number.isFinite(options) && options >= 0
+          ? { maxIdleFrames: Math.floor(options) }
+          : {};
+    const maxIdleFrames =
+      opts.maxIdleFrames !== undefined &&
+      typeof opts.maxIdleFrames === 'number' &&
+      Number.isFinite(opts.maxIdleFrames) &&
+      opts.maxIdleFrames >= 0
+        ? Math.floor(opts.maxIdleFrames)
+        : this._oversizedRtReclaimIdleFrames;
+
+    let stagingReclaimedSlabs = 0;
+    let stagingReclaimedBytes = 0;
+    if (
+      this.stagingPool &&
+      !this.stagingPool._destroyed &&
+      typeof this.stagingPool.trimForSceneTransition === 'function'
+    ) {
+      try {
+        const trimRes =
+          opts.stagingOptions && typeof opts.stagingOptions === 'object'
+            ? this.stagingPool.trimForSceneTransition(opts.stagingOptions)
+            : this.stagingPool.trimForSceneTransition();
+        stagingReclaimedSlabs = toNonNegativeInt(
+          trimRes &&
+            (trimRes.reclaimedSlabs !== undefined ? trimRes.reclaimedSlabs : trimRes.reclaimedCount),
+          0
+        );
+        stagingReclaimedBytes = toNonNegativeInt(trimRes && trimRes.reclaimedBytes, 0);
+        if (stagingReclaimedBytes > 0) {
+          this._stagingSceneTransitionTrimBytes += stagingReclaimedBytes;
+        }
+      } catch (_) {
+        // Staging pool trim errors must never break scene transitions.
+      }
+    }
+
+    let rtReclaimedCount = 0;
+    let rtReclaimedBytes = 0;
+    if (this.rtPool && !this.rtPool.isDestroyed) {
+      if (typeof this.rtPool.reclaimUnused === 'function') {
+        try {
+          const rtRes = this.rtPool.reclaimUnused(maxIdleFrames);
+          rtReclaimedCount = toNonNegativeInt(
+            rtRes && (rtRes.reclaimedCount !== undefined ? rtRes.reclaimedCount : rtRes.evictedCount),
+            0
+          );
+          rtReclaimedBytes = toNonNegativeInt(
+            rtRes && (rtRes.reclaimedBytes !== undefined ? rtRes.reclaimedBytes : rtRes.evictedBytes),
+            0
+          );
+          if (rtReclaimedBytes > 0) {
+            this._reclaimedOversizedBytes += rtReclaimedBytes;
+          }
+        } catch (_) {
+          // RT pool reclaimUnused errors must never break scene transitions.
+        }
+      } else if (typeof this.rtPool.reclaimOversizedIdle === 'function') {
+        const rtRes = this.reclaimOversizedRenderTargets(maxIdleFrames);
+        rtReclaimedCount = rtRes.reclaimedCount;
+        rtReclaimedBytes = rtRes.reclaimedBytes;
+      }
+    }
+
+    return {
+      reclaimedCount: rtReclaimedCount + stagingReclaimedSlabs,
+      reclaimedBytes: rtReclaimedBytes + stagingReclaimedBytes,
+      stagingReclaimedSlabs,
+      stagingReclaimedBytes,
+      rtReclaimedCount,
+      rtReclaimedBytes,
+    };
+  }
+
+  /**
+   * W285 / W332: Mark an explicit scene transition (e.g. Intro Video -> Main Menu -> In-Game)
+   * and immediately trim transient staging slabs & idle oversized render targets.
    *
    * @param {number} [maxIdleFrames=2]
-   * @returns {{ reclaimedCount: number, reclaimedBytes: number }}
+   * @returns {{
+   *   reclaimedCount: number,
+   *   reclaimedBytes: number,
+   *   stagingReclaimedSlabs: number,
+   *   stagingReclaimedBytes: number,
+   *   rtReclaimedCount: number,
+   *   rtReclaimedBytes: number,
+   * }}
    */
   notifySceneTransition(maxIdleFrames = this._oversizedRtReclaimIdleFrames) {
     this._pendingSceneTransition = true;
-    return this.reclaimOversizedRenderTargets(maxIdleFrames);
+    return this.trimTransientMemory({ maxIdleFrames });
   }
 
   _resolveShaderReflection(shaderId, shaderEntry, stageName) {
@@ -8239,12 +8917,12 @@ class WgpuCommandProcessor {
       presentIsIdleFrame = summary.drawsThisFrame === 0;
 
       let swapchainReportedFirstVisible = false;
+      let markResult = null;
       if (activeSwapchain && typeof activeSwapchain.markFrameContent === 'function') {
         const prevSwapVisible = Boolean(
           activeSwapchain.hasFirstVisibleFrame === true ||
             activeSwapchain.hasVisibleContent === true
         );
-        let markResult = null;
         try {
           markResult = activeSwapchain.markFrameContent({
             hasNonClearDraw: summary.hasNonClearDraw,
@@ -8293,34 +8971,79 @@ class WgpuCommandProcessor {
         (summary.hasNonClearDraw || swapchainReportedFirstVisible) &&
         !this._firstVisibleFrameNotified
       ) {
-        const firstVisibleFrameMs =
-          activeSwapchain &&
-          typeof activeSwapchain.firstVisibleFrameMs === 'number' &&
-          Number.isFinite(activeSwapchain.firstVisibleFrameMs)
-            ? activeSwapchain.firstVisibleFrameMs
-            : activeSwapchain &&
-                typeof activeSwapchain.firstVisiblePresentMs === 'number' &&
-                Number.isFinite(activeSwapchain.firstVisiblePresentMs)
-              ? activeSwapchain.firstVisiblePresentMs
-              : presentTs;
-        const firstPresentMs =
-          this._firstPresentMs !== null ? this._firstPresentMs : firstVisibleFrameMs;
-        const blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
-        this._firstVisibleFrameMs = firstVisibleFrameMs;
-        this._blackLoadingMs = blackLoadingMs;
-        this._notifyFirstVisibleFrame({
-          type: 'first-visible-frame',
-          firstVisibleFrame: true,
-          firstVisibleFrameMs,
-          firstPresentMs,
-          blackLoadingMs,
-          presentCount: this._presentCount,
-          realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
-          fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
-          drawsThisFrame: summary.drawsThisFrame,
-          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
-        });
+        let allowVisibleEmit = true;
+        let sampledMaxLuma = null;
+        if (this._requireNonBlackFrame) {
+          const gate = this._evaluateCommandBufferNonBlackGate(
+            markResult,
+            activeSwapchain,
+            curWidth,
+            curHeight,
+            summary
+          );
+          if (gate.evaluated) {
+            this._lastSampledMaxLuma = Math.max(0, Math.min(255, Math.floor(gate.maxLuma || 0)));
+            sampledMaxLuma = this._lastSampledMaxLuma;
+          }
+          if (!gate.visible) {
+            allowVisibleEmit = false;
+            this._suppressedBlackFrames += 1;
+          }
+        }
+        if (allowVisibleEmit) {
+          const firstVisibleFrameMs =
+            activeSwapchain &&
+            typeof activeSwapchain.firstVisibleFrameMs === 'number' &&
+            Number.isFinite(activeSwapchain.firstVisibleFrameMs)
+              ? activeSwapchain.firstVisibleFrameMs
+              : activeSwapchain &&
+                  typeof activeSwapchain.firstVisiblePresentMs === 'number' &&
+                  Number.isFinite(activeSwapchain.firstVisiblePresentMs)
+                ? activeSwapchain.firstVisiblePresentMs
+                : presentTs;
+          const firstPresentMs =
+            this._firstPresentMs !== null ? this._firstPresentMs : firstVisibleFrameMs;
+          const blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
+          this._firstVisibleFrameMs = firstVisibleFrameMs;
+          this._blackLoadingMs = blackLoadingMs;
+          const visiblePayload = {
+            type: 'first-visible-frame',
+            firstVisibleFrame: true,
+            firstVisibleFrameMs,
+            firstPresentMs,
+            blackLoadingMs,
+            presentCount: this._presentCount,
+            realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
+            fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
+            drawsThisFrame: summary.drawsThisFrame,
+            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+          };
+          if (this._requireNonBlackFrame) {
+            visiblePayload.maxLuma =
+              sampledMaxLuma !== null ? sampledMaxLuma : this._lastSampledMaxLuma;
+            visiblePayload.suppressedBlackFrames = this._suppressedBlackFrames;
+          }
+          this._notifyFirstVisibleFrame(visiblePayload);
+        }
       }
+
+      if (
+        this.gpuRecorder &&
+        typeof this.gpuRecorder.isSpikeTriggerEnabled === 'function' &&
+        this.gpuRecorder.isSpikeTriggerEnabled() &&
+        typeof this.gpuRecorder.endFrame === 'function'
+      ) {
+        try {
+          const frameDurationMs =
+            typeof this._frameStartMs === 'number' && Number.isFinite(this._frameStartMs)
+              ? Math.max(0, presentTs - this._frameStartMs)
+              : 0;
+          this.gpuRecorder.endFrame(frameDurationMs);
+        } catch (_) {
+          // Recorder spike auto-capture errors must never break presentation.
+        }
+      }
+      this._frameStartMs = null;
     }
 
     const workDoneFence = submitted ? this._getWorkDoneFence() : null;
@@ -8329,6 +9052,10 @@ class WgpuCommandProcessor {
       resolutionChanged: presentResolutionChanged,
       isIdleFrame: presentIsIdleFrame,
     });
+
+    if (submitted) {
+      this._advanceUniformRingForFrame(this.frameCount);
+    }
 
     if (
       submitted &&
@@ -8749,6 +9476,8 @@ class WgpuCommandProcessor {
     const passTimer = passTimerBase
       ? { ...passTimerBase, lastTimings: lastPassTimings }
       : null;
+    const gpuTimer = resolveGpuTimerTelemetry(this, { passTimer });
+    const gpuRecorder = resolveGpuRecorderTelemetry(this, null);
     const resourceRegistry =
       this.resourceRegistry && typeof this.resourceRegistry.getStats === 'function'
         ? this.resourceRegistry.getStats()
@@ -8895,6 +9624,9 @@ class WgpuCommandProcessor {
       firstVisibleFrame: this._firstVisibleFrameNotified,
       firstVisibleFrameMs: this._firstVisibleFrameMs,
       blackLoadingMs: this._blackLoadingMs,
+      requireNonBlackFrame: this._requireNonBlackFrame,
+      suppressedBlackFrames: this._suppressedBlackFrames,
+      lastSampledMaxLuma: this._lastSampledMaxLuma,
       gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
       chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
@@ -8919,6 +9651,8 @@ class WgpuCommandProcessor {
       stagingPool,
       uniformRing,
       passTimer,
+      gpuTimer,
+      gpuRecorder,
       lastPassTimings,
       resourceRegistry,
       vramBytes: resourceRegistry ? resourceRegistry.totalBytes : 0,
@@ -9076,6 +9810,20 @@ class WgpuCommandProcessor {
     if (this.passTimer && typeof this.passTimer.destroy === 'function') {
       this.passTimer.destroy();
     }
+    if (
+      this.gpuRecorder &&
+      this._ownsGpuRecorder &&
+      typeof this.gpuRecorder.stop === 'function'
+    ) {
+      try {
+        this.gpuRecorder.stop();
+      } catch (_) {
+        // Ignore recorder stop errors during teardown.
+      }
+    }
+    this._uniformRingFrameIndex = -1;
+    this._pendingFrameLuminance = null;
+    this._frameStartMs = null;
     if (this.rtPool && typeof this.rtPool.destroy === 'function') {
       this.rtPool.destroy();
     }
@@ -9516,6 +10264,126 @@ function resolve30FpsTelemetry(processor, stats) {
   };
 }
 
+/**
+ * W332 / W324: Extract and sanitize GpuPassTimer 30 FPS per-pass histogram summary
+ * (zero host paths, bounded pass labels, finite non-negative numbers).
+ */
+function resolveGpuTimerTelemetry(processor, stats) {
+  const proc = processor && typeof processor === 'object' ? processor : null;
+  const st = stats && typeof stats === 'object' ? stats : null;
+  const timerObj = (proc && (proc.passTimer || proc.gpuTimer)) || null;
+  const rawFromObj = timerObj ? readOptionalStatsObject(timerObj) : null;
+  const rawFromStats =
+    (st && st.gpuTimer && typeof st.gpuTimer === 'object' ? st.gpuTimer : null) ||
+    (st && st.passTimer && typeof st.passTimer === 'object' ? st.passTimer : null);
+  const raw = rawFromObj || rawFromStats;
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  let rawPassStats = raw.passStats && typeof raw.passStats === 'object' ? raw.passStats : null;
+  if (!rawPassStats && timerObj && typeof timerObj.getPassStats === 'function') {
+    try {
+      const ps = timerObj.getPassStats();
+      if (ps && typeof ps === 'object') {
+        rawPassStats = ps;
+      }
+    } catch (_) {
+      rawPassStats = null;
+    }
+  }
+
+  const passStats = {};
+  if (rawPassStats) {
+    const keys = Object.keys(rawPassStats);
+    for (let i = 0; i < keys.length; i += 1) {
+      const cleanLabel = sanitizeGpuAdapterField(keys[i]) || `pass_${i}`;
+      const entry = rawPassStats[keys[i]];
+      if (!entry || typeof entry !== 'object') {
+        continue;
+      }
+      passStats[cleanLabel] = {
+        count: toNonNegativeInt(entry.count, 0),
+        lastMs: toNonNegativeFinite(entry.lastMs) ?? 0,
+        avgMs: toNonNegativeFinite(entry.avgMs) ?? 0,
+        p50Ms: toNonNegativeFinite(entry.p50Ms) ?? 0,
+        p95Ms: toNonNegativeFinite(entry.p95Ms) ?? 0,
+        maxMs: toNonNegativeFinite(entry.maxMs) ?? 0,
+        passesOverBudget: toNonNegativeInt(entry.passesOverBudget, 0),
+      };
+    }
+  }
+
+  const passBudgetMs = toNonNegativeFinite(raw.passBudgetMs);
+  return {
+    supported: Boolean(raw.supported),
+    resolvedFrames: toNonNegativeInt(raw.resolvedFrames, 0),
+    skippedFrames: toNonNegativeInt(raw.skippedFrames, 0),
+    droppedPasses: toNonNegativeInt(raw.droppedPasses, 0),
+    droppedQueryFrames: toNonNegativeInt(raw.droppedQueryFrames, 0),
+    lastFrameGpuMs: toNonNegativeFinite(raw.lastFrameGpuMs) ?? 0,
+    p50PassMs: toNonNegativeFinite(raw.p50PassMs) ?? 0,
+    p95PassMs: toNonNegativeFinite(raw.p95PassMs) ?? 0,
+    maxPassMs: toNonNegativeFinite(raw.maxPassMs) ?? 0,
+    passBudgetMs: passBudgetMs !== null && passBudgetMs > 0 ? passBudgetMs : 33.333,
+    passesOverBudget: toNonNegativeInt(raw.passesOverBudget, 0),
+    querySlotRecycles: toNonNegativeInt(raw.querySlotRecycles, 0),
+    querySlotWraps: toNonNegativeInt(raw.querySlotWraps, 0),
+    passStats,
+  };
+}
+
+/**
+ * W332 / W325: Extract and sanitize GpuFrameRecorder 30 FPS spike auto-capture state
+ * (zero raw command buffers, zero host paths).
+ */
+function resolveGpuRecorderTelemetry(processor, stats) {
+  const proc = processor && typeof processor === 'object' ? processor : null;
+  const st = stats && typeof stats === 'object' ? stats : null;
+  const recorderObj = (proc && (proc.gpuRecorder || proc.recorder)) || null;
+  const rawFromObj = recorderObj ? readOptionalStatsObject(recorderObj) : null;
+  const rawFromStats =
+    st && st.gpuRecorder && typeof st.gpuRecorder === 'object' ? st.gpuRecorder : null;
+  const raw = rawFromObj || rawFromStats;
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  let spikeTriggerEnabled = Boolean(raw.spikeTriggerEnabled === true);
+  if (
+    raw.spikeTriggerEnabled === undefined &&
+    recorderObj &&
+    typeof recorderObj.isSpikeTriggerEnabled === 'function'
+  ) {
+    try {
+      spikeTriggerEnabled = Boolean(recorderObj.isSpikeTriggerEnabled());
+    } catch (_) {
+      spikeTriggerEnabled = false;
+    }
+  }
+
+  const spikeBudgetMs = toNonNegativeFinite(raw.spikeBudgetMs);
+  return {
+    recording: Boolean(raw.recording === true),
+    frameCount: toNonNegativeInt(raw.frameCount, 0),
+    recordedBytes: toNonNegativeInt(
+      raw.recordedBytes !== undefined ? raw.recordedBytes : raw.totalBytes,
+      0
+    ),
+    peakRecordedBytes: toNonNegativeInt(raw.peakRecordedBytes, 0),
+    recordedPackets: toNonNegativeInt(
+      raw.recordedPackets !== undefined ? raw.recordedPackets : raw.totalPackets,
+      0
+    ),
+    spikeTriggerEnabled,
+    spikeBudgetMs: spikeBudgetMs !== null && spikeBudgetMs > 0 ? spikeBudgetMs : 33.333,
+    spikeMaxSnapshots: toNonNegativeInt(raw.spikeMaxSnapshots, 0),
+    spikeSnapshotsCaptured: toNonNegativeInt(raw.spikeSnapshotsCaptured, 0),
+    lastSpikeFrameMs: toNonNegativeFinite(raw.lastSpikeFrameMs) ?? 0,
+    bypassedPackets: toNonNegativeInt(raw.bypassedPackets, 0),
+  };
+}
+
 function sanitizeTelemetryStage(stage) {
   if (typeof stage === 'number') {
     return WGPK_STAGE_NAMES[stage] || 'unknown';
@@ -9818,6 +10686,15 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     snapshot.zeroAllocDrains = perf30Fps.zeroAllocDrains;
     snapshot.reclaimedOversizedBytes = perf30Fps.reclaimedOversizedBytes;
     snapshot.pipelineCacheStats = perf30Fps.pipelineCacheStats;
+    // W332: Surface W324 GpuPassTimer 30 FPS histogram & W325 GpuFrameRecorder spike state when active.
+    const gpuTimer = resolveGpuTimerTelemetry(processor, stats);
+    if (gpuTimer !== null) {
+      snapshot.gpuTimer = gpuTimer;
+    }
+    const gpuRecorder = resolveGpuRecorderTelemetry(processor, stats);
+    if (gpuRecorder !== null) {
+      snapshot.gpuRecorder = gpuRecorder;
+    }
   }
   return snapshot;
 }
@@ -10470,6 +11347,18 @@ function createWgpuWorkerHandler(options = {}) {
           ? sanitizeGpuAdapterInfo(info.gpuAdapter)
           : getActiveGpuAdapter(),
     };
+    if (typeof info.source === 'string' && info.source.length > 0) {
+      payload.source = info.source;
+    }
+    if (typeof info.maxLuma === 'number' && Number.isFinite(info.maxLuma)) {
+      payload.maxLuma = Math.max(0, Math.min(255, Math.floor(info.maxLuma)));
+    }
+    if (
+      typeof info.suppressedBlackFrames === 'number' &&
+      Number.isFinite(info.suppressedBlackFrames)
+    ) {
+      payload.suppressedBlackFrames = toNonNegativeInt(info.suppressedBlackFrames, 0);
+    }
     postMessage(payload);
     if (onFirstVisibleFrame) {
       try {
@@ -11181,10 +12070,29 @@ function createWgpuWorkerHandler(options = {}) {
       GpuRingBuffer: injectedRingCtor,
       stagingPool: options.stagingPool,
       uniformRing: options.uniformRing,
-      passTimer: options.passTimer,
+      passTimer: options.passTimer ?? options.gpuTimer,
+      gpuTimer: options.gpuTimer,
+      passTimerOptions: initPayload.passTimerOptions ?? options.passTimerOptions ?? initPayload.gpuTimerOptions ?? options.gpuTimerOptions,
+      gpuRecorder: initPayload.gpuRecorder ?? options.gpuRecorder,
+      GpuFrameRecorder:
+        initPayload.GpuFrameRecorder !== undefined
+          ? initPayload.GpuFrameRecorder
+          : options.GpuFrameRecorder,
+      gpuRecorderOptions: initPayload.gpuRecorderOptions ?? options.gpuRecorderOptions,
       reflectionRegistry: options.reflectionRegistry,
       resourceRegistry: options.resourceRegistry,
       rtPool: options.rtPool,
+      requireNonBlackFrame:
+        initPayload.requireNonBlackFrame !== undefined
+          ? initPayload.requireNonBlackFrame
+          : options.requireNonBlackFrame,
+      minVisibleLuma: initPayload.minVisibleLuma ?? options.minVisibleLuma,
+      minVisiblePixels: initPayload.minVisiblePixels ?? options.minVisiblePixels,
+      nonBlackPixelProbe:
+        initPayload.nonBlackPixelProbe ??
+        options.nonBlackPixelProbe ??
+        initPayload.pixelProbe ??
+        options.pixelProbe,
       pipelineCache: initPayload.pipelineCache ?? options.pipelineCache,
       enablePipelineCache:
         initPayload.enablePipelineCache ?? options.enablePipelineCache,
@@ -11235,8 +12143,22 @@ function createWgpuWorkerHandler(options = {}) {
           ? initPayload.SplashFrameBridge
           : options.SplashFrameBridge,
       binkPresenterOptions: buildMergedBinkPresenterOptions(
-        options.binkPresenterOptions,
-        initPayload.binkPresenterOptions
+        {
+          ...(options.binkPresenterOptions || {}),
+          ...(options.enableTripleBuffering !== undefined &&
+          (!options.binkPresenterOptions ||
+            options.binkPresenterOptions.enableTripleBuffering === undefined)
+            ? { enableTripleBuffering: Boolean(options.enableTripleBuffering) }
+            : {}),
+        },
+        {
+          ...(initPayload.binkPresenterOptions || {}),
+          ...(initPayload.enableTripleBuffering !== undefined &&
+          (!initPayload.binkPresenterOptions ||
+            initPayload.binkPresenterOptions.enableTripleBuffering === undefined)
+            ? { enableTripleBuffering: Boolean(initPayload.enableTripleBuffering) }
+            : {}),
+        }
       ),
       binkChromaOrder:
         initPayload.binkChromaOrder ??
@@ -11255,7 +12177,12 @@ function createWgpuWorkerHandler(options = {}) {
         options.splashBridgeOptions,
       enableStagingPool: initPayload.enableStagingPool ?? options.enableStagingPool,
       enableUniformRing: initPayload.enableUniformRing ?? options.enableUniformRing,
-      enablePassTimer: initPayload.enablePassTimer ?? options.enablePassTimer,
+      enablePassTimer:
+        initPayload.enablePassTimer ??
+        initPayload.enableGpuTimer ??
+        options.enablePassTimer ??
+        options.enableGpuTimer,
+      enableGpuRecorder: initPayload.enableGpuRecorder ?? options.enableGpuRecorder,
       enableReflectionRegistry:
         initPayload.enableReflectionRegistry ?? options.enableReflectionRegistry,
       enableResourceRegistry:
@@ -11493,6 +12420,8 @@ function createWgpuWorkerHandler(options = {}) {
             chunkedWriteBufferUploads: stats
               ? toNonNegativeInt(stats.chunkedWriteBufferUploads, 0)
               : 0,
+            gpuTimer: resolveGpuTimerTelemetry(processor, stats),
+            gpuRecorder: resolveGpuRecorderTelemetry(processor, stats),
             ...resolve30FpsTelemetry(processor, stats),
           };
           if (payload.id !== undefined) {
@@ -11510,18 +12439,69 @@ function createWgpuWorkerHandler(options = {}) {
         const reclaimed =
           typeof processor.notifySceneTransition === 'function'
             ? processor.notifySceneTransition(payload.maxIdleFrames)
-            : { reclaimedCount: 0, reclaimedBytes: 0 };
+            : typeof processor.trimTransientMemory === 'function'
+              ? processor.trimTransientMemory(payload)
+              : {
+                  reclaimedCount: 0,
+                  reclaimedBytes: 0,
+                  stagingReclaimedSlabs: 0,
+                  stagingReclaimedBytes: 0,
+                  rtReclaimedCount: 0,
+                  rtReclaimedBytes: 0,
+                };
         if (payload.id !== undefined || payload.type === 'scene-transition') {
           const reply = {
             type: 'scene-transition',
             reclaimedCount: toNonNegativeInt(reclaimed && reclaimed.reclaimedCount, 0),
             reclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.reclaimedBytes, 0),
+            stagingReclaimedSlabs: toNonNegativeInt(
+              reclaimed && reclaimed.stagingReclaimedSlabs,
+              0
+            ),
+            stagingReclaimedBytes: toNonNegativeInt(
+              reclaimed && reclaimed.stagingReclaimedBytes,
+              0
+            ),
+            rtReclaimedCount: toNonNegativeInt(reclaimed && reclaimed.rtReclaimedCount, 0),
+            rtReclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.rtReclaimedBytes, 0),
           };
           if (payload.id !== undefined) {
             reply.id = payload.id;
           }
           postMessage(reply);
         }
+      } else if (
+        (payload.type === 'trim-transient-memory' ||
+          payload.type === 'memory-pressure' ||
+          payload.trimTransientMemory) &&
+        processor
+      ) {
+        const reclaimed =
+          typeof processor.trimTransientMemory === 'function'
+            ? processor.trimTransientMemory(payload)
+            : typeof processor.notifySceneTransition === 'function'
+              ? processor.notifySceneTransition(payload.maxIdleFrames)
+              : {
+                  reclaimedCount: 0,
+                  reclaimedBytes: 0,
+                  stagingReclaimedSlabs: 0,
+                  stagingReclaimedBytes: 0,
+                  rtReclaimedCount: 0,
+                  rtReclaimedBytes: 0,
+                };
+        const reply = {
+          type: payload.type || 'trim-transient-memory',
+          reclaimedCount: toNonNegativeInt(reclaimed && reclaimed.reclaimedCount, 0),
+          reclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.reclaimedBytes, 0),
+          stagingReclaimedSlabs: toNonNegativeInt(reclaimed && reclaimed.stagingReclaimedSlabs, 0),
+          stagingReclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.stagingReclaimedBytes, 0),
+          rtReclaimedCount: toNonNegativeInt(reclaimed && reclaimed.rtReclaimedCount, 0),
+          rtReclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.rtReclaimedBytes, 0),
+        };
+        if (payload.id !== undefined) {
+          reply.id = payload.id;
+        }
+        postMessage(reply);
       } else if (payload.type === 'present-splash-frame' || payload.type === 'bink-frame') {
         const framePayload =
           payload.frame && typeof payload.frame === 'object' ? payload.frame : payload;
@@ -11709,6 +12689,14 @@ function createWgpuWorkerHandler(options = {}) {
       ) {
         const batchBuffer =
           payload.cmdBuffer || payload.buffer || payload.commands || payload.data;
+        if (
+          (payload.frameLuminance !== undefined || payload.luminance !== undefined) &&
+          typeof processor.setFrameLuminanceMeta === 'function'
+        ) {
+          processor.setFrameLuminanceMeta(
+            payload.frameLuminance !== undefined ? payload.frameLuminance : payload.luminance
+          );
+        }
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
@@ -11750,6 +12738,7 @@ const exportedApi = {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
   buildGpuTelemetrySnapshot,
+  buildMergedBinkPresenterOptions,
   selectSupportedAdapterFeatures,
   OPTIONAL_ADAPTER_FEATURES,
   selectSupportedAdapterLimits,

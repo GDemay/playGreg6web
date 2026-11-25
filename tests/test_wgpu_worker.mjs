@@ -1940,3 +1940,543 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
   );
   assert.deepEqual(throwing.renderStateStats, zeroCounters);
 });
+
+test('W332 buildMergedBinkPresenterOptions defaults enableTripleBuffering: true unless explicitly false (W316)', async () => {
+  const { buildMergedBinkPresenterOptions } = wgpuMod;
+  const { BinkVideoPresenter } = require('../web/workers/bink_presenter.js');
+  assert.equal(typeof buildMergedBinkPresenterOptions, 'function');
+
+  // Default behavior: enableTripleBuffering defaults to true.
+  assert.deepEqual(buildMergedBinkPresenterOptions(null, null), { enableTripleBuffering: true });
+  assert.deepEqual(buildMergedBinkPresenterOptions({}, undefined), { enableTripleBuffering: true });
+  assert.deepEqual(buildMergedBinkPresenterOptions({ chromaOrder: 'YVU' }, null), {
+    chromaOrder: 'yvu',
+    enableTripleBuffering: true,
+  });
+
+  // Explicit false in base or extra options is preserved.
+  assert.equal(
+    buildMergedBinkPresenterOptions({ enableTripleBuffering: false }, null).enableTripleBuffering,
+    false
+  );
+  assert.equal(
+    buildMergedBinkPresenterOptions({ enableTripleBuffering: true }, { enableTripleBuffering: false })
+      .enableTripleBuffering,
+    false
+  );
+  assert.equal(
+    buildMergedBinkPresenterOptions({ enableTripleBuffering: false }, { enableTripleBuffering: true })
+      .enableTripleBuffering,
+    true
+  );
+
+  // Live WgpuCommandProcessor constructs BinkVideoPresenter with 3-slot triple buffering by default.
+  const makePresenterMockDevice = () => {
+    const base = createMockWebGpu();
+    base.device.createBindGroupLayout = (desc) => ({ kind: 'GPUBindGroupLayout', desc });
+    base.device.createPipelineLayout = (desc) => ({ kind: 'GPUPipelineLayout', desc });
+    return base;
+  };
+  const envDefault = makePresenterMockDevice();
+  const procDefault = new WgpuCommandProcessor(envDefault.device, envDefault.ctx, {
+    enableSplashBridge: true,
+    BinkVideoPresenter,
+  });
+  assert.ok(procDefault.binkPresenter instanceof BinkVideoPresenter);
+  assert.equal(procDefault.binkPresenter.planeRingDepth, 3);
+  procDefault.destroy();
+
+  // Explicit enableTripleBuffering: false falls back to double-buffered 2-slot ring.
+  const envOptOut = makePresenterMockDevice();
+  const procOptOut = new WgpuCommandProcessor(envOptOut.device, envOptOut.ctx, {
+    enableSplashBridge: true,
+    BinkVideoPresenter,
+    binkPresenterOptions: { enableTripleBuffering: false },
+  });
+  assert.equal(procOptOut.binkPresenter.planeRingDepth, 2);
+  procOptOut.destroy();
+
+  // Worker init also honors explicit enableTripleBuffering: false.
+  const envWorker = makePresenterMockDevice();
+  const { canvas } = createMockOffscreenCanvas(envWorker.ctx);
+  const posted = [];
+  const mockGpu = {
+    async requestAdapter() {
+      return {
+        info: { vendor: 'mock', architecture: 'w332' },
+        async requestDevice() {
+          return envWorker.device;
+        },
+      };
+    },
+    getPreferredCanvasFormat() {
+      return 'bgra8unorm';
+    },
+  };
+  const handler = createWgpuWorkerHandler({
+    postMessage: (m) => posted.push(m),
+    enableSwapchain: false,
+  });
+  await withMockNavigatorGpu(mockGpu, async () => {
+    await handler.handleMessage({
+      init: true,
+      canvas,
+      width: 640,
+      height: 360,
+      enableSplashBridge: true,
+      enableTripleBuffering: false,
+    });
+  });
+  assert.equal(handler.processor.binkPresenter.planeRingDepth, 2);
+  handler.processor.destroy();
+});
+
+test('W332 active uniformRing advances frame slot cleanly on present with function guards (W314)', () => {
+  const { DynamicUniformRing } = require('../web/workers/uniform_ring.js');
+  const { device, ctx } = createMockWebGpu();
+  device.queue.onSubmittedWorkDone = () => Promise.resolve();
+
+  const uniformRing = new DynamicUniformRing({
+    device,
+    byteSize: 2048,
+    framesInFlight: 3,
+  });
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    uniformRing,
+  });
+
+  // Present without explicit BEGIN_FRAME still rotates slot cleanly (0 -> 1 -> 2 -> 0).
+  const presentOnly = new BinaryCommandBuilder().present().finish();
+  processor.execute(presentOnly);
+  assert.equal(uniformRing.getStats().slotIndex, 1);
+  assert.equal(uniformRing.getStats().frameIndex, 1);
+
+  processor.execute(presentOnly);
+  assert.equal(uniformRing.getStats().slotIndex, 2);
+  assert.equal(uniformRing.getStats().frameIndex, 2);
+
+  // Explicit BEGIN_FRAME matching already-advanced frameIndex must NOT double-rotate.
+  const rotationsBefore = uniformRing.getStats().partitionRotations;
+  const withBeginAndPresent = new BinaryCommandBuilder().beginFrame().present().finish();
+  processor.execute(withBeginAndPresent);
+  assert.equal(uniformRing.getStats().slotIndex, 0);
+  assert.equal(uniformRing.getStats().frameIndex, 3);
+  assert.equal(uniformRing.getStats().partitionRotations, rotationsBefore + 1);
+  processor.destroy();
+
+  // Custom mock exposing advanceFrame() + endFrame() is invoked safely.
+  const events = [];
+  const mockAdvanceRing = {
+    flush() {
+      events.push('flush');
+    },
+    endFrame() {
+      events.push('endFrame');
+    },
+    advanceFrame(frameIdx) {
+      events.push(`advanceFrame:${frameIdx}`);
+    },
+  };
+  const procMock = new WgpuCommandProcessor(device, ctx, { uniformRing: mockAdvanceRing });
+  procMock.execute(presentOnly);
+  assert.deepEqual(events, ['flush', 'endFrame', 'advanceFrame:1']);
+
+  // Partial mock lacking beginFrame/advanceFrame/endFrame/flush never throws.
+  const procBare = new WgpuCommandProcessor(device, ctx, { uniformRing: { custom: true } });
+  assert.doesNotThrow(() => procBare.execute(presentOnly));
+  assert.equal(procBare.frameCount, 1);
+});
+
+test('W332 trimTransientMemory trims StagingPool slabs (W319) and RT pool unused/oversized targets (W285)', async () => {
+  const { GpuStagingPool } = require('../web/workers/staging_pool.js');
+  const { RenderTargetPool } = require('../web/workers/rt_pool.js');
+  const { device, ctx } = createMockWebGpu();
+  device.queue.onSubmittedWorkDone = () => Promise.resolve();
+
+  // 1. Real GpuStagingPool + real RenderTargetPool via trimTransientMemory & scene-transition.
+  const stagingPool = new GpuStagingPool({
+    device,
+    chunkSize: 1024 * 1024, // 1 MiB standard chunk
+    maxPoolBytes: 64 * 1024 * 1024,
+    framesInFlight: 2,
+    mode: 'writeBuffer',
+  });
+  const rtPool = new RenderTargetPool({
+    device,
+    maxPoolBytes: 256 * 1024 * 1024,
+    idleFrameTtl: 16,
+  });
+
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    stagingPool,
+    rtPool,
+  });
+
+  // Allocate an oversized 4 MiB staging slab and recycle it across frames so it's idle.
+  stagingPool.beginFrame(0);
+  stagingPool.allocate(4 * 1024 * 1024);
+  stagingPool.endFrame();
+  stagingPool.beginFrame(1);
+  stagingPool.endFrame();
+  stagingPool.beginFrame(2);
+  stagingPool.endFrame();
+
+  // Acquire & release a 4K oversized render target (3840x2160 rgba8unorm = 33,177,600B) and age 2 frames.
+  const rt4kBytes = 3840 * 2160 * 4;
+  const rt4k = processor.acquireRenderTarget(
+    { width: 3840, height: 2160, format: 'rgba8unorm' },
+    'scene-4k'
+  );
+  processor.releaseRenderTarget(rt4k);
+  rtPool.endFrame();
+  rtPool.endFrame();
+
+  const trimmed = processor.trimTransientMemory();
+  assert.equal(trimmed.stagingReclaimedSlabs, 1);
+  assert.equal(trimmed.stagingReclaimedBytes, 4 * 1024 * 1024);
+  assert.equal(trimmed.rtReclaimedCount, 1);
+  assert.equal(trimmed.rtReclaimedBytes, rt4kBytes);
+  assert.equal(trimmed.reclaimedCount, 2);
+  assert.equal(trimmed.reclaimedBytes, 4 * 1024 * 1024 + rt4kBytes);
+  assert.equal(stagingPool.getStats().sceneTransitionTrimBytes, 4 * 1024 * 1024);
+  processor.destroy();
+
+  // 2. Mock rtPool exposing reclaimUnused() + mock stagingPool exposing trimForSceneTransition()
+  //    wired through worker memory-pressure & scene-transition messages.
+  let stagingTrimCalls = 0;
+  let rtReclaimUnusedCalls = 0;
+  const mockProc = new WgpuCommandProcessor(device, ctx, {
+    stagingPool: {
+      trimForSceneTransition() {
+        stagingTrimCalls += 1;
+        return { reclaimedSlabs: 2, reclaimedBytes: 8192 };
+      },
+    },
+    rtPool: {
+      reclaimUnused() {
+        rtReclaimUnusedCalls += 1;
+        return { reclaimedCount: 3, reclaimedBytes: 16384 };
+      },
+    },
+  });
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor: mockProc,
+    postMessage: (m) => posted.push(m),
+  });
+  await handler.handleMessage({ type: 'memory-pressure', id: 'mp-1' });
+  const mpReply = posted.find((m) => m.id === 'mp-1');
+  assert.ok(mpReply);
+  assert.equal(mpReply.type, 'memory-pressure');
+  assert.equal(mpReply.stagingReclaimedSlabs, 2);
+  assert.equal(mpReply.stagingReclaimedBytes, 8192);
+  assert.equal(mpReply.rtReclaimedCount, 3);
+  assert.equal(mpReply.rtReclaimedBytes, 16384);
+  assert.equal(mpReply.reclaimedCount, 5);
+  assert.equal(mpReply.reclaimedBytes, 24576);
+  assert.equal(stagingTrimCalls, 1);
+  assert.equal(rtReclaimUnusedCalls, 1);
+
+  // Throwing mocks never crash trimTransientMemory().
+  const throwingProc = new WgpuCommandProcessor(device, ctx, {
+    stagingPool: {
+      trimForSceneTransition() {
+        throw new Error('staging trim boom');
+      },
+    },
+    rtPool: {
+      reclaimUnused() {
+        throw new Error('rt reclaim boom');
+      },
+    },
+  });
+  assert.deepEqual(throwingProc.trimTransientMemory(), {
+    reclaimedCount: 0,
+    reclaimedBytes: 0,
+    stagingReclaimedSlabs: 0,
+    stagingReclaimedBytes: 0,
+    rtReclaimedCount: 0,
+    rtReclaimedBytes: 0,
+  });
+});
+
+test('W332 surfaces GpuPassTimer 30 FPS per-pass histogram (W324) and GpuFrameRecorder spike state (W325) in getStats & telemetry', async () => {
+  const { GpuPassTimer } = require('../web/workers/gpu_timer.js');
+  const { GpuFrameRecorder } = require('../web/workers/gpu_recorder.js');
+  const { device, ctx } = createMockWebGpu();
+
+  let fakeNow = 100;
+  const nowFn = () => fakeNow;
+
+  // CPU-mode GpuPassTimer (device without timestamp-query still records rolling 30 FPS pass histograms).
+  const gpuTimer = new GpuPassTimer({
+    device,
+    passBudgetMs: 33.333,
+    now: nowFn,
+  });
+  gpuTimer.beginFrame();
+  gpuTimer.beginPass('shadow_pass');
+  fakeNow = 112;
+  gpuTimer.endPass();
+  gpuTimer.beginPass('gbuffer_pass');
+  fakeNow = 152; // 40ms > 33.333ms budget
+  gpuTimer.endPass();
+  gpuTimer.endFrame();
+
+  // GpuFrameRecorder with 30 FPS spike auto-capture enabled.
+  const gpuRecorder = new GpuFrameRecorder({
+    maxFrames: 4,
+    maxRecordedBytes: 64 * 1024,
+    now: nowFn,
+  });
+  gpuRecorder.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 2 });
+
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    gpuTimer,
+    gpuRecorder,
+    now: nowFn,
+  });
+  assert.equal(processor.gpuTimer, gpuTimer);
+  assert.equal(processor.passTimer, gpuTimer);
+
+  // Attach recorder interceptor so chunks are staged during a frame.
+  const interceptor = gpuRecorder.createInterceptor(processor);
+  const frameStream = new BinaryCommandBuilder().beginFrame().clearColor(0.2, 0.4, 0.6, 1.0).present().finish();
+
+  // Frame 1: fast 16ms frame (under 33.333ms budget) -> NOT captured as spike.
+  fakeNow = 200;
+  processor.beginFrame(0);
+  fakeNow = 216;
+  processor.executeCommandBuffer(frameStream);
+  assert.equal(gpuRecorder.getStats().spikeSnapshotsCaptured, 0);
+
+  // Frame 2: slow 45ms frame (over 33.333ms budget) -> auto-captured as spike snapshot!
+  fakeNow = 300;
+  processor.beginFrame(1);
+  fakeNow = 345;
+  processor.executeCommandBuffer(frameStream);
+  assert.equal(gpuRecorder.getStats().spikeSnapshotsCaptured, 1);
+  assert.equal(gpuRecorder.getStats().lastSpikeFrameMs, 45);
+  interceptor.detach();
+
+  // Verify getStats() exposes sanitized gpuTimer + gpuRecorder summaries.
+  const stats = processor.getStats();
+  assert.ok(stats.gpuTimer);
+  assert.equal(stats.gpuTimer.passBudgetMs, 33.333);
+  assert.equal(stats.gpuTimer.passesOverBudget, 1);
+  assert.equal(stats.gpuTimer.maxPassMs, 40);
+  assert.ok(stats.gpuTimer.passStats.shadow_pass);
+  assert.equal(stats.gpuTimer.passStats.shadow_pass.lastMs, 12);
+  assert.ok(stats.gpuTimer.passStats.gbuffer_pass);
+  assert.equal(stats.gpuTimer.passStats.gbuffer_pass.passesOverBudget, 1);
+
+  assert.ok(stats.gpuRecorder);
+  assert.equal(stats.gpuRecorder.spikeTriggerEnabled, true);
+  assert.equal(stats.gpuRecorder.spikeBudgetMs, 33.333);
+  assert.equal(stats.gpuRecorder.spikeMaxSnapshots, 2);
+  assert.equal(stats.gpuRecorder.spikeSnapshotsCaptured, 1);
+  assert.equal(stats.gpuRecorder.lastSpikeFrameMs, 45);
+
+  // Verify buildGpuTelemetrySnapshot() & worker request-gpu-stats surface both when active.
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 500 });
+  assert.ok(snap.gpuTimer);
+  assert.equal(snap.gpuTimer.passesOverBudget, 1);
+  assert.equal(snap.gpuTimer.passStats.gbuffer_pass.maxMs, 40);
+  assert.ok(snap.gpuRecorder);
+  assert.equal(snap.gpuRecorder.spikeTriggerEnabled, true);
+  assert.equal(snap.gpuRecorder.spikeSnapshotsCaptured, 1);
+
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+  });
+  await handler.handleMessage({ type: 'request-gpu-stats', id: 'stats-w332' });
+  const statsReply = posted.find((m) => m.id === 'stats-w332' && m.type === 'gpu-stats');
+  assert.ok(statsReply);
+  assert.equal(statsReply.gpuTimer.passesOverBudget, 1);
+  assert.equal(statsReply.gpuRecorder.spikeSnapshotsCaptured, 1);
+
+  // Inactive processor omits gpuTimer & gpuRecorder from telemetry snapshot cleanly.
+  const bareProc = new WgpuCommandProcessor(device, ctx, { enablePassTimer: false });
+  assert.equal(bareProc.getStats().gpuTimer, null);
+  assert.equal(bareProc.getStats().gpuRecorder, null);
+  const bareSnap = buildGpuTelemetrySnapshot(bareProc, { timestamp: 600 });
+  assert.equal('gpuTimer' in bareSnap, false);
+  assert.equal('gpuRecorder' in bareSnap, false);
+  processor.destroy();
+});
+
+test('W332 optional requireNonBlackFrame gates first-visible-frame via W307 luminance check for command-buffer & Bink2 frames', async () => {
+  const { device, ctx } = createMockWebGpu();
+  device.createBindGroupLayout = (desc) => ({ kind: 'GPUBindGroupLayout', desc });
+  device.createPipelineLayout = (desc) => ({ kind: 'GPUPipelineLayout', desc });
+  const vsWgsl = '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }';
+
+  const buildDrawFrame = () =>
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createShaderModule(1, SHADER_STAGE.VERTEX, vsWgsl)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsWgsl)
+      .createRenderPipeline(3, 1, 2, 0)
+      .setPipeline(3)
+      .draw(3, 1, 0, 0)
+      .present()
+      .finish();
+
+  // 1. Default requireNonBlackFrame === false: backwards-compatible immediate emit on first draw.
+  {
+    const procDefault = new WgpuCommandProcessor(device, ctx);
+    assert.equal(procDefault.requireNonBlackFrame, false);
+    procDefault.execute(buildDrawFrame());
+    assert.equal(procDefault.firstVisibleFrame, true);
+    assert.equal(procDefault.suppressedBlackFrames, 0);
+  }
+
+  // 2. Worker init option requireNonBlackFrame: true gates pure-black draws until non-black pixels arrive.
+  {
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const posted = [];
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock', architecture: 'w332-luma' },
+          async requestDevice() {
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+    let fakeNow = 1000;
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+      now: () => fakeNow,
+    });
+
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({
+        init: true,
+        canvas,
+        width: 16,
+        height: 16,
+        requireNonBlackFrame: true,
+      });
+    });
+
+    assert.equal(handler.processor.requireNonBlackFrame, true);
+
+    // Draw 1 with all-black RGBA pixels -> suppressed!
+    const blackRgba = new Uint8Array(16 * 16 * 4);
+    for (let i = 3; i < blackRgba.length; i += 4) blackRgba[i] = 255;
+    await handler.handleMessage({
+      cmdBuffer: buildDrawFrame(),
+      frameLuminance: { data: blackRgba, width: 16, height: 16 },
+    });
+    assert.equal(handler.processor.firstVisibleFrame, false);
+    assert.equal(handler.processor.suppressedBlackFrames, 1);
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 0);
+
+    // Draw 2 with bright non-black RGBA pixels -> W307 hasVisibleNonBlackPixels passes, emits ONCE!
+    fakeNow = 1250;
+    const brightRgba = new Uint8Array(16 * 16 * 4).fill(200);
+    await handler.handleMessage({
+      cmdBuffer: buildDrawFrame(),
+      frameLuminance: { data: brightRgba, width: 16, height: 16 },
+    });
+    assert.equal(handler.processor.firstVisibleFrame, true);
+    assert.equal(handler.processor.suppressedBlackFrames, 1);
+    assert.equal(handler.processor.lastSampledMaxLuma, 200);
+    const visMsgs = posted.filter((m) => m.type === 'first-visible-frame');
+    assert.equal(visMsgs.length, 1);
+    assert.equal(visMsgs[0].maxLuma, 200);
+    assert.equal(visMsgs[0].suppressedBlackFrames, 1);
+    handler.processor.destroy();
+  }
+
+  // 3. With requireNonBlackFrame: true, black Bink2 frame is suppressed and bright Bink2 frame emits immediately.
+  {
+    const binkMock = createMockWebGpu();
+    binkMock.device.createBindGroupLayout = (desc) => ({ kind: 'GPUBindGroupLayout', desc });
+    binkMock.device.createPipelineLayout = (desc) => ({ kind: 'GPUPipelineLayout', desc });
+    const origCreateEncoder = binkMock.device.createCommandEncoder.bind(binkMock.device);
+    binkMock.device.createCommandEncoder = () => {
+      const enc = origCreateEncoder();
+      const origBeginRenderPass = enc.beginRenderPass.bind(enc);
+      enc.beginRenderPass = (desc) => {
+        const pass = origBeginRenderPass(desc);
+        pass.setViewport = () => {};
+        pass.setScissorRect = () => {};
+        return pass;
+      };
+      return enc;
+    };
+
+    const posted = [];
+    const procBink = new WgpuCommandProcessor(binkMock.device, binkMock.ctx, {
+      width: 16,
+      height: 8,
+      requireNonBlackFrame: true,
+      enableSplashBridge: true,
+    });
+    const handler = createWgpuWorkerHandler({
+      processor: procBink,
+      postMessage: (m) => posted.push(m),
+    });
+
+    // Black Bink2 YUV420P frame (Y=16 limited-range black) -> presented, but first-visible-frame suppressed.
+    await handler.handleMessage({
+      type: 'bink-frame',
+      id: 'bink-black',
+      frame: {
+        width: 16,
+        height: 8,
+        format: 'yuv420p',
+        colorRange: 'limited',
+        planes: {
+          y: new Uint8Array(16 * 8).fill(16),
+          u: new Uint8Array(8 * 4).fill(128),
+          v: new Uint8Array(8 * 4).fill(128),
+        },
+        frameIndex: 0,
+      },
+    });
+    const blackReply = posted.find((m) => m.id === 'bink-black');
+    assert.ok(blackReply && blackReply.ok === true);
+    assert.equal(procBink.firstVisibleFrame, false);
+    assert.ok(procBink.suppressedBlackFrames >= 1);
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 0);
+
+    // Visible bright Bink2 YUV420P frame (Y=200) -> emits first-visible-frame immediately!
+    await handler.handleMessage({
+      type: 'bink-frame',
+      id: 'bink-bright',
+      frame: {
+        width: 16,
+        height: 8,
+        format: 'yuv420p',
+        colorRange: 'limited',
+        planes: {
+          y: new Uint8Array(16 * 8).fill(200),
+          u: new Uint8Array(8 * 4).fill(128),
+          v: new Uint8Array(8 * 4).fill(128),
+        },
+        frameIndex: 1,
+      },
+    });
+    const brightReply = posted.find((m) => m.id === 'bink-bright');
+    assert.ok(brightReply && brightReply.ok === true);
+    assert.equal(procBink.firstVisibleFrame, true);
+    const visMsgs = posted.filter((m) => m.type === 'first-visible-frame');
+    assert.equal(visMsgs.length, 1);
+    assert.ok(visMsgs[0].maxLuma >= 180);
+    procBink.destroy();
+  }
+});
