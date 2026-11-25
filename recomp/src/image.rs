@@ -546,6 +546,99 @@ impl ImageSection<'_> {
         u64::from(self.rva) + u64::from(self.virtual_size)
     }
 
+    /// Checked `[start_va, end_va)` virtual-address range for this section under `image_base`.
+    pub fn va_range(&self, image_base: u64) -> Result<(u64, u64), ImageError> {
+        let start = image_base
+            .checked_add(u64::from(self.rva))
+            .ok_or(ImageError::Overflow {
+                context: "section start VA",
+            })?;
+        let end = start
+            .checked_add(u64::from(self.virtual_size))
+            .ok_or(ImageError::Overflow {
+                context: "section end VA",
+            })?;
+        Ok((start, end))
+    }
+
+    /// Number of initialised bytes in memory, strictly clamped to `virtual_size`.
+    pub fn initialized_len(&self) -> u64 {
+        u64::try_from(self.data.len())
+            .unwrap_or(u64::MAX)
+            .min(u64::from(self.virtual_size))
+    }
+
+    /// Number of zero-filled BSS tail bytes after the initialised prefix.
+    pub fn bss_tail_len(&self) -> u64 {
+        u64::from(self.virtual_size).saturating_sub(self.initialized_len())
+    }
+
+    /// Read a single guest byte at `rva` within this section, enforcing strict
+    /// initialised-raw vs BSS-tail bounds. Returns `None` if the section is empty
+    /// or `rva` lies outside `[self.rva, self.end())`.
+    pub fn read_byte(&self, rva: u64) -> Option<u8> {
+        if self.virtual_size == 0 {
+            return None;
+        }
+        let rel = rva.checked_sub(u64::from(self.rva))?;
+        if rel >= u64::from(self.virtual_size) {
+            return None;
+        }
+        let rel_usize = usize::try_from(rel).ok()?;
+        let init_len = usize::try_from(self.initialized_len()).ok()?;
+        if rel_usize < init_len {
+            self.data.get(rel_usize).copied()
+        } else {
+            Some(0)
+        }
+    }
+
+    /// Copy `[rva, rva + dst.len())` from this section into `dst`, filling bytes past
+    /// `initialized_len()` up to `virtual_size` with zeros. Returns `false` (leaving `dst`
+    /// untouched) on zero-size sections, arithmetic overflow, or out-of-bounds reads.
+    pub fn read_into(&self, rva: u64, dst: &mut [u8]) -> bool {
+        if self.virtual_size == 0 {
+            return false;
+        }
+        let Ok(len_u64) = u64::try_from(dst.len()) else {
+            return false;
+        };
+        let Some(rel_start) = rva.checked_sub(u64::from(self.rva)) else {
+            return false;
+        };
+        let Some(rel_end) = rel_start.checked_add(len_u64) else {
+            return false;
+        };
+        let vsize = u64::from(self.virtual_size);
+        if dst.is_empty() {
+            return rel_start < vsize;
+        }
+        if rel_end > vsize {
+            return false;
+        }
+        let init_len = self.initialized_len();
+        if rel_start < init_len {
+            let init_end = rel_end.min(init_len);
+            let Ok(src_start) = usize::try_from(rel_start) else {
+                return false;
+            };
+            let Ok(src_end) = usize::try_from(init_end) else {
+                return false;
+            };
+            let Some(copy_len) = src_end.checked_sub(src_start) else {
+                return false;
+            };
+            let Some(src) = self.data.get(src_start..src_end) else {
+                return false;
+            };
+            dst[..copy_len].copy_from_slice(src);
+            dst[copy_len..].fill(0);
+        } else {
+            dst.fill(0);
+        }
+        true
+    }
+
     fn flags(&self) -> u32 {
         (if self.is_headers {
             SECTION_FLAG_HEADERS
@@ -592,14 +685,157 @@ pub struct ImageBuild<'a> {
 }
 
 impl<'a> GuestImage<'a> {
+    /// Checked exclusive end VA (`image_base + size_of_image`).
+    pub fn va_end(&self) -> Result<u64, ImageError> {
+        self.image_base
+            .checked_add(u64::from(self.size_of_image))
+            .ok_or(ImageError::Overflow {
+                context: "image_base + size_of_image",
+            })
+    }
+
+    /// Translate a guest VA inside `[image_base, image_base + size_of_image)` to an RVA.
+    pub fn va_to_rva(&self, va: u64) -> Option<u64> {
+        self.va_end().ok()?;
+        let rva = va.checked_sub(self.image_base)?;
+        (rva < u64::from(self.size_of_image)).then_some(rva)
+    }
+
+    /// Translate an RVA inside `[0, size_of_image)` to a guest VA without overflowing `u64`.
+    pub fn rva_to_va(&self, rva: u64) -> Option<u64> {
+        if rva >= u64::from(self.size_of_image) {
+            return None;
+        }
+        self.image_base.checked_add(rva)
+    }
+
     /// Section containing `rva`, if any (binary search).
     pub fn section_at(&self, rva: u64) -> Option<&ImageSection<'a>> {
+        if rva >= u64::from(self.size_of_image) {
+            return None;
+        }
         let idx = self
             .sections
             .partition_point(|s| u64::from(s.rva) <= rva)
             .checked_sub(1)?;
         let section = &self.sections[idx];
-        (rva < section.end()).then_some(section)
+        (section.virtual_size > 0 && rva < section.end()).then_some(section)
+    }
+
+    /// Section containing guest virtual address `va`, if any.
+    pub fn section_at_va(&self, va: u64) -> Option<&ImageSection<'a>> {
+        self.va_to_rva(va).and_then(|rva| self.section_at(rva))
+    }
+
+    /// Check that every byte in `[rva, rva + len)` is covered by mapped non-empty sections.
+    fn range_is_mapped(&self, rva: u64, len: u64) -> bool {
+        let Some(end) = rva.checked_add(len) else {
+            return false;
+        };
+        if end > u64::from(self.size_of_image) {
+            return false;
+        }
+        if len == 0 {
+            return self.section_at(rva).is_some();
+        }
+        let mut cursor = rva;
+        while cursor < end {
+            let Some(section) = self.section_at(cursor) else {
+                return false;
+            };
+            let next = section.end().min(end);
+            if next <= cursor {
+                return false;
+            }
+            cursor = next;
+        }
+        true
+    }
+
+    /// Read `[rva, rva + dst.len())` into `dst` across mapped sections (initialised bytes
+    /// plus BSS zero-fill tails). Leaves `dst` untouched and returns `false` if any byte is
+    /// unmapped, out of image bounds, or overflows `u64`/`usize`.
+    pub fn read_into_rva(&self, rva: u64, dst: &mut [u8]) -> bool {
+        let Ok(len_u64) = u64::try_from(dst.len()) else {
+            return false;
+        };
+        if !self.range_is_mapped(rva, len_u64) {
+            return false;
+        }
+        let mut cursor = rva;
+        let mut written = 0usize;
+        while written < dst.len() {
+            let Some(section) = self.section_at(cursor) else {
+                return false;
+            };
+            let Some(avail) = section.end().checked_sub(cursor) else {
+                return false;
+            };
+            let remaining = (dst.len() - written) as u64;
+            let Ok(take) = usize::try_from(avail.min(remaining)) else {
+                return false;
+            };
+            if take == 0 {
+                return false;
+            }
+            let Some(next_written) = written.checked_add(take) else {
+                return false;
+            };
+            if !section.read_into(cursor, &mut dst[written..next_written]) {
+                return false;
+            }
+            let Some(next_cursor) = cursor.checked_add(take as u64) else {
+                return false;
+            };
+            cursor = next_cursor;
+            written = next_written;
+        }
+        true
+    }
+
+    /// Read `len` bytes starting at `rva` (initialised bytes plus BSS zero-fill tails).
+    /// Validates bounds before allocating, so huge or overflowing lengths return `None`
+    /// immediately.
+    pub fn read_bytes_rva(&self, rva: u64, len: usize) -> Option<Vec<u8>> {
+        let len_u64 = u64::try_from(len).ok()?;
+        if !self.range_is_mapped(rva, len_u64) {
+            return None;
+        }
+        let mut out = vec![0u8; len];
+        self.read_into_rva(rva, &mut out).then_some(out)
+    }
+
+    /// Read `[va, va + dst.len())` into `dst` using checked `u64` VA arithmetic.
+    pub fn read_into_va(&self, va: u64, dst: &mut [u8]) -> bool {
+        let Ok(len_u64) = u64::try_from(dst.len()) else {
+            return false;
+        };
+        let Some(va_end) = va.checked_add(len_u64) else {
+            return false;
+        };
+        let Ok(image_end) = self.va_end() else {
+            return false;
+        };
+        if va_end > image_end {
+            return false;
+        }
+        let Some(rva) = va.checked_sub(self.image_base) else {
+            return false;
+        };
+        self.read_into_rva(rva, dst)
+    }
+
+    /// Read `len` bytes starting at guest virtual address `va` using checked `u64`/`usize`
+    /// arithmetic. Validates bounds before allocating.
+    pub fn read_bytes_va(&self, va: u64, len: usize) -> Option<Vec<u8>> {
+        let len_u64 = u64::try_from(len).ok()?;
+        let va_end = va.checked_add(len_u64)?;
+        let image_end = self.va_end().ok()?;
+        if va_end > image_end {
+            return None;
+        }
+        let rva = va.checked_sub(self.image_base)?;
+        self.read_bytes_rva(rva, len)
     }
 
     /// Relocation counts as `(dir64, highlow)`.
@@ -614,28 +850,34 @@ impl<'a> GuestImage<'a> {
 
     /// Total initialised bytes stored in the container.
     pub fn stored_bytes(&self) -> u64 {
-        self.sections.iter().map(|s| s.data.len() as u64).sum()
+        self.sections.iter().fold(0u64, |acc, s| {
+            acc.saturating_add(u64::try_from(s.data.len()).unwrap_or(u64::MAX))
+        })
     }
 
     /// Page-granular protections the runtime applies after copying payloads, merged into runs.
     /// Pages shared by several sections (section alignment below the page size) get the union of
     /// their protections. Pages not touched by any section are not listed (reserved, no access).
     pub fn page_protections(&self) -> Vec<PageRun> {
-        let spans: Vec<(u64, u64, Protection)> = self
+        let mut spans: Vec<(u64, u64, Protection)> = self
             .sections
             .iter()
-            .map(|s| {
-                let start = u64::from(s.rva) / IMAGE_PAGE_SIZE * IMAGE_PAGE_SIZE;
-                let end = s.end().div_ceil(IMAGE_PAGE_SIZE) * IMAGE_PAGE_SIZE;
-                (start, end, s.protection)
+            .filter(|s| s.virtual_size > 0)
+            .filter_map(|s| {
+                let start = (u64::from(s.rva) / IMAGE_PAGE_SIZE).checked_mul(IMAGE_PAGE_SIZE)?;
+                let end = s.end().checked_next_multiple_of(IMAGE_PAGE_SIZE)?;
+                (end > start).then_some((start, end, s.protection))
             })
             .collect();
+        spans.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.bits().cmp(&b.2.bits()))
+        });
         let mut cuts: Vec<u64> = spans.iter().flat_map(|&(s, e, _)| [s, e]).collect();
         cuts.sort_unstable();
         cuts.dedup();
 
-        // Sections are sorted and disjoint, so span starts and ends are both non-decreasing and
-        // the spans covering a cut form a window that only moves forward.
         let mut runs: Vec<PageRun> = Vec::new();
         let mut lo = 0;
         for pair in cuts.windows(2) {
@@ -645,18 +887,28 @@ impl<'a> GuestImage<'a> {
             }
             let mut protection: Option<Protection> = None;
             for span in spans[lo..].iter().take_while(|span| span.0 <= start) {
-                protection = Some(protection.map_or(span.2, |p| p | span.2));
+                if span.1 > start {
+                    protection = Some(protection.map_or(span.2, |p| p | span.2));
+                }
             }
             let Some(protection) = protection else {
                 continue;
             };
+            let Some(delta) = end.checked_sub(start) else {
+                continue;
+            };
             match runs.last_mut() {
-                Some(last) if last.rva + last.size == start && last.protection == protection => {
-                    last.size += end - start;
+                Some(last)
+                    if last.rva.checked_add(last.size) == Some(start)
+                        && last.protection == protection =>
+                {
+                    if let Some(next_size) = last.size.checked_add(delta) {
+                        last.size = next_size;
+                    }
                 }
                 _ => runs.push(PageRun {
                     rva: start,
-                    size: end - start,
+                    size: delta,
                     protection,
                 }),
             }
@@ -664,21 +916,67 @@ impl<'a> GuestImage<'a> {
         runs
     }
 
+    /// Validated flat guest memory `[0, SizeOfImage)` at the preferred base using checked
+    /// `usize` arithmetic.
+    pub fn try_materialize(&self) -> Result<Vec<u8>, ImageError> {
+        self.validate()?;
+        let total = usize::try_from(self.size_of_image).map_err(|_| ImageError::Overflow {
+            context: "materialized image size",
+        })?;
+        let mut memory = vec![0u8; total];
+        for section in &self.sections {
+            let start = usize::try_from(section.rva).map_err(|_| ImageError::Overflow {
+                context: "section RVA",
+            })?;
+            let end = start
+                .checked_add(section.data.len())
+                .filter(|&end| end <= memory.len())
+                .ok_or(ImageError::Overflow {
+                    context: "section materialized end",
+                })?;
+            memory[start..end].copy_from_slice(section.data);
+        }
+        Ok(memory)
+    }
+
     /// Flat guest memory `[0, SizeOfImage)` at the preferred base of a validated image. Allocates
     /// the whole image, so this is a reference/test helper; the runtime commits only the pages
     /// sections cover.
     pub fn materialize(&self) -> Vec<u8> {
-        let mut memory = vec![0u8; self.size_of_image as usize];
+        let Ok(total) = usize::try_from(self.size_of_image) else {
+            return Vec::new();
+        };
+        let mut memory = vec![0u8; total];
         for section in &self.sections {
-            let start = section.rva as usize;
-            memory[start..start + section.data.len()].copy_from_slice(section.data);
+            let Ok(start) = usize::try_from(section.rva) else {
+                continue;
+            };
+            let Ok(init_len) = usize::try_from(section.initialized_len()) else {
+                continue;
+            };
+            if start >= memory.len() || init_len == 0 {
+                continue;
+            }
+            let copy_len = init_len.min(memory.len() - start);
+            if let (Some(src), Some(dst)) = (
+                section.data.get(..copy_len),
+                memory.get_mut(start..start + copy_len),
+            ) {
+                dst.copy_from_slice(src);
+            }
         }
         memory
     }
 
-    /// [`materialize`](Self::materialize) and rebase to `new_base`.
+    /// [`try_materialize`](Self::try_materialize) and rebase to `new_base`, checking that
+    /// `[new_base, new_base + size_of_image)` does not overflow `u64`.
     pub fn rebased(&self, new_base: u64) -> Result<Vec<u8>, ImageError> {
-        let mut memory = self.materialize();
+        new_base
+            .checked_add(u64::from(self.size_of_image))
+            .ok_or(ImageError::Overflow {
+                context: "rebased image address range",
+            })?;
+        let mut memory = self.try_materialize()?;
         apply_relocations(&mut memory, &self.relocations, self.image_base, new_base)?;
         Ok(memory)
     }
@@ -708,7 +1006,10 @@ impl<'a> GuestImage<'a> {
             if section.virtual_size == 0 {
                 return invalid("zero in-memory size");
             }
-            if section.data.len() as u64 > u64::from(section.virtual_size) {
+            let data_len = u64::try_from(section.data.len()).map_err(|_| ImageError::Overflow {
+                context: "section data length",
+            })?;
+            if data_len > u64::from(section.virtual_size) {
                 return invalid("initialised bytes exceed in-memory size");
             }
             if section.is_headers && (index != 0 || section.rva != 0) {
@@ -792,8 +1093,19 @@ pub fn build_guest_image<'a>(
     let mut diagnostics = Vec::new();
     let omit = options.executable_bytes == ExecutableBytes::Omit;
 
-    let mut sections = Vec::with_capacity(pe.sections.len() + 1);
-    for header in &pe.sections {
+    let mut pe_sections: Vec<&crate::pe::SectionHeader> = pe.sections.iter().collect();
+    pe_sections.sort_by(|a, b| {
+        a.virtual_address
+            .cmp(&b.virtual_address)
+            .then_with(|| a.virtual_size.cmp(&b.virtual_size))
+            .then_with(|| a.raw_offset.cmp(&b.raw_offset))
+            .then_with(|| a.raw_size.cmp(&b.raw_size))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.characteristics.cmp(&b.characteristics))
+    });
+
+    let mut sections = Vec::with_capacity(pe_sections.len() + 1);
+    for header in pe_sections {
         let memory_size = if header.virtual_size == 0 {
             header.raw_size
         } else {
@@ -812,11 +1124,14 @@ pub fn build_guest_image<'a>(
         } else {
             let expected = header.raw_size.min(memory_size);
             let raw = file_slice(file, u64::from(header.raw_offset), u64::from(expected));
-            if raw.len() < expected as usize {
+            let available = u32::try_from(raw.len()).map_err(|_| ImageError::Overflow {
+                context: "section raw data length",
+            })?;
+            if available < expected {
                 diagnostics.push(ImageDiagnostic::RawDataTruncated {
                     section: header.name.clone(),
                     expected,
-                    available: raw.len() as u32,
+                    available,
                 });
             }
             trim_trailing_zeros(raw)
@@ -832,7 +1147,13 @@ pub fn build_guest_image<'a>(
             data,
         });
     }
-    sections.sort_by_key(|s| s.rva);
+    sections.sort_by(|a, b| {
+        a.rva
+            .cmp(&b.rva)
+            .then_with(|| a.virtual_size.cmp(&b.virtual_size))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.characteristics.cmp(&b.characteristics))
+    });
 
     if options.map_headers {
         let first_rva = sections.first().map_or(u32::MAX, |s| s.rva);
@@ -842,6 +1163,17 @@ pub fn build_guest_image<'a>(
             .min(first_rva)
             .min(pe.optional.size_of_image);
         if size > 0 {
+            let raw = file_slice(file, 0, u64::from(size));
+            let available = u32::try_from(raw.len()).map_err(|_| ImageError::Overflow {
+                context: "headers raw data length",
+            })?;
+            if available < size {
+                diagnostics.push(ImageDiagnostic::RawDataTruncated {
+                    section: HEADERS_SECTION_NAME.to_string(),
+                    expected: size,
+                    available,
+                });
+            }
             sections.insert(
                 0,
                 ImageSection {
@@ -852,7 +1184,7 @@ pub fn build_guest_image<'a>(
                     is_headers: true,
                     bytes_omitted: false,
                     characteristics: 0,
-                    data: trim_trailing_zeros(file_slice(file, 0, u64::from(size))),
+                    data: trim_trailing_zeros(raw),
                 },
             );
         }
@@ -869,6 +1201,9 @@ pub fn build_guest_image<'a>(
         sections,
         relocations: Vec::new(),
     };
+
+    // Validate image address bounds and section layout before indexing sections for relocations.
+    image.validate()?;
 
     if let Some(dir) = pe.optional.data_directory(DIR_BASERELOC) {
         let dir_bytes = reloc_directory_bytes(pe, file, dir.virtual_address, dir.size).ok_or(
@@ -938,7 +1273,8 @@ pub fn parse_base_relocations(dir: &[u8]) -> Result<RelocParse, ImageError> {
             block_size,
             reason,
         };
-        let size = block_size as usize;
+        let size = usize::try_from(block_size)
+            .map_err(|_| malformed("block size overflows usize"))?;
         if size < RELOC_BLOCK_HEADER_BYTES {
             return Err(malformed("block size smaller than its 8-byte header"));
         }
@@ -980,7 +1316,9 @@ pub fn parse_base_relocations(dir: &[u8]) -> Result<RelocParse, ImageError> {
             };
             relocations.push(BaseRelocation { rva, kind });
         }
-        offset += size;
+        offset = offset
+            .checked_add(size)
+            .ok_or_else(|| malformed("block offset overflows usize"))?;
     }
 
     relocations.sort_unstable();
@@ -1017,24 +1355,41 @@ pub fn apply_relocations(
     preferred_base: u64,
     new_base: u64,
 ) -> Result<(), ImageError> {
-    if let Some(bad) = relocations.iter().find(|r| r.end() > memory.len() as u64) {
+    let mem_len = u64::try_from(memory.len()).map_err(|_| ImageError::Overflow {
+        context: "memory buffer length",
+    })?;
+    if let Some(bad) = relocations.iter().find(|r| r.end() > mem_len) {
         return Err(ImageError::RelocSiteOutOfRange {
             rva: bad.rva,
             width: bad.kind.width(),
-            limit: memory.len() as u64,
+            limit: mem_len,
         });
     }
     let delta = new_base.wrapping_sub(preferred_base);
     for reloc in relocations {
-        let start = reloc.rva as usize;
+        let start = usize::try_from(reloc.rva).map_err(|_| ImageError::RelocSiteOutOfRange {
+            rva: reloc.rva,
+            width: reloc.kind.width(),
+            limit: mem_len,
+        })?;
+        let width = usize::try_from(reloc.kind.width()).map_err(|_| ImageError::Overflow {
+            context: "relocation width",
+        })?;
+        let end = start
+            .checked_add(width)
+            .filter(|&end| end <= memory.len())
+            .ok_or(ImageError::RelocSiteOutOfRange {
+                rva: reloc.rva,
+                width: reloc.kind.width(),
+                limit: mem_len,
+            })?;
+        let slot = &mut memory[start..end];
         match reloc.kind {
             BaseRelocKind::Dir64 => {
-                let slot = &mut memory[start..start + 8];
                 let value = u64::from_le_bytes(slot.try_into().expect("8-byte slot"));
                 slot.copy_from_slice(&value.wrapping_add(delta).to_le_bytes());
             }
             BaseRelocKind::HighLow => {
-                let slot = &mut memory[start..start + 4];
                 let value = u32::from_le_bytes(slot.try_into().expect("4-byte slot"));
                 slot.copy_from_slice(&value.wrapping_add(delta as u32).to_le_bytes());
             }
@@ -1051,9 +1406,17 @@ struct Layout {
 
 fn layout(image: &GuestImage<'_>) -> Result<Layout, ImageError> {
     let overflow = |context| ImageError::Overflow { context };
+    let section_table_bytes = u64::try_from(image.sections.len())
+        .ok()
+        .and_then(|n| n.checked_mul(IMAGE_SECTION_ENTRY_BYTES as u64))
+        .ok_or(overflow("section table size"))?;
+    let reloc_table_bytes = u64::try_from(image.relocations.len())
+        .ok()
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(overflow("relocation table size"))?;
     let tables = (IMAGE_HEADER_BYTES as u64)
-        .checked_add(image.sections.len() as u64 * IMAGE_SECTION_ENTRY_BYTES as u64)
-        .and_then(|v| v.checked_add(image.relocations.len() as u64 * 4))
+        .checked_add(section_table_bytes)
+        .and_then(|v| v.checked_add(reloc_table_bytes))
         .ok_or(overflow("container table size"))?;
     let mut cursor = tables;
     let mut data_offsets = Vec::with_capacity(image.sections.len());
@@ -1065,9 +1428,10 @@ fn layout(image: &GuestImage<'_>) -> Result<Layout, ImageError> {
         let offset = cursor
             .checked_next_multiple_of(IMAGE_PAGE_SIZE)
             .ok_or(overflow("payload offset"))?;
+        let data_len = u64::try_from(section.data.len()).map_err(|_| overflow("payload length"))?;
         data_offsets.push(offset);
         cursor = offset
-            .checked_add(section.data.len() as u64)
+            .checked_add(data_len)
             .ok_or(overflow("payload end"))?;
     }
     Ok(Layout {
@@ -1139,7 +1503,8 @@ pub fn write_image(image: &GuestImage<'_>) -> Result<Vec<u8>, ImageError> {
 
     for (section, &offset) in image.sections.iter().zip(&layout.data_offsets) {
         if !section.data.is_empty() {
-            out.resize(offset as usize, 0);
+            let offset_usize = usize::try_from(offset).map_err(|_| overflow("payload offset"))?;
+            out.resize(offset_usize, 0);
             out.extend_from_slice(section.data);
         }
     }
@@ -1149,7 +1514,9 @@ pub fn write_image(image: &GuestImage<'_>) -> Result<Vec<u8>, ImageError> {
 
 /// Parse and fully validate a `PGIM` container. Payloads borrow from `bytes`.
 pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
-    let file_len = bytes.len() as u64;
+    let file_len = u64::try_from(bytes.len()).map_err(|_| ImageError::Overflow {
+        context: "container length",
+    })?;
     if bytes.len() < IMAGE_HEADER_BYTES {
         return Err(ImageError::Truncated {
             context: "image header",
@@ -1190,9 +1557,9 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
     let size_of_image = le_u32(&bytes[32..36]);
     let section_alignment = le_u32(&bytes[36..40]);
     let entry_point_rva = le_u32(&bytes[40..44]);
-    let section_count = le_u32(&bytes[44..48]) as u64;
-    let dir64_count = le_u32(&bytes[48..52]) as u64;
-    let highlow_count = le_u32(&bytes[52..56]) as u64;
+    let section_count = u64::from(le_u32(&bytes[44..48]));
+    let dir64_count = u64::from(le_u32(&bytes[48..52]));
+    let highlow_count = u64::from(le_u32(&bytes[52..56]));
     let file_size = le_u64(&bytes[56..64]);
     if file_size != file_len {
         return Err(ImageError::BadHeaderField {
@@ -1201,9 +1568,29 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
         });
     }
 
-    // All counts are u32, so these products cannot overflow u64.
-    let table_start = IMAGE_HEADER_BYTES as u64 + section_count * IMAGE_SECTION_ENTRY_BYTES as u64;
-    let tables_end = table_start + (dir64_count + highlow_count) * 4;
+    let section_table_bytes = section_count
+        .checked_mul(IMAGE_SECTION_ENTRY_BYTES as u64)
+        .ok_or(ImageError::Overflow {
+            context: "section table size",
+        })?;
+    let table_start = (IMAGE_HEADER_BYTES as u64)
+        .checked_add(section_table_bytes)
+        .ok_or(ImageError::Overflow {
+            context: "relocation table offset",
+        })?;
+    let reloc_count = dir64_count
+        .checked_add(highlow_count)
+        .ok_or(ImageError::Overflow {
+            context: "relocation count",
+        })?;
+    let reloc_table_bytes = reloc_count.checked_mul(4).ok_or(ImageError::Overflow {
+        context: "relocation table size",
+    })?;
+    let tables_end = table_start
+        .checked_add(reloc_table_bytes)
+        .ok_or(ImageError::Overflow {
+            context: "container tables end",
+        })?;
     if tables_end > file_len {
         return Err(ImageError::Truncated {
             context: "section and relocation tables",
@@ -1212,11 +1599,28 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
         });
     }
 
-    let mut sections = Vec::with_capacity(section_count as usize);
+    let section_count_usize = usize::try_from(section_count).map_err(|_| ImageError::Overflow {
+        context: "section count",
+    })?;
+    let mut sections = Vec::with_capacity(section_count_usize);
     let mut payloads: Vec<(u64, u64, usize)> = Vec::new();
-    for index in 0..section_count as usize {
-        let at = IMAGE_HEADER_BYTES + index * IMAGE_SECTION_ENTRY_BYTES;
-        let entry = &bytes[at..at + IMAGE_SECTION_ENTRY_BYTES];
+    for index in 0..section_count_usize {
+        let at = index
+            .checked_mul(IMAGE_SECTION_ENTRY_BYTES)
+            .and_then(|off| IMAGE_HEADER_BYTES.checked_add(off))
+            .ok_or(ImageError::Overflow {
+                context: "section entry offset",
+            })?;
+        let end_at = at
+            .checked_add(IMAGE_SECTION_ENTRY_BYTES)
+            .ok_or(ImageError::Overflow {
+                context: "section entry end",
+            })?;
+        let entry = bytes.get(at..end_at).ok_or(ImageError::Truncated {
+            context: "section table entry",
+            needed: end_at as u64,
+            available: file_len,
+        })?;
         let invalid = |reason| ImageError::InvalidSection { index, reason };
 
         let raw_name = &entry[0..SECTION_NAME_BYTES];
@@ -1261,8 +1665,21 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
                     file_len,
                 });
             };
+            let start_usize =
+                usize::try_from(offset).map_err(|_| ImageError::PayloadOutOfRange {
+                    index,
+                    offset,
+                    length,
+                    file_len,
+                })?;
+            let end_usize = usize::try_from(end).map_err(|_| ImageError::PayloadOutOfRange {
+                index,
+                offset,
+                length,
+                file_len,
+            })?;
             payloads.push((offset, end, index));
-            &bytes[offset as usize..end as usize]
+            &bytes[start_usize..end_usize]
         };
         let actual = fnv1a_64(data);
         if actual != checksum {
@@ -1293,8 +1710,29 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
     }
 
     let read_rvas = |start: u64, count: u64, kind| -> Result<Vec<BaseRelocation>, ImageError> {
-        let table = &bytes[start as usize..(start + count * 4) as usize];
-        let mut out: Vec<BaseRelocation> = Vec::with_capacity(count as usize);
+        let byte_len = count.checked_mul(4).ok_or(ImageError::Overflow {
+            context: "relocation table byte length",
+        })?;
+        let end = start.checked_add(byte_len).ok_or(ImageError::Overflow {
+            context: "relocation table end",
+        })?;
+        let start_usize = usize::try_from(start).map_err(|_| ImageError::Overflow {
+            context: "relocation table start",
+        })?;
+        let end_usize = usize::try_from(end).map_err(|_| ImageError::Overflow {
+            context: "relocation table end",
+        })?;
+        let count_usize = usize::try_from(count).map_err(|_| ImageError::Overflow {
+            context: "relocation count",
+        })?;
+        let table = bytes
+            .get(start_usize..end_usize)
+            .ok_or(ImageError::Truncated {
+                context: "relocation table",
+                needed: end,
+                available: file_len,
+            })?;
+        let mut out: Vec<BaseRelocation> = Vec::with_capacity(count_usize);
         for &chunk in table.as_chunks::<4>().0 {
             let rva = u32::from_le_bytes(chunk);
             if out.last().is_some_and(|prev| prev.rva >= rva) {
@@ -1305,8 +1743,14 @@ pub fn read_image(bytes: &[u8]) -> Result<GuestImage<'_>, ImageError> {
         Ok(out)
     };
     let mut relocations = read_rvas(table_start, dir64_count, BaseRelocKind::Dir64)?;
+    let highlow_start = dir64_count
+        .checked_mul(4)
+        .and_then(|bytes_len| table_start.checked_add(bytes_len))
+        .ok_or(ImageError::Overflow {
+            context: "HIGHLOW relocation table offset",
+        })?;
     relocations.extend(read_rvas(
-        table_start + dir64_count * 4,
+        highlow_start,
         highlow_count,
         BaseRelocKind::HighLow,
     )?);
@@ -1336,6 +1780,7 @@ pub fn render_manifest_json(
     image: &GuestImage<'_>,
     diagnostics: &[ImageDiagnostic],
 ) -> Result<String, ImageError> {
+    image.validate()?;
     let layout = layout(image)?;
     let (dir64, highlow) = image.relocation_counts();
     let mut out = String::new();
@@ -1366,17 +1811,25 @@ pub fn render_manifest_json(
     out.push_str("  \"sections\": [");
     for (i, (section, offset)) in image.sections.iter().zip(&layout.data_offsets).enumerate() {
         out.push_str(if i == 0 { "\n" } else { ",\n" });
+        let data_len = u64::try_from(section.data.len()).map_err(|_| ImageError::Overflow {
+            context: "section data length",
+        })?;
+        let zero_fill = u64::from(section.virtual_size)
+            .checked_sub(data_len)
+            .ok_or(ImageError::InvalidSection {
+                index: i,
+                reason: "initialised bytes exceed in-memory size",
+            })?;
         let _ = write!(
             out,
             "    {{\"name\": {}, \"rva\": \"0x{:x}\", \"virtual_size\": \"0x{:x}\", \
              \"protection\": \"{}\", \"data_offset\": \"0x{offset:x}\", \"data_length\": \"0x{:x}\", \
-             \"zero_fill\": \"0x{:x}\", \"checksum\": \"0x{:016x}\"}}",
+             \"zero_fill\": \"0x{zero_fill:x}\", \"checksum\": \"0x{:016x}\"}}",
             json_string(&section.name),
             section.rva,
             section.virtual_size,
             section.protection.as_str(),
             section.data.len(),
-            u64::from(section.virtual_size) - section.data.len() as u64,
             fnv1a_64(section.data),
         );
     }
@@ -1444,31 +1897,64 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 /// Initialised bytes of the reloc directory (in a section's raw data or in the headers).
 fn reloc_directory_bytes<'a>(pe: &Pe64, file: &'a [u8], rva: u32, size: u32) -> Option<&'a [u8]> {
-    let end = u64::from(rva) + u64::from(size);
-    let file_offset = pe
-        .sections
-        .iter()
+    let end = u64::from(rva).checked_add(u64::from(size))?;
+    if end > u64::from(pe.optional.size_of_image) {
+        return None;
+    }
+    let mut pe_sections: Vec<&crate::pe::SectionHeader> = pe.sections.iter().collect();
+    pe_sections.sort_by(|a, b| {
+        a.virtual_address
+            .cmp(&b.virtual_address)
+            .then_with(|| a.virtual_size.cmp(&b.virtual_size))
+            .then_with(|| a.raw_offset.cmp(&b.raw_offset))
+            .then_with(|| a.raw_size.cmp(&b.raw_size))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.characteristics.cmp(&b.characteristics))
+    });
+    let file_offset = pe_sections
+        .into_iter()
         .find_map(|s| {
             let memory_size = if s.virtual_size == 0 {
                 s.raw_size
             } else {
                 s.virtual_size
             };
+            if memory_size == 0 {
+                return None;
+            }
             let initialised = u64::from(s.raw_size.min(memory_size));
             let start = u64::from(s.virtual_address);
-            (rva >= s.virtual_address && end <= start + initialised)
-                .then(|| u64::from(s.raw_offset) + u64::from(rva - s.virtual_address))
+            let init_end = start.checked_add(initialised)?;
+            if rva >= s.virtual_address && end <= init_end {
+                let delta = u64::from(rva.checked_sub(s.virtual_address)?);
+                u64::from(s.raw_offset).checked_add(delta)
+            } else {
+                None
+            }
         })
         .or_else(|| (end <= u64::from(pe.optional.size_of_headers)).then_some(u64::from(rva)))?;
-    let slice = file_slice(file, file_offset, u64::from(size));
-    (slice.len() == size as usize).then_some(slice)
+    let file_end = file_offset.checked_add(u64::from(size))?;
+    let start_usize = usize::try_from(file_offset).ok()?;
+    let end_usize = usize::try_from(file_end).ok()?;
+    file.get(start_usize..end_usize)
 }
 
-/// `file[offset..offset + len]` clamped to the file.
+/// `file[offset..offset + len]` clamped to the file without overflow.
 fn file_slice(file: &[u8], offset: u64, len: u64) -> &[u8] {
-    let start = offset.min(file.len() as u64) as usize;
-    let end = offset.saturating_add(len).min(file.len() as u64) as usize;
-    &file[start..end]
+    let Ok(file_len) = u64::try_from(file.len()) else {
+        return &[];
+    };
+    if offset >= file_len || len == 0 {
+        return &[];
+    }
+    let end = offset.saturating_add(len).min(file_len);
+    let Ok(start_usize) = usize::try_from(offset) else {
+        return &[];
+    };
+    let Ok(end_usize) = usize::try_from(end) else {
+        return &[];
+    };
+    file.get(start_usize..end_usize).unwrap_or(&[])
 }
 
 fn trim_trailing_zeros(data: &[u8]) -> &[u8] {
@@ -2455,5 +2941,475 @@ mod tests {
             image.page_protections().last().map(|r| r.rva + r.size),
             Some(u64::from(size_of_image))
         );
+    }
+
+    #[test]
+    fn r51_truncated_raw_section_and_headers_zero_fill_remainder() {
+        // Case 1: file truncated mid-.data and completely past a second section's raw offset.
+        let mut raw_a = vec![0x5Au8; 0x300];
+        raw_a[0] = 0xDE;
+        raw_a[0x11F] = 0xAD;
+        let raw_b = vec![0x77u8; 0x200];
+        let spec = Spec::new(
+            0x4000,
+            vec![
+                Sec::new(".data", 0x1000, 0x400, raw_a, R | W),
+                Sec::new(".tail", 0x2000, 0x200, raw_b, R),
+            ],
+        );
+        let mut file = build_pe(&spec);
+        let pe = Pe64::parse(&file).expect("parses");
+        // Headers occupy [0, 0x400), .data raw starts at 0x400 -> keep 0x120 bytes of .data
+        // and drop all of .tail.
+        file.truncate(0x520);
+        let built = build_guest_image(&pe, &file, ImageOptions::default()).expect("builds");
+        assert_eq!(
+            built.diagnostics,
+            [
+                ImageDiagnostic::RawDataTruncated {
+                    section: ".data".to_string(),
+                    expected: 0x300,
+                    available: 0x120,
+                },
+                ImageDiagnostic::RawDataTruncated {
+                    section: ".tail".to_string(),
+                    expected: 0x200,
+                    available: 0,
+                },
+            ]
+        );
+        let data = built.image.section_at(0x1000).expect(".data mapped");
+        assert_eq!(data.initialized_len(), 0x120);
+        assert_eq!(data.bss_tail_len(), 0x2E0);
+        assert_eq!(data.read_byte(0x1000), Some(0xDE));
+        assert_eq!(data.read_byte(0x111F), Some(0xAD));
+        assert_eq!(data.read_byte(0x1120), Some(0));
+        assert_eq!(data.read_byte(0x13FF), Some(0));
+        assert_eq!(data.read_byte(0x1400), None);
+
+        let tail = built.image.section_at(0x2000).expect(".tail mapped");
+        assert_eq!(tail.initialized_len(), 0);
+        assert_eq!(tail.bss_tail_len(), 0x200);
+        assert_eq!(
+            built.image.read_bytes_rva(0x2000, 0x200),
+            Some(vec![0u8; 0x200])
+        );
+        assert_eq!(built.image.read_bytes_rva(0x2000, 0x201), None);
+
+        // Case 2: file truncated inside PE headers reports RawDataTruncated for <headers>.
+        let mut hdr_file = build_pe(&Spec::new(
+            0x2000,
+            vec![Sec::new(".text", 0x1000, 0x20, vec![0xC3; 0x20], R | X)],
+        ));
+        let hdr_pe = Pe64::parse(&hdr_file).expect("parses");
+        hdr_file.truncate(0x280); // size_of_headers is 0x400
+        let hdr_built =
+            build_guest_image(&hdr_pe, &hdr_file, ImageOptions::default()).expect("builds");
+        assert!(hdr_built.diagnostics.contains(&ImageDiagnostic::RawDataTruncated {
+            section: HEADERS_SECTION_NAME.to_string(),
+            expected: 0x400,
+            available: 0x280,
+        }));
+        let headers = hdr_built.image.section_at(0).expect("headers mapped");
+        assert_eq!(headers.read_byte(0), Some(b'M'));
+        assert_eq!(headers.read_byte(0x3FF), Some(0));
+        assert_eq!(headers.read_byte(0x400), None);
+    }
+
+    #[test]
+    fn r51_bss_zero_fill_bounds_and_raw_size_exceeding_virtual_size() {
+        let mut data_raw = vec![0x33u8; 0x18];
+        data_raw.extend_from_slice(&[0u8; 0x08]); // trailing zeros fold into BSS tail
+        let mut clamped_raw = vec![0x12u8; 0x30];
+        clamped_raw.extend_from_slice(&[0xEEu8; 0x1D0]); // raw padding past virtual_size
+        let spec = Spec::new(
+            0x5000,
+            vec![
+                Sec::new(".data", 0x1000, 0x100, data_raw, R | W),
+                Sec::new(".bss", 0x2000, 0x1000, Vec::new(), R | W),
+                Sec::new(".clamped", 0x4000, 0x30, clamped_raw, R),
+            ],
+        );
+        let file = build_pe(&spec);
+        let image = build(&file, ImageOptions::default()).expect("builds").image;
+
+        let data = image.section_at(0x1000).expect(".data");
+        assert_eq!(data.initialized_len(), 0x18);
+        assert_eq!(data.bss_tail_len(), 0xE8);
+
+        // Cross-boundary read spanning initialized prefix into BSS zero-fill tail.
+        let cross = image
+            .read_bytes_rva(0x1014, 0x10)
+            .expect("cross-boundary read succeeds");
+        assert_eq!(&cross[..4], &[0x33; 4]);
+        assert_eq!(&cross[4..], &[0u8; 12]);
+        assert_eq!(
+            image.read_bytes_va(BASE + 0x1014, 0x10),
+            Some(cross.clone())
+        );
+
+        // Exact last byte of .data succeeds; 1 byte past virtual_size fails cleanly without
+        // mutating destination buffer.
+        assert_eq!(image.read_bytes_rva(0x10FF, 1), Some(vec![0u8]));
+        let mut sentinel = [0xA5u8; 4];
+        assert!(!image.read_into_rva(0x10FE, &mut sentinel));
+        assert_eq!(sentinel, [0xA5; 4], "failed read must leave dst untouched");
+
+        // Pure BSS section reads as all zeros across its entire virtual extent and rejects past end.
+        let bss = image.section_at(0x2000).expect(".bss");
+        assert_eq!(bss.initialized_len(), 0);
+        assert_eq!(bss.bss_tail_len(), 0x1000);
+        assert_eq!(image.read_bytes_rva(0x2000, 0x1000), Some(vec![0u8; 0x1000]));
+        let mut bss_over = [0x5Au8; 2];
+        assert!(!bss.read_into(0x2FFF, &mut bss_over));
+        assert_eq!(bss_over, [0x5A; 2]);
+        assert_eq!(image.read_bytes_rva(0x2FFF, 2), None);
+
+        // Raw data larger than VirtualSize is strictly clamped to VirtualSize (no 0xEE leakage).
+        let clamped = image.section_at(0x4000).expect(".clamped");
+        assert_eq!(clamped.initialized_len(), 0x30);
+        assert_eq!(clamped.bss_tail_len(), 0);
+        assert_eq!(image.read_bytes_rva(0x4000, 0x30), Some(vec![0x12u8; 0x30]));
+        assert_eq!(image.read_bytes_rva(0x4030, 1), None);
+        let mem = image.materialize();
+        assert!(mem[0x4030..0x4200].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn r51_u64_max_overflow_guards() {
+        // image_base + size_of_image overflowing u64::MAX is rejected at build time.
+        for bad_base in [u64::MAX, u64::MAX - 0x0FFF] {
+            let mut spec = Spec::new(
+                0x2000,
+                vec![Sec::new(".text", 0x1000, 0x10, vec![0x90; 0x10], R | X)],
+            );
+            spec.image_base = bad_base;
+            let file = build_pe(&spec);
+            assert_eq!(
+                build(&file, ImageOptions::default()).map(|_| ()),
+                Err(ImageError::BadHeaderField {
+                    field: "image_base + size_of_image",
+                    value: bad_base,
+                })
+            );
+        }
+
+        // Exact u64::MAX fit: image_base + size_of_image == u64::MAX is valid.
+        let size_of_image = 0x2000u32;
+        let max_valid_base = u64::MAX - u64::from(size_of_image);
+        let mut spec = Spec::new(
+            size_of_image,
+            vec![Sec::new(".text", 0x1000, 0x1000, vec![0xAB; 0x10], R | X)],
+        );
+        spec.image_base = max_valid_base;
+        let file = build_pe(&spec);
+        let image = build(&file, ImageOptions::default()).expect("builds").image;
+
+        assert_eq!(image.va_end(), Ok(u64::MAX));
+        assert_eq!(image.rva_to_va(0), Some(max_valid_base));
+        assert_eq!(image.rva_to_va(u64::from(size_of_image)), None);
+        assert_eq!(image.va_to_rva(u64::MAX), None);
+        assert_eq!(image.va_to_rva(max_valid_base.wrapping_sub(1)), None);
+
+        let text = image.section_at(0x1000).expect(".text");
+        assert_eq!(
+            text.va_range(max_valid_base),
+            Ok((max_valid_base + 0x1000, u64::MAX))
+        );
+        assert_eq!(
+            text.va_range(u64::MAX),
+            Err(ImageError::Overflow {
+                context: "section start VA",
+            })
+        );
+        assert_eq!(
+            text.va_range(u64::MAX - 0x1000),
+            Err(ImageError::Overflow {
+                context: "section end VA",
+            })
+        );
+
+        // Overflowing VA/RVA/usize reads fail cleanly without allocating or panicking.
+        assert_eq!(image.read_bytes_va(u64::MAX - 1, 1), Some(vec![0u8]));
+        assert_eq!(image.read_bytes_va(u64::MAX - 1, 2), None);
+        assert_eq!(image.read_bytes_va(u64::MAX, 1), None);
+        assert_eq!(image.read_bytes_va(max_valid_base + 0x1000, usize::MAX), None);
+        assert_eq!(image.read_bytes_rva(u64::MAX, 1), None);
+        assert_eq!(image.read_bytes_rva(0x1000, usize::MAX), None);
+        let mut tiny = [0u8; 4];
+        assert!(!image.read_into_va(u64::MAX - 2, &mut tiny));
+        assert!(!image.read_into_rva(u64::MAX - 2, &mut tiny));
+
+        // Rebasing to an overflowing base is rejected.
+        assert_eq!(
+            image.rebased(u64::MAX - 0x0FFF),
+            Err(ImageError::Overflow {
+                context: "rebased image address range",
+            })
+        );
+
+        // file_slice and apply_relocations tolerate extreme bounds without panicking.
+        assert_eq!(file_slice(&[1, 2, 3], u64::MAX, u64::MAX), &[]);
+        assert_eq!(file_slice(&[1, 2, 3], 1, u64::MAX), &[2, 3]);
+        let mut buf = [0u8; 16];
+        assert!(matches!(
+            apply_relocations(&mut buf, &[reloc(u32::MAX, BaseRelocKind::Dir64)], BASE, BASE),
+            Err(ImageError::RelocSiteOutOfRange {
+                rva: u32::MAX,
+                width: 8,
+                limit: 16,
+            })
+        ));
+    }
+
+    #[test]
+    fn r51_empty_images_and_zero_size_guards() {
+        // Empty PE image: SizeOfImage == 0, no sections, no headers mapped.
+        let mut spec = Spec::new(0, Vec::new());
+        spec.size_of_headers = 0x200;
+        let file = build_pe(&spec);
+        let built = build(&file, ImageOptions::default()).expect("empty image builds");
+        assert!(built.diagnostics.is_empty());
+        assert!(!built.image.headers_mapped);
+        assert!(built.image.sections.is_empty());
+        assert!(built.image.page_protections().is_empty());
+        assert_eq!(built.image.materialize(), Vec::<u8>::new());
+        assert_eq!(built.image.try_materialize(), Ok(Vec::<u8>::new()));
+        assert_eq!(built.image.section_at(0), None);
+        assert_eq!(built.image.read_bytes_rva(0, 0), None);
+        assert_eq!(built.image.read_bytes_rva(0, 1), None);
+        assert_eq!(built.image.read_bytes_va(BASE, 1), None);
+
+        let container = write_image(&built.image).expect("writes empty container");
+        assert_eq!(container.len(), IMAGE_HEADER_BYTES);
+        assert_eq!(read_image(&container), Ok(built.image.clone()));
+        let manifest =
+            render_manifest_json(&built.image, &built.diagnostics).expect("renders manifest");
+        assert!(manifest.contains("\"sections\": []"));
+
+        // PE with only zero-size sections and unmapped headers yields an empty GuestImage.
+        let zero_only = Spec::new(
+            0x2000,
+            vec![
+                Sec::new(".z2", 0x2000, 0, Vec::new(), R),
+                Sec::new(".z1", 0x1000, 0, Vec::new(), R | W),
+            ],
+        );
+        let no_headers = ImageOptions {
+            map_headers: false,
+            ..ImageOptions::default()
+        };
+        let zero_file = build_pe(&zero_only);
+        let built_zero = build(&zero_file, no_headers).expect("builds");
+        assert!(built_zero.image.sections.is_empty());
+        assert_eq!(
+            built_zero.diagnostics,
+            [
+                ImageDiagnostic::EmptySection {
+                    section: ".z1".to_string(),
+                },
+                ImageDiagnostic::EmptySection {
+                    section: ".z2".to_string(),
+                },
+            ]
+        );
+
+        // Manually constructed zero-size ImageSection is rejected by validate() and ignored
+        // by page_protections() / section_at() / read_byte().
+        let bad_zero = GuestImage {
+            image_base: BASE,
+            size_of_image: 0x2000,
+            section_alignment: 0x1000,
+            entry_point_rva: 0,
+            headers_mapped: false,
+            executable_bytes: ExecutableBytes::Keep,
+            relocs_stripped: false,
+            sections: vec![ImageSection {
+                name: ".empty".to_string(),
+                rva: 0x1200,
+                virtual_size: 0,
+                protection: Protection::READ_ONLY,
+                is_headers: false,
+                bytes_omitted: false,
+                characteristics: R,
+                data: &[],
+            }],
+            relocations: Vec::new(),
+        };
+        assert_eq!(
+            bad_zero.validate(),
+            Err(ImageError::InvalidSection {
+                index: 0,
+                reason: "zero in-memory size",
+            })
+        );
+        assert!(bad_zero.page_protections().is_empty());
+        assert!(bad_zero.section_at(0x1200).is_none());
+        assert_eq!(bad_zero.sections[0].read_byte(0x1200), None);
+        assert!(!bad_zero.sections[0].read_into(0x1200, &mut []));
+        assert!(render_manifest_json(&bad_zero, &[]).is_err());
+    }
+
+    #[test]
+    fn r51_deterministic_section_layout_ordering_and_diagnostics() {
+        let mk_sections = |order: &[usize]| -> Vec<Sec> {
+            let all = [
+                Sec::new(".empty", 0x0800, 0, Vec::new(), R),
+                Sec::new(".text", 0x1000, 0x200, vec![0x90; 0x100], R | X),
+                Sec::new(".rdata", 0x2000, 0x100, vec![0x42; 0x80], R),
+                Sec::new(".data", 0x3000, 0x400, vec![0x11; 0x200], R | W),
+                Sec::new(".bss", 0x4000, 0x1000, Vec::new(), R | W),
+            ];
+            order
+                .iter()
+                .map(|&i| Sec {
+                    name: all[i].name,
+                    rva: all[i].rva,
+                    virtual_size: all[i].virtual_size,
+                    raw: all[i].raw.clone(),
+                    characteristics: all[i].characteristics,
+                })
+                .collect()
+        };
+        let opts = ImageOptions {
+            map_headers: false,
+            executable_bytes: ExecutableBytes::Keep,
+        };
+        let baseline_file = build_pe(&Spec::new(0x6000, mk_sections(&[0, 1, 2, 3, 4])));
+        let baseline = build(&baseline_file, opts).expect("baseline builds");
+        let baseline_bytes = write_image(&baseline.image).expect("baseline writes");
+        let baseline_manifest =
+            render_manifest_json(&baseline.image, &baseline.diagnostics).expect("manifest");
+
+        for perm in [
+            [4, 3, 2, 1, 0],
+            [2, 0, 4, 1, 3],
+            [3, 1, 4, 0, 2],
+        ] {
+            let file = build_pe(&Spec::new(0x6000, mk_sections(&perm)));
+            let built = build(&file, opts).expect("perm builds");
+            assert_eq!(built.diagnostics, baseline.diagnostics);
+            assert_eq!(built.image.page_protections(), baseline.image.page_protections());
+            assert_eq!(write_image(&built.image).expect("writes"), baseline_bytes);
+            assert_eq!(
+                render_manifest_json(&built.image, &built.diagnostics).expect("manifest"),
+                baseline_manifest
+            );
+        }
+
+        // Colliding RVAs produce identical deterministic OverlappingSections errors regardless
+        // of section header order in the PE.
+        let dup_ab = build_pe(&Spec::new(
+            0x3000,
+            vec![
+                Sec::new(".alpha", 0x1000, 0x20, vec![1; 0x10], R),
+                Sec::new(".beta", 0x1000, 0x20, vec![2; 0x10], R | W),
+            ],
+        ));
+        let dup_ba = build_pe(&Spec::new(
+            0x3000,
+            vec![
+                Sec::new(".beta", 0x1000, 0x20, vec![2; 0x10], R | W),
+                Sec::new(".alpha", 0x1000, 0x20, vec![1; 0x10], R),
+            ],
+        ));
+        assert_eq!(
+            build(&dup_ab, opts).map(|_| ()),
+            build(&dup_ba, opts).map(|_| ())
+        );
+        assert_eq!(
+            build(&dup_ab, opts).map(|_| ()),
+            Err(ImageError::OverlappingSections {
+                first: ".alpha".to_string(),
+                second: ".beta".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn r51_deterministic_rva_and_va_reads_and_roundtrip_equivalence() {
+        let mut data = vec![0x55u8; 0x20];
+        data.extend_from_slice(&[0u8; 0x20]);
+        let spec = Spec::new(
+            0x4000,
+            vec![
+                Sec::new(".part1", 0x1000, 0x100, vec![0xAA; 0x80], R),
+                Sec::new(".part2", 0x1100, 0x100, data, R | W),
+                Sec::new(".far", 0x3000, 0x40, vec![0xCC; 0x20], R | X),
+            ],
+        );
+        let file = build_pe(&spec);
+        let image = build(&file, ImageOptions::default()).expect("builds").image;
+        let container = write_image(&image).expect("writes");
+        let reloaded = read_image(&container).expect("reloads");
+        let materialized = image.materialize();
+
+        // Contiguous read spanning .part1 (initialized + BSS tail) into .part2 (initialized + BSS tail).
+        let span = image
+            .read_bytes_rva(0x1060, 0x120)
+            .expect("contiguous cross-section read succeeds");
+        assert_eq!(span, materialized[0x1060..0x1180]);
+        assert_eq!(reloaded.read_bytes_rva(0x1060, 0x120), Some(span.clone()));
+        assert_eq!(
+            reloaded.read_bytes_va(BASE + 0x1060, 0x120),
+            Some(span.clone())
+        );
+
+        // Zero-length read succeeds inside mapped sections and fails in unmapped gaps.
+        assert_eq!(image.read_bytes_rva(0x1000, 0), Some(Vec::new()));
+        assert_eq!(image.read_bytes_rva(0x2000, 0), None);
+        assert_eq!(image.read_bytes_va(BASE + 0x2000, 0), None);
+
+        // Read crossing into the unmapped gap [0x1200, 0x3000) is rejected atomically.
+        let mut dst = vec![0xFEu8; 0x40];
+        assert!(!image.read_into_rva(0x11E0, &mut dst));
+        assert!(dst.iter().all(|&b| b == 0xFE));
+        assert!(!image.read_into_va(BASE + 0x11E0, &mut dst));
+        assert!(dst.iter().all(|&b| b == 0xFE));
+    }
+
+    #[test]
+    fn r51_inconsistent_section_bounds_never_underflow_or_panic() {
+        let oversized_payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let invalid_image = GuestImage {
+            image_base: BASE,
+            size_of_image: 0x2000,
+            section_alignment: 0x1000,
+            entry_point_rva: 0,
+            headers_mapped: false,
+            executable_bytes: ExecutableBytes::Keep,
+            relocs_stripped: false,
+            sections: vec![ImageSection {
+                name: ".bad".to_string(),
+                rva: 0x1000,
+                virtual_size: 4, // smaller than data.len() == 6
+                protection: Protection::READ_ONLY,
+                is_headers: false,
+                bytes_omitted: false,
+                characteristics: R,
+                data: &oversized_payload,
+            }],
+            relocations: Vec::new(),
+        };
+
+        assert_eq!(
+            invalid_image.validate(),
+            Err(ImageError::InvalidSection {
+                index: 0,
+                reason: "initialised bytes exceed in-memory size",
+            })
+        );
+        assert!(invalid_image.try_materialize().is_err());
+        assert!(invalid_image.rebased(BASE).is_err());
+        assert!(write_image(&invalid_image).is_err());
+        assert!(render_manifest_json(&invalid_image, &[]).is_err());
+
+        // Even direct defensive helpers strictly clamp to virtual_size (never read bytes 4..6).
+        assert_eq!(invalid_image.sections[0].initialized_len(), 4);
+        assert_eq!(invalid_image.sections[0].bss_tail_len(), 0);
+        assert_eq!(invalid_image.sections[0].read_byte(0x1003), Some(0x44));
+        assert_eq!(invalid_image.sections[0].read_byte(0x1004), None);
+        let mem = invalid_image.materialize();
+        assert_eq!(&mem[0x1000..0x1006], &[0x11, 0x22, 0x33, 0x44, 0x00, 0x00]);
     }
 }
