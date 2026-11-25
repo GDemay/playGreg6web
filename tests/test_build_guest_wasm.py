@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f)."""
+"""Unit and CLI tests for tools/build_guest_wasm.py (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f; Track 4 / T44)."""
 
 from __future__ import annotations
 
@@ -6938,6 +6938,617 @@ class TestSplitDefaultPthreadPoolSize(unittest.TestCase):
             "default: 4 monolithic, 48 when --split-modules > 1",
             pool_action.help or "",
         )
+
+
+def _multimodule_bink2_program_layout(root: Path) -> Path:
+    """Create a synthetic R12/R44 build-program tree with main + vcruntime140 + bink2scarlett."""
+    src = root / "program-bink2"
+    _module_layout(src, "vcruntime140", shards=2)
+    _module_layout(src, "bink2scarlett", shards=2)
+    _module_layout(src, "main", shards=3)
+    # Include an extra non-`shard-*` guest DLL .ll unit to confirm it is bucketed as a side shard.
+    _write(
+        src / "bink2scarlett" / "bink2_extra.ll",
+        "; ModuleID = 'bink2_extra'\n"
+        "define void @sub_180002200(ptr %s) { ret void }\n",
+    )
+    _write(src / "exports" / "pg6_export_thunks.cpp", "void pg6_export_thunks() {}\n")
+    _write(src / "program_modules.cpp", "const int pg6_program_modules = 3;\n")
+    _write(
+        src / "pg6_program.cpp",
+        'extern "C" const int __playgta6_shard_dispatch_vcruntime140;\n'
+        'extern "C" const int __playgta6_shard_dispatch_bink2scarlett;\n'
+        'extern "C" const int __playgta6_shard_dispatch_main;\n',
+    )
+    manifest = {
+        "schema": "playgta6-recomp-program",
+        "schema_version": 1,
+        "options": {
+            "allow_allocator_split": False,
+            "force_guest": ["bink2scarlett.dll"],
+            "build": {
+                "emit_obj": False,
+                "shard_size": 128,
+                "indirect_dispatch": "shard",
+            },
+        },
+        "modules": [
+            {
+                "file": "vcruntime140.dll",
+                "dll": "vcruntime140.dll",
+                "module": "vcruntime140",
+                "role": "dll",
+                "entry_point": "0x180101000",
+                "registration": {
+                    "register_function": "__playgta6_register_lifted_functions_vcruntime140",
+                    "table_symbol": "__playgta6_lifted_functions_vcruntime140",
+                    "shard_dispatch_symbol": "__playgta6_shard_dispatch_vcruntime140",
+                    "count": 40,
+                },
+                "bridge": {
+                    "thunks_symbol": "pg6_import_thunks_vcruntime140",
+                    "thunk_count_symbol": "pg6_import_thunk_count_vcruntime140",
+                },
+            },
+            {
+                "file": "Bink2Scarlett.dll",
+                "dll": "bink2scarlett.dll",
+                "module": "bink2scarlett",
+                "role": "dll",
+                "entry_point": "0x180001000",
+                "tls": {"index": 1, "callbacks": ["0x180001080"]},
+                "registration": {
+                    "register_function": "__playgta6_register_lifted_functions_bink2scarlett",
+                    "table_symbol": "__playgta6_lifted_functions_bink2scarlett",
+                    "shard_dispatch_symbol": "__playgta6_shard_dispatch_bink2scarlett",
+                    "count": 120,
+                },
+                "bridge": {
+                    "thunks_symbol": "pg6_import_thunks_bink2scarlett",
+                    "thunk_count_symbol": "pg6_import_thunk_count_bink2scarlett",
+                },
+                "exports": {
+                    "total": 42,
+                    "functions": 42,
+                    "data": 0,
+                },
+            },
+            {
+                "file": "game.exe",
+                "dll": "game.exe",
+                "module": "main",
+                "role": "exe",
+                "entry_point": "0x140001000",
+                "iat_prefill": [
+                    {
+                        "slot_rva": "0x2000",
+                        "value": "0x180002000",
+                        "import": "bink2scarlett.dll!BinkOpen",
+                    }
+                ],
+                "registration": {
+                    "register_function": "__playgta6_register_lifted_functions_main",
+                    "table_symbol": "__playgta6_lifted_functions_main",
+                    "shard_dispatch_symbol": "__playgta6_shard_dispatch_main",
+                    "count": 500,
+                },
+                "bridge": {
+                    "thunks_symbol": "pg6_import_thunks_main",
+                    "thunk_count_symbol": "pg6_import_thunk_count_main",
+                },
+            },
+        ],
+        "imports": [
+            {
+                "importer": "game.exe",
+                "dll": "Bink2Scarlett.dll",
+                "name": "BinkOpen",
+                "binding": "guest",
+                "provider": "bink2scarlett.dll",
+                "target": "0x180002000",
+                "kind": "function",
+            },
+            {
+                "importer": "game.exe",
+                "dll": "Bink2Scarlett.dll",
+                "name": "BinkDoFrame",
+                "binding": "guest",
+                "provider": "bink2scarlett.dll",
+                "target": "0x180002100",
+                "kind": "function",
+            },
+        ],
+        "files": [
+            {"path": "exports/pg6_export_thunks.cpp"},
+            {"path": "program_modules.cpp"},
+            {"path": "pg6_program.cpp"},
+        ],
+    }
+    (src / "program-manifest.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+    return src
+
+
+class TestMultiModuleBink2AsymmetricSplit(unittest.TestCase):
+    """T44 (#889): Multi-module build-program + Bink2Scarlett.dll under -sSIDE_MODULE=2."""
+
+    def _repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void wasm_boot() {}\n")
+        return repo
+
+    def test_required_export_prefixes_and_manifest_extraction_preserve_guest_dll_symbols(
+        self,
+    ) -> None:
+        for sym in (
+            "pg6_import_thunks_bink2scarlett",
+            "pg6_import_thunk_count_bink2scarlett",
+            "pg6_import_thunks_vcruntime140",
+            "pg6_import_thunk_count_vcruntime140",
+            "pg6_import_thunks",
+            "pg6_import_thunk_count",
+            "pg6_export_thunks",
+            "pg6_export_thunk_count",
+            "__playgta6_register_lifted_functions_bink2scarlett",
+            "__playgta6_lifted_functions_bink2scarlett",
+            "__playgta6_lifted_function_count_bink2scarlett",
+            "__playgta6_shard_dispatch_bink2scarlett",
+            "__playgta6_dispatch_shard_bink2scarlett_00000",
+        ):
+            self.assertTrue(
+                bgw.is_required_side_export_symbol(sym),
+                f"expected {sym!r} to be preserved as a required side-module export",
+            )
+        self.assertFalse(bgw.is_required_side_export_symbol("sub_180009990"))
+        self.assertFalse(bgw.is_required_side_export_symbol("bink2_internal_scratch"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = _multimodule_bink2_program_layout(Path(tmp))
+            extracted = bgw.extract_program_required_exports(src)
+            for expected_sym in (
+                "__playgta6_register_lifted_functions_bink2scarlett",
+                "__playgta6_lifted_functions_bink2scarlett",
+                "__playgta6_lifted_function_count_bink2scarlett",
+                "__playgta6_shard_dispatch_bink2scarlett",
+                "pg6_import_thunks_bink2scarlett",
+                "pg6_import_thunk_count_bink2scarlett",
+                "__playgta6_register_lifted_functions_vcruntime140",
+                "__playgta6_shard_dispatch_vcruntime140",
+                "pg6_import_thunks_vcruntime140",
+                "pg6_import_thunk_count_vcruntime140",
+                "sub_180001000",  # bink2scarlett DllMain
+                "sub_180001080",  # bink2scarlett TLS callback
+                "sub_180002000",  # BinkOpen guest export target
+                "sub_180002100",  # BinkDoFrame guest export target
+                "sub_180101000",  # vcruntime140 DllMain
+                "sub_140001000",  # main entry_point
+            ):
+                self.assertIn(expected_sym, extracted)
+
+            # Direct compute_side_module_cross_exports preserves bridge thunk globals
+            # even if placed in a side bucket, while still pruning private symbols.
+            nm_by_obj = {
+                "bink2_side.o": "\n".join(
+                    [
+                        "00000000 D pg6_import_thunks_bink2scarlett",
+                        "00000008 D pg6_import_thunk_count_bink2scarlett",
+                        "00000010 T __playgta6_dispatch_shard_bink2scarlett_00000",
+                        "00000020 T sub_180002000",
+                        "00000030 T sub_180009990",  # private -> PRUNE
+                    ]
+                )
+            }
+            exports = bgw.compute_side_module_cross_exports(
+                [[Path("cache/bink2_side.o")]],
+                [],
+                Path("llvm-nm"),
+                run_command=lambda argv: bgw.CommandResult(
+                    returncode=0,
+                    stdout="\n".join(
+                        nm_by_obj[Path(tok).name]
+                        for tok in argv[1:]
+                        if not str(tok).startswith("-")
+                    )
+                    + "\n",
+                ),
+                required_names=bgw.SIDE_MODULE_REQUIRED_EXPORT_NAMES | extracted,
+            )
+            self.assertEqual(
+                exports[0],
+                [
+                    "__playgta6_dispatch_shard_bink2scarlett_00000",
+                    "pg6_import_thunk_count_bink2scarlett",
+                    "pg6_import_thunks_bink2scarlett",
+                    "sub_180002000",
+                ],
+            )
+            self.assertNotIn("sub_180009990", exports[0])
+
+    def test_discover_guest_dll_modules_sanitizes_and_detects_nested_shard_dispatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) Full program-manifest.json (recomp build-program schema)
+            src = _multimodule_bink2_program_layout(root)
+            self.assertEqual(
+                bgw.discover_guest_dll_modules(src),
+                ("vcruntime140", "bink2scarlett"),
+            )
+            det = bgw.detect_indirect_dispatch(src, bgw.discover_sources(src))
+            self.assertEqual(det, bgw.IndirectDispatchDetection("shard", "program-manifest.json"))
+
+            # 2) Legacy manifest without `role` field (only `file`)
+            legacy_src = _program_layout(root / "legacy")
+            self.assertEqual(
+                bgw.discover_guest_dll_modules(legacy_src),
+                ("vcruntime140",),
+            )
+
+            # 3) Dirty host path in module entry is sanitized to bare module identifier
+            dirty = root / "dirty"
+            dirty.mkdir()
+            (dirty / bgw.PROGRAM_MANIFEST_FILE).write_text(
+                json.dumps(
+                    {
+                        "modules": [
+                            {"module": r"C:\Users\alice\work\bink2scarlett", "role": "dll"},
+                            {"module": "../secret/vcruntime140", "role": "dll"},
+                            {"module": "bink2scarlett", "role": "dll"},  # duplicate ignored
+                            {"module": "game_entry", "role": "exe"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cleaned = bgw.discover_guest_dll_modules(dirty)
+            self.assertEqual(cleaned, ("bink2scarlett", "vcruntime140"))
+            for item in cleaned:
+                self.assertNotIn("\\", item)
+                self.assertNotIn("/", item)
+                self.assertNotIn("alice", item)
+
+            # 4) Single-module directory without program-manifest.json -> empty tuple
+            single = root / "single"
+            _write(single / "lift" / "shard-00000.ll", "; single\n")
+            self.assertEqual(bgw.discover_guest_dll_modules(single), ())
+
+    def test_multimodule_bink2scarlett_asymmetric_split_build_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            orig_lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            src = _multimodule_bink2_program_layout(root)
+            cache = root / "cache"
+            out_dir = root / "dist"
+
+            # 1) CLI dry-run JSON reports guest_dll_modules and includes all bink2scarlett .ll shards.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "asymmetric",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(cache),
+                    "--out-dir",
+                    str(out_dir),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            dry_payload = json.loads(out)
+            self.assertTrue(dry_payload["ok"])
+            self.assertEqual(dry_payload["indirect_dispatch"], "shard")
+            self.assertEqual(dry_payload["indirect_dispatch_source"], "program-manifest.json")
+            self.assertEqual(
+                dry_payload["guest_dll_modules"],
+                ["vcruntime140", "bink2scarlett"],
+            )
+            self.assertEqual(dry_payload["side_module_mode"], 2)
+            self.assertEqual(len(dry_payload["side_modules"]), 3)
+            dry_shard_ids = [
+                sid
+                for side in dry_payload["side_modules"]
+                if side["role"] == "shards"
+                for sid in side["shards"]
+            ]
+            dry_reg_ids = [
+                sid
+                for side in dry_payload["side_modules"]
+                if side["role"] == "registration"
+                for sid in side["shards"]
+            ]
+            for expected_bink_shard in (
+                "bink2scarlett/bink2_extra.ll",
+                "bink2scarlett/lift/shard-00000.ll",
+                "bink2scarlett/lift/shard-00001.ll",
+                "vcruntime140/lift/shard-00000.ll",
+                "vcruntime140/lift/shard-00001.ll",
+                "main/lift/shard-00000.ll",
+                "main/lift/shard-00001.ll",
+                "main/lift/shard-00002.ll",
+            ):
+                self.assertIn(expected_bink_shard, dry_shard_ids)
+            self.assertEqual(
+                dry_reg_ids,
+                [
+                    "bink2scarlett/lift/functions.ll",
+                    "main/lift/functions.ll",
+                    "vcruntime140/lift/functions.ll",
+                ],
+            )
+            self.assertNotIn("\\\\", out)
+
+            # 2) Full mocked asymmetric (-sSIDE_MODULE=2) build with realistic llvm-nm symbols.
+            nm_outputs = {
+                "bink2scarlett__bink2_extra": "\n".join(
+                    [
+                        "00000000 T sub_180002200",  # called from main shard -> cross-bucket export
+                        "00000010 T sub_180009901",  # private in bink2 -> PRUNE
+                    ]
+                ),
+                "bink2scarlett__lift__shard-00000": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_bink2scarlett_00000",
+                        "00000010 T sub_180001000",  # DllMain (from manifest entry_point) -> KEEP
+                        "00000020 T sub_180002000",  # BinkOpen (from manifest guest import/IAT) -> KEEP
+                        "00000030 T sub_180009990",  # private internal Bink2 helper -> PRUNE
+                        "         U sub_180009991",  # intra-bucket call to shard-00001 -> PRUNE
+                    ]
+                ),
+                "bink2scarlett__lift__shard-00001": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_bink2scarlett_00001",
+                        "00000010 T sub_180002100",  # BinkDoFrame (from manifest guest import) -> KEEP
+                        "00000020 T sub_180009991",  # intra-bucket helper -> PRUNE
+                    ]
+                ),
+                "main__lift__shard-00000": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_main_00000",
+                        "00000010 T sub_140001000",  # main entry_point -> KEEP
+                        "00000020 T sub_140009990",  # private in main -> PRUNE
+                        "         U sub_180102000",  # cross-bucket call to vcruntime140 in part_1
+                    ]
+                ),
+                "main__lift__shard-00001": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_main_00001",
+                        "00000010 T sub_140009991",  # private -> PRUNE
+                    ]
+                ),
+                "main__lift__shard-00002": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_main_00002",
+                        "00000010 T sub_140009992",  # private -> PRUNE
+                    ]
+                ),
+                "vcruntime140__lift__shard-00000": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_vcruntime140_00000",
+                        "00000010 T sub_180101000",  # vcruntime140 DllMain -> KEEP
+                    ]
+                ),
+                "vcruntime140__lift__shard-00001": "\n".join(
+                    [
+                        "00000000 T __playgta6_dispatch_shard_vcruntime140_00001",
+                        "00000010 T sub_180102000",  # called from part_0 -> cross-bucket KEEP
+                        "00000020 T sub_180109999",  # private -> PRUNE
+                        "         U sub_180002200",  # cross-bucket call into bink2_extra in part_0
+                    ]
+                ),
+                "bink2scarlett__lift__functions": "\n".join(
+                    [
+                        "00000000 T __playgta6_register_lifted_functions_bink2scarlett",
+                        "00000010 D __playgta6_lifted_functions_bink2scarlett",
+                        "00000018 D __playgta6_lifted_function_count_bink2scarlett",
+                        "00000020 D __playgta6_shard_dispatch_bink2scarlett",
+                        "00000030 D bink2_reg_internal_pad",  # private -> PRUNE
+                        "         U __playgta6_dispatch_shard_bink2scarlett_00000",
+                        "         U __playgta6_dispatch_shard_bink2scarlett_00001",
+                    ]
+                ),
+                "vcruntime140__lift__functions": "\n".join(
+                    [
+                        "00000000 T __playgta6_register_lifted_functions_vcruntime140",
+                        "00000010 D __playgta6_lifted_functions_vcruntime140",
+                        "00000018 D __playgta6_lifted_function_count_vcruntime140",
+                        "00000020 D __playgta6_shard_dispatch_vcruntime140",
+                        "         U __playgta6_dispatch_shard_vcruntime140_00000",
+                        "         U __playgta6_dispatch_shard_vcruntime140_00001",
+                    ]
+                ),
+                "main__lift__functions": "\n".join(
+                    [
+                        "00000000 T __playgta6_register_lifted_functions_main",
+                        "00000010 D __playgta6_lifted_functions_main",
+                        "00000018 D __playgta6_lifted_function_count_main",
+                        "00000020 D __playgta6_shard_dispatch_main",
+                        "         U __playgta6_dispatch_shard_main_00000",
+                        "         U __playgta6_dispatch_shard_main_00001",
+                        "         U __playgta6_dispatch_shard_main_00002",
+                    ]
+                ),
+                "pg6_program": "\n".join(
+                    [
+                        "00000000 D pg6_program",
+                        "         U __playgta6_shard_dispatch_bink2scarlett",
+                        "         U __playgta6_shard_dispatch_vcruntime140",
+                        "         U __playgta6_shard_dispatch_main",
+                        "         U pg6_import_thunks_bink2scarlett",
+                        "         U pg6_import_thunk_count_bink2scarlett",
+                    ]
+                ),
+                "bink2scarlett__stubs__pg6_import_thunks": "\n".join(
+                    [
+                        "00000000 D pg6_import_thunks_bink2scarlett",
+                        "00000008 D pg6_import_thunk_count_bink2scarlett",
+                    ]
+                ),
+            }
+
+            class SizedMultiModuleRunner(RecordingRunner):
+                def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                    res = super().__call__(argv)
+                    tokens = tuple(str(a) for a in argv)
+                    out_path = _dash_o(tokens)
+                    if res.returncode == 0 and out_path is not None:
+                        p = Path(out_path)
+                        if p.suffix.lower() == ".o":
+                            p.write_bytes(b"\x00" * 100)
+                    return res
+
+            runner = SizedMultiModuleRunner(nm_outputs=nm_outputs)
+            report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                max_side_module_mib=994,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertEqual(report.side_module_mode, 2)
+            self.assertEqual(report.guest_dll_modules, ("vcruntime140", "bink2scarlett"))
+            self.assertEqual(len(report.side_modules), 3)
+            self.assertEqual([m.role for m in report.side_modules], ["shards", "shards", "registration"])
+
+            # Every shard of bink2scarlett, vcruntime140, and main is included in side modules,
+            # and all 3 registration functions.ll live in guest_part_2.wasm.
+            part0_shards = set(report.side_modules[0].shards)
+            part1_shards = set(report.side_modules[1].shards)
+            self.assertEqual(len(part0_shards & part1_shards), 0)
+            all_bucketed = part0_shards | part1_shards
+            self.assertEqual(
+                all_bucketed,
+                {
+                    "bink2scarlett/bink2_extra.ll",
+                    "bink2scarlett/lift/shard-00000.ll",
+                    "bink2scarlett/lift/shard-00001.ll",
+                    "main/lift/shard-00000.ll",
+                    "main/lift/shard-00001.ll",
+                    "main/lift/shard-00002.ll",
+                    "vcruntime140/lift/shard-00000.ll",
+                    "vcruntime140/lift/shard-00001.ll",
+                },
+            )
+            self.assertEqual(
+                report.side_modules[2].shards,
+                (
+                    "bink2scarlett/lift/functions.ll",
+                    "main/lift/functions.ll",
+                    "vcruntime140/lift/functions.ll",
+                ),
+            )
+
+            # Verify bink2scarlett import thunks & program units are linked in main runtime.wasm,
+            # while zero .ll shards leak into main link.
+            main_call = runner.link_calls[0]
+            main_names = {Path(t).name for t in main_call}
+            by_id = {u.unit.unit_id: u for u in report.sources}
+            for cpp_id in (
+                "bink2scarlett/stubs/pg6_import_thunks.cpp",
+                "vcruntime140/stubs/pg6_import_thunks.cpp",
+                "main/stubs/pg6_import_thunks.cpp",
+                "exports/pg6_export_thunks.cpp",
+                "pg6_program.cpp",
+                "program_modules.cpp",
+            ):
+                obj = by_id[cpp_id].object_path
+                assert obj is not None
+                self.assertIn(obj.name, main_names)
+            for ll_id in all_bucketed | set(report.side_modules[2].shards):
+                obj = by_id[ll_id].object_path
+                assert obj is not None
+                self.assertNotIn(obj.name, main_names)
+
+            # Inspect generated -Wl,--export=<sym> response files for all 3 side modules.
+            all_shard_export_lines = set(
+                (cache / "side_part_0_exports.rsp").read_text(encoding="utf-8").splitlines()
+            ) | set(
+                (cache / "side_part_1_exports.rsp").read_text(encoding="utf-8").splitlines()
+            )
+            for expected_export in (
+                "__playgta6_dispatch_shard_bink2scarlett_00000",
+                "__playgta6_dispatch_shard_bink2scarlett_00001",
+                "__playgta6_dispatch_shard_vcruntime140_00000",
+                "__playgta6_dispatch_shard_vcruntime140_00001",
+                "__playgta6_dispatch_shard_main_00000",
+                "sub_180001000",  # bink2scarlett DllMain
+                "sub_180002000",  # BinkOpen
+                "sub_180002100",  # BinkDoFrame
+                "sub_180002200",  # bink2_extra cross-bucket callee
+                "sub_180101000",  # vcruntime140 DllMain
+                "sub_180102000",  # vcruntime140 cross-bucket callee from part_0
+                "sub_140001000",  # main entry
+            ):
+                self.assertIn(f"-Wl,--export={expected_export}", all_shard_export_lines)
+            for pruned_internal in (
+                "sub_180009901",
+                "sub_180009990",
+                "sub_180009991",
+                "sub_140009990",
+                "sub_140009991",
+                "sub_140009992",
+                "sub_180109999",
+            ):
+                self.assertNotIn(f"-Wl,--export={pruned_internal}", all_shard_export_lines)
+
+            reg_export_lines = set(
+                (cache / "side_part_2_exports.rsp").read_text(encoding="utf-8").splitlines()
+            )
+            self.assertIn(bgw.SIDE_MODULE_CTOR_EXPORT_FLAG, reg_export_lines)
+            for expected_reg in (
+                "__playgta6_register_lifted_functions_bink2scarlett",
+                "__playgta6_lifted_functions_bink2scarlett",
+                "__playgta6_lifted_function_count_bink2scarlett",
+                "__playgta6_shard_dispatch_bink2scarlett",
+                "__playgta6_register_lifted_functions_vcruntime140",
+                "__playgta6_lifted_functions_vcruntime140",
+                "__playgta6_lifted_function_count_vcruntime140",
+                "__playgta6_shard_dispatch_vcruntime140",
+                "__playgta6_register_lifted_functions_main",
+                "__playgta6_lifted_functions_main",
+                "__playgta6_lifted_function_count_main",
+                "__playgta6_shard_dispatch_main",
+            ):
+                self.assertIn(f"-Wl,--export={expected_reg}", reg_export_lines)
+            self.assertNotIn("-Wl,--export=bink2_reg_internal_pad", reg_export_lines)
+
+            # Verify guest_manifest.json, JSON summary, and text report record guest_dll_modules.
+            gm_text = (out_dir / bgw.GUEST_MANIFEST_FILE).read_text(encoding="utf-8")
+            self.assertNotIn("\\\\", gm_text)
+            gm = json.loads(gm_text)
+            self.assertEqual(gm["guest_dll_modules"], ["vcruntime140", "bink2scarlett"])
+            self.assertEqual(gm["splitStrategy"], "asymmetric")
+            self.assertEqual(gm["sideModuleMode"], 2)
+            self.assertEqual(gm["indirectDispatch"], "shard")
+
+            json_summary = bgw.report_to_json(report)
+            self.assertNotIn("\\\\", json_summary)
+            parsed_summary = json.loads(json_summary)
+            self.assertEqual(
+                parsed_summary["guest_dll_modules"],
+                ["vcruntime140", "bink2scarlett"],
+            )
+
+            text_summary = bgw.format_report_text(report, sanitize=True)
+            self.assertIn("Guest DLL modules: vcruntime140, bink2scarlett", text_summary)
 
 
 if __name__ == "__main__":
