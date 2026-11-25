@@ -46,6 +46,9 @@ export const DEFAULT_BREAKER_WINDOW_MS = 10000;
 export const DEFAULT_MAX_RESPAWNS_PER_SLOT = 16;
 export const DEFAULT_RESPAWN_BACKOFF_BASE_MS = 0;
 export const DEFAULT_RESPAWN_BACKOFF_MAX_MS = 5000;
+export const DEFAULT_MAX_BOOT_RETRIES = 3;
+export const DEFAULT_BOOT_RETRY_BASE_DELAY_MS = 50;
+export const DEFAULT_BOOT_RETRY_MAX_DELAY_MS = 500;
 
 /** Base class for all errors raised by the pool itself. */
 export class WorkerPoolError extends Error {
@@ -214,6 +217,44 @@ function describeErrorEvent(ev) {
   return msg ? String(msg) : 'unknown error';
 }
 
+const TRANSIENT_BOOT_ERROR_NAMES = new Set(['NetworkError']);
+const TRANSIENT_BOOT_ERROR_CODES = new Set([
+  'NETWORK_ERROR',
+  'ERR_NETWORK',
+  'BOOT_TRANSIENT',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'EAGAIN',
+]);
+const TRANSIENT_BOOT_MESSAGE_RE =
+  /\b(?:networkerror|network\s+error|importscripts|failed\s+to\s+(?:fetch|load\s+script)|transient|econnreset|etimedout|econnrefused|eagain)\b|net::err_/i;
+
+function isTransientBootError(err, rawEvent) {
+  const candidates = [];
+  if (err && typeof err === 'object') {
+    candidates.push(err);
+    if (err.cause && typeof err.cause === 'object') candidates.push(err.cause);
+  }
+  if (rawEvent && typeof rawEvent === 'object') {
+    candidates.push(rawEvent);
+    if (rawEvent.error && typeof rawEvent.error === 'object') candidates.push(rawEvent.error);
+  }
+  for (const obj of candidates) {
+    if (obj.transient === true || obj.isTransient === true) return true;
+    if (typeof obj.name === 'string' && TRANSIENT_BOOT_ERROR_NAMES.has(obj.name)) return true;
+    if (typeof obj.code === 'string' && TRANSIENT_BOOT_ERROR_CODES.has(obj.code.toUpperCase())) return true;
+    const msg =
+      typeof obj.reason === 'string'
+        ? obj.reason
+        : typeof obj.message === 'string'
+          ? obj.message
+          : '';
+    if (msg && TRANSIENT_BOOT_MESSAGE_RE.test(msg)) return true;
+  }
+  return false;
+}
+
 /**
  * Bounded pool of dedicated workers speaking the protocol above.
  */
@@ -225,6 +266,7 @@ export class WorkerPool {
    * @param {object} [options.workerOptions] Default `{ type: 'module' }`.
    * @param {number} [options.maxWorkers] Default `defaultPoolSize()`.
    * @param {number} [options.minWorkers=0] Idle shrink never goes below this.
+   * @param {number} [options.minWarmWorkers=0] Warm idle worker reserve floor (clamped to `[0, maxWorkers]`); idle trimming never evicts below this.
    * @param {number} [options.idleTimeoutMs=0] Terminate surplus idle workers after this long (0 = never).
    * @param {number} [options.maxQueue=Infinity] Maximum queued (not yet running) jobs.
    * @param {'reject'|'wait'} [options.overflow='reject'] Policy when the queue is full.
@@ -238,6 +280,9 @@ export class WorkerPool {
    * @param {number} [options.crashWindowMs] Sliding crash-rate window in ms (overrides `breaker.windowMs`).
    * @param {number} [options.respawnBackoffBaseMs=0] Initial exponential backoff delay in ms before respawning a crashed worker (`0` = immediate).
    * @param {number} [options.respawnBackoffMaxMs=5000] Upper bound in ms for exponential respawn backoff.
+   * @param {number} [options.maxBootRetries=3] Max exponential-backoff retries on transient worker boot/startup failures (`0` disables).
+   * @param {number} [options.bootRetryBaseDelayMs=50] Initial exponential backoff delay in ms for transient worker boot retries.
+   * @param {number} [options.bootRetryMaxDelayMs=500] Upper bound in ms for transient worker boot retry backoff.
    * @param {() => number} [options.now] Clock in ms.
    * @param {Function} [options.setTimeout]
    * @param {Function} [options.clearTimeout]
@@ -249,6 +294,7 @@ export class WorkerPool {
       workerOptions = { type: 'module' },
       maxWorkers = defaultPoolSize(),
       minWorkers = 0,
+      minWarmWorkers = 0,
       idleTimeoutMs = 0,
       maxQueue = Infinity,
       overflow = 'reject',
@@ -262,6 +308,9 @@ export class WorkerPool {
       crashWindowMs,
       respawnBackoffBaseMs = DEFAULT_RESPAWN_BACKOFF_BASE_MS,
       respawnBackoffMaxMs = DEFAULT_RESPAWN_BACKOFF_MAX_MS,
+      maxBootRetries = DEFAULT_MAX_BOOT_RETRIES,
+      bootRetryBaseDelayMs = DEFAULT_BOOT_RETRY_BASE_DELAY_MS,
+      bootRetryMaxDelayMs = DEFAULT_BOOT_RETRY_MAX_DELAY_MS,
       now,
       setTimeout: setTimeoutFn,
       clearTimeout: clearTimeoutFn,
@@ -276,6 +325,14 @@ export class WorkerPool {
     if (!Number.isInteger(minWorkers) || minWorkers < 0 || minWorkers > maxWorkers) {
       throw new RangeError(`minWorkers must be an integer in [0, maxWorkers], got ${minWorkers}`);
     }
+    if (
+      typeof minWarmWorkers !== 'number' ||
+      Number.isNaN(minWarmWorkers) ||
+      !Number.isFinite(minWarmWorkers)
+    ) {
+      throw new RangeError(`minWarmWorkers must be a finite number, got ${minWarmWorkers}`);
+    }
+    const clampedMinWarmWorkers = Math.max(0, Math.min(maxWorkers, Math.trunc(minWarmWorkers))) || 0;
     if (overflow !== 'reject' && overflow !== 'wait') {
       throw new RangeError(`overflow must be 'reject' or 'wait', got ${overflow}`);
     }
@@ -329,6 +386,29 @@ export class WorkerPool {
         `respawnBackoffMaxMs must be a finite non-negative number, got ${respawnBackoffMaxMs}`
       );
     }
+    if (!Number.isInteger(maxBootRetries) || maxBootRetries < 0) {
+      throw new RangeError(`maxBootRetries must be a non-negative integer, got ${maxBootRetries}`);
+    }
+    if (
+      typeof bootRetryBaseDelayMs !== 'number' ||
+      Number.isNaN(bootRetryBaseDelayMs) ||
+      !Number.isFinite(bootRetryBaseDelayMs) ||
+      bootRetryBaseDelayMs < 0
+    ) {
+      throw new RangeError(
+        `bootRetryBaseDelayMs must be a finite non-negative number, got ${bootRetryBaseDelayMs}`
+      );
+    }
+    if (
+      typeof bootRetryMaxDelayMs !== 'number' ||
+      Number.isNaN(bootRetryMaxDelayMs) ||
+      !Number.isFinite(bootRetryMaxDelayMs) ||
+      bootRetryMaxDelayMs < 0
+    ) {
+      throw new RangeError(
+        `bootRetryMaxDelayMs must be a finite non-negative number, got ${bootRetryMaxDelayMs}`
+      );
+    }
 
     const breakerObj = breaker && typeof breaker === 'object' ? breaker : null;
     const breakerDisabled = breaker === false && maxConsecutiveCrashes === undefined;
@@ -337,6 +417,7 @@ export class WorkerPool {
       typeof workerFactory === 'function' ? workerFactory : () => new Worker(url, workerOptions);
     this._maxWorkers = maxWorkers;
     this._minWorkers = minWorkers;
+    this._minWarmWorkers = clampedMinWarmWorkers;
     this._idleTimeoutMs = idleTimeoutMs;
     this._maxQueue = maxQueue;
     this._overflow = overflow;
@@ -352,6 +433,9 @@ export class WorkerPool {
       : (crashWindowMs ?? (breakerObj ? breakerObj.windowMs : undefined) ?? DEFAULT_BREAKER_WINDOW_MS);
     this._respawnBackoffBaseMs = respawnBackoffBaseMs;
     this._respawnBackoffMaxMs = respawnBackoffMaxMs;
+    this._maxBootRetries = maxBootRetries;
+    this._bootRetryBaseDelayMs = bootRetryBaseDelayMs;
+    this._bootRetryMaxDelayMs = bootRetryMaxDelayMs;
     this._now =
       now ||
       (() => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()));
@@ -364,6 +448,11 @@ export class WorkerPool {
     this._slotCrashStreak = new Array(maxWorkers).fill(0);
     this._slotBackoffUntil = new Array(maxWorkers).fill(0);
     this._slotBackoffTimers = new Array(maxWorkers).fill(null);
+    this._slotBootRetries = new Array(maxWorkers).fill(0);
+    this._slotBootRetryTimers = new Array(maxWorkers).fill(null);
+    this._slotBootRetryPending = new Array(maxWorkers).fill(false);
+    this._slotBootRetryForWarm = new Array(maxWorkers).fill(false);
+    this._lastSpawnDeferredByBootRetry = false;
     this._queue = [];
     this._blocked = [];
     this._running = 0;
@@ -394,6 +483,9 @@ export class WorkerPool {
       trimmedWorkers: 0,
       circuitBreakerTrips: 0,
       peakQueueDepth: 0,
+      bootRetryCount: 0,
+      bootRetrySuccessCount: 0,
+      bootRetryExhaustedCount: 0,
     };
     this._waitTotal = 0;
     this._waitCount = 0;
@@ -528,21 +620,27 @@ export class WorkerPool {
     return this.terminate(opts);
   }
 
+  /** Alias for `terminate(opts)`. */
+  terminateAll(opts) {
+    return this.terminate(opts);
+  }
+
   /**
    * Pre-spawn idle warm workers up to `count` (clamped to `[0, maxWorkers]`).
    * No-op if the pool is closed or the circuit breaker is open.
-   * @param {number} [count=this._minWorkers]
+   * @param {number} [count=Math.max(this._minWorkers, this._minWarmWorkers)]
    * @returns {number} Current live worker count.
    */
-  warmUp(count = this._minWorkers) {
+  warmUp(count = this._effectiveMinWorkers()) {
     if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
       throw new RangeError(`warmUp count must be a non-negative integer, got ${count}`);
     }
     if (this._closed || this._circuitOpen) return this._slots.size;
     const target = Math.min(count, this._maxWorkers);
     while (this._slots.size < target) {
-      const slot = this._spawn();
+      const slot = this._spawn({ forWarm: true });
       if (!slot) {
+        if (this._lastSpawnDeferredByBootRetry) break;
         this._checkBreaker();
         break;
       }
@@ -552,8 +650,8 @@ export class WorkerPool {
   }
 
   /**
-   * Terminate excess idle workers cleanly down to `minWarm` (least-recently-used first)
-   * to release renderer memory without disrupting active tasks.
+   * Terminate excess idle workers cleanly down to `Math.max(minWarm, minWarmWorkers)`
+   * (least-recently-used first) to release renderer memory without disrupting active tasks.
    * @param {number} [minWarm=0]
    * @returns {{ trimmed: number, remainingIdle: number, active: number }}
    */
@@ -561,6 +659,7 @@ export class WorkerPool {
     if (typeof minWarm !== 'number' || !Number.isInteger(minWarm) || minWarm < 0) {
       throw new RangeError(`trimIdleWorkers minWarm must be a non-negative integer, got ${minWarm}`);
     }
+    const effectiveMinWarm = Math.max(minWarm, this._minWarmWorkers);
     const idleSlots = [];
     let active = 0;
     for (const slot of this._slots) {
@@ -569,9 +668,9 @@ export class WorkerPool {
       else active++;
     }
     let trimmed = 0;
-    if (idleSlots.length > minWarm) {
+    if (idleSlots.length > effectiveMinWarm) {
       idleSlots.sort((a, b) => a.lastIdleSeq - b.lastIdleSeq);
-      const toTrim = idleSlots.length - minWarm;
+      const toTrim = idleSlots.length - effectiveMinWarm;
       for (let i = 0; i < toTrim; i++) {
         this._destroySlot(idleSlots[i]);
         this._counters.trimmedWorkers++;
@@ -594,11 +693,40 @@ export class WorkerPool {
     this._slotNeedsRespawn.fill(false);
     this._slotCrashStreak.fill(0);
     this._clearAllBackoffTimers();
+    this._clearAllBootRetryTimers(true);
   }
 
   /** Alias for `resetCircuitBreaker()`. */
   resetCircuit() {
     this.resetCircuitBreaker();
+  }
+
+  /** Reset cumulative telemetry counters and latency accumulators while keeping live pool state intact. */
+  resetStats() {
+    this._counters = {
+      submitted: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      rejected: 0,
+      crashed: 0,
+      retried: 0,
+      hardKills: 0,
+      spawned: 0,
+      warmReuses: 0,
+      timedOutTasks: 0,
+      respawnedWorkers: 0,
+      trimmedWorkers: 0,
+      circuitBreakerTrips: 0,
+      peakQueueDepth: 0,
+      bootRetryCount: 0,
+      bootRetrySuccessCount: 0,
+      bootRetryExhaustedCount: 0,
+    };
+    this._waitTotal = 0;
+    this._waitCount = 0;
+    this._runTotal = 0;
+    this._runCount = 0;
   }
 
   /** Snapshot of pool counters. Times are in clock milliseconds. */
@@ -616,6 +744,7 @@ export class WorkerPool {
       busy,
       activeWorkers: busy,
       idleWorkers,
+      warmWorkersReserved: Math.min(idleWorkers, this._minWarmWorkers),
       queued,
       blocked,
       queuedTasks,
@@ -640,6 +769,9 @@ export class WorkerPool {
       circuitBreakerTrips: this._counters.circuitBreakerTrips,
       peakQueueDepth: this._counters.peakQueueDepth,
       peakQueuedTasks: this._counters.peakQueueDepth,
+      bootRetryCount: this._counters.bootRetryCount,
+      bootRetrySuccessCount: this._counters.bootRetrySuccessCount,
+      bootRetryExhaustedCount: this._counters.bootRetryExhaustedCount,
       avgWaitMs: this._waitCount ? this._waitTotal / this._waitCount : 0,
       avgRunMs,
       avgTaskMs: avgRunMs,
@@ -889,6 +1021,79 @@ export class WorkerPool {
     this._slotBackoffUntil[index] = 0;
   }
 
+  _effectiveMinWorkers() {
+    return Math.max(this._minWorkers, this._minWarmWorkers);
+  }
+
+  _computeBootRetryDelayMs(attempt) {
+    if (!(this._bootRetryBaseDelayMs > 0) || attempt <= 0) return 0;
+    const exp = Math.min(attempt - 1, 30);
+    const delay = this._bootRetryBaseDelayMs * Math.pow(2, exp);
+    return Math.min(this._bootRetryMaxDelayMs, delay);
+  }
+
+  _clearSlotBootRetryTimer(index, resetCount = true) {
+    const timer = this._slotBootRetryTimers[index];
+    if (timer !== null) {
+      this._clearTimeout(timer);
+      this._slotBootRetryTimers[index] = null;
+    }
+    this._slotBootRetryPending[index] = false;
+    this._slotBootRetryForWarm[index] = false;
+    if (resetCount) this._slotBootRetries[index] = 0;
+  }
+
+  _clearAllBootRetryTimers(resetCount = true) {
+    for (let i = 0; i < this._maxWorkers; i++) {
+      this._clearSlotBootRetryTimer(i, resetCount);
+    }
+  }
+
+  _hasPendingBootRetry() {
+    for (let i = 0; i < this._maxWorkers; i++) {
+      if (this._slotBootRetryPending[i]) return true;
+    }
+    return false;
+  }
+
+  _scheduleBootRetry(index, { forWarm = false } = {}) {
+    const canRunWhileClosed = Boolean(this._terminateState && this._terminateState.graceful);
+    if ((this._closed && !canRunWhileClosed) || this._circuitOpen) return false;
+    if (this._slotBootRetryTimers[index] !== null) {
+      this._clearTimeout(this._slotBootRetryTimers[index]);
+      this._slotBootRetryTimers[index] = null;
+    }
+    this._slotBootRetries[index]++;
+    this._counters.bootRetryCount++;
+    this._slotBootRetryPending[index] = true;
+    if (forWarm) this._slotBootRetryForWarm[index] = true;
+    const delay = this._computeBootRetryDelayMs(this._slotBootRetries[index]);
+    this._slotBootRetryTimers[index] = this._setTimeout(() => {
+      this._slotBootRetryTimers[index] = null;
+      this._slotBootRetryPending[index] = false;
+      const graceful = Boolean(this._terminateState && this._terminateState.graceful);
+      if (this._circuitOpen || (this._closed && !graceful)) {
+        this._slotBootRetryForWarm[index] = false;
+        return;
+      }
+      const warmTarget = this._slotBootRetryForWarm[index];
+      this._slotBootRetryForWarm[index] = false;
+      if (this._queuedCount() > 0 || this._blocked.length > 0) {
+        this._pump();
+      } else if (warmTarget && !this._closed && this._slots.size < this._maxWorkers) {
+        const slot = this._spawn({ preferredIndex: index, forWarm: true });
+        if (slot) {
+          this._armIdle(slot);
+        } else if (!this._lastSpawnDeferredByBootRetry) {
+          this._checkBreaker();
+        }
+      }
+      if (!this._closed) this._ensureMinWorkers();
+      this._checkIdle();
+    }, delay);
+    return true;
+  }
+
   _clearAllBackoffTimers() {
     for (let i = 0; i < this._maxWorkers; i++) {
       this._clearSlotBackoffTimer(i);
@@ -931,7 +1136,7 @@ export class WorkerPool {
     const now = this._now();
     let anyInBackoff = false;
     for (let i = 0; i < this._maxWorkers; i++) {
-      if (occupied.has(i)) continue;
+      if (occupied.has(i) || this._slotBootRetryPending[i]) continue;
       if (
         this._slotNeedsRespawn[i] &&
         this._slotRespawns[i] < this._maxRespawnsPerSlot &&
@@ -944,13 +1149,39 @@ export class WorkerPool {
     return anyInBackoff;
   }
 
-  _pickFreeSlotIndex() {
+  _pickFreeSlotIndex(preferredIndex = -1) {
     const occupied = new Set();
     for (const slot of this._slots) occupied.add(slot.index);
     const now = this._now();
+    if (
+      preferredIndex >= 0 &&
+      preferredIndex < this._maxWorkers &&
+      !occupied.has(preferredIndex) &&
+      !this._slotBootRetryPending[preferredIndex]
+    ) {
+      if (!this._slotNeedsRespawn[preferredIndex]) {
+        return { index: preferredIndex, isRespawn: false };
+      }
+      if (
+        this._slotRespawns[preferredIndex] < this._maxRespawnsPerSlot &&
+        !this._isSlotInBackoff(preferredIndex, now)
+      ) {
+        return { index: preferredIndex, isRespawn: true };
+      }
+    }
+    // Prioritize a slot resuming from a completed boot-retry backoff timer.
+    for (let i = 0; i < this._maxWorkers; i++) {
+      if (occupied.has(i) || this._slotBootRetryPending[i]) continue;
+      if (this._slotBootRetries[i] > 0) {
+        const isRespawn = this._slotNeedsRespawn[i];
+        if (!isRespawn || (this._slotRespawns[i] < this._maxRespawnsPerSlot && !this._isSlotInBackoff(i, now))) {
+          return { index: i, isRespawn };
+        }
+      }
+    }
     let freshCandidate = null;
     for (let i = 0; i < this._maxWorkers; i++) {
-      if (occupied.has(i)) continue;
+      if (occupied.has(i) || this._slotBootRetryPending[i]) continue;
       if (this._slotNeedsRespawn[i]) {
         if (this._slotRespawns[i] < this._maxRespawnsPerSlot) {
           if (!this._isSlotInBackoff(i, now)) {
@@ -964,19 +1195,38 @@ export class WorkerPool {
     return freshCandidate;
   }
 
-  _spawn() {
-    const pick = this._pickFreeSlotIndex();
+  _spawn({ preferredIndex = -1, forWarm = false } = {}) {
+    this._lastSpawnDeferredByBootRetry = false;
+    const pick = this._pickFreeSlotIndex(preferredIndex);
     if (!pick) return null;
     const { index, isRespawn } = pick;
-    if (isRespawn) {
-      this._slotRespawns[index]++;
-    }
     let worker;
     try {
       worker = this._factory();
     } catch (err) {
       this._counters.spawned++;
-      this._recordCrash(new WorkerCrashError('spawn failed: ' + (err && err.message), err));
+      const crashErr = new WorkerCrashError('spawn failed: ' + (err && err.message), err);
+      const canRunWhileClosed = Boolean(this._terminateState && this._terminateState.graceful);
+      if (
+        this._maxBootRetries > 0 &&
+        (!this._closed || canRunWhileClosed) &&
+        !this._circuitOpen &&
+        isTransientBootError(err)
+      ) {
+        if (this._slotBootRetries[index] < this._maxBootRetries) {
+          this._scheduleBootRetry(index, { forWarm });
+          this._lastSpawnDeferredByBootRetry = true;
+          return null;
+        }
+        this._counters.bootRetryExhaustedCount++;
+        this._slotBootRetries[index] = 0;
+      } else if (this._slotBootRetries[index] > 0) {
+        this._slotBootRetries[index] = 0;
+      }
+      if (isRespawn) {
+        this._slotRespawns[index]++;
+      }
+      this._recordCrash(crashErr);
       if (isRespawn && this._slotRespawns[index] < this._maxRespawnsPerSlot) {
         this._slotCrashStreak[index]++;
         const delay = this._computeRespawnBackoffMs(this._slotCrashStreak[index]);
@@ -988,9 +1238,11 @@ export class WorkerPool {
     }
     this._counters.spawned++;
     if (isRespawn) {
+      this._slotRespawns[index]++;
       this._slotNeedsRespawn[index] = false;
       this._counters.respawnedWorkers++;
     }
+    const bootRetryAttempt = this._slotBootRetries[index];
     const slot = {
       index,
       worker,
@@ -1002,11 +1254,14 @@ export class WorkerPool {
       graceTimer: null,
       jobsHandled: 0,
       lastIdleSeq: 0,
+      booted: false,
+      bootRetryAttempt,
+      forWarm,
     };
     this._slots.add(slot);
     listen(worker, 'message', (ev) => this._onMessage(slot, ev && ev.data));
     listen(worker, 'error', (ev) =>
-      this._onCrash(slot, new WorkerCrashError(describeErrorEvent(ev), ev && ev.error))
+      this._onCrash(slot, new WorkerCrashError(describeErrorEvent(ev), ev && ev.error), ev)
     );
     listen(worker, 'messageerror', () =>
       this._onCrash(slot, new WorkerCrashError('messageerror: message could not be deserialised'))
@@ -1019,9 +1274,11 @@ export class WorkerPool {
 
   _ensureMinWorkers() {
     if (this._closed || this._circuitOpen) return;
-    while (this._slots.size < this._minWorkers) {
-      const slot = this._spawn();
+    const target = this._effectiveMinWorkers();
+    while (this._slots.size < target) {
+      const slot = this._spawn({ forWarm: true });
       if (!slot) {
+        if (this._lastSpawnDeferredByBootRetry) break;
         this._checkBreaker();
         if (!this._circuitOpen) {
           this._scheduleAnyBackoffSlots();
@@ -1044,6 +1301,19 @@ export class WorkerPool {
     return best;
   }
 
+  /** Dispatch queued jobs only onto already-idle healthy workers without spawning fresh slots. */
+  _pumpIdleOnly() {
+    for (;;) {
+      if (this._circuitOpen) return;
+      this._admitBlocked();
+      if (this._queuedCount() === 0) return;
+      const slot = this._idleSlot();
+      if (!slot) return;
+      const job = this._nextQueued();
+      this._dispatch(slot, job);
+    }
+  }
+
   /** Move jobs onto workers while capacity and breaker allow. */
   _pump() {
     for (;;) {
@@ -1054,7 +1324,7 @@ export class WorkerPool {
       if (!slot) {
         if (this._slots.size >= this._maxWorkers) return;
         if (!this._pickFreeSlotIndex()) {
-          if (this._scheduleAnyBackoffSlots()) {
+          if (this._scheduleAnyBackoffSlots() || this._hasPendingBootRetry()) {
             return;
           }
           if (this._slots.size === 0) {
@@ -1071,6 +1341,7 @@ export class WorkerPool {
         slot = this._spawn();
         if (!slot) {
           if (this._circuitOpen) return;
+          if (this._lastSpawnDeferredByBootRetry) return;
           // Spawn failed but the breaker is still closed: fail one job rather than spin.
           this._settle(this._nextQueued(), 'fail', this._lastCrash);
           this._checkBreaker();
@@ -1132,9 +1403,15 @@ export class WorkerPool {
     ) {
       slot.idleTimer = this._setTimeout(() => {
         slot.idleTimer = null;
-        if (!slot.dead && slot.state === 'idle' && this._slots.size > this._minWorkers) {
-          this._counters.trimmedWorkers++;
-          this._destroySlot(slot);
+        if (!slot.dead && slot.state === 'idle') {
+          let idleCount = 0;
+          for (const s of this._slots) {
+            if (!s.dead && s.state === 'idle') idleCount++;
+          }
+          if (this._slots.size > this._minWorkers && idleCount > this._minWarmWorkers) {
+            this._counters.trimmedWorkers++;
+            this._destroySlot(slot);
+          }
         }
       }, this._idleTimeoutMs);
     }
@@ -1151,11 +1428,26 @@ export class WorkerPool {
     this._checkIdle();
   }
 
+  _markSlotBooted(slot) {
+    if (slot.booted) return;
+    slot.booted = true;
+    if (slot.bootRetryAttempt > 0) {
+      this._counters.bootRetrySuccessCount++;
+      this._slotBootRetries[slot.index] = 0;
+      slot.bootRetryAttempt = 0;
+    }
+  }
+
   _onMessage(slot, data) {
     if (slot.dead || data === null || typeof data !== 'object') return;
+    if (data.ready === true) {
+      this._markSlotBooted(slot);
+      return;
+    }
     const id = data.id;
     if (slot.state === 'cancelling') {
       if (id === slot.cancelId && (data.cancelled === true || typeof data.ok === 'boolean')) {
+        this._markSlotBooted(slot);
         if (slot.graceTimer !== null) {
           this._clearTimeout(slot.graceTimer);
           slot.graceTimer = null;
@@ -1167,16 +1459,20 @@ export class WorkerPool {
     const job = slot.job;
     if (!job || job.settled || job.id !== id) return;
     if (data.ok === true) {
+      this._markSlotBooted(slot);
       this._slotCrashStreak[slot.index] = 0;
       this._settle(job, 'ok', data.result);
       this._releaseSlot(slot);
     } else if (data.ok === false) {
+      this._markSlotBooted(slot);
       this._settle(job, 'fail', deserializeError(data.error));
       this._releaseSlot(slot);
     } else if (data.cancelled === true) {
+      this._markSlotBooted(slot);
       this._settle(job, 'cancel', new JobAbortedError('cancelled by worker'));
       this._releaseSlot(slot);
     } else if ('progress' in data) {
+      this._markSlotBooted(slot);
       if (job.onProgress) {
         try {
           job.onProgress(data.progress);
@@ -1198,10 +1494,52 @@ export class WorkerPool {
     }
   }
 
-  _onCrash(slot, error) {
+  _onCrash(slot, error, rawEvent = null) {
     if (slot.dead) return;
     const job = slot.job;
     const slotIndex = slot.index;
+    const canRunWhileClosed = Boolean(this._terminateState && this._terminateState.graceful);
+
+    if (
+      !slot.booted &&
+      this._maxBootRetries > 0 &&
+      isTransientBootError(error, rawEvent)
+    ) {
+      if (
+        (!this._closed || canRunWhileClosed) &&
+        !this._circuitOpen &&
+        this._slotBootRetries[slotIndex] < this._maxBootRetries
+      ) {
+        const wasForWarm = slot.forWarm || (job === null && this._slots.size <= this._effectiveMinWorkers());
+        this._destroySlot(slot);
+        if (job && !job.settled) {
+          job.slot = null;
+          if (job.transfer.length === 0) {
+            this._running--;
+            job.state = 'queued';
+            if (job.timeoutTimer !== null) {
+              this._clearTimeout(job.timeoutTimer);
+              job.timeoutTimer = null;
+            }
+            this._enqueue(job);
+          } else {
+            this._settle(job, 'fail', error);
+          }
+        }
+        this._scheduleBootRetry(slotIndex, { forWarm: wasForWarm });
+        this._pumpIdleOnly();
+        this._recordPeakQueueDepth();
+        this._checkIdle();
+        return;
+      }
+      if (this._slotBootRetries[slotIndex] >= this._maxBootRetries) {
+        this._counters.bootRetryExhaustedCount++;
+        this._slotBootRetries[slotIndex] = 0;
+      }
+    } else if (!slot.booted && this._slotBootRetries[slotIndex] > 0) {
+      this._slotBootRetries[slotIndex] = 0;
+    }
+
     this._slotNeedsRespawn[slotIndex] = true;
     this._destroySlot(slot);
     this._recordCrash(error);
@@ -1242,6 +1580,7 @@ export class WorkerPool {
       this._circuitOpen = true;
       this._counters.circuitBreakerTrips++;
       this._clearAllBackoffTimers();
+      this._clearAllBootRetryTimers(true);
       const pending = [...this._drainQueued(), ...this._blocked];
       this._blocked = [];
       for (const job of pending) this._settle(job, 'fail', this._circuitError());
@@ -1250,11 +1589,14 @@ export class WorkerPool {
 
   _checkIdle() {
     if (!this._isIdle()) return;
-    if (this._slots.size >= this._minWorkers) {
+    if (this._slots.size >= this._effectiveMinWorkers()) {
       for (let i = 0; i < this._maxWorkers; i++) {
         if (this._slotBackoffTimers[i] !== null) {
           this._clearTimeout(this._slotBackoffTimers[i]);
           this._slotBackoffTimers[i] = null;
+        }
+        if (this._slotBootRetryTimers[i] !== null && !this._slotBootRetryForWarm[i]) {
+          this._clearSlotBootRetryTimer(i, true);
         }
       }
     }
@@ -1268,6 +1610,7 @@ export class WorkerPool {
   _finishImmediate() {
     const st = this._terminateState;
     this._clearAllBackoffTimers();
+    this._clearAllBootRetryTimers(true);
     const pending = [...this._drainQueued(), ...this._blocked];
     this._blocked = [];
     const running = [];
