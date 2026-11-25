@@ -15,6 +15,7 @@ import {
   DEFAULT_KEY_BINDINGS,
   STANDARD_GAMEPAD_BUTTON_MAP,
   applyDeadzone,
+  applyRadialDeadzone as bridgeApplyRadialDeadzone,
   applyAxialDeadzone,
   applyTriggerDeadzone,
   INPUT_SCRIPT_PRESETS,
@@ -22,6 +23,7 @@ import {
   ScriptedInputPlayer,
   InputBridge,
 } from '../web/input/input_bridge.js';
+import { applyRadialDeadzone } from '../web/input/input_profiles.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2390,4 +2392,257 @@ test('W229 InputBridge drives chrome-full-boot into SAB and formats HUD telemetr
   assert.equal(stats.lastScriptedButton, 'A');
 
   bridge.destroy();
+});
+
+test('W271 applyRadialDeadzone smoothly rescales [inner, outer] -> [0, 1], clamps non-finite inputs, and integrates with gamepad polling', () => {
+  assert.equal(bridgeApplyRadialDeadzone, applyRadialDeadzone);
+
+  // Inside deadzone -> exact +0
+  const inside = applyRadialDeadzone(0.1, -0.08, 0.15, 0.95);
+  assert.deepEqual(inside, { x: 0, y: 0 });
+  assert.ok(Object.is(inside.x, 0));
+  assert.ok(Object.is(inside.y, 0));
+
+  // Boundary at innerDeadzone -> 0; just outside -> smooth ramp from 0
+  assert.deepEqual(applyRadialDeadzone(0.15, 0, 0.15, 0.95), { x: 0, y: 0 });
+  const midX = applyRadialDeadzone(0.55, 0, 0.15, 0.95);
+  approxEqual(midX.x, (0.55 - 0.15) / (0.95 - 0.15)); // 0.5
+  assert.equal(midX.y, 0);
+
+  // Diagonal direction preservation & smooth rescale from [0.2, 0.9]
+  const diag = applyRadialDeadzone(0.5, 0.5, 0.2, 0.9);
+  approxEqual(diag.x, diag.y);
+  approxEqual(Math.hypot(diag.x, diag.y), (Math.hypot(0.5, 0.5) - 0.2) / (0.9 - 0.2));
+
+  // Outer deadzone saturation & unit-disk clamping on diagonal corner
+  const satX = applyRadialDeadzone(0.95, 0, 0.15, 0.95);
+  approxEqual(satX.x, 1.0);
+  assert.equal(satX.y, 0);
+
+  const corner = applyRadialDeadzone(1.0, 1.0, 0.15, 0.95);
+  approxEqual(Math.hypot(corner.x, corner.y), 1.0);
+  approxEqual(corner.x, Math.SQRT1_2);
+  approxEqual(corner.y, Math.SQRT1_2);
+
+  // Non-finite inputs clamp cleanly to { x: 0, y: 0 }
+  assert.deepEqual(applyRadialDeadzone(Number.NaN, 0.5, 0.15, 0.95), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(0.5, Number.POSITIVE_INFINITY, 0.15, 0.95), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(Number.NEGATIVE_INFINITY, Number.NaN, 0.15, 0.95), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(undefined, 0.5, 0.15, 0.95), { x: 0, y: 0 });
+
+  // Zero-alloc scratch object reuse
+  const scratch = { x: 42, y: -42 };
+  const reused = applyRadialDeadzone(0.55, 0, 0.15, 0.95, scratch);
+  assert.equal(reused, scratch);
+  approxEqual(scratch.x, 0.5);
+  assert.equal(scratch.y, 0);
+
+  // End-to-end integration inside InputBridge.pollGamepads() with per-stick deadzones
+  const env = createMockEnv({
+    gamepads: [
+      makeStandardGamepad({
+        index: 0,
+        axes: [0.55, 0.0, 0.2, -0.2],
+      }),
+    ],
+  });
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+    leftStickDeadzone: 0.15,
+    rightStickDeadzone: 0.3,
+    stickOuterDeadzone: 0.95,
+  });
+
+  assert.equal(bridge.pollGamepads(), true);
+  const snap = bridge.getSnapshot();
+  approxEqual(snap.lx, 0.5);
+  approxEqual(snap.ly, 0);
+  // Right stick hypot(0.2, 0.2) ~= 0.2828 < rightStickDeadzone 0.3 -> zeroed
+  assert.equal(snap.rx, 0);
+  assert.equal(snap.ry, 0);
+  assert.equal(bridge.getStats().activeGamepadIndex, 0);
+
+  bridge.destroy();
+});
+
+test('W271 window.blur and document.visibilitychange clear stuck keyboard, mouse, and gamepad inputs and track blurResets', () => {
+  const env = createMockEnv();
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  assert.equal(bridge.getStats().blurResets, 0);
+
+  // Hold keyboard, mouse buttons/delta, and gamepad buttons/sticks/triggers simultaneously
+  env.lockPointer();
+  env.win.dispatch('keydown', { code: 'KeyW' });
+  env.win.dispatch('mousedown', { button: 0 });
+  env.win.dispatch('mousemove', { movementX: 14, movementY: -9 });
+  env.setGamepads([
+    makeStandardGamepad({
+      index: 0,
+      buttons: { 0: 1, 6: 0.7, 7: 0.8 }, // A, LT, RT
+      axes: [0.7, -0.5, -0.6, 0.6],
+    }),
+  ]);
+  assert.equal(bridge.pollGamepads(), true);
+
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.A);
+  assert.equal(snap.mouse_dx, 14);
+  assert.equal(snap.mouse_dy, -9);
+  assert.ok(snap.lx !== 0 && snap.ly !== 0 && snap.rx !== 0 && snap.ry !== 0);
+  assert.ok(snap.lt > 0 && snap.rt > 0);
+
+  // 1. window.blur immediately writes a clean zeroed frame to the SAB and increments blurResets
+  const seqBeforeBlur = snap.seq;
+  env.win.dispatch('blur');
+  snap = bridge.getSnapshot();
+  assert.ok(snap.seq > seqBeforeBlur && (snap.seq & 1) === 0);
+  assert.equal(snap.buttons, 0);
+  assert.equal(snap.mouse_dx, 0);
+  assert.equal(snap.mouse_dy, 0);
+  assert.equal(snap.lx, 0);
+  assert.equal(snap.ly, 0);
+  assert.equal(snap.rx, 0);
+  assert.equal(snap.ry, 0);
+  assert.equal(snap.lt, 0);
+  assert.equal(snap.rt, 0);
+  assert.equal(bridge.getStats().blurResets, 1);
+
+  // 2. Re-engage gamepad + keyboard; visibilitychange while visible (hidden === false) must NOT clear
+  env.win.dispatch('keydown', { code: 'KeyD' });
+  assert.equal(bridge.pollGamepads(), true);
+  assert.notEqual(bridge.getSnapshot().buttons, 0);
+
+  env.doc.hidden = false;
+  env.doc.visibilityState = 'visible';
+  env.doc.dispatch('visibilitychange');
+  assert.notEqual(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getStats().blurResets, 1);
+
+  // 3. visibilitychange with document.hidden === true clears keyboard, mouse, and gamepad cleanly
+  env.doc.hidden = true;
+  env.doc.visibilityState = 'hidden';
+  env.doc.dispatch('visibilitychange');
+
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  assert.equal(snap.mouse_dx, 0);
+  assert.equal(snap.mouse_dy, 0);
+  assert.equal(snap.lx, 0);
+  assert.equal(snap.ly, 0);
+  assert.equal(snap.rx, 0);
+  assert.equal(snap.ry, 0);
+  assert.equal(snap.lt, 0);
+  assert.equal(snap.rt, 0);
+  assert.equal(bridge.getStats().blurResets, 2);
+
+  bridge.destroy();
+});
+
+test('W271 gamepad hot-plug connect/disconnect/failover updates stats cleanly and destroy() removes all listeners', () => {
+  const env = createMockEnv({ withRaf: true });
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // Initial stats
+  let stats = bridge.getStats();
+  assert.equal(stats.blurResets, 0);
+  assert.equal(stats.gamepadConnects, 0);
+  assert.equal(stats.gamepadDisconnects, 0);
+  assert.equal(stats.activeGamepadIndex, null);
+
+  // 1. Connect Xbox controller at index 0 with held A + left stick + right stick + triggers
+  const xboxPad = makeStandardGamepad({
+    index: 0,
+    buttons: { 0: 1, 6: 0.6, 7: 0.9 },
+    axes: [0.8, -0.6, -0.5, 0.5],
+  });
+  env.setGamepads([xboxPad]);
+  env.win.dispatch('gamepadconnected', { gamepad: xboxPad });
+
+  stats = bridge.getStats();
+  assert.equal(bridge.running, true);
+  assert.equal(stats.gamepadConnects, 1);
+  assert.equal(stats.gamepadDisconnects, 0);
+  assert.equal(stats.activeGamepadIndex, 0);
+
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.A);
+  assert.ok(snap.lx > 0 && snap.ly > 0 && snap.rx < 0 && snap.ry < 0);
+  assert.ok(snap.lt > 0 && snap.rt > 0);
+
+  // 2. Disconnect pad 0 even before navigator.getGamepads() removes it -> immediate zeroed SAB frame
+  env.win.dispatch('gamepaddisconnected', { gamepad: { index: 0 } });
+  stats = bridge.getStats();
+  assert.equal(stats.gamepadDisconnects, 1);
+  assert.equal(stats.activeGamepadIndex, null);
+  assert.equal(bridge.running, false);
+  assert.equal(env.pendingRafCount(), 0);
+
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  assert.equal(snap.lx, 0);
+  assert.equal(snap.ly, 0);
+  assert.equal(snap.rx, 0);
+  assert.equal(snap.ry, 0);
+  assert.equal(snap.lt, 0);
+  assert.equal(snap.rt, 0);
+
+  // 3. Reconnect pad 0 AND plug in DualSense at index 1; disconnect pad 0 -> seamless failover to pad 1
+  const dualSensePad = {
+    ...makeStandardGamepad({ index: 1, buttons: { 3: 1 }, axes: [0, 0, 0.6, 0] }),
+    id: 'DualSense Wireless Controller (STANDARD GAMEPAD)',
+  };
+  env.setGamepads([xboxPad, dualSensePad]);
+  env.win.dispatch('gamepadconnected', { gamepad: xboxPad });
+  assert.equal(bridge.getStats().gamepadConnects, 2);
+  assert.equal(bridge.getStats().activeGamepadIndex, 0);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  env.setGamepads([null, dualSensePad]);
+  env.win.dispatch('gamepaddisconnected', { gamepad: { index: 0 } });
+  stats = bridge.getStats();
+  assert.equal(stats.gamepadDisconnects, 2);
+  assert.equal(stats.activeGamepadIndex, 1);
+  assert.equal(bridge.running, true);
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.Y);
+  assert.equal(snap.lx, 0);
+  assert.equal(snap.ly, 0);
+  assert.ok(snap.rx > 0);
+
+  // 4. destroy() removes all listeners cleanly (blur, visibilitychange, gamepad*, key*, mouse*),
+  // cancels rAF, zeros SAB, clears activeGamepadIndex, and ignores subsequent events.
+  bridge.destroy();
+  assert.equal(bridge.disposed, true);
+  assert.equal(bridge.running, false);
+  assert.equal(env.pendingRafCount(), 0);
+  assert.equal(env.canvas.listenerCount(), 0);
+  assert.equal(env.doc.listenerCount(), 0);
+  assert.equal(env.win.listenerCount(), 0);
+
+  stats = bridge.getStats();
+  assert.equal(stats.activeGamepadIndex, null);
+  const seqAfterDestroy = bridge.getSnapshot().seq;
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Post-destroy events must not mutate stats or SAB
+  env.win.dispatch('blur');
+  env.doc.hidden = true;
+  env.doc.dispatch('visibilitychange');
+  env.win.dispatch('gamepadconnected', { gamepad: xboxPad });
+  env.win.dispatch('gamepaddisconnected', { gamepad: dualSensePad });
+  assert.equal(bridge.getStats().blurResets, stats.blurResets);
+  assert.equal(bridge.getStats().gamepadConnects, stats.gamepadConnects);
+  assert.equal(bridge.getStats().gamepadDisconnects, stats.gamepadDisconnects);
+  assert.equal(bridge.getSnapshot().seq, seqAfterDestroy);
 });
