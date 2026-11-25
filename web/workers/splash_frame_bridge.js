@@ -230,6 +230,24 @@
     return null;
   }
 
+  function sanitizeCounter(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function sanitizeSource(source) {
+    if (
+      source === SPLASH_FRAME_SOURCE.RAW ||
+      source === SPLASH_FRAME_SOURCE.EXTERNAL ||
+      source === SPLASH_FRAME_SOURCE.DIAGNOSTIC
+    ) {
+      return source;
+    }
+    return null;
+  }
+
   /**
    * Sanitize a frame format value into the strict allowlisted telemetry token set:
    * `'rgba8' | 'yuv420p' | 'nv12' | 'imagebitmap' | null`.
@@ -491,7 +509,11 @@
 
       this._queue = [];
       this._framesPresented = 0;
+      this._framesBridged = 0;
       this._droppedFrames = 0;
+      this._droppedStaleFrames = 0;
+      this._bitmapsClosed = 0;
+      this._releaseCount = 0;
       this._firstPresentSent = false;
       this._guestFirstPresent = false;
       this._splashSuppressed = Boolean(opts.suppressSplash);
@@ -509,7 +531,10 @@
       this._lastSource = null;
       this._nextFrameIndex = 0;
       this._destroyed = false;
+      this._resourcesReleased = false;
       this._externalScratchTextures = [];
+      this._retainedBitmaps = new Set();
+      this._closedBitmaps = typeof WeakSet === 'function' ? new WeakSet() : new Set();
 
       if (opts.presenter) {
         if (
@@ -640,7 +665,7 @@
       let drained = 0;
       while (this._queue.length > 0) {
         const dropped = this._queue.shift();
-        this._releaseQueuedExternal(dropped);
+        this._releaseEntryResources(dropped);
         this._lateSplashFramesIgnored += 1;
         drained += 1;
       }
@@ -662,6 +687,8 @@
     /**
      * Signal that the live guest engine has reached `FIRST_PRESENT` handoff.
      * Freezes `framesBeforeFirstPresent` and activates splash suppression unless disabled.
+     * When suppression activates, also releases retained splash `ImageBitmap`s, transient
+     * pixel buffers, and external scratch textures so splash GPU/CPU memory cannot leak.
      *
      * @param {{ suppress?: boolean }} [options]
      */
@@ -679,6 +706,7 @@
       if (shouldSuppress) {
         this._splashSuppressed = true;
         drainedFrames = this._drainQueueAsIgnored();
+        this._releaseSplashResourcesInternal();
       }
       return {
         guestFirstPresent: this._guestFirstPresent,
@@ -686,6 +714,8 @@
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         lateSplashFramesIgnored: this._lateSplashFramesIgnored,
         drainedFrames,
+        bitmapsClosed: this._bitmapsClosed,
+        releaseCount: this._releaseCount,
         chromaOrder: sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV,
         loadOp: sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR,
         lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
@@ -703,23 +733,31 @@
       const next = Boolean(suppressed);
       this._splashSuppressed = next;
       const drainedFrames = next ? this._drainQueueAsIgnored() : 0;
+      if (next) {
+        this._closeRemainingRetainedBitmaps();
+        this._destroyExternalScratchTextures();
+      }
       return {
         splashSuppressed: this._splashSuppressed,
         lateSplashFramesIgnored: this._lateSplashFramesIgnored,
         drainedFrames,
+        bitmapsClosed: this._bitmapsClosed,
       };
     }
 
     _enqueue(entry) {
+      this._resourcesReleased = false;
       while (this._queue.length >= this._maxQueueDepth) {
         const dropped = this._queue.shift();
         this._droppedFrames += 1;
-        this._releaseQueuedExternal(dropped);
+        this._droppedStaleFrames += 1;
+        this._releaseEntryResources(dropped);
       }
       this._queue.push(entry);
       return {
         queueDepth: this._queue.length,
         droppedFrames: this._droppedFrames,
+        droppedStaleFrames: this._droppedStaleFrames,
         frameIndex: entry.frameIndex,
         chromaOrder: entry.chromaOrder || this._chromaOrder,
         loadOp: entry.loadOp || this._loadOp,
@@ -727,17 +765,166 @@
       };
     }
 
-    _releaseQueuedExternal(entry) {
-      if (!entry) {
-        return;
+    _closeBitmap(bmp) {
+      if (!bmp || typeof bmp !== 'object') {
+        return false;
       }
-      if (entry.image && typeof entry.image.close === 'function') {
-        try {
-          entry.image.close();
-        } catch (_) {
-          // ImageBitmap may already be closed.
+      this._retainedBitmaps.delete(bmp);
+      if (this._closedBitmaps.has(bmp)) {
+        return false;
+      }
+      if (typeof bmp.close !== 'function') {
+        return false;
+      }
+      this._closedBitmaps.add(bmp);
+      try {
+        bmp.close();
+        this._bitmapsClosed += 1;
+        return true;
+      } catch (_) {
+        // ImageBitmap may already be closed or detached; swallow safely.
+        return false;
+      }
+    }
+
+    _closeRemainingRetainedBitmaps() {
+      let closed = 0;
+      if (this._retainedBitmaps.size === 0) {
+        return 0;
+      }
+      const snapshot = Array.from(this._retainedBitmaps);
+      this._retainedBitmaps.clear();
+      for (let i = 0; i < snapshot.length; i += 1) {
+        if (this._closeBitmap(snapshot[i])) {
+          closed += 1;
         }
       }
+      return closed;
+    }
+
+    _destroyExternalScratchTextures() {
+      if (this._externalScratchTextures.length === 0) {
+        return 0;
+      }
+      const textures = this._externalScratchTextures;
+      this._externalScratchTextures = [];
+      let destroyed = 0;
+      for (let i = 0; i < textures.length; i += 1) {
+        const tex = textures[i];
+        textures[i] = null;
+        if (tex && typeof tex.destroy === 'function') {
+          try {
+            tex.destroy();
+            destroyed += 1;
+          } catch (_) {
+            // Scratch texture may already be destroyed.
+          }
+        }
+      }
+      return destroyed;
+    }
+
+    _releaseEntryResources(entry, options = {}) {
+      if (!entry || typeof entry !== 'object') {
+        return { bitmapsClosed: 0, buffersReleased: 0 };
+      }
+      const closeExternalSource =
+        options && options.closeExternalSource !== undefined
+          ? Boolean(options.closeExternalSource)
+          : true;
+      let bitmapsClosed = 0;
+      let buffersReleased = 0;
+
+      const img = entry.image;
+      const ext = entry.externalSource;
+      entry.image = null;
+      entry.externalSource = null;
+
+      if (img && this._closeBitmap(img)) {
+        bitmapsClosed += 1;
+      }
+      if (ext && ext !== img) {
+        if (closeExternalSource) {
+          if (this._closeBitmap(ext)) {
+            bitmapsClosed += 1;
+          }
+        } else {
+          this._retainedBitmaps.delete(ext);
+        }
+      }
+
+      if (entry.planes && typeof entry.planes === 'object') {
+        const keys = Object.keys(entry.planes);
+        for (let i = 0; i < keys.length; i += 1) {
+          const key = keys[i];
+          if (entry.planes[key] !== null && entry.planes[key] !== undefined) {
+            entry.planes[key] = null;
+            buffersReleased += 1;
+          }
+        }
+        entry.planes = null;
+      }
+
+      return { bitmapsClosed, buffersReleased };
+    }
+
+    _releaseQueuedExternal(entry) {
+      return this._releaseEntryResources(entry);
+    }
+
+    _releaseSplashResourcesInternal() {
+      const hasPendingWork =
+        this._queue.length > 0 ||
+        this._retainedBitmaps.size > 0 ||
+        this._externalScratchTextures.length > 0;
+      if (this._resourcesReleased && !hasPendingWork) {
+        return {
+          released: false,
+          framesReleased: 0,
+          bitmapsClosed: 0,
+          buffersReleased: 0,
+          texturesDestroyed: 0,
+          releaseCount: this._releaseCount,
+          queueDepth: 0,
+        };
+      }
+
+      let framesReleased = 0;
+      let bitmapsClosed = 0;
+      let buffersReleased = 0;
+
+      while (this._queue.length > 0) {
+        const entry = this._queue.shift();
+        const res = this._releaseEntryResources(entry);
+        framesReleased += 1;
+        bitmapsClosed += res.bitmapsClosed;
+        buffersReleased += res.buffersReleased;
+      }
+
+      bitmapsClosed += this._closeRemainingRetainedBitmaps();
+      const texturesDestroyed = this._destroyExternalScratchTextures();
+
+      this._resourcesReleased = true;
+      this._releaseCount += 1;
+
+      return {
+        released: true,
+        framesReleased,
+        bitmapsClosed,
+        buffersReleased,
+        texturesDestroyed,
+        releaseCount: this._releaseCount,
+        queueDepth: this._queue.length,
+      };
+    }
+
+    /**
+     * Explicitly close all retained splash `ImageBitmap`s, null transient splash pixel buffers,
+     * and destroy external scratch GPU textures. Safe and idempotent across repeated calls or
+     * after `dispose()` / `destroy()`.
+     */
+    releaseSplashResources() {
+      return this._releaseSplashResourcesInternal();
     }
 
     /**
@@ -1087,6 +1274,7 @@
       this._nextFrameIndex = Math.max(this._nextFrameIndex, frameIndex + 1);
 
       if (this._splashSuppressed) {
+        this._closeBitmap(imageBitmap);
         return this._ignoreLateSplashFrame(frameIndex);
       }
 
@@ -1097,6 +1285,10 @@
 
       // Prefer immediate RGBA extraction so queue ownership does not depend on live bitmaps.
       const extracted = extractRgbaFromExternal(imageBitmap, width, height);
+      const takeOwnership = Boolean(
+        options && (options.closeOnRelease === true || options.takeOwnership === true)
+      );
+      this._retainedBitmaps.add(imageBitmap);
       const entry = {
         source: SPLASH_FRAME_SOURCE.EXTERNAL,
         width,
@@ -1117,7 +1309,7 @@
         loadOp,
         zeroCopy: false,
         frameIndex,
-        image: extracted ? null : imageBitmap,
+        image: extracted && !takeOwnership ? null : imageBitmap,
         preferCopyExternal: true,
         externalSource: imageBitmap,
       };
@@ -1187,7 +1379,8 @@
       for (let i = 0; i < latestDueIndex; i += 1) {
         const dropped = this._queue.shift();
         this._droppedFrames += 1;
-        this._releaseQueuedExternal(dropped);
+        this._droppedStaleFrames += 1;
+        this._releaseEntryResources(dropped);
       }
       return this._queue.shift();
     }
@@ -1205,6 +1398,9 @@
         return false;
       }
 
+      // Release prior external scratch textures before allocating a replacement.
+      this._destroyExternalScratchTextures();
+
       const texture = device.createTexture({
         label: `playgta6-splash-external-${frame.frameIndex}`,
         size: { width: frame.width, height: frame.height, depthOrArrayLayers: 1 },
@@ -1216,6 +1412,7 @@
         { texture },
         { width: frame.width, height: frame.height, depthOrArrayLayers: 1 }
       );
+      this._resourcesReleased = false;
       this._externalScratchTextures.push(texture);
       return true;
     }
@@ -1438,66 +1635,73 @@
         sanitizeLoadOp(this._loadOp) ||
         LOAD_OP.CLEAR;
 
-      const uploadResult = this._uploadFrame(presenter, device, frame);
-      this._lastSource = frame.source;
-      const sanitizedFormat = sanitizeFrameFormat(frame.telemetryFormat || frame.format);
-      this._lastFrameFormat = sanitizedFormat;
-      this._lastChromaOrder = effectiveChromaOrder;
-      this._lastLoadOp = effectiveLoadOp;
-      this._lastFrameWidth = frame.width;
-      this._lastFrameHeight = frame.height;
-      if (frame.format === PIXEL_FORMAT.NV12) {
-        this._nv12FramesForwarded += 1;
-      }
-      if (effectiveChromaOrder === CHROMA_ORDER.YVU) {
-        this._yvuFramesForwarded += 1;
-      }
-      if (frame.zeroCopy) {
-        this._zeroCopyFramesForwarded += 1;
-      }
-
-      if (typeof device.createCommandEncoder !== 'function') {
-        throw new TypeError('renderFrame requires device.createCommandEncoder()');
-      }
-      const encoder = device.createCommandEncoder({
-        label: 'playgta6-splash-frame-bridge-encoder',
-      });
-      const presentOptions = {
-        loadOp: effectiveLoadOp,
-      };
-      if (opts) {
-        if (opts.clearColor !== undefined) {
-          presentOptions.clearColor = opts.clearColor;
+      let uploadResult;
+      let presentResult;
+      let sanitizedFormat;
+      try {
+        uploadResult = this._uploadFrame(presenter, device, frame);
+        this._lastSource = frame.source;
+        sanitizedFormat = sanitizeFrameFormat(frame.telemetryFormat || frame.format);
+        this._lastFrameFormat = sanitizedFormat;
+        this._lastChromaOrder = effectiveChromaOrder;
+        this._lastLoadOp = effectiveLoadOp;
+        this._lastFrameWidth = frame.width;
+        this._lastFrameHeight = frame.height;
+        if (frame.format === PIXEL_FORMAT.NV12) {
+          this._nv12FramesForwarded += 1;
         }
-        if (opts.storeOp !== undefined) {
-          presentOptions.storeOp = opts.storeOp;
+        if (effectiveChromaOrder === CHROMA_ORDER.YVU) {
+          this._yvuFramesForwarded += 1;
         }
-        if (opts.opacity !== undefined) {
-          presentOptions.opacity = opts.opacity;
+        if (frame.zeroCopy) {
+          this._zeroCopyFramesForwarded += 1;
         }
-      }
-      const presentResult = presenter.presentFrame(
-        encoder,
-        targetView,
-        targetWidth,
-        targetHeight,
-        presentOptions
-      );
 
-      if (device.queue && typeof device.queue.submit === 'function') {
-        const commandBuffer =
-          encoder && typeof encoder.finish === 'function' ? encoder.finish() : encoder;
-        device.queue.submit([commandBuffer]);
-      }
+        if (typeof device.createCommandEncoder !== 'function') {
+          throw new TypeError('renderFrame requires device.createCommandEncoder()');
+        }
+        const encoder = device.createCommandEncoder({
+          label: 'playgta6-splash-frame-bridge-encoder',
+        });
+        const presentOptions = {
+          loadOp: effectiveLoadOp,
+        };
+        if (opts) {
+          if (opts.clearColor !== undefined) {
+            presentOptions.clearColor = opts.clearColor;
+          }
+          if (opts.storeOp !== undefined) {
+            presentOptions.storeOp = opts.storeOp;
+          }
+          if (opts.opacity !== undefined) {
+            presentOptions.opacity = opts.opacity;
+          }
+        }
+        presentResult = presenter.presentFrame(
+          encoder,
+          targetView,
+          targetWidth,
+          targetHeight,
+          presentOptions
+        );
 
-      this._framesPresented += 1;
-      if (effectiveLoadOp === LOAD_OP.LOAD) {
-        this._underlayLoadFramesPresented += 1;
+        if (device.queue && typeof device.queue.submit === 'function') {
+          const commandBuffer =
+            encoder && typeof encoder.finish === 'function' ? encoder.finish() : encoder;
+          device.queue.submit([commandBuffer]);
+        }
+
+        this._framesPresented += 1;
+        this._framesBridged += 1;
+        if (effectiveLoadOp === LOAD_OP.LOAD) {
+          this._underlayLoadFramesPresented += 1;
+        }
+        if (!this._guestFirstPresent) {
+          this._framesBeforeFirstPresent += 1;
+        }
+      } finally {
+        this._releaseEntryResources(frame, { closeExternalSource: false });
       }
-      if (!this._guestFirstPresent) {
-        this._framesBeforeFirstPresent += 1;
-      }
-      this._releaseQueuedExternal(frame);
 
       const resolvedChromaOrder =
         sanitizeChromaOrder(effectiveChromaOrder) ||
@@ -1542,6 +1746,8 @@
         viewport: presentResult ? presentResult.viewport : null,
         queueDepth: this._queue.length,
         framesPresented: this._framesPresented,
+        framesBridged: this._framesBridged,
+        bitmapsClosed: this._bitmapsClosed,
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         nv12FramesForwarded: this._nv12FramesForwarded,
         yvuFramesForwarded: this._yvuFramesForwarded,
@@ -1558,29 +1764,34 @@
       const chromaOrder = sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV;
       const loadOp = sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR;
       return {
-        framesPresented: this._framesPresented,
-        droppedFrames: this._droppedFrames,
+        framesPresented: sanitizeCounter(this._framesPresented),
+        framesBridged: sanitizeCounter(this._framesBridged),
+        droppedFrames: sanitizeCounter(this._droppedFrames),
+        droppedStaleFrames: sanitizeCounter(this._droppedStaleFrames),
+        bitmapsClosed: sanitizeCounter(this._bitmapsClosed),
+        releaseCount: sanitizeCounter(this._releaseCount),
+        retainedBitmaps: this._retainedBitmaps.size,
         queueDepth: this._queue.length,
-        firstPresentSent: this._firstPresentSent,
-        guestFirstPresent: this._guestFirstPresent,
-        splashSuppressed: this._splashSuppressed,
-        framesBeforeFirstPresent: this._framesBeforeFirstPresent,
-        lateSplashFramesIgnored: this._lateSplashFramesIgnored,
-        nv12FramesForwarded: this._nv12FramesForwarded,
-        yvuFramesForwarded: this._yvuFramesForwarded,
-        underlayLoadFramesPresented: this._underlayLoadFramesPresented,
-        zeroCopyFramesForwarded: this._zeroCopyFramesForwarded,
+        firstPresentSent: Boolean(this._firstPresentSent),
+        guestFirstPresent: Boolean(this._guestFirstPresent),
+        splashSuppressed: Boolean(this._splashSuppressed),
+        framesBeforeFirstPresent: sanitizeCounter(this._framesBeforeFirstPresent),
+        lateSplashFramesIgnored: sanitizeCounter(this._lateSplashFramesIgnored),
+        nv12FramesForwarded: sanitizeCounter(this._nv12FramesForwarded),
+        yvuFramesForwarded: sanitizeCounter(this._yvuFramesForwarded),
+        underlayLoadFramesPresented: sanitizeCounter(this._underlayLoadFramesPresented),
+        zeroCopyFramesForwarded: sanitizeCounter(this._zeroCopyFramesForwarded),
         chromaOrder,
         loadOp,
         lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
         lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
-        lastFrameWidth: this._lastFrameWidth,
-        lastFrameHeight: this._lastFrameHeight,
+        lastFrameWidth: sanitizeCounter(this._lastFrameWidth),
+        lastFrameHeight: sanitizeCounter(this._lastFrameHeight),
         lastFrameFormat: sanitizeFrameFormat(this._lastFrameFormat),
-        lastSource: this._lastSource,
+        lastSource: sanitizeSource(this._lastSource),
         maxQueueDepth: this._maxQueueDepth,
-        zeroCopy: this._zeroCopy,
-        destroyed: this._destroyed,
+        zeroCopy: Boolean(this._zeroCopy),
+        destroyed: Boolean(this._destroyed),
         presenterStats:
           this._presenter && typeof this._presenter.getStats === 'function'
             ? this._presenter.getStats()
@@ -1601,22 +1812,54 @@
         lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
-        zeroCopy: this._zeroCopy,
+        zeroCopy: Boolean(this._zeroCopy),
         maxQueueDepth: this._maxQueueDepth,
         queueDepth: this._queue.length,
-        framesPresented: this._framesPresented,
-        droppedFrames: this._droppedFrames,
-        firstPresentSent: this._firstPresentSent,
-        guestFirstPresent: this._guestFirstPresent,
-        splashSuppressed: this._splashSuppressed,
-        framesBeforeFirstPresent: this._framesBeforeFirstPresent,
-        lateSplashFramesIgnored: this._lateSplashFramesIgnored,
+        framesPresented: sanitizeCounter(this._framesPresented),
+        framesBridged: sanitizeCounter(this._framesBridged),
+        droppedFrames: sanitizeCounter(this._droppedFrames),
+        droppedStaleFrames: sanitizeCounter(this._droppedStaleFrames),
+        bitmapsClosed: sanitizeCounter(this._bitmapsClosed),
+        releaseCount: sanitizeCounter(this._releaseCount),
+        retainedBitmaps: this._retainedBitmaps.size,
+        firstPresentSent: Boolean(this._firstPresentSent),
+        guestFirstPresent: Boolean(this._guestFirstPresent),
+        splashSuppressed: Boolean(this._splashSuppressed),
+        framesBeforeFirstPresent: sanitizeCounter(this._framesBeforeFirstPresent),
+        lateSplashFramesIgnored: sanitizeCounter(this._lateSplashFramesIgnored),
         lastFrameFormat: sanitizeFrameFormat(this._lastFrameFormat),
-        lastFrameWidth: this._lastFrameWidth,
-        lastFrameHeight: this._lastFrameHeight,
-        lastSource: this._lastSource,
-        destroyed: this._destroyed,
+        lastFrameWidth: sanitizeCounter(this._lastFrameWidth),
+        lastFrameHeight: sanitizeCounter(this._lastFrameHeight),
+        lastSource: sanitizeSource(this._lastSource),
+        destroyed: Boolean(this._destroyed),
       };
+    }
+
+    /**
+     * Reset telemetry and lifecycle counters without clearing queued frames,
+     * destroying the presenter, or altering bridge configuration.
+     */
+    resetStats() {
+      this._assertNotDestroyed();
+      this._framesPresented = 0;
+      this._framesBridged = 0;
+      this._droppedFrames = 0;
+      this._droppedStaleFrames = 0;
+      this._bitmapsClosed = 0;
+      this._releaseCount = 0;
+      this._framesBeforeFirstPresent = 0;
+      this._lateSplashFramesIgnored = 0;
+      this._nv12FramesForwarded = 0;
+      this._yvuFramesForwarded = 0;
+      this._underlayLoadFramesPresented = 0;
+      this._zeroCopyFramesForwarded = 0;
+      this._lastFrameFormat = null;
+      this._lastChromaOrder = null;
+      this._lastLoadOp = null;
+      this._lastFrameWidth = 0;
+      this._lastFrameHeight = 0;
+      this._lastSource = null;
+      return this.getStats();
     }
 
     /**
@@ -1626,13 +1869,21 @@
     reset() {
       this._assertNotDestroyed();
       while (this._queue.length > 0) {
-        this._releaseQueuedExternal(this._queue.shift());
+        this._releaseEntryResources(this._queue.shift());
       }
+      this._closeRemainingRetainedBitmaps();
+      this._destroyExternalScratchTextures();
+
       this._framesPresented = 0;
+      this._framesBridged = 0;
       this._droppedFrames = 0;
+      this._droppedStaleFrames = 0;
+      this._bitmapsClosed = 0;
+      this._releaseCount = 0;
       this._firstPresentSent = false;
       this._guestFirstPresent = false;
       this._splashSuppressed = false;
+      this._resourcesReleased = false;
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
       this._nv12FramesForwarded = 0;
@@ -1657,18 +1908,11 @@
           this._presenter.setPaused(false);
         }
       }
-
-      for (let i = 0; i < this._externalScratchTextures.length; i += 1) {
-        const tex = this._externalScratchTextures[i];
-        if (tex && typeof tex.destroy === 'function') {
-          tex.destroy();
-        }
-      }
-      this._externalScratchTextures = [];
     }
 
     /**
-     * Idempotently destroy the bridge, queue contents, scratch textures, and owned presenter.
+     * Idempotently destroy the bridge, queue contents, retained ImageBitmaps,
+     * scratch textures, and owned presenter.
      */
     destroy() {
       if (this._destroyed) {
@@ -1676,17 +1920,7 @@
       }
       this._destroyed = true;
 
-      while (this._queue.length > 0) {
-        this._releaseQueuedExternal(this._queue.shift());
-      }
-
-      for (let i = 0; i < this._externalScratchTextures.length; i += 1) {
-        const tex = this._externalScratchTextures[i];
-        if (tex && typeof tex.destroy === 'function') {
-          tex.destroy();
-        }
-      }
-      this._externalScratchTextures = [];
+      this._releaseSplashResourcesInternal();
 
       if (this._ownsPresenter && this._presenter && typeof this._presenter.destroy === 'function') {
         this._presenter.destroy();
@@ -1694,6 +1928,14 @@
       this._presenter = null;
       this._pendingDevice = null;
       this._onFirstPresent = null;
+      this._stagingPool = null;
+    }
+
+    /**
+     * Alias for `destroy()` for callers expecting a `dispose()` lifecycle hook.
+     */
+    dispose() {
+      this.destroy();
     }
   }
 
