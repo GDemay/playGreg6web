@@ -12,6 +12,8 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..');
 
 const {
+  PROGRESS_CHANNEL_NAME,
+  PTHREAD_WGPU_CHANNEL_NAME,
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
   PTHREAD_CMD_LOAD,
   PTHREAD_CMD_LOADED,
@@ -27,6 +29,8 @@ const {
   loadGuestManifest,
   buildRuntimeModuleConfig,
   forwardGpuWorkerMessage,
+  encodeTestFramePacket,
+  postBroadcastOnce,
 } = require('../web/loader.js');
 
 const { createHttpfsMailboxBuffer } = require('../web/workers/httpfs_mailbox.js');
@@ -1316,4 +1320,474 @@ test('W95 forwardGpuWorkerMessage preserves realPackDrawCount, fallbackDrawCount
     droppedFrames: 0,
     packetCount: 55,
   });
+});
+
+function createTrackedBroadcastBus({ rejectSabOnChannel = null, throwOnSendChannel = null } = {}) {
+  const openByName = new Map();
+  const createdByName = new Map();
+  const closedByName = new Map();
+  const deliveries = [];
+
+  class TrackedBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this.closed = false;
+      this.queuedCount = 0;
+      if (!openByName.has(name)) {
+        openByName.set(name, new Set());
+      }
+      openByName.get(name).add(this);
+      createdByName.set(name, (createdByName.get(name) || 0) + 1);
+    }
+
+    postMessage(data) {
+      if (this.closed) {
+        throw new Error(`InvalidStateError: BroadcastChannel ${this.name} is closed`);
+      }
+      if (throwOnSendChannel === this.name) {
+        throw new Error(`simulated postMessage failure on ${this.name}`);
+      }
+      if (
+        rejectSabOnChannel === this.name &&
+        data &&
+        typeof data === 'object' &&
+        typeof SharedArrayBuffer !== 'undefined' &&
+        data.sab instanceof SharedArrayBuffer
+      ) {
+        throw new Error('DataCloneError: SharedArrayBuffer rejected');
+      }
+      const peers = openByName.get(this.name);
+      if (!peers) return;
+      for (const peer of Array.from(peers)) {
+        if (peer === this || peer.closed) continue;
+        // Count every peer with an open BroadcastChannel (even if onmessage is null,
+        // matching Chromium's BroadcastChannel receive queue behavior in #731).
+        peer.queuedCount += 1;
+        deliveries.push({ channel: this.name, target: peer, data });
+        if (typeof peer.onmessage === 'function') {
+          peer.onmessage({ data });
+        }
+      }
+    }
+
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      closedByName.set(this.name, (closedByName.get(this.name) || 0) + 1);
+      const peers = openByName.get(this.name);
+      if (peers) {
+        peers.delete(this);
+      }
+    }
+  }
+
+  return {
+    TrackedBroadcastChannel,
+    openByName,
+    createdByName,
+    closedByName,
+    deliveries,
+    openCount(name) {
+      return openByName.has(name) ? openByName.get(name).size : 0;
+    },
+  };
+}
+
+test('Issue #731: pthreads keep zero open BroadcastChannels after bootstrap and send-only host_log / host_wgpu_submit never queue on sibling pthreads', () => {
+  const sab = createHttpfsMailboxBuffer(1024);
+  const bus = createTrackedBroadcastBus();
+
+  const uiProgressReceived = [];
+  const uiProgressChannel = new bus.TrackedBroadcastChannel(PROGRESS_CHANNEL_NAME);
+  uiProgressChannel.onmessage = (ev) => uiProgressReceived.push(ev.data);
+
+  const coordWgpuReceived = [];
+  const coordWgpuChannel = new bus.TrackedBroadcastChannel(PTHREAD_WGPU_CHANNEL_NAME);
+  coordWgpuChannel.onmessage = (ev) => coordWgpuReceived.push(ev.data);
+
+  const coordSabChannel = new bus.TrackedBroadcastChannel(PTHREAD_HTTPFS_SAB_CHANNEL_NAME);
+  coordSabChannel.onmessage = (ev) => {
+    if (ev.data && ev.data.type === 'request-httpfs-sab') {
+      coordSabChannel.postMessage({ type: 'httpfs-sab', sab });
+    }
+  };
+
+  class MockHttpfsClient {
+    constructor(buf) {
+      this.buf = buf;
+    }
+  }
+
+  const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  const handles = [];
+  for (let i = 1; i <= 52; i += 1) {
+    const scope = {
+      name: `em-pthread-${i}`,
+      location: { href: 'http://127.0.0.1:8080/loader.js' },
+      WebAssembly: { Instance: WebAssembly.Instance },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const h = bootstrapEmscriptenPthreadWorker({
+      scope,
+      importScriptsFn: () => {},
+      BroadcastChannelCtor: bus.TrackedBroadcastChannel,
+      httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+    });
+    h.hostImports.setMemory(mem);
+    assert.equal(h.hasHttpfsSab(), true);
+    assert.equal(h.channels.progress, null);
+    assert.equal(h.channels.wgpu, null);
+    assert.equal(h.channels.httpfs, null);
+    handles.push(h);
+  }
+
+  // Immediately after bootstrapping 52 pthreads: ONLY the 3 long-lived non-pthread endpoints remain open.
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+
+  const frameBytes = new Uint8Array(encodeTestFramePacket(0.1, 0.2, 0.3, 1.0));
+  const memU8 = new Uint8Array(mem.buffer);
+  memU8.set(frameBytes, 256);
+
+  // Send host_log and host_wgpu_submit across multiple pthreads + locateFile on pthread #1.
+  const deliveriesBefore = bus.deliveries.length;
+  handles[0].locateFile('guest_part_0.wasm');
+  for (let t = 0; t < 10; t += 1) {
+    const text = `pthread-${t + 1} tick`;
+    const encoded = new TextEncoder().encode(text);
+    memU8.set(encoded, 32);
+    handles[t].hostImports.env.host_log(32n, BigInt(encoded.byteLength));
+    handles[t].hostImports.env.host_wgpu_submit(256n, BigInt(frameBytes.byteLength));
+  }
+
+  // Every temporary channel opened by pthreads was immediately closed: still only 1 open per bus.
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+
+  // UI received 1 locateFile label + 10 host_log labels; coordinator received all 10 GPU batches.
+  assert.equal(uiProgressReceived.length, 11);
+  assert.equal(uiProgressReceived[0].label, 'Loading Wasm side module (guest_part_0.wasm)...');
+  assert.equal(uiProgressReceived[1].label, '[wasm] pthread-1 tick');
+  assert.equal(uiProgressReceived[10].label, '[wasm] pthread-10 tick');
+  assert.equal(coordWgpuReceived.length, 10);
+  for (const batch of coordWgpuReceived) {
+    assert.equal(batch.type, 'wgpu-submit');
+    assert.deepEqual(new Uint8Array(batch.cmdBuffer), frameBytes);
+  }
+
+  // Zero messages were delivered/queued to any sibling pthread!
+  const postBootstrapDeliveries = bus.deliveries.slice(deliveriesBefore);
+  for (const d of postBootstrapDeliveries) {
+    if (d.channel === PROGRESS_CHANNEL_NAME) {
+      assert.equal(d.target, uiProgressChannel);
+    } else if (d.channel === PTHREAD_WGPU_CHANNEL_NAME) {
+      assert.equal(d.target, coordWgpuChannel);
+    }
+  }
+
+  // Verify postBroadcastOnce closes its temporary channel in `finally` even when postMessage throws.
+  const throwingBus = createTrackedBroadcastBus({ throwOnSendChannel: PTHREAD_WGPU_CHANNEL_NAME });
+  const ok = postBroadcastOnce(
+    throwingBus.TrackedBroadcastChannel,
+    PTHREAD_WGPU_CHANNEL_NAME,
+    { type: 'wgpu-submit' },
+  );
+  assert.equal(ok, false);
+  assert.equal(throwingBus.createdByName.get(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(throwingBus.closedByName.get(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(throwingBus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 0);
+
+  for (const h of handles) {
+    h.cleanup();
+  }
+  uiProgressChannel.close();
+  coordWgpuChannel.close();
+  coordSabChannel.close();
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 0);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 0);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+});
+
+test('Issue #731: playgta6-httpfs-sab channel closes immediately upon SAB delivery across all paths and cleanup', () => {
+  const sab = createHttpfsMailboxBuffer(1024);
+  class MockHttpfsClient {
+    constructor(buf) {
+      this.buf = buf;
+    }
+  }
+
+  // Path A: options.httpfsMailboxSab already supplied -> playgta6-httpfs-sab is never opened at all.
+  const busA = createTrackedBroadcastBus();
+  const handleA = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-1', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: busA.TrackedBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+    httpfsMailboxSab: sab,
+  });
+  assert.equal(handleA.hasHttpfsSab(), true);
+  assert.equal(busA.createdByName.get(PTHREAD_HTTPFS_SAB_CHANNEL_NAME) || 0, 0);
+  assert.equal(busA.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+  handleA.cleanup();
+
+  // Path B: BroadcastChannel rejects SAB, then SAB arrives via direct Worker.postMessage({ __playgta6_httpfs_sab }).
+  const busB = createTrackedBroadcastBus({ rejectSabOnChannel: PTHREAD_HTTPFS_SAB_CHANNEL_NAME });
+  const listenersB = [];
+  const handleB = bootstrapEmscriptenPthreadWorker({
+    scope: {
+      name: 'em-pthread-2',
+      WebAssembly: { Instance: WebAssembly.Instance },
+      addEventListener(type, fn) {
+        if (type === 'message') listenersB.push(fn);
+      },
+      removeEventListener(type, fn) {
+        const idx = listenersB.indexOf(fn);
+        if (idx >= 0) listenersB.splice(idx, 1);
+      },
+    },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: busB.TrackedBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+  });
+  assert.equal(handleB.hasHttpfsSab(), false);
+  assert.equal(busB.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+  const openChB = handleB.channels.httpfs;
+  assert.ok(openChB && !openChB.closed);
+
+  // Deliver SAB via Worker message -> httpfsChannel closes immediately!
+  for (const fn of listenersB.slice()) {
+    fn({ data: { __playgta6_httpfs_sab: sab }, stopImmediatePropagation() {} });
+  }
+  assert.equal(handleB.hasHttpfsSab(), true);
+  assert.equal(openChB.closed, true);
+  assert.equal(openChB.onmessage, null);
+  assert.equal(handleB.channels.httpfs, null);
+  assert.equal(busB.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+  handleB.cleanup();
+
+  // Path C: Async BroadcastChannel reply delivers SAB -> httpfsChannel closes immediately.
+  const busC = createTrackedBroadcastBus();
+  const handleC = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-3', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: busC.TrackedBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+  });
+  assert.equal(busC.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+  const openChC = handleC.channels.httpfs;
+  const senderC = new busC.TrackedBroadcastChannel(PTHREAD_HTTPFS_SAB_CHANNEL_NAME);
+  senderC.postMessage({ type: 'httpfs-sab', sab });
+  assert.equal(handleC.hasHttpfsSab(), true);
+  assert.equal(openChC.closed, true);
+  assert.equal(openChC.onmessage, null);
+  assert.equal(handleC.channels.httpfs, null);
+  senderC.close();
+  assert.equal(busC.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+  handleC.cleanup();
+
+  // Path D: If SAB never arrives, cleanup() closes httpfsChannel cleanly.
+  const busD = createTrackedBroadcastBus();
+  const handleD = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-4', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: busD.TrackedBroadcastChannel,
+    httpfsMailboxApi: { HttpfsMailboxClient: MockHttpfsClient },
+  });
+  assert.equal(busD.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+  handleD.cleanup();
+  assert.equal(handleD.channels.httpfs, null);
+  assert.equal(busD.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+
+  // Path E: Absent httpfsMailboxApi never opens playgta6-httpfs-sab.
+  const busE = createTrackedBroadcastBus();
+  const handleE = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-5', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: busE.TrackedBroadcastChannel,
+    httpfsMailboxApi: null,
+  });
+  assert.equal(busE.createdByName.get(PTHREAD_HTTPFS_SAB_CHANNEL_NAME) || 0, 0);
+  assert.equal(busE.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 0);
+  handleE.cleanup();
+});
+
+test('Issue #731 VM end-to-end: coordinator and pthreads leave only active receiver channels open while forwarding host_log and host_wgpu_submit', () => {
+  const bus = createTrackedBroadcastBus();
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+
+  // UI listener is the ONLY open game-progress subscriber.
+  const uiMessages = [];
+  const uiProgressChannel = new bus.TrackedBroadcastChannel(PROGRESS_CHANNEL_NAME);
+  uiProgressChannel.onmessage = (ev) => uiMessages.push(ev.data);
+
+  // 1. Boot coordinator loader.js in VM sandbox.
+  const coordWorkers = new Map();
+  class CoordMockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      coordWorkers.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+  const coordSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    onmessage: null,
+    postMessage() {},
+  };
+  const coordSandbox = {
+    self: coordSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: bus.TrackedBroadcastChannel,
+    Worker: CoordMockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), coordContext, { filename: resolved });
+    },
+  };
+  coordSandbox.globalThis = coordSandbox;
+  const coordContext = vm.createContext(coordSandbox);
+  vm.runInContext(loaderSource, coordContext, { filename: loaderPath });
+
+  coordSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker);
+
+  // Coordinator holds ZERO open game-progress channels, 1 wgpu receiver, 1 httpfs-sab receiver.
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+
+  // 2. Boot 2 em-pthread workers sharing the same bus.
+  const pthreadInsts = [];
+  for (let p = 1; p <= 2; p += 1) {
+    let capturedImports = null;
+    class CaptureWasmInstance {
+      constructor(_mod, imports) {
+        capturedImports = imports;
+      }
+    }
+    const pSelf = {
+      name: `em-pthread-${p}`,
+      location: { href: 'http://127.0.0.1:8080/loader.js' },
+      onmessage: null,
+      postMessage() {},
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    const pSandbox = {
+      self: pSelf,
+      globalThis: null,
+      URL,
+      WebAssembly: { Instance: CaptureWasmInstance, Module: WebAssembly.Module, Memory: WebAssembly.Memory },
+      BroadcastChannel: bus.TrackedBroadcastChannel,
+      Uint8Array,
+      Int32Array,
+      Uint32Array,
+      DataView,
+      ArrayBuffer,
+      SharedArrayBuffer,
+      Atomics,
+      BigInt,
+      TextEncoder,
+      TextDecoder,
+      Map,
+      Set,
+      Promise,
+      Error,
+      Number,
+      Math,
+      Date,
+      importScripts(scriptPath) {
+        if (scriptPath === './dist/runtime.js') {
+          const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+          const stub = () => {};
+          stub.stub = true;
+          new pSandbox.WebAssembly.Instance('mod', {
+            env: {
+              memory: mem,
+              host_log: stub,
+              host_wgpu_submit: stub,
+            },
+          });
+          pthreadInsts.push({ mem, env: capturedImports.env });
+          return;
+        }
+        const resolved = path.resolve(repoRoot, 'web', scriptPath);
+        vm.runInContext(fs.readFileSync(resolved, 'utf8'), pContext, { filename: resolved });
+      },
+    };
+    pSandbox.globalThis = pSandbox;
+    const pContext = vm.createContext(pSandbox);
+    vm.runInContext(loaderSource, pContext, { filename: loaderPath });
+  }
+
+  // Even with coordinator + 2 pthreads booted, open channel counts remain strictly 1 per bus!
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+
+  // Trigger host_log and host_wgpu_submit (with Present) from both pthreads.
+  const frameBytes = new Uint8Array(encodeTestFramePacket(0.2, 0.4, 0.6, 1.0));
+  for (let i = 0; i < pthreadInsts.length; i += 1) {
+    const { mem, env } = pthreadInsts[i];
+    const msg = new TextEncoder().encode(`alive-from-pthread-${i + 1}`);
+    const u8 = new Uint8Array(mem.buffer);
+    u8.set(msg, 16);
+    u8.set(frameBytes, 128);
+    env.host_log(16n, BigInt(msg.byteLength));
+    env.host_wgpu_submit(128n, BigInt(frameBytes.byteLength));
+  }
+
+  // Open channel counts remain strictly 1 per bus after heavy activity.
+  assert.equal(bus.openCount(PROGRESS_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_WGPU_CHANNEL_NAME), 1);
+  assert.equal(bus.openCount(PTHREAD_HTTPFS_SAB_CHANNEL_NAME), 1);
+
+  // UI got both pthread logs + exactly one [boot] FIRST_PRESENT from coordinator.
+  const labels = uiMessages.filter((m) => m && m.label).map((m) => m.label);
+  assert.ok(labels.includes('[wasm] alive-from-pthread-1'));
+  assert.ok(labels.includes('[wasm] alive-from-pthread-2'));
+  assert.equal(labels.filter((l) => l === '[boot] FIRST_PRESENT').length, 1);
+
+  // Coordinator forwarded both GPU command batches to wgpu_worker.
+  const gpuBatches = gpuWorker.posted.filter((m) => m && m.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(gpuBatches.length, 2);
+  assert.deepEqual(new Uint8Array(gpuBatches[0].cmdBuffer), frameBytes);
+  assert.deepEqual(new Uint8Array(gpuBatches[1].cmdBuffer), frameBytes);
+
+  uiProgressChannel.close();
 });
