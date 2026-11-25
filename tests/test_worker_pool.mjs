@@ -5,6 +5,8 @@ import {
   WorkerPool,
   PRIORITY,
   DEFAULT_MAX_RESPAWNS_PER_SLOT,
+  DEFAULT_RESPAWN_BACKOFF_BASE_MS,
+  DEFAULT_RESPAWN_BACKOFF_MAX_MS,
   WorkerPoolError,
   PoolTerminatedError,
   QueueFullError,
@@ -1632,4 +1634,426 @@ test('W218: telemetry reports exact activeWorkers, idleWorkers, queuedTasks, pea
   assert.equal(s.warmReuses, 2);
 
   await pool.terminate();
+});
+
+// ---- W274: idle-worker trimming, crash-loop circuit breaker & backoff -----
+
+test('W274: constructor validates maxConsecutiveCrashes, crashWindowMs, and respawn backoff options', () => {
+  assert.equal(DEFAULT_RESPAWN_BACKOFF_BASE_MS, 0);
+  assert.equal(DEFAULT_RESPAWN_BACKOFF_MAX_MS, 5000);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxConsecutiveCrashes: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxConsecutiveCrashes: 1.5 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), crashWindowMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), crashWindowMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), crashWindowMs: Infinity }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffBaseMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffBaseMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffBaseMs: Infinity }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffMaxMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffMaxMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), respawnBackoffMaxMs: Infinity }), RangeError);
+});
+
+test('W274: trimIdleWorkers(minWarm) terminates excess LRU idle workers without disrupting active tasks', async () => {
+  const { pool, workers, clock } = setup({ maxWorkers: 4, minWorkers: 2, idleTimeoutMs: 500 });
+
+  assert.throws(() => pool.trimIdleWorkers(-1), RangeError);
+  assert.throws(() => pool.trimIdleWorkers(1.5), RangeError);
+  assert.throws(() => pool.trimIdleWorkers('1'), RangeError);
+
+  // Spawn 4 workers and finish in deterministic order (0, 1, 2, 3) so worker 3 is warmest.
+  const jobs = [pool.submit('t', 0), pool.submit('t', 1), pool.submit('t', 2), pool.submit('t', 3)];
+  for (let i = 0; i < 4; i++) {
+    clock.advance(10);
+    workers[i].reply({ id: workers[i].last().id, ok: true, result: i });
+  }
+  await Promise.all(jobs);
+  assert.equal(pool.getStats().idleWorkers, 4);
+  assert.equal(clock.pending, 4);
+
+  // Occupy the warmest worker (workers[3]) with an active job; 3 workers remain idle.
+  const activeJob = pool.submit('t', 'active');
+  assert.equal(workers[3].last().payload, 'active');
+  assert.equal(pool.getStats().activeWorkers, 1);
+  assert.equal(pool.getStats().idleWorkers, 3);
+  assert.equal(clock.pending, 3);
+
+  // Trim down to 1 warm idle worker: oldest 2 (workers[0], workers[1]) terminate; workers[2] and active workers[3] stay.
+  const res1 = pool.trimIdleWorkers(1);
+  assert.deepEqual(res1, { trimmed: 2, remainingIdle: 1, active: 1 });
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[1].terminated, true);
+  assert.equal(workers[2].terminated, false);
+  assert.equal(workers[3].terminated, false);
+  assert.equal(pool.getStats().trimmedWorkers, 2);
+  assert.equal(pool.getStats().respawnCount, 0);
+  assert.equal(clock.pending, 1);
+
+  // Default minWarm = 0 sheds the last idle worker even below minWorkers without touching the active job.
+  const res2 = pool.trimIdleWorkers();
+  assert.deepEqual(res2, { trimmed: 1, remainingIdle: 0, active: 1 });
+  assert.equal(workers[2].terminated, true);
+  assert.equal(workers[3].terminated, false);
+  assert.equal(pool.getStats().trimmedWorkers, 3);
+  assert.equal(clock.pending, 0);
+
+  // Active task finishes cleanly.
+  workers[3].reply({ id: workers[3].last().id, ok: true, result: 'active-ok' });
+  assert.equal(await activeJob, 'active-ok');
+  assert.equal(pool.getStats().activeWorkers, 0);
+  assert.equal(pool.getStats().idleWorkers, 1);
+
+  // Asking to keep more warm workers than currently idle is a no-op.
+  assert.deepEqual(pool.trimIdleWorkers(5), { trimmed: 0, remainingIdle: 1, active: 0 });
+  assert.equal(pool.getStats().trimmedWorkers, 3);
+
+  // Re-expanding after trim does not inflate respawnCount.
+  const re1 = pool.submit('t', 'r1');
+  const re2 = pool.submit('t', 'r2');
+  const re3 = pool.submit('t', 'r3');
+  assert.equal(pool.getStats().workers, 3);
+  assert.equal(pool.getStats().respawnCount, 0);
+  for (const w of workers.filter((x) => !x.terminated)) {
+    w.reply({ id: w.last().id, ok: true, result: 'ok' });
+  }
+  await Promise.all([re1, re2, re3]);
+
+  // Automatic idleTimeoutMs shrinking also increments trimmedWorkers (3 -> minWorkers=2).
+  clock.advance(500);
+  assert.equal(pool.getStats().workers, 2);
+  assert.equal(pool.getStats().trimmedWorkers, 4);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W274: crash-rate circuit breaker (maxConsecutiveCrashes, crashWindowMs) trips, counts circuitBreakerTrips, and resets via resetCircuitBreaker()', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    maxConsecutiveCrashes: 3,
+    crashWindowMs: 1000,
+  });
+
+  const j1 = pool.submit('t', 1);
+  const j2 = pool.submit('t', 2);
+  const j3 = pool.submit('t', 3);
+  const j4 = pool.submit('t', 4);
+  const s4 = settleState(j4);
+
+  workers[0].emit('error', { message: 'err-1' });
+  await assert.rejects(j1, WorkerCrashError);
+  assert.equal(pool.getStats().circuitOpen, false);
+  assert.equal(pool.getStats().circuitBreakerTrips, 0);
+
+  clock.advance(100);
+  workers[1].emit('messageerror', {});
+  await assert.rejects(j2, WorkerCrashError);
+  assert.equal(pool.getStats().circuitOpen, false);
+  assert.equal(pool.getStats().circuitBreakerTrips, 0);
+
+  clock.advance(100);
+  workers[2].emit('error', { message: 'err-3' });
+  await assert.rejects(j3, WorkerCrashError);
+  await flush();
+
+  // Circuit tripped: queued job j4 rejected with CircuitOpenError and no 4th worker spawned.
+  assert.equal(s4.status, 'rejected');
+  assert.ok(s4.value instanceof CircuitOpenError);
+  assert.equal(workers.length, 3);
+  assert.equal(pool.getStats().circuitOpen, true);
+  assert.equal(pool.getStats().circuitBreakerTrips, 1);
+
+  // Subsequent submits fail fast without spawning.
+  await assert.rejects(pool.submit('t', 5), CircuitOpenError);
+  assert.equal(workers.length, 3);
+
+  // Manual recovery via resetCircuitBreaker() re-enables the pool while keeping cumulative trip count.
+  pool.resetCircuitBreaker();
+  assert.equal(pool.getStats().circuitOpen, false);
+  assert.equal(pool.getStats().circuitBreakerTrips, 1);
+
+  const ok = pool.submit('t', 6);
+  assert.equal(workers.length, 4);
+  workers[3].reply({ id: workers[3].last().id, ok: true, result: 'healthy' });
+  assert.equal(await ok, 'healthy');
+
+  // Crashes spaced past crashWindowMs do not trip.
+  const sp1 = pool.submit('t', 7);
+  workers[3].emit('error', { message: 'spaced-1' });
+  await assert.rejects(sp1, WorkerCrashError);
+  clock.advance(1500);
+  const sp2 = pool.submit('t', 8);
+  workers[4].emit('error', { message: 'spaced-2' });
+  await assert.rejects(sp2, WorkerCrashError);
+  assert.equal(pool.getStats().circuitOpen, false);
+  assert.equal(pool.getStats().circuitBreakerTrips, 1);
+
+  // Trip a second time within window -> circuitBreakerTrips increments to 2.
+  const sp3 = pool.submit('t', 9);
+  workers[5].emit('error', { message: 'burst-2' });
+  await assert.rejects(sp3, WorkerCrashError);
+  const sp4 = pool.submit('t', 10);
+  workers[6].emit('error', { message: 'burst-3' });
+  await assert.rejects(sp4, WorkerCrashError);
+  assert.equal(pool.getStats().circuitOpen, true);
+  assert.equal(pool.getStats().circuitBreakerTrips, 2);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+
+  // maxConsecutiveCrashes: 0 disables circuit tripping.
+  const { pool: noBreakPool, workers: nbWorkers } = setup({
+    maxWorkers: 1,
+    maxConsecutiveCrashes: 0,
+  });
+  for (let i = 0; i < 6; i++) {
+    const p = noBreakPool.submit('t', i);
+    nbWorkers.at(-1).emit('error', { message: `c-${i}` });
+    await assert.rejects(p, WorkerCrashError);
+  }
+  assert.equal(noBreakPool.getStats().circuitOpen, false);
+  assert.equal(noBreakPool.getStats().circuitBreakerTrips, 0);
+  await noBreakPool.terminate();
+});
+
+test('W274: bounded exponential-backoff respawn caps delay at respawnBackoffMaxMs and resets streak on success', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    maxConsecutiveCrashes: 0,
+    maxRespawnsPerSlot: 10,
+    respawnBackoffBaseMs: 50,
+    respawnBackoffMaxMs: 150,
+  });
+
+  const t1 = pool.submit('t', 1);
+  const t2 = pool.submit('t', 2);
+  const t3 = pool.submit('t', 3);
+  const t4 = pool.submit('t', 4);
+  const t5 = pool.submit('t', 5);
+  assert.equal(workers.length, 1);
+
+  // Crash #1 -> 50ms backoff before respawn #1.
+  workers[0].emit('error', { message: 'crash-1' });
+  await assert.rejects(t1, WorkerCrashError);
+  assert.equal(workers.length, 1);
+  clock.advance(49);
+  assert.equal(workers.length, 1);
+  clock.advance(1);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[1].last().payload, 2);
+  assert.equal(pool.getStats().respawnCount, 1);
+
+  // Crash #2 -> 100ms backoff before respawn #2.
+  workers[1].emit('error', { message: 'crash-2' });
+  await assert.rejects(t2, WorkerCrashError);
+  assert.equal(workers.length, 2);
+  clock.advance(99);
+  assert.equal(workers.length, 2);
+  clock.advance(1);
+  assert.equal(workers.length, 3);
+  assert.equal(workers[2].last().payload, 3);
+  assert.equal(pool.getStats().respawnCount, 2);
+
+  // Crash #3 -> 200ms capped at respawnBackoffMaxMs (150ms).
+  workers[2].emit('error', { message: 'crash-3' });
+  await assert.rejects(t3, WorkerCrashError);
+  clock.advance(149);
+  assert.equal(workers.length, 3);
+  clock.advance(1);
+  assert.equal(workers.length, 4);
+  assert.equal(workers[3].last().payload, 4);
+  assert.equal(pool.getStats().respawnCount, 3);
+
+  // Crash #4 -> stays bounded at 150ms.
+  workers[3].emit('error', { message: 'crash-4' });
+  await assert.rejects(t4, WorkerCrashError);
+  clock.advance(149);
+  assert.equal(workers.length, 4);
+  clock.advance(1);
+  assert.equal(workers.length, 5);
+  assert.equal(workers[4].last().payload, 5);
+  assert.equal(pool.getStats().respawnCount, 4);
+
+  // Completing a job successfully resets the slot's crash streak back to 0.
+  workers[4].reply({ id: workers[4].last().id, ok: true, result: 'ok-5' });
+  assert.equal(await t5, 'ok-5');
+
+  // Crash #5 after recovery uses base backoff (50ms), not the 150ms cap.
+  const t6 = pool.submit('t', 6);
+  const t7 = pool.submit('t', 7);
+  workers[4].emit('error', { message: 'crash-after-recovery' });
+  await assert.rejects(t6, WorkerCrashError);
+  clock.advance(49);
+  assert.equal(workers.length, 5);
+  clock.advance(1);
+  assert.equal(workers.length, 6);
+  assert.equal(workers[5].last().payload, 7);
+  workers[5].reply({ id: workers[5].last().id, ok: true, result: 'ok-7' });
+  assert.equal(await t7, 'ok-7');
+  assert.equal(pool.getStats().respawnCount, 5);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W274: backoff respawn handles graceful/immediate terminate, aborts, circuit trip, and minWorkers without timer leaks', async () => {
+  // 1) Graceful terminate finishes queued work once backoff expires.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxConsecutiveCrashes: 0,
+      respawnBackoffBaseMs: 50,
+    });
+    const j1 = pool.submit('t', 1);
+    const j2 = pool.submit('t', 2);
+    workers[0].emit('error', { message: 'boom' });
+    await assert.rejects(j1, WorkerCrashError);
+    assert.equal(workers.length, 1);
+
+    let terminated = false;
+    const termP = pool.terminate({ graceful: true }).then(() => {
+      terminated = true;
+    });
+    clock.advance(50);
+    assert.equal(workers.length, 2);
+    assert.equal(terminated, false);
+    workers[1].reply({ id: workers[1].last().id, ok: true, result: 'finished' });
+    assert.equal(await j2, 'finished');
+    await termP;
+    assert.equal(terminated, true);
+    assert.equal(workers[1].terminated, true);
+    assert.equal(clock.pending, 0);
+  }
+
+  // 2) Immediate terminate clears pending backoff timers cleanly.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxConsecutiveCrashes: 0,
+      respawnBackoffBaseMs: 100,
+    });
+    const j1 = pool.submit('t', 1);
+    const j2 = settleState(pool.submit('t', 2));
+    workers[0].emit('error', { message: 'boom' });
+    await assert.rejects(j1, WorkerCrashError);
+    assert.equal(clock.pending, 1);
+    await pool.terminate();
+    await flush();
+    assert.equal(j2.status, 'rejected');
+    assert.ok(j2.value instanceof PoolTerminatedError);
+    assert.equal(clock.pending, 0);
+  }
+
+  // 3) Aborting the only queued job during backoff clears the unnecessary backoff timer.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxConsecutiveCrashes: 0,
+      respawnBackoffBaseMs: 100,
+    });
+    const ac = new AbortController();
+    const j1 = pool.submit('t', 1);
+    const j2 = pool.submit('t', 2, { signal: ac.signal });
+    workers[0].emit('error', { message: 'boom' });
+    await assert.rejects(j1, WorkerCrashError);
+    assert.equal(clock.pending, 1);
+    ac.abort();
+    await assert.rejects(j2, JobAbortedError);
+    assert.equal(clock.pending, 0);
+    // Submitting before the 100ms window expires still respects the remaining backoff.
+    clock.advance(40);
+    const j3 = pool.submit('t', 3);
+    assert.equal(workers.length, 1);
+    clock.advance(59);
+    assert.equal(workers.length, 1);
+    clock.advance(1);
+    assert.equal(workers.length, 2);
+    workers[1].reply({ id: workers[1].last().id, ok: true, result: 'ok-3' });
+    assert.equal(await j3, 'ok-3');
+    await pool.terminate();
+    assert.equal(clock.pending, 0);
+  }
+
+  // 4) minWorkers > 0 respawns idle crashed worker after backoff expires.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      minWorkers: 1,
+      maxConsecutiveCrashes: 0,
+      respawnBackoffBaseMs: 60,
+    });
+    assert.equal(pool.warmUp(1), 1);
+    workers[0].emit('error', { message: 'idle-crash' });
+    assert.equal(pool.getStats().workers, 0);
+    clock.advance(59);
+    assert.equal(pool.getStats().workers, 0);
+    clock.advance(1);
+    assert.equal(pool.getStats().workers, 1);
+    assert.equal(pool.getStats().respawnCount, 1);
+    await pool.terminate();
+    assert.equal(clock.pending, 0);
+  }
+});
+
+test('W274: getStats() surfaces respawnCount, trimmedWorkers, circuitBreakerTrips, circuitOpen, and watchdogTimeouts', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 2,
+    taskTimeoutMs: 50,
+    cancelGraceMs: 0,
+    maxConsecutiveCrashes: 2,
+    crashWindowMs: 1000,
+  });
+
+  // Initial W274 telemetry fields are zeroed.
+  let s = pool.getStats();
+  assert.deepEqual(s, pool.stats());
+  assert.equal(s.respawnCount, 0);
+  assert.equal(s.trimmedWorkers, 0);
+  assert.equal(s.circuitBreakerTrips, 0);
+  assert.equal(s.circuitOpen, false);
+  assert.equal(s.watchdogTimeouts, 0);
+
+  // Warm 2 workers, trim 1.
+  pool.warmUp(2);
+  assert.deepEqual(pool.trimIdleWorkers(1), { trimmed: 1, remainingIdle: 1, active: 0 });
+  assert.equal(pool.getStats().trimmedWorkers, 1);
+
+  // Trigger 1 watchdog timeout -> hard-kill, then next job respawns the killed slot.
+  const slow = pool.submit('hang', 1);
+  clock.advance(50);
+  await assert.rejects(slow, JobTimeoutError);
+  const follow = pool.submit('work', 2);
+  const liveAfterTimeout = workers.find((w) => !w.terminated && w.last()?.payload === 2);
+  assert.ok(liveAfterTimeout);
+  liveAfterTimeout.reply({ id: liveAfterTimeout.last().id, ok: true, result: 'done-2' });
+  assert.equal(await follow, 'done-2');
+
+  s = pool.getStats();
+  assert.equal(s.watchdogTimeouts, 1);
+  assert.equal(s.timedOutTasks, 1);
+  assert.equal(s.respawnCount, s.respawnedWorkers);
+  assert.ok(s.respawnCount >= 1);
+
+  // Trigger 2 crashes to trip the circuit breaker.
+  const c1 = pool.submit('t', 3);
+  const wA = workers.find((w) => !w.terminated && w.last()?.payload === 3);
+  wA.emit('error', { message: 'crash-a' });
+  await assert.rejects(c1, WorkerCrashError);
+
+  const c2 = pool.submit('t', 4);
+  const wB = workers.find((w) => !w.terminated && w.last()?.payload === 4);
+  wB.emit('error', { message: 'crash-b' });
+  await assert.rejects(c2, WorkerCrashError);
+
+  s = pool.getStats();
+  assert.deepEqual(s, pool.stats());
+  assert.equal(s.trimmedWorkers, 1);
+  assert.equal(s.watchdogTimeouts, 1);
+  assert.equal(s.timedOutTasks, 1);
+  assert.equal(s.respawnCount, s.respawnedWorkers);
+  assert.equal(s.circuitBreakerTrips, 1);
+  assert.equal(s.circuitOpen, true);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
 });
