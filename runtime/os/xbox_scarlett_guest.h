@@ -432,11 +432,14 @@ struct XDspStats {
 XDspStats xdsp_stats();
 
 // xapu.dll guest model (acp_hal_guest.cpp): open connections, commands accepted, results not
-// yet dequeued.
+// yet dequeued, and decode commands (type 3) decoded / failed with the float32 bytes written.
 struct XApuStats {
     uint64_t connections = 0;
     uint64_t commands = 0;
     uint64_t pending_results = 0;
+    uint64_t decoded_packets = 0;
+    uint64_t failed_packets = 0;
+    uint64_t decoded_bytes = 0;
 };
 XApuStats xapu_stats();
 

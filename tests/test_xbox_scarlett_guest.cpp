@@ -6,6 +6,7 @@
 // produced from the synthetic generators in this file (pattern_data / skewed_data).
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(PLAYGTA6_HAVE_OPUS)
+#include <opus.h>
+#endif
+
 #include "abi/playgta6_abi.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/gfx10_detile.h"
@@ -23,6 +28,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/vmem.h"
+#include "os/xapu_opus.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -1936,6 +1942,153 @@ void test_xapu() {
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
 }
 
+bool xapu_opus_available() { return playgta6::os::xapu_opus::available(); }
+
+// Synthetic Opus packets: `count` 20 ms frames of a 440 Hz sine at 48 kHz, encoded here (no game
+// data). Without libopus the packets are placeholders (the model then writes silence).
+std::vector<std::vector<uint8_t>> sine_opus_packets(int channels, int count) {
+    std::vector<std::vector<uint8_t>> packets;
+#if defined(PLAYGTA6_HAVE_OPUS)
+    int error = 0;
+    OpusEncoder* enc = opus_encoder_create(48000, channels, OPUS_APPLICATION_AUDIO, &error);
+    CHECK(enc != nullptr && error == OPUS_OK);
+    std::vector<float> pcm(960 * channels);
+    for (int f = 0; f < count; ++f) {
+        for (int i = 0; i < 960; ++i) {
+            const float v = 0.5f * std::sin(2.0f * 3.14159265f * 440.0f * static_cast<float>(f * 960 + i) / 48000.0f);
+            for (int c = 0; c < channels; ++c) {
+                pcm[i * channels + c] = v;
+            }
+        }
+        std::vector<uint8_t> packet(0x280);
+        const int n = opus_encode_float(enc, pcm.data(), 960, packet.data(), static_cast<opus_int32>(packet.size()));
+        CHECK(n > 0);
+        packet.resize(n > 0 ? n : 1);
+        packets.push_back(std::move(packet));
+    }
+    opus_encoder_destroy(enc);
+#else
+    for (int f = 0; f < count; ++f) {
+        packets.push_back({0xFC, 0xFF, 0xFE});
+    }
+#endif
+    return packets;
+}
+
+// Command 3 in the title's layout (0x144F20AD0): an Opus packet in a voice's input slot decodes to
+// float32 in its output slot, and the result {3, voice, ..., +0x34 bytes} is queued in order with
+// the acknowledgements; +0x20 drops frames from the start; a bad packet posts 0 bytes.
+void test_xapu_decode() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t count = fx.export_address("xapu.dll", "XApuGetResultCount");
+    const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t shared = load64(p2);
+    const ga::XApuStats before = ga::xapu_stats();
+
+    const uint64_t c = com::guest_alloc(0x40);
+    const uint64_t result = com::guest_alloc(0x38);
+    auto submit = [&](uint32_t type, uint32_t voice) {
+        const uint32_t head[2] = {type, voice};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+    };
+    // Mirrors 0x144F20AD0: packet copied into input slot `slot`, output in output slot `slot`.
+    auto decode = [&](uint32_t voice, uint32_t slot, uint32_t channels, const std::vector<uint8_t>& packet,
+                      uint32_t skip) {
+        uint8_t cmd[0x40] = {};
+        const uint32_t type = 3;
+        const float rate = 48000.0f;
+        const uint32_t frames = 0x3C0;
+        const uint32_t bytes = static_cast<uint32_t>(packet.size());
+        const uint64_t input = shared + uint64_t{slot} * 0x280;
+        const uint32_t capacity = channels * 0xF00;
+        const uint64_t output = shared + 0x14000 + uint64_t{slot} * 0x1E00;
+        std::memcpy(cmd + 0x00, &type, 4);
+        std::memcpy(cmd + 0x04, &voice, 4);
+        std::memcpy(cmd + 0x1C, &rate, 4);
+        std::memcpy(cmd + 0x20, &skip, 4);
+        std::memcpy(cmd + 0x24, &frames, 4);
+        std::memcpy(cmd + 0x28, &bytes, 4);
+        std::memcpy(cmd + 0x2C, &input, 8);
+        std::memcpy(cmd + 0x34, &capacity, 4);
+        std::memcpy(cmd + 0x38, &output, 8);
+        CHECK(packet.empty() || com::write_guest(input, packet.data(), packet.size()));
+        CHECK(com::write_guest(c, cmd, sizeof(cmd)));
+        CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+    };
+    auto next = [&](uint32_t type, uint32_t voice) -> uint32_t {
+        CHECK(com::write_guest(result + 0x30, uint64_t{~0ull}));
+        CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+        CHECK(load32(result) == type && load32(result + 4) == voice);
+        return load32(result + 0x34);
+    };
+    auto peak = [&](uint32_t slot, uint32_t bytes) {
+        std::vector<float> pcm(bytes / 4);
+        CHECK(com::read_guest(shared + 0x14000 + uint64_t{slot} * 0x1E00, pcm.data(), bytes));
+        float m = 0.0f;
+        for (float v : pcm) {
+            m = std::max(m, std::fabs(v));
+        }
+        return m;
+    };
+
+    // Mono voice 4 on slot 9: start, five packets (the second trimmed by 312 frames), free.
+    const auto mono = sine_opus_packets(1, 5);
+    submit(1, 4);
+    for (size_t i = 0; i < mono.size(); ++i) {
+        decode(4, 9, 1, mono[i], i == 1 ? 312 : 0);
+    }
+    submit(2, 4);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 7);
+    CHECK(next(1, 4) == 0);
+    CHECK(next(3, 4) == 960 * 4);
+    CHECK(next(3, 4) == (960 - 312) * 4);
+    CHECK(next(3, 4) == 960 * 4);
+    CHECK(next(3, 4) == 960 * 4);
+    CHECK(next(3, 4) == 960 * 4);
+    CHECK(next(2, 4) == 0);
+    // The last packet's output is in the slot: the sine once the encoder delay has passed.
+    if (xapu_opus_available()) {
+        const float m = peak(9, 960 * 4);
+        CHECK(m > 0.2f && m < 1.0f);
+    }
+
+    // Stereo voice 6 on slot 0x7F: the output fills the whole 0x1E00-byte slot.
+    const auto stereo = sine_opus_packets(2, 3);
+    for (const auto& packet : stereo) {
+        decode(6, 0x7F, 2, packet, 0);
+    }
+    for (size_t i = 0; i < stereo.size(); ++i) {
+        CHECK(next(3, 6) == 0x1E00);
+    }
+    if (xapu_opus_available()) {
+        CHECK(peak(0x7F, 0x1E00) > 0.2f);
+    }
+
+    // A packet that does not decode (and an empty one) still gets a result, with 0 bytes.
+    if (xapu_opus_available()) {
+        decode(5, 1, 1, {0xFF}, 0);  // code-3 TOC without a frame count byte
+        CHECK(next(3, 5) == 0);
+    }
+    decode(5, 1, 1, {}, 0);
+    CHECK(next(3, 5) == 0);
+
+    const ga::XApuStats after = ga::xapu_stats();
+    CHECK(after.decoded_packets - before.decoded_packets == mono.size() + stereo.size());
+    CHECK(after.failed_packets - before.failed_packets == (xapu_opus_available() ? 2u : 1u));
+    CHECK(after.decoded_bytes - before.decoded_bytes == (4 * 960 * 4 + (960 - 312) * 4) + 3 * 0x1E00);
+    CHECK(after.pending_results == 0);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1954,6 +2107,7 @@ int main() {
     test_acp_hal();
     test_xdsp();
     test_xapu();
+    test_xapu_decode();
     test_mmdevice();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xbox_scarlett_guest: %d failure(s)\n", g_failures);
