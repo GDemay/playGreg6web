@@ -10,13 +10,20 @@ const stagingMod = require('../web/workers/staging_pool.js');
 const {
   alignUp,
   alignBufferSize,
+  nextPowerOfTwo,
+  buildPowerOfTwoBuckets,
+  selectPowerOfTwoBucket,
   selectLargeSlabBucket,
   isSharedBuffer,
   sanitizeWriteBufferPayload,
   GpuStagingPool,
   DEFAULT_LARGE_SLAB_THRESHOLD,
   DEFAULT_MAX_LARGE_SLABS,
+  DEFAULT_POW2_MIN_SLAB_BYTES,
+  DEFAULT_POW2_MAX_BUCKET_BYTES,
   DEFAULT_LARGE_SLAB_BUCKETS,
+  POW2_LARGE_SLAB_BUCKETS,
+  BUCKET_STRATEGY,
   BUFFER_USAGE,
   MAP_MODE,
   STAGING_MODE,
@@ -2083,5 +2090,460 @@ test('W176: bucket isolation, explicit release, >16 MiB fallback, and idleEvictF
   assert.equal(afterCutscene.recycledChunks, 1);
 
   pool.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W196: Power-of-two bucket scaling through 16 MiB for 4K Bink2 texture
+// uploads, per-bucket caps, deterministic LRU eviction, and pool telemetry.
+// ---------------------------------------------------------------------------
+
+test('W196: power-of-two bucket helpers scale smoothly through 16 MiB and validate constructor options', () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+
+  assert.equal(DEFAULT_POW2_MIN_SLAB_BYTES, 1 * MiB);
+  assert.equal(DEFAULT_POW2_MAX_BUCKET_BYTES, 16 * MiB);
+  assert.deepEqual(
+    Array.from(POW2_LARGE_SLAB_BUCKETS),
+    [1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 16 * MiB]
+  );
+  assert.deepEqual(BUCKET_STRATEGY, { DEFAULT: 'default', POW2: 'pow2' });
+
+  // nextPowerOfTwo across small, 4K plane, and >32-bit sizes.
+  assert.equal(nextPowerOfTwo(1), 1);
+  assert.equal(nextPowerOfTwo(4), 4);
+  assert.equal(nextPowerOfTwo(5), 8);
+  assert.equal(nextPowerOfTwo(1920 * 1080), 2 * MiB); // 2,073,600 B (~2.07 MB) -> 2 MiB
+  assert.equal(nextPowerOfTwo(Math.ceil(2.07 * MiB)), 4 * MiB); // 2.07 MiB -> 4 MiB
+  assert.equal(nextPowerOfTwo(2048 * 1080), 4 * MiB); // 2.11 MiB aligned chroma -> 4 MiB
+  assert.equal(nextPowerOfTwo(3840 * 2160), 8 * MiB); // 7.91 MiB / 8.29 MB 4K Y -> 8 MiB
+  assert.equal(nextPowerOfTwo(Math.ceil(8.3 * MiB)), 16 * MiB); // 8.3 MiB 4K Y -> 16 MiB
+  assert.equal(nextPowerOfTwo(16 * MiB), 16 * MiB);
+  assert.equal(nextPowerOfTwo(0x100000001), 0x200000000);
+  assert.throws(() => nextPowerOfTwo(0), RangeError);
+  assert.throws(() => nextPowerOfTwo(-8), RangeError);
+  assert.throws(() => nextPowerOfTwo(1.5), RangeError);
+
+  // buildPowerOfTwoBuckets default and fine-grained ladders.
+  assert.deepEqual(
+    Array.from(buildPowerOfTwoBuckets()),
+    [1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 16 * MiB]
+  );
+  assert.deepEqual(
+    Array.from(buildPowerOfTwoBuckets(64 * KiB, 16 * MiB)),
+    [
+      64 * KiB,
+      128 * KiB,
+      256 * KiB,
+      512 * KiB,
+      1 * MiB,
+      2 * MiB,
+      4 * MiB,
+      8 * MiB,
+      16 * MiB,
+    ]
+  );
+  assert.throws(() => buildPowerOfTwoBuckets(16 * MiB, 8 * MiB), RangeError);
+
+  // selectPowerOfTwoBucket scales smoothly through 16 MiB and falls back cleanly above 16 MiB.
+  assert.equal(selectPowerOfTwoBucket(1), 4);
+  assert.equal(selectPowerOfTwoBucket(1000, 64 * KiB, 16 * MiB), 64 * KiB);
+  assert.equal(selectPowerOfTwoBucket(1920 * 1080, 1 * MiB, 16 * MiB), 2 * MiB);
+  assert.equal(selectPowerOfTwoBucket(Math.ceil(2.07 * MiB), 1 * MiB, 16 * MiB), 4 * MiB);
+  assert.equal(selectPowerOfTwoBucket(3840 * 2160, 1 * MiB, 16 * MiB), 8 * MiB);
+  assert.equal(selectPowerOfTwoBucket(Math.ceil(8.3 * MiB), 1 * MiB, 16 * MiB), 16 * MiB);
+  assert.equal(selectPowerOfTwoBucket(16 * MiB, 1 * MiB, 16 * MiB), 16 * MiB);
+  assert.equal(selectPowerOfTwoBucket(17 * MiB + 1, 1 * MiB, 16 * MiB), 17 * MiB + 4);
+  assert.throws(() => selectPowerOfTwoBucket(1024, 8 * MiB, 4 * MiB), RangeError);
+
+  // Constructor option aliases and validation.
+  const { device } = createLightweight4kMockDevice();
+  const aliasedPool = new GpuStagingPool({
+    device,
+    maxPooledBytes: 96 * MiB,
+    maxPerBucket: 3,
+    powerOfTwoBuckets: true,
+  });
+  assert.equal(aliasedPool.maxPoolBytes, 96 * MiB);
+  assert.equal(aliasedPool.maxPooledBytes, 96 * MiB);
+  assert.equal(aliasedPool.maxSlabsPerBucket, 3);
+  assert.equal(aliasedPool.bucketStrategy, 'pow2');
+  assert.deepEqual(Array.from(aliasedPool.largeSlabBuckets), Array.from(POW2_LARGE_SLAB_BUCKETS));
+  const initStats = aliasedPool.getStats();
+  assert.equal(initStats.poolHits, 0);
+  assert.equal(initStats.poolMisses, 0);
+  assert.equal(initStats.bytesAllocated, 0);
+  assert.equal(initStats.bytesReused, 0);
+  assert.equal(initStats.evictedCount, 0);
+  assert.equal(initStats.activeCount, 0);
+  assert.equal(initStats.idleCount, 0);
+  assert.equal(initStats.peakBytes, 0);
+  assert.equal(initStats.maxPooledBytes, 96 * MiB);
+  assert.equal(initStats.maxSlabsPerBucket, 3);
+  assert.equal(initStats.bucketStrategy, 'pow2');
+  aliasedPool.destroy();
+
+  assert.throws(
+    () => new GpuStagingPool({ device, maxPoolBytes: 16 * MiB, maxPooledBytes: 32 * MiB }),
+    RangeError
+  );
+  assert.throws(
+    () => new GpuStagingPool({ device, maxSlabsPerBucket: 2, maxPerBucket: 4 }),
+    RangeError
+  );
+  assert.throws(() => new GpuStagingPool({ device, maxSlabsPerBucket: -1 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, maxPerBucket: 1.5 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, bucketStrategy: 'invalid' }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, powerOfTwoBuckets: 'yes' }), TypeError);
+  assert.throws(
+    () => new GpuStagingPool({ device, bucketStrategy: 'default', powerOfTwoBuckets: true }),
+    RangeError
+  );
+  assert.throws(
+    () => new GpuStagingPool({ device, bucketStrategy: 'pow2', powerOfTwoBuckets: false }),
+    RangeError
+  );
+  assert.throws(() => new GpuStagingPool({ device, maxBucketBytes: 0 }), RangeError);
+});
+
+test('W196: repeated 8.3 MiB Y + 2.07 MiB U/V 4K plane acquire/release cycles achieve 100% pow2 reuse after warmup', async () => {
+  const MiB = 1024 * 1024;
+  const yPlane83MiB = Math.ceil(8.3 * MiB); // 8,703,181 B -> 16 MiB pow2 bucket
+  const uvPlane207MiB = Math.ceil(2.07 * MiB); // 2,170,553 B -> 4 MiB pow2 bucket
+  const perFrameBucketBytes = 16 * MiB + 4 * MiB + 4 * MiB; // 24 MiB / frame
+
+  // 1. Triple-buffered (framesInFlight = 3) explicit allocate/release loop over 33 frames.
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 96 * MiB,
+    framesInFlight: 3,
+    maxLargeSlabs: 12,
+    maxSlabsPerBucket: 6,
+  });
+
+  const warmupFrames = 3;
+  const steadyFrames = 30;
+  const totalFrames = warmupFrames + steadyFrames;
+
+  for (let frame = 0; frame < totalFrames; frame += 1) {
+    pool.beginFrame(frame);
+    const ySlice = pool.allocate(yPlane83MiB, 256);
+    const uSlice = pool.allocate(uvPlane207MiB, 256);
+    const vSlice = pool.allocate(uvPlane207MiB, 256);
+
+    assert.equal(ySlice.buffer.size, 16 * MiB);
+    assert.equal(uSlice.buffer.size, 4 * MiB);
+    assert.equal(vSlice.buffer.size, 4 * MiB);
+    assert.equal(ySlice.slabBucketSize, 16 * MiB);
+    assert.equal(uSlice.slabBucketSize, 4 * MiB);
+    assert.equal(vSlice.slabBucketSize, 4 * MiB);
+
+    const midStats = pool.getStats();
+    assert.equal(midStats.activeCount, 3);
+    assert.equal(midStats.idleCount, 0);
+
+    assert.equal(pool.release(ySlice), true);
+    assert.equal(pool.release(uSlice), true);
+    assert.equal(pool.release(vSlice), true);
+    assert.equal(pool.getStats().activeCount, 0);
+    pool.endFrame();
+
+    if (frame === warmupFrames - 1) {
+      assert.equal(createdBuffers.length, 9);
+      const warmStats = pool.getStats();
+      assert.equal(warmStats.poolMisses, 9);
+      assert.equal(warmStats.poolHits, 0);
+      assert.equal(warmStats.bytesAllocated, 3 * perFrameBucketBytes);
+      assert.equal(warmStats.bytesReused, 0);
+      assert.equal(warmStats.peakBytes, 3 * perFrameBucketBytes);
+      assert.equal(warmStats.evictedCount, 0);
+    }
+  }
+
+  // Zero new GPUBuffer allocations across all 30 steady-state frames (100% reuse after warmup).
+  assert.equal(createdBuffers.length, 9);
+  const stats = pool.getStats();
+  assert.equal(stats.poolMisses, 9);
+  assert.equal(stats.poolHits, steadyFrames * 3);
+  assert.equal(stats.largeSlabMisses, 9);
+  assert.equal(stats.largeSlabHits, steadyFrames * 3);
+  assert.equal(stats.bytesAllocated, 3 * perFrameBucketBytes);
+  assert.equal(stats.bytesReused, steadyFrames * perFrameBucketBytes);
+  assert.equal(stats.peakBytes, 3 * perFrameBucketBytes);
+  assert.equal(stats.allocatedBytes, 3 * perFrameBucketBytes);
+  assert.equal(stats.evictedCount, 0);
+  assert.equal(stats.activeCount, 0);
+  assert.equal(stats.idleCount, 0); // last 3 frames still in-flight
+
+  // Advance framesInFlight frames so all 9 slabs return to idle buckets.
+  pool.beginFrame(totalFrames + 3);
+  const idleStats = pool.getStats();
+  assert.equal(idleStats.activeCount, 0);
+  assert.equal(idleStats.idleCount, 9);
+  assert.deepEqual(idleStats.largeSlabBucketCounts, {
+    [16 * MiB]: 3,
+    [4 * MiB]: 6,
+  });
+  pool.destroy();
+
+  // 2. GPU fence-driven 4K Bink2 stageTextureUpload (3840x2160 Y -> 8 MiB, 1920x1080 U/V -> 4 MiB)
+  //    plus raw 2.07 MB (1920x1080) -> 2 MiB bucket reuse.
+  const fencedMock = createLightweight4kMockDevice({ enableWorkDoneFence: true });
+  const fencedPool = new GpuStagingPool({
+    device: fencedMock.device,
+    powerOfTwoBuckets: true,
+    maxPooledBytes: 64 * MiB,
+    framesInFlight: 3,
+  });
+  const encoder = createLightweightEncoder();
+  const yData = new Uint8Array(3840 * 2160); // 7.91 MiB -> 8 MiB pow2 bucket
+  const uData = new Uint8Array(1920 * 1080); // 1920B/row -> 2048B/row aligned = 2.11 MiB -> 4 MiB pow2 bucket
+  const vData = new Uint8Array(1920 * 1080);
+  const dstY = { id: 'pow2-y' };
+  const dstU = { id: 'pow2-u' };
+  const dstV = { id: 'pow2-v' };
+
+  for (let frame = 0; frame < 11; frame += 1) {
+    fencedPool.beginFrame(frame);
+    const yUp = fencedPool.stageTextureUpload(encoder, dstY, yData, {
+      width: 3840,
+      height: 2160,
+      bytesPerRow: 3840,
+    });
+    const uUp = fencedPool.stageTextureUpload(encoder, dstU, uData, {
+      width: 1920,
+      height: 1080,
+      bytesPerRow: 1920,
+    });
+    const vUp = fencedPool.stageTextureUpload(encoder, dstV, vData, {
+      width: 1920,
+      height: 1080,
+      bytesPerRow: 1920,
+    });
+    assert.equal(yUp.buffer.size, 8 * MiB);
+    assert.equal(uUp.buffer.size, 4 * MiB);
+    assert.equal(vUp.buffer.size, 4 * MiB);
+    fencedPool.endFrame();
+
+    const fence = fencedMock.deferredFences[fencedMock.deferredFences.length - 1];
+    fence.resolve();
+    await fence.promise;
+    await Promise.resolve();
+  }
+
+  assert.equal(fencedMock.createdBuffers.length, 3);
+  const fStats = fencedPool.getStats();
+  assert.equal(fStats.poolMisses, 3);
+  assert.equal(fStats.poolHits, 30);
+  assert.equal(fStats.bytesAllocated, 16 * MiB);
+  assert.equal(fStats.bytesReused, 160 * MiB);
+  assert.equal(fStats.peakBytes, 16 * MiB);
+  assert.equal(fStats.evictedCount, 0);
+
+  // Raw 2.07 MB (1920*1080 = 2,073,600 B) hits the 2 MiB pow2 bucket directly and reuses on next frame.
+  fencedPool.beginFrame(11);
+  const rawChroma0 = fencedPool.allocate(1920 * 1080, 256);
+  assert.equal(rawChroma0.buffer.size, 2 * MiB);
+  fencedPool.endFrame();
+  fencedMock.deferredFences[fencedMock.deferredFences.length - 1].resolve();
+  await fencedMock.deferredFences[fencedMock.deferredFences.length - 1].promise;
+  await Promise.resolve();
+
+  fencedPool.beginFrame(12);
+  const rawChroma1 = fencedPool.allocate(1920 * 1080, 256);
+  assert.equal(rawChroma1.buffer, rawChroma0.buffer);
+  assert.equal(fencedMock.createdBuffers.length, 4);
+  fencedPool.destroy();
+});
+
+test('W196: per-bucket cap and maxPooledBytes VRAM cap enforce deterministic LRU eviction and telemetry', () => {
+  const MiB = 1024 * 1024;
+
+  // 1. Per-bucket cap (maxSlabsPerBucket = 2) evicts LRU slab inside the overflowing bucket only.
+  const bucketMock = createLightweight4kMockDevice();
+  const bucketPool = new GpuStagingPool({
+    device: bucketMock.device,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 128 * MiB,
+    maxLargeSlabs: 16,
+    maxSlabsPerBucket: 2,
+    framesInFlight: 1,
+  });
+
+  bucketPool.beginFrame(0);
+  const c0 = bucketPool.allocate(Math.ceil(2.07 * MiB), 256); // buf 0 (4 MiB, seq 1)
+  const c1 = bucketPool.allocate(Math.ceil(2.07 * MiB), 256); // buf 1 (4 MiB, seq 2)
+  const c2 = bucketPool.allocate(Math.ceil(2.07 * MiB), 256); // buf 2 (4 MiB, seq 3)
+  const y0 = bucketPool.allocate(Math.ceil(8.3 * MiB), 256); // buf 3 (16 MiB, seq 4)
+  assert.equal(bucketPool.getStats().activeCount, 4);
+  assert.equal(bucketPool.getStats().bytesAllocated, 28 * MiB);
+  assert.equal(bucketPool.getStats().peakBytes, 28 * MiB);
+  bucketPool.endFrame();
+
+  // Frame 1 recycles all 4 slabs: 4 MiB bucket has 3 > maxSlabsPerBucket(2) -> evicts LRU buf 0!
+  const b1 = bucketPool.beginFrame(1);
+  assert.equal(b1.reclaimedChunks, 1);
+  assert.equal(b1.reclaimedBytes, 4 * MiB);
+  assert.equal(c0.buffer.destroyCount, 1, 'oldest (LRU) 4 MiB slab evicted by per-bucket cap');
+  assert.equal(c1.buffer.destroyCount, 0);
+  assert.equal(c2.buffer.destroyCount, 0);
+  assert.equal(y0.buffer.destroyCount, 0, 'unrelated 16 MiB bucket stays warm');
+
+  const b1Stats = bucketPool.getStats();
+  assert.equal(b1Stats.evictedCount, 1);
+  assert.equal(b1Stats.evictedBytes, 4 * MiB);
+  assert.equal(b1Stats.idleCount, 3);
+  assert.equal(b1Stats.activeCount, 0);
+  assert.equal(b1Stats.allocatedBytes, 24 * MiB);
+  assert.equal(b1Stats.peakBytes, 28 * MiB);
+  assert.deepEqual(b1Stats.largeSlabBucketCounts, {
+    [4 * MiB]: 2,
+    [16 * MiB]: 1,
+  });
+
+  // Touch MRU slab (c2) in frame 1 while leaving c1 untouched at frame 0, and allocate
+  // 2 additional 4 MiB slabs in frame 1 (c3 -> hits c1? No: reuse c2 + fresh c3/c4 after cap=1).
+  // Specifically, verify cross-frame per-bucket LRU with maxSlabsPerBucket = 1:
+  const c2Reused = bucketPool.allocate(Math.ceil(2.07 * MiB), 256);
+  assert.equal(c2Reused.buffer, c2.buffer, 'MRU slab is reused first from bucket');
+  bucketPool.endFrame();
+  bucketPool.destroy();
+
+  const perBucketCrossFrameMock = createLightweight4kMockDevice();
+  const perBucketCrossFramePool = new GpuStagingPool({
+    device: perBucketCrossFrameMock.device,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 64 * MiB,
+    maxSlabsPerBucket: 1,
+    framesInFlight: 2,
+  });
+  perBucketCrossFramePool.beginFrame(0);
+  const f0Slab = perBucketCrossFramePool.allocate(Math.ceil(2.07 * MiB), 256); // frame 0
+  perBucketCrossFramePool.endFrame();
+  perBucketCrossFramePool.beginFrame(1);
+  const f1Slab = perBucketCrossFramePool.allocate(Math.ceil(2.07 * MiB), 256); // frame 1
+  perBucketCrossFramePool.endFrame();
+  perBucketCrossFramePool.beginFrame(2); // recycles f0Slab (idle = 1 <= cap 1)
+  assert.equal(f0Slab.buffer.destroyCount, 0);
+  perBucketCrossFramePool.endFrame();
+  perBucketCrossFramePool.beginFrame(3); // recycles f1Slab -> 2 idle > cap 1 -> evicts older f0Slab!
+  assert.equal(f0Slab.buffer.destroyCount, 1, 'older frame-0 slab evicted before frame-1 slab');
+  assert.equal(f1Slab.buffer.destroyCount, 0, 'newer frame-1 slab retained in bucket');
+  assert.equal(perBucketCrossFramePool.getStats().evictedCount, 1);
+  assert.equal(perBucketCrossFramePool.getStats().idleCount, 1);
+  perBucketCrossFramePool.destroy();
+
+  // 2. Cross-frame deterministic LRU eviction under maxPooledBytes VRAM cap:
+  //    older idle oversized slab (frame 0) is evicted BEFORE newer larger slab (frame 1).
+  const lruMock = createLightweight4kMockDevice();
+  const lruPool = new GpuStagingPool({
+    device: lruMock.device,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 24 * MiB,
+    maxLargeSlabs: 8,
+    framesInFlight: 1,
+  });
+
+  // Frame 0: allocate 4 MiB slab (buf 0, lastUsedFrame = 0).
+  lruPool.beginFrame(0);
+  const old4 = lruPool.allocate(Math.ceil(2.07 * MiB), 256);
+  assert.equal(old4.buffer.size, 4 * MiB);
+  lruPool.endFrame();
+
+  // Frame 1: allocate 16 MiB slab (buf 1, lastUsedFrame = 1). Live = 20 MiB <= 24 MiB.
+  lruPool.beginFrame(1);
+  const newer16 = lruPool.allocate(Math.ceil(8.3 * MiB), 256);
+  assert.equal(newer16.buffer.size, 16 * MiB);
+  lruPool.endFrame();
+
+  // Frame 2: both slabs idle (4 MiB @ frame 0, 16 MiB @ frame 1).
+  // Requesting an 8 MiB slab needs 20 + 8 = 28 > 24 MiB ->
+  // deterministic LRU must evict old4 (frame 0) FIRST, leaving newer16 (frame 1) warm (16 + 8 = 24 MiB)!
+  lruPool.beginFrame(2);
+  assert.equal(lruPool.getStats().idleCount, 2);
+  const fresh8 = lruPool.allocate(3840 * 2160, 256); // 8 MiB bucket
+  assert.equal(fresh8.buffer.size, 8 * MiB);
+  assert.equal(old4.buffer.destroyCount, 1, 'older frame-0 idle slab must be LRU-evicted first');
+  assert.equal(newer16.buffer.destroyCount, 0, 'newer frame-1 16 MiB slab must stay warm');
+
+  let lruStats = lruPool.getStats();
+  assert.equal(lruStats.allocatedBytes, 24 * MiB);
+  assert.equal(lruStats.peakBytes, 24 * MiB);
+  assert.equal(lruStats.bytesAllocated, (4 + 16 + 8) * MiB);
+  assert.equal(lruStats.bytesReused, 0);
+  assert.equal(lruStats.poolMisses, 3);
+  assert.equal(lruStats.poolHits, 0);
+  assert.equal(lruStats.evictedCount, 1);
+  assert.equal(lruStats.evictedBytes, 4 * MiB);
+  assert.equal(lruStats.activeCount, 1);
+  assert.equal(lruStats.idleCount, 1);
+
+  // Immediately acquiring 8.3 MiB hits the preserved newer16 slab with zero eviction or new allocation!
+  const hit16 = lruPool.allocate(Math.ceil(8.3 * MiB), 256);
+  assert.equal(hit16.buffer, newer16.buffer);
+  lruStats = lruPool.getStats();
+  assert.equal(lruStats.poolHits, 1);
+  assert.equal(lruStats.bytesReused, 16 * MiB);
+  assert.equal(lruStats.activeCount, 2);
+  assert.equal(lruStats.idleCount, 0);
+  assert.equal(lruStats.allocatedBytes, 24 * MiB);
+
+  // Over-budget allocation while all 24 MiB are active must throw without altering telemetry!
+  const beforeOom = lruPool.getStats();
+  assert.throws(() => lruPool.allocate(Math.ceil(2.07 * MiB), 256), RangeError);
+  const afterOom = lruPool.getStats();
+  assert.equal(afterOom.poolMisses, beforeOom.poolMisses);
+  assert.equal(afterOom.bytesAllocated, beforeOom.bytesAllocated);
+  assert.equal(afterOom.evictedCount, beforeOom.evictedCount);
+  assert.equal(afterOom.peakBytes, beforeOom.peakBytes);
+  assert.equal(afterOom.allocatedBytes, 24 * MiB);
+
+  lruPool.endFrame();
+  lruPool.destroy();
+  assert.equal(lruPool.getStats().allocatedBytes, 0);
+  assert.equal(lruPool.getStats().activeCount, 0);
+  assert.equal(lruPool.getStats().idleCount, 0);
+  assert.equal(lruPool.getStats().peakBytes, 24 * MiB);
+});
+
+test('W196: classic-worker importScripts exposes pow2 bucket exports without leaking internals', () => {
+  const source = fs.readFileSync(
+    new URL('../web/workers/staging_pool.js', import.meta.url),
+    'utf8'
+  );
+  const sandbox = {
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    DataView,
+    Float32Array,
+    Math,
+    Number,
+    Object,
+    Set,
+    Map,
+    Array,
+    Promise,
+    Error,
+    TypeError,
+    RangeError,
+    JSON,
+    Infinity,
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+  const mod = ctx.PlayGta6StagingPool;
+  assert.equal(typeof mod.nextPowerOfTwo, 'function');
+  assert.equal(typeof mod.buildPowerOfTwoBuckets, 'function');
+  assert.equal(typeof mod.selectPowerOfTwoBucket, 'function');
+  assert.deepEqual(Array.from(mod.POW2_LARGE_SLAB_BUCKETS), Array.from(POW2_LARGE_SLAB_BUCKETS));
+  assert.equal(mod.BUCKET_STRATEGY.POW2, 'pow2');
+  assert.equal(ctx.POW2_LARGE_SLAB_BUCKETS, undefined);
+  assert.equal(ctx.compareEvictionLru, undefined);
 });
 
