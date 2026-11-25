@@ -18,10 +18,23 @@ const mailboxMod = require('../web/workers/httpfs_mailbox.js');
 const {
   DEFAULT_IMMUTABLE_CHUNK_SIZE,
   DEFAULT_IMMUTABLE_MAX_BYTES,
+  DEFAULT_DUMP_ENDPOINT,
+  DUMP_VIRTUAL_PREFIX,
+  HTTPFS_OP_WRITE,
+  HTTPFS_OPEN_FLAG_WRITE,
+  HTTPFS_OPEN_FLAG_APPEND,
+  MAX_SLAB_SIZE,
+  MAX_SLAB_CACHE_BYTES,
+  VIDEO_STREAM_SLAB_PRESET,
   ImmutableHttpfsCache,
   IoWorkerController,
+  createSlabCacheTuningProfile,
+  isDumpVirtualPath,
   isImmutableHttpfsPath,
+  isVideoStreamPath,
   parseContentRangeHeader,
+  resolveDumpConfig,
+  resolveDumpWriteRoute,
   resolveHttpfsRoute,
 } = ioWorkerMod;
 
@@ -1209,4 +1222,707 @@ test('W91: classic Web Worker init message forwards custom shadersBase over self
   } finally {
     await workerSelf.onmessage({ data: { detachMailbox: true, id: 2 } });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 8. W173 (#880): Opt-in /pg6_dump/* write forwarding, strict read-only game
+//    file enforcement, bounded sequential slab prefetch & 4K Bink2 cache tuning
+// ---------------------------------------------------------------------------
+
+function createMockDumpAndRangeFetch(urlBytesMap, options = {}) {
+  const base = createMockRangeFetch(urlBytesMap, options);
+  const posts = [];
+  const dumpedFiles = new Map();
+  const postStatusOverrides = options.postStatusOverrides || new Map();
+
+  async function fetchImpl(url, init = {}) {
+    const method = ((init && init.method) || 'GET').toUpperCase();
+    if (method === 'POST') {
+      const rawBody = init.body;
+      const bodyBytes =
+        rawBody instanceof Uint8Array
+          ? rawBody.slice()
+          : rawBody instanceof ArrayBuffer
+            ? new Uint8Array(rawBody).slice()
+            : typeof rawBody === 'string'
+              ? utf8Encoder.encode(rawBody)
+              : new Uint8Array(0);
+      const parsedUrl = new URL(url, 'http://127.0.0.1');
+      const pathname = parsedUrl.pathname;
+      const append = parsedUrl.searchParams.get('append') === '1';
+      posts.push({ method, url, pathname, append, bytes: bodyBytes });
+
+      if (options.delayMs > 0) {
+        await new Promise((r) => setTimeout(r, options.delayMs));
+      }
+
+      const override = postStatusOverrides.get(pathname);
+      const overrideStatus = typeof override === 'function' ? override(posts.length) : override;
+      if (overrideStatus) {
+        return {
+          ok: false,
+          status: overrideStatus,
+          headers: new Map(),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+
+      if (append && dumpedFiles.has(pathname)) {
+        const prev = dumpedFiles.get(pathname);
+        const merged = new Uint8Array(prev.byteLength + bodyBytes.byteLength);
+        merged.set(prev, 0);
+        merged.set(bodyBytes, prev.byteLength);
+        dumpedFiles.set(pathname, merged);
+      } else {
+        dumpedFiles.set(pathname, bodyBytes);
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+    return base.fetchImpl(url, init);
+  }
+
+  return { fetchImpl, requests: base.requests, posts, dumpedFiles };
+}
+
+async function rawMailboxOp(sab, op, handle, offsetBig, payloadBytes) {
+  const statusView = new Int32Array(sab, 0, 1);
+  const headerView = new DataView(sab, 0, 40);
+  const payloadView = new Uint8Array(sab, 40, sab.byteLength - 40);
+
+  const bytes = payloadBytes instanceof Uint8Array ? payloadBytes : new Uint8Array(0);
+  headerView.setUint32(HttpfsOffsets.OP, op, true);
+  headerView.setInt32(HttpfsOffsets.HANDLE, handle, true);
+  headerView.setBigUint64(HttpfsOffsets.OFFSET, offsetBig, true);
+  headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(bytes.byteLength), true);
+  headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+  if (bytes.byteLength > 0) {
+    payloadView.set(bytes, 0);
+  }
+
+  Atomics.store(statusView, 0, HttpfsStatus.RequestReady);
+  Atomics.notify(statusView, 0, 1);
+
+  let cur = Atomics.load(statusView, 0);
+  while (cur === HttpfsStatus.RequestReady) {
+    const waitObj = Atomics.waitAsync(statusView, 0, HttpfsStatus.RequestReady, 5000);
+    const res = waitObj.async ? await waitObj.value : waitObj.value;
+    cur = Atomics.load(statusView, 0);
+    if (res === 'timed-out' && cur === HttpfsStatus.RequestReady) {
+      throw new Error(`Mailbox hung during op=${op}`);
+    }
+  }
+
+  const result = headerView.getBigInt64(HttpfsOffsets.RESULT, true);
+  Atomics.store(statusView, 0, HttpfsStatus.Idle);
+  Atomics.notify(statusView, 0, 1);
+  return { status: cur, result };
+}
+
+test('W173: dump writes are strictly disabled by default and reject /pg6_dump/* with zero outbound requests', async () => {
+  assert.equal(DUMP_VIRTUAL_PREFIX, '/pg6_dump/');
+  assert.equal(DEFAULT_DUMP_ENDPOINT, '/__pg6_dump/');
+
+  assert.deepEqual(resolveDumpConfig(), { allowDumpWrites: false, dumpEndpoint: null });
+  assert.deepEqual(resolveDumpConfig({ allowDumpWrites: false, dumpEndpoint: '/__pg6_dump/' }), {
+    allowDumpWrites: false,
+    dumpEndpoint: null,
+  });
+  assert.deepEqual(resolveDumpConfig({ allowDumpWrites: true }), {
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+  assert.deepEqual(resolveDumpConfig({ dumpEndpoint: '/__pg6_dump' }), {
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+
+  const disabledRoute = resolveDumpWriteRoute('/pg6_dump/pso_001.dxil');
+  assert.equal(disabledRoute.ok, false);
+  assert.equal(disabledRoute.errno, -30);
+  assert.equal(disabledRoute.code, 'DUMP_WRITES_DISABLED');
+
+  const mock = createMockDumpAndRangeFetch(new Map());
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    opfsDir: null,
+  });
+  const ready = await controller.init({ dataBase: '/data/', gameBase: '/game/' });
+  assert.equal(ready.allowDumpWrites, false);
+  assert.equal(ready.dumpEndpoint, null);
+
+  // Disabled by default: openWriteHandle returns -30 (EROFS) and writeDump throws errno -30
+  assert.equal(await controller.openWriteHandle('/pg6_dump/pso_001.dxil'), -30);
+  assert.equal(await controller.openHandle('/pg6_dump/pso_001.dxil', { mode: 'wb' }), -30);
+  await assert.rejects(
+    () => controller.writeDump('/pg6_dump/pso_001.dxil', new Uint8Array([1, 2, 3])),
+    (err) => err && err.errno === -30,
+  );
+
+  // Zero outbound POSTs ever occurred
+  assert.equal(mock.posts.length, 0);
+
+  const stats = controller.getStats();
+  assert.equal(stats.dumpWritesCompleted, 0);
+  assert.equal(stats.dumpBytesWritten, 0);
+  assert.equal(stats.dumpWriteErrors, 3);
+  assert.equal(stats.dumpWrites.enabled, false);
+});
+
+test('W173: strict /pg6_dump/* normalization blocks path traversal and enforces read-only on all game/boot/shader paths', async () => {
+  const dumpOpts = { allowDumpWrites: true, dumpEndpoint: '/__pg6_dump/' };
+
+  // Valid /pg6_dump/* virtual paths normalize cleanly
+  assert.equal(isDumpVirtualPath('/pg6_dump/pso_01.dxil'), true);
+  assert.equal(isDumpVirtualPath('pg6_dump/nested/sub/shader.bin'), true);
+  assert.deepEqual(resolveDumpWriteRoute('/pg6_dump/dxil/pso_001.dxil', dumpOpts), {
+    ok: true,
+    mount: 'dump',
+    base: '/__pg6_dump/',
+    relPath: 'dxil/pso_001.dxil',
+    encodedRelPath: 'dxil/pso_001.dxil',
+    url: '/__pg6_dump/dxil/pso_001.dxil',
+    appendUrl: '/__pg6_dump/dxil/pso_001.dxil?append=1',
+  });
+
+  // Path traversal, NUL bytes, malformed percent-escapes, and empty filenames are strictly rejected (-22)
+  for (const badPath of [
+    '',
+    '/pg6_dump',
+    '/pg6_dump/',
+    '/pg6_dump/.',
+    '/pg6_dump/../secret.bin',
+    '/pg6_dump/sub/../../secret.bin',
+    '/pg6_dump/sub\\..\\secret.bin',
+    '/pg6_dump/%2e%2e/secret.bin',
+    '/pg6_dump/a%2f..%2fb.bin',
+    '/pg6_dump/a%5c..%5cb.bin',
+    '/pg6_dump/file.dxil\0',
+    '/pg6_dump/file%00.dxil',
+    '/pg6_dump/bad%ZZ.dxil',
+    '/pg6_dump/bad?query=1',
+    '/pg6_dump/bad*glob.dxil',
+  ]) {
+    const res = resolveDumpWriteRoute(badPath, dumpOpts);
+    assert.equal(res.ok, false, `Expected rejection for ${JSON.stringify(badPath)}`);
+    assert.equal(res.errno, -22, `Expected EINVAL (-22) for ${JSON.stringify(badPath)}`);
+  }
+
+  // Every path outside /pg6_dump/* is strictly read-only (-30 EROFS)
+  for (const readOnlyPath of [
+    'G:\\audio.rpf',
+    '\\\\?\\G:\\x64\\movies\\intro.bk2',
+    '/game/audio.rpf',
+    'boot/main/image/guest.pgim',
+    'shaders/splash.wgsl.pack',
+    'data-manifest.json',
+    'rpf://appdata0.rpf/config.xml',
+    '/pg6_dump_other/escape.bin',
+    'C:\\pg6_dump\\escape.bin',
+    'http://127.0.0.1/pg6_dump/escape.bin',
+  ]) {
+    assert.equal(isDumpVirtualPath(readOnlyPath), false);
+    const res = resolveDumpWriteRoute(readOnlyPath, dumpOpts);
+    assert.equal(res.ok, false, `Expected read-only refusal for ${readOnlyPath}`);
+    assert.equal(res.errno, -30, `Expected EROFS (-30) for ${readOnlyPath}`);
+  }
+
+  // Controller-level read-only enforcement even when dump writes are enabled
+  const audioRpf = makePatternBytes(4096, 17);
+  const mock = createMockDumpAndRangeFetch(new Map([['/game/audio.rpf', audioRpf]]));
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    opfsDir: null,
+  });
+  await controller.init({
+    dataBase: '/data/',
+    bootBase: '/boot/',
+    gameBase: '/game/',
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+
+  // Opening a game file for read works normally, while write attempts on it or its handle fail cleanly
+  const readHandle = await controller.openHandle('G:\\audio.rpf');
+  assert.ok(readHandle >= 1);
+  assert.deepEqual(await controller.readHandle(readHandle, 0, 256), audioRpf.subarray(0, 256));
+
+  assert.equal(await controller.openWriteHandle('G:\\audio.rpf'), -30);
+  assert.equal(await controller.openWriteHandle('boot/main/image/guest.pgim'), -30);
+  assert.equal(await controller.openWriteHandle('/pg6_dump/../audio.rpf'), -22);
+
+  await assert.rejects(
+    () => controller.writeHandle(readHandle, new Uint8Array([0xde, 0xad])),
+    (err) => err && err.errno === -30,
+  );
+  await assert.rejects(
+    () => controller.flushHandle(readHandle),
+    (err) => err && err.errno === -30,
+  );
+  await assert.rejects(
+    () => controller.writeDump('G:\\audio.rpf', new Uint8Array([1, 2, 3])),
+    (err) => err && err.errno === -30,
+  );
+
+  // Zero POST requests went out, and game reads remain completely intact
+  assert.equal(mock.posts.length, 0);
+  assert.deepEqual(await controller.readHandle(readHandle, 256, 256), audioRpf.subarray(256, 512));
+  assert.equal(controller.closeHandle(readHandle), true);
+  assert.equal(controller.getStats().dumpWriteErrors, 6);
+});
+
+test('W173: opt-in /pg6_dump/* write, sequential ?append=1 chunking, buffered flush, and error telemetry', async () => {
+  const mock = createMockDumpAndRangeFetch(new Map(), {
+    postStatusOverrides: new Map([['/__pg6_dump/fail_413.dxil', 413]]),
+  });
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    dumpFlushChunkBytes: 512,
+    dumpMaxBufferBytes: 2048,
+    opfsDir: null,
+  });
+
+  const ready = await controller.init({
+    dataBase: '/data/',
+    gameBase: '/game/',
+    dumpEndpoint: '/__pg6_dump',
+  });
+  assert.equal(ready.allowDumpWrites, true);
+  assert.equal(ready.dumpEndpoint, '/__pg6_dump/');
+
+  // 1. Streaming handle: first write POSTs without ?append=1, subsequent writes POST with ?append=1
+  const h = await controller.openWriteHandle('/pg6_dump/pipelines/pso_001.dxil');
+  assert.ok(h >= 1);
+  assert.equal(controller.getHandleInfo(h).kind, 'dump_write');
+  assert.equal(controller.getHandleInfo(h).writable, true);
+
+  // Reading from a write-only dump handle must fail cleanly
+  await assert.rejects(() => controller.readHandle(h, 0, 16), (err) => err && err.errno === -9);
+
+  const c1 = makePatternBytes(300, 11);
+  const c2 = makePatternBytes(250, 22);
+  const c3 = makePatternBytes(150, 33);
+
+  // Issue concurrent sequential writes on the same handle; internal queue preserves exact order!
+  const [r1, r2, r3] = await Promise.all([
+    controller.writeHandle(h, c1),
+    controller.writeHandle(h, c2),
+    controller.writeHandle(h, c3),
+  ]);
+  assert.equal(r1.append, false);
+  assert.equal(r2.append, true);
+  assert.equal(r3.append, true);
+  assert.equal(await controller.closeDumpHandle(h), true);
+
+  const expectedCombined = new Uint8Array(700);
+  expectedCombined.set(c1, 0);
+  expectedCombined.set(c2, 300);
+  expectedCombined.set(c3, 550);
+  assert.deepEqual(mock.dumpedFiles.get('/__pg6_dump/pipelines/pso_001.dxil'), expectedCombined);
+  assert.equal(mock.posts[0].url, '/__pg6_dump/pipelines/pso_001.dxil');
+  assert.equal(mock.posts[1].url, '/__pg6_dump/pipelines/pso_001.dxil?append=1');
+  assert.equal(mock.posts[2].url, '/__pg6_dump/pipelines/pso_001.dxil?append=1');
+
+  // 2. Buffered handle auto-flushes when hitting dumpFlushChunkBytes (512B) and flushes tail on closeDumpHandle
+  const hBuf = await controller.openWriteHandle('/pg6_dump/buffered.bin', { buffered: true });
+  const b1 = makePatternBytes(200, 44);
+  const b2 = makePatternBytes(400, 55);
+  const b3 = makePatternBytes(100, 66);
+
+  const q1 = await controller.writeHandle(hBuf, b1);
+  assert.equal(q1.buffered, true);
+  assert.equal(q1.pendingBytes, 200);
+
+  // Second write pushes pending to 600B >= 512B -> auto-flushes in 512B + 88B chunks!
+  const q2 = await controller.writeHandle(hBuf, b2);
+  assert.equal(q2.autoFlushed, true);
+  assert.equal(controller.getHandleInfo(hBuf).pendingBytes, 0);
+
+  const q3 = await controller.writeHandle(hBuf, b3);
+  assert.equal(q3.buffered, true);
+  assert.equal(q3.pendingBytes, 100);
+  assert.equal(await controller.closeDumpHandle(hBuf), true);
+
+  const expectedBuf = new Uint8Array(700);
+  expectedBuf.set(b1, 0);
+  expectedBuf.set(b2, 200);
+  expectedBuf.set(b3, 600);
+  assert.deepEqual(mock.dumpedFiles.get('/__pg6_dump/buffered.bin'), expectedBuf);
+
+  // 3. One-shot writeDump larger than dumpFlushChunkBytes (1100B -> 512 + 512 + 76)
+  const bigDump = makePatternBytes(1100, 77);
+  const bigRes = await controller.writeDump('/pg6_dump/large_shader.dxil', bigDump);
+  assert.equal(bigRes.ok, true);
+  assert.equal(bigRes.chunks, 3);
+  assert.equal(bigRes.bytesWritten, 1100);
+  assert.deepEqual(mock.dumpedFiles.get('/__pg6_dump/large_shader.dxil'), bigDump);
+
+  // 4. Server 413 error maps cleanly to -27 (EFBIG) and increments dumpWriteErrors
+  await assert.rejects(
+    () => controller.writeDump('/pg6_dump/fail_413.dxil', new Uint8Array([1, 2, 3, 4])),
+    (err) => err && err.errno === -27 && err.status === 413,
+  );
+
+  const stats = controller.getStats();
+  assert.equal(stats.dumpWritesCompleted, 9); // 3 (streaming) + 3 (buffered: 512+88+100) + 3 (large: 512+512+76)
+  assert.equal(stats.dumpBytesWritten, 700 + 700 + 1100);
+  assert.equal(stats.dumpWriteErrors, 1);
+  assert.equal(stats.dumpWrites.enabled, true);
+  assert.equal(stats.dumpWrites.openDumpHandles, 0);
+  assert.equal(stats.dumpWrites.bufferedBytes, 0);
+
+  // Verify dump telemetry is sanitized (no filenames or URLs leaked)
+  const dumpStatsJson = JSON.stringify(stats.dumpWrites);
+  assert.equal(dumpStatsJson.includes('pso_001'), false);
+  assert.equal(dumpStatsJson.includes('__pg6_dump'), false);
+});
+
+test('W173: SAB HttpfsMailbox supports opt-in /pg6_dump/* writes while enforcing read-only on game handles', async () => {
+  const gameBytes = makePatternBytes(2048, 99);
+  const mock = createMockDumpAndRangeFetch(new Map([['/game/movies.rpf', gameBytes]]));
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    opfsDir: null,
+  });
+
+  const sab = createHttpfsMailboxBuffer(4096);
+  try {
+    await controller.init({
+      dataBase: '/data/',
+      gameBase: '/game/',
+      allowDumpWrites: true,
+      dumpEndpoint: '/__pg6_dump/',
+    });
+    await controller.attachMailbox(sab);
+
+    // 1. Open /pg6_dump/mailbox_pso.dxil with write flag over SAB mailbox
+    const openDump = await rawMailboxOp(
+      sab,
+      HttpfsOp.Open,
+      -1,
+      HTTPFS_OPEN_FLAG_WRITE,
+      utf8Encoder.encode('/pg6_dump/mailbox_pso.dxil'),
+    );
+    assert.equal(openDump.status, HttpfsStatus.ResponseReady);
+    const dumpHandle = Number(openDump.result);
+    assert.ok(dumpHandle >= 1);
+
+    // Write chunk 1 (create) and chunk 2 (append)
+    const p1 = makePatternBytes(128, 3);
+    const p2 = makePatternBytes(64, 5);
+    const w1 = await rawMailboxOp(sab, HTTPFS_OP_WRITE, dumpHandle, 0n, p1);
+    assert.equal(w1.status, HttpfsStatus.ResponseReady);
+    assert.equal(w1.result, 128n);
+
+    const w2 = await rawMailboxOp(sab, HTTPFS_OP_WRITE, dumpHandle, HTTPFS_OPEN_FLAG_APPEND, p2);
+    assert.equal(w2.status, HttpfsStatus.ResponseReady);
+    assert.equal(w2.result, 64n);
+
+    const closed = await rawMailboxOp(sab, HttpfsOp.Close, dumpHandle, 0n);
+    assert.equal(closed.status, HttpfsStatus.ResponseReady);
+    assert.equal(closed.result, 0n);
+
+    const expected = new Uint8Array(192);
+    expected.set(p1, 0);
+    expected.set(p2, 128);
+    assert.deepEqual(mock.dumpedFiles.get('/__pg6_dump/mailbox_pso.dxil'), expected);
+
+    // 2. Attempt to open game file with write flag over SAB mailbox -> refused with -30 (EROFS)
+    const openGameWrite = await rawMailboxOp(
+      sab,
+      HttpfsOp.Open,
+      -1,
+      HTTPFS_OPEN_FLAG_WRITE,
+      utf8Encoder.encode('G:\\movies.rpf'),
+    );
+    assert.equal(openGameWrite.status, HttpfsStatus.Error);
+    assert.equal(openGameWrite.result, -30n);
+
+    // 3. Open game file read-only, then attempt HTTPFS_OP_WRITE on that handle -> refused with -30 (EROFS)
+    const openGameRead = await rawMailboxOp(
+      sab,
+      HttpfsOp.Open,
+      -1,
+      0n,
+      utf8Encoder.encode('G:\\movies.rpf'),
+    );
+    assert.equal(openGameRead.status, HttpfsStatus.ResponseReady);
+    const gameHandle = Number(openGameRead.result);
+    const badWrite = await rawMailboxOp(sab, HTTPFS_OP_WRITE, gameHandle, 0n, p1);
+    assert.equal(badWrite.status, HttpfsStatus.Error);
+    assert.equal(badWrite.result, -30n);
+
+    assert.equal(controller.getStats().dumpWritesCompleted, 2);
+    assert.equal(controller.getStats().dumpBytesWritten, 192);
+    assert.equal(controller.getStats().dumpWriteErrors, 2);
+  } finally {
+    await controller.detachMailbox();
+  }
+});
+
+test('W173: tuned sequential slab prefetch & bounded concurrency for 4K Bink2 streaming alongside live dump POSTs', async () => {
+  assert.equal(isVideoStreamPath('x64/movies/intro_4k.bk2'), true);
+  assert.equal(isVideoStreamPath('movies/logo.BIK'), true);
+  assert.equal(isVideoStreamPath('audio.rpf'), false);
+  assert.equal(isImmutableHttpfsPath('x64/movies/intro_4k.bk2'), true);
+  assert.equal(isImmutableHttpfsPath('movies/logo.bik'), true);
+
+  // Verify 4K video preset and upper safety clamping
+  const video4k = createSlabCacheTuningProfile('video4k');
+  assert.deepEqual(video4k, VIDEO_STREAM_SLAB_PRESET);
+  const clamped = createSlabCacheTuningProfile({
+    slabSize: 512 * 1024 * 1024,
+    slabMaxBytes: 2 * 1024 * 1024 * 1024,
+    prefetchAheadSlabs: 100,
+    maxConcurrentSlabFetches: 100,
+  });
+  assert.equal(clamped.slabSize, MAX_SLAB_SIZE);
+  assert.equal(clamped.slabMaxBytes, MAX_SLAB_CACHE_BYTES);
+  assert.ok(clamped.prefetchAheadSlabs <= 7);
+  assert.equal(clamped.maxConcurrentSlabFetches, 16);
+
+  // Synthetic 4K Bink2 video file: 12 slabs of 1024 bytes = 12288 bytes
+  // Slab budget: 4 slabs max (4096 bytes), prefetchAheadSlabs: 2, maxConcurrentSlabFetches: 2
+  const slabSize = 1024;
+  const videoBytes = makePatternBytes(12 * slabSize, 137);
+  let activeRangeFetches = 0;
+  let peakRangeFetches = 0;
+
+  const mock = createMockDumpAndRangeFetch(
+    new Map([['/game/x64/movies/intro_4k.bk2', videoBytes]]),
+    { delayMs: 8 },
+  );
+
+  const instrumentedFetch = async (url, init) => {
+    const isRangeGet = (!init || !init.method || init.method === 'GET') && init && init.headers && init.headers.Range;
+    if (isRangeGet) {
+      activeRangeFetches += 1;
+      if (activeRangeFetches > peakRangeFetches) {
+        peakRangeFetches = activeRangeFetches;
+      }
+    }
+    try {
+      return await mock.fetchImpl(url, init);
+    } finally {
+      if (isRangeGet) {
+        activeRangeFetches -= 1;
+      }
+    }
+  };
+
+  const controller = new IoWorkerController({
+    fetchImpl: instrumentedFetch,
+    opfsDir: null,
+  });
+
+  await controller.init({
+    dataBase: '/data/',
+    gameBase: '/game/',
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+
+  // Tune slab cache live for bounded sequential 4K Bink2 video streaming
+  const tuned = controller.tuneSlabCache({
+    slabSize,
+    slabMaxBytes: 4 * slabSize, // Strictly 4 slabs in RAM (4096B cap)
+    prefetchAheadSlabs: 2,
+    maxConcurrentSlabFetches: 2,
+    sequentialThresholdReads: 2,
+  });
+  assert.equal(tuned.slabSize, slabSize);
+  assert.equal(tuned.slabMaxBytes, 4 * slabSize);
+  assert.equal(tuned.prefetchAheadSlabs, 2);
+  assert.equal(tuned.maxConcurrentSlabFetches, 2);
+
+  // Open Bink2 video via Xbox drive path (routes to /game/ automatically)
+  const hVid = await controller.openHandle('G:\\x64\\movies\\intro_4k.bk2', { probeOnOpen: false });
+  assert.ok(hVid >= 1);
+  assert.equal(controller.getHandleInfo(hVid).mount, 'game');
+
+  // Stream sequentially in 512B reads across the first 8 slabs while concurrently dumping DXIL shaders!
+  const assembled = new Uint8Array(8 * slabSize);
+  const dumpPromises = [];
+  for (let i = 0; i < 16; i += 1) {
+    const off = i * 512;
+    const chunk = await controller.readHandle(hVid, off, 512);
+    assert.equal(chunk.byteLength, 512);
+    assembled.set(chunk, off);
+    if (i % 4 === 0) {
+      dumpPromises.push(
+        controller.writeDump(`/pg6_dump/live_pso_${i}.dxil`, makePatternBytes(256, i + 1)),
+      );
+    }
+    // Wait for background prefetches after slab boundary reads to verify hit acceleration
+    if (i % 2 === 1) {
+      await controller.immutableCache.waitForPrefetches();
+    }
+    // Worker slab memory must NEVER exceed slabMaxBytes
+    assert.ok(
+      controller.getStats().immutableCache.slabBytesCached <= 4 * slabSize,
+      'slabBytesCached must never exceed slabMaxBytes',
+    );
+  }
+  await Promise.all(dumpPromises);
+  await controller.immutableCache.waitForPrefetches();
+
+  assert.deepEqual(assembled, videoBytes.subarray(0, 8 * slabSize));
+
+  // Verify bounded concurrency semaphore enforced maxConcurrentSlabFetches (<= 2)
+  assert.ok(
+    peakRangeFetches <= 2,
+    `Expected peak concurrent slab fetches <= 2, got ${peakRangeFetches}`,
+  );
+
+  // Verify telemetry: sequential prefetch warmed slabs so hits >> misses & dumps succeeded concurrently
+  const stats = controller.getStats();
+  assert.ok(stats.slabCacheHits >= 12, `Expected >= 12 slab hits, got ${stats.slabCacheHits}`);
+  assert.ok(
+    stats.slabCacheMisses <= 2,
+    `Expected <= 2 demand slab misses due to sequential prefetch, got ${stats.slabCacheMisses}`,
+  );
+  assert.ok(stats.immutableCache.slabPrefetchesScheduled >= 6);
+  assert.ok(stats.immutableCache.slabPrefetchesCompleted >= 6);
+  assert.ok(stats.immutableCache.slabEvictions >= 1, 'Expected bounded LRU slab evictions');
+  assert.ok(stats.immutableCache.peakConcurrentSlabFetches <= 2);
+  assert.equal(stats.dumpWritesCompleted, 4);
+  assert.equal(stats.dumpBytesWritten, 4 * 256);
+  assert.equal(stats.dumpWriteErrors, 0);
+
+  // Verify explicit prefetchVideoSlabs + shrinking slabMaxBytes via tuneSlabCache evicts cleanly
+  const preRes = await controller.prefetchVideoSlabs('G:\\x64\\movies\\intro_4k.bk2', 10 * slabSize, 2);
+  assert.equal(preRes.completed, 2);
+  const shrunk = controller.tuneSlabCache({ slabMaxBytes: 2 * slabSize });
+  assert.equal(shrunk.slabMaxBytes, 2 * slabSize);
+  assert.ok(controller.getStats().immutableCache.slabBytesCached <= 2 * slabSize);
+
+  assert.equal(controller.closeHandle(hVid), true);
+});
+
+test('W173: classic Web Worker self.onmessage forwards dump writes, slab tuning, and telemetry', async () => {
+  const binkBytes = makePatternBytes(4096, 51);
+  const mock = createMockDumpAndRangeFetch(new Map([['/game/intro.bk2', binkBytes]]));
+  const posted = [];
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      posted.push(msg);
+    },
+  };
+
+  class MockSyncXHR {
+    open(_method, url) {
+      this._url = url;
+    }
+    send() {
+      const resolved = path.resolve(repoRoot, 'web/workers', this._url);
+      this.status = 200;
+      this.responseText = fs.readFileSync(resolved, 'utf8');
+    }
+  }
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    fetch: mock.fetchImpl,
+    XMLHttpRequest: MockSyncXHR,
+    navigator: {},
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    AbortController,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Object,
+    Array,
+    setTimeout,
+    clearTimeout,
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web/workers', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const ioWorkerPath = path.join(repoRoot, 'web/workers/io_worker.js');
+  vm.runInContext(fs.readFileSync(ioWorkerPath, 'utf8'), context, { filename: ioWorkerPath });
+
+  await workerSelf.onmessage({
+    data: {
+      init: true,
+      dataBase: '/data/',
+      gameBase: '/game/',
+      allowDumpWrites: true,
+      dumpEndpoint: '/__pg6_dump/',
+    },
+  });
+  assert.equal(posted[0].ready, true);
+  assert.equal(posted[0].allowDumpWrites, true);
+  assert.equal(posted[0].dumpEndpoint, '/__pg6_dump/');
+
+  // Tune slab cache via worker message
+  await workerSelf.onmessage({
+    data: {
+      tuneSlabCache: true,
+      id: 10,
+      slabSize: 1024,
+      slabMaxBytes: 4096,
+      prefetchAheadSlabs: 2,
+      maxConcurrentSlabFetches: 2,
+    },
+  });
+  const tuneMsg = posted.find((m) => m.id === 10);
+  assert.equal(tuneMsg.ok, true);
+  assert.equal(tuneMsg.slabConfig.prefetchAheadSlabs, 2);
+
+  // Open, write two chunks, and close a dump file via worker messages
+  await workerSelf.onmessage({ data: { openDump: true, id: 11, path: '/pg6_dump/worker_pso.dxil' } });
+  const openMsg = posted.find((m) => m.id === 11);
+  assert.equal(openMsg.ok, true);
+
+  await workerSelf.onmessage({
+    data: { writeDump: true, id: 12, handle: openMsg.handle, data: new Uint8Array([1, 2, 3]) },
+  });
+  await workerSelf.onmessage({
+    data: { writeDump: true, id: 13, handle: openMsg.handle, data: new Uint8Array([4, 5]) },
+  });
+  await workerSelf.onmessage({ data: { closeDump: true, id: 14, handle: openMsg.handle } });
+
+  // Attempt write to read-only game path via worker message -> rejected cleanly
+  await workerSelf.onmessage({ data: { openDump: true, id: 15, path: 'G:\\intro.bk2' } });
+  const deniedMsg = posted.find((m) => m.id === 15);
+  assert.equal(deniedMsg.ok, false);
+  assert.equal(deniedMsg.errno, -30);
+
+  await workerSelf.onmessage({ data: { stats: true, id: 16 } });
+  const statsMsg = posted.find((m) => m.id === 16);
+  assert.equal(statsMsg.stats.dumpWritesCompleted, 2);
+  assert.equal(statsMsg.stats.dumpBytesWritten, 5);
+  assert.equal(statsMsg.stats.dumpWriteErrors, 1);
+  assert.deepEqual(
+    mock.dumpedFiles.get('/__pg6_dump/worker_pso.dxil'),
+    new Uint8Array([1, 2, 3, 4, 5]),
+  );
 });
