@@ -541,6 +541,12 @@ _BOOT_OPTION_BOOL_KEYS: frozenset[str] = frozenset(
     {
         "verify_window_marks",
         "report_to_log",
+        "present_pacing",
+        "fence_publish_lag",
+        "defer_gpu_objects",
+        "xmem_shared_pages",
+        "present_frame_waits",
+        "audio_endpoint",
     }
 )
 _BOOT_OPTION_UINT_KEYS: frozenset[str] = frozenset(
