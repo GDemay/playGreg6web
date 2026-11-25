@@ -12,7 +12,7 @@ sidecar only when its reflection carries the join keys the runtime needs:
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
 
-    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--json]
+    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--report-missing-sources <report.json>] [--json]
 
 The sidecar is derived from the title's shaders: write it under work/, never into the repository.
 """
@@ -21,12 +21,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
 SCHEMA = "playgta6-stage-reflection"
 VERSION = 1
+REPORT_SCHEMA = "playgta6-stage-reflection-missing-sources"
+REPORT_VERSION = 1
+DEFAULT_MAX_SAMPLE_HASHES = 5
+STAGES = ("vertex", "fragment", "compute")
+
+_SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9_.$<>\[\]-]{1,64}$")
+_SAFE_HASH_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 KIND_MAP = {
     "uniform": "uniform",
@@ -97,8 +105,63 @@ def entries_of(doc: Any) -> list[dict[str, Any]]:
     return []
 
 
-def build(docs: list[Any]) -> tuple[dict[str, Any], dict[str, int]]:
-    stages: dict[str, Any] = {}
+def _sanitize_label(value: Any, *, fallback: str = "") -> str:
+    if not isinstance(value, str):
+        return fallback
+    text = value.strip()
+    if not text:
+        return fallback
+    if _SAFE_LABEL_RE.match(text):
+        return text
+    return "<redacted>"
+
+
+def _sanitize_hash(value: Any) -> str:
+    if value is None:
+        return "<redacted>"
+    text = str(value).strip()
+    if text and _SAFE_HASH_RE.match(text):
+        return text
+    return "<redacted>"
+
+
+def load_existing_sidecar(path: Path) -> dict[str, Any]:
+    """Load and validate an existing v1 sidecar JSON; returns {} if the file does not exist."""
+    if not path.exists():
+        return {}
+    if path.is_dir():
+        raise ValueError("existing sidecar path is a directory")
+    try:
+        with path.open(encoding="utf-8-sig") as f:
+            doc = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in existing sidecar: {exc.msg}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError("existing sidecar must be a JSON object")
+    if doc.get("schema") != SCHEMA:
+        raise ValueError(f"existing sidecar schema must be {SCHEMA!r}, got {doc.get('schema')!r}")
+    version = doc.get("version")
+    if type(version) is not int or version != VERSION:
+        raise ValueError(f"existing sidecar version must be {VERSION}, got {version!r}")
+    stages = doc.get("stages")
+    if not isinstance(stages, dict):
+        raise ValueError("existing sidecar 'stages' must be an object")
+    validated: dict[str, Any] = {}
+    for k, v in stages.items():
+        if not isinstance(k, str) or not k:
+            raise ValueError("existing sidecar stage keys must be non-empty strings")
+        if not isinstance(v, dict):
+            raise ValueError(f"existing sidecar stage {k!r} must be an object")
+        if v.get("stage") not in STAGES:
+            raise ValueError(f"existing sidecar stage {k!r} has invalid stage {v.get('stage')!r}")
+        if not isinstance(v.get("bindings"), list):
+            raise ValueError(f"existing sidecar stage {k!r} must have a 'bindings' list")
+        validated[k] = v
+    return validated
+
+
+def build(docs: list[Any], existing_stages: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, int]]:
+    stages: dict[str, Any] = dict(existing_stages) if existing_stages else {}
     skipped: dict[str, int] = {}
     for doc in docs:
         for entry in entries_of(doc):
@@ -110,21 +173,121 @@ def build(docs: list[Any]) -> tuple[dict[str, Any], dict[str, int]]:
     return {"schema": SCHEMA, "version": VERSION, "stages": stages}, skipped
 
 
+def build_missing_sources_report(
+    docs: list[Any],
+    *,
+    max_samples: int = DEFAULT_MAX_SAMPLE_HASHES,
+) -> dict[str, Any]:
+    """Build a sanitized summary of stages skipped for 'binding without source'."""
+    total_skipped = 0
+    by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    counts_by_pattern: dict[tuple[str, str, str], int] = {}
+    samples_by_pattern: dict[tuple[str, str, str], list[str]] = {}
+    seen_hashes_by_pattern: dict[tuple[str, str, str], set[str]] = {}
+
+    for doc in docs:
+        for entry in entries_of(doc):
+            key, stage_obj, why = convert(entry)
+            if stage_obj is not None or why != "binding without source":
+                continue
+            stage = stage_name(str(entry.get("stage", "")))
+            if stage is None:
+                continue
+            total_skipped += 1
+            by_stage[stage] += 1
+            safe_hash = _sanitize_hash(key)
+            for b in entry.get("bindings", []):
+                if not isinstance(b, dict) or isinstance(b.get("source"), dict):
+                    continue
+                raw_kind = b.get("kind")
+                mapped_kind = KIND_MAP.get(raw_kind) if isinstance(raw_kind, str) else None
+                kind = mapped_kind if mapped_kind is not None else _sanitize_label(raw_kind, fallback="unknown")
+                name = _sanitize_label(b.get("name"), fallback="")
+                pat = (stage, kind, name)
+                counts_by_pattern[pat] = counts_by_pattern.get(pat, 0) + 1
+                seen = seen_hashes_by_pattern.setdefault(pat, set())
+                samples = samples_by_pattern.setdefault(pat, [])
+                if safe_hash not in seen and len(samples) < max_samples:
+                    seen.add(safe_hash)
+                    samples.append(safe_hash)
+
+    top_missing_bindings = [
+        {
+            "stage": stage,
+            "kind": kind,
+            "name": name,
+            "count": count,
+            "sample_hashes": samples_by_pattern[(stage, kind, name)],
+        }
+        for (stage, kind, name), count in sorted(
+            counts_by_pattern.items(),
+            key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]),
+        )
+    ]
+
+    return {
+        "schema": REPORT_SCHEMA,
+        "version": REPORT_VERSION,
+        "total_skipped_missing_source": total_skipped,
+        "by_stage": by_stage,
+        "top_missing_bindings": top_missing_bindings,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--merge-existing",
+        type=Path,
+        default=None,
+        help="load an existing v1 sidecar JSON (if present) and merge newly converted stages on top",
+    )
+    parser.add_argument(
+        "--report-missing-sources",
+        type=Path,
+        default=None,
+        help="write a sanitized JSON report summarizing skipped 'binding without source' stages",
+    )
     parser.add_argument("--json", action="store_true", help="print the counts as JSON")
     args = parser.parse_args(argv)
+
+    existing_stages: dict[str, Any] = {}
+    if args.merge_existing is not None:
+        try:
+            existing_stages = load_existing_sidecar(args.merge_existing)
+        except (OSError, ValueError) as exc:
+            print(f"error: failed to load --merge-existing: {exc}", file=sys.stderr)
+            return 1
+
     docs = []
     for path in args.inputs:
         with path.open(encoding="utf-8-sig") as f:
             docs.append(json.load(f))
-    sidecar, skipped = build(docs)
+
+    sidecar, skipped = build(docs, existing_stages=existing_stages if args.merge_existing is not None else None)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
-    counts = {"stages_written": len(sidecar["stages"]), "skipped": skipped}
-    print(json.dumps(counts) if args.json else
-          f"{counts['stages_written']} stage(s) written; skipped: {skipped or 'none'}")
+
+    if args.report_missing_sources is not None:
+        report = build_missing_sources_report(docs)
+        args.report_missing_sources.parent.mkdir(parents=True, exist_ok=True)
+        args.report_missing_sources.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+
+    counts: dict[str, Any] = {"stages_written": len(sidecar["stages"]), "skipped": skipped}
+    if args.merge_existing is not None:
+        counts["merged_existing"] = len(existing_stages)
+
+    if args.json:
+        print(json.dumps(counts))
+    elif args.merge_existing is not None:
+        print(
+            f"{counts['stages_written']} stage(s) written "
+            f"(merged {counts['merged_existing']} existing); skipped: {skipped or 'none'}"
+        )
+    else:
+        print(f"{counts['stages_written']} stage(s) written; skipped: {skipped or 'none'}")
     return 0
 
 
