@@ -17,6 +17,12 @@ export const WGPK_HEADER_BYTES = 16;
 /** Fixed entry table record size in bytes: hash(8) + stage(1) + reserved(3) + offset(4) + length(4). */
 export const WGPK_ENTRY_BYTES = 20;
 
+/** Default initial byte window for HTTP 206 Range index loading (64 KiB: header + ~3,276 entries in 1 roundtrip). */
+export const DEFAULT_INITIAL_RANGE_BYTES = 64 * 1024;
+
+/** Default bounded in-memory LRU cache budget for on-demand WGSL strings in ranged mode (32 MiB). */
+export const DEFAULT_MAX_CACHED_WGSL_BYTES = 32 * 1024 * 1024;
+
 /** Shader index ABI version matching shaders/src/pack.rs and docs/gpu_commands.md. */
 export const SHADER_INDEX_ABI_VERSION = 1;
 
@@ -93,6 +99,290 @@ function decodeUtf8Strict(slice, entryIndex) {
       `WGPK entry ${entryIndex} payload is not valid UTF-8: ${err instanceof Error ? err.message : String(err)}`
     );
   }
+}
+
+function getResponseHeader(response, headerName) {
+  if (!response || !response.headers) {
+    return null;
+  }
+  const headers = response.headers;
+  if (typeof headers.get === 'function') {
+    const val = headers.get(headerName);
+    return val === undefined ? null : val;
+  }
+  const target = headerName.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === target) {
+      return v === undefined || v === null ? null : String(v);
+    }
+  }
+  return null;
+}
+
+function parseNonNegativeInt(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  const trimmed = String(raw).trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    return null;
+  }
+  return value;
+}
+
+function parseContentRange(headerValue) {
+  if (typeof headerValue !== 'string') {
+    return null;
+  }
+  const match = /^\s*bytes\s+(\d+)-(\d+)\/(\d+|\*)\s*$/i.exec(headerValue);
+  if (!match) {
+    return null;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === '*' ? null : Number(match[3]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    end < start ||
+    (total !== null && (!Number.isSafeInteger(total) || total <= end))
+  ) {
+    return null;
+  }
+  return { start, end, total };
+}
+
+function mergeRequestInit(baseInit, overrides = {}) {
+  const init = baseInit && typeof baseInit === 'object' ? { ...baseInit } : {};
+  const mergedHeaders = {};
+
+  if (init.headers) {
+    if (typeof init.headers.forEach === 'function') {
+      init.headers.forEach((value, key) => {
+        mergedHeaders[key] = value;
+      });
+    } else if (Array.isArray(init.headers)) {
+      for (const pair of init.headers) {
+        if (Array.isArray(pair) && pair.length >= 2) {
+          mergedHeaders[String(pair[0])] = String(pair[1]);
+        }
+      }
+    } else if (typeof init.headers === 'object') {
+      for (const [key, value] of Object.entries(init.headers)) {
+        mergedHeaders[key] = value;
+      }
+    }
+  }
+
+  if (overrides.headers) {
+    for (const [key, value] of Object.entries(overrides.headers)) {
+      // Remove any existing header with the same case-insensitive name before setting.
+      const lower = key.toLowerCase();
+      for (const existingKey of Object.keys(mergedHeaders)) {
+        if (existingKey.toLowerCase() === lower) {
+          delete mergedHeaders[existingKey];
+        }
+      }
+      mergedHeaders[key] = value;
+    }
+  }
+
+  if (overrides.method !== undefined) {
+    init.method = overrides.method;
+  }
+  if (Object.keys(mergedHeaders).length > 0) {
+    init.headers = mergedHeaders;
+  }
+  return init;
+}
+
+function resolveFetchAndOptions(fetchImplOrOptions, maybeOptions, fallbackFetch) {
+  let options;
+  let fetcher;
+  if (typeof fetchImplOrOptions === 'function') {
+    fetcher = fetchImplOrOptions;
+    options = maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : {};
+  } else {
+    options = fetchImplOrOptions && typeof fetchImplOrOptions === 'object' ? fetchImplOrOptions : {};
+    fetcher = options.fetch ?? fallbackFetch ?? globalThis.fetch;
+  }
+  return { fetcher, options };
+}
+
+function validateMaxCachedWgslBytes(value, defaultValue = DEFAULT_MAX_CACHED_WGSL_BYTES) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`maxCachedWgslBytes must be a non-negative integer, got: ${value}`);
+  }
+  return value;
+}
+
+function validateInitialRangeBytes(value, defaultValue = DEFAULT_INITIAL_RANGE_BYTES) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < WGPK_HEADER_BYTES) {
+    throw new RangeError(
+      `initialRangeBytes must be an integer >= ${WGPK_HEADER_BYTES}, got: ${value}`
+    );
+  }
+  return value;
+}
+
+function validateStreamThresholdBytes(value, defaultValue = 0) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`streamThresholdBytes must be a non-negative integer, got: ${value}`);
+  }
+  return value;
+}
+
+function parseWgpkHeader(bytes) {
+  if (bytes.byteLength < WGPK_HEADER_BYTES) {
+    throw new Error(
+      `WGPK pack truncated: ${bytes.byteLength} bytes (minimum required for header: ${WGPK_HEADER_BYTES})`
+    );
+  }
+
+  if (
+    bytes[0] !== WGPK_MAGIC_BYTES[0] ||
+    bytes[1] !== WGPK_MAGIC_BYTES[1] ||
+    bytes[2] !== WGPK_MAGIC_BYTES[2] ||
+    bytes[3] !== WGPK_MAGIC_BYTES[3]
+  ) {
+    const actualHex = Array.from(bytes.subarray(0, 4))
+      .map((b) => `0x${b.toString(16).padStart(2, '0')}`)
+      .join(' ');
+    throw new Error(`Invalid WGPK pack magic [${actualHex}] (expected "${WGPK_MAGIC}")`);
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const version = view.getUint32(4, true);
+  if (version !== WGPK_VERSION) {
+    throw new Error(`Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION})`);
+  }
+
+  const entryCount = view.getUint32(8, true);
+  const flags = view.getUint32(12, true);
+  const tableBytes = entryCount * WGPK_ENTRY_BYTES;
+  const dataStart = WGPK_HEADER_BYTES + tableBytes;
+
+  return { version, entryCount, flags, tableBytes, dataStart };
+}
+
+function parseWgpkEntryTable(bytes, header, totalFileBytes) {
+  const { entryCount, dataStart } = header;
+  if (bytes.byteLength < dataStart) {
+    throw new Error(
+      `WGPK pack truncated: ${bytes.byteLength} bytes (header + ${entryCount} entry table records require at least ${dataStart} bytes)`
+    );
+  }
+  if (totalFileBytes !== null && totalFileBytes !== undefined && totalFileBytes < dataStart) {
+    throw new Error(
+      `WGPK pack truncated: ${totalFileBytes} total bytes (header + ${entryCount} entry table records require at least ${dataStart} bytes)`
+    );
+  }
+
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const rawEntries = new Array(entryCount);
+  const ranges = [];
+  const stageCounts = { vertex: 0, fragment: 0, compute: 0 };
+  let totalPayloadBytes = 0;
+  let maxEnd = dataStart;
+
+  const upperBound =
+    totalFileBytes !== null && totalFileBytes !== undefined ? totalFileBytes : U32_MAX;
+
+  for (let idx = 0; idx < entryCount; idx += 1) {
+    const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
+    const hash = view.getBigUint64(base, true);
+    const stageCode = bytes[base + 8];
+    const stage = STAGE_NAMES[stageCode];
+    if (stage === undefined) {
+      throw new Error(`Invalid WGPK shader stage value ${stageCode} at entry ${idx}`);
+    }
+    // bytes[base + 9 .. base + 12] are reserved for forward compatibility.
+    const offset = view.getUint32(base + 12, true);
+    const length = view.getUint32(base + 16, true);
+    const end = offset + length;
+
+    if (offset < dataStart || end > upperBound) {
+      throw new Error(
+        `WGPK entry ${idx} payload [${offset}..+${length}] is out of bounds (valid payload range: [${dataStart}..${upperBound}])`
+      );
+    }
+
+    if (length > 0) {
+      ranges.push({ start: offset, end, index: idx });
+    }
+
+    if (end > maxEnd) {
+      maxEnd = end;
+    }
+
+    totalPayloadBytes += length;
+    stageCounts[stage] += 1;
+
+    rawEntries[idx] = {
+      index: idx,
+      hash,
+      hashHex: formatHashHex(hash),
+      stage,
+      stageCode,
+      offset,
+      length,
+      end,
+    };
+  }
+
+  // Reject overlapping non-empty payload ranges across entries.
+  if (ranges.length > 1) {
+    ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+    for (let i = 1; i < ranges.length; i += 1) {
+      const prev = ranges[i - 1];
+      const curr = ranges[i];
+      if (curr.start < prev.end) {
+        throw new Error(
+          `WGPK overlapping payload ranges detected between entry ${prev.index} [${prev.start}..${prev.end}) and entry ${curr.index} [${curr.start}..${curr.end})`
+        );
+      }
+    }
+  }
+
+  return { rawEntries, stageCounts, totalPayloadBytes, maxEnd };
+}
+
+async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
+  const rangeHeader = `bytes=${start}-${end}`;
+  const response = await fetcher(url, mergeRequestInit(fetchInit, { headers: { Range: rangeHeader } }));
+  if (!response || (!response.ok && response.status !== 206)) {
+    const status = response ? response.status : 'unknown';
+    const statusText = response && response.statusText ? ` ${response.statusText}` : '';
+    throw new Error(
+      `Failed to fetch WGSL pack range (${rangeHeader}) from "${url}": HTTP ${status}${statusText}`
+    );
+  }
+
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const contentRange = parseContentRange(getResponseHeader(response, 'content-range'));
+  const contentLength = parseNonNegativeInt(getResponseHeader(response, 'content-length'));
+
+  return {
+    status: response.status,
+    bytes,
+    contentRange,
+    contentLength,
+  };
 }
 
 /**
@@ -369,6 +659,14 @@ export class WgslPack {
     byHex,
     stageCounts,
     getDecodedCount,
+    mode = 'buffer',
+    url = null,
+    fetchImpl = null,
+    fetchInit = undefined,
+    maxCachedWgslBytes = DEFAULT_MAX_CACHED_WGSL_BYTES,
+    initialRangeFetches = 0,
+    wgslCache = null,
+    rangedDecodeCounter = null,
   }) {
     this.version = version;
     this.flags = flags;
@@ -376,6 +674,8 @@ export class WgslPack {
     this.dataStart = dataStart;
     this.payloadBytes = payloadBytes;
     this.lazyDecode = lazyDecode;
+    this.mode = mode;
+    this.url = url;
     this.entries = byHash;
     this._byHex = byHex;
     this._entryList = entryList;
@@ -383,6 +683,58 @@ export class WgslPack {
     this._getDecodedCount = getDecodedCount;
     this._dynamicEntries = new Map();
     this._dynamicHits = 0;
+
+    // Ranged streaming state (bounded LRU cache + concurrent in-flight deduplication).
+    this._fetch = fetchImpl;
+    this._fetchInit = fetchInit;
+    this._maxCachedWgslBytes =
+      mode === 'ranged' ? validateMaxCachedWgslBytes(maxCachedWgslBytes) : null;
+    this._wgslCache = wgslCache || new Map();
+    this._cachedWgslBytes = 0;
+    this._inFlight = new Map();
+    this._rangeFetches = initialRangeFetches;
+    this._cacheHits = 0;
+    this._cacheMisses = 0;
+    this._wgslCacheEvictions = 0;
+    this._inFlightDeduplications = 0;
+    this._rangedDecodeCounter = rangedDecodeCounter;
+  }
+
+  /**
+   * Parse a full in-memory `.wgsl.pack` buffer (alias for `parseWgslPack`).
+   *
+   * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
+   * @param {{ lazyDecode?: boolean }} [options]
+   * @returns {WgslPack}
+   */
+  static loadFromBuffer(buffer, options = {}) {
+    return parseWgslPack(buffer, options);
+  }
+
+  /**
+   * Load only the WGPK header + entry table via HTTP `206 Range` requests.
+   * Seamlessly falls back to full in-memory buffer mode if the server responds `200 OK`.
+   *
+   * @param {string} url
+   * @param {typeof fetch | object} [fetchImplOrOptions]
+   * @param {object} [maybeOptions]
+   * @returns {Promise<WgslPack>}
+   */
+  static loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
+    return loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions);
+  }
+
+  /**
+   * Load a `.wgsl.pack` from a URL. When `options.streamThresholdBytes > 0`, automatically
+   * switches to HTTP Range index-only mode when the remote pack exceeds the threshold.
+   *
+   * @param {string} url
+   * @param {typeof fetch | object} [fetchImplOrOptions]
+   * @param {object} [maybeOptions]
+   * @returns {Promise<WgslPack>}
+   */
+  static loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
+    return loadFromUrl(url, fetchImplOrOptions, maybeOptions);
   }
 
   /** Number of distinct resolvable shader entries (static + non-overriding dynamic). */
@@ -560,6 +912,160 @@ export class WgslPack {
   }
 
   /**
+   * Alias for `getSource(hash)`.
+   *
+   * @param {bigint | string | number} hash
+   * @returns {string | undefined}
+   */
+  getWgsl(hash) {
+    return this.getSource(hash);
+  }
+
+  _putWgslCache(key, wgsl, byteLength) {
+    const existing = this._wgslCache.get(key);
+    if (existing !== undefined) {
+      this._wgslCache.delete(key);
+      this._cachedWgslBytes -= existing.byteLength;
+    }
+
+    const budget = this._maxCachedWgslBytes;
+    if (budget === null || budget === 0 || byteLength > budget) {
+      return;
+    }
+
+    while (this._wgslCache.size > 0 && this._cachedWgslBytes + byteLength > budget) {
+      const oldestKey = this._wgslCache.keys().next().value;
+      const oldest = this._wgslCache.get(oldestKey);
+      this._wgslCache.delete(oldestKey);
+      this._cachedWgslBytes -= oldest.byteLength;
+      this._wgslCacheEvictions += 1;
+    }
+
+    this._wgslCache.set(key, { wgsl, byteLength });
+    this._cachedWgslBytes += byteLength;
+  }
+
+  /**
+   * Clear all decoded WGSL strings cached in the ranged-mode LRU cache.
+   * Does not unload the entry table or dynamic shaders.
+   *
+   * @returns {number} Number of cached WGSL entries cleared
+   */
+  clearWgslCache() {
+    const count = this._wgslCache.size;
+    this._wgslCache.clear();
+    this._cachedWgslBytes = 0;
+    return count;
+  }
+
+  /**
+   * Asynchronously resolve the WGSL source string for a shader hash.
+   * Works in both full-buffer mode (returns immediately) and ranged index mode
+   * (checks bounded LRU cache, deduplicates concurrent in-flight requests, and fetches
+   * only the exact `[offset, offset + length - 1]` byte slice via HTTP `206 Range`).
+   *
+   * @param {bigint | string | number} hash
+   * @returns {Promise<string | null>}
+   */
+  async getWgslAsync(hash) {
+    const key = normalizeHash(hash);
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      this._dynamicHits += 1;
+      return dynamicEntry.wgsl;
+    }
+
+    const staticEntry = this.entries.get(key);
+    if (!staticEntry) {
+      return null;
+    }
+
+    if (this.mode !== 'ranged') {
+      this._cacheHits += 1;
+      return staticEntry.wgsl;
+    }
+
+    // Check bounded in-memory LRU cache first.
+    const cached = this._wgslCache.get(key);
+    if (cached !== undefined) {
+      // Refresh recency (move to MRU end).
+      this._wgslCache.delete(key);
+      this._wgslCache.set(key, cached);
+      this._cacheHits += 1;
+      return cached.wgsl;
+    }
+
+    // Zero-length payload needs no HTTP Range request.
+    if (staticEntry.length === 0) {
+      this._cacheMisses += 1;
+      this._putWgslCache(key, '', 0);
+      return '';
+    }
+
+    // Deduplicate concurrent in-flight fetches for the same shader hash.
+    const existingPromise = this._inFlight.get(key);
+    if (existingPromise !== undefined) {
+      this._inFlightDeduplications += 1;
+      return existingPromise;
+    }
+
+    this._cacheMisses += 1;
+    const fetcher = this._fetch ?? globalThis.fetch;
+    if (typeof fetcher !== 'function') {
+      throw new Error('No fetch implementation available for ranged getWgslAsync');
+    }
+
+    const start = staticEntry.offset;
+    const end = staticEntry.offset + staticEntry.length - 1;
+
+    const fetchPromise = (async () => {
+      this._rangeFetches += 1;
+      const chunk = await fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
+
+      let payloadBytes;
+      if (chunk.status === 206) {
+        if (chunk.contentRange && chunk.contentRange.start !== start) {
+          throw new Error(
+            `WGPK ranged fetch mismatch for ${staticEntry.hashHex}: expected start byte ${start}, got ${chunk.contentRange.start}`
+          );
+        }
+        if (chunk.bytes.byteLength < staticEntry.length) {
+          throw new Error(
+            `WGPK ranged payload truncated for ${staticEntry.hashHex}: expected ${staticEntry.length} bytes, received ${chunk.bytes.byteLength}`
+          );
+        }
+        payloadBytes = chunk.bytes.subarray(0, staticEntry.length);
+      } else {
+        // Server returned 200 OK (entire pack) instead of 206 Partial Content.
+        const sliceEnd = staticEntry.offset + staticEntry.length;
+        if (chunk.bytes.byteLength < sliceEnd) {
+          throw new Error(
+            `WGPK full response truncated for ${staticEntry.hashHex}: need byte range [${start}..${sliceEnd}), received ${chunk.bytes.byteLength} bytes`
+          );
+        }
+        payloadBytes = chunk.bytes.subarray(start, sliceEnd);
+      }
+
+      const entryIdx =
+        staticEntry._index !== undefined ? staticEntry._index : staticEntry.hashHex;
+      const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+      if (this._rangedDecodeCounter) {
+        this._rangedDecodeCounter.count += 1;
+      }
+      this._putWgslCache(key, wgsl, staticEntry.length);
+      return wgsl;
+    })();
+
+    this._inFlight.set(key, fetchPromise);
+    try {
+      return await fetchPromise;
+    } finally {
+      this._inFlight.delete(key);
+    }
+  }
+
+  /**
    * Check whether a shader hash exists in dynamic overrides or this static pack
    * without triggering lazy UTF-8 decode.
    *
@@ -651,6 +1157,7 @@ export class WgslPack {
     return {
       version: this.version,
       flags: this.flags,
+      mode: this.mode,
       entryCount,
       byteLength: this.byteLength,
       headerBytes: WGPK_HEADER_BYTES,
@@ -664,6 +1171,14 @@ export class WgslPack {
       dynamicPayloadBytes,
       dynamicHits: this._dynamicHits,
       dynamicStageCounts,
+      rangeFetches: this._rangeFetches,
+      cacheHits: this._cacheHits,
+      cacheMisses: this._cacheMisses,
+      cachedWgslBytes: this._cachedWgslBytes,
+      cachedWgslEntries: this._wgslCache.size,
+      maxCachedWgslBytes: this._maxCachedWgslBytes,
+      wgslCacheEvictions: this._wgslCacheEvictions,
+      inFlightDeduplications: this._inFlightDeduplications,
     };
   }
 
@@ -686,89 +1201,32 @@ export function parseWgslPack(buffer, options = {}) {
   const bytes = toBinaryView(buffer);
   const lazyDecode = Boolean(options && options.lazyDecode);
 
-  if (bytes.byteLength < WGPK_HEADER_BYTES) {
-    throw new Error(
-      `WGPK pack truncated: ${bytes.byteLength} bytes (minimum required for header: ${WGPK_HEADER_BYTES})`
-    );
-  }
+  const header = parseWgpkHeader(bytes);
+  const { rawEntries, stageCounts, totalPayloadBytes } = parseWgpkEntryTable(
+    bytes,
+    header,
+    bytes.byteLength
+  );
 
-  // Validate 4-byte magic ("WGPK")
-  if (
-    bytes[0] !== WGPK_MAGIC_BYTES[0] ||
-    bytes[1] !== WGPK_MAGIC_BYTES[1] ||
-    bytes[2] !== WGPK_MAGIC_BYTES[2] ||
-    bytes[3] !== WGPK_MAGIC_BYTES[3]
-  ) {
-    const actualHex = Array.from(bytes.subarray(0, 4))
-      .map((b) => `0x${b.toString(16).padStart(2, '0')}`)
-      .join(' ');
-    throw new Error(`Invalid WGPK pack magic [${actualHex}] (expected "${WGPK_MAGIC}")`);
-  }
-
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const version = view.getUint32(4, true);
-  if (version !== WGPK_VERSION) {
-    throw new Error(`Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION})`);
-  }
-
-  const entryCount = view.getUint32(8, true);
-  const flags = view.getUint32(12, true);
-
-  const tableBytes = entryCount * WGPK_ENTRY_BYTES;
-  const dataStart = WGPK_HEADER_BYTES + tableBytes;
-  if (bytes.byteLength < dataStart) {
-    throw new Error(
-      `WGPK pack truncated: ${bytes.byteLength} bytes (header + ${entryCount} entry table records require at least ${dataStart} bytes)`
-    );
-  }
-
-  const entryList = new Array(entryCount);
+  const entryList = new Array(header.entryCount);
   const byHash = new Map();
   const byHex = new Map();
-  const ranges = [];
-  const stageCounts = { vertex: 0, fragment: 0, compute: 0 };
-  let totalPayloadBytes = 0;
   let decodedCount = 0;
 
-  for (let idx = 0; idx < entryCount; idx += 1) {
-    const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
-    const hash = view.getBigUint64(base, true);
-    const stageCode = bytes[base + 8];
-    const stage = STAGE_NAMES[stageCode];
-    if (stage === undefined) {
-      throw new Error(`Invalid WGPK shader stage value ${stageCode} at entry ${idx}`);
-    }
-    // bytes[base + 9 .. base + 12] are reserved for forward compatibility.
-    const offset = view.getUint32(base + 12, true);
-    const length = view.getUint32(base + 16, true);
-    const end = offset + length;
-
-    if (offset < dataStart || end > bytes.byteLength) {
-      throw new Error(
-        `WGPK entry ${idx} payload [${offset}..+${length}] is out of bounds (valid payload range: [${dataStart}..${bytes.byteLength}])`
-      );
-    }
-
-    if (length > 0) {
-      ranges.push({ start: offset, end, index: idx });
-    }
-
-    totalPayloadBytes += length;
-    stageCounts[stage] += 1;
-
-    const hashHex = formatHashHex(hash);
-    const slice = bytes.subarray(offset, end);
+  for (let idx = 0; idx < rawEntries.length; idx += 1) {
+    const raw = rawEntries[idx];
+    const slice = bytes.subarray(raw.offset, raw.end);
 
     let entry;
     if (lazyDecode) {
       let cachedWgsl = null;
       entry = {
-        hash,
-        hashHex,
-        stage,
-        stageCode,
-        offset,
-        length,
+        hash: raw.hash,
+        hashHex: raw.hashHex,
+        stage: raw.stage,
+        stageCode: raw.stageCode,
+        offset: raw.offset,
+        length: raw.length,
       };
       Object.defineProperty(entry, 'wgsl', {
         enumerable: true,
@@ -785,40 +1243,26 @@ export function parseWgslPack(buffer, options = {}) {
       const wgsl = decodeUtf8Strict(slice, idx);
       decodedCount += 1;
       entry = {
-        hash,
-        hashHex,
-        stage,
-        stageCode,
-        offset,
-        length,
+        hash: raw.hash,
+        hashHex: raw.hashHex,
+        stage: raw.stage,
+        stageCode: raw.stageCode,
+        offset: raw.offset,
+        length: raw.length,
         wgsl,
       };
     }
 
     entryList[idx] = entry;
-    byHash.set(hash, entry);
-    byHex.set(hashHex, entry);
-  }
-
-  // Reject overlapping non-empty payload ranges across entries.
-  if (ranges.length > 1) {
-    ranges.sort((a, b) => a.start - b.start || a.end - b.end);
-    for (let i = 1; i < ranges.length; i += 1) {
-      const prev = ranges[i - 1];
-      const curr = ranges[i];
-      if (curr.start < prev.end) {
-        throw new Error(
-          `WGPK overlapping payload ranges detected between entry ${prev.index} [${prev.start}..${prev.end}) and entry ${curr.index} [${curr.start}..${curr.end})`
-        );
-      }
-    }
+    byHash.set(raw.hash, entry);
+    byHex.set(raw.hashHex, entry);
   }
 
   return new WgslPack({
-    version,
-    flags,
+    version: header.version,
+    flags: header.flags,
     byteLength: bytes.byteLength,
-    dataStart,
+    dataStart: header.dataStart,
     payloadBytes: totalPayloadBytes,
     lazyDecode,
     entryList,
@@ -826,7 +1270,347 @@ export function parseWgslPack(buffer, options = {}) {
     byHex,
     stageCounts,
     getDecodedCount: () => decodedCount,
+    mode: 'buffer',
   });
+}
+
+/**
+ * Parse only the WGPK header + entry table into a ranged-mode `WgslPack` without
+ * holding payload bytes in memory. Payloads are fetched on demand via `getWgslAsync(hash)`.
+ *
+ * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} indexBuffer
+ * @param {{
+ *   url?: string | null,
+ *   totalBytes?: number | null,
+ *   fetch?: typeof fetch,
+ *   fetchInit?: RequestInit,
+ *   maxCachedWgslBytes?: number,
+ *   initialRangeFetches?: number,
+ * }} [options]
+ * @returns {WgslPack}
+ */
+export function parseWgslPackIndex(indexBuffer, options = {}) {
+  const bytes = toBinaryView(indexBuffer);
+  const totalBytes =
+    options && options.totalBytes !== undefined && options.totalBytes !== null
+      ? options.totalBytes
+      : null;
+  if (totalBytes !== null && (!Number.isSafeInteger(totalBytes) || totalBytes < 0)) {
+    throw new RangeError(`totalBytes must be a non-negative safe integer, got: ${totalBytes}`);
+  }
+
+  const header = parseWgpkHeader(bytes);
+  const { rawEntries, stageCounts, totalPayloadBytes, maxEnd } = parseWgpkEntryTable(
+    bytes,
+    header,
+    totalBytes
+  );
+
+  const wgslCache = new Map();
+  const rangedDecodeCounter = { count: 0 };
+  const entryList = new Array(header.entryCount);
+  const byHash = new Map();
+  const byHex = new Map();
+
+  for (let idx = 0; idx < rawEntries.length; idx += 1) {
+    const raw = rawEntries[idx];
+    const entry = {
+      hash: raw.hash,
+      hashHex: raw.hashHex,
+      stage: raw.stage,
+      stageCode: raw.stageCode,
+      offset: raw.offset,
+      length: raw.length,
+    };
+    Object.defineProperty(entry, '_index', {
+      value: idx,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(entry, 'wgsl', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        const cached = wgslCache.get(raw.hash);
+        if (cached !== undefined) {
+          return cached.wgsl;
+        }
+        if (raw.length === 0) {
+          return '';
+        }
+        throw new Error(
+          `WGPK shader ${raw.hashHex} is not loaded locally in ranged mode; call getWgslAsync(hash) first`
+        );
+      },
+    });
+
+    entryList[idx] = entry;
+    byHash.set(raw.hash, entry);
+    byHex.set(raw.hashHex, entry);
+  }
+
+  const maxCachedWgslBytes = validateMaxCachedWgslBytes(
+    options ? options.maxCachedWgslBytes : undefined
+  );
+  const initialRangeFetches =
+    options && typeof options.initialRangeFetches === 'number' ? options.initialRangeFetches : 0;
+
+  return new WgslPack({
+    version: header.version,
+    flags: header.flags,
+    byteLength: totalBytes !== null ? totalBytes : Math.max(header.dataStart, maxEnd),
+    dataStart: header.dataStart,
+    payloadBytes: totalPayloadBytes,
+    lazyDecode: true,
+    entryList,
+    byHash,
+    byHex,
+    stageCounts,
+    getDecodedCount: () => rangedDecodeCounter.count,
+    mode: 'ranged',
+    url: options && options.url ? String(options.url) : null,
+    fetchImpl: options && typeof options.fetch === 'function' ? options.fetch : null,
+    fetchInit: options ? options.fetchInit : undefined,
+    maxCachedWgslBytes,
+    initialRangeFetches,
+    wgslCache,
+    rangedDecodeCounter,
+  });
+}
+
+async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, options = {}) {
+  const lazyDecode = options && options.lazyDecode !== undefined ? Boolean(options.lazyDecode) : true;
+  const maxCachedWgslBytes = validateMaxCachedWgslBytes(
+    options ? options.maxCachedWgslBytes : undefined
+  );
+
+  // If the server returned 200 OK instead of 206 Partial Content, fall back seamlessly to buffer mode.
+  if (initialChunk.status !== 206) {
+    return parseWgslPack(initialChunk.bytes, { lazyDecode });
+  }
+
+  if (initialChunk.contentRange && initialChunk.contentRange.start !== 0) {
+    throw new Error(
+      `WGPK initial range response from "${url}" started at byte ${initialChunk.contentRange.start} (expected 0)`
+    );
+  }
+
+  let totalBytes = initialChunk.contentRange ? initialChunk.contentRange.total : null;
+  let rangeFetches = 1;
+
+  const header = parseWgpkHeader(initialChunk.bytes);
+  const tableEnd = header.dataStart;
+
+  if (totalBytes !== null && totalBytes < tableEnd) {
+    throw new Error(
+      `WGPK pack truncated: ${totalBytes} total bytes (header + ${header.entryCount} entry table records require at least ${tableEnd} bytes)`
+    );
+  }
+
+  let indexBytes;
+  if (initialChunk.bytes.byteLength >= tableEnd) {
+    // Entire header + entry table fit in the initial range chunk (single roundtrip!).
+    // Copy only the exact index prefix so any trailing bytes are not retained in memory.
+    indexBytes = initialChunk.bytes.slice(0, tableEnd);
+  } else {
+    // Table extends beyond the initial range chunk: fetch only the remaining table bytes.
+    indexBytes = new Uint8Array(tableEnd);
+    indexBytes.set(initialChunk.bytes, 0);
+    let have = initialChunk.bytes.byteLength;
+
+    while (have < tableEnd) {
+      rangeFetches += 1;
+      const remainder = await fetchRangeChunk(fetcher, url, have, tableEnd - 1, options.fetchInit);
+
+      // Server fell back to 200 OK on the continuation request: switch seamlessly to full buffer mode.
+      if (remainder.status !== 206) {
+        return parseWgslPack(remainder.bytes, { lazyDecode });
+      }
+
+      if (remainder.contentRange) {
+        if (remainder.contentRange.start !== have) {
+          throw new Error(
+            `WGPK table continuation range from "${url}" started at byte ${remainder.contentRange.start} (expected ${have})`
+          );
+        }
+        if (remainder.contentRange.total !== null) {
+          totalBytes = remainder.contentRange.total;
+        }
+      }
+
+      if (remainder.bytes.byteLength === 0) {
+        throw new Error(
+          `WGPK pack truncated while fetching entry table from "${url}": received 0 bytes at offset ${have}/${tableEnd}`
+        );
+      }
+
+      const copyLen = Math.min(remainder.bytes.byteLength, tableEnd - have);
+      indexBytes.set(remainder.bytes.subarray(0, copyLen), have);
+      have += copyLen;
+    }
+  }
+
+  return parseWgslPackIndex(indexBytes, {
+    url,
+    totalBytes,
+    fetch: fetcher,
+    fetchInit: options.fetchInit,
+    maxCachedWgslBytes,
+    initialRangeFetches: rangeFetches,
+  });
+}
+
+/**
+ * Fetch only the WGPK header + entry table from a URL using HTTP `206 Range` requests.
+ * Falls back seamlessly to full in-memory buffer mode if the server responds `200 OK`.
+ *
+ * @param {string} url
+ * @param {typeof fetch | {
+ *   fetch?: typeof fetch,
+ *   fetchInit?: RequestInit,
+ *   initialRangeBytes?: number,
+ *   maxCachedWgslBytes?: number,
+ *   lazyDecode?: boolean,
+ * }} [fetchImplOrOptions]
+ * @param {object} [maybeOptions]
+ * @returns {Promise<WgslPack>}
+ */
+export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new TypeError('url must be a non-empty string');
+  }
+  const { fetcher, options } = resolveFetchAndOptions(fetchImplOrOptions, maybeOptions, null);
+  if (typeof fetcher !== 'function') {
+    throw new Error('No fetch implementation available for loadIndexFromUrl');
+  }
+
+  const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
+  validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
+
+  const initialChunk = await fetchRangeChunk(
+    fetcher,
+    url,
+    0,
+    initialRangeBytes - 1,
+    options.fetchInit
+  );
+  return finishPackIndexFromInitialChunk(url, fetcher, initialChunk, options);
+}
+
+/**
+ * Fetch a `.wgsl.pack` from a URL into a `WgslPack`.
+ * When `options.streamThresholdBytes > 0`, probes the remote pack size (via `HEAD` with
+ * Range-probe fallback) and automatically switches to ranged index-only mode if
+ * `totalSize > options.streamThresholdBytes`. When `streamThresholdBytes` is omitted or `0`,
+ * fetches the full buffer via a single `GET` request.
+ *
+ * @param {string} url
+ * @param {typeof fetch | {
+ *   fetch?: typeof fetch,
+ *   fetchInit?: RequestInit,
+ *   lazyDecode?: boolean,
+ *   streamThresholdBytes?: number,
+ *   initialRangeBytes?: number,
+ *   maxCachedWgslBytes?: number,
+ * }} [fetchImplOrOptions]
+ * @param {object} [maybeOptions]
+ * @returns {Promise<WgslPack>}
+ */
+export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new TypeError('url must be a non-empty string');
+  }
+  const { fetcher, options } = resolveFetchAndOptions(fetchImplOrOptions, maybeOptions, null);
+  if (typeof fetcher !== 'function') {
+    throw new Error('No fetch implementation available for loadFromUrl');
+  }
+
+  const lazyDecode = options.lazyDecode !== undefined ? Boolean(options.lazyDecode) : true;
+  const streamThresholdBytes = validateStreamThresholdBytes(options.streamThresholdBytes, 0);
+
+  if (streamThresholdBytes > 0) {
+    const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
+    validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
+
+    // 1. Prefer lightweight HEAD probe for Content-Length & Accept-Ranges.
+    let headResolved = false;
+    let useFullGet = false;
+    let useRanged = false;
+
+    const headResponse = await fetcher(url, mergeRequestInit(options.fetchInit, { method: 'HEAD' }));
+    if (headResponse && headResponse.ok) {
+      const acceptRanges = getResponseHeader(headResponse, 'accept-ranges');
+      if (acceptRanges && acceptRanges.trim().toLowerCase() === 'none') {
+        headResolved = true;
+        useFullGet = true;
+      } else {
+        const contentLength = parseNonNegativeInt(getResponseHeader(headResponse, 'content-length'));
+        if (contentLength !== null) {
+          headResolved = true;
+          if (contentLength > streamThresholdBytes) {
+            useRanged = true;
+          } else {
+            useFullGet = true;
+          }
+        }
+      }
+    } else if (headResponse && headResponse.status !== 405 && headResponse.status !== 501) {
+      const status = headResponse.status;
+      const statusText = headResponse.statusText ? ` ${headResponse.statusText}` : '';
+      throw new Error(`Failed to fetch WGSL pack from "${url}": HTTP ${status}${statusText}`);
+    }
+
+    if (headResolved && useRanged) {
+      return loadIndexFromUrl(url, fetcher, options);
+    }
+
+    if (!headResolved && !useFullGet) {
+      // 2. Fallback probe when HEAD is unsupported or lacks Content-Length: initial byte range.
+      const probe = await fetchRangeChunk(
+        fetcher,
+        url,
+        0,
+        initialRangeBytes - 1,
+        options.fetchInit
+      );
+      if (probe.status !== 206) {
+        return parseWgslPack(probe.bytes, { lazyDecode });
+      }
+      const probeTotal = probe.contentRange ? probe.contentRange.total : null;
+      if (probeTotal !== null && probeTotal <= streamThresholdBytes) {
+        if (
+          probe.bytes.byteLength >= probeTotal &&
+          (!probe.contentRange || probe.contentRange.start === 0)
+        ) {
+          return parseWgslPack(probe.bytes.subarray(0, probeTotal), { lazyDecode });
+        }
+        // Small pack larger than initialRangeBytes: fall through to full GET below.
+      } else {
+        return finishPackIndexFromInitialChunk(url, fetcher, probe, options);
+      }
+    }
+  }
+
+  const response = await fetcher(url, options.fetchInit);
+  if (!response || !response.ok) {
+    const status = response ? response.status : 'unknown';
+    const statusText = response && response.statusText ? ` ${response.statusText}` : '';
+    throw new Error(`Failed to fetch WGSL pack from "${url}": HTTP ${status}${statusText}`);
+  }
+
+  const buffer = await response.arrayBuffer();
+  return parseWgslPack(buffer, { lazyDecode });
+}
+
+/**
+ * Alias for `parseWgslPack(buffer, options)`.
+ *
+ * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
+ * @param {{ lazyDecode?: boolean }} [options]
+ * @returns {WgslPack}
+ */
+export function loadFromBuffer(buffer, options = {}) {
+  return parseWgslPack(buffer, options);
 }
 
 /**
@@ -850,6 +1634,9 @@ export class WgslPackCache {
       throw new RangeError('prewarmConcurrency must be a positive integer');
     }
     this._fetch = typeof options.fetch === 'function' ? options.fetch : null;
+    this._maxCachedWgslBytes = validateMaxCachedWgslBytes(options.maxCachedWgslBytes);
+    this._initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
+    this._streamThresholdBytes = validateStreamThresholdBytes(options.streamThresholdBytes, 0);
 
     this._packs = new Map();
     this._shaderEntries = new Map();
@@ -869,20 +1656,7 @@ export class WgslPackCache {
     };
   }
 
-  /**
-   * Parse and register a `.wgsl.pack` binary buffer.
-   * If a pack with the same `packName` is already loaded, its entries are replaced.
-   * Active dynamic shader overrides are preserved across static pack loads.
-   *
-   * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
-   * @param {string} [packName]
-   * @param {{ lazyDecode?: boolean }} [options]
-   * @returns {WgslPack}
-   */
-  loadPackBuffer(buffer, packName, options = {}) {
-    const lazyDecode =
-      options && options.lazyDecode !== undefined ? Boolean(options.lazyDecode) : this._lazyDecode;
-    const pack = parseWgslPack(buffer, { lazyDecode });
+  _registerPack(pack, packName) {
     const name =
       typeof packName === 'string' && packName.length > 0
         ? packName
@@ -912,20 +1686,132 @@ export class WgslPackCache {
   }
 
   /**
-   * Fetch a `.wgsl.pack` bundle from a URL and register it in the cache.
+   * Parse and register a `.wgsl.pack` binary buffer.
+   * If a pack with the same `packName` is already loaded, its entries are replaced.
+   * Active dynamic shader overrides are preserved across static pack loads.
+   *
+   * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
+   * @param {string} [packName]
+   * @param {{ lazyDecode?: boolean }} [options]
+   * @returns {WgslPack}
+   */
+  loadPackBuffer(buffer, packName, options = {}) {
+    const lazyDecode =
+      options && options.lazyDecode !== undefined ? Boolean(options.lazyDecode) : this._lazyDecode;
+    const pack = parseWgslPack(buffer, { lazyDecode });
+    return this._registerPack(pack, packName);
+  }
+
+  /**
+   * Alias for `loadPackBuffer` accepting either `(buffer, packName, options)` or `(buffer, options)`.
+   *
+   * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} buffer
+   * @param {string | { packName?: string, lazyDecode?: boolean }} [packNameOrOptions]
+   * @param {{ lazyDecode?: boolean }} [maybeOptions]
+   * @returns {WgslPack}
+   */
+  loadFromBuffer(buffer, packNameOrOptions, maybeOptions) {
+    if (packNameOrOptions && typeof packNameOrOptions === 'object') {
+      return this.loadPackBuffer(buffer, packNameOrOptions.packName, packNameOrOptions);
+    }
+    return this.loadPackBuffer(buffer, packNameOrOptions, maybeOptions);
+  }
+
+  /**
+   * Fetch only the WGPK header + entry table from a URL via HTTP `206 Range` and register
+   * the resulting ranged pack (or buffer fallback on `200 OK`).
    *
    * @param {string} url
-   * @param {typeof fetch} [fetchImpl]
-   * @param {{ packName?: string, lazyDecode?: boolean, fetchInit?: RequestInit }} [options]
+   * @param {typeof fetch | {
+   *   packName?: string,
+   *   fetch?: typeof fetch,
+   *   fetchInit?: RequestInit,
+   *   initialRangeBytes?: number,
+   *   maxCachedWgslBytes?: number,
+   *   lazyDecode?: boolean,
+   * }} [fetchImplOrOptions]
+   * @param {object} [maybeOptions]
    * @returns {Promise<WgslPack>}
    */
-  async loadPackUrl(url, fetchImpl, options = {}) {
+  async loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
     if (typeof url !== 'string' || url.length === 0) {
       throw new TypeError('url must be a non-empty string');
     }
-    const fetcher = fetchImpl ?? this._fetch ?? globalThis.fetch;
+    const { fetcher, options } = resolveFetchAndOptions(
+      fetchImplOrOptions,
+      maybeOptions,
+      this._fetch
+    );
+    if (typeof fetcher !== 'function') {
+      throw new Error('No fetch implementation available for loadIndexFromUrl');
+    }
+
+    const pack = await loadIndexFromUrl(url, fetcher, {
+      fetchInit: options.fetchInit,
+      initialRangeBytes: options.initialRangeBytes ?? this._initialRangeBytes,
+      maxCachedWgslBytes: options.maxCachedWgslBytes ?? this._maxCachedWgslBytes,
+      lazyDecode: options.lazyDecode !== undefined ? options.lazyDecode : this._lazyDecode,
+    });
+    const name = options.packName ?? url;
+    return this._registerPack(pack, name);
+  }
+
+  /**
+   * Alias for `loadIndexFromUrl`.
+   */
+  loadPackIndexUrl(url, fetchImplOrOptions, maybeOptions) {
+    return this.loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions);
+  }
+
+  /**
+   * Fetch a `.wgsl.pack` bundle from a URL and register it in the cache.
+   * If `options.streamThresholdBytes > 0` (or configured on the cache), automatically uses
+   * HTTP `206 Range` index-only mode when the remote pack exceeds the threshold.
+   *
+   * @param {string} url
+   * @param {typeof fetch | {
+   *   packName?: string,
+   *   lazyDecode?: boolean,
+   *   fetch?: typeof fetch,
+   *   fetchInit?: RequestInit,
+   *   streamThresholdBytes?: number,
+   *   initialRangeBytes?: number,
+   *   maxCachedWgslBytes?: number,
+   * }} [fetchImplOrOptions]
+   * @param {object} [maybeOptions]
+   * @returns {Promise<WgslPack>}
+   */
+  async loadPackUrl(url, fetchImplOrOptions, maybeOptions) {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError('url must be a non-empty string');
+    }
+    const { fetcher, options } = resolveFetchAndOptions(
+      fetchImplOrOptions,
+      maybeOptions,
+      this._fetch
+    );
     if (typeof fetcher !== 'function') {
       throw new Error('No fetch implementation available for loadPackUrl');
+    }
+
+    const streamThresholdBytes = validateStreamThresholdBytes(
+      options.streamThresholdBytes !== undefined
+        ? options.streamThresholdBytes
+        : this._streamThresholdBytes,
+      0
+    );
+    const lazyDecode = options.lazyDecode !== undefined ? Boolean(options.lazyDecode) : this._lazyDecode;
+    const name = options.packName ?? url;
+
+    if (streamThresholdBytes > 0) {
+      const pack = await loadFromUrl(url, fetcher, {
+        fetchInit: options.fetchInit,
+        lazyDecode,
+        streamThresholdBytes,
+        initialRangeBytes: options.initialRangeBytes ?? this._initialRangeBytes,
+        maxCachedWgslBytes: options.maxCachedWgslBytes ?? this._maxCachedWgslBytes,
+      });
+      return this._registerPack(pack, name);
     }
 
     const response = await fetcher(url, options.fetchInit);
@@ -936,8 +1822,14 @@ export class WgslPackCache {
     }
 
     const buffer = await response.arrayBuffer();
-    const name = options.packName ?? url;
-    return this.loadPackBuffer(buffer, name, { lazyDecode: options.lazyDecode });
+    return this.loadPackBuffer(buffer, name, { lazyDecode });
+  }
+
+  /**
+   * Alias for `loadPackUrl`.
+   */
+  loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
+    return this.loadPackUrl(url, fetchImplOrOptions, maybeOptions);
   }
 
   /**
@@ -1194,6 +2086,17 @@ export class WgslPackCache {
   }
 
   /**
+   * Alias for `hasShader(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {boolean}
+   */
+  has(hash, stage) {
+    return this.hasShader(hash, stage);
+  }
+
+  /**
    * Get the WGSL source string for a shader hash, checking dynamic overrides first
    * and then loaded static packs.
    *
@@ -1204,6 +2107,60 @@ export class WgslPackCache {
   getShaderSource(hash, stage) {
     const found = this.lookup(hash, stage);
     return found ? found.wgsl : undefined;
+  }
+
+  /**
+   * Alias for `getShaderSource(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {string | undefined}
+   */
+  getWgsl(hash, stage) {
+    return this.getShaderSource(hash, stage);
+  }
+
+  /**
+   * Asynchronously retrieve the WGSL source string for a shader hash across both
+   * full-buffer packs and HTTP-ranged packs (checking dynamic overrides first).
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {Promise<string | null>}
+   */
+  async getWgslAsync(hash, stage) {
+    const key = normalizeHash(hash);
+    const expectedStage =
+      stage !== undefined && stage !== null ? resolveStageCode(stage) : null;
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      if (expectedStage !== null && dynamicEntry.stageCode !== expectedStage) {
+        return null;
+      }
+      this._stats.dynamicHits += 1;
+      return dynamicEntry.wgsl;
+    }
+
+    const record = this._shaderEntries.get(key);
+    if (!record) {
+      return null;
+    }
+    if (expectedStage !== null && record.entry.stageCode !== expectedStage) {
+      return null;
+    }
+    return record.pack.getWgslAsync(key);
+  }
+
+  /**
+   * Alias for `getWgslAsync(hash, stage)`.
+   *
+   * @param {bigint | string | number} hash
+   * @param {number | string} [stage]
+   * @returns {Promise<string | null>}
+   */
+  getShaderSourceAsync(hash, stage) {
+    return this.getWgslAsync(hash, stage);
   }
 
   /**
@@ -1330,6 +2287,74 @@ export class WgslPackCache {
   }
 
   /**
+   * Async companion to `getOrCreateShaderModule` supporting both full-buffer and ranged packs.
+   *
+   * @param {GPUDevice} device
+   * @param {bigint | string | number} hash
+   * @param {string} [labelPrefix]
+   * @returns {Promise<GPUShaderModule>}
+   */
+  async getOrCreateShaderModuleAsync(device, hash, labelPrefix) {
+    if (!device || typeof device.createShaderModule !== 'function') {
+      throw new TypeError('device must provide a createShaderModule(descriptor) method');
+    }
+
+    const key = normalizeHash(hash);
+    const deviceMap = this._getDeviceMap(device, true);
+    const cached = deviceMap.get(key);
+    if (cached !== undefined) {
+      this._stats.hits += 1;
+      if (this._dynamicEntries.has(key)) {
+        this._stats.dynamicHits += 1;
+      }
+      return cached;
+    }
+
+    const dynamicEntry = this._dynamicEntries.get(key);
+    if (dynamicEntry) {
+      return this.getOrCreateShaderModule(device, key, labelPrefix);
+    }
+
+    const record = this._shaderEntries.get(key);
+    if (!record) {
+      this._stats.misses += 1;
+      throw new Error(`Shader ${formatHashHex(key)} not found in any loaded WGSL pack`);
+    }
+
+    if (record.pack.mode !== 'ranged') {
+      return this.getOrCreateShaderModule(device, key, labelPrefix);
+    }
+
+    const code = await record.pack.getWgslAsync(key);
+    if (code === null) {
+      this._stats.misses += 1;
+      throw new Error(`Shader ${formatHashHex(key)} not found in any loaded WGSL pack`);
+    }
+
+    // Re-check device cache in case a concurrent caller compiled while we awaited.
+    const cachedAfterFetch = deviceMap.get(key);
+    if (cachedAfterFetch !== undefined) {
+      this._stats.hits += 1;
+      return cachedAfterFetch;
+    }
+
+    this._stats.misses += 1;
+    const prefix = labelPrefix !== undefined ? String(labelPrefix) : this._labelPrefix;
+    const label = prefix
+      ? `${prefix}:${record.entry.stage}:${record.entry.hashHex}`
+      : `${record.entry.stage}:${record.entry.hashHex}`;
+
+    const shaderModule = device.createShaderModule({
+      label,
+      code,
+    });
+
+    deviceMap.set(key, shaderModule);
+    this._stats.compiles += 1;
+    return shaderModule;
+  }
+
+  /**
    * Batch-compile a set of shader hashes on `device` with bounded concurrency.
    * If `hashes` is omitted, prewarms every shader loaded across all packs.
    *
@@ -1390,7 +2415,15 @@ export class WgslPackCache {
       while (cursor < uniqueHashes.length) {
         const hash = uniqueHashes[cursor++];
         const alreadyCached = this._hasCachedModule(device, hash);
-        const mod = this.getOrCreateShaderModule(device, hash, labelPrefix);
+        const record = this._shaderEntries.get(hash);
+        const useAsync =
+          !alreadyCached &&
+          !this._dynamicEntries.has(hash) &&
+          record &&
+          record.pack.mode === 'ranged';
+        const mod = useAsync
+          ? await this.getOrCreateShaderModuleAsync(device, hash, labelPrefix)
+          : this.getOrCreateShaderModule(device, hash, labelPrefix);
         modules.set(hash, mod);
         if (alreadyCached) {
           cached += 1;
@@ -1650,12 +2683,40 @@ export class WgslPackCache {
     }
 
     let totalPackBytes = 0;
+    let rangeFetches = 0;
+    let cacheHits = 0;
+    let cacheMisses = 0;
+    let cachedWgslBytes = 0;
+    let cachedWgslEntries = 0;
+    let wgslCacheEvictions = 0;
+    let inFlightDeduplications = 0;
+    let hasBufferPack = false;
+    let hasRangedPack = false;
     const packs = {};
     for (const [name, pack] of this._packs.entries()) {
       const s = pack.stats();
       totalPackBytes += s.byteLength;
+      rangeFetches += s.rangeFetches;
+      cacheHits += s.cacheHits;
+      cacheMisses += s.cacheMisses;
+      cachedWgslBytes += s.cachedWgslBytes;
+      cachedWgslEntries += s.cachedWgslEntries;
+      wgslCacheEvictions += s.wgslCacheEvictions;
+      inFlightDeduplications += s.inFlightDeduplications;
+      if (s.mode === 'ranged') {
+        hasRangedPack = true;
+      } else {
+        hasBufferPack = true;
+      }
       packs[name] = s;
     }
+
+    const mode =
+      hasRangedPack && hasBufferPack
+        ? 'mixed'
+        : hasRangedPack
+          ? 'ranged'
+          : 'buffer';
 
     const stageCounts = { vertex: 0, fragment: 0, compute: 0 };
     const dynamicStageCounts = { vertex: 0, fragment: 0, compute: 0 };
@@ -1683,6 +2744,7 @@ export class WgslPackCache {
 
     const totalLookups = this._stats.hits + this._stats.misses;
     return {
+      mode,
       packCount: this._packs.size,
       shaderCount,
       staticShaderCount,
@@ -1698,6 +2760,13 @@ export class WgslPackCache {
       evictions: this._stats.evictions,
       dynamicHits: this._stats.dynamicHits,
       hitRate: totalLookups > 0 ? this._stats.hits / totalLookups : 0,
+      rangeFetches,
+      cacheHits,
+      cacheMisses,
+      cachedWgslBytes,
+      cachedWgslEntries,
+      wgslCacheEvictions,
+      inFlightDeduplications,
       stageCounts,
       dynamicStageCounts,
       packs,
