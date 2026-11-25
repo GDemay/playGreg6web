@@ -8,6 +8,7 @@
   const DEFAULT_MAX_RENDER_PIPELINES = 2048;
   const DEFAULT_MAX_COMPUTE_PIPELINES = 1024;
   const DEFAULT_MAX_BIND_GROUP_LAYOUTS = 512;
+  const DEFAULT_MAX_FAST_LOOKUP_ENTRIES = 2048;
   const DEFAULT_PREWARM_CONCURRENCY = 4;
   const DEFAULT_MAX_ERROR_HISTORY = 32;
   const DEFAULT_MAX_QUARANTINED_KEYS = 512;
@@ -268,7 +269,13 @@
   const registeredObjectIds = new WeakMap();
   const opaqueObjectIds = new WeakMap();
   const fallbackPipelineLayoutProfiles = new WeakMap();
+  const gpuHandleFastCache = new WeakMap();
   let nextOpaqueObjectId = 1;
+  let shaderModuleRegistryVersion = 0;
+
+  // Reusable 8-byte scratch view for zero-allocation float64 -> 2x uint32 hashing.
+  const FAST_HASH_F64 = new Float64Array(1);
+  const FAST_HASH_U32 = new Uint32Array(FAST_HASH_F64.buffer);
 
   function defaultNow() {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -407,12 +414,17 @@
    * @param {bigint | number | string} id
    * @returns {string} Canonical registered ID token
    */
+  function setRegisteredObjectId(gpuObject, token) {
+    registeredObjectIds.set(gpuObject, token);
+    shaderModuleRegistryVersion += 1;
+  }
+
   function registerShaderModuleId(gpuObject, id) {
     if (!gpuObject || (typeof gpuObject !== 'object' && typeof gpuObject !== 'function')) {
       throw new TypeError('gpuObject must be an object');
     }
     const token = normalizeShaderId(id);
-    registeredObjectIds.set(gpuObject, token);
+    setRegisteredObjectId(gpuObject, token);
     return token;
   }
 
@@ -1566,6 +1578,1046 @@
     const state = { hi: FNV1A_64_INIT_HI, lo: FNV1A_64_INIT_LO };
     emitDescriptorToSink(obj, { state, buf: '' });
     return fnv1a64FinalizeHex(state);
+  }
+
+  // --- W281: Fast-Path Integer Hash & Structural Descriptor Snapshot Helpers ---
+
+  const FAST_HASH_AUTO_HANDLE = Object.freeze({
+    token: 'auto',
+    h1: 0x6175746f,
+    h2: 0x2f6a1b93,
+  });
+
+  function mixFastInt(state, x) {
+    const v = x | 0;
+    state.h1 = Math.imul(state.h1 ^ v, 0x85ebca6b) >>> 0;
+    state.h2 = Math.imul(state.h2 ^ ((v >>> 16) | (v << 16)), 0xc2b2ae35) >>> 0;
+  }
+
+  function mixFastNumber(state, n) {
+    const normalized = n === 0 ? 0 : n;
+    if ((normalized | 0) === normalized) {
+      mixFastInt(state, normalized);
+      return;
+    }
+    FAST_HASH_F64[0] = normalized;
+    mixFastInt(state, FAST_HASH_U32[0]);
+    mixFastInt(state, FAST_HASH_U32[1]);
+  }
+
+  function mixFastString(state, str) {
+    const len = str.length;
+    let h1 = Math.imul(state.h1 ^ len, 0x85ebca6b) >>> 0;
+    let h2 = Math.imul(state.h2 ^ len, 0xc2b2ae35) >>> 0;
+    for (let i = 0; i < len; i += 1) {
+      const c = str.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ ((c + i) | 0), 0x27d4eb2d) >>> 0;
+    }
+    state.h1 = h1;
+    state.h2 = h2;
+  }
+
+  function finalizeFastHash53(state) {
+    const hi21 = (state.h1 ^ (state.h1 >>> 16)) & 0x1fffff;
+    const lo32 = (state.h2 ^ (state.h2 >>> 15)) >>> 0;
+    return hi21 * 0x100000000 + lo32;
+  }
+
+  function resolveGpuHandleFast(val) {
+    if (val === 'auto') {
+      return FAST_HASH_AUTO_HANDLE;
+    }
+    if (val === null || val === undefined) {
+      return null;
+    }
+    const t = typeof val;
+    if (t === 'object' || t === 'function') {
+      const cached = gpuHandleFastCache.get(val);
+      if (
+        cached !== undefined &&
+        cached.regVer === shaderModuleRegistryVersion &&
+        cached.label === val.label &&
+        cached.wgpkHash === val.wgpkHash &&
+        cached.shaderHash === val.shaderHash &&
+        cached.hashHex === val.hashHex &&
+        cached.hash === val.hash &&
+        cached.shaderId === val.shaderId &&
+        cached.moduleId === val.moduleId
+      ) {
+        return cached;
+      }
+      const token = resolveGpuHandleToken(val);
+      if (token === null) {
+        return null;
+      }
+      const st = { h1: 0x9e3779b9, h2: 0x85ebca6b };
+      mixFastString(st, token);
+      const entry = {
+        token,
+        h1: st.h1,
+        h2: st.h2,
+        regVer: shaderModuleRegistryVersion,
+        label: val.label,
+        wgpkHash: val.wgpkHash,
+        shaderHash: val.shaderHash,
+        hashHex: val.hashHex,
+        hash: val.hash,
+        shaderId: val.shaderId,
+        moduleId: val.moduleId,
+      };
+      gpuHandleFastCache.set(val, entry);
+      return entry;
+    }
+    const token = resolveGpuHandleToken(val);
+    if (token === null) {
+      return null;
+    }
+    const st = { h1: 0x9e3779b9, h2: 0x85ebca6b };
+    mixFastString(st, token);
+    return { token, h1: st.h1, h2: st.h2 };
+  }
+
+  function mixFastGpuHandle(state, handleFast) {
+    mixFastInt(state, handleFast.h1);
+    mixFastInt(state, handleFast.h2);
+  }
+
+  function isLikelyFallbackModule(mod) {
+    if (!mod || typeof mod !== 'object') {
+      return false;
+    }
+    if (
+      mod.isFallback === true ||
+      mod.source === 'builtin' ||
+      (typeof mod.fallbackProfile === 'string' && mod.fallbackProfile.length > 0) ||
+      (typeof mod.profile === 'string' && mod.profile.length > 0)
+    ) {
+      return true;
+    }
+    if (typeof mod.label === 'string' && FALLBACK_LABEL_RE.test(mod.label.trim())) {
+      return true;
+    }
+    return false;
+  }
+
+  function gpuHandlesMatch(actual, expectedRef, expectedToken) {
+    if (actual === expectedRef) {
+      return true;
+    }
+    const fast = resolveGpuHandleFast(actual);
+    return fast !== null && fast.token === expectedToken;
+  }
+
+  function hashAndValidateBlendComponent(comp, tag, state) {
+    if (!isPlainRecordObject(comp)) return false;
+    for (const k in comp) {
+      if (!Object.prototype.hasOwnProperty.call(comp, k)) continue;
+      const v = comp[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k !== 'operation' && k !== 'srcFactor' && k !== 'dstFactor') return false;
+      if (typeof v !== 'string') return false;
+    }
+    mixFastInt(state, tag);
+    if (comp.operation !== undefined) {
+      mixFastInt(state, 0x31);
+      mixFastString(state, comp.operation);
+    }
+    if (comp.srcFactor !== undefined) {
+      mixFastInt(state, 0x32);
+      mixFastString(state, comp.srcFactor);
+    }
+    if (comp.dstFactor !== undefined) {
+      mixFastInt(state, 0x33);
+      mixFastString(state, comp.dstFactor);
+    }
+    return true;
+  }
+
+  function hashAndValidateStencilFace(face, tag, state) {
+    if (!isPlainRecordObject(face)) return false;
+    for (const k in face) {
+      if (!Object.prototype.hasOwnProperty.call(face, k)) continue;
+      const v = face[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k !== 'compare' && k !== 'failOp' && k !== 'depthFailOp' && k !== 'passOp') return false;
+      if (typeof v !== 'string') return false;
+    }
+    mixFastInt(state, tag);
+    if (face.compare !== undefined) {
+      mixFastInt(state, 0x41);
+      mixFastString(state, face.compare);
+    }
+    if (face.failOp !== undefined) {
+      mixFastInt(state, 0x42);
+      mixFastString(state, face.failOp);
+    }
+    if (face.depthFailOp !== undefined) {
+      mixFastInt(state, 0x43);
+      mixFastString(state, face.depthFailOp);
+    }
+    if (face.passOp !== undefined) {
+      mixFastInt(state, 0x44);
+      mixFastString(state, face.passOp);
+    }
+    return true;
+  }
+
+  /**
+   * Single-pass, zero-allocation, key-order-invariant 53-bit integer hash for standard
+   * `GPURenderPipelineDescriptor` objects. Returns `null` for non-standard, fallback, or
+   * unnormalized descriptors so callers fall back safely to canonical normalization/hashing.
+   *
+   * @param {unknown} desc
+   * @returns {number | null}
+   */
+  function computeFastRenderIntHash(desc) {
+    if (!isPlainRecordObject(desc)) return null;
+    if (desc.layout === undefined || desc.layout === null) return null;
+    if (desc.depthStencil === null) return null;
+    if (desc.vertex === undefined || !isPlainRecordObject(desc.vertex)) return null;
+
+    // Validate top-level keys (strict WebGPU GPURenderPipelineDescriptor subset).
+    for (const k in desc) {
+      if (!Object.prototype.hasOwnProperty.call(desc, k)) continue;
+      const v = desc[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (
+        k !== 'layout' &&
+        k !== 'label' &&
+        k !== 'vertex' &&
+        k !== 'fragment' &&
+        k !== 'primitive' &&
+        k !== 'depthStencil' &&
+        k !== 'multisample'
+      ) {
+        return null;
+      }
+    }
+
+    const layoutFast = resolveGpuHandleFast(desc.layout);
+    if (layoutFast === null) return null;
+
+    const state = { h1: 0x52454e44, h2: 0x13579bdf };
+    mixFastInt(state, 0x101);
+    mixFastGpuHandle(state, layoutFast);
+
+    if (desc.label !== undefined) {
+      if (typeof desc.label !== 'string') return null;
+      mixFastInt(state, 0x102);
+      mixFastString(state, desc.label);
+    }
+
+    // Vertex state
+    const v = desc.vertex;
+    for (const vk in v) {
+      if (!Object.prototype.hasOwnProperty.call(v, vk)) continue;
+      const vv = v[vk];
+      if (vv === undefined || typeof vv === 'function') continue;
+      if (vk === 'module' || vk === 'entryPoint' || vk === 'buffers') {
+        continue;
+      }
+      return null;
+    }
+    mixFastInt(state, 0x200);
+    if (v.module !== undefined) {
+      if (isLikelyFallbackModule(v.module)) return null;
+      const vsFast = resolveGpuHandleFast(v.module);
+      if (vsFast === null) return null;
+      mixFastInt(state, 0x201);
+      mixFastGpuHandle(state, vsFast);
+    }
+    if (v.entryPoint !== undefined) {
+      if (typeof v.entryPoint !== 'string') return null;
+      mixFastInt(state, 0x202);
+      mixFastString(state, v.entryPoint);
+    }
+    if (v.buffers !== undefined) {
+      if (!Array.isArray(v.buffers)) return null;
+      const bufs = v.buffers;
+      mixFastInt(state, 0x203);
+      mixFastInt(state, bufs.length);
+      for (let i = 0; i < bufs.length; i += 1) {
+        const b = bufs[i];
+        if (b === null) {
+          mixFastInt(state, 0x210);
+          continue;
+        }
+        if (b === undefined) {
+          mixFastInt(state, 0x211);
+          continue;
+        }
+        if (!isPlainRecordObject(b)) return null;
+        for (const bk in b) {
+          if (!Object.prototype.hasOwnProperty.call(b, bk)) continue;
+          const bv = b[bk];
+          if (bv === undefined || typeof bv === 'function') continue;
+          if (bk !== 'arrayStride' && bk !== 'stepMode' && bk !== 'attributes') return null;
+        }
+        mixFastInt(state, 0x212);
+        if (b.arrayStride !== undefined) {
+          if (typeof b.arrayStride !== 'number' || !Number.isFinite(b.arrayStride)) return null;
+          mixFastInt(state, 0x213);
+          mixFastNumber(state, b.arrayStride);
+        }
+        if (b.stepMode !== undefined) {
+          if (typeof b.stepMode !== 'string') return null;
+          mixFastInt(state, 0x214);
+          mixFastString(state, b.stepMode);
+        }
+        if (b.attributes !== undefined) {
+          if (!Array.isArray(b.attributes)) return null;
+          const attrs = b.attributes;
+          mixFastInt(state, 0x215);
+          mixFastInt(state, attrs.length);
+          for (let j = 0; j < attrs.length; j += 1) {
+            const a = attrs[j];
+            if (!isPlainRecordObject(a)) return null;
+            for (const ak in a) {
+              if (!Object.prototype.hasOwnProperty.call(a, ak)) continue;
+              const av = a[ak];
+              if (av === undefined || typeof av === 'function') continue;
+              if (ak !== 'shaderLocation' && ak !== 'offset' && ak !== 'format') return null;
+            }
+            mixFastInt(state, 0x220);
+            if (a.shaderLocation !== undefined) {
+              if (typeof a.shaderLocation !== 'number' || !Number.isFinite(a.shaderLocation)) {
+                return null;
+              }
+              mixFastInt(state, 0x221);
+              mixFastNumber(state, a.shaderLocation);
+            }
+            if (a.offset !== undefined) {
+              if (typeof a.offset !== 'number' || !Number.isFinite(a.offset)) return null;
+              mixFastInt(state, 0x222);
+              mixFastNumber(state, a.offset);
+            }
+            if (a.format !== undefined) {
+              if (typeof a.format !== 'string') return null;
+              mixFastInt(state, 0x223);
+              mixFastString(state, a.format);
+            }
+          }
+        }
+      }
+    }
+
+    // Fragment state
+    if (desc.fragment !== undefined) {
+      const f = desc.fragment;
+      if (!isPlainRecordObject(f)) return null;
+      if (!Array.isArray(f.targets) || f.targets.length === 0) return null;
+      for (const fk in f) {
+        if (!Object.prototype.hasOwnProperty.call(f, fk)) continue;
+        const fv = f[fk];
+        if (fv === undefined || typeof fv === 'function') continue;
+        if (fk === 'module' || fk === 'entryPoint' || fk === 'targets') {
+          continue;
+        }
+        return null;
+      }
+      mixFastInt(state, 0x300);
+      if (f.module !== undefined) {
+        if (isLikelyFallbackModule(f.module)) return null;
+        const fsFast = resolveGpuHandleFast(f.module);
+        if (fsFast === null) return null;
+        mixFastInt(state, 0x301);
+        mixFastGpuHandle(state, fsFast);
+      }
+      if (f.entryPoint !== undefined) {
+        if (typeof f.entryPoint !== 'string') return null;
+        mixFastInt(state, 0x302);
+        mixFastString(state, f.entryPoint);
+      }
+      const targets = f.targets;
+      mixFastInt(state, 0x303);
+      mixFastInt(state, targets.length);
+      for (let i = 0; i < targets.length; i += 1) {
+        const t = targets[i];
+        if (t === null) {
+          mixFastInt(state, 0x310);
+          continue;
+        }
+        if (t === undefined || !isPlainRecordObject(t)) return null;
+        if (t.blend === null) return null;
+        for (const tk in t) {
+          if (!Object.prototype.hasOwnProperty.call(t, tk)) continue;
+          const tv = t[tk];
+          if (tv === undefined || typeof tv === 'function') continue;
+          if (tk !== 'format' && tk !== 'writeMask' && tk !== 'blend') return null;
+        }
+        mixFastInt(state, 0x312);
+        if (t.format !== undefined) {
+          if (typeof t.format !== 'string') return null;
+          mixFastInt(state, 0x313);
+          mixFastString(state, t.format);
+        }
+        if (t.writeMask !== undefined) {
+          if (typeof t.writeMask !== 'number' || !Number.isFinite(t.writeMask)) return null;
+          mixFastInt(state, 0x314);
+          mixFastNumber(state, t.writeMask);
+        }
+        if (t.blend !== undefined) {
+          if (!isPlainRecordObject(t.blend)) return null;
+          for (const blk in t.blend) {
+            if (!Object.prototype.hasOwnProperty.call(t.blend, blk)) continue;
+            const blv = t.blend[blk];
+            if (blv === undefined || typeof blv === 'function') continue;
+            if (blk !== 'color' && blk !== 'alpha') return null;
+          }
+          mixFastInt(state, 0x315);
+          if (t.blend.color !== undefined) {
+            if (!hashAndValidateBlendComponent(t.blend.color, 0x316, state)) return null;
+          }
+          if (t.blend.alpha !== undefined) {
+            if (!hashAndValidateBlendComponent(t.blend.alpha, 0x317, state)) return null;
+          }
+        }
+      }
+    }
+
+    // Primitive state
+    if (desc.primitive !== undefined) {
+      const p = desc.primitive;
+      if (!isPlainRecordObject(p)) return null;
+      for (const pk in p) {
+        if (!Object.prototype.hasOwnProperty.call(p, pk)) continue;
+        const pv = p[pk];
+        if (pv === undefined || typeof pv === 'function') continue;
+        if (
+          pk !== 'topology' &&
+          pk !== 'stripIndexFormat' &&
+          pk !== 'frontFace' &&
+          pk !== 'cullMode' &&
+          pk !== 'unclippedDepth'
+        ) {
+          return null;
+        }
+      }
+      mixFastInt(state, 0x400);
+      if (p.topology !== undefined) {
+        if (typeof p.topology !== 'string') return null;
+        mixFastInt(state, 0x401);
+        mixFastString(state, p.topology);
+      }
+      if (p.stripIndexFormat !== undefined) {
+        if (typeof p.stripIndexFormat !== 'string') return null;
+        mixFastInt(state, 0x402);
+        mixFastString(state, p.stripIndexFormat);
+      }
+      if (p.frontFace !== undefined) {
+        if (typeof p.frontFace !== 'string') return null;
+        mixFastInt(state, 0x403);
+        mixFastString(state, p.frontFace);
+      }
+      if (p.cullMode !== undefined) {
+        if (typeof p.cullMode !== 'string') return null;
+        mixFastInt(state, 0x404);
+        mixFastString(state, p.cullMode);
+      }
+      if (p.unclippedDepth !== undefined) {
+        if (typeof p.unclippedDepth !== 'boolean') return null;
+        mixFastInt(state, p.unclippedDepth ? 0x405 : 0x406);
+      }
+    }
+
+    // Depth-stencil state
+    if (desc.depthStencil !== undefined) {
+      const ds = desc.depthStencil;
+      if (!isPlainRecordObject(ds)) return null;
+      for (const dk in ds) {
+        if (!Object.prototype.hasOwnProperty.call(ds, dk)) continue;
+        const dv = ds[dk];
+        if (dv === undefined || typeof dv === 'function') continue;
+        if (
+          dk !== 'format' &&
+          dk !== 'depthWriteEnabled' &&
+          dk !== 'depthCompare' &&
+          dk !== 'stencilFront' &&
+          dk !== 'stencilBack' &&
+          dk !== 'stencilReadMask' &&
+          dk !== 'stencilWriteMask' &&
+          dk !== 'depthBias' &&
+          dk !== 'depthBiasSlopeScale' &&
+          dk !== 'depthBiasClamp'
+        ) {
+          return null;
+        }
+      }
+      mixFastInt(state, 0x500);
+      if (ds.format !== undefined) {
+        if (typeof ds.format !== 'string') return null;
+        mixFastInt(state, 0x501);
+        mixFastString(state, ds.format);
+      }
+      if (ds.depthWriteEnabled !== undefined) {
+        if (typeof ds.depthWriteEnabled !== 'boolean') return null;
+        mixFastInt(state, ds.depthWriteEnabled ? 0x502 : 0x503);
+      }
+      if (ds.depthCompare !== undefined) {
+        if (typeof ds.depthCompare !== 'string') return null;
+        mixFastInt(state, 0x504);
+        mixFastString(state, ds.depthCompare);
+      }
+      if (ds.stencilFront !== undefined) {
+        if (!hashAndValidateStencilFace(ds.stencilFront, 0x505, state)) return null;
+      }
+      if (ds.stencilBack !== undefined) {
+        if (!hashAndValidateStencilFace(ds.stencilBack, 0x506, state)) return null;
+      }
+      if (ds.stencilReadMask !== undefined) {
+        if (typeof ds.stencilReadMask !== 'number' || !Number.isFinite(ds.stencilReadMask)) {
+          return null;
+        }
+        mixFastInt(state, 0x507);
+        mixFastNumber(state, ds.stencilReadMask);
+      }
+      if (ds.stencilWriteMask !== undefined) {
+        if (typeof ds.stencilWriteMask !== 'number' || !Number.isFinite(ds.stencilWriteMask)) {
+          return null;
+        }
+        mixFastInt(state, 0x508);
+        mixFastNumber(state, ds.stencilWriteMask);
+      }
+      if (ds.depthBias !== undefined) {
+        if (typeof ds.depthBias !== 'number' || !Number.isFinite(ds.depthBias)) return null;
+        mixFastInt(state, 0x509);
+        mixFastNumber(state, ds.depthBias);
+      }
+      if (ds.depthBiasSlopeScale !== undefined) {
+        if (
+          typeof ds.depthBiasSlopeScale !== 'number' ||
+          !Number.isFinite(ds.depthBiasSlopeScale)
+        ) {
+          return null;
+        }
+        mixFastInt(state, 0x50a);
+        mixFastNumber(state, ds.depthBiasSlopeScale);
+      }
+      if (ds.depthBiasClamp !== undefined) {
+        if (typeof ds.depthBiasClamp !== 'number' || !Number.isFinite(ds.depthBiasClamp)) {
+          return null;
+        }
+        mixFastInt(state, 0x50b);
+        mixFastNumber(state, ds.depthBiasClamp);
+      }
+    }
+
+    // Multisample state
+    if (desc.multisample !== undefined) {
+      const ms = desc.multisample;
+      if (!isPlainRecordObject(ms)) return null;
+      for (const mk in ms) {
+        if (!Object.prototype.hasOwnProperty.call(ms, mk)) continue;
+        const mv = ms[mk];
+        if (mv === undefined || typeof mv === 'function') continue;
+        if (mk !== 'count' && mk !== 'mask' && mk !== 'alphaToCoverageEnabled') return null;
+      }
+      mixFastInt(state, 0x600);
+      if (ms.count !== undefined) {
+        if (typeof ms.count !== 'number' || !Number.isFinite(ms.count)) return null;
+        mixFastInt(state, 0x601);
+        mixFastNumber(state, ms.count);
+      }
+      if (ms.mask !== undefined) {
+        if (typeof ms.mask !== 'number' || !Number.isFinite(ms.mask)) return null;
+        mixFastInt(state, 0x602);
+        mixFastNumber(state, ms.mask);
+      }
+      if (ms.alphaToCoverageEnabled !== undefined) {
+        if (typeof ms.alphaToCoverageEnabled !== 'boolean') return null;
+        mixFastInt(state, ms.alphaToCoverageEnabled ? 0x603 : 0x604);
+      }
+    }
+
+    return finalizeFastHash53(state);
+  }
+
+  /**
+   * Single-pass, zero-allocation, key-order-invariant 53-bit integer hash for standard
+   * `GPUComputePipelineDescriptor` objects.
+   *
+   * @param {unknown} desc
+   * @returns {number | null}
+   */
+  function computeFastComputeIntHash(desc) {
+    if (!isPlainRecordObject(desc)) return null;
+    if (desc.layout === undefined || desc.layout === null) return null;
+    if (desc.compute === undefined || !isPlainRecordObject(desc.compute)) return null;
+
+    for (const k in desc) {
+      if (!Object.prototype.hasOwnProperty.call(desc, k)) continue;
+      const v = desc[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k !== 'layout' && k !== 'label' && k !== 'compute') return null;
+    }
+
+    const layoutFast = resolveGpuHandleFast(desc.layout);
+    if (layoutFast === null) return null;
+
+    const cs = desc.compute;
+    for (const ck in cs) {
+      if (!Object.prototype.hasOwnProperty.call(cs, ck)) continue;
+      const cv = cs[ck];
+      if (cv === undefined || typeof cv === 'function') continue;
+      if (ck !== 'module' && ck !== 'entryPoint') return null;
+    }
+
+    const state = { h1: 0x434f4d50, h2: 0x2468ace0 };
+    mixFastInt(state, 0x701);
+    mixFastGpuHandle(state, layoutFast);
+
+    if (desc.label !== undefined) {
+      if (typeof desc.label !== 'string') return null;
+      mixFastInt(state, 0x702);
+      mixFastString(state, desc.label);
+    }
+    if (cs.module !== undefined) {
+      const csFast = resolveGpuHandleFast(cs.module);
+      if (csFast === null) return null;
+      mixFastInt(state, 0x703);
+      mixFastGpuHandle(state, csFast);
+    }
+    if (cs.entryPoint !== undefined) {
+      if (typeof cs.entryPoint !== 'string') return null;
+      mixFastInt(state, 0x704);
+      mixFastString(state, cs.entryPoint);
+    }
+
+    return finalizeFastHash53(state);
+  }
+
+  /**
+   * Compute a fast 53-bit integer hash for a standard WebGPU render or compute pipeline
+   * descriptor without string serialization, or return `null` when the descriptor requires
+   * canonical hashing.
+   *
+   * @param {unknown} descriptor
+   * @returns {number | null}
+   */
+  function computeFastDescriptorHash(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return null;
+    }
+    if (descriptor.vertex !== undefined) {
+      return computeFastRenderIntHash(descriptor);
+    }
+    if (descriptor.compute !== undefined) {
+      return computeFastComputeIntHash(descriptor);
+    }
+    return null;
+  }
+
+  function captureBlendComponentSnapshot(comp) {
+    if (comp === undefined) return undefined;
+    return {
+      operation: comp.operation,
+      srcFactor: comp.srcFactor,
+      dstFactor: comp.dstFactor,
+    };
+  }
+
+  function matchesBlendComponentSnapshot(comp, snap) {
+    if (snap === undefined) return comp === undefined;
+    if (!comp || typeof comp !== 'object') return false;
+    return (
+      comp.operation === snap.operation &&
+      comp.srcFactor === snap.srcFactor &&
+      comp.dstFactor === snap.dstFactor
+    );
+  }
+
+  function captureStencilFaceSnapshot(face) {
+    if (face === undefined) return undefined;
+    return {
+      compare: face.compare,
+      failOp: face.failOp,
+      depthFailOp: face.depthFailOp,
+      passOp: face.passOp,
+    };
+  }
+
+  function matchesStencilFaceSnapshot(face, snap) {
+    if (snap === undefined) return face === undefined;
+    if (!face || typeof face !== 'object') return false;
+    return (
+      face.compare === snap.compare &&
+      face.failOp === snap.failOp &&
+      face.depthFailOp === snap.depthFailOp &&
+      face.passOp === snap.passOp
+    );
+  }
+
+  function captureRenderSnapshot(desc) {
+    if (!isPlainRecordObject(desc) || !isPlainRecordObject(desc.vertex)) {
+      return null;
+    }
+    const layoutFast =
+      desc.layout !== undefined && desc.layout !== null ? resolveGpuHandleFast(desc.layout) : null;
+    if (desc.layout !== undefined && desc.layout !== null && layoutFast === null) {
+      return null;
+    }
+    const v = desc.vertex;
+    if (v.constants !== undefined) return null;
+    const vsFast =
+      v.module !== undefined && v.module !== null ? resolveGpuHandleFast(v.module) : null;
+    if (v.module !== undefined && v.module !== null && vsFast === null) {
+      return null;
+    }
+
+    let vBuffers = undefined;
+    if (v.buffers !== undefined) {
+      if (!Array.isArray(v.buffers)) return null;
+      vBuffers = new Array(v.buffers.length);
+      for (let i = 0; i < v.buffers.length; i += 1) {
+        const b = v.buffers[i];
+        if (b === null || b === undefined) {
+          vBuffers[i] = b;
+        } else {
+          if (!isPlainRecordObject(b)) return null;
+          let attrs = undefined;
+          if (b.attributes !== undefined) {
+            if (!Array.isArray(b.attributes)) return null;
+            attrs = new Array(b.attributes.length);
+            for (let j = 0; j < b.attributes.length; j += 1) {
+              const a = b.attributes[j];
+              if (!isPlainRecordObject(a)) return null;
+              attrs[j] = {
+                shaderLocation: a.shaderLocation,
+                offset: a.offset,
+                format: a.format,
+              };
+            }
+          }
+          vBuffers[i] = {
+            arrayStride: b.arrayStride,
+            stepMode: b.stepMode,
+            attributes: attrs,
+          };
+        }
+      }
+    }
+
+    let fragmentSnap = undefined;
+    if (desc.fragment !== undefined) {
+      const f = desc.fragment;
+      if (!isPlainRecordObject(f) || f.constants !== undefined) return null;
+      const fsFast =
+        f.module !== undefined && f.module !== null ? resolveGpuHandleFast(f.module) : null;
+      if (f.module !== undefined && f.module !== null && fsFast === null) {
+        return null;
+      }
+      let targetsSnap = undefined;
+      if (f.targets !== undefined) {
+        if (!Array.isArray(f.targets)) return null;
+        targetsSnap = new Array(f.targets.length);
+        for (let i = 0; i < f.targets.length; i += 1) {
+          const t = f.targets[i];
+          if (t === null || t === undefined) {
+            targetsSnap[i] = t;
+          } else {
+            if (!isPlainRecordObject(t)) return null;
+            let blendSnap = undefined;
+            if (t.blend === null) {
+              blendSnap = null;
+            } else if (t.blend !== undefined) {
+              if (!isPlainRecordObject(t.blend)) return null;
+              blendSnap = {
+                color: captureBlendComponentSnapshot(t.blend.color),
+                alpha: captureBlendComponentSnapshot(t.blend.alpha),
+              };
+            }
+            targetsSnap[i] = {
+              format: t.format,
+              writeMask: t.writeMask,
+              blend: blendSnap,
+            };
+          }
+        }
+      }
+      fragmentSnap = {
+        moduleRef: f.module,
+        moduleToken: fsFast ? fsFast.token : null,
+        entryPoint: f.entryPoint,
+        targets: targetsSnap,
+      };
+    }
+
+    let primitiveSnap = undefined;
+    if (desc.primitive !== undefined) {
+      const p = desc.primitive;
+      if (!isPlainRecordObject(p)) return null;
+      primitiveSnap = {
+        topology: p.topology,
+        stripIndexFormat: p.stripIndexFormat,
+        frontFace: p.frontFace,
+        cullMode: p.cullMode,
+        unclippedDepth: p.unclippedDepth,
+      };
+    }
+
+    let dsSnap = undefined;
+    if (desc.depthStencil === null) {
+      dsSnap = null;
+    } else if (desc.depthStencil !== undefined) {
+      const ds = desc.depthStencil;
+      if (!isPlainRecordObject(ds)) return null;
+      dsSnap = {
+        format: ds.format,
+        depthWriteEnabled: ds.depthWriteEnabled,
+        depthCompare: ds.depthCompare,
+        stencilFront: captureStencilFaceSnapshot(ds.stencilFront),
+        stencilBack: captureStencilFaceSnapshot(ds.stencilBack),
+        stencilReadMask: ds.stencilReadMask,
+        stencilWriteMask: ds.stencilWriteMask,
+        depthBias: ds.depthBias,
+        depthBiasSlopeScale: ds.depthBiasSlopeScale,
+        depthBiasClamp: ds.depthBiasClamp,
+      };
+    }
+
+    let msSnap = undefined;
+    if (desc.multisample !== undefined) {
+      const ms = desc.multisample;
+      if (!isPlainRecordObject(ms)) return null;
+      msSnap = {
+        count: ms.count,
+        mask: ms.mask,
+        alphaToCoverageEnabled: ms.alphaToCoverageEnabled,
+      };
+    }
+
+    return {
+      layoutRef: desc.layout,
+      layoutToken: layoutFast ? layoutFast.token : null,
+      label: desc.label,
+      fallbackProfile: desc.fallbackProfile,
+      vertexStride: desc.vertexStride,
+      vertex: {
+        moduleRef: v.module,
+        moduleToken: vsFast ? vsFast.token : null,
+        entryPoint: v.entryPoint,
+        buffers: vBuffers,
+      },
+      fragment: fragmentSnap,
+      primitive: primitiveSnap,
+      depthStencil: dsSnap,
+      multisample: msSnap,
+    };
+  }
+
+  function matchesRenderSnapshot(desc, snap) {
+    if (!desc || typeof desc !== 'object') return false;
+    if (
+      desc.label !== snap.label ||
+      desc.fallbackProfile !== snap.fallbackProfile ||
+      desc.vertexStride !== snap.vertexStride
+    ) {
+      return false;
+    }
+    if (snap.layoutToken === null) {
+      if (desc.layout !== snap.layoutRef) return false;
+    } else if (!gpuHandlesMatch(desc.layout, snap.layoutRef, snap.layoutToken)) {
+      return false;
+    }
+
+    // Vertex
+    const v = desc.vertex;
+    if (!v || typeof v !== 'object' || v.constants !== undefined) return false;
+    const sv = snap.vertex;
+    if (v.entryPoint !== sv.entryPoint) return false;
+    if (sv.moduleToken === null) {
+      if (v.module !== sv.moduleRef) return false;
+    } else if (!gpuHandlesMatch(v.module, sv.moduleRef, sv.moduleToken)) {
+      return false;
+    }
+    if (sv.buffers === undefined) {
+      if (v.buffers !== undefined) return false;
+    } else {
+      const bufs = v.buffers;
+      const sbufs = sv.buffers;
+      if (!Array.isArray(bufs) || bufs.length !== sbufs.length) return false;
+      for (let i = 0; i < sbufs.length; i += 1) {
+        const b = bufs[i];
+        const sb = sbufs[i];
+        if (sb === null || sb === undefined) {
+          if (b !== sb) return false;
+          continue;
+        }
+        if (!b || typeof b !== 'object') return false;
+        if (b.arrayStride !== sb.arrayStride || b.stepMode !== sb.stepMode) return false;
+        if (sb.attributes === undefined) {
+          if (b.attributes !== undefined) return false;
+        } else {
+          const attrs = b.attributes;
+          const sattrs = sb.attributes;
+          if (!Array.isArray(attrs) || attrs.length !== sattrs.length) return false;
+          for (let j = 0; j < sattrs.length; j += 1) {
+            const a = attrs[j];
+            const sa = sattrs[j];
+            if (
+              !a ||
+              typeof a !== 'object' ||
+              a.shaderLocation !== sa.shaderLocation ||
+              a.offset !== sa.offset ||
+              a.format !== sa.format
+            ) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    // Fragment
+    const sf = snap.fragment;
+    if (sf === undefined) {
+      if (desc.fragment !== undefined) return false;
+    } else {
+      const f = desc.fragment;
+      if (!f || typeof f !== 'object' || f.constants !== undefined) return false;
+      if (f.entryPoint !== sf.entryPoint) return false;
+      if (sf.moduleToken === null) {
+        if (f.module !== sf.moduleRef) return false;
+      } else if (!gpuHandlesMatch(f.module, sf.moduleRef, sf.moduleToken)) {
+        return false;
+      }
+      if (sf.targets === undefined) {
+        if (f.targets !== undefined) return false;
+      } else {
+        const targets = f.targets;
+        const stargets = sf.targets;
+        if (!Array.isArray(targets) || targets.length !== stargets.length) return false;
+        for (let i = 0; i < stargets.length; i += 1) {
+          const t = targets[i];
+          const st = stargets[i];
+          if (st === null || st === undefined) {
+            if (t !== st) return false;
+            continue;
+          }
+          if (!t || typeof t !== 'object') return false;
+          if (t.format !== st.format || t.writeMask !== st.writeMask) return false;
+          if (st.blend === undefined || st.blend === null) {
+            if (t.blend !== st.blend) return false;
+          } else {
+            if (!t.blend || typeof t.blend !== 'object') return false;
+            if (
+              !matchesBlendComponentSnapshot(t.blend.color, st.blend.color) ||
+              !matchesBlendComponentSnapshot(t.blend.alpha, st.blend.alpha)
+            ) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    // Primitive
+    const sp = snap.primitive;
+    if (sp === undefined) {
+      if (desc.primitive !== undefined) return false;
+    } else {
+      const p = desc.primitive;
+      if (
+        !p ||
+        typeof p !== 'object' ||
+        p.topology !== sp.topology ||
+        p.stripIndexFormat !== sp.stripIndexFormat ||
+        p.frontFace !== sp.frontFace ||
+        p.cullMode !== sp.cullMode ||
+        p.unclippedDepth !== sp.unclippedDepth
+      ) {
+        return false;
+      }
+    }
+
+    // Depth-stencil
+    const sds = snap.depthStencil;
+    if (sds === undefined || sds === null) {
+      if (desc.depthStencil !== sds) return false;
+    } else {
+      const ds = desc.depthStencil;
+      if (
+        !ds ||
+        typeof ds !== 'object' ||
+        ds.format !== sds.format ||
+        ds.depthWriteEnabled !== sds.depthWriteEnabled ||
+        ds.depthCompare !== sds.depthCompare ||
+        ds.stencilReadMask !== sds.stencilReadMask ||
+        ds.stencilWriteMask !== sds.stencilWriteMask ||
+        ds.depthBias !== sds.depthBias ||
+        ds.depthBiasSlopeScale !== sds.depthBiasSlopeScale ||
+        ds.depthBiasClamp !== sds.depthBiasClamp ||
+        !matchesStencilFaceSnapshot(ds.stencilFront, sds.stencilFront) ||
+        !matchesStencilFaceSnapshot(ds.stencilBack, sds.stencilBack)
+      ) {
+        return false;
+      }
+    }
+
+    // Multisample
+    const sms = snap.multisample;
+    if (sms === undefined) {
+      if (desc.multisample !== undefined) return false;
+    } else {
+      const ms = desc.multisample;
+      if (
+        !ms ||
+        typeof ms !== 'object' ||
+        ms.count !== sms.count ||
+        ms.mask !== sms.mask ||
+        ms.alphaToCoverageEnabled !== sms.alphaToCoverageEnabled
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function captureComputeSnapshot(desc) {
+    if (!isPlainRecordObject(desc) || !isPlainRecordObject(desc.compute)) {
+      return null;
+    }
+    const layoutFast =
+      desc.layout !== undefined && desc.layout !== null ? resolveGpuHandleFast(desc.layout) : null;
+    if (desc.layout !== undefined && desc.layout !== null && layoutFast === null) {
+      return null;
+    }
+    const cs = desc.compute;
+    if (cs.constants !== undefined) return null;
+    const csFast =
+      cs.module !== undefined && cs.module !== null ? resolveGpuHandleFast(cs.module) : null;
+    if (cs.module !== undefined && cs.module !== null && csFast === null) {
+      return null;
+    }
+    return {
+      layoutRef: desc.layout,
+      layoutToken: layoutFast ? layoutFast.token : null,
+      label: desc.label,
+      moduleRef: cs.module,
+      moduleToken: csFast ? csFast.token : null,
+      entryPoint: cs.entryPoint,
+    };
+  }
+
+  function matchesComputeSnapshot(desc, snap) {
+    if (!desc || typeof desc !== 'object') return false;
+    if (desc.label !== snap.label) return false;
+    if (snap.layoutToken === null) {
+      if (desc.layout !== snap.layoutRef) return false;
+    } else if (!gpuHandlesMatch(desc.layout, snap.layoutRef, snap.layoutToken)) {
+      return false;
+    }
+    const cs = desc.compute;
+    if (!cs || typeof cs !== 'object' || cs.constants !== undefined) return false;
+    if (cs.entryPoint !== snap.entryPoint) return false;
+    if (snap.moduleToken === null) {
+      if (cs.module !== snap.moduleRef) return false;
+    } else if (!gpuHandlesMatch(cs.module, snap.moduleRef, snap.moduleToken)) {
+      return false;
+    }
+    return true;
   }
 
   function normalizeVisibility(visibility) {
@@ -3025,6 +4077,12 @@
           : DEFAULT_MAX_BIND_GROUP_LAYOUTS,
         'maxBindGroupLayouts'
       );
+      this._maxFastLookupEntries = validatePositiveInt(
+        options.maxFastLookupEntries !== undefined
+          ? options.maxFastLookupEntries
+          : DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
+        'maxFastLookupEntries'
+      );
       this._maxErrorHistory = validatePositiveInt(
         options.maxErrorHistory !== undefined
           ? options.maxErrorHistory
@@ -3091,6 +4149,12 @@
       this._renderPipelines = new Map();
       this._computePipelines = new Map();
       this._bindGroupLayouts = new Map();
+      this._fastRenderLookup = new Map();
+      this._fastComputeLookup = new Map();
+      this._fastRenderIntHash = new Map();
+      this._fastComputeIntHash = new Map();
+      this._renderDescriptorMemo = new WeakMap();
+      this._computeDescriptorMemo = new WeakMap();
       this._fallbackPipelineLayouts = new Map();
       this._defaultSamplers = new Map();
       this._inFlightRender = new Map();
@@ -3112,6 +4176,8 @@
         inlineSamplerLayouts: 0,
         samplerHits: 0,
         samplerMisses: 0,
+        fastLookupHits: 0,
+        fastLookupMisses: 0,
         inFlightDedupes: 0,
         evictions: 0,
         compileCount: 0,
@@ -3260,7 +4326,7 @@
         throw emptyErr;
       }
 
-      registeredObjectIds.set(sampler, key);
+      setRegisteredObjectId(sampler, key);
       this._defaultSamplers.set(canonical, sampler);
       this._stats.fallbackSamplersCreated += 1;
       return sampler;
@@ -3416,7 +4482,7 @@
           bindGroupLayouts,
         });
         if (layout && (typeof layout === 'object' || typeof layout === 'function')) {
-          registeredObjectIds.set(layout, `fallback-pl:${canonical}`);
+          setRegisteredObjectId(layout, `fallback-pl:${canonical}`);
           fallbackPipelineLayoutProfiles.set(layout, canonical);
           this._fallbackPipelineLayouts.set(canonical, layout);
           return layout;
@@ -3500,19 +4566,285 @@
 
     _setLru(map, key, value, compileMs, maxSize) {
       const ts = this._now();
-      if (map.has(key)) {
+      const prev = map.get(key);
+      if (prev !== undefined) {
+        prev.alive = false;
         map.delete(key);
       }
-      map.set(key, {
+      const entry = {
         value,
         createdAt: ts,
         lastAccessedAt: ts,
         compileMs,
-      });
+        alive: true,
+      };
+      map.set(key, entry);
       while (map.size > maxSize) {
         const oldestKey = map.keys().next().value;
+        const evicted = map.get(oldestKey);
+        if (evicted !== undefined) {
+          evicted.alive = false;
+        }
         map.delete(oldestKey);
         this._stats.evictions += 1;
+      }
+      return entry;
+    }
+
+    _invalidateFastLookups() {
+      this._fastRenderLookup.clear();
+      this._fastComputeLookup.clear();
+      this._fastRenderIntHash.clear();
+      this._fastComputeIntHash.clear();
+      this._renderDescriptorMemo = new WeakMap();
+      this._computeDescriptorMemo = new WeakMap();
+    }
+
+    _isValidFastKey(fastKey) {
+      if (typeof fastKey === 'string') {
+        return fastKey.length > 0;
+      }
+      if (typeof fastKey === 'number') {
+        return Number.isFinite(fastKey);
+      }
+      return typeof fastKey === 'bigint';
+    }
+
+    _touchBackingLru(lruMap, canonicalKey, entry) {
+      entry.lastAccessedAt = this._now();
+      lruMap.delete(canonicalKey);
+      lruMap.set(canonicalKey, entry);
+    }
+
+    _setFastLookup(map, fastKey, canonicalKey, entry) {
+      if (!entry || !entry.alive || !this._isValidFastKey(fastKey)) {
+        return;
+      }
+      const normalizedKey = typeof fastKey === 'number' && fastKey === 0 ? 0 : fastKey;
+      if (map.has(normalizedKey)) {
+        map.delete(normalizedKey);
+      }
+      map.set(normalizedKey, {
+        canonicalKey,
+        entry,
+        generation: this._generation,
+      });
+      while (map.size > this._maxFastLookupEntries) {
+        const oldestKey = map.keys().next().value;
+        map.delete(oldestKey);
+      }
+    }
+
+    _getFastLookup(map, lruMap, fastKey) {
+      const normalizedKey = typeof fastKey === 'number' && fastKey === 0 ? 0 : fastKey;
+      const rec = map.get(normalizedKey);
+      if (rec === undefined) {
+        return undefined;
+      }
+      if (rec.generation !== this._generation || !rec.entry.alive) {
+        map.delete(normalizedKey);
+        return undefined;
+      }
+      map.delete(normalizedKey);
+      map.set(normalizedKey, rec);
+      this._touchBackingLru(lruMap, rec.canonicalKey, rec.entry);
+      return rec.entry.value;
+    }
+
+    _setFastIntHash(map, intHash, canonicalKey, entry, snapshot) {
+      if (intHash === null || !entry || !entry.alive || !snapshot) {
+        return;
+      }
+      if (map.has(intHash)) {
+        map.delete(intHash);
+      }
+      map.set(intHash, {
+        canonicalKey,
+        entry,
+        generation: this._generation,
+        regVer: shaderModuleRegistryVersion,
+        snapshot,
+      });
+      while (map.size > this._maxFastLookupEntries) {
+        const oldestKey = map.keys().next().value;
+        map.delete(oldestKey);
+      }
+    }
+
+    _tryFastRenderLookupByDescriptor(descriptor) {
+      if (!descriptor || typeof descriptor !== 'object') {
+        return undefined;
+      }
+      const memo = this._renderDescriptorMemo.get(descriptor);
+      if (memo !== undefined) {
+        if (
+          memo.generation === this._generation &&
+          memo.entry.alive &&
+          memo.regVer === shaderModuleRegistryVersion &&
+          matchesRenderSnapshot(descriptor, memo.snapshot)
+        ) {
+          this._touchBackingLru(this._renderPipelines, memo.canonicalKey, memo.entry);
+          return memo.entry.value;
+        }
+        this._renderDescriptorMemo.delete(descriptor);
+      }
+
+      if (this._fastRenderIntHash.size === 0) {
+        return undefined;
+      }
+      const intHash = computeFastRenderIntHash(descriptor);
+      if (intHash === null) {
+        return undefined;
+      }
+      const rec = this._fastRenderIntHash.get(intHash);
+      if (rec === undefined) {
+        return undefined;
+      }
+      if (
+        rec.generation !== this._generation ||
+        !rec.entry.alive ||
+        rec.regVer !== shaderModuleRegistryVersion
+      ) {
+        this._fastRenderIntHash.delete(intHash);
+        return undefined;
+      }
+      if (!matchesRenderSnapshot(descriptor, rec.snapshot)) {
+        return undefined;
+      }
+      this._fastRenderIntHash.delete(intHash);
+      this._fastRenderIntHash.set(intHash, rec);
+      this._touchBackingLru(this._renderPipelines, rec.canonicalKey, rec.entry);
+      this._renderDescriptorMemo.set(descriptor, rec);
+      return rec.entry.value;
+    }
+
+    _tryFastComputeLookupByDescriptor(descriptor) {
+      if (!descriptor || typeof descriptor !== 'object') {
+        return undefined;
+      }
+      const memo = this._computeDescriptorMemo.get(descriptor);
+      if (memo !== undefined) {
+        if (
+          memo.generation === this._generation &&
+          memo.entry.alive &&
+          memo.regVer === shaderModuleRegistryVersion &&
+          matchesComputeSnapshot(descriptor, memo.snapshot)
+        ) {
+          this._touchBackingLru(this._computePipelines, memo.canonicalKey, memo.entry);
+          return memo.entry.value;
+        }
+        this._computeDescriptorMemo.delete(descriptor);
+      }
+
+      if (this._fastComputeIntHash.size === 0) {
+        return undefined;
+      }
+      const intHash = computeFastComputeIntHash(descriptor);
+      if (intHash === null) {
+        return undefined;
+      }
+      const rec = this._fastComputeIntHash.get(intHash);
+      if (rec === undefined) {
+        return undefined;
+      }
+      if (
+        rec.generation !== this._generation ||
+        !rec.entry.alive ||
+        rec.regVer !== shaderModuleRegistryVersion
+      ) {
+        this._fastComputeIntHash.delete(intHash);
+        return undefined;
+      }
+      if (!matchesComputeSnapshot(descriptor, rec.snapshot)) {
+        return undefined;
+      }
+      this._fastComputeIntHash.delete(intHash);
+      this._fastComputeIntHash.set(intHash, rec);
+      this._touchBackingLru(this._computePipelines, rec.canonicalKey, rec.entry);
+      this._computeDescriptorMemo.set(descriptor, rec);
+      return rec.entry.value;
+    }
+
+    _populateFastRenderEntry(rawDescriptor, norm, canonicalKey, keyHint, opts, entry) {
+      if (!entry || !entry.alive) {
+        return;
+      }
+      this._setFastLookup(this._fastRenderLookup, canonicalKey, canonicalKey, entry);
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        this._setFastLookup(this._fastRenderLookup, keyHint, canonicalKey, entry);
+      }
+      const hasCustomOpts = Boolean(opts && hasEnumerableDataKeys(opts));
+      if ((keyHint === undefined || keyHint === null) && !hasCustomOpts && rawDescriptor) {
+        if (isFastRenderDescriptor(rawDescriptor)) {
+          const snapshot = captureRenderSnapshot(rawDescriptor);
+          if (snapshot !== null) {
+            const memoRec = {
+              canonicalKey,
+              entry,
+              generation: this._generation,
+              regVer: shaderModuleRegistryVersion,
+              snapshot,
+            };
+            this._renderDescriptorMemo.set(rawDescriptor, memoRec);
+            if (!norm.normalized && norm.fallbackProfile === null) {
+              const intHash = computeFastRenderIntHash(rawDescriptor);
+              if (intHash !== null) {
+                this._setFastIntHash(
+                  this._fastRenderIntHash,
+                  intHash,
+                  canonicalKey,
+                  entry,
+                  snapshot
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
+    _populateFastComputeEntry(rawDescriptor, norm, canonicalKey, keyHint, entry) {
+      if (!entry || !entry.alive) {
+        return;
+      }
+      this._setFastLookup(this._fastComputeLookup, canonicalKey, canonicalKey, entry);
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        this._setFastLookup(this._fastComputeLookup, keyHint, canonicalKey, entry);
+      }
+      if ((keyHint === undefined || keyHint === null) && rawDescriptor) {
+        if (isFastComputeDescriptor(rawDescriptor)) {
+          const snapshot = captureComputeSnapshot(rawDescriptor);
+          if (snapshot !== null) {
+            const memoRec = {
+              canonicalKey,
+              entry,
+              generation: this._generation,
+              regVer: shaderModuleRegistryVersion,
+              snapshot,
+            };
+            this._computeDescriptorMemo.set(rawDescriptor, memoRec);
+            if (!norm.normalized) {
+              const intHash = computeFastComputeIntHash(rawDescriptor);
+              if (intHash !== null) {
+                this._setFastIntHash(
+                  this._fastComputeIntHash,
+                  intHash,
+                  canonicalKey,
+                  entry,
+                  snapshot
+                );
+              }
+            }
+          }
+        }
       }
     }
 
@@ -3761,6 +5093,7 @@
         this._computePipelines.clear();
         this._inFlightRender.clear();
         this._inFlightCompute.clear();
+        this._invalidateFastLookups();
       }
 
       if (opts.resetStats === true) {
@@ -3805,7 +5138,7 @@
       }
 
       if (layout && (typeof layout === 'object' || typeof layout === 'function')) {
-        registeredObjectIds.set(layout, `bgl:${key}`);
+        setRegisteredObjectId(layout, `bgl:${key}`);
       }
       this._setLru(this._bindGroupLayouts, key, layout, compileMs, this._maxBindGroupLayouts);
       return layout;
@@ -3889,6 +5222,64 @@
     }
 
     /**
+     * Fast-path O(1) lookup for an already-compiled `GPURenderPipeline` by numeric/bigint/string
+     * `fastKey` / `psoId` or by descriptor object (via WeakMap memoization + 53-bit integer hash),
+     * avoiding full descriptor normalization and canonical string/JSON serialization on the hot
+     * per-frame draw loop.
+     *
+     * When called with `(fastKey, descriptor, options)`, a fast-path miss automatically falls back
+     * to compiling/fetching via `descriptor` and binds `fastKey` for subsequent O(1) hits.
+     * When called with a single argument `(fastKey)` or `(descriptor)`, a miss returns `null`
+     * without triggering synchronous compilation.
+     *
+     * @param {number | bigint | string | GPURenderPipelineDescriptor} fastKeyOrDescriptor
+     * @param {GPURenderPipelineDescriptor} [descriptor]
+     * @param {object} [options]
+     * @returns {GPURenderPipeline | null}
+     */
+    getFastRenderPipeline(fastKeyOrDescriptor, descriptor, options) {
+      if (
+        typeof fastKeyOrDescriptor === 'string' ||
+        typeof fastKeyOrDescriptor === 'number' ||
+        typeof fastKeyOrDescriptor === 'bigint'
+      ) {
+        if (!this._isValidFastKey(fastKeyOrDescriptor)) {
+          this._stats.fastLookupMisses += 1;
+          return null;
+        }
+        const hit = this._getFastLookup(
+          this._fastRenderLookup,
+          this._renderPipelines,
+          fastKeyOrDescriptor
+        );
+        if (hit !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return hit;
+        }
+        this._stats.fastLookupMisses += 1;
+        if (descriptor && typeof descriptor === 'object') {
+          return this._getOrCreateRenderPipelineSlow(descriptor, fastKeyOrDescriptor, options);
+        }
+        return null;
+      }
+
+      if (fastKeyOrDescriptor && typeof fastKeyOrDescriptor === 'object') {
+        const hit = this._tryFastRenderLookupByDescriptor(fastKeyOrDescriptor);
+        if (hit !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return hit;
+        }
+        this._stats.fastLookupMisses += 1;
+        return null;
+      }
+
+      this._stats.fastLookupMisses += 1;
+      return null;
+    }
+
+    /**
      * Synchronously return a cached `GPURenderPipeline` or compile via `device.createRenderPipeline`.
      * Automatically normalizes missing layouts, malformed vertex buffers, and G34 fallback profiles
      * while leaving already-valid non-fallback descriptors untouched.
@@ -3911,9 +5302,54 @@
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
+        if (!this._isValidFastKey(keyHint)) {
+          this._resolveKey(null, keyHint);
+        }
+        const fastCached = this._getFastLookup(
+          this._fastRenderLookup,
+          this._renderPipelines,
+          keyHint
+        );
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return fastCached;
+        }
+        this._stats.fastLookupMisses += 1;
+      } else if (
+        (keyHint === undefined || keyHint === null) &&
+        (!options || typeof options !== 'object' || !hasEnumerableDataKeys(options))
+      ) {
+        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor);
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return fastCached;
+        }
+        this._stats.fastLookupMisses += 1;
+      } else {
+        this._stats.fastLookupMisses += 1;
+      }
+
+      return this._getOrCreateRenderPipelineSlow(descriptor, keyHint, options);
+    }
+
+    _getOrCreateRenderPipelineSlow(descriptor, keyHint, options) {
+      if (typeof this._device.createRenderPipeline !== 'function') {
+        throw new TypeError('device must provide a createRenderPipeline(descriptor) method');
+      }
+
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
         const hintKey = this._resolveKey(null, keyHint);
         const hintCached = this._getLru(this._renderPipelines, hintKey);
         if (hintCached !== undefined) {
+          const lruEntry = this._renderPipelines.get(hintKey);
+          this._setFastLookup(this._fastRenderLookup, hintKey, hintKey, lruEntry);
+          this._setFastLookup(this._fastRenderLookup, keyHint, hintKey, lruEntry);
           this._stats.renderHits += 1;
           return hintCached;
         }
@@ -3929,6 +5365,14 @@
       const key = this._resolveKey(effectiveDescriptor, keyHint);
       const cached = this._getLru(this._renderPipelines, key);
       if (cached !== undefined) {
+        this._populateFastRenderEntry(
+          descriptor,
+          norm,
+          key,
+          keyHint,
+          opts,
+          this._renderPipelines.get(key)
+        );
         this._stats.renderHits += 1;
         return cached;
       }
@@ -4061,7 +5505,14 @@
       this._recordCompileTiming(compileMs);
       this._recordRenderVariantStats(effectiveDescriptor);
 
-      this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
+      const lruEntry = this._setLru(
+        this._renderPipelines,
+        key,
+        pipeline,
+        compileMs,
+        this._maxRenderPipelines
+      );
+      this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
       return pipeline;
     }
 
@@ -4087,6 +5538,25 @@
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
+        if (!this._isValidFastKey(keyHint)) {
+          try {
+            this._resolveKey(null, keyHint);
+          } catch (err) {
+            return Promise.reject(err);
+          }
+        }
+        const fastCached = this._getFastLookup(
+          this._fastRenderLookup,
+          this._renderPipelines,
+          keyHint
+        );
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return Promise.resolve(fastCached);
+        }
+        this._stats.fastLookupMisses += 1;
+
         let hintKey;
         try {
           hintKey = this._resolveKey(null, keyHint);
@@ -4095,6 +5565,9 @@
         }
         const hintCached = this._getLru(this._renderPipelines, hintKey);
         if (hintCached !== undefined) {
+          const lruEntry = this._renderPipelines.get(hintKey);
+          this._setFastLookup(this._fastRenderLookup, hintKey, hintKey, lruEntry);
+          this._setFastLookup(this._fastRenderLookup, keyHint, hintKey, lruEntry);
           this._stats.renderHits += 1;
           return Promise.resolve(hintCached);
         }
@@ -4106,6 +5579,19 @@
         if (this._hitQuarantine(hintKey, 'render')) {
           return Promise.resolve(null);
         }
+      } else if (
+        (keyHint === undefined || keyHint === null) &&
+        (!options || typeof options !== 'object' || !hasEnumerableDataKeys(options))
+      ) {
+        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor);
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.renderHits += 1;
+          return Promise.resolve(fastCached);
+        }
+        this._stats.fastLookupMisses += 1;
+      } else {
+        this._stats.fastLookupMisses += 1;
       }
 
       const opts = options && typeof options === 'object' ? options : null;
@@ -4121,6 +5607,14 @@
       const effectiveDescriptor = norm.descriptor;
       const cached = this._getLru(this._renderPipelines, key);
       if (cached !== undefined) {
+        this._populateFastRenderEntry(
+          descriptor,
+          norm,
+          key,
+          keyHint,
+          opts,
+          this._renderPipelines.get(key)
+        );
         this._stats.renderHits += 1;
         return Promise.resolve(cached);
       }
@@ -4225,7 +5719,14 @@
           const compileMs = Math.max(0, this._now() - t0);
           this._recordCompileTiming(compileMs);
           this._recordRenderVariantStats(effectiveDescriptor);
-          this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
+          const lruEntry = this._setLru(
+            this._renderPipelines,
+            key,
+            pipeline,
+            compileMs,
+            this._maxRenderPipelines
+          );
+          this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
           return Promise.resolve(pipeline);
         } catch (err) {
           return Promise.reject(err);
@@ -4262,7 +5763,14 @@
         this._recordCompileTiming(compileMs);
         if (generation === this._generation) {
           this._recordRenderVariantStats(effectiveDescriptor);
-          this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
+          const lruEntry = this._setLru(
+            this._renderPipelines,
+            key,
+            pipeline,
+            compileMs,
+            this._maxRenderPipelines
+          );
+          this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
         }
         return pipeline;
       };
@@ -4398,6 +5906,56 @@
     }
 
     /**
+     * Fast-path O(1) lookup for an already-compiled `GPUComputePipeline` by numeric/bigint/string
+     * `fastKey` / `psoId` or by descriptor object (via WeakMap memoization + 53-bit integer hash).
+     *
+     * @param {number | bigint | string | GPUComputePipelineDescriptor} fastKeyOrDescriptor
+     * @param {GPUComputePipelineDescriptor} [descriptor]
+     * @returns {GPUComputePipeline | null}
+     */
+    getFastComputePipeline(fastKeyOrDescriptor, descriptor) {
+      if (
+        typeof fastKeyOrDescriptor === 'string' ||
+        typeof fastKeyOrDescriptor === 'number' ||
+        typeof fastKeyOrDescriptor === 'bigint'
+      ) {
+        if (!this._isValidFastKey(fastKeyOrDescriptor)) {
+          this._stats.fastLookupMisses += 1;
+          return null;
+        }
+        const hit = this._getFastLookup(
+          this._fastComputeLookup,
+          this._computePipelines,
+          fastKeyOrDescriptor
+        );
+        if (hit !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return hit;
+        }
+        this._stats.fastLookupMisses += 1;
+        if (descriptor && typeof descriptor === 'object') {
+          return this._getOrCreateComputePipelineSlow(descriptor, fastKeyOrDescriptor);
+        }
+        return null;
+      }
+
+      if (fastKeyOrDescriptor && typeof fastKeyOrDescriptor === 'object') {
+        const hit = this._tryFastComputeLookupByDescriptor(fastKeyOrDescriptor);
+        if (hit !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return hit;
+        }
+        this._stats.fastLookupMisses += 1;
+        return null;
+      }
+
+      this._stats.fastLookupMisses += 1;
+      return null;
+    }
+
+    /**
      * Synchronously return a cached `GPUComputePipeline` or compile via `device.createComputePipeline`.
      *
      * @param {GPUComputePipelineDescriptor} descriptor
@@ -4417,9 +5975,51 @@
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
+        if (!this._isValidFastKey(keyHint)) {
+          this._resolveKey(null, keyHint);
+        }
+        const fastCached = this._getFastLookup(
+          this._fastComputeLookup,
+          this._computePipelines,
+          keyHint
+        );
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return fastCached;
+        }
+        this._stats.fastLookupMisses += 1;
+      } else if (keyHint === undefined || keyHint === null) {
+        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor);
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return fastCached;
+        }
+        this._stats.fastLookupMisses += 1;
+      } else {
+        this._stats.fastLookupMisses += 1;
+      }
+
+      return this._getOrCreateComputePipelineSlow(descriptor, keyHint);
+    }
+
+    _getOrCreateComputePipelineSlow(descriptor, keyHint) {
+      if (typeof this._device.createComputePipeline !== 'function') {
+        throw new TypeError('device must provide a createComputePipeline(descriptor) method');
+      }
+
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
         const hintKey = this._resolveKey(null, keyHint);
         const hintCached = this._getLru(this._computePipelines, hintKey);
         if (hintCached !== undefined) {
+          const lruEntry = this._computePipelines.get(hintKey);
+          this._setFastLookup(this._fastComputeLookup, hintKey, hintKey, lruEntry);
+          this._setFastLookup(this._fastComputeLookup, keyHint, hintKey, lruEntry);
           this._stats.computeHits += 1;
           return hintCached;
         }
@@ -4434,6 +6034,13 @@
       const key = this._resolveKey(effectiveDescriptor, keyHint);
       const cached = this._getLru(this._computePipelines, key);
       if (cached !== undefined) {
+        this._populateFastComputeEntry(
+          descriptor,
+          norm,
+          key,
+          keyHint,
+          this._computePipelines.get(key)
+        );
         this._stats.computeHits += 1;
         return cached;
       }
@@ -4463,7 +6070,14 @@
       const compileMs = Math.max(0, this._now() - t0);
       this._recordCompileTiming(compileMs);
 
-      this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
+      const lruEntry = this._setLru(
+        this._computePipelines,
+        key,
+        pipeline,
+        compileMs,
+        this._maxComputePipelines
+      );
+      this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
       return pipeline;
     }
 
@@ -4488,6 +6102,25 @@
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
+        if (!this._isValidFastKey(keyHint)) {
+          try {
+            this._resolveKey(null, keyHint);
+          } catch (err) {
+            return Promise.reject(err);
+          }
+        }
+        const fastCached = this._getFastLookup(
+          this._fastComputeLookup,
+          this._computePipelines,
+          keyHint
+        );
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return Promise.resolve(fastCached);
+        }
+        this._stats.fastLookupMisses += 1;
+
         let hintKey;
         try {
           hintKey = this._resolveKey(null, keyHint);
@@ -4496,6 +6129,9 @@
         }
         const hintCached = this._getLru(this._computePipelines, hintKey);
         if (hintCached !== undefined) {
+          const lruEntry = this._computePipelines.get(hintKey);
+          this._setFastLookup(this._fastComputeLookup, hintKey, hintKey, lruEntry);
+          this._setFastLookup(this._fastComputeLookup, keyHint, hintKey, lruEntry);
           this._stats.computeHits += 1;
           return Promise.resolve(hintCached);
         }
@@ -4507,6 +6143,16 @@
         if (this._hitQuarantine(hintKey, 'compute')) {
           return Promise.resolve(null);
         }
+      } else if (keyHint === undefined || keyHint === null) {
+        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor);
+        if (fastCached !== undefined) {
+          this._stats.fastLookupHits += 1;
+          this._stats.computeHits += 1;
+          return Promise.resolve(fastCached);
+        }
+        this._stats.fastLookupMisses += 1;
+      } else {
+        this._stats.fastLookupMisses += 1;
       }
 
       let norm;
@@ -4521,6 +6167,13 @@
       const effectiveDescriptor = norm.descriptor;
       const cached = this._getLru(this._computePipelines, key);
       if (cached !== undefined) {
+        this._populateFastComputeEntry(
+          descriptor,
+          norm,
+          key,
+          keyHint,
+          this._computePipelines.get(key)
+        );
         this._stats.computeHits += 1;
         return Promise.resolve(cached);
       }
@@ -4558,7 +6211,14 @@
           }
           const compileMs = Math.max(0, this._now() - t0);
           this._recordCompileTiming(compileMs);
-          this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
+          const lruEntry = this._setLru(
+            this._computePipelines,
+            key,
+            pipeline,
+            compileMs,
+            this._maxComputePipelines
+          );
+          this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
           return Promise.resolve(pipeline);
         } catch (err) {
           this._recordPipelineError('compute', err, { key });
@@ -4597,7 +6257,14 @@
           const compileMs = Math.max(0, this._now() - t0);
           this._recordCompileTiming(compileMs);
           if (generation === this._generation) {
-            this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
+            const lruEntry = this._setLru(
+              this._computePipelines,
+              key,
+              pipeline,
+              compileMs,
+              this._maxComputePipelines
+            );
+            this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
           }
           return pipeline;
         },
@@ -4641,9 +6308,10 @@
           const desc = isDescriptorWrapper(item) ? item.descriptor : item;
           const keyHint = isDescriptorWrapper(item) ? item.keyHint : undefined;
           const itemOpts = isDescriptorWrapper(item) ? item.options : undefined;
-          const effectiveDesc = isRender
-            ? this.normalizeRenderDescriptor(desc, itemOpts).descriptor
-            : normalizeComputePipelineDescriptor(desc).descriptor;
+          const norm = isRender
+            ? this.normalizeRenderDescriptor(desc, itemOpts)
+            : normalizeComputePipelineDescriptor(desc);
+          const effectiveDesc = norm.descriptor;
           const key = this._resolveKey(effectiveDesc, keyHint);
           const wasCached = cacheMap.has(key);
           const wasInFlight = !wasCached && inFlightMap.has(key);
@@ -4652,6 +6320,16 @@
           const pipeline = isRender
             ? await getterAsync.call(this, desc, key, itemOpts)
             : await getterAsync.call(this, desc, key);
+          if (pipeline && keyHint === undefined) {
+            const entry = cacheMap.get(key);
+            if (entry !== undefined) {
+              if (isRender) {
+                this._populateFastRenderEntry(desc, norm, key, undefined, itemOpts || null, entry);
+              } else {
+                this._populateFastComputeEntry(desc, norm, key, undefined, entry);
+              }
+            }
+          }
           pipelines[idx] = pipeline;
           if (wasCached) {
             cached += 1;
@@ -4732,6 +6410,7 @@
       const prune = (map) => {
         for (const [key, entry] of map.entries()) {
           if (entry.lastAccessedAt < cutoff) {
+            entry.alive = false;
             map.delete(key);
             removed += 1;
           }
@@ -4756,6 +6435,8 @@
       this._stats.inlineSamplerLayouts = 0;
       this._stats.samplerHits = 0;
       this._stats.samplerMisses = 0;
+      this._stats.fastLookupHits = 0;
+      this._stats.fastLookupMisses = 0;
       this._stats.inFlightDedupes = 0;
       this._stats.evictions = 0;
       this._stats.compileCount = 0;
@@ -4801,6 +6482,7 @@
       this._inFlightRender.clear();
       this._inFlightCompute.clear();
       this._quarantinedKeys.clear();
+      this._invalidateFastLookups();
 
       if (options && options.resetStats) {
         this._resetStatsCounters();
@@ -4813,6 +6495,16 @@
      * @param {{ resetStats?: boolean }} [options]
      */
     reset(options = {}) {
+      this.clear(options);
+    }
+
+    /**
+     * Destroy cache state by clearing all cached pipelines, layouts, fast-path lookup tables,
+     * in-flight promises, and quarantined keys so stale resources cannot be reused.
+     *
+     * @param {{ resetStats?: boolean }} [options]
+     */
+    destroy(options = {}) {
       this.clear(options);
     }
 
@@ -4858,6 +6550,22 @@
       const layoutMisses = this._stats.layoutMisses;
       const samplerHits = this._stats.samplerHits;
       const samplerMisses = this._stats.samplerMisses;
+      const fastLookupHits =
+        typeof this._stats.fastLookupHits === 'number' &&
+        Number.isFinite(this._stats.fastLookupHits) &&
+        this._stats.fastLookupHits > 0
+          ? this._stats.fastLookupHits
+          : 0;
+      const fastLookupMisses =
+        typeof this._stats.fastLookupMisses === 'number' &&
+        Number.isFinite(this._stats.fastLookupMisses) &&
+        this._stats.fastLookupMisses > 0
+          ? this._stats.fastLookupMisses
+          : 0;
+      const fastLookupHitRate = computeClampedHitRate(
+        this._stats.fastLookupHits,
+        this._stats.fastLookupMisses
+      );
       const pipelineHits = renderHits + computeHits;
       const pipelineMisses = renderMisses + computeMisses;
       const totalHits = pipelineHits + layoutHits + samplerHits;
@@ -4882,6 +6590,9 @@
         misses: totalMisses,
         pipelineHits,
         pipelineMisses,
+        fastLookupHits,
+        fastLookupMisses,
+        fastLookupHitRate,
         negativeHits: this._stats.quarantineHits,
         negativeCacheHits: this._stats.quarantineHits,
         negativeCacheSize: this._quarantinedKeys.size,
@@ -4956,6 +6667,7 @@
     DEFAULT_MAX_RENDER_PIPELINES,
     DEFAULT_MAX_COMPUTE_PIPELINES,
     DEFAULT_MAX_BIND_GROUP_LAYOUTS,
+    DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
     DEFAULT_PREWARM_CONCURRENCY,
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_MAX_QUARANTINED_KEYS,
@@ -4973,6 +6685,7 @@
     DEFAULT_SAMPLER_DESCRIPTORS,
     fnv1a64Hex,
     buildFastPipelineKey,
+    computeFastDescriptorHash,
     hashDescriptorKey,
     registerShaderModuleId,
     normalizeVisibility,
