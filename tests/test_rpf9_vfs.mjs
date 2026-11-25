@@ -36,11 +36,17 @@ const {
   RPF_ENTRY_FLAG_COMPRESSED,
   RPF_ENTRY_FLAG_RESOURCE,
   RPF_ENTRY_FLAG_ENCRYPTED,
+  DEFAULT_PATH_CACHE_CAPACITY,
+  DEFAULT_DIR_CACHE_CAPACITY,
+  DEFAULT_TOC_CACHE_CAPACITY,
   RpfFormatError,
   EncryptedArchiveError,
   classifyEncryption,
   parseRpfHeader,
   normalizeVirtualPath,
+  joaatHash,
+  hashVirtualPath,
+  RpfTocCache,
   RpfArchiveVfs,
   RpfVfsMountTable,
   buildSyntheticRpf9Buffer,
@@ -805,9 +811,14 @@ test('web/workers/rpf9_vfs.js loads cleanly in a classic Web Worker global conte
   assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC_LE, '9FPR');
   assert.equal(sandbox.PlayGta6Rpf9Vfs.RPF9_MAGIC_U32, 0x52504639);
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.parseRpfHeader, 'function');
+  assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.joaatHash, 'function');
+  assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.hashVirtualPath, 'function');
+  assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfTocCache, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfArchiveVfs, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfVfsMountTable, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.buildSyntheticRpf9Buffer, 'function');
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.DEFAULT_PATH_CACHE_CAPACITY, DEFAULT_PATH_CACHE_CAPACITY);
+  assert.equal(sandbox.PlayGta6Rpf9Vfs.DEFAULT_TOC_CACHE_CAPACITY, DEFAULT_TOC_CACHE_CAPACITY);
 });
 
 test('RpfArchiveVfs O(1) normalized lookup, open/readEntry, traversal rejection, and sanitized getStats()', async () => {
@@ -1100,4 +1111,478 @@ test('RpfVfsMountTable O(1) Map path index, priority/unmount cleanup, and saniti
   assert.equal(table.resolve('x64/textures/shared.ytd'), null);
   assert.equal(table.getStats().lookupMisses, 1);
   assert.equal(table.getStats().lookupHits, 0);
+});
+
+test('joaatHash and hashVirtualPath compute deterministic 32-bit RAGE JOAAT hashes with normalization', () => {
+  assert.equal(joaatHash(''), 0);
+  assert.equal(joaatHash('a'), 0xca2e9442);
+  assert.equal(joaatHash('A'), 0xca2e9442);
+  assert.equal(joaatHash('x64/ui/fonts/menu.gfx'), joaatHash('X64/UI/FONTS/MENU.GFX'));
+
+  // Non-ASCII UTF-8 path folds case deterministically and returns unsigned u32.
+  const utf8A = joaatHash('ui/fonts/Café_Title.gfx');
+  const utf8B = joaatHash('ui/fonts/café_title.gfx');
+  assert.equal(utf8A, utf8B);
+  assert.ok(Number.isInteger(utf8A) && utf8A >= 0 && utf8A <= 0xffffffff);
+
+  // Virtual path normalization produces identical hashes for equivalent variants.
+  const canonical = hashVirtualPath('x64/ui/fonts/menu_main.gfx');
+  assert.equal(hashVirtualPath('///X64\\\\UI\\./Fonts//MENU_MAIN.GFX'), canonical);
+  assert.equal(hashVirtualPath('\\x64/ui/fonts/menu_main.gfx/'), canonical);
+
+  assert.throws(
+    () => hashVirtualPath('../escape/menu.gfx'),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+  assert.throws(
+    () => joaatHash(12345),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+});
+
+test('RpfArchiveVfs hash-indexed lookup, collision disambiguation, and bounded LRU resolved-path caching', async () => {
+  const archive = buildSyntheticRpf9Buffer([
+    { path: 'x64/ui/fonts/hud_font.gfx', data: 'FONT_PAYLOAD_HUD' },
+    { path: 'x64/ui/menus/pause_menu.gfx', data: 'MENU_PAYLOAD_PAUSE' },
+    { path: 'x64/movies/intro_logo.bik', data: 'VIDEO_BIK_INTRO_01' },
+    { path: 'x64/movies/attract_loop.bik', data: 'VIDEO_BIK_ATTRACT' },
+    { path: 'x64/ui/menus/options_menu.gfx', data: 'MENU_PAYLOAD_OPTS' },
+  ]);
+
+  const vfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(archive).readRange,
+    archive.byteLength,
+    {
+      archivePath: 'x64/ui_pack.rpf',
+      pathCacheCapacity: 3,
+    }
+  );
+
+  const initStats = vfs.getStats();
+  assert.equal(initStats.indexedEntryCount, initStats.indexedEntries);
+  assert.ok(initStats.indexedEntryCount >= 9);
+  assert.equal(initStats.tocCacheHits, 0);
+  assert.equal(initStats.resolvedPathCacheCapacity, 3);
+  assert.equal(initStats.resolvedPathCacheSize, 0);
+  assert.equal(initStats.resolvedPathCacheEvictions, 0);
+
+  // Hash-indexed lookups by uint32 and hex string.
+  const fontHash = hashVirtualPath('x64/ui/fonts/hud_font.gfx');
+  const fontHex = `0x${fontHash.toString(16).padStart(8, '0')}`;
+  assert.equal(vfs.hasHash(fontHash), true);
+  assert.equal(vfs.hasHash(fontHex), true);
+  assert.equal(vfs.hasHash(0xdeadbeef), false);
+
+  const byHash = vfs.lookupByHash(fontHash);
+  assert.ok(byHash);
+  assert.equal(byHash.path, 'x64/ui/fonts/hud_font.gfx');
+  assert.equal(byHash.pathHash, fontHash);
+  assert.equal(byHash.collisionCount, 0);
+  assert.equal(byHash.stat.size, 'FONT_PAYLOAD_HUD'.length);
+
+  const byHashAlias = vfs.resolveByHash(fontHex);
+  assert.equal(byHashAlias.path, byHash.path);
+
+  const byPath = vfs.lookupByPath('\\X64\\UI\\Fonts\\HUD_FONT.GFX');
+  assert.ok(byPath);
+  assert.equal(byPath.pathHash, fontHash);
+
+  assert.equal(decoder.decode(await vfs.readEntryByHash(fontHash)), 'FONT_PAYLOAD_HUD');
+  assert.equal(decoder.decode(await vfs.readEntryByHash(fontHex, 5, 7)), 'PAYLOAD');
+  assert.equal(vfs.lookupByHash(0xdeadbeef), null);
+  assert.deepEqual(vfs.lookupAllByHash(0xdeadbeef), []);
+
+  await assert.rejects(
+    () => vfs.readEntryByHash(0xdeadbeef),
+    (err) => err instanceof RpfFormatError && err.code === 'PATH_NOT_FOUND'
+  );
+  await assert.rejects(
+    () => vfs.readEntryByHash(hashVirtualPath('x64/ui/fonts')),
+    (err) => err instanceof RpfFormatError && err.code === 'NOT_A_FILE'
+  );
+  for (const badHash of [-1, 0x100000000, 1.5, 'not-a-hash', '0x123456789', {}]) {
+    assert.throws(
+      () => vfs.lookupByHash(badHash),
+      (err) => err instanceof RpfFormatError && err.code === 'INVALID_HASH'
+    );
+  }
+
+  // Verify bounded LRU resolved-path caching & eviction order (capacity = 3).
+  vfs.clearPathCache();
+  vfs.resetStats();
+
+  const pA = 'x64/ui/fonts/hud_font.gfx';
+  const pB = 'x64/ui/menus/pause_menu.gfx';
+  const pC = 'x64/movies/intro_logo.bik';
+  const pD = 'x64/movies/attract_loop.bik';
+
+  assert.ok(vfs.resolve(pA)); // miss -> cache: [A]
+  assert.ok(vfs.resolve(pB)); // miss -> cache: [A, B]
+  assert.ok(vfs.resolve(pC)); // miss -> cache: [A, B, C]
+  assert.equal(vfs.getStats().tocCacheHits, 0);
+  assert.equal(vfs.getStats().resolvedPathCacheSize, 3);
+  assert.equal(vfs.getStats().resolvedPathCacheEvictions, 0);
+
+  // Touch A -> cache hit + promote A to MRU: [B, C, A].
+  assert.ok(vfs.stat(pA));
+  assert.equal(vfs.getStats().tocCacheHits, 1);
+
+  // Insert D -> evicts B (LRU): [C, A, D].
+  assert.ok(vfs.resolve(pD));
+  assert.equal(vfs.getStats().resolvedPathCacheSize, 3);
+  assert.equal(vfs.getStats().resolvedPathCacheEvictions, 1);
+
+  // A is still cached (hit -> tocCacheHits = 2); B was evicted (miss -> evicts C, evictions = 2).
+  assert.ok(vfs.resolve(pA));
+  assert.equal(vfs.getStats().tocCacheHits, 2);
+  assert.ok(vfs.resolve(pB));
+  assert.equal(vfs.getStats().tocCacheHits, 2);
+  assert.equal(vfs.getStats().resolvedPathCacheEvictions, 2);
+  assert.equal(vfs.getStats().lookupHits, 7);
+
+  // Negative caching: repeated misses hit resolved-path LRU while still counting lookupMisses.
+  assert.equal(vfs.resolve('x64/ui/missing_screen.gfx'), null);
+  const hitsBeforeNegRepeat = vfs.getStats().tocCacheHits;
+  assert.equal(vfs.resolve('x64/ui/missing_screen.gfx'), null);
+  assert.equal(vfs.getStats().tocCacheHits, hitsBeforeNegRepeat + 1);
+  assert.equal(vfs.getStats().lookupMisses, 2);
+
+  // Synthetic hash collision bucket disambiguation test.
+  const nodeA = vfs._nodesByKey.get('x64/ui/fonts/hud_font.gfx');
+  const nodeB = vfs._nodesByKey.get('x64/ui/menus/pause_menu.gfx');
+  const syntheticCollHash = 0x11223344;
+  vfs._nodesByHash.set(syntheticCollHash, [nodeA, nodeB]);
+  const collAll = vfs.lookupAllByHash(syntheticCollHash);
+  assert.equal(collAll.length, 2);
+  assert.equal(vfs.lookupByHash(syntheticCollHash).collisionCount, 1);
+  await assert.rejects(
+    () => vfs.readEntryByHash(syntheticCollHash),
+    (err) => err instanceof RpfFormatError && err.code === 'HASH_COLLISION'
+  );
+  const disambiguated = await vfs.readEntryByHash(syntheticCollHash, {
+    expectedPath: 'X64\\UI\\Menus\\PAUSE_MENU.GFX',
+  });
+  assert.equal(decoder.decode(disambiguated), 'MENU_PAYLOAD_PAUSE');
+
+  // Capacity 0 disables resolved-path LRU caching cleanly.
+  const uncachedVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(archive).readRange,
+    archive.byteLength,
+    { pathCacheCapacity: 0 }
+  );
+  assert.ok(uncachedVfs.resolve(pA));
+  assert.ok(uncachedVfs.resolve(pA));
+  assert.equal(uncachedVfs.getStats().tocCacheHits, 0);
+  assert.equal(uncachedVfs.getStats().resolvedPathCacheSize, 0);
+  assert.equal(uncachedVfs.getStats().lookupHits, 2);
+});
+
+test('RpfTocCache caches parsed TOC + indexes across RpfArchiveVfs.open and enforces LRU capacity', async () => {
+  const uiBuf = buildSyntheticRpf9Buffer([
+    { path: 'ui/fonts/title.gfx', data: 'TITLE_FONT_V1' },
+    { path: 'ui/menus/main.gfx', data: 'MAIN_MENU_V1' },
+  ]);
+  const videoBuf = buildSyntheticRpf9Buffer([
+    { path: 'movies/splash.bik', data: 'SPLASH_BIK_STREAM' },
+  ]);
+  const audioBuf = buildSyntheticRpf9Buffer([
+    { path: 'audio/ui_click.awc', data: 'AWC_CLICK_DATA' },
+  ]);
+
+  const tocCache = new RpfTocCache({ capacity: 2 });
+
+  // First open of ui.rpf fetches header + TOC + names (2 range reads).
+  const tracker1 = createTrackingRangeReader(uiBuf);
+  const vfs1 = await RpfArchiveVfs.open(tracker1.readRange, uiBuf.byteLength, {
+    archivePath: 'x64/ui.rpf',
+    tocCache,
+  });
+  assert.equal(tracker1.reads.length, 2);
+  assert.equal(tocCache.getStats().size, 1);
+  assert.equal(tocCache.getStats().hits, 0);
+  assert.equal(tocCache.getStats().misses, 1);
+  assert.equal(vfs1.getStats().tocCacheHits, 0);
+
+  // Second open of ui.rpf hits RpfTocCache with ZERO header/TOC range reads!
+  const tracker2 = createTrackingRangeReader(uiBuf);
+  const vfs2 = await RpfArchiveVfs.open(tracker2.readRange, uiBuf.byteLength, {
+    archivePath: 'x64/ui.rpf',
+    tocCache,
+  });
+  assert.equal(tracker2.reads.length, 0, 'TOC cache hit must perform zero header/TOC reads');
+  assert.equal(tocCache.getStats().hits, 1);
+  assert.equal(vfs2.getStats().tocCacheHits, 1);
+  assert.equal(vfs2.getStats().indexedEntryCount, vfs1.getStats().indexedEntryCount);
+
+  // Payload read on cached-TOC VFS still streams exact bytes through tracker2.
+  const menuData = await vfs2.readFile('ui/menus/main.gfx');
+  assert.equal(decoder.decode(menuData), 'MAIN_MENU_V1');
+  assert.equal(tracker2.reads.length, 1);
+
+  // Open 2nd and 3rd archives -> capacity 2 evicts LRU archive (x64/ui.rpf).
+  await RpfArchiveVfs.open(createTrackingRangeReader(videoBuf).readRange, videoBuf.byteLength, {
+    archivePath: 'x64/video.rpf',
+    tocCache,
+  });
+  assert.equal(tocCache.getStats().size, 2);
+  assert.equal(tocCache.getStats().evictions, 0);
+
+  await RpfArchiveVfs.open(createTrackingRangeReader(audioBuf).readRange, audioBuf.byteLength, {
+    archivePath: 'x64/audio.rpf',
+    tocCache,
+  });
+  assert.equal(tocCache.getStats().size, 2);
+  assert.equal(tocCache.getStats().evictions, 1);
+
+  // Encrypted archive in RpfTocCache still enforces decryptBlock requirement on hit.
+  const xorByte = 0x3c;
+  const xorFn = (bytes) => {
+    const out = new Uint8Array(bytes.byteLength);
+    for (let i = 0; i < bytes.byteLength; i += 1) {
+      out[i] = bytes[i] ^ xorByte;
+    }
+    return out;
+  };
+  const encBuf = buildSyntheticRpf9Buffer([{ path: 'ui/secret.gfx', data: 'SECRET_UI' }], {
+    encryptionTag: RPF_ENCRYPTION_NG,
+    encryptBlock: xorFn,
+  });
+  const encCache = new RpfTocCache(4);
+  const encVfs1 = await RpfArchiveVfs.open(
+    createTrackingRangeReader(encBuf).readRange,
+    encBuf.byteLength,
+    { archivePath: 'x64/enc.rpf', tocCache: encCache, decryptBlock: xorFn }
+  );
+  assert.equal(decoder.decode(await encVfs1.readFile('ui/secret.gfx')), 'SECRET_UI');
+
+  await assert.rejects(
+    () =>
+      RpfArchiveVfs.open(createTrackingRangeReader(encBuf).readRange, encBuf.byteLength, {
+        archivePath: 'x64/enc.rpf',
+        tocCache: encCache,
+      }),
+    (err) => err instanceof EncryptedArchiveError
+  );
+
+  const encTracker2 = createTrackingRangeReader(encBuf);
+  const encVfs2 = await RpfArchiveVfs.open(encTracker2.readRange, encBuf.byteLength, {
+    archivePath: 'x64/enc.rpf',
+    tocCache: encCache,
+    decryptBlock: xorFn,
+  });
+  assert.equal(encTracker2.reads.length, 0);
+  assert.equal(decoder.decode(await encVfs2.readFile('ui/secret.gfx')), 'SECRET_UI');
+
+  // Verify RpfTocCache.getStats() is strictly numeric and sanitized.
+  for (const [k, v] of Object.entries(tocCache.getStats())) {
+    assert.equal(typeof v, 'number', `RpfTocCache.getStats().${k} must be numeric`);
+    assert.ok(Number.isFinite(v) && v >= 0);
+  }
+});
+
+test('RpfVfsMountTable hash index, LRU resolved-path & dir cache invalidation on mount/unmount', async () => {
+  const baseBuf = buildSyntheticRpf9Buffer([
+    { path: 'ui/fonts/main.gfx', data: 'BASE_MAIN_FONT' },
+    { path: 'ui/menus/title.gfx', data: 'BASE_TITLE_MENU' },
+  ]);
+  const patchBuf = buildSyntheticRpf9Buffer([
+    { path: 'ui/fonts/main.gfx', data: 'PATCH_MAIN_FONT_V2' },
+    { path: 'ui/menus/dlc_banner.gfx', data: 'PATCH_DLC_BANNER' },
+  ]);
+
+  const baseVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(baseBuf).readRange,
+    baseBuf.byteLength,
+    { archivePath: 'base_ui.rpf' }
+  );
+  const patchVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(patchBuf).readRange,
+    patchBuf.byteLength,
+    { archivePath: 'patch_ui.rpf' }
+  );
+
+  const table = new RpfVfsMountTable({ pathCacheCapacity: 16, dirCacheCapacity: 8 });
+  const mBase = table.mount('x64/', baseVfs, { priority: 10 });
+
+  // Populate resolved-path LRU cache & dir listing cache.
+  const mainFontPath = 'X64\\UI\\Fonts\\MAIN.GFX';
+  const mainFontHash = hashVirtualPath('x64/ui/fonts/main.gfx');
+  assert.equal(table.resolve(mainFontPath).mountId, mBase.id);
+  assert.equal(table.resolve(mainFontPath).mountId, mBase.id);
+  assert.equal(table.getStats().tocCacheHits, 1);
+
+  const menusBefore = table.listDir('x64/ui/menus');
+  assert.deepEqual(
+    menusBefore.map((e) => e.name),
+    ['title.gfx']
+  );
+  // Mutating returned array entry must not corrupt cached listing.
+  menusBefore[0].name = 'MUTATED';
+  const menusCached = table.listDir('x64/ui/menus');
+  assert.deepEqual(
+    menusCached.map((e) => e.name),
+    ['title.gfx']
+  );
+  assert.equal(table.getStats().tocCacheHits, 2);
+
+  // Hash lookup on mount table before patch.
+  assert.equal(table.hasHash(mainFontHash), true);
+  assert.equal(table.lookupByHash(mainFontHash).mountId, mBase.id);
+  assert.equal(decoder.decode(await table.readEntryByHash(mainFontHash)), 'BASE_MAIN_FONT');
+
+  // Mount higher-priority patch -> invalidates caches and replaces hash bucket in place (0 false collisions).
+  const mPatch = table.mount('x64/', patchVfs, { priority: 20 });
+  assert.equal(table.getStats().resolvedPathCacheSize, 0);
+  assert.equal(table.getStats().dirListingCacheSize, 0);
+  assert.equal(table.getStats().hashCollisions, 0);
+  assert.equal(table.resolve(mainFontPath).mountId, mPatch.id);
+  assert.equal(table.lookupByHash(mainFontHash).mountId, mPatch.id);
+  assert.equal(decoder.decode(await table.readEntryByHash(mainFontHash)), 'PATCH_MAIN_FONT_V2');
+  assert.deepEqual(
+    table.listDir('x64/ui/menus').map((e) => e.name),
+    ['dlc_banner.gfx', 'title.gfx']
+  );
+
+  // Unmount patch -> invalidates caches and cleanly restores base mount for path & hash lookups.
+  assert.equal(table.unmount(mPatch.id), true);
+  assert.equal(table.resolve(mainFontPath).mountId, mBase.id);
+  assert.equal(table.lookupByHash(mainFontHash).mountId, mBase.id);
+  assert.equal(decoder.decode(await table.readEntryByHash(mainFontHash)), 'BASE_MAIN_FONT');
+  assert.equal(table.lookupByHash(hashVirtualPath('x64/ui/menus/dlc_banner.gfx')), null);
+  assert.deepEqual(
+    table.listDir('x64/ui/menus').map((e) => e.name),
+    ['title.gfx']
+  );
+});
+
+test('Large synthetic TOC (5,200+ entries) O(1) hash/path lookup correctness and benchmark', async () => {
+  const categories = [
+    { dir: 'x64/ui/menus', ext: 'gfx', count: 1400 },
+    { dir: 'x64/ui/fonts', ext: 'gfx', count: 1000 },
+    { dir: 'x64/movies', ext: 'bik', count: 1000 },
+    { dir: 'x64/textures/hud', ext: 'ytd', count: 1000 },
+    { dir: 'common/data/levels', ext: 'meta', count: 800 },
+  ];
+
+  const files = [];
+  const allPaths = [];
+  let seq = 0;
+  for (const cat of categories) {
+    for (let i = 0; i < cat.count; i += 1) {
+      const bucket = String(i % 10).padStart(2, '0');
+      const relPath = `${cat.dir}/b${bucket}/asset_${seq}.${cat.ext}`;
+      const payload = `P${seq}`;
+      files.push({ path: relPath, data: payload });
+      allPaths.push({ path: relPath, payload });
+      seq += 1;
+    }
+  }
+  assert.equal(files.length, 5200);
+
+  const archive = buildSyntheticRpf9Buffer(files);
+  const tracker = createTrackingRangeReader(archive);
+  const tocCache = new RpfTocCache({ capacity: 8 });
+  const vfs = await RpfArchiveVfs.open(tracker.readRange, archive.byteLength, {
+    archivePath: 'x64/large_ui_bundle.rpf',
+    tocCache,
+    pathCacheCapacity: 512,
+  });
+
+  const openStats = vfs.getStats();
+  assert.ok(openStats.indexedEntryCount >= 5250, `Expected >= 5250 indexed entries, got ${openStats.indexedEntryCount}`);
+  assert.equal(openStats.indexedEntries, openStats.indexedEntryCount);
+  assert.ok(openStats.hashIndexSize >= 5250);
+  assert.equal(tracker.reads.length, 2, 'open() must only fetch header + TOC/names even for 5,200+ files');
+
+  // Spot-check first, middle, last, and mixed-case/backslash normalized entries + hash reads.
+  const sampleIndices = [0, 1, 1399, 1400, 2599, 3400, 4400, 5198, 5199];
+  for (const idx of sampleIndices) {
+    const item = allPaths[idx];
+    const noisyPath = `///${item.path.toUpperCase().replace(/\//g, '\\\\')}`;
+    const res = vfs.lookupByPath(noisyPath);
+    assert.ok(res, `Expected lookupByPath hit for ${item.path}`);
+    assert.equal(res.path, item.path);
+
+    const h = hashVirtualPath(item.path);
+    assert.equal(res.pathHash, h);
+    const byHash = vfs.lookupByHash(h);
+    assert.ok(byHash, `Expected lookupByHash hit for ${item.path}`);
+    assert.equal(byHash.path, item.path);
+
+    const bytes = await vfs.readEntryByHash(h);
+    assert.equal(decoder.decode(bytes), item.payload);
+  }
+
+  // Mount into RpfVfsMountTable and verify ZERO linear archive scans across 2,000+ lookups.
+  const table = new RpfVfsMountTable({ pathCacheCapacity: 256 });
+  table.mount('update/', vfs);
+  assert.equal(table.getStats().indexedEntryCount, openStats.indexedEntryCount);
+
+  let scannedVfsCalls = 0;
+  const origExists = vfs.exists.bind(vfs);
+  const origStat = vfs.stat.bind(vfs);
+  vfs.exists = (...args) => {
+    scannedVfsCalls += 1;
+    return origExists(...args);
+  };
+  vfs.stat = (...args) => {
+    scannedVfsCalls += 1;
+    return origStat(...args);
+  };
+
+  // Hot working set of 100 menu/font/video assets queried 20x each (2,000 path lookups + 1,000 hash lookups).
+  const hotPaths = [];
+  const hotHashes = [];
+  for (let i = 0; i < 100; i += 1) {
+    const idx = (i * 51) % allPaths.length;
+    const mountedPath = `update/${allPaths[idx].path}`;
+    hotPaths.push(mountedPath);
+    hotHashes.push(hashVirtualPath(mountedPath));
+  }
+
+  const startMs = Date.now();
+  for (let round = 0; round < 20; round += 1) {
+    for (let i = 0; i < hotPaths.length; i += 1) {
+      const hit = table.resolve(hotPaths[i]);
+      assert.ok(hit);
+    }
+  }
+  for (let round = 0; round < 10; round += 1) {
+    for (let i = 0; i < hotHashes.length; i += 1) {
+      const hit = table.lookupByHash(hotHashes[i]);
+      assert.ok(hit);
+    }
+  }
+  const elapsedMs = Date.now() - startMs;
+
+  assert.equal(scannedVfsCalls, 0, '5,200+ entry lookups must never fall back to linear VFS scans');
+  assert.ok(
+    elapsedMs < 1500,
+    `Expected 3,000 O(1) lookups over 5,200+ TOC entries to finish quickly (<1500ms), took ${elapsedMs}ms`
+  );
+
+  const tableStats = table.getStats();
+  assert.equal(tableStats.lookupHits, 3000);
+  assert.equal(tableStats.lookupMisses, 0);
+  assert.equal(tableStats.tocCacheHits, 1900, '19 warm rounds x 100 hot paths should hit resolved-path LRU');
+  assert.equal(tableStats.resolvedPathCacheSize, 100);
+  assert.ok(tableStats.resolvedPathCacheSize <= tableStats.resolvedPathCacheCapacity);
+
+  // Instant re-open of 5,200+ entry TOC via shared RpfTocCache performs zero range reads.
+  const trackerReopen = createTrackingRangeReader(archive);
+  const vfsReopened = await RpfArchiveVfs.open(trackerReopen.readRange, archive.byteLength, {
+    archivePath: 'x64/large_ui_bundle.rpf',
+    tocCache,
+  });
+  assert.equal(trackerReopen.reads.length, 0);
+  assert.equal(vfsReopened.getStats().tocCacheHits, 1);
+  assert.equal(vfsReopened.getStats().indexedEntryCount, openStats.indexedEntryCount);
+
+  // Verify strict numeric-only sanitization on all stats objects.
+  for (const statsObj of [vfs.getStats(), tableStats, vfsReopened.getStats(), tocCache.getStats()]) {
+    for (const [key, val] of Object.entries(statsObj)) {
+      assert.equal(typeof val, 'number', `Stat field ${key} must be numeric`);
+      assert.ok(Number.isFinite(val) && val >= 0);
+    }
+  }
 });
