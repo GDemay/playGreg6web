@@ -585,6 +585,16 @@ struct LiveCounters {
 };
 LiveCounters live_counters();
 
+// The live present state of the running boot (the newest `present_samples` entry): presents so
+// far, draws of the newest present, wall ms of the newest present. Safe from any thread; drives
+// the input script's `wait` steps (guest/input_script.h).
+struct PresentStatus {
+    uint64_t presents = 0;
+    uint64_t draws_per_frame = 0;
+    uint64_t wall_ms = 0;
+};
+PresentStatus present_status();
+
 // Lifted function containing a host code address (exact only for natively compiled lifted code:
 // nearest lifted function pointer at or below `host_pc`). 0 if unknown.
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr);

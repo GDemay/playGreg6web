@@ -46,6 +46,9 @@
 //   --gpu-capture-frames <n>  frames to capture (default 10)
 //   --gpu-capture-thin-uploads <n>  with payloads: keep only every nth write of a texture/buffer > 4 MiB
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
+//   --gpu-capture-start-ms <n>  start the capture's frames late, n ms after boot (gpu/frame_capture.h
+//                        "Late start"); objects and the newest writes are kept, commands dropped
+//   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
 //   --arena-log-limit <n>     address-space events kept in the report log (default 4096)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
@@ -178,6 +181,8 @@ struct Options {
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
     uint64_t gpu_capture_thin_uploads = 0;
+    uint64_t gpu_capture_start_ms = 0;    // --gpu-capture-start-ms: late start (0 = from boot)
+    bool gpu_capture_start_at_script = false;  // --gpu-capture-start-at-script
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
     bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
     bool eager_gpu_objects = false; // d3d12 DeviceOptions::defer_gpu_objects = false
@@ -210,7 +215,8 @@ void usage() {
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
-                 "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
+                 "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
+                 "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--no-fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
@@ -250,6 +256,8 @@ bool parse(int argc, char** argv, Options& o) {
             playgta6::os::win32::set_process_shared_zone(false);
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
+        } else if (a == "--gpu-capture-start-at-script") {
+            o.gpu_capture_start_at_script = true;
         } else if (a == "--no-fence-lag") {
             o.no_fence_lag = true;
         } else if (a == "--eager-gpu-objects") {
@@ -292,6 +300,7 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
                    a == "--console-mode" || a == "--gpu-capture-frames" || a == "--gpu-capture-thin-uploads" || a == "--arena-log-limit" ||
+                   a == "--gpu-capture-start-ms" ||
                    a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--wgpu-features") {
             if (!value(v)) {
                 return false;
@@ -299,6 +308,7 @@ bool parse(int argc, char** argv, Options& o) {
             uint64_t& target = a == "--max-calls"     ? o.max_calls
                                : a == "--gpu-capture-frames" ? o.gpu_capture_frames
                                : a == "--gpu-capture-thin-uploads" ? o.gpu_capture_thin_uploads
+                               : a == "--gpu-capture-start-ms" ? o.gpu_capture_start_ms
                                : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
@@ -1085,6 +1095,13 @@ int main(int argc, char** argv) {
         capture.frames = static_cast<uint32_t>(std::max<uint64_t>(1, g_options.gpu_capture_frames));
         capture.keep_payloads = g_options.gpu_capture_payloads;
         capture.thin_uploads = static_cast<uint32_t>(g_options.gpu_capture_thin_uploads);
+        capture.start_ms = g_options.gpu_capture_start_ms;
+        capture.deferred = g_options.gpu_capture_start_ms != 0 || g_options.gpu_capture_start_at_script;
+        if (capture.deferred) {
+            std::fprintf(stderr, "[harness] GPU capture deferred until %s\n",
+                         g_options.gpu_capture_start_at_script ? "the input script's capture step"
+                                                               : (std::to_string(capture.start_ms) + " ms").c_str());
+        }
         if (!gpu::frame_capture_start(capture)) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;
@@ -1174,7 +1191,24 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "[harness] input script %s: %zu event(s)\n", g_options.input_script.c_str(), events.size());
         playgta6::os::scarlett::set_game_input_state(&script_input);
+        const bool has_capture_step =
+            std::any_of(events.begin(), events.end(), [](const playgta6::guest::InputScriptEvent& e) {
+                return e.kind == playgta6::guest::InputStepKind::Capture;
+            });
+        if (g_options.gpu_capture_start_at_script && !has_capture_step) {
+            std::fprintf(stderr, "[harness] --gpu-capture-start-at-script: the input script has no capture step\n");
+            return kExitUsage;
+        }
         script_player = std::make_unique<playgta6::guest::InputScriptPlayer>(std::move(events), &script_input);
+        // wait / repeat steps follow the live present counters (the report's present_samples).
+        script_player->set_status_probe([] {
+            const guest::PresentStatus p = guest::present_status();
+            return playgta6::guest::InputStatus{p.presents, p.draws_per_frame};
+        });
+        if (g_options.gpu_capture_start_at_script) {
+            script_player->set_on_capture([] { gpu::frame_capture_begin(); });
+        }
+        script_player->set_log(true);
         script_player->start();
     } else if (g_options.host_input) {
         static playgta6::InputState host_state{};

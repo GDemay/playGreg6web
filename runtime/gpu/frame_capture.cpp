@@ -5,6 +5,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <string>
@@ -35,8 +36,28 @@ struct Omitted {
     uint64_t hash = 0;
 };
 
+// A write held during a deferred capture's prefix.
+struct HeldTextureWrite {
+    uint64_t seq = 0;
+    GpuWriteTexturePayload box{};
+    std::vector<uint8_t> packet;  // the whole packet (header + payload + data)
+};
+
+struct HeldBuffer {
+    uint64_t seq = 0;  // of the newest write
+    uint64_t lo = UINT64_MAX;
+    uint64_t hi = 0;
+    std::vector<uint8_t> image;  // bytes [0, hi); never-written bytes are 0 like a fresh buffer
+};
+
 struct CaptureState {
     std::mutex mutex;
+    bool prefix = false;                     // deferred and not started yet
+    std::atomic<bool> begin_requested{false};
+    uint64_t first_present = 0;
+    uint64_t held_seq = 0;
+    std::map<uint32_t, HeldBuffer> held_buffers;
+    std::map<uint32_t, std::vector<HeldTextureWrite>> held_textures;
     bool open = false;    // a capture runs (until finish)
     bool active = false;  // still writing packets
     FrameCaptureConfig config;
@@ -158,6 +179,139 @@ void write_packet(CaptureState& s, const GpuPacketHeader& h, const uint8_t* pack
     ++s.current.packets;
 }
 
+bool box_contains(const GpuWriteTexturePayload& outer, const GpuWriteTexturePayload& inner) {
+    return outer.mip_level == inner.mip_level && outer.origin_x <= inner.origin_x && outer.origin_y <= inner.origin_y &&
+           outer.origin_z <= inner.origin_z &&
+           uint64_t(outer.origin_x) + outer.width >= uint64_t(inner.origin_x) + inner.width &&
+           uint64_t(outer.origin_y) + outer.height >= uint64_t(inner.origin_y) + inner.height &&
+           uint64_t(outer.origin_z) + outer.depth_or_layers >= uint64_t(inner.origin_z) + inner.depth_or_layers;
+}
+
+// A packet of the deferred prefix: creation/destruction written, writes held, commands dropped.
+void prefix_packet(CaptureState& s, const GpuPacketHeader& h, const uint8_t* packet) {
+    const uint8_t* payload = packet + sizeof(h);
+    switch (static_cast<GpuOpcode>(h.opcode)) {
+        case GpuOpcode::WriteBuffer: {
+            GpuWriteBufferPayload w{};
+            if (h.payload_bytes < sizeof(w)) {
+                return;
+            }
+            std::memcpy(&w, payload, sizeof(w));
+            const size_t n = std::min<size_t>(w.data_len, h.payload_bytes - sizeof(w));
+            HeldBuffer& b = s.held_buffers[w.id];
+            const uint64_t end = uint64_t(w.dst_offset) + n;
+            if (b.image.size() < end) {
+                b.image.resize(end);
+            }
+            std::memcpy(b.image.data() + w.dst_offset, payload + sizeof(w), n);
+            b.lo = std::min<uint64_t>(b.lo, w.dst_offset);
+            b.hi = std::max<uint64_t>(b.hi, end);
+            b.seq = ++s.held_seq;
+            return;
+        }
+        case GpuOpcode::WriteTexture: {
+            HeldTextureWrite held;
+            if (h.payload_bytes < sizeof(held.box)) {
+                return;
+            }
+            std::memcpy(&held.box, payload, sizeof(held.box));
+            std::vector<HeldTextureWrite>& list = s.held_textures[held.box.texture_id];
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [&](const HeldTextureWrite& old) { return box_contains(held.box, old.box); }),
+                       list.end());
+            held.seq = ++s.held_seq;
+            held.packet.assign(packet, packet + sizeof(h) + h.payload_bytes);
+            list.push_back(std::move(held));
+            return;
+        }
+        case GpuOpcode::DestroyResource: {
+            GpuDestroyResourcePayload d{};
+            if (h.payload_bytes >= sizeof(d)) {
+                std::memcpy(&d, payload, sizeof(d));
+                s.held_buffers.erase(d.id);
+                s.held_textures.erase(d.id);
+            }
+            write_packet(s, h, packet);
+            return;
+        }
+        case GpuOpcode::CreateBuffer:
+        case GpuOpcode::CreateShaderModule:
+        case GpuOpcode::CreateRenderPipeline:
+        case GpuOpcode::CreateTexture:
+        case GpuOpcode::CreateSampler:
+        case GpuOpcode::CreateBindGroup:
+        case GpuOpcode::CreateComputePipeline:
+        case GpuOpcode::CreateBindGroupLayout:
+        case GpuOpcode::CreatePipelineLayout:
+        case GpuOpcode::CreateRenderPipeline2:
+        case GpuOpcode::CreateComputePipeline2:
+        case GpuOpcode::CreateBindGroup2:
+        case GpuOpcode::CreateSampler2:
+        case GpuOpcode::CreateTexture2:
+            write_packet(s, h, packet);
+            return;
+        default:
+            return;  // render / compute commands, Present: dropped before the start
+    }
+}
+
+// Ends the prefix: writes the held buffer images and texture writes in the order of their newest
+// write; the following packets are frame 0's commands.
+void flush_prefix(CaptureState& s) {
+    struct Item {
+        uint64_t seq;
+        const HeldBuffer* buffer;
+        uint32_t id;
+        const HeldTextureWrite* texture;
+    };
+    std::vector<Item> items;
+    for (const auto& [id, b] : s.held_buffers) {
+        if (b.hi > b.lo) {
+            items.push_back(Item{b.seq, &b, id, nullptr});
+        }
+    }
+    for (const auto& [id, list] : s.held_textures) {
+        for (const HeldTextureWrite& w : list) {
+            items.push_back(Item{w.seq, nullptr, id, &w});
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.seq < b.seq; });
+    std::vector<uint8_t> packet;
+    for (const Item& it : items) {
+        if (it.texture != nullptr) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, it.texture->packet.data(), sizeof(h));
+            write_packet(s, h, it.texture->packet.data());
+            continue;
+        }
+        const HeldBuffer& b = *it.buffer;
+        const uint64_t n = b.hi - b.lo;
+        GpuWriteBufferPayload w{};
+        w.id = it.id;
+        w.dst_offset = static_cast<uint32_t>(b.lo);
+        w.data_len = static_cast<uint32_t>(n);
+        GpuPacketHeader h{};
+        h.opcode = static_cast<uint16_t>(GpuOpcode::WriteBuffer);
+        h.payload_bytes = static_cast<uint32_t>(sizeof(w) + n);
+        packet.resize(sizeof(h) + sizeof(w) + n);
+        std::memcpy(packet.data(), &h, sizeof(h));
+        std::memcpy(packet.data() + sizeof(h), &w, sizeof(w));
+        std::memcpy(packet.data() + sizeof(h) + sizeof(w), b.image.data() + b.lo, n);
+        write_packet(s, h, packet.data());
+    }
+    s.held_buffers.clear();
+    s.held_textures.clear();
+    s.prefix = false;
+}
+
+bool start_due(CaptureState& s) {
+    if (s.begin_requested.load(std::memory_order_acquire)) {
+        return true;
+    }
+    return s.config.start_ms != 0 &&
+           std::chrono::steady_clock::now() - s.start >= std::chrono::milliseconds(s.config.start_ms);
+}
+
 void observe_locked(CaptureState& s, const uint8_t* data, size_t len) {
     size_t at = 0;
     while (at + sizeof(GpuPacketHeader) <= len) {
@@ -166,7 +320,9 @@ void observe_locked(CaptureState& s, const uint8_t* data, size_t len) {
         if (h.payload_bytes > len - at - sizeof(h)) {
             break;  // a truncated packet: never produced by the encoder; ignore the rest
         }
-        if (s.active) {
+        if (s.prefix) {
+            prefix_packet(s, h, data + at);
+        } else if (s.active) {
             write_packet(s, h, data + at);
         }
         at += sizeof(h) + h.payload_bytes;
@@ -174,6 +330,13 @@ void observe_locked(CaptureState& s, const uint8_t* data, size_t len) {
             continue;
         }
         sample_present(s);
+        if (s.prefix) {
+            if (start_due(s)) {
+                flush_prefix(s);
+                s.first_present = s.presents.size();  // the next Present ends frame 0
+            }
+            continue;
+        }
         if (s.active) {
             s.frames.push_back(s.current);
             s.current = FrameRecord{};
@@ -250,6 +413,12 @@ bool frame_capture_start(const FrameCaptureConfig& config) {
     s.frames.clear();
     s.presents.clear();
     s.omitted.clear();
+    s.prefix = config.deferred;
+    s.begin_requested.store(false);
+    s.first_present = 0;
+    s.held_seq = 0;
+    s.held_buffers.clear();
+    s.held_textures.clear();
     s.start = std::chrono::steady_clock::now();
     if (config.attach) {
         os::set_wgpu_submit_observer(&observer);
@@ -292,9 +461,10 @@ void frame_capture_finish() {
                  "  \"payloads\": \"%s\",\n  \"frames_requested\": %u,\n  \"frames_complete\": %zu,\n"
                  "  \"presents_seen\": %zu,\n  \"packets\": %" PRIu64 ",\n  \"bytes\": %" PRIu64 ",\n"
                  "  \"omitted_bytes\": %" PRIu64 ",\n  \"thinned_packets\": %" PRIu64 ",\n  \"thinned_bytes\": %" PRIu64
-                 ",\n  \"frames\": [",
+                 ",\n  \"first_present\": %" PRIu64 ",\n  \"frames\": [",
                  json_escape(name).c_str(), s.config.keep_payloads ? "kept" : "omitted", s.config.frames,
-                 s.frames.size(), s.presents.size(), s.packets, s.bytes, s.omitted_bytes, s.thinned_packets, s.thinned_bytes);
+                 s.frames.size(), s.presents.size(), s.packets, s.bytes, s.omitted_bytes, s.thinned_packets, s.thinned_bytes,
+                 s.prefix ? uint64_t(s.presents.size()) : s.first_present);
     for (size_t i = 0; i < s.frames.size(); ++i) {
         const FrameRecord& f = s.frames[i];
         std::fprintf(side,
@@ -321,6 +491,10 @@ std::string frame_capture_presents_json() {
 
 void frame_capture_set_counters(FrameCaptureCounters counters) {
     state().counters.store(counters, std::memory_order_release);
+}
+
+void frame_capture_begin() {
+    state().begin_requested.store(true, std::memory_order_release);
 }
 
 uint32_t frame_capture_frames() {

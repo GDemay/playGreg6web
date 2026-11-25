@@ -2707,6 +2707,17 @@ std::string last_summary() {
     return boot().last_summary;
 }
 
+PresentStatus present_status() {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    const gpu::PresentSample last = b.present_samples.last();
+    PresentStatus s;
+    s.presents = b.present_samples.total();
+    s.draws_per_frame = last.draws;
+    s.wall_ms = last.wall_ms;
+    return s;
+}
+
 LiveCounters live_counters() {
     BootState& b = boot();
     LiveCounters c;
