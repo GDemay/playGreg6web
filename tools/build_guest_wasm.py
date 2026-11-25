@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f; Track 5 / W110).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f; Track 5 / W110; Track 4 / T44).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
@@ -196,7 +196,15 @@ LLVM_NM_UNDEFINED_TYPES: frozenset[str] = frozenset({"U", "w"})
 LLVM_NM_MAX_CMD_CHARS = 16_384
 SIDE_MODULE_MIN_INPUT_BYTES_FOR_SIZE_GUARD = 64 * 1024  # 64 KiB
 SIDE_MODULE_MIN_OUTPUT_BYTES = 4096  # 4 KiB (catches ~676 B stripped side modules)
-SIDE_MODULE_REQUIRED_EXPORT_NAMES: frozenset[str] = frozenset({"__wasm_call_ctors"})
+SIDE_MODULE_REQUIRED_EXPORT_NAMES: frozenset[str] = frozenset(
+    {
+        "__wasm_call_ctors",
+        "pg6_import_thunks",
+        "pg6_import_thunk_count",
+        "pg6_export_thunks",
+        "pg6_export_thunk_count",
+    }
+)
 SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous", "asymmetric"})
 DEFAULT_SPLIT_STRATEGY = "balanced"
 # Proven Chrome two-part ceiling: pack part_0 up to ~994 MiB so part_1 lands near ~171 MiB.
@@ -216,6 +224,10 @@ SIDE_MODULE_REQUIRED_EXPORT_PREFIXES: tuple[str, ...] = (
     "pg6_register_",
     "pg6_dispatch_",
     "pg6_entry_",
+    "pg6_import_thunks_",
+    "pg6_import_thunk_count_",
+    "pg6_export_thunks_",
+    "pg6_export_thunk_count_",
     "__playgta6_register_lifted_functions_",
     "__playgta6_lifted_functions_",
     "__playgta6_lifted_function_count_",
@@ -695,6 +707,7 @@ class BuildReport:
     indirect_dispatch_source: str = "default"
     verify_max_table_imports: int | None = None
     guest_manifest: str | None = None
+    guest_dll_modules: tuple[str, ...] = ()
     wasm_metrics: WasmBuildMetrics | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -729,6 +742,7 @@ class BuildReport:
             "indirect_dispatch_source": self.indirect_dispatch_source,
             "verify_max_table_imports": self.verify_max_table_imports,
             "guest_manifest": self.guest_manifest,
+            "guest_dll_modules": list(self.guest_dll_modules),
             "wasm_metrics": self.wasm_metrics.to_dict() if self.wasm_metrics is not None else None,
             "compile_flags": list(self.compile_flags),
             "link_flags": list(self.link_flags),
@@ -1564,6 +1578,16 @@ def is_registration_unit(unit: SourceUnit) -> bool:
     return unit.kind == "ll" and name == "functions.ll"
 
 
+def is_side_shard_unit(unit: SourceUnit) -> bool:
+    """Return True for any lifted LLVM IR `.ll` unit that belongs in a shard side module.
+
+    Includes standard `shard-*.ll` units and any non-registration guest DLL `.ll` file
+    (e.g. `bink2scarlett/*.ll` or `bink2scarlett/lift/*.ll` other than `functions.ll`)
+    so lifted guest DLL IR is never dropped or misclassified into `runtime.wasm`.
+    """
+    return unit.kind == "ll" and not is_registration_unit(unit)
+
+
 def sample_units(units: Sequence[SourceUnit], count: int) -> list[SourceUnit]:
     """`count` shards spread evenly over the set (registration / thunks are not sampled)."""
     shards = [unit for unit in units if is_shard_unit(unit)]
@@ -1848,7 +1872,7 @@ def partition_shard_units(
     """
     bucket_limit = parse_split_modules(split_modules)
     split_strat = parse_split_strategy(strategy)
-    shards = [item for item in items if is_shard_unit(item.unit)]
+    shards = [item for item in items if is_side_shard_unit(item.unit)]
     if not shards:
         return []
     if split_strat == "contiguous":
@@ -2044,6 +2068,246 @@ def is_program_build(source_root: Path, units: Sequence[SourceUnit]) -> bool:
     return False
 
 
+_SAFE_MODULE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _load_program_manifest_data(
+    source_root: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> Mapping[str, Any] | None:
+    """Load `program-manifest.json` as a mapping if present and valid JSON."""
+    prog_manifest = (
+        manifest_path
+        if manifest_path is not None and manifest_path.name == PROGRAM_MANIFEST_FILE
+        else (source_root / PROGRAM_MANIFEST_FILE)
+    )
+    if not prog_manifest.is_file():
+        return None
+    try:
+        data = load_build_manifest(prog_manifest)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, Mapping) else None
+
+
+def _sanitize_guest_module_name(raw: Any) -> str | None:
+    """Sanitize a guest module name so host paths, usernames, or traversal never leak."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().replace("\\", "/").rstrip("/")
+    if not text:
+        return None
+    if text.endswith(f"/{BUILD_MANIFEST_FILE}"):
+        text = text[: -len(BUILD_MANIFEST_FILE)].rstrip("/")
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    if ":" in text:
+        text = text.rsplit(":", 1)[-1]
+    text = _SAFE_MODULE_NAME_RE.sub("", text).strip(".")
+    if not text or text in {".", ".."}:
+        return None
+    return text
+
+
+def _is_guest_dll_entry(item: Any, module_name: str) -> bool:
+    """Return True when a `program-manifest.json` module entry is a lifted guest DLL."""
+    if isinstance(item, Mapping):
+        role = item.get("role")
+        if isinstance(role, str) and role.strip():
+            role_lower = role.strip().lower()
+            if role_lower in {"exe", "main"}:
+                return False
+            if role_lower == "dll":
+                return True
+        for key in ("file", "dll"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                lowered = val.strip().lower()
+                if lowered.endswith(".exe"):
+                    return False
+                if lowered.endswith(".dll"):
+                    return True
+    lowered_name = module_name.lower()
+    if lowered_name in {"main", "program", "boot"} or lowered_name.endswith(".exe"):
+        return False
+    return True
+
+
+def discover_guest_dll_modules(
+    source_root: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> tuple[str, ...]:
+    """Return the sanitized, manifest-ordered tuple of lifted guest DLL module names.
+
+    Reads `program-manifest.json` (`modules[]`), excludes the main executable (`role == "exe"`,
+    `.exe` file, or `main`), strips any path components, and preserves deterministic order
+    (e.g. `("vcruntime140", "bink2scarlett")`). Returns `()` for single-module builds.
+    """
+    data = _load_program_manifest_data(source_root, manifest_path=manifest_path)
+    if data is None:
+        return ()
+    raw_modules = data.get("modules")
+    if not isinstance(raw_modules, list):
+        return ()
+    dll_modules: list[str] = []
+    seen: set[str] = set()
+    for item in raw_modules:
+        raw_name = _module_name_from_entry(item)
+        if not raw_name:
+            continue
+        clean_name = _sanitize_guest_module_name(raw_name)
+        if not clean_name or not _is_guest_dll_entry(item, clean_name):
+            continue
+        if clean_name not in seen:
+            seen.add(clean_name)
+            dll_modules.append(clean_name)
+    return tuple(dll_modules)
+
+
+def _parse_manifest_va(raw: Any) -> int | None:
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str):
+        token = raw.strip()
+        if not token:
+            return None
+        try:
+            value = int(token, 16) if token.lower().startswith("0x") else int(token, 10)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+    return None
+
+
+def _add_va_function_symbols(target: set[str], raw_va: Any) -> None:
+    va = _parse_manifest_va(raw_va)
+    if va is None:
+        return
+    target.add(f"sub_{va:X}")
+    target.add(f"sub_{va:x}")
+
+
+def extract_program_required_exports(
+    source_root: Path,
+    *,
+    manifest_path: Path | None = None,
+) -> frozenset[str]:
+    """Extract required cross-module / guest-DLL export symbols from `program-manifest.json`.
+
+    Retains every lifted module's registration/dispatch/import-bridge symbols, explicit
+    `required_exports` / `exports.symbols` names, and lifted entry-point / TLS / guest-bound
+    IAT target `sub_<VA>` symbols so `-sSIDE_MODULE=2` pruning never drops live guest DLL
+    entries (e.g. `bink2scarlett`, `vcruntime140`).
+    """
+    data = _load_program_manifest_data(source_root, manifest_path=manifest_path)
+    if data is None:
+        return frozenset()
+
+    symbols: set[str] = set()
+
+    def _take_sym(val: Any) -> None:
+        if isinstance(val, str):
+            tok = val.strip()
+            if tok:
+                symbols.add(tok)
+
+    raw_top_req = data.get("required_exports")
+    if isinstance(raw_top_req, list):
+        for sym in raw_top_req:
+            _take_sym(sym)
+
+    raw_modules = data.get("modules")
+    if isinstance(raw_modules, list):
+        for mod in raw_modules:
+            if not isinstance(mod, Mapping):
+                continue
+            mod_name = _sanitize_guest_module_name(_module_name_from_entry(mod))
+            if mod_name:
+                symbols.update(
+                    {
+                        f"__playgta6_register_lifted_functions_{mod_name}",
+                        f"__playgta6_lifted_functions_{mod_name}",
+                        f"__playgta6_lifted_function_count_{mod_name}",
+                        f"{SHARD_DISPATCH_TABLE_PREFIX}{mod_name}",
+                        f"pg6_import_thunks_{mod_name}",
+                        f"pg6_import_thunk_count_{mod_name}",
+                    }
+                )
+            for key in (
+                "shard_dispatch",
+                "shard_dispatch_symbol",
+                "shard_dispatch_table",
+                "registration_symbol",
+            ):
+                _take_sym(mod.get(key))
+
+            reg = mod.get("registration")
+            if isinstance(reg, Mapping):
+                for key in (
+                    "register_function",
+                    "table_symbol",
+                    "count_symbol",
+                    "shard_dispatch_symbol",
+                    "shard_dispatch",
+                    "shard_dispatch_table",
+                ):
+                    _take_sym(reg.get(key))
+
+            bridge = mod.get("bridge")
+            if isinstance(bridge, Mapping):
+                for key in ("thunks_symbol", "thunk_count_symbol"):
+                    _take_sym(bridge.get(key))
+
+            _add_va_function_symbols(symbols, mod.get("entry_point"))
+
+            tls = mod.get("tls")
+            if isinstance(tls, Mapping):
+                callbacks = tls.get("callbacks")
+                if isinstance(callbacks, list):
+                    for cb in callbacks:
+                        _add_va_function_symbols(symbols, cb)
+
+            iat_prefill = mod.get("iat_prefill")
+            if isinstance(iat_prefill, list):
+                for entry in iat_prefill:
+                    if isinstance(entry, Mapping):
+                        _add_va_function_symbols(symbols, entry.get("value"))
+
+            mod_exports = mod.get("exports")
+            if isinstance(mod_exports, Mapping):
+                for list_key in ("symbols", "functions"):
+                    sym_list = mod_exports.get(list_key)
+                    if isinstance(sym_list, list):
+                        for item in sym_list:
+                            if isinstance(item, str):
+                                if item.strip().lower().startswith("0x"):
+                                    _add_va_function_symbols(symbols, item)
+                                else:
+                                    _take_sym(item)
+                            elif isinstance(item, Mapping):
+                                _take_sym(item.get("symbol"))
+                                _add_va_function_symbols(symbols, item.get("va") or item.get("target"))
+
+            mod_req = mod.get("required_exports")
+            if isinstance(mod_req, list):
+                for sym in mod_req:
+                    _take_sym(sym)
+
+    raw_imports = data.get("imports")
+    if isinstance(raw_imports, list):
+        for imp in raw_imports:
+            if not isinstance(imp, Mapping):
+                continue
+            if imp.get("binding") == "guest" and imp.get("kind") != "data":
+                _add_va_function_symbols(symbols, imp.get("target"))
+
+    return frozenset(symbols)
+
+
 def _normalize_dispatch_token(raw: Any) -> str | None:
     if not isinstance(raw, str):
         return None
@@ -2067,6 +2331,11 @@ def _extract_manifest_indirect_dispatch(data: Any) -> str | None:
         opt_mode = _normalize_dispatch_token(options.get("indirect_dispatch"))
         if opt_mode is not None:
             return opt_mode
+        opt_build = options.get("build")
+        if isinstance(opt_build, Mapping):
+            opt_build_mode = _normalize_dispatch_token(opt_build.get("indirect_dispatch"))
+            if opt_build_mode is not None:
+                return opt_build_mode
 
     lift = data.get("lift")
     if isinstance(lift, Mapping):
@@ -2104,6 +2373,16 @@ def _extract_manifest_indirect_dispatch(data: Any) -> str | None:
                 sym = mod.get(key)
                 if isinstance(sym, str) and sym.startswith(SHARD_DISPATCH_TABLE_PREFIX):
                     return "shard"
+            reg = mod.get("registration")
+            if isinstance(reg, Mapping):
+                for key in (
+                    "shard_dispatch",
+                    "shard_dispatch_symbol",
+                    "shard_dispatch_table",
+                ):
+                    sym = reg.get(key)
+                    if isinstance(sym, str) and sym.startswith(SHARD_DISPATCH_TABLE_PREFIX):
+                        return "shard"
         if seen_table:
             return "table"
 
@@ -3529,6 +3808,7 @@ def write_guest_manifest(
     wasm_metrics: WasmBuildMetrics | None,
     max_side_module_mib: int | None = None,
     side_module_mode: int | None = None,
+    guest_dll_modules: Sequence[str] = (),
 ) -> Path:
     """Write or update `guest_manifest.json` with backwards-compatible fields + `wasmMetrics`."""
     manifest_path = output_dir / GUEST_MANIFEST_FILE
@@ -3541,6 +3821,14 @@ def write_guest_manifest(
         except (OSError, json.JSONDecodeError):
             payload = {}
 
+    sanitized_dlls: list[str] = []
+    seen_dlls: set[str] = set()
+    for raw_mod in guest_dll_modules:
+        clean_mod = _sanitize_guest_module_name(raw_mod)
+        if clean_mod and clean_mod not in seen_dlls:
+            seen_dlls.add(clean_mod)
+            sanitized_dlls.append(clean_mod)
+
     payload["schemaVersion"] = SCHEMA_VERSION
     payload["runtimeJs"] = RUNTIME_JS
     payload["runtimeWasm"] = RUNTIME_WASM
@@ -3551,6 +3839,7 @@ def write_guest_manifest(
         payload["maxSideModuleMiB"] = max_side_module_mib
     if side_module_mode is not None:
         payload["sideModuleMode"] = side_module_mode
+    payload["guest_dll_modules"] = sanitized_dlls
     # Keep the legacy name list for loaders; also emit sized telemetry for each part.
     payload["sideModules"] = [side.name for side in side_modules]
     payload["sideModuleSizes"] = [side.to_manifest_dict() for side in side_modules]
@@ -4013,12 +4302,17 @@ def run_build(
         return report
 
     source_root = resolve_source_root(source_dir)
+    manifest_arg = source_dir if source_dir.is_file() else None
     all_units = discover_sources(source_dir)
     program_build = is_program_build(source_root, all_units)
+    report.guest_dll_modules = discover_guest_dll_modules(
+        source_root,
+        manifest_path=manifest_arg,
+    )
     dispatch_info = detect_indirect_dispatch(
         source_root,
         all_units,
-        manifest_path=source_dir if source_dir.is_file() else None,
+        manifest_path=manifest_arg,
     )
     report.indirect_dispatch = dispatch_info.mode
     report.indirect_dispatch_source = dispatch_info.source
@@ -4214,7 +4508,7 @@ def run_build(
         non_shard_items = [
             item
             for item in ordered
-            if not is_shard_unit(item.unit) and not is_registration_unit(item.unit)
+            if not is_side_shard_unit(item.unit) and not is_registration_unit(item.unit)
         ]
         all_side_buckets: list[tuple[str, list[UnitBuildResult]]] = [
             ("shards", bucket) for bucket in buckets
@@ -4342,12 +4636,20 @@ def run_build(
             nm_main_objects = list(main_objects) + [
                 p for p in extra_objects if p.suffix.lower() == ".o" and p.is_file()
             ]
+            manifest_required_exports = extract_program_required_exports(
+                source_root,
+                manifest_path=manifest_arg,
+            )
+            effective_required_names = (
+                SIDE_MODULE_REQUIRED_EXPORT_NAMES | manifest_required_exports
+            )
             try:
                 cross_exports_by_part = compute_side_module_cross_exports(
                     [plan[2] for plan in side_plans],
                     nm_main_objects,
                     llvm_nm_path,
                     run_command=runner,
+                    required_names=effective_required_names,
                 )
             except BuildGuestWasmError as exc:
                 report.ok = False
@@ -4529,6 +4831,7 @@ def run_build(
         wasm_metrics=report.wasm_metrics,
         max_side_module_mib=report.max_side_module_mib if report.split_modules > 1 else None,
         side_module_mode=report.side_module_mode if report.split_modules > 1 else None,
+        guest_dll_modules=report.guest_dll_modules,
     )
     report.guest_manifest = GUEST_MANIFEST_FILE
 
@@ -4571,6 +4874,8 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
             f"  Indirect dispatch: {report.indirect_dispatch} "
             f"(detected from {report.indirect_dispatch_source})"
         )
+    if report.guest_dll_modules:
+        lines.append("  Guest DLL modules: " + ", ".join(report.guest_dll_modules))
     if report.verify_max_table_imports is not None:
         lines.append(f"  Max table imports limit: {report.verify_max_table_imports}")
     if report.linked_guest_boot:
