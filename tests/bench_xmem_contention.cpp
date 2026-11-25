@@ -96,6 +96,10 @@ int main(int argc, char** argv) {
             return 64;
         }
     }
+#if !defined(_WIN32)
+    std::printf("bench_xmem_contention: shared views are write tracked on Windows only, skipped\n");
+    return 0;
+#endif
     xmem_reset_for_testing();
     auto* arena = win32::get_vmem_arena();
     if (!arena->has_shared_zone()) {
