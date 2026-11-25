@@ -1514,9 +1514,18 @@ function normalizeSplashPixelFormat(format, payload) {
     if (key === 'yuva420p' || key === 'yuva420') {
       return 'yuva420p';
     }
+    if (key === 'nv12') {
+      return 'nv12';
+    }
     return key;
   }
   const planes = payload && payload.planes && typeof payload.planes === 'object' ? payload.planes : null;
+  const hasNv12 =
+    (planes && planes.y !== undefined && planes.uv !== undefined && planes.u === undefined && planes.v === undefined) ||
+    (payload && payload.y !== undefined && payload.uv !== undefined && payload.u === undefined && payload.v === undefined);
+  if (hasNv12) {
+    return 'nv12';
+  }
   const hasYuv =
     (planes && (planes.y !== undefined || planes.u !== undefined || planes.v !== undefined)) ||
     (payload && (payload.y !== undefined || payload.u !== undefined || payload.v !== undefined));
@@ -1527,6 +1536,124 @@ function normalizeSplashPixelFormat(format, payload) {
     return hasAlpha ? 'yuva420p' : 'yuv420p';
   }
   return 'rgba8';
+}
+
+function normalizeBinkChromaOrderInput(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeBinkLoadOpInput(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function buildMergedBinkPresenterOptions(baseOptions, extraOptions) {
+  const merged = {};
+  if (baseOptions && typeof baseOptions === 'object') {
+    Object.assign(merged, baseOptions);
+  }
+  if (extraOptions && typeof extraOptions === 'object') {
+    Object.assign(merged, extraOptions);
+  }
+  if (merged.chromaOrder !== undefined && merged.chromaOrder !== null) {
+    const norm = normalizeBinkChromaOrderInput(merged.chromaOrder);
+    if (norm === 'yuv' || norm === 'yvu') {
+      merged.chromaOrder = norm;
+    }
+  }
+  if (merged.loadOp !== undefined && merged.loadOp !== null) {
+    const norm = normalizeBinkLoadOpInput(merged.loadOp);
+    if (norm === 'clear' || norm === 'load') {
+      merged.loadOp = norm;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : null;
+}
+
+const DEFAULT_FALLBACK_SAMPLER_DESCRIPTORS = Object.freeze({
+  filtering: Object.freeze({
+    label: 'fallback-sampler:filtering',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+  }),
+  'non-filtering': Object.freeze({
+    label: 'fallback-sampler:non-filtering',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'nearest',
+    minFilter: 'nearest',
+    mipmapFilter: 'nearest',
+  }),
+  comparison: Object.freeze({
+    label: 'fallback-sampler:comparison',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'nearest',
+    compare: 'less-equal',
+  }),
+});
+
+function normalizeFallbackSamplerKind(kind) {
+  if (typeof kind !== 'string') {
+    return 'filtering';
+  }
+  const key = kind.trim().toLowerCase();
+  if (
+    key === 'non-filtering' ||
+    key === 'non_filtering' ||
+    key === 'nonfiltering' ||
+    key === 'point' ||
+    key === 'nearest' ||
+    key === 'nearest-clamp' ||
+    key === 'point-clamp'
+  ) {
+    return 'non-filtering';
+  }
+  if (
+    key === 'comparison' ||
+    key === 'compare' ||
+    key === 'shadow' ||
+    key === 'less-equal' ||
+    key === 'less_equal' ||
+    key === 'pcf'
+  ) {
+    return 'comparison';
+  }
+  return 'filtering';
+}
+
+function resolveMaxConcurrentCompilesOption(options) {
+  if (options && typeof options === 'object') {
+    if (
+      options.maxConcurrentCompiles === 0 ||
+      (Number.isInteger(options.maxConcurrentCompiles) && options.maxConcurrentCompiles >= 1)
+    ) {
+      return options.maxConcurrentCompiles;
+    }
+    if (
+      options.maxConcurrentPipelineCompiles === 0 ||
+      (Number.isInteger(options.maxConcurrentPipelineCompiles) &&
+        options.maxConcurrentPipelineCompiles >= 1)
+    ) {
+      return options.maxConcurrentPipelineCompiles;
+    }
+  }
+  return DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES;
 }
 
 function isExternalImageLike(obj) {
@@ -1565,6 +1692,11 @@ class WgpuCommandProcessor {
     this.computePipelines = new Map();
     this._pipelineBindGroupLayouts = new Map();
     this._computePipelineBindGroupLayouts = new Map();
+    this._pipelineReflectionGroups = new Map();
+    this._computePipelineReflectionGroups = new Map();
+    this._defaultFallbackSamplers = new Map();
+    this._fallbackSamplersCreated = 0;
+    this._fallbackSamplerBindingsSynthesized = 0;
     this._shaderReflectionKeys = new Map();
     this.frameCount = 0;
     this.ring = null;
@@ -1677,12 +1809,31 @@ class WgpuCommandProcessor {
     this._lastPassTimings = null;
     this._pendingTimerReadbacks = new Set();
 
-    // Optional WebGpuPipelineCache for reflection layout deduplication
-    this.pipelineCache = options.pipelineCache || null;
+    // Optional WebGpuPipelineCache for reflection layout deduplication & W167 fallback sampler synthesis
+    this._ownsPipelineCache = false;
+    this.pipelineCache = null;
+    if (options.pipelineCache && typeof options.pipelineCache === 'object') {
+      this.pipelineCache = options.pipelineCache;
+    } else if (options.enablePipelineCache === true && device && typeof device === 'object') {
+      const PipelineCacheCtor = resolveSubsystemCtor(
+        options.WebGpuPipelineCache,
+        'PlayGta6PipelineCache',
+        'WebGpuPipelineCache',
+        './pipeline_cache.js'
+      );
+      if (PipelineCacheCtor) {
+        this.pipelineCache = new PipelineCacheCtor({
+          ...(options.pipelineCacheOptions || {}),
+          device,
+        });
+        this._ownsPipelineCache = true;
+      }
+    }
 
-    // W103: bounded-concurrency async PSO compilation. render_state_packets.js routes
-    // CreateRenderPipeline2 / CreateComputePipeline2 / v1 CreateComputePipeline through it when the
-    // device exposes create*PipelineAsync, so a burst of pipelines no longer stalls the GPU process.
+    // W103 / W168: priority-scheduled, bounded-concurrency async PSO compilation.
+    // render_state_packets.js routes CreateRenderPipeline2 / CreateComputePipeline2 / v1
+    // CreateComputePipeline through it when the device exposes create*PipelineAsync, compiling
+    // graphics pipelines ahead of background compute during shader bursts.
     this._pendingAsyncPipelineSkips = 0;
     this.asyncPipelineCache = null;
     if (options.asyncPipelineCache && typeof options.asyncPipelineCache === 'object') {
@@ -1695,15 +1846,21 @@ class WgpuCommandProcessor {
         './async_pipeline_cache.js'
       );
       if (AsyncPipelineCacheCtor) {
-        this.asyncPipelineCache = new AsyncPipelineCacheCtor({
+        const maxConcurrentCompiles = resolveMaxConcurrentCompilesOption(options);
+        const prioritizeGraphics = options.prioritizeGraphics !== false;
+        const asyncCacheOpts = {
           device,
-          maxConcurrent:
-            Number.isInteger(options.maxConcurrentPipelineCompiles) &&
-            options.maxConcurrentPipelineCompiles >= 1
-              ? options.maxConcurrentPipelineCompiles
-              : DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
+          maxConcurrentCompiles,
+          prioritizeGraphics,
           logger: this._logger ? this._createAsyncPipelineLogger() : null,
-        });
+        };
+        if (maxConcurrentCompiles > 0) {
+          asyncCacheOpts.maxConcurrent = maxConcurrentCompiles;
+        }
+        if (typeof options.now === 'function') {
+          asyncCacheOpts.nowFn = options.now;
+        }
+        this.asyncPipelineCache = new AsyncPipelineCacheCtor(asyncCacheOpts);
       }
     }
 
@@ -1900,12 +2057,26 @@ class WgpuCommandProcessor {
       this.loadWgslPack(options.wgslPackBuffer);
     }
 
-    // 8. BinkVideoPresenter (W38) + SplashFrameBridge (G26)
+    // 8. BinkVideoPresenter (W38 / W165) + SplashFrameBridge (G26)
     this._BinkVideoPresenterCtor =
       options.BinkVideoPresenter !== undefined ? options.BinkVideoPresenter : undefined;
     this._SplashFrameBridgeCtor =
       options.SplashFrameBridge !== undefined ? options.SplashFrameBridge : undefined;
-    this._binkPresenterOptions = options.binkPresenterOptions || null;
+    const topLevelBinkOpts = {};
+    const initBinkChromaOrder =
+      options.binkChromaOrder !== undefined ? options.binkChromaOrder : options.chromaOrder;
+    if (initBinkChromaOrder !== undefined && initBinkChromaOrder !== null) {
+      topLevelBinkOpts.chromaOrder = initBinkChromaOrder;
+    }
+    const initBinkLoadOp =
+      options.binkLoadOp !== undefined ? options.binkLoadOp : options.loadOp;
+    if (initBinkLoadOp !== undefined && initBinkLoadOp !== null) {
+      topLevelBinkOpts.loadOp = initBinkLoadOp;
+    }
+    this._binkPresenterOptions = buildMergedBinkPresenterOptions(
+      topLevelBinkOpts,
+      options.binkPresenterOptions
+    );
     this._splashBridgeOptions =
       options.splashFrameBridgeOptions || options.splashBridgeOptions || null;
     this._splashBridgeExplicitlyDisabled = options.enableSplashBridge === false;
@@ -1914,6 +2085,20 @@ class WgpuCommandProcessor {
     this.binkPresenter = null;
     if (options.binkPresenter && typeof options.binkPresenter === 'object') {
       this.binkPresenter = options.binkPresenter;
+      if (this._binkPresenterOptions) {
+        if (
+          this._binkPresenterOptions.chromaOrder !== undefined &&
+          typeof this.binkPresenter.setChromaOrder === 'function'
+        ) {
+          this.binkPresenter.setChromaOrder(this._binkPresenterOptions.chromaOrder);
+        }
+        if (
+          this._binkPresenterOptions.loadOp !== undefined &&
+          typeof this.binkPresenter.setLoadOp === 'function'
+        ) {
+          this.binkPresenter.setLoadOp(this._binkPresenterOptions.loadOp);
+        }
+      }
     }
 
     this._ownsSplashFrameBridge = false;
@@ -2819,9 +3004,24 @@ class WgpuCommandProcessor {
       if (!layout) {
         return null;
       }
+      let entries = bgMeta.entries;
+      if (
+        profile === FALLBACK_PROFILE.TEXTURED_QUAD_24B &&
+        groupIndex === 0 &&
+        !bgMeta.hasSampler &&
+        typeof this.device.createSampler === 'function'
+      ) {
+        const synth = this.synthesizeFallbackSamplerEntries(
+          [{ binding: 1, sampler: { type: 'filtering' } }],
+          entries
+        );
+        if (synth && Array.isArray(synth.entries)) {
+          entries = synth.entries;
+        }
+      }
       const bg = this.device.createBindGroup({
         layout,
-        entries: bgMeta.entries,
+        entries,
       });
       this._specializedFallbackBindGroups.set(key, bg);
       return bg;
@@ -3127,7 +3327,31 @@ class WgpuCommandProcessor {
             : baseNow;
       }
 
+      const requestedChromaOrder = normalizeBinkChromaOrderInput(
+        opts.chromaOrder !== undefined ? opts.chromaOrder : framePayload.chromaOrder
+      );
+      const requestedLoadOp = normalizeBinkLoadOpInput(
+        opts.loadOp !== undefined ? opts.loadOp : framePayload.loadOp
+      );
+      const requestedColorRange =
+        opts.colorRange !== undefined ? opts.colorRange : framePayload.colorRange;
+
       if (bridge) {
+        const activePresenter =
+          presenter ||
+          (typeof bridge._ensurePresenter === 'function' ? bridge._ensurePresenter(this.device) : null);
+        if (activePresenter) {
+          if (
+            requestedChromaOrder !== null &&
+            typeof activePresenter.setChromaOrder === 'function'
+          ) {
+            activePresenter.setChromaOrder(requestedChromaOrder);
+          }
+          if (requestedLoadOp !== null && typeof activePresenter.setLoadOp === 'function') {
+            activePresenter.setLoadOp(requestedLoadOp);
+          }
+        }
+
         let pushed;
         if (externalImage) {
           const extOpts = {};
@@ -3166,6 +3390,25 @@ class WgpuCommandProcessor {
                       ? framePayload.rgba
                       : framePayload.data,
             };
+          } else if (format === 'nv12') {
+            planes = {
+              y:
+                rawPlanes.y !== undefined
+                  ? rawPlanes.y
+                  : rawPlanes.yPlane !== undefined
+                    ? rawPlanes.yPlane
+                    : framePayload.y !== undefined
+                      ? framePayload.y
+                      : framePayload.yPlane,
+              uv:
+                rawPlanes.uv !== undefined
+                  ? rawPlanes.uv
+                  : rawPlanes.uvPlane !== undefined
+                    ? rawPlanes.uvPlane
+                    : framePayload.uv !== undefined
+                      ? framePayload.uv
+                      : framePayload.uvPlane,
+            };
           } else {
             planes = {
               y: rawPlanes.y !== undefined ? rawPlanes.y : framePayload.y,
@@ -3176,7 +3419,7 @@ class WgpuCommandProcessor {
               planes.a = rawPlanes.a !== undefined ? rawPlanes.a : framePayload.a;
             }
           }
-          pushed = bridge.pushRawFrame({
+          const rawFrameDesc = {
             width: framePayload.width,
             height: framePayload.height,
             format,
@@ -3185,7 +3428,23 @@ class WgpuCommandProcessor {
             colorSpace: framePayload.colorSpace,
             source: framePayload.source,
             frameIndex: framePayload.frameIndex,
-          });
+          };
+          if (requestedColorRange !== undefined) {
+            rawFrameDesc.colorRange = requestedColorRange;
+          }
+          if (framePayload.yStride !== undefined) {
+            rawFrameDesc.yStride = framePayload.yStride;
+          }
+          if (framePayload.uvStride !== undefined) {
+            rawFrameDesc.uvStride = framePayload.uvStride;
+          }
+          if (framePayload.aStride !== undefined) {
+            rawFrameDesc.aStride = framePayload.aStride;
+          }
+          if (framePayload.strideBytes !== undefined) {
+            rawFrameDesc.strideBytes = framePayload.strideBytes;
+          }
+          pushed = bridge.pushRawFrame(rawFrameDesc);
         }
 
         const renderResult = bridge.renderFrame(
@@ -3218,6 +3477,7 @@ class WgpuCommandProcessor {
               timestampMs: renderResult.timestampMs,
             });
           }
+          const finalPresenter = this.binkPresenter || bridge.presenter || null;
           return {
             ok: true,
             presented: true,
@@ -3233,6 +3493,14 @@ class WgpuCommandProcessor {
             source: renderResult.source,
             viewport: renderResult.viewport || null,
             timestampMs: renderResult.timestampMs,
+            chromaOrder:
+              finalPresenter && typeof finalPresenter.chromaOrder === 'string'
+                ? finalPresenter.chromaOrder
+                : requestedChromaOrder,
+            loadOp:
+              finalPresenter && typeof finalPresenter.loadOp === 'string'
+                ? finalPresenter.loadOp
+                : requestedLoadOp,
           };
         }
 
@@ -3251,6 +3519,10 @@ class WgpuCommandProcessor {
 
       // Direct BinkVideoPresenter fallback when SplashFrameBridge is disabled/unavailable
       // but an explicit BinkVideoPresenter instance was injected.
+      if (requestedLoadOp !== null && typeof presenter.setLoadOp === 'function') {
+        presenter.setLoadOp(requestedLoadOp);
+      }
+
       const format = normalizeSplashPixelFormat(framePayload.format, framePayload);
       const rawPlanes =
         framePayload.planes && typeof framePayload.planes === 'object' ? framePayload.planes : {};
@@ -3264,6 +3536,9 @@ class WgpuCommandProcessor {
           : externalImage && externalImage.height;
 
       if (format === 'rgba8') {
+        if (requestedChromaOrder !== null && typeof presenter.setChromaOrder === 'function') {
+          presenter.setChromaOrder(requestedChromaOrder);
+        }
         const rgba =
           rawPlanes.rgba !== undefined
             ? rawPlanes.rgba
@@ -3274,7 +3549,38 @@ class WgpuCommandProcessor {
                 : framePayload.data !== undefined
                   ? framePayload.data
                   : externalImage && externalImage.data;
-        presenter.uploadRgbaFrame(rgba, width, height);
+        if (framePayload.strideBytes !== undefined) {
+          presenter.uploadRgbaFrame(rgba, width, height, { strideBytes: framePayload.strideBytes });
+        } else {
+          presenter.uploadRgbaFrame(rgba, width, height);
+        }
+      } else if (format === 'nv12' && typeof presenter.uploadNv12Frame === 'function') {
+        const nv12 = {
+          y:
+            rawPlanes.y !== undefined
+              ? rawPlanes.y
+              : rawPlanes.yPlane !== undefined
+                ? rawPlanes.yPlane
+                : framePayload.y !== undefined
+                  ? framePayload.y
+                  : framePayload.yPlane,
+          uv:
+            rawPlanes.uv !== undefined
+              ? rawPlanes.uv
+              : rawPlanes.uvPlane !== undefined
+                ? rawPlanes.uvPlane
+                : framePayload.uv !== undefined
+                  ? framePayload.uv
+                  : framePayload.uvPlane,
+          width,
+          height,
+        };
+        if (framePayload.yStride !== undefined) nv12.yStride = framePayload.yStride;
+        if (framePayload.uvStride !== undefined) nv12.uvStride = framePayload.uvStride;
+        if (framePayload.colorSpace) nv12.colorSpace = framePayload.colorSpace;
+        if (requestedColorRange !== undefined) nv12.colorRange = requestedColorRange;
+        if (requestedChromaOrder !== null) nv12.chromaOrder = requestedChromaOrder;
+        presenter.uploadNv12Frame(nv12);
       } else {
         const yuv = {
           y: rawPlanes.y !== undefined ? rawPlanes.y : framePayload.y,
@@ -3286,8 +3592,19 @@ class WgpuCommandProcessor {
         if (format === 'yuva420p') {
           yuv.a = rawPlanes.a !== undefined ? rawPlanes.a : framePayload.a;
         }
+        if (framePayload.yStride !== undefined) yuv.yStride = framePayload.yStride;
+        if (framePayload.uvStride !== undefined) yuv.uvStride = framePayload.uvStride;
+        if (framePayload.uStride !== undefined) yuv.uStride = framePayload.uStride;
+        if (framePayload.vStride !== undefined) yuv.vStride = framePayload.vStride;
+        if (framePayload.aStride !== undefined) yuv.aStride = framePayload.aStride;
         if (framePayload.colorSpace) {
           yuv.colorSpace = framePayload.colorSpace;
+        }
+        if (requestedColorRange !== undefined) {
+          yuv.colorRange = requestedColorRange;
+        }
+        if (requestedChromaOrder !== null) {
+          yuv.chromaOrder = requestedChromaOrder;
         }
         presenter.uploadYuv420Frame(yuv);
       }
@@ -3295,7 +3612,23 @@ class WgpuCommandProcessor {
       const encoder = this.device.createCommandEncoder({
         label: 'playgta6-wgpu-worker-bink-encoder',
       });
-      const presentResult = presenter.presentFrame(encoder, targetView, targetWidth, targetHeight);
+      const directPresentOpts = {};
+      if (requestedLoadOp !== null) {
+        directPresentOpts.loadOp = requestedLoadOp;
+      }
+      const clearColorOpt =
+        opts.clearColor !== undefined ? opts.clearColor : framePayload.clearColor;
+      if (clearColorOpt !== undefined) {
+        directPresentOpts.clearColor = clearColorOpt;
+      }
+      const opacityOpt = opts.opacity !== undefined ? opts.opacity : framePayload.opacity;
+      if (opacityOpt !== undefined) {
+        directPresentOpts.opacity = opacityOpt;
+      }
+      const presentResult =
+        Object.keys(directPresentOpts).length > 0
+          ? presenter.presentFrame(encoder, targetView, targetWidth, targetHeight, directPresentOpts)
+          : presenter.presentFrame(encoder, targetView, targetWidth, targetHeight);
       if (this.device.queue && typeof this.device.queue.submit === 'function') {
         const cmdBuf = encoder && typeof encoder.finish === 'function' ? encoder.finish() : encoder;
         this.device.queue.submit([cmdBuf]);
@@ -3339,6 +3672,18 @@ class WgpuCommandProcessor {
           source: framePayload.source || 'raw',
           viewport: presentResult.viewport || null,
           timestampMs,
+          chromaOrder:
+            presentResult.chromaOrder !== undefined
+              ? presentResult.chromaOrder
+              : typeof presenter.chromaOrder === 'string'
+                ? presenter.chromaOrder
+                : requestedChromaOrder,
+          loadOp:
+            presentResult.loadOp !== undefined
+              ? presentResult.loadOp
+              : typeof presenter.loadOp === 'string'
+                ? presenter.loadOp
+                : requestedLoadOp,
         };
       }
 
@@ -3787,6 +4132,20 @@ class WgpuCommandProcessor {
     }
     return {
       ...(stats && typeof stats === 'object' ? stats : {}),
+      prioritizeGraphics:
+        stats && typeof stats.prioritizeGraphics === 'boolean'
+          ? stats.prioritizeGraphics
+          : typeof cache.prioritizeGraphics === 'boolean'
+            ? cache.prioritizeGraphics
+            : true,
+      maxConcurrentCompiles:
+        stats && Number.isInteger(stats.maxConcurrentCompiles)
+          ? stats.maxConcurrentCompiles
+          : Number.isInteger(cache.maxConcurrentCompiles)
+            ? cache.maxConcurrentCompiles
+            : stats && Number.isInteger(stats.maxConcurrent)
+              ? stats.maxConcurrent
+              : DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
       pendingAsyncPipelineSkips: this._pendingAsyncPipelineSkips + renderStateSkips,
     };
   }
@@ -4280,6 +4639,9 @@ class WgpuCommandProcessor {
     this.computePipelines.clear();
     this._pipelineBindGroupLayouts.clear();
     this._computePipelineBindGroupLayouts.clear();
+    this._pipelineReflectionGroups.clear();
+    this._computePipelineReflectionGroups.clear();
+    this._defaultFallbackSamplers.clear();
     this._shaderReflectionKeys.clear();
     this._pendingTimerReadbacks.clear();
     this._lastPassTimings = null;
@@ -4463,6 +4825,14 @@ class WgpuCommandProcessor {
     const options = opts && typeof opts === 'object' ? opts : {};
     this._deviceGeneration += 1;
     this._resetDeviceResources();
+    // W167: update pipelineCache device so cached fallback samplers/layouts are invalidated cleanly.
+    if (this.pipelineCache && typeof this.pipelineCache.setDevice === 'function') {
+      try {
+        this.pipelineCache.setDevice(newDevice);
+      } catch (_) {
+        // Ignore pipelineCache device swap errors on custom mocks.
+      }
+    }
     // W103: drop in-flight compiles of the dead device; late results are discarded as stale.
     this._resetAsyncPipelineCache(newDevice);
     if (newCtx && typeof newCtx === 'object') {
@@ -4867,6 +5237,192 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * W179: Return a bounded, sanitized categorized missing-shader summary from
+   * `ShaderFallbackRouter.getMissingShaderSummary()`, or null when unavailable.
+   *
+   * @param {number | { limit?: number | null, reason?: string | null, stage?: number | string | null } | null} [opts]
+   */
+  getMissingShaderSummary(opts) {
+    if (
+      !this.shaderFallbackRouter ||
+      typeof this.shaderFallbackRouter.getMissingShaderSummary !== 'function'
+    ) {
+      return null;
+    }
+    let requestedLimit = DEFAULT_MISSING_SUMMARY_LIMIT;
+    if (typeof opts === 'number' && Number.isInteger(opts) && opts >= 0) {
+      requestedLimit = opts;
+    } else if (
+      opts &&
+      typeof opts === 'object' &&
+      Number.isInteger(opts.limit) &&
+      opts.limit >= 0
+    ) {
+      requestedLimit = opts.limit;
+    }
+    try {
+      const raw =
+        opts !== undefined
+          ? this.shaderFallbackRouter.getMissingShaderSummary(opts)
+          : this.shaderFallbackRouter.getMissingShaderSummary({ limit: requestedLimit });
+      return sanitizeMissingShaderSummary(raw, requestedLimit);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * W167: Return a cached default fallback `GPUSampler` (`'filtering'`, `'non-filtering'`, or
+   * `'comparison'`), delegating to `pipelineCache.getOrCreateDefaultSampler()` when available.
+   *
+   * @param {'filtering' | 'non-filtering' | 'comparison' | string | null | undefined} [kind='filtering']
+   * @returns {GPUSampler | null}
+   */
+  getOrCreateDefaultSampler(kind = 'filtering') {
+    if (this._destroyed || !this.device) {
+      return null;
+    }
+    if (
+      this.pipelineCache &&
+      typeof this.pipelineCache.getOrCreateDefaultSampler === 'function'
+    ) {
+      try {
+        return this.pipelineCache.getOrCreateDefaultSampler(kind);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (typeof this.device.createSampler !== 'function') {
+      return null;
+    }
+    const canonical = normalizeFallbackSamplerKind(kind);
+    const cached = this._defaultFallbackSamplers.get(canonical);
+    if (cached !== undefined) {
+      return cached;
+    }
+    try {
+      const desc = { ...DEFAULT_FALLBACK_SAMPLER_DESCRIPTORS[canonical] };
+      const sampler = this.device.createSampler(desc);
+      if (!sampler || (typeof sampler !== 'object' && typeof sampler !== 'function')) {
+        return null;
+      }
+      this._defaultFallbackSamplers.set(canonical, sampler);
+      this._fallbackSamplersCreated += 1;
+      return sampler;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * W167: Synthesize default fallback `GPUSampler` entries for any sampler slot declared in
+   * `reflectionGroupOrEntries` that is not already bound in `existingEntries`. Delegates to
+   * `pipelineCache.synthesizeFallbackSamplerEntries()` when present.
+   *
+   * @param {Array<object> | { entries?: Array<object>, bindings?: Array<object> }} reflectionGroupOrEntries
+   * @param {Iterable<{ binding: number, resource: unknown }>} [existingEntries=[]]
+   */
+  synthesizeFallbackSamplerEntries(reflectionGroupOrEntries, existingEntries = []) {
+    if (
+      this.pipelineCache &&
+      typeof this.pipelineCache.synthesizeFallbackSamplerEntries === 'function'
+    ) {
+      try {
+        return this.pipelineCache.synthesizeFallbackSamplerEntries(
+          reflectionGroupOrEntries,
+          existingEntries
+        );
+      } catch (_) {
+        // Fall through to local safe fallback synthesis.
+      }
+    }
+
+    let layoutEntries = null;
+    if (Array.isArray(reflectionGroupOrEntries)) {
+      layoutEntries = reflectionGroupOrEntries;
+    } else if (reflectionGroupOrEntries && typeof reflectionGroupOrEntries === 'object') {
+      if (Array.isArray(reflectionGroupOrEntries.entries)) {
+        layoutEntries = reflectionGroupOrEntries.entries;
+      } else if (Array.isArray(reflectionGroupOrEntries.bindings)) {
+        layoutEntries = reflectionGroupOrEntries.bindings;
+      }
+    }
+    const byBinding = new Map();
+    const boundSet = new Set();
+    if (existingEntries !== null && existingEntries !== undefined) {
+      for (const item of existingEntries) {
+        if (!item || typeof item !== 'object') continue;
+        if (!Number.isInteger(item.binding) || item.binding < 0) continue;
+        if (item.resource !== undefined && item.resource !== null) {
+          byBinding.set(item.binding, { ...item });
+          boundSet.add(item.binding);
+        }
+      }
+    }
+    const synthesized = [];
+    if (layoutEntries) {
+      for (let i = 0; i < layoutEntries.length; i += 1) {
+        const entry = layoutEntries[i];
+        if (
+          !entry ||
+          typeof entry !== 'object' ||
+          !entry.sampler ||
+          typeof entry.sampler !== 'object' ||
+          !Number.isInteger(entry.binding) ||
+          entry.binding < 0 ||
+          boundSet.has(entry.binding)
+        ) {
+          continue;
+        }
+        const samplerKind = normalizeFallbackSamplerKind(entry.sampler.type);
+        const sampler = this.getOrCreateDefaultSampler(samplerKind);
+        if (!sampler) {
+          continue;
+        }
+        byBinding.set(entry.binding, { binding: entry.binding, resource: sampler });
+        boundSet.add(entry.binding);
+        synthesized.push({
+          binding: entry.binding,
+          kind: samplerKind,
+          resource: sampler,
+        });
+        this._fallbackSamplerBindingsSynthesized += 1;
+      }
+    }
+    const entries = Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+    return {
+      entries,
+      synthesized,
+      synthesizedCount: synthesized.length,
+    };
+  }
+
+  _getBindGroupLayoutEntriesForSynthesis(pipelineId, groupIndex, pipeMeta, renderStateExt) {
+    const reflectedRender = this._pipelineReflectionGroups.get(pipelineId);
+    if (reflectedRender && reflectedRender[groupIndex]) {
+      return reflectedRender[groupIndex];
+    }
+    const reflectedCompute = this._computePipelineReflectionGroups.get(pipelineId);
+    if (reflectedCompute && reflectedCompute[groupIndex]) {
+      return reflectedCompute[groupIndex];
+    }
+    if (renderStateExt && renderStateExt.bindGroupLayouts) {
+      const bglRec = renderStateExt.bindGroupLayouts.get(pipelineId);
+      if (bglRec && Array.isArray(bglRec.entries) && bglRec.entries.length > 0) {
+        return bglRec.entries;
+      }
+    }
+    if (
+      pipeMeta &&
+      pipeMeta.fallbackProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B &&
+      groupIndex === 0
+    ) {
+      return [{ binding: 1, sampler: { type: 'filtering' } }];
+    }
+    return null;
+  }
+
+  /**
    * Resolve the GPUBindGroupLayout for a pipeline handle and group index, preferring
    * S6-reflected layouts built during pipeline creation and falling back to
    * `pipeline.getBindGroupLayout(groupIndex)`.
@@ -5025,6 +5581,7 @@ class WgpuCommandProcessor {
     }
 
     const capturedBgls = [];
+    const capturedGroupDescs = [];
     const collectorCache = {
       createBindGroupLayoutFromReflection: (desc) => {
         let bgl;
@@ -5036,6 +5593,7 @@ class WgpuCommandProcessor {
           bgl = this.device.createBindGroupLayout(desc);
         }
         capturedBgls.push(bgl);
+        capturedGroupDescs.push(desc);
         return bgl;
       },
     };
@@ -5050,6 +5608,7 @@ class WgpuCommandProcessor {
     return {
       pipelineLayout,
       bindGroupLayouts: capturedBgls,
+      groupDescriptors: capturedGroupDescs,
     };
   }
 
@@ -5228,6 +5787,28 @@ class WgpuCommandProcessor {
       return null;
     }
     const code = entry.code;
+    const recordCompileFailure = () => {
+      if (
+        !this.shaderFallbackRouter ||
+        typeof this.shaderFallbackRouter.recordMissingShader !== 'function'
+      ) {
+        return;
+      }
+      const failHash = entry.requestedHash || entry.hashHex;
+      if (!failHash) {
+        return;
+      }
+      try {
+        this.shaderFallbackRouter.recordMissingShader(
+          failHash,
+          stageCodeToName(entry.stage) || 'vertex',
+          'compile_failed'
+        );
+      } catch (_) {
+        // Never allow telemetry tracking errors to interrupt shader compilation.
+      }
+    };
+
     let module;
     if (allowDirectThrowOnEmpty) {
       module = this.device.createShaderModule({ code });
@@ -5235,6 +5816,7 @@ class WgpuCommandProcessor {
       try {
         module = this.device.createShaderModule({ code });
       } catch (err) {
+        recordCompileFailure();
         this._recordOpValidationError('CreateShaderModule', err);
         return null;
       }
@@ -5246,9 +5828,11 @@ class WgpuCommandProcessor {
             if (this._destroyed || !info || !Array.isArray(info.messages)) {
               return;
             }
+            let hadError = false;
             for (let i = 0; i < info.messages.length; i += 1) {
               const m = info.messages[i];
               if (m && m.type === 'error') {
+                hadError = true;
                 const loc =
                   typeof m.lineNum === 'number' && m.lineNum > 0 ? ` (line ${m.lineNum})` : '';
                 this._recordOpValidationError(
@@ -5256,6 +5840,9 @@ class WgpuCommandProcessor {
                   `shader ${id}${loc}: ${m.message || 'WGSL compilation error'}`
                 );
               }
+            }
+            if (hadError) {
+              recordCompileFailure();
             }
           },
           () => {}
@@ -5756,8 +6343,10 @@ class WgpuCommandProcessor {
     const reflected = this._buildReflectedPipelineLayout(matchedRefls, `render-pipeline-${id}`);
     if (reflected) {
       this._pipelineBindGroupLayouts.set(id, reflected.bindGroupLayouts);
+      this._pipelineReflectionGroups.set(id, reflected.groupDescriptors || []);
     } else {
       this._pipelineBindGroupLayouts.delete(id);
+      this._pipelineReflectionGroups.delete(id);
     }
 
     const topology = TOPOLOGY_NAMES[topologyCode] || 'triangle-list';
@@ -6053,8 +6642,10 @@ class WgpuCommandProcessor {
       : null;
     if (reflected) {
       this._computePipelineBindGroupLayouts.set(id, reflected.bindGroupLayouts);
+      this._computePipelineReflectionGroups.set(id, reflected.groupDescriptors || []);
     } else {
       this._computePipelineBindGroupLayouts.delete(id);
+      this._computePipelineReflectionGroups.delete(id);
     }
 
     return {
@@ -6195,7 +6786,13 @@ class WgpuCommandProcessor {
         hasTexture = true;
         entries.push({ binding, resource: textureView });
       } else if (resourceType === BIND_RESOURCE_TYPE.SAMPLER) {
-        const sampler = this.samplers.get(resourceId);
+        let sampler = this.samplers.get(resourceId);
+        if (!sampler && resourceId === 0 && typeof this.device.createSampler === 'function') {
+          sampler = this.getOrCreateDefaultSampler('filtering');
+          if (sampler) {
+            this._fallbackSamplerBindingsSynthesized += 1;
+          }
+        }
         if (!sampler) {
           this._recordOpValidationError(
             'CreateBindGroup',
@@ -6214,6 +6811,25 @@ class WgpuCommandProcessor {
       }
     }
 
+    let finalEntries = entries;
+    const layoutGroupForSynth = this._getBindGroupLayoutEntriesForSynthesis(
+      pipelineId,
+      groupIndex,
+      pipeMeta,
+      renderStateExt
+    );
+    if (
+      layoutGroupForSynth &&
+      this.device &&
+      typeof this.device.createSampler === 'function'
+    ) {
+      const synth = this.synthesizeFallbackSamplerEntries(layoutGroupForSynth, finalEntries);
+      if (synth && synth.synthesizedCount > 0 && Array.isArray(synth.entries)) {
+        finalEntries = synth.entries;
+        hasSampler = true;
+      }
+    }
+
     this._bindGroupMeta.set(id, {
       id,
       pipelineId,
@@ -6221,7 +6837,7 @@ class WgpuCommandProcessor {
       hasCbv,
       hasTexture,
       hasSampler,
-      entries,
+      entries: finalEntries,
     });
     this._invalidateSpecializedBindGroupsFor(id);
 
@@ -6233,7 +6849,7 @@ class WgpuCommandProcessor {
     try {
       bindGroup = this.device.createBindGroup({
         layout,
-        entries,
+        entries: finalEntries,
       });
     } catch (err) {
       this._recordOpValidationError('CreateBindGroup', err);
@@ -6539,6 +7155,8 @@ class WgpuCommandProcessor {
     this.computePipelines.delete(id);
     this._pipelineBindGroupLayouts.delete(id);
     this._computePipelineBindGroupLayouts.delete(id);
+    this._pipelineReflectionGroups.delete(id);
+    this._computePipelineReflectionGroups.delete(id);
     this._shaderReflectionKeys.delete(id);
     if (this.asyncPipelineCache && typeof this.asyncPipelineCache.delete === 'function') {
       this.asyncPipelineCache.delete(id);
@@ -7438,6 +8056,25 @@ class WgpuCommandProcessor {
         ? this.reflectionRegistry.getStats()
         : null;
     const shaderFallback = this.getShaderFallbackStats();
+    const missingShaderSummary = this.getMissingShaderSummary({
+      limit: DEFAULT_MISSING_SUMMARY_LIMIT,
+    });
+    const asyncPipelineStats = this.getAsyncPipelineStats();
+    const asyncPipelineCompileStats = resolveAsyncPipelineCompileTelemetry(this);
+    let pipelineCache = null;
+    if (this.pipelineCache && typeof this.pipelineCache.getStats === 'function') {
+      try {
+        pipelineCache = this.pipelineCache.getStats();
+      } catch (_) {
+        pipelineCache = null;
+      }
+    }
+    const fallbackSamplersCreated =
+      toNonNegativeInt(pipelineCache && pipelineCache.fallbackSamplersCreated, 0) +
+      this._fallbackSamplersCreated;
+    const fallbackSamplerBindingsSynthesized =
+      toNonNegativeInt(pipelineCache && pipelineCache.fallbackSamplerBindingsSynthesized, 0) +
+      this._fallbackSamplerBindingsSynthesized;
     const wgslPackCache =
       this.wgslPackCache && typeof this.wgslPackCache.getStats === 'function'
         ? this.wgslPackCache.getStats()
@@ -7543,6 +8180,12 @@ class WgpuCommandProcessor {
       reflectionRegistry,
       reflectionShaderCount: reflectionRegistry ? reflectionRegistry.shaderCount : 0,
       shaderFallback,
+      missingShaderSummary,
+      asyncPipelineStats,
+      asyncPipelineCompileStats,
+      pipelineCache,
+      fallbackSamplersCreated,
+      fallbackSamplerBindingsSynthesized,
       fallbackProfileCounts: { ...this._fallbackProfileCounts },
       lastFallbackProfile: this._lastFallbackProfile,
       validationErrorCount: this._validationErrorCount,
@@ -7651,6 +8294,9 @@ class WgpuCommandProcessor {
     this.computePipelines.clear();
     this._pipelineBindGroupLayouts.clear();
     this._computePipelineBindGroupLayouts.clear();
+    this._pipelineReflectionGroups.clear();
+    this._computePipelineReflectionGroups.clear();
+    this._defaultFallbackSamplers.clear();
     this._shaderReflectionKeys.clear();
 
     // 2. Tear down auxiliary subsystems idempotently.
@@ -7665,6 +8311,13 @@ class WgpuCommandProcessor {
     }
     if (this.rtPool && typeof this.rtPool.destroy === 'function') {
       this.rtPool.destroy();
+    }
+    if (
+      this.pipelineCache &&
+      this._ownsPipelineCache &&
+      typeof this.pipelineCache.clear === 'function'
+    ) {
+      this.pipelineCache.clear();
     }
     if (
       this.reflectionRegistry &&
@@ -7696,6 +8349,132 @@ class WgpuCommandProcessor {
 
 const DEFAULT_TELEMETRY_INTERVAL_MS = 250;
 const DEFAULT_TELEMETRY_MISSING_LIMIT = 64;
+const DEFAULT_MISSING_SUMMARY_LIMIT = 32;
+const VALID_MISSING_SHADER_REASONS = Object.freeze(
+  new Set(['not_in_pack', 'reflection_failed', 'compile_failed', 'other'])
+);
+
+function sanitizeMissingShaderReason(raw) {
+  if (typeof raw !== 'string') {
+    return 'other';
+  }
+  const key = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  return VALID_MISSING_SHADER_REASONS.has(key) ? key : 'other';
+}
+
+/**
+ * W179: Sanitize and bound a categorized missing-shader summary so telemetry snapshots and
+ * `getStats` responses never expose host paths, raw WGSL, raw buffers, or unbounded lists.
+ *
+ * @param {object | null | undefined} raw
+ * @param {number} [limit=DEFAULT_MISSING_SUMMARY_LIMIT]
+ */
+function sanitizeMissingShaderSummary(raw, limit = DEFAULT_MISSING_SUMMARY_LIMIT) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const maxTop =
+    Number.isInteger(limit) && limit >= 0 ? limit : DEFAULT_MISSING_SUMMARY_LIMIT;
+  const countsByReasonSrc =
+    raw.countsByReason && typeof raw.countsByReason === 'object' ? raw.countsByReason : {};
+  const countsByStageSrc =
+    raw.countsByStage && typeof raw.countsByStage === 'object' ? raw.countsByStage : {};
+  const uniqueByReasonSrc =
+    raw.uniqueCountsByReason && typeof raw.uniqueCountsByReason === 'object'
+      ? raw.uniqueCountsByReason
+      : {};
+  const uniqueByStageSrc =
+    raw.uniqueCountsByStage && typeof raw.uniqueCountsByStage === 'object'
+      ? raw.uniqueCountsByStage
+      : {};
+  const guardSrc =
+    raw.realShaderGuard && typeof raw.realShaderGuard === 'object' ? raw.realShaderGuard : {};
+  const rawTop = Array.isArray(raw.topMissing) ? raw.topMissing : [];
+  const topMissing = [];
+  for (let i = 0; i < rawTop.length && topMissing.length < maxTop; i += 1) {
+    const row = rawTop[i];
+    if (!row || typeof row !== 'object') {
+      continue;
+    }
+    const rawHash =
+      row.hashHex !== undefined
+        ? row.hashHex
+        : row.hash !== undefined
+          ? row.hash
+          : row.shaderHash;
+    const hashBigInt = normalizeShaderHashBigInt(rawHash);
+    if (hashBigInt === null) {
+      continue;
+    }
+    const rowReasons = row.reasons && typeof row.reasons === 'object' ? row.reasons : {};
+    const reason = sanitizeMissingShaderReason(row.reason);
+    const lastReason = sanitizeMissingShaderReason(
+      row.lastReason !== undefined ? row.lastReason : reason
+    );
+    const cleanRow = {
+      hashHex: formatShaderHashHex(hashBigInt),
+      stage: sanitizeTelemetryStage(row.stage),
+      reason,
+      lastReason,
+      hitCount: toNonNegativeInt(
+        row.hitCount !== undefined ? row.hitCount : row.hits !== undefined ? row.hits : row.count,
+        0
+      ),
+      reasons: {
+        not_in_pack: toNonNegativeInt(rowReasons.not_in_pack, 0),
+        reflection_failed: toNonNegativeInt(rowReasons.reflection_failed, 0),
+        compile_failed: toNonNegativeInt(rowReasons.compile_failed, 0),
+        other: toNonNegativeInt(rowReasons.other, 0),
+      },
+    };
+    const firstSeenMs = toNonNegativeFinite(row.firstSeenMs);
+    const lastSeenMs = toNonNegativeFinite(row.lastSeenMs);
+    if (firstSeenMs !== null) {
+      cleanRow.firstSeenMs = firstSeenMs;
+    }
+    if (lastSeenMs !== null) {
+      cleanRow.lastSeenMs = lastSeenMs;
+    }
+    topMissing.push(cleanRow);
+  }
+  return {
+    totalMissingEvents: toNonNegativeInt(raw.totalMissingEvents, 0),
+    uniqueMissingHashes: toNonNegativeInt(raw.uniqueMissingHashes, topMissing.length),
+    maxTrackedHashes: toNonNegativeInt(raw.maxTrackedHashes, 0),
+    overflowCount: toNonNegativeInt(raw.overflowCount, 0),
+    countsByReason: {
+      not_in_pack: toNonNegativeInt(countsByReasonSrc.not_in_pack, 0),
+      reflection_failed: toNonNegativeInt(countsByReasonSrc.reflection_failed, 0),
+      compile_failed: toNonNegativeInt(countsByReasonSrc.compile_failed, 0),
+      other: toNonNegativeInt(countsByReasonSrc.other, 0),
+    },
+    countsByStage: {
+      vertex: toNonNegativeInt(countsByStageSrc.vertex, 0),
+      fragment: toNonNegativeInt(countsByStageSrc.fragment, 0),
+      compute: toNonNegativeInt(countsByStageSrc.compute, 0),
+    },
+    uniqueCountsByReason: {
+      not_in_pack: toNonNegativeInt(uniqueByReasonSrc.not_in_pack, 0),
+      reflection_failed: toNonNegativeInt(uniqueByReasonSrc.reflection_failed, 0),
+      compile_failed: toNonNegativeInt(uniqueByReasonSrc.compile_failed, 0),
+      other: toNonNegativeInt(uniqueByReasonSrc.other, 0),
+    },
+    uniqueCountsByStage: {
+      vertex: toNonNegativeInt(uniqueByStageSrc.vertex, 0),
+      fragment: toNonNegativeInt(uniqueByStageSrc.fragment, 0),
+      compute: toNonNegativeInt(uniqueByStageSrc.compute, 0),
+    },
+    realShaderGuard: {
+      registeredRealShaders: toNonNegativeInt(guardSrc.registeredRealShaders, 0),
+      blockedOverrideCount: toNonNegativeInt(guardSrc.blockedOverrideCount, 0),
+      overflowBlockedCount: toNonNegativeInt(guardSrc.overflowBlockedCount, 0),
+    },
+    topMissing,
+  };
+}
 
 const MAX_GPU_ERROR_DETAIL_CHARS = 256;
 
@@ -8005,11 +8784,25 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
   // W99: live render_state_packets.js compute/auto-layout counters (0 when not installed).
   // Omitted for a null processor so the empty snapshot shape stays unchanged.
   if (processor && typeof processor === 'object') {
+    const summaryLimit =
+      opts.limit !== undefined || opts.missingShaderLimit !== undefined
+        ? limit
+        : DEFAULT_MISSING_SUMMARY_LIMIT;
     snapshot.renderStateStats = renderStateStats;
     // W100: WebGPU device-loss / recovery counters (zeros when the processor lacks them).
     snapshot.deviceStats = resolveDeviceLossTelemetry(processor, stats);
     // W103: async pipeline compile queue counters (null when async compilation is disabled).
     snapshot.asyncPipelineStats = resolveAsyncPipelineTelemetry(processor);
+    // W168: async pipeline priority & compile-latency telemetry (null when disabled).
+    snapshot.asyncPipelineCompileStats = resolveAsyncPipelineCompileTelemetry(processor);
+    // W179: bounded, sanitized categorized missing-shader summary (null when unavailable).
+    snapshot.missingShaderSummary = resolveMissingShaderSummaryTelemetry(
+      processor,
+      stats,
+      summaryLimit
+    );
+    // W167: fallback sampler synthesis telemetry counters.
+    snapshot.fallbackSamplerStats = resolveFallbackSamplerTelemetry(processor, stats);
     // W121: swapchain format/blit (W112), 3D-BC texture fallback (W108), and WGSL pack mode (W109).
     snapshot.swapchainStats = resolveSwapchainTelemetry(processor, stats);
     snapshot.textureStats = resolveTextureTelemetry(processor, stats);
@@ -8284,6 +9077,151 @@ function resolveAsyncPipelineTelemetry(processor) {
     out[key] = toNonNegativeInt(raw[key], 0);
   }
   return out;
+}
+
+/**
+ * W168: sanitized AsyncPipelineCache priority-queue and compile-latency telemetry,
+ * or null when async pipeline compilation is disabled/unavailable.
+ */
+function resolveAsyncPipelineCompileTelemetry(processor) {
+  if (!processor || typeof processor !== 'object') {
+    return null;
+  }
+  let raw = null;
+  const cache = processor.asyncPipelineCache || null;
+  try {
+    if (typeof processor.getAsyncPipelineStats === 'function') {
+      raw = processor.getAsyncPipelineStats();
+    } else if (cache && typeof cache.getStats === 'function') {
+      raw = cache.getStats();
+    }
+  } catch (_) {
+    raw = null;
+  }
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const avgMs = toNonNegativeFinite(
+    raw.avgCompileMs !== undefined ? raw.avgCompileMs : raw.avgAsyncCompileMs
+  );
+  const maxMs = toNonNegativeFinite(raw.maxCompileMs);
+  return {
+    prioritizeGraphics:
+      typeof raw.prioritizeGraphics === 'boolean'
+        ? raw.prioritizeGraphics
+        : cache && typeof cache.prioritizeGraphics === 'boolean'
+          ? cache.prioritizeGraphics
+          : true,
+    maxConcurrentCompiles: toNonNegativeInt(
+      raw.maxConcurrentCompiles !== undefined
+        ? raw.maxConcurrentCompiles
+        : cache && cache.maxConcurrentCompiles !== undefined
+          ? cache.maxConcurrentCompiles
+          : raw.maxConcurrent,
+      0
+    ),
+    activeCompiles: toNonNegativeInt(
+      raw.activeCompiles !== undefined
+        ? raw.activeCompiles
+        : raw.inFlightCompiles !== undefined
+          ? raw.inFlightCompiles
+          : raw.inFlight,
+      0
+    ),
+    peakConcurrentCompiles: toNonNegativeInt(
+      raw.peakConcurrentCompiles !== undefined
+        ? raw.peakConcurrentCompiles
+        : raw.peakInFlightCompiles,
+      0
+    ),
+    queuedCompiles: toNonNegativeInt(
+      raw.queuedCompiles !== undefined ? raw.queuedCompiles : raw.queued,
+      0
+    ),
+    failedAsyncCompiles: toNonNegativeInt(
+      raw.failedAsyncCompiles !== undefined ? raw.failedAsyncCompiles : raw.failed,
+      0
+    ),
+    avgCompileMs: avgMs !== null ? avgMs : 0,
+    maxCompileMs: maxMs !== null ? maxMs : 0,
+    priorityPromotions: toNonNegativeInt(raw.priorityPromotions, 0),
+  };
+}
+
+/**
+ * W179: sanitized, bounded categorized missing-shader summary from processor or stats.
+ */
+function resolveMissingShaderSummaryTelemetry(processor, stats, limit = DEFAULT_MISSING_SUMMARY_LIMIT) {
+  let raw = null;
+  try {
+    if (processor && typeof processor.getMissingShaderSummary === 'function') {
+      raw = processor.getMissingShaderSummary({ limit });
+    } else if (
+      processor &&
+      processor.shaderFallbackRouter &&
+      typeof processor.shaderFallbackRouter.getMissingShaderSummary === 'function'
+    ) {
+      raw = processor.shaderFallbackRouter.getMissingShaderSummary({ limit });
+    } else if (stats && stats.missingShaderSummary && typeof stats.missingShaderSummary === 'object') {
+      raw = stats.missingShaderSummary;
+    }
+  } catch (_) {
+    raw = null;
+  }
+  return sanitizeMissingShaderSummary(raw, limit);
+}
+
+/**
+ * W167: sanitized default fallback sampler synthesis counters.
+ */
+function resolveFallbackSamplerTelemetry(processor, stats) {
+  let cacheStats = null;
+  try {
+    if (
+      processor &&
+      processor.pipelineCache &&
+      typeof processor.pipelineCache.getStats === 'function'
+    ) {
+      cacheStats = processor.pipelineCache.getStats();
+    } else if (stats && stats.pipelineCache && typeof stats.pipelineCache === 'object') {
+      cacheStats = stats.pipelineCache;
+    }
+  } catch (_) {
+    cacheStats = null;
+  }
+  const localCreated =
+    processor && typeof processor._fallbackSamplersCreated === 'number'
+      ? toNonNegativeInt(processor._fallbackSamplersCreated, 0)
+      : 0;
+  const localSynthesized =
+    processor && typeof processor._fallbackSamplerBindingsSynthesized === 'number'
+      ? toNonNegativeInt(processor._fallbackSamplerBindingsSynthesized, 0)
+      : 0;
+  const localCount =
+    processor &&
+    processor._defaultFallbackSamplers &&
+    typeof processor._defaultFallbackSamplers.size === 'number'
+      ? toNonNegativeInt(processor._defaultFallbackSamplers.size, 0)
+      : 0;
+  const cacheCreated = toNonNegativeInt(cacheStats && cacheStats.fallbackSamplersCreated, 0);
+  const cacheSynthesized = toNonNegativeInt(
+    cacheStats && cacheStats.fallbackSamplerBindingsSynthesized,
+    0
+  );
+  const cacheCount = toNonNegativeInt(cacheStats && cacheStats.fallbackSamplerCount, 0);
+  return {
+    fallbackSamplersCreated:
+      stats && stats.fallbackSamplersCreated !== undefined && cacheCreated + localCreated === 0
+        ? toNonNegativeInt(stats.fallbackSamplersCreated, 0)
+        : cacheCreated + localCreated,
+    fallbackSamplerBindingsSynthesized:
+      stats &&
+      stats.fallbackSamplerBindingsSynthesized !== undefined &&
+      cacheSynthesized + localSynthesized === 0
+        ? toNonNegativeInt(stats.fallbackSamplerBindingsSynthesized, 0)
+        : cacheSynthesized + localSynthesized,
+    fallbackSamplerCount: cacheCount + localCount,
+  };
 }
 
 /**
@@ -9115,7 +10053,37 @@ function createWgpuWorkerHandler(options = {}) {
       reflectionRegistry: options.reflectionRegistry,
       resourceRegistry: options.resourceRegistry,
       rtPool: options.rtPool,
-      pipelineCache: options.pipelineCache,
+      pipelineCache: initPayload.pipelineCache ?? options.pipelineCache,
+      enablePipelineCache:
+        initPayload.enablePipelineCache ?? options.enablePipelineCache,
+      WebGpuPipelineCache:
+        initPayload.WebGpuPipelineCache !== undefined
+          ? initPayload.WebGpuPipelineCache
+          : options.WebGpuPipelineCache,
+      pipelineCacheOptions:
+        initPayload.pipelineCacheOptions ?? options.pipelineCacheOptions,
+      asyncPipelineCache:
+        initPayload.asyncPipelineCache ?? options.asyncPipelineCache,
+      AsyncPipelineCache:
+        initPayload.AsyncPipelineCache !== undefined
+          ? initPayload.AsyncPipelineCache
+          : options.AsyncPipelineCache,
+      enableAsyncPipelines:
+        initPayload.enableAsyncPipelines !== undefined
+          ? initPayload.enableAsyncPipelines
+          : options.enableAsyncPipelines,
+      maxConcurrentCompiles:
+        initPayload.maxConcurrentCompiles !== undefined
+          ? initPayload.maxConcurrentCompiles
+          : options.maxConcurrentCompiles,
+      maxConcurrentPipelineCompiles:
+        initPayload.maxConcurrentPipelineCompiles !== undefined
+          ? initPayload.maxConcurrentPipelineCompiles
+          : options.maxConcurrentPipelineCompiles,
+      prioritizeGraphics:
+        initPayload.prioritizeGraphics !== undefined
+          ? initPayload.prioritizeGraphics
+          : options.prioritizeGraphics,
       wgslPackCache: initPayload.wgslPackCache ?? options.wgslPackCache,
       wgslPackBuffer: initPayload.wgslPackBuffer ?? options.wgslPackBuffer,
       streamThresholdBytes:
@@ -9134,8 +10102,20 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.SplashFrameBridge !== undefined
           ? initPayload.SplashFrameBridge
           : options.SplashFrameBridge,
-      binkPresenterOptions:
-        initPayload.binkPresenterOptions ?? options.binkPresenterOptions,
+      binkPresenterOptions: buildMergedBinkPresenterOptions(
+        options.binkPresenterOptions,
+        initPayload.binkPresenterOptions
+      ),
+      binkChromaOrder:
+        initPayload.binkChromaOrder ??
+        initPayload.chromaOrder ??
+        options.binkChromaOrder ??
+        options.chromaOrder,
+      binkLoadOp:
+        initPayload.binkLoadOp ??
+        initPayload.loadOp ??
+        options.binkLoadOp ??
+        options.loadOp,
       splashFrameBridgeOptions:
         initPayload.splashFrameBridgeOptions ??
         initPayload.splashBridgeOptions ??
@@ -9315,6 +10295,10 @@ function createWgpuWorkerHandler(options = {}) {
             typeof processor.getShaderFallbackStats === 'function'
               ? processor.getShaderFallbackStats()
               : null,
+          missingShaderSummary:
+            typeof processor.getMissingShaderSummary === 'function'
+              ? processor.getMissingShaderSummary(missingOpts)
+              : null,
         });
       } else if (
         payload.stats ||
@@ -9342,6 +10326,18 @@ function createWgpuWorkerHandler(options = {}) {
               : DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
             asyncShaderPendingCount: stats
               ? toNonNegativeInt(stats.asyncShaderPendingCount, 0)
+              : 0,
+            missingShaderSummary:
+              stats && stats.missingShaderSummary ? stats.missingShaderSummary : null,
+            asyncPipelineStats:
+              stats && stats.asyncPipelineStats ? stats.asyncPipelineStats : null,
+            asyncPipelineCompileStats:
+              stats && stats.asyncPipelineCompileStats ? stats.asyncPipelineCompileStats : null,
+            fallbackSamplersCreated: stats
+              ? toNonNegativeInt(stats.fallbackSamplersCreated, 0)
+              : 0,
+            fallbackSamplerBindingsSynthesized: stats
+              ? toNonNegativeInt(stats.fallbackSamplerBindingsSynthesized, 0)
               : 0,
           };
           if (payload.id !== undefined) {
@@ -9415,6 +10411,21 @@ function createWgpuWorkerHandler(options = {}) {
         }
         if (payload.respectPacing !== undefined) {
           presentOpts.respectPacing = payload.respectPacing;
+        }
+        const msgChromaOrder =
+          framePayload.chromaOrder !== undefined ? framePayload.chromaOrder : payload.chromaOrder;
+        if (msgChromaOrder !== undefined) {
+          presentOpts.chromaOrder = msgChromaOrder;
+        }
+        const msgLoadOp =
+          framePayload.loadOp !== undefined ? framePayload.loadOp : payload.loadOp;
+        if (msgLoadOp !== undefined) {
+          presentOpts.loadOp = msgLoadOp;
+        }
+        const msgColorRange =
+          framePayload.colorRange !== undefined ? framePayload.colorRange : payload.colorRange;
+        if (msgColorRange !== undefined) {
+          presentOpts.colorRange = msgColorRange;
         }
         if (payload.targetWidth !== undefined) {
           presentOpts.targetWidth = payload.targetWidth;
@@ -9565,6 +10576,9 @@ const exportedApi = {
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   DEFAULT_TELEMETRY_INTERVAL_MS,
   DEFAULT_TELEMETRY_MISSING_LIMIT,
+  DEFAULT_MISSING_SUMMARY_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
+  sanitizeMissingShaderSummary,
   DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
   DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
   resolveShaderPackStreamThresholdBytes,
