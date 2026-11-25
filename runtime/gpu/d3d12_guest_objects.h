@@ -570,6 +570,17 @@ struct TrackedTexture {
     // subresources taller than one band; empty otherwise). A changed subresource writes only the
     // bands whose hash changed (#691).
     std::vector<std::vector<uint64_t>> subresource_bands;
+    // Window write-mark tracking (G68, #663): when the texture lives in the translated CPU window,
+    // [window_indexed_va, window_indexed_va + window_indexed_size) is indexed in
+    // Device::texture_slot_index_. flush_cpu_buffers sets window_dirty whenever a dirty slot
+    // overlaps it (sharing the submission's MarkPass with CPU buffers); sync_bound_texture_memory
+    // skips reading and hashing when window_checked is true, window_dirty is false, and no slot is
+    // currently marked.
+    uint64_t window_indexed_va = 0;
+    uint64_t window_indexed_size = 0;
+    bool window_indexed = false;
+    bool window_checked = false;
+    bool window_dirty = true;
 };
 // Block rows per dirty-tracked band of a 2D texture upload (TrackedTexture::subresource_bands).
 constexpr uint32_t kUploadBandRows = 64;
@@ -1133,6 +1144,7 @@ private:
     os::guest_window::MarkPass mark_pass_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
+    os::guest_window::SlotIndex texture_slot_index_;    // G68: window slot -> resource_id (under tracked_textures_mutex_)
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
     std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
     std::unordered_set<uint32_t> lossy_reported_;      // under tracked_textures_mutex_: DXGI formats
