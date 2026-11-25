@@ -1,6 +1,6 @@
-// W203 / W263: concurrency throttling, canonical coalescing, priority-lane scheduling,
-// device-loss recovery, bounded compile-latency percentiles & stall telemetry tests
-// for web/workers/async_pipeline_cache.js.
+// W203 / W263 / W305: concurrency throttling, priority-tiered prewarm, canonical coalescing,
+// priority-lane scheduling, device-loss recovery, bounded compile-latency percentiles & stall
+// telemetry tests for web/workers/async_pipeline_cache.js.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -11,13 +11,18 @@ const require = createRequire(import.meta.url);
 const {
   AsyncPipelineCache,
   DEFAULT_MAX_CONCURRENT_PIPELINES,
+  MIN_CONCURRENT_COMPILES,
+  MAX_CONCURRENT_COMPILES,
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
   DEFAULT_COMPILE_LATENCY_RING_SIZE,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
+  PIPELINE_PRIORITY_TIER,
   PIPELINE_STATUS,
   canonicalizePipelineKey,
+  classifyPriorityTier,
+  parsePriorityTier,
   isDeviceLostError,
 } = require('../web/workers/async_pipeline_cache.js');
 
@@ -874,5 +879,396 @@ test('W263: bounded compile-latency ring computes p50CompileMs/p95CompileMs, wra
   assert.equal(stats.compileLatencySampleCount, 1);
   assert.equal(stats.p50CompileMs, 12);
   assert.equal(stats.p95CompileMs, 12);
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W305: priority tiers (CRITICAL=0..BACKGROUND=3) enforce strict ordering under bounded concurrency [1, 16]', async () => {
+  assert.deepEqual(PIPELINE_PRIORITY_TIER, {
+    CRITICAL: 0,
+    HIGH: 1,
+    NORMAL: 2,
+    BACKGROUND: 3,
+  });
+  assert.equal(MIN_CONCURRENT_COMPILES, 1);
+  assert.equal(MAX_CONCURRENT_COMPILES, 16);
+  assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINES, 4);
+  assert.equal(parsePriorityTier(PIPELINE_PRIORITY_TIER.CRITICAL), PIPELINE_PRIORITY_LANE.CRITICAL);
+  assert.equal(parsePriorityTier(PIPELINE_PRIORITY_TIER.BACKGROUND), PIPELINE_PRIORITY_LANE.BACKGROUND);
+  assert.equal(classifyPriorityTier(PIPELINE_PRIORITY_LANE.CRITICAL), 'critical');
+  assert.equal(classifyPriorityTier(PIPELINE_PRIORITY_LANE.HIGH), 'high');
+  assert.equal(classifyPriorityTier(PIPELINE_PRIORITY_LANE.NORMAL), 'normal');
+  assert.equal(classifyPriorityTier(PIPELINE_PRIORITY_LANE.BACKGROUND), 'background');
+
+  // Verify bounded concurrency clamping to [1, 16] (default 4).
+  assert.equal(new AsyncPipelineCache().maxConcurrentCompiles, 4);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 1 }).maxConcurrentCompiles, 1);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 16 }).maxConcurrentCompiles, 16);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 32 }).maxConcurrentCompiles, 16);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 999 }).maxConcurrentCompiles, 16);
+  assert.equal(new AsyncPipelineCache({ maxConcurrent: 64 }).maxConcurrent, 16);
+
+  const clampCache = new AsyncPipelineCache({ device: createManualDevice(), maxConcurrentCompiles: 4 });
+  assert.equal(clampCache.setMaxConcurrentCompiles(64), 16);
+  assert.equal(clampCache.setMaxConcurrentCompiles(1), 1);
+  assert.equal(clampCache.setMaxConcurrentCompiles(-5), 4);
+
+  // Bounded concurrency cap = 2: occupy both slots, then enqueue mixed W305 tiers.
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  const active0 = cache.prewarm('active_0', { label: 'active_0' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+  const active1 = cache.prewarm('active_1', { label: 'active_1' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+
+  const bgWorld1 = cache.prewarm('world_far_1', { label: 'world_far_1' }); // default BACKGROUND = 3
+  const normProps = cache.prewarm('scene_props', { label: 'scene_props' }, { priority: PIPELINE_PRIORITY_TIER.NORMAL });
+  const bgWorld2 = cache.prewarm('world_far_2', { label: 'world_far_2' }, { priority: PIPELINE_PRIORITY_TIER.BACKGROUND });
+  const highHud = cache.prewarm('menu_hud', { label: 'menu_hud' }, { priority: PIPELINE_PRIORITY_TIER.HIGH });
+  const critStart = cache.prewarm('start_screen', { label: 'start_screen' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+  const critUiText = cache.compileRenderPipeline('ui_text', { label: 'ui_text' }, {
+    priorityTier: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+  const highCompute = cache.prewarm('menu_blur_cs', { label: 'menu_blur_cs' }, {
+    kind: PIPELINE_KIND.COMPUTE,
+    priority: PIPELINE_PRIORITY_TIER.HIGH,
+  });
+
+  assert.equal(device.calls.length, 2, 'bounded concurrency strictly capped at 2');
+  const stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.peakActiveCompiles, 2);
+  assert.deepEqual(stats.queuedByPriority, {
+    critical: 2,
+    high: 2,
+    normal: 1,
+    background: 2,
+  });
+
+  // Drain one by one and confirm strict CRITICAL -> HIGH -> NORMAL -> BACKGROUND dispatch order (FIFO within tier).
+  for (let i = 0; i < 9; i += 1) {
+    assert.ok(device.inFlight <= 2, `concurrency cap violated: ${device.inFlight}`);
+    device.calls[i].resolve();
+    await tick();
+  }
+  const settled = await Promise.all([
+    active0,
+    active1,
+    bgWorld1,
+    normProps,
+    bgWorld2,
+    highHud,
+    critStart,
+    critUiText,
+    highCompute,
+  ]);
+  await cache.whenIdle();
+
+  assert.ok(settled.every((r) => r.status === PIPELINE_STATUS.READY));
+  assert.equal(device.peakInFlight, 2);
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    [
+      'active_0',
+      'active_1',
+      'start_screen',
+      'ui_text',
+      'menu_hud',
+      'menu_blur_cs',
+      'scene_props',
+      'world_far_1',
+      'world_far_2',
+    ],
+  );
+  assert.deepEqual(cache.getStats().queuedByPriority, {
+    critical: 0,
+    high: 0,
+    normal: 0,
+    background: 0,
+  });
+
+  // Batch prewarm([...]) on an idle cache dispatches CRITICAL/HIGH into active slots first while
+  // preserving caller's original index order in the resolved array.
+  const batchDev = createManualDevice('batch');
+  const batchCache = new AsyncPipelineCache({ device: batchDev, maxConcurrentCompiles: 2 });
+  const batchPromise = batchCache.prewarm([
+    { id: 'b_bg', descriptor: { label: 'b_bg' }, priority: PIPELINE_PRIORITY_TIER.BACKGROUND },
+    { id: 'b_norm', descriptor: { label: 'b_norm' }, priority: PIPELINE_PRIORITY_TIER.NORMAL },
+    { id: 'b_crit', descriptor: { label: 'b_crit' }, priority: PIPELINE_PRIORITY_TIER.CRITICAL },
+    { id: 'b_high', descriptor: { label: 'b_high' }, priority: PIPELINE_PRIORITY_TIER.HIGH },
+  ]);
+
+  assert.deepEqual(
+    batchDev.calls.map((c) => c.descriptor.label),
+    ['b_crit', 'b_high'],
+    'batch prewarm fills initial slots with CRITICAL and HIGH ahead of NORMAL/BACKGROUND',
+  );
+  assert.deepEqual(batchCache.getStats().queuedByPriority, {
+    critical: 0,
+    high: 0,
+    normal: 1,
+    background: 1,
+  });
+
+  for (let i = 0; i < 4; i += 1) {
+    batchDev.calls[i].resolve();
+    await tick();
+  }
+  const batchResults = await batchPromise;
+  assert.deepEqual(
+    batchResults.map((r) => r.id),
+    ['b_bg', 'b_norm', 'b_crit', 'b_high'],
+    'batch prewarm resolves results aligned 1:1 with caller request order',
+  );
+  assert.deepEqual(
+    batchDev.calls.map((c) => c.descriptor.label),
+    ['b_crit', 'b_high', 'b_norm', 'b_bg'],
+  );
+});
+
+test('W305: coalescing duplicate keys elevates queued BACKGROUND request to CRITICAL without double-queuing', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+
+  // Occupy the single compiler slot.
+  const active = cache.prewarm('active_slot', { label: 'active_slot' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+
+  // Queue BACKGROUND, NORMAL, and HIGH prewarm jobs behind the active compile.
+  const bgWorld = cache.prewarm('world_mesh_bg', { label: 'world_mesh' }, {
+    canonicalKey: 'pso-world-mesh',
+    priority: PIPELINE_PRIORITY_TIER.BACKGROUND,
+  });
+  const bgSameId = cache.prewarm('menu_bg_shader', { label: 'menu_bg_shader' }, {
+    priority: PIPELINE_PRIORITY_TIER.BACKGROUND,
+  });
+  const normTerrain = cache.prewarm('terrain_norm', { label: 'terrain_norm' }, {
+    canonicalKey: 'pso-terrain',
+    priority: PIPELINE_PRIORITY_TIER.NORMAL,
+  });
+  const highUi = cache.prewarm('hud_high', { label: 'hud_high' }, {
+    priority: PIPELINE_PRIORITY_TIER.HIGH,
+  });
+
+  assert.deepEqual(cache.getStats().queuedByPriority, {
+    critical: 0,
+    high: 1,
+    normal: 1,
+    background: 2,
+  });
+
+  // Urgent draw needs 'pso-world-mesh' right now -> coalesces onto queued BACKGROUND job & elevates to CRITICAL!
+  const urgentDrawAlias = cache.compileRenderPipeline('urgent_world_draw', { label: 'world_mesh' }, {
+    canonicalKey: 'pso-world-mesh',
+    priorityTier: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+
+  // Same-id prewarm elevates 'menu_bg_shader' from BACKGROUND -> CRITICAL and returns exact same promise.
+  const urgentSameId = cache.prewarm('menu_bg_shader', { label: 'menu_bg_shader' }, {
+    priority: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+  assert.strictEqual(urgentSameId, bgSameId);
+
+  // Lower-priority duplicate arriving for already-CRITICAL job must NOT demote it.
+  const lowDuplicate = cache.prewarm('world_mesh_low_dup', { label: 'world_mesh' }, {
+    canonicalKey: 'pso-world-mesh',
+    priority: PIPELINE_PRIORITY_TIER.BACKGROUND,
+  });
+
+  // Explicit promoteTier() elevates 'pso-terrain' from NORMAL -> HIGH (after hud_high? no, terrain_norm has earlier seq!).
+  assert.equal(cache.promoteTier('pso-terrain', PIPELINE_PRIORITY_TIER.HIGH), true);
+  assert.equal(cache.promoteTier('pso-terrain', PIPELINE_PRIORITY_TIER.NORMAL), false, 'never demotes');
+
+  const stats = cache.getStats();
+  assert.equal(stats.queued, 4, 'coalesced duplicates never double-queue');
+  assert.equal(stats.coalescedCompiles, 3, 'urgentDrawAlias + urgentSameId + lowDuplicate coalesced');
+  assert.deepEqual(stats.queuedByPriority, {
+    critical: 2,
+    high: 2,
+    normal: 0,
+    background: 0,
+  });
+
+  // Drain all 5 unique compiles.
+  for (let i = 0; i < 5; i += 1) {
+    device.calls[i].resolve();
+    await tick();
+  }
+  const [rActive, rBgWorld, rUrgentAlias, rLowDup, rBgSameId, rNormTerrain, rHighUi] = await Promise.all([
+    active,
+    bgWorld,
+    urgentDrawAlias,
+    lowDuplicate,
+    bgSameId,
+    normTerrain,
+    highUi,
+  ]);
+  await cache.whenIdle();
+
+  assert.equal(device.calls.length, 5, 'zero duplicate createRenderPipelineAsync calls');
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['active_slot', 'world_mesh', 'menu_bg_shader', 'terrain_norm', 'hud_high'],
+  );
+  assert.strictEqual(rBgWorld.pipeline, rUrgentAlias.pipeline);
+  assert.strictEqual(rBgWorld.pipeline, rLowDup.pipeline);
+  assert.equal(rActive.status, PIPELINE_STATUS.READY);
+  assert.equal(rBgSameId.status, PIPELINE_STATUS.READY);
+  assert.equal(rNormTerrain.status, PIPELINE_STATUS.READY);
+  assert.equal(rHighUi.status, PIPELINE_STATUS.READY);
+});
+
+test('W305: error recovery under priority tiers frees slots, evicts failed keys, drains highest priority, and leaks zero rejections', async () => {
+  const device = createManualDevice();
+  const origRender = device.createRenderPipelineAsync;
+  device.createRenderPipelineAsync = (desc) => {
+    if (desc.label === 'crit_sync_throw') {
+      throw new Error('Tint sync validation error');
+    }
+    return origRender(desc);
+  };
+
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+
+  const failCrit = cache.prewarm('fail_crit', { label: 'fail_crit' }, {
+    canonicalKey: 'key-crit-fail',
+    priority: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+  const bgQueued = cache.prewarm('bg_after_err', { label: 'bg_after_err' }, {
+    priority: PIPELINE_PRIORITY_TIER.BACKGROUND,
+  });
+  const syncThrowCrit = cache.prewarm('crit_sync', { label: 'crit_sync_throw' }, {
+    canonicalKey: 'key-sync-throw',
+    priority: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+  const highQueued = cache.prewarm('high_after_err', { label: 'high_after_err' }, {
+    priority: PIPELINE_PRIORITY_TIER.HIGH,
+  });
+
+  // Reject active CRITICAL compile -> slot frees -> crit_sync throws synchronously -> slot frees -> high_after_err runs ahead of bg!
+  device.calls[0].reject(new Error('D3D12 PSO compile rejected'));
+  const [resFail, resSync] = await Promise.all([failCrit, syncThrowCrit]);
+  await tick();
+
+  assert.equal(resFail.status, PIPELINE_STATUS.FAILED);
+  assert.equal(resSync.status, PIPELINE_STATUS.FAILED);
+  assert.equal(cache.getStats().compileErrors, 2);
+  assert.equal(cache.getStats().activeCompiles, 1);
+  assert.equal(device.calls[1].descriptor.label, 'high_after_err');
+
+  device.calls[1].resolve();
+  await highQueued;
+  assert.equal(device.calls[2].descriptor.label, 'bg_after_err');
+  device.calls[2].resolve();
+  await bgQueued;
+
+  // Evicted failed dedupe key retries cleanly at CRITICAL tier.
+  const retryCrit = cache.prewarm('fail_crit_retry', { label: 'fail_crit_fixed' }, {
+    canonicalKey: 'key-crit-fail',
+    priority: PIPELINE_PRIORITY_TIER.CRITICAL,
+  });
+  assert.equal(device.calls.length, 4);
+  device.calls[3].resolve();
+  assert.equal((await retryCrit).status, PIPELINE_STATUS.READY);
+
+  // Batch prewarm gracefully fails malformed entries without throwing or rejecting.
+  const malformedBatch = await cache.prewarm([null]);
+  assert.equal(malformedBatch.length, 1);
+  assert.equal(malformedBatch[0].status, PIPELINE_STATUS.FAILED);
+  await cache.whenIdle();
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W305: sanitized additive telemetry (queuedByPriority, activeCompiles, peakActiveCompiles, compileStallCount, avgCompileMs) and resetStats()', async () => {
+  let now = 500;
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({
+    device,
+    maxConcurrentCompiles: 2,
+    stallThresholdMs: 16,
+    nowFn: () => now,
+  });
+
+  let stats = cache.getStats();
+  assert.deepEqual(stats.queuedByPriority, { critical: 0, high: 0, normal: 0, background: 0 });
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.peakActiveCompiles, 0);
+  assert.equal(stats.compileStallCount, 0);
+  assert.equal(stats.avgCompileMs, 0);
+
+  // Launch 2 active compiles + 2 queued compiles (1 HIGH, 1 BACKGROUND).
+  const c0 = cache.prewarm('c0', { label: 'c0' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+  const c1 = cache.prewarm('c1', { label: 'c1' }, { priority: PIPELINE_PRIORITY_TIER.CRITICAL });
+  const qHigh = cache.prewarm('q_high', { label: 'q_high' }, { priority: PIPELINE_PRIORITY_TIER.HIGH });
+  const qBg = cache.prewarm('q_bg', { label: 'q_bg' }, { priority: PIPELINE_PRIORITY_TIER.BACKGROUND });
+
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.peakActiveCompiles, 2);
+  assert.deepEqual(stats.queuedByPriority, { critical: 0, high: 1, normal: 0, background: 1 });
+
+  // t=510: c0 resolves in 10ms (< 16ms -> no stall); q_high starts at t=510.
+  now = 510;
+  device.calls[0].resolve();
+  await c0;
+  stats = cache.getStats();
+  assert.equal(stats.compileStallCount, 0);
+  assert.equal(stats.avgCompileMs, 10);
+  assert.deepEqual(stats.queuedByPriority, { critical: 0, high: 0, normal: 0, background: 1 });
+
+  // t=530: c1 resolves in 30ms (>= 16ms -> stall #1); q_bg starts at t=530.
+  now = 530;
+  device.calls[1].resolve();
+  await c1;
+  stats = cache.getStats();
+  assert.equal(stats.compileStallCount, 1);
+  assert.equal(stats.avgCompileMs, 20); // (10 + 30) / 2
+  assert.equal(stats.peakActiveCompiles, 2);
+
+  // Mid-flight resetStats(): clears cumulative stall/latency counters while preserving live active compiles & cached PSOs.
+  cache.resetStats();
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.peakActiveCompiles, 2, 'live active floor preserved');
+  assert.equal(stats.compileStallCount, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.ok(cache.get('c0') !== null, 'cached pipelines preserved across resetStats()');
+
+  // Complete q_high (550 - 510 = 40ms -> stall #1 post-reset) and q_bg (550 - 530 = 20ms -> stall #2 post-reset).
+  now = 550;
+  device.calls[2].resolve();
+  device.calls[3].resolve();
+  await Promise.all([qHigh, qBg]);
+  await cache.whenIdle();
+
+  stats = cache.getStats();
+  const tel = cache.getTelemetry();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.peakActiveCompiles, 2);
+  assert.equal(stats.compileStallCount, 2);
+  assert.equal(stats.avgCompileMs, 30); // (40 + 20) / 2
+  assert.deepEqual(stats.queuedByPriority, { critical: 0, high: 0, normal: 0, background: 0 });
+  assert.equal(tel.peakActiveCompiles, 2);
+  assert.equal(tel.compileStallCount, 2);
+  assert.deepEqual(tel.queuedByPriority, { critical: 0, high: 0, normal: 0, background: 0 });
+
+  // Idle resetStats() clears peakActiveCompiles, compileStallCount, and avgCompileMs to 0.
+  cache.resetStats();
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.peakActiveCompiles, 0);
+  assert.equal(stats.compileStallCount, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.deepEqual(stats.queuedByPriority, { critical: 0, high: 0, normal: 0, background: 0 });
+
+  // Verify UMD worker export exposes W305 symbols & prewarm().
+  const source = readFileSync(new URL('../web/workers/async_pipeline_cache.js', import.meta.url), 'utf8');
+  const workerGlobal = {};
+  workerGlobal.self = workerGlobal;
+  workerGlobal.globalThis = workerGlobal;
+  vm.runInNewContext(source, workerGlobal, { filename: 'async_pipeline_cache.js' });
+  const umd = workerGlobal.PlayGta6AsyncPipelineCache;
+  assert.deepEqual({ ...umd.PIPELINE_PRIORITY_TIER }, PIPELINE_PRIORITY_TIER);
+  assert.equal(umd.MIN_CONCURRENT_COMPILES, 1);
+  assert.equal(umd.MAX_CONCURRENT_COMPILES, 16);
+  assert.equal(typeof new umd.AsyncPipelineCache().prewarm, 'function');
+  assert.equal(typeof new umd.AsyncPipelineCache().promoteTier, 'function');
   assert.deepEqual(unhandledRejections, []);
 });
