@@ -800,6 +800,53 @@ void test_game_input_bridge() {
     set_game_input_deadzone(DeadzoneConfig{});
 }
 
+// O36: a key tap that goes down and up between two title readings is reported once.
+void test_game_input_press_latch() {
+    alignas(16) playgta6::InputState sab{};
+    set_game_input_state(&sab, SeqlockMode::MonotonicSeq);
+    Pg6IGameInput* gi = nullptr;
+    CHECK(pg6_xbox_GameInputCreate(&gi) == S_OK_HR);
+
+    auto read = [&](uint64_t* seq) {
+        Pg6IGameInputReading* r = nullptr;
+        CHECK(gi->GetCurrentReading(kGameInputKindGamepad, nullptr, &r) == S_OK_HR);
+        Pg6GameInputGamepadState gp{};
+        CHECK(r->GetGamepadState(&gp));
+        *seq = r->GetSequenceNumber(kGameInputKindGamepad);
+        r->Release();
+        return gp.buttons;
+    };
+
+    uint64_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+    CHECK(read(&s0) == gamepad_button::kNone);
+
+    // Enter down, sampled, then up again before the title reads.
+    playgta6::InputState st{};
+    st.buttons = input_button::kGamepadA;
+    GameInputReader::write_monotonic(sab, st, false);
+    sample_game_input_presses();
+    st.buttons = 0;
+    GameInputReader::write_monotonic(sab, st, false);
+
+    CHECK(read(&s1) == gamepad_button::kA);  // the tap is seen once
+    CHECK(read(&s2) == gamepad_button::kNone);
+    CHECK(s1 > s0 && s2 > s1);                // distinct readings, so the guest records both
+
+    // A held button is not extended past its release.
+    st.buttons = input_button::kDPadDown;
+    GameInputReader::write_monotonic(sab, st, false);
+    sample_game_input_presses();
+    CHECK(read(&s3) == gamepad_button::kDPadDown);
+    sample_game_input_presses();
+    st.buttons = 0;
+    GameInputReader::write_monotonic(sab, st, false);
+    CHECK(read(&s4) == gamepad_button::kNone);
+    CHECK(s4 > s3 && s3 > s2);
+
+    gi->Release();
+    set_game_input_state(nullptr);
+}
+
 // ---------------------------------------------------------------------------
 // 5. Module Registry Helper — pg6_xbox_scarlett_register_all & GetProcAddress
 // ---------------------------------------------------------------------------
@@ -876,6 +923,7 @@ int main() {
     test_surface_blocks();
     test_xg_xs_texture_computer();
     test_game_input_bridge();
+    test_game_input_press_latch();
     test_module_registry_resolution();
 
     if (g_failures > 0) {

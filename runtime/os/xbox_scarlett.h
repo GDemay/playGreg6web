@@ -483,6 +483,12 @@ void set_game_input_state(playgta6::InputState* shared_state,
                           playgta6::os::SeqlockMode mode = playgta6::os::SeqlockMode::MonotonicSeq);
 playgta6::InputState* get_game_input_state();
 void set_game_input_deadzone(const playgta6::os::DeadzoneConfig& config);
+// Press latch: records buttons that went down in the attached InputState since the last
+// GameInput reading, so the next reading reports a tap shorter than the title's frame as down
+// once. sample_game_input_presses() takes one sample; set_game_input_press_sampler(true) samples
+// every 4 ms on a background thread (off by default; the browser and --host-input turn it on).
+void sample_game_input_presses();
+void set_game_input_press_sampler(bool enabled);
 
 // Registers all 16 Xbox Scarlett exports in Win32ModuleRegistry (idempotent, thread-safe).
 size_t register_all_scarlett_exports();
