@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 import {
   AudioEngine,
   PROCESSOR_NAME,
+  DEFAULT_MAX_RESUME_RETRIES,
+  MAX_ERROR_MESSAGE_LENGTH,
+  clampVolume,
+  clampGain,
+  sanitizeResumeError,
   createAudioRingSab,
   HDR_UNDERRUNS,
   HDR_UNDERRUN_FRAMES,
@@ -704,4 +709,515 @@ test('AudioEngine.resumeOnUserGesture unlocks on keydown and removes both listen
   assert.equal(target.listenerCount('pointerdown'), 0);
   assert.equal(target.listenerCount('keydown'), 0);
   await engine.destroy();
+});
+
+test('clampVolume / clampGain guard NaN, ±Infinity, -0, and out-of-range inputs cleanly', () => {
+  assert.equal(clampGain, clampVolume);
+
+  // Finite in-range values.
+  assert.equal(clampVolume(0), 0);
+  assert.equal(clampVolume(0.25), 0.25);
+  assert.equal(clampVolume(1), 1);
+
+  // Finite out-of-range values and negative zero.
+  assert.equal(clampVolume(-5), 0);
+  assert.equal(clampVolume(2.5), 1);
+  assert.equal(Object.is(clampVolume(-0), 0), true);
+
+  // Non-finite and non-number inputs resolve to default or sanitized fallback.
+  assert.equal(clampVolume(Number.NaN), 1.0);
+  assert.equal(clampVolume(Number.POSITIVE_INFINITY), 1.0);
+  assert.equal(clampVolume(Number.NEGATIVE_INFINITY), 1.0);
+  assert.equal(clampVolume(undefined), 1.0);
+  assert.equal(clampVolume(null), 1.0);
+  assert.equal(clampVolume('0.5'), 1.0);
+  assert.equal(clampVolume({}), 1.0);
+
+  assert.equal(clampVolume(Number.NaN, 0.4), 0.4);
+  assert.equal(clampVolume(Number.POSITIVE_INFINITY, 0.4), 0.4);
+  assert.equal(clampVolume(Number.NEGATIVE_INFINITY, 0.4), 0.4);
+  assert.equal(clampVolume(Number.NaN, -2), 0.0);
+  assert.equal(clampVolume(Number.NaN, 5), 1.0);
+  assert.equal(clampVolume(Number.NaN, Number.NaN), 1.0);
+  assert.equal(clampVolume(Number.NaN, Number.POSITIVE_INFINITY), 1.0);
+});
+
+test('AudioEngine guards volume/gain/mute setters against NaN, ±Infinity, and non-finite inputs', async () => {
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'running',
+  });
+
+  // Constructor guardrails: NaN / Infinity / out-of-range / gain alias / null options.
+  assert.equal(new AudioEngine(null).volume, 1.0);
+  assert.equal(new AudioEngine({ volume: Number.NaN }).gain, 1.0);
+  assert.equal(new AudioEngine({ volume: Number.POSITIVE_INFINITY }).gain, 1.0);
+  assert.equal(new AudioEngine({ volume: Number.NEGATIVE_INFINITY }).gain, 1.0);
+  assert.equal(new AudioEngine({ volume: -3.5 }).gain, 0.0);
+  assert.equal(new AudioEngine({ volume: 9.0 }).gain, 1.0);
+  assert.equal(new AudioEngine({ gain: 0.35 }).volume, 0.35);
+
+  const engine = new AudioEngine({
+    volume: 0.6,
+    muted: false,
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine.start();
+
+  // Invalid non-finite / non-number inputs preserve active gain and never post to worklet.
+  assert.equal(engine.setVolume(Number.NaN), 0.6);
+  assert.equal(engine.setVolume(Number.POSITIVE_INFINITY), 0.6);
+  assert.equal(engine.setVolume(Number.NEGATIVE_INFINITY), 0.6);
+  assert.equal(engine.setGain(undefined), 0.6);
+  assert.equal(engine.setGain(null), 0.6);
+  assert.equal(engine.setGain('0.2'), 0.6);
+  assert.equal(engine.volume, 0.6);
+  assert.equal(engine.gain, 0.6);
+  assert.equal(events.nodes[0].postedMessages.length, 0);
+
+  // Finite out-of-range values clamp cleanly to [0, 1] and normalize -0.
+  assert.equal(engine.setGain(4.2), 1.0);
+  assert.equal(engine.setGain(-0.5), 0.0);
+  const negZeroRes = engine.setVolume(-0);
+  assert.equal(Object.is(negZeroRes, 0), true);
+  assert.equal(engine.setGain(0.5), 0.5);
+
+  assert.deepEqual(events.nodes[0].postedMessages, [
+    { type: 'setGain', gain: 1.0 },
+    { type: 'setGain', gain: 0.0 },
+    { type: 'setGain', gain: 0.0 },
+    { type: 'setGain', gain: 0.5 },
+  ]);
+
+  // Mute guardrail strictly coerces to boolean and updates effectiveGain.
+  assert.equal(engine.setMuted(1), true);
+  assert.equal(engine.muted, true);
+  assert.equal(engine.getStats().muted, true);
+  assert.equal(engine.getStats().gain, 0.5);
+  assert.equal(engine.getStats().effectiveGain, 0.0);
+
+  assert.equal(engine.setMuted(Number.NaN), false);
+  assert.equal(engine.muted, false);
+  assert.equal(engine.getStats().muted, false);
+  assert.equal(engine.getStats().effectiveGain, 0.5);
+
+  const stats = engine.getStats();
+  assert.equal(stats.invalidGainInputs, 6);
+  assert.equal(stats.gainClamps, 3);
+
+  await engine.destroy();
+});
+
+test('sanitizeResumeError redacts host paths, URLs, credentials, tokens, control chars, and bounds length', () => {
+  assert.equal(sanitizeResumeError(null), null);
+  assert.equal(sanitizeResumeError(undefined), null);
+
+  const winPathMsg = sanitizeResumeError(
+    new Error('Failed at C:\\Users\\alice\\secrets\\audio.js:12\r\nnext line')
+  );
+  assert.ok(!winPathMsg.includes('alice'));
+  assert.ok(!winPathMsg.includes('C:\\Users'));
+  assert.ok(!/[\r\n]/.test(winPathMsg));
+  assert.ok(winPathMsg.includes('[REDACTED_PATH]'));
+
+  const posixMsg = sanitizeResumeError(
+    new Error('Denied /Users/bob/project/worklet.js and file:///home/bob/index.html')
+  );
+  assert.ok(!posixMsg.includes('bob'));
+  assert.ok(posixMsg.includes('[REDACTED_PATH]'));
+  assert.ok(posixMsg.includes('[REDACTED_FILE_URL]'));
+
+  const tokenMsg = sanitizeResumeError(
+    new Error(
+      'Auth Bearer super-secret-jwt failed for https://user:pass@example.com/audio?token=abc123'
+    )
+  );
+  assert.ok(!tokenMsg.includes('super-secret-jwt'));
+  assert.ok(!tokenMsg.includes('user:pass'));
+  assert.ok(!tokenMsg.includes('abc123'));
+  assert.ok(tokenMsg.includes('Bearer [REDACTED]'));
+  assert.ok(tokenMsg.includes('https://[REDACTED]@example.com/audio?[REDACTED]'));
+
+  const domLike = sanitizeResumeError({
+    name: 'NotAllowedError',
+    message: 'User gesture required',
+  });
+  assert.equal(domLike, 'NotAllowedError: User gesture required');
+
+  // Hostile object with throwing getters never throws.
+  const hostile = {
+    get name() {
+      throw new Error('boom');
+    },
+    get message() {
+      throw new Error('boom');
+    },
+    toString() {
+      throw new Error('boom');
+    },
+  };
+  assert.equal(sanitizeResumeError(hostile), 'AudioContext resume failed');
+
+  // Empty / whitespace string falls back safely.
+  assert.equal(sanitizeResumeError('   \n\t  '), 'AudioContext resume failed');
+
+  // Long message is cleanly truncated to MAX_ERROR_MESSAGE_LENGTH.
+  const longMsg = sanitizeResumeError('X'.repeat(MAX_ERROR_MESSAGE_LENGTH + 100));
+  assert.equal(longMsg.length, MAX_ERROR_MESSAGE_LENGTH);
+  assert.ok(longMsg.endsWith('...'));
+});
+
+test('AudioEngine tracks resumeAttempts, resumeSuccesses, resumeFailures, sanitized lastResumeError, and retry recovery', async () => {
+  let remainingFailures = 2;
+  const errors = [];
+
+  class FlakyResumeAudioContext {
+    constructor(opts = {}) {
+      this.sampleRate = opts.sampleRate ?? 48000;
+      this.state = 'suspended';
+      this.destination = { kind: 'mock-destination' };
+      this.resumeCalls = 0;
+      this._listeners = new Map();
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+      this._listeners.get(type).add(fn);
+    }
+    removeEventListener(type, fn) {
+      const set = this._listeners.get(type);
+      if (set) set.delete(fn);
+    }
+    _emit(type) {
+      const set = this._listeners.get(type);
+      if (!set) return;
+      for (const fn of Array.from(set)) fn({ target: this });
+    }
+    async resume() {
+      this.resumeCalls += 1;
+      if (remainingFailures === 2) {
+        remainingFailures -= 1;
+        throw new Error('NotAllowedError at C:\\Users\\dev\\autoplay.js?token=xyz');
+      }
+      if (remainingFailures === 1) {
+        remainingFailures -= 1;
+        // Silent refusal: resolves without throwing, but remains suspended.
+        return;
+      }
+      this.state = 'running';
+      this._emit('statechange');
+    }
+    async close() {
+      this.state = 'closed';
+      this._emit('statechange');
+    }
+  }
+
+  const { MockAudioWorkletNode } = createMockWebAudioEnv();
+  const engine = new AudioEngine({
+    AudioContextCtor: FlakyResumeAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+    onError: (e) => errors.push(e),
+  });
+
+  // Before start(), resume() returns false and does not count as an AudioContext attempt.
+  assert.equal(await engine.resume(), false);
+  assert.equal(engine.getStats().resumeAttempts, 0);
+  assert.equal(engine.getStats().outputState, 'idle');
+
+  await engine.start();
+  assert.equal(engine.getStats().outputState, 'suspended');
+  assert.equal(engine.getStats().stateTransitions, 1);
+
+  // Attempt 1: throws error with host path & query string -> sanitized lastResumeError.
+  assert.equal(await engine.resume(), false);
+  let stats = engine.getStats();
+  assert.equal(stats.resumeAttempts, 1);
+  assert.equal(stats.resumeSuccesses, 0);
+  assert.equal(stats.resumeFailures, 1);
+  assert.equal(stats.stateTransitions, 1);
+  assert.equal(stats.outputState, 'suspended');
+  assert.ok(typeof stats.lastResumeError === 'string' && stats.lastResumeError.length > 0);
+  assert.ok(!stats.lastResumeError.includes('dev'));
+  assert.ok(!stats.lastResumeError.includes('C:\\Users'));
+  assert.equal(errors.length, 1);
+
+  // Attempt 2: resolves without transitioning out of suspended -> counted as failure.
+  assert.equal(await engine.resume(), false);
+  stats = engine.getStats();
+  assert.equal(stats.resumeAttempts, 2);
+  assert.equal(stats.resumeSuccesses, 0);
+  assert.equal(stats.resumeFailures, 2);
+  assert.match(stats.lastResumeError, /remained in state "suspended"/);
+
+  // Attempt 3: succeeds -> clears lastResumeError, updates stateTransitions once (no double count).
+  assert.equal(await engine.resume(), true);
+  stats = engine.getStats();
+  assert.equal(stats.resumeAttempts, 3);
+  assert.equal(stats.resumeSuccesses, 1);
+  assert.equal(stats.resumeFailures, 2);
+  assert.equal(stats.lastResumeError, null);
+  assert.equal(stats.outputState, 'running');
+  assert.equal(stats.stateTransitions, 2);
+
+  // Already running -> returns true without incrementing resumeAttempts.
+  assert.equal(await engine.resume(), true);
+  assert.equal(engine.getStats().resumeAttempts, 3);
+  assert.equal(engine.getStats().resumeSuccesses, 1);
+
+  await engine.destroy();
+  // Destroyed -> returns false without incrementing resumeAttempts.
+  assert.equal(await engine.resume(), false);
+  assert.equal(engine.getStats().resumeAttempts, 3);
+  assert.equal(engine.getStats().outputState, 'closed');
+  assert.equal(engine.getStats().stateTransitions, 3);
+});
+
+test('AudioEngine.resume supports explicit maxRetries and coalesces concurrent calls', async () => {
+  let failTimes = 2;
+
+  class RetryingContext {
+    constructor() {
+      this.sampleRate = 48000;
+      this.state = 'suspended';
+      this.destination = { kind: 'mock-destination' };
+      this.resumeCalls = 0;
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    async resume() {
+      this.resumeCalls += 1;
+      await Promise.resolve();
+      if (failTimes > 0) {
+        failTimes -= 1;
+        throw new Error('transient resume failure');
+      }
+      this.state = 'running';
+    }
+    async close() {
+      this.state = 'closed';
+    }
+  }
+
+  const { MockAudioWorkletNode } = createMockWebAudioEnv();
+  const engine = new AudioEngine({
+    AudioContextCtor: RetryingContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine.start();
+
+  // Concurrent calls coalesce onto the single retry sequence (2 failures + 1 success = 3 attempts).
+  const [r1, r2] = await Promise.all([
+    engine.resume({ maxRetries: 3, retryDelayMs: 0 }),
+    engine.resume({ maxRetries: 3, retryDelayMs: 0 }),
+  ]);
+
+  assert.equal(r1, true);
+  assert.equal(r2, true);
+  assert.equal(engine.context.resumeCalls, 3);
+
+  const stats = engine.getStats();
+  assert.equal(stats.resumeAttempts, 3);
+  assert.equal(stats.resumeFailures, 2);
+  assert.equal(stats.resumeSuccesses, 1);
+  assert.equal(stats.lastResumeError, null);
+  assert.equal(stats.outputState, 'running');
+  assert.equal(stats.stateTransitions, 2);
+
+  await engine.destroy();
+});
+
+test('AudioEngine.resumeOnUserGesture auto-rearms on failed resume and respects bounded maxRetries', async () => {
+  // Part 1: Fails on first gesture, auto-rearms, and succeeds on second gesture.
+  let failOnce = true;
+  class RecoveringContext {
+    constructor() {
+      this.sampleRate = 48000;
+      this.state = 'suspended';
+      this.destination = { kind: 'mock-destination' };
+      this.resumeCalls = 0;
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    async resume() {
+      this.resumeCalls += 1;
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('autoplay blocked');
+      }
+      this.state = 'running';
+    }
+    async close() {
+      this.state = 'closed';
+    }
+  }
+
+  const { MockAudioWorkletNode } = createMockWebAudioEnv();
+  const engine1 = new AudioEngine({
+    AudioContextCtor: RecoveringContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine1.start();
+
+  const target1 = createMockEventTarget();
+  engine1.resumeOnUserGesture(target1);
+  assert.equal(target1.listenerCount('pointerdown'), 1);
+  assert.equal(target1.listenerCount('keydown'), 1);
+
+  // First gesture fails -> microtasks settle -> listeners automatically re-arm.
+  target1.dispatch('pointerdown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine1.getStats().resumeAttempts, 1);
+  assert.equal(engine1.getStats().resumeFailures, 1);
+  assert.equal(engine1.getStats().resumeSuccesses, 0);
+  assert.equal(engine1.getStats().lastResumeError, 'autoplay blocked');
+  assert.equal(target1.listenerCount('pointerdown'), 1);
+  assert.equal(target1.listenerCount('keydown'), 1);
+
+  // Second gesture succeeds -> listeners permanently cleaned up.
+  target1.dispatch('keydown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine1.getStats().resumeAttempts, 2);
+  assert.equal(engine1.getStats().resumeFailures, 1);
+  assert.equal(engine1.getStats().resumeSuccesses, 1);
+  assert.equal(engine1.getStats().lastResumeError, null);
+  assert.equal(engine1.getStats().outputState, 'running');
+  assert.equal(target1.listenerCount('pointerdown'), 0);
+  assert.equal(target1.listenerCount('keydown'), 0);
+  await engine1.destroy();
+
+  // Part 2: Persistent failures stop re-arming once maxRetries is exhausted.
+  const failingEnv = createMockWebAudioEnv({
+    initialState: 'suspended',
+    resumeError: new Error('persistent autoplay denial'),
+  });
+  const engine2 = new AudioEngine({
+    AudioContextCtor: failingEnv.MockAudioContext,
+    AudioWorkletNodeCtor: failingEnv.MockAudioWorkletNode,
+  });
+  await engine2.start();
+
+  const target2 = createMockEventTarget();
+  assert.equal(DEFAULT_MAX_RESUME_RETRIES, 5);
+  engine2.resumeOnUserGesture(target2, { maxRetries: 2 });
+
+  // 1 initial attempt + 2 retries = 3 total attempts, then disarmed.
+  for (let i = 0; i < 3; i++) {
+    assert.equal(target2.listenerCount('pointerdown'), 1);
+    target2.dispatch('pointerdown');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(target2.listenerCount('pointerdown'), 0);
+  assert.equal(target2.listenerCount('keydown'), 0);
+  assert.equal(engine2.getStats().resumeAttempts, 3);
+  assert.equal(engine2.getStats().resumeFailures, 3);
+  assert.equal(engine2.getStats().resumeSuccesses, 0);
+
+  // Extra gesture after disarming does not invoke resume again.
+  target2.dispatch('pointerdown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine2.getStats().resumeAttempts, 3);
+  await engine2.destroy();
+});
+
+test('AudioEngine counts AudioContext stateTransitions accurately and returns sanitized defensive getStats() snapshots', async () => {
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'suspended',
+  });
+
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    volume: 0.8,
+    muted: false,
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+
+  // Initial snapshot before start.
+  const initialStats = engine.getStats();
+  assert.equal(initialStats.outputState, 'idle');
+  assert.equal(initialStats.state, 'idle');
+  assert.equal(initialStats.gain, 0.8);
+  assert.equal(initialStats.muted, false);
+  assert.equal(initialStats.effectiveGain, 0.8);
+  assert.equal(initialStats.resumeAttempts, 0);
+  assert.equal(initialStats.resumeSuccesses, 0);
+  assert.equal(initialStats.resumeFailures, 0);
+  assert.equal(initialStats.stateTransitions, 0);
+  assert.equal(initialStats.lastResumeError, null);
+  assert.equal(initialStats.error, null);
+
+  // Mutating the returned snapshot cannot corrupt engine internals.
+  initialStats.gain = Number.NaN;
+  initialStats.resumeAttempts = 999;
+  initialStats.outputState = 'hacked';
+  assert.equal(engine.getStats().gain, 0.8);
+  assert.equal(engine.getStats().resumeAttempts, 0);
+  assert.equal(engine.getStats().outputState, 'idle');
+
+  // 1: idle -> suspended
+  await engine.start();
+  const ctx = events.contexts[0];
+  assert.equal(engine.getStats().stateTransitions, 1);
+
+  // 2: suspended -> running
+  await engine.resume();
+  assert.equal(engine.getStats().stateTransitions, 2);
+
+  // Duplicate statechange with same state must not increment stateTransitions.
+  ctx._emit('statechange');
+  assert.equal(engine.getStats().stateTransitions, 2);
+
+  // 3: running -> interrupted (e.g. OS audio interruption)
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.getStats().outputState, 'interrupted');
+  assert.equal(engine.getStats().stateTransitions, 3);
+
+  // 4: interrupted -> running via resume
+  await engine.resume();
+  assert.equal(engine.getStats().outputState, 'running');
+  assert.equal(engine.getStats().stateTransitions, 4);
+  assert.equal(engine.getStats().resumeAttempts, 2);
+  assert.equal(engine.getStats().resumeSuccesses, 2);
+
+  // Even if context exposes corrupted sampleRate or unknown state, getStats() stays finite & sanitized.
+  ctx.sampleRate = Number.NaN;
+  ctx.state = 'bogus-state-value';
+  const corruptedStats = engine.getStats();
+  assert.equal(corruptedStats.sampleRate, 48000);
+  assert.equal(corruptedStats.outputState, 'unknown');
+  for (const key of [
+    'sampleRate',
+    'channels',
+    'capacityFrames',
+    'bufferedFrames',
+    'underruns',
+    'underrunFrames',
+    'overflows',
+    'droppedFrames',
+    'gain',
+    'volume',
+    'effectiveGain',
+    'gainClamps',
+    'invalidGainInputs',
+    'resumeAttempts',
+    'resumeSuccesses',
+    'resumeFailures',
+    'stateTransitions',
+  ]) {
+    assert.equal(
+      Number.isFinite(corruptedStats[key]),
+      true,
+      `Expected finite numeric stat for ${key}, got ${corruptedStats[key]}`
+    );
+    assert.ok(corruptedStats[key] >= 0, `Expected non-negative stat for ${key}`);
+  }
+
+  // 5: -> closed
+  await engine.destroy();
+  assert.equal(engine.getStats().outputState, 'closed');
+  assert.equal(engine.getStats().stateTransitions, 5);
+
+  // Idempotent destroy does not increment stateTransitions again.
+  await engine.destroy();
+  assert.equal(engine.getStats().stateTransitions, 5);
 });
