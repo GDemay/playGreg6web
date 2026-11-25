@@ -66,6 +66,7 @@ class Fixture:
         touch(self.recomp, base + 10)
         touch(self.manifest, base + 20)
         self.base = base
+        self.lift_cache = root / "liftcache"
 
     def run(self, *argv, runner=None, env=None):
         calls = []
@@ -81,8 +82,83 @@ class Fixture:
             code = rnb.main(
                 ["--exe", str(self.exe), "--game-dir", str(self.pkg), "--build-dir", str(self.build),
                  "--harness", str(self.harness), *argv],
-                runner=runner or default_runner, env=env or {}, repo_root=self.repo)
+                runner=runner or default_runner,
+                env=env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache)}, repo_root=self.repo)
         return code, out.getvalue(), err.getvalue(), calls
+
+
+class LiftCacheTests(unittest.TestCase):
+    BASE = ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"},
+            {"runtime/os/x.h": "d"}, ["--target", "native"])
+
+    def test_any_input_change_changes_the_key(self):
+        base = rnb.lift_key(*self.BASE)
+        self.assertEqual(base, rnb.lift_key(*self.BASE))
+        variants = [
+            ({"recomp/src/main.rs": "A", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b", "recomp/src/new.rs": "z"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "B"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe2", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "C"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "D"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "wasm64"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native", "--x"]),
+            # the same hash under another name (a file moved to another table) is another input
+            ({"recomp/src/main.rs": "a"}, "exe", {"bink.dll": "c", "cargo.lock": "b"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+        ]
+        keys = {rnb.lift_key(*v) for v in variants}
+        self.assertEqual(len(keys), len(variants))
+        self.assertNotIn(base, keys)
+
+    def test_inputs_key_follows_file_contents(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            key = lambda: rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg, ["--target", "native"])  # noqa: E731
+            seen = {key()}
+            for path, text in ((fx.repo / "recomp" / "src" / "main.rs", "fn main() {}"), (fx.exe, "MZ2"),
+                               (fx.pkg / "a.dll", "dll"), (fx.repo / "runtime" / "os" / "x.h", "#pragma once")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+                seen.add(key())
+            self.assertEqual(len(seen), 5)
+            self.assertEqual(rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg, ["--target", "native"]), key())
+
+    def test_miss_stores_and_a_hit_skips_recomp_and_lift(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 100)
+
+            def lifting_runner(cmd, cwd, log, timeout):
+                if len(cmd) > 1 and cmd[1] == "build-program":
+                    out = Path(cmd[cmd.index("--out") + 1])
+                    (out / "main" / "lift").mkdir(parents=True)
+                    (out / "main" / "lift" / "shard-00000.ll").write_text("ir")
+                    (out / "program-manifest.json").write_text("{}")
+                return 0 if log is None else rnb.run_command(cmd, cwd, log, timeout)
+
+            code, _, err, _ = fx.run("--name", "r1", runner=lifting_runner)
+            self.assertEqual(code, 0, err)
+            entries = [e for e in fx.lift_cache.iterdir()]
+            self.assertEqual(len(entries), 1)
+            self.assertTrue((entries[0] / "main" / "lift" / "shard-00000.ll").is_file())
+            # The harness deletes IR it no longer needs: the cache keeps its own link.
+            (fx.build / "program" / "main" / "lift" / "shard-00000.ll").unlink()
+            # Same inputs, recompiler sources newer again (another checkout): nothing to redo.
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 200)
+            code, _, err, calls = fx.run("--name", "r2")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(calls), 1, calls)  # stamp matches: only the harness
+            # A fresh build dir takes the program from the cache.
+            fx.build = Path(d) / "build2"
+            code, _, err, calls = fx.run("--name", "r3")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(calls), 1, calls)
+            self.assertIn("lift cache hit", err)
+            self.assertEqual((fx.build / "program" / "main" / "lift" / "shard-00000.ll").read_text(), "ir")
+            # --rebuild-program lifts again.
+            code, _, err, calls = fx.run("--name", "r4", "--rebuild-program", runner=lifting_runner)
+            self.assertIn("[plan] program: forced", err)
 
 
 class StalenessTests(unittest.TestCase):

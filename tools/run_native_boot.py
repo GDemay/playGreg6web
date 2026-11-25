@@ -12,7 +12,12 @@ What it does, in order:
    --out ... --dll-dir <game-dir> --target native`) when its `program-manifest.json` is missing
    or older than the recompiler, the exe or the runtime files it binds imports from
    (`runtime/os/*.h|*.cpp`, `runtime/gpu/d3d12_xs.h`, `d3d12_xs_exports.*`,
-   `runtime/guest/guest_callbacks.h`); the harness (`python tools/build_native_boot.py
+   `runtime/guest/guest_callbacks.h`). A stale program is first looked up in the lift cache
+   (`<object cache>-lift`, or `PLAYGTA6_LIFT_CACHE`; `off` disables) by a hash of the recompiler
+   sources, the exe and DLL bytes, the shim headers and the lift options: a hit hard-links the
+   cached shard IR and metadata in and skips the recompiler build, discovery and the lift; a miss
+   lifts and stores the result (the 2 most recent entries are kept, `PLAYGTA6_LIFT_CACHE_KEEP`);
+   the harness (`python tools/build_native_boot.py
    <build-dir>/program --keep-going --delete-ir --debug-info`, objects from the machine-wide cache
    shared by all checkouts, or `--cache-dir DIR` / `PLAYGTA6_OBJ_CACHE`;
    the PDB lets `--profile` name runtime functions) when the binary is missing or older than the
@@ -156,12 +161,158 @@ def shim_inputs(repo: Path) -> list[Path]:
 class Plan:
     def __init__(self) -> None:
         self.steps: list[dict] = []
+        # stage -> {"run": fn() (instead of the command), "before": fn(), "after": fn()}; not in the JSON.
+        self.hooks: dict[str, dict[str, Callable[[], None]]] = {}
 
-    def add(self, stage: str, reason: str, cmd: list[str]) -> None:
+    def add(self, stage: str, reason: str, cmd: list[str], **hooks: Callable[[], None]) -> None:
         self.steps.append({"stage": stage, "reason": reason, "cmd": cmd})
+        if hooks:
+            self.hooks[stage] = hooks
+
+    def drop(self, stage: str) -> None:
+        self.steps = [s for s in self.steps if s["stage"] != stage]
+        self.hooks.pop(stage, None)
 
     def has(self, stage: str) -> bool:
         return any(s["stage"] == stage for s in self.steps)
+
+
+# ---------------------------------------------------------------------------
+# Lift cache: the output of `build-program` (shard IR plus metadata), keyed by its inputs
+# ---------------------------------------------------------------------------
+
+LIFT_CACHE_ENV = "PLAYGTA6_LIFT_CACHE"  # directory, or "off"
+LIFT_CACHE_KEEP_ENV = "PLAYGTA6_LIFT_CACHE_KEEP"
+LIFT_CACHE_KEEP = 2  # entries are GiBs of IR each
+LIFT_CACHE_VERSION = 1
+LIFT_STAMP = ".lift-key"
+PROGRAM_KEEP = {"native", LIFT_STAMP}  # the harness build below the program dir is not lift output
+
+
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def lift_key(recomp_sources: Mapping[str, str], exe_hash: str, dll_hashes: Mapping[str, str],
+             shim_hashes: Mapping[str, str], options: Sequence[str]) -> str:
+    """Cache key of a `build-program` output: content hashes of the recompiler sources, the exe,
+    the offered DLLs and the shim headers (name -> sha256), plus the lift options. Only hashes
+    are kept outside the cache entry: never any game bytes."""
+    h = hashlib.sha256(f"playgta6-lift v{LIFT_CACHE_VERSION}\n".encode())
+    for tag, table in (("src", recomp_sources), ("dll", dll_hashes), ("shim", shim_hashes)):
+        for name in sorted(table):
+            h.update(f"{tag} {name} {table[name]}\n".encode())
+    h.update(f"exe {exe_hash}\n".encode())
+    h.update(("opt " + "\0".join(options) + "\n").encode())
+    return h.hexdigest()[:32]
+
+
+def recomp_source_files(repo: Path) -> list[Path]:
+    """The files the recompiler binary is built from: every workspace crate's `src/`, manifest and
+    build script, and the root Cargo.toml / Cargo.lock."""
+    files = [repo / "Cargo.toml", repo / "Cargo.lock"]
+    for crate in workspace_dirs(repo):
+        files += [crate / "Cargo.toml", crate / "build.rs"]
+        for dirpath, dirnames, filenames in os.walk(crate / "src"):
+            dirnames.sort()
+            files += [Path(dirpath) / n for n in sorted(filenames)]
+    return [f for f in files if f.is_file()]
+
+
+def lift_inputs_key(repo: Path, exe: Path, game_dir: Path, options: Sequence[str]) -> str:
+    def rel(f: Path) -> str:
+        return f.relative_to(repo).as_posix()
+
+    sources = {rel(f): file_digest(f) for f in recomp_source_files(repo)}
+    shims = {rel(f): file_digest(f) for f in shim_inputs(repo) + [repo / "runtime" / "abi" / "playgta6_abi.h"]
+             if f.is_file()}
+    dlls = {f.name.lower(): file_digest(f) for f in sorted(game_dir.iterdir())
+            if f.is_file() and f.suffix.lower() == ".dll"} if game_dir.is_dir() else {}
+    return lift_key(sources, file_digest(exe), dlls, shims, options)
+
+
+def lift_cache_dir(cache_dir: Path | None, env: Mapping[str, str]) -> Path | None:
+    """`PLAYGTA6_LIFT_CACHE` ("off" disables), else `<object cache>-lift` beside the object cache."""
+    value = env.get(LIFT_CACHE_ENV)
+    if value:
+        return None if value.lower() in ("0", "off", "no") else Path(value).expanduser().resolve()
+    import build_native_boot  # noqa: PLC0415 (only for the default object cache location)
+    obj = (cache_dir if cache_dir is not None else build_native_boot.default_cache_dir(env)).resolve()
+    return obj.with_name(obj.name + "-lift")
+
+
+def _link_file(src: Path, dst: Path) -> None:
+    try:
+        os.link(src, dst)
+    except OSError:  # another volume
+        shutil.copy2(src, dst)
+
+
+def _link_tree(src: Path, dst: Path) -> None:
+    """Hard-links (copies across volumes) every file below `src` to `dst`."""
+    for dirpath, _, filenames in os.walk(src):
+        out = dst / Path(dirpath).relative_to(src)
+        out.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            _link_file(Path(dirpath) / name, out / name)
+
+
+def clear_program(program: Path) -> None:
+    """Removes the lift output from `program` (keeps the harness build). Its files may be hard
+    links into the lift cache, so they are unlinked before a lift, never rewritten in place."""
+    if not program.is_dir():
+        return
+    for entry in program.iterdir():
+        if entry.name == "native":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
+def lift_cache_restore(cache: Path, key: str, program: Path) -> None:
+    clear_program(program)
+    _link_tree(cache / key, program)
+    os.utime(cache / key)
+    (program / LIFT_STAMP).write_text(key + "\n", encoding="utf-8")
+
+
+def lift_cache_store(cache: Path, key: str, program: Path, keep: int = LIFT_CACHE_KEEP) -> None:
+    """Links the fresh lift output into `cache/key` and keeps the `keep` most recent entries."""
+    entry = cache / key
+    if not entry.is_dir():
+        tmp = cache / f"{key}.tmp-{os.getpid()}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for item in program.iterdir():
+            if item.name in PROGRAM_KEEP:
+                continue
+            if item.is_dir():
+                _link_tree(item, tmp / item.name)
+            else:
+                _link_file(item, tmp / item.name)
+        try:
+            tmp.rename(entry)
+        except OSError:  # another checkout stored the same key meanwhile
+            shutil.rmtree(tmp, ignore_errors=True)
+    (program / LIFT_STAMP).write_text(key + "\n", encoding="utf-8")
+    entries = sorted((e for e in cache.iterdir() if e.is_dir() and ".tmp-" not in e.name),
+                     key=lambda e: e.stat().st_mtime, reverse=True)
+    for old in entries[max(keep, 1):]:
+        if old.name != key:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def read_stamp(program: Path) -> str | None:
+    try:
+        return (program / LIFT_STAMP).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 # Longest path below the build dir that the native build produces (MSBuild/CMake nesting under
@@ -194,9 +345,12 @@ def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str],
 
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
               force: bool, harness_override: Path | None,
-              rebuild_program: bool = False, cache_dir: Path | None = None) -> tuple[Plan, Path, Path]:
+              rebuild_program: bool = False, cache_dir: Path | None = None,
+              lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
-    `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts)."""
+    `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
+    `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
+    linked in instead of building the recompiler and running discovery and the lift."""
     program = build_dir / "program"
     recomp = repo / "target" / "release" / ("playgta6-recomp" + EXE_SUFFIX)
     harness = harness_override or program / "native" / "bin" / ("playgta6_boot" + EXE_SUFFIX)
@@ -229,9 +383,27 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
                                          ("the runtime shim headers or export tables", shim_time)])
     if reason is None and plan.has("recomp"):
         reason = "the recompiler is rebuilt"
+    lift_options = ["--target", "native"]
+    key = None
+    if reason and lift_cache is not None and exe is not None and exe.is_file() and game_dir is not None:
+        key = lift_inputs_key(repo, exe, game_dir, lift_options)
+        if not (force or rebuild_program):
+            if read_stamp(program) == key and manifest.is_file():
+                reason = None  # the program there is this exact lift (only mtimes moved)
+                plan.drop("recomp")
+            elif (lift_cache / key / "program-manifest.json").is_file():
+                reason = None
+                plan.drop("recomp")
+                plan.add("program", f"lift cache hit {key[:12]} (no recomp build, discovery or lift)",
+                         ["lift-cache", "restore", str(lift_cache / key), str(program)],
+                         run=lambda: lift_cache_restore(lift_cache, key, program))
     if reason:
+        hooks = {}
+        if key is not None:
+            hooks = {"before": lambda: clear_program(program),
+                     "after": lambda: lift_cache_store(lift_cache, key, program, keep)}
         plan.add("program", reason, [str(recomp), "build-program", str(exe), "--out", str(program),
-                                     "--dll-dir", str(game_dir), "--target", "native", "--jobs", str(jobs)])
+                                     "--dll-dir", str(game_dir), *lift_options, "--jobs", str(jobs)], **hooks)
 
     if harness_override is None:
         runtime_newest = newest_mtime(repo / "runtime", [repo / "tools" / "build_native_boot.py"])
@@ -563,8 +735,10 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if run_dir.exists() and any(run_dir.iterdir()):
         raise RunnerError(f"run directory {run_dir} already exists (pick another --name)")
 
+    lift_cache = None if (args.dry_run or args.trust_build) else lift_cache_dir(args.cache_dir, env)
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
-                                      args.rebuild_program, args.cache_dir)
+                                      args.rebuild_program, args.cache_dir, lift_cache,
+                                      int(env.get(LIFT_CACHE_KEEP_ENV) or LIFT_CACHE_KEEP))
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
@@ -607,8 +781,21 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"harness not found: {args.harness}")
     for step in plan.steps:
         print(f"[build] {step['stage']}: {' '.join(step['cmd'])}", file=sys.stderr, flush=True)
-        if runner(step["cmd"], repo, None, None) != 0:
-            raise RunnerError(f"{step['stage']} failed")
+        hooks = plan.hooks.get(step["stage"], {})
+        started = time.monotonic()
+        try:
+            if "run" in hooks:
+                hooks["run"]()
+            else:
+                if "before" in hooks:
+                    hooks["before"]()
+                if runner(step["cmd"], repo, None, None) != 0:
+                    raise RunnerError(f"{step['stage']} failed")
+                if "after" in hooks:
+                    hooks["after"]()
+        except OSError as exc:
+            raise RunnerError(f"{step['stage']} failed: {exc}") from exc
+        print(f"[build] {step['stage']}: done in {time.monotonic() - started:.0f} s", file=sys.stderr, flush=True)
     if not harness.is_file():
         raise RunnerError(f"harness not found after the build: {harness}")
 
