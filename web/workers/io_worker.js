@@ -137,6 +137,8 @@
   const DEFAULT_NEGATIVE_CACHE_MAX_ENTRIES = 512;
   const DEFAULT_METADATA_MAX_ENTRIES = 4096;
   const MAX_COALESCED_FETCH_BYTES = 4 * 1024 * 1024; // 4 MiB cap per single HTTP 206 fetch
+  const DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES = 64 * 1024; // 64 KiB max gap merged between same-asset batch ranges
+  const DEFAULT_BATCH_COALESCE_MAX_BYTES = 2 * 1024 * 1024; // 2 MiB default cap per coalesced batch span
 
   const SLAB_TUNING_PROFILES = Object.freeze({
     default: Object.freeze({
@@ -2446,12 +2448,48 @@
     };
   }
 
+  function defaultNowMs() {
+    if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function isTransferableArrayBuffer(buf) {
+    if (!buf || !(buf instanceof ArrayBuffer)) {
+      return false;
+    }
+    if (typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer) {
+      return false;
+    }
+    if (buf.detached === true) {
+      return false;
+    }
+    return true;
+  }
+
+  function emptyStreamingStats() {
+    return {
+      readsCompleted: 0,
+      bytesTransferred: 0,
+      batchedRequests: 0,
+      coalescedFetches: 0,
+      rangesCoalesced: 0,
+      cacheHits: 0,
+      errorCount: 0,
+      avgReadMs: 0,
+      totalReadMs: 0,
+      maxReadMs: 0,
+    };
+  }
+
   function emptyStats() {
     const cacheStats = emptyRangeCacheStats();
     const immStats = emptyImmutableCacheStats();
     const wholeStats = emptyWholeFileCacheStats();
     const mailboxStats = emptyMailboxStats();
     const dumpWriteStats = emptyDumpWriteStats(false);
+    const streamingStats = emptyStreamingStats();
     return {
       hits: cacheStats.hits,
       misses: cacheStats.misses,
@@ -2466,11 +2504,19 @@
       dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
       dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
       dumpWriteErrors: dumpWriteStats.dumpWriteErrors,
+      readsCompleted: streamingStats.readsCompleted,
+      bytesTransferred: streamingStats.bytesTransferred,
+      batchedRequests: streamingStats.batchedRequests,
+      coalescedFetches: streamingStats.coalescedFetches,
+      cacheHits: streamingStats.cacheHits,
+      errorCount: streamingStats.errorCount,
+      avgReadMs: streamingStats.avgReadMs,
       rangeCache: cacheStats,
       immutableCache: immStats,
       wholeFileCache: wholeStats,
       mailbox: mailboxStats,
       dumpWrites: dumpWriteStats,
+      streaming: streamingStats,
       scheduler: emptySchedulerStats(),
       rpf: {
         mountedCount: 0,
@@ -2486,10 +2532,244 @@
     if (!(bytes instanceof Uint8Array)) {
       return new Uint8Array(0);
     }
-    if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    if (
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === bytes.buffer.byteLength &&
+      isTransferableArrayBuffer(bytes.buffer)
+    ) {
       return bytes;
     }
     return bytes.slice();
+  }
+
+  function collectTransferableBuffers(results) {
+    if (!Array.isArray(results) || results.length === 0) {
+      return [];
+    }
+    const seen = new Set();
+    const transfer = [];
+    for (let i = 0; i < results.length; i += 1) {
+      const item = results[i];
+      if (!item || !item.ok || !(item.bytes instanceof Uint8Array)) {
+        continue;
+      }
+      const buf = item.bytes.buffer;
+      if (isTransferableArrayBuffer(buf) && buf.byteLength > 0 && !seen.has(buf)) {
+        seen.add(buf);
+        transfer.push(buf);
+      }
+    }
+    return transfer;
+  }
+
+  function isValidIoPriorityValue(priority) {
+    return (
+      priority === IO_PRIORITY.CRITICAL ||
+      priority === IO_PRIORITY.HIGH ||
+      priority === IO_PRIORITY.NORMAL ||
+      priority === IO_PRIORITY.PREFETCH
+    );
+  }
+
+  /**
+   * Validate, route, group by canonical asset, and coalesce adjacent/overlapping/near-adjacent
+   * ranges for a batched multi-range read while preserving each caller's original index and id.
+   */
+  function coalesceBatchReadRequests(requests, options = {}) {
+    if (!Array.isArray(requests)) {
+      throw createErrnoError(-22, 'readBatch requests must be an array');
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const routeBases = {
+      dataBase: opts.dataBase,
+      bootBase: opts.bootBase,
+      gameBase: opts.gameBase,
+      shadersBase: opts.shadersBase,
+    };
+    const defaultPath = typeof opts.path === 'string' && opts.path.length > 0 ? opts.path : null;
+    const defaultPriority =
+      opts.priority !== undefined ? opts.priority : IO_PRIORITY.NORMAL;
+    const maxGapBytes =
+      Number.isFinite(opts.maxGapBytes) && opts.maxGapBytes >= 0
+        ? Math.floor(opts.maxGapBytes)
+        : DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES;
+    const rawMaxCoalesced =
+      Number.isFinite(opts.maxCoalescedBytes) && opts.maxCoalescedBytes > 0
+        ? Math.floor(opts.maxCoalescedBytes)
+        : DEFAULT_BATCH_COALESCE_MAX_BYTES;
+    const maxCoalescedBytes = Math.max(1, Math.min(rawMaxCoalesced, MAX_COALESCED_FETCH_BYTES));
+
+    const byAsset = new Map();
+    const zeroItems = [];
+    const invalidItems = [];
+
+    for (let i = 0; i < requests.length; i += 1) {
+      const req = requests[i];
+      const itemId = req && typeof req === 'object' ? req.id : undefined;
+
+      if (!req || typeof req !== 'object') {
+        invalidItems.push({
+          index: i,
+          id: itemId,
+          errno: -22,
+          error: `Batch read entry at index ${i} must be an object`,
+        });
+        continue;
+      }
+
+      const rawPath =
+        typeof req.path === 'string' && req.path.length > 0 ? req.path : defaultPath;
+      const route = resolveHttpfsRoute(rawPath, routeBases);
+      if (!route.ok) {
+        invalidItems.push({
+          index: i,
+          id: itemId,
+          errno: -22,
+          error: route.error || `Invalid path in batch read entry at index ${i}`,
+        });
+        continue;
+      }
+
+      const offset = req.offset !== undefined ? req.offset : req.start;
+      if (!Number.isInteger(offset) || offset < 0) {
+        invalidItems.push({
+          index: i,
+          id: itemId,
+          errno: -22,
+          error: `Invalid read offset at index ${i}: ${offset}`,
+        });
+        continue;
+      }
+
+      const length =
+        req.length !== undefined
+          ? req.length
+          : Number.isInteger(req.end)
+            ? req.end - offset
+            : undefined;
+      if (!Number.isInteger(length) || length < 0) {
+        invalidItems.push({
+          index: i,
+          id: itemId,
+          errno: -22,
+          error: `Invalid read length at index ${i}: ${length}`,
+        });
+        continue;
+      }
+
+      const priority = req.priority !== undefined ? req.priority : defaultPriority;
+      if (!isValidIoPriorityValue(priority)) {
+        invalidItems.push({
+          index: i,
+          id: itemId,
+          errno: -22,
+          error: `Invalid IO priority at index ${i}: ${priority}`,
+        });
+        continue;
+      }
+
+      const normalizedItem = {
+        index: i,
+        id: itemId,
+        rawPath,
+        route,
+        offset,
+        length,
+        priority,
+      };
+
+      if (length === 0) {
+        zeroItems.push(normalizedItem);
+        continue;
+      }
+
+      const assetKey = route.isRpf ? `rpf:${route.url.toLowerCase()}` : `http:${route.url}`;
+      let list = byAsset.get(assetKey);
+      if (!list) {
+        list = [];
+        byAsset.set(assetKey, list);
+      }
+      list.push(normalizedItem);
+    }
+
+    const groups = [];
+    for (const [assetKey, list] of byAsset.entries()) {
+      list.sort((a, b) =>
+        a.offset !== b.offset
+          ? a.offset - b.offset
+          : a.length !== b.length
+            ? a.length - b.length
+            : a.index - b.index,
+      );
+
+      let current = {
+        assetKey,
+        route: list[0].route,
+        rawPath: list[0].rawPath,
+        offset: list[0].offset,
+        end: list[0].offset + list[0].length,
+        length: list[0].length,
+        priority: list[0].priority,
+        gapBytes: 0,
+        items: [list[0]],
+      };
+
+      const finalize = () => {
+        groups.push({
+          assetKey: current.assetKey,
+          route: current.route,
+          rawPath: current.rawPath,
+          offset: current.offset,
+          length: current.end - current.offset,
+          end: current.end,
+          priority: current.priority,
+          gapBytes: current.gapBytes,
+          coalesced: current.items.length > 1,
+          items: current.items,
+        });
+      };
+
+      for (let i = 1; i < list.length; i += 1) {
+        const item = list[i];
+        const itemEnd = item.offset + item.length;
+        const gap = item.offset > current.end ? item.offset - current.end : 0;
+        const candidateEnd = Math.max(current.end, itemEnd);
+        const candidateSpan = candidateEnd - current.offset;
+        const isContained = item.offset >= current.offset && itemEnd <= current.end;
+
+        if (gap <= maxGapBytes && (candidateSpan <= maxCoalescedBytes || isContained)) {
+          current.end = candidateEnd;
+          current.length = candidateSpan;
+          current.gapBytes += gap;
+          if (item.priority < current.priority) {
+            current.priority = item.priority;
+          }
+          current.items.push(item);
+        } else {
+          finalize();
+          current = {
+            assetKey,
+            route: item.route,
+            rawPath: item.rawPath,
+            offset: item.offset,
+            end: itemEnd,
+            length: item.length,
+            priority: item.priority,
+            gapBytes: 0,
+            items: [item],
+          };
+        }
+      }
+
+      finalize();
+    }
+
+    return {
+      groups,
+      zeroItems,
+      invalidItems,
+    };
   }
 
   class IoWorkerController {
@@ -2539,7 +2819,24 @@
         maxBytes: options.maxBytes,
         maxPrefetchConcurrency: options.maxPrefetchConcurrency,
         opfsDir: options.opfsDir !== undefined ? options.opfsDir : undefined,
+        coalesceAdjacent: options.coalesceAdjacent,
+        coalesceMaxGapBytes: options.coalesceMaxGapBytes,
+        coalesceMaxMergedBytes: options.coalesceMaxMergedBytes,
       };
+      this._now =
+        typeof options.now === 'function'
+          ? options.now
+          : typeof options.nowFn === 'function'
+            ? options.nowFn
+            : defaultNowMs;
+      this._batchCoalesceMaxGapBytes =
+        Number.isFinite(options.batchCoalesceMaxGapBytes) && options.batchCoalesceMaxGapBytes >= 0
+          ? Math.floor(options.batchCoalesceMaxGapBytes)
+          : DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES;
+      this._batchCoalesceMaxBytes =
+        Number.isFinite(options.batchCoalesceMaxBytes) && options.batchCoalesceMaxBytes > 0
+          ? Math.min(Math.floor(options.batchCoalesceMaxBytes), MAX_COALESCED_FETCH_BYTES)
+          : DEFAULT_BATCH_COALESCE_MAX_BYTES;
       this._immutableCacheOptions = {
         chunkSize: options.immutableCacheChunkSize,
         maxBytes: options.immutableCacheMaxBytes,
@@ -2595,6 +2892,8 @@
         dumpHandlesOpened: 0,
         dumpFlushesCompleted: 0,
       };
+      this._streamingStats = emptyStreamingStats();
+      this._countedErrors = new WeakSet();
       this._mountedArchives = new Map();
       this._inFlightMounts = new Map();
       this._rpfMountErrors = 0;
@@ -2691,14 +2990,24 @@
           throw new Error('PlayGta6RangeCache unavailable in io_worker');
         }
         this._hasRoutedRangeCache = true;
-        this.rangeCache = new mod.RangeCache({
+        const rangeCacheOpts = {
           dataBase: this.dataBase,
           chunkSize: this._cacheOptions.chunkSize,
           maxBytes: this._cacheOptions.maxBytes,
           maxPrefetchConcurrency: this._cacheOptions.maxPrefetchConcurrency,
           opfsDir: this._cacheOptions.opfsDir || null,
           fetchImpl: this._createRoutedFetch(this._getFetchImpl()),
-        });
+        };
+        if (typeof this._cacheOptions.coalesceAdjacent === 'boolean') {
+          rangeCacheOpts.coalesceAdjacent = this._cacheOptions.coalesceAdjacent;
+        }
+        if (this._cacheOptions.coalesceMaxGapBytes !== undefined) {
+          rangeCacheOpts.coalesceMaxGapBytes = this._cacheOptions.coalesceMaxGapBytes;
+        }
+        if (this._cacheOptions.coalesceMaxMergedBytes !== undefined) {
+          rangeCacheOpts.coalesceMaxMergedBytes = this._cacheOptions.coalesceMaxMergedBytes;
+        }
+        this.rangeCache = new mod.RangeCache(rangeCacheOpts);
       }
       return this.rangeCache;
     }
@@ -3280,44 +3589,377 @@
       }
     }
 
-    async read(pathStr, offset, length, options = {}) {
-      const priority = options.priority === undefined ? IO_PRIORITY.NORMAL : options.priority;
+    _recordReadSuccess(byteLength, elapsedMs) {
+      const bytes = Number.isFinite(byteLength) && byteLength > 0 ? Math.floor(byteLength) : 0;
+      const dur = Number.isFinite(elapsedMs) && elapsedMs > 0 ? elapsedMs : 0;
+      this._streamingStats.readsCompleted += 1;
+      this._streamingStats.bytesTransferred += bytes;
+      this._streamingStats.totalReadMs += dur;
+      if (dur > this._streamingStats.maxReadMs) {
+        this._streamingStats.maxReadMs = dur;
+      }
+    }
 
-      if (isRpfVirtualPath(pathStr)) {
-        const parsed = parseRpfVirtualPath(pathStr, {
-          manifest: this.manifest,
-          rpf9VfsModule: this._getRpf9VfsModule(),
-        });
-        const record = await this.ensureRpfMounted(parsed.archivePath, { priority });
-        const mountTable = this.ensureRpfMountTable();
-        const resolved = mountTable ? mountTable.resolve(parsed.mountPath) : null;
-        if (resolved) {
-          if (!resolved.stat.isFile) {
-            throw createErrnoError(-21, `Path is a directory, not a file: ${pathStr}`);
-          }
-          const targetRec =
-            (resolved.vfs.archivePath &&
-              this._mountedArchives.get(resolved.vfs.archivePath.toLowerCase())) ||
-            record;
-          return this._readFromMountedRpf(
-            targetRec,
-            resolved.archivePath,
-            offset,
-            length,
-            priority,
+    _recordReadError(err, forceCount = false) {
+      if (err && typeof err === 'object') {
+        if (!forceCount && this._countedErrors.has(err)) {
+          return;
+        }
+        this._countedErrors.add(err);
+      }
+      this._streamingStats.errorCount += 1;
+    }
+
+    async _readRpfRange(pathStr, offset, length, priority) {
+      const parsed = parseRpfVirtualPath(pathStr, {
+        manifest: this.manifest,
+        rpf9VfsModule: this._getRpf9VfsModule(),
+      });
+      const record = await this.ensureRpfMounted(parsed.archivePath, { priority });
+      const mountTable = this.ensureRpfMountTable();
+      const resolved = mountTable ? mountTable.resolve(parsed.mountPath) : null;
+      if (resolved) {
+        if (!resolved.stat.isFile) {
+          throw createErrnoError(-21, `Path is a directory, not a file: ${pathStr}`);
+        }
+        const targetRec =
+          (resolved.vfs.archivePath &&
+            this._mountedArchives.get(resolved.vfs.archivePath.toLowerCase())) ||
+          record;
+        return this._readFromMountedRpf(
+          targetRec,
+          resolved.archivePath,
+          offset,
+          length,
+          priority,
+        );
+      }
+      return this._readFromMountedRpf(record, parsed.innerPath, offset, length, priority);
+    }
+
+    async _readCoalescedRangeCacheSpan(cache, relPath, offset, length, maxMergedBytes, signal) {
+      if (signal && signal.aborted) {
+        const abortErr = createErrnoError(-4, 'The operation was aborted');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORT_ERR';
+        throw abortErr;
+      }
+      if (length === 0) {
+        return new Uint8Array(0);
+      }
+      const cleanPath = normalizeRelPath(relPath);
+      let effectiveLength = length;
+      if (cache._fileSizes && cache._fileSizes.has(cleanPath)) {
+        const knownTotal = cache._fileSizes.get(cleanPath);
+        if (offset >= knownTotal) {
+          return new Uint8Array(0);
+        }
+        effectiveLength = Math.min(length, knownTotal - offset);
+      }
+      const firstChunk = Math.floor(offset / cache.chunkSize);
+      const lastChunk = Math.floor((offset + effectiveLength - 1) / cache.chunkSize);
+      const specs = [];
+      for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+        const chunkStart = idx * cache.chunkSize;
+        const requiredEndInChunk = Math.min(
+          cache.chunkSize,
+          offset + effectiveLength - chunkStart,
+        );
+        specs.push({ chunkIndex: idx, requiredEndInChunk });
+      }
+      const chunks = await cache._getChunksCoalesced(cleanPath, specs, {
+        isPrefetch: false,
+        countMiss: true,
+        countCoalesce: true,
+        maxMergedBytes,
+      });
+      if (signal && signal.aborted) {
+        const abortErr = createErrnoError(-4, 'The operation was aborted');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORT_ERR';
+        throw abortErr;
+      }
+      const slices = [];
+      let totalBytes = 0;
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunkIndex = firstChunk + i;
+        const chunk = chunks[i];
+        if (!chunk || chunk.byteLength === 0) {
+          break;
+        }
+        const chunkStart = chunkIndex * cache.chunkSize;
+        const sliceStart = Math.max(0, offset - chunkStart);
+        const sliceEnd = Math.min(chunk.byteLength, offset + effectiveLength - chunkStart);
+        if (sliceEnd > sliceStart) {
+          const part = chunk.subarray(sliceStart, sliceEnd);
+          slices.push(part);
+          totalBytes += part.byteLength;
+        }
+        if (chunk.byteLength < cache.chunkSize) {
+          break;
+        }
+      }
+      const out = new Uint8Array(totalBytes);
+      let cursor = 0;
+      for (let i = 0; i < slices.length; i += 1) {
+        out.set(slices[i], cursor);
+        cursor += slices[i].byteLength;
+      }
+      return out;
+    }
+
+    async _fetchBatchGroupSpan(group, options, maxCoalescedBytes) {
+      const signal = options && options.signal ? options.signal : null;
+      if (signal && signal.aborted) {
+        const abortErr = createErrnoError(-4, 'The operation was aborted');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORT_ERR';
+        throw abortErr;
+      }
+      if (group.route.isRpf) {
+        return this._readRpfRange(group.route.url, group.offset, group.length, group.priority);
+      }
+      const cachePath = this._routeToCachePath(group.route);
+      const cache = this.ensureRangeCache();
+      if (
+        group.coalesced &&
+        !this._customRangeCacheProvided &&
+        cache &&
+        !cache.coalesceAdjacent &&
+        typeof cache._getChunksCoalesced === 'function' &&
+        Number.isInteger(cache.chunkSize) &&
+        cache.chunkSize > 0
+      ) {
+        const firstChunk = Math.floor(group.offset / cache.chunkSize);
+        const lastChunk = Math.floor((group.offset + group.length - 1) / cache.chunkSize);
+        if (lastChunk > firstChunk) {
+          return this._readCoalescedRangeCacheSpan(
+            cache,
+            cachePath,
+            group.offset,
+            group.length,
+            maxCoalescedBytes,
+            signal,
           );
         }
-        return this._readFromMountedRpf(record, parsed.innerPath, offset, length, priority);
+      }
+      return this._scheduledRead(cachePath, group.offset, group.length, {
+        priority: group.priority,
+        signal,
+      });
+    }
+
+    async read(pathStr, offset, length, options = {}) {
+      const priority = options.priority === undefined ? IO_PRIORITY.NORMAL : options.priority;
+      const startMs = this._now();
+
+      try {
+        let bytes;
+        if (isRpfVirtualPath(pathStr)) {
+          bytes = await this._readRpfRange(pathStr, offset, length, priority);
+        } else {
+          const route = this._resolveRoute(pathStr);
+          if (!route.ok) {
+            throw createErrnoError(-22, route.error);
+          }
+          bytes = await this._scheduledRead(this._routeToCachePath(route), offset, length, {
+            priority,
+            signal: options.signal || null,
+          });
+        }
+        const elapsedMs = Math.max(0, this._now() - startMs);
+        this._recordReadSuccess(bytes ? bytes.byteLength : 0, elapsedMs);
+        return bytes;
+      } catch (err) {
+        this._recordReadError(err);
+        throw err;
+      }
+    }
+
+    async readBatch(requests, options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      if (!Array.isArray(requests)) {
+        const err = createErrnoError(-22, 'readBatch requests must be an array');
+        this._recordReadError(err);
+        throw err;
       }
 
-      const route = this._resolveRoute(pathStr);
-      if (!route.ok) {
-        throw createErrnoError(-22, route.error);
+      this._streamingStats.batchedRequests += 1;
+
+      if (requests.length === 0) {
+        return {
+          ok: true,
+          results: [],
+          requested: 0,
+          succeeded: 0,
+          failed: 0,
+          fetches: 0,
+          coalescedFetches: 0,
+          bytesTransferred: 0,
+          transferList: [],
+        };
       }
-      return this._scheduledRead(this._routeToCachePath(route), offset, length, {
-        priority,
-        signal: options.signal || null,
+
+      const failFast = Boolean(opts.failFast);
+      const isolateBuffers = Boolean(opts.isolateBuffers);
+      const maxGapBytes =
+        Number.isFinite(opts.maxGapBytes) && opts.maxGapBytes >= 0
+          ? Math.floor(opts.maxGapBytes)
+          : this._batchCoalesceMaxGapBytes;
+      const rawMaxCoalesced =
+        Number.isFinite(opts.maxCoalescedBytes) && opts.maxCoalescedBytes > 0
+          ? Math.floor(opts.maxCoalescedBytes)
+          : this._batchCoalesceMaxBytes;
+      const maxCoalescedBytes = Math.max(1, Math.min(rawMaxCoalesced, MAX_COALESCED_FETCH_BYTES));
+
+      const plan = coalesceBatchReadRequests(
+        requests,
+        Object.assign({}, this._getRouteBases(), {
+          path: opts.path,
+          priority: opts.priority,
+          maxGapBytes,
+          maxCoalescedBytes,
+        }),
+      );
+
+      if (failFast && plan.invalidItems.length > 0) {
+        const firstInvalid = plan.invalidItems[0];
+        const err = createErrnoError(firstInvalid.errno, firstInvalid.error);
+        this._recordReadError(err);
+        throw err;
+      }
+
+      const results = new Array(requests.length);
+      let succeeded = 0;
+      let failed = 0;
+      let batchCoalescedFetches = 0;
+      let batchBytesTransferred = 0;
+
+      const makeSuccessResult = (index, id, bytes, coalesced) => {
+        const out = {
+          index,
+          ok: true,
+          bytes,
+          byteOffset: bytes.byteOffset,
+          byteLength: bytes.byteLength,
+          coalesced: Boolean(coalesced),
+        };
+        if (id !== undefined) {
+          out.id = id;
+        }
+        return out;
+      };
+
+      const makeErrorResult = (index, id, errorMsg, errno) => {
+        const out = {
+          index,
+          ok: false,
+          bytes: null,
+          error: errorMsg,
+          errno,
+        };
+        if (id !== undefined) {
+          out.id = id;
+        }
+        return out;
+      };
+
+      for (let i = 0; i < plan.invalidItems.length; i += 1) {
+        const inv = plan.invalidItems[i];
+        this._streamingStats.errorCount += 1;
+        failed += 1;
+        results[inv.index] = makeErrorResult(inv.index, inv.id, inv.error, inv.errno);
+      }
+
+      for (let i = 0; i < plan.zeroItems.length; i += 1) {
+        const z = plan.zeroItems[i];
+        const empty = new Uint8Array(0);
+        this._recordReadSuccess(0, 0);
+        succeeded += 1;
+        results[z.index] = makeSuccessResult(z.index, z.id, empty, false);
+      }
+
+      const groupTasks = plan.groups.map(async (group) => {
+        if (group.coalesced) {
+          batchCoalescedFetches += 1;
+          this._streamingStats.coalescedFetches += 1;
+          this._streamingStats.rangesCoalesced += group.items.length;
+        }
+        const groupStartMs = this._now();
+        try {
+          const rawSpan = await this._fetchBatchGroupSpan(group, opts, maxCoalescedBytes);
+          const groupElapsedMs = Math.max(0, this._now() - groupStartMs);
+          const ownedSpan = ensureTransferableBytes(rawSpan);
+
+          let sharedHighWaterRelEnd = 0;
+          for (let i = 0; i < group.items.length; i += 1) {
+            const item = group.items[i];
+            const relStart = item.offset - group.offset;
+            let itemBytes;
+            if (relStart >= ownedSpan.byteLength) {
+              itemBytes = new Uint8Array(0);
+            } else {
+              const relEnd = Math.min(ownedSpan.byteLength, relStart + item.length);
+              if (
+                group.items.length === 1 &&
+                relStart === 0 &&
+                relEnd === ownedSpan.byteLength
+              ) {
+                itemBytes = ownedSpan;
+                sharedHighWaterRelEnd = relEnd;
+              } else if (!isolateBuffers && relStart >= sharedHighWaterRelEnd) {
+                // Zero-copy subarray view sharing the coalesced transferable ArrayBuffer.
+                itemBytes = ownedSpan.subarray(relStart, relEnd);
+                sharedHighWaterRelEnd = relEnd;
+              } else {
+                // Isolated copy for overlapping ranges or explicit isolateBuffers mode.
+                itemBytes = ownedSpan.slice(relStart, relEnd);
+              }
+            }
+
+            this._recordReadSuccess(itemBytes.byteLength, groupElapsedMs);
+            batchBytesTransferred += itemBytes.byteLength;
+            succeeded += 1;
+            results[item.index] = makeSuccessResult(
+              item.index,
+              item.id,
+              itemBytes,
+              group.coalesced,
+            );
+          }
+        } catch (err) {
+          if (failFast) {
+            this._recordReadError(err);
+            throw err;
+          }
+          const errno = mapErrorToErrno(err, -5);
+          const errStr = err && err.message ? err.message : String(err);
+          if (err && typeof err === 'object') {
+            this._countedErrors.add(err);
+          }
+          for (let i = 0; i < group.items.length; i += 1) {
+            const item = group.items[i];
+            this._streamingStats.errorCount += 1;
+            failed += 1;
+            results[item.index] = makeErrorResult(item.index, item.id, errStr, errno);
+          }
+        }
       });
+
+      await Promise.all(groupTasks);
+
+      const transferList = collectTransferableBuffers(results);
+      return {
+        ok: failed === 0,
+        results,
+        requested: requests.length,
+        succeeded,
+        failed,
+        fetches: plan.groups.length,
+        coalescedFetches: batchCoalescedFetches,
+        bytesTransferred: batchBytesTransferred,
+        transferList,
+      };
     }
 
     async stat(pathStr, options = {}) {
@@ -3608,22 +4250,27 @@
     _readHandleFast(handle, offset, reqLen) {
       const entry = this._handles.get(handle);
       if (!entry) {
+        this._streamingStats.errorCount += 1;
         return null;
       }
       if (entry.kind === 'dump_write') {
+        this._streamingStats.errorCount += 1;
         return null;
       }
       if (reqLen === 0) {
+        this._recordReadSuccess(0, 0);
         return new Uint8Array(0);
       }
+      const startMs = this._now();
       if (entry.wholeFileBytes !== null && entry.wholeFileBytes !== undefined) {
         this._wholeFileStats.hits += 1;
         const buf = entry.wholeFileBytes;
-        if (offset >= buf.byteLength) {
-          return new Uint8Array(0);
-        }
-        const end = Math.min(buf.byteLength, offset + reqLen);
-        return buf.subarray(offset, end);
+        const out =
+          offset >= buf.byteLength
+            ? new Uint8Array(0)
+            : buf.subarray(offset, Math.min(buf.byteLength, offset + reqLen));
+        this._recordReadSuccess(out.byteLength, Math.max(0, this._now() - startMs));
+        return out;
       }
       if (
         entry.kind === 'direct' &&
@@ -3641,6 +4288,7 @@
               entry.size = learnedSize;
             }
           }
+          this._recordReadSuccess(syncBytes.byteLength, Math.max(0, this._now() - startMs));
           return syncBytes;
         }
       }
@@ -3650,63 +4298,77 @@
     async readHandle(handle, offset, reqLen) {
       const entry = this._handles.get(handle);
       if (!entry) {
+        this._streamingStats.errorCount += 1;
         return null;
       }
       if (entry.kind === 'dump_write') {
-        throw createErrnoError(-9, 'Cannot read from write-only /pg6_dump/ handle');
+        const err = createErrnoError(-9, 'Cannot read from write-only /pg6_dump/ handle');
+        this._recordReadError(err);
+        throw err;
       }
       if (reqLen === 0) {
+        this._recordReadSuccess(0, 0);
         return new Uint8Array(0);
       }
-      if (entry.kind === 'rpf') {
-        return this._readFromMountedRpf(
-          entry.mountRecord,
-          entry.innerPath,
-          offset,
-          reqLen,
-          IO_PRIORITY.CRITICAL,
-        );
-      }
-      if (entry.wholeFilePending) {
-        entry.wholeFilePending = false;
-        const wfRes = await this._fetchWholeFile(entry.url, entry.path, entry.size);
-        if (!wfRes.ok) {
-          throw createErrnoError(
-            typeof wfRes.errno === 'number' && wfRes.errno < 0 ? wfRes.errno : -5,
-            `Failed to fetch ${entry.url}`,
+      const startMs = this._now();
+      try {
+        let bytes;
+        if (entry.kind === 'rpf') {
+          bytes = await this._readFromMountedRpf(
+            entry.mountRecord,
+            entry.innerPath,
+            offset,
+            reqLen,
+            IO_PRIORITY.CRITICAL,
           );
-        }
-        if (wfRes.buffered) {
-          const rec = this._retainWholeFile(entry.url, wfRes.bytes, wfRes.size);
-          entry.wholeFileBytes = rec.bytes;
-          entry.size = rec.size;
-        } else if (Number.isSafeInteger(wfRes.size)) {
-          entry.size = wfRes.size;
-        }
-      }
-      if (entry.wholeFileBytes !== null && entry.wholeFileBytes !== undefined) {
-        this._wholeFileStats.hits += 1;
-        const buf = entry.wholeFileBytes;
-        if (offset >= buf.byteLength) {
-          return new Uint8Array(0);
-        }
-        const end = Math.min(buf.byteLength, offset + reqLen);
-        return buf.slice(offset, end);
-      }
-      if (entry.useImmutableCache) {
-        const immCache = this.ensureImmutableCache();
-        const bytes = await immCache.read(entry.url, offset, reqLen);
-        if (entry.size === null) {
-          const learnedSize = immCache.getFileSize(entry.url);
-          if (Number.isSafeInteger(learnedSize)) {
-            entry.size = learnedSize;
+        } else {
+          if (entry.wholeFilePending) {
+            entry.wholeFilePending = false;
+            const wfRes = await this._fetchWholeFile(entry.url, entry.path, entry.size);
+            if (!wfRes.ok) {
+              throw createErrnoError(
+                typeof wfRes.errno === 'number' && wfRes.errno < 0 ? wfRes.errno : -5,
+                `Failed to fetch ${entry.url}`,
+              );
+            }
+            if (wfRes.buffered) {
+              const rec = this._retainWholeFile(entry.url, wfRes.bytes, wfRes.size);
+              entry.wholeFileBytes = rec.bytes;
+              entry.size = rec.size;
+            } else if (Number.isSafeInteger(wfRes.size)) {
+              entry.size = wfRes.size;
+            }
+          }
+          if (entry.wholeFileBytes !== null && entry.wholeFileBytes !== undefined) {
+            this._wholeFileStats.hits += 1;
+            const buf = entry.wholeFileBytes;
+            if (offset >= buf.byteLength) {
+              bytes = new Uint8Array(0);
+            } else {
+              const end = Math.min(buf.byteLength, offset + reqLen);
+              bytes = buf.slice(offset, end);
+            }
+          } else if (entry.useImmutableCache) {
+            const immCache = this.ensureImmutableCache();
+            bytes = await immCache.read(entry.url, offset, reqLen);
+            if (entry.size === null) {
+              const learnedSize = immCache.getFileSize(entry.url);
+              if (Number.isSafeInteger(learnedSize)) {
+                entry.size = learnedSize;
+              }
+            }
+          } else {
+            bytes = await this._scheduledRead(entry.cachePath || entry.path, offset, reqLen, {
+              priority: IO_PRIORITY.CRITICAL,
+            });
           }
         }
+        this._recordReadSuccess(bytes ? bytes.byteLength : 0, Math.max(0, this._now() - startMs));
         return bytes;
+      } catch (err) {
+        this._recordReadError(err);
+        throw err;
       }
-      return this._scheduledRead(entry.cachePath || entry.path, offset, reqLen, {
-        priority: IO_PRIORITY.CRITICAL,
-      });
     }
 
     openWriteHandle(rawPath, options = {}) {
@@ -4229,6 +4891,27 @@
         };
       });
 
+      const totalCacheHits =
+        (Number.isFinite(cacheStats.hits) ? cacheStats.hits : 0) +
+        (Number.isFinite(immutableCacheStats.hits) ? immutableCacheStats.hits : 0) +
+        (Number.isFinite(immutableCacheStats.slabCacheHits) ? immutableCacheStats.slabCacheHits : 0) +
+        (Number.isFinite(wholeFileStats.hits) ? wholeFileStats.hits : 0);
+      const readsCompleted = this._streamingStats.readsCompleted;
+      const avgReadMs =
+        readsCompleted > 0 ? this._streamingStats.totalReadMs / readsCompleted : 0;
+      const streamingStats = {
+        readsCompleted,
+        bytesTransferred: this._streamingStats.bytesTransferred,
+        batchedRequests: this._streamingStats.batchedRequests,
+        coalescedFetches: this._streamingStats.coalescedFetches,
+        rangesCoalesced: this._streamingStats.rangesCoalesced,
+        cacheHits: totalCacheHits,
+        errorCount: this._streamingStats.errorCount,
+        avgReadMs,
+        totalReadMs: this._streamingStats.totalReadMs,
+        maxReadMs: this._streamingStats.maxReadMs,
+      };
+
       return {
         // Backwards-compatible top-level RangeCache fields
         hits: cacheStats.hits,
@@ -4246,12 +4929,21 @@
         dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
         dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
         dumpWriteErrors: dumpWriteStats.dumpWriteErrors,
+        // Top-level streaming & batched range dispatch telemetry (W219)
+        readsCompleted: streamingStats.readsCompleted,
+        bytesTransferred: streamingStats.bytesTransferred,
+        batchedRequests: streamingStats.batchedRequests,
+        coalescedFetches: streamingStats.coalescedFetches,
+        cacheHits: streamingStats.cacheHits,
+        errorCount: streamingStats.errorCount,
+        avgReadMs: streamingStats.avgReadMs,
         // Detailed subsystem telemetry
         rangeCache: cacheStats,
         immutableCache: immutableCacheStats,
         wholeFileCache: wholeFileStats,
         mailbox: mailboxStats,
         dumpWrites: dumpWriteStats,
+        streaming: streamingStats,
         scheduler: schedulerStats,
         rpf: {
           mountedCount: mountedArchives.length,
@@ -4289,6 +4981,22 @@
         dumpHandlesOpened: 0,
         dumpFlushesCompleted: 0,
       };
+      this._streamingStats = emptyStreamingStats();
+      this._countedErrors = new WeakSet();
+      if (typeof opts.now === 'function') {
+        this._now = opts.now;
+      } else if (typeof opts.nowFn === 'function') {
+        this._now = opts.nowFn;
+      }
+      if (Number.isFinite(opts.batchCoalesceMaxGapBytes) && opts.batchCoalesceMaxGapBytes >= 0) {
+        this._batchCoalesceMaxGapBytes = Math.floor(opts.batchCoalesceMaxGapBytes);
+      }
+      if (Number.isFinite(opts.batchCoalesceMaxBytes) && opts.batchCoalesceMaxBytes > 0) {
+        this._batchCoalesceMaxBytes = Math.min(
+          Math.floor(opts.batchCoalesceMaxBytes),
+          MAX_COALESCED_FETCH_BYTES,
+        );
+      }
       this._mountedArchives.clear();
       this._inFlightMounts.clear();
       this._rpfMountErrors = 0;
@@ -4431,20 +5139,40 @@
             typeof opts.now === 'function' ? opts.now : this._immutableCacheOptions.now,
           fetchImpl: fetchFn,
         });
-      this.rangeCache =
-        opts.rangeCache ||
-        new rangeCacheMod.RangeCache({
-          dataBase: this.dataBase,
-          chunkSize:
-            opts.chunkSize !== undefined ? opts.chunkSize : this._cacheOptions.chunkSize,
-          maxBytes: opts.maxBytes !== undefined ? opts.maxBytes : this._cacheOptions.maxBytes,
-          maxPrefetchConcurrency:
-            opts.maxPrefetchConcurrency !== undefined
-              ? opts.maxPrefetchConcurrency
-              : this._cacheOptions.maxPrefetchConcurrency,
-          opfsDir,
-          fetchImpl: routedFetchFn,
-        });
+      const initRangeCacheOpts = {
+        dataBase: this.dataBase,
+        chunkSize:
+          opts.chunkSize !== undefined ? opts.chunkSize : this._cacheOptions.chunkSize,
+        maxBytes: opts.maxBytes !== undefined ? opts.maxBytes : this._cacheOptions.maxBytes,
+        maxPrefetchConcurrency:
+          opts.maxPrefetchConcurrency !== undefined
+            ? opts.maxPrefetchConcurrency
+            : this._cacheOptions.maxPrefetchConcurrency,
+        opfsDir,
+        fetchImpl: routedFetchFn,
+      };
+      const resolvedCoalesceAdjacent =
+        typeof opts.coalesceAdjacent === 'boolean'
+          ? opts.coalesceAdjacent
+          : this._cacheOptions.coalesceAdjacent;
+      if (typeof resolvedCoalesceAdjacent === 'boolean') {
+        initRangeCacheOpts.coalesceAdjacent = resolvedCoalesceAdjacent;
+      }
+      const resolvedCoalesceMaxGap =
+        opts.coalesceMaxGapBytes !== undefined
+          ? opts.coalesceMaxGapBytes
+          : this._cacheOptions.coalesceMaxGapBytes;
+      if (resolvedCoalesceMaxGap !== undefined) {
+        initRangeCacheOpts.coalesceMaxGapBytes = resolvedCoalesceMaxGap;
+      }
+      const resolvedCoalesceMaxMerged =
+        opts.coalesceMaxMergedBytes !== undefined
+          ? opts.coalesceMaxMergedBytes
+          : this._cacheOptions.coalesceMaxMergedBytes;
+      if (resolvedCoalesceMaxMerged !== undefined) {
+        initRangeCacheOpts.coalesceMaxMergedBytes = resolvedCoalesceMaxMerged;
+      }
+      this.rangeCache = opts.rangeCache || new rangeCacheMod.RangeCache(initRangeCacheOpts);
 
       const schedulerMod = this._getIoSchedulerModule();
       if (opts.scheduler) {
@@ -4582,6 +5310,44 @@
           if (this.postMessage) {
             this.postMessage({ id: m.id, bytes: transferable }, [transferable.buffer]);
           }
+        } else if (m.readBatch || m.batchRead) {
+          const rawRequests = Array.isArray(m.requests)
+            ? m.requests
+            : Array.isArray(m.ranges)
+              ? m.ranges
+              : Array.isArray(m.reads)
+                ? m.reads
+                : Array.isArray(m.readBatch)
+                  ? m.readBatch
+                  : Array.isArray(m.batchRead)
+                    ? m.batchRead
+                    : null;
+          const batch = await this.readBatch(rawRequests, {
+            path: m.path,
+            priority: m.priority,
+            maxGapBytes: m.maxGapBytes,
+            maxCoalescedBytes: m.maxCoalescedBytes,
+            failFast: Boolean(m.failFast),
+            isolateBuffers: Boolean(m.isolateBuffers),
+          });
+          if (this.postMessage) {
+            const payload = {
+              id: m.id,
+              ok: batch.ok,
+              results: batch.results,
+              requested: batch.requested,
+              succeeded: batch.succeeded,
+              failed: batch.failed,
+              fetches: batch.fetches,
+              coalescedFetches: batch.coalescedFetches,
+              bytesTransferred: batch.bytesTransferred,
+            };
+            if (batch.transferList.length > 0) {
+              this.postMessage(payload, batch.transferList);
+            } else {
+              this.postMessage(payload);
+            }
+          }
         } else if (m.openWrite || m.openDump) {
           const handle = await this.openWriteHandle(m.path, {
             append: Boolean(m.append),
@@ -4683,6 +5449,7 @@
           }
         }
       } catch (err) {
+        this._recordReadError(err);
         if (this.postMessage) {
           const errPayload = { id: m.id, error: String(err) };
           if (err && typeof err.errno === 'number') {
@@ -4745,9 +5512,13 @@
     SLAB_TUNING_PROFILES,
     VIDEO_STREAM_SLAB_PRESET,
     DEFAULT_NEGATIVE_CACHE_TTL_MS,
+    DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES,
+    DEFAULT_BATCH_COALESCE_MAX_BYTES,
     ImmutableHttpfsCache,
     IoWorkerController,
     createIoWorkerHandler,
+    coalesceBatchReadRequests,
+    collectTransferableBuffers,
     resolveHttpfsRoute,
     normalizeDumpEndpoint,
     resolveDumpConfig,
@@ -4766,6 +5537,7 @@
     emptyWholeFileCacheStats,
     emptyMailboxStats,
     emptyDumpWriteStats,
+    emptyStreamingStats,
     emptySchedulerStats,
     getDefaultController: () => defaultController,
   };
