@@ -3045,6 +3045,13 @@ void test_xbox_unaligned_constant_buffers() {
         }
     }
     CHECK(small_writes == 1);
+    // O36: per-draw VAs (a ring of constants) must not grow the table; evicted homes are reused.
+    for (uint64_t sz = 1; sz <= 9500; ++sz) {
+        uint32_t bid = 0;
+        uint64_t boff = 0;
+        CHECK(dev->relocate_uniform(scene.vb_va + 16, sz, sz, &bid, &boff));
+        CHECK(dev->relocated_uniform_count() <= 8192);
+    }
 
     CHECK(t_balanced);
     scene.release_all({list, heap});
