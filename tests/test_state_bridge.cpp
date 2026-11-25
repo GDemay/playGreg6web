@@ -726,6 +726,108 @@ void test_compute_dispatch_packets() {
 
 }
 
+// Binding arrays (G62, lane-indexed heap windows): with the device capability on, the layout entry
+// carries binding_array_size and the bind group a run of elements; off (default), such a layout is
+// refused and nothing array-shaped reaches the stream.
+void test_binding_array_layouts() {
+    constexpr uint64_t kCs = 0xCA;
+    constexpr uint32_t kCsModule = 9;
+    constexpr uint32_t kFirstTexture = 400;
+
+    d3d::RootSignatureDesc rs;
+    rs.flags = 0x400;  // CBV_SRV_UAV heap directly indexed
+    d3d::RootParameterDesc base;
+    base.parameter_type = d3d::RootParameterType::Constants32Bit;
+    base.num_32bit_values = 1;
+    rs.parameters.push_back(base);
+    d3d::RootSignature signature;
+    CHECK(d3d::RootSignature::build(rs, &signature).ok());
+
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry tex = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture,
+                                               static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                               static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+    tex.binding_array_size = 3;
+    d3d::ShaderBinding window = join(0, d3d::DescriptorRangeType::Srv, 0);
+    window.heap = d3d::HeapAccess::Resource;
+    window.heap_index_parameter = 0;
+    window.heap_index_source = d3d::HeapIndexSource::RootConstantIndex;
+    window.heap_shift = 5;
+    group.bindings.push_back({tex, window});
+    layout.groups.push_back(group);
+    pso::D3D12ComputePsoDesc desc;
+    desc.cs = kCs;
+    desc.root_signature_id = 11;
+
+    auto record = [&](bool binding_arrays, std::vector<Packet>* out) {
+        d3d::DescriptorHeapRegistry heaps;
+        bridge::BridgeOptions options = counting_options(7000);
+        options.binding_arrays = binding_arrays;
+        bridge::StateBridgeDevice device(heaps, options);
+        d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 8, true);
+        d3d::ViewDesc srv;
+        srv.format = 28;  // R8G8B8A8_UNORM
+        srv.dimension = d3d::ViewDimension::Texture2D;
+        srv.mip_levels = 0xffff;
+        for (uint32_t i = 0; i < 8; ++i) {
+            device.register_texture(kFirstTexture + i, {pso::DxgiFormat::R8G8B8A8_UNORM, 16, 16, 1, 1, 1,
+                                                        GpuTextureDimension::Dim2D, false});
+            CHECK(heaps.create_shader_resource_view(kFirstTexture + i, &srv, srv_heap->cpu_handle(i)) ==
+                  d3d::Status::Ok);
+        }
+        device.register_shader_module(kCs, kCsModule);
+        device.register_pipeline_layout(kCs, 0, layout);
+        auto cpso = device.create_compute_pipeline_state(desc, &signature);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+        const uint32_t window_base = 2;
+        CHECK(list.SetComputeRoot32BitConstants(0, 1, &window_base, 0) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        list.Dispatch(1, 1, 1);
+        list.Close();
+        *out = decode(enc);
+    };
+
+    std::vector<Packet> on;
+    record(true, &on);
+    const Packet* bgl = nullptr;
+    const Packet* bg = nullptr;
+    for (const Packet& pk : on) {
+        bgl = pk.opcode == GpuOpcode::CreateBindGroupLayout ? &pk : bgl;
+        bg = pk.opcode == GpuOpcode::CreateBindGroup2 ? &pk : bg;
+    }
+    CHECK(bgl != nullptr && bg != nullptr);
+    if (bgl != nullptr && bg != nullptr) {
+        const auto h = pod<GpuCreateBindGroupLayoutPayload>(*bgl);
+        CHECK(h.flags == GpuLayoutFlags::BindingArrays && h.entry_count == 1);
+        CHECK(bgl->payload.size() == sizeof(h) + sizeof(GpuBindGroupLayoutEntry));
+        const auto e = pod<GpuBindGroupLayoutEntry>(*bgl, sizeof(h));
+        CHECK(e.binding == 0 && e.binding_array_size == 3 && e.reserved == 0);
+        const auto g = pod<GpuCreateBindGroup2Payload>(*bg);
+        CHECK(g.flags == GpuBindGroupFlags::BindingArrays && g.entry_count == 3 && g.layout_id == h.id);
+        CHECK(bg->payload.size() == sizeof(g) + 3 * sizeof(GpuBindGroupEntry2));
+        for (uint32_t k = 0; k < 3 && bg->payload.size() == sizeof(g) + 3 * sizeof(GpuBindGroupEntry2); ++k) {
+            const auto el = pod<GpuBindGroupEntry2>(*bg, sizeof(g) + k * sizeof(GpuBindGroupEntry2));
+            CHECK(el.binding == 0 && el.array_index == k && el.reserved == 0);
+            CHECK(el.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView));
+            // Heap descriptors window_base + k.
+            CHECK(el.resource_id == kFirstTexture + 2 + k);
+        }
+    }
+
+    // Capability off (default): the array layout is refused, no layout / bind group is emitted.
+    std::vector<Packet> off;
+    record(false, &off);
+    for (const Packet& pk : off) {
+        CHECK(pk.opcode != GpuOpcode::CreateBindGroupLayout && pk.opcode != GpuOpcode::CreateBindGroup2);
+    }
+    CHECK(!bridge::BridgeOptions{}.binding_arrays);
+}
+
 void test_diagnostics_and_closed_list() {
     Scene scene;
     gpu::CommandEncoder enc;
@@ -2511,6 +2613,7 @@ int main() {
     test_barrier_flushes_pending_clears();
     test_partial_clear_is_reported();
     test_compute_dispatch_packets();
+    test_binding_array_layouts();
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
     test_concurrent_command_lists();

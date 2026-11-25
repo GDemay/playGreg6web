@@ -47,9 +47,11 @@
 // binding_array<T, max_count>. Element k of the window is the descriptor at byte offset
 // (window_base + k) << shift of the bound heap; window_base is the CB dword read like a CB-indexed
 // source ((dword >> bit_offset) & mask), 0 without "window_base". The stage subtracts the same base
-// from its lane index and bounds-checks against max_count. The bridge has no descriptor arrays
-// yet: such a binding is parsed and validated, and the join fails with a counted reason
-// (JoinStats::lane_indexed_bindings) instead of a generic one.
+// from its lane index and bounds-checks against max_count. Such a binding joins as a binding array
+// (GpuBindGroupLayoutEntry::binding_array_size = max_count; the bridge binds heap descriptors
+// window_base + 0 .. max_count - 1, see d3d::ShaderBinding::array_size) only when the consumer binds
+// binding arrays (JoinOptions::binding_arrays, from bridge::BridgeOptions::binding_arrays; off by
+// default). Otherwise the join fails with a counted reason (JoinStats::lane_indexed_bindings).
 // A CB-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[cb.index]): the index is the
 // 32-bit dword at "byte_offset" of a constant buffer: the root CBV, the CBV in a table slot or the
 // root constants of the root parameter whose user data starts at "cbv"."user_sgpr". The descriptor
@@ -192,12 +194,21 @@ struct JoinStats {
     // declare the slot, or declares it as another class.
     uint64_t table_slots_outside_rs = 0;
     // Lane-indexed heap bindings (LaneIndexed*Heap) that are well formed but cannot be bound: the
-    // bridge has no descriptor arrays yet. Counted whether or not the join succeeds (such a binding
-    // always fails it), so the caller can report these skips apart from other join failures.
+    // consumer does not bind binding arrays (JoinOptions::binding_arrays off). Counted whether or
+    // not the join succeeds (such a binding always fails it), so the caller can report these skips
+    // apart from other join failures.
     uint64_t lane_indexed_bindings = 0;
+    // Lane-indexed heap bindings joined as binding arrays (JoinOptions::binding_arrays; on success).
+    uint64_t lane_indexed_arrays = 0;
+};
+struct JoinOptions {
+    // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
+    // join as arrays instead of failing the join.
+    bool binding_arrays = false;
 };
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
-                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats = nullptr);
+                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats = nullptr,
+                          const JoinOptions& options = {});
 
 // Vertex attributes for a pack-resolved vertex stage: each reflected input is matched to the input
 // element of its slot that covers its byte offset. An element starting at that offset gives its own

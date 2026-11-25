@@ -1270,6 +1270,67 @@ void test_heap_indexed_bind_groups() {
     CHECK(no_heap.bind_group->entries[1].resource_id == 701 && cache.heap_index_misses() == 3);
 }
 
+// Binding array elements (G62, lane-indexed heap windows): element k reads the heap index plus k;
+// a window without a base (HeapIndexSource::Constant) starts at heap index 0.
+void test_heap_indexed_binding_array() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, true);
+    RootSignatureDesc d;
+    d.flags = 0x400;
+    d.parameters.push_back(constants(0, 1));
+    RootSignature rs;
+    CHECK(RootSignature::build(d, &rs).ok());
+    fill_srvs(reg, heap, 0, 8, 100);  // slot i -> resource 100 + i
+
+    std::vector<ShaderBinding> bindings;
+    for (uint32_t k = 0; k < 3; ++k) {
+        ShaderBinding based;  // window base in root constant 0
+        based.binding = 0;
+        based.register_class = DescriptorRangeType::Srv;
+        based.heap = HeapAccess::Resource;
+        based.heap_index_parameter = 0;
+        based.heap_shift = 5;
+        based.array_size = 3;
+        based.array_index = k;
+        bindings.push_back(based);
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        ShaderBinding fixed;  // no window base
+        fixed.binding = 1;
+        fixed.register_class = DescriptorRangeType::Srv;
+        fixed.heap = HeapAccess::Resource;
+        fixed.heap_index_source = HeapIndexSource::Constant;
+        fixed.heap_shift = 5;
+        fixed.array_size = 2;
+        fixed.array_index = k;
+        bindings.push_back(fixed);
+    }
+    CHECK(!same_join(bindings[0], bindings[1]));
+    const BindGroupPlan plan = BindGroupPlan::build(rs, bindings, WebGpuStage::Fragment);
+    CHECK(plan.unresolved_count() == 0 && plan.parameter_mask() == 1);
+
+    RootArgumentState st;
+    BindGroupCache cache;
+    const BindPoint G = BindPoint::Graphics;
+    DescriptorHeap* heaps[1] = {heap};
+    CHECK(st.set_descriptor_heaps(1, heaps) == Status::Ok);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(st.set_root_constant(G, 0, 4, 0) == Status::Ok);  // window base 4
+    BindGroupLookup g = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(g.status == Status::Ok && g.bind_group != nullptr && g.bind_group->entries.size() == 5);
+    if (g.bind_group != nullptr && g.bind_group->entries.size() == 5) {
+        CHECK(g.bind_group->entries[0].resource_id == 104 && g.bind_group->entries[1].resource_id == 105 &&
+              g.bind_group->entries[2].resource_id == 106);
+        CHECK(g.bind_group->entries[3].resource_id == 100 && g.bind_group->entries[4].resource_id == 101);
+        CHECK(g.bind_group->null_entries == 0);
+    }
+    // Moving the window base selects other descriptors.
+    CHECK(st.set_root_constant(G, 0, 1, 0) == Status::Ok);
+    BindGroupLookup moved = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(moved.rebuilt && moved.bind_group != nullptr && moved.bind_group->entries[0].resource_id == 101 &&
+          moved.bind_group->entries[2].resource_id == 103);
+}
+
 // CB-indexed heaps (G62, #482): SM 6.6 ResourceDescriptorHeap[cb.index], the index read from a
 // constant buffer (root CBV, a table slot's CBV or root constants) when the draw is recorded.
 // Guest memory here: a dword map the slot source reads (it decodes no heap itself).
@@ -2137,6 +2198,7 @@ int main() {
     test_bind_group_plan();
     test_bind_group_cache();
     test_heap_indexed_bind_groups();
+    test_heap_indexed_binding_array();
     test_cb_indexed_heap_bind_groups();
     test_inline_sampler_plan();
     test_state_tracker_basic();
