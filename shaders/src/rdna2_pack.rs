@@ -23,7 +23,9 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
-use crate::pack::{PackEntry, PackError, write_json_string, write_pack};
+use crate::pack::{
+    PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry, PackError, write_json_string, write_pack,
+};
 use crate::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, WgslBindingInfo, WgslVertexInputInfo,
     translate_rdna2_to_wgsl, write_wgsl_bindings_json, write_wgsl_vertex_inputs_json,
@@ -116,6 +118,15 @@ pub struct Rdna2PackOptions {
     /// When `true`, skip individual shaders that fail I/O, hash verification, size checks, or
     /// translation/Naga validation and record them in `summary.failures` instead of aborting.
     pub best_effort: bool,
+    /// Optional per-stage WGSL UTF-8 byte limit. When `Some(limit)`, any translated stage whose
+    /// WGSL UTF-8 byte length exceeds `limit` is skipped cleanly instead of packed and counted in
+    /// `summary.skipped_oversize`.
+    pub max_wgsl_bytes: Option<usize>,
+    /// Optional total `.wgsl.pack` byte budget (capped at `u32::MAX`). When `Some(limit)`, stop
+    /// adding further stages once packing another stage would cause total output file size
+    /// (header + entry table + payloads) to exceed `min(limit, u32::MAX as u64)`, counting
+    /// skipped stages in `summary.skipped_budget`.
+    pub max_pack_bytes: Option<u64>,
 }
 
 /// Strictly sanitized per-shader entry summary for [`Rdna2PackSummary`]
@@ -154,6 +165,10 @@ pub struct Rdna2PackSummary {
     pub skipped_or_failed: usize,
     pub failed: usize,
     pub manifest_duplicates_skipped: usize,
+    pub skipped_oversize: usize,
+    pub skipped_budget: usize,
+    pub largest_wgsl_bytes: usize,
+    pub total_wgsl_bytes: u64,
     pub vertex_count: usize,
     pub pixel_count: usize,
     pub compute_count: usize,
@@ -181,6 +196,14 @@ impl Rdna2PackSummary {
             "  \"manifest_duplicates_skipped\": {},",
             self.manifest_duplicates_skipped
         );
+        let _ = writeln!(out, "  \"skipped_oversize\": {},", self.skipped_oversize);
+        let _ = writeln!(out, "  \"skipped_budget\": {},", self.skipped_budget);
+        let _ = writeln!(
+            out,
+            "  \"largest_wgsl_bytes\": {},",
+            self.largest_wgsl_bytes
+        );
+        let _ = writeln!(out, "  \"total_wgsl_bytes\": {},", self.total_wgsl_bytes);
         let _ = writeln!(out, "  \"vertex_count\": {},", self.vertex_count);
         let _ = writeln!(out, "  \"pixel_count\": {},", self.pixel_count);
         let _ = writeln!(out, "  \"compute_count\": {},", self.compute_count);
@@ -279,12 +302,16 @@ impl Rdna2PackSummary {
                 self.manifest_duplicates_skipped
             );
         }
+        let _ = writeln!(out, "  skipped_oversize:  {}", self.skipped_oversize);
+        let _ = writeln!(out, "  skipped_budget:    {}", self.skipped_budget);
         let _ = writeln!(out, "  vertex_count:      {}", self.vertex_count);
         let _ = writeln!(out, "  pixel_count:       {}", self.pixel_count);
         let _ = writeln!(out, "  compute_count:     {}", self.compute_count);
         let _ = writeln!(out, "  vertex_packed:     {}", self.vertex_packed);
         let _ = writeln!(out, "  fragment_packed:   {}", self.fragment_packed);
         let _ = writeln!(out, "  compute_packed:    {}", self.compute_packed);
+        let _ = writeln!(out, "  largest_wgsl_bytes: {}", self.largest_wgsl_bytes);
+        let _ = writeln!(out, "  total_wgsl_bytes:  {}", self.total_wgsl_bytes);
         let _ = writeln!(out, "  pack_bytes:        {}", self.pack_bytes);
         if !self.failures.is_empty() {
             let _ = writeln!(out, "  failures ({}):", self.failures.len());
@@ -1022,18 +1049,104 @@ pub fn parse_pipeline_dump_manifest(
     })
 }
 
-fn build_pack_result(
+struct PackBuildState {
     packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
     total_blobs: usize,
     skipped_or_failed: usize,
     failed: usize,
     manifest_duplicates_skipped: usize,
+    skipped_oversize: usize,
+    skipped_budget: usize,
+    /// Exact `WGPK` v1 byte size of all currently accepted entries (starts at `PACK_HEADER_BYTES`).
+    current_pack_bytes: u64,
+    /// Set once adding another non-oversize stage would exceed `min(max_pack_bytes, u32::MAX)`.
+    budget_exhausted: bool,
     failures: Vec<Rdna2PackFailureSummary>,
+}
+
+impl PackBuildState {
+    fn new() -> Self {
+        Self {
+            packed_by_hash: BTreeMap::new(),
+            total_blobs: 0,
+            skipped_or_failed: 0,
+            failed: 0,
+            manifest_duplicates_skipped: 0,
+            skipped_oversize: 0,
+            skipped_budget: 0,
+            current_pack_bytes: PACK_HEADER_BYTES as u64,
+            budget_exhausted: false,
+            failures: Vec::new(),
+        }
+    }
+
+    fn try_insert_translated(
+        &mut self,
+        hash: u64,
+        entry: PackEntry,
+        entry_summary: Rdna2PackEntrySummary,
+        options: &Rdna2PackOptions,
+    ) {
+        let wgsl_byte_len = entry.wgsl.len();
+        if let Some(max_wgsl) = options.max_wgsl_bytes
+            && wgsl_byte_len > max_wgsl
+        {
+            self.skipped_oversize += 1;
+            self.skipped_or_failed += 1;
+            return;
+        }
+
+        let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(wgsl_byte_len as u64);
+        let projected = self.current_pack_bytes.saturating_add(entry_cost);
+        if let Some(max_pack) = options.max_pack_bytes {
+            let effective_budget = max_pack.min(u64::from(u32::MAX));
+            if self.budget_exhausted || projected > effective_budget {
+                self.budget_exhausted = true;
+                self.skipped_budget += 1;
+                self.skipped_or_failed += 1;
+                return;
+            }
+        }
+
+        self.current_pack_bytes = projected;
+        self.packed_by_hash.insert(hash, (entry, entry_summary));
+    }
+}
+
+fn validate_wgpk_v1_size(
+    entry_count: usize,
+    total_wgsl_bytes: u64,
+    largest_wgsl_bytes: usize,
+) -> Result<u64, Rdna2PackError> {
+    let projected_total = u64::try_from(entry_count)
+        .ok()
+        .and_then(|count| count.checked_mul(PACK_ENTRY_BYTES as u64))
+        .and_then(|table_bytes| (PACK_HEADER_BYTES as u64).checked_add(table_bytes))
+        .and_then(|data_start| data_start.checked_add(total_wgsl_bytes));
+
+    let fits_u32 = u32::try_from(entry_count).is_ok()
+        && projected_total.is_some_and(|total| total <= u64::from(u32::MAX));
+    if !fits_u32 {
+        let total_desc = projected_total
+            .map(|n| format!("{n} bytes"))
+            .unwrap_or_else(|| "> u64::MAX bytes".to_string());
+        return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+            "WGPK v1 pack size ({total_desc} across {entry_count} stages; total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}) exceeds u32::MAX ({} bytes); re-run with --max-wgsl-bytes <N> and/or --max-pack-bytes <N>",
+            u32::MAX
+        ))));
+    }
+
+    Ok(projected_total.unwrap())
+}
+
+fn build_pack_result(
+    state: PackBuildState,
     pack_flags: u32,
 ) -> Result<Rdna2PackResult, Rdna2PackError> {
-    let mut entries: Vec<PackEntry> = Vec::with_capacity(packed_by_hash.len());
-    let mut entry_summaries: Vec<Rdna2PackEntrySummary> = Vec::with_capacity(packed_by_hash.len());
-    for (entry, entry_summary) in packed_by_hash.into_values() {
+    let mut entries: Vec<PackEntry> = Vec::with_capacity(state.packed_by_hash.len());
+    let mut entry_summaries: Vec<Rdna2PackEntrySummary> =
+        Vec::with_capacity(state.packed_by_hash.len());
+    for (entry, entry_summary) in state.packed_by_hash.into_values() {
         entries.push(entry);
         entry_summaries.push(entry_summary);
     }
@@ -1041,21 +1154,43 @@ fn build_pack_result(
     let mut vertex_count = 0usize;
     let mut pixel_count = 0usize;
     let mut compute_count = 0usize;
+    let mut largest_wgsl_bytes = 0usize;
+    let mut total_wgsl_bytes = 0u64;
     for entry in &entries {
         match entry.stage {
             ShaderStage::Vertex => vertex_count += 1,
             ShaderStage::Fragment => pixel_count += 1,
             ShaderStage::Compute => compute_count += 1,
         }
+        let wgsl_len = entry.wgsl.len();
+        if wgsl_len > largest_wgsl_bytes {
+            largest_wgsl_bytes = wgsl_len;
+        }
+        total_wgsl_bytes = total_wgsl_bytes.saturating_add(wgsl_len as u64);
     }
 
-    let pack_bytes = write_pack(&entries, pack_flags).map_err(Rdna2PackError::Pack)?;
+    let _ = validate_wgpk_v1_size(entries.len(), total_wgsl_bytes, largest_wgsl_bytes)?;
+
+    let pack_bytes = write_pack(&entries, pack_flags).map_err(|err| match err {
+        PackError::Overflow(_) => Rdna2PackError::Pack(PackError::Overflow(format!(
+            "WGPK v1 pack size (total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}, entries={}) exceeds u32::MAX ({} bytes); re-run with --max-wgsl-bytes <N> and/or --max-pack-bytes <N>",
+            entries.len(),
+            u32::MAX
+        ))),
+        other => Rdna2PackError::Pack(other),
+    })?;
+    debug_assert_eq!(state.current_pack_bytes, pack_bytes.len() as u64);
+
     let summary = Rdna2PackSummary {
-        total_blobs,
+        total_blobs: state.total_blobs,
         translated_ok: entries.len(),
-        skipped_or_failed,
-        failed,
-        manifest_duplicates_skipped,
+        skipped_or_failed: state.skipped_or_failed,
+        failed: state.failed,
+        manifest_duplicates_skipped: state.manifest_duplicates_skipped,
+        skipped_oversize: state.skipped_oversize,
+        skipped_budget: state.skipped_budget,
+        largest_wgsl_bytes,
+        total_wgsl_bytes,
         vertex_count,
         pixel_count,
         compute_count,
@@ -1064,7 +1199,7 @@ fn build_pack_result(
         compute_packed: compute_count,
         pack_bytes: pack_bytes.len(),
         entries: entry_summaries,
-        failures,
+        failures: state.failures,
     };
 
     Ok(Rdna2PackResult {
@@ -1098,10 +1233,7 @@ fn write_pack_bytes_to_file(out_path: &Path, pack_bytes: &[u8]) -> Result<(), Rd
 fn pack_blobs_into_map(
     blobs: &[Rdna2BlobInput],
     options: &Rdna2PackOptions,
-    packed_by_hash: &mut BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
-    skipped_or_failed: &mut usize,
-    failed: &mut usize,
-    failures: &mut Vec<Rdna2PackFailureSummary>,
+    state: &mut PackBuildState,
 ) {
     // Sort a view of indices deterministically by blob name then raw content length/bytes
     // so duplicate-hash tie-breaking is independent of caller slice order.
@@ -1117,6 +1249,21 @@ fn pack_blobs_into_map(
     for idx in order {
         let blob = &blobs[idx];
         let hint = parse_filename_hint(&blob.name);
+
+        if state.budget_exhausted {
+            let known_hash = blob
+                .hash_override
+                .or(hint.hash)
+                .unwrap_or_else(|| fnv1a_64(&blob.bytes));
+            if state.packed_by_hash.contains_key(&known_hash) {
+                state.skipped_or_failed += 1;
+            } else {
+                state.skipped_budget += 1;
+                state.skipped_or_failed += 1;
+            }
+            continue;
+        }
+
         let stage = if blob.stage_override != Rdna2StageOverride::Auto {
             blob.stage_override
         } else if hint.stage != Rdna2StageOverride::Auto {
@@ -1126,9 +1273,9 @@ fn pack_blobs_into_map(
         };
 
         if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
-            *skipped_or_failed += 1;
-            *failed += 1;
-            failures.push(Rdna2PackFailureSummary {
+            state.skipped_or_failed += 1;
+            state.failed += 1;
+            state.failures.push(Rdna2PackFailureSummary {
                 code_identity: blob.hash_override.or(hint.hash),
                 stage: override_to_stage(stage),
                 reason: format!(
@@ -1150,20 +1297,26 @@ fn pack_blobs_into_map(
         let output = match translate_rdna2_to_wgsl(&blob.bytes, &translate_opts) {
             Ok(out) if out.naga_validated => out,
             Ok(_) => {
-                *skipped_or_failed += 1;
-                *failed += 1;
-                failures.push(Rdna2PackFailureSummary {
-                    code_identity: blob.hash_override.or(hint.hash).or_else(|| Some(fnv1a_64(&blob.bytes))),
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
+                    code_identity: blob
+                        .hash_override
+                        .or(hint.hash)
+                        .or_else(|| Some(fnv1a_64(&blob.bytes))),
                     stage: override_to_stage(stage),
                     reason: "translated WGSL did not pass Naga validation".to_string(),
                 });
                 continue;
             }
             Err(err) => {
-                *skipped_or_failed += 1;
-                *failed += 1;
-                failures.push(Rdna2PackFailureSummary {
-                    code_identity: blob.hash_override.or(hint.hash).or_else(|| Some(fnv1a_64(&blob.bytes))),
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
+                    code_identity: blob
+                        .hash_override
+                        .or(hint.hash)
+                        .or_else(|| Some(fnv1a_64(&blob.bytes))),
                     stage: override_to_stage(stage),
                     reason: format!("RDNA2->WGSL translation failed: {err}"),
                 });
@@ -1176,33 +1329,32 @@ fn pack_blobs_into_map(
             .or(hint.hash)
             .unwrap_or(output.hash_fnv1a64);
 
-        if packed_by_hash.contains_key(&final_hash) {
-            *skipped_or_failed += 1;
+        if state.packed_by_hash.contains_key(&final_hash) {
+            state.skipped_or_failed += 1;
             continue;
         }
 
         let wgsl_byte_len = output.wgsl.len();
-        packed_by_hash.insert(
+        state.try_insert_translated(
             final_hash,
-            (
-                PackEntry {
-                    hash: final_hash,
-                    stage: output.stage,
-                    wgsl: output.wgsl,
-                },
-                Rdna2PackEntrySummary {
-                    hash_fnv1a64: final_hash,
-                    stage: output.stage,
-                    entry_point: output.entry_point,
-                    naga_validated: output.naga_validated,
-                    translated_op_count: output.translated_op_count,
-                    unsupported_op_count: output.unsupported_op_count,
-                    wgsl_byte_len,
-                    vertex_input_mode: output.binding_summary.vertex_input_mode,
-                    bindings: output.bindings,
-                    vertex_inputs: output.vertex_inputs,
-                },
-            ),
+            PackEntry {
+                hash: final_hash,
+                stage: output.stage,
+                wgsl: output.wgsl,
+            },
+            Rdna2PackEntrySummary {
+                hash_fnv1a64: final_hash,
+                stage: output.stage,
+                entry_point: output.entry_point,
+                naga_validated: output.naga_validated,
+                translated_op_count: output.translated_op_count,
+                unsupported_op_count: output.unsupported_op_count,
+                wgsl_byte_len,
+                vertex_input_mode: output.binding_summary.vertex_input_mode,
+                bindings: output.bindings,
+                vertex_inputs: output.vertex_inputs,
+            },
+            options,
         );
     }
 }
@@ -1220,29 +1372,10 @@ pub fn pack_rdna2_blobs(
     blobs: &[Rdna2BlobInput],
     options: &Rdna2PackOptions,
 ) -> Result<Rdna2PackResult, Rdna2PackError> {
-    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-    let mut skipped_or_failed = 0usize;
-    let mut failed = 0usize;
-    let mut failures = Vec::new();
-
-    pack_blobs_into_map(
-        blobs,
-        options,
-        &mut packed_by_hash,
-        &mut skipped_or_failed,
-        &mut failed,
-        &mut failures,
-    );
-
-    build_pack_result(
-        packed_by_hash,
-        blobs.len(),
-        skipped_or_failed,
-        failed,
-        0,
-        failures,
-        options.pack_flags,
-    )
+    let mut state = PackBuildState::new();
+    state.total_blobs = blobs.len();
+    pack_blobs_into_map(blobs, options, &mut state);
+    build_pack_result(state, options.pack_flags)
 }
 
 /// Collect regular RDNA2 blob files (`*.bin`, `*.rdna2`, `*.shader`) inside `input_dir`,
@@ -1394,16 +1527,10 @@ pub fn pack_rdna2_directory_to_file(
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pack_manifest_into_map(
     manifest_path: &Path,
     options: &Rdna2PackOptions,
-    packed_by_hash: &mut BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
-    total_blobs: &mut usize,
-    skipped_or_failed: &mut usize,
-    failed: &mut usize,
-    manifest_duplicates_skipped: &mut usize,
-    failures: &mut Vec<Rdna2PackFailureSummary>,
+    state: &mut PackBuildState,
 ) -> Result<(), Rdna2PackError> {
     let manifest_label = sanitize_source_path(manifest_path, None);
     let meta = fs::metadata(manifest_path).map_err(|_| {
@@ -1444,23 +1571,29 @@ fn pack_manifest_into_map(
         Vec::with_capacity(manifest.native_stages.len());
     for entry in manifest.native_stages {
         if !seen_code_ids.insert(entry.code_identity) {
-            *manifest_duplicates_skipped += 1;
+            state.manifest_duplicates_skipped += 1;
             continue;
         }
         unique_stages.push(entry);
     }
     unique_stages.sort_by_key(|entry| entry.code_identity);
 
-    *total_blobs += unique_stages.len();
+    state.total_blobs += unique_stages.len();
 
     for entry in unique_stages {
+        if state.budget_exhausted {
+            state.skipped_budget += 1;
+            state.skipped_or_failed += 1;
+            continue;
+        }
+
         let rel_path = match validate_manifest_relative_path(&entry.code_file) {
             Ok(p) => p,
             Err(err) => {
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason: err.to_string(),
@@ -1481,9 +1614,9 @@ fn pack_manifest_into_map(
                     err.kind()
                 );
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason,
@@ -1501,9 +1634,9 @@ fn pack_manifest_into_map(
         if !canonical_file.starts_with(&canonical_parent) {
             let reason = "code_file resolves outside the manifest directory".to_string();
             if options.best_effort {
-                *skipped_or_failed += 1;
-                *failed += 1;
-                failures.push(Rdna2PackFailureSummary {
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
                     code_identity: Some(entry.code_identity),
                     stage: Some(entry.stage),
                     reason,
@@ -1522,9 +1655,9 @@ fn pack_manifest_into_map(
             _ => {
                 let reason = "code_file is not a regular file".to_string();
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason,
@@ -1545,9 +1678,9 @@ fn pack_manifest_into_map(
             Err(err) => {
                 let reason = format!("failed to read code_file: {}", err.kind());
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason,
@@ -1565,9 +1698,9 @@ fn pack_manifest_into_map(
         let actual_hash = fnv1a_64(&bytes);
         if actual_hash != entry.code_identity {
             if options.best_effort {
-                *skipped_or_failed += 1;
-                *failed += 1;
-                failures.push(Rdna2PackFailureSummary {
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
                     code_identity: Some(entry.code_identity),
                     stage: Some(entry.stage),
                     reason: format!(
@@ -1591,9 +1724,9 @@ fn pack_manifest_into_map(
                 bytes.len()
             );
             if options.best_effort {
-                *skipped_or_failed += 1;
-                *failed += 1;
-                failures.push(Rdna2PackFailureSummary {
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
                     code_identity: Some(entry.code_identity),
                     stage: Some(entry.stage),
                     reason,
@@ -1620,9 +1753,9 @@ fn pack_manifest_into_map(
             Ok(_) => {
                 let reason = "translated WGSL did not pass Naga validation".to_string();
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason,
@@ -1638,9 +1771,9 @@ fn pack_manifest_into_map(
             Err(err) => {
                 let reason = format!("RDNA2->WGSL translation failed: {err}");
                 if options.best_effort {
-                    *skipped_or_failed += 1;
-                    *failed += 1;
-                    failures.push(Rdna2PackFailureSummary {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
                         code_identity: Some(entry.code_identity),
                         stage: Some(entry.stage),
                         reason,
@@ -1656,27 +1789,26 @@ fn pack_manifest_into_map(
         };
 
         let wgsl_byte_len = output.wgsl.len();
-        packed_by_hash.insert(
+        state.try_insert_translated(
             entry.code_identity,
-            (
-                PackEntry {
-                    hash: entry.code_identity,
-                    stage: output.stage,
-                    wgsl: output.wgsl,
-                },
-                Rdna2PackEntrySummary {
-                    hash_fnv1a64: entry.code_identity,
-                    stage: output.stage,
-                    entry_point: output.entry_point,
-                    naga_validated: output.naga_validated,
-                    translated_op_count: output.translated_op_count,
-                    unsupported_op_count: output.unsupported_op_count,
-                    wgsl_byte_len,
-                    vertex_input_mode: output.binding_summary.vertex_input_mode,
-                    bindings: output.bindings,
-                    vertex_inputs: output.vertex_inputs,
-                },
-            ),
+            PackEntry {
+                hash: entry.code_identity,
+                stage: output.stage,
+                wgsl: output.wgsl,
+            },
+            Rdna2PackEntrySummary {
+                hash_fnv1a64: entry.code_identity,
+                stage: output.stage,
+                entry_point: output.entry_point,
+                naga_validated: output.naga_validated,
+                translated_op_count: output.translated_op_count,
+                unsupported_op_count: output.unsupported_op_count,
+                wgsl_byte_len,
+                vertex_input_mode: output.binding_summary.vertex_input_mode,
+                bindings: output.bindings,
+                vertex_inputs: output.vertex_inputs,
+            },
+            options,
         );
     }
 
@@ -1723,50 +1855,21 @@ pub fn pack_rdna2_sources(
         ));
     }
 
-    let mut packed_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-    let mut total_blobs = 0usize;
-    let mut skipped_or_failed = 0usize;
-    let mut failed = 0usize;
-    let mut manifest_duplicates_skipped = 0usize;
-    let mut failures = Vec::new();
+    let mut state = PackBuildState::new();
 
     if let Some(manifest) = manifest_path {
-        pack_manifest_into_map(
-            manifest,
-            options,
-            &mut packed_by_hash,
-            &mut total_blobs,
-            &mut skipped_or_failed,
-            &mut failed,
-            &mut manifest_duplicates_skipped,
-            &mut failures,
-        )?;
+        pack_manifest_into_map(manifest, options, &mut state)?;
     }
 
     if let Some(dir) = input_dir {
         let (blobs, read_failures) = collect_directory_blobs(dir)?;
-        total_blobs += blobs.len() + read_failures;
-        skipped_or_failed += read_failures;
-        failed += read_failures;
-        pack_blobs_into_map(
-            &blobs,
-            options,
-            &mut packed_by_hash,
-            &mut skipped_or_failed,
-            &mut failed,
-            &mut failures,
-        );
+        state.total_blobs += blobs.len() + read_failures;
+        state.skipped_or_failed += read_failures;
+        state.failed += read_failures;
+        pack_blobs_into_map(&blobs, options, &mut state);
     }
 
-    build_pack_result(
-        packed_by_hash,
-        total_blobs,
-        skipped_or_failed,
-        failed,
-        manifest_duplicates_skipped,
-        failures,
-        options.pack_flags,
-    )
+    build_pack_result(state, options.pack_flags)
 }
 
 /// Convenience helper that runs [`pack_rdna2_sources`] and writes the resulting
@@ -2823,5 +2926,289 @@ mod tests {
         assert!(ps_entry.wgsl.contains("fn fs_main("));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_max_wgsl_bytes_skips_oversize_and_packs_smaller_stages() {
+        let cs_bytes = build_minimal_compute_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        // Build a larger synthetic shader by repeating valid VOP1/VOP2 ALU ops before EXP + s_endpgm.
+        let mut large_words = Vec::new();
+        for _ in 0..80 {
+            large_words.push(enc_vop1(0x01, 1, 242)); // v_mov_b32 v1, 1.0
+            large_words.push(enc_vop2(0x18, 2, 128 + 1, 1)); // v_lshlrev_b32 v2, 1, v1
+        }
+        large_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [1, 2, 1, 2]));
+        large_words.push(enc_sopp(0x01, 0));
+        let large_ps_bytes = words_to_bytes(&large_words);
+
+        let blobs = vec![
+            Rdna2BlobInput::new("cs_0000000000001001.rdna2", cs_bytes),
+            Rdna2BlobInput::new("ps_0000000000001002.rdna2", ps_bytes),
+            Rdna2BlobInput::new("ps_0000000000001003.rdna2", large_ps_bytes),
+        ];
+
+        // Baseline pack without limits to obtain exact translated WGSL byte lengths.
+        let full = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default())
+            .expect("baseline pack should succeed");
+        assert_eq!(full.summary.translated_ok, 3);
+        assert_eq!(full.summary.skipped_oversize, 0);
+        assert_eq!(full.summary.skipped_budget, 0);
+
+        let len_cs = full
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x1001)
+            .unwrap()
+            .wgsl
+            .len();
+        let len_ps = full
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x1002)
+            .unwrap()
+            .wgsl
+            .len();
+        let len_large = full
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x1003)
+            .unwrap()
+            .wgsl
+            .len();
+        assert!(len_large > len_ps && len_large > len_cs);
+        assert_eq!(full.summary.largest_wgsl_bytes, len_large);
+        assert_eq!(
+            full.summary.total_wgsl_bytes,
+            (len_cs + len_ps + len_large) as u64
+        );
+
+        let limit = len_cs.max(len_ps);
+        assert!(limit < len_large);
+
+        let limited = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_wgsl_bytes: Some(limit),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect("max_wgsl_bytes pack should succeed cleanly");
+
+        assert_eq!(limited.summary.total_blobs, 3);
+        assert_eq!(limited.summary.translated_ok, 2);
+        assert_eq!(limited.summary.skipped_oversize, 1);
+        assert_eq!(limited.summary.skipped_budget, 0);
+        assert_eq!(limited.summary.skipped_or_failed, 1);
+        assert_eq!(limited.summary.failed, 0);
+        assert!(limited.summary.failures.is_empty());
+        assert_eq!(limited.summary.largest_wgsl_bytes, limit);
+        assert_eq!(limited.summary.total_wgsl_bytes, (len_cs + len_ps) as u64);
+        assert_eq!(limited.summary.entries.len(), 2);
+        assert!(limited.summary.entries.iter().all(|e| e.hash_fnv1a64 != 0x1003));
+
+        let decoded = read_pack(&limited.pack_bytes).expect("WGPK pack must decode cleanly");
+        assert_eq!(decoded.entries.len(), 2);
+        assert!(decoded.entries.iter().any(|e| e.hash == 0x1001));
+        assert!(decoded.entries.iter().any(|e| e.hash == 0x1002));
+        assert!(decoded.entries.iter().all(|e| e.hash != 0x1003));
+        for entry in &decoded.entries {
+            assert!(entry.wgsl.len() <= limit);
+            assert_naga_wgsl_valid(&entry.wgsl);
+        }
+
+        let json = limited.summary.to_json();
+        let text = limited.summary.to_text();
+        assert!(json.contains("\"skipped_oversize\": 1"), "JSON:\n{json}");
+        assert!(json.contains("\"skipped_budget\": 0"), "JSON:\n{json}");
+        assert!(
+            json.contains(&format!("\"largest_wgsl_bytes\": {limit}")),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"total_wgsl_bytes\": {}",
+                (len_cs + len_ps) as u64
+            )),
+            "JSON:\n{json}"
+        );
+        assert!(!json.contains("0x0000000000001003"), "skipped stage must be excluded from JSON entries:\n{json}");
+        assert!(text.contains("skipped_oversize:  1"), "text:\n{text}");
+        assert!(text.contains("skipped_budget:    0"), "text:\n{text}");
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_and_manifest_max_pack_bytes_enforces_exact_budget() {
+        let cs_bytes = build_minimal_compute_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+
+        // Names chosen so sorted order is a (cs), b (ps), c (vs).
+        let blobs = vec![
+            Rdna2BlobInput::new("a_cs_0000000000002001.rdna2", cs_bytes.clone()),
+            Rdna2BlobInput::new("b_ps_0000000000002002.rdna2", ps_bytes.clone()),
+            Rdna2BlobInput::new("c_vs_0000000000002003.rdna2", vs_bytes.clone()),
+        ];
+
+        let full = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default()).unwrap();
+        let len_a = full
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x2001)
+            .unwrap()
+            .wgsl
+            .len() as u64;
+        let len_b = full
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x2002)
+            .unwrap()
+            .wgsl
+            .len() as u64;
+        let entry_cost_a = PACK_ENTRY_BYTES as u64 + len_a;
+        let entry_cost_b = PACK_ENTRY_BYTES as u64 + len_b;
+
+        // Exact budget for header + a + b: packs 2 stages, skips 3rd.
+        let exact_two_budget = PACK_HEADER_BYTES as u64 + entry_cost_a + entry_cost_b;
+        let two_opts = Rdna2PackOptions {
+            max_pack_bytes: Some(exact_two_budget),
+            ..Rdna2PackOptions::default()
+        };
+        let res_two = pack_rdna2_blobs(&blobs, &two_opts).expect("budgeted pack should succeed");
+        assert_eq!(res_two.pack_bytes.len() as u64, exact_two_budget);
+        assert_eq!(res_two.summary.translated_ok, 2);
+        assert_eq!(res_two.summary.skipped_budget, 1);
+        assert_eq!(res_two.summary.skipped_oversize, 0);
+        assert_eq!(res_two.summary.skipped_or_failed, 1);
+        assert_eq!(res_two.summary.failed, 0);
+        assert_eq!(res_two.summary.total_wgsl_bytes, len_a + len_b);
+        assert_eq!(
+            res_two.summary.largest_wgsl_bytes,
+            (len_a.max(len_b)) as usize
+        );
+        assert_eq!(res_two.summary.entries.len(), 2);
+        let decoded_two = read_pack(&res_two.pack_bytes).unwrap();
+        assert_eq!(decoded_two.entries.len(), 2);
+        assert!(decoded_two.entries.iter().all(|e| e.hash != 0x2003));
+
+        // Determinism check: reversed input slice produces byte-identical pack & summary.
+        let mut blobs_rev = blobs.clone();
+        blobs_rev.reverse();
+        let res_two_rev = pack_rdna2_blobs(&blobs_rev, &two_opts).unwrap();
+        assert_eq!(res_two.pack_bytes, res_two_rev.pack_bytes);
+        assert_eq!(res_two.summary, res_two_rev.summary);
+
+        // One byte shy of fitting stage b -> only stage a fits, 2 skipped_budget.
+        let tight_budget = exact_two_budget - 1;
+        let res_one = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(tight_budget),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(res_one.pack_bytes.len() as u64 <= tight_budget);
+        assert_eq!(
+            res_one.pack_bytes.len() as u64,
+            PACK_HEADER_BYTES as u64 + entry_cost_a
+        );
+        assert_eq!(res_one.summary.translated_ok, 1);
+        assert_eq!(res_one.summary.skipped_budget, 2);
+        assert_eq!(res_one.summary.entries.len(), 1);
+        assert_eq!(res_one.summary.total_wgsl_bytes, len_a);
+        assert_eq!(res_one.summary.largest_wgsl_bytes, len_a as usize);
+
+        // Budget larger than u32::MAX clamps safely to u32::MAX and packs all small shaders.
+        let clamped = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                max_pack_bytes: Some(u64::MAX),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(clamped.summary.translated_ok, 3);
+        assert_eq!(clamped.summary.skipped_budget, 0);
+
+        // Also verify strict --manifest mode respects max_pack_bytes without erroring.
+        let root = make_temp_dir("playgta6_rdna2_manifest_budget");
+        let native_dir = root.join("native");
+        fs::create_dir_all(&native_dir).unwrap();
+        let cs_hash = fnv1a_64(&cs_bytes);
+        let ps_hash = fnv1a_64(&ps_bytes);
+        let vs_hash = fnv1a_64(&vs_bytes);
+        let cs_id = format_shader_hash(cs_hash);
+        let ps_id = format_shader_hash(ps_hash);
+        let vs_id = format_shader_hash(vs_hash);
+        fs::write(native_dir.join(format!("{cs_id}.bin")), &cs_bytes).unwrap();
+        fs::write(native_dir.join(format!("{ps_id}.bin")), &ps_bytes).unwrap();
+        fs::write(native_dir.join(format!("{vs_id}.bin")), &vs_bytes).unwrap();
+
+        let manifest_path = root.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+  "schema": "playgta6-pipeline-dump",
+  "schema_version": 1,
+  "native_stages": [
+    {{"code_identity": "{cs_id}", "stage": "compute", "code_file": "native/{cs_id}.bin"}},
+    {{"code_identity": "{ps_id}", "stage": "pixel", "code_file": "native/{ps_id}.bin"}},
+    {{"code_identity": "{vs_id}", "stage": "vertex", "code_file": "native/{vs_id}.bin"}}
+  ]
+}}"#
+            ),
+        )
+        .unwrap();
+
+        let full_manifest = pack_rdna2_manifest(&manifest_path, &Rdna2PackOptions::default()).unwrap();
+        assert_eq!(full_manifest.entries.len(), 3);
+        let first_entry_len = full_manifest.entries[0].wgsl.len() as u64;
+        let first_budget = PACK_HEADER_BYTES as u64 + PACK_ENTRY_BYTES as u64 + first_entry_len;
+
+        let budgeted_manifest = pack_rdna2_manifest(
+            &manifest_path,
+            &Rdna2PackOptions {
+                best_effort: false,
+                max_pack_bytes: Some(first_budget),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect("strict manifest mode with max_pack_bytes should succeed");
+        assert_eq!(budgeted_manifest.pack_bytes.len() as u64, first_budget);
+        assert_eq!(budgeted_manifest.summary.translated_ok, 1);
+        assert_eq!(budgeted_manifest.summary.skipped_budget, 2);
+        assert_eq!(budgeted_manifest.summary.failed, 0);
+        assert_eq!(budgeted_manifest.summary.entries.len(), 1);
+        assert_eq!(
+            budgeted_manifest.entries[0].hash,
+            full_manifest.entries[0].hash
+        );
+        let decoded_manifest = read_pack(&budgeted_manifest.pack_bytes).unwrap();
+        assert_eq!(decoded_manifest.entries.len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_wgpk_v1_size_returns_actionable_overflow_error_above_u32_max() {
+        let max_single_payload =
+            u64::from(u32::MAX) - PACK_HEADER_BYTES as u64 - PACK_ENTRY_BYTES as u64;
+        assert_eq!(
+            validate_wgpk_v1_size(1, max_single_payload, 1024).unwrap(),
+            u64::from(u32::MAX)
+        );
+
+        let err = validate_wgpk_v1_size(1, max_single_payload + 1, 2_097_152)
+            .expect_err("total size exceeding u32::MAX must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("--max-wgsl-bytes"), "err: {msg}");
+        assert!(msg.contains("--max-pack-bytes"), "err: {msg}");
+        assert!(
+            msg.contains(&format!("total_wgsl_bytes={}", max_single_payload + 1)),
+            "err: {msg}"
+        );
+        assert!(msg.contains("largest_wgsl_bytes=2097152"), "err: {msg}");
     }
 }
