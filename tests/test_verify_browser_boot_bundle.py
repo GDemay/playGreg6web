@@ -1036,5 +1036,337 @@ class TestGuestManifestAndBink2Readiness(unittest.TestCase):
                     self.assertIsNone(re.search(r"[A-Za-z]:[\\/]", output), output)
 
 
+def _build_runtime_wasm_with_exports(
+    extra_exports: list[tuple[str, str, int]],
+) -> bytes:
+    """Build a valid Wasm64 + shared memory + 5/5 host imports module with custom exports."""
+    types: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    imports: list[dict[str, object]] = [
+        {
+            "module": "env",
+            "name": "memory",
+            "kind": "memory",
+            "min_pages": 256,
+            "max_pages": 65536,
+            "is_shared": True,
+            "is_memory64": True,
+        }
+    ]
+    for spec in wasm.REQUIRED_HOST_IMPORTS:
+        type_idx = len(types)
+        types.append((spec.params_wasm64, spec.results_wasm64))
+        imports.append(
+            {
+                "module": spec.module,
+                "name": spec.name,
+                "kind": "func",
+                "type_index": type_idx,
+            }
+        )
+    exports: list[tuple[str, str, int]] = [("memory", "memory", 0)]
+    exports.extend(extra_exports)
+    return wasm.build_wasm_module(
+        types=types,
+        imports=imports,
+        exports=exports,
+        target_features=["+memory64", "+atomics", "+bulk-memory"],
+    )
+
+
+class TestRuntimeWasmAudioRingAndInputExports(unittest.TestCase):
+    def test_pure_python_export_section_parser_on_minimal_modules(self) -> None:
+        # Empty valid 8-byte Wasm binary (no export section at all).
+        bare_wasm = wasm.build_wasm_module()
+        probe_bare = vbb.inspect_wasm_runtime_exports(bare_wasm)
+        self.assertEqual(probe_bare["exports_count"], 0)
+        self.assertFalse(probe_bare["has_main_export"])
+        self.assertFalse(probe_bare["has_input_state_export"])
+        self.assertFalse(probe_bare["has_audio_ring_export"])
+
+        # Canonical un-underscored Wasm function exports (Emscripten output).
+        canonical_wasm = wasm.build_wasm_module(
+            exports=[
+                ("memory", "memory", 0),
+                ("main", "func", 0),
+                ("playgta6_get_input_state_ptr", "func", 1),
+                ("playgta6_audio_ring", "func", 2),
+            ]
+        )
+        probe_canon = vbb.inspect_wasm_runtime_exports(canonical_wasm)
+        self.assertEqual(probe_canon["exports_count"], 4)
+        self.assertTrue(probe_canon["has_main_export"])
+        self.assertTrue(probe_canon["has_input_state_export"])
+        self.assertEqual(probe_canon["input_state_export_name"], "playgta6_get_input_state_ptr")
+        self.assertTrue(probe_canon["has_audio_ring_export"])
+        self.assertEqual(probe_canon["audio_ring_export_name"], "playgta6_audio_ring")
+
+        # Leading-underscore variants also recognized.
+        underscored_wasm = wasm.build_wasm_module(
+            exports=[
+                ("_main", "func", 0),
+                ("_playgta6_get_input_state_ptr", "func", 1),
+                ("_playgta6_audio_ring", "func", 2),
+            ]
+        )
+        probe_under = vbb.inspect_wasm_runtime_exports(underscored_wasm)
+        self.assertTrue(probe_under["has_main_export"])
+        self.assertTrue(probe_under["has_input_state_export"])
+        self.assertEqual(probe_under["input_state_export_name"], "_playgta6_get_input_state_ptr")
+        self.assertTrue(probe_under["has_audio_ring_export"])
+        self.assertEqual(probe_under["audio_ring_export_name"], "_playgta6_audio_ring")
+
+        # Non-function exports with matching names must not satisfy function export checks.
+        wrong_kind_wasm = wasm.build_wasm_module(
+            exports=[
+                ("playgta6_get_input_state_ptr", "global", 0),
+                ("playgta6_audio_ring", "memory", 0),
+            ]
+        )
+        probe_wrong = vbb.inspect_wasm_runtime_exports(wrong_kind_wasm)
+        self.assertFalse(probe_wrong["has_input_state_export"])
+        self.assertFalse(probe_wrong["has_audio_ring_export"])
+
+        # Truncated export section raises ValueError cleanly.
+        truncated = b"\x00asm\x01\x00\x00\x00\x07\x05\x01\x03abc"
+        with self.assertRaises(ValueError):
+            vbb.parse_wasm_export_section(truncated)
+
+    def test_linked_runtime_wasm_with_audio_ring_and_input_exports_passes_strict(self) -> None:
+        for input_name, audio_name in (
+            ("playgta6_get_input_state_ptr", "playgta6_audio_ring"),
+            ("_playgta6_get_input_state_ptr", "_playgta6_audio_ring"),
+        ):
+            with self.subTest(input_name=input_name, audio_name=audio_name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    web_dist = Path(tmp) / "dist"
+                    rt_bytes = _build_runtime_wasm_with_exports(
+                        [
+                            ("main", "func", 0),
+                            (input_name, "func", 1),
+                            (audio_name, "func", 2),
+                        ]
+                    )
+                    _write_valid_web_dist(web_dist, runtime_wasm_bytes=rt_bytes)
+
+                    report = vbb.verify_browser_boot_bundle(
+                        web_dist=web_dist,
+                        strict=True,
+                        require_audio_ring=True,
+                        require_input_state=True,
+                    )
+                    self.assertTrue(report["ok"])
+                    self.assertEqual(report["errors"], [])
+                    self.assertEqual(report["warnings"], [])
+                    rt_wasm = report["wasm"]["runtime_wasm"]
+                    self.assertTrue(rt_wasm["has_input_state_export"])
+                    self.assertEqual(rt_wasm["input_state_export_name"], input_name)
+                    self.assertTrue(rt_wasm["has_audio_ring_export"])
+                    self.assertEqual(rt_wasm["audio_ring_export_name"], audio_name)
+
+                    text = vbb.format_report_text(report)
+                    self.assertIn("input_state=YES", text)
+                    self.assertIn("audio_ring=YES", text)
+
+    def test_linked_runtime_missing_audio_ring_warns_and_fails_strict_or_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            rt_bytes = _build_runtime_wasm_with_exports(
+                [
+                    ("main", "func", 0),
+                    ("playgta6_get_input_state_ptr", "func", 1),
+                ]
+            )
+            _write_valid_web_dist(web_dist, runtime_wasm_bytes=rt_bytes)
+
+            non_strict = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=False)
+            self.assertTrue(non_strict["ok"])
+            self.assertTrue(non_strict["wasm"]["runtime_wasm"]["has_input_state_export"])
+            self.assertFalse(non_strict["wasm"]["runtime_wasm"]["has_audio_ring_export"])
+            self.assertTrue(any("playgta6_audio_ring" in w for w in non_strict["warnings"]))
+
+            strict_report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertFalse(strict_report["ok"])
+
+            req_report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, strict=False, require_audio_ring=True
+            )
+            self.assertFalse(req_report["ok"])
+            self.assertFalse(req_report["wasm"]["runtime_wasm"]["ok"])
+            self.assertTrue(any("playgta6_audio_ring" in e for e in req_report["errors"]))
+
+    def test_smoke_shell_missing_exports_passes_default_and_fails_cli_require_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(web_dist)
+
+            default_report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertTrue(default_report["ok"])
+            self.assertFalse(default_report["wasm"]["runtime_wasm"]["has_input_state_export"])
+            self.assertFalse(default_report["wasm"]["runtime_wasm"]["has_audio_ring_export"])
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = vbb.main(
+                    [
+                        "--web-dist",
+                        str(web_dist),
+                        "--require-audio-ring",
+                        "--require-input-state",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            payload = json.loads(buf.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertTrue(any("playgta6_audio_ring" in e for e in payload["errors"]))
+            self.assertTrue(
+                any("playgta6_get_input_state_ptr" in e for e in payload["errors"])
+            )
+
+
+class TestWgpkEntryBoundsIntegrity(unittest.TestCase):
+    def test_valid_splash_wgpk_pack_reports_clean_bounds_and_splash_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            pack_bytes = wgpk.build_wgpk(
+                [
+                    (0xAAA1, wgpk.ShaderStage.VERTEX, "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+                    (0xBBB2, wgpk.ShaderStage.FRAGMENT, "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+                ]
+            )
+            (shaders_dir / "splash.wgsl.pack").write_bytes(pack_bytes)
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertTrue(report["ok"])
+            shaders = report["shaders"]
+            self.assertTrue(shaders["all_pack_bounds_ok"])
+            self.assertEqual(shaders["out_of_bounds_entries"], 0)
+            self.assertTrue(shaders["splash_pack_present"])
+            self.assertTrue(shaders["splash_pack_ok"])
+            pack = shaders["packs"][0]
+            self.assertTrue(pack["header_ok"])
+            self.assertTrue(pack["table_ok"])
+            self.assertTrue(pack["bounds_ok"])
+            self.assertEqual(pack["data_start_offset"], 16 + 2 * 20)
+            self.assertEqual(pack["max_payload_end"], len(pack_bytes))
+            self.assertEqual(pack["out_of_bounds_entries"], 0)
+            self.assertEqual(pack["invalid_stage_entries"], 0)
+
+            text = vbb.format_report_text(report)
+            self.assertIn("pack splash.wgsl.pack: OK", text)
+            self.assertIn("bounds=OK", text)
+
+    def test_wgpk_entry_payload_exceeding_file_size_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            valid = wgpk.build_wgpk(
+                [(0x1234, wgpk.ShaderStage.FRAGMENT, "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }")]
+            )
+            # Truncate 8 bytes off the payload so offset + length > file_size.
+            (shaders_dir / "splash.wgsl.pack").write_bytes(valid[:-8])
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir
+            )
+            self.assertFalse(report["ok"])
+            shaders = report["shaders"]
+            self.assertFalse(shaders["all_pack_bounds_ok"])
+            self.assertEqual(shaders["out_of_bounds_entries"], 1)
+            self.assertTrue(shaders["splash_pack_present"])
+            self.assertFalse(shaders["splash_pack_ok"])
+            pack = shaders["packs"][0]
+            self.assertTrue(pack["header_ok"])
+            self.assertTrue(pack["table_ok"])
+            self.assertFalse(pack["bounds_ok"])
+            self.assertEqual(pack["out_of_bounds_entries"], 1)
+            self.assertTrue(any("exceeds pack bounds" in e for e in report["errors"]))
+
+    def test_wgpk_entry_offset_overlapping_header_or_table_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            # 1 entry -> data_start = 16 + 20 = 36, but entry claims offset = 12 (< 36).
+            header = struct.pack("<4sIII", b"WGPK", 1, 1, 0)
+            entry = struct.pack("<QB3sII", 0xCAFE, 1, b"\x00\x00\x00", 12, 8)
+            payload = b"// dummy wgsl payload"
+            (shaders_dir / "splash.wgsl.pack").write_bytes(header + entry + payload)
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir
+            )
+            self.assertFalse(report["ok"])
+            pack = report["shaders"]["packs"][0]
+            self.assertTrue(pack["header_ok"])
+            self.assertTrue(pack["table_ok"])
+            self.assertFalse(pack["bounds_ok"])
+            self.assertEqual(pack["out_of_bounds_entries"], 1)
+            self.assertTrue(any("overlaps header/entry table" in e for e in report["errors"]))
+
+    def test_wgpk_multiple_oob_entries_and_invalid_version_and_stage_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            # Pack 1: 10 entries all out of bounds (including u32 overflow) + bad stage.
+            count = 10
+            header = struct.pack("<4sIII", b"WGPK", 1, count, 0)
+            entries = bytearray()
+            for i in range(count):
+                stage = 9 if i == 0 else 1
+                offset = 0xFFFFFFFC if i == 1 else (16 + count * 20 + 500 + i)
+                length = 16
+                entries.extend(struct.pack("<QB3sII", i + 1, stage, b"\x00\x00\x00", offset, length))
+            (shaders_dir / "corrupt_many.wgsl.pack").write_bytes(header + bytes(entries) + b"abcd")
+
+            # Pack 2: unsupported version 2.
+            (shaders_dir / "v2.wgsl.pack").write_bytes(struct.pack("<4sIII", b"WGPK", 2, 0, 0))
+
+            # Pack 3: truncated < 16 bytes header.
+            (shaders_dir / "short.wgsl.pack").write_bytes(b"WGPK\x01\x00")
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir
+            )
+            self.assertFalse(report["ok"])
+            by_name = {p["name"]: p for p in report["shaders"]["packs"]}
+
+            corrupt = by_name["corrupt_many.wgsl.pack"]
+            self.assertFalse(corrupt["ok"])
+            self.assertFalse(corrupt["bounds_ok"])
+            self.assertEqual(corrupt["out_of_bounds_entries"], 10)
+            self.assertEqual(corrupt["invalid_stage_entries"], 1)
+            self.assertTrue(any("additional invalid/out-of-bounds" in e for e in corrupt["errors"]))
+
+            v2 = by_name["v2.wgsl.pack"]
+            self.assertTrue(v2["magic_ok"])
+            self.assertFalse(v2["header_ok"])
+            self.assertFalse(v2["bounds_ok"])
+            self.assertTrue(any("unsupported WGPK version 2" in e for e in v2["errors"]))
+
+            short = by_name["short.wgsl.pack"]
+            self.assertFalse(short["magic_ok"])
+            self.assertFalse(short["header_ok"])
+            self.assertFalse(short["bounds_ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
