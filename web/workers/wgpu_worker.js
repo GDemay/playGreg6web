@@ -7034,6 +7034,10 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
       renderStateTelemetry && renderStateTelemetry.autoLayoutFallbacks,
       0
     ),
+    bindGroupKindMismatches: toNonNegativeInt(
+      renderStateTelemetry && renderStateTelemetry.bindGroupKindMismatches,
+      0
+    ),
   };
 
   let timestamp;
@@ -7174,6 +7178,7 @@ const RENDER_STATE_TELEMETRY_KEYS = Object.freeze([
   'computeDispatchCount',
   'computePipelineCount',
   'autoLayoutFallbacks',
+  'bindGroupKindMismatches',
 ]);
 
 function hasRenderStateTelemetryKeys(obj) {

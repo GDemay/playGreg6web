@@ -93,11 +93,12 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
 const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
 const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;
 // W101: render_state_packets.js counters surfaced from wgpu_worker.js `renderStateStats` (W99).
-// The first three are always present (0 default); the rest are forwarded only when reported.
+// The first four are always present (0 default); the rest are forwarded only when reported.
 const RENDER_STATE_STATS_CORE_KEYS = Object.freeze([
   'computeDispatchCount',
   'computePipelineCount',
   'autoLayoutFallbacks',
+  'bindGroupKindMismatches',
 ]);
 const RENDER_STATE_STATS_OPTIONAL_KEYS = Object.freeze([
   'skippedComputeDispatchCount',

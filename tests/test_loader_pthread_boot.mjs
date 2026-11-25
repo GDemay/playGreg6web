@@ -29,6 +29,7 @@ const {
   loadGuestManifest,
   buildRuntimeModuleConfig,
   forwardGpuWorkerMessage,
+  getLoaderStatus,
   encodeTestFramePacket,
   postBroadcastOnce,
 } = require('../web/loader.js');
@@ -1790,4 +1791,52 @@ test('Issue #731 VM end-to-end: coordinator and pthreads leave only active recei
   assert.deepEqual(new Uint8Array(gpuBatches[1].cmdBuffer), frameBytes);
 
   uiProgressChannel.close();
+});
+
+test('#659 forwardGpuWorkerMessage and getLoaderStatus propagate bindGroupKindMismatches', () => {
+  const forwarded = [];
+  const res = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: { framesPresented: 4, droppedFrames: 0 },
+      renderStateStats: {
+        computeDispatchCount: 2,
+        computePipelineCount: 1,
+        autoLayoutFallbacks: 3,
+        bindGroupKindMismatches: 5.8,
+      },
+    },
+    (msg) => forwarded.push(msg)
+  );
+
+  assert.ok(res);
+  assert.equal(res.renderStateStats.autoLayoutFallbacks, 3);
+  assert.equal(res.renderStateStats.bindGroupKindMismatches, 5);
+  assert.equal(forwarded.length, 1);
+  assert.equal(forwarded[0].renderStateStats.bindGroupKindMismatches, 5);
+  assert.equal(getLoaderStatus().renderStateStats.bindGroupKindMismatches, 5);
+
+  const fromStats = forwardGpuWorkerMessage({
+    id: 11,
+    stats: {
+      frameCount: 2,
+      renderState: {
+        bindGroupKindMismatches: '9',
+      },
+    },
+  });
+  assert.equal(fromStats.renderStateStats.bindGroupKindMismatches, 9);
+  assert.equal(fromStats.renderStateStats.autoLayoutFallbacks, 0);
+  assert.equal(getLoaderStatus().renderStateStats.bindGroupKindMismatches, 9);
+
+  const sanitizedBad = forwardGpuWorkerMessage({
+    type: 'gpu-telemetry',
+    frameStats: { framesPresented: 5, droppedFrames: 0 },
+    renderStateStats: {
+      autoLayoutFallbacks: 1,
+      bindGroupKindMismatches: -4,
+    },
+  });
+  assert.equal(sanitizedBad.renderStateStats.bindGroupKindMismatches, 0);
+  assert.equal(getLoaderStatus().renderStateStats.bindGroupKindMismatches, 0);
 });
