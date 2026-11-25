@@ -562,6 +562,59 @@ void test_bind_group_rebuild_and_retire() {
     list.Close();
 }
 
+// G66 (#691): the title releases a texture and leaves its descriptor in the heap. The descriptor
+// words do not change, so the cached bind group stayed a hit and kept binding the destroyed texture:
+// WebGPU then rejects the whole submit (show1 capture: black frame 2216). The hit is rebuilt with
+// the destroyed texture bound null, and the old group is retired.
+void test_cached_bind_group_drops_destroyed_texture() {
+    Scene scene;
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    // Another texture's destruction leaves the cached group alone.
+    scene.device.unregister_resource(Scene::kAlbedo2);
+    CHECK(scene.device.retired(Scene::kAlbedo2));
+    const auto record = [&] {
+        const size_t mark = enc.size();
+        list.Reset(nullptr);
+        scene.bind_root(list);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        return decode(enc, mark);
+    };
+    std::vector<Packet> p = record();
+    CHECK(std::none_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; }));
+    CHECK(list.stats().bind_groups_resource_retired == 0);
+
+    // Destroying the bound texture: the next hit builds a group with it bound null.
+    scene.device.unregister_resource(Scene::kAlbedo);
+    p = record();
+    const auto created = std::find_if(p.begin(), p.end(),
+                                      [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; });
+    CHECK(created != p.end());
+    if (created != p.end()) {
+        const auto bg = pod<GpuCreateBindGroup2Payload>(*created);
+        const auto e1 = pod<GpuBindGroupEntry2>(*created, sizeof(bg) + sizeof(GpuBindGroupEntry2));
+        CHECK(e1.resource_id == 0 && e1.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView));
+    }
+    CHECK(std::any_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::DestroyResource; }));
+    CHECK(list.stats().bind_groups_resource_retired == 1);
+    CHECK(list.stats().retired_resources_nulled >= 1);
+
+    // The rebuilt group is cached again; a texture registered under the id again is bound again.
+    p = record();
+    CHECK(std::none_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; }));
+    scene.device.register_texture(Scene::kAlbedo, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 9, 1,
+                                                   GpuTextureDimension::Dim2D, false});
+    CHECK(!scene.device.retired(Scene::kAlbedo));
+}
+
 void test_usage_conflict_is_diagnosed() {
     Scene scene;
     gpu::CommandEncoder enc;
@@ -3189,6 +3242,7 @@ int main() {
     test_storage_texture_needs_storage_usage();
     test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();
+    test_cached_bind_group_drops_destroyed_texture();
     test_usage_conflict_is_diagnosed();
     test_barrier_flushes_pending_clears();
     test_partial_clear_is_reported();
