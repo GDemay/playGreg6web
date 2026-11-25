@@ -102,6 +102,21 @@ const TEXTURE_FORMAT_NAMES = Object.freeze([
   'bc7-rgba-unorm',
 ]);
 
+// ABI v2 CreateTexture2 WebGPU texture format codes (docs/gpu_commands.md).
+const TEXTURE_FORMAT_NAMES_V2 = Object.freeze([
+  'undefined', 'r8unorm', 'r8snorm', 'r8uint', 'r8sint', 'r16unorm', 'r16snorm', 'r16uint',
+  'r16sint', 'r16float', 'rg8unorm', 'rg8snorm', 'rg8uint', 'rg8sint', 'r32uint', 'r32sint',
+  'r32float', 'rg16unorm', 'rg16snorm', 'rg16uint', 'rg16sint', 'rg16float', 'rgba8unorm',
+  'rgba8unorm-srgb', 'rgba8snorm', 'rgba8uint', 'rgba8sint', 'bgra8unorm', 'bgra8unorm-srgb',
+  'rgb9e5ufloat', 'rgb10a2uint', 'rgb10a2unorm', 'rg11b10ufloat', 'rg32uint', 'rg32sint',
+  'rg32float', 'rgba16unorm', 'rgba16snorm', 'rgba16uint', 'rgba16sint', 'rgba16float',
+  'rgba32uint', 'rgba32sint', 'rgba32float', 'stencil8', 'depth16unorm', 'depth24plus',
+  'depth24plus-stencil8', 'depth32float', 'depth32float-stencil8', 'bc1-rgba-unorm',
+  'bc1-rgba-unorm-srgb', 'bc2-rgba-unorm', 'bc2-rgba-unorm-srgb', 'bc3-rgba-unorm',
+  'bc3-rgba-unorm-srgb', 'bc4-r-unorm', 'bc4-r-snorm', 'bc5-rg-unorm', 'bc5-rg-snorm',
+  'bc6h-rgb-ufloat', 'bc6h-rgb-float', 'bc7-rgba-unorm', 'bc7-rgba-unorm-srgb',
+]);
+
 const TEXTURE_DIMENSION = Object.freeze({
   DIM_1D: 0,
   DIM_2D: 1,
@@ -847,7 +862,9 @@ function callFallbackRouterResolve(router, lookupHashHex, stageName, profile) {
 const TEXTURE_FORMAT_BPP = Object.freeze({
   rgba8unorm: 4,
   bgra8unorm: 4,
+  r32float: 4,
   rgba16float: 8,
+  rgba32float: 16,
   depth24plus: 4,
   depth32float: 4,
 });
@@ -2144,6 +2161,14 @@ class WgpuCommandProcessor {
     this._frameBegunForIndex = -1;
     this._lastPassTimings = null;
     this._pendingTimerReadbacks = new Set();
+
+    // W342: Mid-frame deferred GPU destroy queue (drained after queue.submit / onSubmittedWorkDone)
+    // and 1D -> 2D LUT texture promotion (enabled by default; opt-out via options.promote1DTo2D === false).
+    this._deferredGpuDestroys = [];
+    this._inFlightDeferredDestroys = new Set();
+    this._deferredDestroyCount = 0;
+    this._promote1DTo2D = options.promote1DTo2D !== false;
+    this._promoted1DTo2DCount = 0;
 
     // Optional WebGpuPipelineCache for reflection layout deduplication & W167 fallback sampler synthesis
     this._ownsPipelineCache = false;
@@ -4557,6 +4582,7 @@ class WgpuCommandProcessor {
       this.stagingPool.prepareSubmit();
     }
     this.device.queue.submit([encoder.finish()]);
+    this._drainDeferredGpuDestroys();
     if (
       retireStaging &&
       this.stagingPool &&
@@ -5198,6 +5224,17 @@ class WgpuCommandProcessor {
       this.resourceRegistry.beginFrame(targetFrame);
     }
     if (
+      this.resourceTable &&
+      !this.resourceTable._destroyed &&
+      typeof this.resourceTable.beginFrame === 'function'
+    ) {
+      try {
+        this.resourceTable.beginFrame();
+      } catch (_) {
+        // ResourceTable beginFrame errors must not break frame begin.
+      }
+    }
+    if (
       this.drawExecutor &&
       typeof this.drawExecutor.beginFrame === 'function'
     ) {
@@ -5241,6 +5278,17 @@ class WgpuCommandProcessor {
       typeof this.resourceRegistry.endFrame === 'function'
     ) {
       this.resourceRegistry.endFrame(workDoneFence);
+    }
+    if (
+      this.resourceTable &&
+      !this.resourceTable._destroyed &&
+      typeof this.resourceTable.endFrame === 'function'
+    ) {
+      try {
+        this.resourceTable.endFrame(this.device ? this.device.queue : undefined);
+      } catch (_) {
+        // ResourceTable endFrame errors must not break presentation.
+      }
     }
     if (
       this.rtPool &&
@@ -6042,6 +6090,7 @@ class WgpuCommandProcessor {
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
     this._frameBegunForIndex = -1;
+    this._flushAllDeferredGpuDestroysImmediate();
 
     const safeDestroy = (resource) => {
       if (resource && typeof resource.destroy === 'function') {
@@ -6366,6 +6415,7 @@ class WgpuCommandProcessor {
     }
     this._flushPendingUploads(false);
     const workDoneFence = this._getWorkDoneFence();
+    this._drainDeferredGpuDestroys(workDoneFence, { immediate: workDoneFence === null });
     this._endSubsystemsForFrame(workDoneFence);
   }
 
@@ -7217,16 +7267,152 @@ class WgpuCommandProcessor {
     };
   }
 
+  _isFrameOrBatchActive() {
+    return Boolean(
+      this._pendingEncoder !== null ||
+        (Array.isArray(this._passCommands) && this._passCommands.length > 0) ||
+        this._frameBegunForIndex >= 0
+    );
+  }
+
+  _retireOrDestroyGpuResource(resource) {
+    if (!resource || typeof resource.destroy !== 'function') {
+      return;
+    }
+    if (this._isFrameOrBatchActive()) {
+      if (
+        !this._inFlightDeferredDestroys.has(resource) &&
+        !this._deferredGpuDestroys.includes(resource)
+      ) {
+        this._deferredGpuDestroys.push(resource);
+      }
+      return;
+    }
+    try {
+      resource.destroy();
+    } catch (_) {
+      // Ignore teardown errors on already-destroyed or lost-device resources.
+    }
+  }
+
+  _drainDeferredGpuDestroys(workDoneFence = null, { immediate = false } = {}) {
+    if (!Array.isArray(this._deferredGpuDestroys) || this._deferredGpuDestroys.length === 0) {
+      return 0;
+    }
+    const batch = this._deferredGpuDestroys;
+    this._deferredGpuDestroys = [];
+
+    if (immediate) {
+      for (let i = 0; i < batch.length; i += 1) {
+        const res = batch[i];
+        this._inFlightDeferredDestroys.delete(res);
+        if (res && typeof res.destroy === 'function') {
+          try {
+            res.destroy();
+          } catch (_) {
+            // Destroying objects on a lost or torn-down device is safe to ignore.
+          }
+        }
+        this._deferredDestroyCount += 1;
+      }
+      return batch.length;
+    }
+
+    let fence = workDoneFence;
+    if (!fence || typeof fence.then !== 'function') {
+      fence = this._getWorkDoneFence();
+    }
+    if (fence && typeof fence.then === 'function') {
+      for (let i = 0; i < batch.length; i += 1) {
+        const res = batch[i];
+        if (res) {
+          this._inFlightDeferredDestroys.add(res);
+        }
+      }
+      const finalize = () => {
+        for (let i = 0; i < batch.length; i += 1) {
+          const res = batch[i];
+          if (!this._inFlightDeferredDestroys.delete(res)) {
+            continue;
+          }
+          if (res && typeof res.destroy === 'function') {
+            try {
+              res.destroy();
+            } catch (_) {
+              // Ignore teardown errors after device loss or duplicate destroy.
+            }
+          }
+          this._deferredDestroyCount += 1;
+        }
+      };
+      Promise.resolve(fence)
+        .then(finalize, finalize)
+        .catch(() => {});
+      return batch.length;
+    }
+
+    for (let i = 0; i < batch.length; i += 1) {
+      const res = batch[i];
+      this._inFlightDeferredDestroys.delete(res);
+      if (res && typeof res.destroy === 'function') {
+        try {
+          res.destroy();
+        } catch (_) {
+          // Ignore teardown errors after device loss or duplicate destroy.
+        }
+      }
+      this._deferredDestroyCount += 1;
+    }
+    return batch.length;
+  }
+
+  _flushAllDeferredGpuDestroysImmediate(alreadyDestroyed = null) {
+    const seen = alreadyDestroyed instanceof Set ? alreadyDestroyed : new Set();
+    const pending = Array.isArray(this._deferredGpuDestroys) ? this._deferredGpuDestroys : [];
+    this._deferredGpuDestroys = [];
+    for (let i = 0; i < pending.length; i += 1) {
+      const res = pending[i];
+      if (!res) continue;
+      this._inFlightDeferredDestroys.delete(res);
+      if (seen.has(res)) continue;
+      seen.add(res);
+      if (typeof res.destroy === 'function') {
+        try {
+          res.destroy();
+        } catch (_) {
+          // Destroying objects of a lost or torn-down device may throw; safe to ignore.
+        }
+      }
+      this._deferredDestroyCount += 1;
+    }
+    if (this._inFlightDeferredDestroys && this._inFlightDeferredDestroys.size > 0) {
+      const inFlight = Array.from(this._inFlightDeferredDestroys);
+      this._inFlightDeferredDestroys.clear();
+      for (let i = 0; i < inFlight.length; i += 1) {
+        const res = inFlight[i];
+        if (!res || seen.has(res)) continue;
+        seen.add(res);
+        if (typeof res.destroy === 'function') {
+          try {
+            res.destroy();
+          } catch (_) {
+            // Destroying objects of a lost or torn-down device may throw; safe to ignore.
+          }
+        }
+        this._deferredDestroyCount += 1;
+      }
+    }
+  }
+
   _destroyBufferIfPresent(id) {
     const existing = this.buffers.get(id);
     if (existing) {
+      let retired = false;
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
-        const retired = this.resourceRegistry.retire('buffer', id);
-        if (!retired && typeof existing.destroy === 'function') {
-          existing.destroy();
-        }
-      } else if (typeof existing.destroy === 'function') {
-        existing.destroy();
+        retired = Boolean(this.resourceRegistry.retire('buffer', id));
+      }
+      if (!retired) {
+        this._retireOrDestroyGpuResource(existing);
       }
       this.buffers.delete(id);
     }
@@ -7235,14 +7421,13 @@ class WgpuCommandProcessor {
   _destroyTextureIfPresent(id) {
     const existing = this.textures.get(id);
     if (existing) {
+      let retiredTex = false;
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
-        const retiredTex = this.resourceRegistry.retire('texture', id);
+        retiredTex = Boolean(this.resourceRegistry.retire('texture', id));
         this.resourceRegistry.retire('textureView', id);
-        if (!retiredTex && typeof existing.destroy === 'function') {
-          existing.destroy();
-        }
-      } else if (typeof existing.destroy === 'function') {
-        existing.destroy();
+      }
+      if (!retiredTex) {
+        this._retireOrDestroyGpuResource(existing);
       }
       this.textures.delete(id);
     }
@@ -8089,6 +8274,102 @@ class WgpuCommandProcessor {
     }
   }
 
+  _normalizeTextureDescriptor(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return descriptor;
+    }
+    const rawDimension = descriptor.dimension || '2d';
+    if (rawDimension !== '1d') {
+      return descriptor;
+    }
+    const size = descriptor.size;
+    let width = 1;
+    if (Array.isArray(size)) {
+      width = Math.max(1, Math.floor(Number(size[0]) || 1));
+    } else if (size && typeof size === 'object') {
+      width = Math.max(1, Math.floor(Number(size.width) || 1));
+    }
+    if (this._promote1DTo2D !== false) {
+      this._promoted1DTo2DCount += 1;
+      return {
+        ...descriptor,
+        dimension: '2d',
+        size: {
+          width,
+          height: 1,
+          depthOrArrayLayers: 1,
+        },
+        mipLevelCount: 1,
+      };
+    }
+    return {
+      ...descriptor,
+      dimension: '1d',
+      size: {
+        width,
+        height: 1,
+        depthOrArrayLayers: 1,
+      },
+      mipLevelCount: 1,
+    };
+  }
+
+  _createSafeTextureView(texture, viewDescriptor = null) {
+    if (!texture || typeof texture.createView !== 'function') {
+      return null;
+    }
+    const texDim =
+      typeof texture.dimension === 'string' && texture.dimension
+        ? texture.dimension
+        : texture.desc && typeof texture.desc.dimension === 'string' && texture.desc.dimension
+          ? texture.desc.dimension
+          : null;
+    if (!viewDescriptor || typeof viewDescriptor !== 'object') {
+      return texture.createView();
+    }
+    if (texDim === '1d' && viewDescriptor.dimension && viewDescriptor.dimension !== '1d') {
+      return texture.createView({ ...viewDescriptor, dimension: '1d' });
+    }
+    return texture.createView(viewDescriptor);
+  }
+
+  _createTrackedTexture(id, descriptor, was1D = false) {
+    const effectiveDescriptor = this._normalizeTextureDescriptor(descriptor);
+    const promotedFrom1D = Boolean(was1D && effectiveDescriptor.dimension === '2d');
+
+    this._destroyTextureIfPresent(id);
+    const texture = this.device.createTexture(effectiveDescriptor);
+    this.textures.set(id, texture);
+    let textureView = null;
+    if (texture && typeof texture.createView === 'function') {
+      textureView = promotedFrom1D
+        ? this._createSafeTextureView(texture, { dimension: '2d' })
+        : this._createSafeTextureView(texture);
+      this.textureViews.set(id, textureView);
+    }
+    if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
+      const size = effectiveDescriptor.size || {};
+      const byteSize = estimateTextureBytes(
+        size.width || 1,
+        size.height || 1,
+        size.depthOrArrayLayers || 1,
+        effectiveDescriptor.mipLevelCount || 1,
+        effectiveDescriptor.format,
+        effectiveDescriptor.dimension
+      );
+      this.resourceRegistry.register('texture', id, texture, {
+        byteSize,
+        label: `texture:${id}`,
+      });
+      if (textureView) {
+        this.resourceRegistry.register('textureView', id, textureView, {
+          byteSize: 0,
+          label: `textureView:${id}`,
+        });
+      }
+    }
+  }
+
   _handleCreateTexture(view, payloadOffset) {
     const id = view.getUint32(payloadOffset, true);
     const width = view.getUint32(payloadOffset + 4, true);
@@ -8102,44 +8383,63 @@ class WgpuCommandProcessor {
     const format = TEXTURE_FORMAT_NAMES[formatCode] || 'rgba8unorm';
     const dimension = TEXTURE_DIMENSION_NAMES[dimensionCode] || '2d';
 
-    this._destroyTextureIfPresent(id);
-    const texture = this.device.createTexture({
+    this._createTrackedTexture(
+      id,
+      {
+        size: {
+          width,
+          height,
+          depthOrArrayLayers,
+        },
+        mipLevelCount,
+        format,
+        usage,
+        dimension,
+      },
+      dimension === '1d'
+    );
+  }
+
+  _handleCreateTexture2(view, payloadOffset) {
+    const id = view.getUint32(payloadOffset, true);
+    const width = Math.max(1, view.getUint32(payloadOffset + 4, true));
+    const height = Math.max(1, view.getUint32(payloadOffset + 8, true));
+    const depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 12, true));
+    const mipLevelCount = Math.max(1, view.getUint32(payloadOffset + 16, true));
+    const sampleCount = Math.max(1, view.getUint32(payloadOffset + 20, true));
+    const usage = view.getUint32(payloadOffset + 24, true);
+    const dimensionCode = view.getUint8(payloadOffset + 28);
+    const formatCode = view.getUint8(payloadOffset + 29);
+    const viewFormatCount = Math.min(8, view.getUint8(payloadOffset + 30));
+
+    const format = (formatCode > 0 && TEXTURE_FORMAT_NAMES_V2[formatCode]) || 'rgba8unorm';
+    const dimension = TEXTURE_DIMENSION_NAMES[dimensionCode] || '2d';
+    const descriptor = {
       size: {
         width,
         height,
         depthOrArrayLayers,
       },
       mipLevelCount,
+      sampleCount,
       format,
       usage,
       dimension,
-    });
-    this.textures.set(id, texture);
-    let textureView = null;
-    if (texture && typeof texture.createView === 'function') {
-      textureView = texture.createView();
-      this.textureViews.set(id, textureView);
-    }
-    if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
-      const byteSize = estimateTextureBytes(
-        width,
-        height,
-        depthOrArrayLayers,
-        mipLevelCount,
-        format,
-        dimension
-      );
-      this.resourceRegistry.register('texture', id, texture, {
-        byteSize,
-        label: `texture:${id}`,
-      });
-      if (textureView) {
-        this.resourceRegistry.register('textureView', id, textureView, {
-          byteSize: 0,
-          label: `textureView:${id}`,
-        });
+    };
+    if (viewFormatCount > 0) {
+      const viewFormats = [];
+      for (let i = 0; i < viewFormatCount; i += 1) {
+        const code = view.getUint8(payloadOffset + 32 + i);
+        const name = code > 0 ? TEXTURE_FORMAT_NAMES_V2[code] : undefined;
+        if (name) {
+          viewFormats.push(name);
+        }
+      }
+      if (viewFormats.length > 0) {
+        descriptor.viewFormats = viewFormats;
       }
     }
+    this._createTrackedTexture(id, descriptor, dimension === '1d');
   }
 
   _handleWriteTexture(view, payloadOffset, payloadBytes) {
@@ -8424,7 +8724,7 @@ class WgpuCommandProcessor {
         if (!textureView) {
           const texture = this.textures.get(resourceId);
           if (texture && typeof texture.createView === 'function') {
-            textureView = texture.createView();
+            textureView = this._createSafeTextureView(texture);
             this.textureViews.set(resourceId, textureView);
             if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
               this.resourceRegistry.register('textureView', resourceId, textureView, {
@@ -8875,6 +9175,7 @@ class WgpuCommandProcessor {
       }
     } catch (err) {
       this._notePresentSubmitFailure(err);
+      this._drainDeferredGpuDestroys(null, { immediate: true });
       this._endSubsystemsForFrame(null);
       this._resetFrameState();
       return;
@@ -9618,6 +9919,9 @@ class WgpuCommandProcessor {
     }
 
     const workDoneFence = submitted ? this._getWorkDoneFence() : null;
+    this._drainDeferredGpuDestroys(workDoneFence, {
+      immediate: !submitted || workDoneFence === null,
+    });
     this._endSubsystemsForFrame(workDoneFence, {
       sceneTransition: presentSceneTransition,
       resolutionChanged: presentResolutionChanged,
@@ -9904,6 +10208,15 @@ class WgpuCommandProcessor {
           this._handleCreateTexture(view, payloadOffset);
         } else {
           this._recordOpValidationError('CreateTexture', `truncated payload (${payloadBytes}B < 32B)`);
+        }
+        break;
+      case OPCODES.CREATE_TEXTURE2:
+        if (this.extension) {
+          this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+        } else if (payloadBytes >= 40) {
+          this._handleCreateTexture2(view, payloadOffset);
+        } else {
+          this._recordOpValidationError('CreateTexture2', `truncated payload (${payloadBytes}B < 40B)`);
         }
         break;
       case OPCODES.WRITE_TEXTURE:
@@ -10278,6 +10591,10 @@ class WgpuCommandProcessor {
       texturePackets,
       bc3dFallbacks,
       bc3dFallbackUploadsSkipped,
+      deferredGpuDestroysPending: this._deferredGpuDestroys.length,
+      deferredGpuDestroysInFlight: this._inFlightDeferredDestroys.size,
+      deferredGpuDestroysCompleted: this._deferredDestroyCount,
+      promoted1DTo2DCount: this._promoted1DTo2DCount,
     };
   }
 
@@ -10345,6 +10662,7 @@ class WgpuCommandProcessor {
         texture.destroy();
       }
     }
+    this._flushAllDeferredGpuDestroysImmediate(destroyedByRegistry);
 
     this.buffers.clear();
     this._bufferMeta.clear();
@@ -12295,7 +12613,9 @@ function createWgpuWorkerHandler(options = {}) {
         texturePacketsApi = require('./texture_packets.js');
       }
       if (texturePacketsApi && typeof texturePacketsApi.installTexturePackets === 'function') {
-        texturePacketsApi.installTexturePackets(targetProcessor);
+        texturePacketsApi.installTexturePackets(targetProcessor, {
+          promote1DTo2D: targetProcessor._promote1DTo2D,
+        });
       }
       return true;
     } catch (err) {
@@ -12785,6 +13105,10 @@ function createWgpuWorkerHandler(options = {}) {
           : options.lazyShaderCompile !== undefined
             ? options.lazyShaderCompile
             : 'pack',
+      promote1DTo2D:
+        initPayload.promote1DTo2D !== undefined
+          ? initPayload.promote1DTo2D
+          : options.promote1DTo2D,
     });
     bindProcessorValidationErrors(processor);
     installPacketExtensions(processor);
