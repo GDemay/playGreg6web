@@ -2125,26 +2125,78 @@ test('W230: holdFallbackTimeoutMs safety cap prevents infinite splash hang, 0 di
   manual.controller.destroy();
 });
 
-test('W230: frosted dark pill wraps .pg6-splash__status-row (spinner + stage text) with high-contrast CSS', () => {
+test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested inner pill box, and updates bar completion state', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const root = controller.getState().root;
 
+  const panel = root.querySelector('.pg6-splash__panel');
   const statusRow = root.querySelector('.pg6-splash__status-row');
   const stageRow = root.querySelector('.pg6-splash__stage-row');
+  const barFill = root.querySelector('.pg6-splash__bar-fill');
+  assert.ok(panel, '.pg6-splash__panel must exist');
   assert.ok(statusRow, '.pg6-splash__status-row must exist');
-  assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same pill row');
-  assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside frosted status pill');
+  assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same row');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside status row');
+  assert.ok(barFill, '.pg6-splash__bar-fill must exist');
 
+  // Verify shared stylesheet matches #hud Astryx tokens with zero nested inner pill box and zero neon blue.
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
   assert.ok(styleEl);
-  assert.match(styleEl.textContent, /\.pg6-splash__status-row/);
-  assert.match(styleEl.textContent, /backdrop-filter:\s*blur\(/);
-  assert.match(styleEl.textContent, /-webkit-backdrop-filter:\s*blur\(/);
-  assert.match(styleEl.textContent, /background:\s*rgba\(/);
-  assert.match(styleEl.textContent, /border-radius:\s*999px/);
+  const css = styleEl.textContent;
+
+  const panelRuleMatch = /\.pg6-splash__panel\{([^}]+)\}/.exec(css);
+  assert.ok(panelRuleMatch, 'SHARED_CSS must define .pg6-splash__panel');
+  const panelCss = panelRuleMatch[1];
+  assert.match(panelCss, /width:\s*min\(340px,\s*calc\(100vw - 24px\)\)/);
+  assert.match(panelCss, /background:\s*var\(--color-background-surface/);
+  assert.match(panelCss, /border:\s*none/);
+  assert.match(panelCss, /border-radius:\s*var\(--radius-container/);
+  assert.match(panelCss, /box-shadow:\s*var\(--shadow-high/);
+  assert.match(panelCss, /backdrop-filter:\s*blur\(18px\)/);
+  assert.match(panelCss, /-webkit-backdrop-filter:\s*blur\(18px\)/);
+  assert.match(panelCss, /padding:\s*12px 14px/);
+  assert.match(panelCss, /gap:\s*8px/);
+
+  const rowRuleMatch = /\.pg6-splash__stage-row,\.pg6-splash__status-row\{([^}]+)\}/.exec(css);
+  assert.ok(rowRuleMatch, 'SHARED_CSS must style .pg6-splash__stage-row,.pg6-splash__status-row');
+  const rowCss = rowRuleMatch[1];
+  assert.match(rowCss, /background:\s*transparent/);
+  assert.match(rowCss, /border:\s*none/);
+  assert.match(rowCss, /padding:\s*0/);
+  assert.match(rowCss, /box-shadow:\s*none/);
+  assert.match(rowCss, /backdrop-filter:\s*none/);
+
+  // Monochrome Astryx spinner (14px) & Spinning Greg (22px).
+  assert.match(css, /\.pg6-splash__spinner-ring\{[^}]*width:14px;height:14px[^}]*border:2px solid var\(--color-track[^}]*border-top-color:var\(--color-accent/);
+  assert.match(css, /\.pg6-splash__spinner--greg\{width:22px;height:22px;\}/);
+  assert.match(css, /\.pg6-splash__greg\{width:22px;height:22px;/);
+
+  // Astryx 4px progress bar using --color-track / --color-accent / --color-success with zero neon blue.
+  assert.match(css, /\.pg6-splash__bar,\.pg6-splash__stream\{[^}]*height:4px;border:none;border-radius:var\(--radius-full[^}]*background:var\(--color-track/);
+  assert.match(css, /\.pg6-splash__bar-fill,\.pg6-splash__stream-fill\{[^}]*background:var\(--color-accent/);
+  assert.match(css, /\.pg6-splash__bar-fill\[data-state="ok"\]\{background:var\(--color-success/);
+  assert.doesNotMatch(css, /#6db3ff/i, 'SHARED_CSS must not use legacy neon blue #6db3ff');
+
+  // Progress fill transitions from active (--color-accent) to ok (--color-success) when complete/ready.
+  assert.equal(barFill.getAttribute('data-state'), 'active');
+  controller.updateBootState({ stage: 'D3D12_CREATE_DEVICE', progressPct: 78 });
+  assert.equal(barFill.getAttribute('data-state'), 'active');
+  controller.updateBootState({ stage: 'FIRST_PRESENT', progressPct: 100, readyForSplash: true });
+  assert.equal(barFill.getAttribute('data-state'), 'ok');
+  controller.show({ reset: true });
+  assert.equal(barFill.getAttribute('data-state'), 'active');
   controller.destroy();
+
+  // While holding for visible frame (W230), bar stays active until notifyFirstVisibleFrame().
+  const held = createController({ holdUntilVisible: true });
+  const heldBarFill = held.controller.getState().root.querySelector('.pg6-splash__bar-fill');
+  held.controller.onFirstPresent();
+  assert.equal(heldBarFill.getAttribute('data-state'), 'active');
+  held.controller.notifyFirstVisibleFrame({ fadeDurationMs: 0 });
+  assert.equal(heldBarFill.getAttribute('data-state'), 'ok');
+  held.controller.destroy();
 });

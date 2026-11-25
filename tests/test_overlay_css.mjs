@@ -450,7 +450,7 @@ test('W232 web/index.html defines a clean inline SVG data-URI favicon in <head> 
   assert.doesNotMatch(decodedSvg, /<script\b|on[a-z]+\s*=|https?:\/\/(?!www\.w3\.org\/2000\/svg)|\bid=/i);
 });
 
-test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-contrast splash backdrop classes', () => {
+test('W232/W252 web/ui/overlay.css provides smooth fade-out helpers and Astryx-matched splash card styling', () => {
   const rootBody = findRuleBody(parsedCss.rules, ':root');
   for (const token of [
     '--pg6-splash-fade',
@@ -462,11 +462,11 @@ test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-
     assert.match(
       rootBody,
       new RegExp(`${token}\\s*:`),
-      `W232 custom property "${token}" must be defined in :root`
+      `Splash custom property "${token}" must be defined in :root`
     );
   }
 
-  // Smooth fade-out transition helpers.
+  // Smooth fade-out transition helpers remain 100% intact.
   const fadeTransitionBody = findRuleBody(parsedCss.rules, '.pg6-fade-transition');
   assert.match(fadeTransitionBody, /\bopacity\s*:\s*1\s*;/);
   assert.match(fadeTransitionBody, /\btransition\s*:[\s\S]*opacity\s+var\(--pg6-splash-fade/);
@@ -486,34 +486,112 @@ test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-
   assert.match(splashRootFadingBody, /\bopacity\s*:\s*0\s*;/);
   assert.match(splashRootFadingBody, /\bpointer-events\s*:\s*none\s*;/);
 
-  // Frosted high-contrast backdrop classes for splash status pill & panel/spinner/Greg overlay.
+  // Helper classes align with Astryx borderless surface tokens.
   const frostedBody = findRuleBody(parsedCss.rules, '.pg6-splash-frosted');
-  assert.match(frostedBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
-  assert.match(frostedBody, /\bbackdrop-filter\s*:\s*blur\(/);
-  assert.match(frostedBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+  assert.match(frostedBody, /\bbackground\s*:\s*var\(--color-background-surface\)\s*;/);
+  assert.match(frostedBody, /\bborder\s*:\s*none\s*;/);
+  assert.match(frostedBody, /\bborder-radius\s*:\s*var\(--radius-container\)\s*;/);
+  assert.match(frostedBody, /\bbox-shadow\s*:\s*var\(--shadow-high\)\s*;/);
+  assert.match(frostedBody, /\bbackdrop-filter\s*:\s*blur\(18px\)\s*;/);
+  assert.match(frostedBody, /-webkit-backdrop-filter\s*:\s*blur\(18px\)\s*;/);
 
   const statusPillBody = findRuleBody(parsedCss.rules, '.pg6-splash-status-pill');
+  assert.match(statusPillBody, /\bborder\s*:\s*none\s*;/);
   assert.match(statusPillBody, /\bborder-radius\s*:\s*var\(--radius-full\)\s*;/);
-  assert.match(statusPillBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop-strong\)\s*;/);
-  assert.match(statusPillBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
-  assert.match(statusPillBody, /\bbackdrop-filter\s*:\s*blur\(/);
-  assert.match(statusPillBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+  assert.match(statusPillBody, /\bbackground\s*:\s*var\(--color-background-surface\)\s*;/);
+  assert.match(statusPillBody, /\bbackdrop-filter\s*:\s*blur\(18px\)\s*;/);
+  assert.match(statusPillBody, /-webkit-backdrop-filter\s*:\s*blur\(18px\)\s*;/);
 
+  // W252: Splash panel matches #hud Astryx elevated borderless card 1:1.
   const splashPanelBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__panel');
-  assert.match(splashPanelBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
-  assert.match(splashPanelBody, /\bbackdrop-filter\s*:\s*blur\(/);
+  assert.match(splashPanelBody, /\bwidth\s*:\s*min\(340px,\s*calc\(100vw - 24px\)\)\s*;/);
+  assert.match(splashPanelBody, /\bmax-width\s*:\s*340px\s*;/);
+  assert.match(splashPanelBody, /\bpadding\s*:\s*12px\s+14px\s*;/);
+  assert.match(splashPanelBody, /\bgap\s*:\s*8px\s*;/);
+  assert.match(splashPanelBody, /\bbackground\s*:\s*var\(--color-background-surface\)\s*;/);
+  assert.match(splashPanelBody, /\bborder\s*:\s*none\s*;/);
+  assert.match(splashPanelBody, /\bborder-radius\s*:\s*var\(--radius-container\)\s*;/);
+  assert.match(splashPanelBody, /\bbox-shadow\s*:\s*var\(--shadow-high\)\s*;/);
+  assert.match(splashPanelBody, /\bbackdrop-filter\s*:\s*blur\(18px\)\s*;/);
+  assert.match(splashPanelBody, /-webkit-backdrop-filter\s*:\s*blur\(18px\)\s*;/);
+  assert.match(splashPanelBody, /\bcolor\s*:\s*var\(--color-text-primary\)\s*;/);
+  assert.match(splashPanelBody, /\bfont-family\s*:\s*var\(--font-family-body\)\s*;/);
+  assert.match(splashPanelBody, /\bfont-size\s*:\s*12px\s*;/);
+  assert.match(splashPanelBody, /\bline-height\s*:\s*1\.4\s*;/);
   assert.match(splashPanelBody, /\bcontain\s*:\s*layout\s+style\s+paint\s*;/);
 
-  const splashStageBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__stage');
-  assert.match(splashStageBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
+  // W252: No nested dark inner pill box inside the splash card.
+  for (const rowSelector of [
+    '#splash-overlay-root .pg6-splash__stage-row',
+    '#splash-overlay-root .pg6-splash__status-row',
+  ]) {
+    const rowBody = findRuleBody(parsedCss.rules, rowSelector);
+    assert.match(rowBody, /\bbackground\s*:\s*transparent\s*;/);
+    assert.match(rowBody, /\bborder\s*:\s*none\s*;/);
+    assert.match(rowBody, /\bpadding\s*:\s*0\s*;/);
+    assert.match(rowBody, /\bbox-shadow\s*:\s*none\s*;/);
+    assert.match(rowBody, /\bbackdrop-filter\s*:\s*none\s*;/);
+  }
 
+  // W252: Crisp Astryx stage & meta typography.
+  const splashStageBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__stage');
+  assert.match(splashStageBody, /\bfont-family\s*:\s*var\(--font-family-body\)\s*;/);
+  assert.match(splashStageBody, /\bfont-size\s*:\s*12px\s*;/);
+  assert.match(splashStageBody, /\bfont-weight\s*:\s*var\(--font-weight-medium\)\s*;/);
+  assert.match(splashStageBody, /\bcolor\s*:\s*var\(--color-text-primary\)\s*;/);
+
+  const splashMetaBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__meta');
+  assert.match(splashMetaBody, /\bfont-size\s*:\s*11px\s*;/);
+  assert.match(splashMetaBody, /\bcolor\s*:\s*var\(--color-text-secondary\)\s*;/);
+  assert.match(splashMetaBody, /\bfont-variant-numeric\s*:\s*tabular-nums\s*;/);
+
+  // W252: Astryx 4px monochrome progress bar matching #hud (zero neon blue).
+  const splashBarBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__bar');
+  assert.match(splashBarBody, /\bheight\s*:\s*4px\s*;/);
+  assert.match(splashBarBody, /\bborder\s*:\s*none\s*;/);
+  assert.match(splashBarBody, /\bborder-radius\s*:\s*var\(--radius-full\)\s*;/);
+  assert.match(splashBarBody, /\bbackground\s*:\s*var\(--color-track\)\s*;/);
+
+  const splashBarFillBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__bar-fill');
+  assert.match(splashBarFillBody, /\bbackground\s*:\s*var\(--color-accent\)\s*;/);
+  assert.doesNotMatch(splashBarFillBody, /#6db3ff/i);
+
+  const splashBarOkBody = findRuleBody(
+    parsedCss.rules,
+    '#splash-overlay-root .pg6-splash__bar-fill[data-state="ok"]'
+  );
+  assert.match(splashBarOkBody, /\bbackground\s*:\s*var\(--color-success\)\s*;/);
+
+  // W252: Astryx 14px monochrome spinner + crisp 22px Spinning Greg icon.
   const splashSpinnerBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__spinner');
+  assert.match(splashSpinnerBody, /\bwidth\s*:\s*14px\s*;/);
+  assert.match(splashSpinnerBody, /\bheight\s*:\s*14px\s*;/);
   assert.match(splashSpinnerBody, /\btransition\s*:/);
 
-  const splashGregBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__greg');
-  assert.match(splashGregBody, /\bbox-shadow\s*:/);
+  const splashSpinnerRingBody = findRuleBody(
+    parsedCss.rules,
+    '#splash-overlay-root .pg6-splash__spinner-ring'
+  );
+  assert.match(splashSpinnerRingBody, /\bwidth\s*:\s*14px\s*;/);
+  assert.match(splashSpinnerRingBody, /\bheight\s*:\s*14px\s*;/);
+  assert.match(splashSpinnerRingBody, /\bborder\s*:\s*2px\s+solid\s+var\(--color-track\)\s*;/);
+  assert.match(splashSpinnerRingBody, /\bborder-top-color\s*:\s*var\(--color-accent\)\s*;/);
 
-  // Reduced-motion block must also disable transitions on the new W232 helpers.
+  const splashSpinnerGregBody = findRuleBody(
+    parsedCss.rules,
+    '#splash-overlay-root .pg6-splash__spinner--greg'
+  );
+  assert.match(splashSpinnerGregBody, /\bwidth\s*:\s*22px\s*;/);
+  assert.match(splashSpinnerGregBody, /\bheight\s*:\s*22px\s*;/);
+
+  const splashGregBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__greg');
+  assert.match(splashGregBody, /\bwidth\s*:\s*22px\s*;/);
+  assert.match(splashGregBody, /\bheight\s*:\s*22px\s*;/);
+  assert.match(splashGregBody, /\bborder\s*:\s*none\s*;/);
+
+  assert.doesNotMatch(overlayCss, /#6db3ff/i, 'overlay.css must not use legacy neon blue #6db3ff');
+
+  // Reduced-motion block must also disable transitions on the splash helpers and bar fills.
   const reducedMotionBlock = parsedCss.mediaBlocks.find((block) =>
     /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/i.test(block.prelude)
   );
@@ -523,6 +601,8 @@ test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-
     '.pg6-fade-out',
     '#splash-overlay-root .pg6-splash',
     '#splash-overlay-root .pg6-splash__spinner',
+    '#splash-overlay-root .pg6-splash__bar-fill',
+    '#splash-overlay-root .pg6-splash__stream-fill',
   ]) {
     const body = findRuleBody(reducedMotionBlock.rules, selector);
     assert.match(
