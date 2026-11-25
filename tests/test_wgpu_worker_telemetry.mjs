@@ -875,3 +875,520 @@ test('#659 bindGroupKindMismatches propagates through buildGpuTelemetrySnapshot 
   assert.equal(onlyMismatches.renderStateStats.bindGroupKindMismatches, 6);
   assert.equal(onlyMismatches.renderStateStats.autoLayoutFallbacks, 0);
 });
+
+
+// ---------------------------------------------------------------------------
+// 7. W295: W284 drainBatchZeroAlloc hot path + legacy drainTo fallback
+// ---------------------------------------------------------------------------
+
+test('W295 drainRing prefers GpuRingBuffer.drainBatchZeroAlloc and surfaces zeroAllocDrains with clean drainTo fallback', async () => {
+  const mock = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx);
+  const producer = GpuRingBuffer.create(4096);
+  processor.attachRing(producer.sab, { GpuRingBuffer });
+
+  let zeroAllocCalls = 0;
+  const origZeroAlloc = processor.ring.drainBatchZeroAlloc.bind(processor.ring);
+  processor.ring.drainBatchZeroAlloc = (...args) => {
+    zeroAllocCalls += 1;
+    return origZeroAlloc(...args);
+  };
+  processor.ring.drainTo = () => {
+    throw new Error('drainTo must not be called when drainBatchZeroAlloc is available');
+  };
+
+  const posted = [];
+  let fakeNow = 1000;
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    telemetryIntervalMs: 50,
+    now: () => fakeNow,
+  });
+
+  const frameStream = new PacketBuilder().beginFrame().clearColor(0.1, 0.2, 0.3, 1.0).present().finish();
+  assert.equal(producer.writeBytes(new Uint8Array(frameStream)), true);
+  await handler.handleMessage({ drainRing: true });
+
+  assert.equal(zeroAllocCalls, 1);
+  assert.equal(processor.frameCount, 1);
+  assert.equal(processor.ring.zeroAllocDrains, 1);
+  assert.equal(processor.getStats().zeroAllocDrains, 1);
+
+  const telemetry = posted.filter((m) => m.type === 'gpu-telemetry');
+  assert.equal(telemetry.length, 1);
+  assert.equal(telemetry[0].zeroAllocDrains, 1);
+
+  // Second drain via worker message also increments zeroAllocDrains and surfaces in request-gpu-stats.
+  fakeNow = 1060;
+  assert.equal(producer.writeBytes(new Uint8Array(frameStream)), true);
+  await handler.handleMessage({ type: 'drain-ring' });
+  await handler.handleMessage({ type: 'request-gpu-stats', id: 'w295-ring' });
+
+  const statsReply = posted.find((m) => m.type === 'gpu-stats' && m.id === 'w295-ring');
+  assert.ok(statsReply);
+  assert.equal(statsReply.zeroAllocDrains, 2);
+
+  // Graceful fallback: legacy mock ring exposing only drainTo (no drainBatchZeroAlloc).
+  const legacyMock = createMockWebGpu();
+  const legacyProc = new WgpuCommandProcessor(legacyMock.device, legacyMock.ctx);
+  let legacyDrainToCalls = 0;
+  const legacyRing = {
+    capacityBytes: 1024,
+    drainTo(cb) {
+      legacyDrainToCalls += 1;
+      cb(new Uint8Array(frameStream));
+      return frameStream.byteLength;
+    },
+  };
+  legacyProc.attachRing(legacyRing);
+  const res = legacyProc.drainRing();
+  assert.equal(legacyDrainToCalls, 1);
+  assert.deepEqual(res, {
+    frameCount: 1,
+    presents: 1,
+    bytesDrained: frameStream.byteLength,
+  });
+  assert.equal(legacyProc.getStats().zeroAllocDrains, 0);
+  assert.equal(buildGpuTelemetrySnapshot(legacyProc, { timestamp: 2000 }).zeroAllocDrains, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 8. W295: W282 DrawExecutor reuseDrawResult: true & zero-alloc getFrameDrawSummary
+// ---------------------------------------------------------------------------
+
+test('W295 configures DrawExecutor with reuseDrawResult: true, uses zero-alloc getFrameDrawSummary({ reuse: true }), and tolerates legacy/frozen mocks', () => {
+  const { DrawExecutor } = require('../web/workers/draw_executor.js');
+  const mock = createMockWebGpu();
+
+  // 1. Owned DrawExecutor created via enableDrawExecutor: true gets reuseDrawResult: true.
+  const ownedProc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    enableDrawExecutor: true,
+    DrawExecutor,
+  });
+  assert.ok(ownedProc.drawExecutor instanceof DrawExecutor);
+  assert.equal(ownedProc.drawExecutor._reuseDrawResult, true);
+
+  // 2. Injected DrawExecutor is configured for reuseDrawResult: true and queried with { reuse: true }.
+  const injectedExec = new DrawExecutor({ device: mock.device });
+  assert.equal(injectedExec._reuseDrawResult, false);
+
+  const summaryArgs = [];
+  const origSummary = injectedExec.getFrameDrawSummary.bind(injectedExec);
+  injectedExec.getFrameDrawSummary = (arg) => {
+    summaryArgs.push(arg);
+    return origSummary(arg);
+  };
+
+  const visibleEvents = [];
+  const proc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    drawExecutor: injectedExec,
+    onFirstVisibleFrame: (e) => visibleEvents.push(e),
+  });
+  assert.equal(injectedExec._reuseDrawResult, true);
+
+  // Execute a non-clear draw via DrawExecutor, then present via command buffer.
+  proc.beginFrame(0);
+  const mockPass = {
+    setPipeline() {},
+    setVertexBuffer() {},
+    setIndexBuffer() {},
+    setBindGroup() {},
+    draw() {},
+  };
+  injectedExec.setPipeline({ kind: 'GPURenderPipeline', isRealPack: true });
+  const r1 = injectedExec.draw(mockPass, 3, 1, 0, 0);
+  const r2 = injectedExec.draw(mockPass, 3, 1, 0, 0);
+  assert.equal(r1, r2, 'reuseDrawResult: true should return the same reusable draw result object');
+
+  proc.executeCommandBuffer(new PacketBuilder().present().finish());
+  assert.equal(summaryArgs.length, 1);
+  assert.deepEqual(summaryArgs[0], { reuse: true });
+  assert.equal(visibleEvents.length, 1);
+  assert.equal(visibleEvents[0].firstVisibleFrame, true);
+  assert.equal(visibleEvents[0].drawsThisFrame, 2);
+
+  // 3. Frozen strict mock DrawExecutor whose getFrameDrawSummary rejects args falls back cleanly.
+  let zeroArgSummaryCalls = 0;
+  const strictMockExec = Object.freeze({
+    beginFrame() {},
+    getFrameDrawSummary(...args) {
+      if (args.length > 0) {
+        throw new TypeError('legacy mock does not accept options');
+      }
+      zeroArgSummaryCalls += 1;
+      return {
+        hasNonClearDraw: true,
+        realPackDrawsThisFrame: 1,
+        fallbackDrawsThisFrame: 0,
+        drawsThisFrame: 1,
+      };
+    },
+  });
+  const strictProc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    drawExecutor: strictMockExec,
+  });
+  strictProc.executeCommandBuffer(new PacketBuilder().beginFrame().present().finish());
+  assert.equal(zeroArgSummaryCalls, 1);
+  assert.equal(strictProc.firstVisibleFrame, true);
+});
+
+// ---------------------------------------------------------------------------
+// 9. W295: W285 rtPool.reclaimOversizedIdle(2) on scene transitions & idle frames + VRAM telemetry
+// ---------------------------------------------------------------------------
+
+test('W295 triggers rtPool.reclaimOversizedIdle(2) on scene transitions and periodic idle frames, surfacing vramBudgetUtilization and reclaimedOversizedBytes', async () => {
+  const { RenderTargetPool } = require('../web/workers/rt_pool.js');
+  const mock = createMockWebGpu();
+  let texHandle = 1;
+  let destroyedTextures = 0;
+  mock.device.createTexture = (desc) => {
+    const handle = texHandle++;
+    return {
+      kind: 'GPUTexture',
+      handle,
+      desc,
+      createView() {
+        return { kind: 'GPUTextureView', handle: texHandle++, textureHandle: handle };
+      },
+      destroy() {
+        destroyedTextures += 1;
+      },
+    };
+  };
+
+  const rtPool = new RenderTargetPool({
+    device: mock.device,
+    maxPoolBytes: 128 * 1024 * 1024,
+    idleFrameTtl: 16,
+  });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    rtPool,
+  });
+
+  const posted = [];
+  let fakeNow = 3000;
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    telemetryIntervalMs: 50,
+    now: () => fakeNow,
+  });
+
+  // Acquire and release a 4K Bink2-sized RT (3840x2160 rgba8unorm = 33,177,600 bytes >= 24 MiB).
+  const expected4kBytes = 3840 * 2160 * 4;
+  const rt4k = processor.acquireRenderTarget(
+    { width: 3840, height: 2160, format: 'rgba8unorm' },
+    'bink2-4k'
+  );
+  processor.releaseRenderTarget(rt4k);
+
+  const beforeSnap = buildGpuTelemetrySnapshot(processor, { timestamp: 3000 });
+  assert.ok(beforeSnap.vramBudgetUtilization > 0.24 && beforeSnap.vramBudgetUtilization < 0.26);
+  assert.equal(beforeSnap.reclaimedOversizedBytes, 0);
+
+  // Frame 1 (currentFrame -> 1): age is 1 < 2, so 4K RT stays pooled.
+  const idleFrame = new PacketBuilder().beginFrame().present().finish();
+  await handler.handleMessage({ cmdBuffer: idleFrame });
+  assert.equal(destroyedTextures, 0);
+  assert.equal(processor.getStats().reclaimedOversizedBytes, 0);
+
+  // Frame 2 (currentFrame -> 2): periodic idle reclaim invokes reclaimOversizedIdle(2) -> 4K RT reclaimed!
+  fakeNow = 3100;
+  await handler.handleMessage({ cmdBuffer: idleFrame });
+  assert.equal(destroyedTextures, 1);
+
+  const afterStats = processor.getStats();
+  assert.equal(afterStats.reclaimedOversizedBytes, expected4kBytes);
+  assert.equal(afterStats.vramBudgetUtilization, 0);
+
+  const afterTelemetry = posted.filter((m) => m.type === 'gpu-telemetry');
+  assert.ok(afterTelemetry.length >= 2);
+  const latest = afterTelemetry[afterTelemetry.length - 1];
+  assert.equal(latest.reclaimedOversizedBytes, expected4kBytes);
+  assert.equal(latest.vramBudgetUtilization, 0);
+
+  // Explicit scene-transition message also triggers reclaimOversizedIdle(2).
+  const rt4k2 = processor.acquireRenderTarget(
+    { width: 3840, height: 2160, format: 'rgba8unorm' },
+    'bink2-4k-second'
+  );
+  processor.releaseRenderTarget(rt4k2);
+  rtPool.endFrame();
+  rtPool.endFrame();
+  await handler.handleMessage({ type: 'scene-transition', id: 'st-1' });
+  const stReply = posted.find((m) => m.type === 'scene-transition' && m.id === 'st-1');
+  assert.ok(stReply);
+  assert.equal(stReply.reclaimedCount, 1);
+  assert.equal(stReply.reclaimedBytes, expected4kBytes);
+  assert.equal(processor.getStats().reclaimedOversizedBytes, expected4kBytes * 2);
+
+  // Graceful fallback: mock rtPool without reclaimOversizedIdle must never throw.
+  const mockNoReclaim = {
+    isDestroyed: false,
+    endFrame() {},
+    getStats() {
+      return { hitRate: 0.5, totalBytes: 16, maxPoolBytes: 64 };
+    },
+  };
+  const fallbackProc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    rtPool: mockNoReclaim,
+  });
+  fallbackProc.executeCommandBuffer(idleFrame);
+  fallbackProc.executeCommandBuffer(idleFrame);
+  const fbSnap = buildGpuTelemetrySnapshot(fallbackProc, { timestamp: 3200 });
+  assert.equal(fbSnap.vramBudgetUtilization, 0.25);
+  assert.equal(fbSnap.reclaimedOversizedBytes, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 10. W295: W281 fast-path PSO lookup + W268 negative compile-failure cache telemetry
+// ---------------------------------------------------------------------------
+
+test('W295 wires W281 getFastRenderPipeline/getFastComputePipeline and surfaces W268 negative compile-failure cache metrics', async () => {
+  const { WebGpuPipelineCache } = require('../web/workers/pipeline_cache.js');
+  const mock = createMockWebGpu();
+
+  let renderCompileCalls = 0;
+  let computeCompileCalls = 0;
+  let failNextRender = false;
+  const origCreateRender = mock.device.createRenderPipeline.bind(mock.device);
+  const origCreateCompute = mock.device.createComputePipeline.bind(mock.device);
+  mock.device.createRenderPipeline = (desc) => {
+    renderCompileCalls += 1;
+    if (failNextRender) {
+      throw new Error('simulated invalid render pipeline C:\\Users\\secret\\shader.wgsl');
+    }
+    return origCreateRender(desc);
+  };
+  mock.device.createComputePipeline = (desc) => {
+    computeCompileCalls += 1;
+    return origCreateCompute(desc);
+  };
+
+  const pipelineCache = new WebGpuPipelineCache({
+    device: mock.device,
+    quarantineFailedKeys: true,
+  });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    pipelineCache,
+    captureValidationErrors: true,
+  });
+
+  const csWgsl = '@compute @workgroup_size(1) fn cs_main() {}\n';
+  const badFsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }\n';
+
+  // Two render pipelines sharing the same VS+FS and two compute pipelines sharing the same CS.
+  const warmupStream = new PacketBuilder()
+    .beginFrame()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, PACK_VS_WGSL)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, PACK_FS_WGSL)
+    .createShaderModule(3, SHADER_STAGE.COMPUTE, csWgsl)
+    .createRenderPipeline(10, 1, 2, 0)
+    .createRenderPipeline(11, 1, 2, 0)
+    .createComputePipeline(20, 3)
+    .createComputePipeline(21, 3)
+    .present()
+    .finish();
+
+  processor.executeCommandBuffer(warmupStream);
+
+  assert.equal(renderCompileCalls, 1, 'second identical render pipeline should hit W281 fast lookup');
+  assert.equal(computeCompileCalls, 1, 'second identical compute pipeline should hit W281 fast lookup');
+  assert.equal(processor.pipelines.get(10), processor.pipelines.get(11));
+  assert.equal(processor.computePipelines.get(20), processor.computePipelines.get(21));
+
+  // Trigger a render pipeline compile failure -> quarantined in W268 negative cache.
+  failNextRender = true;
+  const failStream = new PacketBuilder()
+    .beginFrame()
+    .createShaderModule(4, SHADER_STAGE.FRAGMENT, badFsWgsl)
+    .createRenderPipeline(30, 1, 4, 0)
+    .createRenderPipeline(31, 1, 4, 0)
+    .present()
+    .finish();
+  processor.executeCommandBuffer(failStream);
+
+  // Only 1 additional compile attempt for the failed shader; second attempt short-circuited by negative cache!
+  assert.equal(renderCompileCalls, 2);
+  assert.equal(processor.pipelines.has(30), false);
+  assert.equal(processor.pipelines.has(31), false);
+
+  const stats = processor.getStats();
+  assert.ok(stats.fastLookupHits >= 2);
+  assert.ok(stats.fastLookupHitRate > 0);
+  assert.equal(stats.negativeCacheHits, 1);
+  assert.equal(stats.negativeCacheSize, 1);
+  assert.equal(stats.negativeCacheEvictions, 0);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 4000 });
+  assert.equal(snap.pipelineCacheStats.fastLookupHits, stats.fastLookupHits);
+  assert.equal(snap.pipelineCacheStats.negativeCacheHits, 1);
+  assert.equal(snap.pipelineCacheStats.negativeCacheSize, 1);
+  assert.equal(snap.pipelineCacheStats.negativeCacheEvictions, 0);
+
+  // Verify no host path leaked into telemetry JSON.
+  assert.equal(JSON.stringify(snap).includes('secret'), false);
+});
+
+// ---------------------------------------------------------------------------
+// 11. W295: Full 30 FPS telemetry (W286 swapchain + W267 ResourceTable) & adversarial sanitization
+// ---------------------------------------------------------------------------
+
+test('W295 surfaces W286 swapchain pacing & W267 bindGroupHitRate in periodic telemetry and sanitizes dirty/partial mocks', async () => {
+  const { WgpuSwapchain } = require('../web/workers/wgpu_swapchain.js');
+  const { ResourceTable } = require('../web/workers/resource_table.js');
+  const mock = createMockWebGpu();
+  let nextObj = 50;
+  mock.device.createBuffer = (desc) => ({ kind: 'GPUBuffer', handle: nextObj++, size: desc.size, usage: desc.usage });
+  mock.device.createBindGroup = (desc) => ({ kind: 'GPUBindGroup', handle: nextObj++, desc });
+  mock.device.addEventListener = () => {};
+  mock.device.removeEventListener = () => {};
+  mock.device.lost = new Promise(() => {});
+
+  const canvas = { width: 1280, height: 720, getContext: () => mock.ctx };
+  mock.ctx.configure = () => {};
+  mock.ctx.unconfigure = () => {};
+
+  let fakeNow = 1000;
+  const nowFn = () => fakeNow;
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device: mock.device,
+    context: mock.ctx,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    now: nowFn,
+  });
+  swapchain.configure({ width: 1280, height: 720, devicePixelRatio: 1 });
+
+  const resourceTable = new ResourceTable(mock.device);
+  const layout = { kind: 'GPUBindGroupLayout', handle: 1 };
+  const buf = mock.device.createBuffer({ size: 256, usage: 0x40 });
+  resourceTable.setSlot(0, buf);
+  // 1 miss + 3 hits => bindGroupHitRate === 0.75
+  resourceTable.getOrCreateBindGroup('bg-0', { layout, slots: [0] });
+  resourceTable.getOrCreateBindGroup('bg-0', { layout, slots: [0] });
+  resourceTable.getOrCreateBindGroup('bg-0', { layout, slots: [0] });
+  resourceTable.getOrCreateBindGroup('bg-0', { layout, slots: [0] });
+  assert.equal(resourceTable.getStats().bindGroupHitRate, 0.75);
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    now: nowFn,
+    swapchain,
+    resourceTable,
+    gpuAdapter: { vendor: 'amd', architecture: 'rdna2', device: 'xbox', description: 'test' },
+  });
+
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    telemetryIntervalMs: 50,
+    now: nowFn,
+  });
+
+  const drawFrame = new PacketBuilder()
+    .beginFrame()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, PACK_VS_WGSL)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, PACK_FS_WGSL)
+    .createRenderPipeline(10, 1, 2, 0)
+    .setPipeline(10)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  // Frame 1 at t=1000, Frame 2 at t=1030 (30ms, <=33.3ms), Frame 3 at t=1060 (30ms), Frame 4 at t=1140 (80ms stall).
+  await handler.handleMessage({ cmdBuffer: drawFrame });
+  fakeNow = 1030;
+  await handler.handleMessage({ cmdBuffer: drawFrame });
+  fakeNow = 1060;
+  await handler.handleMessage({ cmdBuffer: drawFrame });
+  fakeNow = 1140;
+  await handler.handleMessage({ cmdBuffer: drawFrame });
+
+  // Existing message types untouched: first-visible-frame + gpu-telemetry + request-gpu-stats.
+  assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 1);
+
+  await handler.handleMessage({ type: 'request-gpu-telemetry', id: 'tel-w295' });
+  const tel = posted.find((m) => m.type === 'gpu-telemetry' && m.id === 'tel-w295');
+  assert.ok(tel);
+  assert.ok(Math.abs(tel.fps30ComplianceRate - 2 / 3) < 1e-6);
+  assert.ok(tel.frameJitterMs > 0);
+  assert.equal(tel.longestStallMs, 80);
+  assert.equal(tel.bindGroupHitRate, 0.75);
+  assert.equal(tel.vramBudgetUtilization, 0);
+  assert.equal(tel.zeroAllocDrains, 0);
+  assert.equal(tel.reclaimedOversizedBytes, 0);
+  assert.equal(tel.gpuAdapter.vendor, 'amd');
+
+  await handler.handleMessage({ type: 'request-gpu-stats', id: 'stats-w295' });
+  const stReply = posted.find((m) => m.type === 'gpu-stats' && m.id === 'stats-w295');
+  assert.ok(stReply);
+  assert.ok(Math.abs(stReply.fps30ComplianceRate - 2 / 3) < 1e-6);
+  assert.ok(stReply.frameJitterMs > 0);
+  assert.equal(stReply.longestStallMs, 80);
+  assert.equal(stReply.bindGroupHitRate, 0.75);
+
+  // Dirty / out-of-range / throwing mocks must clamp safely and never throw.
+  const dirtyMockProcessor = {
+    getStats() {
+      return {
+        frameCount: 2,
+        fps30ComplianceRate: 99,
+        frameJitterMs: -5,
+        longestStallMs: Number.POSITIVE_INFINITY,
+        vramBudgetUtilization: -2,
+        bindGroupHitRate: Number.NaN,
+        zeroAllocDrains: 4.9,
+        reclaimedOversizedBytes: -100,
+      };
+    },
+    swapchain: {
+      getStats() {
+        throw new Error('broken swapchain mock');
+      },
+    },
+    rtPool: {
+      getStats() {
+        return { vramBudgetUtilization: 4.5, reclaimedOversizedBytes: 1024.7 };
+      },
+    },
+    resourceTable: {
+      getStats() {
+        return { bindGroupHitRate: 2.5 };
+      },
+    },
+    pipelineCache: {
+      getStats() {
+        return {
+          fastLookupHits: 10,
+          fastLookupMisses: -3,
+          fastLookupHitRate: 1.5,
+          negativeCacheHits: 3.8,
+          negativeCacheSize: 2,
+          negativeCacheEvictions: -1,
+        };
+      },
+    },
+  };
+
+  const sanitized = buildGpuTelemetrySnapshot(dirtyMockProcessor, { timestamp: 7777 });
+  assert.equal(sanitized.fps30ComplianceRate, 1);
+  assert.equal(sanitized.frameJitterMs, 0);
+  assert.equal(sanitized.longestStallMs, 0);
+  assert.equal(sanitized.vramBudgetUtilization, 1);
+  assert.equal(sanitized.reclaimedOversizedBytes, 1024);
+  assert.equal(sanitized.bindGroupHitRate, 1);
+  assert.equal(sanitized.zeroAllocDrains, 4);
+  assert.deepEqual(sanitized.pipelineCacheStats, {
+    fastLookupHits: 10,
+    fastLookupMisses: 0,
+    fastLookupHitRate: 1,
+    negativeCacheHits: 3,
+    negativeCacheSize: 2,
+    negativeCacheEvictions: 0,
+  });
+});
