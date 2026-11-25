@@ -209,6 +209,8 @@ pub const RUNTIME_EXCEPTION_APIS: &[(&str, &str)] = &[
     ("KERNEL32.dll", "RtlDeleteFunctionTable"),
     ("KERNEL32.dll", "SetUnhandledExceptionFilter"),
     ("KERNEL32.dll", "UnhandledExceptionFilter"),
+    ("KERNEL32.dll", "AddVectoredExceptionHandler"),
+    ("KERNEL32.dll", "RemoveVectoredExceptionHandler"),
     ("ntdll.dll", "RtlRaiseException"),
     ("ntdll.dll", "RtlCaptureContext"),
     ("ntdll.dll", "RtlLookupFunctionEntry"),
