@@ -13,10 +13,12 @@ const {
   DEFAULT_STATUS_URL,
   DEFAULT_STAGE_TIMEOUT_MS,
   DEFAULT_PARALLEL_PRELOAD,
+  DEFAULT_PRELOAD_CONCURRENCY,
   DEFAULT_RELEASE_PRELOAD_BUFFERS,
   discoverBootAssets,
   isRealGuestBoot,
   releaseBootBundleBytes,
+  runConcurrentPreloads,
 } = orchestratorMod;
 
 function createMockFetch(payload, { ok = true, status = 200, throwError = null, delayMs = 0 } = {}) {
@@ -207,7 +209,12 @@ function createOrchestrator(overrides = {}) {
     nowFn: overrides.nowFn,
     stageTimeoutMs: overrides.stageTimeoutMs,
     parallelPreload: overrides.parallelPreload,
+    preloadConcurrency: overrides.preloadConcurrency,
     releasePreloadBuffers: overrides.releasePreloadBuffers,
+    preloadRuntimeWasm: overrides.preloadRuntimeWasm,
+    opfsProbe: overrides.opfsProbe,
+    preloadShaderPackHeader: overrides.preloadShaderPackHeader,
+    preloadReflectionSidecar: overrides.preloadReflectionSidecar,
     preloadTasks: overrides.preloadTasks,
   });
   return { orchestrator, overlay, bootTracer, phases, launches, fallbacks, firstPresents };
@@ -2323,4 +2330,578 @@ test('W258 BootOrchestrator.releasePreloadBuffers() and dispose() release retain
     assert.equal(retainedBundle.pgim.bytes, null);
     assert.equal(orchestrator.getPreloadStats().completedCount, 1);
   }
+});
+
+// ---------------------------------------------------------------------------
+// W309: Concurrent preload overlap scheduling, bounded concurrency & telemetry
+// ---------------------------------------------------------------------------
+
+test('W309 exports runConcurrentPreloads and DEFAULT_PRELOAD_CONCURRENCY and validates new options', () => {
+  assert.equal(typeof runConcurrentPreloads, 'function');
+  assert.equal(Number.isInteger(DEFAULT_PRELOAD_CONCURRENCY) && DEFAULT_PRELOAD_CONCURRENCY >= 4, true);
+
+  assert.throws(() => new BootOrchestrator({ preloadConcurrency: '4' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadConcurrency: 0 }), RangeError);
+  assert.throws(() => new BootOrchestrator({ preloadConcurrency: -2 }), RangeError);
+  assert.throws(() => new BootOrchestrator({ preloadConcurrency: 2.5 }), RangeError);
+  assert.throws(() => new BootOrchestrator({ preloadConcurrency: Number.NaN }), RangeError);
+  assert.throws(() => new BootOrchestrator({ preloadRuntimeWasm: 'nope' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ opfsProbe: 42 }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadShaderPackHeader: {} }), TypeError);
+  assert.throws(() => new BootOrchestrator({ preloadReflectionSidecar: true }), TypeError);
+
+  const aliased = discoverBootAssets({
+    ok: true,
+    hasWasmBinary: true,
+    pgimUrl: '/data/boot/GTA6.pgim',
+    splashShaderPackUrl: '/data/shaders/splash.wgsl.pack',
+    wgpkHeaderUrl: '/data/shaders/splash.wgsl.pack.hdr',
+    reflectJsonUrl: '/data/shaders/splash.wgsl.pack.reflect.json',
+  });
+  assert.equal(aliased.shaderPackUrl, '/data/shaders/splash.wgsl.pack');
+  assert.equal(aliased.shaderPackIndexUrl, '/data/shaders/splash.wgsl.pack.hdr');
+  assert.equal(aliased.reflectionSidecarUrl, '/data/shaders/splash.wgsl.pack.reflect.json');
+
+  const orch = new BootOrchestrator({ fetchImpl: async () => ({}) });
+  const stats = orch.getStats();
+  assert.equal(stats.serialEstimateMs, 0);
+  assert.equal(stats.parallelWallMs, 0);
+  assert.equal(stats.overlapSavedMs, 0);
+  assert.equal(stats.parallelStagesCount, 0);
+  assert.equal(stats.preloadConcurrency, DEFAULT_PRELOAD_CONCURRENCY);
+  assert.equal(stats.parallelPreload, true);
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(stats)));
+});
+
+test('W309 runConcurrentPreloads enforces bounded concurrency, computes overlap savings, and propagates deterministic fatal errors', async () => {
+  await assert.rejects(() => runConcurrentPreloads('not-array'), TypeError);
+  await assert.rejects(() => runConcurrentPreloads([], null), TypeError);
+  await assert.rejects(() => runConcurrentPreloads([{ name: 'a', run: () => {} }], { maxConcurrency: 0 }), RangeError);
+
+  const emptyRes = await runConcurrentPreloads([]);
+  assert.equal(emptyRes.ok, true);
+  assert.equal(emptyRes.stats.parallelStagesCount, 0);
+  assert.equal(emptyRes.stats.overlapSavedMs, 0);
+
+  // Bounded concurrency: maxConcurrency = 2 across 4 overlapping async tasks.
+  let active = 0;
+  let peak = 0;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const boundedTasks = [
+    {
+      name: 'pgim',
+      optional: false,
+      run: async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await sleep(30);
+        active -= 1;
+        return { tag: 'pgim' };
+      },
+    },
+    {
+      name: 'wgpkHeader',
+      optional: true,
+      run: async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await sleep(30);
+        active -= 1;
+        return { tag: 'hdr' };
+      },
+    },
+    {
+      name: 'reflectSidecar',
+      optional: true,
+      run: async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await sleep(30);
+        active -= 1;
+        return { tag: 'reflect' };
+      },
+    },
+    {
+      name: 'runtimeWasm',
+      optional: true,
+      run: async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await sleep(30);
+        active -= 1;
+        return { tag: 'wasm' };
+      },
+    },
+  ];
+
+  const boundedOut = await runConcurrentPreloads(boundedTasks, { parallel: true, maxConcurrency: 2 });
+  assert.equal(boundedOut.ok, true);
+  assert.equal(peak, 2);
+  assert.equal(boundedOut.stats.maxConcurrency, 2);
+  assert.equal(boundedOut.stats.concurrencyLimit, 2);
+  assert.equal(boundedOut.stats.parallelStagesCount, 4);
+  assert.equal(boundedOut.stats.completedCount, 4);
+  assert.equal(boundedOut.stats.serialEstimateMs > boundedOut.stats.parallelWallMs, true);
+  assert.equal(boundedOut.stats.overlapSavedMs > 0, true);
+  assert.equal(boundedOut.results.pgim.tag, 'pgim');
+  assert.equal(boundedOut.results.runtimeWasm.tag, 'wasm');
+
+  // Serial mode (parallel: false) reports parallelStagesCount = 0 and overlapSavedMs = 0.
+  let serialActive = 0;
+  let serialPeak = 0;
+  const serialOut = await runConcurrentPreloads(
+    [
+      {
+        name: 's1',
+        run: async () => {
+          serialActive += 1;
+          serialPeak = Math.max(serialPeak, serialActive);
+          await sleep(10);
+          serialActive -= 1;
+          return 1;
+        },
+      },
+      {
+        name: 's2',
+        run: async () => {
+          serialActive += 1;
+          serialPeak = Math.max(serialPeak, serialActive);
+          await sleep(10);
+          serialActive -= 1;
+          return 2;
+        },
+      },
+    ],
+    { parallel: false }
+  );
+  assert.equal(serialPeak, 1);
+  assert.equal(serialOut.stats.parallelStagesCount, 0);
+  assert.equal(serialOut.stats.overlapSavedMs, 0);
+
+  // Deterministic error propagation:
+  // (a) When two required tasks fail concurrently with distinct non-abort errors, lowest task index wins.
+  let queuedStarted = false;
+  const concurrentErr = await runConcurrentPreloads(
+    [
+      {
+        name: 'firstRequired',
+        optional: false,
+        run: () => Promise.reject(new Error('deterministic root error #0')),
+      },
+      {
+        name: 'secondRequired',
+        optional: false,
+        run: () => Promise.reject(new Error('later-indexed error #1')),
+      },
+      {
+        name: 'unstartedQueued',
+        optional: true,
+        run: async () => {
+          queuedStarted = true;
+          return { ok: true };
+        },
+      },
+    ],
+    { parallel: true, maxConcurrency: 2, throwOnError: false }
+  );
+  assert.equal(concurrentErr.ok, false);
+  assert.match(concurrentErr.error.message, /deterministic root error #0/);
+  assert.equal(concurrentErr.stats.overlapSavedMs, 0);
+  assert.equal(queuedStarted, false);
+
+  // (b) When a later-indexed required task fails while an earlier task is still pending,
+  //     fail-fast abort cancels the pending sibling and propagates the fatal error.
+  let siblingAborted = false;
+  await assert.rejects(
+    () =>
+      runConcurrentPreloads(
+        [
+          {
+            name: 'pendingSibling',
+            optional: false,
+            run: (sig) =>
+              new Promise((_resolve, reject) => {
+                sig.addEventListener(
+                  'abort',
+                  () => {
+                    siblingAborted = true;
+                    const err = new Error('aborted');
+                    err.name = 'AbortError';
+                    reject(err);
+                  },
+                  { once: true }
+                );
+              }),
+          },
+          {
+            name: 'failingRequired',
+            optional: false,
+            run: async () => {
+              throw new Error('fatal sibling boom');
+            },
+          },
+        ],
+        { parallel: true, maxConcurrency: 2 }
+      ),
+    /fatal sibling boom/
+  );
+  assert.equal(siblingAborted, true);
+});
+
+test('W309 overlaps .pgim, splash.wgsl.pack header, auto-derived .reflect.json sidecar, runtime.wasm, and OPFS probe with overlapSavedMs > 0', async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const observedUrls = {};
+
+  function timedStage(key, delayMs, makeValue) {
+    return async (arg1) => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      if (typeof arg1 === 'string') {
+        observedUrls[key] = arg1;
+      }
+      await sleep(delayMs);
+      inFlight -= 1;
+      return makeValue(arg1);
+    };
+  }
+
+  const preloader = {
+    preloadPgim: timedStage('pgim', 45, (url) => ({
+      header: { magic: 'PGIM' },
+      url,
+      bytesLoaded: 1024,
+    })),
+    preloadShaderPackHeader: timedStage('shaderPackIndex', 35, (url) => ({
+      magic: 'WGPK',
+      entryCount: 32,
+      url,
+      bytesLoaded: 128,
+    })),
+    preloadReflectionSidecar: timedStage('reflectionSidecar', 30, (url) => ({
+      schema: 'playgta6-stage-reflection',
+      stageCount: 6,
+      url,
+      bytesLoaded: 96,
+    })),
+  };
+
+  const preloadRuntimeWasm = timedStage('runtimeWasm', 40, (url) => ({
+    module: { compiled: true, kind: 'WebAssembly.Module' },
+    url,
+    bytesLoaded: 2048,
+  }));
+
+  const opfsProbe = async () => {
+    inFlight += 1;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    await sleep(25);
+    inFlight -= 1;
+    return { warm: true, cacheHit: true, entryCount: 14 };
+  };
+
+  const fetchImpl = createMockFetch(
+    readyStatus({
+      shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+      reflectionManifestUrl: null,
+      runtimeWasm: '/dist/runtime.wasm',
+    })
+  );
+
+  const phaseEvents = [];
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl,
+    preloader,
+    preloadRuntimeWasm,
+    opfsProbe,
+    parallelPreload: true,
+    onPhaseChange: (ev) => phaseEvents.push(ev),
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.equal(launches.length, 1);
+
+  // All 5 stages overlapped concurrently in real wall time!
+  assert.equal(peakInFlight, 5);
+  assert.equal(observedUrls.pgim, '/data/boot/GTA6.pgim');
+  assert.equal(observedUrls.shaderPackIndex, '/data/shaders/splash.wgsl.pack');
+  assert.equal(observedUrls.reflectionSidecar, '/data/shaders/splash.wgsl.pack.reflect.json');
+  assert.equal(observedUrls.runtimeWasm, '/dist/runtime.wasm');
+
+  assert.equal(launches[0].bundle.pgim.header.magic, 'PGIM');
+  assert.equal(launches[0].bundle.shaderPackIndex.magic, 'WGPK');
+  assert.equal(launches[0].bundle.reflectionSidecar.stageCount, 6);
+  assert.equal(launches[0].bundle.runtimeWasm.module.compiled, true);
+  assert.equal(launches[0].bundle.opfsWarmBoot.warm, true);
+
+  // Verify timing savings telemetry on start() result, getStats(), getTimingStats(), getState(), and getDiagnosticSnapshot().
+  assert.equal(result.parallelStagesCount, 5);
+  assert.equal(result.serialEstimateMs > result.parallelWallMs, true);
+  assert.equal(result.overlapSavedMs > 0, true);
+  assert.equal(result.overlapSavedMs, result.parallelPreloadSavedMs);
+
+  const stats = orchestrator.getStats();
+  assert.equal(stats.parallelStagesCount, 5);
+  assert.equal(stats.serialEstimateMs, result.serialEstimateMs);
+  assert.equal(stats.parallelWallMs, result.parallelWallMs);
+  assert.equal(stats.overlapSavedMs, result.overlapSavedMs);
+  assert.equal(stats.preloadStats.maxConcurrency, 5);
+  assert.equal(stats.preloadStats.completedCount, 5);
+  assert.equal('bundle' in stats, false);
+
+  const timingStats = orchestrator.getTimingStats();
+  assert.equal(timingStats.serialEstimateMs, stats.serialEstimateMs);
+  assert.equal(timingStats.parallelWallMs, stats.parallelWallMs);
+  assert.equal(timingStats.overlapSavedMs, stats.overlapSavedMs);
+  assert.equal(timingStats.parallelStagesCount, 5);
+
+  const state = orchestrator.getState();
+  assert.equal(state.serialEstimateMs, stats.serialEstimateMs);
+  assert.equal(state.parallelWallMs, stats.parallelWallMs);
+  assert.equal(state.overlapSavedMs, stats.overlapSavedMs);
+  assert.equal(state.parallelStagesCount, 5);
+
+  const diag = orchestrator.getDiagnosticSnapshot();
+  assert.equal(diag.overlapSavedMs, stats.overlapSavedMs);
+  assert.equal(diag.parallelStagesCount, 5);
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(stats)));
+  assert.doesNotThrow(() => JSON.parse(JSON.stringify(diag)));
+
+  const launchEvent = phaseEvents.find((ev) => ev.phase === BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.ok(launchEvent);
+  assert.equal(launchEvent.overlapSavedMs, stats.overlapSavedMs);
+  assert.equal(launchEvent.parallelStagesCount, 5);
+});
+
+test('W309 tolerates optional sidecar, OPFS probe, and runtimeWasm prefetch failures with sanitized diagnostics while failing on BAD_* validation errors', async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const progressEvents = [];
+  const bootTracer = new BootTracer();
+  bootTracer.recordProgress = (ev) => progressEvents.push(ev);
+
+  const preloader = {
+    preloadPgim: async () => {
+      await sleep(30);
+      return { header: { magic: 'PGIM' }, bytesLoaded: 256 };
+    },
+    preloadShaderPackHeader: async () => {
+      await sleep(15);
+      const err = new Error('Missing header at C:\\Users\\dev\\game\\splash.wgsl.pack?token=topsecret (404)');
+      err.status = 404;
+      throw err;
+    },
+    preloadReflectionSidecar: async () => {
+      await sleep(15);
+      const err = new Error('Sidecar not found at /Users/dev/splash.wgsl.pack.reflect.json');
+      err.code = 'NOT_FOUND';
+      throw err;
+    },
+  };
+
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl: createMockFetch(
+      readyStatus({
+        shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+        reflectionManifestUrl: null,
+      })
+    ),
+    preloader,
+    bootTracer,
+    preloadRuntimeWasm: async () => {
+      await sleep(15);
+      throw new Error('Transient wasm prefetch error Bearer secret_tok_99');
+    },
+    opfsProbe: async () => {
+      await sleep(15);
+      throw new Error('OPFS unavailable in private mode');
+    },
+    parallelPreload: true,
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.equal(result.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].bundle.pgim.header.magic, 'PGIM');
+  assert.equal(launches[0].bundle.shaderPackIndex, null);
+  assert.equal(launches[0].bundle.reflectionSidecar, null);
+  assert.equal(launches[0].bundle.runtimeWasm, null);
+  assert.equal(launches[0].bundle.opfsWarmBoot, null);
+
+  const stats = orchestrator.getStats();
+  assert.equal(stats.preloadStats.completedCount, 1);
+  assert.equal(stats.preloadStats.optionalMissingCount, 4);
+  assert.equal(stats.preloadStats.failedCount, 0);
+  assert.equal(stats.parallelStagesCount, 5);
+  assert.equal(stats.overlapSavedMs > 0, true);
+
+  // Sanitization check: no host paths, query tokens, or bearer tokens leak in getStats().
+  const serialized = JSON.stringify(stats);
+  assert.equal(serialized.includes('topsecret'), false);
+  assert.equal(serialized.includes('secret_tok_99'), false);
+  assert.equal(serialized.includes('C:\\\\Users'), false);
+  assert.equal(serialized.includes('/Users/dev'), false);
+  assert.ok(progressEvents.some((ev) => ev.phase === 'optional-missing' && ev.asset === 'opfsWarmBoot'));
+  assert.ok(progressEvents.some((ev) => ev.phase === 'optional-missing' && ev.asset === 'runtimeWasm'));
+
+  // Corrupt validation error (BAD_*) on runtimeWasm MUST fail boot deterministically.
+  const corruptWasmErr = new Error('Corrupt runtime.wasm magic header');
+  corruptWasmErr.code = 'BAD_WASM_BINARY';
+  const badWasm = createOrchestrator({
+    fetchImpl: createMockFetch(readyStatus()),
+    preloader: {
+      preloadPgim: async () => ({ header: { magic: 'PGIM' }, bytesLoaded: 64 }),
+    },
+    preloadRuntimeWasm: async () => {
+      throw corruptWasmErr;
+    },
+    parallelPreload: true,
+  });
+  const badRes = await badWasm.orchestrator.start();
+  assert.equal(badRes.ok, false);
+  assert.equal(badRes.phase, BOOT_PHASE.ERROR);
+  assert.match(badRes.error.message, /Corrupt runtime\.wasm/);
+  assert.equal(badWasm.orchestrator.getStats().overlapSavedMs, 0);
+});
+
+test('W309 preserves W258 buffer release across all concurrent preload stages and resets telemetry cleanly on reset()', async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pgimBuf = new ArrayBuffer(512);
+  const hdrBuf = new ArrayBuffer(128);
+  const sidecarBuf = new ArrayBuffer(96);
+  const wasmBuf = new ArrayBuffer(1024);
+  const opfsBuf = new ArrayBuffer(64);
+  const compiledModule = { kind: 'WebAssembly.Module', valid: true };
+
+  const preloader = {
+    preloadPgim: async () => {
+      await sleep(25);
+      return {
+        header: { magic: 'PGIM' },
+        bytes: new Uint8Array(pgimBuf),
+        buffer: pgimBuf,
+        bytesLoaded: 512,
+      };
+    },
+    preloadShaderPackHeader: async () => {
+      await sleep(20);
+      return {
+        magic: 'WGPK',
+        entryCount: 16,
+        bytes: new Uint8Array(hdrBuf),
+        bytesLoaded: 128,
+      };
+    },
+    preloadReflectionSidecar: async () => {
+      await sleep(20);
+      return {
+        manifest: { stages: 4 },
+        bytes: new Uint8Array(sidecarBuf),
+        bytesLoaded: 96,
+      };
+    },
+  };
+
+  let observedDuringLaunch = null;
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl: createMockFetch(
+      readyStatus({
+        shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+        reflectionManifestUrl: null,
+      })
+    ),
+    preloader,
+    preloadRuntimeWasm: async () => {
+      await sleep(25);
+      return {
+        module: compiledModule,
+        bytes: new Uint8Array(wasmBuf),
+        buffer: wasmBuf,
+        bytesLoaded: 1024,
+        url: '/dist/runtime.wasm',
+      };
+    },
+    opfsProbe: async () => {
+      await sleep(15);
+      return {
+        warm: true,
+        bytes: new Uint8Array(opfsBuf),
+        bytesLoaded: 64,
+      };
+    },
+    parallelPreload: true,
+    releasePreloadBuffers: true,
+    onLaunchRuntime: async (payload) => {
+      launches.push(payload);
+      observedDuringLaunch = {
+        pgimLen: payload.bundle.pgim.bytes.byteLength,
+        hdrLen: payload.bundle.shaderPackIndex.bytes.byteLength,
+        sidecarLen: payload.bundle.reflectionSidecar.bytes.byteLength,
+        wasmLen: payload.bundle.runtimeWasm.bytes.byteLength,
+        wasmBufLen: payload.bundle.runtimeWasm.buffer.byteLength,
+        opfsLen: payload.bundle.opfsWarmBoot.bytes.byteLength,
+      };
+    },
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+  assert.deepEqual(observedDuringLaunch, {
+    pgimLen: 512,
+    hdrLen: 128,
+    sidecarLen: 96,
+    wasmLen: 1024,
+    wasmBufLen: 1024,
+    opfsLen: 64,
+  });
+
+  // After worker handoff, W258 buffer release nulled every large binary payload while preserving metadata & compiled module.
+  assert.equal(orchestrator.getState().bundle, null);
+  assert.equal(launches[0].bundle.pgim.bytes, null);
+  assert.equal(launches[0].bundle.pgim.buffer, null);
+  assert.equal(launches[0].bundle.shaderPackIndex.bytes, null);
+  assert.equal(launches[0].bundle.reflectionSidecar.bytes, null);
+  assert.equal(launches[0].bundle.runtimeWasm.bytes, null);
+  assert.equal(launches[0].bundle.runtimeWasm.buffer, null);
+  assert.equal(launches[0].bundle.opfsWarmBoot.bytes, null);
+
+  assert.equal(launches[0].bundle.runtimeWasm.module, compiledModule);
+  assert.equal(launches[0].bundle.runtimeWasm.bytesLoaded, 1024);
+  assert.equal(launches[0].bundle.opfsWarmBoot.warm, true);
+
+  // Telemetry stats remain intact after W258 release.
+  const preResetStats = orchestrator.getStats();
+  assert.equal(preResetStats.parallelStagesCount, 5);
+  assert.equal(preResetStats.overlapSavedMs > 0, true);
+  assert.equal(preResetStats.serialEstimateMs > preResetStats.parallelWallMs, true);
+
+  // Direct releaseBootBundleBytes also counts runtimeWasm & opfsWarmBoot without double-counting aliased buffers.
+  const standaloneWasmBuf = new ArrayBuffer(2048);
+  const standaloneRelease = releaseBootBundleBytes({
+    runtimeWasm: {
+      bytes: new Uint8Array(standaloneWasmBuf),
+      buffer: standaloneWasmBuf,
+      module: compiledModule,
+    },
+    opfsWarmBoot: new Uint8Array(32),
+  });
+  assert.equal(standaloneRelease.releasedBytes, 2048 + 32);
+
+  // reset() clears W309 overlap telemetry cleanly and allows a fresh subsequent boot.
+  const resetRes = orchestrator.reset();
+  assert.equal(resetRes.ok, true);
+  assert.equal(resetRes.phase, BOOT_PHASE.IDLE);
+
+  const afterReset = orchestrator.getStats();
+  assert.equal(afterReset.phase, BOOT_PHASE.IDLE);
+  assert.equal(afterReset.serialEstimateMs, 0);
+  assert.equal(afterReset.parallelWallMs, 0);
+  assert.equal(afterReset.overlapSavedMs, 0);
+  assert.equal(afterReset.parallelPreloadSavedMs, 0);
+  assert.equal(afterReset.parallelStagesCount, 0);
+  assert.equal(afterReset.preloadStats.taskCount, 0);
+  assert.deepEqual(afterReset.preloadTaskTimingsMs, {});
 });
