@@ -9,7 +9,12 @@ const {
   DXGI_FORMAT,
   WEBGPU_BYTES_PER_ROW_ALIGNMENT,
   TEXTURE_COMPRESSION_BC_FEATURE,
+  TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+  TEXTURE_FORMATS_TIER1_FEATURE,
+  DEPTH32FLOAT_STENCIL8_FEATURE,
   mapDxgiFormatToWebGpu,
+  getSrgbSiblingFormat,
+  classifyTextureFormatSupport,
   calcMipSize,
   calcMipLayout,
   padTextureRowsForWriteTexture,
@@ -497,4 +502,311 @@ test('decodeBc4ToR8 decodes 8-level/6-level red channels and clamps non-power-of
 
   // Truncated input throws RangeError
   assert.throws(() => decodeBc4ToR8(new Uint8Array(15), 5, 3), RangeError);
+});
+
+test('getSrgbSiblingFormat maps linear <-> sRGB pairs bidirectionally and rejects non-sRGB/invalid inputs', () => {
+  const pairs = [
+    ['rgba8unorm', 'rgba8unorm-srgb'],
+    ['bgra8unorm', 'bgra8unorm-srgb'],
+    ['bc1-rgba-unorm', 'bc1-rgba-unorm-srgb'],
+    ['bc2-rgba-unorm', 'bc2-rgba-unorm-srgb'],
+    ['bc3-rgba-unorm', 'bc3-rgba-unorm-srgb'],
+    ['bc7-rgba-unorm', 'bc7-rgba-unorm-srgb'],
+  ];
+
+  for (const [linear, srgb] of pairs) {
+    assert.equal(getSrgbSiblingFormat(linear), srgb);
+    assert.equal(getSrgbSiblingFormat(srgb), linear);
+    assert.equal(getSrgbSiblingFormat(getSrgbSiblingFormat(linear)), linear);
+  }
+
+  // Case/whitespace tolerance
+  assert.equal(getSrgbSiblingFormat(' RGBA8UNORM '), 'rgba8unorm-srgb');
+  assert.equal(getSrgbSiblingFormat('BC7-RGBA-UNORM-SRGB'), 'bc7-rgba-unorm');
+
+  // Formats without an sRGB sibling return null
+  const noSibling = [
+    'rgba16float',
+    'rgb10a2unorm',
+    'r8unorm',
+    'rg8unorm',
+    'rgba8snorm',
+    'rgba8uint',
+    'r16unorm',
+    'bc4-r-unorm',
+    'bc4-r-snorm',
+    'bc5-rg-unorm',
+    'bc5-rg-snorm',
+    'bc6h-rgb-ufloat',
+    'bc6h-rgb-float',
+    'depth24plus',
+    'depth32float-stencil8',
+    '',
+    '   ',
+    'toString',
+    'constructor',
+    '__proto__',
+    'not-a-format',
+  ];
+  for (const fmt of noSibling) {
+    assert.equal(getSrgbSiblingFormat(fmt), null, `expected null for ${JSON.stringify(fmt)}`);
+  }
+
+  // Non-string inputs return null
+  for (const bad of [null, undefined, 0, 28, {}, [], true]) {
+    assert.equal(getSrgbSiblingFormat(bad), null);
+  }
+});
+
+test('classifyTextureFormatSupport handles core WebGPU formats unconditionally', () => {
+  const coreFormats = [
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgba16float',
+    'rgba32float',
+    'rgb10a2unorm',
+    'rg11b10ufloat',
+    'r8unorm',
+    'rg8unorm',
+    'r16float',
+    'rg16float',
+    'r32float',
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'stencil8',
+  ];
+
+  for (const fmt of coreFormats) {
+    assert.deepEqual(classifyTextureFormatSupport(fmt), {
+      supported: true,
+      requiredFeature: null,
+      fallbackFormat: null,
+      reason: null,
+    });
+    assert.deepEqual(
+      classifyTextureFormatSupport(fmt, { dimension: '3d', deviceFeatures: new Set() }),
+      {
+        supported: true,
+        requiredFeature: null,
+        fallbackFormat: null,
+        reason: null,
+      }
+    );
+  }
+
+  // Invalid inputs return unsupported with invalid-format reason
+  for (const bad of [null, undefined, '', '   ', 42, {}]) {
+    assert.deepEqual(classifyTextureFormatSupport(bad), {
+      supported: false,
+      requiredFeature: null,
+      fallbackFormat: null,
+      reason: 'invalid-format',
+    });
+  }
+});
+
+test('classifyTextureFormatSupport handles 2D/1D BC formats across Set, GPUSupportedFeatures-like, and Array feature collections', () => {
+  const bcFormats = [
+    'bc1-rgba-unorm',
+    'bc1-rgba-unorm-srgb',
+    'bc2-rgba-unorm',
+    'bc2-rgba-unorm-srgb',
+    'bc3-rgba-unorm',
+    'bc3-rgba-unorm-srgb',
+    'bc4-r-unorm',
+    'bc4-r-snorm',
+    'bc5-rg-unorm',
+    'bc5-rg-snorm',
+    'bc6h-rgb-ufloat',
+    'bc6h-rgb-float',
+    'bc7-rgba-unorm',
+    'bc7-rgba-unorm-srgb',
+  ];
+
+  const gpuSupportedFeaturesMock = {
+    has(name) {
+      return name === TEXTURE_COMPRESSION_BC_FEATURE;
+    },
+  };
+
+  for (const fmt of bcFormats) {
+    // Missing features (omitted options, null, empty Set, empty Array)
+    for (const opts of [
+      undefined,
+      {},
+      { dimension: '2d', deviceFeatures: null },
+      { dimension: '1d', deviceFeatures: new Set() },
+      { dimension: '2d', deviceFeatures: [] },
+    ]) {
+      assert.deepEqual(classifyTextureFormatSupport(fmt, opts), {
+        supported: false,
+        requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+        fallbackFormat: 'rgba8unorm',
+        reason: 'missing-bc',
+      });
+    }
+
+    // Feature present via Set, GPUSupportedFeatures-like object, and Array
+    for (const features of [
+      new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+      gpuSupportedFeaturesMock,
+      [TEXTURE_COMPRESSION_BC_FEATURE],
+    ]) {
+      assert.deepEqual(classifyTextureFormatSupport(fmt, { dimension: '2d', deviceFeatures: features }), {
+        supported: true,
+        requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+        fallbackFormat: null,
+        reason: null,
+      });
+      assert.deepEqual(classifyTextureFormatSupport(fmt, { dimension: '1d', deviceFeatures: features }), {
+        supported: true,
+        requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+        fallbackFormat: null,
+        reason: null,
+      });
+    }
+  }
+});
+
+test('classifyTextureFormatSupport distinguishes 3D BC sliced feature from 2D BC', () => {
+  const bcFormats = [
+    'bc1-rgba-unorm',
+    'bc3-rgba-unorm-srgb',
+    'bc4-r-unorm',
+    'bc5-rg-snorm',
+    'bc6h-rgb-ufloat',
+    'bc7-rgba-unorm',
+  ];
+
+  // Having only 2D BC is NOT sufficient for 3D BC
+  const only2dBc = new Set([TEXTURE_COMPRESSION_BC_FEATURE]);
+  const with3dBcSet = new Set([TEXTURE_COMPRESSION_BC_FEATURE, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE]);
+  const with3dBcArray = [TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE];
+  const with3dBcHas = {
+    has(name) {
+      return name === TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE;
+    },
+  };
+
+  for (const fmt of bcFormats) {
+    assert.deepEqual(
+      classifyTextureFormatSupport(fmt, { dimension: '3d', deviceFeatures: only2dBc }),
+      {
+        supported: false,
+        requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+        fallbackFormat: 'rgba8unorm',
+        reason: 'missing-bc-sliced-3d',
+      }
+    );
+
+    assert.deepEqual(
+      classifyTextureFormatSupport(fmt, { dimension: '3d', deviceFeatures: null }),
+      {
+        supported: false,
+        requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+        fallbackFormat: 'rgba8unorm',
+        reason: 'missing-bc-sliced-3d',
+      }
+    );
+
+    for (const features of [with3dBcSet, with3dBcArray, with3dBcHas]) {
+      assert.deepEqual(
+        classifyTextureFormatSupport(fmt, { dimension: '3d', deviceFeatures: features }),
+        {
+          supported: true,
+          requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+          fallbackFormat: null,
+          reason: null,
+        }
+      );
+    }
+  }
+});
+
+test('classifyTextureFormatSupport handles 16-bit unorm/snorm with tier1 or chromium experimental feature and float16 fallbacks', () => {
+  const cases = [
+    ['r16unorm', 'r16float'],
+    ['r16snorm', 'r16float'],
+    ['rg16unorm', 'rg16float'],
+    ['rg16snorm', 'rg16float'],
+    ['rgba16unorm', 'rgba16float'],
+    ['rgba16snorm', 'rgba16float'],
+  ];
+
+  const tier1Set = new Set([TEXTURE_FORMATS_TIER1_FEATURE]);
+  const chromiumArr = ['chromium-experimental-unorm16-texture-formats'];
+  const bothSet = new Set([TEXTURE_FORMATS_TIER1_FEATURE, 'chromium-experimental-unorm16-texture-formats']);
+
+  for (const [fmt, expectedFallback] of cases) {
+    // Absent -> float16 fallback matching channel count
+    assert.deepEqual(classifyTextureFormatSupport(fmt, { deviceFeatures: new Set() }), {
+      supported: false,
+      requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+      fallbackFormat: expectedFallback,
+      reason: 'missing-unorm16',
+    });
+
+    // Supported via standard texture-formats-tier1
+    assert.deepEqual(classifyTextureFormatSupport(fmt, { deviceFeatures: tier1Set }), {
+      supported: true,
+      requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+      fallbackFormat: null,
+      reason: null,
+    });
+
+    // Supported via chromium-experimental-unorm16-texture-formats
+    assert.deepEqual(classifyTextureFormatSupport(fmt, { deviceFeatures: chromiumArr }), {
+      supported: true,
+      requiredFeature: 'chromium-experimental-unorm16-texture-formats',
+      fallbackFormat: null,
+      reason: null,
+    });
+
+    // Prefers canonical texture-formats-tier1 when both are present
+    assert.deepEqual(classifyTextureFormatSupport(fmt, { deviceFeatures: bothSet }), {
+      supported: true,
+      requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+      fallbackFormat: null,
+      reason: null,
+    });
+  }
+});
+
+test('classifyTextureFormatSupport handles depth32float-stencil8 with depth24plus-stencil8 fallback', () => {
+  assert.deepEqual(classifyTextureFormatSupport('depth32float-stencil8'), {
+    supported: false,
+    requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+    fallbackFormat: 'depth24plus-stencil8',
+    reason: 'missing-depth32float-stencil8',
+  });
+
+  assert.deepEqual(
+    classifyTextureFormatSupport('depth32float-stencil8', { deviceFeatures: new Set(['texture-compression-bc']) }),
+    {
+      supported: false,
+      requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+      fallbackFormat: 'depth24plus-stencil8',
+      reason: 'missing-depth32float-stencil8',
+    }
+  );
+
+  for (const features of [
+    new Set([DEPTH32FLOAT_STENCIL8_FEATURE]),
+    [DEPTH32FLOAT_STENCIL8_FEATURE],
+    { has: (f) => f === DEPTH32FLOAT_STENCIL8_FEATURE },
+  ]) {
+    assert.deepEqual(
+      classifyTextureFormatSupport('depth32float-stencil8', { deviceFeatures: features }),
+      {
+        supported: true,
+        requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+        fallbackFormat: null,
+        reason: null,
+      }
+    );
+  }
 });
