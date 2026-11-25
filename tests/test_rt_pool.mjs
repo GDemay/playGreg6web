@@ -1199,3 +1199,257 @@ test('G45 preserves G31 classic-worker importScripts IIFE isolation without top-
     'depth24plus-stencil8'
   );
 });
+
+// ---------------------------------------------------------------------------
+// W128: Explicit evictIdle(maxIdleFrames) & Peak VRAM Reuse Telemetry
+// ---------------------------------------------------------------------------
+
+test('W128 evictIdle(maxIdleFrames) destroys aged idle targets, updates bytes/stats, and never evicts active targets', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({
+    device,
+    maxPoolBytes: Infinity,
+    idleFrameTtl: 100,
+    autoReleaseLeaked: false,
+    onLeak: () => {},
+  });
+
+  // Fresh pool exposes additive telemetry fields initialized to 0.
+  let stats = pool.getStats();
+  assert.equal(stats.peakPooledBytes, 0);
+  assert.equal(stats.reuseRatio, 0);
+  assert.equal(stats.budgetEvictions, 0);
+  assert.equal(stats.idleEvictions, 0);
+
+  // Frame 0: acquire 4K color (released at frame 0) and 1080p depth (kept ACTIVE across frames).
+  const oldDesc = { width: 3840, height: 2160, format: 'rgba8unorm' };
+  const activeDesc = { width: 1920, height: 1080, format: 'depth32float' };
+  const midDesc = { width: 1280, height: 720, format: 'rgba16float' };
+  const freshDesc = { width: 640, height: 360, format: 'rgba8unorm' };
+
+  const rtOld = pool.acquire(oldDesc, '4k-old');
+  const rtActive = pool.acquire(activeDesc, '1080p-inflight');
+  pool.release(rtOld); // lastUsedFrame = 0
+
+  // Advance to frame 2, acquire & release rtMid (lastUsedFrame = 2).
+  pool.endFrame(); // frame 1
+  pool.endFrame(); // frame 2
+  const rtMid = pool.acquire(midDesc, '720p-mid');
+  pool.release(rtMid);
+
+  // Advance to frame 4, acquire & release rtFresh (lastUsedFrame = 4).
+  pool.endFrame(); // frame 3
+  pool.endFrame(); // frame 4
+  const rtFresh = pool.acquire(freshDesc, '360p-fresh');
+  pool.release(rtFresh);
+
+  const peakAllFour = rtOld.byteSize + rtActive.byteSize + rtMid.byteSize + rtFresh.byteSize;
+  stats = pool.getStats();
+  assert.equal(stats.currentFrame, 4);
+  assert.equal(stats.activeCount, 1);
+  assert.equal(stats.idleCount, 3);
+  assert.equal(stats.totalBytes, peakAllFour);
+  assert.equal(stats.peakPooledBytes, peakAllFour);
+  assert.equal(stats.peakBytes, peakAllFour);
+
+  // Threshold 5: max idle age is 4 - 0 = 4 < 5 -> evicts nothing.
+  let evictRes = pool.evictIdle(5);
+  assert.deepEqual(evictRes, { evictedCount: 0, evictedBytes: 0 });
+  assert.equal(pool.getStats().idleCount, 3);
+  assert.equal(pool.getStats().idleEvictions, 0);
+
+  // Threshold 4: rtOld has age 4 - 0 = 4 >= 4 -> evicted; rtActive (age 4, ACTIVE) must survive!
+  evictRes = pool.evictIdle(4);
+  assert.deepEqual(evictRes, { evictedCount: 1, evictedBytes: rtOld.byteSize });
+  assert.equal(createdTextures[0].destroyed, true);
+  assert.equal(createdTextures[0].destroyCount, 1);
+  assert.equal(rtOld.destroyed, true);
+  assert.equal(rtOld.view, null);
+
+  assert.equal(createdTextures[1].destroyed, false, 'active target must never be evicted by evictIdle()');
+  assert.equal(rtActive.destroyed, false);
+  assert.ok(rtActive.view !== null);
+  assert.equal(createdTextures[2].destroyed, false);
+  assert.equal(createdTextures[3].destroyed, false);
+
+  stats = pool.getStats();
+  assert.equal(stats.activeCount, 1);
+  assert.equal(stats.activeBytes, rtActive.byteSize);
+  assert.equal(stats.idleCount, 2);
+  assert.equal(stats.idleBytes, rtMid.byteSize + rtFresh.byteSize);
+  assert.equal(stats.totalBytes, rtActive.byteSize + rtMid.byteSize + rtFresh.byteSize);
+  assert.equal(stats.peakPooledBytes, peakAllFour, 'peakPooledBytes must retain high-water mark after eviction');
+  assert.equal(stats.idleEvictions, 1);
+  assert.equal(stats.budgetEvictions, 0);
+  assert.equal(stats.evictions, 1);
+
+  // Repeating evictIdle(4) is a safe idempotent no-op with zero double-destroy.
+  assert.deepEqual(pool.evictIdle(4), { evictedCount: 0, evictedBytes: 0 });
+  assert.equal(createdTextures[0].destroyCount, 1);
+
+  // Threshold 2: rtMid has age 4 - 2 = 2 >= 2 -> evicted; rtFresh (age 0) and rtActive stay intact.
+  evictRes = pool.evictIdle(2);
+  assert.deepEqual(evictRes, { evictedCount: 1, evictedBytes: rtMid.byteSize });
+  assert.equal(createdTextures[2].destroyed, true);
+  assert.equal(createdTextures[2].destroyCount, 1);
+  assert.equal(createdTextures[3].destroyed, false);
+  assert.equal(createdTextures[1].destroyed, false);
+
+  // Threshold 0: evicts all remaining idle targets (rtFresh), still leaves rtActive untouched!
+  evictRes = pool.evictIdle(0);
+  assert.deepEqual(evictRes, { evictedCount: 1, evictedBytes: rtFresh.byteSize });
+  assert.equal(createdTextures[3].destroyed, true);
+  assert.equal(createdTextures[3].destroyCount, 1);
+  assert.equal(createdTextures[1].destroyed, false, 'active target survives even evictIdle(0)');
+  assert.equal(rtActive.destroyed, false);
+
+  stats = pool.getStats();
+  assert.equal(stats.activeCount, 1);
+  assert.equal(stats.idleCount, 0);
+  assert.equal(stats.idleBytes, 0);
+  assert.equal(stats.totalBytes, rtActive.byteSize);
+  assert.equal(stats.idleEvictions, 3);
+  assert.equal(stats.budgetEvictions, 0);
+  assert.equal(stats.evictions, 3);
+
+  // Re-acquiring evicted oldDesc allocates a fresh texture rather than returning a destroyed handle.
+  const rtOldFresh = pool.acquire(oldDesc, '4k-reallocated');
+  assert.equal(rtOldFresh.reused, false);
+  assert.notEqual(rtOldFresh.texture, rtOld.texture);
+  assert.ok(rtOldFresh.view !== null);
+  pool.release(rtOldFresh);
+
+  // Omitting maxIdleFrames defaults to pool.idleFrameTtl (100 -> nothing evicted at age 0).
+  assert.deepEqual(pool.evictIdle(), { evictedCount: 0, evictedBytes: 0 });
+
+  // Invalid maxIdleFrames arguments throw RangeError.
+  assert.throws(() => pool.evictIdle(-1), RangeError);
+  assert.throws(() => pool.evictIdle(1.5), RangeError);
+  assert.throws(() => pool.evictIdle(Number.NaN), RangeError);
+  assert.throws(() => pool.evictIdle('2'), RangeError);
+  assert.throws(() => pool.evictIdle(null), RangeError);
+
+  pool.release(rtActive);
+  pool.destroy();
+
+  // Calling evictIdle() after destroy throws cleanly.
+  assert.throws(() => pool.evictIdle(0), /destroyed/i);
+});
+
+test('W128 telemetry tracks peakPooledBytes, reuseRatio, budgetEvictions, and idleEvictions accurately', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  const oneTargetBytes = 512 * 512 * 4; // 1 MiB
+  const pool = new RenderTargetPool({
+    device,
+    maxPoolBytes: oneTargetBytes * 2, // 2 MiB budget (fits 2 targets)
+    idleFrameTtl: 2,
+    strictBudget: true,
+  });
+
+  const descA = { width: 512, height: 512, format: 'rgba8unorm' };
+  const descB = { width: 512, height: 512, format: 'bgra8unorm' };
+  const descC = { width: 512, height: 512, format: 'rg11b10ufloat' };
+  const descD = { width: 512, height: 512, format: 'rgb10a2unorm' };
+
+  // 1. Two initial misses -> reuseRatio = 0, peakPooledBytes = 2 MiB.
+  const a1 = pool.acquire(descA, 'rt-A');
+  const b1 = pool.acquire(descB, 'rt-B');
+  let stats = pool.getStats();
+  assert.equal(stats.hits, 0);
+  assert.equal(stats.misses, 2);
+  assert.equal(stats.reuseRatio, 0);
+  assert.equal(stats.peakPooledBytes, oneTargetBytes * 2);
+  assert.equal(stats.budgetEvictions, 0);
+  assert.equal(stats.idleEvictions, 0);
+
+  // Failed strict-budget acquire must NOT inflate misses, budgetEvictions, or skew reuseRatio.
+  assert.throws(() => pool.acquire(descC), RangeError);
+  stats = pool.getStats();
+  assert.equal(stats.misses, 2);
+  assert.equal(stats.reuseRatio, 0);
+  assert.equal(stats.budgetEvictions, 0);
+
+  // 2. Release & reuse 3 times -> 3 hits / 5 total acquires = 0.6 reuseRatio.
+  pool.release(a1);
+  pool.release(b1);
+  for (let i = 0; i < 3; i += 1) {
+    const reusedA = pool.acquire(descA);
+    assert.equal(reusedA.reused, true);
+    pool.release(reusedA);
+  }
+  stats = pool.getStats();
+  assert.equal(stats.hits, 3);
+  assert.equal(stats.misses, 2);
+  assert.ok(Math.abs(stats.reuseRatio - 3 / 5) < 1e-9);
+  assert.equal(stats.reuseRatio, stats.hitRate);
+  assert.ok(stats.reuseRatio >= 0 && stats.reuseRatio <= 1);
+
+  // 3. Budget LRU eviction: acquiring descC evicts oldest idle target (descB) due to maxPoolBytes.
+  const c1 = pool.acquire(descC, 'rt-C');
+  assert.equal(c1.reused, false);
+  assert.equal(createdTextures[1].destroyed, true);
+  assert.equal(createdTextures[1].destroyCount, 1);
+
+  stats = pool.getStats();
+  assert.equal(stats.budgetEvictions, 1);
+  assert.equal(stats.idleEvictions, 0);
+  assert.equal(stats.evictions, 1);
+  assert.equal(stats.hits, 3);
+  assert.equal(stats.misses, 3);
+  assert.ok(Math.abs(stats.reuseRatio - 3 / 6) < 1e-9);
+  assert.equal(stats.peakPooledBytes, oneTargetBytes * 2);
+
+  // Release c1 -> both A and C are idle at lastUsedFrame = 0.
+  pool.release(c1);
+
+  // 4. Advance frames so auto-idle TTL (> 2) evicts A while C is kept warm via reuse at frame 1.
+  pool.endFrame(); // frame 1
+  const c2 = pool.acquire(descC);
+  assert.equal(c2.reused, true);
+  pool.release(c2); // C lastUsedFrame = 1, A lastUsedFrame = 0
+
+  pool.endFrame(); // frame 2: A age = 2 <= 2, C age = 1 <= 2
+  assert.equal(pool.getStats().idleEvictions, 0);
+
+  const endRes = pool.endFrame(); // frame 3: A age = 3 > 2 -> auto-idle evicted!
+  assert.equal(endRes.evictedCount, 1);
+  assert.equal(createdTextures[0].destroyed, true);
+  assert.equal(createdTextures[0].destroyCount, 1);
+
+  stats = pool.getStats();
+  assert.equal(stats.budgetEvictions, 1);
+  assert.equal(stats.idleEvictions, 1);
+  assert.equal(stats.evictions, 2);
+
+  // 5. Explicit evictIdle(2) at frame 3 evicts C (3 - 1 = 2 >= 2) and increments idleEvictions.
+  const explicitRes = pool.evictIdle(2);
+  assert.deepEqual(explicitRes, { evictedCount: 1, evictedBytes: oneTargetBytes });
+  assert.equal(createdTextures[2].destroyed, true);
+  assert.equal(createdTextures[2].destroyCount, 1);
+
+  stats = pool.getStats();
+  assert.equal(stats.budgetEvictions, 1);
+  assert.equal(stats.idleEvictions, 2);
+  assert.equal(stats.evictions, 3);
+  assert.equal(stats.totalBytes, 0);
+  assert.equal(stats.peakPooledBytes, oneTargetBytes * 2);
+
+  // 6. invalidateAll() increments evictions without inflating budgetEvictions or idleEvictions.
+  const d1 = pool.acquire(descD, 'rt-D');
+  pool.release(d1);
+  assert.equal(pool.invalidateAll(), 1);
+  stats = pool.getStats();
+  assert.equal(stats.budgetEvictions, 1);
+  assert.equal(stats.idleEvictions, 2);
+  assert.equal(stats.evictions, 4);
+
+  // 7. Post-destroy getStats() preserves peakPooledBytes, reuseRatio, budgetEvictions, idleEvictions.
+  const expectedReuseRatio = stats.reuseRatio;
+  pool.destroy();
+  const postDestroy = pool.getStats();
+  assert.equal(postDestroy.peakPooledBytes, oneTargetBytes * 2);
+  assert.equal(postDestroy.reuseRatio, expectedReuseRatio);
+  assert.equal(postDestroy.budgetEvictions, 1);
+  assert.equal(postDestroy.idleEvictions, 2);
+  assert.equal(postDestroy.totalBytes, 0);
+});

@@ -690,6 +690,8 @@
       this._idleBytes = 0;
       this._peakBytes = 0;
       this._evictions = 0;
+      this._budgetEvictions = 0;
+      this._idleEvictions = 0;
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
@@ -793,12 +795,17 @@
       return true;
     }
 
-    _evictIdleRecord(record) {
+    _evictIdleRecord(record, reason = null) {
       this._idleLru.delete(record.id);
       this._removeFromIdleBucket(record);
       this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
       if (this._destroyRecord(record)) {
         this._evictions += 1;
+        if (reason === 'budget') {
+          this._budgetEvictions += 1;
+        } else if (reason === 'idle') {
+          this._idleEvictions += 1;
+        }
         return true;
       }
       return false;
@@ -950,7 +957,7 @@
         this._idleLru.size > 0
       ) {
         const oldest = this._idleLru.values().next().value;
-        this._evictIdleRecord(oldest);
+        this._evictIdleRecord(oldest, 'budget');
       }
 
       // 4. Allocate new GPUTexture + cached default GPUTextureView.
@@ -1158,11 +1165,9 @@
       const idleRecords = Array.from(this._idleLru.values());
       for (let i = 0; i < idleRecords.length; i += 1) {
         const record = idleRecords[i];
-        if (
-          this._currentFrame - record.lastUsedFrame > this._idleFrameTtl ||
-          !this._isRecordReusable(record)
-        ) {
-          if (this._evictIdleRecord(record)) {
+        const expired = this._currentFrame - record.lastUsedFrame > this._idleFrameTtl;
+        if (expired || !this._isRecordReusable(record)) {
+          if (this._evictIdleRecord(record, expired ? 'idle' : null)) {
             evictedCount += 1;
           }
         }
@@ -1176,6 +1181,34 @@
         activeCount: this._activeEntries.size,
         idleCount: this._idleLru.size,
       };
+    }
+
+    /**
+     * Explicitly destroy and remove non-acquired (idle) pooled render targets whose
+     * idle age satisfies `currentFrame - entry.lastUsedFrame >= maxIdleFrames`.
+     * Never evicts currently acquired/in-use targets.
+     *
+     * @param {number} [maxIdleFrames=this._idleFrameTtl] Non-negative integer frame threshold.
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    evictIdle(maxIdleFrames = this._idleFrameTtl) {
+      this._assertNotDestroyed();
+      assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+
+      let evictedCount = 0;
+      let evictedBytes = 0;
+      const idleRecords = Array.from(this._idleLru.values());
+      for (let i = 0; i < idleRecords.length; i += 1) {
+        const record = idleRecords[i];
+        if (this._currentFrame - record.lastUsedFrame >= maxIdleFrames) {
+          if (this._evictIdleRecord(record, 'idle')) {
+            evictedCount += 1;
+            evictedBytes += record.byteSize;
+          }
+        }
+      }
+
+      return { evictedCount, evictedBytes };
     }
 
     /**
@@ -1228,17 +1261,22 @@
     getStats() {
       const totalRequests = this._hits + this._misses;
       const totalBytes = this._activeBytes + this._idleBytes;
+      const hitRate = totalRequests > 0 ? this._hits / totalRequests : 0;
       return {
         hits: this._hits,
         misses: this._misses,
-        hitRate: totalRequests > 0 ? this._hits / totalRequests : 0,
+        hitRate,
+        reuseRatio: hitRate,
         activeCount: this._activeEntries.size,
         idleCount: this._idleLru.size,
         activeBytes: this._activeBytes,
         idleBytes: this._idleBytes,
         totalBytes,
         peakBytes: this._peakBytes,
+        peakPooledBytes: this._peakBytes,
         evictions: this._evictions,
+        budgetEvictions: this._budgetEvictions,
+        idleEvictions: this._idleEvictions,
         leakedReleases: this._leakedReleases,
         dimensionClampCount: this._dimensionClampCount,
         formatNormalizeCount: this._formatNormalizeCount,
