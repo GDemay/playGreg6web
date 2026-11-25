@@ -1352,7 +1352,25 @@ void test_httpfs_size_cache() {
     set_httpfs_client(nullptr);
 }
 
+static void test_stall_compensation() {
+    using namespace playgta6::os::win32;
+    ResetHostStallForTesting();
+    int64_t a = 0;
+    QueryPerformanceCounter(&a);
+    ReportHostStall(kHostStallThresholdNs - 1);  // below threshold: ignored
+    CHECK(TotalHostStallNs() == 0);
+    ReportHostStall(5'000'000'000LL);  // 5 s host stall
+    CHECK(TotalHostStallNs() == 5'000'000'000LL);
+    int64_t b = 0;
+    QueryPerformanceCounter(&b);
+    CHECK(b >= a);                              // monotonic
+    CHECK(b - a < 1'000'000'000LL);             // stall not visible to guest
+    CHECK(GetTickCount64() < 1000u + static_cast<uint64_t>(b / 1'000'000LL));
+    ResetHostStallForTesting();
+}
+
 int main() {
+    test_stall_compensation();
     test_httpfs_size_cache();
     test_directories_and_attributes();
     test_find_files();

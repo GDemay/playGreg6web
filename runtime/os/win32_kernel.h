@@ -338,6 +338,15 @@ bool QueryPerformanceFrequency(int64_t* frequency);
 uint64_t GetTickCount64();
 void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time);
 
+// Stall compensation: host work that knowingly blocks guest threads (pipeline builds, capture
+// flushes, synchronous loads) must not count against guest watchdogs. Stalls of at least
+// kHostStallThresholdNs are subtracted from QueryPerformanceCounter/GetTickCount64 for all
+// threads; the guest clock stays monotonic. Shorter stalls are ignored (off unless a stall happens).
+constexpr int64_t kHostStallThresholdNs = 50'000'000LL;
+void ReportHostStall(int64_t stall_ns);
+int64_t TotalHostStallNs();
+void ResetHostStallForTesting();
+
 uint32_t GetLastError();
 void SetLastError(uint32_t error_code);
 

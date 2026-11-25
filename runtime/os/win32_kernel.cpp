@@ -31,6 +31,24 @@ const std::chrono::steady_clock::time_point& process_start_time() {
     return kStart;
 }
 
+std::atomic<int64_t> g_host_stall_ns{0};
+std::atomic<int64_t> g_last_guest_ns{0};
+
+// Guest-visible nanoseconds since process start, minus compensated host stalls; never regresses.
+int64_t guest_clock_ns() {
+    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
+    int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count() -
+                 g_host_stall_ns.load(std::memory_order_acquire);
+    if (ns < 0) {
+        ns = 0;
+    }
+    int64_t prev = g_last_guest_ns.load(std::memory_order_relaxed);
+    while (prev < ns &&
+           !g_last_guest_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+    }
+    return prev > ns ? prev : ns;
+}
+
 // ---------------------------------------------------------------------------
 // Injectable backend pointers
 // ---------------------------------------------------------------------------
@@ -1999,16 +2017,27 @@ bool QueryPerformanceCounter(int64_t* performance_count) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
-    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-    *performance_count = (ns >= 0 ? ns : 0) + 1;
+    *performance_count = guest_clock_ns() + 1;
     return true;
 }
 
 uint64_t GetTickCount64() {
-    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
-    const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    return ms >= 0 ? static_cast<uint64_t>(ms) : 0ULL;
+    return static_cast<uint64_t>(guest_clock_ns() / 1'000'000LL);
+}
+
+void ReportHostStall(int64_t stall_ns) {
+    if (stall_ns >= kHostStallThresholdNs) {
+        g_host_stall_ns.fetch_add(stall_ns, std::memory_order_acq_rel);
+    }
+}
+
+int64_t TotalHostStallNs() {
+    return g_host_stall_ns.load(std::memory_order_acquire);
+}
+
+void ResetHostStallForTesting() {
+    g_host_stall_ns.store(0, std::memory_order_release);
+    g_last_guest_ns.store(0, std::memory_order_relaxed);
 }
 
 void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time) {
