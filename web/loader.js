@@ -3,6 +3,7 @@
 // Main runtime coordinator worker (keeps the browser DOM thread completely free).
 (function initPlayGta6Loader() {
 const EMSCRIPTEN_PTHREAD_WORKER_NAME = 'em-pthread';
+const PROGRESS_CHANNEL_NAME = 'game-progress';
 const PTHREAD_WGPU_CHANNEL_NAME = 'playgta6-wgpu-pthread';
 const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
 const PTHREAD_CMD_LOAD = 'load';
@@ -60,10 +61,18 @@ if (typeof importScripts === 'function') {
   importScripts('./workers/httpfs_mailbox.js');
 }
 
-const progress =
-  typeof self !== 'undefined' && typeof BroadcastChannel === 'function'
-    ? new BroadcastChannel('game-progress')
-    : null;
+function postProgress(payload) {
+  if (typeof self === 'undefined') {
+    return false;
+  }
+  const BroadcastChannelCtor =
+    typeof self.BroadcastChannel === 'function'
+      ? self.BroadcastChannel
+      : typeof BroadcastChannel === 'function'
+        ? BroadcastChannel
+        : null;
+  return postBroadcastOnce(BroadcastChannelCtor, PROGRESS_CHANNEL_NAME, payload);
+}
 
 const userdataApi =
   (typeof globalThis !== 'undefined' && globalThis.PlayGta6Userdata) ||
@@ -136,9 +145,7 @@ let httpfsMailboxSab = null;
 let httpfsClient = null;
 
 function report(label) {
-  if (progress) {
-    progress.postMessage({ label });
-  }
+  postProgress({ label });
 }
 
 function ptrToNumber(value, label = 'pointer') {
@@ -1119,6 +1126,40 @@ function tryOpenBroadcastChannel(BroadcastChannelCtor, channelName) {
   }
 }
 
+function closeBroadcastChannel(ch) {
+  if (!ch || typeof ch.close !== 'function') {
+    return;
+  }
+  try {
+    ch.close();
+  } catch {
+    // Ignore BroadcastChannel close errors.
+  }
+}
+
+/**
+ * Send one payload on a short-lived BroadcastChannel and close it immediately in `finally`.
+ * Keeps send-only threads (especially Emscripten pthreads running Wasm or `Atomics.wait`) from
+ * holding open BroadcastChannel receive queues that never drain.
+ */
+function postBroadcastOnce(BroadcastChannelCtor, channelName, payload) {
+  const ch = tryOpenBroadcastChannel(BroadcastChannelCtor, channelName);
+  if (!ch) {
+    return false;
+  }
+  try {
+    if (typeof ch.postMessage !== 'function') {
+      return false;
+    }
+    ch.postMessage(payload);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    closeBroadcastChannel(ch);
+  }
+}
+
 function isEmscriptenPthreadWorkerName(name) {
   if (typeof name !== 'string') {
     return false;
@@ -1479,9 +1520,9 @@ function installPthreadHostImportShim(globalScope, hostImports) {
 
 /**
  * Bootstrap an Emscripten `em-pthread` worker spawned via `new Worker(self.location.href, { name: "em-pthread" })`:
- * - Streams `host_log` over `BroadcastChannel('game-progress')`.
- * - Relays `host_wgpu_submit` batches over `BroadcastChannel('playgta6-wgpu-pthread')` to the coordinator worker.
- * - Acquires `httpfsMailboxSab` via `BroadcastChannel('playgta6-httpfs-sab')` so pthreads can call `host_httpfs_*`.
+ * - Streams `host_log` over short-lived send-only `BroadcastChannel('game-progress')` instances.
+ * - Relays `host_wgpu_submit` batches over short-lived send-only `BroadcastChannel('playgta6-wgpu-pthread')` instances to the coordinator worker.
+ * - Acquires `httpfsMailboxSab` via `Worker.postMessage` or temporary `BroadcastChannel('playgta6-httpfs-sab')` (closed immediately once SAB arrives) so pthreads can call `host_httpfs_*` without keeping any open BroadcastChannels.
  * - Configures side-module `locateFile` resolution against `dist/` for `guest_part_*.wasm`.
  * - Installs the `WebAssembly.Instance` host-import shim BEFORE `importScripts(runtimeScriptUrl)`.
  */
@@ -1524,22 +1565,8 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
         (typeof globalThis !== 'undefined' && globalThis.PlayGta6HttpfsMailbox) ||
         null;
 
-  const progressChannel = tryOpenBroadcastChannel(BroadcastChannelCtor, 'game-progress');
-  const wgpuChannel = tryOpenBroadcastChannel(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME);
-  const httpfsChannel = tryOpenBroadcastChannel(
-    BroadcastChannelCtor,
-    PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
-  );
-
   const pthreadReport = (label) => {
-    if (!progressChannel || typeof progressChannel.postMessage !== 'function') {
-      return;
-    }
-    try {
-      progressChannel.postMessage({ label });
-    } catch {
-      // Progress channel broadcast failures must never crash guest pthreads.
-    }
+    postBroadcastOnce(BroadcastChannelCtor, PROGRESS_CHANNEL_NAME, { label });
   };
 
   const pthreadLocateFile = createRuntimeLocateFile(
@@ -1577,19 +1604,34 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
 
   let pthreadHttpfsClient = null;
   let attachedHttpfsSab = null;
+  let httpfsChannel = null;
+
+  const closeHttpfsChannel = () => {
+    const ch = httpfsChannel;
+    httpfsChannel = null;
+    if (!ch) {
+      return;
+    }
+    try {
+      ch.onmessage = null;
+    } catch {
+      // Ignore errors clearing BroadcastChannel message handler.
+    }
+    closeBroadcastChannel(ch);
+  };
+
   const hostImports = createHostImports({
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
     wgpuSubmit: (bytes) => {
-      if (!wgpuChannel || typeof wgpuChannel.postMessage !== 'function') {
+      if (typeof BroadcastChannelCtor !== 'function') {
         return;
       }
       const copy = bytes.slice();
-      try {
-        wgpuChannel.postMessage({ type: 'wgpu-submit', cmdBuffer: copy.buffer });
-      } catch {
-        // Non-fatal GPU command relay failure.
-      }
+      postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, {
+        type: 'wgpu-submit',
+        cmdBuffer: copy.buffer,
+      });
     },
     getHttpfsClient: () => pthreadHttpfsClient,
   });
@@ -1599,12 +1641,14 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       return false;
     }
     if (attachedHttpfsSab === sab && pthreadHttpfsClient) {
+      closeHttpfsChannel();
       return true;
     }
     try {
       pthreadHttpfsClient = new mailboxApi.HttpfsMailboxClient(sab);
       attachedHttpfsSab = sab;
       hostImports.setHttpfsClient(pthreadHttpfsClient);
+      closeHttpfsChannel();
       return true;
     } catch {
       return false;
@@ -1631,14 +1675,21 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     installedBootstrapMessageListener = true;
   }
 
-  if (httpfsChannel) {
-    httpfsChannel.onmessage = (ev) => {
-      const msg = ev && ev.data;
-      if (msg && msg.type === 'httpfs-sab' && msg.sab) {
-        attachHttpfsSab(msg.sab);
-      }
-    };
-    if (!attachedHttpfsSab) {
+  const canAttachHttpfs = Boolean(
+    mailboxApi && typeof mailboxApi.HttpfsMailboxClient === 'function',
+  );
+  if (!attachedHttpfsSab && canAttachHttpfs) {
+    httpfsChannel = tryOpenBroadcastChannel(
+      BroadcastChannelCtor,
+      PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+    );
+    if (httpfsChannel) {
+      httpfsChannel.onmessage = (ev) => {
+        const msg = ev && ev.data;
+        if (msg && msg.type === 'httpfs-sab' && msg.sab) {
+          attachHttpfsSab(msg.sab);
+        }
+      };
       try {
         if (typeof httpfsChannel.postMessage === 'function') {
           httpfsChannel.postMessage({ type: 'request-httpfs-sab' });
@@ -1669,9 +1720,11 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     attachHttpfsSab,
     hasHttpfsSab: () => Boolean(pthreadHttpfsClient),
     channels: {
-      progress: progressChannel,
-      wgpu: wgpuChannel,
-      httpfs: httpfsChannel,
+      progress: null,
+      wgpu: null,
+      get httpfs() {
+        return httpfsChannel;
+      },
     },
     cleanup() {
       restoreWasmInstance();
@@ -1707,17 +1760,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
           }
         }
       }
-      const channels = [progressChannel, wgpuChannel, httpfsChannel];
-      for (let i = 0; i < channels.length; i += 1) {
-        const ch = channels[i];
-        if (ch && typeof ch.close === 'function') {
-          try {
-            ch.close();
-          } catch {
-            // Ignore BroadcastChannel close errors.
-          }
-        }
-      }
+      closeHttpfsChannel();
     },
   };
 }
@@ -3430,22 +3473,16 @@ async function tryBootWasmRuntime() {
           manifestSummary.maxConcurrentPthreadLoads,
         );
       }
-      if (progress) {
-        try {
-          progress.postMessage({
-            metrics: {
-              indirectDispatch: manifestSummary.indirectDispatch,
-              sideModuleCount: manifestSummary.sideModuleCount,
-              sideModuleUrls: manifestSummary.sideModules.slice(),
-              wasmMetrics: manifestSummary.wasmMetrics
-                ? Object.assign({}, manifestSummary.wasmMetrics)
-                : null,
-            },
-          });
-        } catch {
-          // Non-fatal progress broadcast error.
-        }
-      }
+      postProgress({
+        metrics: {
+          indirectDispatch: manifestSummary.indirectDispatch,
+          sideModuleCount: manifestSummary.sideModuleCount,
+          sideModuleUrls: manifestSummary.sideModules.slice(),
+          wasmMetrics: manifestSummary.wasmMetrics
+            ? Object.assign({}, manifestSummary.wasmMetrics)
+            : null,
+        },
+      });
     }
 
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
@@ -3456,9 +3493,7 @@ async function tryBootWasmRuntime() {
           coordinatorFirstPresentEmitted = true;
         },
         onWasmError: (err) => {
-          if (progress) {
-            progress.postMessage({ error: `runtime wasm: ${err}` });
-          }
+          postProgress({ error: `runtime wasm: ${err}` });
         },
       };
       if (manifestSummary) {
@@ -3477,9 +3512,7 @@ async function tryBootWasmRuntime() {
       await self.createRuntimeModule(moduleConfig);
     }
   } catch (err) {
-    if (progress) {
-      progress.postMessage({ error: `runtime boot: ${err}` });
-    }
+    postProgress({ error: `runtime boot: ${err}` });
   }
 }
 
@@ -3671,7 +3704,7 @@ if (typeof self !== 'undefined') {
 
     ioWorker.onmessage = (e) => {
       if (e.data.ready) onWorkerReady('io_worker', e.data.summary);
-      else if (e.data.error && progress) progress.postMessage({ error: `io_worker: ${e.data.error}` });
+      else if (e.data.error) postProgress({ error: `io_worker: ${e.data.error}` });
     };
     gpuWorker.onmessage = (e) => {
       const data = e && e.data;
@@ -3682,8 +3715,8 @@ if (typeof self !== 'undefined') {
       }
       if (data.frame) {
         report(`WebGPU frame #${data.frame} presented`);
-      } else if (data.error && progress) {
-        progress.postMessage({ error: `wgpu_worker: ${formatGpuWorkerError(data.error)}` });
+      } else if (data.error) {
+        postProgress({ error: `wgpu_worker: ${formatGpuWorkerError(data.error)}` });
       }
       forwardGpuWorkerMessage(data, postToMain);
     };
@@ -3703,6 +3736,7 @@ if (typeof self !== 'undefined') {
 
 const exportedApi = {
   EMSCRIPTEN_PTHREAD_WORKER_NAME,
+  PROGRESS_CHANNEL_NAME,
   PTHREAD_WGPU_CHANNEL_NAME,
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
   PTHREAD_CMD_LOAD,
@@ -3738,6 +3772,7 @@ const exportedApi = {
   buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
+  postBroadcastOnce,
   ptrToNumber,
 };
 
