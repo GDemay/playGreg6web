@@ -1297,6 +1297,401 @@
   }
 
   /**
+   * Sanitize and clamp a unit-interval ratio (e.g. `fps30ComplianceRate`,
+   * `vramBudgetUtilization`, `bindGroupHitRate`) into `[0, 1]`, returning `null`
+   * for missing, non-finite, boolean, object, XSS, or host-path values.
+   *
+   * @param {unknown} value
+   * @returns {number|null}
+   */
+  function sanitizeUnitRatio(value) {
+    let n = null;
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return null;
+      n = value;
+    } else if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.length === 0 || trimmed.length > 32) return null;
+      if (!/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) return null;
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed)) return null;
+      n = parsed;
+    } else {
+      return null;
+    }
+    if (n <= 0) return 0;
+    if (n >= 1) return 1;
+    return n;
+  }
+
+  /**
+   * Sanitize a non-negative finite telemetry scalar, normalizing `-0` to `0` and
+   * returning `null` for negative, non-finite, boolean, XSS, or host-path values.
+   *
+   * @param {unknown} value
+   * @returns {number|null}
+   */
+  function sanitizeCleanNonNegativeNumber(value) {
+    const n = sanitizeNonNegativeNumber(value);
+    return n === null ? null : n === 0 ? 0 : n;
+  }
+
+  /**
+   * Sanitize a positive integer count (`>= 1`, e.g. `mailboxLanes`), returning `null`
+   * for missing, zero, negative, non-finite, boolean, XSS, or host-path values.
+   *
+   * @param {unknown} value
+   * @returns {number|null}
+   */
+  function sanitizePositiveInt(value) {
+    const n = sanitizeNonNegativeNumber(value);
+    if (n === null) return null;
+    const floored = Math.floor(n);
+    if (!Number.isSafeInteger(floored) || floored < 1) return null;
+    return floored;
+  }
+
+  /**
+   * Format a clamped `[0, 1]` unit ratio as a percentage string (`0.0%`–`100.0%`),
+   * returning `—` when absent or invalid.
+   *
+   * @param {unknown} value
+   * @returns {string}
+   */
+  function formatRatioPct(value) {
+    const ratio = sanitizeUnitRatio(value);
+    return ratio === null ? PLACEHOLDER_DASH : `${(ratio * 100).toFixed(1)}%`;
+  }
+
+  /**
+   * Format a non-negative frame jitter duration in milliseconds (`0.00 ms`),
+   * returning `—` when absent or invalid.
+   *
+   * @param {unknown} value
+   * @returns {string}
+   */
+  function formatFrameJitterMs(value) {
+    const n = sanitizeCleanNonNegativeNumber(value);
+    return n === null ? PLACEHOLDER_DASH : `${n.toFixed(2)} ms`;
+  }
+
+  /**
+   * Format a non-negative memory footprint in megabytes (`0.0 MB`),
+   * returning `—` when absent or invalid.
+   *
+   * @param {unknown} value
+   * @returns {string}
+   */
+  function formatMemoryMb(value) {
+    const n = sanitizeCleanNonNegativeNumber(value);
+    return n === null ? PLACEHOLDER_DASH : `${n.toFixed(1)} MB`;
+  }
+
+  /**
+   * Format a positive integer I/O mailbox lane count (`>= 1`),
+   * returning `—` when absent or invalid.
+   *
+   * @param {unknown} value
+   * @returns {string}
+   */
+  function formatMailboxLanes(value) {
+    const lanes = sanitizePositiveInt(value);
+    return lanes === null ? PLACEHOLDER_DASH : String(lanes);
+  }
+
+  function createDefaultPacingStats() {
+    return {
+      fps30ComplianceRate: null,
+      frameJitterMs: null,
+    };
+  }
+
+  function createDefaultMemoryStats() {
+    return {
+      jsHeapUsedMb: null,
+      vramBudgetUtilization: null,
+      bindGroupHitRate: null,
+    };
+  }
+
+  function createDefaultMailboxStats() {
+    return {
+      mailboxLanes: null,
+    };
+  }
+
+  function extractPacingStats(source, base) {
+    let next = base ? { ...base } : createDefaultPacingStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawPacing =
+      safeRead(source, 'pacingStats') !== undefined
+        ? safeRead(source, 'pacingStats')
+        : safeRead(source, 'pacing');
+    if (rawPacing === null) {
+      next = createDefaultPacingStats();
+    }
+    const pacingObj = rawPacing && typeof rawPacing === 'object' ? rawPacing : null;
+
+    const rawPerf =
+      safeRead(source, 'perfStats') !== undefined
+        ? safeRead(source, 'perfStats')
+        : safeRead(source, 'perf');
+    const perfObj = rawPerf && typeof rawPerf === 'object' ? rawPerf : null;
+
+    const rawFrames =
+      safeRead(source, 'frameStats') !== undefined
+        ? safeRead(source, 'frameStats')
+        : safeRead(source, 'frames');
+    const framesObj = rawFrames && typeof rawFrames === 'object' ? rawFrames : null;
+
+    const rawBoot =
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot');
+    const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: pacingObj, explicitNull: true },
+      { obj: perfObj, explicitNull: false },
+      { obj: framesObj, explicitNull: false },
+      { obj: bootObj, explicitNull: false },
+    ];
+
+    const compliance = pickFirstDefinedWithSource(sources, ['fps30ComplianceRate']);
+    if (compliance.found) {
+      if (compliance.value === null) {
+        if (compliance.explicitNull) {
+          next.fps30ComplianceRate = null;
+        }
+      } else {
+        next.fps30ComplianceRate = sanitizeUnitRatio(compliance.value);
+      }
+    }
+
+    const jitter = pickFirstDefinedWithSource(sources, ['frameJitterMs']);
+    if (jitter.found) {
+      if (jitter.value === null) {
+        if (jitter.explicitNull) {
+          next.frameJitterMs = null;
+        }
+      } else {
+        next.frameJitterMs = sanitizeCleanNonNegativeNumber(jitter.value);
+      }
+    }
+
+    return next;
+  }
+
+  function extractMemoryStats(source, base) {
+    let next = base ? { ...base } : createDefaultMemoryStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawMemory =
+      safeRead(source, 'memoryStats') !== undefined
+        ? safeRead(source, 'memoryStats')
+        : safeRead(source, 'memory') !== undefined
+          ? safeRead(source, 'memory')
+          : safeRead(source, 'vramStats') !== undefined
+            ? safeRead(source, 'vramStats')
+            : safeRead(source, 'vram');
+    if (rawMemory === null) {
+      next = createDefaultMemoryStats();
+    }
+    const memoryObj = rawMemory && typeof rawMemory === 'object' ? rawMemory : null;
+
+    const rawPerf =
+      safeRead(source, 'perfStats') !== undefined
+        ? safeRead(source, 'perfStats')
+        : safeRead(source, 'perf');
+    const perfObj = rawPerf && typeof rawPerf === 'object' ? rawPerf : null;
+
+    const rawResourceTable =
+      safeRead(source, 'resourceTableStats') !== undefined
+        ? safeRead(source, 'resourceTableStats')
+        : safeRead(source, 'resourceTable') !== undefined
+          ? safeRead(source, 'resourceTable')
+          : safeRead(source, 'bindGroupStats');
+    const resourceTableObj =
+      rawResourceTable && typeof rawResourceTable === 'object' ? rawResourceTable : null;
+
+    const rawRenderState = safeRead(source, 'renderStateStats');
+    const renderStateObj =
+      rawRenderState && typeof rawRenderState === 'object' ? rawRenderState : null;
+
+    const rawGpu =
+      safeRead(source, 'compatStats') !== undefined
+        ? safeRead(source, 'compatStats')
+        : safeRead(source, 'gpuCompatStats') !== undefined
+          ? safeRead(source, 'gpuCompatStats')
+          : safeRead(source, 'gpu');
+    const gpuObj = rawGpu && typeof rawGpu === 'object' ? rawGpu : null;
+
+    const rawBoot =
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot');
+    const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: memoryObj, explicitNull: true },
+      { obj: perfObj, explicitNull: false },
+      { obj: resourceTableObj, explicitNull: false },
+      { obj: renderStateObj, explicitNull: false },
+      { obj: gpuObj, explicitNull: false },
+      { obj: bootObj, explicitNull: false },
+    ];
+
+    const jsHeap = pickFirstDefinedWithSource(sources, ['jsHeapUsedMb']);
+    if (jsHeap.found) {
+      if (jsHeap.value === null) {
+        if (jsHeap.explicitNull) {
+          next.jsHeapUsedMb = null;
+        }
+      } else {
+        next.jsHeapUsedMb = sanitizeCleanNonNegativeNumber(jsHeap.value);
+      }
+    }
+
+    const vramUtil = pickFirstDefinedWithSource(sources, ['vramBudgetUtilization']);
+    if (vramUtil.found) {
+      if (vramUtil.value === null) {
+        if (vramUtil.explicitNull) {
+          next.vramBudgetUtilization = null;
+        }
+      } else {
+        next.vramBudgetUtilization = sanitizeUnitRatio(vramUtil.value);
+      }
+    }
+
+    const bgHitRate = pickFirstDefinedWithSource(sources, [
+      'bindGroupHitRate',
+      'bindGroupCacheHitRate',
+    ]);
+    if (bgHitRate.found) {
+      if (bgHitRate.value === null) {
+        if (bgHitRate.explicitNull) {
+          next.bindGroupHitRate = null;
+        }
+      } else {
+        next.bindGroupHitRate = sanitizeUnitRatio(bgHitRate.value);
+      }
+    }
+
+    return next;
+  }
+
+  function extractMailboxStats(source, base) {
+    let next = base ? { ...base } : createDefaultMailboxStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawIo =
+      safeRead(source, 'ioStats') !== undefined
+        ? safeRead(source, 'ioStats')
+        : safeRead(source, 'httpfsStats') !== undefined
+          ? safeRead(source, 'httpfsStats')
+          : safeRead(source, 'io');
+    const rawMailbox =
+      safeRead(source, 'mailboxStats') !== undefined
+        ? safeRead(source, 'mailboxStats')
+        : safeRead(source, 'mailbox');
+    if (rawIo === null || rawMailbox === null) {
+      next = createDefaultMailboxStats();
+    }
+    const ioObj = rawIo && typeof rawIo === 'object' ? rawIo : null;
+    const mailboxObj = rawMailbox && typeof rawMailbox === 'object' ? rawMailbox : null;
+
+    const rawBoot =
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot');
+    const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
+
+    const picked = pickFirstDefinedWithSource(
+      [
+        { obj: source, explicitNull: true },
+        { obj: mailboxObj, explicitNull: true },
+        { obj: ioObj, explicitNull: true },
+        { obj: bootObj, explicitNull: false },
+      ],
+      ['mailboxLanes']
+    );
+
+    if (picked.found) {
+      if (picked.value === null) {
+        if (picked.explicitNull) {
+          next.mailboxLanes = null;
+        }
+      } else {
+        next.mailboxLanes = sanitizePositiveInt(picked.value);
+      }
+    }
+
+    return next;
+  }
+
+  /**
+   * Build a concise, sanitized single-line diagnostics summary string from a panel
+   * snapshot or raw telemetry payload. Gracefully omits null/missing optional metrics
+   * and strips any host paths, URLs, or XSS payloads.
+   *
+   * @param {object|null|undefined} input
+   * @returns {string}
+   */
+  function formatSummary(input) {
+    const source = input && typeof input === 'object' ? input : {};
+    const boot = normalizeBootSummary(
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot')
+    );
+    const frameStats = normalizeFrameStats(safeRead(source, 'frameStats'));
+    const fallbackStats = normalizeFallbackStats(safeRead(source, 'fallbackStats'));
+    const adapterStats = extractAdapterStats(source, null);
+    const pacingStats = extractPacingStats(source, null);
+    const memoryStats = extractMemoryStats(source, null);
+    const mailboxStats = extractMailboxStats(source, null);
+
+    const parts = [
+      `${boot.stage} (${boot.progressPct}%)`,
+      `frames=${frameStats.framesPresented}`,
+      `packHit=${formatHitRatePct(fallbackStats.hitRatePct)}`,
+    ];
+
+    if (adapterStats.gpuAdapter !== null) {
+      parts.push(`adapter=${adapterStats.gpuAdapter}`);
+    }
+    if (pacingStats.fps30ComplianceRate !== null) {
+      parts.push(`30fps=${formatRatioPct(pacingStats.fps30ComplianceRate)}`);
+    }
+    if (pacingStats.frameJitterMs !== null) {
+      parts.push(`jitter=${formatFrameJitterMs(pacingStats.frameJitterMs)}`);
+    }
+    if (memoryStats.jsHeapUsedMb !== null) {
+      parts.push(`jsHeap=${formatMemoryMb(memoryStats.jsHeapUsedMb)}`);
+    }
+    if (memoryStats.vramBudgetUtilization !== null) {
+      parts.push(`vram=${formatRatioPct(memoryStats.vramBudgetUtilization)}`);
+    }
+    if (memoryStats.bindGroupHitRate !== null) {
+      parts.push(`bgHit=${formatRatioPct(memoryStats.bindGroupHitRate)}`);
+    }
+    if (mailboxStats.mailboxLanes !== null) {
+      parts.push(`mailboxLanes=${mailboxStats.mailboxLanes}`);
+    }
+
+    return parts.join(' | ');
+  }
+
+  /**
    * Normalize and sanitize a single missing-shader entry into a canonical row
    * (`hash` hex, `stage`, `hits`, optional numeric timestamps, and display `text`).
    * Returns `null` if the entry lacks a valid 64-bit hash (rejecting paths/buffers).
@@ -1452,6 +1847,9 @@
     const adapterStats = extractAdapterStats(source, null);
     const visibilityStats = extractVisibilityStats(source, null);
     const reflectionStats = extractReflectionStats(source, null);
+    const pacingStats = extractPacingStats(source, null);
+    const memoryStats = extractMemoryStats(source, null);
+    const mailboxStats = extractMailboxStats(source, null);
 
     let exportedAtValue = safeRead(source, 'exportedAt');
     if (exportedAtValue === undefined) {
@@ -1537,6 +1935,16 @@
           return item;
         }),
       },
+      pacing: {
+        fps30ComplianceRate: pacingStats.fps30ComplianceRate,
+        frameJitterMs: pacingStats.frameJitterMs,
+      },
+      memory: {
+        jsHeapUsedMb: memoryStats.jsHeapUsedMb,
+        vramBudgetUtilization: memoryStats.vramBudgetUtilization,
+        bindGroupHitRate: memoryStats.bindGroupHitRate,
+      },
+      mailboxLanes: mailboxStats.mailboxLanes,
       missingShaderCount: missingShaders.length,
       missingShaders,
     };
@@ -1698,6 +2106,9 @@
       this._adapterStats = createDefaultAdapterStats();
       this._visibilityStats = createDefaultVisibilityStats();
       this._reflectionStats = createDefaultReflectionStats();
+      this._pacingStats = createDefaultPacingStats();
+      this._memoryStats = createDefaultMemoryStats();
+      this._mailboxStats = createDefaultMailboxStats();
       this._missingShaders = [];
       this._renderedCache = Object.create(null);
 
@@ -2112,6 +2523,66 @@
       adapterReflectionGrid.appendChild(resourceHeapBindingsMetric.card);
       adapterReflectionSection.appendChild(adapterReflectionGrid);
 
+      // --- 30 FPS pacing, memory/VRAM & I/O mailbox telemetry section (W292) ---
+      const pacingMemorySection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__pacing-memory`,
+        {
+          role: 'group',
+          'aria-label': '30 FPS Pacing, Memory & I/O Telemetry',
+        }
+      );
+      pacingMemorySection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, {
+          text: '30 FPS Pacing, Memory & I/O',
+        })
+      );
+      const pacingMemoryGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid`);
+      const fps30ComplianceMetric = this._buildMetricCard(
+        doc,
+        '30 FPS Compliance',
+        `${ROOT_CLASS}__fps30-compliance-rate`,
+        PLACEHOLDER_DASH
+      );
+      const frameJitterMetric = this._buildMetricCard(
+        doc,
+        'Frame Jitter',
+        `${ROOT_CLASS}__frame-jitter-ms`,
+        PLACEHOLDER_DASH
+      );
+      const jsHeapUsedMetric = this._buildMetricCard(
+        doc,
+        'JS Heap',
+        `${ROOT_CLASS}__js-heap-used-mb`,
+        PLACEHOLDER_DASH
+      );
+      const vramBudgetMetric = this._buildMetricCard(
+        doc,
+        'VRAM Budget',
+        `${ROOT_CLASS}__vram-budget-utilization`,
+        PLACEHOLDER_DASH
+      );
+      const bindGroupHitRateMetric = this._buildMetricCard(
+        doc,
+        'BG Hit Rate',
+        `${ROOT_CLASS}__bind-group-hit-rate`,
+        PLACEHOLDER_DASH
+      );
+      const mailboxLanesMetric = this._buildMetricCard(
+        doc,
+        'I/O Mailbox Lanes',
+        `${ROOT_CLASS}__mailbox-lanes`,
+        PLACEHOLDER_DASH
+      );
+      pacingMemoryGrid.appendChild(fps30ComplianceMetric.card);
+      pacingMemoryGrid.appendChild(frameJitterMetric.card);
+      pacingMemoryGrid.appendChild(jsHeapUsedMetric.card);
+      pacingMemoryGrid.appendChild(vramBudgetMetric.card);
+      pacingMemoryGrid.appendChild(bindGroupHitRateMetric.card);
+      pacingMemoryGrid.appendChild(mailboxLanesMetric.card);
+      pacingMemorySection.appendChild(pacingMemoryGrid);
+
       // --- Missing-shader table section ---
       const missingSection = createEl(doc, 'div', `${ROOT_CLASS}__section ${ROOT_CLASS}__missing`);
       const missingHeader = createEl(
@@ -2148,6 +2619,7 @@
       body.appendChild(ioSection);
       body.appendChild(perfSection);
       body.appendChild(adapterReflectionSection);
+      body.appendChild(pacingMemorySection);
       body.appendChild(missingSection);
 
       rootEl.appendChild(header);
@@ -2196,6 +2668,12 @@
         reflectedStages: reflectedStagesMetric.val,
         inlineSamplerStages: inlineSamplerStagesMetric.val,
         resourceHeapBindings: resourceHeapBindingsMetric.val,
+        fps30ComplianceRate: fps30ComplianceMetric.val,
+        frameJitterMs: frameJitterMetric.val,
+        jsHeapUsedMb: jsHeapUsedMetric.val,
+        vramBudgetUtilization: vramBudgetMetric.val,
+        bindGroupHitRate: bindGroupHitRateMetric.val,
+        mailboxLanes: mailboxLanesMetric.val,
         missingHeader,
         table,
         tbody,
@@ -2256,6 +2734,12 @@
           reflectedStages: q(`.${ROOT_CLASS}__reflected-stages`),
           inlineSamplerStages: q(`.${ROOT_CLASS}__inline-sampler-stages`),
           resourceHeapBindings: q(`.${ROOT_CLASS}__resource-heap-bindings`),
+          fps30ComplianceRate: q(`.${ROOT_CLASS}__fps30-compliance-rate`),
+          frameJitterMs: q(`.${ROOT_CLASS}__frame-jitter-ms`),
+          jsHeapUsedMb: q(`.${ROOT_CLASS}__js-heap-used-mb`),
+          vramBudgetUtilization: q(`.${ROOT_CLASS}__vram-budget-utilization`),
+          bindGroupHitRate: q(`.${ROOT_CLASS}__bind-group-hit-rate`),
+          mailboxLanes: q(`.${ROOT_CLASS}__mailbox-lanes`),
           missingHeader: q(`.${ROOT_CLASS}__missing-header`),
           table: q(`.${ROOT_CLASS}__table`),
           tbody: q(`.${ROOT_CLASS}__table-body`),
@@ -2384,6 +2868,9 @@
       const adapter = this._adapterStats;
       const visibility = this._visibilityStats;
       const reflection = this._reflectionStats;
+      const pacing = this._pacingStats;
+      const memory = this._memoryStats;
+      const mailbox = this._mailboxStats;
 
       try {
         this._setTextIfChanged('summaryBadge', els.summaryBadge, `${boot.stage} · ${boot.progressPct}%`);
@@ -2530,6 +3017,38 @@
           reflection.resourceHeapBindings
         );
 
+        // W292: 30 FPS pacing, #1077 memory/VRAM telemetry & #1015 I/O mailbox lanes.
+        this._setTextIfChanged(
+          'fps30ComplianceRate',
+          els.fps30ComplianceRate,
+          formatRatioPct(pacing.fps30ComplianceRate)
+        );
+        this._setTextIfChanged(
+          'frameJitterMs',
+          els.frameJitterMs,
+          formatFrameJitterMs(pacing.frameJitterMs)
+        );
+        this._setTextIfChanged(
+          'jsHeapUsedMb',
+          els.jsHeapUsedMb,
+          formatMemoryMb(memory.jsHeapUsedMb)
+        );
+        this._setTextIfChanged(
+          'vramBudgetUtilization',
+          els.vramBudgetUtilization,
+          formatRatioPct(memory.vramBudgetUtilization)
+        );
+        this._setTextIfChanged(
+          'bindGroupHitRate',
+          els.bindGroupHitRate,
+          formatRatioPct(memory.bindGroupHitRate)
+        );
+        this._setTextIfChanged(
+          'mailboxLanes',
+          els.mailboxLanes,
+          formatMailboxLanes(mailbox.mailboxLanes)
+        );
+
         const totalMissing = this._missingShaders.length;
         const visibleRows = this._missingShaders.slice(0, this._maxRows);
         const overflowCount = Math.max(0, totalMissing - visibleRows.length);
@@ -2650,6 +3169,9 @@
       this._adapterStats = extractAdapterStats(snapshot, this._adapterStats);
       this._visibilityStats = extractVisibilityStats(snapshot, this._visibilityStats);
       this._reflectionStats = extractReflectionStats(snapshot, this._reflectionStats);
+      this._pacingStats = extractPacingStats(snapshot, this._pacingStats);
+      this._memoryStats = extractMemoryStats(snapshot, this._memoryStats);
+      this._mailboxStats = extractMailboxStats(snapshot, this._mailboxStats);
 
       this._render();
       return this.getState();
@@ -2674,6 +3196,9 @@
       this._adapterStats = createDefaultAdapterStats();
       this._visibilityStats = createDefaultVisibilityStats();
       this._reflectionStats = createDefaultReflectionStats();
+      this._pacingStats = createDefaultPacingStats();
+      this._memoryStats = createDefaultMemoryStats();
+      this._mailboxStats = createDefaultMailboxStats();
       this._missingShaders = [];
       this._exportCount = 0;
 
@@ -2699,6 +3224,9 @@
         adapterStats: this._adapterStats,
         visibilityStats: this._visibilityStats,
         reflectionStats: this._reflectionStats,
+        pacingStats: this._pacingStats,
+        memoryStats: this._memoryStats,
+        mailboxLanes: this._mailboxStats.mailboxLanes,
         maxTopMissingShaders: this._maxTopMissingShaders,
         now: this._now,
       });
@@ -2785,6 +3313,14 @@
         resourceHeapBindings: this._reflectionStats.resourceHeapBindings,
         visibilityStats: { ...this._visibilityStats },
         reflectionStats: { ...this._reflectionStats },
+        fps30ComplianceRate: this._pacingStats.fps30ComplianceRate,
+        frameJitterMs: this._pacingStats.frameJitterMs,
+        jsHeapUsedMb: this._memoryStats.jsHeapUsedMb,
+        vramBudgetUtilization: this._memoryStats.vramBudgetUtilization,
+        bindGroupHitRate: this._memoryStats.bindGroupHitRate,
+        mailboxLanes: this._mailboxStats.mailboxLanes,
+        pacingStats: { ...this._pacingStats },
+        memoryStats: { ...this._memoryStats },
         hitRateText: formatHitRatePct(this._fallbackStats.hitRatePct),
         missingShaders: this._missingShaders.map((row) => ({ ...row })),
         visibleMissingShaders,
@@ -2798,6 +3334,24 @@
     /** @returns {object} Snapshot of current panel state (alias of `getState()`). */
     getSnapshot() {
       return this.getState();
+    }
+
+    /**
+     * Format a concise, sanitized single-line diagnostics summary string.
+     * Gracefully omits absent/null optional pacing, memory/VRAM, and mailbox metrics.
+     *
+     * @returns {string}
+     */
+    formatSummary() {
+      return formatSummary({
+        boot: this._boot,
+        frameStats: this._frameStats,
+        fallbackStats: this._fallbackStats,
+        adapterStats: this._adapterStats,
+        pacingStats: this._pacingStats,
+        memoryStats: this._memoryStats,
+        mailboxLanes: this._mailboxStats.mailboxLanes,
+      });
     }
 
     /** Tear down DOM event listeners and detach the panel node. Idempotent. */
@@ -2864,9 +3418,16 @@
     ALLOWED_SWAPCHAIN_FORMATS,
     sanitizeSwapchainFormat,
     sanitizeGpuAdapter,
+    sanitizeUnitRatio,
+    sanitizePositiveInt,
     formatDurationMs,
     formatOnePercentLowFps,
     formatP99FrameMs,
+    formatRatioPct,
+    formatFrameJitterMs,
+    formatMemoryMb,
+    formatMailboxLanes,
+    formatSummary,
     normalizeTopMissingShaders,
     formatTopMissingShaders,
     formatMissingShaderRow,

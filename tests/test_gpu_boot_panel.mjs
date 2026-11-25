@@ -18,9 +18,16 @@ const {
   ALLOWED_SWAPCHAIN_FORMATS,
   sanitizeSwapchainFormat,
   sanitizeGpuAdapter,
+  sanitizeUnitRatio,
+  sanitizePositiveInt,
   formatDurationMs,
   formatOnePercentLowFps,
   formatP99FrameMs,
+  formatRatioPct,
+  formatFrameJitterMs,
+  formatMemoryMb,
+  formatMailboxLanes,
+  formatSummary,
   normalizeTopMissingShaders,
   formatTopMissingShaders,
   formatMissingShaderRow,
@@ -1836,6 +1843,406 @@ test('W240 dirty-checked DOM updates skip redundant writes for adapter, visibili
   assert.equal(blackPresEl.textContentWrites, before.blackPres);
   assert.equal(reflStagesEl.textContentWrites, before.reflStages);
   assert.equal(inlineSampEl.textContentWrites, before.inlineSamp);
+
+  controller.destroy();
+});
+
+test('W292 exports pacing/memory/mailbox formatters, formatSummary, and clean defaults when omitted', () => {
+  assert.equal(typeof sanitizeUnitRatio, 'function');
+  assert.equal(typeof sanitizePositiveInt, 'function');
+  assert.equal(typeof formatRatioPct, 'function');
+  assert.equal(typeof formatFrameJitterMs, 'function');
+  assert.equal(typeof formatMemoryMb, 'function');
+  assert.equal(typeof formatMailboxLanes, 'function');
+  assert.equal(typeof formatSummary, 'function');
+  assert.equal(globalThis.PlayGta6GpuBootPanel.sanitizeUnitRatio, sanitizeUnitRatio);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.sanitizePositiveInt, sanitizePositiveInt);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatRatioPct, formatRatioPct);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatFrameJitterMs, formatFrameJitterMs);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatMemoryMb, formatMemoryMb);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatMailboxLanes, formatMailboxLanes);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatSummary, formatSummary);
+
+  // Unit ratio clamping [0, 1] and rejection of non-finite / hostile values
+  assert.equal(sanitizeUnitRatio(0), 0);
+  assert.equal(Object.is(sanitizeUnitRatio(-0), 0), true);
+  assert.equal(sanitizeUnitRatio(0.945), 0.945);
+  assert.equal(sanitizeUnitRatio(1), 1);
+  assert.equal(sanitizeUnitRatio(-0.25), 0);
+  assert.equal(sanitizeUnitRatio(1.75), 1);
+  assert.equal(sanitizeUnitRatio('0.85'), 0.85);
+  assert.equal(sanitizeUnitRatio('-0.5'), 0);
+  assert.equal(sanitizeUnitRatio('2.5'), 1);
+  assert.equal(sanitizeUnitRatio(null), null);
+  assert.equal(sanitizeUnitRatio(undefined), null);
+  assert.equal(sanitizeUnitRatio(Number.NaN), null);
+  assert.equal(sanitizeUnitRatio(Infinity), null);
+  assert.equal(sanitizeUnitRatio(-Infinity), null);
+  assert.equal(sanitizeUnitRatio(true), null);
+  assert.equal(sanitizeUnitRatio(false), null);
+  assert.equal(sanitizeUnitRatio('C:\\Users\\alice\\rate'), null);
+  assert.equal(sanitizeUnitRatio('<script>alert(1)</script>'), null);
+
+  assert.equal(formatRatioPct(0.985), '98.5%');
+  assert.equal(formatRatioPct(-0.4), '0.0%');
+  assert.equal(formatRatioPct(1.4), '100.0%');
+  assert.equal(formatRatioPct(null), '—');
+  assert.equal(formatRatioPct(Number.NaN), '—');
+
+  // Frame jitter (>= 0) & JS heap MB (>= 0) formatters
+  assert.equal(formatFrameJitterMs(0), '0.00 ms');
+  assert.equal(formatFrameJitterMs(1.456), '1.46 ms');
+  assert.equal(formatFrameJitterMs('2.5'), '2.50 ms');
+  assert.equal(formatFrameJitterMs(-0.1), '—');
+  assert.equal(formatFrameJitterMs(Number.NaN), '—');
+  assert.equal(formatFrameJitterMs(Infinity), '—');
+  assert.equal(formatFrameJitterMs(null), '—');
+  assert.equal(formatFrameJitterMs('<img src=x onerror=alert(1)>'), '—');
+
+  assert.equal(formatMemoryMb(0), '0.0 MB');
+  assert.equal(formatMemoryMb(256.46), '256.5 MB');
+  assert.equal(formatMemoryMb('512'), '512.0 MB');
+  assert.equal(formatMemoryMb(-1), '—');
+  assert.equal(formatMemoryMb(Number.NaN), '—');
+  assert.equal(formatMemoryMb(Infinity), '—');
+  assert.equal(formatMemoryMb(null), '—');
+  assert.equal(formatMemoryMb('/home/alice/heap.bin'), '—');
+
+  // Positive integer (>= 1) mailboxLanes sanitizer & formatter
+  assert.equal(sanitizePositiveInt(1), 1);
+  assert.equal(sanitizePositiveInt(4), 4);
+  assert.equal(sanitizePositiveInt(4.9), 4);
+  assert.equal(sanitizePositiveInt('8'), 8);
+  assert.equal(sanitizePositiveInt(0), null);
+  assert.equal(sanitizePositiveInt(0.9), null);
+  assert.equal(sanitizePositiveInt(-3), null);
+  assert.equal(sanitizePositiveInt(Number.NaN), null);
+  assert.equal(sanitizePositiveInt(Infinity), null);
+  assert.equal(sanitizePositiveInt(true), null);
+  assert.equal(sanitizePositiveInt(null), null);
+  assert.equal(sanitizePositiveInt('<svg onload=alert(1)>'), null);
+  assert.equal(formatMailboxLanes(4), '4');
+  assert.equal(formatMailboxLanes(0), '—');
+  assert.equal(formatMailboxLanes(null), '—');
+
+  // Default panel state, snapshot, DOM, summary, and export
+  const { controller } = createPanel();
+  const state = controller.getState();
+  const snapshot = controller.getSnapshot();
+  const root = state.root;
+
+  assert.deepEqual(snapshot, state);
+  assert.equal(state.fps30ComplianceRate, null);
+  assert.equal(state.frameJitterMs, null);
+  assert.equal(state.jsHeapUsedMb, null);
+  assert.equal(state.vramBudgetUtilization, null);
+  assert.equal(state.bindGroupHitRate, null);
+  assert.equal(state.mailboxLanes, null);
+  assert.deepEqual(state.pacingStats, {
+    fps30ComplianceRate: null,
+    frameJitterMs: null,
+  });
+  assert.deepEqual(state.memoryStats, {
+    jsHeapUsedMb: null,
+    vramBudgetUtilization: null,
+    bindGroupHitRate: null,
+  });
+
+  const section = root.querySelector('.pg6-gpu-panel__pacing-memory');
+  assert.equal(section.getAttribute('role'), 'group');
+  assert.equal(section.getAttribute('aria-label'), '30 FPS Pacing, Memory & I/O Telemetry');
+  assert.equal(root.querySelector('.pg6-gpu-panel__fps30-compliance-rate').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__frame-jitter-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__js-heap-used-mb').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__vram-budget-utilization').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-hit-rate').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__mailbox-lanes').textContent, '—');
+
+  // Missing/null optional W292 metrics are gracefully omitted from formatSummary()
+  const summary = controller.formatSummary();
+  assert.equal(summary, 'NOT_STARTED (0%) | frames=0 | packHit=0.0%');
+  assert.equal(formatSummary(snapshot), summary);
+  assert.doesNotMatch(summary, /30fps=|jitter=|jsHeap=|vram=|bgHit=|mailboxLanes=/);
+
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.deepEqual(exported.pacing, {
+    fps30ComplianceRate: null,
+    frameJitterMs: null,
+  });
+  assert.deepEqual(exported.memory, {
+    jsHeapUsedMb: null,
+    vramBudgetUtilization: null,
+    bindGroupHitRate: null,
+  });
+  assert.equal(exported.mailboxLanes, null);
+
+  controller.destroy();
+});
+
+test('W292 update() normalizes, clamps, and renders 30 FPS pacing, memory/VRAM, bind-group hit-rate, and mailboxLanes across DOM, getSnapshot(), formatSummary(), and reset()', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  // 1. Top-level fields with clamping and integer flooring
+  controller.update({
+    bootSummary: { stage: 'FIRST_VISIBLE_FRAME', progressPct: 100, readyForSplash: true },
+    frameStats: { framesPresented: 120, droppedFrames: 1 },
+    fallbackStats: { packHits: 95, fallbackHits: 5, builtinHits: 0 },
+    fps30ComplianceRate: 1.35, // clamps to 1
+    frameJitterMs: 1.426,
+    jsHeapUsedMb: 312.74,
+    vramBudgetUtilization: -0.2, // clamps to 0
+    bindGroupHitRate: 0.9125,
+    mailboxLanes: 4.8, // floors to 4
+  });
+
+  const s1 = controller.getSnapshot();
+  assert.equal(s1.fps30ComplianceRate, 1);
+  assert.equal(s1.frameJitterMs, 1.426);
+  assert.equal(s1.jsHeapUsedMb, 312.74);
+  assert.equal(s1.vramBudgetUtilization, 0);
+  assert.equal(s1.bindGroupHitRate, 0.9125);
+  assert.equal(s1.mailboxLanes, 4);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__fps30-compliance-rate').textContent, '100.0%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__frame-jitter-ms').textContent, '1.43 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__js-heap-used-mb').textContent, '312.7 MB');
+  assert.equal(root.querySelector('.pg6-gpu-panel__vram-budget-utilization').textContent, '0.0%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-hit-rate').textContent, '91.3%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__mailbox-lanes').textContent, '4');
+
+  const summary1 = controller.formatSummary();
+  assert.equal(
+    summary1,
+    'FIRST_VISIBLE_FRAME (100%) | frames=120 | packHit=95.0% | 30fps=100.0% | jitter=1.43 ms | jsHeap=312.7 MB | vram=0.0% | bgHit=91.3% | mailboxLanes=4'
+  );
+  assert.equal(formatSummary(s1), summary1);
+
+  // 2. Partial unrelated bootSummary with null optional fields must NOT clobber existing values
+  controller.update({
+    bootSummary: {
+      stage: 'FIRST_VISIBLE_FRAME',
+      fps30ComplianceRate: null,
+      frameJitterMs: null,
+      jsHeapUsedMb: null,
+      vramBudgetUtilization: null,
+      bindGroupHitRate: null,
+      mailboxLanes: null,
+    },
+  });
+  const sPreserved = controller.getSnapshot();
+  assert.equal(sPreserved.fps30ComplianceRate, 1);
+  assert.equal(sPreserved.frameJitterMs, 1.426);
+  assert.equal(sPreserved.jsHeapUsedMb, 312.74);
+  assert.equal(sPreserved.vramBudgetUtilization, 0);
+  assert.equal(sPreserved.bindGroupHitRate, 0.9125);
+  assert.equal(sPreserved.mailboxLanes, 4);
+
+  // 3. Nested pacingStats, memoryStats, resourceTableStats, and ioStats.mailboxLanes
+  controller.update({
+    pacingStats: { fps30ComplianceRate: 0.967, frameJitterMs: 0.85 },
+    memoryStats: { jsHeapUsedMb: 420.5, vramBudgetUtilization: 0.625 },
+    resourceTableStats: { bindGroupHitRate: 0.982 },
+    ioStats: { pgimFullFetches: 2, slabCacheHits: 50, slabCacheMisses: 1, syncFastPathHits: 49, mailboxLanes: 8 },
+  });
+
+  const s2 = controller.getSnapshot();
+  assert.equal(s2.fps30ComplianceRate, 0.967);
+  assert.equal(s2.frameJitterMs, 0.85);
+  assert.equal(s2.jsHeapUsedMb, 420.5);
+  assert.equal(s2.vramBudgetUtilization, 0.625);
+  assert.equal(s2.bindGroupHitRate, 0.982);
+  assert.equal(s2.mailboxLanes, 8);
+  // Existing ioStats shape remains strictly backwards-compatible
+  assert.deepEqual(s2.ioStats, {
+    pgimFullFetches: 2,
+    slabCacheHits: 50,
+    slabCacheMisses: 1,
+    syncFastPathHits: 49,
+  });
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__fps30-compliance-rate').textContent, '96.7%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__frame-jitter-ms').textContent, '0.85 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__js-heap-used-mb').textContent, '420.5 MB');
+  assert.equal(root.querySelector('.pg6-gpu-panel__vram-budget-utilization').textContent, '62.5%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-hit-rate').textContent, '98.2%');
+  assert.equal(root.querySelector('.pg6-gpu-panel__mailbox-lanes').textContent, '8');
+
+  // Verify JSON export contains sanitized W292 sections
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.deepEqual(exported.pacing, {
+    fps30ComplianceRate: 0.967,
+    frameJitterMs: 0.85,
+  });
+  assert.deepEqual(exported.memory, {
+    jsHeapUsedMb: 420.5,
+    vramBudgetUtilization: 0.625,
+    bindGroupHitRate: 0.982,
+  });
+  assert.equal(exported.mailboxLanes, 8);
+
+  // 4. Explicit null omission removes metrics cleanly from DOM and formatSummary()
+  controller.update({
+    fps30ComplianceRate: null,
+    jsHeapUsedMb: null,
+    mailboxLanes: null,
+  });
+  const s3 = controller.getSnapshot();
+  assert.equal(s3.fps30ComplianceRate, null);
+  assert.equal(s3.frameJitterMs, 0.85);
+  assert.equal(s3.jsHeapUsedMb, null);
+  assert.equal(s3.vramBudgetUtilization, 0.625);
+  assert.equal(s3.bindGroupHitRate, 0.982);
+  assert.equal(s3.mailboxLanes, null);
+  assert.equal(root.querySelector('.pg6-gpu-panel__fps30-compliance-rate').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__js-heap-used-mb').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__mailbox-lanes').textContent, '—');
+
+  const summary3 = controller.formatSummary();
+  assert.doesNotMatch(summary3, /30fps=|jsHeap=|mailboxLanes=/);
+  assert.match(summary3, /jitter=0\.85 ms/);
+  assert.match(summary3, /vram=62\.5%/);
+  assert.match(summary3, /bgHit=98\.2%/);
+
+  // 5. reset() clears all W292 metrics back to defaults
+  const afterReset = controller.reset();
+  assert.equal(afterReset.fps30ComplianceRate, null);
+  assert.equal(afterReset.frameJitterMs, null);
+  assert.equal(afterReset.jsHeapUsedMb, null);
+  assert.equal(afterReset.vramBudgetUtilization, null);
+  assert.equal(afterReset.bindGroupHitRate, null);
+  assert.equal(afterReset.mailboxLanes, null);
+  assert.equal(root.querySelector('.pg6-gpu-panel__frame-jitter-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__vram-budget-utilization').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-hit-rate').textContent, '—');
+  assert.equal(controller.formatSummary(), 'NOT_STARTED (0%) | frames=0 | packHit=0.0%');
+
+  controller.destroy();
+});
+
+test('W292 rejects XSS payloads and host paths across DOM, getSnapshot(), formatSummary(), and export', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  controller.update({
+    bootSummary: { stage: '<script>alert(1)</script>' },
+    gpuAdapter: '<img src=x onerror=alert(1)>',
+    fps30ComplianceRate: '<script>alert("fps")</script>',
+    frameJitterMs: 'C:\\Users\\alice\\GTA6\\jitter.bin',
+    jsHeapUsedMb: '/home/alice/secret/heap.dump',
+    vramBudgetUtilization: '"><svg onload=alert(1)>',
+    bindGroupHitRate: 'file:///C:/Users/alice/bind_groups.bin',
+    mailboxLanes: '0; ../../etc/passwd',
+    pacingStats: {
+      hostPath: 'D:\\Games\\Secret\\pacing.log',
+      rawBytes: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    },
+    memoryStats: {
+      localFile: '/Users/alice/Library/Application Support/vram.bin',
+      payload: '<iframe src="javascript:alert(1)"></iframe>',
+    },
+  });
+
+  const state = controller.getSnapshot();
+  assert.equal(state.boot.stage, 'UNKNOWN');
+  assert.equal(state.fps30ComplianceRate, null);
+  assert.equal(state.frameJitterMs, null);
+  assert.equal(state.jsHeapUsedMb, null);
+  assert.equal(state.vramBudgetUtilization, null);
+  assert.equal(state.bindGroupHitRate, null);
+  assert.equal(state.mailboxLanes, null);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__fps30-compliance-rate').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__frame-jitter-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__js-heap-used-mb').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__vram-budget-utilization').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-hit-rate').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__mailbox-lanes').textContent, '—');
+
+  // Ensure zero unescaped HTML tags or host paths leak into formatSummary() or JSON export
+  const summary = controller.formatSummary();
+  assert.doesNotMatch(summary, /[<>]|Users|alice|home|secret|file:\/\/|passwd|Games|Library/i);
+  assert.doesNotMatch(summary, /30fps=|jitter=|jsHeap=|vram=|bgHit=|mailboxLanes=/);
+
+  const exportedJson = controller.exportMissingShadersJson();
+  assert.doesNotMatch(
+    exportedJson,
+    /[<>]|Users|alice|home|secret|file:\/\/|passwd|Games|Library|hostPath|rawBytes|localFile|javascript:/i
+  );
+
+  // Also test zero/negative values for mailboxLanes & non-negative scalars
+  controller.update({
+    fps30ComplianceRate: Number.NaN,
+    frameJitterMs: -5,
+    jsHeapUsedMb: -128,
+    vramBudgetUtilization: Infinity,
+    bindGroupHitRate: -Infinity,
+    mailboxLanes: 0,
+  });
+  const s2 = controller.getSnapshot();
+  assert.equal(s2.fps30ComplianceRate, null);
+  assert.equal(s2.frameJitterMs, null);
+  assert.equal(s2.jsHeapUsedMb, null);
+  assert.equal(s2.vramBudgetUtilization, null);
+  assert.equal(s2.bindGroupHitRate, null);
+  assert.equal(s2.mailboxLanes, null);
+
+  controller.destroy();
+});
+
+test('W292 dirty-checked DOM updates skip redundant writes for pacing, memory/VRAM, and mailboxLanes', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  const snapshot = {
+    fps30ComplianceRate: 1.0,
+    frameJitterMs: 1.25,
+    jsHeapUsedMb: 250.4,
+    vramBudgetUtilization: 0.5,
+    bindGroupHitRate: 0.875,
+    mailboxLanes: 4,
+  };
+  controller.update(snapshot);
+
+  const complianceEl = root.querySelector('.pg6-gpu-panel__fps30-compliance-rate');
+  const jitterEl = root.querySelector('.pg6-gpu-panel__frame-jitter-ms');
+  const heapEl = root.querySelector('.pg6-gpu-panel__js-heap-used-mb');
+  const vramEl = root.querySelector('.pg6-gpu-panel__vram-budget-utilization');
+  const bgHitEl = root.querySelector('.pg6-gpu-panel__bind-group-hit-rate');
+  const lanesEl = root.querySelector('.pg6-gpu-panel__mailbox-lanes');
+
+  const before = {
+    compliance: complianceEl.textContentWrites,
+    jitter: jitterEl.textContentWrites,
+    heap: heapEl.textContentWrites,
+    vram: vramEl.textContentWrites,
+    bgHit: bgHitEl.textContentWrites,
+    lanes: lanesEl.textContentWrites,
+  };
+
+  // Identical and clamp/floor-equivalent updates must produce zero DOM writes
+  controller.update(snapshot);
+  controller.update({
+    ...snapshot,
+    fps30ComplianceRate: 1.5, // still clamps to 1 -> '100.0%'
+    mailboxLanes: 4.9, // still floors to 4 -> '4'
+  });
+  assert.equal(complianceEl.textContentWrites, before.compliance);
+  assert.equal(jitterEl.textContentWrites, before.jitter);
+  assert.equal(heapEl.textContentWrites, before.heap);
+  assert.equal(vramEl.textContentWrites, before.vram);
+  assert.equal(bgHitEl.textContentWrites, before.bgHit);
+  assert.equal(lanesEl.textContentWrites, before.lanes);
+
+  // Updating a single metric touches ONLY that DOM node
+  controller.update({ mailboxLanes: 8 });
+  assert.equal(lanesEl.textContent, '8');
+  assert.equal(lanesEl.textContentWrites, before.lanes + 1);
+  assert.equal(complianceEl.textContentWrites, before.compliance);
+  assert.equal(jitterEl.textContentWrites, before.jitter);
+  assert.equal(heapEl.textContentWrites, before.heap);
+  assert.equal(vramEl.textContentWrites, before.vram);
+  assert.equal(bgHitEl.textContentWrites, before.bgHit);
 
   controller.destroy();
 });
