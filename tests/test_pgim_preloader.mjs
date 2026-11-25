@@ -1507,3 +1507,462 @@ test('preloadBootBundle integrates multi-module programManifestUrl alongside sha
   assert.equal(events[events.length - 1].moduleCount, 2);
   assert.equal(events[events.length - 1].loadedBytes, vcruntime.byteLength + mainImg.byteLength);
 });
+
+// ---------------------------------------------------------------------------------------------
+// W147: Throughput telemetry, retry/abort counters, and bounded exponential chunk retry backoff.
+// ---------------------------------------------------------------------------------------------
+
+test('W147 constructor validates retryDelayMs, maxRetryDelayMs, sleepFn, nowFn and starts with idle zero stats', () => {
+  const fetchImpl = async () => new Response(null);
+  assert.throws(() => new PgimPreloader({ fetchImpl, maxRetries: -1 }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, maxRetries: 1.5 }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, retryDelayMs: -1 }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, retryDelayMs: Number.NaN }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, maxRetryDelayMs: -5 }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, maxRetryDelayMs: Number.POSITIVE_INFINITY }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, sleepFn: 'not-a-fn' }), TypeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, nowFn: 123 }), TypeError);
+
+  const customSleep = async () => {};
+  const customNow = () => 42;
+  const p = new PgimPreloader({
+    fetchImpl,
+    maxRetries: 2,
+    retryDelayMs: 15,
+    baseRetryDelayMs: 99,
+    maxRetryDelayMs: 40,
+    sleepFn: customSleep,
+    nowFn: customNow,
+  });
+  assert.equal(p.maxRetries, 2);
+  assert.equal(p.retryDelayMs, 15);
+  assert.equal(p.baseRetryDelayMs, 15);
+  assert.equal(p.maxRetryDelayMs, 40);
+  assert.equal(p.sleepFn, customSleep);
+  assert.equal(p.sleep, customSleep);
+  assert.equal(p.nowFn, customNow);
+
+  const initial = p.getStats();
+  assert.deepEqual(initial, {
+    state: 'idle',
+    bytesLoaded: 0,
+    totalBytes: 0,
+    requests: 0,
+    durationMs: 0,
+    bytesPerSec: 0,
+    peakBytesPerSec: 0,
+    retryCount: 0,
+    abortedCount: 0,
+  });
+  assert.deepEqual(p.getSnapshot(), initial);
+});
+
+test('W147 tracks finite bytesPerSec and peakBytesPerSec with deterministic nowFn across varying chunk speeds', async () => {
+  const image = buildLargePgim();
+  const chunkSize = 4096;
+  const server = createServer({ '/data/game.pgim': image });
+  let clockMs = 1000;
+  let getIdx = 0;
+  // Chunk 0: 100ms, Chunk 1: 25ms (fast burst -> peak), remaining chunks: 200ms each (slower tail)
+  const chunkDurations = [100, 25];
+  const fetchImpl = async (url, init) => {
+    const res = await server.fetchImpl(url, init);
+    if (init.method === 'GET') {
+      const step = getIdx < chunkDurations.length ? chunkDurations[getIdx] : 200;
+      getIdx += 1;
+      clockMs += step;
+    }
+    return res;
+  };
+
+  const preloader = new PgimPreloader({
+    fetchImpl,
+    chunkSize,
+    concurrency: 1,
+    nowFn: () => clockMs,
+  });
+
+  const result = await preloader.preloadGuestImage('/data/game.pgim');
+  const stats = preloader.getStats();
+
+  assert.deepEqual(preloader.getSnapshot(), stats);
+  assert.equal(stats.state, 'complete');
+  assert.equal(stats.bytesLoaded, image.byteLength);
+  assert.equal(stats.totalBytes, image.byteLength);
+  assert.equal(stats.retryCount, 0);
+  assert.equal(stats.abortedCount, 0);
+  assert.ok(Number.isFinite(stats.durationMs) && stats.durationMs > 0);
+  assert.ok(Number.isFinite(stats.bytesPerSec) && stats.bytesPerSec > 0);
+  assert.ok(Number.isFinite(stats.peakBytesPerSec) && stats.peakBytesPerSec > stats.bytesPerSec);
+  // Burst chunk was 4096 bytes in 25ms = 163840 bytes/sec.
+  assert.equal(Math.round(stats.peakBytesPerSec), Math.round((chunkSize * 1000) / 25));
+  assert.equal(result.bytesPerSec, stats.bytesPerSec);
+  assert.equal(result.peakBytesPerSec, stats.peakBytesPerSec);
+  assert.equal(result.retryCount, 0);
+  assert.equal(result.abortedCount, 0);
+});
+
+test('W147 sanitizes non-finite, zero-elapsed, and backwards nowFn clocks to finite >= 0 telemetry', async () => {
+  const image = buildPgim();
+  const server = createServer({ 'z.pgim': image });
+
+  for (const makeNowFn of [
+    () => () => 500, // zero elapsed duration
+    () => () => Number.NaN, // NaN clock
+    () => () => Number.POSITIVE_INFINITY, // Infinity clock
+    () => {
+      let t = 2000;
+      return () => {
+        t -= 50; // backwards clock
+        return t;
+      };
+    },
+  ]) {
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, nowFn: makeNowFn() });
+    const res = await preloader.preloadGuestImage('z.pgim');
+    const stats = preloader.getStats();
+    assert.equal(stats.state, 'complete');
+    assert.equal(stats.durationMs, 0);
+    assert.equal(stats.bytesPerSec, 0);
+    assert.equal(stats.peakBytesPerSec, 0);
+    assert.equal(res.bytesPerSec, 0);
+    assert.equal(res.peakBytesPerSec, 0);
+    assert.ok(Number.isFinite(stats.bytesPerSec));
+    assert.ok(Number.isFinite(stats.peakBytesPerSec));
+  }
+});
+
+test('W147 retries transient HTTP 5xx, 429, and network chunk failures with bounded exponential backoff', async () => {
+  const image = buildLargePgim();
+  const server = createServer({ 'img.pgim': image });
+  const targetRange = 'bytes=4096-8191';
+  const failures = [502, 429, 503, new TypeError('connection reset')];
+  const sleeps = [];
+  let clockMs = 100;
+
+  const fetchImpl = async (url, init) => {
+    if (init.method === 'GET' && init.headers?.Range === targetRange && failures.length > 0) {
+      const next = failures.shift();
+      if (typeof next === 'number') return new Response(null, { status: next });
+      throw next;
+    }
+    const res = await server.fetchImpl(url, init);
+    if (init.method === 'GET') clockMs += 10;
+    return res;
+  };
+
+  const preloader = new PgimPreloader({
+    fetchImpl,
+    chunkSize: 4096,
+    concurrency: 2,
+    maxRetries: 4,
+    retryDelayMs: 25,
+    maxRetryDelayMs: 60,
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+      clockMs += ms;
+    },
+    nowFn: () => clockMs,
+  });
+
+  const result = await preloader.preloadGuestImage('img.pgim');
+  assert.deepEqual(result.bytes, image);
+  // Exponential backoff: 25, 50, capped at 60, capped at 60.
+  assert.deepEqual(sleeps, [25, 50, 60, 60]);
+  const stats = preloader.getStats();
+  assert.equal(stats.state, 'complete');
+  assert.equal(stats.retryCount, 4);
+  assert.equal(stats.abortedCount, 0);
+  assert.equal(result.retryCount, 4);
+  assert.equal(result.abortedCount, 0);
+  assert.ok(stats.bytesPerSec > 0 && Number.isFinite(stats.bytesPerSec));
+  assert.ok(stats.peakBytesPerSec >= stats.bytesPerSec);
+});
+
+test('W147 reports retry exhaustion cleanly for 5xx, 429, and network errors', async () => {
+  const image = buildLargePgim();
+  const server = createServer({ 'img.pgim': image });
+  const targetRange = 'bytes=8192-12287';
+
+  // Exhausted 503 on a chunk.
+  {
+    const sleeps = [];
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === targetRange) {
+        return new Response(null, { status: 503 });
+      }
+      return server.fetchImpl(url, init);
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 2,
+      retryDelayMs: 10,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(
+      preloader.preloadGuestImage('img.pgim'),
+      (err) => err instanceof PgimPreloadError && err.code === 'HTTP_ERROR' && err.status === 503
+    );
+    assert.deepEqual(sleeps, [10, 20]);
+    const stats = preloader.getStats();
+    assert.equal(stats.state, 'error');
+    assert.equal(stats.retryCount, 2);
+    assert.equal(stats.abortedCount, 0);
+  }
+
+  // Exhausted 429 on a chunk.
+  {
+    const sleeps = [];
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === targetRange) {
+        return new Response(null, { status: 429 });
+      }
+      return server.fetchImpl(url, init);
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 2,
+      retryDelayMs: 12,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(
+      preloader.preloadGuestImage('img.pgim'),
+      (err) => err instanceof PgimPreloadError && err.code === 'HTTP_ERROR' && err.status === 429
+    );
+    assert.deepEqual(sleeps, [12, 24]);
+    assert.equal(preloader.getStats().retryCount, 2);
+    assert.equal(preloader.getStats().abortedCount, 0);
+  }
+
+  // Exhausted transient network error.
+  {
+    const sleeps = [];
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === targetRange) {
+        throw new TypeError('socket closed');
+      }
+      return server.fetchImpl(url, init);
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 2,
+      retryDelayMs: 8,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(preloader.preloadGuestImage('img.pgim'), expectCode('NETWORK_ERROR'));
+    assert.deepEqual(sleeps, [8, 16]);
+    assert.equal(preloader.getStats().retryCount, 2);
+    assert.equal(preloader.getStats().abortedCount, 0);
+  }
+});
+
+test('W147 never retries non-retryable 404, 400, or AbortError failures', async () => {
+  const image = buildLargePgim();
+  const server = createServer({ 'img.pgim': image });
+
+  // 404 on missing image -> 0 retries, 0 sleeps.
+  {
+    const sleeps = [];
+    const preloader = new PgimPreloader({
+      fetchImpl: server.fetchImpl,
+      maxRetries: 3,
+      retryDelayMs: 10,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(preloader.preloadGuestImage('missing.pgim'), (e) => e.code === 'NOT_FOUND' && e.status === 404);
+    assert.deepEqual(sleeps, []);
+    assert.equal(preloader.getStats().retryCount, 0);
+    assert.equal(preloader.getStats().abortedCount, 0);
+    assert.equal(preloader.getStats().state, 'error');
+  }
+
+  // 400 on a chunk -> 0 retries, 0 sleeps.
+  {
+    const sleeps = [];
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === 'bytes=4096-8191') {
+        return new Response(null, { status: 400 });
+      }
+      return server.fetchImpl(url, init);
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 3,
+      retryDelayMs: 10,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(
+      preloader.preloadGuestImage('img.pgim'),
+      (e) => e instanceof PgimPreloadError && e.code === 'HTTP_ERROR' && e.status === 400
+    );
+    assert.deepEqual(sleeps, []);
+    assert.equal(preloader.getStats().retryCount, 0);
+    assert.equal(preloader.getStats().abortedCount, 0);
+  }
+
+  // Direct AbortError thrown by fetchImpl -> never retried, increments abortedCount.
+  {
+    const sleeps = [];
+    let getCalls = 0;
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'HEAD') return server.fetchImpl(url, init);
+      getCalls += 1;
+      throw new DOMException('fetch aborted internally', 'AbortError');
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      maxRetries: 3,
+      retryDelayMs: 10,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    await assert.rejects(preloader.preloadGuestImage('img.pgim'), (e) => e.name === 'AbortError');
+    assert.equal(getCalls, 1);
+    assert.deepEqual(sleeps, []);
+    assert.equal(preloader.getStats().retryCount, 0);
+    assert.equal(preloader.getStats().abortedCount, 1);
+    assert.equal(preloader.getStats().state, 'aborted');
+  }
+});
+
+test('W147 honors AbortSignal immediately during retry backoff and tracks abortedCount + clean reset', async () => {
+  const image = buildLargePgim();
+  const server = createServer({ 'img.pgim': image });
+
+  // Pre-aborted signal increments abortedCount without touching network or sleepFn.
+  {
+    const sleeps = [];
+    let fetchCalls = 0;
+    const preloader = new PgimPreloader({
+      fetchImpl: async (...args) => {
+        fetchCalls += 1;
+        return server.fetchImpl(...args);
+      },
+      maxRetries: 3,
+      retryDelayMs: 10,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      preloader.preloadGuestImage('img.pgim', { signal: controller.signal }),
+      (e) => e.name === 'AbortError'
+    );
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(sleeps, []);
+    assert.equal(preloader.getStats().abortedCount, 1);
+    assert.equal(preloader.getStats().retryCount, 0);
+    assert.equal(preloader.getStats().state, 'aborted');
+  }
+
+  // Abort during retry backoff cancels immediately even if sleepFn never resolves on its own.
+  {
+    const controller = new AbortController();
+    let chunkAttempts = 0;
+    let sleepStartedResolve;
+    const sleepStarted = new Promise((r) => {
+      sleepStartedResolve = r;
+    });
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === 'bytes=4096-8191') {
+        chunkAttempts += 1;
+        return new Response(null, { status: 503 });
+      }
+      return server.fetchImpl(url, init);
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 5,
+      retryDelayMs: 60000,
+      sleepFn: () => {
+        sleepStartedResolve();
+        return new Promise(() => {}); // hangs forever unless aborted
+      },
+    });
+    const pending = preloader.preloadGuestImage('img.pgim', { signal: controller.signal });
+    await sleepStarted;
+    controller.abort();
+    await assert.rejects(pending, (e) => e.name === 'AbortError');
+    assert.equal(chunkAttempts, 1, 'must not issue a second attempt after abort during backoff');
+    assert.equal(preloader.getStats().abortedCount, 1);
+    assert.equal(preloader.getStats().retryCount, 1);
+    assert.equal(preloader.getStats().state, 'aborted');
+
+    // Explicit resetStats() / reset() clears all telemetry counters cleanly.
+    const cleared = preloader.resetStats();
+    assert.deepEqual(cleared, {
+      state: 'idle',
+      bytesLoaded: 0,
+      totalBytes: 0,
+      requests: 0,
+      durationMs: 0,
+      bytesPerSec: 0,
+      peakBytesPerSec: 0,
+      retryCount: 0,
+      abortedCount: 0,
+    });
+    assert.deepEqual(preloader.getStats(), cleared);
+  }
+
+  // Starting a new preload automatically resets telemetry from the previous run.
+  {
+    let clockMs = 0;
+    let failOnce = true;
+    const fetchImpl = async (url, init) => {
+      if (init.method === 'GET' && init.headers?.Range === 'bytes=4096-8191' && failOnce) {
+        failOnce = false;
+        return new Response(null, { status: 503 });
+      }
+      const res = await server.fetchImpl(url, init);
+      if (init.method === 'GET') clockMs += 20;
+      return res;
+    };
+    const preloader = new PgimPreloader({
+      fetchImpl,
+      chunkSize: 4096,
+      concurrency: 1,
+      maxRetries: 2,
+      retryDelayMs: 5,
+      sleepFn: async (ms) => {
+        clockMs += ms;
+      },
+      nowFn: () => clockMs,
+    });
+
+    // Run 1: triggers 1 retry.
+    await preloader.preloadGuestImage('img.pgim');
+    assert.equal(preloader.getStats().retryCount, 1);
+    assert.equal(preloader.getStats().abortedCount, 0);
+
+    // Run 2: aborts immediately -> resets retryCount to 0, sets abortedCount to 1.
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(preloader.preloadGuestImage('img.pgim', { signal: aborted.signal }));
+    assert.equal(preloader.getStats().retryCount, 0);
+    assert.equal(preloader.getStats().abortedCount, 1);
+
+    // Run 3: succeeds cleanly -> resets abortedCount to 0, retryCount to 0, fresh throughput.
+    await preloader.preloadGuestImage('img.pgim');
+    const finalStats = preloader.getStats();
+    assert.equal(finalStats.state, 'complete');
+    assert.equal(finalStats.retryCount, 0);
+    assert.equal(finalStats.abortedCount, 0);
+    assert.ok(finalStats.bytesPerSec > 0);
+    assert.ok(finalStats.peakBytesPerSec >= finalStats.bytesPerSec);
+
+    // reset() alias also works.
+    preloader.reset();
+    assert.equal(preloader.getStats().state, 'idle');
+    assert.equal(preloader.getStats().bytesPerSec, 0);
+    assert.equal(preloader.getStats().peakBytesPerSec, 0);
+  }
+});
