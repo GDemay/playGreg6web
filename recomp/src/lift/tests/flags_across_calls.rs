@@ -253,3 +253,34 @@ fn flags_stay_exact_across_calls() {
         assert_eq!(o[4].regs[RAX], x ^ (x >> 3), "nested ({c:#x}, {d:#x})");
     }
 }
+
+#[test]
+fn shifts_skip_flags_a_later_instruction_overwrites() {
+    // xor rewrites CF, OF, ZF, SF and PF; the shift flags are dead (AF stays unchanged).
+    let program = Program::new().asm(CALLER, |a| {
+        a.shr(rax, 3)?;
+        a.xor(rax, rcx)?;
+        a.ret()
+    });
+    let functions = program.discover();
+    let ir = crate::lift::lift_function(&functions[&CALLER])
+        .expect("lifts")
+        .ir;
+    assert_eq!(ir.matches("ctpop").count(), 1, "only the xor PF:\n{ir}");
+    assert_eq!(ir.matches("lshr i64").count(), 1, "only the result:\n{ir}");
+}
+
+#[test]
+fn constant_flags_are_stored_without_a_zext() {
+    // sar by one leaves OF = false; the sync-out stores the constant byte directly.
+    let program = Program::new().asm(CALLER, |a| {
+        a.sar(rax, 1)?;
+        a.ret()
+    });
+    let functions = program.discover();
+    let ir = crate::lift::lift_function(&functions[&CALLER])
+        .expect("lifts")
+        .ir;
+    assert!(!ir.contains("zext i1 false"), "{ir}");
+    assert!(ir.contains("store i8 0,"), "{ir}");
+}

@@ -28,6 +28,8 @@ pub(super) mod simd;
 mod atomics;
 #[path = "bit_ops.rs"]
 mod bit_ops;
+#[path = "flag_liveness.rs"]
+pub(super) mod flag_liveness;
 #[path = "integer.rs"]
 mod integer;
 #[path = "memory_access.rs"]
@@ -36,8 +38,6 @@ mod memory_access;
 mod string_ops;
 #[path = "unwind.rs"]
 mod unwind;
-#[path = "flag_liveness.rs"]
-pub(super) mod flag_liveness;
 
 use flag_liveness::{ALL_FLAGS, ALL_STATE, FlagMask, FlagSummaries, OTHER_STATE, StateMask};
 
@@ -262,10 +262,8 @@ pub(super) fn lift(
             return_blocks += 1;
         }
         for ins in &block.instructions {
-            let mut touched = ins.rflags_read()
-                | ins.rflags_written()
-                | ins.rflags_cleared()
-                | ins.rflags_set();
+            let mut touched =
+                ins.rflags_read() | ins.rflags_written() | ins.rflags_cleared() | ins.rflags_set();
             match ins.mnemonic() {
                 Mnemonic::Rol | Mnemonic::Ror | Mnemonic::Rcl | Mnemonic::Rcr => {
                     touched |= RflagsBits::CF | RflagsBits::OF;
@@ -526,16 +524,15 @@ impl FunctionLifter<'_> {
     fn lift_blocks(&mut self) -> Result<(), LiftError> {
         let func = self.func;
         // Loop heads: targets of a backward (or self) edge in guest address order.
-        let loop_heads: BTreeSet<u64> = func
-            .blocks
-            .iter()
-            .flat_map(|(&start, block)| {
-                block
-                    .successors
-                    .iter()
-                    .filter_map(move |edge| edge.intra_target().filter(|&target| target <= start))
-            })
-            .collect();
+        let loop_heads: BTreeSet<u64> =
+            func.blocks
+                .iter()
+                .flat_map(|(&start, block)| {
+                    block.successors.iter().filter_map(move |edge| {
+                        edge.intra_target().filter(|&target| target <= start)
+                    })
+                })
+                .collect();
         // Incoming edges per block: CFG edges, the function entry and resume-protocol re-entry.
         let mut preds: BTreeMap<u64, usize> = BTreeMap::new();
         for block in func.blocks.values() {
@@ -816,12 +813,7 @@ impl FunctionLifter<'_> {
         let default_kind = kinds[0];
         let mut arms = String::new();
         for &kind in &kinds[1..] {
-            let _ = write!(
-                arms,
-                " i8 {}, label %cold_trap_{}",
-                kind.tag(),
-                kind.tag()
-            );
+            let _ = write!(arms, " i8 {}, label %cold_trap_{}", kind.tag(), kind.tag());
         }
         self.emit(&format!(
             "switch i8 {kind_val}, label %cold_trap_{} [{arms} ]",
@@ -873,8 +865,11 @@ impl FunctionLifter<'_> {
             instruction: text,
             reason,
         });
-        self.cold_traps
-            .push((ColdTrapKind::Unimplemented, ins.ip(), self.current_block.clone()));
+        self.cold_traps.push((
+            ColdTrapKind::Unimplemented,
+            ins.ip(),
+            self.current_block.clone(),
+        ));
         self.emit("br label %cold_trap");
     }
 
@@ -889,8 +884,7 @@ impl FunctionLifter<'_> {
     /// and continues lifting in a fresh continuation block.
     pub(super) fn cold_trap_branch(&mut self, fault: &str, kind: ColdTrapKind, va: u64) {
         let ok = self.new_label("cont");
-        self.cold_traps
-            .push((kind, va, self.current_block.clone()));
+        self.cold_traps.push((kind, va, self.current_block.clone()));
         self.emit(&format!(
             "br i1 {fault}, label %cold_trap, label %{ok}, {}",
             memory_access::UNLIKELY
@@ -1031,7 +1025,11 @@ impl FunctionLifter<'_> {
         for flag in FLAGS {
             if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
                 let bit = self.load_flag(flag);
-                let byte = self.val(&format!("zext i1 {bit} to i8"));
+                let byte = match bit.as_str() {
+                    "true" => "1".to_string(),
+                    "false" => "0".to_string(),
+                    _ => self.val(&format!("zext i1 {bit} to i8")),
+                };
                 let ptr = self.state_flag_ptr(flag);
                 self.emit(&format!("store i8 {byte}, ptr {ptr}"));
             }
@@ -1835,7 +1833,9 @@ impl FunctionLifter<'_> {
             return self.write_op(ins, 0, &a, bits);
         }
 
-        let (r, cf, of) = match kind {
+        let want_cf = self.flag_live(Flag::Cf);
+        let want_of = self.flag_live(Flag::Of);
+        let (r, cf, of): (String, Option<String>, Option<String>) = match kind {
             Shift::Rol | Shift::Ror => {
                 // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
                 let amount = if bits == 64 || imm_count.is_some() {
@@ -1852,86 +1852,114 @@ impl FunctionLifter<'_> {
                 let r = self.val(&format!(
                     "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {amount})"
                 ));
-                let msb = self.msb(&r, bits);
                 if kind == Shift::Rol {
-                    let cf = self.val(&format!("trunc {t} {r} to i1"));
-                    let of = self.val(&format!("xor i1 {msb}, {cf}"));
-                    (r, cf, of)
+                    let cf =
+                        (want_cf || want_of).then(|| self.val(&format!("trunc {t} {r} to i1")));
+                    let of = if want_of {
+                        let msb = self.msb(&r, bits);
+                        Some(self.val(&format!("xor i1 {msb}, {}", cf.as_ref().unwrap())))
+                    } else {
+                        None
+                    };
+                    (r, cf.filter(|_| want_cf), of)
                 } else {
-                    let below = self.val(&format!("lshr {t} {r}, {}", bits - 2));
-                    let below = self.val(&format!("trunc {t} {below} to i1"));
-                    let of = self.val(&format!("xor i1 {msb}, {below}"));
-                    (r, msb, of)
+                    let cf = want_cf.then(|| self.msb(&r, bits));
+                    let of = if want_of {
+                        let msb = self.msb(&r, bits);
+                        let below = self.val(&format!("lshr {t} {r}, {}", bits - 2));
+                        let below = self.val(&format!("trunc {t} {below} to i1"));
+                        Some(self.val(&format!("xor i1 {msb}, {below}")))
+                    } else {
+                        None
+                    };
+                    (r, cf, of)
                 }
             }
             _ => {
                 // count - 1 (masked so a zero count never produces a poison shift amount).
-                let prev = match imm_count {
-                    Some(c) => (c - 1).to_string(),
-                    None => {
-                        let prev = self.val(&format!("add i64 {count}, 63"));
-                        self.val(&format!("and i64 {prev}, 63"))
+                let prev = if !want_cf || kind == Shift::Shl {
+                    String::new()
+                } else {
+                    match imm_count {
+                        Some(c) => (c - 1).to_string(),
+                        None => {
+                            let prev = self.val(&format!("add i64 {count}, 63"));
+                            self.val(&format!("and i64 {prev}, 63"))
+                        }
                     }
                 };
+                let op = match kind {
+                    Shift::Shl => "shl",
+                    Shift::Shr => "lshr",
+                    _ => "ashr",
+                };
                 if bits == 64 {
+                    let r = self.val(&format!("{op} i64 {a}, {count}"));
                     match kind {
                         Shift::Shl => {
-                            let r = self.val(&format!("shl i64 {a}, {count}"));
-                            let back = match imm_count {
-                                Some(c) => ((64 - c) & 63).to_string(),
-                                None => {
-                                    let back = self.val(&format!("sub i64 64, {count}"));
-                                    self.val(&format!("and i64 {back}, 63"))
-                                }
+                            let cf = (want_cf || want_of).then(|| {
+                                let back = match imm_count {
+                                    Some(c) => ((64 - c) & 63).to_string(),
+                                    None => {
+                                        let back = self.val(&format!("sub i64 64, {count}"));
+                                        self.val(&format!("and i64 {back}, 63"))
+                                    }
+                                };
+                                let out = self.val(&format!("lshr i64 {a}, {back}"));
+                                self.val(&format!("trunc i64 {out} to i1"))
+                            });
+                            let of = if want_of {
+                                let msb = self.msb(&r, 64);
+                                Some(self.val(&format!("xor i1 {msb}, {}", cf.as_ref().unwrap())))
+                            } else {
+                                None
                             };
-                            let out = self.val(&format!("lshr i64 {a}, {back}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            let msb = self.msb(&r, 64);
-                            let of = self.val(&format!("xor i1 {msb}, {cf}"));
-                            (r, cf, of)
-                        }
-                        Shift::Shr => {
-                            let r = self.val(&format!("lshr i64 {a}, {count}"));
-                            let out = self.val(&format!("lshr i64 {a}, {prev}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            let of = self.msb(&a, 64);
-                            (r, cf, of)
+                            (r, cf.filter(|_| want_cf), of)
                         }
                         _ => {
-                            let r = self.val(&format!("ashr i64 {a}, {count}"));
-                            let out = self.val(&format!("ashr i64 {a}, {prev}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            (r, cf, "false".to_string())
+                            let cf = want_cf.then(|| {
+                                let out = self.val(&format!("{op} i64 {a}, {prev}"));
+                                self.val(&format!("trunc i64 {out} to i1"))
+                            });
+                            let of = if kind == Shift::Shr {
+                                want_of.then(|| self.msb(&a, 64))
+                            } else {
+                                want_of.then(|| "false".to_string())
+                            };
+                            (r, cf, of)
                         }
                     }
                 } else {
                     // Narrow operands are shifted in 64 bits; counts are at most 31 here.
                     let ext = if kind == Shift::Sar { "sext" } else { "zext" };
                     let wide = self.val(&format!("{ext} {t} {a} to i64"));
+                    let res = self.val(&format!("{op} i64 {wide}, {count}"));
+                    let r = self.val(&format!("trunc i64 {res} to {t}"));
                     match kind {
                         Shift::Shl => {
-                            let res = self.val(&format!("shl i64 {wide}, {count}"));
-                            let r = self.val(&format!("trunc i64 {res} to {t}"));
-                            let out = self.val(&format!("lshr i64 {res}, {bits}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            let msb = self.msb(&r, bits);
-                            let of = self.val(&format!("xor i1 {msb}, {cf}"));
-                            (r, cf, of)
-                        }
-                        Shift::Shr => {
-                            let res = self.val(&format!("lshr i64 {wide}, {count}"));
-                            let r = self.val(&format!("trunc i64 {res} to {t}"));
-                            let out = self.val(&format!("lshr i64 {wide}, {prev}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            let of = self.msb(&a, bits);
-                            (r, cf, of)
+                            let cf = (want_cf || want_of).then(|| {
+                                let out = self.val(&format!("lshr i64 {res}, {bits}"));
+                                self.val(&format!("trunc i64 {out} to i1"))
+                            });
+                            let of = if want_of {
+                                let msb = self.msb(&r, bits);
+                                Some(self.val(&format!("xor i1 {msb}, {}", cf.as_ref().unwrap())))
+                            } else {
+                                None
+                            };
+                            (r, cf.filter(|_| want_cf), of)
                         }
                         _ => {
-                            let res = self.val(&format!("ashr i64 {wide}, {count}"));
-                            let r = self.val(&format!("trunc i64 {res} to {t}"));
-                            let out = self.val(&format!("ashr i64 {wide}, {prev}"));
-                            let cf = self.val(&format!("trunc i64 {out} to i1"));
-                            (r, cf, "false".to_string())
+                            let cf = want_cf.then(|| {
+                                let out = self.val(&format!("{op} i64 {wide}, {prev}"));
+                                self.val(&format!("trunc i64 {out} to i1"))
+                            });
+                            let of = if kind == Shift::Shr {
+                                want_of.then(|| self.msb(&a, bits))
+                            } else {
+                                want_of.then(|| "false".to_string())
+                            };
+                            (r, cf, of)
                         }
                     }
                 }
@@ -1939,12 +1967,23 @@ impl FunctionLifter<'_> {
         };
 
         // Flags only change when the masked count is non-zero.
-        let mut updates = vec![(Flag::Cf, cf), (Flag::Of, of)];
+        let mut updates: Vec<(Flag, String)> = Vec::new();
+        updates.extend(cf.map(|v| (Flag::Cf, v)));
+        updates.extend(of.map(|v| (Flag::Of, v)));
         if !matches!(kind, Shift::Rol | Shift::Ror) {
-            let [zf, sf, pf] = self.zsp(&r, bits);
-            updates.extend([(Flag::Zf, zf), (Flag::Sf, sf), (Flag::Pf, pf)]);
+            if self.flag_live(Flag::Zf) {
+                let zf = self.val(&format!("icmp eq i{bits} {r}, 0"));
+                updates.push((Flag::Zf, zf));
+            }
+            if self.flag_live(Flag::Sf) {
+                let sf = self.msb(&r, bits);
+                updates.push((Flag::Sf, sf));
+            }
+            if self.flag_live(Flag::Pf) {
+                let pf = self.parity(&r, bits);
+                updates.push((Flag::Pf, pf));
+            }
         }
-        updates.retain(|&(flag, _)| self.flag_live(flag));
         if imm_count.is_some() {
             for (flag, new) in updates {
                 self.set_flag(flag, &new);
