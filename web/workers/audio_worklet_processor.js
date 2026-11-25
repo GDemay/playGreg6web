@@ -12,6 +12,14 @@
   const DEFAULT_SOFT_LIMIT_KNEE = 0.9;
   const MAX_TRACKED_CHANNELS = 32;
 
+  // W327: Overrun drift guard & lock-free watermark telemetry defaults (48 kHz stereo).
+  const DEFAULT_MAX_BUFFERED_FRAMES = 0; // 0 = disabled unless explicitly configured
+  const DEFAULT_HIGH_WATERMARK_FRAMES = 4800; // 100 ms @ 48 kHz (3 video frames @ 30 FPS)
+  const DEFAULT_TARGET_WATERMARK_FRAMES = 1440; // 30 ms @ 48 kHz steady-state target
+  const DEFAULT_TRIM_CROSSFADE_FRAMES = 32; // ~0.67 ms @ 48 kHz click-free splice
+  const MAX_TRIM_CROSSFADE_FRAMES = 512;
+  const DEFAULT_STATS_INTERVAL_QUANTA = 0; // 0 = periodic port stats disabled by default
+
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   // Must match web/workers/audio_worker.js byte-for-byte.
   const HDR_WRITE_CURSOR = 0;
@@ -78,6 +86,31 @@
       return fallback;
     }
     return value;
+  }
+
+  function clampFillRatio(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0.0) {
+      return 0.0;
+    }
+    if (value >= 1.0) {
+      return 1.0;
+    }
+    return value;
+  }
+
+  function sanitizeNonNegInt(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return fallback;
+    }
+    return Math.floor(value);
+  }
+
+  function sanitizeTrimCrossfadeFrames(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return fallback;
+    }
+    const n = Math.floor(value);
+    return n > MAX_TRIM_CROSSFADE_FRAMES ? MAX_TRIM_CROSSFADE_FRAMES : n;
   }
 
   function softLimitPositive(absVal, knee, headroom) {
@@ -424,7 +457,99 @@
       this._clampedSamples = 0;
       this._softClippedSamples = 0;
       this._underruns = 0;
+      this._underrunQuanta = 0;
       this._underrunFrames = 0;
+
+      // W327: Overrun drift guard (high-watermark trim) & lock-free telemetry state.
+      let maxBufferedFrames = DEFAULT_MAX_BUFFERED_FRAMES;
+      let targetWatermarkOverride = -1;
+      const rawMaxBuffered =
+        procOpts.maxBufferedFrames !== undefined
+          ? procOpts.maxBufferedFrames
+          : procOpts.highWatermarkFrames;
+      if (rawMaxBuffered === true) {
+        maxBufferedFrames = DEFAULT_HIGH_WATERMARK_FRAMES;
+        targetWatermarkOverride = DEFAULT_TARGET_WATERMARK_FRAMES;
+      } else if (rawMaxBuffered !== undefined && rawMaxBuffered !== null && rawMaxBuffered !== false) {
+        maxBufferedFrames = sanitizeNonNegInt(rawMaxBuffered, DEFAULT_MAX_BUFFERED_FRAMES);
+      } else if (procOpts.overrunGuard === true) {
+        maxBufferedFrames = DEFAULT_HIGH_WATERMARK_FRAMES;
+        targetWatermarkOverride = DEFAULT_TARGET_WATERMARK_FRAMES;
+      }
+
+      const rawTargetWatermark =
+        procOpts.targetWatermarkFrames !== undefined
+          ? procOpts.targetWatermarkFrames
+          : procOpts.targetBufferedFrames !== undefined
+            ? procOpts.targetBufferedFrames
+            : procOpts.lowWatermarkFrames;
+      if (rawTargetWatermark !== undefined && rawTargetWatermark !== null) {
+        targetWatermarkOverride = sanitizeNonNegInt(rawTargetWatermark, targetWatermarkOverride);
+      }
+
+      const rawTrimCrossfade =
+        procOpts.trimCrossfadeFrames !== undefined
+          ? procOpts.trimCrossfadeFrames
+          : procOpts.overrunCrossfadeFrames;
+      const trimCrossfadeFrames =
+        rawTrimCrossfade !== undefined && rawTrimCrossfade !== null
+          ? sanitizeTrimCrossfadeFrames(rawTrimCrossfade, DEFAULT_TRIM_CROSSFADE_FRAMES)
+          : DEFAULT_TRIM_CROSSFADE_FRAMES;
+
+      const rawStatsInterval =
+        procOpts.statsIntervalQuanta !== undefined
+          ? procOpts.statsIntervalQuanta
+          : procOpts.telemetryIntervalQuanta;
+      const statsIntervalQuanta =
+        rawStatsInterval !== undefined && rawStatsInterval !== null
+          ? sanitizeNonNegInt(rawStatsInterval, DEFAULT_STATS_INTERVAL_QUANTA)
+          : DEFAULT_STATS_INTERVAL_QUANTA;
+
+      this._maxBufferedFrames = maxBufferedFrames;
+      this._targetWatermarkFramesOverride = targetWatermarkOverride;
+      this._trimCrossfadeFrames = trimCrossfadeFrames;
+      this._overrunTrimmedFrames = 0;
+      this._overrunTrimCount = 0;
+      this._lastFillRatio = 0.0;
+      this._peakFillRatio = 0.0;
+      this._statsIntervalQuanta = statsIntervalQuanta;
+      this._statsQuantaCounter = 0;
+
+      // Pre-allocated reusable telemetry object for zero-allocation periodic port stats in process().
+      this._periodicStatsPayload = {
+        type: 'stats',
+        periodic: true,
+        attached: false,
+        capacityFrames: 0,
+        channels: DEFAULT_CHANNELS,
+        bufferedFrames: 0,
+        fillRatio: 0.0,
+        peakFillRatio: 0.0,
+        maxBufferedFrames: this._maxBufferedFrames,
+        targetWatermarkFrames: this.targetWatermarkFrames,
+        trimCrossfadeFrames: this._trimCrossfadeFrames,
+        overrunTrimmedFrames: 0,
+        overrunTrimCount: 0,
+        underruns: 0,
+        underrunQuanta: 0,
+        underrunFrames: 0,
+        inUnderrun: false,
+        fadeOutCount: 0,
+        underrunFadeOuts: 0,
+        fadeInCount: 0,
+        recoveryFadeIns: 0,
+        overflows: 0,
+        overruns: 0,
+        droppedFrames: 0,
+        quantaProcessed: 0,
+        processedQuanta: 0,
+        processedFrames: 0,
+        framesProcessed: 0,
+        sanitizedSamples: 0,
+        nonFiniteSanitized: 0,
+        clampedSamples: 0,
+        softClippedSamples: 0,
+      };
 
       if (procOpts.sab !== undefined && procOpts.sab !== null) {
         this._attachSab(procOpts.sab);
@@ -515,6 +640,125 @@
 
     get inUnderrun() {
       return this._inUnderrun;
+    }
+
+    get quantaProcessed() {
+      return this._processedQuanta;
+    }
+
+    get processedQuanta() {
+      return this._processedQuanta;
+    }
+
+    get underrunQuanta() {
+      return this._underrunQuanta;
+    }
+
+    get fillRatio() {
+      if (!this._ctrl || this._capacityFrames <= 0) {
+        return 0.0;
+      }
+      return clampFillRatio(this._computeBufferedFrames() / this._capacityFrames);
+    }
+
+    get peakFillRatio() {
+      return this._peakFillRatio;
+    }
+
+    get overrunTrimmedFrames() {
+      return this._overrunTrimmedFrames;
+    }
+
+    get overrunTrimCount() {
+      return this._overrunTrimCount;
+    }
+
+    get maxBufferedFrames() {
+      return this._maxBufferedFrames;
+    }
+
+    get targetWatermarkFrames() {
+      if (this._maxBufferedFrames <= 0) {
+        return 0;
+      }
+      const raw =
+        this._targetWatermarkFramesOverride >= 0
+          ? this._targetWatermarkFramesOverride
+          : Math.floor(this._maxBufferedFrames / 2);
+      return raw > this._maxBufferedFrames ? this._maxBufferedFrames : raw;
+    }
+
+    get trimCrossfadeFrames() {
+      return this._trimCrossfadeFrames;
+    }
+
+    get statsIntervalQuanta() {
+      return this._statsIntervalQuanta;
+    }
+
+    setMaxBufferedFrames(frames) {
+      if (frames === false || frames === null || frames === 0) {
+        this._maxBufferedFrames = 0;
+      } else if (frames === true) {
+        this._maxBufferedFrames = DEFAULT_HIGH_WATERMARK_FRAMES;
+      } else {
+        this._maxBufferedFrames = sanitizeNonNegInt(frames, this._maxBufferedFrames);
+      }
+      return this._maxBufferedFrames;
+    }
+
+    setTargetWatermarkFrames(frames) {
+      if (frames === null || frames === undefined) {
+        this._targetWatermarkFramesOverride = -1;
+      } else {
+        this._targetWatermarkFramesOverride = sanitizeNonNegInt(
+          frames,
+          this._targetWatermarkFramesOverride
+        );
+      }
+      return this.targetWatermarkFrames;
+    }
+
+    setTrimCrossfadeFrames(frames) {
+      this._trimCrossfadeFrames = sanitizeTrimCrossfadeFrames(frames, this._trimCrossfadeFrames);
+      return this._trimCrossfadeFrames;
+    }
+
+    setStatsIntervalQuanta(quanta) {
+      if (quanta === false || quanta === null || quanta === 0) {
+        this._statsIntervalQuanta = 0;
+        this._statsQuantaCounter = 0;
+      } else {
+        const next = sanitizeNonNegInt(quanta, this._statsIntervalQuanta);
+        if (next !== this._statsIntervalQuanta) {
+          this._statsIntervalQuanta = next;
+          this._statsQuantaCounter = 0;
+        }
+      }
+      return this._statsIntervalQuanta;
+    }
+
+    resetStats() {
+      this._processedQuanta = 0;
+      this._processedFrames = 0;
+      this._sanitizedSamples = 0;
+      this._clampedSamples = 0;
+      this._softClippedSamples = 0;
+      this._underruns = 0;
+      this._underrunQuanta = 0;
+      this._underrunFrames = 0;
+      this._declickFadeOuts = 0;
+      this._fadeInCount = 0;
+      this._overrunTrimmedFrames = 0;
+      this._overrunTrimCount = 0;
+      this._lastFillRatio = 0.0;
+      this._peakFillRatio = 0.0;
+      this._statsQuantaCounter = 0;
+      if (this._ctrl) {
+        Atomics.store(this._ctrl, HDR_UNDERRUNS, 0);
+        Atomics.store(this._ctrl, HDR_UNDERRUN_FRAMES, 0);
+      }
+      return this.getStats();
     }
 
     setFadeCurve(curve) {
@@ -668,6 +912,11 @@
     getStats() {
       const ctrl = this._ctrl;
       const overflows = ctrl ? Atomics.load(ctrl, HDR_OVERFLOWS) : 0;
+      const bufferedFrames = this._computeBufferedFrames();
+      const fillRatio =
+        ctrl && this._capacityFrames > 0
+          ? clampFillRatio(bufferedFrames / this._capacityFrames)
+          : 0.0;
       return {
         attached: ctrl !== null,
         stopped: this._stopped,
@@ -684,8 +933,17 @@
         softLimitKnee: this._softLimitKnee,
         capacityFrames: this._capacityFrames,
         channels: this._channels,
-        bufferedFrames: this._computeBufferedFrames(),
+        bufferedFrames,
+        fillRatio,
+        peakFillRatio: this._peakFillRatio,
+        maxBufferedFrames: this._maxBufferedFrames,
+        targetWatermarkFrames: this.targetWatermarkFrames,
+        trimCrossfadeFrames: this._trimCrossfadeFrames,
+        overrunTrimmedFrames: this._overrunTrimmedFrames,
+        overrunTrimCount: this._overrunTrimCount,
+        statsIntervalQuanta: this._statsIntervalQuanta,
         underruns: ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : this._underruns,
+        underrunQuanta: this._underrunQuanta,
         underrunFrames: ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames,
         inUnderrun: this._inUnderrun,
         fadeOutCount: this._declickFadeOuts,
@@ -695,6 +953,7 @@
         overflows,
         overruns: overflows,
         droppedFrames: ctrl ? Atomics.load(ctrl, HDR_DROPPED_FRAMES) : 0,
+        quantaProcessed: this._processedQuanta,
         processedQuanta: this._processedQuanta,
         processedFrames: this._processedFrames,
         framesProcessed: this._processedFrames,
@@ -703,6 +962,43 @@
         clampedSamples: this._clampedSamples,
         softClippedSamples: this._softClippedSamples,
       };
+    }
+
+    _emitPeriodicStats(bufferedFrames, fillRatio) {
+      const ctrl = this._ctrl;
+      const p = this._periodicStatsPayload;
+      const overflows = ctrl ? Atomics.load(ctrl, HDR_OVERFLOWS) : 0;
+      p.attached = ctrl !== null;
+      p.capacityFrames = this._capacityFrames;
+      p.channels = this._channels;
+      p.bufferedFrames = bufferedFrames;
+      p.fillRatio = fillRatio;
+      p.peakFillRatio = this._peakFillRatio;
+      p.maxBufferedFrames = this._maxBufferedFrames;
+      p.targetWatermarkFrames = this.targetWatermarkFrames;
+      p.trimCrossfadeFrames = this._trimCrossfadeFrames;
+      p.overrunTrimmedFrames = this._overrunTrimmedFrames;
+      p.overrunTrimCount = this._overrunTrimCount;
+      p.underruns = ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : this._underruns;
+      p.underrunQuanta = this._underrunQuanta;
+      p.underrunFrames = ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames;
+      p.inUnderrun = this._inUnderrun;
+      p.fadeOutCount = this._declickFadeOuts;
+      p.underrunFadeOuts = this._declickFadeOuts;
+      p.fadeInCount = this._fadeInCount;
+      p.recoveryFadeIns = this._fadeInCount;
+      p.overflows = overflows;
+      p.overruns = overflows;
+      p.droppedFrames = ctrl ? Atomics.load(ctrl, HDR_DROPPED_FRAMES) : 0;
+      p.quantaProcessed = this._processedQuanta;
+      p.processedQuanta = this._processedQuanta;
+      p.processedFrames = this._processedFrames;
+      p.framesProcessed = this._processedFrames;
+      p.sanitizedSamples = this._sanitizedSamples;
+      p.nonFiniteSanitized = this._sanitizedSamples;
+      p.clampedSamples = this._clampedSamples;
+      p.softClippedSamples = this._softClippedSamples;
+      this._post(p);
     }
 
     _post(payload) {
@@ -852,6 +1148,76 @@
           break;
         }
 
+        case 'setMaxBufferedFrames':
+        case 'setWatermarkConfig':
+        case 'setOverrunGuard': {
+          const rawMax =
+            msg.maxBufferedFrames !== undefined
+              ? msg.maxBufferedFrames
+              : msg.highWatermarkFrames !== undefined
+                ? msg.highWatermarkFrames
+                : msg.frames;
+          if (rawMax !== undefined) {
+            this.setMaxBufferedFrames(rawMax);
+          }
+          const rawTarget =
+            msg.targetWatermarkFrames !== undefined
+              ? msg.targetWatermarkFrames
+              : msg.targetBufferedFrames !== undefined
+                ? msg.targetBufferedFrames
+                : msg.lowWatermarkFrames;
+          if (rawTarget !== undefined) {
+            this.setTargetWatermarkFrames(rawTarget);
+          }
+          const rawXfade =
+            msg.trimCrossfadeFrames !== undefined
+              ? msg.trimCrossfadeFrames
+              : msg.overrunCrossfadeFrames;
+          if (rawXfade !== undefined) {
+            this.setTrimCrossfadeFrames(rawXfade);
+          }
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'watermarkConfig',
+              maxBufferedFrames: this._maxBufferedFrames,
+              targetWatermarkFrames: this.targetWatermarkFrames,
+              trimCrossfadeFrames: this._trimCrossfadeFrames,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
+        case 'setStatsInterval':
+        case 'setStatsIntervalQuanta': {
+          const raw =
+            msg.statsIntervalQuanta !== undefined
+              ? msg.statsIntervalQuanta
+              : msg.intervalQuanta !== undefined
+                ? msg.intervalQuanta
+                : msg.quanta;
+          this.setStatsIntervalQuanta(raw);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'statsInterval',
+              statsIntervalQuanta: this._statsIntervalQuanta,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
+        case 'resetStats': {
+          this.resetStats();
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'statsReset',
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
         case 'stats': {
           const reply = Object.assign({ type: 'stats' }, this.getStats());
           if (msg.id !== undefined) reply.id = msg.id;
@@ -869,6 +1235,166 @@
 
         default:
           break;
+      }
+    }
+
+    _applyTrimCrossfade(
+      output,
+      outChannels,
+      samples,
+      cap,
+      inChannels,
+      oldRead,
+      framesToRead,
+      preLoopGain,
+      preLoopRampRemaining
+    ) {
+      const xfadeCount =
+        this._trimCrossfadeFrames < framesToRead ? this._trimCrossfadeFrames : framesToRead;
+      if (xfadeCount <= 0) {
+        return;
+      }
+      if (preLoopRampRemaining === 0 && preLoopGain === 0.0) {
+        return;
+      }
+
+      const clampLimit = this._clampLimit;
+      const negClampLimit = -clampLimit;
+      const softLimit = this._softLimitEnabled;
+      const softKnee = this._softLimitKnee;
+      const negSoftKnee = -softKnee;
+      const softHeadroom = 1.0 - softKnee;
+      const copyChannels = inChannels < outChannels ? inChannels : outChannels;
+
+      let oldSlot = oldRead >= cap ? oldRead - cap : oldRead;
+      let gain = preLoopGain;
+      let rem = preLoopRampRemaining;
+      const step = this._rampStep;
+      const target = this._targetGain;
+      const invXfade = xfadeCount > 1 ? Math.PI / xfadeCount : 0.0;
+
+      if (inChannels === 2 && outChannels === 2) {
+        const outL = output[0];
+        const outR = output[1];
+        for (let f = 0; f < xfadeCount; f++) {
+          if (rem > 0) {
+            gain += step;
+            rem--;
+            if (rem === 0) gain = target;
+          }
+          const alpha =
+            xfadeCount === 1 ? 0.5 : f === 0 ? 0.0 : 0.5 * (1.0 - Math.cos(f * invXfade));
+          const invAlpha = 1.0 - alpha;
+
+          const src = oldSlot * 2;
+          let sL = samples[src];
+          let sR = samples[src + 1];
+          if (sL - sL !== 0) {
+            sL = 0.0;
+          } else {
+            if (softLimit) {
+              if (sL > softKnee) sL = softLimitPositive(sL, softKnee, softHeadroom);
+              else if (sL < negSoftKnee) sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+            }
+            if (clampLimit > 0.0) {
+              if (sL > clampLimit) sL = clampLimit;
+              else if (sL < negClampLimit) sL = negClampLimit;
+            }
+          }
+          if (sR - sR !== 0) {
+            sR = 0.0;
+          } else {
+            if (softLimit) {
+              if (sR > softKnee) sR = softLimitPositive(sR, softKnee, softHeadroom);
+              else if (sR < negSoftKnee) sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+            }
+            if (clampLimit > 0.0) {
+              if (sR > clampLimit) sR = clampLimit;
+              else if (sR < negClampLimit) sR = negClampLimit;
+            }
+          }
+          if (gain === 0.0) {
+            sL = 0.0;
+            sR = 0.0;
+          } else if (gain !== 1.0) {
+            sL *= gain;
+            sR *= gain;
+          }
+
+          outL[f] = sL * invAlpha + outL[f] * alpha;
+          outR[f] = sR * invAlpha + outR[f] * alpha;
+
+          oldSlot++;
+          if (oldSlot >= cap) oldSlot = 0;
+        }
+      } else if (inChannels === 1) {
+        for (let f = 0; f < xfadeCount; f++) {
+          if (rem > 0) {
+            gain += step;
+            rem--;
+            if (rem === 0) gain = target;
+          }
+          const alpha =
+            xfadeCount === 1 ? 0.5 : f === 0 ? 0.0 : 0.5 * (1.0 - Math.cos(f * invXfade));
+          const invAlpha = 1.0 - alpha;
+
+          let s = samples[oldSlot];
+          if (s - s !== 0) {
+            s = 0.0;
+          } else {
+            if (softLimit) {
+              if (s > softKnee) s = softLimitPositive(s, softKnee, softHeadroom);
+              else if (s < negSoftKnee) s = -softLimitPositive(-s, softKnee, softHeadroom);
+            }
+            if (clampLimit > 0.0) {
+              if (s > clampLimit) s = clampLimit;
+              else if (s < negClampLimit) s = negClampLimit;
+            }
+          }
+          const v = gain === 0.0 ? 0.0 : gain === 1.0 ? s : s * gain;
+          for (let c = 0; c < outChannels; c++) {
+            output[c][f] = v * invAlpha + output[c][f] * alpha;
+          }
+
+          oldSlot++;
+          if (oldSlot >= cap) oldSlot = 0;
+        }
+      } else {
+        for (let f = 0; f < xfadeCount; f++) {
+          if (rem > 0) {
+            gain += step;
+            rem--;
+            if (rem === 0) gain = target;
+          }
+          const alpha =
+            xfadeCount === 1 ? 0.5 : f === 0 ? 0.0 : 0.5 * (1.0 - Math.cos(f * invXfade));
+          const invAlpha = 1.0 - alpha;
+
+          const srcBase = oldSlot * inChannels;
+          for (let c = 0; c < copyChannels; c++) {
+            let s = samples[srcBase + c];
+            if (s - s !== 0) {
+              s = 0.0;
+            } else {
+              if (softLimit) {
+                if (s > softKnee) s = softLimitPositive(s, softKnee, softHeadroom);
+                else if (s < negSoftKnee) s = -softLimitPositive(-s, softKnee, softHeadroom);
+              }
+              if (clampLimit > 0.0) {
+                if (s > clampLimit) s = clampLimit;
+                else if (s < negClampLimit) s = negClampLimit;
+              }
+            }
+            const v = gain === 0.0 ? 0.0 : gain === 1.0 ? s : s * gain;
+            output[c][f] = v * invAlpha + output[c][f] * alpha;
+          }
+          for (let c = copyChannels; c < outChannels; c++) {
+            output[c][f] = 0.0;
+          }
+
+          oldSlot++;
+          if (oldSlot >= cap) oldSlot = 0;
+        }
       }
     }
 
@@ -940,6 +1466,40 @@
         used = cap;
       }
 
+      // W327: Lock-free fill-ratio peak watermark tracking.
+      const preFillRatio = cap > 0 ? clampFillRatio(used / cap) : 0.0;
+      if (preFillRatio > this._peakFillRatio) {
+        this._peakFillRatio = preFillRatio;
+      }
+
+      // W327: Bounded overrun drift guard (high-watermark trim).
+      // Advances the read cursor down to target watermark without inducing an
+      // artificial underrun, then crossfades from the discarded head to prevent pops.
+      let trimFrames = 0;
+      let trimOldRead = read;
+      const maxBuffered = this._maxBufferedFrames;
+      if (maxBuffered > 0 && used > maxBuffered && used > quantumFrames) {
+        let target =
+          this._targetWatermarkFramesOverride >= 0
+            ? this._targetWatermarkFramesOverride
+            : Math.floor(maxBuffered / 2);
+        if (target > maxBuffered) {
+          target = maxBuffered;
+        }
+        const keepFrames = target > quantumFrames ? target : quantumFrames;
+        if (used > keepFrames) {
+          trimFrames = used - keepFrames;
+          trimOldRead = read;
+          read += trimFrames;
+          if (read >= modulus) {
+            read -= modulus;
+          }
+          used = keepFrames;
+          this._overrunTrimmedFrames += trimFrames;
+          this._overrunTrimCount++;
+        }
+      }
+
       const framesToRead = quantumFrames <= used ? quantumFrames : used;
       const lastSamples = this._lastSamples;
       const trackedChannels =
@@ -999,6 +1559,8 @@
         const firstFrames = framesToRead <= cap - readSlot ? framesToRead : cap - readSlot;
         const secondFrames = framesToRead - firstFrames;
         const copyChannels = inChannels < outChannels ? inChannels : outChannels;
+        const preLoopGain = this._currentGain;
+        const preLoopRampRemaining = this._rampRemaining;
         let sanitized = 0;
         let clamped = 0;
         let softClipped = 0;
@@ -1911,6 +2473,22 @@
           this._softClippedSamples += softClipped;
         }
 
+        // W327: Click-free half-cosine splice across overrun trim BEFORE advancing
+        // HDR_READ_CURSOR so the producer cannot overwrite the discarded head slots.
+        if (trimFrames > 0 && !wasInUnderrun && this._trimCrossfadeFrames > 0) {
+          this._applyTrimCrossfade(
+            output,
+            outChannels,
+            samples,
+            cap,
+            inChannels,
+            trimOldRead,
+            framesToRead,
+            preLoopGain,
+            preLoopRampRemaining
+          );
+        }
+
         let nextRead = read + framesToRead;
         if (nextRead >= modulus) {
           nextRead -= modulus;
@@ -2080,6 +2658,7 @@
         }
 
         this._underruns++;
+        this._underrunQuanta++;
         this._underrunFrames += missingFrames;
         Atomics.add(ctrl, HDR_UNDERRUNS, 1);
         Atomics.add(ctrl, HDR_UNDERRUN_FRAMES, missingFrames);
@@ -2087,6 +2666,19 @@
 
       this._processedQuanta++;
       this._processedFrames += framesToRead;
+
+      const remainingBuffered = used - framesToRead;
+      const postFillRatio = cap > 0 ? clampFillRatio(remainingBuffered / cap) : 0.0;
+      this._lastFillRatio = postFillRatio;
+
+      if (this._statsIntervalQuanta > 0) {
+        this._statsQuantaCounter++;
+        if (this._statsQuantaCounter >= this._statsIntervalQuanta) {
+          this._statsQuantaCounter = 0;
+          this._emitPeriodicStats(remainingBuffered, postFillRatio);
+        }
+      }
+
       return true;
     }
   }
@@ -2100,6 +2692,7 @@
     applyFadeRamp,
     softLimitSample,
     sanitizeAndSoftLimitBuffer,
+    clampFillRatio,
     PROCESSOR_NAME,
     DEFAULT_CHANNELS,
     DEFAULT_SMOOTHING_FRAMES,
@@ -2109,6 +2702,12 @@
     MAX_DECLICK_FRAMES,
     DEFAULT_SAMPLE_CLAMP_LIMIT,
     DEFAULT_SOFT_LIMIT_KNEE,
+    DEFAULT_MAX_BUFFERED_FRAMES,
+    DEFAULT_HIGH_WATERMARK_FRAMES,
+    DEFAULT_TARGET_WATERMARK_FRAMES,
+    DEFAULT_TRIM_CROSSFADE_FRAMES,
+    MAX_TRIM_CROSSFADE_FRAMES,
+    DEFAULT_STATS_INTERVAL_QUANTA,
     HDR_WRITE_CURSOR,
     HDR_READ_CURSOR,
     HDR_CAPACITY_FRAMES,
