@@ -13,6 +13,7 @@ const {
   GPU_RING_HEADER_BYTES,
   GPU_PACKET_HEADER_BYTES,
   DEFAULT_BATCH_MAX_PACKETS,
+  DEFAULT_WRAP_SCRATCH_BYTES,
   HEADER_INDEX,
 } = ringMod;
 
@@ -1608,4 +1609,486 @@ test('W244 telemetry sanitization, mid-batch throw semantics, and zero-extra-ato
   assert.equal(consStats.totalBytesDrained, expectedDrainedBytes);
   assert.equal(consStats.maxDrainBatchBytes, 128);
   assert.equal(consStats.peakOccupancyRatio, 1);
+});
+
+test('W284 drainBatchZeroAlloc drains non-wrapping spans as zero-copy SAB subarrays with reusable descriptors and single atomic publish', () => {
+  assert.equal(DEFAULT_WRAP_SCRATCH_BYTES, 65536);
+  assert.equal(GpuRingBuffer.DEFAULT_WRAP_SCRATCH_BYTES, 65536);
+
+  const producer = GpuRingBuffer.create(4096);
+  const consumer = GpuRingBuffer.attach(producer.sab);
+
+  // Argument validation does not increment drainCalls or emptyDrains.
+  assert.throws(() => consumer.drainBatchZeroAlloc(null), TypeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, '8'), TypeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, 0), RangeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, -2), RangeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, 1.5), RangeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, { maxPackets: 0 }), RangeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, { maxBytes: -1 }), RangeError);
+  assert.throws(() => consumer.drainBatchZeroAlloc(() => {}, { maxBytes: NaN }), RangeError);
+  assert.equal(consumer.drainCalls, 0);
+  assert.equal(consumer.emptyDrains, 0);
+  assert.equal(consumer.zeroAllocDrains, 0);
+
+  // Empty ring returns zero-work summary without incrementing zeroAllocDrains.
+  const emptyRes = consumer.drainBatchZeroAlloc(() => {
+    throw new Error('handler should not be called on empty ring');
+  });
+  assert.deepEqual(emptyRes, {
+    packets: 0,
+    bytes: 0,
+    remainingBytes: 0,
+    wrapped: false,
+    zeroCopy: false,
+  });
+  assert.equal(consumer.drainCalls, 1);
+  assert.equal(consumer.emptyDrains, 1);
+  assert.equal(consumer.zeroAllocDrains, 0);
+  assert.equal(consumer.batchesDrained, 0);
+
+  // Enqueue 8 packets (16 bytes each = 128 bytes total) + 4 trailing incomplete header bytes.
+  const rawPackets = [];
+  for (let i = 0; i < 8; i++) {
+    const payload = Uint8Array.from({ length: 8 }, (_, b) => (i * 19 + b * 3 + 1) & 0xff);
+    const pkt = encodeRawPacket(OPCODES.DRAW, i, payload);
+    assert.equal(producer.writeBytes(pkt), true);
+    rawPackets.push(pkt);
+  }
+  const trailingPacket = encodeRawPacket(OPCODES.PRESENT, 0xaa, Uint8Array.from([0xde, 0xad, 0xbe, 0xef]));
+  assert.equal(producer.writeBytes(trailingPacket.subarray(0, 4)), true);
+
+  // Instrument Atomics to prove zero extra atomics during drainBatchZeroAlloc.
+  const origLoad = Atomics.load;
+  const origStore = Atomics.store;
+  const origNotify = Atomics.notify;
+  let writeLoads = 0;
+  let readLoads = 0;
+  let readStores = 0;
+  let readNotifies = 0;
+  Atomics.load = (ta, idx) => {
+    if (idx === HEADER_INDEX.WRITE_POS) writeLoads += 1;
+    if (idx === HEADER_INDEX.READ_POS) readLoads += 1;
+    return origLoad(ta, idx);
+  };
+  Atomics.store = (ta, idx, val) => {
+    if (idx === HEADER_INDEX.READ_POS) readStores += 1;
+    return origStore(ta, idx, val);
+  };
+  Atomics.notify = (ta, idx, count) => {
+    if (idx === HEADER_INDEX.READ_POS) readNotifies += 1;
+    return origNotify(ta, idx, count);
+  };
+
+  let spanRef1 = null;
+  let spanRef2 = null;
+  const capturedBatch1 = [];
+  const capturedBatch2 = [];
+
+  try {
+    // Drain first 3 packets via maxPackets option (48B), non-wrapping zero-copy SAB view.
+    const r1 = consumer.drainBatchZeroAlloc(
+      (bytesView, byteOffset, byteLength, span) => {
+        spanRef1 = span;
+        assert.equal(bytesView instanceof Uint8Array, true);
+        assert.equal(bytesView.buffer, producer.sab, 'non-wrap span must be zero-copy over SAB');
+        assert.equal(byteOffset, 0);
+        assert.equal(byteLength, 48);
+        assert.equal(bytesView.byteLength, 48);
+        assert.equal(span.bytes, bytesView);
+        assert.equal(span.byteOffset, 0);
+        assert.equal(span.byteLength, 48);
+        assert.equal(span.bufferByteOffset, GPU_RING_HEADER_BYTES);
+        assert.equal(span.ringOffset, 0);
+        assert.equal(span.packets, 3);
+        assert.equal(span.wrapped, false);
+        assert.equal(span.zeroCopy, true);
+        capturedBatch1.push(bytesView.slice());
+      },
+      { maxPackets: 3, reuseResult: true }
+    );
+
+    assert.equal(r1.packets, 3);
+    assert.equal(r1.bytes, 48);
+    assert.equal(r1.remainingBytes, 84);
+    assert.equal(r1.wrapped, false);
+    assert.equal(r1.zeroCopy, true);
+    assert.equal(writeLoads, 1);
+    assert.equal(readLoads, 1);
+    assert.equal(readStores, 1);
+    assert.equal(readNotifies, 1);
+
+    // Drain up to maxBytes: 50 -> fits 3 complete 16B packets (48B), leaves 2 packets + 4B tail.
+    const r2 = consumer.drainBatchZeroAlloc(
+      (bytesView, byteOffset, byteLength, span) => {
+        spanRef2 = span;
+        assert.equal(bytesView.buffer, producer.sab);
+        assert.equal(byteOffset, 0);
+        assert.equal(byteLength, 48);
+        assert.equal(span.ringOffset, 48);
+        assert.equal(span.bufferByteOffset, GPU_RING_HEADER_BYTES + 48);
+        assert.equal(span.packets, 3);
+        assert.equal(span.wrapped, false);
+        assert.equal(span.zeroCopy, true);
+        capturedBatch2.push(bytesView.slice());
+      },
+      { maxBytes: 50, reuseResult: true }
+    );
+
+    assert.equal(r2, r1, 'reuseResult: true must reuse the same result object');
+    assert.equal(spanRef2, spanRef1, 'span descriptor object must be reused across drains');
+    assert.equal(r2.packets, 3);
+    assert.equal(r2.bytes, 48);
+    assert.equal(r2.remainingBytes, 36);
+    assert.equal(writeLoads, 2);
+    assert.equal(readLoads, 2);
+    assert.equal(readStores, 2);
+    assert.equal(readNotifies, 2);
+  } finally {
+    Atomics.load = origLoad;
+    Atomics.store = origStore;
+    Atomics.notify = origNotify;
+  }
+
+  // Verify exact byte contents of both non-wrap zero-copy spans.
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual(capturedBatch1[0].subarray(i * 16, (i + 1) * 16), rawPackets[i]);
+    assert.deepEqual(capturedBatch2[0].subarray(i * 16, (i + 1) * 16), rawPackets[3 + i]);
+  }
+
+  // Throwing in handler leaves READ_POS untouched and does not increment zeroAllocDrains/emptyDrains.
+  const readPosBeforeThrow = consumer.readPos;
+  const zeroAllocBeforeThrow = consumer.zeroAllocDrains;
+  const emptyBeforeThrow = consumer.emptyDrains;
+  assert.throws(() => {
+    consumer.drainBatchZeroAlloc(() => {
+      throw new Error('span-handler-boom');
+    });
+  }, /span-handler-boom/);
+  assert.equal(consumer.readPos, readPosBeforeThrow);
+  assert.equal(consumer.zeroAllocDrains, zeroAllocBeforeThrow);
+  assert.equal(consumer.emptyDrains, emptyBeforeThrow);
+
+  // Retry drains the remaining 2 complete packets (32B) and leaves 4B incomplete header unread.
+  const r3 = consumer.drainBatchZeroAlloc((bytesView, _off, byteLength, span) => {
+    assert.equal(bytesView.buffer, producer.sab);
+    assert.equal(byteLength, 32);
+    assert.equal(span.packets, 2);
+    assert.deepEqual(bytesView.subarray(0, 16), rawPackets[6]);
+    assert.deepEqual(bytesView.subarray(16, 32), rawPackets[7]);
+  });
+  assert.equal(r3.packets, 2);
+  assert.equal(r3.bytes, 32);
+  assert.equal(r3.remainingBytes, 4);
+
+  // Draining when only 4 incomplete header bytes remain counts as emptyDrain and invokes no handler.
+  const rPartial = consumer.drainBatchZeroAlloc(() => {
+    throw new Error('incomplete packet must not invoke handler');
+  });
+  assert.equal(rPartial.packets, 0);
+  assert.equal(rPartial.bytes, 0);
+  assert.equal(rPartial.remainingBytes, 4);
+
+  // Complete the trailing packet and drain it cleanly.
+  assert.equal(producer.writeBytes(trailingPacket.subarray(4)), true);
+  let trailingCopy = null;
+  const r4 = consumer.drainBatchZeroAlloc((bytesView, _off, byteLength, span) => {
+    assert.equal(bytesView.buffer, producer.sab);
+    assert.equal(byteLength, trailingPacket.byteLength);
+    assert.equal(span.packets, 1);
+    trailingCopy = bytesView.slice();
+  });
+  assert.equal(r4.packets, 1);
+  assert.equal(r4.bytes, trailingPacket.byteLength);
+  assert.equal(r4.remainingBytes, 0);
+  assert.deepEqual(trailingCopy, trailingPacket);
+
+  // Raw unframed span mode (framed: false) drains exact requested raw bytes.
+  const rawBytes = Uint8Array.from([11, 22, 33, 44, 55, 66, 77, 88, 99, 100]);
+  assert.equal(producer.writeBytes(rawBytes), true);
+  let rawChunk = null;
+  const rRaw = consumer.drainBatchZeroAlloc(
+    (bytesView, byteOffset, byteLength, span) => {
+      assert.equal(bytesView.buffer, producer.sab);
+      assert.equal(byteOffset, 0);
+      assert.equal(byteLength, 6);
+      assert.equal(span.packets, 0);
+      rawChunk = bytesView.slice();
+    },
+    { framed: false, maxBytes: 6 }
+  );
+  assert.equal(rRaw.packets, 0);
+  assert.equal(rRaw.bytes, 6);
+  assert.equal(rRaw.remainingBytes, 4);
+  assert.deepEqual(rawChunk, rawBytes.subarray(0, 6));
+  assert.equal(consumer.drainBatchZeroAlloc(() => {}, { framed: false }).bytes, 4);
+
+  const stats = consumer.getStats();
+  assert.equal(stats.zeroAllocDrains, 6);
+  assert.equal(stats.peakBatchBytes, 48);
+  assert.equal(stats.maxDrainBatchBytes, 48);
+  assert.equal(stats.packetsDrained, 9);
+});
+
+test('W284 drainBatchZeroAlloc reuses pre-allocated wrap scratch buffer across wrap-around & 30 FPS high-throughput frames', () => {
+  // Part 1: Small 64B ring testing split header, split payload, u32 wrap, and zero scratch reallocation.
+  const smallProd = GpuRingBuffer.create(64);
+  const smallCons = GpuRingBuffer.attach(smallProd.sab);
+  const initialSmallScratchBuf = smallCons._wrapScratch.buffer;
+  assert.equal(smallCons._wrapScratch.byteLength, 64);
+
+  // Advance to offset 60 so the first packet header splits [60..64) + [0..4).
+  assert.equal(smallProd.writeBytes(new Uint8Array(60)), true);
+  assert.equal(smallCons.drainTo(() => {}), 60);
+
+  const p0 = encodeRawPacket(6, 0x1111, Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8])); // 16B
+  const p1 = encodeRawPacket(7, 0x2222, Uint8Array.from([9, 10, 11, 12]));          // 12B
+  const p2 = encodeRawPacket(9, 0x3333, new Uint8Array(0));                         // 8B
+  assert.equal(smallProd.writeBytes(p0), true);
+  assert.equal(smallProd.writeBytes(p1), true);
+  assert.equal(smallProd.writeBytes(p2), true);
+
+  let wrappedSpan1 = null;
+  const w1 = smallCons.drainBatchZeroAlloc((bytesView, byteOffset, byteLength, span) => {
+    assert.equal(bytesView.buffer, initialSmallScratchBuf, 'wrap span must reuse pre-allocated scratch buffer');
+    assert.equal(byteOffset, 0);
+    assert.equal(byteLength, 36);
+    assert.equal(span.wrapped, true);
+    assert.equal(span.zeroCopy, false);
+    assert.equal(span.packets, 3);
+    wrappedSpan1 = bytesView.slice();
+  });
+  assert.equal(w1.packets, 3);
+  assert.equal(w1.bytes, 36);
+  assert.equal(w1.wrapped, true);
+  assert.equal(w1.zeroCopy, false);
+  assert.deepEqual(wrappedSpan1.subarray(0, 16), p0);
+  assert.deepEqual(wrappedSpan1.subarray(16, 28), p1);
+  assert.deepEqual(wrappedSpan1.subarray(28, 36), p2);
+
+  // Verify 32-bit monotonic counter wrap across 0xFFFFFFFF -> 0 still reuses the same scratch buffer.
+  const smallHeader = new Uint32Array(smallProd.sab, 0, 16);
+  Atomics.store(smallHeader, HEADER_INDEX.WRITE_POS, 0xfffffff4); // offset 52
+  Atomics.store(smallHeader, HEADER_INDEX.READ_POS, 0xfffffff4);
+
+  const pWrap0 = encodeRawPacket(4, 0xaaaa, Uint8Array.from({ length: 12 }, (_, i) => 0x40 + i)); // 20B (payload splits)
+  const pWrap1 = encodeRawPacket(5, 0xbbbb, Uint8Array.from([0xca, 0xfe, 0xba, 0xbe]));           // 12B
+  assert.equal(smallProd.writeBytes(pWrap0), true);
+  assert.equal(smallProd.writeBytes(pWrap1), true);
+  assert.equal(smallProd.writePos, 0x00000014);
+
+  let wrappedSpan2 = null;
+  const w2 = smallCons.drainBatchZeroAlloc((bytesView, _off, byteLength, span) => {
+    assert.equal(bytesView.buffer, initialSmallScratchBuf, 'subsequent wrap must still reuse same scratch buffer');
+    assert.equal(byteLength, 32);
+    assert.equal(span.wrapped, true);
+    assert.equal(span.packets, 2);
+    wrappedSpan2 = bytesView.slice();
+  });
+  assert.equal(w2.packets, 2);
+  assert.equal(w2.bytes, 32);
+  assert.equal(smallCons.readPos, 0x00000014);
+  assert.deepEqual(wrappedSpan2.subarray(0, 20), pWrap0);
+  assert.deepEqual(wrappedSpan2.subarray(20, 32), pWrap1);
+  assert.equal(smallCons._wrapScratch.buffer, initialSmallScratchBuf);
+
+  // Part 2: 30 FPS high-throughput workload (30 frames x ~192 KB/frame across a 256 KB ring).
+  const RING_CAP = 256 * 1024;
+  const producer = GpuRingBuffer.create(RING_CAP);
+  const consumer = GpuRingBuffer.attach(producer.sab);
+  assert.equal(consumer._wrapScratch.byteLength, DEFAULT_WRAP_SCRATCH_BYTES);
+
+  // Build a realistic 192 KB frame stream (~192 packets of 1024B each = 196,608 bytes).
+  const PACKETS_PER_FRAME = 192;
+  const PAYLOAD_BYTES = 1016; // + 8B header = 1024B/packet -> 196,608B per frame (~192 KB)
+  const PACKET_BYTES = GPU_PACKET_HEADER_BYTES + PAYLOAD_BYTES;
+  const FRAME_BYTES = PACKETS_PER_FRAME * PACKET_BYTES;
+
+  let nonWrapSpans = 0;
+  let wrapSpans = 0;
+  let scratchBufAfterWarmup = null;
+  let verifiedPackets = 0;
+
+  for (let frame = 0; frame < 30; frame++) {
+    for (let p = 0; p < PACKETS_PER_FRAME; p++) {
+      const payload = new Uint8Array(PAYLOAD_BYTES);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, frame, true);
+      dv.setUint32(4, p, true);
+      payload[PAYLOAD_BYTES - 1] = (frame + p) & 0xff;
+      const pkt = encodeRawPacket(OPCODES.DRAW, frame & 0xffff, payload);
+      assert.equal(producer.writeBytes(pkt), true);
+    }
+
+    const res = consumer.drainBatchZeroAlloc(
+      (bytesView, byteOffset, byteLength, span) => {
+        assert.equal(byteOffset, 0);
+        assert.equal(byteLength, FRAME_BYTES);
+        assert.equal(span.packets, PACKETS_PER_FRAME);
+
+        if (span.wrapped) {
+          wrapSpans += 1;
+          if (!scratchBufAfterWarmup) {
+            scratchBufAfterWarmup = bytesView.buffer;
+          } else {
+            assert.equal(
+              bytesView.buffer,
+              scratchBufAfterWarmup,
+              'wrap scratch buffer must remain stable with zero reallocations after warmup'
+            );
+          }
+        } else {
+          nonWrapSpans += 1;
+          assert.equal(bytesView.buffer, producer.sab);
+        }
+
+        // Spot-check first, middle, and last packets in the drained frame span.
+        const dv = new DataView(bytesView.buffer, bytesView.byteOffset, byteLength);
+        for (const idx of [0, 95, PACKETS_PER_FRAME - 1]) {
+          const base = idx * PACKET_BYTES;
+          assert.equal(dv.getUint16(base, true), OPCODES.DRAW);
+          assert.equal(dv.getUint16(base + 2, true), frame & 0xffff);
+          assert.equal(dv.getUint32(base + 4, true), PAYLOAD_BYTES);
+          assert.equal(dv.getUint32(base + 8, true), frame);
+          assert.equal(dv.getUint32(base + 12, true), idx);
+          assert.equal(bytesView[base + PACKET_BYTES - 1], (frame + idx) & 0xff);
+        }
+        verifiedPackets += span.packets;
+      },
+      { maxPackets: 256, reuseResult: true }
+    );
+
+    assert.equal(res.packets, PACKETS_PER_FRAME);
+    assert.equal(res.bytes, FRAME_BYTES);
+    assert.equal(res.remainingBytes, 0);
+  }
+
+  assert.equal(verifiedPackets, 30 * PACKETS_PER_FRAME);
+  assert.ok(nonWrapSpans > 0, '30 FPS stream should exercise non-wrapping zero-copy spans');
+  assert.ok(wrapSpans > 10, '30 FPS stream should exercise repeated wrap-around scratch spans');
+
+  const consStats = consumer.getStats();
+  assert.equal(consStats.zeroAllocDrains, 30);
+  assert.equal(consStats.batchesDrained, 30);
+  assert.equal(consStats.packetsDrained, 30 * PACKETS_PER_FRAME);
+  assert.equal(consStats.peakBatchBytes, FRAME_BYTES);
+  assert.equal(consStats.maxDrainBatchBytes, FRAME_BYTES);
+  assert.equal(consStats.totalBytesDrained, 30 * FRAME_BYTES);
+  assert.equal(consStats.backpressureWaitRate, 0);
+});
+
+test('W284 telemetry tracks peakBatchBytes, zeroAllocDrains, backpressureWaitRate (clamped [0, 1]), sanitization, and resetStats()', () => {
+  const ring = GpuRingBuffer.create(64);
+  const rawHeader = new DataView(ring.sab);
+
+  // Initial getters & getStats().
+  assert.equal(ring.peakBatchBytes, 0);
+  assert.equal(ring.zeroAllocDrains, 0);
+  assert.equal(ring.backpressureWaitRate, 0);
+  const init = ring.getStats();
+  assert.equal(init.peakBatchBytes, 0);
+  assert.equal(init.zeroAllocDrains, 0);
+  assert.equal(init.backpressureWaitRate, 0);
+
+  // 3 successful 16B writes -> 0 waits -> backpressureWaitRate = 0.
+  const pkt16 = encodeRawPacket(OPCODES.DRAW, 1, new Uint8Array(8));
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.backpressureWaitRate, 0);
+  assert.equal(ring.getStats().backpressureWaitRate, 0);
+
+  // Oversized write (> capacity) drops packet but does NOT affect backpressureWaitRate.
+  assert.equal(ring.writeBytes(new Uint8Array(65)), false);
+  assert.equal(ring.backpressureWaitRate, 0);
+
+  // 1 backpressure rejection (32B does not fit in 16B free) -> 1 / (3 + 1) = 0.25.
+  assert.equal(ring.writeBytes(new Uint8Array(32)), false);
+  assert.equal(ring.backpressureWaits, 1);
+  assert.equal(ring.backpressureWaitRate, 0.25);
+  assert.equal(ring.getStats().backpressureWaitRate, 0.25);
+
+  // External recordBackpressureWait(2) -> 3 waits / (3 writes + 3 waits) = 0.5.
+  assert.equal(ring.recordBackpressureWait(2), 3);
+  assert.equal(ring.backpressureWaitRate, 0.5);
+  assert.equal(ring.getStats().backpressureWaitRate, 0.5);
+
+  // Drain 1 packet (16B) via drainBatchZeroAlloc, then 2 packets (32B) via drainBatchZeroAlloc.
+  const z1 = ring.drainBatchZeroAlloc(() => {}, { maxPackets: 1 });
+  assert.equal(z1.bytes, 16);
+  assert.equal(ring.peakBatchBytes, 16);
+  assert.equal(ring.zeroAllocDrains, 1);
+
+  const z2 = ring.drainBatchZeroAlloc(() => {});
+  assert.equal(z2.bytes, 32);
+  assert.equal(ring.peakBatchBytes, 32);
+  assert.equal(ring.zeroAllocDrains, 2);
+
+  // Larger batch via drainBatch (48B) updates peakBatchBytes without incrementing zeroAllocDrains.
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  const b3 = ring.drainBatch(() => {});
+  assert.equal(b3.bytes, 48);
+  assert.equal(ring.peakBatchBytes, 48);
+  assert.equal(ring.zeroAllocDrains, 2);
+  // 6 writes succeeded + 3 waits -> 3 / 9 = 1/3.
+  assert.equal(ring.backpressureWaitRate, 3 / 9);
+
+  // Queue 16B before resetStats() so we verify resetStats() preserves queued SAB data.
+  assert.equal(ring.writeBytes(pkt16), true);
+  const writePosBefore = ring.writePos;
+  const readPosBefore = ring.readPos;
+
+  // Corruption sanitization & [0, 1] clamping guards.
+  ring._peakBatchBytes = 999999;
+  ring._zeroAllocDrains = -10;
+  ring._writesSucceeded = NaN;
+  ring._backpressureWaits = 5;
+  let sanitized = ring.getStats();
+  assert.equal(sanitized.peakBatchBytes, 64);
+  assert.equal(sanitized.zeroAllocDrains, 0);
+  assert.equal(sanitized.backpressureWaitRate, 1);
+
+  ring._peakBatchBytes = NaN;
+  ring._zeroAllocDrains = Infinity;
+  ring._backpressureWaits = -4;
+  ring._writesSucceeded = -2;
+  sanitized = ring.getStats();
+  assert.equal(sanitized.peakBatchBytes, 0);
+  assert.equal(sanitized.zeroAllocDrains, 0);
+  assert.equal(sanitized.backpressureWaitRate, 0);
+
+  // resetStats() clears W284 + W244 stats without disturbing SAB pointers.
+  ring.resetStats();
+  const afterReset = ring.getStats();
+  assert.equal(afterReset.peakBatchBytes, 0);
+  assert.equal(afterReset.zeroAllocDrains, 0);
+  assert.equal(afterReset.backpressureWaitRate, 0);
+  assert.equal(afterReset.drainCalls, 0);
+  assert.equal(afterReset.maxDrainBatchBytes, 0);
+  assert.equal(afterReset.totalBytesDrained, 0);
+  assert.equal(afterReset.backpressureStalls, 0);
+  assert.equal(afterReset.backpressureWaits, 0);
+  assert.equal(afterReset.batchesDrained, 0);
+  assert.equal(afterReset.packetsDrained, 0);
+  assert.equal(ring.writePos, writePosBefore);
+  assert.equal(ring.readPos, readPosBefore);
+
+  // Draining still-queued 16B packet after resetStats() works and records fresh W284 stats.
+  const zAfter = ring.drainBatchZeroAlloc(() => {});
+  assert.equal(zAfter.bytes, 16);
+  assert.equal(ring.peakBatchBytes, 16);
+  assert.equal(ring.zeroAllocDrains, 1);
+  assert.equal(ring.backpressureWaitRate, 0);
+
+  // Pure external wait with 0 writes clamps backpressureWaitRate cleanly to 1.
+  ring.recordBackpressureWait(1);
+  assert.equal(ring.backpressureWaitRate, 1);
+  assert.equal(ring.getStats().backpressureWaitRate, 1);
+
+  // 64-byte SAB header reserved words remain untouched.
+  for (let off = 32; off < 64; off += 4) {
+    assert.equal(rawHeader.getUint32(off, true), 0);
+  }
 });
