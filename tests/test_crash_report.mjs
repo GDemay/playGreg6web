@@ -6,14 +6,17 @@ import CrashReporterDefault, {
   DEFAULT_MAX_LOGS,
   DEFAULT_MAX_ERRORS,
   DEFAULT_APP_VERSION,
+  MAX_GPU_ADAPTER_LENGTH,
   ERROR_CATEGORIES,
   BOOT_ERROR_CODES,
   CrashReporter,
   sanitizeString,
   sanitizeValue,
+  sanitizeGpuAdapter,
   classifyError,
   classifyBootError,
   formatGitHubIssueMarkdown,
+  formatMarkdownReport,
 } from '../web/telemetry/crash_report.js';
 import { PerfMonitor } from '../web/telemetry/perf_monitor.js';
 
@@ -1661,4 +1664,339 @@ test('W220 formatGitHubIssueMarkdown produces compact, strictly sanitized Markdo
   assert.ok(fromInstance.startsWith('### Custom Heading'));
   assert.ok(fromInstance.includes('0x123456789abcdef0'));
   assert.ok(!fromInstance.includes('0xabcdef0123456789'));
+});
+
+test('W247 sanitizeGpuAdapter enforces lowercase vendor/arch, max 96 chars, and strips host paths & secrets', () => {
+  assert.equal(MAX_GPU_ADAPTER_LENGTH, 96);
+
+  // Basic string & object normalization
+  assert.equal(sanitizeGpuAdapter('NVIDIA / Blackwell'), 'nvidia / blackwell');
+  assert.equal(sanitizeGpuAdapter('AMD/RDNA3'), 'amd / rdna3');
+  assert.equal(sanitizeGpuAdapter({ vendor: 'Intel', architecture: 'Gen-12LP' }), 'intel / gen-12lp');
+  assert.equal(sanitizeGpuAdapter({ info: { vendor: 'Apple', arch: 'Metal-3' } }), 'apple / metal-3');
+  assert.equal(sanitizeGpuAdapter({ vendor: 'NVIDIA', architecture: 'nvidia' }), 'nvidia');
+  assert.equal(sanitizeGpuAdapter({ adapterLabel: 'Qualcomm / Adreno-750' }), 'qualcomm / adreno-750');
+
+  // Strips Windows, UNC, POSIX, tilde paths, file:// URLs, query tokens, Bearer secrets, ANSI/HTML
+  assert.equal(
+    sanitizeGpuAdapter('NVIDIA / Blackwell C:\\Users\\alice\\GTA6\\nvgpu.dll ?token=sec123 Bearer eyJsecret'),
+    'nvidia / blackwell'
+  );
+  assert.equal(
+    sanitizeGpuAdapter('AMD / RDNA3 /home/bob/mesa/libvulkan.so (/Users/charlie/Library/Caches)'),
+    'amd / rdna3'
+  );
+  assert.equal(
+    sanitizeGpuAdapter('Intel / Arc \\\\fileserver\\private\\alice\\drv.sys file:///C:/Users/alice/gpu.json ~/drivers/igpu'),
+    'intel / arc'
+  );
+  assert.equal(
+    sanitizeGpuAdapter('\x1b[31mNVIDIA\x1b[0m / <script>alert(1)</script>Turing\x00\x07'),
+    'nvidia / turing'
+  );
+  assert.equal(
+    sanitizeGpuAdapter({ vendor: 'C:\\Users\\alice\\secret', architecture: 'RDNA3' }),
+    'rdna3'
+  );
+  assert.equal(
+    sanitizeGpuAdapter({ vendor: 'NVIDIA', architecture: '/home/bob/secret/driver' }),
+    'nvidia'
+  );
+
+  // Pure paths, empty inputs, and binary buffers yield null
+  assert.equal(sanitizeGpuAdapter('C:\\Users\\alice\\GTA6\\game.exe'), null);
+  assert.equal(sanitizeGpuAdapter('/Users/charlie/Desktop/gpu.bin'), null);
+  assert.equal(sanitizeGpuAdapter('   ///  '), null);
+  assert.equal(sanitizeGpuAdapter(''), null);
+  assert.equal(sanitizeGpuAdapter(null), null);
+  assert.equal(sanitizeGpuAdapter(undefined), null);
+  assert.equal(sanitizeGpuAdapter(new Uint8Array([1, 2, 3])), null);
+  assert.equal(sanitizeGpuAdapter(new ArrayBuffer(16)), null);
+  assert.equal(sanitizeGpuAdapter(42), null);
+
+  // Max 96 chars enforced with clean trailing trim
+  const veryLong = `NVIDIA / ${'blackwell-rtx-'.repeat(12)}`;
+  const clipped = sanitizeGpuAdapter(veryLong);
+  assert.ok(clipped !== null);
+  assert.ok(clipped.length <= 96);
+  assert.equal(clipped, clipped.toLowerCase());
+  assert.ok(!/[\s/._+-]$/.test(clipped));
+});
+
+test('W247 JSON bundles include sanitized gpuAdapter, firstVisibleFrameMs, blackLoadingMs, and #1027 guest audio PCM counters', () => {
+  const clock = createDeterministicClock(1700007000000);
+  const reporter = new CrashReporter({
+    appVersion: '0.5.0-w247',
+    now: clock.now,
+    globalObj: { crossOriginIsolated: true, SharedArrayBuffer },
+    navigatorObj: { gpu: {}, hardwareConcurrency: 8 },
+  });
+
+  // 1. Duck-typed BootTracer summary with firstVisibleFrameMs, blackLoadingMs, gpuAdapter
+  const bootStored = reporter.setBootSnapshot({
+    getSummary() {
+      return {
+        stage: 'FIRST_VISIBLE_FRAME',
+        mode: 'real-wasm',
+        progressPct: 100,
+        readyForSplash: true,
+        elapsedMs: 4250.5,
+        firstPresentMs: 2900.25,
+        firstVisibleFrameMs: 4250.5,
+        blackLoadingMs: 1350.25,
+        gpuAdapter: 'NVIDIA / Blackwell /home/bob/driver',
+        hostPath: 'C:\\Users\\alice\\GTA6',
+      };
+    },
+  });
+  assert.equal(bootStored.firstPresentMs, 2900.25);
+  assert.equal(bootStored.firstVisibleFrameMs, 4250.5);
+  assert.equal(bootStored.blackLoadingMs, 1350.25);
+  assert.equal(bootStored.gpuAdapter, 'nvidia / blackwell');
+  assert.equal('hostPath' in bootStored, false);
+
+  // 2. GPU telemetry with structured adapterInfo + timing fields
+  const gpuStored = reporter.setGpuTelemetry({
+    backend: 'webgpu',
+    gpuAdapter: { vendor: 'NVIDIA', architecture: 'Blackwell' },
+    firstVisibleFrameMs: 4250.5,
+    blackLoadingMs: 1350.25,
+    framesPresented: 12,
+    drawCalls: 95,
+    wgslSource: 'must-be-dropped',
+  });
+  assert.equal(gpuStored.gpuAdapter, 'nvidia / blackwell');
+  assert.equal(gpuStored.firstVisibleFrameMs, 4250.5);
+  assert.equal(gpuStored.blackLoadingMs, 1350.25);
+  assert.equal('wgslSource' in gpuStored, false);
+
+  // 3. Duck-typed AudioEngine (#1027) with PCM ring counters + disallowed buffers/paths/secrets
+  const mockAudioEngine = {
+    getStats() {
+      return {
+        outputState: 'running',
+        sampleRate: 48000,
+        channels: 2,
+        guestRingAttached: true,
+        guestFramesDrained: 19200.8,
+        guestUnderruns: 2,
+        guestOverruns: 1,
+        guestPeakLevel: 0.84,
+        // Disallowed fields that MUST be dropped
+        pcmSamples: new Float32Array([0.1, -0.2, 0.3]),
+        ringSab: new ArrayBuffer(64),
+        audioPath: 'C:\\Users\\alice\\GTA6\\audio\\sfx.awc',
+        token: 'audio-secret-token',
+      };
+    },
+  };
+  const audioStored = reporter.setAudioTelemetry(mockAudioEngine);
+  assert.equal(audioStored.outputState, 'running');
+  assert.equal(audioStored.guestRingAttached, true);
+  assert.equal(audioStored.guestFramesDrained, 19200);
+  assert.equal(audioStored.guestUnderruns, 2);
+  assert.equal(audioStored.guestOverruns, 1);
+  assert.equal(audioStored.guestPeakLevel, 0.84);
+  assert.equal('pcmSamples' in audioStored, false);
+  assert.equal('ringSab' in audioStored, false);
+  assert.equal('audioPath' in audioStored, false);
+  assert.equal('token' in audioStored, false);
+
+  // Build JSON bundle and verify both object and serialized JSON
+  const report = reporter.buildReport();
+  assert.equal(report.schemaVersion, SCHEMA_VERSION);
+  assert.equal(report.bootDiagnostics.gpuAdapter, 'nvidia / blackwell');
+  assert.equal(report.bootDiagnostics.firstVisibleFrameMs, 4250.5);
+  assert.equal(report.bootDiagnostics.blackLoadingMs, 1350.25);
+  assert.equal(report.bootDiagnostics.audioTelemetry.guestRingAttached, true);
+  assert.equal(report.bootDiagnostics.audioTelemetry.guestFramesDrained, 19200);
+  assert.equal(report.bootDiagnostics.audioTelemetry.guestUnderruns, 2);
+  assert.equal(report.bootDiagnostics.audioTelemetry.guestOverruns, 1);
+  assert.equal(report.bootDiagnostics.audioTelemetry.guestPeakLevel, 0.84);
+
+  const json = reporter.toJson();
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.bootDiagnostics.gpuAdapter, 'nvidia / blackwell');
+  assert.equal(parsed.bootDiagnostics.firstVisibleFrameMs, 4250.5);
+  assert.equal(parsed.bootDiagnostics.blackLoadingMs, 1350.25);
+  assert.equal(parsed.bootDiagnostics.audioTelemetry.guestRingAttached, true);
+  assert.equal(parsed.bootDiagnostics.audioTelemetry.guestFramesDrained, 19200);
+  assert.equal(parsed.bootDiagnostics.audioTelemetry.guestUnderruns, 2);
+  assert.equal(parsed.bootDiagnostics.audioTelemetry.guestOverruns, 1);
+  assert.equal(parsed.bootDiagnostics.audioTelemetry.guestPeakLevel, 0.84);
+
+  for (const forbidden of ['alice', 'bob', 'sfx.awc', 'audio-secret-token', 'must-be-dropped']) {
+    assert.ok(!json.includes(forbidden), `W247 JSON bundle leaked "${forbidden}"`);
+  }
+
+  // Clamping & validation edge cases (guestPeakLevel out of [0,1], invalid counters, zero timings)
+  const clampedAudio = reporter.setAudioTelemetry({
+    guestRingAttached: false,
+    guestFramesDrained: -10,
+    guestUnderruns: Number.NaN,
+    guestOverruns: Number.POSITIVE_INFINITY,
+    guestPeakLevel: 1.75,
+  });
+  assert.equal(clampedAudio.guestRingAttached, false);
+  assert.equal('guestFramesDrained' in clampedAudio, false);
+  assert.equal('guestUnderruns' in clampedAudio, false);
+  assert.equal('guestOverruns' in clampedAudio, false);
+  assert.equal(clampedAudio.guestPeakLevel, 1);
+
+  const negPeak = reporter.setAudioTelemetry({ guestPeakLevel: -0.4 });
+  assert.equal(negPeak.guestPeakLevel, 0);
+
+  // Raw binary buffer passed to setAudioTelemetry returns null
+  assert.equal(reporter.setAudioTelemetry(new Float32Array(16)), null);
+  assert.equal(reporter.getAudioTelemetry(), null);
+
+  // Per-call overrides (including zero ms timings and deriving blackLoadingMs from milestones) without mutating stored state
+  reporter.clear();
+  assert.equal(reporter.getGpuAdapter(), null);
+  assert.equal(reporter.getAudioTelemetry(), null);
+
+  const zeroOverride = reporter.buildReport({
+    gpuAdapter: 'AMD / RDNA3 C:\\Users\\alice\\drv',
+    firstVisibleFrameMs: 0,
+    blackLoadingMs: 0,
+    audioTelemetry: {
+      guestRingAttached: true,
+      guestFramesDrained: 0,
+      guestUnderruns: 0,
+      guestOverruns: 0,
+      guestPeakLevel: 0,
+    },
+  });
+  assert.equal(zeroOverride.bootDiagnostics.gpuAdapter, 'amd / rdna3');
+  assert.equal(zeroOverride.bootDiagnostics.firstVisibleFrameMs, 0);
+  assert.equal(zeroOverride.bootDiagnostics.blackLoadingMs, 0);
+  assert.deepEqual(zeroOverride.bootDiagnostics.audioTelemetry, {
+    guestRingAttached: true,
+    guestFramesDrained: 0,
+    guestUnderruns: 0,
+    guestOverruns: 0,
+    guestPeakLevel: 0,
+  });
+  assert.equal(reporter.getGpuAdapter(), null);
+  assert.equal(reporter.getAudioTelemetry(), null);
+
+  // Derives blackLoadingMs from FIRST_PRESENT + FIRST_VISIBLE_FRAME milestones and reads #1027 counters from perf.audio
+  const derivedReport = reporter.buildReport({
+    bootSnapshot: {
+      stage: 'FIRST_VISIBLE_FRAME',
+      milestones: [
+        { milestone: 'FIRST_PRESENT', reached: true, elapsedMs: 1200 },
+        { milestone: 'FIRST_VISIBLE_FRAME', reached: true, elapsedMs: 3700 },
+      ],
+    },
+    perfSnapshot: {
+      frames: { fps: 60 },
+      audio: {
+        bufferedFrames: 1024,
+        guestRingAttached: true,
+        guestFramesDrained: 4800,
+        guestUnderruns: 1,
+        guestOverruns: 0,
+        guestPeakLevel: 0.42,
+      },
+    },
+  });
+  assert.equal(derivedReport.bootDiagnostics.firstVisibleFrameMs, 3700);
+  assert.equal(derivedReport.bootDiagnostics.blackLoadingMs, 2500);
+  assert.equal(derivedReport.bootDiagnostics.audioTelemetry.guestRingAttached, true);
+  assert.equal(derivedReport.bootDiagnostics.audioTelemetry.guestFramesDrained, 4800);
+  assert.equal(derivedReport.bootDiagnostics.audioTelemetry.guestUnderruns, 1);
+  assert.equal(derivedReport.bootDiagnostics.audioTelemetry.guestOverruns, 0);
+  assert.equal(derivedReport.bootDiagnostics.audioTelemetry.guestPeakLevel, 0.42);
+});
+
+test('W247 formatMarkdownReport and formatGitHubIssueMarkdown render sanitized gpuAdapter, boot timings, and #1027 audio stats', () => {
+  const clock = createDeterministicClock(1700008000000);
+  const reporter = new CrashReporter({
+    appVersion: '0.5.0-w247',
+    now: clock.now,
+    globalObj: { crossOriginIsolated: true, SharedArrayBuffer },
+    navigatorObj: { gpu: {}, hardwareConcurrency: 12 },
+  });
+
+  reporter.setGpuAdapter('NVIDIA / Turing C:\\Users\\alice\\nv.dll?token=secret99');
+  reporter.setBootSnapshot({
+    stage: 'FIRST_VISIBLE_FRAME',
+    mode: 'real-wasm',
+    progressPct: 100,
+    readyForSplash: true,
+    firstVisibleFrameMs: 5120,
+    blackLoadingMs: 1840.5,
+    trapCount: 0,
+  });
+  reporter.setGpuTelemetry({
+    backend: 'webgpu',
+    framesPresented: 45,
+    drawCalls: 210,
+    validationErrorCount: 0,
+  });
+  reporter.setAudioTelemetry({
+    outputState: 'running',
+    guestRingAttached: true,
+    guestFramesDrained: 24576,
+    guestUnderruns: 3,
+    guestOverruns: 1,
+    guestPeakLevel: 0.725,
+    pcmDump: new Float32Array(32),
+    audioFile: '/Users/charlie/Music/intro.awc',
+  });
+
+  const mdMethod = reporter.formatMarkdownReport();
+  const mdAlias = reporter.toGitHubIssueMarkdown();
+  const mdStandalone = formatMarkdownReport(reporter.buildReport());
+  const mdFromInstance = formatMarkdownReport(reporter);
+
+  assert.equal(mdMethod, mdAlias);
+  assert.equal(mdMethod, mdStandalone);
+  assert.equal(mdMethod, mdFromInstance);
+
+  assert.ok(mdMethod.includes('gpuAdapter=`nvidia / turing`'));
+  assert.ok(mdMethod.includes('firstVisibleFrameMs=5120ms'));
+  assert.ok(mdMethod.includes('blackLoadingMs=1840.5ms'));
+  assert.ok(mdMethod.includes('- **Audio:**'));
+  assert.ok(mdMethod.includes('state=`running`'));
+  assert.ok(mdMethod.includes('guestRingAttached=yes'));
+  assert.ok(mdMethod.includes('guestFramesDrained=24576'));
+  assert.ok(mdMethod.includes('guestUnderruns=3'));
+  assert.ok(mdMethod.includes('guestOverruns=1'));
+  assert.ok(mdMethod.includes('guestPeakLevel=0.725'));
+
+  for (const forbidden of ['alice', 'charlie', 'secret99', 'nv.dll', 'intro.awc']) {
+    assert.ok(!mdMethod.includes(forbidden), `formatMarkdownReport leaked "${forbidden}"`);
+  }
+
+  // Defense-in-depth: raw unsanitized report object passed directly to formatMarkdownReport()
+  const rawMd = formatMarkdownReport({
+    schemaVersion: 1,
+    appVersion: '0.5.0-raw',
+    gpuAdapter: `Intel / ${'Gen12-LP-'.repeat(15)} /home/bob/dri/iris_dri.so Bearer topsecret`,
+    firstVisibleFrameMs: 2400,
+    blackLoadingMs: 650,
+    audioTelemetry: {
+      guestRingAttached: false,
+      guestFramesDrained: 512,
+      guestUnderruns: 0,
+      guestOverruns: 4,
+      guestPeakLevel: 1.9,
+      rawPcm: new Uint8Array([1, 2, 3, 4]),
+      hostPath: 'C:\\Users\\alice\\GTA6\\audio.rpf',
+    },
+  });
+
+  assert.ok(rawMd.includes('- **Boot:** firstVisibleFrameMs=2400ms, blackLoadingMs=650ms'));
+  assert.ok(rawMd.includes('- **GPU:** gpuAdapter=`intel / gen12-lp-'));
+  const adapterMatch = /gpuAdapter=`([^`]+)`/.exec(rawMd);
+  assert.ok(adapterMatch !== null);
+  assert.ok(adapterMatch[1].length <= 96);
+  assert.equal(adapterMatch[1], adapterMatch[1].toLowerCase());
+  assert.ok(rawMd.includes('- **Audio:** guestRingAttached=no, guestFramesDrained=512, guestUnderruns=0, guestOverruns=4, guestPeakLevel=1'));
+
+  for (const forbidden of ['alice', 'bob', 'topsecret', 'iris_dri.so', 'audio.rpf']) {
+    assert.ok(!rawMd.includes(forbidden), `Raw formatMarkdownReport leaked "${forbidden}"`);
+  }
 });
