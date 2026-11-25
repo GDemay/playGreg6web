@@ -13,6 +13,7 @@ const {
   UNIFORM_FLAG_SWAP_CHROMA,
   TARGET_FPS_30_INTERVAL_MS,
   DEFAULT_BIND_GROUP_CACHE_CAPACITY,
+  TRIPLE_BUFFER_SLOTS,
   BINK_PIXEL_FORMAT,
   BINK_CHROMA_ORDER,
   BINK_LOAD_OP,
@@ -2720,5 +2721,415 @@ test('W280: targetFpsHitRate30 tracks <= 33.333ms intervals, clamps to [0, 1], a
   assert.equal(presenter.getStats().bindGroupHitRate, 1);
   assert.equal(presenter.getStats().targetFpsHitRate30, 1);
 
+  presenter.destroy();
+});
+
+test('W316: triple-buffered Y/U/V/A plane ring rotates across 3 slots and destroys all slots on resize, device-loss, and destroy()', () => {
+  assert.equal(TRIPLE_BUFFER_SLOTS, 3);
+
+  const device = createMockWebGpuDevice();
+  // Option validation for planeRingDepth and conflicting slotCount.
+  assert.throws(() => new BinkVideoPresenter({ device, planeRingDepth: 0 }), RangeError);
+  assert.throws(() => new BinkVideoPresenter({ device, planeRingDepth: -3 }), RangeError);
+  assert.throws(() => new BinkVideoPresenter({ device, planeRingDepth: 1.5 }), RangeError);
+  assert.throws(
+    () => new BinkVideoPresenter({ device, planeRingDepth: 3, slotCount: 2 }),
+    RangeError
+  );
+
+  // Backwards-compatible single-slot ring (planeRingDepth: 1) has zero rotations across consecutive frames.
+  const singleDevice = createMockWebGpuDevice();
+  const singlePresenter = new BinkVideoPresenter({ device: singleDevice, planeRingDepth: 1 });
+  const smallY = new Uint8Array(32 * 16).fill(180);
+  const smallU = new Uint8Array(16 * 8).fill(128);
+  const smallV = new Uint8Array(16 * 8).fill(128);
+  const smallA = new Uint8Array(32 * 16).fill(255);
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w316-ring' };
+
+  for (let i = 0; i < 4; i += 1) {
+    const up = singlePresenter.uploadYuv420Frame({
+      y: smallY,
+      u: smallU,
+      v: smallV,
+      a: smallA,
+      width: 32,
+      height: 16,
+    });
+    assert.equal(up.slotIndex, 0);
+    singlePresenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  }
+  assert.equal(singlePresenter.planeRingDepth, 1);
+  assert.equal(singlePresenter.getStats().planeRingDepth, 1);
+  assert.equal(singlePresenter.getStats().planeSlotRotations, 0);
+  assert.equal(singleDevice.createdTextures.length, 5); // 4 planes + 1 dummy
+  singlePresenter.destroy();
+
+  // Opt-in triple buffering via enableTripleBuffering: true with 4K YUVA420P (Y/U/V/A planes).
+  const tripleDevice = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device: tripleDevice,
+    enableTripleBuffering: true,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  assert.equal(presenter.planeRingDepth, 3);
+  assert.equal(presenter.getStats().planeRingDepth, 3);
+  assert.equal(presenter.getStats().slotCount, 3);
+
+  const y4k = new Uint8Array(3840 * 2160);
+  const cr4k = new Uint8Array(1920 * 1080);
+  const cb4k = new Uint8Array(1920 * 1080);
+  const a4k = new Uint8Array(3840 * 2160);
+
+  const slotSequence = [];
+  const yTexturePerFrame = [];
+  for (let f = 0; f < 6; f += 1) {
+    const callsBefore = tripleDevice.writeTextureCalls.length;
+    const up = presenter.uploadYuv420Frame({
+      y: y4k,
+      u: cr4k,
+      v: cb4k,
+      a: a4k,
+      width: 3840,
+      height: 2160,
+    });
+    slotSequence.push(up.slotIndex);
+    assert.equal(presenter.activePlaneSlot, up.slotIndex);
+    yTexturePerFrame.push(tripleDevice.writeTextureCalls[callsBefore].dest.texture);
+    presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  }
+
+  // Exact 3-slot ring rotation 0 -> 1 -> 2 -> 0 -> 1 -> 2 across 6 frames (5 rotations).
+  assert.deepEqual(slotSequence, [0, 1, 2, 0, 1, 2]);
+  assert.equal(presenter.planeSlotRotations, 5);
+  assert.equal(presenter.getStats().planeSlotRotations, 5);
+
+  // Frame N writes into a strictly distinct GPU texture from frames N-1 and N-2, then wraps to slot 0 on frame 3.
+  assert.notEqual(yTexturePerFrame[0], yTexturePerFrame[1]);
+  assert.notEqual(yTexturePerFrame[1], yTexturePerFrame[2]);
+  assert.notEqual(yTexturePerFrame[0], yTexturePerFrame[2]);
+  assert.equal(yTexturePerFrame[3], yTexturePerFrame[0]);
+  assert.equal(yTexturePerFrame[4], yTexturePerFrame[1]);
+  assert.equal(yTexturePerFrame[5], yTexturePerFrame[2]);
+
+  // 3 slots * 4 planes (Y/U/V/A) + 1 dummy = 13 textures total; 0 new allocations after slot 2 warms.
+  assert.equal(tripleDevice.createdTextures.length, 13);
+  const old4kPlaneTextures = tripleDevice.createdTextures.filter(
+    (t) => t.label !== 'playgta6-bink-presenter-dummy'
+  );
+  assert.equal(old4kPlaneTextures.length, 12);
+  for (const tex of old4kPlaneTextures) {
+    assert.equal(tex.destroyed, false);
+  }
+
+  // Dynamic video resolution resize (3840x2160 -> 1920x1080) destroys ALL 12 plane textures across all 3 slots
+  // and resets to slot 0 without counting the resize reset as a ring rotation.
+  const y1080 = new Uint8Array(1920 * 1080);
+  const c1080 = new Uint8Array(960 * 540);
+  const a1080 = new Uint8Array(1920 * 1080);
+  const resizeUp = presenter.uploadYuv420Frame({
+    y: y1080,
+    u: c1080,
+    v: c1080,
+    a: a1080,
+    width: 1920,
+    height: 1080,
+  });
+  assert.equal(resizeUp.slotIndex, 0);
+  assert.equal(presenter.activePlaneSlot, 0);
+  assert.equal(presenter.planeSlotRotations, 5); // unchanged on resize reset
+  assert.equal(presenter.getStats().resizeCount, 1);
+  for (const tex of old4kPlaneTextures) {
+    assert.equal(tex.destroyed, true);
+    assert.equal(tex.destroyCalls, 1);
+  }
+
+  // Warm all 3 slots at 1080p, then simulate device loss via setDevice(device2) -> destroys all 3 slots cleanly.
+  presenter.uploadYuv420Frame({ y: y1080, u: c1080, v: c1080, a: a1080, width: 1920, height: 1080 });
+  presenter.uploadYuv420Frame({ y: y1080, u: c1080, v: c1080, a: a1080, width: 1920, height: 1080 });
+  assert.equal(presenter.planeSlotRotations, 7);
+  const old1080Textures = tripleDevice.createdTextures.slice(13);
+  assert.equal(old1080Textures.length, 12);
+
+  const device2 = createMockWebGpuDevice();
+  presenter.setDevice(device2);
+  for (const tex of old1080Textures) {
+    assert.equal(tex.destroyed, true);
+    assert.equal(tex.destroyCalls, 1);
+  }
+  assert.equal(presenter.activePlaneSlot, 0);
+  assert.equal(presenter.planeRingDepth, 3);
+
+  // Explicit planeRingDepth: 3 populates all 3 slots on device2 and destroy() frees every plane texture idempotently.
+  const presenterExplicit = new BinkVideoPresenter({ device: device2, planeRingDepth: 3 });
+  assert.equal(presenterExplicit.planeRingDepth, 3);
+  for (let i = 0; i < 3; i += 1) {
+    presenterExplicit.uploadYuv420Frame({
+      y: smallY,
+      u: smallU,
+      v: smallV,
+      a: smallA,
+      width: 32,
+      height: 16,
+    });
+    presenterExplicit.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  }
+  assert.equal(device2.createdTextures.length, 13); // 3 * 4 planes + 1 dummy
+  presenterExplicit.destroy();
+  for (const tex of device2.createdTextures) {
+    assert.equal(tex.destroyed, true);
+    assert.equal(tex.destroyCalls, 1);
+  }
+  presenterExplicit.destroy();
+  for (const tex of device2.createdTextures) {
+    assert.equal(tex.destroyCalls, 1);
+  }
+
+  presenter.destroy();
+});
+
+test('W316: writeTexture descriptors are reused across Y/U/V/A plane uploads with accurate reusedUploadDescriptors telemetry', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    planeRingDepth: 3,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w316-desc' };
+
+  const y = new Uint8Array(64 * 32);
+  const u = new Uint8Array(32 * 16);
+  const v = new Uint8Array(32 * 16);
+  const a = new Uint8Array(64 * 32);
+
+  assert.equal(presenter.reusedUploadDescriptors, 0);
+  assert.equal(presenter.getStats().reusedUploadDescriptors, 0);
+
+  // 6 frames * 4 planes (Y/U/V/A) = 24 plane writeTexture calls (+ 1 dummy setup writeTexture).
+  for (let f = 0; f < 6; f += 1) {
+    presenter.uploadYuv420Frame({ y, u, v, a, width: 64, height: 32 });
+    presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  }
+
+  assert.equal(presenter.reusedUploadDescriptors, 24);
+  assert.equal(presenter.getStats().reusedUploadDescriptors, 24);
+
+  // Also test NV12 (+2 planes) and RGBA8 (+1 plane) -> 27 total plane descriptor reuses.
+  presenter.uploadNv12Frame({
+    y,
+    uv: new Uint8Array(32 * 16 * 2),
+    width: 64,
+    height: 32,
+  });
+  presenter.uploadRgbaFrame(new Uint8Array(64 * 32 * 4), 64, 32);
+  assert.equal(presenter.reusedUploadDescriptors, 27);
+  assert.equal(presenter.getStats().reusedUploadDescriptors, 27);
+
+  // Every single writeTexture call reuses the exact same pre-allocated dest, origin, dataLayout, and extent structs.
+  assert.equal(device.writeTextureCalls.length, 28); // 27 plane uploads + 1 dummy texture init
+  const firstCall = device.writeTextureCalls[0];
+  for (let i = 1; i < device.writeTextureCalls.length; i += 1) {
+    const call = device.writeTextureCalls[i];
+    assert.equal(call.rawDest, firstCall.rawDest, `writeTexture[${i}] must reuse destination struct`);
+    assert.equal(call.rawOrigin, firstCall.rawOrigin, `writeTexture[${i}] must reuse origin struct`);
+    assert.equal(
+      call.rawDataLayout,
+      firstCall.rawDataLayout,
+      `writeTexture[${i}] must reuse dataLayout struct`
+    );
+    assert.equal(call.rawSize, firstCall.rawSize, `writeTexture[${i}] must reuse extent struct`);
+  }
+
+  // Staging pool immediate encoder reuses layout scratch (increments counter); deferred staging does not.
+  const stagedPresenter = new BinkVideoPresenter({
+    device,
+    planeRingDepth: 3,
+    stagingPool: { stageTextureUpload() {} },
+  });
+  stagedPresenter.uploadYuv420Frame({
+    y,
+    u,
+    v,
+    width: 64,
+    height: 32,
+    commandEncoder: createMockCommandEncoder(),
+  });
+  assert.equal(stagedPresenter.getStats().reusedUploadDescriptors, 3);
+  stagedPresenter.uploadYuv420Frame({ y, u, v, width: 64, height: 32 }); // deferred: allocates layouts
+  assert.equal(stagedPresenter.getStats().reusedUploadDescriptors, 3);
+  stagedPresenter.destroy();
+
+  presenter.resetStats();
+  assert.equal(presenter.reusedUploadDescriptors, 0);
+  assert.equal(presenter.getStats().reusedUploadDescriptors, 0);
+  presenter.destroy();
+});
+
+test('W316: 30 FPS pacing telemetry tracks framesOver30FpsBudget, peakPresentIntervalMs, planeSlotRotations and resets cleanly', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    enableTripleBuffering: true,
+    targetFps: 30,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w316-pacing' };
+  const y = new Uint8Array(32 * 16).fill(180);
+  const u = new Uint8Array(16 * 8).fill(128);
+  const v = new Uint8Array(16 * 8).fill(128);
+
+  // Initial sanitized telemetry before any frames.
+  let stats = presenter.getStats();
+  assert.equal(stats.planeRingDepth, 3);
+  assert.equal(stats.planeSlotRotations, 0);
+  assert.equal(stats.reusedUploadDescriptors, 0);
+  assert.equal(stats.framesOver30FpsBudget, 0);
+  assert.equal(stats.peakPresentIntervalMs, 0);
+
+  // Frame 0 baseline at t=1000.0
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1000.0 });
+  assert.equal(presenter.framesOver30FpsBudget, 0);
+  assert.equal(presenter.peakPresentIntervalMs, 0);
+
+  // Frame 1 at t=1016.666 (16.666ms <= 33.333ms) -> within budget, peak=16.666
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1016.666 });
+  assert.equal(presenter.framesOver30FpsBudget, 0);
+  assertNear(presenter.peakPresentIntervalMs, 16.666, 1e-6);
+
+  // Frame 2 at t=1049.999 (33.333ms <= 1000/30) -> within budget, peak=33.333
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1049.999 });
+  assert.equal(presenter.framesOver30FpsBudget, 0);
+  assertNear(presenter.peakPresentIntervalMs, 33.333, 1e-6);
+
+  // Frame 3 at t=1083.333 (33.334ms > 1000/30) -> over 30 FPS budget (1), peak=33.334
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1083.333 });
+  assert.equal(presenter.framesOver30FpsBudget, 1);
+  assertNear(presenter.peakPresentIntervalMs, 33.334, 1e-6);
+
+  // Frame 4 at t=1150.0 (66.667ms hitch) -> over 30 FPS budget (2), peak=66.667
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1150.0 });
+  assert.equal(presenter.framesOver30FpsBudget, 2);
+  assertNear(presenter.peakPresentIntervalMs, 66.667, 1e-6);
+
+  // Frame 5 at t=1170.0 (20.0ms) -> within budget, peak stays 66.667
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1170.0 });
+  assert.equal(presenter.framesOver30FpsBudget, 2);
+  assertNear(presenter.peakPresentIntervalMs, 66.667, 1e-6);
+
+  // Backwards clock and zero-delta intervals do not corrupt budget or peak counters.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1120.0 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1120.0 });
+
+  stats = presenter.getStats();
+  assert.equal(stats.planeRingDepth, 3);
+  assert.equal(stats.planeSlotRotations, 5);
+  assert.equal(stats.reusedUploadDescriptors, 18); // 6 frames * 3 planes
+  assert.equal(stats.framesOver30FpsBudget, 2);
+  assertNear(stats.peakPresentIntervalMs, 66.667, 1e-6);
+  assertNear(stats.targetFpsHitRate30, 3 / 5, 1e-9);
+
+  // resetStats() clears counters cleanly while preserving planeRingDepth and cached GPU textures/bind groups.
+  const texBeforeReset = device.createdTextures.length;
+  const bgBeforeReset = device.createdBindGroups.length;
+  presenter.resetStats();
+
+  stats = presenter.getStats();
+  assert.equal(stats.planeRingDepth, 3);
+  assert.equal(stats.planeSlotRotations, 0);
+  assert.equal(stats.reusedUploadDescriptors, 0);
+  assert.equal(stats.framesOver30FpsBudget, 0);
+  assert.equal(stats.peakPresentIntervalMs, 0);
+  assert.equal(stats.targetFpsHitRate30, 0);
+  assert.equal(stats.bindGroupCacheSize, 3);
+
+  // Fresh frames after resetStats() reuse all 3 ring slots and cached bind groups with 0 GPU allocations.
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 2000.0 });
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 2040.0 });
+
+  assert.equal(device.createdTextures.length, texBeforeReset);
+  assert.equal(device.createdBindGroups.length, bgBeforeReset);
+  stats = presenter.getStats();
+  assert.equal(stats.planeSlotRotations, 2);
+  assert.equal(stats.reusedUploadDescriptors, 6);
+  assert.equal(stats.framesOver30FpsBudget, 1);
+  assertNear(stats.peakPresentIntervalMs, 40.0, 1e-6);
+  assert.equal(stats.bindGroupCacheHits, 2);
+  assert.equal(stats.bindGroupCacheMisses, 0);
+
+  presenter.destroy();
+});
+
+test('W316: triple-buffered 4K playback preserves 100% W280 bind-group LRU cache hit behavior and bounded eviction', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    enableTripleBuffering: true,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w316-w280' };
+
+  const y4k = new Uint8Array(3840 * 2160);
+  const cr4k = new Uint8Array(1920 * 1080);
+  const cb4k = new Uint8Array(1920 * 1080);
+
+  // 15 sustained 4K frames at 30 FPS (33.0ms interval): 3 warm bind-group misses + 12 LRU hits.
+  for (let i = 0; i < 15; i += 1) {
+    presenter.uploadYuv420Frame({ y: y4k, u: cr4k, v: cb4k, width: 3840, height: 2160 });
+    presenter.present(createMockCommandEncoder(), targetView, 3840, 2160, {
+      nowMs: 1000 + i * 33,
+    });
+  }
+
+  let stats = presenter.getStats();
+  assert.equal(device.createdTextures.length, 10); // 3 slots * 3 planes + 1 dummy
+  assert.equal(device.createdBindGroups.length, 3);
+  assert.equal(device.writeBufferCalls.length, 1); // uniform uploaded once, skipped 14 times
+  assert.equal(stats.planeRingDepth, 3);
+  assert.equal(stats.planeSlotRotations, 14);
+  assert.equal(stats.reusedUploadDescriptors, 45); // 15 * 3 planes
+  assert.equal(stats.bindGroupCacheMisses, 3);
+  assert.equal(stats.bindGroupCacheHits, 12);
+  assertNear(stats.bindGroupHitRate, 12 / 15, 1e-9);
+  assert.equal(stats.bindGroupCacheSize, 3);
+  assert.equal(stats.uniformWritesSkipped, 14);
+  assert.equal(stats.framesOver30FpsBudget, 0);
+  assertNear(stats.peakPresentIntervalMs, 33, 1e-6);
+  assertNear(stats.targetFpsHitRate30, 1.0, 1e-9);
+
+  // Output resize() invalidates W280 cache cleanly while preserving triple-buffered slots and active frame.
+  presenter.resize(1920, 1080);
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  const resAfterResize = presenter.present(createMockCommandEncoder(), targetView, 1920, 1080, {
+    nowMs: 1500,
+  });
+  assert.equal(resAfterResize.presented, true);
+  assert.equal(presenter.bindGroupCacheSize, 1);
+  assert.equal(device.createdTextures.length, 10); // plane ring untouched
+
+  // Bounded LRU eviction when bindGroupCacheCapacity (2) < planeRingDepth (3).
+  const capDevice = createMockWebGpuDevice();
+  const capPresenter = new BinkVideoPresenter({
+    device: capDevice,
+    planeRingDepth: 3,
+    bindGroupCacheCapacity: 2,
+  });
+  const smallY = new Uint8Array(16 * 8);
+  const smallC = new Uint8Array(8 * 4);
+  for (let i = 0; i < 4; i += 1) {
+    capPresenter.uploadYuv420Frame({ y: smallY, u: smallC, v: smallC, width: 16, height: 8 });
+    capPresenter.presentFrame(createMockCommandEncoder(), targetView, 320, 180);
+  }
+  assert.equal(capPresenter.planeRingDepth, 3);
+  assert.equal(capPresenter.bindGroupCacheCapacity, 2);
+  assert.equal(capPresenter.bindGroupCacheSize, 2);
+  assert.equal(capDevice.createdBindGroups.length, 4);
+
+  capPresenter.destroy();
   presenter.destroy();
 });
