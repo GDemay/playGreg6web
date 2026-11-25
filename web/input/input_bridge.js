@@ -242,7 +242,15 @@ function readGamepadTrigger(button) {
 }
 
 // Named deterministic scripted-input presets.
-// 'start-screen' matches tools/run_native_boot.py (A held 100 ms every 1000 ms starting at 5000 ms).
+// - 'start-screen': matches tools/run_native_boot.py (A held 100 ms every 1000 ms starting at 5000 ms).
+// - 'menu-flow': periodic A presses on Start Screen, clean pauses across CONTINUE / UI TEXT SIZE,
+//   spaced A confirmations through calibration screens, then gentle periodic D-pad Down/Up + A
+//   navigation probes in the Main Menu (never presses B).
+// - 'calibration-skip': steady A confirmations spaced safely every 2500 ms starting at 5000 ms
+//   to advance cleanly through Start Screen -> CONTINUE -> UI TEXT SIZE -> calibration screens
+//   without double-tapping or backing out (B).
+// - 'intro-watch': waits 18 s (past the 15 s+ 4K Bink2 intro video) before issuing spaced A presses
+//   so automated captures record the full intro video before entering menus.
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -251,7 +259,72 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
     holdMs: 100,
     periodMs: 1000,
   }),
+  'menu-flow': Object.freeze({
+    name: 'menu-flow',
+    events: Object.freeze([
+      // Phase 1: Start Screen ("PRESS A TO START") — periodic A presses.
+      Object.freeze({ atMs: 5000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 6500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 8000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 2: Clean pause across CONTINUE and UI TEXT SIZE transitions.
+      Object.freeze({ atMs: 11500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 14500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 3: Accept calibration screens with safe spacing (no double-tap, no B).
+      Object.freeze({ atMs: 17500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 20500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 23500, holdMs: 100, button: INPUT_BUTTONS.A }),
+    ]),
+    // Phase 4: Main Menu gentle periodic D-pad Down -> Up -> A navigation probes.
+    loop: Object.freeze({
+      startMs: 27000,
+      periodMs: 8000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 2000, holdMs: 100, button: INPUT_BUTTONS.DPAD_UP }),
+        Object.freeze({ offsetMs: 4000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
+  }),
+  'calibration-skip': Object.freeze({
+    name: 'calibration-skip',
+    button: INPUT_BUTTONS.A,
+    startMs: 5000,
+    holdMs: 100,
+    periodMs: 2500,
+  }),
+  'intro-watch': Object.freeze({
+    name: 'intro-watch',
+    button: INPUT_BUTTONS.A,
+    startMs: 18000,
+    holdMs: 100,
+    periodMs: 2500,
+  }),
 });
+
+export const INPUT_SCRIPT_PRESET_NAMES = Object.freeze(Object.keys(INPUT_SCRIPT_PRESETS));
+
+const INPUT_BUTTON_ENTRIES = Object.freeze(
+  Object.entries(INPUT_BUTTONS).map(([name, bit]) => Object.freeze([name, bit]))
+);
+
+function formatScriptButtonMask(mask) {
+  const normalized = mask >>> 0;
+  if (normalized === 0) return null;
+  const names = [];
+  let matchedBits = 0;
+  for (let i = 0; i < INPUT_BUTTON_ENTRIES.length; i++) {
+    const [name, bit] = INPUT_BUTTON_ENTRIES[i];
+    if ((normalized & bit) !== 0) {
+      names.push(name);
+      matchedBits = (matchedBits | bit) >>> 0;
+    }
+  }
+  const unknownBits = (normalized & ~matchedBits) >>> 0;
+  if (unknownBits !== 0) {
+    names.push(`0x${unknownBits.toString(16)}`);
+  }
+  return names.length > 0 ? names.join('+') : null;
+}
 
 const SCRIPT_BUTTON_ALIASES = Object.freeze({
   START: INPUT_BUTTONS.MENU,
@@ -392,6 +465,7 @@ export class ScriptedInputPlayer {
       !Array.isArray(spec) &&
       typeof spec.preset === 'string' &&
       !Array.isArray(spec.events) &&
+      spec.loop === undefined &&
       spec.holdMs === undefined &&
       spec.periodMs === undefined
     ) {
@@ -406,8 +480,17 @@ export class ScriptedInputPlayer {
       };
     }
 
-    if (Array.isArray(spec) || (spec && typeof spec === 'object' && Array.isArray(spec.events))) {
-      const rawEvents = Array.isArray(spec) ? spec : spec.events;
+    if (
+      Array.isArray(spec) ||
+      (spec &&
+        typeof spec === 'object' &&
+        (Array.isArray(spec.events) || (spec.loop !== undefined && spec.loop !== null)))
+    ) {
+      const rawEvents = Array.isArray(spec)
+        ? spec
+        : Array.isArray(spec.events)
+          ? spec.events
+          : EMPTY_ARRAY;
       const specObj = Array.isArray(spec) ? null : spec;
       const endMs = validateOptionalEndMs(
         opts.endMs !== undefined ? opts.endMs : specObj?.endMs
@@ -455,9 +538,70 @@ export class ScriptedInputPlayer {
         );
       }
 
+      let normalizedLoop = null;
+      if (specObj && specObj.loop !== undefined && specObj.loop !== null) {
+        const rawLoop = specObj.loop;
+        if (typeof rawLoop !== 'object' || Array.isArray(rawLoop)) {
+          throw new TypeError('Scripted input loop must be an object');
+        }
+        const loopStartMs = validateNonNegativeFinite(rawLoop.startMs ?? 0, 'loop.startMs');
+        const loopPeriodMs = validatePositiveFinite(rawLoop.periodMs, 'loop.periodMs');
+        if (!Array.isArray(rawLoop.events)) {
+          throw new TypeError('Scripted input loop.events must be an array');
+        }
+        const loopIndexed = rawLoop.events.map((ev, index) => {
+          if (!ev || typeof ev !== 'object') {
+            throw new TypeError(`Scripted input loop event at index ${index} must be an object`);
+          }
+          const offsetMs = validateNonNegativeFinite(
+            ev.offsetMs !== undefined ? ev.offsetMs : 0,
+            `loop.events[${index}].offsetMs`
+          );
+          if (offsetMs >= loopPeriodMs) {
+            throw new RangeError(
+              `loop.events[${index}].offsetMs (${offsetMs}) must be < loop.periodMs (${loopPeriodMs})`
+            );
+          }
+          const holdMs = validatePositiveFinite(ev.holdMs, `loop.events[${index}].holdMs`);
+          const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
+          const sticks = normalizeScriptSticks(ev.sticks);
+          return { index, offsetMs, holdMs, buttonsMask, sticks };
+        });
+
+        loopIndexed.sort((a, b) =>
+          a.offsetMs !== b.offsetMs ? a.offsetMs - b.offsetMs : a.index - b.index
+        );
+
+        const maxLoopPresses =
+          maxPresses !== null ? Math.max(0, maxPresses - capped.length) : null;
+
+        if (
+          loopIndexed.length > 0 &&
+          maxLoopPresses !== 0 &&
+          (endMs === null || loopStartMs < endMs)
+        ) {
+          normalizedLoop = Object.freeze({
+            startMs: loopStartMs,
+            periodMs: loopPeriodMs,
+            maxLoopPresses,
+            events: Object.freeze(
+              loopIndexed.map((ev) =>
+                Object.freeze({
+                  offsetMs: ev.offsetMs,
+                  holdMs: ev.holdMs,
+                  buttonsMask: ev.buttonsMask,
+                  sticks: ev.sticks,
+                })
+              )
+            ),
+          });
+        }
+      }
+
       this._mode = 'events';
       this._rule = null;
       this._events = Object.freeze(normalized);
+      this._loop = normalizedLoop;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
     } else if (spec && typeof spec === 'object') {
@@ -487,6 +631,7 @@ export class ScriptedInputPlayer {
         sticks,
       });
       this._events = EMPTY_ARRAY;
+      this._loop = null;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
     } else {
@@ -542,6 +687,8 @@ export class ScriptedInputPlayer {
     this._startedAt = 0;
     this._stoppedElapsedMs = 0;
     this._pressCount = 0;
+    this._scriptedPressesSent = 0;
+    this._lastScriptedButton = null;
     this._currentMask = 0;
     this._currentSticks = null;
     this._timerId = null;
@@ -638,6 +785,56 @@ export class ScriptedInputPlayer {
       }
     }
 
+    if (
+      this._loop &&
+      elapsedMs >= this._loop.startMs &&
+      (this._endMs === null || elapsedMs < this._endMs)
+    ) {
+      const { startMs: loopStartMs, periodMs, events: loopEvents, maxLoopPresses } = this._loop;
+      const loopLen = loopEvents.length;
+      for (let j = 0; j < loopLen; j++) {
+        const ev = loopEvents[j];
+        if (maxLoopPresses !== null && j >= maxLoopPresses) continue;
+        const firstAt = loopStartMs + ev.offsetMs;
+        if (elapsedMs < firstAt) continue;
+        if (this._endMs !== null && firstAt >= this._endMs) continue;
+
+        let maxK = Math.floor((elapsedMs - firstAt) / periodMs);
+        if (maxLoopPresses !== null) {
+          maxK = Math.min(maxK, Math.floor((maxLoopPresses - 1 - j) / loopLen));
+        }
+        if (this._endMs !== null) {
+          maxK = Math.min(maxK, Math.ceil((this._endMs - firstAt) / periodMs) - 1);
+        }
+        if (maxK < 0) continue;
+
+        const latestEnd = firstAt + maxK * periodMs + ev.holdMs;
+        if (elapsedMs >= latestEnd) continue;
+
+        let countForEv = 1;
+        if (ev.holdMs > periodMs) {
+          let lowK = Math.max(0, Math.floor((elapsedMs - firstAt - ev.holdMs) / periodMs) + 1);
+          while (lowK <= maxK && firstAt + lowK * periodMs + ev.holdMs <= elapsedMs) {
+            lowK += 1;
+          }
+          while (lowK > 0 && firstAt + (lowK - 1) * periodMs + ev.holdMs > elapsedMs) {
+            lowK -= 1;
+          }
+          countForEv = Math.max(1, maxK - lowK + 1);
+        }
+
+        buttonsMask = (buttonsMask | ev.buttonsMask) >>> 0;
+        activeEventCount += countForEv;
+        if (ev.sticks) {
+          hasSticks = true;
+          if (ev.sticks.lx !== null) lx = ev.sticks.lx;
+          if (ev.sticks.ly !== null) ly = ev.sticks.ly;
+          if (ev.sticks.rx !== null) rx = ev.sticks.rx;
+          if (ev.sticks.ry !== null) ry = ev.sticks.ry;
+        }
+      }
+    }
+
     if (hasSticks) {
       return {
         buttonsMask,
@@ -677,6 +874,30 @@ export class ScriptedInputPlayer {
         break;
       }
     }
+
+    if (this._loop && elapsedMs >= this._loop.startMs) {
+      const { startMs: loopStartMs, periodMs, events: loopEvents, maxLoopPresses } = this._loop;
+      const loopLen = loopEvents.length;
+      for (let j = 0; j < loopLen; j++) {
+        const ev = loopEvents[j];
+        if (maxLoopPresses !== null && j >= maxLoopPresses) continue;
+        const firstAt = loopStartMs + ev.offsetMs;
+        if (elapsedMs < firstAt) continue;
+        if (this._endMs !== null && firstAt >= this._endMs) continue;
+
+        let maxK = Math.floor((elapsedMs - firstAt) / periodMs);
+        if (maxLoopPresses !== null) {
+          maxK = Math.min(maxK, Math.floor((maxLoopPresses - 1 - j) / loopLen));
+        }
+        if (this._endMs !== null) {
+          maxK = Math.min(maxK, Math.ceil((this._endMs - firstAt) / periodMs) - 1);
+        }
+        if (maxK >= 0) {
+          count += maxK + 1;
+        }
+      }
+    }
+
     return count;
   }
 
@@ -728,6 +949,60 @@ export class ScriptedInputPlayer {
         nextMs = ev.endMs;
       }
     }
+
+    if (this._loop && (this._endMs === null || t < this._endMs)) {
+      const { startMs: loopStartMs, periodMs, events: loopEvents, maxLoopPresses } = this._loop;
+      const loopLen = loopEvents.length;
+      for (let j = 0; j < loopLen; j++) {
+        const ev = loopEvents[j];
+        if (maxLoopPresses !== null && j >= maxLoopPresses) continue;
+        const firstAt = loopStartMs + ev.offsetMs;
+        if (this._endMs !== null && firstAt >= this._endMs) continue;
+
+        let maxK = Infinity;
+        if (maxLoopPresses !== null) {
+          maxK = Math.min(maxK, Math.floor((maxLoopPresses - 1 - j) / loopLen));
+        }
+        if (this._endMs !== null) {
+          maxK = Math.min(maxK, Math.ceil((this._endMs - firstAt) / periodMs) - 1);
+        }
+        if (maxK < 0) continue;
+
+        if (t < firstAt) {
+          if (firstAt < nextMs) nextMs = firstAt;
+          continue;
+        }
+
+        const k = Math.min(Math.floor((t - firstAt) / periodMs), maxK);
+        if (ev.holdMs < periodMs) {
+          const rawEnd = firstAt + k * periodMs + ev.holdMs;
+          const evEnd = this._endMs !== null ? Math.min(rawEnd, this._endMs) : rawEnd;
+          if (t < evEnd && evEnd < nextMs) {
+            nextMs = evEnd;
+          }
+          if (k + 1 <= maxK) {
+            const nextStart = firstAt + (k + 1) * periodMs;
+            if (nextStart > t && nextStart < nextMs) {
+              nextMs = nextStart;
+            }
+          }
+        } else {
+          if (!Number.isFinite(maxK)) {
+            if (this._endMs !== null && t < this._endMs && this._endMs < nextMs) {
+              nextMs = this._endMs;
+            }
+          } else {
+            const rawFinalEnd = firstAt + maxK * periodMs + ev.holdMs;
+            const finalEnd =
+              this._endMs !== null ? Math.min(rawFinalEnd, this._endMs) : rawFinalEnd;
+            if (t < finalEnd && finalEnd < nextMs) {
+              nextMs = finalEnd;
+            }
+          }
+        }
+      }
+    }
+
     return Number.isFinite(nextMs) ? nextMs : null;
   }
 
@@ -760,17 +1035,31 @@ export class ScriptedInputPlayer {
         ? Math.max(0, elapsedOverride)
         : Math.max(0, this._nowFn() - this._startedAt);
 
+    const prevMask = this._currentMask;
+    const prevPressCount = this._pressCount;
     const sample = this.sampleAt(elapsedMs);
-    this._pressCount = Math.max(this._pressCount, this.pressCountAt(elapsedMs));
+    const newPressCount = Math.max(prevPressCount, this.pressCountAt(elapsedMs));
+    this._pressCount = newPressCount;
 
     const nextMask = sample.buttonsMask >>> 0;
     const nextSticks = sample.sticks || null;
     const changed =
-      nextMask !== this._currentMask || !scriptSticksEqual(nextSticks, this._currentSticks);
+      nextMask !== prevMask || !scriptSticksEqual(nextSticks, this._currentSticks);
 
     if (changed) {
       this._currentMask = nextMask;
       this._currentSticks = nextSticks;
+      if (nextMask !== 0) {
+        const newlyPressed = (nextMask & ~prevMask) >>> 0;
+        if (newlyPressed !== 0) {
+          const addedPresses = Math.max(1, newPressCount - prevPressCount);
+          this._scriptedPressesSent += addedPresses;
+          this._lastScriptedButton = formatScriptButtonMask(newlyPressed);
+        } else if (newPressCount > prevPressCount) {
+          this._scriptedPressesSent += newPressCount - prevPressCount;
+          this._lastScriptedButton = formatScriptButtonMask(nextMask);
+        }
+      }
       this._emitSample(sample);
       if (!this._active || expectedToken !== this._runToken) return;
     }
@@ -803,6 +1092,7 @@ export class ScriptedInputPlayer {
    * Starts timer-driven playback from `elapsedMs = 0`.
    */
   start() {
+    const hadHeldState = this._currentMask !== 0 || this._currentSticks !== null;
     this._clearTimers();
     this._runToken += 1;
     const token = this._runToken;
@@ -810,9 +1100,22 @@ export class ScriptedInputPlayer {
     this._startedAt = this._nowFn();
     this._stoppedElapsedMs = 0;
     this._pressCount = 0;
+    this._scriptedPressesSent = 0;
+    this._lastScriptedButton = null;
+    this._currentMask = 0;
+    this._currentSticks = null;
     this._active = true;
 
     this._tick(token, 0);
+
+    if (
+      hadHeldState &&
+      this._currentMask === 0 &&
+      this._currentSticks === null &&
+      token === this._runToken
+    ) {
+      this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
+    }
 
     if (
       this._active &&
@@ -876,8 +1179,12 @@ export class ScriptedInputPlayer {
     return {
       active: this._active,
       preset: this.preset,
+      activePreset: this._active ? this.preset : null,
       elapsedMs,
+      elapsedScriptMs: elapsedMs,
       pressCount,
+      scriptedPressesSent: this._scriptedPressesSent,
+      lastScriptedButton: this._lastScriptedButton,
       currentMask: this._currentMask,
     };
   }
@@ -1606,20 +1913,55 @@ export class InputBridge {
   }
 
   /**
-   * Returns current scripted playback status:
-   * `{ active, preset, elapsedMs, pressCount, currentMask }`.
+   * Returns current scripted playback status and active-preset telemetry:
+   * `{ active, preset, activePreset, elapsedMs, elapsedScriptMs, pressCount,
+   *    scriptedPressesSent, lastScriptedButton, currentMask }`.
    */
   getScriptState() {
     if (!this._scriptPlayer) {
       return {
         active: false,
         preset: null,
+        activePreset: null,
         elapsedMs: 0,
+        elapsedScriptMs: 0,
         pressCount: 0,
+        scriptedPressesSent: 0,
+        lastScriptedButton: null,
         currentMask: 0,
       };
     }
     return this._scriptPlayer.getState();
+  }
+
+  /**
+   * Returns a sanitized bridge & scripted-input telemetry snapshot for HUD/diagnostics.
+   */
+  getStats() {
+    const script = this.getScriptState();
+    return {
+      running: this.running,
+      disposed: this.disposed,
+      pointerLocked: this.isPointerLocked(),
+      isSharedBuffer: this.isSharedBuffer,
+      usesAtomics: this.usesAtomics,
+      buttons: this.buttons,
+      scriptActive: script.active,
+      activePreset: script.activePreset,
+      preset: script.preset,
+      scriptedPressesSent: script.scriptedPressesSent,
+      lastScriptedButton: script.lastScriptedButton,
+      elapsedScriptMs: script.elapsedScriptMs,
+      currentScriptMask: script.currentMask,
+      availablePresets: INPUT_SCRIPT_PRESET_NAMES,
+    };
+  }
+
+  /**
+   * Alias for `getStats()`, returning a sanitized bridge & scripted-input status snapshot.
+   */
+  getStatus() {
+    return this.getStats();
   }
 
   consumeWheelDelta() {

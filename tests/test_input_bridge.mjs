@@ -18,6 +18,7 @@ import {
   applyAxialDeadzone,
   applyTriggerDeadzone,
   INPUT_SCRIPT_PRESETS,
+  INPUT_SCRIPT_PRESET_NAMES,
   ScriptedInputPlayer,
   InputBridge,
 } from '../web/input/input_bridge.js';
@@ -1251,8 +1252,12 @@ test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly wit
   assert.deepEqual(bridge.getScriptState(), {
     active: false,
     preset: null,
+    activePreset: null,
     elapsedMs: 0,
+    elapsedScriptMs: 0,
     pressCount: 0,
+    scriptedPressesSent: 0,
+    lastScriptedButton: null,
     currentMask: 0,
   });
 
@@ -1270,8 +1275,12 @@ test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly wit
   assert.deepEqual(bridge.getScriptState(), {
     active: true,
     preset: 'start-screen',
+    activePreset: 'start-screen',
     elapsedMs: 0,
+    elapsedScriptMs: 0,
     pressCount: 0,
+    scriptedPressesSent: 0,
+    lastScriptedButton: null,
     currentMask: 0,
   });
 
@@ -1289,8 +1298,12 @@ test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly wit
   assert.deepEqual(bridge.getScriptState(), {
     active: true,
     preset: 'start-screen',
+    activePreset: 'start-screen',
     elapsedMs: 5000,
+    elapsedScriptMs: 5000,
     pressCount: 1,
+    scriptedPressesSent: 1,
+    lastScriptedButton: 'A',
     currentMask: INPUT_BUTTONS.A,
   });
 
@@ -1310,8 +1323,12 @@ test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly wit
   assert.deepEqual(bridge.getScriptState(), {
     active: true,
     preset: 'start-screen',
+    activePreset: 'start-screen',
     elapsedMs: 5100,
+    elapsedScriptMs: 5100,
     pressCount: 1,
+    scriptedPressesSent: 1,
+    lastScriptedButton: 'A',
     currentMask: 0,
   });
 
@@ -1350,8 +1367,12 @@ test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly wit
   assert.deepEqual(bridge.getScriptState(), {
     active: false,
     preset: 'start-screen',
+    activePreset: null,
     elapsedMs: 7050,
+    elapsedScriptMs: 7050,
     pressCount: 3,
+    scriptedPressesSent: 3,
+    lastScriptedButton: 'A',
     currentMask: 0,
   });
 
@@ -1473,4 +1494,370 @@ test('InputBridge scripted playback supports interval mode, scripted sticks, aut
   assert.equal(headlessBridge.disposed, true);
   assert.equal(headlessBridge.getScriptState().active, false);
   assert.equal(headlessBridge.getSnapshot().buttons, 0);
+});
+
+test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen built-in presets cleanly', () => {
+  assert.equal(Object.isFrozen(INPUT_SCRIPT_PRESETS), true);
+  assert.equal(Object.isFrozen(INPUT_SCRIPT_PRESET_NAMES), true);
+  assert.deepEqual(INPUT_SCRIPT_PRESET_NAMES, [
+    'start-screen',
+    'menu-flow',
+    'calibration-skip',
+    'intro-watch',
+  ]);
+  assert.deepEqual(Object.keys(INPUT_SCRIPT_PRESETS), [...INPUT_SCRIPT_PRESET_NAMES]);
+
+  for (const name of INPUT_SCRIPT_PRESET_NAMES) {
+    const spec = INPUT_SCRIPT_PRESETS[name];
+    assert.ok(spec && typeof spec === 'object', `Preset ${name} must exist`);
+    assert.equal(Object.isFrozen(spec), true, `Preset ${name} must be frozen`);
+    assert.equal(spec.name, name);
+    assert.match(name, /^[a-z0-9][a-z0-9_-]{0,63}$/);
+    const player = new ScriptedInputPlayer(name);
+    assert.equal(player.preset, name);
+  }
+});
+
+test('W174 menu-flow preset advances Start Screen -> CONTINUE -> UI TEXT SIZE -> calibration -> periodic Main Menu probes without pressing B', () => {
+  const player = new ScriptedInputPlayer('menu-flow');
+  assert.equal(player.preset, 'menu-flow');
+
+  // 0..4999 ms: silent during initial boot settle.
+  for (const t of [0, 1000, 4999]) {
+    assert.deepEqual(player.sampleAt(t), { buttonsMask: 0, activeEventCount: 0 }, `idle at ${t}`);
+    assert.equal(player.pressCountAt(t), 0);
+  }
+
+  // Phase 1: Start Screen periodic A presses (5000, 6500, 8000).
+  for (const [idx, atMs] of [5000, 6500, 8000].entries()) {
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `Start Screen A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 99).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), idx + 1);
+  }
+
+  // Clean pause across Start Screen -> CONTINUE (8100..11499 -> 3.4 s quiet window).
+  for (let t = 8100; t < 11500; t += 100) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `pause before CONTINUE at ${t}`);
+  }
+  assert.equal(player.sampleAt(11500).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(11600).buttonsMask, 0);
+  assert.equal(player.pressCountAt(11500), 4);
+
+  // Clean pause across CONTINUE -> UI TEXT SIZE (11600..14499 -> 2.9 s quiet window).
+  for (let t = 11600; t < 14500; t += 100) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `pause before UI TEXT SIZE at ${t}`);
+  }
+  assert.equal(player.sampleAt(14500).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(14600).buttonsMask, 0);
+  assert.equal(player.pressCountAt(14500), 5);
+
+  // Phase 3: Spaced calibration screen acceptances (17500, 20500, 23500).
+  for (const [idx, atMs] of [17500, 20500, 23500].entries()) {
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `calibration A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), 6 + idx);
+  }
+
+  // Clean settle pause before Main Menu navigation probes (23600..26999).
+  for (let t = 23600; t < 27000; t += 100) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `pause before Main Menu at ${t}`);
+  }
+
+  // Phase 4: Periodic Main Menu probes (DPAD_DOWN -> DPAD_UP -> A every 8000 ms starting at 27000).
+  for (let cycle = 0; cycle < 4; cycle++) {
+    const base = 27000 + cycle * 8000;
+    assert.equal(player.sampleAt(base).buttonsMask, INPUT_BUTTONS.DPAD_DOWN, `cycle ${cycle} down`);
+    assert.equal(player.sampleAt(base + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(base), 8 + cycle * 3 + 1);
+
+    assert.equal(player.sampleAt(base + 2000).buttonsMask, INPUT_BUTTONS.DPAD_UP, `cycle ${cycle} up`);
+    assert.equal(player.sampleAt(base + 2100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(base + 2000), 8 + cycle * 3 + 2);
+
+    assert.equal(player.sampleAt(base + 4000).buttonsMask, INPUT_BUTTONS.A, `cycle ${cycle} A`);
+    assert.equal(player.sampleAt(base + 4100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(base + 4000), 8 + cycle * 3 + 3);
+  }
+
+  // Invariant: menu-flow NEVER presses B anywhere in 120 seconds of sampling.
+  for (let t = 0; t <= 120000; t += 50) {
+    const { buttonsMask } = player.sampleAt(t);
+    assert.equal(buttonsMask & INPUT_BUTTONS.B, 0, `menu-flow must never press B at t=${t}`);
+  }
+
+  // Exact nextTransitionMs across fixed -> loop boundary and repeated cycles.
+  assert.equal(player.nextTransitionMs(0), 5000);
+  assert.equal(player.nextTransitionMs(23500), 23600);
+  assert.equal(player.nextTransitionMs(23600), 27000);
+  assert.equal(player.nextTransitionMs(27000), 27100);
+  assert.equal(player.nextTransitionMs(27100), 29000);
+  assert.equal(player.nextTransitionMs(31100), 35000);
+
+  // maxPresses caps both fixed-only and loop-entering counts cleanly.
+  const cappedFixed = new ScriptedInputPlayer({ preset: 'menu-flow', maxPresses: 5 });
+  assert.equal(cappedFixed.preset, 'menu-flow');
+  assert.equal(cappedFixed.sampleAt(14500).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedFixed.sampleAt(17500).buttonsMask, 0);
+  assert.equal(cappedFixed.sampleAt(27000).buttonsMask, 0);
+  assert.equal(cappedFixed.pressCountAt(60000), 5);
+  assert.equal(cappedFixed.nextTransitionMs(14600), null);
+
+  const cappedLoop = new ScriptedInputPlayer('menu-flow', { maxPresses: 10 });
+  assert.equal(cappedLoop.sampleAt(27000).buttonsMask, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(cappedLoop.sampleAt(29000).buttonsMask, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(cappedLoop.sampleAt(31000).buttonsMask, 0);
+  assert.equal(cappedLoop.pressCountAt(100000), 10);
+  assert.equal(cappedLoop.nextTransitionMs(29100), null);
+
+  // endMs truncates mid-loop press cleanly.
+  const cappedEnd = new ScriptedInputPlayer('menu-flow', { endMs: 29050 });
+  assert.equal(cappedEnd.sampleAt(29000).buttonsMask, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(cappedEnd.sampleAt(29049).buttonsMask, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(cappedEnd.sampleAt(29050).buttonsMask, 0);
+  assert.equal(cappedEnd.nextTransitionMs(29000), 29050);
+  assert.equal(cappedEnd.nextTransitionMs(29050), null);
+});
+
+test('W174 calibration-skip preset sends steady 2.5 s spaced A confirmations without double-tap or B', () => {
+  const spec = INPUT_SCRIPT_PRESETS['calibration-skip'];
+  assert.equal(spec.button, INPUT_BUTTONS.A);
+  assert.equal(spec.startMs, 5000);
+  assert.equal(spec.holdMs, 100);
+  assert.equal(spec.periodMs, 2500);
+
+  const player = new ScriptedInputPlayer('calibration-skip');
+  assert.equal(player.preset, 'calibration-skip');
+
+  assert.equal(player.sampleAt(0).buttonsMask, 0);
+  assert.equal(player.sampleAt(4999).buttonsMask, 0);
+
+  const expectedPressTimes = [5000, 7500, 10000, 12500, 15000, 17500];
+  for (let i = 0; i < expectedPressTimes.length; i++) {
+    const t = expectedPressTimes[i];
+    assert.equal(player.sampleAt(t - 1).buttonsMask, 0);
+    assert.equal(player.sampleAt(t).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(t + 99).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(t + 100).buttonsMask, 0);
+    // Safe 2400 ms cooldown between presses — no double-taps.
+    assert.equal(player.sampleAt(t + 1000).buttonsMask, 0);
+    assert.equal(player.sampleAt(t + 2499).buttonsMask, 0);
+    assert.equal(player.pressCountAt(t), i + 1);
+  }
+
+  // Never presses B or any button other than A.
+  for (let t = 0; t <= 30000; t += 50) {
+    const mask = player.sampleAt(t).buttonsMask;
+    assert.ok(mask === 0 || mask === INPUT_BUTTONS.A, `unexpected mask ${mask} at t=${t}`);
+    assert.equal(mask & INPUT_BUTTONS.B, 0);
+  }
+
+  // Capped with maxPresses works cleanly.
+  const capped = new ScriptedInputPlayer('calibration-skip', { maxPresses: 3 });
+  assert.equal(capped.sampleAt(10000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(capped.sampleAt(12500).buttonsMask, 0);
+  assert.equal(capped.pressCountAt(30000), 3);
+  assert.equal(capped.nextTransitionMs(10100), null);
+});
+
+test('W174 intro-watch preset waits past the 15 s+ Bink2 intro video before issuing first A press', () => {
+  const spec = INPUT_SCRIPT_PRESETS['intro-watch'];
+  assert.equal(spec.button, INPUT_BUTTONS.A);
+  assert.ok(spec.startMs >= 15000, `intro-watch startMs (${spec.startMs}) must exceed 15 s`);
+  assert.equal(spec.startMs, 18000);
+  assert.equal(spec.holdMs, 100);
+  assert.equal(spec.periodMs, 2500);
+
+  const player = new ScriptedInputPlayer('intro-watch');
+  assert.equal(player.preset, 'intro-watch');
+
+  // Completely silent throughout the entire 15 s+ intro video up to 17999 ms.
+  for (const t of [0, 5000, 10000, 15000, 16500, 17999]) {
+    assert.deepEqual(player.sampleAt(t), { buttonsMask: 0, activeEventCount: 0 }, `silent at ${t}`);
+    assert.equal(player.pressCountAt(t), 0);
+  }
+
+  // First A press fires at 18000 ms, then repeats safely every 2500 ms.
+  assert.equal(player.nextTransitionMs(0), 18000);
+  assert.equal(player.sampleAt(18000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.pressCountAt(18000), 1);
+  assert.equal(player.sampleAt(18100).buttonsMask, 0);
+  assert.equal(player.sampleAt(20500).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.pressCountAt(20500), 2);
+  assert.equal(player.sampleAt(20600).buttonsMask, 0);
+});
+
+test('W174 InputBridge exposes active-preset telemetry via getStats(), getStatus(), and getScriptState() end-to-end', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(500);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // Idle telemetry before any script starts.
+  const idleStats = bridge.getStats();
+  assert.deepEqual(bridge.getStatus(), idleStats);
+  assert.equal(idleStats.scriptActive, false);
+  assert.equal(idleStats.activePreset, null);
+  assert.equal(idleStats.preset, null);
+  assert.equal(idleStats.scriptedPressesSent, 0);
+  assert.equal(idleStats.lastScriptedButton, null);
+  assert.equal(idleStats.elapsedScriptMs, 0);
+  assert.equal(idleStats.currentScriptMask, 0);
+  assert.deepEqual(idleStats.availablePresets, INPUT_SCRIPT_PRESET_NAMES);
+
+  // Start menu-flow and drive clock through Start Screen -> calibration -> Main Menu probes.
+  bridge.startScript('menu-flow', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+
+  let stats = bridge.getStats();
+  assert.equal(stats.scriptActive, true);
+  assert.equal(stats.activePreset, 'menu-flow');
+  assert.equal(stats.scriptedPressesSent, 0);
+  assert.equal(stats.lastScriptedButton, null);
+  assert.equal(stats.elapsedScriptMs, 0);
+
+  // Advance to first Start Screen A press (t = 5000 ms).
+  clock.advanceBy(5000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  stats = bridge.getStats();
+  assert.equal(stats.activePreset, 'menu-flow');
+  assert.equal(stats.scriptedPressesSent, 1);
+  assert.equal(stats.lastScriptedButton, 'A');
+  assert.equal(stats.elapsedScriptMs, 5000);
+  assert.equal(stats.currentScriptMask, INPUT_BUTTONS.A);
+
+  // Advance into quiet pause before CONTINUE (t = 10000 ms): 3 Start Screen A presses sent.
+  clock.advanceBy(5000);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 3);
+  assert.equal(stats.lastScriptedButton, 'A');
+  assert.equal(stats.elapsedScriptMs, 10000);
+
+  // Advance to Main Menu DPAD_DOWN probe (t = 27000 ms -> 8 fixed A + 1 DPAD_DOWN = 9 presses).
+  clock.advanceBy(17000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  stats = bridge.getStats();
+  assert.equal(stats.activePreset, 'menu-flow');
+  assert.equal(stats.scriptedPressesSent, 9);
+  assert.equal(stats.lastScriptedButton, 'DPAD_DOWN');
+  assert.equal(stats.elapsedScriptMs, 27000);
+
+  // Advance to Main Menu DPAD_UP probe (t = 29000 ms -> 10 presses).
+  clock.advanceBy(2000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 10);
+  assert.equal(stats.lastScriptedButton, 'DPAD_UP');
+  assert.equal(stats.elapsedScriptMs, 29000);
+
+  // Advance to Main Menu A probe (t = 31000 ms -> 11 presses).
+  clock.advanceBy(2000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 11);
+  assert.equal(stats.lastScriptedButton, 'A');
+  assert.equal(stats.elapsedScriptMs, 31000);
+
+  // Advance into second Main Menu loop cycle DPAD_DOWN (t = 35000 ms -> 12 presses).
+  clock.advanceBy(4000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 12);
+  assert.equal(stats.lastScriptedButton, 'DPAD_DOWN');
+  assert.equal(stats.elapsedScriptMs, 35000);
+
+  // Stopping clears activePreset to null and releases SAB button while preserving final counts.
+  bridge.stopScript();
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptActive, false);
+  assert.equal(stats.activePreset, null);
+  assert.equal(stats.preset, 'menu-flow');
+  assert.equal(stats.scriptedPressesSent, 12);
+  assert.equal(stats.lastScriptedButton, 'DPAD_DOWN');
+  assert.equal(stats.elapsedScriptMs, 35000);
+
+  // Switching to intro-watch resets telemetry cleanly and stays silent during intro video.
+  bridge.startScript('intro-watch', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  stats = bridge.getStats();
+  assert.equal(stats.activePreset, 'intro-watch');
+  assert.equal(stats.scriptedPressesSent, 0);
+  assert.equal(stats.lastScriptedButton, null);
+  assert.equal(stats.elapsedScriptMs, 0);
+
+  clock.advanceBy(16000);
+  stats = bridge.getStats();
+  assert.equal(stats.activePreset, 'intro-watch');
+  assert.equal(stats.scriptedPressesSent, 0);
+  assert.equal(stats.lastScriptedButton, null);
+  assert.equal(stats.elapsedScriptMs, 16000);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  clock.advanceBy(2000); // t = 18000 ms
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 1);
+  assert.equal(stats.lastScriptedButton, 'A');
+  assert.equal(stats.elapsedScriptMs, 18000);
+
+  // Simultaneous multi-button press formats lastScriptedButton cleanly and auto-complete clears activePreset.
+  bridge.startScript(
+    [
+      { atMs: 100, holdMs: 200, button: ['A', 'RB'] },
+      { atMs: 200, holdMs: 150, button: ['B', 'MENU'] },
+    ],
+    {
+      nowFn: clock.nowFn,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    }
+  );
+  clock.advanceBy(100);
+  assert.equal(bridge.getStats().lastScriptedButton, 'A+RB');
+  assert.equal(bridge.getStats().scriptedPressesSent, 1);
+  clock.advanceBy(100);
+  assert.equal(bridge.getStats().lastScriptedButton, 'B+MENU');
+  assert.equal(bridge.getStats().scriptedPressesSent, 2);
+  clock.advanceBy(150);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptActive, false);
+  assert.equal(stats.activePreset, null);
+  assert.equal(stats.scriptedPressesSent, 2);
+  assert.equal(stats.lastScriptedButton, 'B+MENU');
+
+  // Loop validation errors.
+  assert.throws(
+    () => new ScriptedInputPlayer({ events: [], loop: 'bad' }),
+    TypeError
+  );
+  assert.throws(
+    () => new ScriptedInputPlayer({ events: [], loop: { startMs: 0, periodMs: 1000, events: 'bad' } }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      new ScriptedInputPlayer({
+        events: [],
+        loop: {
+          startMs: 0,
+          periodMs: 1000,
+          events: [{ offsetMs: 1000, holdMs: 100, button: 'A' }],
+        },
+      }),
+    RangeError
+  );
+
+  bridge.destroy();
 });
