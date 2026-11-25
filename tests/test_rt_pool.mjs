@@ -2670,3 +2670,344 @@ test('W249 sanitizes counters and clamps hitRate / viewCacheHitRate strictly to 
 
   pool.destroy();
 });
+
+// ---------------------------------------------------------------------------
+// W285: Intra-Frame Transient RT Aliasing, Scene-Transition Oversized VRAM
+//       Reclaim & Budget Utilization Telemetry
+// ---------------------------------------------------------------------------
+
+test('W285 releaseTransient() aliases non-overlapping same-frame passes without duplicate 4K allocations and increments intraFrameAliasHits', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  const hdr4kDesc = {
+    width: 3840,
+    height: 2160,
+    format: 'rgba16float',
+    usage:
+      TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_SRC,
+  };
+  const hdr4kSubsetDesc = {
+    width: 3840,
+    height: 2160,
+    format: 'rgba16float',
+    usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING,
+  };
+  const bytes4kHdr = 3840 * 2160 * 8;
+
+  // Frame 0: G-buffer -> lighting -> post-process -> UI sequential passes reuse 1 physical 4K texture!
+  const gbuf = pool.acquire(hdr4kDesc, 'pass-gbuffer');
+  assert.equal(gbuf.reused, false);
+  assert.equal(createdTextures.length, 1);
+  assert.equal(pool.getStats().intraFrameAliasHits, 0);
+
+  // Release G-buffer as transient; duplicate release must be a safe no-op returning false.
+  assert.equal(pool.releaseTransient(gbuf), true);
+  assert.equal(pool.releaseTransient(gbuf), false);
+
+  // Lighting pass requests exact descriptor -> immediate intra-frame alias hit #1.
+  const lighting = pool.acquire(hdr4kDesc, 'pass-lighting');
+  assert.equal(lighting.reused, true);
+  assert.equal(lighting.id, gbuf.id);
+  assert.equal(lighting.texture, gbuf.texture);
+  assert.equal(lighting.view, gbuf.view);
+  assert.equal(createdTextures.length, 1);
+  assert.equal(pool.getStats().intraFrameAliasHits, 1);
+
+  // Stale handle gbuf cannot steal lighting's active lease via releaseTransient().
+  assert.equal(pool.releaseTransient(gbuf), false);
+  assert.equal(pool.getStats().activeCount, 1);
+
+  // Release lighting transiently; post-process pass requests compatible subset usage -> alias hit #2!
+  assert.equal(pool.releaseTransient(lighting), true);
+  const postProcess = pool.acquire(hdr4kSubsetDesc, 'pass-postprocess');
+  assert.equal(postProcess.reused, true);
+  assert.equal(postProcess.id, gbuf.id);
+  assert.equal(postProcess.texture, gbuf.texture);
+  assert.equal(createdTextures.length, 1);
+  assert.equal(pool.getStats().intraFrameAliasHits, 2);
+
+  // Release post-process transiently (by numeric id); UI composite pass requests full descriptor -> alias hit #3!
+  assert.equal(pool.releaseTransient(postProcess.id), true);
+  const uiComposite = pool.acquire(hdr4kDesc, 'pass-ui-composite');
+  assert.equal(uiComposite.reused, true);
+  assert.equal(uiComposite.id, gbuf.id);
+  assert.equal(uiComposite.texture, gbuf.texture);
+  assert.equal(createdTextures.length, 1);
+
+  // Incompatible usage requirement (STORAGE_BINDING not present on pooled target) must NOT alias.
+  assert.equal(pool.releaseTransient(uiComposite), true);
+  const computeTarget = pool.acquire(
+    {
+      width: 3840,
+      height: 2160,
+      format: 'rgba16float',
+      usage:
+        TEXTURE_USAGE.RENDER_ATTACHMENT |
+        TEXTURE_USAGE.TEXTURE_BINDING |
+        TEXTURE_USAGE.STORAGE_BINDING,
+    },
+    'pass-compute-storage'
+  );
+  assert.equal(computeTarget.reused, false);
+  assert.notEqual(computeTarget.texture, gbuf.texture);
+  assert.equal(createdTextures.length, 2);
+
+  let stats = pool.getStats();
+  assert.equal(stats.intraFrameAliasHits, 3);
+  assert.equal(stats.poolHits, 3);
+  assert.equal(stats.poolMisses, 2);
+  assert.equal(stats.peakVramBytes, bytes4kHdr * 2);
+
+  // Also test compatible viewFormats superset aliasing within the same frame.
+  const srgbCapable = pool.acquire(
+    {
+      width: 1920,
+      height: 1080,
+      format: 'rgba8unorm',
+      viewFormats: ['rgba8unorm-srgb'],
+    },
+    'ui-srgb-capable'
+  );
+  assert.equal(pool.releaseTransient(srgbCapable), true);
+  const plainLinear = pool.acquire(
+    { width: 1920, height: 1080, format: 'rgba8unorm' },
+    'ui-plain-linear'
+  );
+  assert.equal(plainLinear.reused, true);
+  assert.equal(plainLinear.texture, srgbCapable.texture);
+  assert.equal(pool.getStats().intraFrameAliasHits, 4);
+
+  assert.equal(pool.releaseTransient(plainLinear), true);
+  assert.equal(pool.releaseTransient(computeTarget), true);
+  pool.endFrame(); // frame 1
+
+  // Cross-frame reuse after endFrame() increments poolHits/transientReuseCount, NOT intraFrameAliasHits.
+  const nextFrameHdr = pool.acquire(hdr4kDesc, 'frame1-gbuffer');
+  assert.equal(nextFrameHdr.reused, true);
+  assert.equal(nextFrameHdr.texture, gbuf.texture);
+  stats = pool.getStats();
+  assert.equal(stats.intraFrameAliasHits, 4, 'cross-frame reuse must not increment intraFrameAliasHits');
+  assert.equal(stats.poolHits, 5);
+  assert.equal(stats.transientReuseCount, 5);
+
+  // Cross-frame subset-usage request does NOT cross-alias across frame boundaries (preserves exact keying).
+  assert.equal(pool.release(nextFrameHdr), true);
+  pool.endFrame(); // frame 2
+  const crossFrameSubset = pool.acquire(hdr4kSubsetDesc, 'frame2-subset');
+  assert.equal(crossFrameSubset.reused, false);
+  assert.equal(pool.getStats().intraFrameAliasHits, 4);
+
+  // In-flight active target invalidated by resize retires cleanly on releaseTransient().
+  pool.invalidateAll();
+  assert.equal(pool.releaseTransient(crossFrameSubset), true);
+  assert.equal(crossFrameSubset.destroyed, true);
+  assert.equal(crossFrameSubset.view, null);
+
+  // Argument validation & post-destroy guards.
+  assert.throws(() => pool.releaseTransient(null), TypeError);
+  assert.throws(() => pool.releaseTransient(0), TypeError);
+  assert.throws(() => pool.releaseTransient({}), TypeError);
+
+  pool.destroy();
+  assert.throws(() => pool.releaseTransient(gbuf), /destroyed/i);
+});
+
+test('W285 reclaimOversizedIdle(maxIdleFrames) reclaims stale 4K targets across scene transitions and tracks reclaimedOversizedBytes', () => {
+  const bytes4kHdr = 3840 * 2160 * 8; // 66,355,200 B (>= 24 MiB)
+  const bytes4kRgba8 = 3840 * 2160 * 4; // 33,177,600 B (>= 24 MiB)
+  const bytes1080Rgba8 = 1920 * 1080 * 4; // 8,294,400 B (< 24 MiB)
+
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({
+    device,
+    maxVramBytes: 512 * 1024 * 1024,
+    idleFrameTtl: 16,
+    oversizedTargetBytes: DEFAULT_OVERSIZED_TARGET_BYTES, // 24 MiB
+  });
+
+  // Phase 1 (Start Screen -> 4K Bink2): allocate 1080p UI + two 4K Bink2/video targets.
+  const ui1080 = pool.acquire({ width: 1920, height: 1080, format: 'rgba8unorm-srgb' }, 'start-ui-1080p');
+  const bink4kColor = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' }, 'bink2-4k-color');
+  const bink4kHdr = pool.acquire({ width: 3840, height: 2160, format: 'rgba16float' }, 'bink2-4k-hdr');
+
+  pool.release(ui1080);
+  pool.release(bink4kColor);
+  pool.release(bink4kHdr);
+  pool.endFrame(); // frame 1 (idle age = 1)
+
+  // Default maxIdleFrames = 2: at frame 1 (age 1 < 2), nothing is reclaimed yet.
+  assert.deepEqual(pool.reclaimOversizedIdle(), { reclaimedCount: 0, reclaimedBytes: 0 });
+  assert.equal(pool.getStats().reclaimedOversizedBytes, 0);
+
+  // Phase 2 (Main Menu): 1080p UI stays active, 4K Bink2 targets age to 2 frames idle.
+  const menuUi = pool.acquire({ width: 1920, height: 1080, format: 'rgba8unorm-srgb' }, 'menu-ui-1080p');
+  assert.equal(menuUi.reused, true);
+  pool.release(menuUi);
+  pool.endFrame(); // frame 2 (bink4k age = 2, ui1080 age = 1)
+
+  // Also allocate an ACTIVE 4K Main Menu backdrop to verify active oversized targets are NEVER destroyed.
+  const activeMenu4k = pool.acquire(
+    { width: 3840, height: 2160, format: 'depth32float-stencil8' },
+    'menu-active-4k-depth'
+  );
+
+  // Default reclaimOversizedIdle() (maxIdleFrames = 2) destroys both stale 4K Bink2 targets!
+  const reclaimRes = pool.reclaimOversizedIdle();
+  assert.deepEqual(reclaimRes, {
+    reclaimedCount: 2,
+    reclaimedBytes: bytes4kRgba8 + bytes4kHdr,
+  });
+
+  // Both idle 4K Bink2 textures destroyed once with views nulled; 1080p UI & active 4K backdrop survive!
+  assert.equal(createdTextures[1].destroyed, true);
+  assert.equal(createdTextures[1].destroyCount, 1);
+  assert.equal(createdTextures[2].destroyed, true);
+  assert.equal(createdTextures[2].destroyCount, 1);
+  assert.equal(bink4kColor.view, null);
+  assert.equal(bink4kHdr.view, null);
+  assert.equal(createdTextures[0].destroyed, false, 'idle 1080p target must not be reclaimed as oversized');
+  assert.equal(createdTextures[3].destroyed, false, 'active 4K target must never be destroyed');
+  assert.ok(activeMenu4k.view !== null);
+
+  let stats = pool.getStats();
+  assert.equal(stats.reclaimedOversizedBytes, bytes4kRgba8 + bytes4kHdr);
+  assert.equal(stats.oversizedEvictions, 2);
+  assert.equal(stats.idleEvictions, 2);
+  assert.equal(stats.evictions, 2);
+  assert.equal(stats.activeTargets, 1);
+  assert.equal(stats.idleTargets, 1);
+  assert.equal(stats.estimatedVramBytes, bytes1080Rgba8 + bytes4kHdr);
+  assert.equal(
+    stats.peakVramBytes,
+    bytes1080Rgba8 + bytes4kRgba8 + bytes4kHdr * 2,
+    'peakVramBytes must retain high-water mark after oversized reclaim'
+  );
+
+  // Phase 3 (Main Menu -> In-Game hard transition): release activeMenu4k and call reclaimOversizedIdle(0).
+  pool.release(activeMenu4k);
+  const hardTransitionRes = pool.reclaimOversizedIdle(0);
+  assert.deepEqual(hardTransitionRes, {
+    reclaimedCount: 1,
+    reclaimedBytes: bytes4kHdr,
+  });
+  assert.equal(createdTextures[3].destroyed, true);
+  assert.equal(createdTextures[3].destroyCount, 1);
+  assert.equal(createdTextures[0].destroyed, false, 'even maxIdleFrames=0 spares non-oversized 1080p target');
+
+  stats = pool.getStats();
+  assert.equal(stats.reclaimedOversizedBytes, bytes4kRgba8 + bytes4kHdr * 2);
+  assert.equal(stats.oversizedEvictions, 3);
+  assert.equal(stats.idleTargets, 1);
+  assert.equal(stats.estimatedVramBytes, bytes1080Rgba8);
+
+  // Repeating reclaimOversizedIdle(0) is an idempotent no-op.
+  assert.deepEqual(pool.reclaimOversizedIdle(0), { reclaimedCount: 0, reclaimedBytes: 0 });
+
+  // Validation errors & post-destroy guard.
+  assert.throws(() => pool.reclaimOversizedIdle(-1), RangeError);
+  assert.throws(() => pool.reclaimOversizedIdle(1.5), RangeError);
+  assert.throws(() => pool.reclaimOversizedIdle(Number.NaN), RangeError);
+  assert.throws(() => pool.reclaimOversizedIdle('2'), RangeError);
+  assert.throws(() => pool.reclaimOversizedIdle(null), RangeError);
+
+  pool.destroy();
+  assert.throws(() => pool.reclaimOversizedIdle(), /destroyed/i);
+
+  // When oversizedTargetBytes is Infinity, reclaimOversizedIdle(0) reclaims nothing.
+  {
+    const { device: devInf } = createMockGpuDevice();
+    const poolInf = new RenderTargetPool({ device: devInf, oversizedTargetBytes: Infinity });
+    const rt = poolInf.acquire({ width: 3840, height: 2160, format: 'rgba16float' });
+    poolInf.release(rt);
+    assert.deepEqual(poolInf.reclaimOversizedIdle(0), { reclaimedCount: 0, reclaimedBytes: 0 });
+    assert.equal(poolInf.getStats().reclaimedOversizedBytes, 0);
+    poolInf.destroy();
+  }
+});
+
+test('W285 exposes clamped vramBudgetUtilization, intraFrameAliasHits, and reclaimedOversizedBytes in getStats() and resets cleanly in resetStats()', () => {
+  const bytes4kRgba8 = 3840 * 2160 * 4; // 33,177,600 B
+  const budget = bytes4kRgba8 * 2; // 66,355,200 B
+
+  const { device } = createMockGpuDevice();
+  const pool = new RenderTargetPool({
+    device,
+    maxVramBytes: budget,
+    strictBudget: false,
+    oversizedTargetBytes: DEFAULT_OVERSIZED_TARGET_BYTES,
+  });
+
+  // Fresh pool starts at 0.
+  let stats = pool.getStats();
+  assert.equal(stats.intraFrameAliasHits, 0);
+  assert.equal(stats.reclaimedOversizedBytes, 0);
+  assert.equal(stats.vramBudgetUtilization, 0);
+
+  // Half budget utilization = 0.5.
+  const rt1 = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' }, 'rt1');
+  assert.ok(Math.abs(pool.getStats().vramBudgetUtilization - 0.5) < 1e-9);
+
+  // Intra-frame alias hit keeps utilization at 0.5.
+  assert.equal(pool.releaseTransient(rt1), true);
+  const rt1Alias = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' }, 'rt1-alias');
+  assert.equal(pool.getStats().intraFrameAliasHits, 1);
+  assert.ok(Math.abs(pool.getStats().vramBudgetUtilization - 0.5) < 1e-9);
+
+  // Over-budget burst with strictBudget: false clamps vramBudgetUtilization strictly to 1.
+  const rt2 = pool.acquire({ width: 3840, height: 2160, format: 'bgra8unorm' }, 'rt2');
+  const rt3 = pool.acquire({ width: 3840, height: 2160, format: 'rg11b10ufloat' }, 'rt3');
+  assert.equal(pool.getStats().estimatedVramBytes, bytes4kRgba8 * 3);
+  assert.equal(pool.getStats().vramBudgetUtilization, 1);
+
+  // Release rt2 and rt3, reclaim them via reclaimOversizedIdle(0) -> utilization drops back to 0.5.
+  pool.release(rt2);
+  pool.release(rt3);
+  const reclaimed = pool.reclaimOversizedIdle(0);
+  assert.deepEqual(reclaimed, { reclaimedCount: 2, reclaimedBytes: bytes4kRgba8 * 2 });
+
+  stats = pool.getStats();
+  assert.equal(stats.intraFrameAliasHits, 1);
+  assert.equal(stats.reclaimedOversizedBytes, bytes4kRgba8 * 2);
+  assert.ok(Math.abs(stats.vramBudgetUtilization - 0.5) < 1e-9);
+
+  // resetStats() zeroes intraFrameAliasHits & reclaimedOversizedBytes while preserving live vramBudgetUtilization.
+  const cleared = pool.resetStats();
+  assert.equal(cleared.intraFrameAliasHits, 0);
+  assert.equal(cleared.reclaimedOversizedBytes, 0);
+  assert.ok(Math.abs(cleared.vramBudgetUtilization - 0.5) < 1e-9);
+  assert.equal(cleared.activeTargets, 1);
+
+  // Corrupted internal counters sanitize cleanly to 0 / [0, 1].
+  pool._intraFrameAliasHits = Number.NaN;
+  pool._reclaimedOversizedBytes = -4096;
+  const sanitized = pool.getStats();
+  assert.equal(sanitized.intraFrameAliasHits, 0);
+  assert.equal(sanitized.reclaimedOversizedBytes, 0);
+  assert.ok(sanitized.vramBudgetUtilization >= 0 && sanitized.vramBudgetUtilization <= 1);
+
+  pool.release(rt1Alias);
+  pool.destroy();
+  assert.equal(pool.getStats().vramBudgetUtilization, 0);
+
+  // Unlimited budget (maxPoolBytes: Infinity) reports finite 0 utilization.
+  {
+    const { device: devInf } = createMockGpuDevice();
+    const poolInf = new RenderTargetPool({ device: devInf, maxPoolBytes: Infinity });
+    const rt = poolInf.acquire({ width: 1280, height: 720, format: 'rgba8unorm' });
+    assert.equal(poolInf.getStats().vramBudgetUtilization, 0);
+    poolInf.release(rt);
+    poolInf.destroy();
+  }
+
+  // Classic-worker IIFE isolation: new W285 constants stay isolated inside IIFE.
+  const rtPoolPath = fileURLToPath(new URL('../web/workers/rt_pool.js', import.meta.url));
+  const source = readFileSync(rtPoolPath, 'utf8');
+  const sandbox = { console };
+  const ctx = vm.createContext(sandbox);
+  ctx.self = ctx;
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+    vm.runInContext('const DEFAULT_OVERSIZED_RECLAIM_IDLE_FRAMES = 99;', ctx);
+  });
+});
