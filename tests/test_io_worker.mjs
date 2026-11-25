@@ -19,6 +19,8 @@ const {
   IO_PRIORITY,
   DEFAULT_IMMUTABLE_CHUNK_SIZE,
   DEFAULT_IMMUTABLE_MAX_BYTES,
+  DEFAULT_SLAB_SIZE,
+  DEFAULT_SLAB_MAX_BYTES,
   DEFAULT_DUMP_ENDPOINT,
   DUMP_VIRTUAL_PREFIX,
   HTTPFS_OP_WRITE,
@@ -26,6 +28,7 @@ const {
   HTTPFS_OPEN_FLAG_APPEND,
   MAX_SLAB_SIZE,
   MAX_SLAB_CACHE_BYTES,
+  SLAB_TUNING_PROFILES,
   VIDEO_STREAM_SLAB_PRESET,
   DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES,
   DEFAULT_BATCH_COALESCE_MAX_BYTES,
@@ -261,7 +264,13 @@ async function startRangeHttpServer(routesMap) {
 
 test('isImmutableHttpfsPath matches *.rpf, *.pgim, *.dll, and MicrosoftGame.Config only', () => {
   assert.equal(DEFAULT_IMMUTABLE_CHUNK_SIZE, 64 * 1024);
-  assert.equal(DEFAULT_IMMUTABLE_MAX_BYTES, 64 * 1024 * 1024);
+  assert.equal(DEFAULT_IMMUTABLE_MAX_BYTES, 128 * 1024 * 1024);
+  assert.equal(DEFAULT_SLAB_SIZE, 2 * 1024 * 1024);
+  assert.equal(DEFAULT_SLAB_MAX_BYTES, 192 * 1024 * 1024);
+  assert.equal(MAX_SLAB_CACHE_BYTES, 256 * 1024 * 1024);
+  assert.equal(SLAB_TUNING_PROFILES.default.slabMaxBytes, 192 * 1024 * 1024);
+  assert.equal(SLAB_TUNING_PROFILES.video4k.slabMaxBytes, 192 * 1024 * 1024);
+  assert.equal(SLAB_TUNING_PROFILES['low-memory'].slabMaxBytes, 16 * 1024 * 1024);
 
   for (const p of [
     'audio.rpf',
@@ -341,13 +350,13 @@ test('repeated open + overlapping reads on immutable /game/*.rpf trigger only 1 
 
     const reqsAfterInit = mock.requests.length;
 
-    // 1. Open using Xbox drive path -> triggers 1 aligned 64 KiB HTTP 206 fetch (`bytes=0-65535`).
+    // 1. Open using Xbox drive path -> triggers 1 aligned slab-0 HTTP 206 fetch (`bytes=0-2097151`, clamped by server to 180 KiB).
     const h1 = await client.openAsync('G:\\audio.rpf');
     assert.ok(h1 >= 1);
     assert.equal(controller.getHandleInfo(h1).size, rpfSize);
     assert.equal(mock.requests.length, reqsAfterInit + 1);
     assert.equal(mock.requests[reqsAfterInit].url, '/game/audio.rpf');
-    assert.equal(mock.requests[reqsAfterInit].rangeHeader, 'bytes=0-65535');
+    assert.equal(mock.requests[reqsAfterInit].rangeHeader, `bytes=0-${DEFAULT_SLAB_SIZE - 1}`);
 
     // 2. Re-open same file via multiple path aliases -> ZERO additional network requests!
     const h2 = await client.openAsync('\\\\?\\G:\\audio.rpf');
@@ -406,10 +415,15 @@ test('repeated open + overlapping reads on immutable /game/*.rpf trigger only 1 
     assert.equal(stats.networkFetches, 1);
     assert.equal(stats.metaMisses, 1);
     assert.equal(stats.metaHits, 3);
-    assert.equal(stats.misses, 1);
-    assert.equal(stats.hits, 7);
-    assert.equal(stats.bytesCached, 65536);
-    assert.equal(stats.entries, 1);
+    assert.equal(stats.slabCacheMisses, 1);
+    assert.equal(stats.slabCacheHits, 7);
+    assert.equal(stats.slabBytesCached, rpfSize);
+    assert.equal(stats.slabEntries, 1);
+    // Chunk path is never populated when slab mode is active (zero chunk+slab overlap).
+    assert.equal(stats.misses, 0);
+    assert.equal(stats.hits, 0);
+    assert.equal(stats.bytesCached, 0);
+    assert.equal(stats.entries, 0);
     assert.equal(stats.filesIndexed, 1);
     const statsJson = JSON.stringify(stats);
     assert.equal(statsJson.includes('audio.rpf'), false, 'Stats must not leak file paths');
@@ -812,7 +826,7 @@ test('concurrent open/read calls for the same uncached .rpf coalesce into a sing
     'Concurrent opens for the same URL must coalesce into 1 HTTP 206 fetch',
   );
 
-  // Fire 4 simultaneous reads into uncached chunk 1 [65536..131072) -> must coalesce into 1 fetch!
+  // Fire 4 simultaneous reads into [65536..131072): already covered by slab 0 from open() -> ZERO extra fetches!
   const results = await Promise.all([
     controller.readHandle(handles[0], 65536, 4096),
     controller.readHandle(handles[1], 66000, 8192),
@@ -827,8 +841,8 @@ test('concurrent open/read calls for the same uncached .rpf coalesce into a sing
 
   assert.equal(
     mock.requests.length - reqsAfterInit,
-    2,
-    'Expected 1 fetch for chunk 0 + 1 coalesced fetch for chunk 1',
+    1,
+    'Expected strictly 1 HTTP 206 slab-0 fetch covering both open and [65536..131072) reads',
   );
   assert.ok(controller.getStats().immutableCache.inFlightCoalesced >= 5);
 });
@@ -914,7 +928,8 @@ test('classic Web Worker (importScripts) exposes ImmutableHttpfsCache and report
     const statsMsg = posted.find((m) => m.id === 2);
     assert.ok(statsMsg && statsMsg.stats && statsMsg.stats.immutableCache);
     assert.equal(statsMsg.stats.immutableCache.networkFetches, 1);
-    assert.equal(statsMsg.stats.immutableCache.hits, 1);
+    assert.equal(statsMsg.stats.immutableCache.slabCacheHits, 1);
+    assert.equal(statsMsg.stats.immutableCache.hits, 0);
     assert.equal(statsMsg.stats.immutableCache.filesIndexed, 1);
   } finally {
     await workerSelf.onmessage({ data: { detachMailbox: true, id: 3 } });
@@ -1695,7 +1710,7 @@ test('W173: tuned sequential slab prefetch & bounded concurrency for 4K Bink2 st
   });
   assert.equal(clamped.slabSize, MAX_SLAB_SIZE);
   assert.equal(clamped.slabMaxBytes, MAX_SLAB_CACHE_BYTES);
-  assert.ok(clamped.prefetchAheadSlabs <= 7);
+  assert.ok(clamped.prefetchAheadSlabs <= 8);
   assert.equal(clamped.maxConcurrentSlabFetches, 16);
 
   // Synthetic 4K Bink2 video file: 12 slabs of 1024 bytes = 12288 bytes
@@ -2441,4 +2456,261 @@ test('W219: classic Web Worker self.onmessage handles readBatch with zero-copy t
   assert.equal(s.streaming.bytesTransferred, 160);
   assert.equal(s.streaming.coalescedFetches, 1);
   assert.equal(s.streaming.errorCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 10. W255 (#1104 / #1015): Zero chunk+slab double-fetch & large slab LRU
+//     working-set retention for shaders.rpf / core_bvh4.rpf
+// ---------------------------------------------------------------------------
+
+function parseFetchedRangeSpan(rangeHeader, fileSize) {
+  const match = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader || '');
+  assert.ok(match, `Expected Range header bytes=start-end, got ${rangeHeader}`);
+  const start = Number(match[1]);
+  const end = Math.min(Number(match[2]), fileSize - 1);
+  return { start, end, bytes: end >= start ? end - start + 1 : 0 };
+}
+
+function assertZeroOverlappingRanges(requests, fileSize) {
+  const spans = requests
+    .filter((r) => r.rangeHeader)
+    .map((r) => parseFetchedRangeSpan(r.rangeHeader, fileSize))
+    .sort((a, b) => a.start - b.start);
+
+  let totalFetchedBytes = 0;
+  for (let i = 0; i < spans.length; i += 1) {
+    totalFetchedBytes += spans[i].bytes;
+    if (i > 0) {
+      assert.ok(
+        spans[i].start > spans[i - 1].end,
+        `Duplicate/overlapping HTTP Range fetch detected: [${spans[i - 1].start}..${spans[i - 1].end}] overlaps [${spans[i].start}..${spans[i].end}]`,
+      );
+    }
+  }
+  return { spans, totalFetchedBytes };
+}
+
+test('W255: open() + reads across 4 MiB file issue ZERO overlapping HTTP Range fetches and coalesce concurrent open+read', async () => {
+  const fileSize = 4 * 1024 * 1024; // 4 MiB = 2 x 2 MiB slabs
+  const rpfBytes = makePatternBytes(fileSize, 0xa5);
+  const mock = createMockRangeFetch(new Map([['/game/core_bvh4.rpf', rpfBytes]]), { delayMs: 5 });
+
+  const cache = new ImmutableHttpfsCache({ fetchImpl: mock.fetchImpl });
+  assert.equal(cache.slabSize, 2 * 1024 * 1024);
+  assert.equal(cache.slabMaxBytes, 192 * 1024 * 1024);
+  assert.equal(cache.maxBytes, 128 * 1024 * 1024);
+
+  // 1. open(url) probes slab 0 [0..2 MiB - 1] directly instead of chunk 0 [0..64 KiB - 1].
+  const openRes = await cache.open('/game/core_bvh4.rpf');
+  assert.deepEqual(openRes, { ok: true, size: fileSize });
+  assert.equal(mock.requests.length, 1);
+  assert.equal(mock.requests[0].rangeHeader, `bytes=0-${2 * 1024 * 1024 - 1}`);
+
+  // 2. read(0, 64 KiB) and read(64 KiB, 1 MiB) hit slab 0 with ZERO additional HTTP requests.
+  const first64k = await cache.read('/game/core_bvh4.rpf', 0, 65536);
+  assert.deepEqual(first64k, rpfBytes.subarray(0, 65536));
+  const next1m = await cache.read('/game/core_bvh4.rpf', 65536, 1024 * 1024);
+  assert.deepEqual(next1m, rpfBytes.subarray(65536, 65536 + 1024 * 1024));
+  assert.equal(mock.requests.length, 1, 'Reads within slab 0 after open() must issue 0 extra fetches');
+
+  // 3. Cross-slab read spanning slab 0 -> slab 1 fetches ONLY slab 1 (never re-fetches slab 0).
+  const crossOff = 2 * 1024 * 1024 - 32768;
+  const crossLen = 128 * 1024;
+  const crossBytes = await cache.read('/game/core_bvh4.rpf', crossOff, crossLen);
+  assert.deepEqual(crossBytes, rpfBytes.subarray(crossOff, crossOff + crossLen));
+  assert.equal(mock.requests.length, 2);
+  assert.equal(
+    mock.requests[1].rangeHeader,
+    `bytes=${2 * 1024 * 1024}-${4 * 1024 * 1024 - 1}`,
+  );
+
+  // 4. Tail read in slab 1 hits synchronously with ZERO additional HTTP requests.
+  const tailBytes = await cache.read('/game/core_bvh4.rpf', 3 * 1024 * 1024, 1024 * 1024);
+  assert.deepEqual(tailBytes, rpfBytes.subarray(3 * 1024 * 1024, 4 * 1024 * 1024));
+  assert.equal(mock.requests.length, 2);
+
+  const { totalFetchedBytes } = assertZeroOverlappingRanges(mock.requests, fileSize);
+  assert.equal(totalFetchedBytes, fileSize, 'Total fetched bytes must strictly equal 4 MiB (0% inflation)');
+
+  const stats = cache.getStats();
+  assert.equal(stats.networkFetches, 2);
+  assert.equal(stats.slabCacheMisses, 2);
+  assert.equal(stats.slabEntries, 2);
+  assert.equal(stats.slabBytesCached, fileSize);
+  assert.equal(stats.entries, 0, 'Chunk map must remain empty in slab mode (zero chunk+slab duplication)');
+  assert.equal(stats.bytesCached, 0);
+
+  // 5. Concurrent open() + read(64 KiB, 64 KiB) on a cold file coalesce onto ONE single slab-0 fetch.
+  const concMock = createMockRangeFetch(new Map([['/game/concurrent_bvh.rpf', rpfBytes]]), {
+    delayMs: 10,
+  });
+  const concCache = new ImmutableHttpfsCache({ fetchImpl: concMock.fetchImpl });
+  const [concOpen, concRead] = await Promise.all([
+    concCache.open('/game/concurrent_bvh.rpf'),
+    concCache.read('/game/concurrent_bvh.rpf', 65536, 65536),
+  ]);
+  assert.deepEqual(concOpen, { ok: true, size: fileSize });
+  assert.deepEqual(concRead, rpfBytes.subarray(65536, 131072));
+  assert.equal(
+    concMock.requests.length,
+    1,
+    'Concurrent open() and read() in slab 0 must coalesce into a single HTTP 206 fetch',
+  );
+  assert.ok(concCache.getStats().inFlightCoalesced >= 1);
+});
+
+test('W255: sequential 64 KiB and 1 MiB reads across 8 MiB file fetch each 2 MiB slab strictly ONCE (0% re-fetch inflation) and share warm slabs across controller.read/readBatch', async () => {
+  const fileSize = 8 * 1024 * 1024; // 8 MiB = 4 x 2 MiB slabs
+  const bvhBytes = makePatternBytes(fileSize, 0x3c);
+  const mock = createMockRangeFetch(new Map([['/game/core_bvh4.rpf', bvhBytes]]));
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    opfsDir: null,
+  });
+  await controller.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+
+  const reqsBefore = mock.requests.length;
+  const h = await controller.openHandle('G:\\core_bvh4.rpf');
+  assert.ok(h >= 1);
+  assert.equal(controller.getHandleInfo(h).size, fileSize);
+
+  // Stream first 4 MiB in 64 KiB steps (64 reads) and remaining 4 MiB in 1 MiB steps (4 reads).
+  const assembled = new Uint8Array(fileSize);
+  for (let off = 0; off < 4 * 1024 * 1024; off += 65536) {
+    const chunk = await controller.readHandle(h, off, 65536);
+    assert.equal(chunk.byteLength, 65536);
+    assembled.set(chunk, off);
+  }
+  for (let off = 4 * 1024 * 1024; off < fileSize; off += 1024 * 1024) {
+    const chunk = await controller.readHandle(h, off, 1024 * 1024);
+    assert.equal(chunk.byteLength, 1024 * 1024);
+    assembled.set(chunk, off);
+  }
+  assert.deepEqual(assembled, bvhBytes);
+
+  const gameReqs = mock.requests.slice(reqsBefore);
+  assert.equal(
+    gameReqs.length,
+    4,
+    `Expected strictly 4 x 2 MiB slab fetches for 8 MiB file, got ${gameReqs.length}`,
+  );
+  const { totalFetchedBytes } = assertZeroOverlappingRanges(gameReqs, fileSize);
+  assert.equal(totalFetchedBytes, fileSize, 'Total fetched bytes must equal exact 8 MiB file size');
+
+  // Re-reading the same warmed .rpf through controller.read() and controller.readBatch()
+  // must serve directly from warm ImmutableHttpfsCache slabs with ZERO duplicate fetches!
+  const directSlice = await controller.read('G:\\core_bvh4.rpf', 1024 * 1024, 128 * 1024);
+  assert.deepEqual(directSlice, bvhBytes.subarray(1024 * 1024, 1024 * 1024 + 128 * 1024));
+
+  const batchRes = await controller.readBatch([
+    { id: 's0', path: '/game/core_bvh4.rpf', offset: 0, length: 65536 },
+    { id: 's3', path: 'G:\\core_bvh4.rpf', offset: 6 * 1024 * 1024 + 4096, length: 65536 },
+  ]);
+  assert.equal(batchRes.ok, true);
+  assert.deepEqual(batchRes.results[0].bytes, bvhBytes.subarray(0, 65536));
+  assert.deepEqual(
+    batchRes.results[1].bytes,
+    bvhBytes.subarray(6 * 1024 * 1024 + 4096, 6 * 1024 * 1024 + 4096 + 65536),
+  );
+  assert.equal(
+    mock.requests.length - reqsBefore,
+    4,
+    'Follow-up controller.read() / readBatch() on warm immutable .rpf must trigger 0 extra fetches',
+  );
+
+  const stats = controller.getStats().immutableCache;
+  assert.equal(stats.slabEntries, 4);
+  assert.equal(stats.slabBytesCached, fileSize);
+  assert.equal(stats.slabEvictions, 0);
+  assert.equal(stats.entries, 0);
+  assert.equal(controller.closeHandle(h), true);
+});
+
+test('W255: shaders.rpf random working set fits inside enlarged 192 MiB slab LRU with 0 post-warmup evictions while respecting explicit/low-memory overrides', async () => {
+  // 1. Assert production defaults & profile caps comfortably hold the ~115 MB shaders.rpf working set.
+  assert.ok(DEFAULT_SLAB_MAX_BYTES >= 192 * 1024 * 1024);
+  assert.equal(DEFAULT_SLAB_MAX_BYTES, 192 * 1024 * 1024);
+  assert.equal(MAX_SLAB_CACHE_BYTES, 256 * 1024 * 1024);
+  assert.equal(DEFAULT_IMMUTABLE_MAX_BYTES, 128 * 1024 * 1024);
+  assert.ok(SLAB_TUNING_PROFILES.video4k.slabMaxBytes >= 192 * 1024 * 1024);
+  assert.equal(SLAB_TUNING_PROFILES['low-memory'].slabMaxBytes, 16 * 1024 * 1024);
+
+  const defaultCache = new ImmutableHttpfsCache({});
+  assert.equal(defaultCache.slabMaxBytes, 192 * 1024 * 1024);
+  assert.equal(defaultCache.maxBytes, 128 * 1024 * 1024);
+
+  const lowMemCache = new ImmutableHttpfsCache({ slabProfile: 'low-memory' });
+  assert.equal(lowMemCache.slabSize, 1024 * 1024);
+  assert.equal(lowMemCache.slabMaxBytes, 16 * 1024 * 1024);
+
+  const explicitSmall = new ImmutableHttpfsCache({ slabSize: 64 * 1024, slabMaxBytes: 256 * 1024 });
+  assert.equal(explicitSmall.slabSize, 64 * 1024);
+  assert.equal(explicitSmall.slabMaxBytes, 256 * 1024);
+
+  // 2. Proportional shaders.rpf working-set test (scale 1:1024 -> 412 KiB archive, 116 KiB random
+  //    working set = 58 slabs of 2 KiB; 192 KiB budget = 96 slabs vs old 32 KiB budget = 16 slabs).
+  const slabSize = 2048; // 2 KiB proportional to 2 MiB
+  const archiveSize = 412 * 1024; // 412 KiB proportional to 412 MB shaders.rpf
+  const workingSetSlabs = 58; // 116 KiB proportional to ~115 MB working set
+  const shadersBytes = makePatternBytes(archiveSize, 0x6d);
+
+  // Deterministic pseudo-random access schedule over 58 distinct slabs (300 total reads).
+  const hotSlabs = [];
+  for (let i = 0; i < workingSetSlabs; i += 1) {
+    hotSlabs.push((i * 3 + 5) % Math.floor(archiveSize / slabSize));
+  }
+  const accessSchedule = [];
+  for (let step = 0; step < 300; step += 1) {
+    const slabIdx = hotSlabs[(step * 17 + Math.floor(step / 5)) % workingSetSlabs];
+    const intraOff = ((step * 257) % (slabSize - 256)) & ~15;
+    accessSchedule.push({ offset: slabIdx * slabSize + intraOff, length: 256 });
+  }
+
+  // Under the W255 proportional 192-unit budget (96 slabs >= 58 working-set slabs): 0 evictions!
+  const warmMock = createMockRangeFetch(new Map([['/game/shaders.rpf', shadersBytes]]));
+  const warmCache = new ImmutableHttpfsCache({
+    slabSize,
+    slabMaxBytes: 192 * 1024, // 96 slabs (proportional to 192 MiB)
+    fetchImpl: warmMock.fetchImpl,
+  });
+
+  // Pass 1: warm every slab in the working set
+  for (let i = 0; i < workingSetSlabs; i += 1) {
+    const off = hotSlabs[i] * slabSize;
+    const got = await warmCache.read('/game/shaders.rpf', off, 512);
+    assert.deepEqual(got, shadersBytes.subarray(off, off + 512));
+  }
+  assert.equal(warmMock.requests.length, workingSetSlabs);
+  assert.equal(warmCache.getStats().slabEvictions, 0);
+
+  // Pass 2: 300 random reads across the warmed working set -> ZERO network fetches, ZERO evictions!
+  for (const { offset, length } of accessSchedule) {
+    const got = await warmCache.read('/game/shaders.rpf', offset, length);
+    assert.deepEqual(got, shadersBytes.subarray(offset, offset + length));
+  }
+  assert.equal(
+    warmMock.requests.length,
+    workingSetSlabs,
+    'Warmed working set must suffer 0 re-fetches under 192-unit slab LRU budget',
+  );
+  const warmStats = warmCache.getStats();
+  assert.equal(warmStats.slabEvictions, 0);
+  assert.equal(warmStats.slabCacheHits, 300);
+  assert.equal(warmStats.slabEntries, workingSetSlabs);
+  assert.equal(warmStats.entries, 0);
+
+  // Guard: slabMaxBytes < slabSize falls back safely to chunk mode instead of dropping every slab.
+  const undersizedMock = createMockRangeFetch(new Map([['/game/tiny_cap.rpf', shadersBytes.subarray(0, 8192)]]));
+  const undersizedCache = new ImmutableHttpfsCache({
+    chunkSize: 512,
+    maxBytes: 8192,
+    slabSize: 4096,
+    slabMaxBytes: 2048, // smaller than 1 slab -> safely disables slab mode
+    fetchImpl: undersizedMock.fetchImpl,
+  });
+  await undersizedCache.open('/game/tiny_cap.rpf');
+  const u1 = await undersizedCache.read('/game/tiny_cap.rpf', 0, 512);
+  assert.deepEqual(u1, shadersBytes.subarray(0, 512));
+  assert.equal(undersizedMock.requests.length, 1, 'Fallback chunk cache must retain fetched chunk 0');
 });

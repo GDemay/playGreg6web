@@ -219,7 +219,7 @@ async function startRangeHttpServer(routesMap) {
 test('exports expected PGIM whole-file and slab cache defaults and path predicates', () => {
   assert.equal(DEFAULT_WHOLE_FILE_MAX_BYTES, 256 * 1024 * 1024);
   assert.equal(DEFAULT_SLAB_SIZE, 2 * 1024 * 1024);
-  assert.equal(DEFAULT_SLAB_MAX_BYTES, 32 * 1024 * 1024);
+  assert.equal(DEFAULT_SLAB_MAX_BYTES, 192 * 1024 * 1024);
 
   assert.equal(isWholeFileBufferedPath('main/image/guest.pgim'), true);
   assert.equal(isWholeFileBufferedPath('boot/main/image/GUEST.PGIM'), true);
@@ -510,11 +510,11 @@ test('sequential 64 KiB reads across .rpf, .dll, and .ttpf coalesce into slab-si
       assert.deepEqual(out, expectedBytes);
 
       const totalReqs = mock.requests.length - reqsStart;
-      // 1 OPEN chunk-0 probe + expectedSlabFetches aligned slab fetches
+      // OPEN probes slab 0 directly -> strictly expectedSlabFetches aligned slab fetches (0 duplicate chunk-0 fetch)
       assert.equal(
         totalReqs,
-        1 + expectedSlabFetches,
-        `Expected ${1 + expectedSlabFetches} HTTP fetches for ${openPath}, got ${totalReqs}`,
+        expectedSlabFetches,
+        `Expected ${expectedSlabFetches} HTTP fetches for ${openPath}, got ${totalReqs}`,
       );
 
       // Re-reading across a slab boundary must hit cached slabs with ZERO new HTTP fetches!
@@ -865,8 +865,8 @@ test('real HTTP server + cross-thread Atomics.wait boot loads PGIM in 1 fetch an
     const countFor = (pathname) => server.requests.filter((r) => r.pathname === pathname).length;
     assert.equal(countFor('/boot/program-manifest.json'), 1);
     assert.equal(countFor('/boot/main/image/guest.pgim'), 1, 'PGIM must take exactly 1 HTTP fetch!');
-    assert.equal(countFor('/game/pack0.rpf'), 2, 'RPF: 1 OPEN probe + 1 slab fetch (NOT 11!)');
-    assert.equal(countFor('/game/audio.ttpf'), 2, 'TTPF: 1 OPEN probe + 1 slab fetch (NOT 7!)');
+    assert.equal(countFor('/game/pack0.rpf'), 1, 'RPF: 1 slab-0 fetch on OPEN covers entire 700 KiB file (NOT 11!)');
+    assert.equal(countFor('/game/audio.ttpf'), 1, 'TTPF: 1 slab-0 fetch on OPEN covers entire 400 KiB file (NOT 7!)');
 
     const stats = controller.getStats();
     assert.equal(stats.pgimFullFetches, 1);
@@ -934,11 +934,11 @@ test('W125: multi-chunk 64 KiB reads of .wgsl.pack coalesce into ImmutableHttpfs
     assert.equal(readCalls, 10);
     assert.deepEqual(out, packBytes);
 
-    // 1 OPEN chunk-0 probe + 3 aligned slab fetches = 4 HTTP fetches (NOT 10!)
+    // OPEN probes slab 0 directly -> strictly 3 aligned slab fetches (0 duplicate chunk-0 fetch, NOT 10!)
     assert.equal(
       mock.requests.length - reqsBefore,
-      4,
-      `Expected 4 HTTP fetches for .wgsl.pack, got ${mock.requests.length - reqsBefore}`,
+      3,
+      `Expected 3 HTTP fetches for .wgsl.pack, got ${mock.requests.length - reqsBefore}`,
     );
 
     // Cross-slab re-read hits cached slabs with 0 additional HTTP fetches.
