@@ -1172,6 +1172,60 @@ fn forwarder_chains_cycles_and_api_set_targets() {
 }
 
 #[test]
+fn supplied_bink_is_a_guest_module_and_the_shims_serve_only_without_it() {
+    let mut bink = Synth::new("Bink2Scarlett.dll", DLL_BASE, true);
+    bink.text = vec![0xC3; 0x20];
+    bink.exports = vec![
+        export("BinkOpenWithOptions", 1, Target::Rva(TEXT)),
+        export("BinkWait", 2, Target::Rva(TEXT + 0x10)),
+    ];
+    let mut exe = Synth::new("game.exe", EXE_BASE, false);
+    exe.imports = vec![(
+        "Bink2Scarlett.dll",
+        vec![Imp::Name("BinkOpenWithOptions"), Imp::Name("BinkWait")],
+    )];
+
+    // Supplied: built as a guest module, the title's imports bind to its exports.
+    let tmp = TempDir::new("bink_guest");
+    let r = build(&program_options(tmp.path(), &exe, &[&bink]));
+    assert_eq!(r.module("bink2scarlett.dll").unwrap().reason, "import");
+    for name in ["BinkOpenWithOptions", "BinkWait"] {
+        let i = import(&r, "game.exe", &format!("Bink2Scarlett.dll!{name}"));
+        assert_eq!(i.status(), "guest", "{name}");
+        assert_eq!(i.rule, "*!*=guest");
+    }
+
+    // Absent: the imports go to the import bridge (the runtime's Bink shims; this fixture's shim
+    // catalogue has none, so the bridge reports them unresolved), never to a guest module.
+    let tmp = TempDir::new("bink_host");
+    let r = build(&program_options(tmp.path(), &exe, &[]));
+    assert!(r.module("bink2scarlett.dll").is_none());
+    assert_eq!(
+        import(&r, "game.exe", "Bink2Scarlett.dll!BinkOpenWithOptions").status(),
+        "unresolved"
+    );
+
+    // `--host-dll` still keeps a supplied copy on the shims.
+    let tmp = TempDir::new("bink_forced_host");
+    let mut options = program_options(tmp.path(), &exe, &[&bink]);
+    options.overrides.add_file("Bink2Scarlett.dll=host").expect("policy");
+    let r = build(&options);
+    assert!(r.module("bink2scarlett.dll").is_none());
+    assert_eq!(
+        import(&r, "game.exe", "Bink2Scarlett.dll!BinkWait").status(),
+        "unresolved"
+    );
+    assert_eq!(
+        r.external
+            .iter()
+            .find(|e| e.dll == "bink2scarlett.dll")
+            .unwrap()
+            .status,
+        "host_only"
+    );
+}
+
+#[test]
 fn policy_precedence_roles_and_overrides() {
     // A guest "kernel32.dll" exporting functions the bridge also binds.
     let mut k = Synth::new("KERNEL32.dll", DLL_BASE, true);
