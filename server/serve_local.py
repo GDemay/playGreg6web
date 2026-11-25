@@ -8,9 +8,10 @@
 - Serves sanitized JSON readiness diagnostics at `/api/status` (including staged
   `/dist/*.wasm` side-module discovery).
 - Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
+- Uses HTTP/1.1 persistent keep-alive connections with large streaming buffers (1 MiB).
 - Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
-  `Cache-Control: no-cache`, deterministic `ETag`/`Last-Modified`, `If-None-Match` (`304`),
-  and `If-Range`.
+  `OPTIONS`, `Cache-Control: no-cache`, deterministic `ETag`/`Last-Modified`,
+  `If-None-Match` (`304`), and `If-Range`.
 """
 
 from __future__ import annotations
@@ -39,10 +40,15 @@ RUNTIME_WASM_NAME = "runtime.wasm"
 PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
 
+STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
+KEEP_ALIVE_TIMEOUT = 30.0  # Idle socket timeout (seconds) for HTTP/1.1 keep-alive connections
+ALLOWED_METHODS = "GET, HEAD, OPTIONS"
+
 CLIENT_DISCONNECT_ERRORS = (
     BrokenPipeError,
     ConnectionResetError,
     ConnectionAbortedError,
+    TimeoutError,
 )
 
 mimetypes.add_type("application/wasm", ".wasm")
@@ -490,6 +496,9 @@ def build_status_payload(
 
 class PlayGta6Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    default_request_version = "HTTP/1.1"
+    timeout = KEEP_ALIVE_TIMEOUT
+    disable_nagle_algorithm = True
 
     def __init__(
         self,
@@ -499,6 +508,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         game_root: Path | None = None,
         shaders_root: Path | None = None,
         boot_root: Path | None = None,
+        keep_alive_timeout: float | None = None,
         **kwargs,
     ):
         self.web_root = web_root
@@ -506,20 +516,136 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.game_root = game_root
         self.shaders_root = shaders_root if shaders_root is not None else (data_root / "shaders")
         self.boot_root = boot_root
+        if keep_alive_timeout is not None:
+            self.timeout = keep_alive_timeout
+        self._headers_sent = False
+        self._connection_header_sent = False
         super().__init__(*args, **kwargs)
+
+    def _request_has_unconsumed_body(self) -> bool:
+        if not hasattr(self, "headers") or self.headers is None:
+            return False
+        if self.headers.get("Transfer-Encoding"):
+            return True
+        raw_length = self.headers.get("Content-Length")
+        if not raw_length:
+            return False
+        try:
+            return int(raw_length.strip()) > 0
+        except ValueError:
+            return True
+
+    def parse_request(self) -> bool:
+        ok = super().parse_request()
+        if not ok:
+            self.close_connection = True
+            return False
+
+        if hasattr(self.headers, "get_all"):
+            raw_conn = self.headers.get_all("Connection") or []
+        else:
+            single = self.headers.get("Connection")
+            raw_conn = [single] if single else []
+
+        tokens = {
+            tok.strip().lower()
+            for value in raw_conn
+            for tok in value.split(",")
+            if tok.strip()
+        }
+        if "close" in tokens or self._request_has_unconsumed_body():
+            self.close_connection = True
+        elif "keep-alive" in tokens and self.protocol_version >= "HTTP/1.1":
+            self.close_connection = False
+        return True
+
+    def send_header(self, keyword: str, value: str) -> None:
+        if keyword.lower() == "connection":
+            self._connection_header_sent = True
+        super().send_header(keyword, value)
 
     def end_headers(self) -> None:
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Accept-Ranges", "bytes")
+        if not getattr(self, "_connection_header_sent", False):
+            if getattr(self, "close_connection", False):
+                self.send_header("Connection", "close")
+            else:
+                self.send_header("Connection", "keep-alive")
+                if isinstance(self.timeout, (int, float)) and self.timeout > 0:
+                    self.send_header("Keep-Alive", f"timeout={max(1, int(self.timeout))}")
+        self._headers_sent = True
         super().end_headers()
+
+    def send_error(
+        self,
+        code: int,
+        message: str | None = None,
+        explain: str | None = None,
+    ) -> None:
+        self.close_connection = True
+        try:
+            super().send_error(code, message, explain)
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
 
     def _send_empty(self, status: HTTPStatus) -> None:
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def _send_method_not_allowed(self) -> None:
+        # Close the connection because unsupported methods (e.g. POST/PUT) may
+        # carry an unread request body that would desynchronize keep-alive.
+        self.close_connection = True
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", ALLOWED_METHODS)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def handle_one_request(self) -> None:
+        """Handle a single HTTP request with quiet disconnect/timeout handling."""
+        self._headers_sent = False
+        self._connection_header_sent = False
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = self.default_request_version
+                self.command = ""
+                self.close_connection = True
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                self.close_connection = True
+                return
+            mname = "do_" + self.command
+            if not hasattr(self, mname):
+                self._send_method_not_allowed()
+                return
+            method = getattr(self, mname)
+            method()
+            self.wfile.flush()
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+            return
+        except Exception:
+            self.close_connection = True
+            if not self._headers_sent:
+                try:
+                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self.wfile.flush()
+                except CLIENT_DISCONNECT_ERRORS:
+                    pass
+            raise
 
     def _resolve_target(self, url_path: str) -> Path | None | tuple[None, HTTPStatus]:
         """Resolve a URL path to a filesystem target.
@@ -574,7 +700,11 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             try:
                 self.wfile.write(body)
             except CLIENT_DISCONNECT_ERRORS:
+                self.close_connection = True
                 return
+            except Exception:
+                self.close_connection = True
+                raise
 
     def _serve_file(self, url_path: str, send_body: bool) -> None:
         resolved = self._resolve_target(url_path)
@@ -637,26 +767,40 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             status = HTTPStatus.PARTIAL_CONTENT
 
         length = (end - start + 1) if file_size > 0 else 0
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-        self.send_header("ETag", etag)
-        self.send_header("Last-Modified", last_modified)
-        self.send_header("Cache-Control", "no-cache")
-        if status == HTTPStatus.PARTIAL_CONTENT:
-            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-        self.end_headers()
+
+        def send_file_headers() -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
+            self.send_header("Cache-Control", "no-cache")
+            if status == HTTPStatus.PARTIAL_CONTENT:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.end_headers()
 
         if not send_body or length == 0:
+            send_file_headers()
             return
 
         try:
-            with target.open("rb") as f:
+            f = target.open("rb")
+        except OSError:
+            self._send_empty(HTTPStatus.NOT_FOUND)
+            return
+
+        try:
+            with f:
                 f.seek(start)
+                send_file_headers()
+
                 remaining = length
                 while remaining > 0:
-                    chunk = f.read(min(256 * 1024, remaining))
+                    chunk = f.read(min(STREAM_CHUNK_SIZE, remaining))
                     if not chunk:
+                        # File shrank mid-stream after Content-Length was emitted:
+                        # force socket close so HTTP/1.1 framing cannot desynchronize.
+                        self.close_connection = True
                         break
                     remaining -= len(chunk)
                     if remaining == 0:
@@ -666,7 +810,11 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                         f.close()
                     self.wfile.write(chunk)
         except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
             return
+        except Exception:
+            self.close_connection = True
+            raise
 
     def _dispatch(self, send_body: bool) -> None:
         url_path = urlsplit(self.path).path
@@ -681,9 +829,17 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._dispatch(send_body=False)
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", ALLOWED_METHODS)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that suppresses noisy tracebacks on client disconnects."""
+
+    block_on_close = False
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc = sys.exc_info()[1]
@@ -701,6 +857,7 @@ def create_server(
     game_root: Path | None = None,
     shaders_root: Path | None = None,
     boot_root: Path | None = None,
+    keep_alive_timeout: float | None = None,
 ) -> QuietThreadingHTTPServer:
     handler = partial(
         PlayGta6Handler,
@@ -709,6 +866,7 @@ def create_server(
         game_root=game_root,
         shaders_root=shaders_root,
         boot_root=boot_root,
+        keep_alive_timeout=keep_alive_timeout,
     )
     return QuietThreadingHTTPServer((host, port), handler)
 
