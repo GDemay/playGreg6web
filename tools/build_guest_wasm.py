@@ -153,9 +153,11 @@ SPLIT_INCOMING_MODULE_JS_API = (
 BROWSER_BOOT_EXPORTED_RUNTIME_METHODS = (
     "wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
 )
+BROWSER_BOOT_EXPORTED_FUNCTIONS = "_main,_playgta6_get_input_state_ptr"
 BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
     f"-sINCOMING_MODULE_JS_API={BROWSER_BOOT_INCOMING_MODULE_JS_API}",
     f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}",
+    f"-sEXPORTED_FUNCTIONS={BROWSER_BOOT_EXPORTED_FUNCTIONS}",
 )
 
 # Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
@@ -2549,11 +2551,12 @@ def resolve_link_flags(
         if split_incoming_flag not in flags:
             flags.append(split_incoming_flag)
         if browser_boot_exports:
-            runtime_methods_flag = (
-                f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}"
-            )
-            if runtime_methods_flag not in flags:
-                flags.append(runtime_methods_flag)
+            for export_flag in (
+                f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}",
+                f"-sEXPORTED_FUNCTIONS={BROWSER_BOOT_EXPORTED_FUNCTIONS}",
+            ):
+                if export_flag not in flags:
+                    flags.append(export_flag)
     elif browser_boot_exports:
         for export_flag in BROWSER_BOOT_EXPORT_LINK_FLAGS:
             if export_flag not in flags:

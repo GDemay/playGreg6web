@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "abi/playgta6_abi.h"
 #include "gpu/pso_cache.h"
 #include "gpu/stage_reflection.h"
 
@@ -103,9 +104,20 @@ std::string resolve_module_pgim_path(std::string_view module_name,
 // over HTTPFS, prepares `guest::ProgramBoot`, and invokes `guest::run_boot`.
 WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program& program);
 
+// Returns the 64-byte-aligned static InputState block in linear memory (40 bytes, docs/wasm_abi.md)
+// updated by the browser loader from InputBridge's inputSab.
+playgta6::InputState* input_state_ptr() noexcept;
+
+// Attaches the static wasm_boot InputState block to Xbox Scarlett GameInput with
+// SeqlockMode::MonotonicSeq so live and scripted browser inputs reach the guest.
+void attach_default_input_state();
+
 // Streams the manifest / fallback `.pgim` over HTTPFS, validates PGIM magic, emits
 // `PGIM_LOAD`, and either hooks the linked guest boot (`PG6_BOOT_LINKED_GUEST` /
 // `PG6_BOOT_PROGRAM`) or returns a smoke-shell diagnostic when shards are not linked.
 WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg);
 
 }  // namespace playgta6::boot
+
+// C-ABI / Emscripten export returning the linear-memory address of the static InputState struct.
+extern "C" uintptr_t playgta6_get_input_state_ptr(void);

@@ -30,6 +30,12 @@ const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 // Present is opcode 7 (ClearColor is 2). Detecting opcode 2 as Present would dismiss splash on clear.
 const GPU_PACKET_HEADER_BYTES = 8;
 const GPU_OPCODE_PRESENT = 7;
+
+// playgta6::InputState (40 bytes = 10 x 32-bit words, runtime/abi/playgta6_abi.h & docs/wasm_abi.md).
+const INPUT_STATE_BYTES = 40;
+const INPUT_STATE_WORDS = 10;
+const DEFAULT_INPUT_BRIDGE_POLL_MS = 16;
+const INPUT_SNAPSHOT_MAX_RETRIES = 64;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
 // Emscripten 7.0.1 `-pthread` spawns `new Worker(pthreadMainJs, { name: "em-pthread-" + id })`
@@ -142,6 +148,7 @@ let gpuWorker = null;
 let ioWorker = null;
 let audioWorker = null;
 let inputSab = null;
+let activeCoordinatorInputBridge = null;
 let httpfsMailboxSab = null;
 let httpfsClient = null;
 
@@ -2520,6 +2527,455 @@ function createInstantiateWasmHandler(options = {}) {
   };
 }
 
+function isSharedArrayBufferValue(buf) {
+  return typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer;
+}
+
+function isSupportedInputBuffer(buf) {
+  if (!buf) {
+    return false;
+  }
+  const validType = buf instanceof ArrayBuffer || isSharedArrayBufferValue(buf);
+  return validType && buf.byteLength >= INPUT_STATE_BYTES;
+}
+
+function canUseAtomicsOnInt32View(atomics, view, isShared) {
+  if (
+    !atomics ||
+    typeof atomics.load !== 'function' ||
+    typeof atomics.store !== 'function' ||
+    typeof atomics.add !== 'function'
+  ) {
+    return false;
+  }
+  if (isShared) {
+    return true;
+  }
+  try {
+    atomics.load(view, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveInputStatePointerGetter(mod, explicitGetter) {
+  if (typeof explicitGetter === 'function') {
+    return explicitGetter;
+  }
+  if (!mod || typeof mod !== 'object') {
+    return null;
+  }
+  if (typeof mod._playgta6_get_input_state_ptr === 'function') {
+    return () => mod._playgta6_get_input_state_ptr();
+  }
+  if (mod.asm && typeof mod.asm.playgta6_get_input_state_ptr === 'function') {
+    return () => mod.asm.playgta6_get_input_state_ptr();
+  }
+  if (mod.wasmExports && typeof mod.wasmExports.playgta6_get_input_state_ptr === 'function') {
+    return () => mod.wasmExports.playgta6_get_input_state_ptr();
+  }
+  return null;
+}
+
+function makeInactiveInputBridgeHandle() {
+  return {
+    active: false,
+    inputStatePtr: 0,
+    syncNow() {
+      return false;
+    },
+    stop() {},
+    getStats() {
+      return {
+        active: false,
+        stopped: true,
+        inputStatePtr: 0,
+        syncCount: 0,
+        lastSrcSeq: 0,
+        lastDstSeq: 0,
+        bufferReacquires: 0,
+        waitAsyncWakeups: 0,
+        pollTicks: 0,
+      };
+    },
+  };
+}
+
+/**
+ * Bridge browser `InputBridge` (`inputSab`, 40-byte `playgta6::InputState` seqlock) into the
+ * Wasm64 runtime's static linear-memory `InputState` exported via `_playgta6_get_input_state_ptr`.
+ *
+ * - Degrades cleanly (returns an inactive no-op handle) when `inputSab` is absent or the `.wasm`
+ *   build does not export `_playgta6_get_input_state_ptr` (or returns 0 / 0n).
+ * - Re-acquires `Int32Array(wasmMemory.buffer, ptr, 10)` automatically whenever linear memory
+ *   grows or its backing buffer is replaced.
+ * - Uses `Atomics.waitAsync` for instant wakeups when available, paired with a periodic fallback
+ *   interval (`pollIntervalMs`, default 16 ms) so writers that omit `Atomics.notify` (such as
+ *   `web/input/input_bridge.js`) never miss an edge.
+ */
+function startInputSabBridge(options = {}) {
+  const srcBuf = options && options.inputSab ? options.inputSab : null;
+  if (!isSupportedInputBuffer(srcBuf)) {
+    return makeInactiveInputBridgeHandle();
+  }
+
+  const mod = options && options.module && typeof options.module === 'object' ? options.module : null;
+  const ptrGetter = resolveInputStatePointerGetter(mod, options.getInputStatePtr);
+  if (!ptrGetter) {
+    return makeInactiveInputBridgeHandle();
+  }
+
+  let rawPtr;
+  try {
+    rawPtr = ptrGetter();
+  } catch {
+    return makeInactiveInputBridgeHandle();
+  }
+  if (rawPtr === null || rawPtr === undefined || rawPtr === 0 || rawPtr === 0n) {
+    return makeInactiveInputBridgeHandle();
+  }
+
+  let inputStatePtr = 0;
+  try {
+    inputStatePtr = ptrToNumber(rawPtr, 'inputStatePtr');
+  } catch {
+    return makeInactiveInputBridgeHandle();
+  }
+  if (inputStatePtr <= 0 || (inputStatePtr & 3) !== 0) {
+    return makeInactiveInputBridgeHandle();
+  }
+
+  const pollIntervalMs =
+    typeof options.pollIntervalMs === 'number' &&
+    Number.isFinite(options.pollIntervalMs) &&
+    options.pollIntervalMs > 0
+      ? Math.max(1, Math.floor(options.pollIntervalMs))
+      : DEFAULT_INPUT_BRIDGE_POLL_MS;
+
+  const atomics =
+    options.atomicsObj !== undefined
+      ? options.atomicsObj
+      : typeof Atomics === 'object' && Atomics !== null
+        ? Atomics
+        : null;
+  const setIntervalFn =
+    options.setIntervalFn !== undefined
+      ? options.setIntervalFn
+      : typeof setInterval === 'function'
+        ? setInterval
+        : null;
+  const clearIntervalFn =
+    options.clearIntervalFn !== undefined
+      ? options.clearIntervalFn
+      : typeof clearInterval === 'function'
+        ? clearInterval
+        : null;
+
+  const isSharedSrc = isSharedArrayBufferValue(srcBuf);
+  const srcI32 = new Int32Array(srcBuf, 0, INPUT_STATE_WORDS);
+  const useSrcAtomics = canUseAtomicsOnInt32View(atomics, srcI32, isSharedSrc);
+
+  const loadSrc = (idx) => (useSrcAtomics ? atomics.load(srcI32, idx) : srcI32[idx]);
+  const exchangeSrc = (idx, val) => {
+    if (useSrcAtomics && typeof atomics.exchange === 'function') {
+      return atomics.exchange(srcI32, idx, val);
+    }
+    const prev = srcI32[idx];
+    srcI32[idx] = val | 0;
+    return prev;
+  };
+
+  function resolveWasmBuffer() {
+    const raw =
+      typeof options.getMemory === 'function'
+        ? options.getMemory()
+        : options.memory ||
+          (mod &&
+            (mod.wasmMemory ||
+              (mod.HEAPU8 && mod.HEAPU8.buffer) ||
+              (mod.HEAP32 && mod.HEAP32.buffer) ||
+              (mod.asm && mod.asm.memory) ||
+              (mod.wasmExports && mod.wasmExports.memory))) ||
+          null;
+    const buf = resolveBuffer(raw);
+    if (!buf || buf.detached || buf.byteLength < inputStatePtr + INPUT_STATE_BYTES) {
+      return null;
+    }
+    return buf;
+  }
+
+  let cachedDstBuf = null;
+  let cachedDstI32 = null;
+  let cachedDstUseAtomics = false;
+  let bufferReacquires = 0;
+
+  function acquireDstView() {
+    const buf = resolveWasmBuffer();
+    if (!buf) {
+      cachedDstBuf = null;
+      cachedDstI32 = null;
+      cachedDstUseAtomics = false;
+      return null;
+    }
+    if (buf !== cachedDstBuf || !cachedDstI32) {
+      if (cachedDstBuf !== null) {
+        bufferReacquires += 1;
+      }
+      cachedDstBuf = buf;
+      cachedDstI32 = new Int32Array(buf, inputStatePtr, INPUT_STATE_WORDS);
+      cachedDstUseAtomics = canUseAtomicsOnInt32View(
+        atomics,
+        cachedDstI32,
+        isSharedArrayBufferValue(buf),
+      );
+    }
+    return cachedDstI32;
+  }
+
+  const loadDst = (dst, idx) => (cachedDstUseAtomics ? atomics.load(dst, idx) : dst[idx]);
+  const storeDst = (dst, idx, val) => {
+    if (cachedDstUseAtomics) {
+      atomics.store(dst, idx, val | 0);
+    } else {
+      dst[idx] = val | 0;
+    }
+  };
+  const addDst = (dst, idx, delta) => {
+    if (cachedDstUseAtomics) {
+      atomics.add(dst, idx, delta | 0);
+    } else {
+      dst[idx] = (dst[idx] + delta) | 0;
+    }
+  };
+
+  // Pre-allocated 9-word payload scratch (buttons, mouse_dx, mouse_dy, 6 x f32 axes/triggers).
+  const payloadWords = new Int32Array(INPUT_STATE_WORDS - 1);
+
+  let stopped = false;
+  let hasSynced = false;
+  let lastSrcSeq = 0;
+  let dstSeq = 0;
+  let syncCount = 0;
+  let waitAsyncWakeups = 0;
+  let pollTicks = 0;
+  let waitAsyncEnabled =
+    options.useWaitAsync !== false &&
+    isSharedSrc &&
+    Boolean(atomics && typeof atomics.waitAsync === 'function');
+  let waitAsyncInFlight = false;
+  let intervalId = null;
+
+  function readConsistentSnapshot() {
+    for (let attempt = 0; attempt < INPUT_SNAPSHOT_MAX_RETRIES; attempt += 1) {
+      const seqBefore = loadSrc(0) >>> 0;
+      if ((seqBefore & 1) !== 0) {
+        continue;
+      }
+      for (let w = 1; w < INPUT_STATE_WORDS; w += 1) {
+        payloadWords[w - 1] = loadSrc(w);
+      }
+      const seqAfter = loadSrc(0) >>> 0;
+      if (seqBefore === seqAfter) {
+        return seqBefore;
+      }
+    }
+    return -1;
+  }
+
+  function hasNonZeroPayload() {
+    for (let i = 0; i < payloadWords.length; i += 1) {
+      if (payloadWords[i] !== 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function writeSnapshotToWasm() {
+    const dst = acquireDstView();
+    if (!dst) {
+      return false;
+    }
+
+    const existingDstSeq = loadDst(dst, 0) >>> 0;
+    const baseSeq = existingDstSeq > dstSeq ? existingDstSeq : dstSeq;
+    const oddSeq = ((baseSeq & 1) !== 0 ? baseSeq : baseSeq + 1) >>> 0;
+    const nextEvenSeq = (oddSeq + 1) >>> 0;
+
+    // Drain accumulated mouse deltas atomically from inputSab so we neither drop nor double-count.
+    const dx = payloadWords[1] !== 0 ? exchangeSrc(2, 0) : 0;
+    const dy = payloadWords[2] !== 0 ? exchangeSrc(3, 0) : 0;
+
+    // Seqlock write matching MonotonicSeq & EvenOddSeqlock in runtime/os/game_input.cpp:
+    // odd seq -> write 36-byte payload -> even seq.
+    storeDst(dst, 0, oddSeq | 0);
+    storeDst(dst, 1, payloadWords[0]);
+    if (dx !== 0) {
+      addDst(dst, 2, dx);
+    }
+    if (dy !== 0) {
+      addDst(dst, 3, dy);
+    }
+    for (let w = 4; w < INPUT_STATE_WORDS; w += 1) {
+      storeDst(dst, w, payloadWords[w - 1]);
+    }
+    storeDst(dst, 0, nextEvenSeq | 0);
+
+    dstSeq = nextEvenSeq;
+    return true;
+  }
+
+  function syncNow(force = false) {
+    if (stopped) {
+      return false;
+    }
+    const curSeq = loadSrc(0) >>> 0;
+    if (!force && hasSynced && (curSeq & 1) === 0 && curSeq === lastSrcSeq) {
+      return false;
+    }
+
+    const snapSeq = readConsistentSnapshot();
+    if (snapSeq < 0) {
+      return false;
+    }
+
+    if (!hasSynced) {
+      if (!force && snapSeq === 0 && !hasNonZeroPayload()) {
+        hasSynced = true;
+        lastSrcSeq = 0;
+        return false;
+      }
+      if (!writeSnapshotToWasm()) {
+        return false;
+      }
+      hasSynced = true;
+      lastSrcSeq = snapSeq;
+      syncCount += 1;
+      return true;
+    }
+
+    if (!force && snapSeq === lastSrcSeq) {
+      return false;
+    }
+
+    if (!writeSnapshotToWasm()) {
+      return false;
+    }
+    lastSrcSeq = snapSeq;
+    syncCount += 1;
+    return true;
+  }
+
+  function armWaitAsync(syncDepth = 0) {
+    if (stopped || !waitAsyncEnabled || waitAsyncInFlight) {
+      return;
+    }
+    const expectedSeq = (hasSynced ? lastSrcSeq : 0) | 0;
+    let res;
+    try {
+      res = atomics.waitAsync(srcI32, 0, expectedSeq, pollIntervalMs);
+    } catch {
+      waitAsyncEnabled = false;
+      return;
+    }
+    if (!res) {
+      return;
+    }
+    if (res.async === false) {
+      if (res.value === 'not-equal') {
+        const synced = syncNow(false);
+        if (synced && !stopped && syncDepth < 4) {
+          armWaitAsync(syncDepth + 1);
+        }
+      }
+      return;
+    }
+    if (res.value && typeof res.value.then === 'function') {
+      waitAsyncInFlight = true;
+      res.value.then(
+        (outcome) => {
+          waitAsyncInFlight = false;
+          if (stopped) {
+            return;
+          }
+          if (outcome === 'ok') {
+            waitAsyncWakeups += 1;
+          }
+          syncNow(false);
+          armWaitAsync(0);
+        },
+        () => {
+          waitAsyncInFlight = false;
+          waitAsyncEnabled = false;
+        },
+      );
+    }
+  }
+
+  // Immediate initial sync on attach, then reactive waitAsync + periodic fallback timer.
+  syncNow(false);
+  armWaitAsync(0);
+
+  if (options.disableFallbackInterval !== true && typeof setIntervalFn === 'function') {
+    intervalId = setIntervalFn(() => {
+      if (stopped) {
+        return;
+      }
+      pollTicks += 1;
+      syncNow(false);
+      if (!waitAsyncInFlight && waitAsyncEnabled) {
+        armWaitAsync(0);
+      }
+    }, pollIntervalMs);
+  }
+
+  function stop() {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    if (intervalId !== null && typeof clearIntervalFn === 'function') {
+      try {
+        clearIntervalFn(intervalId);
+      } catch {
+        // Ignore timer cleanup errors.
+      }
+      intervalId = null;
+    }
+    if (waitAsyncInFlight && isSharedSrc && atomics && typeof atomics.notify === 'function') {
+      try {
+        atomics.notify(srcI32, 0, 1);
+      } catch {
+        // Ignore notify failures during teardown.
+      }
+    }
+    cachedDstBuf = null;
+    cachedDstI32 = null;
+    cachedDstUseAtomics = false;
+  }
+
+  return {
+    active: true,
+    inputStatePtr,
+    syncNow,
+    stop,
+    getStats() {
+      return {
+        active: !stopped,
+        stopped,
+        inputStatePtr,
+        syncCount,
+        lastSrcSeq,
+        lastDstSeq: dstSeq,
+        bufferReacquires,
+        waitAsyncWakeups,
+        pollTicks,
+      };
+    },
+  };
+}
+
 /**
  * Build the Emscripten `createRuntimeModule(...)` configuration object with:
  * - `mainScriptUrlOrBlob` pinned to `dist/runtime.js` (never `loader.js`),
@@ -2679,16 +3135,98 @@ function buildRuntimeModuleConfig(options = {}) {
         },
       ];
 
+  const activeInputSab = options.inputSab !== undefined ? options.inputSab : inputSab;
+  let activeInputBridge = null;
+
+  const resolveRuntimeMemory = () =>
+    options.memory ||
+    (boundModule &&
+      (boundModule.wasmMemory ||
+        (boundModule.HEAPU8 && boundModule.HEAPU8.buffer) ||
+        (boundModule.HEAP32 && boundModule.HEAP32.buffer) ||
+        (boundModule.asm && boundModule.asm.memory) ||
+        (boundModule.wasmExports && boundModule.wasmExports.memory))) ||
+    null;
+
+  const stopInputBridge = () => {
+    if (activeInputBridge) {
+      try {
+        activeInputBridge.stop();
+      } catch {
+        // Ignore input bridge teardown errors.
+      }
+      activeInputBridge = null;
+    }
+  };
+
+  const attachInputBridge = (mod) => {
+    if (activeInputBridge && activeInputBridge.active) {
+      return activeInputBridge;
+    }
+    const targetMod = mod && typeof mod === 'object' ? mod : boundModule;
+    if (!activeInputSab || !targetMod) {
+      return null;
+    }
+    const bridge = startInputSabBridge({
+      inputSab: activeInputSab,
+      module: targetMod,
+      getMemory: () =>
+        resolveRuntimeMemory() ||
+        (targetMod &&
+          (targetMod.wasmMemory ||
+            (targetMod.HEAPU8 && targetMod.HEAPU8.buffer) ||
+            (targetMod.HEAP32 && targetMod.HEAP32.buffer) ||
+            (targetMod.asm && targetMod.asm.memory) ||
+            (targetMod.wasmExports && targetMod.wasmExports.memory))) ||
+        null,
+      pollIntervalMs: options.inputPollIntervalMs,
+    });
+    if (bridge && bridge.active) {
+      activeInputBridge = bridge;
+      return bridge;
+    }
+    return null;
+  };
+
+  const userOnRuntimeInitialized =
+    typeof options.onRuntimeInitialized === 'function' ? options.onRuntimeInitialized : null;
+  const userOnExit = typeof options.onExit === 'function' ? options.onExit : null;
+
+  const onRuntimeInitialized = function onPlayGta6RuntimeInitialized() {
+    const mod = this && typeof this === 'object' ? this : boundModule;
+    if (mod && !boundModule) {
+      boundModule = mod;
+    }
+    attachInputBridge(mod);
+    if (userOnRuntimeInitialized) {
+      return userOnRuntimeInitialized.apply(this, arguments);
+    }
+    return undefined;
+  };
+
+  const onExit = function onPlayGta6RuntimeExit() {
+    stopInputBridge();
+    if (userOnExit) {
+      return userOnExit.apply(this, arguments);
+    }
+    return undefined;
+  };
+
   const userdataApiObj = activeHostImports.userdata || {};
   const config = {
     mainScriptUrlOrBlob: resolvedRuntimeScriptUrl,
     locateFile,
     preRun,
+    onRuntimeInitialized,
+    onExit,
     env: activeHostImports.env,
     hostImports: activeHostImports,
     httpfsMailboxSab:
       options.httpfsMailboxSab !== undefined ? options.httpfsMailboxSab : httpfsMailboxSab,
-    inputSab: options.inputSab !== undefined ? options.inputSab : inputSab,
+    inputSab: activeInputSab,
+    attachInputBridge,
+    stopInputBridge,
+    getInputBridge: () => activeInputBridge,
     hostCallbacks: options.hostCallbacks || {
       log: logFn,
       wgpuSubmit,
@@ -3510,7 +4048,26 @@ async function tryBootWasmRuntime() {
       if (typeof moduleConfig.getSideModuleProgress === 'function') {
         activeSideModuleProgressGetter = moduleConfig.getSideModuleProgress;
       }
-      await self.createRuntimeModule(moduleConfig);
+      if (activeCoordinatorInputBridge) {
+        try {
+          activeCoordinatorInputBridge.stop();
+        } catch {
+          // Ignore teardown errors from a previous runtime boot.
+        }
+        activeCoordinatorInputBridge = null;
+      }
+      const runtimeMod = await self.createRuntimeModule(moduleConfig);
+      if (typeof moduleConfig.attachInputBridge === 'function') {
+        const attached = moduleConfig.attachInputBridge(runtimeMod);
+        if (attached && attached.active) {
+          activeCoordinatorInputBridge = attached;
+        }
+      } else if (typeof moduleConfig.getInputBridge === 'function') {
+        const existing = moduleConfig.getInputBridge();
+        if (existing && existing.active) {
+          activeCoordinatorInputBridge = existing;
+        }
+      }
     }
   } catch (err) {
     postProgress({ error: `runtime boot: ${err}` });
@@ -3662,6 +4219,14 @@ if (typeof self !== 'undefined') {
     }
 
     if (!msg.canvas) return;
+    if (activeCoordinatorInputBridge) {
+      try {
+        activeCoordinatorInputBridge.stop();
+      } catch {
+        // Ignore teardown errors when re-initializing workers.
+      }
+      activeCoordinatorInputBridge = null;
+    }
     inputSab = msg.inputSab || null;
     configuredSideModuleUrls = Array.isArray(msg.sideModuleUrls) ? msg.sideModuleUrls : null;
     configuredDynamicLibraries = Array.isArray(msg.dynamicLibraries)
@@ -3748,6 +4313,9 @@ const exportedApi = {
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
+  INPUT_STATE_BYTES,
+  INPUT_STATE_WORDS,
+  DEFAULT_INPUT_BRIDGE_POLL_MS,
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
@@ -3767,6 +4335,7 @@ const exportedApi = {
   forwardGpuWorkerMessage,
   sanitizeRenderStateStats,
   createHostImports,
+  startInputSabBridge,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
   sanitizeSideModuleUrls,

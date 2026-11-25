@@ -24,6 +24,7 @@
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
+#include "os/xbox_scarlett.h"
 #include "wasm_boot.h"
 
 namespace {
@@ -1558,6 +1559,118 @@ void test_wgpu_features_and_dstorage_defaults() {
     }
 }
 
+void test_wasm_input_state_and_game_input_wiring() {
+    namespace scarlett = playgta6::os::scarlett;
+    namespace input_btn = playgta6::os::input_button;
+
+    // 1. Verify exported linear-memory InputState pointer, alignment, and ABI size (40 bytes).
+    static_assert(sizeof(playgta6::InputState) == 40, "InputState must remain 40 bytes");
+    playgta6::InputState* cpp_ptr = playgta6::boot::input_state_ptr();
+    const uintptr_t c_addr = playgta6_get_input_state_ptr();
+    CHECK(cpp_ptr != nullptr);
+    CHECK(c_addr != 0);
+    CHECK(c_addr == reinterpret_cast<uintptr_t>(cpp_ptr));
+    CHECK((c_addr % 64u) == 0u);
+
+    // Reset state cleanly before exercising GameInput.
+    std::memset(cpp_ptr, 0, sizeof(playgta6::InputState));
+    scarlett::set_game_input_state(nullptr);
+    CHECK(scarlett::get_game_input_state() == nullptr);
+
+    // 2. Direct attach_default_input_state() wires GameInput to the static InputState block.
+    playgta6::boot::attach_default_input_state();
+    CHECK(scarlett::get_game_input_state() == cpp_ptr);
+
+    playgta6::InputState write_vals{};
+    write_vals.buttons = input_btn::kGamepadA | input_btn::kRightBumper;
+    write_vals.left_stick_x = 0.75f;
+    write_vals.left_stick_y = -0.50f;
+    write_vals.right_trigger = 0.85f;
+    playgta6::os::GameInputReader::write_seqlock(*cpp_ptr, write_vals);
+
+    Pg6IGameInput* gi = nullptr;
+    CHECK(pg6_xbox_GameInputCreate(&gi) == 0);
+    CHECK(gi != nullptr);
+    if (gi != nullptr) {
+        Pg6IGameInputReading* reading = nullptr;
+        CHECK(gi->GetCurrentReading(scarlett::kGameInputKindGamepad, nullptr, &reading) == 0);
+        CHECK(reading != nullptr);
+        if (reading != nullptr) {
+            Pg6GameInputGamepadState gp{};
+            CHECK(reading->GetGamepadState(&gp));
+            CHECK((gp.buttons & scarlett::gamepad_button::kA) != 0u);
+            CHECK((gp.buttons & scarlett::gamepad_button::kRightShoulder) != 0u);
+            CHECK(gp.left_thumbstick_x > 0.5f);
+            CHECK(gp.left_thumbstick_y < -0.25f);
+            CHECK(gp.right_trigger > 0.7f);
+            CHECK(reading->GetSequenceNumber(scarlett::kGameInputKindGamepad) >= 2u);
+            reading->Release();
+        }
+        gi->Release();
+    }
+
+    // 3. run_wasm_program_boot automatically attaches input_state_ptr() before invoking the guest
+    //    entry point, so live/scripted browser input reaches GameInput during guest execution.
+    std::memset(cpp_ptr, 0, sizeof(playgta6::InputState));
+    scarlett::set_game_input_state(nullptr);
+
+    FakeFs fs;
+    setup_synthetic_program_fs(fs);
+    WasmBootConfig cfg = make_cfg(fs);
+    cfg.read_chunk_bytes = 4096;
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    bool saw_attached = false;
+    bool saw_button_a = false;
+    uint64_t observed_seq = 0;
+
+    g_test_entry_hook = [&]() {
+        saw_attached = (scarlett::get_game_input_state() == cpp_ptr);
+        auto* exported = reinterpret_cast<playgta6::InputState*>(playgta6_get_input_state_ptr());
+        playgta6::InputState press_a{};
+        press_a.buttons = input_btn::kGamepadA;
+        playgta6::os::GameInputReader::write_seqlock(*exported, press_a);
+
+        Pg6IGameInput* guest_gi = nullptr;
+        if (pg6_xbox_GameInputCreate(&guest_gi) == 0 && guest_gi != nullptr) {
+            Pg6IGameInputReading* reading = nullptr;
+            if (guest_gi->GetCurrentReading(scarlett::kGameInputKindGamepad, nullptr, &reading) == 0 &&
+                reading != nullptr) {
+                Pg6GameInputGamepadState gp{};
+                if (reading->GetGamepadState(&gp)) {
+                    saw_button_a = (gp.buttons & scarlett::gamepad_button::kA) != 0u;
+                }
+                observed_seq = reading->GetSequenceNumber(scarlett::kGameInputKindGamepad);
+                reading->Release();
+            }
+            guest_gi->Release();
+        }
+    };
+
+    playgta6::os::VirtualMemoryArena arena;
+    playgta6::os::win32::set_vmem_arena(&arena);
+    const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+    g_test_entry_hook = nullptr;
+    playgta6::guest::reset_boot();
+    playgta6::os::win32::set_vmem_arena(nullptr);
+
+    CHECK(r.ok);
+    CHECK(r.exit_code == 42);
+    CHECK(saw_attached);
+    CHECK(saw_button_a);
+    CHECK(observed_seq >= 2u);
+
+    // Clean up global state.
+    scarlett::set_game_input_state(nullptr);
+    std::memset(cpp_ptr, 0, sizeof(playgta6::InputState));
+}
+
 }  // namespace
 
 int main() {
@@ -1586,6 +1699,7 @@ int main() {
     test_program_boot_stage_reflection_sidecar();
     test_program_boot_pipeline_dump_triggers();
     test_wgpu_features_and_dstorage_defaults();
+    test_wasm_input_state_and_game_input_wiring();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d test(s) failed\n", g_failures);
