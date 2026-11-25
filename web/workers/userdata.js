@@ -11,6 +11,9 @@ const DEFAULT_RESTORE_TIMEOUT_MS = 8000;
 const USERDATA_PREFIX = '/userdata/';
 const ARCHIVE_FORMAT = 'playgta6-userdata-archive-v1';
 const ARCHIVE_VERSION = 1;
+const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_FILE_COUNT = 4096;
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const BASE64_LOOKUP = (() => {
@@ -206,6 +209,93 @@ async function ensureParentDirs(fsAdapter, filePath) {
   }
 }
 
+function nowMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function parseQuotaLimit(value, fallback, label) {
+  if (value === undefined) {
+    return fallback;
+  }
+  if (value === Infinity) {
+    return Infinity;
+  }
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return Math.floor(value);
+  }
+  throw new RangeError(`${label} must be a non-negative finite number or Infinity`);
+}
+
+function createQuotaError(message, details) {
+  const err = new Error(message);
+  err.name = 'QuotaExceededError';
+  err.code = 'QUOTA_EXCEEDED';
+  if (details && typeof details === 'object') {
+    err.details = details;
+  }
+  return err;
+}
+
+function getRecordByteLength(data) {
+  if (data instanceof Uint8Array) {
+    return data.byteLength;
+  }
+  if (ArrayBuffer.isView(data)) {
+    return data.byteLength;
+  }
+  if (data instanceof ArrayBuffer) {
+    return data.byteLength;
+  }
+  if (typeof data === 'string') {
+    return new TextEncoder().encode(data).byteLength;
+  }
+  throw new TypeError('Userdata file payload must be a Uint8Array, ArrayBufferView, ArrayBuffer, or string');
+}
+
+function buildMetadataEntry(validPath, size, mtime) {
+  const rel = validPath.slice(USERDATA_PREFIX.length);
+  const firstSlash = rel.indexOf('/');
+  const containerPrefix =
+    firstSlash === -1 ? USERDATA_PREFIX : `${USERDATA_PREFIX}${rel.slice(0, firstSlash)}/`;
+  const lastSlash = validPath.lastIndexOf('/');
+  const parentDir = validPath.slice(0, lastSlash + 1);
+  const name = validPath.slice(lastSlash + 1);
+  return {
+    path: validPath,
+    size,
+    mtime: Number.isFinite(mtime) ? mtime : 0,
+    containerPrefix,
+    parentDir,
+    name,
+  };
+}
+
+function ancestorPrefixesOf(validPath) {
+  const prefixes = [USERDATA_PREFIX];
+  const rel = validPath.slice(USERDATA_PREFIX.length);
+  const segments = rel.split('/');
+  let current = USERDATA_PREFIX;
+  for (let i = 0; i < segments.length - 1; i += 1) {
+    current += `${segments[i]}/`;
+    prefixes.push(current);
+  }
+  return prefixes;
+}
+
+function cloneMetadataEntry(meta) {
+  return {
+    path: meta.path,
+    size: meta.size,
+    mtime: meta.mtime,
+    containerPrefix: meta.containerPrefix,
+    parentDir: meta.parentDir,
+    name: meta.name,
+  };
+}
+
 class UserdataStore {
   constructor(options = {}) {
     this.dbName = typeof options.dbName === 'string' && options.dbName ? options.dbName : DEFAULT_DB_NAME;
@@ -221,8 +311,306 @@ class UserdataStore {
           : null;
     this.backend = options.backend || null;
 
+    this.maxFileBytes = parseQuotaLimit(options.maxFileBytes, DEFAULT_MAX_FILE_BYTES, 'maxFileBytes');
+    this.maxTotalBytes = parseQuotaLimit(options.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES, 'maxTotalBytes');
+    this.maxFileCount = parseQuotaLimit(options.maxFileCount, DEFAULT_MAX_FILE_COUNT, 'maxFileCount');
+    this.storageEstimate = typeof options.storageEstimate === 'function' ? options.storageEstimate : null;
+
     this._db = null;
     this._dbPromise = null;
+
+    // In-memory container/blob metadata index (never stores raw Uint8Array payloads).
+    this._metaIndex = new Map();
+    this._dirIndex = new Map();
+    this._containerBuckets = new Map();
+    this._indexedTotalBytes = 0;
+    this._indexReady = false;
+    this._indexEpoch = 0;
+    this._indexLoadPromise = null;
+
+    // Serializes mutations so quota validation + persistence + index updates never race.
+    this._mutationTail = Promise.resolve();
+
+    // Lightweight operational telemetry.
+    this._stats = {
+      reads: 0,
+      writes: 0,
+      deletes: 0,
+      indexHits: 0,
+      indexMisses: 0,
+      bytesWritten: 0,
+      bytesRead: 0,
+      quotaRejections: 0,
+      invalidations: 0,
+      atomicCommits: 0,
+      lastWriteDurationMs: 0,
+    };
+  }
+
+  _withMutationLock(fn) {
+    const run = this._mutationTail.then(fn, fn);
+    this._mutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  _clearIndexMaps() {
+    this._metaIndex.clear();
+    this._dirIndex.clear();
+    this._containerBuckets.clear();
+    this._indexedTotalBytes = 0;
+    this._indexReady = false;
+  }
+
+  _indexPut(validPath, size, mtime) {
+    const nextMeta = buildMetadataEntry(validPath, size, mtime);
+    const prev = this._metaIndex.get(validPath);
+
+    if (prev) {
+      const delta = size - prev.size;
+      this._indexedTotalBytes = Math.max(0, this._indexedTotalBytes + delta);
+      const bucket = this._containerBuckets.get(prev.containerPrefix);
+      if (bucket) {
+        bucket.totalBytes = Math.max(0, bucket.totalBytes + delta);
+      }
+      this._metaIndex.set(validPath, nextMeta);
+      return;
+    }
+
+    this._metaIndex.set(validPath, nextMeta);
+    this._indexedTotalBytes += size;
+
+    const prefixes = ancestorPrefixesOf(validPath);
+    for (let i = 0; i < prefixes.length; i += 1) {
+      const prefix = prefixes[i];
+      let set = this._dirIndex.get(prefix);
+      if (!set) {
+        set = new Set();
+        this._dirIndex.set(prefix, set);
+      }
+      set.add(validPath);
+    }
+
+    let bucket = this._containerBuckets.get(nextMeta.containerPrefix);
+    if (!bucket) {
+      bucket = { fileCount: 0, totalBytes: 0 };
+      this._containerBuckets.set(nextMeta.containerPrefix, bucket);
+    }
+    bucket.fileCount += 1;
+    bucket.totalBytes += size;
+  }
+
+  _indexDelete(validPath) {
+    const prev = this._metaIndex.get(validPath);
+    if (!prev) {
+      return false;
+    }
+
+    this._metaIndex.delete(validPath);
+    this._indexedTotalBytes = Math.max(0, this._indexedTotalBytes - prev.size);
+
+    const prefixes = ancestorPrefixesOf(validPath);
+    for (let i = 0; i < prefixes.length; i += 1) {
+      const prefix = prefixes[i];
+      const set = this._dirIndex.get(prefix);
+      if (set) {
+        set.delete(validPath);
+        if (set.size === 0) {
+          this._dirIndex.delete(prefix);
+        }
+      }
+    }
+
+    const bucket = this._containerBuckets.get(prev.containerPrefix);
+    if (bucket) {
+      bucket.fileCount -= 1;
+      bucket.totalBytes = Math.max(0, bucket.totalBytes - prev.size);
+      if (bucket.fileCount <= 0) {
+        this._containerBuckets.delete(prev.containerPrefix);
+      }
+    }
+
+    return true;
+  }
+
+  _populateIndexFromEntries(entries) {
+    this._clearIndexMaps();
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      this._indexPut(entry.path, entry.size, entry.mtime);
+    }
+    this._indexReady = true;
+  }
+
+  _populateIndexFromRecords(records) {
+    const entries = [];
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i];
+      if (!rec || typeof rec.path !== 'string') continue;
+      let validPath;
+      try {
+        validPath = validateUserdataPath(rec.path);
+      } catch {
+        continue;
+      }
+      let size;
+      try {
+        size = getRecordByteLength(rec.data);
+      } catch {
+        continue;
+      }
+      entries.push({
+        path: validPath,
+        size,
+        mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+      });
+    }
+    this._populateIndexFromEntries(entries);
+  }
+
+  invalidateIndex() {
+    this._indexEpoch += 1;
+    this._clearIndexMaps();
+    this._indexLoadPromise = null;
+    this._stats.invalidations += 1;
+  }
+
+  async _ensureIndex(options = {}) {
+    const countHit = Boolean(options && options.countHit);
+    if (this._indexReady) {
+      if (countHit) {
+        this._stats.indexHits += 1;
+      }
+      return true;
+    }
+
+    if (this.backend && typeof this.backend.getAll !== 'function') {
+      return false;
+    }
+
+    if (!this._indexLoadPromise) {
+      this._indexLoadPromise = (async () => {
+        while (!this._indexReady) {
+          const startEpoch = this._indexEpoch;
+          this._stats.indexMisses += 1;
+          const records = await this._getAllRecords();
+          if (this._indexEpoch === startEpoch) {
+            this._populateIndexFromRecords(records);
+            return true;
+          }
+        }
+        return true;
+      })().finally(() => {
+        this._indexLoadPromise = null;
+      });
+    }
+
+    await this._indexLoadPromise;
+    return this._indexReady;
+  }
+
+  async _validateQuotaForWrites(writeSpecs, deletePathsSet) {
+    for (let i = 0; i < writeSpecs.length; i += 1) {
+      const spec = writeSpecs[i];
+      if (spec.size > this.maxFileBytes) {
+        this._stats.quotaRejections += 1;
+        throw createQuotaError(
+          `Userdata file "${spec.path}" (${spec.size} bytes) exceeds maxFileBytes (${this.maxFileBytes})`,
+          { path: spec.path, size: spec.size, maxFileBytes: this.maxFileBytes },
+        );
+      }
+    }
+
+    const needsTotalCheck =
+      this.maxTotalBytes < Infinity ||
+      this.maxFileCount < Infinity ||
+      typeof this.storageEstimate === 'function';
+
+    if (!needsTotalCheck) {
+      return;
+    }
+
+    const indexed = await this._ensureIndex({ countHit: false });
+    const baseBytes = indexed ? this._indexedTotalBytes : 0;
+    const baseCount = indexed ? this._metaIndex.size : 0;
+
+    let projectedBytes = baseBytes;
+    let projectedCount = baseCount;
+
+    if (indexed && deletePathsSet && deletePathsSet.size > 0) {
+      for (const delPath of deletePathsSet) {
+        const existing = this._metaIndex.get(delPath);
+        if (existing) {
+          projectedBytes = Math.max(0, projectedBytes - existing.size);
+          projectedCount = Math.max(0, projectedCount - 1);
+        }
+      }
+    }
+
+    for (let i = 0; i < writeSpecs.length; i += 1) {
+      const spec = writeSpecs[i];
+      const existing =
+        indexed && (!deletePathsSet || !deletePathsSet.has(spec.path))
+          ? this._metaIndex.get(spec.path)
+          : null;
+      if (existing) {
+        projectedBytes = Math.max(0, projectedBytes - existing.size + spec.size);
+      } else {
+        projectedBytes += spec.size;
+        projectedCount += 1;
+      }
+    }
+
+    if (projectedBytes > this.maxTotalBytes) {
+      this._stats.quotaRejections += 1;
+      throw createQuotaError(
+        `Userdata write would reach ${projectedBytes} bytes, exceeding maxTotalBytes (${this.maxTotalBytes})`,
+        {
+          currentBytes: baseBytes,
+          projectedBytes,
+          maxTotalBytes: this.maxTotalBytes,
+        },
+      );
+    }
+
+    if (projectedCount > this.maxFileCount) {
+      this._stats.quotaRejections += 1;
+      throw createQuotaError(
+        `Userdata write would reach ${projectedCount} files, exceeding maxFileCount (${this.maxFileCount})`,
+        {
+          currentCount: baseCount,
+          projectedCount,
+          maxFileCount: this.maxFileCount,
+        },
+      );
+    }
+
+    const deltaBytes = projectedBytes - baseBytes;
+    if (deltaBytes > 0 && typeof this.storageEstimate === 'function') {
+      const estimate = await this.storageEstimate();
+      if (
+        estimate &&
+        typeof estimate === 'object' &&
+        Number.isFinite(estimate.quota) &&
+        estimate.quota > 0 &&
+        Number.isFinite(estimate.usage) &&
+        estimate.usage >= 0
+      ) {
+        if (estimate.usage + deltaBytes > estimate.quota) {
+          this._stats.quotaRejections += 1;
+          throw createQuotaError(
+            `Browser storage quota exceeded: usage ${estimate.usage} + ${deltaBytes} > quota ${estimate.quota}`,
+            {
+              usage: estimate.usage,
+              quota: estimate.quota,
+              deltaBytes,
+            },
+          );
+        }
+      }
+    }
   }
 
   _openDb() {
@@ -271,12 +659,16 @@ class UserdataStore {
             if (this._db === db) {
               this._db = null;
               this._dbPromise = null;
+              this._indexEpoch += 1;
+              this._clearIndexMaps();
             }
           };
           db.onclose = () => {
             if (this._db === db) {
               this._db = null;
               this._dbPromise = null;
+              this._indexEpoch += 1;
+              this._clearIndexMaps();
             }
           };
         }
@@ -398,6 +790,8 @@ class UserdataStore {
     const restorePromise = (async () => {
       let restored = 0;
       let skipped = 0;
+      const restoredEntries = [];
+      const startEpoch = this._indexEpoch;
       try {
         const records = await this._getAllRecords();
         if (timedOut) {
@@ -450,7 +844,18 @@ class UserdataStore {
               // Setting mtime is best-effort.
             }
           }
+          this._stats.reads += 1;
+          this._stats.bytesRead += payload.byteLength;
+          restoredEntries.push({
+            path: validPath,
+            size: payload.byteLength,
+            mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+          });
           restored += 1;
+        }
+
+        if (!timedOut && this._indexEpoch === startEpoch) {
+          this._populateIndexFromEntries(restoredEntries);
         }
 
         return { restored, skipped, timedOut: false, error: null };
@@ -468,23 +873,53 @@ class UserdataStore {
     }
   }
 
-  async saveFile(path, bytes, mtime = Date.now()) {
-    const validPath = validateUserdataPath(path);
-    const data = toUint8Array(bytes);
-    const ts = Number.isFinite(mtime) ? mtime : Date.now();
-    const record = { path: validPath, data, mtime: ts };
-
-    if (this.backend) {
-      await this.backend.put(record);
-    } else {
-      await this._runTransaction('readwrite', (store) => store.put(record));
+  async _saveFileUnlocked(validPath, data, ts, options = {}) {
+    const startMs = nowMs();
+    if (!options.skipQuotaCheck) {
+      await this._validateQuotaForWrites([{ path: validPath, size: data.byteLength }], null);
     }
+
+    const record = { path: validPath, data, mtime: ts };
+    try {
+      if (this.backend) {
+        await this.backend.put(record);
+      } else {
+        await this._runTransaction('readwrite', (store) => store.put(record));
+      }
+    } catch (err) {
+      if (err && (err.name === 'QuotaExceededError' || err.code === 'QUOTA_EXCEEDED')) {
+        this._stats.quotaRejections += 1;
+      }
+      throw err;
+    }
+
+    this._indexEpoch += 1;
+    if (this._indexReady) {
+      this._indexPut(validPath, data.byteLength, ts);
+    }
+    this._stats.writes += 1;
+    this._stats.bytesWritten += data.byteLength;
+    this._stats.lastWriteDurationMs = Math.max(0, nowMs() - startMs);
 
     return { path: validPath, size: data.byteLength, mtime: ts };
   }
 
+  async saveFile(path, bytes, mtime = Date.now()) {
+    const validPath = validateUserdataPath(path);
+    const data = toUint8Array(bytes);
+    const ts = Number.isFinite(mtime) ? mtime : Date.now();
+    return this._withMutationLock(() => this._saveFileUnlocked(validPath, data, ts));
+  }
+
   async getFile(path) {
     const validPath = validateUserdataPath(path);
+    this._stats.reads += 1;
+
+    if (this._indexReady && !this._metaIndex.has(validPath)) {
+      this._stats.indexHits += 1;
+      return null;
+    }
+
     let rec = null;
 
     if (this.backend) {
@@ -507,49 +942,87 @@ class UserdataStore {
     }
 
     if (!rec || typeof rec !== 'object') {
+      if (this._indexReady) {
+        this._indexDelete(validPath);
+      }
       return null;
     }
 
+    const data = toUint8Array(rec.data);
+    const mtime = Number.isFinite(rec.mtime) ? rec.mtime : 0;
+    this._stats.bytesRead += data.byteLength;
+
     return {
       path: validPath,
-      data: toUint8Array(rec.data),
-      mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+      data,
+      mtime,
     };
   }
 
-  async deleteFile(path) {
-    const validPath = validateUserdataPath(path);
-
+  async _deleteFileUnlocked(validPath) {
     if (this.backend) {
       await this.backend.delete(validPath);
     } else {
       await this._runTransaction('readwrite', (store) => store.delete(validPath));
     }
 
+    this._indexEpoch += 1;
+    if (this._indexReady) {
+      this._indexDelete(validPath);
+    }
+    this._stats.deletes += 1;
+
     return { path: validPath, deleted: true };
   }
 
+  async deleteFile(path) {
+    const validPath = validateUserdataPath(path);
+    return this._withMutationLock(() => this._deleteFileUnlocked(validPath));
+  }
+
   async listFiles() {
+    const startEpoch = this._indexEpoch;
     const records = await this._getAllRecords();
     const out = [];
+    const indexEntries = [];
     for (const rec of records) {
       if (!rec || typeof rec.path !== 'string') continue;
       try {
-        validateUserdataPath(rec.path);
+        const validPath = validateUserdataPath(rec.path);
+        const data = toUint8Array(rec.data);
+        const mtime = Number.isFinite(rec.mtime) ? rec.mtime : 0;
         out.push({
-          path: rec.path,
-          data: toUint8Array(rec.data),
-          mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+          path: validPath,
+          data,
+          mtime,
         });
+        indexEntries.push({
+          path: validPath,
+          size: data.byteLength,
+          mtime,
+        });
+        this._stats.reads += 1;
+        this._stats.bytesRead += data.byteLength;
       } catch {
         // Skip invalid entries.
       }
     }
+
+    if (this._indexEpoch === startEpoch) {
+      this._populateIndexFromEntries(indexEntries);
+    }
     return out;
   }
 
-  async listByPrefix(prefix) {
-    const normalizedPrefix = validateUserdataPrefix(prefix);
+  async _listByPrefixUnlocked(normalizedPrefix) {
+    const indexed = await this._ensureIndex({ countHit: true });
+    if (indexed) {
+      const set = this._dirIndex.get(normalizedPrefix);
+      if (!set || set.size === 0) {
+        return [];
+      }
+      return Array.from(set).sort(compareAscii);
+    }
     const files = await this.listFiles();
     const paths = [];
     for (const file of files) {
@@ -561,16 +1034,293 @@ class UserdataStore {
     return paths;
   }
 
-  async deletePrefix(prefix) {
+  async listByPrefix(prefix) {
     const normalizedPrefix = validateUserdataPrefix(prefix);
-    const paths = await this.listByPrefix(normalizedPrefix);
+    return this._listByPrefixUnlocked(normalizedPrefix);
+  }
+
+  async _deletePrefixUnlocked(normalizedPrefix) {
+    const paths = await this._listByPrefixUnlocked(normalizedPrefix);
     for (const filePath of paths) {
-      await this.deleteFile(filePath);
+      await this._deleteFileUnlocked(filePath);
     }
     return paths.length;
   }
 
+  async deletePrefix(prefix) {
+    const normalizedPrefix = validateUserdataPrefix(prefix);
+    return this._withMutationLock(() => this._deletePrefixUnlocked(normalizedPrefix));
+  }
+
+  async getMetadata(path) {
+    const validPath = validateUserdataPath(path);
+    const indexed = await this._ensureIndex({ countHit: true });
+    if (indexed) {
+      const meta = this._metaIndex.get(validPath);
+      return meta ? cloneMetadataEntry(meta) : null;
+    }
+    const file = await this.getFile(validPath);
+    if (!file) return null;
+    return buildMetadataEntry(file.path, file.data.byteLength, file.mtime);
+  }
+
+  async hasFile(path) {
+    const meta = await this.getMetadata(path);
+    return meta !== null;
+  }
+
+  async listMetadataByPrefix(prefix) {
+    const normalizedPrefix = validateUserdataPrefix(prefix);
+    const indexed = await this._ensureIndex({ countHit: true });
+    if (indexed) {
+      const set = this._dirIndex.get(normalizedPrefix);
+      if (!set || set.size === 0) {
+        return [];
+      }
+      const sortedPaths = Array.from(set).sort(compareAscii);
+      const out = [];
+      for (let i = 0; i < sortedPaths.length; i += 1) {
+        const meta = this._metaIndex.get(sortedPaths[i]);
+        if (meta) {
+          out.push(cloneMetadataEntry(meta));
+        }
+      }
+      return out;
+    }
+
+    const files = await this.listFiles();
+    const out = [];
+    for (const file of files) {
+      if (file.path.startsWith(normalizedPrefix)) {
+        out.push(buildMetadataEntry(file.path, file.data.byteLength, file.mtime));
+      }
+    }
+    out.sort((a, b) => compareAscii(a.path, b.path));
+    return out;
+  }
+
+  async listContainers(rootPrefix = USERDATA_PREFIX, options = {}) {
+    const normalizedRoot = validateUserdataPrefix(rootPrefix);
+    let namePrefix = '';
+    if (options && options.namePrefix !== undefined && options.namePrefix !== null) {
+      if (typeof options.namePrefix !== 'string') {
+        throw new TypeError('Container namePrefix must be a string');
+      }
+      if (
+        options.namePrefix.includes('/') ||
+        options.namePrefix.includes('\\') ||
+        options.namePrefix.includes('\0')
+      ) {
+        throw new Error(`Invalid container namePrefix: ${options.namePrefix}`);
+      }
+      namePrefix = options.namePrefix;
+    }
+
+    const indexed = await this._ensureIndex({ countHit: true });
+    const containerMap = new Map();
+
+    const accumulate = (filePath, size, mtime) => {
+      const rel = filePath.slice(normalizedRoot.length);
+      const slashIdx = rel.indexOf('/');
+      if (slashIdx <= 0) {
+        return;
+      }
+      const name = rel.slice(0, slashIdx);
+      if (namePrefix && !name.startsWith(namePrefix)) {
+        return;
+      }
+      let bucket = containerMap.get(name);
+      if (!bucket) {
+        bucket = {
+          name,
+          prefix: `${normalizedRoot}${name}/`,
+          blobCount: 0,
+          totalBytes: 0,
+          lastModified: 0,
+        };
+        containerMap.set(name, bucket);
+      }
+      bucket.blobCount += 1;
+      bucket.totalBytes += size;
+      if (mtime > bucket.lastModified) {
+        bucket.lastModified = mtime;
+      }
+    };
+
+    if (indexed) {
+      const set = this._dirIndex.get(normalizedRoot);
+      if (set && set.size > 0) {
+        for (const filePath of set) {
+          const meta = this._metaIndex.get(filePath);
+          if (meta) {
+            accumulate(meta.path, meta.size, meta.mtime);
+          }
+        }
+      }
+    } else {
+      const files = await this.listFiles();
+      for (const file of files) {
+        if (file.path.startsWith(normalizedRoot)) {
+          accumulate(file.path, file.data.byteLength, file.mtime);
+        }
+      }
+    }
+
+    const out = Array.from(containerMap.values());
+    out.sort((a, b) => compareAscii(a.name, b.name));
+    return out;
+  }
+
+  async commitUpdate(update = {}) {
+    if (!update || typeof update !== 'object' || Array.isArray(update)) {
+      throw new TypeError('commitUpdate requires an update object');
+    }
+    const rawWrites = update.writes === undefined ? [] : update.writes;
+    const rawDeletes = update.deletes === undefined ? [] : update.deletes;
+    if (!Array.isArray(rawWrites)) {
+      throw new TypeError('commitUpdate writes must be an array');
+    }
+    if (!Array.isArray(rawDeletes)) {
+      throw new TypeError('commitUpdate deletes must be an array');
+    }
+
+    const defaultMtime = Number.isFinite(update.mtime) ? update.mtime : Date.now();
+    const deleteSet = new Set();
+    const validatedDeletes = [];
+    for (let i = 0; i < rawDeletes.length; i += 1) {
+      const validPath = validateUserdataPath(rawDeletes[i]);
+      if (!deleteSet.has(validPath)) {
+        deleteSet.add(validPath);
+        validatedDeletes.push(validPath);
+      }
+    }
+
+    const seenWrites = new Set();
+    const validatedWrites = [];
+    const writeSpecs = [];
+    for (let i = 0; i < rawWrites.length; i += 1) {
+      const entry = rawWrites[i];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new TypeError('commitUpdate write entry must be an object');
+      }
+      const validPath = validateUserdataPath(entry.path);
+      if (seenWrites.has(validPath)) {
+        throw new Error(`Duplicate write path in commitUpdate: ${validPath}`);
+      }
+      if (deleteSet.has(validPath)) {
+        throw new Error(`Conflicting write and delete path in commitUpdate: ${validPath}`);
+      }
+      seenWrites.add(validPath);
+
+      const data = toUint8Array(entry.data);
+      const mtime = Number.isFinite(entry.mtime) ? entry.mtime : defaultMtime;
+      validatedWrites.push({ path: validPath, data, mtime });
+      writeSpecs.push({ path: validPath, size: data.byteLength });
+    }
+
+    return this._withMutationLock(async () => {
+      const startMs = nowMs();
+      await this._validateQuotaForWrites(writeSpecs, deleteSet);
+
+      for (let i = 0; i < validatedDeletes.length; i += 1) {
+        await this._deleteFileUnlocked(validatedDeletes[i]);
+      }
+
+      let bytesWritten = 0;
+      for (let i = 0; i < validatedWrites.length; i += 1) {
+        const rec = validatedWrites[i];
+        await this._saveFileUnlocked(rec.path, rec.data, rec.mtime, { skipQuotaCheck: true });
+        bytesWritten += rec.data.byteLength;
+      }
+
+      this._stats.atomicCommits += 1;
+      this._stats.lastWriteDurationMs = Math.max(0, nowMs() - startMs);
+
+      return {
+        written: validatedWrites.length,
+        deleted: validatedDeletes.length,
+        bytesWritten,
+      };
+    });
+  }
+
+  async getQuotaInfo() {
+    const indexed = await this._ensureIndex({ countHit: true });
+    let usedBytes = 0;
+    let fileCount = 0;
+    if (indexed) {
+      usedBytes = this._indexedTotalBytes;
+      fileCount = this._metaIndex.size;
+    } else {
+      const usage = await this.getUsageStats();
+      usedBytes = usage.totalBytes;
+      fileCount = usage.fileCount;
+    }
+
+    const remainingBytes =
+      this.maxTotalBytes === Infinity ? Infinity : Math.max(0, this.maxTotalBytes - usedBytes);
+    return {
+      usedBytes,
+      maxTotalBytes: this.maxTotalBytes,
+      remainingBytes,
+      maxFileBytes: this.maxFileBytes,
+      fileCount,
+      maxFileCount: this.maxFileCount,
+    };
+  }
+
+  getStats() {
+    return {
+      reads: this._stats.reads,
+      writes: this._stats.writes,
+      deletes: this._stats.deletes,
+      indexHits: this._stats.indexHits,
+      indexMisses: this._stats.indexMisses,
+      bytesWritten: this._stats.bytesWritten,
+      bytesRead: this._stats.bytesRead,
+      quotaRejections: this._stats.quotaRejections,
+      invalidations: this._stats.invalidations,
+      atomicCommits: this._stats.atomicCommits,
+      lastWriteDurationMs: this._stats.lastWriteDurationMs,
+      indexReady: this._indexReady,
+      indexedFiles: this._metaIndex.size,
+      indexedBytes: this._indexedTotalBytes,
+    };
+  }
+
+  resetStats() {
+    this._stats.reads = 0;
+    this._stats.writes = 0;
+    this._stats.deletes = 0;
+    this._stats.indexHits = 0;
+    this._stats.indexMisses = 0;
+    this._stats.bytesWritten = 0;
+    this._stats.bytesRead = 0;
+    this._stats.quotaRejections = 0;
+    this._stats.invalidations = 0;
+    this._stats.atomicCommits = 0;
+    this._stats.lastWriteDurationMs = 0;
+  }
+
   async getUsageStats() {
+    const indexed = await this._ensureIndex({ countHit: true });
+    if (indexed) {
+      const sortedKeys = Array.from(this._containerBuckets.keys()).sort(compareAscii);
+      const prefixes = {};
+      for (const key of sortedKeys) {
+        const bucket = this._containerBuckets.get(key);
+        prefixes[key] = {
+          fileCount: bucket.fileCount,
+          totalBytes: bucket.totalBytes,
+        };
+      }
+      return {
+        fileCount: this._metaIndex.size,
+        totalBytes: this._indexedTotalBytes,
+        prefixes,
+      };
+    }
+
     const files = await this.listFiles();
     let totalBytes = 0;
     const prefixMap = new Map();
@@ -608,20 +1358,34 @@ class UserdataStore {
   async exportArchive(options = {}) {
     const filterPrefix =
       options && options.prefix !== undefined ? validateUserdataPrefix(options.prefix) : null;
-    const files = await this.listFiles();
     const entries = [];
 
-    for (const file of files) {
-      const validPath = validateUserdataPath(file.path);
-      if (filterPrefix && !validPath.startsWith(filterPrefix)) {
-        continue;
+    if (filterPrefix && this._indexReady) {
+      const paths = await this._listByPrefixUnlocked(filterPrefix);
+      for (let i = 0; i < paths.length; i += 1) {
+        const file = await this.getFile(paths[i]);
+        if (!file) continue;
+        entries.push({
+          path: file.path,
+          size: file.data.byteLength,
+          mtime: Number.isFinite(file.mtime) ? file.mtime : 0,
+          base64: encodeBase64(file.data),
+        });
       }
-      entries.push({
-        path: validPath,
-        size: file.data.byteLength,
-        mtime: Number.isFinite(file.mtime) ? file.mtime : 0,
-        base64: encodeBase64(file.data),
-      });
+    } else {
+      const files = await this.listFiles();
+      for (const file of files) {
+        const validPath = validateUserdataPath(file.path);
+        if (filterPrefix && !validPath.startsWith(filterPrefix)) {
+          continue;
+        }
+        entries.push({
+          path: validPath,
+          size: file.data.byteLength,
+          mtime: Number.isFinite(file.mtime) ? file.mtime : 0,
+          base64: encodeBase64(file.data),
+        });
+      }
     }
 
     entries.sort((a, b) => compareAscii(a.path, b.path));
@@ -654,6 +1418,7 @@ class UserdataStore {
     }
 
     const validated = [];
+    const writeSpecs = [];
     const seenPaths = new Set();
     for (const entry of parsed.files) {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
@@ -690,22 +1455,35 @@ class UserdataStore {
 
       const mtime = Number.isFinite(entry.mtime) ? entry.mtime : Date.now();
       validated.push({ path: validPath, data, mtime });
+      writeSpecs.push({ path: validPath, size: data.byteLength });
     }
 
-    if (options && options.replace === true) {
-      await this.deletePrefix(USERDATA_PREFIX);
-    }
+    const replace = Boolean(options && options.replace === true);
 
-    let totalBytes = 0;
-    for (const rec of validated) {
-      await this.saveFile(rec.path, rec.data, rec.mtime);
-      totalBytes += rec.data.byteLength;
-    }
+    return this._withMutationLock(async () => {
+      const startMs = nowMs();
+      await this._ensureIndex({ countHit: false });
+      const deleteSet = replace ? new Set(this._metaIndex.keys()) : null;
+      await this._validateQuotaForWrites(writeSpecs, deleteSet);
 
-    return {
-      importedCount: validated.length,
-      totalBytes,
-    };
+      if (replace) {
+        await this._deletePrefixUnlocked(USERDATA_PREFIX);
+      }
+
+      let totalBytes = 0;
+      for (const rec of validated) {
+        await this._saveFileUnlocked(rec.path, rec.data, rec.mtime, { skipQuotaCheck: true });
+        totalBytes += rec.data.byteLength;
+      }
+
+      this._stats.atomicCommits += 1;
+      this._stats.lastWriteDurationMs = Math.max(0, nowMs() - startMs);
+
+      return {
+        importedCount: validated.length,
+        totalBytes,
+      };
+    });
   }
 
   close() {
@@ -718,6 +1496,9 @@ class UserdataStore {
     }
     this._db = null;
     this._dbPromise = null;
+    this._indexEpoch += 1;
+    this._clearIndexMaps();
+    this._indexLoadPromise = null;
     if (this.backend && typeof this.backend.close === 'function') {
       this.backend.close();
     }
@@ -729,6 +1510,9 @@ const exportedApi = {
   DEFAULT_DB_NAME,
   DEFAULT_STORE_NAME,
   DEFAULT_RESTORE_TIMEOUT_MS,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_TOTAL_BYTES,
+  DEFAULT_MAX_FILE_COUNT,
   USERDATA_PREFIX,
   ARCHIVE_FORMAT,
   ARCHIVE_VERSION,
