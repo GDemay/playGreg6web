@@ -799,6 +799,94 @@ void test_lane_indexed_heap_sources() {
     CHECK(mixed.lane_indexed_bindings == 2);
 }
 
+// Root-descriptor sources over a descriptor table (G62, #482): the user SGPR starts a table, so
+// the binding joins as a table slot: slot 0 by default, the sidecar's table_byte_offset from
+// version 2 (ignored in version 1).
+std::string root_table_sidecar(int version) {
+    return std::string(R"({"schema": "playgta6-stage-reflection", "version": )") + std::to_string(version) +
+           R"(, "stages": {"0xc3": {"stage": "fragment", "bindings": [
+             {"group": 0, "binding": 0, "kind": "read_only_storage", "source": {"user_sgpr": 8, "root_descriptor": true}},
+             {"group": 0, "binding": 1, "kind": "uniform",
+              "source": {"user_sgpr": 8, "root_descriptor": true, "table_byte_offset": 32}},
+             {"group": 0, "binding": 2, "kind": "uniform", "source": {"user_sgpr": 11, "root_descriptor": true}}]}}})";
+}
+
+void test_root_descriptor_over_table() {
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    std::string error;
+
+    // Version 1: the offset is not part of the format; both table bindings join at slot 0 (SRV t2).
+    StageReflectionIndex v1;
+    CHECK(parse_stage_reflection_json(root_table_sidecar(1), &v1, &error));
+    const StageReflection& ps1 = v1.at(0xc3);
+    CHECK(ps1.bindings.size() == 3 && ps1.bindings[1].source == ReflectedSource::RootDescriptor &&
+          !ps1.bindings[1].root_table_offset_given && ps1.bindings[1].table_byte_offset == 0);
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    StageReflection only_srv = ps1;
+    only_srv.bindings.erase(only_srv.bindings.begin() + 1);
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &only_srv}}, &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.root_descriptor_tables == 1 && stats.table_slots_outside_rs == 0);
+    const bridge::LayoutBinding* b0 = find(layout, 0, 0);
+    CHECK(b0 != nullptr && b0->join.register_class == d3d::DescriptorRangeType::Srv && b0->join.shader_register == 2 &&
+          b0->join.register_space == 1 && b0->join.table_parameter == d3d::kNoIndex);
+    // A real root CBV keeps its root-descriptor join and is not counted.
+    const bridge::LayoutBinding* b2 = find(layout, 0, 2);
+    CHECK(b2 != nullptr && b2->join.register_class == d3d::DescriptorRangeType::Cbv && b2->join.shader_register == 7);
+    // v1 ignores the offset: the uniform binding also joins slot 0 (SRV t2, a buffer view).
+    stats = JoinStats{};
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps1}}, &layout, &report, &stats));
+    CHECK(stats.root_descriptor_tables == 2 && stats.table_slots_outside_rs == 0);
+    const bridge::LayoutBinding* u1 = find(layout, 0, 1);
+    CHECK(u1 != nullptr && u1->join.register_class == d3d::DescriptorRangeType::Srv && u1->join.shader_register == 2 &&
+          u1->join.register_space == 1);
+    // A slot past the declared ranges joins by slot.
+    StageReflection past = ps1;
+    past.bindings = {ps1.bindings[0]};
+    past.bindings[0].root_table_offset_given = true;
+    past.bindings[0].table_byte_offset = 64;
+    stats = JoinStats{};
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &past}}, &layout, &report, &stats));
+    CHECK(stats.root_descriptor_tables == 1 && stats.table_slots_outside_rs == 1);
+    const bridge::LayoutBinding* p0 = find(layout, 0, 0);
+    CHECK(p0 != nullptr && p0->join.table_parameter == 0 && p0->join.table_slot == 2);
+
+    // Version 2: the given table_byte_offset picks slot 1 (CBV b0 space 1).
+    StageReflectionIndex v2;
+    CHECK(parse_stage_reflection_json(root_table_sidecar(2), &v2, &error));
+    const StageReflection& ps2 = v2.at(0xc3);
+    CHECK(ps2.bindings[1].root_table_offset_given && ps2.bindings[1].table_byte_offset == 32);
+    CHECK(!ps2.bindings[0].root_table_offset_given);
+    stats = JoinStats{};
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps2}}, &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.root_descriptor_tables == 2 && stats.table_slots_outside_rs == 0);
+    u1 = find(layout, 0, 1);
+    CHECK(u1 != nullptr && u1->join.register_class == d3d::DescriptorRangeType::Cbv && u1->join.shader_register == 0 &&
+          u1->join.register_space == 1 && u1->join.table_parameter == d3d::kNoIndex);
+
+    // A misaligned offset fails the join like a table source; an unknown version is rejected.
+    StageReflection bad = ps2;
+    bad.bindings[1].table_byte_offset = 36;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad}}, &layout, &report));
+    CHECK(report.find("not a descriptor boundary") != std::string::npos);
+    StageReflectionIndex v3;
+    CHECK(!parse_stage_reflection_json(root_table_sidecar(3), &v3, &error));
+    CHECK(error.find("version") != std::string::npos);
+    // Root constants are still not a root descriptor.
+    StageReflection consts = ps1;
+    consts.bindings = {ps1.bindings[0]};
+    consts.bindings[0].user_sgpr = 9;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &consts}}, &layout, &report));
+    CHECK(report.find("is not a root descriptor") != std::string::npos);
+}
+
 int main() {
     test_parse();
     test_user_data_rule();
@@ -810,6 +898,7 @@ int main() {
     test_cbv_indexed_heap_sources();
     test_lane_indexed_heap_sources();
     test_inline_sampler();
+    test_root_descriptor_over_table();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;
