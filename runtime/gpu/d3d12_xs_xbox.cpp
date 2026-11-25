@@ -18,6 +18,7 @@
 
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/descriptor_words.h"
+#include "gpu/present_pacing.h"
 #include "os/os_shim.h"
 #include "os/xmem_windows.h"
 
@@ -1192,7 +1193,7 @@ HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext& ctx
     return kSOk;
 }
 
-HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) {
+HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) {
     if (plane_count == 0) {
         device_->count(xbox::Counter::PresentsWithoutPlanes);
         return kSOk;
@@ -1239,6 +1240,14 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t) 
     const uint32_t drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
     device_->count(xbox::Counter::PresentPlanesDrawn, drawn);
     device_->count(xbox::Counter::PresentPlanesNotDrawn, plane_count - drawn);
+    // O36: the flip waits for the title's sync interval on the 60 Hz display (gpu/present_pacing.h):
+    // no wait when the present parameters ask for an immediate flip (their first member, a BOOL),
+    // otherwise the frame interval the title set (slot 78) in vblanks, at least one.
+    uint32_t immediate = 0;
+    if (parameters != 0 && !com::read_guest(parameters, &immediate, sizeof(immediate))) {
+        immediate = 0;
+    }
+    present_pacer().present(immediate != 0 ? 0u : device_->present_interval_vblanks());
     return kSOk;
 }
 
