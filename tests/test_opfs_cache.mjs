@@ -6,11 +6,14 @@ import {
   DEFAULT_INDEX_FILENAME,
   DEFAULT_INDEX_FLUSH_DELAY_MS,
   DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_PENDING_WRITES,
+  DEFAULT_MAX_WRITE_CONCURRENCY,
   DEFAULT_OPFS_CACHE_DIR,
   DEFAULT_PREFETCH_CONCURRENCY,
   OPFS_CACHE_INDEX_VERSION,
   OpfsCache,
   OpfsChunkCache,
+  buildFileFingerprint,
   inferChunkKind,
   makeChunkKey,
   validateChunkKey,
@@ -724,6 +727,166 @@ test('structured range descriptors prefetch, alphabetical index hydration, and O
   const lruAfter = cache.getLruKeys();
   assert.equal(lruAfter.length, cache.getStats().entryCount);
   assert.equal(lruAfter[lruAfter.length - 1], 'scale/k_49.bin');
+
+  await cache.close();
+});
+
+// --- W262: Versioned fingerprint keys, stale invalidation & non-blocking background write-through ---
+
+test('W262: buildFileFingerprint, versioned makeChunkKey, and fingerprint metadata invalidation across warm reload', async () => {
+  assert.equal(DEFAULT_MAX_PENDING_WRITES, 64);
+  assert.equal(DEFAULT_MAX_WRITE_CONCURRENCY, 4);
+
+  const fpSizeOnly = buildFileFingerprint(4096);
+  const fpWithEtag = buildFileFingerprint(4096, '"shaders-v1"');
+  const fpV2 = buildFileFingerprint(8192, '"shaders-v2"');
+  assert.equal(fpSizeOnly, '4096');
+  assert.match(fpWithEtag, /^4096_[0-9a-f]{16}$/);
+  assert.notEqual(fpWithEtag, fpV2);
+
+  // Versioned chunk keys stay classified as RANGE_CHUNK and remain backward-compatible without fingerprint.
+  const versionedChunkKey = makeChunkKey({
+    path: 'game/shaders.rpf',
+    chunkIndex: 0,
+    chunkSize: 262144,
+    fileFingerprint: fpWithEtag,
+  });
+  assert.match(versionedChunkKey, /^c_262144_0_[0-9a-f]+_fp_4096_[0-9a-f]{16}\.bin$/);
+  assert.equal(inferChunkKind(versionedChunkKey), CHUNK_KINDS.RANGE_CHUNK);
+
+  const versionedRangeKey = makeChunkKey({
+    path: 'game/movies.rpf',
+    offset: 0,
+    length: 65536,
+    fileSize: 1048576,
+    etag: '"movies-v1"',
+  });
+  assert.match(versionedRangeKey, /^r_0_65536_[0-9a-f]+_fp_1048576_[0-9a-f]{16}\.bin$/);
+  assert.equal(inferChunkKind(versionedRangeKey), CHUNK_KINDS.RANGE_CHUNK);
+
+  // Persist chunk with fileFingerprint, reload into fresh OpfsChunkCache, verify hit then stale invalidation.
+  const cacheDir = createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR);
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+
+  const cold = new OpfsChunkCache({ opfsRoot, indexFlushDelayMs: 0 });
+  const baseKey = makeChunkKey({ path: 'game/shaders.rpf', chunkIndex: 0, chunkSize: 16 });
+  await cold.put(baseKey, makePatternBytes(16, 7), { fileFingerprint: fpWithEtag });
+  assert.equal(cold.getMeta(baseKey).fileFingerprint, fpWithEtag);
+  await cold.close();
+
+  const warm = new OpfsChunkCache({ opfsRoot, indexFlushDelayMs: 0 });
+  await warm.init();
+  const hit = await warm.getEntry(baseKey, { fileFingerprint: fpWithEtag });
+  assert.equal(hit.hit, true);
+  assert.deepEqual(hit.data, makePatternBytes(16, 7));
+  assert.equal(warm.getStats().opfsHits, 1);
+  assert.equal(warm.getStats().opfsHitRate, 1);
+
+  // Changing fileFingerprint invalidates the stale OPFS entry and increments opfsStaleInvalidations.
+  const stale = await warm.getEntry(baseKey, { fileFingerprint: fpV2 });
+  assert.equal(stale.hit, false);
+  assert.equal(stale.invalidated, true);
+  assert.equal(stale.reason, 'fingerprint-mismatch');
+  assert.equal(warm.has(baseKey), false);
+  assert.equal(warm.getStats().opfsStaleInvalidations, 1);
+  assert.equal(warm.getStats().opfsMisses, 1);
+  assert.equal(warm.getStats().opfsHitRate, 0.5);
+
+  // Bulk stale invalidation by archive path descriptor removes outdated fingerprinted chunks.
+  const kOld0 = makeChunkKey({ path: 'game/core_bvh4.rpf', chunkIndex: 0, chunkSize: 16, fileFingerprint: '100' });
+  const kOld1 = makeChunkKey({ path: 'game/core_bvh4.rpf', chunkIndex: 1, chunkSize: 16, fileFingerprint: '100' });
+  const kNew0 = makeChunkKey({ path: 'game/core_bvh4.rpf', chunkIndex: 0, chunkSize: 16, fileFingerprint: '200' });
+  await warm.put(kOld0, makePatternBytes(16, 1), { fileFingerprint: '100' });
+  await warm.put(kOld1, makePatternBytes(16, 2), { fileFingerprint: '100' });
+  await warm.put(kNew0, makePatternBytes(16, 3), { fileFingerprint: '200' });
+
+  const purged = await warm.invalidateStaleFingerprint({ path: 'game/core_bvh4.rpf' }, '200');
+  assert.equal(purged.invalidatedCount, 2);
+  assert.equal(purged.freedBytes, 32);
+  assert.equal(warm.has(kOld0), false);
+  assert.equal(warm.has(kOld1), false);
+  assert.equal(warm.has(kNew0), true);
+  assert.equal(warm.getStats().opfsStaleInvalidations, 3);
+
+  await warm.close();
+});
+
+test('W262: putBackground provides non-blocking bounded write-through and degrades gracefully on quota/storage errors', async () => {
+  let gateWrites = true;
+  const pendingGates = [];
+  let failAllWrites = false;
+
+  const cacheDir = createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, null, {
+    async onBeforeWrite(fileName) {
+      if (fileName === DEFAULT_INDEX_FILENAME) return;
+      if (failAllWrites) {
+        const err = new Error('QuotaExceededError: disk full');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      if (gateWrites) {
+        await new Promise((resolve) => pendingGates.push(resolve));
+      }
+    },
+  });
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+
+  const cache = new OpfsChunkCache({
+    opfsRoot,
+    indexFlushDelayMs: 0,
+    maxPendingWrites: 2,
+    maxWriteConcurrency: 1,
+  });
+  await cache.init();
+
+  // Enqueue 4 writes synchronously while writes are gated: never blocks and bounds pending queue to 2!
+  const r0 = cache.putBackground('bg-0.bin', makePatternBytes(16, 0), { fileFingerprint: '16' });
+  const r1 = cache.putBackground('bg-1.bin', makePatternBytes(16, 1), { fileFingerprint: '16' });
+  const r2 = cache.putBackground('bg-2.bin', makePatternBytes(16, 2), { fileFingerprint: '16' });
+  const r3 = cache.putBackground('bg-3.bin', makePatternBytes(16, 3), { fileFingerprint: '16' });
+
+  assert.equal(r0.queued, true);
+  assert.equal(r1.queued, true);
+  assert.equal(r2.queued, true);
+  assert.equal(r3.queued, true);
+  assert.equal(r3.droppedOldest, true);
+  assert.equal(cache.getStats().opfsWrites, 0, 'putBackground must return before OPFS disk write completes');
+  assert.ok(cache.getStats().pendingBackgroundWrites <= 3);
+
+  // Release write gate and drain background writes.
+  gateWrites = false;
+  while (cache.getStats().pendingBackgroundWrites > 0) {
+    if (pendingGates.length > 0) {
+      pendingGates.shift()();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  await cache.flushBackgroundWrites();
+
+  assert.equal(cache.getStats().opfsWrites, 3);
+  assert.equal(cache.getStats().opfsWriteErrors, 0);
+  assert.equal(cache.has('bg-0.bin'), true);
+  assert.equal(cache.has('bg-1.bin'), false, 'Oldest queued entry bg-1.bin must be dropped when queue overflows');
+  assert.equal(cache.has('bg-2.bin'), true);
+  assert.equal(cache.has('bg-3.bin'), true);
+
+  // Persistent QuotaExceededError in putBackground degrades gracefully without throwing and increments opfsWriteErrors.
+  failAllWrites = true;
+  cache.putBackground('bg-fail.bin', makePatternBytes(16, 9));
+  await cache.flushBackgroundWrites();
+
+  const stats = cache.getStats();
+  assert.equal(stats.opfsWriteErrors, 1);
+  assert.equal(stats.opfsWrites, 3);
+  assert.ok(stats.opfsHitRate >= 0 && stats.opfsHitRate <= 1);
+
+  // All telemetry fields remain strictly sanitized primitives.
+  for (const [k, v] of Object.entries(stats)) {
+    assert.ok(
+      typeof v === 'number' || typeof v === 'boolean' || v === null,
+      `telemetry field ${k} must be primitive number/boolean/null, got ${typeof v}`
+    );
+  }
 
   await cache.close();
 });

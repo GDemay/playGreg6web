@@ -11,6 +11,8 @@ export const OPFS_CACHE_INDEX_VERSION = 1;
 export const DEFAULT_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB
 export const DEFAULT_INDEX_FLUSH_DELAY_MS = 0;
 export const DEFAULT_PREFETCH_CONCURRENCY = 4;
+export const DEFAULT_MAX_PENDING_WRITES = 64;
+export const DEFAULT_MAX_WRITE_CONCURRENCY = 4;
 
 export const CHUNK_KINDS = Object.freeze({
   SHADER_PACK: 'shader-pack',
@@ -220,8 +222,64 @@ function normalizeChunkKind(kind, key) {
 }
 
 /**
+ * Builds a deterministic, OPFS-filename-safe fingerprint string (`<size>`, `<size>_<etagHash>`,
+ * or sanitized token) matching web/workers/range_cache.js.
+ *
+ * @param {string|number|object|null|undefined} sizeOrMeta
+ * @param {string|null} [etag=null]
+ * @returns {string|null}
+ */
+export function buildFileFingerprint(sizeOrMeta, etag = null) {
+  if (sizeOrMeta === null || sizeOrMeta === undefined) {
+    const tag = normalizeOptionalTag(etag);
+    return tag ? `e_${fnv1a128Hex(tag).slice(0, 16)}` : null;
+  }
+  if (typeof sizeOrMeta === 'string') {
+    const trimmed = sizeOrMeta.trim();
+    if (!trimmed) return null;
+    if (/^[0-9a-zA-Z_-]{1,64}$/.test(trimmed)) {
+      return trimmed;
+    }
+    return `h_${fnv1a128Hex(trimmed).slice(0, 16)}`;
+  }
+
+  let size = null;
+  let tag = etag;
+  if (typeof sizeOrMeta === 'object') {
+    if (typeof sizeOrMeta.fileFingerprint === 'string' && sizeOrMeta.fileFingerprint.trim()) {
+      return buildFileFingerprint(sizeOrMeta.fileFingerprint);
+    }
+    if (sizeOrMeta.fileSize !== undefined) {
+      size = sizeOrMeta.fileSize;
+    } else if (sizeOrMeta.size !== undefined) {
+      size = sizeOrMeta.size;
+    }
+    if (tag === null && sizeOrMeta.etag !== undefined) {
+      tag = sizeOrMeta.etag;
+    }
+  } else {
+    size = sizeOrMeta;
+  }
+
+  const validSize = Number.isSafeInteger(size) && size >= 0 ? size : null;
+  const validTag = normalizeOptionalTag(tag);
+
+  if (validSize !== null && validTag !== null) {
+    return `${validSize}_${fnv1a128Hex(validTag).slice(0, 16)}`;
+  }
+  if (validSize !== null) {
+    return `${validSize}`;
+  }
+  if (validTag !== null) {
+    return `e_${fnv1a128Hex(validTag).slice(0, 16)}`;
+  }
+  return null;
+}
+
+/**
  * Normalizes a string key or chunk descriptor (`{ key }`, `{ path, chunkIndex, chunkSize }`,
  * or `{ path, offset, length }`) into a deterministic validated OPFS cache key.
+ * Optionally appends `_fp_<fileFingerprint>` when a file fingerprint or fileSize is provided.
  *
  * @param {string|object} descriptor
  * @param {string} [indexFileName=DEFAULT_INDEX_FILENAME]
@@ -242,6 +300,13 @@ export function makeChunkKey(descriptor, indexFileName = DEFAULT_INDEX_FILENAME)
     const encoded = utf8ToHex(normPath);
     const pathToken =
       encoded.length <= 128 ? encoded : `${encoded.slice(0, 64)}_${fnv1a128Hex(normPath)}`;
+    const fp =
+      descriptor.fileFingerprint !== undefined
+        ? buildFileFingerprint(descriptor.fileFingerprint)
+        : descriptor.fileSize !== undefined
+          ? buildFileFingerprint(descriptor.fileSize, descriptor.etag || null)
+          : null;
+    const fpSuffix = fp ? `_fp_${fp}` : '';
 
     if (Number.isInteger(descriptor.chunkIndex) && descriptor.chunkIndex >= 0) {
       const chunkSize =
@@ -249,7 +314,7 @@ export function makeChunkKey(descriptor, indexFileName = DEFAULT_INDEX_FILENAME)
           ? descriptor.chunkSize
           : 0;
       return validateChunkKey(
-        `c_${chunkSize}_${descriptor.chunkIndex}_${pathToken}.bin`,
+        `c_${chunkSize}_${descriptor.chunkIndex}_${pathToken}${fpSuffix}.bin`,
         indexFileName
       );
     }
@@ -261,7 +326,7 @@ export function makeChunkKey(descriptor, indexFileName = DEFAULT_INDEX_FILENAME)
       descriptor.length > 0
     ) {
       return validateChunkKey(
-        `r_${descriptor.offset}_${descriptor.length}_${pathToken}.bin`,
+        `r_${descriptor.offset}_${descriptor.length}_${pathToken}${fpSuffix}.bin`,
         indexFileName
       );
     }
@@ -278,6 +343,7 @@ function cloneNodeMeta(node) {
     createdAtMs: node.createdAtMs,
     etag: node.etag,
     versionKey: node.versionKey,
+    fileFingerprint: node.fileFingerprint || null,
     pinned: node.pinned,
     kind: node.kind,
     accessOrder: node.accessOrder,
@@ -399,6 +465,14 @@ export class OpfsChunkCache {
     );
     this.persistIndex = opts.persistIndex !== false;
     this.reconcileOnInit = opts.reconcileOnInit !== false;
+    this.maxPendingWrites = sanitizePositiveInt(
+      opts.maxPendingWrites,
+      DEFAULT_MAX_PENDING_WRITES
+    );
+    this.maxWriteConcurrency = sanitizePositiveInt(
+      opts.maxWriteConcurrency,
+      DEFAULT_MAX_WRITE_CONCURRENCY
+    );
 
     this._nowFn =
       typeof opts.nowFn === 'function'
@@ -436,14 +510,21 @@ export class OpfsChunkCache {
     // In-flight prefetch deduplication map: Map<key, Promise<{ok, bytes, error}>>.
     this._inFlightPrefetches = new Map();
 
+    // Bounded non-blocking background write-through queue.
+    this._bgWriteQueue = new Map();
+    this._activeBgWrites = new Set();
+    this._bgWriteWaiters = [];
+
     // Sanitized warm-boot telemetry counters.
     this._hits = 0;
     this._misses = 0;
     this._puts = 0;
+    this._writeErrors = 0;
     this._deletes = 0;
     this._evictions = 0;
     this._evictedBytes = 0;
     this._invalidations = 0;
+    this._staleInvalidations = 0;
     this._indexFlushes = 0;
     this._coalescedFlushes = 0;
     this._flushErrors = 0;
@@ -514,6 +595,7 @@ export class OpfsChunkCache {
       existing.createdAtMs = meta.createdAtMs;
       existing.etag = meta.etag;
       existing.versionKey = meta.versionKey;
+      existing.fileFingerprint = meta.fileFingerprint || null;
       existing.pinned = meta.pinned;
       existing.kind = meta.kind;
       existing.accessOrder = meta.accessOrder;
@@ -534,6 +616,7 @@ export class OpfsChunkCache {
       createdAtMs: meta.createdAtMs,
       etag: meta.etag,
       versionKey: meta.versionKey,
+      fileFingerprint: meta.fileFingerprint || null,
       pinned: meta.pinned,
       kind: meta.kind,
       accessOrder: meta.accessOrder,
@@ -775,6 +858,7 @@ export class OpfsChunkCache {
         createdAtMs: node.createdAtMs,
         etag: node.etag,
         versionKey: node.versionKey,
+        fileFingerprint: node.fileFingerprint || null,
         pinned: node.pinned,
         kind: node.kind,
         accessOrder: node.accessOrder,
@@ -1009,6 +1093,7 @@ export class OpfsChunkCache {
             createdAtMs,
             etag: normalizeOptionalTag(raw.etag),
             versionKey: normalizeOptionalTag(raw.versionKey),
+            fileFingerprint: buildFileFingerprint(raw.fileFingerprint),
             pinned: Boolean(raw.pinned),
             kind: normalizeChunkKind(raw.kind, validKey),
             accessOrder,
@@ -1219,6 +1304,18 @@ export class OpfsChunkCache {
           ? keyOrDescriptor.versionKey
           : null
     );
+    const fileFingerprint =
+      opts.fileFingerprint !== undefined
+        ? buildFileFingerprint(opts.fileFingerprint)
+        : opts.fileSize !== undefined
+          ? buildFileFingerprint(opts.fileSize, etag)
+          : typeof keyOrDescriptor === 'object' && keyOrDescriptor
+            ? keyOrDescriptor.fileFingerprint !== undefined
+              ? buildFileFingerprint(keyOrDescriptor.fileFingerprint)
+              : keyOrDescriptor.fileSize !== undefined
+                ? buildFileFingerprint(keyOrDescriptor.fileSize, etag)
+                : null
+            : null;
     const pinned =
       opts.pinned !== undefined
         ? Boolean(opts.pinned)
@@ -1238,7 +1335,9 @@ export class OpfsChunkCache {
       replaced &&
       ((existing.etag !== etag && (existing.etag !== null || etag !== null)) ||
         (existing.versionKey !== versionKey &&
-          (existing.versionKey !== null || versionKey !== null)));
+          (existing.versionKey !== null || versionKey !== null)) ||
+        (existing.fileFingerprint !== fileFingerprint &&
+          (existing.fileFingerprint !== null || fileFingerprint !== null)));
 
     let evictedEntries = 0;
     let evictedBytes = 0;
@@ -1248,6 +1347,7 @@ export class OpfsChunkCache {
       await this._writeFile(cacheDir, key, bytes);
     } catch (err) {
       if (!isQuotaExceededError(err)) {
+        this._writeErrors += 1;
         throw err;
       }
       const targetBudget = Math.max(0, this._totalBytes - Math.max(bytes.byteLength, 1));
@@ -1257,12 +1357,18 @@ export class OpfsChunkCache {
       });
       evictedEntries += recovery.evictedEntries;
       evictedBytes += recovery.evictedBytes;
-      await this._writeFile(cacheDir, key, bytes);
+      try {
+        await this._writeFile(cacheDir, key, bytes);
+      } catch (retryErr) {
+        this._writeErrors += 1;
+        throw retryErr;
+      }
       quotaRecovered = true;
     }
 
     if (versionChanged) {
       this._invalidations += 1;
+      this._staleInvalidations += 1;
     }
 
     const nowMs = this._readNowMs();
@@ -1273,6 +1379,7 @@ export class OpfsChunkCache {
       createdAtMs: existing && !versionChanged ? existing.createdAtMs : nowMs,
       etag,
       versionKey,
+      fileFingerprint,
       pinned,
       kind,
       accessOrder: this._nextAccessOrder(),
@@ -1310,6 +1417,118 @@ export class OpfsChunkCache {
       evictedBytes,
       meta: cloneNodeMeta(node),
     };
+  }
+
+  /**
+   * Non-blocking bounded background write-through into OPFS.
+   * Never throws and never blocks the caller; quota/storage errors degrade gracefully
+   * and increment `opfsWriteErrors`.
+   *
+   * @param {string|object} keyOrDescriptor
+   * @param {Uint8Array|ArrayBufferView|ArrayBuffer|string} data
+   * @param {object} [options]
+   * @returns {{queued: boolean, droppedOldest: boolean, key: string|null}}
+   */
+  putBackground(keyOrDescriptor, data, options = {}) {
+    let key;
+    let bytes;
+    try {
+      key = makeChunkKey(keyOrDescriptor, this.indexFileName);
+      bytes = toUint8Array(data);
+    } catch {
+      this._writeErrors += 1;
+      return { queued: false, droppedOldest: false, key: null };
+    }
+
+    const opts = options && typeof options === 'object' ? { ...options } : {};
+    if (
+      opts.fileFingerprint === undefined &&
+      typeof keyOrDescriptor === 'object' &&
+      keyOrDescriptor &&
+      keyOrDescriptor.fileFingerprint !== undefined
+    ) {
+      opts.fileFingerprint = keyOrDescriptor.fileFingerprint;
+    }
+    if (
+      opts.fileSize === undefined &&
+      typeof keyOrDescriptor === 'object' &&
+      keyOrDescriptor &&
+      keyOrDescriptor.fileSize !== undefined
+    ) {
+      opts.fileSize = keyOrDescriptor.fileSize;
+    }
+
+    let droppedOldest = false;
+    if (this._bgWriteQueue.has(key)) {
+      this._bgWriteQueue.delete(key);
+    } else {
+      while (this._bgWriteQueue.size >= this.maxPendingWrites) {
+        const oldestKey = this._bgWriteQueue.keys().next().value;
+        if (oldestKey === undefined) break;
+        this._bgWriteQueue.delete(oldestKey);
+        droppedOldest = true;
+      }
+    }
+
+    this._bgWriteQueue.set(key, { key, bytes, options: opts });
+    this._pumpBgWriteQueue();
+    return { queued: true, droppedOldest, key };
+  }
+
+  _pumpBgWriteQueue() {
+    while (
+      this._activeBgWrites.size < this.maxWriteConcurrency &&
+      this._bgWriteQueue.size > 0
+    ) {
+      const next = this._bgWriteQueue.entries().next().value;
+      if (!next) break;
+      const [key, task] = next;
+      this._bgWriteQueue.delete(key);
+
+      const writePromise = (async () => {
+        try {
+          const res = await this.put(task.key, task.bytes, task.options);
+          if (!res || !res.stored) {
+            this._writeErrors += 1;
+          }
+        } catch {
+          // `_writeErrors` already incremented inside `put()` when OPFS throws;
+          // swallow cleanly so background write-through never surfaces unhandled rejections.
+        }
+      })();
+
+      this._activeBgWrites.add(writePromise);
+      writePromise.finally(() => {
+        this._activeBgWrites.delete(writePromise);
+        this._pumpBgWriteQueue();
+        if (this._activeBgWrites.size === 0 && this._bgWriteQueue.size === 0) {
+          const waiters = this._bgWriteWaiters.splice(0, this._bgWriteWaiters.length);
+          for (let i = 0; i < waiters.length; i += 1) {
+            waiters[i]();
+          }
+        }
+      });
+    }
+  }
+
+  /**
+   * Waits for all queued and in-flight background writes scheduled via `putBackground()`.
+   */
+  async flushBackgroundWrites() {
+    while (this._activeBgWrites.size > 0 || this._bgWriteQueue.size > 0) {
+      this._pumpBgWriteQueue();
+      await new Promise((resolve) => {
+        if (this._activeBgWrites.size === 0 && this._bgWriteQueue.size === 0) {
+          resolve();
+          return;
+        }
+        this._bgWriteWaiters.push(resolve);
+      });
+    }
+  }
+
+  async flushWrites() {
+    return this.flushBackgroundWrites();
   }
 
   /**
@@ -1358,6 +1577,19 @@ export class OpfsChunkCache {
     const expectedVersionKey = normalizeOptionalTag(
       opts.versionKey !== undefined ? opts.versionKey : opts.expectedVersionKey
     );
+    const expectedFileFingerprint =
+      opts.fileFingerprint !== undefined
+        ? buildFileFingerprint(opts.fileFingerprint)
+        : opts.expectedFileFingerprint !== undefined
+          ? buildFileFingerprint(opts.expectedFileFingerprint)
+          : opts.fileSize !== undefined
+            ? buildFileFingerprint(opts.fileSize, expectedEtag)
+            : typeof keyOrDescriptor === 'object' &&
+                keyOrDescriptor &&
+                typeof keyOrDescriptor.key === 'string' &&
+                keyOrDescriptor.fileFingerprint !== undefined
+              ? buildFileFingerprint(keyOrDescriptor.fileFingerprint)
+              : null;
 
     const existing = this._entries.get(key) || null;
 
@@ -1366,6 +1598,7 @@ export class OpfsChunkCache {
         await this._removeFile(cacheDir, key);
         this._deleteNode(existing);
         this._invalidations += 1;
+        this._staleInvalidations += 1;
         this._misses += 1;
         await this._markIndexDirty();
         return {
@@ -1382,6 +1615,7 @@ export class OpfsChunkCache {
         await this._removeFile(cacheDir, key);
         this._deleteNode(existing);
         this._invalidations += 1;
+        this._staleInvalidations += 1;
         this._misses += 1;
         await this._markIndexDirty();
         return {
@@ -1389,6 +1623,23 @@ export class OpfsChunkCache {
           hit: false,
           invalidated: true,
           reason: 'version-mismatch',
+          key,
+          data: null,
+          meta: null,
+        };
+      }
+      if (expectedFileFingerprint !== null && existing.fileFingerprint !== expectedFileFingerprint) {
+        await this._removeFile(cacheDir, key);
+        this._deleteNode(existing);
+        this._invalidations += 1;
+        this._staleInvalidations += 1;
+        this._misses += 1;
+        await this._markIndexDirty();
+        return {
+          supported: true,
+          hit: false,
+          invalidated: true,
+          reason: 'fingerprint-mismatch',
           key,
           data: null,
           meta: null,
@@ -1414,16 +1665,25 @@ export class OpfsChunkCache {
       };
     }
 
-    if (!existing && (expectedEtag !== null || expectedVersionKey !== null)) {
+    if (
+      !existing &&
+      (expectedEtag !== null || expectedVersionKey !== null || expectedFileFingerprint !== null)
+    ) {
       await this._removeFile(cacheDir, key);
       this._invalidations += 1;
+      this._staleInvalidations += 1;
       this._misses += 1;
       await this._markIndexDirty();
       return {
         supported: true,
         hit: false,
         invalidated: true,
-        reason: expectedEtag !== null ? 'etag-mismatch' : 'version-mismatch',
+        reason:
+          expectedFileFingerprint !== null
+            ? 'fingerprint-mismatch'
+            : expectedEtag !== null
+              ? 'etag-mismatch'
+              : 'version-mismatch',
         key,
         data: null,
         meta: null,
@@ -1440,6 +1700,7 @@ export class OpfsChunkCache {
         this._deleteNode(existing);
       }
       this._invalidations += 1;
+      this._staleInvalidations += 1;
       this._misses += 1;
       await this._markIndexDirty();
       return {
@@ -1463,6 +1724,7 @@ export class OpfsChunkCache {
         createdAtMs: nowMs,
         etag: null,
         versionKey: null,
+        fileFingerprint: null,
         pinned: false,
         kind: inferChunkKind(key),
         accessOrder: this._nextAccessOrder(),
@@ -1735,13 +1997,24 @@ export class OpfsChunkCache {
         desc && typeof desc === 'object' ? normalizeOptionalTag(desc.etag) : null;
       const expectedVersionKey =
         desc && typeof desc === 'object' ? normalizeOptionalTag(desc.versionKey) : null;
+      const expectedFileFingerprint =
+        desc && typeof desc === 'object'
+          ? desc.fileFingerprint !== undefined
+            ? buildFileFingerprint(desc.fileFingerprint)
+            : desc.fileSize !== undefined
+              ? buildFileFingerprint(desc.fileSize, expectedEtag)
+              : null
+          : null;
 
       // 1. Check already-cached O(1) index entry (skip fetch on warm hit).
       const existing = this._entries.get(key);
       if (existing) {
         const etagOk = expectedEtag === null || existing.etag === expectedEtag;
         const versionOk = expectedVersionKey === null || existing.versionKey === expectedVersionKey;
-        if (etagOk && versionOk) {
+        const fpOk =
+          expectedFileFingerprint === null ||
+          existing.fileFingerprint === expectedFileFingerprint;
+        if (etagOk && versionOk && fpOk) {
           this._touchNode(existing, this._readNowMs());
           this._hits += 1;
           this._prefetchHits += 1;
@@ -1791,6 +2064,10 @@ export class OpfsChunkCache {
               etag: response.etag !== undefined ? response.etag : expectedEtag,
               versionKey:
                 response.versionKey !== undefined ? response.versionKey : expectedVersionKey,
+              fileFingerprint:
+                response.fileFingerprint !== undefined
+                  ? response.fileFingerprint
+                  : expectedFileFingerprint,
               pinned:
                 response.pinned !== undefined
                   ? response.pinned
@@ -1808,6 +2085,7 @@ export class OpfsChunkCache {
             putOpts = {
               etag: expectedEtag,
               versionKey: expectedVersionKey,
+              fileFingerprint: expectedFileFingerprint,
               pinned: desc && typeof desc === 'object' ? desc.pinned : undefined,
               kind: desc && typeof desc === 'object' ? desc.kind : undefined,
             };
@@ -1881,6 +2159,66 @@ export class OpfsChunkCache {
     };
   }
 
+  /**
+   * Invalidates all cached entries matching a chunk path/prefix whose `fileFingerprint`
+   * differs from `expectedFileFingerprint`.
+   *
+   * @param {string|object} pathOrPrefix
+   * @param {string|number|object} expectedFileFingerprint
+   * @returns {Promise<{invalidatedCount: number, freedBytes: number}>}
+   */
+  async invalidateStaleFingerprint(pathOrPrefix, expectedFileFingerprint) {
+    const expectedFp = buildFileFingerprint(expectedFileFingerprint);
+    if (!expectedFp) {
+      return { invalidatedCount: 0, freedBytes: 0 };
+    }
+    if (!this._initialized) {
+      await this.init();
+    }
+    const { supported, dir: cacheDir } = await this._ensureCacheDir({ create: false });
+    if (!supported || !cacheDir) {
+      return { invalidatedCount: 0, freedBytes: 0 };
+    }
+
+    let matchFn = null;
+    if (typeof pathOrPrefix === 'string' && pathOrPrefix.length > 0) {
+      const prefix = pathOrPrefix;
+      matchFn = (key) => key.startsWith(prefix);
+    } else if (pathOrPrefix && typeof pathOrPrefix === 'object' && typeof pathOrPrefix.path === 'string') {
+      const normPath = normalizeRelPath(pathOrPrefix.path);
+      const encoded = utf8ToHex(normPath);
+      const pathToken =
+        encoded.length <= 128 ? encoded : `${encoded.slice(0, 64)}_${fnv1a128Hex(normPath)}`;
+      matchFn = (key) => key.includes(`_${pathToken}.bin`) || key.includes(`_${pathToken}_fp_`);
+    } else {
+      return { invalidatedCount: 0, freedBytes: 0 };
+    }
+
+    let invalidatedCount = 0;
+    let freedBytes = 0;
+    for (const [key, node] of Array.from(this._entries.entries())) {
+      if (!matchFn(key)) continue;
+      if (node.fileFingerprint === expectedFp && !key.includes('_fp_')) {
+        continue;
+      }
+      if (key.endsWith(`_fp_${expectedFp}.bin`) && (node.fileFingerprint === null || node.fileFingerprint === expectedFp)) {
+        continue;
+      }
+      const sizeBytes = node.sizeBytes;
+      await this._removeFile(cacheDir, key);
+      this._deleteNode(node);
+      invalidatedCount += 1;
+      freedBytes += sizeBytes;
+      this._invalidations += 1;
+      this._staleInvalidations += 1;
+    }
+
+    if (invalidatedCount > 0) {
+      await this._markIndexDirty();
+    }
+    return { invalidatedCount, freedBytes };
+  }
+
   // --- Sanitized Warm-Boot Telemetry & Lifecycle ---
 
   /**
@@ -1889,7 +2227,7 @@ export class OpfsChunkCache {
    */
   getStats() {
     const totalLookups = this._hits + this._misses;
-    const hitRate = totalLookups > 0 ? this._hits / totalLookups : 0;
+    const hitRate = totalLookups > 0 ? Math.max(0, Math.min(1, this._hits / totalLookups)) : 0;
     const utilizationRatio =
       this.maxBytes !== null && this.maxBytes > 0
         ? Math.min(1, this._totalBytes / this.maxBytes)
@@ -1907,6 +2245,13 @@ export class OpfsChunkCache {
       hits: this._hits,
       misses: this._misses,
       hitRate,
+      opfsHits: this._hits,
+      opfsMisses: this._misses,
+      opfsWrites: this._puts,
+      opfsWriteErrors: this._writeErrors,
+      opfsStaleInvalidations: this._staleInvalidations,
+      opfsHitRate: hitRate,
+      pendingBackgroundWrites: this._bgWriteQueue.size + this._activeBgWrites.size,
       puts: this._puts,
       deletes: this._deletes,
       evictions: this._evictions,
@@ -1934,10 +2279,12 @@ export class OpfsChunkCache {
     this._hits = 0;
     this._misses = 0;
     this._puts = 0;
+    this._writeErrors = 0;
     this._deletes = 0;
     this._evictions = 0;
     this._evictedBytes = 0;
     this._invalidations = 0;
+    this._staleInvalidations = 0;
     this._indexFlushes = 0;
     this._coalescedFlushes = 0;
     this._flushErrors = 0;
@@ -1951,9 +2298,10 @@ export class OpfsChunkCache {
   }
 
   /**
-   * Flushes any pending batched index metadata and clears pending timers.
+   * Flushes any pending background writes and batched index metadata, and clears pending timers.
    */
   async close() {
+    await this.flushBackgroundWrites();
     this._cancelFlushTimer();
     return this.flushIndex();
   }
