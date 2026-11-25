@@ -53,6 +53,7 @@
   const PIPE_FLAG_VIDEO = 1 << 3;
   const PIPE_FLAG_RECTLIST = 1 << 4;
   const PIPE_FLAG_STRIDE_24 = 1 << 5;
+  const PIPE_FLAG_CLEAR = 1 << 6;
 
   const FALLBACK_VERTEX_LAYOUT_24B = Object.freeze({
     arrayStride: TEXTURED_QUAD_VERTEX_STRIDE,
@@ -1069,6 +1070,7 @@
   function createZeroedStats() {
     return {
       totalDraws: 0,
+      totalDrawsExecuted: 0,
       normalDraws: 0,
       fallbackDraws: 0,
       indexedDraws: 0,
@@ -1271,6 +1273,11 @@
       this._fallbackSplashVertexBuffer24B = null;
 
       this._destroyed = false;
+      this._frameHasNonClearDraw = false;
+      this._frameRealPackDraws = 0;
+      this._frameFallbackDraws = 0;
+      this._frameDraws = 0;
+      this._totalStateCalls = 0;
       this._stats = createZeroedStats();
     }
 
@@ -1426,6 +1433,9 @@
       if (pipe.vertexStride === TEXTURED_QUAD_VERTEX_STRIDE) {
         flags |= PIPE_FLAG_STRIDE_24;
       }
+      if (pipe.isClear === true || pipe.isClearDraw === true || cat === 'clear') {
+        flags |= PIPE_FLAG_CLEAR;
+      }
       this._pipelineMetaCache.set(pipe, flags);
       return flags;
     }
@@ -1475,6 +1485,40 @@
       if (isVideo) {
         this._stats.videoDraws += 1;
       }
+    }
+
+    _recordExecutedDrawVisibility(args, pipe, isFallback) {
+      this._stats.totalDrawsExecuted += 1;
+      this._frameDraws += 1;
+      if (isFallback) {
+        this._frameFallbackDraws += 1;
+      } else {
+        this._frameRealPackDraws += 1;
+      }
+      const pipeFlags = pipe && typeof pipe === 'object' ? this._getPipelineMetaFlags(pipe) : 0;
+      const isClearDraw =
+        (pipeFlags & PIPE_FLAG_CLEAR) !== 0 ||
+        (args !== null &&
+          args !== undefined &&
+          (args.isClear === true ||
+            args.isClearDraw === true ||
+            args.drawCategory === 'clear' ||
+            args.category === 'clear'));
+      if (!isClearDraw) {
+        this._frameHasNonClearDraw = true;
+      }
+    }
+
+    _computeStateElisionHitRate() {
+      const total = this._totalStateCalls;
+      if (!(total > 0)) {
+        return 0;
+      }
+      const raw = this._stats.totalElidedStateCalls / total;
+      if (!Number.isFinite(raw) || raw <= 0) {
+        return 0;
+      }
+      return raw >= 1 ? 1 : raw;
     }
 
     _recordSkip(reason, options) {
@@ -1699,6 +1743,37 @@
     }
 
     /**
+     * Reset per-frame draw-visibility counters with zero heap allocations
+     * (call at the start of each frame before recording render passes).
+     */
+    beginFrame() {
+      this._frameHasNonClearDraw = false;
+      this._frameRealPackDraws = 0;
+      this._frameFallbackDraws = 0;
+      this._frameDraws = 0;
+    }
+
+    /**
+     * Return a JSON-serializable summary of draws executed in the current frame
+     * for swapchain visible-frame readiness tracking (W251 -> W231).
+     *
+     * @returns {{
+     *   hasNonClearDraw: boolean,
+     *   realPackDrawsThisFrame: number,
+     *   fallbackDrawsThisFrame: number,
+     *   drawsThisFrame: number,
+     * }}
+     */
+    getFrameDrawSummary() {
+      return {
+        hasNonClearDraw: this._frameHasNonClearDraw,
+        realPackDrawsThisFrame: this._frameRealPackDraws,
+        fallbackDrawsThisFrame: this._frameFallbackDraws,
+        drawsThisFrame: this._frameDraws,
+      };
+    }
+
+    /**
      * Reset per-pass bound draw state (call at the start of a render pass).
      */
     beginPass(options) {
@@ -1771,10 +1846,12 @@
         this._stats.redundantPipelineSkips += 1;
         this._stats.elidedPipelineSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return false;
       }
       pass.setPipeline(gpuPipeline);
       this._boundPipeline = gpuPipeline;
+      this._totalStateCalls += 1;
       return true;
     }
 
@@ -1792,6 +1869,7 @@
           this._stats.redundantBindGroupSkips += 1;
           this._stats.elidedBindGroupSets += 1;
           this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
           return false;
         }
       }
@@ -1800,6 +1878,7 @@
       } else {
         pass.setBindGroup(groupIndex, bindGroup);
       }
+      this._totalStateCalls += 1;
       let record = this._boundBindGroups.get(groupIndex);
       if (!record) {
         record = {
@@ -1837,6 +1916,7 @@
           this._stats.redundantVertexBufferSkips += 1;
           this._stats.elidedVertexBufferSets += 1;
           this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
           return false;
         }
       }
@@ -1845,6 +1925,7 @@
       } else {
         pass.setVertexBuffer(slot, buffer, normOffset);
       }
+      this._totalStateCalls += 1;
       let record = this._boundVertexBuffers.get(slot);
       if (!record) {
         record = { buffer, offset: normOffset, size: normSize };
@@ -1876,6 +1957,7 @@
         this._stats.redundantIndexBufferSkips += 1;
         this._stats.elidedIndexBufferSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return false;
       }
       if (hasSize) {
@@ -1883,6 +1965,7 @@
       } else {
         pass.setIndexBuffer(buffer, indexFormat, normOffset);
       }
+      this._totalStateCalls += 1;
       if (!this._boundIndexBuffer) {
         this._boundIndexBuffer = {
           buffer,
@@ -1917,9 +2000,11 @@
       ) {
         this._stats.elidedViewportScissorSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return BIND_STATUS_ELIDED;
       }
       pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
+      this._totalStateCalls += 1;
       if (!this._boundViewport) {
         this._boundViewport = {
           x: vp.x,
@@ -1956,9 +2041,11 @@
       ) {
         this._stats.elidedViewportScissorSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return BIND_STATUS_ELIDED;
       }
       pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
+      this._totalStateCalls += 1;
       if (!this._boundScissorRect) {
         this._boundScissorRect = {
           x: sc.x,
@@ -1991,9 +2078,11 @@
       ) {
         this._stats.elidedBlendConstantSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return BIND_STATUS_ELIDED;
       }
       pass.setBlendConstant({ r: bc.r, g: bc.g, b: bc.b, a: bc.a });
+      this._totalStateCalls += 1;
       if (!this._boundBlendConstant) {
         this._boundBlendConstant = { r: bc.r, g: bc.g, b: bc.b, a: bc.a };
       } else {
@@ -2013,10 +2102,12 @@
       if (this._elideRedundantBlendStencil && this._boundStencilReference === ref) {
         this._stats.elidedStencilReferenceSets += 1;
         this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
         return BIND_STATUS_ELIDED;
       }
       pass.setStencilReference(ref);
       this._boundStencilReference = ref;
+      this._totalStateCalls += 1;
       return BIND_STATUS_EMITTED;
     }
 
@@ -3890,6 +3981,7 @@
           this._stats.totalDraws += 1;
           this._stats.normalDraws += 1;
           this._stats.indirectDraws += 1;
+          this._recordExecutedDrawVisibility(args, activePipe, false);
           this._recordExecutedDrawCategory(args, activePipe, 0, null);
           result.executed = true;
           return result;
@@ -4050,6 +4142,7 @@
         ? resolved.selectedProfile
         : FALLBACK_PROFILE.DEFAULT;
       this._stats.fallbackProfileCounts[countedProfile] += 1;
+      this._recordExecutedDrawVisibility(args, activePipe, true);
       this._recordExecutedDrawCategory(args, activePipe, 0, resolved.effectiveProfile);
 
       result.executed = true;
@@ -4158,6 +4251,7 @@
           }
           this._stats.totalDraws += 1;
           this._stats.normalDraws += 1;
+          this._recordExecutedDrawVisibility(args, activePipe, false);
           this._recordExecutedDrawCategory(args, activePipe, count, null);
           result.executed = true;
           return result;
@@ -4336,6 +4430,7 @@
         ? resolved.selectedProfile
         : FALLBACK_PROFILE.DEFAULT;
       this._stats.fallbackProfileCounts[countedProfile] += 1;
+      this._recordExecutedDrawVisibility(args, activePipe, true);
       this._recordExecutedDrawCategory(args, activePipe, effectiveCount, resolved.effectiveProfile);
 
       result.executed = true;
@@ -4358,8 +4453,13 @@
       }
       return {
         totalDraws: this._stats.totalDraws,
+        totalDrawsExecuted: this._stats.totalDrawsExecuted,
         normalDraws: this._stats.normalDraws,
         fallbackDraws: this._stats.fallbackDraws,
+        hasNonClearDraw: this._frameHasNonClearDraw,
+        realPackDrawsThisFrame: this._frameRealPackDraws,
+        fallbackDrawsThisFrame: this._frameFallbackDraws,
+        drawsThisFrame: this._frameDraws,
         indexedDraws: this._stats.indexedDraws,
         nonIndexedDraws: this._stats.nonIndexedDraws,
         indirectDraws: this._stats.indirectDraws,
@@ -4386,6 +4486,7 @@
         elidedBlendConstantSets: this._stats.elidedBlendConstantSets,
         elidedStencilReferenceSets: this._stats.elidedStencilReferenceSets,
         totalElidedStateCalls: this._stats.totalElidedStateCalls,
+        stateElisionHitRate: this._computeStateElisionHitRate(),
         bindGroupCacheHits: this._stats.bindGroupCacheHits,
         bindGroupCacheMisses: this._stats.bindGroupCacheMisses,
         bindGroupCacheEvictions: this._stats.bindGroupCacheEvictions,
@@ -4425,6 +4526,8 @@
      */
     resetStats() {
       this._stats = createZeroedStats();
+      this._totalStateCalls = 0;
+      this.beginFrame();
     }
 
     _destroySyntheticResources() {
