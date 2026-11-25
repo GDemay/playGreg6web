@@ -36,7 +36,20 @@
 //                           {"cbv_indexed_resource_heap" | "cbv_indexed_sampler_heap": {
 //                               "cbv": {"user_sgpr", "root_descriptor": true} | {"user_sgpr", "table_byte_offset"} |
 //                                      {"user_sgpr", "root_constants": true},
-//                               "byte_offset", "shift", "bit_offset" (0), "mask" (0xffffffff), "stride" (opt.)}}}]}}}
+//                               "byte_offset", "shift", "bit_offset" (0), "mask" (0xffffffff), "stride" (opt.)}} |
+//                           {"lane_indexed_resource_heap" | "lane_indexed_sampler_heap": {
+//                               "max_count", "shift", "stride" (opt.),
+//                               "window_base" (opt.): {"cbv": <as above>, "byte_offset", "bit_offset" (0),
+//                                                      "mask" (0xffffffff)}}}}]}}}
+// A lane-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[NonUniformResourceIndex(i)]:
+// a VGPR index, v_readfirstlane_b32 waterfall loops): each lane picks its own descriptor, so the
+// stage reads a window of "max_count" consecutive heap descriptors as a WGSL
+// binding_array<T, max_count>. Element k of the window is the descriptor at byte offset
+// (window_base + k) << shift of the bound heap; window_base is the CB dword read like a CB-indexed
+// source ((dword >> bit_offset) & mask), 0 without "window_base". The stage subtracts the same base
+// from its lane index and bounds-checks against max_count. The bridge has no descriptor arrays
+// yet: such a binding is parsed and validated, and the join fails with a counted reason
+// (JoinStats::lane_indexed_bindings) instead of a generic one.
 // A CB-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[cb.index]): the index is the
 // 32-bit dword at "byte_offset" of a constant buffer: the root CBV, the CBV in a table slot or the
 // root constants of the root parameter whose user data starts at "cbv"."user_sgpr". The descriptor
@@ -98,7 +111,13 @@ enum class ReflectedSource : uint8_t {
     InlineSampler,  // the stage builds the S# from constants in its code (sampler_words)
     CbvIndexedSamplerHeap,   // heap index read from a constant buffer (cb_*), G62
     CbvIndexedResourceHeap,
+    LaneIndexedSamplerHeap,  // per-lane index into a window of the heap (lane_*), G62
+    LaneIndexedResourceHeap,
 };
+
+// Largest lane-indexed window a sidecar may ask for (WebGPU's per-stage sampled-texture limit we
+// request is at most 256).
+inline constexpr uint32_t kMaxLaneIndexedWindow = 256;
 
 // Where a CB-indexed heap source's constant buffer is (the root parameter at user_sgpr).
 enum class ReflectedCbv : uint8_t { RootDescriptor = 0, Table = 1, RootConstants = 2 };
@@ -132,6 +151,11 @@ struct ReflectedBinding {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    // LaneIndexed*Heap: a window of lane_max_count descriptors starting at heap index window_base
+    // (heap_shift, heap_stride as for the heap sources). lane_has_window_base: the base is read like
+    // a CB-indexed index (cbv, user_sgpr, table_byte_offset, cb_*); otherwise it is 0.
+    uint32_t lane_max_count = 0;
+    bool lane_has_window_base = false;
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };
@@ -162,11 +186,15 @@ struct ReflectedStageRef {
     uint32_t visibility = 0;  // GpuShaderStageBits
     const StageReflection* reflection = nullptr;
 };
-// Join statistics (added to on success only).
+// Join statistics (added to on success only, except lane_indexed_bindings).
 struct JoinStats {
     // Table bindings joined by slot (ShaderBinding::table_parameter): the root signature does not
     // declare the slot, or declares it as another class.
     uint64_t table_slots_outside_rs = 0;
+    // Lane-indexed heap bindings (LaneIndexed*Heap) that are well formed but cannot be bound: the
+    // bridge has no descriptor arrays yet. Counted whether or not the join succeeds (such a binding
+    // always fails it), so the caller can report these skips apart from other join failures.
+    uint64_t lane_indexed_bindings = 0;
 };
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
                           bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats = nullptr);

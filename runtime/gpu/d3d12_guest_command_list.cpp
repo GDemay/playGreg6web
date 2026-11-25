@@ -48,6 +48,7 @@ const char* work_name(Work w) {
     case Work::GpuObjectsDeferred: return "gpu_objects_deferred";
     case Work::GpuObjectsCreatedOnUse: return "gpu_objects_created_on_use";
     case Work::GpuObjectsNeverCreated: return "gpu_objects_never_created";
+    case Work::ReflectionLaneIndexedUnbound: return "reflection_lane_indexed_unbound";
     case Work::Count: break;
     }
     return "?";
