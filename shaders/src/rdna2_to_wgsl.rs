@@ -769,21 +769,155 @@ fn default_entry_point(stage: ShaderStage) -> &'static str {
     }
 }
 
+/// Highest architectural SGPR index in GFX10.3 (`s0..=s105`).
+const MAX_SGPR_INDEX: u8 = 105;
+
+/// Checked VGPR index calculation (`base + offset <= 255`), returning `None` on overflow.
+#[inline]
+fn checked_vgpr_reg(base: u8, offset: u8) -> Option<u8> {
+    base.checked_add(offset)
+}
+
+/// Checked architectural SGPR index calculation (`base + offset <= 105`), returning `None`
+/// when out of range or overflowing `u8`.
+#[inline]
+fn checked_sgpr_reg(base: u8, offset: u8) -> Option<u8> {
+    base.checked_add(offset)
+        .filter(|&reg| reg <= MAX_SGPR_INDEX)
+}
+
+/// Checked tracked-SGPR index calculation (`base + offset <= MAX_TRACKED_SGPR`), covering
+/// `s0..=s105` plus `vcc_lo (106)` and `vcc_hi (107)`.
+#[inline]
+fn checked_tracked_sgpr_reg(base: u8, offset: u8) -> Option<u8> {
+    base.checked_add(offset)
+        .filter(|&reg| reg <= MAX_TRACKED_SGPR)
+}
+
+/// Checked descriptor base SGPR calculation (`slot * stride <= MAX_TRACKED_SGPR`), preventing
+/// `u8` multiplication overflow or out-of-range descriptor indices.
+#[inline]
+fn checked_descriptor_sgpr(slot: u8, stride: u8) -> Option<u8> {
+    slot.checked_mul(stride)
+        .filter(|&reg| reg <= MAX_TRACKED_SGPR)
+}
+
+/// Returns `true` if `ident` is a WGSL keyword, predeclared scalar/vector/resource type,
+/// or collides with a translator-generated module-scope symbol.
+fn is_wgsl_reserved_or_builtin_ident(ident: &str) -> bool {
+    matches!(
+        ident,
+        "alias"
+            | "array"
+            | "atomic"
+            | "bitcast"
+            | "bool"
+            | "break"
+            | "case"
+            | "const"
+            | "const_assert"
+            | "continue"
+            | "continuing"
+            | "default"
+            | "diagnostic"
+            | "discard"
+            | "else"
+            | "enable"
+            | "f16"
+            | "f32"
+            | "false"
+            | "fn"
+            | "for"
+            | "i32"
+            | "if"
+            | "let"
+            | "loop"
+            | "mat2x2"
+            | "mat2x3"
+            | "mat2x4"
+            | "mat3x2"
+            | "mat3x3"
+            | "mat3x4"
+            | "mat4x2"
+            | "mat4x3"
+            | "mat4x4"
+            | "override"
+            | "ptr"
+            | "requires"
+            | "return"
+            | "sampler"
+            | "sampler_comparison"
+            | "struct"
+            | "switch"
+            | "texture_1d"
+            | "texture_2d"
+            | "texture_2d_array"
+            | "texture_3d"
+            | "texture_cube"
+            | "texture_cube_array"
+            | "texture_depth_2d"
+            | "texture_depth_2d_array"
+            | "texture_depth_cube"
+            | "texture_depth_cube_array"
+            | "texture_depth_multisampled_2d"
+            | "texture_multisampled_2d"
+            | "texture_storage_1d"
+            | "texture_storage_2d"
+            | "texture_storage_2d_array"
+            | "texture_storage_3d"
+            | "true"
+            | "u32"
+            | "var"
+            | "vec2"
+            | "vec3"
+            | "vec4"
+            | "while"
+            | "Rdna2Cbv"
+            | "VsIn"
+            | "VsOut"
+            | "FragIn"
+            | "PsOut"
+            | "lds"
+            | "cb0"
+            | "tex0"
+            | "samp0"
+            | "pg6_u32_bits_to_float"
+            | "pg6_unpack2x16float"
+            | "pg6_pack2x16float"
+            | "pg6_rt_f32"
+            | "pg6_rt_u32"
+            | "pg6_rt_i32"
+            | "pg6_rt_vec2_f32"
+    )
+}
+
 fn sanitize_wgsl_ident(raw: &str, fallback: &str) -> String {
+    if raw.starts_with("__") {
+        return fallback.to_string();
+    }
     let mut out = String::new();
-    for (i, ch) in raw.chars().enumerate() {
-        let valid = if i == 0 {
-            ch.is_ascii_alphabetic() || ch == '_'
+    for ch in raw.chars() {
+        let valid = if out.is_empty() {
+            ch.is_ascii_alphabetic()
         } else {
             ch.is_ascii_alphanumeric() || ch == '_'
         };
         if valid {
+            if ch == '_' && out.ends_with('_') {
+                continue;
+            }
             out.push(ch);
-        } else if !out.is_empty() {
+        } else if !out.is_empty() && !out.ends_with('_') {
             out.push('_');
         }
     }
-    if out.is_empty() || out == "_" {
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty()
+        || out.starts_with("__")
+        || is_wgsl_reserved_or_builtin_ident(&out)
+    {
         fallback.to_string()
     } else {
         out
@@ -1252,6 +1386,36 @@ struct OriginState {
 }
 
 impl OriginState {
+    #[inline]
+    fn sgpr_origin(&self, reg: u8) -> SgprOrigin {
+        self.origins
+            .get(usize::from(reg))
+            .copied()
+            .unwrap_or(SgprOrigin::Unknown)
+    }
+
+    #[inline]
+    fn set_sgpr_origin(&mut self, reg: u8, origin: SgprOrigin) {
+        if let Some(slot) = self.origins.get_mut(usize::from(reg)) {
+            *slot = origin;
+        }
+    }
+
+    #[inline]
+    fn vgpr_origin(&self, reg: u8) -> SgprOrigin {
+        self.vgpr_uniform_origins
+            .get(usize::from(reg))
+            .copied()
+            .unwrap_or(SgprOrigin::Unknown)
+    }
+
+    #[inline]
+    fn set_vgpr_origin(&mut self, reg: u8, origin: SgprOrigin) {
+        if let Some(slot) = self.vgpr_uniform_origins.get_mut(usize::from(reg)) {
+            *slot = origin;
+        }
+    }
+
     fn initial(stage: ShaderStage) -> Self {
         let mut origins = [SgprOrigin::Unwritten; TRACKED_SGPR_COUNT];
         // Seed console ABI initial SGPR origins:
@@ -1426,6 +1590,11 @@ fn decode_const_lane_index(src1: u16, literal: Option<u32>) -> Option<u8> {
     decode_inline_u32_src(src1, literal).map(|v| (v as u32 & 63) as u8)
 }
 
+#[inline]
+fn origin_at(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], idx: usize) -> SgprOrigin {
+    origins.get(idx).copied().unwrap_or(SgprOrigin::Unknown)
+}
+
 fn resolve_const_u32(
     src: u8,
     literal: Option<u32>,
@@ -1436,7 +1605,8 @@ fn resolve_const_u32(
     } else if let Some(bits) = decode_inline_float_u32(u16::from(src)) {
         Some(bits)
     } else if src <= MAX_TRACKED_SGPR
-        && let SgprOrigin::ConstImmediate { value: Some(v), .. } = origins[src as usize]
+        && let SgprOrigin::ConstImmediate { value: Some(v), .. } =
+            origin_at(origins, usize::from(src))
     {
         Some(v)
     } else {
@@ -1452,7 +1622,8 @@ fn resolve_const_lane_index(
     if let Some(lane) = decode_const_lane_index(src1, literal) {
         Some(lane)
     } else if src1 <= u16::from(MAX_TRACKED_SGPR)
-        && let SgprOrigin::ConstImmediate { value: Some(v), .. } = origins[src1 as usize]
+        && let SgprOrigin::ConstImmediate { value: Some(v), .. } =
+            origin_at(origins, usize::from(src1))
     {
         Some((v & 63) as u8)
     } else {
@@ -1463,7 +1634,10 @@ fn resolve_const_lane_index(
 fn is_const_src(src: u8, origins: &[SgprOrigin; TRACKED_SGPR_COUNT]) -> bool {
     src >= 128
         || (src <= MAX_TRACKED_SGPR
-            && matches!(origins[src as usize], SgprOrigin::ConstImmediate { .. }))
+            && matches!(
+                origin_at(origins, usize::from(src)),
+                SgprOrigin::ConstImmediate { .. }
+            ))
 }
 
 fn normalize_read_origin(o: SgprOrigin) -> SgprOrigin {
@@ -1493,7 +1667,7 @@ fn resolve_src_origin_u8(
     origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
 ) -> SgprOrigin {
     if src <= MAX_TRACKED_SGPR {
-        normalize_read_origin(origins[src as usize])
+        normalize_read_origin(origin_at(origins, usize::from(src)))
     } else if let Some(v) = decode_inline_u32_src(u16::from(src), literal) {
         SgprOrigin::ConstImmediate {
             def_inst_idx: inst_idx,
@@ -1521,9 +1695,9 @@ fn resolve_src_pair_origins(
     origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
 ) -> (SgprOrigin, SgprOrigin) {
     if src <= MAX_TRACKED_SGPR {
-        let lo = normalize_read_origin(origins[src as usize]);
-        let hi = if src <= MAX_TRACKED_SGPR_PAIR {
-            normalize_read_origin(origins[(src + 1) as usize])
+        let lo = normalize_read_origin(origin_at(origins, usize::from(src)));
+        let hi = if let Some(hi_reg) = checked_tracked_sgpr_reg(src, 1) {
+            normalize_read_origin(origin_at(origins, usize::from(hi_reg)))
         } else {
             SgprOrigin::Unknown
         };
@@ -1574,13 +1748,11 @@ fn resolve_inline_sampler_sdwords(
     origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
     samp_sgpr: u8,
 ) -> Option<[u32; 4]> {
-    let base = samp_sgpr as usize;
-    if base + 3 >= origins.len() {
-        return None;
-    }
+    let base = usize::from(samp_sgpr);
     let mut sdwords = [0u32; 4];
     for (i, slot) in sdwords.iter_mut().enumerate() {
-        match origins[base + i] {
+        let idx = base.checked_add(i)?;
+        match origins.get(idx).copied()? {
             SgprOrigin::ConstImmediate { value: Some(v), .. } => *slot = v,
             _ => return None,
         }
@@ -1738,11 +1910,14 @@ fn join_cfg_origin(
                 base: b1,
             },
         ) if patched_desc_word_of(other).is_some_and(|(_, b2)| b1 == b2) => {
-            let (d2, _) = patched_desc_word_of(other).unwrap();
-            record_def_alias(def_aliases, d1, d2);
-            SgprOrigin::PatchedDescWord {
-                def_inst_idx: d1.min(d2),
-                base: b1,
+            if let Some((d2, _)) = patched_desc_word_of(other) {
+                record_def_alias(def_aliases, d1, d2);
+                SgprOrigin::PatchedDescWord {
+                    def_inst_idx: d1.min(d2),
+                    base: b1,
+                }
+            } else {
+                SgprOrigin::Unknown
             }
         }
         (
@@ -1868,11 +2043,14 @@ fn merge_select_origin(
                 base: b1,
             },
         ) if patched_desc_word_of(other).is_some_and(|(_, b2)| b1 == b2) => {
-            let (d2, _) = patched_desc_word_of(other).unwrap();
-            record_def_alias(def_aliases, d1, d2);
-            SgprOrigin::PatchedDescWord {
-                def_inst_idx: d1.min(d2),
-                base: b1,
+            if let Some((d2, _)) = patched_desc_word_of(other) {
+                record_def_alias(def_aliases, d1, d2);
+                SgprOrigin::PatchedDescWord {
+                    def_inst_idx: d1.min(d2),
+                    base: b1,
+                }
+            } else {
+                SgprOrigin::Unknown
             }
         }
         (
@@ -1986,12 +2164,12 @@ fn apply_or_const(origin: SgprOrigin, imm: u32, inst_idx: usize) -> SgprOrigin {
         }
         SgprOrigin::DynamicHeapDesc { .. } if imm < 0x0010_0000 => origin,
         // GFX10.3 V# word-3 OOB_SELECT attribute patch (`s_or_b32 w3, w3, 0x30000000`).
-        other
-            if matches!(imm, 0x1000_0000 | 0x2000_0000 | 0x3000_0000)
-                && patched_desc_word_of(other).is_some() =>
-        {
-            let (def_inst_idx, base) = patched_desc_word_of(other).unwrap();
-            SgprOrigin::PatchedDescWord { def_inst_idx, base }
+        other if matches!(imm, 0x1000_0000 | 0x2000_0000 | 0x3000_0000) => {
+            if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
+                SgprOrigin::PatchedDescWord { def_inst_idx, base }
+            } else {
+                SgprOrigin::Unknown
+            }
         }
         _ => SgprOrigin::Unknown,
     }
@@ -2085,12 +2263,12 @@ fn apply_and_const(origin: SgprOrigin, mask: u32, inst_idx: usize) -> SgprOrigin
         },
         // GFX10.3 structured-buffer V# word-1 stride clear (`0xc000ffff`) and word-3 OOB_SELECT
         // clear (`0xcfffffff`), preserving descriptor provenance strictly for V# recovery.
-        other
-            if matches!(mask, 0xC000_FFFF | 0xCFFF_FFFF)
-                && patched_desc_word_of(other).is_some() =>
-        {
-            let (def_inst_idx, base) = patched_desc_word_of(other).unwrap();
-            SgprOrigin::PatchedDescWord { def_inst_idx, base }
+        other if matches!(mask, 0xC000_FFFF | 0xCFFF_FFFF) => {
+            if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
+                SgprOrigin::PatchedDescWord { def_inst_idx, base }
+            } else {
+                SgprOrigin::Unknown
+            }
         }
         _ => SgprOrigin::Unknown,
     }
@@ -2227,7 +2405,7 @@ fn taint_sgpr_if_loaded(
     if let Some(col) = collector.as_deref_mut()
         && src <= u16::from(MAX_TRACKED_SGPR)
     {
-        match origins[src as usize] {
+        match origin_at(origins, usize::from(src)) {
             SgprOrigin::TableDesc { def_inst_idx, .. }
             | SgprOrigin::DynamicHeapDesc { def_inst_idx, .. }
             | SgprOrigin::RawTableDesc { def_inst_idx, .. }
@@ -2241,7 +2419,7 @@ fn taint_sgpr_if_loaded(
 }
 
 fn clear_vgpr_origins(state: &mut OriginState, vdst: u8) {
-    state.vgpr_uniform_origins[vdst as usize] = SgprOrigin::Unknown;
+    state.set_vgpr_origin(vdst, SgprOrigin::Unknown);
     if !state.lane_origins.is_empty() {
         state.lane_origins.retain(|&(v, _), _| v != vdst);
     }
@@ -2251,7 +2429,8 @@ fn copy_vgpr_origins(state: &mut OriginState, vdst: u8, vsrc: u8) {
     if vdst == vsrc {
         return;
     }
-    state.vgpr_uniform_origins[vdst as usize] = state.vgpr_uniform_origins[vsrc as usize];
+    let src_origin = state.vgpr_origin(vsrc);
+    state.set_vgpr_origin(vdst, src_origin);
     if !state.lane_origins.is_empty() {
         state.lane_origins.retain(|&(v, _), _| v != vdst);
         let copied: Vec<(u8, SgprOrigin)> = state
@@ -2269,7 +2448,10 @@ fn swap_vgpr_origins(state: &mut OriginState, va: u8, vb: u8) {
     if va == vb {
         return;
     }
-    state.vgpr_uniform_origins.swap(va as usize, vb as usize);
+    let orig_a = state.vgpr_origin(va);
+    let orig_b = state.vgpr_origin(vb);
+    state.set_vgpr_origin(va, orig_b);
+    state.set_vgpr_origin(vb, orig_a);
     if !state.lane_origins.is_empty() {
         let a_lanes: Vec<(u8, SgprOrigin)> = state
             .lane_origins
@@ -2295,10 +2477,15 @@ fn is_synthesized_root_vsharp(
     origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
     rsrc_sgpr: u8,
 ) -> bool {
-    let idx = rsrc_sgpr as usize;
-    idx + 3 < origins.len()
-        && (matches!(origins[idx + 2], SgprOrigin::ConstImmediate { .. })
-            || matches!(origins[idx + 3], SgprOrigin::ConstImmediate { .. }))
+    let idx = usize::from(rsrc_sgpr);
+    let Some(w2) = idx.checked_add(2).and_then(|i| origins.get(i)) else {
+        return false;
+    };
+    let Some(w3) = idx.checked_add(3).and_then(|i| origins.get(i)) else {
+        return false;
+    };
+    matches!(w2, SgprOrigin::ConstImmediate { .. })
+        || matches!(w3, SgprOrigin::ConstImmediate { .. })
 }
 
 /// Resolve the 4-SGPR V# or S# descriptor origin at `s[rsrc_sgpr .. rsrc_sgpr+3]`.
@@ -2308,24 +2495,23 @@ fn is_synthesized_root_vsharp(
 /// back to matching descriptor word pairs `(2, 3)`, `(1, 3)`, or `(1, 2)` (including GFX10.3
 /// structured-buffer `PatchedDescWord` words) from the same defining instruction.
 fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: u8) -> SgprOrigin {
-    let idx = rsrc_sgpr as usize;
-    if idx >= origins.len() {
+    let idx = usize::from(rsrc_sgpr);
+    let Some(&w0) = origins.get(idx) else {
         return SgprOrigin::Unknown;
-    }
-    let w0 = origins[idx];
+    };
     if !matches!(
         w0,
         SgprOrigin::Unknown | SgprOrigin::Unwritten | SgprOrigin::PatchedDescWord { .. }
     ) {
         return w0;
     }
-    if idx + 3 < origins.len() {
+    if idx.checked_add(3).is_some_and(|end| end < origins.len()) {
         for (wi, wj) in [(2usize, 3usize), (1, 3), (1, 2)] {
             let byte_delta_i = (wi * 4) as u32;
             let byte_delta_diff = ((wj - wi) * 4) as u32;
             if let (Some((di, bi)), Some((dj, bj))) = (
-                patched_desc_word_of(origins[idx + wi]),
-                patched_desc_word_of(origins[idx + wj]),
+                patched_desc_word_of(origin_at(origins, idx + wi)),
+                patched_desc_word_of(origin_at(origins, idx + wj)),
             ) && di == dj
             {
                 match (bi, bj) {
@@ -2379,20 +2565,25 @@ fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
 /// Checks word 0 first; if word 0 was overwritten/clobbered, checks consecutive descriptor word
 /// pairs `(2, 3)`, `(4, 5)`, and `(6, 7)` from the same defining instruction.
 fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: u8) -> SgprOrigin {
-    let idx = rsrc_sgpr as usize;
-    if idx >= origins.len() {
+    let idx = usize::from(rsrc_sgpr);
+    let Some(&w0) = origins.get(idx) else {
         return SgprOrigin::Unknown;
-    }
-    let w0 = origins[idx];
+    };
     if !matches!(w0, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
         return w0;
     }
     for word_lo in [2usize, 4, 6] {
-        if idx + word_lo + 1 >= origins.len() {
+        let Some(lo_idx) = idx.checked_add(word_lo) else {
+            break;
+        };
+        let Some(hi_idx) = lo_idx.checked_add(1) else {
+            break;
+        };
+        if hi_idx >= origins.len() {
             break;
         }
         let byte_delta = (word_lo * 4) as u32;
-        match (origins[idx + word_lo], origins[idx + word_lo + 1]) {
+        match (origin_at(origins, lo_idx), origin_at(origins, hi_idx)) {
             (
                 SgprOrigin::TableDesc {
                     def_inst_idx: d_lo,
@@ -2607,8 +2798,8 @@ fn step_origin_state(
                             // s_cmov_b64
                             let (src_lo, src_hi) =
                                 resolve_src_pair_origins(*ssrc0, *literal, inst_idx, &state.origins);
-                            let dst_lo = state.origins[*sdst as usize];
-                            let dst_hi = state.origins[(*sdst + 1) as usize];
+                            let dst_lo = state.sgpr_origin(*sdst);
+                            let dst_hi = state.sgpr_origin(sdst.saturating_add(1));
                             let lo = merge_select_origin(
                                 dst_lo,
                                 src_lo,
@@ -2672,8 +2863,8 @@ fn step_origin_state(
                         }
                         0x1C | 0x1E => {
                             // s_bitset0_b64 / s_bitset1_b64
-                            let dst_lo = state.origins[*sdst as usize];
-                            let dst_hi = state.origins[(*sdst + 1) as usize];
+                            let dst_lo = state.sgpr_origin(*sdst);
+                            let dst_hi = state.sgpr_origin(sdst.saturating_add(1));
                             if let (
                                 SgprOrigin::ConstImmediate { value: lo_v, .. },
                                 SgprOrigin::ConstImmediate { value: hi_v, .. },
@@ -2702,16 +2893,18 @@ fn step_origin_state(
                         }
                         _ => (SgprOrigin::Unknown, SgprOrigin::Unknown),
                     };
-                    state.origins[*sdst as usize] = new_lo;
-                    state.origins[(*sdst + 1) as usize] = new_hi;
+                    state.set_sgpr_origin(*sdst, new_lo);
+                    if let Some(hi_reg) = checked_tracked_sgpr_reg(*sdst, 1) {
+                        state.set_sgpr_origin(hi_reg, new_hi);
+                        clear_pending_xor_if(state, hi_reg);
+                    }
                     clear_pending_xor_if(state, *sdst);
-                    clear_pending_xor_if(state, *sdst + 1);
                 } else if *sdst == MAX_TRACKED_SGPR {
-                    state.origins[MAX_TRACKED_SGPR as usize] = SgprOrigin::Unknown;
+                    state.set_sgpr_origin(MAX_TRACKED_SGPR, SgprOrigin::Unknown);
                     clear_pending_xor_if(state, MAX_TRACKED_SGPR);
                 }
             } else if *sdst <= MAX_TRACKED_SGPR {
-                let prev = state.origins[*sdst as usize];
+                let prev = state.sgpr_origin(*sdst);
                 let next = match *op {
                     0x03 => {
                         // s_mov_b32
@@ -2817,7 +3010,7 @@ fn step_origin_state(
                     }
                     _ => SgprOrigin::Unknown,
                 };
-                state.origins[*sdst as usize] = next;
+                state.set_sgpr_origin(*sdst, next);
                 clear_pending_xor_if(state, *sdst);
             }
         }
@@ -2833,9 +3026,9 @@ fn step_origin_state(
                 taint_sgpr_if_loaded(&mut collector, &state.origins, u16::from(*sdst));
             }
             if !matches!(*op, 0x03..=0x0E | 0x17..=0x1A) && *sdst <= MAX_TRACKED_SGPR {
-                let prev_origin = state.origins[*sdst as usize];
+                let prev_origin = state.sgpr_origin(*sdst);
                 let imm = i32::from(*simm16 as i16);
-                state.origins[*sdst as usize] = match *op {
+                let next_sopk = match *op {
                     0x00 => {
                         // s_movk_i32
                         SgprOrigin::ConstImmediate {
@@ -2879,6 +3072,7 @@ fn step_origin_state(
                     }
                     _ => SgprOrigin::Unknown,
                 };
+                state.set_sgpr_origin(*sdst, next_sopk);
                 clear_pending_xor_if(state, *sdst);
             }
         }
@@ -2946,10 +3140,12 @@ fn step_origin_state(
                 } else {
                     (SgprOrigin::Unknown, SgprOrigin::Unknown)
                 };
-                state.origins[*sdst as usize] = lo_orig;
-                state.origins[(*sdst + 1) as usize] = hi_orig;
+                state.set_sgpr_origin(*sdst, lo_orig);
+                if let Some(hi_reg) = checked_tracked_sgpr_reg(*sdst, 1) {
+                    state.set_sgpr_origin(hi_reg, hi_orig);
+                    clear_pending_xor_if(state, hi_reg);
+                }
                 clear_pending_xor_if(state, *sdst);
-                clear_pending_xor_if(state, *sdst + 1);
             } else if pair0 && *sdst <= MAX_TRACKED_SGPR_PAIR {
                 let (s0_lo, s0_hi) =
                     resolve_src_pair_origins(*ssrc0, *literal, inst_idx, &state.origins);
@@ -3253,25 +3449,19 @@ fn step_origin_state(
                     }
                     _ => (SgprOrigin::Unknown, SgprOrigin::Unknown),
                 };
-                state.origins[*sdst as usize] = new_lo;
-                state.origins[(*sdst + 1) as usize] = new_hi;
+                state.set_sgpr_origin(*sdst, new_lo);
+                if let Some(hi_reg) = checked_tracked_sgpr_reg(*sdst, 1) {
+                    state.set_sgpr_origin(hi_reg, new_hi);
+                    clear_pending_xor_if(state, hi_reg);
+                }
                 clear_pending_xor_if(state, *sdst);
-                clear_pending_xor_if(state, *sdst + 1);
                 state.pending_xor_pair = next_pending_xor_pair;
                 if *op != 0x0B {
                     state.last_carry_lo_reg = None;
                 }
             } else if *sdst <= MAX_TRACKED_SGPR {
-                let src0_origin = if *ssrc0 <= MAX_TRACKED_SGPR {
-                    state.origins[*ssrc0 as usize]
-                } else {
-                    SgprOrigin::Unknown
-                };
-                let src1_origin = if *ssrc1 <= MAX_TRACKED_SGPR {
-                    state.origins[*ssrc1 as usize]
-                } else {
-                    SgprOrigin::Unknown
-                };
+                let src0_origin = state.sgpr_origin(*ssrc0);
+                let src1_origin = state.sgpr_origin(*ssrc1);
                 let c0 = resolve_const_u32(*ssrc0, *literal, &state.origins);
                 let c1 = resolve_const_u32(*ssrc1, *literal, &state.origins);
                 let mut next_origin = SgprOrigin::Unknown;
@@ -3738,7 +3928,7 @@ fn step_origin_state(
                     }
                     _ => {}
                 }
-                state.origins[*sdst as usize] = next_origin;
+                state.set_sgpr_origin(*sdst, next_origin);
                 clear_pending_xor_if(state, *sdst);
                 state.pending_xor = next_pending_xor;
                 state.last_carry_lo_reg = next_carry_lo;
@@ -3762,26 +3952,26 @@ fn step_origin_state(
                 Some(v)
             } else if *soffset <= MAX_TRACKED_SGPR
                 && let SgprOrigin::ConstImmediate { value: Some(v), .. } =
-                    state.origins[*soffset as usize]
+                    state.sgpr_origin(*soffset)
             {
                 Some(v as i32)
             } else {
                 None
             };
             let is_dynamic = const_soffset.is_none();
-            let sbase_sgpr = sbase.saturating_mul(2);
+            let sbase_sgpr = checked_descriptor_sgpr(*sbase, 2);
 
             // Snapshot base & dynamic-offset origins BEFORE overwriting sdata (since sdata can
             // alias sbase_sgpr and/or soffset, e.g. `s_load_dwordx4 s[8:11], s[8:9], s10`).
-            let base_origin = if matches!(*op, 0x08..=0x0C) {
-                resolve_vsharp_origin(&state.origins, sbase_sgpr)
-            } else if (sbase_sgpr as usize) < state.origins.len() {
-                state.origins[sbase_sgpr as usize]
-            } else {
-                SgprOrigin::Unknown
+            let base_origin = match sbase_sgpr {
+                Some(sgpr) if matches!(*op, 0x08..=0x0C) => {
+                    resolve_vsharp_origin(&state.origins, sgpr)
+                }
+                Some(sgpr) => state.sgpr_origin(sgpr),
+                None => SgprOrigin::Unknown,
             };
-            let soffset_origin = if is_dynamic && (*soffset as usize) < state.origins.len() {
-                state.origins[*soffset as usize]
+            let soffset_origin = if is_dynamic {
+                state.sgpr_origin(*soffset)
             } else {
                 SgprOrigin::Unknown
             };
@@ -3868,9 +4058,8 @@ fn step_origin_state(
                 }
                 if let Some(count) = smem_load_dword_count(*op) {
                     for k in 0..count {
-                        let reg = sdata.saturating_add(k);
-                        if (reg as usize) < state.origins.len() {
-                            state.origins[reg as usize] = SgprOrigin::Unknown;
+                        if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                            state.set_sgpr_origin(reg, SgprOrigin::Unknown);
                             clear_pending_xor_if(state, reg);
                         }
                     }
@@ -3982,9 +4171,8 @@ fn step_origin_state(
 
                 // Clear destination origins before populating derived descriptor/pointer origins.
                 for k in 0..count {
-                    let reg = sdata.saturating_add(k);
-                    if (reg as usize) < state.origins.len() {
-                        state.origins[reg as usize] = SgprOrigin::Unknown;
+                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                        state.set_sgpr_origin(reg, SgprOrigin::Unknown);
                         clear_pending_xor_if(state, reg);
                     }
                 }
@@ -3992,34 +4180,38 @@ fn step_origin_state(
                 // Track descriptor & nested-table-pointer loads (`s_load_dword` / `x2` / `x4` /
                 // `x8` / `x16`), including SM 6.6 dynamic heap fetches, 2-level table chains, and
                 // descriptors spanning `s104..=vcc_hi` (`s[104:107]`, `s[100:107]`).
-                if (*sdata as usize) < state.origins.len() {
+                if *sdata <= MAX_TRACKED_SGPR {
                     if let Some(s_off) = const_soffset {
                         let raw_off = offset.saturating_add(s_off);
                         match base_origin {
                             SgprOrigin::DynamicHeapPtr(heap)
                             | SgprOrigin::DynamicHeapDesc { origin: heap, .. } => {
                                 for k in 0..count {
-                                    let reg = sdata.saturating_add(k);
-                                    if (reg as usize) < state.origins.len() {
-                                        state.origins[reg as usize] = SgprOrigin::DynamicHeapDesc {
-                                            def_inst_idx: inst_idx,
-                                            origin: heap,
-                                        };
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::DynamicHeapDesc {
+                                                def_inst_idx: inst_idx,
+                                                origin: heap,
+                                            },
+                                        );
                                     }
                                 }
                             }
                             SgprOrigin::VbTablePtr { byte_offset } => {
                                 let eff = byte_offset.saturating_add(raw_off);
                                 for k in 0..count {
-                                    let reg = sdata.saturating_add(k);
-                                    if (reg as usize) < state.origins.len() {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
                                         let vb_slot = (eff.saturating_add(i32::from(k) * 4)).max(0)
                                             as u32
                                             / 16;
-                                        state.origins[reg as usize] = SgprOrigin::VbDesc {
-                                            def_inst_idx: inst_idx,
-                                            vb_slot,
-                                        };
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::VbDesc {
+                                                def_inst_idx: inst_idx,
+                                                vb_slot,
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -4029,16 +4221,18 @@ fn step_origin_state(
                             } => {
                                 let eff = byte_offset.saturating_add(raw_off);
                                 for k in 0..count {
-                                    let reg = sdata.saturating_add(k);
-                                    if (reg as usize) < state.origins.len() {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
                                         let byte_off =
                                             (eff.saturating_add(i32::from(k) * 4)).max(0) as u32;
-                                        state.origins[reg as usize] = SgprOrigin::TableDesc {
-                                            def_inst_idx: inst_idx,
-                                            user_sgpr,
-                                            table_byte_offset: byte_off,
-                                            addr_offset: 0,
-                                        };
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::TableDesc {
+                                                def_inst_idx: inst_idx,
+                                                user_sgpr,
+                                                table_byte_offset: byte_off,
+                                                addr_offset: 0,
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -4054,31 +4248,35 @@ fn step_origin_state(
                                     .saturating_add(addr_offset)
                                     .saturating_add(raw_off);
                                 for k in 0..count {
-                                    let reg = sdata.saturating_add(k);
-                                    if (reg as usize) < state.origins.len() {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
                                         let byte_off =
                                             (eff.saturating_add(i32::from(k) * 4)).max(0) as u32;
-                                        state.origins[reg as usize] = SgprOrigin::TableDesc {
-                                            def_inst_idx: inst_idx,
-                                            user_sgpr,
-                                            table_byte_offset: byte_off,
-                                            addr_offset: 0,
-                                        };
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::TableDesc {
+                                                def_inst_idx: inst_idx,
+                                                user_sgpr,
+                                                table_byte_offset: byte_off,
+                                                addr_offset: 0,
+                                            },
+                                        );
                                     }
                                 }
                             }
                             _ => {
                                 if matches!(*op, 0x02 | 0x03 | 0x04) && (*sdata % 2 == 0) {
                                     for k in 0..count {
-                                        let reg = sdata.saturating_add(k);
-                                        if (reg as usize) < state.origins.len() {
-                                            state.origins[reg as usize] = SgprOrigin::RawTableDesc {
-                                                def_inst_idx: inst_idx,
-                                                table_sbase: *sbase,
-                                                table_offset: raw_off
-                                                    .saturating_add(i32::from(k) * 4),
-                                                is_dynamic: false,
-                                            };
+                                        if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                            state.set_sgpr_origin(
+                                                reg,
+                                                SgprOrigin::RawTableDesc {
+                                                    def_inst_idx: inst_idx,
+                                                    table_sbase: *sbase,
+                                                    table_offset: raw_off
+                                                        .saturating_add(i32::from(k) * 4),
+                                                    is_dynamic: false,
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -4086,24 +4284,28 @@ fn step_origin_state(
                         }
                     } else if let Some(heap) = dynamic_heap_from_soffset {
                         for k in 0..count {
-                            let reg = sdata.saturating_add(k);
-                            if (reg as usize) < state.origins.len() {
-                                state.origins[reg as usize] = SgprOrigin::DynamicHeapDesc {
-                                    def_inst_idx: inst_idx,
-                                    origin: heap,
-                                };
+                            if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                state.set_sgpr_origin(
+                                    reg,
+                                    SgprOrigin::DynamicHeapDesc {
+                                        def_inst_idx: inst_idx,
+                                        origin: heap,
+                                    },
+                                );
                             }
                         }
                     } else if matches!(*op, 0x02 | 0x03 | 0x04) && (*sdata % 2 == 0) {
                         for k in 0..count {
-                            let reg = sdata.saturating_add(k);
-                            if (reg as usize) < state.origins.len() {
-                                state.origins[reg as usize] = SgprOrigin::RawTableDesc {
-                                    def_inst_idx: inst_idx,
-                                    table_sbase: *sbase,
-                                    table_offset: 0,
-                                    is_dynamic: true,
-                                };
+                            if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                state.set_sgpr_origin(
+                                    reg,
+                                    SgprOrigin::RawTableDesc {
+                                        def_inst_idx: inst_idx,
+                                        table_sbase: *sbase,
+                                        table_offset: 0,
+                                        is_dynamic: true,
+                                    },
+                                );
                             }
                         }
                     }
@@ -4122,24 +4324,28 @@ fn step_origin_state(
                         // v_mov_b32: preserve uniform SGPR/VGPR origin (e.g. uniform SGPR spill).
                         if *src0 <= u16::from(MAX_TRACKED_SGPR) {
                             clear_vgpr_origins(state, *vdst);
-                            state.vgpr_uniform_origins[*vdst as usize] =
-                                state.origins[*src0 as usize];
+                            let s0 = state.sgpr_origin(*src0 as u8);
+                            state.set_vgpr_origin(*vdst, s0);
                         } else if (256..=511).contains(src0) {
                             copy_vgpr_origins(state, *vdst, (*src0 - 256) as u8);
                         } else if let Some(v) = decode_inline_u32_src(*src0, *literal) {
                             clear_vgpr_origins(state, *vdst);
-                            state.vgpr_uniform_origins[*vdst as usize] =
+                            state.set_vgpr_origin(
+                                *vdst,
                                 SgprOrigin::ConstImmediate {
                                     def_inst_idx: inst_idx,
                                     value: Some(v as u32),
-                                };
+                                },
+                            );
                         } else if let Some(bits) = decode_inline_float_u32(*src0) {
                             clear_vgpr_origins(state, *vdst);
-                            state.vgpr_uniform_origins[*vdst as usize] =
+                            state.set_vgpr_origin(
+                                *vdst,
                                 SgprOrigin::ConstImmediate {
                                     def_inst_idx: inst_idx,
                                     value: Some(bits),
-                                };
+                                },
+                            );
                         } else {
                             clear_vgpr_origins(state, *vdst);
                         }
@@ -4155,14 +4361,14 @@ fn step_origin_state(
                                         .lane_origins
                                         .get(&(vsrc, 0))
                                         .copied()
-                                        .unwrap_or(state.vgpr_uniform_origins[vsrc as usize]),
+                                        .unwrap_or_else(|| state.vgpr_origin(vsrc)),
                                 )
                             } else if *src0 <= u16::from(MAX_TRACKED_SGPR) {
-                                normalize_read_origin(state.origins[*src0 as usize])
+                                normalize_read_origin(state.sgpr_origin(*src0 as u8))
                             } else {
                                 SgprOrigin::Unknown
                             };
-                            state.origins[sd as usize] = restored;
+                            state.set_sgpr_origin(sd, restored);
                             clear_pending_xor_if(state, sd);
                         }
                     }
@@ -4185,10 +4391,10 @@ fn step_origin_state(
             taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
             if (*op & 0x10) == 0 {
                 // `v_cmp_*` writes `vcc` (`106` in Wave32, `106..=107` in Wave64).
-                state.origins[106] = SgprOrigin::Unknown;
+                state.set_sgpr_origin(106, SgprOrigin::Unknown);
                 clear_pending_xor_if(state, 106);
                 if !is_wave32 {
-                    state.origins[107] = SgprOrigin::Unknown;
+                    state.set_sgpr_origin(107, SgprOrigin::Unknown);
                     clear_pending_xor_if(state, 107);
                 }
             }
@@ -4197,10 +4403,10 @@ fn step_origin_state(
             taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
             clear_vgpr_origins(state, *vdst);
             if vop2_is_co_ci(*op) {
-                state.origins[106] = SgprOrigin::Unknown;
+                state.set_sgpr_origin(106, SgprOrigin::Unknown);
                 clear_pending_xor_if(state, 106);
                 if !is_wave32 {
-                    state.origins[107] = SgprOrigin::Unknown;
+                    state.set_sgpr_origin(107, SgprOrigin::Unknown);
                     clear_pending_xor_if(state, 107);
                 }
             }
@@ -4255,11 +4461,14 @@ fn step_origin_state(
             if let Some(sd) = sdst {
                 let sd7 = *sd & 0x7F;
                 if sd7 <= MAX_TRACKED_SGPR {
-                    state.origins[sd7 as usize] = SgprOrigin::Unknown;
+                    state.set_sgpr_origin(sd7, SgprOrigin::Unknown);
                     clear_pending_xor_if(state, sd7);
-                    if !is_wave32 && sd7 % 2 == 0 && sd7 <= MAX_TRACKED_SGPR_PAIR {
-                        state.origins[(sd7 + 1) as usize] = SgprOrigin::Unknown;
-                        clear_pending_xor_if(state, sd7 + 1);
+                    if !is_wave32
+                        && sd7 % 2 == 0
+                        && let Some(hi) = checked_tracked_sgpr_reg(sd7, 1)
+                    {
+                        state.set_sgpr_origin(hi, SgprOrigin::Unknown);
+                        clear_pending_xor_if(state, hi);
                     }
                 }
             }
@@ -4267,11 +4476,14 @@ fn step_origin_state(
                 if (*op & 0x10) == 0 {
                     let sd = *vdst & 0x7F;
                     if sd <= MAX_TRACKED_SGPR {
-                        state.origins[sd as usize] = SgprOrigin::Unknown;
+                        state.set_sgpr_origin(sd, SgprOrigin::Unknown);
                         clear_pending_xor_if(state, sd);
-                        if !is_wave32 && sd % 2 == 0 && sd <= MAX_TRACKED_SGPR_PAIR {
-                            state.origins[(sd + 1) as usize] = SgprOrigin::Unknown;
-                            clear_pending_xor_if(state, sd + 1);
+                        if !is_wave32
+                            && sd % 2 == 0
+                            && let Some(hi) = checked_tracked_sgpr_reg(sd, 1)
+                        {
+                            state.set_sgpr_origin(hi, SgprOrigin::Unknown);
+                            clear_pending_xor_if(state, hi);
                         }
                     }
                 }
@@ -4279,21 +4491,28 @@ fn step_origin_state(
                 // v_mov_b32_e64
                 if *src0 <= u16::from(MAX_TRACKED_SGPR) {
                     clear_vgpr_origins(state, *vdst);
-                    state.vgpr_uniform_origins[*vdst as usize] = state.origins[*src0 as usize];
+                    let s0 = state.sgpr_origin(*src0 as u8);
+                    state.set_vgpr_origin(*vdst, s0);
                 } else if (256..=511).contains(src0) {
                     copy_vgpr_origins(state, *vdst, (*src0 - 256) as u8);
                 } else if let Some(v) = decode_inline_u32_src(*src0, *literal) {
                     clear_vgpr_origins(state, *vdst);
-                    state.vgpr_uniform_origins[*vdst as usize] = SgprOrigin::ConstImmediate {
-                        def_inst_idx: inst_idx,
-                        value: Some(v as u32),
-                    };
+                    state.set_vgpr_origin(
+                        *vdst,
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                            value: Some(v as u32),
+                        },
+                    );
                 } else if let Some(bits) = decode_inline_float_u32(*src0) {
                     clear_vgpr_origins(state, *vdst);
-                    state.vgpr_uniform_origins[*vdst as usize] = SgprOrigin::ConstImmediate {
-                        def_inst_idx: inst_idx,
-                        value: Some(bits),
-                    };
+                    state.set_vgpr_origin(
+                        *vdst,
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                            value: Some(bits),
+                        },
+                    );
                 } else {
                     clear_vgpr_origins(state, *vdst);
                 }
@@ -4308,14 +4527,14 @@ fn step_origin_state(
                                 .lane_origins
                                 .get(&(vsrc, 0))
                                 .copied()
-                                .unwrap_or(state.vgpr_uniform_origins[vsrc as usize]),
+                                .unwrap_or_else(|| state.vgpr_origin(vsrc)),
                         )
                     } else if *src0 <= u16::from(MAX_TRACKED_SGPR) {
-                        normalize_read_origin(state.origins[*src0 as usize])
+                        normalize_read_origin(state.sgpr_origin(*src0 as u8))
                     } else {
                         SgprOrigin::Unknown
                     };
-                    state.origins[sd as usize] = restored;
+                    state.set_sgpr_origin(sd, restored);
                     clear_pending_xor_if(state, sd);
                 }
             } else if *op == 0x1E5 {
@@ -4329,7 +4548,7 @@ fn step_origin_state(
                 // v_writelane_b32 vdst, ssrc0, lane: preserve spilled SGPR origin per (vgpr, lane)
                 if let Some(lane) = resolve_const_lane_index(*src1, *literal, &state.origins) {
                     let val_origin = if *src0 <= u16::from(MAX_TRACKED_SGPR) {
-                        state.origins[*src0 as usize]
+                        state.sgpr_origin(*src0 as u8)
                     } else if let Some(v) = decode_inline_u32_src(*src0, *literal) {
                         SgprOrigin::ConstImmediate {
                             def_inst_idx: inst_idx,
@@ -4348,7 +4567,7 @@ fn step_origin_state(
                     } else {
                         SgprOrigin::Unknown
                     };
-                    state.vgpr_uniform_origins[*vdst as usize] = SgprOrigin::Unknown;
+                    state.set_vgpr_origin(*vdst, SgprOrigin::Unknown);
                     state.lane_origins.insert((*vdst, lane), val_origin);
                 } else {
                     clear_vgpr_origins(state, *vdst);
@@ -4367,21 +4586,23 @@ fn step_origin_state(
                                 .lane_origins
                                 .get(&(vsrc, lane))
                                 .copied()
-                                .unwrap_or(state.vgpr_uniform_origins[vsrc as usize])
+                                .unwrap_or_else(|| state.vgpr_origin(vsrc))
                         } else {
-                            state.vgpr_uniform_origins[vsrc as usize]
+                            state.vgpr_origin(vsrc)
                         };
                         normalize_read_origin(raw)
                     } else {
                         SgprOrigin::Unknown
                     };
-                    state.origins[sd as usize] = restored;
+                    state.set_sgpr_origin(sd, restored);
                     clear_pending_xor_if(state, sd);
                 }
             } else {
                 clear_vgpr_origins(state, *vdst);
-                if (matches!(*op, 0x2FF..=0x301) || *op == 0x364) && *vdst < 255 {
-                    clear_vgpr_origins(state, *vdst + 1);
+                if (matches!(*op, 0x2FF..=0x301) || *op == 0x364)
+                    && let Some(hi_v) = checked_vgpr_reg(*vdst, 1)
+                {
+                    clear_vgpr_origins(state, hi_v);
                 }
             }
         }
@@ -4413,12 +4634,17 @@ fn step_origin_state(
                     let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
                     let out_cnt = eff_mask.count_ones() as u8;
                     for d in 0..out_cnt {
-                        clear_vgpr_origins(state, vdata.saturating_add(d));
+                        if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                            clear_vgpr_origins(state, reg);
+                        }
                     }
                 }
                 if let Some(col) = collector.as_deref_mut() {
-                    let rsrc_sgpr = srsrc.saturating_mul(4);
-                    match resolve_tsharp_origin(&state.origins, rsrc_sgpr) {
+                    let tsharp_origin = checked_descriptor_sgpr(*srsrc, 4)
+                        .map_or(SgprOrigin::Unknown, |rsrc_sgpr| {
+                            resolve_tsharp_origin(&state.origins, rsrc_sgpr)
+                        });
+                    match tsharp_origin {
                         SgprOrigin::TableDesc {
                             def_inst_idx,
                             user_sgpr,
@@ -4463,8 +4689,11 @@ fn step_origin_state(
                         _ => {}
                     }
                     if !layout.is_load && !layout.is_store {
-                        let samp_sgpr = ssamp.saturating_mul(4);
-                        match resolve_vsharp_origin(&state.origins, samp_sgpr) {
+                        let samp_sgpr_opt = checked_descriptor_sgpr(*ssamp, 4);
+                        let samp_origin = samp_sgpr_opt.map_or(SgprOrigin::Unknown, |samp_sgpr| {
+                            resolve_vsharp_origin(&state.origins, samp_sgpr)
+                        });
+                        match samp_origin {
                             SgprOrigin::TableDesc {
                                 def_inst_idx,
                                 user_sgpr,
@@ -4501,9 +4730,9 @@ fn step_origin_state(
                             }
                             SgprOrigin::ConstImmediate { def_inst_idx, .. } => {
                                 if !layout.is_get_lod {
-                                    let key = if let Some(sdwords) =
-                                        resolve_inline_sampler_sdwords(&state.origins, samp_sgpr)
-                                    {
+                                    let key = if let Some(sdwords) = samp_sgpr_opt.and_then(|s| {
+                                        resolve_inline_sampler_sdwords(&state.origins, s)
+                                    }) {
                                         ResourceKey::InlineSampler(sdwords)
                                     } else {
                                         let idx = *col
@@ -4545,12 +4774,16 @@ fn step_origin_state(
                 && !buf_op.is_store()
             {
                 for d in 0..buf_op.vdata_count() {
-                    clear_vgpr_origins(state, vdata.saturating_add(d));
+                    if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                        clear_vgpr_origins(state, reg);
+                    }
                 }
             }
             if let Some(col) = collector.as_deref_mut() {
-                let rsrc_sgpr = srsrc.saturating_mul(4);
-                let origin = resolve_vsharp_origin(&state.origins, rsrc_sgpr);
+                let rsrc_sgpr_opt = checked_descriptor_sgpr(*srsrc, 4);
+                let origin = rsrc_sgpr_opt.map_or(SgprOrigin::Unknown, |rsrc_sgpr| {
+                    resolve_vsharp_origin(&state.origins, rsrc_sgpr)
+                });
                 match origin {
                     SgprOrigin::VbDesc {
                         def_inst_idx,
@@ -4597,7 +4830,9 @@ fn step_origin_state(
                     }
                     SgprOrigin::UserTable { user_sgpr, .. }
                         if (stage != ShaderStage::Vertex || !*idxen)
-                            && is_synthesized_root_vsharp(&state.origins, rsrc_sgpr) =>
+                            && rsrc_sgpr_opt.is_some_and(|rsrc_sgpr| {
+                                is_synthesized_root_vsharp(&state.origins, rsrc_sgpr)
+                            }) =>
                     {
                         col.out
                             .inst_storage_buf_keys
@@ -4626,12 +4861,16 @@ fn step_origin_state(
                 && !buf_op.is_store()
             {
                 for d in 0..buf_op.vdata_count() {
-                    clear_vgpr_origins(state, vdata.saturating_add(d));
+                    if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                        clear_vgpr_origins(state, reg);
+                    }
                 }
             }
             if let Some(col) = collector.as_deref_mut() {
-                let rsrc_sgpr = srsrc.saturating_mul(4);
-                let origin = resolve_vsharp_origin(&state.origins, rsrc_sgpr);
+                let rsrc_sgpr_opt = checked_descriptor_sgpr(*srsrc, 4);
+                let origin = rsrc_sgpr_opt.map_or(SgprOrigin::Unknown, |rsrc_sgpr| {
+                    resolve_vsharp_origin(&state.origins, rsrc_sgpr)
+                });
                 match origin {
                     SgprOrigin::VbDesc {
                         def_inst_idx,
@@ -4678,7 +4917,9 @@ fn step_origin_state(
                     }
                     SgprOrigin::UserTable { user_sgpr, .. }
                         if (stage != ShaderStage::Vertex || !*idxen)
-                            && is_synthesized_root_vsharp(&state.origins, rsrc_sgpr) =>
+                            && rsrc_sgpr_opt.is_some_and(|rsrc_sgpr| {
+                                is_synthesized_root_vsharp(&state.origins, rsrc_sgpr)
+                            }) =>
                     {
                         col.out
                             .inst_storage_buf_keys
@@ -4779,38 +5020,51 @@ fn analyze_vsharp_indirections(
     let Some(entry) = cfg.entry() else {
         return DescriptorAnalysis::default();
     };
-    block_in[entry] = Some(entry_state.clone());
-    worklist.insert(entry);
+    if let Some(slot) = block_in.get_mut(entry) {
+        *slot = Some(entry_state.clone());
+        worklist.insert(entry);
+    }
 
     while let Some(bid) = worklist.pop_first() {
-        if visits[bid] >= 32 {
+        let Some(visit_count) = visits.get_mut(bid) else {
+            continue;
+        };
+        if *visit_count >= 32 {
             continue;
         }
-        visits[bid] += 1;
-        let block = &cfg.blocks[bid];
+        *visit_count += 1;
+        let Some(block) = cfg.blocks.get(bid) else {
+            continue;
+        };
         if block.synthetic_exit {
             continue;
         }
-        let Some(mut state) = block_in[bid].clone() else {
+        let Some(mut state) = block_in.get(bid).and_then(Option::as_ref).cloned() else {
             continue;
         };
         for inst_idx in block.instr_range.clone() {
+            let Some(inst) = active.get(inst_idx) else {
+                continue;
+            };
             step_origin_state(
                 &mut state,
                 inst_idx,
-                &active[inst_idx],
+                inst,
                 stage,
                 is_wave32,
                 None,
             );
         }
         for succ in block.terminator.successors() {
-            if cfg.blocks[succ].synthetic_exit {
+            if cfg.blocks.get(succ).is_none_or(|b| b.synthetic_exit) {
                 continue;
             }
-            match &mut block_in[succ] {
+            let Some(succ_in) = block_in.get_mut(succ) else {
+                continue;
+            };
+            match succ_in {
                 None => {
-                    block_in[succ] = Some(state.clone());
+                    *succ_in = Some(state.clone());
                     worklist.insert(succ);
                 }
                 Some(existing) => {
@@ -4832,12 +5086,19 @@ fn analyze_vsharp_indirections(
         if block.synthetic_exit || block.instr_range.is_empty() {
             continue;
         }
-        let mut state = block_in[bid].clone().unwrap_or_else(|| entry_state.clone());
+        let mut state = block_in
+            .get(bid)
+            .and_then(Option::as_ref)
+            .cloned()
+            .unwrap_or_else(|| entry_state.clone());
         for inst_idx in block.instr_range.clone() {
+            let Some(inst) = active.get(inst_idx) else {
+                continue;
+            };
             step_origin_state(
                 &mut state,
                 inst_idx,
-                &active[inst_idx],
+                inst,
                 stage,
                 is_wave32,
                 Some(&mut collector),
@@ -5357,8 +5618,7 @@ fn plan_program(
                             has_dynamic_offset: is_dynamic,
                         });
                     for k in 0..count {
-                        let reg = sdata.saturating_add(k);
-                        if reg <= 105 {
+                        if let Some(reg) = checked_sgpr_reg(*sdata, k) {
                             sgprs.insert(reg);
                             written_sgprs.insert(reg);
                         }
@@ -5682,9 +5942,10 @@ fn plan_program(
                         let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
                         let out_cnt = eff_mask.count_ones() as u8;
                         for d in 0..out_cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                         continue;
                     }
@@ -5702,19 +5963,21 @@ fn plan_program(
                                 .and_modify(|d| *d = d.merge(tex_dim))
                                 .or_insert(tex_dim);
                             for a in 0..addr_vgprs {
-                                let reg = vaddr.saturating_add(a);
-                                vgprs.insert(reg);
-                                if !written_vgprs.contains(&reg) {
-                                    read_before_write_vgprs.insert(reg);
+                                if let Some(reg) = checked_vgpr_reg(*vaddr, a) {
+                                    vgprs.insert(reg);
+                                    if !written_vgprs.contains(&reg) {
+                                        read_before_write_vgprs.insert(reg);
+                                    }
                                 }
                             }
                             let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
                             let in_cnt = eff_mask.count_ones() as u8;
                             for d in 0..in_cnt {
-                                let reg = vdata.saturating_add(d);
-                                vgprs.insert(reg);
-                                if !written_vgprs.contains(&reg) {
-                                    read_before_write_vgprs.insert(reg);
+                                if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                    vgprs.insert(reg);
+                                    if !written_vgprs.contains(&reg) {
+                                        read_before_write_vgprs.insert(reg);
+                                    }
                                 }
                             }
                         }
@@ -5737,18 +6000,20 @@ fn plan_program(
                             samp_rsrc_set.insert(skey);
                         }
                         for a in 0..addr_vgprs {
-                            let reg = vaddr.saturating_add(a);
-                            vgprs.insert(reg);
-                            if !written_vgprs.contains(&reg) {
-                                read_before_write_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vaddr, a) {
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
                             }
                         }
                         let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
                         let out_cnt = eff_mask.count_ones() as u8;
                         for d in 0..out_cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                     }
                 }
@@ -5777,9 +6042,10 @@ fn plan_program(
                                 fetch_format: None,
                             });
                         for d in 0..comps {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                     }
                 } else if let Some(buf_op) = mubuf_storage_op(*op) {
@@ -5799,8 +6065,10 @@ fn plan_program(
                             read_before_write_vgprs.insert(*vaddr);
                         }
                     }
-                    if *offen && *idxen {
-                        let v1 = vaddr.saturating_add(1);
+                    if *offen
+                        && *idxen
+                        && let Some(v1) = checked_vgpr_reg(*vaddr, 1)
+                    {
                         vgprs.insert(v1);
                         if !written_vgprs.contains(&v1) {
                             read_before_write_vgprs.insert(v1);
@@ -5815,17 +6083,19 @@ fn plan_program(
                     let cnt = buf_op.vdata_count();
                     if buf_op.is_store() {
                         for d in 0..cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            if !written_vgprs.contains(&reg) {
-                                read_before_write_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
                             }
                         }
                     } else {
                         for d in 0..cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                     }
                 } else if mubuf_is_atomic(*op) && stage != ShaderStage::Vertex {
@@ -5871,9 +6141,10 @@ fn plan_program(
                                 fetch_format: fetch_fmt,
                             });
                         for d in 0..comps {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                     }
                 } else if let Some(buf_op) = mtbuf_storage_op(*op) {
@@ -5893,8 +6164,10 @@ fn plan_program(
                             read_before_write_vgprs.insert(*vaddr);
                         }
                     }
-                    if *offen && *idxen {
-                        let v1 = vaddr.saturating_add(1);
+                    if *offen
+                        && *idxen
+                        && let Some(v1) = checked_vgpr_reg(*vaddr, 1)
+                    {
                         vgprs.insert(v1);
                         if !written_vgprs.contains(&v1) {
                             read_before_write_vgprs.insert(v1);
@@ -5909,17 +6182,19 @@ fn plan_program(
                     let cnt = buf_op.vdata_count();
                     if buf_op.is_store() {
                         for d in 0..cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            if !written_vgprs.contains(&reg) {
-                                read_before_write_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
                             }
                         }
                     } else {
                         for d in 0..cnt {
-                            let reg = vdata.saturating_add(d);
-                            vgprs.insert(reg);
-                            written_vgprs.insert(reg);
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
                         }
                     }
                 }
@@ -5943,24 +6218,27 @@ fn plan_program(
                     match lds_op {
                         DsLdsOp::ReadContiguous(n) => {
                             for k in 0..n {
-                                let reg = vdst.saturating_add(k);
-                                vgprs.insert(reg);
-                                written_vgprs.insert(reg);
+                                if let Some(reg) = checked_vgpr_reg(*vdst, k) {
+                                    vgprs.insert(reg);
+                                    written_vgprs.insert(reg);
+                                }
                             }
                         }
                         DsLdsOp::Read2 { .. } => {
                             for k in 0..2u8 {
-                                let reg = vdst.saturating_add(k);
-                                vgprs.insert(reg);
-                                written_vgprs.insert(reg);
+                                if let Some(reg) = checked_vgpr_reg(*vdst, k) {
+                                    vgprs.insert(reg);
+                                    written_vgprs.insert(reg);
+                                }
                             }
                         }
                         DsLdsOp::WriteContiguous(n) => {
                             for k in 0..n {
-                                let reg = data0.saturating_add(k);
-                                vgprs.insert(reg);
-                                if !written_vgprs.contains(&reg) {
-                                    read_before_write_vgprs.insert(reg);
+                                if let Some(reg) = checked_vgpr_reg(*data0, k) {
+                                    vgprs.insert(reg);
+                                    if !written_vgprs.contains(&reg) {
+                                        read_before_write_vgprs.insert(reg);
+                                    }
                                 }
                             }
                         }
@@ -6148,8 +6426,7 @@ fn plan_program(
         vgprs.insert(0);
         let wg_base = options.workgroup_id_sgpr_base.unwrap_or(0);
         for c in 0..3u8 {
-            let reg = wg_base.saturating_add(c);
-            if reg <= 105
+            if let Some(reg) = checked_sgpr_reg(wg_base, c)
                 && sgprs.contains(&reg)
                 && (options.workgroup_id_sgpr_base.is_some()
                     || read_before_write_sgprs.contains(&reg))
@@ -6333,7 +6610,17 @@ fn align_up(value: u32, align: u32) -> u32 {
     if align <= 1 {
         return value;
     }
-    (value + (align - 1)) & !(align - 1)
+    value.saturating_add(align - 1) & !(align - 1)
+}
+
+/// Allocate a unique `@group(0) @binding(N)` slot starting from `preferred`, advancing
+/// deterministically if `preferred` is already claimed so duplicate bindings cannot occur.
+fn alloc_group0_binding(used: &mut BTreeSet<(u32, u32)>, preferred: u32) -> u32 {
+    let mut candidate = preferred;
+    while !used.insert((0, candidate)) {
+        candidate = candidate.saturating_add(1);
+    }
+    candidate
 }
 
 fn insert_type(module: &mut Module, name: Option<String>, inner: TypeInner) -> Handle<Type> {
@@ -6430,6 +6717,7 @@ impl IrEmitter {
             BTreeMap::new();
         let mut storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)> =
             BTreeMap::new();
+        let mut used_group0_bindings: BTreeSet<(u32, u32)> = BTreeSet::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
         let has_any_binding = !plan.cbv_slots.is_empty()
             || !plan.tex_slots.is_empty()
@@ -6499,14 +6787,14 @@ impl IrEmitter {
                         },
                     )
                 });
-                let binding_num = binding_base
-                    + if idx == 0 {
-                        0
-                    } else {
-                        let b = next_extra_binding;
-                        next_extra_binding += 1;
-                        b
-                    };
+                let preferred_binding = binding_base.saturating_add(if idx == 0 {
+                    0
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding = next_extra_binding.saturating_add(1);
+                    b
+                });
+                let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
                 let name = format!("cb{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -6592,14 +6880,14 @@ impl IrEmitter {
                         )
                     }),
                 };
-                let binding_num = binding_base
-                    + if idx == 0 {
-                        1
-                    } else {
-                        let b = next_extra_binding;
-                        next_extra_binding += 1;
-                        b
-                    };
+                let preferred_binding = binding_base.saturating_add(if idx == 0 {
+                    1
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding = next_extra_binding.saturating_add(1);
+                    b
+                });
+                let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
                 let name = format!("tex{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -6629,14 +6917,14 @@ impl IrEmitter {
                 });
             }
             for (idx, &key) in plan.samp_slots.iter().enumerate() {
-                let binding_num = binding_base
-                    + if idx == 0 {
-                        2
-                    } else {
-                        let b = next_extra_binding;
-                        next_extra_binding += 1;
-                        b
-                    };
+                let preferred_binding = binding_base.saturating_add(if idx == 0 {
+                    2
+                } else {
+                    let b = next_extra_binding;
+                    next_extra_binding = next_extra_binding.saturating_add(1);
+                    b
+                });
+                let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
                 let name = format!("samp{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -6680,8 +6968,9 @@ impl IrEmitter {
             let mut srv_idx = 0u32;
             let mut uav_idx = 0u32;
             for slot in &plan.storage_buf_slots {
-                let binding_num = binding_base + next_extra_binding;
-                next_extra_binding += 1;
+                let preferred_binding = binding_base.saturating_add(next_extra_binding);
+                next_extra_binding = next_extra_binding.saturating_add(1);
+                let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
                 let (name, access, kind) = if slot.writable {
                     let n = format!("uav_buf{uav_idx}");
                     uav_idx += 1;
@@ -6774,8 +7063,9 @@ impl IrEmitter {
                         )
                     }),
                 };
-                let binding_num = binding_base + next_extra_binding;
-                next_extra_binding += 1;
+                let preferred_binding = binding_base.saturating_add(next_extra_binding);
+                next_extra_binding = next_extra_binding.saturating_add(1);
+                let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
                 let name = format!("uav_tex{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -6833,7 +7123,14 @@ impl IrEmitter {
             None
         };
 
-        emitted_bindings.sort_by_key(|b| (b.group, b.binding));
+        emitted_bindings.sort_by(|a, b| {
+            (a.group, a.binding, a.kind, a.name.as_str()).cmp(&(
+                b.group,
+                b.binding,
+                b.kind,
+                b.name.as_str(),
+            ))
+        });
 
         let mut func = Function {
             name: Some(plan.entry_point.clone()),
@@ -8237,6 +8534,35 @@ impl IrEmitter {
         self.store_vgpr_f32(reg, f);
     }
 
+    /// Checked VGPR load at `base + offset`: returns `0.0` when `base + offset > 255`.
+    fn load_vgpr_offset_f32(&mut self, base: u8, offset: u8) -> Handle<Expression> {
+        match checked_vgpr_reg(base, offset) {
+            Some(reg) => self.load_vgpr_f32(reg),
+            None => self.lit_f32(0.0),
+        }
+    }
+
+    /// Checked VGPR f32 store at `base + offset`: no-op when `base + offset > 255`.
+    fn store_vgpr_offset_f32(&mut self, base: u8, offset: u8, val: Handle<Expression>) {
+        if let Some(reg) = checked_vgpr_reg(base, offset) {
+            self.store_vgpr_f32(reg, val);
+        }
+    }
+
+    /// Checked VGPR u32 store at `base + offset`: no-op when `base + offset > 255`.
+    fn store_vgpr_offset_u32(&mut self, base: u8, offset: u8, val: Handle<Expression>) {
+        if let Some(reg) = checked_vgpr_reg(base, offset) {
+            self.store_vgpr_u32(reg, val);
+        }
+    }
+
+    /// Checked VGPR i32 store at `base + offset`: no-op when `base + offset > 255`.
+    fn store_vgpr_offset_i32(&mut self, base: u8, offset: u8, val: Handle<Expression>) {
+        if let Some(reg) = checked_vgpr_reg(base, offset) {
+            self.store_vgpr_i32(reg, val);
+        }
+    }
+
     /// Pack an `f32` value into the low 16 bits (`[15:0]`) of `v[reg]` as IEEE-754 `f16`
     /// using core WGSL `pack2x16float`, preserving the upper 16 bits (`[31:16]`).
     fn store_vgpr_f16_lo(&mut self, reg: u8, val_f32: Handle<Expression>) {
@@ -9318,9 +9644,10 @@ impl IrEmitter {
                 ssrc0,
                 literal,
                 ..
-            } if exec_write.is_some() => {
-                self.translate_exec_mask_write(exec_write.unwrap(), *sdst, *ssrc0, *literal)
-            }
+            } if exec_write.is_some() => match exec_write {
+                Some(write) => self.translate_exec_mask_write(write, *sdst, *ssrc0, *literal),
+                None => false,
+            },
             Rdna2Detail::Sopp { op, .. } => self.translate_sopp(*op, inst.offset),
             Rdna2Detail::Sopc {
                 op,
@@ -10537,10 +10864,9 @@ impl IrEmitter {
         let mut cached_static_vec: Option<(u32, Handle<Expression>)> = None;
 
         for k in 0..count {
-            let dst_reg = sdata.saturating_add(k);
-            if dst_reg > 105 {
+            let Some(dst_reg) = checked_sgpr_reg(sdata, k) else {
                 break;
-            }
+            };
             let elem_val = if let Some(base_w) = base_word_dyn {
                 let k_lit = self.lit_u32(u32::from(k));
                 let raw_word = self.emit_expr(Expression::Binary {
@@ -13000,7 +13326,7 @@ impl IrEmitter {
             for ch in 0..4u32 {
                 if (eff_mask & (1 << ch)) != 0 {
                     let zero = self.lit_f32(0.0);
-                    self.store_vgpr_f32(vdata.saturating_add(dst_offset), zero);
+                    self.store_vgpr_offset_f32(vdata, dst_offset, zero);
                     dst_offset = dst_offset.saturating_add(1);
                 }
             }
@@ -13025,14 +13351,14 @@ impl IrEmitter {
                 return false;
             };
             let image = self.raw_expr(Expression::GlobalVariable(uav_tex_global));
-            let ux = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
-            let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let ux = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
+            let uy = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let iz = if inst_dim == TexDim::D3 {
-                        let uz = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        let uz = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
                         self.bitcast_f32_to_i32(uz)
                     } else {
                         self.lit_i32(0)
@@ -13047,7 +13373,7 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
                         self.bitcast_f32_to_i32(s)
                     } else {
                         self.lit_i32(0)
@@ -13074,7 +13400,7 @@ impl IrEmitter {
             let mut comps = Vec::with_capacity(4);
             for ch in 0..4u32 {
                 if (eff_mask & (1 << ch)) != 0 {
-                    comps.push(self.load_vgpr_f32(vdata.saturating_add(src_offset)));
+                    comps.push(self.load_vgpr_offset_f32(vdata, src_offset));
                     src_offset = src_offset.saturating_add(1);
                 } else {
                     comps.push(self.lit_f32(if ch == 3 { 1.0 } else { 0.0 }));
@@ -13113,14 +13439,14 @@ impl IrEmitter {
 
         let sampled = if layout.is_load {
             // image_load / image_load_mip
-            let ux = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
-            let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let ux = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
+            let uy = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let iz = if inst_dim == TexDim::D3 {
-                        let uz = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        let uz = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
                         self.bitcast_f32_to_i32(uz)
                     } else {
                         self.lit_i32(0)
@@ -13135,7 +13461,7 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
                         self.bitcast_f32_to_i32(s)
                     } else {
                         self.lit_i32(0)
@@ -13157,7 +13483,7 @@ impl IrEmitter {
                 ),
             };
             let level = if let Some(lod_off) = layout.lod_off {
-                let ml = self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
+                let ml = self.load_vgpr_offset_f32(vaddr, lod_off.saturating_add(lod_shift));
                 Some(self.bitcast_f32_to_i32(ml))
             } else {
                 Some(self.lit_i32(0))
@@ -13184,12 +13510,12 @@ impl IrEmitter {
                 return false;
             };
             let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
-            let u = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
-            let v = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
+            let u = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
+            let v = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let w = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2))
+                        self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2))
                     } else {
                         self.lit_f32(0.0)
                     };
@@ -13203,7 +13529,7 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
                         self.emit_expr(Expression::As {
                             expr: s,
                             kind: ScalarKind::Sint,
@@ -13235,23 +13561,23 @@ impl IrEmitter {
             let level = if layout.is_zero_lod {
                 SampleLevel::Exact(self.lit_f32(0.0))
             } else if let Some(lod_off) = layout.lod_off {
-                let lod =
-                    self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
+                let lod = self.load_vgpr_offset_f32(vaddr, lod_off.saturating_add(lod_shift));
                 SampleLevel::Exact(lod)
             } else if let Some(grad_off) = layout.grad_off {
                 if tex_dim == TexDim::D3 {
-                    let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
-                    let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
+                    let dudx = self.load_vgpr_offset_f32(vaddr, grad_off);
+                    let dvdx = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(1));
                     let dwdx = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2))
+                        self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(2))
                     } else {
                         self.lit_f32(0.0)
                     };
                     let dy_base = if inst_dim == TexDim::D3 { 3 } else { 2 };
-                    let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base));
-                    let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base + 1));
+                    let dy_off = grad_off.saturating_add(dy_base);
+                    let dudy = self.load_vgpr_offset_f32(vaddr, dy_off);
+                    let dvdy = self.load_vgpr_offset_f32(vaddr, dy_off.saturating_add(1));
                     let dwdy = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base + 2))
+                        self.load_vgpr_offset_f32(vaddr, dy_off.saturating_add(2))
                     } else {
                         self.lit_f32(0.0)
                     };
@@ -13265,10 +13591,10 @@ impl IrEmitter {
                     });
                     SampleLevel::Gradient { x, y }
                 } else {
-                    let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
-                    let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
-                    let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2));
-                    let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 3));
+                    let dudx = self.load_vgpr_offset_f32(vaddr, grad_off);
+                    let dvdx = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(1));
+                    let dudy = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(2));
+                    let dvdy = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(3));
                     let x = self.emit_expr(Expression::Compose {
                         ty: self.types.vec2_f32_ty,
                         components: vec![dudx, dvdx],
@@ -13282,7 +13608,7 @@ impl IrEmitter {
             } else if let Some(bias_off) = layout.bias_off {
                 // Implicit-derivative sampling requires uniform control flow in WGSL.
                 if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
-                    let bias = self.load_vgpr_f32(vaddr.saturating_add(bias_off));
+                    let bias = self.load_vgpr_offset_f32(vaddr, bias_off);
                     SampleLevel::Bias(bias)
                 } else {
                     SampleLevel::Exact(self.lit_f32(0.0))
@@ -13308,7 +13634,7 @@ impl IrEmitter {
             if let Some(cmp_off) = layout.compare_off {
                 // Depth/shadow comparison on baseline `texture_2d<f32>` + `sampler`:
                 // returns 1.0 when `z_ref <= tex.x`, else 0.0, replicated across channels.
-                let z_ref = self.load_vgpr_f32(vaddr.saturating_add(cmp_off));
+                let z_ref = self.load_vgpr_offset_f32(vaddr, cmp_off);
                 let depth_val = self.emit_expr(Expression::AccessIndex {
                     base: raw_sample,
                     index: 0,
@@ -13342,7 +13668,7 @@ impl IrEmitter {
                     base: sampled,
                     index: ch,
                 });
-                self.store_vgpr_f32(vdata.saturating_add(dst_offset), comp);
+                self.store_vgpr_offset_f32(vdata, dst_offset, comp);
                 dst_offset = dst_offset.saturating_add(1);
             }
         }
@@ -13440,7 +13766,7 @@ impl IrEmitter {
                 left: idx_u,
                 right: stride_lit,
             });
-            let off_f = self.load_vgpr_f32(vaddr.saturating_add(1));
+            let off_f = self.load_vgpr_offset_f32(vaddr, 1);
             let off_u = self.bitcast_f32_to_u32(off_f);
             let sum = self.emit_expr(Expression::Binary {
                 op: BinaryOperator::Add,
@@ -13658,7 +13984,7 @@ impl IrEmitter {
                     loaded.push(self.emit_expr(Expression::Load { pointer: elem_ptr }));
                 }
                 for (k, word) in loaded.into_iter().enumerate() {
-                    self.store_vgpr_u32(vdata.saturating_add(k as u8), word);
+                    self.store_vgpr_offset_u32(vdata, k as u8, word);
                 }
                 true
             }
@@ -13685,7 +14011,7 @@ impl IrEmitter {
                         base: buf_ptr,
                         index: safe_idx,
                     });
-                    let vf = self.load_vgpr_f32(vdata.saturating_add(k));
+                    let vf = self.load_vgpr_offset_f32(vdata, k);
                     let vu = self.bitcast_f32_to_u32(vf);
                     self.func.body.push(
                         Statement::Store {
@@ -13769,7 +14095,7 @@ impl IrEmitter {
                     loaded.push(self.emit_expr(Expression::Load { pointer: elem_ptr }));
                 }
                 for (k, word) in loaded.into_iter().enumerate() {
-                    self.store_vgpr_u32(vdst.saturating_add(k as u8), word);
+                    self.store_vgpr_offset_u32(vdst, k as u8, word);
                 }
                 true
             }
@@ -13781,7 +14107,7 @@ impl IrEmitter {
                         base: lds_ptr,
                         index: idx,
                     });
-                    let vf = self.load_vgpr_f32(data0.saturating_add(k));
+                    let vf = self.load_vgpr_offset_f32(data0, k);
                     let vu = self.bitcast_f32_to_u32(vf);
                     self.func.body.push(
                         Statement::Store {
@@ -13809,7 +14135,7 @@ impl IrEmitter {
                 let w1 = self.emit_expr(Expression::Load { pointer: ptr1 });
 
                 self.store_vgpr_u32(vdst, w0);
-                self.store_vgpr_u32(vdst.saturating_add(1), w1);
+                self.store_vgpr_offset_u32(vdst, 1, w1);
                 true
             }
             DsLdsOp::Write2 { stride_bytes } => {
@@ -13894,9 +14220,9 @@ impl IrEmitter {
                     })
                 };
                 match scalar_kind {
-                    ScalarKind::Uint => self.store_vgpr_u32(vdata.saturating_add(c), elem),
-                    ScalarKind::Sint => self.store_vgpr_i32(vdata.saturating_add(c), elem),
-                    _ => self.store_vgpr_f32(vdata.saturating_add(c), elem),
+                    ScalarKind::Uint => self.store_vgpr_offset_u32(vdata, c, elem),
+                    ScalarKind::Sint => self.store_vgpr_offset_i32(vdata, c, elem),
+                    _ => self.store_vgpr_offset_f32(vdata, c, elem),
                 }
             } else {
                 let fallback = match scalar_kind {
@@ -13905,9 +14231,9 @@ impl IrEmitter {
                     _ => self.lit_f32(if c == 3 { 1.0 } else { 0.0 }),
                 };
                 match scalar_kind {
-                    ScalarKind::Uint => self.store_vgpr_u32(vdata.saturating_add(c), fallback),
-                    ScalarKind::Sint => self.store_vgpr_i32(vdata.saturating_add(c), fallback),
-                    _ => self.store_vgpr_f32(vdata.saturating_add(c), fallback),
+                    ScalarKind::Uint => self.store_vgpr_offset_u32(vdata, c, fallback),
+                    ScalarKind::Sint => self.store_vgpr_offset_i32(vdata, c, fallback),
+                    _ => self.store_vgpr_offset_f32(vdata, c, fallback),
                 }
             }
         }
@@ -14449,7 +14775,10 @@ impl IrEmitter {
             let selector = s.load_local(pc);
             let mut cases = Vec::with_capacity(members.len() + 1);
             for &id in &members {
-                let terminator = cfg.blocks[id].terminator;
+                let Some(block) = cfg.blocks.get(id) else {
+                    continue;
+                };
+                let terminator = block.terminator;
                 let case_body = s.lower_nested(|s| {
                     s.lower_basic_block(id, cfg, insts);
                     if s.body_terminated() {
@@ -14557,6 +14886,245 @@ impl IrEmitter {
     }
 }
 
+/// Normalize line endings to LF (`\n`) and guarantee a trailing LF on non-empty WGSL text.
+fn normalize_wgsl_newlines(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(raw.len() + 1);
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Post-emit WGSL structural checks executed unconditionally after Naga emission:
+/// - LF-only newlines (no `\r`)
+/// - Balanced `{`/`}`, `(`/`)`, `[`/`]` delimiters and closed nested `/* ... */` comments
+/// - No illegal module-scope `let` declarations
+/// - Present, non-empty entry point `fn <entry_point>(...) { ... }`
+fn validate_emitted_wgsl_structure(
+    wgsl: &str,
+    entry_point: &str,
+) -> Result<(), Rdna2TranslateError> {
+    if wgsl.is_empty() {
+        return Err(Rdna2TranslateError::WgslParse(
+            "emitted WGSL output is empty".to_string(),
+        ));
+    }
+    if wgsl.contains('\r') {
+        return Err(Rdna2TranslateError::WgslParse(
+            "emitted WGSL contains CR (\\r) newline characters".to_string(),
+        ));
+    }
+
+    let bytes = wgsl.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut brace_depth: usize = 0;
+    let mut paren_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
+    let mut block_comment_depth: usize = 0;
+
+    // Entry-point state machine:
+    //   0 = idle at module scope
+    //   1 = saw `fn` at module scope, expecting identifier
+    //   2 = saw `fn <entry_point>`, waiting for opening `{` at depth 0 -> 1
+    //   3 = inside entry point `{ ... }` body (brace_depth >= 1)
+    let mut ep_state: u8 = 0;
+    let mut ep_found = false;
+    let mut ep_body_has_code = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        if block_comment_depth > 0 {
+            if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                block_comment_depth += 1;
+                i += 2;
+            } else if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            block_comment_depth = 1;
+            i += 2;
+            continue;
+        }
+
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'{' => {
+                if ep_state == 3 {
+                    ep_body_has_code = true;
+                } else if ep_state == 2
+                    && brace_depth == 0
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                {
+                    ep_state = 3;
+                }
+                brace_depth += 1;
+                i += 1;
+                continue;
+            }
+            b'}' => {
+                if brace_depth == 0 {
+                    return Err(Rdna2TranslateError::WgslParse(
+                        "unbalanced closing '}' in emitted WGSL".to_string(),
+                    ));
+                }
+                brace_depth -= 1;
+                if ep_state == 3 && brace_depth == 0 {
+                    ep_state = 0;
+                }
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                if ep_state == 3 {
+                    ep_body_has_code = true;
+                }
+                paren_depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                if paren_depth == 0 {
+                    return Err(Rdna2TranslateError::WgslParse(
+                        "unbalanced closing ')' in emitted WGSL".to_string(),
+                    ));
+                }
+                paren_depth -= 1;
+                i += 1;
+                continue;
+            }
+            b'[' => {
+                if ep_state == 3 {
+                    ep_body_has_code = true;
+                }
+                bracket_depth += 1;
+                i += 1;
+                continue;
+            }
+            b']' => {
+                if bracket_depth == 0 {
+                    return Err(Rdna2TranslateError::WgslParse(
+                        "unbalanced closing ']' in emitted WGSL".to_string(),
+                    ));
+                }
+                bracket_depth -= 1;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if ep_state == 3 {
+            ep_body_has_code = true;
+        }
+
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 {
+                let ident = &wgsl[start..i];
+                if ident == "let" {
+                    return Err(Rdna2TranslateError::WgslParse(
+                        "illegal module-scope `let` declaration in emitted WGSL".to_string(),
+                    ));
+                }
+                match ep_state {
+                    0 if ident == "fn" => ep_state = 1,
+                    1 => {
+                        if ident == entry_point {
+                            ep_found = true;
+                            ep_state = 2;
+                        } else {
+                            ep_state = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        if brace_depth == 0
+            && paren_depth == 0
+            && bracket_depth == 0
+            && (ep_state == 1 || (ep_state == 2 && b == b';'))
+        {
+            ep_state = 0;
+        }
+        i += 1;
+    }
+
+    if block_comment_depth != 0 {
+        return Err(Rdna2TranslateError::WgslParse(
+            "unterminated block comment in emitted WGSL".to_string(),
+        ));
+    }
+    if brace_depth != 0 {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "unbalanced opening '{{' in emitted WGSL (remaining depth {brace_depth})"
+        )));
+    }
+    if paren_depth != 0 {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "unbalanced opening '(' in emitted WGSL (remaining depth {paren_depth})"
+        )));
+    }
+    if bracket_depth != 0 {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "unbalanced opening '[' in emitted WGSL (remaining depth {bracket_depth})"
+        )));
+    }
+    if !ep_found {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "missing entry point `fn {entry_point}` in emitted WGSL"
+        )));
+    }
+    if !ep_body_has_code {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "entry point `{entry_point}` has an empty body in emitted WGSL"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Baseline WebGPU capabilities permitted during Naga validation.
 /// `SHADER_FLOAT16_IN_FLOAT32` enables core WGSL `pack2x16float`/`unpack2x16float`
 /// built-ins (no `enable f16;` extension required in WebGPU).
@@ -14618,13 +15186,13 @@ pub fn translate_rdna2_to_wgsl(
     .map_err(|err| Rdna2TranslateError::WgslEmit(err.to_string()))?;
 
     // Prepend strictly sanitized WGSL header & graceful fallback opcode comments.
-    let mut wgsl = String::with_capacity(wgsl_body.len() + 256);
+    let mut raw_wgsl = String::with_capacity(wgsl_body.len() + 256);
     let _ = writeln!(
-        wgsl,
+        raw_wgsl,
         "// Translated from AMD RDNA2 (GFX10.3) by playgta6-shaders"
     );
     let _ = writeln!(
-        wgsl,
+        raw_wgsl,
         "// hash: {} | stage: {} | translated_ops: {} | unsupported_ops: {}",
         format_shader_hash(summary.fnv1a_hash),
         plan.stage.as_str(),
@@ -14632,10 +15200,15 @@ pub fn translate_rdna2_to_wgsl(
         unsupported_op_count
     );
     for comment in unsupported_comments.iter().chain(note_comments.iter()) {
-        let _ = writeln!(wgsl, "{comment}");
+        let single_line = comment.replace(['\r', '\n'], " ");
+        let _ = writeln!(raw_wgsl, "{single_line}");
     }
-    wgsl.push('\n');
-    wgsl.push_str(&wgsl_body);
+    raw_wgsl.push('\n');
+    raw_wgsl.push_str(&wgsl_body);
+
+    // Normalize line endings to LF and enforce unconditional post-emit WGSL structural checks.
+    let wgsl = normalize_wgsl_newlines(&raw_wgsl);
+    validate_emitted_wgsl_structure(&wgsl, &entry_point)?;
 
     // When `naga/wgsl-in` is active (unit tests), additionally round-trip parse & validate the
     // final WGSL text (including comments) via `naga::front::wgsl::parse_str`.
@@ -14670,7 +15243,7 @@ pub fn translate_rdna2_to_wgsl(
         exports_depth: plan.stage == ShaderStage::Fragment && plan.ps_exports_depth,
     };
 
-    let vertex_inputs: Vec<WgslVertexInputInfo> = if plan.stage == ShaderStage::Vertex
+    let mut vertex_inputs: Vec<WgslVertexInputInfo> = if plan.stage == ShaderStage::Vertex
         && plan.vertex_input_mode == VertexInputMode::Attributes
     {
         plan.vertex_attrs
@@ -14689,6 +15262,7 @@ pub fn translate_rdna2_to_wgsl(
     } else {
         Vec::new()
     };
+    vertex_inputs.sort_by_key(|v| (v.location, v.vb_slot, v.byte_offset));
 
     Ok(Rdna2WgslOutput {
         wgsl,
@@ -21083,5 +21657,386 @@ mod tests {
             "conflicting s_cselect_b64 between different user tables must not fabricate provenance: {:?}",
             neg_cbv
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S60: Determinism, checked register/descriptor bounds, LF normalization
+    //      & post-emit WGSL structural validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn s60_empty_truncated_and_malformed_inputs_never_panic_and_roundtrip_naga() {
+        let stages = [
+            Rdna2StageOverride::Auto,
+            Rdna2StageOverride::Vertex,
+            Rdna2StageOverride::Pixel,
+            Rdna2StageOverride::Compute,
+        ];
+
+        // 1. Empty and misaligned short byte slices across all stage overrides.
+        let malformed_slices: [&[u8]; 9] = [
+            &[],
+            &[0x00],
+            &[0xFF, 0xFF],
+            &[0xDE, 0xAD, 0xBE],
+            &[0x00, 0x00, 0x00, 0x00],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x01, 0x02, 0x03, 0x04, 0x05],
+            // Truncated 64-bit SMEM header (missing second dword)
+            &enc_smem(0x02, 16, 4, 0x7D, 0, false, false)[0].to_le_bytes(),
+            // Truncated 64-bit MIMG header (missing second dword)
+            &enc_mimg(0x20, 0xF, 1, 0, 4, 2, 1)[0].to_le_bytes(),
+        ];
+
+        for stage in stages {
+            let opts = Rdna2TranslateOptions {
+                stage,
+                ..Rdna2TranslateOptions::default()
+            };
+            for bytes in malformed_slices {
+                let out = translate_rdna2_to_wgsl(bytes, &opts)
+                    .unwrap_or_else(|e| panic!("failed on {stage:?} len={}: {e}", bytes.len()));
+                assert!(out.naga_validated);
+                assert!(!out.wgsl.contains('\r'), "emitted WGSL must be LF-only");
+                assert!(out.wgsl.ends_with('\n'));
+                validate_emitted_wgsl_structure(&out.wgsl, &out.entry_point)
+                    .expect("post-emit structural check must pass");
+                assert_naga_wgsl_valid(&out.wgsl);
+            }
+        }
+
+        // 2. Deterministic pseudo-random malformed 64-byte payload across all stages.
+        let mut fuzz_bytes = [0u8; 64];
+        let mut state = 0x5EED_CAFE_1234_5678u64;
+        for b in &mut fuzz_bytes {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (state >> 56) as u8;
+        }
+        for stage in stages {
+            let out = translate_rdna2_to_wgsl(
+                &fuzz_bytes,
+                &Rdna2TranslateOptions {
+                    stage,
+                    ..Rdna2TranslateOptions::default()
+                },
+            )
+            .expect("arbitrary malformed fuzz bytes must never panic or fail");
+            assert!(out.naga_validated);
+            assert!(!out.wgsl.contains('\r'));
+            validate_emitted_wgsl_structure(&out.wgsl, &out.entry_point)
+                .expect("fuzz output must satisfy structural invariants");
+            assert_naga_wgsl_valid(&out.wgsl);
+        }
+    }
+
+    #[test]
+    fn s60_out_of_range_vgpr_sgpr_and_descriptor_indices_never_panic() {
+        // Compute shader combining boundary & out-of-range SGPR, VGPR, and descriptor indices:
+        // - SMEM s_load_dwordx16 with sdata=104 (spans past s105), sdata=120 (>105), sbase=63 (63*2=126>107)
+        // - SOP1/SOP2 64-bit pair writes at sdst=105 and sdst=124
+        // - VOP3 64-bit pair writes at vdst=255 (255+1 overflows u8)
+        // - MIMG image_sample with vaddr=255, vdata=254, srsrc=31 (31*4=124>107), ssamp=31, dim=5 (2D-array)
+        // - MUBUF load/store dwordx4 with vaddr=255 (offen+idxen), vdata=254, srsrc=31, soffset=120
+        // - DS read/write b128 with addr=255, data0=254, vdst=254
+        // - workgroup_id_sgpr_base=Some(105) and Some(255)
+        let mut cs_words = Vec::new();
+        cs_words.extend_from_slice(&enc_smem(0x04, 104, 63, 120, 0x20, false, false));
+        cs_words.extend_from_slice(&enc_smem(0x04, 120, 63, 120, 0x00, false, false));
+        cs_words.push(enc_sop1(0x04, 105, 105)); // s_mov_b64 s[105:106], s[105:106]
+        cs_words.push(enc_sop1(0x04, 124, 127)); // s_mov_b64 null, exec_hi
+        cs_words.push(enc_sop2(0x0E, 105, 105, 255)); // s_and_b32 s105, s105, lit
+        cs_words.push(0x1234_5678);
+        cs_words.extend_from_slice(&enc_vop3(
+            0x2FF,
+            255,
+            128 + 1,
+            256 + 255,
+            0,
+            false,
+            0,
+            0,
+            0,
+        )); // v_lshlrev_b64 v[255:256], 1, v[255:256]
+        cs_words.extend_from_slice(&enc_vop3(
+            0x364,
+            255,
+            256 + 255,
+            256 + 255,
+            0,
+            false,
+            0,
+            0,
+            0,
+        )); // v_add_f64 v[255:256], v[255:256], v[255:256]
+        cs_words.extend_from_slice(&enc_mimg(0x20, 0xF, 5, 255, 254, 31, 31));
+        cs_words.extend_from_slice(&enc_mubuf_full(0x0F, 0, true, true, 255, 254, 31, 120)); // buffer_load_dwordx4
+        cs_words.extend_from_slice(&enc_mubuf_full(0x1F, 0, true, true, 255, 254, 31, 120)); // buffer_store_dwordx4
+        cs_words.extend_from_slice(&enc_ds(0xDF, 0, 0, 255, 254, 255, 254)); // ds_write_b128
+        cs_words.extend_from_slice(&enc_ds(0xFF, 0, 0, 255, 254, 255, 254)); // ds_read_b128
+        cs_words.push(enc_sopp(0x01, 0));
+
+        let cs_bytes = words_to_bytes(&cs_words);
+        for wg_base in [Some(105u8), Some(255u8)] {
+            let out = translate_rdna2_to_wgsl(
+                &cs_bytes,
+                &Rdna2TranslateOptions {
+                    stage: Rdna2StageOverride::Compute,
+                    workgroup_id_sgpr_base: wg_base,
+                    ..Rdna2TranslateOptions::default()
+                },
+            )
+            .expect("out-of-range compute register/descriptor indices must not panic");
+            assert!(out.naga_validated);
+            assert!(!out.wgsl.contains('\r'));
+            assert!(
+                !out.wgsl.contains("var s_106") && !out.wgsl.contains("var s_120"),
+                "out-of-range SGPRs (>105) must never be declared:\n{}",
+                out.wgsl
+            );
+            validate_emitted_wgsl_structure(&out.wgsl, &out.entry_point)
+                .expect("structural check must pass");
+            assert_naga_wgsl_valid(&out.wgsl);
+        }
+
+        // Fragment shader with out-of-range VINTRP attr (63) and out-of-range MRT export (target=7, 15).
+        let mut ps_words = Vec::new();
+        ps_words.push(enc_vintrp(0, 255, 63, 3, 0));
+        ps_words.extend_from_slice(&enc_exp(7, 0xF, false, false, true, [255, 255, 255, 255]));
+        ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [255, 255, 255, 255]));
+        ps_words.push(enc_sopp(0x01, 0));
+        let ps_out = translate_as(&ps_words, Rdna2StageOverride::Pixel);
+        assert!(ps_out.naga_validated);
+        assert!(!ps_out.wgsl.contains('\r'));
+        assert_naga_wgsl_valid(&ps_out.wgsl);
+
+        // Checked helper unit invariants.
+        assert_eq!(checked_vgpr_reg(255, 0), Some(255));
+        assert_eq!(checked_vgpr_reg(255, 1), None);
+        assert_eq!(checked_sgpr_reg(105, 0), Some(105));
+        assert_eq!(checked_sgpr_reg(105, 1), None);
+        assert_eq!(checked_sgpr_reg(200, 0), None);
+        assert_eq!(checked_descriptor_sgpr(26, 4), Some(104));
+        assert_eq!(checked_descriptor_sgpr(27, 4), None);
+        assert_eq!(checked_descriptor_sgpr(64, 4), None);
+        assert_eq!(checked_descriptor_sgpr(54, 2), None);
+    }
+
+    #[test]
+    fn s60_deterministic_repeated_codegen_bindings_and_json() {
+        // Multi-resource compute shader with multiple CBVs, sampled texture + sampler,
+        // read-only & read-write storage buffers, storage texture, LDS, and a conditional branch.
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x02, 12, 8, 0x7D, 0x00, false, false)); // cbA
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0x10, false, false)); // cbB
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 0, 4, 6, 3)); // sample tex/samp
+        words.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 4, 8, 0)); // image_store uav_tex
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 0, 8, 5, 0x7D)); // ro storage buf
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 8, 7, 0x7D)); // rw storage buf
+        words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 8, 0, 0)); // ds_write_b32
+        words.extend_from_slice(&enc_ds(0x36, 0, 0, 0, 0, 0, 9)); // ds_read_b32
+        words.push(enc_sopc(0x06, 12, 16)); // s_cmp_eq_u32
+        words.push(enc_sopp(0x04, 1)); // s_cbranch_scc0 +1
+        words.push(enc_vop2(0x03, 9, 256 + 8, 9)); // v_add_f32
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let opts = Rdna2TranslateOptions {
+            stage: Rdna2StageOverride::Compute,
+            ..Rdna2TranslateOptions::default()
+        };
+
+        let baseline = translate_rdna2_to_wgsl(&bytes, &opts).expect("baseline translation");
+        let baseline_json = baseline.to_json();
+        assert!(!baseline.wgsl.contains('\r'));
+        assert_naga_wgsl_valid(&baseline.wgsl);
+
+        // Verify strictly sorted, collision-free (group, binding) ordering.
+        let mut prev_key: Option<(u32, u32)> = None;
+        for b in &baseline.bindings {
+            let key = (b.group, b.binding);
+            if let Some(prev) = prev_key {
+                assert!(
+                    prev < key,
+                    "bindings must be strictly ascending without duplicates: {:?}",
+                    baseline.bindings
+                );
+            }
+            prev_key = Some(key);
+        }
+
+        // Repeat 10 times and assert byte-for-byte determinism across WGSL, bindings, and JSON.
+        for run in 0..10 {
+            let again = translate_rdna2_to_wgsl(&bytes, &opts)
+                .unwrap_or_else(|e| panic!("run {run} failed: {e}"));
+            assert_eq!(again.wgsl, baseline.wgsl, "WGSL diverged on run {run}");
+            assert_eq!(
+                again.bindings, baseline.bindings,
+                "bindings diverged on run {run}"
+            );
+            assert_eq!(
+                again.binding_summary, baseline.binding_summary,
+                "binding_summary diverged on run {run}"
+            );
+            assert_eq!(
+                again.to_json(),
+                baseline_json,
+                "JSON summary diverged on run {run}"
+            );
+        }
+    }
+
+    #[test]
+    fn s60_sanitize_wgsl_ident_handles_digits_keywords_and_reserved_prefixes() {
+        // Leading digits must never produce a digit-prefixed WGSL identifier.
+        assert_eq!(sanitize_wgsl_ident("123abc", "cs_main"), "abc");
+        assert_eq!(sanitize_wgsl_ident("12345", "cs_main"), "cs_main");
+        assert_eq!(sanitize_wgsl_ident("", "vs_main"), "vs_main");
+        assert_eq!(sanitize_wgsl_ident("_", "fs_main"), "fs_main");
+        assert_eq!(sanitize_wgsl_ident("__reserved", "cs_main"), "cs_main");
+        assert_eq!(sanitize_wgsl_ident("let", "cs_main"), "cs_main");
+        assert_eq!(sanitize_wgsl_ident("fn", "vs_main"), "vs_main");
+        assert_eq!(sanitize_wgsl_ident("Rdna2Cbv", "cs_main"), "cs_main");
+        assert_eq!(
+            sanitize_wgsl_ident("custom-entry.v2", "cs_main"),
+            "custom_entry_v2"
+        );
+        assert_eq!(sanitize_wgsl_ident("my-entry!", "cs_main"), "my_entry");
+        assert_eq!(sanitize_wgsl_ident("_leading", "cs_main"), "leading");
+
+        // End-to-end check: adversarial custom entry_point names still emit valid WGSL
+        // that round-trips through Naga WGSL front-end parsing.
+        let bytes = words_to_bytes(&[enc_sopp(0x01, 0)]);
+        for bad_name in [
+            "123abc",
+            "999",
+            "__bad",
+            "_leading",
+            "let",
+            "fn",
+            "struct",
+            "my-entry!",
+        ] {
+            let out = translate_rdna2_to_wgsl(
+                &bytes,
+                &Rdna2TranslateOptions {
+                    stage: Rdna2StageOverride::Compute,
+                    entry_point: Some(bad_name.to_string()),
+                    ..Rdna2TranslateOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("entry_point '{bad_name}' failed: {e}"));
+            assert!(out.naga_validated);
+            validate_emitted_wgsl_structure(&out.wgsl, &out.entry_point)
+                .expect("sanitized entry point must pass structural check");
+            assert_naga_wgsl_valid(&out.wgsl);
+        }
+    }
+
+    #[test]
+    fn s60_lf_newline_normalization_and_post_emit_structural_validator() {
+        // LF newline normalization.
+        assert_eq!(normalize_wgsl_newlines(""), "");
+        assert_eq!(
+            normalize_wgsl_newlines("line1\r\nline2\rline3"),
+            "line1\nline2\nline3\n"
+        );
+        assert_eq!(normalize_wgsl_newlines("already_lf\n"), "already_lf\n");
+
+        // Positive structural case: nested comments & function-scope `let` are allowed.
+        let good = "// let ignored_in_line_comment = 1;\n\
+                    /* outer /* nested let { ( [ */ comment */\n\
+                    @compute @workgroup_size(1, 1, 1)\n\
+                    fn cs_main() {\n\
+                        let local_ok = 1u;\n\
+                        return;\n\
+                    }\n";
+        assert!(validate_emitted_wgsl_structure(good, "cs_main").is_ok());
+
+        // Negative cases caught deterministically by post-emit structural validator.
+        assert!(validate_emitted_wgsl_structure("", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() {\r\n return;\r\n}\r\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { return; \n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { return; }}\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main( { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { var a: array<u32, 1; }\n", "cs_main").is_ok()); // angle brackets are not []
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { var x = a[0; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("/* unterminated fn cs_main() { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("let bad_global = 1u;\nfn cs_main() { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn other_main() { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { /* empty body */ }\n", "cs_main").is_err());
+    }
+
+    #[test]
+    fn s60_naga_wgsl_frontend_roundtrip_all_stages_and_structured_cf() {
+        // 1. Vertex shader with CBV + attribute fetch + position/param export.
+        let mut vs_words = Vec::new();
+        vs_words.extend_from_slice(&enc_mubuf(0x0E, 0, 1, 0, 0, true)); // buffer_load_dwordx3 v[1:3]
+        vs_words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0, false, false)); // s_load_dwordx4 s[12:15]
+        vs_words.push(enc_vop2(0x03, 1, 12, 1)); // v_add_f32 v1, s12, v1
+        vs_words.push(enc_vop1(0x01, 4, 242)); // v4 = 1.0
+        vs_words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [1, 2, 3, 4]));
+        vs_words.extend_from_slice(&enc_exp(32, 0x3, false, true, false, [1, 2, 0, 0]));
+        vs_words.push(enc_sopp(0x01, 0));
+
+        // 2. Fragment shader with VINTRP + MIMG + MRT0 + depth export.
+        let mut ps_words = Vec::new();
+        ps_words.push(enc_vintrp(0, 2, 0, 0, 0));
+        ps_words.push(enc_vintrp(1, 2, 0, 0, 1));
+        ps_words.push(enc_vintrp(0, 3, 0, 1, 0));
+        ps_words.push(enc_vintrp(1, 3, 0, 1, 1));
+        ps_words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 4, 2, 1));
+        ps_words.extend_from_slice(&enc_exp(8, 0x1, false, false, false, [4, 0, 0, 0])); // MrtZ
+        ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        ps_words.push(enc_sopp(0x01, 0));
+
+        // 3. Compute shader with structured if/else + loop + LDS + storage buffer.
+        let mut cs_words = Vec::new();
+        cs_words.push(enc_sop1(0x03, 4, 128 + 4)); // s4 = 4
+        cs_words.push(enc_sopc(0x06, 4, 128 + 0)); // s_cmp_eq_u32 s4, 0
+        cs_words.push(enc_sopp(0x05, 3)); // s_cbranch_scc1 +3 -> skip loop
+        cs_words.push(enc_sop2(0x01, 4, 4, 128 + 1)); // s4 -= 1
+        cs_words.push(enc_sopc(0x07, 4, 128 + 0)); // s_cmp_lg_u32 s4, 0
+        cs_words.push(enc_sopp(0x05, (-3i16) as u16)); // back-edge loop
+        cs_words.extend_from_slice(&enc_ds(0x0D, 0, 0, 0, 0, 0, 0)); // ds_write_b32
+        cs_words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 0, 4, 0x7D)); // buffer_store_dword
+        cs_words.push(enc_sopp(0x01, 0));
+
+        let cases = [
+            (&vs_words[..], Rdna2StageOverride::Vertex, NagaStage::Vertex, "vs_main"),
+            (&ps_words[..], Rdna2StageOverride::Pixel, NagaStage::Fragment, "fs_main"),
+            (&cs_words[..], Rdna2StageOverride::Compute, NagaStage::Compute, "cs_main"),
+        ];
+
+        for (words, stage_override, expected_naga_stage, expected_ep) in cases {
+            let out = translate_as(words, stage_override);
+            assert!(out.naga_validated);
+            assert_eq!(out.entry_point, expected_ep);
+            assert!(!out.wgsl.contains('\r'));
+            validate_emitted_wgsl_structure(&out.wgsl, &out.entry_point)
+                .expect("emitted WGSL must pass structural validation");
+
+            // Explicit Naga WGSL front-end round-trip parse + baseline WebGPU validation.
+            let reparsed = naga::front::wgsl::parse_str(&out.wgsl)
+                .unwrap_or_else(|e| panic!("WGSL round-trip parse failed for {expected_ep}:\n{}\n{}", e.emit_to_string(&out.wgsl), out.wgsl));
+            let mut validator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
+            validator
+                .validate(&reparsed)
+                .unwrap_or_else(|e| panic!("WGSL round-trip validate failed for {expected_ep}:\n{}\n{}", e.emit_to_string(&out.wgsl), out.wgsl));
+
+            assert_eq!(reparsed.entry_points.len(), 1);
+            assert_eq!(reparsed.entry_points[0].name, expected_ep);
+            assert_eq!(reparsed.entry_points[0].stage, expected_naga_stage);
+
+            let reparsed_binding_count = reparsed
+                .global_variables
+                .iter()
+                .filter(|(_, gv)| gv.binding.is_some())
+                .count();
+            assert_eq!(
+                reparsed_binding_count,
+                out.bindings.len(),
+                "reparsed @group/@binding count must match reflected bindings for {expected_ep}"
+            );
+        }
     }
 }
