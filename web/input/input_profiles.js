@@ -261,6 +261,20 @@ function validateAndNormalizeKeyBindings(rawBindings, contextLabel = 'keyBinding
   return normalized;
 }
 
+const PROFILE_NUMERIC_FIELD_LIMITS = Object.freeze([
+  Object.freeze(['mouseSensitivityX', PROFILE_LIMITS.MIN_SENSITIVITY, PROFILE_LIMITS.MAX_SENSITIVITY]),
+  Object.freeze(['mouseSensitivityY', PROFILE_LIMITS.MIN_SENSITIVITY, PROFILE_LIMITS.MAX_SENSITIVITY]),
+  Object.freeze(['leftStickDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE]),
+  Object.freeze(['rightStickDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE]),
+  Object.freeze(['triggerDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE]),
+]);
+
+const PROFILE_BOOLEAN_FIELDS = Object.freeze([
+  'invertLookY',
+  'swapSticks',
+  'swapTriggersAndBumpers',
+]);
+
 function validateAndNormalizeProfile(
   rawProfile,
   contextLabel = 'profile',
@@ -271,16 +285,8 @@ function validateAndNormalizeProfile(
   const id = validateProfileId(rawProfile.id, `${contextLabel}.id`);
   const name = validateProfileName(rawProfile.name, `${contextLabel}.name`);
 
-  const numericFields = [
-    ['mouseSensitivityX', PROFILE_LIMITS.MIN_SENSITIVITY, PROFILE_LIMITS.MAX_SENSITIVITY],
-    ['mouseSensitivityY', PROFILE_LIMITS.MIN_SENSITIVITY, PROFILE_LIMITS.MAX_SENSITIVITY],
-    ['leftStickDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE],
-    ['rightStickDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE],
-    ['triggerDeadzone', PROFILE_LIMITS.MIN_DEADZONE, PROFILE_LIMITS.MAX_DEADZONE],
-  ];
-
   const validatedNumbers = {};
-  for (const [field, min, max] of numericFields) {
+  for (const [field, min, max] of PROFILE_NUMERIC_FIELD_LIMITS) {
     const val = rawProfile[field];
     if (typeof val !== 'number' || !Number.isFinite(val)) {
       throw new TypeError(`${contextLabel}.${field} must be a finite number`);
@@ -293,8 +299,7 @@ function validateAndNormalizeProfile(
     validatedNumbers[field] = normalizeZero(clamp(val, min, max));
   }
 
-  const booleanFields = ['invertLookY', 'swapSticks', 'swapTriggersAndBumpers'];
-  for (const field of booleanFields) {
+  for (const field of PROFILE_BOOLEAN_FIELDS) {
     if (typeof rawProfile[field] !== 'boolean') {
       throw new TypeError(`${contextLabel}.${field} must be a boolean`);
     }
@@ -325,6 +330,118 @@ function validateAndNormalizeProfile(
     swapSticks: rawProfile.swapSticks,
     swapTriggersAndBumpers: rawProfile.swapTriggersAndBumpers,
   };
+}
+
+/**
+ * Strictly validates a partial custom profile override object.
+ * Rejects non-plain objects, prototype-pollution keys, unknown fields,
+ * control characters, out-of-range numeric settings, invalid curves,
+ * wrong types, and invalid DOM KeyboardEvent.code / INPUT_BUTTONS bindings.
+ */
+export function validateProfileOverrides(overrides, contextLabel = 'overrides') {
+  assertSafePlainObject(overrides, contextLabel, ALLOWED_PROFILE_FIELD_SET);
+
+  const validated = {};
+
+  if (Object.prototype.hasOwnProperty.call(overrides, 'id')) {
+    validated.id = validateProfileId(overrides.id, `${contextLabel}.id`);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(overrides, 'name')) {
+    validated.name = validateProfileName(overrides.name, `${contextLabel}.name`);
+  }
+
+  for (const [field, min, max] of PROFILE_NUMERIC_FIELD_LIMITS) {
+    if (!Object.prototype.hasOwnProperty.call(overrides, field)) continue;
+    const val = overrides[field];
+    if (typeof val !== 'number' || !Number.isFinite(val)) {
+      throw new TypeError(`${contextLabel}.${field} must be a finite number`);
+    }
+    if (val < min || val > max) {
+      throw new RangeError(
+        `${contextLabel}.${field} must be within [${min}, ${max}] (got ${val})`
+      );
+    }
+    validated[field] = normalizeZero(val);
+  }
+
+  for (const field of PROFILE_BOOLEAN_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(overrides, field)) continue;
+    const val = overrides[field];
+    if (typeof val !== 'boolean') {
+      throw new TypeError(`${contextLabel}.${field} must be a boolean`);
+    }
+    validated[field] = val;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(overrides, 'stickCurve')) {
+    if (typeof overrides.stickCurve !== 'string' || !VALID_CURVES.has(overrides.stickCurve)) {
+      throw new RangeError(
+        `${contextLabel}.stickCurve must be one of: ${[...VALID_CURVES].join(', ')}`
+      );
+    }
+    validated.stickCurve = overrides.stickCurve;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(overrides, 'keyBindings')) {
+    validated.keyBindings = validateAndNormalizeKeyBindings(
+      overrides.keyBindings,
+      `${contextLabel}.keyBindings`
+    );
+  }
+
+  return validated;
+}
+
+/**
+ * Safely merges validated custom profile overrides onto a built-in profile ID
+ * or validated base profile object without mutating either input.
+ * By default merges `keyBindings` (with mask `0` unbinding keys); pass
+ * `{ mergeKeyBindings: false }` to replace `keyBindings` wholesale.
+ */
+export function applyProfileOverrides(baseProfile, overrides, options = {}) {
+  const opts = isPlainObject(options) ? options : {};
+  const mergeKeyBindings = opts.mergeKeyBindings !== false;
+
+  let base;
+  if (typeof baseProfile === 'string') {
+    if (!Object.prototype.hasOwnProperty.call(BUILTIN_PROFILES, baseProfile)) {
+      throw new RangeError(`Unknown built-in input profile: ${baseProfile}`);
+    }
+    base = cloneProfile(BUILTIN_PROFILES[baseProfile]);
+  } else {
+    base = validateAndNormalizeProfile(baseProfile, 'baseProfile', { strict: true });
+  }
+
+  const validatedOverrides = validateProfileOverrides(overrides, 'overrides');
+
+  let keyBindings;
+  if (Object.prototype.hasOwnProperty.call(overrides, 'keyBindings')) {
+    if (mergeKeyBindings) {
+      const mergedBindings = { ...base.keyBindings };
+      for (const keyCode of Object.getOwnPropertyNames(overrides.keyBindings)) {
+        const mask = overrides.keyBindings[keyCode] >>> 0;
+        if (mask === 0) {
+          delete mergedBindings[keyCode];
+        } else {
+          mergedBindings[keyCode] = mask;
+        }
+      }
+      keyBindings = validateAndNormalizeKeyBindings(mergedBindings, 'profile.keyBindings');
+    } else {
+      keyBindings = validatedOverrides.keyBindings;
+    }
+  } else {
+    keyBindings = { ...base.keyBindings };
+  }
+
+  const merged = {
+    ...base,
+    ...validatedOverrides,
+    keyBindings,
+  };
+
+  return validateAndNormalizeProfile(merged, 'profile', { strict: true });
 }
 
 /**
@@ -507,6 +624,74 @@ function applyRadialStickCurve(x, y, curve, exponent) {
   };
 }
 
+/**
+ * Applies a circular (radial) stick deadzone followed by a symmetric radial
+ * response curve ('linear' | 'cubic' | 'expo'), matching InputBridge's
+ * outer deadzone normalization and clamping outputs cleanly onto the unit disk.
+ */
+export function applyRadialDeadzone(
+  x,
+  y,
+  deadzone = 0.15,
+  curve = RESPONSE_CURVES.LINEAR,
+  exponentOrOptions
+) {
+  if (!VALID_CURVES.has(curve)) {
+    throw new RangeError(`Unknown response curve: ${String(curve)}`);
+  }
+  if (
+    typeof x !== 'number' ||
+    !Number.isFinite(x) ||
+    typeof y !== 'number' ||
+    !Number.isFinite(y)
+  ) {
+    return { x: 0, y: 0 };
+  }
+
+  const inner = clamp(
+    typeof deadzone === 'number' && Number.isFinite(deadzone) ? deadzone : 0.15,
+    PROFILE_LIMITS.MIN_DEADZONE,
+    PROFILE_LIMITS.MAX_DEADZONE
+  );
+
+  let exponent;
+  let outer = 0.98;
+  if (typeof exponentOrOptions === 'number') {
+    exponent = exponentOrOptions;
+  } else if (isPlainObject(exponentOrOptions)) {
+    exponent = exponentOrOptions.exponent;
+    if (
+      typeof exponentOrOptions.outerDeadzone === 'number' &&
+      Number.isFinite(exponentOrOptions.outerDeadzone)
+    ) {
+      outer = exponentOrOptions.outerDeadzone;
+    }
+  }
+  outer = clamp(outer, inner + 1e-4, 1);
+
+  const mag = Math.hypot(x, y);
+  if (!Number.isFinite(mag)) {
+    const maxAbs = Math.max(Math.abs(x), Math.abs(y));
+    if (maxAbs <= 0) return { x: 0, y: 0 };
+    const sx = x / maxAbs;
+    const sy = y / maxAbs;
+    const smag = Math.hypot(sx, sy);
+    const curvedMag = applyResponseCurve(1, curve, exponent);
+    const scale = curvedMag / smag;
+    return {
+      x: normalizeZero(clamp(sx * scale, -1, 1)),
+      y: normalizeZero(clamp(sy * scale, -1, 1)),
+    };
+  }
+
+  const norm = applyDeadzone(x, y, inner, outer);
+  if (norm.x === 0 && norm.y === 0) {
+    return { x: 0, y: 0 };
+  }
+
+  return applyRadialStickCurve(norm.x, norm.y, curve, exponent);
+}
+
 const LEFTY_KB_BINDINGS = {
   KeyI: INPUT_BUTTONS.MOVE_FORWARD,
   KeyK: INPUT_BUTTONS.MOVE_BACKWARD,
@@ -527,6 +712,24 @@ const LEFTY_KB_BINDINGS = {
   ArrowDown: INPUT_BUTTONS.DPAD_DOWN,
   ArrowLeft: INPUT_BUTTONS.DPAD_LEFT,
   ArrowRight: INPUT_BUTTONS.DPAD_RIGHT,
+};
+
+const MENU_NAVIGATION_KB_BINDINGS = {
+  Enter: INPUT_BUTTONS.A,
+  NumpadEnter: INPUT_BUTTONS.A,
+  Space: INPUT_BUTTONS.A,
+  Escape: INPUT_BUTTONS.B,
+  Backspace: INPUT_BUTTONS.B,
+  ArrowUp: INPUT_BUTTONS.DPAD_UP,
+  ArrowDown: INPUT_BUTTONS.DPAD_DOWN,
+  ArrowLeft: INPUT_BUTTONS.DPAD_LEFT,
+  ArrowRight: INPUT_BUTTONS.DPAD_RIGHT,
+  KeyX: INPUT_BUTTONS.X,
+  KeyY: INPUT_BUTTONS.Y,
+  KeyQ: INPUT_BUTTONS.LB,
+  KeyE: INPUT_BUTTONS.RB,
+  Tab: INPUT_BUTTONS.VIEW,
+  KeyM: INPUT_BUTTONS.MENU,
 };
 
 export const BUILTIN_PROFILES = Object.freeze({
@@ -586,6 +789,20 @@ export const BUILTIN_PROFILES = Object.freeze({
     swapSticks: false,
     swapTriggersAndBumpers: false,
   }),
+  'menu-navigation': deepFreezeProfile({
+    id: 'menu-navigation',
+    name: 'Menu Navigation (Xbox Series)',
+    keyBindings: { ...MENU_NAVIGATION_KB_BINDINGS },
+    mouseSensitivityX: 1.0,
+    mouseSensitivityY: 1.0,
+    invertLookY: false,
+    leftStickDeadzone: 0.2,
+    rightStickDeadzone: 0.2,
+    triggerDeadzone: 0.1,
+    stickCurve: RESPONSE_CURVES.CUBIC,
+    swapSticks: false,
+    swapTriggersAndBumpers: false,
+  }),
 });
 
 /**
@@ -618,11 +835,8 @@ export function transformStickAxes(lx, ly, rx, ry, profile = BUILTIN_PROFILES.de
 
   const curve = VALID_CURVES.has(cfg.stickCurve) ? cfg.stickCurve : RESPONSE_CURVES.LINEAR;
 
-  const leftNorm = applyDeadzone(inLx, inLy, leftDz);
-  const rightNorm = applyDeadzone(inRx, inRy, rightDz);
-
-  const leftCurved = applyRadialStickCurve(leftNorm.x, leftNorm.y, curve);
-  const rightCurved = applyRadialStickCurve(rightNorm.x, rightNorm.y, curve);
+  const leftCurved = applyRadialDeadzone(inLx, inLy, leftDz, curve);
+  const rightCurved = applyRadialDeadzone(inRx, inRy, rightDz, curve);
 
   const outRy = cfg.invertLookY ? normalizeZero(-rightCurved.y) : rightCurved.y;
 
@@ -689,9 +903,14 @@ export class InputProfileManager {
   }
 
   createProfile(rawProfile) {
-    const normalized = validateAndNormalizeProfile(rawProfile, 'profile');
+    const normalized = validateAndNormalizeProfile(rawProfile, 'profile', { strict: true });
     if (this._profiles.has(normalized.id)) {
       throw new RangeError(`Input profile "${normalized.id}" already exists`);
+    }
+    if (this._profiles.size >= PROFILE_LIMITS.MAX_PROFILES) {
+      throw new RangeError(
+        `Cannot exceed max profile count of ${PROFILE_LIMITS.MAX_PROFILES}`
+      );
     }
     this._profiles.set(normalized.id, normalized);
     return cloneProfile(normalized);
@@ -699,15 +918,23 @@ export class InputProfileManager {
 
   updateProfile(profileId, patch) {
     const existing = this._requireProfile(profileId);
-    assertSafePlainObject(patch, 'patch');
+    const validatedPatch = validateProfileOverrides(patch, 'patch');
+    if (validatedPatch.id !== undefined && validatedPatch.id !== existing.id) {
+      throw new RangeError(
+        `Cannot change profile id from "${existing.id}" to "${validatedPatch.id}"`
+      );
+    }
     const merged = {
       ...cloneProfile(existing),
-      ...patch,
+      ...validatedPatch,
       id: existing.id,
-      keyBindings:
-        patch.keyBindings !== undefined ? patch.keyBindings : { ...existing.keyBindings },
+      keyBindings: Object.prototype.hasOwnProperty.call(validatedPatch, 'keyBindings')
+        ? validatedPatch.keyBindings
+        : { ...existing.keyBindings },
     };
-    const validated = validateAndNormalizeProfile(merged, `profile("${profileId}")`);
+    const validated = validateAndNormalizeProfile(merged, `profile("${profileId}")`, {
+      strict: true,
+    });
     this._profiles.set(existing.id, validated);
     return cloneProfile(validated);
   }
@@ -882,6 +1109,7 @@ export class InputProfileManager {
    */
   toInputBridgeOptions(profileId = this._activeProfileId, overrides = {}) {
     const profile = this._requireProfile(profileId);
+    assertSafePlainObject(overrides, 'overrides');
     const keyBindings = {};
     for (const defaultKey of Object.keys(DEFAULT_KEY_BINDINGS)) {
       keyBindings[defaultKey] = 0;
@@ -889,7 +1117,7 @@ export class InputProfileManager {
     Object.assign(keyBindings, profile.keyBindings);
 
     return {
-      ...(isPlainObject(overrides) ? overrides : {}),
+      ...overrides,
       keyBindings,
       stickDeadzone: profile.leftStickDeadzone,
       leftStickDeadzone: profile.leftStickDeadzone,

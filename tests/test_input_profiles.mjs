@@ -15,7 +15,10 @@ import {
   PROFILE_SCHEMA_VERSION,
   DEFAULT_STORAGE_KEY,
   applyResponseCurve,
+  applyRadialDeadzone,
   transformStickAxes,
+  validateProfileOverrides,
+  applyProfileOverrides,
   exportProfileJson,
   importProfileJson,
   detectBindingConflicts,
@@ -148,10 +151,10 @@ test('applyResponseCurve handles linear, cubic, expo, negative symmetry, clampin
   assert.throws(() => applyResponseCurve(0.5, 'invalid-curve'), RangeError);
 });
 
-test('BUILTIN_PROFILES defines default, southpaw, fps, and lefty-kb with frozen immutability', () => {
+test('BUILTIN_PROFILES defines default, southpaw, fps, lefty-kb, and menu-navigation with frozen immutability', () => {
   assert.deepEqual(
     Object.keys(BUILTIN_PROFILES).sort(),
-    ['default', 'fps', 'lefty-kb', 'southpaw']
+    ['default', 'fps', 'lefty-kb', 'menu-navigation', 'southpaw']
   );
 
   // Default matches InputBridge DEFAULT_KEY_BINDINGS and deadzones 100%
@@ -428,7 +431,7 @@ test('save, load, exportJson, and importJson persist state and strictly validate
   assert.equal(reader.getActiveProfile().swapTriggersAndBumpers, true);
   assert.equal(reader.getActiveProfile().mouseSensitivityX, 2.25);
   assert.equal(reader.getProfile('default').keyBindings.KeyT, INPUT_BUTTONS.X);
-  assert.equal(reader.listProfiles().length, 5);
+  assert.equal(reader.listProfiles().length, Object.keys(BUILTIN_PROFILES).length + 1);
 
   // Round-trip exportJson / importJson with out-of-range sensitivity/deadzone clamping
   const exported = JSON.parse(writer.exportJson());
@@ -911,4 +914,310 @@ test('safe fallback reset recovers cleanly from corrupted storage, throwing stor
   });
   assert.equal(autoRecovered.getActiveProfile().id, 'default');
   assert.equal(autoRecovered.listProfiles().length, Object.keys(BUILTIN_PROFILES).length);
+});
+
+test('applyRadialDeadzone enforces circular threshold, rotational/reflectional symmetry, curves, and unit-disk clamping', () => {
+  // Zero / inside circular deadzone -> exact +0 outputs
+  const zeroOut = applyRadialDeadzone(-0, -0, 0.15, RESPONSE_CURVES.LINEAR);
+  assert.ok(Object.is(zeroOut.x, 0));
+  assert.ok(Object.is(zeroOut.y, 0));
+  assert.deepEqual(applyRadialDeadzone(0.15, 0, 0.15, RESPONSE_CURVES.LINEAR), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(0.1, 0.1, 0.15, RESPONSE_CURVES.LINEAR), { x: 0, y: 0 });
+
+  // True radial (circular) threshold: (0.12, 0.12) has hypot ~0.1697 > 0.15 even though each axis < 0.15
+  const diagOutside = applyRadialDeadzone(0.12, 0.12, 0.15, RESPONSE_CURVES.LINEAR);
+  assert.ok(diagOutside.x > 0 && diagOutside.y > 0);
+  approxEqual(diagOutside.x, diagOutside.y);
+
+  // Zero deadzone lets tiny non-zero deflections through
+  const tinyOut = applyRadialDeadzone(0.01, 0, 0, RESPONSE_CURVES.LINEAR);
+  assert.ok(tinyOut.x > 0);
+  assert.equal(tinyOut.y, 0);
+
+  // Odd, axis-reflection, swap, and rotational symmetry across all response curves
+  const angles = [0, Math.PI / 6, Math.PI / 4, Math.PI / 3, Math.PI / 2, (3 * Math.PI) / 4, Math.PI, -Math.PI / 3];
+  for (const curve of Object.values(RESPONSE_CURVES)) {
+    const base = applyRadialDeadzone(0.45, 0.35, 0.15, curve);
+    const negBoth = applyRadialDeadzone(-0.45, -0.35, 0.15, curve);
+    const negX = applyRadialDeadzone(-0.45, 0.35, 0.15, curve);
+    const negY = applyRadialDeadzone(0.45, -0.35, 0.15, curve);
+    const swapped = applyRadialDeadzone(0.35, 0.45, 0.15, curve);
+
+    approxEqual(negBoth.x, -base.x);
+    approxEqual(negBoth.y, -base.y);
+    approxEqual(negX.x, -base.x);
+    approxEqual(negX.y, base.y);
+    approxEqual(negY.x, base.x);
+    approxEqual(negY.y, -base.y);
+    approxEqual(swapped.x, base.y);
+    approxEqual(swapped.y, base.x);
+
+    // Rotational invariance: output magnitude depends only on input radius, not angle
+    const radius = 0.6;
+    const expectedMag = Math.hypot(
+      applyRadialDeadzone(radius, 0, 0.15, curve).x,
+      applyRadialDeadzone(radius, 0, 0.15, curve).y
+    );
+    assert.ok(expectedMag > 0 && expectedMag < 1);
+    for (const theta of angles) {
+      const sample = applyRadialDeadzone(
+        radius * Math.cos(theta),
+        radius * Math.sin(theta),
+        0.15,
+        curve
+      );
+      approxEqual(Math.hypot(sample.x, sample.y), expectedMag, 1e-6);
+    }
+  }
+
+  // Response curve ordering at mid-deflection: cubic < expo(2) < linear
+  const midLinear = applyRadialDeadzone(0.55, 0, 0.15, RESPONSE_CURVES.LINEAR).x;
+  const midExpo = applyRadialDeadzone(0.55, 0, 0.15, RESPONSE_CURVES.EXPO).x;
+  const midCubic = applyRadialDeadzone(0.55, 0, 0.15, RESPONSE_CURVES.CUBIC).x;
+  assert.ok(midCubic > 0 && midCubic < midExpo && midExpo < midLinear && midLinear < 1);
+
+  // Custom exponent and outerDeadzone options
+  const customExpo = applyRadialDeadzone(0.6, 0, 0.2, RESPONSE_CURVES.EXPO, {
+    exponent: 2.5,
+    outerDeadzone: 1.0,
+  });
+  approxEqual(customExpo.x, Math.pow((0.6 - 0.2) / (1.0 - 0.2), 2.5));
+  assert.equal(customExpo.y, 0);
+
+  // Unit-disk clamping for diagonal corners, oversized inputs, and finite overflow
+  for (const curve of Object.values(RESPONSE_CURVES)) {
+    const corner = applyRadialDeadzone(1.0, 1.0, 0.15, curve);
+    approxEqual(corner.x, Math.SQRT1_2);
+    approxEqual(corner.y, Math.SQRT1_2);
+    approxEqual(Math.hypot(corner.x, corner.y), 1.0);
+
+    const huge = applyRadialDeadzone(5.0, -5.0, 0.15, curve);
+    approxEqual(huge.x, Math.SQRT1_2);
+    approxEqual(huge.y, -Math.SQRT1_2);
+    assert.ok(Math.hypot(huge.x, huge.y) <= 1 + 1e-12);
+
+    const overflow = applyRadialDeadzone(1e308, 1e308, 0.15, curve);
+    approxEqual(overflow.x, Math.SQRT1_2);
+    approxEqual(overflow.y, Math.SQRT1_2);
+  }
+
+  // Non-finite inputs return zero; out-of-range deadzone clamps safely; unknown curve throws
+  assert.deepEqual(applyRadialDeadzone(Number.NaN, 0.5, 0.15, RESPONSE_CURVES.LINEAR), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(0.5, Number.POSITIVE_INFINITY, 0.15, RESPONSE_CURVES.LINEAR), { x: 0, y: 0 });
+  assert.deepEqual(applyRadialDeadzone(0.5, 0, 1.5, RESPONSE_CURVES.LINEAR), { x: 0, y: 0 }); // clamps dz to 0.9
+  assert.ok(applyRadialDeadzone(0.95, 0, 1.5, RESPONSE_CURVES.LINEAR).x > 0);
+  assert.ok(applyRadialDeadzone(0.05, 0, -0.5, RESPONSE_CURVES.LINEAR).x > 0); // clamps dz to 0
+  assert.throws(() => applyRadialDeadzone(0.5, 0.5, 0.15, 'quartic'), RangeError);
+});
+
+test('menu-navigation built-in profile provides complete Xbox Series menu bindings and integrates with InputBridge', () => {
+  const menuProfile = BUILTIN_PROFILES['menu-navigation'];
+  assert.ok(menuProfile, 'menu-navigation preset must exist');
+  assert.equal(menuProfile.id, 'menu-navigation');
+  assert.equal(Object.isFrozen(menuProfile), true);
+  assert.equal(Object.isFrozen(menuProfile.keyBindings), true);
+
+  // Confirm (A) & Cancel/Back (B)
+  assert.equal(menuProfile.keyBindings.Enter, INPUT_BUTTONS.A);
+  assert.equal(menuProfile.keyBindings.NumpadEnter, INPUT_BUTTONS.A);
+  assert.equal(menuProfile.keyBindings.Space, INPUT_BUTTONS.A);
+  assert.equal(menuProfile.keyBindings.Escape, INPUT_BUTTONS.B);
+  assert.equal(menuProfile.keyBindings.Backspace, INPUT_BUTTONS.B);
+
+  // D-pad navigation via arrow keys
+  assert.equal(menuProfile.keyBindings.ArrowUp, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(menuProfile.keyBindings.ArrowDown, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(menuProfile.keyBindings.ArrowLeft, INPUT_BUTTONS.DPAD_LEFT);
+  assert.equal(menuProfile.keyBindings.ArrowRight, INPUT_BUTTONS.DPAD_RIGHT);
+
+  // Y/X shortcuts plus tab/system navigation (LB, RB, VIEW, MENU)
+  assert.equal(menuProfile.keyBindings.KeyX, INPUT_BUTTONS.X);
+  assert.equal(menuProfile.keyBindings.KeyY, INPUT_BUTTONS.Y);
+  assert.equal(menuProfile.keyBindings.KeyQ, INPUT_BUTTONS.LB);
+  assert.equal(menuProfile.keyBindings.KeyE, INPUT_BUTTONS.RB);
+  assert.equal(menuProfile.keyBindings.Tab, INPUT_BUTTONS.VIEW);
+  assert.equal(menuProfile.keyBindings.KeyM, INPUT_BUTTONS.MENU);
+
+  // Drift-resistant calibration deadzones & cubic response curve
+  assert.ok(menuProfile.leftStickDeadzone >= 0.2);
+  assert.ok(menuProfile.rightStickDeadzone >= 0.2);
+  assert.ok(menuProfile.triggerDeadzone >= 0.1);
+  assert.equal(menuProfile.stickCurve, RESPONSE_CURVES.CUBIC);
+
+  // Manager lifecycle & strict JSON round-trip
+  const manager = new InputProfileManager({ storage: null });
+  assert.throws(() => manager.deleteProfile('menu-navigation'), RangeError);
+  const exported = manager.exportProfileJson('menu-navigation');
+  const reimported = importProfileJson(exported);
+  assert.deepEqual(reimported, manager.getProfile('menu-navigation'));
+
+  // Direct InputBridge integration: every menu shortcut maps cleanly and gameplay-only WASD stays off
+  const env = createMockBridgeEnv();
+  const bridge = new InputBridge(
+    env.canvas,
+    manager.toInputBridgeOptions('menu-navigation', {
+      windowObj: env.win,
+      documentObj: env.doc,
+      navigatorObj: env.nav,
+    })
+  );
+
+  const menuChecks = [
+    ['Enter', INPUT_BUTTONS.A],
+    ['Space', INPUT_BUTTONS.A],
+    ['Escape', INPUT_BUTTONS.B],
+    ['Backspace', INPUT_BUTTONS.B],
+    ['ArrowUp', INPUT_BUTTONS.DPAD_UP],
+    ['ArrowDown', INPUT_BUTTONS.DPAD_DOWN],
+    ['ArrowLeft', INPUT_BUTTONS.DPAD_LEFT],
+    ['ArrowRight', INPUT_BUTTONS.DPAD_RIGHT],
+    ['KeyX', INPUT_BUTTONS.X],
+    ['KeyY', INPUT_BUTTONS.Y],
+    ['KeyQ', INPUT_BUTTONS.LB],
+    ['KeyE', INPUT_BUTTONS.RB],
+    ['Tab', INPUT_BUTTONS.VIEW],
+    ['KeyM', INPUT_BUTTONS.MENU],
+    ['KeyW', 0],
+  ];
+
+  for (const [code, expectedMask] of menuChecks) {
+    env.win.dispatch('keydown', { code });
+    assert.equal(
+      bridge.getSnapshot().buttons,
+      expectedMask,
+      `Expected ${code} to produce button mask 0x${expectedMask.toString(16)}`
+    );
+    env.win.dispatch('keyup', { code });
+    assert.equal(bridge.getSnapshot().buttons, 0);
+  }
+
+  bridge.destroy();
+});
+
+test('custom profile override validation accepts safe overrides and strictly rejects invalid overrides', () => {
+  // Valid partial overrides via validateProfileOverrides & applyProfileOverrides
+  const validPatch = validateProfileOverrides({
+    leftStickDeadzone: 0.22,
+    rightStickDeadzone: 0.18,
+    stickCurve: RESPONSE_CURVES.EXPO,
+    invertLookY: true,
+    keyBindings: {
+      KeyP: INPUT_BUTTONS.MENU,
+      Space: 0,
+    },
+  });
+  assert.equal(validPatch.leftStickDeadzone, 0.22);
+  assert.equal(validPatch.rightStickDeadzone, 0.18);
+  assert.equal(validPatch.stickCurve, RESPONSE_CURVES.EXPO);
+  assert.equal(validPatch.invertLookY, true);
+  assert.deepEqual(validPatch.keyBindings, { KeyP: INPUT_BUTTONS.MENU });
+
+  const mergedMenu = applyProfileOverrides('menu-navigation', {
+    id: 'custom-menu',
+    name: 'Custom Menu',
+    leftStickDeadzone: 0.25,
+    keyBindings: {
+      Space: 0,
+      KeyP: INPUT_BUTTONS.MENU,
+    },
+  });
+  assert.equal(mergedMenu.id, 'custom-menu');
+  assert.equal(mergedMenu.leftStickDeadzone, 0.25);
+  assert.equal(mergedMenu.keyBindings.Space, undefined, 'mask 0 unbinds key when merging');
+  assert.equal(mergedMenu.keyBindings.Enter, INPUT_BUTTONS.A, 'unrelated base bindings preserved');
+  assert.equal(mergedMenu.keyBindings.KeyP, INPUT_BUTTONS.MENU);
+  assert.equal(BUILTIN_PROFILES['menu-navigation'].keyBindings.Space, INPUT_BUTTONS.A);
+
+  const replacedMenu = applyProfileOverrides(
+    BUILTIN_PROFILES['menu-navigation'],
+    { keyBindings: { Enter: INPUT_BUTTONS.A } },
+    { mergeKeyBindings: false }
+  );
+  assert.deepEqual(replacedMenu.keyBindings, { Enter: INPUT_BUTTONS.A });
+
+  // Build prototype-pollution objects safely via Object.defineProperty / JSON.parse
+  const protoPolluteOverride = JSON.parse('{"__proto__":{"polluted":true},"leftStickDeadzone":0.2}');
+  const protoPolluteBindings = { keyBindings: JSON.parse('{"__proto__":1}') };
+  const tooManyBindings = {};
+  for (let i = 0; i <= PROFILE_LIMITS.MAX_KEY_BINDINGS; i++) {
+    tooManyBindings[`Key${String(i).padStart(2, '0')}`] = INPUT_BUTTONS.A;
+  }
+
+  const invalidOverrides = [
+    [null, TypeError],
+    [undefined, TypeError],
+    [[], TypeError],
+    ['invalid', TypeError],
+    [new Date(), TypeError],
+    // Prototype pollution & unknown fields
+    [protoPolluteOverride, RangeError],
+    [{ constructor: { polluted: true } }, RangeError],
+    [{ prototype: { polluted: true } }, RangeError],
+    [protoPolluteBindings, RangeError],
+    [{ unknownField: 123 }, RangeError],
+    // Out-of-range numeric settings
+    [{ leftStickDeadzone: -0.01 }, RangeError],
+    [{ leftStickDeadzone: PROFILE_LIMITS.MAX_DEADZONE + 0.05 }, RangeError],
+    [{ rightStickDeadzone: 1.0 }, RangeError],
+    [{ triggerDeadzone: -0.1 }, RangeError],
+    [{ triggerDeadzone: 0.95 }, RangeError],
+    [{ mouseSensitivityX: PROFILE_LIMITS.MIN_SENSITIVITY - 0.05 }, RangeError],
+    [{ mouseSensitivityY: PROFILE_LIMITS.MAX_SENSITIVITY + 1 }, RangeError],
+    // Wrong numeric/boolean/curve types
+    [{ leftStickDeadzone: Number.NaN }, TypeError],
+    [{ rightStickDeadzone: Number.POSITIVE_INFINITY }, TypeError],
+    [{ mouseSensitivityX: '1.5' }, TypeError],
+    [{ invertLookY: 'true' }, TypeError],
+    [{ swapSticks: 1 }, TypeError],
+    [{ swapTriggersAndBumpers: null }, TypeError],
+    [{ stickCurve: 'quartic' }, RangeError],
+    [{ stickCurve: 42 }, RangeError],
+    // Invalid id / name / keyBindings
+    [{ id: '../escape' }, RangeError],
+    [{ id: 'bad\nid' }, RangeError],
+    [{ name: '   ' }, TypeError],
+    [{ name: 'Bad\u0000Name' }, RangeError],
+    [{ keyBindings: null }, TypeError],
+    [{ keyBindings: [] }, TypeError],
+    [{ keyBindings: { badKey: INPUT_BUTTONS.A } }, RangeError],
+    [{ keyBindings: { KeyW: -1 } }, RangeError],
+    [{ keyBindings: { KeyW: 1.5 } }, RangeError],
+    [{ keyBindings: { KeyW: 1 << 6 } }, RangeError],
+    [{ keyBindings: { KeyW: 1 << 30 } }, RangeError],
+    [{ keyBindings: tooManyBindings }, RangeError],
+  ];
+
+  const manager = new InputProfileManager({ storage: null });
+  const snapshotBefore = manager.exportJson();
+
+  for (const [badOverride, expectedErr] of invalidOverrides) {
+    assert.throws(() => validateProfileOverrides(badOverride), expectedErr);
+    assert.throws(() => applyProfileOverrides('menu-navigation', badOverride), expectedErr);
+    assert.throws(() => manager.updateProfile('menu-navigation', badOverride), expectedErr);
+  }
+
+  // Attempting to change profile id via updateProfile is rejected
+  assert.throws(() => manager.updateProfile('menu-navigation', { id: 'renamed-id' }), RangeError);
+  // Unknown base profile ID on applyProfileOverrides throws
+  assert.throws(() => applyProfileOverrides('does-not-exist', {}), RangeError);
+  // createProfile also strictly rejects unknown fields and out-of-range deadzones
+  assert.throws(
+    () => manager.createProfile({ ...BUILTIN_PROFILES['menu-navigation'], id: 'bad-custom', unknownField: true }),
+    RangeError
+  );
+  assert.throws(
+    () => manager.createProfile({ ...BUILTIN_PROFILES['menu-navigation'], id: 'bad-dz', leftStickDeadzone: 1.2 }),
+    RangeError
+  );
+  // toInputBridgeOptions rejects non-object or prototype-polluting overrides
+  assert.throws(() => manager.toInputBridgeOptions('menu-navigation', null), TypeError);
+  assert.throws(
+    () => manager.toInputBridgeOptions('menu-navigation', JSON.parse('{"__proto__":{"polluted":true}}')),
+    RangeError
+  );
+
+  // Zero prototype pollution and zero manager state mutation after all rejected calls
+  assert.equal(({}).polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined);
+  assert.equal(manager.exportJson(), snapshotBefore);
 });
