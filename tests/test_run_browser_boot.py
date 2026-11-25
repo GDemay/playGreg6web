@@ -2214,5 +2214,311 @@ class HudMp4AndNewPresetsTests(unittest.TestCase):
             self.assertEqual(cmd_meta["input_script"], "legal-notices")
 
 
+class ChromeFullBootGpuAdapterAndMp4HardeningTests(unittest.TestCase):
+    def test_chrome_full_boot_registered_in_aliases_cli_and_help(self):
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-full-boot"), "chrome-full-boot")
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-full-boot"), "chrome-full-boot")
+        self.assertEqual(rbb.sanitize_input_script_preset("chrome-full-boot"), "chrome-full-boot")
+        self.assertEqual(rbb.sanitize_input_script_preset("  CHROME-FULL-BOOT  "), "chrome-full-boot")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="chrome-full-boot"),
+            "http://127.0.0.1:8080/?inputScript=chrome-full-boot",
+        )
+
+        help_text = rbb.build_arg_parser().format_help()
+        self.assertIn("chrome-full-boot", help_text)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-chrome-full-boot",
+                "--input-script",
+                "chrome-full-boot",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["input_script"], "chrome-full-boot")
+            self.assertEqual(payload["inputScript"], "chrome-full-boot")
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=chrome-full-boot",
+            )
+
+    def test_gpu_adapter_extraction_and_sanitization(self):
+        self.assertEqual(rbb.sanitize_gpu_adapter("nvidia / turing"), "nvidia / turing")
+        self.assertEqual(rbb.sanitize_gpu_adapter("Intel / Gen-12LP"), "intel / gen-12lp")
+        self.assertEqual(rbb.sanitize_gpu_adapter("  AMD / RDNA-2  "), "amd / rdna-2")
+
+        # Strips Windows, UNC, and POSIX host paths as well as control/unsafe characters
+        dirty_win = r"NVIDIA / Turing / C:\Users\secretuser\drivers\nv.dll"
+        self.assertEqual(rbb.sanitize_gpu_adapter(dirty_win), "nvidia / turing")
+        dirty_unc = r"Intel / Gen-12LP / \\fileserver\share\driver.bin"
+        self.assertEqual(rbb.sanitize_gpu_adapter(dirty_unc), "intel / gen-12lp")
+        dirty_posix = "AMD / RDNA-3 / /home/alice/mesa/libvulkan.so"
+        self.assertEqual(rbb.sanitize_gpu_adapter(dirty_posix), "amd / rdna-3")
+        self.assertEqual(rbb.sanitize_gpu_adapter("nvidia / turing\ninjected: bad"), "nvidia / turing")
+
+        # Pure host paths or empty/non-string inputs resolve cleanly to None
+        for bad in (
+            None,
+            123,
+            "",
+            "   ",
+            r"C:\Users\secretuser\gpu.dll",
+            "/Users/alice/local/gpu",
+            "///...",
+        ):
+            self.assertIsNone(rbb.sanitize_gpu_adapter(bad), f"expected None for {bad!r}")
+
+        # Enforces max 96-character bound without trailing slash/space
+        overlong = "nvidia / turing / " + ("geforce-rtx " * 20)
+        sanitized_long = rbb.sanitize_gpu_adapter(overlong)
+        self.assertIsNotNone(sanitized_long)
+        assert sanitized_long is not None
+        self.assertLessEqual(len(sanitized_long), 96)
+        self.assertFalse(sanitized_long.endswith(("/", " ")))
+
+        # Console line extraction picks the latest valid [wgpu_worker] WebGPU adapter line
+        lines = [
+            "[   0.10s] [console.log] booting",
+            "[   0.55s] [console.info] [wgpu_worker] WebGPU adapter: Intel / Gen-12LP",
+            "[   1.20s] [console.info] [wgpu_worker] WebGPU adapter: NVIDIA / Turing / C:\\Users\\bob\\nv.dll",
+            "[   1.30s] [console.info] [wgpu_worker] WebGPU adapter:    ",
+        ]
+        self.assertEqual(rbb.extract_gpu_adapter_from_console_lines(lines), "nvidia / turing")
+        self.assertIsNone(rbb.extract_gpu_adapter_from_console_lines(["[   0.10s] [console.log] no adapter"]))
+
+    def test_gpu_adapter_surfaced_in_session_telemetry_report_and_digest(self):
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "t56-sess"
+            run_dir.mkdir(parents=True)
+            emitted = {"done": False}
+            fake_clock = {"t": 3000.0}
+
+            class FakeCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": make_sample_probe(presents=2, real_draws=4, fallback_draws=0)}}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    fake_clock["t"] += 0.1
+                    if not emitted["done"]:
+                        emitted["done"] = True
+                        return [
+                            {
+                                "method": "Runtime.consoleAPICalled",
+                                "params": {
+                                    "type": "info",
+                                    "args": [{"value": "[wgpu_worker] WebGPU adapter: Intel / Gen-12LP"}],
+                                },
+                            }
+                        ]
+                    return []
+
+            with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=None,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=0.15,
+                    headless=True,
+                    smoke=True,
+                    send_input=False,
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=FakeCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            self.assertEqual(sess.gpu_adapter, "intel / gen-12lp")
+
+            # End-to-end CLI artifact output (telemetry.json, boot-report.json, digest.txt)
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t56-cli-adapter",
+                "--input-script",
+                "chrome-full-boot",
+                session_runner=lambda **kw: sess,
+            )
+            self.assertEqual(code, 0, err)
+            cli_dir = fx.build / "runs" / "t56-cli-adapter"
+            telemetry = json.loads((cli_dir / "telemetry.json").read_text(encoding="utf-8"))
+            report = json.loads((cli_dir / "boot-report.json").read_text(encoding="utf-8"))
+            digest_text = (cli_dir / "digest.txt").read_text(encoding="utf-8")
+
+            self.assertEqual(telemetry["gpu_adapter"], "intel / gen-12lp")
+            self.assertEqual(telemetry["summary"]["gpu_adapter"], "intel / gen-12lp")
+            self.assertEqual(report["gpu_adapter"], "intel / gen-12lp")
+            self.assertEqual(report["summary"]["gpu_adapter"], "intel / gen-12lp")
+            self.assertIn("gpu_adapter: intel / gen-12lp", digest_text)
+            self.assertIn("gpu_adapter: intel / gen-12lp", out)
+            self.assertIn("input_script: chrome-full-boot", digest_text)
+
+            # Console-only fallback when BrowserSessionResult.gpu_adapter is left None
+            console_only_session = make_fake_session_result(
+                console_lines=[
+                    "[   0.42s] [console.info] [wgpu_worker] WebGPU adapter: nvidia / turing",
+                ]
+            )
+            self.assertIsNone(console_only_session.gpu_adapter)
+            rep_console = rbb.build_boot_report(console_only_session, smoke=True, preset="smoke")
+            tel_console = rbb.build_telemetry_payload(
+                console_only_session, smoke=True, preset="smoke", headless=True
+            )
+            self.assertEqual(rep_console["gpu_adapter"], "nvidia / turing")
+            self.assertEqual(rep_console["summary"]["gpu_adapter"], "nvidia / turing")
+            self.assertEqual(tel_console["gpu_adapter"], "nvidia / turing")
+            self.assertIn("gpu_adapter: nvidia / turing", rbb.digest(rep_console, 0))
+
+            # Omitted from digest.txt and summary when not detected
+            no_adapter_session = make_fake_session_result(console_lines=["[   0.10s] [console.log] ready"])
+            rep_none = rbb.build_boot_report(no_adapter_session, smoke=True, preset="smoke")
+            tel_none = rbb.build_telemetry_payload(no_adapter_session, smoke=True, preset="smoke", headless=True)
+            self.assertIsNone(rep_none["gpu_adapter"])
+            self.assertNotIn("gpu_adapter", rep_none["summary"])
+            self.assertIsNone(tel_none["gpu_adapter"])
+            self.assertNotIn("gpu_adapter", tel_none["summary"])
+            self.assertNotIn("gpu_adapter:", rbb.digest(rep_none, 0))
+
+    def test_encode_frames_to_mp4_filters_zero_byte_and_truncated_trailing_pngs(self):
+        black_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 0, 0))
+        lit_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (20, 180, 90) if x >= 410 else (0, 0, 0))
+        truncated_png = lit_png[: len(lit_png) // 2]  # valid PNG header, missing IEND
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+
+            # 1. Trailing 0-byte PNG is excluded before ffmpeg runs (would otherwise exit -28)
+            dir_zero = root / "trailing_zero"
+            dir_zero.mkdir()
+            (dir_zero / "frame_0001.png").write_bytes(black_png)
+            (dir_zero / "frame_0002.png").write_bytes(lit_png)
+            (dir_zero / "frame_0003.png").write_bytes(b"")  # 0-byte trailing frame
+
+            seen_stage_files: list[list[str]] = []
+            seen_stage_dirs: list[Path] = []
+            ffmpeg_cmds: list[list[str]] = []
+
+            def strict_fake_ffmpeg(cmd, cwd, log, timeout):
+                ffmpeg_cmds.append(list(cmd))
+                input_pat = Path(cmd[cmd.index("-i") + 1])
+                stage_dir = input_pat.parent
+                seen_stage_dirs.append(stage_dir)
+                staged = sorted(stage_dir.glob("frame_*.png"))
+                seen_stage_files.append([p.name for p in staged])
+                # Simulate real ffmpeg failing with -28 (4294967268) if any 0-byte/truncated frame is present
+                for frame in staged:
+                    data = frame.read_bytes()
+                    if not data or not data.endswith(rbb._PNG_IEND_CHUNK):
+                        return 4294967268
+                Path(cmd[-1]).write_bytes(b"ftypmp42")
+                return 0
+
+            ok, warn = rbb.encode_frames_to_mp4(
+                dir_zero,
+                root / "trailing_zero.mp4",
+                fps=2.0,
+                skip_black=True,
+                canvas_min_x=rbb.CANVAS_MIN_X,
+                pil_image_mod=_FakePilModule,
+                _auto_import_pil=False,
+                runner=strict_fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok, warn)
+            self.assertEqual(seen_stage_files[-1], ["frame_0001.png", "frame_0002.png"])
+            self.assertEqual(ffmpeg_cmds[-1][ffmpeg_cmds[-1].index("-start_number") + 1], "2")
+            # Temporary staging directory is cleaned up after encoding
+            self.assertFalse(seen_stage_dirs[-1].exists())
+
+            # 2. Trailing truncated PNG (partial write without IEND) is also excluded
+            dir_trunc = root / "trailing_trunc"
+            dir_trunc.mkdir()
+            (dir_trunc / "frame_0001.png").write_bytes(lit_png)
+            (dir_trunc / "frame_0002.png").write_bytes(truncated_png)
+            (dir_trunc / "frame_0003.png").write_bytes(b"")
+
+            ok2, warn2 = rbb.encode_frames_to_mp4(
+                dir_trunc,
+                root / "trailing_trunc.mp4",
+                fps=1.0,
+                runner=strict_fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok2, warn2)
+            self.assertEqual(seen_stage_files[-1], ["frame_0001.png"])
+
+            # 3. Middle 0-byte PNG is skipped and remaining frames are staged contiguously
+            dir_mid = root / "mid_zero"
+            dir_mid.mkdir()
+            (dir_mid / "frame_0001.png").write_bytes(lit_png)
+            (dir_mid / "frame_0002.png").write_bytes(b"")
+            (dir_mid / "frame_0003.png").write_bytes(lit_png)
+
+            ok3, warn3 = rbb.encode_frames_to_mp4(
+                dir_mid,
+                root / "mid_zero.mp4",
+                fps=1.0,
+                runner=strict_fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok3, warn3)
+            self.assertEqual(seen_stage_files[-1], ["frame_0001.png", "frame_0002.png"])
+
+            # 4. All-zero/corrupt frames return a clean warning without invoking ffmpeg
+            dir_all_bad = root / "all_bad"
+            dir_all_bad.mkdir()
+            (dir_all_bad / "frame_0001.png").write_bytes(b"")
+            (dir_all_bad / "frame_0002.png").write_bytes(truncated_png)
+            calls_before = len(ffmpeg_cmds)
+            ok4, warn4 = rbb.encode_frames_to_mp4(
+                dir_all_bad,
+                root / "all_bad.mp4",
+                fps=1.0,
+                runner=strict_fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertFalse(ok4)
+            self.assertIn("no valid captured frames", warn4 or "")
+            self.assertEqual(len(ffmpeg_cmds), calls_before)
+
+
 if __name__ == "__main__":
     unittest.main()
