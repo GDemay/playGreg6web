@@ -1849,3 +1849,420 @@ test('RpfVfsMountTable O(1) normalized-path index, negative LRU eviction, and mo
     assert.ok(Number.isFinite(val) && val >= 0);
   }
 });
+
+test('RpfArchiveVfs W322 zero-alloc resolveByHashFast, statEntryFast, batchStat, negative-cache & resetStats()', async () => {
+  const hudData = 'HUD_BOOT_TEXTURE_DATA';
+  const fontData = 'FONT_MENU_GLYPHS_0123';
+  const hexNamedData = 'FILE_NAMED_DEADBEEF';
+
+  const archive = buildSyntheticRpf9Buffer([
+    { path: 'x64/textures/hud.ytd', data: hudData, isResource: true },
+    { path: 'x64/ui/fonts/menu.gfx', data: fontData },
+    { path: 'deadbeef', data: hexNamedData },
+  ]);
+
+  const vfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(archive).readRange,
+    archive.byteLength,
+    {
+      archivePath: '/private_host/w322_boot.rpf',
+      pathCacheCapacity: 8,
+      maxNegativeEntries: 4,
+    }
+  );
+
+  // Initial W322 telemetry fields are present and zero.
+  const initStats = vfs.getStats();
+  assert.equal(initStats.fastHashHits, 0);
+  assert.equal(initStats.batchStatCalls, 0);
+  assert.equal(initStats.batchStatHits, 0);
+
+  const hudHash = hashVirtualPath('x64/textures/hud.ytd');
+  const fontHash = hashVirtualPath('x64/ui/fonts/menu.gfx');
+  const dirHash = hashVirtualPath('x64/textures');
+  const rootHash = hashVirtualPath('');
+  const hudHex = `0x${hudHash.toString(16).padStart(8, '0')}`;
+
+  // 1. resolveByHashFast without `out` matches resolveByHash() return shape exactly.
+  const defaultFast = vfs.resolveByHashFast(hudHash);
+  const defaultLegacy = vfs.resolveByHash(hudHash);
+  assert.deepEqual(defaultFast, defaultLegacy);
+  assert.equal(vfs.getStats().fastHashHits, 1);
+
+  // 2. resolveByHashFast with BigInt u32, hex string, and reusable `out` scratch object.
+  const scratch = {};
+  const r1 = vfs.resolveByHashFast(BigInt(hudHash), scratch);
+  assert.equal(r1, scratch);
+  assert.equal(r1.path, 'x64/textures/hud.ytd');
+  assert.equal(r1.pathHash, hudHash);
+  assert.equal(r1.collisionCount, 0);
+  assert.equal(r1.stat.isFile, true);
+  assert.equal(r1.stat.isResource, true);
+  assert.equal(r1.stat.size, hudData.length);
+  const reusedStatObj = r1.stat;
+
+  // Reusing `scratch` reuses both `scratch` and `scratch.stat` with zero new object allocations.
+  const r2 = vfs.resolveByHashFast(fontHash, scratch);
+  assert.equal(r2, scratch);
+  assert.equal(r2.stat, reusedStatObj);
+  assert.equal(r2.path, 'x64/ui/fonts/menu.gfx');
+  assert.equal(r2.stat.size, fontData.length);
+  assert.equal(r2.stat.isResource, false);
+
+  // Switching reused scratch from file -> directory clears stale file-only fields cleanly.
+  const rDir = vfs.resolveByHashFast(dirHash, scratch);
+  assert.equal(rDir, scratch);
+  assert.equal(rDir.stat, reusedStatObj);
+  assert.equal(rDir.stat.kind, 'directory');
+  assert.equal(rDir.stat.isDirectory, true);
+  assert.equal(rDir.stat.isFile, false);
+  assert.equal(rDir.stat.childCount, 1);
+  assert.equal(rDir.stat.dataOffset, undefined);
+  assert.equal(rDir.stat.size, undefined);
+
+  // Switching back to file clears directory-only fields cleanly.
+  const rFileAgain = vfs.resolveByHashFast(hudHex, scratch);
+  assert.equal(rFileAgain, scratch);
+  assert.equal(rFileAgain.stat, reusedStatObj);
+  assert.equal(rFileAgain.stat.isFile, true);
+  assert.equal(rFileAgain.stat.firstChildIndex, undefined);
+  assert.equal(rFileAgain.stat.childCount, undefined);
+
+  // Pre-allocated { stat: preStat } reuses preStat on the very first call (including root hash 0n).
+  const preStat = {};
+  const preOut = { stat: preStat };
+  const rRoot = vfs.resolveByHashFast(BigInt(rootHash), preOut);
+  assert.equal(rRoot, preOut);
+  assert.equal(rRoot.stat, preStat);
+  assert.equal(rRoot.stat.isDirectory, true);
+
+  // Hash miss returns null, increments lookupMisses, does NOT increment fastHashHits.
+  const hitsBeforeMiss = vfs.getStats().fastHashHits;
+  assert.equal(vfs.resolveByHashFast(0xdeadc0de, scratch), null);
+  assert.equal(vfs.resolveByHashFast(0xdeadc0den, scratch), null);
+  assert.equal(vfs.getStats().fastHashHits, hitsBeforeMiss);
+
+  // Invalid hashes (including negative/out-of-range BigInt and NUL-prefixed strings) throw INVALID_HASH.
+  for (const badHash of [-1, -1n, 0x100000000, 0x100000000n, 1.5, NaN, 'not-a-hash', '0x123456789', '\0deadbeef', {}]) {
+    assert.throws(
+      () => vfs.resolveByHashFast(badHash, scratch),
+      (err) => err instanceof RpfFormatError && err.code === 'INVALID_HASH'
+    );
+  }
+
+  // Synthetic hash collision count updated accurately on reused scratch and reset to 0 on next non-colliding lookup.
+  const nodeHud = vfs._nodesByKey.get('x64/textures/hud.ytd');
+  const nodeFont = vfs._nodesByKey.get('x64/ui/fonts/menu.gfx');
+  const collHash = 0x55aa55aa;
+  vfs._nodesByHash.set(collHash, [nodeHud, nodeFont]);
+  const rColl = vfs.resolveByHashFast(collHash, scratch);
+  assert.equal(rColl, scratch);
+  assert.equal(rColl.collisionCount, 1);
+  const rNonColl = vfs.resolveByHashFast(hudHash, scratch);
+  assert.equal(rNonColl.collisionCount, 0);
+  vfs._nodesByHash.delete(collHash);
+
+  // 3. statEntryFast: default return shape parity, scratch reuse, path & hash discrimination, negative cache.
+  assert.deepEqual(vfs.statEntryFast('x64/textures/hud.ytd'), vfs.stat('x64/textures/hud.ytd'));
+  assert.deepEqual(vfs.statEntryFast(hudHash), vfs.stat('x64/textures/hud.ytd'));
+  assert.deepEqual(vfs.statEntryFast(BigInt(fontHash)), vfs.stat('x64/ui/fonts/menu.gfx'));
+  assert.deepEqual(vfs.statEntryFast(hudHex), vfs.stat('x64/textures/hud.ytd'));
+
+  // Non-0x hex-looking filename resolves as a path (not misclassified as a hash).
+  const statScratch = {};
+  const stHexFile = vfs.statEntryFast('deadbeef', statScratch);
+  assert.equal(stHexFile, statScratch);
+  assert.equal(stHexFile.path, 'deadbeef');
+  assert.equal(stHexFile.size, hexNamedData.length);
+
+  // Reusing statScratch across mixed-case/backslash path, directory, and hash probes.
+  const stDir = vfs.statEntryFast('\\X64\\Textures\\', statScratch);
+  assert.equal(stDir, statScratch);
+  assert.equal(stDir.isDirectory, true);
+  assert.equal(stDir.size, undefined);
+  assert.equal(stDir.dataOffset, undefined);
+
+  const stByHash = vfs.statEntryFast(BigInt(hudHash), statScratch);
+  assert.equal(stByHash, statScratch);
+  assert.equal(stByHash.isFile, true);
+  assert.equal(stByHash.size, hudData.length);
+  assert.equal(stByHash.childCount, undefined);
+
+  // Missing path via statEntryFast populates & hits bounded negative cache; traversal throws INVALID_PATH.
+  assert.equal(vfs.statEntryFast('x64/missing/fast_probe.ytd', statScratch), null);
+  const negHitsBefore = vfs.getStats().negativeLookupHits;
+  assert.equal(vfs.statEntryFast('\\X64\\Missing\\FAST_PROBE.YTD', statScratch), null);
+  assert.equal(vfs.getStats().negativeLookupHits, negHitsBefore + 1);
+  assert.throws(
+    () => vfs.statEntryFast('../escape/boot.ytd', statScratch),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+  assert.throws(
+    () => vfs.statEntryFast('x64/bad\0entry.ytd', statScratch),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+
+  // 4. batchStat(): single-pass resolution with O(1) index hits + bounded negative-cache hits + scratch array reuse.
+  vfs.clearCaches();
+  vfs.resetStats();
+
+  const batchPaths = [
+    'x64/textures/hud.ytd',
+    '\\X64\\UI\\Fonts\\MENU.GFX',
+    'x64/missing/boot_a.ytd',
+    'X64\\MISSING\\BOOT_A.YTD', // duplicate miss in same batch -> hits negative cache!
+    BigInt(hudHash),
+    'x64/textures',
+    'x64/missing/boot_b.ytd',
+  ];
+  const batchRes1 = vfs.batchStat(batchPaths);
+  assert.equal(batchRes1.length, batchPaths.length);
+  assert.equal(batchRes1[0].path, 'x64/textures/hud.ytd');
+  assert.equal(batchRes1[1].path, 'x64/ui/fonts/menu.gfx');
+  assert.equal(batchRes1[2], null);
+  assert.equal(batchRes1[3], null);
+  assert.equal(batchRes1[4].path, 'x64/textures/hud.ytd');
+  assert.equal(batchRes1[5].isDirectory, true);
+  assert.equal(batchRes1[6], null);
+
+  const afterBatch1 = vfs.getStats();
+  assert.equal(afterBatch1.batchStatCalls, 1);
+  assert.equal(afterBatch1.batchStatHits, 4);
+  assert.equal(afterBatch1.fastHashHits, 1);
+  assert.equal(afterBatch1.negativeLookupEntries, 2);
+  assert.equal(afterBatch1.negativeLookupHits, 1);
+
+  // Second pass with pre-allocated scratch output array reuses slot objects and hits positive + negative caches.
+  const slot0 = {};
+  const slot1 = {};
+  const batchOut = [slot0, slot1];
+  const batchRes2 = vfs.batchStat(
+    ['x64/textures/hud.ytd', 'x64/ui/fonts/menu.gfx', 'x64/missing/boot_a.ytd', 'x64/missing/boot_b.ytd'],
+    batchOut
+  );
+  assert.equal(batchRes2, batchOut);
+  assert.equal(batchRes2.length, 4);
+  assert.equal(batchRes2[0], slot0);
+  assert.equal(batchRes2[1], slot1);
+  assert.equal(batchRes2[2], null);
+  assert.equal(batchRes2[3], null);
+
+  const afterBatch2 = vfs.getStats();
+  assert.equal(afterBatch2.batchStatCalls, 2);
+  assert.equal(afterBatch2.batchStatHits, 6);
+  assert.equal(afterBatch2.negativeLookupHits, 3);
+  assert.ok(afterBatch2.tocCacheHits >= 4);
+
+  // Iterable (Set) and empty/null inputs work cleanly; non-iterable throws INVALID_PATH.
+  const setRes = vfs.batchStat(new Set(['x64/textures/hud.ytd', 'x64/missing/boot_c.ytd']));
+  assert.equal(setRes.length, 2);
+  assert.equal(setRes[0].path, 'x64/textures/hud.ytd');
+  assert.equal(setRes[1], null);
+  assert.deepEqual(vfs.batchStat([]), []);
+  assert.deepEqual(vfs.batchStat(null), []);
+  assert.throws(
+    () => vfs.batchStat(12345),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+  assert.throws(
+    () => vfs.batchStat(['x64/textures/hud.ytd', '../escape.ytd']),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+
+  // Strict numeric-only sanitization before resetStats().
+  const preResetStats = vfs.getStats();
+  for (const [key, val] of Object.entries(preResetStats)) {
+    assert.equal(typeof val, 'number', `RpfArchiveVfs.getStats().${key} must be numeric`);
+    assert.ok(Number.isFinite(val) && val >= 0);
+  }
+  assert.equal(JSON.stringify(preResetStats).includes('private_host'), false);
+
+  // 5. resetStats() clears W322 + W270 telemetry counters while preserving caches & index.
+  vfs.resetStats();
+  const afterResetStats = vfs.getStats();
+  assert.equal(afterResetStats.fastHashHits, 0);
+  assert.equal(afterResetStats.batchStatCalls, 0);
+  assert.equal(afterResetStats.batchStatHits, 0);
+  assert.equal(afterResetStats.lookupHits, 0);
+  assert.equal(afterResetStats.lookupMisses, 0);
+  assert.equal(afterResetStats.pathIndexHits, 0);
+  assert.equal(afterResetStats.negativeLookupHits, 0);
+  assert.ok(afterResetStats.indexedEntries >= 6);
+  assert.ok(afterResetStats.negativeLookupEntries >= 2);
+
+  // reset() clears both caches and all telemetry counters.
+  vfs.reset();
+  const afterFullReset = vfs.getStats();
+  assert.equal(afterFullReset.fastHashHits, 0);
+  assert.equal(afterFullReset.batchStatCalls, 0);
+  assert.equal(afterFullReset.batchStatHits, 0);
+  assert.equal(afterFullReset.negativeLookupEntries, 0);
+  assert.equal(afterFullReset.resolvedPathCacheSize, 0);
+});
+
+test('RpfVfsMountTable W322 zero-alloc resolveByHashFast, statEntryFast, batchStat, override & resetStats()', async () => {
+  const baseBuf = buildSyntheticRpf9Buffer([
+    { path: 'textures/hud.ytd', data: 'MOUNT_HUD_V1' },
+    { path: 'data/boot.meta', data: '<boot v="1"/>' },
+  ]);
+  const patchBuf = buildSyntheticRpf9Buffer([
+    { path: 'textures/hud.ytd', data: 'MOUNT_HUD_V2_PATCHED' },
+    { path: 'ui/menu.gfx', data: 'MOUNT_MENU_PATCH' },
+  ]);
+
+  const baseVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(baseBuf).readRange,
+    baseBuf.byteLength,
+    { archivePath: '/private_mount/base.rpf' }
+  );
+  const patchVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(patchBuf).readRange,
+    patchBuf.byteLength,
+    { archivePath: '/private_mount/patch.rpf' }
+  );
+
+  const table = new RpfVfsMountTable({ pathCacheCapacity: 16, maxNegativeEntries: 4 });
+  const mBase = table.mount('x64/game', baseVfs, { priority: 10 });
+
+  // Instrument mounted VFS instances to ensure ZERO linear archive scans occur.
+  let scannedVfsCalls = 0;
+  for (const v of [baseVfs, patchVfs]) {
+    const origExists = v.exists.bind(v);
+    const origStat = v.stat.bind(v);
+    v.exists = (...args) => {
+      scannedVfsCalls += 1;
+      return origExists(...args);
+    };
+    v.stat = (...args) => {
+      scannedVfsCalls += 1;
+      return origStat(...args);
+    };
+  }
+
+  const hudPath = 'x64/game/textures/hud.ytd';
+  const hudHash = hashVirtualPath(hudPath);
+  const bootPath = 'x64/game/data/boot.meta';
+  const bootHash = hashVirtualPath(bootPath);
+  const menuPath = 'x64/game/ui/menu.gfx';
+  const menuHash = hashVirtualPath(menuPath);
+
+  // 1. resolveByHashFast parity & reusable scratch object with BigInt hash.
+  assert.deepEqual(table.resolveByHashFast(hudHash), table.resolveByHash(hudHash));
+  const hashScratch = { stat: {} };
+  const origStatRef = hashScratch.stat;
+  const h1 = table.resolveByHashFast(BigInt(hudHash), hashScratch);
+  assert.equal(h1, hashScratch);
+  assert.equal(h1.stat, origStatRef);
+  assert.equal(h1.mountId, mBase.id);
+  assert.equal(h1.stat.size, 'MOUNT_HUD_V1'.length);
+  assert.equal(h1.collisionCount, 0);
+
+  const h2 = table.resolveByHashFast(bootHash, hashScratch);
+  assert.equal(h2, hashScratch);
+  assert.equal(h2.stat, origStatRef);
+  assert.equal(h2.stat.path, bootPath);
+  assert.equal(h2.stat.size, '<boot v="1"/>'.length);
+
+  assert.equal(table.resolveByHashFast(menuHash, hashScratch), null);
+  assert.equal(table.getStats().fastHashHits, 3);
+
+  // 2. statEntryFast across mounted file, virtual prefix directory, and back to file using one scratch object.
+  const statScratch = {};
+  const stFile = table.statEntryFast(hudPath, statScratch);
+  assert.equal(stFile, statScratch);
+  assert.equal(stFile.mountId, mBase.id);
+  assert.equal(stFile.isFile, true);
+  assert.equal(stFile.size, 'MOUNT_HUD_V1'.length);
+
+  // Virtual prefix directory ('x64') clears stale file/mount fields cleanly.
+  const stVdir = table.statEntryFast('x64', statScratch);
+  assert.equal(stVdir, statScratch);
+  assert.equal(stVdir.isDirectory, true);
+  assert.equal(stVdir.virtual, true);
+  assert.equal(stVdir.mountId, undefined);
+  assert.equal(stVdir.size, undefined);
+  assert.equal(stVdir.dataOffset, undefined);
+
+  // Back to mounted file via explicit 0x hex hash clears `virtual` cleanly.
+  const stHex = table.statEntryFast(`0x${bootHash.toString(16).padStart(8, '0')}`, statScratch);
+  assert.equal(stHex, statScratch);
+  assert.equal(stHex.isFile, true);
+  assert.equal(stHex.virtual, undefined);
+  assert.equal(stHex.mountId, mBase.id);
+
+  // Parity when `out` is omitted for both mounted file and virtual dir.
+  assert.deepEqual(table.statEntryFast(hudPath), table.stat(hudPath));
+  assert.deepEqual(table.statEntryFast('x64'), table.stat('x64'));
+
+  // 3. batchStat() single-pass prefetch + negative-cache integration + override invalidation.
+  const hotBootPaths = [
+    hudPath,
+    menuPath, // missing before patch mount
+    'X64\\GAME\\UI\\MENU.GFX', // duplicate miss -> negative cache hit in same batch
+    'x64', // virtual prefix dir
+    BigInt(bootHash),
+    'x64/game/missing_extra.ytd',
+  ];
+  const b1 = table.batchStat(hotBootPaths);
+  assert.equal(b1[0].mountId, mBase.id);
+  assert.equal(b1[0].size, 'MOUNT_HUD_V1'.length);
+  assert.equal(b1[1], null);
+  assert.equal(b1[2], null);
+  assert.equal(b1[3].virtual, true);
+  assert.equal(b1[4].path, bootPath);
+  assert.equal(b1[5], null);
+  assert.equal(table.getStats().batchStatCalls, 1);
+  assert.equal(table.getStats().batchStatHits, 3);
+  assert.equal(table.getStats().negativeLookupEntries, 2);
+  assert.equal(table.getStats().negativeLookupHits, 1);
+
+  // Mount higher-priority patch -> invalidates caches; next batchStat + resolveByHashFast see patch immediately!
+  const mPatch = table.mount('x64/game', patchVfs, { priority: 20 });
+  assert.equal(table.getStats().negativeLookupEntries, 0);
+
+  const b2 = table.batchStat([hudPath, menuPath, 'x64/game/missing_extra.ytd']);
+  assert.equal(b2[0].mountId, mPatch.id);
+  assert.equal(b2[0].size, 'MOUNT_HUD_V2_PATCHED'.length);
+  assert.equal(b2[1].mountId, mPatch.id);
+  assert.equal(b2[1].size, 'MOUNT_MENU_PATCH'.length);
+  assert.equal(b2[2], null);
+  assert.equal(table.getStats().batchStatCalls, 2);
+  assert.equal(table.getStats().batchStatHits, 5);
+
+  const hPatched = table.resolveByHashFast(hudHash, hashScratch);
+  assert.equal(hPatched, hashScratch);
+  assert.equal(hPatched.mountId, mPatch.id);
+  assert.equal(hPatched.stat.size, 'MOUNT_HUD_V2_PATCHED'.length);
+
+  // Confirm zero linear archive scans occurred across all fast lookups & batchStat calls.
+  assert.equal(scannedVfsCalls, 0);
+
+  // Sanitization check before resetStats().
+  const stats = table.getStats();
+  assert.ok(stats.fastHashHits >= 5);
+  assert.equal(stats.batchStatCalls, 2);
+  assert.equal(stats.batchStatHits, 5);
+  for (const [key, val] of Object.entries(stats)) {
+    assert.equal(typeof val, 'number', `RpfVfsMountTable.getStats().${key} must be numeric`);
+    assert.ok(Number.isFinite(val) && val >= 0);
+  }
+  assert.equal(JSON.stringify(stats).includes('private_mount'), false);
+
+  // resetStats() zeroes W322 telemetry while preserving mounts & index.
+  table.resetStats();
+  const afterResetStats = table.getStats();
+  assert.equal(afterResetStats.fastHashHits, 0);
+  assert.equal(afterResetStats.batchStatCalls, 0);
+  assert.equal(afterResetStats.batchStatHits, 0);
+  assert.equal(afterResetStats.mountedArchives, 2);
+  assert.ok(afterResetStats.indexedEntries >= 6);
+
+  // reset() unmounts everything and zeroes all telemetry.
+  table.reset();
+  const afterReset = table.getStats();
+  assert.equal(afterReset.mountedArchives, 0);
+  assert.equal(afterReset.indexedEntries, 0);
+  assert.equal(afterReset.fastHashHits, 0);
+  assert.equal(afterReset.batchStatCalls, 0);
+  assert.equal(afterReset.batchStatHits, 0);
+});
