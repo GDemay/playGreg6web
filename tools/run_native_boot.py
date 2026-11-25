@@ -62,6 +62,7 @@ from typing import Callable, Mapping, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
+import find_chrome  # noqa: E402
 import screen_timeline  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
@@ -366,10 +367,10 @@ def make_thumbnails(args, run_dir: Path, report: dict, env: Mapping[str, str],
     if not capture.is_file() or not args.gpu_capture_payloads:
         return ["thumbnails: need a GPU capture with payloads (--gpu-capture-frames N --gpu-capture-payloads, "
                 "ideally --gpu-capture-thin-uploads N); none made"]
-    chrome = args.chrome or env.get("PLAYGTA6_CHROME")
+    chrome = find_chrome.resolve_chrome(args.chrome, env)
     pack = args.replay_pack
     if not chrome or not pack:
-        return ["thumbnails: pass --chrome (or $PLAYGTA6_CHROME) and --replay-pack (the wgsl pack)"]
+        return ["thumbnails: no Chrome found (pass --chrome or set $PLAYGTA6_CHROME) and pass --replay-pack (the wgsl pack)"]
     picks = thumbnail_frames(report.get("screen_timeline") or [], total_presents=len(report.get("presents") or []) or None)
     if not picks:
         return ["thumbnails: no screen segment longer than 1 s within the captured frames"]
@@ -445,7 +446,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="with payloads: keep only every Nth write of a texture/buffer > 4 MiB")
     p.add_argument("--thumbnails", action="store_true",
                    help="after a payload GPU capture, replay it in Chrome and save one image per screen segment")
-    p.add_argument("--chrome", help="Chrome executable for --thumbnails (default $PLAYGTA6_CHROME)")
+    p.add_argument("--chrome", help="Chrome executable for --thumbnails (default $PLAYGTA6_CHROME, then auto-detected)")
     p.add_argument("--replay-pack", help="wgsl pack file for --thumbnails")
     p.add_argument("--import-trace", action="store_true", help="write import-trace.txt")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory under work/)")
