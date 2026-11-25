@@ -11,10 +11,12 @@ import {
   INDIRECT_DISPATCH_MODE,
   DEFAULT_MAX_VALIDATION_ERRORS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
+  DEFAULT_TOGGLE_KEY,
   normalizeBootMode,
   normalizeAudioOutputState,
   normalizeIndirectDispatchMode,
   sanitizeValidationErrorMessage,
+  sanitizeScriptedInputPreset,
   parseSideModuleProgressLabel,
   formatFpsDisplay,
 } from '../web/ui/hud_controller.js';
@@ -2816,4 +2818,337 @@ test('W90: direct displayElements update across all HUD frame/milestone APIs wit
   assert.equal(fpsEl.textContent, '0.0');
 
   await sessionController.stop();
+});
+
+// --- W143: HUD Visibility Toggle (F3) & Scripted-Input Status Indicator ---
+
+test('W143: isVisible, setVisible, and toggleVisible update root HUD element cleanly and safely no-op without DOM', () => {
+  // 1. Default visibility with bound hudRootEl.
+  const hudRootEl = createDisplayMockElement();
+  const visibilityCallbacks = [];
+  const hud = {
+    ...createMockHud(),
+    setVisible(v) {
+      visibilityCallbacks.push(v);
+    },
+  };
+
+  const controller = new HudController({
+    hud,
+    displayElements: { hudRootEl },
+  });
+
+  assert.equal(controller.isVisible(), true);
+  assert.equal(controller.getSnapshot().visible, true);
+  assert.equal(controller.getBootStatus().visible, true);
+  assert.equal(hudRootEl.hidden, false);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'false');
+  assert.equal(hudRootEl.dataset.hudVisible, 'true');
+
+  // Hide HUD via setVisible(false).
+  assert.equal(controller.setVisible(false), false);
+  assert.equal(controller.isVisible(), false);
+  assert.equal(controller.getSnapshot().visible, false);
+  assert.equal(hudRootEl.hidden, true);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'true');
+  assert.equal(hudRootEl.dataset.hudVisible, 'false');
+  assert.deepEqual(visibilityCallbacks, [false]);
+
+  // Toggle back to visible via toggleVisible(), then hide via toggleVisibility() alias.
+  assert.equal(controller.toggleVisible(), true);
+  assert.equal(controller.isVisible(), true);
+  assert.equal(hudRootEl.hidden, false);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'false');
+  assert.equal(hudRootEl.dataset.hudVisible, 'true');
+
+  assert.equal(controller.toggleVisibility(), false);
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'true');
+  assert.deepEqual(visibilityCallbacks, [false, true, false]);
+
+  // 2. Constructor visible: false + direct hudRootEl option initializes hidden.
+  const hiddenRoot = createDisplayMockElement();
+  const initiallyHidden = new HudController({
+    hudRootEl: hiddenRoot,
+    visible: false,
+  });
+  assert.equal(initiallyHidden.isVisible(), false);
+  assert.equal(hiddenRoot.hidden, true);
+  assert.equal(hiddenRoot.getAttribute('aria-hidden'), 'true');
+  initiallyHidden.destroy();
+
+  // 3. Safe no-op when no DOM root element is present or when root element throws.
+  const bare = new HudController();
+  assert.equal(bare.isVisible(), true);
+  assert.doesNotThrow(() => {
+    assert.equal(bare.setVisible(false), false);
+    assert.equal(bare.toggleVisible(), true);
+  });
+  bare.destroy();
+
+  const throwingRoot = {
+    set hidden(_v) {
+      throw new Error('DOM detached');
+    },
+    setAttribute() {
+      throw new Error('DOM detached');
+    },
+    get dataset() {
+      throw new Error('DOM detached');
+    },
+  };
+  const resilient = new HudController({
+    hudRootEl: throwingRoot,
+    hud: {
+      setVisible() {
+        throw new Error('callback failed');
+      },
+    },
+  });
+  assert.doesNotThrow(() => {
+    assert.equal(resilient.setVisible(false), false);
+    assert.equal(resilient.toggleVisible(), true);
+  });
+  resilient.destroy();
+
+  // 4. After destroy(), setVisible and toggleVisible safely no-op.
+  controller.destroy();
+  assert.equal(controller.setVisible(true), false);
+  assert.equal(controller.toggleVisible(), false);
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+});
+
+test('W143: bindToggleKey and enableToggleShortcut toggle HUD on F3, ignore text inputs, and clean up on destroy', () => {
+  assert.equal(DEFAULT_TOGGLE_KEY, 'F3');
+
+  const hudRootEl = createDisplayMockElement();
+  const keyTarget = createMockElement();
+
+  // 1. Automatic binding via enableToggleShortcut: true.
+  const controller = new HudController({
+    hudRootEl,
+    enableToggleShortcut: true,
+    toggleShortcutTarget: keyTarget,
+  });
+
+  assert.equal(keyTarget.listenerCount('keydown'), 1);
+  assert.equal(controller.isVisible(), true);
+
+  let prevented = 0;
+  const dispatchKey = (extra = {}) => {
+    keyTarget.dispatch('keydown', {
+      key: 'F3',
+      code: 'F3',
+      repeat: false,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+      defaultPrevented: false,
+      target: { tagName: 'BODY' },
+      preventDefault() {
+        prevented += 1;
+      },
+      ...extra,
+    });
+  };
+
+  // Pressing F3 hides the HUD and calls preventDefault.
+  dispatchKey();
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'true');
+  assert.equal(prevented, 1);
+
+  // Pressing F3 again shows the HUD.
+  dispatchKey();
+  assert.equal(controller.isVisible(), true);
+  assert.equal(hudRootEl.hidden, false);
+  assert.equal(prevented, 2);
+
+  // Non-F3 keys, repeats, defaultPrevented, and modifier chords are ignored.
+  dispatchKey({ key: 'F2', code: 'F2' });
+  dispatchKey({ repeat: true });
+  dispatchKey({ defaultPrevented: true });
+  dispatchKey({ ctrlKey: true });
+  dispatchKey({ altKey: true });
+  dispatchKey({ metaKey: true });
+  assert.equal(controller.isVisible(), true);
+  assert.equal(prevented, 2);
+
+  // Text inputs, textareas, selects, and contenteditable targets must NOT trigger HUD toggle.
+  dispatchKey({ target: { tagName: 'INPUT' } });
+  dispatchKey({ target: { tagName: 'input' } });
+  dispatchKey({ target: { tagName: 'TEXTAREA' } });
+  dispatchKey({ target: { tagName: 'SELECT' } });
+  dispatchKey({ target: { tagName: 'DIV', isContentEditable: true } });
+  dispatchKey({ target: { tagName: 'DIV', contentEditable: 'true' } });
+  dispatchKey({
+    target: {
+      tagName: 'DIV',
+      getAttribute(name) {
+        return name === 'contenteditable' ? '' : null;
+      },
+    },
+  });
+  assert.equal(controller.isVisible(), true);
+  assert.equal(prevented, 2);
+
+  // Non-editable contenteditable="false" still toggles normally.
+  dispatchKey({
+    target: {
+      tagName: 'DIV',
+      isContentEditable: false,
+      getAttribute(name) {
+        return name === 'contenteditable' ? 'false' : null;
+      },
+    },
+  });
+  assert.equal(controller.isVisible(), false);
+  assert.equal(prevented, 3);
+
+  // Re-binding replaces previous listener rather than duplicating it.
+  const unbindCustom = controller.bindToggleKey(keyTarget, 'F4');
+  assert.equal(keyTarget.listenerCount('keydown'), 1);
+  dispatchKey({ key: 'F3', code: 'F3' });
+  assert.equal(controller.isVisible(), false);
+  dispatchKey({ key: 'F4', code: 'F4' });
+  assert.equal(controller.isVisible(), true);
+
+  // Returned unbind function cleans up idempotently.
+  unbindCustom();
+  unbindCustom();
+  assert.equal(keyTarget.listenerCount('keydown'), 0);
+
+  // Re-bind F3 and verify destroy() removes listener completely.
+  controller.bindToggleKey(keyTarget);
+  assert.equal(keyTarget.listenerCount('keydown'), 1);
+  controller.destroy();
+  assert.equal(keyTarget.listenerCount('keydown'), 0);
+
+  // Events after destroy() do nothing.
+  dispatchKey();
+  assert.equal(controller.isVisible(), true);
+
+  // Invalid target throws TypeError; null target safely no-ops.
+  const validationController = new HudController();
+  assert.throws(() => validationController.bindToggleKey({}), TypeError);
+  assert.doesNotThrow(() => validationController.bindToggleKey(null));
+  validationController.destroy();
+});
+
+test('W143: setScriptedInputStatus displays valid presets, clears on null, and rejects malicious paths/text', () => {
+  // Direct sanitizer allowlist verification (/^[a-z0-9][a-z0-9_-]{0,31}$/i).
+  assert.equal(sanitizeScriptedInputPreset('start-screen'), 'start-screen');
+  assert.equal(sanitizeScriptedInputPreset('  menu_nav-01  '), 'menu_nav-01');
+  assert.equal(sanitizeScriptedInputPreset('A'), 'A');
+  assert.equal(sanitizeScriptedInputPreset('a'.repeat(32)), 'a'.repeat(32));
+  assert.equal(sanitizeScriptedInputPreset('a'.repeat(33)), null);
+  assert.equal(sanitizeScriptedInputPreset(''), null);
+  assert.equal(sanitizeScriptedInputPreset('   '), null);
+  assert.equal(sanitizeScriptedInputPreset(null), null);
+  assert.equal(sanitizeScriptedInputPreset(undefined), null);
+  assert.equal(sanitizeScriptedInputPreset(42), null);
+  assert.equal(sanitizeScriptedInputPreset({ preset: 'start-screen' }), null);
+  assert.equal(sanitizeScriptedInputPreset('-leading-dash'), null);
+  assert.equal(sanitizeScriptedInputPreset('_leading_underscore'), null);
+  assert.equal(sanitizeScriptedInputPreset('start screen'), null);
+  assert.equal(sanitizeScriptedInputPreset('../etc/passwd'), null);
+  assert.equal(sanitizeScriptedInputPreset('C:\\Users\\alice\\script.json'), null);
+  assert.equal(sanitizeScriptedInputPreset('/home/alice/private/input.json'), null);
+  assert.equal(sanitizeScriptedInputPreset('file:///Users/bob/script'), null);
+  assert.equal(sanitizeScriptedInputPreset('start-screen?token=secret'), null);
+  assert.equal(sanitizeScriptedInputPreset('<script>alert(1)</script>'), null);
+  assert.equal(sanitizeScriptedInputPreset('start\nscreen'), null);
+
+  const scriptedInputBadge = createDisplayMockElement();
+  const bootStatusEl = createDisplayMockElement();
+  const hud = createMockHud();
+
+  const controller = new HudController({
+    hud,
+    bootMode: 'real-wasm64',
+    displayElements: {
+      scriptedInputBadge,
+      bootStatusEl,
+    },
+  });
+
+  // Initial state: inactive and hidden badge, clean boot status text.
+  assert.equal(controller.getScriptedInputStatus(), null);
+  assert.equal(controller.getBootStatus().scriptedInputPreset, null);
+  assert.equal(controller.getSnapshot().scriptedInputPreset, null);
+  assert.equal(scriptedInputBadge.hidden, true);
+  assert.equal(scriptedInputBadge.getAttribute('aria-hidden'), 'true');
+  assert.equal(scriptedInputBadge.textContent, '');
+  assert.equal(scriptedInputBadge.dataset.active, 'false');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+
+  // Valid preset activates badge and appends to HUD status line.
+  const activePreset = controller.setScriptedInputStatus('start-screen');
+  assert.equal(activePreset, 'start-screen');
+  assert.equal(controller.getScriptedInputStatus(), 'start-screen');
+  assert.equal(controller.getBootStatus().scriptedInputPreset, 'start-screen');
+  assert.equal(controller.getSnapshot().scriptedInputPreset, 'start-screen');
+  assert.equal(scriptedInputBadge.hidden, false);
+  assert.equal(scriptedInputBadge.getAttribute('aria-hidden'), 'false');
+  assert.equal(scriptedInputBadge.textContent, 'Scripted input: start-screen');
+  assert.equal(scriptedInputBadge.dataset.preset, 'start-screen');
+  assert.equal(scriptedInputBadge.dataset.active, 'true');
+  assert.equal(scriptedInputBadge.dataset.state, 'info');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest — Scripted input: start-screen');
+  assert.equal(hud.statuses.at(-1).text, 'Real Wasm64 Guest — Scripted input: start-screen');
+
+  // Clearing with null hides badge and removes indicator from HUD status line.
+  const cleared = controller.setScriptedInputStatus(null);
+  assert.equal(cleared, null);
+  assert.equal(controller.getScriptedInputStatus(), null);
+  assert.equal(controller.getBootStatus().scriptedInputPreset, null);
+  assert.equal(controller.getSnapshot().scriptedInputPreset, null);
+  assert.equal(scriptedInputBadge.hidden, true);
+  assert.equal(scriptedInputBadge.getAttribute('aria-hidden'), 'true');
+  assert.equal(scriptedInputBadge.textContent, '');
+  assert.equal(scriptedInputBadge.dataset.preset, undefined);
+  assert.equal(scriptedInputBadge.dataset.active, 'false');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+  assert.equal(hud.statuses.at(-1).text, 'Real Wasm64 Guest');
+
+  // Malicious paths / arbitrary text are strictly rejected to null and never leak to DOM or snapshot.
+  controller.setScriptedInputStatus('start-screen');
+  const maliciousInputs = [
+    'C:\\Users\\secretuser\\GTA6\\macros.json',
+    '/home/secretuser/script.json',
+    '../../etc/passwd',
+    'start-screen?api_key=secret123',
+    '<img src=x onerror=alert(1)>',
+    'arbitrary text with spaces',
+  ];
+  for (const bad of maliciousInputs) {
+    const res = controller.setScriptedInputStatus(bad);
+    assert.equal(res, null);
+    assert.equal(controller.getScriptedInputStatus(), null);
+    assert.equal(scriptedInputBadge.hidden, true);
+    assert.equal(scriptedInputBadge.textContent, '');
+    assert.doesNotMatch(bootStatusEl.textContent, /secretuser|passwd|<img|alert\(|api_key/i);
+    assert.doesNotMatch(JSON.stringify(controller.getSnapshot()), /secretuser|passwd|<img|alert\(|api_key/i);
+  }
+
+  // Initial constructor scriptedInputPreset option works with standalone scriptedInputBadge option.
+  const standaloneBadge = createDisplayMockElement();
+  const withInitialPreset = new HudController({
+    scriptedInputBadge: standaloneBadge,
+    scriptedInputPreset: 'boot_smoke_1',
+  });
+  assert.equal(withInitialPreset.getScriptedInputStatus(), 'boot_smoke_1');
+  assert.equal(standaloneBadge.hidden, false);
+  assert.equal(standaloneBadge.textContent, 'Scripted input: boot_smoke_1');
+  withInitialPreset.destroy();
+
+  // After destroy(), setScriptedInputStatus safely no-ops.
+  controller.setScriptedInputStatus('start-screen');
+  controller.destroy();
+  assert.equal(controller.setScriptedInputStatus(null), 'start-screen');
+  assert.equal(controller.setScriptedInputStatus('other-preset'), 'start-screen');
+  assert.equal(controller.getScriptedInputStatus(), 'start-screen');
 });
