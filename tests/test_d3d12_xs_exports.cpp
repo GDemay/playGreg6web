@@ -5986,6 +5986,281 @@ void test_window_write_marks_flush() {
     playgta6::os::set_write_tracking(true);
 }
 
+// G68 (#663): window write-mark early-out, shared MarkPass with CPU buffers, cross-submission
+// dirty propagation, verify-mode miss detection, and in-place hashing / zero-copy staging for
+// tightly-packed 256B-aligned linear textures (such as 4K Bink2 Y/U/V planes).
+void test_window_texture_sync_markpass_and_inplace_hash() {
+    namespace gw = playgta6::os::guest_window;
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    constexpr uint64_t k64K = 64ull << 10, k16G = 16ull << 30;
+    constexpr uint32_t kType = 0x20402000u;
+    constexpr uint32_t kW = 256, kH = 192;  // 3 bands of 64 rows, 256B-aligned R8_UNORM (48 KiB)
+    constexpr uint32_t kDxgiR8Unorm = 61;
+
+    playgta6::os::set_write_tracking(false);
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+    const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+    const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+    CHECK(C == gw::kWindowBase && xw::is_phantom(G, k16G));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, pfn) == 1);
+
+    auto decode_encoder = [](const gpu::CommandEncoder& enc) {
+        std::vector<Packet> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            out.push_back(std::move(p));
+        }
+        CHECK(off == enc.size());
+        return out;
+    };
+    auto write_texture_packets = [&](const gpu::CommandEncoder& enc, uint32_t tex_id) {
+        std::vector<Packet> out;
+        for (const Packet& p : decode_encoder(enc)) {
+            if (p.opcode == GpuOpcode::WriteTexture &&
+                payload_as<GpuWriteTexturePayload>(p).texture_id == tex_id) {
+                out.push_back(p);
+            }
+        }
+        return out;
+    };
+    auto write_buffer_packets = [&](const gpu::CommandEncoder& enc, uint32_t buf_id) {
+        std::vector<Packet> out;
+        for (const Packet& p : decode_encoder(enc)) {
+            if (p.opcode == GpuOpcode::WriteBuffer &&
+                payload_as<GpuWriteBufferPayload>(p).id == buf_id) {
+                out.push_back(p);
+            }
+        }
+        return out;
+    };
+
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        int32_t result = -1;
+
+        // Buffer and texture share 64 KiB slot 4: buffer at +0x0000 (4 KiB), texture at +0x2000 (48 KiB).
+        const uint64_t buf_gpu = G + 4 * k64K;
+        const uint64_t buf_cpu = C + 4 * k64K;
+        const uint64_t tex_gpu = G + 4 * k64K + 0x2000;
+        const uint64_t tex_cpu = C + 4 * k64K + 0x2000;
+
+        const uint64_t buf_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(buf_gpu), I(put(buffer_desc(0x1000))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf_obj)->cpu_address() == buf_cpu);
+        const uint32_t buf_id = object_of<dg::Resource>(buf_obj)->id();
+
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(tex_gpu), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x11u);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+
+        // (a) Initial submission indexes and uploads the full 256x192 texture (and warms up buf).
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.width == kW && wt.height == kH && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + pixels.size());
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload), pixels.data(),
+                                  pixels.size()) == 0);
+            }
+        }
+
+        // Steady state: no slot marks -> skips immediately.
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // Unmarked direct mutation in band 1 (rows 64..127) must be skipped when marks are not verified,
+        // proving the write-mark early-out bypassed scanning/hashing.
+        auto* raw_tex = static_cast<uint8_t*>(gw::translate(tex_cpu));
+        CHECK(raw_tex != nullptr);
+        std::memset(raw_tex + size_t{64} * kW, 0x22u, size_t{64} * kW);
+        std::memset(pixels.data() + size_t{64} * kW, 0x22u, size_t{64} * kW);
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // (b) Marking the slot triggers re-upload of ONLY the changed 64-row band (band 1).
+        gw::mark_written(tex_cpu + size_t{64} * kW, size_t{64} * kW);
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 64 && wt.width == kW && wt.height == 64 && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + size_t{64} * kW);
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload),
+                                  pixels.data() + size_t{64} * kW, size_t{64} * kW) == 0);
+            }
+        }
+
+        // (c) Shared 64 KiB slot between buffer and texture in the same submission:
+        // writing both must notify BOTH flush_cpu_buffers and sync_bound_texture_memory via shared MarkPass.
+        const uint32_t buf_val = 0xCAFEBABEu;
+        CHECK(com::write_guest(buf_cpu + 0x100, buf_val));
+        std::memset(pixels.data(), 0x33u, size_t{64} * kW);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), size_t{64} * kW));
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wbs = write_buffer_packets(buf_enc, buf_id);
+            CHECK(wbs.size() == 1);
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.height == 64);
+            }
+        }
+
+        // Cross-submission persistence: a submission that flushes buffers (clearing window marks)
+        // without binding `tex` must still leave `tex` dirty for the next submission that binds it.
+        std::memset(pixels.data() + size_t{128} * kW, 0x44u, size_t{64} * kW);
+        CHECK(com::write_guest(tex_cpu + size_t{128} * kW, pixels.data() + size_t{128} * kW, size_t{64} * kW));
+        {
+            gpu::CommandEncoder buf_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            dev->end_submission();
+        }
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 128 && wt.height == 64);
+            }
+        }
+
+        // (d) In-place hash skips upload when a marked slot's content is unchanged.
+        CHECK(com::write_guest(tex_cpu, pixels.data(), size_t{64} * kW));  // same bytes, marks slot 4
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // Write-mark verification mode detects unmarked texture writes and still uploads them.
+        std::memset(raw_tex, 0x55u, size_t{64} * kW);
+        gw::set_write_marks_verified(true);
+        const uint64_t misses_before = gw::verify_misses();
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(gw::verify_misses() == misses_before + 1);
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1 && payload_as<GpuWriteTexturePayload>(wts[0]).origin_y == 0);
+        }
+        gw::set_write_marks_verified(false);
+
+        fx.vcall(tex_obj, Slot::Release);
+        fx.vcall(buf_obj, Slot::Release);
+        scene.release_all();
+    }
+
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    playgta6::os::set_write_tracking(true);
+
+    // Non-window contiguous arena texture: in-place hash skips copy when unchanged and band-wise
+    // direct staging uploads only the modified band.
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t arena_mem = com::guest_alloc(size_t{kW} * kH);
+        CHECK(arena_mem != 0);
+        int32_t result = -1;
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(arena_mem), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x7Au);
+        CHECK(com::write_guest(arena_mem, pixels.data(), pixels.size()));
+        gpu::CommandEncoder e1, e2, e3;
+        CHECK(dev->sync_bound_texture_memory(tex_id, e1));
+        CHECK(write_texture_packets(e1, tex_id).size() == 1);
+        CHECK(!dev->sync_bound_texture_memory(tex_id, e2));
+        CHECK(write_texture_packets(e2, tex_id).empty());
+
+        std::memset(pixels.data() + size_t{64} * kW, 0x8Bu, size_t{64} * kW);
+        CHECK(com::write_guest(arena_mem + size_t{64} * kW, pixels.data() + size_t{64} * kW, size_t{64} * kW));
+        CHECK(dev->sync_bound_texture_memory(tex_id, e3));
+        const auto wts = write_texture_packets(e3, tex_id);
+        CHECK(wts.size() == 1);
+        if (wts.size() == 1) {
+            const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+            CHECK(wt.origin_y == 64 && wt.height == 64 && wt.bytes_per_row == kW);
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+        scene.release_all();
+    }
+}
+
 // R40: native CPU-window pages are shared page views (O36), which carry no MEM_WRITE_WATCH: their
 // writes are tracked by write protection (os::take_written_pages). After the first flush only
 // pages written since are compared and uploaded, including writes through another address of the
@@ -6101,6 +6376,7 @@ int main() {
     test_same_bytes();
     test_compare_shadow_pages();
     test_window_write_marks_flush();
+    test_window_texture_sync_markpass_and_inplace_hash();
     test_shared_view_write_tracking_flush();
     test_export_registration();
     test_create_device();
