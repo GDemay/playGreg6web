@@ -1350,6 +1350,33 @@ void test_xg() {
         CHECK(fx.vcall(t64, 1) == 0);
     }
 
+    // GetTexelElementOffsetBytes (slot 6): the GFX10 address of an element (the detiler's), plus
+    // the slice's chain; bit offset 0; invalid plane / mip / coordinate -> UINT64_MAX.
+    {
+        namespace gx = playgta6::gpu::gfx10;
+        const uint64_t tdesc = xg_desc(3, 512, 512, 2, 10, 98);
+        CHECK(com::write_guest(tdesc + 0x2C, uint32_t{0x10A}));
+        const uint64_t tout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+        const uint64_t tc = load64(tout);
+        const gx::TextureLayoutDesc chain{98u, 512u, 512u, 1u, 10u, 0x10Au, 0u};
+        const uint64_t chain_bytes = gx::surface_bytes(chain);
+        const uint64_t bit = com::guest_alloc(4);
+        CHECK(com::write_guest(bit, uint32_t{0xFFFFFFFFu}));
+        for (const uint32_t mip : {0u, 1u, 3u}) {
+            const uint64_t got = fx.vcall(tc, 6, {I(0), I(mip), I(3), I(5), I(1), I(0), I(bit)});
+            CHECK(got == chain_bytes + gx::surface_element_offset(chain, mip, 3u, 5u, 0u));
+        }
+        uint32_t bits = 1;
+        CHECK(com::read_guest(bit, bits) && bits == 0u);
+        CHECK(fx.vcall(tc, 6, {I(0), I(0), I(0), I(0), I(0), I(0), I(0)}) == gx::surface_element_offset(chain, 0u, 0u, 0u, 0u));
+        CHECK(fx.vcall(tc, 6, {I(1), I(0), I(0), I(0), I(0), I(0), I(0)}) == UINT64_MAX);    // plane
+        CHECK(fx.vcall(tc, 6, {I(0), I(10), I(0), I(0), I(0), I(0), I(0)}) == UINT64_MAX);   // mip
+        CHECK(fx.vcall(tc, 6, {I(0), I(0), I(128), I(0), I(0), I(0), I(0)}) == UINT64_MAX);  // x (128 blocks)
+        CHECK(fx.vcall(tc, 6, {I(0), I(0), I(0), I(0), I(2), I(0), I(0)}) == UINT64_MAX);    // slice
+        CHECK(fx.vcall(tc, 1) == 0);
+    }
+
     // An unsupported dimension fails.
     CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
 
