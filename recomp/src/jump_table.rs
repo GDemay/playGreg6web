@@ -53,8 +53,49 @@ pub const MAX_JUMP_TABLE_ENTRIES: u64 = 1 << 16;
 /// Bound on nested slice steps (register copies, extensions, address chains) followed for one value.
 const MAX_SLICE_DEPTH: u32 = 16;
 
+/// Bound on total recursive slice visits per resolution/classification (guards against exponential
+/// fan-out across `add`/`lea` DAGs).
+const MAX_SLICE_STEPS: usize = 4096;
+
 /// Bound on alias hops followed when matching a branch guard against an aliased register.
 const MAX_ALIAS_DEPTH: u32 = 4;
+
+/// Maximum number of distinct `!=` guard exclusions tracked per index bound.
+const MAX_EXCLUDED_VALUES: usize = 8;
+
+/// Return the unique case targets of `table` in strictly ascending, deterministic order.
+///
+/// [`JumpTable::targets`] preserves table-slot order (including duplicate entries) so slot-level
+/// relocations remain aligned with table offsets; callers building CFG edges or canonical target
+/// sets consume this sorted, deduplicated view.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn sorted_unique_targets(table: &JumpTable) -> Vec<u64> {
+    let mut targets = table.targets.clone();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+/// Resolve an IP-relative memory operand address with checked 32-bit signed displacement arithmetic
+/// so 64-bit address-space wraparound is rejected.
+fn checked_rip_target(instr: &Instruction) -> Option<u64> {
+    if !instr.is_ip_rel_memory_operand() {
+        return None;
+    }
+    let next_ip = instr.next_ip();
+    let target = instr.ip_rel_memory_address();
+    let rel = target.wrapping_sub(next_ip) as i64;
+    if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&rel) {
+        return None;
+    }
+    (next_ip.checked_add_signed(rel)? == target).then_some(target)
+}
+
+/// Add a sign-extended x86-64 memory displacement (`disp` as `i64`) to `base` without wrapping
+/// across `0` or `u64::MAX`.
+fn checked_disp_add(base: u64, disp: u64) -> Option<u64> {
+    base.checked_add_signed(disp as i64)
+}
 
 /// One instruction of the trace. `taken` is set on a conditional branch that ends a predecessor
 /// block: whether the path to the jump took it.
@@ -83,17 +124,22 @@ impl EntryEncoding {
         }
     }
 
-    fn decode(self, chunk: &[u8]) -> u64 {
+    fn decode(self, chunk: &[u8]) -> Option<u64> {
         match self {
             Self::Unsigned32 { base } => {
-                let raw = u32::from_le_bytes(chunk.try_into().unwrap());
-                base.wrapping_add(u64::from(raw))
+                let bytes: [u8; 4] = chunk.try_into().ok()?;
+                let raw = u32::from_le_bytes(bytes);
+                base.checked_add(u64::from(raw))
             }
             Self::Signed32 { base } => {
-                let raw = i32::from_le_bytes(chunk.try_into().unwrap());
-                base.wrapping_add(i64::from(raw) as u64)
+                let bytes: [u8; 4] = chunk.try_into().ok()?;
+                let raw = i32::from_le_bytes(bytes);
+                base.checked_add_signed(i64::from(raw))
             }
-            Self::Absolute64 => u64::from_le_bytes(chunk.try_into().unwrap()),
+            Self::Absolute64 => {
+                let bytes: [u8; 8] = chunk.try_into().ok()?;
+                Some(u64::from_le_bytes(bytes))
+            }
         }
     }
 }
@@ -179,16 +225,11 @@ pub(crate) fn resolve_in(
     leaf: Option<(u64, u64)>,
 ) -> Option<JumpTable> {
     let at = trace.len().checked_sub(1)?;
-    let jmp = trace[at].instr;
-    if jmp.flow_control() != FlowControl::IndirectBranch {
+    let jmp = trace.get(at)?.instr;
+    if jmp.is_invalid() || jmp.flow_control() != FlowControl::IndirectBranch {
         return None;
     }
-    let mut slicer = Slicer {
-        image,
-        trace,
-        info: InstructionInfoFactory::new(),
-        width_only: false,
-    };
+    let mut slicer = Slicer::new(image, trace);
     let (load, encoding) = match jmp.op0_kind() {
         OpKind::Register if jmp.op0_register().is_gpr64() => {
             match slicer.value(jmp.op0_register(), at, 0)? {
@@ -202,12 +243,13 @@ pub(crate) fn resolve_in(
         }
         _ => return None,
     };
+    let load_site = trace.get(load.at)?.instr.ip();
 
     let Some(bound) = slicer.bound(load.index, load.index_at, load.index_width, 0) else {
         return infer_extent(
             image,
             jmp,
-            trace[load.at].instr.ip(),
+            load_site,
             load.table,
             encoding,
             leaf,
@@ -221,9 +263,11 @@ pub(crate) fn resolve_in(
     if count > MAX_JUMP_TABLE_ENTRIES {
         return None;
     }
+    let count_usize = usize::try_from(count).ok()?;
     let entry_size = encoding.entry_size();
-    let table_start = load.table.wrapping_add(bound.min.checked_mul(entry_size)?);
+    let table_start = load.table.checked_add(bound.min.checked_mul(entry_size)?)?;
     let byte_len = count.checked_mul(entry_size)?;
+    table_start.checked_add(byte_len)?;
     // The only bound is the width of a zero-extended byte/word index (e.g. its mask or guard lies
     // before a loop the slice does not cross): a table that ends before that range does is read
     // as far as its entries stay inside the function, as for a table without a bound. A bound
@@ -235,11 +279,11 @@ pub(crate) fn resolve_in(
                 infer_extent(
                     image,
                     jmp,
-                    trace[load.at].instr.ip(),
+                    load_site,
                     load.table,
                     encoding,
                     leaf,
-                    usize::try_from(count).ok()?,
+                    count_usize,
                 )
             })
             .flatten()
@@ -248,17 +292,22 @@ pub(crate) fn resolve_in(
         return infer_within_width();
     };
     let owner = image.function_table.function_at(jmp.ip());
-    let mut targets = Vec::with_capacity(count as usize);
+    let mut targets = Vec::with_capacity(count_usize);
     for chunk in bytes.chunks_exact(entry_size as usize) {
-        let target = encoding.decode(chunk);
+        let Some(target) = encoding.decode(chunk) else {
+            return infer_within_width();
+        };
         if image.code_bytes(target).is_err() || image.function_table.function_at(target) != owner {
             return infer_within_width();
         }
         targets.push(target);
     }
+    if targets.len() != count_usize {
+        return infer_within_width();
+    }
     Some(JumpTable {
         site: jmp.ip(),
-        load_site: trace[load.at].instr.ip(),
+        load_site,
         table: table_start,
         targets,
         index: bound.index,
@@ -272,6 +321,9 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
         return UnresolvedJump::Computed;
     };
     let jmp = trace[at].instr;
+    if jmp.is_invalid() {
+        return UnresolvedJump::Computed;
+    }
     if jmp.op0_kind() == OpKind::Memory {
         let scaled = jmp.memory_index() != Register::None && jmp.memory_index_scale() == 8;
         return if scaled {
@@ -283,12 +335,7 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
     if jmp.op0_kind() != OpKind::Register {
         return UnresolvedJump::Computed;
     }
-    let mut slicer = Slicer {
-        image,
-        trace,
-        info: InstructionInfoFactory::new(),
-        width_only: false,
-    };
+    let mut slicer = Slicer::new(image, trace);
     if let Some(Value::Target { .. }) = slicer.value(jmp.op0_register(), at, 0) {
         return UnresolvedJump::TableUnbounded;
     }
@@ -299,7 +346,9 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
         let Some(def) = slicer.def(reg, before) else {
             return UnresolvedJump::RegisterLiveIn;
         };
-        let instr = trace[def].instr;
+        let Some(instr) = trace.get(def).map(|s| s.instr) else {
+            return UnresolvedJump::Computed;
+        };
         let src_reg = (instr.op_count() == 2 && instr.op1_kind() == OpKind::Register)
             .then(|| instr.op1_register());
         match instr.mnemonic() {
@@ -335,7 +384,8 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
                 let table_shaped = operands.iter().any(|&r| {
                     slicer
                         .def(r, def)
-                        .is_some_and(|d| is_table_read(trace[d].instr))
+                        .and_then(|d| trace.get(d))
+                        .is_some_and(|s| is_table_read(s.instr))
                 });
                 return if table_shaped {
                     UnresolvedJump::TableBaseUnknown
@@ -384,6 +434,9 @@ fn infer_extent(
     leaf: Option<(u64, u64)>,
     limit: usize,
 ) -> Option<JumpTable> {
+    if limit < MIN_INFERRED_ENTRIES {
+        return None;
+    }
     let owner = image.function_table.function_at(jmp.ip());
     let leaf_gap = match owner {
         Some(_) => None,
@@ -391,13 +444,16 @@ fn infer_extent(
             let (gap_start, gap_end) = image
                 .function_table
                 .gap_at(jmp.ip())
-                .filter(|(start, end)| end - start <= MAX_LEAF_GAP)?;
+                .filter(|(start, end)| end.checked_sub(*start).is_some_and(|g| g <= MAX_LEAF_GAP))?;
             let (entry, next) = leaf?;
             let (start, end) = (entry.max(gap_start), next.min(gap_end));
             (start <= jmp.ip() && jmp.ip() < end).then_some(())?;
+            let next_ip = jmp.next_ip();
+            // Reject IP wraparound and empty post-dispatch spans.
+            (next_ip > jmp.ip() && next_ip < end).then_some(())?;
             // Cases after the dispatch only: an over-read entry that lands before it (e.g. inside
             // another switch's dispatch sequence) would split blocks of proven code.
-            Some((jmp.next_ip(), end))
+            Some((next_ip, end))
         }
     };
     let inside = |target: u64| match leaf_gap {
@@ -405,18 +461,26 @@ fn infer_extent(
         None => image.function_table.function_at(target) == owner,
     };
     let entry_size = encoding.entry_size();
+    let cap = limit
+        .min(MAX_INFERRED_ENTRIES)
+        .min(usize::try_from(MAX_JUMP_TABLE_ENTRIES).unwrap_or(usize::MAX));
     let mut targets = Vec::new();
     let mut va = table;
-    while targets.len() < limit.min(MAX_INFERRED_ENTRIES) {
+    while targets.len() < cap {
         let Some(chunk) = read(image, va, entry_size) else {
             break;
         };
-        let target = encoding.decode(chunk);
+        let Some(target) = encoding.decode(chunk) else {
+            break;
+        };
         if image.code_bytes(target).is_err() || !inside(target) {
             break;
         }
         targets.push(target);
-        va += entry_size;
+        let Some(next_va) = va.checked_add(entry_size) else {
+            break;
+        };
+        va = next_va;
     }
     (targets.len() >= MIN_INFERRED_ENTRIES).then(|| JumpTable {
         site: jmp.ip(),
@@ -428,10 +492,15 @@ fn infer_extent(
     })
 }
 
-/// `len` initialised bytes at `va` from a single section.
+/// `len` initialised bytes at `va` from a single section, rejecting zero-length reads and VA
+/// wraparound past `u64::MAX`.
 fn read<'a>(image: &CodeImage<'a>, va: u64, len: u64) -> Option<&'a [u8]> {
+    if len == 0 {
+        return None;
+    }
+    va.checked_add(len)?;
     let section = image.section_at(va)?;
-    let start = usize::try_from(va - section.va).ok()?;
+    let start = usize::try_from(va.checked_sub(section.va)?).ok()?;
     let end = start.checked_add(usize::try_from(len).ok()?)?;
     section.data.get(start..end)
 }
@@ -440,20 +509,29 @@ fn mask(bits: u32) -> u64 {
     if bits >= 64 {
         u64::MAX
     } else {
-        (1 << bits) - 1
+        (1u64 << bits) - 1
     }
 }
 
 fn sign_extend(val: u64, bits: u32) -> i64 {
+    if bits == 0 {
+        return 0;
+    }
     let shift = 64u32.saturating_sub(bits);
     ((val << shift) as i64) >> shift
 }
 
 fn min_signed(bits: u32) -> i64 {
+    if bits == 0 {
+        return 0;
+    }
     i64::MIN >> 64u32.saturating_sub(bits)
 }
 
 fn max_signed(bits: u32) -> i64 {
+    if bits == 0 {
+        return 0;
+    }
     i64::MAX >> 64u32.saturating_sub(bits)
 }
 
@@ -488,6 +566,29 @@ struct Slicer<'t, 'b, 'i, 'a> {
     /// Set when a bound came only from the width of a zero-extended byte/word (no guard or
     /// definition narrowed it): the full range `[0, 0xff]` or `[0, 0xffff]`.
     width_only: bool,
+    /// Remaining recursive slice steps before aborting to bound worst-case work.
+    steps_remaining: usize,
+}
+
+impl<'t, 'b, 'i, 'a> Slicer<'t, 'b, 'i, 'a> {
+    fn new(image: &'i CodeImage<'a>, trace: &'t [Step<'b>]) -> Self {
+        Self {
+            image,
+            trace,
+            info: InstructionInfoFactory::new(),
+            width_only: false,
+            steps_remaining: MAX_SLICE_STEPS,
+        }
+    }
+
+    fn consume_step(&mut self) -> bool {
+        if let Some(next) = self.steps_remaining.checked_sub(1) {
+            self.steps_remaining = next;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Slicer<'_, '_, '_, '_> {
@@ -525,7 +626,7 @@ impl Slicer<'_, '_, '_, '_> {
     /// Whether bits 32..63 of the full 64-bit register `reg` are guaranteed zero just before
     /// `before` (e.g., produced by a 32-bit GPR write, `movzx`, or `and r64, imm32_u`).
     fn is_zero_extended_32(&mut self, reg: Register, before: usize, depth: u32) -> bool {
-        if depth > MAX_ALIAS_DEPTH {
+        if depth > MAX_ALIAS_DEPTH || !self.consume_step() {
             return false;
         }
         let reg = reg.full_register();
@@ -579,6 +680,9 @@ impl Slicer<'_, '_, '_, '_> {
     /// `before`: its last write is a `movzx` from at most `bits` bits, or an `and` with a mask
     /// below `1 << bits`, into a 32- or 64-bit register.
     fn is_zero_above(&mut self, reg: Register, before: usize, bits: u32) -> bool {
+        if bits == 0 || bits > 64 {
+            return false;
+        }
         let Some(at) = self.def(reg, before) else {
             return false;
         };
@@ -598,7 +702,7 @@ impl Slicer<'_, '_, '_, '_> {
                     OpKind::Memory => instr.memory_size().size() as u32 * 8,
                     _ => return false,
                 };
-                src_bits <= bits
+                src_bits > 0 && src_bits <= bits
             }
             Mnemonic::And => instr
                 .try_immediate(1)
@@ -609,7 +713,7 @@ impl Slicer<'_, '_, '_, '_> {
 
     /// Symbolic value of the full register `reg` just before position `before`.
     fn value(&mut self, reg: Register, before: usize, depth: u32) -> Option<Value> {
-        if depth > MAX_SLICE_DEPTH {
+        if depth > MAX_SLICE_DEPTH || !self.consume_step() {
             return None;
         }
         let reg = reg.full_register();
@@ -629,7 +733,7 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Lea, OpKind::Memory)
                 if dst.is_gpr64() && instr.is_ip_rel_memory_operand() =>
             {
-                let va = instr.ip_rel_memory_address();
+                let va = checked_rip_target(instr)?;
                 self.image.contains(va).then_some(Value::Const(va))
             }
             (Mnemonic::Lea, OpKind::Memory)
@@ -691,9 +795,9 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Add | Mnemonic::Sub, _)
                 if dst.is_gpr64() && instr.try_immediate(1).is_ok() =>
             {
-                let imm = instr.try_immediate(1).ok()?;
+                let imm = instr.try_immediate(1).ok()? as i64;
                 let delta = if instr.mnemonic() == Mnemonic::Sub {
-                    0u64.wrapping_sub(imm)
+                    imm.checked_neg()?
                 } else {
                     imm
                 };
@@ -704,9 +808,9 @@ impl Slicer<'_, '_, '_, '_> {
         }
     }
 
-    fn offset_value(val: Value, delta: u64) -> Option<Value> {
+    fn offset_value(val: Value, delta: i64) -> Option<Value> {
         match val {
-            Value::Const(va) => Some(Value::Const(va.wrapping_add(delta))),
+            Value::Const(va) => va.checked_add_signed(delta).map(Value::Const),
             Value::TablePtr {
                 table,
                 index,
@@ -714,7 +818,7 @@ impl Slicer<'_, '_, '_, '_> {
                 index_width,
                 scale,
             } => Some(Value::TablePtr {
-                table: table.wrapping_add(delta),
+                table: table.checked_add_signed(delta)?,
                 index,
                 index_at,
                 index_width,
@@ -726,7 +830,7 @@ impl Slicer<'_, '_, '_, '_> {
             } => Some(Value::Target {
                 load,
                 encoding: EntryEncoding::Unsigned32 {
-                    base: base.wrapping_add(delta),
+                    base: base.checked_add_signed(delta)?,
                 },
             }),
             Value::Target {
@@ -735,7 +839,7 @@ impl Slicer<'_, '_, '_, '_> {
             } => Some(Value::Target {
                 load,
                 encoding: EntryEncoding::Signed32 {
-                    base: base.wrapping_add(delta),
+                    base: base.checked_add_signed(delta)?,
                 },
             }),
             _ => None,
@@ -756,7 +860,7 @@ impl Slicer<'_, '_, '_, '_> {
         match (lhs, rhs) {
             (Some(Value::Const(base)), Some(Value::Entry { load, signed }))
             | (Some(Value::Entry { load, signed }), Some(Value::Const(base))) => {
-                let adj_base = base.wrapping_add(disp);
+                let adj_base = checked_disp_add(base, disp)?;
                 let encoding = if signed {
                     EntryEncoding::Signed32 { base: adj_base }
                 } else {
@@ -778,7 +882,7 @@ impl Slicer<'_, '_, '_, '_> {
         disp: u64,
         depth: u32,
     ) -> Option<Value> {
-        let table = base.wrapping_add(disp);
+        let table = checked_disp_add(base, disp)?;
         if let Some((orig_idx, orig_at, orig_width, scale)) = self.scaled_index(idx, at, depth + 1)
         {
             Some(Value::TablePtr {
@@ -813,7 +917,7 @@ impl Slicer<'_, '_, '_, '_> {
 
         if base.is_gpr64() && index == Register::None {
             let v = self.value(base, at, depth + 1)?;
-            return Self::offset_value(v, disp);
+            return Self::offset_value(v, disp as i64);
         }
         if base.is_gpr64() && index.is_gpr64() && scale == 1 {
             return self.add_reg_value(base, index, at, disp, depth);
@@ -824,7 +928,7 @@ impl Slicer<'_, '_, '_, '_> {
             && let Some(Value::Const(base_va)) = self.value(base, at, depth + 1)
         {
             return Some(Value::TablePtr {
-                table: base_va.wrapping_add(disp),
+                table: checked_disp_add(base_va, disp)?,
                 index: index.full_register(),
                 index_at: at,
                 index_width: 64,
@@ -851,7 +955,7 @@ impl Slicer<'_, '_, '_, '_> {
         before: usize,
         depth: u32,
     ) -> Option<(Register, usize, u32, u32)> {
-        if depth > MAX_SLICE_DEPTH {
+        if depth > MAX_SLICE_DEPTH || !self.consume_step() {
             return None;
         }
         let reg = reg.full_register();
@@ -908,7 +1012,10 @@ impl Slicer<'_, '_, '_, '_> {
 
     /// Match an `element`-byte table read in operand `mem_op` of the instruction at `at`.
     fn table_load(&mut self, at: usize, mem_op: u32, element: u32, depth: u32) -> Option<Load> {
-        let instr = self.trace[at].instr;
+        if depth > MAX_SLICE_DEPTH || !self.consume_step() {
+            return None;
+        }
+        let instr = self.trace.get(at)?.instr;
         if instr.op_kind(mem_op) != OpKind::Memory
             || instr.is_ip_rel_memory_operand()
             || instr.memory_size().size() != element as usize
@@ -926,10 +1033,12 @@ impl Slicer<'_, '_, '_, '_> {
 
         // Standard `[rBase + rIdx*element + disp]` (and swapped `[rIdx + rBase + disp]` for scale 1).
         if base.is_gpr64() && index.is_gpr64() && scale == element {
-            if let Some(Value::Const(base_va)) = self.value(base, at, depth + 1) {
+            if let Some(Value::Const(base_va)) = self.value(base, at, depth + 1)
+                && let Some(table) = checked_disp_add(base_va, disp)
+            {
                 return Some(Load {
                     at,
-                    table: base_va.wrapping_add(disp),
+                    table,
                     index: index.full_register(),
                     index_at: at,
                     index_width: 64,
@@ -937,10 +1046,11 @@ impl Slicer<'_, '_, '_, '_> {
             }
             if element == 1
                 && let Some(Value::Const(base_va)) = self.value(index, at, depth + 1)
+                && let Some(table) = checked_disp_add(base_va, disp)
             {
                 return Some(Load {
                     at,
-                    table: base_va.wrapping_add(disp),
+                    table,
                     index: base.full_register(),
                     index_at: at,
                     index_width: 64,
@@ -948,8 +1058,13 @@ impl Slicer<'_, '_, '_, '_> {
             }
         }
 
-        // Pre-scaled index `[rBase + rScaled*scale + disp]` where `scale < element`.
-        if base.is_gpr64() && index.is_gpr64() && scale < element && element.is_multiple_of(scale) {
+        // Pre-scaled index `[rBase + rScaled*scale + disp]` where `0 < scale < element`.
+        if base.is_gpr64()
+            && index.is_gpr64()
+            && scale > 0
+            && scale < element
+            && element.is_multiple_of(scale)
+        {
             let need = element / scale;
             let pairs: &[(Register, Register)] = if scale == 1 {
                 &[(base, index), (index, base)]
@@ -958,13 +1073,14 @@ impl Slicer<'_, '_, '_, '_> {
             };
             for &(b, idx) in pairs {
                 if let Some(Value::Const(base_va)) = self.value(b, at, depth + 1)
+                    && let Some(table) = checked_disp_add(base_va, disp)
                     && let Some((orig_idx, orig_at, orig_width, s)) =
                         self.scaled_index(idx, at, depth + 1)
                     && s == need
                 {
                     return Some(Load {
                         at,
-                        table: base_va.wrapping_add(disp),
+                        table,
                         index: orig_idx,
                         index_at: orig_at,
                         index_width: orig_width,
@@ -984,10 +1100,11 @@ impl Slicer<'_, '_, '_, '_> {
                 scale: ptr_scale,
             }) = self.value(base, at, depth + 1)
             && ptr_scale == element
+            && let Some(table) = checked_disp_add(ptr_base, disp)
         {
             return Some(Load {
                 at,
-                table: ptr_base.wrapping_add(disp),
+                table,
                 index: orig_idx,
                 index_at,
                 index_width,
@@ -1015,7 +1132,7 @@ impl Slicer<'_, '_, '_, '_> {
     /// Proven inclusive unsigned range `[min, max]` of the low `width` bits of the full register
     /// `reg` just before position `before` (`width == 64`: of the whole register).
     fn bound(&mut self, reg: Register, before: usize, width: u32, depth: u32) -> Option<Bound> {
-        if depth > MAX_SLICE_DEPTH {
+        if depth > MAX_SLICE_DEPTH || width == 0 || width > 64 || !self.consume_step() {
             return None;
         }
         let reg = reg.full_register();
@@ -1057,7 +1174,7 @@ impl Slicer<'_, '_, '_, '_> {
                         unsigned_upper = Some(unsigned_upper.map_or(v, |cur| cur.min(v)));
                     }
                     GuardFact::NotEqual(v) => {
-                        if excluded.len() < 8 {
+                        if !excluded.contains(&v) && excluded.len() < MAX_EXCLUDED_VALUES {
                             excluded.push(v);
                         }
                     }
@@ -1098,17 +1215,18 @@ impl Slicer<'_, '_, '_, '_> {
         if min > max {
             return None;
         }
-        while excluded.contains(&max) {
+        excluded.sort_unstable();
+        while excluded.binary_search(&max).is_ok() {
             if max == min {
                 return None;
             }
-            max -= 1;
+            max = max.checked_sub(1)?;
         }
-        while excluded.contains(&min) {
+        while excluded.binary_search(&min).is_ok() {
             if min == max {
                 return None;
             }
-            min += 1;
+            min = min.checked_add(1)?;
         }
         if min > max {
             return None;
@@ -1116,26 +1234,28 @@ impl Slicer<'_, '_, '_, '_> {
         Some(Bound { min, max, index })
     }
 
-    /// Shift a proven range `[min, max]` by signed `delta`, failing if it would wrap `eff_bits`.
+    /// Shift a proven range `[min, max]` by signed `delta`, failing if it would wrap `eff_bits`
+    /// or `width`.
     fn shift_bound(deeper: Bound, delta: i128, eff_bits: u32, width: u32) -> Option<Bound> {
-        if deeper.index.is_some() {
+        if deeper.index.is_some() || eff_bits == 0 || width == 0 {
             return None;
         }
-        let new_min = i128::from(deeper.min) + delta;
-        let new_max = i128::from(deeper.max) + delta;
-        if new_min < 0 || new_min > new_max || new_max > i128::from(mask(eff_bits)) {
+        let new_min = i128::from(deeper.min).checked_add(delta)?;
+        let new_max = i128::from(deeper.max).checked_add(delta)?;
+        let max_allowed = i128::from(mask(eff_bits.min(width)));
+        if new_min < 0 || new_min > new_max || new_max > max_allowed {
             return None;
         }
         Some(Bound {
-            min: new_min as u64,
-            max: (new_max as u64).min(mask(width)),
+            min: u64::try_from(new_min).ok()?,
+            max: u64::try_from(new_max).ok()?,
             index: None,
         })
     }
 
     /// Bound of the register written by the instruction at `at`.
     fn def_bound(&mut self, at: usize, width: u32, depth: u32) -> Option<Bound> {
-        let instr = self.trace[at].instr;
+        let instr = self.trace.get(at)?.instr;
         let dst = instr.op0_register();
         let src = instr.op1_register();
         let src_is_reg = instr.op_count() == 2 && instr.op1_kind() == OpKind::Register;
@@ -1174,13 +1294,14 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::Mov
                 if instr.op_count() == 2
                     && instr.op0_kind() == OpKind::Register
+                    && dst.is_gpr()
                     && instr.try_immediate(1).is_ok()
                     && (dst.is_gpr32()
                         || dst.is_gpr64()
                         || (!is_high_byte(dst) && width <= dst.size() as u32 * 8)) =>
             {
                 let dst_bits = dst.size() as u32 * 8;
-                let v = (instr.try_immediate(1).ok()? & mask(dst_bits)).min(mask(width));
+                let v = (instr.try_immediate(1).ok()? & mask(dst_bits)) & mask(width);
                 Some(Bound {
                     min: v,
                     max: v,
@@ -1190,6 +1311,7 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::Xor
                 if src_is_reg
                     && dst == src
+                    && dst.is_gpr()
                     && (dst.is_gpr32()
                         || dst.is_gpr64()
                         || (!is_high_byte(dst) && width <= dst.size() as u32 * 8)) =>
@@ -1256,6 +1378,7 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::And
                 if instr.op_count() == 2
                     && instr.op0_kind() == OpKind::Register
+                    && dst.is_gpr()
                     && instr.try_immediate(1).is_ok() =>
             {
                 let dst_bits = dst.size() as u32 * 8;
@@ -1285,6 +1408,7 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::Shr
                 if instr.op_count() == 2
                     && instr.op0_kind() == OpKind::Register
+                    && dst.is_gpr()
                     && instr.try_immediate(1).is_ok() =>
             {
                 let dst_bits = dst.size() as u32 * 8;
@@ -1295,9 +1419,18 @@ impl Slicer<'_, '_, '_, '_> {
                 let shift =
                     (instr.try_immediate(1).ok()? & if dst_bits == 64 { 63 } else { 31 }) as u32;
                 let deeper = self.bound(dst, at, dst_bits, depth + 1);
+                let wmask = mask(width);
                 let (min, max) = match deeper {
-                    Some(b) => (b.min >> shift, (b.max >> shift).min(mask(width))),
-                    None => (0, (mask(dst_bits) >> shift).min(mask(width))),
+                    Some(b) => {
+                        let lo = b.min >> shift;
+                        let hi = b.max >> shift;
+                        if hi <= wmask {
+                            (lo, hi)
+                        } else {
+                            (0, wmask)
+                        }
+                    }
+                    None => (0, (mask(dst_bits) >> shift).min(wmask)),
                 };
                 Some(Bound {
                     min,
@@ -1362,6 +1495,10 @@ impl Slicer<'_, '_, '_, '_> {
 
     /// Two-level dispatch: `movzx r, byte/word [base + index*element + index_rva]` from `load`.
     fn index_table_from_load(&mut self, load: Load, element: u32, depth: u32) -> Option<Bound> {
+        if depth > MAX_SLICE_DEPTH || !self.consume_step() {
+            return None;
+        }
+        let load_site = self.trace.get(load.at)?.instr.ip();
         let outer = self.bound(load.index, load.index_at, load.index_width, depth + 1)?;
         if outer.index.is_some() || outer.min > outer.max {
             return None;
@@ -1371,8 +1508,9 @@ impl Slicer<'_, '_, '_, '_> {
             return None;
         }
         let elem = u64::from(element);
-        let table_start = load.table.wrapping_add(outer.min.checked_mul(elem)?);
+        let table_start = load.table.checked_add(outer.min.checked_mul(elem)?)?;
         let byte_len = count.checked_mul(elem)?;
+        table_start.checked_add(byte_len)?;
         let bytes = read(self.image, table_start, byte_len)?;
         let max = match element {
             1 => u64::from(bytes.iter().copied().max()?),
@@ -1382,11 +1520,14 @@ impl Slicer<'_, '_, '_, '_> {
                 .max()?,
             _ => return None,
         };
+        if max >= MAX_JUMP_TABLE_ENTRIES {
+            return None;
+        }
         Some(Bound {
             min: 0,
             max,
             index: Some(JumpTableIndex {
-                load_site: self.trace[load.at].instr.ip(),
+                load_site,
                 table: table_start,
                 len: byte_len,
             }),
@@ -1396,7 +1537,7 @@ impl Slicer<'_, '_, '_, '_> {
     /// Constraint implied by the conditional branch at `at` (taken or not, per `taken`) from the
     /// last flag-modifying instruction before it.
     fn guard_at(&mut self, at: usize, taken: bool) -> Option<RawGuard> {
-        let jcc = self.trace[at].instr.mnemonic();
+        let jcc = self.trace.get(at)?.instr.mnemonic();
         for i in (0..at).rev() {
             let instr = self.trace[i].instr;
             if matches!(
@@ -1414,12 +1555,15 @@ impl Slicer<'_, '_, '_, '_> {
                         return None;
                     }
                     let cmp_reg = instr.op0_register();
-                    if is_high_byte(cmp_reg)
+                    let bits = cmp_reg.size() as u32 * 8;
+                    if !cmp_reg.is_gpr()
+                        || bits == 0
+                        || bits > 64
+                        || is_high_byte(cmp_reg)
                         || (i + 1..at).any(|k| self.writes(self.trace[k].instr, cmp_reg))
                     {
                         return None;
                     }
-                    let bits = cmp_reg.size() as u32 * 8;
                     let imm = instr.try_immediate(1).ok()?;
                     let fact = Self::cmp_imm_fact(jcc, taken, imm, bits)?;
                     return Some(RawGuard {
@@ -1433,10 +1577,15 @@ impl Slicer<'_, '_, '_, '_> {
                         return None;
                     }
                     let r = instr.op0_register();
-                    if is_high_byte(r) || (i + 1..at).any(|k| self.writes(self.trace[k].instr, r)) {
+                    let bits = r.size() as u32 * 8;
+                    if !r.is_gpr()
+                        || bits == 0
+                        || bits > 64
+                        || is_high_byte(r)
+                        || (i + 1..at).any(|k| self.writes(self.trace[k].instr, r))
+                    {
                         return None;
                     }
-                    let bits = r.size() as u32 * 8;
                     if instr.op1_kind() == OpKind::Register && instr.op1_register() == r {
                         let fact = match (jcc, taken) {
                             (Mnemonic::Js, false)
@@ -1503,9 +1652,10 @@ impl Slicer<'_, '_, '_, '_> {
             && !matches!(a.memory_segment(), Register::FS | Register::GS)
             && a.memory_size().size() == b.memory_size().size()
             && if a.is_ip_rel_memory_operand() || b.is_ip_rel_memory_operand() {
-                a.is_ip_rel_memory_operand()
-                    && b.is_ip_rel_memory_operand()
-                    && a.ip_rel_memory_address() == b.ip_rel_memory_address()
+                matches!(
+                    (checked_rip_target(a), checked_rip_target(b)),
+                    (Some(ta), Some(tb)) if ta == tb
+                )
             } else {
                 a.memory_base().is_gpr64()
                     && a.memory_base() == b.memory_base()
@@ -1518,9 +1668,15 @@ impl Slicer<'_, '_, '_, '_> {
     /// change the slot's base register (`cmp dword [rsp+0x30], 11; ja default; ...;
     /// mov eax, [rsp+0x30]`).
     fn slot_bound(&mut self, at: usize, width: u32) -> Option<Bound> {
-        let load = self.trace[at].instr;
+        if width == 0 || width > 64 {
+            return None;
+        }
+        let load = self.trace.get(at)?.instr;
         let base = load.memory_base();
         let bits = load.memory_size().size() as u32 * 8;
+        if bits == 0 || bits > 64 {
+            return None;
+        }
         let mut upper: Option<u64> = None;
         let mut lower: u64 = 0;
         for i in (0..at).rev() {
@@ -1576,6 +1732,9 @@ impl Slicer<'_, '_, '_, '_> {
     /// Fact proven about the left operand of `cmp x, imm` (`bits` wide) when the conditional
     /// branch `jcc` is taken (`taken`) or falls through.
     fn cmp_imm_fact(jcc: Mnemonic, taken: bool, imm: u64, bits: u32) -> Option<GuardFact> {
+        if bits == 0 || bits > 64 {
+            return None;
+        }
         let imm_u = imm & mask(bits);
         let imm_s = sign_extend(imm, bits);
         let fact = match (jcc, taken) {
@@ -1586,7 +1745,7 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Jb, false) | (Mnemonic::Jae, true) => GuardFact::UnsignedLower(imm_u),
             (Mnemonic::Jbe, false) | (Mnemonic::Ja, true) => {
                 if imm_u < mask(bits) {
-                    GuardFact::UnsignedLower(imm_u + 1)
+                    GuardFact::UnsignedLower(imm_u.checked_add(1)?)
                 } else {
                     return None;
                 }
@@ -1594,7 +1753,7 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Jg, false) | (Mnemonic::Jle, true) => GuardFact::SignedUpper(imm_s),
             (Mnemonic::Jge, false) | (Mnemonic::Jl, true) => {
                 if imm_s > min_signed(bits) {
-                    GuardFact::SignedUpper(imm_s - 1)
+                    GuardFact::SignedUpper(imm_s.checked_sub(1)?)
                 } else {
                     return None;
                 }
@@ -1602,7 +1761,7 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Jl, false) | (Mnemonic::Jge, true) => GuardFact::SignedLower(imm_s),
             (Mnemonic::Jle, false) | (Mnemonic::Jg, true) => {
                 if imm_s < max_signed(bits) {
-                    GuardFact::SignedLower(imm_s + 1)
+                    GuardFact::SignedLower(imm_s.checked_add(1)?)
                 } else {
                     return None;
                 }
@@ -1634,6 +1793,9 @@ impl Slicer<'_, '_, '_, '_> {
         let target_full = raw.reg.full_register();
 
         for _ in 0..=MAX_ALIAS_DEPTH {
+            if !self.consume_step() {
+                return None;
+            }
             if cur_reg == target_full
                 && raw.bits < 32
                 && raw.bits < cur_width
@@ -3735,6 +3897,440 @@ mod tests {
                 UnresolvedJump::LoadedPointer,
                 UnresolvedJump::RegisterLiveIn,
             ]
+        );
+    }
+
+    // ---- R44: checked bounds, determinism, entry caps & slice-budget hardening -----------------
+
+    #[test]
+    fn r44_checked_arithmetic_rejects_rva_va_wraparound_and_short_chunks() {
+        use super::{EntryEncoding, checked_disp_add, checked_rip_target, infer_extent, read};
+
+        // Truncated chunks never panic.
+        let enc_u32 = EntryEncoding::Unsigned32 { base: BASE };
+        let enc_i32 = EntryEncoding::Signed32 { base: BASE };
+        let enc_abs = EntryEncoding::Absolute64;
+        assert_eq!(enc_u32.decode(&[]), None);
+        assert_eq!(enc_u32.decode(&[1, 2, 3]), None);
+        assert_eq!(enc_i32.decode(&[1, 2]), None);
+        assert_eq!(enc_abs.decode(&[0; 7]), None);
+
+        // Unsigned32 overflow past u64::MAX is rejected instead of wrapping into low memory.
+        let high_u32 = EntryEncoding::Unsigned32 {
+            base: u64::MAX - 0x10,
+        };
+        assert_eq!(high_u32.decode(&0x20u32.to_le_bytes()), None);
+        assert_eq!(high_u32.decode(&0x10u32.to_le_bytes()), Some(u64::MAX));
+
+        // Signed32 underflow below 0 and overflow past u64::MAX are rejected.
+        let low_i32 = EntryEncoding::Signed32 { base: 0x10 };
+        assert_eq!(low_i32.decode(&(-0x20i32).to_le_bytes()), None);
+        assert_eq!(low_i32.decode(&(-0x10i32).to_le_bytes()), Some(0));
+        let high_i32 = EntryEncoding::Signed32 {
+            base: u64::MAX - 0x10,
+        };
+        assert_eq!(high_i32.decode(&0x20i32.to_le_bytes()), None);
+        assert_eq!(high_i32.decode(&0x10i32.to_le_bytes()), Some(u64::MAX));
+
+        // Signed displacement addition rejects wraparound in both directions.
+        assert_eq!(checked_disp_add(BASE, 0x2000), Some(BASE + 0x2000));
+        assert_eq!(
+            checked_disp_add(BASE + 0x2000, (-0x1000i64) as u64),
+            Some(BASE + 0x1000)
+        );
+        assert_eq!(checked_disp_add(0x10, (-0x20i64) as u64), None);
+        assert_eq!(checked_disp_add(u64::MAX - 0x10, 0x20), None);
+
+        // Wrapping RIP-relative LEA near u64::MAX is rejected.
+        let lea_plus_100 = [0x48, 0x8d, 0x15, 0x00, 0x01, 0x00, 0x00]; // lea rdx, [rip + 0x100]
+        let mut dec_ok = Decoder::with_ip(64, &lea_plus_100, BASE + 0x1000, DecoderOptions::NONE);
+        assert_eq!(
+            checked_rip_target(&dec_ok.decode()),
+            Some(BASE + 0x1007 + 0x100)
+        );
+        let mut dec_wrap = Decoder::with_ip(64, &lea_plus_100, u64::MAX - 0x20, DecoderOptions::NONE);
+        assert_eq!(checked_rip_target(&dec_wrap.decode()), None);
+
+        // `read` rejects zero-length reads and VA wraparound across u64::MAX.
+        let tail_bytes = [0x90u8; 16];
+        let wrap_image = CodeImage::new(
+            u64::MAX - 16,
+            vec![CodeSection::new(u64::MAX - 8, &tail_bytes, false)],
+            vec![],
+        );
+        assert_eq!(read(&wrap_image, u64::MAX - 8, 0), None);
+        assert_eq!(read(&wrap_image, u64::MAX - 8, 12), None);
+        assert_eq!(read(&wrap_image, u64::MAX - 8, 8).map(<[u8]>::len), Some(8));
+
+        // `infer_extent` near u64::MAX stops cleanly without overflowing `va += entry_size`.
+        let code = [0xff, 0xe1, 0xc3, 0xc3]; // jmp rcx; ret; ret
+        let code_va = u64::MAX - 0x200;
+        let table_va = u64::MAX - 8;
+        let target_a = code_va + 2;
+        let target_b = code_va + 3;
+        let mut table_bytes = Vec::new();
+        table_bytes.extend_from_slice(&((target_a - code_va) as u32).to_le_bytes());
+        table_bytes.extend_from_slice(&((target_b - code_va) as u32).to_le_bytes());
+        let mut high_image = CodeImage::new(
+            code_va,
+            vec![
+                CodeSection::new(code_va, &code, true),
+                CodeSection::new(table_va, &table_bytes, false),
+            ],
+            vec![code_va],
+        );
+        high_image.function_table = FunctionTable::new(vec![FunctionRange {
+            start: code_va,
+            end: code_va + code.len() as u64,
+            function: code_va,
+        }]);
+        let jmp = Decoder::with_ip(64, &code, code_va, DecoderOptions::NONE).decode();
+        let inferred = infer_extent(
+            &high_image,
+            &jmp,
+            code_va,
+            table_va,
+            EntryEncoding::Unsigned32 { base: code_va },
+            None,
+            16,
+        )
+        .expect("two valid entries before u64::MAX resolve without overflowing");
+        assert_eq!(inferred.targets, [target_a, target_b]);
+    }
+
+    #[test]
+    fn r44_bit_width_helpers_and_malformed_traces_never_panic() {
+        use super::{Slicer, classify, mask, max_signed, min_signed, resolve, sign_extend};
+        use iced_x86::Mnemonic;
+
+        // Zero and oversized bit widths never panic on shift overflow.
+        assert_eq!(mask(0), 0);
+        assert_eq!(mask(64), u64::MAX);
+        assert_eq!(mask(128), u64::MAX);
+        assert_eq!(sign_extend(0xff, 0), 0);
+        assert_eq!(sign_extend(0xff, 8), -1);
+        assert_eq!(min_signed(0), 0);
+        assert_eq!(max_signed(0), 0);
+        assert!(Slicer::cmp_imm_fact(Mnemonic::Ja, false, 3, 0).is_none());
+        assert!(Slicer::cmp_imm_fact(Mnemonic::Ja, false, 3, 128).is_none());
+
+        // Empty trace and invalid Instruction::default() never panic.
+        let image = CodeImage::new(BASE, vec![], vec![]);
+        assert!(resolve(&image, &[]).is_none());
+        assert_eq!(classify(&image, &[]), UnresolvedJump::Computed);
+
+        let invalid = Instruction::default();
+        let bad_trace = [super::Step {
+            instr: &invalid,
+            taken: None,
+        }];
+        assert!(resolve(&image, &bad_trace).is_none());
+        assert_eq!(classify(&image, &bad_trace), UnresolvedJump::Computed);
+    }
+
+    #[test]
+    fn r44_deterministic_target_ordering_and_sorted_unique_targets() {
+        use super::sorted_unique_targets;
+
+        // 6-entry table with reversed and duplicated case targets.
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let slot_targets = [cases[2], cases[0], cases[2], cases[1], cases[0], cases[3]];
+        let data = rva_table(slot_targets.map(|va| (va - BASE) as u32));
+
+        let run_a = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let run_b = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        assert_eq!(run_a, run_b);
+
+        let jt = run_a
+            .jump_tables
+            .get(&jmp_va)
+            .expect("switch with reversed/duplicate targets resolved");
+        // Table-slot order is preserved for JumpTableEntry relocations.
+        assert_eq!(jt.targets, slot_targets);
+        // Canonical sorted unique target view is strictly ascending and deduplicated.
+        let canonical = sorted_unique_targets(jt);
+        let mut expected = cases.to_vec();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(canonical, expected);
+        assert_eq!(
+            jump_successors(&run_a.functions[&TEXT], jmp_va),
+            expected
+                .iter()
+                .copied()
+                .map(Edge::JumpTable)
+                .collect::<Vec<_>>()
+        );
+
+        // Duplicate `!=` guards on the upper bound still trim deterministically.
+        let code_neq = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.and(ecx, 3)?;
+            a.cmp(ecx, 3)?;
+            a.je(def)?;
+            a.cmp(ecx, 3)?;
+            a.je(def)?;
+            a.cmp(ecx, 2)?;
+            a.je(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let neq_cases = find_four_cases(&code_neq);
+        let neq_jmp = find_indirect_jmp(&code_neq);
+        let neq_data = rva_table(neq_cases[..2].iter().map(|va| (va - BASE) as u32));
+        let neq_analysis = analyze(&code_neq, &neq_data, &[0], &[(0, code_neq.len() as u32, 0)]);
+        let neq_jt = neq_analysis
+            .jump_tables
+            .get(&neq_jmp)
+            .expect("duplicate NotEqual guards trim deterministically");
+        assert!(!neq_jt.inferred);
+        assert_eq!(neq_jt.targets, neq_cases[..2]);
+    }
+
+    #[test]
+    fn r44_bounded_entry_caps_and_slicer_step_budget() {
+        use super::{
+            EntryEncoding, MAX_INFERRED_ENTRIES, MAX_JUMP_TABLE_ENTRIES, classify, infer_extent,
+            resolve,
+        };
+
+        // 1) Proven bound exceeding MAX_JUMP_TABLE_ENTRIES is rejected cleanly.
+        let code_over_cap = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, MAX_JUMP_TABLE_ENTRIES as u32)?; // 0..=65536 => 65537 entries > cap
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let over_cases = find_four_cases(&code_over_cap);
+        let over_jmp = (find_indirect_jmp(&code_over_cap) - TEXT) as u32;
+        let over_data = rva_table(over_cases.map(|va| (va - BASE) as u32));
+        assert_unresolved(&analyze(&code_over_cap, &over_data, &[0], &[]), over_jmp);
+
+        // 2) Inferred extent strictly caps at MAX_INFERRED_ENTRIES and rejects limit < 2.
+        let (loop_code, loop_cases, loop_jmp) = loop_remainder_switch();
+        let big_data = rva_table(std::iter::repeat_n(
+            (loop_cases[0] - BASE) as u32,
+            MAX_INFERRED_ENTRIES + 32,
+        ));
+        let big_analysis = analyze(
+            &loop_code,
+            &big_data,
+            &[0],
+            &[(0, loop_code.len() as u32, 0)],
+        );
+        let big_jt = big_analysis
+            .jump_tables
+            .get(&loop_jmp)
+            .expect("large inferred table resolved up to cap");
+        assert!(big_jt.inferred);
+        assert_eq!(big_jt.targets.len(), MAX_INFERRED_ENTRIES);
+
+        let mut img = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &loop_code, true),
+                CodeSection::new(DATA, &big_data, false),
+            ],
+            vec![TEXT],
+        );
+        img.function_table = FunctionTable::new(vec![FunctionRange {
+            start: TEXT,
+            end: TEXT + loop_code.len() as u64,
+            function: TEXT,
+        }]);
+        let mut dec = Decoder::with_ip(64, &loop_code, TEXT, DecoderOptions::NONE);
+        let mut jmp_instr = Instruction::default();
+        while dec.can_decode() {
+            let i = dec.decode();
+            if i.ip() == loop_jmp {
+                jmp_instr = i;
+                break;
+            }
+        }
+        assert!(
+            infer_extent(
+                &img,
+                &jmp_instr,
+                loop_jmp,
+                DATA,
+                EntryEncoding::Unsigned32 { base: BASE },
+                None,
+                1,
+            )
+            .is_none()
+        );
+
+        // 3) Adversarial exponential-fanout `add rax, rax` chain hits MAX_SLICE_STEPS cleanly.
+        let fanout_code = assemble_at_text(|a| {
+            for _ in 0..24 {
+                a.add(rax, rax)?;
+            }
+            a.jmp(rax)?;
+            Ok(())
+        });
+        let fanout_img = CodeImage::new(
+            BASE,
+            vec![CodeSection::new(TEXT, &fanout_code, true)],
+            vec![TEXT],
+        );
+        let mut dec = Decoder::with_ip(64, &fanout_code, TEXT, DecoderOptions::NONE);
+        let mut instrs = Vec::new();
+        while dec.can_decode() {
+            instrs.push(dec.decode());
+        }
+        let steps: Vec<super::Step<'_>> = instrs
+            .iter()
+            .map(|instr| super::Step { instr, taken: None })
+            .collect();
+        assert!(resolve(&fanout_img, &steps).is_none());
+        assert_eq!(classify(&fanout_img, &steps), UnresolvedJump::Computed);
+    }
+
+    #[test]
+    fn r44_truncated_tables_and_malformed_leaf_gaps_return_none() {
+        use super::{EntryEncoding, infer_extent};
+
+        // 1) Truncated 32-bit RVA table (missing 1..3 bytes of final entry).
+        let code = switch_code(TEXT_RVA, DATA_RVA);
+        let full_data = case_table(TEXT_RVA);
+        for cut in 1..=3 {
+            let truncated = &full_data[..full_data.len() - cut];
+            assert_unresolved(&analyze(&code, truncated, &[0], &[]), 0x19);
+        }
+
+        // 2) Truncated 64-bit pointer table (missing final 4 bytes).
+        let code_abs = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.mov(rax, qword_ptr(rdx + rax * 8))?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_abs = find_four_cases(&code_abs);
+        let jmp_abs = (find_indirect_jmp(&code_abs) - TEXT) as u32;
+        let data_abs: Vec<u8> = cases_abs.iter().flat_map(|&va| va.to_le_bytes()).collect();
+        assert_unresolved(
+            &analyze(&code_abs, &data_abs[..data_abs.len() - 4], &[0], &[]),
+            jmp_abs,
+        );
+
+        // 3) Truncated 16-bit word index table (odd byte length, missing 1 byte of last u16).
+        let code_word = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movzx(eax, word_ptr(rdx + rax * 2 + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_word = find_four_cases(&code_word);
+        let jmp_word = (find_indirect_jmp(&code_word) - TEXT) as u32;
+        let mut data_word = rva_table(cases_word.map(|va| (va - BASE) as u32));
+        data_word.resize(0x20, 0xcc);
+        data_word.extend_from_slice(&[0, 0, 1, 0, 2, 0, 3]); // 7 bytes instead of 8!
+        assert_unresolved(&analyze(&code_word, &data_word, &[0], &[]), jmp_word);
+
+        // 4) Malformed / inverted leaf gap returns None cleanly without panicking.
+        let leaf_code = [0xff, 0xe1, 0xc3, 0xc3];
+        let leaf_data = rva_table([TEXT_RVA + 2, TEXT_RVA + 3]);
+        let mut leaf_img = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &leaf_code, true),
+                CodeSection::new(DATA, &leaf_data, false),
+            ],
+            vec![TEXT],
+        );
+        leaf_img.function_table = FunctionTable::new(vec![
+            FunctionRange {
+                start: TEXT - 0x20,
+                end: TEXT - 0x10,
+                function: TEXT - 0x20,
+            },
+            FunctionRange {
+                start: TEXT + 0x10,
+                end: TEXT + 0x20,
+                function: TEXT + 0x10,
+            },
+        ]);
+        let jmp = Decoder::with_ip(64, &leaf_code, TEXT, DecoderOptions::NONE).decode();
+        // Inverted leaf extent (entry > next).
+        assert!(
+            infer_extent(
+                &leaf_img,
+                &jmp,
+                TEXT,
+                DATA,
+                EntryEncoding::Unsigned32 { base: BASE },
+                Some((TEXT + 0x10, TEXT)),
+                16,
+            )
+            .is_none()
+        );
+        // Jump whose next_ip equals the end of the leaf extent (empty post-dispatch span).
+        assert!(
+            infer_extent(
+                &leaf_img,
+                &jmp,
+                TEXT,
+                DATA,
+                EntryEncoding::Unsigned32 { base: BASE },
+                Some((TEXT, jmp.next_ip())),
+                16,
+            )
+            .is_none()
         );
     }
 }
