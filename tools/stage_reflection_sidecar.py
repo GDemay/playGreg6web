@@ -9,7 +9,11 @@ sidecar only when its reflection carries the join keys the runtime needs:
     {user_sgpr, root_descriptor} | {static_sampler} | {sampler_heap | resource_heap: {base_user_sgpr,
     stride, index: {user_sgpr, shift}}} (S34: a directly indexed heap, index from a root constant) |
     {inline_sampler: {sdwords: [d0, d1, d2, d3]}} (#482: the four GFX10 S# dwords of a sampler the
-    stage builds from constants; the runtime decodes them));
+    stage builds from constants; the runtime decodes them) |
+    {cbv_indexed_resource_heap | cbv_indexed_sampler_heap: {cbv: {user_sgpr, root_descriptor: true} |
+    {user_sgpr, table_byte_offset} | {user_sgpr, root_constants: true}, byte_offset, shift,
+    bit_offset?, mask?, stride?}} (G62 / #482: SM 6.6 bindless, the heap index is the dword at
+    byte_offset of a constant buffer, read by the runtime at draw time));
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
@@ -68,6 +72,30 @@ def heap_source_ok(source: dict[str, Any]) -> bool | None:
     return all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in ints) and ints[3] < 32
 
 
+def _u32(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 0xFFFFFFFF
+
+
+def cbv_heap_source_ok(source: dict[str, Any]) -> bool | None:
+    """None: not a CB-indexed heap source; else whether it follows the G62 contract (#482)."""
+    heap = source.get("cbv_indexed_resource_heap", source.get("cbv_indexed_sampler_heap"))
+    if heap is None:
+        return None
+    if not isinstance(heap, dict) or not isinstance(heap.get("cbv"), dict):
+        return False
+    cbv = heap["cbv"]
+    where = [cbv.get("root_descriptor") is True, cbv.get("root_constants") is True, "table_byte_offset" in cbv]
+    if not _u32(cbv.get("user_sgpr")) or sum(where) != 1:
+        return False
+    if where[2] and (not _u32(cbv["table_byte_offset"]) or cbv["table_byte_offset"] % 32 != 0):
+        return False
+    byte_offset, shift = heap.get("byte_offset"), heap.get("shift")
+    if not _u32(byte_offset) or byte_offset % 4 != 0 or not _u32(shift) or shift >= 32:
+        return False
+    bit_offset, mask, stride = heap.get("bit_offset", 0), heap.get("mask", 0xFFFFFFFF), heap.get("stride", 0)
+    return _u32(bit_offset) and bit_offset < 32 and _u32(mask) and mask != 0 and _u32(stride)
+
+
 def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
     """None: not an inline sampler; else whether sdwords is four 32-bit unsigned integers."""
     if "inline_sampler" not in source:
@@ -93,6 +121,8 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
             return key, None, "malformed heap source"
         if inline_sampler_ok(source) is False:
             return key, None, "malformed inline sampler"
+        if cbv_heap_source_ok(source) is False:
+            return key, None, "malformed CB-indexed heap source"
         kind = KIND_MAP.get(str(b.get("kind", "")))
         if kind is None:
             return key, None, f"unknown binding kind {b.get('kind')!r}"
@@ -208,6 +238,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
     inline_sampler_bindings = 0
     resource_heap_stages = 0
     resource_heap_bindings = 0
+    cbv_indexed_heap_stages = 0
+    cbv_indexed_heap_bindings = 0
     vertex_index_stages = 0
 
     for stage_obj in stages.values():
@@ -219,6 +251,7 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
 
         has_inline_sampler = False
         has_resource_heap = False
+        has_cbv_indexed_heap = False
         bindings = stage_obj.get("bindings")
         if isinstance(bindings, list):
             for binding in bindings:
@@ -233,11 +266,16 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
                 if "resource_heap" in source:
                     resource_heap_bindings += 1
                     has_resource_heap = True
+                if "cbv_indexed_resource_heap" in source or "cbv_indexed_sampler_heap" in source:
+                    cbv_indexed_heap_bindings += 1
+                    has_cbv_indexed_heap = True
 
         if has_inline_sampler:
             inline_sampler_stages += 1
         if has_resource_heap:
             resource_heap_stages += 1
+        if has_cbv_indexed_heap:
+            cbv_indexed_heap_stages += 1
         if _is_vertex_index_stage(stage_obj):
             vertex_index_stages += 1
 
@@ -247,6 +285,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         "inline_sampler_bindings": inline_sampler_bindings,
         "resource_heap_stages": resource_heap_stages,
         "resource_heap_bindings": resource_heap_bindings,
+        "cbv_indexed_heap_stages": cbv_indexed_heap_stages,
+        "cbv_indexed_heap_bindings": cbv_indexed_heap_bindings,
         "vertex_index_stages": vertex_index_stages,
     }
 
