@@ -8,6 +8,7 @@ export const SCHEMA_VERSION = 1;
 export const DEFAULT_MAX_LOGS = 200;
 export const DEFAULT_MAX_ERRORS = 32;
 export const DEFAULT_APP_VERSION = '0.1.0';
+export const MAX_GPU_ADAPTER_LENGTH = 96;
 
 export const ERROR_CATEGORIES = Object.freeze([
   'wasm_trap',
@@ -610,6 +611,10 @@ function roundTo2(value) {
   return Math.round(value * 100) / 100;
 }
 
+function roundTo3(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
 function clipSanitizedString(value, maxLen = 256) {
   if (typeof value !== 'string') {
     return undefined;
@@ -640,6 +645,346 @@ function pickPct(obj, key) {
     return Math.min(100, Math.max(0, val));
   }
   return undefined;
+}
+
+function pickUnitLevel(obj, key) {
+  const val = obj[key];
+  if (typeof val === 'number' && Number.isFinite(val)) {
+    return Math.min(1, Math.max(0, val));
+  }
+  return undefined;
+}
+
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const GPU_ADAPTER_CTRL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+const GPU_ADAPTER_URL_RE = /\b(?:https?|file|data|javascript|ftp|wss?):\/\/[^\s"'`<>)\]},;]*/gi;
+const GPU_ADAPTER_SCHEME_RE = /\b(?:javascript|data):[^\s"'`<>)\]},;]*/gi;
+const GPU_ADAPTER_REDACTED_TOKEN_RE =
+  /(?:\b(?:bearer|basic)\s+)?\??\[REDACTED(?:_[A-Z0-9_]+)?\]/gi;
+const GPU_ADAPTER_LOWER_POSIX_PATH_RE =
+  /(^|[\s"'`(\[={<,:;|])(\/(?:users|library|applications|volumes|home|root|tmp|var|etc|opt|usr|mnt|media|private|srv|proc|sys|dev|run|cygdrive)(?:\/[^\s"'`<>)\]},;]+)?)(?=[\s"'`<>)\]},;]|$)/gi;
+const GPU_ADAPTER_MULTI_SEG_POSIX_PATH_RE =
+  /(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]*/g;
+const GPU_ADAPTER_BACKSLASH_TOKEN_RE = /(?:^|\s)[^\s]*\\[^\s]*/g;
+const GPU_ADAPTER_TRAVERSAL_RE = /\.\.(?:[\\/][^\s]*)?/g;
+
+function sanitizeGpuAdapterText(rawText, limit) {
+  if (typeof rawText !== 'string' || rawText.length === 0) {
+    return null;
+  }
+
+  let text = rawText
+    .replace(ANSI_ESCAPE_RE, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(GPU_ADAPTER_CTRL_CHAR_RE, '');
+
+  if (!text.trim()) {
+    return null;
+  }
+
+  // Strip HTML/script fragments, URLs, query/fragment tokens, and host paths/secrets.
+  text = text.replace(/<script\b[\s\S]*?<\/script>/gi, ' ');
+  text = text.replace(/<[^>]*>/g, ' ');
+  text = text.replace(GPU_ADAPTER_URL_RE, ' ');
+  text = text.replace(GPU_ADAPTER_SCHEME_RE, ' ');
+  text = sanitizeString(text);
+  text = text.replace(GPU_ADAPTER_REDACTED_TOKEN_RE, ' ');
+  text = text.replace(GPU_ADAPTER_BACKSLASH_TOKEN_RE, ' ');
+  text = text.replace(GPU_ADAPTER_TRAVERSAL_RE, ' ');
+  text = text.replace(GPU_ADAPTER_LOWER_POSIX_PATH_RE, '$1 ');
+  text = text.replace(GPU_ADAPTER_MULTI_SEG_POSIX_PATH_RE, '$1 ');
+  text = text.replace(/[?#][^\s]*/g, ' ');
+
+  text = text
+    .toLowerCase()
+    .replace(/\(\s*\)|\[\s*\]/g, ' ')
+    .replace(/[^a-z0-9 /._+()-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*\/\s*/g, ' / ')
+    .replace(/(?:\s*\/\s*){2,}/g, ' / ')
+    .replace(/^[\s/._+-]+|[\s/._+-]+$/g, '');
+
+  if (text.length > limit) {
+    text = text.slice(0, limit).replace(/[\s/._+-]+$/, '');
+  }
+
+  if (!/[a-z0-9]/.test(text)) {
+    return null;
+  }
+
+  return text.length > 0 ? text : null;
+}
+
+/**
+ * Sanitizes a WebGPU adapter label (or `{ vendor, architecture }` / `GPUAdapterInfo` object)
+ * into a lowercase safe vendor/architecture string of at most `MAX_GPU_ADAPTER_LENGTH` (96)
+ * characters with zero host paths, URLs, control characters, or secrets.
+ *
+ * @param {unknown} rawAdapter
+ * @param {number} [maxLength=MAX_GPU_ADAPTER_LENGTH]
+ * @returns {string|null}
+ */
+export function sanitizeGpuAdapter(rawAdapter, maxLength = MAX_GPU_ADAPTER_LENGTH) {
+  if (rawAdapter === null || rawAdapter === undefined) {
+    return null;
+  }
+
+  const limit =
+    typeof maxLength === 'number' && Number.isFinite(maxLength) && maxLength >= 1
+      ? Math.min(MAX_GPU_ADAPTER_LENGTH, Math.floor(maxLength))
+      : MAX_GPU_ADAPTER_LENGTH;
+
+  if (typeof rawAdapter === 'string') {
+    return sanitizeGpuAdapterText(rawAdapter, limit);
+  }
+
+  if (!isPlainObject(rawAdapter)) {
+    return null;
+  }
+
+  const source = isPlainObject(rawAdapter.info) ? rawAdapter.info : rawAdapter;
+  const rawVendor = typeof source.vendor === 'string' ? source.vendor : null;
+  const rawArch =
+    typeof source.architecture === 'string'
+      ? source.architecture
+      : typeof source.arch === 'string'
+        ? source.arch
+        : null;
+
+  if (rawVendor !== null || rawArch !== null) {
+    const safeVendor = rawVendor !== null ? sanitizeGpuAdapterText(rawVendor, limit) : null;
+    const safeArch = rawArch !== null ? sanitizeGpuAdapterText(rawArch, limit) : null;
+    if (safeVendor && safeArch) {
+      if (safeVendor === safeArch) {
+        return safeVendor;
+      }
+      return sanitizeGpuAdapterText(`${safeVendor} / ${safeArch}`, limit);
+    }
+    if (safeVendor || safeArch) {
+      return safeVendor || safeArch;
+    }
+  }
+
+  for (const key of ['gpuAdapter', 'gpu_adapter', 'adapterLabel', 'adapter_label', 'adapter', 'label', 'description', 'device', 'name']) {
+    if (typeof source[key] === 'string' && source[key].length > 0) {
+      const cleaned = sanitizeGpuAdapterText(source[key], limit);
+      if (cleaned !== null) {
+        return cleaned;
+      }
+    }
+  }
+
+  return null;
+}
+
+const GUEST_AUDIO_RING_KEYS = Object.freeze([
+  'guestRingAttached',
+  'guestFramesDrained',
+  'guestUnderruns',
+  'guestOverruns',
+  'guestPeakLevel',
+]);
+
+function hasGuestAudioRingFields(obj) {
+  if (!isPlainObject(obj)) {
+    return false;
+  }
+  for (let i = 0; i < GUEST_AUDIO_RING_KEYS.length; i += 1) {
+    if (obj[GUEST_AUDIO_RING_KEYS[i]] !== undefined) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Strictly allowlists and sanitizes `#1027` guest audio PCM ring telemetry
+ * (and safe AudioEngine/worker summary counters, supporting duck-typed
+ * `AudioEngine` instances via `getStats()` / `getTelemetry()`).
+ * Drops raw PCM buffers, host paths, secrets, and unknown keys.
+ *
+ * @param {unknown} raw
+ * @returns {object|null}
+ */
+function sanitizeAudioTelemetry(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getStats === 'function') {
+    try {
+      source = source.getStats();
+    } catch {
+      return null;
+    }
+  } else if (typeof source === 'object' && typeof source.getTelemetry === 'function') {
+    try {
+      source = source.getTelemetry();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+
+  const nestedGuest = isPlainObject(source.guestAudio)
+    ? source.guestAudio
+    : isPlainObject(source.guestRing)
+      ? source.guestRing
+      : null;
+
+  const out = {};
+
+  // #1027 guest audio PCM ring counters (strictly typed & bounded)
+  const rawAttached =
+    source.guestRingAttached !== undefined
+      ? source.guestRingAttached
+      : nestedGuest
+        ? nestedGuest.guestRingAttached ?? nestedGuest.attached
+        : undefined;
+  if (typeof rawAttached === 'boolean') {
+    out.guestRingAttached = rawAttached;
+  }
+
+  for (const intKey of ['guestFramesDrained', 'guestUnderruns', 'guestOverruns']) {
+    let val = pickNonNegInt(source, intKey);
+    if (val === undefined && nestedGuest) {
+      val = pickNonNegInt(nestedGuest, intKey);
+    }
+    if (val !== undefined) {
+      out[intKey] = val;
+    }
+  }
+
+  let guestPeakLevel = pickUnitLevel(source, 'guestPeakLevel');
+  if (guestPeakLevel === undefined && nestedGuest) {
+    guestPeakLevel = pickUnitLevel(nestedGuest, 'guestPeakLevel');
+  }
+  if (guestPeakLevel !== undefined) {
+    out.guestPeakLevel = guestPeakLevel;
+  }
+
+  // Safe AudioEngine / worker status metadata
+  for (const strKey of ['outputState', 'contextState', 'state']) {
+    const val = clipSanitizedString(source[strKey], 32);
+    if (val !== undefined) {
+      out[strKey] = val;
+    }
+  }
+
+  for (const intKey of [
+    'sampleRate',
+    'channels',
+    'capacityFrames',
+    'bufferedFrames',
+    'freeFrames',
+    'submittedFrames',
+    'consumedFrames',
+    'underruns',
+    'underrunFrames',
+    'overflows',
+    'overruns',
+    'droppedFrames',
+    'activeVoices',
+  ]) {
+    const val = pickNonNegInt(source, intKey);
+    if (val !== undefined) {
+      out[intKey] = val;
+    }
+  }
+
+  for (const levelKey of ['gain', 'volume', 'masterGain', 'effectiveGain']) {
+    const val = pickUnitLevel(source, levelKey);
+    if (val !== undefined) {
+      out[levelKey] = val;
+    }
+  }
+
+  for (const boolKey of ['muted', 'unlockedOnGesture']) {
+    if (typeof source[boolKey] === 'boolean') {
+      out[boolKey] = source[boolKey];
+    }
+  }
+
+  return out;
+}
+
+function extractMilestoneElapsedMs(milestones, name) {
+  if (!Array.isArray(milestones)) {
+    return null;
+  }
+  for (let i = 0; i < milestones.length; i += 1) {
+    const m = milestones[i];
+    if (
+      isPlainObject(m) &&
+      m.milestone === name &&
+      m.reached !== false &&
+      typeof m.elapsedMs === 'number' &&
+      Number.isFinite(m.elapsedMs) &&
+      m.elapsedMs >= 0
+    ) {
+      return m.elapsedMs;
+    }
+  }
+  return null;
+}
+
+function resolveBootTimingMetrics({
+  explicitFirstVisibleFrameMs,
+  explicitBlackLoadingMs,
+  bootSnapshot,
+  gpuTelemetry,
+}) {
+  const gpuFs = gpuTelemetry && isPlainObject(gpuTelemetry.frameStats) ? gpuTelemetry.frameStats : null;
+
+  const firstPresentMs =
+    (bootSnapshot && pickNonNegNumber(bootSnapshot, 'firstPresentMs')) ??
+    (gpuTelemetry && pickNonNegNumber(gpuTelemetry, 'firstPresentMs')) ??
+    (gpuFs && pickNonNegNumber(gpuFs, 'firstPresentMs')) ??
+    (bootSnapshot ? extractMilestoneElapsedMs(bootSnapshot.milestones, 'FIRST_PRESENT') : null) ??
+    null;
+
+  let firstVisibleFrameMs = null;
+  if (explicitFirstVisibleFrameMs === null) {
+    firstVisibleFrameMs = null;
+  } else if (
+    typeof explicitFirstVisibleFrameMs === 'number' &&
+    Number.isFinite(explicitFirstVisibleFrameMs) &&
+    explicitFirstVisibleFrameMs >= 0
+  ) {
+    firstVisibleFrameMs = explicitFirstVisibleFrameMs;
+  } else {
+    firstVisibleFrameMs =
+      (bootSnapshot && pickNonNegNumber(bootSnapshot, 'firstVisibleFrameMs')) ??
+      (gpuTelemetry && pickNonNegNumber(gpuTelemetry, 'firstVisibleFrameMs')) ??
+      (gpuFs && pickNonNegNumber(gpuFs, 'firstVisibleFrameMs')) ??
+      (bootSnapshot ? extractMilestoneElapsedMs(bootSnapshot.milestones, 'FIRST_VISIBLE_FRAME') : null) ??
+      null;
+  }
+
+  let blackLoadingMs = null;
+  if (explicitBlackLoadingMs === null) {
+    blackLoadingMs = null;
+  } else if (
+    typeof explicitBlackLoadingMs === 'number' &&
+    Number.isFinite(explicitBlackLoadingMs) &&
+    explicitBlackLoadingMs >= 0
+  ) {
+    blackLoadingMs = explicitBlackLoadingMs;
+  } else {
+    const explicitFromSources =
+      (bootSnapshot ? pickNonNegNumber(bootSnapshot, 'blackLoadingMs') : undefined) ??
+      (gpuTelemetry ? pickNonNegNumber(gpuTelemetry, 'blackLoadingMs') : undefined) ??
+      (gpuFs ? pickNonNegNumber(gpuFs, 'blackLoadingMs') : undefined);
+    if (explicitFromSources !== undefined) {
+      blackLoadingMs = explicitFromSources;
+    } else if (firstVisibleFrameMs !== null && firstPresentMs !== null) {
+      blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
+    }
+  }
+
+  return { firstVisibleFrameMs, blackLoadingMs };
 }
 
 function sanitizeTrapRecord(raw) {
@@ -848,6 +1193,30 @@ function sanitizeBootSnapshot(raw) {
 
   const elapsedMs = pickNonNegNumber(source, 'elapsedMs');
   if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  if (source.firstPresentMs === null) {
+    out.firstPresentMs = null;
+  } else {
+    const firstPresentMs = pickNonNegNumber(source, 'firstPresentMs');
+    if (firstPresentMs !== undefined) out.firstPresentMs = firstPresentMs;
+  }
+  if (source.firstVisibleFrameMs === null) {
+    out.firstVisibleFrameMs = null;
+  } else {
+    const firstVisibleFrameMs = pickNonNegNumber(source, 'firstVisibleFrameMs');
+    if (firstVisibleFrameMs !== undefined) out.firstVisibleFrameMs = firstVisibleFrameMs;
+  }
+  if (source.blackLoadingMs === null) {
+    out.blackLoadingMs = null;
+  } else {
+    const blackLoadingMs = pickNonNegNumber(source, 'blackLoadingMs');
+    if (blackLoadingMs !== undefined) out.blackLoadingMs = blackLoadingMs;
+  }
+  if (source.gpuAdapter === null) {
+    out.gpuAdapter = null;
+  } else if (source.gpuAdapter !== undefined) {
+    const gpuAdapter = sanitizeGpuAdapter(source.gpuAdapter);
+    if (gpuAdapter !== null) out.gpuAdapter = gpuAdapter;
+  }
   const milestonesReached = pickNonNegInt(source, 'milestonesReached');
   if (milestonesReached !== undefined) out.milestonesReached = milestonesReached;
 
@@ -1094,9 +1463,43 @@ function sanitizeGpuTelemetry(raw) {
   if (timestamp !== undefined) out.timestamp = timestamp;
   const adapter = clipSanitizedString(raw.adapter, 128);
   if (adapter !== undefined) out.adapter = adapter;
+  if (raw.gpuAdapter === null) {
+    out.gpuAdapter = null;
+  } else {
+    const rawGpuAdapter =
+      raw.gpuAdapter !== undefined
+        ? raw.gpuAdapter
+        : raw.adapterLabel !== undefined
+          ? raw.adapterLabel
+          : raw.adapterInfo !== undefined
+            ? raw.adapterInfo
+            : raw.adapter;
+    if (rawGpuAdapter !== undefined) {
+      const gpuAdapter = sanitizeGpuAdapter(rawGpuAdapter);
+      if (gpuAdapter !== null) out.gpuAdapter = gpuAdapter;
+    }
+  }
   const backend = clipSanitizedString(raw.backend, 64);
   if (backend !== undefined) out.backend = backend;
   if (typeof raw.deviceLost === 'boolean') out.deviceLost = raw.deviceLost;
+  if (raw.firstPresentMs === null) {
+    out.firstPresentMs = null;
+  } else {
+    const firstPresentMs = pickNonNegNumber(raw, 'firstPresentMs');
+    if (firstPresentMs !== undefined) out.firstPresentMs = firstPresentMs;
+  }
+  if (raw.firstVisibleFrameMs === null) {
+    out.firstVisibleFrameMs = null;
+  } else {
+    const firstVisibleFrameMs = pickNonNegNumber(raw, 'firstVisibleFrameMs');
+    if (firstVisibleFrameMs !== undefined) out.firstVisibleFrameMs = firstVisibleFrameMs;
+  }
+  if (raw.blackLoadingMs === null) {
+    out.blackLoadingMs = null;
+  } else {
+    const blackLoadingMs = pickNonNegNumber(raw, 'blackLoadingMs');
+    if (blackLoadingMs !== undefined) out.blackLoadingMs = blackLoadingMs;
+  }
 
   if (raw.lastValidationErrorCode === null) {
     out.lastValidationErrorCode = null;
@@ -1178,6 +1581,9 @@ function sanitizeGpuTelemetry(raw) {
       'p95FrameMs',
       'p99FrameMs',
       'maxFrameMs',
+      'firstPresentMs',
+      'firstVisibleFrameMs',
+      'blackLoadingMs',
     ]) {
       const val = pickNonNegNumber(raw.frameStats, numKey);
       if (val !== undefined) fs[numKey] = val;
@@ -1417,6 +1823,8 @@ export class CrashReporter {
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
+    this._audioTelemetry = null;
+    this._gpuAdapter = null;
 
     this._attachedTarget = null;
     this._boundOnError = null;
@@ -1495,6 +1903,29 @@ export class CrashReporter {
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
+    this._audioTelemetry = null;
+    this._gpuAdapter = null;
+  }
+
+  /**
+   * Stores a sanitized lowercase WebGPU adapter label (max 96 chars, no host paths)
+   * to include in exported diagnostic bundles. Pass `null` or `undefined` to clear.
+   *
+   * @param {string|object|null|undefined} adapter
+   * @returns {string|null}
+   */
+  setGpuAdapter(adapter) {
+    this._gpuAdapter = sanitizeGpuAdapter(adapter);
+    return this._gpuAdapter;
+  }
+
+  /**
+   * Returns the stored sanitized GPU adapter label, or `null` when unset.
+   *
+   * @returns {string|null}
+   */
+  getGpuAdapter() {
+    return this._gpuAdapter;
   }
 
   /**
@@ -1562,6 +1993,29 @@ export class CrashReporter {
    */
   getBinkTelemetry() {
     return this._binkTelemetry ? sanitizeValue(this._binkTelemetry) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized `#1027` guest audio PCM ring telemetry snapshot
+   * (or duck-typed `AudioEngine` instance via `getStats()` / `getTelemetry()`)
+   * to include under `bootDiagnostics.audioTelemetry` in exported diagnostic bundles.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setAudioTelemetry(snapshot) {
+    this._audioTelemetry = sanitizeAudioTelemetry(snapshot);
+    return this.getAudioTelemetry();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached audio telemetry snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getAudioTelemetry() {
+    return this._audioTelemetry ? sanitizeValue(this._audioTelemetry) : null;
   }
 
   /**
@@ -1796,6 +2250,10 @@ export class CrashReporter {
    * @param {object} [options.bootSummary] Alias for `bootSnapshot`.
    * @param {object} [options.gpuTelemetry] Optional per-report GPU telemetry override.
    * @param {object} [options.binkTelemetry] Optional per-report Bink2/splash telemetry override.
+   * @param {object} [options.audioTelemetry] Optional per-report `#1027` guest audio PCM ring telemetry override.
+   * @param {string|object|null} [options.gpuAdapter] Optional per-report sanitized GPU adapter override.
+   * @param {number|null} [options.firstVisibleFrameMs] Optional per-report first visible frame timestamp override (ms).
+   * @param {number|null} [options.blackLoadingMs] Optional per-report black loading duration override (ms).
    * @param {unknown} [options.extra]
    * @returns {object}
    */
@@ -1807,6 +2265,10 @@ export class CrashReporter {
     bootSummary,
     gpuTelemetry,
     binkTelemetry,
+    audioTelemetry,
+    gpuAdapter,
+    firstVisibleFrameMs,
+    blackLoadingMs,
     extra,
   } = {}) {
     const ts = this._now();
@@ -1850,6 +2312,38 @@ export class CrashReporter {
     const resolvedBinkTelemetry =
       binkTelemetry !== undefined ? sanitizeBinkTelemetry(binkTelemetry) : this._binkTelemetry;
 
+    let resolvedAudioTelemetry =
+      audioTelemetry !== undefined ? sanitizeAudioTelemetry(audioTelemetry) : this._audioTelemetry;
+    if (
+      resolvedAudioTelemetry === null &&
+      audioTelemetry === undefined &&
+      isPlainObject(resolvedPerf) &&
+      hasGuestAudioRingFields(resolvedPerf.audio)
+    ) {
+      resolvedAudioTelemetry = sanitizeAudioTelemetry(resolvedPerf.audio);
+    }
+
+    let resolvedGpuAdapter = null;
+    if (gpuAdapter !== undefined) {
+      resolvedGpuAdapter = sanitizeGpuAdapter(gpuAdapter);
+    } else if (this._gpuAdapter !== null) {
+      resolvedGpuAdapter = this._gpuAdapter;
+    } else if (resolvedGpuTelemetry && typeof resolvedGpuTelemetry.gpuAdapter === 'string') {
+      resolvedGpuAdapter = resolvedGpuTelemetry.gpuAdapter;
+    } else if (resolvedBootSnapshot && typeof resolvedBootSnapshot.gpuAdapter === 'string') {
+      resolvedGpuAdapter = resolvedBootSnapshot.gpuAdapter;
+    } else if (resolvedGpuTelemetry && typeof resolvedGpuTelemetry.adapter === 'string') {
+      resolvedGpuAdapter = sanitizeGpuAdapter(resolvedGpuTelemetry.adapter);
+    }
+
+    const { firstVisibleFrameMs: resolvedFirstVisibleFrameMs, blackLoadingMs: resolvedBlackLoadingMs } =
+      resolveBootTimingMetrics({
+        explicitFirstVisibleFrameMs: firstVisibleFrameMs,
+        explicitBlackLoadingMs: blackLoadingMs,
+        bootSnapshot: resolvedBootSnapshot,
+        gpuTelemetry: resolvedGpuTelemetry,
+      });
+
     const report = {
       schemaVersion: SCHEMA_VERSION,
       generatedAt: formatIsoTimestamp(ts),
@@ -1864,9 +2358,13 @@ export class CrashReporter {
       bootDiagnostics: {
         classifiedErrors,
         errorCodeCounts,
+        gpuAdapter: resolvedGpuAdapter,
+        firstVisibleFrameMs: resolvedFirstVisibleFrameMs,
+        blackLoadingMs: resolvedBlackLoadingMs,
         bootSnapshot: resolvedBootSnapshot,
         gpuTelemetry: resolvedGpuTelemetry,
         binkTelemetry: resolvedBinkTelemetry,
+        audioTelemetry: resolvedAudioTelemetry,
       },
     };
 
@@ -1926,6 +2424,17 @@ export class CrashReporter {
   toGitHubIssueMarkdown(options = {}) {
     const opts = options && typeof options === 'object' ? options : {};
     return formatGitHubIssueMarkdown(this.buildReport(opts), opts);
+  }
+
+  /**
+   * Alias for `toGitHubIssueMarkdown(options)` producing a compact, strictly sanitized
+   * Markdown diagnostic summary.
+   *
+   * @param {object} [options]
+   * @returns {string}
+   */
+  formatMarkdownReport(options = {}) {
+    return this.toGitHubIssueMarkdown(options);
   }
 
   /**
@@ -2155,6 +2664,43 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
           ? gpuTelemetry.bink ?? gpuTelemetry.binkPresenter ?? gpuTelemetry.splashBridge ?? null
           : null
   );
+  const rawPerfAudio =
+    isPlainObject(rawSource) && isPlainObject(rawSource.perf) && hasGuestAudioRingFields(rawSource.perf.audio)
+      ? rawSource.perf.audio
+      : null;
+  const audioTelemetry = sanitizeAudioTelemetry(
+    rawBootDiag && rawBootDiag.audioTelemetry !== undefined
+      ? rawBootDiag.audioTelemetry
+      : isPlainObject(rawSource) && rawSource.audioTelemetry !== undefined
+        ? rawSource.audioTelemetry
+        : rawPerfAudio
+  );
+
+  const resolvedGpuAdapter =
+    (rawBootDiag && rawBootDiag.gpuAdapter !== undefined ? sanitizeGpuAdapter(rawBootDiag.gpuAdapter) : null) ??
+    (isPlainObject(rawSource) && rawSource.gpuAdapter !== undefined ? sanitizeGpuAdapter(rawSource.gpuAdapter) : null) ??
+    (gpuTelemetry && typeof gpuTelemetry.gpuAdapter === 'string' ? gpuTelemetry.gpuAdapter : null) ??
+    (bootSnapshot && typeof bootSnapshot.gpuAdapter === 'string' ? bootSnapshot.gpuAdapter : null) ??
+    (gpuTelemetry && typeof gpuTelemetry.adapter === 'string' ? sanitizeGpuAdapter(gpuTelemetry.adapter) : null) ??
+    null;
+
+  const { firstVisibleFrameMs: resolvedFirstVisibleFrameMs, blackLoadingMs: resolvedBlackLoadingMs } =
+    resolveBootTimingMetrics({
+      explicitFirstVisibleFrameMs:
+        rawBootDiag && rawBootDiag.firstVisibleFrameMs !== undefined
+          ? rawBootDiag.firstVisibleFrameMs
+          : isPlainObject(rawSource)
+            ? rawSource.firstVisibleFrameMs
+            : undefined,
+      explicitBlackLoadingMs:
+        rawBootDiag && rawBootDiag.blackLoadingMs !== undefined
+          ? rawBootDiag.blackLoadingMs
+          : isPlainObject(rawSource)
+            ? rawSource.blackLoadingMs
+            : undefined,
+      bootSnapshot,
+      gpuTelemetry,
+    });
 
   const title =
     typeof opts.title === 'string' && opts.title.trim().length > 0
@@ -2196,18 +2742,28 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
   }
 
   // Boot summary
-  if (bootSnapshot && Object.keys(bootSnapshot).length > 0) {
+  if (
+    (bootSnapshot && Object.keys(bootSnapshot).length > 0) ||
+    resolvedFirstVisibleFrameMs !== null ||
+    resolvedBlackLoadingMs !== null
+  ) {
     const bootParts = [];
-    if (bootSnapshot.stage) bootParts.push(`stage=${escapeMdInlineCode(bootSnapshot.stage, 64)}`);
-    if (bootSnapshot.progressPct !== undefined) {
+    if (bootSnapshot && bootSnapshot.stage) bootParts.push(`stage=${escapeMdInlineCode(bootSnapshot.stage, 64)}`);
+    if (bootSnapshot && bootSnapshot.progressPct !== undefined) {
       bootParts.push(`progress=${formatCompactNumber(bootSnapshot.progressPct)}%`);
     }
-    const mode = bootSnapshot.mode || bootSnapshot.bootMode;
+    const mode = bootSnapshot ? bootSnapshot.mode || bootSnapshot.bootMode : undefined;
     if (mode) bootParts.push(`mode=${escapeMdInlineCode(mode, 64)}`);
-    if (bootSnapshot.readyForSplash !== undefined) {
+    if (bootSnapshot && bootSnapshot.readyForSplash !== undefined) {
       bootParts.push(`readyForSplash=${bootSnapshot.readyForSplash ? 'yes' : 'no'}`);
     }
-    if (bootSnapshot.trapCount !== undefined) {
+    if (resolvedFirstVisibleFrameMs !== null) {
+      bootParts.push(`firstVisibleFrameMs=${formatCompactNumber(resolvedFirstVisibleFrameMs)}ms`);
+    }
+    if (resolvedBlackLoadingMs !== null) {
+      bootParts.push(`blackLoadingMs=${formatCompactNumber(resolvedBlackLoadingMs)}ms`);
+    }
+    if (bootSnapshot && bootSnapshot.trapCount !== undefined) {
       const uniq =
         bootSnapshot.uniqueTrapCount !== undefined ? ` (unique=${bootSnapshot.uniqueTrapCount})` : '';
       bootParts.push(`traps=${bootSnapshot.trapCount}${uniq}`);
@@ -2254,47 +2810,48 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
     lines.push(`- **Performance:** ${perfParts.join(', ')}`);
   }
 
-  // GPU telemetry summary (validation / draw / skip counts + fallback stats)
-  if (gpuTelemetry && Object.keys(gpuTelemetry).length > 0) {
+  // GPU telemetry summary (adapter / validation / draw / skip counts + fallback stats)
+  if ((gpuTelemetry && Object.keys(gpuTelemetry).length > 0) || resolvedGpuAdapter !== null) {
     const fs = gpuFrameStats || {};
     const gpuParts = [];
-    if (gpuTelemetry.backend) gpuParts.push(`backend=${escapeMdInlineCode(gpuTelemetry.backend, 64)}`);
-    if (gpuTelemetry.adapter) gpuParts.push(`adapter=${escapeMdInlineCode(gpuTelemetry.adapter, 96)}`);
-    if (gpuTelemetry.deviceLost === true) gpuParts.push('deviceLost=yes');
+    if (gpuTelemetry && gpuTelemetry.backend) {
+      gpuParts.push(`backend=${escapeMdInlineCode(gpuTelemetry.backend, 64)}`);
+    }
+    if (resolvedGpuAdapter !== null) {
+      gpuParts.push(`gpuAdapter=${escapeMdInlineCode(resolvedGpuAdapter, MAX_GPU_ADAPTER_LENGTH)}`);
+    }
+    if (gpuTelemetry && gpuTelemetry.deviceLost === true) gpuParts.push('deviceLost=yes');
 
     const presents =
-      gpuTelemetry.framesPresented ??
-      gpuTelemetry.presentCount ??
+      (gpuTelemetry && (gpuTelemetry.framesPresented ?? gpuTelemetry.presentCount)) ??
       fs.framesPresented ??
       fs.presentCount;
     if (presents !== undefined) gpuParts.push(`presents=${presents}`);
 
-    const drawCalls = gpuTelemetry.drawCalls ?? fs.drawCalls;
+    const drawCalls = (gpuTelemetry && gpuTelemetry.drawCalls) ?? fs.drawCalls;
     if (drawCalls !== undefined) gpuParts.push(`draws=${drawCalls}`);
-    const realDraws = gpuTelemetry.realPackDrawCount ?? fs.realPackDrawCount;
+    const realDraws = (gpuTelemetry && gpuTelemetry.realPackDrawCount) ?? fs.realPackDrawCount;
     if (realDraws !== undefined) gpuParts.push(`realPackDraws=${realDraws}`);
-    const fallbackDraws = gpuTelemetry.fallbackDrawCount ?? fs.fallbackDrawCount;
+    const fallbackDraws = (gpuTelemetry && gpuTelemetry.fallbackDrawCount) ?? fs.fallbackDrawCount;
     if (fallbackDraws !== undefined) gpuParts.push(`fallbackDraws=${fallbackDraws}`);
     const skippedDraws =
-      gpuTelemetry.skippedDrawCount ??
-      gpuTelemetry.skippedDraws ??
+      (gpuTelemetry && (gpuTelemetry.skippedDrawCount ?? gpuTelemetry.skippedDraws)) ??
       fs.skippedDrawCount ??
       fs.skippedDraws;
     if (skippedDraws !== undefined) gpuParts.push(`skippedDraws=${skippedDraws}`);
-    const unboundBg = gpuTelemetry.unboundBindGroupCount ?? fs.unboundBindGroupCount;
+    const unboundBg = (gpuTelemetry && gpuTelemetry.unboundBindGroupCount) ?? fs.unboundBindGroupCount;
     if (unboundBg !== undefined) gpuParts.push(`unboundBindGroups=${unboundBg}`);
 
-    const computeDispatches = gpuTelemetry.computeDispatches ?? fs.computeDispatches;
+    const computeDispatches = (gpuTelemetry && gpuTelemetry.computeDispatches) ?? fs.computeDispatches;
     if (computeDispatches !== undefined) gpuParts.push(`compute=${computeDispatches}`);
 
     const validationErrors =
-      gpuTelemetry.validationErrorCount ??
-      gpuTelemetry.validationErrors ??
+      (gpuTelemetry && (gpuTelemetry.validationErrorCount ?? gpuTelemetry.validationErrors)) ??
       fs.validationErrorCount ??
       fs.validationErrors;
     if (validationErrors !== undefined) gpuParts.push(`validationErrors=${validationErrors}`);
 
-    if (gpuTelemetry.fallbackStats) {
+    if (gpuTelemetry && gpuTelemetry.fallbackStats) {
       const fb = gpuTelemetry.fallbackStats;
       if (fb.hitRatePct !== undefined) {
         gpuParts.push(`shaderHitRate=${formatCompactNumber(fb.hitRatePct)}%`);
@@ -2308,7 +2865,7 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
       lines.push(`- **GPU:** ${gpuParts.join(', ')}`);
     }
 
-    if (gpuTelemetry.lastValidationErrorCode || gpuTelemetry.lastValidationErrorMessage) {
+    if (gpuTelemetry && (gpuTelemetry.lastValidationErrorCode || gpuTelemetry.lastValidationErrorMessage)) {
       const codeStr = gpuTelemetry.lastValidationErrorCode
         ? `${escapeMdInlineCode(gpuTelemetry.lastValidationErrorCode, 64)} `
         : '';
@@ -2362,6 +2919,33 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
     if (targetFps !== undefined) binkParts.push(`targetFps=${formatCompactNumber(targetFps)}`);
     if (binkParts.length > 0) {
       lines.push(`- **Bink2:** ${binkParts.join(', ')}`);
+    }
+  }
+
+  // #1027 Guest Audio PCM ring telemetry
+  if (audioTelemetry && Object.keys(audioTelemetry).length > 0) {
+    const audioParts = [];
+    const outputState = audioTelemetry.outputState ?? audioTelemetry.contextState ?? audioTelemetry.state;
+    if (outputState) {
+      audioParts.push(`state=${escapeMdInlineCode(outputState, 32)}`);
+    }
+    if (typeof audioTelemetry.guestRingAttached === 'boolean') {
+      audioParts.push(`guestRingAttached=${audioTelemetry.guestRingAttached ? 'yes' : 'no'}`);
+    }
+    if (audioTelemetry.guestFramesDrained !== undefined) {
+      audioParts.push(`guestFramesDrained=${audioTelemetry.guestFramesDrained}`);
+    }
+    if (audioTelemetry.guestUnderruns !== undefined) {
+      audioParts.push(`guestUnderruns=${audioTelemetry.guestUnderruns}`);
+    }
+    if (audioTelemetry.guestOverruns !== undefined) {
+      audioParts.push(`guestOverruns=${audioTelemetry.guestOverruns}`);
+    }
+    if (audioTelemetry.guestPeakLevel !== undefined) {
+      audioParts.push(`guestPeakLevel=${roundTo3(audioTelemetry.guestPeakLevel)}`);
+    }
+    if (audioParts.length > 0) {
+      lines.push(`- **Audio:** ${audioParts.join(', ')}`);
     }
   }
 
@@ -2497,6 +3081,18 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
   }
 
   return sanitizeString(lines.join('\n'));
+}
+
+/**
+ * Alias for `formatGitHubIssueMarkdown(report, options)` producing a compact,
+ * strictly sanitized Markdown diagnostic summary.
+ *
+ * @param {object|null|undefined} report
+ * @param {object} [options]
+ * @returns {string}
+ */
+export function formatMarkdownReport(report, options = {}) {
+  return formatGitHubIssueMarkdown(report, options);
 }
 
 export default CrashReporter;
