@@ -9,6 +9,8 @@ const {
   DEFAULT_COALESCE_MAX_GAP_BYTES,
   DEFAULT_COALESCE_MAX_MERGED_BYTES,
   DEFAULT_MAX_READ_AHEAD_BYTES,
+  DEFAULT_MIN_READAHEAD_BYTES,
+  DEFAULT_MAX_READAHEAD_BYTES,
   DEFAULT_SEQUENTIAL_STREAK_THRESHOLD,
   DEFAULT_MAX_PENDING_OPFS_WRITES,
   DEFAULT_MAX_OPFS_WRITE_CONCURRENCY,
@@ -1415,4 +1417,382 @@ test('W262: RangeCache interoperates with OpfsChunkCache L2 backend including ve
   assert.equal(fetch3.calls.length, 2);
   assert.equal(stale.getStats().opfsStaleInvalidations, 2);
   await opfsCache.close();
+});
+
+// --- W312: Adaptive sequential readahead window (256 KiB -> 4 MiB), zero-alloc hit path, & resetStats ---
+
+test('W312: adaptive sequential readahead window ramps 256 KiB -> 4 MiB per file and isolates unrelated files', async () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+
+  assert.equal(DEFAULT_MIN_READAHEAD_BYTES, 256 * KiB);
+  assert.equal(DEFAULT_MAX_READAHEAD_BYTES, 4 * MiB);
+
+  const bk2Bytes = makePatternBytes(16 * MiB, 21);
+  const tocBytes = makePatternBytes(2 * MiB, 77);
+  const mock = createMockRangeFetch(
+    new Map([
+      ['movies/intro_4k.bk2', bk2Bytes],
+      ['x64/toc.rpf', tocBytes],
+    ]),
+  );
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 32 * MiB,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  assert.equal(cache.minReadaheadBytes, 256 * KiB);
+  assert.equal(cache.maxReadaheadBytes, 4 * MiB);
+
+  const initialStats = cache.getStats();
+  assert.equal(initialStats.adaptiveReadaheadWindowBytes, 0);
+  assert.equal(initialStats.sequentialStreakPeak, 0);
+  assert.equal(initialStats.readaheadHits, 0);
+  assert.equal(initialStats.readaheadWastedBytes, 0);
+  assert.equal(initialStats.zeroAllocCopyHits, 0);
+
+  // Stream 8 consecutive 64 KiB reads on movies/intro_4k.bk2 and verify exact doubling:
+  // read 0 (streak 0): 256 KiB baseline
+  // read 1 (streak 1): 256 KiB baseline
+  // read 2 (streak 2): 256 KiB active
+  // read 3 (streak 3): 512 KiB
+  // read 4 (streak 4): 1 MiB
+  // read 5 (streak 5): 2 MiB
+  // read 6 (streak 6): 4 MiB (cap)
+  // read 7 (streak 7): 4 MiB (stays capped)
+  const observedWindows = [];
+  for (let i = 0; i < 8; i += 1) {
+    const off = i * 64 * KiB;
+    const out = await cache.read('movies/intro_4k.bk2', off, 64 * KiB);
+    assert.deepEqual(out, bk2Bytes.subarray(off, off + 64 * KiB));
+    await cache.flushPrefetches();
+    const seq = cache.getSequentialState('movies/intro_4k.bk2');
+    observedWindows.push(seq.adaptiveWindowBytes);
+    assert.equal(cache.getStats().adaptiveReadaheadWindowBytes, seq.adaptiveWindowBytes);
+  }
+
+  assert.deepEqual(observedWindows, [
+    256 * KiB,
+    256 * KiB,
+    256 * KiB,
+    512 * KiB,
+    MiB,
+    2 * MiB,
+    4 * MiB,
+    4 * MiB,
+  ]);
+
+  // Verify a second unrelated file keeps its own independent per-file adaptive window.
+  await cache.read('x64/toc.rpf', 0, 64 * KiB);
+  assert.equal(cache.getSequentialState('x64/toc.rpf').adaptiveWindowBytes, 256 * KiB);
+  assert.equal(cache.getSequentialState('movies/intro_4k.bk2').adaptiveWindowBytes, 4 * MiB);
+
+  // Continue streaming movies/intro_4k.bk2 across multiple chunks -> consumes adaptive readahead chunks.
+  for (let i = 8; i < 24; i += 1) {
+    const off = i * 64 * KiB;
+    const out = await cache.read('movies/intro_4k.bk2', off, 64 * KiB);
+    assert.deepEqual(out, bk2Bytes.subarray(off, off + 64 * KiB));
+    await cache.flushPrefetches();
+  }
+
+  const stats = cache.getStats();
+  assert.equal(stats.adaptiveReadaheadWindowBytes, 4 * MiB);
+  assert.equal(stats.sequentialStreakPeak, 23);
+  assert.ok(stats.readaheadHits >= 4, `Expected >= 4 readaheadHits, got ${stats.readaheadHits}`);
+  assert.equal(stats.readaheadWastedBytes, 0, 'Pure sequential stream without seeks/evictions should waste 0 bytes');
+});
+
+test('W312: random backward and distant seeks shrink adaptive readahead window down to minReadaheadBytes and track wasted bytes', async () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+  const fileBytes = makePatternBytes(16 * MiB, 57);
+  const mock = createMockRangeFetch(new Map([['x64/world_stream.rpf', fileBytes]]));
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 32 * MiB,
+    minReadaheadBytes: 256 * KiB,
+    maxReadaheadBytes: 4 * MiB,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  // Ramp up to 4 MiB via 7 sequential 64 KiB reads.
+  for (let i = 0; i < 7; i += 1) {
+    await cache.read('x64/world_stream.rpf', i * 64 * KiB, 64 * KiB);
+    await cache.flushPrefetches();
+  }
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, 4 * MiB);
+  assert.equal(cache.getStats().sequentialStreakPeak, 6);
+
+  // 1st random seek (distant forward jump to 10 MiB): 4 MiB -> 2 MiB, abandons unread readahead chunks!
+  const s1 = await cache.read('x64/world_stream.rpf', 10 * MiB, 64 * KiB);
+  assert.deepEqual(s1, fileBytes.subarray(10 * MiB, 10 * MiB + 64 * KiB));
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').streak, 0);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').readAheadBytes, 0);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, 2 * MiB);
+  assert.equal(cache.getStats().adaptiveReadaheadWindowBytes, 2 * MiB);
+  const wastedAfterSeek1 = cache.getStats().readaheadWastedBytes;
+  assert.ok(wastedAfterSeek1 > 0, `Expected wasted readahead bytes > 0 after seek, got ${wastedAfterSeek1}`);
+
+  // 2nd random seek (backward to 0): 2 MiB -> 1 MiB.
+  await cache.read('x64/world_stream.rpf', 0, 64 * KiB);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, MiB);
+  assert.equal(cache.getStats().adaptiveReadaheadWindowBytes, MiB);
+  // Already-accounted abandoned readahead chunks must not be double-counted on subsequent seeks.
+  assert.equal(cache.getStats().readaheadWastedBytes, wastedAfterSeek1);
+
+  // 3rd random seek (distant forward to 12 MiB): 1 MiB -> 512 KiB.
+  await cache.read('x64/world_stream.rpf', 12 * MiB, 64 * KiB);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, 512 * KiB);
+
+  // 4th random seek (backward to 2 MiB): 512 KiB -> 256 KiB (minReadaheadBytes floor).
+  await cache.read('x64/world_stream.rpf', 2 * MiB, 64 * KiB);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, 256 * KiB);
+
+  // 5th random seek (backward to 512 KiB): stays clamped at 256 KiB.
+  await cache.read('x64/world_stream.rpf', 512 * KiB, 64 * KiB);
+  assert.equal(cache.getSequentialState('x64/world_stream.rpf').adaptiveWindowBytes, 256 * KiB);
+  assert.equal(cache.getStats().adaptiveReadaheadWindowBytes, 256 * KiB);
+  // Historical streak peak stays intact until resetStats().
+  assert.equal(cache.getStats().sequentialStreakPeak, 6);
+
+  // Also test LRU eviction of unread readahead chunks increments readaheadWastedBytes.
+  const smallBytes = makePatternBytes(2 * MiB, 91);
+  const smallMock = createMockRangeFetch(new Map([['x64/evict.rpf', smallBytes]]));
+  const tightCache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 1024 * KiB, // holds only 4 chunks
+    minReadaheadBytes: 256 * KiB,
+    maxReadaheadBytes: 512 * KiB,
+    fetchImpl: smallMock.fetchImpl,
+  });
+  await tightCache.read('x64/evict.rpf', 0, 64 * KiB);
+  await tightCache.read('x64/evict.rpf', 64 * KiB, 64 * KiB);
+  await tightCache.read('x64/evict.rpf', 128 * KiB, 64 * KiB);
+  await tightCache.flushPrefetches(); // prefetches chunk 1
+  // Fill cache with 4 chunks from another file without seeking evict.rpf -> evicts unread prefetched chunk 1!
+  const otherBytes = makePatternBytes(1024 * KiB, 33);
+  const combinedMock = createMockRangeFetch(
+    new Map([
+      ['x64/evict.rpf', smallBytes],
+      ['x64/other.rpf', otherBytes],
+    ]),
+  );
+  tightCache.fetchImpl = combinedMock.fetchImpl;
+  await tightCache.read('x64/other.rpf', 0, 1024 * KiB);
+  assert.ok(
+    tightCache.getStats().readaheadWastedBytes >= 256 * KiB,
+    `Expected LRU eviction of unread readahead chunk to record >= 256 KiB wasted, got ${tightCache.getStats().readaheadWastedBytes}`,
+  );
+});
+
+test('W312: readCachedRangeInto performs zero-alloc direct copies across chunk boundaries, handles URLs, misses, EOF, and validation', async () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+  // 3 full 256 KiB chunks + 50 KiB tail chunk = 818 KiB
+  const totalBytes = 3 * 256 * KiB + 50 * KiB;
+  const fileBytes = makePatternBytes(totalBytes, 123);
+  const mock = createMockRangeFetch(new Map([['x64/world_chunks.rpf', fileBytes]]));
+
+  const cache = new RangeCache({
+    dataBase: '/data/',
+    chunkSize: 256 * KiB,
+    maxBytes: 8 * MiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  // Cold miss returns -1 without mutating targetBytes or stats!
+  const target = new Uint8Array(600 * KiB);
+  target.fill(0xaa);
+  const missResult = cache.readCachedRangeInto('x64/world_chunks.rpf', 100, 1024, target);
+  assert.equal(missResult, -1);
+  assert.equal(target[0], 0xaa);
+  assert.equal(target[1023], 0xaa);
+  assert.equal(cache.getStats().zeroAllocCopyHits, 0);
+  assert.equal(cache.getStats().hits, 0);
+  assert.equal(cache.getStats().misses, 0);
+
+  // Warm chunks 0, 1, 2 (768 KiB) via normal async read.
+  await cache.read('x64/world_chunks.rpf', 0, 768 * KiB);
+  const callsAfterWarm = mock.calls.length;
+
+  // Cross-chunk unaligned copy spanning chunk 0 (tail), chunk 1 (full), and chunk 2 (head): [200 KiB .. 720 KiB) = 520 KiB.
+  const crossLen = 520 * KiB;
+  const crossStart = 200 * KiB;
+  const copied = cache.readCachedRangeInto('x64/world_chunks.rpf', crossStart, crossLen, target);
+  assert.equal(copied, crossLen);
+  assert.deepEqual(target.subarray(0, crossLen), fileBytes.subarray(crossStart, crossStart + crossLen));
+  // Guard bytes beyond crossLen remain untouched.
+  assert.equal(target[crossLen], 0xaa);
+  assert.equal(mock.calls.length, callsAfterWarm, 'Zero-alloc cache hit must issue 0 network fetches');
+  assert.equal(cache.getStats().zeroAllocCopyHits, 1);
+
+  // Supports dataBase-prefixed path and full HTTP URL as well as Uint8Array subviews with non-zero byteOffset.
+  const slab = new Uint8Array(4096);
+  slab.fill(0x55);
+  const subview = slab.subarray(128, 128 + 300);
+  const smallCopied = cache.readCachedRangeInto(
+    '/data/x64/world_chunks.rpf',
+    256 * KiB - 20, // straddles chunk 0 -> chunk 1 with <= 64-byte edge slice!
+    300,
+    subview,
+  );
+  assert.equal(smallCopied, 300);
+  assert.deepEqual(subview, fileBytes.subarray(256 * KiB - 20, 256 * KiB - 20 + 300));
+  assert.equal(slab[127], 0x55);
+  assert.equal(slab[128 + 300], 0x55);
+
+  const urlOut = new Uint8Array(40);
+  const urlCopied = cache.readCachedRangeInto(
+    'http://127.0.0.1:8080/data/x64/world_chunks.rpf?v=1',
+    256 * KiB - 16,
+    40,
+    urlOut,
+  );
+  assert.equal(urlCopied, 40);
+  assert.deepEqual(urlOut, fileBytes.subarray(256 * KiB - 16, 256 * KiB + 24));
+  assert.equal(cache.getStats().zeroAllocCopyHits, 3);
+
+  // Partial cache coverage (chunks 2 cached, chunk 3 uncached) returns -1 cleanly without partial writes!
+  const partialTarget = new Uint8Array(128 * KiB);
+  partialTarget.fill(0xcc);
+  assert.equal(
+    cache.readCachedRangeInto('x64/world_chunks.rpf', 700 * KiB, 100 * KiB, partialTarget),
+    -1,
+  );
+  assert.equal(partialTarget[0], 0xcc);
+
+  // Warm tail chunk 3 and verify EOF clamping in readCachedRangeInto.
+  await cache.read('x64/world_chunks.rpf', 768 * KiB, 50 * KiB);
+  const eofTarget = new Uint8Array(100 * KiB);
+  const eofCopied = cache.readCachedRangeInto('x64/world_chunks.rpf', 760 * KiB, 100 * KiB, eofTarget);
+  assert.equal(eofCopied, totalBytes - 760 * KiB);
+  assert.deepEqual(eofTarget.subarray(0, eofCopied), fileBytes.subarray(760 * KiB, totalBytes));
+
+  // Zero-length read and past-EOF read return 0 cleanly.
+  assert.equal(cache.readCachedRangeInto('x64/world_chunks.rpf', 0, 0, urlOut), 0);
+  assert.equal(cache.readCachedRangeInto('x64/world_chunks.rpf', totalBytes, 64, urlOut), 0);
+
+  // Fingerprint mismatch returns -1 safely.
+  assert.equal(
+    cache.readCachedRangeInto('x64/world_chunks.rpf', 0, 64, urlOut, { fileFingerprint: 'wrong_fp' }),
+    -1,
+  );
+
+  // Validation guards: non-Uint8Array targetBytes and undersized targetBytes.
+  assert.throws(() => cache.readCachedRangeInto('x64/world_chunks.rpf', 0, 16, new ArrayBuffer(16)), TypeError);
+  assert.throws(() => cache.readCachedRangeInto('x64/world_chunks.rpf', 0, 64, new Uint8Array(32)), RangeError);
+});
+
+test('W312: resetStats clears all telemetry counters cleanly while preserving live L1 RAM and W262 OPFS L2 state', async () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+  const fileBytes = makePatternBytes(4 * MiB, 42);
+  const mock = createMockRangeFetch(new Map([['game/shaders.rpf', fileBytes]]));
+  const opfsDir = createQuotaMockOpfsDir();
+  const fp = buildFileFingerprint(fileBytes.byteLength, '"shaders-w312"');
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 16 * MiB,
+    minReadaheadBytes: 256 * KiB,
+    maxReadaheadBytes: 4 * MiB,
+    fetchImpl: mock.fetchImpl,
+    opfsDir,
+    fileFingerprints: { 'game/shaders.rpf': fp },
+  });
+
+  // Trigger sequential reads, adaptive readahead, OPFS L2 background writes, random seek waste, and zero-alloc hits.
+  for (let i = 0; i < 6; i += 1) {
+    await cache.read('game/shaders.rpf', i * 64 * KiB, 64 * KiB);
+    await cache.flushPrefetches();
+  }
+  await cache.flushOpfsWrites();
+
+  // Consume at least one prefetched chunk via zero-alloc helper, then seek to generate wasted readahead bytes.
+  const scratch = new Uint8Array(64 * KiB);
+  const zBytes = cache.readCachedRangeInto('game/shaders.rpf', 6 * 64 * KiB, 64 * KiB, scratch);
+  assert.equal(zBytes, 64 * KiB);
+  assert.deepEqual(scratch, fileBytes.subarray(6 * 64 * KiB, 7 * 64 * KiB));
+  await cache.flushPrefetches();
+
+  // Random seek to trigger wasted readahead bytes.
+  await cache.read('game/shaders.rpf', 0, 64 * KiB);
+  await cache.flushOpfsWrites();
+
+  const before = cache.getStats();
+  assert.ok(before.hits > 0);
+  assert.ok(before.misses > 0);
+  assert.ok(before.opfsWrites > 0);
+  assert.ok(before.sequentialHits > 0);
+  assert.ok(before.sequentialStreakPeak >= 5);
+  assert.ok(before.adaptiveReadaheadWindowBytes > 0);
+  assert.ok(before.readaheadHits > 0);
+  assert.ok(before.readaheadWastedBytes > 0);
+  assert.equal(before.zeroAllocCopyHits, 1);
+  assert.ok(before.bytesCached > 0);
+  assert.ok(before.entries > 0);
+
+  const cachedBytesBefore = before.bytesCached;
+  const entriesBefore = before.entries;
+  const opfsFilesBefore = opfsDir.files.size;
+
+  // resetStats() clears all cumulative & W312 counters while keeping cached chunks and OPFS L2 live!
+  cache.resetStats();
+
+  const after = cache.getStats();
+  assert.equal(after.hits, 0);
+  assert.equal(after.misses, 0);
+  assert.equal(after.opfsHits, 0);
+  assert.equal(after.opfsMisses, 0);
+  assert.equal(after.opfsWrites, 0);
+  assert.equal(after.opfsWriteErrors, 0);
+  assert.equal(after.opfsStaleInvalidations, 0);
+  assert.equal(after.opfsHitRate, 0);
+  assert.equal(after.evictions, 0);
+  assert.equal(after.quotaEvictions, 0);
+  assert.equal(after.quotaRetrySuccesses, 0);
+  assert.equal(after.corruptEvictions, 0);
+  assert.equal(after.coalescedRangeCount, 0);
+  assert.equal(after.sequentialHits, 0);
+  assert.equal(after.prefetchHits, 0);
+  assert.equal(after.prefetchBytes, 0);
+  assert.equal(after.bytesSavedByCoalescing, 0);
+  assert.equal(after.adaptiveReadaheadWindowBytes, 0);
+  assert.equal(after.sequentialStreakPeak, 0);
+  assert.equal(after.readaheadHits, 0);
+  assert.equal(after.readaheadWastedBytes, 0);
+  assert.equal(after.zeroAllocCopyHits, 0);
+
+  // Live L1 memory and OPFS L2 entries are strictly preserved!
+  assert.equal(after.bytesCached, cachedBytesBefore);
+  assert.equal(after.entries, entriesBefore);
+  assert.equal(opfsDir.files.size, opfsFilesBefore);
+
+  // Zero-alloc hit still succeeds immediately after resetStats() with 0 HTTP fetches!
+  const callsBeforeVerify = mock.calls.length;
+  const verifyBuf = new Uint8Array(64 * KiB);
+  const postResetBytes = cache.readCachedRangeInto('game/shaders.rpf', 0, 64 * KiB, verifyBuf);
+  assert.equal(postResetBytes, 64 * KiB);
+  assert.deepEqual(verifyBuf, fileBytes.subarray(0, 64 * KiB));
+  assert.equal(mock.calls.length, callsBeforeVerify);
+  assert.equal(cache.getStats().zeroAllocCopyHits, 1);
+
+  // Warm reload from OPFS L2 still works with 0 HTTP fetches (W262 intact!).
+  const warmFetch = createMockRangeFetch(new Map([['game/shaders.rpf', fileBytes]]));
+  const warmCache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 16 * MiB,
+    fetchImpl: warmFetch.fetchImpl,
+    opfsDir,
+    fileFingerprints: { 'game/shaders.rpf': fp },
+  });
+  const warmOut = await warmCache.read('game/shaders.rpf', 0, 256 * KiB);
+  assert.deepEqual(warmOut, fileBytes.subarray(0, 256 * KiB));
+  assert.equal(warmFetch.calls.length, 0);
+  assert.equal(warmCache.getStats().opfsHits, 1);
 });
