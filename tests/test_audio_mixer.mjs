@@ -10,9 +10,11 @@ const {
   AudioMixer,
   decodePcm16,
   decodeImaAdpcm,
+  softClipSample,
   DEFAULT_SAMPLE_RATE,
   DEFAULT_CHANNELS,
   DEFAULT_MAX_VOICES,
+  DEFAULT_SOFT_CLIP_KNEE,
   IMA_INDEX_TABLE,
   IMA_STEP_TABLE,
 } = mixerMod;
@@ -525,5 +527,233 @@ test('AudioMixer stereo voice passthrough, panning, and masterGain scaling', () 
   const outRight = mixer.renderFrames(1);
   assert.equal(outRight[0], 0.0);
   assert.ok(Math.abs(outRight[1] - 0.2) < 1e-6);
+});
+
+test('W139: softClipSample is bit-exact for |x| <= knee, strictly monotonic & bounded in [-1, 1], and sanitizes non-finite inputs', () => {
+  assert.equal(typeof softClipSample, 'function');
+  assert.equal(DEFAULT_SOFT_CLIP_KNEE, 0.95);
+  assert.equal(globalThis.PlayGta6AudioMixer.softClipSample, softClipSample);
+
+  // Bit-exact passthrough for |x| <= 0.95 (including exact boundary and -0).
+  const linearSamples = [-0.95, -0.9, -0.5, -0.123456789, -0.0, 0.0, 0.25, 0.75, 0.9499999, 0.95];
+  for (const s of linearSamples) {
+    assert.ok(
+      Object.is(softClipSample(s), s),
+      `Expected bit-exact passthrough for ${s}, got ${softClipSample(s)}`
+    );
+  }
+
+  // Monotonic compression into (knee, 1.0] for |x| > 0.95 and exact odd symmetry.
+  const overloaded = [0.955, 0.97, 1.0, 1.05, 1.15, 1.3, 1.6];
+  const headroom = 1.0 - 0.95;
+  let prev = 0.95;
+  for (const x of overloaded) {
+    const pos = softClipSample(x);
+    const neg = softClipSample(-x);
+    const expected = 0.95 + headroom * Math.tanh((x - 0.95) / headroom);
+    assert.equal(pos, expected);
+    assert.ok(pos > prev && pos <= 1.0, `Expected monotonic compression in (${prev}, 1.0], got ${pos}`);
+    assert.equal(neg, -pos, 'softClipSample must be odd-symmetric');
+    prev = pos;
+  }
+
+  // Extreme magnitudes stay strictly bounded in [-1.0, 1.0].
+  assert.ok(softClipSample(1e6) <= 1.0 && softClipSample(1e6) > 0.9999);
+  assert.ok(softClipSample(-1e6) >= -1.0 && softClipSample(-1e6) < -0.9999);
+
+  // Custom knee support.
+  assert.equal(softClipSample(0.8, 0.8), 0.8);
+  const customCompressed = softClipSample(1.0, 0.8);
+  assert.ok(customCompressed > 0.8 && customCompressed < 1.0);
+
+  // Non-finite inputs sanitize to 0.0.
+  assert.equal(softClipSample(Number.NaN), 0.0);
+  assert.equal(softClipSample(Number.POSITIVE_INFINITY), 0.0);
+  assert.equal(softClipSample(Number.NEGATIVE_INFINITY), 0.0);
+
+  // Invalid knee values throw RangeError.
+  assert.throws(() => softClipSample(0.5, -0.1), RangeError);
+  assert.throws(() => softClipSample(0.5, 1.0), RangeError);
+  assert.throws(() => softClipSample(0.5, Number.NaN), RangeError);
+});
+
+test('W139: AudioMixer sanitizes NaN and +/-Infinity voice inputs to 0.0 without poisoning concurrent voices', () => {
+  const mixer = new AudioMixer({ sampleRate: 48000 });
+
+  // Mono voice with NaN, +Infinity, -Infinity interleaved between valid samples.
+  const badMono = new Float32Array([0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0.25]);
+  mixer.createVoice({ samples: badMono, channels: 1, gain: 1.0, pan: -1.0, loop: false });
+
+  // Concurrent clean voice on the same left channel must NOT be poisoned by badMono.
+  const cleanMono = new Float32Array([0.1, 0.2, 0.3, 0.4, 0.5]);
+  mixer.createVoice({ samples: cleanMono, channels: 1, gain: 1.0, pan: -1.0, loop: false });
+
+  const out = mixer.renderFrames(5);
+  for (let i = 0; i < out.length; i++) {
+    assert.ok(Number.isFinite(out[i]), `Output sample ${i} must be finite, got ${out[i]}`);
+  }
+
+  const expectedL = [0.6, 0.2, 0.3, 0.4, 0.25];
+  for (let f = 0; f < expectedL.length; f++) {
+    assert.ok(
+      Math.abs(out[f * 2] - expectedL[f]) < 1e-6,
+      `Frame ${f} L: expected ${expectedL[f]}, got ${out[f * 2]}`
+    );
+    assert.equal(out[f * 2 + 1], 0.0);
+  }
+  assert.equal(mixer.getStats().sanitizedNonFiniteSamples, 3);
+
+  // Stereo voice: non-finite left sample sanitizes to 0.0 while finite right sample survives.
+  const badStereo = new Float32Array([Number.NaN, 0.4, -0.3, Number.POSITIVE_INFINITY]);
+  mixer.createVoice({ samples: badStereo, channels: 2, gain: 1.0, pan: 0.0, loop: false });
+  const stereoOut = mixer.renderFrames(2);
+  assert.ok(Math.abs(stereoOut[0]) < 1e-6);
+  assert.ok(Math.abs(stereoOut[1] - 0.4) < 1e-6);
+  assert.ok(Math.abs(stereoOut[2] - -0.3) < 1e-6);
+  assert.equal(stereoOut[3], 0.0);
+  assert.equal(mixer.getStats().sanitizedNonFiniteSamples, 5);
+
+  // Fractional resampling across a NaN sample produces finite output and increments counter.
+  const resampledMixer = new AudioMixer({ sampleRate: 48000 });
+  resampledMixer.createVoice({
+    samples: new Float32Array([0.2, Number.NaN, 0.4]),
+    sampleRate: 24000,
+    channels: 1,
+    pan: -1.0,
+    loop: false,
+  });
+  const resampledOut = resampledMixer.renderFrames(6);
+  for (let i = 0; i < resampledOut.length; i++) {
+    assert.ok(Number.isFinite(resampledOut[i]), `Resampled sample ${i} must be finite`);
+  }
+  assert.ok(Math.abs(resampledOut[0] - 0.2) < 1e-6); // pos=0.0 exact finite sample
+  assert.equal(resampledOut[2], 0.0); // pos=0.5 interpolated with NaN -> sanitized
+  assert.equal(resampledOut[4], 0.0); // pos=1.0 exact NaN -> sanitized
+  assert.equal(resampledOut[6], 0.0); // pos=1.5 interpolated with NaN -> sanitized
+  assert.ok(Math.abs(resampledOut[8] - 0.4) < 1e-6); // pos=2.0 exact finite sample
+  assert.equal(resampledMixer.getStats().sanitizedNonFiniteSamples, 3);
+
+  // Output-stage finite * huge masterGain overflow to Infinity is also sanitized cleanly.
+  const overflowMixer = new AudioMixer({ sampleRate: 48000, masterGain: 1e308 });
+  overflowMixer.createVoice({
+    samples: new Float32Array([1e10]),
+    channels: 1,
+    pan: -1.0,
+    loop: false,
+  });
+  const overflowOut = overflowMixer.renderFrames(1);
+  assert.equal(overflowOut[0], 0.0);
+  assert.equal(overflowOut[1], 0.0);
+  assert.equal(overflowMixer.getStats().sanitizedNonFiniteSamples, 1);
+});
+
+test('W139: softClip: true preserves bit-exact |x| <= 0.95, smoothly compresses |x| > 0.95, and softClip: false hard-clips at +-1.0', () => {
+  // 1. softClip: true — bit-exact for |x| <= 0.95, clippedSamples === 0.
+  const softMixer = new AudioMixer({ sampleRate: 48000, softClip: true });
+  const withinKnee = new Float32Array([-0.95, -0.5, 0.0, 0.5, 0.9, 0.95]);
+  softMixer.createVoice({ samples: withinKnee, channels: 1, gain: 1.0, pan: -1.0, loop: false });
+  const linearOut = softMixer.renderFrames(withinKnee.length);
+  for (let f = 0; f < withinKnee.length; f++) {
+    assert.equal(linearOut[f * 2], withinKnee[f], `Expected bit-exact sample at frame ${f}`);
+    assert.equal(linearOut[f * 2 + 1], 0.0);
+  }
+  assert.equal(softMixer.getStats().clippedSamples, 0);
+
+  // 2. softClip: true — |x| > 0.95 is strictly monotonic, bounded in [-1, 1], and increments clippedSamples.
+  const overInputs = [0.96, 1.0, 1.1, 1.3, 2.0];
+  softMixer.createVoice({
+    samples: new Float32Array(overInputs),
+    channels: 1,
+    gain: 1.0,
+    pan: -1.0,
+    loop: false,
+  });
+  const softOut = softMixer.renderFrames(overInputs.length);
+  let prev = 0.95;
+  for (let f = 0; f < overInputs.length; f++) {
+    const val = softOut[f * 2];
+    assert.ok(val > prev && val <= 1.0, `Expected monotonic soft-clip at frame ${f}, got ${val} after ${prev}`);
+    prev = val;
+  }
+  assert.equal(softMixer.getStats().clippedSamples, overInputs.length);
+
+  // 3. softClip: false — exact passthrough up to +-1.0 and hard-clip beyond +-1.0.
+  const hardMixer = new AudioMixer({ sampleRate: 48000, softClip: false });
+  hardMixer.createVoice({
+    samples: new Float32Array([0.98, -0.98, 1.0, 1.5, -2.0]),
+    channels: 1,
+    gain: 1.0,
+    pan: -1.0,
+    loop: false,
+  });
+  const hardOut = hardMixer.renderFrames(5);
+  assert.equal(hardOut[0], Math.fround(0.98));
+  assert.equal(hardOut[2], Math.fround(-0.98));
+  assert.equal(hardOut[4], 1.0);
+  assert.equal(hardOut[6], 1.0);
+  assert.equal(hardOut[8], -1.0);
+  assert.equal(hardMixer.getStats().clippedSamples, 2);
+});
+
+test('W139: getStats() tracks peakOutputLevel, activeVoicePeak, clippedSamples, sanitizedNonFiniteSamples and resets cleanly on reset()', () => {
+  const mixer = new AudioMixer({ sampleRate: 48000, softClip: true });
+
+  // Initial stats are zeroed.
+  const initStats = mixer.getStats();
+  assert.equal(initStats.clippedSamples, 0);
+  assert.equal(initStats.sanitizedNonFiniteSamples, 0);
+  assert.equal(initStats.peakOutputLevel, 0);
+  assert.equal(initStats.peakLevel, 0);
+  assert.equal(initStats.activeVoicePeak, 0);
+  assert.equal(initStats.renderedFrames, 0);
+  assert.equal(initStats.softClip, true);
+  assert.equal(initStats.limiterKnee, 0.95);
+
+  // Spawn 4 concurrent voices (2 short one-shots + 2 looping).
+  mixer.createVoice({ samples: new Float32Array([0.4, 0.4]), channels: 1, pan: -1.0, loop: false });
+  mixer.createVoice({ samples: new Float32Array([0.4, 0.4]), channels: 1, pan: -1.0, loop: false });
+  mixer.createVoice({ samples: new Float32Array([0.3, Number.NaN]), channels: 1, pan: -1.0, loop: true });
+  mixer.createVoice({ samples: new Float32Array([0.1, 0.1]), channels: 1, pan: 1.0, loop: true });
+
+  assert.equal(mixer.getStats().activeVoices, 4);
+  assert.equal(mixer.getStats().activeVoicePeak, 4);
+
+  // Render 4 frames: frame 0 left sums to 0.4 + 0.4 + 0.3 = 1.1 (> 0.95, clips);
+  // frame 1 & frame 3 have NaN from looping voice -> 2 sanitized samples;
+  // the two 2-frame one-shots are reaped leaving 2 active voices while activeVoicePeak stays 4.
+  const out = mixer.renderFrames(4);
+  const stats = mixer.getStats();
+  assert.equal(stats.activeVoices, 2);
+  assert.equal(stats.activeVoicePeak, 4);
+  assert.equal(stats.renderedFrames, 4);
+  assert.equal(stats.clippedSamples, 1); // frame 0 left = 1.1 > 0.95
+  assert.equal(stats.sanitizedNonFiniteSamples, 2); // frames 1 and 3 from looping voice
+  const expectedPeak = softClipSample(1.1, 0.95);
+  assert.ok(Math.abs(stats.peakOutputLevel - expectedPeak) < 1e-6);
+  assert.equal(stats.peakLevel, stats.peakOutputLevel);
+  assert.ok(Math.abs(out[0] - expectedPeak) < 1e-6);
+
+  // reset() clears voices and zeroes all telemetry counters cleanly.
+  mixer.reset();
+  const afterReset = mixer.getStats();
+  assert.equal(afterReset.activeVoices, 0);
+  assert.equal(afterReset.totalVoices, 0);
+  assert.equal(afterReset.renderedFrames, 0);
+  assert.equal(afterReset.clippedSamples, 0);
+  assert.equal(afterReset.sanitizedNonFiniteSamples, 0);
+  assert.equal(afterReset.peakOutputLevel, 0);
+  assert.equal(afterReset.peakLevel, 0);
+  assert.equal(afterReset.activeVoicePeak, 0);
+
+  // Mixer remains usable after reset() and tracks fresh post-reset telemetry.
+  mixer.createVoice({ samples: new Float32Array([0.25, -0.5]), channels: 1, pan: -1.0, loop: false });
+  mixer.renderFrames(2);
+  const postResetStats = mixer.getStats();
+  assert.equal(postResetStats.activeVoices, 0);
+  assert.equal(postResetStats.activeVoicePeak, 1);
+  assert.equal(postResetStats.renderedFrames, 2);
+  assert.equal(postResetStats.clippedSamples, 0);
+  assert.equal(postResetStats.sanitizedNonFiniteSamples, 0);
+  assert.ok(Math.abs(postResetStats.peakOutputLevel - 0.5) < 1e-6);
 });
 
