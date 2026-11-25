@@ -15,9 +15,15 @@ import { INPUT_SCRIPT_PRESETS, InputBridge } from './input/input_bridge.js';
 import { InputProfileManager } from './input/input_profiles.js';
 import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
-import { PerfMonitor } from './telemetry/perf_monitor.js';
+import {
+  DEFAULT_FRAME_BUDGET_MS,
+  DEFAULT_TARGET_FPS,
+  FRAME_BOTTLENECKS,
+  PERF_PHASES,
+  PerfMonitor,
+} from './telemetry/perf_monitor.js';
 import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
-import { BootTracer, sanitizeGpuAdapter } from './telemetry/boot_tracer.js';
+import { BootTracer, FAST_BOOT_MILESTONES, sanitizeGpuAdapter } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_SHADER_PACK_URL = '/shaders/fallback.wgsl.pack';
@@ -118,6 +124,67 @@ const LOADER_TELEMETRY_MESSAGE_TYPES = new Set([
   'manifest-stats',
   'shard-dispatch',
   'boot-telemetry',
+]);
+
+const PERF_TELEMETRY_MESSAGE_TYPES = new Set([
+  'perf-stats',
+  'perf-telemetry',
+  'frame-stats',
+  'frame-telemetry',
+]);
+
+const IO_TELEMETRY_MESSAGE_TYPES = new Set([
+  'io-stats',
+  'io-telemetry',
+  'httpfs-stats',
+  'mailbox-stats',
+]);
+
+const ALLOWED_FRAME_BOTTLENECKS = new Set(Object.values(FRAME_BOTTLENECKS));
+const FAST_BOOT_PRESSURE_LEVEL_SET = new Set(['low', 'medium', 'high', 'critical']);
+const FAST_BOOT_MILESTONE_SET = new Set(FAST_BOOT_MILESTONES);
+
+const FAST_BOOT_TRACER_METHODS = Object.freeze({
+  START_SCREEN: 'recordStartScreen',
+  INTRO_VIDEO: 'recordIntroVideo',
+  MAIN_MENU: 'recordMainMenu',
+  IN_GAME: 'recordInGame',
+});
+
+const FAST_BOOT_MESSAGE_TYPE_TO_MILESTONE = Object.freeze({
+  'start-screen': 'START_SCREEN',
+  start_screen: 'START_SCREEN',
+  'intro-video': 'INTRO_VIDEO',
+  intro_video: 'INTRO_VIDEO',
+  'main-menu': 'MAIN_MENU',
+  main_menu: 'MAIN_MENU',
+  'in-game': 'IN_GAME',
+  in_game: 'IN_GAME',
+});
+
+const FAST_BOOT_MILESTONE_LOG_PATTERNS = Object.freeze([
+  [
+    'START_SCREEN',
+    /\bSTART_SCREEN\b|\bstart[\s_-]*screen\b|\bpress[\s_-]*(?:any[\s_-]*button|start)\b/i,
+  ],
+  [
+    'INTRO_VIDEO',
+    /\bINTRO_VIDEO\b|\bintro[\s_-]*(?:video|movie|cinematic|bink)\b|\bopening[\s_-]*(?:video|cinematic)\b/i,
+  ],
+  ['MAIN_MENU', /\bMAIN_MENU\b|\bmain[\s_-]*menu\b|\btitle[\s_-]*menu\b/i],
+  [
+    'IN_GAME',
+    /\bIN_GAME\b|\bin[\s_-]*game\b|\bgameplay[\s_-]*(?:started|active|ready|entered)\b/i,
+  ],
+]);
+
+const PANEL_PERF_TELEMETRY_KEYS = Object.freeze([
+  'fps30ComplianceRate',
+  'frameJitterMs',
+  'jsHeapUsedMb',
+  'vramBudgetUtilization',
+  'bindGroupHitRate',
+  'mailboxLanes',
 ]);
 
 function defaultNow() {
@@ -784,6 +851,91 @@ function toSafeNonNegativeInt(value, fallback = 0) {
   return parsed === null ? fallback : parsed;
 }
 
+function sanitizeNonNegativeFiniteNumber(raw) {
+  if (
+    raw === undefined ||
+    raw === null ||
+    raw === '' ||
+    typeof raw === 'boolean' ||
+    typeof raw === 'symbol' ||
+    typeof raw === 'object' ||
+    typeof raw === 'bigint'
+  ) {
+    return null;
+  }
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    return null;
+  }
+  return n === 0 ? 0 : n;
+}
+
+function sanitizeUnitInterval(raw) {
+  if (
+    raw === undefined ||
+    raw === null ||
+    raw === '' ||
+    typeof raw === 'boolean' ||
+    typeof raw === 'symbol' ||
+    typeof raw === 'object' ||
+    typeof raw === 'bigint'
+  ) {
+    return null;
+  }
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) {
+    return null;
+  }
+  const clamped = Math.min(1, Math.max(0, n));
+  return clamped === 0 ? 0 : clamped;
+}
+
+function sanitizePositiveInt(raw) {
+  const parsed = toNonNegativeInt(raw, null);
+  return parsed !== null && parsed >= 1 ? parsed : null;
+}
+
+function normalizeDominantBottleneck(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return normalized && ALLOWED_FRAME_BOTTLENECKS.has(normalized) ? normalized : null;
+}
+
+function normalizeFastBootMilestone(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toUpperCase().replace(/[\s-]+/g, '_');
+  return normalized && FAST_BOOT_MILESTONE_SET.has(normalized) ? normalized : null;
+}
+
+function sanitizeFastBootPressureLevel(raw) {
+  if (typeof raw !== 'string') {
+    return 'unknown';
+  }
+  const normalized = raw.trim().toLowerCase();
+  return FAST_BOOT_PRESSURE_LEVEL_SET.has(normalized) ? normalized : 'unknown';
+}
+
+function detectFastBootMilestonesFromLog(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return [];
+  }
+  if (VISIBLE_FRAME_LOG_FAILURE_RE.test(text)) {
+    return [];
+  }
+  const matched = [];
+  for (let i = 0; i < FAST_BOOT_MILESTONE_LOG_PATTERNS.length; i += 1) {
+    const [milestone, pattern] = FAST_BOOT_MILESTONE_LOG_PATTERNS[i];
+    if (pattern.test(text)) {
+      matched.push(milestone);
+    }
+  }
+  return matched;
+}
+
 function normalizeIndirectDispatch(raw) {
   if (typeof raw !== 'string') {
     return 'unknown';
@@ -1234,8 +1386,10 @@ export class PlayGta6AppHandle {
     this._getWasmWorker = components.getWasmWorker;
     this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
     this._getBootTelemetry = components.getBootTelemetry || (() => null);
+    this._getFastBootPlan = components.getFastBootPlan || (() => null);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._notifyFirstVisibleFrame = components.notifyFirstVisibleFrame || (() => ({ ok: true }));
+    this._recordFastBootMilestone = components.recordFastBootMilestone || (() => null);
     this._start = components.start;
     this._stop = components.stop;
     this._resize = components.resize;
@@ -1263,12 +1417,20 @@ export class PlayGta6AppHandle {
     return this._getBootTelemetry();
   }
 
+  getFastBootPlan() {
+    return this._getFastBootPlan();
+  }
+
   notifyFirstPresent(meta) {
     return this._notifyFirstPresent(meta);
   }
 
   notifyFirstVisibleFrame(meta) {
     return this._notifyFirstVisibleFrame(meta);
+  }
+
+  recordFastBootMilestone(milestone, meta) {
+    return this._recordFastBootMilestone(milestone, meta);
   }
 
   start(opts) {
@@ -1507,6 +1669,75 @@ export function bootstrapPlayGta6App(options = {}) {
     ),
   };
 
+  const perfTelemetry = {
+    fps30ComplianceRate: null,
+    dominantBottleneck: null,
+    frameJitterMs: null,
+    vramBudgetUtilization: null,
+    bindGroupHitRate: null,
+    jsHeapUsedMb: null,
+    jsHeapTotalMb: null,
+    mailboxLanes: null,
+  };
+
+  const fastBootMilestones = {
+    START_SCREEN: null,
+    INTRO_VIDEO: null,
+    MAIN_MENU: null,
+    IN_GAME: null,
+  };
+
+  let latestFastBootPlan = null;
+  let latestQuotaEviction = null;
+  const bootStartedAtMs = now();
+
+  function readRawPerformanceMemory() {
+    const perfCandidates = [
+      options.performanceObj,
+      windowObj && typeof windowObj === 'object' ? windowObj.performance : null,
+      typeof performance !== 'undefined' ? performance : null,
+    ];
+    for (let i = 0; i < perfCandidates.length; i += 1) {
+      const perf = perfCandidates[i];
+      if (!perf || typeof perf !== 'object') {
+        continue;
+      }
+      try {
+        const mem = perf.memory;
+        if (mem && typeof mem === 'object') {
+          const used = sanitizeNonNegativeFiniteNumber(mem.usedJSHeapSize);
+          const total = sanitizeNonNegativeFiniteNumber(mem.totalJSHeapSize);
+          const limit = sanitizeNonNegativeFiniteNumber(mem.jsHeapSizeLimit);
+          if (used !== null || total !== null || limit !== null) {
+            return { usedJSHeapSize: used, totalJSHeapSize: total, jsHeapSizeLimit: limit };
+          }
+        }
+      } catch {
+        // Ignore restricted performance.memory getters.
+      }
+    }
+    return null;
+  }
+
+  function sampleJsHeapMemory() {
+    const raw = readRawPerformanceMemory();
+    if (!raw) {
+      return null;
+    }
+    const jsHeapUsedMb =
+      raw.usedJSHeapSize !== null
+        ? Math.round((raw.usedJSHeapSize / BYTES_PER_MIB) * 100) / 100
+        : null;
+    const jsHeapTotalMb =
+      raw.totalJSHeapSize !== null
+        ? Math.round((raw.totalJSHeapSize / BYTES_PER_MIB) * 100) / 100
+        : null;
+    if (jsHeapUsedMb === null && jsHeapTotalMb === null) {
+      return null;
+    }
+    return { jsHeapUsedMb, jsHeapTotalMb };
+  }
+
   function collectPlainSources(candidates) {
     const out = [];
     for (let i = 0; i < candidates.length; i += 1) {
@@ -1736,6 +1967,9 @@ export function bootstrapPlayGta6App(options = {}) {
       fields.allowDumpWrites = true;
       fields.dumpEndpoint = activeDumpConfig.dumpEndpoint || DEFAULT_DUMP_ENDPOINT;
     }
+    if (latestFastBootPlan && latestFastBootPlan.recommendedSlabMaxBytes > 0) {
+      fields.recommendedSlabMaxBytes = latestFastBootPlan.recommendedSlabMaxBytes;
+    }
     return fields;
   }
 
@@ -1789,12 +2023,15 @@ export function bootstrapPlayGta6App(options = {}) {
       ? windowObj.clearInterval.bind(windowObj)
       : undefined);
 
-  const perfMonitor = new PerfMonitor({
-    ...perfMonitorOptions,
-    now: perfMonitorOptions.now || now,
-    ...(resolvedSetInterval ? { setInterval: resolvedSetInterval } : {}),
-    ...(resolvedClearInterval ? { clearInterval: resolvedClearInterval } : {}),
-  });
+  const perfMonitor =
+    options.perfMonitor && typeof options.perfMonitor === 'object'
+      ? options.perfMonitor
+      : new PerfMonitor({
+          ...perfMonitorOptions,
+          now: perfMonitorOptions.now || now,
+          ...(resolvedSetInterval ? { setInterval: resolvedSetInterval } : {}),
+          ...(resolvedClearInterval ? { clearInterval: resolvedClearInterval } : {}),
+        });
 
   // 3. InputProfileManager (load persisted profile safely) + InputBridge.
   const inputProfileOptions =
@@ -1888,12 +2125,15 @@ export function bootstrapPlayGta6App(options = {}) {
           ? windowObj.indexedDB
           : undefined;
 
-  const storageManager = new BrowserStorageManager({
-    ...storageOptions,
-    storageObj,
-    ...(indexedDBFactory !== undefined ? { indexedDBFactory } : {}),
-    now: storageOptions.now || epochNow,
-  });
+  const storageManager =
+    options.storageManager && typeof options.storageManager === 'object'
+      ? options.storageManager
+      : new BrowserStorageManager({
+          ...storageOptions,
+          storageObj,
+          ...(indexedDBFactory !== undefined ? { indexedDBFactory } : {}),
+          now: storageOptions.now || epochNow,
+        });
 
   // 5. AudioEngine (WebAudio + AudioWorklet + SAB ring).
   const audioOptions =
@@ -2041,6 +2281,7 @@ export function bootstrapPlayGta6App(options = {}) {
   let latestPanelFrameStats = undefined;
   let latestPanelFallbackStats = undefined;
   let latestPanelMissingShaders = undefined;
+  const latestPanelPerfFields = Object.create(null);
   const bootTracerCleanupFns = [];
 
   function safeUpdateGpuBootPanel(patch = {}) {
@@ -2058,6 +2299,14 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (patch.missingShaders !== undefined) {
       latestPanelMissingShaders = patch.missingShaders;
+    }
+    for (let i = 0; i < PANEL_PERF_TELEMETRY_KEYS.length; i += 1) {
+      const key = PANEL_PERF_TELEMETRY_KEYS[i];
+      if (patch[key] !== undefined) {
+        latestPanelPerfFields[key] = patch[key];
+      } else if (perfTelemetry[key] !== null) {
+        latestPanelPerfFields[key] = perfTelemetry[key];
+      }
     }
 
     const payload = {};
@@ -2078,6 +2327,12 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (latestPanelMissingShaders !== undefined) {
       payload.missingShaders = latestPanelMissingShaders;
+    }
+    for (let i = 0; i < PANEL_PERF_TELEMETRY_KEYS.length; i += 1) {
+      const key = PANEL_PERF_TELEMETRY_KEYS[i];
+      if (latestPanelPerfFields[key] !== undefined && latestPanelPerfFields[key] !== null) {
+        payload[key] = latestPanelPerfFields[key];
+      }
     }
 
     try {
@@ -2677,6 +2932,27 @@ export function bootstrapPlayGta6App(options = {}) {
             ...(gpuStatsPayload.blackLoadingMs !== undefined
               ? { blackLoadingMs: gpuStatsPayload.blackLoadingMs }
               : {}),
+            ...(perfTelemetry.fps30ComplianceRate !== null
+              ? { fps30ComplianceRate: perfTelemetry.fps30ComplianceRate }
+              : {}),
+            ...(perfTelemetry.dominantBottleneck !== null
+              ? { dominantBottleneck: perfTelemetry.dominantBottleneck }
+              : {}),
+            ...(perfTelemetry.frameJitterMs !== null
+              ? { frameJitterMs: perfTelemetry.frameJitterMs }
+              : {}),
+            ...(perfTelemetry.jsHeapUsedMb !== null
+              ? { jsHeapUsedMb: perfTelemetry.jsHeapUsedMb }
+              : {}),
+            ...(perfTelemetry.vramBudgetUtilization !== null
+              ? { vramBudgetUtilization: perfTelemetry.vramBudgetUtilization }
+              : {}),
+            ...(perfTelemetry.bindGroupHitRate !== null
+              ? { bindGroupHitRate: perfTelemetry.bindGroupHitRate }
+              : {}),
+            ...(perfTelemetry.mailboxLanes !== null
+              ? { mailboxLanes: perfTelemetry.mailboxLanes }
+              : {}),
           });
         } catch {
           // Ignore HUD metrics errors.
@@ -2691,6 +2967,476 @@ export function bootstrapPlayGta6App(options = {}) {
         gpuStatsPayload
       );
     }
+  }
+
+  function ingestPerfAndIoTelemetry(
+    data,
+    { notifyHud = true, updatePanel = true, allowLanesAlias = false } = {}
+  ) {
+    if (!data || typeof data !== 'object' || destroyed) {
+      return { updated: false, panelFieldUpdated: false, panelPatch: {} };
+    }
+
+    const sources = collectPlainSources([
+      data,
+      data.stats,
+      data.perfStats,
+      data.perf,
+      data.pacingStats,
+      data.pacing,
+      data.frameBudget,
+      data.budget,
+      data.frameStats,
+      data.frames,
+      data.gpuStats,
+      data.gpu,
+      data.drawStats,
+      data.swapchainStats,
+      data.swapchain,
+      data.memoryStats,
+      data.memory,
+      data.vramStats,
+      data.vram,
+      data.resourceTableStats,
+      data.resourceTable,
+      data.bindGroupStats,
+      data.renderStateStats,
+      data.ioStats,
+      data.io,
+      data.httpfsStats,
+      data.mailboxStats,
+      data.mailbox,
+      data.metrics,
+      data.frameBreakdown,
+      data.timing,
+      data.frameTiming,
+    ]);
+
+    let updated = false;
+    let frameBudgetUpdated = false;
+    let memoryUpdated = false;
+    let mailboxUpdated = false;
+    let panelFieldUpdated = false;
+    const panelPatch = {};
+
+    // 1. Feed detailed per-stage frame timing into PerfMonitor.recordDetailedFrame() (W287).
+    const frameMsField = pickFirstDefinedField(sources, ['frameMs', 'frameTimeMs', 'frame_ms']);
+    const ioWaitMsField = pickFirstDefinedField(sources, ['ioWaitMs', 'io_wait_ms']);
+    const shaderCompileMsField = pickFirstDefinedField(sources, [
+      'shaderCompileMs',
+      'shader_compile_ms',
+    ]);
+    const gpuMsField = pickFirstDefinedField(sources, ['gpuMs', 'gpu_ms', 'gpuTimeMs']);
+    const cpuMsField = pickFirstDefinedField(sources, ['cpuMs', 'cpu_ms', 'cpuTimeMs']);
+
+    const parsedFrameMs = frameMsField.found
+      ? sanitizeNonNegativeFiniteNumber(frameMsField.value)
+      : null;
+    const parsedIoWaitMs = ioWaitMsField.found
+      ? sanitizeNonNegativeFiniteNumber(ioWaitMsField.value)
+      : null;
+    const parsedShaderCompileMs = shaderCompileMsField.found
+      ? sanitizeNonNegativeFiniteNumber(shaderCompileMsField.value)
+      : null;
+    const parsedGpuMs = gpuMsField.found ? sanitizeNonNegativeFiniteNumber(gpuMsField.value) : null;
+    const parsedCpuMs = cpuMsField.found ? sanitizeNonNegativeFiniteNumber(cpuMsField.value) : null;
+
+    let perfSnap = null;
+    const hasDetailedFrameTiming =
+      parsedFrameMs !== null ||
+      parsedIoWaitMs !== null ||
+      parsedShaderCompileMs !== null ||
+      parsedGpuMs !== null ||
+      parsedCpuMs !== null;
+
+    if (hasDetailedFrameTiming && perfMonitor && typeof perfMonitor.recordDetailedFrame === 'function') {
+      try {
+        const sample = {};
+        if (parsedFrameMs !== null) sample.frameMs = parsedFrameMs;
+        if (parsedIoWaitMs !== null) sample.ioWaitMs = parsedIoWaitMs;
+        if (parsedShaderCompileMs !== null) sample.shaderCompileMs = parsedShaderCompileMs;
+        if (parsedGpuMs !== null) sample.gpuMs = parsedGpuMs;
+        if (parsedCpuMs !== null) sample.cpuMs = parsedCpuMs;
+        perfMonitor.recordDetailedFrame(sample);
+        if (typeof perfMonitor.getSnapshot === 'function') {
+          perfSnap = perfMonitor.getSnapshot();
+        }
+      } catch {
+        // PerfMonitor errors must never interrupt worker telemetry.
+      }
+    }
+
+    // 2. 30 FPS compliance rate & dominant bottleneck (explicit or derived from PerfMonitor).
+    const complianceField = pickFirstDefinedField(sources, [
+      'fps30ComplianceRate',
+      'fps30_compliance_rate',
+      'complianceRate30Fps',
+      'compliance_rate_30fps',
+      'fps30Compliance',
+      'fps30_compliance',
+    ]);
+    if (complianceField.found) {
+      const rate = sanitizeUnitInterval(complianceField.value);
+      if (rate !== null) {
+        perfTelemetry.fps30ComplianceRate = rate;
+        panelPatch.fps30ComplianceRate = rate;
+        frameBudgetUpdated = true;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    } else if (perfSnap && typeof perfSnap.fps30ComplianceRate === 'number') {
+      const rate = sanitizeUnitInterval(perfSnap.fps30ComplianceRate);
+      if (rate !== null) {
+        perfTelemetry.fps30ComplianceRate = rate;
+        panelPatch.fps30ComplianceRate = rate;
+        frameBudgetUpdated = true;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    }
+
+    const bottleneckField = pickFirstDefinedField(sources, [
+      'dominantBottleneck',
+      'dominant_bottleneck',
+      'bottleneck',
+    ]);
+    if (bottleneckField.found) {
+      const bottleneck = normalizeDominantBottleneck(bottleneckField.value);
+      if (bottleneck !== null) {
+        perfTelemetry.dominantBottleneck = bottleneck;
+        frameBudgetUpdated = true;
+        updated = true;
+      }
+    } else if (perfSnap && typeof perfSnap.dominantBottleneck === 'string') {
+      const bottleneck = normalizeDominantBottleneck(perfSnap.dominantBottleneck);
+      if (bottleneck !== null) {
+        perfTelemetry.dominantBottleneck = bottleneck;
+        frameBudgetUpdated = true;
+        updated = true;
+      }
+    }
+
+    // 3. Frame jitter (ms).
+    const jitterField = pickFirstDefinedField(sources, [
+      'frameJitterMs',
+      'frame_jitter_ms',
+      'jitterMs',
+    ]);
+    if (jitterField.found) {
+      const jitter = sanitizeNonNegativeFiniteNumber(jitterField.value);
+      if (jitter !== null) {
+        perfTelemetry.frameJitterMs = jitter;
+        panelPatch.frameJitterMs = jitter;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    }
+
+    // 4. VRAM budget utilization ([0, 1]).
+    const vramField = pickFirstDefinedField(sources, [
+      'vramBudgetUtilization',
+      'vram_budget_utilization',
+      'vramUtilization',
+      'vram_utilization',
+    ]);
+    if (vramField.found) {
+      const util = sanitizeUnitInterval(vramField.value);
+      if (util !== null) {
+        perfTelemetry.vramBudgetUtilization = util;
+        panelPatch.vramBudgetUtilization = util;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    } else {
+      const vramUsedField = pickFirstDefinedField(sources, ['vramUsedBytes', 'vram_used_bytes']);
+      const vramBudgetField = pickFirstDefinedField(sources, [
+        'vramBudgetBytes',
+        'vram_budget_bytes',
+      ]);
+      if (vramUsedField.found && vramBudgetField.found) {
+        const used = sanitizeNonNegativeFiniteNumber(vramUsedField.value);
+        const budget = sanitizeNonNegativeFiniteNumber(vramBudgetField.value);
+        if (used !== null && budget !== null && budget > 0) {
+          const util = sanitizeUnitInterval(used / budget);
+          if (util !== null) {
+            perfTelemetry.vramBudgetUtilization = util;
+            panelPatch.vramBudgetUtilization = util;
+            panelFieldUpdated = true;
+            updated = true;
+          }
+        }
+      }
+    }
+
+    // 5. Bind-group cache hit rate ([0, 1]).
+    const bgHitField = pickFirstDefinedField(sources, [
+      'bindGroupHitRate',
+      'bind_group_hit_rate',
+      'bindGroupCacheHitRate',
+      'bind_group_cache_hit_rate',
+    ]);
+    if (bgHitField.found) {
+      const hitRate = sanitizeUnitInterval(bgHitField.value);
+      if (hitRate !== null) {
+        perfTelemetry.bindGroupHitRate = hitRate;
+        panelPatch.bindGroupHitRate = hitRate;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    } else {
+      const bgHitsField = pickFirstDefinedField(sources, ['bindGroupCacheHits']);
+      const bgMissesField = pickFirstDefinedField(sources, ['bindGroupCacheMisses']);
+      if (bgHitsField.found && bgMissesField.found) {
+        const hits = sanitizeNonNegativeFiniteNumber(bgHitsField.value);
+        const misses = sanitizeNonNegativeFiniteNumber(bgMissesField.value);
+        if (hits !== null && misses !== null && hits + misses > 0) {
+          const hitRate = sanitizeUnitInterval(hits / (hits + misses));
+          if (hitRate !== null) {
+            perfTelemetry.bindGroupHitRate = hitRate;
+            panelPatch.bindGroupHitRate = hitRate;
+            panelFieldUpdated = true;
+            updated = true;
+          }
+        }
+      }
+    }
+
+    // 6. JS heap memory stats (explicit payload or performance.memory fallback).
+    const heapUsedMbField = pickFirstDefinedField(sources, [
+      'jsHeapUsedMb',
+      'js_heap_used_mb',
+      'heapUsedMb',
+      'heap_used_mb',
+    ]);
+    const heapTotalMbField = pickFirstDefinedField(sources, [
+      'jsHeapTotalMb',
+      'js_heap_total_mb',
+      'heapTotalMb',
+      'heap_total_mb',
+    ]);
+    const heapUsedBytesField = pickFirstDefinedField(sources, [
+      'usedJSHeapSize',
+      'jsHeapUsedBytes',
+      'js_heap_used_bytes',
+    ]);
+    const heapTotalBytesField = pickFirstDefinedField(sources, [
+      'totalJSHeapSize',
+      'jsHeapTotalBytes',
+      'js_heap_total_bytes',
+    ]);
+
+    let sawExplicitMemory = false;
+    if (heapUsedMbField.found) {
+      sawExplicitMemory = true;
+      const usedMb = sanitizeNonNegativeFiniteNumber(heapUsedMbField.value);
+      if (usedMb !== null) {
+        perfTelemetry.jsHeapUsedMb = usedMb;
+        panelPatch.jsHeapUsedMb = usedMb;
+        memoryUpdated = true;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    } else if (heapUsedBytesField.found) {
+      sawExplicitMemory = true;
+      const usedBytes = sanitizeNonNegativeFiniteNumber(heapUsedBytesField.value);
+      if (usedBytes !== null) {
+        const usedMb = Math.round((usedBytes / BYTES_PER_MIB) * 100) / 100;
+        perfTelemetry.jsHeapUsedMb = usedMb;
+        panelPatch.jsHeapUsedMb = usedMb;
+        memoryUpdated = true;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    }
+
+    if (heapTotalMbField.found) {
+      sawExplicitMemory = true;
+      const totalMb = sanitizeNonNegativeFiniteNumber(heapTotalMbField.value);
+      if (totalMb !== null) {
+        perfTelemetry.jsHeapTotalMb = totalMb;
+        memoryUpdated = true;
+        updated = true;
+      }
+    } else if (heapTotalBytesField.found) {
+      sawExplicitMemory = true;
+      const totalBytes = sanitizeNonNegativeFiniteNumber(heapTotalBytesField.value);
+      if (totalBytes !== null) {
+        perfTelemetry.jsHeapTotalMb = Math.round((totalBytes / BYTES_PER_MIB) * 100) / 100;
+        memoryUpdated = true;
+        updated = true;
+      }
+    }
+
+    if (!sawExplicitMemory) {
+      const sampledMem = sampleJsHeapMemory();
+      if (sampledMem) {
+        if (sampledMem.jsHeapUsedMb !== null) {
+          perfTelemetry.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
+          panelPatch.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
+          memoryUpdated = true;
+          panelFieldUpdated = true;
+          updated = true;
+        }
+        if (sampledMem.jsHeapTotalMb !== null) {
+          perfTelemetry.jsHeapTotalMb = sampledMem.jsHeapTotalMb;
+          memoryUpdated = true;
+          updated = true;
+        }
+      }
+    }
+
+    // 7. HTTPFS I/O mailbox lane count (W260/W294).
+    const mailboxKeys = allowLanesAlias
+      ? [
+          'mailboxLanes',
+          'mailbox_lanes',
+          'ioMailboxLanes',
+          'io_mailbox_lanes',
+          'httpfsMailboxLanes',
+          'httpfs_mailbox_lanes',
+          'lanes',
+        ]
+      : [
+          'mailboxLanes',
+          'mailbox_lanes',
+          'ioMailboxLanes',
+          'io_mailbox_lanes',
+          'httpfsMailboxLanes',
+          'httpfs_mailbox_lanes',
+        ];
+    let mailboxField = pickFirstDefinedField(sources, mailboxKeys);
+    if (!mailboxField.found && !allowLanesAlias) {
+      const ioOnlySources = collectPlainSources([
+        data.ioStats,
+        data.httpfsStats,
+        data.mailboxStats,
+        data.mailbox,
+      ]);
+      if (ioOnlySources.length > 0) {
+        mailboxField = pickFirstDefinedField(ioOnlySources, ['lanes']);
+      }
+    }
+    if (mailboxField.found) {
+      const lanes = sanitizePositiveInt(mailboxField.value);
+      if (lanes !== null) {
+        perfTelemetry.mailboxLanes = lanes;
+        panelPatch.mailboxLanes = lanes;
+        mailboxUpdated = true;
+        panelFieldUpdated = true;
+        updated = true;
+      }
+    }
+
+    // 8. Forward cleanly to HudController (W289) with defensive feature checks.
+    if (updated && notifyHud) {
+      const hudTargets = resolveHudTargets();
+      const frameBudgetPayload = {};
+      if (perfTelemetry.fps30ComplianceRate !== null) {
+        frameBudgetPayload.fps30ComplianceRate = perfTelemetry.fps30ComplianceRate;
+      }
+      if (perfTelemetry.dominantBottleneck !== null) {
+        frameBudgetPayload.dominantBottleneck = perfTelemetry.dominantBottleneck;
+      }
+
+      const memoryPayload = {};
+      if (perfTelemetry.jsHeapUsedMb !== null) {
+        memoryPayload.jsHeapUsedMb = perfTelemetry.jsHeapUsedMb;
+      }
+      if (perfTelemetry.jsHeapTotalMb !== null) {
+        memoryPayload.jsHeapTotalMb = perfTelemetry.jsHeapTotalMb;
+      }
+
+      const perfPayload = {};
+      if (perfTelemetry.fps30ComplianceRate !== null) {
+        perfPayload.fps30ComplianceRate = perfTelemetry.fps30ComplianceRate;
+      }
+      if (perfTelemetry.dominantBottleneck !== null) {
+        perfPayload.dominantBottleneck = perfTelemetry.dominantBottleneck;
+      }
+      if (perfTelemetry.frameJitterMs !== null) {
+        perfPayload.frameJitterMs = perfTelemetry.frameJitterMs;
+      }
+      if (perfTelemetry.jsHeapUsedMb !== null) {
+        perfPayload.jsHeapUsedMb = perfTelemetry.jsHeapUsedMb;
+      }
+      if (perfTelemetry.jsHeapTotalMb !== null) {
+        perfPayload.jsHeapTotalMb = perfTelemetry.jsHeapTotalMb;
+      }
+      if (perfTelemetry.vramBudgetUtilization !== null) {
+        perfPayload.vramBudgetUtilization = perfTelemetry.vramBudgetUtilization;
+      }
+      if (perfTelemetry.bindGroupHitRate !== null) {
+        perfPayload.bindGroupHitRate = perfTelemetry.bindGroupHitRate;
+      }
+      if (perfTelemetry.mailboxLanes !== null) {
+        perfPayload.mailboxLanes = perfTelemetry.mailboxLanes;
+      }
+      if (perfSnap && perfSnap.frames && typeof perfSnap.frames === 'object') {
+        if (typeof perfSnap.frames.fps === 'number' && Number.isFinite(perfSnap.frames.fps) && perfSnap.frames.fps > 0) {
+          perfPayload.fps = perfSnap.frames.fps;
+        }
+        if (
+          typeof perfSnap.frames.onePercentLowFps === 'number' &&
+          Number.isFinite(perfSnap.frames.onePercentLowFps) &&
+          perfSnap.frames.onePercentLowFps > 0
+        ) {
+          perfPayload.onePercentLowFps = perfSnap.frames.onePercentLowFps;
+        }
+        if (
+          typeof perfSnap.frames.p99FrameMs === 'number' &&
+          Number.isFinite(perfSnap.frames.p99FrameMs) &&
+          perfSnap.frames.p99FrameMs > 0
+        ) {
+          perfPayload.p99FrameMs = perfSnap.frames.p99FrameMs;
+        }
+      }
+
+      for (let i = 0; i < hudTargets.length; i += 1) {
+        const target = hudTargets[i];
+        if (!target || typeof target !== 'object') {
+          continue;
+        }
+        if (frameBudgetUpdated && typeof target.setFrameBudgetStats === 'function') {
+          try {
+            target.setFrameBudgetStats(frameBudgetPayload);
+          } catch {
+            // Optional HUD hooks must never interrupt telemetry.
+          }
+        }
+        if (memoryUpdated && typeof target.setMemoryStats === 'function') {
+          try {
+            target.setMemoryStats(memoryPayload);
+          } catch {
+            // Optional HUD hooks must never interrupt telemetry.
+          }
+        }
+        if (
+          mailboxUpdated &&
+          perfTelemetry.mailboxLanes !== null &&
+          typeof target.setIoMailboxLanes === 'function'
+        ) {
+          try {
+            target.setIoMailboxLanes(perfTelemetry.mailboxLanes);
+          } catch {
+            // Optional HUD hooks must never interrupt telemetry.
+          }
+        }
+        if (typeof target.updatePerfStats === 'function') {
+          try {
+            target.updatePerfStats(perfPayload);
+          } catch {
+            // Optional HUD hooks must never interrupt telemetry.
+          }
+        }
+      }
+    }
+
+    // 9. Forward cleanly to GpuBootPanel (W292) when requested.
+    if (updatePanel && panelFieldUpdated && gpuBootPanel) {
+      safeUpdateGpuBootPanel(panelPatch);
+    }
+
+    return { updated, panelFieldUpdated, panelPatch };
   }
 
   function applyGpuStatsFields(data) {
@@ -2805,12 +3551,14 @@ export function bootstrapPlayGta6App(options = {}) {
       return false;
     }
     applyGpuStatsFields(data);
+    const perfRes = ingestPerfAndIoTelemetry(data, { notifyHud: true, updatePanel: false });
     syncVisibleFrameFromTelemetry(data, { source: 'gpu-stats', deferObserverForward: true });
     const gpuStatsPayload = buildGpuStatsPayload();
     forwardGpuStatsToObservers(gpuStatsPayload, { allowHudMetricsFallback: true });
-    if (gpuBootPanel && gpuStatsPayload.presentCount > 0) {
-      safeUpdateGpuBootPanel({
-        frameStats: {
+    if (gpuBootPanel && (gpuStatsPayload.presentCount > 0 || perfRes.panelFieldUpdated)) {
+      const panelPatch = { ...perfRes.panelPatch };
+      if (gpuStatsPayload.presentCount > 0) {
+        panelPatch.frameStats = {
           ...(latestPanelFrameStats && typeof latestPanelFrameStats === 'object'
             ? latestPanelFrameStats
             : {}),
@@ -2819,8 +3567,9 @@ export function bootstrapPlayGta6App(options = {}) {
             latestPanelFrameStats && Number.isFinite(latestPanelFrameStats.droppedFrames)
               ? latestPanelFrameStats.droppedFrames
               : 0,
-        },
-      });
+        };
+      }
+      safeUpdateGpuBootPanel(panelPatch);
     }
     return true;
   }
@@ -3054,6 +3803,11 @@ export function bootstrapPlayGta6App(options = {}) {
       }
     }
 
+    const perfRes = ingestPerfAndIoTelemetry(data, { notifyHud: notify, updatePanel: notify });
+    if (perfRes.updated) {
+      updated = true;
+    }
+
     return updated;
   }
 
@@ -3083,6 +3837,11 @@ export function bootstrapPlayGta6App(options = {}) {
       patch.missingShaders = data.missingShaders;
     }
     const hadDrawOrBindFields = applyGpuStatsFields(data);
+    const perfRes = ingestPerfAndIoTelemetry(data, { notifyHud: true, updatePanel: false });
+    Object.assign(patch, perfRes.panelPatch);
+    if (data.fastBootMilestone !== undefined) {
+      recordFastBootMilestone(data.fastBootMilestone, { source: 'gpu-telemetry' });
+    }
     const triggeredVisible = syncVisibleFrameFromTelemetry(data, {
       source: 'gpu-telemetry',
       deferObserverForward: true,
@@ -3119,6 +3878,44 @@ export function bootstrapPlayGta6App(options = {}) {
     if (data.type === 'gpu-stats') {
       return handleGpuStatsMessage(data);
     }
+    if (typeof data.type === 'string' && PERF_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
+      ingestPerfAndIoTelemetry(data, { notifyHud: true, updatePanel: true });
+      return true;
+    }
+    if (typeof data.type === 'string' && IO_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
+      ingestPerfAndIoTelemetry(data, {
+        notifyHud: true,
+        updatePanel: true,
+        allowLanesAlias: true,
+      });
+      return true;
+    }
+    if (
+      typeof data.type === 'string' &&
+      Object.prototype.hasOwnProperty.call(FAST_BOOT_MESSAGE_TYPE_TO_MILESTONE, data.type)
+    ) {
+      recordFastBootMilestone(FAST_BOOT_MESSAGE_TYPE_TO_MILESTONE[data.type], {
+        ...data,
+        source: data.source || data.type,
+      });
+      return true;
+    }
+    if (
+      data.type === 'boot-milestone' ||
+      data.type === 'fast-boot-milestone' ||
+      data.type === 'milestone'
+    ) {
+      const targetMilestone = normalizeFastBootMilestone(
+        data.milestone ?? data.stage ?? data.name
+      );
+      if (targetMilestone) {
+        recordFastBootMilestone(targetMilestone, {
+          ...data,
+          source: data.source || data.type,
+        });
+        return true;
+      }
+    }
     if (data.type === 'stats') {
       if (
         looksLikeAudioStatsPayload(data) &&
@@ -3148,6 +3945,7 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (data.type === 'frame-presented') {
       ingestGpuAdapterFromPayload(data);
+      const perfRes = ingestPerfAndIoTelemetry(data, { notifyHud: true, updatePanel: false });
       const reportedFrames = toNonNegativeInt(
         data.presentCount ?? data.framesPresented ?? data.frame ?? data.frameCount,
         null
@@ -3172,6 +3970,9 @@ export function bootstrapPlayGta6App(options = {}) {
       }
       syncVisibleFrameFromTelemetry(data, { source: 'frame-presented', deferObserverForward: true });
       forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+      if (gpuBootPanel && perfRes.panelFieldUpdated) {
+        safeUpdateGpuBootPanel(perfRes.panelPatch);
+      }
       return true;
     }
     if (data.type === 'first-present') {
@@ -3281,6 +4082,9 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (typeof data.type === 'string' && LOADER_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
       ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
+      if (data.fastBootMilestone !== undefined) {
+        recordFastBootMilestone(data.fastBootMilestone, { source: data.type });
+      }
       return true;
     }
     if (data.type === undefined && data.label === undefined && data.error === undefined) {
@@ -3355,6 +4159,10 @@ export function bootstrapPlayGta6App(options = {}) {
 
     wrapMethod('markMilestone', () => true);
     wrapMethod('recordFirstVisibleFrame', () => true);
+    wrapMethod('recordStartScreen', () => true);
+    wrapMethod('recordIntroVideo', () => true);
+    wrapMethod('recordMainMenu', () => true);
+    wrapMethod('recordInGame', () => true);
     wrapMethod('recordGpuAdapter', () => true);
     wrapMethod('recordTrap', () => true);
     wrapMethod('reset', () => true);
@@ -3612,6 +4420,142 @@ export function bootstrapPlayGta6App(options = {}) {
     };
   }
 
+  function syncPerfPhaseForFastBootMilestone(milestone) {
+    if (!perfMonitor || typeof perfMonitor.setPhase !== 'function') {
+      return;
+    }
+    let nextPhase = null;
+    if (milestone === 'START_SCREEN' || milestone === 'MAIN_MENU') {
+      nextPhase = PERF_PHASES.MENU;
+    } else if (milestone === 'IN_GAME') {
+      nextPhase = PERF_PHASES.GAMEPLAY;
+    }
+    if (!nextPhase) {
+      return;
+    }
+    try {
+      perfMonitor.setPhase(nextPhase);
+    } catch {
+      // Telemetry phase updates must never disrupt boot.
+    }
+  }
+
+  function syncFastBootMilestonesFromTracer() {
+    if (!bootTracer || typeof bootTracer.getSummary !== 'function') {
+      return;
+    }
+    try {
+      const summary = bootTracer.getSummary();
+      if (!summary || typeof summary !== 'object') {
+        return;
+      }
+      const pairs = [
+        ['START_SCREEN', summary.bootToStartScreenMs],
+        ['INTRO_VIDEO', summary.bootToIntroVideoMs],
+        ['MAIN_MENU', summary.bootToMainMenuMs],
+        ['IN_GAME', summary.bootToInGameMs],
+      ];
+      for (let i = 0; i < pairs.length; i += 1) {
+        const [name, ms] = pairs[i];
+        if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+          const wasUnset = fastBootMilestones[name] === null;
+          fastBootMilestones[name] = ms;
+          if (wasUnset) {
+            syncPerfPhaseForFastBootMilestone(name);
+          }
+        }
+      }
+    } catch {
+      // Ignore tracer summary errors.
+    }
+  }
+
+  function recordFastBootMilestone(rawMilestone, meta = {}) {
+    if (destroyed) {
+      return { ok: false, destroyed: true };
+    }
+    const milestone = normalizeFastBootMilestone(rawMilestone);
+    if (!milestone) {
+      return null;
+    }
+    const safeMeta = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+    const overwrite = safeMeta.overwrite === true;
+    if (fastBootMilestones[milestone] !== null && !overwrite) {
+      return Object.freeze({
+        ok: true,
+        milestone,
+        elapsedMs: fastBootMilestones[milestone],
+        alreadyRecorded: true,
+      });
+    }
+
+    const explicitElapsedMs = sanitizeNonNegativeFiniteNumber(safeMeta.elapsedMs);
+    const tracerOpts = {};
+    if (explicitElapsedMs !== null) {
+      tracerOpts.elapsedMs = explicitElapsedMs;
+    }
+    if (overwrite) {
+      tracerOpts.overwrite = true;
+    }
+    if (typeof safeMeta.source === 'string' && safeMeta.source.trim().length > 0) {
+      tracerOpts.source = sanitizeDiagnosticText(safeMeta.source, 64);
+    }
+    if (safeMeta.detail !== undefined) {
+      tracerOpts.detail = safeMeta.detail;
+    }
+
+    let recordedMs = null;
+    const methodName = FAST_BOOT_TRACER_METHODS[milestone];
+    if (bootTracer && methodName && typeof bootTracer[methodName] === 'function') {
+      try {
+        const rec = bootTracer[methodName](tracerOpts);
+        if (rec && typeof rec === 'object') {
+          const candidate =
+            rec.elapsedMs ??
+            rec.bootToStartScreenMs ??
+            rec.bootToIntroVideoMs ??
+            rec.bootToMainMenuMs ??
+            rec.bootToInGameMs;
+          recordedMs = sanitizeNonNegativeFiniteNumber(candidate);
+        }
+      } catch {
+        // Tracer errors must never interrupt boot.
+      }
+    } else if (bootTracer && typeof bootTracer.markMilestone === 'function') {
+      try {
+        const rec = bootTracer.markMilestone(milestone, safeMeta);
+        if (rec && typeof rec === 'object') {
+          recordedMs = sanitizeNonNegativeFiniteNumber(rec.elapsedMs);
+        }
+      } catch {
+        // Ignore stub tracers without fast-boot milestones.
+      }
+    }
+
+    if (recordedMs === null) {
+      syncFastBootMilestonesFromTracer();
+      recordedMs = fastBootMilestones[milestone];
+    }
+    if (recordedMs === null) {
+      if (explicitElapsedMs !== null) {
+        recordedMs = explicitElapsedMs;
+      } else {
+        const fallbackElapsed = now() - bootStartedAtMs;
+        recordedMs = Number.isFinite(fallbackElapsed) && fallbackElapsed >= 0 ? fallbackElapsed : 0;
+      }
+    }
+
+    fastBootMilestones[milestone] = recordedMs;
+    syncPerfPhaseForFastBootMilestone(milestone);
+
+    return Object.freeze({
+      ok: true,
+      milestone,
+      elapsedMs: recordedMs,
+      alreadyRecorded: false,
+    });
+  }
+
   function feedBootLog(line) {
     if (destroyed) {
       return;
@@ -3625,6 +4569,17 @@ export function bootstrapPlayGta6App(options = {}) {
       Boolean(text) &&
       FIRST_VISIBLE_FRAME_LOG_RE.test(text) &&
       !VISIBLE_FRAME_LOG_FAILURE_RE.test(text);
+    const detectedFastBootMilestones = text ? detectFastBootMilestonesFromLog(text) : [];
+
+    const recordDetectedFastBootMilestones = () => {
+      syncFastBootMilestonesFromTracer();
+      for (let i = 0; i < detectedFastBootMilestones.length; i += 1) {
+        const milestone = detectedFastBootMilestones[i];
+        if (fastBootMilestones[milestone] === null) {
+          recordFastBootMilestone(milestone, { source: 'boot_log' });
+        }
+      }
+    };
 
     if (bootOrchestrator && typeof bootOrchestrator.feedRuntimeLog === 'function') {
       try {
@@ -3632,6 +4587,7 @@ export function bootstrapPlayGta6App(options = {}) {
         if (logIndicatesVisibleFrame) {
           notifyFirstVisibleFrame({ source: 'boot_log' });
         }
+        recordDetectedFastBootMilestones();
         return;
       } catch {
         // Fall back to direct tracer update.
@@ -3662,11 +4618,15 @@ export function bootstrapPlayGta6App(options = {}) {
         ) {
           notifyFirstVisibleFrame({ source: 'boot_log' });
         }
+        recordDetectedFastBootMilestones();
       } catch {
         // Tracer errors must never interrupt runtime logs.
       }
-    } else if (logIndicatesVisibleFrame) {
-      notifyFirstVisibleFrame({ source: 'boot_log' });
+    } else {
+      if (logIndicatesVisibleFrame) {
+        notifyFirstVisibleFrame({ source: 'boot_log' });
+      }
+      recordDetectedFastBootMilestones();
     }
   }
 
@@ -4530,12 +5490,89 @@ export function bootstrapPlayGta6App(options = {}) {
     return { gpuAdapter, firstVisibleFrameMs, blackLoadingMs };
   }
 
+  function resolveFastBootTimings() {
+    syncFastBootMilestonesFromTracer();
+    return {
+      bootToStartScreenMs: fastBootMilestones.START_SCREEN,
+      bootToIntroVideoMs: fastBootMilestones.INTRO_VIDEO,
+      bootToMainMenuMs: fastBootMilestones.MAIN_MENU,
+      bootToInGameMs: fastBootMilestones.IN_GAME,
+    };
+  }
+
+  function resolvePerfTelemetrySnapshot() {
+    let fps30ComplianceRate = perfTelemetry.fps30ComplianceRate;
+    let dominantBottleneck = perfTelemetry.dominantBottleneck;
+    let targetFps = DEFAULT_TARGET_FPS;
+    let budgetMs = DEFAULT_FRAME_BUDGET_MS;
+
+    if (perfMonitor && typeof perfMonitor.getSnapshot === 'function') {
+      try {
+        const snap = perfMonitor.getSnapshot();
+        if (snap && typeof snap === 'object') {
+          if (typeof snap.targetFps === 'number' && Number.isFinite(snap.targetFps) && snap.targetFps > 0) {
+            targetFps = snap.targetFps;
+          }
+          if (typeof snap.budgetMs === 'number' && Number.isFinite(snap.budgetMs) && snap.budgetMs > 0) {
+            budgetMs = snap.budgetMs;
+          }
+          const within = sanitizeNonNegativeFiniteNumber(snap.framesWithin30FpsBudget) ?? 0;
+          const over = sanitizeNonNegativeFiniteNumber(snap.framesOver30FpsBudget) ?? 0;
+          if (within + over > 0) {
+            if (fps30ComplianceRate === null) {
+              fps30ComplianceRate = sanitizeUnitInterval(snap.fps30ComplianceRate);
+            }
+            if (dominantBottleneck === null) {
+              dominantBottleneck = normalizeDominantBottleneck(snap.dominantBottleneck);
+            }
+          }
+        }
+      } catch {
+        // Ignore PerfMonitor snapshot errors.
+      }
+    }
+
+    let jsHeapUsedMb = perfTelemetry.jsHeapUsedMb;
+    let jsHeapTotalMb = perfTelemetry.jsHeapTotalMb;
+    if (jsHeapUsedMb === null || jsHeapTotalMb === null) {
+      const sampled = sampleJsHeapMemory();
+      if (sampled) {
+        if (jsHeapUsedMb === null && sampled.jsHeapUsedMb !== null) {
+          jsHeapUsedMb = sampled.jsHeapUsedMb;
+        }
+        if (jsHeapTotalMb === null && sampled.jsHeapTotalMb !== null) {
+          jsHeapTotalMb = sampled.jsHeapTotalMb;
+        }
+      }
+    }
+
+    return Object.freeze({
+      targetFps,
+      budgetMs,
+      fps30ComplianceRate,
+      dominantBottleneck,
+      frameJitterMs: perfTelemetry.frameJitterMs,
+      jsHeapUsedMb,
+      jsHeapTotalMb,
+      vramBudgetUtilization: perfTelemetry.vramBudgetUtilization,
+      bindGroupHitRate: perfTelemetry.bindGroupHitRate,
+      mailboxLanes: perfTelemetry.mailboxLanes,
+    });
+  }
+
   function getDiagnosticsSnapshot() {
     const sessionState = resolveSessionStateText();
     const recentCopy = Object.freeze(
       recentValidationErrors.map((entry) => Object.freeze({ ...entry }))
     );
     const { gpuAdapter, firstVisibleFrameMs, blackLoadingMs } = resolveTracerVisibleTiming();
+    const {
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
+    } = resolveFastBootTimings();
+    const perf = resolvePerfTelemetrySnapshot();
     const loadingAssets = isSplashOverlayHolding();
     return Object.freeze({
       bootMode: resolveCurrentBootMode(),
@@ -4550,6 +5587,18 @@ export function bootstrapPlayGta6App(options = {}) {
       hasVisibleContent: Boolean(gpuTelemetry.hasVisibleContent),
       firstVisibleFrameMs,
       blackLoadingMs,
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
+      fps30ComplianceRate: perf.fps30ComplianceRate,
+      dominantBottleneck: perf.dominantBottleneck,
+      frameJitterMs: perf.frameJitterMs,
+      jsHeapUsedMb: perf.jsHeapUsedMb,
+      vramBudgetUtilization: perf.vramBudgetUtilization,
+      bindGroupHitRate: perf.bindGroupHitRate,
+      mailboxLanes: perf.mailboxLanes,
+      fastBootPlan: latestFastBootPlan,
       loadingAssets,
       holdUntilVisible: Boolean(resolvedHoldUntilVisible),
       dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
@@ -4566,6 +5615,13 @@ export function bootstrapPlayGta6App(options = {}) {
       ? audioTelemetry.outputState
       : normalizeAudioOutputState(audioEngine && audioEngine.state);
     const { gpuAdapter, firstVisibleFrameMs, blackLoadingMs } = resolveTracerVisibleTiming();
+    const {
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
+    } = resolveFastBootTimings();
+    const perf = resolvePerfTelemetrySnapshot();
     const loadingAssets = isSplashOverlayHolding();
 
     const gpu = Object.freeze({
@@ -4601,6 +5657,18 @@ export function bootstrapPlayGta6App(options = {}) {
       preferredShaderPackUrl: resolveSanitizedPreferredShaderPackUrl(),
     });
 
+    const fastBootMilestonesSnap = Object.freeze({
+      START_SCREEN: bootToStartScreenMs,
+      INTRO_VIDEO: bootToIntroVideoMs,
+      MAIN_MENU: bootToMainMenuMs,
+      IN_GAME: bootToInGameMs,
+    });
+
+    const storage = Object.freeze({
+      fastBootPlan: latestFastBootPlan,
+      quotaEviction: latestQuotaEviction,
+    });
+
     return Object.freeze({
       bootMode: resolveCurrentBootMode(),
       sessionState,
@@ -4614,6 +5682,21 @@ export function bootstrapPlayGta6App(options = {}) {
       hasVisibleContent: gpu.hasVisibleContent,
       firstVisibleFrameMs: gpu.firstVisibleFrameMs,
       blackLoadingMs: gpu.blackLoadingMs,
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
+      fastBootMilestones: fastBootMilestonesSnap,
+      fps30ComplianceRate: perf.fps30ComplianceRate,
+      dominantBottleneck: perf.dominantBottleneck,
+      frameJitterMs: perf.frameJitterMs,
+      jsHeapUsedMb: perf.jsHeapUsedMb,
+      jsHeapTotalMb: perf.jsHeapTotalMb,
+      vramBudgetUtilization: perf.vramBudgetUtilization,
+      bindGroupHitRate: perf.bindGroupHitRate,
+      mailboxLanes: perf.mailboxLanes,
+      fastBootPlan: latestFastBootPlan,
+      quotaEviction: latestQuotaEviction,
       loadingAssets: gpu.loadingAssets,
       realPackDrawCount: gpu.realPackDrawCount,
       fallbackDrawCount: gpu.fallbackDrawCount,
@@ -4637,6 +5720,8 @@ export function bootstrapPlayGta6App(options = {}) {
       gpu,
       audio,
       loader,
+      perf,
+      storage,
     });
   }
 
@@ -4755,6 +5840,91 @@ export function bootstrapPlayGta6App(options = {}) {
     }
   }
 
+  async function initializeFastBootStoragePlan() {
+    if (destroyed || !storageManager || typeof storageManager.getFastBootPlan !== 'function') {
+      return null;
+    }
+    latestFastBootPlan = null;
+    latestQuotaEviction = null;
+
+    const planOpts = {};
+    const rawMemory = readRawPerformanceMemory();
+    if (rawMemory) {
+      planOpts.memory = rawMemory;
+    }
+    if (
+      navigatorObj &&
+      typeof navigatorObj === 'object' &&
+      typeof navigatorObj.deviceMemory === 'number' &&
+      Number.isFinite(navigatorObj.deviceMemory) &&
+      navigatorObj.deviceMemory > 0
+    ) {
+      planOpts.deviceMemoryGb = navigatorObj.deviceMemory;
+    }
+
+    let rawPlan = null;
+    try {
+      rawPlan =
+        Object.keys(planOpts).length > 0
+          ? await storageManager.getFastBootPlan(planOpts)
+          : await storageManager.getFastBootPlan();
+    } catch {
+      return null;
+    }
+
+    if (destroyed || !rawPlan || typeof rawPlan !== 'object') {
+      return null;
+    }
+
+    latestFastBootPlan = Object.freeze({
+      warmCacheReady: Boolean(rawPlan.warmCacheReady),
+      recommendedSlabMaxBytes: toSafeNonNegativeInt(rawPlan.recommendedSlabMaxBytes, 0),
+      recommendedOpfsBudgetBytes: toSafeNonNegativeInt(rawPlan.recommendedOpfsBudgetBytes, 0),
+      quotaHeadroomBytes: toSafeNonNegativeInt(rawPlan.quotaHeadroomBytes, 0),
+      pressureLevel: sanitizeFastBootPressureLevel(rawPlan.pressureLevel),
+      shouldEvictColdChunks: Boolean(rawPlan.shouldEvictColdChunks),
+    });
+
+    if (
+      latestFastBootPlan.shouldEvictColdChunks &&
+      typeof storageManager.runQuotaPressureEviction === 'function'
+    ) {
+      try {
+        const rawEviction = await storageManager.runQuotaPressureEviction();
+        if (!destroyed && rawEviction && typeof rawEviction === 'object') {
+          latestQuotaEviction = Object.freeze({
+            triggered: true,
+            ok: rawEviction.ok !== false,
+            evictedBytes: toSafeNonNegativeInt(rawEviction.evictedBytes, 0),
+            evictedEntries: toSafeNonNegativeInt(rawEviction.evictedEntries, 0),
+          });
+        }
+      } catch {
+        if (!destroyed) {
+          latestQuotaEviction = Object.freeze({
+            triggered: true,
+            ok: false,
+            evictedBytes: 0,
+            evictedEntries: 0,
+          });
+        }
+      }
+    }
+
+    if (!destroyed) {
+      const hudTargets = resolveHudTargets();
+      for (let i = 0; i < hudTargets.length; i += 1) {
+        invokeFirstHook(
+          hudTargets[i],
+          ['setFastBootPlan', 'updateFastBootPlan'],
+          latestFastBootPlan
+        );
+      }
+    }
+
+    return latestFastBootPlan;
+  }
+
   async function start(startOpts) {
     if (destroyed) {
       return {
@@ -4780,6 +5950,16 @@ export function bootstrapPlayGta6App(options = {}) {
             startOpts.wgslPack
           )
         : null;
+    await initializeFastBootStoragePlan();
+    if (destroyed) {
+      return {
+        ok: false,
+        destroyed: true,
+        state: SESSION_STATE.STOPPED,
+        mode: SESSION_MODE.NONE,
+        error: new Error('PlayGta6AppHandle has been destroyed'),
+      };
+    }
     let result;
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
@@ -4936,7 +6116,9 @@ export function bootstrapPlayGta6App(options = {}) {
       }
 
       try {
-        perfMonitor.detachHud();
+        if (perfMonitor && typeof perfMonitor.detachHud === 'function') {
+          perfMonitor.detachHud();
+        }
       } catch {
         // Ignore teardown errors.
       }
@@ -5016,8 +6198,10 @@ export function bootstrapPlayGta6App(options = {}) {
     getWasmWorker: () => activeWasmWorker,
     getDiagnosticsSnapshot,
     getBootTelemetry,
+    getFastBootPlan: () => latestFastBootPlan,
     notifyFirstPresent,
     notifyFirstVisibleFrame,
+    recordFastBootMilestone,
     start,
     stop,
     resize,
