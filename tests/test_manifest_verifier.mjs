@@ -9,17 +9,22 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  DEFAULT_MAX_CONCURRENCY,
   DEFAULT_SAMPLE_COUNT,
   INCOMPLETE_DOWNLOAD_SUFFIXES,
   MANIFEST_ABI_VERSION,
+  MAX_MAX_CONCURRENCY,
+  MIN_MAX_CONCURRENCY,
   MISMATCH_CATEGORIES,
   SCHEMA_DIAGNOSTIC_CODES,
   STREAM_HASH_ALGORITHMS,
   computeDigest,
   computeStreamingReadiness,
   createIncrementalVerifier,
+  getStats,
   hasIncompleteSuffix,
   parseContentRange,
+  resetStats,
   validateBootset,
   validateDataManifest,
   validateManifestPath,
@@ -1275,6 +1280,7 @@ describe('verification telemetry, mismatch categories, AbortSignal, and sanitiza
       dataBase: '/data/',
       manifest,
       sampleCount: 3,
+      maxConcurrency: 1,
       signal: controller.signal,
     });
 
@@ -1944,5 +1950,528 @@ describe('incremental streaming chunk verification & schema diagnostics (W221)',
     const bootCodes = new Set(bootRes.schemaDiagnostics.map((d) => d.code));
     assert.ok(bootCodes.has(SCHEMA_DIAGNOSTIC_CODES.RANGE_OUT_OF_BOUNDS));
     assert.ok(bootCodes.has(SCHEMA_DIAGNOSTIC_CODES.MISSING_MANIFEST_FILE));
+  });
+});
+
+describe('bounded concurrency, streaming reader hashing, AbortSignal propagation & telemetry (W278)', () => {
+  it('exports concurrency bound constants and clamps maxConcurrency to [1, 16] with default 4', async () => {
+    assert.equal(DEFAULT_MAX_CONCURRENCY, 4);
+    assert.equal(MIN_MAX_CONCURRENCY, 1);
+    assert.equal(MAX_MAX_CONCURRENCY, 16);
+
+    const backing = new Map([['a.bin', { bytes: new Uint8Array(16).fill(1), etag: '"a"' }]]);
+    const manifest = makeValidManifest({ files: [{ path: 'a.bin', size: 16, etag: '"a"' }] });
+    const { fetchImpl } = createMockDataFetch(backing);
+
+    const cases = [
+      { input: undefined, expected: 4 },
+      { input: null, expected: 4 },
+      { input: Number.NaN, expected: 4 },
+      { input: 'invalid', expected: 4 },
+      { input: 0, expected: 1 },
+      { input: -8, expected: 1 },
+      { input: -Infinity, expected: 1 },
+      { input: 2.9, expected: 2 },
+      { input: 16, expected: 16 },
+      { input: 64, expected: 16 },
+      { input: Infinity, expected: 16 },
+    ];
+
+    for (const tc of cases) {
+      const report = await verifyLiveEndpoints({
+        fetchImpl,
+        dataBase: '/data/',
+        manifest,
+        sampleCount: 1,
+        maxConcurrency: tc.input,
+      });
+      assert.equal(report.ok, true);
+      assert.equal(
+        report.maxConcurrency,
+        tc.expected,
+        `expected maxConcurrency(${String(tc.input)}) -> ${tc.expected}`,
+      );
+      assert.equal(report.telemetry.maxConcurrency, tc.expected);
+    }
+  });
+
+  it('enforces bounded concurrency across default (4) and explicit maxConcurrency while preserving manifest order', async () => {
+    resetStats();
+
+    const fileCount = 10;
+    const files = [];
+    const payloads = new Map();
+    let expectedTotalBytes = 0;
+    for (let i = 0; i < fileCount; i += 1) {
+      const p = `x64/archive_${String(i).padStart(2, '0')}.rpf`;
+      const bytes = makeSyntheticPayload(4096 + i * 257, 0x100 + i);
+      const sha = sha256Hex(bytes);
+      const etag = `"arch-${i}"`;
+      files.push({ path: p, size: bytes.byteLength, sha256: sha, etag });
+      payloads.set(p, { bytes, etag });
+      expectedTotalBytes += bytes.byteLength;
+    }
+    const manifest = makeValidManifest({ files });
+
+    const runWithConcurrency = async (maxConcurrencyOpt) => {
+      let inFlight = 0;
+      let peakInFlight = 0;
+      let arrayBufferCalled = 0;
+
+      const fetchImpl = async (url, init = {}) => {
+        const method = (init.method || 'GET').toUpperCase();
+        const rangeHeader = init.headers?.Range || init.headers?.range || null;
+        const relPath = url.replace(/^\/data\//, '');
+        const entry = payloads.get(relPath);
+        const baseHeaders = {
+          'Accept-Ranges': 'bytes',
+          ETag: entry.etag,
+        };
+
+        if (method === 'HEAD') {
+          return {
+            status: 200,
+            ok: true,
+            headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(entry.bytes.byteLength) }),
+          };
+        }
+
+        if (rangeHeader) {
+          const { stream } = createChunkReadableStream([entry.bytes.subarray(0, 1)]);
+          return {
+            status: 206,
+            ok: true,
+            headers: makeMockHeaders({
+              ...baseHeaders,
+              'Content-Range': `bytes 0-0/${entry.bytes.byteLength}`,
+              'Content-Length': '1',
+            }),
+            body: stream,
+            async arrayBuffer() {
+              arrayBufferCalled += 1;
+              throw new Error('Range probe must stream via body.getReader()');
+            },
+          };
+        }
+
+        // Full GET for SHA-256: track active concurrency across async chunk delivery.
+        const chunks = splitIntoChunks(entry.bytes, [1024, 1536, 2048]);
+        let idx = 0;
+        let activeForThisStream = false;
+        const stream = new ReadableStream({
+          async pull(controller) {
+            if (!activeForThisStream) {
+              activeForThisStream = true;
+              inFlight += 1;
+              if (inFlight > peakInFlight) {
+                peakInFlight = inFlight;
+              }
+            }
+            await new Promise((r) => setTimeout(r, 4));
+            if (idx >= chunks.length) {
+              if (activeForThisStream) {
+                activeForThisStream = false;
+                inFlight -= 1;
+              }
+              controller.close();
+              return;
+            }
+            controller.enqueue(chunks[idx]);
+            idx += 1;
+          },
+          cancel() {
+            if (activeForThisStream) {
+              activeForThisStream = false;
+              inFlight -= 1;
+            }
+          },
+        });
+
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Length': String(entry.bytes.byteLength),
+          }),
+          body: stream,
+          async arrayBuffer() {
+            arrayBufferCalled += 1;
+            throw new Error('Full GET must stream via body.getReader()');
+          },
+        };
+      };
+
+      const opts = {
+        fetchImpl,
+        dataBase: '/data/',
+        manifest,
+        sampleCount: fileCount,
+        verifyHashes: true,
+      };
+      if (maxConcurrencyOpt !== undefined) {
+        opts.maxConcurrency = maxConcurrencyOpt;
+      }
+
+      const report = await verifyLiveEndpoints(opts);
+      return { report, peakInFlight, arrayBufferCalled };
+    };
+
+    // 1. Default maxConcurrency (4)
+    const defaultRun = await runWithConcurrency(undefined);
+    assert.equal(defaultRun.report.ok, true);
+    assert.equal(defaultRun.report.maxConcurrency, 4);
+    assert.equal(defaultRun.report.passed, fileCount);
+    assert.equal(defaultRun.report.bytesHashed, expectedTotalBytes);
+    assert.equal(defaultRun.arrayBufferCalled, 0);
+    assert.ok(
+      defaultRun.peakInFlight >= 2 && defaultRun.peakInFlight <= 4,
+      `expected default concurrency in [2, 4], got ${defaultRun.peakInFlight}`,
+    );
+    assert.ok(
+      defaultRun.report.peakConcurrentHashes >= 2 && defaultRun.report.peakConcurrentHashes <= 4,
+      `expected peakConcurrentHashes in [2, 4], got ${defaultRun.report.peakConcurrentHashes}`,
+    );
+    assert.deepEqual(
+      defaultRun.report.results.map((r) => r.path),
+      files.map((f) => f.path),
+    );
+
+    // 2. Explicit maxConcurrency = 2
+    resetStats();
+    const boundedRun = await runWithConcurrency(2);
+    assert.equal(boundedRun.report.ok, true);
+    assert.equal(boundedRun.report.maxConcurrency, 2);
+    assert.equal(boundedRun.arrayBufferCalled, 0);
+    assert.equal(boundedRun.peakInFlight, 2);
+    assert.equal(boundedRun.report.peakConcurrentHashes, 2);
+
+    const stats = getStats();
+    assert.equal(stats.filesVerified, fileCount);
+    assert.equal(stats.bytesHashed, expectedTotalBytes);
+    assert.equal(stats.mismatchCount, 0);
+    assert.equal(stats.abortedCount, 0);
+    assert.equal(stats.peakConcurrentHashes, 2);
+    assert.equal(stats.activeHashes, 0);
+  });
+
+  it('streams Range GET directly via body.getReader() without arrayBuffer() and cancels non-206 bodies', async () => {
+    resetStats();
+    const smallPayload = makeSyntheticPayload(12000, 0x99);
+    const smallSha = sha256Hex(smallPayload);
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'shaders/small.wgsl.pack', size: smallPayload.byteLength, sha256: smallSha, etag: '"s1"' },
+        { path: 'x64/no_range_server.rpf', size: 1000000, etag: '"nr1"' },
+      ],
+    });
+
+    let arrayBufferCalled = 0;
+    let fullGetCalledForSmall = false;
+    let non206BodyCancelled = false;
+
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const isSmall = url.endsWith('small.wgsl.pack');
+
+      if (method === 'HEAD') {
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({
+            'Accept-Ranges': 'bytes',
+            ETag: isSmall ? '"s1"' : '"nr1"',
+            'Content-Length': String(isSmall ? smallPayload.byteLength : 1000000),
+          }),
+        };
+      }
+
+      if (isSmall) {
+        if (!rangeHeader) {
+          fullGetCalledForSmall = true;
+        }
+        const { stream } = createChunkReadableStream(splitIntoChunks(smallPayload, [1024, 2048, 3072]));
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            'Accept-Ranges': 'bytes',
+            ETag: '"s1"',
+            'Content-Range': `bytes 0-${smallPayload.byteLength - 1}/${smallPayload.byteLength}`,
+            'Content-Length': String(smallPayload.byteLength),
+          }),
+          body: stream,
+          async arrayBuffer() {
+            arrayBufferCalled += 1;
+            throw new Error('must not call arrayBuffer() when body.getReader() is available');
+          },
+        };
+      }
+
+      // Misconfigured server returns 200 instead of 206 for a Range probe on a large file.
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new Uint8Array(65536));
+        },
+        cancel() {
+          non206BodyCancelled = true;
+        },
+      });
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({
+          'Content-Length': '1000000',
+          ETag: '"nr1"',
+        }),
+        body: stream,
+        async arrayBuffer() {
+          arrayBufferCalled += 1;
+          throw new Error('must not buffer 200 body on failed Range probe');
+        },
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 5,
+      probeBytes: 16384,
+      verifyHashes: true,
+      maxConcurrency: 2,
+    });
+
+    assert.equal(arrayBufferCalled, 0);
+    assert.equal(fullGetCalledForSmall, false);
+    assert.equal(non206BodyCancelled, true);
+    assert.equal(report.ok, false);
+    assert.equal(report.passed, 1);
+    assert.equal(report.failed, 1);
+    assert.equal(report.results[0].ok, true);
+    assert.equal(report.results[0].hash.verified, true);
+    assert.equal(report.results[0].hash.actual, smallSha);
+    assert.equal(report.bytesHashed, smallPayload.byteLength);
+
+    const stats = getStats();
+    assert.equal(stats.filesVerified, 2);
+    assert.equal(stats.bytesHashed, smallPayload.byteLength);
+    assert.equal(stats.activeHashes, 0);
+  });
+
+  it('propagates AbortSignal across all active concurrent workers, cancels streams, and increments abortedCount', async () => {
+    resetStats();
+    const files = [];
+    const payloads = new Map();
+    for (let i = 0; i < 8; i += 1) {
+      const p = `x64/pack_${i}.rpf`;
+      const bytes = makeSyntheticPayload(4096, 0x20 + i);
+      files.push({ path: p, size: bytes.byteLength, sha256: sha256Hex(bytes), etag: `"e${i}"` });
+      payloads.set(p, bytes);
+    }
+    const manifest = makeValidManifest({ files });
+
+    const controller = new AbortController();
+    const seenSignals = [];
+    const requestedFiles = new Set();
+    const streamHandles = [];
+    let hangingCount = 0;
+
+    const fetchImpl = async (url, init = {}) => {
+      seenSignals.push(init.signal);
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const relPath = url.replace(/^\/data\//, '');
+      requestedFiles.add(relPath);
+      const bytes = payloads.get(relPath);
+      const baseHeaders = { 'Accept-Ranges': 'bytes', ETag: `"e${relPath.match(/\d+/)[0]}"` };
+
+      if (method === 'HEAD') {
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(bytes.byteLength) }),
+        };
+      }
+      if (rangeHeader) {
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Range': `bytes 0-0/${bytes.byteLength}`,
+            'Content-Length': '1',
+          }),
+          body: createChunkReadableStream([bytes.subarray(0, 1)]).stream,
+        };
+      }
+
+      // Full GET hangs after yielding the first 512 bytes until AbortSignal cancels all 3 workers.
+      const handle = createChunkReadableStream([bytes.subarray(0, 512), bytes.subarray(512)], {
+        hangAtIndex: 1,
+        onHang: () => {
+          hangingCount += 1;
+          if (hangingCount === 3) {
+            setTimeout(() => controller.abort(new Error('boot cancelled')), 5);
+          }
+        },
+      });
+      streamHandles.push(handle);
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(bytes.byteLength) }),
+        body: handle.stream,
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 8,
+      maxConcurrency: 3,
+      verifyHashes: true,
+      signal: controller.signal,
+    });
+
+    assert.equal(report.ok, false);
+    assert.equal(report.aborted, true);
+    assert.equal(report.abortedCount, 3);
+    assert.equal(report.telemetry.aborted, true);
+    assert.equal(report.telemetry.abortedCount, 3);
+    assert.equal(report.probed, 0);
+    assert.equal(streamHandles.length, 3);
+    assert.ok(streamHandles.every((h) => h.cancelled === true));
+    assert.ok(seenSignals.every((s) => s === controller.signal));
+    // Remaining queued files (pack_3..pack_7) must never have started.
+    assert.equal(requestedFiles.size, 3);
+    assert.equal(report.bytesHashed, 512 * 3);
+
+    const stats = getStats();
+    assert.equal(stats.abortedCount, 3);
+    assert.equal(stats.bytesHashed, 512 * 3);
+    assert.equal(stats.peakConcurrentHashes, 3);
+    assert.equal(stats.activeHashes, 0);
+
+    // Pre-aborted signal increments abortedCount without launching workers or bumping peakConcurrentHashes.
+    resetStats();
+    const preAborted = new AbortController();
+    preAborted.abort();
+    const preReport = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      signal: preAborted.signal,
+    });
+    assert.equal(preReport.aborted, true);
+    assert.equal(preReport.abortedCount, 1);
+    assert.equal(getStats().abortedCount, 1);
+    assert.equal(getStats().peakConcurrentHashes, 0);
+    assert.equal(getStats().activeHashes, 0);
+  });
+
+  it('tracks sanitized mismatchCount, bytesHashed, filesVerified across APIs and resets cleanly via resetStats()', async () => {
+    resetStats();
+    assert.deepEqual(getStats(), {
+      filesVerified: 0,
+      bytesHashed: 0,
+      mismatchCount: 0,
+      abortedCount: 0,
+      peakConcurrentHashes: 0,
+      activeHashes: 0,
+    });
+
+    const goodBytes = makeSyntheticPayload(1024, 0xaa);
+    const badHashBytes = makeSyntheticPayload(512, 0xbb);
+    const sizeDriftBytes = makeSyntheticPayload(256, 0xcc);
+
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'good.bin', size: goodBytes.byteLength, sha256: sha256Hex(goodBytes), etag: '"g1"' },
+        { path: 'bad_hash.bin', size: badHashBytes.byteLength, sha256: '0'.repeat(64), etag: '"bh1"' },
+        { path: 'missing.bin', size: 128, etag: '"m1"' },
+        { path: 'size_drift.bin', size: 500, etag: '"sd1"' },
+      ],
+    });
+
+    const backing = new Map([
+      ['good.bin', { bytes: goodBytes, etag: '"g1"' }],
+      ['bad_hash.bin', { bytes: badHashBytes, etag: '"bh1"' }],
+      ['size_drift.bin', { bytes: sizeDriftBytes, etag: '"sd1"' }],
+    ]);
+    const { fetchImpl } = createMockDataFetch(backing);
+
+    const liveReport = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      maxConcurrency: 4,
+    });
+
+    assert.equal(liveReport.ok, false);
+    assert.equal(liveReport.filesVerified, 4);
+    assert.equal(liveReport.mismatchCount, 3); // 1 hash_mismatch + 1 missing + 1 size_mismatch
+    assert.equal(liveReport.bytesHashed, 1024 + 512);
+
+    const afterLive = getStats();
+    assert.equal(afterLive.filesVerified, 4);
+    assert.equal(afterLive.bytesHashed, 1024 + 512);
+    assert.equal(afterLive.mismatchCount, 3);
+    assert.equal(afterLive.abortedCount, 0);
+    assert.ok(afterLive.peakConcurrentHashes >= 1 && afterLive.peakConcurrentHashes <= 4);
+    assert.equal(afterLive.activeHashes, 0);
+
+    // Standalone verifyStream and createIncrementalVerifier also accumulate into getStats().
+    const streamPayload = makeSyntheticPayload(2048, 0xdd);
+    const { stream } = createChunkReadableStream(splitIntoChunks(streamPayload, [512]));
+    const streamRes = await verifyStream(stream, {
+      algorithm: 'sha256',
+      expectedDigest: 'f'.repeat(64), // 1 mismatch
+      expectedSize: 2048,
+      path: 'C:\\Users\\Alice\\Private\\secret.pgim',
+    });
+    assert.equal(streamRes.ok, false);
+    assert.equal(streamRes.mismatchCount, 1);
+
+    const inc = createIncrementalVerifier({
+      algorithm: 'crc32',
+      expectedDigest: computeDigest(goodBytes, 'crc32'),
+      expectedSize: goodBytes.byteLength,
+    });
+    inc.update(goodBytes);
+    const incRes1 = inc.finalize();
+    const incRes2 = inc.finalize(); // idempotent: must NOT double-count
+    assert.strictEqual(incRes1, incRes2);
+
+    const afterAll = getStats();
+    assert.equal(afterAll.filesVerified, 4 + 1 + 1);
+    assert.equal(afterAll.bytesHashed, 1024 + 512 + 2048 + 1024);
+    assert.equal(afterAll.mismatchCount, 3 + 1);
+    assert.equal(afterAll.abortedCount, 0);
+    assert.equal(afterAll.activeHashes, 0);
+
+    // Telemetry snapshot must be strictly sanitized numeric values (no paths or raw bytes).
+    const serializedStats = JSON.stringify(afterAll);
+    assert.equal(serializedStats.includes('Alice'), false);
+    assert.equal(serializedStats.includes('secret.pgim'), false);
+    for (const [key, value] of Object.entries(afterAll)) {
+      assert.equal(typeof value, 'number', `getStats().${key} must be numeric`);
+      assert.ok(Number.isSafeInteger(value) && value >= 0);
+    }
+
+    // resetStats() clears all counters cleanly.
+    resetStats();
+    assert.deepEqual(getStats(), {
+      filesVerified: 0,
+      bytesHashed: 0,
+      mismatchCount: 0,
+      abortedCount: 0,
+      peakConcurrentHashes: 0,
+      activeHashes: 0,
+    });
   });
 });
