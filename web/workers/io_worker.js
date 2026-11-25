@@ -139,6 +139,10 @@
   const MAX_COALESCED_FETCH_BYTES = 4 * 1024 * 1024; // 4 MiB cap per single HTTP 206 fetch
   const DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES = 64 * 1024; // 64 KiB max gap merged between same-asset batch ranges
   const DEFAULT_BATCH_COALESCE_MAX_BYTES = 2 * 1024 * 1024; // 2 MiB default cap per coalesced batch span
+  const DEFAULT_HOT_OPFS_RPF_ALLOWLIST = Object.freeze(['shaders.rpf', 'core_bvh4.rpf']);
+  const DEFAULT_OPFS_L2_MAX_PENDING_WRITES = 64;
+  const DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY = 4;
+  const DEFAULT_OPFS_L2_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB bounded OPFS L2 cap
 
   const SLAB_TUNING_PROFILES = Object.freeze({
     default: Object.freeze({
@@ -196,6 +200,242 @@
       return true;
     }
     return IMMUTABLE_HTTPFS_EXT_RE.test(cleanPath);
+  }
+
+  function isQuotaExceededError(err) {
+    return Boolean(
+      err &&
+        (err.name === 'QuotaExceededError' ||
+          err.code === 22 ||
+          err.code === 1014 ||
+          /quota/i.test(String(err.message || ''))),
+    );
+  }
+
+  function isNotFoundError(err) {
+    return Boolean(
+      err &&
+        (err.name === 'NotFoundError' ||
+          err.code === 'ENOENT' ||
+          err.code === 8 ||
+          /not\s*found/i.test(String(err.message || ''))),
+    );
+  }
+
+  function utf8ToHex(str) {
+    const bytes = utf8Encoder.encode(str);
+    let hex = '';
+    for (let i = 0; i < bytes.length; i += 1) {
+      hex += bytes[i].toString(16).padStart(2, '0');
+    }
+    return hex;
+  }
+
+  function fnv1a128Hex(str) {
+    // Deterministic 128-bit four-lane FNV-1a hash matching web/workers/range_cache.js & web/storage/opfs_cache.js.
+    const bytes = utf8Encoder.encode(str);
+    let h1 = 0x811c9dc5;
+    let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+    let h3 = 0x811c9dc5 ^ 0x85ebca6b;
+    let h4 = 0x811c9dc5 ^ 0xc2b2ae35;
+    for (let i = 0; i < bytes.length; i += 1) {
+      const b = bytes[i];
+      h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ ((b + i) & 0xff), 0x01000193) >>> 0;
+      h3 = Math.imul(h3 ^ (b ^ 0xa5), 0x01000193) >>> 0;
+      h4 = Math.imul(h4 ^ ((b + i * 31) & 0xff), 0x01000193) >>> 0;
+    }
+    return (
+      h1.toString(16).padStart(8, '0') +
+      h2.toString(16).padStart(8, '0') +
+      h3.toString(16).padStart(8, '0') +
+      h4.toString(16).padStart(8, '0')
+    );
+  }
+
+  /**
+   * Builds a deterministic, OPFS-filename-safe version fingerprint (`<size>_<etagHash16>`,
+   * `<size>`, `e_<etagHash16>`, or sanitized token) matching W262 (`range_cache.js` / `opfs_cache.js`).
+   */
+  function buildFileFingerprint(sizeOrMeta, etag = null) {
+    if (sizeOrMeta === null || sizeOrMeta === undefined) {
+      if (typeof etag === 'string' && etag.trim().length > 0) {
+        return `e_${fnv1a128Hex(etag.trim()).slice(0, 16)}`;
+      }
+      return null;
+    }
+    if (typeof sizeOrMeta === 'string') {
+      const trimmed = sizeOrMeta.trim();
+      if (!trimmed) return null;
+      if (/^[0-9a-zA-Z_-]{1,64}$/.test(trimmed)) {
+        return trimmed;
+      }
+      return `h_${fnv1a128Hex(trimmed).slice(0, 16)}`;
+    }
+
+    let size = null;
+    let tag = etag;
+    if (typeof sizeOrMeta === 'object') {
+      if (typeof sizeOrMeta.fileFingerprint === 'string' && sizeOrMeta.fileFingerprint.trim()) {
+        return buildFileFingerprint(sizeOrMeta.fileFingerprint);
+      }
+      if (sizeOrMeta.fileSize !== undefined) {
+        size = sizeOrMeta.fileSize;
+      } else if (sizeOrMeta.size !== undefined) {
+        size = sizeOrMeta.size;
+      }
+      if (tag === null && sizeOrMeta.etag !== undefined) {
+        tag = sizeOrMeta.etag;
+      }
+    } else {
+      size = sizeOrMeta;
+    }
+
+    const validSize = Number.isSafeInteger(size) && size >= 0 ? size : null;
+    const validTag = typeof tag === 'string' && tag.trim().length > 0 ? tag.trim() : null;
+
+    if (validSize !== null && validTag !== null) {
+      return `${validSize}_${fnv1a128Hex(validTag).slice(0, 16)}`;
+    }
+    if (validSize !== null) {
+      return `${validSize}`;
+    }
+    if (validTag !== null) {
+      return `e_${fnv1a128Hex(validTag).slice(0, 16)}`;
+    }
+    return null;
+  }
+
+  function parseSizeFromFingerprint(fileFingerprint) {
+    if (typeof fileFingerprint !== 'string') {
+      return null;
+    }
+    const match = /^(\d+)(?:_[0-9a-f]{16})?$/.exec(fileFingerprint);
+    if (!match) {
+      return null;
+    }
+    const parsed = Number(match[1]);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  }
+
+  /**
+   * Normalizes a URL or Xbox/Win32/POSIX path into a clean relative POSIX path for OPFS L2 keying
+   * (e.g. `http://127.0.0.1:8080/game/shaders.rpf` -> `game/shaders.rpf`).
+   */
+  function normalizeOpfsL2Path(urlOrPath) {
+    if (typeof urlOrPath !== 'string' || urlOrPath.length === 0) {
+      return null;
+    }
+    if (urlOrPath.includes('\0')) {
+      return null;
+    }
+    let s = urlOrPath.trim();
+    if (!s) {
+      return null;
+    }
+    s = s.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '');
+    s = s.replace(/[?#].*$/, '');
+    s = s.replace(/\\/g, '/');
+    if (/^\/\/[?.]\//.test(s)) {
+      s = s.slice(4);
+    }
+    if (/^[A-Za-z]:/.test(s)) {
+      s = s.slice(2);
+    }
+    while (s.startsWith('/') || s.startsWith('./')) {
+      s = s.startsWith('/') ? s.slice(1) : s.slice(2);
+    }
+    if (!s || hasTraversalOrNulSegment(s)) {
+      return null;
+    }
+    const parts = s.split('/');
+    const clean = [];
+    for (let i = 0; i < parts.length; i += 1) {
+      const seg = parts[i];
+      if (!seg || seg === '.') {
+        continue;
+      }
+      if (seg === '..') {
+        return null;
+      }
+      clean.push(seg);
+    }
+    return clean.length > 0 ? clean.join('/') : null;
+  }
+
+  function isHotOpfsL2Path(pathOrUrl, allowlist = DEFAULT_HOT_OPFS_RPF_ALLOWLIST) {
+    if (allowlist === false || allowlist === null) {
+      return false;
+    }
+    const normPath = normalizeOpfsL2Path(pathOrUrl);
+    if (!normPath) {
+      return false;
+    }
+    if (allowlist === true || allowlist === '*') {
+      return true;
+    }
+    if (typeof allowlist === 'function') {
+      try {
+        return Boolean(allowlist(normPath, pathOrUrl));
+      } catch {
+        return false;
+      }
+    }
+    const items =
+      allowlist instanceof Set
+        ? Array.from(allowlist)
+        : Array.isArray(allowlist)
+          ? allowlist
+          : null;
+    if (!items || items.length === 0) {
+      return false;
+    }
+    const pathLower = normPath.toLowerCase();
+    const baseLower = basenameOfPath(pathLower);
+    for (let i = 0; i < items.length; i += 1) {
+      const entry = items[i];
+      if (entry === '*') {
+        return true;
+      }
+      if (entry instanceof RegExp) {
+        if (entry.test(normPath)) {
+          return true;
+        }
+        continue;
+      }
+      if (typeof entry !== 'string') {
+        continue;
+      }
+      const cleanEntry = entry.trim().replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+      if (!cleanEntry) {
+        continue;
+      }
+      if (cleanEntry.includes('/')) {
+        if (pathLower === cleanEntry || pathLower.endsWith(`/${cleanEntry}`)) {
+          return true;
+        }
+      } else if (baseLower === cleanEntry) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function opfsL2PathToken(normalizedPath) {
+    const encoded = utf8ToHex(normalizedPath);
+    return encoded.length <= 128
+      ? encoded
+      : `${encoded.slice(0, 64)}_${fnv1a128Hex(normalizedPath)}`;
+  }
+
+  function opfsL2RangeFilePrefix(normalizedPath, offset, length) {
+    return `r_${offset}_${length}_${opfsL2PathToken(normalizedPath)}`;
+  }
+
+  function opfsL2RangeFileName(normalizedPath, offset, length, fileFingerprint = null) {
+    const prefix = opfsL2RangeFilePrefix(normalizedPath, offset, length);
+    const fp = buildFileFingerprint(fileFingerprint);
+    return fp ? `${prefix}_fp_${fp}.bin` : `${prefix}.bin`;
   }
 
   function normalizeDataBase(base) {
@@ -1094,6 +1334,11 @@
       inFlightCoalesced: 0,
       networkFetches: 0,
       evictions: 0,
+      opfsL2Hits: 0,
+      opfsL2Misses: 0,
+      opfsL2Writes: 0,
+      opfsL2WriteErrors: 0,
+      opfsL2Invalidations: 0,
       bytesCached: 0,
       maxBytes:
         Number.isFinite(options.maxBytes) && options.maxBytes >= 0
@@ -1151,9 +1396,37 @@
             : null;
       this._now = typeof options.now === 'function' ? options.now : () => Date.now();
 
+      // Optional versioned OPFS L2 write-through persistence (W298 / W262).
+      this.opfsL2 = options.opfsL2 || null;
+      this.opfsCache = options.opfsCache || null;
+      this.opfsDir = options.opfsDir || null;
+      this.opfsL2Enabled = options.opfsL2Enabled !== false;
+      this.opfsL2Allowlist =
+        options.opfsL2Allowlist !== undefined
+          ? options.opfsL2Allowlist
+          : options.hotOpfsAllowlist !== undefined
+            ? options.hotOpfsAllowlist
+            : options.opfsHotRpfAllowlist !== undefined
+              ? options.opfsHotRpfAllowlist
+              : DEFAULT_HOT_OPFS_RPF_ALLOWLIST;
+      this.opfsL2RequireEtag = Boolean(options.opfsL2RequireEtag);
+      this.maxPendingOpfsL2Writes =
+        Number.isInteger(options.maxPendingOpfsL2Writes) && options.maxPendingOpfsL2Writes > 0
+          ? options.maxPendingOpfsL2Writes
+          : DEFAULT_OPFS_L2_MAX_PENDING_WRITES;
+      this.maxOpfsL2WriteConcurrency =
+        Number.isInteger(options.maxOpfsL2WriteConcurrency) && options.maxOpfsL2WriteConcurrency > 0
+          ? options.maxOpfsL2WriteConcurrency
+          : DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY;
+      this.opfsL2MaxBytes =
+        Number.isFinite(options.opfsL2MaxBytes) && options.opfsL2MaxBytes >= 0
+          ? Math.floor(options.opfsL2MaxBytes)
+          : DEFAULT_OPFS_L2_MAX_BYTES;
+
       this._chunks = new Map(); // key (`${url}::${chunkIndex}`) -> owned Uint8Array (LRU order)
       this._slabs = new Map(); // key (`${url}::slab::${slabIndex}`) -> owned Uint8Array (LRU order)
-      this._fileMeta = new Map(); // normalized url -> { size: number | null } (LRU order)
+      this._fileMeta = new Map(); // normalized url -> { size: number | null, etag: string | null, fileFingerprint: string | null } (LRU order)
+      this._fileFingerprints = new Map(); // normalizedPath -> { fp: string, explicit: boolean, size: number | null, etag: string | null }
       this._negativeCache = new Map(); // normalized url -> { errno, status, expiresAt } (LRU order)
       this._inFlightChunks = new Map(); // chunkKey -> Promise<Uint8Array>
       this._inFlightSlabs = new Map(); // slabKey -> Promise<Uint8Array>
@@ -1162,6 +1435,12 @@
       this._activeSlabFetches = 0;
       this._slabWaitQueue = []; // { resolve, priority } (demand=0 before prefetch=1)
       this._pendingPrefetches = new Set();
+      this._opfsL2WriteQueue = new Map(); // writeKey -> { normalizedPath, offset, unitLength, bytes, fileFingerprint }
+      this._activeOpfsL2Writes = new Set(); // Set<Promise>
+      this._opfsL2WriteWaiters = [];
+      this._opfsL2Entries = new Map(); // fileName -> { normalizedPath, offset, unitLength, byteLength }
+      this._opfsL2ValidatedFingerprints = new Map(); // normalizedPath -> last validated fp
+      this._opfsL2QuotaEvictChain = Promise.resolve();
       this._bytesCached = 0;
       this._slabBytesCached = 0;
 
@@ -1182,7 +1461,22 @@
         inFlightCoalesced: 0,
         networkFetches: 0,
         evictions: 0,
+        opfsL2Hits: 0,
+        opfsL2Misses: 0,
+        opfsL2Writes: 0,
+        opfsL2WriteErrors: 0,
+        opfsL2Invalidations: 0,
       };
+
+      if (options.fileFingerprints instanceof Map) {
+        for (const [p, fp] of options.fileFingerprints.entries()) {
+          this.setFileFingerprint(p, fp);
+        }
+      } else if (options.fileFingerprints && typeof options.fileFingerprints === 'object') {
+        for (const [p, fp] of Object.entries(options.fileFingerprints)) {
+          this.setFileFingerprint(p, fp);
+        }
+      }
     }
 
     _chunkKey(url, chunkIndex) {
@@ -1197,6 +1491,230 @@
       return this.slabSize > 0 && this.slabMaxBytes >= this.slabSize;
     }
 
+    setOpfsL2(store) {
+      const next = store || null;
+      if (next !== this.opfsL2) {
+        this._opfsL2WriteQueue.clear();
+        this._opfsL2Entries.clear();
+        this._opfsL2ValidatedFingerprints.clear();
+      }
+      this.opfsL2 = next;
+    }
+
+    setOpfsCache(opfsCache) {
+      const next = opfsCache || null;
+      if (next !== this.opfsCache) {
+        this._opfsL2WriteQueue.clear();
+        this._opfsL2ValidatedFingerprints.clear();
+      }
+      this.opfsCache = next;
+    }
+
+    setOpfsDir(opfsDir) {
+      const next = opfsDir || null;
+      if (next !== this.opfsDir) {
+        this._opfsL2WriteQueue.clear();
+        this._opfsL2Entries.clear();
+        this._opfsL2ValidatedFingerprints.clear();
+      }
+      this.opfsDir = next;
+    }
+
+    _getOpfsL2Backend() {
+      if (!this.opfsL2Enabled) {
+        return null;
+      }
+      if (this.opfsL2) {
+        if (
+          typeof this.opfsL2.readRange === 'function' ||
+          typeof this.opfsL2.writeRange === 'function'
+        ) {
+          return { kind: 'range', store: this.opfsL2 };
+        }
+        if (
+          typeof this.opfsL2.getEntry === 'function' &&
+          typeof this.opfsL2.put === 'function'
+        ) {
+          return { kind: 'opfsCache', store: this.opfsL2 };
+        }
+        if (
+          typeof this.opfsL2.getFileHandle === 'function' ||
+          typeof this.opfsL2.get === 'function'
+        ) {
+          return { kind: 'opfsDir', store: this.opfsL2 };
+        }
+      }
+      if (
+        this.opfsCache &&
+        typeof this.opfsCache.getEntry === 'function' &&
+        typeof this.opfsCache.put === 'function'
+      ) {
+        return { kind: 'opfsCache', store: this.opfsCache };
+      }
+      if (
+        this.opfsDir &&
+        (typeof this.opfsDir.getFileHandle === 'function' ||
+          typeof this.opfsDir.get === 'function')
+      ) {
+        return { kind: 'opfsDir', store: this.opfsDir };
+      }
+      return null;
+    }
+
+    _hasOpfsL2ForUrl(url) {
+      return Boolean(this._getOpfsL2Backend() && isHotOpfsL2Path(url, this.opfsL2Allowlist));
+    }
+
+    _evictUrlFromMemory(url) {
+      const prefix = `${url}::`;
+      for (const [key, bytes] of Array.from(this._slabs.entries())) {
+        if (key.startsWith(prefix)) {
+          this._slabs.delete(key);
+          this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
+        }
+      }
+      for (const [key, bytes] of Array.from(this._chunks.entries())) {
+        if (key.startsWith(prefix)) {
+          this._chunks.delete(key);
+          this._bytesCached = Math.max(0, this._bytesCached - bytes.byteLength);
+        }
+      }
+    }
+
+    _evictNormalizedPathFromMemory(normalizedPath) {
+      for (const [key, bytes] of Array.from(this._slabs.entries())) {
+        const sep = key.indexOf('::');
+        const keyUrl = sep >= 0 ? key.slice(0, sep) : key;
+        const keyNorm = normalizeOpfsL2Path(keyUrl);
+        if (
+          keyNorm === normalizedPath ||
+          (keyNorm && basenameOfPath(keyNorm) === normalizedPath)
+        ) {
+          this._slabs.delete(key);
+          this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
+        }
+      }
+      for (const [key, bytes] of Array.from(this._chunks.entries())) {
+        const sep = key.indexOf('::');
+        const keyUrl = sep >= 0 ? key.slice(0, sep) : key;
+        const keyNorm = normalizeOpfsL2Path(keyUrl);
+        if (
+          keyNorm === normalizedPath ||
+          (keyNorm && basenameOfPath(keyNorm) === normalizedPath)
+        ) {
+          this._chunks.delete(key);
+          this._bytesCached = Math.max(0, this._bytesCached - bytes.byteLength);
+        }
+      }
+      for (const [wKey, task] of Array.from(this._opfsL2WriteQueue.entries())) {
+        if (
+          task.normalizedPath === normalizedPath ||
+          basenameOfPath(task.normalizedPath) === normalizedPath
+        ) {
+          this._opfsL2WriteQueue.delete(wKey);
+        }
+      }
+    }
+
+    setFileFingerprint(urlOrPath, fingerprintOrMeta) {
+      const normPath = normalizeOpfsL2Path(urlOrPath);
+      if (!normPath) {
+        return null;
+      }
+      const nextFp = buildFileFingerprint(fingerprintOrMeta);
+      const prevRec = this._fileFingerprints.get(normPath) || null;
+      let metaSize = null;
+      let metaEtag = null;
+      if (fingerprintOrMeta && typeof fingerprintOrMeta === 'object') {
+        const rawSize =
+          fingerprintOrMeta.fileSize !== undefined
+            ? fingerprintOrMeta.fileSize
+            : fingerprintOrMeta.size;
+        if (Number.isSafeInteger(rawSize) && rawSize >= 0) {
+          metaSize = rawSize;
+        }
+        if (typeof fingerprintOrMeta.etag === 'string' && fingerprintOrMeta.etag.trim()) {
+          metaEtag = fingerprintOrMeta.etag.trim();
+        }
+      }
+      if (metaSize === null && nextFp !== null) {
+        metaSize = parseSizeFromFingerprint(nextFp);
+      }
+
+      if (nextFp === null) {
+        this._fileFingerprints.delete(normPath);
+      } else {
+        this._fileFingerprints.set(normPath, {
+          fp: nextFp,
+          explicit: true,
+          size: metaSize,
+          etag: metaEtag,
+        });
+      }
+
+      if (prevRec && prevRec.fp && prevRec.fp !== nextFp) {
+        this._evictNormalizedPathFromMemory(normPath);
+        for (const [metaUrl, meta] of Array.from(this._fileMeta.entries())) {
+          if (normalizeOpfsL2Path(metaUrl) === normPath) {
+            this._fileMeta.set(metaUrl, {
+              size: metaSize !== null ? metaSize : meta.size,
+              etag: metaEtag !== null ? metaEtag : null,
+              fileFingerprint: nextFp,
+            });
+          }
+        }
+        if (nextFp !== null && this._getOpfsL2Backend()) {
+          this._enqueueOpfsL2Invalidation(normPath, nextFp, { countIfNoReport: true });
+        }
+      }
+      return nextFp;
+    }
+
+    getFileFingerprint(urlOrPath) {
+      if (typeof urlOrPath !== 'string' || urlOrPath.length === 0) {
+        return null;
+      }
+      const meta = this._fileMeta.get(urlOrPath);
+      if (meta && meta.fileFingerprint) {
+        return meta.fileFingerprint;
+      }
+      const normPath = normalizeOpfsL2Path(urlOrPath);
+      if (!normPath) {
+        return null;
+      }
+      const direct = this._fileFingerprints.get(normPath);
+      if (direct && direct.fp) {
+        return direct.fp;
+      }
+      const base = basenameOfPath(normPath);
+      if (base !== normPath) {
+        const byBase = this._fileFingerprints.get(base);
+        if (byBase && byBase.fp) {
+          return byBase.fp;
+        }
+      }
+      return null;
+    }
+
+    _lookupSeededFingerprintRecord(url) {
+      const normPath = normalizeOpfsL2Path(url);
+      if (!normPath) {
+        return null;
+      }
+      const direct = this._fileFingerprints.get(normPath);
+      if (direct) {
+        return { normPath, record: direct };
+      }
+      const base = basenameOfPath(normPath);
+      if (base !== normPath) {
+        const byBase = this._fileFingerprints.get(base);
+        if (byBase) {
+          return { normPath, record: byBase };
+        }
+      }
+      return { normPath, record: null };
+    }
+
     _touchMeta(url) {
       if (!this._fileMeta.has(url)) {
         return null;
@@ -1207,13 +1725,26 @@
       return meta;
     }
 
-    setFileMetadata(url, size) {
+    setFileMetadata(url, size, etag = undefined) {
       if (typeof url !== 'string' || url.length === 0) {
         return;
       }
       const cleanSize = Number.isSafeInteger(size) && size >= 0 ? size : null;
+      const cleanEtag =
+        typeof etag === 'string' && etag.trim().length > 0 ? etag.trim() : null;
       const existing = this._fileMeta.get(url);
       const nextSize = cleanSize !== null ? cleanSize : existing ? existing.size : null;
+      const nextEtag =
+        etag !== undefined ? cleanEtag : existing ? existing.etag || null : null;
+      const seeded = this._lookupSeededFingerprintRecord(url);
+      const seededFp = seeded && seeded.record ? seeded.record.fp : null;
+      const derivedFp =
+        nextEtag !== null
+          ? buildFileFingerprint(nextSize, nextEtag)
+          : existing && existing.fileFingerprint
+            ? existing.fileFingerprint
+            : seededFp;
+
       if (existing) {
         this._fileMeta.delete(url);
       } else if (this._fileMeta.size >= this.metadataMaxEntries) {
@@ -1222,19 +1753,728 @@
           this._fileMeta.delete(oldestUrl);
         }
       }
-      this._fileMeta.set(url, { size: nextSize });
+      this._fileMeta.set(url, {
+        size: nextSize,
+        etag: nextEtag,
+        fileFingerprint: derivedFp || null,
+      });
       // A confirmed existing file clears any stale negative entry.
       this._negativeCache.delete(url);
     }
 
+    _recordObservedHttpMeta(url, totalSize, etag) {
+      if (typeof url !== 'string' || url.length === 0) {
+        return null;
+      }
+      const validSize = Number.isSafeInteger(totalSize) && totalSize >= 0 ? totalSize : null;
+      const validTag = typeof etag === 'string' && etag.trim().length > 0 ? etag.trim() : null;
+      const existing = this._fileMeta.get(url) || null;
+      const seededLookup = this._lookupSeededFingerprintRecord(url);
+      const normPath = seededLookup ? seededLookup.normPath : null;
+      const seededRec = seededLookup ? seededLookup.record : null;
+
+      const prevSize = existing ? existing.size : seededRec ? seededRec.size : null;
+      const prevEtag = existing ? existing.etag : seededRec ? seededRec.etag : null;
+      const prevFp = existing
+        ? existing.fileFingerprint
+        : seededRec
+          ? seededRec.fp
+          : null;
+      const hadExplicitFp = Boolean(seededRec && seededRec.explicit);
+
+      const nextSize = validSize !== null ? validSize : prevSize;
+      const nextEtag = validTag !== null ? validTag : prevEtag;
+
+      let nextFp = null;
+      if (this.opfsL2RequireEtag) {
+        nextFp = nextEtag !== null ? buildFileFingerprint(nextSize, nextEtag) : null;
+      } else {
+        nextFp = buildFileFingerprint(nextSize, nextEtag);
+      }
+
+      const sizeChanged = prevSize !== null && validSize !== null && prevSize !== validSize;
+      const etagChanged = prevEtag !== null && validTag !== null && prevEtag !== validTag;
+      const explicitFpMismatch =
+        hadExplicitFp && prevFp !== null && nextFp !== null && prevFp !== nextFp;
+
+      if (existing) {
+        this._fileMeta.delete(url);
+      } else if (this._fileMeta.size >= this.metadataMaxEntries) {
+        const oldestUrl = this._fileMeta.keys().next().value;
+        if (oldestUrl !== undefined) {
+          this._fileMeta.delete(oldestUrl);
+        }
+      }
+      this._fileMeta.set(url, {
+        size: nextSize,
+        etag: nextEtag,
+        fileFingerprint: nextFp,
+      });
+      this._negativeCache.delete(url);
+
+      if (normPath && nextFp !== null) {
+        this._fileFingerprints.set(normPath, {
+          fp: nextFp,
+          explicit: hadExplicitFp && !explicitFpMismatch,
+          size: nextSize,
+          etag: nextEtag,
+        });
+      }
+
+      if (sizeChanged || etagChanged || explicitFpMismatch) {
+        this._evictUrlFromMemory(url);
+        if (normPath && nextFp !== null && this._hasOpfsL2ForUrl(url)) {
+          this._opfsL2ValidatedFingerprints.set(normPath, nextFp);
+          this._enqueueOpfsL2Invalidation(normPath, nextFp, { countIfNoReport: true });
+        }
+      } else if (
+        normPath &&
+        nextFp !== null &&
+        this._hasOpfsL2ForUrl(url) &&
+        this._opfsL2ValidatedFingerprints.get(normPath) !== nextFp
+      ) {
+        this._opfsL2ValidatedFingerprints.set(normPath, nextFp);
+        this._enqueueOpfsL2Invalidation(normPath, nextFp, { countIfNoReport: false });
+      }
+
+      return nextFp;
+    }
+
     getFileMetadata(url) {
       const meta = this._touchMeta(url);
-      return meta ? { size: meta.size } : null;
+      return meta
+        ? {
+            size: meta.size,
+            etag: meta.etag || null,
+            fileFingerprint: meta.fileFingerprint || null,
+          }
+        : null;
     }
 
     getFileSize(url) {
       const meta = this._fileMeta.get(url);
       return meta && Number.isSafeInteger(meta.size) ? meta.size : null;
+    }
+
+    // --- Versioned OPFS L2 Persistence (W298 / W262) ---
+
+    async _deleteOpfsDirEntry(store, fileName) {
+      if (!store || !fileName) return false;
+      try {
+        if (typeof store.removeEntry === 'function') {
+          await store.removeEntry(fileName);
+          return true;
+        }
+        if (typeof store.delete === 'function') {
+          return Boolean(await store.delete(fileName));
+        }
+        if (typeof store.remove === 'function') {
+          await store.remove(fileName);
+          return true;
+        }
+      } catch {
+        // Ignore NotFoundError or unsupported delete failures.
+      }
+      return false;
+    }
+
+    async _listOpfsDirEntryNames(store) {
+      if (!store) return [];
+      const names = [];
+      try {
+        if (typeof store.keys === 'function') {
+          for await (const name of store.keys()) {
+            if (typeof name === 'string') {
+              names.push(name);
+            }
+          }
+          return names;
+        }
+        if (typeof store.entries === 'function') {
+          for await (const pair of store.entries()) {
+            if (Array.isArray(pair) && typeof pair[0] === 'string') {
+              names.push(pair[0]);
+            }
+          }
+          return names;
+        }
+      } catch {
+        // Ignore directory enumeration errors.
+      }
+      return names;
+    }
+
+    async _invalidateStaleOpfsDirPath(store, normalizedPath, expectedFp, specificPrefix = null) {
+      if (!store || !normalizedPath) return 0;
+      const pathToken = opfsL2PathToken(normalizedPath);
+      const expectedSuffix = expectedFp ? `_fp_${expectedFp}.bin` : '.bin';
+      const isStaleMatch = (name) => {
+        if (typeof name !== 'string' || !name.endsWith('.bin')) {
+          return false;
+        }
+        if (specificPrefix !== null) {
+          const activeName = expectedFp
+            ? `${specificPrefix}_fp_${expectedFp}.bin`
+            : `${specificPrefix}.bin`;
+          if (name === activeName) return false;
+          return (
+            name === `${specificPrefix}.bin` ||
+            name.startsWith(`${specificPrefix}_fp_`)
+          );
+        }
+        const belongsToPath =
+          name.includes(`_${pathToken}.bin`) || name.includes(`_${pathToken}_fp_`);
+        if (!belongsToPath) return false;
+        if (expectedFp && name.endsWith(expectedSuffix)) {
+          return false;
+        }
+        return true;
+      };
+
+      const staleNames = new Set();
+      for (const fileName of this._opfsL2Entries.keys()) {
+        if (isStaleMatch(fileName)) {
+          staleNames.add(fileName);
+        }
+      }
+      const dirNames = await this._listOpfsDirEntryNames(store);
+      for (let i = 0; i < dirNames.length; i += 1) {
+        if (isStaleMatch(dirNames[i])) {
+          staleNames.add(dirNames[i]);
+        }
+      }
+
+      let invalidated = 0;
+      for (const staleName of staleNames) {
+        this._opfsL2Entries.delete(staleName);
+        const deleted = await this._deleteOpfsDirEntry(store, staleName);
+        if (deleted) {
+          invalidated += 1;
+        }
+      }
+      return invalidated;
+    }
+
+    async _evictOpfsDirForQuota(store, excludeFileName, targetBytes) {
+      let freedBytes = 0;
+      const evicted = new Set();
+      if (excludeFileName) {
+        evicted.add(excludeFileName);
+      }
+      const snapshot = Array.from(this._opfsL2Entries.entries());
+      for (let i = 0; i < snapshot.length && freedBytes < targetBytes; i += 1) {
+        const [fileName, meta] = snapshot[i];
+        if (evicted.has(fileName)) continue;
+        this._opfsL2Entries.delete(fileName);
+        evicted.add(fileName);
+        await this._deleteOpfsDirEntry(store, fileName);
+        freedBytes += meta && Number.isFinite(meta.byteLength) && meta.byteLength > 0
+          ? meta.byteLength
+          : this.slabSize || this.chunkSize;
+      }
+      if (freedBytes < targetBytes) {
+        const dirNames = await this._listOpfsDirEntryNames(store);
+        for (let i = 0; i < dirNames.length && freedBytes < targetBytes; i += 1) {
+          const name = dirNames[i];
+          if (evicted.has(name) || !/^r_\d+_\d+_.*\.bin$/.test(name)) continue;
+          evicted.add(name);
+          this._opfsL2Entries.delete(name);
+          await this._deleteOpfsDirEntry(store, name);
+          freedBytes += this.slabSize || this.chunkSize;
+        }
+      }
+      return freedBytes;
+    }
+
+    _evictOpfsDirForQuotaSerialized(store, excludeFileName, targetBytes) {
+      const run = () => this._evictOpfsDirForQuota(store, excludeFileName, targetBytes);
+      const next = this._opfsL2QuotaEvictChain.then(run, run);
+      this._opfsL2QuotaEvictChain = next.then(
+        () => {},
+        () => {},
+      );
+      return next;
+    }
+
+    async _writeOpfsDirOnce(store, fileName, bytes) {
+      if (typeof store.getFileHandle === 'function') {
+        const handle = await store.getFileHandle(fileName, { create: true });
+        if (typeof handle.createWritable === 'function') {
+          const writable = await handle.createWritable();
+          try {
+            await writable.write(bytes);
+            await writable.close();
+          } catch (err) {
+            if (typeof writable.abort === 'function') {
+              try {
+                await writable.abort();
+              } catch {
+                // Ignore abort failures during cleanup.
+              }
+            }
+            throw err;
+          }
+          return true;
+        }
+        if (typeof handle.createSyncAccessHandle === 'function') {
+          const syncHandle = await handle.createSyncAccessHandle();
+          try {
+            syncHandle.truncate(0);
+            syncHandle.write(bytes, { at: 0 });
+            syncHandle.flush();
+          } finally {
+            syncHandle.close();
+          }
+          return true;
+        }
+        return false;
+      }
+      if (typeof store.set === 'function') {
+        await store.set(fileName, bytes.slice());
+        return true;
+      }
+      return false;
+    }
+
+    _extractInvalidatedCount(res) {
+      if (typeof res === 'number' && Number.isFinite(res) && res > 0) {
+        return Math.floor(res);
+      }
+      if (res === true) {
+        return 1;
+      }
+      if (res && typeof res === 'object') {
+        const raw =
+          res.invalidatedCount !== undefined
+            ? res.invalidatedCount
+            : res.invalidated !== undefined
+              ? res.invalidated
+              : res.removedCount !== undefined
+                ? res.removedCount
+                : 0;
+        if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+          return Math.floor(raw);
+        }
+        if (raw === true) {
+          return 1;
+        }
+      }
+      return 0;
+    }
+
+    async _runOpfsL2Invalidation(normalizedPath, expectedFp, countIfNoReport) {
+      const backend = this._getOpfsL2Backend();
+      if (!backend || !normalizedPath) {
+        return 0;
+      }
+      let count = 0;
+      try {
+        if (backend.kind === 'range') {
+          if (typeof backend.store.invalidateFingerprint === 'function') {
+            const res = await backend.store.invalidateFingerprint(normalizedPath, expectedFp);
+            count = this._extractInvalidatedCount(res);
+          }
+        } else if (backend.kind === 'opfsCache') {
+          if (typeof backend.store.invalidateStaleFingerprint === 'function') {
+            const res = await backend.store.invalidateStaleFingerprint(
+              { path: normalizedPath },
+              expectedFp,
+            );
+            count = this._extractInvalidatedCount(res);
+          }
+        } else if (backend.kind === 'opfsDir') {
+          count = await this._invalidateStaleOpfsDirPath(
+            backend.store,
+            normalizedPath,
+            expectedFp,
+            null,
+          );
+        }
+      } catch {
+        // Degrade gracefully on OPFS invalidation failures.
+      }
+      if (count > 0) {
+        this._stats.opfsL2Invalidations += count;
+      } else if (countIfNoReport) {
+        this._stats.opfsL2Invalidations += 1;
+      }
+      return count;
+    }
+
+    _enqueueOpfsL2Invalidation(normalizedPath, expectedFp, options = {}) {
+      const countIfNoReport = Boolean(options && options.countIfNoReport);
+      const taskPromise = this._runOpfsL2Invalidation(normalizedPath, expectedFp, countIfNoReport);
+      this._activeOpfsL2Writes.add(taskPromise);
+      taskPromise.finally(() => {
+        this._activeOpfsL2Writes.delete(taskPromise);
+        if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
+          const waiters = this._opfsL2WriteWaiters.splice(0, this._opfsL2WriteWaiters.length);
+          for (let i = 0; i < waiters.length; i += 1) {
+            waiters[i]();
+          }
+        }
+      });
+    }
+
+    async _tryReadOpfsL2(url, offset, unitLength, knownSize) {
+      const backend = this._getOpfsL2Backend();
+      if (!backend || !isHotOpfsL2Path(url, this.opfsL2Allowlist)) {
+        return null;
+      }
+      const normPath = normalizeOpfsL2Path(url);
+      if (!normPath) {
+        return null;
+      }
+      const fp = this.getFileFingerprint(url);
+      if (!fp) {
+        this._stats.opfsL2Misses += 1;
+        return null;
+      }
+
+      let rawBytes = null;
+      let reportedSize = null;
+      let reportedEtag = null;
+      let staleInvalidated = false;
+
+      try {
+        if (backend.kind === 'range') {
+          if (typeof backend.store.readRange !== 'function') {
+            this._stats.opfsL2Misses += 1;
+            return null;
+          }
+          const res = await backend.store.readRange(normPath, offset, unitLength, fp);
+          if (res instanceof Uint8Array) {
+            rawBytes = res.slice();
+          } else if (res instanceof ArrayBuffer) {
+            rawBytes = new Uint8Array(res.slice(0));
+          } else if (res && typeof res === 'object') {
+            if (res.invalidated === true || res.stale === true) {
+              staleInvalidated = true;
+            } else if (res.hit !== false) {
+              const payload = res.bytes !== undefined ? res.bytes : res.data;
+              if (payload instanceof Uint8Array) {
+                rawBytes = payload.slice();
+              } else if (payload instanceof ArrayBuffer) {
+                rawBytes = new Uint8Array(payload.slice(0));
+              }
+              if (Number.isSafeInteger(res.size) && res.size >= 0) {
+                reportedSize = res.size;
+              }
+              if (typeof res.etag === 'string' && res.etag.trim()) {
+                reportedEtag = res.etag.trim();
+              }
+            }
+          }
+        } else if (backend.kind === 'opfsCache') {
+          const entry = await backend.store.getEntry(
+            { path: normPath, offset, length: unitLength },
+            { fileFingerprint: fp },
+          );
+          if (entry && entry.invalidated) {
+            staleInvalidated = true;
+          } else if (entry && entry.hit && entry.data instanceof Uint8Array) {
+            rawBytes = entry.data.slice();
+          }
+        } else if (backend.kind === 'opfsDir') {
+          const fileName = opfsL2RangeFileName(normPath, offset, unitLength, fp);
+          const prefix = opfsL2RangeFilePrefix(normPath, offset, unitLength);
+          if (typeof backend.store.getFileHandle === 'function') {
+            let handle = null;
+            try {
+              handle = await backend.store.getFileHandle(fileName, { create: false });
+            } catch (err) {
+              if (isNotFoundError(err)) {
+                const inv = await this._invalidateStaleOpfsDirPath(
+                  backend.store,
+                  normPath,
+                  fp,
+                  prefix,
+                );
+                if (inv > 0) {
+                  this._stats.opfsL2Invalidations += inv;
+                }
+                this._stats.opfsL2Misses += 1;
+                return null;
+              }
+              throw err;
+            }
+            const file = await handle.getFile();
+            const buf = await file.arrayBuffer();
+            rawBytes = new Uint8Array(buf);
+            if (this._opfsL2Entries.has(fileName)) {
+              const meta = this._opfsL2Entries.get(fileName);
+              this._opfsL2Entries.delete(fileName);
+              this._opfsL2Entries.set(fileName, meta);
+            } else {
+              this._opfsL2Entries.set(fileName, {
+                normalizedPath: normPath,
+                offset,
+                unitLength,
+                byteLength: rawBytes.byteLength,
+              });
+            }
+          } else if (typeof backend.store.get === 'function') {
+            const val = await backend.store.get(fileName);
+            if (val === undefined || val === null) {
+              const inv = await this._invalidateStaleOpfsDirPath(
+                backend.store,
+                normPath,
+                fp,
+                prefix,
+              );
+              if (inv > 0) {
+                this._stats.opfsL2Invalidations += inv;
+              }
+              this._stats.opfsL2Misses += 1;
+              return null;
+            }
+            if (val instanceof Uint8Array) {
+              rawBytes = val.slice();
+            } else if (val instanceof ArrayBuffer) {
+              rawBytes = new Uint8Array(val.slice(0));
+            }
+          }
+        }
+      } catch {
+        // Degrade gracefully on OPFS L2 read errors and fall back to HTTP.
+        this._stats.opfsL2Misses += 1;
+        return null;
+      }
+
+      if (staleInvalidated) {
+        this._stats.opfsL2Invalidations += 1;
+        this._stats.opfsL2Misses += 1;
+        return null;
+      }
+
+      if (!(rawBytes instanceof Uint8Array) || rawBytes.byteLength === 0 || rawBytes.byteLength > unitLength) {
+        this._stats.opfsL2Misses += 1;
+        return null;
+      }
+
+      const expectedSize =
+        knownSize !== null
+          ? knownSize
+          : reportedSize !== null
+            ? reportedSize
+            : parseSizeFromFingerprint(fp);
+      if (expectedSize !== null) {
+        const expectedLen = Math.max(0, Math.min(unitLength, expectedSize - offset));
+        if (rawBytes.byteLength !== expectedLen) {
+          this._stats.opfsL2Misses += 1;
+          this._enqueueOpfsL2Invalidation(normPath, fp, { countIfNoReport: true });
+          return null;
+        }
+      }
+
+      this._stats.opfsL2Hits += 1;
+      this._opfsL2ValidatedFingerprints.set(normPath, fp);
+
+      if (this.getFileSize(url) === null) {
+        if (expectedSize !== null) {
+          this.setFileMetadata(url, expectedSize, reportedEtag !== null ? reportedEtag : undefined);
+        } else if (offset === 0 && rawBytes.byteLength < unitLength) {
+          this.setFileMetadata(url, rawBytes.byteLength, reportedEtag !== null ? reportedEtag : undefined);
+        }
+      }
+
+      return rawBytes;
+    }
+
+    async _writeOpfsL2Task(task) {
+      const backend = this._getOpfsL2Backend();
+      if (!backend) {
+        return false;
+      }
+      const { normalizedPath, offset, unitLength, bytes, fileFingerprint } = task;
+      try {
+        if (backend.kind === 'range') {
+          if (typeof backend.store.writeRange !== 'function') {
+            return false;
+          }
+          const res = await backend.store.writeRange(
+            normalizedPath,
+            offset,
+            unitLength,
+            bytes,
+            fileFingerprint,
+          );
+          if (
+            res === false ||
+            (res &&
+              typeof res === 'object' &&
+              (res.stored === false || res.ok === false || res.written === false))
+          ) {
+            this._stats.opfsL2WriteErrors += 1;
+            return false;
+          }
+          this._stats.opfsL2Writes += 1;
+          return true;
+        }
+
+        if (backend.kind === 'opfsCache') {
+          const res = await backend.store.put(
+            { path: normalizedPath, offset, length: unitLength },
+            bytes,
+            { fileFingerprint },
+          );
+          if (res && res.stored) {
+            this._stats.opfsL2Writes += 1;
+            return true;
+          }
+          this._stats.opfsL2WriteErrors += 1;
+          return false;
+        }
+
+        if (backend.kind === 'opfsDir') {
+          const fileName = opfsL2RangeFileName(normalizedPath, offset, unitLength, fileFingerprint);
+          try {
+            const wrote = await this._writeOpfsDirOnce(backend.store, fileName, bytes);
+            if (wrote) {
+              this._opfsL2Entries.delete(fileName);
+              this._opfsL2Entries.set(fileName, {
+                normalizedPath,
+                offset,
+                unitLength,
+                byteLength: bytes.byteLength,
+              });
+              this._stats.opfsL2Writes += 1;
+              return true;
+            }
+            this._stats.opfsL2WriteErrors += 1;
+            return false;
+          } catch (err) {
+            this._opfsL2Entries.delete(fileName);
+            await this._deleteOpfsDirEntry(backend.store, fileName);
+            if (!isQuotaExceededError(err)) {
+              this._stats.opfsL2WriteErrors += 1;
+              return false;
+            }
+            const targetBytes = Math.max(
+              bytes.byteLength,
+              Math.ceil(Math.max(this.slabMaxBytes || this.maxBytes || bytes.byteLength, 1) * 0.25),
+            );
+            await this._evictOpfsDirForQuotaSerialized(backend.store, fileName, targetBytes);
+            try {
+              const retryWrote = await this._writeOpfsDirOnce(backend.store, fileName, bytes);
+              if (retryWrote) {
+                this._opfsL2Entries.delete(fileName);
+                this._opfsL2Entries.set(fileName, {
+                  normalizedPath,
+                  offset,
+                  unitLength,
+                  byteLength: bytes.byteLength,
+                });
+                this._stats.opfsL2Writes += 1;
+                return true;
+              }
+              this._stats.opfsL2WriteErrors += 1;
+              return false;
+            } catch {
+              this._opfsL2Entries.delete(fileName);
+              await this._deleteOpfsDirEntry(backend.store, fileName);
+              this._stats.opfsL2WriteErrors += 1;
+              return false;
+            }
+          }
+        }
+      } catch {
+        this._stats.opfsL2WriteErrors += 1;
+        return false;
+      }
+      return false;
+    }
+
+    _pumpOpfsL2WriteQueue() {
+      while (
+        this._activeOpfsL2Writes.size < this.maxOpfsL2WriteConcurrency &&
+        this._opfsL2WriteQueue.size > 0
+      ) {
+        const nextEntry = this._opfsL2WriteQueue.entries().next().value;
+        if (!nextEntry) break;
+        const [writeKey, task] = nextEntry;
+        this._opfsL2WriteQueue.delete(writeKey);
+
+        const writePromise = (async () => {
+          try {
+            await this._writeOpfsL2Task(task);
+          } catch {
+            this._stats.opfsL2WriteErrors += 1;
+          }
+        })();
+
+        this._activeOpfsL2Writes.add(writePromise);
+        writePromise.finally(() => {
+          this._activeOpfsL2Writes.delete(writePromise);
+          this._pumpOpfsL2WriteQueue();
+          if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
+            const waiters = this._opfsL2WriteWaiters.splice(0, this._opfsL2WriteWaiters.length);
+            for (let i = 0; i < waiters.length; i += 1) {
+              waiters[i]();
+            }
+          }
+        });
+      }
+    }
+
+    _maybeWriteThroughOpfsL2(url, offset, unitLength, bytes) {
+      if (
+        !this._hasOpfsL2ForUrl(url) ||
+        !(bytes instanceof Uint8Array) ||
+        bytes.byteLength === 0
+      ) {
+        return false;
+      }
+      const normPath = normalizeOpfsL2Path(url);
+      if (!normPath) {
+        return false;
+      }
+      const fp = this.getFileFingerprint(url);
+      if (!fp) {
+        return false;
+      }
+      const writeKey = `${normPath}::${offset}::${unitLength}::${fp}`;
+      if (this._opfsL2WriteQueue.has(writeKey)) {
+        this._opfsL2WriteQueue.delete(writeKey);
+      } else {
+        while (this._opfsL2WriteQueue.size >= this.maxPendingOpfsL2Writes) {
+          const oldestKey = this._opfsL2WriteQueue.keys().next().value;
+          if (oldestKey === undefined) break;
+          this._opfsL2WriteQueue.delete(oldestKey);
+        }
+      }
+      this._opfsL2WriteQueue.set(writeKey, {
+        normalizedPath: normPath,
+        offset,
+        unitLength,
+        bytes: bytes.slice(),
+        fileFingerprint: fp,
+      });
+      this._pumpOpfsL2WriteQueue();
+      return true;
+    }
+
+    async flushOpfsL2Writes() {
+      while (this._activeOpfsL2Writes.size > 0 || this._opfsL2WriteQueue.size > 0) {
+        this._pumpOpfsL2WriteQueue();
+        await new Promise((resolve) => {
+          if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
+            resolve();
+            return;
+          }
+          this._opfsL2WriteWaiters.push(resolve);
+        });
+      }
+      const backend = this._getOpfsL2Backend();
+      if (backend && backend.store) {
+        if (typeof backend.store.flushBackgroundWrites === 'function') {
+          await backend.store.flushBackgroundWrites();
+        } else if (typeof backend.store.flushWrites === 'function') {
+          await backend.store.flushWrites();
+        } else if (typeof backend.store.flush === 'function') {
+          await backend.store.flush();
+        }
+      }
     }
 
     _getNegative(url) {
@@ -1376,17 +2616,21 @@
       });
 
       const status = res && typeof res.status === 'number' ? res.status : 0;
+      const etag = res ? getResponseHeader(res.headers, 'ETag') : null;
 
       if (status === 416) {
         const cr = parseContentRangeHeader(getResponseHeader(res.headers, 'Content-Range'));
         if (cr && Number.isSafeInteger(cr.total)) {
-          this.setFileMetadata(url, cr.total);
+          this._recordObservedHttpMeta(url, cr.total, etag);
+        } else if (etag) {
+          this._recordObservedHttpMeta(url, null, etag);
         }
         return {
           bytes: new Uint8Array(0),
           actualStart: reqStart,
           actualEnd: reqStart - 1,
           knownTotal: cr && Number.isSafeInteger(cr.total) ? cr.total : this.getFileSize(url),
+          etag,
           reachedEof: true,
         };
       }
@@ -1407,9 +2651,9 @@
         const cr = parseContentRangeHeader(getResponseHeader(res.headers, 'Content-Range'));
         if (cr && !cr.unsatisfied) {
           if (cr.total !== null) {
-            this.setFileMetadata(url, cr.total);
+            this._recordObservedHttpMeta(url, cr.total, etag);
           } else {
-            this.setFileMetadata(url, null);
+            this._recordObservedHttpMeta(url, null, etag);
           }
           const expectedLen = cr.end - cr.start + 1;
           const availLen = Math.min(raw.byteLength, expectedLen);
@@ -1421,6 +2665,7 @@
             actualStart: cr.start,
             actualEnd,
             knownTotal: cr.total !== null ? cr.total : this.getFileSize(url),
+            etag,
             reachedEof,
           };
         }
@@ -1429,26 +2674,28 @@
         const requestedLen = reqEnd - reqStart + 1;
         const reachedEof = raw.byteLength < requestedLen;
         if (reachedEof) {
-          this.setFileMetadata(url, reqStart + raw.byteLength);
+          this._recordObservedHttpMeta(url, reqStart + raw.byteLength, etag);
         } else {
-          this.setFileMetadata(url, null);
+          this._recordObservedHttpMeta(url, null, etag);
         }
         return {
           bytes: raw,
           actualStart: reqStart,
           actualEnd: reqStart + raw.byteLength - 1,
           knownTotal: reachedEof ? reqStart + raw.byteLength : this.getFileSize(url),
+          etag,
           reachedEof,
         };
       }
 
       // 200 OK fallback (server returned full resource instead of 206 Partial Content).
-      this.setFileMetadata(url, raw.byteLength);
+      this._recordObservedHttpMeta(url, raw.byteLength, etag);
       return {
         bytes: raw,
         actualStart: 0,
         actualEnd: raw.byteLength - 1,
         knownTotal: raw.byteLength,
+        etag,
         reachedEof: true,
       };
     }
@@ -1469,103 +2716,150 @@
 
       const executeRun = async () => {
         try {
-          const knownSize = this.getFileSize(url);
-          const runStart = runStartIdx * this.chunkSize;
-          if (knownSize !== null && runStart >= knownSize) {
+          let pending = deferreds;
+          if (this._hasOpfsL2ForUrl(url)) {
+            const afterL2 = [];
             for (let i = 0; i < deferreds.length; i += 1) {
-              deferreds[i].resolve(new Uint8Array(0));
-            }
-            return;
-          }
-
-          const naturalEnd = (runEndIdx + 1) * this.chunkSize - 1;
-          const reqEnd =
-            knownSize !== null && knownSize > 0
-              ? Math.min(naturalEnd, knownSize - 1)
-              : naturalEnd;
-
-          const fetched = await this._fetchRangeBytes(url, runStart, reqEnd);
-          const totalAfter =
-            fetched.knownTotal !== null ? fetched.knownTotal : this.getFileSize(url);
-          const uncovered = [];
-
-          for (let i = 0; i < deferreds.length; i += 1) {
-            const item = deferreds[i];
-            const cStart = item.idx * this.chunkSize;
-            const cMaxEnd = (item.idx + 1) * this.chunkSize - 1;
-
-            if (totalAfter !== null && cStart >= totalAfter) {
-              item.resolve(new Uint8Array(0));
-              continue;
-            }
-
-            const expectedEnd =
-              totalAfter !== null ? Math.min(cMaxEnd, totalAfter - 1) : cMaxEnd;
-
-            const startsInResponse =
-              fetched.bytes.byteLength > 0 &&
-              cStart >= fetched.actualStart &&
-              cStart <= fetched.actualEnd;
-
-            if (startsInResponse) {
-              const relStart = cStart - fetched.actualStart;
-              const availFromChunkStart = fetched.bytes.byteLength - relStart;
-              const neededLen = expectedEnd - cStart + 1;
-              const coversCompleteChunk =
-                fetched.actualEnd >= expectedEnd ||
-                (fetched.reachedEof && availFromChunkStart > 0);
-
-              if (coversCompleteChunk) {
-                const takeLen = Math.min(this.chunkSize, neededLen, availFromChunkStart);
-                const chunkBytes = fetched.bytes.slice(relStart, relStart + takeLen);
-                if (chunkBytes.byteLength > 0) {
-                  this._putChunk(item.key, chunkBytes);
-                }
-                item.resolve(chunkBytes);
+              const item = deferreds[i];
+              const knownNow = this.getFileSize(url);
+              const cStart = item.idx * this.chunkSize;
+              if (knownNow !== null && cStart >= knownNow) {
+                item.resolve(new Uint8Array(0));
                 continue;
               }
-            } else if (fetched.reachedEof && cStart > fetched.actualEnd) {
-              item.resolve(new Uint8Array(0));
-              continue;
+              const l2Bytes = await this._tryReadOpfsL2(url, cStart, this.chunkSize, knownNow);
+              if (l2Bytes !== null) {
+                if (l2Bytes.byteLength > 0) {
+                  this._putChunk(item.key, l2Bytes);
+                }
+                item.resolve(l2Bytes);
+              } else {
+                afterL2.push(item);
+              }
             }
-
-            uncovered.push(item);
+            pending = afterL2;
+            if (pending.length === 0) {
+              return;
+            }
           }
 
-          // If the server returned a truncated 206 covering only a prefix of the
-          // coalesced run, fetch each remaining uncovered chunk individually.
-          for (let i = 0; i < uncovered.length; i += 1) {
-            const item = uncovered[i];
-            const latestSize = this.getFileSize(url);
-            const cStart = item.idx * this.chunkSize;
-            if (latestSize !== null && cStart >= latestSize) {
-              item.resolve(new Uint8Array(0));
+          // Group remaining missing chunks into contiguous runs for coalesced HTTP 206 fetches.
+          const subRuns = [];
+          let curSub = [pending[0]];
+          for (let i = 1; i < pending.length; i += 1) {
+            if (pending[i].idx === pending[i - 1].idx + 1) {
+              curSub.push(pending[i]);
+            } else {
+              subRuns.push(curSub);
+              curSub = [pending[i]];
+            }
+          }
+          subRuns.push(curSub);
+
+          for (let r = 0; r < subRuns.length; r += 1) {
+            const runItems = subRuns[r];
+            const subStartIdx = runItems[0].idx;
+            const subEndIdx = runItems[runItems.length - 1].idx;
+            const knownSize = this.getFileSize(url);
+            const runStart = subStartIdx * this.chunkSize;
+            if (knownSize !== null && runStart >= knownSize) {
+              for (let i = 0; i < runItems.length; i += 1) {
+                runItems[i].resolve(new Uint8Array(0));
+              }
               continue;
             }
-            const cNaturalEnd = (item.idx + 1) * this.chunkSize - 1;
-            const cReqEnd =
-              latestSize !== null && latestSize > 0
-                ? Math.min(cNaturalEnd, latestSize - 1)
-                : cNaturalEnd;
-            try {
-              const single = await this._fetchRangeBytes(url, cStart, cReqEnd);
-              if (
-                single.bytes.byteLength === 0 ||
-                cStart < single.actualStart ||
-                cStart > single.actualEnd
-              ) {
+
+            const naturalEnd = (subEndIdx + 1) * this.chunkSize - 1;
+            const reqEnd =
+              knownSize !== null && knownSize > 0
+                ? Math.min(naturalEnd, knownSize - 1)
+                : naturalEnd;
+
+            const fetched = await this._fetchRangeBytes(url, runStart, reqEnd);
+            const totalAfter =
+              fetched.knownTotal !== null ? fetched.knownTotal : this.getFileSize(url);
+            const uncovered = [];
+
+            for (let i = 0; i < runItems.length; i += 1) {
+              const item = runItems[i];
+              const cStart = item.idx * this.chunkSize;
+              const cMaxEnd = (item.idx + 1) * this.chunkSize - 1;
+
+              if (totalAfter !== null && cStart >= totalAfter) {
                 item.resolve(new Uint8Array(0));
-              } else {
-                const relStart = cStart - single.actualStart;
-                const takeLen = Math.min(this.chunkSize, single.bytes.byteLength - relStart);
-                const chunkBytes = single.bytes.slice(relStart, relStart + takeLen);
-                if (chunkBytes.byteLength > 0) {
-                  this._putChunk(item.key, chunkBytes);
-                }
-                item.resolve(chunkBytes);
+                continue;
               }
-            } catch (err) {
-              item.reject(err);
+
+              const expectedEnd =
+                totalAfter !== null ? Math.min(cMaxEnd, totalAfter - 1) : cMaxEnd;
+
+              const startsInResponse =
+                fetched.bytes.byteLength > 0 &&
+                cStart >= fetched.actualStart &&
+                cStart <= fetched.actualEnd;
+
+              if (startsInResponse) {
+                const relStart = cStart - fetched.actualStart;
+                const availFromChunkStart = fetched.bytes.byteLength - relStart;
+                const neededLen = expectedEnd - cStart + 1;
+                const coversCompleteChunk =
+                  fetched.actualEnd >= expectedEnd ||
+                  (fetched.reachedEof && availFromChunkStart > 0);
+
+                if (coversCompleteChunk) {
+                  const takeLen = Math.min(this.chunkSize, neededLen, availFromChunkStart);
+                  const chunkBytes = fetched.bytes.slice(relStart, relStart + takeLen);
+                  if (chunkBytes.byteLength > 0) {
+                    this._putChunk(item.key, chunkBytes);
+                    this._maybeWriteThroughOpfsL2(url, cStart, this.chunkSize, chunkBytes);
+                  }
+                  item.resolve(chunkBytes);
+                  continue;
+                }
+              } else if (fetched.reachedEof && cStart > fetched.actualEnd) {
+                item.resolve(new Uint8Array(0));
+                continue;
+              }
+
+              uncovered.push(item);
+            }
+
+            // If the server returned a truncated 206 covering only a prefix of the
+            // coalesced run, fetch each remaining uncovered chunk individually.
+            for (let i = 0; i < uncovered.length; i += 1) {
+              const item = uncovered[i];
+              const latestSize = this.getFileSize(url);
+              const cStart = item.idx * this.chunkSize;
+              if (latestSize !== null && cStart >= latestSize) {
+                item.resolve(new Uint8Array(0));
+                continue;
+              }
+              const cNaturalEnd = (item.idx + 1) * this.chunkSize - 1;
+              const cReqEnd =
+                latestSize !== null && latestSize > 0
+                  ? Math.min(cNaturalEnd, latestSize - 1)
+                  : cNaturalEnd;
+              try {
+                const single = await this._fetchRangeBytes(url, cStart, cReqEnd);
+                if (
+                  single.bytes.byteLength === 0 ||
+                  cStart < single.actualStart ||
+                  cStart > single.actualEnd
+                ) {
+                  item.resolve(new Uint8Array(0));
+                } else {
+                  const relStart = cStart - single.actualStart;
+                  const takeLen = Math.min(this.chunkSize, single.bytes.byteLength - relStart);
+                  const chunkBytes = single.bytes.slice(relStart, relStart + takeLen);
+                  if (chunkBytes.byteLength > 0) {
+                    this._putChunk(item.key, chunkBytes);
+                    this._maybeWriteThroughOpfsL2(url, cStart, this.chunkSize, chunkBytes);
+                  }
+                  item.resolve(chunkBytes);
+                }
+              } catch (err) {
+                item.reject(err);
+              }
             }
           }
         } catch (err) {
@@ -1671,7 +2965,8 @@
           if (!meta) {
             this.setFileMetadata(url, null);
           }
-          return { ok: true, size: meta ? meta.size : null };
+          const finalMeta = this._fileMeta.get(url);
+          return { ok: true, size: finalMeta ? finalMeta.size : null };
         } catch (err) {
           return {
             ok: false,
@@ -1748,9 +3043,22 @@
       }
 
       const promise = (async () => {
+        const slabStart = slabIndex * this.slabSize;
+        const knownSizeBefore = this.getFileSize(url);
+        if (knownSizeBefore !== null && slabStart >= knownSizeBefore) {
+          return new Uint8Array(0);
+        }
+
+        if (this._hasOpfsL2ForUrl(url)) {
+          const l2Hit = await this._tryReadOpfsL2(url, slabStart, this.slabSize, knownSizeBefore);
+          if (l2Hit !== null) {
+            this._putSlab(key, l2Hit);
+            return l2Hit;
+          }
+        }
+
         await this._acquireSlabSlot(isPrefetch);
         try {
-          const slabStart = slabIndex * this.slabSize;
           const knownSize = this.getFileSize(url);
           if (knownSize !== null && slabStart >= knownSize) {
             return new Uint8Array(0);
@@ -1795,6 +3103,7 @@
                   : first.bytes.slice(relStart, relStart + takeLen);
               if (slabBytes.byteLength > 0) {
                 this._putSlab(key, slabBytes);
+                this._maybeWriteThroughOpfsL2(url, slabStart, this.slabSize, slabBytes);
               }
               return slabBytes;
             }
@@ -1841,6 +3150,7 @@
             }
             if (combined.byteLength > 0) {
               this._putSlab(key, combined);
+              this._maybeWriteThroughOpfsL2(url, slabStart, this.slabSize, combined);
             }
             return combined;
           }
@@ -2369,8 +3679,11 @@
       this._chunks.clear();
       this._slabs.clear();
       this._fileMeta.clear();
+      this._fileFingerprints.clear();
       this._negativeCache.clear();
       this._streamTrackers.clear();
+      this._opfsL2WriteQueue.clear();
+      this._opfsL2ValidatedFingerprints.clear();
       this._bytesCached = 0;
       this._slabBytesCached = 0;
     }
@@ -2401,6 +3714,11 @@
         inFlightCoalesced: this._stats.inFlightCoalesced,
         networkFetches: this._stats.networkFetches,
         evictions: this._stats.evictions,
+        opfsL2Hits: this._stats.opfsL2Hits,
+        opfsL2Misses: this._stats.opfsL2Misses,
+        opfsL2Writes: this._stats.opfsL2Writes,
+        opfsL2WriteErrors: this._stats.opfsL2WriteErrors,
+        opfsL2Invalidations: this._stats.opfsL2Invalidations,
         bytesCached: this._bytesCached,
         maxBytes: this.maxBytes,
         chunkSize: this.chunkSize,
@@ -2537,6 +3855,10 @@
       pgimFullFetches: wholeStats.pgimFullFetches,
       slabCacheHits: immStats.slabCacheHits,
       slabCacheMisses: immStats.slabCacheMisses,
+      opfsL2Hits: immStats.opfsL2Hits,
+      opfsL2Misses: immStats.opfsL2Misses,
+      opfsL2Writes: immStats.opfsL2Writes,
+      opfsL2Invalidations: immStats.opfsL2Invalidations,
       syncFastPathHits: mailboxStats.syncFastPathHits,
       dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
       dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
@@ -2892,6 +4214,21 @@
         negativeCacheTtlMs: options.negativeCacheTtlMs,
         negativeCacheMaxEntries: options.negativeCacheMaxEntries,
         metadataMaxEntries: options.metadataMaxEntries,
+        opfsL2: options.opfsL2,
+        opfsCache: options.opfsCache,
+        opfsDir: options.opfsDir,
+        opfsL2Enabled: options.opfsL2Enabled,
+        opfsL2Allowlist:
+          options.opfsL2Allowlist !== undefined
+            ? options.opfsL2Allowlist
+            : options.hotOpfsAllowlist !== undefined
+              ? options.hotOpfsAllowlist
+              : options.opfsHotRpfAllowlist,
+        opfsL2RequireEtag: options.opfsL2RequireEtag,
+        fileFingerprints: options.fileFingerprints,
+        maxPendingOpfsL2Writes: options.maxPendingOpfsL2Writes,
+        maxOpfsL2WriteConcurrency: options.maxOpfsL2WriteConcurrency,
+        opfsL2MaxBytes: options.opfsL2MaxBytes,
         now: typeof options.now === 'function' ? options.now : undefined,
       };
       this._wholeFileBufferEnabled = options.wholeFileBufferEnabled !== false;
@@ -3070,11 +4407,30 @@
           negativeCacheTtlMs: this._immutableCacheOptions.negativeCacheTtlMs,
           negativeCacheMaxEntries: this._immutableCacheOptions.negativeCacheMaxEntries,
           metadataMaxEntries: this._immutableCacheOptions.metadataMaxEntries,
+          opfsL2: this._immutableCacheOptions.opfsL2,
+          opfsCache: this._immutableCacheOptions.opfsCache,
+          opfsDir: this._immutableCacheOptions.opfsDir,
+          opfsL2Enabled: this._immutableCacheOptions.opfsL2Enabled,
+          opfsL2Allowlist: this._immutableCacheOptions.opfsL2Allowlist,
+          opfsL2RequireEtag: this._immutableCacheOptions.opfsL2RequireEtag,
+          fileFingerprints: this._immutableCacheOptions.fileFingerprints,
+          maxPendingOpfsL2Writes: this._immutableCacheOptions.maxPendingOpfsL2Writes,
+          maxOpfsL2WriteConcurrency: this._immutableCacheOptions.maxOpfsL2WriteConcurrency,
+          opfsL2MaxBytes: this._immutableCacheOptions.opfsL2MaxBytes,
           now: this._immutableCacheOptions.now,
           fetchImpl: this._getFetchImpl(),
         });
       }
       return this.immutableCache;
+    }
+
+    async flushOpfsL2Writes() {
+      if (this.immutableCache && typeof this.immutableCache.flushOpfsL2Writes === 'function') {
+        await this.immutableCache.flushOpfsL2Writes();
+      }
+      if (this.rangeCache && typeof this.rangeCache.flushOpfsWrites === 'function') {
+        await this.rangeCache.flushOpfsWrites();
+      }
     }
 
     tuneSlabCache(profileOrOptions = 'video4k') {
@@ -5052,6 +6408,7 @@
         (Number.isFinite(cacheStats.hits) ? cacheStats.hits : 0) +
         (Number.isFinite(immutableCacheStats.hits) ? immutableCacheStats.hits : 0) +
         (Number.isFinite(immutableCacheStats.slabCacheHits) ? immutableCacheStats.slabCacheHits : 0) +
+        (Number.isFinite(immutableCacheStats.opfsL2Hits) ? immutableCacheStats.opfsL2Hits : 0) +
         (Number.isFinite(wholeFileStats.hits) ? wholeFileStats.hits : 0);
       const readsCompleted = this._streamingStats.readsCompleted;
       const avgReadMs =
@@ -5081,6 +6438,10 @@
         pgimFullFetches: wholeFileStats.pgimFullFetches,
         slabCacheHits: immutableCacheStats.slabCacheHits,
         slabCacheMisses: immutableCacheStats.slabCacheMisses,
+        opfsL2Hits: immutableCacheStats.opfsL2Hits,
+        opfsL2Misses: immutableCacheStats.opfsL2Misses,
+        opfsL2Writes: immutableCacheStats.opfsL2Writes,
+        opfsL2Invalidations: immutableCacheStats.opfsL2Invalidations,
         syncFastPathHits: mailboxStats.syncFastPathHits,
         // Top-level opt-in /pg6_dump/* write forwarding telemetry
         dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
@@ -5263,6 +6624,43 @@
           ? opts.sequentialThresholdReads
           : this._immutableCacheOptions.sequentialThresholdReads;
 
+      const resolvedOpfsL2 =
+        opts.opfsL2 !== undefined ? opts.opfsL2 : this._immutableCacheOptions.opfsL2;
+      const resolvedOpfsCache =
+        opts.opfsCache !== undefined ? opts.opfsCache : this._immutableCacheOptions.opfsCache;
+      const resolvedOpfsL2Enabled =
+        opts.opfsL2Enabled !== undefined
+          ? opts.opfsL2Enabled
+          : this._immutableCacheOptions.opfsL2Enabled;
+      const resolvedOpfsL2Allowlist =
+        opts.opfsL2Allowlist !== undefined
+          ? opts.opfsL2Allowlist
+          : opts.hotOpfsAllowlist !== undefined
+            ? opts.hotOpfsAllowlist
+            : opts.opfsHotRpfAllowlist !== undefined
+              ? opts.opfsHotRpfAllowlist
+              : this._immutableCacheOptions.opfsL2Allowlist;
+      const resolvedOpfsL2RequireEtag =
+        opts.opfsL2RequireEtag !== undefined
+          ? opts.opfsL2RequireEtag
+          : this._immutableCacheOptions.opfsL2RequireEtag;
+      const resolvedFileFingerprints =
+        opts.fileFingerprints !== undefined
+          ? opts.fileFingerprints
+          : this._immutableCacheOptions.fileFingerprints;
+      const resolvedMaxPendingOpfsL2Writes =
+        opts.maxPendingOpfsL2Writes !== undefined
+          ? opts.maxPendingOpfsL2Writes
+          : this._immutableCacheOptions.maxPendingOpfsL2Writes;
+      const resolvedMaxOpfsL2WriteConcurrency =
+        opts.maxOpfsL2WriteConcurrency !== undefined
+          ? opts.maxOpfsL2WriteConcurrency
+          : this._immutableCacheOptions.maxOpfsL2WriteConcurrency;
+      const resolvedOpfsL2MaxBytes =
+        opts.opfsL2MaxBytes !== undefined
+          ? opts.opfsL2MaxBytes
+          : this._immutableCacheOptions.opfsL2MaxBytes;
+
       this.immutableCache =
         opts.immutableCache ||
         new ImmutableHttpfsCache({
@@ -5293,6 +6691,16 @@
             opts.metadataMaxEntries !== undefined
               ? opts.metadataMaxEntries
               : this._immutableCacheOptions.metadataMaxEntries,
+          opfsL2: resolvedOpfsL2,
+          opfsCache: resolvedOpfsCache,
+          opfsDir,
+          opfsL2Enabled: resolvedOpfsL2Enabled,
+          opfsL2Allowlist: resolvedOpfsL2Allowlist,
+          opfsL2RequireEtag: resolvedOpfsL2RequireEtag,
+          fileFingerprints: resolvedFileFingerprints,
+          maxPendingOpfsL2Writes: resolvedMaxPendingOpfsL2Writes,
+          maxOpfsL2WriteConcurrency: resolvedMaxOpfsL2WriteConcurrency,
+          opfsL2MaxBytes: resolvedOpfsL2MaxBytes,
           now:
             typeof opts.now === 'function' ? opts.now : this._immutableCacheOptions.now,
           fetchImpl: fetchFn,
@@ -5686,6 +7094,10 @@
     DEFAULT_NEGATIVE_CACHE_TTL_MS,
     DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES,
     DEFAULT_BATCH_COALESCE_MAX_BYTES,
+    DEFAULT_HOT_OPFS_RPF_ALLOWLIST,
+    DEFAULT_OPFS_L2_MAX_PENDING_WRITES,
+    DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY,
+    DEFAULT_OPFS_L2_MAX_BYTES,
     ImmutableHttpfsCache,
     IoWorkerController,
     createIoWorkerHandler,
@@ -5700,6 +7112,10 @@
     isImmutableHttpfsPath,
     isWholeFileBufferedPath,
     isVideoStreamPath,
+    buildFileFingerprint,
+    normalizeOpfsL2Path,
+    isHotOpfsL2Path,
+    opfsL2RangeFileName,
     parseContentRangeHeader,
     isRpfVirtualPath,
     parseRpfVirtualPath,
