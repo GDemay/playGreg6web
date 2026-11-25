@@ -191,12 +191,22 @@
     return durationMs;
   }
 
+  function defaultNowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
   /**
    * Non-blocking WebGPU per-pass GPU profiler backed by optional `'timestamp-query'`
    * `GPUQuerySet` resolution and multi-slot staging buffer readback.
    *
-   * Degrades cleanly to a zero-overhead no-op whenever the GPUDevice does not support
-   * `'timestamp-query'` (or after `destroy()`).
+   * Supports named pass profiling via `beginPass(label)` / `endPass()` and
+   * `getTopPasses(limit)` bottleneck summaries. When WebGPU `'timestamp-query'`
+   * is unavailable, `beginPass(label)` / `endPass()` gracefully degrade to CPU
+   * `performance.now()` timing while keeping GPU-only methods (`getPassTimestampWrites`,
+   * `resolveFrame`, `collectCompletedReadback`) as safe no-ops.
    */
   class GpuPassTimer {
     /**
@@ -206,6 +216,7 @@
      * @param {number} [options.readbackSlots=3]
      * @param {number} [options.historySize=120]
      * @param {number} [options.frameBudgetMs=16.67]
+     * @param {() => number} [options.now] Optional clock returning milliseconds (defaults to `performance.now()`).
      */
     constructor(options = {}) {
       const opts = options && typeof options === 'object' ? options : {};
@@ -231,6 +242,10 @@
         DEFAULT_FRAME_BUDGET_MS,
         'frameBudgetMs'
       );
+      if (opts.now !== undefined && typeof opts.now !== 'function') {
+        throw new TypeError('now must be a function');
+      }
+      this._now = opts.now || defaultNowMs;
 
       this._device = device;
       this._maxQueries = this._maxPassesPerFrame * 2;
@@ -242,10 +257,37 @@
       this._querySet = null;
       this._resolveBuffer = null;
       this._readbackSlots = [];
-      this._pendingQueue = [];
+      this._timestampWriteDescriptors = [];
+      this._pendingRing = new Array(this._readbackSlotCount).fill(null);
+      this._pendingHead = 0;
+      this._pendingTail = 0;
+      this._pendingCount = 0;
 
-      this._framePasses = [];
+      // Pre-allocated per-frame pass recording storage (zero hot-path allocations).
+      this._framePassNames = new Array(this._maxPassesPerFrame);
+      this._framePassBeginIdx = new Uint32Array(this._maxPassesPerFrame);
+      this._framePassEndIdx = new Uint32Array(this._maxPassesPerFrame);
+      this._framePassCount = 0;
       this._queryCursor = 0;
+
+      // Pre-allocated active pass stack for beginPass(label) / endPass().
+      this._activePassLabels = new Array(this._maxPassesPerFrame);
+      this._activePassStarts = new Float64Array(this._maxPassesPerFrame);
+      this._activePassModes = new Uint8Array(this._maxPassesPerFrame); // 0 = GPU, 1 = CPU
+      this._activePassDepth = 0;
+
+      // Pre-allocated rolling frame total ring for share-of-frame % calculations.
+      this._frameTotals = new Float64Array(this._historySize);
+      this._frameTotalSeqs = new Float64Array(this._historySize);
+      this._frameTotalWriteIdx = 0;
+      this._frameTotalWindowCount = 0;
+      this._frameSeq = 0;
+
+      // Open CPU fallback frame accumulators (active only when !supported and beginPass/endPass are used).
+      this._cpuFrameOpen = false;
+      this._cpuFrameSeq = 0;
+      this._cpuFrameTotalMs = 0;
+      this._cpuFramePassCount = 0;
 
       this._resolvedFrames = 0;
       this._skippedFrames = 0;
@@ -296,16 +338,29 @@
             index: i,
             buffer,
             state: 'idle',
-            passes: null,
+            passNames: new Array(this._maxPassesPerFrame),
+            passBeginIdx: new Uint32Array(this._maxPassesPerFrame),
+            passEndIdx: new Uint32Array(this._maxPassesPerFrame),
+            passCount: 0,
             queryCount: 0,
             copyBytes: 0,
             generation: 0,
           });
         }
 
+        const timestampWriteDescriptors = new Array(this._maxPassesPerFrame);
+        for (let i = 0; i < this._maxPassesPerFrame; i += 1) {
+          timestampWriteDescriptors[i] = Object.freeze({
+            querySet,
+            beginningOfPassWriteIndex: i * 2,
+            endOfPassWriteIndex: i * 2 + 1,
+          });
+        }
+
         this._querySet = querySet;
         this._resolveBuffer = resolveBuffer;
         this._readbackSlots = readbackSlots;
+        this._timestampWriteDescriptors = timestampWriteDescriptors;
         this._supported = true;
       } catch (_) {
         if (querySet && typeof querySet.destroy === 'function') {
@@ -334,12 +389,17 @@
         this._querySet = null;
         this._resolveBuffer = null;
         this._readbackSlots = [];
+        this._timestampWriteDescriptors = [];
         this._supported = false;
       }
     }
 
     get supported() {
       return this._supported;
+    }
+
+    get mode() {
+      return this._supported ? 'gpu' : 'cpu';
     }
 
     get maxPassesPerFrame() {
@@ -362,15 +422,162 @@
       return this._destroyed;
     }
 
+    _recordFrameTotal(totalMs, frameSeq) {
+      const safeTotalMs =
+        typeof totalMs === 'number' && Number.isFinite(totalMs) && totalMs >= 0 ? totalMs : 0;
+      this._frameTotals[this._frameTotalWriteIdx] = safeTotalMs;
+      this._frameTotalSeqs[this._frameTotalWriteIdx] = frameSeq;
+      this._frameTotalWriteIdx = (this._frameTotalWriteIdx + 1) % this._historySize;
+      if (this._frameTotalWindowCount < this._historySize) {
+        this._frameTotalWindowCount += 1;
+      }
+    }
+
+    _finalizeCpuFrame() {
+      if (this._cpuFramePassCount === 0) {
+        this._cpuFrameOpen = false;
+        this._cpuFrameSeq = 0;
+        this._cpuFrameTotalMs = 0;
+        return false;
+      }
+      const frameSeq = this._cpuFrameSeq;
+      const totalMs = this._cpuFrameTotalMs;
+      this._frameSeq = frameSeq;
+      this._recordFrameTotal(totalMs, frameSeq);
+      this._resolvedFrames += 1;
+      this._lastFrameGpuMs = totalMs;
+
+      this._cpuFrameOpen = false;
+      this._cpuFrameSeq = 0;
+      this._cpuFrameTotalMs = 0;
+      this._cpuFramePassCount = 0;
+      return true;
+    }
+
     /**
      * Resets per-frame pass metadata and query cursor for a new frame.
+     * In CPU fallback mode, commits any pending passes recorded during the previous frame.
      */
     beginFrame() {
-      if (!this._supported || this._destroyed) {
+      if (this._destroyed) {
         return;
       }
-      this._framePasses = [];
-      this._queryCursor = 0;
+      if (this._supported) {
+        this._framePassCount = 0;
+        this._queryCursor = 0;
+        this._activePassDepth = 0;
+        return;
+      }
+      if (this._cpuFramePassCount > 0) {
+        this._finalizeCpuFrame();
+      }
+      this._activePassDepth = 0;
+      this._cpuFrameOpen = true;
+      this._cpuFrameSeq = 0;
+      this._cpuFrameTotalMs = 0;
+      this._cpuFramePassCount = 0;
+    }
+
+    /**
+     * Explicitly finalizes the current frame in CPU fallback mode.
+     * In GPU mode this is a safe no-op (frames finalize when `collectCompletedReadback()` resolves).
+     *
+     * @returns {boolean} True if a CPU fallback frame with recorded passes was committed.
+     */
+    endFrame() {
+      if (this._destroyed) {
+        return false;
+      }
+      this._activePassDepth = 0;
+      if (this._supported) {
+        return false;
+      }
+      return this._finalizeCpuFrame();
+    }
+
+    /**
+     * Begins a named pass scope without hot-path heap allocations.
+     *
+     * - When WebGPU `'timestamp-query'` is supported: allocates a query pair and returns
+     *   the pre-allocated `timestampWrites` descriptor for `beginRenderPass` / `beginComputePass`.
+     * - When `'timestamp-query'` is unavailable: captures a CPU `performance.now()` start
+     *   timestamp and returns `undefined`.
+     *
+     * @param {string} [label]
+     * @returns {{ querySet: GPUQuerySet, beginningOfPassWriteIndex: number, endOfPassWriteIndex: number } | undefined}
+     */
+    beginPass(label) {
+      if (this._destroyed) {
+        return undefined;
+      }
+
+      if (this._supported) {
+        const descriptor = this.getPassTimestampWrites(label);
+        if (descriptor !== undefined && this._activePassDepth < this._maxPassesPerFrame) {
+          const depth = this._activePassDepth;
+          this._activePassLabels[depth] = this._framePassNames[this._framePassCount - 1];
+          this._activePassStarts[depth] = 0;
+          this._activePassModes[depth] = 0;
+          this._activePassDepth = depth + 1;
+        }
+        return descriptor;
+      }
+
+      if (this._activePassDepth >= this._maxPassesPerFrame) {
+        this._droppedPasses += 1;
+        return undefined;
+      }
+
+      const depth = this._activePassDepth;
+      const name =
+        typeof label === 'string' && label.length > 0
+          ? label
+          : `pass_${this._cpuFramePassCount}`;
+      this._activePassLabels[depth] = name;
+      this._activePassStarts[depth] = this._now();
+      this._activePassModes[depth] = 1;
+      this._activePassDepth = depth + 1;
+      return undefined;
+    }
+
+    /**
+     * Ends the most recently started pass from `beginPass(label)`.
+     *
+     * - In CPU fallback mode: records the elapsed `performance.now()` duration into the
+     *   pass's rolling history and returns the duration in milliseconds.
+     * - In GPU timestamp-query mode: closes the active pass scope and returns `null`
+     *   (GPU timings are recorded asynchronously when `collectCompletedReadback()` resolves).
+     *
+     * @returns {number | null}
+     */
+    endPass() {
+      if (this._destroyed || this._activePassDepth === 0) {
+        return null;
+      }
+
+      const depth = this._activePassDepth - 1;
+      this._activePassDepth = depth;
+      const mode = this._activePassModes[depth];
+      const label = this._activePassLabels[depth];
+      this._activePassLabels[depth] = undefined;
+
+      if (mode === 0) {
+        return null;
+      }
+
+      const endMs = this._now();
+      const rawDelta = endMs - this._activePassStarts[depth];
+      const durationMs =
+        typeof rawDelta === 'number' && Number.isFinite(rawDelta) && rawDelta > 0 ? rawDelta : 0;
+
+      if (this._cpuFramePassCount === 0) {
+        this._cpuFrameSeq = this._frameSeq + 1;
+        this._cpuFrameOpen = true;
+      }
+      this._cpuFrameTotalMs += durationMs;
+      this._cpuFramePassCount += 1;
+      this._recordPassSample(label, durationMs, this._cpuFrameSeq);
+      return durationMs;
     }
 
     /**
@@ -392,26 +599,20 @@
         return undefined;
       }
 
+      const passIdx = this._framePassCount;
       const beginningOfPassWriteIndex = this._queryCursor;
       const endOfPassWriteIndex = this._queryCursor + 1;
       this._queryCursor += 2;
+      this._framePassCount = passIdx + 1;
 
       const name =
-        typeof passName === 'string' && passName.length > 0
-          ? passName
-          : `pass_${this._framePasses.length}`;
+        typeof passName === 'string' && passName.length > 0 ? passName : `pass_${passIdx}`;
 
-      this._framePasses.push({
-        name,
-        beginIndex: beginningOfPassWriteIndex,
-        endIndex: endOfPassWriteIndex,
-      });
+      this._framePassNames[passIdx] = name;
+      this._framePassBeginIdx[passIdx] = beginningOfPassWriteIndex;
+      this._framePassEndIdx[passIdx] = endOfPassWriteIndex;
 
-      return {
-        querySet: this._querySet,
-        beginningOfPassWriteIndex,
-        endOfPassWriteIndex,
-      };
+      return this._timestampWriteDescriptors[passIdx];
     }
 
     /**
@@ -419,14 +620,27 @@
      * Skips cleanly (incrementing `skippedFrames`) if all readback slots are currently
      * in-flight or mapped so rendering never stalls.
      *
+     * In CPU fallback mode, commits any passes recorded via `beginPass()`/`endPass()`
+     * for the current frame and returns `false` (no GPU resolve commands encoded).
+     *
      * @param {GPUCommandEncoder} encoder
      * @returns {boolean} True if resolve commands were encoded, false if skipped or no-op.
      */
     resolveFrame(encoder) {
-      if (!this._supported || this._destroyed || !this._querySet || !this._resolveBuffer) {
+      if (this._destroyed) {
         return false;
       }
-      const passCount = this._framePasses.length;
+      if (!this._supported) {
+        if (this._cpuFramePassCount > 0) {
+          this._finalizeCpuFrame();
+        }
+        this._activePassDepth = 0;
+        return false;
+      }
+      if (!this._querySet || !this._resolveBuffer) {
+        return false;
+      }
+      const passCount = this._framePassCount;
       if (passCount === 0) {
         return false;
       }
@@ -448,8 +662,9 @@
 
       if (!freeSlot) {
         this._skippedFrames += 1;
-        this._framePasses = [];
+        this._framePassCount = 0;
         this._queryCursor = 0;
+        this._activePassDepth = 0;
         return false;
       }
 
@@ -460,18 +675,27 @@
       encoder.copyBufferToBuffer(this._resolveBuffer, 0, freeSlot.buffer, 0, copyBytes);
 
       freeSlot.state = 'pending';
-      freeSlot.passes = this._framePasses.slice();
+      for (let i = 0; i < passCount; i += 1) {
+        freeSlot.passNames[i] = this._framePassNames[i];
+        freeSlot.passBeginIdx[i] = this._framePassBeginIdx[i];
+        freeSlot.passEndIdx[i] = this._framePassEndIdx[i];
+      }
+      freeSlot.passCount = passCount;
       freeSlot.queryCount = queryCount;
       freeSlot.copyBytes = copyBytes;
       freeSlot.generation = this._resetGeneration;
-      this._pendingQueue.push(freeSlot);
 
-      this._framePasses = [];
+      this._pendingRing[this._pendingTail] = freeSlot;
+      this._pendingTail = (this._pendingTail + 1) % this._readbackSlotCount;
+      this._pendingCount += 1;
+
+      this._framePassCount = 0;
       this._queryCursor = 0;
+      this._activePassDepth = 0;
       return true;
     }
 
-    _recordPassSample(name, durationMs) {
+    _recordPassSample(name, durationMs, frameSeq) {
       const safeDurationMs =
         typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0
           ? durationMs
@@ -486,6 +710,12 @@
           count: 0,
           lastMs: 0,
           budgetExceedCount: 0,
+          frameSamples: new Float64Array(this._historySize),
+          frameSeqs: new Float64Array(this._historySize),
+          frameWriteIdx: 0,
+          frameWindowCount: 0,
+          lastFrameSeq: 0,
+          lastFrameSlotIdx: -1,
         };
         this._passHistories.set(name, entry);
       }
@@ -500,6 +730,22 @@
       if (safeDurationMs > this._frameBudgetMs) {
         entry.budgetExceedCount += 1;
       }
+
+      if (typeof frameSeq === 'number' && frameSeq > 0) {
+        if (entry.lastFrameSeq === frameSeq && entry.lastFrameSlotIdx >= 0) {
+          entry.frameSamples[entry.lastFrameSlotIdx] += safeDurationMs;
+        } else {
+          const slotIdx = entry.frameWriteIdx;
+          entry.frameSamples[slotIdx] = safeDurationMs;
+          entry.frameSeqs[slotIdx] = frameSeq;
+          entry.lastFrameSeq = frameSeq;
+          entry.lastFrameSlotIdx = slotIdx;
+          entry.frameWriteIdx = (slotIdx + 1) % this._historySize;
+          if (entry.frameWindowCount < this._historySize) {
+            entry.frameWindowCount += 1;
+          }
+        }
+      }
     }
 
     /**
@@ -513,17 +759,21 @@
       if (!this._supported || this._destroyed) {
         return null;
       }
-      if (this._pendingQueue.length === 0) {
+      if (this._pendingCount === 0) {
         return null;
       }
 
-      const slot = this._pendingQueue.shift();
+      const slot = this._pendingRing[this._pendingHead];
+      this._pendingRing[this._pendingHead] = null;
+      this._pendingHead = (this._pendingHead + 1) % this._readbackSlotCount;
+      this._pendingCount -= 1;
+
       if (!slot || !slot.buffer || slot.state !== 'pending') {
         return null;
       }
 
       const buffer = slot.buffer;
-      const recordedPasses = slot.passes || [];
+      const passCount = slot.passCount;
       const queryCount = slot.queryCount;
       const copyBytes = slot.copyBytes;
       const slotGeneration = slot.generation;
@@ -546,19 +796,25 @@
         const range = buffer.getMappedRange(0, copyBytes);
         const timestamps = readTimestampsView(range, queryCount);
 
-        let totalGpuMs = 0;
-        const passes = new Array(recordedPasses.length);
+        const frameSeq = this._frameSeq + 1;
+        this._frameSeq = frameSeq;
 
-        for (let i = 0; i < recordedPasses.length; i += 1) {
-          const pass = recordedPasses[i];
-          const startNs = pass.beginIndex < timestamps.length ? timestamps[pass.beginIndex] : 0n;
-          const endNs = pass.endIndex < timestamps.length ? timestamps[pass.endIndex] : 0n;
+        let totalGpuMs = 0;
+        const passes = new Array(passCount);
+
+        for (let i = 0; i < passCount; i += 1) {
+          const passName = slot.passNames[i];
+          const beginIdx = slot.passBeginIdx[i];
+          const endIdx = slot.passEndIdx[i];
+          const startNs = beginIdx < timestamps.length ? timestamps[beginIdx] : 0n;
+          const endNs = endIdx < timestamps.length ? timestamps[endIdx] : 0n;
           const durationMs = computeDurationMs(startNs, endNs);
           totalGpuMs += durationMs;
-          passes[i] = { name: pass.name, durationMs };
-          this._recordPassSample(pass.name, durationMs);
+          passes[i] = { name: passName, durationMs };
+          this._recordPassSample(passName, durationMs, frameSeq);
         }
 
+        this._recordFrameTotal(totalGpuMs, frameSeq);
         this._resolvedFrames += 1;
         this._lastFrameGpuMs = totalGpuMs;
 
@@ -575,7 +831,7 @@
         }
         if (!this._destroyed && slot.buffer === buffer) {
           slot.state = 'idle';
-          slot.passes = null;
+          slot.passCount = 0;
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
@@ -678,6 +934,139 @@
     }
 
     /**
+     * Returns the slowest passes ranked by rolling window frame contribution (highest
+     * share-of-frame % first), computing rolling per-pass average ms, max ms, and
+     * share-of-frame % over the active `historySize` rolling window.
+     *
+     * @param {number} [limit] Maximum number of passes to return (defaults to all active passes).
+     * @returns {Array<{
+     *   label: string,
+     *   name: string,
+     *   count: number,
+     *   totalCount: number,
+     *   avgMs: number,
+     *   maxMs: number,
+     *   lastMs: number,
+     *   totalMs: number,
+     *   shareOfFramePct: number,
+     *   mode: 'gpu' | 'cpu'
+     * }>}
+     */
+    getTopPasses(limit) {
+      let maxResults = Infinity;
+      if (limit !== undefined && limit !== null) {
+        if (typeof limit !== 'number' || Number.isNaN(limit) || limit <= 0) {
+          return [];
+        }
+        maxResults = Number.isFinite(limit) ? Math.floor(limit) : Infinity;
+        if (maxResults <= 0) {
+          return [];
+        }
+      }
+
+      const hasOpenCpuFrame = !this._supported && this._cpuFramePassCount > 0;
+      const finalizedCount = this._frameTotalWindowCount;
+      if (finalizedCount === 0 && !hasOpenCpuFrame) {
+        return [];
+      }
+
+      let maxSeq = 0;
+      let minSeq = 0;
+      let rollingFrameTotalMs = 0;
+
+      if (hasOpenCpuFrame) {
+        const activeFrameCount = Math.min(this._historySize, finalizedCount + 1);
+        maxSeq = this._cpuFrameSeq;
+        minSeq = maxSeq - activeFrameCount + 1;
+        rollingFrameTotalMs = this._cpuFrameTotalMs;
+        for (let i = 0; i < finalizedCount; i += 1) {
+          const seq = this._frameTotalSeqs[i];
+          if (seq >= minSeq && seq <= maxSeq) {
+            rollingFrameTotalMs += this._frameTotals[i];
+          }
+        }
+      } else {
+        maxSeq = this._frameSeq;
+        minSeq = maxSeq - finalizedCount + 1;
+        for (let i = 0; i < finalizedCount; i += 1) {
+          rollingFrameTotalMs += this._frameTotals[i];
+        }
+      }
+
+      const mode = this._supported ? 'gpu' : 'cpu';
+      const ranked = [];
+
+      for (const [label, entry] of this._passHistories.entries()) {
+        let activeCount = 0;
+        let sum = 0;
+        let maxMs = 0;
+        let lastMs = 0;
+        let latestSeq = -1;
+
+        for (let i = 0; i < entry.frameWindowCount; i += 1) {
+          const seq = entry.frameSeqs[i];
+          if (seq >= minSeq && seq <= maxSeq) {
+            const v = entry.frameSamples[i];
+            activeCount += 1;
+            sum += v;
+            if (v > maxMs) {
+              maxMs = v;
+            }
+            if (seq >= latestSeq) {
+              latestSeq = seq;
+              lastMs = v;
+            }
+          }
+        }
+
+        if (activeCount === 0) {
+          continue;
+        }
+
+        const avgMs = sum / activeCount;
+        const shareOfFramePct =
+          rollingFrameTotalMs > 0 ? (sum / rollingFrameTotalMs) * 100 : 0;
+
+        ranked.push({
+          label,
+          name: label,
+          count: activeCount,
+          totalCount: entry.count,
+          avgMs,
+          maxMs,
+          lastMs,
+          totalMs: sum,
+          shareOfFramePct,
+          mode,
+        });
+      }
+
+      ranked.sort((a, b) => {
+        if (b.totalMs !== a.totalMs) {
+          return b.totalMs - a.totalMs;
+        }
+        if (b.avgMs !== a.avgMs) {
+          return b.avgMs - a.avgMs;
+        }
+        if (b.maxMs !== a.maxMs) {
+          return b.maxMs - a.maxMs;
+        }
+        if (a.label < b.label) {
+          return -1;
+        }
+        if (a.label > b.label) {
+          return 1;
+        }
+        return 0;
+      });
+
+      if (ranked.length > maxResults) {
+        ranked.length = maxResults;
+      }
+      return ranked;
+    }
+
+    /**
      * Clears rolling per-pass histories, percentile samples, and budget spike counters
      * while keeping GPU resources intact for subsequent frames.
      */
@@ -688,18 +1077,37 @@
       this._droppedPasses = 0;
       this._lastFrameGpuMs = 0;
       this._passHistories.clear();
-      this._framePasses = [];
+      this._framePassCount = 0;
+      this._framePassNames.fill(undefined);
       this._queryCursor = 0;
-      for (const slot of this._pendingQueue) {
+      this._activePassDepth = 0;
+      this._activePassLabels.fill(undefined);
+      this._frameTotals.fill(0);
+      this._frameTotalSeqs.fill(0);
+      this._frameTotalWriteIdx = 0;
+      this._frameTotalWindowCount = 0;
+      this._frameSeq = 0;
+      this._cpuFrameOpen = false;
+      this._cpuFrameSeq = 0;
+      this._cpuFrameTotalMs = 0;
+      this._cpuFramePassCount = 0;
+
+      for (let i = 0; i < this._pendingCount; i += 1) {
+        const idx = (this._pendingHead + i) % this._readbackSlotCount;
+        const slot = this._pendingRing[idx];
+        this._pendingRing[idx] = null;
         if (slot && slot.state === 'pending') {
           slot.state = 'idle';
-          slot.passes = null;
+          slot.passCount = 0;
+          slot.passNames.fill(undefined);
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
         }
       }
-      this._pendingQueue = [];
+      this._pendingHead = 0;
+      this._pendingTail = 0;
+      this._pendingCount = 0;
     }
 
     /**
@@ -782,12 +1190,17 @@
         }
         slot.buffer = null;
         slot.state = 'destroyed';
-        slot.passes = null;
+        slot.passCount = 0;
+        slot.passNames.fill(undefined);
         slot.queryCount = 0;
         slot.copyBytes = 0;
       }
       this._readbackSlots = [];
-      this._pendingQueue = [];
+      this._timestampWriteDescriptors = [];
+      this._pendingRing.fill(null);
+      this._pendingHead = 0;
+      this._pendingTail = 0;
+      this._pendingCount = 0;
       this.reset();
       this._device = null;
     }
