@@ -18,6 +18,9 @@
 
   const SUPPORTED_ALPHA_MODES = Object.freeze(['opaque', 'premultiplied']);
 
+  const VALID_CANVAS_FORMATS = Object.freeze(['bgra8unorm', 'rgba8unorm', 'rgba16float']);
+  const VALID_CANVAS_FORMAT_SET = new Set(VALID_CANVAS_FORMATS);
+
   const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
   const DEFAULT_FORMAT = 'bgra8unorm';
   const DEFAULT_ALPHA_MODE = 'opaque';
@@ -26,12 +29,73 @@
   const DEFAULT_MAX_ERROR_HISTORY = 32;
   const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 
-  // WebGPU GPUTextureUsage.RENDER_ATTACHMENT === 0x10 (fallback for Node/headless tests).
+  // WebGPU GPUTextureUsage constants with numeric fallbacks for Node/headless tests.
+  const TEXTURE_USAGE_COPY_SRC =
+    typeof GPUTextureUsage !== 'undefined' && typeof GPUTextureUsage.COPY_SRC === 'number'
+      ? GPUTextureUsage.COPY_SRC
+      : 0x01;
+  const TEXTURE_USAGE_TEXTURE_BINDING =
+    typeof GPUTextureUsage !== 'undefined' && typeof GPUTextureUsage.TEXTURE_BINDING === 'number'
+      ? GPUTextureUsage.TEXTURE_BINDING
+      : 0x04;
   const TEXTURE_USAGE_RENDER_ATTACHMENT =
     typeof GPUTextureUsage !== 'undefined' &&
     typeof GPUTextureUsage.RENDER_ATTACHMENT === 'number'
       ? GPUTextureUsage.RENDER_ATTACHMENT
       : 0x10;
+  const INTERMEDIATE_TEXTURE_USAGE =
+    TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_SRC;
+
+  const BLIT_FULLSCREEN_WGSL = /* wgsl */ `
+struct BlitVsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> BlitVsOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(3.0, -1.0),
+    vec2<f32>(-1.0, 3.0)
+  );
+  var uv = array<vec2<f32>, 3>(
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(2.0, 1.0),
+    vec2<f32>(0.0, -1.0)
+  );
+  var out: BlitVsOut;
+  out.pos = vec4<f32>(pos[vid], 0.0, 1.0);
+  out.uv = uv[vid];
+  return out;
+}
+
+@group(0) @binding(0) var blit_tex: texture_2d<f32>;
+@group(0) @binding(1) var blit_sampler: sampler;
+
+@fragment
+fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
+  return textureSample(blit_tex, blit_sampler, in.uv);
+}
+`.trim();
+
+  function isValidCanvasFormat(format) {
+    return typeof format === 'string' && VALID_CANVAS_FORMAT_SET.has(format);
+  }
+
+  function resolvePreferredCanvasFormat() {
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.gpu &&
+      typeof navigator.gpu.getPreferredCanvasFormat === 'function'
+    ) {
+      const preferred = navigator.gpu.getPreferredCanvasFormat();
+      if (isValidCanvasFormat(preferred)) {
+        return preferred;
+      }
+    }
+    return DEFAULT_FORMAT;
+  }
 
   function defaultNow() {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -241,6 +305,7 @@
         device,
         context,
         format,
+        streamFormat,
         depthFormat = DEFAULT_DEPTH_FORMAT,
         alphaMode = DEFAULT_ALPHA_MODE,
         maxDimension = DEFAULT_MAX_DIMENSION,
@@ -287,19 +352,40 @@
         throw new RangeError(`maxErrorHistory must be a positive integer, got ${maxErrorHistory}`);
       }
 
-      const resolvedFormat =
-        typeof format === 'string' && format.length > 0
-          ? format
-          : typeof navigator !== 'undefined' &&
-              navigator.gpu &&
-              typeof navigator.gpu.getPreferredCanvasFormat === 'function'
-            ? navigator.gpu.getPreferredCanvasFormat()
-            : DEFAULT_FORMAT;
+      const preferredCanvasFormat = resolvePreferredCanvasFormat();
+      let resolvedCanvasFormat = preferredCanvasFormat;
+      let resolvedStreamFormat = preferredCanvasFormat;
+      let initialUsesBlitFallback = false;
+
+      if (typeof format === 'string' && format.length > 0) {
+        if (isValidCanvasFormat(format)) {
+          resolvedCanvasFormat = format;
+          resolvedStreamFormat = format;
+        } else {
+          resolvedCanvasFormat = preferredCanvasFormat;
+          resolvedStreamFormat = format;
+          initialUsesBlitFallback = true;
+        }
+      }
+
+      if (typeof streamFormat === 'string' && streamFormat.length > 0) {
+        if (isValidCanvasFormat(streamFormat)) {
+          resolvedCanvasFormat = streamFormat;
+          resolvedStreamFormat = streamFormat;
+          initialUsesBlitFallback = false;
+        } else {
+          resolvedStreamFormat = streamFormat;
+          initialUsesBlitFallback = true;
+        }
+      }
 
       this._canvas = canvas;
       this._device = device;
       this._context = resolvedContext;
-      this._format = resolvedFormat;
+      this._preferredCanvasFormat = resolvedCanvasFormat;
+      this._format = resolvedCanvasFormat;
+      this._streamFormat = resolvedStreamFormat;
+      this._usesBlitFallback = initialUsesBlitFallback;
       this._depthFormat = depthFormat;
       this._alphaMode = alphaMode;
       this._maxDimension = maxDimension;
@@ -318,6 +404,17 @@
       this._depthTexture = null;
       this._depthTextureView = null;
       this._depthTextureMeta = null;
+
+      this._intermediateTexture = null;
+      this._intermediateTextureView = null;
+      this._intermediateTextureMeta = null;
+      this._blitShaderModule = null;
+      this._blitSampler = null;
+      this._blitPipeline = null;
+      this._blitPipelineMeta = null;
+      this._blitBindGroup = null;
+      this._blitBindGroupMeta = null;
+      this._blitCount = 0;
 
       this._isDeviceLost = false;
       this._lastDeviceLostInfo = null;
@@ -350,6 +447,30 @@
 
     get format() {
       return this._format;
+    }
+
+    get canvasFormat() {
+      return this._format;
+    }
+
+    get streamFormat() {
+      return this._streamFormat;
+    }
+
+    get usesBlitFallback() {
+      return this._usesBlitFallback;
+    }
+
+    get blitCount() {
+      return this._blitCount;
+    }
+
+    get intermediateTexture() {
+      return this._intermediateTexture;
+    }
+
+    get intermediateTextureView() {
+      return this._intermediateTextureView;
     }
 
     get depthFormat() {
@@ -466,6 +587,168 @@
       return texture;
     }
 
+    _invalidateBlitBindGroup() {
+      this._blitBindGroup = null;
+      this._blitBindGroupMeta = null;
+    }
+
+    _destroyIntermediateTexture() {
+      if (this._intermediateTexture) {
+        if (typeof this._intermediateTexture.destroy === 'function') {
+          this._intermediateTexture.destroy();
+        }
+        this._intermediateTexture = null;
+      }
+      this._intermediateTextureView = null;
+      this._intermediateTextureMeta = null;
+      this._invalidateBlitBindGroup();
+    }
+
+    _destroyBlitResources() {
+      this._destroyIntermediateTexture();
+      this._blitPipeline = null;
+      this._blitPipelineMeta = null;
+      this._blitShaderModule = null;
+      this._blitSampler = null;
+    }
+
+    _ensureIntermediateTexture() {
+      if (!this._usesBlitFallback) {
+        this._destroyIntermediateTexture();
+        return null;
+      }
+      if (this._width < 1 || this._height < 1 || !this._device) {
+        return null;
+      }
+
+      const meta = this._intermediateTextureMeta;
+      if (
+        this._intermediateTexture &&
+        this._intermediateTextureView &&
+        meta &&
+        meta.width === this._width &&
+        meta.height === this._height &&
+        meta.format === this._streamFormat &&
+        meta.device === this._device
+      ) {
+        return this._intermediateTexture;
+      }
+
+      // Destroy previous intermediate texture BEFORE allocating the new one to avoid VRAM leaks.
+      this._destroyIntermediateTexture();
+
+      const texture = this._device.createTexture({
+        label: 'playgta6-swapchain-intermediate',
+        size: {
+          width: this._width,
+          height: this._height,
+          depthOrArrayLayers: 1,
+        },
+        format: this._streamFormat,
+        usage: INTERMEDIATE_TEXTURE_USAGE,
+      });
+
+      this._intermediateTexture = texture;
+      this._intermediateTextureView =
+        texture && typeof texture.createView === 'function' ? texture.createView() : null;
+      this._intermediateTextureMeta = {
+        width: this._width,
+        height: this._height,
+        format: this._streamFormat,
+        device: this._device,
+      };
+      return texture;
+    }
+
+    _ensureBlitPipeline() {
+      const meta = this._blitPipelineMeta;
+      if (
+        this._blitPipeline &&
+        this._blitShaderModule &&
+        this._blitSampler &&
+        meta &&
+        meta.device === this._device &&
+        meta.canvasFormat === this._format
+      ) {
+        return this._blitPipeline;
+      }
+
+      if (!meta || meta.device !== this._device) {
+        this._blitShaderModule = this._device.createShaderModule({
+          label: 'playgta6-swapchain-blit-wgsl',
+          code: BLIT_FULLSCREEN_WGSL,
+        });
+        this._blitSampler = this._device.createSampler({
+          label: 'playgta6-swapchain-blit-sampler',
+          magFilter: 'linear',
+          minFilter: 'linear',
+          addressModeU: 'clamp-to-edge',
+          addressModeV: 'clamp-to-edge',
+        });
+      }
+
+      this._blitPipeline = this._device.createRenderPipeline({
+        label: 'playgta6-swapchain-blit-pipeline',
+        layout: 'auto',
+        vertex: {
+          module: this._blitShaderModule,
+          entryPoint: 'vs_main',
+        },
+        fragment: {
+          module: this._blitShaderModule,
+          entryPoint: 'fs_main',
+          targets: [{ format: this._format }],
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none',
+        },
+      });
+      this._blitPipelineMeta = {
+        device: this._device,
+        canvasFormat: this._format,
+      };
+      this._invalidateBlitBindGroup();
+      return this._blitPipeline;
+    }
+
+    _ensureBlitBindGroup() {
+      const meta = this._blitBindGroupMeta;
+      if (
+        this._blitBindGroup &&
+        meta &&
+        meta.texture === this._intermediateTexture &&
+        meta.view === this._intermediateTextureView &&
+        meta.pipeline === this._blitPipeline &&
+        meta.device === this._device
+      ) {
+        return this._blitBindGroup;
+      }
+
+      const layout =
+        this._blitPipeline && typeof this._blitPipeline.getBindGroupLayout === 'function'
+          ? this._blitPipeline.getBindGroupLayout(0)
+          : undefined;
+
+      const bindGroup = this._device.createBindGroup({
+        label: 'playgta6-swapchain-blit-bg',
+        layout,
+        entries: [
+          { binding: 0, resource: this._intermediateTextureView },
+          { binding: 1, resource: this._blitSampler },
+        ],
+      });
+
+      this._blitBindGroup = bindGroup;
+      this._blitBindGroupMeta = {
+        texture: this._intermediateTexture,
+        view: this._intermediateTextureView,
+        pipeline: this._blitPipeline,
+        device: this._device,
+      };
+      return bindGroup;
+    }
+
     _hookDeviceLost(device) {
       if (!device || device === this._hookedDevice) {
         return;
@@ -489,6 +772,7 @@
         this._isDeviceLost = true;
         this._lastDeviceLostInfo = info || { reason: 'unknown', message: '' };
         this._destroyDepthTexture();
+        this._destroyBlitResources();
 
         for (const callback of Array.from(this._deviceLostCallbacks)) {
           callback(this._lastDeviceLostInfo, this);
@@ -603,6 +887,107 @@
       this._context.configure(cfg);
       this._configured = true;
       this._ensureDepthTexture();
+      if (this._usesBlitFallback) {
+        this._ensureIntermediateTexture();
+      }
+    }
+
+    /**
+     * Configure swapchain rendering for a stream-declared back-buffer format.
+     *
+     * Valid WebGPU canvas formats ('bgra8unorm', 'rgba8unorm', 'rgba16float') configure the
+     * canvas context directly with zero extra textures or blit overhead.
+     *
+     * Non-canvas formats (e.g. 'rgb10a2unorm', 'rg11b10ufloat', 'rgba8unorm-srgb', 'rgba16unorm')
+     * keep the canvas context configured in its valid preferred canvas format and activate an
+     * offscreen intermediate render-target texture + fullscreen-triangle blit fallback.
+     *
+     * @param {string} streamFormat
+     * @returns {boolean} True when format/mode changed and was applied, false on no-op or invalid.
+     */
+    configureForStreamFormat(streamFormat) {
+      if (this._destroyed || this._isDeviceLost) {
+        return false;
+      }
+      if (typeof streamFormat !== 'string' || streamFormat.length === 0) {
+        return false;
+      }
+
+      if (isValidCanvasFormat(streamFormat)) {
+        const hadBlit = this._usesBlitFallback;
+        const canvasChanged = this._format !== streamFormat;
+        const viewFormatsChanged =
+          Array.isArray(this._viewFormats) && this._viewFormats.length > 0;
+        const streamChanged = this._streamFormat !== streamFormat;
+
+        if (!hadBlit && !canvasChanged && !viewFormatsChanged && !streamChanged && this._configured) {
+          return false;
+        }
+
+        if (hadBlit) {
+          this._usesBlitFallback = false;
+          this._destroyBlitResources();
+        }
+
+        this._streamFormat = streamFormat;
+        this._format = streamFormat;
+        this._viewFormats = null;
+
+        if (this._configured && this._device && this._context && (canvasChanged || viewFormatsChanged)) {
+          this._applyContextConfiguration();
+        }
+        return true;
+      }
+
+      // Non-canvas stream format: keep canvas configured in a valid canvas format and render
+      // into an offscreen intermediate texture in `streamFormat`, blitting to canvas on present.
+      const nextCanvasFormat = isValidCanvasFormat(this._format)
+        ? this._format
+        : this._preferredCanvasFormat;
+      const canvasChanged = this._format !== nextCanvasFormat;
+      const viewFormatsChanged =
+        Array.isArray(this._viewFormats) && this._viewFormats.length > 0;
+      const streamChanged = this._streamFormat !== streamFormat;
+      const needsIntermediateNow =
+        this._configured &&
+        this._width > 0 &&
+        this._height > 0 &&
+        (!this._intermediateTexture ||
+          !this._intermediateTextureMeta ||
+          this._intermediateTextureMeta.format !== streamFormat ||
+          this._intermediateTextureMeta.width !== this._width ||
+          this._intermediateTextureMeta.height !== this._height ||
+          this._intermediateTextureMeta.device !== this._device);
+
+      if (
+        this._usesBlitFallback &&
+        !streamChanged &&
+        !canvasChanged &&
+        !viewFormatsChanged &&
+        !needsIntermediateNow
+      ) {
+        return false;
+      }
+
+      this._format = nextCanvasFormat;
+      this._viewFormats = null;
+      this._streamFormat = streamFormat;
+      this._usesBlitFallback = true;
+
+      if (canvasChanged) {
+        this._blitPipeline = null;
+        this._blitPipelineMeta = null;
+        this._invalidateBlitBindGroup();
+      }
+
+      if (this._configured && this._device && this._context) {
+        if (canvasChanged || viewFormatsChanged) {
+          this._applyContextConfiguration();
+        } else {
+          this._ensureIntermediateTexture();
+        }
+      }
+      return true;
     }
 
     /**
@@ -622,13 +1007,28 @@
       }
       const nextViewFormats =
         Array.isArray(viewFormats) && viewFormats.length > 0 ? viewFormats.slice() : null;
+      if (!isValidCanvasFormat(format) && !nextViewFormats) {
+        return this.configureForStreamFormat(format);
+      }
       const prevViewKey = Array.isArray(this._viewFormats) ? this._viewFormats.join(',') : '';
       const nextViewKey = nextViewFormats ? nextViewFormats.join(',') : '';
-      if (this._format === format && prevViewKey === nextViewKey && this._configured) {
+      const hadBlit = this._usesBlitFallback;
+      if (!hadBlit && this._format === format && prevViewKey === nextViewKey && this._configured) {
         return false;
       }
+      if (hadBlit) {
+        this._usesBlitFallback = false;
+        this._destroyBlitResources();
+      }
+      const canvasChanged = this._format !== format;
       this._format = format;
+      this._streamFormat = format;
       this._viewFormats = nextViewFormats;
+      if (canvasChanged) {
+        this._blitPipeline = null;
+        this._blitPipelineMeta = null;
+        this._invalidateBlitBindGroup();
+      }
       if (this._configured && this._device && this._context) {
         this._applyContextConfiguration();
       }
@@ -663,7 +1063,49 @@
         if (typeof config.format !== 'string' || config.format.length === 0) {
           throw new TypeError('format must be a non-empty string');
         }
-        this._format = config.format;
+        if (isValidCanvasFormat(config.format)) {
+          if (this._format !== config.format) {
+            this._blitPipeline = null;
+            this._blitPipelineMeta = null;
+            this._invalidateBlitBindGroup();
+          }
+          if (this._usesBlitFallback) {
+            this._usesBlitFallback = false;
+            this._destroyBlitResources();
+          }
+          this._format = config.format;
+          this._streamFormat = config.format;
+        } else {
+          if (!isValidCanvasFormat(this._format)) {
+            this._format = this._preferredCanvasFormat;
+          }
+          this._streamFormat = config.format;
+          this._usesBlitFallback = true;
+        }
+      }
+      if (config.streamFormat !== undefined) {
+        if (typeof config.streamFormat !== 'string' || config.streamFormat.length === 0) {
+          throw new TypeError('streamFormat must be a non-empty string');
+        }
+        if (isValidCanvasFormat(config.streamFormat)) {
+          if (this._format !== config.streamFormat) {
+            this._blitPipeline = null;
+            this._blitPipelineMeta = null;
+            this._invalidateBlitBindGroup();
+          }
+          if (this._usesBlitFallback) {
+            this._usesBlitFallback = false;
+            this._destroyBlitResources();
+          }
+          this._format = config.streamFormat;
+          this._streamFormat = config.streamFormat;
+        } else {
+          if (!isValidCanvasFormat(this._format)) {
+            this._format = this._preferredCanvasFormat;
+          }
+          this._streamFormat = config.streamFormat;
+          this._usesBlitFallback = true;
+        }
       }
       if (config.depthFormat !== undefined) {
         validateDepthFormat(config.depthFormat);
@@ -740,6 +1182,109 @@
     }
 
     /**
+     * Return the active render-target color GPUTextureView for the current frame.
+     *
+     * When blit fallback is inactive (valid direct canvas format), this acquires and returns
+     * the canvas context texture view directly with zero intermediate allocation overhead.
+     * When blit fallback is active, this lazily ensures and returns the offscreen intermediate
+     * texture view in `streamFormat`.
+     *
+     * @param {GPUTextureViewDescriptor} [viewDescriptor]
+     * @returns {GPUTextureView}
+     */
+    getRenderTargetView(viewDescriptor) {
+      if (this._destroyed) {
+        throw new Error('Cannot get render target view from a destroyed WgpuSwapchain');
+      }
+      if (this._isDeviceLost) {
+        throw new Error('Cannot get render target view while GPUDevice is lost');
+      }
+      if (!this._configured) {
+        throw new Error('WgpuSwapchain must be configured before calling getRenderTargetView()');
+      }
+
+      if (this._usesBlitFallback) {
+        this._ensureIntermediateTexture();
+        return this._intermediateTextureView;
+      }
+
+      const currentTexture = this._context.getCurrentTexture();
+      return viewDescriptor !== undefined
+        ? currentTexture.createView(viewDescriptor)
+        : currentTexture.createView();
+    }
+
+    /**
+     * Record a fullscreen-triangle blit pass copying the offscreen intermediate render-target
+     * texture onto the WebGPU canvas texture view when blit fallback is active.
+     *
+     * Strict no-op (returning false) when rendering directly to a valid WebGPU canvas format.
+     *
+     * @param {GPUCommandEncoder} commandEncoder
+     * @param {GPUTextureView} [canvasTextureView] Optional pre-acquired canvas view; acquired from
+     *   `context.getCurrentTexture().createView()` when omitted.
+     * @returns {boolean} True if a blit pass was recorded, false if no-op.
+     */
+    blitToCanvasIfNeeded(commandEncoder, canvasTextureView) {
+      if (!this._usesBlitFallback) {
+        return false;
+      }
+      if (this._destroyed || this._isDeviceLost || !this._configured || !this._device) {
+        return false;
+      }
+      if (!commandEncoder || typeof commandEncoder.beginRenderPass !== 'function') {
+        throw new TypeError('blitToCanvasIfNeeded requires a GPUCommandEncoder');
+      }
+
+      this._ensureIntermediateTexture();
+      if (!this._intermediateTextureView) {
+        return false;
+      }
+
+      const targetView =
+        canvasTextureView !== undefined && canvasTextureView !== null
+          ? canvasTextureView
+          : this._context.getCurrentTexture().createView();
+
+      const pipeline = this._ensureBlitPipeline();
+      const bindGroup = this._ensureBlitBindGroup();
+
+      const pass = commandEncoder.beginRenderPass({
+        label: 'playgta6-swapchain-blit-pass',
+        colorAttachments: [
+          {
+            view: targetView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          },
+        ],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3);
+      pass.end();
+
+      this._blitCount += 1;
+      return true;
+    }
+
+    /**
+     * Finalize frame presentation on the given command encoder by recording the fullscreen
+     * intermediate-to-canvas blit pass if blit fallback is active.
+     *
+     * @param {GPUCommandEncoder} [commandEncoder]
+     * @param {GPUTextureView} [canvasTextureView]
+     * @returns {boolean} True if a blit pass was recorded.
+     */
+    present(commandEncoder, canvasTextureView) {
+      if (!commandEncoder) {
+        return false;
+      }
+      return this.blitToCanvasIfNeeded(commandEncoder, canvasTextureView);
+    }
+
+    /**
      * Acquire the current swapchain color texture view (and matching depth-stencil view when
      * enabled) packaged as a GPURenderPassDescriptor ready for encoder.beginRenderPass().
      *
@@ -781,8 +1326,7 @@
         label,
       } = options || {};
 
-      const currentTexture = this._context.getCurrentTexture();
-      const colorView = currentTexture.createView();
+      const colorView = this.getRenderTargetView();
 
       const colorAttachment = {
         view: colorView,
@@ -886,7 +1430,7 @@
     }
 
     /**
-     * Return swapchain telemetry plus WebGPU validation-error counters.
+     * Return swapchain telemetry plus WebGPU validation-error and blit-fallback counters.
      */
     getStats() {
       return {
@@ -895,6 +1439,10 @@
         validationErrorHistorySize: this._validationErrors.length,
         maxErrorHistory: this._maxErrorHistory,
         isDestroyed: this._destroyed,
+        usesBlitFallback: this._usesBlitFallback,
+        streamFormat: this._streamFormat,
+        canvasFormat: this._format,
+        blitCount: this._blitCount,
       };
     }
 
@@ -959,12 +1507,25 @@
         if (typeof newFormat !== 'string' || newFormat.length === 0) {
           throw new TypeError('newFormat must be a non-empty string when provided');
         }
-        this._format = newFormat;
+        if (isValidCanvasFormat(newFormat)) {
+          this._format = newFormat;
+          this._preferredCanvasFormat = newFormat;
+          if (!this._usesBlitFallback) {
+            this._streamFormat = newFormat;
+          }
+        } else {
+          this._streamFormat = newFormat;
+          this._usesBlitFallback = true;
+          if (!isValidCanvasFormat(this._format)) {
+            this._format = this._preferredCanvasFormat;
+          }
+        }
       }
 
       this._deviceLostGeneration += 1;
       this._unhookUncapturedError();
       this._destroyDepthTexture();
+      this._destroyBlitResources();
 
       this._device = newDevice;
       this._isDeviceLost = false;
@@ -1004,6 +1565,7 @@
       this._deviceLostGeneration += 1;
       this._unhookUncapturedError();
       this._destroyDepthTexture();
+      this._destroyBlitResources();
 
       if (this._context && typeof this._context.unconfigure === 'function') {
         this._context.unconfigure();
@@ -1022,13 +1584,19 @@
   const exportedApi = {
     DEFAULT_DEPTH_FORMAT,
     SUPPORTED_DEPTH_FORMATS,
+    VALID_CANVAS_FORMATS,
     DEFAULT_CLEAR_COLOR,
     DEFAULT_ALPHA_MODE,
     DEFAULT_MAX_DIMENSION,
     DEFAULT_FRAME_WINDOW,
     DEFAULT_MAX_ERROR_HISTORY,
     MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
+    TEXTURE_USAGE_COPY_SRC,
+    TEXTURE_USAGE_TEXTURE_BINDING,
     TEXTURE_USAGE_RENDER_ATTACHMENT,
+    INTERMEDIATE_TEXTURE_USAGE,
+    BLIT_FULLSCREEN_WGSL,
+    isValidCanvasFormat,
     WgpuSwapchain,
   };
 
