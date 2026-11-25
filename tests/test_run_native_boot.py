@@ -114,6 +114,23 @@ class StalenessTests(unittest.TestCase):
             self.assertEqual([c[1] if len(c) > 1 else c[0] for c in calls[:-1]], ["build-program"])
             self.assertNotIn("[plan] recomp", err)
 
+    def test_newer_shim_header_or_export_table_regenerates_the_program(self):
+        # The recompiler binds imports from the runtime's shim headers and export tables; a new
+        # pg6_gthunk_* registration must regenerate the program, not only rebuild the harness.
+        for rel in ("runtime/os/xbox_scarlett_guest.h", "runtime/os/xbox_scarlett_guest.cpp",
+                    "runtime/guest/guest_callbacks.h"):
+            with self.subTest(rel), tempfile.TemporaryDirectory() as d:
+                fx = Fixture(Path(d))
+                touch(fx.repo / rel, fx.base + 700)
+                _, _, err, calls = fx.run("--name", "r1")
+                self.assertEqual([c[1] if len(c) > 1 else c[0] for c in calls[:-1]], ["build-program"])
+                self.assertIn("[plan] program: the runtime shim headers or export tables", err)
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            touch(fx.repo / "runtime" / "guest" / "boot.cpp", fx.base + 700)  # not scanned
+            _, _, err, calls = fx.run("--name", "r1")
+            self.assertEqual(len(calls), 1)
+
     def test_plan_for_harness_and_flags(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
