@@ -64,6 +64,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <tuple>
 #include <string>
 #include <unordered_map>
@@ -840,8 +841,9 @@ public:
                                     uint32_t depth, uint32_t mip_levels, uint32_t d3d12_layout,
                                     GpuTextureDimension dim, bool uav);
     // Designates a texture as the presented back buffer: render passes that target it write the
-    // canvas texture (kGpuSwapchainTextureId). PresentX calls it for plane 0's resource the first
-    // time that resource is presented (d3d12_xs_xbox.h). False if `resource` is not a 2D texture.
+    // canvas texture (kGpuSwapchainTextureId). For hosts that own the swapchain; PresentX does not
+    // call it (it draws the presented texture into the canvas instead, Device::present). False if
+    // `resource` is not a 2D texture.
     bool set_back_buffer(uint64_t resource_interface_pointer);
     // GPU address windows aliasing CPU memory (the executable reserves a CPU window and a GPU window
     // of equal size and maps the same pages into both; d3d12_xs_xbox.h). A buffer created at a GPU
@@ -890,8 +892,14 @@ public:
     void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
     // Several byte ranges as one submission (no other submission in between).
     void submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts);
-    // Present packet (and BeginFrame before the next frame's first submission).
-    void present();
+    // Present packet (and BeginFrame before the next frame's first submission). `plane_textures`
+    // (PresentX planes, plane 0 on top; 0 = no texture) are first drawn into the canvas texture
+    // (kGpuSwapchainTextureId) by one pass, each scaled to the full canvas: the last drawable plane
+    // opaque, the ones above it blended as premultiplied alpha. So every presented back buffer
+    // reaches the screen whenever its render-target views were created. Planes that cannot be
+    // sampled with filtering, or that already are the canvas (set_back_buffer), are skipped.
+    // Returns the number of planes drawn.
+    uint32_t present(std::span<const uint32_t> plane_textures = {});
     void set_sink(PacketSink sink);
 
     DeviceStats stats() const;
@@ -916,6 +924,14 @@ private:
     bool frame_open_ = false;
     uint64_t presents_ = 0;
     uint64_t submissions_ = 0;
+    // Present composition objects (under submit_mutex_), created on first use: shader modules,
+    // layouts, sampler, one pipeline per (canvas format, blended), one bind group per texture.
+    uint32_t emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc);
+    struct PresentBlit {
+        uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
+        std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
+        std::unordered_map<uint32_t, uint32_t> groups;     // presented texture id -> bind group
+    } present_blit_;
 
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;
