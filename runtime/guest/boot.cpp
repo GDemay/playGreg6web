@@ -161,6 +161,7 @@ struct RecentImport {
     size_t import_index = 0;
     uint64_t args[5] = {};  // rcx rdx r8 r9 [rsp+0x28] at the call
     uint32_t thread = 0;    // guest thread id (TEB ClientId)
+    uint64_t return_address = 0;  // guest return address of the call
 };
 
 // First call of an API worth a timeline entry (see kTimelineApis).
@@ -1009,6 +1010,7 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                 read_u64(*b.arena, state->gpr[GuestReg::Rsp] + 0x28, entry.args[4]);
             }
             entry.thread = t_active != nullptr ? t_active->thread_id : 0;
+            entry.return_address = t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address;
             const BootImport& imp = b.imports[static_cast<size_t>(index)].import;
             std::string strings;
             if (b.trace_limit != 0) {
@@ -2389,7 +2391,30 @@ std::string guest_thread_last_import(uint32_t thread_id) {
     std::lock_guard<std::mutex> lock(b.mutex);
     for (const auto& [thread, entry] : b.thread_last) {
         if (thread->thread_id == thread_id) {
-            return import_label(b.imports[entry.import_index].import);
+            const BootImport& imp = b.imports[entry.import_index].import;
+            std::string label = import_label(imp);
+            // Waits and sleeps: the guest caller and the handle / time argument, so a profile
+            // says which wait a blocked thread is in (--profile).
+            const std::string symbol = import_symbol(imp);
+            const bool sleep = symbol == "Sleep" || symbol == "SleepEx";
+            const bool wait_one = symbol == "WaitForSingleObject" || symbol == "WaitForSingleObjectEx";
+            const bool wait_many = symbol == "WaitForMultipleObjects" || symbol == "WaitForMultipleObjectsEx";
+            if (sleep || wait_one || wait_many) {
+                char text[96];
+                if (sleep) {
+                    std::snprintf(text, sizeof(text), " ms=%" PRIu64, entry.args[0] & 0xFFFFFFFFu);
+                } else if (wait_one) {
+                    std::snprintf(text, sizeof(text), " h=0x%" PRIx64 " ms=%" PRId32, entry.args[0],
+                                  static_cast<int32_t>(entry.args[1]));
+                } else {
+                    std::snprintf(text, sizeof(text), " n=%" PRIu64 " ms=%" PRId32, entry.args[0] & 0xFFFFFFFFu,
+                                  static_cast<int32_t>(entry.args[3]));
+                }
+                label += text;
+                std::snprintf(text, sizeof(text), " ret 0x%" PRIx64, entry.return_address);
+                label += text;
+            }
+            return label;
         }
     }
     return {};

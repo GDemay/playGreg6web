@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "os/host_sleep.h"
 #include "os/os_shim.h"
 #include "os/win32_compat.h"
 #include "os/win32_compat_internal.h"
@@ -523,7 +524,9 @@ void pg6_win32_sleep(uint32_t milliseconds) {
             std::this_thread::sleep_for(std::chrono::hours(1));
         }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+    // Precise (os/host_sleep.h): titles poll with Sleep(1), which the host timer tick stretched to
+    // ~16 ms per poll.
+    playgta6::os::host_sleep::sleep_for(std::chrono::milliseconds(milliseconds));
 }
 
 int32_t pg6_win32_initialize_critical_section_and_spin_count(Pg6CriticalSection* critical_section,
