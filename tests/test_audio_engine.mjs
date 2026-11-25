@@ -11,6 +11,9 @@ import {
   PROCESSOR_NAME,
   DEFAULT_MAX_RESUME_RETRIES,
   DEFAULT_GESTURE_EVENTS,
+  DEFAULT_GAIN_RAMP_MS,
+  MAX_GAIN_RAMP_MS,
+  DEFAULT_UNLOCK_FADE_IN_MS,
   MAX_ERROR_MESSAGE_LENGTH,
   clampVolume,
   clampGain,
@@ -1612,4 +1615,599 @@ test('W214: reset() and close() clean up ring state, telemetry counters, gesture
   // Second close() is an idempotent no-op.
   await engine.close();
   assert.equal(events.contexts[0].closeCalls, 1);
+});
+
+function createGainNodeMockWebAudioEnv(options = {}) {
+  const base = createMockWebAudioEnv(options);
+  const gainNodes = [];
+
+  class MockGainNode {
+    constructor(ctx) {
+      this.context = ctx;
+      this.connectedTo = null;
+      this.disconnected = false;
+      this.ops = [];
+      const self = this;
+      this.gain = {
+        value: 1.0,
+        cancelScheduledValues(time) {
+          self.ops.push({ op: 'cancel', time });
+        },
+        setValueAtTime(value, time) {
+          this.value = value;
+          self.ops.push({ op: 'set', value, time });
+        },
+        linearRampToValueAtTime(value, endTime) {
+          this.value = value;
+          self.ops.push({ op: 'linearRamp', value, endTime });
+        },
+      };
+      gainNodes.push(this);
+    }
+
+    connect(dest) {
+      this.connectedTo = dest;
+      return dest;
+    }
+
+    disconnect() {
+      this.disconnected = true;
+      this.connectedTo = null;
+    }
+  }
+
+  class GainCapableAudioContext extends base.MockAudioContext {
+    constructor(ctxOpts = {}) {
+      super(ctxOpts);
+      this.currentTime = options.initialCurrentTime ?? 1.5;
+    }
+
+    createGain() {
+      return new MockGainNode(this);
+    }
+  }
+
+  return {
+    MockAudioContext: GainCapableAudioContext,
+    MockAudioWorkletNode: base.MockAudioWorkletNode,
+    events: { ...base.events, gainNodes },
+  };
+}
+
+test('W238: attachGuestPcmRing / detachGuestPcmRing track state locally and forward cleanly to worker and bridge', async () => {
+  // 1. Worker-style postMessage forwarding with #1027 Playgta6AudioRing layout.
+  const workerMessages = [];
+  const mockWorker = {
+    postMessage(msg) {
+      workerMessages.push(msg);
+    },
+  };
+
+  const guestMem = new SharedArrayBuffer(131072 * 4 + 64);
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    channels: 2,
+    audioWorker: mockWorker,
+  });
+
+  assert.equal(engine.guestRingAttached, false);
+  assert.equal(engine.guestPcmRing, null);
+  assert.equal(engine.getStats().guestRingAttached, false);
+
+  const attachRes = engine.attachGuestPcmRing({
+    buffer: guestMem,
+    base: 64,
+    capacity: 131072,
+    channels: 2,
+    sample_rate: 48000,
+    read_index_ptr: 0,
+    write_index_ptr: 4,
+  });
+
+  assert.equal(attachRes.ok, true);
+  assert.equal(attachRes.attached, true);
+  assert.equal(attachRes.forwarded, true);
+  assert.equal(attachRes.reason, null);
+  assert.equal(attachRes.ring.base, 64);
+  assert.equal(attachRes.ring.capacity, 131072);
+  assert.equal(attachRes.ring.capacityFrames, 65536);
+  assert.equal(attachRes.ring.channels, 2);
+  assert.equal(attachRes.ring.sampleRate, 48000);
+  assert.equal(attachRes.ring.readIndexPtr, 0);
+  assert.equal(attachRes.ring.writeIndexPtr, 4);
+
+  assert.equal(engine.guestRingAttached, true);
+  assert.equal(engine.getStats().guestRingAttached, true);
+  assert.equal(workerMessages.length, 1);
+  assert.equal(workerMessages[0].type, 'attachGuestPcmRing');
+  assert.equal(workerMessages[0].attachGuestPcmRing, true);
+  assert.equal(workerMessages[0].ring.buffer, guestMem);
+  assert.equal(workerMessages[0].ring.capacity, 131072);
+
+  // Defensive clone on getter: mutating returned ring cannot mutate internal state.
+  const ringSnap = engine.guestPcmRing;
+  ringSnap.capacity = -999;
+  assert.equal(engine.guestPcmRing.capacity, 131072);
+
+  // Detach forwards cleanly and is idempotent.
+  const detachRes = engine.detachGuestPcmRing();
+  assert.equal(detachRes.ok, true);
+  assert.equal(detachRes.attached, false);
+  assert.equal(detachRes.wasAttached, true);
+  assert.equal(detachRes.forwarded, true);
+  assert.equal(engine.guestRingAttached, false);
+  assert.equal(engine.guestPcmRing, null);
+  assert.equal(engine.getStats().guestRingAttached, false);
+  assert.equal(workerMessages.length, 2);
+  assert.equal(workerMessages[1].type, 'detachGuestPcmRing');
+  assert.equal(workerMessages[1].detachGuestPcmRing, true);
+
+  const detachAgain = engine.detachGuestPcmRing();
+  assert.equal(detachAgain.ok, true);
+  assert.equal(detachAgain.wasAttached, false);
+
+  // 2. Direct bridge method forwarding + Float32Array samples / Uint32Array index views.
+  const bridgeCalls = [];
+  const bridge = {
+    attachGuestPcmRing(desc) {
+      bridgeCalls.push({ method: 'attach', desc });
+    },
+    detachGuestPcmRing() {
+      bridgeCalls.push({ method: 'detach' });
+    },
+  };
+  engine.setAudioWorker(bridge);
+
+  const sampleView = new Float32Array(new SharedArrayBuffer(2048 * 4));
+  const readIdx = new Uint32Array(new SharedArrayBuffer(4));
+  const writeIdx = new Uint32Array(new SharedArrayBuffer(4));
+  const bridgeAttach = engine.attachGuestPcmRing({
+    samples: sampleView,
+    readIndex: readIdx,
+    writeIndex: writeIdx,
+    channels: 2,
+    sampleRate: 48000,
+  });
+  assert.equal(bridgeAttach.ok, true);
+  assert.equal(bridgeAttach.forwarded, true);
+  assert.equal(bridgeAttach.ring.capacity, 2048);
+  assert.equal(bridgeAttach.ring.capacityFrames, 1024);
+  assert.equal(bridgeCalls.length, 1);
+  assert.equal(bridgeCalls[0].method, 'attach');
+  assert.equal(bridgeCalls[0].desc.samples, sampleView);
+
+  // destroy() automatically detaches active guest ring on the bridge.
+  await engine.destroy();
+  assert.equal(engine.guestRingAttached, false);
+  assert.equal(bridgeCalls.length, 2);
+  assert.equal(bridgeCalls[1].method, 'detach');
+
+  // Post-destroy attach is rejected cleanly without throwing.
+  const postDestroyAttach = engine.attachGuestPcmRing({
+    samples: sampleView,
+    capacity: 2048,
+  });
+  assert.equal(postDestroyAttach.ok, false);
+  assert.equal(postDestroyAttach.reason, 'closed');
+
+  // 3. Invalid descriptors & no-worker standalone mode never throw.
+  const errors = [];
+  const standalone = new AudioEngine({ onError: (e) => errors.push(e) });
+  assert.equal(standalone.attachGuestPcmRing(null).reason, 'invalid-descriptor');
+  assert.equal(standalone.attachGuestPcmRing({}).reason, 'missing-buffer');
+  assert.equal(
+    standalone.attachGuestPcmRing({ base: 0, capacity: -10 }).reason,
+    'invalid-capacity'
+  );
+  assert.equal(
+    standalone.attachGuestPcmRing({ base: 0, capacity: Number.NaN }).reason,
+    'invalid-capacity'
+  );
+  assert.equal(
+    standalone.attachGuestPcmRing({ base: 0, capacity: 1024, channels: 0 }).reason,
+    'invalid-channels'
+  );
+  assert.equal(
+    standalone.attachGuestPcmRing({ base: 0, capacity: 1024, sampleRate: -48000 }).reason,
+    'invalid-sample-rate'
+  );
+  assert.equal(
+    standalone.attachGuestPcmRing({ base: 0, capacity: 1024, read_index_ptr: -4 }).reason,
+    'invalid-index-ptr'
+  );
+  assert.equal(standalone.guestRingAttached, false);
+
+  // Valid attach without worker tracks state locally with forwarded: false.
+  const localOnly = standalone.attachGuestPcmRing({
+    memory: { buffer: guestMem },
+    base: 16,
+    capacityFrames: 4096,
+    channels: 2,
+    sampleRate: 48000,
+  });
+  assert.equal(localOnly.ok, true);
+  assert.equal(localOnly.attached, true);
+  assert.equal(localOnly.forwarded, false);
+  assert.equal(localOnly.ring.capacity, 8192);
+  assert.equal(localOnly.ring.capacityFrames, 4096);
+
+  // Throwing worker forwards error to onError without throwing out of attachGuestPcmRing.
+  standalone.setAudioWorker({
+    postMessage() {
+      throw new Error('worker terminated');
+    },
+  });
+  const throwingWorkerRes = standalone.attachGuestPcmRing({
+    base: 0,
+    capacity: 1024,
+  });
+  assert.equal(throwingWorkerRes.ok, true);
+  assert.equal(throwingWorkerRes.forwarded, false);
+  assert.equal(errors.length, 1);
+  await standalone.destroy();
+});
+
+test('W238: setMasterGain and setMuted schedule smooth WebAudio GainNode ramps and fallback worklet messages', async () => {
+  // 1. GainNode-capable AudioContext: worklet stays unity gain (no double attenuation),
+  //    master GainNode performs smooth linear ramps and forwards to audioWorker.
+  const workerMsgs = [];
+  const env = createGainNodeMockWebAudioEnv({
+    initialState: 'running',
+    initialCurrentTime: 2.0,
+  });
+
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    masterGain: 0.7,
+    muted: false,
+    audioWorker: { postMessage: (m) => workerMsgs.push(m) },
+    AudioContextCtor: env.MockAudioContext,
+    AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+  });
+
+  const startRes = await engine.start();
+  assert.equal(startRes.ok, true);
+  assert.equal(env.events.gainNodes.length, 1);
+  const gainNode = env.events.gainNodes[0];
+  assert.equal(env.events.nodes[0].connectedTo, gainNode);
+  assert.equal(gainNode.connectedTo, env.events.contexts[0].destination);
+  // Worklet runs at unity gain because masterGainNode owns gain/mute scaling.
+  assert.equal(env.events.nodes[0].options.processorOptions.gain, 1.0);
+  assert.equal(env.events.nodes[0].options.processorOptions.muted, false);
+  assert.equal(gainNode.gain.value, 0.7);
+
+  // Smooth master gain ramp over 20 ms -> linearRampToValueAtTime(0.4, 2.02).
+  assert.equal(engine.setMasterGain(0.4, 20), 0.4);
+  assert.equal(engine.masterGain, 0.4);
+  assert.equal(engine.getStats().masterGain, 0.4);
+  assert.equal(engine.getStats().effectiveGain, 0.4);
+  const lastOps = gainNode.ops.slice(-3);
+  assert.equal(lastOps[0].op, 'cancel');
+  assert.equal(lastOps[0].time, 2.0);
+  assert.equal(lastOps[1].op, 'set');
+  assert.equal(lastOps[1].value, 0.7);
+  assert.equal(lastOps[2].op, 'linearRamp');
+  assert.equal(lastOps[2].value, 0.4);
+  assert.ok(Math.abs(lastOps[2].endTime - 2.02) < 1e-9);
+
+  // Immediate master gain change (rampMs = 0) uses setValueAtTime without linear ramp.
+  env.events.contexts[0].currentTime = 3.0;
+  assert.equal(engine.setMasterGain(0.9, 0), 0.9);
+  assert.deepEqual(gainNode.ops.slice(-2), [
+    { op: 'cancel', time: 3.0 },
+    { op: 'set', value: 0.9, time: 3.0 },
+  ]);
+
+  // Smooth mute ramp over 25 ms -> linear ramp down to 0.0.
+  env.events.contexts[0].currentTime = 4.0;
+  assert.equal(engine.setMuted(true, 25), true);
+  assert.equal(engine.getStats().muted, true);
+  assert.equal(engine.getStats().effectiveGain, 0.0);
+  const muteOps = gainNode.ops.slice(-3);
+  assert.equal(muteOps[0].op, 'cancel');
+  assert.equal(muteOps[1].op, 'set');
+  assert.equal(muteOps[1].value, 0.9);
+  assert.equal(muteOps[2].op, 'linearRamp');
+  assert.equal(muteOps[2].value, 0.0);
+  assert.ok(Math.abs(muteOps[2].endTime - 4.025) < 1e-9);
+
+  // Smooth unmute ramp over 30 ms -> linear ramp back up to 0.9.
+  env.events.contexts[0].currentTime = 5.0;
+  assert.equal(engine.setMuted(false, 30), false);
+  const unmuteOps = gainNode.ops.slice(-3);
+  assert.equal(unmuteOps[1].value, 0.0);
+  assert.equal(unmuteOps[2].op, 'linearRamp');
+  assert.equal(unmuteOps[2].value, 0.9);
+  assert.ok(Math.abs(unmuteOps[2].endTime - 5.03) < 1e-9);
+
+  // Invalid gain inputs are rejected without mutating masterGain; extreme rampMs is clamped.
+  const opsBeforeInvalid = gainNode.ops.length;
+  assert.equal(engine.setMasterGain(Number.NaN, 10), 0.9);
+  assert.equal(engine.setMasterGain(Number.POSITIVE_INFINITY, 10), 0.9);
+  assert.equal(engine.setMasterGain('0.5', 10), 0.9);
+  assert.equal(gainNode.ops.length, opsBeforeInvalid);
+  assert.equal(engine.getStats().invalidGainInputs, 3);
+
+  env.events.contexts[0].currentTime = 6.0;
+  assert.equal(engine.setMasterGain(2.5, MAX_GAIN_RAMP_MS + 9999), 1.0);
+  assert.equal(gainNode.ops[gainNode.ops.length - 1].value, 1.0);
+  assert.ok(
+    Math.abs(gainNode.ops[gainNode.ops.length - 1].endTime - (6.0 + MAX_GAIN_RAMP_MS / 1000)) < 1e-9
+  );
+  assert.equal(workerMsgs.some((m) => m.type === 'setMasterGain' && m.rampMs === 20), true);
+  assert.equal(workerMsgs.some((m) => m.type === 'setMuted' && m.muted === true && m.rampMs === 25), true);
+
+  await engine.destroy();
+  assert.equal(gainNode.disconnected, true);
+
+  // 2. Worklet-only fallback (no createGain): forwards rampMs / rampFrames metadata cleanly.
+  const fallbackEnv = createMockWebAudioEnv({ initialState: 'running' });
+  const fallbackEngine = new AudioEngine({
+    sampleRate: 48000,
+    AudioContextCtor: fallbackEnv.MockAudioContext,
+    AudioWorkletNodeCtor: fallbackEnv.MockAudioWorkletNode,
+  });
+  await fallbackEngine.start();
+
+  fallbackEngine.setMasterGain(0.5, 20);
+  fallbackEngine.setMasterGain(0.8, 0);
+  fallbackEngine.setMuted(true, 10);
+  fallbackEngine.setMuted(false, 0);
+  fallbackEngine.setMuted(true); // legacy 1-arg call keeps exact payload
+
+  assert.deepEqual(fallbackEnv.events.nodes[0].postedMessages, [
+    { type: 'setGain', gain: 0.5, rampMs: 20, rampFrames: 960 },
+    { type: 'setGain', gain: 0.8, rampMs: 0, immediate: true },
+    { type: 'setMuted', muted: true, rampMs: 10, rampFrames: 480 },
+    { type: 'setMuted', muted: false, rampMs: 0, immediate: true },
+    { type: 'setMuted', muted: true },
+  ]);
+  await fallbackEngine.destroy();
+});
+
+test('W238: unlockOnGesture resumes suspended AudioContext with click-free auto-fade-in and guards edge cases', async () => {
+  // 1. GainNode-capable suspended AudioContext starts silent (0.0) and smoothly fades in on unlockOnGesture().
+  const workerMsgs = [];
+  const env = createGainNodeMockWebAudioEnv({
+    initialState: 'suspended',
+    initialCurrentTime: 10.0,
+  });
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    volume: 0.8,
+    unlockFadeInMs: 40,
+    audioWorker: { postMessage: (m) => workerMsgs.push(m) },
+    AudioContextCtor: env.MockAudioContext,
+    AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+  });
+
+  // Calling unlockOnGesture() before start() fails gracefully without throwing.
+  const preStart = await engine.unlockOnGesture();
+  assert.equal(preStart.ok, false);
+  assert.equal(preStart.unlocked, false);
+  assert.equal(preStart.reason, 'not-started');
+  assert.equal(engine.getStats().unlockedOnGesture, false);
+
+  await engine.start();
+  const gainNode = env.events.gainNodes[0];
+  // Suspended context holds master gain at 0.0 to eliminate startup pop.
+  assert.equal(gainNode.gain.value, 0.0);
+
+  // Arm gesture listeners; unlockOnGesture() should also clean them up upon unlocking.
+  const target = createMockEventTarget();
+  engine.resumeOnUserGesture(target);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  const unlockRes = await engine.unlockOnGesture();
+  assert.equal(unlockRes.ok, true);
+  assert.equal(unlockRes.unlocked, true);
+  assert.equal(unlockRes.alreadyRunning, false);
+  assert.equal(unlockRes.state, 'running');
+  assert.equal(unlockRes.fadeInMs, 40);
+  assert.equal(unlockRes.effectiveGain, 0.8);
+  assert.equal(engine.unlockedOnGesture, true);
+  assert.equal(engine.getStats().unlockedOnGesture, true);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  // Verify fade-in ramp from 0.0 -> 0.8 over 40 ms (0.04 s).
+  const rampOps = gainNode.ops.slice(-3);
+  assert.equal(rampOps[0].op, 'cancel');
+  assert.equal(rampOps[1].op, 'set');
+  assert.equal(rampOps[1].value, 0.0);
+  assert.equal(rampOps[2].op, 'linearRamp');
+  assert.equal(rampOps[2].value, 0.8);
+  assert.ok(Math.abs(rampOps[2].endTime - 10.04) < 1e-9);
+  assert.equal(
+    workerMsgs.some((m) => m.type === 'audio-context-state' && m.unlockedOnGesture === true),
+    true
+  );
+
+  // Calling unlockOnGesture() when already running does not cause an audio dip.
+  const opsCount = gainNode.ops.length;
+  const repeatUnlock = await engine.unlockOnGesture({ rampMs: 50 });
+  assert.equal(repeatUnlock.ok, true);
+  assert.equal(repeatUnlock.alreadyRunning, true);
+  assert.equal(repeatUnlock.fadeInMs, 0);
+  assert.equal(gainNode.ops.length, opsCount);
+
+  await engine.destroy();
+  const closedUnlock = await engine.unlockOnGesture();
+  assert.equal(closedUnlock.ok, false);
+  assert.equal(closedUnlock.reason, 'closed');
+
+  // 2. Worklet-only fallback (no createGain): anchors worklet gain to 0 then ramps to target.
+  const fallbackEnv = createMockWebAudioEnv({ initialState: 'suspended' });
+  const fallbackEngine = new AudioEngine({
+    sampleRate: 48000,
+    volume: 0.6,
+    AudioContextCtor: fallbackEnv.MockAudioContext,
+    AudioWorkletNodeCtor: fallbackEnv.MockAudioWorkletNode,
+  });
+  await fallbackEngine.start();
+  const fbRes = await fallbackEngine.unlockOnGesture(DEFAULT_UNLOCK_FADE_IN_MS);
+  assert.equal(fbRes.ok, true);
+  assert.equal(fbRes.unlocked, true);
+  assert.equal(fallbackEngine.getStats().unlockedOnGesture, true);
+  assert.deepEqual(fallbackEnv.events.nodes[0].postedMessages, [
+    { type: 'setGain', gain: 0.0, immediate: true },
+    {
+      type: 'setGain',
+      gain: 0.6,
+      rampMs: DEFAULT_UNLOCK_FADE_IN_MS,
+      rampFrames: Math.round((DEFAULT_UNLOCK_FADE_IN_MS / 1000) * 48000),
+    },
+  ]);
+  await fallbackEngine.destroy();
+
+  // 3. Muted engine stays silent (effectiveGain === 0) after unlockOnGesture().
+  const mutedEnv = createGainNodeMockWebAudioEnv({
+    initialState: 'suspended',
+    initialCurrentTime: 1.0,
+  });
+  const mutedEngine = new AudioEngine({
+    volume: 0.75,
+    muted: true,
+    AudioContextCtor: mutedEnv.MockAudioContext,
+    AudioWorkletNodeCtor: mutedEnv.MockAudioWorkletNode,
+  });
+  await mutedEngine.start();
+  const mutedRes = await mutedEngine.unlockOnGesture({ rampMs: 20 });
+  assert.equal(mutedRes.ok, true);
+  assert.equal(mutedRes.effectiveGain, 0.0);
+  assert.equal(mutedEngine.getStats().muted, true);
+  assert.equal(mutedEngine.getStats().unlockedOnGesture, true);
+  assert.equal(mutedEnv.events.gainNodes[0].gain.value, 0.0);
+  await mutedEngine.destroy();
+
+  // 4. Autoplay failure leaves unlockedOnGesture === false without throwing.
+  const blockedEnv = createMockWebAudioEnv({
+    initialState: 'suspended',
+    resumeError: new Error('NotAllowedError: gesture required'),
+  });
+  const blockedEngine = new AudioEngine({
+    AudioContextCtor: blockedEnv.MockAudioContext,
+    AudioWorkletNodeCtor: blockedEnv.MockAudioWorkletNode,
+  });
+  await blockedEngine.start();
+  const blockedRes = await blockedEngine.unlockOnGesture();
+  assert.equal(blockedRes.ok, false);
+  assert.equal(blockedRes.unlocked, false);
+  assert.equal(blockedRes.reason, 'resume-failed');
+  assert.equal(blockedEngine.getStats().unlockedOnGesture, false);
+  await blockedEngine.destroy();
+});
+
+test('W238: updateGuestAudioTelemetry sanitizes guest PCM metrics and surfaces them via getStats()', async () => {
+  assert.equal(DEFAULT_GAIN_RAMP_MS, 15);
+  assert.equal(DEFAULT_UNLOCK_FADE_IN_MS, 25);
+
+  const engine = new AudioEngine({
+    masterGain: 0.65,
+    muted: false,
+  });
+
+  // Initial sanitized defaults in getStats().
+  let stats = engine.getStats();
+  assert.equal(stats.guestRingAttached, false);
+  assert.equal(stats.guestFramesDrained, 0);
+  assert.equal(stats.guestUnderruns, 0);
+  assert.equal(stats.guestOverruns, 0);
+  assert.equal(stats.guestPeakLevel, 0);
+  assert.equal(stats.unlockedOnGesture, false);
+  assert.equal(stats.muted, false);
+  assert.equal(stats.masterGain, 0.65);
+
+  // Valid update + nested audio-stats shape + guestOverflows alias.
+  const updated = engine.updateGuestAudioTelemetry({
+    guestRingAttached: true,
+    guestFramesDrained: 9600.9,
+    guestUnderruns: 3,
+    guestOverruns: 1,
+    guestPeakLevel: 0.84,
+  });
+  assert.deepEqual(updated, {
+    guestRingAttached: true,
+    guestFramesDrained: 9600,
+    guestUnderruns: 3,
+    guestOverruns: 1,
+    guestPeakLevel: 0.84,
+    unlockedOnGesture: false,
+    muted: false,
+    masterGain: 0.65,
+  });
+
+  stats = engine.getStats();
+  assert.equal(stats.guestRingAttached, true);
+  assert.equal(stats.guestFramesDrained, 9600);
+  assert.equal(stats.guestUnderruns, 3);
+  assert.equal(stats.guestOverruns, 1);
+  assert.equal(stats.guestPeakLevel, 0.84);
+
+  // Nested `{ stats: { ... } }` envelope and peak clamping to [0, 1].
+  engine.updateGuestAudioTelemetry({
+    type: 'audio-stats',
+    stats: {
+      guestFramesDrained: 14400,
+      guestOverflows: 4,
+      guestPeakLevel: 1.75,
+    },
+  });
+  stats = engine.getStats();
+  assert.equal(stats.guestFramesDrained, 14400);
+  assert.equal(stats.guestOverruns, 4);
+  assert.equal(stats.guestPeakLevel, 1.0);
+
+  // Non-finite, negative, invalid, and hostile throwing getters never corrupt telemetry.
+  engine.updateGuestAudioTelemetry(null);
+  engine.updateGuestAudioTelemetry({
+    guestRingAttached: 'yes',
+    guestFramesDrained: Number.NaN,
+    guestUnderruns: -5,
+    guestOverruns: Number.POSITIVE_INFINITY,
+    guestPeakLevel: Number.NEGATIVE_INFINITY,
+  });
+  engine.updateGuestAudioTelemetry({
+    get guestFramesDrained() {
+      throw new Error('hostile getter');
+    },
+    get guestPeakLevel() {
+      throw new Error('hostile getter');
+    },
+  });
+
+  stats = engine.getStats();
+  assert.equal(stats.guestRingAttached, true);
+  assert.equal(stats.guestFramesDrained, 14400);
+  assert.equal(stats.guestUnderruns, 3);
+  assert.equal(stats.guestOverruns, 4);
+  assert.equal(stats.guestPeakLevel, 1.0);
+
+  // Negative peak level clamps cleanly to 0.0.
+  engine.updateGuestAudioTelemetry({ guestPeakLevel: -0.25 });
+  assert.equal(engine.getStats().guestPeakLevel, 0.0);
+
+  // Mutating getStats() snapshot cannot mutate internal telemetry.
+  stats.guestFramesDrained = -999;
+  stats.guestPeakLevel = Number.NaN;
+  stats.guestRingAttached = false;
+  assert.equal(engine.getStats().guestFramesDrained, 14400);
+  assert.equal(engine.getStats().guestPeakLevel, 0.0);
+  assert.equal(engine.getStats().guestRingAttached, true);
+
+  // reset({ preserveStats: true }) preserves guest counters; full reset() clears them.
+  engine.reset({ preserveStats: true });
+  assert.equal(engine.getStats().guestFramesDrained, 14400);
+  assert.equal(engine.getStats().guestRingAttached, true);
+
+  engine.reset();
+  assert.equal(engine.getStats().guestFramesDrained, 0);
+  assert.equal(engine.getStats().guestUnderruns, 0);
+  assert.equal(engine.getStats().guestOverruns, 0);
+  assert.equal(engine.getStats().guestPeakLevel, 0);
+  assert.equal(engine.getStats().guestRingAttached, true);
+
+  engine.reset({ detachGuestRing: true });
+  assert.equal(engine.getStats().guestRingAttached, false);
+
+  await engine.destroy();
 });
