@@ -131,6 +131,46 @@ void test_user_data_rule() {
     CHECK(root_parameter_for_user_sgpr(rs, true, 4) == 0);
     CHECK(root_parameter_for_user_sgpr(rs, true, 5) == 1);
     CHECK(root_parameter_for_user_sgpr(rs, true, 7) == 2);
+    // Containing lookup: s10 is dword 1 of the constants (parameter 1); s12 is the high half of the root CBV.
+    uint32_t dw = 99;
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 10, &dw) == 1 && dw == 1);
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 12, &dw) == 2 && dw == 1);
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 13, &dw) == -1);
+}
+
+void test_contained_sgpr_and_bitcast_vertex() {
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    StageReflection fs;
+    ReflectedBinding b;
+    b.group = 0;
+    b.binding = 0;
+    b.kind = ReflectedBindingKind::Uniform;
+    b.source = ReflectedSource::RootConstants;
+    b.user_sgpr = 10;  // second dword of the 2-constant parameter
+    fs.bindings = {b};
+    ReflectedStageRef ref;
+    ref.reflection = &fs;
+    bridge::PipelineLayoutDesc out;
+    std::string report;
+    CHECK(join_pipeline_layout(rs, false, {ref}, &out, &report, nullptr, JoinOptions{}));
+    // A table read through the middle of a root CBV is refused with a precise reason.
+    fs.bindings[0].source = ReflectedSource::Table;
+    fs.bindings[0].user_sgpr = 12;
+    fs.bindings[0].table_byte_offset = 1056;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {ref}, &out, &report, nullptr, JoinOptions{}));
+    CHECK(report.find("dword 1 of root parameter 2") != std::string::npos);
+
+    // f32 attribute over a u32 stage input: reinterpreted, not refused.
+    std::vector<pso::D3D12InputElementDesc> e(1);
+    e[0].SemanticName = "POSITION";
+    e[0].Format = pso::DxgiFormat::R32G32_FLOAT;
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 0, 2, ReflectedComponentType::U32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    report.clear();
+    CHECK(join_vertex_inputs(vs, e.data(), 1, &fetches, &report));
+    CHECK(fetches.size() == 1 && fetches[0].format == pso::WgpuVertexFormat::Uint32x2);
 }
 
 std::vector<pso::D3D12InputElementDesc> ui_input_layout() {
@@ -332,7 +372,7 @@ void test_layout_join() {
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad}}, &untouched, &report, &failed_stats));
     CHECK(untouched.groups.empty());
     CHECK(failed_stats.table_slots_outside_rs == 0);  // counted only when the join succeeds
-    CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: no root parameter starts at s12") != std::string::npos);
+    CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: s12 is dword 1 of root parameter 2") != std::string::npos);
     // A slot declared as another class joins the slot itself (no failure).
     CHECK(report.find("@binding(2)") == std::string::npos);
     CHECK(report.find("byte offset 16") != std::string::npos);
@@ -890,6 +930,7 @@ void test_root_descriptor_over_table() {
 int main() {
     test_parse();
     test_user_data_rule();
+    test_contained_sgpr_and_bitcast_vertex();
     test_vertex_join();
     test_vertex_join_wide_fetch();
     test_layout_join();

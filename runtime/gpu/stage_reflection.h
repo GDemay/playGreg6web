@@ -194,6 +194,9 @@ inline constexpr uint32_t kGraphicsUserDataBase = 8;
 inline constexpr uint32_t kComputeUserDataBase = 4;
 inline constexpr uint32_t kTableSlotBytes = 32;
 int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr);
+// The root parameter whose user data *covers* `user_sgpr` (-1 when none), with the dword index into it.
+int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
+                                        uint32_t* dword);
 
 // Pipeline layout for pack-resolved stages from their reflection joined to the root signature.
 // `stages`: each stage's reflection with its GpuShaderStageBits. Bindings that two stages share
