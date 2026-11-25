@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import BootTracerDefault, {
   BOOT_MILESTONES,
   OPTIONAL_BOOT_MILESTONES,
+  FAST_BOOT_MILESTONES,
+  ALL_BOOT_MILESTONES,
   MAX_GPU_ADAPTER_LENGTH,
   TRAP_KIND,
   DEFAULT_MAX_TRAPS,
@@ -1169,4 +1171,276 @@ test('W236: reset clears FIRST_VISIBLE_FRAME, blackLoadingMs, and gpuAdapter cle
   assert.equal(again.firstVisibleFrameMs, 3500);
   assert.equal(again.blackLoadingMs, 2500);
   assert.equal(tracer.getSummary().gpuAdapter, 'amd / rdna 3');
+});
+
+test('W290: exports FAST_BOOT_MILESTONES and tracks START_SCREEN, INTRO_VIDEO, MAIN_MENU, IN_GAME across summary, snapshot, and toJSON', () => {
+  assert.deepEqual(FAST_BOOT_MILESTONES, ['START_SCREEN', 'INTRO_VIDEO', 'MAIN_MENU', 'IN_GAME']);
+  assert.ok(Object.isFrozen(FAST_BOOT_MILESTONES));
+  assert.ok(Object.isFrozen(ALL_BOOT_MILESTONES));
+  assert.deepEqual(ALL_BOOT_MILESTONES, [...BOOT_MILESTONES, ...OPTIONAL_BOOT_MILESTONES, ...FAST_BOOT_MILESTONES]);
+  for (const name of FAST_BOOT_MILESTONES) {
+    assert.equal(BOOT_MILESTONES.includes(name), false);
+    assert.equal(OPTIONAL_BOOT_MILESTONES.includes(name), false);
+  }
+
+  const clock = createClock(2000);
+  const hud = createHud();
+  const tracer = new BootTracer({ now: clock.now, hud });
+
+  // All derived durations start as null until reached.
+  for (const view of [tracer.getSummary(), tracer.getSnapshot(), tracer.toJSON(), JSON.parse(JSON.stringify(tracer))]) {
+    assert.equal(view.firstPresentMs, null);
+    assert.equal(view.firstVisibleFrameMs, null);
+    assert.equal(view.blackLoadingMs, null);
+    assert.equal(view.bootToStartScreenMs, null);
+    assert.equal(view.bootToIntroVideoMs, null);
+    assert.equal(view.bootToMainMenuMs, null);
+    assert.equal(view.bootToInGameMs, null);
+    assert.equal(view.milestones.length, BOOT_MILESTONES.length);
+  }
+
+  clock.advance(1000);
+  tracer.markMilestone('FIRST_PRESENT');
+  clock.advance(500);
+  tracer.recordFirstVisibleFrame({ frameIndex: 30 });
+
+  clock.advance(750);
+  const startScreen = tracer.recordStartScreen({ scene: 'press_start' });
+  assert.equal(startScreen.milestone, 'START_SCREEN');
+  assert.equal(startScreen.firstReach, true);
+  assert.equal(startScreen.index, BOOT_MILESTONES.length + OPTIONAL_BOOT_MILESTONES.length);
+  assert.equal(startScreen.elapsedMs, 2250);
+  assert.equal(startScreen.bootToStartScreenMs, 2250);
+  assert.equal(startScreen.blackLoadingMs, 500);
+  assert.deepEqual(startScreen.detail, { scene: 'press_start' });
+
+  clock.advance(1250);
+  const introVideo = tracer.recordIntroVideo({ clip: 'rockstar_intro.bk2' });
+  assert.equal(introVideo.milestone, 'INTRO_VIDEO');
+  assert.equal(introVideo.firstReach, true);
+  assert.equal(introVideo.elapsedMs, 3500);
+  assert.equal(introVideo.bootToIntroVideoMs, 3500);
+  assert.equal(introVideo.blackLoadingMs, 500);
+
+  clock.advance(2000);
+  const mainMenu = tracer.recordMainMenu({ mode: 'story_menu' });
+  assert.equal(mainMenu.milestone, 'MAIN_MENU');
+  assert.equal(mainMenu.firstReach, true);
+  assert.equal(mainMenu.elapsedMs, 5500);
+  assert.equal(mainMenu.bootToMainMenuMs, 5500);
+  assert.equal(mainMenu.blackLoadingMs, 500);
+
+  clock.advance(4500);
+  const inGame = tracer.recordInGame({ detail: { map: 'vice_city', secret: 'do-not-leak' } });
+  assert.equal(inGame.milestone, 'IN_GAME');
+  assert.equal(inGame.firstReach, true);
+  assert.equal(inGame.elapsedMs, 10000);
+  assert.equal(inGame.bootToInGameMs, 10000);
+  assert.equal(inGame.blackLoadingMs, 500);
+  assert.equal(inGame.detail.secret, '[REDACTED]');
+
+  const summary = tracer.getSummary();
+  const snapshot = tracer.getSnapshot();
+  const toJsonObj = tracer.toJSON();
+  const stringified = JSON.parse(JSON.stringify(tracer));
+  const toJsonStr = JSON.parse(tracer.toJson());
+
+  assert.deepEqual(snapshot, summary);
+  assert.deepEqual(toJsonObj, summary);
+  assert.deepEqual(stringified, summary);
+  assert.deepEqual(toJsonStr, summary);
+
+  assert.equal(summary.stage, 'IN_GAME');
+  assert.equal(summary.progressPct, 100);
+  assert.equal(summary.readyForSplash, true);
+  assert.equal(summary.firstPresentMs, 1000);
+  assert.equal(summary.firstVisibleFrameMs, 1500);
+  assert.equal(summary.blackLoadingMs, 500);
+  assert.equal(summary.bootToStartScreenMs, 2250);
+  assert.equal(summary.bootToIntroVideoMs, 3500);
+  assert.equal(summary.bootToMainMenuMs, 5500);
+  assert.equal(summary.bootToInGameMs, 10000);
+  assert.equal(summary.milestonesReached, 6);
+  assert.equal(summary.milestones.length, BOOT_MILESTONES.length + 1 + FAST_BOOT_MILESTONES.length);
+  assert.deepEqual(
+    summary.milestones.slice(BOOT_MILESTONES.length).map((m) => m.milestone),
+    ['FIRST_VISIBLE_FRAME', 'START_SCREEN', 'INTRO_VIDEO', 'MAIN_MENU', 'IN_GAME']
+  );
+
+  assert.deepEqual(hud.calls, [
+    { text: 'Boot 100%: FIRST_PRESENT', level: 'ok' },
+    { text: 'Boot 100%: FIRST_VISIBLE_FRAME', level: 'ok' },
+    { text: 'Boot 100%: START_SCREEN', level: 'ok' },
+    { text: 'Boot 100%: INTRO_VIDEO', level: 'ok' },
+    { text: 'Boot 100%: MAIN_MENU', level: 'ok' },
+    { text: 'Boot 100%: IN_GAME', level: 'ok' },
+  ]);
+
+  const trace = tracer.toChromeTraceEvents();
+  assert.equal(trace.metadata.bootToStartScreenMs, 2250);
+  assert.equal(trace.metadata.bootToIntroVideoMs, 3500);
+  assert.equal(trace.metadata.bootToMainMenuMs, 5500);
+  assert.equal(trace.metadata.bootToInGameMs, 10000);
+  assert.equal(trace.metadata.blackLoadingMs, 500);
+  for (const name of FAST_BOOT_MILESTONES) {
+    assert.ok(trace.traceEvents.some((e) => e.ph === 'X' && e.name === `phase:${name}`));
+    assert.ok(trace.traceEvents.some((e) => e.ph === 'i' && e.name === name));
+  }
+});
+
+test('W290: convenience recorders are idempotent by default and support { overwrite: true } with delta recomputation', () => {
+  const clock = createClock(0);
+  const tracer = new BootTracer({ now: clock.now, slowThresholdMs: 1000 });
+
+  clock.advance(400);
+  tracer.markMilestone('FIRST_PRESENT');
+  clock.advance(600);
+  tracer.recordFirstVisibleFrame();
+  clock.advance(500);
+  tracer.recordStartScreen({ screen: 'initial' });
+  clock.advance(1500);
+  tracer.recordMainMenu({ tab: 'campaign' });
+
+  // Repeat without overwrite preserves first-occurrence timestamp and detail.
+  clock.advance(500);
+  const repeatStart = tracer.recordStartScreen({ screen: 'ignored' });
+  assert.equal(repeatStart.firstReach, false);
+  assert.equal(repeatStart.count, 2);
+  assert.equal(repeatStart.elapsedMs, 1500);
+  assert.equal(repeatStart.lastElapsedMs, 3500);
+  assert.equal(repeatStart.bootToStartScreenMs, 1500);
+  assert.deepEqual(repeatStart.detail, { screen: 'initial' });
+
+  // Explicit overwrite updates timestamp, recomputes deltas/slow flags, and sanitizes detail.
+  const overwrittenStart = tracer.recordStartScreen({
+    elapsedMs: 2200,
+    overwrite: true,
+    detail: { screen: 'confirmed', path: 'C:\\Users\\alice\\capture.png' },
+  });
+  assert.equal(overwrittenStart.firstReach, false);
+  assert.equal(overwrittenStart.count, 3);
+  assert.equal(overwrittenStart.elapsedMs, 2200);
+  assert.equal(overwrittenStart.lastElapsedMs, 2200);
+  assert.equal(overwrittenStart.bootToStartScreenMs, 2200);
+  assert.equal(overwrittenStart.detail.screen, 'confirmed');
+  assert.equal(JSON.stringify(overwrittenStart.detail).includes('alice'), false);
+
+  // Overwriting without detail keeps the existing detail; overwrite with detail: null clears it.
+  const keptDetail = tracer.recordStartScreen({ elapsedMs: 2250, overwrite: true });
+  assert.equal(keptDetail.elapsedMs, 2250);
+  assert.equal(keptDetail.detail.screen, 'confirmed');
+
+  const clearedDetail = tracer.recordStartScreen({ elapsedMs: 2250, overwrite: true, detail: null });
+  assert.equal(clearedDetail.detail, null);
+
+  // Deltas remain contiguous and sum to the final cumulativeMs (3000ms).
+  const deltas = tracer.getMilestoneDeltas();
+  assert.deepEqual(
+    deltas.map(({ name, atMs, deltaMs, slow }) => ({ name, atMs, deltaMs, slow })),
+    [
+      { name: 'FIRST_PRESENT', atMs: 400, deltaMs: 400, slow: false },
+      { name: 'FIRST_VISIBLE_FRAME', atMs: 1000, deltaMs: 600, slow: false },
+      { name: 'START_SCREEN', atMs: 2250, deltaMs: 1250, slow: true },
+      { name: 'MAIN_MENU', atMs: 3000, deltaMs: 750, slow: false },
+    ]
+  );
+  assert.equal(
+    deltas.reduce((sum, d) => sum + d.deltaMs, 0),
+    deltas.at(-1).cumulativeMs
+  );
+
+  // Overwriting FIRST_VISIBLE_FRAME updates blackLoadingMs accordingly.
+  const overwrittenVis = tracer.recordFirstVisibleFrame({ elapsedMs: 1100, overwrite: true });
+  assert.equal(overwrittenVis.firstVisibleFrameMs, 1100);
+  assert.equal(overwrittenVis.blackLoadingMs, 700);
+  assert.equal(tracer.getSnapshot().blackLoadingMs, 700);
+
+  // markMilestone also supports optional { overwrite: true } as a 3rd argument.
+  clock.set(4200);
+  const overwrittenMenu = tracer.markMilestone('MAIN_MENU', { tab: 'online' }, { overwrite: true });
+  assert.equal(overwrittenMenu.elapsedMs, 4200);
+  assert.deepEqual(overwrittenMenu.detail, { tab: 'online' });
+  assert.equal(tracer.getSummary().bootToMainMenuMs, 4200);
+
+  // Intro video and in-game idempotency + overwrite.
+  const firstIntro = tracer.recordIntroVideo({ elapsedMs: 0 });
+  assert.equal(firstIntro.bootToIntroVideoMs, 0);
+  assert.equal(tracer.getSnapshot().bootToIntroVideoMs, 0);
+  assert.equal(tracer.recordIntroVideo({ elapsedMs: 999 }).bootToIntroVideoMs, 0);
+  assert.equal(tracer.recordIntroVideo({ elapsedMs: 3100, overwrite: true }).bootToIntroVideoMs, 3100);
+
+  const firstInGame = tracer.recordInGame({ elapsedMs: 5000 });
+  assert.equal(firstInGame.bootToInGameMs, 5000);
+  assert.equal(tracer.recordInGame({ elapsedMs: 6000 }).bootToInGameMs, 5000);
+  assert.equal(tracer.recordInGame({ elapsedMs: 5400, overwrite: true }).bootToInGameMs, 5400);
+});
+
+test('W290: validates recorder options, ingests fast-boot log lines, and clears cleanly on reset()', () => {
+  const clock = createClock(0);
+  const tracer = new BootTracer({ now: clock.now });
+
+  for (const method of ['recordStartScreen', 'recordIntroVideo', 'recordMainMenu', 'recordInGame']) {
+    assert.throws(() => tracer[method](null), TypeError);
+    assert.throws(() => tracer[method]([]), TypeError);
+    assert.throws(() => tracer[method]('bad'), TypeError);
+    assert.throws(() => tracer[method]({ elapsedMs: -0.1 }), RangeError);
+    assert.throws(() => tracer[method]({ elapsedMs: Number.NaN }), RangeError);
+    assert.throws(() => tracer[method]({ elapsedMs: Number.POSITIVE_INFINITY }), RangeError);
+    assert.throws(() => tracer[method]({ elapsedMs: '100' }), RangeError);
+    assert.throws(() => tracer[method]({ overwrite: 'yes' }), TypeError);
+  }
+  assert.throws(() => tracer.markMilestone('MAIN_MENU', null, null), TypeError);
+  assert.throws(() => tracer.markMilestone('MAIN_MENU', null, { overwrite: 1 }), TypeError);
+
+  // Log ingestion heuristics and explicit tokens.
+  const logCases = [
+    ['[boot] start screen rendered (press any button)', 'START_SCREEN', 'bootToStartScreenMs', 100],
+    ['[wasm] intro video playback started', 'INTRO_VIDEO', 'bootToIntroVideoMs', 200],
+    ['[boot] main menu interactive', 'MAIN_MENU', 'bootToMainMenuMs', 300],
+    ['[wasm] gameplay started - player in-game', 'IN_GAME', 'bootToInGameMs', 400],
+  ];
+  for (const [line, milestone, durationKey, expectedMs] of logCases) {
+    clock.advance(100);
+    const res = tracer.ingestLogLine(line);
+    assert.equal(res?.type, 'milestone', line);
+    assert.deepEqual(
+      res.milestones.map((m) => m.milestone),
+      [milestone],
+      line
+    );
+    assert.equal(tracer.getSnapshot()[durationKey], expectedMs);
+  }
+
+  assert.deepEqual(parseLogLine('[boot] milestone=START_SCREEN')?.milestones, ['START_SCREEN']);
+  assert.deepEqual(parseLogLine('[boot] milestone=INTRO_VIDEO')?.milestones, ['INTRO_VIDEO']);
+  assert.deepEqual(parseLogLine('[boot] milestone=MAIN_MENU')?.milestones, ['MAIN_MENU']);
+  assert.deepEqual(parseLogLine('[boot] milestone=IN_GAME')?.milestones, ['IN_GAME']);
+  assert.equal(parseLogLine('[boot] MAIN_MENU failed to load'), null);
+  assert.equal(parseLogLine('[boot] IN_GAME error'), null);
+
+  // Reset clears all fast-boot milestones and derived durations.
+  tracer.reset();
+  const afterReset = tracer.getSnapshot();
+  assert.equal(afterReset.stage, STAGE_NOT_STARTED);
+  assert.equal(afterReset.progressPct, 0);
+  assert.equal(afterReset.bootToStartScreenMs, null);
+  assert.equal(afterReset.bootToIntroVideoMs, null);
+  assert.equal(afterReset.bootToMainMenuMs, null);
+  assert.equal(afterReset.bootToInGameMs, null);
+  assert.equal(afterReset.blackLoadingMs, null);
+  assert.equal(afterReset.milestones.length, BOOT_MILESTONES.length);
+  assert.deepEqual(tracer.toJSON(), afterReset);
+
+  const traceAfterReset = tracer.toChromeTraceEvents();
+  assert.equal(traceAfterReset.metadata.bootToStartScreenMs, null);
+  assert.equal(traceAfterReset.metadata.bootToIntroVideoMs, null);
+  assert.equal(traceAfterReset.metadata.bootToMainMenuMs, null);
+  assert.equal(traceAfterReset.metadata.bootToInGameMs, null);
+
+  // Re-record cleanly after reset anchored to the new boot clock.
+  clock.advance(333);
+  const reMenu = tracer.recordMainMenu();
+  assert.equal(reMenu.firstReach, true);
+  assert.equal(reMenu.bootToMainMenuMs, 333);
+  assert.equal(tracer.getSnapshot().bootToMainMenuMs, 333);
 });

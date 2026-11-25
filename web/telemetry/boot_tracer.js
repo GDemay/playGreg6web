@@ -32,7 +32,24 @@ export const BOOT_MILESTONES = Object.freeze([
 /** Optional post-present boot milestones that do not affect core BOOT_MILESTONES ordering or progress percentages. */
 export const OPTIONAL_BOOT_MILESTONES = Object.freeze(['FIRST_VISIBLE_FRAME']);
 
-const ALL_MILESTONES = Object.freeze([...BOOT_MILESTONES, ...OPTIONAL_BOOT_MILESTONES]);
+/** Post-visible fast-boot milestones tracking progression from splash through main menu to playable in-game. */
+export const FAST_BOOT_MILESTONES = Object.freeze([
+  'START_SCREEN',
+  'INTRO_VIDEO',
+  'MAIN_MENU',
+  'IN_GAME',
+]);
+
+/** Complete ordered list of all core, optional, and fast-boot milestones. */
+export const ALL_BOOT_MILESTONES = Object.freeze([
+  ...BOOT_MILESTONES,
+  ...OPTIONAL_BOOT_MILESTONES,
+  ...FAST_BOOT_MILESTONES,
+]);
+
+const POST_PRESENT_MILESTONES = Object.freeze([...OPTIONAL_BOOT_MILESTONES, ...FAST_BOOT_MILESTONES]);
+const ALL_MILESTONES = ALL_BOOT_MILESTONES;
+const OK_HUD_MILESTONES = new Set(['FIRST_PRESENT', ...POST_PRESENT_MILESTONES]);
 
 /** Trap kinds mirroring the recompiler/runtime fault helpers. */
 export const TRAP_KIND = Object.freeze({
@@ -91,6 +108,10 @@ const MILESTONE_HEURISTICS = Object.freeze([
   ['BINK_OPEN', /\bBinkOpen\w*\b|\bbink\s+(?:open(?:ed)?|stream\s+opened)\b/i],
   ['FIRST_PRESENT', /\bfirst[\s_-]*(?:swapchain[\s_-]*)?(?:present(?:ed)?|frame)\b/i],
   ['FIRST_VISIBLE_FRAME', /\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b/i],
+  ['START_SCREEN', /\bstart[\s_-]*screen\b|\bpress[\s_-]*(?:any[\s_-]*button|start)\b/i],
+  ['INTRO_VIDEO', /\bintro[\s_-]*(?:video|movie|cinematic|bink)\b|\bopening[\s_-]*(?:video|cinematic)\b/i],
+  ['MAIN_MENU', /\bmain[\s_-]*menu\b|\btitle[\s_-]*menu\b/i],
+  ['IN_GAME', /\bin[\s_-]*game\b|\bgameplay[\s_-]*(?:started|active|ready|entered)\b/i],
 ]);
 
 function defaultNow() {
@@ -412,6 +433,10 @@ function msToMicros(ms) {
   return Number.isFinite(ms) ? Math.max(0, Math.round(ms * 1000)) : 0;
 }
 
+function clampNonNegativeFiniteMs(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : null;
+}
+
 /**
  * Tracks guest boot progress through `BOOT_MILESTONES` and collects guest traps
  * (unimplemented opcodes, unresolved imports, indirect-call misses, ...) into a
@@ -510,14 +535,33 @@ export class BootTracer {
       : Math.min(100, Math.round(((this._highestIdx + 1) / BOOT_MILESTONES.length) * 100));
   }
 
+  _milestoneElapsedMs(name) {
+    const entry = this._milestones.get(name);
+    return entry ? clampNonNegativeFiniteMs(entry.elapsedMs) : null;
+  }
+
   _firstPresentMs() {
-    const entry = this._milestones.get('FIRST_PRESENT');
-    return entry ? entry.elapsedMs : null;
+    return this._milestoneElapsedMs('FIRST_PRESENT');
   }
 
   _firstVisibleFrameMs() {
-    const entry = this._milestones.get('FIRST_VISIBLE_FRAME');
-    return entry ? entry.elapsedMs : null;
+    return this._milestoneElapsedMs('FIRST_VISIBLE_FRAME');
+  }
+
+  _bootToStartScreenMs() {
+    return this._milestoneElapsedMs('START_SCREEN');
+  }
+
+  _bootToIntroVideoMs() {
+    return this._milestoneElapsedMs('INTRO_VIDEO');
+  }
+
+  _bootToMainMenuMs() {
+    return this._milestoneElapsedMs('MAIN_MENU');
+  }
+
+  _bootToInGameMs() {
+    return this._milestoneElapsedMs('IN_GAME');
   }
 
   _blackLoadingMs() {
@@ -526,7 +570,27 @@ export class BootTracer {
     if (firstPresentMs === null || firstVisibleFrameMs === null) {
       return null;
     }
-    return Math.max(0, firstVisibleFrameMs - firstPresentMs);
+    return clampNonNegativeFiniteMs(firstVisibleFrameMs - firstPresentMs);
+  }
+
+  _recomputeMilestoneDeltas() {
+    let prevElapsedMs = 0;
+    let maxElapsedMs = 0;
+    for (const name of this._milestoneOrder) {
+      const entry = this._milestones.get(name);
+      if (!entry) {
+        continue;
+      }
+      entry.deltaFromPrevMs = Math.max(0, entry.elapsedMs - prevElapsedMs);
+      entry.slow = this._slowThresholdMs !== null && entry.deltaFromPrevMs > this._slowThresholdMs;
+      if (entry.elapsedMs > prevElapsedMs) {
+        prevElapsedMs = entry.elapsedMs;
+      }
+      if (entry.elapsedMs > maxElapsedMs) {
+        maxElapsedMs = entry.elapsedMs;
+      }
+    }
+    this._lastMilestoneElapsedMs = maxElapsedMs;
   }
 
   _notifyHud(text, level) {
@@ -559,18 +623,31 @@ export class BootTracer {
 
   /**
    * Records that a boot milestone was reached. The first-reached timestamp is kept;
-   * repeats only bump `count` and `lastElapsedMs`.
+   * repeats only bump `count` and `lastElapsedMs` unless `options.overwrite` is `true`.
    *
-   * @param {string} milestone One of `BOOT_MILESTONES` or `OPTIONAL_BOOT_MILESTONES`.
-   * @param {unknown} [detail] Optional sanitized detail stored on first reach.
+   * @param {string} milestone One of `BOOT_MILESTONES`, `OPTIONAL_BOOT_MILESTONES`, or `FAST_BOOT_MILESTONES`.
+   * @param {unknown} [detail] Optional sanitized detail stored on first reach (or overwrite).
+   * @param {{ overwrite?: boolean }} [options] Optional control flags.
    * @returns {{ milestone: string, index: number, elapsedMs: number, lastElapsedMs: number,
    *   count: number, detail: any, firstReach: boolean }}
    */
-  markMilestone(milestone, detail) {
-    return this._markMilestone(milestone, detail, undefined);
+  markMilestone(milestone, detail, options) {
+    let overwrite = false;
+    if (options !== undefined) {
+      if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new TypeError('markMilestone options must be an object');
+      }
+      if (options.overwrite !== undefined) {
+        if (typeof options.overwrite !== 'boolean') {
+          throw new TypeError(`overwrite must be a boolean, got ${typeof options.overwrite}`);
+        }
+        overwrite = options.overwrite;
+      }
+    }
+    return this._markMilestone(milestone, detail, undefined, overwrite);
   }
 
-  _markMilestone(milestone, detail, explicitElapsedMs) {
+  _markMilestone(milestone, detail, explicitElapsedMs, overwrite = false) {
     const name = resolveMilestone(milestone);
     let elapsedMs;
     if (explicitElapsedMs !== undefined) {
@@ -609,10 +686,16 @@ export class BootTracer {
       }
       const pct = this._progressPct();
       this._forward('recordLog', 'info', 'boot_tracer', `milestone ${name} reached at ${elapsedMs.toFixed(1)}ms`);
-      this._notifyHud(
-        `Boot ${pct}%: ${name}`,
-        name === 'FIRST_PRESENT' || name === 'FIRST_VISIBLE_FRAME' ? 'ok' : 'info'
-      );
+      this._notifyHud(`Boot ${pct}%: ${name}`, OK_HUD_MILESTONES.has(name) ? 'ok' : 'info');
+    } else if (overwrite) {
+      entry.count += 1;
+      entry.elapsedMs = elapsedMs;
+      entry.lastElapsedMs = elapsedMs;
+      if (detail !== undefined) {
+        entry.detail = sanitizeValue(detail) ?? null;
+      }
+      this._recomputeMilestoneDeltas();
+      this._forward('recordLog', 'info', 'boot_tracer', `milestone ${name} overwritten at ${elapsedMs.toFixed(1)}ms`);
     } else {
       entry.count += 1;
       entry.lastElapsedMs = elapsedMs;
@@ -620,19 +703,9 @@ export class BootTracer {
     return { ...entry, firstReach };
   }
 
-  /**
-   * Records the optional `FIRST_VISIBLE_FRAME` milestone (first non-black frame after
-   * `FIRST_PRESENT`), preserving the first-reached `firstVisibleFrameMs` and computing
-   * `blackLoadingMs = max(0, firstVisibleFrameMs - firstPresentMs)` when both exist.
-   *
-   * @param {object} [opts]
-   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
-   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
-   * @returns {object} Milestone record enriched with `firstVisibleFrameMs` and `blackLoadingMs`.
-   */
-  recordFirstVisibleFrame(opts = {}) {
+  _recordPostPresentMilestone(milestone, opts = {}, methodName) {
     if (opts !== undefined && (opts === null || typeof opts !== 'object' || Array.isArray(opts))) {
-      throw new TypeError('recordFirstVisibleFrame options must be an object');
+      throw new TypeError(`${methodName} options must be an object`);
     }
     let explicitElapsedMs;
     if (opts.elapsedMs !== undefined && opts.elapsedMs !== null) {
@@ -641,24 +714,123 @@ export class BootTracer {
       }
       explicitElapsedMs = opts.elapsedMs;
     }
+    let overwrite = false;
+    if (opts.overwrite !== undefined) {
+      if (typeof opts.overwrite !== 'boolean') {
+        throw new TypeError(`overwrite must be a boolean, got ${typeof opts.overwrite}`);
+      }
+      overwrite = opts.overwrite;
+    }
 
-    const nonTimingKeys = Object.keys(opts).filter((key) => key !== 'elapsedMs');
+    const nonControlKeys = Object.keys(opts).filter((key) => key !== 'elapsedMs' && key !== 'overwrite');
     let detail;
-    if (nonTimingKeys.length === 0) {
+    if (nonControlKeys.length === 0) {
       detail = undefined;
-    } else if (nonTimingKeys.length === 1 && nonTimingKeys[0] === 'detail') {
+    } else if (nonControlKeys.length === 1 && nonControlKeys[0] === 'detail') {
       detail = opts.detail;
     } else {
       detail = {};
-      for (const key of nonTimingKeys) {
+      for (const key of nonControlKeys) {
         detail[key] = opts[key];
       }
     }
 
-    const entry = this._markMilestone('FIRST_VISIBLE_FRAME', detail, explicitElapsedMs);
+    return this._markMilestone(milestone, detail, explicitElapsedMs, overwrite);
+  }
+
+  /**
+   * Records the optional `FIRST_VISIBLE_FRAME` milestone (first non-black frame after
+   * `FIRST_PRESENT`), preserving the first-reached `firstVisibleFrameMs` unless
+   * `{ overwrite: true }` is passed, and computing
+   * `blackLoadingMs = max(0, firstVisibleFrameMs - firstPresentMs)` when both exist.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {boolean} [opts.overwrite=false] Overwrite existing first-occurrence timestamp and detail.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `firstVisibleFrameMs` and `blackLoadingMs`.
+   */
+  recordFirstVisibleFrame(opts = {}) {
+    const entry = this._recordPostPresentMilestone('FIRST_VISIBLE_FRAME', opts, 'recordFirstVisibleFrame');
     return {
       ...entry,
       firstVisibleFrameMs: this._firstVisibleFrameMs(),
+      blackLoadingMs: this._blackLoadingMs(),
+    };
+  }
+
+  /**
+   * Records the `START_SCREEN` fast-boot milestone (idempotent first-occurrence timestamp
+   * unless `{ overwrite: true }`).
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {boolean} [opts.overwrite=false] Overwrite existing first-occurrence timestamp and detail.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `bootToStartScreenMs` and `blackLoadingMs`.
+   */
+  recordStartScreen(opts = {}) {
+    const entry = this._recordPostPresentMilestone('START_SCREEN', opts, 'recordStartScreen');
+    return {
+      ...entry,
+      bootToStartScreenMs: this._bootToStartScreenMs(),
+      blackLoadingMs: this._blackLoadingMs(),
+    };
+  }
+
+  /**
+   * Records the `INTRO_VIDEO` fast-boot milestone (idempotent first-occurrence timestamp
+   * unless `{ overwrite: true }`).
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {boolean} [opts.overwrite=false] Overwrite existing first-occurrence timestamp and detail.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `bootToIntroVideoMs` and `blackLoadingMs`.
+   */
+  recordIntroVideo(opts = {}) {
+    const entry = this._recordPostPresentMilestone('INTRO_VIDEO', opts, 'recordIntroVideo');
+    return {
+      ...entry,
+      bootToIntroVideoMs: this._bootToIntroVideoMs(),
+      blackLoadingMs: this._blackLoadingMs(),
+    };
+  }
+
+  /**
+   * Records the `MAIN_MENU` fast-boot milestone (idempotent first-occurrence timestamp
+   * unless `{ overwrite: true }`).
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {boolean} [opts.overwrite=false] Overwrite existing first-occurrence timestamp and detail.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `bootToMainMenuMs` and `blackLoadingMs`.
+   */
+  recordMainMenu(opts = {}) {
+    const entry = this._recordPostPresentMilestone('MAIN_MENU', opts, 'recordMainMenu');
+    return {
+      ...entry,
+      bootToMainMenuMs: this._bootToMainMenuMs(),
+      blackLoadingMs: this._blackLoadingMs(),
+    };
+  }
+
+  /**
+   * Records the `IN_GAME` fast-boot milestone (idempotent first-occurrence timestamp
+   * unless `{ overwrite: true }`).
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {boolean} [opts.overwrite=false] Overwrite existing first-occurrence timestamp and detail.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `bootToInGameMs` and `blackLoadingMs`.
+   */
+  recordInGame(opts = {}) {
+    const entry = this._recordPostPresentMilestone('IN_GAME', opts, 'recordInGame');
+    return {
+      ...entry,
+      bootToInGameMs: this._bootToInGameMs(),
       blackLoadingMs: this._blackLoadingMs(),
     };
   }
@@ -988,6 +1160,10 @@ export class BootTracer {
     const firstPresentMs = this._firstPresentMs();
     const firstVisibleFrameMs = this._firstVisibleFrameMs();
     const blackLoadingMs = this._blackLoadingMs();
+    const bootToStartScreenMs = this._bootToStartScreenMs();
+    const bootToIntroVideoMs = this._bootToIntroVideoMs();
+    const bootToMainMenuMs = this._bootToMainMenuMs();
+    const bootToInGameMs = this._bootToInGameMs();
 
     const metadata = {
       source: 'playgta6web.boot_tracer',
@@ -998,6 +1174,10 @@ export class BootTracer {
       firstPresentMs,
       firstVisibleFrameMs,
       blackLoadingMs,
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
       gpuAdapter: this._gpuAdapter,
       milestonesReached: this._milestones.size,
       trapCount: this._trapCount,
@@ -1044,7 +1224,7 @@ export class BootTracer {
           };
     });
 
-    for (const name of OPTIONAL_BOOT_MILESTONES) {
+    for (const name of POST_PRESENT_MILESTONES) {
       const entry = this._milestones.get(name);
       if (entry) {
         milestones.push({
@@ -1070,6 +1250,10 @@ export class BootTracer {
     const firstPresentMs = this._firstPresentMs();
     const firstVisibleFrameMs = this._firstVisibleFrameMs();
     const blackLoadingMs = this._blackLoadingMs();
+    const bootToStartScreenMs = this._bootToStartScreenMs();
+    const bootToIntroVideoMs = this._bootToIntroVideoMs();
+    const bootToMainMenuMs = this._bootToMainMenuMs();
+    const bootToInGameMs = this._bootToInGameMs();
 
     return sanitizeValue({
       stage: this._stage(),
@@ -1079,6 +1263,10 @@ export class BootTracer {
       firstPresentMs,
       firstVisibleFrameMs,
       blackLoadingMs,
+      bootToStartScreenMs,
+      bootToIntroVideoMs,
+      bootToMainMenuMs,
+      bootToInGameMs,
       gpuAdapter: this._gpuAdapter,
       milestonesReached: this._milestones.size,
       milestones,
@@ -1090,6 +1278,20 @@ export class BootTracer {
       unresolvedImports,
       recentTraps: this._traps.toArray().map((record) => ({ ...record })),
     });
+  }
+
+  /**
+   * Returns a sanitized telemetry snapshot (alias for `getSummary()`).
+   */
+  getSnapshot() {
+    return this.getSummary();
+  }
+
+  /**
+   * Returns the sanitized summary object for standard `JSON.stringify(tracer)` serialization.
+   */
+  toJSON() {
+    return this.getSummary();
   }
 
   /**
