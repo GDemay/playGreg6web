@@ -123,6 +123,11 @@ test('defaults: maxConcurrent 4 and initial stats', () => {
     syncFallbacks: 0,
     autoLayoutRetries: 0,
     discardedStale: 0,
+    inFlightCompiles: 0,
+    peakInFlightCompiles: 0,
+    queuedCompiles: 0,
+    failedAsyncCompiles: 0,
+    avgAsyncCompileMs: 0,
   });
   assert.equal(new AsyncPipelineCache({ maxConcurrent: 0 }).maxConcurrent, 4);
   assert.equal(new AsyncPipelineCache({ maxConcurrent: 2.5 }).maxConcurrent, 4);
@@ -497,6 +502,241 @@ test('repeat compile of a pending or ready id does not recompile', async () => {
   const p3 = await cache.compileRenderPipeline('x', { label: 'x' });
   assert.equal(p3.status, 'ready');
   assert.equal(device.calls.length, 1);
+});
+
+test('W138: maxConcurrentCompiles: 2 caps 5 distinct pipelines in FIFO order with telemetry', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+  assert.equal(cache.maxConcurrentCompiles, 2);
+
+  const promises = [
+    cache.compileRenderPipeline('k0', { label: 'k0' }),
+    cache.compileComputePipeline('k1', { label: 'k1' }),
+    cache.compileRenderPipeline('k2', { label: 'k2' }),
+    cache.compileComputePipeline('k3', { label: 'k3' }),
+    cache.compileRenderPipeline('k4', { label: 'k4' }),
+  ];
+
+  assert.equal(device.calls.length, 2, 'only 2 async compiles active simultaneously');
+  assert.deepEqual(device.calls.map((c) => c.descriptor.label), ['k0', 'k1']);
+  let stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 2);
+  assert.equal(stats.peakInFlightCompiles, 2);
+  assert.equal(stats.queuedCompiles, 3);
+  assert.equal(stats.failedAsyncCompiles, 0);
+
+  // Resolve k0 -> k2 starts next (FIFO)
+  device.calls[0].resolve();
+  await promises[0];
+  assert.equal(device.calls.length, 3);
+  assert.equal(device.calls[2].descriptor.label, 'k2');
+  stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 2);
+  assert.equal(stats.peakInFlightCompiles, 2);
+  assert.equal(stats.queuedCompiles, 2);
+
+  // Resolve k1 -> k3 starts next (FIFO)
+  device.calls[1].resolve();
+  await promises[1];
+  assert.equal(device.calls.length, 4);
+  assert.equal(device.calls[3].descriptor.label, 'k3');
+  assert.equal(cache.getStats().queuedCompiles, 1);
+
+  // Resolve k2 -> k4 starts next (FIFO)
+  device.calls[2].resolve();
+  await promises[2];
+  assert.equal(device.calls.length, 5);
+  assert.equal(device.calls[4].descriptor.label, 'k4');
+  assert.equal(cache.getStats().queuedCompiles, 0);
+
+  device.calls[3].resolve();
+  device.calls[4].resolve();
+  const results = await Promise.all(promises);
+  await cache.whenIdle();
+
+  assert.ok(results.every((r) => r.status === PIPELINE_STATUS.READY));
+  assert.equal(device.peakInFlight, 2);
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['k0', 'k1', 'k2', 'k3', 'k4'],
+  );
+  stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 0);
+  assert.equal(stats.peakInFlightCompiles, 2);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.failedAsyncCompiles, 0);
+  assert.equal(stats.compiled, 5);
+});
+
+test('W138: maxConcurrentCompiles: 0 allows unlimited concurrent async compiles', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 0 });
+  assert.equal(cache.maxConcurrentCompiles, 0);
+
+  const promises = [];
+  for (let i = 0; i < 5; i += 1) {
+    promises.push(cache.compileRenderPipeline(`u${i}`, { label: `u${i}` }));
+  }
+
+  assert.equal(device.calls.length, 5, 'all 5 compiles start immediately when unlimited');
+  let stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 5);
+  assert.equal(stats.peakInFlightCompiles, 5);
+  assert.equal(stats.queuedCompiles, 0);
+
+  for (const call of device.calls) call.resolve();
+  await Promise.all(promises);
+  await cache.whenIdle();
+
+  stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 0);
+  assert.equal(stats.peakInFlightCompiles, 5);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.compiled, 5);
+});
+
+test('W138: deduplication while queued and in-flight returns same promise without double-queuing', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  const p0a = cache.compileRenderPipeline('p0', { label: 'p0' }, { dedupeKey: 'dk0' });
+  const p1 = cache.compileRenderPipeline('p1', { label: 'p1' }, { dedupeKey: 'dk1' });
+  const p2a = cache.compileRenderPipeline('p2', { label: 'p2' }, { dedupeKey: 'dk2' });
+
+  // Repeat request for already in-flight id returns exact same promise.
+  const p0b = cache.compileRenderPipeline('p0', { label: 'p0' }, { dedupeKey: 'dk0' });
+  assert.strictEqual(p0a, p0b);
+
+  // Repeat request for already queued id returns exact same promise without double-queuing.
+  const p2b = cache.compileRenderPipeline('p2', { label: 'p2' }, { dedupeKey: 'dk2' });
+  assert.strictEqual(p2a, p2b);
+
+  // Distinct id sharing the queued dedupeKey attaches to the queued job without double-queuing.
+  const p2Alias = cache.compileRenderPipeline('p2_alias', { label: 'p2' }, { dedupeKey: 'dk2' });
+
+  let stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 2);
+  assert.equal(stats.queuedCompiles, 1, 'queued job was not double-queued');
+  assert.equal(stats.dedupeHits, 1);
+
+  device.calls[0].resolve();
+  device.calls[1].resolve();
+  await Promise.all([p0a, p1]);
+  assert.equal(device.calls.length, 3);
+  assert.equal(device.calls[2].descriptor.label, 'p2');
+
+  device.calls[2].resolve();
+  const [r2a, r2b, r2Alias] = await Promise.all([p2a, p2b, p2Alias]);
+  await cache.whenIdle();
+
+  assert.equal(device.calls.length, 3, 'each distinct pipeline compiled once');
+  assert.strictEqual(r2a.pipeline, r2b.pipeline);
+  assert.strictEqual(r2a.pipeline, r2Alias.pipeline);
+  assert.equal(r2Alias.dedupe, true);
+  stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 0);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.compiled, 3);
+});
+
+test('W138: failed async compiles release concurrency slot, increment failedAsyncCompiles, and drain queue', async () => {
+  const device = createManualDevice();
+  const origComputeAsync = device.createComputePipelineAsync;
+  device.createComputePipelineAsync = (descriptor) => {
+    if (descriptor.label === 'sync-throw') {
+      throw new Error('sync throw during async dispatch');
+    }
+    return origComputeAsync(descriptor);
+  };
+
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  const p0 = cache.compileRenderPipeline('f0', { label: 'f0' });
+  const p1 = cache.compileComputePipeline('f1', { label: 'sync-throw' });
+  const p2 = cache.compileRenderPipeline('f2', { label: 'f2' });
+  const p3 = cache.compileRenderPipeline('f3', { label: 'f3' });
+  const p4 = cache.compileComputePipeline('f4', { label: 'f4' });
+
+  // Wait for f1's sync throw rejection microtask to settle and drain f2 into the freed slot.
+  const r1 = await p1;
+  assert.equal(r1.status, PIPELINE_STATUS.FAILED);
+  assert.match(r1.error.message, /sync throw during async dispatch/);
+  assert.equal(cache.getStats().failedAsyncCompiles, 1);
+  assert.equal(cache.getStats().inFlightCompiles, 2, 'slot released and refilled with f2');
+  assert.equal(cache.getStats().queuedCompiles, 2);
+  assert.deepEqual(device.calls.map((c) => c.descriptor.label), ['f0', 'f2']);
+
+  // Reject f0 -> must release its slot, increment failedAsyncCompiles, and drain f3.
+  device.calls[0].reject(new Error('shader validation error'));
+  const r0 = await p0;
+  assert.equal(r0.status, PIPELINE_STATUS.FAILED);
+  assert.equal(r0.error.message, 'shader validation error');
+  assert.equal(cache.getStats().failedAsyncCompiles, 2);
+  assert.equal(cache.getStats().inFlightCompiles, 2);
+  assert.equal(cache.getStats().queuedCompiles, 1);
+  assert.equal(device.calls[2].descriptor.label, 'f3');
+
+  // Resolve remaining queued compiles (f2, f3, f4).
+  device.calls[1].resolve();
+  await p2;
+  assert.equal(device.calls[3].descriptor.label, 'f4');
+  device.calls[2].resolve();
+  device.calls[3].resolve();
+  const [r2, r3, r4] = await Promise.all([p2, p3, p4]);
+  await cache.whenIdle();
+
+  assert.equal(r2.status, PIPELINE_STATUS.READY);
+  assert.equal(r3.status, PIPELINE_STATUS.READY);
+  assert.equal(r4.status, PIPELINE_STATUS.READY);
+  const stats = cache.getStats();
+  assert.equal(stats.inFlightCompiles, 0);
+  assert.equal(stats.peakInFlightCompiles, 2);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.failedAsyncCompiles, 2);
+  assert.equal(stats.failed, 2);
+  assert.equal(stats.compiled, 3);
+});
+
+test('W138: deterministic fake-clock nowFn tracks avgAsyncCompileMs without queue wait time', async () => {
+  let now = 100;
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({
+    device,
+    maxConcurrentCompiles: 2,
+    nowFn: () => now,
+  });
+
+  assert.equal(cache.getStats().avgAsyncCompileMs, 0);
+
+  // t=100: p0 and p1 launch; p2 waits in queue.
+  const p0 = cache.compileRenderPipeline('t0', { label: 't0' });
+  const p1 = cache.compileRenderPipeline('t1', { label: 't1' });
+  const p2 = cache.compileComputePipeline('t2', { label: 't2' });
+
+  // t=110: p0 completes in 10ms; p2 launches at t=110 (not t=100).
+  now = 110;
+  device.calls[0].resolve();
+  await p0;
+  assert.equal(cache.getStats().avgAsyncCompileMs, 10);
+
+  // t=130: p1 completes in 30ms -> avg = (10 + 30) / 2 = 20ms.
+  now = 130;
+  device.calls[1].resolve();
+  await p1;
+  assert.equal(cache.getStats().avgAsyncCompileMs, 20);
+
+  // t=160: p2 started at t=110, completes in 50ms -> avg = (10 + 30 + 50) / 3 = 30ms.
+  now = 160;
+  device.calls[2].resolve();
+  await p2;
+  assert.equal(cache.getStats().avgAsyncCompileMs, 30);
+
+  // Non-monotonic clock jump clamps elapsed time to 0 instead of going negative.
+  const p3 = cache.compileRenderPipeline('t3', { label: 't3' });
+  now = 140;
+  device.calls[3].resolve();
+  await p3;
+  assert.equal(cache.getStats().avgAsyncCompileMs, 22.5);
 });
 
 test('zero unhandled rejections: throwing APIs, callbacks, and logger are contained', async () => {
