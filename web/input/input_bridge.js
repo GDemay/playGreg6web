@@ -200,6 +200,39 @@ function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
   return Object.freeze(events);
 }
 
+function buildChromeMenuFlow2Events() {
+  const events = [];
+  // Phase 1: Human-paced A confirmations every 2500 ms from 110000 ms through 165000 ms
+  // (Start Screen -> CONTINUE -> Calibration -> UI TEXT SIZE in Chrome Wasm64 boots).
+  for (let atMs = 110000; atMs <= 165000; atMs += 2500) {
+    events.push(Object.freeze({ atMs, holdMs: 100, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 2: 3 human-paced DPAD_DOWN, DPAD_DOWN, A cycles every 12000 ms from 169000 ms
+  // to highlight and select "Next >" on LEGAL NOTICES (mirrors PR #1333).
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const base = 169000 + cycle * 12000;
+    events.push(Object.freeze({ atMs: base, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN }));
+    events.push(Object.freeze({ atMs: base + 2000, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN }));
+    events.push(Object.freeze({ atMs: base + 4500, holdMs: 100, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 3: Single A at 206500 ms (+9 s after Phase 2) to leave the post-legal list screen.
+  events.push(Object.freeze({ atMs: 206500, holdMs: 100, button: INPUT_BUTTONS.A }));
+  // Phase 4: Cycling DPAD_DOWN x N + A (N = 1..5, spaced 25000 ms apart from 230000 ms)
+  // to advance through post-legal menu screens (never presses B or DPAD_UP).
+  for (let n = 1; n <= 5; n++) {
+    const groupStart = 230000 + (n - 1) * 25000;
+    for (let i = 0; i < n; i++) {
+      events.push(
+        Object.freeze({ atMs: groupStart + i * 1500, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN })
+      );
+    }
+    events.push(
+      Object.freeze({ atMs: groupStart + n * 1500 + 1500, holdMs: 100, button: INPUT_BUTTONS.A })
+    );
+  }
+  return Object.freeze(events);
+}
+
 // Named deterministic scripted-input presets.
 // - 'start-screen': matches tools/run_native_boot.py (A held 100 ms every 1000 ms starting at 5000 ms).
 // - 'menu-flow': periodic A presses on Start Screen, clean pauses across CONTINUE / UI TEXT SIZE,
@@ -226,6 +259,12 @@ function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
 //   Intro cinematic skip (hold A / MENU) -> Main Menu Story/Play selection -> brief in-game
 //   left stick, right stick, and LT/RT trigger movement (runtime #1139), completing cleanly
 //   at 59300 ms with all inputs released (never presses B or DPAD_UP).
+// - 'chrome-menu-flow-2': Mirrors PR #1333 (menu-flow-2) for Chrome Wasm64 boots:
+//   human-paced A every 2500 ms from 110000 ms through 165000 ms (Start Screen / Calibration /
+//   UI TEXT SIZE), 3 cycles of DPAD_DOWN, DPAD_DOWN, A every 12000 ms from 169000 ms for
+//   LEGAL NOTICES ("Next >"), A at 206500 ms to leave the post-legal list screen, cycling
+//   DPAD_DOWN x N + A (N = 1..5, spaced 25000 ms apart from 230000 ms), then looping A every
+//   9000 ms from 360000 ms into Main Menu / In-Game (never presses B or DPAD_UP).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -394,6 +433,19 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
       }),
     ]),
   }),
+  'chrome-menu-flow-2': Object.freeze({
+    name: 'chrome-menu-flow-2',
+    events: buildChromeMenuFlow2Events(),
+    // Phase 5: Periodic A every 9000 ms from 360000 ms to advance cleanly into Main Menu /
+    // In-Game (mirrors PR #1333 menu-flow-2; never presses B or DPAD_UP).
+    loop: Object.freeze({
+      startMs: 360000,
+      periodMs: 9000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
+  }),
 });
 
 export const INPUT_SCRIPT_PRESET_NAMES = Object.freeze(Object.keys(INPUT_SCRIPT_PRESETS));
@@ -560,6 +612,11 @@ function validateOptionalEndMs(value) {
   return validateNonNegativeFinite(value, 'endMs');
 }
 
+function validateOptionalStartOffsetMs(value) {
+  if (value === undefined || value === null) return 0;
+  return validateNonNegativeFinite(value, 'startOffsetMs');
+}
+
 function validateOptionalMaxPresses(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
@@ -606,6 +663,7 @@ export class ScriptedInputPlayer {
         ...INPUT_SCRIPT_PRESETS[spec.preset],
         ...(spec.endMs !== undefined ? { endMs: spec.endMs } : null),
         ...(spec.maxPresses !== undefined ? { maxPresses: spec.maxPresses } : null),
+        ...(spec.startOffsetMs !== undefined ? { startOffsetMs: spec.startOffsetMs } : null),
       };
     }
 
@@ -621,6 +679,9 @@ export class ScriptedInputPlayer {
           ? spec.events
           : EMPTY_ARRAY;
       const specObj = Array.isArray(spec) ? null : spec;
+      const startOffsetMs = validateOptionalStartOffsetMs(
+        opts.startOffsetMs !== undefined ? opts.startOffsetMs : specObj?.startOffsetMs
+      );
       const endMs = validateOptionalEndMs(
         opts.endMs !== undefined ? opts.endMs : specObj?.endMs
       );
@@ -637,10 +698,11 @@ export class ScriptedInputPlayer {
         if (!ev || typeof ev !== 'object') {
           throw new TypeError(`Scripted input event at index ${index} must be an object`);
         }
-        const atMs = validateNonNegativeFinite(
-          ev.atMs !== undefined ? ev.atMs : ev.startMs,
-          `events[${index}].atMs`
-        );
+        const atMs =
+          validateNonNegativeFinite(
+            ev.atMs !== undefined ? ev.atMs : ev.startMs,
+            `events[${index}].atMs`
+          ) + startOffsetMs;
         const holdMs = validatePositiveFinite(ev.holdMs, `events[${index}].holdMs`);
         const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
         const sticks = normalizeScriptSticks(ev.sticks);
@@ -675,7 +737,8 @@ export class ScriptedInputPlayer {
         if (typeof rawLoop !== 'object' || Array.isArray(rawLoop)) {
           throw new TypeError('Scripted input loop must be an object');
         }
-        const loopStartMs = validateNonNegativeFinite(rawLoop.startMs ?? 0, 'loop.startMs');
+        const loopStartMs =
+          validateNonNegativeFinite(rawLoop.startMs ?? 0, 'loop.startMs') + startOffsetMs;
         const loopPeriodMs = validatePositiveFinite(rawLoop.periodMs, 'loop.periodMs');
         if (!Array.isArray(rawLoop.events)) {
           throw new TypeError('Scripted input loop.events must be an array');
@@ -737,8 +800,12 @@ export class ScriptedInputPlayer {
       this._loop = normalizedLoop;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
+      this.startOffsetMs = startOffsetMs;
     } else if (spec && typeof spec === 'object') {
-      const startMs = validateNonNegativeFinite(spec.startMs ?? 0, 'startMs');
+      const startOffsetMs = validateOptionalStartOffsetMs(
+        opts.startOffsetMs !== undefined ? opts.startOffsetMs : spec.startOffsetMs
+      );
+      const startMs = validateNonNegativeFinite(spec.startMs ?? 0, 'startMs') + startOffsetMs;
       const holdMs = validatePositiveFinite(spec.holdMs, 'holdMs');
       const periodMs = validatePositiveFinite(spec.periodMs, 'periodMs');
       const endMs = validateOptionalEndMs(opts.endMs !== undefined ? opts.endMs : spec.endMs);
@@ -769,6 +836,7 @@ export class ScriptedInputPlayer {
       this._loop = null;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
+      this.startOffsetMs = startOffsetMs;
     } else {
       throw new TypeError(
         'Input script spec must be a preset name, repeating schedule object, or event array'
