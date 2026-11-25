@@ -9,12 +9,16 @@ Pure Python 3.12 stdlib only. Usable both as an importable library and as a CLI:
 
     python tools/check_wasm_exports.py <runtime.wasm> [--json]
         [--require-memory64] [--require-shared-memory] [--require-host-imports]
+        [--browser-boot-required]
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -114,6 +118,99 @@ IMPORT_EXPORT_KINDS: dict[int, str] = {
 }
 
 KIND_TO_CODE: dict[str, int] = {name: code for code, name in IMPORT_EXPORT_KINDS.items()}
+
+_UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
+_POSIX_PATH_RE = re.compile(
+    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|proc|run|srv)/[^\s\"'<>|,;()\[\]]*"
+)
+
+
+def _current_usernames() -> list[str]:
+    """Return active OS username candidates (length >= 3) for redaction."""
+    names: list[str] = []
+    candidates: list[str] = [
+        os.environ.get("USERNAME", ""),
+        os.environ.get("USER", ""),
+        os.environ.get("LOGNAME", ""),
+    ]
+    try:
+        candidates.append(getpass.getuser())
+    except (OSError, KeyError, RuntimeError):
+        pass
+    try:
+        candidates.append(Path.home().name)
+    except (OSError, RuntimeError):
+        pass
+
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        if len(cleaned) >= 3 and cleaned not in names:
+            names.append(cleaned)
+    return names
+
+
+def _home_path_variants() -> list[str]:
+    """Return concrete home directory path strings (native + POSIX) for redaction."""
+    variants: list[str] = []
+    try:
+        home = Path.home()
+        for raw in (str(home), home.as_posix()):
+            cleaned = raw.rstrip("/\\")
+            if len(cleaned) >= 4 and cleaned not in variants:
+                variants.append(cleaned)
+    except (OSError, RuntimeError):
+        pass
+    return variants
+
+
+def sanitize_text(raw: str | None) -> str:
+    """Strip host filesystem paths, drive letters, UNC paths, POSIX roots, and usernames."""
+    if raw is None:
+        return ""
+    text = str(raw)
+    for home_str in _home_path_variants():
+        if home_str:
+            text = re.sub(
+                rf"{re.escape(home_str)}(?:[\\/][^\s\"'<>|,;()\[\]]*)?",
+                "<path>",
+                text,
+                flags=re.IGNORECASE,
+            )
+    text = _UNC_BS_PATH_RE.sub("<path>", text)
+    text = text.replace("\\", "/")
+    text = _WINDOWS_PATH_RE.sub("<path>", text)
+    text = _UNC_FS_PATH_RE.sub("<path>", text)
+    text = _POSIX_PATH_RE.sub("<path>", text)
+    for username in _current_usernames():
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        text = pattern.sub("<user>", text)
+    return text
+
+
+def sanitize_source_label(source: str | Path | None) -> str:
+    """Return a basename-only label for human-readable headers; never a host path."""
+    if source is None:
+        return "<memory>"
+    raw = str(source).strip()
+    if not raw:
+        return "<memory>"
+    if raw in ("-", "<stdin>"):
+        return "<stdin>"
+    if raw == "<memory>":
+        return "<memory>"
+    stripped = raw.rstrip("/\\")
+    if not stripped:
+        return "<file>"
+    parts = re.split(r"[/\\]+", stripped)
+    base = parts[-1]
+    if not base or (len(base) == 2 and base[1] == ":"):
+        return "<file>"
+    return sanitize_text(base)
 
 
 class WasmParseError(ValueError):
@@ -972,6 +1069,62 @@ class HostImportCheck:
 
 
 @dataclass(frozen=True)
+class BrowserBootExportSpec:
+    """Expected callable function export on `runtime.wasm` for browser boot."""
+
+    name: str
+    accepted_names: tuple[str, ...]
+    purpose: str = ""
+
+
+REQUIRED_BROWSER_BOOT_EXPORTS: tuple[BrowserBootExportSpec, ...] = (
+    BrowserBootExportSpec(
+        name="main",
+        accepted_names=("main", "_main"),
+        purpose="Guest runtime entrypoint invoked by web/loader.js",
+    ),
+    BrowserBootExportSpec(
+        name="playgta6_get_input_state_ptr",
+        accepted_names=("playgta6_get_input_state_ptr", "_playgta6_get_input_state_ptr"),
+        purpose="Linear-memory InputState pointer accessor for web/input bridge",
+    ),
+    BrowserBootExportSpec(
+        name="playgta6_audio_ring",
+        accepted_names=("playgta6_audio_ring", "_playgta6_audio_ring"),
+        purpose="Linear-memory Playgta6AudioRing pointer accessor for audio_worker (#1028)",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class BrowserBootExportCheck:
+    """Validation result for a single required browser-boot callable function export."""
+
+    name: str
+    accepted_names: tuple[str, ...]
+    present: bool
+    ok: bool
+    status: str  # "ok", "missing", "wrong_kind"
+    matched_name: str | None
+    actual_kind: str | None
+    export_index: int | None
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "accepted_names": list(self.accepted_names),
+            "present": self.present,
+            "ok": self.ok,
+            "status": self.status,
+            "matched_name": self.matched_name,
+            "actual_kind": self.actual_kind,
+            "export_index": self.export_index,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     """Structured Wasm64 / threads / host ABI validation report."""
 
@@ -995,12 +1148,16 @@ class ValidationReport:
     required_checks: dict[str, bool]
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
+    browser_boot_exports: tuple[BrowserBootExportCheck, ...] = ()
+    missing_browser_boot_exports: tuple[str, ...] = ()
+    mismatched_browser_boot_exports: tuple[str, ...] = ()
+    all_browser_boot_exports_ok: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a sanitized dictionary (counts, booleans, export/import names; zero host paths)."""
         return {
             "ok": self.ok,
             "abi_version": self.abi_version,
-            "path": self.path,
             "byte_size": self.byte_size,
             "wasm_version": self.wasm_version,
             "is_memory64": self.is_memory64,
@@ -1010,14 +1167,24 @@ class ValidationReport:
             "missing_host_imports": list(self.missing_host_imports),
             "mismatched_host_imports": list(self.mismatched_host_imports),
             "all_host_imports_ok": self.all_host_imports_ok,
+            "browser_boot_exports": [b.to_dict() for b in self.browser_boot_exports],
+            "browser_boot_exports_valid": sum(
+                1 for b in self.browser_boot_exports if b.ok
+            ),
+            "browser_boot_exports_total": len(self.browser_boot_exports),
+            "missing_browser_boot_exports": list(self.missing_browser_boot_exports),
+            "mismatched_browser_boot_exports": list(
+                self.mismatched_browser_boot_exports
+            ),
+            "all_browser_boot_exports_ok": self.all_browser_boot_exports_ok,
             "imports_count": self.imports_count,
             "exports_count": self.exports_count,
             "exports": [e.to_dict() for e in self.exports],
             "custom_sections": list(self.custom_sections),
             "target_features": list(self.target_features),
             "required_checks": dict(self.required_checks),
-            "errors": list(self.errors),
-            "warnings": list(self.warnings),
+            "errors": [sanitize_text(e) for e in self.errors],
+            "warnings": [sanitize_text(w) for w in self.warnings],
         }
 
 
@@ -1141,16 +1308,73 @@ def _check_single_host_import(
     )
 
 
+def _check_single_browser_boot_export(
+    spec: BrowserBootExportSpec,
+    exports_by_name: dict[str, list[WasmExport]],
+) -> BrowserBootExportCheck:
+    matches: list[WasmExport] = []
+    for candidate in spec.accepted_names:
+        matches.extend(exports_by_name.get(candidate, ()))
+
+    if not matches:
+        accepted = " / ".join(spec.accepted_names)
+        return BrowserBootExportCheck(
+            name=spec.name,
+            accepted_names=spec.accepted_names,
+            present=False,
+            ok=False,
+            status="missing",
+            matched_name=None,
+            actual_kind=None,
+            export_index=None,
+            detail=f"missing required browser-boot callable function export {accepted}",
+        )
+
+    # Prefer a callable function export if multiple aliases or entries exist.
+    exp = next((m for m in matches if m.kind == "func"), matches[0])
+    if exp.kind != "func":
+        return BrowserBootExportCheck(
+            name=spec.name,
+            accepted_names=spec.accepted_names,
+            present=True,
+            ok=False,
+            status="wrong_kind",
+            matched_name=exp.name,
+            actual_kind=exp.kind,
+            export_index=exp.index,
+            detail=(
+                f"browser-boot export {exp.name!r} has kind {exp.kind!r}, "
+                "expected callable 'func'"
+            ),
+        )
+
+    return BrowserBootExportCheck(
+        name=spec.name,
+        accepted_names=spec.accepted_names,
+        present=True,
+        ok=True,
+        status="ok",
+        matched_name=exp.name,
+        actual_kind="func",
+        export_index=exp.index,
+        detail=f"exported callable func {exp.name!r} (index {exp.index})",
+    )
+
+
 def validate_runtime_wasm(
     module: WasmModule,
     *,
     require_memory64: bool = False,
     require_shared_memory: bool = False,
     require_host_imports: bool = False,
+    require_browser_boot: bool = False,
     expected_host_imports: Sequence[HostImportSpec] = REQUIRED_HOST_IMPORTS,
+    expected_browser_boot_exports: Sequence[
+        BrowserBootExportSpec
+    ] = REQUIRED_BROWSER_BOOT_EXPORTS,
     path: str | None = None,
 ) -> ValidationReport:
-    """Validate a parsed `WasmModule` against Wasm64/threads/host ABI requirements."""
+    """Validate a parsed `WasmModule` against Wasm64/threads/host ABI & browser-boot requirements."""
     all_memories = module.all_memories
     is_memory64 = any(m.is_memory64 for m in all_memories)
     is_shared_memory = any(m.is_shared for m in all_memories)
@@ -1168,6 +1392,22 @@ def validate_runtime_wasm(
         c.name for c in host_checks if c.present and not c.ok
     )
     all_host_imports_ok = all(c.ok for c in host_checks)
+
+    exports_by_name: dict[str, list[WasmExport]] = {}
+    for exp in module.exports:
+        exports_by_name.setdefault(exp.name, []).append(exp)
+
+    browser_boot_checks = tuple(
+        _check_single_browser_boot_export(spec, exports_by_name)
+        for spec in expected_browser_boot_exports
+    )
+    missing_browser_boot_exports = tuple(
+        c.name for c in browser_boot_checks if c.status == "missing"
+    )
+    mismatched_browser_boot_exports = tuple(
+        c.name for c in browser_boot_checks if c.present and not c.ok
+    )
+    all_browser_boot_exports_ok = all(c.ok for c in browser_boot_checks)
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -1212,10 +1452,16 @@ def validate_runtime_wasm(
             else:
                 warnings.append(check.detail)
 
+    if require_browser_boot:
+        for boot_check in browser_boot_checks:
+            if not boot_check.ok:
+                errors.append(boot_check.detail)
+
     required_checks = {
         "memory64": require_memory64,
         "shared_memory": require_shared_memory,
         "host_imports": require_host_imports,
+        "browser_boot_exports": require_browser_boot,
     }
 
     return ValidationReport(
@@ -1239,6 +1485,10 @@ def validate_runtime_wasm(
         required_checks=required_checks,
         errors=tuple(errors),
         warnings=tuple(warnings),
+        browser_boot_exports=browser_boot_checks,
+        missing_browser_boot_exports=missing_browser_boot_exports,
+        mismatched_browser_boot_exports=mismatched_browser_boot_exports,
+        all_browser_boot_exports_ok=all_browser_boot_exports_ok,
     )
 
 
@@ -1248,6 +1498,7 @@ def validate_wasm_file(
     require_memory64: bool = False,
     require_shared_memory: bool = False,
     require_host_imports: bool = False,
+    require_browser_boot: bool = False,
 ) -> ValidationReport:
     """Read, parse, and validate a `.wasm` file from disk."""
     file_path = Path(path)
@@ -1258,6 +1509,7 @@ def validate_wasm_file(
         require_memory64=require_memory64,
         require_shared_memory=require_shared_memory,
         require_host_imports=require_host_imports,
+        require_browser_boot=require_browser_boot,
         path=str(file_path),
     )
 
@@ -1270,7 +1522,7 @@ def validate_wasm_file(
 def format_report_text(report: ValidationReport) -> str:
     """Render a human-readable validation summary."""
     status_label = "PASS" if report.ok else "FAIL"
-    header_target = report.path or "<memory>"
+    header_target = sanitize_source_label(report.path)
     lines: list[str] = [
         f"Wasm ABI Validation [{status_label}]: {header_target}",
         f"  Size:           {report.byte_size} bytes (Wasm v{report.wasm_version}, ABI v{report.abi_version})",
@@ -1278,6 +1530,8 @@ def format_report_text(report: ValidationReport) -> str:
         f"  Shared Memory:  {'YES' if report.is_shared_memory else 'NO'}",
         f"  Host Imports:   {'OK' if report.all_host_imports_ok else 'INCOMPLETE/MISMATCH'} "
         f"({sum(1 for h in report.host_imports if h.ok)}/{len(report.host_imports)} valid)",
+        f"  Browser Boot:   {'OK' if report.all_browser_boot_exports_ok else 'INCOMPLETE/MISMATCH'} "
+        f"({sum(1 for b in report.browser_boot_exports if b.ok)}/{len(report.browser_boot_exports)} callable)",
         f"  Counts:         {report.imports_count} imports, {report.exports_count} exports, "
         f"{len(report.memories)} memories",
     ]
@@ -1307,6 +1561,20 @@ def format_report_text(report: ValidationReport) -> str:
             f"actual {actual}"
         )
 
+    if report.browser_boot_exports:
+        lines.append("  Browser-boot callable exports:")
+        for boot_check in report.browser_boot_exports:
+            actual = (
+                f"{boot_check.matched_name} ({boot_check.actual_kind})"
+                if boot_check.matched_name is not None
+                else "missing"
+            )
+            tag = boot_check.status.upper()
+            lines.append(
+                f"    [{tag}] {' / '.join(boot_check.accepted_names)}: "
+                f"expected func, actual {actual}"
+            )
+
     if report.custom_sections:
         lines.append(f"  Custom sections: {', '.join(report.custom_sections)}")
     if report.target_features:
@@ -1315,18 +1583,18 @@ def format_report_text(report: ValidationReport) -> str:
     if report.errors:
         lines.append("  Errors:")
         for err in report.errors:
-            lines.append(f"    - {err}")
+            lines.append(f"    - {sanitize_text(err)}")
 
     if report.warnings:
         lines.append("  Warnings:")
         for warn in report.warnings:
-            lines.append(f"    - {warn}")
+            lines.append(f"    - {sanitize_text(warn)}")
 
     return "\n".join(lines)
 
 
 def report_to_json(report: ValidationReport, *, indent: int = 2) -> str:
-    """Serialize a `ValidationReport` to formatted JSON."""
+    """Serialize a `ValidationReport` to sanitized, formatted JSON (zero host paths)."""
     return json.dumps(report.to_dict(), indent=indent)
 
 
@@ -1534,11 +1802,14 @@ def build_valid_runtime_wasm(
     wasm32_host_sigs: bool = False,
     omit_host_imports: Sequence[str] = (),
     include_target_features: bool = True,
+    include_browser_boot_exports: bool = False,
+    browser_boot_export_names: Sequence[str] | None = None,
 ) -> bytes:
     """Build a synthetic `runtime.wasm` fixture matching `docs/wasm_abi.md`."""
     omit_set = set(omit_host_imports)
     types: list[tuple[Sequence[str], Sequence[str]]] = []
     imports: list[dict[str, Any]] = []
+    function_types: list[int] = []
     memories: list[dict[str, Any]] = []
 
     if imported_memory:
@@ -1563,6 +1834,7 @@ def build_valid_runtime_wasm(
             }
         )
 
+    imported_func_count = 0
     for spec in REQUIRED_HOST_IMPORTS:
         if spec.name in omit_set:
             continue
@@ -1578,8 +1850,22 @@ def build_valid_runtime_wasm(
                 "type_index": type_idx,
             }
         )
+        imported_func_count += 1
 
-    exports = [("memory", "memory", 0)]
+    exports: list[tuple[str, str, int]] = [("memory", "memory", 0)]
+    if include_browser_boot_exports or browser_boot_export_names is not None:
+        names = (
+            tuple(browser_boot_export_names)
+            if browser_boot_export_names is not None
+            else ("_main", "_playgta6_get_input_state_ptr", "_playgta6_audio_ring")
+        )
+        ptr_type = "i64" if is_memory64 else "i32"
+        export_type_idx = len(types)
+        types.append(((), (ptr_type,)))
+        for offset, export_name in enumerate(names):
+            function_types.append(export_type_idx)
+            exports.append((export_name, "func", imported_func_count + offset))
+
     features: list[str] = []
     if include_target_features:
         if is_memory64:
@@ -1591,6 +1877,7 @@ def build_valid_runtime_wasm(
     return build_wasm_module(
         types=types,
         imports=imports,
+        function_types=function_types,
         memories=memories,
         exports=exports,
         target_features=features,
@@ -1606,7 +1893,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Inspect and validate a compiled WebAssembly binary for Wasm64 memory64, "
-            "shared memory (-pthread), and playgta6 env.host_* ABI imports."
+            "shared memory (-pthread), playgta6 env.host_* ABI imports, and browser-boot exports."
         )
     )
     parser.add_argument(
@@ -1617,7 +1904,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         dest="as_json",
-        help="Emit structured JSON output instead of human-readable text.",
+        help="Emit sanitized structured JSON output instead of human-readable text (zero host paths).",
     )
     parser.add_argument(
         "--require-memory64",
@@ -1634,6 +1921,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fail with exit code 1 unless all required env.host_* Wasm64 ABI imports are present and match.",
     )
+    parser.add_argument(
+        "--browser-boot-required",
+        action="store_true",
+        dest="require_browser_boot",
+        help=(
+            "Fail with exit code 1 unless callable function exports for main/_main, "
+            "playgta6_get_input_state_ptr/_playgta6_get_input_state_ptr, and "
+            "playgta6_audio_ring/_playgta6_audio_ring are present."
+        ),
+    )
     return parser
 
 
@@ -1646,16 +1943,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_label = "<stdin>"
     else:
         path = Path(args.wasm_file)
-        source_label = str(path)
+        source_label = sanitize_source_label(path)
         if not path.is_file():
-            err_msg = f"wasm file not found: {path}"
+            if args.as_json:
+                err_msg = "wasm file not found"
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "abi_version": ABI_VERSION,
+                            "error": err_msg,
+                            "errors": [err_msg],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Error: wasm file not found: {source_label}", file=sys.stderr)
+            return 2
+        try:
+            raw_bytes = path.read_bytes()
+        except OSError as exc:
+            err_msg = sanitize_text(
+                f"unable to read wasm file ({exc.strerror or type(exc).__name__})"
+            )
             if args.as_json:
                 print(
                     json.dumps(
                         {
                             "ok": False,
                             "abi_version": ABI_VERSION,
-                            "path": source_label,
                             "error": err_msg,
                             "errors": [err_msg],
                         },
@@ -1665,19 +1982,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"Error: {err_msg}", file=sys.stderr)
             return 2
-        raw_bytes = path.read_bytes()
 
     try:
         module = parse_wasm_module(raw_bytes)
     except WasmParseError as exc:
-        err_msg = str(exc)
+        err_msg = sanitize_text(str(exc))
         if args.as_json:
             print(
                 json.dumps(
                     {
                         "ok": False,
                         "abi_version": ABI_VERSION,
-                        "path": source_label,
                         "byte_size": len(raw_bytes),
                         "parse_error": err_msg,
                         "offset": exc.offset,
@@ -1695,6 +2010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_memory64=args.require_memory64,
         require_shared_memory=args.require_shared_memory,
         require_host_imports=args.require_host_imports,
+        require_browser_boot=args.require_browser_boot,
         path=source_label,
     )
 
