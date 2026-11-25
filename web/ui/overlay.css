@@ -111,8 +111,9 @@
   --duration-fast: 125ms;
   --ease-standard: cubic-bezier(0.24, 1, 0.4, 1);
 
-  /* --- Splash Cross-Fade & Astryx-Matched Surface Tokens (W232 / W252) --- */
-  --pg6-splash-fade: 400ms;
+  /* --- Splash Cross-Fade & Astryx-Matched Surface Tokens (W232 / W252 / W311 / W330) --- */
+  --pg6-splash-fade-out: 220ms;
+  --pg6-splash-fade: 220ms;
   --pg6-splash-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --pg6-splash-backdrop: var(--color-background-surface);
   --pg6-splash-backdrop-strong: var(--color-background-surface);
@@ -1049,8 +1050,8 @@ body {
 .pg6-fade-transition {
   opacity: 1;
   transition:
-    opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease),
-    transform var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+    opacity var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1)),
+    transform var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1));
   will-change: opacity;
 }
 
@@ -1059,8 +1060,8 @@ body {
   transform: translateY(4px);
   pointer-events: none;
   transition:
-    opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease),
-    transform var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+    opacity var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1)),
+    transform var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1));
 }
 
 .pg6-splash-frosted {
@@ -1087,17 +1088,28 @@ body {
   -webkit-backdrop-filter: blur(18px);
 }
 
+.pg6-splash,
 #splash-overlay-root .pg6-splash {
   padding: 0 12px 24px;
   background: var(--color-background-body);
   color: var(--color-text-primary);
   font-family: var(--font-family-body);
-  transition: opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+  opacity: 1;
+  transition: opacity var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1));
   will-change: opacity;
 }
 
+.pg6-splash.pg6-splash--fading,
 #splash-overlay-root .pg6-splash.pg6-splash--fading {
   opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1));
+}
+
+.pg6-splash.pg6-splash--fading .pg6-splash__panel,
+#splash-overlay-root .pg6-splash.pg6-splash--fading .pg6-splash__panel {
+  opacity: 0;
+  transform: translateY(4px);
   pointer-events: none;
 }
 
@@ -1120,6 +1132,9 @@ body {
   line-height: 1.4;
   user-select: none;
   contain: layout style paint;
+  transition:
+    opacity var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1)),
+    transform var(--pg6-splash-fade, 220ms) var(--pg6-splash-ease, cubic-bezier(0.22, 1, 0.36, 1));
 }
 
 #splash-overlay-root .pg6-splash__stage-row,
@@ -1246,7 +1261,162 @@ body {
 }
 
 /* ============================================================================
- * Reduced Motion & Instant HUD / Splash Hiding (W226)
+ * Programmatic Reduced-Motion Override (`[data-reduced-motion="true"]`) (W330)
+ * ========================================================================== */
+
+.pg6-splash[data-reduced-motion="true"],
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] {
+  --pg6-splash-fade: 0ms;
+  --pg6-splash-fade-out: 0ms;
+  transition: none !important;
+  transition-duration: 0ms !important;
+  transition-delay: 0ms !important;
+  will-change: auto;
+}
+
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__panel,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__panel,
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__bar-fill,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__bar-fill,
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__stream-fill,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__stream-fill,
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__spinner,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__spinner {
+  transition: none !important;
+  transition-duration: 0ms !important;
+  transition-delay: 0ms !important;
+  transform: none !important;
+}
+
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__spinner-ring,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__spinner-ring,
+.pg6-splash[data-reduced-motion="true"] .pg6-splash__greg,
+#splash-overlay-root .pg6-splash[data-reduced-motion="true"] .pg6-splash__greg {
+  animation: none !important;
+}
+
+/* ============================================================================
+ * Responsive Viewport Sizing — 1080p Baseline, 4K & Narrow Viewports (W330)
+ * Keeps the compact top-left Astryx `#hud` card crisp without bloating it.
+ * ========================================================================== */
+
+@media (min-width: 2560px) {
+  #hud {
+    top: 16px;
+    left: 16px;
+    width: min(344px, calc(100vw - 32px));
+    max-width: 344px;
+    font-size: 12.5px;
+  }
+
+  #hud.collapsed {
+    max-width: calc(100vw - 32px);
+  }
+
+  #hud-body {
+    max-height: calc(100vh - 88px);
+    max-height: calc(100dvh - 88px);
+  }
+
+  .hud-brand,
+  .hud-metric-value {
+    font-size: 13.5px;
+  }
+
+  .pg6-splash,
+  #splash-overlay-root .pg6-splash {
+    padding: 0 16px 36px;
+  }
+
+  .pg6-splash__panel,
+  #splash-overlay-root .pg6-splash__panel {
+    width: min(368px, calc(100vw - 32px));
+    max-width: 368px;
+    padding: 14px 16px;
+    font-size: 12.5px;
+  }
+
+  .pg6-splash__stage,
+  #splash-overlay-root .pg6-splash__stage {
+    font-size: 12.5px;
+  }
+}
+
+@media (max-width: 640px) {
+  #hud {
+    top: 8px;
+    left: 8px;
+    width: min(320px, calc(100vw - 16px));
+  }
+
+  #hud.collapsed {
+    max-width: calc(100vw - 16px);
+  }
+
+  .hud-header {
+    padding: 10px 8px 6px 12px;
+  }
+
+  #hud-body {
+    gap: 8px;
+    padding: 4px 12px 10px;
+    max-height: calc(100vh - 60px);
+    max-height: calc(100dvh - 60px);
+  }
+
+  .hud-metric-cell {
+    padding: 6px 8px;
+  }
+
+  .pg6-splash,
+  #splash-overlay-root .pg6-splash {
+    padding: 0 8px 16px;
+  }
+
+  .pg6-splash__panel,
+  #splash-overlay-root .pg6-splash__panel {
+    width: min(340px, calc(100vw - 16px));
+    padding: 10px 12px;
+  }
+}
+
+@media (max-width: 380px) {
+  .hud-metrics-strip {
+    gap: 4px;
+  }
+
+  .hud-metric-value {
+    font-size: 12px;
+  }
+
+  .hud-primary-actions,
+  .controls-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #hud.collapsed .hud-pill-meta {
+    display: none;
+  }
+}
+
+@media (max-height: 600px) {
+  #hud-body {
+    max-height: calc(100vh - 56px);
+    max-height: calc(100dvh - 56px);
+  }
+
+  #hud-log {
+    height: 68px;
+  }
+
+  .pg6-splash,
+  #splash-overlay-root .pg6-splash {
+    padding-bottom: 14px;
+  }
+}
+
+/* ============================================================================
+ * Reduced Motion & Instant HUD / Splash Hiding (W226 / W330)
  * ========================================================================== */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1254,12 +1424,18 @@ body {
   [data-astryx-theme="astryx"] {
     --duration-fast: 0ms;
     --pg6-splash-fade: 0ms;
+    --pg6-splash-fade-out: 0ms;
   }
 
   #hud,
   #splash-overlay-root,
   .pg6-splash,
+  .pg6-splash.pg6-splash--fading,
   #splash-overlay-root .pg6-splash,
+  #splash-overlay-root .pg6-splash.pg6-splash--fading,
+  .pg6-splash__panel,
+  #splash-overlay-root .pg6-splash__panel,
+  .pg6-splash__spinner,
   #splash-overlay-root .pg6-splash__spinner,
   .pg6-fade-transition,
   .pg6-fade-out,
@@ -1277,9 +1453,18 @@ body {
     transition-delay: 0ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    will-change: auto;
   }
 
+  .pg6-fade-out,
+  .pg6-splash.pg6-splash--fading .pg6-splash__panel,
+  #splash-overlay-root .pg6-splash.pg6-splash--fading .pg6-splash__panel {
+    transform: none !important;
+  }
+
+  .pg6-splash__spinner-ring,
   #splash-overlay-root .pg6-splash__spinner-ring,
+  .pg6-splash__greg,
   #splash-overlay-root .pg6-splash__greg {
     animation: none !important;
   }
