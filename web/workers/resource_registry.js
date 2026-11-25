@@ -295,6 +295,31 @@
     }
   }
 
+  function sanitizeNonNegativeCounter(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function clampUnitRate(numerator, denominator) {
+    if (
+      typeof numerator !== 'number' ||
+      typeof denominator !== 'number' ||
+      !Number.isFinite(numerator) ||
+      !Number.isFinite(denominator) ||
+      denominator <= 0 ||
+      numerator <= 0
+    ) {
+      return 0;
+    }
+    const rate = numerator / denominator;
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return 0;
+    }
+    return rate >= 1 ? 1 : rate;
+  }
+
   function snapshotEntry(entry) {
     return {
       kind: entry.kind,
@@ -1460,13 +1485,17 @@
       this._mipClampCount = 0;
       this._sampleClampCount = 0;
 
-      // Additive W178/W201 view-cache and texture-recreation telemetry exposed on getStats().
+      // Additive W178/W201/W250 view-cache, format, and peak-live telemetry exposed on getStats().
       this._staleViewsInvalidated = 0;
       this._viewCacheHits = 0;
       this._viewCacheMisses = 0;
       this._viewCacheInvalidations = 0;
       this._viewCacheEvictions = 0;
       this._textureRecreations = 0;
+      this._r8unormTextures = 0;
+      this._rgba8unormTextures = 0;
+      this._peakLiveTextures = 0;
+      this._peakLiveBuffers = 0;
     }
 
     /**
@@ -1502,6 +1531,32 @@
         this._peakBytes = totalBytes;
       }
       return totalBytes;
+    }
+
+    _updatePeakLiveCounts(kind) {
+      if (kind === RESOURCE_KIND.TEXTURE) {
+        const liveTextures = this._tables.get(RESOURCE_KIND.TEXTURE).size;
+        if (liveTextures > this._peakLiveTextures) {
+          this._peakLiveTextures = liveTextures;
+        }
+      } else if (kind === RESOURCE_KIND.BUFFER) {
+        const liveBuffers = this._tables.get(RESOURCE_KIND.BUFFER).size;
+        if (liveBuffers > this._peakLiveBuffers) {
+          this._peakLiveBuffers = liveBuffers;
+        }
+      }
+    }
+
+    _recordTextureFormatTelemetry(format) {
+      if (typeof format !== 'string') {
+        return;
+      }
+      const normalized = format.trim().toLowerCase();
+      if (normalized === 'r8unorm') {
+        this._r8unormTextures += 1;
+      } else if (normalized === 'rgba8unorm') {
+        this._rgba8unormTextures += 1;
+      }
     }
 
     _checkBudget(context) {
@@ -1903,6 +1958,7 @@
       this._nextRegistrationSeq += 1;
 
       table.set(handle, entry);
+      this._updatePeakLiveCounts(kind);
 
       if (kind === RESOURCE_KIND.TEXTURE) {
         const autoMeta = this._maybeBuildTextureMetaFromRegistration(
@@ -1914,6 +1970,7 @@
         );
         if (autoMeta) {
           this._textureMeta.set(handle, autoMeta);
+          this._recordTextureFormatTelemetry(autoMeta.format);
         }
       } else if (kind === RESOURCE_KIND.TEXTURE_VIEW && linkedTextureId !== null) {
         let linkedSet = this._linkedViewHandlesByTexture.get(linkedTextureId);
@@ -2211,6 +2268,7 @@
         isTexture2: Boolean(options && options.isTexture2),
         byteSize: estimatedBytes,
       });
+      this._recordTextureFormatTelemetry(sanitized.effectiveFormat);
 
       if (
         (!options || options.createView !== false) &&
@@ -3001,7 +3059,8 @@
 
     /**
      * Return a sanitized snapshot of per-kind counts, VRAM byte accounting,
-     * lifecycle stats, and Frame-1 hardening counters.
+     * lifecycle stats, Frame-1 hardening counters, and W250 texture-view &
+     * r8unorm/rgba8unorm format telemetry.
      */
     getStats() {
       const countsByKind = {};
@@ -3013,7 +3072,7 @@
         countsByKind[kind] = count;
         byKind[kind] = {
           count,
-          bytes: this._activeBytesByKind[kind],
+          bytes: sanitizeNonNegativeCounter(this._activeBytesByKind[kind]),
         };
         activeCount += count;
       }
@@ -3031,40 +3090,106 @@
         cachedViewCount += perTexCache.size;
       }
 
+      const activeBytes = sanitizeNonNegativeCounter(this._activeBytes);
+      const pendingRetireBytes = sanitizeNonNegativeCounter(this._pendingRetireBytes);
+      const totalBytes = activeBytes + pendingRetireBytes;
+      const peakBytes = Math.max(totalBytes, sanitizeNonNegativeCounter(this._peakBytes));
+
+      const liveTextures = countsByKind[RESOURCE_KIND.TEXTURE];
+      const liveBuffers = countsByKind[RESOURCE_KIND.BUFFER];
+      const peakLiveTextures = Math.max(
+        liveTextures,
+        sanitizeNonNegativeCounter(this._peakLiveTextures)
+      );
+      const peakLiveBuffers = Math.max(
+        liveBuffers,
+        sanitizeNonNegativeCounter(this._peakLiveBuffers)
+      );
+
+      const viewCacheHits = sanitizeNonNegativeCounter(this._viewCacheHits);
+      const viewCacheMisses = sanitizeNonNegativeCounter(this._viewCacheMisses);
+      const viewCacheHitRate = clampUnitRate(viewCacheHits, viewCacheHits + viewCacheMisses);
+      const viewCacheInvalidations = sanitizeNonNegativeCounter(this._viewCacheInvalidations);
+
       return {
         countsByKind,
         byKind,
         pendingCountsByKind,
         activeCount,
         pendingRetireCount: this._pendingRetire.length,
-        activeBytes: this._activeBytes,
-        pendingRetireBytes: this._pendingRetireBytes,
-        totalBytes: this._activeBytes + this._pendingRetireBytes,
-        peakBytes: this._peakBytes,
-        peakTotalBytes: this._peakBytes,
+        activeBytes,
+        pendingRetireBytes,
+        totalBytes,
+        peakBytes,
+        peakTotalBytes: peakBytes,
+        peakLiveTextures,
+        peakLiveBuffers,
         softBudgetBytes: this.softBudgetBytes,
         budgetExceeded: this._budgetExceeded,
-        budgetWarningCount: this._budgetWarningCount,
-        totalRegistered: this._totalRegistered,
-        totalRetired: this._totalRetired,
-        totalDestroyed: this._totalDestroyed,
-        destroyErrors: this._destroyErrors,
-        currentFrame: this._currentFrame,
+        budgetWarningCount: sanitizeNonNegativeCounter(this._budgetWarningCount),
+        totalRegistered: sanitizeNonNegativeCounter(this._totalRegistered),
+        totalRetired: sanitizeNonNegativeCounter(this._totalRetired),
+        totalDestroyed: sanitizeNonNegativeCounter(this._totalDestroyed),
+        destroyErrors: sanitizeNonNegativeCounter(this._destroyErrors),
+        currentFrame: sanitizeNonNegativeCounter(this._currentFrame),
         framesInFlight: this.framesInFlight,
-        bcFormatFallbackCount: this._bcFormatFallbackCount,
-        bcDimensionAlignCount: this._bcDimensionAlignCount,
-        bufferAlignPadCount: this._bufferAlignPadCount,
-        mipClampCount: this._mipClampCount,
-        sampleClampCount: this._sampleClampCount,
-        staleViewsInvalidated: this._staleViewsInvalidated,
-        viewCacheHits: this._viewCacheHits,
-        viewCacheMisses: this._viewCacheMisses,
-        viewCacheInvalidations: this._viewCacheInvalidations,
-        viewCacheEvictions: this._viewCacheEvictions,
+        bcFormatFallbackCount: sanitizeNonNegativeCounter(this._bcFormatFallbackCount),
+        bcDimensionAlignCount: sanitizeNonNegativeCounter(this._bcDimensionAlignCount),
+        bufferAlignPadCount: sanitizeNonNegativeCounter(this._bufferAlignPadCount),
+        mipClampCount: sanitizeNonNegativeCounter(this._mipClampCount),
+        sampleClampCount: sanitizeNonNegativeCounter(this._sampleClampCount),
+        staleViewsInvalidated: sanitizeNonNegativeCounter(this._staleViewsInvalidated),
+        viewCacheHits,
+        viewCacheMisses,
+        viewCacheHitRate,
+        viewCacheInvalidations,
+        viewInvalidations: viewCacheInvalidations,
+        viewCacheEvictions: sanitizeNonNegativeCounter(this._viewCacheEvictions),
         maxCachedViewsPerTexture: this.maxCachedViewsPerTexture,
-        textureRecreations: this._textureRecreations,
+        textureRecreations: sanitizeNonNegativeCounter(this._textureRecreations),
+        r8unormTextures: sanitizeNonNegativeCounter(this._r8unormTextures),
+        rgba8unormTextures: sanitizeNonNegativeCounter(this._rgba8unormTextures),
         cachedViewCount,
       };
+    }
+
+    /**
+     * Reset cumulative telemetry counters while preserving all live resources,
+     * cached texture views, texture generations, and deferred retirement queues.
+     * Re-baselines `peakBytes`, `peakLiveTextures`, and `peakLiveBuffers` to the
+     * current live occupancy so peak >= live invariants always hold.
+     *
+     * @returns {object} Fresh `getStats()` snapshot after reset
+     */
+    resetStats() {
+      this._peakBytes =
+        sanitizeNonNegativeCounter(this._activeBytes) +
+        sanitizeNonNegativeCounter(this._pendingRetireBytes);
+      this._peakLiveTextures = this._tables.get(RESOURCE_KIND.TEXTURE).size;
+      this._peakLiveBuffers = this._tables.get(RESOURCE_KIND.BUFFER).size;
+
+      this._budgetWarningCount = 0;
+      this._totalRegistered = 0;
+      this._totalRetired = 0;
+      this._totalDestroyed = 0;
+      this._destroyErrors = 0;
+
+      this._bcFormatFallbackCount = 0;
+      this._bcDimensionAlignCount = 0;
+      this._bufferAlignPadCount = 0;
+      this._mipClampCount = 0;
+      this._sampleClampCount = 0;
+
+      this._staleViewsInvalidated = 0;
+      this._viewCacheHits = 0;
+      this._viewCacheMisses = 0;
+      this._viewCacheInvalidations = 0;
+      this._viewCacheEvictions = 0;
+      this._textureRecreations = 0;
+      this._r8unormTextures = 0;
+      this._rgba8unormTextures = 0;
+
+      return this.getStats();
     }
 
     /**
