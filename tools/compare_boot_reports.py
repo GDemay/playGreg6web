@@ -43,9 +43,13 @@ Tolerances: a value pair matches when |a - b| <= max(floor, rel * max(|a|, |b|))
 Everything else must match exactly. `--ignore PATTERN` (repeatable, fnmatch on the field path,
 e.g. `milestones.*.elapsed_ms` or `address_space.*`) drops known-different fields.
 
-Output is text by default and `--json` for automation. When GPU/draw/frame-pacing metrics (including
-`FIRST_VISIBLE_FRAME` and `black_loading_ms` / `blackLoadingMs`) are present in both reports, an
-additive, strictly-sanitized `gpu_delta` summary is included without altering pass/fail verdicts or
+Output is text by default, `--markdown` for Markdown tables, and `--json` for automation. When
+GPU/draw/frame-pacing metrics (including `FIRST_VISIBLE_FRAME` and `black_loading_ms` /
+`blackLoadingMs`) are present in both reports, an additive, strictly-sanitized `gpu_delta` summary
+is included without altering pass/fail verdicts or exit codes. When Chrome boot telemetry metrics
+(`first_visible_frame_s`, `black_loading_s`, `js_heap_used_mb`, `js_heap_total_mb`,
+`audio_ring_attached`, `audio_frames_drained`) are present in either report, an additive,
+strictly-sanitized `telemetry_delta` summary is included without altering pass/fail verdicts or
 exit codes. When sanitized `gpu_adapter` labels differ between baseline and candidate, an
 informational warning note is emitted without altering pass/fail verdicts or exit codes. Exit code:
 0 pass, 1 differences, 2 usage error (missing or malformed input).
@@ -95,6 +99,7 @@ class Comparison:
     ignore: list[str]
     entries: list[dict[str, Any]] = field(default_factory=list)
     gpu_delta: dict[str, dict[str, int | float | None]] = field(default_factory=dict)
+    telemetry_delta: dict[str, dict[str, Any]] = field(default_factory=dict)
     gpu_adapter: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -518,6 +523,37 @@ def _first_number(*candidates: Any) -> int | float | None:
     return None
 
 
+def _non_negative_number(value: Any) -> int | float | None:
+    num = _finite_number(value)
+    if num is None or float(num) < 0.0:
+        return None
+    return num
+
+
+def _first_non_negative_number(*candidates: Any) -> int | float | None:
+    for candidate in candidates:
+        num = _non_negative_number(candidate)
+        if num is not None:
+            return num
+    return None
+
+
+def _strict_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _first_bool(*candidates: Any) -> bool | None:
+    for candidate in candidates:
+        b = _strict_bool(candidate)
+        if b is not None:
+            return b
+    return None
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def extract_gpu_metrics(
     report: dict[str, Any],
     presents: list[dict[str, Any]] | None = None,
@@ -746,6 +782,433 @@ def compute_gpu_delta(
     return out
 
 
+TELEMETRY_DELTA_METRICS: tuple[str, ...] = (
+    "first_visible_frame_s",
+    "black_loading_s",
+    "js_heap_used_mb",
+    "js_heap_total_mb",
+    "audio_ring_attached",
+    "audio_frames_drained",
+)
+
+_TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
+    "first_visible_frame_s": {"kind": "float", "unit": "s", "better": "lower"},
+    "black_loading_s": {"kind": "float", "unit": "s", "better": "lower"},
+    "js_heap_used_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "js_heap_total_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "audio_ring_attached": {"kind": "bool", "unit": "", "better": "true"},
+    "audio_frames_drained": {"kind": "int", "unit": "", "better": "higher"},
+}
+
+_BYTES_PER_MIB = 1024.0 * 1024.0
+
+
+def _format_decimal(value: float, *, signed: bool = False) -> str:
+    """Format a float with 1 decimal place when exact to 0.1 (e.g. -38.2, -950.0), else 2 decimals."""
+    rounded = round(float(value), 2)
+    if rounded == 0.0:
+        rounded = 0.0
+    if abs(rounded * 10.0 - round(rounded * 10.0)) < 1e-6:
+        fmt = "+.1f" if signed and rounded != 0.0 else ".1f"
+    else:
+        fmt = "+.2f" if signed and rounded != 0.0 else ".2f"
+    return format(rounded, fmt)
+
+
+def _format_telemetry_value(metric: str, value: Any) -> str:
+    if value is None:
+        return "<missing>"
+    spec = _TELEMETRY_METRIC_SPECS[metric]
+    kind = spec["kind"]
+    unit = spec["unit"]
+    if kind == "bool":
+        return "true" if value else "false"
+    if kind == "int":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f"{value}{unit}"
+        return f"{_format_decimal(float(value))}{unit}"
+    return f"{_format_decimal(float(value))}{unit}"
+
+
+def _format_telemetry_signed_delta(metric: str, delta: Any) -> str | None:
+    if delta is None:
+        return None
+    spec = _TELEMETRY_METRIC_SPECS[metric]
+    kind = spec["kind"]
+    unit = spec["unit"]
+    if kind == "bool":
+        return str(delta)
+    if kind == "int":
+        if isinstance(delta, int) and not isinstance(delta, bool):
+            if delta == 0:
+                return f"0{unit}"
+            return f"{delta:+d}{unit}"
+        return f"{_format_decimal(float(delta), signed=True)}{unit}"
+    return f"{_format_decimal(float(delta), signed=True)}{unit}"
+
+
+def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float | bool]:
+    """Extract sanitized Chrome boot telemetry (visible frame, black loading, JS heap, audio ring)."""
+    telemetry = _dict_or_empty(report.get("telemetry"))
+    summary = _dict_or_empty(report.get("summary"))
+    counters = _dict_or_empty(report.get("counters"))
+    memory = _dict_or_empty(report.get("memory"))
+    telemetry_memory = _dict_or_empty(telemetry.get("memory"))
+    summary_memory = _dict_or_empty(summary.get("memory"))
+    audio = _dict_or_empty(report.get("audio"))
+    audio_ring = _dict_or_empty(audio.get("ring")) or _dict_or_empty(audio.get("pcm_ring"))
+    top_audio_ring = _dict_or_empty(report.get("audio_ring"))
+    telemetry_audio = _dict_or_empty(telemetry.get("audio"))
+    telemetry_audio_ring = (
+        _dict_or_empty(telemetry_audio.get("ring"))
+        or _dict_or_empty(telemetry_audio.get("pcm_ring"))
+        or _dict_or_empty(telemetry.get("audio_ring"))
+    )
+    summary_audio = _dict_or_empty(summary.get("audio"))
+    summary_audio_ring = _dict_or_empty(summary.get("audio_ring"))
+
+    metrics: dict[str, int | float | bool] = {}
+
+    # 1. first_visible_frame_s (direct seconds, else converted from ms)
+    fvf_obj = _dict_or_empty(report.get("first_visible_frame"))
+    fvf_s = _first_non_negative_number(
+        report.get("first_visible_frame_s"),
+        report.get("firstVisibleFrameS"),
+        telemetry.get("first_visible_frame_s"),
+        telemetry.get("firstVisibleFrameS"),
+        summary.get("first_visible_frame_s"),
+        summary.get("firstVisibleFrameS"),
+        counters.get("first_visible_frame_s"),
+        counters.get("firstVisibleFrameS"),
+        fvf_obj.get("elapsed_s"),
+    )
+    if fvf_s is None:
+        milestone_fvf_ms: Any = None
+        for m in report.get("milestones") or []:
+            if isinstance(m, dict) and m.get("milestone") == "FIRST_VISIBLE_FRAME":
+                milestone_fvf_ms = m.get("elapsed_ms")
+                break
+        fvf_ms = _first_non_negative_number(
+            fvf_obj.get("elapsed_ms"),
+            milestone_fvf_ms,
+            report.get("first_visible_frame_ms"),
+            report.get("firstVisibleFrameMs"),
+            telemetry.get("first_visible_frame_ms"),
+            telemetry.get("firstVisibleFrameMs"),
+            summary.get("first_visible_frame_ms"),
+            summary.get("firstVisibleFrameMs"),
+            counters.get("first_visible_frame_ms"),
+            counters.get("firstVisibleFrameMs"),
+        )
+        if fvf_ms is not None:
+            fvf_s = round(float(fvf_ms) / 1000.0, 2)
+    if fvf_s is not None:
+        metrics["first_visible_frame_s"] = round(float(fvf_s), 2)
+
+    # 2. black_loading_s (direct seconds, else converted from ms, else derived from visible - present)
+    black_s = _first_non_negative_number(
+        report.get("black_loading_s"),
+        report.get("blackLoadingS"),
+        telemetry.get("black_loading_s"),
+        telemetry.get("blackLoadingS"),
+        summary.get("black_loading_s"),
+        summary.get("blackLoadingS"),
+        counters.get("black_loading_s"),
+        counters.get("blackLoadingS"),
+    )
+    if black_s is None:
+        black_ms = _first_non_negative_number(
+            report.get("black_loading_ms"),
+            report.get("blackLoadingMs"),
+            telemetry.get("black_loading_ms"),
+            telemetry.get("blackLoadingMs"),
+            summary.get("black_loading_ms"),
+            summary.get("blackLoadingMs"),
+            counters.get("black_loading_ms"),
+            counters.get("blackLoadingMs"),
+        )
+        if black_ms is not None:
+            black_s = round(float(black_ms) / 1000.0, 2)
+    if black_s is None and "first_visible_frame_s" in metrics:
+        fp_obj = _dict_or_empty(report.get("first_present"))
+        fp_s = _first_non_negative_number(
+            report.get("first_present_s"),
+            telemetry.get("first_present_s"),
+            summary.get("first_present_s"),
+            fp_obj.get("elapsed_s"),
+        )
+        if fp_s is None:
+            milestone_fp_ms: Any = None
+            for m in report.get("milestones") or []:
+                if isinstance(m, dict) and m.get("milestone") == "FIRST_PRESENT":
+                    milestone_fp_ms = m.get("elapsed_ms")
+                    break
+            fp_ms = _first_non_negative_number(
+                fp_obj.get("elapsed_ms"),
+                milestone_fp_ms,
+                report.get("first_present_ms"),
+                telemetry.get("first_present_ms"),
+                summary.get("first_present_ms"),
+            )
+            if fp_ms is not None:
+                fp_s = float(fp_ms) / 1000.0
+        if fp_s is not None and float(metrics["first_visible_frame_s"]) >= float(fp_s):
+            black_s = round(float(metrics["first_visible_frame_s"]) - float(fp_s), 2)
+    if black_s is not None:
+        metrics["black_loading_s"] = round(float(black_s), 2)
+
+    # 3. js_heap_used_mb (direct MB, else converted from bytes)
+    heap_used_mb = _first_non_negative_number(
+        report.get("js_heap_used_mb"),
+        report.get("jsHeapUsedMb"),
+        report.get("jsHeapUsedMB"),
+        telemetry.get("js_heap_used_mb"),
+        telemetry.get("jsHeapUsedMb"),
+        telemetry.get("jsHeapUsedMB"),
+        memory.get("js_heap_used_mb"),
+        memory.get("jsHeapUsedMb"),
+        memory.get("jsHeapUsedMB"),
+        telemetry_memory.get("js_heap_used_mb"),
+        telemetry_memory.get("jsHeapUsedMb"),
+        telemetry_memory.get("jsHeapUsedMB"),
+        summary.get("js_heap_used_mb"),
+        summary.get("jsHeapUsedMb"),
+        summary.get("jsHeapUsedMB"),
+        summary_memory.get("js_heap_used_mb"),
+        summary_memory.get("jsHeapUsedMb"),
+        summary_memory.get("jsHeapUsedMB"),
+        counters.get("js_heap_used_mb"),
+        counters.get("jsHeapUsedMb"),
+    )
+    if heap_used_mb is None:
+        heap_used_bytes = _first_non_negative_number(
+            report.get("js_heap_used_bytes"),
+            report.get("usedJSHeapSize"),
+            telemetry.get("js_heap_used_bytes"),
+            telemetry.get("usedJSHeapSize"),
+            memory.get("js_heap_used_bytes"),
+            memory.get("usedJSHeapSize"),
+            telemetry_memory.get("js_heap_used_bytes"),
+            telemetry_memory.get("usedJSHeapSize"),
+            summary.get("js_heap_used_bytes"),
+            summary.get("usedJSHeapSize"),
+            summary_memory.get("js_heap_used_bytes"),
+            summary_memory.get("usedJSHeapSize"),
+        )
+        if heap_used_bytes is not None:
+            heap_used_mb = round(float(heap_used_bytes) / _BYTES_PER_MIB, 2)
+    if heap_used_mb is not None:
+        metrics["js_heap_used_mb"] = round(float(heap_used_mb), 2)
+
+    # 4. js_heap_total_mb (direct MB, else converted from bytes)
+    heap_total_mb = _first_non_negative_number(
+        report.get("js_heap_total_mb"),
+        report.get("jsHeapTotalMb"),
+        report.get("jsHeapTotalMB"),
+        telemetry.get("js_heap_total_mb"),
+        telemetry.get("jsHeapTotalMb"),
+        telemetry.get("jsHeapTotalMB"),
+        memory.get("js_heap_total_mb"),
+        memory.get("jsHeapTotalMb"),
+        memory.get("jsHeapTotalMB"),
+        telemetry_memory.get("js_heap_total_mb"),
+        telemetry_memory.get("jsHeapTotalMb"),
+        telemetry_memory.get("jsHeapTotalMB"),
+        summary.get("js_heap_total_mb"),
+        summary.get("jsHeapTotalMb"),
+        summary.get("jsHeapTotalMB"),
+        summary_memory.get("js_heap_total_mb"),
+        summary_memory.get("jsHeapTotalMb"),
+        summary_memory.get("jsHeapTotalMB"),
+        counters.get("js_heap_total_mb"),
+        counters.get("jsHeapTotalMb"),
+    )
+    if heap_total_mb is None:
+        heap_total_bytes = _first_non_negative_number(
+            report.get("js_heap_total_bytes"),
+            report.get("totalJSHeapSize"),
+            telemetry.get("js_heap_total_bytes"),
+            telemetry.get("totalJSHeapSize"),
+            memory.get("js_heap_total_bytes"),
+            memory.get("totalJSHeapSize"),
+            telemetry_memory.get("js_heap_total_bytes"),
+            telemetry_memory.get("totalJSHeapSize"),
+            summary.get("js_heap_total_bytes"),
+            summary.get("totalJSHeapSize"),
+            summary_memory.get("js_heap_total_bytes"),
+            summary_memory.get("totalJSHeapSize"),
+        )
+        if heap_total_bytes is not None:
+            heap_total_mb = round(float(heap_total_bytes) / _BYTES_PER_MIB, 2)
+    if heap_total_mb is not None:
+        metrics["js_heap_total_mb"] = round(float(heap_total_mb), 2)
+
+    # 5. audio_ring_attached (strict bool)
+    audio_attached = _first_bool(
+        report.get("audio_ring_attached"),
+        report.get("audioRingAttached"),
+        telemetry.get("audio_ring_attached"),
+        telemetry.get("audioRingAttached"),
+        audio.get("audio_ring_attached"),
+        audio.get("audioRingAttached"),
+        audio.get("ring_attached"),
+        audio.get("ringAttached"),
+        audio.get("attached"),
+        audio_ring.get("attached"),
+        top_audio_ring.get("attached"),
+        telemetry_audio.get("audio_ring_attached"),
+        telemetry_audio.get("audioRingAttached"),
+        telemetry_audio.get("ring_attached"),
+        telemetry_audio.get("ringAttached"),
+        telemetry_audio.get("attached"),
+        telemetry_audio_ring.get("attached"),
+        summary.get("audio_ring_attached"),
+        summary.get("audioRingAttached"),
+        summary_audio.get("audio_ring_attached"),
+        summary_audio.get("audioRingAttached"),
+        summary_audio.get("ring_attached"),
+        summary_audio.get("ringAttached"),
+        summary_audio.get("attached"),
+        summary_audio_ring.get("attached"),
+        counters.get("audio_ring_attached"),
+    )
+    if audio_attached is not None:
+        metrics["audio_ring_attached"] = audio_attached
+
+    # 6. audio_frames_drained (non-negative frame count)
+    frames_drained = _first_non_negative_number(
+        report.get("audio_frames_drained"),
+        report.get("audioFramesDrained"),
+        telemetry.get("audio_frames_drained"),
+        telemetry.get("audioFramesDrained"),
+        audio.get("audio_frames_drained"),
+        audio.get("audioFramesDrained"),
+        audio.get("frames_drained"),
+        audio.get("framesDrained"),
+        audio_ring.get("frames_drained"),
+        audio_ring.get("framesDrained"),
+        top_audio_ring.get("frames_drained"),
+        top_audio_ring.get("framesDrained"),
+        telemetry_audio.get("audio_frames_drained"),
+        telemetry_audio.get("audioFramesDrained"),
+        telemetry_audio.get("frames_drained"),
+        telemetry_audio.get("framesDrained"),
+        telemetry_audio_ring.get("frames_drained"),
+        telemetry_audio_ring.get("framesDrained"),
+        summary.get("audio_frames_drained"),
+        summary.get("audioFramesDrained"),
+        summary_audio.get("audio_frames_drained"),
+        summary_audio.get("audioFramesDrained"),
+        summary_audio.get("frames_drained"),
+        summary_audio.get("framesDrained"),
+        summary_audio_ring.get("frames_drained"),
+        summary_audio_ring.get("framesDrained"),
+        counters.get("audio_frames_drained"),
+    )
+    if frames_drained is not None:
+        if isinstance(frames_drained, int):
+            metrics["audio_frames_drained"] = frames_drained
+        elif float(frames_drained).is_integer():
+            metrics["audio_frames_drained"] = int(frames_drained)
+        else:
+            metrics["audio_frames_drained"] = round(float(frames_drained), 2)
+
+    return metrics
+
+
+def compute_telemetry_delta(
+    ra: dict[str, Any],
+    rb: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Build a strictly-sanitized delta map for Chrome boot telemetry present in either report."""
+    ma = extract_telemetry_metrics(ra)
+    mb = extract_telemetry_metrics(rb)
+    out: dict[str, dict[str, Any]] = {}
+    for key in TELEMETRY_DELTA_METRICS:
+        in_a = key in ma
+        in_b = key in mb
+        if not in_a and not in_b:
+            continue
+        spec = _TELEMETRY_METRIC_SPECS[key]
+        kind = spec["kind"]
+        better = spec["better"]
+        va: Any = ma.get(key)
+        vb: Any = mb.get(key)
+
+        if kind == "bool":
+            if in_a and in_b:
+                changed = bool(va) != bool(vb)
+                transition = f"{'true' if va else 'false'} -> {'true' if vb else 'false'}"
+                if not changed:
+                    status = "unchanged"
+                elif vb:
+                    status = "improved"
+                else:
+                    status = "regressed"
+                out[key] = {
+                    "a": bool(va),
+                    "b": bool(vb),
+                    "delta": transition,
+                    "changed": changed,
+                    "transition": transition,
+                    "better": better,
+                    "status": status,
+                }
+            else:
+                out[key] = {
+                    "a": bool(va) if in_a else None,
+                    "b": bool(vb) if in_b else None,
+                    "delta": None,
+                    "changed": None,
+                    "transition": None,
+                    "better": better,
+                    "status": "added" if not in_a else "removed",
+                }
+            continue
+
+        if in_a and in_b:
+            if isinstance(va, int) and isinstance(vb, int):
+                delta: int | float = vb - va
+            else:
+                va = round(float(va), 2)
+                vb = round(float(vb), 2)
+                delta = round(vb - va, 2)
+                if delta == 0.0:
+                    delta = 0.0
+            if va != 0:
+                pct: float | None = round(((vb - va) / va) * 100.0, 2)
+            elif vb == 0:
+                pct = 0.0
+            else:
+                pct = None
+            if delta == 0:
+                status = "unchanged"
+            elif better == "lower":
+                status = "improved" if delta < 0 else "regressed"
+            else:
+                status = "improved" if delta > 0 else "regressed"
+            out[key] = {
+                "a": va,
+                "b": vb,
+                "delta": delta,
+                "pct": pct,
+                "formatted_delta": _format_telemetry_signed_delta(key, delta),
+                "better": better,
+                "status": status,
+            }
+        else:
+            out[key] = {
+                "a": va if in_a else None,
+                "b": vb if in_b else None,
+                "delta": None,
+                "pct": None,
+                "formatted_delta": None,
+                "better": better,
+                "status": "added" if not in_a else "removed",
+            }
+    return out
+
+
 def compare(
     ra: dict[str, Any],
     rb: dict[str, Any],
@@ -775,6 +1238,7 @@ def compare(
     if adapter_warning is not None:
         c.warnings.append(adapter_warning)
     c.gpu_delta = compute_gpu_delta(ra, rb, pa, pb)
+    c.telemetry_delta = compute_telemetry_delta(ra, rb)
     return c
 
 
@@ -803,6 +1267,8 @@ def to_result(c: Comparison) -> dict[str, Any]:
         result["warnings"] = list(c.warnings)
     if c.gpu_delta:
         result["gpu_delta"] = c.gpu_delta
+    if c.telemetry_delta:
+        result["telemetry_delta"] = c.telemetry_delta
     return result
 
 
@@ -817,6 +1283,27 @@ def _format_gpu_delta_line(metric: str, item: dict[str, int | float | None]) -> 
         if pct is not None:
             change += f", {pct:+.1f}%"
     return f"  {metric}: {a} -> {b} ({change})"
+
+
+def _format_telemetry_delta_line(metric: str, item: dict[str, Any]) -> str:
+    a_str = _format_telemetry_value(metric, item.get("a"))
+    b_str = _format_telemetry_value(metric, item.get("b"))
+    status = item.get("status")
+    spec = _TELEMETRY_METRIC_SPECS[metric]
+    if spec["kind"] == "bool":
+        if item.get("delta") is None:
+            return f"  {metric}: {a_str} -> {b_str} (n/a, {status})"
+        return f"  {metric}: {a_str} -> {b_str} ({status})"
+    formatted_delta = item.get("formatted_delta")
+    pct = item.get("pct")
+    if formatted_delta is None:
+        return f"  {metric}: {a_str} -> {b_str} (n/a, {status})"
+    parts = [str(formatted_delta)]
+    if item.get("delta") != 0 and pct is not None:
+        parts.append(f"{pct:+.1f}%")
+    if status:
+        parts.append(str(status))
+    return f"  {metric}: {a_str} -> {b_str} ({', '.join(parts)})"
 
 
 def format_text(c: Comparison, verbose: bool = False) -> str:
@@ -845,9 +1332,78 @@ def format_text(c: Comparison, verbose: bool = False) -> str:
         lines.append("[gpu_delta]")
         for metric, item in c.gpu_delta.items():
             lines.append(_format_gpu_delta_line(metric, item))
+    if c.telemetry_delta:
+        lines.append("[telemetry_delta]")
+        for metric, item in c.telemetry_delta.items():
+            lines.append(_format_telemetry_delta_line(metric, item))
     lines.append(
         f"verdict: {result['verdict'].upper()} ({result['differences']} difference(s) in {result['checked']} checks)"
     )
+    return "\n".join(lines)
+
+
+def format_markdown(c: Comparison, verbose: bool = False) -> str:
+    """Format the comparison result as clean GitHub-flavored Markdown."""
+    result = to_result(c)
+    lines = [
+        f"## Boot Report Comparison — {result['verdict'].upper()} "
+        f"({result['differences']} difference(s) in {result['checked']} checks)"
+    ]
+    shown = c.entries if verbose else c.failures()
+    if shown:
+        lines.append("")
+        lines.append("### Checks" if verbose else "### Differences")
+        lines.append("| Field | Status | Baseline | Candidate | Mode |")
+        lines.append("|---|---|---|---|---|")
+        for e in shown:
+            st = "ok" if e["ok"] else "DIFF"
+            lines.append(f"| `{e['field']}` | {st} | `{e['a']!r}` | `{e['b']!r}` | {e['mode']} |")
+    if c.gpu_adapter is not None:
+        lines.append("")
+        lines.append("### GPU Adapter")
+        a_label = c.gpu_adapter["a"] if c.gpu_adapter["a"] is not None else "<unknown>"
+        b_label = c.gpu_adapter["b"] if c.gpu_adapter["b"] is not None else "<unknown>"
+        suffix = " (mismatch)" if c.gpu_adapter.get("mismatch") else ""
+        lines.append(f"- `{a_label}` -> `{b_label}`{suffix}")
+    if c.warnings:
+        lines.append("")
+        lines.append("### Warnings")
+        for warning in c.warnings:
+            lines.append(f"- {warning}")
+    if c.telemetry_delta:
+        lines.append("")
+        lines.append("### Telemetry Delta")
+        lines.append("| Metric | Baseline | Candidate | Delta | % | Status |")
+        lines.append("|---|---:|---:|---:|---:|---|")
+        for metric, item in c.telemetry_delta.items():
+            a_str = _format_telemetry_value(metric, item.get("a")) if item.get("a") is not None else "—"
+            b_str = _format_telemetry_value(metric, item.get("b")) if item.get("b") is not None else "—"
+            spec = _TELEMETRY_METRIC_SPECS[metric]
+            if spec["kind"] == "bool":
+                delta_str = item.get("transition") or "—"
+                pct_str = "—"
+            else:
+                delta_str = item.get("formatted_delta") or "—"
+                pct = item.get("pct")
+                pct_str = f"{pct:+.1f}%" if (item.get("delta") not in (None, 0) and pct is not None) else "—"
+            status_str = str(item.get("status") or "—")
+            lines.append(f"| `{metric}` | {a_str} | {b_str} | {delta_str} | {pct_str} | {status_str} |")
+    if c.gpu_delta:
+        lines.append("")
+        lines.append("### GPU Delta")
+        lines.append("| Metric | Baseline | Candidate | Delta | % |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for metric, item in c.gpu_delta.items():
+            unit = _GPU_DELTA_UNITS.get(metric, "")
+            a, b, delta, pct = item["a"], item["b"], item["delta"], item["pct"]
+            if delta == 0:
+                delta_str = f"0{unit}"
+                pct_str = "0.0%"
+            else:
+                sign = "+" if (delta is not None and delta > 0) else ""
+                delta_str = f"{sign}{delta}{unit}"
+                pct_str = f"{pct:+.1f}%" if pct is not None else "—"
+            lines.append(f"| `{metric}` | {a} | {b} | {delta_str} | {pct_str} |")
     return "\n".join(lines)
 
 
@@ -872,7 +1428,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--count-tolerance", type=float, default=0.05, metavar="REL",
                    help="relative tolerance for wall-clock dependent counts (default 0.05)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the result as JSON")
-    p.add_argument("-v", "--verbose", action="store_true", help="also list the matching fields (text mode)")
+    p.add_argument("--markdown", dest="as_markdown", action="store_true", help="print the result as Markdown")
+    p.add_argument("-v", "--verbose", action="store_true", help="also list the matching fields (text/Markdown mode)")
     return p
 
 
@@ -882,6 +1439,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return 0 if exc.code in (0, None) else 2
+    if args.as_json and args.as_markdown:
+        print("error: --json and --markdown are mutually exclusive", file=sys.stderr)
+        return 2
     if args.import_trace and not args.capture:
         print("error: --import-trace needs --capture", file=sys.stderr)
         return 2
@@ -900,6 +1460,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     c = compare(ra, rb, tol, args.ignore, captures, traces)  # type: ignore[arg-type]
     if args.as_json:
         print(json.dumps(to_result(c), indent=2))
+    elif args.as_markdown:
+        print(format_markdown(c, args.verbose))
     else:
         print(format_text(c, args.verbose))
     return 1 if c.failures() else 0
