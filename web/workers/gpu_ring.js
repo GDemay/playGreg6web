@@ -11,6 +11,7 @@
   //   u16 opcode (0..2), u16 flags (2..4), u32 payload_bytes (4..8).
   const GPU_PACKET_HEADER_BYTES = 8;
   const DEFAULT_BATCH_MAX_PACKETS = 256;
+  const DEFAULT_WRAP_SCRATCH_BYTES = 65536;
 
   // 32-bit word indices within the 64-byte header (offsets 0..64).
   const HEADER_INDEX = Object.freeze({
@@ -86,6 +87,7 @@
     static HEADER_INDEX = HEADER_INDEX;
     static PACKET_HEADER_BYTES = GPU_PACKET_HEADER_BYTES;
     static DEFAULT_BATCH_MAX_PACKETS = DEFAULT_BATCH_MAX_PACKETS;
+    static DEFAULT_WRAP_SCRATCH_BYTES = DEFAULT_WRAP_SCRATCH_BYTES;
 
     static byteLength(capacityBytes) {
       if (!isPowerOfTwo(capacityBytes)) {
@@ -201,7 +203,28 @@
       );
       this._headerScratch = new Uint8Array(GPU_PACKET_HEADER_BYTES);
       this._headerScratchView = new DataView(this._headerScratch.buffer);
-      this._scratch = null;
+      // Pre-allocated reusable wrap scratch buffer so wrap-around spans avoid per-batch allocations.
+      const initialWrapScratchBytes = Math.min(this._capacityBytes, DEFAULT_WRAP_SCRATCH_BYTES);
+      this._wrapScratch = new Uint8Array(initialWrapScratchBytes);
+      this._scratch = this._wrapScratch;
+      // Reusable descriptor and result objects for zero-alloc consumer batch span draining.
+      this._spanDescriptor = {
+        bytes: null,
+        byteOffset: 0,
+        byteLength: 0,
+        bufferByteOffset: 0,
+        ringOffset: 0,
+        packets: 0,
+        wrapped: false,
+        zeroCopy: false,
+      };
+      this._reusableDrainResult = {
+        packets: 0,
+        bytes: 0,
+        remainingBytes: 0,
+        wrapped: false,
+        zeroCopy: false,
+      };
 
       // Local throughput & backpressure telemetry (kept outside the 64-byte SAB ABI header).
       this._batchesDrained = 0;
@@ -209,11 +232,36 @@
       this._maxBatchSize = 0;
       this._backpressureWaits = 0;
       this._backpressureStalls = 0;
+      this._writesSucceeded = 0;
       this._peakOccupancyBytes = 0;
       this._drainCalls = 0;
       this._maxDrainBatchBytes = 0;
+      this._peakBatchBytes = 0;
+      this._zeroAllocDrains = 0;
       this._totalBytesDrained = 0;
       this._emptyDrains = 0;
+    }
+
+    _ensureWrapScratch(requiredBytes) {
+      if (this._wrapScratch && this._wrapScratch.byteLength >= requiredBytes) {
+        return this._wrapScratch;
+      }
+      let nextSize =
+        this._wrapScratch && this._wrapScratch.byteLength > 0
+          ? this._wrapScratch.byteLength
+          : Math.min(this._capacityBytes, 1024);
+      if (nextSize < 64) {
+        nextSize = 64;
+      }
+      while (nextSize < requiredBytes && nextSize < this._capacityBytes) {
+        nextSize = Math.min(this._capacityBytes, nextSize * 2);
+      }
+      if (nextSize < requiredBytes) {
+        nextSize = requiredBytes;
+      }
+      this._wrapScratch = new Uint8Array(nextSize);
+      this._scratch = this._wrapScratch;
+      return this._wrapScratch;
     }
 
     _recordOccupancy(bytes) {
@@ -270,6 +318,24 @@
 
     get maxDrainBatchBytes() {
       return Math.min(this._capacityBytes, sanitizeNonNegInt(this._maxDrainBatchBytes));
+    }
+
+    get peakBatchBytes() {
+      return Math.min(this._capacityBytes, sanitizeNonNegInt(this._peakBatchBytes));
+    }
+
+    get zeroAllocDrains() {
+      return sanitizeNonNegInt(this._zeroAllocDrains);
+    }
+
+    get backpressureWaitRate() {
+      const waits = sanitizeNonNegInt(this._backpressureWaits);
+      const writes = sanitizeNonNegInt(this._writesSucceeded);
+      const total = writes + waits;
+      if (total <= 0) {
+        return 0;
+      }
+      return clampUnitRatio(waits / total);
     }
 
     get totalBytesDrained() {
@@ -386,6 +452,7 @@
       Atomics.store(this._headerU32, HEADER_INDEX.WRITE_POS, nextWrite);
       Atomics.add(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
       Atomics.notify(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+      this._writesSucceeded = sanitizeNonNegInt(this._writesSucceeded) + 1;
       this._recordOccupancy(used + len);
       return true;
     }
@@ -420,14 +487,12 @@
       if (offset + avail <= this._capacityBytes) {
         slice = this._data.subarray(offset, offset + avail);
       } else {
-        if (!this._scratch || this._scratch.byteLength < avail) {
-          this._scratch = new Uint8Array(avail);
-        }
+        const scratch = this._ensureWrapScratch(avail);
         const firstLen = this._capacityBytes - offset;
         const secondLen = avail - firstLen;
-        this._scratch.set(this._data.subarray(offset, this._capacityBytes), 0);
-        this._scratch.set(this._data.subarray(0, secondLen), firstLen);
-        slice = this._scratch.subarray(0, avail);
+        scratch.set(this._data.subarray(offset, this._capacityBytes), 0);
+        scratch.set(this._data.subarray(0, secondLen), firstLen);
+        slice = scratch.subarray(0, avail);
       }
 
       const nextRead = (readPos + avail) >>> 0;
@@ -440,6 +505,10 @@
         const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
         if (avail > curMaxBytes) {
           this._maxDrainBatchBytes = avail;
+        }
+        const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+        if (avail > curPeakBatch) {
+          this._peakBatchBytes = avail;
         }
       }
       return avail;
@@ -563,15 +632,13 @@
             );
           } else {
             packetWrapped = true;
-            if (!this._scratch || this._scratch.byteLength < packetLen) {
-              this._scratch = new Uint8Array(packetLen);
-            }
+            const scratch = this._ensureWrapScratch(packetLen);
             const firstLen = this._capacityBytes - pktOffset;
             const secondLen = packetLen - firstLen;
-            this._scratch.set(this._data.subarray(pktOffset, this._capacityBytes), 0);
-            this._scratch.set(this._data.subarray(0, secondLen), firstLen);
-            bytes = this._scratch.subarray(0, packetLen);
-            payload = this._scratch.subarray(GPU_PACKET_HEADER_BYTES, packetLen);
+            scratch.set(this._data.subarray(pktOffset, this._capacityBytes), 0);
+            scratch.set(this._data.subarray(0, secondLen), firstLen);
+            bytes = scratch.subarray(0, packetLen);
+            payload = scratch.subarray(GPU_PACKET_HEADER_BYTES, packetLen);
           }
 
           const shouldContinue = handler(
@@ -605,6 +672,10 @@
           if (completedBytes > curMaxBytes) {
             this._maxDrainBatchBytes = completedBytes;
           }
+          const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+          if (completedBytes > curPeakBatch) {
+            this._peakBatchBytes = completedBytes;
+          }
         }
         if (completedPackets > 0) {
           this._batchesDrained = sanitizeNonNegInt(this._batchesDrained) + 1;
@@ -631,15 +702,243 @@
       };
     }
 
+    /**
+     * Zero-alloc consumer batch span drain optimized for high-throughput 30 FPS
+     * command-ring consumption (Main Menu & 3D world frames).
+     *
+     * Scans up to `maxPackets` complete framed GpuPacketHeader packets (bounded by
+     * `maxBytes`) without allocating per-packet `Uint8Array` views or wrapper objects,
+     * then invokes `handler(bytesView, byteOffset, byteLength, spanDescriptor)` once
+     * for the entire drained span:
+     *   - Non-wrapping spans pass a direct zero-copy `subarray` view over the SAB.
+     *   - Wrap-around spans linearize into the reusable pre-allocated `_wrapScratch`
+     *     buffer with zero per-batch backing allocations.
+     *   - Reads `write_pos` / `read_pos` once and publishes `read_pos` once on completion.
+     *   - If `handler` throws, `read_pos` is left unchanged so the span remains unread.
+     *
+     * @param {(bytesView: Uint8Array, byteOffset: number, byteLength: number, span: {bytes: Uint8Array, byteOffset: number, byteLength: number, bufferByteOffset: number, ringOffset: number, packets: number, wrapped: boolean, zeroCopy: boolean}) => void} handler
+     * @param {number | {maxPackets?: number, maxBytes?: number, framed?: boolean, reuseResult?: boolean}} [options]
+     * @returns {{packets: number, bytes: number, remainingBytes: number, wrapped: boolean, zeroCopy: boolean}}
+     */
+    drainBatchZeroAlloc(handler, options) {
+      if (typeof handler !== 'function') {
+        throw new TypeError('GpuRingBuffer.drainBatchZeroAlloc requires a handler function');
+      }
+
+      let maxPackets = DEFAULT_BATCH_MAX_PACKETS;
+      let maxBytes = this._capacityBytes;
+      let framed = true;
+      let reuseResult = false;
+
+      if (options !== undefined && options !== null) {
+        if (typeof options === 'number') {
+          if (!Number.isSafeInteger(options) || options < 1) {
+            throw new RangeError(
+              `GpuRingBuffer.drainBatchZeroAlloc maxPackets must be a positive safe integer, got ${options}`
+            );
+          }
+          maxPackets = options;
+        } else if (typeof options === 'object') {
+          if (options.maxPackets !== undefined && options.maxPackets !== null) {
+            if (
+              typeof options.maxPackets !== 'number' ||
+              !Number.isSafeInteger(options.maxPackets) ||
+              options.maxPackets < 1
+            ) {
+              throw new RangeError(
+                `GpuRingBuffer.drainBatchZeroAlloc maxPackets must be a positive safe integer, got ${options.maxPackets}`
+              );
+            }
+            maxPackets = options.maxPackets;
+          }
+          if (options.maxBytes !== undefined && options.maxBytes !== null) {
+            if (
+              typeof options.maxBytes !== 'number' ||
+              !Number.isSafeInteger(options.maxBytes) ||
+              options.maxBytes < 1
+            ) {
+              throw new RangeError(
+                `GpuRingBuffer.drainBatchZeroAlloc maxBytes must be a positive safe integer, got ${options.maxBytes}`
+              );
+            }
+            maxBytes = Math.min(this._capacityBytes, options.maxBytes);
+          }
+          if (options.framed !== undefined) {
+            framed = Boolean(options.framed);
+          }
+          if (options.reuseResult !== undefined) {
+            reuseResult = Boolean(options.reuseResult);
+          }
+        } else {
+          throw new TypeError(
+            'GpuRingBuffer.drainBatchZeroAlloc options must be an options object or positive integer maxPackets'
+          );
+        }
+      }
+
+      const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+      const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      const avail = (writePos - readPos) >>> 0;
+      this._drainCalls = sanitizeNonNegInt(this._drainCalls) + 1;
+
+      if (avail === 0) {
+        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        if (reuseResult) {
+          this._reusableDrainResult.packets = 0;
+          this._reusableDrainResult.bytes = 0;
+          this._reusableDrainResult.remainingBytes = 0;
+          this._reusableDrainResult.wrapped = false;
+          this._reusableDrainResult.zeroCopy = false;
+          return this._reusableDrainResult;
+        }
+        return { packets: 0, bytes: 0, remainingBytes: 0, wrapped: false, zeroCopy: false };
+      }
+
+      const boundedAvail = avail > this._capacityBytes ? this._capacityBytes : avail;
+      this._recordOccupancy(boundedAvail);
+
+      const startOffset = (readPos & this._mask) >>> 0;
+      let spanBytes = 0;
+      let packetCount = 0;
+
+      if (framed) {
+        while (packetCount < maxPackets) {
+          const remaining = boundedAvail - spanBytes;
+          if (remaining < GPU_PACKET_HEADER_BYTES) {
+            break;
+          }
+
+          const pktOffset = (((readPos + spanBytes) >>> 0) & this._mask) >>> 0;
+          let payloadBytes;
+          if (pktOffset + GPU_PACKET_HEADER_BYTES <= this._capacityBytes) {
+            payloadBytes = this._dataView.getUint32(pktOffset + 4, true);
+          } else {
+            const firstHdr = this._capacityBytes - pktOffset;
+            for (let i = 0; i < firstHdr; i++) {
+              this._headerScratch[i] = this._data[pktOffset + i];
+            }
+            for (let i = firstHdr; i < GPU_PACKET_HEADER_BYTES; i++) {
+              this._headerScratch[i] = this._data[i - firstHdr];
+            }
+            payloadBytes = this._headerScratchView.getUint32(4, true);
+          }
+
+          if (payloadBytes > remaining - GPU_PACKET_HEADER_BYTES) {
+            break;
+          }
+
+          const packetLen = GPU_PACKET_HEADER_BYTES + payloadBytes;
+          if (spanBytes + packetLen > maxBytes) {
+            break;
+          }
+
+          spanBytes += packetLen;
+          packetCount += 1;
+        }
+      } else {
+        spanBytes = boundedAvail > maxBytes ? maxBytes : boundedAvail;
+      }
+
+      if (spanBytes === 0) {
+        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        if (reuseResult) {
+          this._reusableDrainResult.packets = 0;
+          this._reusableDrainResult.bytes = 0;
+          this._reusableDrainResult.remainingBytes = boundedAvail;
+          this._reusableDrainResult.wrapped = false;
+          this._reusableDrainResult.zeroCopy = false;
+          return this._reusableDrainResult;
+        }
+        return {
+          packets: 0,
+          bytes: 0,
+          remainingBytes: boundedAvail,
+          wrapped: false,
+          zeroCopy: false,
+        };
+      }
+
+      let bytesView;
+      let wrapped = false;
+      if (startOffset + spanBytes <= this._capacityBytes) {
+        bytesView = this._data.subarray(startOffset, startOffset + spanBytes);
+      } else {
+        wrapped = true;
+        const scratch = this._ensureWrapScratch(spanBytes);
+        const firstLen = this._capacityBytes - startOffset;
+        const secondLen = spanBytes - firstLen;
+        scratch.set(this._data.subarray(startOffset, this._capacityBytes), 0);
+        scratch.set(this._data.subarray(0, secondLen), firstLen);
+        bytesView = scratch.subarray(0, spanBytes);
+      }
+
+      const zeroCopy = !wrapped;
+      const span = this._spanDescriptor;
+      span.bytes = bytesView;
+      span.byteOffset = 0;
+      span.byteLength = spanBytes;
+      span.bufferByteOffset = bytesView.byteOffset;
+      span.ringOffset = startOffset;
+      span.packets = packetCount;
+      span.wrapped = wrapped;
+      span.zeroCopy = zeroCopy;
+
+      // Only advance READ_POS and telemetry if handler succeeds without throwing.
+      handler(bytesView, 0, spanBytes, span);
+
+      const nextRead = (readPos + spanBytes) >>> 0;
+      Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
+      Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+
+      this._totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained) + spanBytes;
+      const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+      if (spanBytes > curMaxBytes) {
+        this._maxDrainBatchBytes = spanBytes;
+      }
+      const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+      if (spanBytes > curPeakBatch) {
+        this._peakBatchBytes = spanBytes;
+      }
+      this._zeroAllocDrains = sanitizeNonNegInt(this._zeroAllocDrains) + 1;
+      this._batchesDrained = sanitizeNonNegInt(this._batchesDrained) + 1;
+      if (packetCount > 0) {
+        this._packetsDrained = sanitizeNonNegInt(this._packetsDrained) + packetCount;
+        const curMaxBatch = sanitizeNonNegInt(this._maxBatchSize);
+        if (packetCount > curMaxBatch) {
+          this._maxBatchSize = packetCount;
+        }
+      }
+
+      const remainingBytes = boundedAvail - spanBytes;
+      if (reuseResult) {
+        this._reusableDrainResult.packets = packetCount;
+        this._reusableDrainResult.bytes = spanBytes;
+        this._reusableDrainResult.remainingBytes = remainingBytes;
+        this._reusableDrainResult.wrapped = wrapped;
+        this._reusableDrainResult.zeroCopy = zeroCopy;
+        return this._reusableDrainResult;
+      }
+      return {
+        packets: packetCount,
+        bytes: spanBytes,
+        remainingBytes,
+        wrapped,
+        zeroCopy,
+      };
+    }
+
     resetStats() {
       this._batchesDrained = 0;
       this._packetsDrained = 0;
       this._maxBatchSize = 0;
       this._backpressureWaits = 0;
       this._backpressureStalls = 0;
+      this._writesSucceeded = 0;
       this._peakOccupancyBytes = 0;
       this._drainCalls = 0;
       this._maxDrainBatchBytes = 0;
+      this._peakBatchBytes = 0;
+      this._zeroAllocDrains = 0;
       this._totalBytesDrained = 0;
       this._emptyDrains = 0;
     }
@@ -670,11 +969,20 @@
         batchesDrained > 0 ? sanitizeNonNegNumber(packetsDrained / batchesDrained) : 0;
       const backpressureWaits = sanitizeNonNegInt(this._backpressureWaits);
       const backpressureStalls = sanitizeNonNegInt(this._backpressureStalls);
+      const writesSucceeded = sanitizeNonNegInt(this._writesSucceeded);
+      const totalWriteEvents = writesSucceeded + backpressureWaits;
+      const backpressureWaitRate =
+        totalWriteEvents > 0 ? clampUnitRatio(backpressureWaits / totalWriteEvents) : 0;
       const drainCalls = sanitizeNonNegInt(this._drainCalls);
       const maxDrainBatchBytes = Math.min(
         this._capacityBytes,
         sanitizeNonNegInt(this._maxDrainBatchBytes)
       );
+      const peakBatchBytes = Math.min(
+        this._capacityBytes,
+        sanitizeNonNegInt(this._peakBatchBytes)
+      );
+      const zeroAllocDrains = sanitizeNonNegInt(this._zeroAllocDrains);
       const totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained);
       const emptyDrains = sanitizeNonNegInt(this._emptyDrains);
       const peakOccupancyBytes = Math.min(
@@ -715,8 +1023,11 @@
         packetsDrained,
         backpressureWaits,
         backpressureStalls,
+        backpressureWaitRate,
         drainCalls,
         maxDrainBatchBytes,
+        peakBatchBytes,
+        zeroAllocDrains,
         totalBytesDrained,
         emptyDrains,
         peakOccupancyBytes,
@@ -737,6 +1048,7 @@
     GPU_PACKET_HEADER_BYTES,
     DEFAULT_CAPACITY_BYTES,
     DEFAULT_BATCH_MAX_PACKETS,
+    DEFAULT_WRAP_SCRATCH_BYTES,
     HEADER_INDEX,
     isPowerOfTwo,
   };
