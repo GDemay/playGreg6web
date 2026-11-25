@@ -995,6 +995,10 @@ playgta6::InputState* input_state_ptr() noexcept {
 
 void attach_default_input_state() {
     os::scarlett::set_game_input_state(&g_wasm_input_state.state, os::SeqlockMode::MonotonicSeq);
+#ifdef __EMSCRIPTEN__
+    // O36: a key tap shorter than the title's frame must still reach it (press latch).
+    os::scarlett::set_game_input_press_sampler(true);
+#endif
 }
 
 }  // namespace playgta6::boot

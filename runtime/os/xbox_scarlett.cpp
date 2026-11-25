@@ -13,6 +13,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -2275,12 +2276,38 @@ struct GameInputGlobalState {
     int64_t accum_mouse_x = 0;
     int64_t accum_mouse_y = 0;
     uint32_t focus_policy = 0;
+    // Press latch (O36): the title samples GameInput once per frame, so a key tap that goes down
+    // and up between two of its readings was lost. The sampler records press edges between
+    // readings; the next reading reports them as down once.
+    uint32_t latch_last_buttons = 0;  // newest buttons seen by the sampler or a reading
+    uint32_t latch_pending = 0;       // press edges not reported by a reading yet
+    uint64_t seq_bias = 0;            // keeps reading sequence numbers distinct around latched readings
+    bool latch_emitted = false;       // the previous reading carried latched buttons
 };
 
 GameInputGlobalState& game_input_state() {
     static GameInputGlobalState state;
     return state;
 }
+
+void sample_game_input_presses_locked(GameInputGlobalState& gi) {
+    if (!gi.reader.is_attached()) {
+        return;
+    }
+    playgta6::InputState snap{};
+    if (!gi.reader.read_snapshot(snap, 4)) {
+        return;
+    }
+    gi.latch_pending |= snap.buttons & ~gi.latch_last_buttons;
+    gi.latch_last_buttons = snap.buttons;
+}
+
+std::atomic<bool>& game_input_sampler_enabled() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
+
+constexpr auto kGameInputSamplePeriod = std::chrono::milliseconds(4);
 
 uint32_t map_sab_buttons_to_gamepad(uint32_t raw_buttons) {
     uint32_t out = gamepad_button::kNone;
@@ -2453,7 +2480,16 @@ public:
             std::lock_guard<std::mutex> lock(gi.mutex);
             GameInputFrame frame{};
             if (gi.reader.is_attached() && gi.reader.poll(frame, true)) {
-                seq = frame.seq;
+                // Presses that went down and up since the previous reading are reported once.
+                const uint32_t latched = gi.latch_pending & ~frame.buttons;
+                gi.latch_pending = 0;
+                gi.latch_last_buttons = frame.buttons;
+                if (latched != 0 || gi.latch_emitted) {
+                    gi.seq_bias += 1;
+                }
+                gi.latch_emitted = latched != 0;
+                frame.buttons |= latched;
+                seq = frame.seq + gi.seq_bias;
                 raw_buttons = frame.buttons;
                 gp.buttons = map_sab_buttons_to_gamepad(frame.buttons);
                 gp.left_trigger = frame.left_trigger;
@@ -2908,6 +2944,34 @@ void set_game_input_state(playgta6::InputState* shared_state, SeqlockMode mode) 
     gi.reader.attach(shared_state, mode);
     gi.accum_mouse_x = 0;
     gi.accum_mouse_y = 0;
+    gi.latch_last_buttons = 0;
+    gi.latch_pending = 0;
+    gi.seq_bias = 0;
+    gi.latch_emitted = false;
+}
+
+void sample_game_input_presses() {
+    auto& gi = game_input_state();
+    std::lock_guard<std::mutex> lock(gi.mutex);
+    sample_game_input_presses_locked(gi);
+}
+
+void set_game_input_press_sampler(bool enabled) {
+    game_input_sampler_enabled().store(enabled, std::memory_order_release);
+    if (!enabled) {
+        return;
+    }
+    static std::once_flag started;
+    std::call_once(started, [] {
+        std::thread([] {
+            for (;;) {
+                if (game_input_sampler_enabled().load(std::memory_order_acquire)) {
+                    sample_game_input_presses();
+                }
+                std::this_thread::sleep_for(kGameInputSamplePeriod);
+            }
+        }).detach();
+    });
 }
 
 playgta6::InputState* get_game_input_state() {

@@ -1214,6 +1214,7 @@ int main(int argc, char** argv) {
         static playgta6::InputState host_state{};
         static playgta6::guest::host_input::HostInputSource host_source(&host_state);
         playgta6::os::scarlett::set_game_input_state(&host_state);
+        playgta6::os::scarlett::set_game_input_press_sampler(true);
         host_source.start();
         std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
     }
