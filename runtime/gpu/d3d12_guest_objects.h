@@ -1062,8 +1062,13 @@ private:
         uint32_t buffer_id = 0;
         uint64_t offset = 0;
         std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
+        uint64_t last_used_seq = 0;
     };
     mutable std::mutex relocation_mutex_;
+    // O36: homes of evicted entries, reused by the next entry of the same (size, home bytes) so the
+    // zero tail past `size` stays zero. Bounds relocations_ and the chunks behind it.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<std::pair<uint32_t, uint64_t>>> relocation_free_;
+    uint64_t relocation_seq_ = 0;
     // (va, size, home bytes)
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, RelocatedUniform> relocations_;
     struct RelocatedStorage {
