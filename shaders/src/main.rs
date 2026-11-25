@@ -26,7 +26,8 @@ use playgta6_shaders::rdna2::{
     analyze_instructions, decode_program, format_disasm_with_summary, to_json_with_disasm,
 };
 use playgta6_shaders::rdna2_pack::{
-    BudgetOrder, Rdna2PackOptions, Rdna2PackResult, pack_rdna2_sources_to_file,
+    BudgetOrder, Rdna2PackOptions, Rdna2PackResult, load_priority_hashes_file,
+    pack_rdna2_sources_to_file,
 };
 use playgta6_shaders::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, translate_rdna2_to_wgsl,
@@ -91,6 +92,7 @@ enum Command {
         max_wgsl_bytes: Option<usize>,
         max_pack_bytes: Option<u64>,
         budget_order: BudgetOrder,
+        priority_hashes_path: Option<PathBuf>,
         jobs: Option<usize>,
         json: bool,
     },
@@ -116,7 +118,7 @@ fn print_usage() {
         "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]"
     );
     eprintln!(
-        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--jobs <N>] [--json]"
+        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
     );
     eprintln!();
     eprintln!(
@@ -460,6 +462,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut max_wgsl_bytes: Option<usize> = None;
             let mut max_pack_bytes: Option<u64> = None;
             let mut budget_order = BudgetOrder::HashOrder;
+            let mut priority_hashes_path: Option<PathBuf> = None;
             let mut jobs: Option<usize> = None;
             let mut json = false;
 
@@ -511,6 +514,18 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .ok_or_else(|| "missing value for --budget-order".to_string())?;
                         budget_order = BudgetOrder::parse_str(val)?;
                     }
+                    "--priority-hashes" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --priority-hashes".to_string())?;
+                        if priority_hashes_path.is_some() {
+                            return Err(
+                                "duplicate option --priority-hashes for pack-rdna2".to_string(),
+                            );
+                        }
+                        priority_hashes_path = Some(PathBuf::from(val));
+                    }
                     flag @ ("--jobs" | "-j") => {
                         i += 1;
                         let val = args
@@ -542,7 +557,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
             if input_dir.is_none() && manifest_path.is_none() {
                 return Err(
-                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--jobs <N>] [--json]"
+                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
                         .to_string(),
                 );
             }
@@ -558,6 +573,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 max_wgsl_bytes,
                 max_pack_bytes,
                 budget_order,
+                priority_hashes_path,
                 jobs,
                 json,
             })
@@ -1236,6 +1252,13 @@ fn format_and_write_pack_rdna2(
     )
 }
 
+fn load_cli_priority_hashes(path: Option<&Path>) -> Result<Vec<u64>, String> {
+    match path {
+        Some(p) => load_priority_hashes_file(p).map_err(|err| err.to_string()),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn run_pack_rdna2(
     input_dir: Option<&Path>,
     manifest_path: Option<&Path>,
@@ -1392,14 +1415,23 @@ fn main() -> ExitCode {
             max_wgsl_bytes,
             max_pack_bytes,
             budget_order,
+            priority_hashes_path,
             jobs,
             json,
         }) => {
+            let priority_hashes = match load_cli_priority_hashes(priority_hashes_path.as_deref()) {
+                Ok(hashes) => hashes,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let options = Rdna2PackOptions {
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
                 budget_order,
+                priority_hashes,
                 jobs,
                 ..Rdna2PackOptions::default()
             };
@@ -2118,6 +2150,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: None,
                 json: true,
             }
@@ -2140,12 +2173,13 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: None,
                 json: false,
             }
         );
 
-        // Standalone --manifest mode with size controls, --budget-order, and --jobs
+        // Standalone --manifest mode with size controls, --budget-order, --priority-hashes, and --jobs
         let cmd_manifest = parse_args(&[
             "pack-rdna2".to_string(),
             "--manifest".to_string(),
@@ -2159,6 +2193,8 @@ mod tests {
             "536870912".to_string(),
             "--budget-order".to_string(),
             "smallest-first".to_string(),
+            "--priority-hashes".to_string(),
+            "work/priority_hashes.txt".to_string(),
             "--jobs".to_string(),
             "4".to_string(),
             "--json".to_string(),
@@ -2174,6 +2210,7 @@ mod tests {
                 max_wgsl_bytes: Some(262_144),
                 max_pack_bytes: Some(536_870_912),
                 budget_order: BudgetOrder::SmallestFirst,
+                priority_hashes_path: Some(PathBuf::from("work/priority_hashes.txt")),
                 jobs: Some(4),
                 json: true,
             }
@@ -2200,6 +2237,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::ManifestOrder,
+                priority_hashes_path: None,
                 jobs: None,
                 json: false,
             }
@@ -2224,6 +2262,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: None,
                 json: false,
             }
@@ -2249,6 +2288,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: Some(1),
                 json: false,
             }
@@ -2273,6 +2313,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: Some(4),
                 json: false,
             }
@@ -2298,6 +2339,7 @@ mod tests {
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
                 budget_order: BudgetOrder::HashOrder,
+                priority_hashes_path: None,
                 jobs: None,
                 json: false,
             }
@@ -2498,6 +2540,31 @@ mod tests {
             ])
             .unwrap_err()
             .contains("--budget-order")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--priority-hashes".to_string(),
+            ])
+            .unwrap_err()
+            .contains("--priority-hashes")
+        );
+        assert!(
+            parse_args(&[
+                "pack-rdna2".to_string(),
+                "rdna2_blobs".to_string(),
+                "--out".to_string(),
+                "out.wgsl.pack".to_string(),
+                "--priority-hashes".to_string(),
+                "a.txt".to_string(),
+                "--priority-hashes".to_string(),
+                "b.txt".to_string(),
+            ])
+            .unwrap_err()
+            .contains("--priority-hashes")
         );
         assert!(
             parse_args(&[
@@ -2852,6 +2919,7 @@ mod tests {
             max_wgsl_bytes,
             max_pack_bytes,
             budget_order,
+            priority_hashes_path: _,
             jobs,
             json,
         } = parsed_cmd
@@ -3041,6 +3109,7 @@ mod tests {
             max_wgsl_bytes,
             max_pack_bytes,
             budget_order,
+            priority_hashes_path: _,
             jobs,
             json,
         } = parsed
@@ -3155,6 +3224,7 @@ mod tests {
                 max_wgsl_bytes,
                 max_pack_bytes,
                 budget_order,
+                priority_hashes_path: _,
                 jobs,
                 json,
             } = cmd
@@ -3250,6 +3320,7 @@ mod tests {
             max_wgsl_bytes,
             max_pack_bytes,
             budget_order,
+            priority_hashes_path: _,
             jobs,
             json,
         } = cmd
@@ -3291,6 +3362,146 @@ mod tests {
         let decoded = read_pack(&fs::read(&out_pack).unwrap()).unwrap();
         let hashes: Vec<u64> = decoded.entries.iter().map(|e| e.hash).collect();
         assert_eq!(hashes, vec![0xa000_0000_0000_0002, 0xf000_0000_0000_0003]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn end_to_end_pack_rdna2_cli_priority_hashes_packs_large_priority_ahead_of_smallest_first() {
+        let root = make_temp_dir("playgta6_shaders_pack_rdna2_priority_hashes_cli");
+        let in_dir = root.join("blobs");
+        let out_pack = root.join("out/prioritized.wgsl.pack");
+        let priority_file = root.join("priority_hashes.txt");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        let small_cs = words_to_bytes(&[
+            (0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242,
+            (0b1_0111_1111_u32 << 23) | (0x0Au32 << 16),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ]);
+        let mut large_cs_words = Vec::new();
+        for _ in 0..160 {
+            large_cs_words.push((0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242);
+            large_cs_words.push((0x18u32 << 25) | (2u32 << 17) | (1u32 << 9) | (128 + 1));
+        }
+        large_cs_words.push((0b1_0111_1111_u32 << 23) | (0x0Au32 << 16));
+        large_cs_words.push((0b1_0111_1111_u32 << 23) | (0x01u32 << 16));
+        let large_cs = words_to_bytes(&large_cs_words);
+
+        fs::write(in_dir.join("cs_f000000000000001.rdna2"), &large_cs).unwrap();
+        fs::write(in_dir.join("cs_0000000000000002.rdna2"), &small_cs).unwrap();
+        fs::write(in_dir.join("cs_0000000000000003.rdna2"), &small_cs).unwrap();
+
+        let (_, baseline) =
+            format_and_write_pack_rdna2(&in_dir, &out_pack, true).expect("baseline pack succeeds");
+        let large_len = baseline
+            .entries
+            .iter()
+            .find(|e| e.hash == 0xf000_0000_0000_0001)
+            .unwrap()
+            .wgsl
+            .len() as u64;
+        let small_len = baseline
+            .entries
+            .iter()
+            .find(|e| e.hash == 0x0000_0000_0000_0002)
+            .unwrap()
+            .wgsl
+            .len() as u64;
+
+        // Budget fits `large + 1 small`, forcing 1 small shader out when `large` is prioritized.
+        let budget = PACK_HEADER_BYTES as u64
+            + (PACK_ENTRY_BYTES as u64 + large_len)
+            + (PACK_ENTRY_BYTES as u64 + small_len);
+
+        fs::write(
+            &priority_file,
+            "# Critical hot shaders\n\n0xF000000000000001 # large shader\ndeadbeef00000009\n",
+        )
+        .unwrap();
+
+        let cmd = parse_args(&[
+            "pack-rdna2".to_string(),
+            in_dir.to_string_lossy().into_owned(),
+            "--out".to_string(),
+            out_pack.to_string_lossy().into_owned(),
+            "--max-pack-bytes".to_string(),
+            budget.to_string(),
+            "--budget-order".to_string(),
+            "smallest-first".to_string(),
+            "--priority-hashes".to_string(),
+            priority_file.to_string_lossy().into_owned(),
+            "--json".to_string(),
+        ])
+        .expect("pack-rdna2 --priority-hashes should parse");
+
+        let Command::PackRdna2 {
+            input_dir,
+            manifest_path,
+            out_path,
+            best_effort,
+            max_wgsl_bytes,
+            max_pack_bytes,
+            budget_order,
+            priority_hashes_path,
+            jobs,
+            json,
+        } = cmd
+        else {
+            panic!("expected Command::PackRdna2");
+        };
+
+        let priority_hashes =
+            load_cli_priority_hashes(priority_hashes_path.as_deref()).expect("priority file valid");
+        assert_eq!(
+            priority_hashes,
+            vec![0xf000_0000_0000_0001, 0xdead_beef_0000_0009]
+        );
+
+        let opts = Rdna2PackOptions {
+            best_effort,
+            max_wgsl_bytes,
+            max_pack_bytes,
+            budget_order,
+            priority_hashes,
+            jobs,
+            ..Rdna2PackOptions::default()
+        };
+        let (json_out, res) = format_and_write_pack_rdna2_sources(
+            input_dir.as_deref(),
+            manifest_path.as_deref(),
+            &out_path,
+            &opts,
+            json,
+        )
+        .expect("pack-rdna2 --priority-hashes should succeed");
+
+        assert_eq!(res.summary.translated_ok, 2);
+        assert_eq!(res.summary.omitted_by_budget, 1);
+        assert_eq!(res.summary.priority_hashes_requested, 2);
+        assert_eq!(res.summary.priority_hashes_packed, 1);
+        assert!(
+            json_out.contains("\"priority_hashes_requested\": 2"),
+            "JSON:\n{json_out}"
+        );
+        assert!(
+            json_out.contains("\"priority_hashes_packed\": 1"),
+            "JSON:\n{json_out}"
+        );
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        assert!(!json_out.contains(&root_str), "JSON must not leak host path");
+
+        let decoded = read_pack(&fs::read(&out_pack).unwrap()).unwrap();
+        let hashes: Vec<u64> = decoded.entries.iter().map(|e| e.hash).collect();
+        assert_eq!(hashes, vec![0x0000_0000_0000_0002, 0xf000_0000_0000_0001]);
+
+        // Verify invalid hex line returns a clean error without leaking host path.
+        let bad_file = root.join("bad_priority.txt");
+        fs::write(&bad_file, "0xnot_valid_hex\n").unwrap();
+        let err = load_cli_priority_hashes(Some(&bad_file))
+            .expect_err("invalid priority hashes file must error");
+        assert!(err.contains("line 1"), "err: {err}");
+        assert!(!err.contains(&root_str), "err must not leak host path: {err}");
 
         let _ = fs::remove_dir_all(&root);
     }
