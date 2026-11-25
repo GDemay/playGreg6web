@@ -156,6 +156,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Run and loop every runtime suite under ASan+UBSan and TSan, fix findings by cause with regression tests, and close the thread-pool submission leak left by O32.
 - [ ] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `IN PROGRESS` (#687, @Timon-ok) *(coordinated with the browser pipeline's owner)*
   - Run the browser boot end to end locally, compare it with a native run of the same commit, and fix wasm-only runtime gaps; web and build-tool items go to their owner first.
+- [ ] **O37 — Write Tracking for the Translated CPU Window in the Browser: Per-Slot Dirty Bits From Lifted Stores and Copy Helpers** — `IN PROGRESS` (#716, @Timon-ok) *(O36 follow-up)*
+  - Lifted window stores and runtime copy helpers set per-slot dirty bits so the GPU shadow flush compares only written slots in the browser.
 
 ---
 
