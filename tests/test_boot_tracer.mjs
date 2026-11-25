@@ -5,6 +5,10 @@ import BootTracerDefault, {
   BOOT_MILESTONES,
   TRAP_KIND,
   DEFAULT_MAX_TRAPS,
+  DEFAULT_SLOW_THRESHOLD_MS,
+  CHROME_TRACE_CATEGORY,
+  DEFAULT_TRACE_PID,
+  DEFAULT_TRACE_TID,
   STAGE_NOT_STARTED,
   BootTracer,
   parseLogLine,
@@ -559,4 +563,362 @@ test('reset clears state, restarts the clock, and keeps sinks attached', () => {
   const seq = tracer.recordTrap({ kind: TRAP_KIND.GUEST_TRAP }).seq;
   assert.equal(seq, 1);
   assert.equal(hud.calls.at(-2).text, 'Boot 89%: BINK_OPEN');
+});
+
+test('exports Chrome trace and slow-threshold defaults and validates slowThresholdMs', () => {
+  assert.equal(DEFAULT_SLOW_THRESHOLD_MS, null);
+  assert.equal(CHROME_TRACE_CATEGORY, 'playgta6.boot');
+  assert.equal(DEFAULT_TRACE_PID, 1);
+  assert.equal(DEFAULT_TRACE_TID, 1);
+  assert.equal(new BootTracer().slowThresholdMs, null);
+  assert.equal(new BootTracer({ slowThresholdMs: 0 }).slowThresholdMs, 0);
+  assert.equal(new BootTracer({ slowThresholdMs: 250.5 }).slowThresholdMs, 250.5);
+
+  assert.throws(() => new BootTracer({ slowThresholdMs: -1 }), RangeError);
+  assert.throws(() => new BootTracer({ slowThresholdMs: Number.NaN }), RangeError);
+  assert.throws(() => new BootTracer({ slowThresholdMs: Number.POSITIVE_INFINITY }), RangeError);
+  assert.throws(() => new BootTracer({ slowThresholdMs: '100' }), RangeError);
+});
+
+test('getMilestoneDeltas computes inter-milestone deltas and cumulative timings from boot start', () => {
+  const clock = createClock(1000);
+  const tracer = new BootTracer({ now: clock.now });
+
+  assert.deepEqual(tracer.getMilestoneDeltas(), []);
+  assert.deepEqual(tracer.getSummary().slowMilestones, []);
+  assert.ok(tracer.getSummary().milestones.every((m) => m.deltaFromPrevMs === null && m.slow === false));
+
+  clock.advance(12.5);
+  const m1 = tracer.markMilestone('PGIM_LOAD');
+  assert.equal(m1.deltaFromPrevMs, 12.5);
+
+  clock.advance(27.5);
+  const m2 = tracer.markMilestone('TLS_INIT');
+  assert.equal(m2.deltaFromPrevMs, 27.5);
+
+  // Zero-delta milestone reached at the exact same timestamp as previous.
+  const m3 = tracer.markMilestone('CRT_INITTERM');
+  assert.equal(m3.deltaFromPrevMs, 0);
+
+  clock.advance(60);
+  const m4 = tracer.markMilestone('ENTRY_CALL');
+  assert.equal(m4.deltaFromPrevMs, 60);
+
+  const deltas = tracer.getMilestoneDeltas();
+  assert.deepEqual(
+    deltas.map(({ name, atMs, deltaMs, cumulativeMs }) => ({ name, atMs, deltaMs, cumulativeMs })),
+    [
+      { name: 'PGIM_LOAD', atMs: 12.5, deltaMs: 12.5, cumulativeMs: 12.5 },
+      { name: 'TLS_INIT', atMs: 40, deltaMs: 27.5, cumulativeMs: 40 },
+      { name: 'CRT_INITTERM', atMs: 40, deltaMs: 0, cumulativeMs: 40 },
+      { name: 'ENTRY_CALL', atMs: 100, deltaMs: 60, cumulativeMs: 100 },
+    ]
+  );
+
+  // Invariant: sum of deltas equals final cumulativeMs.
+  const totalDelta = deltas.reduce((sum, d) => sum + d.deltaMs, 0);
+  assert.equal(totalDelta, deltas.at(-1).cumulativeMs);
+  assert.ok(deltas.every((d) => d.deltaFromPrevMs === d.deltaMs && d.slow === false));
+
+  const summary = tracer.getSummary();
+  assert.equal(summary.milestones[0].deltaFromPrevMs, 12.5);
+  assert.equal(summary.milestones[1].deltaFromPrevMs, 27.5);
+  assert.equal(summary.milestones[2].deltaFromPrevMs, 0);
+  assert.equal(summary.milestones[3].deltaFromPrevMs, 60);
+  assert.equal(summary.milestones[4].deltaFromPrevMs, null);
+});
+
+test('slowThresholdMs flags milestones exceeding threshold in summary and deltas', () => {
+  const clock = createClock(0);
+  const tracer = new BootTracer({ now: clock.now, slowThresholdMs: 50 });
+
+  clock.advance(50); // exact boundary: NOT slow
+  const exact = tracer.markMilestone('PGIM_LOAD');
+  assert.equal(exact.slow, false);
+
+  clock.advance(50.1); // exceeds 50ms: slow
+  const slow1 = tracer.markMilestone('TLS_INIT');
+  assert.equal(slow1.slow, true);
+
+  clock.advance(10); // fast
+  const fast = tracer.markMilestone('CRT_INITTERM');
+  assert.equal(fast.slow, false);
+
+  clock.advance(120); // slow
+  const slow2 = tracer.markMilestone('ENTRY_CALL');
+  assert.equal(slow2.slow, true);
+
+  const summary = tracer.getSummary();
+  assert.equal(summary.slowThresholdMs, 50);
+  assert.deepEqual(
+    summary.slowMilestones.map((m) => m.name),
+    ['TLS_INIT', 'ENTRY_CALL']
+  );
+  assert.equal(summary.milestones[0].slow, false);
+  assert.equal(summary.milestones[1].slow, true);
+  assert.equal(summary.milestones[2].slow, false);
+  assert.equal(summary.milestones[3].slow, true);
+  assert.equal(summary.milestones[4].slow, false);
+
+  // Per-call override does not mutate the tracer's configured slowThresholdMs.
+  const stricter = tracer.getMilestoneDeltas({ slowThresholdMs: 25 });
+  assert.deepEqual(
+    stricter.filter((d) => d.slow).map((d) => d.name),
+    ['PGIM_LOAD', 'TLS_INIT', 'ENTRY_CALL']
+  );
+  assert.equal(tracer.slowThresholdMs, 50);
+  assert.deepEqual(
+    tracer.getMilestoneDeltas({ slowThresholdMs: null }).filter((d) => d.slow),
+    []
+  );
+
+  assert.throws(() => tracer.getMilestoneDeltas(null), TypeError);
+  assert.throws(() => tracer.getMilestoneDeltas({ slowThresholdMs: -5 }), RangeError);
+});
+
+test('getMilestoneDeltas handles out-of-order, duplicate, and backwards-clock milestones', () => {
+  const clock = createClock(500);
+  const tracer = new BootTracer({ now: clock.now });
+
+  // Out of canonical order: GDK_INIT first, then duplicate GDK_INIT, then PGIM_LOAD, then backwards clock TLS_INIT.
+  clock.advance(20);
+  tracer.markMilestone('GDK_INIT');
+
+  // Duplicate later at +15ms must not duplicate entry or shift subsequent deltas.
+  clock.advance(15);
+  const dup = tracer.markMilestone('GDK_INIT');
+  assert.equal(dup.firstReach, false);
+  assert.equal(dup.count, 2);
+  assert.equal(dup.elapsedMs, 20);
+  assert.equal(dup.lastElapsedMs, 35);
+  assert.equal(dup.deltaFromPrevMs, 20);
+
+  // Next distinct milestone at +30ms (total elapsed 65ms): delta from previous distinct milestone (20ms) is 45ms.
+  clock.advance(30);
+  tracer.markMilestone('PGIM_LOAD');
+
+  // Clock jumps backwards: monotonic clamp keeps elapsedMs at 65ms and deltaMs at 0ms.
+  clock.set(510);
+  tracer.markMilestone('TLS_INIT');
+
+  const deltas = tracer.getMilestoneDeltas();
+  assert.deepEqual(
+    deltas.map(({ name, atMs, deltaMs, cumulativeMs }) => ({ name, atMs, deltaMs, cumulativeMs })),
+    [
+      { name: 'GDK_INIT', atMs: 20, deltaMs: 20, cumulativeMs: 20 },
+      { name: 'PGIM_LOAD', atMs: 65, deltaMs: 45, cumulativeMs: 65 },
+      { name: 'TLS_INIT', atMs: 65, deltaMs: 0, cumulativeMs: 65 },
+    ]
+  );
+  assert.equal(
+    deltas.reduce((sum, d) => sum + d.deltaMs, 0),
+    deltas.at(-1).cumulativeMs
+  );
+});
+
+test('toChromeTraceEvents emits valid Chromium/Perfetto JSON schema with phase spans and instant markers', () => {
+  const clock = createClock(2000);
+  const tracer = new BootTracer({ now: clock.now, slowThresholdMs: 30 });
+
+  clock.advance(15.25);
+  tracer.markMilestone('PGIM_LOAD', { segments: 4 });
+
+  clock.advance(20);
+  tracer.recordTrap({
+    kind: TRAP_KIND.UNRESOLVED_IMPORT,
+    dll: 'd3d12_xs.dll',
+    symbol: 'D3D12XboxCreateDevice',
+    message: 'missing shim',
+  });
+
+  clock.advance(25.5);
+  tracer.markMilestone('TLS_INIT');
+
+  // Duplicate milestone should not add extra trace events.
+  clock.advance(5);
+  tracer.markMilestone('PGIM_LOAD');
+
+  const trace = tracer.toChromeTraceEvents();
+  assert.equal(trace.displayTimeUnit, 'ms');
+  assert.ok(Array.isArray(trace.traceEvents));
+  assert.equal(trace.metadata.source, 'playgta6web.boot_tracer');
+  assert.equal(trace.metadata.stage, 'TLS_INIT');
+  assert.equal(trace.metadata.milestonesReached, 2);
+  assert.equal(trace.metadata.trapCount, 1);
+  assert.equal(trace.metadata.slowThresholdMs, 30);
+
+  // JSON round-trip must succeed cleanly.
+  const parsed = JSON.parse(JSON.stringify(trace));
+  assert.deepEqual(parsed, trace);
+
+  // Verify schema of every event and non-decreasing timestamp ordering.
+  let prevTs = 0;
+  for (const ev of trace.traceEvents) {
+    assert.equal(typeof ev.name, 'string');
+    assert.ok(ev.name.length > 0);
+    assert.equal(ev.cat, CHROME_TRACE_CATEGORY);
+    assert.ok(ev.ph === 'X' || ev.ph === 'i');
+    assert.equal(typeof ev.ts, 'number');
+    assert.ok(Number.isInteger(ev.ts) && ev.ts >= 0);
+    assert.ok(ev.ts >= prevTs, `expected non-decreasing ts (${ev.ts} >= ${prevTs})`);
+    prevTs = ev.ts;
+    assert.equal(ev.pid, DEFAULT_TRACE_PID);
+    assert.equal(ev.tid, DEFAULT_TRACE_TID);
+    assert.equal(typeof ev.args, 'object');
+    if (ev.ph === 'X') {
+      assert.equal(typeof ev.dur, 'number');
+      assert.ok(Number.isInteger(ev.dur) && ev.dur >= 0);
+      assert.equal('s' in ev, false);
+    } else {
+      assert.equal(ev.s, 't');
+      assert.equal('dur' in ev, false);
+    }
+  }
+
+  const spans = trace.traceEvents.filter((e) => e.ph === 'X');
+  assert.equal(spans.length, 2);
+  assert.deepEqual(
+    spans.map((s) => ({ name: s.name, ts: s.ts, dur: s.dur, slow: s.args.slow })),
+    [
+      { name: 'phase:PGIM_LOAD', ts: 0, dur: 15250, slow: false },
+      { name: 'phase:TLS_INIT', ts: 15250, dur: 45500, slow: true },
+    ]
+  );
+
+  // Spans are contiguous: second span starts exactly where first ends.
+  assert.equal(spans[0].ts + spans[0].dur, spans[1].ts);
+
+  const instants = trace.traceEvents.filter((e) => e.ph === 'i');
+  assert.equal(instants.length, 3);
+  assert.deepEqual(
+    instants.map((i) => ({ name: i.name, ts: i.ts })),
+    [
+      { name: 'PGIM_LOAD', ts: 15250 },
+      { name: 'trap:UNRESOLVED_IMPORT', ts: 35250 },
+      { name: 'TLS_INIT', ts: 60750 },
+    ]
+  );
+  assert.equal(instants[0].args.count, 2);
+  assert.deepEqual(instants[0].args.detail, { segments: 4 });
+  assert.equal(instants[1].args.import, 'd3d12_xs.dll!D3D12XboxCreateDevice');
+
+  // Option controls: exclude traps, include metadata, custom pid/tid/category.
+  const custom = tracer.toChromeTraceEvents({
+    pid: 42,
+    tid: 7,
+    category: 'custom.boot',
+    includeTraps: false,
+    includeMetadata: true,
+    slowThresholdMs: 100,
+  });
+  const meta = custom.traceEvents.filter((e) => e.ph === 'M');
+  assert.equal(meta.length, 2);
+  assert.equal(meta[0].name, 'process_name');
+  assert.equal(meta[0].pid, 42);
+  assert.equal(meta[1].name, 'thread_name');
+  assert.equal(meta[1].tid, 7);
+  assert.equal(custom.traceEvents.filter((e) => e.name.startsWith('trap:')).length, 0);
+  assert.ok(custom.traceEvents.filter((e) => e.ph !== 'M').every((e) => e.cat === 'custom.boot'));
+  assert.ok(custom.traceEvents.filter((e) => e.ph === 'X').every((e) => e.args.slow === false));
+
+  assert.throws(() => tracer.toChromeTraceEvents(null), TypeError);
+  assert.throws(() => tracer.toChromeTraceEvents({ pid: -1 }), RangeError);
+  assert.throws(() => tracer.toChromeTraceEvents({ tid: 1.5 }), RangeError);
+  assert.throws(() => tracer.toChromeTraceEvents({ slowThresholdMs: -1 }), RangeError);
+});
+
+test('toChromeTraceEvents strictly sanitizes host paths, credentials, and binary buffers', () => {
+  const clock = createClock(100);
+  const tracer = new BootTracer({ now: clock.now });
+
+  clock.advance(10);
+  tracer.ingestLogLine('[boot] loaded pgim from C:\\Users\\alice\\Games\\GTA6\\boot.pgim');
+  clock.advance(15);
+  tracer.markMilestone('TLS_INIT', {
+    path: '/home/bob/local-data/tls.bin',
+    url: 'file:///Users/carol/secret.pgim',
+    apiKey: 'super-secret-token',
+    rawBytes: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    rawBuf: new ArrayBuffer(16),
+  });
+  clock.advance(5);
+  tracer.recordTrap({
+    kind: TRAP_KIND.GUEST_TRAP,
+    message: 'fault in \\\\fileserver\\share\\dump.dmp Bearer tok.123.456',
+  });
+
+  const trace = tracer.toChromeTraceEvents({
+    category: 'playgta6.boot C:\\Users\\dave\\cat token=xyz999',
+  });
+  const json = JSON.stringify(trace);
+
+  for (const leak of [
+    'alice',
+    'bob',
+    'carol',
+    'dave',
+    'super-secret-token',
+    'fileserver',
+    'tok.123.456',
+    'xyz999',
+    '222', // 0xde raw byte must not appear as array dump
+  ]) {
+    assert.equal(json.includes(leak), false, `Chrome trace leaked ${leak}`);
+  }
+  assert.match(json, /REDACTED/);
+
+  const tlsInstant = trace.traceEvents.find((e) => e.ph === 'i' && e.name === 'TLS_INIT');
+  assert.deepEqual(tlsInstant.args.detail.rawBytes, { type: 'Uint8Array', byteLength: 4 });
+  assert.deepEqual(tlsInstant.args.detail.rawBuf, { type: 'ArrayBuffer', byteLength: 16 });
+  assert.equal(tlsInstant.args.detail.apiKey, '[REDACTED]');
+});
+
+test('reset clears milestone deltas, slowMilestones, and Chrome traceEvents while keeping slowThresholdMs', () => {
+  const clock = createClock(100);
+  const tracer = new BootTracer({ now: clock.now, slowThresholdMs: 25 });
+
+  clock.advance(40);
+  tracer.markMilestone('PGIM_LOAD');
+  clock.advance(10);
+  tracer.recordTrap({ kind: TRAP_KIND.GUEST_TRAP, guestVa: '0x140001000' });
+
+  assert.equal(tracer.getMilestoneDeltas().length, 1);
+  assert.equal(tracer.getSummary().slowMilestones.length, 1);
+  assert.equal(tracer.toChromeTraceEvents().traceEvents.length, 3);
+
+  tracer.reset();
+  assert.equal(tracer.slowThresholdMs, 25);
+  assert.deepEqual(tracer.getMilestoneDeltas(), []);
+  assert.deepEqual(tracer.getSummary().slowMilestones, []);
+  assert.deepEqual(tracer.toChromeTraceEvents().traceEvents, []);
+
+  // Post-reset deltas anchor to the new boot start clock.
+  clock.advance(12);
+  tracer.markMilestone('TLS_INIT');
+  clock.advance(30);
+  tracer.markMilestone('CRT_INITTERM');
+
+  assert.deepEqual(
+    tracer.getMilestoneDeltas().map(({ name, atMs, deltaMs, cumulativeMs, slow }) => ({
+      name,
+      atMs,
+      deltaMs,
+      cumulativeMs,
+      slow,
+    })),
+    [
+      { name: 'TLS_INIT', atMs: 12, deltaMs: 12, cumulativeMs: 12, slow: false },
+      { name: 'CRT_INITTERM', atMs: 42, deltaMs: 30, cumulativeMs: 42, slow: true },
+    ]
+  );
+
+  const postResetTrace = tracer.toChromeTraceEvents();
+  const spans = postResetTrace.traceEvents.filter((e) => e.ph === 'X');
+  assert.deepEqual(
+    spans.map((s) => ({ name: s.name, ts: s.ts, dur: s.dur })),
+    [
+      { name: 'phase:TLS_INIT', ts: 0, dur: 12000 },
+      { name: 'phase:CRT_INITTERM', ts: 12000, dur: 30000 },
+    ]
+  );
 });
