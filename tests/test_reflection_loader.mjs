@@ -1203,10 +1203,12 @@ test('parseReflectionManifest and ReflectionRegistry preserve S34 heap sources a
   assert.deepEqual(parsed.summary, {
     shaderCount: 2,
     stageCount: 2,
+    stagesIndexed: 2,
     bindGroupLayoutCount: 2,
     pipelineLayoutCount: 2,
     pipelineCount: 0,
     samplerHeapBindings: 1,
+    resourceHeapStages: 2,
     resourceHeapBindings: 2,
     inlineSamplerStages: 0,
     inlineSamplerBindings: 0,
@@ -2462,23 +2464,28 @@ test('W215 parseStageReflectionSidecar parses splash.wgsl.pack.reflect.json form
 
   assert.deepEqual(parsed.summary, {
     stageCount: 5,
+    stagesIndexed: 5,
     inlineSamplerStages: 2,
     inlineSamplerBindings: 3,
-    vertexIndexStages: 2,
-    samplerHeapBindings: 1,
+    resourceHeapStages: 1,
     resourceHeapBindings: 1,
+    samplerHeapBindings: 1,
+    vertexIndexStages: 2,
   });
 
   // Initial lookup stats
   assert.deepEqual(parsed.getStats(), {
     stageCount: 5,
+    stagesIndexed: 5,
     inlineSamplerStages: 2,
     inlineSamplerBindings: 3,
-    vertexIndexStages: 2,
-    samplerHeapBindings: 1,
+    resourceHeapStages: 1,
     resourceHeapBindings: 1,
+    samplerHeapBindings: 1,
+    vertexIndexStages: 2,
     lookupHits: 0,
     lookupMisses: 0,
+    lookupHitRate: 0,
   });
 
   // O(1) normalized-hash lookup across '0x...', uppercase '0X...', bare 16-hex, short hex, BigInt, safe int
@@ -2850,9 +2857,505 @@ test('W215 S6 parseReflectionManifest tracks inline_sampler and vertex_index tel
 
   const stats = registry.getStats();
   assert.equal(stats.stageCount, 2);
+  assert.equal(stats.stagesIndexed, 2);
   assert.equal(stats.inlineSamplerStages, 1);
   assert.equal(stats.inlineSamplerBindings, 1);
+  assert.equal(stats.resourceHeapStages, 0);
   assert.equal(stats.vertexIndexStages, 1);
   assert.equal(stats.lookupHits, 2);
   assert.equal(stats.lookupMisses, 0);
+  assert.equal(stats.lookupHitRate, 1);
+});
+
+// ---------------------------------------------------------------------------
+// W275: Compact interned stage indexing, resource_heap: true + inline_sampler
+// metadata, lookupHitRate & resetStats() telemetry, and 9,574-stage scale test
+// ---------------------------------------------------------------------------
+
+test('W275 parseBindingSource and diagnoseStageBindings support v1 resource_heap: true shorthand alongside S34 object form', () => {
+  // Standalone boolean shorthand: { resource_heap: true }
+  const boolOnly = parseBindingSource({ resource_heap: true });
+  assert.deepEqual(boolOnly, { kind: 'resource_heap', resourceHeap: true });
+
+  // Boolean shorthand with user_sgpr: { user_sgpr: 10, resource_heap: true }
+  const boolWithSgpr = parseBindingSource({ user_sgpr: 10, resource_heap: true });
+  assert.deepEqual(boolWithSgpr, { kind: 'resource_heap', resourceHeap: true, userSgpr: 10 });
+
+  // S34 object form remains 100% preserved
+  const s34Obj = parseBindingSource({
+    resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 10, shift: 5 } },
+  });
+  assert.deepEqual(s34Obj, {
+    kind: 'resource_heap',
+    baseUserSgpr: 4,
+    stride: 32,
+    indexUserSgpr: 10,
+    indexShift: 5,
+  });
+
+  // Malformed boolean / combined forms are rejected cleanly
+  const invalidResourceHeapCases = [
+    [{ resource_heap: false }, /resource_heap must be an object/],
+    [{ resource_heap: true, static_sampler: 0 }, /resource_heap source cannot be combined/],
+    [{ resource_heap: true, inline_sampler: { sdwords: [1, 2, 3, 4] } }, /resource_heap source cannot be combined/],
+    [{ resource_heap: true, table_byte_offset: 32 }, /resource_heap source cannot be combined/],
+    [{ resource_heap: true, root_constants: true }, /resource_heap source cannot be combined/],
+    [{ resource_heap: true, root_descriptor: true }, /resource_heap source cannot be combined/],
+    [{ resource_heap: true, user_sgpr: -1 }, /user_sgpr must be a non-negative uint32/],
+    [{ resource_heap: true, user_sgpr: '10' }, /user_sgpr must be a non-negative uint32/],
+    [
+      {
+        resource_heap: true,
+        sampler_heap: { base_user_sgpr: 2, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+      },
+      /cannot define both sampler_heap and resource_heap/,
+    ],
+  ];
+
+  for (const [badSource, pattern] of invalidResourceHeapCases) {
+    assert.throws(
+      () => parseBindingSource(badSource, 'test.source'),
+      (err) => err instanceof ManifestValidationError && pattern.test(err.message),
+      `Expected parseBindingSource(${JSON.stringify(badSource)}) to fail with ${pattern}`
+    );
+  }
+
+  // diagnoseStageBindings resolves resource_heap: true on textures/buffers and rejects samplers
+  const emptyRs = { parameters: [], static_samplers: [] };
+  const validStage = {
+    stage: 'fragment',
+    bindings: [
+      { group: 0, binding: 0, name: 'rh_tex', kind: 'texture', source: { resource_heap: true } },
+      {
+        group: 0,
+        binding: 1,
+        name: 'rh_buf',
+        kind: 'read_only_storage',
+        min_binding_size_bytes: 16,
+        source: { user_sgpr: 10, resource_heap: true },
+      },
+      {
+        group: 0,
+        binding: 2,
+        name: 'inline_smp',
+        kind: 'sampler',
+        source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+      },
+    ],
+  };
+
+  const diagOk = diagnoseStageBindings(validStage, emptyRs);
+  assert.equal(diagOk.ok, true);
+  assert.equal(diagOk.resolvedBindings.length, 3);
+  assert.equal(diagOk.resolvedBindings[0].registerClass, 'srv');
+  assert.deepEqual(diagOk.resolvedBindings[0].heap, {
+    kind: 'resource_heap',
+    resourceHeap: true,
+    parameterIndex: null,
+    userSgpr: null,
+  });
+  assert.equal(diagOk.resolvedBindings[1].registerClass, 'srv');
+  assert.deepEqual(diagOk.resolvedBindings[1].heap, {
+    kind: 'resource_heap',
+    resourceHeap: true,
+    parameterIndex: null,
+    userSgpr: 10,
+  });
+  assert.equal(diagOk.resolvedBindings[2].inlineSampler, true);
+
+  // Sampler binding with resource_heap: true must fail with HEAP_KIND_MISMATCH
+  const badSamplerDiag = diagnoseStageBindings(
+    {
+      stage: 'fragment',
+      bindings: [
+        { group: 0, binding: 0, name: 'bad_smp', kind: 'sampler', source: { resource_heap: true } },
+      ],
+    },
+    emptyRs
+  );
+  assert.equal(badSamplerDiag.ok, false);
+  assert.equal(badSamplerDiag.diagnostics.length, 1);
+  assert.equal(badSamplerDiag.diagnostics[0].code, DIAGNOSTIC_CODES.HEAP_KIND_MISMATCH);
+  assert.match(badSamplerDiag.diagnostics[0].message, /resource heap/);
+});
+
+test('W275 compact sidecar indexing interns canonical tokens/sources/layouts and discards raw JSON wrappers', () => {
+  const sidecarObj = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    _unused_root_blob: 'x'.repeat(2048),
+    stages: {
+      '0x0000000000010001': {
+        stage: '  FRAGMENT  ',
+        entry_point: 'ps_custom_long_entry_point_name',
+        _raw_stage_wrapper: { disasm: 's_endpgm', rawBytes: [1, 2, 3] },
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'shared_uniform_block_name',
+            kind: 'UNIFORM',
+            min_binding_size_bytes: 64,
+            _unused_binding_meta: 'discard_me',
+            source: { user_sgpr: 8, table_byte_offset: 0, _extra_src_wrapper: true },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'shared_tex_name',
+            kind: 'TEXTURE',
+            view_dimension: '2D_ARRAY',
+            sample_type: 'UNFILTERABLE_FLOAT',
+            source: { resource_heap: true },
+          },
+          {
+            group: 0,
+            binding: 2,
+            name: 'shared_uav_tex',
+            kind: 'storage_texture',
+            view_dimension: '2d',
+            storage_format: 'rgba16float_custom_long',
+            source: {
+              resource_heap: { base_user_sgpr: 0, stride: 32, index: { user_sgpr: 10, shift: 5 } },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            name: 'shared_inline_smp',
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+      '0x0000000000010002': {
+        stage: 'pixel',
+        entry_point: 'ps_custom_long_entry_point_name',
+        _raw_stage_wrapper: { disasm: 's_endpgm' },
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'shared_uniform_block_name',
+            kind: 'uniform',
+            min_binding_size_bytes: 64,
+            source: { user_sgpr: 8, table_byte_offset: 0 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'shared_tex_name',
+            kind: 'texture',
+            view_dimension: '2d-array',
+            sample_type: 'unfilterable-float',
+            source: { resource_heap: true },
+          },
+          {
+            group: 0,
+            binding: 2,
+            name: 'shared_uav_tex',
+            kind: 'storage-texture',
+            view_dimension: '2d',
+            storage_format: 'rgba16float_custom_long',
+            source: {
+              resource_heap: { base_user_sgpr: 0, stride: 32, index: { user_sgpr: 10, shift: 5 } },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            name: 'shared_inline_smp',
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseStageReflectionSidecar(JSON.stringify(sidecarObj));
+  const s1 = parsed.getStage('0x0000000000010001');
+  const s2 = parsed.getStage('0x0000000000010002');
+  assert.ok(s1 && s2);
+
+  // Raw JSON wrapper fields must NOT be retained on indexed stage/binding/source objects
+  assert.equal('_unused_root_blob' in parsed, false);
+  assert.equal('_raw_stage_wrapper' in s1, false);
+  assert.equal('_unused_binding_meta' in s1.bindings[0], false);
+  assert.equal('_extra_src_wrapper' in s1.bindings[0].source, false);
+
+  // Canonical string tokens, normalized sources, layout entries, BGLs, and empty arrays are shared
+  assert.equal(s1.stage, 'fragment');
+  assert.equal(s1.stage, s2.stage);
+  assert.equal(s1.entryPoint, s2.entryPoint);
+  assert.equal(s1.bindings[1].viewDimension, '2d-array');
+  assert.equal(s1.bindings[1].sampleType, 'unfilterable-float');
+  assert.equal(s1.bindings[2].storageFormat, s2.bindings[2].storageFormat);
+
+  // Deduplicated immutable source, layoutEntry, bindGroupLayout, bindGroupLayoutIds & empty arrays
+  assert.equal(s1.bindings[0].source, s2.bindings[0].source);
+  assert.equal(s1.bindings[1].source, s2.bindings[1].source);
+  assert.equal(s1.bindings[2].source, s2.bindings[2].source);
+  assert.equal(s1.bindings[3].source, s2.bindings[3].source);
+  assert.equal(s1.bindings[3].source.sdwords, s2.bindings[3].source.sdwords);
+  assert.equal(s1.bindings[0].layoutEntry, s2.bindings[0].layoutEntry);
+  assert.equal(s1.bindings[0].layoutEntry, s1.bindGroupLayouts[0].entries[0]);
+  assert.equal(s1.bindGroupLayouts[0], s2.bindGroupLayouts[0]);
+  assert.equal(s1.bindGroupLayoutIds, s2.bindGroupLayoutIds);
+  assert.equal(s1.bind_group_layouts, s1.bindGroupLayoutIds);
+  assert.equal(s1.fragmentOutputs, s2.fragmentOutputs);
+  assert.equal(s1.requiresLowering, s2.requiresLowering);
+  assert.equal(s1.limitViolations, s2.limitViolations);
+  assert.equal(s1.vertexInputs, s2.vertexInputs);
+
+  // Stage-level counting: each stage has 2 resource_heap bindings, counted once per stage
+  assert.equal(s1.hasResourceHeap, true);
+  assert.equal(s1.resourceHeapBindings, 2);
+  assert.equal(s1.hasInlineSampler, true);
+  assert.equal(s1.inlineSamplerBindings, 1);
+
+  const stats = parsed.getStats();
+  assert.equal(stats.stagesIndexed, 2);
+  assert.equal(stats.resourceHeapStages, 2);
+  assert.equal(stats.resourceHeapBindings, 4);
+  assert.equal(stats.inlineSamplerStages, 2);
+  assert.equal(stats.inlineSamplerBindings, 2);
+  assert.equal(stats.lookupHits, 2);
+  assert.equal(stats.lookupMisses, 0);
+  assert.equal(stats.lookupHitRate, 1);
+});
+
+test('W275 getStats() exposes lookupHitRate clamped [0, 1], resourceHeapStages, stagesIndexed, and clean resetStats()', () => {
+  const sidecar = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x0000000000020001': {
+        stage: 'fragment',
+        bindings: [
+          { group: 0, binding: 0, kind: 'texture', source: { resource_heap: true } },
+          { group: 0, binding: 1, kind: 'read_only_storage', source: { resource_heap: true } },
+          {
+            group: 0,
+            binding: 2,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+      '0x0000000000020002': {
+        stage: 'compute',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'storage',
+            source: {
+              resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 5, shift: 5 } },
+            },
+          },
+        ],
+      },
+      '0x0000000000020003': {
+        stage: 'vertex',
+        bindings: [
+          { group: 0, binding: 0, kind: 'uniform', source: { user_sgpr: 8, table_byte_offset: 0 } },
+        ],
+      },
+    },
+  };
+
+  // 1. Standalone sidecar getStats() & resetStats()
+  const parsed = parseStageReflectionSidecar(sidecar);
+  assert.equal(parsed.getStats().lookupHitRate, 0);
+  assert.equal(parsed.getStats().stagesIndexed, 3);
+  assert.equal(parsed.getStats().inlineSamplerStages, 1);
+  assert.equal(parsed.getStats().resourceHeapStages, 2);
+
+  // All misses -> hitRate === 0
+  assert.equal(parsed.getStage('0x0000000000029999'), undefined);
+  assert.equal(parsed.getStage('0x0000000000029998'), undefined);
+  assert.equal(parsed.getStats().lookupHits, 0);
+  assert.equal(parsed.getStats().lookupMisses, 2);
+  assert.equal(parsed.getStats().lookupHitRate, 0);
+
+  // Mixed hits & misses -> 3 hits / (3 + 2) = 0.6
+  assert.ok(parsed.getStage('0x0000000000020001'));
+  assert.ok(parsed.getStage('0x0000000000020002'));
+  assert.ok(parsed.getStage('0000000000020003'));
+  let sStats = parsed.getStats();
+  assert.equal(sStats.lookupHits, 3);
+  assert.equal(sStats.lookupMisses, 2);
+  assert.ok(Math.abs(sStats.lookupHitRate - 0.6) < 1e-12);
+  assert.ok(sStats.lookupHitRate >= 0 && sStats.lookupHitRate <= 1);
+
+  // resetStats() clears lookup counters & hitRate without losing indexed stages
+  parsed.resetStats();
+  sStats = parsed.getStats();
+  assert.equal(sStats.lookupHits, 0);
+  assert.equal(sStats.lookupMisses, 0);
+  assert.equal(sStats.lookupHitRate, 0);
+  assert.equal(sStats.stagesIndexed, 3);
+  assert.equal(sStats.inlineSamplerStages, 1);
+  assert.equal(sStats.resourceHeapStages, 2);
+  assert.ok(parsed.getStage(0x20001n));
+  assert.equal(parsed.getStats().lookupHits, 1);
+  assert.equal(parsed.getStats().lookupHitRate, 1);
+
+  // 2. ReflectionRegistry getStats(), overwrite accounting for resourceHeapStages, & resetStats()
+  const registry = new ReflectionRegistry();
+  assert.equal(registry.getStats().lookupHitRate, 0);
+  assert.equal(registry.getStats().stagesIndexed, 0);
+  assert.equal(registry.getStats().resourceHeapStages, 0);
+
+  registry.loadStageReflection(sidecar);
+  let rStats = registry.getStats();
+  assert.equal(rStats.stagesIndexed, 3);
+  assert.equal(rStats.inlineSamplerStages, 1);
+  assert.equal(rStats.resourceHeapStages, 2);
+  assert.equal(rStats.resourceHeapBindings, 3);
+  assert.equal(rStats.lookupHitRate, 0);
+
+  // 3 hits, 1 miss -> 0.75
+  assert.ok(registry.getStageReflection('0x0000000000020001'));
+  assert.ok(registry.getStageReflection('0000000000020002'));
+  assert.ok(registry.getStageReflection(0x20003n));
+  assert.equal(registry.getStageReflection('0xdeadbeef'), undefined);
+  rStats = registry.getStats();
+  assert.equal(rStats.lookupHits, 3);
+  assert.equal(rStats.lookupMisses, 1);
+  assert.equal(rStats.lookupHitRate, 0.75);
+
+  // Overwriting stage 0x20001 to remove resource_heap and inline_sampler updates stage counts cleanly
+  registry.loadStageReflection({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x0000000000020001': {
+        stage: 'fragment',
+        bindings: [
+          { group: 0, binding: 0, kind: 'uniform', source: { user_sgpr: 8, table_byte_offset: 0 } },
+        ],
+      },
+    },
+  });
+  rStats = registry.getStats();
+  assert.equal(rStats.stagesIndexed, 3);
+  assert.equal(rStats.inlineSamplerStages, 0);
+  assert.equal(rStats.inlineSamplerBindings, 0);
+  assert.equal(rStats.resourceHeapStages, 1);
+  assert.equal(rStats.resourceHeapBindings, 1);
+
+  // resetStats() clears cumulative counters while preserving indexed stage counts and lookupability
+  registry.resetStats();
+  rStats = registry.getStats();
+  assert.equal(rStats.lookupHits, 0);
+  assert.equal(rStats.lookupMisses, 0);
+  assert.equal(rStats.lookupHitRate, 0);
+  assert.equal(rStats.manifestsLoaded, 0);
+  assert.equal(rStats.sidecarsLoaded, 0);
+  assert.equal(rStats.stagesIndexed, 3);
+  assert.equal(rStats.resourceHeapStages, 1);
+  assert.ok(registry.getStageReflection('0x0000000000020002'));
+  assert.equal(registry.getStats().lookupHits, 1);
+  assert.equal(registry.getStats().lookupHitRate, 1);
+
+  // clear() zeroes live resourceHeapStages too
+  registry.clear();
+  assert.equal(registry.getStats().stagesIndexed, 0);
+  assert.equal(registry.getStats().resourceHeapStages, 0);
+});
+
+test('W275 indexes 9,574-stage sidecar (splash.wgsl.pack.reflect.json scale) with compact interning and O(1) lookup telemetry', () => {
+  const STAGE_COUNT = 9574;
+  const rawStages = {};
+  let expectedInlineSamplerStages = 0;
+  let expectedResourceHeapStages = 0;
+
+  for (let i = 0; i < STAGE_COUNT; i += 1) {
+    const hashHex = `0x${(0x1000000000000000n + BigInt(i)).toString(16)}`;
+    const kindMod = i % 3;
+    const stageType = kindMod === 0 ? 'vertex' : kindMod === 1 ? 'fragment' : 'compute';
+    const bindings = [
+      {
+        group: 0,
+        binding: 0,
+        kind: 'uniform',
+        min_binding_size_bytes: 64,
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+    ];
+    if (i % 5 === 0) {
+      expectedInlineSamplerStages += 1;
+      bindings.push({
+        group: 0,
+        binding: 1,
+        kind: 'sampler',
+        source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+      });
+    }
+    if (i % 4 === 0) {
+      expectedResourceHeapStages += 1;
+      bindings.push({
+        group: 0,
+        binding: 2,
+        kind: 'texture',
+        view_dimension: '2d',
+        sample_type: 'float',
+        source:
+          i % 8 === 0
+            ? { resource_heap: true }
+            : { resource_heap: { base_user_sgpr: 0, stride: 32, index: { user_sgpr: 10, shift: 5 } } },
+      });
+    }
+    rawStages[hashHex] = {
+      stage: stageType,
+      bindings,
+    };
+  }
+
+  const jsonPayload = JSON.stringify({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: rawStages,
+  });
+
+  const registry = new ReflectionRegistry();
+  registry.loadStageReflection(jsonPayload);
+
+  let stats = registry.getStats();
+  assert.equal(stats.stagesIndexed, STAGE_COUNT);
+  assert.equal(stats.stageCount, STAGE_COUNT);
+  assert.equal(stats.inlineSamplerStages, expectedInlineSamplerStages);
+  assert.equal(stats.resourceHeapStages, expectedResourceHeapStages);
+  assert.equal(stats.lookupHits, 0);
+  assert.equal(stats.lookupMisses, 0);
+  assert.equal(stats.lookupHitRate, 0);
+
+  // Spot-check shared canonical objects across distant stages (interning proof)
+  const first = registry.getStageReflection('0x1000000000000000');
+  const later = registry.getStageReflection('1000000000000078'); // i = 120 (divisible by 3, 4, 5, 8)
+  const last = registry.getStageReflection(0x1000000000000000n + BigInt(STAGE_COUNT - 1));
+  const missing = registry.getStageReflection('0xffffffffffffffff');
+
+  assert.ok(first && later && last);
+  assert.equal(missing, undefined);
+  assert.equal(first.bindings[0].source, later.bindings[0].source);
+  assert.equal(first.bindings[1].source, later.bindings[1].source);
+  assert.equal(first.bindings[2].source, later.bindings[2].source);
+  assert.equal(first.bindGroupLayouts[0], later.bindGroupLayouts[0]);
+
+  stats = registry.getStats();
+  assert.equal(stats.lookupHits, 3);
+  assert.equal(stats.lookupMisses, 1);
+  assert.equal(stats.lookupHitRate, 0.75);
+
+  registry.resetStats();
+  stats = registry.getStats();
+  assert.equal(stats.stagesIndexed, STAGE_COUNT);
+  assert.equal(stats.inlineSamplerStages, expectedInlineSamplerStages);
+  assert.equal(stats.resourceHeapStages, expectedResourceHeapStages);
+  assert.equal(stats.lookupHits, 0);
+  assert.equal(stats.lookupMisses, 0);
+  assert.equal(stats.lookupHitRate, 0);
 });
