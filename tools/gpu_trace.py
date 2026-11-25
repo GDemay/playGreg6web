@@ -8,7 +8,7 @@ handling of unknown/future opcodes >= 35).
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
 
-    python tools/gpu_trace.py <trace.bin> [--json] [--stats] [--strict] [--shader-summary] [--binding-audit]
+    python tools/gpu_trace.py <trace.bin> [--json] [--stats] [--strict] [--shader-summary] [--binding-audit] [--bink-video-audit] [--start-screen-skips]
 """
 
 from __future__ import annotations
@@ -735,6 +735,8 @@ class DecodedTrace:
         stats_only: bool = False,
         shader_summary: bool = False,
         binding_audit: bool = False,
+        bink_video_audit: bool = False,
+        start_screen_skips: bool = False,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {
             "abi_version": self.abi_version,
@@ -777,6 +779,10 @@ class DecodedTrace:
             result["shader_summary"] = summarize_shaders(self)
         if binding_audit:
             result["binding_audit"] = audit_bindings(self)
+        if bink_video_audit:
+            result["bink_video_audit"] = audit_bink_video(self)
+        if start_screen_skips:
+            result["start_screen_skips"] = audit_start_screen_skips(self)
         return result
 
 
@@ -4174,6 +4180,1354 @@ def format_binding_audit_text(audit: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Offline diagnostic audits (--bink-video-audit & --start-screen-skips)
+# ---------------------------------------------------------------------------
+
+_BINK_VIDEO_RESOLUTION_HINTS: dict[tuple[int, int], str] = {
+    (3840, 2160): "4k_luma",
+    (1920, 1080): "4k_chroma_or_1080p_luma",
+    (960, 540): "1080p_chroma",
+    (2560, 1440): "1440p_luma",
+    (1280, 720): "1440p_chroma_or_720p_luma",
+    (640, 360): "720p_chroma",
+}
+
+_SKIP_EVENT_REASONS = frozenset(
+    {
+        "set_pipeline_without_draw",
+        "set_compute_pipeline_without_dispatch",
+        "pipeline_never_executed",
+        "missing_shader_module",
+        "zero_count_draw",
+        "zero_count_dispatch",
+        "draw_outside_render_pass",
+    }
+)
+
+_BINDING_ANOMALY_REASONS = frozenset(
+    {
+        "unbound_bind_group_slot",
+        "bind_group_layout_mismatch",
+        "missing_binding",
+        "null_binding",
+        "resource_kind_mismatch",
+        "undeclared_binding",
+        "duplicate_binding",
+        "unknown_layout",
+        "render_pass_format_mismatch",
+    }
+)
+
+
+def _build_packet_frame_map(trace: DecodedTrace) -> dict[int, int]:
+    """Map packet index -> frame_index from trace.frames."""
+    mapping: dict[int, int] = {}
+    for frame in trace.frames:
+        for idx in range(frame.start_packet_index, frame.end_packet_index + 1):
+            mapping[idx] = frame.frame_index
+    return mapping
+
+
+def _is_r8unorm_format(fmt: Any) -> bool:
+    return isinstance(fmt, str) and fmt.strip().lower() == "r8unorm"
+
+
+class _BinkPlaneRecord:
+    __slots__ = (
+        "texture_id",
+        "width",
+        "height",
+        "depth_or_layers",
+        "mip_levels",
+        "usage_names",
+        "upload_count",
+        "upload_bytes",
+        "upload_frames",
+        "bind_group_count",
+        "bind_group_ids",
+        "set_bind_group_count",
+        "draw_count",
+        "dispatch_count",
+        "sampled_pipeline_ids",
+        "sampled_compute_pipeline_ids",
+        "destroyed",
+    )
+
+    def __init__(self, texture_id: int) -> None:
+        self.texture_id = texture_id
+        self.width: int | None = None
+        self.height: int | None = None
+        self.depth_or_layers: int | None = None
+        self.mip_levels: int | None = None
+        self.usage_names: list[str] = []
+        self.upload_count = 0
+        self.upload_bytes = 0
+        self.upload_frames: set[int] = set()
+        self.bind_group_count = 0
+        self.bind_group_ids: set[int] = set()
+        self.set_bind_group_count = 0
+        self.draw_count = 0
+        self.dispatch_count = 0
+        self.sampled_pipeline_ids: set[int] = set()
+        self.sampled_compute_pipeline_ids: set[int] = set()
+        self.destroyed = False
+
+
+def audit_bink_video(trace: DecodedTrace) -> dict[str, Any]:
+    """Audit r8unorm planar Bink2 video texture uploads, bind-group references, and draw sampling.
+
+    Output is strictly sanitized metadata (counts, byte totals, dimensions, and resource IDs):
+    zero host paths and zero raw image bytes.
+    """
+    packet_frames = _build_packet_frame_map(trace)
+
+    # Pre-pass: identify every texture ID created with or viewed as r8unorm.
+    planes: dict[int, _BinkPlaneRecord] = {}
+    for pkt in trace.packets:
+        if not pkt.valid:
+            continue
+        op = pkt.opcode
+        f = pkt.fields
+        if op == GpuOpcode.CreateTexture:
+            fmt = f.get("format_webgpu") or f.get("format_name")
+            if _is_r8unorm_format(fmt):
+                tid = int(f["id"])
+                rec = planes.setdefault(tid, _BinkPlaneRecord(tid))
+                rec.width = int(f["width"])
+                rec.height = int(f["height"])
+                rec.depth_or_layers = int(f["depth_or_layers"])
+                rec.mip_levels = int(f["mip_levels"])
+                rec.usage_names = list(f.get("usage_names") or ())
+        elif op == GpuOpcode.CreateTexture2:
+            if _is_r8unorm_format(f.get("format")):
+                tid = int(f["id"])
+                rec = planes.setdefault(tid, _BinkPlaneRecord(tid))
+                rec.width = int(f["width"])
+                rec.height = int(f["height"])
+                rec.depth_or_layers = int(f["depth_or_layers"])
+                rec.mip_levels = int(f["mip_levels"])
+                rec.usage_names = list(f.get("usage_names") or ())
+        elif op == GpuOpcode.CreateBindGroup2:
+            for entry in f.get("entries") or ():
+                if int(entry["resource_type"]) != int(GpuBindResourceType.TextureView):
+                    continue
+                tid = int(entry["resource_id"])
+                if tid == 0:
+                    continue
+                view = entry.get("view")
+                if isinstance(view, dict) and _is_r8unorm_format(view.get("format")):
+                    planes.setdefault(tid, _BinkPlaneRecord(tid))
+
+    bind_group_r8_textures: dict[int, set[int]] = {}
+    active_bind_groups: dict[int, int] = {}
+    active_render_pipeline_id: int | None = None
+    active_compute_pipeline_id: int | None = None
+    active_pass_kind: str | None = None  # "render" | "compute" | None
+
+    total_draws_sampling_planes = 0
+    total_dispatches_sampling_planes = 0
+
+    for pkt in trace.packets:
+        if not pkt.valid:
+            continue
+        op = pkt.opcode
+        f = pkt.fields
+
+        if op == GpuOpcode.CreateTexture:
+            tid = int(f["id"])
+            rec = planes.get(tid)
+            if rec is not None and _is_r8unorm_format(f.get("format_webgpu") or f.get("format_name")):
+                rec.width = int(f["width"])
+                rec.height = int(f["height"])
+                rec.depth_or_layers = int(f["depth_or_layers"])
+                rec.mip_levels = int(f["mip_levels"])
+                rec.usage_names = list(f.get("usage_names") or ())
+                rec.destroyed = False
+
+        elif op == GpuOpcode.CreateTexture2:
+            tid = int(f["id"])
+            rec = planes.get(tid)
+            if rec is not None and _is_r8unorm_format(f.get("format")):
+                rec.width = int(f["width"])
+                rec.height = int(f["height"])
+                rec.depth_or_layers = int(f["depth_or_layers"])
+                rec.mip_levels = int(f["mip_levels"])
+                rec.usage_names = list(f.get("usage_names") or ())
+                rec.destroyed = False
+
+        elif op == GpuOpcode.WriteTexture:
+            tid = int(f["texture_id"])
+            rec = planes.get(tid)
+            if rec is not None:
+                rec.upload_count += 1
+                rec.upload_bytes += int(f["data_len"])
+                frame_idx = packet_frames.get(pkt.index, 0)
+                rec.upload_frames.add(frame_idx)
+                if rec.width is None and int(f.get("mip_level", 0)) == 0:
+                    rec.width = int(f["width"])
+                    rec.height = int(f["height"])
+                    rec.depth_or_layers = int(f["depth_or_layers"])
+
+        elif op in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2):
+            bg_id = int(f["id"])
+            referenced_r8: set[int] = set()
+            for entry in f.get("entries") or ():
+                if int(entry["resource_type"]) != int(GpuBindResourceType.TextureView):
+                    continue
+                tid = int(entry["resource_id"])
+                if tid in planes:
+                    referenced_r8.add(tid)
+            bind_group_r8_textures[bg_id] = referenced_r8
+            for tid in referenced_r8:
+                rec = planes[tid]
+                rec.bind_group_count += 1
+                rec.bind_group_ids.add(bg_id)
+
+        elif op in (GpuOpcode.SetBindGroup, GpuOpcode.SetBindGroup2):
+            group_idx = int(f["group_index"])
+            bg_id = int(f["bind_group_id"])
+            active_bind_groups[group_idx] = bg_id
+            for tid in bind_group_r8_textures.get(bg_id, ()):
+                planes[tid].set_bind_group_count += 1
+
+        elif op == GpuOpcode.DestroyResource:
+            rid = int(f["id"])
+            if rid in planes:
+                planes[rid].destroyed = True
+            if rid in bind_group_r8_textures:
+                bind_group_r8_textures.pop(rid, None)
+                stale_groups = [g for g, bg in active_bind_groups.items() if bg == rid]
+                for g in stale_groups:
+                    active_bind_groups.pop(g, None)
+            if active_render_pipeline_id == rid:
+                active_render_pipeline_id = None
+            if active_compute_pipeline_id == rid:
+                active_compute_pipeline_id = None
+
+        elif op in (GpuOpcode.BeginFrame, GpuOpcode.Present):
+            active_bind_groups.clear()
+            active_render_pipeline_id = None
+            active_compute_pipeline_id = None
+            active_pass_kind = None
+
+        elif op == GpuOpcode.BeginRenderPass:
+            active_bind_groups.clear()
+            active_render_pipeline_id = None
+            active_pass_kind = "render"
+
+        elif op == GpuOpcode.EndRenderPass:
+            active_bind_groups.clear()
+            active_render_pipeline_id = None
+            active_pass_kind = None
+
+        elif op == GpuOpcode.SetPipeline:
+            if active_pass_kind == "compute":
+                active_bind_groups.clear()
+            active_render_pipeline_id = int(f["pipeline_id"])
+            active_pass_kind = "render"
+
+        elif op == GpuOpcode.SetComputePipeline:
+            if active_pass_kind == "render":
+                active_bind_groups.clear()
+            active_compute_pipeline_id = int(f["pipeline_id"])
+            active_render_pipeline_id = None
+            active_pass_kind = "compute"
+
+        elif pkt.name in _DRAW_PACKET_NAMES:
+            bound_r8: set[int] = set()
+            for bg_id in active_bind_groups.values():
+                bound_r8.update(bind_group_r8_textures.get(bg_id, ()))
+            if bound_r8:
+                total_draws_sampling_planes += 1
+                for tid in bound_r8:
+                    rec = planes[tid]
+                    rec.draw_count += 1
+                    if active_render_pipeline_id is not None:
+                        rec.sampled_pipeline_ids.add(active_render_pipeline_id)
+
+        elif pkt.name in _DISPATCH_PACKET_NAMES:
+            bound_r8 = set()
+            for bg_id in active_bind_groups.values():
+                bound_r8.update(bind_group_r8_textures.get(bg_id, ()))
+            if bound_r8:
+                total_dispatches_sampling_planes += 1
+                for tid in bound_r8:
+                    rec = planes[tid]
+                    rec.dispatch_count += 1
+                    if active_compute_pipeline_id is not None:
+                        rec.sampled_compute_pipeline_ids.add(active_compute_pipeline_id)
+
+    # Detect half-resolution Y / Cb / Cr planar texture groups: (W, H) paired with (W//2, H//2).
+    dims_to_tids: dict[tuple[int, int], list[int]] = {}
+    for rec in planes.values():
+        if rec.width is not None and rec.height is not None and rec.width > 0 and rec.height > 0:
+            dims_to_tids.setdefault((rec.width, rec.height), []).append(rec.texture_id)
+
+    planar_full_tids: set[int] = set()
+    planar_half_tids: set[int] = set()
+    planar_groups: list[dict[str, Any]] = []
+    for (w, h), luma_tids in sorted(dims_to_tids.items(), key=lambda kv: (-kv[0][0] * kv[0][1], kv[0])):
+        if w < 2 or h < 2 or (w % 2) != 0 or (h % 2) != 0:
+            continue
+        half_dim = (w // 2, h // 2)
+        chroma_tids = dims_to_tids.get(half_dim)
+        if not chroma_tids:
+            continue
+        sorted_luma = sorted(luma_tids)
+        sorted_chroma = sorted(chroma_tids)
+        planar_full_tids.update(sorted_luma)
+        planar_half_tids.update(sorted_chroma)
+        group_tids = sorted_luma + sorted_chroma
+        planar_groups.append(
+            {
+                "luma_dimensions": f"{w}x{h}",
+                "chroma_dimensions": f"{half_dim[0]}x{half_dim[1]}",
+                "luma_texture_ids": sorted_luma,
+                "chroma_texture_ids": sorted_chroma,
+                "total_upload_count": sum(planes[t].upload_count for t in group_tids),
+                "total_upload_bytes": sum(planes[t].upload_bytes for t in group_tids),
+                "any_sampled_by_draw": any(planes[t].draw_count > 0 for t in group_tids),
+                "any_sampled_by_dispatch": any(planes[t].dispatch_count > 0 for t in group_tids),
+            }
+        )
+
+    plane_rows: list[dict[str, Any]] = []
+    for rec in planes.values():
+        dims = (rec.width, rec.height) if rec.width is not None and rec.height is not None else None
+        is_video_res = dims in _BINK_VIDEO_RESOLUTION_HINTS if dims is not None else False
+        upload_frame_count = len(rec.upload_frames)
+        per_frame_uploads = upload_frame_count >= 2
+        in_planar_group = rec.texture_id in planar_full_tids or rec.texture_id in planar_half_tids
+        is_render_attachment = "RENDER_ATTACHMENT" in rec.usage_names
+        is_video_candidate = bool(
+            is_video_res or per_frame_uploads or (in_planar_group and rec.upload_count > 0)
+        )
+
+        if dims is not None and dims in _BINK_VIDEO_RESOLUTION_HINTS:
+            plane_hint = _BINK_VIDEO_RESOLUTION_HINTS[dims]
+        elif rec.texture_id in planar_full_tids:
+            plane_hint = "planar_luma"
+        elif rec.texture_id in planar_half_tids:
+            plane_hint = "planar_chroma"
+        elif per_frame_uploads:
+            plane_hint = "r8unorm_per_frame"
+        else:
+            plane_hint = "r8unorm"
+
+        plane_rows.append(
+            {
+                "texture_id": rec.texture_id,
+                "width": rec.width,
+                "height": rec.height,
+                "depth_or_layers": rec.depth_or_layers,
+                "mip_levels": rec.mip_levels,
+                "format": "r8unorm",
+                "usage_names": list(rec.usage_names),
+                "is_render_attachment": is_render_attachment,
+                "plane_hint": plane_hint,
+                "is_video_resolution": is_video_res,
+                "is_video_candidate": is_video_candidate,
+                "upload_count": rec.upload_count,
+                "upload_bytes": rec.upload_bytes,
+                "upload_frame_count": upload_frame_count,
+                "per_frame_uploads": per_frame_uploads,
+                "bind_group_count": rec.bind_group_count,
+                "bind_group_ids": sorted(rec.bind_group_ids),
+                "set_bind_group_count": rec.set_bind_group_count,
+                "draw_count": rec.draw_count,
+                "dispatch_count": rec.dispatch_count,
+                "sampled_by_draw": rec.draw_count > 0,
+                "sampled_by_dispatch": rec.dispatch_count > 0,
+                "sampled_pipeline_ids": sorted(rec.sampled_pipeline_ids),
+                "sampled_compute_pipeline_ids": sorted(rec.sampled_compute_pipeline_ids),
+                "destroyed": rec.destroyed,
+            }
+        )
+
+    plane_rows.sort(
+        key=lambda row: (
+            not bool(row["is_video_candidate"]),
+            -int(row["upload_count"]),
+            -int(row["upload_bytes"]),
+            -int(row["draw_count"]),
+            int(row["texture_id"]),
+        )
+    )
+
+    video_candidates = [row for row in plane_rows if row["is_video_candidate"]]
+    any_r8unorm_sampled_by_draw = any(row["sampled_by_draw"] for row in plane_rows)
+    any_video_plane_sampled_by_draw = any(row["sampled_by_draw"] for row in video_candidates)
+    any_plane_sampled_by_draw = (
+        any_video_plane_sampled_by_draw if video_candidates else any_r8unorm_sampled_by_draw
+    )
+
+    return {
+        "r8unorm_texture_count": len(plane_rows),
+        "video_candidate_count": len(video_candidates),
+        "uploaded_plane_count": sum(1 for row in plane_rows if row["upload_count"] > 0),
+        "per_frame_uploaded_plane_count": sum(1 for row in plane_rows if row["per_frame_uploads"]),
+        "bound_plane_count": sum(1 for row in plane_rows if row["bind_group_count"] > 0),
+        "sampled_by_draw_plane_count": sum(1 for row in plane_rows if row["sampled_by_draw"]),
+        "sampled_by_dispatch_plane_count": sum(
+            1 for row in plane_rows if row["sampled_by_dispatch"]
+        ),
+        "any_plane_sampled_by_draw": any_plane_sampled_by_draw,
+        "any_video_plane_sampled_by_draw": any_video_plane_sampled_by_draw,
+        "any_r8unorm_sampled_by_draw": any_r8unorm_sampled_by_draw,
+        "total_upload_count": sum(int(row["upload_count"]) for row in plane_rows),
+        "total_upload_bytes": sum(int(row["upload_bytes"]) for row in plane_rows),
+        "total_bind_group_refs": sum(int(row["bind_group_count"]) for row in plane_rows),
+        "total_set_bind_group_refs": sum(int(row["set_bind_group_count"]) for row in plane_rows),
+        "total_draws_sampling_planes": total_draws_sampling_planes,
+        "total_dispatches_sampling_planes": total_dispatches_sampling_planes,
+        "planar_groups": planar_groups,
+        "planes": plane_rows,
+    }
+
+
+def format_bink_video_audit_text(audit: dict[str, Any]) -> str:
+    """Format an audit_bink_video() dictionary as a sanitized human-readable report."""
+    sampled_str = "YES" if audit["any_plane_sampled_by_draw"] else "NO"
+    lines: list[str] = [
+        "Bink Video Audit (r8unorm planes):",
+        (
+            f"  Planes: {audit['r8unorm_texture_count']} "
+            f"(video-candidates={audit['video_candidate_count']}, "
+            f"uploaded={audit['uploaded_plane_count']}, "
+            f"per-frame={audit['per_frame_uploaded_plane_count']}, "
+            f"bound={audit['bound_plane_count']}, "
+            f"sampled-by-draw={audit['sampled_by_draw_plane_count']}, "
+            f"sampled-by-dispatch={audit['sampled_by_dispatch_plane_count']})"
+        ),
+        f"  Any Video Plane Sampled By Draw: {sampled_str}",
+        (
+            f"  Uploads: {audit['total_upload_count']} ({audit['total_upload_bytes']} B) | "
+            f"BindGroup Refs: {audit['total_bind_group_refs']} | "
+            f"SetBindGroup Refs: {audit['total_set_bind_group_refs']} | "
+            f"Draws Sampling Planes: {audit['total_draws_sampling_planes']} | "
+            f"Dispatches Sampling Planes: {audit['total_dispatches_sampling_planes']}"
+        ),
+    ]
+
+    groups = audit.get("planar_groups") or []
+    if groups:
+        lines.append("  Planar Groups:")
+        for grp in groups:
+            luma_ids = ",".join(f"#{t}" for t in grp["luma_texture_ids"])
+            chroma_ids = ",".join(f"#{t}" for t in grp["chroma_texture_ids"])
+            grp_sampled = "YES" if grp["any_sampled_by_draw"] else "NO"
+            lines.append(
+                f"    {grp['luma_dimensions']} (Y: {luma_ids}) + "
+                f"{grp['chroma_dimensions']} (Cb/Cr: {chroma_ids}) "
+                f"[uploads={grp['total_upload_count']}, bytes={grp['total_upload_bytes']}, "
+                f"sampled-by-draw={grp_sampled}]"
+            )
+
+    planes = audit.get("planes") or []
+    if not planes:
+        lines.append("  (none)")
+        return "\n".join(lines)
+
+    lines.append(
+        f"  {'TexID':<8s}  {'Dimensions':<11s}  {'Hint':<24s}  "
+        f"{'Uploads':>7s}  {'Bytes':>11s}  {'Frames':>6s}  {'BGs':>4s}  "
+        f"{'SetBG':>5s}  {'Draws':>5s}  {'Disp':>4s}  {'Sampled':<7s}"
+    )
+    lines.append(
+        f"  {'-' * 8}  {'-' * 11}  {'-' * 24}  "
+        f"{'-' * 7}  {'-' * 11}  {'-' * 6}  {'-' * 4}  "
+        f"{'-' * 5}  {'-' * 5}  {'-' * 4}  {'-' * 7}"
+    )
+    for row in planes:
+        dims = (
+            f"{row['width']}x{row['height']}"
+            if row["width"] is not None and row["height"] is not None
+            else "unknown"
+        )
+        sampled_flag = "draw" if row["sampled_by_draw"] else (
+            "compute" if row["sampled_by_dispatch"] else "no"
+        )
+        lines.append(
+            f"  {int(row['texture_id']):<8d}  {dims:<11s}  {str(row['plane_hint']):<24s}  "
+            f"{int(row['upload_count']):7d}  {int(row['upload_bytes']):11d}  "
+            f"{int(row['upload_frame_count']):6d}  {int(row['bind_group_count']):4d}  "
+            f"{int(row['set_bind_group_count']):5d}  {int(row['draw_count']):5d}  "
+            f"{int(row['dispatch_count']):4d}  {sampled_flag:<7s}"
+        )
+    return "\n".join(lines)
+
+
+class _StartScreenPairRecord:
+    __slots__ = (
+        "kind",
+        "shader_pair",
+        "vs_shader",
+        "ps_shader",
+        "cs_shader",
+        "pipeline_ids",
+        "set_count",
+        "emitted_draws",
+        "emitted_dispatches",
+        "reason_counts",
+        "affected_bind_group_ids",
+        "affected_bindings",
+    )
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        shader_pair: str,
+        vs_shader: str | None = None,
+        ps_shader: str | None = None,
+        cs_shader: str | None = None,
+    ) -> None:
+        self.kind = kind
+        self.shader_pair = shader_pair
+        self.vs_shader = vs_shader
+        self.ps_shader = ps_shader
+        self.cs_shader = cs_shader
+        self.pipeline_ids: set[int] = set()
+        self.set_count = 0
+        self.emitted_draws = 0
+        self.emitted_dispatches = 0
+        self.reason_counts: Counter[str] = Counter()
+        self.affected_bind_group_ids: set[int] = set()
+        self.affected_bindings: set[str] = set()
+
+
+def _layouts_equivalent(
+    expected: _BindGroupLayoutRecord | None,
+    actual: _BindGroupLayoutRecord | None,
+) -> bool:
+    if expected is None or actual is None:
+        return False
+    if expected.layout_id == actual.layout_id:
+        return True
+    if (
+        expected.content_id != _ZERO_HASH_HEX
+        and actual.content_id != _ZERO_HASH_HEX
+        and expected.content_id == actual.content_id
+    ):
+        return True
+    if not expected.manifest_reference and not actual.manifest_reference:
+        if expected.entries.keys() != actual.entries.keys():
+            return False
+        for b, e_entry in expected.entries.items():
+            a_entry = actual.entries[b]
+            if (
+                e_entry.get("type") != a_entry.get("type")
+                or e_entry.get("binding_type") != a_entry.get("binding_type")
+                or e_entry.get("has_dynamic_offset") != a_entry.get("has_dynamic_offset")
+            ):
+                return False
+        return True
+    return False
+
+
+def _render_pass_mismatch_count(
+    active_render_pass: _ActiveRenderPass,
+    pipe_info: dict[str, Any],
+) -> int:
+    """Count render-pass attachment vs CreateRenderPipeline2 key mismatches for one draw."""
+    mismatches = 0
+    pass_colors = active_render_pass.color_attachments
+    pipe_colors = pipe_info["color_targets"]
+    max_slots = max(len(pass_colors), len(pipe_colors))
+    for slot in range(max_slots):
+        pass_att = pass_colors[slot] if slot < len(pass_colors) else None
+        pipe_tgt = pipe_colors[slot] if slot < len(pipe_colors) else None
+        if pass_att is None and pipe_tgt is None:
+            continue
+        if pass_att is None or pipe_tgt is None:
+            mismatches += 1
+            continue
+        pipe_fmt = str(pipe_tgt["format"])
+        if pass_att.format is not None and pass_att.format != pipe_fmt:
+            mismatches += 1
+
+    pass_ds = active_render_pass.depth_stencil
+    pipe_ds = pipe_info["depth_stencil"]
+    if (pass_ds is None) != (pipe_ds is None):
+        mismatches += 1
+    elif pass_ds is not None and pipe_ds is not None:
+        pipe_ds_fmt = str(pipe_ds["format"])
+        if pass_ds.format is not None and pass_ds.format != pipe_ds_fmt:
+            mismatches += 1
+    return mismatches
+
+
+def audit_start_screen_skips(trace: DecodedTrace) -> dict[str, Any]:
+    """Rank top pipelines/shader pairs with skipped/unemitted draws or missing-binding anomalies.
+
+    Output is strictly sanitized (shader hashes, pipeline/group/binding IDs, and counts):
+    zero host paths and zero raw image bytes.
+    """
+    hash_refs: dict[int, str] = dict(trace._shader_hash_refs)
+
+    # Pre-pass: correlate live CreateShaderModule packet indices with v2 pipeline key hashes.
+    active_mod_pkt: dict[int, int] = {}
+    mod_pkt_key_hash: dict[int, str] = {}
+    for pkt in trace.packets:
+        if not pkt.valid:
+            continue
+        op = pkt.opcode
+        f = pkt.fields
+        if op == GpuOpcode.CreateShaderModule:
+            active_mod_pkt[int(f["id"])] = pkt.index
+        elif op == GpuOpcode.DestroyResource:
+            active_mod_pkt.pop(int(f["id"]), None)
+        elif op == GpuOpcode.CreateRenderPipeline2:
+            key = f["key"]
+            vs_id = int(f["vs_module_id"])
+            fs_id = int(f["fs_module_id"])
+            vs_hash = str(key["vs_shader"])
+            ps_hash = str(key["ps_shader"])
+            if vs_id != 0 and vs_hash != _ZERO_HASH_HEX and vs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[vs_id], vs_hash)
+            if fs_id != 0 and ps_hash != _ZERO_HASH_HEX and fs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[fs_id], ps_hash)
+        elif op == GpuOpcode.CreateComputePipeline2:
+            cs_id = int(f["cs_module_id"])
+            cs_hash = str(f["cs_shader"])
+            if cs_id != 0 and cs_hash != _ZERO_HASH_HEX and cs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[cs_id], cs_hash)
+
+    pair_records: dict[tuple[str, ...], _StartScreenPairRecord] = {}
+    active_module_hashes: dict[int, str | None] = {}
+    destroyed_module_ids: set[int] = set()
+
+    layouts: dict[int, _BindGroupLayoutRecord] = {}
+    pipeline_layouts: dict[int, list[int]] = {}
+    bind_groups: dict[int, dict[str, Any]] = {}
+    textures: dict[int, str] = {}
+
+    # Track created pipelines (both live and historical execution counts).
+    render_pipelines: dict[int, dict[str, Any]] = {}
+    compute_pipelines: dict[int, dict[str, Any]] = {}
+    created_pipelines: dict[int, dict[str, Any]] = {}
+
+    active_render_pass: _ActiveRenderPass | None = None
+    active_bind_groups: dict[int, int] = {}
+    active_pass_kind: str | None = None
+
+    active_render_pipeline_id: int | None = None
+    pending_render_drew = False
+    active_compute_pipeline_id: int | None = None
+    pending_compute_dispatched = False
+
+    total_emitted_draws = 0
+    total_emitted_dispatches = 0
+    unbound_draws = 0
+    unbound_dispatches = 0
+    uses_render_passes = trace.begin_render_passes > 0
+
+    def _get_pair(
+        *,
+        kind: str,
+        vs_shader: str | None = None,
+        ps_shader: str | None = None,
+        cs_shader: str | None = None,
+        pipeline_id: int | None = None,
+    ) -> _StartScreenPairRecord:
+        if kind == "render":
+            vs_label = vs_shader or "none"
+            ps_label = ps_shader or "none"
+            pkey = ("render", vs_label, ps_label)
+            pair_label = f"{vs_label} / {ps_label}"
+            rec = pair_records.get(pkey)
+            if rec is None:
+                rec = _StartScreenPairRecord(
+                    kind="render",
+                    shader_pair=pair_label,
+                    vs_shader=vs_label,
+                    ps_shader=ps_label,
+                )
+                pair_records[pkey] = rec
+        else:
+            cs_label = cs_shader or "none"
+            pkey = ("compute", cs_label)
+            pair_label = f"cs:{cs_label}"
+            rec = pair_records.get(pkey)
+            if rec is None:
+                rec = _StartScreenPairRecord(
+                    kind="compute",
+                    shader_pair=pair_label,
+                    cs_shader=cs_label,
+                )
+                pair_records[pkey] = rec
+        if pipeline_id is not None:
+            rec.pipeline_ids.add(pipeline_id)
+        return rec
+
+    def _resolve_shader_label(module_id: int, key_hash: str | None) -> str:
+        if key_hash is not None and key_hash != _ZERO_HASH_HEX:
+            return key_hash
+        if module_id == 0:
+            return "none"
+        mod_hash = active_module_hashes.get(module_id)
+        if mod_hash is not None:
+            return mod_hash
+        return f"id:{module_id}"
+
+    def _check_bound_groups_for_pipeline(
+        pair_rec: _StartScreenPairRecord,
+        pipe_info: dict[str, Any] | None,
+    ) -> None:
+        checked_bg_ids: set[int] = set()
+        expected_group_set: set[int] | None = None
+        if pipe_info is not None:
+            pll_id = int(pipe_info.get("pipeline_layout_id", 0))
+            if pll_id != 0 and pll_id in pipeline_layouts:
+                expected_groups = pipeline_layouts[pll_id]
+                expected_group_set = {
+                    idx for idx, bgl_id in enumerate(expected_groups) if bgl_id != 0
+                }
+                for group_idx, expected_bgl_id in enumerate(expected_groups):
+                    if expected_bgl_id == 0:
+                        continue
+                    expected_bgl = layouts.get(expected_bgl_id)
+                    requires_bg = (
+                        expected_bgl is None
+                        or expected_bgl.manifest_reference
+                        or len(expected_bgl.entries) > 0
+                    )
+                    bg_id = active_bind_groups.get(group_idx)
+                    if bg_id is None:
+                        if requires_bg:
+                            pair_rec.reason_counts["unbound_bind_group_slot"] += 1
+                            pair_rec.affected_bindings.add(f"@group({group_idx})")
+                        continue
+                    bg_info = bind_groups.get(bg_id)
+                    if bg_info is not None and bg_info["v2"]:
+                        actual_bgl_id = int(bg_info["layout_id"])
+                        if actual_bgl_id != expected_bgl_id:
+                            actual_bgl = layouts.get(actual_bgl_id)
+                            if not _layouts_equivalent(expected_bgl, actual_bgl):
+                                pair_rec.reason_counts["bind_group_layout_mismatch"] += 1
+                                pair_rec.affected_bind_group_ids.add(bg_id)
+                                pair_rec.affected_bindings.add(f"@group({group_idx})")
+
+        for group_idx, bg_id in sorted(active_bind_groups.items()):
+            if expected_group_set is not None and group_idx not in expected_group_set:
+                continue
+            if bg_id in checked_bg_ids:
+                continue
+            checked_bg_ids.add(bg_id)
+            bg_info = bind_groups.get(bg_id)
+            if bg_info is None:
+                continue
+            anomalies: list[tuple[str, int | None]] = bg_info["anomalies"]
+            for reason, binding in anomalies:
+                pair_rec.reason_counts[reason] += 1
+                pair_rec.affected_bind_group_ids.add(bg_id)
+                if binding is not None:
+                    pair_rec.affected_bindings.add(f"@group({group_idx}):@binding({binding})")
+                else:
+                    pair_rec.affected_bindings.add(f"@group({group_idx})")
+
+    def _flush_pending_render() -> None:
+        nonlocal active_render_pipeline_id, pending_render_drew
+        if active_render_pipeline_id is not None and not pending_render_drew:
+            pid = active_render_pipeline_id
+            pipe_info = render_pipelines.get(pid)
+            if pipe_info is not None:
+                pair_rec = pipe_info["pair"]
+            else:
+                pair_rec = _get_pair(
+                    kind="render",
+                    vs_shader=f"pipeline:{pid}",
+                    ps_shader="unknown",
+                    pipeline_id=pid,
+                )
+            pair_rec.reason_counts["set_pipeline_without_draw"] += 1
+            _check_bound_groups_for_pipeline(pair_rec, pipe_info)
+        active_render_pipeline_id = None
+        pending_render_drew = False
+
+    def _flush_pending_compute() -> None:
+        nonlocal active_compute_pipeline_id, pending_compute_dispatched
+        if active_compute_pipeline_id is not None and not pending_compute_dispatched:
+            pid = active_compute_pipeline_id
+            pipe_info = compute_pipelines.get(pid)
+            if pipe_info is not None:
+                pair_rec = pipe_info["pair"]
+            else:
+                pair_rec = _get_pair(
+                    kind="compute",
+                    cs_shader=f"pipeline:{pid}",
+                    pipeline_id=pid,
+                )
+            pair_rec.reason_counts["set_compute_pipeline_without_dispatch"] += 1
+            _check_bound_groups_for_pipeline(pair_rec, pipe_info)
+        active_compute_pipeline_id = None
+        pending_compute_dispatched = False
+
+    for pkt in trace.packets:
+        if not pkt.valid:
+            continue
+        op = pkt.opcode
+        f = pkt.fields
+
+        if op == GpuOpcode.CreateShaderModule:
+            mod_id = int(f["id"])
+            resolved_hash: str | None = mod_pkt_key_hash.get(pkt.index)
+            if resolved_hash is None:
+                resolved_hash = hash_refs.get(pkt.index)
+            if resolved_hash is None and int(f.get("code_len", 0)) > 0:
+                resolved_hash = str(f["wgsl_hash_fnv1a64"])
+            active_module_hashes[mod_id] = resolved_hash
+            destroyed_module_ids.discard(mod_id)
+
+        elif op == GpuOpcode.CreateBindGroupLayout:
+            layout_id = int(f["id"])
+            entries_map = {int(e["binding"]): e for e in f.get("entries", ())}
+            layouts[layout_id] = _BindGroupLayoutRecord(
+                layout_id=layout_id,
+                manifest_reference=bool(f["manifest_reference"]),
+                content_id=str(f["content_id"]),
+                entries=entries_map,
+            )
+
+        elif op == GpuOpcode.CreatePipelineLayout:
+            pipeline_layouts[int(f["id"])] = [int(x) for x in f.get("bind_group_layout_ids", ())]
+
+        elif op == GpuOpcode.CreateBindGroup:
+            bg_id = int(f["id"])
+            bind_groups[bg_id] = {
+                "v2": False,
+                "layout_id": 0,
+                "anomalies": [],
+            }
+
+        elif op == GpuOpcode.CreateBindGroup2:
+            bg_id = int(f["id"])
+            layout_id = int(f["layout_id"])
+            bg_entries = list(f.get("entries", ()))
+            anomalies: list[tuple[str, int | None]] = []
+
+            for entry in bg_entries:
+                if bool(entry.get("null_binding")):
+                    anomalies.append(("null_binding", int(entry["binding"])))
+
+            layout = layouts.get(layout_id)
+            if layout is None:
+                anomalies.append(("unknown_layout", None))
+            elif not layout.manifest_reference:
+                seen_bindings: set[int] = set()
+                for entry in bg_entries:
+                    binding = int(entry["binding"])
+                    rtype = int(entry["resource_type"])
+                    if binding in seen_bindings:
+                        anomalies.append(("duplicate_binding", binding))
+                        continue
+                    seen_bindings.add(binding)
+                    layout_entry = layout.entries.get(binding)
+                    if layout_entry is None:
+                        anomalies.append(("undeclared_binding", binding))
+                        continue
+                    expected_pair = _LAYOUT_TYPE_TO_EXPECTED_RESOURCE.get(str(layout_entry["type"]))
+                    if expected_pair is not None and rtype != int(expected_pair[0]):
+                        anomalies.append(("resource_kind_mismatch", binding))
+                for binding in sorted(layout.entries):
+                    if binding not in seen_bindings:
+                        anomalies.append(("missing_binding", binding))
+
+            bind_groups[bg_id] = {
+                "v2": True,
+                "layout_id": layout_id,
+                "anomalies": anomalies,
+            }
+
+        elif op == GpuOpcode.CreateTexture:
+            fmt = f.get("format_webgpu") or f.get("format_name")
+            if fmt:
+                textures[int(f["id"])] = str(fmt)
+
+        elif op == GpuOpcode.CreateTexture2:
+            fmt = f.get("format")
+            if fmt and fmt != "undefined":
+                textures[int(f["id"])] = str(fmt)
+
+        elif op == GpuOpcode.CreateRenderPipeline:
+            pid = int(f["id"])
+            vs_id = int(f["vs_shader_id"])
+            fs_id = int(f["fs_shader_id"])
+            vs_label = _resolve_shader_label(vs_id, None)
+            fs_label = _resolve_shader_label(fs_id, None)
+            pair_rec = _get_pair(
+                kind="render",
+                vs_shader=vs_label,
+                ps_shader=fs_label,
+                pipeline_id=pid,
+            )
+            missing_mod = (
+                vs_id == 0
+                or fs_id == 0
+                or vs_id in destroyed_module_ids
+                or fs_id in destroyed_module_ids
+            )
+            if missing_mod:
+                pair_rec.reason_counts["missing_shader_module"] += 1
+            pipe_info = {
+                "id": pid,
+                "kind": "render",
+                "v2": False,
+                "pair": pair_rec,
+                "pipeline_layout_id": 0,
+                "color_targets": None,
+                "depth_stencil": None,
+                "set_count": 0,
+                "exec_count": 0,
+                "zero_exec_count": 0,
+            }
+            render_pipelines[pid] = pipe_info
+            created_pipelines[pid] = pipe_info
+
+        elif op == GpuOpcode.CreateRenderPipeline2:
+            pid = int(f["id"])
+            vs_id = int(f["vs_module_id"])
+            fs_id = int(f["fs_module_id"])
+            pll_id = int(f["pipeline_layout_id"])
+            key = f["key"]
+            vs_hash = str(key["vs_shader"])
+            ps_hash = str(key["ps_shader"])
+            vs_label = _resolve_shader_label(vs_id, vs_hash)
+            ps_label = _resolve_shader_label(fs_id, ps_hash)
+            pair_rec = _get_pair(
+                kind="render",
+                vs_shader=vs_label,
+                ps_shader=ps_label,
+                pipeline_id=pid,
+            )
+            has_color_targets = any(t is not None for t in key.get("color_targets") or ())
+            missing_vs = vs_id == 0 or vs_id in destroyed_module_ids
+            missing_fs = (
+                (fs_id == 0 and (ps_hash != _ZERO_HASH_HEX or has_color_targets))
+                or (fs_id != 0 and fs_id in destroyed_module_ids)
+            )
+            if missing_vs or missing_fs:
+                pair_rec.reason_counts["missing_shader_module"] += 1
+            pipe_info = {
+                "id": pid,
+                "kind": "render",
+                "v2": True,
+                "pair": pair_rec,
+                "pipeline_layout_id": pll_id,
+                "color_targets": list(key["color_targets"]),
+                "depth_stencil": key["depth_stencil"],
+                "set_count": 0,
+                "exec_count": 0,
+                "zero_exec_count": 0,
+            }
+            render_pipelines[pid] = pipe_info
+            created_pipelines[pid] = pipe_info
+
+        elif op == GpuOpcode.CreateComputePipeline:
+            pid = int(f["id"])
+            cs_id = int(f["cs_shader_id"])
+            cs_label = _resolve_shader_label(cs_id, None)
+            pair_rec = _get_pair(kind="compute", cs_shader=cs_label, pipeline_id=pid)
+            if cs_id == 0 or cs_id in destroyed_module_ids:
+                pair_rec.reason_counts["missing_shader_module"] += 1
+            pipe_info = {
+                "id": pid,
+                "kind": "compute",
+                "v2": False,
+                "pair": pair_rec,
+                "pipeline_layout_id": 0,
+                "set_count": 0,
+                "exec_count": 0,
+                "zero_exec_count": 0,
+            }
+            compute_pipelines[pid] = pipe_info
+            created_pipelines[pid] = pipe_info
+
+        elif op == GpuOpcode.CreateComputePipeline2:
+            pid = int(f["id"])
+            cs_id = int(f["cs_module_id"])
+            pll_id = int(f["pipeline_layout_id"])
+            cs_hash = str(f["cs_shader"])
+            cs_label = _resolve_shader_label(cs_id, cs_hash)
+            pair_rec = _get_pair(kind="compute", cs_shader=cs_label, pipeline_id=pid)
+            if cs_id == 0 or cs_id in destroyed_module_ids:
+                pair_rec.reason_counts["missing_shader_module"] += 1
+            pipe_info = {
+                "id": pid,
+                "kind": "compute",
+                "v2": True,
+                "pair": pair_rec,
+                "pipeline_layout_id": pll_id,
+                "set_count": 0,
+                "exec_count": 0,
+                "zero_exec_count": 0,
+            }
+            compute_pipelines[pid] = pipe_info
+            created_pipelines[pid] = pipe_info
+
+        elif op == GpuOpcode.DestroyResource:
+            rid = int(f["id"])
+            if active_render_pipeline_id == rid:
+                _flush_pending_render()
+            if active_compute_pipeline_id == rid:
+                _flush_pending_compute()
+            if rid in active_module_hashes:
+                active_module_hashes.pop(rid, None)
+                destroyed_module_ids.add(rid)
+            layouts.pop(rid, None)
+            pipeline_layouts.pop(rid, None)
+            bind_groups.pop(rid, None)
+            textures.pop(rid, None)
+            render_pipelines.pop(rid, None)
+            compute_pipelines.pop(rid, None)
+            stale_groups = [g for g, bg in active_bind_groups.items() if bg == rid]
+            for g in stale_groups:
+                active_bind_groups.pop(g, None)
+
+        elif op in (GpuOpcode.BeginFrame, GpuOpcode.Present):
+            _flush_pending_render()
+            _flush_pending_compute()
+            active_render_pass = None
+            active_bind_groups.clear()
+            active_pass_kind = None
+
+        elif op == GpuOpcode.BeginRenderPass:
+            _flush_pending_render()
+            _flush_pending_compute()
+            active_bind_groups.clear()
+            active_pass_kind = "render"
+            resolved_colors: list[_ResolvedAttachment | None] = []
+            for color in f.get("color_attachments", ()):
+                if color is None:
+                    resolved_colors.append(None)
+                    continue
+                tex_id = int(color["texture_id"])
+                is_swapchain = bool(color["swapchain"])
+                view_fmt = str(color["view"]["format"])
+                if view_fmt and view_fmt != "undefined":
+                    fmt: str | None = view_fmt
+                    fmt_src = "view"
+                elif is_swapchain:
+                    fmt = None
+                    fmt_src = "swapchain"
+                elif tex_id in textures:
+                    fmt = textures[tex_id]
+                    fmt_src = "texture"
+                else:
+                    fmt = None
+                    fmt_src = "unknown"
+                resolved_colors.append(
+                    _ResolvedAttachment(
+                        texture_id=tex_id,
+                        swapchain=is_swapchain,
+                        format=fmt,
+                        format_source=fmt_src,
+                    )
+                )
+            resolved_ds: _ResolvedAttachment | None = None
+            ds = f.get("depth_stencil")
+            if ds is not None:
+                ds_tex_id = int(ds["texture_id"])
+                ds_view_fmt = str(ds["view"]["format"])
+                if ds_view_fmt and ds_view_fmt != "undefined":
+                    ds_fmt: str | None = ds_view_fmt
+                    ds_src = "view"
+                elif ds_tex_id in textures:
+                    ds_fmt = textures[ds_tex_id]
+                    ds_src = "texture"
+                else:
+                    ds_fmt = None
+                    ds_src = "unknown"
+                resolved_ds = _ResolvedAttachment(
+                    texture_id=ds_tex_id,
+                    swapchain=False,
+                    format=ds_fmt,
+                    format_source=ds_src,
+                )
+            active_render_pass = _ActiveRenderPass(
+                packet_index=pkt.index,
+                color_attachments=tuple(resolved_colors),
+                depth_stencil=resolved_ds,
+            )
+
+        elif op == GpuOpcode.EndRenderPass:
+            _flush_pending_render()
+            active_render_pass = None
+            active_bind_groups.clear()
+            active_pass_kind = None
+
+        elif op in (GpuOpcode.SetBindGroup, GpuOpcode.SetBindGroup2):
+            active_bind_groups[int(f["group_index"])] = int(f["bind_group_id"])
+
+        elif op == GpuOpcode.SetPipeline:
+            _flush_pending_render()
+            _flush_pending_compute()
+            if active_pass_kind == "compute":
+                active_bind_groups.clear()
+            active_pass_kind = "render"
+            pid = int(f["pipeline_id"])
+            active_render_pipeline_id = pid
+            pending_render_drew = False
+            pipe_info = render_pipelines.get(pid)
+            if pipe_info is not None:
+                pipe_info["set_count"] += 1
+                pipe_info["pair"].set_count += 1
+            else:
+                pair_rec = _get_pair(
+                    kind="render",
+                    vs_shader=f"pipeline:{pid}",
+                    ps_shader="unknown",
+                    pipeline_id=pid,
+                )
+                pair_rec.set_count += 1
+
+        elif op == GpuOpcode.SetComputePipeline:
+            _flush_pending_render()
+            _flush_pending_compute()
+            if active_pass_kind == "render":
+                active_bind_groups.clear()
+            active_render_pass = None
+            active_pass_kind = "compute"
+            pid = int(f["pipeline_id"])
+            active_compute_pipeline_id = pid
+            pending_compute_dispatched = False
+            pipe_info = compute_pipelines.get(pid)
+            if pipe_info is not None:
+                pipe_info["set_count"] += 1
+                pipe_info["pair"].set_count += 1
+            else:
+                pair_rec = _get_pair(
+                    kind="compute",
+                    cs_shader=f"pipeline:{pid}",
+                    pipeline_id=pid,
+                )
+                pair_rec.set_count += 1
+
+        elif pkt.name in _DRAW_PACKET_NAMES:
+            if active_render_pipeline_id is None:
+                unbound_draws += 1
+                continue
+            pending_render_drew = True
+            pid = active_render_pipeline_id
+            pipe_info = render_pipelines.get(pid)
+            if pipe_info is not None:
+                pair_rec = pipe_info["pair"]
+            else:
+                pair_rec = _get_pair(
+                    kind="render",
+                    vs_shader=f"pipeline:{pid}",
+                    ps_shader="unknown",
+                    pipeline_id=pid,
+                )
+
+            is_zero = False
+            if op == GpuOpcode.Draw:
+                is_zero = int(f["vertex_count"]) == 0 or int(f["instance_count"]) == 0
+            elif op == GpuOpcode.DrawIndexed:
+                is_zero = int(f["index_count"]) == 0 or int(f["instance_count"]) == 0
+
+            if is_zero:
+                pair_rec.reason_counts["zero_count_draw"] += 1
+                if pipe_info is not None:
+                    pipe_info["zero_exec_count"] += 1
+            else:
+                total_emitted_draws += 1
+                pair_rec.emitted_draws += 1
+                if pipe_info is not None:
+                    pipe_info["exec_count"] += 1
+
+            if uses_render_passes and active_render_pass is None:
+                pair_rec.reason_counts["draw_outside_render_pass"] += 1
+
+            _check_bound_groups_for_pipeline(pair_rec, pipe_info)
+
+            if (
+                pipe_info is not None
+                and pipe_info["v2"]
+                and active_render_pass is not None
+            ):
+                rp_mismatches = _render_pass_mismatch_count(active_render_pass, pipe_info)
+                if rp_mismatches > 0:
+                    pair_rec.reason_counts["render_pass_format_mismatch"] += rp_mismatches
+
+        elif pkt.name in _DISPATCH_PACKET_NAMES:
+            if active_compute_pipeline_id is None:
+                unbound_dispatches += 1
+                continue
+            pending_compute_dispatched = True
+            pid = active_compute_pipeline_id
+            pipe_info = compute_pipelines.get(pid)
+            if pipe_info is not None:
+                pair_rec = pipe_info["pair"]
+            else:
+                pair_rec = _get_pair(
+                    kind="compute",
+                    cs_shader=f"pipeline:{pid}",
+                    pipeline_id=pid,
+                )
+
+            is_zero = False
+            if op == GpuOpcode.DispatchCompute:
+                is_zero = (
+                    int(f["workgroup_x"]) == 0
+                    or int(f["workgroup_y"]) == 0
+                    or int(f["workgroup_z"]) == 0
+                )
+
+            if is_zero:
+                pair_rec.reason_counts["zero_count_dispatch"] += 1
+                if pipe_info is not None:
+                    pipe_info["zero_exec_count"] += 1
+            else:
+                total_emitted_dispatches += 1
+                pair_rec.emitted_dispatches += 1
+                if pipe_info is not None:
+                    pipe_info["exec_count"] += 1
+
+            _check_bound_groups_for_pipeline(pair_rec, pipe_info)
+
+    # Flush any pending SetPipeline / SetComputePipeline at EOF.
+    _flush_pending_render()
+    _flush_pending_compute()
+
+    # Flag created pipelines that were never even bound or executed.
+    for pipe_info in created_pipelines.values():
+        if (
+            pipe_info["set_count"] == 0
+            and pipe_info["exec_count"] == 0
+            and pipe_info["zero_exec_count"] == 0
+        ):
+            pipe_info["pair"].reason_counts["pipeline_never_executed"] += 1
+
+    reason_totals: Counter[str] = Counter()
+    ranked_rows: list[dict[str, Any]] = []
+    for rec in pair_records.values():
+        skip_events = sum(
+            count for reason, count in rec.reason_counts.items() if reason in _SKIP_EVENT_REASONS
+        )
+        binding_anomalies = sum(
+            count
+            for reason, count in rec.reason_counts.items()
+            if reason in _BINDING_ANOMALY_REASONS
+        )
+        total_anomalies = skip_events + binding_anomalies
+        if total_anomalies == 0:
+            continue
+        reason_totals.update(rec.reason_counts)
+        top_reason = sorted(rec.reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        ranked_rows.append(
+            {
+                "kind": rec.kind,
+                "shader_pair": rec.shader_pair,
+                "vs_shader": rec.vs_shader,
+                "ps_shader": rec.ps_shader,
+                "cs_shader": rec.cs_shader,
+                "pipeline_ids": sorted(rec.pipeline_ids),
+                "pipeline_count": len(rec.pipeline_ids),
+                "set_count": rec.set_count,
+                "emitted_draws": rec.emitted_draws,
+                "emitted_dispatches": rec.emitted_dispatches,
+                "skip_event_count": skip_events,
+                "binding_anomaly_count": binding_anomalies,
+                "total_anomalies": total_anomalies,
+                "top_reason": top_reason,
+                "reason_counts": dict(sorted(rec.reason_counts.items())),
+                "affected_bind_group_ids": sorted(rec.affected_bind_group_ids),
+                "affected_bindings": sorted(rec.affected_bindings),
+            }
+        )
+
+    ranked_rows.sort(
+        key=lambda row: (
+            -int(row["total_anomalies"]),
+            -int(row["skip_event_count"]),
+            -int(row["binding_anomaly_count"]),
+            str(row["kind"]),
+            str(row["shader_pair"]),
+        )
+    )
+    for rank, row in enumerate(ranked_rows, start=1):
+        row["rank"] = rank
+
+    total_skip_events = sum(int(row["skip_event_count"]) for row in ranked_rows)
+    total_binding_anomalies = sum(int(row["binding_anomaly_count"]) for row in ranked_rows)
+    total_anomalies = total_skip_events + total_binding_anomalies + unbound_draws + unbound_dispatches
+
+    return {
+        "ok": total_anomalies == 0,
+        "total_anomalies": total_anomalies,
+        "total_skip_events": total_skip_events,
+        "total_binding_anomalies": total_binding_anomalies,
+        "total_pipelines": len(created_pipelines),
+        "total_pipeline_pairs": len(pair_records),
+        "affected_pipeline_pairs": len(ranked_rows),
+        "emitted_draws": total_emitted_draws,
+        "emitted_dispatches": total_emitted_dispatches,
+        "unbound_draws": unbound_draws,
+        "unbound_dispatches": unbound_dispatches,
+        "reason_totals": dict(sorted(reason_totals.items())),
+        "ranked_pairs": ranked_rows,
+    }
+
+
+def format_start_screen_skips_text(audit: dict[str, Any]) -> str:
+    """Format an audit_start_screen_skips() dictionary as a sanitized human-readable report."""
+    total = int(audit["total_anomalies"])
+    status = (
+        "CLEAN (0 anomalies)"
+        if audit["ok"]
+        else (
+            f"ISSUES FOUND ({total} anomaly event(s) across "
+            f"{audit['affected_pipeline_pairs']}/{audit['total_pipeline_pairs']} pipeline pair(s))"
+        )
+    )
+    reasons_str = _format_op_histogram(audit.get("reason_totals"))
+    lines: list[str] = [
+        "Start-Screen Skips Audit:",
+        f"  Status: {status}",
+        (
+            f"  Pipelines: {audit['total_pipelines']} | "
+            f"Pairs: {audit['total_pipeline_pairs']} "
+            f"(affected={audit['affected_pipeline_pairs']}) | "
+            f"Emitted Draws: {audit['emitted_draws']} | "
+            f"Emitted Dispatches: {audit['emitted_dispatches']} | "
+            f"Unbound Draws: {audit['unbound_draws']} | "
+            f"Unbound Dispatches: {audit['unbound_dispatches']}"
+        ),
+        (
+            f"  Skip Events: {audit['total_skip_events']} | "
+            f"Binding Anomalies: {audit['total_binding_anomalies']} | "
+            f"Reasons: {reasons_str}"
+        ),
+    ]
+
+    ranked = audit.get("ranked_pairs") or []
+    if not ranked:
+        lines.append("  (none)")
+        return "\n".join(lines)
+
+    lines.append(
+        f"  {'Rank':>4s}  {'Kind':<7s}  {'Shader Pair (VS / PS or CS)':<39s}  "
+        f"{'Pipes':>5s}  {'Draws':>5s}  {'Disp':>4s}  {'Skips':>5s}  "
+        f"{'BindAnom':>8s}  {'Total':>5s}  {'Top Reason'}"
+    )
+    lines.append(
+        f"  {'-' * 4}  {'-' * 7}  {'-' * 39}  "
+        f"{'-' * 5}  {'-' * 5}  {'-' * 4}  {'-' * 5}  "
+        f"{'-' * 8}  {'-' * 5}  {'-' * 24}"
+    )
+    for row in ranked:
+        lines.append(
+            f"  {int(row['rank']):4d}  {str(row['kind']):<7s}  {str(row['shader_pair']):<39s}  "
+            f"{int(row['pipeline_count']):5d}  {int(row['emitted_draws']):5d}  "
+            f"{int(row['emitted_dispatches']):4d}  {int(row['skip_event_count']):5d}  "
+            f"{int(row['binding_anomaly_count']):8d}  {int(row['total_anomalies']):5d}  "
+            f"{row['top_reason']}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Formatting & JSON serialization
 # ---------------------------------------------------------------------------
 
@@ -4428,6 +5782,8 @@ def format_trace_text(
     stats_only: bool = False,
     shader_summary: bool = False,
     binding_audit: bool = False,
+    bink_video_audit: bool = False,
+    start_screen_skips: bool = False,
 ) -> str:
     """Format a DecodedTrace as human-readable disassembly and/or statistics."""
     lines: list[str] = [
@@ -4545,6 +5901,14 @@ def format_trace_text(
         lines.append("")
         lines.append(format_binding_audit_text(audit_bindings(trace)))
 
+    if bink_video_audit:
+        lines.append("")
+        lines.append(format_bink_video_audit_text(audit_bink_video(trace)))
+
+    if start_screen_skips:
+        lines.append("")
+        lines.append(format_start_screen_skips_text(audit_start_screen_skips(trace)))
+
     return "\n".join(lines)
 
 
@@ -4554,6 +5918,8 @@ def trace_to_json(
     stats_only: bool = False,
     shader_summary: bool = False,
     binding_audit: bool = False,
+    bink_video_audit: bool = False,
+    start_screen_skips: bool = False,
     indent: int = 2,
 ) -> str:
     """Serialize a DecodedTrace to formatted JSON."""
@@ -4562,6 +5928,8 @@ def trace_to_json(
             stats_only=stats_only,
             shader_summary=shader_summary,
             binding_audit=binding_audit,
+            bink_video_audit=bink_video_audit,
+            start_screen_skips=start_screen_skips,
         ),
         indent=indent,
     )
@@ -4616,6 +5984,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--bink-video-audit",
+        action="store_true",
+        help=(
+            "Audit r8unorm planar Bink2 video textures (uploads, byte totals, bind groups, "
+            "and whether any draw or compute dispatch sampled those video planes)."
+        ),
+    )
+    parser.add_argument(
+        "--start-screen-skips",
+        action="store_true",
+        help=(
+            "Rank top pipelines/shader pairs associated with skipped/unemitted draws "
+            "or missing-binding anomalies in sanitized text/JSON output."
+        ),
+    )
+    parser.add_argument(
         "--preview-bytes",
         type=int,
         default=DEFAULT_PREVIEW_BYTES,
@@ -4654,6 +6038,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stats_only=args.stats,
                 shader_summary=args.shader_summary,
                 binding_audit=args.binding_audit,
+                bink_video_audit=args.bink_video_audit,
+                start_screen_skips=args.start_screen_skips,
             )
         )
     else:
@@ -4663,6 +6049,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stats_only=args.stats,
                 shader_summary=args.shader_summary,
                 binding_audit=args.binding_audit,
+                bink_video_audit=args.bink_video_audit,
+                start_screen_skips=args.start_screen_skips,
             )
         )
 
