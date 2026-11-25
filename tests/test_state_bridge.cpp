@@ -2599,8 +2599,152 @@ void test_content_hash_change_detection() {
     }
 }
 
+// #482 / #954: the translator declares every storage texture rgba8unorm. A compute binding of a
+// storage-capable texture of another float format (the rgba16float 3D LUT of stage
+// 0x311b9e5fc666d0b5) is bound to an intermediate texture in the declared format, converted into the
+// real texture after the dispatch (and from it before, for read-write access). Matching formats
+// keep the exact binding and emit no conversion.
+void test_storage_texture_format_conversion() {
+    struct Case {
+        pso::DxgiFormat format;
+        bool volume;
+        GpuStorageTextureAccess access;
+    };
+    const Case cases[] = {
+        {pso::DxgiFormat::R16G16B16A16_FLOAT, true, GpuStorageTextureAccess::WriteOnly},   // mismatched 3D LUT
+        {pso::DxgiFormat::R16G16B16A16_FLOAT, false, GpuStorageTextureAccess::ReadWrite},  // mismatched, read-write
+        {pso::DxgiFormat::R8G8B8A8_UNORM, true, GpuStorageTextureAccess::WriteOnly},       // matched
+    };
+    for (const Case& c : cases) {
+        const bool mismatched = c.format != pso::DxgiFormat::R8G8B8A8_UNORM;
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
+        constexpr uint32_t kTex = 302;
+        constexpr uint64_t kCs = 0xE3;
+        bridge::TextureInfo tex{c.format, 32, 16, c.volume ? 8u : 1u, 1, 1,
+                                c.volume ? GpuTextureDimension::Dim3D : GpuTextureDimension::Dim2D, false};
+        tex.storage = true;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kCs, 3);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::ViewDesc vd;
+        vd.format = static_cast<uint32_t>(tex.format);
+        vd.dimension = c.volume ? d3d::ViewDimension::Texture3D : d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Uav;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs.parameters.push_back(table);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        const auto dim = c.volume ? GpuTextureViewDimension::Dim3D : GpuTextureViewDimension::Dim2D;
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        GpuBindGroupLayoutEntry entry =
+            layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                         static_cast<uint8_t>(c.access), static_cast<uint8_t>(dim));
+        entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+        group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        auto cpso = device.create_compute_pipeline_state(desc, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.Dispatch(2, 2, 2);
+        list.Dispatch(1, 1, 1);
+        list.Close();
+
+        const std::vector<Packet> p = decode(enc);
+        uint32_t intermediate = 0, game_group = 0, conversion_modules = 0;
+        GpuCreateTexture2Payload created{};
+        GpuBindGroupEntry2 bound{};
+        std::vector<std::pair<uint32_t, uint32_t>> dispatches;  // (pipeline, x)
+        uint32_t pipeline = 0;
+        for (const Packet& pk : p) {
+            if (pk.opcode == GpuOpcode::CreateTexture2) {
+                created = pod<GpuCreateTexture2Payload>(pk);
+                intermediate = created.id;
+            } else if (pk.opcode == GpuOpcode::CreateShaderModule) {
+                ++conversion_modules;
+            } else if (pk.opcode == GpuOpcode::CreateBindGroup2 && game_group == 0) {
+                game_group = pod<GpuCreateBindGroup2Payload>(pk).id;
+                bound = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload));
+            } else if (pk.opcode == GpuOpcode::SetComputePipeline) {
+                pipeline = pod<GpuSetComputePipelinePayload>(pk).pipeline_id;
+            } else if (pk.opcode == GpuOpcode::DispatchCompute) {
+                dispatches.emplace_back(pipeline, pod<GpuDispatchComputePayload>(pk).workgroup_x);
+            }
+        }
+        CHECK(list.stats().dispatches == 2);
+        CHECK(list.stats().storage_views_format_mismatch == 0 && list.stats().storage_views_without_usage == 0);
+        if (!mismatched) {
+            CHECK(intermediate == 0 && conversion_modules == 0);
+            CHECK(bound.resource_id == kTex);
+            CHECK(list.stats().storage_views_converted == 0 && list.stats().storage_conversions == 0);
+            CHECK(dispatches.size() == 2);
+            continue;
+        }
+        // The intermediate: the texture's size, dimension and mips in the declared format.
+        CHECK(intermediate != 0 && intermediate != kTex);
+        CHECK(created.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
+        CHECK(created.width == 32 && created.height == 16 && created.depth_or_layers == tex.depth_or_array_size);
+        CHECK(created.dimension == static_cast<uint8_t>(tex.dimension) && created.mip_levels == 1);
+        CHECK((created.usage_flags & GpuTextureUsage::StorageBinding) != 0);
+        CHECK(bound.resource_id == intermediate &&
+              bound.view.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm));
+        CHECK(list.stats().storage_views_converted == 1);
+        // One conversion out per dispatch, plus one in per dispatch for read-write access.
+        const bool rw = c.access == GpuStorageTextureAccess::ReadWrite;
+        const uint32_t per_dispatch = rw ? 2u : 1u;
+        CHECK(list.stats().storage_conversions == 2 * per_dispatch);
+        CHECK(conversion_modules == per_dispatch);  // one pipeline per (target format, dimension)
+        CHECK(dispatches.size() == 2 * (1 + per_dispatch));
+        if (dispatches.size() == 2 * (1 + per_dispatch)) {
+            for (size_t d = 0; d < 2; ++d) {
+                const size_t base = d * (1 + per_dispatch);
+                const size_t game = base + (rw ? 1 : 0);
+                CHECK(dispatches[game].first == cpso->pipeline_id());
+                CHECK(dispatches[game + 1].first != cpso->pipeline_id());  // converted after it
+                // 3D: 4x4x4 groups over 32x16x8; 2D: 8x8 groups over 32x16.
+                CHECK(dispatches[game + 1].second == (c.volume ? 8u : 4u));
+                if (rw) {
+                    CHECK(dispatches[base].first != cpso->pipeline_id());  // copied in before it
+                }
+            }
+        }
+        // The conversion out binds the intermediate (sampled) and the real texture (storage, its format).
+        bool out_group = false;
+        for (const Packet& pk : p) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2 && pk.payload.size() >= sizeof(GpuCreateBindGroup2Payload) +
+                                                                                   2 * sizeof(GpuBindGroupEntry2)) {
+                const auto src = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload));
+                const auto dst =
+                    pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                if (src.resource_id == intermediate && dst.resource_id == kTex) {
+                    out_group = dst.view.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba16Float) &&
+                                dst.view.dimension == static_cast<uint8_t>(dim) && dst.view.mip_level_count == 1;
+                }
+            }
+        }
+        CHECK(out_group);
+    }
+}
+
 int main() {
     test_content_hash_change_detection();
+    test_storage_texture_format_conversion();
     test_seam_conversions();
     test_memory_backed_tables();
     test_representative_command_list();

@@ -301,6 +301,25 @@ private:
     // True exactly once per compute pipeline id: the caller emits CreateComputePipeline2.
     bool claim_compute_creation(uint32_t pipeline_id);
 
+    // #482 storage-format fallback: the intermediate texture of `resource_id` in `format` (same size,
+    // dimension and mips), created through `encoder` on first use.
+    uint32_t intermediate_storage_texture(uint32_t resource_id, const TextureInfo& info, uint8_t format,
+                                          CommandEncoder& encoder);
+    // The conversion pipeline writing `dst_format` views of `dimension` (GpuTextureViewDimension), and
+    // its bind group for (src, dst, subresource); created through `encoder` on first use.
+    struct StorageConversionPipeline {
+        uint32_t group_layout = 0;
+        uint32_t pipeline = 0;
+    };
+    StorageConversionPipeline storage_conversion_pipeline(uint8_t dst_format, uint8_t dimension,
+                                                          CommandEncoder& encoder);
+    uint32_t storage_conversion_group(const StorageConversionPipeline& pipeline, uint8_t dimension, uint32_t src,
+                                      uint8_t src_format, uint32_t dst, uint8_t dst_format, uint32_t mip,
+                                      uint32_t base_layer, uint32_t layer_count, CommandEncoder& encoder);
+    // Drops the intermediates and conversion bind groups of `resource_id` (destroyed at next use).
+    void retire_intermediates(uint32_t resource_id);
+    void flush_retired_locked(CommandEncoder& encoder);
+
     d3d::DescriptorHeapRegistry& heaps_;
     BridgeOptions options_;
     const d3d::ResourceStateRegistry* resource_states_ = nullptr;
@@ -326,6 +345,10 @@ private:
     std::unordered_set<uint32_t> emitted_compute_;
     uint32_t ring_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
+    std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
+    std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
+    std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
+    std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next use
 };
 
 // Graphics PSO as seen by the bridge: the G7 GraphicsPso plus everything needed to emit its packets.
@@ -398,6 +421,12 @@ struct BridgeStats {
     uint64_t storage_views_without_usage = 0;
     // ... of a texture whose format is not the stage's storage format, bound as null too.
     uint64_t storage_views_format_mismatch = 0;
+    // Compute storage-texture bindings of another format than the stage's bound instead to an
+    // intermediate texture in the stage's format (#482: both formats storage-capable and float),
+    // converted into the real texture after the dispatch (and from it before, for read access).
+    uint64_t storage_views_converted = 0;
+    // Conversion dispatches emitted for them (intermediate <-> real texture).
+    uint64_t storage_conversions = 0;
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;
@@ -527,6 +556,32 @@ private:
     bool prepare_render_draw();
     void apply_input_assembler(bool indexed);
 
+    // #482: a compute storage-texture binding redirected to an intermediate texture in the stage's
+    // storage format.
+    struct StorageRedirect {
+        size_t entry = 0;            // index in the bind group's entries
+        uint32_t texture = 0;        // real texture
+        uint32_t intermediate = 0;   // bound instead
+        uint8_t format = 0;          // real texture's format
+        uint8_t storage_format = 0;  // the stage's (and the intermediate's) format
+        uint8_t dimension = 0;       // GpuTextureViewDimension: 2D, 2D array or 3D
+        uint8_t access = 0;          // GpuStorageTextureAccess
+        uint32_t mip = 0;
+        uint32_t base_layer = 0;
+        uint32_t layer_count = 1;
+        uint32_t extent[3] = {1, 1, 1};  // texels of the view (z: depth or layers)
+        bool same_target(const StorageRedirect& o) const noexcept {
+            return entry == o.entry && texture == o.texture && intermediate == o.intermediate &&
+                   format == o.format && storage_format == o.storage_format && dimension == o.dimension &&
+                   mip == o.mip && base_layer == o.base_layer && layer_count == o.layer_count;
+        }
+    };
+    bool storage_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id, const TextureInfo& info,
+                          uint8_t own_format, const GpuTextureViewDesc& view, CommandEncoder& side,
+                          StorageRedirect* out);
+    // Emits one conversion dispatch: real -> intermediate (`into_intermediate`) or back.
+    void emit_storage_conversion(const StorageRedirect& r, bool into_intermediate);
+
     StateBridgeDevice& device_;
     CommandEncoder& encoder_;
     pso::CommandListStateTracker tracker_;
@@ -549,6 +604,9 @@ private:
         d3d::CachedBindGroup built;
     };
     std::vector<MemoryBindGroup> memory_groups_;
+    // Storage redirects the last gpu_entries call made, and those of each bind group (by gpu id).
+    std::vector<StorageRedirect> pending_redirects_;
+    std::unordered_map<uint32_t, std::vector<StorageRedirect>> redirects_;
     static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
     void note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::BindGroupPlan& plan,
                            const d3d::CachedBindGroup& cached, size_t entries_offset);

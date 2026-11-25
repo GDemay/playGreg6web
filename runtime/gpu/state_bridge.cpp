@@ -169,15 +169,26 @@ StateBridgeDevice::StateBridgeDevice(d3d::DescriptorHeapRegistry& heaps,
 StateBridgeDevice::~StateBridgeDevice() = default;
 
 void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo& info) {
-    std::unique_lock lock(resources_mutex_);
-    if (auto it = textures_.find(resource_id); it != textures_.end() && it->second.gpu_va != 0) {
-        if (auto v = textures_by_va_.find(it->second.gpu_va); v != textures_by_va_.end() && v->second == resource_id) {
-            textures_by_va_.erase(v);
+    bool replaced = false;
+    {
+        std::unique_lock lock(resources_mutex_);
+        if (auto it = textures_.find(resource_id); it != textures_.end()) {
+            const TextureInfo& old = it->second;
+            replaced = old.format != info.format || old.width != info.width || old.height != info.height ||
+                       old.depth_or_array_size != info.depth_or_array_size || old.mip_levels != info.mip_levels ||
+                       old.dimension != info.dimension;
+            if (auto v = textures_by_va_.find(it->second.gpu_va);
+                it->second.gpu_va != 0 && v != textures_by_va_.end() && v->second == resource_id) {
+                textures_by_va_.erase(v);
+            }
+        }
+        textures_[resource_id] = info;
+        if (info.gpu_va != 0) {
+            textures_by_va_[info.gpu_va] = resource_id;
         }
     }
-    textures_[resource_id] = info;
-    if (info.gpu_va != 0) {
-        textures_by_va_[info.gpu_va] = resource_id;
+    if (replaced) {
+        retire_intermediates(resource_id);  // a new description: intermediates of the old one are stale
     }
 }
 
@@ -211,18 +222,22 @@ uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
 }
 
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
-    std::unique_lock lock(resources_mutex_);
-    if (auto it = textures_.find(resource_id); it != textures_.end()) {
-        if (auto v = textures_by_va_.find(it->second.gpu_va); v != textures_by_va_.end() && v->second == resource_id) {
-            textures_by_va_.erase(v);
+    {
+        std::unique_lock lock(resources_mutex_);
+        if (auto it = textures_.find(resource_id); it != textures_.end()) {
+            if (auto v = textures_by_va_.find(it->second.gpu_va);
+                v != textures_by_va_.end() && v->second == resource_id) {
+                textures_by_va_.erase(v);
+            }
+            textures_.erase(it);
         }
-        textures_.erase(it);
+        if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
+            buffers_by_va_.erase(it->second);
+            buffer_va_.erase(it);
+        }
+        buffer_allocated_.erase(resource_id);
     }
-    if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
-        buffers_by_va_.erase(it->second);
-        buffer_va_.erase(it);
-    }
-    buffer_allocated_.erase(resource_id);
+    retire_intermediates(resource_id);
 }
 
 void StateBridgeDevice::register_shader_module(uint64_t shader_identity, uint32_t module_id) {
@@ -421,6 +436,188 @@ uint32_t StateBridgeDevice::allocate_root_constants(uint32_t bytes, bool* wrappe
 bool StateBridgeDevice::claim_compute_creation(uint32_t pipeline_id) {
     std::lock_guard lock(objects_mutex_);
     return emitted_compute_.insert(pipeline_id).second;
+}
+
+// ---- #482: storage views through an intermediate texture of the stage's storage format ----
+
+namespace {
+
+// Float formats WGSL can declare as a write-only storage texture without optional features: the
+// conversion pass loads one as unfilterable-float and stores the other.
+bool convertible_storage_format(uint8_t code) noexcept {
+    using F = pso::WgpuTextureFormat;
+    switch (static_cast<F>(code)) {
+    case F::Rgba8Unorm:
+    case F::Rgba8Snorm:
+    case F::Rgba16Float:
+    case F::R32Float:
+    case F::Rg32Float:
+    case F::Rgba32Float:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::string storage_conversion_wgsl(uint8_t dst_format, uint8_t dimension) {
+    const char* format = pso::texture_format_name(static_cast<pso::WgpuTextureFormat>(dst_format));
+    std::string s;
+    switch (static_cast<GpuTextureViewDimension>(dimension)) {
+    case GpuTextureViewDimension::Dim3D:
+        s = "@group(0) @binding(0) var src: texture_3d<f32>;\n"
+            "@group(0) @binding(1) var dst: texture_storage_3d<FMT, write>;\n"
+            "@compute @workgroup_size(4, 4, 4)\n"
+            "fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+            "  if (any(id >= textureDimensions(dst))) { return; }\n"
+            "  textureStore(dst, id, textureLoad(src, id, 0));\n"
+            "}\n";
+        break;
+    case GpuTextureViewDimension::Dim2DArray:
+        s = "@group(0) @binding(0) var src: texture_2d_array<f32>;\n"
+            "@group(0) @binding(1) var dst: texture_storage_2d_array<FMT, write>;\n"
+            "@compute @workgroup_size(8, 8, 1)\n"
+            "fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+            "  if (any(id.xy >= textureDimensions(dst)) || id.z >= textureNumLayers(dst)) { return; }\n"
+            "  textureStore(dst, id.xy, id.z, textureLoad(src, id.xy, id.z, 0));\n"
+            "}\n";
+        break;
+    default:
+        s = "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+            "@group(0) @binding(1) var dst: texture_storage_2d<FMT, write>;\n"
+            "@compute @workgroup_size(8, 8, 1)\n"
+            "fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+            "  if (any(id.xy >= textureDimensions(dst))) { return; }\n"
+            "  textureStore(dst, id.xy, textureLoad(src, id.xy, 0));\n"
+            "}\n";
+        break;
+    }
+    const size_t at = s.find("FMT");
+    s.replace(at, 3, format != nullptr ? format : "rgba8unorm");
+    return s;
+}
+
+}  // namespace
+
+void StateBridgeDevice::flush_retired_locked(CommandEncoder& encoder) {
+    for (const uint32_t id : retired_ids_) {
+        encoder.destroy_resource(id);
+    }
+    retired_ids_.clear();
+}
+
+void StateBridgeDevice::retire_intermediates(uint32_t resource_id) {
+    std::lock_guard lock(objects_mutex_);
+    std::vector<uint32_t> gone{resource_id};
+    for (auto it = intermediates_.begin(); it != intermediates_.end();) {
+        if (it->first.first == resource_id) {
+            gone.push_back(it->second);
+            retired_ids_.push_back(it->second);
+            it = intermediates_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = conversion_groups_.begin(); it != conversion_groups_.end();) {
+        const bool uses = std::find(gone.begin(), gone.end(), it->first[1]) != gone.end() ||
+                          std::find(gone.begin(), gone.end(), it->first[2]) != gone.end();
+        if (uses) {
+            retired_ids_.push_back(it->second);
+            it = conversion_groups_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+uint32_t StateBridgeDevice::intermediate_storage_texture(uint32_t resource_id, const TextureInfo& info,
+                                                         uint8_t format, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    flush_retired_locked(encoder);
+    uint32_t& id = intermediates_[{resource_id, format}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuCreateTexture2Payload p{};
+        p.id = id;
+        p.width = std::max(info.width, 1u);
+        p.height = std::max(info.height, 1u);
+        p.depth_or_layers = std::max(info.depth_or_array_size, 1u);
+        p.mip_levels = std::max(info.mip_levels, 1u);
+        p.sample_count = 1;
+        p.usage_flags = GpuTextureUsage::TextureBinding | GpuTextureUsage::StorageBinding;
+        p.dimension = static_cast<uint8_t>(info.dimension);
+        p.format = format;
+        encoder.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
+    }
+    return id;
+}
+
+StateBridgeDevice::StorageConversionPipeline StateBridgeDevice::storage_conversion_pipeline(
+    uint8_t dst_format, uint8_t dimension, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    StorageConversionPipeline& c = conversion_pipelines_[uint32_t{dst_format} << 8 | dimension];
+    if (c.pipeline == 0) {
+        const uint32_t module = allocate_id();
+        encoder.create_shader_module(module, GpuShaderStage::Compute, storage_conversion_wgsl(dst_format, dimension));
+        GpuBindGroupLayoutEntry entries[2] = {};
+        entries[0].binding = 0;
+        entries[0].visibility = GpuShaderStageBits::Compute;
+        entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entries[0].binding_type = static_cast<uint8_t>(GpuTextureSampleType::UnfilterableFloat);
+        entries[0].view_dimension = dimension;
+        entries[1].binding = 1;
+        entries[1].visibility = GpuShaderStageBits::Compute;
+        entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
+        entries[1].binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+        entries[1].view_dimension = dimension;
+        entries[1].storage_format = dst_format;
+        c.group_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.group_layout;
+        layout.entry_count = 2;
+        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = allocate_id();
+        pl.bind_group_layout_count = 1;
+        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+        GpuCreateComputePipeline2Payload p{};
+        p.id = allocate_id();
+        p.cs_module_id = module;
+        p.pipeline_layout_id = pl.id;
+        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
+        c.pipeline = p.id;
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipeline& pipeline, uint8_t dimension,
+                                                     uint32_t src, uint8_t src_format, uint32_t dst,
+                                                     uint8_t dst_format, uint32_t mip, uint32_t base_layer,
+                                                     uint32_t layer_count, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    uint32_t& id = conversion_groups_[{pipeline.group_layout, src, dst, mip, base_layer, layer_count}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[2] = {};
+        const uint32_t ids[2] = {src, dst};
+        const uint8_t formats[2] = {src_format, dst_format};
+        for (uint32_t i = 0; i < 2; ++i) {
+            e[i].binding = i;
+            e[i].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+            e[i].resource_id = ids[i];
+            e[i].view.format = formats[i];
+            e[i].view.dimension = dimension;
+            e[i].view.base_mip_level = static_cast<uint16_t>(mip);
+            e[i].view.mip_level_count = 1;
+            e[i].view.base_array_layer = base_layer;
+            e[i].view.array_layer_count = layer_count;
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = pipeline.group_layout;
+        g.entry_count = 2;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    }
+    return id;
 }
 
 uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
@@ -1151,6 +1348,11 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     encoder_.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(), entry_bytes);
     cached->gpu_id = header.id;
     ++stats_.bind_groups_created;
+    if (!pending_redirects_.empty()) {
+        stats_.storage_views_converted += pending_redirects_.size();
+        redirects_[header.id] = std::move(pending_redirects_);
+        pending_redirects_.clear();
+    }
     if (cached->from_memory && plan != nullptr) {
         note_memory_group(group, *plan, *cached, encoder_.size() - entry_bytes);
     }
@@ -1186,6 +1388,22 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
         if (changed) {
             std::vector<GpuBindGroupEntry2> entries;
             gpu_entries(*m.group, m.built, prelude, &entries);
+            // The conversions were recorded with the dispatches: a redirect the recording did not
+            // make has none, so that binding is bound null as before (#482).
+            const auto recorded = redirects_.find(m.built.gpu_id);
+            for (const StorageRedirect& r : pending_redirects_) {
+                const bool known =
+                    recorded != redirects_.end() &&
+                    std::any_of(recorded->second.begin(), recorded->second.end(),
+                                [&](const StorageRedirect& o) { return o.same_target(r); });
+                if (!known && r.entry < entries.size()) {
+                    entries[r.entry].resource_id = 0;
+                    entries[r.entry].view = GpuTextureViewDesc{};
+                    diagnostics_ |= BridgeDiag::StorageViewNoUsage;
+                    ++stats_.storage_views_format_mismatch;
+                }
+            }
+            pending_redirects_.clear();
             const size_t bytes = entries.size() * sizeof(GpuBindGroupEntry2);
             if (m.entries_offset != kNoPacket) {
                 encoder_.patch(m.entries_offset, entries.data(), bytes);
@@ -1231,6 +1449,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                                     std::vector<GpuBindGroupEntry2>* result) {
     std::vector<GpuBindGroupEntry2>& entries = *result;
     entries.assign(cached.entries.size(), GpuBindGroupEntry2{});
+    pending_redirects_.clear();
     for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
         const d3d::BindGroupEntry& e = cached.entries[i];
         const GpuBindGroupLayoutEntry& layout = group.entries[i];
@@ -1371,6 +1590,15 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     out.view = GpuTextureViewDesc{};
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
                     ++stats_.storage_views_without_usage;
+                } else if (StorageRedirect r; e.resource_id != 0 && !format_ok &&
+                                              storage_redirect(layout, e.resource_id, info, own, out.view, side, &r)) {
+                    // #482: the translator declares every storage texture rgba8unorm. A compute
+                    // binding of another storage-capable float format is bound to an intermediate
+                    // texture in the declared format, converted into the real one after the dispatch.
+                    r.entry = i;
+                    out.resource_id = r.intermediate;
+                    out.view.format = r.storage_format;
+                    pending_redirects_.push_back(r);
                 } else if (e.resource_id != 0 && !format_ok) {
                     // WebGPU requires the storage format to be the texture's: another format
                     // invalidates the bind group and the whole command buffer. Bound null instead.
@@ -1425,6 +1653,67 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             break;
         }
     }
+}
+
+bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id,
+                                         const TextureInfo& info, uint8_t own_format, const GpuTextureViewDesc& view,
+                                         CommandEncoder& side, StorageRedirect* out) {
+    using D = GpuTextureViewDimension;
+    // Compute only: the conversion runs as dispatches next to the stage's own.
+    if ((layout.visibility & GpuShaderStageBits::Compute) == 0 ||
+        (layout.visibility & ~GpuShaderStageBits::Compute) != 0 || info.sample_count > 1 ||
+        !convertible_storage_format(own_format) || !convertible_storage_format(layout.storage_format)) {
+        return false;
+    }
+    const D dim = layout.view_dimension == static_cast<uint8_t>(D::Undefined) ? D::Dim2D
+                                                                             : static_cast<D>(layout.view_dimension);
+    const bool volume = info.dimension == GpuTextureDimension::Dim3D;
+    if ((dim == D::Dim3D) != volume || (dim != D::Dim3D && dim != D::Dim2D && dim != D::Dim2DArray) ||
+        view.base_mip_level >= std::max(info.mip_levels, 1u)) {
+        return false;
+    }
+    StorageRedirect r;
+    r.texture = resource_id;
+    r.format = own_format;
+    r.storage_format = layout.storage_format;
+    r.dimension = static_cast<uint8_t>(dim);
+    r.access = layout.binding_type;
+    r.mip = view.base_mip_level;
+    const uint32_t layers = volume ? 1u : std::max(info.depth_or_array_size, 1u);
+    r.base_layer = volume ? 0u : view.base_array_layer;
+    r.layer_count = dim == D::Dim2DArray ? (view.array_layer_count != 0 ? view.array_layer_count
+                                                                        : layers - std::min(r.base_layer, layers))
+                                         : 1u;
+    if (r.layer_count == 0 || r.base_layer + r.layer_count > layers) {
+        return false;
+    }
+    r.extent[0] = mip_extent(info.width, r.mip);
+    r.extent[1] = mip_extent(info.height, r.mip);
+    r.extent[2] = volume ? mip_extent(info.depth_or_array_size, r.mip) : r.layer_count;
+    r.intermediate = device_.intermediate_storage_texture(resource_id, info, layout.storage_format, side);
+    *out = r;
+    return true;
+}
+
+void CommandListBridge::emit_storage_conversion(const StorageRedirect& r, bool into_intermediate) {
+    const uint8_t dst_format = into_intermediate ? r.storage_format : r.format;
+    const StateBridgeDevice::StorageConversionPipeline pipeline =
+        device_.storage_conversion_pipeline(dst_format, r.dimension, encoder_);
+    const uint32_t group = into_intermediate
+                               ? device_.storage_conversion_group(pipeline, r.dimension, r.texture, r.format,
+                                                                  r.intermediate, r.storage_format, r.mip,
+                                                                  r.base_layer, r.layer_count, encoder_)
+                               : device_.storage_conversion_group(pipeline, r.dimension, r.intermediate,
+                                                                  r.storage_format, r.texture, r.format, r.mip,
+                                                                  r.base_layer, r.layer_count, encoder_);
+    encoder_.set_compute_pipeline(pipeline.pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    const bool volume = r.dimension == static_cast<uint8_t>(GpuTextureViewDimension::Dim3D);
+    const uint32_t xy = volume ? 4u : 8u;
+    encoder_.dispatch_compute((r.extent[0] + xy - 1) / xy, (r.extent[1] + xy - 1) / xy,
+                              volume ? (r.extent[2] + 3u) / 4u : r.extent[2]);
+    ++stats_.storage_conversions;
 }
 
 void CommandListBridge::add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join) {
@@ -1486,6 +1775,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                     return false;
                 }
                 if (lookup.retired_gpu_id != 0) {
+                    redirects_.erase(lookup.retired_gpu_id);
                     encoder_.destroy_resource(lookup.retired_gpu_id);
                     ++stats_.bind_groups_retired;
                 }
@@ -1630,8 +1920,42 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
         !apply_bind_groups(d3d::BindPoint::Compute, state->layout_, state->plans_, &compute_groups_, false)) {
         return;
     }
+    // #482: storage bindings redirected to an intermediate texture. Dispatches in one compute pass
+    // are separate usage scopes, so the conversions run as dispatches around the stage's.
+    std::vector<StorageRedirect> active;
+    for (const BoundGroup& b : compute_groups_) {
+        if (const auto it = redirects_.find(b.bind_group_id); it != redirects_.end()) {
+            active.insert(active.end(), it->second.begin(), it->second.end());
+        }
+    }
+    bool copied_in = false;
+    for (const StorageRedirect& r : active) {
+        if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly)) {
+            emit_storage_conversion(r, true);  // the stage reads it: real texture -> intermediate
+            copied_in = true;
+        }
+    }
+    if (copied_in) {  // the stage's pipeline and bind groups again
+        encoder_.set_compute_pipeline(state->pipeline_id_);
+        for (size_t g = 0; g < compute_groups_.size(); ++g) {
+            const BoundGroup& b = compute_groups_[g];
+            const GpuSetBindGroup2Payload header{static_cast<uint32_t>(g), b.bind_group_id,
+                                                 static_cast<uint32_t>(b.dynamic_offsets.size()), 0u};
+            encoder_.emit_packet(GpuOpcode::SetBindGroup2, &header, sizeof(header), b.dynamic_offsets.data(),
+                                 static_cast<uint32_t>(b.dynamic_offsets.size() * sizeof(uint32_t)));
+        }
+    }
     encoder_.dispatch_compute(thread_group_count_x, thread_group_count_y, thread_group_count_z);
     ++stats_.dispatches;
+    for (const StorageRedirect& r : active) {
+        if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly)) {
+            emit_storage_conversion(r, false);  // what the stage wrote: intermediate -> real texture
+        }
+    }
+    if (!active.empty()) {  // the next dispatch sets the stage's pipeline and bind groups again
+        compute_pipeline_bound_ = 0;
+        compute_groups_.clear();
+    }
 }
 
 void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers) {
