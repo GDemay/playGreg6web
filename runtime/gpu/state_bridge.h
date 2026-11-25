@@ -186,6 +186,10 @@ struct BridgeOptions {
     // `resource_id` and emits WriteTexture into `encoder` for each subresource whose texels
     // changed; returns true when a WriteTexture packet was emitted.
     std::function<bool(uint32_t resource_id, CommandEncoder& encoder)> sync_texture_memory;
+    // Device capability (G62, #482): the consumer binds binding arrays (GpuLayoutFlags::BindingArrays /
+    // GpuBindGroupFlags::BindingArrays). Off by default: lane-indexed heap windows are then refused at
+    // the reflection join (counted) and no layout with binding_array_size != 0 is emitted.
+    bool binding_arrays = false;
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
@@ -267,8 +271,12 @@ private:
     struct GroupLayoutRecord {
         uint32_t id = 0;
         GpuCreateBindGroupLayoutPayload header{};
+        // Per bind group entry: a binding array of N elements (binding_array_size N) is N copies of its
+        // layout entry, joins[i].array_index 0..N-1 (one GpuBindGroupEntry2 each).
         std::vector<GpuBindGroupLayoutEntry> entries;
         std::vector<d3d::ShaderBinding> joins;  // same order as entries
+        // The emitted GpuBindGroupLayoutEntry list: one per binding (arrays not expanded).
+        std::vector<GpuBindGroupLayoutEntry> layout_entries;
         bool emitted = false;
     };
     struct PipelineLayoutRecord {

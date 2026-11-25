@@ -524,7 +524,20 @@ inline constexpr uint8_t Multisampled = 0x2u;      // texture entries
 namespace GpuLayoutFlags {
 // The object is the one layout-manifest.json lists under `content_id`; the packet carries no entries.
 inline constexpr uint32_t ManifestReference = 0x1u;
+// CreateBindGroupLayout (G62, #482): some entries are binding arrays (binding_array_size >= 1). Set
+// only for a consumer that reported binding-array support; others never see such a layout.
+inline constexpr uint32_t BindingArrays = 0x2u;
 }  // namespace GpuLayoutFlags
+
+// GpuCreateBindGroup2Payload::flags.
+namespace GpuBindGroupFlags {
+// The entries hold binding-array runs (GpuBindGroupEntry2::array_index); set exactly when the
+// layout has GpuLayoutFlags::BindingArrays.
+inline constexpr uint32_t BindingArrays = 0x1u;
+}  // namespace GpuBindGroupFlags
+
+// Largest binding array the producer emits (the stage reflection window limit, kMaxLaneIndexedWindow).
+inline constexpr uint32_t kGpuMaxBindingArraySize = 256;
 
 // GPUTextureViewDescriptor subset used by render pass attachments and bind group entries.
 struct GpuTextureViewDesc {
@@ -549,10 +562,15 @@ struct GpuBindGroupLayoutEntry {
     uint8_t view_dimension;     // texture / storageTexture: GpuTextureViewDimension (Undefined = "2d")
     uint8_t flags;              // GpuBindGroupLayoutEntryFlags
     uint8_t storage_format;     // storageTexture: WebGPU texture format code
-    uint8_t reserved[3];
+    uint8_t reserved;
+    // Binding array (G62, #482; WGSL binding_array<T, N>, GPUBindGroupLayoutEntry.bindingArraySize):
+    // N elements of this entry's type; 0 = not an array (the v2 meaning of these bytes, reserved 0).
+    // Only in layouts carrying GpuLayoutFlags::BindingArrays.
+    uint16_t binding_array_size;
     uint64_t min_binding_size;  // buffer: minBindingSize (0 = none)
 };
 static_assert(sizeof(GpuBindGroupLayoutEntry) == 24, "GpuBindGroupLayoutEntry layout must stay 24 bytes");
+static_assert(offsetof(GpuBindGroupLayoutEntry, binding_array_size) == 14);
 static_assert(offsetof(GpuBindGroupLayoutEntry, min_binding_size) == 16);
 
 // Followed immediately by `entry_count` packed GpuBindGroupLayoutEntry structs.
@@ -780,24 +798,30 @@ static_assert(sizeof(GpuSetStencilReferencePayload) == 4, "GpuSetStencilReferenc
 // ---- Bind groups against explicit layouts ----
 
 // GpuBindGroupEntry (v1, first 32 bytes) + a texture view descriptor for TextureView entries.
+// A binding array of N elements (layout binding_array_size N) is a run of N consecutive entries with
+// the same `binding` and array_index 0..N-1 (element i: GPUBindGroupEntry binding + i in WebGPU's
+// binding-array numbering); a null element has resource_id 0. Other entries have array_index 0.
 struct GpuBindGroupEntry2 {
     uint32_t binding;
     uint32_t resource_type;  // GpuBindResourceType
     uint32_t resource_id;    // 0 = null binding (the worker binds a zero resource matching the layout)
-    uint32_t reserved;
+    uint16_t array_index;    // element of a binding array run (GpuBindGroupFlags::BindingArrays); else 0
+    uint16_t reserved;
     uint64_t offset;         // Buffer
     uint64_t size;           // Buffer; 0 = to the end of the buffer
     GpuTextureViewDesc view; // TextureView; all-zero = default view
 };
 static_assert(sizeof(GpuBindGroupEntry2) == 48, "GpuBindGroupEntry2 layout must stay 48 bytes");
+static_assert(offsetof(GpuBindGroupEntry2, array_index) == 12);
 static_assert(offsetof(GpuBindGroupEntry2, view) == 32);
 
-// Followed immediately by `entry_count` packed GpuBindGroupEntry2 structs.
+// Followed immediately by `entry_count` packed GpuBindGroupEntry2 structs (binding-array runs count
+// one per element).
 struct GpuCreateBindGroup2Payload {
     uint32_t id;
     uint32_t layout_id;  // CreateBindGroupLayout id
     uint32_t entry_count;
-    uint32_t reserved;
+    uint32_t flags;      // GpuBindGroupFlags (v2: reserved 0)
 };
 static_assert(sizeof(GpuCreateBindGroup2Payload) == 16, "GpuCreateBindGroup2Payload layout must stay 16 bytes");
 

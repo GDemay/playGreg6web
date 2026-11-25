@@ -123,7 +123,7 @@ v2 adds explicit bind group / pipeline layouts, full render pipeline keys, expli
 | `29` | `SetScissorRect` | `16` | `{ u32 x, u32 y, u32 width, u32 height }` (`GpuSetScissorRectPayload`) |
 | `30` | `SetBlendConstant` | `16` | `{ f32 r, f32 g, f32 b, f32 a }` (`GpuSetBlendConstantPayload`) |
 | `31` | `SetStencilReference` | `4` | `{ u32 reference }` (`GpuSetStencilReferencePayload`) |
-| `32` | `CreateBindGroup2` | `16 + 48 * entry_count` | `{ u32 id, u32 layout_id, u32 entry_count, u32 reserved }` (`GpuCreateBindGroup2Payload`) followed by `entry_count` `GpuBindGroupEntry2` (48 bytes each) |
+| `32` | `CreateBindGroup2` | `16 + 48 * entry_count` | `{ u32 id, u32 layout_id, u32 entry_count, u32 flags }` (`GpuCreateBindGroup2Payload`; `flags & BindingArrays (0x1)`: entries hold binding-array runs, set exactly when the layout has `GpuLayoutFlags::BindingArrays`) followed by `entry_count` `GpuBindGroupEntry2` (48 bytes each) |
 | `33` | `SetBindGroup2` | `16 + 4 * dynamic_offset_count` | `{ u32 group_index, u32 bind_group_id, u32 dynamic_offset_count, u32 reserved }` (`GpuSetBindGroup2Payload`) followed by `dynamic_offset_count` `u32` dynamic offsets |
 | `34` | `CreateSampler2` | `24` | `{ u32 id, u8 address_u, u8 address_v, u8 address_w, u8 mag_filter, u8 min_filter, u8 mipmap_filter, u8 compare, u8 reserved0, u16 max_anisotropy, u16 reserved1, f32 lod_min_clamp, f32 lod_max_clamp }` (`GpuCreateSampler2Payload`) |
 | `35` | `CreateTexture2` | `40` | `{ u32 id, u32 width, u32 height, u32 depth_or_layers, u32 mip_levels, u32 sample_count, u32 usage_flags, u8 dimension, u8 format, u8 view_format_count, u8 reserved, u8 view_formats[8] }` (`GpuCreateTexture2Payload`) |
@@ -134,6 +134,7 @@ v2 adds explicit bind group / pipeline layouts, full render pipeline keys, expli
 - **Layout ids.** S6 (`shaders/src/reflect.rs`, `layout-manifest.json`) identifies layouts by 64-bit content ids (`"0x"` + 16 hex digits, FNV-1a 64). Packets reference layouts by a `u32` runtime id; `content_id` carries the S6 id parsed as a `u64` (`0` when the layout did not come from the manifest). The producer allocates one runtime id per distinct `content_id` and never reuses it for another `content_id`. The worker keeps `content_id -> layout` so a layout may come from a packet or from the manifest:
   - `flags = 0`: the packet carries the entries; the worker creates the layout from them (and may reuse an identical object registered under the same non-zero `content_id`).
   - `flags & ManifestReference (0x1)`: the packet carries no entries (`entry_count` / `bind_group_layout_count` must be `0`); the worker binds `id` to the layout it loaded from `layout-manifest.json` under `content_id`.
+  - `CreateBindGroupLayout` `flags & BindingArrays (0x2)`: some entries are binding arrays (`binding_array_size >= 1`). Emitted only when the producer's device capability `BridgeOptions::binding_arrays` is set (the consumer supports `GPUBindGroupLayoutEntry.bindingArraySize`); off by default, a consumer that did not opt in never sees such a layout.
 
 ### `GpuBindGroupLayoutEntry` (24 bytes, one `GPUBindGroupLayoutEntry`)
 Same information as an S6 manifest entry, so manifest JSON and packets convert 1:1.
@@ -147,7 +148,8 @@ Same information as an S6 manifest entry, so manifest JSON and packets convert 1
 | `10` | `u8` | `view_dimension` (`GpuTextureViewDimension`, texture / storageTexture; `0` = `"2d"`) |
 | `11` | `u8` | `flags`: `0x1` buffer `hasDynamicOffset`, `0x2` texture `multisampled` |
 | `12` | `u8` | `storage_format` (storageTexture: texture format code) |
-| `13` | `u8[3]` | reserved (0) |
+| `13` | `u8` | reserved (0) |
+| `14` | `u16` | `binding_array_size`: `0` = not an array (the former reserved bytes); `N >= 1` = `GPUBindGroupLayoutEntry.bindingArraySize` N (WGSL `binding_array<T, N>`), only in layouts with `BindingArrays`; `N <= kGpuMaxBindingArraySize` (256) |
 | `16` | `u64` | `min_binding_size` (buffer `minBindingSize`) |
 
 ### `GpuTextureViewDesc` (16 bytes, a `GPUTextureViewDescriptor`)
@@ -166,6 +168,8 @@ An all-zero descriptor is the texture's default view.
 
 ### `GpuBindGroupEntry2` (48 bytes)
 The v1 `GpuBindGroupEntry` (offsets `0..32`: `binding`, `resource_type`, `resource_id`, `reserved`, `u64 offset`, `u64 size`) followed by a `GpuTextureViewDesc view` at offset `32` that describes the view for `TextureView` entries (sampled and storage textures). `resource_id == 0` is a null binding (D3D12 null descriptor): the worker binds a zero-filled resource compatible with the layout entry (buffer / 1×1 texture of the entry's sample type and view dimension / default sampler).
+
+Offset `12` (v1 `reserved`) is `u16 array_index` + `u16 reserved`. A binding array of `N` elements is a run of `N` consecutive entries with the same `binding` and `array_index` `0..N-1` (element `i` is `GPUBindGroupEntry` `binding + i` in WebGPU's binding-array numbering); each element may be null (`resource_id == 0`). `entry_count` counts every element. Outside binding arrays `array_index` is `0`.
 
 ### `CreateRenderPipeline2` and the render pipeline key
 `vs_module_id` / `fs_module_id` are `CreateShaderModule` ids (entry points `vs_main` / `fs_main` as in v1; `fs_module_id == 0` = no fragment shader, in which case the worker binds an empty fragment stage when `color_target_count > 0`). `pipeline_layout_id` is a `CreatePipelineLayout` id (`0` = `layout: "auto"`).

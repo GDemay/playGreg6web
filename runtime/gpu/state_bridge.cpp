@@ -253,6 +253,16 @@ uint32_t StateBridgeDevice::module_id(uint64_t shader_identity, bool* known) con
 
 void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t second_shader, PipelineLayoutDesc desc) {
     std::lock_guard lock(objects_mutex_);
+    // Binding arrays (G62) only for a consumer that binds them: otherwise the layout is refused
+    // (no layout registered: the pipeline falls back like an unknown one).
+    for (const GroupLayoutDesc& g : desc.groups) {
+        for (const LayoutBinding& b : g.bindings) {
+            if (b.entry.binding_array_size != 0 &&
+                (!options_.binding_arrays || b.entry.binding_array_size > kGpuMaxBindingArraySize)) {
+                return;
+            }
+        }
+    }
     std::vector<GroupLayoutRecord*> groups;
     for (GroupLayoutDesc& g : desc.groups) {
         std::stable_sort(g.bindings.begin(), g.bindings.end(), [](const LayoutBinding& a, const LayoutBinding& b) {
@@ -268,21 +278,37 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
                 b.entry.flags |= GpuBindGroupLayoutEntryFlags::HasDynamicOffset;
                 modified = true;
             }
-            record->entries.push_back(b.entry);
-            record->joins.push_back(b.join);
+            record->layout_entries.push_back(b.entry);
+            if (b.entry.binding_array_size == 0) {
+                b.join.array_size = 0;
+                b.join.array_index = 0;
+                record->entries.push_back(b.entry);
+                record->joins.push_back(b.join);
+                continue;
+            }
+            // Binding array: one bind group entry (and join) per element.
+            record->header.flags |= GpuLayoutFlags::BindingArrays;
+            b.join.array_size = b.entry.binding_array_size;
+            for (uint32_t k = 0; k < b.entry.binding_array_size; ++k) {
+                b.join.array_index = k;
+                record->entries.push_back(b.entry);
+                record->joins.push_back(b.join);
+            }
         }
         // A layout that differs from the manifest's no longer carries the manifest id.
         record->header.content_id = modified ? 0 : g.content_id;
-        record->header.entry_count = static_cast<uint32_t>(record->entries.size());
+        record->header.entry_count = static_cast<uint32_t>(record->layout_entries.size());
 
         GroupLayoutRecord* found = nullptr;
         for (const auto& existing : group_layouts_) {
             if (existing->header.content_id == record->header.content_id &&
+                existing->header.flags == record->header.flags &&
                 existing->entries.size() == record->entries.size() &&
+                existing->layout_entries.size() == record->layout_entries.size() &&
                 // memcmp with null pointers is undefined even for size 0 (both vectors empty).
-                (record->entries.empty() ||
-                 std::memcmp(existing->entries.data(), record->entries.data(),
-                             record->entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
+                (record->layout_entries.empty() ||
+                 std::memcmp(existing->layout_entries.data(), record->layout_entries.data(),
+                             record->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
                 const bool same_joins = std::equal(
                     existing->joins.begin(), existing->joins.end(), record->joins.begin(),
                     [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) { return d3d::same_join(a, b); });
@@ -337,8 +363,8 @@ void StateBridgeDevice::ensure_layout_emitted(PipelineLayoutRecord* layout, Comm
     for (GroupLayoutRecord* group : layout->groups) {
         if (!group->emitted) {
             encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &group->header, sizeof(group->header),
-                                group->entries.data(),
-                                static_cast<uint32_t>(group->entries.size() * sizeof(GpuBindGroupLayoutEntry)));
+                                group->layout_entries.data(),
+                                static_cast<uint32_t>(group->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)));
             group->emitted = true;
         }
         group_ids.push_back(group->id);
@@ -1120,6 +1146,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     header.id = device_.allocate_id();
     header.layout_id = group.id;
     header.entry_count = static_cast<uint32_t>(entries.size());
+    header.flags = (group.header.flags & GpuLayoutFlags::BindingArrays) != 0 ? GpuBindGroupFlags::BindingArrays : 0u;
     const uint32_t entry_bytes = static_cast<uint32_t>(entries.size() * sizeof(GpuBindGroupEntry2));
     encoder_.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(), entry_bytes);
     cached->gpu_id = header.id;
@@ -1168,6 +1195,7 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
                 header.id = m.built.gpu_id;
                 header.layout_id = m.group->id;
                 header.entry_count = static_cast<uint32_t>(entries.size());
+                header.flags = (m.group->header.flags & GpuLayoutFlags::BindingArrays) != 0 ? GpuBindGroupFlags::BindingArrays : 0u;
                 prelude.emit_packet(GpuOpcode::CreateBindGroup2, &header, sizeof(header), entries.data(),
                                     static_cast<uint32_t>(bytes));
             }
@@ -1208,6 +1236,9 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         const GpuBindGroupLayoutEntry& layout = group.entries[i];
         GpuBindGroupEntry2& out = entries[i];
         out.binding = layout.binding;
+        if (i < group.joins.size()) {
+            out.array_index = static_cast<uint16_t>(group.joins[i].array_index);  // 0 outside binding arrays
+        }
         switch (e.kind) {
         case d3d::BindResourceKind::Buffer:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);

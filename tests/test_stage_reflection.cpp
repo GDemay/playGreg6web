@@ -704,6 +704,29 @@ void test_lane_indexed_heap_sources() {
     CHECK(report.find("resource heap[(0 + lane) << 5] x 64") != std::string::npos);
     CHECK(report.find("sampler heap[(cb(root CBV at s11)[8] + lane) << 4] x 16") != std::string::npos);
 
+    // A consumer that binds binding arrays: both windows join as arrays of max_count heap descriptors.
+    bridge::PipelineLayoutDesc arrays;
+    report.clear();
+    JoinStats array_stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &arrays, &report, &array_stats,
+                               JoinOptions{true}));
+    CHECK(report.empty());
+    CHECK(array_stats.lane_indexed_bindings == 0 && array_stats.lane_indexed_arrays == 2);
+    CHECK(arrays.groups.size() == 1 && arrays.groups[0].bindings.size() == 2);
+    if (arrays.groups.size() == 1 && arrays.groups[0].bindings.size() == 2) {
+        const bridge::LayoutBinding& tex = arrays.groups[0].bindings[0];
+        CHECK(tex.entry.binding_array_size == 64 && tex.join.array_size == 64 && tex.join.array_index == 0);
+        CHECK(tex.join.heap == d3d::HeapAccess::Resource && tex.join.heap_shift == 5 &&
+              tex.join.heap_index_source == d3d::HeapIndexSource::Constant);
+        CHECK(tex.join.register_class == d3d::DescriptorRangeType::Srv);
+        const bridge::LayoutBinding& smp = arrays.groups[0].bindings[1];
+        CHECK(smp.entry.binding_array_size == 16 && smp.join.array_size == 16);
+        CHECK(smp.join.heap == d3d::HeapAccess::Sampler && smp.join.heap_shift == 4 &&
+              smp.join.heap_index_source == d3d::HeapIndexSource::CbRootDescriptor && smp.join.cb_byte_offset == 8 &&
+              smp.join.cb_bit_offset == 8 && smp.join.cb_mask == 255);
+        CHECK(smp.join.register_class == d3d::DescriptorRangeType::Sampler);
+    }
+
     // Malformed joins are not counted as lane-indexed: wrong heap for the kind, a window base that is
     // not a root CBV.
     StageReflection wrong = ps;

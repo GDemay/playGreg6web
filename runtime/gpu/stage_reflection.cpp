@@ -734,10 +734,12 @@ bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const Reflect
 }  // namespace
 
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
-                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats) {
+                          bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats,
+                          const JoinOptions& options) {
     std::map<std::pair<uint32_t, uint32_t>, bridge::LayoutBinding> joined;
     uint64_t outside_rs = 0;
     uint64_t lane_indexed = 0;
+    uint64_t lane_arrays = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -810,8 +812,10 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.cb_mask = b.cb_mask;
             } else if (b.source == ReflectedSource::LaneIndexedSamplerHeap ||
                        b.source == ReflectedSource::LaneIndexedResourceHeap) {
-                // Lane-indexed heap window (G62): validated like a CB-indexed source, then refused
-                // with its own reason: the bridge cannot bind a binding_array of descriptors yet.
+                // Lane-indexed heap window (G62): validated like a CB-indexed source. With a consumer
+                // that binds binding arrays (JoinOptions::binding_arrays) it joins as an array of
+                // lane_max_count heap descriptors starting at the window base; otherwise it is refused
+                // with its own reason.
                 const bool sampler_kind =
                     b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
                 if ((b.source == ReflectedSource::LaneIndexedSamplerHeap) != sampler_kind) {
@@ -820,20 +824,40 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                                 " heap");
                     continue;
                 }
+                int pi = -1;
+                d3d::HeapIndexSource from = d3d::HeapIndexSource::Constant;
+                uint32_t slot = 0;
                 if (b.lane_has_window_base) {
-                    int pi = -1;
-                    d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
-                    uint32_t slot = 0;
                     std::string why;
                     if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why)) {
                         fail(b, "window base: " + why);
                         continue;
                     }
                 }
-                ++lane_indexed;
-                fail(b, "lane-indexed heap window of " + std::to_string(b.lane_max_count) +
-                            " descriptors needs a binding array; the bridge cannot bind descriptor arrays yet");
-                continue;
+                if (!options.binding_arrays) {
+                    ++lane_indexed;
+                    fail(b, "lane-indexed heap window of " + std::to_string(b.lane_max_count) +
+                                " descriptors needs a binding array; the consumer does not bind binding arrays");
+                    continue;
+                }
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                          ? d3d::DescriptorRangeType::Uav
+                          : d3d::DescriptorRangeType::Srv;
+                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+                lb.join.heap_index_source = from;
+                lb.join.heap_shift = b.heap_shift;
+                lb.join.array_size = b.lane_max_count;
+                if (b.lane_has_window_base) {
+                    lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+                    lb.join.cb_table_slot = slot;
+                    lb.join.cb_byte_offset = b.cb_byte_offset;
+                    lb.join.cb_bit_offset = b.cb_bit_offset;
+                    lb.join.cb_mask = b.cb_mask;
+                }
+                lb.entry.binding_array_size = static_cast<uint16_t>(b.lane_max_count);
+                ++lane_arrays;
             } else if (b.source == ReflectedSource::InlineSampler) {
                 if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
                     fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
@@ -1048,6 +1072,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     *out = std::move(layout);
     if (stats != nullptr) {
         stats->table_slots_outside_rs += outside_rs;
+        stats->lane_indexed_arrays += lane_arrays;
     }
     return true;
 }
