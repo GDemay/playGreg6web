@@ -17,12 +17,33 @@
 
 namespace playgta6::gpu {
 
+inline constexpr size_t kShaderPackHeaderBytes = 16;
+inline constexpr size_t kShaderPackEntryBytes = 20;
+
 enum class PackStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };
 
 // Pack key -> stage. A key present for several stages keeps the first.
 using ShaderPackIndex = std::unordered_map<uint64_t, PackStage>;
 
-// Parses the header and entry table (payloads are not read). False + message when malformed.
+// Parses and validates the 16-byte WGPK header ("WGPK" magic, version == 1) and writes the entry
+// count to `out_count`. False + message when malformed.
+bool parse_shader_pack_header(const uint8_t* data,
+                              size_t size,
+                              uint32_t* out_count,
+                              std::string* error);
+
+// Parses the header and entry table from a TOC-only (or full-file) buffer without reading WGSL
+// payloads. Validates magic, version 1, `toc_size >= 16 + count * 20`, entry stages in 1..3,
+// non-overflowing 32-bit `offset + length`, and `offset >= 16 + count * 20` (unless `length == 0`).
+// When `total_file_size > 0`, also validates `uint64_t{offset} + length <= total_file_size`.
+bool parse_shader_pack_index_toc(const uint8_t* toc_data,
+                                 size_t toc_size,
+                                 uint64_t total_file_size,
+                                 ShaderPackIndex* out,
+                                 std::string* error);
+
+// Parses the header and entry table of a complete in-memory pack (payloads are not read).
+// Equivalent to `parse_shader_pack_index_toc(data, size, size, out, error)`.
 bool parse_shader_pack_index(const uint8_t* data, size_t size, ShaderPackIndex* out, std::string* error);
 
 // The hash-only CreateShaderModule code for a pack key ("0x" + 16 lowercase hex digits).
