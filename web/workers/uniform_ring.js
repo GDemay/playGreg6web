@@ -230,13 +230,16 @@
       const {
         device,
         byteSize,
+        capacityBytes,
         alignment,
-        maxByteSize = DEFAULT_MAX_BYTE_SIZE,
+        maxByteSize,
         framesInFlight = DEFAULT_FRAMES_IN_FLIGHT,
         maxBindingSize,
         minUniformBindingSize = DEFAULT_MIN_UNIFORM_BINDING_SIZE,
         allowEmptyPayloads = false,
         allowOverflow = false,
+        allowSpill,
+        maxRingBytes,
       } = options;
 
       if (!device || typeof device.createBuffer !== 'function') {
@@ -260,7 +263,19 @@
       const resolvedMaxBindingSize =
         maxBindingSize === undefined ? resolveDeviceMaxBindingSize(device) : maxBindingSize;
 
-      assertPositiveInteger(maxByteSize, 'maxByteSize');
+      const hasExplicitMaxByteSize = maxByteSize !== undefined;
+      const hasExplicitMaxRingBytes = maxRingBytes !== undefined;
+      const rawByteSize = byteSize !== undefined ? byteSize : capacityBytes;
+
+      if (hasExplicitMaxRingBytes) {
+        assertPositiveInteger(maxRingBytes, 'maxRingBytes');
+        if (maxRingBytes < resolvedAlignment) {
+          throw new RangeError(
+            `maxRingBytes (${maxRingBytes}) must be at least alignment (${resolvedAlignment})`
+          );
+        }
+      }
+
       assertPositiveInteger(framesInFlight, 'framesInFlight');
       assertPositiveInteger(resolvedMaxBindingSize, 'maxBindingSize');
       assertPositiveInteger(minUniformBindingSize, 'minUniformBindingSize');
@@ -276,39 +291,98 @@
         );
       }
 
-      if (maxByteSize < resolvedAlignment) {
-        throw new RangeError(
-          `maxByteSize (${maxByteSize}) must be at least alignment (${resolvedAlignment})`
-        );
+      const spillRequestedByOptions =
+        allowSpill === true || (allowSpill === undefined && hasExplicitMaxRingBytes);
+
+      let resolvedMaxByteSize;
+      if (hasExplicitMaxByteSize) {
+        assertPositiveInteger(maxByteSize, 'maxByteSize');
+        if (maxByteSize < resolvedAlignment) {
+          throw new RangeError(
+            `maxByteSize (${maxByteSize}) must be at least alignment (${resolvedAlignment})`
+          );
+        }
+        resolvedMaxByteSize = maxByteSize;
+      } else if (spillRequestedByOptions) {
+        resolvedMaxByteSize = null;
+      } else if (hasExplicitMaxRingBytes) {
+        resolvedMaxByteSize = Math.min(DEFAULT_MAX_BYTE_SIZE, maxRingBytes);
+      } else {
+        resolvedMaxByteSize = DEFAULT_MAX_BYTE_SIZE;
       }
 
       let resolvedByteSize;
-      if (byteSize === undefined) {
+      if (rawByteSize === undefined) {
+        const capBasis =
+          resolvedMaxByteSize !== null
+            ? resolvedMaxByteSize
+            : hasExplicitMaxRingBytes
+              ? maxRingBytes
+              : DEFAULT_MAX_BYTE_SIZE;
         const clampedMax =
-          Math.floor(maxByteSize / resolvedAlignment) * resolvedAlignment;
+          Math.floor(capBasis / resolvedAlignment) * resolvedAlignment;
         resolvedByteSize = Math.min(
           alignUp(DEFAULT_BYTE_SIZE, resolvedAlignment),
           clampedMax
         );
       } else {
-        assertPositiveInteger(byteSize, 'byteSize');
-        resolvedByteSize = alignUp(byteSize, resolvedAlignment);
-        if (resolvedByteSize > maxByteSize) {
+        assertPositiveInteger(rawByteSize, 'byteSize');
+        resolvedByteSize = alignUp(rawByteSize, resolvedAlignment);
+        if (resolvedMaxByteSize !== null && resolvedByteSize > resolvedMaxByteSize) {
           throw new RangeError(
-            `Aligned byteSize (${resolvedByteSize}) exceeds maxByteSize (${maxByteSize})`
+            `Aligned byteSize (${resolvedByteSize}) exceeds maxByteSize (${resolvedMaxByteSize})`
           );
         }
+      }
+
+      if (resolvedMaxByteSize === null) {
+        resolvedMaxByteSize = resolvedByteSize;
+      }
+
+      if (hasExplicitMaxRingBytes) {
+        if (maxRingBytes < resolvedByteSize) {
+          throw new RangeError(
+            `maxRingBytes (${maxRingBytes}) must be at least aligned byteSize (${resolvedByteSize})`
+          );
+        }
+        if (hasExplicitMaxByteSize && maxRingBytes < resolvedMaxByteSize) {
+          throw new RangeError(
+            `maxRingBytes (${maxRingBytes}) must be at least maxByteSize (${resolvedMaxByteSize})`
+          );
+        }
+      }
+
+      let resolvedAllowSpill;
+      if (allowSpill !== undefined) {
+        resolvedAllowSpill = Boolean(allowSpill);
+      } else if (hasExplicitMaxRingBytes && maxRingBytes > resolvedMaxByteSize) {
+        resolvedAllowSpill = true;
+      } else {
+        resolvedAllowSpill = false;
+      }
+
+      let resolvedMaxRingBytes;
+      if (hasExplicitMaxRingBytes) {
+        resolvedMaxRingBytes = maxRingBytes;
+      } else if (resolvedAllowSpill) {
+        resolvedMaxRingBytes = Math.max(DEFAULT_MAX_BYTE_SIZE, resolvedMaxByteSize);
+      } else if (allowOverflow) {
+        resolvedMaxRingBytes = null;
+      } else {
+        resolvedMaxRingBytes = resolvedMaxByteSize;
       }
 
       this.device = device;
       this.alignment = resolvedAlignment;
       this.deviceMinUniformBufferOffsetAlignment = deviceAlignment;
-      this.maxByteSize = maxByteSize;
+      this.maxByteSize = resolvedMaxByteSize;
       this.framesInFlight = framesInFlight;
       this.maxBindingSize = resolvedMaxBindingSize;
       this.minUniformBindingSize = resolvedMinUniformBindingSize;
       this.allowEmptyPayloads = Boolean(allowEmptyPayloads);
       this.allowOverflow = Boolean(allowOverflow);
+      this.allowSpill = resolvedAllowSpill;
+      this.maxRingBytes = resolvedMaxRingBytes;
 
       this._capacity = resolvedByteSize;
       this._shadow = new Uint8Array(resolvedByteSize);
@@ -320,6 +394,7 @@
       this._cursor = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._primaryFrameDrawCount = 0;
       this._frameOverflowBytes = 0;
       this._dirty = false;
 
@@ -327,6 +402,7 @@
       this._allocatedGpuBytes = 0;
       this._peakAllocatedGpuBytes = 0;
       this._peakUsedBytes = 0;
+      this._peakFrameBytes = 0;
       this._frameDrawCount = 0;
       this._totalDrawCount = 0;
       this._totalBytesPushed = 0;
@@ -334,6 +410,8 @@
       this._flushCount = 0;
       this._growCount = 0;
       this._overflowAllocCount = 0;
+      this._spillAllocations = 0;
+      this._spillPagesCreated = 0;
       this._sabCopyCount = 0;
       this._unalignedCopyCount = 0;
       this._wrapCount = 0;
@@ -360,6 +438,10 @@
     }
 
     get capacity() {
+      return this._capacity;
+    }
+
+    get capacityBytes() {
       return this._capacity;
     }
 
@@ -506,6 +588,33 @@
       this._overflowAllocCount += 1;
     }
 
+    _getSlotSpillBytes(slot) {
+      let bytes = 0;
+      if (slot && slot.overflowChunks) {
+        for (let i = 0; i < slot.overflowChunks.length; i += 1) {
+          bytes += slot.overflowChunks[i].byteSize;
+        }
+      }
+      return bytes;
+    }
+
+    _getSlotLiveBytes(slot) {
+      if (!slot) {
+        return 0;
+      }
+      return slot.byteSize + this._getSlotSpillBytes(slot);
+    }
+
+    _recordFramePeak() {
+      const totalUsed = this._cursor + this._frameOverflowBytes;
+      if (totalUsed > this._peakUsedBytes) {
+        this._peakUsedBytes = totalUsed;
+      }
+      if (totalUsed > this._peakFrameBytes) {
+        this._peakFrameBytes = totalUsed;
+      }
+    }
+
     _allocateOverflowSlice(slot, alignedSize) {
       let chunk =
         slot.overflowChunks.length > 0
@@ -514,10 +623,27 @@
 
       if (!chunk || alignUp(chunk.cursor, this.alignment) + alignedSize > chunk.byteSize) {
         const chunkIndex = slot.overflowChunks.length;
-        const chunkByteSize = alignUp(
+        const desiredPageSize = alignUp(
           Math.max(alignedSize, this._capacity),
           this.alignment
         );
+        let chunkByteSize = desiredPageSize;
+        if (this.maxRingBytes !== null) {
+          const liveBytes = this._getSlotLiveBytes(slot);
+          const remainingBytes = this.maxRingBytes - liveBytes;
+          const maxAlignedRemaining =
+            remainingBytes > 0
+              ? Math.floor(remainingBytes / this.alignment) * this.alignment
+              : 0;
+          if (maxAlignedRemaining < alignedSize) {
+            throw new RangeError(
+              `DynamicUniformRing maxRingBytes budget exceeded: need ${liveBytes + alignedSize} bytes ` +
+                `(live ${liveBytes} + ${alignedSize}), maxRingBytes is ${this.maxRingBytes} bytes`
+            );
+          }
+          chunkByteSize = Math.min(desiredPageSize, maxAlignedRemaining);
+        }
+
         const buffer = this._createGpuUniformBuffer(
           `playgta6-uniform-ring-slot-${slot.index}-overflow-${chunkIndex}`,
           chunkByteSize
@@ -534,6 +660,7 @@
         };
         slot.overflowChunks.push(chunk);
         this._overflowAllocCount += 1;
+        this._spillPagesCreated += 1;
       }
 
       const dynamicOffset = alignUp(chunk.cursor, this.alignment);
@@ -566,6 +693,22 @@
       return count;
     }
 
+    _countLiveSpillPages() {
+      let count = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        count += this._slots[i].overflowChunks.length;
+      }
+      return count;
+    }
+
+    _countLiveSpillBytes() {
+      let bytes = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        bytes += this._getSlotSpillBytes(this._slots[i]);
+      }
+      return bytes;
+    }
+
     /**
      * Pad a uniform slice byte length to a 4-byte multiple and at least
      * `this.minUniformBindingSize` (default 16B).
@@ -588,10 +731,7 @@
     beginFrame(frameIndex) {
       this._assertNotDestroyed();
 
-      const totalUsed = this._cursor + this._frameOverflowBytes;
-      if (totalUsed > this._peakUsedBytes) {
-        this._peakUsedBytes = totalUsed;
-      }
+      this._recordFramePeak();
 
       let nextFrame;
       if (frameIndex === undefined) {
@@ -606,6 +746,7 @@
       this._cursor = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._primaryFrameDrawCount = 0;
       this._frameOverflowBytes = 0;
       this._frameDrawCount = 0;
       this._dirty = false;
@@ -712,6 +853,7 @@
           this._shadow.fill(0, primaryDynamicOffset + size, primaryEndOffset);
         }
         this._cursor = primaryEndOffset;
+        this._primaryFrameDrawCount += 1;
         targetBuffer = slot.buffer;
         dynamicOffset = primaryDynamicOffset;
       } else if (primaryEndOffset <= this.maxByteSize) {
@@ -721,9 +863,10 @@
           this._shadow.fill(0, primaryDynamicOffset + size, primaryEndOffset);
         }
         this._cursor = primaryEndOffset;
+        this._primaryFrameDrawCount += 1;
         targetBuffer = slot.buffer;
         dynamicOffset = primaryDynamicOffset;
-      } else if (this.allowOverflow) {
+      } else if (this.allowSpill || this.allowOverflow) {
         const overflowAlloc = this._allocateOverflowSlice(slot, alignedSize);
         const chunk = overflowAlloc.chunk;
         dynamicOffset = overflowAlloc.dynamicOffset;
@@ -737,6 +880,7 @@
         chunk.drawCount += 1;
         chunk.dirty = true;
         this._frameOverflowBytes += alignedSize;
+        this._spillAllocations += 1;
 
         targetBuffer = chunk.buffer;
         isOverflow = true;
@@ -758,18 +902,17 @@
       this._frameDrawCount += 1;
       this._totalDrawCount += 1;
       this._totalBytesPushed += size;
-      const totalUsed = this._cursor + this._frameOverflowBytes;
-      if (totalUsed > this._peakUsedBytes) {
-        this._peakUsedBytes = totalUsed;
-      }
+      this._recordFramePeak();
 
       return {
         buffer: targetBuffer,
+        offset: dynamicOffset,
         dynamicOffset,
         size,
         paddedSize,
         alignedSize,
         overflow: isOverflow,
+        isSpill: isOverflow,
       };
     }
 
@@ -822,11 +965,7 @@
       if (hasPrimaryDirty) {
         const startOffset = this._flushedCursor;
         const primaryBytes = this._cursor - startOffset;
-        const overflowDrawsTotal = slot.overflowChunks.reduce(
-          (acc, c) => acc + c.drawCount,
-          0
-        );
-        const primaryDrawTotal = this._frameDrawCount - overflowDrawsTotal;
+        const primaryDrawTotal = this._primaryFrameDrawCount;
         const primaryDraws = primaryDrawTotal - this._flushedDrawCount;
         const shadowSlice = this._shadow.subarray(startOffset, this._cursor);
 
@@ -862,6 +1001,123 @@
       this._totalBytesUploaded += uploadedBytes;
 
       return { uploadedBytes, drawCount };
+    }
+
+    /**
+     * Reclaim and destroy auxiliary spill-page GPUBuffers across all slots (or a single
+     * specified `slotIndex`). Safe and idempotent to call on quiet frames or after GPU work
+     * completes.
+     *
+     * @param {number} [slotIndex]
+     * @returns {{ reclaimedPages: number, reclaimedBytes: number }}
+     */
+    reclaimSpillPages(slotIndex) {
+      this._assertNotDestroyed();
+      if (slotIndex !== undefined) {
+        assertNonNegativeInteger(slotIndex, 'slotIndex');
+        if (slotIndex >= this.framesInFlight) {
+          throw new RangeError(
+            `slotIndex (${slotIndex}) out of range [0, ${this.framesInFlight - 1}]`
+          );
+        }
+      }
+
+      let reclaimedPages = 0;
+      let reclaimedBytes = 0;
+      const start = slotIndex !== undefined ? slotIndex : 0;
+      const end = slotIndex !== undefined ? slotIndex + 1 : this._slots.length;
+
+      for (let i = start; i < end; i += 1) {
+        const slot = this._slots[i];
+        if (!slot || !slot.overflowChunks || slot.overflowChunks.length === 0) {
+          continue;
+        }
+        for (let j = 0; j < slot.overflowChunks.length; j += 1) {
+          const chunk = slot.overflowChunks[j];
+          reclaimedPages += 1;
+          reclaimedBytes += chunk.byteSize;
+          this._destroyRawBuffer(chunk.buffer, chunk.byteSize);
+          chunk.buffer = null;
+          chunk.shadow = null;
+        }
+        slot.overflowChunks.length = 0;
+      }
+
+      const activeSlot = this._slots[this._slotIndex];
+      let activeHasDirtySpill = false;
+      if (activeSlot && activeSlot.overflowChunks) {
+        for (let i = 0; i < activeSlot.overflowChunks.length; i += 1) {
+          const chunk = activeSlot.overflowChunks[i];
+          if (chunk.dirty && chunk.cursor > chunk.flushedCursor) {
+            activeHasDirtySpill = true;
+            break;
+          }
+        }
+      }
+      if (this._cursor <= this._flushedCursor && !activeHasDirtySpill) {
+        this._dirty = false;
+      }
+
+      return { reclaimedPages, reclaimedBytes };
+    }
+
+    /**
+     * Complete the active frame, updating peak frame utilization telemetry and reclaiming
+     * the active slot's spill pages unless `{ deferReclaim: true }` or
+     * `{ reclaimSpillPages: false }` is passed.
+     *
+     * @param {{ deferReclaim?: boolean, reclaimSpillPages?: boolean }} [options]
+     * @returns {{ frameIndex: number, slotIndex: number, frameBytes: number, reclaimedPages: number, reclaimedBytes: number }}
+     */
+    endFrame(options = {}) {
+      this._assertNotDestroyed();
+      this._recordFramePeak();
+
+      const frameBytes = this._cursor + this._frameOverflowBytes;
+      const shouldReclaim =
+        !(options && (options.deferReclaim === true || options.reclaimSpillPages === false));
+
+      let reclaimedPages = 0;
+      let reclaimedBytes = 0;
+      if (shouldReclaim) {
+        const res = this.reclaimSpillPages(this._slotIndex);
+        reclaimedPages = res.reclaimedPages;
+        reclaimedBytes = res.reclaimedBytes;
+      }
+
+      return {
+        frameIndex: this._frameIndex,
+        slotIndex: this._slotIndex,
+        frameBytes,
+        reclaimedPages,
+        reclaimedBytes,
+      };
+    }
+
+    /**
+     * Reset per-frame write state and destroy all live spill pages and retired buffers across
+     * all slots while preserving primary slot GPUBuffers and lifetime telemetry counters.
+     *
+     * @returns {{ reclaimedPages: number, reclaimedBytes: number }}
+     */
+    reset() {
+      this._assertNotDestroyed();
+      this._recordFramePeak();
+
+      const { reclaimedPages, reclaimedBytes } = this.reclaimSpillPages();
+      for (let i = 0; i < this._slots.length; i += 1) {
+        this._releaseSlotTransientBuffers(this._slots[i]);
+      }
+
+      this._cursor = 0;
+      this._flushedCursor = 0;
+      this._flushedDrawCount = 0;
+      this._primaryFrameDrawCount = 0;
+      this._frameOverflowBytes = 0;
+      this._frameDrawCount = 0;
+      this._dirty = false;
+
+      return { reclaimedPages, reclaimedBytes };
     }
 
     /**
@@ -1012,10 +1268,14 @@
         minUniformBindingSize: this.minUniformBindingSize,
         byteSize: this._capacity,
         maxByteSize: this.maxByteSize,
+        maxRingBytes: this.maxRingBytes,
         maxBindingSize: this.maxBindingSize,
         allowOverflow: this.allowOverflow,
+        allowSpill: this.allowSpill,
         usedBytes: this._cursor + this._frameOverflowBytes,
         peakUsedBytes: this._peakUsedBytes,
+        peakFrameBytes: this._peakFrameBytes,
+        peakUtilizationRatio: this._capacity > 0 ? this._peakFrameBytes / this._capacity : 0,
         allocatedGpuBytes: this._allocatedGpuBytes,
         peakAllocatedGpuBytes: this._peakAllocatedGpuBytes,
         frameDrawCount: this._frameDrawCount,
@@ -1026,6 +1286,10 @@
         growCount: this._growCount,
         overflowAllocCount: this._overflowAllocCount,
         overflowBufferCount: this._destroyed ? 0 : this._countLiveOverflowBuffers(),
+        spillAllocations: this._spillAllocations,
+        spillPagesCreated: this._spillPagesCreated,
+        liveSpillPages: this._destroyed ? 0 : this._countLiveSpillPages(),
+        liveSpillBytes: this._destroyed ? 0 : this._countLiveSpillBytes(),
         sabCopyCount: this._sabCopyCount,
         unalignedCopyCount: this._unalignedCopyCount,
         wrapCount: this._wrapCount,
@@ -1055,6 +1319,7 @@
       this._cursor = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._primaryFrameDrawCount = 0;
       this._frameOverflowBytes = 0;
       this._frameDrawCount = 0;
       this._dirty = false;
