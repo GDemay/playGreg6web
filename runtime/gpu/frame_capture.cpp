@@ -13,6 +13,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 
 namespace playgta6::gpu {
 
@@ -430,6 +431,7 @@ void frame_capture_observe(const uint8_t* data, size_t len) {
     CaptureState& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.open) {
+        os::win32::HostStallScope stall;  // capture payload writes/flushes block the submitting guest thread
         observe_locked(s, data, len);
     }
 }
@@ -440,6 +442,7 @@ void frame_capture_finish() {
     if (!s.open) {
         return;
     }
+    os::win32::HostStallScope stall;
     if (s.config.attach) {
         os::set_wgpu_submit_observer(nullptr);
     }
