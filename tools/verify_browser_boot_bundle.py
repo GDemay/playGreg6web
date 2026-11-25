@@ -8,8 +8,11 @@ and Chrome/Edge:
    - Verifies `runtime.js` and `runtime.wasm` exist inside `--web-dist` (regular
      files, no escaping symlinks).
    - Validates `runtime.wasm` via `tools/check_wasm_exports.py` (`memory64`,
-     shared memory, 5/5 `env.host_*` ABI imports) and checks
-     `size <= 1,073,741,824` bytes (V8's 1 GiB `WebAssembly.instantiate()` cap).
+     shared memory, 5/5 `env.host_*` ABI imports), parses its Wasm export
+     section (section id `7`) for `playgta6_get_input_state_ptr` /
+     `_playgta6_get_input_state_ptr` and `playgta6_audio_ring` /
+     `_playgta6_audio_ring` (`#1028`), and checks `size <= 1,073,741,824` bytes
+     (V8's 1 GiB `WebAssembly.instantiate()` cap).
    - Discovers top-level sibling side modules (`guest_part_*.wasm` / `*.wasm`,
      naturally sorted, skipping escaping symlinks), verifies each has valid
      `\\0asm` magic (version 1) and `size <= 1,073,741,824` bytes (`v8_limit_ok`),
@@ -85,6 +88,22 @@ BINK2_MODULE_KEY = "bink2scarlett"
 WASM_MAGIC = b"\x00asm"
 WASM_VERSION = 1
 WASM_HEADER_BYTES = 8
+WASM_SECTION_EXPORT = 7
+WASM_EXPORT_KIND_FUNC = 0x00
+WASM_EXPORT_VALID_KINDS: frozenset[int] = frozenset({0x00, 0x01, 0x02, 0x03, 0x04})
+INPUT_STATE_EXPORT_NAMES: tuple[str, ...] = (
+    "playgta6_get_input_state_ptr",
+    "_playgta6_get_input_state_ptr",
+)
+AUDIO_RING_EXPORT_NAMES: tuple[str, ...] = (
+    "playgta6_audio_ring",
+    "_playgta6_audio_ring",
+)
+MAIN_EXPORT_NAMES: tuple[str, ...] = (
+    "main",
+    "_main",
+    "__main_argc_argv",
+)
 
 PROGRAM_MANIFEST_NAME = "program-manifest.json"
 BOOT_MANIFEST_NAME = "boot-manifest.json"
@@ -101,6 +120,9 @@ WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
 WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
 WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
 WGPK_VALID_STAGES: frozenset[int] = frozenset({1, 2, 3})
+WGPK_MAX_U32 = 0xFFFFFFFF
+WGPK_MAX_ENTRY_ERRORS = 8
+SPLASH_PACK_NAME = "splash.wgsl.pack"
 
 REFLECT_SIDECAR_SUFFIX = ".reflect.json"
 REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
@@ -588,10 +610,146 @@ def inspect_guest_manifest(web_dist: Path) -> tuple[dict[str, Any], list[str]]:
     return info, warnings
 
 
+def _read_uleb128_u32(
+    buf: memoryview,
+    pos: int,
+    end: int,
+    *,
+    context: str,
+) -> tuple[int, int]:
+    """Decode an unsigned 32-bit LEB128 integer from `buf[pos:end]`."""
+    result = 0
+    shift = 0
+    for byte_idx in range(5):
+        if pos >= end:
+            raise ValueError(f"truncated ULEB128 while reading {context}")
+        byte = buf[pos]
+        pos += 1
+        if byte_idx == 4:
+            if byte & 0x80:
+                raise ValueError(f"overlong ULEB128 while reading {context}")
+            if byte & 0xF0:
+                raise ValueError(f"ULEB128 u32 overflow while reading {context}")
+        result |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            return result, pos
+        shift += 7
+    raise ValueError(f"overlong ULEB128 while reading {context}")
+
+
+def parse_wasm_export_section(
+    data: bytes | bytearray | memoryview,
+) -> list[tuple[str, int, int]]:
+    """Pure-Python parser for Wasm export section (section id `7`).
+
+    Validates the 8-byte `\\0asm` v1 header, skips all non-export sections by
+    their LEB128 byte length, and decodes `(name, kind_code, index)` tuples from
+    section id `7` when present.
+    """
+    view = memoryview(data)
+    total = len(view)
+    if total < WASM_HEADER_BYTES:
+        raise ValueError(
+            f"Wasm binary truncated: expected at least {WASM_HEADER_BYTES} bytes, got {total}"
+        )
+    if bytes(view[0:4]) != WASM_MAGIC:
+        raise ValueError("invalid Wasm magic (expected \\x00asm)")
+    (version,) = struct.unpack_from("<I", view, 4)
+    if version != WASM_VERSION:
+        raise ValueError(f"unsupported Wasm version {version} (expected {WASM_VERSION})")
+
+    pos = WASM_HEADER_BYTES
+    exports: list[tuple[str, int, int]] = []
+    while pos < total:
+        sec_id = view[pos]
+        pos += 1
+        sec_size, pos = _read_uleb128_u32(
+            view, pos, total, context=f"section {sec_id} size"
+        )
+        sec_end = pos + sec_size
+        if sec_end > total:
+            raise ValueError(
+                f"truncated Wasm section {sec_id}: need {sec_size} bytes, "
+                f"only {total - pos} available"
+            )
+        if sec_id == WASM_SECTION_EXPORT:
+            cur = pos
+            export_count, cur = _read_uleb128_u32(
+                view, cur, sec_end, context="export count"
+            )
+            for idx in range(export_count):
+                name_len, cur = _read_uleb128_u32(
+                    view, cur, sec_end, context=f"export[{idx}] name length"
+                )
+                name_end = cur + name_len
+                if name_end > sec_end:
+                    raise ValueError(
+                        f"truncated Wasm export[{idx}] name: need {name_len} bytes"
+                    )
+                try:
+                    name = bytes(view[cur:name_end]).decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"invalid UTF-8 in Wasm export[{idx}] name") from exc
+                cur = name_end
+                if cur >= sec_end:
+                    raise ValueError(f"truncated Wasm export[{idx}] kind")
+                kind_code = view[cur]
+                cur += 1
+                if kind_code not in WASM_EXPORT_VALID_KINDS:
+                    raise ValueError(
+                        f"unknown Wasm export[{idx}] kind 0x{kind_code:02x}"
+                    )
+                export_index, cur = _read_uleb128_u32(
+                    view, cur, sec_end, context=f"export[{idx}] index"
+                )
+                exports.append((name, int(kind_code), int(export_index)))
+            if cur != sec_end:
+                raise ValueError(
+                    f"trailing {sec_end - cur} byte(s) in Wasm export section"
+                )
+        pos = sec_end
+
+    return exports
+
+
+def _match_func_export(
+    func_exports: set[str],
+    candidates: Sequence[str],
+) -> str | None:
+    for name in candidates:
+        if name in func_exports:
+            return name
+    return None
+
+
+def inspect_wasm_runtime_exports(
+    data: bytes | bytearray | memoryview,
+) -> dict[str, Any]:
+    """Inspect Wasm export section (id `7`) for interactive runtime ABI exports."""
+    exports = parse_wasm_export_section(data)
+    func_exports = {
+        name for name, kind_code, _index in exports if kind_code == WASM_EXPORT_KIND_FUNC
+    }
+    main_name = _match_func_export(func_exports, MAIN_EXPORT_NAMES)
+    input_name = _match_func_export(func_exports, INPUT_STATE_EXPORT_NAMES)
+    audio_name = _match_func_export(func_exports, AUDIO_RING_EXPORT_NAMES)
+    return {
+        "exports_count": len(exports),
+        "has_main_export": main_name is not None,
+        "main_export_name": main_name,
+        "has_input_state_export": input_name is not None,
+        "input_state_export_name": input_name,
+        "has_audio_ring_export": audio_name is not None,
+        "audio_ring_export_name": audio_name,
+    }
+
+
 def verify_web_dist(
     web_dist: Path,
     *,
     max_module_bytes: int = V8_MAX_WASM_MODULE_BYTES,
+    require_audio_ring: bool = False,
+    require_input_state: bool = False,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     """Verify `runtime.js`, `runtime.wasm` (ABI + V8 cap), and any sibling side modules."""
     errors: list[str] = []
@@ -618,6 +776,10 @@ def verify_web_dist(
         "missing_host_imports": [],
         "mismatched_host_imports": [],
         "exports_count": 0,
+        "has_input_state_export": False,
+        "input_state_export_name": None,
+        "has_audio_ring_export": False,
+        "audio_ring_export_name": None,
         "errors": [],
         "warnings": [],
     }
@@ -764,6 +926,70 @@ def verify_web_dist(
                     runtime_wasm_info["warnings"].extend(val_warnings)
                     errors.extend(val_errors)
                     warnings.extend(val_warnings)
+
+                    try:
+                        export_probe = inspect_wasm_runtime_exports(raw_bytes)
+                    except ValueError as exc:
+                        msg = sanitize_text(
+                            f"runtime.wasm export section parse error: {exc}"
+                        )
+                        runtime_wasm_info["errors"].append(msg)
+                        errors.append(msg)
+                    else:
+                        has_input = bool(export_probe["has_input_state_export"])
+                        has_audio = bool(export_probe["has_audio_ring_export"])
+                        has_main = bool(export_probe["has_main_export"])
+                        runtime_wasm_info["has_input_state_export"] = has_input
+                        runtime_wasm_info["input_state_export_name"] = export_probe[
+                            "input_state_export_name"
+                        ]
+                        runtime_wasm_info["has_audio_ring_export"] = has_audio
+                        runtime_wasm_info["audio_ring_export_name"] = export_probe[
+                            "audio_ring_export_name"
+                        ]
+                        # Treat linked guest binaries (exporting main/_main or at
+                        # least one interactive ABI accessor) as expecting both
+                        # playgta6_get_input_state_ptr and playgta6_audio_ring;
+                        # minimal smoke fixtures remain warning-free unless
+                        # explicitly required via --require-input-state /
+                        # --require-audio-ring.
+                        expects_linked_exports = has_main or has_input or has_audio
+
+                        if not has_input:
+                            if require_input_state:
+                                msg = (
+                                    "runtime.wasm missing required function export "
+                                    "'playgta6_get_input_state_ptr' / "
+                                    "'_playgta6_get_input_state_ptr'"
+                                )
+                                runtime_wasm_info["errors"].append(msg)
+                                errors.append(msg)
+                            elif expects_linked_exports:
+                                msg = (
+                                    "runtime.wasm missing function export "
+                                    "'playgta6_get_input_state_ptr' / "
+                                    "'_playgta6_get_input_state_ptr' "
+                                    "(input SAB bridge disabled)"
+                                )
+                                runtime_wasm_info["warnings"].append(msg)
+                                warnings.append(msg)
+
+                        if not has_audio:
+                            if require_audio_ring:
+                                msg = (
+                                    "runtime.wasm missing required function export "
+                                    "'playgta6_audio_ring' / '_playgta6_audio_ring' (#1028)"
+                                )
+                                runtime_wasm_info["errors"].append(msg)
+                                errors.append(msg)
+                            elif expects_linked_exports:
+                                msg = (
+                                    "runtime.wasm missing function export "
+                                    "'playgta6_audio_ring' / '_playgta6_audio_ring' "
+                                    "(#1028 guest PCM audio ring disabled)"
+                                )
+                                runtime_wasm_info["warnings"].append(msg)
+                                warnings.append(msg)
 
             runtime_wasm_info["ok"] = bool(
                 runtime_wasm_info["v8_limit_ok"]
@@ -1276,13 +1502,21 @@ def verify_boot_dir(boot_dir: Path) -> tuple[dict[str, Any], list[str], list[str
 
 def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, Any], list[str]]:
     """Safely validate a `.wgsl.pack` (`WGPK` v1) binary matching `shaders/src/pack.rs`."""
+    safe_name = sanitize_text(pack_name)
     errors: list[str] = []
     warnings: list[str] = []
     size_bytes = 0
     magic_ok = False
+    header_ok = False
+    table_ok = False
+    bounds_ok = False
     version: int | None = None
     entry_count: int | None = None
     flags: int | None = None
+    data_start_offset: int | None = None
+    max_payload_end: int | None = None
+    out_of_bounds_entries = 0
+    invalid_stage_entries = 0
 
     try:
         size_bytes = get_file_size(pack_path)
@@ -1290,12 +1524,19 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
         errors.append(_sanitize_os_error(pack_name, exc))
         return (
             {
-                "name": sanitize_text(pack_name),
+                "name": safe_name,
                 "size_bytes": 0,
                 "magic_ok": False,
+                "header_ok": False,
+                "table_ok": False,
+                "bounds_ok": False,
                 "version": None,
                 "entry_count": None,
                 "flags": None,
+                "data_start_offset": None,
+                "max_payload_end": None,
+                "out_of_bounds_entries": 0,
+                "invalid_stage_entries": 0,
                 "ok": False,
                 "errors": errors,
             },
@@ -1304,7 +1545,7 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
 
     if size_bytes < WGPK_HEADER_BYTES:
         errors.append(
-            f"{sanitize_text(pack_name)} truncated: {size_bytes} bytes "
+            f"{safe_name} truncated: {size_bytes} bytes "
             f"(minimum WGPK header is {WGPK_HEADER_BYTES} bytes)"
         )
     else:
@@ -1313,13 +1554,13 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                 header = fh.read(WGPK_HEADER_BYTES)
                 if len(header) < WGPK_HEADER_BYTES:
                     errors.append(
-                        f"{sanitize_text(pack_name)} truncated while reading WGPK header"
+                        f"{safe_name} truncated while reading WGPK header"
                     )
                 else:
                     magic, ver, count, hdr_flags = WGPK_HEADER_STRUCT.unpack_from(header, 0)
                     if magic != WGPK_MAGIC:
                         errors.append(
-                            f"{sanitize_text(pack_name)} has invalid magic (expected 'WGPK')"
+                            f"{safe_name} has invalid magic (expected 'WGPK')"
                         )
                     else:
                         magic_ok = True
@@ -1329,15 +1570,17 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
 
                         if ver != WGPK_VERSION:
                             errors.append(
-                                f"{sanitize_text(pack_name)} has unsupported WGPK version {ver} "
+                                f"{safe_name} has unsupported WGPK version {ver} "
                                 f"(expected {WGPK_VERSION})"
                             )
                         else:
+                            header_ok = True
                             table_bytes = count * WGPK_ENTRY_BYTES
                             data_start = WGPK_HEADER_BYTES + table_bytes
+                            data_start_offset = data_start
                             if data_start > size_bytes:
                                 errors.append(
-                                    f"{sanitize_text(pack_name)} truncated entry table: "
+                                    f"{safe_name} truncated entry table: "
                                     f"entry_count={count} requires {data_start} bytes, "
                                     f"file is {size_bytes} bytes"
                                 )
@@ -1347,42 +1590,91 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                                 table_raw = fh.read(table_bytes)
                                 if len(table_raw) < table_bytes:
                                     errors.append(
-                                        f"{sanitize_text(pack_name)} truncated while reading entry table"
+                                        f"{safe_name} truncated while reading entry table"
                                     )
                                 else:
+                                    table_ok = True
+                                    highest_end = data_start
+                                    entry_errors_reported = 0
+                                    suppressed_entry_errors = 0
                                     for idx in range(count):
                                         base = idx * WGPK_ENTRY_BYTES
                                         _h, stage_raw, _res, offset, length = (
                                             WGPK_ENTRY_STRUCT.unpack_from(table_raw, base)
                                         )
                                         if stage_raw not in WGPK_VALID_STAGES:
-                                            errors.append(
-                                                f"{sanitize_text(pack_name)} entry {idx} has "
-                                                f"invalid shader stage {stage_raw}"
-                                            )
-                                            break
-                                        if offset < data_start or (offset + length) > size_bytes:
-                                            errors.append(
-                                                f"{sanitize_text(pack_name)} entry {idx} payload "
-                                                f"[{offset}..+{length}] exceeds pack bounds "
-                                                f"[{data_start}..{size_bytes}]"
-                                            )
-                                            break
-                                if count == 0 and not errors:
-                                    warnings.append(
-                                        f"{sanitize_text(pack_name)} contains 0 shader entries"
-                                    )
+                                            invalid_stage_entries += 1
+                                            if entry_errors_reported < WGPK_MAX_ENTRY_ERRORS:
+                                                errors.append(
+                                                    f"{safe_name} entry {idx} has "
+                                                    f"invalid shader stage {stage_raw}"
+                                                )
+                                                entry_errors_reported += 1
+                                            else:
+                                                suppressed_entry_errors += 1
+
+                                        payload_end = offset + length
+                                        if (
+                                            offset < data_start
+                                            or payload_end > WGPK_MAX_U32
+                                            or payload_end > size_bytes
+                                        ):
+                                            out_of_bounds_entries += 1
+                                            if entry_errors_reported < WGPK_MAX_ENTRY_ERRORS:
+                                                if offset < data_start:
+                                                    reason = (
+                                                        f"overlaps header/entry table "
+                                                        f"(offset {offset} < data_start {data_start})"
+                                                    )
+                                                elif payload_end > WGPK_MAX_U32:
+                                                    reason = (
+                                                        f"range overflows uint32 "
+                                                        f"[{offset}..+{length}]"
+                                                    )
+                                                else:
+                                                    reason = (
+                                                        f"exceeds pack bounds "
+                                                        f"[{data_start}..{size_bytes}]"
+                                                    )
+                                                errors.append(
+                                                    f"{safe_name} entry {idx} payload "
+                                                    f"[{offset}..+{length}] {reason}"
+                                                )
+                                                entry_errors_reported += 1
+                                            else:
+                                                suppressed_entry_errors += 1
+                                        elif payload_end > highest_end:
+                                            highest_end = payload_end
+
+                                    if suppressed_entry_errors > 0:
+                                        errors.append(
+                                            f"{safe_name} has {suppressed_entry_errors} "
+                                            f"additional invalid/out-of-bounds entry error(s)"
+                                        )
+                                    max_payload_end = highest_end
+                                    bounds_ok = out_of_bounds_entries == 0
+                                    if count == 0 and not errors:
+                                        warnings.append(
+                                            f"{safe_name} contains 0 shader entries"
+                                        )
         except OSError as exc:
             errors.append(_sanitize_os_error(pack_name, exc))
 
     return (
         {
-            "name": sanitize_text(pack_name),
+            "name": safe_name,
             "size_bytes": size_bytes,
             "magic_ok": magic_ok,
+            "header_ok": header_ok,
+            "table_ok": table_ok,
+            "bounds_ok": bounds_ok,
             "version": version,
             "entry_count": entry_count,
             "flags": flags,
+            "data_start_offset": data_start_offset,
+            "max_payload_end": max_payload_end,
+            "out_of_bounds_entries": out_of_bounds_entries,
+            "invalid_stage_entries": invalid_stage_entries,
             "ok": len(errors) == 0,
             "errors": errors,
         },
@@ -1584,6 +1876,10 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
         "status": "fail",
         "pack_count": 0,
         "valid_pack_count": 0,
+        "all_pack_bounds_ok": False,
+        "out_of_bounds_entries": 0,
+        "splash_pack_present": False,
+        "splash_pack_ok": None,
         "skipped_escaping_symlinks": 0,
         "total_pack_bytes": 0,
         "total_shader_entries": 0,
@@ -1695,11 +1991,18 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
     valid_count = 0
     total_bytes = 0
     total_entries = 0
+    total_oob_entries = 0
+    splash_present = False
+    splash_ok: bool | None = None
     for pack_name, pack_path in candidates:
         info, pack_warnings = inspect_wgsl_pack_file(pack_name, pack_path)
         packs.append(info)
         warnings.extend(pack_warnings)
         total_bytes += int(info["size_bytes"])
+        total_oob_entries += int(info.get("out_of_bounds_entries", 0))
+        if pack_name.lower() == SPLASH_PACK_NAME:
+            splash_present = True
+            splash_ok = bool(info["ok"])
         if info["ok"]:
             valid_count += 1
             total_entries += int(info["entry_count"] or 0)
@@ -1709,6 +2012,12 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
     section["packs"] = packs
     section["pack_count"] = len(packs)
     section["valid_pack_count"] = valid_count
+    section["all_pack_bounds_ok"] = bool(packs) and all(
+        bool(p.get("bounds_ok")) for p in packs
+    )
+    section["out_of_bounds_entries"] = total_oob_entries
+    section["splash_pack_present"] = splash_present
+    section["splash_pack_ok"] = splash_ok
     section["total_pack_bytes"] = total_bytes
     section["total_shader_entries"] = total_entries
     section["status"] = "pass" if len(errors) == 0 else "fail"
@@ -1741,6 +2050,10 @@ def _empty_shaders_section() -> dict[str, Any]:
         "status": "skipped",
         "pack_count": 0,
         "valid_pack_count": 0,
+        "all_pack_bounds_ok": False,
+        "out_of_bounds_entries": 0,
+        "splash_pack_present": False,
+        "splash_pack_ok": None,
         "skipped_escaping_symlinks": 0,
         "total_pack_bytes": 0,
         "total_shader_entries": 0,
@@ -1761,6 +2074,8 @@ def verify_browser_boot_bundle(
     boot_dir: Path | str | None = None,
     shaders_dir: Path | str | None = None,
     strict: bool = False,
+    require_audio_ring: bool = False,
+    require_input_state: bool = False,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     max_module_bytes: int = V8_MAX_WASM_MODULE_BYTES,
 ) -> dict[str, Any]:
@@ -1776,6 +2091,8 @@ def verify_browser_boot_bundle(
     wasm_section, wasm_errors, wasm_warnings = verify_web_dist(
         web_dist_path,
         max_module_bytes=max_module_bytes,
+        require_audio_ring=require_audio_ring,
+        require_input_state=require_input_state,
     )
     errors.extend(wasm_errors)
     warnings.extend(wasm_warnings)
@@ -1852,7 +2169,9 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"memory64={'YES' if rt_wasm.get('is_memory64') else 'NO'}, "
         f"shared={'YES' if rt_wasm.get('is_shared_memory') else 'NO'}, "
         f"host_imports={rt_wasm.get('host_imports_valid', 0)}/"
-        f"{rt_wasm.get('host_imports_total', 0)})",
+        f"{rt_wasm.get('host_imports_total', 0)}, "
+        f"input_state={'YES' if rt_wasm.get('has_input_state_export') else 'NO'}, "
+        f"audio_ring={'YES' if rt_wasm.get('has_audio_ring_export') else 'NO'})",
     ]
 
     for mod in side_modules:
@@ -1900,7 +2219,8 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                 f"    pack {pack.get('name')}: {'OK' if pack.get('ok') else 'FAIL'} "
                 f"({pack.get('size_bytes', 0)} bytes, "
                 f"magic={'WGPK' if pack.get('magic_ok') else 'BAD'}, "
-                f"entries={pack.get('entry_count')})"
+                f"entries={pack.get('entry_count')}, "
+                f"bounds={'OK' if pack.get('bounds_ok') else 'FAIL'})"
             )
         if int(shaders.get("reflect_sidecar_count", 0)) > 0:
             lines.append(
@@ -1966,6 +2286,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat any warning (e.g. skipped escaping symlinks or empty shader packs) as a failure.",
     )
+    parser.add_argument(
+        "--require-audio-ring",
+        action="store_true",
+        help="Fail unless runtime.wasm exports playgta6_audio_ring / _playgta6_audio_ring (#1028).",
+    )
+    parser.add_argument(
+        "--require-input-state",
+        action="store_true",
+        help="Fail unless runtime.wasm exports playgta6_get_input_state_ptr / _playgta6_get_input_state_ptr.",
+    )
     return parser
 
 
@@ -1978,6 +2308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         boot_dir=args.boot_dir,
         shaders_dir=args.shaders_dir,
         strict=args.strict,
+        require_audio_ring=args.require_audio_ring,
+        require_input_state=args.require_input_state,
     )
 
     if args.as_json:
