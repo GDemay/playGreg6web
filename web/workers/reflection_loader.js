@@ -18,6 +18,35 @@
   /** Maximum valid bit-shift for S34 dynamic descriptor-heap index calculations (0..31). */
   const MAX_HEAP_INDEX_SHIFT = 31;
 
+  /** Console ABI user-data SGPR bases & descriptor-table slot size (runtime/gpu/stage_reflection.h). */
+  const GRAPHICS_USER_DATA_BASE = 8;
+  const COMPUTE_USER_DATA_BASE = 4;
+  const TABLE_SLOT_BYTES = 32;
+  const UNBOUNDED_DESCRIPTOR_COUNT = 0xffffffff;
+  const DESCRIPTOR_RANGE_OFFSET_APPEND = 0xffffffff;
+
+  /** WebGPU / WGSL buffer min_binding_size_bytes alignments (bytes). */
+  const UNIFORM_MIN_BINDING_SIZE_ALIGNMENT = 16;
+  const STORAGE_MIN_BINDING_SIZE_ALIGNMENT = 4;
+
+  /** Structured mismatch diagnostic codes emitted by diagnoseStageBindings(). */
+  const DIAGNOSTIC_CODES = Object.freeze({
+    MISSING_SOURCE: 'MISSING_SOURCE',
+    INVALID_SOURCE: 'INVALID_SOURCE',
+    UNKNOWN_BINDING_KIND: 'UNKNOWN_BINDING_KIND',
+    ROOT_PARAMETER_NOT_FOUND: 'ROOT_PARAMETER_NOT_FOUND',
+    ROOT_PARAMETER_TYPE_MISMATCH: 'ROOT_PARAMETER_TYPE_MISMATCH',
+    TABLE_OFFSET_UNALIGNED: 'TABLE_OFFSET_UNALIGNED',
+    TABLE_DESCRIPTOR_MISSING: 'TABLE_DESCRIPTOR_MISSING',
+    DESCRIPTOR_TYPE_MISMATCH: 'DESCRIPTOR_TYPE_MISMATCH',
+    STATIC_SAMPLER_MISSING: 'STATIC_SAMPLER_MISSING',
+    HEAP_INDEX_NOT_ROOT_CONSTANT: 'HEAP_INDEX_NOT_ROOT_CONSTANT',
+    HEAP_KIND_MISMATCH: 'HEAP_KIND_MISMATCH',
+    MISSING_STORAGE_FORMAT: 'MISSING_STORAGE_FORMAT',
+    MIN_BINDING_SIZE_MISALIGNED: 'MIN_BINDING_SIZE_MISALIGNED',
+    MIN_BINDING_SIZE_UNEXPECTED: 'MIN_BINDING_SIZE_UNEXPECTED',
+  });
+
   /** WebGPU GPUShaderStage bitmask constants with headless/Node fallbacks. */
   const SHADER_STAGE_BITS = Object.freeze({
     VERTEX:
@@ -923,6 +952,37 @@
 
     const source = parseBindingSource(raw.source, `${path}.source`);
 
+    let minBindingSizeBytes = null;
+    const rawMinBindingSizeBytes =
+      raw.min_binding_size_bytes !== undefined
+        ? raw.min_binding_size_bytes
+        : raw.minBindingSizeBytes;
+    if (rawMinBindingSizeBytes !== undefined && rawMinBindingSizeBytes !== null) {
+      if (!isNonNegativeInt(rawMinBindingSizeBytes)) {
+        throw new ManifestValidationError(
+          `min_binding_size_bytes must be a non-negative uint32 safe integer, got ${JSON.stringify(rawMinBindingSizeBytes)}`,
+          `${path}.min_binding_size_bytes`
+        );
+      }
+      minBindingSizeBytes = rawMinBindingSizeBytes;
+    }
+
+    let storageFormat = null;
+    const rawStorageFormat =
+      raw.storage_format !== undefined ? raw.storage_format : raw.storageFormat;
+    if (rawStorageFormat !== undefined && rawStorageFormat !== null) {
+      if (
+        (typeof rawStorageFormat !== 'string' || rawStorageFormat.length === 0) &&
+        !isNonNegativeInt(rawStorageFormat)
+      ) {
+        throw new ManifestValidationError(
+          `storage_format must be a non-empty string or non-negative integer, got ${JSON.stringify(rawStorageFormat)}`,
+          `${path}.storage_format`
+        );
+      }
+      storageFormat = rawStorageFormat;
+    }
+
     return {
       group: raw.group,
       binding: raw.binding,
@@ -937,6 +997,10 @@
       binding_array: bindingArray,
       bindingArray,
       source,
+      min_binding_size_bytes: minBindingSizeBytes,
+      minBindingSizeBytes,
+      storage_format: storageFormat,
+      storageFormat,
       layoutEntry: null,
     };
   }
@@ -2074,6 +2138,1414 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Stage Reflection Join Diagnostics & Static-Sampler Fallback Metadata (W171)
+  // ---------------------------------------------------------------------------
+
+  const STAGE_REFLECTION_KIND_MAP = Object.freeze({
+    uniform: 'uniform',
+    storage: 'storage',
+    read_only_storage: 'read_only_storage',
+    'read-only-storage': 'read_only_storage',
+    texture: 'texture',
+    texture_2d: 'texture',
+    storage_texture: 'storage_texture',
+    'storage-texture': 'storage_texture',
+    storagetexture: 'storage_texture',
+    sampler: 'sampler',
+    comparison_sampler: 'comparison_sampler',
+    'comparison-sampler': 'comparison_sampler',
+    sampler_comparison: 'comparison_sampler',
+  });
+
+  const ACCEPTED_DESCRIPTOR_CLASSES = Object.freeze({
+    uniform: Object.freeze(['cbv', 'srv']),
+    read_only_storage: Object.freeze(['srv', 'uav', 'cbv']),
+    storage: Object.freeze(['uav']),
+    storage_texture: Object.freeze(['uav']),
+    texture: Object.freeze(['srv']),
+    sampler: Object.freeze(['sampler']),
+    comparison_sampler: Object.freeze(['sampler']),
+  });
+
+  const DESCRIPTOR_CLASS_LABELS = Object.freeze({
+    cbv: 'CBV',
+    srv: 'SRV',
+    uav: 'UAV',
+    sampler: 'sampler',
+  });
+
+  function formatDescriptorClass(cls) {
+    return DESCRIPTOR_CLASS_LABELS[cls] || String(cls);
+  }
+
+  function normalizeDiagnosticStage(rawStage) {
+    if (typeof rawStage !== 'string') {
+      return null;
+    }
+    const lower = rawStage.trim().toLowerCase();
+    if (lower === 'pixel') return 'fragment';
+    if (lower === 'vertex' || lower === 'fragment' || lower === 'compute') return lower;
+    return null;
+  }
+
+  function normalizeRootParameterType(rawType) {
+    if (typeof rawType === 'number' && Number.isInteger(rawType)) {
+      if (rawType === 0) return 'table';
+      if (rawType === 1) return 'constants';
+      if (rawType === 2) return 'cbv';
+      if (rawType === 3) return 'srv';
+      if (rawType === 4) return 'uav';
+      return null;
+    }
+    if (typeof rawType !== 'string') return null;
+    const lower = rawType.trim().toLowerCase();
+    if (lower === 'table' || lower === 'descriptor_table' || lower === 'descriptortable') {
+      return 'table';
+    }
+    if (
+      lower === 'constants' ||
+      lower === 'root_constants' ||
+      lower === 'rootconstants' ||
+      lower === 'constants32bit' ||
+      lower === '32bit_constants'
+    ) {
+      return 'constants';
+    }
+    if (lower === 'cbv' || lower === 'root_cbv' || lower === 'rootcbv') return 'cbv';
+    if (lower === 'srv' || lower === 'root_srv' || lower === 'rootsrv') return 'srv';
+    if (lower === 'uav' || lower === 'root_uav' || lower === 'rootuav') return 'uav';
+    return null;
+  }
+
+  function normalizeDescriptorRangeType(rawType) {
+    if (typeof rawType === 'number' && Number.isInteger(rawType)) {
+      if (rawType === 0) return 'srv';
+      if (rawType === 1) return 'uav';
+      if (rawType === 2) return 'cbv';
+      if (rawType === 3) return 'sampler';
+      return null;
+    }
+    if (typeof rawType !== 'string') return null;
+    const lower = rawType.trim().toLowerCase();
+    if (lower === 'srv' || lower === 't') return 'srv';
+    if (lower === 'uav' || lower === 'u') return 'uav';
+    if (lower === 'cbv' || lower === 'b') return 'cbv';
+    if (lower === 'sampler' || lower === 's') return 'sampler';
+    return null;
+  }
+
+  function normalizeDescriptorRange(rawRange, path) {
+    if (!isPlainObject(rawRange)) {
+      throw new TypeError(`${path} must be an object`);
+    }
+    const rawType =
+      rawRange.type !== undefined
+        ? rawRange.type
+        : rawRange.range_type !== undefined
+          ? rawRange.range_type
+          : rawRange.rangeType;
+    const type = normalizeDescriptorRangeType(rawType);
+    if (!type) {
+      throw new TypeError(`${path}.type has unsupported descriptor range type ${JSON.stringify(rawType)}`);
+    }
+
+    const rawCount =
+      rawRange.count !== undefined
+        ? rawRange.count
+        : rawRange.num_descriptors !== undefined
+          ? rawRange.num_descriptors
+          : rawRange.numDescriptors !== undefined
+            ? rawRange.numDescriptors
+            : 1;
+    let count;
+    if (
+      rawCount === -1 ||
+      rawCount === Infinity ||
+      rawCount === UNBOUNDED_DESCRIPTOR_COUNT ||
+      rawCount === 'unbounded' ||
+      rawCount === null
+    ) {
+      count = UNBOUNDED_DESCRIPTOR_COUNT;
+    } else if (isNonNegativeInt(rawCount)) {
+      count = rawCount;
+    } else {
+      throw new TypeError(`${path}.count must be a non-negative integer or unbounded (-1), got ${JSON.stringify(rawCount)}`);
+    }
+
+    const rawBaseReg =
+      rawRange.base_register !== undefined
+        ? rawRange.base_register
+        : rawRange.base_shader_register !== undefined
+          ? rawRange.base_shader_register
+          : rawRange.baseShaderRegister !== undefined
+            ? rawRange.baseShaderRegister
+            : rawRange.register !== undefined
+              ? rawRange.register
+              : 0;
+    if (!isNonNegativeInt(rawBaseReg)) {
+      throw new TypeError(`${path}.base_register must be a non-negative integer, got ${JSON.stringify(rawBaseReg)}`);
+    }
+
+    const rawSpace =
+      rawRange.space !== undefined
+        ? rawRange.space
+        : rawRange.register_space !== undefined
+          ? rawRange.register_space
+          : rawRange.registerSpace !== undefined
+            ? rawRange.registerSpace
+            : 0;
+    if (!isNonNegativeInt(rawSpace)) {
+      throw new TypeError(`${path}.space must be a non-negative integer, got ${JSON.stringify(rawSpace)}`);
+    }
+
+    const rawOffset =
+      rawRange.offset !== undefined
+        ? rawRange.offset
+        : rawRange.offset_in_descriptors_from_table_start !== undefined
+          ? rawRange.offset_in_descriptors_from_table_start
+          : rawRange.offsetInDescriptorsFromTableStart;
+    let offset;
+    if (
+      rawOffset === undefined ||
+      rawOffset === null ||
+      rawOffset === -1 ||
+      rawOffset === DESCRIPTOR_RANGE_OFFSET_APPEND ||
+      rawOffset === 'append'
+    ) {
+      offset = DESCRIPTOR_RANGE_OFFSET_APPEND;
+    } else if (isNonNegativeInt(rawOffset)) {
+      offset = rawOffset;
+    } else {
+      throw new TypeError(`${path}.offset must be a non-negative integer or append (-1), got ${JSON.stringify(rawOffset)}`);
+    }
+
+    return {
+      type,
+      count,
+      baseRegister: rawBaseReg,
+      space: rawSpace,
+      offset,
+    };
+  }
+
+  function normalizeRootSignatureSpec(rootSignatureSpec, defaultUserDataBase, options = {}) {
+    if (!isPlainObject(rootSignatureSpec)) {
+      throw new TypeError('rootSignatureSpec must be an object');
+    }
+
+    const rawUserDataBase =
+      options.userDataBase !== undefined
+        ? options.userDataBase
+        : rootSignatureSpec.userDataBase !== undefined
+          ? rootSignatureSpec.userDataBase
+          : rootSignatureSpec.user_data_base !== undefined
+            ? rootSignatureSpec.user_data_base
+            : defaultUserDataBase;
+    if (!isNonNegativeInt(rawUserDataBase)) {
+      throw new RangeError(`userDataBase must be a non-negative integer, got ${JSON.stringify(rawUserDataBase)}`);
+    }
+
+    const rawTableSlotBytes =
+      options.tableSlotBytes !== undefined
+        ? options.tableSlotBytes
+        : rootSignatureSpec.tableSlotBytes !== undefined
+          ? rootSignatureSpec.tableSlotBytes
+          : rootSignatureSpec.table_slot_bytes !== undefined
+            ? rootSignatureSpec.table_slot_bytes
+            : TABLE_SLOT_BYTES;
+    if (!isNonNegativeInt(rawTableSlotBytes) || rawTableSlotBytes <= 0) {
+      throw new RangeError(
+        `tableSlotBytes must be a positive integer, got ${JSON.stringify(rawTableSlotBytes)}`
+      );
+    }
+
+    const rawParams =
+      rootSignatureSpec.parameters !== undefined
+        ? rootSignatureSpec.parameters
+        : rootSignatureSpec.root_parameters !== undefined
+          ? rootSignatureSpec.root_parameters
+          : rootSignatureSpec.rootParameters !== undefined
+            ? rootSignatureSpec.rootParameters
+            : [];
+    if (!Array.isArray(rawParams)) {
+      throw new TypeError('rootSignatureSpec.parameters must be an array');
+    }
+
+    const parameters = [];
+    let currentSgpr = rawUserDataBase;
+    for (let i = 0; i < rawParams.length; i += 1) {
+      const rawParam = rawParams[i];
+      const pPath = `rootSignatureSpec.parameters[${i}]`;
+      if (!isPlainObject(rawParam)) {
+        throw new TypeError(`${pPath} must be an object`);
+      }
+      const rawType =
+        rawParam.type !== undefined
+          ? rawParam.type
+          : rawParam.parameter_type !== undefined
+            ? rawParam.parameter_type
+            : rawParam.parameterType;
+      const type = normalizeRootParameterType(rawType);
+      if (!type) {
+        throw new TypeError(`${pPath}.type has unsupported root parameter type ${JSON.stringify(rawType)}`);
+      }
+
+      const rawExplicitSgpr =
+        rawParam.user_sgpr !== undefined ? rawParam.user_sgpr : rawParam.userSgpr;
+      let startSgpr = currentSgpr;
+      if (rawExplicitSgpr !== undefined && rawExplicitSgpr !== null) {
+        if (!isNonNegativeInt(rawExplicitSgpr)) {
+          throw new TypeError(`${pPath}.user_sgpr must be a non-negative integer`);
+        }
+        startSgpr = rawExplicitSgpr;
+      }
+
+      let dwords;
+      let num32BitValues = 0;
+      let ranges = [];
+      const shaderRegister =
+        rawParam.shader_register !== undefined
+          ? rawParam.shader_register
+          : rawParam.shaderRegister !== undefined
+            ? rawParam.shaderRegister
+            : rawParam.register !== undefined
+              ? rawParam.register
+              : 0;
+      const registerSpace =
+        rawParam.register_space !== undefined
+          ? rawParam.register_space
+          : rawParam.registerSpace !== undefined
+            ? rawParam.registerSpace
+            : rawParam.space !== undefined
+              ? rawParam.space
+              : 0;
+
+      if (type === 'table') {
+        dwords = 1;
+        const rawRanges =
+          rawParam.ranges !== undefined
+            ? rawParam.ranges
+            : rawParam.descriptor_ranges !== undefined
+              ? rawParam.descriptor_ranges
+              : rawParam.descriptorRanges !== undefined
+                ? rawParam.descriptorRanges
+                : [];
+        if (!Array.isArray(rawRanges)) {
+          throw new TypeError(`${pPath}.ranges must be an array`);
+        }
+        ranges = rawRanges.map((r, rIdx) => normalizeDescriptorRange(r, `${pPath}.ranges[${rIdx}]`));
+      } else if (type === 'constants') {
+        const rawNum =
+          rawParam.num_32bit_values !== undefined
+            ? rawParam.num_32bit_values
+            : rawParam.num32BitValues !== undefined
+              ? rawParam.num32BitValues
+              : rawParam.numValues !== undefined
+                ? rawParam.numValues
+                : rawParam.dwords !== undefined
+                  ? rawParam.dwords
+                  : rawParam.count !== undefined
+                    ? rawParam.count
+                    : 1;
+        if (!isNonNegativeInt(rawNum)) {
+          throw new TypeError(`${pPath}.num_32bit_values must be a non-negative integer, got ${JSON.stringify(rawNum)}`);
+        }
+        num32BitValues = rawNum;
+        dwords = rawNum;
+      } else {
+        dwords = 2;
+      }
+
+      parameters.push({
+        index: i,
+        type,
+        startSgpr,
+        endSgpr: startSgpr + dwords,
+        dwords,
+        num32BitValues,
+        shaderRegister: isNonNegativeInt(shaderRegister) ? shaderRegister : 0,
+        registerSpace: isNonNegativeInt(registerSpace) ? registerSpace : 0,
+        ranges,
+      });
+      currentSgpr = startSgpr + dwords;
+    }
+
+    const rawStaticSamplers =
+      rootSignatureSpec.static_samplers !== undefined
+        ? rootSignatureSpec.static_samplers
+        : rootSignatureSpec.staticSamplers;
+    let staticSamplerCount = 0;
+    let staticSamplers = null;
+    if (rawStaticSamplers === undefined || rawStaticSamplers === null) {
+      staticSamplerCount = 0;
+      staticSamplers = [];
+    } else if (Array.isArray(rawStaticSamplers)) {
+      staticSamplerCount = rawStaticSamplers.length;
+      staticSamplers = rawStaticSamplers;
+    } else if (isNonNegativeInt(rawStaticSamplers)) {
+      staticSamplerCount = rawStaticSamplers;
+      staticSamplers = null;
+    } else {
+      throw new TypeError(
+        `rootSignatureSpec.static_samplers must be an array or non-negative integer, got ${JSON.stringify(rawStaticSamplers)}`
+      );
+    }
+
+    return {
+      userDataBase: rawUserDataBase,
+      tableSlotBytes: rawTableSlotBytes,
+      parameters,
+      staticSamplerCount,
+      staticSamplers,
+    };
+  }
+
+  function resolveTableSlot(param, slot) {
+    let next = 0;
+    for (let i = 0; i < param.ranges.length; i += 1) {
+      const r = param.ranges[i];
+      const start = r.offset === DESCRIPTOR_RANGE_OFFSET_APPEND ? next : r.offset;
+      const unbounded = r.count === UNBOUNDED_DESCRIPTOR_COUNT;
+      if (slot >= start && (unbounded || slot < start + r.count)) {
+        return {
+          cls: r.type,
+          shaderRegister: r.baseRegister + (slot - start),
+          registerSpace: r.space,
+          rangeIndex: i,
+        };
+      }
+      next = unbounded ? Number.MAX_SAFE_INTEGER : start + r.count;
+    }
+    return null;
+  }
+
+  function findRootParameterStartingAt(parameters, userSgpr) {
+    for (let i = 0; i < parameters.length; i += 1) {
+      if (parameters[i].startSgpr === userSgpr) {
+        return parameters[i];
+      }
+    }
+    return null;
+  }
+
+  function findRootParameterCovering(parameters, userSgpr) {
+    for (let i = 0; i < parameters.length; i += 1) {
+      const p = parameters[i];
+      if (userSgpr >= p.startSgpr && userSgpr < p.endSgpr) {
+        return p;
+      }
+    }
+    return null;
+  }
+
+  function isNormalizedBindingSource(rawSource) {
+    if (!isPlainObject(rawSource) || typeof rawSource.kind !== 'string') {
+      return false;
+    }
+    switch (rawSource.kind) {
+      case 'table':
+        return isNonNegativeInt(rawSource.userSgpr) && isNonNegativeInt(rawSource.tableByteOffset);
+      case 'root_constants':
+      case 'root_descriptor':
+        return isNonNegativeInt(rawSource.userSgpr);
+      case 'static_sampler':
+        return isNonNegativeInt(rawSource.index);
+      case 'sampler_heap':
+      case 'resource_heap':
+        return (
+          isNonNegativeInt(rawSource.baseUserSgpr) &&
+          isNonNegativeInt(rawSource.stride) &&
+          rawSource.stride > 0 &&
+          isNonNegativeInt(rawSource.indexUserSgpr) &&
+          isNonNegativeInt(rawSource.indexShift) &&
+          rawSource.indexShift <= MAX_HEAP_INDEX_SHIFT
+        );
+      default:
+        return false;
+    }
+  }
+
+  function resolveDiagnosticBindingKind(binding, layoutEntry) {
+    if (binding.kind !== undefined && binding.kind !== null) {
+      if (typeof binding.kind === 'string') {
+        const mapped = STAGE_REFLECTION_KIND_MAP[binding.kind.trim().toLowerCase()];
+        if (mapped) {
+          return { kind: mapped, rawKind: binding.kind };
+        }
+      }
+      return { kind: null, rawKind: binding.kind };
+    }
+
+    const entry = layoutEntry || (isPlainObject(binding.layoutEntry) ? binding.layoutEntry : null);
+    if (entry) {
+      if (entry.buffer) {
+        const mapped = STAGE_REFLECTION_KIND_MAP[String(entry.buffer.type || 'uniform').toLowerCase()];
+        return { kind: mapped || 'uniform', rawKind: entry.buffer.type || 'uniform' };
+      }
+      if (entry.texture) {
+        return { kind: 'texture', rawKind: 'texture' };
+      }
+      if (entry.storageTexture) {
+        return { kind: 'storage_texture', rawKind: 'storageTexture' };
+      }
+      if (entry.sampler) {
+        return {
+          kind: entry.sampler.type === 'comparison' ? 'comparison_sampler' : 'sampler',
+          rawKind: entry.sampler.type || 'sampler',
+        };
+      }
+    }
+
+    if (binding.buffer) {
+      const mapped = STAGE_REFLECTION_KIND_MAP[String(binding.buffer.type || 'uniform').toLowerCase()];
+      return { kind: mapped || 'uniform', rawKind: binding.buffer.type || 'uniform' };
+    }
+    if (binding.texture) {
+      return { kind: 'texture', rawKind: 'texture' };
+    }
+    if (binding.storageTexture || binding.storage_texture) {
+      return { kind: 'storage_texture', rawKind: 'storageTexture' };
+    }
+    if (binding.sampler) {
+      return {
+        kind: binding.sampler.type === 'comparison' ? 'comparison_sampler' : 'sampler',
+        rawKind: binding.sampler.type || 'sampler',
+      };
+    }
+
+    if (typeof binding.resource === 'string') {
+      const res = binding.resource.trim();
+      if (res === 'texture') return { kind: 'texture', rawKind: res };
+      if (res === 'storageTexture') return { kind: 'storage_texture', rawKind: res };
+      if (res === 'sampler') return { kind: 'sampler', rawKind: res };
+      if (res === 'buffer') {
+        if (binding.root_constants === true || binding.rootConstants === true) {
+          return { kind: 'uniform', rawKind: res };
+        }
+        if (binding.register && binding.register.class === 'b') {
+          return { kind: 'uniform', rawKind: res };
+        }
+        if (binding.register && binding.register.class === 't') {
+          return { kind: 'read_only_storage', rawKind: res };
+        }
+        if (binding.register && binding.register.class === 'u') {
+          return { kind: 'storage', rawKind: res };
+        }
+        return { kind: 'uniform', rawKind: res };
+      }
+    }
+
+    return { kind: null, rawKind: binding.resource !== undefined ? binding.resource : null };
+  }
+
+  function formatBindingSourceKey(group, binding, source) {
+    const base = `@group(${group}) @binding(${binding})`;
+    if (!source) return base;
+    switch (source.kind) {
+      case 'table':
+        return `${base} <- table at s${source.userSgpr} + ${source.tableByteOffset}`;
+      case 'root_constants':
+        return `${base} <- root constants at s${source.userSgpr}`;
+      case 'root_descriptor':
+        return `${base} <- root descriptor at s${source.userSgpr}`;
+      case 'static_sampler':
+        return `${base} <- static sampler ${source.index}`;
+      case 'sampler_heap':
+        return `${base} <- sampler heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
+      case 'resource_heap':
+        return `${base} <- resource heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
+      default:
+        return base;
+    }
+  }
+
+  function extractStaticSamplerComparisonMode(staticSamplerDesc) {
+    if (!isPlainObject(staticSamplerDesc)) return null;
+    if (typeof staticSamplerDesc.comparison === 'boolean') {
+      return staticSamplerDesc.comparison;
+    }
+    if (typeof staticSamplerDesc.isComparison === 'boolean') {
+      return staticSamplerDesc.isComparison;
+    }
+    if (typeof staticSamplerDesc.type === 'string') {
+      const lower = staticSamplerDesc.type.trim().toLowerCase();
+      if (lower === 'comparison') return true;
+      if (lower === 'filtering' || lower === 'non-filtering') return false;
+    }
+    if (typeof staticSamplerDesc.compare === 'string' && staticSamplerDesc.compare.length > 0) {
+      return true;
+    }
+    return null;
+  }
+
+  function buildStaticSamplerFallbackEntry(bindingInfo, staticSamplerIndex, reason, detailMessage) {
+    const isComparison = bindingInfo.kind === 'comparison_sampler';
+    const samplerType = isComparison ? 'comparison' : 'filtering';
+    const fallbackDescriptor = isComparison
+      ? {
+          label:
+            staticSamplerIndex !== null
+              ? `fallback_static_sampler_${staticSamplerIndex}_comparison`
+              : `fallback_sampler_g${bindingInfo.group}_b${bindingInfo.binding}_comparison`,
+          addressModeU: 'clamp-to-edge',
+          addressModeV: 'clamp-to-edge',
+          addressModeW: 'clamp-to-edge',
+          magFilter: 'linear',
+          minFilter: 'linear',
+          mipmapFilter: 'nearest',
+          compare: 'less-equal',
+          maxAnisotropy: 1,
+        }
+      : {
+          label:
+            staticSamplerIndex !== null
+              ? `fallback_static_sampler_${staticSamplerIndex}_filtering`
+              : `fallback_sampler_g${bindingInfo.group}_b${bindingInfo.binding}_filtering`,
+          addressModeU: 'clamp-to-edge',
+          addressModeV: 'clamp-to-edge',
+          addressModeW: 'clamp-to-edge',
+          magFilter: 'linear',
+          minFilter: 'linear',
+          mipmapFilter: 'linear',
+          maxAnisotropy: 1,
+        };
+
+    return {
+      group: bindingInfo.group,
+      binding: bindingInfo.binding,
+      name: bindingInfo.name,
+      kind: bindingInfo.kind,
+      samplerType,
+      staticSamplerIndex,
+      reason,
+      message: detailMessage,
+      fallbackDescriptor,
+    };
+  }
+
+  function buildGroupLayoutLookup(stageReflection) {
+    const lookup = new Map();
+    if (isPlainObject(stageReflection) && Array.isArray(stageReflection.bindGroupLayouts)) {
+      for (let i = 0; i < stageReflection.bindGroupLayouts.length; i += 1) {
+        const bgl = stageReflection.bindGroupLayouts[i];
+        if (!bgl || !Array.isArray(bgl.entries)) continue;
+        const group = isNonNegativeInt(bgl.group) ? bgl.group : i;
+        for (let j = 0; j < bgl.entries.length; j += 1) {
+          const entry = bgl.entries[j];
+          if (entry && isNonNegativeInt(entry.binding)) {
+            lookup.set(`${group}:${entry.binding}`, entry);
+          }
+        }
+      }
+    }
+    return lookup;
+  }
+
+  function extractMinBindingSizeBytes(rawBinding, layoutEntry) {
+    if (rawBinding.min_binding_size_bytes !== undefined && rawBinding.min_binding_size_bytes !== null) {
+      return rawBinding.min_binding_size_bytes;
+    }
+    if (rawBinding.minBindingSizeBytes !== undefined && rawBinding.minBindingSizeBytes !== null) {
+      return rawBinding.minBindingSizeBytes;
+    }
+    if (rawBinding.min_binding_size !== undefined && rawBinding.min_binding_size !== null) {
+      return rawBinding.min_binding_size;
+    }
+    if (rawBinding.minBindingSize !== undefined && rawBinding.minBindingSize !== null) {
+      return rawBinding.minBindingSize;
+    }
+    if (layoutEntry && layoutEntry.buffer && layoutEntry.buffer.minBindingSize !== undefined) {
+      return layoutEntry.buffer.minBindingSize;
+    }
+    if (rawBinding.buffer && rawBinding.buffer.minBindingSize !== undefined) {
+      return rawBinding.buffer.minBindingSize;
+    }
+    return null;
+  }
+
+  /**
+   * Detect reflected sampler slots whose `static_sampler` index is missing from `rootSignatureSpec`
+   * (and optionally missing descriptor-table sampler slots) and synthesize default WebGPU
+   * filtering / comparison sampler fallback metadata for callers.
+   *
+   * @param {object} stageReflection
+   * @param {object | null | undefined} [rootSignatureSpec]
+   * @param {{ includeMissingTableSamplers?: boolean, compute?: boolean, userDataBase?: number, tableSlotBytes?: number }} [options]
+   * @returns {{
+   *   needed: boolean,
+   *   count: number,
+   *   filteringCount: number,
+   *   comparisonCount: number,
+   *   slots: Array<object>,
+   *   bySlot: Map<string, object>,
+   *   byStaticSamplerIndex: Map<number, object>
+   * }}
+   */
+  function synthesizeMissingStaticSamplers(stageReflection, rootSignatureSpec = null, options = {}) {
+    if (!isPlainObject(stageReflection)) {
+      throw new TypeError('stageReflection must be an object');
+    }
+    if (options !== undefined && !isPlainObject(options)) {
+      throw new TypeError('options must be an object');
+    }
+
+    const stage = normalizeDiagnosticStage(stageReflection.stage) || 'fragment';
+    const compute =
+      typeof options.compute === 'boolean' ? options.compute : stage === 'compute';
+    const defaultBase = compute ? COMPUTE_USER_DATA_BASE : GRAPHICS_USER_DATA_BASE;
+    const normalizedRs =
+      rootSignatureSpec !== null && rootSignatureSpec !== undefined
+        ? normalizeRootSignatureSpec(rootSignatureSpec, defaultBase, options)
+        : normalizeRootSignatureSpec({ parameters: [], static_samplers: [] }, defaultBase, options);
+
+    const includeMissingTableSamplers = Boolean(options.includeMissingTableSamplers);
+    const includeExcludedBindings = Boolean(options.includeExcludedBindings);
+    const layoutLookup = buildGroupLayoutLookup(stageReflection);
+    const bindings = Array.isArray(stageReflection.bindings) ? stageReflection.bindings : [];
+
+    const slots = [];
+    const bySlot = new Map();
+    const byStaticSamplerIndex = new Map();
+    let filteringCount = 0;
+    let comparisonCount = 0;
+
+    for (let i = 0; i < bindings.length; i += 1) {
+      const raw = bindings[i];
+      if (!isPlainObject(raw)) continue;
+      if (!includeExcludedBindings && (raw.in_layout === false || raw.inLayout === false)) {
+        continue;
+      }
+
+      const group = isNonNegativeInt(raw.group) ? raw.group : 0;
+      const binding = isNonNegativeInt(raw.binding) ? raw.binding : i;
+      const name = typeof raw.name === 'string' ? raw.name : null;
+      const layoutEntry =
+        (isPlainObject(raw.layoutEntry) ? raw.layoutEntry : null) ||
+        layoutLookup.get(`${group}:${binding}`) ||
+        null;
+      const { kind } = resolveDiagnosticBindingKind(raw, layoutEntry);
+      if (kind !== 'sampler' && kind !== 'comparison_sampler') {
+        continue;
+      }
+
+      let source = null;
+      if (raw.source !== undefined && raw.source !== null) {
+        if (isNormalizedBindingSource(raw.source)) {
+          source = raw.source;
+        } else {
+          try {
+            source = parseBindingSource(raw.source, `bindings[${i}].source`);
+          } catch (_err) {
+            continue;
+          }
+        }
+      }
+      if (!source) continue;
+
+      let fallbackEntry = null;
+      if (source.kind === 'static_sampler') {
+        const idx = source.index;
+        const missing =
+          idx >= normalizedRs.staticSamplerCount ||
+          (Array.isArray(normalizedRs.staticSamplers) &&
+            (normalizedRs.staticSamplers[idx] === null ||
+              normalizedRs.staticSamplers[idx] === undefined));
+        if (missing) {
+          const key = formatBindingSourceKey(group, binding, source);
+          fallbackEntry = buildStaticSamplerFallbackEntry(
+            { group, binding, name, kind },
+            idx,
+            DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING,
+            `${key}: missing static sampler ${idx} (root signature defines ${normalizedRs.staticSamplerCount}); synthesize default ${kind === 'comparison_sampler' ? 'comparison' : 'filtering'} sampler`
+          );
+          if (!byStaticSamplerIndex.has(idx)) {
+            byStaticSamplerIndex.set(idx, fallbackEntry);
+          }
+        }
+      } else if (includeMissingTableSamplers && source.kind === 'table') {
+        const param = findRootParameterStartingAt(normalizedRs.parameters, source.userSgpr);
+        const misaligned = source.tableByteOffset % normalizedRs.tableSlotBytes !== 0;
+        const slotInfo =
+          param && param.type === 'table' && !misaligned
+            ? resolveTableSlot(param, source.tableByteOffset / normalizedRs.tableSlotBytes)
+            : null;
+        if (!slotInfo || slotInfo.cls !== 'sampler') {
+          const key = formatBindingSourceKey(group, binding, source);
+          fallbackEntry = buildStaticSamplerFallbackEntry(
+            { group, binding, name, kind },
+            null,
+            !param
+              ? DIAGNOSTIC_CODES.ROOT_PARAMETER_NOT_FOUND
+              : param.type !== 'table'
+                ? DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH
+                : misaligned
+                  ? DIAGNOSTIC_CODES.TABLE_OFFSET_UNALIGNED
+                  : !slotInfo
+                    ? DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING
+                    : DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+            `${key}: table sampler slot unavailable; synthesize default ${kind === 'comparison_sampler' ? 'comparison' : 'filtering'} sampler`
+          );
+        }
+      }
+
+      if (fallbackEntry) {
+        slots.push(fallbackEntry);
+        bySlot.set(`${group}:${binding}`, fallbackEntry);
+        if (fallbackEntry.samplerType === 'comparison') {
+          comparisonCount += 1;
+        } else {
+          filteringCount += 1;
+        }
+      }
+    }
+
+    slots.sort((a, b) => a.group - b.group || a.binding - b.binding);
+
+    return {
+      needed: slots.length > 0,
+      count: slots.length,
+      filteringCount,
+      comparisonCount,
+      slots,
+      bySlot,
+      byStaticSamplerIndex,
+    };
+  }
+
+  /**
+   * Validate each reflected binding's `source` (`table`, `static_sampler`, `root_constants`,
+   * `root_descriptor`, `sampler_heap`, `resource_heap`), descriptor class compatibility,
+   * storage texture format presence, and `min_binding_size_bytes` alignment against a D3D12
+   * root signature layout, returning structured mismatch diagnostics.
+   *
+   * @param {object} stageReflection
+   * @param {object} rootSignatureSpec
+   * @param {{
+   *   compute?: boolean,
+   *   userDataBase?: number,
+   *   tableSlotBytes?: number,
+   *   uniformMinBindingSizeAlignment?: number,
+   *   storageMinBindingSizeAlignment?: number,
+   *   synthesizeMissingStaticSamplers?: boolean,
+   *   includeExcludedBindings?: boolean,
+   * }} [options]
+   * @returns {object}
+   */
+  function diagnoseStageBindings(stageReflection, rootSignatureSpec, options = {}) {
+    if (!isPlainObject(stageReflection)) {
+      throw new TypeError('stageReflection must be an object');
+    }
+    if (options !== undefined && !isPlainObject(options)) {
+      throw new TypeError('options must be an object');
+    }
+
+    const stage = normalizeDiagnosticStage(stageReflection.stage) || 'fragment';
+    const compute =
+      typeof options.compute === 'boolean' ? options.compute : stage === 'compute';
+    const defaultBase = compute ? COMPUTE_USER_DATA_BASE : GRAPHICS_USER_DATA_BASE;
+    const rs = normalizeRootSignatureSpec(rootSignatureSpec, defaultBase, options);
+
+    const uniformAlign =
+      options.uniformMinBindingSizeAlignment !== undefined
+        ? options.uniformMinBindingSizeAlignment
+        : UNIFORM_MIN_BINDING_SIZE_ALIGNMENT;
+    const storageAlign =
+      options.storageMinBindingSizeAlignment !== undefined
+        ? options.storageMinBindingSizeAlignment
+        : STORAGE_MIN_BINDING_SIZE_ALIGNMENT;
+    if (!isNonNegativeInt(uniformAlign) || uniformAlign <= 0) {
+      throw new RangeError(
+        `uniformMinBindingSizeAlignment must be a positive integer, got ${JSON.stringify(uniformAlign)}`
+      );
+    }
+    if (!isNonNegativeInt(storageAlign) || storageAlign <= 0) {
+      throw new RangeError(
+        `storageMinBindingSizeAlignment must be a positive integer, got ${JSON.stringify(storageAlign)}`
+      );
+    }
+
+    const allowStaticSamplerFallback = Boolean(options.synthesizeMissingStaticSamplers);
+    const includeExcludedBindings = Boolean(options.includeExcludedBindings);
+    const layoutLookup = buildGroupLayoutLookup(stageReflection);
+    const rawBindings = Array.isArray(stageReflection.bindings) ? stageReflection.bindings : [];
+
+    const diagnostics = [];
+    const resolvedBindings = [];
+    const staticSamplerFallbacks = [];
+    const codeCounts = {};
+
+    const emit = (group, binding, kind, code, expected, actual, message, name, source) => {
+      codeCounts[code] = (codeCounts[code] || 0) + 1;
+      diagnostics.push({
+        group,
+        binding,
+        kind: kind || 'unknown',
+        code,
+        expected,
+        actual,
+        message,
+        name: name || null,
+        source: source || null,
+      });
+    };
+
+    let checkedCount = 0;
+
+    for (let i = 0; i < rawBindings.length; i += 1) {
+      const raw = rawBindings[i];
+      if (!isPlainObject(raw)) {
+        emit(
+          0,
+          i,
+          'unknown',
+          DIAGNOSTIC_CODES.INVALID_SOURCE,
+          'binding object',
+          raw,
+          `bindings[${i}]: binding record must be an object`,
+          null,
+          null
+        );
+        continue;
+      }
+      if (!includeExcludedBindings && (raw.in_layout === false || raw.inLayout === false)) {
+        continue;
+      }
+      checkedCount += 1;
+
+      const group = isNonNegativeInt(raw.group) ? raw.group : 0;
+      const binding = isNonNegativeInt(raw.binding) ? raw.binding : i;
+      const name = typeof raw.name === 'string' ? raw.name : null;
+      const layoutEntry =
+        (isPlainObject(raw.layoutEntry) ? raw.layoutEntry : null) ||
+        layoutLookup.get(`${group}:${binding}`) ||
+        null;
+
+      const { kind, rawKind } = resolveDiagnosticBindingKind(raw, layoutEntry);
+
+      // Parse or accept pre-normalized source
+      let source = null;
+      let sourceOk = true;
+      if (raw.source === undefined || raw.source === null) {
+        sourceOk = false;
+        emit(
+          group,
+          binding,
+          kind || 'unknown',
+          DIAGNOSTIC_CODES.MISSING_SOURCE,
+          'binding source (table, root_constants, root_descriptor, static_sampler, sampler_heap, or resource_heap)',
+          null,
+          `@group(${group}) @binding(${binding}): missing binding source`,
+          name,
+          null
+        );
+      } else if (isNormalizedBindingSource(raw.source)) {
+        source = raw.source;
+      } else {
+        try {
+          source = parseBindingSource(raw.source, `bindings[${i}].source`);
+        } catch (err) {
+          sourceOk = false;
+          emit(
+            group,
+            binding,
+            kind || 'unknown',
+            DIAGNOSTIC_CODES.INVALID_SOURCE,
+            'valid WgslBindingSource object',
+            raw.source,
+            `@group(${group}) @binding(${binding}): invalid binding source (${err.message})`,
+            name,
+            null
+          );
+        }
+      }
+
+      const key = formatBindingSourceKey(group, binding, source);
+
+      let bindingFailed = !sourceOk;
+      if (!kind) {
+        bindingFailed = true;
+        emit(
+          group,
+          binding,
+          'unknown',
+          DIAGNOSTIC_CODES.UNKNOWN_BINDING_KIND,
+          Object.keys(ACCEPTED_DESCRIPTOR_CLASSES),
+          rawKind,
+          `${key}: unrecognized binding kind ${JSON.stringify(rawKind)}`,
+          name,
+          source
+        );
+      }
+
+      // Check min_binding_size_bytes alignment regardless of source join result
+      const minBindingSizeBytes = extractMinBindingSizeBytes(raw, layoutEntry);
+      if (minBindingSizeBytes !== null) {
+        const isBufferKind =
+          kind === 'uniform' || kind === 'storage' || kind === 'read_only_storage';
+        if (
+          typeof minBindingSizeBytes !== 'number' ||
+          !Number.isInteger(minBindingSizeBytes) ||
+          minBindingSizeBytes < 0
+        ) {
+          bindingFailed = true;
+          emit(
+            group,
+            binding,
+            kind || 'unknown',
+            DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED,
+            {
+              type: 'non-negative integer',
+              alignment: kind === 'uniform' ? uniformAlign : storageAlign,
+            },
+            { minBindingSizeBytes },
+            `${key}: invalid min_binding_size_bytes ${JSON.stringify(minBindingSizeBytes)} (expected non-negative integer)`,
+            name,
+            source
+          );
+        } else if (isBufferKind && minBindingSizeBytes > 0) {
+          const requiredAlign = kind === 'uniform' ? uniformAlign : storageAlign;
+          const remainder = minBindingSizeBytes % requiredAlign;
+          if (remainder !== 0) {
+            const alignedSizeBytes =
+              Math.ceil(minBindingSizeBytes / requiredAlign) * requiredAlign;
+            bindingFailed = true;
+            emit(
+              group,
+              binding,
+              kind,
+              DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED,
+              {
+                alignment: requiredAlign,
+                alignedSizeBytes,
+              },
+              {
+                minBindingSizeBytes,
+                remainder,
+              },
+              `${key}: ${kind} min_binding_size_bytes (${minBindingSizeBytes}) is not aligned to ${requiredAlign} bytes (next aligned size: ${alignedSizeBytes})`,
+              name,
+              source
+            );
+          }
+        } else if (!isBufferKind && kind && minBindingSizeBytes > 0) {
+          bindingFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.MIN_BINDING_SIZE_UNEXPECTED,
+            0,
+            minBindingSizeBytes,
+            `${key}: non-buffer ${kind} binding should not specify non-zero min_binding_size_bytes (${minBindingSizeBytes})`,
+            name,
+            source
+          );
+        }
+      }
+
+      // Storage texture format check (matching runtime/gpu/stage_reflection.cpp:720)
+      if (kind === 'storage_texture') {
+        const fmt =
+          raw.storage_format !== undefined && raw.storage_format !== null
+            ? raw.storage_format
+            : raw.storageFormat !== undefined && raw.storageFormat !== null
+              ? raw.storageFormat
+              : layoutEntry && layoutEntry.storageTexture
+                ? layoutEntry.storageTexture.format
+                : raw.storageTexture
+                  ? raw.storageTexture.format
+                  : null;
+        if (fmt === null || fmt === 0 || fmt === '') {
+          bindingFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.MISSING_STORAGE_FORMAT,
+            'non-empty WebGPU storage texture format',
+            fmt,
+            `${key}: a storage texture needs its format`,
+            name,
+            source
+          );
+        }
+      }
+
+      if (!sourceOk || !kind) {
+        continue;
+      }
+
+      // Join source against root signature layout
+      let resolvedClass = null;
+      let resolvedParamIndex = null;
+      let resolvedRegister = 0;
+      let resolvedSpace = 0;
+      let resolvedRootConstants = false;
+      let resolvedHeap = null;
+      let synthesizedFallback = null;
+      let joinFailed = false;
+
+      if (source.kind === 'sampler_heap' || source.kind === 'resource_heap') {
+        const covering = findRootParameterCovering(rs.parameters, source.indexUserSgpr);
+        if (!covering || covering.type !== 'constants') {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.HEAP_INDEX_NOT_ROOT_CONSTANT,
+            { userSgpr: source.indexUserSgpr, parameterType: 'constants' },
+            covering
+              ? {
+                  userSgpr: source.indexUserSgpr,
+                  parameterIndex: covering.index,
+                  parameterType: covering.type,
+                }
+              : { userSgpr: source.indexUserSgpr, parameterIndex: null, parameterType: null },
+            `${key}: s${source.indexUserSgpr} is not inside a root-constants parameter`,
+            name,
+            source
+          );
+        }
+        const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+        if ((source.kind === 'sampler_heap') !== samplerKind) {
+          joinFailed = true;
+          const heapLabel = source.kind === 'sampler_heap' ? 'sampler' : 'resource';
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.HEAP_KIND_MISMATCH,
+            samplerKind ? 'sampler_heap' : 'resource_heap',
+            source.kind,
+            `${key}: a ${kind} binding cannot come from the ${heapLabel} heap`,
+            name,
+            source
+          );
+        }
+        if (!joinFailed) {
+          resolvedParamIndex = covering.index;
+          resolvedClass =
+            kind === 'uniform'
+              ? 'cbv'
+              : samplerKind
+                ? 'sampler'
+                : kind === 'storage' || kind === 'storage_texture'
+                  ? 'uav'
+                  : 'srv';
+          resolvedHeap = {
+            kind: source.kind,
+            parameterIndex: covering.index,
+            dwordOffset: source.indexUserSgpr - covering.startSgpr,
+            baseUserSgpr: source.baseUserSgpr,
+            stride: source.stride,
+            shift: source.indexShift,
+          };
+        }
+      } else if (source.kind === 'static_sampler') {
+        const idx = source.index;
+        const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+        const missing =
+          idx >= rs.staticSamplerCount ||
+          (Array.isArray(rs.staticSamplers) &&
+            (rs.staticSamplers[idx] === null || rs.staticSamplers[idx] === undefined));
+
+        if (!samplerKind) {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+            ACCEPTED_DESCRIPTOR_CLASSES[kind].map(formatDescriptorClass),
+            formatDescriptorClass('sampler'),
+            `${key}: a ${kind} binding cannot take a sampler`,
+            name,
+            source
+          );
+        } else if (missing) {
+          if (allowStaticSamplerFallback) {
+            synthesizedFallback = buildStaticSamplerFallbackEntry(
+              { group, binding, name, kind },
+              idx,
+              DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING,
+              `${key}: missing static sampler ${idx} (root signature defines ${rs.staticSamplerCount}); synthesized default ${kind === 'comparison_sampler' ? 'comparison' : 'filtering'} sampler`
+            );
+            staticSamplerFallbacks.push(synthesizedFallback);
+            resolvedClass = 'sampler';
+            resolvedRegister = idx;
+            resolvedSpace = 0;
+          } else {
+            joinFailed = true;
+            emit(
+              group,
+              binding,
+              kind,
+              DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING,
+              {
+                staticSamplerCount: rs.staticSamplerCount,
+                validRange: rs.staticSamplerCount > 0 ? [0, rs.staticSamplerCount - 1] : null,
+              },
+              { staticSamplerIndex: idx },
+              `${key}: no static sampler ${idx} (root signature defines ${rs.staticSamplerCount})`,
+              name,
+              source
+            );
+          }
+        } else {
+          const desc = Array.isArray(rs.staticSamplers) ? rs.staticSamplers[idx] : null;
+          const explicitComparison = extractStaticSamplerComparisonMode(desc);
+          if (explicitComparison !== null) {
+            const wantsComparison = kind === 'comparison_sampler';
+            if (wantsComparison !== explicitComparison) {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+                wantsComparison ? 'comparison_sampler' : 'filtering_sampler',
+                explicitComparison ? 'comparison_sampler' : 'filtering_sampler',
+                `${key}: static sampler ${idx} is ${explicitComparison ? 'comparison' : 'filtering'} but binding expects ${kind}`,
+                name,
+                source
+              );
+            }
+          }
+          if (!joinFailed) {
+            resolvedClass = 'sampler';
+            if (isPlainObject(desc)) {
+              const sReg =
+                desc.shader_register !== undefined
+                  ? desc.shader_register
+                  : desc.shaderRegister !== undefined
+                    ? desc.shaderRegister
+                    : desc.register;
+              const sSpace =
+                desc.register_space !== undefined
+                  ? desc.register_space
+                  : desc.registerSpace !== undefined
+                    ? desc.registerSpace
+                    : desc.space;
+              resolvedRegister = isNonNegativeInt(sReg) ? sReg : idx;
+              resolvedSpace = isNonNegativeInt(sSpace) ? sSpace : 0;
+            } else {
+              resolvedRegister = idx;
+            }
+          }
+        }
+      } else {
+        // table / root_constants / root_descriptor: root parameter must START at user_sgpr
+        const param = findRootParameterStartingAt(rs.parameters, source.userSgpr);
+        if (!param) {
+          joinFailed = true;
+          const covering = findRootParameterCovering(rs.parameters, source.userSgpr);
+          const insideDetail = covering
+            ? ` (inside root parameter ${covering.index} [${covering.type}] spanning s${covering.startSgpr}..s${covering.endSgpr - 1})`
+            : '';
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.ROOT_PARAMETER_NOT_FOUND,
+            {
+              userSgpr: source.userSgpr,
+              parameterType:
+                source.kind === 'table'
+                  ? 'table'
+                  : source.kind === 'root_constants'
+                    ? 'constants'
+                    : ['cbv', 'srv', 'uav'],
+            },
+            {
+              userSgpr: source.userSgpr,
+              userDataBase: rs.userDataBase,
+              coveringParameterIndex: covering ? covering.index : null,
+              coveringParameterType: covering ? covering.type : null,
+              availableStartSgprs: rs.parameters.map((p) => p.startSgpr),
+            },
+            `${key}: no root parameter starts at s${source.userSgpr}${insideDetail}`,
+            name,
+            source
+          );
+        } else {
+          resolvedParamIndex = param.index;
+          const pname = `root parameter ${param.index}`;
+
+          if (source.kind === 'table') {
+            if (param.type !== 'table') {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+                'table',
+                param.type,
+                `${key}: ${pname} is not a descriptor table (got ${param.type})`,
+                name,
+                source
+              );
+            } else if (source.tableByteOffset % rs.tableSlotBytes !== 0) {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.TABLE_OFFSET_UNALIGNED,
+                { tableSlotBytes: rs.tableSlotBytes },
+                {
+                  tableByteOffset: source.tableByteOffset,
+                  remainder: source.tableByteOffset % rs.tableSlotBytes,
+                },
+                `${key}: ${pname} has no descriptor at byte offset ${source.tableByteOffset} (not a multiple of ${rs.tableSlotBytes} bytes)`,
+                name,
+                source
+              );
+            } else {
+              const slot = source.tableByteOffset / rs.tableSlotBytes;
+              const slotInfo = resolveTableSlot(param, slot);
+              if (!slotInfo) {
+                joinFailed = true;
+                emit(
+                  group,
+                  binding,
+                  kind,
+                  DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING,
+                  {
+                    parameterIndex: param.index,
+                    tableByteOffset: source.tableByteOffset,
+                    slot,
+                  },
+                  {
+                    parameterIndex: param.index,
+                    rangeCount: param.ranges.length,
+                  },
+                  `${key}: ${pname} has no descriptor at byte offset ${source.tableByteOffset}`,
+                  name,
+                  source
+                );
+              } else {
+                resolvedClass = slotInfo.cls;
+                resolvedRegister = slotInfo.shaderRegister;
+                resolvedSpace = slotInfo.registerSpace;
+              }
+            }
+          } else if (source.kind === 'root_constants') {
+            if (param.type !== 'constants') {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+                'constants',
+                param.type,
+                `${key}: ${pname} is not root constants (got ${param.type})`,
+                name,
+                source
+              );
+            } else if (kind !== 'uniform') {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+                'uniform',
+                kind,
+                `${key}: root constants bind as a uniform buffer only`,
+                name,
+                source
+              );
+            } else {
+              resolvedClass = 'cbv';
+              resolvedRegister = param.shaderRegister;
+              resolvedSpace = param.registerSpace;
+              resolvedRootConstants = true;
+            }
+          } else if (source.kind === 'root_descriptor') {
+            if (param.type !== 'cbv' && param.type !== 'srv' && param.type !== 'uav') {
+              joinFailed = true;
+              emit(
+                group,
+                binding,
+                kind,
+                DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+                ['cbv', 'srv', 'uav'],
+                param.type,
+                `${key}: ${pname} is not a root descriptor (got ${param.type})`,
+                name,
+                source
+              );
+            } else {
+              resolvedClass = param.type;
+              resolvedRegister = param.shaderRegister;
+              resolvedSpace = param.registerSpace;
+            }
+          }
+        }
+      }
+
+      if (!joinFailed && !resolvedRootConstants && resolvedClass !== null) {
+        const accepted = ACCEPTED_DESCRIPTOR_CLASSES[kind] || [];
+        if (!accepted.includes(resolvedClass)) {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH,
+            accepted.map(formatDescriptorClass),
+            formatDescriptorClass(resolvedClass),
+            `${key}: a ${kind} binding cannot take a ${formatDescriptorClass(resolvedClass)}`,
+            name,
+            source
+          );
+        }
+      }
+
+      if (!joinFailed && !bindingFailed) {
+        resolvedBindings.push({
+          group,
+          binding,
+          name,
+          kind,
+          source,
+          parameterIndex: resolvedParamIndex,
+          registerClass: resolvedClass,
+          shaderRegister: resolvedRegister,
+          registerSpace: resolvedSpace,
+          rootConstants: resolvedRootConstants,
+          heap: resolvedHeap,
+          minBindingSizeBytes: minBindingSizeBytes !== null ? minBindingSizeBytes : 0,
+          synthesizedStaticSampler: Boolean(synthesizedFallback),
+          fallbackDescriptor: synthesizedFallback ? synthesizedFallback.fallbackDescriptor : null,
+        });
+      }
+    }
+
+    return {
+      ok: diagnostics.length === 0,
+      stage,
+      compute,
+      userDataBase: rs.userDataBase,
+      tableSlotBytes: rs.tableSlotBytes,
+      bindingCount: checkedCount,
+      resolvedBindings,
+      diagnostics,
+      staticSamplerFallbacks,
+      summary: {
+        totalBindings: checkedCount,
+        resolvedCount: resolvedBindings.length,
+        mismatchCount: diagnostics.length,
+        synthesizedStaticSamplers: staticSamplerFallbacks.length,
+        codes: codeCounts,
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // ReflectionRegistry
   // ---------------------------------------------------------------------------
 
@@ -2431,6 +3903,34 @@
     }
 
     /**
+     * Validate a registered shader (by hash, name, or reflection object) against a root
+     * signature layout using `diagnoseStageBindings`.
+     *
+     * @param {bigint | string | number | object} shaderHashOrReflection
+     * @param {object} rootSignatureSpec
+     * @param {object} [options]
+     * @returns {object}
+     */
+    diagnoseStageBindings(shaderHashOrReflection, rootSignatureSpec, options = {}) {
+      const [resolved] = this._resolveReflections(shaderHashOrReflection);
+      return diagnoseStageBindings(resolved, rootSignatureSpec, options);
+    }
+
+    /**
+     * Detect missing `static_sampler` slots on a registered shader (by hash, name, or
+     * reflection object) and return fallback sampler metadata via `synthesizeMissingStaticSamplers`.
+     *
+     * @param {bigint | string | number | object} shaderHashOrReflection
+     * @param {object | null | undefined} [rootSignatureSpec]
+     * @param {object} [options]
+     * @returns {object}
+     */
+    synthesizeMissingStaticSamplers(shaderHashOrReflection, rootSignatureSpec = null, options = {}) {
+      const [resolved] = this._resolveReflections(shaderHashOrReflection);
+      return synthesizeMissingStaticSamplers(resolved, rootSignatureSpec, options);
+    }
+
+    /**
      * Clear all loaded manifests and optionally reset telemetry counters.
      *
      * @param {{ resetStats?: boolean }} [options]
@@ -2482,6 +3982,12 @@
     LAYOUT_MANIFEST_SCHEMA_VERSION,
     MAX_WEBGPU_BIND_GROUPS,
     MAX_HEAP_INDEX_SHIFT,
+    GRAPHICS_USER_DATA_BASE,
+    COMPUTE_USER_DATA_BASE,
+    TABLE_SLOT_BYTES,
+    UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
+    STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
+    DIAGNOSTIC_CODES,
     SHADER_STAGE_BITS,
     VERTEX_FORMAT_BYTE_SIZES,
     ReflectionError,
@@ -2498,6 +4004,8 @@
     parseReflectionManifest,
     buildBindGroupLayoutDescriptors,
     buildVertexBufferLayouts,
+    diagnoseStageBindings,
+    synthesizeMissingStaticSamplers,
     ReflectionRegistry,
   };
 
