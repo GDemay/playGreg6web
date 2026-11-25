@@ -1794,5 +1794,381 @@ class CaptureFramesDumpPipelinesAndPresetsTests(unittest.TestCase):
             self.assertTrue(any("frame_%04d.png" in tok for tok in ffmpeg_cmds[0]))
 
 
+class HudMp4AndNewPresetsTests(unittest.TestCase):
+    def test_t49_flag_defaults_and_parsing(self):
+        parser = rbb.build_arg_parser()
+        defaults = parser.parse_args([])
+        self.assertFalse(defaults.hide_hud)
+        self.assertIsNone(defaults.mp4_fps)
+        self.assertFalse(defaults.mp4_skip_black)
+
+        parsed = parser.parse_args(
+            [
+                "--input-script",
+                "legal-notices",
+                "--hide-hud",
+                "--mp4",
+                "--mp4-fps",
+                "4.5",
+                "--mp4-skip-black",
+            ]
+        )
+        self.assertEqual(parsed.input_script, "legal-notices")
+        self.assertTrue(parsed.hide_hud)
+        self.assertTrue(parsed.mp4)
+        self.assertEqual(parsed.mp4_fps, 4.5)
+        self.assertTrue(parsed.mp4_skip_black)
+
+    def test_legal_notices_and_chrome_menu_flow_input_script_presets(self):
+        for preset in ("legal-notices", "chrome-menu-flow"):
+            self.assertEqual(rbb.sanitize_input_script_preset(preset), preset)
+            self.assertEqual(rbb.sanitize_input_script_preset(f"  {preset.upper()}  "), preset)
+            self.assertEqual(
+                rbb.build_target_url("127.0.0.1", 8080, input_script=preset),
+                f"http://127.0.0.1:8080/?inputScript={preset}",
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            for preset in ("legal-notices", "chrome-menu-flow"):
+                code, out, err, _, _ = fx.run_cli(
+                    "--smoke",
+                    "--dry-run",
+                    "--name",
+                    f"dry-{preset}",
+                    "--input-script",
+                    preset,
+                )
+                self.assertEqual(code, 0, err)
+                payload = json.loads(out)
+                self.assertEqual(payload["input_script"], preset)
+                self.assertEqual(payload["inputScript"], preset)
+                self.assertEqual(
+                    payload["url"],
+                    f"http://127.0.0.1:<ephemeral>/?smoke=1&inputScript={preset}",
+                )
+
+    def test_hide_hud_url_plumbing_and_dry_run_plan(self):
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, hide_hud=True),
+            "http://127.0.0.1:8080/?hud=0",
+        )
+        self.assertEqual(
+            rbb.build_target_url(
+                "127.0.0.1",
+                8080,
+                smoke=True,
+                input_script="chrome-menu-flow",
+                stream_shaders=True,
+                stream_threshold_mb=32.0,
+                hide_hud=True,
+            ),
+            "http://127.0.0.1:8080/?smoke=1&inputScript=chrome-menu-flow&streamShaders=1&streamThresholdMb=32&hud=0",
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "hud-mp4-dry",
+                "--input-script",
+                "legal-notices",
+                "--hide-hud",
+                "--mp4",
+                "--mp4-fps",
+                "0.5",
+                "--mp4-skip-black",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["hide_hud"])
+            self.assertTrue(payload["mp4"])
+            self.assertEqual(payload["mp4_fps"], 0.5)
+            self.assertTrue(payload["mp4_skip_black"])
+            self.assertEqual(payload["input_script"], "legal-notices")
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=legal-notices&hud=0",
+            )
+            self.assertNotIn(str(Path(d)), out)
+
+            # Default dry-run preserves backwards-compatible URL and defaults
+            code_def, out_def, err_def, _, _ = fx.run_cli("--smoke", "--dry-run", "--name", "hud-def")
+            self.assertEqual(code_def, 0, err_def)
+            payload_def = json.loads(out_def)
+            self.assertFalse(payload_def["hide_hud"])
+            self.assertIsNone(payload_def["mp4_fps"])
+            self.assertFalse(payload_def["mp4_skip_black"])
+            self.assertNotIn("hud=0", payload_def["url"])
+
+    def test_mp4_fps_validation(self):
+        self.assertIsNone(rbb.validate_mp4_fps(None))
+        self.assertEqual(rbb.validate_mp4_fps(0.5), 0.5)
+        self.assertEqual(rbb.validate_mp4_fps(24), 24.0)
+        for bad in (0, -1, -0.25, float("nan"), float("inf"), float("-inf"), True, "5"):
+            with self.assertRaises(rbb.RunnerError, msg=f"expected RunnerError for {bad!r}"):
+                rbb.validate_mp4_fps(bad)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            for bad_args in (
+                ("--mp4-fps", "0"),
+                ("--mp4-fps", "-2"),
+                ("--mp4-fps", "-0.1"),
+                ("--mp4-fps", "nan"),
+                ("--mp4-fps", "inf"),
+                ("--mp4-fps", "-inf"),
+            ):
+                code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", *bad_args)
+                self.assertEqual(code, 2, f"expected exit 2 for {bad_args}")
+
+    def test_encode_frames_to_mp4_custom_fps_and_skip_leading_black_frames(self):
+        all_black_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 0, 0))
+        sidebar_only_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (255, 255, 255) if x < 410 else (0, 0, 0))
+        canvas_lit_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (10, 120, 240) if x >= 410 else (0, 0, 0))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            frames_dir = root / "frames"
+            frames_dir.mkdir()
+            # Frames 1 & 2 have black canvas (x>=410); frame 3 is lit; frame 4 is black again (must NOT be skipped)
+            (frames_dir / "frame_0001.png").write_bytes(all_black_png)
+            (frames_dir / "frame_0002.png").write_bytes(sidebar_only_png)
+            (frames_dir / "frame_0003.png").write_bytes(canvas_lit_png)
+            (frames_dir / "frame_0004.png").write_bytes(all_black_png)
+
+            ffmpeg_cmds: list[list[str]] = []
+
+            def fake_ffmpeg(cmd, cwd, log, timeout):
+                ffmpeg_cmds.append(list(cmd))
+                Path(cmd[-1]).write_bytes(b"ftypmp42")
+                return 0
+
+            # 1. skip_black=True with HUD visible (canvas_min_x=410) skips frames 1..2 -> -start_number 3 and custom fps 0.5
+            ok, warn = rbb.encode_frames_to_mp4(
+                frames_dir,
+                root / "skip_hud.mp4",
+                fps=0.5,
+                skip_black=True,
+                canvas_min_x=rbb.CANVAS_MIN_X,
+                pil_image_mod=_FakePilModule,
+                _auto_import_pil=False,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok, warn)
+            cmd1 = ffmpeg_cmds[-1]
+            self.assertEqual(cmd1[cmd1.index("-framerate") + 1], "0.5")
+            self.assertIn("-start_number", cmd1)
+            self.assertEqual(cmd1[cmd1.index("-start_number") + 1], "3")
+            self.assertLess(cmd1.index("-start_number"), cmd1.index("-i"))
+
+            # 2. skip_black=True with hide_hud (canvas_min_x=0): frame 2 has lit pixels at x<410 -> -start_number 2
+            ok2, warn2 = rbb.encode_frames_to_mp4(
+                frames_dir,
+                root / "skip_nohud.mp4",
+                fps=4.0,
+                skip_black=True,
+                canvas_min_x=0,
+                pil_image_mod=_FakePilModule,
+                _auto_import_pil=False,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok2, warn2)
+            cmd2 = ffmpeg_cmds[-1]
+            self.assertEqual(cmd2[cmd2.index("-framerate") + 1], "4.0")
+            self.assertEqual(cmd2[cmd2.index("-start_number") + 1], "2")
+
+            # 3. skip_black=False does NOT pass -start_number
+            ok3, warn3 = rbb.encode_frames_to_mp4(
+                frames_dir,
+                root / "noskip.mp4",
+                fps=2.5,
+                skip_black=False,
+                pil_image_mod=_FakePilModule,
+                _auto_import_pil=False,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok3, warn3)
+            cmd3 = ffmpeg_cmds[-1]
+            self.assertEqual(cmd3[cmd3.index("-framerate") + 1], "2.5")
+            self.assertNotIn("-start_number", cmd3)
+
+            # 4. Graceful fallback when Pillow is unavailable
+            ok4, warn4 = rbb.encode_frames_to_mp4(
+                frames_dir,
+                root / "nopil.mp4",
+                fps=2.0,
+                skip_black=True,
+                pil_image_mod=None,
+                _auto_import_pil=False,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok4, warn4)
+            self.assertNotIn("-start_number", ffmpeg_cmds[-1])
+
+            # 5. All-black frames gracefully fall back to encoding from frame 1 (no -start_number)
+            all_black_dir = root / "all_black"
+            all_black_dir.mkdir()
+            (all_black_dir / "frame_0001.png").write_bytes(all_black_png)
+            (all_black_dir / "frame_0002.png").write_bytes(all_black_png)
+            ok5, warn5 = rbb.encode_frames_to_mp4(
+                all_black_dir,
+                root / "all_black.mp4",
+                fps=2.0,
+                skip_black=True,
+                canvas_min_x=0,
+                pil_image_mod=_FakePilModule,
+                _auto_import_pil=False,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok5, warn5)
+            self.assertNotIn("-start_number", ffmpeg_cmds[-1])
+
+    def test_run_browser_session_and_cli_plumbing_for_hide_hud_mp4_fps_and_skip_black(self):
+        all_black_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 0, 0))
+        left_lit_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (200, 100, 50) if x < 410 else (0, 0, 0))
+        frame_seq = [all_black_png, left_lit_png, left_lit_png]
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "t49-session"
+            run_dir.mkdir(parents=True)
+            cap_dir = fx.repo / "work" / "t49-frames"
+
+            navigated_urls: list[str] = []
+            ffmpeg_cmds: list[list[str]] = []
+            shot_idx = {"n": 0}
+            fake_clock = {"t": 2000.0}
+
+            class FakeCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Page.navigate" and isinstance(params, dict):
+                        navigated_urls.append(str(params.get("url") or ""))
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": make_sample_probe(presents=2, real_draws=3, fallback_draws=0)}}
+                    if method == "Page.captureScreenshot":
+                        payload = frame_seq[min(shot_idx["n"], len(frame_seq) - 1)]
+                        shot_idx["n"] += 1
+                        return {"data": base64.b64encode(payload).decode("ascii")}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    fake_clock["t"] += 0.1
+                    return []
+
+            def fake_ffmpeg(cmd, cwd, log, timeout):
+                ffmpeg_cmds.append(list(cmd))
+                Path(cmd[-1]).write_bytes(b"ftypmp42")
+                return 0
+
+            with (
+                mock.patch.object(rbb, "_import_pil_image", return_value=_FakePilModule),
+                mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]),
+            ):
+                res = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=None,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=0.29,
+                    headless=True,
+                    smoke=True,
+                    send_input=False,
+                    capture_frames=True,
+                    capture_frames_dir=cap_dir,
+                    capture_interval_sec=0.1,
+                    frame_interval_s=1.0,
+                    encode_mp4=True,
+                    mp4_fps=3.5,
+                    mp4_skip_black=True,
+                    hide_hud=True,
+                    input_script="chrome-menu-flow",
+                    runner=fake_ffmpeg,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=FakeCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                    which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+                )
+
+            self.assertTrue(res.ok)
+            self.assertEqual(len(navigated_urls), 1)
+            self.assertIn("inputScript=chrome-menu-flow", navigated_urls[0])
+            self.assertIn("hud=0", navigated_urls[0])
+            # hide_hud=True checks full frame (canvas_min_x=0), so frame 1 is black and frames 2..3 are lit
+            self.assertEqual(len(res.captured_frames), 3)
+            self.assertEqual(res.non_black_canvas_frames, 2)
+            self.assertEqual(res.mp4_path, "capture.mp4")
+            self.assertEqual(len(ffmpeg_cmds), 1)
+            cmd = ffmpeg_cmds[0]
+            self.assertEqual(cmd[cmd.index("-framerate") + 1], "3.5")
+            self.assertEqual(cmd[cmd.index("-start_number") + 1], "2")
+
+            # Verify CLI writes new metadata cleanly into telemetry.json and command.json
+            code, _, err, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t49-cli-run",
+                "--input-script",
+                "legal-notices",
+                "--hide-hud",
+                "--mp4",
+                "--mp4-fps",
+                "6",
+                "--mp4-skip-black",
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sessions[0]["input_script"], "legal-notices")
+            self.assertTrue(sessions[0]["hide_hud"])
+            self.assertEqual(sessions[0]["mp4_fps"], 6.0)
+            self.assertTrue(sessions[0]["mp4_skip_black"])
+
+            cli_run_dir = fx.build / "runs" / "t49-cli-run"
+            telemetry = json.loads((cli_run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            cmd_meta = json.loads((cli_run_dir / "command.json").read_text(encoding="utf-8"))
+            self.assertTrue(telemetry["hide_hud"])
+            self.assertEqual(telemetry["mp4_fps"], 6.0)
+            self.assertTrue(telemetry["mp4_skip_black"])
+            self.assertEqual(telemetry["inputScript"], "legal-notices")
+            self.assertTrue(cmd_meta["hide_hud"])
+            self.assertEqual(cmd_meta["mp4_fps"], 6.0)
+            self.assertTrue(cmd_meta["mp4_skip_black"])
+            self.assertEqual(cmd_meta["input_script"], "legal-notices")
+
+
 if __name__ == "__main__":
     unittest.main()
