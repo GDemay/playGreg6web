@@ -11,6 +11,7 @@
 (function (root) {
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_SOFT_BUDGET_BYTES = 512 * 1024 * 1024; // 512 MiB
+  const DEFAULT_OLDEST_LIVE_LIMIT = 16;
 
   const CREATE_TEXTURE2_OPCODE = 35;
   const CREATE_TEXTURE2_PAYLOAD_BYTES = 40;
@@ -962,8 +963,12 @@
 
       /** @type {Map<string, Map<number, object>>} */
       this._tables = new Map();
+      /** @type {Record<string, number>} */
+      this._activeBytesByKind = {};
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
-        this._tables.set(RESOURCE_KINDS[i], new Map());
+        const kind = RESOURCE_KINDS[i];
+        this._tables.set(kind, new Map());
+        this._activeBytesByKind[kind] = 0;
       }
 
       /** @type {Map<number, object>} */
@@ -980,6 +985,7 @@
 
       this._currentFrame = 0;
       this._generation = 0;
+      this._nextRegistrationSeq = 0;
 
       this._activeBytes = 0;
       this._pendingRetireBytes = 0;
@@ -1143,6 +1149,8 @@
       if (existing) {
         if (existing.resource === resource) {
           this._activeBytes = Math.max(0, this._activeBytes - existing.byteSize) + byteSize;
+          this._activeBytesByKind[kind] =
+            Math.max(0, this._activeBytesByKind[kind] - existing.byteSize) + byteSize;
           existing.byteSize = byteSize;
           existing.label = label;
           existing.tag = tag;
@@ -1162,6 +1170,7 @@
         label,
         tag,
         registeredAtFrame: this._currentFrame,
+        registrationSeq: this._nextRegistrationSeq,
         retiredAtFrame: -1,
         sealed: false,
         hasFence: false,
@@ -1169,9 +1178,11 @@
         fenceFailed: false,
         destroyed: false,
       };
+      this._nextRegistrationSeq += 1;
 
       table.set(handle, entry);
       this._activeBytes += byteSize;
+      this._activeBytesByKind[kind] += byteSize;
       this._totalRegistered += 1;
 
       this._updatePeakBytes();
@@ -1639,6 +1650,7 @@
       }
 
       this._activeBytes = Math.max(0, this._activeBytes - entry.byteSize);
+      this._activeBytesByKind[kind] = Math.max(0, this._activeBytesByKind[kind] - entry.byteSize);
       this._pendingRetireBytes += entry.byteSize;
 
       entry.retiredAtFrame = this._currentFrame;
@@ -1835,16 +1847,65 @@
     }
 
     /**
+     * Return up to `limit` currently live resources sorted oldest-first by
+     * `createdFrame` (then registration order). Output is strictly sanitized to
+     * `{ kind, id, byteSize, createdFrame }` with zero labels, host paths,
+     * tags, or raw GPU handles.
+     *
+     * @param {number} [limit=16]
+     * @returns {Array<{ kind: string, id: number, byteSize: number, createdFrame: number }>}
+     */
+    getOldestLiveResources(limit = DEFAULT_OLDEST_LIVE_LIMIT) {
+      assertNonNegativeInteger(limit, 'limit');
+      if (limit === 0) {
+        return [];
+      }
+
+      const live = [];
+      for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
+        const table = this._tables.get(RESOURCE_KINDS[i]);
+        for (const entry of table.values()) {
+          live.push(entry);
+        }
+      }
+
+      live.sort((a, b) => {
+        if (a.registeredAtFrame !== b.registeredAtFrame) {
+          return a.registeredAtFrame - b.registeredAtFrame;
+        }
+        return a.registrationSeq - b.registrationSeq;
+      });
+
+      const count = Math.min(limit, live.length);
+      const result = new Array(count);
+      for (let i = 0; i < count; i += 1) {
+        const entry = live[i];
+        result[i] = {
+          kind: entry.kind,
+          id: entry.handle,
+          byteSize: entry.byteSize,
+          createdFrame: entry.registeredAtFrame,
+        };
+      }
+      return result;
+    }
+
+    /**
      * Return a sanitized snapshot of per-kind counts, VRAM byte accounting,
      * lifecycle stats, and Frame-1 hardening counters.
      */
     getStats() {
       const countsByKind = {};
+      const byKind = {};
       let activeCount = 0;
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
         const kind = RESOURCE_KINDS[i];
         const count = this._tables.get(kind).size;
         countsByKind[kind] = count;
+        byKind[kind] = {
+          count,
+          bytes: this._activeBytesByKind[kind],
+        };
         activeCount += count;
       }
 
@@ -1858,6 +1919,7 @@
 
       return {
         countsByKind,
+        byKind,
         pendingCountsByKind,
         activeCount,
         pendingRetireCount: this._pendingRetire.length,
@@ -1865,6 +1927,7 @@
         pendingRetireBytes: this._pendingRetireBytes,
         totalBytes: this._activeBytes + this._pendingRetireBytes,
         peakBytes: this._peakBytes,
+        peakTotalBytes: this._peakBytes,
         softBudgetBytes: this.softBudgetBytes,
         budgetExceeded: this._budgetExceeded,
         budgetWarningCount: this._budgetWarningCount,
@@ -1894,11 +1957,13 @@
 
       const toDestroy = [];
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
-        const table = this._tables.get(RESOURCE_KINDS[i]);
+        const kind = RESOURCE_KINDS[i];
+        const table = this._tables.get(kind);
         for (const entry of table.values()) {
           toDestroy.push(entry);
         }
         table.clear();
+        this._activeBytesByKind[kind] = 0;
       }
       this._bufferMeta.clear();
       this._textureMeta.clear();

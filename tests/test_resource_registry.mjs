@@ -1312,3 +1312,272 @@ test('G41 setDevice, missing device guards, and getStats() sanitized counters de
     clamped: false,
   });
 });
+
+// ---------------------------------------------------------------------------
+// W129 (#785): Per-kind VRAM accounting (byKind), peakTotalBytes high-water
+// mark, fence-deferred retirement without double-decrementing, and sanitized
+// getOldestLiveResources(limit) diagnostics.
+// ---------------------------------------------------------------------------
+
+test('W129 getStats().byKind tracks per-kind live counts and VRAM bytes accurately across kinds', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+
+  // Initial empty state exposes every RESOURCE_KIND with { count: 0, bytes: 0 }
+  const emptyStats = reg.getStats();
+  assert.equal(emptyStats.peakTotalBytes, 0);
+  for (const kind of RESOURCE_KINDS) {
+    assert.deepEqual(emptyStats.byKind[kind], { count: 0, bytes: 0 });
+  }
+
+  reg.beginFrame(1);
+  reg.register(RESOURCE_KIND.BUFFER, 1, createDestroyableMock('vb-1'), { byteSize: 4096 });
+  reg.register(RESOURCE_KIND.BUFFER, 2, createDestroyableMock('ib-2'), { byteSize: 2048 });
+  reg.register(RESOURCE_KIND.TEXTURE, 10, createDestroyableMock('tex-10'), { byteSize: 65536 });
+  reg.register(RESOURCE_KIND.TEXTURE_VIEW, 10, createNonDestroyableMock('view-10'), { byteSize: 0 });
+  reg.register(RESOURCE_KIND.SAMPLER, 20, createNonDestroyableMock('samp-20'));
+  reg.register(RESOURCE_KIND.BIND_GROUP, 30, createNonDestroyableMock('bg-30'), { byteSize: 128 });
+  reg.register(RESOURCE_KIND.RENDER_PIPELINE, 40, createNonDestroyableMock('pso-40'), { byteSize: 512 });
+
+  const stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 2, bytes: 6144 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.TEXTURE], { count: 1, bytes: 65536 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.TEXTURE_VIEW], { count: 1, bytes: 0 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.SAMPLER], { count: 1, bytes: 0 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BIND_GROUP], { count: 1, bytes: 128 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.RENDER_PIPELINE], { count: 1, bytes: 512 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.COMPUTE_PIPELINE], { count: 0, bytes: 0 });
+
+  const sumCount = Object.values(stats.byKind).reduce((acc, k) => acc + k.count, 0);
+  const sumBytes = Object.values(stats.byKind).reduce((acc, k) => acc + k.bytes, 0);
+  assert.equal(sumCount, stats.activeCount);
+  assert.equal(sumBytes, stats.activeBytes);
+  assert.equal(stats.peakTotalBytes, 6144 + 65536 + 128 + 512);
+  assert.equal(stats.peakTotalBytes, stats.peakBytes);
+
+  // Snapshot isolation: mutating stats.byKind must not corrupt internal counters.
+  stats.byKind[RESOURCE_KIND.BUFFER].bytes = 999999;
+  stats.byKind[RESOURCE_KIND.BUFFER].count = 999;
+  assert.deepEqual(reg.getStats().byKind[RESOURCE_KIND.BUFFER], { count: 2, bytes: 6144 });
+});
+
+test('W129 overwrite replacement updates byKind without double-counting and tracks peakTotalBytes', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+  const bufV1 = createDestroyableMock('buf-v1');
+  const bufV2 = createDestroyableMock('buf-v2');
+  const texOther = createDestroyableMock('tex-other');
+
+  reg.beginFrame(1);
+  reg.register(RESOURCE_KIND.BUFFER, 5, bufV1, { byteSize: 1024, label: 'v1' });
+  reg.register(RESOURCE_KIND.TEXTURE, 6, texOther, { byteSize: 4096, label: 't1' });
+  assert.deepEqual(reg.getStats().byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 1024 });
+  assert.equal(reg.getStats().peakTotalBytes, 5120);
+
+  // Replace (buffer, 5) with a new object (2048 bytes): old buffer moves to pendingRetire,
+  // live byKind.buffer must reflect ONLY bufV2 (no double-counting), while peakTotalBytes
+  // captures active (2048 + 4096) + pendingRetire (1024) = 7168.
+  reg.register(RESOURCE_KIND.BUFFER, 5, bufV2, { byteSize: 2048, label: 'v2' });
+  let stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 2048 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.TEXTURE], { count: 1, bytes: 4096 });
+  assert.equal(stats.activeBytes, 6144);
+  assert.equal(stats.pendingRetireBytes, 1024);
+  assert.equal(stats.totalBytes, 7168);
+  assert.equal(stats.peakTotalBytes, 7168);
+
+  // Re-registering the exact same object updates byteSize in-place without double-counting.
+  reg.register(RESOURCE_KIND.BUFFER, 5, bufV2, { byteSize: 3072, label: 'v2-grown' });
+  stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 3072 });
+  assert.equal(stats.peakTotalBytes, 8192);
+
+  // Shrinking same object updates bytes cleanly while preserving peakTotalBytes.
+  reg.register(RESOURCE_KIND.BUFFER, 5, bufV2, { byteSize: 512, label: 'v2-shrunk' });
+  stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 512 });
+  assert.equal(stats.peakTotalBytes, 8192);
+
+  // Advance framesInFlight so bufV1 is destroyed -> byKind.buffer must NOT double-decrement.
+  reg.endFrame();
+  reg.beginFrame(2);
+  reg.beginFrame(3);
+  assert.equal(bufV1.destroyCount, 1);
+  assert.equal(bufV2.destroyCount, 0);
+  stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 512 });
+  assert.equal(stats.pendingRetireBytes, 0);
+  assert.equal(stats.peakTotalBytes, 8192);
+});
+
+test('W129 fence-deferred retirement and destroyAll never double-decrement byKind and preserve peakTotalBytes', async () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 3 });
+  const b1 = createDestroyableMock('b1');
+  const b2 = createDestroyableMock('b2');
+  const t1 = createDestroyableMock('t1');
+  const fence = createDeferred();
+
+  reg.beginFrame(1);
+  reg.register(RESOURCE_KIND.BUFFER, 1, b1, { byteSize: 4000 });
+  reg.register(RESOURCE_KIND.BUFFER, 2, b2, { byteSize: 6000 });
+  reg.register(RESOURCE_KIND.TEXTURE, 3, t1, { byteSize: 16000 });
+
+  assert.equal(reg.getStats().peakTotalBytes, 26000);
+
+  // Retire b1 and t1, bind to GPU fence.
+  assert.equal(reg.retire(RESOURCE_KIND.BUFFER, 1), true);
+  assert.equal(reg.retire(RESOURCE_KIND.BUFFER, 1), false); // duplicate retire is a no-op
+  assert.equal(reg.retire(RESOURCE_KIND.TEXTURE, 3), true);
+  reg.endFrame(fence.promise);
+
+  // Immediately after retire (before fence resolves), byKind reflects only live b2.
+  let stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 6000 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.TEXTURE], { count: 0, bytes: 0 });
+  assert.equal(stats.activeBytes, 6000);
+  assert.equal(stats.pendingRetireBytes, 20000);
+  assert.equal(stats.totalBytes, 26000);
+  assert.equal(stats.peakTotalBytes, 26000);
+
+  // Resolve fence and collect -> b1 and t1 destroyed; byKind must NOT double-decrement!
+  fence.resolve();
+  await fence.promise;
+  await Promise.resolve();
+
+  const col = reg.collect();
+  assert.equal(col.destroyedCount, 2);
+  assert.equal(col.freedBytes, 20000);
+  assert.equal(b1.destroyCount, 1);
+  assert.equal(t1.destroyCount, 1);
+  assert.equal(b2.destroyCount, 0);
+
+  stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 6000 });
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.TEXTURE], { count: 0, bytes: 0 });
+  assert.equal(stats.activeBytes, 6000);
+  assert.equal(stats.pendingRetireBytes, 0);
+  assert.equal(stats.totalBytes, 6000);
+  assert.equal(stats.peakTotalBytes, 26000);
+
+  // Register a texture and retire it so destroyAll sees BOTH active (b2) and pending (t2).
+  const t2 = createDestroyableMock('t2');
+  reg.register(RESOURCE_KIND.TEXTURE, 4, t2, { byteSize: 8000 });
+  reg.retire(RESOURCE_KIND.TEXTURE, 4);
+  assert.deepEqual(reg.getStats().byKind[RESOURCE_KIND.TEXTURE], { count: 0, bytes: 0 });
+
+  const torn = reg.destroyAll();
+  assert.equal(torn.destroyedCount, 2);
+  assert.equal(torn.freedBytes, 14000);
+
+  stats = reg.getStats();
+  for (const kind of RESOURCE_KINDS) {
+    assert.deepEqual(stats.byKind[kind], { count: 0, bytes: 0 });
+  }
+  assert.equal(stats.activeBytes, 0);
+  assert.equal(stats.pendingRetireBytes, 0);
+  assert.equal(stats.totalBytes, 0);
+  assert.equal(stats.peakTotalBytes, 26000);
+
+  // Idempotent second destroyAll() keeps all zeroes and peakTotalBytes intact.
+  reg.destroyAll();
+  assert.deepEqual(reg.getStats().byKind[RESOURCE_KIND.BUFFER], { count: 0, bytes: 0 });
+  assert.equal(reg.getStats().peakTotalBytes, 26000);
+
+  // Re-allocation above prior peak raises peakTotalBytes cleanly.
+  reg.register(RESOURCE_KIND.BUFFER, 9, createDestroyableMock('big-buf'), { byteSize: 32000 });
+  stats = reg.getStats();
+  assert.deepEqual(stats.byKind[RESOURCE_KIND.BUFFER], { count: 1, bytes: 32000 });
+  assert.equal(stats.peakTotalBytes, 32000);
+});
+
+test('W129 getOldestLiveResources(limit) orders by createdFrame then registration order and strictly sanitizes output', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+
+  assert.deepEqual(reg.getOldestLiveResources(), []);
+  assert.deepEqual(reg.getOldestLiveResources(0), []);
+
+  // Frame 2: register texture first, then buffer, then sampler (cross-kind registration order).
+  reg.beginFrame(2);
+  const tex2 = createDestroyableMock('tex-f2');
+  const buf2 = createDestroyableMock('buf-f2');
+  reg.register(RESOURCE_KIND.TEXTURE, 100, tex2, {
+    byteSize: 8192,
+    label: 'C:\\secret\\host\\path\\albedo.dds',
+    tag: { secretHostInfo: '/home/user/private' },
+  });
+  reg.register(RESOURCE_KIND.BUFFER, 10, buf2, {
+    byteSize: 1024,
+    label: '/Users/dev/mesh.bin',
+    tag: 'mesh',
+  });
+  reg.register(RESOURCE_KIND.SAMPLER, 5, createNonDestroyableMock('samp-f2'), {
+    byteSize: 0,
+    label: 'private-sampler-label',
+  });
+
+  // Frame 5: register bindGroup, overwrite (buffer, 10) with a NEW resource (moves its createdFrame to 5),
+  // and update tex2 in-place (preserves its original createdFrame 2 and registration order).
+  reg.beginFrame(5);
+  reg.register(RESOURCE_KIND.BIND_GROUP, 20, createNonDestroyableMock('bg-f5'), { byteSize: 64 });
+  reg.register(RESOURCE_KIND.BUFFER, 10, createDestroyableMock('buf-f5-replaced'), {
+    byteSize: 2048,
+    label: 'replaced-buf',
+  });
+  reg.register(RESOURCE_KIND.TEXTURE, 100, tex2, {
+    byteSize: 16384,
+    label: 'updated-label-must-not-leak',
+  });
+
+  // Frame 7: register a renderPipeline and retire sampler 5 (retired entries must be excluded).
+  reg.beginFrame(7);
+  reg.register(RESOURCE_KIND.RENDER_PIPELINE, 30, createNonDestroyableMock('pso-f7'), { byteSize: 512 });
+  reg.retire(RESOURCE_KIND.SAMPLER, 5);
+
+  const allOldest = reg.getOldestLiveResources(10);
+  assert.deepEqual(allOldest, [
+    { kind: RESOURCE_KIND.TEXTURE, id: 100, byteSize: 16384, createdFrame: 2 },
+    { kind: RESOURCE_KIND.BIND_GROUP, id: 20, byteSize: 64, createdFrame: 5 },
+    { kind: RESOURCE_KIND.BUFFER, id: 10, byteSize: 2048, createdFrame: 5 },
+    { kind: RESOURCE_KIND.RENDER_PIPELINE, id: 30, byteSize: 512, createdFrame: 7 },
+  ]);
+
+  // Strict sanitization: ONLY { kind, id, byteSize, createdFrame } keys; zero labels/tags/GPU handles.
+  for (const item of allOldest) {
+    assert.deepEqual(Object.keys(item).sort(), ['byteSize', 'createdFrame', 'id', 'kind']);
+    assert.equal('label' in item, false);
+    assert.equal('tag' in item, false);
+    assert.equal('resource' in item, false);
+    assert.equal('handle' in item, false);
+    assert.equal('registeredAtFrame' in item, false);
+    assert.equal('registrationSeq' in item, false);
+  }
+  const serialized = JSON.stringify(allOldest);
+  assert.equal(serialized.includes('secret'), false);
+  assert.equal(serialized.includes('host'), false);
+  assert.equal(serialized.includes('private'), false);
+
+  // Limit truncation works accurately.
+  assert.deepEqual(reg.getOldestLiveResources(2), allOldest.slice(0, 2));
+  assert.deepEqual(reg.getOldestLiveResources(0), []);
+
+  // Default limit is 16 when > 16 resources are live.
+  reg.beginFrame(8);
+  for (let i = 0; i < 20; i += 1) {
+    reg.register(RESOURCE_KIND.BUFFER, 500 + i, createDestroyableMock(`extra-${i}`), {
+      byteSize: 256,
+    });
+  }
+  const defaultLimited = reg.getOldestLiveResources();
+  assert.equal(defaultLimited.length, 16);
+  assert.deepEqual(defaultLimited.slice(0, 4), allOldest);
+  assert.equal(defaultLimited[4].id, 500);
+  assert.equal(defaultLimited[15].id, 511);
+
+  // Validation rejects invalid limits.
+  assert.throws(() => reg.getOldestLiveResources(-1), RangeError);
+  assert.throws(() => reg.getOldestLiveResources(1.5), RangeError);
+  assert.throws(() => reg.getOldestLiveResources(NaN), RangeError);
+  assert.throws(() => reg.getOldestLiveResources('16'), RangeError);
+
+  // destroyAll clears live entries.
+  reg.destroyAll();
+  assert.deepEqual(reg.getOldestLiveResources(), []);
+});
