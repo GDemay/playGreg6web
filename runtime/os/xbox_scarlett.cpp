@@ -2668,6 +2668,55 @@ bool xmem_virtual_free(void* address) {
     return true;
 }
 
+bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* entry)>& entry_at,
+                               const uint8_t* data,
+                               size_t len) {
+    auto& st = xmem_state();
+    std::unique_lock<std::mutex> lock(st.mutex);
+    wait_idle_locked(st, lock);  // no page bytes in flight while they are written
+    auto find_page = [&](uint64_t entry) -> PhysicalPage* {
+        if ((entry & (kXMemPageSize4K - 1)) == 0) {
+            auto it = st.physical_pages.find(entry >> 12);  // a physical address
+            if (it != st.physical_pages.end()) {
+                return it->second.get();
+            }
+        }
+        auto it = st.physical_pages.find(entry);  // a frame number
+        return it != st.physical_pages.end() ? it->second.get() : nullptr;
+    };
+    std::vector<PhysicalPage*> pages;
+    for (size_t done = 0; done < len;) {
+        uint64_t entry = 0;
+        if (!entry_at(pages.size(), &entry)) {
+            return false;
+        }
+        PhysicalPage* page = find_page(entry);
+        if (page == nullptr) {
+            return false;
+        }
+        pages.push_back(page);
+        done += static_cast<size_t>(std::min<uint64_t>(page->page_size, len - done));
+    }
+    size_t off = 0;
+    for (PhysicalPage* page : pages) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(page->page_size, len - off));
+        uint8_t* bytes = page_bytes_locked(*page);
+        if (bytes == nullptr) {
+            return false;
+        }
+        std::memcpy(bytes, data + off, n);
+        if (page->home_va != 0) {
+            guest_window::mark_written(page->home_va, n);
+            mark_mirror_locked(st, page->home_va, n);
+        }
+        for (const uint64_t w : page->window_slots) {
+            guest_window::mark_written(w, n);
+        }
+        off += n;
+    }
+    return true;
+}
+
 bool xmem_unmap_physical_pages(void* virtual_address) {
     if (virtual_address == nullptr) {
         return false;

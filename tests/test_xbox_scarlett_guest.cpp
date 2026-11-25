@@ -748,6 +748,70 @@ void test_requests_round_trip() {
     CHECK(fx.vcall(factory, 2) == 1);
 }
 
+void test_dstorage_option_parsing() {
+    static_assert(ga::parse_dstorage_options(0x200001u).zlib);
+    const ga::DStorageOptions z = ga::parse_dstorage_options(0x200001u);
+    CHECK(z.zlib && z.physical_pages && z.bcpack_mode == 0 && !z.source_memory && z.unknown_bits == 0);
+    const ga::DStorageOptions plain = ga::parse_dstorage_options(0);
+    CHECK(!plain.compressed() && !plain.physical_pages && plain.unknown_bits == 0);
+    for (uint64_t mode = 1; mode < 16; ++mode) {
+        const ga::DStorageOptions b = ga::parse_dstorage_options(mode << 1);
+        CHECK(b.bcpack_mode == mode && !b.zlib && b.compressed() && b.unknown_bits == 0);
+    }
+    const ga::DStorageOptions m = ga::parse_dstorage_options(ga::kDStorageOptionSourceMemory | 1);
+    CHECK(m.source_memory && m.zlib && m.unknown_bits == 0);
+    CHECK(ga::parse_dstorage_options(1ull << 5).unknown_bits == (1ull << 5));  // the old 0xFF mask hid these
+    CHECK(ga::parse_dstorage_options(1ull << 9).unknown_bits == (1ull << 9));
+}
+
+void test_physical_page_scatter() {
+    using namespace playgta6::os::scarlett;
+    size_t count = 3;
+    uint64_t pfn[3] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &count, pfn) == 1);
+    std::vector<uint8_t> data(2 * 65536 + 100);
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<uint8_t>(i * 7 + (i >> 16));
+    }
+    // Entries as physical addresses and as frame numbers, out of order.
+    const std::vector<uint64_t> entries = {pfn[2] << 12, pfn[0], pfn[1] << 12};
+    auto entry_at = [&](size_t i, uint64_t* e) {
+        if (i >= entries.size()) {
+            return false;
+        }
+        *e = entries[i];
+        return true;
+    };
+    CHECK(xmem_write_physical_pages(entry_at, data.data(), data.size()));
+    const uint64_t order[3] = {pfn[2], pfn[0], pfn[1]};
+    for (size_t k = 0; k < 3; ++k) {
+        auto* p = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &order[k]));
+        CHECK(p != nullptr);
+        const size_t n = std::min<size_t>(65536, data.size() - k * 65536);
+        CHECK(std::memcmp(p, data.data() + k * 65536, n) == 0);
+        if (n < 65536) {
+            CHECK(p[n] == 0);  // the tail of the last page is untouched
+        }
+        CHECK(xmem_unmap_physical_pages(p));
+    }
+    // An unknown page or an unreadable array entry writes nothing.
+    const std::vector<uint64_t> bogus = {pfn[0], 0xDEAD0000ull};
+    auto bogus_at = [&](size_t i, uint64_t* e) {
+        if (i >= bogus.size()) {
+            return false;
+        }
+        *e = bogus[i];
+        return true;
+    };
+    std::vector<uint8_t> ones(4 * 65536, 0xFF);
+    CHECK(!xmem_write_physical_pages(bogus_at, ones.data(), 65536 + 1));
+    CHECK(!xmem_write_physical_pages(entry_at, ones.data(), ones.size()));  // a 4th entry is missing
+    auto* p0 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+    CHECK(p0 != nullptr && std::memcmp(p0, data.data() + 65536, 65536) == 0);
+    CHECK(xmem_unmap_physical_pages(p0));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(3, pfn) == 1);
+}
+
 void test_compressed_and_memory_sources() {
     Fixture fx;
     std::vector<uint8_t> blob(100, 0xEE);
@@ -760,7 +824,7 @@ void test_compressed_and_memory_sources() {
     const uint64_t dest = com::guest_alloc(65536);
 
     ga::DStorageRequest r = file_request(file, 100, sizeof(kZlibPage64k), dest, 65536);
-    r.options = ga::kDStorageFormatZlib;  // bit 0: the title's hardware-decompressed format
+    r.options = ga::kDStorageOptionZlib;  // bit 0: the title's hardware-decompressed format
     fx.enqueue(queue, r);
     fx.vcall(queue, 4, {I(status), I(1)});
     // Memory source (bit 22): copy 64 bytes of guest memory.
@@ -781,7 +845,7 @@ void test_compressed_and_memory_sources() {
     // A truncated compressed stream fails with ERROR_INVALID_DATA.
     const uint64_t dest3 = com::guest_alloc(65536);
     ga::DStorageRequest bad = file_request(file, 100, sizeof(kZlibPage64k) - 20, dest3, 65536);
-    bad.options = ga::kDStorageFormatZlib;
+    bad.options = ga::kDStorageOptionZlib;
     fx.enqueue(queue, bad);
     fx.vcall(queue, 4, {I(status), I(2)});
     fx.vcall(queue, 6);
@@ -793,19 +857,42 @@ void test_compressed_and_memory_sources() {
     CHECK(guest_bytes(dest2, 64) == mem);
     CHECK(ga::dstorage_stats().decompressed_requests == 1);
 
-    // Option bit 21 on a zlib file request (the title's 0x200001, R40) is accepted and ignored.
-    const uint64_t dest4 = com::guest_alloc(65536);
-    ga::DStorageRequest f21 = file_request(file, 100, sizeof(kZlibPage64k), dest4, 65536);
-    f21.options = ga::kDStorageFormatZlib | ga::kDStorageOptionIgnoredFlag21;
-    CHECK(f21.options == 0x200001u);
-    const uint64_t flag21_before = ga::dstorage_stats().flag21_requests;
-    fx.enqueue(queue, f21);
+    // DestinationIsPhysicalPages (bit 21, the title's 0x200001): `destination` is a guest array of
+    // physical page addresses; the inflated bytes go into those pages, not over the array.
+    size_t page_count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(16);
+    const uint64_t entries[2] = {pfn[1] << 12, pfn[0] << 12};  // scattered: second page first
+    CHECK(com::write_guest(page_array, entries, sizeof(entries)));
+    ga::DStorageRequest pp = file_request(file, 100, sizeof(kZlibPage64k), page_array, 65536);
+    pp.options = ga::kDStorageOptionZlib | ga::kDStorageOptionDestinationIsPhysicalPages;
+    CHECK(pp.options == 0x200001u);
+    const uint64_t pp_before = ga::dstorage_stats().physical_page_requests;
+    fx.enqueue(queue, pp);
     fx.vcall(queue, 4, {I(status), I(3)});
     fx.vcall(queue, 6);
     CHECK(fx.wait_complete(status, 3));
     CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == 0);
-    CHECK(guest_bytes(dest4, 65536) == pattern_data(65536));
-    CHECK(ga::dstorage_stats().flag21_requests == flag21_before + 1);
+    CHECK(ga::dstorage_stats().physical_page_requests == pp_before + 1);
+    std::vector<uint8_t> array_after(16);
+    CHECK(com::read_guest(page_array, array_after.data(), 16));
+    CHECK(std::memcmp(array_after.data(), entries, 16) == 0);  // the array is left alone
+    {
+        auto* p1 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        CHECK(p1 != nullptr && std::vector<uint8_t>(p1, p1 + 65536) == pattern_data(65536));
+        CHECK(os::scarlett::xmem_unmap_physical_pages(p1));
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+
+    // BCPack (bits 1-4) fails truthfully.
+    ga::DStorageRequest bc = file_request(file, 100, 16, dest, 65536);
+    bc.options = 3ull << 1;
+    fx.enqueue(queue, bc);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
 
     // Unsupported compression format and option bits.
     ga::DStorageRequest f2 = file_request(file, 100, 16, dest, 65536);
@@ -2119,6 +2206,8 @@ int main() {
     test_factory_identity_and_stubs();
     test_open_file_and_information();
     test_requests_round_trip();
+    test_dstorage_option_parsing();
+    test_physical_page_scatter();
     test_compressed_and_memory_sources();
     test_errors_and_error_record();
     test_cancel_close_and_signal();
