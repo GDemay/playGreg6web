@@ -8,10 +8,18 @@ const {
   AUDIO_RING_STRUCT_BYTES_WASM64,
   AUDIO_RING_STRUCT_BYTES_WASM32,
   AUDIO_RING_CHANNELS,
+  DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS,
+  DEFAULT_AUDIO_RING_MAX_RETRIES,
+  AUDIO_RING_REASON,
+  GPU_OPCODE_PRESENT,
+  sanitizeAudioRingReason,
+  probePlaygta6AudioRingDescriptor,
   readPlaygta6AudioRingDescriptor,
   attachRuntimeAudioRing,
   resetAttachedRuntimeAudioRing,
+  scheduleAudioRingRetry,
   buildRuntimeModuleConfig,
+  getLoaderStatus,
 } = require('../web/loader.js');
 
 const { AudioMixerWorker } = require('../web/workers/audio_worker.js');
@@ -446,4 +454,590 @@ test('W254 end-to-end integration with audio_worker.js AudioMixerWorker + GuestP
     );
   }
   assert.equal(Atomics.load(readIdx, 0) >>> 0, 22, 'read_index must advance atomically across wrap to 22 floats');
+});
+
+function createFakeTimerHarness() {
+  let nextId = 1;
+  let now = 0;
+  const active = new Map();
+  const scheduled = [];
+  let clearCount = 0;
+
+  function setTimeoutFn(fn, delayMs) {
+    const id = nextId++;
+    const entry = {
+      id,
+      fn,
+      delayMs,
+      dueAt: now + Math.max(0, Number(delayMs) || 0),
+    };
+    active.set(id, entry);
+    scheduled.push({ id, delayMs });
+    return id;
+  }
+
+  function clearTimeoutFn(id) {
+    if (active.delete(id)) {
+      clearCount += 1;
+    }
+  }
+
+  function tickNext() {
+    if (active.size === 0) {
+      return false;
+    }
+    let earliest = null;
+    for (const entry of active.values()) {
+      if (!earliest || entry.dueAt < earliest.dueAt || (entry.dueAt === earliest.dueAt && entry.id < earliest.id)) {
+        earliest = entry;
+      }
+    }
+    active.delete(earliest.id);
+    now = earliest.dueAt;
+    earliest.fn();
+    return true;
+  }
+
+  function runAll(limit = 500) {
+    let ticks = 0;
+    while (active.size > 0 && ticks < limit) {
+      tickNext();
+      ticks += 1;
+    }
+    return ticks;
+  }
+
+  return {
+    setTimeoutFn,
+    clearTimeoutFn,
+    tickNext,
+    runAll,
+    getActiveCount: () => active.size,
+    getScheduled: () => scheduled.slice(),
+    getClearCount: () => clearCount,
+  };
+}
+
+test('W308 constants, probePlaygta6AudioRingDescriptor reasons, and sanitizeAudioRingReason enum mapping', () => {
+  assert.equal(DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS, 250);
+  assert.equal(DEFAULT_AUDIO_RING_MAX_RETRIES, 120);
+  assert.deepEqual(AUDIO_RING_REASON, {
+    OK: 'ok',
+    NULL_PTR: 'null_ptr',
+    NO_EXPORT: 'no_export',
+    WORKER_NOT_READY: 'worker_not_ready',
+    INVALID_STRUCT: 'invalid_struct',
+  });
+
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 64 });
+  assert.equal(probePlaygta6AudioRingDescriptor({}, layout.buffer).reason, 'no_export');
+  assert.equal(
+    probePlaygta6AudioRingDescriptor({ _playgta6_audio_ring: () => 0n }, layout.buffer).reason,
+    'null_ptr',
+  );
+  assert.equal(
+    probePlaygta6AudioRingDescriptor({ _playgta6_audio_ring: () => 0 }, layout.buffer).reason,
+    'null_ptr',
+  );
+  // Misaligned pointer -> invalid_struct
+  assert.equal(
+    probePlaygta6AudioRingDescriptor({ _playgta6_audio_ring: () => 68n }, layout.buffer).reason,
+    'invalid_struct',
+  );
+  // Valid Wasm64 struct -> ok
+  const okProbe = probePlaygta6AudioRingDescriptor(
+    { _playgta6_audio_ring: () => BigInt(layout.structOffset) },
+    layout.buffer,
+  );
+  assert.equal(okProbe.reason, 'ok');
+  assert.ok(okProbe.descriptor);
+
+  assert.equal(sanitizeAudioRingReason('ok'), 'ok');
+  assert.equal(sanitizeAudioRingReason('null_ptr'), 'null_ptr');
+  assert.equal(sanitizeAudioRingReason('no_export'), 'no_export');
+  assert.equal(sanitizeAudioRingReason('worker_not_ready'), 'worker_not_ready');
+  assert.equal(sanitizeAudioRingReason('invalid_struct'), 'invalid_struct');
+  assert.equal(sanitizeAudioRingReason('no-audio-worker'), 'worker_not_ready');
+  assert.equal(sanitizeAudioRingReason('audio-worker-not-ready'), 'worker_not_ready');
+  assert.equal(sanitizeAudioRingReason('post-message-error'), 'worker_not_ready');
+  assert.equal(sanitizeAudioRingReason('non-shared-buffer'), 'invalid_struct');
+  assert.equal(sanitizeAudioRingReason('unknown-anything'), 'invalid_struct');
+
+  const status = getLoaderStatus();
+  assert.equal(typeof status.audioRingAttached, 'boolean');
+  assert.equal(typeof status.audioRingRetryCount, 'number');
+  assert.ok(
+    status.audioRingLastReason === null ||
+      Object.values(AUDIO_RING_REASON).includes(status.audioRingLastReason),
+  );
+});
+
+test('W308 lazy ring init (0n for first 3 polls then valid Wasm64 struct) attaches automatically and stops timers', () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 128, sampleRate: 48000 });
+  const timers = createFakeTimerHarness();
+  const posted = [];
+  const reports = [];
+  const worker = { postMessage: (msg) => posted.push(msg) };
+
+  let ringCalls = 0;
+  const mod = {
+    _playgta6_audio_ring() {
+      ringCalls += 1;
+      // First 3 polls (initial + 2 retries) return 0n before XAudio2 initializes the ring;
+      // 4th poll (3rd retry) returns the valid Wasm64 struct pointer.
+      return ringCalls <= 3 ? 0n : BigInt(layout.structOffset);
+    },
+    wasmMemory: { buffer: layout.buffer },
+  };
+
+  const cfg = buildRuntimeModuleConfig({
+    audioWorker: worker,
+    instantiateWasm: false,
+    reportFn: (line) => reports.push(line),
+    audioRingSetTimeoutFn: timers.setTimeoutFn,
+    audioRingClearTimeoutFn: timers.clearTimeoutFn,
+  });
+
+  cfg.onRuntimeInitialized.call(mod);
+
+  // Initial probe saw 0n -> null_ptr, scheduled first 250ms retry.
+  assert.equal(posted.length, 0);
+  assert.equal(timers.getActiveCount(), 1);
+  assert.equal(timers.getScheduled()[0].delayMs, 250);
+  let telem = cfg.getAudioRingTelemetry();
+  assert.equal(telem.audioRingAttached, false);
+  assert.equal(telem.audioRingRetryCount, 0);
+  assert.equal(telem.audioRingLastReason, 'null_ptr');
+  assert.equal(telem.audioRingRetryPending, true);
+  assert.equal(telem.audioRingMaxRetries, 120);
+  assert.equal(telem.audioRingRetryIntervalMs, 250);
+
+  // Retry 1 -> still 0n
+  assert.equal(timers.tickNext(), true);
+  assert.equal(posted.length, 0);
+  assert.equal(timers.getActiveCount(), 1);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingRetryCount, 1);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingLastReason, 'null_ptr');
+
+  // Retry 2 -> still 0n
+  assert.equal(timers.tickNext(), true);
+  assert.equal(posted.length, 0);
+  assert.equal(timers.getActiveCount(), 1);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingRetryCount, 2);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingLastReason, 'null_ptr');
+
+  // Retry 3 -> valid Wasm64 struct pointer -> attaches automatically and stops polling!
+  assert.equal(timers.tickNext(), true);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].type, 'attach-guest-pcm-ring');
+  assert.equal(posted[0].dataByteOffset, layout.base);
+  assert.equal(posted[0].capacitySamples, 128);
+  assert.equal(posted[0].readIndexByteOffset, layout.readIndexPtr);
+  assert.equal(posted[0].writeIndexByteOffset, layout.writeIndexPtr);
+  assert.equal(timers.getActiveCount(), 0, 'retry timer must stop immediately upon attach');
+
+  telem = cfg.getAudioRingTelemetry();
+  assert.equal(telem.audioRingAttached, true);
+  assert.equal(telem.audioRingRetryCount, 3);
+  assert.equal(telem.audioRingLastReason, 'ok');
+  assert.equal(telem.audioRingRetryPending, false);
+  assert.ok(cfg.getAudioRingDescriptor());
+  assert.ok(
+    reports.some((line) => line.includes('audio_ring_attached=true') && line.includes('retries=3')),
+    'should emit sanitized audio_ring_attached=true progress telemetry on attach',
+  );
+
+  // No further timers exist.
+  assert.equal(timers.tickNext(), false);
+});
+
+test('W308 delayed audioWorker readiness attaches automatically via polling, onAudioWorkerReady, and setAudioWorker', () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 64 });
+  const mod = {
+    _playgta6_audio_ring: () => BigInt(layout.structOffset),
+    wasmMemory: { buffer: layout.buffer },
+  };
+
+  // Case 1: audioWorker becomes ready later and auto-retry poller attaches without explicit notify
+  const timersA = createFakeTimerHarness();
+  const postedA = [];
+  let workerReadyA = false;
+  let workerA = null;
+  const cfgA = buildRuntimeModuleConfig({
+    getAudioWorker: () => workerA,
+    isAudioWorkerReady: () => workerReadyA,
+    instantiateWasm: false,
+    audioRingRetryIntervalMs: 50,
+    audioRingMaxRetries: 10,
+    audioRingSetTimeoutFn: timersA.setTimeoutFn,
+    audioRingClearTimeoutFn: timersA.clearTimeoutFn,
+  });
+
+  cfgA.onRuntimeInitialized.call(mod);
+  assert.equal(postedA.length, 0);
+  assert.equal(timersA.getActiveCount(), 1);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingLastReason, 'worker_not_ready');
+
+  // Tick 1: worker created but not ready yet
+  workerA = { postMessage: (msg) => postedA.push(msg) };
+  assert.equal(timersA.tickNext(), true);
+  assert.equal(postedA.length, 0);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingRetryCount, 1);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingLastReason, 'worker_not_ready');
+
+  // Tick 2: worker reports ready -> poller attaches automatically and clears timer
+  workerReadyA = true;
+  assert.equal(timersA.tickNext(), true);
+  assert.equal(postedA.length, 1);
+  assert.equal(timersA.getActiveCount(), 0);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingAttached, true);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingRetryCount, 2);
+  assert.equal(cfgA.getAudioRingTelemetry().audioRingLastReason, 'ok');
+
+  // Case 2: onAudioWorkerReady triggers immediate probe when ring is still 0n, then retry finishes attach
+  const timersB = createFakeTimerHarness();
+  const postedB = [];
+  const workerB = { postMessage: (msg) => postedB.push(msg) };
+  let ringReadyB = false;
+  const lazyModB = {
+    _playgta6_audio_ring: () => (ringReadyB ? BigInt(layout.structOffset) : 0n),
+    wasmMemory: { buffer: layout.buffer },
+  };
+  const cfgB = buildRuntimeModuleConfig({
+    getAudioWorker: () => workerB,
+    isAudioWorkerReady: () => false,
+    instantiateWasm: false,
+    audioRingRetryIntervalMs: 100,
+    audioRingMaxRetries: 10,
+    audioRingSetTimeoutFn: timersB.setTimeoutFn,
+    audioRingClearTimeoutFn: timersB.clearTimeoutFn,
+  });
+
+  cfgB.onRuntimeInitialized.call(lazyModB);
+  assert.equal(cfgB.getAudioRingTelemetry().audioRingLastReason, 'worker_not_ready');
+  assert.equal(timersB.getActiveCount(), 1);
+
+  // audioWorker becomes ready while ring still returns 0n -> immediate probe transitions reason to null_ptr and keeps polling
+  cfgB.onAudioWorkerReady(workerB);
+  assert.equal(postedB.length, 0);
+  assert.equal(cfgB.getAudioRingTelemetry().audioRingLastReason, 'null_ptr');
+  assert.equal(cfgB.getAudioRingTelemetry().audioRingRetryCount, 1);
+  assert.equal(timersB.getActiveCount(), 1);
+
+  // Next retry sees valid ring -> attaches immediately and stops timers
+  ringReadyB = true;
+  assert.equal(timersB.tickNext(), true);
+  assert.equal(postedB.length, 1);
+  assert.equal(timersB.getActiveCount(), 0);
+  assert.equal(cfgB.getAudioRingTelemetry().audioRingAttached, true);
+  assert.equal(cfgB.getAudioRingTelemetry().audioRingLastReason, 'ok');
+
+  // Case 3: setAudioWorker triggers immediate probe and cancels pending retry timer
+  const timersC = createFakeTimerHarness();
+  const postedC = [];
+  const workerC = { postMessage: (msg) => postedC.push(msg) };
+  const cfgC = buildRuntimeModuleConfig({
+    instantiateWasm: false,
+    audioRingRetryIntervalMs: 250,
+    audioRingSetTimeoutFn: timersC.setTimeoutFn,
+    audioRingClearTimeoutFn: timersC.clearTimeoutFn,
+  });
+
+  cfgC.onRuntimeInitialized.call(mod);
+  assert.equal(postedC.length, 0);
+  assert.equal(timersC.getActiveCount(), 1);
+  assert.equal(cfgC.getAudioRingTelemetry().audioRingLastReason, 'worker_not_ready');
+
+  const setRes = cfgC.setAudioWorker(workerC);
+  assert.equal(setRes.attached, true);
+  assert.equal(postedC.length, 1);
+  assert.equal(timersC.getActiveCount(), 0, 'setAudioWorker must cancel pending retry timer on immediate attach');
+  assert.equal(cfgC.getAudioRingTelemetry().audioRingAttached, true);
+  assert.equal(cfgC.getAudioRingTelemetry().audioRingLastReason, 'ok');
+});
+
+test('W308 immediate probe retry fires on FIRST_PRESENT and guest audio milestone logs (even after retry exhaustion)', () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 64 });
+  const timers = createFakeTimerHarness();
+  const posted = [];
+  const worker = { postMessage: (msg) => posted.push(msg) };
+
+  let ringReady = false;
+  const mod = {
+    _playgta6_audio_ring: () => (ringReady ? BigInt(layout.structOffset) : 0n),
+    wasmMemory: { buffer: layout.buffer },
+  };
+
+  let firstPresentSeen = 0;
+  const cfg = buildRuntimeModuleConfig({
+    audioWorker: worker,
+    memory: layout.buffer,
+    instantiateWasm: false,
+    audioRingRetryIntervalMs: 250,
+    audioRingMaxRetries: 2,
+    audioRingSetTimeoutFn: timers.setTimeoutFn,
+    audioRingClearTimeoutFn: timers.clearTimeoutFn,
+    onFirstPresent: () => {
+      firstPresentSeen += 1;
+    },
+  });
+
+  cfg.onRuntimeInitialized.call(mod);
+  assert.equal(timers.getActiveCount(), 1);
+  assert.equal(posted.length, 0);
+
+  // Guest initializes ring and submits a Present packet (opcode 7) BEFORE timer tick fires.
+  ringReady = true;
+  const pktOffset = 1024;
+  const dv = new DataView(layout.buffer, pktOffset, 8);
+  dv.setUint16(0, GPU_OPCODE_PRESENT, true);
+  dv.setUint16(2, 0, true);
+  dv.setUint32(4, 0, true);
+
+  cfg.hostImports.env.host_wgpu_submit(BigInt(pktOffset), 8n);
+  assert.equal(firstPresentSeen, 1);
+  assert.equal(posted.length, 1, 'FIRST_PRESENT must immediately probe and attach audio ring');
+  assert.equal(timers.getActiveCount(), 0, 'FIRST_PRESENT attach must cancel pending retry timer');
+  assert.equal(cfg.getAudioRingTelemetry().audioRingAttached, true);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingLastReason, 'ok');
+
+  // Now verify guest audio milestone log triggers immediate probe even after bounded retries exhausted.
+  const timers2 = createFakeTimerHarness();
+  const posted2 = [];
+  const worker2 = { postMessage: (msg) => posted2.push(msg) };
+  let ringReady2 = false;
+  const mod2 = {
+    _playgta6_audio_ring: () => (ringReady2 ? BigInt(layout.structOffset) : 0n),
+    wasmMemory: { buffer: layout.buffer },
+  };
+  const logs2 = [];
+  const cfg2 = buildRuntimeModuleConfig({
+    audioWorker: worker2,
+    memory: layout.buffer,
+    instantiateWasm: false,
+    log: (m) => logs2.push(m),
+    audioRingRetryIntervalMs: 10,
+    audioRingMaxRetries: 2,
+    audioRingSetTimeoutFn: timers2.setTimeoutFn,
+    audioRingClearTimeoutFn: timers2.clearTimeoutFn,
+  });
+
+  cfg2.onRuntimeInitialized.call(mod2);
+  timers2.runAll();
+  assert.equal(timers2.getActiveCount(), 0);
+  assert.equal(cfg2.getAudioRingTelemetry().audioRingRetryExhausted, true);
+  assert.equal(cfg2.getAudioRingTelemetry().audioRingRetryCount, 2);
+  assert.equal(posted2.length, 0);
+
+  // Guest initializes XAudio2 later and logs via host_log -> triggers immediate probe!
+  ringReady2 = true;
+  const msgBytes = new TextEncoder().encode('XAudio2Create initialized stereo output');
+  const logOffset = 1536;
+  new Uint8Array(layout.buffer, logOffset, msgBytes.length).set(msgBytes);
+  cfg2.hostImports.env.host_log(BigInt(logOffset), BigInt(msgBytes.length));
+
+  assert.equal(logs2.length, 1);
+  assert.equal(posted2.length, 1, 'XAudio2 guest milestone log must trigger immediate audio ring attach');
+  assert.equal(cfg2.getAudioRingTelemetry().audioRingAttached, true);
+  assert.equal(cfg2.getAudioRingTelemetry().audioRingLastReason, 'ok');
+  assert.equal(timers2.getActiveCount(), 0);
+});
+
+test('W308 timer cleanup on destroy() and reset() guarantees zero leaked timers', () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 64 });
+  const timers = createFakeTimerHarness();
+  const posted = [];
+  const worker = { postMessage: (msg) => posted.push(msg) };
+
+  let ptrVal = 0n;
+  const mod = {
+    _playgta6_audio_ring: () => ptrVal,
+    wasmMemory: { buffer: layout.buffer },
+  };
+
+  // 1. Standalone scheduleAudioRingRetry: reset() cancels timer & clears counters; destroy() permanently stops timers.
+  const poller = scheduleAudioRingRetry({
+    module: mod,
+    audioWorker: worker,
+    retryIntervalMs: 100,
+    maxRetries: 20,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  assert.equal(timers.getActiveCount(), 1);
+  assert.equal(timers.tickNext(), true);
+  assert.equal(poller.getTelemetry().audioRingRetryCount, 1);
+  assert.equal(timers.getActiveCount(), 1);
+
+  poller.reset();
+  assert.equal(timers.getActiveCount(), 0, 'reset() must cancel active retry timer');
+  assert.equal(poller.getTelemetry().audioRingRetryCount, 0);
+  assert.equal(poller.getTelemetry().audioRingLastReason, null);
+  assert.equal(poller.getTelemetry().audioRingRetryPending, false);
+
+  // Can re-schedule cleanly after reset(), then destroy() permanently prevents further timers.
+  poller.schedule({ immediate: true });
+  assert.equal(timers.getActiveCount(), 1);
+  poller.destroy();
+  assert.equal(timers.getActiveCount(), 0, 'destroy() must cancel active retry timer');
+  assert.equal(poller.getTelemetry().destroyed, true);
+
+  // Post-destroy triggers must NEVER leak timers or attach.
+  ptrVal = BigInt(layout.structOffset);
+  poller.schedule({ immediate: true });
+  poller.onAudioWorkerReady(worker);
+  poller.setAudioWorker(worker);
+  poller.notifyGuestMilestone('first_present');
+  assert.equal(timers.getActiveCount(), 0);
+  assert.equal(posted.length, 0);
+
+  // 2. buildRuntimeModuleConfig: reset() and destroy() clean up timers without leaking.
+  ptrVal = 0n;
+  const timersCfg = createFakeTimerHarness();
+  const cfg = buildRuntimeModuleConfig({
+    audioWorker: worker,
+    instantiateWasm: false,
+    audioRingRetryIntervalMs: 250,
+    audioRingMaxRetries: 120,
+    audioRingSetTimeoutFn: timersCfg.setTimeoutFn,
+    audioRingClearTimeoutFn: timersCfg.clearTimeoutFn,
+  });
+  cfg.onRuntimeInitialized.call(mod);
+  assert.equal(timersCfg.getActiveCount(), 1);
+
+  cfg.reset();
+  assert.equal(timersCfg.getActiveCount(), 0, 'config.reset() must cancel active retry timer');
+  assert.equal(cfg.getAudioRingTelemetry().audioRingRetryCount, 0);
+  assert.equal(cfg.getAudioRingTelemetry().audioRingLastReason, null);
+
+  cfg.onRuntimeInitialized.call(mod);
+  assert.equal(timersCfg.getActiveCount(), 1);
+  cfg.destroy();
+  assert.equal(timersCfg.getActiveCount(), 0, 'config.destroy() must cancel active retry timer');
+  assert.equal(cfg.getAudioRingTelemetry().destroyed, true);
+});
+
+test('W308 bounded maxRetries termination, invalid_struct recovery, and no_export early stop', () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 64 });
+
+  // 1. Bounded maxRetries termination
+  const timers = createFakeTimerHarness();
+  const posted = [];
+  const worker = { postMessage: (msg) => posted.push(msg) };
+  let exhaustedEvents = 0;
+  const poller = scheduleAudioRingRetry(
+    { _playgta6_audio_ring: () => 0n, wasmMemory: { buffer: layout.buffer } },
+    worker,
+    {
+      retryIntervalMs: 25,
+      maxRetries: 4,
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      onExhausted: () => {
+        exhaustedEvents += 1;
+      },
+    },
+  );
+
+  const ticks = timers.runAll();
+  assert.equal(ticks, 4, 'must run exactly maxRetries timer ticks');
+  assert.equal(timers.getActiveCount(), 0, 'must leave zero active timers after maxRetries');
+  assert.equal(exhaustedEvents, 1, 'onExhausted must fire once');
+  assert.equal(posted.length, 0);
+  const telem = poller.getTelemetry();
+  assert.equal(telem.audioRingAttached, false);
+  assert.equal(telem.audioRingRetryCount, 4);
+  assert.equal(telem.audioRingLastReason, 'null_ptr');
+  assert.equal(telem.audioRingRetryExhausted, true);
+  assert.equal(telem.audioRingRetryPending, false);
+
+  // 2. invalid_struct (zeroed struct memory) retries until guest populates struct fields
+  const timersInvalid = createFakeTimerHarness();
+  const sab = new SharedArrayBuffer(4096);
+  const postedInvalid = [];
+  const workerInvalid = { postMessage: (msg) => postedInvalid.push(msg) };
+  const modInvalid = {
+    _playgta6_audio_ring: () => 64n,
+    wasmMemory: { buffer: sab },
+  };
+  const pollerInvalid = scheduleAudioRingRetry(modInvalid, workerInvalid, {
+    retryIntervalMs: 20,
+    maxRetries: 5,
+    setTimeoutFn: timersInvalid.setTimeoutFn,
+    clearTimeoutFn: timersInvalid.clearTimeoutFn,
+  });
+  assert.equal(pollerInvalid.getTelemetry().audioRingLastReason, 'invalid_struct');
+  assert.equal(timersInvalid.getActiveCount(), 1);
+
+  // Populate valid Wasm64 struct before tick 1 -> attaches cleanly!
+  writeAudioRingStruct(
+    sab,
+    64,
+    { base: 256, capacity: 64, channels: 2, sampleRate: 48000, readIndexPtr: 128, writeIndexPtr: 132 },
+    { pointerSize: 8 },
+  );
+  assert.equal(timersInvalid.tickNext(), true);
+  assert.equal(postedInvalid.length, 1);
+  assert.equal(timersInvalid.getActiveCount(), 0);
+  assert.equal(pollerInvalid.getTelemetry().audioRingAttached, true);
+  assert.equal(pollerInvalid.getTelemetry().audioRingLastReason, 'ok');
+  assert.equal(pollerInvalid.getTelemetry().audioRingRetryCount, 1);
+
+  // 3. no_export does not spawn background timers
+  const timersNoExport = createFakeTimerHarness();
+  const pollerNoExport = scheduleAudioRingRetry({}, worker, {
+    retryIntervalMs: 25,
+    maxRetries: 10,
+    setTimeoutFn: timersNoExport.setTimeoutFn,
+    clearTimeoutFn: timersNoExport.clearTimeoutFn,
+  });
+  assert.equal(timersNoExport.getActiveCount(), 0, 'no_export must not spawn polling timers');
+  assert.equal(pollerNoExport.getTelemetry().audioRingLastReason, 'no_export');
+  assert.equal(pollerNoExport.getTelemetry().audioRingRetryCount, 0);
+});
+
+test('W308 real timer async auto-retry attaches lazy Wasm64 ring to real AudioMixerWorker with zero leaked handles', async () => {
+  const layout = createValidLayout({ shared: true, pointerSize: 8, capacity: 32, sampleRate: 48000 });
+  const replies = [];
+  const mixer = new AudioMixerWorker((reply) => replies.push(reply), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+  mixer.handleMessage({ init: true, sampleRate: 48000, channels: 2 });
+  const bridgeWorker = { postMessage: (msg) => mixer.handleMessage(msg) };
+
+  let polls = 0;
+  const mod = {
+    _playgta6_audio_ring() {
+      polls += 1;
+      return polls <= 3 ? 0n : BigInt(layout.structOffset);
+    },
+    wasmMemory: { buffer: layout.buffer },
+  };
+
+  let resolveAttached;
+  const attachedPromise = new Promise((resolve) => {
+    resolveAttached = resolve;
+  });
+
+  const poller = scheduleAudioRingRetry({
+    module: mod,
+    audioWorker: bridgeWorker,
+    retryIntervalMs: 5,
+    maxRetries: 20,
+    attachOptions: { id: 'w308-real-timer-attach' },
+    onAttached: (res, telem) => resolveAttached({ res, telem }),
+  });
+
+  const { res, telem } = await attachedPromise;
+  assert.equal(res.attached, true);
+  assert.equal(telem.audioRingAttached, true);
+  assert.equal(telem.audioRingRetryCount, 3);
+  assert.equal(telem.audioRingLastReason, 'ok');
+  assert.equal(telem.audioRingRetryPending, false);
+  assert.equal(poller.getTelemetry().audioRingRetryPending, false);
+
+  const reply = replies.find((r) => r && r.id === 'w308-real-timer-attach');
+  assert.ok(reply && reply.attached === true && reply.guestRingAttached === true);
 });

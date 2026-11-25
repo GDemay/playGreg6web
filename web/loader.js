@@ -48,6 +48,18 @@ const AUDIO_RING_MIN_CAPACITY_SAMPLES = 2;
 const AUDIO_RING_MAX_CAPACITY_SAMPLES = 1 << 24;
 const AUDIO_RING_MIN_SAMPLE_RATE = 8000;
 const AUDIO_RING_MAX_SAMPLE_RATE = 384000;
+const DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS = 250;
+const DEFAULT_AUDIO_RING_MAX_RETRIES = 120; // 120 * 250ms = 30s bounded retry window
+const AUDIO_RING_REASON = Object.freeze({
+  OK: 'ok',
+  NULL_PTR: 'null_ptr',
+  NO_EXPORT: 'no_export',
+  WORKER_NOT_READY: 'worker_not_ready',
+  INVALID_STRUCT: 'invalid_struct',
+});
+const AUDIO_RING_REASON_SET = new Set(Object.values(AUDIO_RING_REASON));
+const GUEST_AUDIO_MILESTONE_LOG_RE =
+  /(?:xaudio2|playgta6_audio_ring|audio[\s_-]*ring|spatial[\s_-]*audio|audio[\s_-]*downmix|wasapi|iaudiorenderclient)/i;
 const DEFAULT_MEMFS_PIPELINE_DUMP_DIR = '/pg6_dump';
 const DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT = '/__pg6_dump/';
 const DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS = 3000;
@@ -2796,16 +2808,56 @@ function resolveRuntimeMemoryBuffer(mod, explicitMemoryOrBuffer) {
   return null;
 }
 
+function sanitizeAudioRingReason(reason) {
+  if (typeof reason === 'string') {
+    const normalized = reason.trim().toLowerCase();
+    if (AUDIO_RING_REASON_SET.has(normalized)) {
+      return normalized;
+    }
+    if (
+      normalized === 'no-audio-worker' ||
+      normalized === 'audio-worker-not-ready' ||
+      normalized === 'post-message-error'
+    ) {
+      return AUDIO_RING_REASON.WORKER_NOT_READY;
+    }
+    if (normalized === 'non-shared-buffer' || normalized === 'no-audio-ring') {
+      return AUDIO_RING_REASON.INVALID_STRUCT;
+    }
+  }
+  return AUDIO_RING_REASON.INVALID_STRUCT;
+}
+
+function normalizeAudioRingRetryIntervalMs(value, fallback = DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+function normalizeAudioRingMaxRetries(value, fallback = DEFAULT_AUDIO_RING_MAX_RETRIES) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+    return fallback;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
 /**
  * Probe `playgta6_audio_ring()` on a Wasm module or exports object and decode the
  * `Playgta6AudioRing` struct (`runtime/os/audio_downmix.h`) from linear memory.
  *
- * Handles both Wasm64 (8-byte `uintptr_t`, 40-byte struct with 4-byte padding at +20,
- * `BigInt` return pointer) and Wasm32 (4-byte `uintptr_t`, 24-byte struct, `number`
- * return pointer). Returns a validated descriptor object compatible with
- * `audio_worker.js` (`GuestPcmRingReader`), or `null` on missing/invalid/out-of-bounds state.
+ * Returns `{ descriptor, reason }` where `reason` is one of the sanitized enum values:
+ * `'ok' | 'no_export' | 'null_ptr' | 'invalid_struct'`.
  */
-function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options) {
+function probePlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options) {
   let explicitMem = memoryBuffer;
   let opts = options;
   if (
@@ -2821,17 +2873,17 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
 
   const ptrGetter = resolveAudioRingPointerGetter(moduleOrExports, safeOpts.getAudioRingPtr);
   if (!ptrGetter) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.NO_EXPORT };
   }
 
   let rawPtr;
   try {
     rawPtr = ptrGetter();
   } catch {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (rawPtr === null || rawPtr === undefined || rawPtr === 0 || rawPtr === 0n) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.NULL_PTR };
   }
 
   const pointerSize =
@@ -2851,10 +2903,10 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
   try {
     structOffset = ptrToNumber(rawPtr, 'audioRingPtr');
   } catch {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (structOffset <= 0 || structOffset % pointerSize !== 0) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   const memCandidate =
@@ -2864,14 +2916,14 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
       : safeOpts.memory || safeOpts.buffer || null);
   const buf = resolveRuntimeMemoryBuffer(moduleOrExports, memCandidate);
   if (!buf || structOffset + structSize > buf.byteLength) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   let view;
   try {
     view = new DataView(buf);
   } catch {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   let rawBase;
@@ -2898,7 +2950,7 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
       rawWriteIndexPtr = view.getUint32(structOffset + 20, true);
     }
   } catch {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   let baseOffset;
@@ -2909,7 +2961,7 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
     readIndexOffset = ptrToNumber(rawReadIndexPtr, 'audioRing.read_index_ptr');
     writeIndexOffset = ptrToNumber(rawWriteIndexPtr, 'audioRing.write_index_ptr');
   } catch {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   if (
@@ -2918,68 +2970,84 @@ function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options)
     capacity > AUDIO_RING_MAX_CAPACITY_SAMPLES ||
     (capacity & (capacity - 1)) !== 0
   ) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (!Number.isInteger(channels) || channels !== AUDIO_RING_CHANNELS) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (
     !Number.isInteger(sampleRate) ||
     sampleRate < AUDIO_RING_MIN_SAMPLE_RATE ||
     sampleRate > AUDIO_RING_MAX_SAMPLE_RATE
   ) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   if (baseOffset <= 0 || baseOffset % Float32Array.BYTES_PER_ELEMENT !== 0) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (readIndexOffset <= 0 || readIndexOffset % Uint32Array.BYTES_PER_ELEMENT !== 0) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (writeIndexOffset <= 0 || writeIndexOffset % Uint32Array.BYTES_PER_ELEMENT !== 0) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   const dataByteLength = capacity * Float32Array.BYTES_PER_ELEMENT;
   const dataEnd = baseOffset + dataByteLength;
   if (dataEnd > buf.byteLength) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (readIndexOffset + Uint32Array.BYTES_PER_ELEMENT > buf.byteLength) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (writeIndexOffset + Uint32Array.BYTES_PER_ELEMENT > buf.byteLength) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (readIndexOffset === writeIndexOffset) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (readIndexOffset >= baseOffset && readIndexOffset < dataEnd) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
   if (writeIndexOffset >= baseOffset && writeIndexOffset < dataEnd) {
-    return null;
+    return { descriptor: null, reason: AUDIO_RING_REASON.INVALID_STRUCT };
   }
 
   return {
-    sab: buf,
-    buffer: buf,
-    base: baseOffset,
-    dataByteOffset: baseOffset,
-    capacity,
-    capacitySamples: capacity,
-    capacityFrames: capacity >>> 1,
-    channels,
-    sampleRate,
-    readIndexPtr: readIndexOffset,
-    readIndexByteOffset: readIndexOffset,
-    writeIndexPtr: writeIndexOffset,
-    writeIndexByteOffset: writeIndexOffset,
-    structOffset,
-    pointerSize,
-    isShared: isSharedArrayBufferValue(buf),
+    descriptor: {
+      sab: buf,
+      buffer: buf,
+      base: baseOffset,
+      dataByteOffset: baseOffset,
+      capacity,
+      capacitySamples: capacity,
+      capacityFrames: capacity >>> 1,
+      channels,
+      sampleRate,
+      readIndexPtr: readIndexOffset,
+      readIndexByteOffset: readIndexOffset,
+      writeIndexPtr: writeIndexOffset,
+      writeIndexByteOffset: writeIndexOffset,
+      structOffset,
+      pointerSize,
+      isShared: isSharedArrayBufferValue(buf),
+    },
+    reason: AUDIO_RING_REASON.OK,
   };
+}
+
+/**
+ * Probe `playgta6_audio_ring()` on a Wasm module or exports object and decode the
+ * `Playgta6AudioRing` struct (`runtime/os/audio_downmix.h`) from linear memory.
+ *
+ * Handles both Wasm64 (8-byte `uintptr_t`, 40-byte struct with 4-byte padding at +20,
+ * `BigInt` return pointer) and Wasm32 (4-byte `uintptr_t`, 24-byte struct, `number`
+ * return pointer). Returns a validated descriptor object compatible with
+ * `audio_worker.js` (`GuestPcmRingReader`), or `null` on missing/invalid/out-of-bounds state.
+ */
+function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options) {
+  return probePlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options).descriptor;
 }
 
 function resetAttachedRuntimeAudioRing(targetAudioWorker) {
@@ -3005,20 +3073,23 @@ function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}
       alreadyAttached: false,
       descriptor: null,
       reason: 'no-audio-worker',
+      statusReason: AUDIO_RING_REASON.WORKER_NOT_READY,
     };
   }
 
-  const descriptor = readPlaygta6AudioRingDescriptor(
+  const probe = probePlaygta6AudioRingDescriptor(
     moduleOrExports,
     safeOpts.memory || safeOpts.buffer || null,
     safeOpts,
   );
+  const descriptor = probe.descriptor;
   if (!descriptor) {
     return {
       attached: false,
       alreadyAttached: false,
       descriptor: null,
       reason: 'no-audio-ring',
+      statusReason: probe.reason,
     };
   }
 
@@ -3028,6 +3099,7 @@ function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}
       alreadyAttached: false,
       descriptor,
       reason: 'non-shared-buffer',
+      statusReason: AUDIO_RING_REASON.INVALID_STRUCT,
     };
   }
 
@@ -3042,6 +3114,7 @@ function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}
       attached: true,
       alreadyAttached: true,
       descriptor: previous.descriptor,
+      statusReason: AUDIO_RING_REASON.OK,
     };
   }
 
@@ -3086,6 +3159,7 @@ function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}
       alreadyAttached: false,
       descriptor,
       reason: 'post-message-error',
+      statusReason: AUDIO_RING_REASON.WORKER_NOT_READY,
     };
   }
 
@@ -3099,7 +3173,590 @@ function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}
     attached: true,
     alreadyAttached: false,
     descriptor,
+    statusReason: AUDIO_RING_REASON.OK,
   };
+}
+
+/**
+ * Bounded auto-retry controller for lazy `_playgta6_audio_ring()` discovery and delayed
+ * `audioWorker` readiness (W308 / #1259).
+ *
+ * - Polls at `retryIntervalMs` (default 250 ms) up to `maxRetries` (default 120 = 30 s).
+ * - Stops immediately upon successful attachment, `reset()`, `stop()`, or `destroy()`/`dispose()`.
+ * - Supports immediate probe triggers via `onAudioWorkerReady`, `setAudioWorker`, and
+ *   `notifyGuestMilestone` / `onFirstPresent`.
+ */
+function createAudioRingAttachmentController(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  let retryIntervalMs = normalizeAudioRingRetryIntervalMs(
+    safeOpts.retryIntervalMs !== undefined ? safeOpts.retryIntervalMs : safeOpts.intervalMs,
+    DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS,
+  );
+  let maxRetries = normalizeAudioRingMaxRetries(
+    safeOpts.maxRetries,
+    DEFAULT_AUDIO_RING_MAX_RETRIES,
+  );
+  const autoRetry = safeOpts.autoRetry !== false;
+  const retryOnNoExport = safeOpts.retryOnNoExport === true;
+  const setTimeoutFn =
+    typeof safeOpts.setTimeoutFn === 'function'
+      ? safeOpts.setTimeoutFn
+      : typeof setTimeout === 'function'
+        ? (fn, ms) => setTimeout(fn, ms)
+        : null;
+  const clearTimeoutFn =
+    typeof safeOpts.clearTimeoutFn === 'function'
+      ? safeOpts.clearTimeoutFn
+      : typeof clearTimeout === 'function'
+        ? (id) => clearTimeout(id)
+        : null;
+
+  let boundModule =
+    safeOpts.module && typeof safeOpts.module === 'object' ? safeOpts.module : null;
+  let pendingModule = null;
+  let dynamicWorker = undefined;
+  let dynamicWorkerReady = undefined;
+  let activeDescriptor = null;
+  let activeWorker = null;
+  let retryTimerId = null;
+  let retryCount = 0;
+  let scheduledRetries = 0;
+  let lastReason = null;
+  let hasAttempted = false;
+  let retryExhausted = false;
+  let destroyed = false;
+
+  function clearRetryTimer() {
+    if (retryTimerId !== null) {
+      const id = retryTimerId;
+      retryTimerId = null;
+      if (clearTimeoutFn) {
+        try {
+          clearTimeoutFn(id);
+        } catch {
+          // Ignore timer teardown errors.
+        }
+      }
+    }
+  }
+
+  function resolveModule(modOverride) {
+    if (modOverride && typeof modOverride === 'object') {
+      boundModule = modOverride;
+      return modOverride;
+    }
+    if (typeof safeOpts.getModule === 'function') {
+      try {
+        const dynamicMod = safeOpts.getModule();
+        if (dynamicMod && typeof dynamicMod === 'object') {
+          boundModule = dynamicMod;
+          return dynamicMod;
+        }
+      } catch {
+        // Ignore dynamic module getter errors.
+      }
+    }
+    return boundModule || pendingModule || null;
+  }
+
+  function resolveWorker(workerOverride) {
+    if (workerOverride && typeof workerOverride.postMessage === 'function') {
+      return workerOverride;
+    }
+    if (dynamicWorker !== undefined) {
+      return dynamicWorker;
+    }
+    if (typeof safeOpts.getAudioWorker === 'function') {
+      try {
+        return safeOpts.getAudioWorker();
+      } catch {
+        return null;
+      }
+    }
+    if (safeOpts.audioWorker !== undefined) {
+      return safeOpts.audioWorker;
+    }
+    return null;
+  }
+
+  function isWorkerReady(workerOverride) {
+    if (workerOverride && typeof workerOverride.postMessage === 'function') {
+      return true;
+    }
+    if (dynamicWorkerReady !== undefined) {
+      return dynamicWorkerReady;
+    }
+    if (typeof safeOpts.isAudioWorkerReady === 'function') {
+      try {
+        return Boolean(safeOpts.isAudioWorkerReady());
+      } catch {
+        return false;
+      }
+    }
+    if (safeOpts.audioWorker !== undefined || typeof safeOpts.getAudioWorker === 'function') {
+      return true;
+    }
+    return false;
+  }
+
+  function buildAttachOptions(targetMod, attachOpts) {
+    const dynamicOpts =
+      typeof safeOpts.getAttachOptions === 'function' ? safeOpts.getAttachOptions(targetMod) : null;
+    const baseOpts =
+      safeOpts.attachOptions && typeof safeOpts.attachOptions === 'object'
+        ? safeOpts.attachOptions
+        : null;
+    const inlineOpts = {};
+    if (safeOpts.memory !== undefined) inlineOpts.memory = safeOpts.memory;
+    if (safeOpts.buffer !== undefined) inlineOpts.buffer = safeOpts.buffer;
+    if (typeof safeOpts.getMemory === 'function') inlineOpts.getMemory = safeOpts.getMemory;
+    if (typeof safeOpts.getAudioRingPtr === 'function') {
+      inlineOpts.getAudioRingPtr = safeOpts.getAudioRingPtr;
+    }
+    if (safeOpts.pointerSize !== undefined) inlineOpts.pointerSize = safeOpts.pointerSize;
+    if (safeOpts.wasm64 !== undefined) inlineOpts.wasm64 = safeOpts.wasm64;
+    if (safeOpts.autoPump !== undefined) inlineOpts.autoPump = safeOpts.autoPump;
+    if (safeOpts.requireShared !== undefined) inlineOpts.requireShared = safeOpts.requireShared;
+    return Object.assign(
+      inlineOpts,
+      dynamicOpts && typeof dynamicOpts === 'object' ? dynamicOpts : null,
+      baseOpts,
+      attachOpts && typeof attachOpts === 'object' ? attachOpts : null,
+    );
+  }
+
+  function getTelemetry() {
+    return {
+      audioRingAttached: activeDescriptor !== null,
+      audioRingRetryCount: retryCount,
+      audioRingLastReason: lastReason,
+      audioRingRetryPending: retryTimerId !== null,
+      audioRingRetryExhausted: retryExhausted,
+      audioRingMaxRetries: maxRetries,
+      audioRingRetryIntervalMs: retryIntervalMs,
+      destroyed,
+    };
+  }
+
+  function notifyAttempt(res) {
+    if (typeof safeOpts.onAttempt === 'function') {
+      try {
+        safeOpts.onAttempt(res, getTelemetry());
+      } catch {
+        // Ignore telemetry observer errors.
+      }
+    }
+  }
+
+  function markExhausted() {
+    if (retryExhausted) {
+      return;
+    }
+    retryExhausted = true;
+    if (typeof safeOpts.onExhausted === 'function') {
+      try {
+        safeOpts.onExhausted(getTelemetry());
+      } catch {
+        // Ignore observer errors.
+      }
+    }
+  }
+
+  function shouldRetryReason(statusReason, targetMod, mergedAttachOpts) {
+    if (statusReason === AUDIO_RING_REASON.OK) {
+      return false;
+    }
+    if (statusReason === AUDIO_RING_REASON.NO_EXPORT) {
+      return retryOnNoExport || (typeof safeOpts.getModule === 'function' && !targetMod);
+    }
+    if (statusReason === AUDIO_RING_REASON.WORKER_NOT_READY) {
+      if (!targetMod) {
+        return typeof safeOpts.getModule === 'function';
+      }
+      const hasExport = Boolean(
+        resolveAudioRingPointerGetter(
+          targetMod,
+          mergedAttachOpts && mergedAttachOpts.getAudioRingPtr,
+        ),
+      );
+      return hasExport || retryOnNoExport;
+    }
+    return true;
+  }
+
+  function scheduleNextTimer() {
+    if (destroyed || activeDescriptor !== null || retryTimerId !== null) {
+      return false;
+    }
+    if (!setTimeoutFn || maxRetries <= 0) {
+      markExhausted();
+      return false;
+    }
+    if (scheduledRetries >= maxRetries) {
+      markExhausted();
+      return false;
+    }
+    retryTimerId = setTimeoutFn(() => {
+      retryTimerId = null;
+      if (destroyed || activeDescriptor !== null) {
+        return;
+      }
+      scheduledRetries += 1;
+      const res = attemptAttach(null, null, null, { isRetry: true, allowSchedule: true });
+      if ((!res || !res.attached) && !destroyed && retryTimerId === null && scheduledRetries >= maxRetries) {
+        markExhausted();
+      }
+    }, retryIntervalMs);
+    return true;
+  }
+
+  function attemptAttach(modOverride, workerOverride, attachOpts, internalOpts = {}) {
+    if (destroyed) {
+      return {
+        attached: false,
+        alreadyAttached: false,
+        descriptor: null,
+        reason: 'destroyed',
+        statusReason: lastReason || AUDIO_RING_REASON.WORKER_NOT_READY,
+      };
+    }
+
+    const targetMod = resolveModule(modOverride);
+    if (!targetMod) {
+      if (internalOpts.isRetry) {
+        retryCount += 1;
+      }
+      hasAttempted = true;
+      lastReason = AUDIO_RING_REASON.NO_EXPORT;
+      if (
+        internalOpts.allowSchedule !== false &&
+        autoRetry &&
+        shouldRetryReason(lastReason, null, null)
+      ) {
+        scheduleNextTimer();
+      }
+      return null;
+    }
+
+    if (internalOpts.isRetry) {
+      retryCount += 1;
+    }
+    hasAttempted = true;
+
+    const mergedAttachOpts = buildAttachOptions(targetMod, attachOpts);
+    const targetWorker = resolveWorker(workerOverride);
+    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
+      pendingModule = targetMod;
+      lastReason = AUDIO_RING_REASON.WORKER_NOT_READY;
+      const res = {
+        attached: false,
+        alreadyAttached: false,
+        pending: true,
+        descriptor: null,
+        reason: 'no-audio-worker',
+        statusReason: AUDIO_RING_REASON.WORKER_NOT_READY,
+      };
+      if (
+        internalOpts.allowSchedule !== false &&
+        autoRetry &&
+        shouldRetryReason(lastReason, targetMod, mergedAttachOpts)
+      ) {
+        scheduleNextTimer();
+      }
+      notifyAttempt(res);
+      return res;
+    }
+
+    if (!workerOverride && !isWorkerReady(null)) {
+      pendingModule = targetMod;
+      lastReason = AUDIO_RING_REASON.WORKER_NOT_READY;
+      const res = {
+        attached: false,
+        alreadyAttached: false,
+        pending: true,
+        descriptor: null,
+        reason: 'audio-worker-not-ready',
+        statusReason: AUDIO_RING_REASON.WORKER_NOT_READY,
+      };
+      if (
+        internalOpts.allowSchedule !== false &&
+        autoRetry &&
+        shouldRetryReason(lastReason, targetMod, mergedAttachOpts)
+      ) {
+        scheduleNextTimer();
+      }
+      notifyAttempt(res);
+      return res;
+    }
+
+    const res = attachRuntimeAudioRing(targetMod, targetWorker, mergedAttachOpts);
+    const statusReason = sanitizeAudioRingReason(res && (res.statusReason || res.reason));
+    lastReason = res && res.attached ? AUDIO_RING_REASON.OK : statusReason;
+
+    if (res && res.attached && res.descriptor) {
+      clearRetryTimer();
+      pendingModule = null;
+      activeDescriptor = res.descriptor;
+      activeWorker = targetWorker;
+      retryExhausted = false;
+      notifyAttempt(res);
+      if (!res.alreadyAttached && typeof safeOpts.onAttached === 'function') {
+        try {
+          safeOpts.onAttached(res, getTelemetry());
+        } catch {
+          // Ignore callback errors.
+        }
+      }
+      return res;
+    }
+
+    pendingModule = targetMod;
+    if (
+      internalOpts.allowSchedule !== false &&
+      autoRetry &&
+      shouldRetryReason(lastReason, targetMod, mergedAttachOpts)
+    ) {
+      scheduleNextTimer();
+    } else if (lastReason === AUDIO_RING_REASON.NO_EXPORT && !retryOnNoExport) {
+      clearRetryTimer();
+    }
+    notifyAttempt(res);
+    return res;
+  }
+
+  function schedule(retryOpts) {
+    if (destroyed || activeDescriptor !== null) {
+      return getTelemetry();
+    }
+    if (retryOpts && typeof retryOpts === 'object') {
+      if (retryOpts.retryIntervalMs !== undefined || retryOpts.intervalMs !== undefined) {
+        retryIntervalMs = normalizeAudioRingRetryIntervalMs(
+          retryOpts.retryIntervalMs !== undefined
+            ? retryOpts.retryIntervalMs
+            : retryOpts.intervalMs,
+          retryIntervalMs,
+        );
+      }
+      if (retryOpts.maxRetries !== undefined) {
+        maxRetries = normalizeAudioRingMaxRetries(retryOpts.maxRetries, maxRetries);
+        if (scheduledRetries < maxRetries) {
+          retryExhausted = false;
+        }
+      }
+      if (retryOpts.immediate === true) {
+        clearRetryTimer();
+        attemptAttach(
+          retryOpts.module || null,
+          retryOpts.audioWorker || null,
+          retryOpts.attachOptions || null,
+          { isRetry: hasAttempted, allowSchedule: true },
+        );
+        return getTelemetry();
+      }
+    }
+    scheduleNextTimer();
+    return getTelemetry();
+  }
+
+  function onAudioWorkerReady(workerOverride) {
+    if (destroyed) {
+      return null;
+    }
+    if (workerOverride && typeof workerOverride.postMessage === 'function') {
+      dynamicWorker = workerOverride;
+    }
+    dynamicWorkerReady = true;
+    const targetWorker = resolveWorker(workerOverride);
+    if (targetWorker && typeof targetWorker.postMessage === 'function') {
+      resetAttachedRuntimeAudioRing(targetWorker);
+    }
+    if (activeWorker && targetWorker && activeWorker !== targetWorker) {
+      resetAttachedRuntimeAudioRing(activeWorker);
+    }
+    activeWorker = null;
+    activeDescriptor = null;
+    const targetMod = resolveModule(null);
+    if (!targetMod) {
+      return null;
+    }
+    clearRetryTimer();
+    return attemptAttach(targetMod, targetWorker, { force: true }, {
+      isRetry: hasAttempted,
+      allowSchedule: true,
+    });
+  }
+
+  function setAudioWorker(nextWorker, readyOverride) {
+    if (destroyed) {
+      return null;
+    }
+    if (activeWorker && activeWorker !== nextWorker) {
+      resetAttachedRuntimeAudioRing(activeWorker);
+      activeWorker = null;
+      activeDescriptor = null;
+    }
+    const hasPostMessage = Boolean(nextWorker && typeof nextWorker.postMessage === 'function');
+    dynamicWorker = hasPostMessage ? nextWorker : null;
+    dynamicWorkerReady =
+      readyOverride !== undefined ? Boolean(readyOverride) : hasPostMessage;
+
+    const targetMod = resolveModule(null);
+    if (!hasPostMessage || !dynamicWorkerReady) {
+      if (targetMod) {
+        pendingModule = targetMod;
+        lastReason = AUDIO_RING_REASON.WORKER_NOT_READY;
+        const mergedAttachOpts = buildAttachOptions(targetMod, null);
+        if (autoRetry && shouldRetryReason(lastReason, targetMod, mergedAttachOpts)) {
+          scheduleNextTimer();
+        }
+      }
+      return null;
+    }
+    resetAttachedRuntimeAudioRing(nextWorker);
+    if (!targetMod) {
+      return null;
+    }
+    clearRetryTimer();
+    return attemptAttach(targetMod, nextWorker, { force: true }, {
+      isRetry: hasAttempted,
+      allowSchedule: true,
+    });
+  }
+
+  function notifyGuestMilestone() {
+    if (destroyed || activeDescriptor !== null) {
+      return null;
+    }
+    const targetMod = resolveModule(null);
+    if (!targetMod) {
+      return null;
+    }
+    clearRetryTimer();
+    return attemptAttach(targetMod, null, null, {
+      isRetry: hasAttempted,
+      allowSchedule: true,
+    });
+  }
+
+  function stop() {
+    clearRetryTimer();
+  }
+
+  function reset() {
+    clearRetryTimer();
+    if (activeWorker) {
+      resetAttachedRuntimeAudioRing(activeWorker);
+    }
+    activeWorker = null;
+    activeDescriptor = null;
+    pendingModule = null;
+    boundModule =
+      typeof safeOpts.getModule === 'function'
+        ? null
+        : safeOpts.module && typeof safeOpts.module === 'object'
+          ? safeOpts.module
+          : null;
+    dynamicWorker = undefined;
+    dynamicWorkerReady = undefined;
+    retryCount = 0;
+    scheduledRetries = 0;
+    lastReason = null;
+    hasAttempted = false;
+    retryExhausted = false;
+    destroyed = false;
+  }
+
+  function destroy() {
+    clearRetryTimer();
+    if (activeWorker) {
+      resetAttachedRuntimeAudioRing(activeWorker);
+    }
+    activeWorker = null;
+    activeDescriptor = null;
+    pendingModule = null;
+    boundModule = null;
+    dynamicWorker = undefined;
+    dynamicWorkerReady = undefined;
+    destroyed = true;
+  }
+
+  return {
+    attach: (mod, workerOverride, attachOpts) =>
+      attemptAttach(mod, workerOverride, attachOpts, { isRetry: false, allowSchedule: true }),
+    probeNow: (attachOpts) => {
+      if (destroyed) {
+        return null;
+      }
+      clearRetryTimer();
+      return attemptAttach(null, null, attachOpts, {
+        isRetry: hasAttempted,
+        allowSchedule: true,
+      });
+    },
+    schedule,
+    stop,
+    reset,
+    destroy,
+    dispose: destroy,
+    onAudioWorkerReady,
+    notifyAudioWorkerReady: onAudioWorkerReady,
+    setAudioWorker,
+    notifyGuestMilestone,
+    onFirstPresent: () => notifyGuestMilestone('first_present'),
+    isAttached: () => activeDescriptor !== null,
+    getDescriptor: () => activeDescriptor,
+    getTelemetry,
+    getStats: getTelemetry,
+  };
+}
+
+/**
+ * Start a bounded auto-retry poller for `_playgta6_audio_ring()` attachment (W308 / #1259).
+ *
+ * Accepts either `(options)` or `(moduleOrExports, targetAudioWorker, options)`.
+ * Returns a controller handle with `probeNow()`, `onAudioWorkerReady()`, `setAudioWorker()`,
+ * `notifyGuestMilestone()`, `getTelemetry()`, `reset()`, `stop()`, and `destroy()`/`dispose()`.
+ */
+function scheduleAudioRingRetry(moduleOrOptions, targetAudioWorker, maybeOptions) {
+  let opts;
+  const looksLikeWasmMod = Boolean(
+    moduleOrOptions &&
+      typeof moduleOrOptions === 'object' &&
+      (typeof moduleOrOptions._playgta6_audio_ring === 'function' ||
+        typeof moduleOrOptions.playgta6_audio_ring === 'function' ||
+        (moduleOrOptions.asm &&
+          (typeof moduleOrOptions.asm._playgta6_audio_ring === 'function' ||
+            typeof moduleOrOptions.asm.playgta6_audio_ring === 'function')) ||
+        (moduleOrOptions.wasmExports &&
+          (typeof moduleOrOptions.wasmExports._playgta6_audio_ring === 'function' ||
+            typeof moduleOrOptions.wasmExports.playgta6_audio_ring === 'function'))),
+  );
+  if (
+    arguments.length <= 1 &&
+    moduleOrOptions &&
+    typeof moduleOrOptions === 'object' &&
+    !looksLikeWasmMod
+  ) {
+    opts = Object.assign({}, moduleOrOptions);
+  } else {
+    opts = Object.assign(
+      {},
+      maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : null,
+    );
+    if (moduleOrOptions !== undefined) {
+      opts.module = moduleOrOptions;
+    }
+    if (targetAudioWorker !== undefined) {
+      opts.audioWorker = targetAudioWorker;
+    }
+  }
+  const controller = createAudioRingAttachmentController(opts);
+  if (opts.immediate !== false) {
+    controller.attach(opts.module || null, opts.audioWorker || null, opts.attachOptions || null);
+  } else {
+    controller.schedule();
+  }
+  return controller;
 }
 
 function resolveInputStatePointerGetter(mod, explicitGetter) {
@@ -4227,8 +4884,41 @@ function buildRuntimeModuleConfig(options = {}) {
           activeGpuWorker.postMessage({ cmdBuffer: copy }, [copy]);
         };
 
-  const logFn =
+  const userLogFn =
     typeof options.log === 'function' ? options.log : (msg) => activeReportFn(`[wasm] ${msg}`);
+  const userOnFirstPresent =
+    typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
+  let audioRingController = null;
+
+  const logFn = (msg) => {
+    if (
+      audioRingController &&
+      !audioRingController.isAttached() &&
+      typeof msg === 'string' &&
+      GUEST_AUDIO_MILESTONE_LOG_RE.test(msg)
+    ) {
+      try {
+        audioRingController.notifyGuestMilestone('guest_audio_log');
+      } catch {
+        // Audio ring milestone probe must never interfere with host_log.
+      }
+    }
+    return userLogFn(msg);
+  };
+
+  const handleFirstPresent = (detail) => {
+    if (audioRingController && !audioRingController.isAttached()) {
+      try {
+        audioRingController.notifyGuestMilestone('first_present');
+      } catch {
+        // Audio ring milestone probe must never interfere with FIRST_PRESENT.
+      }
+    }
+    if (userOnFirstPresent) {
+      return userOnFirstPresent(detail);
+    }
+    return undefined;
+  };
 
   const activeHostImports =
     options.hostImports && typeof options.hostImports === 'object'
@@ -4245,8 +4935,7 @@ function buildRuntimeModuleConfig(options = {}) {
           wgpuSubmit,
           httpfsClient: activeHttpfsClient,
           userdataStore: activeUserdataStore,
-          onFirstPresent:
-            typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null,
+          onFirstPresent: handleFirstPresent,
           emitFirstPresentLog: options.emitFirstPresentLog === true,
         });
 
@@ -4476,10 +5165,11 @@ function buildRuntimeModuleConfig(options = {}) {
     return null;
   };
 
-  const resolveActiveAudioWorker = (workerOverride) => {
-    if (workerOverride && typeof workerOverride.postMessage === 'function') {
-      return workerOverride;
-    }
+  const audioRingRetryOpts =
+    options.audioRingRetry && typeof options.audioRingRetry === 'object'
+      ? options.audioRingRetry
+      : {};
+  const resolveConfiguredAudioWorker = () => {
     if (typeof options.getAudioWorker === 'function') {
       return options.getAudioWorker();
     }
@@ -4488,7 +5178,7 @@ function buildRuntimeModuleConfig(options = {}) {
     }
     return audioWorker;
   };
-  const checkAudioWorkerReady = () => {
+  const checkConfiguredAudioWorkerReady = () => {
     if (typeof options.isAudioWorkerReady === 'function') {
       try {
         return Boolean(options.isAudioWorkerReady());
@@ -4501,78 +5191,101 @@ function buildRuntimeModuleConfig(options = {}) {
     }
     return audioWorkerReady;
   };
-  let pendingAudioRingModule = null;
-  let activeAudioRingDescriptor = null;
-  let activeAudioRingWorker = null;
+
+  audioRingController = createAudioRingAttachmentController({
+    getModule: () => boundModule,
+    getAudioWorker: resolveConfiguredAudioWorker,
+    isAudioWorkerReady: checkConfiguredAudioWorkerReady,
+    getAttachOptions: (targetMod) => ({
+      getMemory: () =>
+        resolveRuntimeMemory() || resolveRuntimeMemoryBuffer(targetMod, null) || null,
+      pointerSize: options.audioRingPointerSize,
+      autoPump: options.audioRingAutoPump,
+    }),
+    retryIntervalMs:
+      options.audioRingRetryIntervalMs !== undefined
+        ? options.audioRingRetryIntervalMs
+        : audioRingRetryOpts.retryIntervalMs !== undefined
+          ? audioRingRetryOpts.retryIntervalMs
+          : options.retryIntervalMs,
+    maxRetries:
+      options.audioRingMaxRetries !== undefined
+        ? options.audioRingMaxRetries
+        : audioRingRetryOpts.maxRetries !== undefined
+          ? audioRingRetryOpts.maxRetries
+          : options.maxRetries,
+    autoRetry: options.audioRingAutoRetry !== false && audioRingRetryOpts.autoRetry !== false,
+    retryOnNoExport:
+      options.audioRingRetryOnNoExport === true || audioRingRetryOpts.retryOnNoExport === true,
+    setTimeoutFn:
+      typeof options.audioRingSetTimeoutFn === 'function'
+        ? options.audioRingSetTimeoutFn
+        : typeof audioRingRetryOpts.setTimeoutFn === 'function'
+          ? audioRingRetryOpts.setTimeoutFn
+          : undefined,
+    clearTimeoutFn:
+      typeof options.audioRingClearTimeoutFn === 'function'
+        ? options.audioRingClearTimeoutFn
+        : typeof audioRingRetryOpts.clearTimeoutFn === 'function'
+          ? audioRingRetryOpts.clearTimeoutFn
+          : undefined,
+    onAttached: (res, telemetry) => {
+      try {
+        if (res && res.descriptor) {
+          activeReportFn(
+            `[audio] audio_ring_attached=true sampleRate=${res.descriptor.sampleRate} channels=${res.descriptor.channels} capacity=${res.descriptor.capacity} retries=${telemetry.audioRingRetryCount}`,
+          );
+        }
+      } catch {
+        // Audio attach telemetry report must never break runtime execution.
+      }
+    },
+  });
 
   const resetAudioRingAttachment = () => {
-    if (activeAudioRingWorker) {
-      resetAttachedRuntimeAudioRing(activeAudioRingWorker);
-    }
-    activeAudioRingWorker = null;
-    activeAudioRingDescriptor = null;
-    pendingAudioRingModule = null;
+    audioRingController.reset();
   };
 
   const attachAudioRing = (mod, workerOverride, attachOpts) => {
-    const targetMod = mod && typeof mod === 'object' ? mod : boundModule || pendingAudioRingModule;
-    if (!targetMod) {
-      return null;
+    if (mod && typeof mod === 'object' && !boundModule) {
+      boundModule = mod;
     }
-    const targetWorker = resolveActiveAudioWorker(workerOverride);
-    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
-      pendingAudioRingModule = targetMod;
-      return {
-        attached: false,
-        alreadyAttached: false,
-        pending: true,
-        descriptor: null,
-        reason: 'no-audio-worker',
-      };
-    }
-    if (!workerOverride && !checkAudioWorkerReady()) {
-      pendingAudioRingModule = targetMod;
-      return {
-        attached: false,
-        alreadyAttached: false,
-        pending: true,
-        descriptor: null,
-        reason: 'audio-worker-not-ready',
-      };
-    }
-    const res = attachRuntimeAudioRing(
-      targetMod,
-      targetWorker,
-      Object.assign(
-        {
-          getMemory: () =>
-            resolveRuntimeMemory() ||
-            resolveRuntimeMemoryBuffer(targetMod, null) ||
-            null,
-          pointerSize: options.audioRingPointerSize,
-          autoPump: options.audioRingAutoPump,
-        },
-        attachOpts && typeof attachOpts === 'object' ? attachOpts : null,
-      ),
-    );
-    if (res && res.attached && res.descriptor) {
-      pendingAudioRingModule = null;
-      activeAudioRingDescriptor = res.descriptor;
-      activeAudioRingWorker = targetWorker;
-    }
-    return res;
+    return audioRingController.attach(mod, workerOverride, attachOpts);
   };
 
-  const notifyAudioWorkerReady = (workerOverride) => {
-    const targetWorker = resolveActiveAudioWorker(workerOverride);
-    if (targetWorker) {
-      resetAttachedRuntimeAudioRing(targetWorker);
+  const notifyAudioWorkerReady = (workerOverride) =>
+    audioRingController.onAudioWorkerReady(workerOverride);
+
+  const onAudioWorkerReady = notifyAudioWorkerReady;
+
+  const setAudioWorker = (nextWorker, readyOverride) =>
+    audioRingController.setAudioWorker(nextWorker, readyOverride);
+
+  const notifyGuestMilestone = (milestoneName) =>
+    audioRingController.notifyGuestMilestone(milestoneName);
+
+  const scheduleConfigAudioRingRetry = (retryOpts) =>
+    audioRingController.schedule(retryOpts);
+
+  const stopAudioRingRetry = () => {
+    audioRingController.stop();
+  };
+
+  const getAudioRingTelemetry = () => audioRingController.getTelemetry();
+
+  const destroyRuntimeConfig = () => {
+    stopInputBridge();
+    audioRingController.destroy();
+    boundModule = null;
+    const drainPromise = stopPipelineDumpSyncer();
+    if (drainPromise && typeof drainPromise.catch === 'function') {
+      drainPromise.catch(() => {});
     }
-    const targetMod = boundModule || pendingAudioRingModule;
-    if (!targetMod) {
-      return null;
-    }
-    return attachAudioRing(targetMod, targetWorker, { force: true });
+  };
+
+  const resetRuntimeConfig = () => {
+    stopInputBridge();
+    audioRingController.reset();
   };
 
   const userOnRuntimeInitialized =
@@ -4596,6 +5309,7 @@ function buildRuntimeModuleConfig(options = {}) {
   const onExit = function onPlayGta6RuntimeExit() {
     stopInputBridge();
     resetAudioRingAttachment();
+    boundModule = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -4626,8 +5340,17 @@ function buildRuntimeModuleConfig(options = {}) {
     getInputBridge: () => activeInputBridge,
     attachAudioRing,
     notifyAudioWorkerReady,
+    onAudioWorkerReady,
+    setAudioWorker,
+    notifyGuestMilestone,
+    scheduleAudioRingRetry: scheduleConfigAudioRingRetry,
+    stopAudioRingRetry,
     resetAudioRingAttachment,
-    getAudioRingDescriptor: () => activeAudioRingDescriptor,
+    getAudioRingDescriptor: () => audioRingController.getDescriptor(),
+    getAudioRingTelemetry,
+    reset: resetRuntimeConfig,
+    destroy: destroyRuntimeConfig,
+    dispose: destroyRuntimeConfig,
     pipelineDumpSyncer,
     getPipelineDumpSyncer: () => pipelineDumpSyncer,
     flushPipelineDumps: () => pipelineDumpSyncer.flush(),
@@ -5536,6 +6259,16 @@ function handlePthreadWgpuSubmit(data, options = {}) {
     const info = inspectGpuPacketBatchForPresent(inspectBytes);
     if (info.hasPresent) {
       coordinatorFirstPresentEmitted = true;
+      if (
+        activeCoordinatorModuleConfig &&
+        typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
+      ) {
+        try {
+          activeCoordinatorModuleConfig.notifyGuestMilestone('first_present');
+        } catch {
+          // Non-fatal audio ring milestone retry failure.
+        }
+      }
       report('[boot] FIRST_PRESENT');
     }
   }
@@ -5596,6 +6329,11 @@ function getLoaderStatus() {
             ? activeGuestManifestSummary.sideModules.slice()
             : [],
         };
+  const audioRingTelemetry =
+    activeCoordinatorModuleConfig &&
+    typeof activeCoordinatorModuleConfig.getAudioRingTelemetry === 'function'
+      ? activeCoordinatorModuleConfig.getAudioRingTelemetry()
+      : null;
   return {
     pthreadSpawnedCount: pthread.pthreadSpawnedCount,
     pthreadActiveCount: pthread.pthreadActiveCount,
@@ -5626,6 +6364,9 @@ function getLoaderStatus() {
       : null,
     sideModules,
     firstPresentEmitted: coordinatorFirstPresentEmitted,
+    audioRingAttached: audioRingTelemetry ? Boolean(audioRingTelemetry.audioRingAttached) : false,
+    audioRingRetryCount: audioRingTelemetry ? audioRingTelemetry.audioRingRetryCount : 0,
+    audioRingLastReason: audioRingTelemetry ? audioRingTelemetry.audioRingLastReason : null,
     renderStateStats: lastRenderStateStats ? Object.assign({}, lastRenderStateStats) : null,
   };
 }
@@ -5721,6 +6462,18 @@ async function tryBootWasmRuntime() {
           // Ignore teardown errors from a previous runtime boot.
         }
         activeCoordinatorPipelineDumpSyncer = null;
+      }
+      if (activeCoordinatorModuleConfig) {
+        try {
+          if (typeof activeCoordinatorModuleConfig.destroy === 'function') {
+            activeCoordinatorModuleConfig.destroy();
+          } else if (typeof activeCoordinatorModuleConfig.resetAudioRingAttachment === 'function') {
+            activeCoordinatorModuleConfig.resetAudioRingAttachment();
+          }
+        } catch {
+          // Ignore teardown errors from a previous runtime boot.
+        }
+        activeCoordinatorModuleConfig = null;
       }
       const moduleConfig = createRuntimeModuleOptions(runtimeOptions);
       activeCoordinatorModuleConfig = moduleConfig;
@@ -5904,9 +6657,13 @@ if (typeof self !== 'undefined') {
       }
       activeCoordinatorInputBridge = null;
     }
-    if (activeCoordinatorModuleConfig && typeof activeCoordinatorModuleConfig.resetAudioRingAttachment === 'function') {
+    if (activeCoordinatorModuleConfig) {
       try {
-        activeCoordinatorModuleConfig.resetAudioRingAttachment();
+        if (typeof activeCoordinatorModuleConfig.destroy === 'function') {
+          activeCoordinatorModuleConfig.destroy();
+        } else if (typeof activeCoordinatorModuleConfig.resetAudioRingAttachment === 'function') {
+          activeCoordinatorModuleConfig.resetAudioRingAttachment();
+        }
       } catch {
         // Ignore audio ring teardown errors when re-initializing workers.
       }
@@ -5998,6 +6755,16 @@ if (typeof self !== 'undefined') {
         return;
       }
       if (data.frame) {
+        if (
+          activeCoordinatorModuleConfig &&
+          typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
+        ) {
+          try {
+            activeCoordinatorModuleConfig.notifyGuestMilestone('frame_presented');
+          } catch {
+            // Non-fatal audio ring milestone retry failure.
+          }
+        }
         report(`WebGPU frame #${data.frame} presented`);
       } else if (data.error) {
         postProgress({ error: `wgpu_worker: ${formatGpuWorkerError(data.error)}` });
@@ -6011,6 +6778,11 @@ if (typeof self !== 'undefined') {
         const wasReady = audioWorkerReady;
         audioWorkerReady = true;
         if (
+          activeCoordinatorModuleConfig &&
+          typeof activeCoordinatorModuleConfig.onAudioWorkerReady === 'function'
+        ) {
+          activeCoordinatorModuleConfig.onAudioWorkerReady(audioWorker);
+        } else if (
           activeCoordinatorModuleConfig &&
           typeof activeCoordinatorModuleConfig.notifyAudioWorkerReady === 'function'
         ) {
@@ -6065,6 +6837,9 @@ const exportedApi = {
   AUDIO_RING_MAX_CAPACITY_SAMPLES,
   AUDIO_RING_MIN_SAMPLE_RATE,
   AUDIO_RING_MAX_SAMPLE_RATE,
+  DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS,
+  DEFAULT_AUDIO_RING_MAX_RETRIES,
+  AUDIO_RING_REASON,
   DEFAULT_MEMFS_PIPELINE_DUMP_DIR,
   DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT,
   DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS,
@@ -6090,9 +6865,12 @@ const exportedApi = {
   forwardGpuWorkerMessage,
   sanitizeRenderStateStats,
   createHostImports,
+  sanitizeAudioRingReason,
+  probePlaygta6AudioRingDescriptor,
   readPlaygta6AudioRingDescriptor,
   attachRuntimeAudioRing,
   resetAttachedRuntimeAudioRing,
+  scheduleAudioRingRetry,
   startInputSabBridge,
   resolveDumpPipelinesEnabled,
   sanitizeDumpRelPath,
