@@ -582,6 +582,60 @@ void test_subresource_round_trips() {
     CHECK(surface_bytes(vol_array) == 0u);
 }
 
+// surface_element_offset is the address the surface detiler reads: for every element of every
+// mip and slice the bytes at the reported offset equal the detiled element. Covers 256B/4KB/64KB
+// _S and _D, the console linear layout, BC formats, mip tails, array slices and thick 3D.
+void verify_element_offsets(TextureLayoutDesc desc, uint32_t layers, uint32_t seed) {
+    desc.array_size = layers;
+    const size_t total = surface_bytes(desc);
+    CHECK(total != 0u);
+    const std::vector<uint8_t> surface = make_synthetic_linear(total, seed);
+    const FormatGeometry g = format_geometry(desc.dxgi_format);
+    bool all_same = true;
+    for (uint32_t mip = 0; mip < desc.mip_levels; ++mip) {
+        const uint32_t w = std::max(1u, desc.width >> mip), h = std::max(1u, desc.height >> mip);
+        const uint32_t d = std::max(1u, desc.depth >> mip);
+        const uint32_t bx = (w + g.block_width - 1u) / g.block_width, by = (h + g.block_height - 1u) / g.block_height;
+        const uint32_t subresources = desc.depth > 1u ? 1u : layers;
+        for (uint32_t s = 0; s < subresources; ++s) {
+            std::vector<uint8_t> out;
+            const DetileResult r = detile_surface_subresource(desc, mip, s, surface.data(), surface.size(), out);
+            CHECK(r.ok);
+            const uint32_t nz = desc.depth > 1u ? d : 1u;
+            for (uint32_t z = 0; r.ok && z < nz; ++z) {
+                for (uint32_t y = 0; y < by; ++y) {
+                    for (uint32_t x = 0; x < bx; ++x) {
+                        const uint64_t off = surface_element_offset(desc, mip, x, y, desc.depth > 1u ? z : s);
+                        const size_t lin = ((size_t{z} * by + y) * bx + x) * g.bytes_per_block;
+                        all_same = all_same && off != UINT64_MAX && off + g.bytes_per_block <= total &&
+                                   std::memcmp(surface.data() + off, out.data() + lin, g.bytes_per_block) == 0;
+                    }
+                }
+            }
+        }
+        // Out of range: one element past the row, the column, the slices.
+        CHECK(surface_element_offset(desc, mip, bx, 0u, 0u) == UINT64_MAX);
+        CHECK(surface_element_offset(desc, mip, 0u, by, 0u) == UINT64_MAX);
+        CHECK(surface_element_offset(desc, mip, 0u, 0u, desc.depth > 1u ? d : layers) == UINT64_MAX);
+    }
+    CHECK(all_same);
+    CHECK(surface_element_offset(desc, desc.mip_levels, 0u, 0u, 0u) == UINT64_MAX);
+}
+
+void test_element_offsets() {
+    verify_element_offsets({28u, 64u, 64u, 1u, 7u, 0x101u, 0u}, 2u, 14100u);    // 256B_S RGBA8
+    verify_element_offsets({28u, 64u, 32u, 1u, 7u, 0x102u, 0u}, 1u, 14200u);    // 256B_D
+    verify_element_offsets({77u, 128u, 64u, 1u, 8u, 0x105u, 0u}, 3u, 14300u);   // 4KB_S BC3, tail
+    verify_element_offsets({61u, 100u, 60u, 1u, 7u, 0x106u, 0u}, 2u, 14400u);   // 4KB_D 1 B
+    verify_element_offsets({71u, 512u, 512u, 1u, 10u, 0x109u, 0u}, 2u, 14500u); // 64KB_S BC1
+    verify_element_offsets({98u, 512u, 512u, 1u, 10u, 0x10Au, 0u}, 2u, 14600u); // 64KB_D BC7 (the title's case)
+    verify_element_offsets({10u, 300u, 20u, 1u, 9u, 0x10Au, 0u}, 2u, 14700u);   // 64KB_D 8 B
+    verify_element_offsets({10u, 32u, 32u, 32u, 4u, 0x105u, 0u}, 1u, 14800u);   // thick 3D 4KB_S
+    verify_element_offsets({41u, 128u, 72u, 1u, 7u, 0x100u, 0u}, 2u, 14900u);   // console linear
+    // D3D12 linear layouts (UNKNOWN / ROW_MAJOR) have no surface placement.
+    CHECK(surface_element_offset({28u, 64u, 64u, 1u, 1u, 0u, 0u}, 0u, 0u, 0u, 0u) == UINT64_MAX);
+}
+
 // Tail mips are read inside the tail block at addrlib's coordinates: 32x32 BC3 with 4 mips in
 // 4KB_S keeps the whole chain in one block, mip 0 at element (8, 0) and mip 1 at (4, 8). The
 // expected bytes come from the plain 4KB_S equation (tiled_byte_offset_2d) at those coordinates.
@@ -746,6 +800,7 @@ int main() {
     test_console_linear_chain();
     test_subresource_round_trips();
     test_tail_coordinates();
+    test_element_offsets();
     test_linear_subresources();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();

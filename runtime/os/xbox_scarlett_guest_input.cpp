@@ -619,6 +619,34 @@ public:
         return hr;
     }
 
+    // 6 GetTexelElementOffsetBytes(plane, mipLevel, x, y, zOrSlice, sample, bitOffset*) -> UINT64:
+    // byte offset from the resource base of element (x, y) of the mip in slice zOrSlice. The title
+    // passes element coordinates (for BC formats it divides texel coordinates by 4 itself). Tiled
+    // and console linear layouts use the GFX10 address the detiler and CopyIntoSubresource use;
+    // other layouts the host computer's linear mips. Elements are whole bytes: *bitOffset = 0.
+    // UINT64_MAX for an invalid plane, mip or coordinate.
+    uint64_t GetTexelElementOffsetBytes(uint32_t plane, uint32_t mip, uint64_t x, uint32_t y, uint32_t z,
+                                        uint32_t /*sample*/, GuestPtr<uint32_t> bit_offset) {
+        if (!bit_offset.is_null()) {
+            bit_offset.write(0);
+        }
+        if (plane != 0 || mip >= layout_.mip_levels || x > 0xFFFFFFFFull) {
+            return UINT64_MAX;
+        }
+        if (tiled_) {
+            const bool is_3d = desc_.dimension == 4;
+            if (!is_3d && z >= slices_) {
+                return UINT64_MAX;
+            }
+            const uint64_t offset = playgta6::gpu::gfx10::surface_element_offset(
+                tiled_desc_, mip, static_cast<uint32_t>(x), y, is_3d ? z : 0u);
+            return offset == UINT64_MAX ? offset : (is_3d ? 0u : uint64_t{z} * chain_bytes_) + offset;
+        }
+        const Pg6XgMipLevelLayout& ml = layout_.mips[mip];
+        const ElementInfo e = element_info(desc_.format);
+        return ml.offset_bytes + uint64_t{z} * ml.slice_size_bytes + uint64_t{y} * ml.row_pitch_bytes + x * e.bytes;
+    }
+
     // 10 (D3D12 GetResourceTiling shape; standard 64 KiB tiles, numbered in GFX10 memory order for
     // the 64KB swizzle modes)
     void GetResourceTiling(GuestPtr<uint32_t> num_tiles, GuestPtr<XgPackedMipInfo> packed,
@@ -881,7 +909,9 @@ constexpr com::MethodDesc kXgMethods[] = {
     XM::method<&XgComputer::AddRef>("AddRef"),                            // 0
     XM::method<&XgComputer::Release>("Release"),                          // 1
     XM::method<&XgComputer::GetResourceLayout>("GetResourceLayout"),      // 2
-    {}, {}, {}, {}, {},                                                   // 3..7 unknown
+    {}, {}, {},                                                           // 3..5 unknown
+    XM::method<&XgComputer::GetTexelElementOffsetBytes>("GetTexelElementOffsetBytes"),  // 6
+    {},                                                                   // 7 unknown
     XM::method<&XgComputer::CopyIntoSubresource>("CopyIntoSubresource"),  // 8
     {},                                                                   // 9 unknown
     XM::method<&XgComputer::GetResourceTiling>("GetResourceTiling"),      // 10
