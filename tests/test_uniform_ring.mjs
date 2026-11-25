@@ -14,6 +14,8 @@ const {
   DEFAULT_MAX_BYTE_SIZE,
   DEFAULT_FRAMES_IN_FLIGHT,
   DEFAULT_MAX_BINDING_SIZE,
+  DEFAULT_SHRINK_AFTER_IDLE_FRAMES,
+  DEFAULT_SHRINK_THRESHOLD_RATIO,
   WEBGPU_BUFFER_COPY_ALIGNMENT,
   BUFFER_USAGE,
   SHADER_STAGE,
@@ -2312,4 +2314,492 @@ test('W193: writeStaged(offset, data) out-of-order coalescing, SAB isolation, ga
   assert.throws(() => ring.writeStaged(0, new Uint32Array([1])), /destroyed/i);
   assert.throws(() => ring.flushDirty(), /destroyed/i);
   assert.throws(() => ring.getDirtyRanges(), /destroyed/i);
+});
+
+test('W264: bounded idle-frame auto-shrink reclaims transient spike VRAM across 10,000+ frames with safe deferred slot retirement', () => {
+  assert.equal(DEFAULT_SHRINK_AFTER_IDLE_FRAMES, 120);
+  assert.equal(DEFAULT_SHRINK_THRESHOLD_RATIO, 0.25);
+
+  const { device, createdBuffers } = createMockGpuDevice();
+
+  // Constructor option validation for W264 shrink controls.
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, shrinkAfterIdleFrames: -1 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, shrinkAfterIdleFrames: 2.5 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, shrinkThresholdRatio: 0 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, shrinkThresholdRatio: 1 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, maxByteSize: 4096, minSlotBytes: 2048 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, minSlotBytes: 0 }),
+    RangeError
+  );
+
+  // Spike -> idle auto-shrink -> 10,000+ steady-state frames.
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 1024,
+    minSlotBytes: 1024,
+    maxByteSize: 32768,
+    framesInFlight: 3,
+    shrinkAfterIdleFrames: 4,
+  });
+
+  assert.equal(ring.minSlotBytes, 1024);
+  assert.equal(ring.shrinkAfterIdleFrames, 4);
+
+  const payload = new Uint32Array([0x12345678, 0x9abcdef0, 1, 2]);
+  const scratchOut = {};
+
+  // Frame 0 (slot 0): transient uniform spike -> grows 1024 -> 32768 (128 draws x 256B).
+  ring.beginFrame();
+  for (let i = 0; i < 128; i += 1) {
+    payload[2] = i;
+    ring.write(payload, scratchOut);
+  }
+  ring.flush();
+  assert.equal(ring.capacity, 32768);
+
+  // Frames 1 & 2: slots 1 & 2 lazily catch up to 32768 while pushing 1 quiet draw (256B) each.
+  const f1 = ring.beginFrame();
+  assert.equal(f1.byteSize, 32768);
+  const slot1LargeBuf = f1.buffer;
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  const f2 = ring.beginFrame();
+  assert.equal(f2.byteSize, 32768);
+  const slot2LargeBuf = f2.buffer;
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  const peakStats = ring.getStats();
+  assert.equal(peakStats.allocatedGpuBytes, 3 * 32768);
+  assert.equal(peakStats.peakVramBytes, 3 * 32768);
+  assert.equal(peakStats.peakAllocatedGpuBytes, 3 * 32768);
+  assert.equal(peakStats.shrinkCount, 0);
+
+  // Frame 3 (slot 0): 2 idle frames so far (F1, F2); still < 4, so no shrink yet.
+  const f3 = ring.beginFrame();
+  const slot0LargeBuf = f3.buffer;
+  assert.equal(f3.byteSize, 32768);
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  // Frame 4 (slot 1): 3 idle frames so far (F1, F2, F3); still < 4, no shrink yet.
+  const f4 = ring.beginFrame();
+  assert.equal(f4.byteSize, 32768);
+  assert.equal(ring.getStats().shrinkCount, 0);
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  // Frame 5 (slot 2): 4th consecutive idle frame (F1..F4) triggers bounded auto-shrink!
+  // Slot 2 (completed 3 frames ago) shrinks immediately to 1024B while in-flight slots 0 & 1 STAY ALIVE!
+  const f5 = ring.beginFrame();
+  assert.equal(f5.slotIndex, 2);
+  assert.equal(f5.byteSize, 1024);
+  assert.equal(ring.capacity, 1024);
+  assert.equal(slot2LargeBuf.destroyCount, 1, 'recycled slot 2 large buffer must be destroyed on shrink');
+  assert.equal(slot0LargeBuf.destroyCount, 0, 'in-flight slot 0 large buffer must stay alive');
+  assert.equal(slot1LargeBuf.destroyCount, 0, 'in-flight slot 1 large buffer must stay alive');
+  assert.equal(ring.getStats().shrinkCount, 1);
+  assert.equal(ring.getStats().allocatedGpuBytes, 1024 + 32768 + 32768);
+  assert.equal(ring.getStats().peakVramBytes, 3 * 32768, 'peakVramBytes must not increase during shrink');
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  // Frame 6 (slot 0): slot 0 completes in-flight window and shrinks to 1024B; slot 1 still alive.
+  const f6 = ring.beginFrame();
+  assert.equal(f6.slotIndex, 0);
+  assert.equal(f6.byteSize, 1024);
+  assert.equal(slot0LargeBuf.destroyCount, 1);
+  assert.equal(slot1LargeBuf.destroyCount, 0);
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  // Frame 7 (slot 1): slot 1 completes in-flight window and shrinks to 1024B.
+  const f7 = ring.beginFrame();
+  assert.equal(f7.slotIndex, 1);
+  assert.equal(f7.byteSize, 1024);
+  assert.equal(slot1LargeBuf.destroyCount, 1);
+  assert.equal(ring.getStats().allocatedGpuBytes, 3 * 1024);
+  assert.equal(ring.getStats().peakVramBytes, 3 * 32768);
+  assert.equal(ring.getStats().shrinkCount, 1);
+  ring.write(payload, scratchOut);
+  ring.flush();
+
+  // Run 10,000 more steady-state frames: VRAM stays bounded at 3072B with zero extra GPUBuffer creations!
+  const buffersAfterShrink = createdBuffers.length;
+  for (let frame = 8; frame < 10008; frame += 1) {
+    ring.beginFrame();
+    payload[2] = frame;
+    const res = ring.write(payload, scratchOut);
+    assert.equal(res, scratchOut);
+    assert.equal(res.dynamicOffset, 0);
+    assert.equal(res.buffer.size, 1024);
+    ring.flush();
+  }
+
+  const longRunStats = ring.getStats();
+  assert.equal(createdBuffers.length, buffersAfterShrink, '10,000 steady-state frames must create 0 GPUBuffers');
+  assert.equal(longRunStats.allocatedGpuBytes, 3072);
+  assert.equal(longRunStats.peakVramBytes, 3 * 32768);
+  assert.equal(longRunStats.shrinkCount, 1);
+  assert.ok(longRunStats.reuseRate > 0.999 && longRunStats.reuseRate <= 1);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W264: auto-shrink respects headroom, idle-streak interruption, shrinkAfterIdleFrames=0 disable, and explicit shrink() deferred retirement', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    minSlotBytes: 512,
+    maxByteSize: 8192,
+    framesInFlight: 2,
+    shrinkAfterIdleFrames: 3,
+  });
+
+  const draw64 = new Uint32Array(16);
+
+  // Frame 0: spike to 8192B (32 draws).
+  ring.beginFrame();
+  for (let i = 0; i < 32; i += 1) {
+    ring.pushConstants(draw64);
+  }
+  ring.flush();
+  assert.equal(ring.capacity, 8192);
+
+  // Frames 1 & 2: 2 quiet frames (256B each -> consecutiveIdleFrames reaches 2).
+  ring.beginFrame();
+  ring.pushConstants(draw64);
+  ring.flush();
+  ring.beginFrame();
+  ring.pushConstants(draw64);
+  ring.flush();
+
+  // Frame 3: medium-heavy frame (4096B > 8192 * 0.25 = 2048B) MUST reset idle streak (no premature shrink).
+  ring.beginFrame();
+  for (let i = 0; i < 16; i += 1) {
+    ring.pushConstants(draw64);
+  }
+  ring.flush();
+  assert.equal(ring.capacity, 8192);
+  assert.equal(ring.getStats().shrinkCount, 0);
+
+  // Frames 4, 5, 6: steady 1024B/frame (4 draws <= 8192 * 0.25 = 2048B).
+  // After 3 frames, shrinks with 2x headroom over 1024B -> target 2048B (not 512B!) so steady state doesn't thrash.
+  for (let f = 0; f < 3; f += 1) {
+    ring.beginFrame();
+    for (let i = 0; i < 4; i += 1) {
+      ring.pushConstants(draw64);
+    }
+    ring.flush();
+  }
+  const afterPartial = ring.beginFrame();
+  assert.equal(ring.capacity, 2048);
+  assert.equal(afterPartial.byteSize, 2048);
+  assert.equal(ring.getStats().shrinkCount, 1);
+
+  // Explicit shrink() mid-frame AFTER a draw defers destroying the active slot buffer until wrap.
+  const activeBeforeShrink = ring.currentBuffer;
+  ring.pushConstants(draw64);
+  ring.flush();
+  const explicitRes = ring.shrink(512);
+  assert.deepEqual(explicitRes, { shrunk: true, previousCapacity: 2048, capacity: 512 });
+  assert.equal(activeBeforeShrink.destroyCount, 0, 'active flushed buffer must not be destroyed mid-frame');
+  assert.equal(ring.getStats().shrinkCount, 2);
+
+  // Rotating across 2 frames retires both oversized buffers cleanly down to 512B.
+  ring.beginFrame(); // other slot shrinks to 512
+  assert.equal(activeBeforeShrink.destroyCount, 0, 'previous frame buffer stays alive while in flight');
+  ring.beginFrame(); // wraps back to activeBeforeShrink's slot -> destroys it cleanly!
+  assert.equal(activeBeforeShrink.destroyCount, 1);
+  assert.equal(ring.getStats().allocatedGpuBytes, 1024); // 2 x 512B
+
+  // Explicit shrink() when already at minSlotBytes is a safe no-op.
+  assert.deepEqual(ring.shrink(512), { shrunk: false, previousCapacity: 512, capacity: 512 });
+  assert.equal(ring.getStats().shrinkCount, 2);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1);
+  }
+
+  // shrinkAfterIdleFrames: 0 disables auto-shrink cleanly.
+  const { device: devNoShrink } = createMockGpuDevice();
+  const noShrinkRing = new DynamicUniformRing({
+    device: devNoShrink,
+    byteSize: 512,
+    maxByteSize: 2048,
+    framesInFlight: 2,
+    shrinkAfterIdleFrames: 0,
+  });
+  noShrinkRing.beginFrame();
+  for (let i = 0; i < 8; i += 1) {
+    noShrinkRing.pushConstants(draw64);
+  }
+  noShrinkRing.flush();
+  assert.equal(noShrinkRing.capacity, 2048);
+  for (let f = 0; f < 20; f += 1) {
+    noShrinkRing.beginFrame();
+    noShrinkRing.pushConstants(draw64);
+    noShrinkRing.flush();
+  }
+  assert.equal(noShrinkRing.capacity, 2048);
+  assert.equal(noShrinkRing.getStats().shrinkCount, 0);
+  noShrinkRing.destroy();
+});
+
+test('W264: zero-alloc allocate() and write() hot paths enforce strict 256-byte alignment and byte fidelity', () => {
+  const { device, queueWrites } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 256, maxUniformBufferBindingSize: 65536 },
+  });
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 4096,
+    maxByteSize: 16384,
+    alignment: 64, // must clamp up to device's 256-byte minUniformBufferOffsetAlignment
+    framesInFlight: 2,
+  });
+
+  assert.equal(ring.alignment, 256);
+  ring.beginFrame();
+
+  const out = {};
+
+  // 1. allocate(byteLength, out) reuses `out` in place and exposes zero-filled `shadow` at 256B-aligned offset.
+  const a0 = ring.allocate(20, out);
+  assert.equal(a0, out, 'allocate() must populate reusable out object in place');
+  assert.equal(a0.dynamicOffset, 0);
+  assert.equal(a0.offset, 0);
+  assert.equal(a0.size, 20);
+  assert.equal(a0.paddedSize, 20);
+  assert.equal(a0.alignedSize, 256);
+  assert.ok(a0.shadow instanceof Uint8Array);
+  a0.shadow[0] = 0xaa;
+  a0.shadow[19] = 0xbb;
+
+  // 2. write(Float32Array, out) reuses `out` in place with zero-alloc typed shadow copy.
+  const f32 = new Float32Array([1.25, -2.5, 3.75, 4.0]);
+  const a1 = ring.write(f32, out);
+  assert.equal(a1, out);
+  assert.equal(a1.dynamicOffset, 256);
+  assert.equal(a1.dynamicOffset % 256, 0);
+  assert.equal(a1.size, 16);
+  assert.equal(a1.alignedSize, 256);
+
+  // 3. write(Uint32Array, out) + write(Int32Array, out) + write(SharedArrayBuffer, out).
+  const u32 = new Uint32Array([0xdeadbeef, 0xcafebabe, 0x01020304, 0x05060708]);
+  const a2 = ring.write(u32, out);
+  assert.equal(a2, out);
+  assert.equal(a2.dynamicOffset, 512);
+
+  const i32 = new Int32Array([-1, -42, 1337, 2147483647]);
+  const a3 = ring.write(i32, out);
+  assert.equal(a3, out);
+  assert.equal(a3.dynamicOffset, 768);
+
+  const sab = new SharedArrayBuffer(16);
+  new Uint32Array(sab).set([0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00]);
+  const a4 = ring.write(sab, out);
+  assert.equal(a4, out);
+  assert.equal(a4.dynamicOffset, 1024);
+  // Mutate source SAB immediately after write() to verify synchronous snapshot into regular ArrayBuffer shadow.
+  new Uint32Array(sab).fill(0);
+
+  // 4. write(offset, data, { out }) explicit offset write reuses `out` in place.
+  const a5 = ring.write(1280, new Uint8Array([9, 8, 7, 6, 5]), { out });
+  assert.equal(a5, out);
+  assert.equal(a5.dynamicOffset, 1280);
+  assert.equal(a5.size, 5);
+  assert.equal(a5.paddedSize, 16);
+  assert.equal(a5.alignedSize, 256);
+
+  // 5. allocate(0, { allowEmpty: true, out }) pads empty CBV to 16B / 256B aligned.
+  const a6 = ring.allocate(0, { allowEmpty: true, out });
+  assert.equal(a6, out);
+  assert.equal(a6.dynamicOffset, 1536);
+  assert.equal(a6.size, 0);
+  assert.equal(a6.paddedSize, 16);
+  assert.equal(a6.alignedSize, 256);
+
+  // Single coalesced flush uploads all 7 slices ([0, 1792)) in ONE queue.writeBuffer call.
+  const flushRes = ring.flushDirty();
+  assert.equal(flushRes.writeBufferCalls, 1);
+  assert.equal(flushRes.uploadedBytes, 7 * 256);
+  assert.equal(flushRes.stagedWrites, 7);
+  assert.equal(queueWrites.length, 1);
+
+  const gpuBytes = ring.currentBuffer._data;
+  assert.equal(gpuBytes[0], 0xaa);
+  assert.equal(gpuBytes[19], 0xbb);
+  assert.equal(gpuBytes[20], 0);
+  assert.deepEqual(Array.from(new Float32Array(gpuBytes.buffer, 256, 4)), [1.25, -2.5, 3.75, 4.0]);
+  assert.deepEqual(
+    Array.from(new Uint32Array(gpuBytes.buffer, 512, 4)),
+    [0xdeadbeef, 0xcafebabe, 0x01020304, 0x05060708]
+  );
+  assert.deepEqual(
+    Array.from(new Int32Array(gpuBytes.buffer, 768, 4)),
+    [-1, -42, 1337, 2147483647]
+  );
+  assert.deepEqual(
+    Array.from(new Uint32Array(gpuBytes.buffer, 1024, 4)),
+    [0x11223344, 0x55667788, 0x99aabbcc, 0xddeeff00]
+  );
+  assert.deepEqual(Array.from(gpuBytes.subarray(1280, 1285)), [9, 8, 7, 6, 5]);
+  for (let p = 1285; p < 1792; p += 1) {
+    assert.equal(gpuBytes[p], 0);
+  }
+
+  // Validation guards on allocate() and write().
+  assert.throws(() => ring.allocate(0), RangeError);
+  assert.throws(() => ring.allocate(-16), RangeError);
+  assert.throws(() => ring.allocate(70000), RangeError);
+  assert.throws(() => ring.allocate(16, 'bad-out'), TypeError);
+  assert.throws(() => ring.write(128, new Uint32Array([1, 2, 3, 4])), RangeError);
+
+  ring.destroy();
+  assert.throws(() => ring.allocate(16), /destroyed/i);
+  assert.throws(() => ring.write(f32), /destroyed/i);
+  assert.throws(() => ring.shrink(512), /destroyed/i);
+});
+
+test('W264: telemetry tracks peakVramBytes, shrinkCount, alignmentPaddingBytes, clamped reuseRate [0, 1], and resetStats() re-baselines peakVramBytes', () => {
+  const { device } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    minSlotBytes: 512,
+    maxByteSize: 1024,
+    allowSpill: true,
+    maxRingBytes: 2048,
+    framesInFlight: 2,
+    shrinkAfterIdleFrames: 2,
+  });
+
+  // Initial stats before any allocations: reuseRate === 0, peakVramBytes === live VRAM (2 x 512 = 1024).
+  const initStats = ring.getStats();
+  assert.equal(initStats.allocatedGpuBytes, 1024);
+  assert.equal(initStats.peakVramBytes, 1024);
+  assert.equal(initStats.shrinkCount, 0);
+  assert.equal(initStats.alignmentPaddingBytes, 0);
+  assert.equal(initStats.reuseRate, 0);
+
+  ring.beginFrame(); // Frame 0 (slot 0, 512B)
+
+  // Draw 0: 5B -> aligned 256B (padding 251B, reused slot 0 buffer -> reused=1, fresh=0)
+  ring.write(new Uint8Array(5));
+  // Draw 1: 256B -> aligned 256B (padding 0B, reused slot 0 buffer -> reused=2, fresh=0)
+  ring.write(new Uint8Array(256));
+  // Draw 2: 19B -> triggers _grow(768) to 1024B (padding 237B, fresh GPUBuffer -> reused=2, fresh=1)
+  ring.write(new Uint8Array(19));
+  // Draw 3: 64B -> fits in grown 1024B slot 0 (padding 192B, reused -> reused=3, fresh=1)
+  ring.write(new Uint8Array(64));
+  // Draw 4: 300B -> aligned 512B -> creates spill page #0 (1024B) (padding 212B, fresh -> reused=3, fresh=2)
+  ring.write(new Uint8Array(300));
+  // Draw 5: 16B -> fits in existing spill page #0 (padding 240B, reused -> reused=4, fresh=2)
+  ring.write(new Uint8Array(16));
+  ring.flush();
+
+  const s0 = ring.getStats();
+  const expectedPadding = 251 + 0 + 237 + 192 + 212 + 240;
+  assert.equal(s0.alignmentPaddingBytes, expectedPadding);
+  assert.equal(s0.alignedBytesWasted, expectedPadding);
+  assert.equal(s0.reusedAllocations, 4);
+  assert.equal(s0.freshAllocations, 2);
+  assert.equal(s0.totalAllocations, 6);
+  assert.equal(s0.reuseRate, 4 / 6);
+  assert.ok(s0.reuseRate >= 0 && s0.reuseRate <= 1);
+  // Live VRAM: slot 0 (1024) + slot 1 (512) + spill page #0 (1024) = 2560B.
+  assert.equal(s0.allocatedGpuBytes, 2560);
+  assert.equal(s0.peakVramBytes, 2560);
+  assert.ok(s0.peakVramBytes >= s0.allocatedGpuBytes);
+
+  // Frame 1 (slot 1): grows slot 1 from 512 -> 1024 (live = 1024 + 1024 + 1024 spill = 3072B peak!).
+  ring.beginFrame();
+  ring.write(new Uint8Array(16)); // quiet draw (256B <= 1024 * 0.25)
+  ring.flush();
+  assert.equal(ring.getStats().peakVramBytes, 3072);
+
+  // Frame 2 (slot 0): wraps, reclaims spill page; quiet draw (2nd idle frame).
+  ring.beginFrame();
+  ring.write(new Uint8Array(16));
+  ring.flush();
+  assert.equal(ring.getStats().allocatedGpuBytes, 2048);
+  assert.equal(ring.getStats().peakVramBytes, 3072);
+
+  // Frame 3 (slot 1): auto-shrink triggers (1024 -> 512), slot 1 shrinks to 512.
+  ring.beginFrame();
+  ring.write(new Uint8Array(16));
+  ring.flush();
+  // Frame 4 (slot 0): slot 0 shrinks to 512. Live VRAM is now 1024B, peakVramBytes is still 3072B!
+  ring.beginFrame();
+  const pendingOut = ring.write(new Uint8Array(16)); // keep unflushed write to verify resetStats preserves live state!
+
+  const beforeReset = ring.getStats();
+  assert.equal(beforeReset.allocatedGpuBytes, 1024);
+  assert.equal(beforeReset.peakVramBytes, 3072);
+  assert.equal(beforeReset.shrinkCount, 1);
+  assert.ok(beforeReset.alignmentPaddingBytes > 0);
+  assert.ok(beforeReset.reuseRate > 0 && beforeReset.reuseRate <= 1);
+
+  // resetStats() re-baselines peakVramBytes to current live VRAM (1024B) and zeroes cumulative counters
+  // without invalidating live slot GPUBuffers or pending unflushed dirty writes!
+  const afterReset = ring.resetStats();
+  assert.equal(afterReset.allocatedGpuBytes, 1024);
+  assert.equal(afterReset.peakVramBytes, 1024, 'resetStats() must re-baseline peakVramBytes to live VRAM');
+  assert.equal(afterReset.peakAllocatedGpuBytes, 1024);
+  assert.equal(afterReset.shrinkCount, 0);
+  assert.equal(afterReset.growCount, 0);
+  assert.equal(afterReset.alignmentPaddingBytes, 0);
+  assert.equal(afterReset.alignedBytesWasted, 0);
+  assert.equal(afterReset.totalAllocations, 0);
+  assert.equal(afterReset.reusedAllocations, 0);
+  assert.equal(afterReset.freshAllocations, 0);
+  assert.equal(afterReset.reuseRate, 0);
+  assert.equal(afterReset.flushCount, 0);
+  assert.equal(afterReset.usedBytes, 256, 'live frame cursor/usedBytes preserved across resetStats()');
+  assert.equal(afterReset.peakUsedBytes, 256, 'peakUsedBytes re-baselined to live usedBytes');
+
+  // Pending write staged before resetStats() flushes cleanly!
+  const flushAfterReset = ring.flush();
+  assert.deepEqual(flushAfterReset, { uploadedBytes: 256, drawCount: 1 });
+  assert.equal(pendingOut.buffer, ring.currentBuffer);
+
+  // Next steady-state reused write produces exact reuseRate === 1.0 (clamped <= 1).
+  ring.write(new Uint8Array(64));
+  const postResetStats = ring.getStats();
+  assert.equal(postResetStats.reuseRate, 1);
+  assert.equal(postResetStats.alignmentPaddingBytes, 256 - 64);
+  assert.equal(postResetStats.peakVramBytes, 1024);
+
+  // Classic-worker VM isolation still holds with W264 exports.
+  const source = readFileSync(new URL('../web/workers/uniform_ring.js', import.meta.url), 'utf8');
+  const ctx = vm.createContext({ console });
+  ctx.self = ctx;
+  vm.runInContext(source, ctx, { filename: 'uniform_ring.js' });
+  vm.runInContext('const clampUnitRate = () => 0; const DEFAULT_SHRINK_AFTER_IDLE_FRAMES = 0;', ctx);
+  assert.equal(ctx.PlayGta6UniformRing.DEFAULT_SHRINK_AFTER_IDLE_FRAMES, 120);
+  assert.equal(ctx.PlayGta6UniformRing.DEFAULT_SHRINK_THRESHOLD_RATIO, 0.25);
+
+  ring.destroy();
 });
