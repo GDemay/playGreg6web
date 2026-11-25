@@ -54,7 +54,9 @@
   const KNOWN_HEADER_FLAGS = PGIM_FLAGS.HEADERS_MAPPED | PGIM_FLAGS.EXECUTABLE_BYTES_OMITTED | PGIM_FLAGS.RELOCS_STRIPPED;
   const KNOWN_SECTION_FLAGS = PGIM_SECTION_FLAGS.HEADERS | PGIM_SECTION_FLAGS.BYTES_OMITTED;
   const U64_MAX = 0xffffffffffffffffn;
+  const BYTES_PER_MIB = 1024 * 1024;
   const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
+  const DEFAULT_CHUNK_BYTES = DEFAULT_CHUNK_SIZE;
   const DEFAULT_CONCURRENCY = 4;
   const DEFAULT_MAX_RETRIES = 3;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
@@ -131,15 +133,25 @@
     return Number.isFinite(rate) && rate > 0 ? rate : 0;
   }
 
+  function computeThroughputMBps(bytesPerSec) {
+    if (!(typeof bytesPerSec === 'number' && Number.isFinite(bytesPerSec) && bytesPerSec > 0)) return 0;
+    const mbps = bytesPerSec / BYTES_PER_MIB;
+    return Number.isFinite(mbps) && mbps > 0 ? mbps : 0;
+  }
+
   function emptyTelemetrySnapshot() {
     return {
       state: 'idle',
       bytesLoaded: 0,
       totalBytes: 0,
+      chunksFetched: 0,
       requests: 0,
       durationMs: 0,
+      elapsedMs: 0,
       bytesPerSec: 0,
       peakBytesPerSec: 0,
+      throughputMBps: 0,
+      parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
     };
@@ -153,10 +165,12 @@
       this.lastSampleAt = this.startedAt;
       this.bytesLoaded = 0;
       this.totalBytes = 0;
+      this.chunksFetched = 0;
       this.requests = 0;
       this.durationMs = 0;
       this.bytesPerSec = 0;
       this.peakBytesPerSec = 0;
+      this.parallelMode = false;
       this.retryCount = 0;
       this.abortedCount = 0;
       this._abortRecorded = false;
@@ -179,6 +193,15 @@
 
     recordRequest() {
       this.requests += 1;
+    }
+
+    recordChunk(count = 1) {
+      const n = sanitizeNonNegativeInt(count);
+      if (n > 0) this.chunksFetched += n;
+    }
+
+    setParallelMode(enabled) {
+      if (enabled) this.parallelMode = true;
     }
 
     recordRetry() {
@@ -252,16 +275,21 @@
     }
 
     snapshot() {
+      const durationMs = sanitizeNonNegativeFinite(this.durationMs);
       const bytesPerSec = sanitizeNonNegativeFinite(this.bytesPerSec);
       const peakBytesPerSec = sanitizeNonNegativeFinite(Math.max(this.peakBytesPerSec, bytesPerSec));
       return {
         state: this.state,
         bytesLoaded: sanitizeNonNegativeInt(this.bytesLoaded),
         totalBytes: sanitizeNonNegativeInt(this.totalBytes),
+        chunksFetched: sanitizeNonNegativeInt(this.chunksFetched),
         requests: sanitizeNonNegativeInt(this.requests),
-        durationMs: sanitizeNonNegativeFinite(this.durationMs),
+        durationMs,
+        elapsedMs: durationMs,
         bytesPerSec,
         peakBytesPerSec,
+        throughputMBps: computeThroughputMBps(bytesPerSec),
+        parallelMode: Boolean(this.parallelMode),
         retryCount: sanitizeNonNegativeInt(this.retryCount),
         abortedCount: sanitizeNonNegativeInt(this.abortedCount),
       };
@@ -1453,6 +1481,7 @@
    *   fetchImpl?: typeof fetch,
    *   rangeCache?: { read(path: string, offset: number, length: number): Promise<Uint8Array> } | null,
    *   chunkSize?: number,
+   *   chunkBytes?: number,
    *   concurrency?: number,
    *   maxRetries?: number,
    *   retryDelayMs?: number,
@@ -1469,7 +1498,8 @@
   constructor({
     fetchImpl,
     rangeCache = null,
-    chunkSize = DEFAULT_CHUNK_SIZE,
+    chunkSize,
+    chunkBytes,
     concurrency = DEFAULT_CONCURRENCY,
     maxRetries = DEFAULT_MAX_RETRIES,
     retryDelayMs,
@@ -1493,8 +1523,14 @@
     if (rangeCache !== null && (typeof rangeCache !== 'object' || typeof rangeCache.read !== 'function')) {
       throw new TypeError('rangeCache must expose read(path, offset, length)');
     }
-    if (!Number.isSafeInteger(chunkSize) || chunkSize < PGIM_HEADER_BYTES) {
-      throw new RangeError(`chunkSize must be an integer >= ${PGIM_HEADER_BYTES}, got: ${chunkSize}`);
+    const effectiveChunkSize =
+      chunkSize !== undefined
+        ? chunkSize
+        : chunkBytes !== undefined
+          ? chunkBytes
+          : DEFAULT_CHUNK_SIZE;
+    if (!Number.isSafeInteger(effectiveChunkSize) || effectiveChunkSize < PGIM_HEADER_BYTES) {
+      throw new RangeError(`chunkSize must be an integer >= ${PGIM_HEADER_BYTES}, got: ${effectiveChunkSize}`);
     }
     if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
       throw new RangeError(`concurrency must be a positive integer, got: ${concurrency}`);
@@ -1534,7 +1570,8 @@
     }
     this.fetchImpl = impl;
     this.rangeCache = rangeCache;
-    this.chunkSize = chunkSize;
+    this.chunkSize = effectiveChunkSize;
+    this.chunkBytes = effectiveChunkSize;
     this.concurrency = concurrency;
     this.maxRetries = maxRetries;
     this.retryDelayMs = effectiveRetryDelayMs;
@@ -1546,6 +1583,23 @@
     this.useSharedArrayBuffer = Boolean(useSharedArrayBuffer);
     this.targetBuffer = targetBuffer;
     this._telemetryRun = null;
+  }
+
+  _resolveTransferConfig({ chunkSize, chunkBytes, concurrency } = {}) {
+    const effectiveChunkSize =
+      chunkSize !== undefined
+        ? chunkSize
+        : chunkBytes !== undefined
+          ? chunkBytes
+          : this.chunkSize;
+    if (!Number.isSafeInteger(effectiveChunkSize) || effectiveChunkSize < PGIM_HEADER_BYTES) {
+      throw new RangeError(`chunkSize must be an integer >= ${PGIM_HEADER_BYTES}, got: ${effectiveChunkSize}`);
+    }
+    const effectiveConcurrency = concurrency !== undefined ? concurrency : this.concurrency;
+    if (!Number.isSafeInteger(effectiveConcurrency) || effectiveConcurrency < 1) {
+      throw new RangeError(`concurrency must be a positive integer, got: ${effectiveConcurrency}`);
+    }
+    return { chunkSize: effectiveChunkSize, concurrency: effectiveConcurrency };
   }
 
   /**
@@ -1628,16 +1682,23 @@
    *
    * @param {string} url
    * @param {{ onProgress?: (e: { phase: string, loadedBytes: number, totalBytes: number | null, pct: number }) => void,
-   *           signal?: AbortSignal, verifyChecksums?: boolean }} [options]
+   *           signal?: AbortSignal, verifyChecksums?: boolean,
+   *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} [options]
    */
-  async preloadGuestImage(url, { onProgress, signal, verifyChecksums = false } = {}) {
+  async preloadGuestImage(
+    url,
+    { onProgress, signal, verifyChecksums = false, chunkSize, chunkBytes, concurrency } = {}
+  ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
+    const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
     const run = this._startTelemetryRun();
     try {
       const result = await this._preloadGuestImageCore(url, {
         onProgress,
         signal,
         verifyChecksums,
+        chunkSize: transfer.chunkSize,
+        concurrency: transfer.concurrency,
         precomputedProbe: null,
         emitProbe: true,
         emitComplete: true,
@@ -1648,8 +1709,12 @@
       const stats = run.snapshot();
       return {
         ...result,
+        chunksFetched: stats.chunksFetched,
+        elapsedMs: stats.elapsedMs,
         bytesPerSec: stats.bytesPerSec,
         peakBytesPerSec: stats.peakBytesPerSec,
+        throughputMBps: stats.throughputMBps,
+        parallelMode: stats.parallelMode,
         retryCount: stats.retryCount,
         abortedCount: stats.abortedCount,
       };
@@ -1665,6 +1730,8 @@
       onProgress,
       signal,
       verifyChecksums = false,
+      chunkSize = this.chunkSize,
+      concurrency = this.concurrency,
       precomputedProbe = null,
       emitProbe = true,
       emitComplete = true,
@@ -1676,7 +1743,17 @@
     throwIfAborted(signal);
     const started = this._now();
     const emit = makeEmitter(onProgress);
-    const ctx = { url, signal, emit, requests: 0, run: telemetryRun, ownsTotalBytes };
+    const ctx = {
+      url,
+      signal,
+      emit,
+      requests: 0,
+      run: telemetryRun,
+      ownsTotalBytes,
+      chunkSize,
+      concurrency,
+      what: 'PGIM image',
+    };
 
     let probe = precomputedProbe;
     if (probe === null) {
@@ -1707,10 +1784,13 @@
       shared: loaded.shared,
       transport: loaded.transport,
       requests: ctx.requests,
+      chunksFetched: loaded.chunksFetched,
+      parallelMode: loaded.parallelMode,
       totalBytes,
       bytesLoaded: totalBytes,
       timingMs: durationMs,
       durationMs,
+      elapsedMs: durationMs,
     };
   }
 
@@ -1722,9 +1802,10 @@
    *
    * @param {string | { programManifestUrl?: string, manifestUrl?: string, bootManifestUrl?: string | null,
    *                   fallbackPgimUrl?: string | null, onProgress?: Function, signal?: AbortSignal,
-   *                   verifyChecksums?: boolean }} manifestUrl
+   *                   verifyChecksums?: boolean, chunkSize?: number, chunkBytes?: number, concurrency?: number }} manifestUrl
    * @param {{ bootManifestUrl?: string | null, fallbackPgimUrl?: string | null,
-   *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean }} [options]
+   *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean,
+   *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} [options]
    */
   async preloadProgramModules(manifestUrl, options = {}) {
     let requestedUrl = manifestUrl;
@@ -1734,15 +1815,24 @@
       requestedUrl = opts.programManifestUrl ?? opts.manifestUrl;
     }
     validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
+    const transfer = this._resolveTransferConfig(opts || {});
     const run = this._startTelemetryRun();
     try {
-      const result = await this._preloadProgramModulesCore(requestedUrl, opts, run);
+      const result = await this._preloadProgramModulesCore(
+        requestedUrl,
+        { ...(opts || {}), chunkSize: transfer.chunkSize, concurrency: transfer.concurrency },
+        run
+      );
       run.complete(result.totalBytes);
       const stats = run.snapshot();
       return {
         ...result,
+        chunksFetched: stats.chunksFetched,
+        elapsedMs: stats.elapsedMs,
         bytesPerSec: stats.bytesPerSec,
         peakBytesPerSec: stats.peakBytesPerSec,
+        throughputMBps: stats.throughputMBps,
+        parallelMode: stats.parallelMode,
         retryCount: stats.retryCount,
         abortedCount: stats.abortedCount,
       };
@@ -1759,6 +1849,8 @@
       onProgress,
       signal,
       verifyChecksums = false,
+      chunkSize = this.chunkSize,
+      concurrency = this.concurrency,
     } = opts || {};
 
     validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
@@ -1976,7 +2068,7 @@
       }
     };
     try {
-      await Promise.all(Array.from({ length: Math.min(this.concurrency, moduleCount) }, probeWorker));
+      await Promise.all(Array.from({ length: Math.min(concurrency, moduleCount) }, probeWorker));
     } finally {
       unlinkProbe();
     }
@@ -2039,6 +2131,8 @@
       const modResult = await this._preloadGuestImageCore(descriptor.url, {
         signal,
         verifyChecksums,
+        chunkSize,
+        concurrency,
         precomputedProbe: probes[i],
         emitProbe: false,
         emitComplete: false,
@@ -2074,10 +2168,13 @@
         shared: modResult.shared,
         transport: modResult.transport,
         requests: modResult.requests,
+        chunksFetched: modResult.chunksFetched,
+        parallelMode: modResult.parallelMode,
         totalBytes: modResult.totalBytes,
         bytesLoaded: modResult.bytesLoaded,
         timingMs: modResult.timingMs,
         durationMs: modResult.durationMs,
+        elapsedMs: modResult.elapsedMs,
       };
       loadedModules.push(entry);
       Object.defineProperty(modulesByName, descriptor.name, {
@@ -2133,7 +2230,8 @@
    * Stream and validate a PGIM v1 guest image. Returns `{ header, buffer, bytesLoaded, durationMs }`.
    *
    * @param {string} url
-   * @param {{ onProgress?: Function, signal?: AbortSignal, verifyChecksums?: boolean }} [options]
+   * @param {{ onProgress?: Function, signal?: AbortSignal, verifyChecksums?: boolean,
+   *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} [options]
    */
   async preloadPgim(url, options = {}) {
     const result = await this.preloadGuestImage(url, options);
@@ -2141,14 +2239,19 @@
       header: result.header,
       buffer: result.buffer,
       bytesLoaded: result.bytesLoaded,
+      totalBytes: result.totalBytes,
       durationMs: result.durationMs,
+      elapsedMs: result.elapsedMs,
       layout: result.layout,
       bytes: result.bytes,
       shared: result.shared,
       transport: result.transport,
       requests: result.requests,
+      chunksFetched: result.chunksFetched,
+      parallelMode: result.parallelMode,
       bytesPerSec: result.bytesPerSec,
       peakBytesPerSec: result.peakBytesPerSec,
+      throughputMBps: result.throughputMBps,
       retryCount: result.retryCount,
       abortedCount: result.abortedCount,
     };
@@ -2158,17 +2261,23 @@
    * Stream a `.wgsl.pack` bundle and validate the WGPK magic/version/entry table header.
    *
    * @param {string} url
-   * @param {{ onProgress?: Function, signal?: AbortSignal }} [options]
+   * @param {{ onProgress?: Function, signal?: AbortSignal,
+   *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} [options]
    */
-  async preloadShaderPack(url, { onProgress, signal } = {}) {
+  async preloadShaderPack(url, { onProgress, signal, chunkSize, chunkBytes, concurrency } = {}) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('shader pack url must be a non-empty string');
+    const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
     const run = this._startTelemetryRun();
     try {
       throwIfAborted(signal);
       const started = this._now();
       const emit = makeEmitter(onProgress);
-      const bytes = await this._fetchAsset(url, 'WGPK shader pack', signal, emit, run, true);
-      const validated = validateWgslPackBytes(bytes, url);
+      const fetched = await this._fetchAsset(url, 'WGPK shader pack', signal, emit, run, true, {
+        allowParallelRange: true,
+        chunkSize: transfer.chunkSize,
+        concurrency: transfer.concurrency,
+      });
+      const validated = validateWgslPackBytes(fetched.bytes, url);
       run.complete(validated.byteLength);
       const stats = run.snapshot();
       return {
@@ -2177,9 +2286,15 @@
           : validated.slice().buffer,
         bytes: validated,
         bytesLoaded: validated.byteLength,
+        totalBytes: validated.byteLength,
+        transport: fetched.transport,
+        chunksFetched: stats.chunksFetched,
         durationMs: this._elapsedSince(started),
+        elapsedMs: stats.elapsedMs,
         bytesPerSec: stats.bytesPerSec,
         peakBytesPerSec: stats.peakBytesPerSec,
+        throughputMBps: stats.throughputMBps,
+        parallelMode: stats.parallelMode,
         retryCount: stats.retryCount,
         abortedCount: stats.abortedCount,
       };
@@ -2204,7 +2319,10 @@
       throwIfAborted(signal);
       const started = this._now();
       const emit = makeEmitter(onProgress);
-      const bytes = await this._fetchAsset(url, 'reflection manifest', signal, emit, run, true);
+      const fetched = await this._fetchAsset(url, 'reflection manifest', signal, emit, run, true, {
+        allowParallelRange: false,
+      });
+      const bytes = fetched.bytes;
       const manifest = parseReflectionManifestJson(bytes, url);
       run.complete(bytes.byteLength);
       const stats = run.snapshot();
@@ -2212,9 +2330,14 @@
         manifest,
         bytes,
         bytesLoaded: bytes.byteLength,
+        totalBytes: bytes.byteLength,
+        chunksFetched: stats.chunksFetched,
         durationMs: this._elapsedSince(started),
+        elapsedMs: stats.elapsedMs,
         bytesPerSec: stats.bytesPerSec,
         peakBytesPerSec: stats.peakBytesPerSec,
+        throughputMBps: stats.throughputMBps,
+        parallelMode: stats.parallelMode,
         retryCount: stats.retryCount,
         abortedCount: stats.abortedCount,
       };
@@ -2231,7 +2354,8 @@
    *
    * @param {{ pgimUrl?: string | null, programManifestUrl?: string | null, bootManifestUrl?: string | null,
    *           shaderPackUrl?: string | null, reflectionUrl?: string | null,
-   *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean }} options
+   *           onProgress?: (e: object) => void, signal?: AbortSignal, verifyChecksums?: boolean,
+   *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} options
    *   Progress events carry an extra `asset` field: `pgim`, `shaderPack`, `reflection`, or `bundle`.
    */
   async preloadBootBundle({
@@ -2243,12 +2367,16 @@
     onProgress,
     signal,
     verifyChecksums = false,
+    chunkSize,
+    chunkBytes,
+    concurrency,
   } = {}) {
     const hasProgramManifest = typeof programManifestUrl === 'string' && programManifestUrl.length > 0;
     const hasPgimUrl = typeof pgimUrl === 'string' && pgimUrl.length > 0;
     if (!hasProgramManifest && !hasPgimUrl) {
       throw new TypeError('pgimUrl or programManifestUrl must be a non-empty string');
     }
+    const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
     const run = this._startTelemetryRun();
     try {
       throwIfAborted(signal);
@@ -2267,12 +2395,25 @@
       const forward = (asset) =>
         typeof onProgress === 'function' ? (event) => onProgress({ ...event, asset }) : undefined;
 
-      const optionalAsset = async (key, url, label, validate) => {
+      const optionalAsset = async (key, url, label, validate, allowParallelRange) => {
         if (!url) return null;
         try {
-          return await timed(key, async () =>
-            validate(await this._fetchAsset(url, label, inner, makeEmitter(onProgress, { asset: key }), run, false), url)
-          );
+          return await timed(key, async () => {
+            const fetched = await this._fetchAsset(
+              url,
+              label,
+              inner,
+              makeEmitter(onProgress, { asset: key }),
+              run,
+              false,
+              {
+                allowParallelRange,
+                chunkSize: transfer.chunkSize,
+                concurrency: transfer.concurrency,
+              }
+            );
+            return validate(fetched.bytes, url);
+          });
         } catch (err) {
           if (err instanceof PgimPreloadError && err.code === 'NOT_FOUND') {
             timingMs[key] = timingMs[key] ?? this._elapsedSince(started);
@@ -2296,6 +2437,8 @@
                   onProgress: forward('pgim'),
                   signal: inner,
                   verifyChecksums,
+                  chunkSize: transfer.chunkSize,
+                  concurrency: transfer.concurrency,
                 },
                 run
               )
@@ -2303,6 +2446,8 @@
                 onProgress: forward('pgim'),
                 signal: inner,
                 verifyChecksums,
+                chunkSize: transfer.chunkSize,
+                concurrency: transfer.concurrency,
                 precomputedProbe: null,
                 emitProbe: true,
                 emitComplete: true,
@@ -2310,8 +2455,8 @@
                 ownsTotalBytes: false,
               })
         ),
-        optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes),
-        optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson),
+        optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes, true),
+        optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson, false),
       ];
 
       let results;
@@ -2365,9 +2510,14 @@
           reflectionManifest,
           timingMs,
           durationMs: timingMs.total,
+          elapsedMs: stats.elapsedMs,
           bytesLoaded: pgimResult.bytesLoaded,
+          totalBytes: stats.totalBytes,
+          chunksFetched: stats.chunksFetched,
           bytesPerSec: stats.bytesPerSec,
           peakBytesPerSec: stats.peakBytesPerSec,
+          throughputMBps: stats.throughputMBps,
+          parallelMode: stats.parallelMode,
           retryCount: stats.retryCount,
           abortedCount: stats.abortedCount,
         };
@@ -2395,9 +2545,14 @@
         reflectionManifest,
         timingMs,
         durationMs: timingMs.total,
+        elapsedMs: stats.elapsedMs,
         bytesLoaded: image.bytesLoaded,
+        totalBytes: stats.totalBytes,
+        chunksFetched: stats.chunksFetched,
         bytesPerSec: stats.bytesPerSec,
         peakBytesPerSec: stats.peakBytesPerSec,
+        throughputMBps: stats.throughputMBps,
+        parallelMode: stats.parallelMode,
         retryCount: stats.retryCount,
         abortedCount: stats.abortedCount,
       };
@@ -2482,6 +2637,26 @@
       return { totalBytes, acceptRanges };
     }
 
+    async _probeAsset(ctx, what) {
+      let response;
+      try {
+        response = await this._request(ctx, { method: 'HEAD' });
+      } catch (err) {
+        if (ctx.signal && ctx.signal.aborted) throw err;
+        return { totalBytes: null, acceptRanges: null };
+      }
+      if (response.status === 404 || response.status === 410) throw httpError(ctx.url, response.status, what);
+      if (!response.ok) return { totalBytes: null, acceptRanges: null };
+      const totalBytes = contentLength(response);
+      const ranges = headerValue(response, 'accept-ranges');
+      let acceptRanges = null;
+      if (ranges !== null) {
+        if (/\bbytes\b/i.test(ranges)) acceptRanges = true;
+        else if (ranges.trim().toLowerCase() === 'none') acceptRanges = false;
+      }
+      return { totalBytes, acceptRanges };
+    }
+
   _allocate(totalBytes) {
     if (this.targetBuffer) {
       if (this.targetBuffer.byteLength < totalBytes) {
@@ -2509,24 +2684,163 @@
     }
   }
 
-    async _loadRanged(ctx, probe) {
-      const firstLen = probe.totalBytes !== null ? Math.min(this.chunkSize, probe.totalBytes) : this.chunkSize;
-      const response = await this._request(ctx, { method: 'GET', headers: { Range: `bytes=0-${firstLen - 1}` } });
-      if (response.status === 200) {
-        // Server ignored the Range header: consume the full body as a single GET.
-        return this._consumeFullBody(ctx, response, probe.totalBytes);
+    async _readRangeBodyInto(response, dest, start, expectedLen, signal) {
+      const body = response.body;
+      if (!body || typeof body.getReader !== 'function') {
+        const data = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+        throwIfAborted(signal);
+        if (data.byteLength !== expectedLen) {
+          throw new PgimPreloadError(
+            'RANGE_MISMATCH',
+            `PGIM chunk bytes=${start}-${start + expectedLen - 1} returned ${data.byteLength} bytes, expected ${expectedLen}`
+          );
+        }
+        dest.set(data, start);
+        return expectedLen;
       }
-      if (response.status === 416) {
-        throw new PgimPreloadError('TRUNCATED', `truncated PGIM image header: ${ctx.url} is empty (HTTP 416)`, {
-          needed: PGIM_HEADER_BYTES,
-          available: 0,
-        });
-      }
-      if (response.status !== 206) throw httpError(ctx.url, response.status);
 
-      const range = parseContentRange(headerValue(response, 'content-range'));
-      const first = new Uint8Array(await raceAbort(response.arrayBuffer(), ctx.signal));
-      throwIfAborted(ctx.signal);
+      const reader = body.getReader();
+      let written = 0;
+      try {
+        for (;;) {
+          const { done, value } = await raceAbort(reader.read(), signal);
+          if (done) break;
+          const part = toBytes(value, 'range chunk');
+          if (written + part.byteLength > expectedLen) {
+            throw new PgimPreloadError(
+              'RANGE_MISMATCH',
+              `PGIM chunk bytes=${start}-${start + expectedLen - 1} exceeded expected ${expectedLen} bytes`
+            );
+          }
+          dest.set(part, start + written);
+          written += part.byteLength;
+        }
+      } catch (err) {
+        reader.cancel(err).catch(() => {});
+        throwIfAborted(signal);
+        throw err;
+      }
+      throwIfAborted(signal);
+      if (written !== expectedLen) {
+        throw new PgimPreloadError(
+          'RANGE_MISMATCH',
+          `PGIM chunk bytes=${start}-${start + expectedLen - 1} returned ${written} bytes, expected ${expectedLen}`
+        );
+      }
+      return written;
+    }
+
+    async _fetchRangeChunkWithRetry(
+      ctx,
+      start,
+      end,
+      dest,
+      signal = ctx.signal,
+      { allowFullFallback = false, validateTotal = null } = {}
+    ) {
+      const expectedLen = end - start;
+      const rangeHeader = `bytes=${start}-${end - 1}`;
+      const what = ctx.what || 'PGIM image';
+      let attempt = 0;
+      for (;;) {
+        throwIfAborted(signal);
+        ctx.requests += 1;
+        if (ctx.run) ctx.run.recordRequest();
+        try {
+          const res = await raceAbort(
+            Promise.resolve().then(() =>
+              this.fetchImpl(ctx.url, { method: 'GET', headers: { Range: rangeHeader }, signal })
+            ),
+            signal
+          );
+          if (isRetryableHttpStatus(res.status) && attempt < this.maxRetries) {
+            throwIfAborted(signal);
+            if (res.body && typeof res.body.cancel === 'function') {
+              res.body.cancel().catch(() => {});
+            }
+            const delayMs = this._computeRetryDelayMs(attempt);
+            attempt += 1;
+            if (ctx.run) ctx.run.recordRetry();
+            await this._sleepWithAbort(delayMs, signal);
+            continue;
+          }
+          if (allowFullFallback && res.status === 200) {
+            return { fullResponse: res };
+          }
+          if (res.status === 416 && start === 0) {
+            throw new PgimPreloadError('TRUNCATED', `truncated PGIM image header: ${ctx.url} is empty (HTTP 416)`, {
+              needed: PGIM_HEADER_BYTES,
+              available: 0,
+            });
+          }
+          if (res.status !== 206) {
+            throw res.status === 200
+              ? new PgimPreloadError('RANGE_NOT_HONORED', `server ignored Range ${rangeHeader} for ${ctx.url}`)
+              : httpError(ctx.url, res.status, what);
+          }
+
+          const cr = parseContentRange(headerValue(res, 'content-range'));
+          if (dest !== null) {
+            if (cr && (cr.start !== start || cr.end !== end - 1 || (validateTotal !== null && cr.total !== null && cr.total !== validateTotal))) {
+              if (res.body && typeof res.body.cancel === 'function') {
+                res.body.cancel().catch(() => {});
+              }
+              throw new PgimPreloadError('RANGE_MISMATCH', `unexpected Content-Range for ${rangeHeader}`);
+            }
+            const declaredLen = contentLength(res);
+            if (declaredLen !== null && declaredLen !== expectedLen) {
+              if (res.body && typeof res.body.cancel === 'function') {
+                res.body.cancel().catch(() => {});
+              }
+              throw new PgimPreloadError(
+                'RANGE_MISMATCH',
+                `PGIM chunk ${rangeHeader} declared ${declaredLen} bytes, expected ${expectedLen}`
+              );
+            }
+            const bytesWritten = await this._readRangeBodyInto(res, dest, start, expectedLen, signal);
+            return { bytesWritten, range: cr };
+          }
+
+          const bytes = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
+          throwIfAborted(signal);
+          return { bytes, range: cr };
+        } catch (err) {
+          if (signal && signal.aborted) throw abortReason(signal);
+          if (isAbortError(err)) throw err;
+          if (err instanceof PgimPreloadError && err.code !== 'NETWORK_ERROR') throw err;
+          const wrapped =
+            err instanceof PgimPreloadError
+              ? err
+              : new PgimPreloadError(
+                  'NETWORK_ERROR',
+                  `${what} request failed: ${ctx.url} (${err && err.message ? err.message : err})`,
+                  { url: ctx.url, cause: err }
+                );
+          if (attempt < this.maxRetries && isRetryableNetworkError(wrapped)) {
+            throwIfAborted(signal);
+            const delayMs = this._computeRetryDelayMs(attempt);
+            attempt += 1;
+            if (ctx.run) ctx.run.recordRetry();
+            await this._sleepWithAbort(delayMs, signal);
+            continue;
+          }
+          throw wrapped;
+        }
+      }
+    }
+
+    async _loadRanged(ctx, probe) {
+      const chunkSize = ctx.chunkSize ?? this.chunkSize;
+      const concurrency = ctx.concurrency ?? this.concurrency;
+      const firstLen = probe.totalBytes !== null ? Math.min(chunkSize, probe.totalBytes) : chunkSize;
+      const firstRes = await this._fetchRangeChunkWithRetry(ctx, 0, firstLen, null, ctx.signal, {
+        allowFullFallback: true,
+      });
+      if (firstRes.fullResponse) {
+        // Server ignored the Range header: consume the full body as a single GET.
+        return this._consumeFullBody(ctx, firstRes.fullResponse, probe.totalBytes);
+      }
+      const { bytes: first, range } = firstRes;
       if (range && (range.start !== 0 || range.end - range.start + 1 !== first.byteLength)) {
         throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`);
       }
@@ -2547,26 +2861,32 @@
       if (ctx.run) {
         if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
         ctx.run.recordBytes(first.byteLength);
+        ctx.run.recordChunk(1);
       }
       ctx.emit('header', first.byteLength, total);
 
-      await this._parallelChunks(ctx, dest.bytes, first.byteLength, async (start, end, signal) => {
-        const res = await this._request(ctx, { method: 'GET', headers: { Range: `bytes=${start}-${end - 1}` } }, signal);
-        if (res.status !== 206) {
-          throw res.status === 200
-            ? new PgimPreloadError('RANGE_NOT_HONORED', `server ignored Range bytes=${start}-${end - 1} for ${ctx.url}`)
-            : httpError(ctx.url, res.status);
-        }
-        const cr = parseContentRange(headerValue(res, 'content-range'));
-        if (cr && (cr.start !== start || cr.end !== end - 1 || (cr.total !== null && cr.total !== total))) {
-          throw new PgimPreloadError('RANGE_MISMATCH', `unexpected Content-Range for bytes=${start}-${end - 1}`);
-        }
-        return new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
-      });
-      return { ...dest, transport: 'range' };
+      const parallel = await this._parallelChunks(
+        ctx,
+        dest.bytes,
+        first.byteLength,
+        async (start, end, signal) => {
+          const chunkRes = await this._fetchRangeChunkWithRetry(ctx, start, end, dest.bytes, signal, {
+            allowFullFallback: false,
+            validateTotal: total,
+          });
+          return chunkRes.bytesWritten;
+        },
+        { directWrite: true }
+      );
+      const chunksFetched = 1 + parallel.chunksCompleted;
+      const parallelMode = concurrency > 1 && chunksFetched > 1;
+      if (parallelMode && ctx.run) ctx.run.setParallelMode(true);
+      return { ...dest, transport: 'range', chunksFetched, parallelMode };
     }
 
     async _loadViaRangeCache(ctx, probe) {
+      const chunkSize = ctx.chunkSize ?? this.chunkSize;
+      const concurrency = ctx.concurrency ?? this.concurrency;
       const cache = this.rangeCache;
       const read = async (offset, length, signal) => {
         throwIfAborted(signal);
@@ -2574,7 +2894,7 @@
         if (ctx.run) ctx.run.recordRequest();
         return toBytes(await raceAbort(Promise.resolve().then(() => cache.read(ctx.url, offset, length)), signal), 'rangeCache chunk');
       };
-      const firstLen = probe.totalBytes !== null ? Math.min(this.chunkSize, probe.totalBytes) : this.chunkSize;
+      const firstLen = probe.totalBytes !== null ? Math.min(chunkSize, probe.totalBytes) : chunkSize;
       const first = await read(0, firstLen, ctx.signal);
       const header = parsePgimHeader(first, { totalBytes: probe.totalBytes });
       const total = header.fileSize;
@@ -2586,39 +2906,66 @@
       if (ctx.run) {
         if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
         ctx.run.recordBytes(first.byteLength);
+        ctx.run.recordChunk(1);
       }
       ctx.emit('header', first.byteLength, total);
-      await this._parallelChunks(ctx, dest.bytes, first.byteLength, (start, end, signal) => read(start, end - start, signal));
-      return { ...dest, transport: 'range-cache' };
+      const parallel = await this._parallelChunks(ctx, dest.bytes, first.byteLength, (start, end, signal) =>
+        read(start, end - start, signal)
+      );
+      const chunksFetched = 1 + parallel.chunksCompleted;
+      const parallelMode = concurrency > 1 && chunksFetched > 1;
+      if (parallelMode && ctx.run) ctx.run.setParallelMode(true);
+      return { ...dest, transport: 'range-cache', chunksFetched, parallelMode };
     }
 
-    async _parallelChunks(ctx, dest, startOffset, fetchChunk) {
+    async _parallelChunks(ctx, dest, startOffset, fetchChunk, { directWrite = false } = {}) {
+      const chunkSize = ctx.chunkSize ?? this.chunkSize;
+      const concurrency = ctx.concurrency ?? this.concurrency;
       const total = dest.byteLength;
       const chunks = [];
-      for (let start = startOffset; start < total; start += this.chunkSize) {
-        chunks.push([start, Math.min(total, start + this.chunkSize)]);
+      for (let start = startOffset; start < total; start += chunkSize) {
+        chunks.push([start, Math.min(total, start + chunkSize)]);
       }
-      if (chunks.length === 0) return;
+      if (chunks.length === 0) return { chunksCompleted: 0 };
       const { controller, unlink } = linkSignal(ctx.signal);
       let next = 0;
       let loaded = startOffset;
+      let chunksCompleted = 0;
       let failure = null;
       const worker = async () => {
         while (failure === null && next < chunks.length) {
           const [start, end] = chunks[next];
           next += 1;
           try {
-            const data = await fetchChunk(start, end, controller.signal);
-            if (failure !== null) return;
-            if (data.byteLength !== end - start) {
-              throw new PgimPreloadError(
-                'RANGE_MISMATCH',
-                `PGIM chunk bytes=${start}-${end - 1} returned ${data.byteLength} bytes, expected ${end - start}`
-              );
+            const expectedLen = end - start;
+            let written;
+            if (directWrite) {
+              written = await fetchChunk(start, end, controller.signal);
+              if (failure !== null) return;
+              if (written !== expectedLen) {
+                throw new PgimPreloadError(
+                  'RANGE_MISMATCH',
+                  `PGIM chunk bytes=${start}-${end - 1} returned ${written} bytes, expected ${expectedLen}`
+                );
+              }
+            } else {
+              const data = await fetchChunk(start, end, controller.signal);
+              if (failure !== null) return;
+              if (data.byteLength !== expectedLen) {
+                throw new PgimPreloadError(
+                  'RANGE_MISMATCH',
+                  `PGIM chunk bytes=${start}-${end - 1} returned ${data.byteLength} bytes, expected ${expectedLen}`
+                );
+              }
+              dest.set(data, start);
+              written = data.byteLength;
             }
-            dest.set(data, start);
-            loaded += data.byteLength;
-            if (ctx.run) ctx.run.recordBytes(data.byteLength);
+            loaded += written;
+            chunksCompleted += 1;
+            if (ctx.run) {
+              ctx.run.recordBytes(written);
+              ctx.run.recordChunk(1);
+            }
             ctx.emit('download', loaded, total);
           } catch (err) {
             if (failure === null) {
@@ -2630,12 +2977,13 @@
         }
       };
       try {
-        await Promise.all(Array.from({ length: Math.min(this.concurrency, chunks.length) }, worker));
+        await Promise.all(Array.from({ length: Math.min(concurrency, chunks.length) }, worker));
       } finally {
         unlink();
       }
       throwIfAborted(ctx.signal);
       if (failure !== null) throw failure;
+      return { chunksCompleted };
     }
 
     async _consumeFullBody(ctx, response, knownTotal) {
@@ -2660,9 +3008,10 @@
         if (ctx.run) {
           if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(header.fileSize);
           ctx.run.recordBytes(whole.byteLength);
+          ctx.run.recordChunk(1);
         }
         ctx.emit('download', whole.byteLength, header.fileSize);
-        return { ...dest, transport: 'full' };
+        return { ...dest, transport: 'full', chunksFetched: 1, parallelMode: false };
       }
 
       const reader = body.getReader();
@@ -2730,23 +3079,111 @@
           available: loaded,
         });
       }
-      return { ...dest, transport: 'full' };
+      if (ctx.run) ctx.run.recordChunk(1);
+      return { ...dest, transport: 'full', chunksFetched: 1, parallelMode: false };
     }
 
-    async _fetchAsset(url, what, signal, emit, telemetryRun = null, ownsTotalBytes = false) {
-      const ctx = { url, signal, emit, requests: 0, run: telemetryRun, ownsTotalBytes };
+    async _fetchAsset(
+      url,
+      what,
+      signal,
+      emit,
+      telemetryRun = null,
+      ownsTotalBytes = false,
+      { allowParallelRange = false, chunkSize = this.chunkSize, concurrency = this.concurrency } = {}
+    ) {
+      const ctx = {
+        url,
+        signal,
+        emit,
+        requests: 0,
+        run: telemetryRun,
+        ownsTotalBytes,
+        chunkSize,
+        concurrency,
+        what,
+      };
+      if (allowParallelRange && concurrency > 1) {
+        const probe = await this._probeAsset(ctx, what);
+        if (probe.acceptRanges === true && probe.totalBytes !== null && probe.totalBytes > chunkSize) {
+          const total = probe.totalBytes;
+          const dest = new Uint8Array(total);
+          if (telemetryRun && ownsTotalBytes) telemetryRun.setTotalBytes(total);
+          emit('download', 0, total);
+          const parallel = await this._parallelChunks(
+            ctx,
+            dest,
+            0,
+            async (start, end, chunkSignal) => {
+              const chunkRes = await this._fetchRangeChunkWithRetry(ctx, start, end, dest, chunkSignal, {
+                allowFullFallback: false,
+                validateTotal: total,
+              });
+              return chunkRes.bytesWritten;
+            },
+            { directWrite: true }
+          );
+          const parallelMode = parallel.chunksCompleted > 1;
+          if (parallelMode && telemetryRun) telemetryRun.setParallelMode(true);
+          emit('complete', total, total);
+          return { bytes: dest, transport: 'range', chunksFetched: parallel.chunksCompleted, parallelMode };
+        }
+      }
+
       const response = await this._request(ctx, { method: 'GET' });
       if (!response.ok) throw httpError(url, response.status, what);
       const declared = contentLength(response);
       emit('download', 0, declared);
-      const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
-      throwIfAborted(signal);
-      if (telemetryRun) {
-        if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
-        telemetryRun.recordBytes(bytes.byteLength);
+      let bytes;
+      const body = response.body;
+      if (body && typeof body.getReader === 'function') {
+        const reader = body.getReader();
+        const parts = [];
+        let loaded = 0;
+        if (telemetryRun && ownsTotalBytes && declared !== null) {
+          telemetryRun.setTotalBytes(declared);
+        }
+        try {
+          for (;;) {
+            const { done, value } = await raceAbort(reader.read(), signal);
+            if (done) break;
+            const part = toBytes(value, what);
+            parts.push(part);
+            loaded += part.byteLength;
+            if (telemetryRun) telemetryRun.recordBytes(part.byteLength);
+            emit('download', loaded, declared);
+          }
+        } catch (err) {
+          reader.cancel(err).catch(() => {});
+          throwIfAborted(signal);
+          throw err;
+        }
+        throwIfAborted(signal);
+        if (parts.length === 1) {
+          bytes = parts[0];
+        } else {
+          bytes = new Uint8Array(loaded);
+          let offset = 0;
+          for (const part of parts) {
+            bytes.set(part, offset);
+            offset += part.byteLength;
+          }
+        }
+        if (telemetryRun) {
+          if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
+          telemetryRun.recordChunk(1);
+        }
+      } else {
+        bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+        throwIfAborted(signal);
+        if (telemetryRun) {
+          if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
+          telemetryRun.recordBytes(bytes.byteLength);
+          telemetryRun.recordChunk(1);
+        }
       }
       emit('complete', bytes.byteLength, bytes.byteLength);
-      return bytes;
+      return { bytes, transport: 'full', chunksFetched: 1, parallelMode: false };
     }
   }
 
@@ -2769,6 +3206,7 @@
       fetchImpl,
       rangeCache = null,
       chunkSize,
+      chunkBytes,
       concurrency,
       maxRetries,
       retryDelayMs,
@@ -2788,6 +3226,7 @@
             fetchImpl,
             rangeCache,
             ...(chunkSize !== undefined ? { chunkSize } : {}),
+            ...(chunkBytes !== undefined ? { chunkBytes } : {}),
             ...(concurrency !== undefined ? { concurrency } : {}),
             ...(maxRetries !== undefined ? { maxRetries } : {}),
             ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
@@ -2812,6 +3251,8 @@
     PGIM_FLAGS,
     PGIM_SECTION_FLAGS,
     PGIM_PROT,
+    DEFAULT_CHUNK_BYTES,
+    DEFAULT_CONCURRENCY,
     PROGRAM_MANIFEST_SCHEMA,
     PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,
