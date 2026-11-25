@@ -195,6 +195,8 @@ struct BridgeOptions {
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
 // WebGPU's default maxUniformBufferBindingSize (also D3D12's 4096 x 16-byte constant buffer limit).
 inline constexpr uint64_t kMaxUniformBindingSize = 65536;
+// Bind groups one command list keeps cached across Resets (O36); see CommandListBridge::Reset.
+inline constexpr size_t kMaxCachedBindGroups = 4096;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
