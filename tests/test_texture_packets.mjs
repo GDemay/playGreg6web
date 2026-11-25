@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const { WgpuCommandProcessor, OPCODES } = require('../web/workers/wgpu_worker.js');
 const { installRenderStatePackets, TEXTURE_FORMAT_NAMES: RS_FORMATS } = require('../web/workers/render_state_packets.js');
 const { GpuStagingPool } = require('../web/workers/staging_pool.js');
+const tf = require('../web/workers/texture_formats.js');
 const tp = require('../web/workers/texture_packets.js');
 
 const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
@@ -825,7 +826,13 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
       const DEFAULT_MAX_SCRATCH_BYTES = 0;
       const getSrgbSiblingFormat = null;
       const resolveCompatibleViewFormats = null;
+      const WEBGPU_FORMAT_BLOCK_INFO = null;
+      const WEBGPU_FORMAT_INFO = null;
+      const expandA8ToRgba8 = null;
+      const alignCopySizeForFormat = null;
+      const calcMipUploadLayout = null;
       class TexturePackets {}
+      class TextureScratchPool {}
       `,
       ctx
     );
@@ -833,6 +840,10 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
 
   assert.equal(typeof ctx.PlayGta6TexturePackets.alignBytesPerRow256, 'function');
   assert.equal(typeof ctx.PlayGta6TexturePackets.repackRowsTo256, 'function');
+  assert.equal(typeof ctx.PlayGta6TexturePackets.expandA8ToRgba8, 'function');
+  assert.equal(typeof ctx.PlayGta6TexturePackets.TextureScratchPool, 'function');
+  assert.equal(typeof ctx.PlayGta6TextureFormats.expandA8ToRgba8, 'function');
+  assert.equal(typeof ctx.PlayGta6TextureFormats.TextureScratchPool, 'function');
   assert.equal(ctx.PlayGta6TexturePackets.alignBytesPerRow256(16), 256);
 });
 
@@ -1897,4 +1908,563 @@ test('W191: upload telemetry distinguishes zero-copy, scratch-repack, oversized 
     scratchBufferBytes: 0,
     sabCopyCount: 0,
   });
+});
+
+test('W265 (#1127): BC1-BC7 mip layout & 4x4 block-extent alignment cover all 14 formats across 1x1, 2x2, 3x3, 4x4, and multi-row mips', () => {
+  const allBcFormats = [
+    ['bc1-rgba-unorm', 8],
+    ['bc1-rgba-unorm-srgb', 8],
+    ['bc2-rgba-unorm', 16],
+    ['bc2-rgba-unorm-srgb', 16],
+    ['bc3-rgba-unorm', 16],
+    ['bc3-rgba-unorm-srgb', 16],
+    ['bc4-r-unorm', 8],
+    ['bc4-r-snorm', 8],
+    ['bc5-rg-unorm', 16],
+    ['bc5-rg-snorm', 16],
+    ['bc6h-rgb-ufloat', 16],
+    ['bc6h-rgb-float', 16],
+    ['bc7-rgba-unorm', 16],
+    ['bc7-rgba-unorm-srgb', 16],
+  ];
+
+  for (const [format, bytesPerBlock] of allBcFormats) {
+    // 1x1, 2x2, 3x3 tail mips must clamp copy extents to 4x4 and align bytesPerRow to 256B.
+    for (const [w, h] of [
+      [1, 1],
+      [2, 2],
+      [3, 3],
+      [1, 3],
+      [2, 1],
+    ]) {
+      const tpLayout = tp.calcMipUploadLayout(format, w, h, 1);
+      const tfLayout = tf.calcMipUploadLayout(format, w, h, 1);
+      assert.deepEqual(tpLayout, tfLayout, `${format} ${w}x${h} layout must match across modules`);
+      assert.equal(tpLayout.copyWidth, 4);
+      assert.equal(tpLayout.copyHeight, 4);
+      assert.equal(tpLayout.blocksX, 1);
+      assert.equal(tpLayout.blocksY, 1);
+      assert.equal(tpLayout.bytesPerBlock, bytesPerBlock);
+      assert.equal(tpLayout.unalignedBytesPerRow, bytesPerBlock);
+      assert.equal(tpLayout.bytesPerRow, 256);
+      assert.equal(tpLayout.rowsPerImage, 1);
+      assert.equal(tpLayout.tightTotalBytes, bytesPerBlock);
+      assert.equal(tpLayout.totalBytes, 256);
+      assert.equal(tpLayout.isCompressed, true);
+      assert.equal(tpLayout.isTailMip, true);
+      assert.equal(tpLayout.wasBlockClamped, true);
+      assert.equal(tpLayout.needsRowPadding, true);
+
+      assert.deepEqual(tp.alignCopySizeForFormat(format, { width: w, height: h, depthOrArrayLayers: 1 }), {
+        width: 4,
+        height: 4,
+        depthOrArrayLayers: 1,
+      });
+      const tfExtent = tf.alignCopyExtentForFormat(format, w, h, 1);
+      assert.equal(tfExtent.width, 4);
+      assert.equal(tfExtent.height, 4);
+      assert.equal(tfExtent.wasClamped, true);
+    }
+
+    // 4x4 single-block mip: already 4x4 aligned (not clamped, not tail mip), 1 block row -> 256B padded.
+    const mip4 = tp.calcMipUploadLayout(format, 4, 4, 1);
+    assert.equal(mip4.copyWidth, 4);
+    assert.equal(mip4.copyHeight, 4);
+    assert.equal(mip4.blocksX, 1);
+    assert.equal(mip4.blocksY, 1);
+    assert.equal(mip4.unalignedBytesPerRow, bytesPerBlock);
+    assert.equal(mip4.bytesPerRow, 256);
+    assert.equal(mip4.isTailMip, false);
+    assert.equal(mip4.wasBlockClamped, false);
+
+    // 5x3 non-multiple-of-4 sub-mip -> 2x1 blocks -> 8x4 copy extent.
+    const mip5x3 = tp.calcMipUploadLayout(format, 5, 3, 1);
+    assert.equal(mip5x3.copyWidth, 8);
+    assert.equal(mip5x3.copyHeight, 4);
+    assert.equal(mip5x3.blocksX, 2);
+    assert.equal(mip5x3.blocksY, 1);
+    assert.equal(mip5x3.unalignedBytesPerRow, bytesPerBlock * 2);
+    assert.equal(mip5x3.bytesPerRow, 256);
+    assert.equal(mip5x3.wasBlockClamped, true);
+
+    // 8x8 multi-row mip -> 2x2 blocks -> 2 rows x 256B = 512B.
+    const mip8 = tp.calcMipUploadLayout(format, 8, 8, 1);
+    assert.equal(mip8.copyWidth, 8);
+    assert.equal(mip8.copyHeight, 8);
+    assert.equal(mip8.blocksX, 2);
+    assert.equal(mip8.blocksY, 2);
+    assert.equal(mip8.unalignedBytesPerRow, bytesPerBlock * 2);
+    assert.equal(mip8.bytesPerRow, 256);
+    assert.equal(mip8.rowsPerImage, 2);
+    assert.equal(mip8.tightTotalBytes, bytesPerBlock * 4);
+    assert.equal(mip8.totalBytes, 512);
+
+    // Exact 256-byte-aligned row width (128px for 8B/block BC1/BC4; 64px for 16B/block BC2/3/5/6H/7).
+    const alignedW = (256 / bytesPerBlock) * 4;
+    const exactMip = tp.calcMipUploadLayout(format, alignedW, 8, 1);
+    assert.equal(exactMip.unalignedBytesPerRow, 256);
+    assert.equal(exactMip.bytesPerRow, 256);
+    assert.equal(exactMip.needsRowPadding, false);
+    assert.equal(exactMip.totalBytes, 512);
+
+    // texture_formats.js calcMipLayout accepts WebGPU format names directly.
+    const baseLayout = tf.calcMipLayout(format, 2, 2, 6);
+    assert.equal(baseLayout.blocksX, 1);
+    assert.equal(baseLayout.blocksY, 1);
+    assert.equal(baseLayout.unalignedBytesPerRow, bytesPerBlock);
+    assert.equal(baseLayout.bytesPerRow, 256);
+    assert.equal(baseLayout.totalBytes, 256 * 6);
+  }
+});
+
+test('W265 (#1127): streamed BC1-BC7 mip chains clamp 1x1/2x2/3x3 tail mips to 4x4 and pad 256B rows under strict WebGPU validation', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+
+  // Layer strict WebGPU BC copy validation on top of mock device.
+  const origWriteTexture = gpu.device.queue.writeTexture;
+  gpu.device.queue.writeTexture = (destination, data, dataLayout, size) => {
+    const fmt = destination.texture && destination.texture.format;
+    const info = tp.getTextureFormatBlockInfo(fmt);
+    if (info && info.isCompressed) {
+      assert.equal(size.width % 4, 0, `writeTexture BC copySize.width (${size.width}) must be a multiple of 4`);
+      assert.equal(size.height % 4, 0, `writeTexture BC copySize.height (${size.height}) must be a multiple of 4`);
+      const blocksX = size.width / 4;
+      if (dataLayout && dataLayout.bytesPerRow !== undefined) {
+        assert.ok(
+          dataLayout.bytesPerRow >= blocksX * info.bytesPerBlock,
+          `writeTexture BC bytesPerRow (${dataLayout.bytesPerRow}) < ${blocksX * info.bytesPerBlock}`
+        );
+      }
+    }
+    return origWriteTexture(destination, data, dataLayout, size);
+  };
+  const origCreateCommandEncoder = gpu.device.createCommandEncoder;
+  gpu.device.createCommandEncoder = () => {
+    const enc = origCreateCommandEncoder();
+    const origC2t = enc.copyBufferToTexture;
+    enc.copyBufferToTexture = (source, destination, copySize) => {
+      const fmt = destination.texture && destination.texture.format;
+      const info = tp.getTextureFormatBlockInfo(fmt);
+      if (info && info.isCompressed) {
+        assert.equal(copySize.width % 4, 0, `copyBufferToTexture BC copySize.width (${copySize.width}) must be a multiple of 4`);
+        assert.equal(copySize.height % 4, 0, `copyBufferToTexture BC copySize.height (${copySize.height}) must be a multiple of 4`);
+        assert.equal(source.bytesPerRow % 256, 0, 'copyBufferToTexture bytesPerRow must be 256B aligned');
+        const blocksX = copySize.width / 4;
+        assert.ok(source.bytesPerRow >= blocksX * info.bytesPerBlock);
+      }
+      return origC2t(source, destination, copySize);
+    };
+    return enc;
+  };
+
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // Create 16x16 5-mip BC1 (code 50, 8B/block) and BC7 (code 62, 16B/block), plus 6-layer BC3 cubemap (code 54).
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 801, width: 16, height: 16, mips: 5, usage: 0x06, format: 50 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 802, width: 16, height: 16, mips: 5, usage: 0x06, format: 62 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 803, width: 16, height: 16, layers: 6, mips: 5, usage: 0x06, format: 54 })
+  );
+
+  // Stream complete BC1 mip chain: 16x16 (mip0), 8x8 (mip1), 4x4 (mip2), 2x2 (mip3), 1x1 (mip4).
+  const bc1Mips = [
+    { mip: 0, w: 16, h: 16, bpr: 32, rows: 4, bytes: 128 },
+    { mip: 1, w: 8, h: 8, bpr: 0, rows: 0, bytes: 32 }, // implicit tight packing (2x2 blocks * 8B)
+    { mip: 2, w: 4, h: 4, bpr: 8, rows: 1, bytes: 8 },
+    { mip: 3, w: 2, h: 2, bpr: 8, rows: 2, bytes: 8 }, // texel-height rowsPerImage=2 safely clamped to 1 block row
+    { mip: 4, w: 1, h: 1, bpr: 0, rows: 0, bytes: 8 }, // 1x1 tail mip -> 4x4 copySize
+  ];
+
+  for (const m of bc1Mips) {
+    const payload = new Uint8Array(m.bytes);
+    for (let i = 0; i < payload.length; i += 1) payload[i] = ((m.mip + 1) * 17 + i) & 0xff;
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 801,
+        mipLevel: m.mip,
+        width: m.w,
+        height: m.h,
+        bytesPerRow: m.bpr,
+        rowsPerImage: m.rows,
+        data: payload,
+        useSab: m.mip >= 3, // exercise SAB copy on 2x2 and 1x1 tail mips
+      })
+    );
+  }
+
+  // Stream BC7 2x2 and 1x1 tail mips (16B/block) + 6-layer BC3 2x2 cubemap tail mip (6 * 16B = 96B).
+  const bc7Tail = new Uint8Array(16);
+  for (let i = 0; i < 16; i += 1) bc7Tail[i] = 0xc0 + i;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 802,
+      mipLevel: 3,
+      width: 2,
+      height: 2,
+      bytesPerRow: 16,
+      rowsPerImage: 1,
+      data: bc7Tail,
+    })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 802,
+      mipLevel: 4,
+      width: 1,
+      height: 1,
+      bytesPerRow: 0,
+      rowsPerImage: 0,
+      data: bc7Tail,
+    })
+  );
+
+  const cubeTail = new Uint8Array(6 * 16);
+  for (let face = 0; face < 6; face += 1) {
+    for (let b = 0; b < 16; b += 1) cubeTail[face * 16 + b] = ((face + 1) << 4) | b;
+  }
+  // Poison persistent scratch buffer before cubemap upload to confirm zeroed padding tails on all 6 faces.
+  assert.ok(handler._scratchBuffer instanceof Uint8Array);
+  handler._scratchBuffer.fill(0xee);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 803,
+      mipLevel: 3,
+      width: 2,
+      height: 2,
+      layers: 6,
+      bytesPerRow: 16,
+      rowsPerImage: 1,
+      data: cubeTail,
+    })
+  );
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 8);
+
+  // Verify BC1 mip 1 (8x8 implicit tight packing): 2 block rows x 256B, copySize 8x8.
+  assert.deepEqual(c2tCalls[1].copySize, { width: 8, height: 8, depthOrArrayLayers: 1 });
+  assert.equal(c2tCalls[1].source.bytesPerRow, 256);
+  assert.equal(c2tCalls[1].source.rowsPerImage, 2);
+  for (let p = 16; p < 256; p += 1) {
+    assert.equal(c2tCalls[1].bytes[p], 0, 'BC1 mip1 row 0 padding must be zero');
+    assert.equal(c2tCalls[1].bytes[256 + p], 0, 'BC1 mip1 row 1 padding must be zero');
+  }
+
+  // Verify BC1 mip 3 (2x2) & mip 4 (1x1) clamped to 4x4 copy extents and 1 block row.
+  assert.deepEqual(c2tCalls[3].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.equal(c2tCalls[3].source.rowsPerImage, 1);
+  assert.deepEqual(c2tCalls[4].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.equal(c2tCalls[4].source.rowsPerImage, 1);
+
+  // Verify BC7 tail mips (2x2 and 1x1) clamped to 4x4 with exact 16-byte block and zeroed padding.
+  assert.deepEqual(c2tCalls[5].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(Array.from(c2tCalls[5].bytes.subarray(0, 16)), Array.from(bc7Tail));
+  assert.deepEqual(c2tCalls[6].copySize, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(Array.from(c2tCalls[6].bytes.subarray(0, 16)), Array.from(bc7Tail));
+
+  // Verify 6-face BC3 2x2 cubemap tail mip: 6 slices x 256B, copySize 4x4x6, zeroed tails.
+  const cubeCall = c2tCalls[7];
+  assert.deepEqual(cubeCall.copySize, { width: 4, height: 4, depthOrArrayLayers: 6 });
+  assert.equal(cubeCall.source.bytesPerRow, 256);
+  assert.equal(cubeCall.source.rowsPerImage, 1);
+  for (let face = 0; face < 6; face += 1) {
+    const base = face * 256;
+    assert.deepEqual(
+      Array.from(cubeCall.bytes.subarray(base, base + 16)),
+      Array.from(cubeTail.subarray(face * 16, face * 16 + 16))
+    );
+    for (let p = 16; p < 256; p += 1) {
+      assert.equal(cubeCall.bytes[base + p], 0, `cubemap face ${face} padding byte ${p} must be zero`);
+    }
+  }
+
+  // Also test direct queue.writeTexture path (no stagingPool) for 1x1 & 2x2 BC7 tail mips.
+  const directProcessor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const directHandler = tp.installTexturePackets(directProcessor);
+  directProcessor.executeCommandBuffer(
+    createTexture2Packet({ id: 810, width: 8, height: 8, mips: 4, usage: 0x06, format: 62 })
+  );
+  directProcessor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 810,
+      mipLevel: 3,
+      width: 1,
+      height: 1,
+      bytesPerRow: 0,
+      rowsPerImage: 0,
+      data: bc7Tail,
+    })
+  );
+  // Direct handler.writeTexture also clamps 2x2 BC7 copySize to 4x4.
+  directHandler.writeTexture(
+    { texture: directProcessor.textures.get(810), mipLevel: 2, origin: { x: 0, y: 0, z: 0 } },
+    bc7Tail,
+    { offset: 0, bytesPerRow: 16, rowsPerImage: 1 },
+    { width: 2, height: 2, depthOrArrayLayers: 1 },
+    810
+  );
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 2);
+  assert.deepEqual(wtCalls[0].size, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.deepEqual(wtCalls[1].size, { width: 4, height: 4, depthOrArrayLayers: 1 });
+  assert.equal(handler.getStats().errors, 0);
+  assert.equal(directHandler.getStats().errors, 0);
+});
+
+test('W265 (#1127 / #973): A8_UNORM -> rgba8unorm font atlas expansion widens alpha to (0,0,0,a), aligns 256B rows, and reuses scratch', () => {
+  // 1) Unit test tight & 256B-aligned expansion in both texture_formats.js and texture_packets.js.
+  const width = 5;
+  const height = 3;
+  // Use strided source (srcBytesPerRow = 8 > width = 5) with non-zero slack bytes to ensure slack is ignored.
+  const srcStride = 8;
+  const a8Src = new Uint8Array(srcStride * height);
+  a8Src.fill(0xee);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      a8Src[y * srcStride + x] = (y * 32 + x * 7 + 11) & 0xff;
+    }
+  }
+
+  // Tight expansion (texture_formats.expandA8ToRgba8 default alignBytesPerRow = 1).
+  const tight = tf.expandA8ToRgba8(a8Src, width, height, { srcBytesPerRow: srcStride });
+  assert.equal(tight.byteLength, width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const off = (y * width + x) * 4;
+      assert.equal(tight[off], 0);
+      assert.equal(tight[off + 1], 0);
+      assert.equal(tight[off + 2], 0);
+      assert.equal(tight[off + 3], a8Src[y * srcStride + x]);
+    }
+  }
+
+  // 256-byte aligned expansion into a poisoned reusable scratch pool (SAB input!).
+  const sab = new SharedArrayBuffer(a8Src.byteLength);
+  new Uint8Array(sab).set(a8Src);
+  const pool = new tp.TextureScratchPool({ maxBytes: 4096 });
+
+  const first = tp.expandA8ToRgba8(sab, width, height, {
+    srcBytesPerRow: srcStride,
+    scratchPool: pool,
+  });
+  assert.equal(first.bytesPerRow, 256);
+  assert.equal(first.unalignedBytesPerRow, 20);
+  assert.equal(first.rowsPerImage, 3);
+  assert.equal(first.totalBytes, 768);
+  assert.equal(first.copiedFromSab, true);
+  assert.equal(first.reusedScratch, false);
+  assert.equal(first.pooledScratch, true);
+  assert.equal(first.data.buffer instanceof ArrayBuffer, true);
+
+  // Poison entire pool buffer with 0xff and expand again -> must reuse buffer AND strictly zero RGB + padding tails!
+  pool.currentBuffer.fill(0xff);
+  const second = tp.expandA8ToRgba8(sab, width, height, {
+    srcBytesPerRow: srcStride,
+    scratchPool: pool,
+  });
+  assert.equal(second.reusedScratch, true);
+  assert.equal(second.data.buffer, pool.currentBuffer.buffer);
+  for (let y = 0; y < height; y += 1) {
+    const rowBase = y * 256;
+    for (let x = 0; x < width; x += 1) {
+      assert.equal(second.data[rowBase + x * 4 + 0], 0);
+      assert.equal(second.data[rowBase + x * 4 + 1], 0);
+      assert.equal(second.data[rowBase + x * 4 + 2], 0);
+      assert.equal(second.data[rowBase + x * 4 + 3], a8Src[y * srcStride + x]);
+    }
+    for (let p = 20; p < 256; p += 1) {
+      assert.equal(second.data[rowBase + p], 0, `A8 row ${y} padding byte ${p} must be zeroed`);
+    }
+  }
+  assert.equal(pool.getStats().allocations, 1);
+  assert.equal(pool.getStats().reuses, 1);
+
+  // 2) End-to-end handler.writeA8Texture staged + direct uploads with zero per-frame scratch churn.
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 128 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // Font atlas target is rgba8unorm (code 22) per #973.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 850, width: 100, height: 32, usage: 0x06, format: 22 })
+  );
+  const atlasTex = processor.textures.get(850);
+  const glyphData = new Uint8Array(100 * 32);
+
+  let scratchRef = null;
+  for (let frame = 0; frame < 4; frame += 1) {
+    stagingPool.beginFrame(frame);
+    glyphData.fill(0x40 + frame);
+    glyphData[0] = 0x90 + frame;
+    glyphData[99] = 0xa0 + frame;
+    const res = handler.writeA8Texture(
+      { texture: atlasTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+      glyphData,
+      { width: 100, height: 32, depthOrArrayLayers: 1 }
+    );
+    assert.equal(res.uploaded, true);
+    assert.equal(res.staged, true);
+    assert.equal(res.unalignedBytesPerRow, 400);
+    assert.equal(res.bytesPerRow, 512);
+    assert.equal(res.pooledScratch, true);
+    if (frame === 0) {
+      assert.equal(res.reusedScratch, false);
+      scratchRef = handler._scratchBuffer;
+      assert.equal(scratchRef.byteLength, 512 * 32);
+      scratchRef.fill(0xdd, 400, 512); // poison padding tail
+    } else {
+      assert.equal(res.reusedScratch, true);
+      assert.equal(handler._scratchBuffer, scratchRef);
+    }
+    stagingPool.endFrame();
+  }
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 4);
+  const frame1Bytes = c2tCalls[1].bytes;
+  assert.deepEqual(Array.from(frame1Bytes.subarray(0, 4)), [0, 0, 0, 0x91]);
+  assert.deepEqual(Array.from(frame1Bytes.subarray(99 * 4, 100 * 4)), [0, 0, 0, 0xa1]);
+  for (let p = 400; p < 512; p += 1) {
+    assert.equal(frame1Bytes[p], 0, `staged A8 atlas padding byte ${p} must be zero`);
+  }
+  assert.equal(handler.getStats().scratchBufferAllocations, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 3);
+  assert.equal(handler.getStats().scratchRepackUploads, 4);
+
+  // Direct mode (preferDirect: true) expands tightly (400B/row) with SAB input and zero SAB views reaching WebGPU.
+  const sabGlyph = new SharedArrayBuffer(100 * 32);
+  new Uint8Array(sabGlyph).fill(0x7f);
+  const directRes = handler.writeA8Texture(
+    { texture: atlasTex, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    sabGlyph,
+    { width: 100, height: 32, depthOrArrayLayers: 1 },
+    { preferDirect: true }
+  );
+  assert.equal(directRes.uploaded, true);
+  assert.equal(directRes.staged, false);
+  assert.equal(directRes.bytesPerRow, 400);
+  assert.equal(directRes.copiedFromSab, true);
+  assert.equal(directRes.reusedScratch, true);
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 1);
+  assert.equal(wtCalls[0].isSab, false);
+  assert.deepEqual(Array.from(wtCalls[0].bytes.subarray(0, 4)), [0, 0, 0, 0x7f]);
+});
+
+test('W265 (#1127): TextureScratchPool enforces upper cap, multi-slot isolation, SAB rejection, and opt-in vs safe-copy anti-aliasing', () => {
+  // 1) Bounded upper-cap safety: oversized one-off uploads must NEVER pin giant RAM.
+  const pool = new tf.TextureScratchPool({ maxBytes: 2048 });
+  const a1 = pool.acquire(1024);
+  assert.equal(a1.pooled, true);
+  assert.equal(a1.reused, false);
+  assert.equal(a1.oversized, false);
+  const retainedRef = pool.currentBuffer;
+  assert.equal(retainedRef.byteLength, 1024);
+
+  const a2 = pool.acquire(512);
+  assert.equal(a2.pooled, true);
+  assert.equal(a2.reused, true);
+  assert.equal(a2.buffer, retainedRef);
+  assert.equal(a2.view.byteLength, 512);
+
+  // Oversized 8192B (> 2048B cap): one-off standalone buffer, retained buffer stays 1024B.
+  const huge = pool.acquire(8192);
+  assert.equal(huge.pooled, false);
+  assert.equal(huge.reused, false);
+  assert.equal(huge.oversized, true);
+  assert.equal(huge.view.byteLength, 8192);
+  assert.equal(pool.currentBuffer, retainedRef);
+  assert.equal(pool.retainedBytes, 1024);
+  assert.deepEqual(pool.getStats(), {
+    allocations: 1,
+    reuses: 1,
+    oversizedFallbacks: 1,
+    retainedBytes: 1024,
+    maxBytes: 2048,
+    maxSlots: 1,
+    activeSlots: 1,
+  });
+
+  // 2) Safe copy semantics (anti-aliasing): default calls and copyResult:true never alias stored slices!
+  const rowA = new Uint8Array(16).fill(0x11);
+  const rowB = new Uint8Array(16).fill(0x22);
+
+  // padTextureRowsForWriteTexture default (no scratch) -> independent buffers.
+  const padSafeA = tf.padTextureRowsForWriteTexture(rowA, 8, 256, 2);
+  const padSafeB = tf.padTextureRowsForWriteTexture(rowB, 8, 256, 2);
+  assert.notEqual(padSafeA.buffer, padSafeB.buffer);
+  assert.equal(padSafeA[0], 0x11);
+  assert.equal(padSafeB[0], 0x22);
+
+  // padTextureRowsForWriteTexture with pool + copyResult:true -> owned non-aliased copy.
+  const padPoolOwnedA = tf.padTextureRowsForWriteTexture(rowA, 8, 256, 2, {
+    scratchPool: pool,
+    copyResult: true,
+  });
+  const padPoolReusedB = tf.padTextureRowsForWriteTexture(rowB, 8, 256, 2, pool);
+  assert.notEqual(padPoolOwnedA.buffer, padPoolReusedB.buffer);
+  assert.equal(padPoolOwnedA[0], 0x11);
+  assert.equal(padPoolReusedB[0], 0x22);
+
+  // expandA8ToRgba8 with copyResult:true & pool.snapshot() prevent aliasing across consecutive frames.
+  const a8First = new Uint8Array([0x12, 0x34, 0x56, 0x78]);
+  const a8Second = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]);
+  const expOwned = tp.expandA8ToRgba8(a8First, 2, 2, { scratchPool: pool, copyResult: true });
+  const expScratch = tp.expandA8ToRgba8(a8Second, 2, 2, { scratchPool: pool });
+  const snap = pool.snapshot(expScratch.data);
+  // Overwrite scratch with new data and verify both expOwned and snap stayed intact.
+  tp.expandA8ToRgba8(new Uint8Array([0xff, 0xff, 0xff, 0xff]), 2, 2, { scratchPool: pool });
+  assert.equal(expOwned.data[3], 0x12);
+  assert.equal(expOwned.data[256 + 7], 0x78);
+  assert.equal(snap[3], 0xaa);
+  assert.equal(snap[256 + 7], 0xdd);
+
+  // repackRowsTo256 with copyResult:true detaches even already-256B-aligned input.
+  const alignedIn = new Uint8Array(256).fill(0x55);
+  const detached = tp.repackRowsTo256(alignedIn, 256, 1, 1, { copyResult: true });
+  assert.notEqual(detached.data.buffer, alignedIn.buffer);
+  alignedIn[0] = 0x99;
+  assert.equal(detached.data[0], 0x55);
+
+  // 3) Multi-slot pool isolates concurrent slots while enforcing combined maxBytes cap.
+  const multiPool = new tp.TextureScratchPool({ maxBytes: 1024, maxSlots: 2 });
+  const slot0 = multiPool.acquire(512, { slot: 0 });
+  const slot1 = multiPool.acquire(512, { slot: 1 });
+  assert.equal(slot0.pooled, true);
+  assert.equal(slot1.pooled, true);
+  assert.notEqual(slot0.buffer, slot1.buffer);
+  slot0.view.fill(0x33);
+  slot1.view.fill(0x77);
+  assert.equal(slot0.view[0], 0x33);
+  assert.equal(slot1.view[0], 0x77);
+  // Growing slot 1 to 768B would push total retained bytes (512 + 768 = 1280) > 1024 cap -> oversized fallback.
+  const overCap = multiPool.acquire(768, { slot: 1 });
+  assert.equal(overCap.oversized, true);
+  assert.equal(overCap.pooled, false);
+  assert.equal(multiPool.retainedBytes, 1024);
+
+  // 4) SAB-backed scratch buffers are rejected safely (never returned as WebGPU destination).
+  const sabScratch = new Uint8Array(new SharedArrayBuffer(1024));
+  const paddedSafe = tf.padTextureRowsForWriteTexture(rowA, 8, 256, 2, sabScratch);
+  assert.equal(paddedSafe.buffer instanceof ArrayBuffer, true);
+  const expandedSafe = tp.expandA8ToRgba8(a8First, 2, 2, { scratchBuffer: sabScratch });
+  assert.equal(expandedSafe.data.buffer instanceof ArrayBuffer, true);
+  assert.equal(expandedSafe.reusedScratch, false);
+
+  // 5) Reset releases retained RAM cleanly.
+  pool.reset();
+  multiPool.destroy();
+  assert.equal(pool.currentBuffer, null);
+  assert.equal(pool.retainedBytes, 0);
+  assert.equal(multiPool.retainedBytes, 0);
 });
