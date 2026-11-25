@@ -38,6 +38,15 @@ const INPUT_STATE_BYTES = 40;
 const INPUT_STATE_WORDS = 10;
 const DEFAULT_INPUT_BRIDGE_POLL_MS = 16;
 const INPUT_SNAPSHOT_MAX_RETRIES = 64;
+// Playgta6AudioRing (runtime/os/audio_downmix.h): 40 bytes on Wasm64 (8-byte uintptr_t + 4-byte
+// padding at +20), 24 bytes on Wasm32 (4-byte uintptr_t).
+const AUDIO_RING_STRUCT_BYTES_WASM64 = 40;
+const AUDIO_RING_STRUCT_BYTES_WASM32 = 24;
+const AUDIO_RING_CHANNELS = 2;
+const AUDIO_RING_MIN_CAPACITY_SAMPLES = 2;
+const AUDIO_RING_MAX_CAPACITY_SAMPLES = 1 << 24;
+const AUDIO_RING_MIN_SAMPLE_RATE = 8000;
+const AUDIO_RING_MAX_SAMPLE_RATE = 384000;
 const DEFAULT_MEMFS_PIPELINE_DUMP_DIR = '/pg6_dump';
 const DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT = '/__pg6_dump/';
 const DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS = 3000;
@@ -155,8 +164,11 @@ const U64_MAX = 0xffffffffffffffffn;
 let gpuWorker = null;
 let ioWorker = null;
 let audioWorker = null;
+let audioWorkerReady = false;
 let inputSab = null;
 let activeCoordinatorInputBridge = null;
+let activeCoordinatorRuntimeModule = null;
+let activeCoordinatorModuleConfig = null;
 let httpfsMailboxSab = null;
 let httpfsClient = null;
 
@@ -2671,6 +2683,367 @@ function canUseAtomicsOnInt32View(atomics, view, isShared) {
   }
 }
 
+const attachedAudioRingByWorker = new WeakMap();
+
+function resolveAudioRingPointerGetter(mod, explicitGetter) {
+  if (typeof explicitGetter === 'function') {
+    return explicitGetter;
+  }
+  if (!mod || typeof mod !== 'object') {
+    return null;
+  }
+  if (typeof mod._playgta6_audio_ring === 'function') {
+    return () => mod._playgta6_audio_ring();
+  }
+  if (typeof mod.playgta6_audio_ring === 'function') {
+    return () => mod.playgta6_audio_ring();
+  }
+  if (mod.asm && typeof mod.asm._playgta6_audio_ring === 'function') {
+    return () => mod.asm._playgta6_audio_ring();
+  }
+  if (mod.asm && typeof mod.asm.playgta6_audio_ring === 'function') {
+    return () => mod.asm.playgta6_audio_ring();
+  }
+  if (mod.wasmExports && typeof mod.wasmExports._playgta6_audio_ring === 'function') {
+    return () => mod.wasmExports._playgta6_audio_ring();
+  }
+  if (mod.wasmExports && typeof mod.wasmExports.playgta6_audio_ring === 'function') {
+    return () => mod.wasmExports.playgta6_audio_ring();
+  }
+  return null;
+}
+
+function resolveRuntimeMemoryBuffer(mod, explicitMemoryOrBuffer) {
+  const explicitBuf = resolveBuffer(explicitMemoryOrBuffer);
+  if (explicitBuf && !explicitBuf.detached && explicitBuf.byteLength > 0) {
+    return explicitBuf;
+  }
+  if (!mod || typeof mod !== 'object') {
+    return null;
+  }
+  const candidates = [
+    mod.wasmMemory,
+    mod.memory,
+    mod.HEAPU8 && mod.HEAPU8.buffer,
+    mod.HEAP32 && mod.HEAP32.buffer,
+    mod.asm && mod.asm.memory,
+    mod.wasmExports && mod.wasmExports.memory,
+  ];
+  for (let i = 0; i < candidates.length; i += 1) {
+    const buf = resolveBuffer(candidates[i]);
+    if (buf && !buf.detached && buf.byteLength > 0) {
+      return buf;
+    }
+  }
+  return null;
+}
+
+/**
+ * Probe `playgta6_audio_ring()` on a Wasm module or exports object and decode the
+ * `Playgta6AudioRing` struct (`runtime/os/audio_downmix.h`) from linear memory.
+ *
+ * Handles both Wasm64 (8-byte `uintptr_t`, 40-byte struct with 4-byte padding at +20,
+ * `BigInt` return pointer) and Wasm32 (4-byte `uintptr_t`, 24-byte struct, `number`
+ * return pointer). Returns a validated descriptor object compatible with
+ * `audio_worker.js` (`GuestPcmRingReader`), or `null` on missing/invalid/out-of-bounds state.
+ */
+function readPlaygta6AudioRingDescriptor(moduleOrExports, memoryBuffer, options) {
+  let explicitMem = memoryBuffer;
+  let opts = options;
+  if (
+    opts === undefined &&
+    memoryBuffer &&
+    typeof memoryBuffer === 'object' &&
+    resolveBuffer(memoryBuffer) === null
+  ) {
+    opts = memoryBuffer;
+    explicitMem = null;
+  }
+  const safeOpts = opts && typeof opts === 'object' ? opts : {};
+
+  const ptrGetter = resolveAudioRingPointerGetter(moduleOrExports, safeOpts.getAudioRingPtr);
+  if (!ptrGetter) {
+    return null;
+  }
+
+  let rawPtr;
+  try {
+    rawPtr = ptrGetter();
+  } catch {
+    return null;
+  }
+  if (rawPtr === null || rawPtr === undefined || rawPtr === 0 || rawPtr === 0n) {
+    return null;
+  }
+
+  const pointerSize =
+    safeOpts.pointerSize === 8 || safeOpts.pointerSize === 4
+      ? safeOpts.pointerSize
+      : typeof safeOpts.wasm64 === 'boolean'
+        ? safeOpts.wasm64
+          ? 8
+          : 4
+        : typeof rawPtr === 'bigint'
+          ? 8
+          : 4;
+  const structSize =
+    pointerSize === 8 ? AUDIO_RING_STRUCT_BYTES_WASM64 : AUDIO_RING_STRUCT_BYTES_WASM32;
+
+  let structOffset;
+  try {
+    structOffset = ptrToNumber(rawPtr, 'audioRingPtr');
+  } catch {
+    return null;
+  }
+  if (structOffset <= 0 || structOffset % pointerSize !== 0) {
+    return null;
+  }
+
+  const memCandidate =
+    explicitMem ||
+    (typeof safeOpts.getMemory === 'function'
+      ? safeOpts.getMemory()
+      : safeOpts.memory || safeOpts.buffer || null);
+  const buf = resolveRuntimeMemoryBuffer(moduleOrExports, memCandidate);
+  if (!buf || structOffset + structSize > buf.byteLength) {
+    return null;
+  }
+
+  let view;
+  try {
+    view = new DataView(buf);
+  } catch {
+    return null;
+  }
+
+  let rawBase;
+  let capacity;
+  let channels;
+  let sampleRate;
+  let rawReadIndexPtr;
+  let rawWriteIndexPtr;
+  try {
+    if (pointerSize === 8) {
+      rawBase = view.getBigUint64(structOffset + 0, true);
+      capacity = view.getUint32(structOffset + 8, true);
+      channels = view.getUint32(structOffset + 12, true);
+      sampleRate = view.getUint32(structOffset + 16, true);
+      // Bytes +20..+23 are 4-byte alignment padding before 8-byte read_index_ptr.
+      rawReadIndexPtr = view.getBigUint64(structOffset + 24, true);
+      rawWriteIndexPtr = view.getBigUint64(structOffset + 32, true);
+    } else {
+      rawBase = view.getUint32(structOffset + 0, true);
+      capacity = view.getUint32(structOffset + 4, true);
+      channels = view.getUint32(structOffset + 8, true);
+      sampleRate = view.getUint32(structOffset + 12, true);
+      rawReadIndexPtr = view.getUint32(structOffset + 16, true);
+      rawWriteIndexPtr = view.getUint32(structOffset + 20, true);
+    }
+  } catch {
+    return null;
+  }
+
+  let baseOffset;
+  let readIndexOffset;
+  let writeIndexOffset;
+  try {
+    baseOffset = ptrToNumber(rawBase, 'audioRing.base');
+    readIndexOffset = ptrToNumber(rawReadIndexPtr, 'audioRing.read_index_ptr');
+    writeIndexOffset = ptrToNumber(rawWriteIndexPtr, 'audioRing.write_index_ptr');
+  } catch {
+    return null;
+  }
+
+  if (
+    !Number.isInteger(capacity) ||
+    capacity < AUDIO_RING_MIN_CAPACITY_SAMPLES ||
+    capacity > AUDIO_RING_MAX_CAPACITY_SAMPLES ||
+    (capacity & (capacity - 1)) !== 0
+  ) {
+    return null;
+  }
+  if (!Number.isInteger(channels) || channels !== AUDIO_RING_CHANNELS) {
+    return null;
+  }
+  if (
+    !Number.isInteger(sampleRate) ||
+    sampleRate < AUDIO_RING_MIN_SAMPLE_RATE ||
+    sampleRate > AUDIO_RING_MAX_SAMPLE_RATE
+  ) {
+    return null;
+  }
+
+  if (baseOffset <= 0 || baseOffset % Float32Array.BYTES_PER_ELEMENT !== 0) {
+    return null;
+  }
+  if (readIndexOffset <= 0 || readIndexOffset % Uint32Array.BYTES_PER_ELEMENT !== 0) {
+    return null;
+  }
+  if (writeIndexOffset <= 0 || writeIndexOffset % Uint32Array.BYTES_PER_ELEMENT !== 0) {
+    return null;
+  }
+
+  const dataByteLength = capacity * Float32Array.BYTES_PER_ELEMENT;
+  const dataEnd = baseOffset + dataByteLength;
+  if (dataEnd > buf.byteLength) {
+    return null;
+  }
+  if (readIndexOffset + Uint32Array.BYTES_PER_ELEMENT > buf.byteLength) {
+    return null;
+  }
+  if (writeIndexOffset + Uint32Array.BYTES_PER_ELEMENT > buf.byteLength) {
+    return null;
+  }
+  if (readIndexOffset === writeIndexOffset) {
+    return null;
+  }
+  if (readIndexOffset >= baseOffset && readIndexOffset < dataEnd) {
+    return null;
+  }
+  if (writeIndexOffset >= baseOffset && writeIndexOffset < dataEnd) {
+    return null;
+  }
+
+  return {
+    sab: buf,
+    buffer: buf,
+    base: baseOffset,
+    dataByteOffset: baseOffset,
+    capacity,
+    capacitySamples: capacity,
+    capacityFrames: capacity >>> 1,
+    channels,
+    sampleRate,
+    readIndexPtr: readIndexOffset,
+    readIndexByteOffset: readIndexOffset,
+    writeIndexPtr: writeIndexOffset,
+    writeIndexByteOffset: writeIndexOffset,
+    structOffset,
+    pointerSize,
+    isShared: isSharedArrayBufferValue(buf),
+  };
+}
+
+function resetAttachedRuntimeAudioRing(targetAudioWorker) {
+  if (targetAudioWorker && typeof targetAudioWorker === 'object') {
+    attachedAudioRingByWorker.delete(targetAudioWorker);
+  }
+}
+
+/**
+ * Probe `playgta6_audio_ring()` from the Wasm runtime and post an `attach-guest-pcm-ring`
+ * message to `targetAudioWorker` matching `web/workers/audio_worker.js`'s exact schema.
+ *
+ * - Deduplicates repeated attachments for the same `(buffer, baseOffset)` on the same worker
+ *   unless `options.force === true` or `resetAttachedRuntimeAudioRing(worker)` was called.
+ * - Never throws when `_playgta6_audio_ring` is absent, returns `0`/`0n`, or `audioWorker`
+ *   is missing or unavailable.
+ */
+function attachRuntimeAudioRing(moduleOrExports, targetAudioWorker, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  if (!targetAudioWorker || typeof targetAudioWorker.postMessage !== 'function') {
+    return {
+      attached: false,
+      alreadyAttached: false,
+      descriptor: null,
+      reason: 'no-audio-worker',
+    };
+  }
+
+  const descriptor = readPlaygta6AudioRingDescriptor(
+    moduleOrExports,
+    safeOpts.memory || safeOpts.buffer || null,
+    safeOpts,
+  );
+  if (!descriptor) {
+    return {
+      attached: false,
+      alreadyAttached: false,
+      descriptor: null,
+      reason: 'no-audio-ring',
+    };
+  }
+
+  if (safeOpts.requireShared === true && !descriptor.isShared) {
+    return {
+      attached: false,
+      alreadyAttached: false,
+      descriptor,
+      reason: 'non-shared-buffer',
+    };
+  }
+
+  const previous = attachedAudioRingByWorker.get(targetAudioWorker);
+  if (
+    !safeOpts.force &&
+    previous &&
+    previous.buffer === descriptor.buffer &&
+    previous.baseOffset === descriptor.dataByteOffset
+  ) {
+    return {
+      attached: true,
+      alreadyAttached: true,
+      descriptor: previous.descriptor,
+    };
+  }
+
+  const message = {
+    type: 'attach-guest-pcm-ring',
+    sab: descriptor.sab,
+    buffer: descriptor.buffer,
+    base: descriptor.base,
+    dataByteOffset: descriptor.dataByteOffset,
+    capacity: descriptor.capacity,
+    capacitySamples: descriptor.capacitySamples,
+    capacityFrames: descriptor.capacityFrames,
+    channels: descriptor.channels,
+    sampleRate: descriptor.sampleRate,
+    readIndexPtr: descriptor.readIndexPtr,
+    readIndexByteOffset: descriptor.readIndexByteOffset,
+    writeIndexPtr: descriptor.writeIndexPtr,
+    writeIndexByteOffset: descriptor.writeIndexByteOffset,
+    autoPump: safeOpts.autoPump !== undefined ? Boolean(safeOpts.autoPump) : true,
+  };
+  if (safeOpts.id !== undefined) {
+    message.id = safeOpts.id;
+  }
+  if (safeOpts.quantumFrames !== undefined) {
+    message.quantumFrames = safeOpts.quantumFrames;
+  }
+  if (safeOpts.softClip !== undefined) {
+    message.softClip = Boolean(safeOpts.softClip);
+  }
+  if (safeOpts.limiterKnee !== undefined) {
+    message.limiterKnee = safeOpts.limiterKnee;
+  }
+  if (safeOpts.resetStats !== undefined) {
+    message.resetStats = Boolean(safeOpts.resetStats);
+  }
+
+  try {
+    targetAudioWorker.postMessage(message);
+  } catch {
+    return {
+      attached: false,
+      alreadyAttached: false,
+      descriptor,
+      reason: 'post-message-error',
+    };
+  }
+
+  attachedAudioRingByWorker.set(targetAudioWorker, {
+    buffer: descriptor.buffer,
+    baseOffset: descriptor.dataByteOffset,
+    descriptor,
+  });
+
+  return {
+    attached: true,
+    alreadyAttached: false,
+    descriptor,
+  };
+}
+
 function resolveInputStatePointerGetter(mod, explicitGetter) {
   if (typeof explicitGetter === 'function') {
     return explicitGetter;
@@ -4045,6 +4418,105 @@ function buildRuntimeModuleConfig(options = {}) {
     return null;
   };
 
+  const resolveActiveAudioWorker = (workerOverride) => {
+    if (workerOverride && typeof workerOverride.postMessage === 'function') {
+      return workerOverride;
+    }
+    if (typeof options.getAudioWorker === 'function') {
+      return options.getAudioWorker();
+    }
+    if (options.audioWorker !== undefined) {
+      return options.audioWorker;
+    }
+    return audioWorker;
+  };
+  const checkAudioWorkerReady = () => {
+    if (typeof options.isAudioWorkerReady === 'function') {
+      try {
+        return Boolean(options.isAudioWorkerReady());
+      } catch {
+        return false;
+      }
+    }
+    if (options.audioWorker !== undefined || typeof options.getAudioWorker === 'function') {
+      return true;
+    }
+    return audioWorkerReady;
+  };
+  let pendingAudioRingModule = null;
+  let activeAudioRingDescriptor = null;
+  let activeAudioRingWorker = null;
+
+  const resetAudioRingAttachment = () => {
+    if (activeAudioRingWorker) {
+      resetAttachedRuntimeAudioRing(activeAudioRingWorker);
+    }
+    activeAudioRingWorker = null;
+    activeAudioRingDescriptor = null;
+    pendingAudioRingModule = null;
+  };
+
+  const attachAudioRing = (mod, workerOverride, attachOpts) => {
+    const targetMod = mod && typeof mod === 'object' ? mod : boundModule || pendingAudioRingModule;
+    if (!targetMod) {
+      return null;
+    }
+    const targetWorker = resolveActiveAudioWorker(workerOverride);
+    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
+      pendingAudioRingModule = targetMod;
+      return {
+        attached: false,
+        alreadyAttached: false,
+        pending: true,
+        descriptor: null,
+        reason: 'no-audio-worker',
+      };
+    }
+    if (!workerOverride && !checkAudioWorkerReady()) {
+      pendingAudioRingModule = targetMod;
+      return {
+        attached: false,
+        alreadyAttached: false,
+        pending: true,
+        descriptor: null,
+        reason: 'audio-worker-not-ready',
+      };
+    }
+    const res = attachRuntimeAudioRing(
+      targetMod,
+      targetWorker,
+      Object.assign(
+        {
+          getMemory: () =>
+            resolveRuntimeMemory() ||
+            resolveRuntimeMemoryBuffer(targetMod, null) ||
+            null,
+          pointerSize: options.audioRingPointerSize,
+          autoPump: options.audioRingAutoPump,
+        },
+        attachOpts && typeof attachOpts === 'object' ? attachOpts : null,
+      ),
+    );
+    if (res && res.attached && res.descriptor) {
+      pendingAudioRingModule = null;
+      activeAudioRingDescriptor = res.descriptor;
+      activeAudioRingWorker = targetWorker;
+    }
+    return res;
+  };
+
+  const notifyAudioWorkerReady = (workerOverride) => {
+    const targetWorker = resolveActiveAudioWorker(workerOverride);
+    if (targetWorker) {
+      resetAttachedRuntimeAudioRing(targetWorker);
+    }
+    const targetMod = boundModule || pendingAudioRingModule;
+    if (!targetMod) {
+      return null;
+    }
+    return attachAudioRing(targetMod, targetWorker, { force: true });
+  };
+
   const userOnRuntimeInitialized =
     typeof options.onRuntimeInitialized === 'function' ? options.onRuntimeInitialized : null;
   const userOnExit = typeof options.onExit === 'function' ? options.onExit : null;
@@ -4056,6 +4528,7 @@ function buildRuntimeModuleConfig(options = {}) {
     }
     attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
+    attachAudioRing(mod);
     if (userOnRuntimeInitialized) {
       return userOnRuntimeInitialized.apply(this, arguments);
     }
@@ -4064,6 +4537,7 @@ function buildRuntimeModuleConfig(options = {}) {
 
   const onExit = function onPlayGta6RuntimeExit() {
     stopInputBridge();
+    resetAudioRingAttachment();
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -4089,6 +4563,10 @@ function buildRuntimeModuleConfig(options = {}) {
     attachInputBridge,
     stopInputBridge,
     getInputBridge: () => activeInputBridge,
+    attachAudioRing,
+    notifyAudioWorkerReady,
+    resetAudioRingAttachment,
+    getAudioRingDescriptor: () => activeAudioRingDescriptor,
     pipelineDumpSyncer,
     getPipelineDumpSyncer: () => pipelineDumpSyncer,
     flushPipelineDumps: () => pipelineDumpSyncer.flush(),
@@ -5057,7 +5535,11 @@ async function tryBootWasmRuntime() {
         },
         onExit: () => {
           coordinatorPthreadPool.closeTxPorts();
+          activeCoordinatorRuntimeModule = null;
+          activeCoordinatorModuleConfig = null;
         },
+        getAudioWorker: () => audioWorker,
+        isAudioWorkerReady: () => audioWorkerReady,
         onWasmError: (err) => {
           postProgress({ error: `runtime wasm: ${err}` });
         },
@@ -5095,6 +5577,7 @@ async function tryBootWasmRuntime() {
         activeCoordinatorPipelineDumpSyncer = null;
       }
       const moduleConfig = createRuntimeModuleOptions(runtimeOptions);
+      activeCoordinatorModuleConfig = moduleConfig;
       if (typeof moduleConfig.getPipelineDumpSyncer === 'function') {
         activeCoordinatorPipelineDumpSyncer = moduleConfig.getPipelineDumpSyncer();
       }
@@ -5110,6 +5593,7 @@ async function tryBootWasmRuntime() {
         activeCoordinatorInputBridge = null;
       }
       const runtimeMod = await self.createRuntimeModule(moduleConfig);
+      activeCoordinatorRuntimeModule = runtimeMod;
       if (typeof moduleConfig.attachInputBridge === 'function') {
         const attached = moduleConfig.attachInputBridge(runtimeMod);
         if (attached && attached.active) {
@@ -5120,6 +5604,9 @@ async function tryBootWasmRuntime() {
         if (existing && existing.active) {
           activeCoordinatorInputBridge = existing;
         }
+      }
+      if (typeof moduleConfig.attachAudioRing === 'function') {
+        moduleConfig.attachAudioRing(runtimeMod);
       }
     }
   } catch (err) {
@@ -5257,6 +5744,16 @@ if (typeof self !== 'undefined') {
       }
       activeCoordinatorInputBridge = null;
     }
+    if (activeCoordinatorModuleConfig && typeof activeCoordinatorModuleConfig.resetAudioRingAttachment === 'function') {
+      try {
+        activeCoordinatorModuleConfig.resetAudioRingAttachment();
+      } catch {
+        // Ignore audio ring teardown errors when re-initializing workers.
+      }
+    }
+    activeCoordinatorRuntimeModule = null;
+    activeCoordinatorModuleConfig = null;
+    audioWorkerReady = false;
     if (activeCoordinatorPipelineDumpSyncer) {
       try {
         activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
@@ -5334,7 +5831,24 @@ if (typeof self !== 'undefined') {
       forwardGpuWorkerMessage(data, postToMain);
     };
     audioWorker.onmessage = (e) => {
-      if (e.data.ready) onWorkerReady('audio_worker');
+      const data = e && e.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.ready) {
+        const wasReady = audioWorkerReady;
+        audioWorkerReady = true;
+        if (
+          activeCoordinatorModuleConfig &&
+          typeof activeCoordinatorModuleConfig.notifyAudioWorkerReady === 'function'
+        ) {
+          activeCoordinatorModuleConfig.notifyAudioWorkerReady(audioWorker);
+        } else if (activeCoordinatorRuntimeModule) {
+          resetAttachedRuntimeAudioRing(audioWorker);
+          attachRuntimeAudioRing(activeCoordinatorRuntimeModule, audioWorker);
+        }
+        if (!wasReady) {
+          onWorkerReady('audio_worker');
+        }
+      }
     };
 
     const workerInits = createWorkerBootInitPayloads(msg);
@@ -5365,6 +5879,13 @@ const exportedApi = {
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
+  AUDIO_RING_STRUCT_BYTES_WASM64,
+  AUDIO_RING_STRUCT_BYTES_WASM32,
+  AUDIO_RING_CHANNELS,
+  AUDIO_RING_MIN_CAPACITY_SAMPLES,
+  AUDIO_RING_MAX_CAPACITY_SAMPLES,
+  AUDIO_RING_MIN_SAMPLE_RATE,
+  AUDIO_RING_MAX_SAMPLE_RATE,
   DEFAULT_MEMFS_PIPELINE_DUMP_DIR,
   DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT,
   DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS,
@@ -5388,6 +5909,9 @@ const exportedApi = {
   forwardGpuWorkerMessage,
   sanitizeRenderStateStats,
   createHostImports,
+  readPlaygta6AudioRingDescriptor,
+  attachRuntimeAudioRing,
+  resetAttachedRuntimeAudioRing,
   startInputSabBridge,
   resolveDumpPipelinesEnabled,
   sanitizeDumpRelPath,
