@@ -19,6 +19,7 @@ const {
   FRAME_CAPTURE_SCHEMA,
   FRAME_CAPTURE_SCHEMA_VERSION,
   PACKET_HEADER_BYTES,
+  DEFAULT_START_FRAME,
   DEFAULT_MAX_FRAMES,
   DEFAULT_MAX_BYTES,
   OPCODES,
@@ -1206,4 +1207,365 @@ test('GpuTraceReplayer replays multi-frame traces, captures errors, and integrat
   assert.throws(() => replayer.replayFrame(3, mockBatchProcessor), RangeError);
   assert.throws(() => replayer.replayFrame(0, null), TypeError);
   assert.throws(() => replayer.replayAll({}), TypeError);
+});
+
+function concatUint8Arrays(arrays) {
+  const total = arrays.reduce((sum, a) => sum + a.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.byteLength;
+  }
+  return out;
+}
+
+test('W124: startFrame: 3 skips frames 0..2 and captures cleanly from frame 3 onward', () => {
+  assert.equal(DEFAULT_START_FRAME, 0);
+  assert.equal(GpuFrameRecorder.DEFAULT_START_FRAME, 0);
+
+  const frames = [
+    buildSimpleFrame(0.0, 3),
+    buildSimpleFrame(0.1, 6),
+    buildSimpleFrame(0.2, 9),
+    buildSimpleFrame(0.3, 12),
+    buildSimpleFrame(0.4, 15),
+    buildSimpleFrame(0.5, 18),
+  ];
+
+  // 1) Via startCapture({ startFrame: 3 })
+  const rec = new GpuFrameRecorder();
+  assert.equal(rec.startCapture({ startFrame: 3 }), rec);
+  assert.equal(rec.isRecording(), true);
+
+  for (const f of frames) {
+    rec.recordChunk(f);
+  }
+
+  const stats = rec.getStats();
+  assert.equal(stats.startFrame, 3);
+  assert.equal(stats.observedFrames, 6);
+  assert.equal(stats.skippedFrames, 3);
+  assert.equal(stats.capturedFrames, 3);
+  assert.equal(stats.frameCount, 3);
+  assert.equal(stats.capturedBytes, frames[3].byteLength + frames[4].byteLength + frames[5].byteLength);
+  assert.equal(stats.totalBytes, stats.capturedBytes);
+  assert.equal(stats.droppedBudgetFrames, 0);
+  assert.equal(stats.budgetReached, false);
+  assert.equal(stats.recording, true);
+
+  const expected = concatUint8Arrays([frames[3], frames[4], frames[5]]);
+  assert.deepEqual(rec.exportTraceBytes(), expected);
+
+  const meta = rec.exportMetadata();
+  assert.deepEqual(
+    meta.frames.map((f) => f.sequence),
+    [3, 4, 5]
+  );
+
+  // 2) Via constructor options ({ startFrame: 3, autoStart: true }) with huge skipped frames
+  //    that exceed maxBytes — skipped frames must not trip budgetReached!
+  const hugeSkipped = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(1, 0, new Uint8Array(512))
+    .present()
+    .finish();
+  const smallFrame3 = buildSimpleFrame(0.75, 9);
+  const smallFrame4 = buildSimpleFrame(0.85, 12);
+
+  const ctorRec = new GpuFrameRecorder({
+    startFrame: 3,
+    maxBytes: smallFrame3.byteLength * 2,
+    autoStart: true,
+  });
+  ctorRec.recordChunk(hugeSkipped);
+  ctorRec.recordChunk(hugeSkipped);
+  ctorRec.recordChunk(hugeSkipped);
+  ctorRec.recordChunk(smallFrame3);
+  ctorRec.recordChunk(smallFrame4);
+
+  const ctorStats = ctorRec.getStats();
+  assert.equal(ctorStats.startFrame, 3);
+  assert.equal(ctorStats.skippedFrames, 3);
+  assert.equal(ctorStats.capturedFrames, 2);
+  assert.equal(ctorStats.capturedBytes, smallFrame3.byteLength + smallFrame4.byteLength);
+  assert.equal(ctorStats.budgetReached, false);
+  assert.equal(ctorStats.droppedBudgetFrames, 0);
+  assert.deepEqual(ctorRec.exportTraceBytes(), concatUint8Arrays([smallFrame3, smallFrame4]));
+
+  // 3) Option validation (constructor and startCapture leave state intact on error)
+  assert.throws(() => new GpuFrameRecorder({ startFrame: -1 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ startFrame: 1.5 }), RangeError);
+  assert.throws(() => new GpuFrameRecorder({ startFrame: '3' }), RangeError);
+  assert.throws(() => ctorRec.startCapture({ startFrame: -2 }), RangeError);
+  assert.throws(() => ctorRec.startCapture({ maxFrames: 0 }), RangeError);
+  assert.throws(() => ctorRec.startCapture({ maxBytes: 0 }), RangeError);
+  assert.equal(ctorRec.getStats().capturedFrames, 2);
+});
+
+test('W124: maxFrames: 2 stops cleanly after 2 captured frames with budgetReached and droppedBudgetFrames', () => {
+  const frames = [
+    buildSimpleFrame(0.1, 3),
+    buildSimpleFrame(0.2, 6),
+    buildSimpleFrame(0.3, 9),
+    buildSimpleFrame(0.4, 12),
+    buildSimpleFrame(0.5, 15),
+  ];
+
+  // 1) Frame-by-frame delivery via startCapture({ maxFrames: 2 })
+  const rec = new GpuFrameRecorder();
+  rec.startCapture({ maxFrames: 2 });
+
+  rec.recordChunk(frames[0]);
+  rec.recordChunk(frames[1]);
+  const midStats = rec.getStats();
+  assert.equal(midStats.capturedFrames, 2);
+  assert.equal(midStats.budgetReached, false);
+  assert.equal(midStats.droppedBudgetFrames, 0);
+  assert.equal(rec.isRecording(), true);
+
+  // Frame 2 exceeds maxFrames -> budgetReached=true, droppedBudgetFrames>0, clean auto-stop.
+  const hitRes = rec.recordChunk(frames[2]);
+  assert.equal(hitRes.completedFrames, 0);
+  assert.equal(hitRes.droppedFrames, 1);
+
+  const afterHit = rec.getStats();
+  assert.equal(afterHit.capturedFrames, 2);
+  assert.equal(afterHit.frameCount, 2);
+  assert.equal(afterHit.capturedBytes, frames[0].byteLength + frames[1].byteLength);
+  assert.equal(afterHit.budgetReached, true);
+  assert.ok(afterHit.droppedBudgetFrames > 0);
+  assert.equal(afterHit.droppedBudgetFrames, 1);
+  assert.equal(afterHit.recording, false);
+  assert.equal(rec.isRecording(), false);
+
+  // Subsequent frames after clean stop are ignored without corrupting captured frames.
+  const ignoredRes = rec.recordChunk(frames[3]);
+  assert.equal(ignoredRes.recordedBytes, 0);
+  assert.equal(rec.getStats().capturedFrames, 2);
+  assert.deepEqual(rec.exportTraceBytes(), concatUint8Arrays([frames[0], frames[1]]));
+
+  // 2) Single multi-frame chunk delivery with combined startFrame: 2 & maxFrames: 2
+  const windowedRec = new GpuFrameRecorder();
+  windowedRec.startCapture({ startFrame: 2, maxFrames: 2 });
+  windowedRec.recordChunk(concatUint8Arrays(frames));
+
+  const wStats = windowedRec.getStats();
+  assert.equal(wStats.startFrame, 2);
+  assert.equal(wStats.skippedFrames, 2);
+  assert.equal(wStats.capturedFrames, 2);
+  assert.equal(wStats.budgetReached, true);
+  assert.ok(wStats.droppedBudgetFrames > 0);
+  assert.equal(wStats.recording, false);
+  assert.deepEqual(windowedRec.exportTraceBytes(), concatUint8Arrays([frames[2], frames[3]]));
+
+  // 3) Re-starting a new capture resets budget state cleanly.
+  windowedRec.startCapture({ startFrame: 0, maxFrames: 3 });
+  const resetStats = windowedRec.getStats();
+  assert.equal(resetStats.startFrame, 0);
+  assert.equal(resetStats.capturedFrames, 0);
+  assert.equal(resetStats.capturedBytes, 0);
+  assert.equal(resetStats.droppedBudgetFrames, 0);
+  assert.equal(resetStats.budgetReached, false);
+  assert.equal(resetStats.recording, true);
+
+  // 4) Interceptor continues passing frames to WgpuCommandProcessor after recorder hits budget.
+  const { device, ctx, calls } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+  const intRec = new GpuFrameRecorder();
+  const handle = intRec.createInterceptor(processor);
+  intRec.startCapture({ startFrame: 1, maxFrames: 2 });
+
+  for (const f of frames) {
+    processor.executeCommandBuffer(f);
+  }
+  handle.detach();
+
+  assert.equal(calls.filter((c) => c.op === 'submit').length, 5);
+  assert.equal(intRec.getStats().capturedFrames, 2);
+  assert.equal(intRec.getStats().budgetReached, true);
+  assert.ok(intRec.getStats().droppedBudgetFrames > 0);
+  assert.deepEqual(intRec.exportTraceBytes(), concatUint8Arrays([frames[1], frames[2]]));
+});
+
+test('W124: maxBytes enforces byte budget cleanly without partial or corrupt packets in .pg6trace', (t) => {
+  const frame0 = buildSimpleFrame(0.1, 3); // 64 bytes
+  const frame1 = buildSimpleFrame(0.2, 6); // 64 bytes
+  const frame2 = buildSimpleFrame(0.3, 9); // 64 bytes
+  assert.equal(frame0.byteLength, 64);
+
+  // 1) Budget hit mid-frame (maxBytes = 100: frame0=64 fits, frame1 overflows on Draw packet)
+  //    Verify both single-chunk and 1-byte-chunk delivery leave ONLY intact frame0!
+  for (const oneByteChunks of [false, true]) {
+    const rec = new GpuFrameRecorder();
+    rec.startCapture({ maxBytes: 100 });
+    const stream = concatUint8Arrays([frame0, frame1, frame2]);
+
+    if (oneByteChunks) {
+      for (let i = 0; i < stream.byteLength; i++) {
+        rec.recordChunk(stream.subarray(i, i + 1));
+      }
+    } else {
+      rec.recordChunk(stream);
+    }
+
+    const stats = rec.getStats();
+    assert.equal(stats.capturedFrames, 1);
+    assert.equal(stats.capturedBytes, 64);
+    assert.ok(stats.capturedBytes <= 100);
+    assert.equal(stats.budgetReached, true);
+    assert.ok(stats.droppedBudgetFrames > 0);
+    assert.equal(stats.recording, false);
+
+    const exported = rec.exportTraceBytes();
+    assert.deepEqual(exported, frame0);
+
+    // splitTraceIntoFrames must report 1 complete, non-truncated frame.
+    const split = splitTraceIntoFrames(exported);
+    assert.equal(split.length, 1);
+    assert.equal(split[0].complete, true);
+    assert.equal(split[0].truncated, false);
+    assert.equal(split[0].truncatedBytes, 0);
+  }
+
+  // 2) Oversized split packet header exceeding maxBytes stops immediately without OOM buffering.
+  const recSplitHuge = new GpuFrameRecorder();
+  recSplitHuge.startCapture({ maxBytes: 128 });
+  recSplitHuge.recordChunk(frame0); // 64 bytes retained
+
+  // Start frame 1 with BeginFrame (8B) + WriteBuffer header claiming 1 MiB payload (only 16B sent).
+  const hugePartial = new Uint8Array(8 + 8 + 16);
+  const hugeView = new DataView(hugePartial.buffer);
+  // BeginFrame header
+  hugeView.setUint16(0, OPCODES.BEGIN_FRAME, true);
+  hugeView.setUint16(2, 0, true);
+  hugeView.setUint32(4, 0, true);
+  // WriteBuffer header claiming 1,048,576-byte payload
+  hugeView.setUint16(8, OPCODES.WRITE_BUFFER, true);
+  hugeView.setUint16(10, 0, true);
+  hugeView.setUint32(12, 1024 * 1024, true);
+
+  recSplitHuge.recordChunk(hugePartial);
+  const splitStats = recSplitHuge.getStats();
+  assert.equal(splitStats.budgetReached, true);
+  assert.equal(splitStats.droppedBudgetFrames, 1);
+  assert.equal(splitStats.capturedFrames, 1);
+  assert.equal(splitStats.capturedBytes, 64);
+  assert.equal(splitStats.recording, false);
+  assert.deepEqual(recSplitHuge.exportTraceBytes(), frame0);
+
+  // 3) First frame itself exceeds maxBytes -> 0 frames captured, empty valid trace.
+  const recTiny = new GpuFrameRecorder({ maxBytes: 32, stopOnBudget: true, autoStart: true });
+  recTiny.recordChunk(frame0);
+  const tinyStats = recTiny.getStats();
+  assert.equal(tinyStats.capturedFrames, 0);
+  assert.equal(tinyStats.capturedBytes, 0);
+  assert.equal(tinyStats.budgetReached, true);
+  assert.equal(tinyStats.droppedBudgetFrames, 1);
+  assert.equal(tinyStats.recording, false);
+  assert.equal(recTiny.exportTraceBytes().byteLength, 0);
+
+  // 4) Cross-check windowed + byte-budgeted .pg6trace with tools/gpu_trace.py --strict
+  //    --shader-summary --binding-audit.
+  const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+  const probe = spawnSync(pythonCmd, ['--version'], { encoding: 'utf-8' });
+  if (probe.error || probe.status !== 0) {
+    t.skip('python interpreter unavailable for gpu_trace.py cross-check');
+    return;
+  }
+
+  const vsWgsl = '@vertex fn vs_main(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 1.0); }\n';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }\n';
+  const richFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .clearColor(0.1, 0.2, 0.3, 1.0)
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsWgsl)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsWgsl)
+    .createRenderPipeline(3, 1, 2, 12, PRIMITIVE_TOPOLOGY.TRIANGLE_LIST, 0)
+    .setPipeline(3)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  const recAudit = new GpuFrameRecorder();
+  recAudit.startCapture({
+    startFrame: 1,
+    maxFrames: 10,
+    maxBytes: richFrame.byteLength + 40, // fits frame 1, overflows mid-frame on frame 2
+  });
+  recAudit.recordChunk(frame0); // skipped (frame 0)
+  recAudit.recordChunk(richFrame); // captured (frame 1)
+  recAudit.recordChunk(richFrame); // exceeds maxBytes mid-frame -> cleanly dropped
+
+  assert.equal(recAudit.getStats().capturedFrames, 1);
+  assert.equal(recAudit.getStats().budgetReached, true);
+  const traceBytes = recAudit.exportTraceBytes();
+  assert.deepEqual(traceBytes, richFrame);
+
+  const traceScript = path.join(REPO_ROOT, 'tools', 'gpu_trace.py');
+  const proc = spawnSync(
+    pythonCmd,
+    [traceScript, '-', '--json', '--strict', '--shader-summary', '--binding-audit'],
+    {
+      input: Buffer.from(traceBytes),
+      maxBuffer: 4 * 1024 * 1024,
+    }
+  );
+  assert.equal(proc.status, 0, `gpu_trace.py failed: ${proc.stderr.toString('utf-8')}`);
+  const parsed = JSON.parse(proc.stdout.toString('utf-8'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.diagnostics, []);
+  assert.equal(parsed.frame_count, 1);
+  assert.equal(parsed.total_bytes, richFrame.byteLength);
+  assert.equal(parsed.consumed_bytes, richFrame.byteLength);
+});
+
+test('W124: default behavior without options remains 100% backwards-compatible and getStats() is JSON-safe', () => {
+  const rec = new GpuFrameRecorder();
+  const initial = rec.getStats();
+  assert.equal(initial.abiVersion, 1);
+  assert.equal(initial.frameCount, 0);
+  assert.equal(initial.totalBytes, 0);
+  assert.equal(initial.totalPackets, 0);
+  assert.deepEqual(initial.opcodeCounts, {});
+  assert.equal(initial.droppedFrames, 0);
+  assert.equal(initial.capturedFrames, 0);
+  assert.equal(initial.capturedBytes, 0);
+  assert.equal(initial.droppedBudgetFrames, 0);
+  assert.equal(initial.budgetReached, false);
+  assert.equal(initial.startFrame, 0);
+  assert.equal(initial.stopOnBudget, false);
+  assert.equal(initial.recording, false);
+  assert.equal(initial.maxFrames, DEFAULT_MAX_FRAMES);
+  assert.equal(initial.maxBytes, DEFAULT_MAX_BYTES);
+
+  // Default mode retains rolling ring eviction when started with start().
+  rec.start();
+  const frames = [];
+  for (let i = 0; i < DEFAULT_MAX_FRAMES + 3; i++) {
+    const f = buildSimpleFrame(i / 100, i + 1);
+    frames.push(f);
+    rec.recordChunk(f);
+  }
+
+  const stats = rec.getStats();
+  assert.equal(stats.frameCount, DEFAULT_MAX_FRAMES);
+  assert.equal(stats.capturedFrames, DEFAULT_MAX_FRAMES + 3);
+  assert.equal(stats.droppedFrames, 3);
+  assert.equal(stats.droppedBudgetFrames, 0);
+  assert.equal(stats.budgetReached, false);
+  assert.equal(stats.recording, true);
+  assert.equal(stats.capturedBytes, stats.totalBytes);
+  assert.deepEqual(JSON.parse(JSON.stringify(stats)), stats);
+
+  // Mutating returned getStats().opcodeCounts must not affect internal state.
+  stats.opcodeCounts.BeginFrame = 999999;
+  assert.equal(rec.getStats().opcodeCounts.BeginFrame, DEFAULT_MAX_FRAMES);
+
+  // Retained frames in default ring mode are the newest 60 frames.
+  assert.deepEqual(rec.exportTraceBytes({ frameStart: 0, frameCount: 1 }), frames[3]);
+  assert.deepEqual(
+    rec.exportTraceBytes({ frameStart: DEFAULT_MAX_FRAMES - 1, frameCount: 1 }),
+    frames[frames.length - 1]
+  );
 });

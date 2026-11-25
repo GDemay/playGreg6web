@@ -7,6 +7,7 @@
 
   const ABI_VERSION = 1;
   const PACKET_HEADER_BYTES = 8;
+  const DEFAULT_START_FRAME = 0;
   const DEFAULT_MAX_FRAMES = 60;
   const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
   const FRAME_CAPTURE_SCHEMA = 'playgta6-frame-capture';
@@ -162,6 +163,7 @@
   class GpuFrameRecorder {
     static ABI_VERSION = ABI_VERSION;
     static PACKET_HEADER_BYTES = PACKET_HEADER_BYTES;
+    static DEFAULT_START_FRAME = DEFAULT_START_FRAME;
     static DEFAULT_MAX_FRAMES = DEFAULT_MAX_FRAMES;
     static DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES;
     static OPCODES = OPCODES;
@@ -171,7 +173,12 @@
       const opts = options || {};
       const maxFrames = opts.maxFrames !== undefined ? opts.maxFrames : DEFAULT_MAX_FRAMES;
       const maxBytes = opts.maxBytes !== undefined ? opts.maxBytes : DEFAULT_MAX_BYTES;
+      const startFrame = opts.startFrame !== undefined ? opts.startFrame : DEFAULT_START_FRAME;
       const autoStart = opts.autoStart !== undefined ? Boolean(opts.autoStart) : false;
+      const stopOnBudget =
+        opts.stopOnBudget !== undefined
+          ? Boolean(opts.stopOnBudget)
+          : opts.startFrame !== undefined;
 
       if (!Number.isInteger(maxFrames) || maxFrames < 1) {
         throw new RangeError(`maxFrames must be a positive integer, got ${maxFrames}`);
@@ -179,9 +186,14 @@
       if (!Number.isInteger(maxBytes) || maxBytes < 1) {
         throw new RangeError(`maxBytes must be a positive integer, got ${maxBytes}`);
       }
+      if (!Number.isInteger(startFrame) || startFrame < 0) {
+        throw new RangeError(`startFrame must be a non-negative integer, got ${startFrame}`);
+      }
 
       this._maxFrames = maxFrames;
       this._maxBytes = maxBytes;
+      this._startFrame = startFrame;
+      this._stopOnBudget = stopOnBudget;
       this._recording = autoStart;
 
       this._frames = [];
@@ -190,7 +202,11 @@
       this._totalPackets = 0;
       this._opcodeCounts = {};
       this._droppedFrames = 0;
+      this._droppedBudgetFrames = 0;
+      this._budgetReached = false;
       this._capturedFrames = 0;
+      this._observedFrames = 0;
+      this._skippedFrames = 0;
       this._nextFrameSeq = 0;
 
       this._activeFrame = null;
@@ -210,7 +226,69 @@
       return this._frames.length - this._frameHead;
     }
 
+    _triggerBudgetStop() {
+      this._budgetReached = true;
+      this._droppedBudgetFrames += 1;
+      this._droppedFrames += 1;
+      this._recording = false;
+      this._resetPartialState();
+    }
+
     start() {
+      this._recording = true;
+      return this;
+    }
+
+    /**
+     * Starts a bounded capture session with optional frame-window and byte-budget
+     * controls (`startFrame`, `maxFrames`, `maxBytes`). By default stops cleanly
+     * once `maxFrames` or `maxBytes` would be exceeded (`stopOnBudget: true`) and
+     * clears prior captured frames (`clear: true`).
+     *
+     * @param {{
+     *   startFrame?: number,
+     *   maxFrames?: number,
+     *   maxBytes?: number,
+     *   stopOnBudget?: boolean,
+     *   clear?: boolean
+     * }} [options]
+     */
+    startCapture(options = {}) {
+      const opts = options || {};
+      const nextStartFrame =
+        opts.startFrame !== undefined ? opts.startFrame : this._startFrame;
+      const nextMaxFrames =
+        opts.maxFrames !== undefined ? opts.maxFrames : this._maxFrames;
+      const nextMaxBytes =
+        opts.maxBytes !== undefined ? opts.maxBytes : this._maxBytes;
+      const nextStopOnBudget =
+        opts.stopOnBudget !== undefined ? Boolean(opts.stopOnBudget) : true;
+      const shouldClear = opts.clear !== undefined ? Boolean(opts.clear) : true;
+
+      if (!Number.isInteger(nextStartFrame) || nextStartFrame < 0) {
+        throw new RangeError(
+          `startFrame must be a non-negative integer, got ${nextStartFrame}`
+        );
+      }
+      if (!Number.isInteger(nextMaxFrames) || nextMaxFrames < 1) {
+        throw new RangeError(`maxFrames must be a positive integer, got ${nextMaxFrames}`);
+      }
+      if (!Number.isInteger(nextMaxBytes) || nextMaxBytes < 1) {
+        throw new RangeError(`maxBytes must be a positive integer, got ${nextMaxBytes}`);
+      }
+
+      this._startFrame = nextStartFrame;
+      this._maxFrames = nextMaxFrames;
+      this._maxBytes = nextMaxBytes;
+      this._stopOnBudget = nextStopOnBudget;
+
+      if (shouldClear) {
+        this.clear();
+      } else {
+        this._budgetReached = false;
+        this._resetPartialState();
+      }
+
       this._recording = true;
       return this;
     }
@@ -228,7 +306,11 @@
       this._totalPackets = 0;
       this._opcodeCounts = {};
       this._droppedFrames = 0;
+      this._droppedBudgetFrames = 0;
+      this._budgetReached = false;
       this._capturedFrames = 0;
+      this._observedFrames = 0;
+      this._skippedFrames = 0;
       this._nextFrameSeq = 0;
       this._resetPartialState();
       return this;
@@ -272,8 +354,20 @@
     _commitActiveFrame() {
       const active = this._activeFrame;
       this._activeFrame = null;
-      if (!active) {
+      if (!active || active.skip) {
         return { completed: 0, dropped: 0 };
+      }
+
+      this._observedFrames += 1;
+
+      if (this._stopOnBudget) {
+        if (
+          this._retainedFrameCount() >= this._maxFrames ||
+          this._totalBytes + active.byteLength > this._maxBytes
+        ) {
+          this._triggerBudgetStop();
+          return { completed: 0, dropped: 1 };
+        }
       }
 
       const frameBytes = concatChunks(active.chunks, active.byteLength);
@@ -317,17 +411,37 @@
 
     _ingestPacket(opcode, packetBytesCopy) {
       if (opcode === OPCODES.BEGIN_FRAME) {
+        const skip = this._observedFrames < this._startFrame;
         // Start a fresh frame; any unclosed prior frame without Present is discarded.
-        this._activeFrame = {
-          chunks: [],
-          byteLength: 0,
-          packetCount: 0,
-          opcodeCounts: {},
-        };
+        this._activeFrame = skip
+          ? {
+              skip: true,
+              chunks: null,
+              byteLength: 0,
+              packetCount: 0,
+              opcodeCounts: null,
+            }
+          : {
+              skip: false,
+              chunks: [],
+              byteLength: 0,
+              packetCount: 0,
+              opcodeCounts: {},
+            };
       }
 
       if (!this._activeFrame) {
         // Ignore packets outside a BeginFrame..Present boundary.
+        return { completed: 0, dropped: 0 };
+      }
+
+      if (this._activeFrame.skip) {
+        if (opcode === OPCODES.PRESENT) {
+          this._activeFrame = null;
+          this._observedFrames += 1;
+          this._skippedFrames += 1;
+          this._nextFrameSeq += 1;
+        }
         return { completed: 0, dropped: 0 };
       }
 
@@ -414,17 +528,65 @@
         const payloadBytes = view.getUint32(offset + 4, true);
         const packetLen = PACKET_HEADER_BYTES + payloadBytes;
 
+        if (this._stopOnBudget) {
+          if (opcode === OPCODES.BEGIN_FRAME) {
+            if (this._observedFrames >= this._startFrame) {
+              if (
+                this._retainedFrameCount() >= this._maxFrames ||
+                this._totalBytes + packetLen > this._maxBytes
+              ) {
+                this._triggerBudgetStop();
+                droppedFrames += 1;
+                return {
+                  recordedBytes: srcLen,
+                  packetsParsed,
+                  completedFrames,
+                  droppedFrames,
+                };
+              }
+            }
+          } else if (this._activeFrame && !this._activeFrame.skip) {
+            if (this._totalBytes + this._activeFrame.byteLength + packetLen > this._maxBytes) {
+              this._triggerBudgetStop();
+              droppedFrames += 1;
+              return {
+                recordedBytes: srcLen,
+                packetsParsed,
+                completedFrames,
+                droppedFrames,
+              };
+            }
+          }
+        }
+
         if (offset + packetLen > len) {
           this._pendingNeededBytes = packetLen;
           break;
         }
 
-        const packetCopy = copyBytes(buf.subarray(offset, offset + packetLen));
+        let packetCopy = null;
+        if (opcode === OPCODES.BEGIN_FRAME) {
+          if (this._observedFrames >= this._startFrame) {
+            packetCopy = copyBytes(buf.subarray(offset, offset + packetLen));
+          }
+        } else if (this._activeFrame && !this._activeFrame.skip) {
+          packetCopy = copyBytes(buf.subarray(offset, offset + packetLen));
+        }
+
         const res = this._ingestPacket(opcode, packetCopy);
         packetsParsed += 1;
         completedFrames += res.completed;
         droppedFrames += res.dropped;
         offset += packetLen;
+
+        if (!this._recording) {
+          return {
+            recordedBytes: srcLen,
+            packetsParsed,
+            completedFrames,
+            droppedFrames,
+          };
+        }
       }
 
       if (offset < len) {
@@ -496,8 +658,34 @@
     }
 
     /**
+     * Returns JSON-safe capture telemetry including frame-window and budget counters.
+     */
+    getStats() {
+      const available = this._retainedFrameCount();
+      return {
+        abiVersion: ABI_VERSION,
+        frameCount: available,
+        totalBytes: this._totalBytes,
+        totalPackets: this._totalPackets,
+        opcodeCounts: cloneCounts(this._opcodeCounts),
+        droppedFrames: this._droppedFrames,
+        capturedFrames: this._capturedFrames,
+        capturedBytes: this._totalBytes,
+        droppedBudgetFrames: this._droppedBudgetFrames,
+        budgetReached: this._budgetReached,
+        startFrame: this._startFrame,
+        observedFrames: this._observedFrames,
+        skippedFrames: this._skippedFrames,
+        stopOnBudget: this._stopOnBudget,
+        recording: this._recording,
+        maxFrames: this._maxFrames,
+        maxBytes: this._maxBytes,
+      };
+    }
+
+    /**
      * Returns a JSON-safe summary of recorded frames, byte usage, opcode histogram,
-     * dropped frame count, and recording state.
+     * dropped frame count, budget telemetry, and recording state.
      */
     exportMetadata() {
       const available = this._retainedFrameCount();
@@ -513,19 +701,9 @@
         };
       }
 
-      return {
-        abiVersion: ABI_VERSION,
-        frameCount: available,
-        totalBytes: this._totalBytes,
-        totalPackets: this._totalPackets,
-        opcodeCounts: cloneCounts(this._opcodeCounts),
-        droppedFrames: this._droppedFrames,
-        capturedFrames: this._capturedFrames,
-        recording: this._recording,
-        maxFrames: this._maxFrames,
-        maxBytes: this._maxBytes,
-        frames,
-      };
+      const stats = this.getStats();
+      stats.frames = frames;
+      return stats;
     }
 
     /**
@@ -1301,6 +1479,7 @@
     FRAME_CAPTURE_SCHEMA_VERSION,
     ABI_VERSION,
     PACKET_HEADER_BYTES,
+    DEFAULT_START_FRAME,
     DEFAULT_MAX_FRAMES,
     DEFAULT_MAX_BYTES,
     OPCODES,
