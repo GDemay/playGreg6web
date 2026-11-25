@@ -2247,3 +2247,426 @@ test('W200 classic-worker importScripts compatibility keeps new helpers isolated
   assert.equal(ctx.PlayGta6RenderTargetPool.DEFAULT_OVERSIZED_TARGET_BYTES, 24 * 1024 * 1024);
   assert.equal(typeof ctx.PlayGta6RenderTargetPool.makeTextureViewKey, 'function');
 });
+
+// ---------------------------------------------------------------------------
+// W249: Sanitized 4K Render-Target Reuse, Peak VRAM, Oversized Evictions,
+//       View-Cache Hit-Rate Telemetry & resetStats()
+// ---------------------------------------------------------------------------
+
+test('W249 tracks poolHits, poolMisses, clamped hitRate, transientReuseCount, peakVramBytes, and viewCacheHitRate across 4K reuse', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // 1. Fresh pool starts with all sanitized W249 and legacy telemetry fields at 0.
+  let stats = pool.getStats();
+  assert.equal(stats.poolHits, 0);
+  assert.equal(stats.poolMisses, 0);
+  assert.equal(stats.hits, 0);
+  assert.equal(stats.misses, 0);
+  assert.equal(stats.hitRate, 0);
+  assert.equal(stats.reuseRatio, 0);
+  assert.equal(stats.transientReuseCount, 0);
+  assert.equal(stats.peakVramBytes, 0);
+  assert.equal(stats.peakBytes, 0);
+  assert.equal(stats.oversizedEvictions, 0);
+  assert.equal(stats.viewCacheHits, 0);
+  assert.equal(stats.viewCacheMisses, 0);
+  assert.equal(stats.viewCacheHitRate, 0);
+
+  const desc4kColor = {
+    width: 3840,
+    height: 2160,
+    format: 'rgba8unorm',
+    viewFormats: ['rgba8unorm-srgb'],
+  };
+  const desc4kDepth = {
+    width: 3840,
+    height: 2160,
+    format: 'depth32float-stencil8',
+  };
+  const desc1080Ui = {
+    width: 1920,
+    height: 1080,
+    format: 'rgba8unorm-srgb',
+  };
+  const expectedWorkingSetBytes =
+    3840 * 2160 * 4 + 3840 * 2160 * 8 + 1920 * 1080 * 4;
+
+  // 2. Frame 0 misses: 3 textures allocated, 3 default views created -> hitRate = 0, viewCacheHitRate = 0.
+  const c0 = pool.acquire(desc4kColor, '4k-color-f0');
+  const d0 = pool.acquire(desc4kDepth, '4k-depth-f0');
+  const u0 = pool.acquire(desc1080Ui, '1080p-ui-f0');
+
+  stats = pool.getStats();
+  assert.equal(stats.poolHits, 0);
+  assert.equal(stats.poolMisses, 3);
+  assert.equal(stats.transientReuseCount, 0);
+  assert.equal(stats.hitRate, 0);
+  assert.equal(stats.peakVramBytes, expectedWorkingSetBytes);
+  assert.equal(stats.viewCacheHits, 0);
+  assert.equal(stats.viewCacheMisses, 3);
+  assert.equal(stats.viewCacheHitRate, 0);
+  assert.equal(stats.oversizedEvictions, 0);
+
+  // Create 2 custom sub-views (misses) and re-query them + default view (hits).
+  const srgbView = c0.getView({ format: 'rgba8unorm-srgb' }); // miss #4
+  const depthOnlyView = d0.getView({ aspect: 'depth-only' }); // miss #5
+  assert.equal(c0.getView({ format: 'rgba8unorm-srgb' }), srgbView); // hit #1
+  assert.equal(d0.getView({ aspect: 'depth-only' }), depthOnlyView); // hit #2
+  assert.equal(c0.getView(), c0.view); // hit #3
+
+  stats = pool.getStats();
+  assert.equal(stats.viewCacheHits, 3);
+  assert.equal(stats.viewCacheMisses, 5);
+  assert.ok(Math.abs(stats.viewCacheHitRate - 3 / 8) < 1e-9);
+  assert.ok(stats.viewCacheHitRate >= 0 && stats.viewCacheHitRate <= 1);
+
+  // 3. Same-frame aliasing of 4K color target increments poolHits, transientReuseCount, and viewCacheHits.
+  assert.equal(pool.release(c0), true);
+  const c0Aliased = pool.acquire(desc4kColor, '4k-postfx-alias-f0');
+  assert.equal(c0Aliased.reused, true);
+  assert.equal(c0Aliased.texture, c0.texture);
+  assert.equal(c0Aliased.getView({ format: 'rgba8unorm-srgb' }), srgbView); // hit #5 (acquire hit was #4)
+
+  stats = pool.getStats();
+  assert.equal(stats.poolHits, 1);
+  assert.equal(stats.poolMisses, 3);
+  assert.equal(stats.transientReuseCount, 1);
+  assert.ok(Math.abs(stats.hitRate - 1 / 4) < 1e-9);
+  assert.equal(stats.viewCacheHits, 5);
+  assert.equal(stats.viewCacheMisses, 5);
+  assert.ok(Math.abs(stats.viewCacheHitRate - 0.5) < 1e-9);
+  assert.equal(stats.peakVramBytes, expectedWorkingSetBytes);
+
+  pool.release(c0Aliased);
+  pool.release(d0);
+  pool.release(u0);
+  pool.endFrame();
+
+  // 4. Cross-frame 4K + 1080p reuse across 3 frames: zero extra texture/view creations.
+  const texCountBefore = createdTextures.length;
+  for (let f = 1; f <= 3; f += 1) {
+    const c = pool.acquire(desc4kColor, `4k-color-f${f}`);
+    const d = pool.acquire(desc4kDepth, `4k-depth-f${f}`);
+    const u = pool.acquire(desc1080Ui, `1080p-ui-f${f}`);
+    assert.equal(c.reused, true);
+    assert.equal(d.reused, true);
+    assert.equal(u.reused, true);
+    assert.equal(c.getView({ format: 'rgba8unorm-srgb' }), srgbView);
+    assert.equal(d.getView({ aspect: 'depth-only' }), depthOnlyView);
+    pool.release(c);
+    pool.release(d);
+    pool.release(u);
+    pool.endFrame();
+  }
+
+  assert.equal(createdTextures.length, texCountBefore);
+  stats = pool.getStats();
+  // 1 same-frame alias + 9 cross-frame reuses = 10 hits; 3 initial misses -> 10/13
+  assert.equal(stats.poolHits, 10);
+  assert.equal(stats.poolMisses, 3);
+  assert.equal(stats.transientReuseCount, 10);
+  assert.ok(Math.abs(stats.hitRate - 10 / 13) < 1e-9);
+  assert.equal(stats.hitRate, stats.reuseRatio);
+  // 5 prior view hits + 3 frames * (3 acquire default hits + 2 sub-view hits) = 20 hits, 5 misses -> 20/25 = 0.8
+  assert.equal(stats.viewCacheHits, 20);
+  assert.equal(stats.viewCacheMisses, 5);
+  assert.ok(Math.abs(stats.viewCacheHitRate - 0.8) < 1e-9);
+  assert.equal(stats.peakVramBytes, expectedWorkingSetBytes);
+  assert.equal(stats.oversizedEvictions, 0);
+
+  pool.destroy();
+});
+
+test('W249 tracks oversizedEvictions strictly for targets >= oversizedTargetBytes across idle, budget, resize, and external-destroy evictions', () => {
+  const bytes4kHdr = 3840 * 2160 * 8; // 63.3 MiB (>= 24 MiB oversized)
+  const bytes4kRgba8 = 3840 * 2160 * 4; // 31.6 MiB (>= 24 MiB oversized)
+  const bytes1080Rgba8 = 1920 * 1080 * 4; // 7.9 MiB (< 24 MiB)
+  const bytes1080Hdr = 1920 * 1080 * 8; // 15.8 MiB (< 24 MiB)
+
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({
+    device,
+    maxPoolBytes: bytes4kHdr + bytes4kRgba8 + bytes1080Rgba8 + bytes1080Hdr,
+    idleFrameTtl: 6,
+    oversizedTargetBytes: DEFAULT_OVERSIZED_TARGET_BYTES, // 24 MiB
+    oversizedIdleFrameTtl: 1,
+    strictBudget: true,
+  });
+
+  const desc4kHdr = { width: 3840, height: 2160, format: 'rgba16float' };
+  const desc4kColor = { width: 3840, height: 2160, format: 'rgba8unorm' };
+  const desc1080Color = { width: 1920, height: 1080, format: 'rgba8unorm' };
+  const desc1080Hdr = { width: 1920, height: 1080, format: 'rgba16float' };
+
+  // 1. Oversized idle-TTL eviction in endFrame(): 4K HDR evicted, 1080p targets survive.
+  const rt4kHdr = pool.acquire(desc4kHdr, '4k-hdr');
+  const rt1080 = pool.acquire(desc1080Color, '1080p-ui');
+  pool.release(rt4kHdr);
+  pool.release(rt1080);
+
+  pool.endFrame(); // frame 1 (age = 1 <= oversizedIdleFrameTtl 1)
+  assert.equal(pool.getStats().oversizedEvictions, 0);
+  pool.endFrame(); // frame 2 (age = 2 > 1 -> 4K HDR evicted!)
+  let stats = pool.getStats();
+  assert.equal(stats.oversizedEvictions, 1);
+  assert.equal(stats.idleEvictions, 1);
+  assert.equal(stats.evictions, 1);
+  assert.equal(stats.peakVramBytes, bytes4kHdr + bytes1080Rgba8);
+
+  // 2. Evicting a non-oversized 1080p target increments evictions/idleEvictions but NOT oversizedEvictions.
+  const smallEvict = pool.evictIdle(0);
+  assert.equal(smallEvict.evictedCount, 1);
+  stats = pool.getStats();
+  assert.equal(stats.evictions, 2);
+  assert.equal(stats.idleEvictions, 2);
+  assert.equal(stats.oversizedEvictions, 1);
+
+  // 3. Budget LRU eviction of an idle 4K target increments oversizedEvictions and budgetEvictions.
+  const rt4kColor = pool.acquire(desc4kColor, '4k-color');
+  const rt1080Hdr = pool.acquire(desc1080Hdr, '1080p-hdr');
+  pool.release(rt4kColor); // oldest idle (oversized)
+  pool.release(rt1080Hdr); // newer idle (non-oversized)
+
+  // Shrink budget via trimToBudget to bytes1080Hdr -> evicts oldest idle (4K color).
+  const trimRes = pool.trimToBudget(bytes1080Hdr);
+  assert.deepEqual(trimRes, { evictedCount: 1, evictedBytes: bytes4kRgba8 });
+  stats = pool.getStats();
+  assert.equal(stats.oversizedEvictions, 2);
+  assert.equal(stats.budgetEvictions, 1);
+  assert.equal(stats.evictions, 3);
+
+  // 4. invalidateAll() evicts idle 1080p (not oversized) and flags active 4K for retireOnRelease (oversized).
+  const rt4kInFlight = pool.acquire(desc4kColor, '4k-inflight');
+  assert.equal(pool.invalidateAll(), 1); // evicts idle rt1080Hdr
+  stats = pool.getStats();
+  assert.equal(stats.evictions, 4);
+  assert.equal(stats.oversizedEvictions, 2, 'evicting 1080p via invalidateAll must not count as oversized');
+
+  // Releasing retired active 4K target counts as an oversized eviction.
+  assert.equal(pool.release(rt4kInFlight), true);
+  stats = pool.getStats();
+  assert.equal(stats.evictions, 5);
+  assert.equal(stats.oversizedEvictions, 3);
+
+  // 5. Externally-destroyed idle 4K target cleaned up on acquire increments oversizedEvictions.
+  const rt4kExt = pool.acquire(desc4kColor, '4k-ext-destroyed');
+  const extTex = createdTextures[createdTextures.length - 1];
+  pool.release(rt4kExt);
+  extTex.destroy();
+
+  const rt4kFresh = pool.acquire(desc4kColor, '4k-fresh-after-ext');
+  assert.equal(rt4kFresh.reused, false);
+  stats = pool.getStats();
+  assert.equal(stats.evictions, 6);
+  assert.equal(stats.oversizedEvictions, 4);
+  assert.ok(stats.oversizedEvictions <= stats.evictions);
+
+  pool.release(rt4kFresh);
+  pool.destroy();
+
+  // 6. When oversizedTargetBytes is Infinity, evicting 4K targets never increments oversizedEvictions.
+  {
+    const { device: devInf } = createMockGpuDevice();
+    const poolInf = new RenderTargetPool({
+      device: devInf,
+      oversizedTargetBytes: Infinity,
+    });
+    const rt = poolInf.acquire(desc4kHdr);
+    poolInf.release(rt);
+    poolInf.evictIdle(0);
+    assert.equal(poolInf.getStats().evictions, 1);
+    assert.equal(poolInf.getStats().oversizedEvictions, 0);
+    poolInf.destroy();
+  }
+});
+
+test('W249 resetStats() resets cumulative telemetry cleanly, preserves live pool/view state, and stays safe post-destroy', () => {
+  const bytes4kRgba8 = 3840 * 2160 * 4;
+  const bytes1080Rgba8 = 1920 * 1080 * 4;
+
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({
+    device,
+    oversizedTargetBytes: DEFAULT_OVERSIZED_TARGET_BYTES,
+    oversizedIdleFrameTtl: 1,
+    autoReleaseLeaked: true,
+    onLeak: () => {},
+  });
+
+  const desc4k = { width: 3840, height: 2160, format: 'rgba8unorm', viewFormats: ['rgba8unorm-srgb'] };
+  const desc1080 = { width: 1920, height: 1080, format: 'rgba8unorm' };
+
+  // Build up hits, misses, views, sanitization counters, leaks, peak VRAM, and oversized evictions.
+  const rt4k = pool.acquire(desc4k, '4k-live');
+  const srgbView = rt4k.getView({ format: 'rgba8unorm-srgb' });
+  assert.equal(rt4k.getView({ format: 'rgba8unorm-srgb' }), srgbView);
+
+  const rt4kTemp = pool.acquire({ width: 3840, height: 2160, format: 'r8g8b8a8_unorm', sampleCount: 2 }, '4k-temp');
+  const rtClamped = pool.acquire({ width: 0, height: 0, format: 'rgba8unorm' }, 'clamped-1x1');
+  const rt1080 = pool.acquire(desc1080, '1080p-live');
+
+  pool.release(rt4k);
+  const rt4kHit = pool.acquire(desc4k, '4k-live-hit');
+  assert.equal(rt4kHit.reused, true);
+  pool.release(rt4kHit);
+  pool.release(rt4kTemp);
+  pool.release(rtClamped);
+  // Leave rt1080 active across endFrame to trigger leakedReleases = 1.
+  pool.endFrame(); // frame 1 (rt1080 auto-released)
+  // Re-acquire rt1080 to keep it active during resetStats, and evict idle oversized rt4kTemp.
+  const rt1080Active = pool.acquire(desc1080, '1080p-active');
+  assert.equal(pool.evictIdle(0, { minBytes: DEFAULT_OVERSIZED_TARGET_BYTES }).evictedCount, 2); // evicts rt4k & rt4kTemp
+
+  // Re-allocate a single 4K idle target so live pool has: 1 active 1080p + 1 idle 4K + 1 idle 1x1.
+  const rt4kIdle = pool.acquire(desc4k, '4k-idle-live');
+  const srgbView2 = rt4kIdle.getView({ format: 'rgba8unorm-srgb' });
+  pool.release(rt4kIdle);
+
+  const beforeReset = pool.getStats();
+  assert.ok(beforeReset.poolHits > 0);
+  assert.ok(beforeReset.poolMisses > 0);
+  assert.ok(beforeReset.transientReuseCount > 0);
+  assert.ok(beforeReset.oversizedEvictions > 0);
+  assert.ok(beforeReset.leakedReleases > 0);
+  assert.ok(beforeReset.dimensionClampCount > 0);
+  assert.ok(beforeReset.formatNormalizeCount > 0);
+  assert.ok(beforeReset.sampleCountNormalizeCount > 0);
+  assert.ok(beforeReset.peakVramBytes > beforeReset.estimatedVramBytes);
+
+  const liveBytesBefore = beforeReset.estimatedVramBytes;
+  const liveViewsBefore = beforeReset.viewsCached;
+  const frameBefore = beforeReset.currentFrame;
+
+  // Call resetStats(): zeroes cumulative counters, re-baselines peakVramBytes to live VRAM,
+  // and keeps active/idle textures, views, and currentFrame intact.
+  const cleared = pool.resetStats();
+  assert.equal(cleared.hits, 0);
+  assert.equal(cleared.misses, 0);
+  assert.equal(cleared.poolHits, 0);
+  assert.equal(cleared.poolMisses, 0);
+  assert.equal(cleared.transientReuseCount, 0);
+  assert.equal(cleared.hitRate, 0);
+  assert.equal(cleared.reuseRatio, 0);
+  assert.equal(cleared.viewCacheHits, 0);
+  assert.equal(cleared.viewCacheMisses, 0);
+  assert.equal(cleared.viewCacheHitRate, 0);
+  assert.equal(cleared.evictions, 0);
+  assert.equal(cleared.budgetEvictions, 0);
+  assert.equal(cleared.idleEvictions, 0);
+  assert.equal(cleared.oversizedEvictions, 0);
+  assert.equal(cleared.leakedReleases, 0);
+  assert.equal(cleared.dimensionClampCount, 0);
+  assert.equal(cleared.formatNormalizeCount, 0);
+  assert.equal(cleared.sampleCountNormalizeCount, 0);
+
+  // Live state preserved and peakVramBytes re-baselined to live occupancy.
+  assert.equal(cleared.activeCount, 1);
+  assert.equal(cleared.idleCount, 2);
+  assert.equal(cleared.estimatedVramBytes, liveBytesBefore);
+  assert.equal(cleared.peakVramBytes, liveBytesBefore);
+  assert.equal(cleared.peakBytes, liveBytesBefore);
+  assert.equal(cleared.peakPooledBytes, liveBytesBefore);
+  assert.equal(cleared.peakEstimatedBytes, liveBytesBefore);
+  assert.equal(cleared.viewsCached, liveViewsBefore);
+  assert.equal(cleared.currentFrame, frameBefore);
+
+  // Reusing the live idle 4K target & its cached view after resetStats hits 100% (1.0) hit rates with 0 new allocations!
+  const texCountAfterReset = createdTextures.length;
+  const rt4kReused = pool.acquire(desc4k, '4k-post-reset-hit');
+  assert.equal(rt4kReused.reused, true);
+  assert.equal(rt4kReused.texture, rt4kIdle.texture);
+  assert.equal(rt4kReused.getView({ format: 'rgba8unorm-srgb' }), srgbView2);
+  assert.equal(createdTextures.length, texCountAfterReset);
+
+  const afterHit = pool.getStats();
+  assert.equal(afterHit.poolHits, 1);
+  assert.equal(afterHit.poolMisses, 0);
+  assert.equal(afterHit.transientReuseCount, 1);
+  assert.equal(afterHit.hitRate, 1);
+  assert.equal(afterHit.viewCacheHits, 2);
+  assert.equal(afterHit.viewCacheMisses, 0);
+  assert.equal(afterHit.viewCacheHitRate, 1);
+  assert.equal(afterHit.peakVramBytes, liveBytesBefore);
+
+  // Release both active handles and destroy; resetStats() post-destroy is safe and zeroes peakVramBytes.
+  assert.equal(pool.release(rt4kReused), true);
+  assert.equal(pool.release(rt1080Active), true);
+  pool.destroy();
+
+  const postDestroyReset = pool.resetStats();
+  assert.equal(postDestroyReset.poolHits, 0);
+  assert.equal(postDestroyReset.poolMisses, 0);
+  assert.equal(postDestroyReset.transientReuseCount, 0);
+  assert.equal(postDestroyReset.hitRate, 0);
+  assert.equal(postDestroyReset.viewCacheHitRate, 0);
+  assert.equal(postDestroyReset.oversizedEvictions, 0);
+  assert.equal(postDestroyReset.peakVramBytes, 0);
+  assert.equal(postDestroyReset.estimatedVramBytes, 0);
+  assert.equal(postDestroyReset.viewsCached, 0);
+  assert.equal(bytes4kRgba8 + bytes1080Rgba8 + 4, liveBytesBefore);
+});
+
+test('W249 sanitizes counters and clamps hitRate / viewCacheHitRate strictly to [0, 1] without leaking helpers to WorkerGlobalScope', () => {
+  const { device } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // Mutating getStats() output cannot corrupt pool telemetry.
+  const snap = pool.getStats();
+  snap.poolHits = 9999;
+  snap.hitRate = 42;
+  snap.viewCacheHitRate = -7;
+  snap.peakVramBytes = -1;
+  snap.oversizedEvictions = 99;
+  const freshSnap = pool.getStats();
+  assert.equal(freshSnap.poolHits, 0);
+  assert.equal(freshSnap.hitRate, 0);
+  assert.equal(freshSnap.viewCacheHitRate, 0);
+  assert.equal(freshSnap.peakVramBytes, 0);
+  assert.equal(freshSnap.oversizedEvictions, 0);
+
+  // Perturb internal counters with NaN / Infinity / negative values -> getStats() sanitizes cleanly.
+  pool._hits = Number.NaN;
+  pool._misses = -10;
+  pool._transientReuseCount = Number.POSITIVE_INFINITY;
+  pool._viewCacheHits = -3;
+  pool._viewCacheMisses = Number.NaN;
+  pool._peakBytes = -500;
+  pool._oversizedEvictions = Number.NEGATIVE_INFINITY;
+  const sanitizedZero = pool.getStats();
+  assert.equal(sanitizedZero.poolHits, 0);
+  assert.equal(sanitizedZero.poolMisses, 0);
+  assert.equal(sanitizedZero.hitRate, 0);
+  assert.equal(sanitizedZero.transientReuseCount, 0);
+  assert.equal(sanitizedZero.viewCacheHits, 0);
+  assert.equal(sanitizedZero.viewCacheMisses, 0);
+  assert.equal(sanitizedZero.viewCacheHitRate, 0);
+  assert.equal(sanitizedZero.peakVramBytes, 0);
+  assert.equal(sanitizedZero.oversizedEvictions, 0);
+
+  // Even if live activeBytes exceeds a stale/lower _peakBytes, peakVramBytes >= estimatedVramBytes holds.
+  pool._activeBytes = 4096;
+  pool._peakBytes = 1024;
+  assert.equal(pool.getStats().peakVramBytes, 4096);
+  pool._activeBytes = 0;
+  pool.resetStats();
+
+  // Classic-worker IIFE isolation: new sanitization helpers must not leak into WorkerGlobalScope.
+  const rtPoolPath = fileURLToPath(new URL('../web/workers/rt_pool.js', import.meta.url));
+  const source = readFileSync(rtPoolPath, 'utf8');
+  const sandbox = { console };
+  const ctx = vm.createContext(sandbox);
+  ctx.self = ctx;
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+    vm.runInContext(
+      `
+      function sanitizeNonNegativeCounter() {}
+      function clampUnitRate() {}
+      `,
+      ctx
+    );
+  });
+
+  pool.destroy();
+});
