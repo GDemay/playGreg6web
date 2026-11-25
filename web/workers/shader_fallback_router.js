@@ -37,6 +37,8 @@
 
   const U64_MAX = 0xffffffffffffffffn;
   const DEFAULT_MAX_TRACKED_MISSING = 512;
+  const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
+  const DEFAULT_TOP_MISSING_LIMIT = 16;
 
   /**
    * Minimal original WebGPU WGSL fallbacks used when no pack (and no S9 fallback hash)
@@ -510,7 +512,9 @@
      * @param {{
      *   packLoader?: object | Map | null,
      *   fallbackHashes?: Record<string, bigint | string | number> | null,
+     *   maxTrackedMissingHashes?: number,
      *   maxTrackedMissing?: number,
+     *   defaultProfile?: string | null,
      *   now?: () => number,
      * }} [options]
      */
@@ -526,12 +530,24 @@
           ? { ...opts.fallbackHashes }
           : {};
 
-      const maxTracked =
-        opts.maxTrackedMissing !== undefined ? opts.maxTrackedMissing : DEFAULT_MAX_TRACKED_MISSING;
-      if (!Number.isInteger(maxTracked) || maxTracked < 0) {
-        throw new RangeError(
-          `maxTrackedMissing must be a non-negative integer, got ${maxTracked}`
-        );
+      let maxTracked = DEFAULT_MAX_TRACKED_MISSING_HASHES;
+      if (opts.maxTrackedMissingHashes !== undefined) {
+        if (
+          !Number.isInteger(opts.maxTrackedMissingHashes) ||
+          opts.maxTrackedMissingHashes < 0
+        ) {
+          throw new RangeError(
+            `maxTrackedMissingHashes must be a non-negative integer, got ${opts.maxTrackedMissingHashes}`
+          );
+        }
+        maxTracked = opts.maxTrackedMissingHashes;
+      } else if (opts.maxTrackedMissing !== undefined) {
+        if (!Number.isInteger(opts.maxTrackedMissing) || opts.maxTrackedMissing < 0) {
+          throw new RangeError(
+            `maxTrackedMissing must be a non-negative integer, got ${opts.maxTrackedMissing}`
+          );
+        }
+        maxTracked = opts.maxTrackedMissing;
       }
       this._maxTrackedMissing = maxTracked;
 
@@ -710,13 +726,49 @@
     }
 
     /**
+     * Return top-N missing shaders ranked by miss count descending, breaking ties
+     * deterministically by `hashHex` ascending (then `stage` ascending).
+     * Records are sanitized (`{ hashHex, stage, count }`) with zero host paths or
+     * raw shader text.
+     *
+     * @param {number} [limit=16]
+     * @returns {Array<{ hashHex: string, stage: 'vertex' | 'fragment' | 'compute', count: number }>}
+     */
+    getTopMissingShaders(limit = DEFAULT_TOP_MISSING_LIMIT) {
+      const resolvedLimit =
+        limit === undefined || limit === null ? DEFAULT_TOP_MISSING_LIMIT : limit;
+      if (!Number.isInteger(resolvedLimit) || resolvedLimit < 0) {
+        throw new RangeError(`limit must be a non-negative integer, got ${resolvedLimit}`);
+      }
+      if (resolvedLimit === 0 || this._missing.size === 0) {
+        return [];
+      }
+
+      const rows = Array.from(this._missing.values(), (row) => ({
+        hashHex: row.hash,
+        stage: row.stage,
+        count: row.hitCount,
+      }));
+
+      rows.sort(
+        (a, b) =>
+          b.count - a.count ||
+          (a.hashHex < b.hashHex ? -1 : a.hashHex > b.hashHex ? 1 : 0) ||
+          (a.stage < b.stage ? -1 : a.stage > b.stage ? 1 : 0)
+      );
+
+      return rows.slice(0, resolvedLimit);
+    }
+
+    /**
      * Aggregate lookup / missing-shader telemetry.
      */
     getStats() {
       const uniqueMissing = this._missing.size;
       const total = this._stats.totalLookups;
+      const hitRatio = total > 0 ? this._stats.packHits / total : 0;
       const hitRatePct =
-        total > 0 ? Math.round((this._stats.packHits / total) * 10000) / 100 : 0;
+        total > 0 ? Math.round(hitRatio * 10000) / 100 : 0;
       return {
         totalLookups: this._stats.totalLookups,
         packHits: this._stats.packHits,
@@ -724,7 +776,9 @@
         builtinHits: this._stats.builtinHits,
         uniqueMissing,
         overflowMissingCount: this._overflowMissingCount,
+        overflowMissingHashes: this._overflowMissingCount,
         hitRatePct,
+        hitRatio,
       };
     }
 
@@ -750,6 +804,8 @@
     BUILTIN_FALLBACK_PROFILES,
     DEFAULT_ENTRY_POINTS,
     DEFAULT_MAX_TRACKED_MISSING,
+    DEFAULT_MAX_TRACKED_MISSING_HASHES,
+    DEFAULT_TOP_MISSING_LIMIT,
     normalizeShaderHash,
     formatShaderHash,
     normalizeStage,
