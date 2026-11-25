@@ -36,7 +36,9 @@
   });
 
   const U64_MAX = 0xffffffffffffffffn;
+  const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
   const DEFAULT_MAX_TRACKED_MISSING = 512;
+  const DEFAULT_MAX_MISSING_HASHES = 512;
   const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
   const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 8192;
   const DEFAULT_MAX_RESOLVE_CACHE_ENTRIES = 8192;
@@ -899,6 +901,7 @@
      *   fallbackHashes?: Record<string, bigint | string | number> | null,
      *   maxTrackedMissingHashes?: number,
      *   maxTrackedMissing?: number,
+     *   maxMissingHashes?: number,
      *   maxCategorizedMissingHashes?: number,
      *   maxResolveCacheEntries?: number,
      *   maxCompileFailureEntries?: number,
@@ -943,6 +946,17 @@
         hasExplicitLegacyCap = true;
       }
       this._maxTrackedMissing = maxTracked;
+
+      let maxMissingHashes = DEFAULT_MAX_MISSING_HASHES;
+      if (opts.maxMissingHashes !== undefined) {
+        if (!Number.isInteger(opts.maxMissingHashes) || opts.maxMissingHashes < 0) {
+          throw new RangeError(
+            `maxMissingHashes must be a non-negative integer, got ${opts.maxMissingHashes}`
+          );
+        }
+        maxMissingHashes = opts.maxMissingHashes;
+      }
+      this._maxMissingHashes = maxMissingHashes;
 
       let maxCategorized = hasExplicitLegacyCap
         ? maxTracked
@@ -1003,10 +1017,17 @@
       this._overflowMissingCount = 0;
       this._telemetryGeneration = 0;
 
-      // W204: Fast-path per-stage resolved-hash memoization (zero temporary objects on cache hits).
+      // W304: Bounded sanitized missing/fallback shader frequency table keyed by u64 BigInt
+      // for S47 `playgta6-shaders pack-rdna2 --priority-hashes` export.
+      this._missingPriorityHashes = new Map();
+      this._missingPrioritySeq = 0;
+      this._missingPriorityEvictions = 0;
+
+      // W204/W304: Fast-path per-stage resolved-hash memoization (zero temporary objects / zero hex formatting on cache hits).
       this._resolveCacheByStage = [null, new Map(), new Map(), new Map()];
       this._resolveCacheEntries = new Map();
       this._resolveCacheHits = 0;
+      this._fastPathHits = 0;
       this._resolveCacheMisses = 0;
       this._resolveCacheInvalidations = 0;
       this._packStampVersion = undefined;
@@ -1139,6 +1160,9 @@
       if (entry.key3 !== undefined && stageCache.get(entry.key3) === entry) {
         stageCache.delete(entry.key3);
       }
+      if (entry.key4 !== undefined && stageCache.get(entry.key4) === entry) {
+        stageCache.delete(entry.key4);
+      }
       this._resolveCacheEntries.delete(entry);
     }
 
@@ -1165,7 +1189,7 @@
         return null;
       }
 
-      const existing = this._compileFailures.get(hashHex);
+      const existing = this._compileFailures.get(hashBigInt);
       if (existing !== undefined) {
         existing.count += 1;
         existing.reason = sanitizedReason;
@@ -1174,8 +1198,8 @@
         }
         existing.lastSeenMs = nowMs;
         // Refresh LRU position (move to tail of Map).
-        this._compileFailures.delete(hashHex);
-        this._compileFailures.set(hashHex, existing);
+        this._compileFailures.delete(hashBigInt);
+        this._compileFailures.set(hashBigInt, existing);
         return existing;
       }
 
@@ -1187,6 +1211,7 @@
       }
 
       const entry = {
+        hashBigInt,
         hashHex,
         stage: stageName,
         reason: sanitizedReason,
@@ -1194,7 +1219,7 @@
         firstSeenMs: nowMs,
         lastSeenMs: nowMs,
       };
-      this._compileFailures.set(hashHex, entry);
+      this._compileFailures.set(hashBigInt, entry);
       return entry;
     }
 
@@ -1275,14 +1300,14 @@
       if (hash === null || hash === undefined || hash === '') {
         return false;
       }
-      const hashHex = formatShaderHash(normalizeShaderHash(hash));
-      const entry = this._compileFailures.get(hashHex);
+      const hashBigInt = normalizeShaderHash(hash);
+      const entry = this._compileFailures.get(hashBigInt);
       if (entry === undefined) {
         return false;
       }
       // Refresh LRU recency (move to tail of Map).
-      this._compileFailures.delete(hashHex);
-      this._compileFailures.set(hashHex, entry);
+      this._compileFailures.delete(hashBigInt);
+      this._compileFailures.set(hashBigInt, entry);
       this._compileFailureCacheHits += 1;
       return true;
     }
@@ -1305,8 +1330,8 @@
       if (hash === null || hash === undefined || hash === '') {
         return null;
       }
-      const hashHex = formatShaderHash(normalizeShaderHash(hash));
-      const entry = this._compileFailures.get(hashHex);
+      const hashBigInt = normalizeShaderHash(hash);
+      const entry = this._compileFailures.get(hashBigInt);
       if (entry === undefined) {
         return null;
       }
@@ -1331,12 +1356,13 @@
         return false;
       }
       const hashBigInt = normalizeShaderHash(hash);
-      const hashHex = formatShaderHash(hashBigInt);
-      const removed = this._compileFailures.delete(hashHex);
-      if (removed) {
-        this._evictResolveCacheForHash(hashBigInt, hashHex);
+      const existing = this._compileFailures.get(hashBigInt);
+      if (existing === undefined) {
+        return false;
       }
-      return removed;
+      this._compileFailures.delete(hashBigInt);
+      this._evictResolveCacheForHash(hashBigInt, existing.hashHex);
+      return true;
     }
 
     /**
@@ -1375,7 +1401,8 @@
       source,
       profile,
       missingRow,
-      categorizedRow
+      categorizedRow,
+      priorityRow
     ) {
       if (this._maxResolveCacheEntries <= 0) {
         return;
@@ -1397,6 +1424,9 @@
       const key1 = hashBigInt;
       const key2 = hashHex;
       const key3 = rawHash !== key1 && rawHash !== key2 ? rawHash : undefined;
+      const numericKey =
+        hashBigInt <= MAX_SAFE_INTEGER_BIGINT ? Number(hashBigInt) : undefined;
+      const key4 = numericKey !== undefined && numericKey !== key3 ? numericKey : undefined;
 
       const entry = {
         stageCode,
@@ -1408,16 +1438,21 @@
         result,
         missingRow,
         categorizedRow,
+        priorityRow: priorityRow !== undefined ? priorityRow : null,
         telemetryGeneration: this._telemetryGeneration,
         key1,
         key2,
         key3,
+        key4,
       };
 
       stageCache.set(key1, entry);
       stageCache.set(key2, entry);
       if (key3 !== undefined) {
         stageCache.set(key3, entry);
+      }
+      if (key4 !== undefined) {
+        stageCache.set(key4, entry);
       }
       this._resolveCacheEntries.set(entry, entry);
     }
@@ -1932,14 +1967,33 @@
           opts.reason !== undefined ||
           opts.missingReason !== undefined);
 
-      // W204 Fast Path: zero temporary object allocations on cache hits.
+      // W204/W304 Fast Path: zero-alloc O(1) BigInt/numeric/canonical-hex routing (no hex formatting).
+      let requested;
+      let hasRequested = false;
       if (!hasSpecialOpts && this._maxResolveCacheEntries > 0) {
-        const cached = this._resolveCacheByStage[stageCode].get(hash);
+        const stageCache = this._resolveCacheByStage[stageCode];
+        let cached = stageCache.get(hash);
+        if (cached === undefined) {
+          requested = normalizeShaderHash(hash);
+          hasRequested = true;
+          cached = stageCache.get(requested);
+          if (
+            cached !== undefined &&
+            cached.key3 === undefined &&
+            hash !== cached.key1 &&
+            hash !== cached.key2 &&
+            hash !== cached.key4
+          ) {
+            cached.key3 = hash;
+            stageCache.set(hash, cached);
+          }
+        }
         if (cached !== undefined) {
           if (cached.source === 'pack') {
             this._stats.totalLookups += 1;
             this._stats.packHits += 1;
             this._resolveCacheHits += 1;
+            this._fastPathHits += 1;
             return cached.result;
           }
           if (cached.source === 'fallback') {
@@ -1950,6 +2004,7 @@
             this._stats.totalLookups += 1;
             this._stats.fallbackHits += 1;
             this._resolveCacheHits += 1;
+            this._fastPathHits += 1;
             this._recordCachedMissHit(cached, this._now(), frame);
             return cached.result;
           }
@@ -1968,6 +2023,7 @@
               this._stats.totalLookups += 1;
               this._stats.builtinHits += 1;
               this._resolveCacheHits += 1;
+              this._fastPathHits += 1;
               this._recordCachedMissHit(cached, this._now(), frame);
               return cached.result;
             }
@@ -1975,8 +2031,9 @@
         }
       }
 
-      const requested = normalizeShaderHash(hash);
-      const requestedHex = formatShaderHash(requested);
+      if (!hasRequested) {
+        requested = normalizeShaderHash(hash);
+      }
       const frame =
         opts !== null && opts.frame !== undefined && opts.frame !== null
           ? normalizeFrameNumber(opts.frame)
@@ -1996,15 +2053,18 @@
 
       // W268: Negative compile-failure cache — skip retrying known-broken hashes and
       // route straight to the deterministic fallback shader without spamming Tint errors.
+      // Keyed by u64 BigInt (W304) so repeated BigInt/numeric lookups avoid hex string formatting.
       const compileFailureEntry =
-        this._compileFailures.size > 0 ? this._compileFailures.get(requestedHex) : undefined;
+        this._compileFailures.size > 0 ? this._compileFailures.get(requested) : undefined;
       if (compileFailureEntry !== undefined) {
-        this._compileFailures.delete(requestedHex);
-        this._compileFailures.set(requestedHex, compileFailureEntry);
+        this._compileFailures.delete(requested);
+        this._compileFailures.set(requested, compileFailureEntry);
         this._compileFailureCacheHits += 1;
 
+        const requestedHex = compileFailureEntry.hashHex;
         const nowMs = this._now();
         this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
+        this._trackMissingPriorityHash(requested, requestedHex, stageCode, stageName, nowMs);
         const failReason =
           opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
             ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
@@ -2012,23 +2072,21 @@
         this._recordCategorizedMissingRow(requestedHex, stageName, failReason, nowMs);
 
         const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
-        if (fallbackHash !== null) {
+        if (fallbackHash !== null && !this._compileFailures.has(fallbackHash)) {
           const resolvedHex = formatShaderHash(fallbackHash);
-          if (!this._compileFailures.has(resolvedHex)) {
-            const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
-            if (fallbackHit) {
-              this._stats.fallbackHits += 1;
-              return Object.freeze({
-                wgsl: fallbackHit.wgsl,
-                source: 'fallback',
-                requestedHash: requestedHex,
-                resolvedHash: resolvedHex,
-                stage: stageName,
-                entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
-                compileFailureCached: true,
-                compileFailureReason: compileFailureEntry.reason,
-              });
-            }
+          const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
+          if (fallbackHit) {
+            this._stats.fallbackHits += 1;
+            return Object.freeze({
+              wgsl: fallbackHit.wgsl,
+              source: 'fallback',
+              requestedHash: requestedHex,
+              resolvedHash: resolvedHex,
+              stage: stageName,
+              entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
+              compileFailureCached: true,
+              compileFailureReason: compileFailureEntry.reason,
+            });
           }
         }
 
@@ -2047,6 +2105,8 @@
           compileFailureReason: compileFailureEntry.reason,
         });
       }
+
+      const requestedHex = formatShaderHash(requested);
 
       const exact = lookupPackSource(this._packLoader, requested, requestedHex);
       if (exact) {
@@ -2082,6 +2142,7 @@
             requestedHex,
             result,
             'pack',
+            null,
             null,
             null,
             null
@@ -2170,8 +2231,9 @@
         }
       }
 
-      // Exact miss — record Frame-1 & categorized missing-shader telemetry in O(1).
+      // Exact miss — record Frame-1, categorized, and W304 priority-hash telemetry in O(1).
       const missingRow = this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
+      const priorityRow = this._trackMissingPriorityHash(requested, requestedHex, stageCode, stageName, nowMs);
       const missReason =
         opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
           ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
@@ -2181,36 +2243,35 @@
       const canCacheMiss = !hasSpecialOpts && !isPendingRangedPackShader(this._packLoader, requested);
 
       const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
-      if (fallbackHash !== null) {
+      if (fallbackHash !== null && !this._compileFailures.has(fallbackHash)) {
         const resolvedHex = formatShaderHash(fallbackHash);
-        if (!this._compileFailures.has(resolvedHex)) {
-          const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
-          if (fallbackHit) {
-            this._stats.fallbackHits += 1;
-            const result = Object.freeze({
-              wgsl: fallbackHit.wgsl,
-              source: 'fallback',
-              requestedHash: requestedHex,
-              resolvedHash: resolvedHex,
-              stage: stageName,
-              entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
-            });
-            if (canCacheMiss) {
-              this._storeResolveCache(
-                stageCode,
-                stageName,
-                hash,
-                requested,
-                requestedHex,
-                result,
-                'fallback',
-                null,
-                missingRow,
-                categorizedRow
-              );
-            }
-            return result;
+        const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
+        if (fallbackHit) {
+          this._stats.fallbackHits += 1;
+          const result = Object.freeze({
+            wgsl: fallbackHit.wgsl,
+            source: 'fallback',
+            requestedHash: requestedHex,
+            resolvedHash: resolvedHex,
+            stage: stageName,
+            entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
+          });
+          if (canCacheMiss) {
+            this._storeResolveCache(
+              stageCode,
+              stageName,
+              hash,
+              requested,
+              requestedHex,
+              result,
+              'fallback',
+              null,
+              missingRow,
+              categorizedRow,
+              priorityRow
+            );
           }
+          return result;
         }
       }
 
@@ -2237,7 +2298,8 @@
           'builtin',
           profileName,
           missingRow,
-          categorizedRow
+          categorizedRow,
+          priorityRow
         );
       }
       return result;
@@ -2257,6 +2319,24 @@
           }
         } else {
           this._overflowMissingCount += 1;
+        }
+
+        const pRow = cached.priorityRow;
+        if (pRow !== null && !pRow.evicted) {
+          pRow.hitCount += 1;
+          pRow.stageMask |= 1 << cached.stageCode;
+          pRow.lastStage = cached.stageName;
+          pRow.lastSeenMs = nowMs;
+          this._missingPrioritySeq += 1;
+          pRow.lastSeenSeq = this._missingPrioritySeq;
+        } else if (this._maxMissingHashes > 0) {
+          cached.priorityRow = this._trackMissingPriorityHash(
+            cached.hashBigInt,
+            cached.hashHex,
+            cached.stageCode,
+            cached.stageName,
+            nowMs
+          );
         }
 
         this._categorizedTotals.total += 1;
@@ -2283,6 +2363,13 @@
         nowMs,
         frame
       );
+      cached.priorityRow = this._trackMissingPriorityHash(
+        cached.hashBigInt,
+        cached.hashHex,
+        cached.stageCode,
+        cached.stageName,
+        nowMs
+      );
       cached.categorizedRow = this._recordCategorizedMissingRow(
         cached.hashHex,
         cached.stageName,
@@ -2290,6 +2377,60 @@
         nowMs
       );
       cached.telemetryGeneration = this._telemetryGeneration;
+    }
+
+    _trackMissingPriorityHash(hashBigInt, hashHex, stageCode, stageName, nowMs) {
+      if (this._maxMissingHashes <= 0) {
+        return null;
+      }
+
+      const existing = this._missingPriorityHashes.get(hashBigInt);
+      if (existing !== undefined) {
+        existing.hitCount += 1;
+        if (stageCode > 0) {
+          existing.stageMask |= 1 << stageCode;
+          existing.lastStage = stageName;
+        }
+        existing.lastSeenMs = nowMs;
+        this._missingPrioritySeq += 1;
+        existing.lastSeenSeq = this._missingPrioritySeq;
+        return existing;
+      }
+
+      if (this._missingPriorityHashes.size >= this._maxMissingHashes) {
+        let victimKey;
+        let victimRow = null;
+        for (const [k, row] of this._missingPriorityHashes.entries()) {
+          if (
+            victimRow === null ||
+            row.hitCount < victimRow.hitCount ||
+            (row.hitCount === victimRow.hitCount && row.lastSeenSeq < victimRow.lastSeenSeq)
+          ) {
+            victimKey = k;
+            victimRow = row;
+          }
+        }
+        if (victimRow !== null) {
+          victimRow.evicted = true;
+          this._missingPriorityHashes.delete(victimKey);
+          this._missingPriorityEvictions += 1;
+        }
+      }
+
+      this._missingPrioritySeq += 1;
+      const row = {
+        hashBigInt,
+        hashHex,
+        hitCount: 1,
+        stageMask: stageCode > 0 ? 1 << stageCode : 0,
+        lastStage: stageName,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+        lastSeenSeq: this._missingPrioritySeq,
+        evicted: false,
+      };
+      this._missingPriorityHashes.set(hashBigInt, row);
+      return row;
     }
 
     _trackMissing(hashBigInt, hashHex, stageCode, stageName, nowMs, frame) {
@@ -2403,9 +2544,11 @@
     recordMissingShader(hashHex, stage, reason = MISSING_SHADER_REASONS.OTHER) {
       const hashBigInt = normalizeShaderHash(hashHex);
       const canonicalHash = formatShaderHash(hashBigInt);
-      const stageName = normalizeStage(stage);
+      const stageCode = normalizeStageCode(stage);
+      const stageName = STAGE_NAMES[stageCode];
       const canonicalReason = normalizeMissingReason(reason);
       const nowMs = this._now();
+      this._trackMissingPriorityHash(hashBigInt, canonicalHash, stageCode, stageName, nowMs);
       if (canonicalReason === MISSING_SHADER_REASONS.COMPILE_FAILED) {
         this._recordCompileFailureEntry(
           hashBigInt,
@@ -2640,6 +2783,111 @@
     }
 
     /**
+     * Return the bounded sanitized frequency list of missing/fallback shader hashes
+     * sorted by descending `hitCount`, breaking ties deterministically by ascending `hash`
+     * (`0x<16-hex>`). Ready for Main Menu / In-Game shader completeness triage and S47 export.
+     *
+     * @param {number | { limit?: number | null } | null} [optionsOrLimit]
+     * @returns {Array<{
+     *   hash: string,
+     *   hashHex: string,
+     *   hitCount: number,
+     *   stage: 'vertex' | 'fragment' | 'compute' | null,
+     *   stages: Array<'vertex' | 'fragment' | 'compute'>,
+     *   firstSeenMs: number,
+     *   lastSeenMs: number,
+     * }>}
+     */
+    getMissingShaderPriorityList(optionsOrLimit) {
+      let limit = this._missingPriorityHashes.size;
+      if (typeof optionsOrLimit === 'number') {
+        limit = optionsOrLimit;
+      } else if (optionsOrLimit !== undefined && optionsOrLimit !== null) {
+        if (typeof optionsOrLimit !== 'object') {
+          throw new RangeError(
+            `options must be an object or non-negative integer limit, got ${optionsOrLimit}`
+          );
+        }
+        if (optionsOrLimit.limit !== undefined && optionsOrLimit.limit !== null) {
+          limit = optionsOrLimit.limit;
+        }
+      }
+      if (!Number.isInteger(limit) || limit < 0) {
+        throw new RangeError(`limit must be a non-negative integer, got ${limit}`);
+      }
+      if (limit === 0 || this._missingPriorityHashes.size === 0) {
+        return [];
+      }
+
+      const rows = Array.from(this._missingPriorityHashes.values());
+      rows.sort((a, b) => {
+        if (a.hitCount !== b.hitCount) {
+          return b.hitCount - a.hitCount;
+        }
+        return a.hashHex < b.hashHex ? -1 : a.hashHex > b.hashHex ? 1 : 0;
+      });
+
+      const count = limit < rows.length ? limit : rows.length;
+      const out = new Array(count);
+      for (let i = 0; i < count; i += 1) {
+        const row = rows[i];
+        const stages = [];
+        if (row.stageMask & (1 << SHADER_STAGE.VERTEX)) stages.push('vertex');
+        if (row.stageMask & (1 << SHADER_STAGE.FRAGMENT)) stages.push('fragment');
+        if (row.stageMask & (1 << SHADER_STAGE.COMPUTE)) stages.push('compute');
+        out[i] = {
+          hash: row.hashHex,
+          hashHex: row.hashHex,
+          hitCount: row.hitCount,
+          stage: row.lastStage,
+          stages,
+          firstSeenMs: row.firstSeenMs,
+          lastSeenMs: row.lastSeenMs,
+        };
+      }
+      return out;
+    }
+
+    /**
+     * Format the missing/fallback shader priority table as `# header` + `0x<16-hex>` lines
+     * directly consumable by `playgta6-shaders pack-rdna2 --priority-hashes` (S47).
+     * Strictly sanitized: contains only `#` header metadata and canonical 64-bit hex hashes.
+     *
+     * @param {number | { limit?: number | null, includeHitComments?: boolean } | null} [optionsOrLimit]
+     * @returns {string}
+     */
+    exportPriorityHashesText(optionsOrLimit) {
+      let includeHitComments = false;
+      if (
+        optionsOrLimit !== undefined &&
+        optionsOrLimit !== null &&
+        typeof optionsOrLimit === 'object'
+      ) {
+        includeHitComments = optionsOrLimit.includeHitComments === true;
+      }
+
+      const list = this.getMissingShaderPriorityList(optionsOrLimit);
+      let totalHits = 0;
+      for (let i = 0; i < list.length; i += 1) {
+        totalHits += list[i].hitCount;
+      }
+
+      const lines = [
+        '# playgta6-shaders pack-rdna2 --priority-hashes (W304/S47)',
+        `# unique_hashes=${list.length} total_hits=${totalHits}`,
+      ];
+      for (let i = 0; i < list.length; i += 1) {
+        const entry = list[i];
+        if (includeHitComments) {
+          lines.push(`${entry.hash} # hits=${entry.hitCount}`);
+        } else {
+          lines.push(entry.hash);
+        }
+      }
+      return `${lines.join('\n')}\n`;
+    }
+
+    /**
      * Aggregate lookup / missing-shader telemetry.
      */
     getStats() {
@@ -2654,6 +2902,8 @@
         fallbackHits: this._stats.fallbackHits,
         builtinHits: this._stats.builtinHits,
         uniqueMissing,
+        missingUniqueHashes: this._missingPriorityHashes.size,
+        fastPathHits: this._fastPathHits,
         overflowMissingCount: this._overflowMissingCount,
         overflowMissingHashes: this._overflowMissingCount,
         hitRatePct,
@@ -2665,7 +2915,8 @@
     }
 
     /**
-     * Clear tracked missing-shader maps, categorized missing telemetry, and overflow counters.
+     * Clear tracked missing-shader maps, categorized missing telemetry, priority hash table,
+     * and overflow counters.
      * Preserves configured `packLoader`, `fallbackHashes`, registered real shaders,
      * lookup hit counters, and memoized shader resolutions.
      */
@@ -2677,6 +2928,10 @@
       this._overflowMissingCount = 0;
       this._telemetryGeneration += 1;
 
+      this._missingPriorityHashes.clear();
+      this._missingPrioritySeq = 0;
+      this._missingPriorityEvictions = 0;
+
       this._categorizedMissing.clear();
       this._categorizedOverflowCount = 0;
       this._categorizedTotals.total = 0;
@@ -2685,8 +2940,8 @@
     }
 
     /**
-     * Clear missing-shader telemetry, categorized summary, guard counters, negative
-     * compile-failure cache, and lookup counters.
+     * Clear missing-shader telemetry, categorized summary, priority hash table, guard counters,
+     * negative compile-failure cache, and lookup counters.
      * Preserves configured `packLoader`, `fallbackHashes`, and registered real shaders.
      */
     reset() {
@@ -2697,6 +2952,7 @@
       this._stats.builtinHits = 0;
 
       this._resolveCacheHits = 0;
+      this._fastPathHits = 0;
       this._resolveCacheMisses = 0;
 
       this._blockedOverrides.clear();
@@ -2713,7 +2969,7 @@
 
     /**
      * Alias for `reset()` that resets lookup counters, missing-shader telemetry,
-     * and compile-failure cache statistics.
+     * priority hash table, and compile-failure cache statistics.
      */
     resetStats() {
       this.reset();
@@ -2730,6 +2986,7 @@
     BUILTIN_FALLBACK_PROFILES,
     DEFAULT_ENTRY_POINTS,
     DEFAULT_MAX_TRACKED_MISSING,
+    DEFAULT_MAX_MISSING_HASHES,
     DEFAULT_MAX_TRACKED_MISSING_HASHES,
     DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
     DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
