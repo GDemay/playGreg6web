@@ -5,7 +5,9 @@
   const DEFAULT_CHANNELS = 2;
   const DEFAULT_SMOOTHING_FRAMES = 64;
   const DEFAULT_DECLICK_FRAMES = 32;
+  const DEFAULT_FADE_IN_FRAMES = DEFAULT_DECLICK_FRAMES;
   const MAX_DECLICK_FRAMES = 4096;
+  const DEFAULT_SAMPLE_CLAMP_LIMIT = 1.0;
   const MAX_TRACKED_CHANNELS = 32;
 
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
@@ -47,6 +49,19 @@
     if (n < 0) return fallback;
     if (n > MAX_DECLICK_FRAMES) return MAX_DECLICK_FRAMES;
     return n;
+  }
+
+  function sanitizeClampLimit(value, fallback) {
+    if (value === true) {
+      return DEFAULT_SAMPLE_CLAMP_LIMIT;
+    }
+    if (value === false || value === null || value === 0) {
+      return 0.0;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return fallback;
+    }
+    return value;
   }
 
   const BaseAudioWorkletProcessor =
@@ -92,22 +107,50 @@
           : procOpts.underrunFadeFrames;
       this._declickFrames = sanitizeDeclickFrames(rawDeclick, 0);
 
+      const rawFadeIn =
+        procOpts.fadeInFrames !== undefined
+          ? procOpts.fadeInFrames
+          : procOpts.recoveryFadeFrames;
+      this._fadeInFramesOverride =
+        rawFadeIn !== undefined && rawFadeIn !== null
+          ? sanitizeDeclickFrames(rawFadeIn, -1)
+          : -1;
+
+      let clampLimit = 0.0;
+      const rawClampLimit =
+        procOpts.sampleClampLimit !== undefined
+          ? procOpts.sampleClampLimit
+          : procOpts.clampLimit;
+      if (rawClampLimit !== undefined) {
+        clampLimit = sanitizeClampLimit(rawClampLimit, 0.0);
+      } else if (procOpts.clampSamples !== undefined) {
+        clampLimit = sanitizeClampLimit(procOpts.clampSamples, 0.0);
+      }
+      this._clampLimit = clampLimit;
+
       this._targetGain = this._muted ? 0.0 : this._gain;
       this._currentGain = this._targetGain;
       this._rampStep = 0.0;
       this._rampRemaining = 0;
 
-      // Pre-allocated fixed-size per-channel sample history for zero-GC underrun de-click fade-out.
+      // Pre-allocated fixed-size per-channel sample history for zero-GC underrun fade-out & recovery fade-in.
       this._lastSamples = new Float32Array(MAX_TRACKED_CHANNELS);
+      this._fadeInFrom = new Float32Array(MAX_TRACKED_CHANNELS);
       this._hasActiveAudio = false;
+      this._inUnderrun = false;
       this._declickPos = 0;
       this._declickTotal = 0;
       this._declickFadeOuts = 0;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._fadeInHasOffset = false;
+      this._fadeInCount = 0;
 
       this._stopped = false;
       this._processedQuanta = 0;
       this._processedFrames = 0;
       this._sanitizedSamples = 0;
+      this._clampedSamples = 0;
       this._underruns = 0;
       this._underrunFrames = 0;
 
@@ -134,6 +177,18 @@
       return this._sanitizedSamples;
     }
 
+    get clampedSamples() {
+      return this._clampedSamples;
+    }
+
+    get clampSamples() {
+      return this._clampLimit > 0.0;
+    }
+
+    get clampLimit() {
+      return this._clampLimit;
+    }
+
     get underruns() {
       return this._ctrl ? Atomics.load(this._ctrl, HDR_UNDERRUNS) : this._underruns;
     }
@@ -146,8 +201,20 @@
       return this._declickFrames;
     }
 
+    get fadeInFrames() {
+      return this._fadeInFramesOverride >= 0 ? this._fadeInFramesOverride : this._declickFrames;
+    }
+
     get fadeOutCount() {
       return this._declickFadeOuts;
+    }
+
+    get fadeInCount() {
+      return this._fadeInCount;
+    }
+
+    get inUnderrun() {
+      return this._inUnderrun;
     }
 
     setDeclickFrames(frames) {
@@ -156,14 +223,43 @@
         this._declickPos = 0;
         this._declickTotal = 0;
       }
+      if (this.fadeInFrames === 0) {
+        this._fadeInPos = 0;
+        this._fadeInTotal = 0;
+        this._fadeInHasOffset = false;
+      }
       return this._declickFrames;
+    }
+
+    setFadeInFrames(frames) {
+      if (frames === null || frames === undefined) {
+        this._fadeInFramesOverride = -1;
+      } else {
+        this._fadeInFramesOverride = sanitizeDeclickFrames(frames, this._fadeInFramesOverride);
+      }
+      if (this.fadeInFrames === 0) {
+        this._fadeInPos = 0;
+        this._fadeInTotal = 0;
+        this._fadeInHasOffset = false;
+      }
+      return this.fadeInFrames;
+    }
+
+    setClampSamples(enabledOrLimit) {
+      this._clampLimit = sanitizeClampLimit(enabledOrLimit, this._clampLimit);
+      return this._clampLimit;
     }
 
     _resetDeclickState() {
       this._lastSamples.fill(0);
+      this._fadeInFrom.fill(0);
       this._hasActiveAudio = false;
+      this._inUnderrun = false;
       this._declickPos = 0;
       this._declickTotal = 0;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._fadeInHasOffset = false;
     }
 
     _attachSab(sab) {
@@ -235,13 +331,20 @@
       if (!this._ctrl || this._capacityFrames <= 0) {
         return 0;
       }
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
+      const modulus = this._modulus;
+      let write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
+      let read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
+      if (write < 0 || write >= modulus) {
+        write = ((write % modulus) + modulus) % modulus;
+      }
+      if (read < 0 || read >= modulus) {
+        read = ((read % modulus) + modulus) % modulus;
+      }
       let used = write - read;
       if (used < 0) {
-        used += this._modulus;
+        used += modulus;
       }
-      return used;
+      return used > this._capacityFrames ? this._capacityFrames : used;
     }
 
     getStats() {
@@ -255,12 +358,17 @@
         currentGain: this._currentGain,
         targetGain: this._targetGain,
         declickFrames: this._declickFrames,
+        fadeInFrames: this.fadeInFrames,
+        clampSamples: this._clampLimit > 0.0,
+        clampLimit: this._clampLimit,
         capacityFrames: this._capacityFrames,
         channels: this._channels,
         bufferedFrames: this._computeBufferedFrames(),
         underruns: ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : this._underruns,
         underrunFrames: ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames,
+        inUnderrun: this._inUnderrun,
         fadeOutCount: this._declickFadeOuts,
+        fadeInCount: this._fadeInCount,
         overflows,
         overruns: overflows,
         droppedFrames: ctrl ? Atomics.load(ctrl, HDR_DROPPED_FRAMES) : 0,
@@ -268,6 +376,7 @@
         processedFrames: this._processedFrames,
         framesProcessed: this._processedFrames,
         sanitizedSamples: this._sanitizedSamples,
+        clampedSamples: this._clampedSamples,
       };
     }
 
@@ -336,6 +445,49 @@
           break;
         }
 
+        case 'setFadeInFrames':
+        case 'setRecoveryFadeFrames': {
+          const raw =
+            msg.fadeInFrames !== undefined
+              ? msg.fadeInFrames
+              : msg.recoveryFadeFrames !== undefined
+                ? msg.recoveryFadeFrames
+                : msg.frames;
+          this.setFadeInFrames(raw);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'fadeInFrames',
+              fadeInFrames: this.fadeInFrames,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
+        case 'setClampSamples':
+        case 'setSampleClamp': {
+          const raw =
+            msg.sampleClampLimit !== undefined
+              ? msg.sampleClampLimit
+              : msg.clampLimit !== undefined
+                ? msg.clampLimit
+                : msg.limit !== undefined
+                  ? msg.limit
+                  : msg.clampSamples !== undefined
+                    ? msg.clampSamples
+                    : msg.enabled;
+          this.setClampSamples(raw);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'clampSamples',
+              clampSamples: this._clampLimit > 0.0,
+              clampLimit: this._clampLimit,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
         case 'stats': {
           const reply = Object.assign({ type: 'stats' }, this.getStats());
           if (msg.id !== undefined) reply.id = msg.id;
@@ -359,9 +511,9 @@
     /**
      * WebAudio AudioWorklet render callback.
      * Strictly zero allocations and lock-free on the hot audio thread.
-     * Sanitizes any non-finite (`NaN`/`±Infinity`) PCM sample to `0.0` and,
-     * when `declickFrames > 0`, applies a short linear fade-out de-click ramp
-     * from the last emitted sample when an underrun begins.
+     * Sanitizes any non-finite (`NaN`/`±Infinity`) PCM sample to `0.0`,
+     * optionally clamps out-of-range finite samples to `[-clampLimit, +clampLimit]`,
+     * and applies short linear de-click fade-out on underrun and fade-in on recovery.
      *
      * @param {Float32Array[][]} _inputs
      * @param {Float32Array[][]} outputs
@@ -374,7 +526,7 @@
         if (hasOutput) {
           const out = outputs[0];
           for (let c = 0; c < out.length; c++) {
-            out[c].fill(0);
+            if (out[c]) out[c].fill(0);
           }
         }
         return false;
@@ -386,7 +538,11 @@
 
       const output = outputs[0];
       const outChannels = output.length;
-      const quantumFrames = output[0].length;
+      const firstChannel = output[0];
+      if (!firstChannel) {
+        return true;
+      }
+      const quantumFrames = firstChannel.length;
       if (quantumFrames <= 0) {
         return true;
       }
@@ -404,8 +560,14 @@
       const inChannels = this._channels;
       const modulus = this._modulus;
 
-      const read = Atomics.load(ctrl, HDR_READ_CURSOR);
-      const write = Atomics.load(ctrl, HDR_WRITE_CURSOR);
+      let read = Atomics.load(ctrl, HDR_READ_CURSOR);
+      let write = Atomics.load(ctrl, HDR_WRITE_CURSOR);
+      if (read < 0 || read >= modulus) {
+        read = ((read % modulus) + modulus) % modulus;
+      }
+      if (write < 0 || write >= modulus) {
+        write = ((write % modulus) + modulus) % modulus;
+      }
       let used = write - read;
       if (used < 0) {
         used += modulus;
@@ -418,8 +580,46 @@
       const lastSamples = this._lastSamples;
       const trackedChannels =
         outChannels < lastSamples.length ? outChannels : lastSamples.length;
+      const clampLimit = this._clampLimit;
+      const negClampLimit = -clampLimit;
 
       if (framesToRead > 0) {
+        const wasInUnderrun = this._inUnderrun;
+        const wasMidFadeOut = this._declickTotal > 0;
+        const fadeInFrames =
+          this._fadeInFramesOverride >= 0 ? this._fadeInFramesOverride : this._declickFrames;
+
+        if (wasInUnderrun) {
+          this._inUnderrun = false;
+          if (fadeInFrames > 0) {
+            if (wasMidFadeOut) {
+              const prevScale = (this._declickTotal - this._declickPos) / this._declickTotal;
+              const fadeInFrom = this._fadeInFrom;
+              let hasOffset = false;
+              for (let c = 0; c < trackedChannels; c++) {
+                const prevVal = lastSamples[c] * prevScale;
+                fadeInFrom[c] = prevVal;
+                if (prevVal !== 0.0) {
+                  hasOffset = true;
+                }
+              }
+              for (let c = trackedChannels; c < fadeInFrom.length; c++) {
+                fadeInFrom[c] = 0.0;
+              }
+              this._fadeInHasOffset = hasOffset;
+            } else {
+              this._fadeInHasOffset = false;
+            }
+            this._fadeInPos = 0;
+            this._fadeInTotal = fadeInFrames;
+            this._fadeInCount++;
+          } else {
+            this._fadeInPos = 0;
+            this._fadeInTotal = 0;
+            this._fadeInHasOffset = false;
+          }
+        }
+
         // Fresh audio arrived: cancel any in-flight cross-quantum underrun fade-out.
         this._declickPos = 0;
         this._declickTotal = 0;
@@ -429,6 +629,7 @@
         const secondFrames = framesToRead - firstFrames;
         const copyChannels = inChannels < outChannels ? inChannels : outChannels;
         let sanitized = 0;
+        let clamped = 0;
 
         if (this._rampRemaining > 0) {
           // Smooth linear gain ramp (click-free volume/mute transition).
@@ -452,10 +653,26 @@
               if (sL - sL !== 0) {
                 sL = 0.0;
                 sanitized++;
+              } else if (clampLimit > 0.0) {
+                if (sL > clampLimit) {
+                  sL = clampLimit;
+                  clamped++;
+                } else if (sL < negClampLimit) {
+                  sL = negClampLimit;
+                  clamped++;
+                }
               }
               if (sR - sR !== 0) {
                 sR = 0.0;
                 sanitized++;
+              } else if (clampLimit > 0.0) {
+                if (sR > clampLimit) {
+                  sR = clampLimit;
+                  clamped++;
+                } else if (sR < negClampLimit) {
+                  sR = negClampLimit;
+                  clamped++;
+                }
               }
               if (gain === 0.0) {
                 outL[f] = 0.0;
@@ -480,10 +697,26 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sL > clampLimit) {
+                    sL = clampLimit;
+                    clamped++;
+                  } else if (sL < negClampLimit) {
+                    sL = negClampLimit;
+                    clamped++;
+                  }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sR > clampLimit) {
+                    sR = clampLimit;
+                    clamped++;
+                  } else if (sR < negClampLimit) {
+                    sR = negClampLimit;
+                    clamped++;
+                  }
                 }
                 if (gain === 0.0) {
                   outL[dst] = 0.0;
@@ -507,6 +740,14 @@
               if (s - s !== 0) {
                 s = 0.0;
                 sanitized++;
+              } else if (clampLimit > 0.0) {
+                if (s > clampLimit) {
+                  s = clampLimit;
+                  clamped++;
+                } else if (s < negClampLimit) {
+                  s = negClampLimit;
+                  clamped++;
+                }
               }
               const v = gain === 0.0 ? 0.0 : s * gain;
               for (let c = 0; c < outChannels; c++) {
@@ -527,6 +768,14 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (s > clampLimit) {
+                    s = clampLimit;
+                    clamped++;
+                  } else if (s < negClampLimit) {
+                    s = negClampLimit;
+                    clamped++;
+                  }
                 }
                 const v = gain === 0.0 ? 0.0 : s * gain;
                 for (let c = 0; c < outChannels; c++) {
@@ -548,6 +797,14 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (s > clampLimit) {
+                    s = clampLimit;
+                    clamped++;
+                  } else if (s < negClampLimit) {
+                    s = negClampLimit;
+                    clamped++;
+                  }
                 }
                 output[c][f] = gain === 0.0 ? 0.0 : s * gain;
               }
@@ -570,6 +827,14 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                   output[c][dst] = gain === 0.0 ? 0.0 : s * gain;
                 }
@@ -591,20 +856,28 @@
             for (let c = 0; c < outChannels; c++) {
               output[c].fill(0, 0, framesToRead);
             }
-            // Scan consumed ring samples so sanitizedSamples telemetry stays exact while muted.
+            // Scan consumed ring samples so sanitized/clamped telemetry stays exact while muted.
             const scanChannels = inChannels === 1 ? 1 : copyChannels;
             if (scanChannels === inChannels) {
               const firstCount = firstFrames * inChannels;
               let src = readSlot * inChannels;
               for (let i = 0; i < firstCount; i++) {
                 const s = samples[src + i];
-                if (s - s !== 0) sanitized++;
+                if (s - s !== 0) {
+                  sanitized++;
+                } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                  clamped++;
+                }
               }
               if (secondFrames > 0) {
                 const secondCount = secondFrames * inChannels;
                 for (let i = 0; i < secondCount; i++) {
                   const s = samples[i];
-                  if (s - s !== 0) sanitized++;
+                  if (s - s !== 0) {
+                    sanitized++;
+                  } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                    clamped++;
+                  }
                 }
               }
             } else {
@@ -612,7 +885,11 @@
               for (let f = 0; f < firstFrames; f++) {
                 for (let c = 0; c < scanChannels; c++) {
                   const s = samples[srcBase + c];
-                  if (s - s !== 0) sanitized++;
+                  if (s - s !== 0) {
+                    sanitized++;
+                  } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                    clamped++;
+                  }
                 }
                 srcBase += inChannels;
               }
@@ -621,7 +898,11 @@
                 for (let f = 0; f < secondFrames; f++) {
                   for (let c = 0; c < scanChannels; c++) {
                     const s = samples[srcBase + c];
-                    if (s - s !== 0) sanitized++;
+                    if (s - s !== 0) {
+                      sanitized++;
+                    } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                      clamped++;
+                    }
                   }
                   srcBase += inChannels;
                 }
@@ -638,10 +919,26 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sL > clampLimit) {
+                    sL = clampLimit;
+                    clamped++;
+                  } else if (sL < negClampLimit) {
+                    sL = negClampLimit;
+                    clamped++;
+                  }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sR > clampLimit) {
+                    sR = clampLimit;
+                    clamped++;
+                  } else if (sR < negClampLimit) {
+                    sR = negClampLimit;
+                    clamped++;
+                  }
                 }
                 outL[f] = sL;
                 outR[f] = sR;
@@ -656,10 +953,26 @@
                   if (sL - sL !== 0) {
                     sL = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (sL > clampLimit) {
+                      sL = clampLimit;
+                      clamped++;
+                    } else if (sL < negClampLimit) {
+                      sL = negClampLimit;
+                      clamped++;
+                    }
                   }
                   if (sR - sR !== 0) {
                     sR = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (sR > clampLimit) {
+                      sR = clampLimit;
+                      clamped++;
+                    } else if (sR < negClampLimit) {
+                      sR = negClampLimit;
+                      clamped++;
+                    }
                   }
                   outL[dst] = sL;
                   outR[dst] = sR;
@@ -673,6 +986,14 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (s > clampLimit) {
+                    s = clampLimit;
+                    clamped++;
+                  } else if (s < negClampLimit) {
+                    s = negClampLimit;
+                    clamped++;
+                  }
                 }
                 for (let c = 0; c < outChannels; c++) {
                   output[c][f] = s;
@@ -687,6 +1008,14 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                   for (let c = 0; c < outChannels; c++) {
                     output[c][dst] = s;
@@ -702,6 +1031,14 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                   output[c][f] = s;
                 }
@@ -719,6 +1056,14 @@
                     if (s - s !== 0) {
                       s = 0.0;
                       sanitized++;
+                    } else if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                     output[c][dst] = s;
                   }
@@ -740,10 +1085,26 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sL > clampLimit) {
+                    sL = clampLimit;
+                    clamped++;
+                  } else if (sL < negClampLimit) {
+                    sL = negClampLimit;
+                    clamped++;
+                  }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (sR > clampLimit) {
+                    sR = clampLimit;
+                    clamped++;
+                  } else if (sR < negClampLimit) {
+                    sR = negClampLimit;
+                    clamped++;
+                  }
                 }
                 outL[f] = sL * gain;
                 outR[f] = sR * gain;
@@ -758,10 +1119,26 @@
                   if (sL - sL !== 0) {
                     sL = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (sL > clampLimit) {
+                      sL = clampLimit;
+                      clamped++;
+                    } else if (sL < negClampLimit) {
+                      sL = negClampLimit;
+                      clamped++;
+                    }
                   }
                   if (sR - sR !== 0) {
                     sR = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (sR > clampLimit) {
+                      sR = clampLimit;
+                      clamped++;
+                    } else if (sR < negClampLimit) {
+                      sR = negClampLimit;
+                      clamped++;
+                    }
                   }
                   outL[dst] = sL * gain;
                   outR[dst] = sR * gain;
@@ -775,6 +1152,14 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
+                } else if (clampLimit > 0.0) {
+                  if (s > clampLimit) {
+                    s = clampLimit;
+                    clamped++;
+                  } else if (s < negClampLimit) {
+                    s = negClampLimit;
+                    clamped++;
+                  }
                 }
                 const v = s * gain;
                 for (let c = 0; c < outChannels; c++) {
@@ -790,6 +1175,14 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                   const v = s * gain;
                   for (let c = 0; c < outChannels; c++) {
@@ -806,6 +1199,14 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
+                  } else if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                   output[c][f] = s * gain;
                 }
@@ -823,6 +1224,14 @@
                     if (s - s !== 0) {
                       s = 0.0;
                       sanitized++;
+                    } else if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                     output[c][dst] = s * gain;
                   }
@@ -839,12 +1248,66 @@
         if (sanitized > 0) {
           this._sanitizedSamples += sanitized;
         }
+        if (clamped > 0) {
+          this._clampedSamples += clamped;
+        }
 
         let nextRead = read + framesToRead;
         if (nextRead >= modulus) {
           nextRead -= modulus;
         }
         Atomics.store(ctrl, HDR_READ_CURSOR, nextRead);
+
+        // Apply smooth linear fade-in (or crossfade from interrupted fade-out) on recovery.
+        if (this._fadeInTotal > 0) {
+          const total = this._fadeInTotal;
+          const startPos = this._fadeInPos;
+          const remaining = total - startPos;
+          const rampCount = framesToRead < remaining ? framesToRead : remaining;
+
+          if (this._fadeInHasOffset) {
+            const fadeInFrom = this._fadeInFrom;
+            for (let f = 0; f < rampCount; f++) {
+              const alpha = (startPos + f) / total;
+              if (alpha === 0.0) {
+                for (let c = 0; c < trackedChannels; c++) {
+                  output[c][f] = fadeInFrom[c];
+                }
+                for (let c = trackedChannels; c < outChannels; c++) {
+                  output[c][f] = 0.0;
+                }
+              } else {
+                const invAlpha = 1.0 - alpha;
+                for (let c = 0; c < trackedChannels; c++) {
+                  output[c][f] = fadeInFrom[c] * invAlpha + output[c][f] * alpha;
+                }
+                for (let c = trackedChannels; c < outChannels; c++) {
+                  output[c][f] *= alpha;
+                }
+              }
+            }
+          } else {
+            for (let f = 0; f < rampCount; f++) {
+              const alpha = (startPos + f) / total;
+              if (alpha === 0.0) {
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][f] = 0.0;
+                }
+              } else {
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][f] *= alpha;
+                }
+              }
+            }
+          }
+
+          this._fadeInPos = startPos + rampCount;
+          if (this._fadeInPos >= total) {
+            this._fadeInPos = 0;
+            this._fadeInTotal = 0;
+            this._fadeInHasOffset = false;
+          }
+        }
 
         // Record the last emitted finite frame for smooth underrun de-click fade-out.
         const lastIdx = framesToRead - 1;
@@ -865,6 +1328,12 @@
       if (framesToRead < quantumFrames) {
         const missingFrames = quantumFrames - framesToRead;
         const declickFrames = this._declickFrames;
+
+        // Entering underrun cancels any in-flight recovery fade-in cleanly.
+        this._fadeInPos = 0;
+        this._fadeInTotal = 0;
+        this._fadeInHasOffset = false;
+        this._inUnderrun = true;
 
         if (declickFrames > 0) {
           if (this._declickTotal === 0 && this._hasActiveAudio) {
@@ -958,7 +1427,9 @@
     DEFAULT_CHANNELS,
     DEFAULT_SMOOTHING_FRAMES,
     DEFAULT_DECLICK_FRAMES,
+    DEFAULT_FADE_IN_FRAMES,
     MAX_DECLICK_FRAMES,
+    DEFAULT_SAMPLE_CLAMP_LIMIT,
     HDR_WRITE_CURSOR,
     HDR_READ_CURSOR,
     HDR_CAPACITY_FRAMES,
