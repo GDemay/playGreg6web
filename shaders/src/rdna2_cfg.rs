@@ -52,8 +52,13 @@ pub const STRUCTURED_LOOP_MAX_ITERATIONS: u32 = 65_536;
 pub const DISPATCH_EXIT_PC: u32 = u32::MAX;
 
 /// Maximum structured nesting depth before falling back to `Dispatch`
-/// (bounds recursion in both structuring and emission).
-const MAX_STRUCTURE_DEPTH: usize = 160;
+/// (bounds recursion in structuring, emission, and downstream Naga/WGSL
+/// parsing/validation even on constrained debug stacks).
+const MAX_STRUCTURE_DEPTH: usize = 32;
+
+/// Hard upper bound on structuring region visits so pathological large CFGs
+/// degrade to bounded `Dispatch` in deterministic linear-ish time.
+const MAX_STRUCTURE_BUDGET: usize = 262_144;
 
 // SOPP opcodes (GFX10.3).
 const SOPP_ENDPGM: u8 = 0x01;
@@ -504,7 +509,8 @@ impl ControlFlowGraph {
         first_offset: usize,
         end_offset: usize,
     ) -> Option<usize> {
-        let in_range = target >= first_offset as i64 && target < end_offset as i64;
+        let in_range =
+            usize::try_from(target).is_ok_and(|t| t >= first_offset && t < end_offset);
         let found = usize::try_from(target)
             .ok()
             .and_then(|t| self.offset_to_index.get(&t).copied());
@@ -695,22 +701,29 @@ pub enum StructuredNode {
 }
 
 impl StructuredNode {
-    /// Number of `Dispatch` fallbacks in the tree.
+    /// Number of `Dispatch` fallbacks in the tree (iterative, stack-safe).
     pub fn dispatch_count(&self) -> usize {
-        match self {
-            Self::Dispatch { .. } => 1,
-            Self::Seq(nodes) => nodes.iter().map(Self::dispatch_count).sum(),
-            Self::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                then_branch.dispatch_count()
-                    + else_branch.as_ref().map_or(0, |e| e.dispatch_count())
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Dispatch { .. } => count += 1,
+                Self::Seq(nodes) => stack.extend(nodes.iter()),
+                Self::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    stack.push(then_branch);
+                    if let Some(e) = else_branch {
+                        stack.push(e);
+                    }
+                }
+                Self::Loop { body } => stack.push(body),
+                Self::Block(_) | Self::Break | Self::Continue | Self::Return => {}
             }
-            Self::Loop { body } => body.dispatch_count(),
-            Self::Block(_) | Self::Break | Self::Continue | Self::Return => 0,
         }
+        count
     }
 
     /// `true` when no `Dispatch` fallback was needed.
@@ -719,14 +732,26 @@ impl StructuredNode {
     }
 
     fn escapes(&self) -> bool {
+        self.escapes_bounded(0)
+    }
+
+    fn escapes_bounded(&self, depth: usize) -> bool {
+        if depth > MAX_STRUCTURE_DEPTH * 4 {
+            return false;
+        }
         match self {
             Self::Break | Self::Continue | Self::Return => true,
-            Self::Seq(nodes) => nodes.last().is_some_and(Self::escapes),
+            Self::Seq(nodes) => nodes
+                .last()
+                .is_some_and(|n| n.escapes_bounded(depth + 1)),
             Self::If {
                 then_branch,
                 else_branch: Some(else_branch),
                 ..
-            } => then_branch.escapes() && else_branch.escapes(),
+            } => {
+                then_branch.escapes_bounded(depth + 1)
+                    && else_branch.escapes_bounded(depth + 1)
+            }
             _ => false,
         }
     }
@@ -792,8 +817,11 @@ impl<'a> Structurer<'a> {
         let order: Vec<BlockId> = cfg
             .blocks
             .iter()
-            .filter(|b| reachable[b.id] && !b.synthetic_exit)
-            .map(|b| b.id)
+            .enumerate()
+            .filter(|&(idx, b)| {
+                b.id == idx && reachable.get(idx).copied().unwrap_or(false) && !b.synthetic_exit
+            })
+            .map(|(idx, _)| idx)
             .collect();
         if order.is_empty() {
             return None;
@@ -810,7 +838,11 @@ impl<'a> Structurer<'a> {
                 }
             }
         }
-        let budget = order.len().saturating_mul(32).saturating_add(256);
+        let budget = order
+            .len()
+            .saturating_mul(32)
+            .saturating_add(256)
+            .min(MAX_STRUCTURE_BUDGET);
         Some(Self {
             cfg,
             order,
@@ -818,6 +850,10 @@ impl<'a> Structurer<'a> {
             preds,
             budget,
         })
+    }
+
+    fn single_entry(&self, lo: usize, hi: usize) -> bool {
+        (lo + 1..hi).all(|p| self.preds[p].iter().all(|&q| q >= lo && q < hi))
     }
 
     fn tgt(&self, block: BlockId) -> Result<Tgt, Fail> {
@@ -889,10 +925,8 @@ impl<'a> Structurer<'a> {
             return Err(Fail::Shape);
         }
         // Single entry: interior positions may only be reached from inside.
-        for p in lo + 1..hi {
-            if self.preds[p].iter().any(|&q| q < lo || q >= hi) {
-                return Err(Fail::Shape);
-            }
+        if !self.single_entry(lo, hi) {
+            return Err(Fail::Shape);
         }
 
         let mut nodes = Vec::new();
@@ -903,19 +937,23 @@ impl<'a> Structurer<'a> {
             starts.push((i, nodes.len()));
             match self.node_at(i, hi, follow, lp, header_at_lo && i == lo, depth) {
                 Ok((mut ns, end)) => {
+                    if end <= i || end > hi {
+                        return Err(Fail::Shape);
+                    }
                     nodes.append(&mut ns);
                     i = end;
                 }
-                Err(Fail::Shape) if lp.is_none() => {
+                Err(Fail::Shape) => {
                     // Dispatch the smallest suffix `[j, hi)` (j = a node start)
-                    // whose edges stay inside / leave to `follow` / end the program.
-                    // Earlier nodes only fall into `j` or return, so `[j, hi)`
-                    // is single-entry.
-                    let Some(&(j, len)) = starts
-                        .iter()
-                        .rev()
-                        .find(|&&(j, _)| self.dispatchable(j, hi, follow))
-                    else {
+                    // that is single-entry and whose edges stay inside / leave to
+                    // `follow` / end the program. When `header_at_lo && j == lo`,
+                    // let the enclosing loop handler emit `Dispatch` directly
+                    // without a redundant `loop { dispatch; break; }` wrapper.
+                    let Some(&(j, len)) = starts.iter().rev().find(|&&(j, _)| {
+                        !(header_at_lo && j == lo)
+                            && self.single_entry(j, hi)
+                            && self.dispatchable(j, hi, follow)
+                    }) else {
                         return Err(Fail::Shape);
                     };
                     nodes.truncate(len);
@@ -950,14 +988,21 @@ impl<'a> Structurer<'a> {
                 header: i,
                 exit: nf,
             };
-            let mut body = self.region(i, end, nf, Some(ctx), true, depth + 1)?;
-            if !body.last().is_some_and(StructuredNode::escapes) {
-                body.push(StructuredNode::Break);
+            match self.region(i, end, nf, Some(ctx), true, depth + 1) {
+                Ok(mut body) => {
+                    if !body.last().is_some_and(StructuredNode::escapes) {
+                        body.push(StructuredNode::Break);
+                    }
+                    let node = StructuredNode::Loop {
+                        body: Box::new(seq(body)),
+                    };
+                    return Ok((vec![node], end));
+                }
+                Err(Fail::Shape) if self.single_entry(i, end) && self.dispatchable(i, end, nf) => {
+                    return Ok((vec![self.dispatch(i, end)], end));
+                }
+                Err(e) => return Err(e),
             }
-            let node = StructuredNode::Loop {
-                body: Box::new(seq(body)),
-            };
-            return Ok((vec![node], end));
         }
 
         let bid = self.order[i];
@@ -1036,34 +1081,47 @@ impl<'a> Structurer<'a> {
             return Err(Fail::Shape);
         };
 
-        // if (!taken) { fallthrough region }
-        let skip = self.region(q, end, nf, lp, false, depth + 1);
-        match skip {
-            Ok(then_nodes) => {
-                out.push(StructuredNode::If {
-                    cond_block: bid,
-                    cond: neg,
-                    then_branch: Box::new(seq(then_nodes)),
-                    else_branch: None,
-                });
-                return Ok((out, end));
+        // Detect an `if/else` diamond upfront when the last block of `[q, tp)`
+        // unconditionally jumps past `tp` to a merge target that is not an
+        // enclosing loop exit. Skipping the doomed `if-skip` probe eliminates
+        // O(2^D) exponential backtracking on deeply nested diamonds.
+        let diamond_merge = if tp < hi {
+            let then_last = self.order[tp - 1];
+            match self.cfg.blocks[then_last].terminator {
+                Terminator::Branch(merge) => match self.tgt(merge).ok() {
+                    Some(Tgt::Pos(mp)) if mp > tp && mp < hi => Some((mp, Some(mp))),
+                    Some(Tgt::Pos(mp)) if mp > tp && Some(mp) == follow => Some((hi, follow)),
+                    _ => None,
+                },
+                _ => None,
             }
-            Err(Fail::Budget) => return Err(Fail::Budget),
-            Err(Fail::Shape) => {}
+        } else {
+            None
+        };
+        let skip_impossible = diamond_merge
+            .is_some_and(|(_, nf2)| nf2 != lp.and_then(|l| l.exit));
+
+        // if (!taken) { fallthrough region }
+        if !skip_impossible {
+            let skip = self.region(q, end, nf, lp, false, depth + 1);
+            match skip {
+                Ok(then_nodes) => {
+                    out.push(StructuredNode::If {
+                        cond_block: bid,
+                        cond: neg,
+                        then_branch: Box::new(seq(then_nodes)),
+                        else_branch: None,
+                    });
+                    return Ok((out, end));
+                }
+                Err(Fail::Budget) => return Err(Fail::Budget),
+                Err(Fail::Shape) => {}
+            }
         }
 
         // Diamond: then-region `[q, tp)` ends with `s_branch merge`.
-        if tp >= hi {
+        let Some((else_end, nf2)) = diamond_merge else {
             return Err(Fail::Shape);
-        }
-        let then_last = self.order[tp - 1];
-        let Terminator::Branch(merge) = self.cfg.blocks[then_last].terminator else {
-            return Err(Fail::Shape);
-        };
-        let (else_end, nf2) = match self.tgt(merge)? {
-            Tgt::Pos(mp) if mp > tp && mp < hi => (mp, Some(mp)),
-            Tgt::Pos(mp) if Some(mp) == follow => (hi, follow),
-            _ => return Err(Fail::Shape),
         };
         let then_nodes = self.region(q, tp, nf2, lp, false, depth + 1)?;
         let else_nodes = self.region(tp, else_end, nf2, lp, false, depth + 1)?;
@@ -1226,18 +1284,28 @@ where
         if Some(target) == self.cfg.exit_block {
             "return;".to_string()
         } else if members.contains(&target) {
-            format!("_pg6_pc = {target}u;")
+            match u32::try_from(target) {
+                Ok(v) if v != DISPATCH_EXIT_PC => format!("_pg6_pc = {v}u;"),
+                _ => format!("_pg6_pc = {DISPATCH_EXIT_PC}u;"),
+            }
         } else {
             format!("_pg6_pc = {DISPATCH_EXIT_PC}u;")
         }
     }
 
     fn dispatch(&mut self, entry: BlockId, blocks: &[BlockId], max_iterations: u32, indent: usize) {
-        let members: BTreeSet<BlockId> = blocks.iter().copied().collect();
+        let members: BTreeSet<BlockId> = blocks
+            .iter()
+            .copied()
+            .filter(|&b| {
+                self.cfg.blocks.get(b).is_some_and(|blk| !blk.synthetic_exit)
+                    && u32::try_from(b).is_ok_and(|v| v != DISPATCH_EXIT_PC)
+            })
+            .collect();
         let entry_pc = if members.contains(&entry) {
-            entry.to_string()
+            u32::try_from(entry).unwrap_or(DISPATCH_EXIT_PC)
         } else {
-            DISPATCH_EXIT_PC.to_string()
+            DISPATCH_EXIT_PC
         };
         self.line(indent, "{");
         let i1 = indent + 1;
@@ -1275,12 +1343,16 @@ where
                     fallthrough,
                 } => {
                     let taken = self.transfer(target, &members);
-                    let not_taken = self.transfer(fallthrough, &members);
-                    self.line(i3 + 1, &format!("if ({}) {{", cond_expr(kind)));
-                    self.line(i3 + 2, &taken);
-                    self.line(i3 + 1, "} else {");
-                    self.line(i3 + 2, &not_taken);
-                    self.line(i3 + 1, "}");
+                    if target == fallthrough || !kind.is_conditional() {
+                        self.line(i3 + 1, &taken);
+                    } else {
+                        let not_taken = self.transfer(fallthrough, &members);
+                        self.line(i3 + 1, &format!("if ({}) {{", cond_expr(kind)));
+                        self.line(i3 + 2, &taken);
+                        self.line(i3 + 1, "} else {");
+                        self.line(i3 + 2, &not_taken);
+                        self.line(i3 + 1, "}");
+                    }
                 }
             }
             self.line(i3, "}");
@@ -2207,5 +2279,370 @@ mod tests {
         let (_, cfg) = build(&ops);
         let node = lift_and_check(&cfg);
         assert_eq!(node.dispatch_count(), 2, "{node:#?}");
+    }
+
+    // --- S49: Nested loops, diamonds-in-loops, early exits, truncation, determinism ---
+
+    #[test]
+    fn nested_three_level_loops_with_early_break_and_continue() {
+        // 3 nested loops with early break and continue at every nesting level:
+        // outer: 1..=14 (exit 15)
+        //   middle: 3..=12 (exit 13)
+        //     inner: 5..=9 (exit 10)
+        let ops = [
+            Nop,           // 0: pre-loop
+            Nop,           // 1: outer header
+            Br(Scc0, 15),  // 2: outer early break
+            Nop,           // 3: middle header
+            Br(Vccz, 13),  // 4: middle early break
+            Nop,           // 5: inner header
+            Br(Execz, 10), // 6: inner early break
+            Br(Scc1, 5),   // 7: inner early continue
+            Nop,           // 8: inner body
+            Br(Vccnz, 5),  // 9: inner latch -> 5
+            Nop,           // 10: middle post-inner
+            Br(Execnz, 3), // 11: middle early continue
+            Br(Scc1, 3),   // 12: middle latch -> 3
+            Br(Vccz, 1),   // 13: outer early continue
+            Br(Execnz, 1), // 14: outer latch -> 1
+            End,           // 15: outer exit
+        ];
+        let (_, cfg) = build(&ops);
+        let node = lift_and_check(&cfg);
+        assert!(node.is_fully_structured(), "{node:#?}");
+        let wgsl = emit_wgsl_control_flow(&node, &cfg, |_| String::new());
+        assert!(wgsl.contains("_pg6_loop0"), "{wgsl}");
+        assert!(wgsl.contains("_pg6_loop1"), "{wgsl}");
+        assert!(wgsl.contains("_pg6_loop2"), "{wgsl}");
+    }
+
+    #[test]
+    fn nested_loop_multilevel_break_dispatches_locally() {
+        // Structured prefix `if`, then an outer loop whose inner loop breaks
+        // directly to the outer exit (no WGSL labeled break), then a structured
+        // post-loop `if`. Only the outer loop should fall back to `Dispatch`.
+        let ops = [
+            Br(Scc0, 2),   // 0: prefix if-skip over 1
+            Nop,           // 1: prefix body
+            Nop,           // 2: outer header
+            Nop,           // 3: inner header
+            Br(Execz, 7),  // 4: multi-level break directly to outer exit 7
+            Br(Scc1, 3),   // 5: inner latch -> 3
+            Br(Vccnz, 2),  // 6: outer latch -> 2
+            Br(Execnz, 9), // 7: post-loop if-skip over 8
+            Nop,           // 8: post-loop body
+            End,           // 9: end
+        ];
+        let (_, cfg) = build(&ops);
+        let node = lift_and_check(&cfg);
+        assert_eq!(node.dispatch_count(), 1, "{node:#?}");
+        let StructuredNode::Seq(items) = &node else {
+            panic!("expected top-level Seq: {node:#?}");
+        };
+        assert!(matches!(items[0], StructuredNode::Block(0)));
+        assert!(matches!(items[1], StructuredNode::If { .. }));
+        assert!(matches!(items[2], StructuredNode::Dispatch { .. }));
+        // Post-loop `if` remains cleanly structured outside the dispatcher.
+        assert!(items[3..].iter().any(|n| matches!(n, StructuredNode::If { .. })));
+    }
+
+    #[test]
+    fn diamond_inside_loop_with_early_break_and_continue() {
+        // Natural loop containing an `if/else` diamond where `then` has an
+        // early `break` and `else` has an early `continue`, both merging into
+        // the loop latch.
+        let ops = [
+            Nop,                  // 0: pre
+            Nop,                  // 1: loop header
+            Br(Scc0, 6),          // 2: if (scc1) then=3..6 else=6..9
+            Br(Execz, 10),        // 3: then early break -> exit
+            Nop,                  // 4: then body
+            Br(Unconditional, 9), // 5: then -> merge/latch
+            Br(Vccz, 1),          // 6: else early continue -> header
+            Nop,                  // 7: else body
+            Nop,                  // 8: else fallthrough -> merge/latch
+            Br(Vccnz, 1),         // 9: loop latch -> header
+            End,                  // 10: loop exit
+        ];
+        let (_, cfg) = build(&ops);
+        let node = lift_and_check(&cfg);
+        assert!(node.is_fully_structured(), "{node:#?}");
+        let wgsl = emit_wgsl_control_flow(&node, &cfg, |_| String::new());
+        assert!(
+            wgsl.contains("loop {") && wgsl.contains("} else {") && wgsl.contains("break;") && wgsl.contains("continue;"),
+            "{wgsl}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_diamonds_avoid_exponential_backtracking() {
+        // 20 nested `if/else` diamonds where each `then` branch contains the
+        // next inner diamond and ends with `s_branch outer_merge`. Without
+        // upfront diamond detection this triggers O(2^20) backtracking and
+        // exhausts the structuring budget.
+        let depth = 20usize;
+        // Layout:
+        // - depth headers at 0..depth: Br(Scc0, else_idx[d])
+        // - innermost then body at depth, followed by Br(Unconditional, merge_idx[depth-1])
+        // - for each d from depth-1 down to 0:
+        //   inner_merge_branch (if d < depth-1), else_body, merge_nop
+        // Simpler symmetric construction: build recursively in index order.
+        fn emit_nested_diamond(ops: &mut Vec<Op>, depth: usize) {
+            if depth == 0 {
+                ops.push(Nop);
+                return;
+            }
+            let cond_idx = ops.len();
+            ops.push(Nop); // placeholder for Br(Scc0, else_start)
+            emit_nested_diamond(ops, depth - 1);
+            let jump_idx = ops.len();
+            ops.push(Nop); // placeholder for Br(Unconditional, merge_start)
+            let else_start = ops.len();
+            ops.push(Nop); // else body
+            let merge_start = ops.len();
+            ops.push(Nop); // merge block
+            ops[cond_idx] = Br(Scc0, else_start as i64);
+            ops[jump_idx] = Br(Unconditional, merge_start as i64);
+        }
+
+        let mut ops = Vec::new();
+        emit_nested_diamond(&mut ops, depth);
+        ops.push(End);
+
+        let (_, cfg) = build(&ops);
+        let node = lift_and_check(&cfg);
+        assert!(
+            node.is_fully_structured(),
+            "20-deep nested diamonds should structure cleanly without budget exhaustion: {node:#?}"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_loops_hit_depth_guard_without_stack_overflow() {
+        // Exceed MAX_STRUCTURE_DEPTH with nested loops: must never stack
+        // overflow, must remain semantically equivalent, and must emit valid
+        // Naga WGSL by falling back to bounded `Dispatch` at the depth limit.
+        let levels = MAX_STRUCTURE_DEPTH + 16;
+        let mut ops = Vec::with_capacity(levels * 2 + 2);
+        ops.push(Nop); // 0: entry
+        for _ in 0..levels {
+            ops.push(Nop); // header for level k is at index 1 + k
+        }
+        for k in (0..levels).rev() {
+            let header = (1 + k) as i64;
+            ops.push(Br(Scc1, header));
+        }
+        ops.push(End);
+
+        let (_, cfg) = build(&ops);
+        let node = structure_cfg(&cfg);
+        assert!(
+            node.dispatch_count() >= 1,
+            "nesting beyond MAX_STRUCTURE_DEPTH must fall back to Dispatch"
+        );
+        assert_equivalent(&cfg, &node);
+        validate_wgsl(&wgsl_function(&cfg, &node));
+    }
+
+    #[test]
+    fn fallthrough_and_dead_backedge_after_endpgm() {
+        // Part A: all s_endpgm variants followed by dead padding containing a
+        // backward jump into block 0. The unreachable backedge must NOT turn
+        // block 0 into a loop.
+        for end_op in [
+            SOPP_ENDPGM,
+            SOPP_ENDPGM_SAVED,
+            SOPP_ENDPGM_ORDERED_PS_DONE,
+            SOPP_CODE_END,
+        ] {
+            let ops = [
+                Nop,                    // 0: live entry
+                Op::Word(enc_sopp(end_op, 0)), // 1: program end
+                Nop,                    // 2: dead trailing instruction
+                Br(Unconditional, 0),   // 3: dead backedge to 0
+                Nop,                    // 4: dead fallthrough past end
+            ];
+            let (_, cfg) = build(&ops);
+            let reachable = cfg.reachable();
+            assert!(reachable[0]);
+            assert!(!reachable[1], "post-endpgm block must be unreachable");
+            let node = lift_and_check(&cfg);
+            assert!(node.is_fully_structured());
+            assert_eq!(
+                node,
+                StructuredNode::Seq(vec![StructuredNode::Block(0), StructuredNode::Return])
+            );
+        }
+
+        // Part B: early s_endpgm inside a loop and inside an if-then, followed
+        // by reachable code that itself falls off the end without a second
+        // s_endpgm.
+        let ops = [
+            Nop,          // 0: loop header
+            Br(Scc0, 4),  // 1: skip early return
+            Nop,          // 2: early-exit prep
+            End,          // 3: early s_endpgm inside loop
+            Br(Vccnz, 0), // 4: reachable after s_endpgm; backedge to 0
+            Nop,          // 5: loop exit, falls off end without s_endpgm
+        ];
+        let (_, cfg) = build(&ops);
+        assert!(
+            cfg.diagnostics
+                .iter()
+                .any(|d| matches!(d, CfgDiagnostic::FallthroughPastEnd { instr_index: 5, .. }))
+        );
+        let node = lift_and_check(&cfg);
+        assert!(node.is_fully_structured(), "{node:#?}");
+    }
+
+    #[test]
+    fn empty_truncated_and_extreme_offset_slices_never_panic() {
+        // Empty and sub-dword truncated slices.
+        for bytes in [&[][..], &[0x00], &[0x01, 0x02], &[0x01, 0x02, 0x03]] {
+            let instrs = decode_program(bytes);
+            let cfg = ControlFlowGraph::from_instructions(&instrs);
+            let node = lift_and_check(&cfg);
+            assert!(node.is_fully_structured());
+        }
+
+        // Truncated 64-bit SOP1 literal instruction (missing 2nd dword).
+        let truncated_lit = enc_sop1(0x03, 0, 0xFF).to_le_bytes();
+        let instrs = decode_program(&truncated_lit);
+        let cfg = ControlFlowGraph::from_instructions(&instrs);
+        lift_and_check(&cfg);
+
+        // Single-instruction streams (including self-loops and out-of-range jumps).
+        for single in [
+            [Nop],
+            [End],
+            [Br(Unconditional, 0)],
+            [Br(Scc1, 0)],
+            [Br(Scc0, 99)],
+            [Br(Unconditional, -10)],
+        ] {
+            let (_, cfg) = build(&single);
+            lift_and_check(&cfg);
+        }
+
+        // Extreme high byte offsets near usize::MAX must never wrap or panic.
+        let mut high = decode_program(&assemble(&[Br(Scc0, 2), End]));
+        high[0].offset = usize::MAX - 8;
+        high[1].offset = usize::MAX - 4;
+        if let Rdna2Detail::Sopp {
+            ref mut branch_target,
+            ..
+        } = high[0].detail
+        {
+            *branch_target = Some(-16);
+        }
+        let cfg = ControlFlowGraph::from_instructions(&high);
+        assert!(cfg.diagnostics.iter().any(|d| matches!(
+            d,
+            CfgDiagnostic::BranchTargetOutOfRange {
+                instr_index: 0,
+                target: -16,
+                ..
+            }
+        )));
+        lift_and_check(&cfg);
+    }
+
+    #[test]
+    fn irreducible_two_entry_loops_and_in_loop_dispatch() {
+        // Case A: A 2-entry irreducible cycle nested inside a loop's `if` arm.
+        // The enclosing outer loop stays cleanly structured while only the
+        // irreducible arm dispatches locally.
+        let ops = [
+            Nop,           // 0: outer loop header
+            Br(Scc0, 8),   // 1: if (scc1) enter irreducible arm 2..8
+            Br(Vccz, 5),   // 2: -> entry B (5) or entry A (3)
+            Nop,           // 3: A
+            Nop,           // 4: A -> B
+            Nop,           // 5: B
+            Br(Execnz, 3), // 6: B -> A (2-entry cycle)
+            Nop,           // 7: exit irreducible arm to merge 8
+            Br(Vccnz, 0),  // 8: merge & outer loop latch -> 0
+            End,           // 9: outer loop exit
+        ];
+        let (_, cfg) = build(&ops);
+        let node = lift_and_check(&cfg);
+        assert_eq!(node.dispatch_count(), 1, "{node:#?}");
+        let StructuredNode::Seq(items) = &node else {
+            panic!("expected Seq: {node:#?}");
+        };
+        assert!(
+            matches!(items[0], StructuredNode::Loop { .. }),
+            "enclosing natural loop should remain structured: {node:#?}"
+        );
+
+        // Case B: Figure-8 interlocking 2-entry cycle with early s_endpgm exit
+        // and a post-cycle merge block.
+        let fig8 = [
+            Br(Scc0, 4),   // 0: entry -> left (1) or right (4)
+            Nop,           // 1: left
+            Br(Execz, 7),  // 2: left early exit
+            Br(Vccnz, 4),  // 3: left -> right
+            Nop,           // 4: right
+            Br(Scc1, 1),   // 5: right -> left (backedge)
+            Br(Execnz, 8), // 6: right -> merge
+            End,           // 7: early s_endpgm
+            Nop,           // 8: merge
+            End,           // 9: end
+        ];
+        let (_, cfg2) = build(&fig8);
+        let node2 = lift_and_check(&cfg2);
+        assert!(node2.dispatch_count() >= 1, "{node2:#?}");
+    }
+
+    #[test]
+    fn deterministic_cfg_structuring_and_wgsl_output() {
+        let ops = [
+            Nop,                  // 0
+            Br(Scc0, 6),          // 1: if-else diamond
+            Nop,                  // 2
+            Br(Vccnz, 2),         // 3: inner loop inside then
+            Br(Unconditional, 8), // 4: then -> merge
+            Nop,                  // 5: unreachable dead block
+            Br(Execz, 8),         // 6: else
+            Nop,                  // 7
+            Br(Scc1, 11),         // 8: irreducible 2-entry suffix
+            Nop,                  // 9: A
+            Nop,                  // 10: A
+            Nop,                  // 11: B
+            Br(Vccnz, 9),         // 12: B -> A
+            End,                  // 13
+        ];
+        let (instrs, baseline_cfg) = build(&ops);
+        let baseline_node = lift_and_check(&baseline_cfg);
+        let baseline_wgsl = emit_wgsl_control_flow(&baseline_node, &baseline_cfg, test_block_body);
+
+        for _ in 0..8 {
+            let cfg = ControlFlowGraph::from_instructions(&instrs);
+            let node = structure_cfg(&cfg);
+            let wgsl = emit_wgsl_control_flow(&node, &cfg, test_block_body);
+            assert_eq!(cfg, baseline_cfg);
+            assert_eq!(node, baseline_node);
+            assert_eq!(wgsl, baseline_wgsl);
+        }
+
+        // Manually permuted / duplicated / out-of-range block lists in a
+        // `Dispatch` node must still emit identically sorted, valid WGSL cases.
+        let mut forward = vec![0, 1, 2];
+        let mut scrambled = vec![2, 999, DISPATCH_EXIT_PC as usize, 0, 1, 2, 0];
+        let (_, simple_cfg) = build(&[Br(Scc0, 2), Nop, End]);
+        let n1 = StructuredNode::Dispatch {
+            entry: 0,
+            blocks: std::mem::take(&mut forward),
+            max_iterations: 64,
+        };
+        let n2 = StructuredNode::Dispatch {
+            entry: 0,
+            blocks: std::mem::take(&mut scrambled),
+            max_iterations: 64,
+        };
+        let w1 = wgsl_function(&simple_cfg, &n1);
+        let w2 = wgsl_function(&simple_cfg, &n2);
+        assert_eq!(w1, w2);
+        validate_wgsl(&w1);
     }
 }
