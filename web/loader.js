@@ -13,6 +13,7 @@ const PTHREAD_CMD_LOADED = 'loaded';
 const PTHREAD_CMD_RUN = 'run';
 const PTHREAD_CMD_OBJECT_TRANSFER = 'objectTransfer';
 const DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2;
+const DEFAULT_HTTPFS_MAILBOX_LANES = 8;
 const DEFAULT_GUEST_MANIFEST_RELATIVE = './dist/guest_manifest.json';
 const INDIRECT_DISPATCH_MODES = new Set(['shard', 'table']);
 const HOST_ABI_IMPORT_NAMES = Object.freeze([
@@ -170,7 +171,58 @@ let activeCoordinatorInputBridge = null;
 let activeCoordinatorRuntimeModule = null;
 let activeCoordinatorModuleConfig = null;
 let httpfsMailboxSab = null;
+let httpfsMailboxSabs = [];
 let httpfsClient = null;
+let nextHttpfsBroadcastLane = 0;
+
+function normalizeHttpfsMailboxLanes(value, fallback = DEFAULT_HTTPFS_MAILBOX_LANES) {
+  const defaultLanes =
+    Number.isInteger(fallback) && fallback >= 1 ? fallback : DEFAULT_HTTPFS_MAILBOX_LANES;
+  if (value === undefined || value === null || value === '') {
+    return defaultLanes;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return defaultLanes;
+  }
+  return Math.floor(parsed);
+}
+
+function allocateHttpfsMailboxPool(
+  lanes = DEFAULT_HTTPFS_MAILBOX_LANES,
+  mailboxApi = httpfsMailboxApi,
+) {
+  if (typeof SharedArrayBuffer === 'undefined' || !mailboxApi) {
+    return { sab: null, sabs: [], lanes: 0 };
+  }
+  const requestedLanes = normalizeHttpfsMailboxLanes(lanes, DEFAULT_HTTPFS_MAILBOX_LANES);
+  const maxSlots =
+    Number.isInteger(mailboxApi.HTTPFS_MAX_PIPELINE_SLOTS) &&
+    mailboxApi.HTTPFS_MAX_PIPELINE_SLOTS >= 1
+      ? mailboxApi.HTTPFS_MAX_PIPELINE_SLOTS
+      : 16;
+  const targetLanes = Math.min(requestedLanes, maxSlots);
+
+  if (targetLanes > 1 && typeof mailboxApi.createHttpfsMailboxPool === 'function') {
+    const sabs = mailboxApi.createHttpfsMailboxPool(targetLanes);
+    if (Array.isArray(sabs) && sabs.length > 0) {
+      return {
+        sab: sabs[0] || null,
+        sabs: sabs.slice(),
+        lanes: sabs.length,
+      };
+    }
+  }
+  if (typeof mailboxApi.createHttpfsMailboxBuffer === 'function') {
+    const sab = mailboxApi.createHttpfsMailboxBuffer();
+    return {
+      sab,
+      sabs: sab ? [sab] : [],
+      lanes: sab ? 1 : 0,
+    };
+  }
+  return { sab: null, sabs: [], lanes: 0 };
+}
 
 function report(label) {
   postProgress({ label });
@@ -1782,8 +1834,9 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       return;
     }
     let handled = false;
-    if (msg.__playgta6_httpfs_sab) {
-      attachHttpfsSab(msg.__playgta6_httpfs_sab);
+    const incomingHttpfsSab = msg.__playgta6_httpfs_lane_sab || msg.__playgta6_httpfs_sab;
+    if (incomingHttpfsSab) {
+      attachHttpfsSab(incomingHttpfsSab);
       handled = true;
     }
     if (msg.__playgta6_tx_port) {
@@ -1812,8 +1865,12 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     if (httpfsChannel) {
       httpfsChannel.onmessage = (ev) => {
         const msg = ev && ev.data;
-        if (msg && msg.type === 'httpfs-sab' && msg.sab) {
-          attachHttpfsSab(msg.sab);
+        if (msg && msg.type === 'httpfs-sab') {
+          const candidateSab =
+            msg.sab || (Array.isArray(msg.sabs) && msg.sabs.length > 0 ? msg.sabs[0] : null);
+          if (candidateSab) {
+            attachHttpfsSab(candidateSab);
+          }
         }
       };
       try {
@@ -1845,6 +1902,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     restoreWasmInstance,
     attachHttpfsSab,
     hasHttpfsSab: () => Boolean(pthreadHttpfsClient),
+    getHttpfsSab: () => attachedHttpfsSab,
     attachTxPort,
     hasTxPort: () => Boolean(txPort && !txPortClosed),
     channels: {
@@ -4559,6 +4617,9 @@ function buildRuntimeModuleConfig(options = {}) {
     hostImports: activeHostImports,
     httpfsMailboxSab:
       options.httpfsMailboxSab !== undefined ? options.httpfsMailboxSab : httpfsMailboxSab,
+    httpfsMailboxSabs: Array.isArray(options.httpfsMailboxSabs)
+      ? options.httpfsMailboxSabs.slice()
+      : httpfsMailboxSabs.slice(),
     inputSab: activeInputSab,
     attachInputBridge,
     stopInputBridge,
@@ -4788,10 +4849,18 @@ function createPthreadPoolCoordinator(options = {}) {
     options.maxConcurrentPthreadLoads,
     DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
   );
+  const hasExplicitSingleSabOption =
+    typeof options.getHttpfsMailboxSab === 'function' || options.httpfsMailboxSab !== undefined;
   const getHttpfsMailboxSab =
     typeof options.getHttpfsMailboxSab === 'function'
       ? options.getHttpfsMailboxSab
       : () => options.httpfsMailboxSab || null;
+  const getHttpfsMailboxSabs =
+    typeof options.getHttpfsMailboxSabs === 'function'
+      ? options.getHttpfsMailboxSabs
+      : Array.isArray(options.httpfsMailboxSabs)
+        ? () => options.httpfsMailboxSabs
+        : null;
   const onPthreadTxMessage =
     typeof options.onPthreadTxMessage === 'function' ? options.onPthreadTxMessage : null;
   const explicitMessageChannelCtor = options.MessageChannelCtor;
@@ -4804,6 +4873,7 @@ function createPthreadPoolCoordinator(options = {}) {
   let queuedCount = 0;
   let activeLoads = 0;
   let draining = false;
+  let nextHttpfsMailboxLane = 0;
 
   let pthreadSpawnedCount = 0;
   let pthreadActiveCount = 0;
@@ -4812,6 +4882,47 @@ function createPthreadPoolCoordinator(options = {}) {
   let pthreadLoadedCount = 0;
   let peakConcurrentLoads = 0;
   let pthreadActiveTxPorts = 0;
+
+  function resolveHttpfsMailboxPool() {
+    const rawPool = getHttpfsMailboxSabs ? getHttpfsMailboxSabs() : null;
+    if (Array.isArray(rawPool) && rawPool.length > 0) {
+      return rawPool;
+    }
+    const single = getHttpfsMailboxSab();
+    return single ? [single] : [];
+  }
+
+  function assignNextHttpfsMailboxLane(meta) {
+    if (meta && meta.httpfsMailboxSab !== undefined) {
+      const explicitSab = meta.httpfsMailboxSab;
+      return {
+        primarySab: explicitSab,
+        laneSab: explicitSab,
+        laneIndex: explicitSab ? 0 : -1,
+        laneCount: explicitSab ? 1 : 0,
+      };
+    }
+    const pool = resolveHttpfsMailboxPool();
+    if (pool.length === 0) {
+      return { primarySab: null, laneSab: null, laneIndex: -1, laneCount: 0 };
+    }
+    const laneIndex = nextHttpfsMailboxLane % pool.length;
+    nextHttpfsMailboxLane += 1;
+    const laneSab = pool[laneIndex] || null;
+    // Preserve __playgta6_httpfs_sab pointing to lane 0 when a legacy single-SAB getter is
+    // supplied alongside the multi-lane pool; dedicated per-pthread lanes arrive via
+    // __playgta6_httpfs_lane_sab (preferred by bootstrapEmscriptenPthreadWorker).
+    const primarySab =
+      hasExplicitSingleSabOption && pool.length > 1
+        ? getHttpfsMailboxSab() || pool[0] || laneSab
+        : laneSab;
+    return {
+      primarySab,
+      laneSab,
+      laneIndex,
+      laneCount: pool.length,
+    };
+  }
 
   function getTelemetry() {
     return {
@@ -4825,6 +4936,7 @@ function createPthreadPoolCoordinator(options = {}) {
       pthreadPeakConcurrentLoads: peakConcurrentLoads,
       maxConcurrentPthreadLoads: maxConcurrentLoads,
       pthreadActiveTxPorts,
+      httpfsMailboxLanes: resolveHttpfsMailboxPool().length,
     };
   }
 
@@ -5055,8 +5167,9 @@ function createPthreadPoolCoordinator(options = {}) {
 
     const workerName =
       meta && typeof meta.name === 'string' ? meta.name : EMSCRIPTEN_PTHREAD_WORKER_NAME;
-    const sab =
-      meta && meta.httpfsMailboxSab !== undefined ? meta.httpfsMailboxSab : getHttpfsMailboxSab();
+    const laneAssignment = assignNextHttpfsMailboxLane(meta);
+    const sab = laneAssignment.primarySab;
+    const laneSab = laneAssignment.laneSab;
 
     let coordPort = null;
     let pthreadPort = null;
@@ -5095,11 +5208,17 @@ function createPthreadPoolCoordinator(options = {}) {
       }
     }
 
-    if (origPostMessage && (sab || pthreadPort)) {
+    if (origPostMessage && (sab || laneSab || pthreadPort)) {
       const bootstrapMsg = {};
       const transferList = [];
       if (sab) {
         bootstrapMsg.__playgta6_httpfs_sab = sab;
+      }
+      if (laneSab) {
+        bootstrapMsg.__playgta6_httpfs_lane_sab = laneSab;
+        if (laneAssignment.laneIndex >= 0) {
+          bootstrapMsg.__playgta6_httpfs_lane = laneAssignment.laneIndex;
+        }
       }
       if (pthreadPort) {
         bootstrapMsg.__playgta6_tx_port = pthreadPort;
@@ -5117,9 +5236,19 @@ function createPthreadPoolCoordinator(options = {}) {
           closeMessagePort(pthreadPort);
           coordPort = null;
           pthreadPort = null;
-          if (sab) {
+          if (sab || laneSab) {
+            const fallbackMsg = {};
+            if (sab) {
+              fallbackMsg.__playgta6_httpfs_sab = sab;
+            }
+            if (laneSab) {
+              fallbackMsg.__playgta6_httpfs_lane_sab = laneSab;
+              if (laneAssignment.laneIndex >= 0) {
+                fallbackMsg.__playgta6_httpfs_lane = laneAssignment.laneIndex;
+              }
+            }
             try {
-              origPostMessage.call(worker, { __playgta6_httpfs_sab: sab });
+              origPostMessage.call(worker, fallbackMsg);
             } catch {
               // Non-fatal: BroadcastChannel handshake remains as fallback.
             }
@@ -5148,6 +5277,8 @@ function createPthreadPoolCoordinator(options = {}) {
       origPostMessage,
       origTerminate,
       txPort: coordPort,
+      httpfsLaneIndex: laneAssignment.laneIndex,
+      httpfsLaneSab: laneSab,
       messageCleanupHooks: [],
       cleanupHooks: [],
     };
@@ -5303,6 +5434,19 @@ function createPthreadPoolCoordinator(options = {}) {
       });
       emitTelemetry();
     },
+    getWorkerHttpfsLane(worker) {
+      const entry = trackedWorkers.get(worker);
+      if (!entry) {
+        return null;
+      }
+      return {
+        laneIndex: entry.httpfsLaneIndex,
+        sab: entry.httpfsLaneSab,
+      };
+    },
+    resetHttpfsLaneCursor() {
+      nextHttpfsMailboxLane = 0;
+    },
   };
 }
 
@@ -5423,6 +5567,7 @@ function handlePthreadTxMessage(data) {
 
 const coordinatorPthreadPool = createPthreadPoolCoordinator({
   getHttpfsMailboxSab: () => httpfsMailboxSab,
+  getHttpfsMailboxSabs: () => httpfsMailboxSabs,
   onPthreadTxMessage: handlePthreadTxMessage,
 });
 
@@ -5461,6 +5606,7 @@ function getLoaderStatus() {
     pthreadActiveLoads: pthread.pthreadActiveLoads,
     pthreadPeakConcurrentLoads: pthread.pthreadPeakConcurrentLoads,
     maxConcurrentPthreadLoads: pthread.maxConcurrentPthreadLoads,
+    httpfsMailboxLanes: httpfsMailboxSabs.length || (httpfsMailboxSab ? 1 : 0),
     indirectDispatch: activeGuestManifestSummary
       ? activeGuestManifestSummary.indirectDispatch
       : 'table',
@@ -5661,16 +5807,30 @@ if (typeof self !== 'undefined') {
       ? tryOpenBroadcastChannel(BroadcastChannel, PTHREAD_HTTPFS_SAB_CHANNEL_NAME)
       : null;
 
-  const broadcastHttpfsSab = () => {
+  const pickBroadcastHttpfsLaneSab = () => {
+    if (Array.isArray(httpfsMailboxSabs) && httpfsMailboxSabs.length > 0) {
+      const idx = nextHttpfsBroadcastLane % httpfsMailboxSabs.length;
+      nextHttpfsBroadcastLane += 1;
+      return httpfsMailboxSabs[idx] || httpfsMailboxSab;
+    }
+    return httpfsMailboxSab;
+  };
+
+  const broadcastHttpfsSab = (assignedLaneSab) => {
+    const laneSab = assignedLaneSab || httpfsMailboxSab;
     if (
       !httpfsSabChannel ||
-      !httpfsMailboxSab ||
+      !laneSab ||
       typeof httpfsSabChannel.postMessage !== 'function'
     ) {
       return;
     }
     try {
-      httpfsSabChannel.postMessage({ type: 'httpfs-sab', sab: httpfsMailboxSab });
+      const payload = { type: 'httpfs-sab', sab: laneSab };
+      if (Array.isArray(httpfsMailboxSabs) && httpfsMailboxSabs.length > 0) {
+        payload.sabs = httpfsMailboxSabs.slice();
+      }
+      httpfsSabChannel.postMessage(payload);
     } catch {
       // Some runtimes reject SharedArrayBuffer over BroadcastChannel; degrade safely.
     }
@@ -5686,7 +5846,7 @@ if (typeof self !== 'undefined') {
     httpfsSabChannel.onmessage = (ev) => {
       const msg = ev && ev.data;
       if (msg && msg.type === 'request-httpfs-sab') {
-        broadcastHttpfsSab();
+        broadcastHttpfsSab(pickBroadcastHttpfsLaneSab());
       }
     };
   }
@@ -5787,15 +5947,29 @@ if (typeof self !== 'undefined') {
       coordinatorPthreadPool.setMaxConcurrentPthreadLoads(configuredMaxConcurrentPthreadLoads);
     }
 
+    const requestedHttpfsMailboxLanes =
+      msg.httpfsMailboxLanes !== undefined
+        ? msg.httpfsMailboxLanes
+        : DEFAULT_HTTPFS_MAILBOX_LANES;
+    const allocatedMailboxPool = allocateHttpfsMailboxPool(
+      requestedHttpfsMailboxLanes,
+      httpfsMailboxApi,
+    );
+    httpfsMailboxSabs = allocatedMailboxPool.sabs;
+    httpfsMailboxSab = allocatedMailboxPool.sab;
+    nextHttpfsBroadcastLane = 0;
+    if (typeof coordinatorPthreadPool.resetHttpfsLaneCursor === 'function') {
+      coordinatorPthreadPool.resetHttpfsLaneCursor();
+    }
     if (
-      typeof SharedArrayBuffer !== 'undefined' &&
+      httpfsMailboxSab &&
       httpfsMailboxApi &&
-      typeof httpfsMailboxApi.createHttpfsMailboxBuffer === 'function'
+      typeof httpfsMailboxApi.HttpfsMailboxClient === 'function'
     ) {
-      httpfsMailboxSab = httpfsMailboxApi.createHttpfsMailboxBuffer();
       httpfsClient = new httpfsMailboxApi.HttpfsMailboxClient(httpfsMailboxSab);
-      broadcastHttpfsSab();
+      broadcastHttpfsSab(httpfsMailboxSab);
     } else {
+      httpfsMailboxSabs = [];
       httpfsMailboxSab = null;
       httpfsClient = null;
     }
@@ -5854,7 +6028,11 @@ if (typeof self !== 'undefined') {
     const workerInits = createWorkerBootInitPayloads(msg);
     ioWorker.postMessage(workerInits.ioInit);
     if (httpfsMailboxSab) {
-      ioWorker.postMessage({ attachMailbox: true, sab: httpfsMailboxSab });
+      const attachMailboxMsg = { attachMailbox: true, sab: httpfsMailboxSab };
+      if (httpfsMailboxSabs.length > 0) {
+        attachMailboxMsg.sabs = httpfsMailboxSabs.slice();
+      }
+      ioWorker.postMessage(attachMailboxMsg);
     }
     gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
     audioWorker.postMessage({ init: true });
@@ -5873,6 +6051,7 @@ const exportedApi = {
   PTHREAD_CMD_RUN,
   PTHREAD_CMD_OBJECT_TRANSFER,
   DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
+  DEFAULT_HTTPFS_MAILBOX_LANES,
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
@@ -5893,6 +6072,8 @@ const exportedApi = {
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
+  normalizeHttpfsMailboxLanes,
+  allocateHttpfsMailboxPool,
   createPatchedPthreadEnv,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,

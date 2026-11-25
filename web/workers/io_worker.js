@@ -2562,6 +2562,7 @@
       },
       mountedRpfCount: 0,
       openHandles: 0,
+      mailboxLanes: 0,
     };
   }
 
@@ -2910,6 +2911,7 @@
       };
 
       this._mailboxHost = null;
+      this._mailboxLanes = 0;
       this._handles = new Map();
       this._nextHandle = 1;
       this._activeWholeFiles = new Map(); // url -> { bytes, size, refCount }
@@ -2944,6 +2946,10 @@
 
     get mailboxHost() {
       return this._mailboxHost;
+    }
+
+    get mailboxLanes() {
+      return this._mailboxLanes;
     }
 
     _getRangeCacheModule() {
@@ -4763,7 +4769,10 @@
       if (this._mailboxHost) {
         const prev = this._mailboxHost;
         this._mailboxHost = null;
+        this._mailboxLanes = 0;
         await prev.stop();
+      } else {
+        this._mailboxLanes = 0;
       }
       for (const entry of this._handles.values()) {
         if (entry && entry.wholeFileBytes) {
@@ -4775,13 +4784,7 @@
       this._inFlightWholeFiles.clear();
     }
 
-    async attachMailbox(sab, options = {}) {
-      const mailboxMod = this._getHttpfsMailboxModule();
-      if (!mailboxMod || typeof mailboxMod.HttpfsMailboxHost !== 'function') {
-        throw new Error('PlayGta6HttpfsMailbox unavailable in io_worker');
-      }
-      await this.detachMailbox();
-
+    _createMailboxHostBinding(mailboxMod, options = {}) {
       const probeOnOpen = options.probeOnOpen !== false;
       const BaseHost = mailboxMod.HttpfsMailboxHost;
       const HttpfsStatus = mailboxMod.HttpfsStatus;
@@ -4823,6 +4826,9 @@
           const op = this._headerView.getUint32(mailboxMod.HttpfsOffsets.OP, true);
           if (op === HTTPFS_OP_WRITE) {
             this._stats.requests += 1;
+            if (typeof this._slotRequests === 'number') {
+              this._slotRequests += 1;
+            }
             const handle = this._headerView.getInt32(mailboxMod.HttpfsOffsets.HANDLE, true);
             const offsetBig = this._headerView.getBigUint64(mailboxMod.HttpfsOffsets.OFFSET, true);
             const lengthBig = this._headerView.getBigUint64(mailboxMod.HttpfsOffsets.LENGTH, true);
@@ -4831,6 +4837,9 @@
               controller._dumpWriteStats.dumpWriteErrors += 1;
               this.completeResponse(-22n, HttpfsStatus.Error);
               this._stats.syncFastPathHits += 1;
+              if (typeof this._slotSyncFastPathHits === 'number') {
+                this._slotSyncFastPathHits += 1;
+              }
               return true;
             }
             const writeLen = Number(lengthBig);
@@ -4840,6 +4849,9 @@
             }
             const appendFlag = (offsetBig & HTTPFS_OPEN_FLAG_APPEND) !== 0n;
             this._stats.asyncPathHits += 1;
+            if (typeof this._slotAsyncPathHits === 'number') {
+              this._slotAsyncPathHits += 1;
+            }
             return controller.writeHandle(handle, copy, { append: appendFlag }).then(
               (res) => {
                 const written = res && typeof res.bytesWritten === 'number' ? res.bytesWritten : writeLen;
@@ -4856,7 +4868,7 @@
         }
       }
 
-      this._mailboxHost = new IoWorkerMailboxHost(sab, {
+      const hostOptions = {
         getRangeCache: () => this.ensureRangeCache(),
         getManifest: () => this.manifest,
         probeOnOpen,
@@ -4871,7 +4883,89 @@
           }
           return this.closeHandle(handle);
         },
+      };
+      if (options.readAhead !== undefined) {
+        hostOptions.readAhead = options.readAhead;
+      } else if (options.enableReadAhead !== undefined) {
+        hostOptions.enableReadAhead = options.enableReadAhead;
+      } else {
+        // IoWorkerController performs slab/range caching and coalescing directly; disable
+        // redundant host-side read-ahead amplification unless explicitly opted in.
+        hostOptions.readAhead = false;
+      }
+
+      return { IoWorkerMailboxHost, hostOptions };
+    }
+
+    async attachMailboxPool(sabs, options = {}) {
+      if (!Array.isArray(sabs) || sabs.length < 1) {
+        throw new RangeError('attachMailboxPool requires a non-empty array of SharedArrayBuffers');
+      }
+      const mailboxMod = this._getHttpfsMailboxModule();
+      if (
+        !mailboxMod ||
+        typeof mailboxMod.HttpfsMailboxHost !== 'function' ||
+        typeof mailboxMod.HttpfsMailboxPoolHost !== 'function'
+      ) {
+        throw new Error('PlayGta6HttpfsMailbox.HttpfsMailboxPoolHost unavailable in io_worker');
+      }
+      await this.detachMailbox();
+
+      const { IoWorkerMailboxHost, hostOptions } = this._createMailboxHostBinding(
+        mailboxMod,
+        options,
+      );
+      const PoolHost = mailboxMod.HttpfsMailboxPoolHost;
+
+      class IoWorkerMailboxPoolHost extends PoolHost {
+        constructor(slotBuffers, poolOptions) {
+          super(slotBuffers, poolOptions);
+          this._slots = slotBuffers.map(
+            (slotSab) =>
+              new IoWorkerMailboxHost(
+                slotSab,
+                Object.assign({}, poolOptions, { _sharedState: this._shared }),
+              ),
+          );
+        }
+      }
+
+      this._mailboxHost = new IoWorkerMailboxPoolHost(sabs, hostOptions);
+      this._mailboxLanes = sabs.length;
+
+      this._mailboxHost.start().catch((err) => {
+        if (this.postMessage) {
+          this.postMessage({ error: `httpfs_mailbox: ${err}` });
+        }
       });
+
+      return this._mailboxHost;
+    }
+
+    async attachMailbox(sabOrSabs, options = {}) {
+      if (Array.isArray(sabOrSabs)) {
+        if (sabOrSabs.length === 0) {
+          throw new RangeError('attachMailbox requires at least one SharedArrayBuffer');
+        }
+        if (sabOrSabs.length > 1) {
+          return this.attachMailboxPool(sabOrSabs, options);
+        }
+        sabOrSabs = sabOrSabs[0];
+      }
+
+      const mailboxMod = this._getHttpfsMailboxModule();
+      if (!mailboxMod || typeof mailboxMod.HttpfsMailboxHost !== 'function') {
+        throw new Error('PlayGta6HttpfsMailbox unavailable in io_worker');
+      }
+      await this.detachMailbox();
+
+      const { IoWorkerMailboxHost, hostOptions } = this._createMailboxHostBinding(
+        mailboxMod,
+        options,
+      );
+
+      this._mailboxHost = new IoWorkerMailboxHost(sabOrSabs, hostOptions);
+      this._mailboxLanes = 1;
 
       this._mailboxHost.start().catch((err) => {
         if (this.postMessage) {
@@ -5015,6 +5109,7 @@
         },
         mountedRpfCount: mountedArchives.length,
         openHandles: this._handles.size,
+        mailboxLanes: this._mailboxLanes,
       };
     }
 
@@ -5351,13 +5446,27 @@
       const m = msg || {};
       try {
         if (m.init) {
-          if (m.mailboxSab) {
+          if (Array.isArray(m.mailboxSabs) && m.mailboxSabs.length > 0) {
+            await this.attachMailbox(m.mailboxSabs, m);
+          } else if (m.mailboxSab) {
             await this.attachMailbox(m.mailboxSab, m);
           }
           await this.init(m);
+        } else if (m.attachMailboxPool) {
+          const poolSabs = m.sabs || m.mailboxSabs || m.sab || m.mailboxSab;
+          await this.attachMailboxPool(poolSabs, m);
+          const reply = { mailboxAttached: true, mailboxLanes: this._mailboxLanes };
+          if (m.id !== undefined) reply.id = m.id;
+          if (this.postMessage) this.postMessage(reply);
         } else if (m.attachMailbox) {
-          await this.attachMailbox(m.sab || m.mailboxSab, m);
-          const reply = { mailboxAttached: true };
+          const target =
+            Array.isArray(m.sabs) && m.sabs.length > 0
+              ? m.sabs
+              : Array.isArray(m.mailboxSabs) && m.mailboxSabs.length > 0
+                ? m.mailboxSabs
+                : m.sab || m.mailboxSab;
+          await this.attachMailbox(target, m);
+          const reply = { mailboxAttached: true, mailboxLanes: this._mailboxLanes };
           if (m.id !== undefined) reply.id = m.id;
           if (this.postMessage) this.postMessage(reply);
         } else if (m.detachMailbox) {
