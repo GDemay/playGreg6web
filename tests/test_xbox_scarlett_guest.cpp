@@ -1312,6 +1312,44 @@ void test_xg() {
     CHECK(pm.start_tile_index_in_overall_resource == 170);
     CHECK(fx.vcall(bc, 1) == 0);
 
+    // GetResourceTiling for 64KB_D (0x10A): tiles in GFX10 memory order. A 512x512 BC7 array of
+    // 32 with 10 mips: per slice the mip tail (mips 2..9) is tile 0, mip 1 tile 1 and mip 0
+    // (2x2 tiles) starts at tile 2; 6 tiles per slice.
+    {
+        const uint64_t tdesc = xg_desc(3, 512, 512, 32, 10, 98);
+        CHECK(com::write_guest(tdesc + 0x2C, uint32_t{0x10A}));
+        const uint64_t tout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+        const uint64_t t64 = load64(tout);
+        uint32_t tcap = 16;
+        CHECK(com::write_guest(count, tcap));
+        fx.vcall(t64, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tilings)});
+        ga::XgPackedMipInfo tp{};
+        CHECK(com::read_guest(packed, tp));
+        CHECK(tp.num_standard_mips == 2 && tp.num_packed_mips == 8);
+        CHECK(tp.num_tiles_for_packed_mips == 1 && tp.start_tile_index_in_overall_resource == 0);
+        uint32_t ttiles = 0;
+        CHECK(com::read_guest(num_tiles, ttiles));
+        CHECK(ttiles == 6u * 32u);
+        ga::XgSubresourceTiling m0{};
+        ga::XgSubresourceTiling m1{};
+        ga::XgSubresourceTiling m2{};
+        ga::XgSubresourceTiling s1m0{};
+        CHECK(com::read_guest(tilings, m0));
+        CHECK(com::read_guest(tilings + 12, m1));
+        CHECK(com::read_guest(tilings + 24, m2));
+        CHECK(m0.width_in_tiles == 2 && m0.height_in_tiles == 2 && m0.start_tile_index_in_overall_resource == 2);
+        CHECK(m1.width_in_tiles == 1 && m1.height_in_tiles == 1 && m1.start_tile_index_in_overall_resource == 1);
+        CHECK(m2.start_tile_index_in_overall_resource == ga::kXgPackedTile);
+        // Subresource 10 = slice 1, mip 0: one slice (6 tiles) further.
+        uint32_t one = 1;
+        CHECK(com::write_guest(count, one));
+        fx.vcall(t64, 10, {I(num_tiles), I(packed), I(shape), I(count), I(10), I(tilings)});
+        CHECK(com::read_guest(tilings, s1m0));
+        CHECK(s1m0.start_tile_index_in_overall_resource == 8);
+        CHECK(fx.vcall(t64, 1) == 0);
+    }
+
     // An unsupported dimension fails.
     CHECK(as_hr(fx.dcall(create, {I(xg_desc(7, 16, 16, 1, 1, 28)), I(fx.out_slot())})) == com::E_INVALIDARG_HR);
 
