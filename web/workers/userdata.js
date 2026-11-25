@@ -20,6 +20,9 @@ const DEFAULT_MAX_QUARANTINE_FILES = 32;
 const DEFAULT_MAX_QUARANTINE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_QUOTA_CLEANUP_STEPS = 64;
 const MAX_QUARANTINE_RECORD_BYTES = 256 * 1024;
+const DEFAULT_MAX_COALESCED_PER_KEY = 256;
+const DEFAULT_MAX_PENDING_COALESCED_KEYS = 256;
+const MAX_CONTAINER_LIST_CACHE_ENTRIES = 64;
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const BASE64_LOOKUP = (() => {
@@ -505,6 +508,17 @@ class UserdataStore {
       DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
       'maxQuotaCleanupSteps',
     );
+    this.coalescePendingWrites = options.coalescePendingWrites !== false;
+    this.maxCoalescedPerKey = parseQuotaLimit(
+      options.maxCoalescedPerKey,
+      DEFAULT_MAX_COALESCED_PER_KEY,
+      'maxCoalescedPerKey',
+    );
+    this.maxPendingCoalescedKeys = parseQuotaLimit(
+      options.maxPendingCoalescedKeys,
+      DEFAULT_MAX_PENDING_COALESCED_KEYS,
+      'maxPendingCoalescedKeys',
+    );
     this.storageEstimate = typeof options.storageEstimate === 'function' ? options.storageEstimate : null;
 
     this._db = null;
@@ -513,6 +527,8 @@ class UserdataStore {
     // In-memory container/blob metadata index (never stores raw Uint8Array payloads).
     this._metaIndex = new Map();
     this._dirIndex = new Map();
+    this._sortedDirCache = new Map();
+    this._containerListCache = new Map();
     this._containerBuckets = new Map();
     this._indexedTotalBytes = 0;
     this._fallbackStoredBytes = 0;
@@ -522,8 +538,11 @@ class UserdataStore {
     this._indexLoadPromise = null;
     this._quarantineSeq = 0;
 
-    // Serializes mutations so quota validation + persistence + index updates never race.
+    // Serializes mutations so quota validation + persistence + index updates never race,
+    // while allowing bounded latest-wins coalescing for back-to-back writes to the same slot.
     this._mutationTail = Promise.resolve();
+    this._activeMutations = 0;
+    this._pendingWrites = new Map();
 
     // Lightweight operational telemetry.
     this._stats = {
@@ -532,6 +551,9 @@ class UserdataStore {
       deletes: 0,
       indexHits: 0,
       indexMisses: 0,
+      indexCacheHits: 0,
+      indexCacheMisses: 0,
+      coalescedWrites: 0,
       bytesWritten: 0,
       bytesRead: 0,
       quotaRejections: 0,
@@ -547,7 +569,15 @@ class UserdataStore {
   }
 
   _withMutationLock(fn) {
-    const run = this._mutationTail.then(fn, fn);
+    this._activeMutations += 1;
+    const exec = async () => {
+      try {
+        return await fn();
+      } finally {
+        this._activeMutations = Math.max(0, this._activeMutations - 1);
+      }
+    };
+    const run = this._mutationTail.then(exec, exec);
     this._mutationTail = run.then(
       () => undefined,
       () => undefined,
@@ -555,9 +585,59 @@ class UserdataStore {
     return run;
   }
 
+  _sealPendingWrite(validPath) {
+    this._pendingWrites.delete(validPath);
+  }
+
+  _sealPendingWritesByPrefix(normalizedPrefix) {
+    if (this._pendingWrites.size === 0) {
+      return;
+    }
+    for (const key of this._pendingWrites.keys()) {
+      if (key.startsWith(normalizedPrefix)) {
+        this._pendingWrites.delete(key);
+      }
+    }
+  }
+
+  _sealAllPendingWrites() {
+    this._pendingWrites.clear();
+  }
+
+  async _flushPendingWrite(entry) {
+    if (this._pendingWrites.get(entry.path) === entry) {
+      this._pendingWrites.delete(entry.path);
+    }
+    const { path: validPath, data, ts, waiters } = entry;
+    entry.data = null;
+    entry.waiters = [];
+    try {
+      const result = await this._saveFileUnlocked(validPath, data, ts);
+      for (let i = 0; i < waiters.length; i += 1) {
+        waiters[i].resolve({
+          path: result.path,
+          size: result.size,
+          mtime: result.mtime,
+        });
+      }
+    } catch (err) {
+      for (let i = 0; i < waiters.length; i += 1) {
+        waiters[i].reject(err);
+      }
+    }
+  }
+
+  async flushPendingWrites() {
+    while (this._activeMutations > 0 || this._pendingWrites.size > 0) {
+      await this._mutationTail;
+    }
+  }
+
   _clearIndexMaps() {
     this._metaIndex.clear();
     this._dirIndex.clear();
+    this._sortedDirCache.clear();
+    this._containerListCache.clear();
     this._containerBuckets.clear();
     this._indexedTotalBytes = 0;
     this._fallbackStoredBytes = 0;
@@ -565,9 +645,24 @@ class UserdataStore {
     this._indexReady = false;
   }
 
+  _getSortedPathsForPrefix(normalizedPrefix) {
+    const cached = this._sortedDirCache.get(normalizedPrefix);
+    if (cached) {
+      return cached.slice();
+    }
+    const set = this._dirIndex.get(normalizedPrefix);
+    if (!set || set.size === 0) {
+      return [];
+    }
+    const sorted = Array.from(set).sort(compareAscii);
+    this._sortedDirCache.set(normalizedPrefix, sorted);
+    return sorted.slice();
+  }
+
   _indexPut(validPath, size, mtime) {
     const nextMeta = buildMetadataEntry(validPath, size, mtime);
     const prev = this._metaIndex.get(validPath);
+    this._containerListCache.clear();
 
     if (prev) {
       const delta = size - prev.size;
@@ -592,6 +687,7 @@ class UserdataStore {
         this._dirIndex.set(prefix, set);
       }
       set.add(validPath);
+      this._sortedDirCache.delete(prefix);
     }
 
     let bucket = this._containerBuckets.get(nextMeta.containerPrefix);
@@ -610,6 +706,7 @@ class UserdataStore {
     }
 
     this._metaIndex.delete(validPath);
+    this._containerListCache.clear();
     this._indexedTotalBytes = Math.max(0, this._indexedTotalBytes - prev.size);
 
     const prefixes = ancestorPrefixesOf(validPath);
@@ -622,6 +719,7 @@ class UserdataStore {
           this._dirIndex.delete(prefix);
         }
       }
+      this._sortedDirCache.delete(prefix);
     }
 
     const bucket = this._containerBuckets.get(prev.containerPrefix);
@@ -684,11 +782,16 @@ class UserdataStore {
     if (this._indexReady) {
       if (countHit) {
         this._stats.indexHits += 1;
+        this._stats.indexCacheHits += 1;
       }
       return true;
     }
 
     if (this.backend && typeof this.backend.getAll !== 'function') {
+      if (countHit) {
+        this._stats.indexMisses += 1;
+        this._stats.indexCacheMisses += 1;
+      }
       return false;
     }
 
@@ -697,6 +800,7 @@ class UserdataStore {
         while (!this._indexReady) {
           const startEpoch = this._indexEpoch;
           this._stats.indexMisses += 1;
+          this._stats.indexCacheMisses += 1;
           const records = await this._getAllRecords();
           if (this._indexEpoch === startEpoch) {
             await this._populateIndexFromRecords(records);
@@ -1159,6 +1263,10 @@ class UserdataStore {
 
     if (this._indexReady) {
       this._indexDelete(validPath);
+    } else if (this._fallbackSizes.has(validPath)) {
+      const prevFallbackSize = this._fallbackSizes.get(validPath) || 0;
+      this._fallbackSizes.delete(validPath);
+      this._fallbackStoredBytes = Math.max(0, this._fallbackStoredBytes - prevFallbackSize);
     }
     this._stats.corruptRecoveries += 1;
     return quarantineKey;
@@ -1210,6 +1318,9 @@ class UserdataStore {
     for (let i = 0; i < temps.length && removed < stepCap; i += 1) {
       try {
         await this._deleteRawRecord(temps[i].path);
+        if (this._indexReady && this._metaIndex.has(temps[i].path)) {
+          this._indexDelete(temps[i].path);
+        }
         removed += 1;
         removedTemps += 1;
         reclaimedBytes += temps[i].size;
@@ -1225,6 +1336,9 @@ class UserdataStore {
       }
       try {
         await this._deleteRawRecord(quarantined[i].path);
+        if (this._indexReady && this._metaIndex.has(quarantined[i].path)) {
+          this._indexDelete(quarantined[i].path);
+        }
         removed += 1;
         removedQuarantined += 1;
         reclaimedBytes += quarantined[i].size;
@@ -1490,7 +1604,55 @@ class UserdataStore {
     const validPath = validateUserdataPath(path);
     const data = toUint8Array(bytes);
     const ts = Number.isFinite(mtime) ? mtime : Date.now();
-    return this._withMutationLock(() => this._saveFileUnlocked(validPath, data, ts));
+
+    if (!this.coalescePendingWrites) {
+      return this._withMutationLock(() => this._saveFileUnlocked(validPath, data, ts));
+    }
+
+    // Reject single-file quota violations immediately before coalescing so an invalid
+    // oversized write never overwrites a valid pending coalesced save for the same slot.
+    if (data.byteLength > this.maxFileBytes) {
+      this._stats.quotaRejections += 1;
+      this._stats.quotaErrors += 1;
+      throw createQuotaError(
+        `Userdata file "${validPath}" (${data.byteLength} bytes) exceeds maxFileBytes (${this.maxFileBytes})`,
+        { path: validPath, size: data.byteLength, maxFileBytes: this.maxFileBytes },
+      );
+    }
+
+    const existing = this._pendingWrites.get(validPath);
+    if (existing && existing.coalescedCount < this.maxCoalescedPerKey) {
+      existing.data = data;
+      existing.ts = ts;
+      existing.coalescedCount += 1;
+      this._stats.coalescedWrites += 1;
+      return new Promise((resolve, reject) => {
+        existing.waiters.push({ resolve, reject });
+      });
+    }
+
+    // If this path hit its per-key coalescing bound, seal the full wave so the
+    // new write begins a fresh bounded flush wave after it.
+    if (existing) {
+      this._pendingWrites.delete(validPath);
+    }
+
+    // If distinct pending keys hit the global bound, fall back to a direct serialized write.
+    if (this._pendingWrites.size >= this.maxPendingCoalescedKeys) {
+      return this._withMutationLock(() => this._saveFileUnlocked(validPath, data, ts));
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        path: validPath,
+        data,
+        ts,
+        coalescedCount: 0,
+        waiters: [{ resolve, reject }],
+      };
+      this._pendingWrites.set(validPath, entry);
+      this._withMutationLock(() => this._flushPendingWrite(entry));
+    });
   }
 
   async getFile(path) {
@@ -1499,6 +1661,7 @@ class UserdataStore {
 
     if (this._indexReady && !this._metaIndex.has(validPath)) {
       this._stats.indexHits += 1;
+      this._stats.indexCacheHits += 1;
       return null;
     }
 
@@ -1550,6 +1713,7 @@ class UserdataStore {
 
   async deleteFile(path) {
     const validPath = validateUserdataPath(path);
+    this._sealPendingWrite(validPath);
     return this._withMutationLock(() => this._deleteFileUnlocked(validPath));
   }
 
@@ -1596,11 +1760,7 @@ class UserdataStore {
   async _listByPrefixUnlocked(normalizedPrefix) {
     const indexed = await this._ensureIndex({ countHit: true });
     if (indexed) {
-      const set = this._dirIndex.get(normalizedPrefix);
-      if (!set || set.size === 0) {
-        return [];
-      }
-      return Array.from(set).sort(compareAscii);
+      return this._getSortedPathsForPrefix(normalizedPrefix);
     }
     const files = await this.listFiles();
     const paths = [];
@@ -1618,6 +1778,10 @@ class UserdataStore {
     return this._listByPrefixUnlocked(normalizedPrefix);
   }
 
+  async listKeys(prefix = USERDATA_PREFIX) {
+    return this.listByPrefix(prefix);
+  }
+
   async _deletePrefixUnlocked(normalizedPrefix) {
     const paths = await this._listByPrefixUnlocked(normalizedPrefix);
     for (const filePath of paths) {
@@ -1628,7 +1792,30 @@ class UserdataStore {
 
   async deletePrefix(prefix) {
     const normalizedPrefix = validateUserdataPrefix(prefix);
+    this._sealPendingWritesByPrefix(normalizedPrefix);
     return this._withMutationLock(() => this._deletePrefixUnlocked(normalizedPrefix));
+  }
+
+  async clear(options = {}) {
+    const includeQuarantine = Boolean(options && options.includeQuarantine === true);
+    this._sealAllPendingWrites();
+    return this._withMutationLock(async () => {
+      const deleted = await this._deletePrefixUnlocked(USERDATA_PREFIX);
+      let quarantinedRemoved = 0;
+      if (includeQuarantine) {
+        const entries = await this.listQuarantined();
+        for (let i = 0; i < entries.length; i += 1) {
+          await this._deleteRawRecord(entries[i].quarantineKey);
+          quarantinedRemoved += 1;
+        }
+      }
+      this._indexEpoch += 1;
+      this._clearIndexMaps();
+      this._indexReady = true;
+      return includeQuarantine
+        ? { deleted, quarantinedRemoved, cleared: true }
+        : { deleted, cleared: true };
+    });
   }
 
   async getMetadata(path) {
@@ -1643,6 +1830,10 @@ class UserdataStore {
     return buildMetadataEntry(file.path, file.data.byteLength, file.mtime);
   }
 
+  async stat(path) {
+    return this.getMetadata(path);
+  }
+
   async hasFile(path) {
     const meta = await this.getMetadata(path);
     return meta !== null;
@@ -1652,11 +1843,10 @@ class UserdataStore {
     const normalizedPrefix = validateUserdataPrefix(prefix);
     const indexed = await this._ensureIndex({ countHit: true });
     if (indexed) {
-      const set = this._dirIndex.get(normalizedPrefix);
-      if (!set || set.size === 0) {
+      const sortedPaths = this._getSortedPathsForPrefix(normalizedPrefix);
+      if (sortedPaths.length === 0) {
         return [];
       }
-      const sortedPaths = Array.from(set).sort(compareAscii);
       const out = [];
       for (let i = 0; i < sortedPaths.length; i += 1) {
         const meta = this._metaIndex.get(sortedPaths[i]);
@@ -1696,6 +1886,18 @@ class UserdataStore {
     }
 
     const indexed = await this._ensureIndex({ countHit: true });
+    const cacheKey = `${normalizedRoot}\0${namePrefix}`;
+    if (indexed) {
+      const cached = this._containerListCache.get(cacheKey);
+      if (cached) {
+        const cloned = new Array(cached.length);
+        for (let i = 0; i < cached.length; i += 1) {
+          cloned[i] = { ...cached[i] };
+        }
+        return cloned;
+      }
+    }
+
     const containerMap = new Map();
 
     const accumulate = (filePath, size, mtime) => {
@@ -1747,6 +1949,18 @@ class UserdataStore {
 
     const out = Array.from(containerMap.values());
     out.sort((a, b) => compareAscii(a.name, b.name));
+
+    if (indexed) {
+      if (this._containerListCache.size >= MAX_CONTAINER_LIST_CACHE_ENTRIES) {
+        this._containerListCache.clear();
+      }
+      const cachedCopy = new Array(out.length);
+      for (let i = 0; i < out.length; i += 1) {
+        cachedCopy[i] = { ...out[i] };
+      }
+      this._containerListCache.set(cacheKey, cachedCopy);
+    }
+
     return out;
   }
 
@@ -1797,6 +2011,7 @@ class UserdataStore {
       writeSpecs.push({ path: validPath, size: data.byteLength });
     }
 
+    this._sealAllPendingWrites();
     return this._withMutationLock(async () => {
       const startMs = nowMs();
       await this._validateQuotaForWrites(writeSpecs, deleteSet);
@@ -1895,6 +2110,9 @@ class UserdataStore {
       deletes: this._stats.deletes,
       indexHits: this._stats.indexHits,
       indexMisses: this._stats.indexMisses,
+      indexCacheHits: this._stats.indexCacheHits,
+      indexCacheMisses: this._stats.indexCacheMisses,
+      coalescedWrites: this._stats.coalescedWrites,
       bytesWritten: this._stats.bytesWritten,
       bytesRead: this._stats.bytesRead,
       quotaRejections: this._stats.quotaRejections,
@@ -1919,6 +2137,9 @@ class UserdataStore {
     this._stats.deletes = 0;
     this._stats.indexHits = 0;
     this._stats.indexMisses = 0;
+    this._stats.indexCacheHits = 0;
+    this._stats.indexCacheMisses = 0;
+    this._stats.coalescedWrites = 0;
     this._stats.bytesWritten = 0;
     this._stats.bytesRead = 0;
     this._stats.quotaRejections = 0;
@@ -2090,6 +2311,7 @@ class UserdataStore {
 
     const replace = Boolean(options && options.replace === true);
 
+    this._sealAllPendingWrites();
     return this._withMutationLock(async () => {
       const startMs = nowMs();
       await this._ensureIndex({ countHit: false });
@@ -2117,6 +2339,7 @@ class UserdataStore {
   }
 
   close() {
+    this._sealAllPendingWrites();
     if (this._db && typeof this._db.close === 'function') {
       try {
         this._db.close();
@@ -2146,6 +2369,8 @@ const exportedApi = {
   DEFAULT_MAX_QUARANTINE_FILES,
   DEFAULT_MAX_QUARANTINE_BYTES,
   DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
+  DEFAULT_MAX_COALESCED_PER_KEY,
+  DEFAULT_MAX_PENDING_COALESCED_KEYS,
   TEMP_SUFFIX,
   QUARANTINE_PREFIX,
   USERDATA_PREFIX,

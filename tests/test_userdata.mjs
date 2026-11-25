@@ -18,6 +18,8 @@ const {
   DEFAULT_MAX_QUARANTINE_FILES,
   DEFAULT_MAX_QUARANTINE_BYTES,
   DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
+  DEFAULT_MAX_COALESCED_PER_KEY,
+  DEFAULT_MAX_PENDING_COALESCED_KEYS,
   TEMP_SUFFIX,
   QUARANTINE_PREFIX,
   USERDATA_PREFIX,
@@ -1770,4 +1772,471 @@ test('W273: getStats() exposes atomicWrites, writeVerifyFailures, corruptRecover
   assert.equal(afterReset.storedBytes, 20);
   assert.equal(afterReset.indexReady, true);
   assert.equal(afterReset.indexedFiles, 1);
+});
+
+// --- W323: O(1) save-directory index cache, bounded rapid-write coalescing, and telemetry ---
+
+function createCountingMockIndexedDB() {
+  const inner = createMockIndexedDB();
+  const counts = { open: 0, getAll: 0, getAllKeys: 0, get: 0, put: 0, delete: 0 };
+
+  return {
+    databases: inner.databases,
+    counts,
+    open(dbName, version = 1) {
+      counts.open += 1;
+      const req = inner.open(dbName, version);
+      const origSetSuccess = Object.getOwnPropertyDescriptor(req, 'onsuccess');
+      let userOnSuccess = null;
+      Object.defineProperty(req, 'onsuccess', {
+        configurable: true,
+        get() {
+          return userOnSuccess;
+        },
+        set(fn) {
+          userOnSuccess = (ev) => {
+            const db = req.result;
+            if (db && !db.__w323Wrapped) {
+              db.__w323Wrapped = true;
+              const origTx = db.transaction.bind(db);
+              db.transaction = (storeName, mode) => {
+                const tx = origTx(storeName, mode);
+                const origObjectStore = tx.objectStore.bind(tx);
+                tx.objectStore = (name) => {
+                  const store = origObjectStore(name);
+                  return {
+                    put(...args) {
+                      counts.put += 1;
+                      return store.put(...args);
+                    },
+                    get(...args) {
+                      counts.get += 1;
+                      return store.get(...args);
+                    },
+                    delete(...args) {
+                      counts.delete += 1;
+                      return store.delete(...args);
+                    },
+                    getAll(...args) {
+                      counts.getAll += 1;
+                      return store.getAll(...args);
+                    },
+                    getAllKeys(...args) {
+                      counts.getAllKeys += 1;
+                      return store.getAll(...args);
+                    },
+                  };
+                };
+                return tx;
+              };
+            }
+            if (fn) fn(ev);
+          };
+          if (origSetSuccess && origSetSuccess.set) {
+            origSetSuccess.set.call(req, userOnSuccess);
+          }
+        },
+      });
+      return req;
+    },
+  };
+}
+
+test('W323: O(1) save-directory index cache serves repeated stat/listKeys/listContainers with zero extra IDB scans and syncs across writes, deletes, and clear()', async () => {
+  assert.ok(DEFAULT_MAX_COALESCED_PER_KEY > 0);
+  assert.ok(DEFAULT_MAX_PENDING_COALESCED_KEYS > 0);
+  assert.equal(globalThis.PlayGta6Userdata.DEFAULT_MAX_COALESCED_PER_KEY, DEFAULT_MAX_COALESCED_PER_KEY);
+  assert.equal(
+    globalThis.PlayGta6Userdata.DEFAULT_MAX_PENDING_COALESCED_KEYS,
+    DEFAULT_MAX_PENDING_COALESCED_KEYS,
+  );
+
+  const mockIdb = createCountingMockIndexedDB();
+  const seedStore = new UserdataStore({ indexedDB: mockIdb });
+  await seedStore.saveFile('/userdata/saves/slot0.sav', new Uint8Array(32).fill(1), 1000);
+  await seedStore.saveFile('/userdata/saves/slot1.sav', new Uint8Array(48).fill(2), 2000);
+  await seedStore.saveFile('/userdata/profiles/p0/settings.json', new Uint8Array(16).fill(3), 1500);
+  seedStore.close();
+
+  // Open a fresh store instance over the populated mock IDB.
+  const store = new UserdataStore({ indexedDB: mockIdb });
+  const scansBefore = mockIdb.counts.getAll + mockIdb.counts.getAllKeys;
+  assert.equal(store.getStats().indexCacheHits, 0);
+  assert.equal(store.getStats().indexCacheMisses, 0);
+
+  // First stat() hydrates the in-memory index cache with exactly 1 scan (1 miss, 0 hits).
+  const s0 = await store.stat('/userdata/saves/slot0.sav');
+  assert.deepEqual(s0, {
+    path: '/userdata/saves/slot0.sav',
+    size: 32,
+    mtime: 1000,
+    containerPrefix: '/userdata/saves/',
+    parentDir: '/userdata/saves/',
+    name: 'slot0.sav',
+  });
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+  assert.equal(mockIdb.counts.getAllKeys, 0);
+  assert.equal(store.getStats().indexCacheMisses, 1);
+  assert.equal(store.getStats().indexCacheHits, 0);
+
+  // Repeated stat(), hasFile(), listKeys(), listByPrefix(), listContainers() hit cache with ZERO scans!
+  for (let i = 0; i < 10; i += 1) {
+    const st = await store.stat('/userdata/saves/slot1.sav');
+    assert.equal(st.size, 48);
+    assert.equal(st.mtime, 2000);
+    assert.equal(await store.stat('/userdata/saves/slot99.sav'), null);
+    const keys = await store.listKeys('/userdata/saves');
+    assert.deepEqual(keys, ['/userdata/saves/slot0.sav', '/userdata/saves/slot1.sav']);
+    // Mutating returned array must not corrupt cached sorted directory list.
+    keys.push('/userdata/saves/mutated.sav');
+    const containers = await store.listContainers('/userdata/');
+    assert.equal(containers.length, 2);
+    containers[0].blobCount = 999;
+  }
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+  assert.equal(store.getStats().indexCacheMisses, 1);
+  assert.equal(store.getStats().indexCacheHits, 40);
+
+  // Overwriting an existing slot updates size & mtime in place without triggering an IDB scan.
+  await store.saveFile('/userdata/saves/slot0.sav', new Uint8Array(64).fill(9), 3000);
+  const updatedS0 = await store.stat('/userdata/saves/slot0.sav');
+  assert.equal(updatedS0.size, 64);
+  assert.equal(updatedS0.mtime, 3000);
+  assert.deepEqual(await store.listKeys('/userdata/saves'), [
+    '/userdata/saves/slot0.sav',
+    '/userdata/saves/slot1.sav',
+  ]);
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+
+  // Deleting a single slot invalidates its index entry & sorted prefix cache cleanly.
+  await store.deleteFile('/userdata/saves/slot0.sav');
+  assert.equal(await store.stat('/userdata/saves/slot0.sav'), null);
+  assert.deepEqual(await store.listKeys('/userdata/saves'), ['/userdata/saves/slot1.sav']);
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+
+  // clear() wipes all live entries and keeps the index cache synced & warm at 0 entries.
+  const clearRes = await store.clear();
+  assert.deepEqual(clearRes, { deleted: 2, cleared: true });
+  assert.equal(await store.stat('/userdata/saves/slot1.sav'), null);
+  assert.equal(await store.stat('/userdata/profiles/p0/settings.json'), null);
+  assert.deepEqual(await store.listKeys(), []);
+  assert.deepEqual(await store.listContainers('/userdata/'), []);
+  assert.deepEqual(await store.getUsageStats(), { fileCount: 0, totalBytes: 0, prefixes: {} });
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+  assert.equal(store.getStats().indexReady, true);
+  assert.equal(store.getStats().indexedFiles, 0);
+  assert.equal(store.getStats().storedBytes, 0);
+
+  // Saving after clear() immediately populates the warm cache cleanly.
+  await store.saveFile('/userdata/saves/slot2.sav', new Uint8Array(20).fill(5), 4000);
+  assert.deepEqual(await store.listKeys('/userdata/saves'), ['/userdata/saves/slot2.sav']);
+  assert.equal((await store.stat('/userdata/saves/slot2.sav')).size, 20);
+  assert.equal(mockIdb.counts.getAll + mockIdb.counts.getAllKeys, scansBefore + 1);
+
+  store.close();
+});
+
+test('W323: rapid back-to-back writes to the same save slot coalesce latest-wins while earlier transaction is in flight', async () => {
+  // Controlled slow backend: pauses the very first .tmp put so subsequent writes arrive mid-flight.
+  let releaseFirstWrite = null;
+  let signalFirstWriteStarted = null;
+  const firstWriteStarted = new Promise((resolve) => {
+    signalFirstWriteStarted = resolve;
+  });
+  let pausedOnce = false;
+  const committedPayloads = [];
+
+  const backend = createFullRecordBackend({
+    async onPut(record, map, cloneRecord) {
+      if (!pausedOnce && record.path.endsWith(TEMP_SUFFIX)) {
+        pausedOnce = true;
+        await new Promise((resolve) => {
+          releaseFirstWrite = resolve;
+          signalFirstWriteStarted();
+        });
+      }
+      if (!record.path.endsWith(TEMP_SUFFIX)) {
+        committedPayloads.push(new TextDecoder().decode(record.data));
+      }
+      map.set(record.path, cloneRecord(record));
+      return true;
+    },
+  });
+
+  const store = new UserdataStore({ backend });
+  const slotPath = '/userdata/saves/autosave.sav';
+
+  // 1. Start first write (in-flight, paused mid-IDB-transaction).
+  const p1 = store.saveFile(slotPath, new TextEncoder().encode('SAVE_FRAME_001'), 1001);
+  await firstWriteStarted;
+  assert.equal(typeof releaseFirstWrite, 'function', 'First write should be in-flight');
+
+  // 2. While p1 is still in flight, fire 5 rapid back-to-back auto-saves to the same slot.
+  const p2 = store.saveFile(slotPath, new TextEncoder().encode('SAVE_FRAME_002'), 1002);
+  const p3 = store.saveFile(slotPath, new TextEncoder().encode('SAVE_FRAME_003'), 1003);
+  const p4 = store.saveFile(slotPath, new TextEncoder().encode('SAVE_FRAME_004'), 1004);
+  const p5 = store.saveFile(slotPath, new TextEncoder().encode('SAVE_FRAME_005_FINAL_PAYLOAD'), 1005);
+
+  // Release the in-flight first transaction and wait for all callers to settle.
+  releaseFirstWrite();
+  const results = await Promise.all([p1, p2, p3, p4, p5]);
+
+  // Only 2 actual atomic writes occurred (v1 + coalesced v5), with 3 writes coalesced!
+  assert.deepEqual(committedPayloads, ['SAVE_FRAME_001', 'SAVE_FRAME_005_FINAL_PAYLOAD']);
+  const finalBytes = new TextEncoder().encode('SAVE_FRAME_005_FINAL_PAYLOAD');
+  assert.equal(results[0].size, new TextEncoder().encode('SAVE_FRAME_001').byteLength);
+  for (let i = 1; i < results.length; i += 1) {
+    assert.deepEqual(results[i], {
+      path: slotPath,
+      size: finalBytes.byteLength,
+      mtime: 1005,
+    });
+  }
+
+  // Verify final stored payload integrity, checksum, zero leftover .tmp, and index coherence.
+  assert.equal(backend.map.has(`${slotPath}${TEMP_SUFFIX}`), false);
+  const liveRec = backend.map.get(slotPath);
+  assert.equal(liveRec.checksum, computeChecksum(finalBytes));
+  assert.deepEqual((await store.getFile(slotPath)).data, finalBytes);
+  assert.equal((await store.stat(slotPath)).size, finalBytes.byteLength);
+  assert.equal((await store.stat(slotPath)).mtime, 1005);
+
+  const stats = store.getStats();
+  assert.equal(stats.writes, 2);
+  assert.equal(stats.atomicWrites, 2);
+  assert.equal(stats.coalescedWrites, 3);
+});
+
+test('W323: same-tick write burst coalescing, bounded waves, opt-out flag, and delete/clear ordering barriers', async () => {
+  // 1. Same-tick burst of 4 writes to same slot coalesces into 1 atomic write (3 coalesced).
+  const backend1 = createFullRecordBackend();
+  const store1 = new UserdataStore({ backend: backend1 });
+  const p = '/userdata/saves/burst.sav';
+  const finalData = new TextEncoder().encode('FINAL_SAME_TICK');
+  await Promise.all([
+    store1.saveFile(p, new TextEncoder().encode('v1'), 10),
+    store1.saveFile(p, new TextEncoder().encode('v2'), 20),
+    store1.saveFile(p, new TextEncoder().encode('v3'), 30),
+    store1.saveFile(p, finalData, 40),
+  ]);
+  assert.equal(store1.getStats().atomicWrites, 1);
+  assert.equal(store1.getStats().coalescedWrites, 3);
+  assert.deepEqual((await store1.getFile(p)).data, finalData);
+
+  // 2. Bounded coalescing (maxCoalescedPerKey: 2) caps a single wave at 2 superseding writes.
+  const backend2 = createFullRecordBackend();
+  const store2 = new UserdataStore({ backend: backend2, maxCoalescedPerKey: 2 });
+  await Promise.all([
+    store2.saveFile(p, new TextEncoder().encode('w1'), 1),
+    store2.saveFile(p, new TextEncoder().encode('w2'), 2),
+    store2.saveFile(p, new TextEncoder().encode('w3'), 3), // wave 1 hits cap (coalescedCount === 2)
+    store2.saveFile(p, new TextEncoder().encode('w4'), 4), // wave 2 starts
+    store2.saveFile(p, new TextEncoder().encode('w5'), 5), // wave 2 coalesces
+  ]);
+  assert.equal(store2.getStats().atomicWrites, 2);
+  assert.equal(store2.getStats().coalescedWrites, 3);
+  assert.deepEqual((await store2.getFile(p)).data, new TextEncoder().encode('w5'));
+
+  // 3. Opt-out via coalescePendingWrites: false executes every write individually.
+  const backend3 = createFullRecordBackend();
+  const store3 = new UserdataStore({ backend: backend3, coalescePendingWrites: false });
+  await Promise.all([
+    store3.saveFile(p, new TextEncoder().encode('a'), 1),
+    store3.saveFile(p, new TextEncoder().encode('b'), 2),
+    store3.saveFile(p, new TextEncoder().encode('c'), 3),
+  ]);
+  assert.equal(store3.getStats().atomicWrites, 3);
+  assert.equal(store3.getStats().coalescedWrites, 0);
+  assert.deepEqual((await store3.getFile(p)).data, new TextEncoder().encode('c'));
+
+  // 4. Interleaved save -> delete -> save preserves strict linearizable order (barriers seal pending waves).
+  const backend4 = createFullRecordBackend();
+  const store4 = new UserdataStore({ backend: backend4 });
+  const afterDeleteBytes = new TextEncoder().encode('AFTER_DELETE_FINAL');
+  await Promise.all([
+    store4.saveFile(p, new TextEncoder().encode('before-1'), 1),
+    store4.saveFile(p, new TextEncoder().encode('before-2'), 2),
+    store4.deleteFile(p),
+    store4.saveFile(p, new TextEncoder().encode('after-1'), 3),
+    store4.saveFile(p, afterDeleteBytes, 4),
+  ]);
+  assert.deepEqual((await store4.getFile(p)).data, afterDeleteBytes);
+  assert.equal((await store4.stat(p)).mtime, 4);
+  assert.equal(store4.getStats().coalescedWrites, 2);
+  assert.equal(store4.getStats().deletes, 1);
+
+  // 5. Invalid oversized write (> maxFileBytes) rejects immediately without clobbering a valid pending save.
+  const backend5 = createFullRecordBackend();
+  const store5 = new UserdataStore({ backend: backend5, maxFileBytes: 16 });
+  const validSave = new TextEncoder().encode('VALID_12BYTE');
+  const [validRes, oversizedRes] = await Promise.allSettled([
+    store5.saveFile(p, validSave, 100),
+    store5.saveFile(p, new Uint8Array(32).fill(0xff), 101),
+  ]);
+  assert.equal(validRes.status, 'fulfilled');
+  assert.equal(oversizedRes.status, 'rejected');
+  assert.equal(oversizedRes.reason.code, 'QUOTA_EXCEEDED');
+  assert.deepEqual((await store5.getFile(p)).data, validSave);
+
+  // Invalid coalescing limit constructor options throw RangeError.
+  assert.throws(() => new UserdataStore({ maxCoalescedPerKey: -1 }), RangeError);
+  assert.throws(() => new UserdataStore({ maxPendingCoalescedKeys: NaN }), RangeError);
+});
+
+test('W323: coalesced rapid writes preserve W273 crash-safe atomic verification, quota-pressure recovery, and index coherence', async () => {
+  let failMode = null;
+  let hardByteLimit = 220;
+  const totalBackendBytes = (map) => {
+    let sum = 0;
+    for (const rec of map.values()) {
+      sum += rec.data instanceof Uint8Array ? rec.data.byteLength : 0;
+    }
+    return sum;
+  };
+
+  const backend = createFullRecordBackend({
+    onPut(record, map, cloneRecord) {
+      if (failMode === 'bitflip-stage' && record.path.endsWith(TEMP_SUFFIX)) {
+        const corrupted = record.data.slice();
+        corrupted[0] ^= 0xff;
+        map.set(record.path, { ...cloneRecord(record), data: corrupted });
+        return true;
+      }
+      const existing = map.get(record.path);
+      const prevSize = existing && existing.data instanceof Uint8Array ? existing.data.byteLength : 0;
+      const nextSize = record.data instanceof Uint8Array ? record.data.byteLength : 0;
+      if (totalBackendBytes(map) - prevSize + nextSize > hardByteLimit) {
+        const err = new Error('QuotaExceededError: storage full');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      map.set(record.path, cloneRecord(record));
+      return true;
+    },
+  });
+
+  const store = new UserdataStore({ backend });
+  const slotPath = '/userdata/saves/slot0.sav';
+  const committedV1 = new Uint8Array(60).fill(0x11);
+  await store.saveFile(slotPath, committedV1, 1000);
+
+  // 1. Silent bit-flip during coalesced flush rejects all waiters with WRITE_VERIFY_FAILED,
+  //    cleans up .tmp, and preserves prior v1 payload + index cache entry intact.
+  failMode = 'bitflip-stage';
+  const badBurst = await Promise.allSettled([
+    store.saveFile(slotPath, new Uint8Array(64).fill(0x22), 2000),
+    store.saveFile(slotPath, new Uint8Array(64).fill(0x33), 2001),
+    store.saveFile(slotPath, new Uint8Array(64).fill(0x44), 2002),
+  ]);
+  for (const r of badBurst) {
+    assert.equal(r.status, 'rejected');
+    assert.equal(r.reason.code, 'WRITE_VERIFY_FAILED');
+  }
+  assert.equal(backend.map.has(`${slotPath}${TEMP_SUFFIX}`), false);
+  assert.deepEqual((await store.getFile(slotPath)).data, committedV1);
+  assert.equal((await store.stat(slotPath)).size, 60);
+  assert.equal((await store.stat(slotPath)).mtime, 1000);
+  assert.equal(store.getStats().writeVerifyFailures, 1);
+
+  // 2. Quota pressure during coalesced flush reclaims stale .tmp + quarantined artifacts and succeeds!
+  failMode = null;
+  backend.map.set('/userdata/saves/orphan.sav.tmp', {
+    path: '/userdata/saves/orphan.sav.tmp',
+    data: new Uint8Array(70).fill(0xee),
+    mtime: 500,
+    staging: true,
+  });
+  backend.map.set(`${QUARANTINE_PREFIX}400-1-checksum_mismatch/saves/old.sav`, {
+    path: `${QUARANTINE_PREFIX}400-1-checksum_mismatch/saves/old.sav`,
+    originalPath: '/userdata/saves/old.sav',
+    reason: 'checksum_mismatch',
+    quarantinedAt: 400,
+    data: new Uint8Array(70).fill(0xcc),
+    mtime: 400,
+    quarantined: true,
+  });
+
+  // Currently backend holds 60 + 70 + 70 = 200B / 220B. Coalesced 50B write triggers quota cleanup and commits!
+  const recoveredV2 = new Uint8Array(50).fill(0x7a);
+  await Promise.all([
+    store.saveFile(slotPath, new Uint8Array(50).fill(0x55), 3000),
+    store.saveFile(slotPath, new Uint8Array(50).fill(0x66), 3001),
+    store.saveFile(slotPath, recoveredV2, 3002),
+  ]);
+  assert.equal(backend.map.has('/userdata/saves/orphan.sav.tmp'), false);
+  assert.deepEqual((await store.getFile(slotPath)).data, recoveredV2);
+  assert.equal((await store.stat(slotPath)).size, 50);
+  assert.equal((await store.stat(slotPath)).mtime, 3002);
+  assert.ok(store.getStats().quotaCleanups >= 1);
+
+  // 3. Unrecoverable quota exhaustion during coalesced flush preserves recoveredV2 and index state.
+  hardByteLimit = 80; // currently 50B live; staging another 50B needs 100B > 80B
+  const quotaBurst = await Promise.allSettled([
+    store.saveFile(slotPath, new Uint8Array(50).fill(0x88), 4000),
+    store.saveFile(slotPath, new Uint8Array(50).fill(0x99), 4001),
+  ]);
+  for (const r of quotaBurst) {
+    assert.equal(r.status, 'rejected');
+    assert.equal(isQuotaExceededError(r.reason), true);
+  }
+  assert.equal(backend.map.has(`${slotPath}${TEMP_SUFFIX}`), false);
+  assert.deepEqual((await store.getFile(slotPath)).data, recoveredV2);
+  assert.equal((await store.stat(slotPath)).size, 50);
+  assert.equal((await store.stat(slotPath)).mtime, 3002);
+  assert.equal(store.getStats().quotaErrors, 1);
+});
+
+test('W323: getStats() exposes sanitized indexCacheHits, indexCacheMisses, coalescedWrites and resetStats() clears them cleanly', async () => {
+  const backend = createCountingMemoryBackend([
+    { path: '/userdata/saves/slot0.sav', data: new Uint8Array(16).fill(1), mtime: 100 },
+  ]);
+  const store = new UserdataStore({ backend });
+
+  const initial = store.getStats();
+  assert.equal(initial.indexCacheHits, 0);
+  assert.equal(initial.indexCacheMisses, 0);
+  assert.equal(initial.coalescedWrites, 0);
+
+  // 1 cold miss + 2 cache hits
+  await store.stat('/userdata/saves/slot0.sav');
+  await store.listKeys('/userdata/saves');
+  await store.stat('/userdata/saves/missing.sav');
+
+  // Rapid burst producing 2 coalesced writes
+  await Promise.all([
+    store.saveFile('/userdata/saves/slot0.sav', new Uint8Array(20).fill(2), 200),
+    store.saveFile('/userdata/saves/slot0.sav', new Uint8Array(24).fill(3), 201),
+    store.saveFile('/userdata/saves/slot0.sav', new Uint8Array(28).fill(4), 202),
+  ]);
+  await store.flushPendingWrites();
+
+  const stats = store.getStats();
+  assert.equal(stats.indexCacheMisses, 1);
+  assert.equal(stats.indexCacheHits, 2);
+  assert.equal(stats.coalescedWrites, 2);
+  assert.equal(stats.indexedFiles, 1);
+  assert.equal(stats.indexedBytes, 28);
+  assert.equal(stats.storedBytes, 28);
+
+  // Verify stats payload is strictly sanitized (only numbers/booleans, no paths or raw buffers).
+  for (const [key, val] of Object.entries(stats)) {
+    assert.ok(
+      typeof val === 'number' || typeof val === 'boolean',
+      `Expected sanitized primitive telemetry for "${key}", got ${typeof val}`,
+    );
+  }
+
+  // resetStats() clears cumulative W323 counters while preserving live index state.
+  store.resetStats();
+  const afterReset = store.getStats();
+  assert.equal(afterReset.indexCacheHits, 0);
+  assert.equal(afterReset.indexCacheMisses, 0);
+  assert.equal(afterReset.coalescedWrites, 0);
+  assert.equal(afterReset.indexHits, 0);
+  assert.equal(afterReset.indexMisses, 0);
+  assert.equal(afterReset.writes, 0);
+  assert.equal(afterReset.indexReady, true);
+  assert.equal(afterReset.indexedFiles, 1);
+  assert.equal(afterReset.indexedBytes, 28);
+  assert.equal(afterReset.storedBytes, 28);
 });
