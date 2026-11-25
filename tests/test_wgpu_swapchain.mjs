@@ -5,12 +5,18 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const {
+  BLIT_FULLSCREEN_WGSL,
   DEFAULT_DEPTH_FORMAT,
   DEFAULT_MAX_ERROR_HISTORY,
+  INTERMEDIATE_TEXTURE_USAGE,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   SUPPORTED_DEPTH_FORMATS,
+  TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
+  TEXTURE_USAGE_TEXTURE_BINDING,
+  VALID_CANVAS_FORMATS,
   WgpuSwapchain,
+  isValidCanvasFormat,
 } = swapchainMod;
 
 function createMockWebGpuEnv({ limits, withUnconfigure = true } = {}) {
@@ -888,4 +894,497 @@ test('G35 removes uncapturederror listener cleanly on recover(newDevice) and des
   sc2.destroy();
   env2.device.dispatchUncapturedError({ name: 'GPUValidationError', message: 'ignored after destroy' });
   assert.equal(sc2.getStats().validationErrorCount, 0);
+});
+
+function attachMockBlitCapabilities(device, events) {
+  let nextShaderId = 1;
+  let nextSamplerId = 1;
+  let nextPipelineId = 1;
+  let nextBindGroupId = 1;
+
+  device.createdShaderModules = [];
+  device.createdSamplers = [];
+  device.createdRenderPipelines = [];
+  device.createdBindGroups = [];
+
+  device.createShaderModule = function createShaderModule(desc) {
+    const mod = { kind: 'GPUShaderModule', id: nextShaderId++, deviceLabel: device.label, desc };
+    device.createdShaderModules.push(mod);
+    events.push({ op: 'device.createShaderModule', id: mod.id, deviceLabel: device.label });
+    return mod;
+  };
+
+  device.createSampler = function createSampler(desc) {
+    const sampler = { kind: 'GPUSampler', id: nextSamplerId++, deviceLabel: device.label, desc };
+    device.createdSamplers.push(sampler);
+    events.push({ op: 'device.createSampler', id: sampler.id, deviceLabel: device.label });
+    return sampler;
+  };
+
+  device.createRenderPipeline = function createRenderPipeline(desc) {
+    const id = nextPipelineId++;
+    const pipeline = {
+      kind: 'GPURenderPipeline',
+      id,
+      deviceLabel: device.label,
+      desc,
+      getBindGroupLayout(index) {
+        return { kind: 'GPUBindGroupLayout', pipelineId: id, index };
+      },
+    };
+    device.createdRenderPipelines.push(pipeline);
+    events.push({
+      op: 'device.createRenderPipeline',
+      id,
+      deviceLabel: device.label,
+      targetFormat: desc.fragment && desc.fragment.targets && desc.fragment.targets[0]?.format,
+    });
+    return pipeline;
+  };
+
+  device.createBindGroup = function createBindGroup(desc) {
+    const bg = { kind: 'GPUBindGroup', id: nextBindGroupId++, deviceLabel: device.label, desc };
+    device.createdBindGroups.push(bg);
+    events.push({ op: 'device.createBindGroup', id: bg.id, deviceLabel: device.label });
+    return bg;
+  };
+
+  return device;
+}
+
+function createMockCommandEncoder() {
+  const passes = [];
+  return {
+    passes,
+    beginRenderPass(desc) {
+      const record = {
+        desc,
+        pipelines: [],
+        bindGroups: [],
+        draws: [],
+        ended: false,
+      };
+      passes.push(record);
+      return {
+        setPipeline(pipeline) {
+          record.pipelines.push(pipeline);
+        },
+        setBindGroup(index, bindGroup) {
+          record.bindGroups.push({ index, bindGroup });
+        },
+        draw(vertexCount, instanceCount, firstVertex, firstInstance) {
+          record.draws.push({ vertexCount, instanceCount, firstVertex, firstInstance });
+        },
+        end() {
+          record.ended = true;
+        },
+      };
+    },
+  };
+}
+
+test('W112 direct WebGPU canvas formats (rgba8unorm, bgra8unorm, rgba16float) allocate zero intermediate textures and blitToCanvasIfNeeded is a no-op', () => {
+  assert.deepEqual(VALID_CANVAS_FORMATS, ['bgra8unorm', 'rgba8unorm', 'rgba16float']);
+  assert.equal(isValidCanvasFormat('rgba8unorm'), true);
+  assert.equal(isValidCanvasFormat('bgra8unorm'), true);
+  assert.equal(isValidCanvasFormat('rgba16float'), true);
+  assert.equal(isValidCanvasFormat('rgb10a2unorm'), false);
+  assert.equal(isValidCanvasFormat('rg11b10ufloat'), false);
+  assert.equal(isValidCanvasFormat('rgba8unorm-srgb'), false);
+  assert.equal(
+    INTERMEDIATE_TEXTURE_USAGE,
+    TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_SRC
+  );
+  assert.ok(typeof BLIT_FULLSCREEN_WGSL === 'string' && BLIT_FULLSCREEN_WGSL.includes('vs_main'));
+  assert.ok(BLIT_FULLSCREEN_WGSL.includes('fs_main'));
+
+  for (const directFormat of ['rgba8unorm', 'bgra8unorm', 'rgba16float']) {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720 });
+    swapchain.configureForStreamFormat(directFormat);
+
+    assert.equal(swapchain.usesBlitFallback, false);
+    assert.equal(swapchain.streamFormat, directFormat);
+    assert.equal(swapchain.canvasFormat, directFormat);
+    assert.equal(swapchain.format, directFormat);
+    assert.equal(swapchain.intermediateTexture, null);
+    assert.equal(swapchain.intermediateTextureView, null);
+    assert.equal(device.createdTextures.length, 0);
+
+    const lastCfg = context.configurations[context.configurations.length - 1];
+    assert.equal(lastCfg.format, directFormat);
+
+    // Direct render-target view comes straight from context.getCurrentTexture().
+    const rtView = swapchain.getRenderTargetView();
+    assert.match(rtView.id, /^color-view-/);
+
+    // blitToCanvasIfNeeded & present must be strict no-ops with zero GPU pipeline allocations.
+    const encoder = createMockCommandEncoder();
+    assert.equal(swapchain.blitToCanvasIfNeeded(encoder, rtView), false);
+    assert.equal(swapchain.present(encoder, rtView), false);
+    assert.equal(encoder.passes.length, 0);
+    assert.equal(device.createdShaderModules.length, 0);
+    assert.equal(device.createdSamplers.length, 0);
+    assert.equal(device.createdRenderPipelines.length, 0);
+    assert.equal(device.createdBindGroups.length, 0);
+    assert.equal(swapchain.blitCount, 0);
+
+    const stats = swapchain.getStats();
+    assert.equal(stats.usesBlitFallback, false);
+    assert.equal(stats.streamFormat, directFormat);
+    assert.equal(stats.canvasFormat, directFormat);
+    assert.equal(stats.blitCount, 0);
+  }
+});
+
+test('W112 non-canvas stream format (rgb10a2unorm) allocates intermediate texture, keeps canvas in preferred format, and records fullscreen-triangle blit pass', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: true,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  assert.equal(device.createdTextures.length, 1); // depth only
+  assert.equal(context.configurations.length, 1);
+
+  // Switch to non-canvas format rgb10a2unorm.
+  assert.equal(swapchain.configureForStreamFormat('rgb10a2unorm'), true);
+  // Repeating the same stream format is a no-op.
+  assert.equal(swapchain.configureForStreamFormat('rgb10a2unorm'), false);
+
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.streamFormat, 'rgb10a2unorm');
+  assert.equal(swapchain.canvasFormat, 'bgra8unorm');
+  assert.equal(swapchain.format, 'bgra8unorm');
+
+  // Canvas context stayed configured with valid preferred format (no invalid rgb10a2unorm configure).
+  assert.equal(context.configurations.length, 1);
+  assert.equal(context.configurations[0].format, 'bgra8unorm');
+
+  // Intermediate rgb10a2unorm texture allocated with RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC.
+  assert.equal(device.createdTextures.length, 2);
+  const intermediateTex = device.createdTextures[1];
+  assert.equal(swapchain.intermediateTexture, intermediateTex);
+  assert.equal(swapchain.intermediateTextureView, intermediateTex.view);
+  assert.deepEqual(intermediateTex.desc, {
+    label: 'playgta6-swapchain-intermediate',
+    size: { width: 1280, height: 720, depthOrArrayLayers: 1 },
+    format: 'rgb10a2unorm',
+    usage: INTERMEDIATE_TEXTURE_USAGE,
+  });
+
+  // getRenderTargetView() and acquireRenderPassDescriptor() transparently target intermediate view.
+  assert.equal(swapchain.getRenderTargetView(), intermediateTex.view);
+  const passDesc = swapchain.acquireRenderPassDescriptor({
+    clearColor: { r: 0.2, g: 0.4, b: 0.6, a: 1.0 },
+  });
+  assert.equal(passDesc.colorAttachments[0].view, intermediateTex.view);
+  assert.equal(passDesc.depthStencilAttachment.view, device.createdTextures[0].view);
+
+  // Record blit pass onto explicit canvas texture view.
+  const encoder1 = createMockCommandEncoder();
+  const explicitCanvasView = { kind: 'GPUTextureView', id: 'explicit-canvas-view-1' };
+  assert.equal(swapchain.blitToCanvasIfNeeded(encoder1, explicitCanvasView), true);
+
+  assert.equal(device.createdShaderModules.length, 1);
+  assert.equal(device.createdSamplers.length, 1);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(
+    device.createdRenderPipelines[0].desc.fragment.targets[0].format,
+    'bgra8unorm'
+  );
+  assert.equal(device.createdBindGroups[0].desc.entries[0].resource, intermediateTex.view);
+  assert.equal(device.createdBindGroups[0].desc.entries[1].resource, device.createdSamplers[0]);
+
+  assert.equal(encoder1.passes.length, 1);
+  const blitPass1 = encoder1.passes[0];
+  assert.equal(blitPass1.desc.colorAttachments[0].view, explicitCanvasView);
+  assert.equal(blitPass1.desc.colorAttachments[0].loadOp, 'clear');
+  assert.equal(blitPass1.desc.colorAttachments[0].storeOp, 'store');
+  assert.deepEqual(blitPass1.pipelines, [device.createdRenderPipelines[0]]);
+  assert.deepEqual(blitPass1.bindGroups, [{ index: 0, bindGroup: device.createdBindGroups[0] }]);
+  assert.equal(blitPass1.draws.length, 1);
+  assert.equal(blitPass1.draws[0].vertexCount, 3);
+  assert.equal(blitPass1.ended, true);
+  assert.equal(swapchain.blitCount, 1);
+
+  // Second blit (via present() with 1-arg auto canvas view) reuses cached pipeline & bindGroup!
+  const encoder2 = createMockCommandEncoder();
+  assert.equal(swapchain.present(encoder2), true);
+  assert.equal(device.createdShaderModules.length, 1);
+  assert.equal(device.createdSamplers.length, 1);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(encoder2.passes.length, 1);
+  assert.match(encoder2.passes[0].desc.colorAttachments[0].view.id, /^color-view-/);
+  assert.equal(encoder2.passes[0].draws[0].vertexCount, 3);
+  assert.equal(swapchain.blitCount, 2);
+
+  const stats = swapchain.getStats();
+  assert.equal(stats.usesBlitFallback, true);
+  assert.equal(stats.streamFormat, 'rgb10a2unorm');
+  assert.equal(stats.canvasFormat, 'bgra8unorm');
+  assert.equal(stats.blitCount, 2);
+});
+
+test('W112 constructor with non-canvas format allocates intermediate lazily on configure and supports format changes', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'rg11b10ufloat',
+    enableDepth: false,
+  });
+
+  // Constructor must not allocate textures before configure().
+  assert.equal(device.createdTextures.length, 0);
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.streamFormat, 'rg11b10ufloat');
+  assert.equal(swapchain.canvasFormat, 'bgra8unorm');
+
+  swapchain.configure({ width: 800, height: 600 });
+  assert.equal(context.configurations[0].format, 'bgra8unorm');
+  assert.equal(device.createdTextures.length, 1);
+  assert.equal(device.createdTextures[0].desc.format, 'rg11b10ufloat');
+  assert.deepEqual(device.createdTextures[0].desc.size, {
+    width: 800,
+    height: 600,
+    depthOrArrayLayers: 1,
+  });
+
+  const enc1 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc1), true);
+  assert.equal(device.createdBindGroups.length, 1);
+
+  // Switch to another non-canvas format (rgba8unorm-srgb): destroys old intermediate & invalidates bind group.
+  const firstTex = device.createdTextures[0];
+  assert.equal(swapchain.configureForStreamFormat('rgba8unorm-srgb'), true);
+  assert.equal(firstTex.destroyed, true);
+  assert.equal(device.createdTextures.length, 2);
+  assert.equal(device.createdTextures[1].desc.format, 'rgba8unorm-srgb');
+
+  const enc2 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc2), true);
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(device.createdRenderPipelines.length, 1); // canvasFormat unchanged -> pipeline reused
+  assert.equal(device.createdBindGroups[1].desc.entries[0].resource, device.createdTextures[1].view);
+});
+
+test('W112 resize destroys old intermediate texture before creating replacement and invalidates bind group', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 640, height: 360 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  const firstIntermediate = device.createdTextures[0];
+  assert.deepEqual(firstIntermediate.desc.size, {
+    width: 640,
+    height: 360,
+    depthOrArrayLayers: 1,
+  });
+
+  const enc1 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc1), true);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(device.createdBindGroups.length, 1);
+
+  // No-op resize keeps intermediate texture and bind group intact.
+  assert.equal(swapchain.resize(640, 360, 1), false);
+  assert.equal(firstIntermediate.destroyed, false);
+  assert.equal(device.createdTextures.length, 1);
+
+  // Clear events to check destroy-before-create ordering on resize.
+  events.length = 0;
+
+  assert.equal(swapchain.resize(960, 540, 2), true);
+  assert.equal(firstIntermediate.destroyed, true);
+  assert.equal(firstIntermediate.destroyCalls, 1);
+  assert.equal(device.createdTextures.length, 2);
+
+  const secondIntermediate = device.createdTextures[1];
+  assert.equal(swapchain.intermediateTexture, secondIntermediate);
+  assert.deepEqual(secondIntermediate.desc.size, {
+    width: 1920,
+    height: 1080,
+    depthOrArrayLayers: 1,
+  });
+  assert.equal(secondIntermediate.desc.format, 'rgb10a2unorm');
+
+  const destroyIdx = events.findIndex((e) => e.op === 'depthTexture.destroy' && e.id === firstIntermediate.id);
+  const createIdx = events.findIndex((e) => e.op === 'device.createTexture' && e.id === secondIntermediate.id);
+  assert.ok(destroyIdx !== -1 && createIdx !== -1 && destroyIdx < createIdx);
+
+  // Next blit must allocate a fresh bind group for the resized view while reusing the blit pipeline.
+  const enc2 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc2), true);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(device.createdBindGroups[1].desc.entries[0].resource, secondIntermediate.view);
+  assert.equal(enc2.passes[0].bindGroups[0].bindGroup, device.createdBindGroups[1]);
+  assert.equal(swapchain.blitCount, 2);
+});
+
+test('W112 switching back to direct canvas format (rgba8unorm) destroys intermediate texture and disables blit fallback', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  const intermediateTex = device.createdTextures[0];
+  const enc1 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc1), true);
+  assert.equal(swapchain.blitCount, 1);
+
+  // Switch back to direct rgba8unorm.
+  assert.equal(swapchain.configureForStreamFormat('rgba8unorm'), true);
+
+  assert.equal(intermediateTex.destroyed, true);
+  assert.equal(intermediateTex.destroyCalls, 1);
+  assert.equal(swapchain.intermediateTexture, null);
+  assert.equal(swapchain.intermediateTextureView, null);
+  assert.equal(swapchain.usesBlitFallback, false);
+  assert.equal(swapchain.streamFormat, 'rgba8unorm');
+  assert.equal(swapchain.canvasFormat, 'rgba8unorm');
+  assert.equal(swapchain.format, 'rgba8unorm');
+  assert.equal(context.configurations[context.configurations.length - 1].format, 'rgba8unorm');
+
+  // Direct view now returns canvas view and blitToCanvasIfNeeded is a no-op.
+  const directView = swapchain.getRenderTargetView();
+  assert.match(directView.id, /^color-view-/);
+
+  const enc2 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc2, directView), false);
+  assert.equal(enc2.passes.length, 0);
+  assert.equal(swapchain.blitCount, 1);
+
+  // Re-enabling blit fallback later builds fresh resources (confirming old cache was cleared).
+  assert.equal(swapchain.configureForStreamFormat('rgb10a2unorm'), true);
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.canvasFormat, 'rgba8unorm');
+  const enc3 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc3), true);
+  assert.equal(device.createdRenderPipelines.length, 2);
+  assert.equal(device.createdRenderPipelines[1].desc.fragment.targets[0].format, 'rgba8unorm');
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(swapchain.blitCount, 2);
+});
+
+test('W112 device.lost and recover(newDevice) destroy stale intermediate texture and rebuild blit resources cleanly', async () => {
+  const { canvas, context, device, events, makeDevice } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  const oldIntermediate = device.createdTextures[0];
+  const enc1 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc1), true);
+  assert.equal(swapchain.blitCount, 1);
+
+  device.triggerLost({ reason: 'unknown', message: 'simulated loss' });
+  await device.lost;
+  await Promise.resolve();
+
+  assert.equal(oldIntermediate.destroyed, true);
+  assert.equal(swapchain.intermediateTexture, null);
+  assert.equal(swapchain.blitToCanvasIfNeeded(createMockCommandEncoder()), false);
+
+  const newDevice = attachMockBlitCapabilities(makeDevice('device-1'), events);
+  swapchain.recover(newDevice, 'rgba8unorm');
+
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.streamFormat, 'rgb10a2unorm');
+  assert.equal(swapchain.canvasFormat, 'rgba8unorm');
+  assert.equal(newDevice.createdTextures.length, 1);
+  assert.equal(newDevice.createdTextures[0].desc.format, 'rgb10a2unorm');
+
+  const enc2 = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc2), true);
+  assert.equal(newDevice.createdShaderModules.length, 1);
+  assert.equal(newDevice.createdSamplers.length, 1);
+  assert.equal(newDevice.createdRenderPipelines.length, 1);
+  assert.equal(newDevice.createdRenderPipelines[0].desc.fragment.targets[0].format, 'rgba8unorm');
+  assert.equal(newDevice.createdBindGroups.length, 1);
+  assert.equal(newDevice.createdBindGroups[0].desc.entries[0].resource, newDevice.createdTextures[0].view);
+  assert.equal(swapchain.blitCount, 2);
+});
+
+test('W112 destroy() cleanly destroys intermediate texture, is idempotent, and prevents further blits', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: true,
+  });
+  swapchain.configure({ width: 800, height: 600 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  const depthTex = device.createdTextures[0];
+  const intermediateTex = device.createdTextures[1];
+  const enc = createMockCommandEncoder();
+  assert.equal(swapchain.blitToCanvasIfNeeded(enc), true);
+
+  swapchain.destroy();
+  assert.equal(depthTex.destroyed, true);
+  assert.equal(depthTex.destroyCalls, 1);
+  assert.equal(intermediateTex.destroyed, true);
+  assert.equal(intermediateTex.destroyCalls, 1);
+  assert.equal(swapchain.intermediateTexture, null);
+  assert.equal(swapchain.intermediateTextureView, null);
+
+  // Idempotent second destroy().
+  swapchain.destroy();
+  assert.equal(intermediateTex.destroyCalls, 1);
+
+  // Post-destroy guards.
+  assert.throws(() => swapchain.getRenderTargetView(), /destroyed/i);
+  assert.equal(swapchain.blitToCanvasIfNeeded(createMockCommandEncoder()), false);
+  assert.equal(swapchain.configureForStreamFormat('rgba8unorm'), false);
+  assert.equal(swapchain.getStats().blitCount, 1);
 });
