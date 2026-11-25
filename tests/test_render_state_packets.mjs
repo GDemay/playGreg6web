@@ -1523,6 +1523,10 @@ test('W81 G31 render_state_packets.js has zero ES module syntax and reloads clea
   assert.equal(typeof ctx.PlayGta6RenderState.resolveTextureSampleType, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.parseWgslGroup0Bindings, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.isExplicitLayoutCompatibleWithWgsl, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.isIntegerTextureFormat, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.isBlendableTextureFormat, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.sanitizeColorTargetBlendState, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.sanitizeRenderPassAttachments, 'function');
 
   // Verify zero leaked top-level lexical declarations
   assert.doesNotThrow(() => {
@@ -4651,4 +4655,500 @@ test('W186 (#927): PresentX multi-plane bind-group/view cache eliminates per-fra
     }),
     null
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// W266 (#1128): Viewport/scissor clamping telemetry, blend-state & attachment sanitization
+// ---------------------------------------------------------------------------------------------
+
+test('W266 (#1128): clampViewportToTarget & clampScissorToTarget sanitize NaN/Infinity/overflow/float32-edge inputs and track telemetry counters', () => {
+  // Pure unit checks for extreme/non-finite inputs
+  assert.deepEqual(
+    clampViewportToTarget(
+      {
+        x: Number.NEGATIVE_INFINITY,
+        y: Number.NaN,
+        width: Number.POSITIVE_INFINITY,
+        height: -120,
+        minDepth: Number.POSITIVE_INFINITY,
+        maxDepth: Number.NEGATIVE_INFINITY,
+      },
+      { width: 1280, height: 720 }
+    ),
+    { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 }
+  );
+
+  // Huge finite f64 values without targetSize must never produce non-finite f32
+  const hugeUnbounded = clampViewportToTarget(
+    { x: 1e308, y: -1e308, width: 1e308, height: 1e308, minDepth: 2, maxDepth: -1 },
+    null
+  );
+  assert.deepEqual(hugeUnbounded, { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 });
+
+  // Huge finite f64 values WITH targetSize clamp to [0, targetWidth] x [0, targetHeight]
+  const hugeBounded = clampViewportToTarget(
+    { x: 1e308, y: 10, width: 1e308, height: 1e308, minDepth: 0.9, maxDepth: 0.1 },
+    { width: 1280, height: 720 }
+  );
+  assert.deepEqual(hugeBounded, { x: 1280, y: 10, width: 0, height: 710, minDepth: 0.1, maxDepth: 0.9 });
+
+  // Float32 sum overflow edge case (0.7 + 1279.3 in f32 > 1280)
+  const f32Sum = clampViewportToTarget(
+    { x: 0.7, y: 0.7, width: 1279.3, height: 719.3, minDepth: 0, maxDepth: 1 },
+    { width: 1280, height: 720 }
+  );
+  assert.ok(f32Sum.x >= 0 && f32Sum.width >= 0 && Math.fround(f32Sum.x) + Math.fround(f32Sum.width) <= 1280);
+  assert.ok(f32Sum.y >= 0 && f32Sum.height >= 0 && Math.fround(f32Sum.y) + Math.fround(f32Sum.height) <= 720);
+
+  // Null / undefined viewport & scissor objects sanitize cleanly
+  assert.deepEqual(clampViewportToTarget(null, { width: 1280, height: 720 }), {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    minDepth: 0,
+    maxDepth: 1,
+  });
+  assert.deepEqual(clampScissorToTarget(null, { width: 1280, height: 720 }), {
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+  });
+  assert.deepEqual(
+    clampScissorToTarget(
+      { x: Number.NaN, y: Number.POSITIVE_INFINITY, width: 1e20, height: -50 },
+      { width: 1280, height: 720 }
+    ),
+    { x: 0, y: 0, width: 1280, height: 0 }
+  );
+  assert.deepEqual(
+    clampScissorToTarget({ x: 1e20, y: 0, width: 1e20, height: 10 }, null),
+    { x: 0xffffffff, y: 0, width: 0xffffffff, height: 10 }
+  );
+
+  // End-to-end packet stream verifies clampedViewports & clampedScissors counters and warnings
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 720 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  assert.equal(handler.getStats().clampedViewports, 0);
+  assert.equal(handler.getStats().clampedScissors, 0);
+
+  const nanBlend = new Uint8Array(16);
+  const nbv = new DataView(nanBlend.buffer);
+  nbv.setFloat32(0, Number.NaN, true);
+  nbv.setFloat32(4, Number.POSITIVE_INFINITY, true);
+  nbv.setFloat32(8, 0.25, true);
+  nbv.setFloat32(12, -0, true);
+
+  const stream = concat(
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+    // 1. Valid in-bounds viewport & scissor -> counters must NOT increment
+    setViewportPacket(0, 0, 1280, 720, 0, 1),
+    setScissorPacket(0, 0, 1280, 720),
+    // 2. Oversized 4K viewport & scissor -> +1 each
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(0, 0, 3840, 2160),
+    // 3. NaN/negative viewport with reversed depth & huge uint32 scissor -> +1 each
+    setViewportPacket(Number.NaN, -10, 640, Number.POSITIVE_INFINITY, 0.9, 0.1),
+    setScissorPacket(0xffffffff, 500, 1000, 500),
+    // 4. Depth-only out-of-range viewport -> +1 viewport
+    setViewportPacket(10, 20, 100, 100, -0.5, 1.5),
+    // 5. Non-finite blend constant -> sanitized to finite 0
+    header(V2_OPCODES.SET_BLEND_CONSTANT, nanBlend),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.getStats().clampedViewports, 3);
+  assert.equal(handler.getTelemetry().clampedViewports, 3);
+  assert.equal(handler.getStats().clampedScissors, 2);
+  assert.equal(handler.getTelemetry().clampedScissors, 2);
+
+  const vps = gpu.passCalls.filter((c) => c.op === 'setViewport').map((c) => c.args);
+  assert.deepEqual(vps, [
+    [0, 0, 1280, 720, 0, 1],
+    [0, 0, 1280, 720, 0, 1],
+    [0, 0, 640, 0, Math.fround(0.1), Math.fround(0.9)],
+    [10, 20, 100, 100, 0, 1],
+  ]);
+  const scs = gpu.passCalls.filter((c) => c.op === 'setScissorRect').map((c) => c.args);
+  assert.deepEqual(scs, [
+    [0, 0, 1280, 720],
+    [0, 0, 1280, 720],
+    [1280, 500, 0, 220],
+  ]);
+  const blendConst = gpu.passCalls.find((c) => c.op === 'setBlendConstant');
+  assert.deepEqual(blendConst.args, [{ r: 0, g: 0, b: 0.25, a: 0 }]);
+
+  const warnings = handler.getTelemetry().warnings;
+  assert.ok(warnings.some((w) => w.includes('clamped viewport')));
+  assert.ok(warnings.some((w) => w.includes('clamped scissor')));
+});
+
+test('W266 (#1128): isBlendableTextureFormat & sanitizeColorTargetBlendState strip blend on integer and non-blendable float32 formats', () => {
+  const {
+    isIntegerTextureFormat,
+    isBlendableTextureFormat,
+    sanitizeColorTargetBlendState,
+  } = rs;
+
+  const noFeatureDevice = { features: new Set() };
+  const f32BlendDevice = { features: new Set(['float32-blendable']) };
+  const rg11Device = { features: new Set(['rg11b10ufloat-renderable']) };
+  const tier1Device = { features: new Set(['texture-formats-tier1']) };
+
+  // Integer formats are never blendable (even with optional device features)
+  for (const fmt of [
+    'r8uint',
+    'r8sint',
+    'r16uint',
+    'r16sint',
+    'r32uint',
+    'r32sint',
+    'rg8uint',
+    'rg8sint',
+    'rg16uint',
+    'rg16sint',
+    'rg32uint',
+    'rg32sint',
+    'rgba8uint',
+    'rgba8sint',
+    'rgb10a2uint',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba32uint',
+    'rgba32sint',
+  ]) {
+    assert.equal(isIntegerTextureFormat(fmt), true, `${fmt} must be classified as integer`);
+    assert.equal(isBlendableTextureFormat(fmt, noFeatureDevice), false, `${fmt} must not be blendable`);
+    assert.equal(isBlendableTextureFormat(fmt, f32BlendDevice), false, `${fmt} must not be blendable with float32-blendable`);
+  }
+
+  // Core blendable formats
+  for (const fmt of [
+    'r8unorm',
+    'r16float',
+    'rg8unorm',
+    'rg16float',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgb10a2unorm',
+    'rgba16float',
+  ]) {
+    assert.equal(isIntegerTextureFormat(fmt), false);
+    assert.equal(isBlendableTextureFormat(fmt, noFeatureDevice), true, `${fmt} must be core blendable`);
+  }
+
+  // Float32 formats require float32-blendable feature
+  for (const fmt of ['r32float', 'rg32float', 'rgba32float']) {
+    assert.equal(isBlendableTextureFormat(fmt, noFeatureDevice), false);
+    assert.equal(isBlendableTextureFormat(fmt, f32BlendDevice), true);
+  }
+
+  // Feature-gated renderable/blendable formats
+  assert.equal(isBlendableTextureFormat('rg11b10ufloat', noFeatureDevice), false);
+  assert.equal(isBlendableTextureFormat('rg11b10ufloat', rg11Device), true);
+  assert.equal(isBlendableTextureFormat('rgba16unorm', noFeatureDevice), false);
+  assert.equal(isBlendableTextureFormat('rgba16unorm', tier1Device), true);
+
+  // Non-renderable / depth / compressed / invalid formats are never blendable
+  for (const fmt of ['rgb9e5ufloat', 'rgba8snorm', 'depth32float', 'stencil8', 'bc7-rgba-unorm', 'undefined', '', null]) {
+    assert.equal(isBlendableTextureFormat(fmt, f32BlendDevice), false);
+  }
+
+  const blendSpec = {
+    color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+    alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+  };
+
+  // Pure sanitizeColorTargetBlendState checks (non-mutating)
+  const intTarget = { format: 'rgba8uint', writeMask: 0x0f, blend: blendSpec };
+  const intSan = sanitizeColorTargetBlendState(intTarget, noFeatureDevice);
+  assert.equal(intSan.stripped, true);
+  assert.equal(intSan.reason, 'integer-format-not-blendable');
+  assert.deepEqual(intSan.target, { format: 'rgba8uint', writeMask: 0x0f });
+  assert.ok(intTarget.blend, 'sanitizeColorTargetBlendState must not mutate input target');
+
+  const f32Target = { format: 'rgba32float', writeMask: 0x07, blend: blendSpec };
+  const f32SanNoFeat = sanitizeColorTargetBlendState(f32Target, noFeatureDevice);
+  assert.equal(f32SanNoFeat.stripped, true);
+  assert.equal(f32SanNoFeat.reason, 'float32-format-not-blendable');
+  assert.deepEqual(f32SanNoFeat.target, { format: 'rgba32float', writeMask: 0x07 });
+
+  const f32SanWithFeat = sanitizeColorTargetBlendState(f32Target, f32BlendDevice);
+  assert.equal(f32SanWithFeat.stripped, false);
+  assert.equal(f32SanWithFeat.target, f32Target);
+
+  const nonBlendTarget = { format: 'rgba8uint', writeMask: 0x0f };
+  assert.deepEqual(sanitizeColorTargetBlendState(nonBlendTarget, noFeatureDevice), {
+    target: nonBlendTarget,
+    stripped: false,
+    reason: null,
+  });
+
+  // End-to-end CreateRenderPipeline2 MRT pipeline:
+  // target 0: rgba8unorm (blend kept)
+  // target 1: r32uint (blend stripped)
+  // target 2: rgba32float (blend stripped without float32-blendable; kept WITH float32-blendable)
+  // target 3: rgba16sint (blend stripped)
+  function buildMrtBlendKey() {
+    const key = new Uint8Array(376);
+    const v = new DataView(key.buffer);
+    v.setUint32(20, 4, true);
+    const formats = [
+      formatCodeOf('rgba8unorm'),
+      formatCodeOf('r32uint'),
+      formatCodeOf('rgba32float'),
+      formatCodeOf('rgba16sint'),
+    ];
+    formats.forEach((fmtCode, idx) => {
+      // format, blendEnable=1, writeMask=0xf, pad=0, color(add, src-alpha=4, one-minus-src-alpha=5), alpha(add, one=1, zero=0)
+      key.set([fmtCode, 1, 0x0f, 0, 0, 4, 5, 0, 0, 1, 0, 0], 24 + idx * 12);
+    });
+    v.setUint32(160, 1, true);
+    v.setUint32(164, 0xffffffff, true);
+    return key;
+  }
+
+  // Case A: device without float32-blendable -> strips 3 targets (r32uint, rgba32float, rgba16sint)
+  {
+    const gpu = createMockWebGpu();
+    gpu.device.features = new Set();
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+    const handler = installRenderStatePackets(processor);
+    processor.executeCommandBuffer(
+      concat(
+        new Stream()
+          .shader(1, 0, '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }')
+          .shader(2, 1, '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }')
+          .bytes(),
+        renderPipeline2Packet(50, 1, 2, 0, buildMrtBlendKey())
+      )
+    );
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.equal(handler.getStats().strippedNonBlendableBlends, 3);
+    assert.equal(handler.getTelemetry().strippedNonBlendableBlends, 3);
+
+    const [pipe] = gpu.results('createRenderPipeline');
+    const targets = pipe.desc.fragment.targets;
+    assert.equal(targets.length, 4);
+    assert.ok(targets[0].blend, 'rgba8unorm blend must be preserved');
+    assert.equal('blend' in targets[1], false, 'r32uint blend must be stripped');
+    assert.equal('blend' in targets[2], false, 'rgba32float blend must be stripped without float32-blendable');
+    assert.equal('blend' in targets[3], false, 'rgba16sint blend must be stripped');
+    assert.equal(targets[1].writeMask, 0x0f);
+    assert.equal(targets[2].writeMask, 0x0f);
+    assert.equal(targets[3].writeMask, 0x0f);
+
+    const warnings = handler.getTelemetry().warnings;
+    assert.ok(warnings.some((w) => w.includes('r32uint') && w.includes('integer-format-not-blendable')));
+    assert.ok(warnings.some((w) => w.includes('rgba32float') && w.includes('float32-format-not-blendable')));
+  }
+
+  // Case B: device WITH float32-blendable -> preserves rgba32float blend, still strips integer targets (2)
+  {
+    const gpu = createMockWebGpu();
+    gpu.device.features = new Set(['float32-blendable']);
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+    const handler = installRenderStatePackets(processor);
+    processor.executeCommandBuffer(
+      concat(
+        new Stream()
+          .shader(1, 0, '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }')
+          .shader(2, 1, '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }')
+          .bytes(),
+        renderPipeline2Packet(51, 1, 2, 0, buildMrtBlendKey())
+      )
+    );
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.equal(handler.getStats().strippedNonBlendableBlends, 2);
+
+    const [pipe] = gpu.results('createRenderPipeline');
+    const targets = pipe.desc.fragment.targets;
+    assert.ok(targets[0].blend);
+    assert.equal('blend' in targets[1], false);
+    assert.ok(targets[2].blend, 'rgba32float blend must be preserved when float32-blendable is enabled');
+    assert.equal('blend' in targets[3], false);
+  }
+});
+
+test('W266 (#1128): sanitizeRenderPassAttachments guards mismatched color/depth/resolve dimensions and depthClearValue/readOnly invariants', () => {
+  const { sanitizeRenderPassAttachments } = rs;
+
+  // 1. Pure unit test: mismatched secondary color, resolveTarget, and depthStencil
+  const vColor0 = { kind: 'GPUTextureView', id: 'c0' };
+  const vResolve0 = { kind: 'GPUTextureView', id: 'r0', width: 640, height: 360 };
+  const vColor1 = { kind: 'GPUTextureView', id: 'c1' };
+  const vDepth = { kind: 'GPUTextureView', id: 'ds' };
+
+  const resMismatch = sanitizeRenderPassAttachments(
+    {
+      colorAttachments: [
+        { view: vColor0, resolveTarget: vResolve0, loadOp: 'clear', storeOp: 'store' },
+        { view: vColor1, loadOp: 'load', storeOp: 'store' },
+      ],
+      depthStencilAttachment: {
+        view: vDepth,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store',
+        depthClearValue: 1,
+      },
+    },
+    {
+      colors: [
+        { width: 1280, height: 720 },
+        { width: 640, height: 360 },
+      ],
+      depthStencil: { width: 3840, height: 2160 },
+    }
+  );
+  assert.equal(resMismatch.sanitizedCount, 3);
+  assert.deepEqual(resMismatch.referenceSize, { width: 1280, height: 720 });
+  assert.deepEqual(resMismatch.descriptor.colorAttachments, [
+    { view: vColor0, loadOp: 'clear', storeOp: 'store' },
+    null,
+  ]);
+  assert.equal('depthStencilAttachment' in resMismatch.descriptor, false);
+
+  // 2. Pure unit test: depthClearValue out of [0, 1] / NaN and readOnly ops stripped
+  const resClearClamp = sanitizeRenderPassAttachments(
+    {
+      colorAttachments: [{ view: vColor0, loadOp: 'load', storeOp: 'store' }],
+      depthStencilAttachment: {
+        view: vDepth,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store',
+        depthClearValue: Number.NaN,
+        stencilReadOnly: true,
+        stencilLoadOp: 'clear',
+        stencilStoreOp: 'store',
+        stencilClearValue: 1,
+      },
+    },
+    {
+      colors: [{ width: 1280, height: 720 }],
+      depthStencil: { width: 1280, height: 720 },
+    }
+  );
+  assert.equal(resClearClamp.sanitizedCount, 2);
+  assert.equal(resClearClamp.descriptor.depthStencilAttachment.depthClearValue, 1);
+  assert.equal('stencilLoadOp' in resClearClamp.descriptor.depthStencilAttachment, false);
+  assert.equal('stencilStoreOp' in resClearClamp.descriptor.depthStencilAttachment, false);
+  assert.equal('stencilClearValue' in resClearClamp.descriptor.depthStencilAttachment, false);
+
+  const resDepthReadOnly = sanitizeRenderPassAttachments(
+    {
+      colorAttachments: [],
+      depthStencilAttachment: {
+        view: vDepth,
+        depthReadOnly: true,
+        depthLoadOp: 'clear',
+        depthStoreOp: 'store',
+        depthClearValue: 0.5,
+      },
+    },
+    { colors: [], depthStencil: { width: 512, height: 512 } }
+  );
+  assert.equal(resDepthReadOnly.sanitizedCount, 1);
+  assert.deepEqual(resDepthReadOnly.descriptor.depthStencilAttachment, {
+    view: vDepth,
+    depthReadOnly: true,
+  });
+
+  // 3. Unknown sizes never produce false positives
+  const resUnknown = sanitizeRenderPassAttachments(
+    {
+      colorAttachments: [{ view: vColor0, loadOp: 'clear', storeOp: 'store' }],
+      depthStencilAttachment: { view: vDepth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1 },
+    },
+    { colors: [null], depthStencil: { width: 1280, height: 720 } }
+  );
+  assert.equal(resUnknown.sanitizedCount, 0);
+  assert.ok(resUnknown.descriptor.depthStencilAttachment);
+
+  // 4. End-to-end BeginRenderPass stream:
+  //    Pass A: 1280x720 swapchain color + 3840x2160 4K depth texture -> depth dropped cleanly + viewport/scissor clamped to 1280x720
+  //    Pass B: Offscreen MRT color0 (1024x512) + color1 (512x256, mismatch) + depth (1024x512 @ mip 1 = 512x256, mismatch) -> color1 null, depth dropped
+  //    Pass C: Offscreen mip-matched color0 (1024x512 @ mip 1 = 512x256) + depth (512x256 @ mip 0) + depthClearValue=2.5 -> both kept, depthClearValue clamped to 1
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 720 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const rgbaCode = formatCodeOf('rgba8unorm');
+  const depthCode = formatCodeOf('depth32float');
+
+  const stream = concat(
+    createTexture2Packet({ id: 200, width: 3840, height: 2160, format: depthCode, usage: 0x10 }),
+    createTexture2Packet({ id: 201, width: 1024, height: 512, mipLevels: 2, format: rgbaCode, usage: 0x10 }),
+    createTexture2Packet({ id: 202, width: 512, height: 256, format: rgbaCode, usage: 0x10 }),
+    createTexture2Packet({ id: 203, width: 1024, height: 512, mipLevels: 2, format: depthCode, usage: 0x10 }),
+    createTexture2Packet({ id: 204, width: 512, height: 256, format: depthCode, usage: 0x10 }),
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    // Pass A: swapchain 1280x720 + 4K depth 3840x2160 -> depth dropped (+1)
+    beginRenderPassPacket({
+      colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }],
+      depthStencil: { textureId: 200 },
+    }),
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(0, 0, 3840, 2160),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass B: MRT color0 1024x512 + color1 512x256 + depth mip1 512x256 -> color1=null (+1), depth dropped (+1)
+    beginRenderPassPacket({
+      colors: [
+        { textureId: 201, view: viewDesc({ baseMip: 0, mipCount: 1 }) },
+        { textureId: 202 },
+      ],
+      depthStencil: { textureId: 203, view: viewDesc({ baseMip: 1, mipCount: 1 }) },
+    }),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass C: mip-matched color0 (512x256) + depth (512x256) with out-of-range depthClearValue=2.5 (+1)
+    beginRenderPassPacket({
+      colors: [{ textureId: 201, view: viewDesc({ baseMip: 1, mipCount: 1 }) }],
+      depthStencil: { textureId: 204, depthClearValue: 2.5 },
+    }),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.getStats().sanitizedAttachments, 4);
+  assert.equal(handler.getTelemetry().sanitizedAttachments, 4);
+  assert.equal(handler.getStats().clampedViewports, 1);
+  assert.equal(handler.getStats().clampedScissors, 1);
+
+  const begins = gpu.passCalls.filter((c) => c.op === 'beginRenderPass').map((c) => c.args[0]);
+  assert.equal(begins.length, 3);
+
+  // Pass A: swapchain kept, 4K depth dropped
+  assert.equal(begins[0].colorAttachments.length, 1);
+  assert.equal(begins[0].colorAttachments[0].view, gpu.swapchainView);
+  assert.equal('depthStencilAttachment' in begins[0], false);
+
+  // Pass B: color0 kept, color1 nulled, mismatched mip-1 depth dropped
+  assert.equal(begins[1].colorAttachments.length, 2);
+  assert.ok(begins[1].colorAttachments[0] !== null);
+  assert.equal(begins[1].colorAttachments[1], null);
+  assert.equal('depthStencilAttachment' in begins[1], false);
+
+  // Pass C: both mip-matched attachments kept, depthClearValue clamped to 1
+  assert.equal(begins[2].colorAttachments.length, 1);
+  assert.ok(begins[2].depthStencilAttachment);
+  assert.equal(begins[2].depthStencilAttachment.depthClearValue, 1);
+
+  const warnings = handler.getTelemetry().warnings;
+  assert.ok(warnings.some((w) => w.includes('dropped depthStencilAttachment (3840x2160)')));
+  assert.ok(warnings.some((w) => w.includes('dropped colorAttachments[1] (512x256)')));
+  assert.ok(warnings.some((w) => w.includes('clamped depthClearValue')));
 });
