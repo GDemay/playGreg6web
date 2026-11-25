@@ -32,8 +32,8 @@ use crate::convert::{ShaderStage, format_shader_hash};
 use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
-    analyze_instructions, decode_program, sop2_src_pair_widths, sopc_src_pair_widths,
-    vop2_is_co_ci, vop2_is_madk,
+    analyze_instructions, decode_program, decode_vop3_interp_attr, sop2_src_pair_widths,
+    sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
 };
 use crate::rdna2_cfg::{
     BlockId, BranchKind, ControlFlowGraph, DISPATCH_EXIT_PC, ExecMaskOp, ExecMaskWrite,
@@ -789,6 +789,7 @@ struct MimgAddrLayout {
     is_zero_lod: bool,
     is_load: bool,
     is_store: bool,
+    is_get_lod: bool,
 }
 
 /// Decode GFX10.3 2D MIMG address VGPR layout (`[offset], [bias], [z_compare], [grad], u, v, [lod/clamp]`).
@@ -803,6 +804,7 @@ fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
         is_zero_lod: false,
         is_load: false,
         is_store: false,
+        is_get_lod: false,
     };
     match op {
         // image_load: (x, y)
@@ -932,6 +934,11 @@ fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
             compare_off: Some(1),
             uv_off: 2,
             is_zero_lod: true,
+            ..base
+        }),
+        // image_get_lod: (u, v) -> mip levels (safe WGSL mip 0.0 fallback)
+        0x60 => Some(MimgAddrLayout {
+            is_get_lod: true,
             ..base
         }),
         _ => None,
@@ -1373,7 +1380,7 @@ fn analyze_vsharp_indirections(
                         origins[105] = SgprOrigin::Unknown;
                     }
                 } else {
-                    if *op == 0x05 {
+                    if matches!(*op, 0x05 | 0x1B | 0x1D) {
                         taint_vsharp_if_sgpr_read(&mut live, u16::from(*sdst));
                     }
                     if *sdst <= 105 {
@@ -1412,10 +1419,10 @@ fn analyze_vsharp_indirections(
             Rdna2Detail::Sopk {
                 op, sdst, simm16, ..
             } => {
-                if matches!(*op, 0x0F | 0x10) {
+                if matches!(*op, 0x03..=0x0E | 0x0F | 0x10) {
                     taint_vsharp_if_sgpr_read(&mut live, u16::from(*sdst));
                 }
-                if !matches!(*op, 0x17..=0x1A) && *sdst <= 105 {
+                if !matches!(*op, 0x03..=0x0E | 0x17..=0x1A) && *sdst <= 105 {
                     let prev_origin = origins[*sdst as usize];
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
                     let imm = i32::from(*simm16 as i16);
@@ -1849,7 +1856,10 @@ fn analyze_vsharp_indirections(
                 src2,
                 ..
             } => {
-                taint_vsharp_if_sgpr_read(&mut live, *src0);
+                let is_interp_f16 = vop3_is_interp_f16(*op);
+                if !is_interp_f16 {
+                    taint_vsharp_if_sgpr_read(&mut live, *src0);
+                }
                 let is_unary = (0x180..=0x1FF).contains(op);
                 if !is_unary {
                     taint_vsharp_if_sgpr_read(&mut live, *src1);
@@ -1858,16 +1868,25 @@ fn analyze_vsharp_indirections(
                     // 64-bit shifts read an SGPR pair in src1
                     taint_vsharp_if_sgpr_read(&mut live, *src1 + 1);
                 }
-                let is_ternary = matches!(
-                    *op,
-                    0x100
-                        | 0x101
-                        | 0x128..=0x12A
-                        | 0x140..=0x165
-                        | 0x16D..=0x171
-                        | 0x340..=0x35F
-                        | 0x36D..=0x371
-                );
+                if *op == 0x364 {
+                    if *src0 <= 104 {
+                        taint_vsharp_if_sgpr_read(&mut live, *src0 + 1);
+                    }
+                    if *src1 <= 104 {
+                        taint_vsharp_if_sgpr_read(&mut live, *src1 + 1);
+                    }
+                }
+                let is_ternary = *op != 0x342
+                    && matches!(
+                        *op,
+                        0x100
+                            | 0x101
+                            | 0x128..=0x12A
+                            | 0x140..=0x165
+                            | 0x16D..=0x171
+                            | 0x340..=0x35F
+                            | 0x36D..=0x371
+                    );
                 if is_ternary {
                     taint_vsharp_if_sgpr_read(&mut live, *src2);
                 }
@@ -1928,7 +1947,7 @@ fn analyze_vsharp_indirections(
                                 };
                                 if layout.is_store {
                                     out.inst_storage_tex_keys.insert(inst_idx, key);
-                                } else {
+                                } else if !layout.is_get_lod {
                                     out.inst_tex_keys.insert(inst_idx, key);
                                 }
                             }
@@ -1945,7 +1964,7 @@ fn analyze_vsharp_indirections(
                                 };
                                 if layout.is_store {
                                     out.inst_storage_tex_keys.insert(inst_idx, key);
-                                } else {
+                                } else if !layout.is_get_lod {
                                     out.inst_tex_keys.insert(inst_idx, key);
                                 }
                             }
@@ -1970,39 +1989,45 @@ fn analyze_vsharp_indirections(
                                     table_byte_offset,
                                 } => {
                                     out.vsharp_fetch_insts.insert(def_inst_idx);
-                                    out.inst_samp_keys.insert(
-                                        inst_idx,
-                                        ResourceKey::Table {
-                                            user_sgpr,
-                                            table_byte_offset,
-                                        },
-                                    );
+                                    if !layout.is_get_lod {
+                                        out.inst_samp_keys.insert(
+                                            inst_idx,
+                                            ResourceKey::Table {
+                                                user_sgpr,
+                                                table_byte_offset,
+                                            },
+                                        );
+                                    }
                                 }
                                 SgprOrigin::DynamicHeapDesc {
                                     def_inst_idx,
                                     origin,
                                 } => {
                                     out.vsharp_fetch_insts.insert(def_inst_idx);
-                                    out.inst_samp_keys.insert(
-                                        inst_idx,
-                                        ResourceKey::SamplerHeap {
-                                            base_user_sgpr: origin.base_user_sgpr,
-                                            stride: origin.stride,
-                                            index_user_sgpr: origin.index_user_sgpr,
-                                            index_shift: origin.index_shift,
-                                        },
-                                    );
+                                    if !layout.is_get_lod {
+                                        out.inst_samp_keys.insert(
+                                            inst_idx,
+                                            ResourceKey::SamplerHeap {
+                                                base_user_sgpr: origin.base_user_sgpr,
+                                                stride: origin.stride,
+                                                index_user_sgpr: origin.index_user_sgpr,
+                                                index_shift: origin.index_shift,
+                                            },
+                                        );
+                                    }
                                 }
                                 SgprOrigin::ConstImmediate { def_inst_idx } => {
-                                    let idx = *static_sampler_by_def
-                                        .entry(def_inst_idx)
-                                        .or_insert_with(|| {
-                                            let i = next_static_sampler_index;
-                                            next_static_sampler_index += 1;
-                                            i
-                                        });
-                                    out.inst_samp_keys
-                                        .insert(inst_idx, ResourceKey::StaticSampler(idx));
+                                    if !layout.is_get_lod {
+                                        let idx = *static_sampler_by_def
+                                            .entry(def_inst_idx)
+                                            .or_insert_with(|| {
+                                                let i = next_static_sampler_index;
+                                                next_static_sampler_index += 1;
+                                                i
+                                            });
+                                        out.inst_samp_keys
+                                            .insert(inst_idx, ResourceKey::StaticSampler(idx));
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2484,8 +2509,10 @@ fn plan_program(
                         needs_vcc = true;
                     }
                 } else {
-                    if *op == 0x05 {
-                        needs_scc = true;
+                    if matches!(*op, 0x05 | 0x1B | 0x1D) {
+                        if *op == 0x05 {
+                            needs_scc = true;
+                        }
                         if *sdst <= 105 {
                             sgprs.insert(*sdst);
                             if !written_sgprs.contains(sdst) {
@@ -2500,7 +2527,10 @@ fn plan_program(
                 }
             }
             Rdna2Detail::Sopk { op, sdst, .. } => {
-                if *sdst <= 105 {
+                if matches!(*op, 0x03..=0x0E) {
+                    needs_scc = true;
+                    record_src!(u16::from(*sdst));
+                } else if *sdst <= 105 {
                     if matches!(*op, 0x0F | 0x10) && !written_sgprs.contains(sdst) {
                         read_before_write_sgprs.insert(*sdst);
                     }
@@ -2658,7 +2688,9 @@ fn plan_program(
                     }
                 }
             }
-            Rdna2Detail::Vopc { vsrc1, src0, .. } => {
+            Rdna2Detail::Vopc {
+                op, vsrc1, src0, ..
+            } => {
                 record_src_usage(
                     *src0,
                     &mut vgprs,
@@ -2681,7 +2713,11 @@ fn plan_program(
                     &mut needs_vcc,
                     &mut needs_scc,
                 );
-                needs_vcc = true;
+                if (*op & 0x10) != 0 {
+                    needs_exec = true;
+                } else {
+                    needs_vcc = true;
+                }
             }
             Rdna2Detail::Vop2 {
                 op,
@@ -2742,6 +2778,15 @@ fn plan_program(
                 src2,
                 ..
             } => {
+                if vop3_is_interp_f16(*op) {
+                    let (attr, _, _) = decode_vop3_interp_attr(*src0);
+                    if stage == ShaderStage::Fragment {
+                        frag_attr_set.insert(attr % MAX_WEBGPU_LOCATIONS);
+                    }
+                    vgprs.insert(*vdst);
+                    written_vgprs.insert(*vdst);
+                    continue;
+                }
                 record_src_usage(
                     *src0,
                     &mut vgprs,
@@ -2799,6 +2844,7 @@ fn plan_program(
                     // v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64 read a 64-bit src1 pair
                     record_src_pair_hi!(*src1);
                 }
+                let is_pair_dst = is_shift64 || *op == 0x364;
                 // Lane-mask SGPR destinations are written as canonical `(lo = lane bit, hi = 0)` pairs.
                 let mut record_lane_mask_dst = |sd7: u8| {
                     if sd7 <= 105 {
@@ -2816,11 +2862,14 @@ fn plan_program(
                     record_lane_mask_dst(*sd & 0x7F);
                 }
                 if *op <= 0xFF {
+                    if ((*op as u8) & 0x10) != 0 {
+                        needs_exec = true;
+                    }
                     record_lane_mask_dst(*vdst & 0x7F);
                 } else {
                     vgprs.insert(*vdst);
                     written_vgprs.insert(*vdst);
-                    if is_shift64 && *vdst < 255 {
+                    if is_pair_dst && *vdst < 255 {
                         vgprs.insert(*vdst + 1);
                         written_vgprs.insert(*vdst + 1);
                     }
@@ -2890,6 +2939,16 @@ fn plan_program(
                 ..
             } => {
                 if let Some(layout) = mimg_addr_layout(*op) {
+                    if layout.is_get_lod {
+                        let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
+                        let out_cnt = eff_mask.count_ones() as u8;
+                        for d in 0..out_cnt {
+                            let reg = vdata.saturating_add(d);
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
+                        continue;
+                    }
                     let tex_dim = TexDim::from_mimg_dim(*dim);
                     let addr_vgprs = layout.total_vgprs.saturating_add(tex_dim.extra_coord_vgprs());
                     if layout.is_store {
@@ -5120,6 +5179,11 @@ impl IrEmitter {
                             return self.lit_u32(a.count_ones());
                         }
                     }
+                    MathFunction::CountLeadingZeros => {
+                        if let Expression::Literal(Literal::U32(a)) = self.func.expressions[arg] {
+                            return self.lit_u32(a.leading_zeros());
+                        }
+                    }
                     MathFunction::Abs => {
                         if let Expression::Literal(Literal::I32(a)) = self.func.expressions[arg] {
                             return self.lit_i32(a.wrapping_abs());
@@ -6497,10 +6561,10 @@ impl IrEmitter {
                 omod,
                 abs,
                 neg,
+                op_sel,
                 literal,
-                ..
             } => self.translate_vop3(
-                *op, *vdst, *sdst, *src0, *src1, *src2, *clamp, *omod, *abs, *neg, *literal,
+                *op, *vdst, *sdst, *src0, *src1, *src2, *clamp, *omod, *abs, *neg, *op_sel, *literal,
             ),
             Rdna2Detail::Vop3P {
                 op,
@@ -6604,8 +6668,10 @@ impl IrEmitter {
         match op {
             // s_nop, s_endpgm, s_waitcnt, s_setprio (scheduling priority hint),
             // s_endpgm_saved, s_endpgm_ordered_ps_done, s_code_end,
-            // s_inst_prefetch, s_clause, s_wait_idle, s_waitcnt_depctr
-            0x00 | 0x01 | 0x0C | 0x0F | 0x1B | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 => true,
+            // s_inst_prefetch, s_clause, s_wait_idle, s_waitcnt_depctr, s_round_mode
+            0x00 | 0x01 | 0x0C | 0x0F | 0x1B | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => {
+                true
+            }
             // s_branch / s_cbranch_{scc0,scc1,vccz,vccnz,execz,execnz}: lifted into structured
             // WGSL control flow by `rdna2_cfg` (the branch itself emits no statement).
             0x02 | 0x04..=0x09 => self.structured_cf,
@@ -6820,6 +6886,23 @@ impl IrEmitter {
                 self.update_scc_nonzero(res);
                 true
             }
+            // s_flbit_i32_b32: count leading zeros from MSB; returns -1 (0xFFFFFFFF) when src0 == 0
+            0x15 => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let clz = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: v,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_bin(BinaryOperator::Equal, v, zero);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let res = self.emit_select(is_zero, neg_one, clz);
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
             // s_sext_i32_i8 / s_sext_i32_i16
             0x19 | 0x1A => {
                 let v = self.read_src_i32(u16::from(ssrc0), literal);
@@ -6837,6 +6920,23 @@ impl IrEmitter {
                 });
                 let u = self.bitcast_i32_to_u32(sext);
                 self.store_sgpr_u32(sdst, u);
+                true
+            }
+            // s_bitset0_b32 (0x1B) / s_bitset1_b32 (0x1D): clear/set bit (src0 & 31) in sdst
+            0x1B | 0x1D => {
+                let idx_raw = self.read_src_u32(u16::from(ssrc0), literal);
+                let mask31 = self.lit_u32(31);
+                let idx = self.emit_bin(BinaryOperator::And, idx_raw, mask31);
+                let one = self.lit_u32(1);
+                let bit = self.emit_bin(BinaryOperator::ShiftLeft, one, idx);
+                let cur = self.load_sgpr_u32(sdst);
+                let res = if op == 0x1D {
+                    self.emit_bin(BinaryOperator::InclusiveOr, cur, bit)
+                } else {
+                    let nbit = self.emit_bit_not(bit);
+                    self.emit_bin(BinaryOperator::And, cur, nbit)
+                };
+                self.store_sgpr_u32(sdst, res);
                 true
             }
             // s_abs_i32
@@ -6864,6 +6964,33 @@ impl IrEmitter {
             0x00 => {
                 let v = self.lit_u32(imm_u32);
                 self.store_sgpr_u32(sdst, v);
+                true
+            }
+            // s_cmpk_{eq,lg,gt,ge,lt,le}_{i32,u32}: compare sdst against sign/zero-extended simm16 -> SCC
+            0x03..=0x0E => {
+                let is_signed = op <= 0x08;
+                let cc = if is_signed { op - 0x03 } else { op - 0x09 };
+                let bin_op = match cc {
+                    0 => BinaryOperator::Equal,
+                    1 => BinaryOperator::NotEqual,
+                    2 => BinaryOperator::Greater,
+                    3 => BinaryOperator::GreaterEqual,
+                    4 => BinaryOperator::Less,
+                    _ => BinaryOperator::LessEqual,
+                };
+                let (lhs, rhs) = if is_signed {
+                    (
+                        self.read_src_i32(u16::from(sdst), None),
+                        self.lit_i32(i32::from(simm16 as i16)),
+                    )
+                } else {
+                    (
+                        self.read_src_u32(u16::from(sdst), None),
+                        self.lit_u32(u32::from(simm16)),
+                    )
+                };
+                let cmp = self.emit_bin(bin_op, lhs, rhs);
+                self.store_scc(cmp);
                 true
             }
             // s_addk_i32
@@ -7816,44 +7943,79 @@ impl IrEmitter {
     ) -> bool {
         let cmp = match op {
             // f32 comparisons: 0x00..=0x0F (v_cmp_*_f32) and 0x10..=0x1F (v_cmpx_*_f32)
+            // All 16 IEEE-754 condition codes (NaN-aware):
+            //   0=f, 1=lt, 2=eq, 3=le, 4=gt, 5=lg, 6=ge, 7=o,
+            //   8=u, 9=nge, 10=nlg, 11=ngt, 12=nle, 13=neq, 14=nlt, 15=tru
             0x00..=0x1F => {
                 let cc = op & 0xF;
                 let l = self.read_src_f32(src0, literal, (abs & 1) != 0, (neg & 1) != 0);
                 let r = self.read_src_f32(src1, literal, (abs & 2) != 0, (neg & 2) != 0);
                 match cc {
                     0 => self.lit_bool(false),
-                    1 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::Less,
-                        left: l,
-                        right: r,
-                    }),
-                    2 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::Equal,
-                        left: l,
-                        right: r,
-                    }),
-                    3 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::LessEqual,
-                        left: l,
-                        right: r,
-                    }),
-                    4 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::Greater,
-                        left: l,
-                        right: r,
-                    }),
-                    5 | 13 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::NotEqual,
-                        left: l,
-                        right: r,
-                    }),
-                    6 => self.emit_expr(Expression::Binary {
-                        op: BinaryOperator::GreaterEqual,
-                        left: l,
-                        right: r,
-                    }),
-                    15 => self.lit_bool(true),
-                    _ => return false,
+                    1 => self.emit_bin(BinaryOperator::Less, l, r),
+                    2 => self.emit_bin(BinaryOperator::Equal, l, r),
+                    3 => self.emit_bin(BinaryOperator::LessEqual, l, r),
+                    4 => self.emit_bin(BinaryOperator::Greater, l, r),
+                    5 => {
+                        let lt = self.emit_bin(BinaryOperator::Less, l, r);
+                        let gt = self.emit_bin(BinaryOperator::Greater, l, r);
+                        self.emit_bin(BinaryOperator::LogicalOr, lt, gt)
+                    }
+                    6 => self.emit_bin(BinaryOperator::GreaterEqual, l, r),
+                    7 => {
+                        let lo = self.emit_bin(BinaryOperator::Equal, l, l);
+                        let ro = self.emit_bin(BinaryOperator::Equal, r, r);
+                        self.emit_bin(BinaryOperator::LogicalAnd, lo, ro)
+                    }
+                    8 => {
+                        let lu = self.emit_bin(BinaryOperator::NotEqual, l, l);
+                        let ru = self.emit_bin(BinaryOperator::NotEqual, r, r);
+                        self.emit_bin(BinaryOperator::LogicalOr, lu, ru)
+                    }
+                    9 => {
+                        // nge: !(l >= r) — true when l < r or either operand is NaN
+                        let ge = self.emit_bin(BinaryOperator::GreaterEqual, l, r);
+                        self.emit_expr(Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr: ge,
+                        })
+                    }
+                    10 => {
+                        // nlg: !(l < r || l > r) — true when l == r or either operand is NaN
+                        let lt = self.emit_bin(BinaryOperator::Less, l, r);
+                        let gt = self.emit_bin(BinaryOperator::Greater, l, r);
+                        let lg = self.emit_bin(BinaryOperator::LogicalOr, lt, gt);
+                        self.emit_expr(Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr: lg,
+                        })
+                    }
+                    11 => {
+                        // ngt: !(l > r) — true when l <= r or either operand is NaN
+                        let gt = self.emit_bin(BinaryOperator::Greater, l, r);
+                        self.emit_expr(Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr: gt,
+                        })
+                    }
+                    12 => {
+                        // nle: !(l <= r) — true when l > r or either operand is NaN
+                        let le = self.emit_bin(BinaryOperator::LessEqual, l, r);
+                        self.emit_expr(Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr: le,
+                        })
+                    }
+                    13 => self.emit_bin(BinaryOperator::NotEqual, l, r),
+                    14 => {
+                        // nlt: !(l < r) — true when l >= r or either operand is NaN
+                        let lt = self.emit_bin(BinaryOperator::Less, l, r);
+                        self.emit_expr(Expression::Unary {
+                            op: UnaryOperator::LogicalNot,
+                            expr: lt,
+                        })
+                    }
+                    _ => self.lit_bool(true),
                 }
             }
             // i32 comparisons: 0x80..=0x87 / 0x90..=0x97
@@ -7888,9 +8050,25 @@ impl IrEmitter {
             _ => return false,
         };
 
-        match sdst_override {
-            Some(sd) => self.store_lane_mask(sd, cmp),
-            None => self.store_vcc(cmp),
+        let is_cmpx = (op & 0x10) != 0;
+        if is_cmpx {
+            // GFX10.3 v_cmpx_* updates EXEC (single-lane model: exec_mask &= cmp_bit).
+            if let Some(local) = self.exec_local {
+                let old_exec = self.load_local(local);
+                let cmp_bit = self.bool_to_u32(cmp);
+                let new_exec = self.emit_bin(BinaryOperator::And, old_exec, cmp_bit);
+                self.store_local(local, new_exec);
+            }
+            if let Some(sd) = sdst_override
+                && (sd & 0x7F) <= 106
+            {
+                self.store_lane_mask(sd, cmp);
+            }
+        } else {
+            match sdst_override {
+                Some(sd) => self.store_lane_mask(sd, cmp),
+                None => self.store_vcc(cmp),
+            }
         }
         true
     }
@@ -8595,6 +8773,7 @@ impl IrEmitter {
         omod: u8,
         abs: u8,
         neg: u8,
+        op_sel: u8,
         literal: Option<u32>,
     ) -> bool {
         // VOPC promoted to VOP3 (0x000..=0x0FF)
@@ -9013,6 +9192,39 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_cvt_pk_u8_f32: clamp f32 src0 to [0, 255], convert to u8, pack into byte (src1 & 3) of src2
+            0x15E => {
+                let f = self.read_src_f32(src0, literal, abs0, neg0);
+                let lo = self.lit_f32(0.0);
+                let hi = self.lit_f32(255.0);
+                let clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: f,
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                });
+                let u_raw = self.emit_expr(Expression::As {
+                    expr: clamped,
+                    kind: ScalarKind::Uint,
+                    convert: Some(4),
+                });
+                let mask_ff = self.lit_u32(0xFF);
+                let byte_val = self.emit_bin(BinaryOperator::And, u_raw, mask_ff);
+                let s1 = self.read_src_u32(src1, literal);
+                let mask3 = self.lit_u32(3);
+                let byte_idx = self.emit_bin(BinaryOperator::And, s1, mask3);
+                let sh3 = self.lit_u32(3);
+                let shift = self.emit_bin(BinaryOperator::ShiftLeft, byte_idx, sh3);
+                let shifted_byte = self.emit_bin(BinaryOperator::ShiftLeft, byte_val, shift);
+                let byte_mask = self.emit_bin(BinaryOperator::ShiftLeft, mask_ff, shift);
+                let inv_mask = self.emit_bit_not(byte_mask);
+                let s2 = self.read_src_u32(src2, literal);
+                let cleared = self.emit_bin(BinaryOperator::And, s2, inv_mask);
+                let res = self.emit_bin(BinaryOperator::InclusiveOr, cleared, shifted_byte);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_mul_lo_u32
             0x169 => {
                 let a = self.read_src_u32(src0, literal);
@@ -9105,6 +9317,42 @@ impl IrEmitter {
                 }
                 true
             }
+            // v_interp_p1ll_f16 (0x342), v_interp_p1lv_f16 (0x343), v_interp_p2_f16 (0x35A):
+            // GFX10.3 VOP3 16-bit fragment attribute interpolation.
+            // src0 packs {high[8], attrchan[7:6], attr[5:0]}; op_sel[3] selects dst lo/hi f16 half on p2.
+            0x342 | 0x343 | 0x35A => {
+                if self.stage != ShaderStage::Fragment {
+                    return false;
+                }
+                let Some(arg_idx) = self.frag_in_arg else {
+                    return false;
+                };
+                let (attr, attrchan, _high) = decode_vop3_interp_attr(src0);
+                let clamped_attr = attr % MAX_WEBGPU_LOCATIONS;
+                let Some(&member_idx) = self.frag_attr_member_index.get(&clamped_attr) else {
+                    return false;
+                };
+                let frag_in = self.raw_expr(Expression::FunctionArgument(arg_idx));
+                let attr_vec = self.emit_expr(Expression::AccessIndex {
+                    base: frag_in,
+                    index: member_idx,
+                });
+                let comp = self.emit_expr(Expression::AccessIndex {
+                    base: attr_vec,
+                    index: u32::from(attrchan & 0x3),
+                });
+                let out = self.apply_float_out_mods(comp, omod, clamp);
+                if op == 0x35A {
+                    if (op_sel & 0x8) != 0 {
+                        self.store_vgpr_f16_hi(vdst, out);
+                    } else {
+                        self.store_vgpr_f16_lo(vdst, out);
+                    }
+                } else {
+                    self.store_vgpr_f32(vdst, out);
+                }
+                true
+            }
             // v_lshl_add_u32: (src0 << (src1 & 31)) + src2
             0x346 => {
                 let a = self.read_src_u32(src0, literal);
@@ -9167,6 +9415,19 @@ impl IrEmitter {
                 });
                 let out = self.apply_float_out_mods(res, omod, clamp);
                 self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_add_f64: f32-emulated addition into dst VGPR pair (low = f32 sum, high = 0)
+            0x364 => {
+                let a = self.read_src_f32(src0, literal, abs0, neg0);
+                let b = self.read_src_f32(src1, literal, abs1, neg1);
+                let sum = self.emit_bin(BinaryOperator::Add, a, b);
+                let out = self.apply_float_out_mods(sum, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                if vdst < 255 {
+                    let zero = self.lit_u32(0);
+                    self.store_vgpr_u32(vdst + 1, zero);
+                }
                 true
             }
             // v_add3_u32
@@ -9472,6 +9733,19 @@ impl IrEmitter {
         let Some(layout) = mimg_addr_layout(op) else {
             return false;
         };
+        if layout.is_get_lod {
+            // WGSL has no textureQueryLod builtin; emit safe mip 0.0 fallback into dst VGPRs per dmask.
+            let eff_mask = if dmask == 0 { 0xF } else { dmask };
+            let mut dst_offset = 0u8;
+            for ch in 0..4u32 {
+                if (eff_mask & (1 << ch)) != 0 {
+                    let zero = self.lit_f32(0.0);
+                    self.store_vgpr_f32(vdata.saturating_add(dst_offset), zero);
+                    dst_offset = dst_offset.saturating_add(1);
+                }
+            }
+            return true;
+        }
         let inst_dim = TexDim::from_mimg_dim(dim);
 
         if layout.is_store {
@@ -15196,5 +15470,317 @@ mod tests {
             "JSON:\n{json}"
         );
         assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    fn enc_sopk(op: u8, sdst: u8, simm16: u16) -> u32 {
+        (0b1011u32 << 28)
+            | (u32::from(op & 0x1F) << 23)
+            | (u32::from(sdst & 0x7F) << 16)
+            | u32::from(simm16)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_vop3_opsel(
+        op: u16,
+        vdst: u8,
+        src0: u16,
+        src1: u16,
+        src2: u16,
+        op_sel: u8,
+        clamp: bool,
+        omod: u8,
+    ) -> [u32; 2] {
+        let w0 = (0b110101u32 << 26)
+            | (u32::from(op & 0x3FF) << 16)
+            | (u32::from(clamp) << 15)
+            | (u32::from(op_sel & 0xF) << 11)
+            | u32::from(vdst);
+        let w1 = (u32::from(omod & 0x3) << 27)
+            | (u32::from(src2 & 0x1FF) << 18)
+            | (u32::from(src1 & 0x1FF) << 9)
+            | u32::from(src0 & 0x1FF);
+        [w0, w1]
+    }
+
+    #[test]
+    fn s38_translates_v_interp_f16_p1ll_p2_with_op_sel_packing_into_fma_mix_and_compr_mrt0() {
+        // Real UI/menu fragment shader pattern using VOP3 f16 interpolation:
+        //   v_interp_p1ll_f16 v15, v0, attr0.x
+        //   v_interp_p2_f16   v16, v1, attr0.x, v15               (op_sel=0 -> v16.lo)
+        //   v_interp_p1ll_f16 v15, v0, attr0.y
+        //   v_interp_p2_f16   v16, v1, attr0.y, v15 op_sel:[0,0,0,1] (op_sel[3]=1 -> v16.hi)
+        //   v_interp_p1ll_f16 v17, v0, attr1.x high
+        //   v_interp_p2_f16   v18, v1, attr1.x, v17 high          (op_sel=0 -> v18.lo)
+        //   v_interp_p1lv_f16 v17, v0, attr1.w, v18
+        //   v_interp_p2_f16   v18, v1, attr1.w, v17 op_sel:[0,0,0,1] clamp
+        //   v_fma_mixlo_f16   v19, v16, v18, 0.5 op_sel_hi:[1,1,0]
+        //   v_fma_mixhi_f16   v19, v16, v18, 0.5 op_sel:[1,1,0] op_sel_hi:[1,1,0]
+        //   exp mrt0 v19, v18, off, off done compr vm
+        //   s_endpgm
+        let attr0_x: u16 = (0 << 6) | 0;
+        let attr0_y: u16 = (1 << 6) | 0;
+        let attr1_x_hi: u16 = (1 << 8) | (0 << 6) | 1;
+        let attr1_w: u16 = (3 << 6) | 1;
+
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_vop3_opsel(0x342, 15, attr0_x, 256 + 0, 0, 0, false, 0));
+        words.extend_from_slice(&enc_vop3_opsel(0x35A, 16, attr0_x, 256 + 1, 256 + 15, 0, false, 0));
+        words.extend_from_slice(&enc_vop3_opsel(0x342, 15, attr0_y, 256 + 0, 0, 0, false, 0));
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x35A,
+            16,
+            attr0_y,
+            256 + 1,
+            256 + 15,
+            0b1000,
+            false,
+            0,
+        ));
+        words.extend_from_slice(&enc_vop3_opsel(0x342, 17, attr1_x_hi, 256 + 0, 0, 0, false, 0));
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x35A,
+            18,
+            attr1_x_hi,
+            256 + 1,
+            256 + 17,
+            0,
+            false,
+            0,
+        ));
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x343,
+            17,
+            attr1_w,
+            256 + 0,
+            256 + 18,
+            0,
+            false,
+            0,
+        ));
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x35A,
+            18,
+            attr1_w,
+            256 + 1,
+            256 + 17,
+            0b1000,
+            true,
+            0,
+        ));
+        words.extend_from_slice(&enc_vop3p(
+            0x21,
+            19,
+            256 + 16,
+            256 + 18,
+            240,
+            false,
+            0b000,
+            0b011,
+            0,
+            0,
+        ));
+        words.extend_from_slice(&enc_vop3p(
+            0x22,
+            19,
+            256 + 16,
+            256 + 18,
+            240,
+            false,
+            0b011,
+            0b011,
+            0,
+            0,
+        ));
+        words.extend_from_slice(&enc_exp(0, 0xF, true, true, true, [19, 18, 0, 0]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_rdna2_to_wgsl(&words_to_bytes(&words), &Rdna2TranslateOptions::default())
+            .expect("v_interp_*_f16 fragment shader must translate and validate");
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Fragment);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.binding_summary.fragment_input_locations, vec![0, 1]);
+        assert!(
+            out.wgsl.contains("@location(0) attr_0_: vec4<f32>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("@location(1) attr_1_: vec4<f32>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        assert!(out.wgsl.contains("pack2x16float("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("unpack2x16float("), "WGSL:\n{}", out.wgsl);
+        assert!(
+            !out.wgsl.contains("var s_0_:") && !out.wgsl.contains("var s_1_:"),
+            "attr bitfield in src0 must not allocate bogus SGPRs:\n{}",
+            out.wgsl
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s38_translates_ieee_f32_cmp_and_cmpx_family_with_nan_aware_logic_and_exec_updates() {
+        let mut words = Vec::new();
+        // Seed v0, v1 from fragment attr0.xy so compares stay runtime expressions.
+        words.push(enc_vintrp(0, 0, 0, 0, 0));
+        words.push(enc_vintrp(0, 1, 0, 1, 0));
+        // VOPC v_cmp_*_f32: o (0x07), u (0x08), nge (0x09), nlg (0x0A), ngt (0x0B), nle (0x0C), nlt (0x0E)
+        words.push(enc_vopc(0x07, 256 + 0, 1));
+        words.push(enc_vopc(0x08, 256 + 0, 1));
+        words.push(enc_vopc(0x09, 256 + 0, 1));
+        words.push(enc_vopc(0x0A, 256 + 0, 1));
+        words.push(enc_vopc(0x0B, 256 + 0, 1));
+        words.push(enc_vopc(0x0C, 256 + 0, 1));
+        words.push(enc_vopc(0x0E, 256 + 0, 1));
+        // VOP3 v_cmp_*_f32 into SGPR pair s[4:5]
+        words.extend_from_slice(&enc_vop3(0x00E, 4, 256 + 0, 256 + 1, 0, false, 0, 0, 0)); // v_cmp_nlt_f32
+        words.extend_from_slice(&enc_vop3(0x009, 6, 256 + 0, 256 + 1, 0, false, 0, 0, 0)); // v_cmp_nge_f32
+        words.extend_from_slice(&enc_vop3(0x00B, 8, 256 + 0, 256 + 1, 0, false, 0, 0, 0)); // v_cmp_ngt_f32
+        words.extend_from_slice(&enc_vop3(0x00A, 10, 256 + 0, 256 + 1, 0, false, 0, 0, 0)); // v_cmp_nlg_f32
+        // VOPC v_cmpx_*_f32: nge (0x19), nlg (0x1A), ngt (0x1B), nlt (0x1E)
+        words.push(enc_vopc(0x19, 256 + 0, 1));
+        words.push(enc_vopc(0x1A, 256 + 0, 1));
+        words.push(enc_vopc(0x1B, 256 + 0, 1));
+        words.push(enc_vopc(0x1E, 256 + 0, 1));
+        // VOP3 v_cmpx_*_f32 writing exec_lo (0x7E)
+        words.extend_from_slice(&enc_vop3(0x01E, 126, 256 + 0, 256 + 1, 0, false, 0, 0b001, 0));
+        words.extend_from_slice(&enc_vop3(0x019, 126, 256 + 0, 256 + 1, 0, false, 0, 0, 0b010));
+        words.extend_from_slice(&enc_vop3(0x01B, 126, 256 + 0, 256 + 1, 0, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x01A, 126, 256 + 0, 256 + 1, 0, false, 0, 0, 0));
+        // Structured s_cbranch_execz +1 (skips 1 dword v_mov_b32 v2, 1.0)
+        words.push(enc_sopp(0x08, 1));
+        words.push(enc_vop1(0x01, 2, 242));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 2]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("var exec_mask: u32"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("exec_mask ="), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("!("), "NaN-aware negated compare expected:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s38_translates_s_round_mode_and_image_get_lod_without_breaking_texture_bindings() {
+        // Case A: s_round_mode + image_get_lod alongside image_sample (bindings stay intact)
+        let mut words = Vec::new();
+        words.push(enc_sopp(0x24, 0x0000)); // s_round_mode
+        words.push(enc_vintrp(0, 2, 0, 0, 0));
+        words.push(enc_vintrp(0, 3, 0, 1, 0));
+        // Load T# from user SGPR s8 table (sbase=4 -> s[8:9]) into s[12:19], S# into s[20:23]
+        words.extend_from_slice(&enc_smem(0x03, 12, 4, 0x7D, 0x20, false, false)); // T# -> s[12:19]
+        words.extend_from_slice(&enc_smem(0x02, 20, 4, 0x7D, 0x40, false, false)); // S# -> s[20:23]
+        words.extend_from_slice(&enc_mimg(0x60, 0x3, 1, 2, 4, 3, 5)); // image_get_lod v[4:5], v[2:3], s[12:19], s[20:23] dmask:0x3
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 6, 3, 5)); // image_sample v[6:9], v[2:3], s[12:19], s[20:23]
+        words.push(enc_vop2(0x03, 6, 256 + 6, 4)); // v6 = v6 + v4 (uses lod.x)
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [6, 7, 8, 9]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.translated_op_count >= 9);
+        assert_eq!(
+            out.bindings.iter().filter(|b| b.kind == "texture_2d").count(),
+            1,
+            "bindings: {:?}",
+            out.bindings
+        );
+        assert_eq!(
+            out.bindings.iter().filter(|b| b.kind == "sampler").count(),
+            1,
+            "bindings: {:?}",
+            out.bindings
+        );
+        assert!(
+            out.bindings.iter().all(|b| b.kind != "uniform"),
+            "T#/S# descriptor loads must not become CBVs: {:?}",
+            out.bindings
+        );
+        assert!(out.wgsl.contains("v_4_ = 0f;"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("v_5_ = 0f;"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Case B: standalone image_get_lod (no image_sample) emits zero dead texture/CBV bindings
+        let mut solo = Vec::new();
+        solo.push(enc_sopp(0x24, 0x0001)); // s_round_mode
+        solo.extend_from_slice(&enc_smem(0x03, 12, 4, 0x7D, 0x20, false, false)); // T#
+        solo.extend_from_slice(&enc_smem(0x02, 20, 4, 0x7D, 0x40, false, false)); // S#
+        solo.extend_from_slice(&enc_mimg(0x60, 0xF, 1, 2, 4, 3, 5)); // image_get_lod dmask:0xf
+        solo.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        solo.push(enc_sopp(0x01, 0));
+
+        let out_solo = translate_as(&solo, Rdna2StageOverride::Pixel);
+        assert!(out_solo.naga_validated);
+        assert_eq!(out_solo.unsupported_op_count, 0, "WGSL:\n{}", out_solo.wgsl);
+        assert!(
+            out_solo.bindings.is_empty(),
+            "standalone image_get_lod must emit no dead bindings or bogus CBVs: {:?}",
+            out_solo.bindings
+        );
+        assert_naga_wgsl_valid(&out_solo.wgsl);
+    }
+
+    #[test]
+    fn s38_translates_v_add_f64_s_flbit_s_bitset1_s_cmpk_and_v_cvt_pk_u8_f32() {
+        // Part 1: runtime forms (with fragment attribute + CBV inputs)
+        let mut words = Vec::new();
+        words.push(enc_vintrp(0, 0, 0, 0, 0)); // v0 = attr0.x
+        words.push(enc_vintrp(0, 1, 0, 1, 0)); // v1 = attr0.y
+        words.extend_from_slice(&enc_smem(0x00, 2, 0, 0x7D, 0x00, false, false)); // s2 = cb0[0].x
+        // s_flbit_i32_b32 s3, s2
+        words.push(enc_sop1(0x15, 3, 2));
+        // s_bitset1_b32 s3, 5 (read-modify-write s3)
+        words.push(enc_sop1(0x1D, 3, 128 + 5));
+        // s_bitset0_b32 s3, 2
+        words.push(enc_sop1(0x1B, 3, 128 + 2));
+        // s_cmpk_eq_i32 s3, 32 -> SCC, then s_cselect_b32 s4, s3, 0
+        words.push(enc_sopk(0x03, 3, 32));
+        words.push(enc_sop2(0x0A, 4, 3, 128));
+        // Also cover signed/unsigned s_cmpk_* variants
+        words.push(enc_sopk(0x04, 3, (-1i16) as u16)); // s_cmpk_lg_i32
+        words.push(enc_sopk(0x09, 3, 0xFFFF)); // s_cmpk_eq_u32
+        words.push(enc_sopk(0x0D, 3, 100)); // s_cmpk_lt_u32
+        // v_add_f64 v[4:5], v0, v1
+        words.extend_from_slice(&enc_vop3(0x364, 4, 256 + 0, 256 + 1, 0, false, 0, 0, 0));
+        // v_cvt_pk_u8_f32 v6, v0, 0, 0
+        words.extend_from_slice(&enc_vop3(0x15E, 6, 256 + 0, 128 + 0, 128 + 0, false, 0, 0, 0));
+        // v_cvt_pk_u8_f32 v6, v1, 2, v6
+        words.extend_from_slice(&enc_vop3(0x15E, 6, 256 + 1, 128 + 2, 256 + 6, false, 0, 0, 0));
+        // v_cvt_pk_u8_f32 v7, v4, s4, v6 (runtime byte index + constant f32 variant too)
+        words.extend_from_slice(&enc_vop3(0x15E, 7, 256 + 4, 4, 256 + 6, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x15E, 8, 242, 128 + 3, 256 + 7, false, 0, 0, 0));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 8]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("countLeadingZeros("), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("v_5_ = 0f;"), "v_add_f64 hi word should be 0:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("clamp("), "v_cvt_pk_u8_f32 should clamp f32:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Part 2: constant-folding verification for s_flbit_i32_b32 exact edge cases
+        let mut cwords = Vec::new();
+        cwords.push(enc_sop1(0x15, 2, 128 + 0)); // s_flbit_i32_b32 s2, 0 -> 0xFFFFFFFF (-1)
+        cwords.push(enc_sop1(0x15, 3, 0xFF)); // s_flbit_i32_b32 s3, 0x80000000 -> 0
+        cwords.push(0x8000_0000);
+        cwords.push(enc_sop1(0x15, 4, 0xFF)); // s_flbit_i32_b32 s4, 0x0000CCCC -> 16
+        cwords.push(0x0000_CCCC);
+        cwords.push(enc_sop1(0x15, 5, 128 + 1)); // s_flbit_i32_b32 s5, 1 -> 31
+        cwords.push(enc_sopp(0x01, 0));
+
+        let cout = translate_as(&cwords, Rdna2StageOverride::Compute);
+        assert_eq!(cout.unsupported_op_count, 0, "WGSL:\n{}", cout.wgsl);
+        assert_eq!(last_assignment(&cout.wgsl, "s_2_").as_deref(), Some("4294967295u"));
+        assert_eq!(last_assignment(&cout.wgsl, "s_3_").as_deref(), Some("0u"));
+        assert_eq!(last_assignment(&cout.wgsl, "s_4_").as_deref(), Some("16u"));
+        assert_eq!(last_assignment(&cout.wgsl, "s_5_").as_deref(), Some("31u"));
+        assert_naga_wgsl_valid(&cout.wgsl);
     }
 }
