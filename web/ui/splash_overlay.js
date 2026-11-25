@@ -38,6 +38,9 @@
   });
 
   const DEFAULT_FADE_MS = 400;
+  const DEFAULT_GREG_IMAGE_URL = './assets/greg.png';
+  const DEFAULT_GREG_CLICK_THRESHOLD = 3;
+  const GREG_SECRET_WORD = 'greg';
   const STAGE_NOT_STARTED = 'NOT_STARTED';
   const STYLE_ATTR = 'data-pg6-splash-style';
   const ROOT_CLASS = 'pg6-splash';
@@ -45,6 +48,7 @@
   const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
   const DISMISS_REASON_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/i;
   const HUD_HIDDEN_VALUES = new Set(['0', 'false', 'off', 'no', 'none', 'hidden']);
+  const GREG_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
   const DISMISS_REASONS = Object.freeze({
     FIRST_PRESENT: 'first_present',
     IMMEDIATE: 'immediate',
@@ -98,6 +102,31 @@
     '__panel{position:relative;z-index:1;width:min(36rem,100%);display:flex;flex-direction:column;gap:0.55rem;}' +
     '.' +
     ROOT_CLASS +
+    '__stage-row{display:flex;align-items:center;gap:0.6rem;min-height:1.5rem;}' +
+    '.' +
+    ROOT_CLASS +
+    '__spinner{position:relative;flex:0 0 auto;width:1.25rem;height:1.25rem;display:inline-flex;' +
+    'align-items:center;justify-content:center;cursor:pointer;user-select:none;}' +
+    '.' +
+    ROOT_CLASS +
+    '__spinner--greg{width:1.65rem;height:1.65rem;}' +
+    '.' +
+    ROOT_CLASS +
+    '__spinner-ring{box-sizing:border-box;width:1.1rem;height:1.1rem;border-radius:50%;' +
+    'border:2px solid rgba(255,255,255,0.18);border-top-color:#6db3ff;animation:pg6-spin 850ms linear infinite;}' +
+    '.' +
+    ROOT_CLASS +
+    '__greg{width:1.65rem;height:1.65rem;object-fit:contain;border-radius:50%;' +
+    'display:block;animation:pg6-spin 1200ms linear infinite;}' +
+    '.' +
+    ROOT_CLASS +
+    '__spinner[hidden],.' +
+    ROOT_CLASS +
+    '__spinner-ring[hidden],.' +
+    ROOT_CLASS +
+    '__greg[hidden]{display:none!important;}' +
+    '.' +
+    ROOT_CLASS +
     '__stage{font-size:0.95rem;letter-spacing:0.04em;opacity:0.95;}' +
     '.' +
     ROOT_CLASS +
@@ -124,13 +153,27 @@
     '__badge{margin-top:0.15rem;padding:0.45rem 0.65rem;border-radius:0.4rem;' +
     'background:rgba(180,60,60,0.22);border:1px solid rgba(255,140,140,0.35);' +
     'color:#ffc9c9;font-size:0.78rem;line-height:1.35;}' +
+    '@keyframes pg6-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}' +
+    '.' +
+    ROOT_CLASS +
+    '[data-reduced-motion="true"] .' +
+    ROOT_CLASS +
+    '__spinner-ring,.' +
+    ROOT_CLASS +
+    '[data-reduced-motion="true"] .' +
+    ROOT_CLASS +
+    '__greg{animation:none!important;}' +
     '@media (prefers-reduced-motion: reduce){.' +
     ROOT_CLASS +
     ',.' +
     ROOT_CLASS +
     '__bar-fill,.' +
     ROOT_CLASS +
-    '__stream-fill{transition:none!important;}}';
+    '__stream-fill{transition:none!important;}.' +
+    ROOT_CLASS +
+    '__spinner-ring,.' +
+    ROOT_CLASS +
+    '__greg{animation:none!important;}}';
 
   /**
    * Strictly validate a scripted-input preset identifier.
@@ -175,18 +218,12 @@
     return trimmed;
   }
 
-  /**
-   * Detect whether a URL query string / URLSearchParams / Location disables the HUD
-   * (e.g. `?hud=0`, `?hud=false`, `?hud=off`, `?hud=no`). Never throws.
-   *
-   * @param {unknown} search
-   * @returns {boolean}
-   */
-  function isHudHiddenQuery(search) {
+  function readLastQueryParam(search, targetKey) {
     if (search === null || search === undefined || search === '') {
-      return false;
+      return null;
     }
     try {
+      const normalizedTarget = String(targetKey).trim().toLowerCase();
       let params = null;
       if (typeof URLSearchParams === 'function' && search instanceof URLSearchParams) {
         params = search;
@@ -198,46 +235,92 @@
           raw = search.search;
         }
         if (typeof raw !== 'string' || raw.length === 0) {
-          return false;
+          return null;
         }
         const hashIdx = raw.indexOf('#');
         const withoutHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
         const qIdx = withoutHash.indexOf('?');
         const query = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : withoutHash;
         if (!query) {
-          return false;
+          return null;
         }
         if (typeof URLSearchParams === 'function') {
           params = new URLSearchParams(query);
         } else {
-          let lastHudValue = null;
+          let lastValue = null;
           for (const part of query.split('&')) {
             if (!part) continue;
             const eqIdx = part.indexOf('=');
             const rawKey = eqIdx >= 0 ? part.slice(0, eqIdx) : part;
             const rawVal = eqIdx >= 0 ? part.slice(eqIdx + 1) : '';
             const key = decodeURIComponent(rawKey).trim().toLowerCase();
-            if (key === 'hud') {
-              lastHudValue = decodeURIComponent(rawVal).trim().toLowerCase();
+            if (key === normalizedTarget) {
+              lastValue = decodeURIComponent(rawVal).trim().toLowerCase();
             }
           }
-          return lastHudValue !== null && HUD_HIDDEN_VALUES.has(lastHudValue);
+          return lastValue;
         }
       }
 
       if (!params) {
-        return false;
+        return null;
       }
-      let lastHudValue = null;
+      let lastValue = null;
       for (const [key, value] of params.entries()) {
-        if (String(key).trim().toLowerCase() === 'hud') {
-          lastHudValue = String(value).trim().toLowerCase();
+        if (String(key).trim().toLowerCase() === normalizedTarget) {
+          lastValue = String(value).trim().toLowerCase();
         }
       }
-      return lastHudValue !== null && HUD_HIDDEN_VALUES.has(lastHudValue);
+      return lastValue;
     } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Detect whether a URL query string / URLSearchParams / Location disables the HUD
+   * (e.g. `?hud=0`, `?hud=false`, `?hud=off`, `?hud=no`). Never throws.
+   *
+   * @param {unknown} search
+   * @returns {boolean}
+   */
+  function isHudHiddenQuery(search) {
+    const value = readLastQueryParam(search, 'hud');
+    return value !== null && HUD_HIDDEN_VALUES.has(value);
+  }
+
+  /**
+   * Detect whether a URL query string / URLSearchParams / Location enables the
+   * Spinning Greg easter egg (e.g. `?greg=1`, `?greg=true`, `?greg=on`, `?greg=yes`).
+   * Never throws.
+   *
+   * @param {unknown} search
+   * @returns {boolean}
+   */
+  function isGregQuery(search) {
+    const value = readLastQueryParam(search, 'greg');
+    return value !== null && GREG_ENABLED_VALUES.has(value);
+  }
+
+  function isEditableEventTarget(target) {
+    if (!target || typeof target !== 'object') {
       return false;
     }
+    if (target.isContentEditable === true) {
+      return true;
+    }
+    if (typeof target.getAttribute === 'function') {
+      try {
+        const ce = target.getAttribute('contenteditable');
+        if (ce === '' || ce === 'true' || ce === 'plaintext-only') {
+          return true;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    const tag = typeof target.tagName === 'string' ? target.tagName.toUpperCase() : '';
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
   }
 
   function resolveSearchSource(opts, doc) {
@@ -446,6 +529,9 @@
      * @param {string|URLSearchParams|object|null} [options.locationSearch]
      * @param {string|URLSearchParams|object|null} [options.search]
      * @param {string|null} [options.scriptedInput]
+     * @param {boolean} [options.gregMode]
+     * @param {number} [options.gregClickThreshold=3]
+     * @param {string|null} [options.gregImageUrl]
      * @param {boolean} [options.autoMount=true]
      * @param {boolean} [options.visible=true]
      */
@@ -504,6 +590,27 @@
       ) {
         throw new TypeError('windowObj must be an object or null');
       }
+      if (
+        opts.gregMode !== undefined &&
+        opts.gregMode !== null &&
+        typeof opts.gregMode !== 'boolean'
+      ) {
+        throw new TypeError('gregMode must be a boolean');
+      }
+      if (
+        opts.gregClickThreshold !== undefined &&
+        opts.gregClickThreshold !== null &&
+        (!Number.isInteger(opts.gregClickThreshold) || opts.gregClickThreshold < 1)
+      ) {
+        throw new TypeError('gregClickThreshold must be a positive integer');
+      }
+      if (
+        opts.gregImageUrl !== undefined &&
+        opts.gregImageUrl !== null &&
+        typeof opts.gregImageUrl !== 'string'
+      ) {
+        throw new TypeError('gregImageUrl must be a string or null');
+      }
 
       this._document = doc;
       this._window = opts.windowObj && typeof opts.windowObj === 'object' ? opts.windowObj : null;
@@ -516,6 +623,14 @@
         typeof opts.splashImageUrl === 'string' && opts.splashImageUrl.length > 0
           ? opts.splashImageUrl
           : null;
+      this._gregImageUrl =
+        typeof opts.gregImageUrl === 'string' && opts.gregImageUrl.trim().length > 0
+          ? opts.gregImageUrl.trim()
+          : DEFAULT_GREG_IMAGE_URL;
+      this._gregClickThreshold =
+        typeof opts.gregClickThreshold === 'number'
+          ? opts.gregClickThreshold
+          : DEFAULT_GREG_CLICK_THRESHOLD;
       this._fadeMs =
         typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs) && opts.fadeMs >= 0
           ? opts.fadeMs
@@ -545,6 +660,13 @@
       this._hudHidden = isHudHiddenQuery(searchSource);
       this._instantHide =
         typeof opts.instantHide === 'boolean' ? opts.instantHide : this._hudHidden;
+      this._gregMode =
+        typeof opts.gregMode === 'boolean' ? opts.gregMode : isGregQuery(searchSource);
+      this._gregClickCount = 0;
+      this._gregKeyBuffer = '';
+      this._onSpinnerClick = null;
+      this._onKeyDown = null;
+      this._keyTarget = null;
 
       const autoHiddenByHud =
         this._hudHidden && opts.visible === undefined && opts.instantHide !== false;
@@ -654,7 +776,27 @@
       scripted.hidden = true;
       if (scripted.style) scripted.style.display = 'none';
 
+      const stageRow = createEl(doc, 'div', `${ROOT_CLASS}__stage-row`);
+      const spinner = createEl(doc, 'span', `${ROOT_CLASS}__spinner`, {
+        'aria-hidden': 'true',
+        'data-greg-mode': 'false',
+      });
+      const spinnerRing = createEl(doc, 'span', `${ROOT_CLASS}__spinner-ring`, {
+        'aria-hidden': 'true',
+      });
+      const gregImg = createEl(doc, 'img', `${ROOT_CLASS}__greg`, {
+        src: this._gregImageUrl,
+        alt: 'Greg',
+        decoding: 'async',
+      });
+      gregImg.hidden = true;
+      if (gregImg.style) gregImg.style.display = 'none';
+      spinner.appendChild(spinnerRing);
+      spinner.appendChild(gregImg);
+
       const stage = createEl(doc, 'div', `${ROOT_CLASS}__stage`);
+      stageRow.appendChild(spinner);
+      stageRow.appendChild(stage);
       const bar = createEl(doc, 'div', `${ROOT_CLASS}__bar`, {
         role: 'progressbar',
         'aria-valuemin': '0',
@@ -679,7 +821,7 @@
       badge.hidden = true;
 
       panel.appendChild(scripted);
-      panel.appendChild(stage);
+      panel.appendChild(stageRow);
       panel.appendChild(bar);
       panel.appendChild(stream);
       panel.appendChild(meta);
@@ -694,6 +836,10 @@
         img,
         fallback,
         scripted,
+        stageRow,
+        spinner,
+        spinnerRing,
+        gregImg,
         stage,
         bar,
         barFill,
@@ -707,6 +853,34 @@
       return root;
     }
 
+    _resolveKeyTarget() {
+      if (this._window && typeof this._window.addEventListener === 'function') {
+        return this._window;
+      }
+      if (this._document && typeof this._document.addEventListener === 'function') {
+        return this._document;
+      }
+      try {
+        if (
+          this._document &&
+          this._document.defaultView &&
+          typeof this._document.defaultView.addEventListener === 'function'
+        ) {
+          return this._document.defaultView;
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+          return window;
+        }
+      } catch {
+        // ignore
+      }
+      return null;
+    }
+
     _bindElements() {
       const els = this._els || {};
       if (!els.root) {
@@ -715,6 +889,12 @@
           img: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__img`) : null,
           fallback: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__fallback`) : null,
           scripted: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scripted`) : null,
+          stageRow: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__stage-row`) : null,
+          spinner: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__spinner`) : null,
+          spinnerRing: this._root.querySelector
+            ? this._root.querySelector(`.${ROOT_CLASS}__spinner-ring`)
+            : null,
+          gregImg: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__greg`) : null,
           stage: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__stage`) : null,
           bar: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__bar`) : null,
           barFill: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__bar-fill`) : null,
@@ -741,6 +921,60 @@
           img.onerror = this._onImageError;
         }
       }
+
+      const spinner = this._els.spinner;
+      if (spinner && typeof spinner.addEventListener === 'function') {
+        this._onSpinnerClick = () => {
+          if (this._destroyed || !this._visible || this._dismissed) {
+            return;
+          }
+          this._gregClickCount += 1;
+          if (this._gregClickCount >= this._gregClickThreshold) {
+            this._gregClickCount = 0;
+            this.toggleGregMode();
+          }
+        };
+        try {
+          spinner.addEventListener('click', this._onSpinnerClick);
+        } catch {
+          this._onSpinnerClick = null;
+        }
+      }
+
+      const keyTarget = this._resolveKeyTarget();
+      if (keyTarget) {
+        this._onKeyDown = (event) => {
+          if (this._destroyed || !this._visible || this._dismissed) {
+            return;
+          }
+          if (!event || typeof event.key !== 'string') {
+            return;
+          }
+          if (event.ctrlKey || event.metaKey || event.altKey) {
+            return;
+          }
+          if (isEditableEventTarget(event.target)) {
+            return;
+          }
+          const ch = event.key.toLowerCase();
+          if (ch.length !== 1) {
+            return;
+          }
+          this._gregKeyBuffer = (this._gregKeyBuffer + ch).slice(-GREG_SECRET_WORD.length);
+          if (this._gregKeyBuffer === GREG_SECRET_WORD) {
+            this._gregKeyBuffer = '';
+            this.toggleGregMode();
+          }
+        };
+        try {
+          keyTarget.addEventListener('keydown', this._onKeyDown);
+          this._keyTarget = keyTarget;
+        } catch {
+          this._onKeyDown = null;
+          this._keyTarget = null;
+        }
+      }
+
       this._syncImage();
     }
 
@@ -812,6 +1046,80 @@
       this._visible = Boolean(visible);
     }
 
+    _syncSpinner() {
+      const els = this._els || {};
+      const spinner = els.spinner;
+      const spinnerRing = els.spinnerRing;
+      const gregImg = els.gregImg;
+      const reducedMotion = this._isReducedMotion();
+      const activeGreg = Boolean(this._gregMode);
+      const hideSpinner = Boolean(this._dismissed);
+
+      if (this._root) {
+        try {
+          this._root.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
+          this._root.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+        } catch {
+          // ignore
+        }
+      }
+
+      if (spinner) {
+        try {
+          spinner.hidden = hideSpinner;
+          if (spinner.style) spinner.style.display = hideSpinner ? 'none' : '';
+          spinner.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
+          spinner.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+          const gregClass = `${ROOT_CLASS}__spinner--greg`;
+          if (spinner.classList && typeof spinner.classList.add === 'function' && typeof spinner.classList.remove === 'function') {
+            if (activeGreg) {
+              spinner.classList.add(gregClass);
+            } else {
+              spinner.classList.remove(gregClass);
+            }
+          } else if (typeof spinner.className === 'string') {
+            const tokens = spinner.className.split(/\s+/).filter((c) => c && c !== gregClass);
+            if (activeGreg) tokens.push(gregClass);
+            spinner.className = tokens.join(' ');
+          }
+        } catch {
+          // Spinner updates must never throw.
+        }
+      }
+
+      if (spinnerRing) {
+        try {
+          spinnerRing.hidden = activeGreg;
+          if (spinnerRing.style) {
+            spinnerRing.style.display = activeGreg ? 'none' : '';
+            spinnerRing.style.animation = reducedMotion ? 'none' : '';
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (gregImg) {
+        try {
+          if (gregImg.getAttribute && gregImg.getAttribute('src') !== this._gregImageUrl) {
+            gregImg.setAttribute('src', this._gregImageUrl);
+          } else if (gregImg.src !== this._gregImageUrl) {
+            gregImg.src = this._gregImageUrl;
+          }
+          if (gregImg.getAttribute && gregImg.getAttribute('alt') !== 'Greg') {
+            gregImg.setAttribute('alt', 'Greg');
+          }
+          gregImg.hidden = !activeGreg;
+          if (gregImg.style) {
+            gregImg.style.display = activeGreg ? '' : 'none';
+            gregImg.style.animation = reducedMotion ? 'none' : '';
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+
     _syncChrome() {
       const els = this._els || {};
       const pct = Math.round(clampPct(this._progressPct));
@@ -878,6 +1186,8 @@
           // Scripted-input pill updates must never throw.
         }
       }
+
+      this._syncSpinner();
 
       if (this._root) {
         try {
@@ -995,6 +1305,35 @@
       return this.getState();
     }
 
+    /**
+     * Enable or disable the Spinning Greg loading spinner easter egg.
+     *
+     * @param {boolean} enabled
+     * @returns {object} Current controller state.
+     */
+    setGregMode(enabled) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      this._gregMode = Boolean(enabled);
+      this._gregClickCount = 0;
+      this._gregKeyBuffer = '';
+      this._syncSpinner();
+      return this.getState();
+    }
+
+    /**
+     * Toggle the Spinning Greg loading spinner easter egg.
+     *
+     * @returns {object} Current controller state.
+     */
+    toggleGregMode() {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      return this.setGregMode(!this._gregMode);
+    }
+
     _completeDismiss(effectiveFadeMs, startedAtMs, reason) {
       const completedAtMs = this._safeNow();
       let fadeDurationMs = 0;
@@ -1012,6 +1351,7 @@
       this._pendingDismissReason = null;
       this._fading = false;
       this._applyVisibility(false);
+      this._syncSpinner();
       this._fireDismiss();
     }
 
@@ -1144,6 +1484,7 @@
       this._dismissed = true;
       this._pendingDismissReason = resolvedReason;
       this._clearFadeTimer();
+      this._syncSpinner();
 
       if (this._root) {
         try {
@@ -1271,6 +1612,7 @@
         progressPct: Math.round(clampPct(this._progressPct)),
         readyForSplash: Boolean(this._readyForSplash),
         scriptedInputPreset: this._scriptedInputPreset,
+        gregMode: Boolean(this._gregMode),
       };
     }
 
@@ -1303,6 +1645,7 @@
         dismissReason: this._dismissReason,
         reducedMotion: this._isReducedMotion(),
         scriptedInputPreset: this._scriptedInputPreset,
+        gregMode: Boolean(this._gregMode),
         root: this._root,
       };
     }
@@ -1315,6 +1658,8 @@
       this._destroyed = true;
       this._clearFadeTimer();
       this._pendingDismissReason = null;
+      this._gregClickCount = 0;
+      this._gregKeyBuffer = '';
 
       const img = this._els && this._els.img;
       if (img && this._onImageError) {
@@ -1328,6 +1673,30 @@
           // ignore
         }
       }
+
+      const spinner = this._els && this._els.spinner;
+      if (spinner && this._onSpinnerClick) {
+        try {
+          if (typeof spinner.removeEventListener === 'function') {
+            spinner.removeEventListener('click', this._onSpinnerClick);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      this._onSpinnerClick = null;
+
+      if (this._keyTarget && this._onKeyDown) {
+        try {
+          if (typeof this._keyTarget.removeEventListener === 'function') {
+            this._keyTarget.removeEventListener('keydown', this._onKeyDown);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      this._onKeyDown = null;
+      this._keyTarget = null;
 
       if (this._root && this._root.parentNode && typeof this._root.parentNode.removeChild === 'function') {
         try {
@@ -1352,8 +1721,12 @@
     sanitizeScriptedInputPreset,
     sanitizeDismissReason,
     isHudHiddenQuery,
+    isGregQuery,
     SplashOverlayController,
     DEFAULT_FADE_MS,
+    DEFAULT_GREG_IMAGE_URL,
+    DEFAULT_GREG_CLICK_THRESHOLD,
+    GREG_SECRET_WORD,
     REDUCED_MOTION_QUERY,
   };
 

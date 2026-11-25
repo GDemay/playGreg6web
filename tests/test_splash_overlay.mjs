@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '..');
 
 const require = createRequire(import.meta.url);
 const splashMod = require('../web/ui/splash_overlay.js');
@@ -13,8 +20,12 @@ const {
   sanitizeScriptedInputPreset,
   sanitizeDismissReason,
   isHudHiddenQuery,
+  isGregQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
+  DEFAULT_GREG_IMAGE_URL,
+  DEFAULT_GREG_CLICK_THRESHOLD,
+  GREG_SECRET_WORD,
   REDUCED_MOTION_QUERY,
 } = splashMod;
 
@@ -63,6 +74,7 @@ class MockElement {
       _props: Object.create(null),
       display: '',
       width: '',
+      animation: '',
       setProperty(name, value) {
         this._props[name] = String(value);
       },
@@ -151,6 +163,11 @@ class MockElement {
     if (set) set.delete(handler);
   }
 
+  listenerCount(type) {
+    const set = this._listeners.get(type);
+    return set ? set.size : 0;
+  }
+
   dispatch(type, event = {}) {
     const set = this._listeners.get(type);
     if (set) {
@@ -206,6 +223,29 @@ class MockDocument {
     this.documentElement.appendChild(this.head);
     this.documentElement.appendChild(this.body);
     this._styles = [];
+    this._listeners = new Map();
+  }
+
+  addEventListener(type, handler) {
+    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+    this._listeners.get(type).add(handler);
+  }
+
+  removeEventListener(type, handler) {
+    const set = this._listeners.get(type);
+    if (set) set.delete(handler);
+  }
+
+  listenerCount(type) {
+    const set = this._listeners.get(type);
+    return set ? set.size : 0;
+  }
+
+  dispatch(type, event = {}) {
+    const set = this._listeners.get(type);
+    if (set) {
+      for (const handler of Array.from(set)) handler(event);
+    }
   }
 
   createElement(tag) {
@@ -1342,4 +1382,351 @@ test('W213: re-show on restart cleanly restores overlay and tracks subsequent di
   assert.equal(dismissCalls.length, 2);
   assert.doesNotThrow(() => JSON.stringify(finalStats));
   controller.destroy();
+});
+
+test('W228: exports isGregQuery, Spinning Greg constants, and web/assets/greg.png exists on disk', () => {
+  assert.equal(typeof isGregQuery, 'function');
+  assert.equal(DEFAULT_GREG_IMAGE_URL, './assets/greg.png');
+  assert.equal(DEFAULT_GREG_CLICK_THRESHOLD, 3);
+  assert.equal(GREG_SECRET_WORD, 'greg');
+  assert.equal(globalThis.PlayGta6SplashOverlay.isGregQuery, isGregQuery);
+  assert.equal(globalThis.PlayGta6SplashOverlay.DEFAULT_GREG_IMAGE_URL, DEFAULT_GREG_IMAGE_URL);
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.DEFAULT_GREG_CLICK_THRESHOLD,
+    DEFAULT_GREG_CLICK_THRESHOLD
+  );
+  assert.equal(globalThis.PlayGta6SplashOverlay.GREG_SECRET_WORD, GREG_SECRET_WORD);
+
+  // Verify org mascot image exists on disk and is a valid, compact PNG.
+  const gregPath = path.join(REPO_ROOT, 'web', 'assets', 'greg.png');
+  assert.equal(fs.existsSync(gregPath), true, 'web/assets/greg.png must exist on disk');
+  const bytes = fs.readFileSync(gregPath);
+  assert.ok(bytes.length > 0 && bytes.length < 512 * 1024, 'greg.png must be non-empty and < 512 KiB');
+  assert.deepEqual(
+    Array.from(bytes.subarray(0, 8)),
+    [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+    'greg.png must have a valid PNG signature'
+  );
+
+  // isGregQuery parsing across string, URLSearchParams, Location, and full URLs.
+  assert.equal(isGregQuery('?greg=1'), true);
+  assert.equal(isGregQuery('greg=1'), true);
+  assert.equal(isGregQuery('?GREG=TRUE'), true);
+  assert.equal(isGregQuery('?greg=true'), true);
+  assert.equal(isGregQuery('?greg=on'), true);
+  assert.equal(isGregQuery('?greg=yes'), true);
+  assert.equal(isGregQuery('?foo=1&greg=yes&bar=2'), true);
+  assert.equal(isGregQuery('?greg=0&greg=1'), true);
+  assert.equal(isGregQuery('?greg=1&greg=0'), false);
+  assert.equal(isGregQuery('?greg=0'), false);
+  assert.equal(isGregQuery('?greg=false'), false);
+  assert.equal(isGregQuery('?greg='), false);
+  assert.equal(isGregQuery(''), false);
+  assert.equal(isGregQuery(null), false);
+  assert.equal(isGregQuery(undefined), false);
+  assert.equal(isGregQuery(new URLSearchParams('?greg=1')), true);
+  assert.equal(isGregQuery(new URLSearchParams('?greg=0')), false);
+  assert.equal(isGregQuery({ search: '?greg=true' }), true);
+  assert.equal(isGregQuery('http://localhost:8000/?greg=1#top'), true);
+  assert.equal(isGregQuery('http://localhost:8000/?greg=0#?greg=1'), false);
+});
+
+test('W228: default ring spinner renders cleanly with gregMode false, hides on dismiss, and respects reduced motion', () => {
+  const doc = new MockDocument();
+  const { controller } = createController({ documentObj: doc });
+  const state = controller.getState();
+  const stats = controller.getStats();
+
+  assert.equal(state.gregMode, false);
+  assert.equal(stats.gregMode, false);
+
+  const panel = state.root.querySelector('.pg6-splash__panel');
+  assert.ok(panel);
+  const spinner = panel.querySelector('.pg6-splash__spinner');
+  const ring = panel.querySelector('.pg6-splash__spinner-ring');
+  const greg = panel.querySelector('.pg6-splash__greg');
+  const stage = panel.querySelector('.pg6-splash__stage');
+
+  assert.ok(spinner, 'spinner element must render inside panel');
+  assert.ok(ring, 'default CSS ring spinner must render inside spinner');
+  assert.ok(greg, 'greg img element must render inside spinner');
+  assert.ok(stage, 'stage label must remain intact inside panel');
+  assert.equal(spinner.hidden, false);
+  assert.equal(spinner.style.display, '');
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(ring.hidden, false);
+  assert.equal(ring.style.display, '');
+  assert.equal(greg.hidden, true);
+  assert.equal(greg.style.display, 'none');
+  assert.equal(greg.getAttribute('src'), './assets/greg.png');
+  assert.equal(greg.getAttribute('alt'), 'Greg');
+
+  // Shared stylesheet includes spin keyframes and reduced-motion animation suppression.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /@keyframes pg6-spin/);
+  assert.match(styleEl.textContent, /\.pg6-splash__spinner/);
+  assert.match(styleEl.textContent, /\.pg6-splash__greg/);
+  assert.match(
+    styleEl.textContent,
+    /@media \(prefers-reduced-motion: reduce\)\{[\s\S]*\.pg6-splash__spinner-ring,\.pg6-splash__greg\{animation:none!important;\}\}/
+  );
+
+  // Dismissing hides the spinner cleanly; show() restores it.
+  controller.dismiss({ fadeMs: 0 });
+  assert.equal(spinner.hidden, true);
+  assert.equal(spinner.style.display, 'none');
+
+  controller.show();
+  assert.equal(spinner.hidden, false);
+  assert.equal(spinner.style.display, '');
+  controller.destroy();
+
+  // Reduced motion disables spin animation without breaking Greg visibility.
+  const reduced = createController({ reducedMotion: true, gregMode: true });
+  const rRoot = reduced.controller.getState().root;
+  const rSpinner = rRoot.querySelector('.pg6-splash__spinner');
+  const rRing = rRoot.querySelector('.pg6-splash__spinner-ring');
+  const rGreg = rRoot.querySelector('.pg6-splash__greg');
+  assert.equal(reduced.controller.getStats().gregMode, true);
+  assert.equal(reduced.controller.getStats().reducedMotion, true);
+  assert.equal(rSpinner.hidden, false);
+  assert.equal(rSpinner.getAttribute('data-reduced-motion'), 'true');
+  assert.equal(rRing.style.animation, 'none');
+  assert.equal(rGreg.hidden, false);
+  assert.equal(rGreg.style.display, '');
+  assert.equal(rGreg.style.animation, 'none');
+  reduced.controller.destroy();
+});
+
+test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning Greg and preserve ?hud=0', () => {
+  // Option validation.
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), gregMode: 'yes' }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), gregClickThreshold: 0 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), gregClickThreshold: 1.5 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), gregImageUrl: 42 }),
+    TypeError
+  );
+
+  // ?greg=1 via locationSearch enables Spinning Greg automatically.
+  const viaQuery1 = createController({ locationSearch: '?greg=1' });
+  assert.equal(viaQuery1.controller.getState().gregMode, true);
+  assert.equal(viaQuery1.controller.getStats().gregMode, true);
+  const root1 = viaQuery1.controller.getState().root;
+  assert.equal(root1.querySelector('.pg6-splash__spinner').classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(root1.querySelector('.pg6-splash__spinner-ring').hidden, true);
+  assert.equal(root1.querySelector('.pg6-splash__greg').hidden, false);
+  assert.equal(root1.querySelector('.pg6-splash__greg').getAttribute('src'), './assets/greg.png');
+  assert.equal(root1.querySelector('.pg6-splash__greg').getAttribute('alt'), 'Greg');
+  viaQuery1.controller.destroy();
+
+  // ?greg=true via windowObj.location.search enables Spinning Greg automatically.
+  const viaWindow = createController({ windowObj: { location: { search: '?foo=bar&greg=true' } } });
+  assert.equal(viaWindow.controller.getState().gregMode, true);
+  assert.equal(viaWindow.controller.getStats().gregMode, true);
+  viaWindow.controller.destroy();
+
+  // Explicit constructor gregMode option overrides query in both directions.
+  const explicitOn = createController({ gregMode: true });
+  assert.equal(explicitOn.controller.getStats().gregMode, true);
+  explicitOn.controller.destroy();
+
+  const explicitOff = createController({ locationSearch: '?greg=1', gregMode: false });
+  assert.equal(explicitOff.controller.getStats().gregMode, false);
+  explicitOff.controller.destroy();
+
+  // ?hud=0 still hides the overlay cleanly even when combined with ?greg=1.
+  const hudHiddenOnly = createController({ locationSearch: '?hud=0', nowFn: () => 5000 });
+  assert.equal(hudHiddenOnly.controller.getStats().visible, false);
+  assert.equal(hudHiddenOnly.controller.getStats().dismissed, true);
+  assert.equal(hudHiddenOnly.controller.getStats().hudHidden, true);
+  assert.equal(hudHiddenOnly.controller.getStats().gregMode, false);
+  assert.equal(hudHiddenOnly.controller.getState().root.hidden, true);
+  hudHiddenOnly.controller.destroy();
+
+  const hudHiddenWithGreg = createController({ locationSearch: '?hud=0&greg=1', nowFn: () => 5100 });
+  assert.equal(hudHiddenWithGreg.controller.getStats().visible, false);
+  assert.equal(hudHiddenWithGreg.controller.getStats().dismissed, true);
+  assert.equal(hudHiddenWithGreg.controller.getStats().hudHidden, true);
+  assert.equal(hudHiddenWithGreg.controller.getStats().gregMode, true);
+  assert.equal(hudHiddenWithGreg.controller.getState().root.hidden, true);
+  assert.equal(hudHiddenWithGreg.controller.getState().root.querySelector('.pg6-splash__spinner').hidden, true);
+  hudHiddenWithGreg.controller.destroy();
+});
+
+test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects gregClickThreshold', () => {
+  const { controller } = createController();
+  const root = controller.getState().root;
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const ring = root.querySelector('.pg6-splash__spinner-ring');
+  const greg = root.querySelector('.pg6-splash__greg');
+
+  assert.equal(controller.getState().gregMode, false);
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
+
+  // 3rd click activates Spinning Greg.
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, true);
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(ring.hidden, true);
+  assert.equal(greg.hidden, false);
+
+  // Clicking while hidden is ignored.
+  controller.hide();
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, true);
+
+  // Show again and click 3x to toggle back off.
+  controller.show();
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, true);
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
+
+  // Listener is cleaned up on destroy.
+  assert.equal(spinner.listenerCount('click'), 1);
+  controller.destroy();
+  assert.equal(spinner.listenerCount('click'), 0);
+
+  // Custom gregClickThreshold works.
+  const customThreshold = createController({ gregClickThreshold: 2 });
+  const customSpinner = customThreshold.controller.getState().root.querySelector('.pg6-splash__spinner');
+  customSpinner.dispatch('click');
+  assert.equal(customThreshold.controller.getStats().gregMode, false);
+  customSpinner.dispatch('click');
+  assert.equal(customThreshold.controller.getStats().gregMode, true);
+  customThreshold.controller.destroy();
+});
+
+test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modifiers, and cleans up on destroy', () => {
+  const { controller, documentObj } = createController();
+  assert.equal(documentObj.listenerCount('keydown'), 1);
+  assert.equal(controller.getStats().gregMode, false);
+
+  const typeWord = (target, word, extra = {}) => {
+    for (const ch of word) {
+      target.dispatch('keydown', { key: ch, ...extra });
+    }
+  };
+
+  // Ignored when modifiers are held.
+  typeWord(documentObj, 'greg', { ctrlKey: true });
+  assert.equal(controller.getStats().gregMode, false);
+  typeWord(documentObj, 'greg', { altKey: true });
+  assert.equal(controller.getStats().gregMode, false);
+  typeWord(documentObj, 'greg', { metaKey: true });
+  assert.equal(controller.getStats().gregMode, false);
+
+  // Ignored when event originates from editable inputs/textareas/select/contenteditable.
+  typeWord(documentObj, 'greg', { target: { tagName: 'INPUT' } });
+  typeWord(documentObj, 'greg', { target: { tagName: 'TEXTAREA' } });
+  typeWord(documentObj, 'greg', { target: { tagName: 'SELECT' } });
+  typeWord(documentObj, 'greg', { target: { tagName: 'DIV', isContentEditable: true } });
+  typeWord(documentObj, 'greg', {
+    target: { tagName: 'DIV', getAttribute: (name) => (name === 'contenteditable' ? 'true' : null) },
+  });
+  assert.equal(controller.getStats().gregMode, false);
+
+  // Typing g-r-e-g (even after unrelated keys) toggles Spinning Greg ON.
+  typeWord(documentObj, 'abgreg');
+  assert.equal(controller.getState().gregMode, true);
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, false);
+
+  // Ignored while splash overlay is hidden or dismissed.
+  controller.hide();
+  typeWord(documentObj, 'greg');
+  assert.equal(controller.getStats().gregMode, true);
+  controller.show();
+
+  // Case-insensitive typing toggles Spinning Greg OFF again.
+  typeWord(documentObj, 'GREG');
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, true);
+
+  // destroy() removes keydown listener so no listeners leak.
+  controller.destroy();
+  assert.equal(documentObj.listenerCount('keydown'), 0);
+  typeWord(documentObj, 'greg');
+  assert.equal(controller.getStats().gregMode, false);
+
+  // Also binds and cleans up when windowObj provides addEventListener.
+  const winListeners = new Map();
+  const mockWin = {
+    location: { search: '' },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      winListeners.get(type)?.delete(fn);
+    },
+    dispatch(type, event) {
+      for (const fn of winListeners.get(type) || []) fn(event);
+    },
+  };
+  const viaWin = createController({ windowObj: mockWin });
+  assert.equal(winListeners.get('keydown')?.size, 1);
+  typeWord(mockWin, 'greg');
+  assert.equal(viaWin.controller.getStats().gregMode, true);
+  viaWin.controller.destroy();
+  assert.equal(winListeners.get('keydown')?.size, 0);
+});
+
+test('W228: setGregMode and toggleGregMode update DOM & telemetry cleanly and are safe no-ops after destroy', () => {
+  const { controller } = createController();
+  const root = controller.getState().root;
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const ring = root.querySelector('.pg6-splash__spinner-ring');
+  const greg = root.querySelector('.pg6-splash__greg');
+
+  const s1 = controller.setGregMode(true);
+  assert.equal(s1.gregMode, true);
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(root.getAttribute('data-greg-mode'), 'true');
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'true');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(ring.hidden, true);
+  assert.equal(greg.hidden, false);
+  assert.doesNotThrow(() => JSON.stringify(controller.getStats()));
+
+  const s2 = controller.toggleGregMode();
+  assert.equal(s2.gregMode, false);
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(root.getAttribute('data-greg-mode'), 'false');
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
+
+  const s3 = controller.toggleGregMode();
+  assert.equal(s3.gregMode, true);
+  const s4 = controller.setGregMode(false);
+  assert.equal(s4.gregMode, false);
+
+  controller.destroy();
+  assert.doesNotThrow(() => controller.setGregMode(true));
+  assert.doesNotThrow(() => controller.toggleGregMode());
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().destroyed, true);
 });
