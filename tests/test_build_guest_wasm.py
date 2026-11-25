@@ -2559,7 +2559,7 @@ class TestSplitModules(unittest.TestCase):
             self.assertIn("-fPIC", report.compile_flags)
             self.assertIn("-sMAIN_MODULE=1", report.link_flags)
             self.assertNotIn("-sMAIN_MODULE=2", report.link_flags)
-            self.assertIn("-sPTHREAD_POOL_SIZE=8", report.link_flags)
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", report.link_flags)
             self.assertNotIn("-sPTHREAD_POOL_SIZE=4", report.link_flags)
             self.assertIn("-sALLOW_MEMORY_GROWTH=1", report.link_flags)
             self.assertIn("-sMAXIMUM_MEMORY=16GB", report.link_flags)
@@ -2656,14 +2656,14 @@ class TestSplitModules(unittest.TestCase):
             self.assertEqual(ar_call[3:], ("wasm_boot.cpp.o", "main.cpp.o"))
 
             # Main module link has -sMAIN_MODULE=1, --whole-archive with the filtered archive,
-            # dynamicLibraries in INCOMING_MODULE_JS_API, growable 16GB memory, pool size 8,
+            # dynamicLibraries in INCOMING_MODULE_JS_API, growable 16GB memory, pool size 48,
             # NO guest_part_*.wasm arguments, and ZERO shard or registration .o files.
             main_call = runner.link_calls[0]
             self.assertIn("-sMAIN_MODULE=1", main_call)
             self.assertNotIn("-sMAIN_MODULE=2", main_call)
             self.assertIn("-sMEMORY64=1", main_call)
             self.assertIn("-pthread", main_call)
-            self.assertIn("-sPTHREAD_POOL_SIZE=8", main_call)
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", main_call)
             self.assertIn("-sALLOW_MEMORY_GROWTH=1", main_call)
             self.assertIn("-sMAXIMUM_MEMORY=16GB", main_call)
             self.assertIn("-sINITIAL_MEMORY=64MB", main_call)
@@ -3041,7 +3041,7 @@ class TestSplitModules(unittest.TestCase):
             self.assertIn("-sMAIN_MODULE=1", payload["link_flags"])
             self.assertNotIn("-sMAIN_MODULE=2", payload["link_flags"])
             self.assertIn("-sMAIN_MODULE=1", payload["link_argv"])
-            self.assertIn("-sPTHREAD_POOL_SIZE=8", payload["link_flags"])
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", payload["link_flags"])
             self.assertIn("-sALLOW_MEMORY_GROWTH=1", payload["link_flags"])
             self.assertIn("-sMAXIMUM_MEMORY=16GB", payload["link_flags"])
             self.assertIn("-sINITIAL_MEMORY=64MB", payload["link_flags"])
@@ -3168,7 +3168,7 @@ class TestSplitModules(unittest.TestCase):
 
             # Main link command checks: MAIN_MODULE=1, whole-archive filtered copy,
             # zero guest_part_*.wasm args, single INCOMING_MODULE_JS_API with dynamicLibraries,
-            # EXPORTED_RUNTIME_METHODS present, growable 16GB memory + 64MB initial, pool size 8.
+            # EXPORTED_RUNTIME_METHODS present, growable 16GB memory + 64MB initial, pool size 48.
             self.assertEqual(len(runner.link_calls), 1)
             main_call = runner.link_calls[0]
             self.assertIn("-sMAIN_MODULE=1", main_call)
@@ -3192,7 +3192,7 @@ class TestSplitModules(unittest.TestCase):
             self.assertIn("-sALLOW_MEMORY_GROWTH=1", main_call)
             self.assertIn("-sMAXIMUM_MEMORY=16GB", main_call)
             self.assertIn("-sINITIAL_MEMORY=64MB", main_call)
-            self.assertIn("-sPTHREAD_POOL_SIZE=8", main_call)
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", main_call)
             self.assertNotIn("-sPTHREAD_POOL_SIZE=4", main_call)
 
             # Explicit --initial-memory and --pthread-pool-size override split defaults.
@@ -3204,7 +3204,7 @@ class TestSplitModules(unittest.TestCase):
             self.assertIn("-sINITIAL_MEMORY=128MB", override_flags)
             self.assertNotIn("-sINITIAL_MEMORY=64MB", override_flags)
             self.assertIn("-sPTHREAD_POOL_SIZE=12", override_flags)
-            self.assertNotIn("-sPTHREAD_POOL_SIZE=8", override_flags)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=48", override_flags)
 
             # emar d failure aborts before main link.
             runner_ar_fail = RecordingRunner(fail_outputs=frozenset({"libplaygta6_core_split.a"}))
@@ -3280,7 +3280,7 @@ class TestSplitModules(unittest.TestCase):
                 bgw.resolve_link_flags(browser_boot_exports=True, main_module=False),
             )
             self.assertIn("-sPTHREAD_POOL_SIZE=4", link)
-            self.assertNotIn("-sPTHREAD_POOL_SIZE=8", link)
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=48", link)
             self.assertNotIn("-sMAIN_MODULE=1", link)
             self.assertNotIn("-sMAIN_MODULE=2", link)
             self.assertNotIn("-Wl,--whole-archive", link)
@@ -6849,6 +6849,95 @@ class TestRuntimeHeaderCacheKeys(unittest.TestCase):
                 if item.unit.kind == "ll":
                     self.assertEqual(item.status, "hit", item.unit.unit_id)
                     self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+
+class TestSplitDefaultPthreadPoolSize(unittest.TestCase):
+    """W158 (#852): Split-module builds default to -sPTHREAD_POOL_SIZE=48."""
+
+    def test_split_default_constant_and_resolve_link_flags(self) -> None:
+        self.assertEqual(bgw.SPLIT_DEFAULT_PTHREAD_POOL_SIZE, 48)
+
+        split_flags = bgw.resolve_link_flags(main_module=True)
+        self.assertIn("-sPTHREAD_POOL_SIZE=48", split_flags)
+        self.assertNotIn("-sPTHREAD_POOL_SIZE=4", split_flags)
+        self.assertNotIn("-sPTHREAD_POOL_SIZE=8", split_flags)
+
+        mono_flags = bgw.resolve_link_flags(main_module=False)
+        self.assertIn("-sPTHREAD_POOL_SIZE=4", mono_flags)
+        self.assertNotIn("-sPTHREAD_POOL_SIZE=48", mono_flags)
+
+        override_higher = bgw.resolve_link_flags(main_module=True, pthread_pool_size=64)
+        self.assertIn("-sPTHREAD_POOL_SIZE=64", override_higher)
+        self.assertNotIn("-sPTHREAD_POOL_SIZE=48", override_higher)
+
+        override_lower = bgw.resolve_link_flags(main_module=True, pthread_pool_size=16)
+        self.assertIn("-sPTHREAD_POOL_SIZE=16", override_lower)
+        self.assertNotIn("-sPTHREAD_POOL_SIZE=48", override_lower)
+
+    def test_cli_split_default_and_explicit_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            src = _program_layout(root)
+
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-default"),
+                    "--out-dir",
+                    str(root / "dist-default"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", payload["link_flags"])
+            self.assertIn("-sPTHREAD_POOL_SIZE=48", payload["link_argv"])
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=8", payload["link_flags"])
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=4", payload["link_flags"])
+
+            # Explicit CLI --pthread-pool-size overrides split default 48.
+            code_ov, out_ov, err_ov = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--pthread-pool-size",
+                    "16",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(root / "cache-override"),
+                    "--out-dir",
+                    str(root / "dist-override"),
+                ]
+            )
+            self.assertEqual(code_ov, 0, err_ov)
+            ov_payload = json.loads(out_ov)
+            self.assertIn("-sPTHREAD_POOL_SIZE=16", ov_payload["link_flags"])
+            self.assertIn("-sPTHREAD_POOL_SIZE=16", ov_payload["link_argv"])
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=48", ov_payload["link_flags"])
+            self.assertNotIn("-sPTHREAD_POOL_SIZE=48", ov_payload["link_argv"])
+
+    def test_cli_help_documents_split_default_48(self) -> None:
+        parser = bgw.build_arg_parser()
+        pool_action = next(
+            a for a in parser._actions if "--pthread-pool-size" in a.option_strings
+        )
+        self.assertIn(
+            "default: 4 monolithic, 48 when --split-modules > 1",
+            pool_action.help or "",
+        )
 
 
 if __name__ == "__main__":
