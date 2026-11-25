@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f).
+"""Parallel sharded LLVM IR / C++ → Wasm64 Emscripten build orchestrator (Track 1 / R13, R21, R24, R25, R26, R27, R28, R30, R31, R33, R35, R37d, R37e, R37f; Track 5 / W110).
 
 Takes a `playgta6-recomp build` (R9) output directory of sharded `.ll` / `.c` / `.cpp`
 translation units, or a multi-module `playgta6-recomp build-program` (R12) tree with
 `program-manifest.json`, compiles dirty shards in parallel with `emcc`/`em++`, caches
-`.o` files by SHA-256 of content + compiler flags (plus sibling `.h`/`.hpp` headers for
-C/C++ units), and links with `libplaygta6_core.a` into `web/dist/runtime.js` +
+`.o` files by SHA-256 of content + compiler flags (plus `runtime/` and generated/sibling
+`.h`/`.hpp`/`.inl` header fingerprints for C/C++ units, never `.ll` shards), and links with
+`libplaygta6_core.a` into `web/dist/runtime.js` +
 `web/dist/runtime.wasm` (optionally splitting `.ll` shards and `functions.ll`
 registration tables across `guest_part_*.wasm` `-sSIDE_MODULE=1` modules with `-fPIC`,
 `-sMAIN_MODULE=1`, filtered whole-archive, runtime `Module.dynamicLibraries` loading,
@@ -90,7 +91,7 @@ PROGRAM_LEVEL_UNITS: tuple[str, ...] = (
 SOURCE_SUFFIXES: frozenset[str] = frozenset({".ll", ".c", ".cc", ".cpp", ".cxx"})
 IR_SUFFIXES: frozenset[str] = frozenset({".ll"})
 CXX_SUFFIXES: frozenset[str] = frozenset({".cc", ".cpp", ".cxx"})
-HEADER_SUFFIXES: frozenset[str] = frozenset({".h", ".hpp"})
+HEADER_SUFFIXES: frozenset[str] = frozenset({".h", ".hpp", ".inl"})
 SKIP_DIR_NAMES: frozenset[str] = frozenset(
     {
         ".git",
@@ -255,6 +256,7 @@ _TARGET_DATALAYOUT_RE = re.compile(r"^[ \t]*target[ \t]+datalayout[ \t]*=")
 _TARGET_TRIPLE_WASM64_RE = re.compile(
     r'^([ \t]*target[ \t]+triple[ \t]*=[ \t]*)"wasm64-unknown-unknown"([ \t]*(?:;.*)?)$'
 )
+_LOCAL_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"\r\n]+)"', re.MULTILINE)
 
 CommandRunner = Callable[..., "CommandResult"]
 WhichFn = Callable[[str], str | None]
@@ -1221,15 +1223,81 @@ def compile_flags_for(
     return tuple(flags)
 
 
-def sibling_headers_fingerprint(source_path: Path) -> bytes:
-    """Return a deterministic SHA-256 digest of same-directory `.h`/`.hpp` headers, or `b""`."""
-    parent = source_path.parent
-    if not parent.is_dir():
+def _should_skip_header_dir(dir_name: str) -> bool:
+    """Return True for build, target, hidden, or VCS directories excluded from header hashing."""
+    if not dir_name or dir_name.startswith("."):
+        return True
+    lowered = dir_name.lower()
+    if lowered.startswith("build"):
+        return True
+    return dir_name in SKIP_DIR_NAMES or lowered in SKIP_DIR_NAMES
+
+
+def _iter_header_files(root: Path) -> list[tuple[str, Path]]:
+    """Collect `(posix_rel, path)` for all headers under `root`, sorted deterministically."""
+    if not root.is_dir():
+        return []
+    entries: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not _should_skip_header_dir(d))
+        current = Path(dirpath)
+        for filename in sorted(filenames):
+            candidate = current / filename
+            if candidate.suffix.lower() not in HEADER_SUFFIXES:
+                continue
+            if not candidate.is_file():
+                continue
+            rel = candidate.relative_to(root).as_posix()
+            entries.append((rel, candidate))
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def compute_runtime_headers_fingerprint(
+    repo_root: Path | None = None,
+    *,
+    header_roots: Sequence[Path] | None = None,
+) -> str:
+    """Return a deterministic SHA-256 hex digest of `runtime/` headers (or explicit `header_roots`).
+
+    Walks `repo_root / "runtime"` (or each directory in `header_roots`) in sorted POSIX
+    relative path order, skipping `build*`, `target`, hidden directories, and `SKIP_DIR_NAMES`.
+    Hashes every `*.h`, `*.hpp`, and `*.inl` file's relative path and raw bytes into one
+    SHA-256 hex digest. Computed once per build and salted into C/C++ `.o` cache keys only
+    (never `.ll` LLVM IR shards).
+    """
+    if header_roots is not None:
+        roots = [Path(p) for p in header_roots]
+    elif repo_root is not None:
+        roots = [Path(repo_root) / "runtime"]
+    else:
+        roots = [DEFAULT_REPO_ROOT / "runtime"]
+
+    digest = hashlib.sha256()
+    digest.update(b"playgta6-runtime-headers-v1\0")
+    multi_root = len(roots) > 1
+    for root_index, root in enumerate(roots):
+        if multi_root:
+            digest.update(f"root:{root_index}\0".encode("ascii"))
+        for rel, header_path in _iter_header_files(root):
+            data = header_path.read_bytes()
+            digest.update(rel.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(len(data)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(data)
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _dir_headers_fingerprint(directory: Path, *, tag: bytes) -> bytes:
+    """Return a deterministic SHA-256 digest of direct-child headers in `directory`, or `b""`."""
+    if not directory.is_dir():
         return b""
     headers = sorted(
         (
             entry
-            for entry in parent.iterdir()
+            for entry in directory.iterdir()
             if entry.is_file() and entry.suffix.lower() in HEADER_SUFFIXES
         ),
         key=lambda p: p.name,
@@ -1237,7 +1305,7 @@ def sibling_headers_fingerprint(source_path: Path) -> bytes:
     if not headers:
         return b""
     digest = hashlib.sha256()
-    digest.update(b"playgta6-sibling-headers-v1\0")
+    digest.update(tag)
     for header in headers:
         data = header.read_bytes()
         digest.update(header.name.encode("utf-8"))
@@ -1249,10 +1317,92 @@ def sibling_headers_fingerprint(source_path: Path) -> bytes:
     return digest.digest()
 
 
-def _extra_fingerprint_for_unit(unit: SourceUnit) -> bytes:
-    if unit.kind in {"c", "cpp"}:
-        return sibling_headers_fingerprint(unit.path)
-    return b""
+def sibling_headers_fingerprint(source_path: Path) -> bytes:
+    """Return a deterministic SHA-256 digest of same-directory `.h`/`.hpp`/`.inl` headers, or `b""`."""
+    return _dir_headers_fingerprint(source_path.parent, tag=b"playgta6-sibling-headers-v1\0")
+
+
+def source_root_headers_fingerprint(source_root: Path) -> bytes:
+    """Return a deterministic SHA-256 digest of top-level generated headers in `source_root`, or `b""`."""
+    return _dir_headers_fingerprint(source_root, tag=b"playgta6-source-root-headers-v1\0")
+
+
+def _included_source_root_headers_fingerprint(
+    content: bytes,
+    source_root: Path | None,
+) -> bytes:
+    """Hash any local `#include "..."` headers resolved under `source_root` (transitively)."""
+    if source_root is None or not source_root.is_dir():
+        return b""
+    resolved_root = source_root.resolve()
+    matched: dict[str, bytes] = {}
+    queue: list[tuple[Path, bytes]] = [(resolved_root, content)]
+    while queue:
+        base_dir, text = queue.pop()
+        for match in _LOCAL_INCLUDE_RE.finditer(text):
+            raw_inc = match.group(1).decode("utf-8", errors="ignore").replace("\\", "/").strip()
+            if not raw_inc or raw_inc.startswith("/"):
+                continue
+            for search_dir in (base_dir, resolved_root):
+                candidate = (search_dir / raw_inc).resolve()
+                try:
+                    rel = candidate.relative_to(resolved_root).as_posix()
+                except ValueError:
+                    continue
+                if rel in matched:
+                    break
+                if candidate.suffix.lower() in HEADER_SUFFIXES and candidate.is_file():
+                    data = candidate.read_bytes()
+                    matched[rel] = data
+                    queue.append((candidate.parent, data))
+                    break
+    if not matched:
+        return b""
+    digest = hashlib.sha256()
+    digest.update(b"playgta6-included-source-headers-v1\0")
+    for rel in sorted(matched):
+        data = matched[rel]
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.digest()
+
+
+def _extra_fingerprint_for_unit(
+    unit: SourceUnit,
+    *,
+    content: bytes | None = None,
+    source_root: Path | None = None,
+    source_root_headers_fp: bytes = b"",
+) -> bytes:
+    if unit.kind not in {"c", "cpp"}:
+        return b""
+    sibling_fp = sibling_headers_fingerprint(unit.path)
+    included_fp = (
+        _included_source_root_headers_fingerprint(content, source_root)
+        if content is not None and source_root is not None
+        else b""
+    )
+    if not source_root_headers_fp and not included_fp:
+        return sibling_fp
+    digest = hashlib.sha256()
+    digest.update(b"playgta6-unit-extra-headers-v1\0")
+    for label, part in (
+        (b"sibling", sibling_fp),
+        (b"source-root", source_root_headers_fp),
+        (b"included", included_fp),
+    ):
+        if part:
+            digest.update(label)
+            digest.update(b"\0")
+            digest.update(str(len(part)).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(part)
+            digest.update(b"\0")
+    return digest.digest()
 
 
 def cache_key_for(
@@ -1262,6 +1412,7 @@ def cache_key_for(
     kind: str,
     retarget_version: int | str | None = None,
     extra_fingerprint: bytes = b"",
+    runtime_headers_fingerprint: str = "",
 ) -> str:
     digest = hashlib.sha256()
     digest.update(b"playgta6-guest-wasm-v1\0")
@@ -1274,6 +1425,13 @@ def cache_key_for(
         digest.update(b"\0")
     for flag in flags:
         digest.update(flag.encode("utf-8"))
+        digest.update(b"\0")
+    if kind in {"c", "cpp"} and runtime_headers_fingerprint:
+        rt_fp_bytes = runtime_headers_fingerprint.encode("utf-8")
+        digest.update(b"runtime-headers\0")
+        digest.update(str(len(rt_fp_bytes)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(rt_fp_bytes)
         digest.update(b"\0")
     if extra_fingerprint:
         digest.update(b"extra\0")
@@ -3469,11 +3627,25 @@ def compile_unit(
     cache_dir: Path,
     dry_run: bool,
     run_command: CommandRunner,
+    runtime_headers_fingerprint: str = "",
+    source_root: Path | None = None,
+    source_root_headers_fp: bytes = b"",
 ) -> UnitBuildResult:
     started = time.monotonic()
     content = unit.path.read_bytes()
-    extra_fp = _extra_fingerprint_for_unit(unit)
-    key = cache_key_for(content, flags, kind=unit.kind, extra_fingerprint=extra_fp)
+    extra_fp = _extra_fingerprint_for_unit(
+        unit,
+        content=content,
+        source_root=source_root,
+        source_root_headers_fp=source_root_headers_fp,
+    )
+    key = cache_key_for(
+        content,
+        flags,
+        kind=unit.kind,
+        extra_fingerprint=extra_fp,
+        runtime_headers_fingerprint=runtime_headers_fingerprint,
+    )
     object_path = cache_object_path(cache_dir, key, unit.unit_id)
     argv = build_compile_argv(compiler, unit.path, object_path, flags)
     display_argv = tuple(sanitize_argv(argv))
@@ -3900,6 +4072,8 @@ def run_build(
         if shrink_largest_shards > 0 and opt_level != "Oz"
         else frozenset()
     )
+    runtime_headers_fp = compute_runtime_headers_fingerprint(repo_root)
+    source_root_hdr_fp = source_root_headers_fingerprint(source_root)
     planned: list[UnitBuildResult] = []
     compile_tasks: list[tuple[SourceUnit, Path, tuple[str, ...]]] = []
     for unit in units:
@@ -3919,8 +4093,19 @@ def run_build(
             pic=use_split,
         )
         content = unit.path.read_bytes()
-        extra_fp = _extra_fingerprint_for_unit(unit)
-        key = cache_key_for(content, flags, kind=unit.kind, extra_fingerprint=extra_fp)
+        extra_fp = _extra_fingerprint_for_unit(
+            unit,
+            content=content,
+            source_root=source_root,
+            source_root_headers_fp=source_root_hdr_fp,
+        )
+        key = cache_key_for(
+            content,
+            flags,
+            kind=unit.kind,
+            extra_fingerprint=extra_fp,
+            runtime_headers_fingerprint=runtime_headers_fp,
+        )
         object_path = cache_object_path(cache_root, key, unit.unit_id)
         argv = tuple(sanitize_argv(build_compile_argv(compiler, unit.path, object_path, flags)))
         if object_path.is_file():
@@ -3963,6 +4148,9 @@ def run_build(
                 cache_dir=cache_root,
                 dry_run=False,
                 run_command=runner,
+                runtime_headers_fingerprint=runtime_headers_fp,
+                source_root=source_root,
+                source_root_headers_fp=source_root_hdr_fp,
             )
 
         workers = min(worker_count, len(compile_tasks))
