@@ -28,6 +28,7 @@ const {
   checkIndirectRange,
   isZeroCountRecord,
   validateIndirectBufferArgs,
+  validateIndirectDrawArgs,
   validateIndirectRange,
   computeIndirectBatchStepPlan,
   validateIndirectBatch,
@@ -44,6 +45,9 @@ const {
   executeIndirectDraw,
   executeIndirectDrawIndexed,
   executeIndirectDispatch,
+  dispatchIndirectDraw,
+  dispatchIndexedIndirectDraw,
+  dispatchIndirectBatch,
   getStats,
   resetStats,
   IndirectArgsBuffer,
@@ -866,6 +870,10 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
     skippedOutOfBoundsDraws: 0,
     skippedMisalignedDraws: 0,
     skippedZeroCountDraws: 0,
+    batchesDispatched: 0,
+    commandsValidated: 0,
+    zeroCountElided: 0,
+    outOfBoundsElided: 0,
   });
 
   // IndirectArgsBuffer instance telemetry + maxIndirectBatchCount + resetStats
@@ -1533,4 +1541,450 @@ test('W269: zero-count indirect draws and dispatches are safely elided across si
   assert.equal(clearedMod.skippedOutOfBoundsDraws, 0);
   assert.equal(clearedMod.skippedMisalignedDraws, 0);
   assert.equal(clearedMod.skippedZeroCountDraws, 0);
+});
+
+test('W306: validateIndirectDrawArgs / validateIndirectBufferArgs / checkIndirectRange support zero-alloc out scratch reuse and preserve default return shape', () => {
+  resetStats();
+  const buf64 = indirectBuf(64);
+  const scratch = {};
+
+  // 1. Positional `out` scratch reuse on validateIndirectDrawArgs (kind-first & buffer-first forms)
+  const r1 = validateIndirectDrawArgs(INDIRECT_KIND.DRAW, buf64, 16, null, scratch);
+  assert.equal(r1, scratch, 'returns caller scratch object directly');
+  assert.deepEqual(r1, {
+    ok: true,
+    valid: true,
+    code: null,
+    reason: null,
+    kind: INDIRECT_KIND.DRAW,
+    offset: 16,
+    recordSize: 16,
+    requiredStrideBytes: 16,
+    bufferSize: 64,
+    zeroCount: false,
+  });
+
+  // Subsequent invalid call overwrites all fields on the same scratch object (no stale state)
+  const r2 = validateIndirectDrawArgs(INDIRECT_KIND.DRAW_INDEXED, buf64, 48, { out: scratch });
+  assert.equal(r2, scratch);
+  assert.equal(r2.ok, false);
+  assert.equal(r2.valid, false);
+  assert.equal(r2.code, 'OUT_OF_BOUNDS');
+  assert.equal(r2.reason, 'OUT_OF_BOUNDS');
+  assert.equal(r2.kind, INDIRECT_KIND.DRAW_INDEXED);
+  assert.equal(r2.recordSize, 20);
+  assert.equal(r2.zeroCount, false);
+
+  // Buffer-first convenience forms: (buffer, offset, options, out) and (buffer, offset, indexedBool, out)
+  const r3 = validateIndirectDrawArgs(buf64, 44, { indexed: true }, scratch);
+  assert.equal(r3, scratch);
+  assert.equal(r3.ok, true);
+  assert.equal(r3.code, null);
+  assert.equal(r3.recordSize, 20);
+
+  const r4 = validateIndirectDrawArgs(buf64, 2, true, scratch);
+  assert.equal(r4, scratch);
+  assert.equal(r4.ok, false);
+  assert.equal(r4.code, 'MISALIGNED_OFFSET');
+
+  // Zero-count detection via Uint32Array shadowData with zero-alloc scratch reuse
+  const u32Shadow = new Uint32Array([36, 0, 0, 0, 12, 1, 0, 0]);
+  const r5 = validateIndirectDrawArgs(
+    INDIRECT_KIND.DRAW,
+    buf64,
+    0,
+    { shadowData: u32Shadow },
+    scratch
+  );
+  assert.equal(r5, scratch);
+  assert.equal(r5.ok, true);
+  assert.equal(r5.zeroCount, true);
+  assert.equal(r5.code, 'ZERO_COUNT');
+
+  const r6 = validateIndirectBufferArgs(
+    INDIRECT_KIND.DRAW,
+    buf64,
+    16,
+    { shadowData: u32Shadow, out: scratch }
+  );
+  assert.equal(r6, scratch);
+  assert.equal(r6.ok, true);
+  assert.equal(r6.zeroCount, false);
+  assert.equal(r6.code, null);
+
+  // Omitting `out` allocates a fresh result object preserving exact default return shape
+  const d1 = validateIndirectDrawArgs(INDIRECT_KIND.DRAW, buf64, 0);
+  const d2 = validateIndirectDrawArgs(INDIRECT_KIND.DRAW, buf64, 0);
+  assert.notEqual(d1, d2);
+  assert.deepEqual(d1, {
+    ok: true,
+    valid: true,
+    code: null,
+    reason: null,
+    kind: INDIRECT_KIND.DRAW,
+    offset: 0,
+    recordSize: 16,
+    requiredStrideBytes: 16,
+    bufferSize: 64,
+    zeroCount: false,
+  });
+
+  // checkIndirectRange also supports `out` scratch reuse without mutating telemetry
+  const rangeScratch = {};
+  const cr1 = checkIndirectRange(buf64, 44, 20, null, rangeScratch);
+  assert.equal(cr1, rangeScratch);
+  assert.deepEqual(cr1, { ok: true, code: null, offset: 44, recordSize: 20, bufferSize: 64 });
+  const cr2 = checkIndirectRange(buf64, 48, 20, { out: rangeScratch });
+  assert.equal(cr2, rangeScratch);
+  assert.equal(cr2.ok, false);
+  assert.equal(cr2.code, 'OUT_OF_BOUNDS');
+
+  // Pure validation never mutates telemetry
+  const stats = getStats();
+  assert.equal(stats.commandsValidated, 0);
+  assert.equal(stats.batchesDispatched, 0);
+  assert.equal(stats.zeroCountElided, 0);
+  assert.equal(stats.outOfBoundsElided, 0);
+
+  // UMD global export exposes all W306 helpers
+  assert.equal(globalThis.PlayGta6IndirectDraw.validateIndirectDrawArgs, validateIndirectDrawArgs);
+  assert.equal(globalThis.PlayGta6IndirectDraw.dispatchIndirectDraw, dispatchIndirectDraw);
+  assert.equal(globalThis.PlayGta6IndirectDraw.dispatchIndexedIndirectDraw, dispatchIndexedIndirectDraw);
+  assert.equal(globalThis.PlayGta6IndirectDraw.dispatchIndirectBatch, dispatchIndirectBatch);
+});
+
+test('W306: dispatchIndirectDraw & dispatchIndexedIndirectDraw reuse out scratch, preserve W269 bounds checks, and update telemetry', () => {
+  resetStats();
+  const pass = createMockPass();
+  const buf64 = indirectBuf(64);
+  const scratch = {};
+
+  // Valid non-indexed draw (16B) with positional `out` scratch
+  const r1 = dispatchIndirectDraw(pass, buf64, 48, null, scratch);
+  assert.equal(r1, scratch);
+  assert.deepEqual(r1, {
+    ok: true,
+    dispatched: true,
+    executed: 1,
+    skipped: 0,
+    elided: false,
+    reason: null,
+    offset: 48,
+    byteSize: 16,
+    indexed: false,
+  });
+
+  // Valid indexed draw (20B) with `options.out` scratch
+  const r2 = dispatchIndexedIndirectDraw(pass, buf64, 44, { out: scratch });
+  assert.equal(r2, scratch);
+  assert.deepEqual(r2, {
+    ok: true,
+    dispatched: true,
+    executed: 1,
+    skipped: 0,
+    elided: false,
+    reason: null,
+    offset: 44,
+    byteSize: 20,
+    indexed: true,
+  });
+
+  // Zero-count elision via Uint8Array shadow and inline fields reuses scratch cleanly
+  const shadowBytes = encodeDrawIndirect({ vertexCount: 36, instanceCount: 0 });
+  const r3 = dispatchIndirectDraw(pass, buf64, 0, { shadowData: shadowBytes }, scratch);
+  assert.equal(r3, scratch);
+  assert.equal(r3.ok, true);
+  assert.equal(r3.dispatched, false);
+  assert.equal(r3.executed, 0);
+  assert.equal(r3.skipped, 1);
+  assert.equal(r3.elided, true);
+  assert.equal(r3.reason, 'ZERO_COUNT');
+
+  const r4 = dispatchIndexedIndirectDraw(pass, buf64, 0, { indexCount: 0, instanceCount: 2, out: scratch });
+  assert.equal(r4, scratch);
+  assert.equal(r4.ok, true);
+  assert.equal(r4.dispatched, false);
+  assert.equal(r4.elided, true);
+  assert.equal(r4.reason, 'ZERO_COUNT');
+
+  // Out-of-bounds elision (16B draw at 52 > 64, 20B indexed draw at 48 > 64)
+  const r5 = dispatchIndirectDraw(pass, buf64, 52, null, scratch);
+  assert.equal(r5, scratch);
+  assert.equal(r5.ok, false);
+  assert.equal(r5.dispatched, false);
+  assert.equal(r5.elided, true);
+  assert.equal(r5.reason, 'OUT_OF_BOUNDS');
+
+  const r6 = dispatchIndexedIndirectDraw(pass, buf64, 48, null, scratch);
+  assert.equal(r6, scratch);
+  assert.equal(r6.ok, false);
+  assert.equal(r6.reason, 'OUT_OF_BOUNDS');
+
+  // Misaligned offset and destroyed buffer elided safely
+  const r7 = dispatchIndirectDraw(pass, buf64, 2, null, scratch);
+  assert.equal(r7, scratch);
+  assert.equal(r7.ok, false);
+  assert.equal(r7.reason, 'MISALIGNED_OFFSET');
+
+  const r8 = dispatchIndexedIndirectDraw(
+    pass,
+    { usage: BUFFER_USAGE.INDIRECT, size: 64, destroyed: true },
+    0,
+    null,
+    scratch
+  );
+  assert.equal(r8, scratch);
+  assert.equal(r8.ok, false);
+  assert.equal(r8.reason, 'DESTROYED_BUFFER');
+
+  // Omitting `out` returns fresh objects with exact default shape
+  const fresh1 = dispatchIndirectDraw(pass, buf64, 0);
+  const fresh2 = dispatchIndirectDraw(pass, buf64, 0);
+  assert.notEqual(fresh1, fresh2);
+  assert.equal(fresh1.dispatched, true);
+  assert.equal(fresh2.dispatched, true);
+
+  // Strict mode throws W269 errors on invalid args
+  assert.throws(
+    () => dispatchIndirectDraw(pass, buf64, 52, { strict: true }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.throws(
+    () => dispatchIndexedIndirectDraw(pass, buf64, 6, { strict: true }),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+
+  // executeIndirectDraw & encodeIndirectDraw also support `out` scratch reuse
+  const execScratch = {};
+  const ex1 = executeIndirectDraw(pass, buf64, 0, null, execScratch);
+  assert.equal(ex1, execScratch);
+  assert.equal(ex1.ok, true);
+  assert.equal(ex1.executed, 1);
+
+  const encScratch = {};
+  const en1 = encodeIndirectDraw(pass, buf64, 0, null, encScratch);
+  assert.equal(en1, encScratch);
+  assert.equal(en1.offset, 0);
+  assert.equal(en1.byteSize, 16);
+  // Default encodeIndirectDraw without `out` preserves exact { offset, byteSize } shape
+  assert.deepEqual(encodeIndirectDraw(pass, buf64, 16), { offset: 16, byteSize: 16 });
+
+  assert.deepEqual(pass.calls, [
+    ['drawIndirect', 48],
+    ['drawIndexedIndirect', 44],
+    ['drawIndirect', 0],
+    ['drawIndirect', 0],
+    ['drawIndirect', 0],
+    ['drawIndirect', 0],
+    ['drawIndirect', 16],
+  ]);
+
+  const s = getStats();
+  assert.equal(s.commandsValidated, 15);
+  assert.equal(s.validatedIndirectDraws, 7);
+  assert.equal(s.zeroCountElided, 2);
+  assert.equal(s.skippedZeroCountDraws, 2);
+  assert.equal(s.outOfBoundsElided, 2);
+  assert.equal(s.skippedOutOfBoundsDraws, 3); // 2 elided + 1 strict throw
+  assert.equal(s.skippedMisalignedDraws, 2); // 1 elided + 1 strict throw
+});
+
+test('W306: dispatchIndirectBatch validates consecutive structs in a single pass with zero-count & OOB elision, native coalescing, and scratch reuse', () => {
+  resetStats();
+  const pass = createMockPass(true);
+  const scratch = {};
+
+  // 1. Mixed indexed batch (20B stride): 5 requested commands in an 80B buffer (fits slots 0..3; slot 4 is OOB)
+  // Slot 0: active (36, 1)
+  // Slot 1: zero indexCount -> elided
+  // Slot 2: active (24, 2)
+  // Slot 3: zero instanceCount -> elided
+  // Slot 4: offset 80 + 20 = 100 > 80 -> OOB elided
+  const { bytes: shadowBytes } = encodeBatch(INDIRECT_KIND.DRAW_INDEXED, [
+    { indexCount: 36, instanceCount: 1 },
+    { indexCount: 0, instanceCount: 1 },
+    { indexCount: 24, instanceCount: 2 },
+    { indexCount: 12, instanceCount: 0 },
+  ]);
+
+  const b1 = dispatchIndirectBatch(
+    pass,
+    indirectBuf(80),
+    {
+      indexed: true,
+      count: 5,
+      shadowData: shadowBytes,
+    },
+    scratch
+  );
+  assert.equal(b1, scratch, 'reuses caller scratch object');
+  assert.deepEqual(b1, {
+    ok: true,
+    dispatched: 2,
+    executed: 2,
+    calls: 2,
+    validated: 5,
+    requestedCount: 5,
+    clamped: true,
+    skipped: 3,
+    zeroCountElided: 2,
+    outOfBoundsElided: 1,
+    visibilitySkipped: 0,
+    reason: 'CLAMPED_TO_BUFFER',
+    native: false,
+    firstOffset: 0,
+    stride: 20,
+  });
+  assert.deepEqual(pass.calls, [
+    ['drawIndexedIndirect', 0],
+    ['drawIndexedIndirect', 40],
+  ]);
+
+  // 2. Native multi-draw coalescing around zero-count holes + OOB tail in one pass (Uint32Array shadow)
+  pass.calls.length = 0;
+  // 5 non-indexed draw records (16B each = 80B); buffer is 96B (fits 6), request 8 -> 2 OOB tail
+  const u32DrawShadow = new Uint32Array([
+    3, 1, 0, 0, // slot 0: active
+    6, 2, 0, 0, // slot 1: active -> coalesced with slot 0 (run of 2 at offset 0)
+    0, 1, 0, 0, // slot 2: zero vertexCount -> elided
+    9, 1, 0, 0, // slot 3: active
+    12, 1, 0, 0, // slot 4: active
+    15, 0, 0, 0, // slot 5: zero instanceCount -> elided (run of 2 flushed at offset 48)
+  ]);
+  const b2 = dispatchIndirectBatch(pass, indirectBuf(96), {
+    indexed: false,
+    count: 8,
+    shadowData: u32DrawShadow,
+    useNative: true,
+    out: scratch,
+  });
+  assert.equal(b2, scratch);
+  assert.equal(b2.ok, true);
+  assert.equal(b2.dispatched, 4);
+  assert.equal(b2.calls, 2);
+  assert.equal(b2.validated, 8);
+  assert.equal(b2.zeroCountElided, 2);
+  assert.equal(b2.outOfBoundsElided, 2);
+  assert.equal(b2.native, true);
+  assert.equal(b2.reason, 'CLAMPED_TO_BUFFER');
+  assert.deepEqual(pass.calls, [
+    ['multiDrawIndirect', 0, 2],
+    ['multiDrawIndirect', 48, 2],
+  ]);
+
+  // 3. Custom stride (32B) with records array + visibility mask + baseOffset
+  pass.calls.length = 0;
+  const b3 = dispatchIndirectBatch(pass, indirectBuf(160), {
+    indexed: true,
+    baseOffset: 16,
+    stride: 32,
+    records: [
+      { indexCount: 12, instanceCount: 1 }, // off 16: active
+      { indexCount: 18, instanceCount: 1 }, // off 48: visibility false -> skipped
+      { indexCount: 24, instanceCount: 0 }, // off 80: zero instanceCount -> elided
+      { indexCount: 30, instanceCount: 1 }, // off 112: active (112+20=132 <= 160)
+      { indexCount: 36, instanceCount: 1 }, // off 144: OOB (144+20=164 > 160) -> elided
+    ],
+    visibility: [1, 0, 1, 1, 1],
+  });
+  assert.notEqual(b3, scratch, 'omitting out allocates fresh batch result');
+  assert.equal(b3.ok, true);
+  assert.equal(b3.dispatched, 2);
+  assert.equal(b3.validated, 5);
+  assert.equal(b3.visibilitySkipped, 1);
+  assert.equal(b3.zeroCountElided, 1);
+  assert.equal(b3.outOfBoundsElided, 1);
+  assert.deepEqual(pass.calls, [
+    ['drawIndexedIndirect', 16],
+    ['drawIndexedIndirect', 112],
+  ]);
+
+  // 4. Full-batch OOB emits zero GPU commands and records all commands as outOfBoundsElided
+  pass.calls.length = 0;
+  const b4 = dispatchIndirectBatch(
+    pass,
+    indirectBuf(16),
+    { indexed: true, count: 3 },
+    scratch
+  );
+  assert.equal(b4, scratch);
+  assert.equal(b4.ok, false);
+  assert.equal(b4.dispatched, 0);
+  assert.equal(b4.validated, 3);
+  assert.equal(b4.outOfBoundsElided, 3);
+  assert.equal(b4.reason, 'OUT_OF_BOUNDS');
+  assert.equal(pass.calls.length, 0);
+
+  // 5. All-zero-count batch emits zero GPU commands, does not increment batchesDispatched
+  const b5 = dispatchIndirectBatch(
+    pass,
+    indirectBuf(64),
+    {
+      indexed: false,
+      records: [
+        { vertexCount: 0, instanceCount: 1 },
+        { vertexCount: 3, instanceCount: 0 },
+      ],
+    },
+    scratch
+  );
+  assert.equal(b5.ok, true);
+  assert.equal(b5.dispatched, 0);
+  assert.equal(b5.zeroCountElided, 2);
+  assert.equal(b5.reason, 'ZERO_COUNT');
+  assert.equal(pass.calls.length, 0);
+
+  // 6. Empty count === 0 batch and misaligned offset rejection
+  const b6 = dispatchIndirectBatch(pass, indirectBuf(64), { count: 0 }, scratch);
+  assert.equal(b6.ok, true);
+  assert.equal(b6.dispatched, 0);
+  assert.equal(b6.validated, 0);
+
+  const b7 = dispatchIndirectBatch(pass, indirectBuf(64), { count: 2, baseOffset: 2 }, scratch);
+  assert.equal(b7.ok, false);
+  assert.equal(b7.reason, 'MISALIGNED_OFFSET');
+  assert.equal(pass.calls.length, 0);
+
+  // Verify sanitized telemetry totals
+  const stats = getStats();
+  assert.equal(stats.batchesDispatched, 3); // b1, b2, b3
+  assert.equal(stats.commandsValidated, 5 + 8 + 5 + 3 + 2 + 2); // 25
+  assert.equal(stats.zeroCountElided, 2 + 2 + 1 + 2); // 7
+  assert.equal(stats.outOfBoundsElided, 1 + 2 + 1 + 3); // 7
+  assert.equal(stats.validatedIndirectDraws, 2 + 4 + 2); // 8
+  assert.equal(stats.skippedZeroCountDraws, 8); // 7 zero-count commands + 1 count===0 batch
+  assert.equal(stats.skippedOutOfBoundsDraws, 7);
+  assert.equal(stats.skippedMisalignedDraws, 2);
+
+  for (const [key, val] of Object.entries(stats)) {
+    assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
+    assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
+  }
+
+  // resetStats clears all W306 counters cleanly on both module and IndirectArgsBuffer
+  resetStats();
+  const cleared = getStats();
+  assert.equal(cleared.batchesDispatched, 0);
+  assert.equal(cleared.commandsValidated, 0);
+  assert.equal(cleared.zeroCountElided, 0);
+  assert.equal(cleared.outOfBoundsElided, 0);
+  assert.equal(cleared.validatedIndirectDraws, 0);
+  assert.equal(cleared.skippedZeroCountDraws, 0);
+  assert.equal(cleared.skippedOutOfBoundsDraws, 0);
+  assert.equal(cleared.skippedMisalignedDraws, 0);
+
+  const { device } = createMockDevice();
+  const args = new IndirectArgsBuffer({ device, capacity: 4 });
+  args.allocate(rec(12));
+  args.allocate(rec(24));
+  args.executeDraws(pass);
+  assert.equal(args.getStats().batchesDispatched, 1);
+  assert.equal(args.getStats().commandsValidated, 2);
+  args.resetStats();
+  const clearedBuf = args.getStats();
+  assert.equal(clearedBuf.batchesDispatched, 0);
+  assert.equal(clearedBuf.commandsValidated, 0);
+  assert.equal(clearedBuf.zeroCountElided, 0);
+  assert.equal(clearedBuf.outOfBoundsElided, 0);
+  assert.equal(clearedBuf.liveSlots, 2);
 });
