@@ -394,6 +394,12 @@ Arg I(uint64_t v) {
     return Arg{v, false};
 }
 
+Arg F(float v) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &v, sizeof(bits));
+    return Arg{bits, true};
+}
+
 int32_t as_hr(uint64_t rax) {
     return static_cast<int32_t>(static_cast<uint32_t>(rax));
 }
@@ -1765,6 +1771,78 @@ void spatial_audio_stream_cycle(AudioFixture& fx) {
     win32::CloseHandle(event);
 }
 
+// ISpatialAudioObject::SetVolume scales the object's samples (render sink and stereo downmix),
+// rejects values outside [0, 1], and the statistics count the non-zero buffers the title wrote.
+void spatial_audio_object_volume(AudioFixture& fx) {
+    static float seen = -1.0f;
+    ga::set_audio_render_sink(
+        [](void*, uint32_t, const float* pcm, uint32_t, uint32_t, uint32_t) { seen = pcm[7]; }, nullptr);
+    static float left = -1.0f;
+    static float right = -1.0f;
+    ga::set_audio_stereo_sink(
+        [](void*, const float* stereo, uint32_t frames, uint32_t) {
+            CHECK(frames == 480);
+            left = stereo[2 * 7];
+            right = stereo[2 * 7 + 1];
+        },
+        nullptr);
+    const uint64_t dev = fx.default_endpoint(fx.enumerator());
+    const uint64_t sac = fx.activate(dev, kIidSpatialAudioClient);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.vcall(sac, 6, {I(out)})) == 0);
+    const uint64_t formats = load64(out);
+    CHECK(as_hr(fx.vcall(formats, 4, {I(0), I(out)})) == 0);
+    const uint64_t fmt = load64(out);
+
+    const win32::Handle event = win32::CreateEventW(nullptr, false, false, nullptr);
+    const uint64_t params = com::guest_alloc(0x28);
+    CHECK(com::write_guest(params, fmt) && com::write_guest(params + 8, uint32_t{0x6}) &&
+          com::write_guest(params + 20, uint32_t{6}) && com::write_guest(params + 24, uint64_t{event}));
+    const uint64_t pv = com::guest_alloc(24);
+    CHECK(com::write_guest(pv, uint16_t{65}) && com::write_guest(pv + 8, uint32_t{0x28}) &&
+          com::write_guest(pv + 16, params));
+    CHECK(as_hr(fx.vcall(sac, 10, {I(pv), I(fx.guid(kIidSpatialStream)), I(out)})) == 0);
+    const uint64_t stream = load64(out);
+    CHECK(as_hr(fx.vcall(stream, 5)) == 0);  // Start
+
+    const uint64_t frames = com::guest_alloc(8);
+    const uint64_t buf = com::guest_alloc(16);
+    uint64_t object = 0;
+    // pass: volume set before End, sample written, expected output
+    struct Pass {
+        float volume;
+        float sample;
+        float expected;
+    };
+    const Pass passes[] = {{1.0f, 0.0f, 0.0f}, {0.5f, 0.25f, 0.125f}, {0.0f, 0.25f, 0.0f}};
+    for (const Pass& p : passes) {
+        CHECK(as_hr(fx.vcall(stream, 8, {I(frames), I(frames + 4)})) == 0);  // Begin
+        if (object == 0) {
+            CHECK(as_hr(fx.vcall(stream, 10, {I(0x2), I(out)})) == 0);  // FrontLeft
+            object = load64(out);
+        }
+        CHECK(as_hr(fx.vcall(object, 3, {I(buf), I(buf + 8)})) == 0);
+        std::vector<float> zeros(480, 0.0f);
+        CHECK(com::write_guest(load64(buf), zeros.data(), zeros.size() * sizeof(float)));
+        CHECK(com::write_guest(load64(buf) + 7 * 4, p.sample));
+        CHECK(as_hr(fx.vcall(object, 8, {F(p.volume)})) == 0);  // SetVolume
+        CHECK(as_hr(fx.vcall(stream, 9)) == 0);                // End
+        CHECK(seen == p.expected);
+        ga::audio_engine_tick();
+        CHECK(left == p.expected && right == 0.0f);
+    }
+    CHECK(as_hr(fx.vcall(object, 8, {F(1.5f)})) == com::E_INVALIDARG_HR);
+    CHECK(as_hr(fx.vcall(object, 8, {F(-0.1f)})) == com::E_INVALIDARG_HR);
+    const ga::AudioEndpointStats st = ga::audio_endpoint_stats();
+    CHECK(st.spatial_passes == 3 && st.spatial_object_buffers == 3 && st.spatial_nonzero_buffers == 1);
+
+    ga::set_audio_stereo_sink(nullptr, nullptr);
+    for (const uint64_t o : {object, stream, formats, sac, dev}) {
+        fx.vcall(o, 2);
+    }
+    win32::CloseHandle(event);
+}
+
 void test_mmdevice() {
     AudioFixture fx;
     mmdevice_enumerator_and_endpoint(fx);
@@ -1772,6 +1850,8 @@ void test_mmdevice() {
     audio_client_render_cycle(fx);
     fx.next_case();
     spatial_audio_stream_cycle(fx);
+    fx.next_case();
+    spatial_audio_object_volume(fx);
 }
 
 // chad.dll XDsp in the executable's call shapes: connect hands out an opaque handle, activation
