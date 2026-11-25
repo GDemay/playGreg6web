@@ -11,6 +11,8 @@ import {
   DEFAULT_MAX_CONCURRENT_RANGE_FETCHES,
   DEFAULT_MAX_RANGE_FETCH_RETRIES,
   DEFAULT_RANGE_RETRY_DELAY_MS,
+  DEFAULT_PREFETCH_MAX_GAP_BYTES,
+  DEFAULT_PREFETCH_MAX_SPAN_BYTES,
   SHADER_STAGE,
   STAGE_NAMES,
   fnv1a64,
@@ -2740,4 +2742,578 @@ test('W162 WgslPackCache forwards concurrency/retry options and aggregates range
   assert.equal(snapshot.stats.rangeFetchRetries, 1);
   assert.equal(snapshot.stats.peakConcurrentRangeFetches, 3);
   assert.equal(snapshot.stats.activeRangeFetches, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W202: Hot-shader LRU lookup optimization, coalesced ranged prefetchHashes,
+//       in-flight batch deduplication, and cache/prefetch telemetry
+// ---------------------------------------------------------------------------
+
+test('W202 hot-hash WGSL LRU cache tracks lruHits/lruMisses/lruEvictions/lruBytes and never re-fetches hot intro/menu shaders', async () => {
+  assert.equal(DEFAULT_MAX_CACHED_WGSL_BYTES, 32 * 1024 * 1024);
+  assert.equal(DEFAULT_PREFETCH_MAX_GAP_BYTES, 16 * 1024);
+  assert.equal(DEFAULT_PREFETCH_MAX_SPAN_BYTES, 512 * 1024);
+
+  const enc = new TextEncoder();
+  const makeSizedWgsl = (tag, targetBytes) => {
+    const prefix = `@compute @workgroup_size(1) fn w202_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = targetBytes - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'h'.repeat(padLen)}${suffix}`;
+  };
+
+  const hIntro = fnv1a64('w202-hot-intro');
+  const hMenu = fnv1a64('w202-hot-menu');
+  const hWorld1 = fnv1a64('w202-cold-world-1');
+  const hWorld2 = fnv1a64('w202-cold-world-2');
+
+  const wgslIntro = makeSizedWgsl('intro', 120);
+  const wgslMenu = makeSizedWgsl('menu', 120);
+  const wgslWorld1 = makeSizedWgsl('world1', 120);
+  const wgslWorld2 = makeSizedWgsl('world2', 120);
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hIntro, stage: SHADER_STAGE.VERTEX, wgsl: wgslIntro },
+    { hash: hMenu, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslMenu },
+    { hash: hWorld1, stage: SHADER_STAGE.COMPUTE, wgsl: wgslWorld1 },
+    { hash: hWorld2, stage: SHADER_STAGE.COMPUTE, wgsl: wgslWorld2 },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+  const mock = createRangeMockFetch({ '/packs/w202-lru.wgsl.pack': packBuf });
+
+  // Budget = 360 bytes -> holds 3 x 120-byte shaders; 4th triggers eviction of LRU tail.
+  const pack = await loadIndexFromUrl('/packs/w202-lru.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCachedWgslBytes: 360,
+  });
+
+  // Load intro, menu, world1 -> 3 misses, 0 hits, 360 lruBytes
+  assert.equal(await pack.getWgslAsync(hIntro), wgslIntro);
+  assert.equal(await pack.getWgslAsync(hMenu), wgslMenu);
+  assert.equal(await pack.getWgslAsync(hWorld1), wgslWorld1);
+  assert.equal(mock.requests.length, 4); // 1 index + 3 shaders
+
+  let s = pack.stats();
+  assert.equal(s.lruHits, 0);
+  assert.equal(s.lruMisses, 3);
+  assert.equal(s.lruEvictions, 0);
+  assert.equal(s.lruBytes, 360);
+  assert.equal(s.prefetchBatches, 0);
+  assert.equal(s.prefetchShaders, 0);
+
+  // Repeated hot lookups of intro (canonical hex string + BigInt) and menu (back-to-back MRU fast-path)
+  // must NEVER issue HTTP Range requests and must keep both intro & menu hot!
+  const introHex = formatHashHex(hIntro);
+  const menuHex = formatHashHex(hMenu);
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal(await pack.getWgslAsync(introHex), wgslIntro);
+    assert.equal(await pack.getWgslAsync(hIntro), wgslIntro);
+  }
+  for (let i = 0; i < 4; i += 1) {
+    assert.equal(await pack.getWgslAsync(menuHex), wgslMenu);
+  }
+  assert.equal(mock.requests.length, 4, 'hot intro/menu lookups must issue 0 extra Range fetches');
+
+  s = pack.stats();
+  assert.equal(s.lruHits, 14);
+  assert.equal(s.lruMisses, 3);
+  assert.equal(s.lruEvictions, 0);
+  assert.equal(s.lruBytes, 360);
+
+  // Now fetch cold world2 -> must evict world1 (the oldest untouched entry), keeping intro & menu hot!
+  assert.equal(await pack.getWgslAsync(hWorld2), wgslWorld2);
+  assert.equal(mock.requests.length, 5);
+
+  s = pack.stats();
+  assert.equal(s.lruEvictions, 1);
+  assert.equal(s.lruMisses, 4);
+  assert.equal(s.lruBytes, 360);
+
+  // Intro & menu are still resident (0 HTTP fetches), whereas world1 was evicted (1 HTTP fetch).
+  assert.equal(await pack.getWgslAsync(introHex), wgslIntro);
+  assert.equal(await pack.getWgslAsync(menuHex), wgslMenu);
+  assert.equal(mock.requests.length, 5);
+  assert.equal(pack.stats().lruHits, 16);
+
+  assert.equal(await pack.getWgslAsync(hWorld1), wgslWorld1);
+  assert.equal(mock.requests.length, 6);
+  assert.equal(pack.stats().lruEvictions, 2);
+  assert.equal(pack.stats().lruMisses, 5);
+  assert.equal(pack.stats().lruBytes, 360);
+});
+
+test('W202 prefetchHashes coalesces nearby byte ranges by maxGapBytes/maxSpanBytes and skips unrequested gap entries', async () => {
+  const enc = new TextEncoder();
+  const makeFixed = (tag, size) => {
+    const prefix = `@compute @workgroup_size(1) fn pf_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = size - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'p'.repeat(padLen)}${suffix}`;
+  };
+
+  // Layout in pack:
+  //   [0] h0: 100B (requested)
+  //   [1] hGapSmall: 60B (NOT requested - small gap <= 128B)
+  //   [2] h1: 100B (requested -> coalesces with h0 across 60B gap!)
+  //   [3] h2: 100B (requested -> contiguous with h1 -> same batch!)
+  //   [4] hGapHuge: 400B (NOT requested - huge gap > 128B -> forces batch split!)
+  //   [5] h3: 100B (requested -> batch 2)
+  //   [6] h4: 100B (requested -> contiguous with h3 -> batch 2)
+  //   [7] hOversized: 600B (requested -> single shader > maxSpanBytes=380 -> own exact batch 3)
+  const h0 = fnv1a64('w202-pf-0');
+  const hGapSmall = fnv1a64('w202-pf-gap-small');
+  const h1 = fnv1a64('w202-pf-1');
+  const h2 = fnv1a64('w202-pf-2');
+  const hGapHuge = fnv1a64('w202-pf-gap-huge');
+  const h3 = fnv1a64('w202-pf-3');
+  const h4 = fnv1a64('w202-pf-4');
+  const hOversized = fnv1a64('w202-pf-oversized');
+  const hEmpty = fnv1a64('w202-pf-empty');
+  const hMissing = fnv1a64('w202-pf-missing');
+
+  const entries = [
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: makeFixed('0', 100) },
+    { hash: hGapSmall, stage: SHADER_STAGE.FRAGMENT, wgsl: makeFixed('gs', 60) },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: makeFixed('1', 100) },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: makeFixed('2', 100) },
+    { hash: hGapHuge, stage: SHADER_STAGE.COMPUTE, wgsl: makeFixed('gh', 400) },
+    { hash: h3, stage: SHADER_STAGE.VERTEX, wgsl: makeFixed('3', 100) },
+    { hash: h4, stage: SHADER_STAGE.FRAGMENT, wgsl: makeFixed('4', 100) },
+    { hash: hOversized, stage: SHADER_STAGE.COMPUTE, wgsl: makeFixed('big', 600) },
+    { hash: hEmpty, stage: SHADER_STAGE.COMPUTE, wgsl: '' },
+  ];
+
+  const packBuf = buildWgslPackBuffer(entries);
+  const tableEnd = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
+  const mock = createRangeMockFetch({ '/packs/w202-pf.wgsl.pack': packBuf });
+
+  const pack = await loadIndexFromUrl('/packs/w202-pf.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    prefetchMaxGapBytes: 128,
+    prefetchMaxSpanBytes: 380,
+  });
+
+  // Pass hashes deliberately out-of-order, with duplicates, mixed hex/BigInt, empty payload, and unknown hash
+  const result = await pack.prefetchHashes([
+    h4,
+    formatHashHex(h1),
+    hOversized,
+    h0,
+    h1, // duplicate
+    h3,
+    h2,
+    hEmpty,
+    hMissing,
+  ]);
+
+  // Expected batches:
+  //   Batch 1: [h0..h2] span = 100 + 60 + 100 + 100 = 360B (<= 380B, gap 60 <= 128)
+  //   Batch 2: [h3..h4] span = 100 + 100 = 200B (gap from h2 is 400B > 128B)
+  //   Batch 3: [hOversized] span = 600B (h3..hOversized would be 800B > 380B -> own exact span)
+  assert.equal(result.requested, 8); // 6 fetched + 1 empty cached + 1 missing
+  assert.equal(result.prefetched, 6);
+  assert.equal(result.cached, 1); // hEmpty (0-length)
+  assert.equal(result.inFlight, 0);
+  assert.equal(result.missing, 1);
+  assert.equal(result.batches, 3);
+  assert.equal(result.bytesFetched, 360 + 200 + 600);
+
+  // Only 1 index + 3 batched HTTP 206 Range requests instead of 1 + 6!
+  assert.equal(mock.requests.length, 4);
+  const off0 = pack.entries.get(h0).offset;
+  const off2End = pack.entries.get(h2).offset + pack.entries.get(h2).length - 1;
+  const off3 = pack.entries.get(h3).offset;
+  const off4End = pack.entries.get(h4).offset + pack.entries.get(h4).length - 1;
+  const offBig = pack.entries.get(hOversized).offset;
+  const offBigEnd = offBig + pack.entries.get(hOversized).length - 1;
+
+  const payloadRanges = mock.requests.slice(1).map((r) => r.range);
+  assert.deepEqual(payloadRanges, [
+    `bytes=${off0}-${off2End}`,
+    `bytes=${off3}-${off4End}`,
+    `bytes=${offBig}-${offBigEnd}`,
+  ]);
+
+  // Verify telemetry on pack
+  const s = pack.stats();
+  assert.equal(s.prefetchBatches, 3);
+  assert.equal(s.prefetchShaders, 6);
+  assert.equal(s.lruBytes, 100 * 5 + 600); // unrequested hGapSmall was NOT cached into LRU!
+  assert.equal(s.cachedWgslEntries, 7); // 6 fetched + 1 empty
+  assert.equal(s.lruHits, 0);
+  assert.equal(s.lruMisses, 0);
+  assert.equal(s.prefetchMaxGapBytes, 128);
+  assert.equal(s.prefetchMaxSpanBytes, 380);
+
+  // Subsequent getWgslAsync for every prefetched shader hits LRU with ZERO HTTP fetches!
+  for (const idx of [0, 2, 3, 5, 6, 7]) {
+    assert.equal(await pack.getWgslAsync(entries[idx].hash), entries[idx].wgsl);
+  }
+  assert.equal(mock.requests.length, 4);
+  assert.equal(pack.stats().lruHits, 6);
+  assert.equal(pack.stats().lruMisses, 0);
+
+  // Unrequested gap entry hGapSmall is NOT in LRU -> triggers a fresh Range fetch when actually requested
+  assert.equal(await pack.getWgslAsync(hGapSmall), entries[1].wgsl);
+  assert.equal(mock.requests.length, 5);
+  assert.equal(pack.stats().lruMisses, 1);
+
+  // Repeating prefetchHashes on already-cached shaders does 0 HTTP requests
+  const repeat = await pack.prefetchHashes([h0, h1, h2]);
+  assert.equal(repeat.prefetched, 0);
+  assert.equal(repeat.cached, 3);
+  assert.equal(repeat.batches, 0);
+  assert.equal(repeat.bytesFetched, 0);
+  assert.equal(mock.requests.length, 5);
+  assert.equal(pack.stats().prefetchBatches, 3);
+  assert.equal(pack.stats().prefetchShaders, 6);
+
+  // Per-call maxGapBytes=0 only coalesces strictly contiguous entries (never bridges a gap)
+  pack.clearWgslCache();
+  assert.equal(pack.stats().lruBytes, 0);
+  const strictRes = await pack.prefetchHashes([h0, h1, h2], { maxGapBytes: 0, maxSpanBytes: 1024 });
+  assert.equal(strictRes.batches, 2); // [h0] and [h1, h2] (60B gap between h0 & h1 splits)
+  assert.equal(strictRes.prefetched, 3);
+  assert.equal(strictRes.bytesFetched, 100 + 200);
+});
+
+test('W202 prefetchHashes deduplicates in-flight fetches bidirectionally with getWgslAsync and cleans up on errors/retries', async () => {
+  const hA = fnv1a64('w202-inflight-A');
+  const hB = fnv1a64('w202-inflight-B');
+  const hC = fnv1a64('w202-inflight-C');
+  const hD = fnv1a64('w202-inflight-D');
+
+  const wgslA = `@vertex fn a_vs() -> @builtin(position) vec4<f32> { return vec4<f32>(1.0); }`;
+  const wgslB = `@fragment fn b_fs() -> @location(0) vec4<f32> { return vec4<f32>(0.5); }`;
+  const wgslC = `@compute @workgroup_size(4) fn c_cs() {}`;
+  const wgslD = `@compute @workgroup_size(8) fn d_cs() {}`;
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.VERTEX, wgsl: wgslA },
+    { hash: hB, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslB },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC },
+    { hash: hD, stage: SHADER_STAGE.COMPUTE, wgsl: wgslD },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+
+  const gates = [];
+  let failNextBatch = false;
+  let holdPayloads = false;
+
+  const mock = createRangeMockFetch(
+    { '/packs/w202-inflight.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (!range || range.startsWith('bytes=0-')) {
+          return null;
+        }
+        if (holdPayloads) {
+          await new Promise((resolve) => {
+            gates.push(resolve);
+          });
+        }
+        if (failNextBatch) {
+          failNextBatch = false;
+          return {
+            ok: false,
+            status: 503,
+            statusText: 'Service Unavailable',
+            headers: new Headers(),
+            async arrayBuffer() {
+              return new ArrayBuffer(0);
+            },
+          };
+        }
+        return null;
+      },
+    }
+  );
+
+  const pack = await loadIndexFromUrl('/packs/w202-inflight.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxRangeFetchRetries: 0,
+  });
+
+  // 1. Start prefetchHashes([hA, hB]) while gated, then concurrently call getWgslAsync(hA), getWgslAsync(hB),
+  //    and another prefetchHashes([hB, hC])!
+  holdPayloads = true;
+  const pPrefetch1 = pack.prefetchHashes([hA, hB]);
+  const pGetA = pack.getWgslAsync(formatHashHex(hA));
+  const pGetB = pack.getWgslAsync(hB);
+  const pPrefetch2 = pack.prefetchHashes([hB, hC]); // hB deduplicates onto pPrefetch1, only hC fetches!
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(gates.length, 2, 'only 2 HTTP 206 requests expected: batch([A,B]) and batch([C])');
+  assert.equal(pack.stats().inFlightCount, 3); // hA, hB, hC
+  assert.equal(pack.stats().inFlightCoalesced, 3); // pGetA, pGetB, and hB in pPrefetch2
+
+  holdPayloads = false;
+  while (gates.length > 0) {
+    gates.shift()();
+  }
+
+  const [res1, gotA, gotB, res2] = await Promise.all([pPrefetch1, pGetA, pGetB, pPrefetch2]);
+  assert.equal(gotA, wgslA);
+  assert.equal(gotB, wgslB);
+  assert.equal(res1.prefetched, 2);
+  assert.equal(res1.batches, 1);
+  assert.equal(res2.inFlight, 1); // hB deduplicated onto pPrefetch1
+  assert.equal(res2.prefetched, 1); // hC
+  assert.equal(res2.batches, 1);
+  assert.equal(mock.requests.length, 3); // 1 index + batch([A,B]) + batch([C])
+  assert.equal(pack.stats().inFlightCount, 0);
+
+  // 2. Start getWgslAsync(hD) first, then call prefetchHashes([hD]) while hD is in flight -> 0 extra fetches!
+  holdPayloads = true;
+  const pGetD = pack.getWgslAsync(hD);
+  const pPrefetchD = pack.prefetchHashes([hD]);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(gates.length, 1);
+  assert.equal(pack.stats().inFlightCount, 1);
+  holdPayloads = false;
+  gates.shift()();
+
+  const [gotD, resD] = await Promise.all([pGetD, pPrefetchD]);
+  assert.equal(gotD, wgslD);
+  assert.equal(resD.inFlight, 1);
+  assert.equal(resD.prefetched, 0);
+  assert.equal(resD.batches, 0);
+  assert.equal(mock.requests.length, 4); // +1 for hD only
+
+  // 3. Batch failure cleans up inFlightFetches BEFORE caller .catch() runs so immediate retry succeeds!
+  pack.clearWgslCache();
+  failNextBatch = true;
+  let inFlightInCatch = -1;
+  let retryWgslA = null;
+  const pFailPrefetch = pack.prefetchHashes([hA, hB]);
+  const pFailGetA = pack.getWgslAsync(hA).catch(async (err) => {
+    assert.match(err.message, /HTTP 503/);
+    inFlightInCatch = pack.stats().inFlightCount;
+    retryWgslA = await pack.getWgslAsync(hA);
+    return 'recovered';
+  });
+
+  const [settledPrefetch, settledGetA] = await Promise.allSettled([pFailPrefetch, pFailGetA]);
+  assert.equal(settledPrefetch.status, 'rejected');
+  assert.match(settledPrefetch.reason.message, /HTTP 503/);
+  assert.equal(settledGetA.status, 'fulfilled');
+  assert.equal(settledGetA.value, 'recovered');
+  assert.equal(inFlightInCatch, 0, 'inFlightFetches must clear before rejecting callers');
+  assert.equal(retryWgslA, wgslA);
+  assert.equal(pack.stats().inFlightCount, 0);
+});
+
+test('W202 WgslPackCache.prefetchHashes aggregates multi-pack ranged/buffer/dynamic prefetch and exposes telemetry', async () => {
+  const hR1 = fnv1a64('w202-cache-r1');
+  const hR2 = fnv1a64('w202-cache-r2');
+  const hR3 = fnv1a64('w202-cache-r3');
+  const hBuf = fnv1a64('w202-cache-buf');
+  const hDyn = fnv1a64('w202-cache-dyn');
+  const hUnknown = fnv1a64('w202-cache-unknown');
+
+  const rangedBuf = buildWgslPackBuffer([
+    { hash: hR1, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hR2, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+    { hash: hR3, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+  ]);
+  const bufferBuf = buildWgslPackBuffer([
+    { hash: hBuf, stage: SHADER_STAGE.COMPUTE, wgsl: '@compute @workgroup_size(1) fn buf_main() {}' },
+  ]);
+  const rangedTableEnd = WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES;
+
+  const mock = createRangeMockFetch({ '/packs/w202-ranged.wgsl.pack': rangedBuf });
+  const cache = new WgslPackCache({
+    fetch: mock.fetch,
+    initialRangeBytes: rangedTableEnd,
+    maxCachedWgslBytes: 4096,
+    prefetchMaxGapBytes: 1024,
+    prefetchMaxSpanBytes: 8192,
+  });
+
+  await cache.loadIndexFromUrl('/packs/w202-ranged.wgsl.pack');
+  cache.loadFromBuffer(bufferBuf, 'boot.wgsl.pack');
+  const dynWgsl = '@fragment fn dyn_hot() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }';
+  cache.registerDynamicShader(hDyn, 'fragment', dynWgsl);
+
+  // Coalesce all 3 ranged shaders into 1 single HTTP 206 fetch while handling buffer, dynamic, and missing hashes cleanly
+  const summary = await cache.prefetchHashes([hR1, hR2, hR3, hBuf, hDyn, hUnknown, hR1]);
+  assert.equal(summary.requested, 6);
+  assert.equal(summary.prefetched, 3);
+  assert.equal(summary.cached, 2); // hBuf + hDyn
+  assert.equal(summary.inFlight, 0);
+  assert.equal(summary.missing, 1);
+  assert.equal(summary.batches, 1);
+  assert.equal(mock.requests.length, 2); // 1 index + 1 coalesced batch
+
+  // Now look up all 3 ranged shaders via cache -> 3 LRU hits, 0 extra HTTP fetches!
+  assert.equal(await cache.getWgslAsync(hR1), SAMPLE_VS_WGSL);
+  assert.equal(await cache.getWgslAsync(hR2), SAMPLE_FS_WGSL);
+  assert.equal(await cache.getWgslAsync(hR3), SAMPLE_CS_WGSL);
+  assert.equal(mock.requests.length, 2);
+
+  const stats = cache.getStats();
+  assert.equal(stats.lruHits, 3);
+  assert.equal(stats.lruMisses, 0);
+  assert.equal(stats.lruEvictions, 0);
+  assert.equal(
+    stats.lruBytes,
+    new TextEncoder().encode(SAMPLE_VS_WGSL).byteLength +
+      new TextEncoder().encode(SAMPLE_FS_WGSL).byteLength +
+      new TextEncoder().encode(SAMPLE_CS_WGSL).byteLength
+  );
+  assert.equal(stats.prefetchBatches, 1);
+  assert.equal(stats.prefetchShaders, 3);
+
+  // inspect() remains JSON-serializable with all W202 telemetry fields
+  const snapshot = cache.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+  assert.equal(snapshot.stats.lruHits, 3);
+  assert.equal(snapshot.stats.lruMisses, 0);
+  assert.equal(snapshot.stats.lruEvictions, 0);
+  assert.equal(snapshot.stats.lruBytes, stats.lruBytes);
+  assert.equal(snapshot.stats.prefetchBatches, 1);
+  assert.equal(snapshot.stats.prefetchShaders, 3);
+
+  // Null/empty hashes return zero summary; invalid options reject with RangeError/TypeError
+  const emptyRes = await cache.prefetchHashes(null);
+  assert.deepEqual(emptyRes, {
+    requested: 0,
+    prefetched: 0,
+    cached: 0,
+    inFlight: 0,
+    missing: 0,
+    batches: 0,
+    bytesFetched: 0,
+  });
+  await assert.rejects(() => cache.prefetchHashes(123), TypeError);
+  await assert.rejects(() => cache.prefetchHashes([], { maxGapBytes: -1 }), RangeError);
+  await assert.rejects(() => cache.prefetchHashes([], { maxSpanBytes: 0 }), RangeError);
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/w202-ranged.wgsl.pack', { fetch: mock.fetch, prefetchMaxGapBytes: -5 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/w202-ranged.wgsl.pack', { fetch: mock.fetch, prefetchMaxSpanBytes: 0 }),
+    RangeError
+  );
+});
+
+test('W202 prefetchHashes handles 200 OK fallback, partial UTF-8 errors, and >2 GiB unsigned u32 offsets cleanly', async () => {
+  const enc = new TextEncoder();
+  const h1 = fnv1a64('w202-edge-1');
+  const h2 = fnv1a64('w202-edge-2');
+  const packBuf = buildWgslPackBuffer([
+    { hash: h1, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: h2, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES;
+
+  // 1. Server returns 200 OK on prefetch range request (non-range server mid-stream)
+  let serve200AfterIndex = false;
+  const mock200 = createRangeMockFetch(
+    { '/packs/w202-200.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (serve200AfterIndex && range && !range.startsWith('bytes=0-')) {
+          return {
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            headers: new Headers({ 'Content-Length': String(packBuf.byteLength) }),
+            async arrayBuffer() {
+              return packBuf.slice(0);
+            },
+          };
+        }
+        return null;
+      },
+    }
+  );
+  const pack200 = await loadIndexFromUrl('/packs/w202-200.wgsl.pack', {
+    fetch: mock200.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  serve200AfterIndex = true;
+  const res200 = await pack200.prefetchHashes([h1, h2]);
+  assert.equal(res200.prefetched, 2);
+  assert.equal(res200.batches, 1);
+  assert.equal(await pack200.getWgslAsync(h1), SAMPLE_VS_WGSL);
+  assert.equal(await pack200.getWgslAsync(h2), SAMPLE_FS_WGSL);
+  assert.equal(pack200.stats().lruHits, 2);
+
+  // 2. Corrupt UTF-8 in h1 inside a coalesced [h1, h2] batch rejects h1 while still caching valid h2
+  const corruptBytes = new Uint8Array(packBuf).slice();
+  corruptBytes[tableEnd] = 0xff;
+  const mockBad = createRangeMockFetch({ '/packs/w202-bad.wgsl.pack': corruptBytes });
+  const packBad = await loadIndexFromUrl('/packs/w202-bad.wgsl.pack', {
+    fetch: mockBad.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  const pBadPrefetch = packBad.prefetchHashes([h1, h2]);
+  const pBadGet2 = packBad.getWgslAsync(h2);
+  await assert.rejects(() => pBadPrefetch, /not valid utf-8/i);
+  assert.equal(await pBadGet2, SAMPLE_FS_WGSL);
+  assert.equal(mockBad.requests.length, 2, 'h1 and h2 should share 1 coalesced batch request');
+  assert.equal(packBad.stats().inFlightCount, 0);
+  assert.equal(await packBad.getWgslAsync(h2), SAMPLE_FS_WGSL);
+  assert.equal(packBad.stats().lruHits, 1);
+
+  // 3. >2 GiB unsigned u32 coalesced prefetch (exact 4 GiB ceiling)
+  const TOTAL_4_GIB = 0x100000000;
+  const wgslHighA = `@vertex fn hi_a() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }`;
+  const wgslHighB = `@fragment fn hi_b() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }`;
+  const lenA = enc.encode(wgslHighA).byteLength;
+  const lenB = enc.encode(wgslHighB).byteLength;
+  const offB = TOTAL_4_GIB - lenB;
+  const offA = offB - lenA - 16; // 16-byte gap above 3.99 GiB!
+
+  const hHighA = fnv1a64('w202-hi-a');
+  const hHighB = fnv1a64('w202-hi-b');
+  const highIndex = buildSyntheticLargeIndexBuffer([
+    { hash: hHighA, stage: SHADER_STAGE.VERTEX, offset: offA, length: lenA },
+    { hash: hHighB, stage: SHADER_STAGE.FRAGMENT, offset: offB, length: lenB },
+  ]);
+
+  const combinedSpan = new Uint8Array(TOTAL_4_GIB - offA);
+  combinedSpan.set(enc.encode(wgslHighA), 0);
+  combinedSpan.set(enc.encode(wgslHighB), offB - offA);
+
+  const highRequests = [];
+  const highFetch = async (url, init = {}) => {
+    const range = init.headers && (init.headers.Range || init.headers.range);
+    highRequests.push(range);
+    const [, sStr, eStr] = /^bytes=(\d+)-(\d+)$/.exec(range);
+    const start = Number(sStr);
+    const end = Number(eStr);
+    const slice = start === 0 ? highIndex.slice(start, end + 1) : combinedSpan.slice();
+    return {
+      ok: true,
+      status: 206,
+      statusText: 'Partial Content',
+      headers: new Headers({
+        'Content-Range': `bytes ${start}-${end}/${TOTAL_4_GIB}`,
+        'Content-Length': String(slice.byteLength),
+      }),
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  };
+
+  const highPack = await loadIndexFromUrl('/packs/w202-4gib.wgsl.pack', {
+    fetch: highFetch,
+    initialRangeBytes: highIndex.byteLength,
+  });
+  const highRes = await highPack.prefetchHashes([hHighB, hHighA]);
+  assert.equal(highRes.batches, 1);
+  assert.equal(highRes.prefetched, 2);
+  assert.equal(highRequests[1], `bytes=${offA}-${TOTAL_4_GIB - 1}`);
+  assert.equal(await highPack.getWgslAsync(hHighA), wgslHighA);
+  assert.equal(await highPack.getWgslAsync(hHighB), wgslHighB);
+  assert.equal(highPack.stats().lruHits, 2);
 });

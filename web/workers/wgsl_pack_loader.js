@@ -32,6 +32,12 @@ export const DEFAULT_MAX_RANGE_FETCH_RETRIES = 2;
 /** Default base backoff delay in milliseconds before retrying a transient Range fetch failure. */
 export const DEFAULT_RANGE_RETRY_DELAY_MS = 25;
 
+/** Default maximum byte gap between nearby shaders to coalesce into a single prefetch HTTP 206 Range request (16 KiB). */
+export const DEFAULT_PREFETCH_MAX_GAP_BYTES = 16 * 1024;
+
+/** Default maximum byte span for a single coalesced prefetch HTTP 206 Range request (512 KiB). */
+export const DEFAULT_PREFETCH_MAX_SPAN_BYTES = 512 * 1024;
+
 /** Shader index ABI version matching shaders/src/pack.rs and docs/gpu_commands.md. */
 export const SHADER_INDEX_ABI_VERSION = 1;
 
@@ -310,6 +316,26 @@ function validateSleepFn(value, defaultValue = null) {
   }
   if (typeof value !== 'function') {
     throw new TypeError('sleepFn must be a function');
+  }
+  return value;
+}
+
+function validatePrefetchMaxGapBytes(value, defaultValue = DEFAULT_PREFETCH_MAX_GAP_BYTES) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`prefetchMaxGapBytes must be a non-negative integer, got: ${value}`);
+  }
+  return value;
+}
+
+function validatePrefetchMaxSpanBytes(value, defaultValue = DEFAULT_PREFETCH_MAX_SPAN_BYTES) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new RangeError(`prefetchMaxSpanBytes must be a positive integer, got: ${value}`);
   }
   return value;
 }
@@ -814,6 +840,8 @@ export class WgslPack {
     maxRangeFetchRetries = DEFAULT_MAX_RANGE_FETCH_RETRIES,
     rangeRetryDelayMs = DEFAULT_RANGE_RETRY_DELAY_MS,
     sleepFn = null,
+    prefetchMaxGapBytes = DEFAULT_PREFETCH_MAX_GAP_BYTES,
+    prefetchMaxSpanBytes = DEFAULT_PREFETCH_MAX_SPAN_BYTES,
     initialRangeFetches = 0,
     initialRangeBytesFetched = 0,
     initialRangeFetchRetries = 0,
@@ -837,7 +865,7 @@ export class WgslPack {
     this._dynamicHits = 0;
 
     // Ranged streaming state (bounded LRU cache, FIFO concurrency semaphore, transient retry,
-    // and concurrent in-flight deduplication).
+    // coalesced range prefetch, and concurrent in-flight deduplication).
     this._fetch = fetchImpl;
     this._fetchInit = fetchInit;
     this._maxCachedWgslBytes =
@@ -849,8 +877,13 @@ export class WgslPack {
     this._rangeRetryDelayMs =
       mode === 'ranged' ? validateRangeRetryDelayMs(rangeRetryDelayMs) : null;
     this._sleepFn = mode === 'ranged' ? validateSleepFn(sleepFn) : null;
+    this._prefetchMaxGapBytes =
+      mode === 'ranged' ? validatePrefetchMaxGapBytes(prefetchMaxGapBytes) : null;
+    this._prefetchMaxSpanBytes =
+      mode === 'ranged' ? validatePrefetchMaxSpanBytes(prefetchMaxSpanBytes) : null;
     this._wgslCache = wgslCache || new Map();
     this._cachedWgslBytes = 0;
+    this._mruKey = undefined;
     this._inFlightFetches = new Map();
     this._rangeFetchWaiters = [];
     this._activeRangeFetches = 0;
@@ -860,7 +893,11 @@ export class WgslPack {
     this._rangeFetchRetries = sanitizeNonNegativeInt(initialRangeFetchRetries, 0);
     this._cacheHits = 0;
     this._cacheMisses = 0;
+    this._lruHits = 0;
+    this._lruMisses = 0;
     this._wgslCacheEvictions = 0;
+    this._prefetchBatches = 0;
+    this._prefetchShaders = 0;
     this._inFlightCoalesced = 0;
     this._rangedDecodeCounter = rangedDecodeCounter;
   }
@@ -1086,16 +1123,48 @@ export class WgslPack {
     return this.getSource(hash);
   }
 
+  _resolveHashKey(hash) {
+    if (typeof hash === 'bigint') {
+      if (hash < 0n || hash > U64_MAX) {
+        throw new RangeError(`Shader hash out of u64 range: ${hash.toString()}`);
+      }
+      return hash;
+    }
+    if (typeof hash === 'string') {
+      const fast = this._byHex.get(hash);
+      if (fast !== undefined) {
+        return fast.hash;
+      }
+    }
+    return normalizeHash(hash);
+  }
+
+  _touchWgslCache(key) {
+    const cached = this._wgslCache.get(key);
+    if (cached === undefined) {
+      return undefined;
+    }
+    if (this._mruKey !== key && this._wgslCache.size > 1) {
+      this._wgslCache.delete(key);
+      this._wgslCache.set(key, cached);
+    }
+    this._mruKey = key;
+    return cached;
+  }
+
   _putWgslCache(key, wgsl, byteLength) {
     const existing = this._wgslCache.get(key);
     if (existing !== undefined) {
       this._wgslCache.delete(key);
       this._cachedWgslBytes -= existing.byteLength;
+      if (this._mruKey === key) {
+        this._mruKey = undefined;
+      }
     }
 
     const budget = this._maxCachedWgslBytes;
     if (budget === null || budget === 0 || byteLength > budget) {
-      return;
+      return false;
     }
 
     while (this._wgslCache.size > 0 && this._cachedWgslBytes + byteLength > budget) {
@@ -1104,10 +1173,15 @@ export class WgslPack {
       this._wgslCache.delete(oldestKey);
       this._cachedWgslBytes -= oldest.byteLength;
       this._wgslCacheEvictions += 1;
+      if (this._mruKey === oldestKey) {
+        this._mruKey = undefined;
+      }
     }
 
     this._wgslCache.set(key, { wgsl, byteLength });
     this._cachedWgslBytes += byteLength;
+    this._mruKey = key;
+    return true;
   }
 
   /**
@@ -1120,6 +1194,7 @@ export class WgslPack {
     const count = this._wgslCache.size;
     this._wgslCache.clear();
     this._cachedWgslBytes = 0;
+    this._mruKey = undefined;
     return count;
   }
 
@@ -1201,15 +1276,26 @@ export class WgslPack {
    * @returns {Promise<string | null>}
    */
   async getWgslAsync(hash) {
-    const key = normalizeHash(hash);
-
-    const dynamicEntry = this._dynamicEntries.get(key);
-    if (dynamicEntry) {
-      this._dynamicHits += 1;
-      return dynamicEntry.wgsl;
+    let key;
+    let staticEntry;
+    if (this._dynamicEntries.size === 0 && typeof hash === 'string') {
+      staticEntry = this._byHex.get(hash);
+      if (staticEntry !== undefined) {
+        key = staticEntry.hash;
+      } else {
+        key = normalizeHash(hash);
+        staticEntry = this.entries.get(key);
+      }
+    } else {
+      key = this._resolveHashKey(hash);
+      const dynamicEntry = this._dynamicEntries.get(key);
+      if (dynamicEntry) {
+        this._dynamicHits += 1;
+        return dynamicEntry.wgsl;
+      }
+      staticEntry = this.entries.get(key);
     }
 
-    const staticEntry = this.entries.get(key);
     if (!staticEntry) {
       return null;
     }
@@ -1219,13 +1305,11 @@ export class WgslPack {
       return staticEntry.wgsl;
     }
 
-    // Check bounded in-memory LRU cache first.
-    const cached = this._wgslCache.get(key);
+    // Check bounded in-memory hot-hash LRU cache first.
+    const cached = this._touchWgslCache(key);
     if (cached !== undefined) {
-      // Refresh recency (move to MRU end).
-      this._wgslCache.delete(key);
-      this._wgslCache.set(key, cached);
       this._cacheHits += 1;
+      this._lruHits += 1;
       return cached.wgsl;
     }
 
@@ -1233,11 +1317,13 @@ export class WgslPack {
     const length = staticEntry.length >>> 0;
     if (length === 0) {
       this._cacheMisses += 1;
+      this._lruMisses += 1;
       this._putWgslCache(key, '', 0);
       return '';
     }
 
-    // Deduplicate concurrent in-flight fetches for the same shader hash before acquiring a slot.
+    // Deduplicate concurrent in-flight fetches (including active coalesced prefetch batches)
+    // before acquiring a range fetch slot.
     const existingPromise = this._inFlightFetches.get(key);
     if (existingPromise !== undefined) {
       this._inFlightCoalesced += 1;
@@ -1245,6 +1331,7 @@ export class WgslPack {
     }
 
     this._cacheMisses += 1;
+    this._lruMisses += 1;
     const fetcher = this._fetch ?? globalThis.fetch;
     if (typeof fetcher !== 'function') {
       throw new Error('No fetch implementation available for ranged getWgslAsync');
@@ -1306,6 +1393,299 @@ export class WgslPack {
       this._inFlightFetches.set(key, fetchPromise);
     }
     return fetchPromise;
+  }
+
+  /**
+   * Prefetch a set of shader hashes into the bounded hot-hash WGSL LRU cache by coalescing
+   * nearby byte ranges (within `maxGapBytes` and `maxSpanBytes`) into batched HTTP `206 Range`
+   * fetches.
+   *
+   * Already-cached entries (and dynamic overrides) are refreshed/skipped with zero HTTP traffic;
+   * hashes already in flight via `getWgslAsync()` or a concurrent `prefetchHashes()` call are
+   * deduplicated onto their existing promises.
+   *
+   * @param {Iterable<bigint | string | number>} hashes
+   * @param {{
+   *   maxGapBytes?: number,
+   *   maxSpanBytes?: number,
+   *   prefetchMaxGapBytes?: number,
+   *   prefetchMaxSpanBytes?: number,
+   * }} [options]
+   * @returns {Promise<{
+   *   requested: number,
+   *   prefetched: number,
+   *   cached: number,
+   *   inFlight: number,
+   *   missing: number,
+   *   batches: number,
+   *   bytesFetched: number,
+   * }>}
+   */
+  async prefetchHashes(hashes, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxGapBytes = validatePrefetchMaxGapBytes(
+      opts.maxGapBytes !== undefined ? opts.maxGapBytes : opts.prefetchMaxGapBytes,
+      this._prefetchMaxGapBytes !== null
+        ? this._prefetchMaxGapBytes
+        : DEFAULT_PREFETCH_MAX_GAP_BYTES
+    );
+    const maxSpanBytes = validatePrefetchMaxSpanBytes(
+      opts.maxSpanBytes !== undefined ? opts.maxSpanBytes : opts.prefetchMaxSpanBytes,
+      this._prefetchMaxSpanBytes !== null
+        ? this._prefetchMaxSpanBytes
+        : DEFAULT_PREFETCH_MAX_SPAN_BYTES
+    );
+
+    if (hashes === undefined || hashes === null) {
+      return {
+        requested: 0,
+        prefetched: 0,
+        cached: 0,
+        inFlight: 0,
+        missing: 0,
+        batches: 0,
+        bytesFetched: 0,
+      };
+    }
+    if (typeof hashes[Symbol.iterator] !== 'function') {
+      throw new TypeError('hashes must be an iterable of shader hashes');
+    }
+
+    const seen = new Set();
+    let requested = 0;
+    let cached = 0;
+    let inFlight = 0;
+    let missing = 0;
+    const toFetch = [];
+    const inFlightPromises = [];
+
+    for (const rawHash of hashes) {
+      const key = this._resolveHashKey(rawHash);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      requested += 1;
+
+      if (this._dynamicEntries.has(key)) {
+        cached += 1;
+        continue;
+      }
+
+      const staticEntry = this.entries.get(key);
+      if (!staticEntry) {
+        missing += 1;
+        continue;
+      }
+
+      if (this.mode !== 'ranged') {
+        void staticEntry.wgsl;
+        cached += 1;
+        continue;
+      }
+
+      if (this._touchWgslCache(key) !== undefined) {
+        cached += 1;
+        continue;
+      }
+
+      const length = staticEntry.length >>> 0;
+      if (length === 0) {
+        this._putWgslCache(key, '', 0);
+        cached += 1;
+        continue;
+      }
+
+      const existingPromise = this._inFlightFetches.get(key);
+      if (existingPromise !== undefined) {
+        this._inFlightCoalesced += 1;
+        inFlight += 1;
+        inFlightPromises.push(existingPromise);
+        continue;
+      }
+
+      const start = staticEntry.offset >>> 0;
+      toFetch.push({
+        key,
+        entry: staticEntry,
+        start,
+        length,
+        end: start + length,
+      });
+    }
+
+    if (toFetch.length === 0) {
+      if (inFlightPromises.length > 0) {
+        await Promise.all(inFlightPromises);
+      }
+      return {
+        requested,
+        prefetched: 0,
+        cached,
+        inFlight,
+        missing,
+        batches: 0,
+        bytesFetched: 0,
+      };
+    }
+
+    const fetcher = this._fetch ?? globalThis.fetch;
+    if (typeof fetcher !== 'function') {
+      throw new Error('No fetch implementation available for ranged prefetchHashes');
+    }
+
+    // Sort by ascending byte offset and coalesce nearby ranges within maxGapBytes & maxSpanBytes.
+    toFetch.sort((a, b) => a.start - b.start);
+    const batches = [];
+    let current = {
+      start: toFetch[0].start,
+      end: toFetch[0].end,
+      items: [toFetch[0]],
+    };
+    for (let i = 1; i < toFetch.length; i += 1) {
+      const item = toFetch[i];
+      const gap = item.start - current.end;
+      const proposedSpan = item.end - current.start;
+      if (gap <= maxGapBytes && proposedSpan <= maxSpanBytes) {
+        current.end = item.end;
+        current.items.push(item);
+      } else {
+        batches.push(current);
+        current = {
+          start: item.start,
+          end: item.end,
+          items: [item],
+        };
+      }
+    }
+    batches.push(current);
+
+    let prefetched = 0;
+    let completedBatches = 0;
+    let bytesFetched = 0;
+
+    // Register per-hash in-flight promises synchronously BEFORE awaiting any batch so concurrent
+    // getWgslAsync() or prefetchHashes() calls deduplicate cleanly onto the coalesced batch.
+    const batchPromises = batches.map((batch) => {
+      const deferreds = batch.items.map((item) => {
+        let resolve;
+        let reject;
+        const promise = new Promise((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        // Prevent unhandled rejection noise if the batch fails and only prefetchHashes() catches.
+        promise.catch(() => {});
+        this._inFlightFetches.set(item.key, promise);
+        return { item, promise, resolve, reject };
+      });
+
+      const clearInFlight = () => {
+        for (let i = 0; i < deferreds.length; i += 1) {
+          const { item, promise } = deferreds[i];
+          if (this._inFlightFetches.get(item.key) === promise) {
+            this._inFlightFetches.delete(item.key);
+          }
+        }
+      };
+
+      return (async () => {
+        let chunk;
+        try {
+          chunk = await this._fetchRangeChunkBounded(fetcher, batch.start, batch.end - 1);
+        } catch (err) {
+          clearInFlight();
+          for (let i = 0; i < deferreds.length; i += 1) {
+            deferreds[i].reject(err);
+          }
+          throw err;
+        }
+
+        const chunkBytes = sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
+        this._rangeBytesFetched += chunkBytes;
+        bytesFetched += chunkBytes;
+
+        const expectedSpan = batch.end - batch.start;
+        try {
+          if (chunk.status === 206) {
+            if (chunk.contentRange && chunk.contentRange.start !== batch.start) {
+              throw new Error(
+                `WGPK ranged prefetch mismatch: expected start byte ${batch.start}, got ${chunk.contentRange.start}`
+              );
+            }
+            if (chunk.bytes.byteLength < expectedSpan) {
+              throw new Error(
+                `WGPK ranged prefetch truncated: expected ${expectedSpan} bytes for [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength}`
+              );
+            }
+          } else if (chunk.bytes.byteLength < batch.end) {
+            throw new Error(
+              `WGPK full prefetch response truncated: need byte range [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength} bytes`
+            );
+          }
+        } catch (err) {
+          clearInFlight();
+          for (let i = 0; i < deferreds.length; i += 1) {
+            deferreds[i].reject(err);
+          }
+          throw err;
+        }
+
+        const decodedResults = new Array(deferreds.length);
+        let firstDecodeError = null;
+        for (let i = 0; i < deferreds.length; i += 1) {
+          const { item } = deferreds[i];
+          const relStart = chunk.status === 206 ? item.start - batch.start : item.start;
+          const payloadBytes = chunk.bytes.subarray(relStart, relStart + item.length);
+          const entryIdx =
+            item.entry._index !== undefined ? item.entry._index : item.entry.hashHex;
+          try {
+            const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+            if (this._rangedDecodeCounter) {
+              this._rangedDecodeCounter.count += 1;
+            }
+            this._putWgslCache(item.key, wgsl, item.length);
+            prefetched += 1;
+            this._prefetchShaders += 1;
+            decodedResults[i] = { ok: true, wgsl };
+          } catch (decodeErr) {
+            if (firstDecodeError === null) {
+              firstDecodeError = decodeErr;
+            }
+            decodedResults[i] = { ok: false, err: decodeErr };
+          }
+        }
+
+        this._prefetchBatches += 1;
+        completedBatches += 1;
+        clearInFlight();
+
+        for (let i = 0; i < deferreds.length; i += 1) {
+          const res = decodedResults[i];
+          if (res.ok) {
+            deferreds[i].resolve(res.wgsl);
+          } else {
+            deferreds[i].reject(res.err);
+          }
+        }
+
+        if (firstDecodeError !== null) {
+          throw firstDecodeError;
+        }
+      })();
+    });
+
+    await Promise.all([...batchPromises, ...inFlightPromises]);
+
+    return {
+      requested,
+      prefetched,
+      cached,
+      inFlight,
+      missing,
+      batches: completedBatches,
+      bytesFetched,
+    };
   }
 
   /**
@@ -1404,9 +1784,14 @@ export class WgslPack {
     const peakConcurrentRangeFetches = sanitizeNonNegativeInt(this._peakConcurrentRangeFetches, 0);
     const cacheHits = sanitizeNonNegativeInt(this._cacheHits, 0);
     const cacheMisses = sanitizeNonNegativeInt(this._cacheMisses, 0);
+    const lruHits = sanitizeNonNegativeInt(this._lruHits, 0);
+    const lruMisses = sanitizeNonNegativeInt(this._lruMisses, 0);
     const cachedWgslBytes = sanitizeNonNegativeInt(this._cachedWgslBytes, 0);
+    const lruBytes = cachedWgslBytes;
     const cachedWgslEntries = sanitizeNonNegativeInt(this._wgslCache.size, 0);
     const lruEvictions = sanitizeNonNegativeInt(this._wgslCacheEvictions, 0);
+    const prefetchBatches = sanitizeNonNegativeInt(this._prefetchBatches, 0);
+    const prefetchShaders = sanitizeNonNegativeInt(this._prefetchShaders, 0);
     const inFlightCoalesced = sanitizeNonNegativeInt(this._inFlightCoalesced, 0);
     const inFlightCount = sanitizeNonNegativeInt(this._inFlightFetches.size, 0);
 
@@ -1437,11 +1822,18 @@ export class WgslPack {
       maxRangeFetchRetries: this._maxRangeFetchRetries,
       cacheHits,
       cacheMisses,
+      lruHits,
+      lruMisses,
+      lruBytes,
       cachedWgslBytes,
       cachedWgslEntries,
       maxCachedWgslBytes: this._maxCachedWgslBytes,
       wgslCacheEvictions: lruEvictions,
       lruEvictions,
+      prefetchBatches,
+      prefetchShaders,
+      prefetchMaxGapBytes: this._prefetchMaxGapBytes,
+      prefetchMaxSpanBytes: this._prefetchMaxSpanBytes,
       inFlightDeduplications: inFlightCoalesced,
       inFlightCoalesced,
       inFlightCount,
@@ -1628,6 +2020,12 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     options ? options.rangeRetryDelayMs : undefined
   );
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
+  const prefetchMaxGapBytes = validatePrefetchMaxGapBytes(
+    options ? options.prefetchMaxGapBytes : undefined
+  );
+  const prefetchMaxSpanBytes = validatePrefetchMaxSpanBytes(
+    options ? options.prefetchMaxSpanBytes : undefined
+  );
   const initialRangeFetches = sanitizeNonNegativeInt(
     options ? options.initialRangeFetches : 0,
     0
@@ -1662,6 +2060,8 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     maxRangeFetchRetries,
     rangeRetryDelayMs,
     sleepFn,
+    prefetchMaxGapBytes,
+    prefetchMaxSpanBytes,
     initialRangeFetches,
     initialRangeBytesFetched,
     initialRangeFetchRetries,
@@ -1685,6 +2085,12 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     options ? options.rangeRetryDelayMs : undefined
   );
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
+  const prefetchMaxGapBytes = validatePrefetchMaxGapBytes(
+    options ? options.prefetchMaxGapBytes : undefined
+  );
+  const prefetchMaxSpanBytes = validatePrefetchMaxSpanBytes(
+    options ? options.prefetchMaxSpanBytes : undefined
+  );
 
   // If the server returned 200 OK instead of 206 Partial Content, fall back seamlessly to buffer mode.
   if (initialChunk.status !== 206) {
@@ -1790,6 +2196,8 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     maxRangeFetchRetries,
     rangeRetryDelayMs,
     sleepFn,
+    prefetchMaxGapBytes,
+    prefetchMaxSpanBytes,
     initialRangeFetches: rangeFetches,
     initialRangeBytesFetched: rangeBytesFetched,
     initialRangeFetchRetries: rangeFetchRetries,
@@ -1810,6 +2218,8 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
  *   maxRangeFetchRetries?: number,
  *   rangeRetryDelayMs?: number,
  *   sleepFn?: (ms: number) => Promise<void>,
+ *   prefetchMaxGapBytes?: number,
+ *   prefetchMaxSpanBytes?: number,
  *   lazyDecode?: boolean,
  * }} [fetchImplOrOptions]
  * @param {object} [maybeOptions]
@@ -1830,6 +2240,8 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
   const maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
   const rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
   const sleepFn = validateSleepFn(options.sleepFn);
+  validatePrefetchMaxGapBytes(options.prefetchMaxGapBytes);
+  validatePrefetchMaxSpanBytes(options.prefetchMaxSpanBytes);
 
   let initialRangeFetches = 0;
   let initialRangeFetchRetries = 0;
@@ -1896,6 +2308,8 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
     const maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
     const rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
     const sleepFn = validateSleepFn(options.sleepFn);
+    validatePrefetchMaxGapBytes(options.prefetchMaxGapBytes);
+    validatePrefetchMaxSpanBytes(options.prefetchMaxSpanBytes);
 
     // 1. Prefer lightweight HEAD probe for Content-Length & Accept-Ranges.
     let headResolved = false;
@@ -2025,6 +2439,8 @@ export class WgslPackCache {
     this._maxRangeFetchRetries = validateMaxRangeFetchRetries(options.maxRangeFetchRetries);
     this._rangeRetryDelayMs = validateRangeRetryDelayMs(options.rangeRetryDelayMs);
     this._sleepFn = validateSleepFn(options.sleepFn);
+    this._prefetchMaxGapBytes = validatePrefetchMaxGapBytes(options.prefetchMaxGapBytes);
+    this._prefetchMaxSpanBytes = validatePrefetchMaxSpanBytes(options.prefetchMaxSpanBytes);
 
     this._packs = new Map();
     this._shaderEntries = new Map();
@@ -2143,6 +2559,8 @@ export class WgslPackCache {
       maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
       rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
       sleepFn: options.sleepFn ?? this._sleepFn,
+      prefetchMaxGapBytes: options.prefetchMaxGapBytes ?? this._prefetchMaxGapBytes,
+      prefetchMaxSpanBytes: options.prefetchMaxSpanBytes ?? this._prefetchMaxSpanBytes,
       lazyDecode: options.lazyDecode !== undefined ? options.lazyDecode : this._lazyDecode,
     });
     const name = options.packName ?? url;
@@ -2208,6 +2626,8 @@ export class WgslPackCache {
         maxRangeFetchRetries: options.maxRangeFetchRetries ?? this._maxRangeFetchRetries,
         rangeRetryDelayMs: options.rangeRetryDelayMs ?? this._rangeRetryDelayMs,
         sleepFn: options.sleepFn ?? this._sleepFn,
+        prefetchMaxGapBytes: options.prefetchMaxGapBytes ?? this._prefetchMaxGapBytes,
+        prefetchMaxSpanBytes: options.prefetchMaxSpanBytes ?? this._prefetchMaxSpanBytes,
       });
       return this._registerPack(pack, name);
     }
@@ -2559,6 +2979,142 @@ export class WgslPackCache {
    */
   getShaderSourceAsync(hash, stage) {
     return this.getWgslAsync(hash, stage);
+  }
+
+  /**
+   * Prefetch a set of shader hashes across all loaded packs, coalescing nearby byte ranges
+   * per ranged pack into batched HTTP `206 Range` fetches and populating each pack's bounded
+   * hot-hash WGSL LRU cache.
+   *
+   * @param {Iterable<bigint | string | number>} hashes
+   * @param {{
+   *   maxGapBytes?: number,
+   *   maxSpanBytes?: number,
+   *   prefetchMaxGapBytes?: number,
+   *   prefetchMaxSpanBytes?: number,
+   * }} [options]
+   * @returns {Promise<{
+   *   requested: number,
+   *   prefetched: number,
+   *   cached: number,
+   *   inFlight: number,
+   *   missing: number,
+   *   batches: number,
+   *   bytesFetched: number,
+   * }>}
+   */
+  async prefetchHashes(hashes, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxGapBytes =
+      opts.maxGapBytes !== undefined || opts.prefetchMaxGapBytes !== undefined
+        ? validatePrefetchMaxGapBytes(
+            opts.maxGapBytes !== undefined ? opts.maxGapBytes : opts.prefetchMaxGapBytes,
+            this._prefetchMaxGapBytes
+          )
+        : undefined;
+    const maxSpanBytes =
+      opts.maxSpanBytes !== undefined || opts.prefetchMaxSpanBytes !== undefined
+        ? validatePrefetchMaxSpanBytes(
+            opts.maxSpanBytes !== undefined ? opts.maxSpanBytes : opts.prefetchMaxSpanBytes,
+            this._prefetchMaxSpanBytes
+          )
+        : undefined;
+
+    if (hashes === undefined || hashes === null) {
+      return {
+        requested: 0,
+        prefetched: 0,
+        cached: 0,
+        inFlight: 0,
+        missing: 0,
+        batches: 0,
+        bytesFetched: 0,
+      };
+    }
+    if (typeof hashes[Symbol.iterator] !== 'function') {
+      throw new TypeError('hashes must be an iterable of shader hashes');
+    }
+
+    const seen = new Set();
+    let requested = 0;
+    let cached = 0;
+    let missing = 0;
+    const byPack = new Map();
+
+    for (const rawHash of hashes) {
+      const key = normalizeHash(rawHash);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      requested += 1;
+
+      if (this._dynamicEntries.has(key)) {
+        cached += 1;
+        continue;
+      }
+
+      const record = this._shaderEntries.get(key);
+      if (!record) {
+        missing += 1;
+        continue;
+      }
+
+      let list = byPack.get(record.pack);
+      if (!list) {
+        list = [];
+        byPack.set(record.pack, list);
+      }
+      list.push(key);
+    }
+
+    if (byPack.size === 0) {
+      return {
+        requested,
+        prefetched: 0,
+        cached,
+        inFlight: 0,
+        missing,
+        batches: 0,
+        bytesFetched: 0,
+      };
+    }
+
+    const forwardOptions = {};
+    if (maxGapBytes !== undefined) {
+      forwardOptions.maxGapBytes = maxGapBytes;
+    }
+    if (maxSpanBytes !== undefined) {
+      forwardOptions.maxSpanBytes = maxSpanBytes;
+    }
+
+    const results = await Promise.all(
+      Array.from(byPack.entries(), ([pack, keys]) => pack.prefetchHashes(keys, forwardOptions))
+    );
+
+    let prefetched = 0;
+    let inFlight = 0;
+    let batches = 0;
+    let bytesFetched = 0;
+    for (let i = 0; i < results.length; i += 1) {
+      const r = results[i];
+      prefetched += r.prefetched;
+      cached += r.cached;
+      inFlight += r.inFlight;
+      missing += r.missing;
+      batches += r.batches;
+      bytesFetched += r.bytesFetched;
+    }
+
+    return {
+      requested,
+      prefetched,
+      cached,
+      inFlight,
+      missing,
+      batches,
+      bytesFetched,
+    };
   }
 
   /**
@@ -3088,9 +3644,14 @@ export class WgslPackCache {
     let peakConcurrentRangeFetches = 0;
     let cacheHits = 0;
     let cacheMisses = 0;
+    let lruHits = 0;
+    let lruMisses = 0;
+    let lruBytes = 0;
     let cachedWgslBytes = 0;
     let cachedWgslEntries = 0;
     let wgslCacheEvictions = 0;
+    let prefetchBatches = 0;
+    let prefetchShaders = 0;
     let inFlightDeduplications = 0;
     let inFlightCount = 0;
     let hasBufferPack = false;
@@ -3109,9 +3670,14 @@ export class WgslPackCache {
       }
       cacheHits += sanitizeNonNegativeInt(s.cacheHits, 0);
       cacheMisses += sanitizeNonNegativeInt(s.cacheMisses, 0);
+      lruHits += sanitizeNonNegativeInt(s.lruHits, 0);
+      lruMisses += sanitizeNonNegativeInt(s.lruMisses, 0);
+      lruBytes += sanitizeNonNegativeInt(s.lruBytes, 0);
       cachedWgslBytes += sanitizeNonNegativeInt(s.cachedWgslBytes, 0);
       cachedWgslEntries += sanitizeNonNegativeInt(s.cachedWgslEntries, 0);
       wgslCacheEvictions += sanitizeNonNegativeInt(s.lruEvictions, 0);
+      prefetchBatches += sanitizeNonNegativeInt(s.prefetchBatches, 0);
+      prefetchShaders += sanitizeNonNegativeInt(s.prefetchShaders, 0);
       inFlightDeduplications += sanitizeNonNegativeInt(s.inFlightCoalesced, 0);
       inFlightCount += sanitizeNonNegativeInt(s.inFlightCount, 0);
       if (s.mode === 'ranged') {
@@ -3182,10 +3748,15 @@ export class WgslPackCache {
       peakConcurrentRangeFetches,
       cacheHits,
       cacheMisses,
+      lruHits,
+      lruMisses,
+      lruBytes,
       cachedWgslBytes,
       cachedWgslEntries,
       wgslCacheEvictions,
       lruEvictions: wgslCacheEvictions,
+      prefetchBatches,
+      prefetchShaders,
       inFlightDeduplications,
       inFlightCoalesced: inFlightDeduplications,
       inFlightCount,
