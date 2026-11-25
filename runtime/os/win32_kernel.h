@@ -408,6 +408,22 @@ Pg6Handle pg6_win32_create_file_w(const char16_t* file_name,
                                   uint32_t creation_disposition,
                                   uint32_t flags_and_attributes,
                                   Pg6Handle template_file);
+// CREATEFILE2_EXTENDED_PARAMETERS.
+struct Pg6CreateFile2Params {
+    uint32_t size;
+    uint32_t file_attributes;
+    uint32_t file_flags;
+    uint32_t security_qos_flags;
+    void* security_attributes;
+    Pg6Handle template_file;
+};
+static_assert(sizeof(Pg6CreateFile2Params) == 32, "CREATEFILE2_EXTENDED_PARAMETERS is 32 bytes");
+// CreateFile2: CreateFileW with the attributes, flags and QoS flags taken from `params` (optional).
+Pg6Handle pg6_win32_create_file_2(const char16_t* file_name,
+                                  uint32_t desired_access,
+                                  uint32_t share_mode,
+                                  uint32_t creation_disposition,
+                                  const Pg6CreateFile2Params* params);
 int32_t pg6_win32_read_file(Pg6Handle file_handle,
                             void* buffer,
                             uint32_t bytes_to_read,

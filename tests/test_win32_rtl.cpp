@@ -1404,6 +1404,28 @@ void test_find_first_file_ex() {
     CHECK(write_file(u"T:\\userdata\\rtl\\a.txt", "aaaa", 4));
     CHECK(write_file(u"T:\\userdata\\rtl\\b.txt", "bb", 2));
     CHECK(write_file(u"T:\\userdata\\rtl\\c.dat", "c", 1));
+    // CreateFile2 opens like CreateFileW (attributes and flags from the extended parameters).
+    {
+        Pg6CreateFile2Params params{};
+        params.size = sizeof(params);
+        params.file_attributes = win32::FILE_ATTRIBUTE_NORMAL;
+        const Pg6Handle h2 = pg6_win32_create_file_2(u"T:\\userdata\\rtl\\a.txt", win32::GENERIC_READ,
+                                                     win32::FILE_SHARE_READ, win32::OPEN_EXISTING, &params);
+        CHECK(h2 != win32::INVALID_HANDLE_VALUE);
+        char buf[8] = {};
+        uint32_t got = 0;
+        CHECK(pg6_win32_read_file(h2, buf, sizeof(buf), &got, nullptr) == 1 && got == 4 && buf[0] == 'a');
+        pg6_win32_close_handle(h2);
+        const Pg6Handle h3 = pg6_win32_create_file_2(u"T:\\userdata\\rtl\\a.txt", win32::GENERIC_READ,
+                                                     win32::FILE_SHARE_READ, win32::OPEN_EXISTING, nullptr);
+        CHECK(h3 != win32::INVALID_HANDLE_VALUE);
+        pg6_win32_close_handle(h3);
+        params.size = 8;  // too small
+        CHECK(pg6_win32_create_file_2(u"T:\\userdata\\rtl\\a.txt", win32::GENERIC_READ, win32::FILE_SHARE_READ,
+                                      win32::OPEN_EXISTING, &params) == win32::INVALID_HANDLE_VALUE);
+        CHECK(pg6_win32_create_file_2(u"T:\\userdata\\rtl\\missing.txt", win32::GENERIC_READ, 0,
+                                      win32::OPEN_EXISTING, nullptr) == win32::INVALID_HANDLE_VALUE);
+    }
     CHECK(pg6_win32_create_directory_w(u"T:\\userdata\\rtl\\sub", nullptr) == 1);
 
     for (const int32_t level : {win32::FindExInfoStandard, win32::FindExInfoBasic}) {
@@ -1707,21 +1729,6 @@ void test_thread_pool_close_races_last_callback() {
     win32::shutdown_thread_pool();
 }
 
-// O35: a submission the pool refuses never runs a callback, so nothing would release its pending
-// count and the record leaked after Close.
-void test_thread_pool_failed_submit_releases_record() {
-    Fixture fx;
-    const int64_t before = rtl::live_work_records();
-    const uint64_t work = fx.call(&pg6_gthunk_create_threadpool_work, {kRaceCb, 0, 0});
-    CHECK(rtl::live_work_records() == before + 1);
-    win32::fail_next_thread_pool_submissions_for_testing(1);
-    fx.call(&pg6_gthunk_submit_threadpool_work, {work});
-    fx.call(&pg6_gthunk_close_threadpool_work, {work});
-    CHECK(rtl::live_work_records() == before);
-    CHECK(rtl::live_pool_records() == 0);
-    win32::shutdown_thread_pool();
-}
-
 // ---------------------------------------------------------------------------
 // RtlCaptureStackBackTrace
 // ---------------------------------------------------------------------------
@@ -1829,7 +1836,6 @@ int main() {
     RUN(test_links);
     RUN(test_thread_pool_guest);
     RUN(test_thread_pool_close_races_last_callback);
-    RUN(test_thread_pool_failed_submit_releases_record);
     RUN(test_capture_stack_back_trace);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

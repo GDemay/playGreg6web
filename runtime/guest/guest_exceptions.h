@@ -398,6 +398,14 @@ RestoreResult restore_context(os::VirtualMemoryArena& arena,
 // SetUnhandledExceptionFilter (guest function VA, 0 = none); returns the previous filter.
 uint64_t set_unhandled_exception_filter(uint64_t filter);
 
+// AddVectoredExceptionHandler / RemoveVectoredExceptionHandler. Vectored handlers (guest function
+// VAs, LONG (EXCEPTION_POINTERS*)) see raised exceptions before the frame-based handlers; the
+// first returning EXCEPTION_CONTINUE_EXECUTION resumes. `first` != 0 puts the handler in front.
+// Returns an opaque non-null handle (0 for a null handler).
+inline constexpr uint64_t kVectoredHandleBase = 0x7EC0'0000'0000ull;
+uint64_t add_vectored_exception_handler(uint32_t first, uint64_t handler);
+bool remove_vectored_exception_handler(uint64_t handle);
+
 // ---------------------------------------------------------------------------
 // Thunks and binding
 // ---------------------------------------------------------------------------

@@ -1056,6 +1056,29 @@ void test_unhandled_exception() {
     CHECK(rax == 1);
 }
 
+void test_vectored_handler() {
+    // A vectored handler sees the exception before any frame-based handler; answering
+    // EXCEPTION_CONTINUE_EXECUTION resumes at the raise site (the MSVC thread-naming idiom).
+    Fixture fx;
+    g_code = kCodeUnknown;
+    const uint64_t handle = add_vectored_exception_handler(1, va(kFilter));
+    CHECK(handle != 0);
+    uint64_t rax = 0;
+    CHECK(fx.run(kMain, &rax) == 0);
+    CHECK(g_log == "U");  // no "d": the frame handler was not reached
+    CHECK(g_after_raise_rax == 0x42);
+    CHECK(rax == 1);
+    CHECK(remove_vectored_exception_handler(handle));
+    CHECK(!remove_vectored_exception_handler(handle));
+    CHECK(add_vectored_exception_handler(0, 0) == 0);
+
+    // Removed: the exception goes to the frame handlers and is unhandled again.
+    Fixture fx2;
+    g_code = kCodeUnknown;
+    CHECK(fx2.run(kMain) == static_cast<uint32_t>(FaultKind::UnhandledException));
+    CHECK(g_log == "d");
+}
+
 void test_nested_exception_during_unwind_collides() {
     Fixture fx;
     // The termination handler raises kCodePlain while the unwind for kCodeConsolidate runs.
@@ -1132,6 +1155,7 @@ int main() {
     test_plain_unwind_target_and_return_value();
     test_continue_execution();
     test_unhandled_exception();
+    test_vectored_handler();
     test_nested_exception_during_unwind_collides();
     test_longjmp_across_frames();
     test_unknown_resume_targets_fault();

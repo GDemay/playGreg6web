@@ -2060,6 +2060,27 @@ Pg6Handle pg6_win32_create_file_w(const char16_t* file_name,
         creation_disposition, flags_and_attributes, template_file);
 }
 
+Pg6Handle pg6_win32_create_file_2(const char16_t* file_name,
+                                  uint32_t desired_access,
+                                  uint32_t share_mode,
+                                  uint32_t creation_disposition,
+                                  const Pg6CreateFile2Params* params) {
+    uint32_t flags_and_attributes = 0;
+    void* security_attributes = nullptr;
+    Pg6Handle template_file{};
+    if (params != nullptr) {
+        if (params->size < sizeof(Pg6CreateFile2Params)) {
+            playgta6::os::win32::SetLastError(playgta6::os::win32::ERROR_INVALID_PARAMETER);
+            return playgta6::os::win32::INVALID_HANDLE_VALUE;
+        }
+        flags_and_attributes = params->file_attributes | params->file_flags | params->security_qos_flags;
+        security_attributes = params->security_attributes;
+        template_file = params->template_file;
+    }
+    return playgta6::os::win32::CreateFileW(file_name, desired_access, share_mode, security_attributes,
+                                            creation_disposition, flags_and_attributes, template_file);
+}
+
 int32_t pg6_win32_read_file(Pg6Handle file_handle,
                             void* buffer,
                             uint32_t bytes_to_read,

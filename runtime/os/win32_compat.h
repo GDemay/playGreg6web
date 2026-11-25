@@ -434,6 +434,18 @@ int32_t pg6_win32_get_thread_group_affinity(Pg6Handle thread, Pg6GroupAffinity* 
 int32_t pg6_win32_set_thread_group_affinity(Pg6Handle thread,
                                             const Pg6GroupAffinity* group_affinity,
                                             Pg6GroupAffinity* previous_group_affinity);
+// PROCESSOR_NUMBER.
+struct Pg6ProcessorNumber {
+    uint16_t group;
+    uint8_t number;
+    uint8_t reserved;
+};
+static_assert(sizeof(Pg6ProcessorNumber) == 4, "PROCESSOR_NUMBER is 4 bytes");
+// SetThreadIdealProcessorEx: records the ideal processor (a scheduling hint; the host scheduler
+// is not told) and reports the previous one (initially group 0, processor 0).
+int32_t pg6_win32_set_thread_ideal_processor_ex(Pg6Handle thread,
+                                                const Pg6ProcessorNumber* ideal_processor,
+                                                Pg6ProcessorNumber* previous_ideal_processor);
 char* pg6_win32_get_command_line_a(void);
 void pg6_win32_sleep(uint32_t milliseconds);
 int32_t pg6_win32_initialize_critical_section_and_spin_count(Pg6CriticalSection* critical_section,

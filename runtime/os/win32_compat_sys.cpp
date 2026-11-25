@@ -470,6 +470,31 @@ int32_t pg6_win32_set_thread_group_affinity(Pg6Handle thread,
     return 1;
 }
 
+int32_t pg6_win32_set_thread_ideal_processor_ex(Pg6Handle thread,
+                                                const Pg6ProcessorNumber* ideal,
+                                                Pg6ProcessorNumber* previous) {
+    if (!win32::is_thread_handle(thread)) {
+        win32::SetLastError(win32::ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if (ideal == nullptr || ideal->group != 0 || ideal->number >= win32::processor_count()) {
+        win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    static std::mutex mutex;
+    // Keyed by handle; the current-thread pseudo handle by the calling thread's id.
+    static std::map<uint64_t, uint8_t> ideals;
+    const uint64_t raw = static_cast<uint64_t>(thread);
+    const uint64_t id = raw == static_cast<uint64_t>(-2) ? (uint64_t{1} << 63) | pg6_win32_get_current_thread_id() : raw;
+    std::lock_guard<std::mutex> lock(mutex);
+    uint8_t& slot = ideals[id];
+    if (previous != nullptr) {
+        *previous = Pg6ProcessorNumber{0, slot, 0};
+    }
+    slot = ideal->number;
+    return 1;
+}
+
 char* pg6_win32_get_command_line_a(void) {
     // Stable storage that outlives later set_command_line calls (previous strings are kept).
     static std::mutex mutex;
