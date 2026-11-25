@@ -1239,6 +1239,16 @@ void test_heap_indexed_bind_groups() {
     BindGroupLookup rewritten = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
     CHECK(rewritten.rebuilt && rewritten.retired_gpu_id == 50 && rewritten.bind_group->entries[1].resource_id == 701);
 
+    // 32-bit soffset wrap (G66): shifted indices overflowing 32 bits wrap like the hardware and land in the heap.
+    const uint32_t wrapk[2] = {0x10000003u, 0x08000007u};  // << 4 -> 0x30 (slot 3), << 5 -> 0xE0 (slot 7)
+    CHECK(st.set_root_constants(G, 0, 2, wrapk, 0) == Status::Ok);
+    BindGroupLookup wrapped = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(wrapped.status == Status::Ok && wrapped.bind_group != nullptr);
+    CHECK(wrapped.bind_group->entries[0].kind == BindResourceKind::Sampler &&
+          wrapped.bind_group->entries[0].sampler.max_anisotropy == 4);
+    CHECK(wrapped.bind_group->entries[1].kind == BindResourceKind::TextureView &&
+          wrapped.bind_group->entries[1].resource_id == 701);
+
     // Out of range (and not a whole descriptor): null entries, counted, no crash.
     const uint32_t far[2] = {16, 0xffffffffu};
     CHECK(st.set_root_constant(G, 0, far[0], 0) == Status::Ok);

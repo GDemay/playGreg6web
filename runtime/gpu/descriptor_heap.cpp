@@ -1940,7 +1940,8 @@ bool heap_slot(const RootArgumentState& state, BindPoint bind_point, const PlanE
     if (h == nullptr || p.heap_dword >= values.size()) {
         return false;
     }
-    const uint64_t byte_offset = uint64_t{values[p.heap_dword]} << p.heap_shift;
+    // RDNA2 scalar-load soffset is 32-bit: the shifted index wraps in hardware.
+    const uint64_t byte_offset = static_cast<uint32_t>(values[p.heap_dword] << p.heap_shift);
     const uint64_t increment = h->increment();
     if (increment == 0 || byte_offset % increment != 0 || byte_offset / increment >= h->capacity()) {
         return false;
@@ -2098,7 +2099,7 @@ BindGroupLookup BindGroupCache::get_or_build(
             p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
         const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
         scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
-        scratch_key_.push_back(p.heap_dword < values.size() ? uint64_t{values[p.heap_dword]} << p.heap_shift : ~0ull);
+        scratch_key_.push_back(p.heap_dword < values.size() ? uint64_t{static_cast<uint32_t>(values[p.heap_dword] << p.heap_shift)} : ~0ull);
     }
     const uint64_t h = hash_key(scratch_key_);
     auto it = entries_.find(h);
