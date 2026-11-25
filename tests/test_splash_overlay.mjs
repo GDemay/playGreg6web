@@ -15,8 +15,12 @@ const splashMod = require('../web/ui/splash_overlay.js');
 const {
   BOOT_STAGE_ORDER,
   BOOT_STAGE_LABELS,
+  BOOT_PHASE_ORDER,
+  BOOT_PHASE_RANGES,
   DISMISS_REASONS,
   computeBootProgress,
+  resolveBootPhase,
+  clampMonotonicPhaseProgress,
   sanitizeScriptedInputPreset,
   sanitizeDismissReason,
   isHudHiddenQuery,
@@ -24,6 +28,7 @@ const {
   isSplashHoldQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
+  DEFAULT_FADE_OUT_MS,
   DEFAULT_VISIBLE_FRAME_FADE_MS,
   DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
   DEFAULT_LOADING_ASSETS_MESSAGE,
@@ -2199,4 +2204,409 @@ test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested 
   held.controller.notifyFirstVisibleFrame({ fadeDurationMs: 0 });
   assert.equal(heldBarFill.getAttribute('data-state'), 'ok');
   held.controller.destroy();
+});
+
+test('W311: exports monotonic phase constants, DEFAULT_FADE_OUT_MS (220), and phase clamping helpers on module and UMD global', () => {
+  assert.ok(Object.isFrozen(BOOT_PHASE_ORDER));
+  assert.ok(Object.isFrozen(BOOT_PHASE_RANGES));
+  assert.deepEqual(BOOT_PHASE_ORDER, [
+    'PGIM_LOAD',
+    'WASM_INIT',
+    'D3D12_INIT',
+    'ASSET_STREAMING',
+    'FIRST_VISIBLE_FRAME',
+  ]);
+  assert.equal(DEFAULT_FADE_OUT_MS, 220);
+  assert.equal(typeof resolveBootPhase, 'function');
+  assert.equal(typeof clampMonotonicPhaseProgress, 'function');
+  assert.equal(globalThis.PlayGta6SplashOverlay.BOOT_PHASE_ORDER, BOOT_PHASE_ORDER);
+  assert.equal(globalThis.PlayGta6SplashOverlay.BOOT_PHASE_RANGES, BOOT_PHASE_RANGES);
+  assert.equal(globalThis.PlayGta6SplashOverlay.DEFAULT_FADE_OUT_MS, 220);
+  assert.equal(globalThis.PlayGta6SplashOverlay.resolveBootPhase, resolveBootPhase);
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.clampMonotonicPhaseProgress,
+    clampMonotonicPhaseProgress
+  );
+
+  // Stage-to-phase resolution covers both canonical phases and fine-grained BootTracer milestones.
+  assert.equal(resolveBootPhase('PGIM_LOAD'), 'PGIM_LOAD');
+  assert.equal(resolveBootPhase('WASM_INIT'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('TLS_INIT'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('CRT_INITTERM'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('ENTRY_CALL'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('XMEM_INIT'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('GDK_INIT'), 'WASM_INIT');
+  assert.equal(resolveBootPhase('D3D12_INIT'), 'D3D12_INIT');
+  assert.equal(resolveBootPhase('D3D12_CREATE_DEVICE'), 'D3D12_INIT');
+  assert.equal(resolveBootPhase('ASSET_STREAMING'), 'ASSET_STREAMING');
+  assert.equal(resolveBootPhase('BINK_OPEN'), 'ASSET_STREAMING');
+  assert.equal(resolveBootPhase('FIRST_VISIBLE_FRAME'), 'FIRST_VISIBLE_FRAME');
+  assert.equal(resolveBootPhase('FIRST_PRESENT'), 'FIRST_VISIBLE_FRAME');
+  assert.equal(
+    resolveBootPhase('FIRST_PRESENT', { holdingForVisibleFrame: true }),
+    'ASSET_STREAMING'
+  );
+  assert.equal(resolveBootPhase('NOT_STARTED'), null);
+  assert.equal(resolveBootPhase('UNKNOWN_STAGE'), null);
+
+  // clampMonotonicPhaseProgress enforces per-phase bounds and never moves backwards.
+  assert.equal(clampMonotonicPhaseProgress('PGIM_LOAD', 95, 0), 20);
+  assert.equal(clampMonotonicPhaseProgress('WASM_INIT', 5, 11), 20);
+  assert.equal(clampMonotonicPhaseProgress('WASM_INIT', 45, 20), 45);
+  assert.equal(clampMonotonicPhaseProgress('PGIM_LOAD', 15, 45), 45);
+  assert.equal(clampMonotonicPhaseProgress('D3D12_INIT', 99, 45), 85);
+  assert.equal(clampMonotonicPhaseProgress('ASSET_STREAMING', 100, 85), 99);
+  assert.equal(clampMonotonicPhaseProgress('FIRST_VISIBLE_FRAME', 100, 99), 100);
+  assert.equal(
+    clampMonotonicPhaseProgress('FIRST_VISIBLE_FRAME', 100, 95, { holdingForVisibleFrame: true }),
+    99
+  );
+});
+
+test('W311: monotonic phase-aware progress clamping prevents backwards jumps during parallel preloads and reaches 100% right before dismiss', () => {
+  const { controller } = createController({ holdUntilVisible: true, fadeOutMs: 220 });
+  const root = controller.getState().root;
+  const barFill = root.querySelector('.pg6-splash__bar-fill');
+
+  // 1. PGIM_LOAD clamps upper bound to 20% even if a sub-loader reports 100%.
+  let state = controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 12, elapsedMs: 100 });
+  assert.equal(state.phase, 'PGIM_LOAD');
+  assert.equal(state.progressPct, 12);
+  state = controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 100, elapsedMs: 150 });
+  assert.equal(state.progressPct, 20);
+
+  // 2. WASM_INIT advances smoothly using phaseProgress interpolation and ignores lower values.
+  state = controller.updateBootState({ stage: 'WASM_INIT', phaseProgress: 0.5, elapsedMs: 400 });
+  assert.equal(state.phase, 'WASM_INIT');
+  assert.equal(state.progressPct, Math.round(20 + (67 - 20) * 0.5));
+  const wasmPct = state.progressPct;
+  const wasmStatus = state.statusText;
+
+  // Late parallel PGIM_LOAD update NEVER jumps progress, phase, or status text backwards.
+  state = controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 15, elapsedMs: 120 });
+  assert.equal(state.phase, 'WASM_INIT');
+  assert.equal(state.progressPct, wasmPct);
+  assert.equal(state.statusText, wasmStatus);
+  assert.equal(state.elapsedMs, 400);
+
+  // Lower progress within the same WASM_INIT phase also never jumps backwards.
+  state = controller.updateBootState({ stage: 'WASM_INIT', progressPct: 25, elapsedMs: 450 });
+  assert.equal(state.progressPct, wasmPct);
+
+  // 3. D3D12_INIT clamps within [67, 85].
+  state = controller.updateBootState({ stage: 'D3D12_INIT', progressPct: 10, elapsedMs: 700 });
+  assert.equal(state.phase, 'D3D12_INIT');
+  assert.equal(state.progressPct, 67);
+  state = controller.updateBootState({ stage: 'D3D12_INIT', progressPct: 99, elapsedMs: 900 });
+  assert.equal(state.progressPct, 85);
+
+  // 4. ASSET_STREAMING holds cleanly within [85, 99] and never drops on lower setLoadingAssetsProgress pct.
+  state = controller.onFirstPresent();
+  assert.equal(state.phase, 'ASSET_STREAMING');
+  assert.equal(state.progressPct, 90);
+  assert.equal(barFill.getAttribute('data-state'), 'active');
+
+  state = controller.setLoadingAssetsProgress({ presents: 50, realPackDraws: 20, progressPct: 95 });
+  assert.equal(state.progressPct, 95);
+
+  // Out-of-order lower progressPct or late WASM_INIT never regresses progress.
+  state = controller.setLoadingAssetsProgress({ presents: 60, realPackDraws: 21, progressPct: 40 });
+  assert.equal(state.progressPct, 95);
+  state = controller.updateBootState({ stage: 'WASM_INIT', progressPct: 30 });
+  assert.equal(state.phase, 'ASSET_STREAMING');
+  assert.equal(state.progressPct, 95);
+
+  // Overshooting 100% during ASSET_STREAMING stays capped at 99% until first visible frame.
+  state = controller.setLoadingAssetsProgress({ presents: 100, realPackDraws: 50, progressPct: 100 });
+  assert.equal(state.progressPct, 99);
+  assert.equal(barFill.getAttribute('data-state'), 'active');
+
+  // 5. First non-black frame smoothly reaches 100% right before fade-out dismiss.
+  state = controller.notifyFirstVisibleFrame();
+  assert.equal(state.phase, 'FIRST_VISIBLE_FRAME');
+  assert.equal(state.progressPct, 100);
+  assert.equal(barFill.style.width, '100%');
+  assert.equal(barFill.getAttribute('data-state'), 'ok');
+  assert.equal(state.fading, true);
+  assert.equal(state.fadeOutCompleted, false);
+
+  // Resetting via show({ reset: true }) allows a fresh boot starting cleanly from 0%.
+  state = controller.show({ reset: true });
+  assert.equal(state.phase, 'NOT_STARTED');
+  assert.equal(state.progressPct, 0);
+  assert.equal(state.fadeOutCompleted, false);
+  state = controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 8 });
+  assert.equal(state.phase, 'PGIM_LOAD');
+  assert.equal(state.progressPct, 8);
+  controller.destroy();
+});
+
+test('W311: smooth fade-out dismissal state (fadeOutMs default 220ms, instant fadeOutMs: 0) and leak-free idempotent hide()/destroy()', () => {
+  // Constructor validation for fadeOutMs.
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), fadeOutMs: -1 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), fadeOutMs: Number.NaN }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), fadeOutMs: '220' }),
+    TypeError
+  );
+
+  // Default fadeOutMs is 220 ms in stats/state.
+  const defaultCtrl = createController();
+  assert.equal(defaultCtrl.controller.getStats().fadeOutMs, 220);
+  assert.equal(defaultCtrl.controller.getState().fadeOutMs, 220);
+  assert.equal(defaultCtrl.controller.getStats().fadeOutCompleted, false);
+  defaultCtrl.controller.destroy();
+
+  // 1) Smooth 220 ms fade-out on first non-black frame transitions opacity cleanly and completes.
+  let now = 1000;
+  const smooth = createController({
+    holdUntilVisible: true,
+    fadeOutMs: 220,
+    fadeMs: undefined,
+    nowFn: () => now,
+  });
+  const root = smooth.controller.getState().root;
+  assert.equal(root.style.getPropertyValue('--pg6-splash-fade'), '220ms');
+
+  smooth.controller.onFirstPresent();
+  now = 2500;
+  const fadingState = smooth.controller.notifyFirstVisibleFrame();
+  assert.equal(fadingState.visible, true);
+  assert.equal(fadingState.dismissed, true);
+  assert.equal(fadingState.fading, true);
+  assert.equal(fadingState.fadeOutCompleted, false);
+  assert.equal(fadingState.progressPct, 100);
+  assert.equal(root.classList.contains('pg6-splash--fading'), true);
+  assert.equal(root.style.opacity, '0');
+  assert.equal(root.style.getPropertyValue('--pg6-splash-fade'), '220ms');
+  assert.deepEqual(smooth.timer.delays(), [220]);
+  assert.equal(smooth.dismissCalls.length, 0);
+
+  now = 2720;
+  smooth.timer.flush();
+  const doneStats = smooth.controller.getStats();
+  assert.equal(doneStats.visible, false);
+  assert.equal(doneStats.fading, false);
+  assert.equal(doneStats.dismissed, true);
+  assert.equal(doneStats.fadeOutCompleted, true);
+  assert.equal(doneStats.fadeDurationMs, 220);
+  assert.equal(root.hidden, true);
+  assert.equal(root.style.display, 'none');
+  assert.equal(root.style.opacity, '');
+  assert.equal(smooth.timer.size, 0);
+  assert.equal(smooth.dismissCalls.length, 1);
+  smooth.controller.destroy();
+
+  // 2) Instant hide option fadeOutMs: 0 (constructor and per-call) hides synchronously with zero timers.
+  const instantCtor = createController({
+    holdUntilVisible: true,
+    fadeOutMs: 0,
+    fadeMs: undefined,
+    nowFn: () => 5000,
+  });
+  assert.equal(instantCtor.controller.getStats().fadeOutMs, 0);
+  assert.equal(
+    instantCtor.controller.getState().root.style.getPropertyValue('--pg6-splash-fade'),
+    '0ms'
+  );
+  instantCtor.controller.onFirstPresent();
+  const instState = instantCtor.controller.notifyFirstVisibleFrame();
+  assert.equal(instState.visible, false);
+  assert.equal(instState.dismissed, true);
+  assert.equal(instState.fading, false);
+  assert.equal(instState.fadeOutCompleted, true);
+  assert.equal(instState.fadeDurationMs, 0);
+  assert.equal(instState.progressPct, 100);
+  assert.equal(instantCtor.timer.size, 0);
+  assert.equal(instantCtor.dismissCalls.length, 1);
+  instantCtor.controller.destroy();
+
+  const instantPerCall = createController({ holdUntilVisible: true, fadeOutMs: 220, nowFn: () => 6000 });
+  instantPerCall.controller.onFirstPresent();
+  instantPerCall.controller.notifyFirstVisibleFrame({ fadeOutMs: 0 });
+  assert.equal(instantPerCall.timer.size, 0);
+  assert.equal(instantPerCall.controller.getStats().visible, false);
+  assert.equal(instantPerCall.controller.getStats().fadeOutCompleted, true);
+  assert.equal(instantPerCall.controller.getStats().fadeDurationMs, 0);
+  assert.equal(instantPerCall.dismissCalls.length, 1);
+  instantPerCall.controller.destroy();
+
+  // 3) hide({ fadeOutMs }) smooth fade + idempotent hide() / destroy() cancel all timers cleanly (zero leaks).
+  const hideFade = createController({ fadeOutMs: 220 });
+  hideFade.controller.hide({ fadeOutMs: 220 });
+  assert.equal(hideFade.timer.size, 1);
+  assert.deepEqual(hideFade.timer.delays(), [220]);
+  assert.equal(hideFade.controller.getStats().fading, true);
+  assert.equal(hideFade.controller.getStats().fadeOutCompleted, false);
+  assert.equal(hideFade.controller.getState().root.style.opacity, '0');
+
+  // Calling hide() again mid-fade cancels timer and hides synchronously without firing onDismiss.
+  hideFade.controller.hide();
+  assert.equal(hideFade.timer.size, 0);
+  assert.equal(hideFade.controller.getStats().visible, false);
+  assert.equal(hideFade.controller.getStats().fading, false);
+  assert.equal(hideFade.dismissCalls.length, 0);
+  // Repeated idempotent hide() stays clean.
+  hideFade.controller.hide();
+  hideFade.controller.hide();
+  assert.equal(hideFade.timer.size, 0);
+  hideFade.controller.destroy();
+
+  // Completing hide({ fadeOutMs: 220 }) marks fadeOutCompleted without firing onDismiss.
+  const hideFadeDone = createController({ fadeOutMs: 220 });
+  hideFadeDone.controller.hide({ fadeOutMs: 220 });
+  assert.equal(hideFadeDone.timer.size, 1);
+  hideFadeDone.timer.flush();
+  assert.equal(hideFadeDone.timer.size, 0);
+  assert.equal(hideFadeDone.controller.getStats().visible, false);
+  assert.equal(hideFadeDone.controller.getStats().fading, false);
+  assert.equal(hideFadeDone.controller.getStats().fadeOutCompleted, true);
+  assert.equal(hideFadeDone.dismissCalls.length, 0);
+  hideFadeDone.controller.destroy();
+
+  // destroy() mid-fade cancels all pending timers, detaches root, and is idempotent.
+  const midDestroy = createController({ holdUntilVisible: true, fadeOutMs: 220, holdFallbackTimeoutMs: 5000 });
+  midDestroy.controller.onFirstPresent();
+  assert.equal(midDestroy.timer.size, 1);
+  midDestroy.controller.notifyFirstVisibleFrame();
+  assert.equal(midDestroy.timer.size, 1);
+  assert.equal(midDestroy.controller.getStats().fading, true);
+  midDestroy.controller.destroy();
+  assert.equal(midDestroy.timer.size, 0);
+  assert.equal(midDestroy.controller.getStats().destroyed, true);
+  assert.equal(midDestroy.controller.getStats().fading, false);
+  assert.equal(midDestroy.controller.getStats().fadeOutCompleted, false);
+  // Idempotent repeated destroy & timer flush never throw or fire callbacks.
+  assert.doesNotThrow(() => midDestroy.controller.destroy());
+  midDestroy.timer.flush();
+  assert.equal(midDestroy.dismissCalls.length, 0);
+});
+
+test('W311: surfaces sanitized phase timing telemetry (stageDurationsMs, totalSplashMs, fadeOutCompleted) and preserves W252 Astryx & Spinning Greg', () => {
+  let now = 1000;
+  const doc = new MockDocument();
+  const { controller, timer } = createController({
+    documentObj: doc,
+    holdUntilVisible: true,
+    fadeOutMs: 220,
+    fadeMs: undefined,
+    nowFn: () => now,
+  });
+
+  // Initial telemetry is clean and JSON-safe.
+  const initStats = controller.getStats();
+  assert.deepEqual(initStats.stageDurationsMs, {});
+  assert.equal(initStats.totalSplashMs, 0);
+  assert.equal(initStats.fadeOutCompleted, false);
+  assert.equal(initStats.phase, 'NOT_STARTED');
+
+  // Walk through all 5 phases with deterministic clock advances.
+  now = 1100;
+  controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 12 });
+
+  now = 1450; // PGIM_LOAD = 350 ms
+  controller.updateBootState({ stage: 'WASM_INIT', progressPct: 35 });
+
+  // Stale parallel PGIM_LOAD event must NOT corrupt PGIM_LOAD duration or add unsanitized keys.
+  now = 1600;
+  controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 18 });
+  controller.updateBootState({ stage: '../malicious/path', progressPct: 40 });
+
+  now = 2000; // WASM_INIT = 550 ms
+  controller.updateBootState({ stage: 'D3D12_INIT', progressPct: 75 });
+
+  // Verify Spinning Greg easter egg still toggles cleanly mid-boot and preserves W252 Astryx DOM.
+  const root = controller.getState().root;
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const gregImg = root.querySelector('.pg6-splash__greg');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(gregImg.hidden, false);
+
+  now = 2300; // D3D12_INIT = 300 ms
+  controller.onFirstPresent();
+  now = 3100;
+  controller.setLoadingAssetsProgress({ presents: 40, realPackDraws: 12 });
+
+  // Live telemetry during ASSET_STREAMING includes elapsed duration so far (800 ms).
+  const midStats = controller.getStats();
+  assert.deepEqual(midStats.stageDurationsMs, {
+    PGIM_LOAD: 350,
+    WASM_INIT: 550,
+    D3D12_INIT: 300,
+    ASSET_STREAMING: 800,
+  });
+  assert.equal(midStats.totalSplashMs, 2100);
+  assert.equal(midStats.fadeOutCompleted, false);
+
+  // Mutating returned stageDurationsMs does not corrupt controller state.
+  midStats.stageDurationsMs.PGIM_LOAD = 999999;
+  midStats.stageDurationsMs.EVIL = 123;
+  assert.equal(controller.getStats().stageDurationsMs.PGIM_LOAD, 350);
+  assert.equal('EVIL' in controller.getStats().stageDurationsMs, false);
+
+  // First non-black frame at t=3500 (ASSET_STREAMING = 1200 ms), fade finishes at t=3720 (FIRST_VISIBLE_FRAME = 220 ms).
+  now = 3500;
+  controller.notifyFirstVisibleFrame();
+  assert.equal(controller.getStats().fadeOutCompleted, false);
+  now = 3720;
+  timer.flush();
+
+  const finalStats = controller.getStats();
+  const finalState = controller.getState();
+  const expectedDurations = {
+    PGIM_LOAD: 350,
+    WASM_INIT: 550,
+    D3D12_INIT: 300,
+    ASSET_STREAMING: 1200,
+    FIRST_VISIBLE_FRAME: 220,
+  };
+  assert.deepEqual(finalStats.stageDurationsMs, expectedDurations);
+  assert.deepEqual(finalState.stageDurationsMs, expectedDurations);
+  assert.equal(finalStats.totalSplashMs, 2720);
+  assert.equal(finalState.totalSplashMs, 2720);
+  assert.equal(finalStats.fadeOutCompleted, true);
+  assert.equal(finalState.fadeOutCompleted, true);
+  assert.equal(finalStats.gregMode, true);
+  assert.doesNotThrow(() => JSON.stringify(finalStats));
+
+  // Verify W252 Astryx stylesheet tokens remain intact.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /var\(--color-background-surface/);
+  assert.match(styleEl.textContent, /var\(--color-accent/);
+  assert.match(styleEl.textContent, /var\(--color-success/);
+
+  // show({ reset: true }) resets phase durations, totalSplashMs, and fadeOutCompleted for a fresh cycle.
+  now = 5000;
+  const restarted = controller.show({ reset: true });
+  assert.deepEqual(restarted.stageDurationsMs, {});
+  assert.equal(restarted.totalSplashMs, 0);
+  assert.equal(restarted.fadeOutCompleted, false);
+  assert.equal(restarted.phase, 'NOT_STARTED');
+  controller.destroy();
+
+  // Faulty / backwards clock values are strictly sanitized to non-negative finite integers.
+  let clockVal = 5000;
+  const faulty = createController({ fadeOutMs: 0, fadeMs: undefined, nowFn: () => clockVal });
+  faulty.controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 10 });
+  clockVal = 1000; // clock jumped backwards
+  faulty.controller.updateBootState({ stage: 'WASM_INIT', progressPct: 30 });
+  clockVal = Number.NaN;
+  faulty.controller.notifyFirstVisibleFrame();
+  const safeStats = faulty.controller.getStats();
+  assert.equal(safeStats.stageDurationsMs.PGIM_LOAD, 0);
+  assert.equal(safeStats.stageDurationsMs.WASM_INIT, 0);
+  assert.equal(safeStats.totalSplashMs, 0);
+  assert.equal(safeStats.fadeOutCompleted, true);
+  assert.doesNotThrow(() => JSON.stringify(safeStats));
+  faulty.controller.destroy();
 });
