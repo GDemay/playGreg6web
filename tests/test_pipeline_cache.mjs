@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const shaderFallbackMod = require('../web/workers/shader_fallback_router.js');
 const {
+  DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_MAX_QUARANTINED_KEYS,
   DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
@@ -20,6 +21,7 @@ const {
   SHADER_STAGE_BITS,
   fnv1a64Hex,
   buildFastPipelineKey,
+  computeFastDescriptorHash,
   hashDescriptorKey,
   registerShaderModuleId,
   normalizeFallbackProfile,
@@ -351,6 +353,9 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     misses: 4,
     pipelineHits: 3,
     pipelineMisses: 3,
+    fastLookupHits: 3,
+    fastLookupMisses: 3,
+    fastLookupHitRate: 0.5,
     negativeHits: 0,
     negativeCacheHits: 0,
     negativeCacheSize: 0,
@@ -822,6 +827,9 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     misses: 0,
     pipelineHits: 0,
     pipelineMisses: 0,
+    fastLookupHits: 0,
+    fastLookupMisses: 0,
+    fastLookupHitRate: 0,
     negativeHits: 0,
     negativeCacheHits: 0,
     negativeCacheSize: 0,
@@ -3459,4 +3467,403 @@ test('W246 sanitizes avgCompileMs, maxCompileMs, hitRate clamping, JSON serializ
   assert.equal(sandbox.descriptorHasInlineSampler, undefined);
   assert.equal(sandbox.computeClampedHitRate, undefined);
   assert.equal(typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.resetStats, 'function');
+});
+
+// --- W281: 30 FPS Fast-Path PSO Lookup Cache Tests ---
+
+test('W281 fast-path render & compute lookups hit by numeric/bigint/string key, WeakMap descriptor, and 53-bit int hash without JSON.stringify', async () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000080001', code: 'vs' });
+  const fs = device.createShaderModule({ label: 'wgpk:fragment:0x0000000000080002', code: 'fs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000080003', code: 'cs' });
+
+  const renderDesc = {
+    layout: 'auto',
+    vertex: {
+      module: vs,
+      entryPoint: 'vs_main',
+      buffers: [
+        {
+          arrayStride: 24,
+          stepMode: 'vertex',
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x4' },
+            { shaderLocation: 1, offset: 16, format: 'float32x2' },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: 'bgra8unorm',
+          writeMask: 0xf,
+          blend: {
+            color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+          },
+        },
+      ],
+    },
+    primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw' },
+    depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+  };
+  const computeDesc = {
+    layout: 'auto',
+    compute: { module: cs, entryPoint: 'cs_main' },
+  };
+
+  // Pure fast-path lookups on cold cache miss cleanly without compiling
+  assert.equal(cache.getFastRenderPipeline(101), null);
+  assert.equal(cache.getFastRenderPipeline(renderDesc), null);
+  assert.equal(cache.getFastComputePipeline(202), null);
+  assert.equal(cache.getFastComputePipeline(computeDesc), null);
+  assert.equal(cache.getFastRenderPipeline(''), null);
+  assert.equal(cache.getFastRenderPipeline(NaN), null);
+  assert.equal(cache.getFastRenderPipeline(null), null);
+  assert.equal(device.calls.createRenderPipeline.length, 0);
+  assert.equal(device.calls.createComputePipeline.length, 0);
+  assert.equal(cache.getStats().fastLookupHits, 0);
+  assert.equal(cache.getStats().fastLookupMisses, 7);
+  assert.equal(cache.getStats().fastLookupHitRate, 0);
+
+  // Compile render + compute pipelines and also bind explicit numeric/bigint/string fast keys
+  const rp = cache.getOrCreateRenderPipeline(renderDesc);
+  const rpByNum = cache.getFastRenderPipeline(101, renderDesc);
+  const rpByBigInt = cache.getOrCreateRenderPipeline(renderDesc, 0x123456789abcdef0n);
+  const rpByStr = cache.getOrCreateRenderPipeline(renderDesc, 'pso:menu:main');
+  const cp = cache.getOrCreateComputePipeline(computeDesc);
+  const cpByNum = cache.getFastComputePipeline(202, computeDesc);
+
+  assert.equal(device.calls.createRenderPipeline.length, 4);
+  assert.equal(device.calls.createComputePipeline.length, 2);
+
+  // Verify hot-loop fast lookups bypass JSON.stringify completely
+  const origStringify = JSON.stringify;
+  let stringifyCalls = 0;
+  JSON.stringify = () => {
+    stringifyCalls += 1;
+    throw new Error('JSON.stringify must not be called on W281 fast-path lookups');
+  };
+  try {
+    // 1. Direct numeric/bigint/string fastKey lookups
+    assert.equal(cache.getFastRenderPipeline(101), rpByNum);
+    assert.equal(cache.getFastRenderPipeline(0x123456789abcdef0n), rpByBigInt);
+    assert.equal(cache.getFastRenderPipeline('pso:menu:main'), rpByStr);
+    assert.equal(cache.getFastComputePipeline(202), cpByNum);
+    assert.equal(cache.getOrCreateRenderPipeline(renderDesc, 101), rpByNum);
+    assert.equal(await cache.getOrCreateRenderPipelineAsync(renderDesc, 'pso:menu:main'), rpByStr);
+    assert.equal(cache.getOrCreateComputePipeline(computeDesc, 202), cpByNum);
+
+    // 2. Same descriptor object (WeakMap memoization hit)
+    for (let frame = 0; frame < 30; frame += 1) {
+      assert.equal(cache.getFastRenderPipeline(renderDesc), rp);
+      assert.equal(cache.getOrCreateRenderPipeline(renderDesc), rp);
+      assert.equal(cache.getFastComputePipeline(computeDesc), cp);
+    }
+
+    // 3. Freshly constructed descriptor literal with reordered keys (53-bit int-hash hit)
+    const freshReorderedRender = {
+      depthStencil: { depthCompare: 'less', depthWriteEnabled: true, format: 'depth24plus' },
+      primitive: { frontFace: 'ccw', cullMode: 'back', topology: 'triangle-list' },
+      fragment: {
+        targets: [
+          {
+            blend: {
+              alpha: { dstFactor: 'one-minus-src-alpha', srcFactor: 'one', operation: 'add' },
+              color: { dstFactor: 'one-minus-src-alpha', srcFactor: 'src-alpha', operation: 'add' },
+            },
+            writeMask: 0xf,
+            format: 'bgra8unorm',
+          },
+        ],
+        entryPoint: 'fs_main',
+        module: fs,
+      },
+      vertex: {
+        buffers: [
+          {
+            attributes: [
+              { format: 'float32x4', offset: 0, shaderLocation: 0 },
+              { format: 'float32x2', offset: 16, shaderLocation: 1 },
+            ],
+            stepMode: 'vertex',
+            arrayStride: 24,
+          },
+        ],
+        entryPoint: 'vs_main',
+        module: vs,
+      },
+      layout: 'auto',
+    };
+    const freshReorderedCompute = {
+      compute: { entryPoint: 'cs_main', module: cs },
+      layout: 'auto',
+    };
+    assert.equal(
+      computeFastDescriptorHash(renderDesc),
+      computeFastDescriptorHash(freshReorderedRender)
+    );
+    assert.equal(
+      computeFastDescriptorHash(computeDesc),
+      computeFastDescriptorHash(freshReorderedCompute)
+    );
+    assert.equal(cache.getFastRenderPipeline(freshReorderedRender), rp);
+    assert.equal(cache.getOrCreateRenderPipeline(freshReorderedRender), rp);
+    assert.equal(cache.getFastComputePipeline(freshReorderedCompute), cp);
+    assert.equal(await cache.getOrCreateComputePipelineAsync(freshReorderedCompute), cp);
+  } finally {
+    JSON.stringify = origStringify;
+  }
+
+  assert.equal(stringifyCalls, 0);
+  assert.equal(device.calls.createRenderPipeline.length, 4);
+  assert.equal(device.calls.createComputePipeline.length, 2);
+
+  const stats = cache.getStats();
+  assert.equal(stats.fastLookupHits, 101); // 7 + 90 + 4
+  assert.equal(stats.fastLookupMisses, 13); // 7 initial + 6 compiles
+  assert.equal(stats.fastLookupHitRate, 101 / 114);
+  assert.ok(stats.fastLookupHitRate > 0.88 && stats.fastLookupHitRate <= 1);
+
+  // resetStats() clears fastLookup counters while keeping warm fast-path tables intact
+  cache.resetStats();
+  assert.equal(cache.getStats().fastLookupHits, 0);
+  assert.equal(cache.getStats().fastLookupMisses, 0);
+  assert.equal(cache.getStats().fastLookupHitRate, 0);
+  assert.equal(cache.getFastRenderPipeline(101), rpByNum);
+  assert.equal(cache.getFastRenderPipeline(renderDesc), rp);
+  assert.equal(cache.getStats().fastLookupHits, 2);
+  assert.equal(cache.getStats().fastLookupMisses, 0);
+  assert.equal(cache.getStats().fastLookupHitRate, 1);
+});
+
+test('W281 invalidates fast-path lookups cleanly on clear, reset, destroy, device loss, setDevice, shader-pack reload, and eviction', async () => {
+  let clock = 1000;
+  let device1 = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({
+    device: device1,
+    maxRenderPipelines: 4,
+    maxFastLookupEntries: 2,
+    now: () => clock,
+  });
+
+  const makeModules = (dev) => ({
+    vs: dev.createShaderModule({ label: 'wgpk:vertex:0x0000000000081001', code: 'vs' }),
+    fs: dev.createShaderModule({ label: 'wgpk:fragment:0x0000000000081002', code: 'fs' }),
+    cs: dev.createShaderModule({ label: 'wgpk:compute:0x0000000000081003', code: 'cs' }),
+  });
+
+  let { vs, fs, cs } = makeModules(device1);
+  const descA = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_a' },
+    fragment: { module: fs, entryPoint: 'fs_a', targets: [{ format: 'bgra8unorm' }] },
+  };
+  const descB = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_b' },
+    fragment: { module: fs, entryPoint: 'fs_b', targets: [{ format: 'bgra8unorm' }] },
+  };
+  const descC = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_c' },
+    fragment: { module: fs, entryPoint: 'fs_c', targets: [{ format: 'bgra8unorm' }] },
+  };
+  const computeDesc = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_main' } };
+
+  // 1. Bounded maxFastLookupEntries (capacity = 2) evicts oldest fastKey while backing cache still holds pipeline
+  const pA = cache.getOrCreateRenderPipeline(descA, 'pso_a');
+  const pB = cache.getOrCreateRenderPipeline(descB, 'pso_b');
+  const pC = cache.getOrCreateRenderPipeline(descC, 'pso_c');
+  // Each compile inserts canonical key + keyHint; 'pso_a' was evicted from the 2-slot fast table
+  assert.equal(cache.getFastRenderPipeline('pso_a'), null);
+  // Backing cache still serves pA without recompiling, and re-warms 'pso_a'
+  assert.equal(cache.getOrCreateRenderPipeline(descA, 'pso_a'), pA);
+  assert.equal(device1.calls.createRenderPipeline.length, 3);
+  assert.equal(cache.getFastRenderPipeline('pso_a'), pA);
+  assert.ok(pB && pC);
+
+  // 2. clear() invalidates all fast-path entries (key + WeakMap + int-hash)
+  cache.clear();
+  assert.equal(cache.getFastRenderPipeline('pso_a'), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+  const pAAfterClear = cache.getOrCreateRenderPipeline(descA);
+  assert.notEqual(pAAfterClear, pA);
+  assert.equal(cache.getFastRenderPipeline(descA), pAAfterClear);
+
+  // 3. reset() invalidates fast-path entries
+  cache.reset();
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+
+  // 4. destroy() invalidates fast-path entries
+  const pBeforeDestroy = cache.getOrCreateRenderPipeline(descA, 777);
+  const cBeforeDestroy = cache.getOrCreateComputePipeline(computeDesc, 888);
+  assert.equal(cache.getFastRenderPipeline(777), pBeforeDestroy);
+  assert.equal(cache.getFastComputePipeline(888), cBeforeDestroy);
+  cache.destroy();
+  assert.equal(cache.getFastRenderPipeline(777), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+  assert.equal(cache.getFastComputePipeline(888), null);
+  assert.equal(cache.getFastComputePipeline(computeDesc), null);
+
+  // 5. onDeviceLost() invalidates fast-path entries
+  const pBeforeLoss = cache.getOrCreateRenderPipeline(descA, 123);
+  assert.equal(cache.getFastRenderPipeline(123), pBeforeLoss);
+  cache.onDeviceLost();
+  assert.equal(cache.getFastRenderPipeline(123), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+
+  // 6. setDevice(newDevice) invalidates fast-path entries so stale pipelines from old device are never returned
+  const pOldDevice = cache.getOrCreateRenderPipeline(descA, 555);
+  assert.equal(cache.getFastRenderPipeline(555), pOldDevice);
+  const device2 = createMockGpuDevice();
+  assert.equal(cache.setDevice(device2), true);
+  assert.equal(cache.getFastRenderPipeline(555), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+  const pNewDevice = cache.getOrCreateRenderPipeline(descA, 555);
+  assert.notEqual(pNewDevice, pOldDevice);
+  assert.equal(device2.calls.createRenderPipeline.length, 1);
+  assert.equal(cache.getFastRenderPipeline(555), pNewDevice);
+
+  // 7. onShaderPackUpdated({ clearPipelines: true }) invalidates fast-path entries
+  cache.onShaderPackUpdated({ clearPipelines: true });
+  assert.equal(cache.getFastRenderPipeline(555), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+
+  // 8. evictOlderThan() invalidates stale fast-path entries for expired pipelines only
+  clock = 2000;
+  const pOld = cache.getOrCreateRenderPipeline(descA, 'old_key');
+  clock = 3500;
+  const pFresh = cache.getOrCreateRenderPipeline(descB, 'fresh_key');
+  clock = 3600;
+  assert.equal(cache.evictOlderThan(1000), 1);
+  assert.equal(cache.getFastRenderPipeline('old_key'), null);
+  assert.equal(cache.getFastRenderPipeline(descA), null);
+  assert.equal(cache.getFastRenderPipeline('fresh_key'), pFresh);
+  assert.notEqual(pOld, pFresh);
+
+  // 9. prewarmRenderPipelines() warms fast-path lookups immediately
+  cache.clear({ resetStats: true });
+  await cache.prewarmRenderPipelines([descA, descB]);
+  const statsBefore = cache.getStats();
+  assert.ok(cache.getFastRenderPipeline(descA));
+  assert.ok(cache.getFastRenderPipeline(descB));
+  assert.equal(cache.getStats().fastLookupHits, statsBefore.fastLookupHits + 2);
+});
+
+test('W281 guards against in-place descriptor mutation, shader re-registration, fastLookupHitRate clamping, and IIFE isolation', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+  const vsMod = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000082001', code: 'vs' });
+  const fsMod = device.createShaderModule({ label: 'wgpk:fragment:0x0000000000082002', code: 'fs' });
+
+  const mutableDesc = {
+    layout: 'auto',
+    vertex: {
+      module: vsMod,
+      entryPoint: 'vs_v1',
+      buffers: [
+        {
+          arrayStride: 24,
+          stepMode: 'vertex',
+          attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }],
+        },
+      ],
+    },
+    fragment: {
+      module: fsMod,
+      entryPoint: 'fs_v1',
+      targets: [{ format: 'bgra8unorm', writeMask: 0xf }],
+    },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+  };
+
+  const p1 = cache.getOrCreateRenderPipeline(mutableDesc);
+  assert.equal(cache.getFastRenderPipeline(mutableDesc), p1);
+
+  // Mutate entryPoint in-place -> WeakMap memo must detect mutation and compile distinct PSO
+  mutableDesc.vertex.entryPoint = 'vs_v2';
+  assert.equal(cache.getFastRenderPipeline(mutableDesc), null);
+  const p2 = cache.getOrCreateRenderPipeline(mutableDesc);
+  assert.notEqual(p2, p1);
+  assert.equal(cache.getFastRenderPipeline(mutableDesc), p2);
+
+  // Mutate nested target format in-place -> must detect mutation
+  mutableDesc.fragment.targets[0].format = 'rgba8unorm-srgb';
+  assert.equal(cache.getFastRenderPipeline(mutableDesc), null);
+  const p3 = cache.getOrCreateRenderPipeline(mutableDesc);
+  assert.notEqual(p3, p2);
+
+  // Mutate vertex buffer stride in-place -> must detect mutation
+  mutableDesc.vertex.buffers[0].arrayStride = 32;
+  assert.equal(cache.getFastRenderPipeline(mutableDesc), null);
+  const p4 = cache.getOrCreateRenderPipeline(mutableDesc);
+  assert.notEqual(p4, p3);
+
+  // Re-registering an opaque shader module ID invalidates memoized fast entries
+  const opaqueVs = {};
+  const opaqueDesc = { layout: 'auto', vertex: { module: opaqueVs, entryPoint: 'vs_main' } };
+  const pOpaque1 = cache.getOrCreateRenderPipeline(opaqueDesc);
+  assert.equal(cache.getFastRenderPipeline(opaqueDesc), pOpaque1);
+  cache.registerShaderModule(opaqueVs, 0xdeadbeef00001111n);
+  assert.equal(cache.getFastRenderPipeline(opaqueDesc), null);
+  const pOpaque2 = cache.getOrCreateRenderPipeline(opaqueDesc);
+  assert.notEqual(pOpaque2, pOpaque1);
+
+  // Defensive fastLookupHitRate clamping to [0, 1] under corrupted counters
+  cache._stats.fastLookupHits = 50;
+  cache._stats.fastLookupMisses = -20;
+  assert.equal(cache.getStats().fastLookupHitRate, 1);
+
+  cache._stats.fastLookupHits = -10;
+  cache._stats.fastLookupMisses = 5;
+  assert.equal(cache.getStats().fastLookupHitRate, 0);
+  assert.equal(cache.getStats().fastLookupHits, 0);
+
+  cache._stats.fastLookupHits = NaN;
+  cache._stats.fastLookupMisses = Infinity;
+  assert.equal(cache.getStats().fastLookupHitRate, 0);
+  assert.equal(cache.getStats().fastLookupHits, 0);
+  assert.equal(cache.getStats().fastLookupMisses, 0);
+
+  // Option validation for maxFastLookupEntries
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, maxFastLookupEntries: 0 }),
+    /maxFastLookupEntries must be a positive integer/
+  );
+  assert.equal(DEFAULT_MAX_FAST_LOOKUP_ENTRIES, 2048);
+
+  // Classic-Worker sandbox isolation: no W281 internal helpers leaked to global scope
+  const scriptPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    '../web/workers/pipeline_cache.js'
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = { performance, Date };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+
+  assert.equal(sandbox.computeFastRenderIntHash, undefined);
+  assert.equal(sandbox.captureRenderSnapshot, undefined);
+  assert.equal(sandbox.matchesRenderSnapshot, undefined);
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.computeFastDescriptorHash, 'function');
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.getFastRenderPipeline,
+    'function'
+  );
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.getFastComputePipeline,
+    'function'
+  );
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.destroy,
+    'function'
+  );
 });
