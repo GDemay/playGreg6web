@@ -273,6 +273,22 @@ const TIER1_RENDERABLE_FORMATS = Object.freeze(
   new Set(['r16unorm', 'r16snorm', 'rg16unorm', 'rg16snorm', 'rgba16unorm', 'rgba16snorm'])
 );
 
+// Core WebGPU blendable color target formats ("Texture Format Capabilities").
+const BLENDABLE_CORE_FORMATS = Object.freeze(
+  new Set([
+    'r8unorm',
+    'r16float',
+    'rg8unorm',
+    'rg16float',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgb10a2unorm',
+    'rgba16float',
+  ])
+);
+
 const NON_MULTISAMPLEABLE_CORE_FORMATS = Object.freeze(
   new Set([
     'r32uint',
@@ -350,6 +366,53 @@ function isSrgbTextureFormat(format) {
 
 function isFloat32TextureFormat(format) {
   return typeof format === 'string' && FLOAT32_TEXTURE_FORMATS.has(format);
+}
+
+function isIntegerTextureFormat(format) {
+  if (typeof format !== 'string' || format.length === 0) return false;
+  const normalized = format.trim().toLowerCase();
+  return normalized.endsWith('uint') || normalized.endsWith('sint');
+}
+
+// W266: WebGPU forbids blending on integer (*uint/*sint), depth/stencil, compressed, and
+// non-blendable float32 formats (r32float/rg32float/rgba32float without 'float32-blendable').
+function isBlendableTextureFormat(format, device) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return false;
+  const normalized = format.trim().toLowerCase();
+  if (isIntegerTextureFormat(normalized)) return false;
+  if (isDepthOrStencilTextureFormat(normalized) || isBcCompressedFormat(normalized)) return false;
+  if (BLENDABLE_CORE_FORMATS.has(normalized)) return true;
+  if (FLOAT32_TEXTURE_FORMATS.has(normalized)) {
+    return deviceHasFeature(device, 'float32-blendable');
+  }
+  if (normalized === 'rg11b10ufloat') {
+    return deviceHasFeature(device, 'rg11b10ufloat-renderable');
+  }
+  if (TIER1_RENDERABLE_FORMATS.has(normalized)) {
+    return deviceHasFeature(device, 'texture-formats-tier1');
+  }
+  return false;
+}
+
+// W266: strips `.blend` from a GPUColorTargetState when its format is not blendable on `device`,
+// preventing WebGPU pipeline creation from failing with "Format is not blendable".
+function sanitizeColorTargetBlendState(target, device) {
+  if (!target || typeof target !== 'object' || !target.blend) {
+    return { target, stripped: false, reason: null };
+  }
+  const format = typeof target.format === 'string' ? target.format.trim().toLowerCase() : '';
+  if (isBlendableTextureFormat(format, device)) {
+    return { target, stripped: false, reason: null };
+  }
+  const cleanTarget = { ...target };
+  delete cleanTarget.blend;
+  let reason = 'format-not-blendable';
+  if (isIntegerTextureFormat(format)) {
+    reason = 'integer-format-not-blendable';
+  } else if (FLOAT32_TEXTURE_FORMATS.has(format)) {
+    reason = 'float32-format-not-blendable';
+  }
+  return { target: cleanTarget, stripped: true, reason };
 }
 
 function deviceHasFeature(device, featureName) {
@@ -1251,11 +1314,15 @@ function clampViewportToTarget(viewport, targetSize) {
 
   const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
   if (!target) {
+    const safeX = Number.isFinite(Math.fround(rawX)) ? Math.max(0, rawX) || 0 : 0;
+    const safeY = Number.isFinite(Math.fround(rawY)) ? Math.max(0, rawY) || 0 : 0;
+    const safeW = Number.isFinite(Math.fround(rawW)) ? Math.max(0, rawW) || 0 : 0;
+    const safeH = Number.isFinite(Math.fround(rawH)) ? Math.max(0, rawH) || 0 : 0;
     return {
-      x: Math.max(0, rawX) || 0,
-      y: Math.max(0, rawY) || 0,
-      width: Math.max(0, rawW) || 0,
-      height: Math.max(0, rawH) || 0,
+      x: safeX,
+      y: safeY,
+      width: safeW,
+      height: safeH,
       minDepth,
       maxDepth,
     };
@@ -1283,8 +1350,14 @@ function clampViewportToTarget(viewport, targetSize) {
     };
   }
 
-  const x = Math.min(Math.max(0, rawX), targetWidth) || 0;
-  const y = Math.min(Math.max(0, rawY), targetHeight) || 0;
+  let x = Math.min(Math.max(0, rawX), targetWidth) || 0;
+  if (Math.fround(x) > targetWidth) {
+    x = Math.max(0, Math.floor(targetWidth)) || 0;
+  }
+  let y = Math.min(Math.max(0, rawY), targetHeight) || 0;
+  if (Math.fround(y) > targetHeight) {
+    y = Math.max(0, Math.floor(targetHeight)) || 0;
+  }
   let width = Math.min(Math.max(0, rawW), targetWidth - x) || 0;
   let height = Math.min(Math.max(0, rawH), targetHeight - y) || 0;
   if (x + width > targetWidth || Math.fround(x) + Math.fround(width) > targetWidth) {
@@ -1296,12 +1369,32 @@ function clampViewportToTarget(viewport, targetSize) {
   return { x, y, width, height, minDepth, maxDepth };
 }
 
+function isViewportClamped(raw, clamped) {
+  if (!raw || typeof raw !== 'object') return true;
+  return (
+    !Number.isFinite(raw.x) ||
+    !Number.isFinite(raw.y) ||
+    !Number.isFinite(raw.width) ||
+    !Number.isFinite(raw.height) ||
+    !Number.isFinite(raw.minDepth) ||
+    !Number.isFinite(raw.maxDepth) ||
+    clamped.x !== raw.x ||
+    clamped.y !== raw.y ||
+    clamped.width !== raw.width ||
+    clamped.height !== raw.height ||
+    clamped.minDepth !== raw.minDepth ||
+    clamped.maxDepth !== raw.maxDepth
+  );
+}
+
+const MAX_SCISSOR_UINT32 = 0xffffffff;
+
 // Clamps a guest integer scissor rect to [0..targetWidth] x [0..targetHeight].
 function clampScissorToTarget(scissor, targetSize) {
-  const rawX = Math.max(0, Math.floor(finiteOr(scissor && scissor.x, 0))) || 0;
-  const rawY = Math.max(0, Math.floor(finiteOr(scissor && scissor.y, 0))) || 0;
-  const rawW = Math.max(0, Math.floor(finiteOr(scissor && scissor.width, 0))) || 0;
-  const rawH = Math.max(0, Math.floor(finiteOr(scissor && scissor.height, 0))) || 0;
+  const rawX = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.x, 0)))) || 0;
+  const rawY = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.y, 0)))) || 0;
+  const rawW = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.width, 0)))) || 0;
+  const rawH = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.height, 0)))) || 0;
 
   const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
   if (!target) {
@@ -1323,6 +1416,189 @@ function clampScissorToTarget(scissor, targetSize) {
   const width = Math.min(rawW, targetWidth - x) || 0;
   const height = Math.min(rawH, targetHeight - y) || 0;
   return { x, y, width, height };
+}
+
+function isScissorClamped(raw, clamped) {
+  if (!raw || typeof raw !== 'object') return true;
+  return (
+    !Number.isFinite(raw.x) ||
+    !Number.isFinite(raw.y) ||
+    !Number.isFinite(raw.width) ||
+    !Number.isFinite(raw.height) ||
+    clamped.x !== raw.x ||
+    clamped.y !== raw.y ||
+    clamped.width !== raw.width ||
+    clamped.height !== raw.height
+  );
+}
+
+function resolveAttachmentViewSize(view, explicitSize) {
+  if (explicitSize) {
+    const valid = validTargetSize(explicitSize.width, explicitSize.height);
+    if (valid) return valid;
+  }
+  if (!view || typeof view !== 'object') return null;
+  const fromView = validTargetSize(view.width, view.height);
+  if (fromView) return fromView;
+  if (view.texture && typeof view.texture === 'object') {
+    const fromTex = validTargetSize(view.texture.width, view.texture.height);
+    if (fromTex) return fromTex;
+  }
+  return null;
+}
+
+// W266: normalizes a GPURenderPassDescriptor so all attachments share a consistent (width, height),
+// dropping mismatched secondary color / depthStencil / resolveTarget attachments and clamping
+// depthClearValue / readOnly invariants before WebGPU sees the pass descriptor.
+function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
+  if (!descriptor || typeof descriptor !== 'object') {
+    return { descriptor, referenceSize: null, sanitizedCount: 0, warnings: [] };
+  }
+  const colorSizesInput =
+    attachmentSizes && Array.isArray(attachmentSizes.colors) ? attachmentSizes.colors : [];
+  const rawColors = Array.isArray(descriptor.colorAttachments) ? descriptor.colorAttachments : [];
+  const colorSizes = rawColors.map((att, i) =>
+    att ? resolveAttachmentViewSize(att.view, colorSizesInput[i] || null) : null
+  );
+  const rawDs = descriptor.depthStencilAttachment || null;
+  const dsSize = rawDs
+    ? resolveAttachmentViewSize(rawDs.view, attachmentSizes ? attachmentSizes.depthStencil : null)
+    : null;
+
+  let referenceSize = null;
+  for (let i = 0; i < colorSizes.length; i += 1) {
+    if (colorSizes[i]) {
+      referenceSize = colorSizes[i];
+      break;
+    }
+  }
+  if (!referenceSize && dsSize) {
+    referenceSize = dsSize;
+  }
+
+  let sanitizedCount = 0;
+  const warnings = [];
+  let colorsChanged = false;
+  const outColors = rawColors.slice();
+
+  for (let i = 0; i < outColors.length; i += 1) {
+    const att = outColors[i];
+    if (!att) continue;
+    const sz = colorSizes[i];
+    if (referenceSize && sz && (sz.width !== referenceSize.width || sz.height !== referenceSize.height)) {
+      outColors[i] = null;
+      colorsChanged = true;
+      sanitizedCount += 1;
+      warnings.push({
+        key: `rp-color-size-mismatch:${i}:${sz.width}x${sz.height}:${referenceSize.width}x${referenceSize.height}`,
+        message: `render pass: dropped colorAttachments[${i}] (${sz.width}x${sz.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
+      });
+      continue;
+    }
+    if (att.resolveTarget) {
+      const resolveExplicit =
+        attachmentSizes && Array.isArray(attachmentSizes.resolveTargets)
+          ? attachmentSizes.resolveTargets[i] || null
+          : null;
+      const resolveSz = resolveAttachmentViewSize(att.resolveTarget, resolveExplicit);
+      if (
+        referenceSize &&
+        resolveSz &&
+        (resolveSz.width !== referenceSize.width || resolveSz.height !== referenceSize.height)
+      ) {
+        const cleanAtt = { ...att };
+        delete cleanAtt.resolveTarget;
+        outColors[i] = cleanAtt;
+        colorsChanged = true;
+        sanitizedCount += 1;
+        warnings.push({
+          key: `rp-resolve-size-mismatch:${i}:${resolveSz.width}x${resolveSz.height}:${referenceSize.width}x${referenceSize.height}`,
+          message: `render pass: dropped colorAttachments[${i}].resolveTarget (${resolveSz.width}x${resolveSz.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
+        });
+      }
+    }
+  }
+
+  let outDs = rawDs;
+  let dsChanged = false;
+  if (rawDs) {
+    if (referenceSize && dsSize && (dsSize.width !== referenceSize.width || dsSize.height !== referenceSize.height)) {
+      outDs = null;
+      dsChanged = true;
+      sanitizedCount += 1;
+      warnings.push({
+        key: `rp-depth-size-mismatch:${dsSize.width}x${dsSize.height}:${referenceSize.width}x${referenceSize.height}`,
+        message: `render pass: dropped depthStencilAttachment (${dsSize.width}x${dsSize.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
+      });
+    } else {
+      let cleanDs = null;
+      const ensureDsClone = () => {
+        if (!cleanDs) cleanDs = { ...rawDs };
+        return cleanDs;
+      };
+      if (rawDs.depthReadOnly) {
+        if (
+          rawDs.depthLoadOp !== undefined ||
+          rawDs.depthStoreOp !== undefined ||
+          rawDs.depthClearValue !== undefined
+        ) {
+          const cloned = ensureDsClone();
+          delete cloned.depthLoadOp;
+          delete cloned.depthStoreOp;
+          delete cloned.depthClearValue;
+          dsChanged = true;
+          sanitizedCount += 1;
+          warnings.push({
+            key: 'rp-depth-readonly-ops',
+            message: 'render pass: stripped depthLoadOp/depthStoreOp/depthClearValue on depthReadOnly attachment',
+          });
+        }
+      } else if (rawDs.depthLoadOp === 'clear') {
+        const rawClear = rawDs.depthClearValue;
+        const clampedClear = Math.min(1, Math.max(0, finiteOr(rawClear, 1))) || 0;
+        if (!Number.isFinite(rawClear) || clampedClear !== rawClear) {
+          const cloned = ensureDsClone();
+          cloned.depthClearValue = clampedClear;
+          dsChanged = true;
+          sanitizedCount += 1;
+          warnings.push({
+            key: `rp-depth-clear-clamp:${rawClear}`,
+            message: `render pass: clamped depthClearValue ${rawClear} to ${clampedClear}`,
+          });
+        }
+      }
+      if (rawDs.stencilReadOnly) {
+        if (
+          rawDs.stencilLoadOp !== undefined ||
+          rawDs.stencilStoreOp !== undefined ||
+          rawDs.stencilClearValue !== undefined
+        ) {
+          const cloned = ensureDsClone();
+          delete cloned.stencilLoadOp;
+          delete cloned.stencilStoreOp;
+          delete cloned.stencilClearValue;
+          dsChanged = true;
+          sanitizedCount += 1;
+          warnings.push({
+            key: 'rp-stencil-readonly-ops',
+            message: 'render pass: stripped stencilLoadOp/stencilStoreOp/stencilClearValue on stencilReadOnly attachment',
+          });
+        }
+      }
+      if (cleanDs) outDs = cleanDs;
+    }
+  }
+
+  if (!colorsChanged && !dsChanged) {
+    return { descriptor, referenceSize, sanitizedCount: 0, warnings };
+  }
+  const outDescriptor = { ...descriptor, colorAttachments: outColors };
+  if (outDs) {
+    outDescriptor.depthStencilAttachment = outDs;
+  } else {
+    delete outDescriptor.depthStencilAttachment;
+  }
+  return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings };
 }
 
 // ---- Decoders (pure; also used by the tests) ----
@@ -1655,6 +1931,10 @@ class RenderStatePackets {
       presentxBindGroupCacheHits: 0,
       presentxBindGroupCacheMisses: 0,
       fallbackSamplersBound: 0,
+      clampedViewports: 0,
+      clampedScissors: 0,
+      strippedNonBlendableBlends: 0,
+      sanitizedAttachments: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -1665,6 +1945,7 @@ class RenderStatePackets {
     this._suppressPacketError = false;
     this._activePass = null;
     this._activePassTargetSize = null;
+    this._lastPassReferenceSize = null;
   }
 
   getStats() {
@@ -1687,6 +1968,10 @@ class RenderStatePackets {
       presentxBindGroupCacheHits: this.telemetry.presentxBindGroupCacheHits,
       presentxBindGroupCacheMisses: this.telemetry.presentxBindGroupCacheMisses,
       fallbackSamplersBound: this.telemetry.fallbackSamplersBound,
+      clampedViewports: this.telemetry.clampedViewports,
+      clampedScissors: this.telemetry.clampedScissors,
+      strippedNonBlendableBlends: this.telemetry.strippedNonBlendableBlends,
+      sanitizedAttachments: this.telemetry.sanitizedAttachments,
     };
   }
 
@@ -1715,6 +2000,10 @@ class RenderStatePackets {
       presentxBindGroupCacheHits: this.telemetry.presentxBindGroupCacheHits,
       presentxBindGroupCacheMisses: this.telemetry.presentxBindGroupCacheMisses,
       fallbackSamplersBound: this.telemetry.fallbackSamplersBound,
+      clampedViewports: this.telemetry.clampedViewports,
+      clampedScissors: this.telemetry.clampedScissors,
+      strippedNonBlendableBlends: this.telemetry.strippedNonBlendableBlends,
+      sanitizedAttachments: this.telemetry.sanitizedAttachments,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -1771,6 +2060,7 @@ class RenderStatePackets {
             if (ctl.passKind === 'render') ctl.endPass();
             this._activePass = null;
             this._activePassTargetSize = null;
+            this._lastPassReferenceSize = null;
           },
         };
         this.processor._passCommands.push(endCmd);
@@ -1788,7 +2078,16 @@ class RenderStatePackets {
         };
         this._queue((ctl) => {
           if (ctl.passKind !== 'render') return;
-          const vp = clampViewportToTarget(rawViewport, this._getActivePassTargetSize(ctl));
+          const targetSize = this._getActivePassTargetSize(ctl);
+          const vp = clampViewportToTarget(rawViewport, targetSize);
+          if (isViewportClamped(rawViewport, vp)) {
+            this.telemetry.clampedViewports += 1;
+            const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
+            this._recordTelemetryWarningOnce(
+              `clamp-viewport:${targetTag}`,
+              `clamped viewport (${rawViewport.x},${rawViewport.y},${rawViewport.width}x${rawViewport.height},d=${rawViewport.minDepth}..${rawViewport.maxDepth}) to (${vp.x},${vp.y},${vp.width}x${vp.height},d=${vp.minDepth}..${vp.maxDepth}) for target ${targetTag}`
+            );
+          }
           ctl.pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
         });
         return this._count(true);
@@ -1803,14 +2102,23 @@ class RenderStatePackets {
         };
         this._queue((ctl) => {
           if (ctl.passKind !== 'render') return;
-          const sc = clampScissorToTarget(rawScissor, this._getActivePassTargetSize(ctl));
+          const targetSize = this._getActivePassTargetSize(ctl);
+          const sc = clampScissorToTarget(rawScissor, targetSize);
+          if (isScissorClamped(rawScissor, sc)) {
+            this.telemetry.clampedScissors += 1;
+            const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
+            this._recordTelemetryWarningOnce(
+              `clamp-scissor:${targetTag}`,
+              `clamped scissor (${rawScissor.x},${rawScissor.y},${rawScissor.width}x${rawScissor.height}) to (${sc.x},${sc.y},${sc.width}x${sc.height}) for target ${targetTag}`
+            );
+          }
           ctl.pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
         });
         return this._count(true);
       }
       case V2_OPCODES.SET_BLEND_CONSTANT: {
         if (payloadBytes < 16) return this._count(false);
-        const c = [0, 4, 8, 12].map((o) => view.getFloat32(offset + o, true));
+        const c = [0, 4, 8, 12].map((o) => finiteOr(view.getFloat32(offset + o, true), 0) || 0);
         this._queueRender((pass) => pass.setBlendConstant({ r: c[0], g: c[1], b: c[2], a: c[3] }));
         return this._count(true);
       }
@@ -2164,6 +2472,7 @@ class RenderStatePackets {
     this.emptyFragment = null;
     this._activePass = null;
     this._activePassTargetSize = null;
+    this._lastPassReferenceSize = null;
   }
 
   destroy() {
@@ -2428,6 +2737,20 @@ class RenderStatePackets {
         return null;
       }
       fragmentModule = fs.module;
+      if (Array.isArray(targets) && targets.length > 0) {
+        targets = targets.map((t, idx) => {
+          if (!t) return null;
+          const checked = sanitizeColorTargetBlendState(t, this.device);
+          if (checked.stripped) {
+            this.telemetry.strippedNonBlendableBlends += 1;
+            this._recordTelemetryWarningOnce(
+              `strip-blend:${t.format}:${idx}`,
+              `render pipeline ${pipeId} target ${idx}: stripped blend state on non-blendable format ${t.format} (${checked.reason})`
+            );
+          }
+          return checked.target;
+        });
+      }
     } else if (key.colorTargetCount > 0) {
       // No pixel shader but color targets: an empty fragment stage that writes nothing.
       if (!this.emptyFragment) this.emptyFragment = this.device.createShaderModule({ code: EMPTY_FRAGMENT_WGSL });
@@ -3768,8 +4091,13 @@ class RenderStatePackets {
   _textureAttachmentSize(textureId, viewDesc) {
     const textures = this.processor && this.processor.textures;
     const texture = textures && typeof textures.get === 'function' ? textures.get(textureId) : null;
-    if (!texture) return null;
-    const base = validTargetSize(texture.width, texture.height);
+    let base = texture ? validTargetSize(texture.width, texture.height) : null;
+    if (!base) {
+      const meta = this.textureMeta.get(textureId);
+      if (meta) {
+        base = validTargetSize(meta.width, meta.height);
+      }
+    }
     if (!base) return null;
     const mip =
       viewDesc && typeof viewDesc.baseMipLevel === 'number' && viewDesc.baseMipLevel > 0
@@ -3854,8 +4182,17 @@ class RenderStatePackets {
 
   // The exact GPURenderPassDescriptor for a decoded BeginRenderPass (views resolved via `ctl`).
   buildRenderPassDescriptor(decoded, resolvers, ctl) {
+    const colorSizes = [];
     const colorAttachments = decoded.colors.map((c, i) => {
-      if (!c) return null;
+      if (!c) {
+        colorSizes.push(null);
+        return null;
+      }
+      colorSizes.push(
+        c.textureId === SWAPCHAIN_TEXTURE_ID
+          ? this._resolveSwapchainSize(ctl)
+          : this._textureAttachmentSize(c.textureId, c.view)
+      );
       const loadOp = c.loadOp === 'clear' || c.loadOp === 'load' ? c.loadOp : 'load';
       const storeOp = c.storeOp === 'discard' || c.storeOp === 'store' ? c.storeOp : 'store';
       const attachment = { view: resolvers.colors[i](ctl), loadOp, storeOp };
@@ -3871,7 +4208,12 @@ class RenderStatePackets {
     });
     const descriptor = { colorAttachments };
     const d = decoded.depthStencil;
+    let depthStencilSize = null;
     if (d) {
+      depthStencilSize =
+        d.textureId === SWAPCHAIN_TEXTURE_ID
+          ? this._resolveSwapchainSize(ctl)
+          : this._textureAttachmentSize(d.textureId, d.view);
       const ds = { view: resolvers.depthStencil(ctl) };
       if (d.depthLoadOp !== 0) {
         ds.depthLoadOp = nameOf(LOAD_OP_NAMES, d.depthLoadOp);
@@ -3887,7 +4229,19 @@ class RenderStatePackets {
       if (d.stencilReadOnly) ds.stencilReadOnly = true;
       descriptor.depthStencilAttachment = ds;
     }
-    return descriptor;
+    const sanitized = sanitizeRenderPassAttachments(descriptor, {
+      colors: colorSizes,
+      depthStencil: depthStencilSize,
+    });
+    this._lastPassReferenceSize = sanitized.referenceSize;
+    if (sanitized.sanitizedCount > 0) {
+      this.telemetry.sanitizedAttachments += sanitized.sanitizedCount;
+      for (let i = 0; i < sanitized.warnings.length; i += 1) {
+        const w = sanitized.warnings[i];
+        this._recordTelemetryWarningOnce(w.key, w.message);
+      }
+    }
+    return sanitized.descriptor;
   }
 
   // W104: report a missing render-pass attachment once per texture id and device generation
@@ -3952,9 +4306,11 @@ class RenderStatePackets {
       _rsPassOp: 'beginRenderPass',
       _wgpuMeta: { kind: 'beginRenderPass' },
       run: (ctl) => {
-        const pass = ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl));
+        const desc = this.buildRenderPassDescriptor(decoded, resolvers, ctl);
+        const pass = ctl.beginRenderPass(desc);
         this._activePass = pass || ctl.pass || null;
-        this._activePassTargetSize = resolveTargetSize ? resolveTargetSize(ctl) : null;
+        this._activePassTargetSize =
+          this._lastPassReferenceSize || (resolveTargetSize ? resolveTargetSize(ctl) : null);
       },
     });
     return true;
@@ -4671,6 +5027,8 @@ const exportedApi = {
   decodeBindGroupLayoutEntry,
   decodeCreateTexture2,
   sanitizeTextureDescriptor,
+  sanitizeColorTargetBlendState,
+  sanitizeRenderPassAttachments,
   validateComputeDispatch,
   getMaxComputeWorkgroupsPerDimension,
   deviceHasFeature,
@@ -4678,6 +5036,8 @@ const exportedApi = {
   isSrgbTextureFormat,
   isDepthOrStencilTextureFormat,
   isFloat32TextureFormat,
+  isIntegerTextureFormat,
+  isBlendableTextureFormat,
   isStorageBindingSupported,
   resolveStorageTextureFormat,
   isRenderAttachmentSupported,
@@ -4691,6 +5051,7 @@ const exportedApi = {
   validateVertexBufferLayouts,
   DEFAULT_ENTRY_POINTS,
   DEPTH_TEXTURE_FORMATS,
+  BLENDABLE_CORE_FORMATS,
   VERTEX_FORMAT_BYTE_SIZES,
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
