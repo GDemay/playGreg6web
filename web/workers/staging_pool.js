@@ -9,6 +9,8 @@
   const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
   const DEFAULT_MAX_POOL_BYTES = 64 * 1024 * 1024; // 64 MiB
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
+  const DEFAULT_MIN_WARM_CHUNKS = 1;
+  const DEFAULT_IDLE_EVICT_FRAMES = 0;
   const WEBGPU_BUFFER_COPY_ALIGNMENT = 4;
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
 
@@ -209,6 +211,8 @@
         maxPoolBytes = DEFAULT_MAX_POOL_BYTES,
         framesInFlight = DEFAULT_FRAMES_IN_FLIGHT,
         mode = STAGING_MODE.WRITE_BUFFER,
+        minWarmChunks = DEFAULT_MIN_WARM_CHUNKS,
+        idleEvictFrames = DEFAULT_IDLE_EVICT_FRAMES,
       } = options;
 
       if (!device || typeof device.createBuffer !== 'function') {
@@ -216,6 +220,8 @@
       }
       assertPositiveInteger(maxPoolBytes, 'maxPoolBytes');
       assertPositiveInteger(framesInFlight, 'framesInFlight');
+      assertNonNegativeInteger(minWarmChunks, 'minWarmChunks');
+      assertNonNegativeInteger(idleEvictFrames, 'idleEvictFrames');
 
       if (mode !== STAGING_MODE.WRITE_BUFFER && mode !== STAGING_MODE.MAPPED) {
         throw new RangeError(
@@ -244,6 +250,8 @@
       this.maxPoolBytes = maxPoolBytes;
       this.framesInFlight = framesInFlight;
       this.mode = mode;
+      this.minWarmChunks = minWarmChunks;
+      this.idleEvictFrames = idleEvictFrames;
 
       this._destroyed = false;
       this._currentFrame = -1;
@@ -263,6 +271,9 @@
       this._totalChunksAllocated = 0;
       this._allocatedBytes = 0;
       this._peakAllocatedBytes = 0;
+      this._reclaimedChunks = 0;
+      this._reclaimedBytes = 0;
+      this._oversizeAllocations = 0;
       this._bytesUploaded = 0;
       this._allocationCount = 0;
       this._bufferReuseHits = 0;
@@ -335,6 +346,7 @@
         cursor: 0,
         oversized,
         state: 'active',
+        lastUsedFrame: this._currentFrame < 0 ? 0 : this._currentFrame,
         retiredAtFrame: -1,
         gpuDone: false,
         readyToRecycle: false,
@@ -455,7 +467,95 @@
      */
     recycleCompleted() {
       this._assertNotDestroyed();
-      return this._reclaimCompletedInFlight();
+      const recycled = this._reclaimCompletedInFlight();
+      if (this.idleEvictFrames > 0) {
+        this.reclaimIdleChunks(this.idleEvictFrames);
+      }
+      return recycled;
+    }
+
+    /**
+     * Destroy and remove idle recycled (not active, not in-flight) staging chunks
+     * whose `currentFrame - chunk.lastUsedFrame >= maxIdleFrames`, while keeping
+     * at least `minWarmChunks` warm chunks in the recycled pool.
+     *
+     * Prefers evicting oversized burst chunks (largest first) and oldest chunks
+     * first so steady-state standard chunks stay warm.
+     *
+     * @param {number} [maxIdleFrames]
+     * @returns {{ reclaimedChunks: number, reclaimedBytes: number }}
+     */
+    reclaimIdleChunks(maxIdleFrames) {
+      this._assertNotDestroyed();
+
+      let threshold;
+      if (maxIdleFrames === undefined) {
+        if (this.idleEvictFrames <= 0) {
+          return { reclaimedChunks: 0, reclaimedBytes: 0 };
+        }
+        threshold = this.idleEvictFrames;
+      } else {
+        assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+        threshold = maxIdleFrames;
+      }
+
+      if (this._recycledChunks.length <= this.minWarmChunks) {
+        return { reclaimedChunks: 0, reclaimedBytes: 0 };
+      }
+
+      const currentFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+      const candidates = [];
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        const chunk = this._recycledChunks[i];
+        if (
+          chunk &&
+          !chunk.destroyed &&
+          chunk.state === 'recycled' &&
+          currentFrame - chunk.lastUsedFrame >= threshold
+        ) {
+          candidates.push(chunk);
+        }
+      }
+
+      if (candidates.length === 0) {
+        return { reclaimedChunks: 0, reclaimedBytes: 0 };
+      }
+
+      candidates.sort((a, b) => {
+        if (a.oversized !== b.oversized) {
+          return a.oversized ? -1 : 1;
+        }
+        if (a.oversized && a.size !== b.size) {
+          return b.size - a.size;
+        }
+        if (a.lastUsedFrame !== b.lastUsedFrame) {
+          return a.lastUsedFrame - b.lastUsedFrame;
+        }
+        return a.id - b.id;
+      });
+
+      let reclaimedChunks = 0;
+      let reclaimedBytes = 0;
+      for (let i = 0; i < candidates.length; i += 1) {
+        if (this._recycledChunks.length <= this.minWarmChunks) {
+          break;
+        }
+        const chunk = candidates[i];
+        if (chunk.destroyed || chunk.state !== 'recycled') {
+          continue;
+        }
+        const byteSize = chunk.size;
+        this._destroyChunk(chunk);
+        reclaimedChunks += 1;
+        reclaimedBytes += byteSize;
+      }
+
+      if (reclaimedChunks > 0) {
+        this._reclaimedChunks += reclaimedChunks;
+        this._reclaimedBytes += reclaimedBytes;
+      }
+
+      return { reclaimedChunks, reclaimedBytes };
     }
 
     _ensureBudget(allocSize, requestedSize) {
@@ -537,6 +637,7 @@
 
       const [chunk] = this._recycledChunks.splice(bestIndex, 1);
       chunk.cursor = 0;
+      chunk.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
       chunk.retiredAtFrame = -1;
       chunk.gpuDone = false;
       chunk.readyToRecycle = false;
@@ -730,11 +831,18 @@
 
       this._inFlightChunks = stillInFlight;
 
+      let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
+      if (this.idleEvictFrames > 0) {
+        idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
+      }
+
       return {
         frameIndex: this._currentFrame,
         recycledCount,
         recycledChunks: this._recycledChunks.length,
         inFlightChunks: this._inFlightChunks.length,
+        reclaimedChunks: idleReclaim.reclaimedChunks,
+        reclaimedBytes: idleReclaim.reclaimedBytes,
       };
     }
 
@@ -862,6 +970,11 @@
 
       this._attachWorkDoneFence(retiredChunks);
 
+      let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
+      if (this.idleEvictFrames > 0) {
+        idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
+      }
+
       const frameStats = {
         frameIndex: this._currentFrame,
         chunksRetired: retiredChunks.length,
@@ -870,6 +983,8 @@
         bytesUploaded: this._frameBytesUploaded,
         inFlightChunks: this._inFlightChunks.length,
         recycledChunks: this._recycledChunks.length,
+        reclaimedChunks: idleReclaim.reclaimedChunks,
+        reclaimedBytes: idleReclaim.reclaimedBytes,
       };
 
       this._inFrame = false;
@@ -901,10 +1016,11 @@
       const alignedSize = alignBufferSize(byteSize);
       const effectiveAlignment = lcmWithBufferAlignment(alignment);
 
+      const isOversized = alignedSize > this.chunkSize;
       let chunk;
       let offset;
 
-      if (alignedSize > this.chunkSize) {
+      if (isOversized) {
         // Dedicated oversized chunk; preserve _currentChunk for smaller allocations.
         chunk = this._acquireChunk(alignedSize, true);
         offset = 0;
@@ -925,6 +1041,12 @@
           chunk.cursor = alignedSize;
           this._currentChunk = chunk;
         }
+      }
+
+      chunk.lastUsedFrame = this._currentFrame;
+
+      if (isOversized) {
+        this._oversizeAllocations += 1;
       }
 
       if (alignedSize !== byteSize) {
@@ -1197,6 +1319,10 @@
         recycledBuffers: recycledCount,
         allocatedBytes: this._allocatedBytes,
         peakAllocatedBytes: this._peakAllocatedBytes,
+        peakBytesAllocated: this._peakAllocatedBytes,
+        reclaimedChunks: this._reclaimedChunks,
+        reclaimedBytes: this._reclaimedBytes,
+        oversizeAllocations: this._oversizeAllocations,
         bytesUploaded: this._bytesUploaded,
         allocationCount: this._allocationCount,
         bufferReuseHits: this._bufferReuseHits,
@@ -1238,6 +1364,8 @@
     DEFAULT_CHUNK_SIZE,
     DEFAULT_MAX_POOL_BYTES,
     DEFAULT_FRAMES_IN_FLIGHT,
+    DEFAULT_MIN_WARM_CHUNKS,
+    DEFAULT_IDLE_EVICT_FRAMES,
     WEBGPU_BUFFER_COPY_ALIGNMENT,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     BUFFER_USAGE,
