@@ -49,22 +49,34 @@ const char* work_name(Work w) {
     case Work::GpuObjectsCreatedOnUse: return "gpu_objects_created_on_use";
     case Work::GpuObjectsNeverCreated: return "gpu_objects_never_created";
     case Work::ReflectionLaneIndexedUnbound: return "reflection_lane_indexed_unbound";
+    case Work::BindGroupCacheHits: return "bind_group_cache_hits";
+    case Work::BindGroupCacheMisses: return "bind_group_cache_misses";
+    case Work::BindGroupsCreated: return "bind_groups_created";
+    case Work::PipelinesCreated: return "pipelines_created";
     case Work::Count: break;
     }
     return "?";
 }
 
 namespace {
+void count_object_reuse(const bridge::BridgeStats& a, const bridge::BridgeStats& b) {
+    count_work(Work::BindGroupCacheHits, b.bind_group_cache_hits - a.bind_group_cache_hits);
+    count_work(Work::BindGroupCacheMisses, b.bind_group_cache_misses - a.bind_group_cache_misses);
+    count_work(Work::BindGroupsCreated, b.bind_groups_created - a.bind_groups_created);
+    count_work(Work::PipelinesCreated, b.pipelines_created - a.pipelines_created);
+}
+
 // Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the
 // bridge drew, dropped by the bridge if it skipped, otherwise `fallback` (set by the caller's own
 // skip paths).
 class DrawOutcome {
 public:
     explicit DrawOutcome(const bridge::CommandListBridge& b)
-        : bridge_(b), drawn_(b.stats().draws), dropped_(b.stats().draws_skipped) {
+        : bridge_(b), drawn_(b.stats().draws), dropped_(b.stats().draws_skipped), before_(b.stats()) {
         count_work(Work::DrawsIssued);
     }
     ~DrawOutcome() {
+        count_object_reuse(before_, bridge_.stats());
         if (bridge_.stats().draws != drawn_) {
             count_work(Work::DrawsEmitted);
         } else if (bridge_.stats().draws_skipped != dropped_) {
@@ -79,6 +91,7 @@ private:
     const bridge::CommandListBridge& bridge_;
     uint64_t drawn_;
     uint64_t dropped_;
+    bridge::BridgeStats before_;
 };
 }  // namespace
 
@@ -928,7 +941,9 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
         return;
     }
     const uint64_t emitted = bridge_.stats().dispatches;
+    const bridge::BridgeStats before = bridge_.stats();
     bridge_.Dispatch(x, y, z);
+    count_object_reuse(before, bridge_.stats());
     count_work(bridge_.stats().dispatches != emitted ? Work::DispatchesEmitted : Work::DispatchesDroppedByBridge);
 }
 

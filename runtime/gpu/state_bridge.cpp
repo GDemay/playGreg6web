@@ -1779,8 +1779,12 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
         } else {
             const uint64_t heap_misses_before = bind_groups_.heap_index_misses();
             const uint64_t cb_misses_before = bind_groups_.cb_index_misses();
+            const uint64_t hits_before = bind_groups_.hits();
+            const uint64_t misses_before = bind_groups_.misses();
             const d3d::BindGroupLookup lookup = bind_groups_.get_or_build(
                 root_args_, bind_point, plans[g], group.id, &StateBridgeDevice::gpu_va_trampoline, &device_);
+            stats_.bind_group_cache_hits += bind_groups_.hits() - hits_before;
+            stats_.bind_group_cache_misses += bind_groups_.misses() - misses_before;
             stats_.heap_index_misses += bind_groups_.heap_index_misses() - heap_misses_before;
             stats_.cb_index_misses += bind_groups_.cb_index_misses() - cb_misses_before;
             if (lookup.status != d3d::Status::Ok || lookup.bind_group == nullptr) {
@@ -1823,10 +1827,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             b.bind_group_id = bind_group_id;
             b.dynamic_offsets = std::move(offsets);
         }
-        if (track_usage && cached != nullptr &&
-            std::find(scoped_bind_groups_.begin(), scoped_bind_groups_.end(), bind_group_id) ==
-                scoped_bind_groups_.end()) {
-            scoped_bind_groups_.push_back(bind_group_id);
+        if (track_usage && cached != nullptr && scoped_bind_groups_.insert(bind_group_id).second) {
             for (size_t i = 0; i < cached->entries.size(); ++i) {
                 add_usage(cached->entries[i], group.joins[i]);
             }
