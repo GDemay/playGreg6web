@@ -947,6 +947,9 @@ void test_fault_reports() {
         CHECK(run.report["startup"]["modules"][0]["pdata"].boolean == pdata);
         check_fault(run, "trap", kLeaf + 4, kLeaf);
         CHECK(run.report["fault"]["trap_kind"].text == "GUEST_TRAP");
+        CHECK(run.report["code_misses"]["trap"]["count"].number == 1);
+        CHECK(run.report["code_misses"]["trap"]["targets"][0].hex() == kLeaf + 4);
+        CHECK(run.report["code_misses"]["unknown_target"]["count"].number == 0);
         const Json& bt = run.report["backtrace"];
         CHECK(bt["method"].text == (pdata ? "rtl-virtual-unwind" : "stack-scan-call-verified"));
         CHECK(bt["frames"].items.size() == 2);
@@ -969,6 +972,15 @@ void test_fault_reports() {
     check_fault(run, "unknown_target", kUnknownInsideEntry, kEntry);
     CHECK(run.report["fault"]["trap_kind"].text == "INDIRECT_CALL_MISS");
     CHECK(run.report["fault"]["detail"].hex() == kEntry);  // nearest entry below the target
+    {
+        // The dispatch miss is counted and its target listed for recomp seeding (`--entry`).
+        const Json& misses = run.report["code_misses"];
+        CHECK(misses["unknown_target"]["count"].number == 1);
+        CHECK(misses["unknown_target"]["targets"].items.size() == 1);
+        CHECK(misses["unknown_target"]["targets"][0].hex() == kUnknownInsideEntry);
+        CHECK(misses["unknown_resume_target"]["count"].number == 0);
+        CHECK(misses["trap"]["targets"].items.empty());
+    }
     // (the synthetic unwind info describes the Trap scenario's frames; only the caller is exact here)
     CHECK(!run.report["backtrace"]["frames"].items.empty());
     CHECK(run.report["backtrace"]["frames"][0]["return_address"].hex() == kEntryCallsIat);

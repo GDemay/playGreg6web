@@ -148,6 +148,14 @@ struct SurveyEntry {
     uint64_t count = 0;
 };
 
+// Guest addresses the recompiler missed, by fault kind: a count plus the distinct addresses in
+// first-seen order (capped at kMissTargetCap; `count` keeps counting past the cap).
+struct MissList {
+    uint64_t count = 0;
+    std::vector<uint64_t> targets;
+};
+constexpr size_t kMissTargetCap = 256;
+
 struct RecentImport {
     uint64_t seq = 0;
     size_t import_index = 0;
@@ -267,6 +275,11 @@ struct BootState {
     std::vector<RecentImport> recent;  // ring
     size_t recent_next = 0;
     std::vector<SurveyEntry> survey_called;
+    // Code misses (guarded by `mutex`): indirect calls/jumps to no lifted entry, context restores
+    // to no resume target, and traps. Every boot thread's fault is counted, even ones not reported.
+    MissList miss_unknown_target;
+    MissList miss_unknown_resume_target;
+    MissList miss_trap;
     uint64_t tls_callbacks_run = 0;
     bool entry_started = false;
     std::vector<Milestone> milestones;
@@ -817,10 +830,40 @@ const char* fault_kind_id(FaultKind kind) {
 void log_trap();
 void finish_report();
 
+void record_code_miss(FaultKind kind, uint64_t va) {
+    BootState& b = boot();
+    MissList* list = nullptr;
+    switch (kind) {
+        case FaultKind::UnknownTarget:
+            list = &b.miss_unknown_target;
+            break;
+        case FaultKind::UnknownResumeTarget:
+            list = &b.miss_unknown_resume_target;
+            break;
+        case FaultKind::Trap:
+            list = &b.miss_trap;
+            break;
+        default:
+            return;
+    }
+    std::lock_guard<std::mutex> lock(b.mutex);
+    ++list->count;
+    if (list->targets.size() < kMissTargetCap &&
+        std::find(list->targets.begin(), list->targets.end(), va) == list->targets.end()) {
+        list->targets.push_back(va);
+    }
+}
+
 void boot_fault_handler(const FaultInfo* info) {
     BootState& b = boot();
     if (!b.running || info == nullptr) {
         return;  // the default handler logs and aborts
+    }
+    {
+        const auto miss_kind = static_cast<FaultKind>(info->kind);
+        record_code_miss(miss_kind, miss_kind == FaultKind::UnknownResumeTarget && info->state != nullptr
+                                        ? info->state->resume_rip
+                                        : info->va);
     }
     const bool other_thread = !t_running_boot;
     if (other_thread && (b.off_thread_fault == nullptr || b.off_thread_fault_taken.exchange(true))) {
@@ -1789,6 +1832,19 @@ std::string build_report() {
                  ", \"count\": " + std::to_string(e.count) + "}";
         }
         o += b.survey_called.empty() ? "]},\n" : "\n  ]},\n";
+
+        // Code the recompiler missed (addresses only; feed back with `recomp build --entry`).
+        const auto miss_json = [](const char* name, const MissList& m) {
+            std::string j = std::string("\"") + name + "\": {\"count\": " + std::to_string(m.count) +
+                            ", \"targets\": [";
+            for (size_t k = 0; k < m.targets.size(); ++k) {
+                j += (k == 0 ? "" : ", ") + hex(m.targets[k]);
+            }
+            return j + "]}";
+        };
+        o += "  \"code_misses\": {" + miss_json("unknown_target", b.miss_unknown_target) + ", " +
+             miss_json("unknown_resume_target", b.miss_unknown_resume_target) + ", " +
+             miss_json("trap", b.miss_trap) + "},\n";
     }
 
     // Timeline of first calls, threads, address space.
@@ -2749,6 +2805,9 @@ void reset_boot() {
     b.recent.clear();
     b.recent_next = 0;
     b.survey_called.clear();
+    b.miss_unknown_target = {};
+    b.miss_unknown_resume_target = {};
+    b.miss_trap = {};
     b.tls_callbacks_run = 0;
     b.entry_started = false;
     b.milestones.clear();
