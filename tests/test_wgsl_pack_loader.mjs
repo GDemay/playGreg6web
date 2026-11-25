@@ -6,6 +6,8 @@ import {
   WGPK_VERSION,
   WGPK_HEADER_BYTES,
   WGPK_ENTRY_BYTES,
+  DEFAULT_INITIAL_RANGE_BYTES,
+  DEFAULT_MAX_CACHED_WGSL_BYTES,
   SHADER_STAGE,
   STAGE_NAMES,
   fnv1a64,
@@ -13,6 +15,10 @@ import {
   formatHashHex,
   buildWgslPackBuffer,
   parseWgslPack,
+  parseWgslPackIndex,
+  loadFromBuffer,
+  loadIndexFromUrl,
+  loadFromUrl,
   WgslPack,
   WgslPackCache,
 } from '../web/workers/wgsl_pack_loader.js';
@@ -931,4 +937,733 @@ test('G40 WgslPack supports direct dynamic shader registration, overrides, looku
   assert.equal(pack.hasDynamicShader(hVs), false);
   assert.equal(pack.getSource(hVs), SAMPLE_VS_WGSL);
   assert.equal(pack.getStats().dynamicCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W109: HTTP 206 Range index-only & on-demand WGSL streaming tests (#737)
+// ---------------------------------------------------------------------------
+
+function createRangeMockFetch(fileMap, options = {}) {
+  const requests = [];
+  const ignoreRange = Boolean(options.ignoreRange);
+  const rejectHeadStatus = options.rejectHeadStatus || 0;
+  const acceptRangesHeader =
+    options.acceptRangesHeader !== undefined ? options.acceptRangesHeader : 'bytes';
+  const maxChunkBytes = options.maxChunkBytes || Infinity;
+  const beforeResponse = options.beforeResponse || null;
+
+  const readHeader = (headers, name) => {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name);
+    const target = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === target) return String(v);
+    }
+    return null;
+  };
+
+  const mockFetch = async (url, init = {}) => {
+    const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+    const range = readHeader(init && init.headers, 'Range');
+
+    if (beforeResponse) {
+      const override = await beforeResponse({ url, method, range, init, requests });
+      if (override) {
+        requests.push({
+          url,
+          method,
+          range,
+          status: override.status,
+          bytesSent: 0,
+          start: null,
+          end: null,
+        });
+        return override;
+      }
+    }
+
+    const raw = fileMap[url];
+    if (!raw) {
+      requests.push({ url, method, range, status: 404, bytesSent: 0, start: null, end: null });
+      return {
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        headers: new Headers(),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    const total = bytes.byteLength;
+
+    if (method === 'HEAD') {
+      if (rejectHeadStatus) {
+        requests.push({
+          url,
+          method,
+          range,
+          status: rejectHeadStatus,
+          bytesSent: 0,
+          start: null,
+          end: null,
+        });
+        return {
+          ok: false,
+          status: rejectHeadStatus,
+          statusText: 'Method Not Allowed',
+          headers: new Headers(),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      const headers = new Headers({
+        'Content-Length': String(total),
+        'Accept-Ranges': acceptRangesHeader,
+      });
+      requests.push({ url, method, range: null, status: 200, bytesSent: 0, start: null, end: null });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers,
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    if (range && !ignoreRange) {
+      const match = /^bytes=(\d+)-(\d+)$/i.exec(range.trim());
+      if (!match) {
+        requests.push({ url, method, range, status: 416, bytesSent: 0, start: null, end: null });
+        return {
+          ok: false,
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: new Headers({ 'Content-Range': `bytes */${total}` }),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      const reqStart = Number(match[1]);
+      const reqEnd = Number(match[2]);
+      if (reqStart >= total || reqEnd < reqStart) {
+        requests.push({ url, method, range, status: 416, bytesSent: 0, start: reqStart, end: reqEnd });
+        return {
+          ok: false,
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: new Headers({ 'Content-Range': `bytes */${total}` }),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      const clampedEnd = Math.min(reqEnd, total - 1, reqStart + maxChunkBytes - 1);
+      const slice = bytes.slice(reqStart, clampedEnd + 1);
+      requests.push({
+        url,
+        method,
+        range,
+        status: 206,
+        bytesSent: slice.byteLength,
+        start: reqStart,
+        end: clampedEnd,
+      });
+      return {
+        ok: true,
+        status: 206,
+        statusText: 'Partial Content',
+        headers: new Headers({
+          'Content-Range': `bytes ${reqStart}-${clampedEnd}/${total}`,
+          'Content-Length': String(slice.byteLength),
+          'Accept-Ranges': 'bytes',
+        }),
+        async arrayBuffer() {
+          return slice.buffer;
+        },
+      };
+    }
+
+    // Full 200 OK response
+    const copy = bytes.slice();
+    requests.push({
+      url,
+      method,
+      range,
+      status: 200,
+      bytesSent: copy.byteLength,
+      start: 0,
+      end: copy.byteLength - 1,
+    });
+    return {
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({
+        'Content-Length': String(copy.byteLength),
+      }),
+      async arrayBuffer() {
+        return copy.buffer;
+      },
+    };
+  };
+
+  return { fetch: mockFetch, requests };
+}
+
+test('W109 loadIndexFromUrl parses header + table via HTTP 206 Range (single-step and two-step) without fetching payload bytes', async () => {
+  assert.equal(DEFAULT_INITIAL_RANGE_BYTES, 64 * 1024);
+  assert.equal(DEFAULT_MAX_CACHED_WGSL_BYTES, 32 * 1024 * 1024);
+
+  // Build a pack with 10 entries: tableEnd = 16 + 10 * 20 = 216 bytes, payloads start at byte 216.
+  const entries = [];
+  for (let i = 0; i < 10; i += 1) {
+    const stage = (i % 3) + 1;
+    const wgsl = `// shader #${i} ${'x'.repeat(200)}\n@compute @workgroup_size(${i + 1}) fn main_${i}() {}`;
+    entries.push({
+      hash: fnv1a64(`ranged-shader-${i}`),
+      stage,
+      wgsl,
+    });
+  }
+  const packBuf = buildWgslPackBuffer(entries, { flags: 0x1234 });
+  const tableEnd = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
+  assert.equal(tableEnd, 216);
+  assert.ok(packBuf.byteLength > 2500);
+
+  // 1. Single-step range load: initialRangeBytes exactly covers header + table (216 bytes) -> 1 roundtrip, 0 payload bytes!
+  const singleMock = createRangeMockFetch({ '/packs/large.wgsl.pack': packBuf });
+  const singlePack = await loadIndexFromUrl('/packs/large.wgsl.pack', {
+    fetch: singleMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+
+  assert.equal(singlePack.mode, 'ranged');
+  assert.equal(singlePack.flags, 0x1234);
+  assert.equal(singlePack.size, 10);
+  assert.equal(singlePack.byteLength, packBuf.byteLength);
+  assert.equal(singlePack.dataStart, tableEnd);
+  assert.equal(singleMock.requests.length, 1);
+  assert.equal(singleMock.requests[0].range, `bytes=0-${tableEnd - 1}`);
+  assert.equal(singleMock.requests[0].bytesSent, tableEnd);
+  assert.ok(singleMock.requests[0].end < tableEnd, 'must not fetch any payload bytes');
+
+  const singleStats = singlePack.stats();
+  assert.equal(singleStats.mode, 'ranged');
+  assert.equal(singleStats.rangeFetches, 1);
+  assert.equal(singleStats.cacheHits, 0);
+  assert.equal(singleStats.cacheMisses, 0);
+  assert.equal(singleStats.cachedWgslBytes, 0);
+  assert.equal(singleStats.decodedCount, 0);
+
+  // Metadata inspection and existence checks trigger zero additional HTTP requests
+  assert.equal(singlePack.has(entries[0].hash), true);
+  assert.equal(singlePack.has(entries[9].hash), true);
+  assert.equal(singlePack.has(0x999999n), false);
+  assert.equal(singlePack.listEntries().length, 10);
+  assert.equal(singleMock.requests.length, 1);
+
+  // Sync getWgsl / getSource on an unfetched ranged entry throws a clear actionable error
+  assert.throws(() => singlePack.getWgsl(entries[0].hash), /getWgslAsync/i);
+
+  // 2. Two-step range load: initialRangeBytes = 64 (< tableEnd 216) -> fetches 0-63 then 64-215, zero payload bytes!
+  const twoStepMock = createRangeMockFetch({ '/packs/large.wgsl.pack': packBuf });
+  const twoStepPack = await WgslPack.loadIndexFromUrl('/packs/large.wgsl.pack', {
+    fetch: twoStepMock.fetch,
+    initialRangeBytes: 64,
+  });
+
+  assert.equal(twoStepPack.mode, 'ranged');
+  assert.equal(twoStepPack.size, 10);
+  assert.equal(twoStepMock.requests.length, 2);
+  assert.equal(twoStepMock.requests[0].range, 'bytes=0-63');
+  assert.equal(twoStepMock.requests[1].range, `bytes=64-${tableEnd - 1}`);
+  const totalBytesDownloaded = twoStepMock.requests.reduce((acc, r) => acc + r.bytesSent, 0);
+  assert.equal(totalBytesDownloaded, tableEnd);
+  assert.equal(twoStepPack.stats().rangeFetches, 2);
+
+  // 3. Header-only initial range (initialRangeBytes = 16) also works in two exact steps (0-15, then 16-215)
+  const headerOnlyMock = createRangeMockFetch({ '/packs/large.wgsl.pack': packBuf });
+  const headerOnlyPack = await loadIndexFromUrl('/packs/large.wgsl.pack', {
+    fetch: headerOnlyMock.fetch,
+    initialRangeBytes: WGPK_HEADER_BYTES,
+  });
+  assert.equal(headerOnlyPack.size, 10);
+  assert.equal(headerOnlyMock.requests.length, 2);
+  assert.equal(headerOnlyMock.requests[0].range, 'bytes=0-15');
+  assert.equal(headerOnlyMock.requests[1].range, `bytes=16-${tableEnd - 1}`);
+});
+
+test('W109 getWgslAsync fetches exact byte ranges, caches hits, deduplicates concurrent calls, and recovers from errors', async () => {
+  const utf8Fs = `// UTF-8 range shader 日本語 🚀\n${SAMPLE_FS_WGSL}`;
+  const hVs = fnv1a64('async-vs');
+  const hFs = fnv1a64('async-fs');
+  const hCs = fnv1a64('async-cs');
+  const hEmpty = fnv1a64('async-empty');
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: utf8Fs },
+    { hash: hCs, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+    { hash: hEmpty, stage: SHADER_STAGE.COMPUTE, wgsl: '' },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+
+  // Gate to deterministically hold concurrent requests in flight
+  let releaseGate = null;
+  let gateActive = false;
+  let failNextCs = false;
+
+  const mock = createRangeMockFetch(
+    { '/packs/on-demand.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (failNextCs && range && !range.startsWith('bytes=0-')) {
+          failNextCs = false;
+          return {
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+            headers: new Headers(),
+            async arrayBuffer() {
+              return new ArrayBuffer(0);
+            },
+          };
+        }
+        if (gateActive && range && !range.startsWith('bytes=0-')) {
+          await new Promise((resolve) => {
+            releaseGate = resolve;
+          });
+        }
+        return null;
+      },
+    }
+  );
+
+  const pack = await loadIndexFromUrl('/packs/on-demand.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  assert.equal(mock.requests.length, 1);
+
+  // 1. Fetch UTF-8 fragment shader by exact byte range
+  const fsMeta = pack.listEntries().find((e) => e.hash === hFs);
+  const fsWgsl = await pack.getWgslAsync(hFs);
+  assert.equal(fsWgsl, utf8Fs);
+  assert.equal(mock.requests.length, 2);
+  assert.equal(mock.requests[1].range, `bytes=${fsMeta.offset}-${fsMeta.offset + fsMeta.length - 1}`);
+  assert.equal(mock.requests[1].bytesSent, fsMeta.length);
+
+  let stats = pack.stats();
+  assert.equal(stats.rangeFetches, 2);
+  assert.equal(stats.cacheMisses, 1);
+  assert.equal(stats.cacheHits, 0);
+  assert.equal(stats.cachedWgslBytes, fsMeta.length);
+  assert.equal(stats.decodedCount, 1);
+
+  // Once cached, even sync getWgsl() works while resident in LRU
+  assert.equal(pack.getWgsl(hFs), utf8Fs);
+
+  // 2. Repeated getWgslAsync (via hex string) hits LRU cache with 0 extra HTTP fetches
+  const fsWgslCached = await pack.getWgslAsync(formatHashHex(hFs));
+  assert.equal(fsWgslCached, utf8Fs);
+  assert.equal(mock.requests.length, 2);
+  stats = pack.stats();
+  assert.equal(stats.rangeFetches, 2);
+  assert.equal(stats.cacheHits, 1);
+  assert.equal(stats.cacheMisses, 1);
+
+  // 3. Unknown hash returns null with 0 HTTP fetches
+  assert.equal(await pack.getWgslAsync(0xdeadbeefn), null);
+  assert.equal(mock.requests.length, 2);
+
+  // 4. Empty 0-byte payload resolves to '' with 0 HTTP fetches
+  assert.equal(await pack.getWgslAsync(hEmpty), '');
+  assert.equal(mock.requests.length, 2);
+
+  // 5. Concurrent calls for the same hash (mixed BigInt / hex formats) deduplicate to 1 HTTP Range fetch
+  gateActive = true;
+  const p1 = pack.getWgslAsync(hVs);
+  const p2 = pack.getWgslAsync(formatHashHex(hVs));
+  const p3 = pack.getWgslAsync(formatHashHex(hVs).slice(2).toUpperCase());
+  const p4 = pack.getWgslAsync(hVs);
+
+  // Wait a microtask tick so the single fetch reaches the gate
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(typeof releaseGate, 'function', 'expected exactly one in-flight fetch to hit gate');
+  gateActive = false;
+  releaseGate();
+
+  const [r1, r2, r3, r4] = await Promise.all([p1, p2, p3, p4]);
+  assert.equal(r1, SAMPLE_VS_WGSL);
+  assert.equal(r2, SAMPLE_VS_WGSL);
+  assert.equal(r3, SAMPLE_VS_WGSL);
+  assert.equal(r4, SAMPLE_VS_WGSL);
+  assert.equal(mock.requests.length, 3, 'all 4 concurrent calls must share 1 Range request');
+  assert.equal(pack.stats().inFlightDeduplications, 3);
+
+  // 6. Failed in-flight fetch cleans up so subsequent retry succeeds
+  failNextCs = true;
+  await assert.rejects(() => pack.getWgslAsync(hCs), /HTTP 500/);
+  const csWgsl = await pack.getWgslAsync(hCs);
+  assert.equal(csWgsl, SAMPLE_CS_WGSL);
+});
+
+test('W109 ranged LRU cache enforces maxCachedWgslBytes, refreshes recency on hit, and evicts oldest entries', async () => {
+  // Four 100-byte shaders
+  const makeWgsl = (tag) => {
+    const prefix = `@compute @workgroup_size(1) fn fn_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = 100 - prefix.length - suffix.length;
+    return `${prefix}${'a'.repeat(padLen)}${suffix}`;
+  };
+
+  const hA = fnv1a64('lru-A');
+  const hB = fnv1a64('lru-B');
+  const hC = fnv1a64('lru-C');
+  const hD = fnv1a64('lru-D');
+  const wgslA = makeWgsl('A');
+  const wgslB = makeWgsl('B');
+  const wgslC = makeWgsl('C');
+  const wgslD = makeWgsl('D');
+  assert.equal(new TextEncoder().encode(wgslA).byteLength, 100);
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hA, stage: SHADER_STAGE.COMPUTE, wgsl: wgslA },
+    { hash: hB, stage: SHADER_STAGE.COMPUTE, wgsl: wgslB },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, wgsl: wgslC },
+    { hash: hD, stage: SHADER_STAGE.COMPUTE, wgsl: wgslD },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+  const mock = createRangeMockFetch({ '/packs/lru.wgsl.pack': packBuf });
+
+  // Budget = 220 bytes -> holds at most 2 shaders (200 bytes)
+  const pack = await loadIndexFromUrl('/packs/lru.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCachedWgslBytes: 220,
+  });
+
+  // Load A and B -> cache: [A, B], 200 bytes
+  assert.equal(await pack.getWgslAsync(hA), wgslA);
+  assert.equal(await pack.getWgslAsync(hB), wgslB);
+  assert.equal(pack.stats().cachedWgslBytes, 200);
+  assert.equal(pack.stats().cachedWgslEntries, 2);
+  assert.equal(pack.stats().wgslCacheEvictions, 0);
+  assert.equal(mock.requests.length, 3); // 1 index + A + B
+
+  // Access A -> cache hit refreshes recency -> cache order becomes [B, A]
+  assert.equal(await pack.getWgslAsync(hA), wgslA);
+  assert.equal(pack.stats().cacheHits, 1);
+  assert.equal(mock.requests.length, 3);
+
+  // Load C -> exceeds 220 -> evicts oldest (B) -> cache: [A, C], 200 bytes
+  assert.equal(await pack.getWgslAsync(hC), wgslC);
+  assert.equal(pack.stats().cachedWgslBytes, 200);
+  assert.equal(pack.stats().wgslCacheEvictions, 1);
+  assert.equal(mock.requests.length, 4);
+
+  // A must still be cached (0 extra fetches)
+  assert.equal(await pack.getWgslAsync(hA), wgslA);
+  assert.equal(pack.stats().cacheHits, 2);
+  assert.equal(mock.requests.length, 4);
+
+  // B was evicted, so fetching B issues a new Range request and evicts C (since A was just touched)
+  assert.equal(await pack.getWgslAsync(hB), wgslB);
+  assert.equal(pack.stats().wgslCacheEvictions, 2);
+  assert.equal(pack.stats().cachedWgslBytes, 200);
+  assert.equal(mock.requests.length, 5);
+
+  // clearWgslCache resets cached bytes to 0 and forces next access to re-fetch
+  assert.equal(pack.clearWgslCache(), 2);
+  assert.equal(pack.stats().cachedWgslBytes, 0);
+  assert.equal(await pack.getWgslAsync(hD), wgslD);
+  assert.equal(pack.stats().cachedWgslBytes, 100);
+  assert.equal(mock.requests.length, 6);
+
+  // Single shader larger than maxCachedWgslBytes returns WGSL cleanly without caching or looping
+  const tinyMock = createRangeMockFetch({ '/packs/lru.wgsl.pack': packBuf });
+  const tinyCachePack = await loadIndexFromUrl('/packs/lru.wgsl.pack', {
+    fetch: tinyMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCachedWgslBytes: 50,
+  });
+  assert.equal(await tinyCachePack.getWgslAsync(hA), wgslA);
+  assert.equal(tinyCachePack.stats().cachedWgslBytes, 0);
+  assert.equal(tinyCachePack.stats().cachedWgslEntries, 0);
+  // Second fetch re-fetches because it exceeded cache budget
+  assert.equal(await tinyCachePack.getWgslAsync(hA), wgslA);
+  assert.equal(tinyMock.requests.length, 3);
+});
+
+test('W109 loadIndexFromUrl falls back seamlessly to full buffer mode when server returns 200 OK', async () => {
+  const hVs = fnv1a64('fallback-200-vs');
+  const hFs = fnv1a64('fallback-200-fs');
+  const packBuf = buildWgslPackBuffer([
+    { hash: hVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+
+  const mock = createRangeMockFetch({ '/packs/no-range.wgsl.pack': packBuf }, { ignoreRange: true });
+  const pack = await loadIndexFromUrl('/packs/no-range.wgsl.pack', { fetch: mock.fetch });
+
+  assert.equal(pack.mode, 'buffer');
+  assert.equal(pack.size, 2);
+  assert.equal(mock.requests.length, 1);
+  assert.equal(mock.requests[0].status, 200);
+  assert.equal(pack.stats().mode, 'buffer');
+  assert.equal(pack.stats().rangeFetches, 0);
+
+  // Both sync getWgsl and async getWgslAsync resolve immediately with zero extra network calls
+  assert.equal(pack.getWgsl(hVs), SAMPLE_VS_WGSL);
+  assert.equal(await pack.getWgslAsync(hFs), SAMPLE_FS_WGSL);
+  assert.equal(await pack.getWgslAsync(0x12345n), null);
+  assert.equal(mock.requests.length, 1);
+});
+
+test('W109 loadFromUrl with streamThresholdBytes automatically switches between buffer and ranged modes', async () => {
+  const hSmall = fnv1a64('small-pack-shader');
+  const smallPackBuf = buildWgslPackBuffer([
+    { hash: hSmall, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+  ]);
+
+  const hLarge1 = fnv1a64('large-pack-shader-1');
+  const hLarge2 = fnv1a64('large-pack-shader-2');
+  const largeWgsl1 = `// ${'A'.repeat(2048)}\n${SAMPLE_VS_WGSL}`;
+  const largeWgsl2 = `// ${'B'.repeat(2048)}\n${SAMPLE_FS_WGSL}`;
+  const largePackBuf = buildWgslPackBuffer([
+    { hash: hLarge1, stage: SHADER_STAGE.VERTEX, wgsl: largeWgsl1 },
+    { hash: hLarge2, stage: SHADER_STAGE.FRAGMENT, wgsl: largeWgsl2 },
+  ]);
+  const largeTableEnd = WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES;
+
+  assert.ok(smallPackBuf.byteLength < 512);
+  assert.ok(largePackBuf.byteLength > 4000);
+
+  // 1. Default (no streamThresholdBytes): single GET -> buffer mode (legacy behavior unchanged)
+  const defaultMock = createRangeMockFetch({ '/packs/large.wgsl.pack': largePackBuf });
+  const defaultPack = await loadFromUrl('/packs/large.wgsl.pack', { fetch: defaultMock.fetch });
+  assert.equal(defaultPack.mode, 'buffer');
+  assert.equal(defaultMock.requests.length, 1);
+  assert.equal(defaultMock.requests[0].method, 'GET');
+  assert.equal(defaultMock.requests[0].range, null);
+
+  // 2. Small pack (<= threshold) stays full-buffer via HEAD + GET
+  const smallMock = createRangeMockFetch({ '/packs/small.wgsl.pack': smallPackBuf });
+  const smallPack = await loadFromUrl('/packs/small.wgsl.pack', {
+    fetch: smallMock.fetch,
+    streamThresholdBytes: 1024,
+  });
+  assert.equal(smallPack.mode, 'buffer');
+  assert.equal(smallMock.requests[0].method, 'HEAD');
+  assert.equal(smallMock.requests[1].method, 'GET');
+  assert.equal(smallPack.getWgsl(hSmall), SAMPLE_CS_WGSL);
+
+  // 3. Large pack (> threshold) switches to ranged mode via HEAD + Range (no full download!)
+  const largeMock = createRangeMockFetch({ '/packs/large.wgsl.pack': largePackBuf });
+  const largePack = await loadFromUrl('/packs/large.wgsl.pack', {
+    fetch: largeMock.fetch,
+    streamThresholdBytes: 1024,
+    initialRangeBytes: largeTableEnd,
+  });
+  assert.equal(largePack.mode, 'ranged');
+  assert.equal(largeMock.requests.length, 2);
+  assert.equal(largeMock.requests[0].method, 'HEAD');
+  assert.equal(largeMock.requests[1].status, 206);
+  assert.equal(largeMock.requests[1].bytesSent, largeTableEnd);
+  assert.equal(await largePack.getWgslAsync(hLarge2), largeWgsl2);
+  assert.equal(largeMock.requests.length, 3);
+
+  // 4. Server rejecting HEAD with 405 falls back cleanly to initial Range probe (zero duplicate index fetch!)
+  const noHeadMock = createRangeMockFetch(
+    { '/packs/large.wgsl.pack': largePackBuf, '/packs/small.wgsl.pack': smallPackBuf },
+    { rejectHeadStatus: 405 }
+  );
+  const noHeadLarge = await loadFromUrl('/packs/large.wgsl.pack', {
+    fetch: noHeadMock.fetch,
+    streamThresholdBytes: 1024,
+    initialRangeBytes: largeTableEnd,
+  });
+  assert.equal(noHeadLarge.mode, 'ranged');
+  assert.equal(noHeadMock.requests.length, 2); // HEAD (405) + 1 Range probe reused as index
+  assert.equal(await noHeadLarge.getWgslAsync(hLarge1), largeWgsl1);
+
+  const noHeadSmall = await loadFromUrl('/packs/small.wgsl.pack', {
+    fetch: noHeadMock.fetch,
+    streamThresholdBytes: 1024,
+  });
+  assert.equal(noHeadSmall.mode, 'buffer');
+  assert.equal(noHeadSmall.getWgsl(hSmall), SAMPLE_CS_WGSL);
+
+  // 5. Server advertising Accept-Ranges: none on HEAD falls back to full GET buffer mode
+  const noRangeMock = createRangeMockFetch(
+    { '/packs/large.wgsl.pack': largePackBuf },
+    { acceptRangesHeader: 'none' }
+  );
+  const noRangePack = await loadFromUrl('/packs/large.wgsl.pack', {
+    fetch: noRangeMock.fetch,
+    streamThresholdBytes: 1024,
+  });
+  assert.equal(noRangePack.mode, 'buffer');
+  assert.equal(noRangePack.getWgsl(hLarge1), largeWgsl1);
+});
+
+test('W109 WgslPackCache integrates ranged packs with getWgslAsync, GPUShaderModule async compile, prewarm, dynamic overrides, and stats', async () => {
+  const hRangedVs = fnv1a64('cache-ranged-vs');
+  const hRangedFs = fnv1a64('cache-ranged-fs');
+  const hBufCs = fnv1a64('cache-buf-cs');
+
+  const rangedBuf = buildWgslPackBuffer([
+    { hash: hRangedVs, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: hRangedFs, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+  const bufPack = buildWgslPackBuffer([
+    { hash: hBufCs, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+  ]);
+  const rangedTableEnd = WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES;
+
+  const mock = createRangeMockFetch({ '/packs/world.wgsl.pack': rangedBuf });
+  const cache = new WgslPackCache({
+    fetch: mock.fetch,
+    maxCachedWgslBytes: 4096,
+    initialRangeBytes: rangedTableEnd,
+  });
+
+  const rangedPack = await cache.loadIndexFromUrl('/packs/world.wgsl.pack');
+  assert.equal(rangedPack.mode, 'ranged');
+  assert.equal(cache.has(hRangedVs), true);
+  assert.equal(cache.hasShader(hRangedFs, 'fragment'), true);
+  assert.equal(cache.getStats().mode, 'ranged');
+  assert.equal(cache.getStats().rangeFetches, 1);
+
+  // Load a second full-buffer pack via loadFromBuffer -> mixed mode telemetry
+  cache.loadFromBuffer(bufPack, 'boot.wgsl.pack');
+  assert.equal(cache.getStats().mode, 'mixed');
+
+  // getWgslAsync works uniformly across ranged pack, buffer pack, stage mismatch, and missing hashes
+  assert.equal(await cache.getWgslAsync(hBufCs), SAMPLE_CS_WGSL);
+  assert.equal(await cache.getWgslAsync(hRangedVs, 'fragment'), null);
+  assert.equal(await cache.getWgslAsync(hRangedVs, 'vertex'), SAMPLE_VS_WGSL);
+  assert.equal(await cache.getWgslAsync(0xbeefn), null);
+  assert.equal(cache.getStats().rangeFetches, 2);
+  assert.equal(cache.getStats().cacheMisses, 1);
+  assert.equal(cache.getStats().cacheHits, 1); // buffer pack async hit
+
+  // Dynamic override supersedes ranged static shader with zero HTTP fetches
+  const hotFs = '@fragment fn fs_hot() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }';
+  cache.registerDynamicShader(hRangedFs, 'fragment', hotFs, { override: true, label: 'live' });
+  assert.equal(await cache.getWgslAsync(hRangedFs), hotFs);
+  assert.equal(cache.getStats().rangeFetches, 2); // no fetch for overridden ranged shader!
+
+  // Unregister override -> fetches underlying ranged static shader on demand
+  cache.unregisterDynamicShader(hRangedFs);
+  const gpu = createMockGpuDevice();
+  const modFs = await cache.getOrCreateShaderModuleAsync(gpu.device, hRangedFs, 'gta6');
+  assert.equal(modFs.code, SAMPLE_FS_WGSL);
+  assert.equal(cache.getStats().rangeFetches, 3);
+
+  // Second getOrCreateShaderModuleAsync hits device module cache with zero extra fetches
+  const modFs2 = await cache.getOrCreateShaderModuleAsync(gpu.device, hRangedFs, 'gta6');
+  assert.equal(modFs2, modFs);
+  assert.equal(cache.getStats().rangeFetches, 3);
+
+  // prewarm() works seamlessly across ranged + buffer packs
+  const warm = await cache.prewarm(gpu.device, [hRangedVs, hRangedFs, hBufCs]);
+  assert.equal(warm.total, 3);
+  assert.equal(warm.cached, 1);
+  assert.equal(warm.compiled, 2);
+  assert.equal(warm.modules.get(hRangedVs).code, SAMPLE_VS_WGSL);
+  assert.equal(warm.modules.get(hBufCs).code, SAMPLE_CS_WGSL);
+
+  // loadFromUrl on cache with streamThresholdBytes
+  const thresholdPack = await cache.loadFromUrl('/packs/world.wgsl.pack', {
+    packName: 'world-auto',
+    streamThresholdBytes: 64,
+    initialRangeBytes: rangedTableEnd,
+  });
+  assert.equal(thresholdPack.mode, 'ranged');
+
+  // Module-level loadFromBuffer matches parseWgslPack
+  const directBuf = loadFromBuffer(bufPack);
+  assert.equal(directBuf.mode, 'buffer');
+  assert.equal(directBuf.getWgsl(hBufCs), SAMPLE_CS_WGSL);
+});
+
+test('W109 ranged index parser & fetcher validate corrupt headers, bounds, UTF-8, and options', async () => {
+  const h1 = fnv1a64('val-1');
+  const h2 = fnv1a64('val-2');
+  const validBuf = buildWgslPackBuffer([
+    { hash: h1, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: h2, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+  ]);
+  const validBytes = new Uint8Array(validBuf);
+  const tableEnd = WGPK_HEADER_BYTES + 2 * WGPK_ENTRY_BYTES;
+
+  // Invalid option ranges
+  const mockOk = createRangeMockFetch({ '/ok.wgsl.pack': validBuf });
+  await assert.rejects(
+    () => loadIndexFromUrl('/ok.wgsl.pack', { fetch: mockOk.fetch, maxCachedWgslBytes: -1 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/ok.wgsl.pack', { fetch: mockOk.fetch, initialRangeBytes: 8 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadFromUrl('/ok.wgsl.pack', { fetch: mockOk.fetch, streamThresholdBytes: -10 }),
+    RangeError
+  );
+
+  // HTTP 404
+  await assert.rejects(
+    () => loadIndexFromUrl('/missing.wgsl.pack', { fetch: mockOk.fetch }),
+    /HTTP 404/
+  );
+
+  // Bad magic via Range
+  const badMagic = validBytes.slice();
+  badMagic.set(new TextEncoder().encode('BAD!'), 0);
+  const badMagicMock = createRangeMockFetch({ '/bad.wgsl.pack': badMagic });
+  await assert.rejects(
+    () => loadIndexFromUrl('/bad.wgsl.pack', { fetch: badMagicMock.fetch }),
+    /invalid wgpk pack magic/i
+  );
+
+  // Out-of-bounds entry against totalBytes reported by Content-Range
+  const oobEntry = validBytes.slice();
+  new DataView(oobEntry.buffer).setUint32(WGPK_HEADER_BYTES + 16, 999999, true);
+  const oobMock = createRangeMockFetch({ '/oob.wgsl.pack': oobEntry });
+  await assert.rejects(
+    () => loadIndexFromUrl('/oob.wgsl.pack', { fetch: oobMock.fetch, initialRangeBytes: tableEnd }),
+    /out of bounds/i
+  );
+
+  // Invalid UTF-8 payload fetched on demand rejects without caching
+  const badUtf8 = validBytes.slice();
+  badUtf8[tableEnd] = 0xff;
+  const badUtf8Mock = createRangeMockFetch({ '/bad-utf8.wgsl.pack': badUtf8 });
+  const badUtf8Pack = await loadIndexFromUrl('/bad-utf8.wgsl.pack', {
+    fetch: badUtf8Mock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  await assert.rejects(() => badUtf8Pack.getWgslAsync(h1), /not valid utf-8/i);
+  assert.equal(badUtf8Pack.stats().cachedWgslBytes, 0);
+  // Valid sibling entry still loads fine!
+  assert.equal(await badUtf8Pack.getWgslAsync(h2), SAMPLE_FS_WGSL);
+
+  // parseWgslPackIndex works directly on an index-only slice (no payload bytes present)
+  const indexOnlySlice = validBytes.slice(0, tableEnd);
+  const directIndexPack = parseWgslPackIndex(indexOnlySlice, {
+    url: '/ok.wgsl.pack',
+    totalBytes: validBytes.byteLength,
+    fetch: mockOk.fetch,
+  });
+  assert.equal(directIndexPack.mode, 'ranged');
+  assert.equal(await directIndexPack.getWgslAsync(h1), SAMPLE_VS_WGSL);
 });
