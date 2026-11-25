@@ -11,6 +11,7 @@
 (function (root) {
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
   const UNIFORM_BUFFER_SIZE = 96; // 24 x 4-byte lanes, 16-byte aligned WGSL struct
+  const UNIFORM_FLOAT_COUNT = UNIFORM_BUFFER_SIZE / 4;
   const DEFAULT_PRESENTATION_FORMAT = 'bgra8unorm';
   const DEFAULT_TARGET_FPS = 30;
   const DOUBLE_BUFFER_SLOTS = 2;
@@ -408,7 +409,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
    * }} [params]
    * @returns {Uint8Array}
    */
-  function packPresenterUniforms(params = {}) {
+  function writePresenterUniforms(params, f32, u32) {
     const pixelFormat = params.pixelFormat ?? BINK_PIXEL_FORMAT.RGBA8;
     const colorSpace = params.colorSpace ?? YUV_COLOR_SPACE.BT709;
     const colorRange = params.colorRange ?? YUV_COLOR_RANGE.LIMITED;
@@ -424,10 +425,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     validateOpacity(opacity);
 
     const matrix = YUV_RANGE_MATRICES[colorRange][colorSpace];
-    const buffer = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
-    const u32 = new Uint32Array(buffer);
-    const f32 = new Float32Array(buffer);
-
     const packedFlags =
       ((flags >>> 0) |
         (colorRange === YUV_COLOR_RANGE.FULL ? UNIFORM_FLAG_FULL_RANGE : 0) |
@@ -468,7 +465,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     f32[21] = matrix.offset[1];
     f32[22] = matrix.offset[2];
     f32[23] = matrix.offset[3];
+  }
 
+  function packPresenterUniforms(params = {}) {
+    const buffer = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
+    const u32 = new Uint32Array(buffer);
+    const f32 = new Float32Array(buffer);
+    writePresenterUniforms(params, f32, u32);
     return new Uint8Array(buffer);
   }
 
@@ -569,6 +572,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       height: 0,
       uvWidth: 0,
       uvHeight: 0,
+      generation: 0,
       rgba: null,
       y: null,
       u: null,
@@ -576,6 +580,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       uv: null,
       a: null,
       bindGroup: null,
+      bindGroupKey: null,
     };
   }
 
@@ -599,6 +604,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     slot.uv = null;
     slot.a = null;
     slot.bindGroup = null;
+    slot.bindGroupKey = null;
+    slot.generation = 0;
     slot.format = null;
     slot.width = 0;
     slot.height = 0;
@@ -691,6 +698,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._uniformBuffer = null;
       this._dummyTexture = null;
       this._dummyTextureView = null;
+      this._textureGeneration = 0;
+
+      // Pre-allocated uniform scratch buffer (96 bytes = 24 x f32/u32 lanes) reused across frames.
+      this._uniformScratchF32 = new Float32Array(UNIFORM_FLOAT_COUNT);
+      this._uniformScratchU32 = new Uint32Array(
+        this._uniformScratchF32.buffer,
+        this._uniformScratchF32.byteOffset,
+        UNIFORM_FLOAT_COUNT
+      );
+      this._uniformLastUploadedU32 = new Uint32Array(UNIFORM_FLOAT_COUNT);
+      this._hasUploadedUniforms = false;
       this._uniformsDirty = true;
       this._lastUniformOpacity = null;
 
@@ -709,6 +727,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._bytesUploaded = 0;
       this._directZeroCopyUploads = 0;
       this._chromaRepackUploads = 0;
+      this._bindGroupCacheHits = 0;
+      this._bindGroupCacheMisses = 0;
+      this._uniformWritesSkipped = 0;
       this._destroyed = false;
     }
 
@@ -764,6 +785,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return this._destroyed;
     }
 
+    get framesPresented() {
+      return this._presentedFrames;
+    }
+
+    get bindGroupCacheHits() {
+      return this._bindGroupCacheHits;
+    }
+
+    get bindGroupCacheMisses() {
+      return this._bindGroupCacheMisses;
+    }
+
+    get uniformWritesSkipped() {
+      return this._uniformWritesSkipped;
+    }
+
     _assertNotDestroyed() {
       if (this._destroyed) {
         throw new Error('BinkVideoPresenter has been destroyed');
@@ -789,6 +826,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._pendingUploads = [];
     }
 
+    _invalidateBindGroupCache() {
+      for (let i = 0; i < this._slots.length; i += 1) {
+        this._slots[i].bindGroup = null;
+        this._slots[i].bindGroupKey = null;
+      }
+    }
+
     _selectWriteSlot(format, width, height) {
       const formatOrSizeChanged =
         this._hasFrame &&
@@ -801,7 +845,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._destroyAllSlots();
         this._resizeCount += 1;
         this._planeReallocations += 1;
-        this._uniformsDirty = true;
+        if (this._pixelFormat !== format) {
+          this._uniformsDirty = true;
+        }
         return 0;
       }
 
@@ -886,12 +932,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
       }
 
+      this._textureGeneration += 1;
+      slot.generation = this._textureGeneration;
       slot.format = format;
       slot.width = width;
       slot.height = height;
       slot.uvWidth = uvWidth;
       slot.uvHeight = uvHeight;
       slot.bindGroup = null;
+      slot.bindGroupKey = null;
       return slot;
     }
 
@@ -1236,6 +1285,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (chromaOrder !== undefined && chromaOrder !== null && chromaOrder !== this._chromaOrder) {
         this._chromaOrder = chromaOrder;
+        this._invalidateBindGroupCache();
         this._uniformsDirty = true;
       }
       if (this._pixelFormat !== format) {
@@ -1390,6 +1440,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (chromaOrder !== undefined && chromaOrder !== null && chromaOrder !== this._chromaOrder) {
         this._chromaOrder = chromaOrder;
+        this._invalidateBindGroupCache();
         this._uniformsDirty = true;
       }
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.NV12) {
@@ -1586,9 +1637,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     _ensureSlotBindGroup(slotIndex) {
       const slot = this._slots[slotIndex];
-      if (slot.bindGroup) {
+      const bindGroupKey = `${slot.generation}|${slot.format}|${slot.width}x${slot.height}|${this._chromaOrder}`;
+      if (slot.bindGroup && slot.bindGroupKey === bindGroupKey) {
+        this._bindGroupCacheHits += 1;
         return slot.bindGroup;
       }
+      this._bindGroupCacheMisses += 1;
 
       const primaryView =
         slot.format === BINK_PIXEL_FORMAT.RGBA8 ? slot.rgba.view : slot.y.view;
@@ -1620,27 +1674,54 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           { binding: 5, resource: aView },
         ],
       });
+      slot.bindGroupKey = bindGroupKey;
 
       return slot.bindGroup;
     }
 
     _syncUniformBuffer(opacity) {
-      if (!this._uniformsDirty && this._lastUniformOpacity === opacity) {
-        return;
+      if (this._hasUploadedUniforms && !this._uniformsDirty && this._lastUniformOpacity === opacity) {
+        this._uniformWritesSkipped += 1;
+        return false;
       }
-      const packed = packPresenterUniforms({
-        pixelFormat: this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8,
-        colorSpace: this._colorSpace,
-        colorRange: this._colorRange,
-        chromaOrder: this._chromaOrder,
-        opacity,
-        uvTransform: this._uvTransform,
-      });
+
+      writePresenterUniforms(
+        {
+          pixelFormat: this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8,
+          colorSpace: this._colorSpace,
+          colorRange: this._colorRange,
+          chromaOrder: this._chromaOrder,
+          opacity,
+          uvTransform: this._uvTransform,
+        },
+        this._uniformScratchF32,
+        this._uniformScratchU32
+      );
+
+      if (this._hasUploadedUniforms) {
+        let identical = true;
+        for (let i = 0; i < UNIFORM_FLOAT_COUNT; i += 1) {
+          if (this._uniformScratchU32[i] !== this._uniformLastUploadedU32[i]) {
+            identical = false;
+            break;
+          }
+        }
+        if (identical) {
+          this._uniformsDirty = false;
+          this._lastUniformOpacity = opacity;
+          this._uniformWritesSkipped += 1;
+          return false;
+        }
+      }
+
       if (this._device.queue && typeof this._device.queue.writeBuffer === 'function') {
-        this._device.queue.writeBuffer(this._uniformBuffer, 0, packed);
+        this._device.queue.writeBuffer(this._uniformBuffer, 0, this._uniformScratchF32);
       }
+      this._uniformLastUploadedU32.set(this._uniformScratchU32);
+      this._hasUploadedUniforms = true;
       this._uniformsDirty = false;
       this._lastUniformOpacity = opacity;
+      return true;
     }
 
     /**
@@ -1765,7 +1846,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      */
     setUvTransform(scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0) {
       this._assertNotDestroyed();
-      this._uvTransform = [scaleX, scaleY, offsetX, offsetY];
+      if (
+        this._uvTransform[0] === scaleX &&
+        this._uvTransform[1] === scaleY &&
+        this._uvTransform[2] === offsetX &&
+        this._uvTransform[3] === offsetY
+      ) {
+        return;
+      }
+      this._uvTransform[0] = scaleX;
+      this._uvTransform[1] = scaleY;
+      this._uvTransform[2] = offsetX;
+      this._uvTransform[3] = offsetY;
       this._uniformsDirty = true;
     }
 
@@ -1809,6 +1901,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       validateChromaOrder(chromaOrder);
       if (chromaOrder !== this._chromaOrder) {
         this._chromaOrder = chromaOrder;
+        this._invalidateBindGroupCache();
         this._uniformsDirty = true;
       }
     }
@@ -1947,6 +2040,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         directZeroCopyUploads: this._directZeroCopyUploads,
         chromaRepackUploads: this._chromaRepackUploads,
         bytesUploaded: this._bytesUploaded,
+        bindGroupCacheHits: this._bindGroupCacheHits,
+        bindGroupCacheMisses: this._bindGroupCacheMisses,
+        uniformWritesSkipped: this._uniformWritesSkipped,
         slotCount: this._slots.length,
         activeSlotIndex: this._activeSlotIndex,
         hasFrame: this._hasFrame,
@@ -1981,6 +2077,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._uniformBuffer.destroy();
       }
       this._uniformBuffer = null;
+      this._hasUploadedUniforms = false;
+      this._uniformsDirty = true;
+      this._lastUniformOpacity = null;
 
       this._uploadScratch = null;
       this._shaderModule = null;
