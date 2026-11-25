@@ -50,9 +50,39 @@
   ]);
 
   const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
+  const BC_SLICED_3D_FEATURE = 'texture-compression-bc-sliced-3d';
 
   const HOOK_ORIG_CREATE_TEXTURE = '__playgta6OrigHandleCreateTexture';
   const HOOK_ORIG_WRITE_TEXTURE = '__playgta6OrigHandleWriteTexture';
+
+  function isBcCompressedFormat(format) {
+    return typeof format === 'string' && format.startsWith('bc');
+  }
+
+  function deviceSupportsBcSliced3d(device) {
+    const features = device && device.features;
+    if (!features) {
+      return false;
+    }
+    if (typeof features.has === 'function') {
+      return Boolean(features.has(BC_SLICED_3D_FEATURE));
+    }
+    if (Array.isArray(features)) {
+      return features.includes(BC_SLICED_3D_FEATURE);
+    }
+    if (typeof features[Symbol.iterator] === 'function') {
+      for (const item of features) {
+        if (item === BC_SLICED_3D_FEATURE) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (typeof features === 'object') {
+      return Boolean(features[BC_SLICED_3D_FEATURE]);
+    }
+    return false;
+  }
 
   function toNonNegativeInt(value) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -504,12 +534,16 @@
     constructor(processor, next) {
       this.processor = processor;
       this.next = next || null;
+      this._bc3dFallbackTextures = new Set();
+      this._bc3dFallbackTextureObjs = new WeakSet();
       this.stats = {
         created: 0,
         errors: 0,
         createTexture2Count: 0,
         rowPitchRepackCount: 0,
         sabCopyCount: 0,
+        bc3dFallbacks: 0,
+        bc3dFallbackUploadsSkipped: 0,
       };
       this.lastError = null;
     }
@@ -525,6 +559,8 @@
         createTexture2Count: toNonNegativeInt(this.stats.createTexture2Count),
         rowPitchRepackCount: toNonNegativeInt(this.stats.rowPitchRepackCount),
         sabCopyCount: toNonNegativeInt(this.stats.sabCopyCount),
+        bc3dFallbacks: toNonNegativeInt(this.stats.bc3dFallbacks),
+        bc3dFallbackUploadsSkipped: toNonNegativeInt(this.stats.bc3dFallbackUploadsSkipped),
       };
     }
 
@@ -572,6 +608,7 @@
     }
 
     destroyResource(id) {
+      this._bc3dFallbackTextures.delete(id);
       if (this.next && typeof this.next.destroyResource === 'function') {
         this.next.destroyResource(id);
       }
@@ -582,6 +619,15 @@
      * into a standalone `ArrayBuffer`-backed `Uint8Array` before uploading.
      */
     writeTexture(destination, data, dataLayout, size) {
+      if (
+        destination &&
+        destination.texture &&
+        this._bc3dFallbackTextureObjs.has(destination.texture)
+      ) {
+        this.stats.bc3dFallbackUploadsSkipped += 1;
+        return { uploaded: false, copiedFromSab: false, skippedBc3dFallback: true };
+      }
+
       const p = this.processor;
       if (!p || !p.device || !p.device.queue || typeof p.device.queue.writeTexture !== 'function') {
         this._error('writeTexture: device.queue.writeTexture is unavailable');
@@ -617,6 +663,18 @@
       }
       if (!destination || typeof destination !== 'object' || !destination.texture) {
         throw new TypeError('copyBufferToTexture requires a destination with a texture');
+      }
+
+      if (this._bc3dFallbackTextureObjs.has(destination.texture)) {
+        this.stats.bc3dFallbackUploadsSkipped += 1;
+        return {
+          repacked: false,
+          copiedFromSab: false,
+          bytesPerRow: 0,
+          originalBytesPerRow: Number.isInteger(source.bytesPerRow) ? source.bytesPerRow : 0,
+          staged: false,
+          skippedBc3dFallback: true,
+        };
       }
 
       const normSize = normalizeCopySize(copySize);
@@ -878,6 +936,11 @@
         return;
       }
 
+      if (this._bc3dFallbackTextures.has(textureId)) {
+        this.stats.bc3dFallbackUploadsSkipped += 1;
+        return;
+      }
+
       const rawData = new Uint8Array(
         view.buffer,
         view.byteOffset + payloadOffset + WRITE_TEXTURE_HEADER_BYTES,
@@ -965,6 +1028,7 @@
 
     _create(id, descriptor, isV2 = true) {
       const p = this.processor;
+      this._bc3dFallbackTextures.delete(id);
       if (typeof p._destroyTextureIfPresent === 'function') {
         p._destroyTextureIfPresent(id);
       }
@@ -972,15 +1036,69 @@
       if (this.next && typeof this.next.destroyResource === 'function') {
         this.next.destroyResource(id);
       }
+
+      let effectiveDescriptor = descriptor;
+      let bc3dFallback = false;
+      if (
+        descriptor &&
+        descriptor.dimension === '3d' &&
+        isBcCompressedFormat(descriptor.format) &&
+        !deviceSupportsBcSliced3d(p && p.device)
+      ) {
+        // W108 (#734): WebGPU rejects 3D BC-compressed textures without texture-compression-bc-sliced-3d.
+        bc3dFallback = true;
+        effectiveDescriptor = {
+          ...descriptor,
+          size: descriptor.size ? { ...descriptor.size } : descriptor.size,
+          format: 'rgba8unorm',
+        };
+        if (Array.isArray(descriptor.viewFormats)) {
+          const filteredViewFormats = descriptor.viewFormats.filter(
+            (vf) => !isBcCompressedFormat(vf)
+          );
+          if (filteredViewFormats.length > 0) {
+            effectiveDescriptor.viewFormats = filteredViewFormats;
+          } else {
+            delete effectiveDescriptor.viewFormats;
+          }
+        }
+      }
+
       let texture;
       try {
-        texture = p.device.createTexture(descriptor);
+        texture = p.device.createTexture(effectiveDescriptor);
       } catch (err) {
         const label = isV2 ? 'CreateTexture2' : 'CreateTexture';
         this._error(`${label} ${id}: ${String(err && err.message ? err.message : err)}`);
         return;
       }
       p.textures.set(id, texture);
+      if (bc3dFallback) {
+        this._bc3dFallbackTextures.add(id);
+        if (texture && typeof texture === 'object') {
+          this._bc3dFallbackTextureObjs.add(texture);
+        }
+        this.stats.bc3dFallbacks += 1;
+        // Propagate fallback metadata to chained RenderStatePackets so CreateBindGroup2 /
+        // BeginRenderPass views never pass a bc* view format against the rgba8unorm texture.
+        if (this.next && this.next.textureMeta && typeof this.next.textureMeta.set === 'function') {
+          this.next.textureMeta.set(id, {
+            id,
+            requestedFormat: descriptor.format,
+            format: effectiveDescriptor.format,
+            bcFallback: true,
+            formatFallback: true,
+            usage: effectiveDescriptor.usage,
+            dimension: effectiveDescriptor.dimension,
+            sampleCount: effectiveDescriptor.sampleCount || 1,
+            width: effectiveDescriptor.size ? effectiveDescriptor.size.width : 1,
+            height: effectiveDescriptor.size ? effectiveDescriptor.size.height : 1,
+            depthOrArrayLayers: effectiveDescriptor.size
+              ? effectiveDescriptor.size.depthOrArrayLayers
+              : 1,
+          });
+        }
+      }
       let textureView = null;
       if (texture && typeof texture.createView === 'function') {
         textureView = texture.createView();
@@ -1064,6 +1182,9 @@
     repackRowsTo256,
     copyFromSharedIfNeeded,
     isSharedArrayBufferView,
+    isBcCompressedFormat,
+    deviceSupportsBcSliced3d,
+    BC_SLICED_3D_FEATURE,
     CREATE_TEXTURE,
     CREATE_TEXTURE_BYTES,
     WRITE_TEXTURE,
