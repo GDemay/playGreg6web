@@ -20,6 +20,7 @@ const {
   alignUp,
   alignUniformSliceSize,
   copyForWriteBuffer,
+  coalesceDirtyRanges,
   DynamicUniformRing,
 } = uniformRingMod;
 
@@ -1855,4 +1856,460 @@ test('W177: alignedBytesWasted accurately tracks alignment padding across empty,
   assert.equal(stats.peakFrameBytes, 256 + 256 + 256 + 512);
 
   ring.destroy();
+});
+
+test('W193: coalesceDirtyRanges merges adjacent, overlapping, out-of-order, gap-bridging, and wrap-around intervals', () => {
+  assert.equal(typeof coalesceDirtyRanges, 'function');
+
+  // Adjacent + overlapping + out-of-order merge into one contiguous range.
+  assert.deepEqual(
+    coalesceDirtyRanges([
+      { start: 512, end: 768 },
+      { start: 0, end: 256 },
+      { start: 256, end: 512 },
+      { start: 256, end: 384 },
+    ]),
+    [{ start: 0, end: 768, byteLength: 768, writeCount: 4 }]
+  );
+
+  // Wrap-around (tail + head with clean gap in middle) produces 2 sorted coalesced runs.
+  assert.deepEqual(
+    coalesceDirtyRanges([
+      { start: 1536, end: 1792 },
+      { start: 1792, end: 2048 },
+      { start: 0, end: 256 },
+      { start: 256, end: 512 },
+    ]),
+    [
+      { start: 0, end: 512, byteLength: 512, writeCount: 2 },
+      { start: 1536, end: 2048, byteLength: 512, writeCount: 2 },
+    ]
+  );
+
+  // Gap bridging when maxGapBytes >= gap merges disjoint ranges.
+  assert.deepEqual(
+    coalesceDirtyRanges(
+      [
+        { start: 0, end: 256 },
+        { start: 512, end: 768 },
+      ],
+      256
+    ),
+    [{ start: 0, end: 768, byteLength: 768, writeCount: 2 }]
+  );
+
+  // Empty & zero-length ranges are ignored cleanly.
+  assert.deepEqual(coalesceDirtyRanges([]), []);
+  assert.deepEqual(coalesceDirtyRanges([{ start: 256, end: 256 }]), []);
+
+  // Invalid inputs reject cleanly.
+  assert.throws(() => coalesceDirtyRanges('bad'), TypeError);
+  assert.throws(() => coalesceDirtyRanges([{ start: 512, end: 256 }]), RangeError);
+  assert.throws(() => coalesceDirtyRanges([], -4), RangeError);
+
+  // Classic-worker VM isolation still holds with new W193 exports.
+  const source = readFileSync(new URL('../web/workers/uniform_ring.js', import.meta.url), 'utf8');
+  const ctx = vm.createContext({ console });
+  ctx.self = ctx;
+  vm.runInContext(source, ctx, { filename: 'uniform_ring.js' });
+  vm.runInContext('const coalesceDirtyRanges = () => []; const insertDirtyRange = () => {};', ctx);
+  assert.equal(typeof ctx.PlayGta6UniformRing.coalesceDirtyRanges, 'function');
+});
+
+test('W193: beginBatch() / endBatch() / flush() / flushDirty() coalesce contiguous allocations with full telemetry', () => {
+  const { device, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 4096,
+    framesInFlight: 2,
+  });
+
+  ring.beginFrame();
+
+  // 1. Nested beginBatch() / endBatch() defers auto-flush until outermost batch ends.
+  const b1 = ring.beginBatch();
+  assert.equal(b1.batchDepth, 1);
+  assert.equal(ring.batchDepth, 1);
+  assert.equal(ring.isBatchActive, true);
+
+  const a0 = ring.pushConstants(new Uint32Array([10, 11, 12, 13])); // [0, 256)
+  const b2 = ring.beginBatch();
+  assert.equal(b2.batchDepth, 2);
+  const a1 = ring.pushConstants(new Uint32Array([20, 21, 22, 23])); // [256, 512)
+  const a2 = ring.pushConstants(new Uint32Array([30, 31, 32, 33])); // [512, 768)
+
+  const innerEnd = ring.endBatch();
+  assert.equal(innerEnd.batchDepth, 1);
+  assert.equal(innerEnd.writeBufferCalls, 0);
+  assert.equal(queueWrites.length, 0, 'inner endBatch must not flush before outer batch ends');
+  assert.deepEqual(ring.getDirtyRanges(), [
+    { start: 0, end: 768, byteLength: 768, writeCount: 3 },
+  ]);
+
+  const a3 = ring.pushConstants(new Uint32Array([40, 41, 42, 43])); // [768, 1024)
+  const outerEnd = ring.endBatch();
+  assert.equal(outerEnd.batchDepth, 0);
+  assert.equal(outerEnd.uploadedBytes, 1024);
+  assert.equal(outerEnd.bytesUploaded, 1024);
+  assert.equal(outerEnd.drawCount, 4);
+  assert.equal(outerEnd.stagedWrites, 4);
+  assert.equal(outerEnd.writeBufferCalls, 1);
+  assert.equal(outerEnd.coalescedWrites, 3);
+  assert.equal(outerEnd.dirtyRangesFlushed, 1);
+  assert.equal(ring.isBatchActive, false);
+  assert.equal(queueWrites.length, 1, '4 sequential writes must coalesce into 1 writeBuffer call');
+  assert.equal(queueWrites[0].bufferOffset, 0);
+  assert.equal(queueWrites[0].byteLength, 1024);
+
+  // Verify exact byte fidelity + 256B alignment and zero-padded tails.
+  const gpuBytes = ring.currentBuffer._data;
+  const draws = [a0, a1, a2, a3];
+  for (let i = 0; i < draws.length; i += 1) {
+    assert.equal(draws[i].dynamicOffset, i * 256);
+    assert.equal(draws[i].dynamicOffset % 256, 0);
+    const u32 = new Uint32Array(gpuBytes.buffer, draws[i].dynamicOffset, 4);
+    assert.deepEqual(Array.from(u32), [(i + 1) * 10, (i + 1) * 10 + 1, (i + 1) * 10 + 2, (i + 1) * 10 + 3]);
+    for (let p = 16; p < 256; p += 1) {
+      assert.equal(gpuBytes[draws[i].dynamicOffset + p], 0);
+    }
+  }
+
+  // 2. beginBatch() + endBatch({ autoFlush: false }) leaves dirty range pending for flushDirty().
+  ring.beginBatch();
+  ring.writeStaged(new Uint32Array([50, 51, 52, 53])); // [1024, 1280)
+  ring.writeStaged(new Uint32Array([60, 61, 62, 63])); // [1280, 1536)
+  const deferredEnd = ring.endBatch({ autoFlush: false });
+  assert.equal(deferredEnd.batchDepth, 0);
+  assert.equal(deferredEnd.writeBufferCalls, 0);
+  assert.equal(queueWrites.length, 1);
+  assert.equal(ring.getStats().dirtyRangeCount, 1);
+
+  const flushRes = ring.flushDirty();
+  assert.deepEqual(flushRes, {
+    uploadedBytes: 512,
+    bytesUploaded: 512,
+    drawCount: 2,
+    stagedWrites: 2,
+    writeBufferCalls: 1,
+    coalescedWrites: 1,
+    dirtyRangesFlushed: 1,
+  });
+  assert.equal(queueWrites.length, 2);
+  assert.equal(queueWrites[1].bufferOffset, 1024);
+  assert.equal(queueWrites[1].byteLength, 512);
+
+  // 3. Unmatched endBatch() is a safe no-op.
+  const noopEnd = ring.endBatch();
+  assert.equal(noopEnd.writeBufferCalls, 0);
+  assert.equal(noopEnd.batchDepth, 0);
+
+  // 4. Lifetime telemetry reflects both coalesced flushes accurately.
+  const stats = ring.getStats();
+  assert.equal(stats.writeBufferCalls, 2);
+  assert.equal(stats.coalescedWrites, 4); // 3 + 1
+  assert.equal(stats.stagedWritesFlushed, 6);
+  assert.equal(stats.stagedWritesFlushed, stats.writeBufferCalls + stats.coalescedWrites);
+  assert.equal(stats.bytesUploaded, 1536);
+  assert.equal(stats.totalBytesUploaded, 1536);
+  assert.equal(stats.dirtyRangeCount, 0);
+  assert.equal(stats.batchActive, false);
+
+  ring.destroy();
+});
+
+test('W193: immediateFlush mode preserves immediate per-write flush outside a batch and coalesces inside beginBatch()', () => {
+  const { device, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 4096,
+    framesInFlight: 2,
+    immediateFlush: true,
+  });
+
+  assert.equal(ring.immediateFlush, true);
+  ring.beginFrame();
+
+  // Outside a batch: each pushConstants() immediately uploads via queue.writeBuffer.
+  ring.pushConstants(new Uint32Array([1, 2, 3, 4]));
+  ring.pushConstants(new Uint32Array([5, 6, 7, 8]));
+  ring.pushConstants(new Uint32Array([9, 10, 11, 12]));
+  assert.equal(queueWrites.length, 3);
+  assert.equal(ring.getStats().writeBufferCalls, 3);
+  assert.equal(ring.getStats().coalescedWrites, 0);
+  assert.equal(ring.getStats().bytesUploaded, 768);
+
+  // Inside a batch: 4 pushes defer and coalesce into ONE writeBuffer call on endBatch().
+  ring.beginBatch();
+  for (let i = 0; i < 4; i += 1) {
+    ring.pushConstants(new Uint32Array([100 + i, 200 + i, 300 + i, 400 + i]));
+  }
+  assert.equal(queueWrites.length, 3, 'batch must defer immediate writes until endBatch/flush');
+  const batchRes = ring.endBatch();
+  assert.equal(batchRes.writeBufferCalls, 1);
+  assert.equal(batchRes.coalescedWrites, 3);
+  assert.equal(batchRes.bytesUploaded, 1024);
+  assert.equal(queueWrites.length, 4);
+  assert.equal(queueWrites[3].bufferOffset, 768);
+  assert.equal(queueWrites[3].byteLength, 1024);
+
+  // writeStaged() always stays staged until flushDirty(), even under immediateFlush: true.
+  const s0 = ring.writeStaged(new Uint32Array([501, 502, 503, 504]));
+  const s1 = ring.writeStaged(new Uint32Array([601, 602, 603, 604]));
+  assert.equal(s0.staged, true);
+  assert.equal(s1.staged, true);
+  assert.equal(queueWrites.length, 4);
+  const stagedFlush = ring.flushDirty();
+  assert.equal(stagedFlush.writeBufferCalls, 1);
+  assert.equal(stagedFlush.coalescedWrites, 1);
+  assert.equal(stagedFlush.bytesUploaded, 512);
+  assert.equal(queueWrites.length, 5);
+
+  const stats = ring.getStats();
+  assert.equal(stats.writeBufferCalls, 5);
+  assert.equal(stats.coalescedWrites, 4);
+  assert.equal(stats.bytesUploaded, 768 + 1024 + 512);
+  assert.equal(stats.stagedWritesFlushed, 9);
+
+  ring.destroy();
+});
+
+test('W193: wrap-around writes coalesce tail and head runs, enforce 256-byte alignment, and preserve byte fidelity', () => {
+  const { device, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 2048, // 8 x 256B aligned uniform slots
+    framesInFlight: 1,
+    allowWrap: true,
+  });
+
+  assert.equal(ring.allowWrap, true);
+  ring.beginFrame();
+
+  // Fill slots 0..5 ([0, 1536)) and flush so cursor rests at 1536.
+  for (let i = 0; i < 6; i += 1) {
+    const a = ring.pushConstants(new Uint32Array([0xa000 + i, i * 17, i * 31, 0x1111]));
+    assert.equal(a.dynamicOffset, i * 256);
+    assert.equal(a.wrapped, false);
+  }
+  const initFlush = ring.flushDirty();
+  assert.equal(initFlush.writeBufferCalls, 1);
+  assert.equal(initFlush.coalescedWrites, 5);
+  assert.equal(initFlush.bytesUploaded, 1536);
+  assert.equal(ring.cursor, 1536);
+
+  // Batch 4 draws across the 2048B wrap boundary:
+  // - Draw 6: [1536, 1792) (tail)
+  // - Draw 7: [1792, 2048) (tail, coalesces with Draw 6 -> [1536, 2048))
+  // - Draw 8: wraps to [0, 256) (head)
+  // - Draw 9: [256, 512) (head, coalesces with Draw 8 -> [0, 512))
+  ring.beginBatch();
+  const d6 = ring.pushConstants(new Uint32Array([0xb006, 61, 62, 63]));
+  const d7 = ring.pushConstants(new Uint32Array([0xb007, 71, 72, 73]));
+  const d8 = ring.pushConstants(new Uint32Array([0xb008, 81, 82, 83]));
+  const d9 = ring.pushConstants(new Uint32Array([0xb009, 91, 92, 93]));
+
+  assert.equal(d6.dynamicOffset, 1536);
+  assert.equal(d6.wrapped, false);
+  assert.equal(d7.dynamicOffset, 1792);
+  assert.equal(d7.wrapped, false);
+  assert.equal(d8.dynamicOffset, 0);
+  assert.equal(d8.wrapped, true);
+  assert.equal(d9.dynamicOffset, 256);
+  assert.equal(d9.wrapped, false);
+
+  for (const a of [d6, d7, d8, d9]) {
+    assert.equal(a.dynamicOffset % 256, 0, 'wrapped offsets must remain 256-byte aligned');
+    assert.ok(a.dynamicOffset + a.alignedSize <= 2048, 'wrapped slice must stay in-bounds');
+  }
+
+  // Dirty ranges before flush: exact 2 coalesced ranges skipping clean middle [512, 1536).
+  assert.deepEqual(ring.getDirtyRanges(), [
+    { start: 0, end: 512, byteLength: 512, writeCount: 2 },
+    { start: 1536, end: 2048, byteLength: 512, writeCount: 2 },
+  ]);
+
+  const wrapFlush = ring.endBatch();
+  assert.equal(wrapFlush.writeBufferCalls, 2, '4 wrap-around draws must coalesce into 2 writeBuffer calls');
+  assert.equal(wrapFlush.coalescedWrites, 2);
+  assert.equal(wrapFlush.stagedWrites, 4);
+  assert.equal(wrapFlush.bytesUploaded, 1024);
+  assert.equal(queueWrites.length, 3);
+  assert.equal(queueWrites[1].bufferOffset, 0);
+  assert.equal(queueWrites[1].byteLength, 512);
+  assert.equal(queueWrites[2].bufferOffset, 1536);
+  assert.equal(queueWrites[2].byteLength, 512);
+
+  // Verify exact byte fidelity in GPU buffer for all wrapped draws AND untouched middle slots 2..5!
+  const gpuU32 = new Uint32Array(ring.currentBuffer._data.buffer);
+  assert.deepEqual(Array.from(gpuU32.subarray(0, 4)), [0xb008, 81, 82, 83]);
+  assert.deepEqual(Array.from(gpuU32.subarray(256 / 4, 256 / 4 + 4)), [0xb009, 91, 92, 93]);
+  for (let untouched = 2; untouched <= 5; untouched += 1) {
+    const base = (untouched * 256) / 4;
+    assert.deepEqual(
+      Array.from(gpuU32.subarray(base, base + 4)),
+      [0xa000 + untouched, untouched * 17, untouched * 31, 0x1111],
+      `clean middle slot ${untouched} must remain untouched`
+    );
+  }
+  assert.deepEqual(Array.from(gpuU32.subarray(1536 / 4, 1536 / 4 + 4)), [0xb006, 61, 62, 63]);
+  assert.deepEqual(Array.from(gpuU32.subarray(1792 / 4, 1792 / 4 + 4)), [0xb007, 71, 72, 73]);
+
+  const stats = ring.getStats();
+  assert.equal(stats.wrapCount, 1);
+  assert.equal(stats.writeBufferCalls, 3);
+  assert.equal(stats.coalescedWrites, 7); // 5 + 2
+  assert.equal(stats.bytesUploaded, 2560);
+  assert.equal(stats.stagedWritesFlushed, 10);
+
+  ring.destroy();
+
+  // Full wrap-around meeting at the wrap seam coalesces into ONE single writeBuffer call,
+  // and oversized tail remainder wraps cleanly to offset 0 without splitting a uniform struct.
+  const { device: dev2, queueWrites: writes2 } = createMockGpuDevice();
+  const ring2 = new DynamicUniformRing({
+    device: dev2,
+    byteSize: 1024, // 4 x 256B
+    framesInFlight: 1,
+    allowWrap: true,
+  });
+  ring2.beginFrame();
+  ring2.pushConstants(new Uint32Array([1, 0, 0, 0])); // [0, 256)
+  ring2.pushConstants(new Uint32Array([2, 0, 0, 0])); // [256, 512)
+  ring2.flush(); // cursor = 512
+
+  // 4 draws covering [512, 768), [768, 1024), wrap -> [0, 256), [256, 512): head meets tail at 512!
+  ring2.beginBatch();
+  ring2.writeStaged(new Uint32Array([10, 0, 0, 0])); // [512, 768)
+  ring2.writeStaged(new Uint32Array([20, 0, 0, 0])); // [768, 1024)
+  const wrappedFull = ring2.writeStaged(new Uint32Array([30, 0, 0, 0])); // [0, 256)
+  ring2.writeStaged(new Uint32Array([40, 0, 0, 0])); // [256, 512)
+  assert.equal(wrappedFull.wrapped, true);
+  assert.deepEqual(ring2.getDirtyRanges(), [
+    { start: 0, end: 1024, byteLength: 1024, writeCount: 4 },
+  ]);
+  const fullWrapRes = ring2.endBatch();
+  assert.equal(fullWrapRes.writeBufferCalls, 1, 'head meeting tail across wrap must coalesce into 1 writeBuffer');
+  assert.equal(fullWrapRes.coalescedWrites, 3);
+  assert.equal(fullWrapRes.bytesUploaded, 1024);
+
+  // Oversized tail remainder: cursor is at 512, push 256B -> cursor 768, then push 300B (aligned 512B).
+  // 768 + 512 > 1024 -> must wrap cleanly to offset 0 (never split across end of GPUBuffer).
+  ring2.pushConstants(new Uint32Array([50, 0, 0, 0])); // [512, 768)
+  const bigPayload = new Uint8Array(300);
+  for (let i = 0; i < 300; i += 1) {
+    bigPayload[i] = (i * 7 + 3) & 0xff;
+  }
+  const bigWrapped = ring2.pushConstants(bigPayload);
+  assert.equal(bigWrapped.wrapped, true);
+  assert.equal(bigWrapped.dynamicOffset, 0);
+  assert.equal(bigWrapped.alignedSize, 512);
+  // Dirty ranges: [0, 512) and [512, 768) are contiguous -> coalesce to [0, 768)!
+  assert.deepEqual(ring2.getDirtyRanges(), [
+    { start: 0, end: 768, byteLength: 768, writeCount: 2 },
+  ]);
+  const tailWrapRes = ring2.flushDirty();
+  assert.equal(tailWrapRes.writeBufferCalls, 1);
+  assert.equal(tailWrapRes.bytesUploaded, 768);
+  assert.deepEqual(
+    Array.from(ring2.currentBuffer._data.subarray(0, 300)),
+    Array.from(bigPayload)
+  );
+  assert.equal(writes2.length, 3);
+
+  ring2.destroy();
+});
+
+test('W193: writeStaged(offset, data) out-of-order coalescing, SAB isolation, gap bridging, and validation', () => {
+  const { device, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 2048,
+    framesInFlight: 2,
+  });
+
+  ring.beginFrame();
+
+  // Out-of-order writes at offset 512 and 0 create 2 disjoint dirty ranges.
+  const w512 = ring.writeStaged(512, new Uint32Array([0x5120, 1, 2, 3]));
+  const w0 = ring.writeStaged(0, new Uint32Array([0x0000, 4, 5, 6]));
+  assert.equal(w512.dynamicOffset, 512);
+  assert.equal(w0.dynamicOffset, 0);
+  assert.deepEqual(ring.getDirtyRanges(), [
+    { start: 0, end: 256, byteLength: 256, writeCount: 1 },
+    { start: 512, end: 768, byteLength: 256, writeCount: 1 },
+  ]);
+
+  // Filling the gap at 256 merges all 3 into ONE contiguous dirty range [0, 768).
+  ring.writeStaged(256, new Uint32Array([0x2560, 7, 8, 9]));
+  assert.deepEqual(ring.getDirtyRanges(), [
+    { start: 0, end: 768, byteLength: 768, writeCount: 3 },
+  ]);
+
+  // Overwriting offset 256 with a SharedArrayBuffer-backed view keeps 1 coalesced range and latest bytes win.
+  const sab = new SharedArrayBuffer(16);
+  new Uint32Array(sab).set([0x256f, 70, 80, 90]);
+  ring.writeStaged(256, sab);
+  new Uint32Array(sab).set([0xdead, 0xdead, 0xdead, 0xdead]); // mutate source SAB after staging
+
+  assert.deepEqual(ring.getDirtyRanges(), [
+    { start: 0, end: 768, byteLength: 768, writeCount: 4 },
+  ]);
+
+  const flushRes = ring.flushDirty();
+  assert.deepEqual(flushRes, {
+    uploadedBytes: 768,
+    bytesUploaded: 768,
+    drawCount: 4,
+    stagedWrites: 4,
+    writeBufferCalls: 1,
+    coalescedWrites: 3,
+    dirtyRangesFlushed: 1,
+  });
+  assert.equal(queueWrites.length, 1);
+  assert.equal(queueWrites[0].bufferOffset, 0);
+  assert.equal(queueWrites[0].byteLength, 768);
+
+  const gpuU32 = new Uint32Array(ring.currentBuffer._data.buffer);
+  assert.deepEqual(Array.from(gpuU32.subarray(0, 4)), [0x0000, 4, 5, 6]);
+  assert.deepEqual(Array.from(gpuU32.subarray(256 / 4, 256 / 4 + 4)), [0x256f, 70, 80, 90]);
+  assert.deepEqual(Array.from(gpuU32.subarray(512 / 4, 512 / 4 + 4)), [0x5120, 1, 2, 3]);
+  assert.equal(ring.getStats().sabCopyCount, 1);
+
+  // Validation: rejects unaligned 256B offsets, negative offsets, out-of-bounds, and empty payloads.
+  assert.throws(() => ring.writeStaged(128, new Uint32Array([1, 2, 3, 4])), RangeError);
+  assert.throws(() => ring.writeStaged(4, new Uint32Array([1, 2, 3, 4])), RangeError);
+  assert.throws(() => ring.writeStaged(-256, new Uint32Array([1, 2, 3, 4])), RangeError);
+  assert.throws(() => ring.writeStaged(2048, new Uint32Array([1, 2, 3, 4])), RangeError);
+  assert.throws(() => ring.writeStaged(0, new Uint8Array(0)), RangeError);
+  assert.throws(() => ring.writeStaged(0, 'invalid'), TypeError);
+
+  // Optional maxCoalesceGapBytes bridges small clean gaps into a single writeBuffer call.
+  const { device: devGap, queueWrites: gapWrites } = createMockGpuDevice();
+  const gapRing = new DynamicUniformRing({
+    device: devGap,
+    byteSize: 2048,
+    framesInFlight: 1,
+    maxCoalesceGapBytes: 256,
+  });
+  gapRing.beginFrame();
+  gapRing.writeStaged(0, new Uint32Array([11, 12, 13, 14]));
+  gapRing.writeStaged(512, new Uint32Array([21, 22, 23, 24]));
+  assert.deepEqual(gapRing.getDirtyRanges(), [
+    { start: 0, end: 768, byteLength: 768, writeCount: 2 },
+  ]);
+  const gapRes = gapRing.flushDirty();
+  assert.equal(gapRes.writeBufferCalls, 1);
+  assert.equal(gapRes.coalescedWrites, 1);
+  assert.equal(gapRes.bytesUploaded, 768);
+  assert.equal(gapWrites.length, 1);
+  gapRing.destroy();
+
+  // Destroy guards all W193 methods cleanly.
+  ring.destroy();
+  assert.throws(() => ring.beginBatch(), /destroyed/i);
+  assert.throws(() => ring.endBatch(), /destroyed/i);
+  assert.throws(() => ring.writeStaged(new Uint32Array([1])), /destroyed/i);
+  assert.throws(() => ring.writeStaged(0, new Uint32Array([1])), /destroyed/i);
+  assert.throws(() => ring.flushDirty(), /destroyed/i);
+  assert.throws(() => ring.getDirtyRanges(), /destroyed/i);
 });
