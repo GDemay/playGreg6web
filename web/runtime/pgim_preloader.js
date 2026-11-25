@@ -312,6 +312,188 @@
     return typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer;
   }
 
+  function getBinaryBufferInfo(value) {
+    if (value instanceof ArrayBuffer) {
+      return { backingBuffer: value, byteLength: value.byteLength };
+    }
+    if (isSharedArrayBuffer(value)) {
+      return { backingBuffer: value, byteLength: value.byteLength };
+    }
+    if (ArrayBuffer.isView(value)) {
+      return { backingBuffer: value.buffer, byteLength: value.byteLength };
+    }
+    return null;
+  }
+
+  function isWritableOwnProperty(obj, key) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) return false;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc) return false;
+    if ('get' in desc || 'set' in desc) {
+      return typeof desc.set === 'function';
+    }
+    return desc.writable === true;
+  }
+
+  /**
+   * Release large binary payload references (`ArrayBuffer`, `SharedArrayBuffer`, or TypedArray views)
+   * held on a preloaded boot bundle or asset preload result while preserving lightweight metadata
+   * (`bytesLoaded`, `totalBytes`, `entryCount`, `manifest`, `header`, `timingMs`, `durationMs`,
+   * `transport`). Defensive and idempotent: never throws on null, primitive, or frozen inputs.
+   *
+   * @param {unknown} bundle
+   * @returns {{ releasedFields: string[], releasedBytes: number }}
+   */
+  function releaseBootBundleBytes(bundle) {
+    const releasedFields = [];
+    let releasedBytes = 0;
+    if (!bundle || typeof bundle !== 'object') {
+      return { releasedFields, releasedBytes };
+    }
+
+    const countedByBuffer = new Map();
+    const visitedObjects = new Set();
+
+    const recordBufferBytes = (info) => {
+      if (!info || !info.backingBuffer) return;
+      const len =
+        typeof info.byteLength === 'number' && Number.isFinite(info.byteLength) && info.byteLength > 0
+          ? info.byteLength
+          : 0;
+      const prev = countedByBuffer.get(info.backingBuffer) || 0;
+      if (len > prev) {
+        releasedBytes += len - prev;
+        countedByBuffer.set(info.backingBuffer, len);
+      }
+    };
+
+    const nullBinaryProp = (obj, key, path) => {
+      if (!isWritableOwnProperty(obj, key)) return false;
+      let val;
+      try {
+        val = obj[key];
+      } catch {
+        return false;
+      }
+      const info = getBinaryBufferInfo(val);
+      if (!info) return false;
+      try {
+        obj[key] = null;
+      } catch {
+        return false;
+      }
+      releasedFields.push(path);
+      recordBufferBytes(info);
+      return true;
+    };
+
+    const releasePayloadContainer = (obj, prefix) => {
+      if (!obj || typeof obj !== 'object' || visitedObjects.has(obj)) return;
+      visitedObjects.add(obj);
+      nullBinaryProp(obj, 'bytes', `${prefix}.bytes`);
+      nullBinaryProp(obj, 'buffer', `${prefix}.buffer`);
+    };
+
+    const releaseAssetSlot = (parent, key, prefix) => {
+      if (!parent || typeof parent !== 'object' || !Object.prototype.hasOwnProperty.call(parent, key)) {
+        return;
+      }
+      let val;
+      try {
+        val = parent[key];
+      } catch {
+        return;
+      }
+      if (!val || typeof val !== 'object') return;
+      if (getBinaryBufferInfo(val)) {
+        nullBinaryProp(parent, key, prefix);
+        return;
+      }
+      releasePayloadContainer(val, prefix);
+    };
+
+    const releaseModuleList = (list, prefix) => {
+      if (!Array.isArray(list) || visitedObjects.has(list)) return;
+      visitedObjects.add(list);
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[i];
+        if (!item || typeof item !== 'object') continue;
+        if (getBinaryBufferInfo(item)) {
+          nullBinaryProp(list, String(i), `${prefix}[${i}]`);
+        } else {
+          releasePayloadContainer(item, `${prefix}[${i}]`);
+        }
+      }
+    };
+
+    const releaseModuleMap = (map, prefix) => {
+      if (!map || typeof map !== 'object' || Array.isArray(map) || visitedObjects.has(map)) return;
+      visitedObjects.add(map);
+      for (const key of Object.keys(map)) {
+        releaseAssetSlot(map, key, `${prefix}.${key}`);
+      }
+    };
+
+    visitedObjects.add(bundle);
+
+    nullBinaryProp(bundle, 'buffer', 'buffer');
+    nullBinaryProp(bundle, 'bytes', 'bytes');
+    nullBinaryProp(bundle, 'pgimBytes', 'pgimBytes');
+
+    releaseAssetSlot(bundle, 'shaderPackBytes', 'shaderPackBytes');
+    releaseAssetSlot(bundle, 'pgim', 'pgim');
+    releaseAssetSlot(bundle, 'shaderPackIndex', 'shaderPackIndex');
+    releaseAssetSlot(bundle, 'reflectionManifest', 'reflectionManifest');
+    releaseAssetSlot(bundle, 'reflectionSidecar', 'reflectionSidecar');
+
+    if (Object.prototype.hasOwnProperty.call(bundle, 'modules')) {
+      releaseModuleList(bundle.modules, 'modules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'modulesByName')) {
+      releaseModuleMap(bundle.modulesByName, 'modulesByName');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'mainModule')) {
+      releaseAssetSlot(bundle, 'mainModule', 'mainModule');
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(bundle, 'program') &&
+      bundle.program &&
+      typeof bundle.program === 'object' &&
+      !visitedObjects.has(bundle.program)
+    ) {
+      const program = bundle.program;
+      visitedObjects.add(program);
+      nullBinaryProp(program, 'bytes', 'program.bytes');
+      nullBinaryProp(program, 'buffer', 'program.buffer');
+      if (Object.prototype.hasOwnProperty.call(program, 'mainModule')) {
+        releaseAssetSlot(program, 'mainModule', 'program.mainModule');
+      }
+      if (Object.prototype.hasOwnProperty.call(program, 'modules')) {
+        releaseModuleList(program.modules, 'program.modules');
+      }
+      if (Object.prototype.hasOwnProperty.call(program, 'modulesByName')) {
+        releaseModuleMap(program.modulesByName, 'program.modulesByName');
+      }
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(bundle, 'sidecars') &&
+      bundle.sidecars &&
+      typeof bundle.sidecars === 'object' &&
+      !Array.isArray(bundle.sidecars) &&
+      !visitedObjects.has(bundle.sidecars)
+    ) {
+      const sidecars = bundle.sidecars;
+      visitedObjects.add(sidecars);
+      for (const key of Object.keys(sidecars)) {
+        releaseAssetSlot(sidecars, key, `sidecars.${key}`);
+      }
+    }
+
+    return { releasedFields, releasedBytes };
+  }
+
   function toBytes(input, label = 'buffer') {
     if (input instanceof Uint8Array) return input;
     if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
@@ -2278,15 +2460,17 @@
         concurrency: transfer.concurrency,
       });
       const validated = validateWgslPackBytes(fetched.bytes, url);
-      run.complete(validated.byteLength);
+      const isExactBuffer =
+        validated.byteOffset === 0 && validated.byteLength === validated.buffer.byteLength;
+      const tightBuffer = isExactBuffer ? validated.buffer : validated.slice().buffer;
+      const tightBytes = isExactBuffer ? validated : new Uint8Array(tightBuffer);
+      run.complete(tightBytes.byteLength);
       const stats = run.snapshot();
       return {
-        buffer: validated.buffer.byteLength === validated.byteLength && validated.byteOffset === 0
-          ? validated.buffer
-          : validated.slice().buffer,
-        bytes: validated,
-        bytesLoaded: validated.byteLength,
-        totalBytes: validated.byteLength,
+        buffer: tightBuffer,
+        bytes: tightBytes,
+        bytesLoaded: tightBytes.byteLength,
+        totalBytes: tightBytes.byteLength,
         transport: fetched.transport,
         chunksFetched: stats.chunksFetched,
         durationMs: this._elapsedSince(started),
@@ -3138,7 +3322,8 @@
       const body = response.body;
       if (body && typeof body.getReader === 'function') {
         const reader = body.getReader();
-        const parts = [];
+        let prealloc = declared !== null && declared > 0 ? new Uint8Array(declared) : null;
+        let parts = prealloc === null ? [] : null;
         let loaded = 0;
         if (telemetryRun && ownsTotalBytes && declared !== null) {
           telemetryRun.setTotalBytes(declared);
@@ -3148,7 +3333,16 @@
             const { done, value } = await raceAbort(reader.read(), signal);
             if (done) break;
             const part = toBytes(value, what);
-            parts.push(part);
+            if (prealloc !== null) {
+              if (loaded + part.byteLength <= prealloc.byteLength) {
+                prealloc.set(part, loaded);
+              } else {
+                parts = loaded > 0 ? [prealloc.slice(0, loaded), part] : [part];
+                prealloc = null;
+              }
+            } else {
+              parts.push(part);
+            }
             loaded += part.byteLength;
             if (telemetryRun) telemetryRun.recordBytes(part.byteLength);
             emit('download', loaded, declared);
@@ -3159,8 +3353,12 @@
           throw err;
         }
         throwIfAborted(signal);
-        if (parts.length === 1) {
+        if (prealloc !== null) {
+          bytes = loaded === prealloc.byteLength ? prealloc : prealloc.slice(0, loaded);
+          prealloc = null;
+        } else if (parts.length === 1) {
           bytes = parts[0];
+          parts.length = 0;
         } else {
           bytes = new Uint8Array(loaded);
           let offset = 0;
@@ -3168,6 +3366,7 @@
             bytes.set(part, offset);
             offset += part.byteLength;
           }
+          parts.length = 0;
         }
         if (telemetryRun) {
           if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
@@ -3263,6 +3462,7 @@
     parseProgramManifest,
     parseBootManifest,
     preloadProgramModules,
+    releaseBootBundleBytes,
     PgimPreloader,
     default: PgimPreloader,
   });
