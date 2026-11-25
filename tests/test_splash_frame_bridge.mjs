@@ -14,12 +14,22 @@ const {
   ALLOWED_FRAME_FORMATS,
   COLOR_SPACE,
   COLOR_RANGE,
+  CHROMA_ORDER,
+  LOAD_OP,
   sanitizeFrameFormat,
+  sanitizeChromaOrder,
+  sanitizeLoadOp,
   generateDiagnosticSplashFrame,
   SplashFrameBridge,
 } = bridgeMod;
 
-const { BinkVideoPresenter, BINK_PIXEL_FORMAT } = binkMod;
+const {
+  BinkVideoPresenter,
+  BINK_PIXEL_FORMAT,
+  BINK_CHROMA_ORDER,
+  BINK_LOAD_OP,
+  UNIFORM_FLAG_SWAP_CHROMA,
+} = binkMod;
 
 function createMockWebGpuDevice(options = {}) {
   let nextTextureId = 1;
@@ -53,6 +63,7 @@ function createMockWebGpuDevice(options = {}) {
       writeTextureCalls.push({
         dest: { ...dest, origin: dest.origin ? { ...dest.origin } : undefined },
         data: bytes,
+        rawData: data,
         dataLayout: { ...dataLayout },
         size: { ...size },
       });
@@ -1122,4 +1133,507 @@ test('notifyGuestFirstPresent without suppression freezes framesBeforeFirstPrese
   const ignored = bridge.pushDiagnosticFrame(8, 4, 2, { timestampMs: 20 });
   assert.equal(ignored.ignored, true);
   assert.equal(bridge.getStats().lateSplashFramesIgnored, 1);
+});
+
+test('W189: CHROMA_ORDER and LOAD_OP constants, defaults, sanitization, and validation preserve invariants', () => {
+  assert.ok(Object.isFrozen(CHROMA_ORDER));
+  assert.ok(Object.isFrozen(LOAD_OP));
+  assert.equal(CHROMA_ORDER.YUV, BINK_CHROMA_ORDER.YUV);
+  assert.equal(CHROMA_ORDER.YVU, BINK_CHROMA_ORDER.YVU);
+  assert.equal(LOAD_OP.CLEAR, BINK_LOAD_OP.CLEAR);
+  assert.equal(LOAD_OP.LOAD, BINK_LOAD_OP.LOAD);
+
+  assert.equal(sanitizeChromaOrder('yuv'), 'yuv');
+  assert.equal(sanitizeChromaOrder(' YVU '), 'yvu');
+  assert.equal(sanitizeChromaOrder('ycrcb'), null);
+  assert.equal(sanitizeChromaOrder('C:\\video\\intro.bk2'), null);
+  assert.equal(sanitizeChromaOrder(null), null);
+  assert.equal(sanitizeChromaOrder(42), null);
+
+  assert.equal(sanitizeLoadOp('clear'), 'clear');
+  assert.equal(sanitizeLoadOp(' LOAD '), 'load');
+  assert.equal(sanitizeLoadOp('discard'), null);
+  assert.equal(sanitizeLoadOp('/tmp/frame.raw'), null);
+  assert.equal(sanitizeLoadOp(undefined), null);
+  assert.equal(sanitizeLoadOp({}), null);
+
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, targetFps: 1000 });
+  assert.equal(bridge.chromaOrder, 'yuv');
+  assert.equal(bridge.loadOp, 'clear');
+  assert.equal(bridge.zeroCopy, false);
+
+  const initialStats = bridge.getStats();
+  const initialState = bridge.getState();
+  assert.equal(initialStats.chromaOrder, 'yuv');
+  assert.equal(initialStats.loadOp, 'clear');
+  assert.equal(initialStats.lastChromaOrder, null);
+  assert.equal(initialStats.lastLoadOp, null);
+  assert.equal(initialStats.yvuFramesForwarded, 0);
+  assert.equal(initialStats.underlayLoadFramesPresented, 0);
+  assert.equal(initialStats.zeroCopyFramesForwarded, 0);
+  assert.equal(initialState.chromaOrder, 'yuv');
+  assert.equal(initialState.loadOp, 'clear');
+  assert.equal(initialState.lastChromaOrder, null);
+  assert.equal(initialState.lastLoadOp, null);
+  assert.equal(initialState.zeroCopy, false);
+
+  // Invalid constructor / setter / frame / render options throw RangeError without mutating state.
+  assert.throws(() => new SplashFrameBridge({ device, chromaOrder: 'ycrcb' }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, chromaOrder: 123 }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, loadOp: 'discard' }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, loadOp: 0 }), RangeError);
+
+  assert.throws(() => bridge.setChromaOrder('nv21'), RangeError);
+  assert.throws(() => bridge.setChromaOrder(''), RangeError);
+  assert.throws(() => bridge.setChromaOrder(null), RangeError);
+  assert.throws(() => bridge.setLoadOp('preserve'), RangeError);
+  assert.throws(() => bridge.setLoadOp(''), RangeError);
+  assert.throws(() => bridge.setLoadOp(undefined), RangeError);
+  assert.equal(bridge.chromaOrder, 'yuv');
+  assert.equal(bridge.loadOp, 'clear');
+
+  const planes = makeYuv420Planes(8, 4);
+  assert.throws(
+    () =>
+      bridge.pushRawFrame({
+        width: 8,
+        height: 4,
+        format: PIXEL_FORMAT.YUV420P,
+        planes,
+        chromaOrder: 'invalid',
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      bridge.pushRawFrame({
+        width: 8,
+        height: 4,
+        format: PIXEL_FORMAT.YUV420P,
+        planes,
+        loadOp: 'keep',
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      bridge.pushExternalImage(
+        { width: 4, height: 4, data: makeRgbaFrame(4, 4) },
+        { loadOp: 'bad' }
+      ),
+    RangeError
+  );
+  assert.throws(() => bridge.pushDiagnosticFrame(4, 4, 0, { loadOp: 'bad' }), RangeError);
+  assert.equal(bridge.getStats().queueDepth, 0);
+
+  bridge.pushDiagnosticFrame(4, 4, 0, { timestampMs: 0 });
+  assert.throws(
+    () => bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 0, { loadOp: 'bad' }),
+    RangeError
+  );
+  assert.throws(
+    () => bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 0, 'invalid-opts'),
+    TypeError
+  );
+  // Queue was not consumed by invalid render options.
+  assert.equal(bridge.getStats().queueDepth, 1);
+
+  // Corrupted internal metadata is defensively sanitized in getStats() / getState().
+  bridge._chromaOrder = 'C:\\secret\\bad';
+  bridge._loadOp = '/etc/passwd';
+  bridge._lastChromaOrder = 'https://invalid';
+  bridge._lastLoadOp = 'discard';
+  assert.equal(bridge.getStats().chromaOrder, 'yuv');
+  assert.equal(bridge.getStats().loadOp, 'clear');
+  assert.equal(bridge.getStats().lastChromaOrder, null);
+  assert.equal(bridge.getStats().lastLoadOp, null);
+  assert.equal(bridge.getState().chromaOrder, 'yuv');
+  assert.equal(bridge.getState().loadOp, 'clear');
+  assert.equal(bridge.getState().lastChromaOrder, null);
+  assert.equal(bridge.getState().lastLoadOp, null);
+
+  bridge.destroy();
+});
+
+test('W189: forwards chromaOrder (yuv/yvu) and underlay loadOp (clear/load) through BinkVideoPresenter', () => {
+  const device = createMockWebGpuDevice();
+  const firstPresentEvents = [];
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    chromaOrder: CHROMA_ORDER.YVU,
+    loadOp: LOAD_OP.LOAD,
+    onFirstPresent(info) {
+      firstPresentEvents.push(info);
+    },
+  });
+
+  const yuvPlanes = makeYuv420Planes(16, 8);
+  const enq0 = bridge.pushRawFrame({
+    width: 16,
+    height: 8,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: yuvPlanes,
+    timestampMs: 0,
+  });
+  assert.equal(enq0.chromaOrder, 'yvu');
+  assert.equal(enq0.loadOp, 'load');
+
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.chromaOrder, 'yvu');
+  assert.equal(r0.loadOp, 'load');
+  assert.equal(r0.yvuFramesForwarded, 1);
+  assert.equal(r0.underlayLoadFramesPresented, 1);
+  assert.equal(bridge.presenter.chromaOrder, 'yvu');
+  assert.equal(bridge.presenter.loadOp, 'load');
+
+  // Uniform buffer carries SWAP_CHROMA flag (bit 1 = 2) for YVU.
+  const u0 = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const u0View = new Uint32Array(u0.buffer, u0.byteOffset, u0.byteLength / 4);
+  assert.equal(u0View[3] & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+
+  // Underlay loadOp: 'load' omits clearValue on the render pass attachment.
+  const pass0Attachment =
+    device.createdEncoders[device.createdEncoders.length - 1].renderPasses[0].descriptor
+      .colorAttachments[0];
+  assert.equal(pass0Attachment.loadOp, 'load');
+  assert.equal('clearValue' in pass0Attachment, false);
+
+  // First-present telemetry includes chromaOrder and loadOp.
+  assert.equal(firstPresentEvents.length, 1);
+  assert.equal(firstPresentEvents[0].chromaOrder, 'yvu');
+  assert.equal(firstPresentEvents[0].loadOp, 'load');
+
+  // Per-frame override switches back to yuv + clear without altering bridge defaults.
+  bridge.pushRawFrame({
+    width: 16,
+    height: 8,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: yuvPlanes,
+    chromaOrder: 'YUV',
+    loadOp: 'CLEAR',
+    timestampMs: 10,
+  });
+  const r1 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 10);
+  assert.equal(r1.presented, true);
+  assert.equal(r1.chromaOrder, 'yuv');
+  assert.equal(r1.loadOp, 'clear');
+  assert.equal(bridge.presenter.chromaOrder, 'yuv');
+
+  const u1 = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const u1View = new Uint32Array(u1.buffer, u1.byteOffset, u1.byteLength / 4);
+  assert.equal(u1View[3] & UNIFORM_FLAG_SWAP_CHROMA, 0);
+
+  const pass1Attachment =
+    device.createdEncoders[device.createdEncoders.length - 1].renderPasses[0].descriptor
+      .colorAttachments[0];
+  assert.equal(pass1Attachment.loadOp, 'clear');
+  assert.ok('clearValue' in pass1Attachment);
+
+  // Subsequent frame omitting chromaOrder/loadOp restores bridge defaults (yvu + load),
+  // and renderFrame options override loadOp & opacity per call.
+  const nv12 = makeNv12Planes(16, 8);
+  bridge.pushNv12Frame({
+    width: 16,
+    height: 8,
+    yPlane: nv12.yPlane,
+    uvPlane: nv12.uvPlane,
+    timestampMs: 20,
+  });
+  const r2 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, {
+    nowMs: 20,
+    loadOp: 'clear',
+    opacity: 0.5,
+  });
+  assert.equal(r2.presented, true);
+  assert.equal(r2.chromaOrder, 'yvu');
+  assert.equal(r2.loadOp, 'clear');
+  assert.equal(bridge.presenter.chromaOrder, 'yvu');
+
+  const u2 = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const u2u32 = new Uint32Array(u2.buffer, u2.byteOffset, u2.byteLength / 4);
+  const u2f32 = new Float32Array(u2.buffer, u2.byteOffset, u2.byteLength / 4);
+  assert.equal(u2u32[3] & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+  assert.ok(Math.abs(u2f32[2] - 0.5) < 1e-6);
+
+  // Setters synchronize with presenter and snapshots.
+  bridge.setChromaOrder(CHROMA_ORDER.YUV);
+  bridge.setLoadOp(LOAD_OP.CLEAR);
+  assert.equal(bridge.chromaOrder, 'yuv');
+  assert.equal(bridge.loadOp, 'clear');
+  assert.equal(bridge.presenter.chromaOrder, 'yuv');
+  assert.equal(bridge.presenter.loadOp, 'clear');
+
+  const handoff = bridge.notifyGuestFirstPresent();
+  assert.equal(handoff.chromaOrder, 'yuv');
+  assert.equal(handoff.loadOp, 'clear');
+  assert.equal(handoff.lastChromaOrder, 'yvu');
+  assert.equal(handoff.lastLoadOp, 'clear');
+
+  const stats = bridge.getStats();
+  const state = bridge.getState();
+  assert.equal(stats.yvuFramesForwarded, 2);
+  assert.equal(stats.underlayLoadFramesPresented, 1);
+  assert.equal(stats.lastChromaOrder, 'yvu');
+  assert.equal(stats.lastLoadOp, 'clear');
+  assert.equal(state.guestFirstPresent, true);
+  assert.equal(state.splashSuppressed, true);
+  assert.equal(state.lastChromaOrder, 'yvu');
+  assert.equal(state.lastLoadOp, 'clear');
+
+  // Reset clears per-session last* and counters while preserving configured defaults.
+  bridge.reset();
+  assert.equal(bridge.getStats().yvuFramesForwarded, 0);
+  assert.equal(bridge.getStats().underlayLoadFramesPresented, 0);
+  assert.equal(bridge.getStats().lastChromaOrder, null);
+  assert.equal(bridge.getStats().lastLoadOp, null);
+  assert.equal(bridge.getState().chromaOrder, 'yuv');
+  assert.equal(bridge.getState().loadOp, 'clear');
+
+  bridge.destroy();
+});
+
+test('W189: injected presenter chromaOrder and loadOp defaults are inherited when omitted', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    targetFps: 1000,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+    loadOp: BINK_LOAD_OP.LOAD,
+  });
+  const bridge = new SplashFrameBridge({ presenter });
+
+  assert.equal(bridge.chromaOrder, 'yvu');
+  assert.equal(bridge.loadOp, 'load');
+  assert.equal(bridge.getState().chromaOrder, 'yvu');
+  assert.equal(bridge.getState().loadOp, 'load');
+
+  bridge.pushDiagnosticFrame(8, 4, 0, { timestampMs: 0 });
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.loadOp, 'load');
+  const att =
+    device.createdEncoders[0].renderPasses[0].descriptor.colorAttachments[0];
+  assert.equal(att.loadOp, 'load');
+  assert.equal('clearValue' in att, false);
+
+  bridge.destroy();
+  presenter.destroy();
+});
+
+test('W189: 4K (3840x2160 Y + 1920x1080 Cr/Cb) Bink2Scarlett yvu preserves plane order and zero-copy typed-array views', () => {
+  const width = 3840;
+  const height = 2160;
+  const uvW = 1920;
+  const uvH = 1080;
+  const yBytes = width * height;
+  const chromaBytes = uvW * uvH;
+
+  // Single contiguous 4K Y/Cr/Cb decode slab with distinct typed-array subviews.
+  const slab = new ArrayBuffer(yBytes + chromaBytes * 2);
+  const yView = new Uint8Array(slab, 0, yBytes);
+  const crView = new Uint8Array(slab, yBytes, chromaBytes);
+  const cbView = new Uint8Array(slab, yBytes + chromaBytes, chromaBytes);
+
+  yView[0] = 0x11;
+  yView[width - 1] = 0x22;
+  yView[(height - 1) * width + width - 1] = 0x33;
+
+  crView[0] = 0xa1;
+  crView[uvW - 1] = 0xa2;
+  crView[uvW] = 0xa3;
+  crView[(uvH - 1) * uvW + uvW - 1] = 0xa4;
+
+  cbView[0] = 0xb1;
+  cbView[uvW - 1] = 0xb2;
+  cbView[uvW] = 0xb3;
+  cbView[(uvH - 1) * uvW + uvW - 1] = 0xb4;
+
+  // 1) Verify exact typed-array view preservation (zero payload copies in bridge) via spy presenter.
+  const uploadedPayloads = [];
+  const presentCalls = [];
+  const spyPresenter = {
+    uploadFrame(frame) {
+      return this.uploadYuv420Frame(frame);
+    },
+    uploadYuv420Frame(frame) {
+      uploadedPayloads.push(frame);
+      return { format: frame.format, chromaOrder: frame.chromaOrder };
+    },
+    presentFrame(_enc, _view, _w, _h, opts) {
+      presentCalls.push(opts);
+      return {
+        presented: true,
+        viewport: { x: 0, y: 0, width: 3840, height: 2160 },
+        chromaOrder: 'yvu',
+        loadOp: opts.loadOp,
+      };
+    },
+  };
+  const spyDevice = createMockWebGpuDevice();
+  const spyBridge = new SplashFrameBridge({
+    presenter: spyPresenter,
+    zeroCopy: true,
+    maxQueueDepth: 2,
+  });
+
+  // Push via named cr/cb planes with chromaOrder: 'yvu' and underlay loadOp: 'load'.
+  spyBridge.pushRawFrame({
+    width,
+    height,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: { y: yView, cr: crView, cb: cbView },
+    chromaOrder: CHROMA_ORDER.YVU,
+    loadOp: LOAD_OP.LOAD,
+    timestampMs: 0,
+  });
+
+  const spyRes = spyBridge.renderFrame(spyDevice, { kind: 'GPUTextureView' }, 3840, 2160, 0);
+  assert.equal(spyRes.presented, true);
+  assert.equal(spyRes.chromaOrder, 'yvu');
+  assert.equal(spyRes.loadOp, 'load');
+  assert.equal(spyRes.zeroCopy, true);
+  assert.equal(uploadedPayloads.length, 1);
+  assert.equal(uploadedPayloads[0].chromaOrder, 'yvu');
+  // Exact Uint8Array view references preserved (no copy, same backing ArrayBuffer & byteOffset).
+  assert.equal(uploadedPayloads[0].y, yView);
+  assert.equal(uploadedPayloads[0].u, crView);
+  assert.equal(uploadedPayloads[0].v, cbView);
+  assert.equal(uploadedPayloads[0].y.buffer, slab);
+  assert.equal(uploadedPayloads[0].u.byteOffset, yBytes);
+  assert.equal(uploadedPayloads[0].v.byteOffset, yBytes + chromaBytes);
+  assert.equal(presentCalls[0].loadOp, 'load');
+
+  // Also verify non-Uint8Array ArrayBufferView (Uint8ClampedArray) keeps zero-copy buffer view.
+  const clampedCr = new Uint8ClampedArray(slab, yBytes, chromaBytes);
+  const clampedCb = new Uint8ClampedArray(slab, yBytes + chromaBytes, chromaBytes);
+  spyBridge.pushRawFrame({
+    width,
+    height,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: { y: yView, u: clampedCr, v: clampedCb },
+    chromaOrder: CHROMA_ORDER.YVU,
+    timestampMs: 10,
+  });
+  spyBridge.renderFrame(spyDevice, { kind: 'GPUTextureView' }, 3840, 2160, 10);
+  assert.equal(uploadedPayloads[1].u.buffer, slab);
+  assert.equal(uploadedPayloads[1].u.byteOffset, yBytes);
+  assert.equal(uploadedPayloads[1].v.buffer, slab);
+  assert.equal(uploadedPayloads[1].v.byteOffset, yBytes + chromaBytes);
+  spyBridge.destroy();
+
+  // 2) End-to-end 4K Bink2Scarlett YVU through real BinkVideoPresenter (tight 1920 chroma).
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    zeroCopy: true,
+    chromaOrder: CHROMA_ORDER.YVU,
+    loadOp: LOAD_OP.LOAD,
+  });
+
+  bridge.pushRawFrame({
+    width,
+    height,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: { y: yView, cr: crView, cb: cbView },
+    timestampMs: 0,
+  });
+  const res4k = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 3840, 2160, 0);
+  assert.equal(res4k.presented, true);
+  assert.equal(res4k.width, 3840);
+  assert.equal(res4k.height, 2160);
+  assert.equal(res4k.chromaOrder, 'yvu');
+  assert.equal(res4k.loadOp, 'load');
+  assert.equal(res4k.zeroCopy, true);
+
+  const planeCalls = device.writeTextureCalls.filter(
+    (c) => c.dest.texture.label !== 'playgta6-bink-presenter-dummy'
+  );
+  assert.equal(planeCalls.length, 3);
+  const [yCall, crCall, cbCall] = planeCalls;
+
+  // Y plane: exact caller Uint8Array passed zero-copy with 3840 bytesPerRow.
+  assert.equal(yCall.rawData, yView);
+  assert.equal(yCall.dataLayout.bytesPerRow, 3840);
+  assert.equal(yCall.size.width, 3840);
+  assert.equal(yCall.size.height, 2160);
+
+  // Cr/Cb planes: plane order preserved (slot.u = Cr, slot.v = Cb) and 2048-aligned.
+  assert.equal(crCall.dataLayout.bytesPerRow, 2048);
+  assert.equal(cbCall.dataLayout.bytesPerRow, 2048);
+  assert.equal(crCall.data[0], 0xa1);
+  assert.equal(crCall.data[uvW - 1], 0xa2);
+  assert.equal(crCall.data[2048], 0xa3);
+  assert.equal(crCall.data[(uvH - 1) * 2048 + uvW - 1], 0xa4);
+  assert.equal(cbCall.data[0], 0xb1);
+  assert.equal(cbCall.data[uvW - 1], 0xb2);
+  assert.equal(cbCall.data[2048], 0xb3);
+  assert.equal(cbCall.data[(uvH - 1) * 2048 + uvW - 1], 0xb4);
+
+  // Render pass uses underlay loadOp: 'load' without clearValue.
+  const att4k = device.createdEncoders[0].renderPasses[0].descriptor.colorAttachments[0];
+  assert.equal(att4k.loadOp, 'load');
+  assert.equal('clearValue' in att4k, false);
+
+  const stats4k = bridge.getStats();
+  assert.equal(stats4k.lastFrameWidth, 3840);
+  assert.equal(stats4k.lastFrameHeight, 2160);
+  assert.equal(stats4k.chromaOrder, 'yvu');
+  assert.equal(stats4k.lastChromaOrder, 'yvu');
+  assert.equal(stats4k.loadOp, 'load');
+  assert.equal(stats4k.lastLoadOp, 'load');
+  assert.equal(stats4k.zeroCopyFramesForwarded, 1);
+  assert.equal(stats4k.presenterStats.directZeroCopyUploads, 1);
+  assert.equal(stats4k.presenterStats.chromaRepackUploads, 2);
+  assert.equal(stats4k.presenterStats.scratchAllocations, 1);
+  assert.equal(stats4k.presenterStats.chromaOrder, 'yvu');
+  bridge.destroy();
+
+  // 3) Pre-aligned 2048-byte chroma stride: all 3 4K planes pass end-to-end zero-copy with 0 scratch allocs.
+  const alignedDevice = createMockWebGpuDevice();
+  const alignedBridge = new SplashFrameBridge({
+    device: alignedDevice,
+    targetFps: 1000,
+    chromaOrder: CHROMA_ORDER.YVU,
+  });
+  const crAligned = new Uint8Array(2048 * uvH);
+  const cbAligned = new Uint8Array(2048 * uvH);
+  crAligned[0] = 0xc1;
+  cbAligned[0] = 0xd1;
+
+  alignedBridge.pushRawFrame({
+    width,
+    height,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: { y: yView, cr: crAligned, cb: cbAligned },
+    yStride: 3840,
+    crStride: 2048,
+    cbStride: 2048,
+    chromaOrder: CHROMA_ORDER.YVU,
+    zeroCopy: true,
+    timestampMs: 0,
+  });
+  const resAligned = alignedBridge.renderFrame(
+    alignedDevice,
+    { kind: 'GPUTextureView' },
+    3840,
+    2160,
+    0
+  );
+  assert.equal(resAligned.presented, true);
+
+  const alignedCalls = alignedDevice.writeTextureCalls.filter(
+    (c) => c.dest.texture.label !== 'playgta6-bink-presenter-dummy'
+  );
+  assert.equal(alignedCalls.length, 3);
+  assert.equal(alignedCalls[0].rawData, yView);
+  assert.equal(alignedCalls[1].rawData, crAligned);
+  assert.equal(alignedCalls[2].rawData, cbAligned);
+  assert.equal(alignedBridge.getStats().presenterStats.directZeroCopyUploads, 3);
+  assert.equal(alignedBridge.getStats().presenterStats.chromaRepackUploads, 0);
+  assert.equal(alignedBridge.getStats().presenterStats.scratchAllocations, 0);
+  alignedBridge.destroy();
 });
