@@ -62,6 +62,45 @@ const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
   'zero_copy_frames_forwarded',
   'zeroCopyFrames',
   'binkZeroCopyFrames',
+  'gpuAdapter',
+  'gpu_adapter',
+  'adapterLabel',
+  'adapter_label',
+  'adapterInfo',
+  'adapter_info',
+  'blackLoadingMs',
+  'black_loading_ms',
+  'blackScreenMs',
+  'black_screen_ms',
+  'firstVisibleFrameMs',
+  'first_visible_frame_ms',
+  'firstVisibleMs',
+  'first_visible_ms',
+  'timeToFirstVisibleFrameMs',
+  'time_to_first_visible_frame_ms',
+  'loadingAssets',
+  'loading_assets',
+  'isLoadingAssets',
+  'is_loading_assets',
+]);
+
+const GUEST_AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
+  'guestRingAttached',
+  'guest_ring_attached',
+  'ringAttached',
+  'pcmRingAttached',
+  'guestFramesDrained',
+  'guest_frames_drained',
+  'guestDrainedFrames',
+  'guest_drained_frames',
+  'guestUnderruns',
+  'guest_underruns',
+  'guestUnderrunCount',
+  'guest_underrun_count',
+  'guestPeakLevel',
+  'guest_peak_level',
+  'guestPeak',
+  'guest_peak',
 ]);
 
 const AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -77,6 +116,7 @@ const AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
   'overrunCount',
   'overrun_count',
   'overflows',
+  ...GUEST_AUDIO_TELEMETRY_FIELD_KEYS,
 ]);
 
 const PTHREAD_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -96,6 +136,7 @@ const PTHREAD_TELEMETRY_FIELD_KEYS = Object.freeze([
 
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
+export const MAX_GPU_ADAPTER_LABEL_LENGTH = 96;
 export const DEFAULT_TOGGLE_KEY = 'F3';
 export const DEFAULT_MIN_RENDER_INTERVAL_MS = 0;
 const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
@@ -190,6 +231,14 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'bootProgressBarEl',
   'bootProgressFillEl',
   'bootElapsedEl',
+  'gpuAdapterEl',
+  'gpuAdapterBadgeEl',
+  'loadingAssetsBadgeEl',
+  'loadingAssetsEl',
+  'blackLoadingEl',
+  'firstVisibleFrameEl',
+  'audioStatusEl',
+  'guestAudioStatusEl',
 ]);
 
 export const HUD_ACTIONS = Object.freeze({
@@ -520,6 +569,229 @@ function toNonNegativeFiniteNumber(value, fallback = null) {
   return n;
 }
 
+function toUnitIntervalNumber(value, fallback = 0) {
+  const n = toNonNegativeFiniteNumber(value, null);
+  if (n === null) {
+    return fallback;
+  }
+  return Math.min(1, n);
+}
+
+/**
+ * Sanitizes an active WebGPU adapter label (or adapter info object) into a safe,
+ * lowercase vendor/architecture label (e.g. `'nvidia / turing'`, `'intel / gen-12lp'`),
+ * capped at `maxLength` (default 96 chars) with zero host paths, URLs, scripts,
+ * control characters, or secrets. Returns `null` when empty or wholly invalid.
+ *
+ * @param {unknown} raw
+ * @param {number} [maxLength=MAX_GPU_ADAPTER_LABEL_LENGTH]
+ * @returns {string|null}
+ */
+export function sanitizeGpuAdapterLabel(raw, maxLength = MAX_GPU_ADAPTER_LABEL_LENGTH) {
+  const limit =
+    typeof maxLength === 'number' && Number.isFinite(maxLength) && maxLength >= 1
+      ? Math.min(MAX_GPU_ADAPTER_LABEL_LENGTH, Math.floor(maxLength))
+      : MAX_GPU_ADAPTER_LABEL_LENGTH;
+
+  let text = '';
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (isPlainObject(raw)) {
+    const nestedInfo = safeGet(raw, 'info');
+    const source = isPlainObject(nestedInfo) ? nestedInfo : raw;
+    const rawVendor = safeGet(source, 'vendor');
+    const rawArch = safeGet(source, 'architecture') ?? safeGet(source, 'arch');
+    const parts = [];
+    if (typeof rawVendor === 'string' && rawVendor.trim().length > 0) {
+      parts.push(rawVendor.trim());
+    }
+    if (typeof rawArch === 'string' && rawArch.trim().length > 0) {
+      const archTrimmed = rawArch.trim();
+      if (
+        parts.length === 0 ||
+        parts[0].toLowerCase() !== archTrimmed.toLowerCase()
+      ) {
+        parts.push(archTrimmed);
+      }
+    }
+    if (parts.length > 0) {
+      text = parts.join(' / ');
+    } else {
+      const fallback = pickFirstDefined(source, [
+        'gpuAdapter',
+        'gpu_adapter',
+        'adapterLabel',
+        'adapter_label',
+        'label',
+        'description',
+        'device',
+        'name',
+      ]);
+      if (typeof fallback === 'string') {
+        text = fallback;
+      } else {
+        return null;
+      }
+    }
+  } else {
+    return null;
+  }
+
+  // Strip control characters and collapse whitespace before redaction.
+  text = text.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1F\x7F]+/g, '');
+  if (!text.trim()) {
+    return null;
+  }
+
+  // Strip HTML/script blocks, URLs, and inline query/secret tokens.
+  text = text.replace(/<script\b[\s\S]*?<\/script>/gi, ' ');
+  text = text.replace(/<[^>]*>/g, ' ');
+  text = text.replace(/\b(?:https?|file|data|javascript|ftp|wss?):\/\/[^\s"'`<>)\]},;]*/gi, ' ');
+  text = text.replace(/\b(?:javascript|data):[^\s"'`<>)\]},;]*/gi, ' ');
+
+  // Redact host filesystem paths, file:// URLs, tokens, and binary blobs.
+  text = sanitizeString(text);
+  text = text.replace(/\??\[REDACTED(?:_[A-Z0-9_]+)?\]/gi, ' ');
+
+  // Strip any remaining Windows backslash paths, path traversal, or multi-segment POSIX paths.
+  text = text.replace(/(?:^|\s)[^\s]*\\[^\s]*/g, ' ');
+  text = text.replace(/\.\.(?:[\\/][^\s]*)?/g, ' ');
+  text = text.replace(/(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]*/g, '$1 ');
+  text = text.replace(/(^|[\s"'`(\[=,:])\/[A-Za-z0-9._-]+\/[A-Za-z0-9._~+-]+/g, '$1 ');
+  text = text.replace(/[?#][^\s]*/g, ' ');
+
+  text = text.toLowerCase();
+  text = text.replace(/\(\s*\)|\[\s*\]/g, ' ');
+  text = text.replace(/[^a-z0-9 /._:+(),-]+/g, ' ');
+  text = text.replace(/\s*\/\s*/g, ' / ');
+  text = text.replace(/(?:\s*\/\s*){2,}/g, ' / ');
+  text = text.replace(/\s{2,}/g, ' ').trim();
+  text = text.replace(/^[\/\s,;:-]+|[\/\s,;:-]+$/g, '').trim();
+
+  if (!text) {
+    return null;
+  }
+
+  if (text.length > limit) {
+    text = text
+      .slice(0, limit)
+      .replace(/[\/\s,;:-]+$/g, '')
+      .trim();
+  }
+
+  return text || null;
+}
+
+function formatDurationShortMs(ms) {
+  const value = toNonNegativeFiniteNumber(ms, null);
+  if (value === null) {
+    return '';
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}s`;
+  }
+  return `${Math.round(value)}ms`;
+}
+
+/**
+ * Formats a sanitized WebGPU adapter label for HUD display (e.g. `'GPU: nvidia / turing'`).
+ * Returns `''` when absent or invalid.
+ *
+ * @param {unknown} label
+ * @returns {string}
+ */
+export function formatGpuAdapter(label) {
+  const safe = sanitizeGpuAdapterLabel(label);
+  return safe ? `GPU: ${safe}` : '';
+}
+
+/**
+ * Formats a black-loading duration in milliseconds for HUD display
+ * (e.g. `'Black loading: 3.5s'`, `'Black loading: 450ms'`). Returns `''` when absent.
+ *
+ * @param {unknown} ms
+ * @returns {string}
+ */
+export function formatBlackLoadingMs(ms) {
+  const formatted = formatDurationShortMs(ms);
+  return formatted ? `Black loading: ${formatted}` : '';
+}
+
+/**
+ * Formats time-to-first-visible-frame in milliseconds for HUD display
+ * (e.g. `'First visible frame: 4.1s'`). Returns `''` when absent.
+ *
+ * @param {unknown} ms
+ * @returns {string}
+ */
+export function formatFirstVisibleFrameMs(ms) {
+  const formatted = formatDurationShortMs(ms);
+  return formatted ? `First visible frame: ${formatted}` : '';
+}
+
+/**
+ * Formats the combined loading-assets / black-loading / first-visible-frame
+ * indicator text for HUD display. Returns `''` when none are set.
+ *
+ * @param {object|null|undefined} input
+ * @returns {string}
+ */
+export function formatLoadingStatus(input) {
+  if (!isPlainObject(input)) {
+    return '';
+  }
+  const source = isPlainObject(safeGet(input, 'gpu')) ? safeGet(input, 'gpu') : input;
+  const loadingAssets = safeGet(source, 'loadingAssets') === true;
+  const blackMs = toNonNegativeFiniteNumber(safeGet(source, 'blackLoadingMs'), null);
+  const firstMs = toNonNegativeFiniteNumber(safeGet(source, 'firstVisibleFrameMs'), null);
+
+  if (loadingAssets) {
+    const dur = formatDurationShortMs(blackMs);
+    return dur ? `Loading assets (${dur})` : 'Loading assets';
+  }
+  if (firstMs !== null) {
+    return `First visible frame: ${formatDurationShortMs(firstMs)}`;
+  }
+  if (blackMs !== null) {
+    return `Black loading: ${formatDurationShortMs(blackMs)}`;
+  }
+  return '';
+}
+
+/**
+ * Formats guest audio PCM ring status (attachment, drained frames, underruns,
+ * and normalized peak level percentage) for HUD display.
+ *
+ * @param {object|null|undefined} input
+ * @returns {string}
+ */
+export function formatGuestAudioStatus(input) {
+  if (!isPlainObject(input)) {
+    return '';
+  }
+  const source = isPlainObject(safeGet(input, 'audio')) ? safeGet(input, 'audio') : input;
+  const attached = safeGet(source, 'guestRingAttached') === true;
+  const drained = toNonNegativeInt(safeGet(source, 'guestFramesDrained'), 0);
+  const underruns = toNonNegativeInt(safeGet(source, 'guestUnderruns'), 0);
+  const peak = toUnitIntervalNumber(safeGet(source, 'guestPeakLevel'), 0);
+
+  const details = [];
+  if (drained > 0) {
+    details.push(`${drained} drained`);
+  }
+  if (underruns > 0) {
+    details.push(`${underruns} underrun${underruns === 1 ? '' : 's'}`);
+  }
+  if (peak > 0) {
+    details.push(`peak ${Math.round(peak * 100)}%`);
+  }
+
+  const stateLabel = attached ? 'attached' : 'detached';
+  return details.length > 0
+    ? `Guest PCM: ${stateLabel} (${details.join(', ')})`
+    : `Guest PCM: ${stateLabel}`;
+}
+
 /**
  * Formats an FPS number for HUD display matching `web/index.html` (`0.0` for 0,
  * one decimal below 10 FPS, rounded integer at or above 10 FPS).
@@ -820,6 +1092,10 @@ function createInitialGpuTelemetry() {
     onePercentLowFps: null,
     p99FrameMs: null,
     zeroCopyUploads: null,
+    gpuAdapter: null,
+    blackLoadingMs: null,
+    firstVisibleFrameMs: null,
+    loadingAssets: false,
     updatedAtMs: null,
   };
 }
@@ -830,6 +1106,10 @@ function createInitialAudioTelemetry() {
     framesDrained: 0,
     underruns: 0,
     overruns: 0,
+    guestRingAttached: false,
+    guestFramesDrained: 0,
+    guestUnderruns: 0,
+    guestPeakLevel: 0,
     updatedAtMs: null,
   };
 }
@@ -1203,6 +1483,7 @@ export class HudController {
       scriptedInputStatusEl = null,
       visible = true,
       scriptedInputPreset = null,
+      gpuAdapter = null,
       enableToggleShortcut = false,
       toggleShortcutTarget = undefined,
       keyTarget = undefined,
@@ -1330,7 +1611,14 @@ export class HudController {
     this._pthreadTelemetry = createInitialPthreadTelemetry();
     this._hasGpuTelemetry = false;
     this._hasAudioTelemetry = false;
+    this._hasGuestAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
+
+    const initialGpuAdapter = sanitizeGpuAdapterLabel(gpuAdapter);
+    if (initialGpuAdapter !== null) {
+      this._gpuTelemetry.gpuAdapter = initialGpuAdapter;
+      this._hasGpuTelemetry = true;
+    }
 
     const resolvedMinRenderIntervalMs =
       typeof minRenderIntervalMs === 'number' &&
@@ -3217,6 +3505,62 @@ export class HudController {
       touched = true;
     }
 
+    const rawGpuAdapter = pickTelemetryField(primary, secondary, [
+      'gpuAdapter',
+      'gpu_adapter',
+      'adapterLabel',
+      'adapter_label',
+      'adapterInfo',
+      'adapter_info',
+    ]);
+    if (rawGpuAdapter !== undefined) {
+      this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+      touched = true;
+    }
+
+    const rawBlackLoadingMs = pickTelemetryField(primary, secondary, [
+      'blackLoadingMs',
+      'black_loading_ms',
+      'blackScreenMs',
+      'black_screen_ms',
+    ]);
+    if (rawBlackLoadingMs !== undefined) {
+      this._gpuTelemetry.blackLoadingMs = toNonNegativeFiniteNumber(rawBlackLoadingMs, null);
+      touched = true;
+    }
+
+    const rawFirstVisibleFrameMs = pickTelemetryField(primary, secondary, [
+      'firstVisibleFrameMs',
+      'first_visible_frame_ms',
+      'firstVisibleMs',
+      'first_visible_ms',
+      'timeToFirstVisibleFrameMs',
+      'time_to_first_visible_frame_ms',
+    ]);
+    if (rawFirstVisibleFrameMs !== undefined) {
+      this._gpuTelemetry.firstVisibleFrameMs = toNonNegativeFiniteNumber(
+        rawFirstVisibleFrameMs,
+        null
+      );
+      touched = true;
+    }
+
+    const rawLoadingAssets = pickTelemetryField(primary, secondary, [
+      'loadingAssets',
+      'loading_assets',
+      'isLoadingAssets',
+      'is_loading_assets',
+    ]);
+    if (rawLoadingAssets !== undefined) {
+      this._gpuTelemetry.loadingAssets = rawLoadingAssets === true;
+      touched = true;
+    } else if (
+      rawFirstVisibleFrameMs !== undefined &&
+      this._gpuTelemetry.firstVisibleFrameMs !== null
+    ) {
+      this._gpuTelemetry.loadingAssets = false;
+    }
+
     if (touched) {
       this._hasGpuTelemetry = true;
       this._gpuTelemetry.updatedAtMs = this._safeNowMs();
@@ -3233,6 +3577,7 @@ export class HudController {
     const secondary = primary === input ? outer : input;
 
     let touched = false;
+    let guestTouched = false;
 
     const outputState = pickTelemetryField(primary, secondary, [
       'outputState',
@@ -3277,6 +3622,57 @@ export class HudController {
       touched = true;
     }
 
+    const guestRingAttached = pickTelemetryField(primary, secondary, [
+      'guestRingAttached',
+      'guest_ring_attached',
+      'ringAttached',
+      'pcmRingAttached',
+    ]);
+    if (guestRingAttached !== undefined) {
+      this._audioTelemetry.guestRingAttached = guestRingAttached === true;
+      guestTouched = true;
+      touched = true;
+    }
+
+    const guestFramesDrained = pickTelemetryField(primary, secondary, [
+      'guestFramesDrained',
+      'guest_frames_drained',
+      'guestDrainedFrames',
+      'guest_drained_frames',
+    ]);
+    if (guestFramesDrained !== undefined) {
+      this._audioTelemetry.guestFramesDrained = toNonNegativeInt(guestFramesDrained, 0);
+      guestTouched = true;
+      touched = true;
+    }
+
+    const guestUnderruns = pickTelemetryField(primary, secondary, [
+      'guestUnderruns',
+      'guest_underruns',
+      'guestUnderrunCount',
+      'guest_underrun_count',
+    ]);
+    if (guestUnderruns !== undefined) {
+      this._audioTelemetry.guestUnderruns = toNonNegativeInt(guestUnderruns, 0);
+      guestTouched = true;
+      touched = true;
+    }
+
+    const guestPeakLevel = pickTelemetryField(primary, secondary, [
+      'guestPeakLevel',
+      'guest_peak_level',
+      'guestPeak',
+      'guest_peak',
+    ]);
+    if (guestPeakLevel !== undefined) {
+      this._audioTelemetry.guestPeakLevel = toUnitIntervalNumber(guestPeakLevel, 0);
+      guestTouched = true;
+      touched = true;
+    }
+
+    if (guestTouched) {
+      this._hasGuestAudioTelemetry = true;
+    }
     if (touched) {
       this._hasAudioTelemetry = true;
       this._audioTelemetry.updatedAtMs = this._safeNowMs();
@@ -3493,6 +3889,11 @@ export class HudController {
       if (this._applyAudioTelemetry(audioNested)) {
         changed = true;
       }
+      if (hasAnyDefinedKey(payload, GUEST_AUDIO_TELEMETRY_FIELD_KEYS)) {
+        if (this._applyAudioTelemetry(payload)) {
+          changed = true;
+        }
+      }
     } else if (
       msgType === 'audio-stats' ||
       msgType === 'audio-telemetry' ||
@@ -3528,6 +3929,41 @@ export class HudController {
     }
 
     return changed;
+  }
+
+  /**
+   * Returns the current sanitized WebGPU adapter label (`'nvidia / turing'`, etc.) or `null`.
+   *
+   * @returns {string|null}
+   */
+  getGpuAdapter() {
+    return this._gpuTelemetry.gpuAdapter;
+  }
+
+  /**
+   * Updates the active WebGPU adapter label (sanitized lowercase vendor/arch, max 96 chars,
+   * no host paths or secrets) and re-renders HUD diagnostics.
+   *
+   * @param {string|object|null|undefined} label
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   * @returns {string|null} Sanitized adapter label or `null`.
+   */
+  setGpuAdapter(label, options = {}) {
+    if (this._destroyed) {
+      return this._gpuTelemetry.gpuAdapter;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    const sanitized = sanitizeGpuAdapterLabel(label);
+    this._gpuTelemetry.gpuAdapter = sanitized;
+    if (sanitized !== null) {
+      this._hasGpuTelemetry = true;
+    }
+    this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+    this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
+    });
+    return sanitized;
   }
 
   /**
@@ -3603,6 +4039,58 @@ export class HudController {
     ]);
     if (rawZeroCopy !== undefined) {
       this._gpuTelemetry.zeroCopyUploads = toNonNegativeInt(rawZeroCopy, null);
+    }
+
+    const rawGpuAdapter = pickFirstDefined(event, [
+      'gpuAdapter',
+      'gpu_adapter',
+      'adapterLabel',
+      'adapter_label',
+      'adapterInfo',
+      'adapter_info',
+    ]);
+    if (rawGpuAdapter !== undefined) {
+      this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+    }
+
+    const rawBlackLoadingMs = pickFirstDefined(event, [
+      'blackLoadingMs',
+      'black_loading_ms',
+      'blackScreenMs',
+      'black_screen_ms',
+    ]);
+    if (rawBlackLoadingMs !== undefined) {
+      this._gpuTelemetry.blackLoadingMs = toNonNegativeFiniteNumber(rawBlackLoadingMs, null);
+    }
+
+    const rawFirstVisibleFrameMs = pickFirstDefined(event, [
+      'firstVisibleFrameMs',
+      'first_visible_frame_ms',
+      'firstVisibleMs',
+      'first_visible_ms',
+      'timeToFirstVisibleFrameMs',
+      'time_to_first_visible_frame_ms',
+    ]);
+    if (rawFirstVisibleFrameMs !== undefined) {
+      this._gpuTelemetry.firstVisibleFrameMs = toNonNegativeFiniteNumber(
+        rawFirstVisibleFrameMs,
+        null
+      );
+    }
+
+    const rawLoadingAssets = pickFirstDefined(event, [
+      'loadingAssets',
+      'loading_assets',
+      'isLoadingAssets',
+      'is_loading_assets',
+    ]);
+    if (rawLoadingAssets !== undefined) {
+      this._gpuTelemetry.loadingAssets = rawLoadingAssets === true;
+    } else if (
+      rawFirstVisibleFrameMs !== undefined &&
+      this._gpuTelemetry.firstVisibleFrameMs !== null
+    ) {
+      this._gpuTelemetry.loadingAssets = false;
     }
 
     this._recordLiveFrames(nextFrames, {
@@ -3806,6 +4294,7 @@ export class HudController {
     this._pthreadTelemetry = createInitialPthreadTelemetry();
     this._hasGpuTelemetry = false;
     this._hasAudioTelemetry = false;
+    this._hasGuestAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
     this._liveFramesPresented = 0;
     this._liveFps = 0;
@@ -3845,6 +4334,9 @@ export class HudController {
     }
 
     let audioStatusText = '';
+    const guestAudioStatusText = this._hasGuestAudioTelemetry
+      ? formatGuestAudioStatus(a)
+      : '';
     if (this._hasAudioTelemetry) {
       const details = [];
       if (a.framesDrained > 0) {
@@ -3856,10 +4348,13 @@ export class HudController {
       if (a.overruns > 0) {
         details.push(`${a.overruns} overrun${a.overruns === 1 ? '' : 's'}`);
       }
-      audioStatusText =
+      const baseAudioText =
         details.length > 0
           ? `Audio: ${a.outputState} (${details.join(', ')})`
           : `Audio: ${a.outputState}`;
+      audioStatusText = guestAudioStatusText
+        ? `${baseAudioText} · ${guestAudioStatusText}`
+        : baseAudioText;
     }
 
     let pthreadStatusText = '';
@@ -3876,6 +4371,10 @@ export class HudController {
     const p99FrameMsText = formatP99FrameMs(g.p99FrameMs);
     const zeroCopyUploadsText = formatZeroCopyUploads(g.zeroCopyUploads);
     const perfSummaryText = formatPerfMetricsSummary(g);
+    const gpuAdapterText = formatGpuAdapter(g.gpuAdapter);
+    const blackLoadingText = formatBlackLoadingMs(g.blackLoadingMs);
+    const firstVisibleFrameText = formatFirstVisibleFrameMs(g.firstVisibleFrameMs);
+    const loadingStatusText = formatLoadingStatus(g);
 
     return {
       gpu: {
@@ -3891,6 +4390,14 @@ export class HudController {
         p99FrameMsText,
         zeroCopyUploadsText,
         perfSummaryText,
+        gpuAdapter: g.gpuAdapter,
+        gpuAdapterText,
+        blackLoadingMs: g.blackLoadingMs,
+        firstVisibleFrameMs: g.firstVisibleFrameMs,
+        loadingAssets: g.loadingAssets,
+        blackLoadingText,
+        firstVisibleFrameText,
+        loadingStatusText,
         unboundBindGroupCount: g.unboundBindGroupCount,
         skippedDrawCount: g.skippedDrawCount,
         validationErrorCount: g.validationErrorCount,
@@ -3905,6 +4412,11 @@ export class HudController {
         framesDrained: a.framesDrained,
         underruns: a.underruns,
         overruns: a.overruns,
+        guestRingAttached: a.guestRingAttached,
+        guestFramesDrained: a.guestFramesDrained,
+        guestUnderruns: a.guestUnderruns,
+        guestPeakLevel: a.guestPeakLevel,
+        guestStatusText: guestAudioStatusText,
         updatedAtMs: a.updatedAtMs,
         statusText: audioStatusText,
       },
@@ -4624,6 +5136,12 @@ export class HudController {
     if (sideModules.active && sideModules.statusText) {
       parts.push(sideModules.statusText);
     }
+    if (telemetry.gpu.gpuAdapterText) {
+      parts.push(telemetry.gpu.gpuAdapterText);
+    }
+    if (telemetry.gpu.loadingStatusText) {
+      parts.push(telemetry.gpu.loadingStatusText);
+    }
     if (telemetry.gpu.statusText) {
       parts.push(telemetry.gpu.statusText);
     }
@@ -4668,6 +5186,16 @@ export class HudController {
       p99FrameMs: telemetry.gpu.p99FrameMs,
       zeroCopyUploads: telemetry.gpu.zeroCopyUploads,
       perfSummaryText: telemetry.gpu.perfSummaryText,
+      gpuAdapter: telemetry.gpu.gpuAdapter,
+      blackLoadingMs: telemetry.gpu.blackLoadingMs,
+      firstVisibleFrameMs: telemetry.gpu.firstVisibleFrameMs,
+      loadingAssets: telemetry.gpu.loadingAssets,
+      loadingStatusText: telemetry.gpu.loadingStatusText,
+      guestRingAttached: telemetry.audio.guestRingAttached,
+      guestFramesDrained: telemetry.audio.guestFramesDrained,
+      guestUnderruns: telemetry.audio.guestUnderruns,
+      guestPeakLevel: telemetry.audio.guestPeakLevel,
+      guestAudioStatusText: telemetry.audio.guestStatusText,
       sideModules,
       validation,
       telemetry,
@@ -4977,6 +5505,151 @@ export class HudController {
         domStats
       );
       safeSetTitle(zeroCopyEl, zeroCopyUploadsText, domStats);
+    }
+
+    const gpuAdapterEl = els.gpuAdapterEl || els.gpuAdapterBadgeEl || null;
+    if (gpuAdapterEl) {
+      const adapterLabel = gpuTelemetry ? gpuTelemetry.gpuAdapter : null;
+      const adapterTitle = gpuTelemetry ? gpuTelemetry.gpuAdapterText : '';
+      safeSetText(gpuAdapterEl, adapterLabel || '--', domStats);
+      safeSetDataset(gpuAdapterEl, 'gpuAdapter', adapterLabel || '', domStats);
+      safeSetDataset(gpuAdapterEl, 'state', adapterLabel ? 'ok' : '', domStats);
+      safeSetTitle(gpuAdapterEl, adapterTitle, domStats);
+    }
+
+    const loadingEl = els.loadingAssetsBadgeEl || els.loadingAssetsEl || els.blackLoadingEl || null;
+    if (loadingEl) {
+      const loadingAssets = gpuTelemetry ? gpuTelemetry.loadingAssets : false;
+      const blackLoadingMs = gpuTelemetry ? gpuTelemetry.blackLoadingMs : null;
+      const firstVisibleFrameMs = gpuTelemetry ? gpuTelemetry.firstVisibleFrameMs : null;
+      const loadingStatusText = gpuTelemetry ? gpuTelemetry.loadingStatusText : '';
+      const activeLoadingIndicator = loadingAssets || Boolean(loadingStatusText);
+      safeSetHidden(loadingEl, !activeLoadingIndicator, domStats);
+      safeSetAttribute(
+        loadingEl,
+        'aria-hidden',
+        activeLoadingIndicator ? 'false' : 'true',
+        domStats
+      );
+      safeSetText(loadingEl, loadingStatusText, domStats);
+      safeSetDataset(loadingEl, 'loadingAssets', loadingAssets ? 'true' : 'false', domStats);
+      safeSetDataset(
+        loadingEl,
+        'blackLoadingMs',
+        blackLoadingMs !== null ? String(blackLoadingMs) : '',
+        domStats
+      );
+      safeSetDataset(
+        loadingEl,
+        'firstVisibleFrameMs',
+        firstVisibleFrameMs !== null ? String(firstVisibleFrameMs) : '',
+        domStats
+      );
+      safeSetDataset(
+        loadingEl,
+        'state',
+        loadingAssets ? 'info' : firstVisibleFrameMs !== null ? 'ok' : blackLoadingMs !== null ? 'info' : '',
+        domStats
+      );
+      safeSetTitle(loadingEl, loadingStatusText, domStats);
+    }
+
+    if (els.firstVisibleFrameEl) {
+      const firstVisibleFrameMs = gpuTelemetry ? gpuTelemetry.firstVisibleFrameMs : null;
+      const firstVisibleText = gpuTelemetry ? gpuTelemetry.firstVisibleFrameText : '';
+      safeSetText(els.firstVisibleFrameEl, firstVisibleText || '--', domStats);
+      safeSetDataset(
+        els.firstVisibleFrameEl,
+        'firstVisibleFrameMs',
+        firstVisibleFrameMs !== null ? String(firstVisibleFrameMs) : '',
+        domStats
+      );
+      safeSetDataset(
+        els.firstVisibleFrameEl,
+        'state',
+        firstVisibleFrameMs !== null ? 'ok' : '',
+        domStats
+      );
+      safeSetTitle(els.firstVisibleFrameEl, firstVisibleText, domStats);
+    }
+
+    const audioTelemetry = status.telemetry && status.telemetry.audio ? status.telemetry.audio : null;
+    if (els.audioStatusEl && audioTelemetry) {
+      safeSetText(els.audioStatusEl, audioTelemetry.statusText || '--', domStats);
+      safeSetDataset(els.audioStatusEl, 'outputState', audioTelemetry.outputState, domStats);
+      safeSetDataset(
+        els.audioStatusEl,
+        'guestRingAttached',
+        audioTelemetry.guestRingAttached ? 'true' : 'false',
+        domStats
+      );
+      safeSetDataset(
+        els.audioStatusEl,
+        'guestFramesDrained',
+        String(audioTelemetry.guestFramesDrained),
+        domStats
+      );
+      safeSetDataset(
+        els.audioStatusEl,
+        'guestUnderruns',
+        String(audioTelemetry.guestUnderruns),
+        domStats
+      );
+      safeSetDataset(
+        els.audioStatusEl,
+        'guestPeakLevel',
+        String(audioTelemetry.guestPeakLevel),
+        domStats
+      );
+      safeSetDataset(
+        els.audioStatusEl,
+        'state',
+        audioTelemetry.guestRingAttached || audioTelemetry.outputState === AUDIO_OUTPUT_STATE.ACTIVE
+          ? 'ok'
+          : 'info',
+        domStats
+      );
+      safeSetTitle(els.audioStatusEl, audioTelemetry.statusText, domStats);
+    }
+
+    if (els.guestAudioStatusEl && audioTelemetry) {
+      const guestText = audioTelemetry.guestStatusText || '';
+      safeSetText(els.guestAudioStatusEl, guestText || '--', domStats);
+      safeSetDataset(
+        els.guestAudioStatusEl,
+        'guestRingAttached',
+        audioTelemetry.guestRingAttached ? 'true' : 'false',
+        domStats
+      );
+      safeSetDataset(
+        els.guestAudioStatusEl,
+        'guestFramesDrained',
+        String(audioTelemetry.guestFramesDrained),
+        domStats
+      );
+      safeSetDataset(
+        els.guestAudioStatusEl,
+        'guestUnderruns',
+        String(audioTelemetry.guestUnderruns),
+        domStats
+      );
+      safeSetDataset(
+        els.guestAudioStatusEl,
+        'guestPeakLevel',
+        String(audioTelemetry.guestPeakLevel),
+        domStats
+      );
+      safeSetDataset(
+        els.guestAudioStatusEl,
+        'state',
+        audioTelemetry.guestRingAttached
+          ? audioTelemetry.guestUnderruns > 0
+            ? 'warn'
+            : 'ok'
+          : '',
+        domStats
+      );
+      safeSetTitle(els.guestAudioStatusEl, guestText, domStats);
     }
 
     if (els.bootStageEl) {
@@ -5475,6 +6148,7 @@ export class HudController {
       this._pthreadTelemetry = createInitialPthreadTelemetry();
       this._hasGpuTelemetry = false;
       this._hasAudioTelemetry = false;
+      this._hasGuestAudioTelemetry = false;
       this._hasPthreadTelemetry = false;
       this._liveFramesPresented = 0;
       this._liveFps = 0;
@@ -5715,17 +6389,27 @@ export class HudController {
    * scripted-input status, boot diagnostics, render stats, and honest GPU/Audio/Pthread telemetry.
    */
   getSnapshot() {
+    const bootStatus = this.getBootStatus();
+    const telemetry = this.getTelemetry();
     return {
       ...this.getState(),
       visible: this._visible,
       scriptedInputPreset: this._scriptedInputPreset,
+      gpuAdapter: telemetry.gpu.gpuAdapter,
+      blackLoadingMs: telemetry.gpu.blackLoadingMs,
+      firstVisibleFrameMs: telemetry.gpu.firstVisibleFrameMs,
+      loadingAssets: telemetry.gpu.loadingAssets,
+      guestRingAttached: telemetry.audio.guestRingAttached,
+      guestFramesDrained: telemetry.audio.guestFramesDrained,
+      guestUnderruns: telemetry.audio.guestUnderruns,
+      guestPeakLevel: telemetry.audio.guestPeakLevel,
       domWrites: this._domWriteStats.domWrites,
       domWritesElided: this._domWriteStats.domWritesElided,
       minRenderIntervalMs: this._minRenderIntervalMs,
       throttledRenders: this._throttledRenders,
       renderStats: this.getRenderStats(),
-      bootStatus: this.getBootStatus(),
-      telemetry: this.getTelemetry(),
+      bootStatus,
+      telemetry,
     };
   }
 }
