@@ -180,6 +180,22 @@ pub enum WgslBindingSource {
     RootDescriptor { user_sgpr: u32 },
     /// Inline static sampler S# materialized directly in SGPRs (0-based index in stage order).
     StaticSampler { index: u32 },
+    /// SM 6.6 `SamplerDescriptorHeap[index]` (`SAMPLER_HEAP_DIRECTLY_INDEXED`, 0x800):
+    /// 16-byte S# loaded from heap base in `base_user_sgpr` at byte offset derived from `index_user_sgpr`.
+    SamplerHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
+    /// SM 6.6 `ResourceDescriptorHeap[index]` (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, 0x400):
+    /// V#/T# loaded from heap base in `base_user_sgpr` at byte offset derived from `index_user_sgpr`.
+    ResourceHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
 }
 
 /// Reflected vertex input attribute fetched by a vertex stage (`stage_reflection.h`).
@@ -274,6 +290,28 @@ pub(crate) fn write_wgsl_bindings_json(
                 }
                 WgslBindingSource::StaticSampler { index } => {
                     let _ = write!(out, "{{\"static_sampler\": {index}}}");
+                }
+                WgslBindingSource::SamplerHeap {
+                    base_user_sgpr,
+                    stride,
+                    index_user_sgpr,
+                    index_shift,
+                } => {
+                    let _ = write!(
+                        out,
+                        "{{\"sampler_heap\": {{\"base_user_sgpr\": {base_user_sgpr}, \"stride\": {stride}, \"index\": {{\"user_sgpr\": {index_user_sgpr}, \"shift\": {index_shift}}}}}}}"
+                    );
+                }
+                WgslBindingSource::ResourceHeap {
+                    base_user_sgpr,
+                    stride,
+                    index_user_sgpr,
+                    index_shift,
+                } => {
+                    let _ = write!(
+                        out,
+                        "{{\"resource_heap\": {{\"base_user_sgpr\": {base_user_sgpr}, \"stride\": {stride}, \"index\": {{\"user_sgpr\": {index_user_sgpr}, \"shift\": {index_shift}}}}}}}"
+                    );
                 }
             }
         }
@@ -509,12 +547,22 @@ struct VertexFetchPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DynamicHeapOrigin {
+    base_user_sgpr: u32,
+    stride: u32,
+    index_user_sgpr: u32,
+    index_shift: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CbvKey {
     /// Base SGPR pair index (root descriptor table `sbase` for coalesced V# loads,
     /// or direct SMEM `sbase` for direct CBV loads).
     base_sbase: u8,
     /// `Some(table_offset)` for a coalesced descriptor-table V# entry, `None` for direct SMEM.
     table_offset: Option<i32>,
+    /// `Some(origin)` for a coalesced SM 6.6 `ResourceDescriptorHeap` V# CBV entry.
+    dynamic_heap: Option<DynamicHeapOrigin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,6 +585,18 @@ enum ResourceKey {
         table_byte_offset: u32,
     },
     StaticSampler(u32),
+    SamplerHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
+    ResourceHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
     RawSlot(u8),
 }
 
@@ -551,6 +611,28 @@ impl ResourceKey {
                 table_byte_offset,
             }),
             Self::StaticSampler(index) => Some(WgslBindingSource::StaticSampler { index }),
+            Self::SamplerHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => Some(WgslBindingSource::SamplerHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            }),
+            Self::ResourceHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => Some(WgslBindingSource::ResourceHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            }),
             Self::RawSlot(_) => None,
         }
     }
@@ -1028,11 +1110,26 @@ enum SgprOrigin {
     VbTablePtr,
     /// Console user-data SGPR (`s8+` for graphics, `s4+` for compute), optionally offset by bytes.
     UserTable { user_sgpr: u32, byte_offset: i32 },
+    /// Shifted/scaled console user-data SGPR (`s_lshl_b32`, `s_mul_i32`, `s_mulk_i32`),
+    /// used as a dynamic descriptor-heap byte offset.
+    ScaledUserSgpr {
+        user_sgpr: u32,
+        stride: u32,
+        shift: u32,
+    },
+    /// 32-bit GPUVA pointer formed by adding a heap base user SGPR and a scaled index user SGPR
+    /// (`s_add_u32` / `s_add_i32` / `s_lshl{1..4}_add_u32`).
+    DynamicHeapPtr(DynamicHeapOrigin),
     /// Descriptor dword loaded from a user-data descriptor table via `s_load_dwordx4/x8/x16`.
     TableDesc {
         def_inst_idx: usize,
         user_sgpr: u32,
         table_byte_offset: u32,
+    },
+    /// Descriptor dword loaded from an SM 6.6 dynamic sampler/resource heap via `s_load_dwordx4/x8/x16`.
+    DynamicHeapDesc {
+        def_inst_idx: usize,
+        origin: DynamicHeapOrigin,
     },
     /// Vertex-buffer V# descriptor loaded from the hardware VB table (`s[0:1]`).
     VbDesc {
@@ -1052,6 +1149,7 @@ struct VSharpCandidate {
     user_sgpr: Option<u32>,
     table_offset: i32,
     is_dynamic_desc: bool,
+    dynamic_heap: Option<DynamicHeapOrigin>,
     buffer_load_users: Vec<(usize, i32)>,
     tainted_by_scalar_read: bool,
     /// Vertex-shader `idxen` MUBUF/MTBUF attribute fetches using this V# as `srsrc`.
@@ -1122,9 +1220,78 @@ fn decode_inline_u32_src(src: u16, literal: Option<u32>) -> Option<i32> {
     }
 }
 
+fn scale_user_sgpr_by_shift(origin: SgprOrigin, shift: u32) -> SgprOrigin {
+    if shift >= 32 {
+        return SgprOrigin::Unknown;
+    }
+    let mult = 1u32 << shift;
+    match origin {
+        SgprOrigin::UserTable {
+            user_sgpr,
+            byte_offset: 0,
+        } => SgprOrigin::ScaledUserSgpr {
+            user_sgpr,
+            stride: mult,
+            shift,
+        },
+        SgprOrigin::ScaledUserSgpr {
+            user_sgpr, stride, ..
+        } => match stride.checked_mul(mult) {
+            Some(new_stride) if new_stride > 0 => SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride: new_stride,
+                shift: if new_stride.is_power_of_two() {
+                    new_stride.trailing_zeros()
+                } else {
+                    0
+                },
+            },
+            _ => SgprOrigin::Unknown,
+        },
+        _ => SgprOrigin::Unknown,
+    }
+}
+
+fn scale_user_sgpr_by_mul(origin: SgprOrigin, factor: i32) -> SgprOrigin {
+    if factor <= 0 {
+        return SgprOrigin::Unknown;
+    }
+    let f = factor as u32;
+    match origin {
+        SgprOrigin::UserTable {
+            user_sgpr,
+            byte_offset: 0,
+        } => SgprOrigin::ScaledUserSgpr {
+            user_sgpr,
+            stride: f,
+            shift: if f.is_power_of_two() {
+                f.trailing_zeros()
+            } else {
+                0
+            },
+        },
+        SgprOrigin::ScaledUserSgpr {
+            user_sgpr, stride, ..
+        } => match stride.checked_mul(f) {
+            Some(new_stride) if new_stride > 0 => SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride: new_stride,
+                shift: if new_stride.is_power_of_two() {
+                    new_stride.trailing_zeros()
+                } else {
+                    0
+                },
+            },
+            _ => SgprOrigin::Unknown,
+        },
+        _ => SgprOrigin::Unknown,
+    }
+}
+
 /// Detect descriptor-table V#/T#/S# indirections (`s_load_dwordx4/x8/x16`) and track
 /// console user-data SGPR provenance (`s8+` graphics, `s4+` compute) plus hardware VB-table
-/// (`s[0:1]`) and inline static-sampler S# origins for `<pack>.reflect.json` (S31 / #662).
+/// (`s[0:1]`), SM 6.6 dynamic descriptor heaps, and inline static-sampler S# origins
+/// for `<pack>.reflect.json` (S31 / #662, S34 / #733).
 fn analyze_vsharp_indirections(
     active: &[Rdna2Instruction],
     stage: ShaderStage,
@@ -1181,22 +1348,26 @@ fn analyze_vsharp_indirections(
                     }
                     if *sdst <= 104 {
                         retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
-                        let src_origin = if *ssrc0 <= 105 {
-                            origins[*ssrc0 as usize]
+                        let (src_lo, src_hi) = if *ssrc0 <= 105 {
+                            let lo = origins[*ssrc0 as usize];
+                            let hi = if *op == 0x04 && *ssrc0 <= 104 {
+                                origins[(*ssrc0 + 1) as usize]
+                            } else {
+                                SgprOrigin::Unknown
+                            };
+                            (lo, hi)
                         } else if decode_inline_u32_src(u16::from(*ssrc0), *literal).is_some()
                             || *ssrc0 == 0xFF
                         {
-                            SgprOrigin::ConstImmediate {
+                            let c = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
-                            }
+                            };
+                            (c, c)
                         } else {
-                            SgprOrigin::Unknown
+                            (SgprOrigin::Unknown, SgprOrigin::Unknown)
                         };
-                        origins[*sdst as usize] = src_origin;
-                        origins[(*sdst + 1) as usize] = match src_origin {
-                            SgprOrigin::ConstImmediate { .. } => src_origin,
-                            _ => SgprOrigin::Unknown,
-                        };
+                        origins[*sdst as usize] = src_lo;
+                        origins[(*sdst + 1) as usize] = src_hi;
                     } else if *sdst == 105 {
                         retire_overwritten_vsharps(&mut live, &mut finished, 105, 1);
                         origins[105] = SgprOrigin::Unknown;
@@ -1215,11 +1386,13 @@ fn analyze_vsharp_indirections(
                                 && (*sdst % 2 == 1)
                                 && matches!(
                                     origins[(*sdst - 1) as usize],
-                                    SgprOrigin::UserTable { .. } | SgprOrigin::VbTablePtr
+                                    SgprOrigin::UserTable { .. }
+                                        | SgprOrigin::VbTablePtr
+                                        | SgprOrigin::DynamicHeapPtr(_)
                                 )
                             {
-                                // Zero-extending a 32-bit console table pointer in s[2k:2k+1]:
-                                // preserve the low SGPR's UserTable/VbTablePtr origin.
+                                // Zero-extending a 32-bit console table/heap pointer in s[2k:2k+1]:
+                                // preserve the low SGPR's UserTable/VbTablePtr/DynamicHeapPtr origin.
                                 origins[*sdst as usize] = SgprOrigin::ConstImmediate {
                                     def_inst_idx: inst_idx,
                                 };
@@ -1236,19 +1409,42 @@ fn analyze_vsharp_indirections(
                     }
                 }
             }
-            Rdna2Detail::Sopk { op, sdst, .. } => {
+            Rdna2Detail::Sopk {
+                op, sdst, simm16, ..
+            } => {
                 if matches!(*op, 0x0F | 0x10) {
                     taint_vsharp_if_sgpr_read(&mut live, u16::from(*sdst));
                 }
                 if !matches!(*op, 0x17..=0x1A) && *sdst <= 105 {
+                    let prev_origin = origins[*sdst as usize];
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
-                    origins[*sdst as usize] = if *op == 0x00 {
-                        // s_movk_i32
-                        SgprOrigin::ConstImmediate {
-                            def_inst_idx: inst_idx,
+                    let imm = i32::from(*simm16 as i16);
+                    origins[*sdst as usize] = match *op {
+                        0x00 => {
+                            // s_movk_i32
+                            SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                            }
                         }
-                    } else {
-                        SgprOrigin::Unknown
+                        0x0F => {
+                            // s_addk_i32
+                            match prev_origin {
+                                SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset,
+                                } => SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset: byte_offset.saturating_add(imm),
+                                },
+                                SgprOrigin::ScaledUserSgpr { .. } if imm == 0 => prev_origin,
+                                _ => SgprOrigin::Unknown,
+                            }
+                        }
+                        0x10 => {
+                            // s_mulk_i32
+                            scale_user_sgpr_by_mul(prev_origin, imm)
+                        }
+                        _ => SgprOrigin::Unknown,
                     };
                 }
             }
@@ -1286,47 +1482,155 @@ fn analyze_vsharp_indirections(
                     origins[*sdst as usize] = SgprOrigin::Unknown;
                     origins[(*sdst + 1) as usize] = SgprOrigin::Unknown;
                 } else if *sdst <= 105 {
+                    let src0_origin = if *ssrc0 <= 105 {
+                        origins[*ssrc0 as usize]
+                    } else {
+                        SgprOrigin::Unknown
+                    };
+                    let src1_origin = if *ssrc1 <= 105 {
+                        origins[*ssrc1 as usize]
+                    } else {
+                        SgprOrigin::Unknown
+                    };
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
-                    // Preserve table pointer + constant byte offset on s_add_u32 (op 0x00).
                     let mut next_origin = SgprOrigin::Unknown;
-                    if *op == 0x00 {
-                        if *ssrc0 <= 105
-                            && let SgprOrigin::UserTable {
-                                user_sgpr,
-                                byte_offset,
-                            } = origins[*ssrc0 as usize]
-                            && let Some(imm) = decode_inline_u32_src(u16::from(*ssrc1), *literal)
-                        {
-                            next_origin = SgprOrigin::UserTable {
-                                user_sgpr,
-                                byte_offset: byte_offset.saturating_add(imm),
-                            };
-                        } else if *ssrc1 <= 105
-                            && let SgprOrigin::UserTable {
-                                user_sgpr,
-                                byte_offset,
-                            } = origins[*ssrc1 as usize]
-                            && let Some(imm) = decode_inline_u32_src(u16::from(*ssrc0), *literal)
-                        {
-                            next_origin = SgprOrigin::UserTable {
-                                user_sgpr,
-                                byte_offset: byte_offset.saturating_add(imm),
-                            };
+                    match *op {
+                        // s_add_u32 / s_add_i32: table pointer + constant offset, or heap base + scaled index.
+                        0x00 | 0x02 => {
+                            if let (
+                                SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset,
+                                },
+                                Some(imm),
+                            ) = (src0_origin, decode_inline_u32_src(u16::from(*ssrc1), *literal))
+                            {
+                                next_origin = SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset: byte_offset.saturating_add(imm),
+                                };
+                            } else if let (
+                                SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset,
+                                },
+                                Some(imm),
+                            ) = (src1_origin, decode_inline_u32_src(u16::from(*ssrc0), *literal))
+                            {
+                                next_origin = SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset: byte_offset.saturating_add(imm),
+                                };
+                            } else if let (
+                                SgprOrigin::UserTable {
+                                    user_sgpr: base_user_sgpr,
+                                    byte_offset: 0,
+                                },
+                                SgprOrigin::ScaledUserSgpr {
+                                    user_sgpr: index_user_sgpr,
+                                    stride,
+                                    shift: index_shift,
+                                },
+                            ) = (src0_origin, src1_origin)
+                            {
+                                next_origin = SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
+                                    base_user_sgpr,
+                                    stride,
+                                    index_user_sgpr,
+                                    index_shift,
+                                });
+                            } else if let (
+                                SgprOrigin::ScaledUserSgpr {
+                                    user_sgpr: index_user_sgpr,
+                                    stride,
+                                    shift: index_shift,
+                                },
+                                SgprOrigin::UserTable {
+                                    user_sgpr: base_user_sgpr,
+                                    byte_offset: 0,
+                                },
+                            ) = (src0_origin, src1_origin)
+                            {
+                                next_origin = SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
+                                    base_user_sgpr,
+                                    stride,
+                                    index_user_sgpr,
+                                    index_shift,
+                                });
+                            } else if matches!(src0_origin, SgprOrigin::ScaledUserSgpr { .. })
+                                && decode_inline_u32_src(u16::from(*ssrc1), *literal) == Some(0)
+                            {
+                                next_origin = src0_origin;
+                            } else if matches!(src1_origin, SgprOrigin::ScaledUserSgpr { .. })
+                                && decode_inline_u32_src(u16::from(*ssrc0), *literal) == Some(0)
+                            {
+                                next_origin = src1_origin;
+                            }
                         }
-                    } else if *op == 0x24 {
+                        // s_lshl_b32: scale user SGPR index by `1 << shift` for SM 6.6 heap offset.
+                        0x1E => {
+                            if let Some(raw_shift) =
+                                decode_inline_u32_src(u16::from(*ssrc1), *literal)
+                                && (0..32).contains(&raw_shift)
+                            {
+                                next_origin =
+                                    scale_user_sgpr_by_shift(src0_origin, raw_shift as u32);
+                            }
+                        }
+                        // s_mul_i32: scale user SGPR index by constant stride for SM 6.6 heap offset.
+                        0x26 => {
+                            if let Some(imm) = decode_inline_u32_src(u16::from(*ssrc1), *literal) {
+                                next_origin = scale_user_sgpr_by_mul(src0_origin, imm);
+                            } else if let Some(imm) =
+                                decode_inline_u32_src(u16::from(*ssrc0), *literal)
+                            {
+                                next_origin = scale_user_sgpr_by_mul(src1_origin, imm);
+                            }
+                        }
+                        // s_lshl{1,2,3,4}_add_u32: `(ssrc0 << k) + ssrc1`.
+                        0x2E..=0x31 => {
+                            let shift = u32::from(*op - 0x2D);
+                            if let SgprOrigin::ScaledUserSgpr {
+                                user_sgpr: index_user_sgpr,
+                                stride,
+                                shift: index_shift,
+                            } = scale_user_sgpr_by_shift(src0_origin, shift)
+                            {
+                                if let SgprOrigin::UserTable {
+                                    user_sgpr: base_user_sgpr,
+                                    byte_offset: 0,
+                                } = src1_origin
+                                {
+                                    next_origin = SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
+                                        base_user_sgpr,
+                                        stride,
+                                        index_user_sgpr,
+                                        index_shift,
+                                    });
+                                } else if decode_inline_u32_src(u16::from(*ssrc1), *literal)
+                                    == Some(0)
+                                {
+                                    next_origin = SgprOrigin::ScaledUserSgpr {
+                                        user_sgpr: index_user_sgpr,
+                                        stride,
+                                        shift: index_shift,
+                                    };
+                                }
+                            }
+                        }
                         // s_bfm_b32 with immediate operands (common in inline static sampler S#).
-                        if *ssrc0 >= 128 && *ssrc1 >= 128 {
+                        0x24 if *ssrc0 >= 128 && *ssrc1 >= 128 => {
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                             };
                         }
-                    } else if matches!(*op, 0x0E | 0x10)
-                        && *ssrc0 >= 128
-                        && *ssrc1 >= 128
-                    {
-                        next_origin = SgprOrigin::ConstImmediate {
-                            def_inst_idx: inst_idx,
-                        };
+                        // s_and_b32 / s_or_b32 with immediate operands.
+                        0x0E | 0x10 if *ssrc0 >= 128 && *ssrc1 >= 128 => {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                            };
+                        }
+                        _ => {}
                     }
                     origins[*sdst as usize] = next_origin;
                 }
@@ -1379,10 +1683,15 @@ fn analyze_vsharp_indirections(
                         out.direct_smem_user_sgpr.insert(inst_idx, user_sgpr);
                     }
                 }
-                // Snapshot base origin BEFORE overwriting sdata (since sdata can alias sbase_sgpr,
-                // e.g. `s_load_dwordx4 s[8:11], s[8:9], 0x0`).
+                // Snapshot base & dynamic-offset origins BEFORE overwriting sdata (since sdata can
+                // alias sbase_sgpr and/or soffset, e.g. `s_load_dwordx4 s[8:11], s[8:9], s10`).
                 let base_origin = if (sbase_sgpr as usize) < origins.len() {
                     origins[sbase_sgpr as usize]
+                } else {
+                    SgprOrigin::Unknown
+                };
+                let soffset_origin = if is_dynamic && (*soffset as usize) < origins.len() {
+                    origins[*soffset as usize]
                 } else {
                     SgprOrigin::Unknown
                 };
@@ -1403,47 +1712,102 @@ fn analyze_vsharp_indirections(
                     && let Some(count) = smem_load_dword_count(*op)
                     && sdata.saturating_add(count) <= 106
                 {
-                    let (user_sgpr, eff_table_off) = if !is_dynamic {
+                    let (user_sgpr, eff_table_off, dynamic_heap) = if !is_dynamic {
                         let inline_off = if (128..=192).contains(soffset) {
                             i32::from(*soffset - 128)
                         } else {
                             0
                         };
                         let raw_off = offset.saturating_add(inline_off);
-                        let (user_sgpr, eff_table_off, is_vb_table) = match base_origin {
-                            SgprOrigin::VbTablePtr => (None, raw_off, true),
-                            SgprOrigin::UserTable {
-                                user_sgpr,
-                                byte_offset,
-                            } => (Some(user_sgpr), byte_offset.saturating_add(raw_off), false),
-                            _ => (None, raw_off, false),
-                        };
-                        if is_vb_table {
+                        if let SgprOrigin::DynamicHeapPtr(heap) = base_origin {
                             for k in 0..count {
                                 let reg = sdata.saturating_add(k);
-                                let vb_slot = (eff_table_off.saturating_add(i32::from(k) * 4))
-                                    .max(0) as u32
-                                    / 16;
-                                origins[reg as usize] = SgprOrigin::VbDesc {
+                                origins[reg as usize] = SgprOrigin::DynamicHeapDesc {
                                     def_inst_idx: inst_idx,
-                                    vb_slot,
+                                    origin: heap,
                                 };
                             }
-                        } else if let Some(u) = user_sgpr {
+                            (None, 0, Some(heap))
+                        } else {
+                            let (user_sgpr, eff_table_off, is_vb_table) = match base_origin {
+                                SgprOrigin::VbTablePtr => (None, raw_off, true),
+                                SgprOrigin::UserTable {
+                                    user_sgpr,
+                                    byte_offset,
+                                } => (Some(user_sgpr), byte_offset.saturating_add(raw_off), false),
+                                _ => (None, raw_off, false),
+                            };
+                            if is_vb_table {
+                                for k in 0..count {
+                                    let reg = sdata.saturating_add(k);
+                                    let vb_slot = (eff_table_off.saturating_add(i32::from(k) * 4))
+                                        .max(0) as u32
+                                        / 16;
+                                    origins[reg as usize] = SgprOrigin::VbDesc {
+                                        def_inst_idx: inst_idx,
+                                        vb_slot,
+                                    };
+                                }
+                            } else if let Some(u) = user_sgpr {
+                                for k in 0..count {
+                                    let reg = sdata.saturating_add(k);
+                                    let byte_off =
+                                        (eff_table_off.saturating_add(i32::from(k) * 4)).max(0)
+                                            as u32;
+                                    origins[reg as usize] = SgprOrigin::TableDesc {
+                                        def_inst_idx: inst_idx,
+                                        user_sgpr: u,
+                                        table_byte_offset: byte_off,
+                                    };
+                                }
+                            }
+                            (user_sgpr, eff_table_off, None)
+                        }
+                    } else {
+                        let dynamic_heap = match (base_origin, soffset_origin) {
+                            (
+                                SgprOrigin::UserTable {
+                                    user_sgpr: base_user_sgpr,
+                                    byte_offset: 0,
+                                },
+                                SgprOrigin::ScaledUserSgpr {
+                                    user_sgpr: index_user_sgpr,
+                                    stride,
+                                    shift: index_shift,
+                                },
+                            ) => Some(DynamicHeapOrigin {
+                                base_user_sgpr,
+                                stride,
+                                index_user_sgpr,
+                                index_shift,
+                            }),
+                            (
+                                SgprOrigin::UserTable {
+                                    user_sgpr: base_user_sgpr,
+                                    byte_offset: 0,
+                                },
+                                SgprOrigin::UserTable {
+                                    user_sgpr: index_user_sgpr,
+                                    byte_offset: 0,
+                                },
+                            ) => Some(DynamicHeapOrigin {
+                                base_user_sgpr,
+                                stride: 1,
+                                index_user_sgpr,
+                                index_shift: 0,
+                            }),
+                            _ => None,
+                        };
+                        if let Some(heap) = dynamic_heap {
                             for k in 0..count {
                                 let reg = sdata.saturating_add(k);
-                                let byte_off =
-                                    (eff_table_off.saturating_add(i32::from(k) * 4)).max(0) as u32;
-                                origins[reg as usize] = SgprOrigin::TableDesc {
+                                origins[reg as usize] = SgprOrigin::DynamicHeapDesc {
                                     def_inst_idx: inst_idx,
-                                    user_sgpr: u,
-                                    table_byte_offset: byte_off,
+                                    origin: heap,
                                 };
                             }
                         }
-                        (user_sgpr, eff_table_off)
-                    } else {
-                        (None, 0)
+                        (None, 0, dynamic_heap)
                     };
                     live.push(VSharpCandidate {
                         def_inst_idx: inst_idx,
@@ -1452,7 +1816,8 @@ fn analyze_vsharp_indirections(
                         table_sbase: *sbase,
                         user_sgpr,
                         table_offset: eff_table_off,
-                        is_dynamic_desc: is_dynamic,
+                        is_dynamic_desc: is_dynamic || dynamic_heap.is_some(),
+                        dynamic_heap,
                         buffer_load_users: Vec::new(),
                         tainted_by_scalar_read: false,
                         vertex_fetch_users: 0,
@@ -1549,22 +1914,42 @@ fn analyze_vsharp_indirections(
                             cand.used_as_descriptor = true;
                         }
                     }
-                    if (rsrc_sgpr as usize) < origins.len()
-                        && let SgprOrigin::TableDesc {
-                            def_inst_idx,
-                            user_sgpr,
-                            table_byte_offset,
-                        } = origins[rsrc_sgpr as usize]
-                    {
-                        out.vsharp_fetch_insts.insert(def_inst_idx);
-                        let key = ResourceKey::Table {
-                            user_sgpr,
-                            table_byte_offset,
-                        };
-                        if layout.is_store {
-                            out.inst_storage_tex_keys.insert(inst_idx, key);
-                        } else {
-                            out.inst_tex_keys.insert(inst_idx, key);
+                    if (rsrc_sgpr as usize) < origins.len() {
+                        match origins[rsrc_sgpr as usize] {
+                            SgprOrigin::TableDesc {
+                                def_inst_idx,
+                                user_sgpr,
+                                table_byte_offset,
+                            } => {
+                                out.vsharp_fetch_insts.insert(def_inst_idx);
+                                let key = ResourceKey::Table {
+                                    user_sgpr,
+                                    table_byte_offset,
+                                };
+                                if layout.is_store {
+                                    out.inst_storage_tex_keys.insert(inst_idx, key);
+                                } else {
+                                    out.inst_tex_keys.insert(inst_idx, key);
+                                }
+                            }
+                            SgprOrigin::DynamicHeapDesc {
+                                def_inst_idx,
+                                origin,
+                            } => {
+                                out.vsharp_fetch_insts.insert(def_inst_idx);
+                                let key = ResourceKey::ResourceHeap {
+                                    base_user_sgpr: origin.base_user_sgpr,
+                                    stride: origin.stride,
+                                    index_user_sgpr: origin.index_user_sgpr,
+                                    index_shift: origin.index_shift,
+                                };
+                                if layout.is_store {
+                                    out.inst_storage_tex_keys.insert(inst_idx, key);
+                                } else {
+                                    out.inst_tex_keys.insert(inst_idx, key);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     if !layout.is_load && !layout.is_store {
@@ -1590,6 +1975,21 @@ fn analyze_vsharp_indirections(
                                         ResourceKey::Table {
                                             user_sgpr,
                                             table_byte_offset,
+                                        },
+                                    );
+                                }
+                                SgprOrigin::DynamicHeapDesc {
+                                    def_inst_idx,
+                                    origin,
+                                } => {
+                                    out.vsharp_fetch_insts.insert(def_inst_idx);
+                                    out.inst_samp_keys.insert(
+                                        inst_idx,
+                                        ResourceKey::SamplerHeap {
+                                            base_user_sgpr: origin.base_user_sgpr,
+                                            stride: origin.stride,
+                                            index_user_sgpr: origin.index_user_sgpr,
+                                            index_shift: origin.index_shift,
                                         },
                                     );
                                 }
@@ -1651,6 +2051,25 @@ fn analyze_vsharp_indirections(
                         }
                         record_vsharp_buffer_use(&mut live, *srsrc, false);
                     }
+                    SgprOrigin::DynamicHeapDesc {
+                        def_inst_idx,
+                        origin,
+                    } => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::ResourceHeap {
+                                base_user_sgpr: origin.base_user_sgpr,
+                                stride: origin.stride,
+                                index_user_sgpr: origin.index_user_sgpr,
+                                index_shift: origin.index_shift,
+                            },
+                        );
+                        if stage == ShaderStage::Vertex && mubuf_storage_op(*op).is_some() {
+                            out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                        record_vsharp_buffer_use(&mut live, *srsrc, false);
+                    }
                     _ => {
                         let is_vertex_fetch = stage == ShaderStage::Vertex
                             && *idxen
@@ -1700,6 +2119,25 @@ fn analyze_vsharp_indirections(
                         }
                         record_vsharp_buffer_use(&mut live, *srsrc, false);
                     }
+                    SgprOrigin::DynamicHeapDesc {
+                        def_inst_idx,
+                        origin,
+                    } => {
+                        out.vsharp_fetch_insts.insert(def_inst_idx);
+                        out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::ResourceHeap {
+                                base_user_sgpr: origin.base_user_sgpr,
+                                stride: origin.stride,
+                                index_user_sgpr: origin.index_user_sgpr,
+                                index_shift: origin.index_shift,
+                            },
+                        );
+                        if stage == ShaderStage::Vertex && mtbuf_storage_op(*op).is_some() {
+                            out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                        record_vsharp_buffer_use(&mut live, *srsrc, false);
+                    }
                     _ => {
                         let is_vertex_fetch = stage == ShaderStage::Vertex
                             && *idxen
@@ -1732,6 +2170,7 @@ fn analyze_vsharp_indirections(
                 let key = CbvKey {
                     base_sbase: cand.table_sbase,
                     table_offset: Some(eff_off),
+                    dynamic_heap: None,
                 };
                 out.indirect_smem_cbv_keys.insert(user_idx, key);
                 if let Some(u) = cand.user_sgpr {
@@ -1742,9 +2181,30 @@ fn analyze_vsharp_indirections(
                 }
             }
         } else if !cand.tainted_by_scalar_read
-            && (cand.used_as_descriptor
-                || cand.vertex_fetch_users > 0
-                || (cand.is_dynamic_desc && !cand.buffer_load_users.is_empty()))
+            && cand.is_dynamic_desc
+            && !cand.buffer_load_users.is_empty()
+        {
+            out.vsharp_fetch_insts.insert(cand.def_inst_idx);
+            if let Some(heap) = cand.dynamic_heap {
+                for (user_idx, _delta_bytes) in cand.buffer_load_users {
+                    let key = CbvKey {
+                        base_sbase: cand.table_sbase,
+                        table_offset: None,
+                        dynamic_heap: Some(heap),
+                    };
+                    out.indirect_smem_cbv_keys.insert(user_idx, key);
+                    out.cbv_sources
+                        .entry(key)
+                        .or_insert(WgslBindingSource::ResourceHeap {
+                            base_user_sgpr: heap.base_user_sgpr,
+                            stride: heap.stride,
+                            index_user_sgpr: heap.index_user_sgpr,
+                            index_shift: heap.index_shift,
+                        });
+                }
+            }
+        } else if !cand.tainted_by_scalar_read
+            && (cand.used_as_descriptor || cand.vertex_fetch_users > 0)
         {
             // Pure descriptor fetch (static or dynamic heap T#/S#/VB V#/storage V#):
             // never allocate a spurious CBV!
@@ -2143,8 +2603,10 @@ fn plan_program(
                         .unwrap_or(CbvKey {
                             base_sbase: *sbase,
                             table_offset: None,
+                            dynamic_heap: None,
                         });
                     if cbv_key.table_offset.is_none()
+                        && cbv_key.dynamic_heap.is_none()
                         && let Some(&user_sgpr) = desc_analysis.direct_smem_user_sgpr.get(&inst_idx)
                     {
                         desc_analysis
@@ -6950,6 +7412,7 @@ impl IrEmitter {
             .unwrap_or(CbvKey {
                 base_sbase: sbase,
                 table_offset: None,
+                dynamic_heap: None,
             });
         let Some(&(cb_global, cb_vec4_count)) = self
             .cb_globals
@@ -14495,6 +14958,243 @@ mod tests {
         assert_eq!(tex.view_dimension, Some("3d"));
         assert_eq!(uav.view_dimension, Some("3d"));
         assert_eq!(uav.storage_format, Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s34_sampler_heap_pattern_a_emits_source_json_and_no_bogus_cbv() {
+        // SM 6.6 SAMPLER_HEAP_DIRECTLY_INDEXED (0x800) Pattern A (#482 Comment #21):
+        //   s_mov_b32 s10, s11
+        //   s_lshl_b32 s9, s9, 4
+        //   s_load_dwordx4 s[16:19], s[10:11], s9
+        //   s_mov_b32 s9, 0
+        //   s_load_dwordx8 s[24:31], s[8:9], 0x0
+        //   image_sample v0, v2, s[24:31], s[16:19] dmask:0xf dim:1
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 11)); // s_mov_b32 s10, s11
+        words.push(enc_sop2(0x1E, 9, 9, 128 + 4)); // s_lshl_b32 s9, s9, 4
+        words.extend_from_slice(&enc_smem(0x02, 16, 5, 9, 0x0, false, false)); // s_load_dwordx4 s[16:19], s[10:11], s9
+        words.push(enc_sop1(0x03, 9, 0x80)); // s_mov_b32 s9, 0
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x0, false, false)); // s_load_dwordx8 s[24:31], s[8:9], 0x0
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 0, 6, 4)); // image_sample srsrc=6, ssamp=4
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.kind != "uniform"),
+            "dynamic sampler heap load must NOT fabricate a spurious CBV: {:?}",
+            out.bindings
+        );
+        assert_eq!(out.bindings.len(), 2, "bindings: {:?}", out.bindings);
+        assert_eq!(out.bindings[0].kind, "texture_2d");
+        assert_eq!(
+            out.bindings[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 0,
+            })
+        );
+        assert_eq!(out.bindings[1].kind, "sampler");
+        assert_eq!(
+            out.bindings[1].source,
+            Some(WgslBindingSource::SamplerHeap {
+                base_user_sgpr: 11,
+                stride: 16,
+                index_user_sgpr: 9,
+                index_shift: 4,
+            })
+        );
+        // All bindings are reflected -> fragment offset +32 applies.
+        assert_eq!(out.bindings[0].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 1);
+        assert_eq!(out.bindings[1].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 2);
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"source\": {\"sampler_heap\": {\"base_user_sgpr\": 11, \"stride\": 16, \"index\": {\"user_sgpr\": 9, \"shift\": 4}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s34_sampler_heap_pattern_b_in_place_overwrite_emits_source() {
+        // SM 6.6 SAMPLER_HEAP_DIRECTLY_INDEXED (0x800) Pattern B (#482 Comment #21):
+        //   s_mov_b32 s10, s9
+        //   s_mov_b32 s9, 0
+        //   s_load_dwordx8 s[16:23], s[8:9], 0x0
+        //   s_mov_b32 s8, s11
+        //   s_lshl_b32 s10, s10, 4
+        //   s_load_dwordx4 s[8:11], s[8:9], s10    ; overwrites BOTH base (s8:9) and index (s10)!
+        //   image_sample v0, v2, s[16:23], s[8:11] dmask:0xf dim:1
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 9)); // s_mov_b32 s10, s9
+        words.push(enc_sop1(0x03, 9, 0x80)); // s_mov_b32 s9, 0
+        words.extend_from_slice(&enc_smem(0x03, 16, 4, 0x7D, 0x0, false, false)); // T# @ s8 + 0 -> s[16:23]
+        words.push(enc_sop1(0x03, 8, 11)); // s_mov_b32 s8, s11
+        words.push(enc_sop2(0x1E, 10, 10, 128 + 4)); // s_lshl_b32 s10, s10, 4
+        words.extend_from_slice(&enc_smem(0x02, 8, 4, 10, 0x0, false, false)); // s_load_dwordx4 s[8:11], s[8:9], s10
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 0, 4, 2)); // image_sample srsrc=4, ssamp=2
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.kind != "uniform"),
+            "in-place dynamic sampler heap load must NOT fabricate a spurious CBV: {:?}",
+            out.bindings
+        );
+        assert_eq!(out.bindings.len(), 2, "bindings: {:?}", out.bindings);
+        assert_eq!(
+            out.bindings[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 0,
+            })
+        );
+        assert_eq!(
+            out.bindings[1].source,
+            Some(WgslBindingSource::SamplerHeap {
+                base_user_sgpr: 11,
+                stride: 16,
+                index_user_sgpr: 9,
+                index_shift: 4,
+            })
+        );
+        assert_eq!(out.bindings[0].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 1);
+        assert_eq!(out.bindings[1].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 2);
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"source\": {\"sampler_heap\": {\"base_user_sgpr\": 11, \"stride\": 16, \"index\": {\"user_sgpr\": 9, \"shift\": 4}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s34_resource_heap_texture_and_buffers_emit_source_and_key_by_origin() {
+        // Compute shader using SM 6.6 ResourceDescriptorHeap (0x400) + SamplerDescriptorHeap (0x800):
+        //   - s4 = resource heap base, s5 = tex index, s6 = buf0 index, s7 = buf1 index,
+        //     s8 = sampler heap base, s9 = sampler index
+        //   - T# loaded via s_lshl_b32 (shift 5 -> stride 32) into BOTH s[24:31] and s[32:39]
+        //     (must deduplicate into 1 texture_2d binding!).
+        //   - S# loaded via s_lshl4_add_u32 + static-offset s_load_dwordx4 -> SamplerHeap!
+        //   - V#0 loaded via s_mul_i32 (pow2 stride 16 -> shift 4) into s[16:19] -> buffer_load.
+        //   - V#1 loaded via s_mul_i32 (non-pow2 stride 24 -> shift 0) into SAME s[16:19] -> buffer_load
+        //     (must separate into 2 distinct read-only-storage bindings despite SGPR reuse!).
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 4)); // s10 = s4 (resource heap base)
+        words.push(enc_sop1(0x03, 11, 0x80)); // s11 = 0
+        words.push(enc_sop2(0x1E, 12, 5, 128 + 5)); // s_lshl_b32 s12, s5, 5 (stride 32)
+        words.extend_from_slice(&enc_smem(0x03, 24, 5, 12, 0x0, false, false)); // T# -> s[24:31]
+        words.extend_from_slice(&enc_smem(0x03, 32, 5, 12, 0x0, false, false)); // SAME T# -> s[32:39]
+        // S# via s_lshl4_add_u32 s14, s9, s8 ; s_mov_b32 s15, 0 ; s_load_dwordx4 s[20:23], s[14:15], 0x0
+        words.push(enc_sop2(0x31, 14, 9, 8)); // s_lshl4_add_u32 s14, s9, s8
+        words.push(enc_sop1(0x03, 15, 0x80)); // s15 = 0
+        words.extend_from_slice(&enc_smem(0x02, 20, 7, 0x7D, 0x0, false, false)); // S# -> s[20:23]
+        // Sample both T# copies with the dynamic heap sampler
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 4, 6, 5)); // image_sample_lz srsrc=6 (s24), ssamp=5 (s20)
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 8, 8, 5)); // image_sample_lz srsrc=8 (s32), ssamp=5 (s20)
+        // V#0: s_mul_i32 s13, s6, 16 -> s_load_dwordx4 s[16:19], s[10:11], s13 -> buffer_load_dwordx4
+        words.push(enc_sop2(0x26, 13, 6, 128 + 16)); // s_mul_i32 s13, s6, 16
+        words.extend_from_slice(&enc_smem(0x02, 16, 5, 13, 0x0, false, false)); // V#0 -> s[16:19]
+        let ld_w0 = (0b111000u32 << 26) | (0x0Eu32 << 18) | (1u32 << 12);
+        let ld1_w1 = (0x80u32 << 24) | (4u32 << 16) | (12u32 << 8);
+        words.extend_from_slice(&[ld_w0, ld1_w1]);
+        // V#1: s_mul_i32 s13, s7, 24 -> reload SAME s[16:19] -> buffer_load_dwordx4
+        words.push(enc_sop2(0x26, 13, 7, 128 + 24)); // s_mul_i32 s13, s7, 24
+        words.extend_from_slice(&enc_smem(0x02, 16, 5, 13, 0x0, false, false)); // V#1 -> s[16:19]
+        let ld2_w1 = (0x80u32 << 24) | (4u32 << 16) | (16u32 << 8);
+        words.extend_from_slice(&[ld_w0, ld2_w1]);
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.kind != "uniform"),
+            "dynamic heap T#/S#/V# loads must NOT fabricate spurious CBVs: {:?}",
+            out.bindings
+        );
+
+        let texs: Vec<_> = out.bindings.iter().filter(|b| b.kind == "texture_2d").collect();
+        assert_eq!(texs.len(), 1, "duplicate ResourceHeap T# must deduplicate: {:?}", out.bindings);
+        assert_eq!(
+            texs[0].source,
+            Some(WgslBindingSource::ResourceHeap {
+                base_user_sgpr: 4,
+                stride: 32,
+                index_user_sgpr: 5,
+                index_shift: 5,
+            })
+        );
+
+        let samps: Vec<_> = out.bindings.iter().filter(|b| b.kind == "sampler").collect();
+        assert_eq!(samps.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(
+            samps[0].source,
+            Some(WgslBindingSource::SamplerHeap {
+                base_user_sgpr: 8,
+                stride: 16,
+                index_user_sgpr: 9,
+                index_shift: 4,
+            })
+        );
+
+        let sbufs: Vec<_> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "read-only-storage")
+            .collect();
+        assert_eq!(sbufs.len(), 2, "reused SGPR across 2 heap indices must emit 2 sbufs: {:?}", out.bindings);
+        assert_eq!(
+            sbufs[0].source,
+            Some(WgslBindingSource::ResourceHeap {
+                base_user_sgpr: 4,
+                stride: 16,
+                index_user_sgpr: 6,
+                index_shift: 4,
+            })
+        );
+        assert_eq!(
+            sbufs[1].source,
+            Some(WgslBindingSource::ResourceHeap {
+                base_user_sgpr: 4,
+                stride: 24,
+                index_user_sgpr: 7,
+                index_shift: 0,
+            })
+        );
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"source\": {\"resource_heap\": {\"base_user_sgpr\": 4, \"stride\": 32, \"index\": {\"user_sgpr\": 5, \"shift\": 5}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"resource_heap\": {\"base_user_sgpr\": 4, \"stride\": 16, \"index\": {\"user_sgpr\": 6, \"shift\": 4}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"resource_heap\": {\"base_user_sgpr\": 4, \"stride\": 24, \"index\": {\"user_sgpr\": 7, \"shift\": 0}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"sampler_heap\": {\"base_user_sgpr\": 8, \"stride\": 16, \"index\": {\"user_sgpr\": 9, \"shift\": 4}}}"
+            ),
+            "JSON:\n{json}"
+        );
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
