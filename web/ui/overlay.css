@@ -1154,6 +1154,15 @@ body {
   -webkit-backdrop-filter: none;
 }
 
+@keyframes pg6-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 #splash-overlay-root .pg6-splash__spinner {
   width: 14px;
   height: 14px;
@@ -1178,9 +1187,11 @@ body {
 #splash-overlay-root .pg6-splash__greg {
   width: 22px;
   height: 22px;
+  display: block;
+  object-fit: contain;
   border: none;
-  border-radius: var(--radius-full);
   box-shadow: none;
+  animation: pg6-spin 1200ms linear infinite;
 }
 
 #splash-overlay-root .pg6-splash__stage {
