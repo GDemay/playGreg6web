@@ -1702,6 +1702,17 @@ export function bootstrapPlayGta6App(options = {}) {
         : '';
   const parsedUrlOptions = parseBootUrlOptions(rawUrlSearch);
   const parsedSplashHold = parseSplashHoldQuery(rawUrlSearch);
+  // #1077: `?opfsL2=0` bypasses the io_worker OPFS L2 hot-file cache (#1238). Off by default.
+  const opfsL2Disabled = (() => {
+    try {
+      const qs = String(rawUrlSearch || '');
+      const q = qs.indexOf('?');
+      const params = new URLSearchParams(q >= 0 ? qs.slice(q + 1) : qs);
+      return parseBooleanQueryFlag(getQueryParamInsensitive(params, 'opfsL2')) === false;
+    } catch {
+      return false;
+    }
+  })();
   const splashOverlayOptions =
     options.splashOverlayOptions && typeof options.splashOverlayOptions === 'object'
       ? options.splashOverlayOptions
@@ -2146,6 +2157,9 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (typeof options.audioRingAutoPump === 'boolean') {
       fields.audioRingAutoPump = options.audioRingAutoPump;
+    }
+    if (opfsL2Disabled) {
+      fields.opfsL2Enabled = false;
     }
     return fields;
   }
