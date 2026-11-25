@@ -1509,6 +1509,7 @@ test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen buil
     'legal-notices',
     'chrome-menu-flow',
     'chrome-full-boot',
+    'menu-to-ingame',
   ]);
   assert.deepEqual(Object.keys(INPUT_SCRIPT_PRESETS), [...INPUT_SCRIPT_PRESET_NAMES]);
 
@@ -1522,6 +1523,12 @@ test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen buil
       assert.equal(Object.isFrozen(spec.events), true, `Preset ${name} events must be frozen`);
       for (const ev of spec.events) {
         assert.equal(Object.isFrozen(ev), true, `Preset ${name} event must be frozen`);
+        if (ev.sticks) {
+          assert.equal(Object.isFrozen(ev.sticks), true, `Preset ${name} event.sticks must be frozen`);
+        }
+        if (ev.triggers) {
+          assert.equal(Object.isFrozen(ev.triggers), true, `Preset ${name} event.triggers must be frozen`);
+        }
       }
     }
     if (spec.loop) {
@@ -2645,4 +2652,449 @@ test('W271 gamepad hot-plug connect/disconnect/failover updates stats cleanly an
   assert.equal(bridge.getStats().gamepadConnects, stats.gamepadConnects);
   assert.equal(bridge.getStats().gamepadDisconnects, stats.gamepadDisconnects);
   assert.equal(bridge.getSnapshot().seq, seqAfterDestroy);
+});
+
+test('W297 menu-to-ingame preset progresses deterministically from Start Screen through Calibration/Legal, Intro skip, Main Menu, and in-game sticks/triggers, and completes cleanly bounded', () => {
+  assert.ok(INPUT_SCRIPT_PRESET_NAMES.includes('menu-to-ingame'));
+  const spec = INPUT_SCRIPT_PRESETS['menu-to-ingame'];
+  assert.ok(spec);
+  assert.equal(spec.name, 'menu-to-ingame');
+  assert.equal(spec.loop, undefined, 'menu-to-ingame must be cleanly bounded without an infinite loop');
+  assert.equal(spec.events.length, 24);
+  assert.equal(spec.events[0].atMs, 5000);
+  assert.equal(spec.events[spec.events.length - 1].atMs, 58500);
+  assert.equal(spec.events[spec.events.length - 1].holdMs, 800);
+
+  const player = new ScriptedInputPlayer('menu-to-ingame');
+  assert.equal(player.preset, 'menu-to-ingame');
+
+  // Initial quiet boot settle window (0..4999 ms).
+  for (const t of [0, 1000, 4999]) {
+    assert.deepEqual(player.sampleAt(t), { buttonsMask: 0, activeEventCount: 0 }, `silent at ${t}`);
+    assert.equal(player.pressCountAt(t), 0);
+  }
+
+  // Phase 1: Start Screen A confirmations (5000, 7000, 9000).
+  for (const [idx, atMs] of [5000, 7000, 9000].entries()) {
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `Start Screen A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 99).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), idx + 1);
+  }
+
+  // Phase 2: Calibration & Legal Notices accepts (12000..26500) including DPAD_DOWN x2 + A for "Next >".
+  const phase2 = [
+    [12000, INPUT_BUTTONS.A],
+    [14500, INPUT_BUTTONS.A],
+    [17000, INPUT_BUTTONS.A],
+    [20000, INPUT_BUTTONS.DPAD_DOWN],
+    [20500, INPUT_BUTTONS.DPAD_DOWN],
+    [21200, INPUT_BUTTONS.A],
+    [24000, INPUT_BUTTONS.A],
+    [26500, INPUT_BUTTONS.A],
+  ];
+  for (const [idx, [atMs, btn]] of phase2.entries()) {
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0, `idle before phase2 at ${atMs}`);
+    assert.equal(player.sampleAt(atMs).buttonsMask, btn, `phase2 btn at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 99).buttonsMask, btn);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), 3 + idx + 1);
+  }
+
+  // Phase 3: Intro cinematic skip (hold A 600ms, MENU 150ms, confirm A 100ms).
+  assert.equal(player.sampleAt(30000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(30599).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(30600).buttonsMask, 0);
+  assert.equal(player.sampleAt(32500).buttonsMask, INPUT_BUTTONS.MENU);
+  assert.equal(player.sampleAt(32649).buttonsMask, INPUT_BUTTONS.MENU);
+  assert.equal(player.sampleAt(32650).buttonsMask, 0);
+  assert.equal(player.sampleAt(34500).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(34600).buttonsMask, 0);
+  assert.equal(player.pressCountAt(34500), 14);
+
+  // Phase 4: Main Menu Story/Play selection confirmations (38000, 40500, 43000, 45500).
+  for (const [idx, atMs] of [38000, 40500, 43000, 45500].entries()) {
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `Main Menu A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), 14 + idx + 1);
+  }
+
+  // Phase 5: In-game left stick, right stick, and LT/RT trigger probes (50000..59300 ms).
+  assert.deepEqual(player.sampleAt(50000), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: 0, ly: 0.85, rx: 0, ry: 0 },
+  });
+  assert.deepEqual(player.sampleAt(51500), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(52000), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: 0, ly: 0, rx: 0.75, ry: 0.25 },
+  });
+  assert.deepEqual(player.sampleAt(53200), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(53700), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: 0.6, ly: 0.4, rx: -0.75, ry: -0.2 },
+  });
+  assert.deepEqual(player.sampleAt(54900), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(55500), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: 0, ly: 0, rx: 0.35, ry: 0 },
+    triggers: { lt: 0.85, rt: 0 },
+  });
+  assert.deepEqual(player.sampleAt(56500), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(57000), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: 0, ly: 0.9, rx: 0, ry: 0 },
+    triggers: { lt: 0, rt: 0.9 },
+  });
+  assert.deepEqual(player.sampleAt(58000), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(58500), {
+    buttonsMask: 0,
+    activeEventCount: 1,
+    sticks: { lx: -0.5, ly: 0.5, rx: 0.5, ry: 0 },
+    triggers: { lt: 0.5, rt: 0.75 },
+  });
+
+  // Bounded completion at 59300 ms: all axes/buttons released, no further transitions.
+  assert.deepEqual(player.sampleAt(59300), { buttonsMask: 0, activeEventCount: 0 });
+  assert.equal(player.nextTransitionMs(58500), 59300);
+  assert.equal(player.nextTransitionMs(59300), null);
+  assert.equal(player.pressCountAt(120000), 24);
+
+  // Invariants over 120 seconds: NEVER presses B or DPAD_UP, axes bounded, idle after 59300 ms.
+  for (let t = 0; t <= 120000; t += 50) {
+    const sample = player.sampleAt(t);
+    assert.equal(sample.buttonsMask & INPUT_BUTTONS.B, 0, `must never press B at t=${t}`);
+    assert.equal(sample.buttonsMask & INPUT_BUTTONS.DPAD_UP, 0, `must never press DPAD_UP at t=${t}`);
+    if (sample.sticks) {
+      for (const axis of ['lx', 'ly', 'rx', 'ry']) {
+        assert.ok(sample.sticks[axis] >= -1 && sample.sticks[axis] <= 1, `${axis} out of range at t=${t}`);
+      }
+    }
+    if (sample.triggers) {
+      for (const trig of ['lt', 'rt']) {
+        assert.ok(sample.triggers[trig] >= 0 && sample.triggers[trig] <= 1, `${trig} out of range at t=${t}`);
+      }
+    }
+    if (t >= 59300) {
+      assert.deepEqual(sample, { buttonsMask: 0, activeEventCount: 0 }, `must stay idle after 59300 ms at t=${t}`);
+    }
+  }
+
+  // maxPresses and endMs caps work cleanly on menu-to-ingame.
+  const capped = new ScriptedInputPlayer({ preset: 'menu-to-ingame', maxPresses: 20 });
+  assert.equal(capped.preset, 'menu-to-ingame');
+  assert.deepEqual(capped.sampleAt(52000).sticks, { lx: 0, ly: 0, rx: 0.75, ry: 0.25 }); // #20
+  assert.deepEqual(capped.sampleAt(53700), { buttonsMask: 0, activeEventCount: 0 });
+  assert.equal(capped.pressCountAt(120000), 20);
+  assert.equal(capped.nextTransitionMs(53200), null);
+
+  const cappedEnd = new ScriptedInputPlayer('menu-to-ingame', { endMs: 56000 });
+  assert.deepEqual(cappedEnd.sampleAt(55999).triggers, { lt: 0.85, rt: 0 });
+  assert.deepEqual(cappedEnd.sampleAt(56000), { buttonsMask: 0, activeEventCount: 0 });
+  assert.equal(cappedEnd.nextTransitionMs(55500), 56000);
+  assert.equal(cappedEnd.nextTransitionMs(56000), null);
+});
+
+test('W297 InputBridge drives menu-to-ingame (buttons, sticks, triggers) into 40-byte SAB, merges with live inputs, and auto-completes cleanly', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+  const dv = new DataView(bridge.sab);
+
+  assert.ok(bridge.getStats().availablePresets.includes('menu-to-ingame'));
+
+  let completedState = null;
+  bridge.startScript('menu-to-ingame', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+    onComplete: (state) => {
+      completedState = state;
+    },
+  });
+
+  assert.equal(bridge.getInputTelemetry().activePreset, 'menu-to-ingame');
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 0);
+
+  // Phase 1 Start Screen A at 5000 ms.
+  clock.advanceTo(5000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 1);
+
+  // Phase 2 Legal Notices DPAD_DOWN at 20000 ms.
+  clock.advanceTo(20000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+
+  // Phase 3 Intro skip MENU at 32500 ms.
+  clock.advanceTo(32500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MENU);
+
+  // Phase 4 Main Menu A at 45500 ms.
+  clock.advanceTo(45500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 18);
+
+  // Phase 5 In-game movement: left stick forward (50000 ms).
+  clock.advanceTo(50000);
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  approxEqual(snap.lx, 0);
+  approxEqual(snap.ly, 0.85);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.LEFT_STICK_Y, true), 0.85);
+
+  // Phase 5 In-game camera look: right stick (52000 ms).
+  clock.advanceTo(52000);
+  snap = bridge.getSnapshot();
+  approxEqual(snap.lx, 0);
+  approxEqual(snap.ly, 0);
+  approxEqual(snap.rx, 0.75);
+  approxEqual(snap.ry, 0.25);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.RIGHT_STICK_X, true), 0.75);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.RIGHT_STICK_Y, true), 0.25);
+
+  // Phase 5 In-game aim probe: right stick + LT trigger (55500 ms), merged with live mouse RT.
+  clock.advanceTo(55500);
+  env.lockPointer();
+  env.win.dispatch('mousedown', { button: 0 }); // live mouse RT = 1.0
+  snap = bridge.getSnapshot();
+  approxEqual(snap.rx, 0.35);
+  approxEqual(snap.lt, 0.85);
+  approxEqual(snap.rt, 1.0);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.LEFT_TRIGGER, true), 0.85);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.RIGHT_TRIGGER, true), 1.0);
+
+  // Window blur clears stuck human mouse RT while preserving active scripted LT & right stick!
+  env.win.dispatch('blur');
+  snap = bridge.getSnapshot();
+  approxEqual(snap.rx, 0.35);
+  approxEqual(snap.lt, 0.85);
+  approxEqual(snap.rt, 0);
+  assert.equal(bridge.getInputTelemetry().stuckResetCount, 1);
+
+  // Phase 5 In-game accelerate probe: left stick + RT trigger (57000 ms).
+  clock.advanceTo(57000);
+  snap = bridge.getSnapshot();
+  approxEqual(snap.ly, 0.9);
+  approxEqual(snap.lt, 0);
+  approxEqual(snap.rt, 0.9);
+  approxEqual(dv.getFloat32(INPUT_OFFSETS.RIGHT_TRIGGER, true), 0.9);
+
+  // Phase 5 Combined dual stick + dual triggers (58500 ms).
+  clock.advanceTo(58500);
+  snap = bridge.getSnapshot();
+  approxEqual(snap.lx, -0.5);
+  approxEqual(snap.ly, 0.5);
+  approxEqual(snap.rx, 0.5);
+  approxEqual(snap.ry, 0);
+  approxEqual(snap.lt, 0.5);
+  approxEqual(snap.rt, 0.75);
+
+  // Auto-completion at 59300 ms: every channel zeroed, timers cleared, activePreset cleared.
+  clock.advanceTo(59300);
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  assert.equal(snap.lx, 0);
+  assert.equal(snap.ly, 0);
+  assert.equal(snap.rx, 0);
+  assert.equal(snap.ry, 0);
+  assert.equal(snap.lt, 0);
+  assert.equal(snap.rt, 0);
+  assert.equal(clock.pendingTimeouts(), 0);
+  assert.ok(completedState !== null && completedState.active === false);
+  assert.equal(bridge.getScriptState().active, false);
+  assert.equal(bridge.getInputTelemetry().activePreset, null);
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 24);
+
+  // Custom repeating trigger spec + stopScript() immediately clears held scripted triggers.
+  bridge.startScript(
+    {
+      startMs: 0,
+      holdMs: 500,
+      periodMs: 1000,
+      triggers: { left: 0.6, rightTrigger: 0.8 },
+    },
+    {
+      nowFn: clock.nowFn,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    }
+  );
+  snap = bridge.getSnapshot();
+  approxEqual(snap.lt, 0.6);
+  approxEqual(snap.rt, 0.8);
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 25);
+
+  bridge.stopScript();
+  snap = bridge.getSnapshot();
+  assert.equal(snap.lt, 0);
+  assert.equal(snap.rt, 0);
+  assert.equal(bridge.getInputTelemetry().scriptedEventsDispatched, 25, 'stopScript must not increment dispatched count');
+
+  // Invalid triggers specifier throws TypeError.
+  assert.throws(
+    () => new ScriptedInputPlayer([{ atMs: 0, holdMs: 100, triggers: 'invalid' }]),
+    TypeError
+  );
+
+  bridge.destroy();
+});
+
+test('W297 zero-alloc getSnapshot({ reuse: true }) and getInputTelemetry() track pollsCount, writesCount, stuckResetCount, activePreset, and scriptedEventsDispatched', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // 1. Initial telemetry is clean zeroed state.
+  const initialTel = bridge.getInputTelemetry();
+  assert.equal(initialTel.pollsCount, 0);
+  assert.equal(initialTel.writesCount, 0);
+  assert.equal(initialTel.stuckResetCount, 0);
+  assert.equal(initialTel.activePreset, null);
+  assert.equal(initialTel.scriptedEventsDispatched, 0);
+  assert.equal(initialTel.seq, 0);
+  assert.equal(initialTel.buttons, 0);
+  assert.equal(initialTel.pointerLocked, false);
+  assert.equal(initialTel.activeGamepadIndex, null);
+
+  // 2. Zero-alloc getSnapshot({ reuse: true }) reuses the exact same internal object in-place.
+  const reusedSnap1 = bridge.getSnapshot({ reuse: true });
+  const reusedSnap2 = bridge.getSnapshot({ reuse: true });
+  assert.equal(reusedSnap1, reusedSnap2, 'getSnapshot({ reuse: true }) must reuse internal scratch object');
+  assert.equal(reusedSnap1.seq, 0);
+
+  // Default getSnapshot() preserves backwards-compatible fresh-object behavior.
+  const freshSnap1 = bridge.getSnapshot();
+  const freshSnap2 = bridge.getSnapshot();
+  assert.notEqual(freshSnap1, freshSnap2);
+  assert.notEqual(freshSnap1, reusedSnap1);
+
+  // getSnapshot({ out }) reuses caller-provided object.
+  const callerSnap = {};
+  assert.equal(bridge.getSnapshot({ out: callerSnap, maxRetries: 8 }), callerSnap);
+
+  // 3. Zero-alloc getInputTelemetry({ reuse: true }) and getInputTelemetry(out) reuse in-place.
+  const reusedTel1 = bridge.getInputTelemetry({ reuse: true });
+  const reusedTel2 = bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1, reusedTel2, 'getInputTelemetry({ reuse: true }) must reuse internal scratch object');
+  const callerTel = {};
+  assert.equal(bridge.getInputTelemetry(callerTel), callerTel);
+  assert.equal(bridge.getInputTelemetry({ out: callerTel }), callerTel);
+  assert.notEqual(bridge.getInputTelemetry(), reusedTel1);
+
+  // 4. Gamepad poll/write path: steady-state polling increments pollsCount without spurious writes
+  //    and reuses internal _selectedGamepadScratch (zero per-frame allocations).
+  const pad = makeStandardGamepad({
+    index: 0,
+    buttons: { 0: 1, 6: 0.4, 7: 0.8 },
+    axes: [0.6, -0.4, -0.5, 0.5],
+  });
+  env.setGamepads([pad]);
+
+  const entry1 = bridge._selectGamepadEntry();
+  const entry2 = bridge._selectGamepadEntry();
+  assert.equal(entry1, entry2, '_selectGamepadEntry must reuse pre-allocated scratch entry');
+  assert.equal(entry1, bridge._selectedGamepadScratch);
+
+  assert.equal(bridge.pollGamepads(), true);
+  assert.equal(bridge._selectedGamepadScratch.pad, null, 'pollGamepads must clear scratch pad ref');
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.pollsCount, 1);
+  assert.equal(reusedTel1.writesCount, 1);
+  assert.equal(reusedTel1.activeGamepadIndex, 0);
+  assert.equal(reusedTel1.buttons, INPUT_BUTTONS.A);
+
+  // 100 identical polls -> pollsCount += 100, writesCount unchanged.
+  for (let i = 0; i < 100; i++) {
+    assert.equal(bridge.pollGamepads(), false);
+  }
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.pollsCount, 101);
+  assert.equal(reusedTel1.writesCount, 1);
+
+  // 5. Mousemove + keyboard writes increment writesCount and update reused snapshot in-place.
+  env.lockPointer();
+  env.win.dispatch('mousemove', { movementX: 11, movementY: -7 });
+  env.win.dispatch('keydown', { code: 'KeyW' });
+  bridge.getSnapshot({ reuse: true });
+  assert.equal(reusedSnap1.mouse_dx, 11);
+  assert.equal(reusedSnap1.mouse_dy, -7);
+  assert.equal(reusedSnap1.buttons, INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD);
+  assert.equal(reusedSnap1.pointerLocked, true);
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.writesCount, 3);
+
+  // 6. Seqlock odd sequence respected by getSnapshot({ reuse: true, maxRetries: 4 }).
+  const savedSeq = reusedSnap1.seq;
+  Atomics.store(bridge.u32, INPUT_WORD_INDICES.SEQ, savedSeq + 1);
+  assert.equal(bridge.getSnapshot({ reuse: true, maxRetries: 4 }), null);
+  Atomics.store(bridge.u32, INPUT_WORD_INDICES.SEQ, savedSeq + 2);
+  assert.equal(bridge.getSnapshot({ reuse: true, maxRetries: 4 }), reusedSnap1);
+  assert.equal(reusedSnap1.seq, savedSeq + 2);
+
+  // 7. Blur / visibilitychange (hidden) / pagehide increment stuckResetCount (and writesCount).
+  env.win.dispatch('blur');
+  env.doc.hidden = false;
+  env.doc.visibilityState = 'visible';
+  env.doc.dispatch('visibilitychange'); // visible -> must NOT increment stuckResetCount
+  env.doc.hidden = true;
+  env.doc.visibilityState = 'hidden';
+  env.doc.dispatch('visibilitychange');
+  env.win.dispatch('pagehide');
+
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.stuckResetCount, 3);
+  assert.equal(reusedTel1.writesCount, 6);
+  assert.equal(bridge.getStats().stuckResetCount, 3);
+  assert.equal(bridge.getStats().blurResets, 3);
+  assert.equal(bridge.getStats().pollsCount, 101);
+  assert.equal(bridge.getStats().writesCount, 6);
+
+  // 8. Scripted playback updates activePreset and scriptedEventsDispatched in hot telemetry.
+  bridge.startScript('menu-to-ingame', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.activePreset, 'menu-to-ingame');
+  assert.equal(reusedTel1.scriptedEventsDispatched, 0);
+
+  clock.advanceTo(5000);
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.scriptedEventsDispatched, 1);
+  assert.equal(reusedTel1.writesCount, 7);
+
+  // Release at 5100 ms writes zeroed state to SAB without incrementing scriptedEventsDispatched.
+  clock.advanceTo(5100);
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.scriptedEventsDispatched, 1);
+  assert.equal(reusedTel1.writesCount, 8);
+  assert.equal(bridge.getStats().scriptedEventsDispatched, 1);
+
+  bridge.stopScript();
+  bridge.getInputTelemetry({ reuse: true });
+  assert.equal(reusedTel1.activePreset, null);
+  assert.equal(reusedTel1.scriptedEventsDispatched, 1);
+
+  bridge.destroy();
 });
