@@ -850,5 +850,536 @@ class TestWholeFileNativeDumpPackingAndEntryPoints(unittest.TestCase):
             self.assertEqual(updated, already_ok_wgsl)
 
 
+class TestWgpkVerificationAndBounds(unittest.TestCase):
+    """T91: Verify WGPK v1 header, table/payload bounds, overlaps, UTF-8, and CLI --verify-pack."""
+
+    def _raw_pack(
+        self,
+        entries: list[tuple[int, int, bytes, int, int]],
+        *,
+        magic: bytes = packer.PACK_MAGIC,
+        version: int = packer.PACK_VERSION,
+        entry_count: int | None = None,
+        flags: int = 0,
+        payload_blob: bytes = b"",
+    ) -> bytes:
+        count = len(entries) if entry_count is None else entry_count
+        header = packer.PACK_HEADER_STRUCT.pack(magic, version, count, flags)
+        table = b"".join(
+            packer.PACK_ENTRY_STRUCT.pack(h, st, res, off, length)
+            for h, st, res, off, length in entries
+        )
+        return header + table + payload_blob
+
+    def test_verify_wgpk_pack_valid_and_bounds_errors(self) -> None:
+        vs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.VERTEX]
+        fs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.FRAGMENT]
+        valid_bytes, _ = packer.serialize_wgpk(
+            [(0x10, packer.ShaderStage.VERTEX, vs), (0x20, packer.ShaderStage.FRAGMENT, fs)],
+            flags=7,
+        )
+
+        summary = packer.verify_wgpk_pack(valid_bytes, require_canonical_order=True)
+        self.assertEqual(summary.version, 1)
+        self.assertEqual(summary.flags, 7)
+        self.assertEqual(summary.entry_count, 2)
+        self.assertEqual(summary.unique_hash_count, 2)
+        self.assertEqual(summary.total_wgsl_bytes, len(vs.encode("utf-8")) + len(fs.encode("utf-8")))
+        self.assertTrue(summary.canonical_hash_order)
+        self.assertTrue(summary.canonical_pair_order)
+        self.assertEqual(summary.stage_counts, {"vertex": 1, "fragment": 1, "compute": 0})
+
+        # Truncated header (empty and < 16 bytes)
+        for bad_hdr in (b"", b"WGPK", b"WGPK" + b"\x00" * 11):
+            with self.assertRaises(packer.PackerError) as ctx:
+                packer.verify_wgpk_pack(bad_hdr)
+            self.assertEqual(ctx.exception.code, "wgpk_truncated_header")
+
+        # Invalid magic
+        bad_magic = self._raw_pack([], magic=b"NOPE")
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(bad_magic)
+        self.assertEqual(ctx.exception.code, "wgpk_invalid_magic")
+
+        # Unsupported versions
+        for bad_ver in (0, 2, 99):
+            with self.assertRaises(packer.PackerError) as ctx:
+                packer.verify_wgpk_pack(self._raw_pack([], version=bad_ver))
+            self.assertEqual(ctx.exception.code, "wgpk_unsupported_version")
+
+        # Entry count exceeding MAX_PACK_ENTRIES (u32 table overflow)
+        overflow_hdr = packer.PACK_HEADER_STRUCT.pack(
+            packer.PACK_MAGIC, packer.PACK_VERSION, packer.MAX_PACK_ENTRIES + 1, 0
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(overflow_hdr)
+        self.assertEqual(ctx.exception.code, "pack_overflow")
+
+        # Truncated entry table
+        truncated_table = self._raw_pack(
+            [(0x1, 1, b"\x00\x00\x00", 56, 0)],
+            entry_count=2,
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(truncated_table)
+        self.assertEqual(ctx.exception.code, "wgpk_truncated_table")
+
+        # Invalid stage code
+        bad_stage = self._raw_pack(
+            [(0x1, 9, b"\x00\x00\x00", 36, 4)],
+            payload_blob=b"abcd",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(bad_stage)
+        self.assertEqual(ctx.exception.code, "wgpk_invalid_stage")
+
+        # Payload offset pointing inside header/entry table (< data_start)
+        offset_in_header = self._raw_pack(
+            [(0x1, 1, b"\x00\x00\x00", 8, 4)],
+            payload_blob=b"abcd",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(offset_in_header)
+        self.assertEqual(ctx.exception.code, "wgpk_out_of_bounds")
+
+        # Payload extending past EOF
+        past_eof = self._raw_pack(
+            [(0x1, 1, b"\x00\x00\x00", 36, 10)],
+            payload_blob=b"abcd",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(past_eof)
+        self.assertEqual(ctx.exception.code, "wgpk_out_of_bounds")
+
+        # Payload offset + length overflowing u32::MAX
+        u32_overflow = self._raw_pack(
+            [(0x1, 1, b"\x00\x00\x00", 0xFFFFFFF0, 0x20)],
+            payload_blob=b"abcd",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(u32_overflow)
+        self.assertEqual(ctx.exception.code, "wgpk_payload_overflow")
+
+        # Overlapping payload ranges
+        data_start = packer.PACK_HEADER_BYTES + 2 * packer.PACK_ENTRY_BYTES
+        overlapping = self._raw_pack(
+            [
+                (0x1, 1, b"\x00\x00\x00", data_start, 8),
+                (0x2, 2, b"\x00\x00\x00", data_start + 4, 8),
+            ],
+            payload_blob=b"0123456789ab",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(overlapping)
+        self.assertEqual(ctx.exception.code, "wgpk_overlapping_payloads")
+
+        # Invalid UTF-8 payload
+        bad_utf8 = self._raw_pack(
+            [(0x1, 1, b"\x00\x00\x00", 36, 3)],
+            payload_blob=b"\xff\xfe\xfd",
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(bad_utf8)
+        self.assertEqual(ctx.exception.code, "wgpk_invalid_utf8")
+
+    def test_cli_verify_pack_mode_valid_and_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pack_path = tmp_path / "verified.wgsl.pack"
+            report_path = tmp_path / "verify_report.json"
+
+            with redirect_stdout(io.StringIO()):
+                rc_build = packer.main(
+                    [
+                        "--hashes",
+                        "fragment:0x200,vertex:0x100",
+                        "--out",
+                        str(pack_path),
+                    ]
+                )
+            self.assertEqual(rc_build, 0)
+
+            out_buf = io.StringIO()
+            with redirect_stdout(out_buf):
+                rc_verify = packer.main(
+                    [
+                        "--verify-pack",
+                        str(pack_path),
+                        "--require-canonical-order",
+                        "--json",
+                        "--report-json",
+                        str(report_path),
+                    ]
+                )
+            self.assertEqual(rc_verify, 0)
+            payload = json.loads(out_buf.getvalue())
+            self.assertEqual(payload["mode"], "verify")
+            self.assertTrue(payload["verified"])
+            self.assertTrue(payload["canonical_hash_order"])
+            self.assertEqual(payload["entry_count"], 2)
+            self.assertEqual(payload["input_file"], "verified.wgsl.pack")
+            self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), payload)
+
+            # Corrupt one byte in the magic header -> verify fails with rc=1
+            corrupt_path = tmp_path / "corrupt.wgsl.pack"
+            corrupt_path.write_bytes(b"BAD!" + pack_path.read_bytes()[4:])
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc_bad = packer.main(["--verify-pack", str(corrupt_path)])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("invalid WGPK magic", err_buf.getvalue())
+
+            # Mutually exclusive flags -> exit code 2
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc_conflict = packer.main(
+                    ["--verify-pack", str(pack_path), "--out", str(tmp_path / "other.pack")]
+                )
+            self.assertEqual(rc_conflict, 2)
+
+
+class TestDuplicateHashRejection(unittest.TestCase):
+    """T91: Verify duplicate-hash rejection across verifier, serializer, builder, and CLI."""
+
+    def test_verify_wgpk_rejects_duplicate_hashes_and_pairs(self) -> None:
+        vs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.VERTEX]
+        fs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.FRAGMENT]
+        vs_bytes = vs.encode("utf-8")
+        fs_bytes = fs.encode("utf-8")
+        data_start = packer.PACK_HEADER_BYTES + 2 * packer.PACK_ENTRY_BYTES
+
+        # Raw pack with exact duplicate (hash, stage) pair
+        dup_pair_pack = (
+            packer.PACK_HEADER_STRUCT.pack(packer.PACK_MAGIC, packer.PACK_VERSION, 2, 0)
+            + packer.PACK_ENTRY_STRUCT.pack(0xABC, 1, b"\x00\x00\x00", data_start, len(vs_bytes))
+            + packer.PACK_ENTRY_STRUCT.pack(
+                0xABC, 1, b"\x00\x00\x00", data_start + len(vs_bytes), len(vs_bytes)
+            )
+            + vs_bytes
+            + vs_bytes
+        )
+        for reject_flag in (True, False):
+            with self.assertRaises(packer.PackerError) as ctx:
+                packer.verify_wgpk_pack(dup_pair_pack, reject_duplicate_hashes=reject_flag)
+            self.assertEqual(ctx.exception.code, "wgpk_duplicate_hash")
+
+        # Raw pack with duplicate 64-bit hash across distinct stages
+        dup_hash_diff_stage = (
+            packer.PACK_HEADER_STRUCT.pack(packer.PACK_MAGIC, packer.PACK_VERSION, 2, 0)
+            + packer.PACK_ENTRY_STRUCT.pack(0xABC, 1, b"\x00\x00\x00", data_start, len(vs_bytes))
+            + packer.PACK_ENTRY_STRUCT.pack(
+                0xABC, 2, b"\x00\x00\x00", data_start + len(vs_bytes), len(fs_bytes)
+            )
+            + vs_bytes
+            + fs_bytes
+        )
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(dup_hash_diff_stage, reject_duplicate_hashes=True)
+        self.assertEqual(ctx.exception.code, "wgpk_duplicate_hash")
+
+        # Legacy stage-conflict inspection still works when opted in
+        summary = packer.verify_wgpk_pack(
+            dup_hash_diff_stage,
+            reject_duplicate_hashes=False,
+            require_canonical_order=True,
+        )
+        self.assertEqual(summary.entry_count, 2)
+        self.assertEqual(summary.unique_hash_count, 1)
+        self.assertFalse(summary.canonical_hash_order)
+        self.assertTrue(summary.canonical_pair_order)
+
+    def test_serializer_and_builder_reject_duplicate_hashes(self) -> None:
+        vs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.VERTEX]
+        fs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.FRAGMENT]
+
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.serialize_wgpk(
+                [(0x42, packer.ShaderStage.VERTEX, vs), (0x42, packer.ShaderStage.VERTEX, vs)]
+            )
+        self.assertEqual(ctx.exception.code, "duplicate_hash")
+
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.serialize_wgpk(
+                [(0x42, packer.ShaderStage.VERTEX, vs), (0x42, packer.ShaderStage.FRAGMENT, fs)],
+                reject_duplicate_hashes=True,
+            )
+        self.assertEqual(ctx.exception.code, "duplicate_hash")
+
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.sort_entries_canonical(
+                [(0x42, packer.ShaderStage.VERTEX, vs), (0x42, packer.ShaderStage.FRAGMENT, fs)],
+                reject_duplicate_hashes=True,
+            )
+        self.assertEqual(ctx.exception.code, "duplicate_hash")
+
+        # build_fallback_pack with reject_duplicate_hashes=True rejects same-stage, cross-stage, and unknown dupes
+        for bad_records in (
+            [
+                packer.ShaderInputRecord(0x99, packer.ShaderStage.VERTEX, "cli_hashes"),
+                packer.ShaderInputRecord(0x99, packer.ShaderStage.VERTEX, "cli_hashes"),
+            ],
+            [
+                packer.ShaderInputRecord(0x99, packer.ShaderStage.VERTEX, "cli_hashes"),
+                packer.ShaderInputRecord(0x99, packer.ShaderStage.FRAGMENT, "cli_hashes"),
+            ],
+            [
+                packer.ShaderInputRecord(0x99, packer.ShaderStage.VERTEX, "cli_hashes"),
+                packer.ShaderInputRecord(0x99, None, "scan_json"),
+            ],
+        ):
+            with self.assertRaises(packer.PackerError) as ctx:
+                packer.build_fallback_pack(bad_records, reject_duplicate_hashes=True)
+            self.assertEqual(ctx.exception.code, "duplicate_hash")
+
+        # CLI --reject-duplicate-hashes fails without writing output
+        with tempfile.TemporaryDirectory() as tmp:
+            out_pack = Path(tmp) / "dup.wgsl.pack"
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc = packer.main(
+                    [
+                        "--hashes",
+                        "vertex:0x1234,fragment:0x1234",
+                        "--reject-duplicate-hashes",
+                        "--out",
+                        str(out_pack),
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            self.assertIn("duplicate shader hash", err_buf.getvalue())
+            self.assertFalse(out_pack.exists())
+
+
+class TestCanonicalHashSortingDeterminism(unittest.TestCase):
+    """T91: Verify deterministic canonical ascending unsigned 64-bit hash sorting."""
+
+    def test_unsigned_u64_canonical_order_and_permutation_determinism(self) -> None:
+        vs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.VERTEX]
+        fs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.FRAGMENT]
+        cs = packer.BUILTIN_PROFILES["default"][packer.ShaderStage.COMPUTE]
+
+        # Include unsigned 64-bit edge values (signed i64 would mis-order 0x8000... / 0xFFFF...)
+        entries_a = [
+            (0xFFFFFFFFFFFFFFFF, packer.ShaderStage.COMPUTE, cs),
+            (0x8000000000000000, packer.ShaderStage.FRAGMENT, fs),
+            (0x0000000000000000, packer.ShaderStage.VERTEX, vs),
+            (0x7FFFFFFFFFFFFFFF, packer.ShaderStage.VERTEX, vs),
+            (0x0000000000000001, packer.ShaderStage.FRAGMENT, fs),
+        ]
+        entries_b = list(reversed(entries_a))
+        entries_c = [entries_a[3], entries_a[0], entries_a[4], entries_a[2], entries_a[1]]
+
+        bytes_a, ranges_a = packer.serialize_wgpk(entries_a, canonical_sort=True, reject_duplicate_hashes=True)
+        bytes_b, ranges_b = packer.serialize_wgpk(entries_b, canonical_sort=True, reject_duplicate_hashes=True)
+        bytes_c, _ = packer.serialize_wgpk(entries_c, canonical_sort=True, reject_duplicate_hashes=True)
+
+        self.assertEqual(bytes_a, bytes_b)
+        self.assertEqual(bytes_a, bytes_c)
+
+        # Returned ranges map accurately back to each input entry's WGSL payload
+        for (expected_list, ranges, raw_pack) in ((entries_a, ranges_a, bytes_a), (entries_b, ranges_b, bytes_b)):
+            for (_h, _st, wgsl), (off, length) in zip(expected_list, ranges, strict=True):
+                self.assertEqual(raw_pack[off : off + length].decode("utf-8"), wgsl)
+
+        summary = packer.verify_wgpk_pack(bytes_a, reject_duplicate_hashes=True, require_canonical_order=True)
+        self.assertTrue(summary.canonical_hash_order)
+        self.assertEqual(
+            [e.shader_hash for e in summary.entries],
+            [
+                0x0000000000000000,
+                0x0000000000000001,
+                0x7FFFFFFFFFFFFFFF,
+                0x8000000000000000,
+                0xFFFFFFFFFFFFFFFF,
+            ],
+        )
+
+        # Unsorted raw pack fails require_canonical_order=True
+        unsorted_bytes, _ = packer.serialize_wgpk(entries_a, canonical_sort=False, reject_duplicate_hashes=True)
+        unsorted_summary = packer.verify_wgpk_pack(unsorted_bytes, require_canonical_order=False)
+        self.assertFalse(unsorted_summary.canonical_hash_order)
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_wgpk_pack(unsorted_bytes, require_canonical_order=True)
+        self.assertEqual(ctx.exception.code, "wgpk_non_canonical_order")
+
+        # Direct verify_canonical_hash_order checks
+        packer.verify_canonical_hash_order([0, 1, 0x7FFFFFFFFFFFFFFF, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF])
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_canonical_hash_order([0x10, 0x10])
+        self.assertEqual(ctx.exception.code, "wgpk_duplicate_hash")
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.verify_canonical_hash_order([0x20, 0x10])
+        self.assertEqual(ctx.exception.code, "wgpk_non_canonical_order")
+
+
+class TestEmptyInputGuards(unittest.TestCase):
+    """T91: Verify empty-input guards and explicit --allow-empty escape hatch."""
+
+    def test_empty_records_and_unknown_only_inputs_rejected_by_default(self) -> None:
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.build_fallback_pack([])
+        self.assertEqual(ctx.exception.code, "empty_input")
+
+        with self.assertRaises(packer.PackerError) as ctx:
+            packer.build_fallback_pack([packer.ShaderInputRecord(0x1234, None, "scan_json")])
+        self.assertEqual(ctx.exception.code, "empty_pack")
+
+        # Explicit allow_empty=True produces a valid 16-byte WGPK v1 header
+        empty_res = packer.build_fallback_pack([], allow_empty=True)
+        self.assertEqual(len(empty_res.pack_bytes), packer.PACK_HEADER_BYTES)
+        self.assertEqual(len(empty_res.entries), 0)
+        assert empty_res.verification is not None
+        self.assertTrue(empty_res.verification.canonical_hash_order)
+        self.assertEqual(empty_res.verification.entry_count, 0)
+
+    def test_cli_empty_scan_json_and_allow_empty_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            empty_scan = tmp_path / "empty_scan.json"
+            empty_scan.write_text(json.dumps({"schema_version": 1, "files": []}), encoding="utf-8")
+            unknown_only_scan = tmp_path / "unknown_only.json"
+            unknown_only_scan.write_text(
+                json.dumps({"shaders": [{"hash": "0xdeadbeef", "stage": "unknown"}]}),
+                encoding="utf-8",
+            )
+            out_pack = tmp_path / "empty.wgsl.pack"
+
+            # Empty scan JSON refused without --allow-empty
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = packer.main(["--scan-json", str(empty_scan), "--out", str(out_pack)])
+            self.assertEqual(rc, 1)
+            self.assertIn("no shader records", err.getvalue())
+            self.assertFalse(out_pack.exists())
+
+            # Unknown-only scan JSON refused without --allow-empty
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = packer.main(["--scan-json", str(unknown_only_scan), "--out", str(out_pack)])
+            self.assertEqual(rc, 1)
+            self.assertIn("no packable shader entries", err.getvalue())
+            self.assertFalse(out_pack.exists())
+
+            # Empty --hashes string rejected
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = packer.main(["--hashes", " , , ", "--out", str(out_pack)])
+            self.assertEqual(rc, 1)
+
+            # Missing --out (and no --verify-pack) returns exit code 2
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = packer.main(["--hashes", "vertex:0x1"])
+            self.assertEqual(rc, 2)
+
+            # Explicit --allow-empty succeeds and passes WGPK verification
+            out_buf = io.StringIO()
+            with redirect_stdout(out_buf):
+                rc = packer.main(
+                    ["--scan-json", str(empty_scan), "--allow-empty", "--out", str(out_pack), "--json"]
+                )
+            self.assertEqual(rc, 0)
+            rep = json.loads(out_buf.getvalue())
+            self.assertEqual(rep["summary"]["packed_entry_count"], 0)
+            self.assertTrue(rep["verification"]["verified"])
+            self.assertEqual(len(out_pack.read_bytes()), packer.PACK_HEADER_BYTES)
+
+
+class TestHostPathJsonSanitization(unittest.TestCase):
+    """T91: Verify host paths, file URIs, tilde paths, usernames, and raw bytes never leak in JSON."""
+
+    def test_render_json_summary_scrubs_all_host_path_variants_and_usernames(self) -> None:
+        fake_user = "hidden_builder_99"
+        env_patch = {
+            "USERNAME": f"CORP\\{fake_user}",
+            "USER": fake_user,
+            "HOME": f"/home/{fake_user}",
+            "USERPROFILE": f"C:\\Users\\{fake_user}",
+        }
+        raw_payload = {
+            "win_path": f"C:\\Users\\{fake_user}\\Private\\game.bin",
+            "unc_path": f"\\\\fileserver\\share\\{fake_user}\\pack.wgsl.pack",
+            "posix_path": f"/Users/{fake_user}/workspace/pack.wgsl.pack",
+            "cygwin_path": f"/cygdrive/c/Users/{fake_user}/shader.bin",
+            "file_uri_posix": f"file:///home/{fake_user}/pack.wgsl.pack",
+            "file_uri_win": f"file:///C:/Users/{fake_user}/pack.wgsl.pack",
+            "tilde_path": f"~/Documents/{fake_user}/pack.wgsl.pack",
+            "path_obj": Path(f"/tmp/{fake_user}/nested/out_{fake_user}.wgsl.pack"),
+            "raw_bytes": b"WGPK\x01\x00\x00\x00",
+            f"key_with_{fake_user}": [f"owned by {fake_user}"],
+        }
+
+        with mock.patch.dict(os.environ, env_patch):
+            rendered = packer.render_json_summary(raw_payload)
+
+        parsed = json.loads(rendered)
+        self.assertNotIn(fake_user, rendered)
+        self.assertNotIn("CORP", rendered)
+        self.assertNotIn("C:", rendered)
+        self.assertNotIn("fileserver", rendered)
+        self.assertNotIn("/Users/", rendered)
+        self.assertNotIn("/home/", rendered)
+        self.assertNotIn("/cygdrive/", rendered)
+        self.assertNotIn("file://", rendered)
+        self.assertNotIn("~/Documents", rendered)
+        self.assertNotIn("WGPK", rendered)
+        self.assertEqual(parsed["raw_bytes"], "<bytes:8>")
+        self.assertEqual(parsed["path_obj"], "out_<user>.wgsl.pack")
+        self.assertIn("key_with_<user>", parsed)
+
+    def test_cli_json_and_verify_json_include_sanitized_verification_summary(self) -> None:
+        fake_user = "ci_secret_runner"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nested = tmp_path / f"dir_{fake_user}"
+            nested.mkdir()
+            out_pack = nested / f"bundle_{fake_user}.wgsl.pack"
+
+            pack_stdout = io.StringIO()
+            verify_stdout = io.StringIO()
+            with mock.patch.dict(
+                os.environ,
+                {"USERNAME": fake_user, "USER": fake_user, "HOME": f"/home/{fake_user}"},
+            ):
+                with redirect_stdout(pack_stdout):
+                    rc_pack = packer.main(
+                        [
+                            "--hashes",
+                            "compute:0x300,vertex:0x100,fragment:0x200",
+                            "--reject-duplicate-hashes",
+                            "--out",
+                            str(out_pack),
+                            "--json",
+                        ]
+                    )
+                with redirect_stdout(verify_stdout):
+                    rc_verify = packer.main(
+                        [
+                            "--verify-pack",
+                            str(out_pack),
+                            "--require-canonical-order",
+                            "--json",
+                        ]
+                    )
+
+            self.assertEqual(rc_pack, 0)
+            self.assertEqual(rc_verify, 0)
+
+            for text in (pack_stdout.getvalue(), verify_stdout.getvalue()):
+                self.assertNotIn(fake_user, text)
+                self.assertNotIn(str(tmp_path), text)
+                self.assertNotRegex(text, r"[A-Za-z]:[\\/]")
+                self.assertNotRegex(text, r"/(?:Users|home|tmp|var|private)/")
+                self.assertNotIn("@vertex", text)
+
+            pack_json = json.loads(pack_stdout.getvalue())
+            verify_json = json.loads(verify_stdout.getvalue())
+            self.assertTrue(pack_json["summary"]["canonical_hash_order"])
+            self.assertTrue(pack_json["verification"]["verified"])
+            self.assertEqual(pack_json["verification"]["pack_sha256"], verify_json["pack_sha256"])
+            self.assertEqual(pack_json["output_file"], "bundle_<user>.wgsl.pack")
+            self.assertEqual(verify_json["input_file"], "bundle_<user>.wgsl.pack")
+
+
 if __name__ == "__main__":
     unittest.main()
