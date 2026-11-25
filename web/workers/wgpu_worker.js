@@ -4138,6 +4138,75 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * #709: Reconfigure the WebGPU canvas context / swapchain to match the swapchain attachment
+   * format declared by the command stream (e.g. 'rgba8unorm' instead of Windows's default
+   * 'bgra8unorm' from getPreferredCanvasFormat()), preventing RenderPipeline vs RenderPassEncoder
+   * attachment format mismatches on Present.
+   *
+   * @param {string} declaredFormat
+   * @returns {boolean}
+   */
+  setSwapchainFormat(declaredFormat) {
+    if (typeof declaredFormat !== 'string' || declaredFormat.length === 0) {
+      return false;
+    }
+    const isSrgb = declaredFormat.endsWith('-srgb');
+    const baseFormat = isSrgb ? declaredFormat.slice(0, -5) : declaredFormat;
+    if (
+      baseFormat !== 'rgba8unorm' &&
+      baseFormat !== 'bgra8unorm' &&
+      baseFormat !== 'rgba16float'
+    ) {
+      return false;
+    }
+    const viewFormat = isSrgb ? declaredFormat : null;
+    this._streamSwapchainFormat = declaredFormat;
+    if (this.format === baseFormat && (this._swapchainViewFormat || null) === viewFormat) {
+      return true;
+    }
+    this.format = baseFormat;
+    this._swapchainViewFormat = viewFormat;
+    const viewFormats = viewFormat ? [viewFormat] : null;
+    if (
+      this._swapchain &&
+      !this._swapchain.isDestroyed &&
+      typeof this._swapchain.setFormat === 'function'
+    ) {
+      try {
+        this._swapchain.setFormat(baseFormat, viewFormats);
+      } catch (err) {
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] failed to reconfigure swapchain format to ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+        );
+        return false;
+      }
+      return true;
+    }
+    if (this.ctx && typeof this.ctx.configure === 'function' && this.device) {
+      try {
+        const cfg = {
+          device: this.device,
+          format: baseFormat,
+          alphaMode: 'opaque',
+        };
+        if (viewFormats) {
+          cfg.viewFormats = viewFormats;
+        }
+        this.ctx.configure(cfg);
+      } catch (err) {
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] failed to reconfigure canvas context format to ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+        );
+        return false;
+      }
+      return true;
+    }
+    return true;
+  }
+
+  /**
    * W100: bind a recovered GPUDevice (and re-acquired canvas context) after device loss. Clears
    * every resource handle owned by the dead device, rebuilds owned subsystems, re-configures the
    * swapchain (via `recover()`) or the raw canvas context, and re-hooks `device.lost`. Telemetry
@@ -4168,16 +4237,23 @@ class WgpuCommandProcessor {
         typeof this._swapchain.recover === 'function' &&
         options.recoverSwapchain !== false
     );
+    const effectiveFormat = this._streamSwapchainFormat
+      ? this.format
+      : options.format;
     this.bindDevice(newDevice, {
-      format: options.format,
+      format: effectiveFormat,
       recoverSwapchain: options.recoverSwapchain,
     });
     if (!swapchainRecovers && this.ctx && typeof this.ctx.configure === 'function') {
-      this.ctx.configure({
+      const cfg = {
         device: newDevice,
         format: this.format,
         alphaMode: typeof options.alphaMode === 'string' ? options.alphaMode : 'opaque',
-      });
+      };
+      if (this._swapchainViewFormat) {
+        cfg.viewFormats = [this._swapchainViewFormat];
+      }
+      this.ctx.configure(cfg);
     }
     this._recreateOwnedSubsystems(newDevice);
     this._hookDeviceLost(newDevice);
@@ -5687,7 +5763,9 @@ class WgpuCommandProcessor {
       swapchainTexture = this.ctx.getCurrentTexture();
       swapchainView =
         swapchainTexture && typeof swapchainTexture.createView === 'function'
-          ? swapchainTexture.createView()
+          ? this._swapchainViewFormat
+            ? swapchainTexture.createView({ format: this._swapchainViewFormat })
+            : swapchainTexture.createView()
           : swapchainTexture;
     } catch (err) {
       this._notePresentSubmitFailure(err);
