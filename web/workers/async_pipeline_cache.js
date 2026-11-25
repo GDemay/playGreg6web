@@ -1,15 +1,18 @@
-// W102 / W138 / W168 / W203: priority-scheduled, bounded-concurrency async GPU pipeline compilation.
+// W102 / W138 / W168 / W203 / W263: priority-scheduled, bounded-concurrency async GPU pipeline compilation.
 //
 // A burst of ~200 createRenderPipeline() calls on one frame blocks the GPU process long enough to
 // trip a Windows WDDM TDR and lose the Dawn instance. AsyncPipelineCache routes every compile
 // through create{Render,Compute}PipelineAsync with at most `maxConcurrentCompiles` (default 4,
 // 0 = unlimited, dynamically adjustable via setMaxConcurrentCompiles) compilations in flight,
-// prioritizing graphics (render) pipelines ahead of background compute pipelines (or explicit
-// numeric priority / named priority lanes, FIFO within equal priority), coalesces identical
-// pipelines by `id` or `(kind, dedupeKey)` (promoting queued jobs when a higher-priority caller
+// prioritizing demand draws / graphics (render) pipelines ahead of background warmups & compute
+// pipelines (or explicit numeric priority / named priority lanes, FIFO within equal priority),
+// coalesces concurrent identical pipelines by `id` or canonical key (`(kind, dedupeKey/canonicalKey)`
+// or opt-in descriptor canonicalization, promoting queued jobs when a higher-priority caller
 // arrives or via promote()), retries once with a `fallbackDescriptor` (e.g. layout: 'auto') when
-// the primary descriptor rejects, tracks compile-stall and queue-wait telemetry via getTelemetry()
-// and getStats(), and drops results that resolve after reset(newDevice) (device loss) instead of
+// the primary descriptor rejects (unless device-lost), tracks compile latency percentiles
+// (`p50CompileMs`, `p95CompileMs`) in a bounded ring alongside `activeCompiles`, `coalescedCompiles`,
+// `compileErrors`, and compile-stall / queue-wait telemetry via getTelemetry(), getStats(), and
+// resetStats(), and drops results that resolve after reset(newDevice) (device loss) instead of
 // writing them into the new device.
 //
 // Zero external dependencies; UMD export for classic Web Workers loaded through importScripts
@@ -21,6 +24,7 @@
 
 const DEFAULT_MAX_CONCURRENT_PIPELINES = 4;
 const DEFAULT_COMPILE_STALL_THRESHOLD_MS = 16;
+const DEFAULT_COMPILE_LATENCY_RING_SIZE = 128;
 
 const PIPELINE_KIND = Object.freeze({ RENDER: 'render', COMPUTE: 'compute' });
 
@@ -32,11 +36,14 @@ const DEFAULT_PIPELINE_PRIORITY = Object.freeze({
 const PIPELINE_PRIORITY_LANE = Object.freeze({
   BACKGROUND: -10,
   PREWARM: -10,
+  WARMUP: -10,
+  SPECULATIVE: -10,
   LOW: 0,
   COMPUTE: 0,
   NORMAL: 10,
   RENDER: 10,
   HIGH: 20,
+  DEMAND: 100,
   URGENT: 100,
 });
 
@@ -82,6 +89,145 @@ function normalizeStallThresholdMs(value) {
   if (value === 0) return 0;
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_COMPILE_STALL_THRESHOLD_MS;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeLatencyRingSize(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_COMPILE_LATENCY_RING_SIZE;
+}
+
+/**
+ * Deterministic nearest-rank percentile over a sorted ascending numeric array.
+ * @param {Float64Array | number[]} sorted
+ * @param {number} count
+ * @param {number} fraction
+ * @returns {number}
+ */
+function percentileFromSorted(sorted, count, fraction) {
+  if (count <= 0) return 0;
+  const idx = Math.min(count - 1, Math.max(0, Math.ceil(fraction * count) - 1));
+  return sorted[idx];
+}
+
+const _opaqueObjectIds = new WeakMap();
+let _nextOpaqueObjectId = 1;
+
+function getOpaqueObjectId(obj) {
+  let id = _opaqueObjectIds.get(obj);
+  if (id === undefined) {
+    id = _nextOpaqueObjectId;
+    _nextOpaqueObjectId += 1;
+    _opaqueObjectIds.set(obj, id);
+  }
+  return id;
+}
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object') return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Deterministically serialize a pipeline key or descriptor into a stable canonical string.
+ * Preserves non-empty strings verbatim for O(1) hot-path overhead, sorts plain object keys,
+ * and assigns stable WeakMap identities to opaque objects (e.g. GPUShaderModule / GPUPipelineLayout).
+ *
+ * @param {unknown} value
+ * @param {{ ignoreTopLevelLabel?: boolean }} [options]
+ * @returns {string | null}
+ */
+function canonicalizePipelineKey(value, options = null) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value !== '' ? value : null;
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : null;
+  if (typeof value === 'bigint' || typeof value === 'boolean') return String(value);
+
+  const ignoreTopLevelLabel = !!(options && options.ignoreTopLevelLabel);
+  const seen = new Set();
+
+  const serialize = (node, depth) => {
+    if (node === null) return 'null';
+    const type = typeof node;
+    if (type === 'undefined') return 'undefined';
+    if (type === 'string') return JSON.stringify(node);
+    if (type === 'number') return Number.isFinite(node) ? String(node) : `"${String(node)}"`;
+    if (type === 'boolean') return node ? 'true' : 'false';
+    if (type === 'bigint') return `${node.toString()}n`;
+    if (type === 'function' || type === 'symbol') return `"@ref#${getOpaqueObjectId(node)}"`;
+
+    if (seen.has(node)) {
+      return `"@cycle#${getOpaqueObjectId(node)}"`;
+    }
+    seen.add(node);
+    try {
+      if (Array.isArray(node)) {
+        const parts = new Array(node.length);
+        for (let i = 0; i < node.length; i += 1) {
+          parts[i] = serialize(node[i], depth + 1);
+        }
+        return `[${parts.join(',')}]`;
+      }
+      if (ArrayBuffer.isView(node)) {
+        const bytes = new Uint8Array(node.buffer, node.byteOffset, node.byteLength);
+        const tag = node.constructor ? node.constructor.name : 'View';
+        let hex = '';
+        for (let i = 0; i < bytes.length; i += 1) {
+          hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        return `"@${tag}:${hex}"`;
+      }
+      if (node instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(node);
+        let hex = '';
+        for (let i = 0; i < bytes.length; i += 1) {
+          hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        return `"@ArrayBuffer:${hex}"`;
+      }
+      if (!isPlainObject(node)) {
+        return `"@obj#${getOpaqueObjectId(node)}"`;
+      }
+      const keys = Object.keys(node).sort();
+      const entries = [];
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        if (depth === 0 && ignoreTopLevelLabel && k === 'label') continue;
+        const v = node[k];
+        if (v === undefined) continue;
+        entries.push(`${JSON.stringify(k)}:${serialize(v, depth + 1)}`);
+      }
+      return `{${entries.join(',')}}`;
+    } finally {
+      seen.delete(node);
+    }
+  };
+
+  const result = serialize(value, 0);
+  return result !== '' ? result : null;
+}
+
+/**
+ * Heuristic check for WebGPU device-loss / destroyed errors so failed in-flight jobs on a
+ * lost device skip pointless fallbackDescriptor retries and clean up immediately.
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isDeviceLostError(err) {
+  if (!err) return false;
+  if (typeof err === 'object') {
+    if (err.reason === 'destroyed' || err.reason === 'unknown') return true;
+    if (err.name === 'GPUDeviceLostError') return true;
+    if (err.cause && err.cause !== err && isDeviceLostError(err.cause)) return true;
+  }
+  const msg = typeof err === 'string'
+    ? err
+    : (err && typeof err.message === 'string' ? err.message : '');
+  return /\bdevice\s+(was\s+)?(lost|destroyed)\b|\bgpu\s*device\s*lost\b/i.test(msg);
 }
 
 /**
@@ -183,7 +329,10 @@ class AsyncPipelineCache {
    *   maxConcurrent?: number,
    *   maxConcurrentCompiles?: number,
    *   prioritizeGraphics?: boolean,
+   *   coalesceByDescriptor?: boolean,
    *   stallThresholdMs?: number,
+   *   compileLatencyRingSize?: number,
+   *   latencySampleCapacity?: number,
    *   nowFn?: (() => number) | null,
    *   onReady?: ((id: unknown, pipeline: object, meta: object) => void) | null,
    *   onError?: ((id: unknown, err: Error, meta: object) => void) | null,
@@ -196,7 +345,10 @@ class AsyncPipelineCache {
     maxConcurrent,
     maxConcurrentCompiles,
     prioritizeGraphics = true,
+    coalesceByDescriptor = false,
     stallThresholdMs = DEFAULT_COMPILE_STALL_THRESHOLD_MS,
+    compileLatencyRingSize,
+    latencySampleCapacity,
     nowFn = null,
     onReady = null,
     onError = null,
@@ -222,7 +374,14 @@ class AsyncPipelineCache {
     }
     this._concurrencyLimit = this.maxConcurrent > 0 ? this.maxConcurrent : Infinity;
     this.prioritizeGraphics = prioritizeGraphics !== false;
+    this.coalesceByDescriptor = coalesceByDescriptor === true;
     this.stallThresholdMs = normalizeStallThresholdMs(stallThresholdMs);
+    this._latencyRingSize = normalizeLatencyRingSize(
+      compileLatencyRingSize !== undefined ? compileLatencyRingSize : latencySampleCapacity,
+    );
+    this._latencyRing = new Float64Array(this._latencyRingSize);
+    this._latencyRingHead = 0;
+    this._latencyRingCount = 0;
     this._nowFn = typeof nowFn === 'function' ? nowFn : defaultNow;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.onError = typeof onError === 'function' ? onError : null;
@@ -250,6 +409,9 @@ class AsyncPipelineCache {
     };
     this._peakInFlightCompiles = 0;
     this._failedAsyncCompiles = 0;
+    this._compileErrors = 0;
+    this._coalescedCompiles = 0;
+    this._deviceLostRejections = 0;
     this._asyncCompileCount = 0;
     this._asyncCompileTotalMs = 0;
     this._maxCompileMs = 0;
@@ -298,13 +460,14 @@ class AsyncPipelineCache {
       return this._promoteQueuedJob(entry.job, targetPriority);
     }
 
-    if (typeof idOrKey === 'string' && idOrKey !== '') {
+    const canonicalKey = canonicalizePipelineKey(idOrKey);
+    if (canonicalKey !== null) {
       const kinds = kind === PIPELINE_KIND.RENDER || kind === PIPELINE_KIND.COMPUTE
         ? [kind]
         : [PIPELINE_KIND.RENDER, PIPELINE_KIND.COMPUTE];
       let promoted = false;
       for (const candidateKind of kinds) {
-        const dedupeMapKey = makeDedupeMapKey(candidateKind, idOrKey);
+        const dedupeMapKey = makeDedupeMapKey(candidateKind, canonicalKey);
         const shared = this._dedupe.get(dedupeMapKey);
         if (shared && !shared.done && !shared.started) {
           if (this._promoteQueuedJob(shared, targetPriority)) {
@@ -416,6 +579,41 @@ class AsyncPipelineCache {
     return this.whenIdle();
   }
 
+  /**
+   * W263: Reset all cumulative telemetry counters and the bounded compile-latency ring
+   * without disturbing cached pipelines, queued work, active compiles, or device generation.
+   */
+  resetStats() {
+    this._stats.peakQueueDepth = this._queue.length;
+    this._stats.compiled = 0;
+    this._stats.failed = 0;
+    this._stats.dedupeHits = 0;
+    this._stats.syncFallbacks = 0;
+    this._stats.autoLayoutRetries = 0;
+    this._stats.discardedStale = 0;
+    this._peakInFlightCompiles = this._inFlight;
+    this._failedAsyncCompiles = 0;
+    this._compileErrors = 0;
+    this._coalescedCompiles = 0;
+    this._deviceLostRejections = 0;
+    this._asyncCompileCount = 0;
+    this._asyncCompileTotalMs = 0;
+    this._maxCompileMs = 0;
+    this._lastCompileMs = 0;
+    this._priorityPromotions = 0;
+    this._queuedPromotions = 0;
+    this._dedupedCount = 0;
+    this._inFlightDedupedCount = 0;
+    this._queuedDedupedCount = 0;
+    this._startedJobCount = 0;
+    this._totalQueueWaitMs = 0;
+    this._maxQueueWaitMs = 0;
+    this._stallCount = 0;
+    this._latencyRing.fill(0);
+    this._latencyRingHead = 0;
+    this._latencyRingCount = 0;
+  }
+
   getStats() {
     const avgCompileMs = this._asyncCompileCount > 0
       ? this._asyncCompileTotalMs / this._asyncCompileCount
@@ -423,6 +621,7 @@ class AsyncPipelineCache {
     const avgQueueWaitMs = this._startedJobCount > 0
       ? this._totalQueueWaitMs / this._startedJobCount
       : 0;
+    const { p50CompileMs, p95CompileMs } = this._computeCompileLatencyPercentiles();
     const stats = {
       generation: this.generation,
       maxConcurrent: this.maxConcurrent,
@@ -440,9 +639,9 @@ class AsyncPipelineCache {
       maxCompileMs: this._maxCompileMs,
       priorityPromotions: this._priorityPromotions,
     };
-    // W203 canonical telemetry aliases exposed on getStats() as non-enumerable properties
+    // W203 / W263 canonical telemetry properties exposed on getStats() as non-enumerable properties
     // so legacy deepEqual snapshots keep their exact own-enumerable shape while callers reading
-    // stats.inFlightCount / queuedCount / promotedCount / dedupedCount / completedCount / failedCount
+    // stats.p50CompileMs / p95CompileMs / coalescedCompiles / compileErrors / inFlightCount / ...
     // work without needing a separate call. Use getTelemetry() for an all-enumerable snapshot.
     Object.defineProperties(stats, {
       inFlightCount: { value: this._inFlight, enumerable: false, configurable: true },
@@ -454,12 +653,19 @@ class AsyncPipelineCache {
       stallCount: { value: this._stallCount, enumerable: false, configurable: true },
       maxQueueWaitMs: { value: this._maxQueueWaitMs, enumerable: false, configurable: true },
       avgQueueWaitMs: { value: avgQueueWaitMs, enumerable: false, configurable: true },
+      coalescedCompiles: { value: this._coalescedCompiles, enumerable: false, configurable: true },
+      compileErrors: { value: this._compileErrors, enumerable: false, configurable: true },
+      p50CompileMs: { value: p50CompileMs, enumerable: false, configurable: true },
+      p95CompileMs: { value: p95CompileMs, enumerable: false, configurable: true },
+      compileLatencySampleCount: { value: this._latencyRingCount, enumerable: false, configurable: true },
+      compileLatencyRingSize: { value: this._latencyRingSize, enumerable: false, configurable: true },
+      deviceLostRejections: { value: this._deviceLostRejections, enumerable: false, configurable: true },
     });
     return stats;
   }
 
   /**
-   * W203: Return an all-enumerable compile queue & stall telemetry snapshot.
+   * W203 / W263: Return an all-enumerable compile queue, coalescing, latency percentile & stall telemetry snapshot.
    */
   getTelemetry() {
     const avgCompileMs = this._asyncCompileCount > 0
@@ -468,9 +674,11 @@ class AsyncPipelineCache {
     const avgQueueWaitMs = this._startedJobCount > 0
       ? this._totalQueueWaitMs / this._startedJobCount
       : 0;
+    const { p50CompileMs, p95CompileMs } = this._computeCompileLatencyPercentiles();
     return {
       generation: this.generation,
       maxConcurrentCompiles: this.maxConcurrentCompiles,
+      activeCompiles: this._inFlight,
       inFlightCount: this._inFlight,
       peakInFlightCount: this._peakInFlightCompiles,
       queuedCount: this._queue.length,
@@ -478,13 +686,20 @@ class AsyncPipelineCache {
       promotedCount: this._queuedPromotions,
       priorityPromotions: this._priorityPromotions,
       dedupedCount: this._dedupedCount,
+      coalescedCompiles: this._coalescedCompiles,
       inFlightDedupedCount: this._inFlightDedupedCount,
       queuedDedupedCount: this._queuedDedupedCount,
       completedCount: this._stats.compiled,
       failedCount: this._stats.failed,
+      compileErrors: this._compileErrors,
       failedAsyncCompiles: this._failedAsyncCompiles,
+      deviceLostRejections: this._deviceLostRejections,
       maxCompileMs: this._maxCompileMs,
       avgCompileMs,
+      p50CompileMs,
+      p95CompileMs,
+      compileLatencySampleCount: this._latencyRingCount,
+      compileLatencyRingSize: this._latencyRingSize,
       lastCompileMs: this._lastCompileMs,
       maxQueueWaitMs: this._maxQueueWaitMs,
       avgQueueWaitMs,
@@ -498,14 +713,27 @@ class AsyncPipelineCache {
 
   _compile(kind, id, descriptor, options) {
     const opts = options && typeof options === 'object' ? options : {};
-    const dedupeKey = typeof opts.dedupeKey === 'string' && opts.dedupeKey !== '' ? opts.dedupeKey : null;
+    const rawKey = opts.dedupeKey !== undefined
+      ? opts.dedupeKey
+      : (opts.canonicalKey !== undefined ? opts.canonicalKey : opts.key);
+    let dedupeKey = canonicalizePipelineKey(rawKey);
+    const shouldCoalesceByDescriptor = opts.coalesceByDescriptor === true
+      || (opts.coalesceByDescriptor !== false && this.coalesceByDescriptor);
+    if (dedupeKey === null && shouldCoalesceByDescriptor && descriptor && typeof descriptor === 'object') {
+      dedupeKey = canonicalizePipelineKey(descriptor, { ignoreTopLevelLabel: true });
+    }
     const dedupeMapKey = makeDedupeMapKey(kind, dedupeKey);
     const parsedPriority = parsePriorityValue(opts.priority);
     const parsedLane = parsedPriority === null ? parsePriorityValue(opts.lane) : null;
-    const hasExplicitPriority = parsedPriority !== null || parsedLane !== null;
+    const semanticPriority = (parsedPriority === null && parsedLane === null)
+      ? (opts.demand === true
+        ? PIPELINE_PRIORITY_LANE.DEMAND
+        : ((opts.warmup === true || opts.isWarmup === true) ? PIPELINE_PRIORITY_LANE.WARMUP : null))
+      : null;
+    const hasExplicitPriority = parsedPriority !== null || parsedLane !== null || semanticPriority !== null;
     const priority = resolvePipelinePriority(
       kind,
-      parsedPriority !== null ? parsedPriority : parsedLane,
+      parsedPriority !== null ? parsedPriority : (parsedLane !== null ? parsedLane : semanticPriority),
       this.prioritizeGraphics,
     );
     const allowSyncFallback = opts.allowSyncFallback !== false;
@@ -515,6 +743,7 @@ class AsyncPipelineCache {
     if (existing && existing.state !== PIPELINE_STATUS.FAILED) {
       if (existing.state === PIPELINE_STATUS.PENDING) {
         this._dedupedCount += 1;
+        this._coalescedCompiles += 1;
         if (existing.job && existing.job.started) {
           this._inFlightDedupedCount += 1;
         } else {
@@ -553,6 +782,7 @@ class AsyncPipelineCache {
         if (shared.done) {
           this._finishReady(entry, shared.pipeline, { dedupe: true, syncFallback: false, retried: false });
         } else {
+          this._coalescedCompiles += 1;
           entry.job = shared;
           shared.ids.add(id);
           if (shared.started) {
@@ -702,14 +932,42 @@ class AsyncPipelineCache {
     }
   }
 
+  _recordCompileLatency(elapsedMs) {
+    const sample = Number.isFinite(elapsedMs) && elapsedMs >= 0 ? elapsedMs : 0;
+    this._latencyRing[this._latencyRingHead] = sample;
+    this._latencyRingHead = (this._latencyRingHead + 1) % this._latencyRingSize;
+    if (this._latencyRingCount < this._latencyRingSize) {
+      this._latencyRingCount += 1;
+    }
+  }
+
+  _computeCompileLatencyPercentiles() {
+    const count = this._latencyRingCount;
+    if (count <= 0) {
+      return { p50CompileMs: 0, p95CompileMs: 0 };
+    }
+    const sorted = count < this._latencyRingSize
+      ? this._latencyRing.slice(0, count)
+      : this._latencyRing.slice();
+    sorted.sort();
+    return {
+      p50CompileMs: percentileFromSorted(sorted, count, 0.5),
+      p95CompileMs: percentileFromSorted(sorted, count, 0.95),
+    };
+  }
+
   _issue(job, descriptor) {
     const device = this.device;
     const method = DEVICE_METHODS[job.kind].async;
     let promise;
-    try {
-      promise = Promise.resolve(device[method](descriptor));
-    } catch (err) {
-      promise = Promise.reject(err);
+    if (!device || typeof device[method] !== 'function') {
+      promise = Promise.reject(new Error(`AsyncPipelineCache: GPU device unavailable or lost (${method})`));
+    } else {
+      try {
+        promise = Promise.resolve(device[method](descriptor));
+      } catch (err) {
+        promise = Promise.reject(err);
+      }
     }
     promise.then(
       (pipeline) => this._onSettled(job, pipeline, null),
@@ -732,7 +990,9 @@ class AsyncPipelineCache {
       error = new Error(`AsyncPipelineCache: ${DEVICE_METHODS[job.kind].async} resolved no pipeline`);
     }
 
-    if (error && job.fallbackDescriptor && !job.retried) {
+    const deviceLost = !!error && isDeviceLostError(error);
+
+    if (error && job.fallbackDescriptor && !job.retried && !deviceLost) {
       job.retried = true;
       this._stats.autoLayoutRetries += 1;
       this._log('warn', 'pipeline compile rejected; retrying with fallbackDescriptor', {
@@ -757,6 +1017,7 @@ class AsyncPipelineCache {
       this._lastCompileMs = elapsedMs;
       this._asyncCompileCount += 1;
       this._asyncCompileTotalMs += elapsedMs;
+      this._recordCompileLatency(elapsedMs);
       if (elapsedMs > this._maxCompileMs) {
         this._maxCompileMs = elapsedMs;
       }
@@ -776,10 +1037,13 @@ class AsyncPipelineCache {
       }
       if (error) {
         this._failedAsyncCompiles += 1;
+        if (deviceLost) {
+          this._deviceLostRejections += 1;
+        }
       }
       releaseSlot();
       if (job.dedupeMapKey !== null && this._dedupe.get(job.dedupeMapKey) === job) {
-        if (error) this._dedupe.delete(job.dedupeMapKey);
+        if (error || job.ids.size === 0) this._dedupe.delete(job.dedupeMapKey);
         else this._dedupe.set(job.dedupeMapKey, { kind: job.kind, done: true, pipeline });
       }
       this._completeJob(job, pipeline, error, false);
@@ -795,8 +1059,12 @@ class AsyncPipelineCache {
   }
 
   _completeJob(job, pipeline, error, syncFallback) {
-    if (error) this._stats.failed += 1;
-    else this._stats.compiled += 1;
+    if (error) {
+      this._stats.failed += 1;
+      this._compileErrors += 1;
+    } else {
+      this._stats.compiled += 1;
+    }
     for (const id of job.ids) {
       const entry = this._entries.get(id);
       if (!entry || entry.job !== job) continue;
@@ -899,9 +1167,12 @@ const exportedApi = {
   DEFAULT_MAX_CONCURRENT_PIPELINES,
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
+  DEFAULT_COMPILE_LATENCY_RING_SIZE,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
   PIPELINE_STATUS,
+  canonicalizePipelineKey,
+  isDeviceLostError,
 };
 
   if (typeof globalThis !== 'undefined') {
