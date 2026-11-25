@@ -17,6 +17,9 @@ const {
   isSharedBuffer,
   sanitizeWriteBufferPayload,
   GpuStagingPool,
+  DEFAULT_FRAMES_IN_FLIGHT,
+  DEFAULT_MAX_FRAMES_IN_FLIGHT,
+  DEFAULT_IDLE_SHRINK_FRAMES,
   DEFAULT_LARGE_SLAB_THRESHOLD,
   DEFAULT_MAX_LARGE_SLABS,
   DEFAULT_POW2_MIN_SLAB_BYTES,
@@ -2964,5 +2967,463 @@ test('W245: classic-worker importScripts keeps W245 telemetry helpers isolated i
   assert.equal(typeof ctx.PlayGta6StagingPool.GpuStagingPool.prototype.resetStats, 'function');
   assert.equal(ctx.clampUnitRate, undefined);
   assert.equal(ctx.sanitizeNonNegativeCounter, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// W283: 30 FPS stall-free streaming — 3-deep frame-in-flight slab recycling
+// (`maxFramesInFlight`), bump-pointer sub-allocation coalescing
+// (`subAllocCoalesced`), idle oversized-slab shrinking (`idleShrinkFrames`,
+// `shrinkIdleOversizedSlabs`, `idleSlabShrinks`), and `stallAvoidedCount`.
+// ---------------------------------------------------------------------------
+
+test('W283: constructor options, defaults, validation, and initial telemetry for maxFramesInFlight & idleShrinkFrames', () => {
+  assert.equal(DEFAULT_FRAMES_IN_FLIGHT, 3);
+  assert.equal(DEFAULT_MAX_FRAMES_IN_FLIGHT, 3);
+  assert.equal(DEFAULT_IDLE_SHRINK_FRAMES, 120);
+
+  const { device } = createMockGpuDevice();
+  const defaultPool = new GpuStagingPool({ device });
+  assert.equal(defaultPool.framesInFlight, 3);
+  assert.equal(defaultPool.maxFramesInFlight, 3);
+  assert.equal(defaultPool.idleShrinkFrames, 120);
+
+  const initStats = defaultPool.getStats();
+  assert.equal(initStats.maxFramesInFlight, 3);
+  assert.equal(initStats.idleShrinkFrames, 120);
+  assert.equal(initStats.subAllocCoalesced, 0);
+  assert.equal(initStats.idleSlabShrinks, 0);
+  assert.equal(initStats.stallAvoidedCount, 0);
+
+  // Sanitized JSON round-trip & snapshot immutability.
+  const roundTrip = JSON.parse(JSON.stringify(initStats));
+  assert.equal(roundTrip.subAllocCoalesced, 0);
+  assert.equal(roundTrip.idleSlabShrinks, 0);
+  assert.equal(roundTrip.stallAvoidedCount, 0);
+  initStats.subAllocCoalesced = 999;
+  initStats.idleSlabShrinks = 999;
+  initStats.stallAvoidedCount = 999;
+  const fresh = defaultPool.getStats();
+  assert.equal(fresh.subAllocCoalesced, 0);
+  assert.equal(fresh.idleSlabShrinks, 0);
+  assert.equal(fresh.stallAvoidedCount, 0);
+  defaultPool.destroy();
+
+  // Explicit maxFramesInFlight & idleShrinkFrames options.
+  const customPool = new GpuStagingPool({
+    device,
+    maxFramesInFlight: 4,
+    idleShrinkFrames: 60,
+  });
+  assert.equal(customPool.framesInFlight, 4);
+  assert.equal(customPool.maxFramesInFlight, 4);
+  assert.equal(customPool.idleShrinkFrames, 60);
+  customPool.destroy();
+
+  // Matching framesInFlight & maxFramesInFlight succeeds; mismatching throws.
+  const matchedPool = new GpuStagingPool({
+    device,
+    framesInFlight: 2,
+    maxFramesInFlight: 2,
+    idleShrinkFrames: 0,
+  });
+  assert.equal(matchedPool.maxFramesInFlight, 2);
+  assert.equal(matchedPool.idleShrinkFrames, 0);
+  matchedPool.destroy();
+
+  assert.throws(
+    () => new GpuStagingPool({ device, framesInFlight: 2, maxFramesInFlight: 3 }),
+    RangeError
+  );
+  assert.throws(() => new GpuStagingPool({ device, maxFramesInFlight: 0 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, maxFramesInFlight: -1 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, maxFramesInFlight: 2.5 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, idleShrinkFrames: -1 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, idleShrinkFrames: 1.5 }), RangeError);
+});
+
+test('W283: bump-pointer sub-allocation coalesces multiple small/medium uploads into one slab per frame and tracks subAllocCoalesced', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 16 * 1024, // 16 KiB standard slab
+    maxPoolBytes: 128 * 1024,
+    maxFramesInFlight: 3,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuffer = { id: 'dst-coalesced-buf' };
+  const dstTexture = { id: 'dst-coalesced-tex' };
+
+  pool.beginFrame(0);
+
+  // 5 small/medium buffer + texture uploads pack into a SINGLE 16 KiB staging GPUBuffer.
+  const u1 = pool.stageBufferUpload(encoder, dstBuffer, 0, new Uint8Array(64).fill(1));
+  const u2 = pool.stageBufferUpload(encoder, dstBuffer, 64, new Uint8Array(128).fill(2));
+  const u3 = pool.stageTextureUpload(encoder, dstTexture, new Uint8Array(16 * 4).fill(3), {
+    width: 4,
+    height: 4,
+    bytesPerRow: 16,
+  }); // 256B aligned offset, 1024B staged
+  const u4 = pool.stageBufferUpload(encoder, dstBuffer, 256, new Uint8Array(512).fill(4));
+  const u5 = pool.allocate(1024, 256);
+
+  assert.equal(createdBuffers.length, 1, 'all 5 uploads must coalesce into 1 GPUBuffer');
+  assert.equal(u2.buffer, u1.buffer);
+  assert.equal(u3.buffer, u1.buffer);
+  assert.equal(u4.buffer, u1.buffer);
+  assert.equal(u5.buffer, u1.buffer);
+  assert.equal(u1.offset, 0);
+  assert.equal(u2.offset, 64);
+  assert.equal(u3.offset, 256);
+  assert.equal(u3.offset % 256, 0);
+  assert.equal(u4.offset, 256 + 1024);
+  assert.equal(u5.offset % 256, 0);
+  assert.equal(pool.getStats().subAllocCoalesced, 4);
+
+  // Oversized allocation does NOT disrupt _currentChunk or inflate subAllocCoalesced;
+  // a following small allocation still coalesces into u1.buffer!
+  const big = pool.allocate(20 * 1024, 256);
+  assert.notEqual(big.buffer, u1.buffer);
+  assert.equal(pool.getStats().subAllocCoalesced, 4);
+
+  const u6 = pool.allocate(256, 4);
+  assert.equal(u6.buffer, u1.buffer);
+  assert.equal(pool.getStats().subAllocCoalesced, 5);
+
+  // Rollover into a 2nd standard chunk: first alloc in chunk 2 is NOT coalesced, next one IS.
+  const rollover = pool.allocate(15 * 1024, 256);
+  assert.notEqual(rollover.buffer, u1.buffer);
+  assert.notEqual(rollover.buffer, big.buffer);
+  assert.equal(rollover.offset, 0);
+  assert.equal(pool.getStats().subAllocCoalesced, 5);
+
+  const afterRollover = pool.allocate(128, 4);
+  assert.equal(afterRollover.buffer, rollover.buffer);
+  assert.equal(afterRollover.offset, 15 * 1024);
+  assert.equal(pool.getStats().subAllocCoalesced, 6);
+
+  pool.endFrame();
+  pool.destroy();
+});
+
+test('W283: 3-deep frame-in-flight ring sustains 30 FPS steady-state streaming with zero buffer churn and stall avoidance (writeBuffer & mapped modes)', async () => {
+  // 1. writeBuffer mode: 30 frames @ 30 FPS with 8 uploads per frame coalesced into 1 slab/frame.
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 32 * 1024,
+    maxPoolBytes: 256 * 1024,
+    maxFramesInFlight: 3,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuf = { id: 'stream-buf' };
+  const payload = new Uint8Array(512).fill(0x5c);
+
+  const totalFrames = 30;
+  const uploadsPerFrame = 8;
+  for (let frame = 0; frame < totalFrames; frame += 1) {
+    pool.beginFrame(frame);
+    let firstBuf = null;
+    for (let u = 0; u < uploadsPerFrame; u += 1) {
+      const res = pool.stageBufferUpload(encoder, dstBuf, u * 512, payload);
+      if (u === 0) {
+        firstBuf = res.buffer;
+      } else {
+        assert.equal(res.buffer, firstBuf, 'all uploads in one frame must coalesce into 1 slab');
+      }
+    }
+    pool.endFrame();
+  }
+
+  assert.equal(createdBuffers.length, 3, '3-deep ring must allocate strictly 3 slabs for 30 FPS streaming');
+  const wbStats = pool.getStats();
+  assert.equal(wbStats.poolMisses, 3);
+  assert.equal(wbStats.poolHits, totalFrames - 3);
+  assert.equal(wbStats.subAllocCoalesced, totalFrames * (uploadsPerFrame - 1));
+  // Frame 0 has 0 in-flight; frames 1..29 each acquire a slab while 1–2 frames remain in-flight!
+  assert.equal(wbStats.stallAvoidedCount, totalFrames - 1);
+  pool.destroy();
+
+  // 2. mapped mode: 3-deep frame ring with deferred GPU fences avoids mapAsync stalls completely.
+  const mappedMock = createMockGpuDevice({ enableWorkDoneFence: true });
+  const mappedPool = new GpuStagingPool({
+    device: mappedMock.device,
+    chunkSize: 4096,
+    maxPoolBytes: 32 * 1024,
+    maxFramesInFlight: 3,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  const mappedEnc = createMockEncoder();
+  const mappedDst = { id: 'mapped-stream-dst' };
+
+  // Warmup frames 0, 1, 2: GPU fences have NOT resolved yet; 3-deep ring avoids stalling!
+  for (let frame = 0; frame < 3; frame += 1) {
+    mappedPool.beginFrame(frame);
+    const a = mappedPool.stageBufferUpload(mappedEnc, mappedDst, 0, new Uint8Array(64).fill(frame + 1));
+    const b = mappedPool.stageBufferUpload(mappedEnc, mappedDst, 64, new Uint8Array(64).fill(frame + 11));
+    assert.equal(b.buffer, a.buffer);
+    mappedPool.endFrame();
+  }
+
+  assert.equal(mappedMock.createdBuffers.length, 3);
+  assert.equal(mappedMock.queueWrites.length, 0);
+  assert.equal(mappedPool.getStats().inFlightChunks, 3);
+  assert.equal(mappedPool.getStats().subAllocCoalesced, 3);
+  assert.equal(mappedPool.getStats().stallAvoidedCount, 2); // frames 1 and 2 avoided waiting on in-flight slabs
+
+  // Steady-state frames 3..11: resolve oldest GPU fence (frame - 3) before each frame,
+  // keeping 2 frames in-flight while recycling the 3rd mapped slab with zero new allocations!
+  for (let frame = 3; frame < 12; frame += 1) {
+    const oldestFence = mappedMock.deferredFences[frame - 3];
+    oldestFence.resolve();
+    await oldestFence.promise;
+    await mappedPool.waitForPendingMaps();
+
+    const beginInfo = mappedPool.beginFrame(frame);
+    assert.equal(beginInfo.recycledCount, 1);
+    assert.equal(beginInfo.inFlightChunks, 2);
+    const a = mappedPool.stageBufferUpload(mappedEnc, mappedDst, 0, new Uint8Array(128).fill(0x2a));
+    const b = mappedPool.stageBufferUpload(mappedEnc, mappedDst, 128, new Uint8Array(128).fill(0x3b));
+    assert.equal(b.buffer, a.buffer);
+    mappedPool.endFrame();
+  }
+
+  assert.equal(mappedMock.createdBuffers.length, 3, '3-deep mapped ring must allocate zero extra buffers');
+  const mStats = mappedPool.getStats();
+  assert.equal(mStats.poolHits, 9);
+  assert.equal(mStats.poolMisses, 3);
+  assert.equal(mStats.subAllocCoalesced, 12);
+  assert.equal(mStats.stallAvoidedCount, 11); // frames 1..11 all bypassed in-flight GPU work
+  mappedPool.destroy();
+});
+
+test('W283: idle oversized-slab shrinking destroys transient boot slabs after idleShrinkFrames while preserving warm standard chunks', async () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    maxFramesInFlight: 3,
+    minWarmChunks: 1,
+    idleEvictFrames: 0, // standard warm chunks stay warm
+    // default idleShrinkFrames = 120
+  });
+
+  // Frame 0 boot burst: 1 standard 4 MiB chunk + 1 oversized 8 MiB Y slab + 1 oversized 16 MiB texture slab.
+  pool.beginFrame(0);
+  const stdChunk = pool.allocate(1024, 4); // 4 MiB standard chunk
+  const bootSlab8 = pool.allocate(3840 * 2160, 256); // 8 MiB large slab (oversized)
+  const bootSlab16 = pool.allocate(16 * MiB, 256); // 16 MiB large slab (oversized)
+  assert.equal(createdBuffers.length, 3);
+  assert.equal(pool.getStats().allocatedBytes, (4 + 8 + 16) * MiB);
+  assert.equal(pool.getStats().peakAllocatedBytes, 28 * MiB);
+  pool.endFrame();
+
+  // Frame 3: all 3 buffers recycle. Frame 119: idle age 119 < 120 -> nothing shrunk yet.
+  pool.beginFrame(3);
+  pool.endFrame();
+  const begin119 = pool.beginFrame(119);
+  assert.equal(begin119.shrunkSlabs, 0);
+  assert.equal(begin119.shrunkBytes, 0);
+  assert.equal(pool.getStats().idleSlabShrinks, 0);
+  assert.equal(bootSlab8.buffer.destroyCount, 0);
+  assert.equal(bootSlab16.buffer.destroyCount, 0);
+  pool.endFrame();
+
+  // Frame 120: idle age == 120 >= idleShrinkFrames -> both oversized boot slabs destroyed!
+  // Standard 4 MiB warm chunk remains alive!
+  const begin120 = pool.beginFrame(120);
+  assert.equal(begin120.shrunkSlabs, 2);
+  assert.equal(begin120.shrunkBytes, 24 * MiB);
+  assert.equal(begin120.reclaimedChunks, 2);
+  assert.equal(begin120.reclaimedBytes, 24 * MiB);
+  assert.equal(bootSlab8.buffer.destroyCount, 1, 'idle 8 MiB boot slab must be shrunk');
+  assert.equal(bootSlab16.buffer.destroyCount, 1, 'idle 16 MiB boot slab must be shrunk');
+  assert.equal(stdChunk.buffer.destroyCount, 0, 'warm standard chunk must remain alive');
+
+  const afterShrink = pool.getStats();
+  assert.equal(afterShrink.idleSlabShrinks, 2);
+  assert.equal(afterShrink.allocatedBytes, 4 * MiB);
+  assert.equal(afterShrink.largeSlabBytes, 0);
+  assert.equal(afterShrink.idleLargeSlabs, 0);
+  assert.equal(afterShrink.recycledChunks, 1);
+  assert.equal(afterShrink.peakAllocatedBytes, 28 * MiB, 'peak VRAM high-water mark stays intact');
+  assert.equal(afterShrink.lruEvictions, 2);
+  assert.equal(afterShrink.largeSlabEvictions, 2);
+  pool.endFrame();
+  pool.destroy();
+
+  // Verify non-bucketed oversized burst chunks shrink even when minWarmChunks = 1 and 0 standard chunks exist,
+  // and reusing a slab before idleShrinkFrames resets its idle timer.
+  const customMock = createMockGpuDevice();
+  const customPool = new GpuStagingPool({
+    device: customMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 8192,
+    maxFramesInFlight: 2,
+    minWarmChunks: 1,
+    idleShrinkFrames: 10,
+    largeSlabBuckets: [],
+  });
+
+  customPool.beginFrame(0);
+  const ov1 = customPool.allocate(1024, 4); // non-bucketed oversized chunk
+  customPool.endFrame();
+
+  // Reuse ov1 at frame 6 (refreshes lastUsedFrame = 6).
+  customPool.beginFrame(6);
+  const ov1Reuse = customPool.allocate(1024, 4);
+  assert.equal(ov1Reuse.buffer, ov1.buffer);
+  customPool.endFrame();
+
+  // Frame 15 (15 - 6 = 9 < 10): still warm!
+  customPool.beginFrame(15);
+  assert.equal(customPool.getStats().idleSlabShrinks, 0);
+  assert.equal(ov1.buffer.destroyCount, 0);
+  customPool.endFrame();
+
+  // Frame 16 (16 - 6 = 10 >= 10): shrunk cleanly down to 0 bytes even though minWarmChunks = 1!
+  const b16 = customPool.beginFrame(16);
+  assert.equal(b16.shrunkSlabs, 1);
+  assert.equal(b16.shrunkBytes, 1024);
+  assert.equal(ov1.buffer.destroyCount, 1);
+  assert.equal(customPool.getStats().idleSlabShrinks, 1);
+  assert.equal(customPool.getStats().allocatedBytes, 0);
+  customPool.destroy();
+
+  // Active and in-flight oversized slabs must NEVER be shrunk prematurely;
+  // idleShrinkFrames = 0 disables auto-shrink while explicit shrinkIdleOversizedSlabs(N) works.
+  const guardMock = createMockGpuDevice({ enableWorkDoneFence: true });
+  const guardPool = new GpuStagingPool({
+    device: guardMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 4096,
+    maxFramesInFlight: 10,
+    idleShrinkFrames: 0,
+    largeSlabBuckets: [],
+  });
+
+  guardPool.beginFrame(0);
+  const inFlightOv = guardPool.allocate(1024, 4);
+  guardPool.endFrame();
+
+  guardPool.beginFrame(5);
+  const activeOv = guardPool.allocate(1024, 4);
+  // Explicit shrink(0) must NOT touch active or in-flight slabs!
+  assert.deepEqual(guardPool.shrinkIdleOversizedSlabs(0), { shrunkSlabs: 0, shrunkBytes: 0 });
+  assert.equal(inFlightOv.buffer.destroyCount, 0);
+  assert.equal(activeOv.buffer.destroyCount, 0);
+  // No-arg shrink is a no-op when idleShrinkFrames === 0.
+  assert.deepEqual(guardPool.shrinkIdleOversizedSlabs(), { shrunkSlabs: 0, shrunkBytes: 0 });
+
+  // Resolve frame-0 fence and recycleCompleted -> now inFlightOv is recycled and explicit shrink destroys it.
+  guardMock.deferredFences[0].resolve();
+  await guardMock.deferredFences[0].promise;
+  await Promise.resolve();
+  assert.equal(guardPool.recycleCompleted(), 1);
+  assert.deepEqual(guardPool.shrinkIdleOversizedSlabs(5), { shrunkSlabs: 1, shrunkBytes: 1024 });
+  assert.equal(inFlightOv.buffer.destroyCount, 1);
+  assert.equal(activeOv.buffer.destroyCount, 0);
+  assert.equal(guardPool.getStats().idleSlabShrinks, 1);
+
+  assert.throws(() => guardPool.shrinkIdleOversizedSlabs(-1), RangeError);
+  assert.throws(() => guardPool.shrinkIdleOversizedSlabs(1.5), RangeError);
+  guardPool.destroy();
+  assert.throws(() => guardPool.shrinkIdleOversizedSlabs(0), /destroyed/i);
+});
+
+test('W283: resetStats zeroes subAllocCoalesced, idleSlabShrinks, and stallAvoidedCount, OOM never inflates them, and classic-worker IIFE stays isolated', () => {
+  const { device } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 2048,
+    maxFramesInFlight: 2,
+    idleShrinkFrames: 5,
+    largeSlabBuckets: [],
+  });
+
+  // Frame 0: 2 coalesced standard allocs + 1 oversized chunk (512 + 1024 = 1536B).
+  pool.beginFrame(0);
+  pool.allocate(128, 4);
+  pool.allocate(128, 4); // coalesced #1
+  pool.allocate(1024, 4); // oversized
+  pool.endFrame();
+
+  // Frame 1: frame 0 still in-flight -> stall avoided #1; 2nd alloc coalesced #2.
+  pool.beginFrame(1);
+  pool.allocate(64, 4); // 512B -> total 2048B (at budget cap)
+  pool.allocate(64, 4); // coalesced #2
+
+  // OOM allocation must NOT inflate subAllocCoalesced, idleSlabShrinks, or stallAvoidedCount!
+  const beforeOom = pool.getStats();
+  assert.equal(beforeOom.subAllocCoalesced, 2);
+  assert.equal(beforeOom.stallAvoidedCount, 1);
+  assert.equal(beforeOom.idleSlabShrinks, 0);
+  assert.throws(() => pool.allocate(1024, 4), RangeError);
+  const afterOom = pool.getStats();
+  assert.equal(afterOom.subAllocCoalesced, beforeOom.subAllocCoalesced);
+  assert.equal(afterOom.stallAvoidedCount, beforeOom.stallAvoidedCount);
+  assert.equal(afterOom.idleSlabShrinks, beforeOom.idleSlabShrinks);
+  pool.endFrame();
+
+  // Frame 6: idle oversized chunk (lastUsedFrame = 0, age 6 >= 5) shrinks -> idleSlabShrinks = 1.
+  pool.beginFrame(6);
+  const preReset = pool.getStats();
+  assert.equal(preReset.subAllocCoalesced, 2);
+  assert.equal(preReset.stallAvoidedCount, 1);
+  assert.equal(preReset.idleSlabShrinks, 1);
+  assert.equal(preReset.recycledChunks, 2); // 2 warm standard 512B chunks preserved
+
+  // resetStats zeroes all three W283 counters while preserving warm buffers & config.
+  const postReset = pool.resetStats();
+  assert.equal(postReset.subAllocCoalesced, 0);
+  assert.equal(postReset.stallAvoidedCount, 0);
+  assert.equal(postReset.idleSlabShrinks, 0);
+  assert.equal(postReset.maxFramesInFlight, 2);
+  assert.equal(postReset.idleShrinkFrames, 5);
+  assert.equal(postReset.recycledChunks, 2);
+  assert.equal(postReset.allocatedBytes, 1024);
+  pool.destroy();
+
+  // Classic-worker importScripts IIFE exports W283 additions cleanly without leaking internals.
+  const source = fs.readFileSync(
+    new URL('../web/workers/staging_pool.js', import.meta.url),
+    'utf8'
+  );
+  const sandbox = {
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    DataView,
+    Float32Array,
+    Math,
+    Number,
+    Object,
+    Set,
+    Map,
+    Array,
+    Promise,
+    Error,
+    TypeError,
+    RangeError,
+    JSON,
+    Infinity,
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+  assert.equal(ctx.PlayGta6StagingPool.DEFAULT_MAX_FRAMES_IN_FLIGHT, 3);
+  assert.equal(ctx.PlayGta6StagingPool.DEFAULT_IDLE_SHRINK_FRAMES, 120);
+  assert.equal(
+    typeof ctx.PlayGta6StagingPool.GpuStagingPool.prototype.shrinkIdleOversizedSlabs,
+    'function'
+  );
+  assert.equal(ctx.DEFAULT_IDLE_SHRINK_FRAMES, undefined);
+  assert.equal(ctx.DEFAULT_MAX_FRAMES_IN_FLIGHT, undefined);
 });
 
