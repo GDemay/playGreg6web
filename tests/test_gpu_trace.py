@@ -2589,5 +2589,568 @@ class TestGpuTraceBinkAndStartScreenAudits(unittest.TestCase):
         self.assertEqual(skips["ranked_pairs"], [])
 
 
+class TestGpuTrace30FpsSpikeAnalyzer(unittest.TestCase):
+    EXPECTED_TOP_LEVEL_KEYS = (
+        "schema_version",
+        "source_kind",
+        "timing_source",
+        "ok",
+        "budget_ms",
+        "target_fps",
+        "total_frames",
+        "frames_within_budget",
+        "frames_over_budget",
+        "fps30_compliance_rate",
+        "avg_frame_ms",
+        "min_frame_ms",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "max_frame_ms",
+        "total_over_budget_ms",
+        "max_over_budget_ms",
+        "top_n",
+        "spike_causes",
+        "cause_breakdown",
+        "top_slow_frames",
+        "top_slow_passes",
+        "malformed_records",
+        "diagnostics",
+    )
+
+    def test_smooth_30fps_trace_and_boundary_compliance(self) -> None:
+        # 20 frames all within 33.333 ms budget, including exact boundary 33.333 ms.
+        frames = [
+            {
+                "frame_index": i,
+                "frame_ms": 16.0 + (i * 0.5) if i < 19 else 33.333,
+                "phase": "gameplay",
+                "draw_calls": 80 + i,
+                "passes": [
+                    {"name": "shadow_pass", "duration_ms": 4.0},
+                    {"name": "gbuffer_draw", "duration_ms": 8.0 + (i * 0.2)},
+                    {"name": "ui_composite", "duration_ms": 2.0},
+                ],
+            }
+            for i in range(20)
+        ]
+        report = gpu_trace.analyze_30fps_frames({"frames": frames}, top_n=5)
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["source_kind"], "timing_log")
+        self.assertEqual(report["timing_source"], "measured")
+        self.assertEqual(report["budget_ms"], 33.333)
+        self.assertEqual(report["total_frames"], 20)
+        self.assertEqual(report["frames_within_budget"], 20)
+        self.assertEqual(report["frames_over_budget"], 0)
+        self.assertEqual(report["fps30_compliance_rate"], 1.0)
+        self.assertEqual(report["min_frame_ms"], 16.0)
+        self.assertEqual(report["p50_ms"], 20.5)
+        self.assertEqual(report["p95_ms"], 25.0)
+        self.assertEqual(report["p99_ms"], 33.333)
+        self.assertEqual(report["max_frame_ms"], 33.333)
+        self.assertEqual(report["total_over_budget_ms"], 0.0)
+        self.assertEqual(report["max_over_budget_ms"], 0.0)
+        self.assertEqual(sum(report["spike_causes"].values()), 0)
+        self.assertEqual(len(report["top_slow_frames"]), 5)
+        self.assertEqual(report["top_slow_frames"][0]["frame_index"], 19)
+        self.assertFalse(report["top_slow_frames"][0]["over_budget"])
+        self.assertEqual(report["top_slow_frames"][0]["over_budget_ms"], 0.0)
+        self.assertEqual(report["top_slow_frames"][0]["cause"], "draw_burst")
+
+        text = gpu_trace.format_30fps_analysis_text(report)
+        self.assertIn("WITHIN BUDGET (20/20 frames within budget | compliance=100.00%", text)
+        self.assertIn("Spike Causes: (none)", text)
+        self.assertIn("gbuffer_draw", text)
+
+    def test_categorized_spikes_pso_upload_draw_rt_sync_and_unknown(self) -> None:
+        # 10 smooth frames + 6 over-budget spike frames covering every canonical category.
+        frames: list[dict] = [
+            {
+                "frame_index": i,
+                "frame_ms": 15.0 + i * 0.5,
+                "phase": "gameplay",
+                "draw_calls": 40,
+                "passes": [{"name": "main_gbuffer_draw", "duration_ms": 12.0}],
+            }
+            for i in range(10)
+        ]
+        frames.extend(
+            [
+                # 10: PSO compile spike (slowest: 92.5 ms)
+                {
+                    "frame_index": 10,
+                    "frame_ms": 92.5,
+                    "phase": "boot",
+                    "pso_compiles": 4,
+                    "passes": [
+                        {"name": "pso_compile_gbuffer", "duration_ms": 74.0},
+                        {"name": "main_gbuffer_draw", "duration_ms": 12.5},
+                    ],
+                },
+                # 11: Staging upload spike (68.0 ms)
+                {
+                    "frame_index": 11,
+                    "frame_ms": 68.0,
+                    "phase": "loading_assets",
+                    "upload_bytes": 16 * 1024 * 1024,
+                    "passes": [
+                        {"name": "bink_staging_upload", "duration_ms": 51.0},
+                        {"name": "ui_composite", "duration_ms": 6.0},
+                    ],
+                },
+                # 12: Sync stall spike (54.2 ms)
+                {
+                    "frame_index": 12,
+                    "frame_ms": 54.2,
+                    "phase": "gameplay",
+                    "sync_stall_ms": 38.5,
+                    "passes": [
+                        {"name": "fence_readback_wait", "duration_ms": 38.5},
+                        {"name": "main_gbuffer_draw", "duration_ms": 11.0},
+                    ],
+                },
+                # 13: RT alloc spike (48.0 ms)
+                {
+                    "frame_index": 13,
+                    "frame_ms": 48.0,
+                    "phase": "menu",
+                    "rt_allocs": 5,
+                    "passes": [
+                        {"name": "rt_pool_alloc_4k_gbuffer", "duration_ms": 32.0},
+                        {"name": "main_gbuffer_draw", "duration_ms": 10.0},
+                    ],
+                },
+                # 14: Draw burst spike (44.0 ms)
+                {
+                    "frame_index": 14,
+                    "frame_ms": 44.0,
+                    "phase": "gameplay",
+                    "draw_calls": 2400,
+                    "passes": [
+                        {"name": "shadow_cascade_draw", "duration_ms": 29.0},
+                        {"name": "main_gbuffer_draw", "duration_ms": 13.0},
+                    ],
+                },
+                # 15: Unknown spike (39.0 ms, opaque marker with no counters)
+                {
+                    "frame_index": 15,
+                    "frame_ms": 39.0,
+                    "passes": [
+                        {"name": "mystery_op_alpha", "duration_ms": 31.0},
+                    ],
+                },
+            ]
+        )
+
+        report = gpu_trace.analyze_30fps_frames({"frames": frames}, top_n=6)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["total_frames"], 16)
+        self.assertEqual(report["frames_within_budget"], 10)
+        self.assertEqual(report["frames_over_budget"], 6)
+        self.assertAlmostEqual(report["fps30_compliance_rate"], 10 / 16, places=6)
+        self.assertEqual(report["max_frame_ms"], 92.5)
+        self.assertEqual(report["p99_ms"], 92.5)
+        self.assertGreaterEqual(report["p95_ms"], report["p50_ms"])
+        self.assertLessEqual(report["p95_ms"], report["p99_ms"])
+
+        self.assertEqual(
+            report["spike_causes"],
+            {
+                "pso_compile": 1,
+                "staging_upload": 1,
+                "draw_burst": 1,
+                "rt_alloc": 1,
+                "sync_stall": 1,
+                "unknown": 1,
+            },
+        )
+        self.assertEqual(sum(report["spike_causes"].values()), report["frames_over_budget"])
+
+        top_frames = report["top_slow_frames"]
+        self.assertEqual(
+            [(r["frame_index"], r["cause"]) for r in top_frames],
+            [
+                (10, "pso_compile"),
+                (11, "staging_upload"),
+                (12, "sync_stall"),
+                (13, "rt_alloc"),
+                (14, "draw_burst"),
+                (15, "unknown"),
+            ],
+        )
+        self.assertEqual(top_frames[0]["top_pass"], "pso_compile_gbuffer")
+        self.assertEqual(top_frames[0]["top_pass_ms"], 74.0)
+        self.assertAlmostEqual(top_frames[0]["over_budget_ms"], 92.5 - 33.333, places=3)
+
+        top_passes = report["top_slow_passes"]
+        self.assertEqual(top_passes[0]["name"], "pso_compile_gbuffer")
+        self.assertEqual(top_passes[0]["cause"], "pso_compile")
+        self.assertEqual(top_passes[0]["worst_frame_index"], 10)
+        self.assertEqual(top_passes[1]["name"], "bink_staging_upload")
+        self.assertEqual(top_passes[1]["cause"], "staging_upload")
+        self.assertEqual(top_passes[2]["name"], "fence_readback_wait")
+        self.assertEqual(top_passes[2]["cause"], "sync_stall")
+
+        text = gpu_trace.format_30fps_analysis_text(report)
+        self.assertIn("OVER BUDGET (6/16 frames over budget", text)
+        self.assertIn("pso_compile=1", text)
+        self.assertIn("staging_upload=1", text)
+        self.assertIn("Top Slowest Frames (top 6):", text)
+        self.assertIn("Top Slowest Passes (top 6):", text)
+
+    def test_custom_budget_ms_and_cli_validation(self) -> None:
+        # 4 frames: 12ms, 18ms, 30ms, 45ms
+        payload = {
+            "frames": [
+                {"frame_index": 0, "frame_ms": 12.0, "passes": [{"name": "draw_pass", "duration_ms": 10.0}]},
+                {"frame_index": 1, "frame_ms": 18.0, "passes": [{"name": "staging_upload", "duration_ms": 15.0}]},
+                {"frame_index": 2, "frame_ms": 30.0, "passes": [{"name": "pso_compile", "duration_ms": 25.0}]},
+                {"frame_index": 3, "frame_ms": 45.0, "passes": [{"name": "fence_wait", "duration_ms": 35.0}]},
+            ]
+        }
+
+        # At 60 FPS (16.667 ms): 1 within, 3 over
+        r60 = gpu_trace.analyze_30fps_frames(payload, budget_ms=16.667, top_n=2)
+        self.assertEqual(r60["budget_ms"], 16.667)
+        self.assertAlmostEqual(r60["target_fps"], 59.999, places=2)
+        self.assertEqual(r60["frames_within_budget"], 1)
+        self.assertEqual(r60["frames_over_budget"], 3)
+        self.assertEqual(r60["fps30_compliance_rate"], 0.25)
+        self.assertEqual(len(r60["top_slow_frames"]), 2)
+        self.assertEqual(len(r60["top_slow_passes"]), 2)
+
+        # At 20 FPS (50.0 ms): 4 within, 0 over
+        r20 = gpu_trace.analyze_30fps_frames(payload, budget_ms=50.0)
+        self.assertEqual(r20["frames_within_budget"], 4)
+        self.assertEqual(r20["frames_over_budget"], 0)
+        self.assertEqual(r20["fps30_compliance_rate"], 1.0)
+
+        # Library validation errors
+        with self.assertRaises(ValueError):
+            gpu_trace.analyze_30fps_frames(payload, budget_ms=0.0)
+        with self.assertRaises(ValueError):
+            gpu_trace.analyze_30fps_frames(payload, budget_ms=-10.0)
+        with self.assertRaises(ValueError):
+            gpu_trace.analyze_30fps_frames(payload, budget_ms=float("nan"))
+        with self.assertRaises(ValueError):
+            gpu_trace.analyze_30fps_frames(payload, top_n=0)
+
+        # CLI custom --budget-ms (without needing --analyze-30fps explicitly) and invalid args
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "timings.json"
+            log_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = gpu_trace.main([str(log_path), "--budget-ms", "16.667", "--top-n", "2", "--json"])
+            self.assertEqual(rc, 0)
+            cli_out = json.loads(buf.getvalue())
+            self.assertEqual(cli_out["frames_over_budget"], 3)
+            self.assertEqual(len(cli_out["top_slow_frames"]), 2)
+
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc_bad = gpu_trace.main([str(log_path), "--analyze-30fps", "--budget-ms", "-1"])
+            self.assertEqual(rc_bad, 2)
+            self.assertIn("budget_ms", err_buf.getvalue())
+
+            err_buf2 = io.StringIO()
+            with redirect_stderr(err_buf2):
+                rc_bad2 = gpu_trace.main([str(log_path), "--analyze-30fps", "--top-n", "0"])
+            self.assertEqual(rc_bad2, 2)
+            self.assertIn("top_n", err_buf2.getvalue())
+
+    def test_chrome_trace_events_and_ndjson_logs(self) -> None:
+        # Chrome trace event format (microseconds: ts, dur) with X and B/E pairs.
+        chrome_trace = {
+            "traceEvents": [
+                {"ph": "X", "name": "Frame", "cat": "frame", "ts": 0, "dur": 16500, "args": {"frame_index": 0}},
+                {"ph": "X", "name": "gbuffer_draw", "cat": "gpu", "ts": 1000, "dur": 12000, "args": {"frame_index": 0}},
+                {"ph": "B", "name": "Frame", "cat": "frame", "ts": 20000, "pid": 1, "tid": 1, "args": {"frame_index": 1}},
+                {"ph": "X", "name": "CreateRenderPipeline2", "cat": "gpu", "ts": 21000, "dur": 41000, "args": {"frame_index": 1}},
+                {"ph": "E", "name": "Frame", "cat": "frame", "ts": 68000, "pid": 1, "tid": 1},
+            ]
+        }
+        r_chrome = gpu_trace.analyze_30fps_frames(chrome_trace)
+        self.assertTrue(r_chrome["ok"])
+        self.assertEqual(r_chrome["total_frames"], 2)
+        self.assertEqual(r_chrome["frames_within_budget"], 1)
+        self.assertEqual(r_chrome["frames_over_budget"], 1)
+        self.assertEqual(r_chrome["max_frame_ms"], 48.0)
+        self.assertEqual(r_chrome["spike_causes"]["pso_compile"], 1)
+        self.assertEqual(r_chrome["top_slow_frames"][0]["cause"], "pso_compile")
+        self.assertEqual(r_chrome["top_slow_passes"][0]["name"], "CreateRenderPipeline2")
+        self.assertEqual(r_chrome["top_slow_passes"][0]["max_ms"], 41.0)
+
+        # NDJSON with one corrupted line in the middle: recovers valid lines cleanly.
+        ndjson = "\n".join(
+            [
+                json.dumps({"frame_index": 0, "frame_ms": 16.0, "passes": [{"name": "draw_main", "duration_ms": 11.0}]}),
+                "{corrupted_json_line",
+                json.dumps({"frame_index": 1, "frame_ms": 52.0, "passes": [{"name": "write_texture_upload", "duration_ms": 40.0}]}),
+            ]
+        )
+        r_ndjson = gpu_trace.analyze_30fps_frames(ndjson, strict=False)
+        self.assertTrue(r_ndjson["ok"])
+        self.assertEqual(r_ndjson["total_frames"], 2)
+        self.assertEqual(r_ndjson["frames_over_budget"], 1)
+        self.assertEqual(r_ndjson["malformed_records"], 1)
+        self.assertEqual(r_ndjson["spike_causes"]["staging_upload"], 1)
+        self.assertEqual(r_ndjson["diagnostics"][0]["code"], "malformed_ndjson_line")
+
+        r_ndjson_strict = gpu_trace.analyze_30fps_frames(ndjson, strict=True)
+        self.assertFalse(r_ndjson_strict["ok"])
+
+    def test_empty_and_malformed_inputs(self) -> None:
+        for empty_input in (b"", "", "   \n\t ", [], {}, {"frames": []}, {"traceEvents": []}):
+            rep = gpu_trace.analyze_30fps_frames(empty_input, strict=True)
+            self.assertTrue(rep["ok"], f"Failed on empty input {empty_input!r}")
+            self.assertEqual(rep["total_frames"], 0)
+            self.assertEqual(rep["frames_within_budget"], 0)
+            self.assertEqual(rep["frames_over_budget"], 0)
+            self.assertEqual(rep["fps30_compliance_rate"], 0.0)
+            self.assertEqual(rep["p50_ms"], 0.0)
+            self.assertEqual(rep["p95_ms"], 0.0)
+            self.assertEqual(rep["p99_ms"], 0.0)
+            self.assertEqual(rep["max_frame_ms"], 0.0)
+            self.assertEqual(rep["top_slow_frames"], [])
+            self.assertEqual(rep["top_slow_passes"], [])
+
+        # Completely malformed JSON
+        bad = gpu_trace.analyze_30fps_frames("{not valid json", strict=False)
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["total_frames"], 0)
+        self.assertGreaterEqual(bad["malformed_records"], 1)
+        self.assertEqual(bad["diagnostics"][0]["code"], "malformed_json")
+
+        # Invalid UTF-8 bytes
+        bad_utf8 = gpu_trace.analyze_30fps_frames(b"\xff\xfe\x80", strict=False)
+        self.assertFalse(bad_utf8["ok"])
+        self.assertEqual(bad_utf8["diagnostics"][0]["code"], "invalid_utf8")
+
+        # Mixed malformed entries inside frames array (negative, bool, string, NaN)
+        mixed = {
+            "frames": [
+                {"frame_index": 0, "frame_ms": -5.0},
+                {"frame_index": 1, "frame_ms": True},
+                {"frame_index": 2, "frame_ms": "fast"},
+                {"frame_index": 3, "frame_ms": float("nan")},
+                {"frame_index": 4, "frame_ms": 20.0, "passes": ["not_an_object", {"name": "ok_draw", "duration_ms": 12.0}]},
+            ]
+        }
+        rep_mixed = gpu_trace.analyze_30fps_frames(mixed, strict=False)
+        self.assertTrue(rep_mixed["ok"])
+        self.assertEqual(rep_mixed["total_frames"], 1)
+        self.assertEqual(rep_mixed["malformed_records"], 5)
+        self.assertEqual(rep_mixed["p50_ms"], 20.0)
+
+        # CLI strict mode returns exit code 1 on malformed JSON
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_path = Path(tmp) / "broken.json"
+            bad_path.write_text("{broken json", encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = gpu_trace.main([str(bad_path), "--analyze-30fps", "--strict", "--json"])
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertFalse(out["ok"])
+            self.assertEqual(out["diagnostics"][0]["code"], "malformed_json")
+
+    def test_binary_pg6trace_30fps_spike_analysis_and_backwards_compat(self) -> None:
+        # Frame 0: smooth draw frame
+        f0 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                gpu_trace.encode_draw(6),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+        # Frame 1: PSO compile spike (5 render pipelines2 = ~40 ms)
+        f1 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                *[
+                    gpu_trace.encode_create_render_pipeline2(
+                        100 + i,
+                        1,
+                        2,
+                        0,
+                        _make_pipeline_key(vs_shader=0x1000 + i, ps_shader=0x2000 + i, color_formats=[27]),
+                    )
+                    for i in range(5)
+                ],
+                gpu_trace.encode_present(),
+            ]
+        )
+        # Frame 2: Staging upload spike (16 MiB WriteTexture = ~40 ms)
+        # Use 16 * 1 MiB WriteBuffer chunks to keep memory/test fast (~16 MiB total)
+        one_mb = b"\xab" * (1024 * 1024)
+        f2 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                *[gpu_trace.encode_write_buffer(10, i * 1024, one_mb) for i in range(16)],
+                gpu_trace.encode_present(),
+            ]
+        )
+        # Frame 3: RT alloc spike (8 RENDER_ATTACHMENT textures = ~36 ms)
+        f3 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                *[gpu_trace.encode_create_texture2(200 + i, 1920, 1080, 27, usage_flags=0x0010) for i in range(8)],
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        stream = f0 + f1 + f2 + f3
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+
+        analysis = gpu_trace.analyze_30fps_trace(trace)
+        self.assertTrue(analysis["ok"])
+        self.assertEqual(analysis["source_kind"], "binary_trace")
+        self.assertEqual(analysis["timing_source"], "estimated")
+        self.assertEqual(analysis["total_frames"], 4)
+        self.assertEqual(analysis["frames_within_budget"], 1)
+        self.assertEqual(analysis["frames_over_budget"], 3)
+        self.assertEqual(analysis["fps30_compliance_rate"], 0.25)
+        self.assertEqual(analysis["spike_causes"]["pso_compile"], 1)
+        self.assertEqual(analysis["spike_causes"]["staging_upload"], 1)
+        self.assertEqual(analysis["spike_causes"]["rt_alloc"], 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "capture.pg6trace"
+            trace_path.write_bytes(stream)
+
+            # 1. Backwards compatibility: omitting --analyze-30fps leaves output unchanged.
+            buf_orig = io.StringIO()
+            with redirect_stdout(buf_orig):
+                rc0 = gpu_trace.main([str(trace_path), "--json", "--stats"])
+            self.assertEqual(rc0, 0)
+            orig_payload = json.loads(buf_orig.getvalue())
+            self.assertNotIn("fps30_analysis", orig_payload)
+
+            # 2. Standalone --analyze-30fps --json emits top-level 30 FPS schema directly.
+            buf_standalone = io.StringIO()
+            with redirect_stdout(buf_standalone):
+                rc1 = gpu_trace.main([str(trace_path), "--analyze-30fps", "--json"])
+            self.assertEqual(rc1, 0)
+            standalone_payload = json.loads(buf_standalone.getvalue())
+            self.assertEqual(tuple(standalone_payload.keys()), self.EXPECTED_TOP_LEVEL_KEYS)
+            self.assertEqual(standalone_payload["source_kind"], "binary_trace")
+            self.assertEqual(standalone_payload["frames_over_budget"], 3)
+
+            # 3. Combined --stats --analyze-30fps --json embeds fps30_analysis inside DecodedTrace JSON.
+            buf_combined = io.StringIO()
+            with redirect_stdout(buf_combined):
+                rc2 = gpu_trace.main([str(trace_path), "--stats", "--analyze-30fps", "--json"])
+            self.assertEqual(rc2, 0)
+            combined_payload = json.loads(buf_combined.getvalue())
+            self.assertIn("fps30_analysis", combined_payload)
+            self.assertEqual(combined_payload["fps30_analysis"]["frames_over_budget"], 3)
+
+            # 4. Standalone text output prints clean 30 FPS table (not raw packet disassembly).
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc3 = gpu_trace.main([str(trace_path), "--analyze-30fps"])
+            self.assertEqual(rc3, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("30 FPS Frame-Budget Spike Analysis", text_out)
+            self.assertNotIn("Packets:\n", text_out)
+
+    def test_sanitization_and_deterministic_json_schema_stability(self) -> None:
+        secret_win_path = r"C:\Users\secret_alice\gta6_private\shaders\secret_shader.wgsl"
+        secret_unix_path = "/home/secret_bob/local-data/game_dump/frame0.rpf"
+        secret_unc_path = r"\\fileserver\private_share\secret_capture.pg6trace"
+        secret_wgsl = "@vertex fn secret_vs_main(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(p, 1.0); }"
+
+        payload = {
+            "host_path": secret_win_path,
+            "frames": [
+                {
+                    "frame_index": 0,
+                    "frame_ms": 55.0,
+                    "phase": secret_unix_path,
+                    "shader_source": secret_wgsl,
+                    "host_file": secret_unc_path,
+                    "passes": [
+                        {"name": secret_wgsl, "duration_ms": 40.0, "wgsl": secret_wgsl},
+                        {"name": secret_win_path, "duration_ms": 8.0},
+                        {"name": secret_unix_path, "duration_ms": 4.0},
+                        {"name": secret_unc_path, "duration_ms": 3.0},
+                    ],
+                },
+                {
+                    "frame_index": 1,
+                    "frame_ms": 16.5,
+                    "phase": "main_menu",
+                    "passes": [{"name": "menu_ui_draw", "duration_ms": 12.0}],
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_dir = Path(tmp) / "secret_host_folder_t67"
+            secret_dir.mkdir()
+            log_path = secret_dir / "secret_capture_file_t67.json"
+            log_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            buf1 = io.StringIO()
+            with redirect_stdout(buf1):
+                rc1 = gpu_trace.main([str(log_path), "--analyze-30fps", "--json"])
+            self.assertEqual(rc1, 0)
+            json_out_1 = buf1.getvalue()
+
+            buf2 = io.StringIO()
+            with redirect_stdout(buf2):
+                rc2 = gpu_trace.main([str(log_path), "--analyze-30fps", "--json"])
+            self.assertEqual(rc2, 0)
+            json_out_2 = buf2.getvalue()
+
+            # Determinism: identical inputs produce byte-for-byte identical JSON.
+            self.assertEqual(json_out_1, json_out_2)
+
+            buf_txt = io.StringIO()
+            with redirect_stdout(buf_txt):
+                rc_txt = gpu_trace.main([str(log_path), "--analyze-30fps"])
+            self.assertEqual(rc_txt, 0)
+            txt_out = buf_txt.getvalue()
+
+            # Strict sanitization: zero host paths, zero filenames, zero raw WGSL source.
+            forbidden_tokens = (
+                "secret_host_folder_t67",
+                "secret_capture_file_t67",
+                "secret_alice",
+                "secret_bob",
+                "gta6_private",
+                "fileserver",
+                "private_share",
+                "secret_vs_main",
+                "@vertex",
+                "vec4<f32>",
+                "secret_shader.wgsl",
+                "frame0.rpf",
+            )
+            for token in forbidden_tokens:
+                self.assertNotIn(token, json_out_1, f"Leaked {token!r} in JSON output")
+                self.assertNotIn(token, txt_out, f"Leaked {token!r} in text output")
+
+            parsed = json.loads(json_out_1)
+            # Exact stable top-level JSON schema order and keys.
+            self.assertEqual(tuple(parsed.keys()), self.EXPECTED_TOP_LEVEL_KEYS)
+            self.assertEqual(tuple(parsed["spike_causes"].keys()), gpu_trace.SPIKE_CAUSES)
+            self.assertEqual(tuple(parsed["cause_breakdown"].keys()), gpu_trace.SPIKE_CAUSES)
+            # Shader-source pass was classified as pso_compile before redacting its label.
+            self.assertEqual(parsed["top_slow_frames"][0]["cause"], "pso_compile")
+            self.assertEqual(parsed["top_slow_frames"][0]["top_pass"], "shader_event_redacted")
+            self.assertIsNone(parsed["top_slow_frames"][0]["phase"])
+            self.assertEqual(parsed["top_slow_frames"][1]["phase"], "main_menu")
+
+
 if __name__ == "__main__":
     unittest.main()
