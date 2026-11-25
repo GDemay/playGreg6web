@@ -2259,6 +2259,80 @@ mod tests {
         assert!(json.contains("\"jump_table_entry\": 4"));
     }
 
+    /// Synthetic PE with `.pdata`: four switch functions (0x1100, 0x1140, 0x1180, 0x11c0) and a
+    /// caller at 0x1080 that calls two of them and tail-jumps into a third.
+    fn multi_switch_image(file: &[u8]) -> CodeImage<'_> {
+        use crate::pdata::ExceptionDirectory;
+        use crate::pe::Pe64;
+
+        let pe = Pe64::parse(file).expect("synthetic PE parses");
+        let mut image = CodeImage::from_pe(&pe, file);
+        ExceptionDirectory::from_pe(&pe, file).seed(&mut image);
+        image
+    }
+
+    fn multi_switch_file() -> Vec<u8> {
+        use crate::pdata::tests::{pe_with_pdata, put, unwind_bytes};
+
+        const SWITCHES: [u32; 4] = [0x1100, 0x1140, 0x1180, 0x11c0];
+        let mut records = vec![(0x1080, 0x1090, 0x2700)];
+        records.extend(SWITCHES.map(|rva| (rva, rva + 0x30, 0x2700)));
+        let mut file = pe_with_pdata(&records);
+        put(&mut file, 0x2700, &unwind_bytes(0, &[]));
+        for (i, rva) in SWITCHES.into_iter().enumerate() {
+            let table = 0x2600 + 0x10 * i as u32;
+            put(&mut file, rva, &switch_code(rva, table));
+            put(&mut file, table, &case_table(rva));
+        }
+        let rel = |from: u32, to: u32| (to.wrapping_sub(from + 5)).to_le_bytes();
+        let caller = [
+            &[0xe8][..],
+            &rel(0x1080, 0x1100), // 0: call 0x1100
+            &[0xe8],
+            &rel(0x1085, 0x1140), // 5: call 0x1140
+            &[0xe9],
+            &rel(0x108a, 0x1180), // a: jmp 0x1180 (tail call)
+        ]
+        .concat();
+        put(&mut file, 0x1080, &caller);
+        file
+    }
+
+    #[test]
+    fn parallel_discovery_matches_serial_on_synthetic_pe() {
+        use crate::discover::discover_with_threads;
+
+        let file = multi_switch_file();
+        let image = multi_switch_image(&file);
+        let serial = discover_with_threads(&image, 1);
+        assert_eq!(serial.jump_tables.len(), 4);
+        assert!(serial.function(BASE + 0x1080).is_some());
+        let parallel = discover_with_threads(&image, 4);
+        assert_eq!(serial, parallel);
+        assert_eq!(
+            serial.functions.keys().collect::<Vec<_>>(),
+            parallel.functions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discovery_is_deterministic_across_thread_counts() {
+        use crate::discover::discover_with_threads;
+
+        let file = multi_switch_file();
+        let image = multi_switch_image(&file);
+        let reference = discover_with_threads(&image, 1);
+        for threads in [0, 2, 3, 5, 8, 64] {
+            for _ in 0..3 {
+                assert_eq!(
+                    reference,
+                    discover_with_threads(&image, threads),
+                    "{threads} threads"
+                );
+            }
+        }
+    }
+
     // ---- Extended MSVC x64 jump-table pattern tests ----
 
     use iced_x86::code_asm::*;
