@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66)."""
+"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66, W119)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import tempfile
 import threading
@@ -76,6 +77,33 @@ def _write_wasm_pair(
     wasm_dir.mkdir(parents=True, exist_ok=True)
     (wasm_dir / "runtime.wasm").write_bytes(wasm_bytes)
     (wasm_dir / "runtime.js").write_text(js_text, encoding="utf-8")
+
+
+def _build_synthetic_wgpk(seed: int = 1) -> bytes:
+    """Build a minimal valid WGPK v1 binary shader pack header + payload."""
+    return struct.pack("<4sIII", b"WGPK", 1, 0, seed)
+
+
+def _sample_reflect_sidecar(stage_count: int = 2) -> dict[str, object]:
+    stages = {
+        f"0x{idx + 1:016x}": {
+            "stage": "vertex" if idx % 2 == 0 else "fragment",
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                }
+            ],
+        }
+        for idx in range(stage_count)
+    }
+    return {
+        "schema": "playgta6-stage-reflection",
+        "version": 1,
+        "stages": stages,
+    }
 
 
 def _can_create_symlinks(tmp_dir: Path) -> bool:
@@ -1232,6 +1260,459 @@ class TestCrossPlatformSanitization(unittest.TestCase):
                 for username in sbb._current_usernames():
                     self.assertNotRegex(
                         text,
+                        re.compile(
+                            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+                            re.IGNORECASE,
+                        ),
+                    )
+
+
+class TestShaderPackAndSidecarStaging(unittest.TestCase):
+    def test_stages_wgsl_pack_with_adjacent_reflect_sidecar_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            boot_dir = repo / "work" / "recomp_build"
+            shaders_dir = repo / "local-data" / "shaders"
+            _populate_program_dir(program_dir)
+
+            src_dir = repo / "work" / "shader_build"
+            src_dir.mkdir(parents=True)
+            src_pack = src_dir / "foo.wgsl.pack"
+            src_sidecar = Path(str(src_pack) + ".reflect.json")
+            pack_bytes = _build_synthetic_wgpk(seed=7)
+            sidecar_text = json.dumps(_sample_reflect_sidecar(stage_count=3), indent=2) + "\n"
+            sidecar_bytes = sidecar_text.encode("utf-8")
+            src_pack.write_bytes(pack_bytes)
+            src_sidecar.write_bytes(sidecar_bytes)
+
+            # Dry-run plans both pack + sidecar without writing files.
+            dry = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                boot_dir=boot_dir,
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+                dry_run=True,
+            )
+            self.assertTrue(dry["ok"])
+            self.assertEqual(dry["shaders"]["status"], "planned")
+            self.assertEqual(dry["shaders"]["planned_count"], 2)
+            self.assertFalse(dry["sidecar_staged"])
+            self.assertEqual(dry["sidecar_bytes"], 0)
+            self.assertFalse(shaders_dir.exists())
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                boot_dir=boot_dir,
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["sidecar_staged"])
+            self.assertEqual(report["sidecar_bytes"], len(sidecar_bytes))
+            self.assertEqual(report["shaders"]["status"], "staged")
+            self.assertTrue(report["shaders"]["sidecar_staged"])
+            self.assertEqual(report["shaders"]["sidecar_bytes"], len(sidecar_bytes))
+            self.assertEqual(report["shaders"]["copied_count"], 2)
+            self.assertEqual(report["shaders"]["pack"]["name"], "splash.wgsl.pack")
+            self.assertEqual(report["shaders"]["sidecar"]["name"], "splash.wgsl.pack.reflect.json")
+            self.assertEqual(report["shaders"]["sidecar"]["stage_count"], 3)
+            self.assertEqual(report["shaders"]["sidecar"]["source"], "adjacent")
+
+            dst_pack = shaders_dir / "splash.wgsl.pack"
+            dst_sidecar = shaders_dir / "splash.wgsl.pack.reflect.json"
+            self.assertEqual(dst_pack.read_bytes(), pack_bytes)
+            self.assertEqual(dst_sidecar.read_bytes(), sidecar_bytes)
+            self.assertEqual(
+                sorted(p.name for p in shaders_dir.iterdir()),
+                ["splash.wgsl.pack", "splash.wgsl.pack.reflect.json"],
+            )
+
+            # Second run is incremental unchanged no-op, still reporting sidecar_staged=True.
+            second = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                boot_dir=boot_dir,
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+            )
+            self.assertTrue(second["ok"])
+            self.assertEqual(second["shaders"]["status"], "unchanged")
+            self.assertEqual(second["shaders"]["copied_count"], 0)
+            self.assertEqual(second["shaders"]["unchanged_count"], 2)
+            self.assertTrue(second["sidecar_staged"])
+            self.assertEqual(second["sidecar_bytes"], len(sidecar_bytes))
+
+    def test_stages_wgsl_pack_without_sidecar_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            boot_dir = repo / "work" / "recomp_build"
+            shaders_dir = repo / "local-data" / "shaders"
+            _populate_program_dir(program_dir)
+
+            src_pack = repo / "work" / "no_sidecar.wgsl.pack"
+            pack_bytes = _build_synthetic_wgpk(seed=11)
+            src_pack.write_bytes(pack_bytes)
+
+            report = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                boot_dir=boot_dir,
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["shaders"]["status"], "staged")
+            self.assertFalse(report["sidecar_staged"])
+            self.assertEqual(report["sidecar_bytes"], 0)
+            self.assertIsNone(report["shaders"]["sidecar"])
+            self.assertEqual(report["shaders"]["copied_count"], 1)
+            self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), pack_bytes)
+            self.assertFalse((shaders_dir / "splash.wgsl.pack.reflect.json").exists())
+
+    def test_invalid_sidecar_json_fails_cleanly_without_clobbering_existing_files(self) -> None:
+        cases = [
+            ("malformed_json", "{not-valid-json"),
+            ("non_object_json", "[1, 2, 3]"),
+            ("missing_stages_map", '{"schema": "playgta6-stage-reflection", "version": 1}'),
+            ("non_dict_stages", '{"schema": "playgta6-stage-reflection", "stages": []}'),
+            ("bad_version_bool", '{"version": true, "stages": {}}'),
+        ]
+        for label, bad_sidecar in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                repo = _make_repo_skeleton(Path(tmp))
+                shaders_dir = repo / "local-data" / "shaders"
+                shaders_dir.mkdir(parents=True)
+
+                # Pre-populate known-good staged pack + sidecar.
+                existing_pack = _build_synthetic_wgpk(seed=100)
+                existing_sidecar = json.dumps(_sample_reflect_sidecar(stage_count=1)) + "\n"
+                (shaders_dir / "splash.wgsl.pack").write_bytes(existing_pack)
+                (shaders_dir / "splash.wgsl.pack.reflect.json").write_text(
+                    existing_sidecar, encoding="utf-8"
+                )
+
+                # New candidate has updated pack + invalid sidecar.
+                src_pack = repo / "work" / "broken.wgsl.pack"
+                src_pack.write_bytes(_build_synthetic_wgpk(seed=200))
+                Path(str(src_pack) + ".reflect.json").write_text(bad_sidecar, encoding="utf-8")
+
+                report = sbb.stage_browser_boot(
+                    shader_pack=src_pack,
+                    shaders_dir=shaders_dir,
+                    repo_root=repo,
+                )
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["shaders"]["status"], "refused")
+                self.assertFalse(report["sidecar_staged"])
+                self.assertEqual(report["sidecar_bytes"], 0)
+                self.assertTrue(report["errors"])
+                # Existing staged pack and sidecar MUST remain completely untouched!
+                self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), existing_pack)
+                self.assertEqual(
+                    (shaders_dir / "splash.wgsl.pack.reflect.json").read_text(encoding="utf-8"),
+                    existing_sidecar,
+                )
+
+    def test_reflect_sidecar_override_flag_and_missing_override_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            src_pack = repo / "work" / "custom.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=5))
+
+            override_sidecar = repo / "work" / "override.reflect.json"
+            override_bytes = (json.dumps(_sample_reflect_sidecar(stage_count=4)) + "\n").encode(
+                "utf-8"
+            )
+            override_sidecar.write_bytes(override_bytes)
+
+            report = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                shader_pack_name="custom_out.wgsl.pack",
+                reflect_sidecar=override_sidecar,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["sidecar_staged"])
+            self.assertEqual(report["sidecar_bytes"], len(override_bytes))
+            self.assertEqual(report["shaders"]["sidecar"]["source"], "override")
+            self.assertEqual(
+                report["shaders"]["sidecar"]["name"], "custom_out.wgsl.pack.reflect.json"
+            )
+            self.assertEqual(
+                (shaders_dir / "custom_out.wgsl.pack.reflect.json").read_bytes(),
+                override_bytes,
+            )
+
+            # Missing explicit override fails cleanly without writing pack.
+            missing_report = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=repo / "local-data" / "shaders_missing",
+                reflect_sidecar=repo / "work" / "does_not_exist.reflect.json",
+                repo_root=repo,
+            )
+            self.assertFalse(missing_report["ok"])
+            self.assertEqual(missing_report["shaders"]["status"], "error")
+            self.assertFalse((repo / "local-data" / "shaders_missing").exists())
+
+    def test_refuses_tracked_shaders_dir_and_unsafe_shader_pack_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            src_pack = repo / "work" / "foo.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=1))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(_sample_reflect_sidecar(stage_count=1)), encoding="utf-8"
+            )
+
+            for bad_rel in ("web", "tools", "runtime", "web/dist", "."):
+                bad_dir = repo / bad_rel
+                report = sbb.stage_browser_boot(
+                    shader_pack=src_pack,
+                    shaders_dir=bad_dir,
+                    repo_root=repo,
+                )
+                self.assertFalse(report["ok"], f"expected refusal for shaders_dir={bad_rel}")
+                self.assertFalse(report["safety"]["shaders_dir_safe"])
+                self.assertEqual(report["shaders"]["status"], "refused")
+                self.assertFalse((bad_dir / "splash.wgsl.pack").exists())
+                self.assertFalse((bad_dir / "splash.wgsl.pack.reflect.json").exists())
+
+            bad_name_report = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=repo / "local-data" / "shaders",
+                shader_pack_name="../escape.wgsl.pack",
+                repo_root=repo,
+            )
+            self.assertFalse(bad_name_report["ok"])
+            self.assertEqual(bad_name_report["shaders"]["status"], "refused")
+
+    def test_atomic_replace_failure_preserves_existing_pack_and_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            shaders_dir.mkdir(parents=True)
+
+            old_pack = _build_synthetic_wgpk(seed=1)
+            old_sidecar = json.dumps(_sample_reflect_sidecar(stage_count=1)) + "\n"
+            (shaders_dir / "splash.wgsl.pack").write_bytes(old_pack)
+            (shaders_dir / "splash.wgsl.pack.reflect.json").write_text(
+                old_sidecar, encoding="utf-8"
+            )
+
+            src_pack = repo / "work" / "new.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=2))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(_sample_reflect_sidecar(stage_count=2)) + "\n",
+                encoding="utf-8",
+            )
+
+            orig_replace = os.replace
+
+            def fail_on_shaders_dir(src: Path | str, dst: Path | str) -> None:
+                if Path(dst).parent.resolve() == shaders_dir.resolve():
+                    raise OSError("simulated replace failure")
+                orig_replace(src, dst)
+
+            with mock.patch("stage_browser_boot.os.replace", side_effect=fail_on_shaders_dir):
+                report = sbb.stage_browser_boot(
+                    shader_pack=src_pack,
+                    shaders_dir=shaders_dir,
+                    repo_root=repo,
+                )
+
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["shaders"]["status"], "error")
+            self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), old_pack)
+            self.assertEqual(
+                (shaders_dir / "splash.wgsl.pack.reflect.json").read_text(encoding="utf-8"),
+                old_sidecar,
+            )
+            self.assertEqual(
+                sorted(p.name for p in shaders_dir.iterdir()),
+                ["splash.wgsl.pack", "splash.wgsl.pack.reflect.json"],
+            )
+
+
+class TestBootOptionsStaging(unittest.TestCase):
+    def test_verify_window_marks_writes_valid_boot_options_json_and_refuses_tracked_dirs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            boot_dir = repo / "work" / "recomp_build"
+
+            report = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                verify_window_marks=True,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["boot_options_staged"])
+            self.assertEqual(report["boot_options"]["status"], "staged")
+            self.assertEqual(
+                report["boot_options"]["options"],
+                {"verify_window_marks": True},
+            )
+            written = json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8"))
+            self.assertEqual(written, {"verify_window_marks": True})
+
+            # Refuses tracked repo directories cleanly without writing boot-options.json.
+            for bad_rel in ("web", "tools", "runtime", "web/dist", "."):
+                bad_boot = repo / bad_rel
+                refused = sbb.stage_browser_boot(
+                    boot_dir=bad_boot,
+                    verify_window_marks=True,
+                    repo_root=repo,
+                )
+                self.assertFalse(refused["ok"], f"expected refusal for {bad_rel}")
+                self.assertFalse(refused["safety"]["boot_dir_safe"])
+                self.assertFalse(refused["boot_options_staged"])
+                self.assertEqual(refused["boot_options"]["status"], "refused")
+                self.assertFalse((bad_boot / "boot-options.json").exists())
+
+    def test_boot_options_json_inline_file_merge_and_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            boot_dir = repo / "work" / "recomp_build"
+
+            # Inline JSON merged with --verify-window-marks.
+            report = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                boot_options='{"max_wall_ms": 900000, "report_to_log": true}',
+                verify_window_marks=True,
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["boot_options_staged"])
+            self.assertEqual(
+                json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8")),
+                {
+                    "max_wall_ms": 900000,
+                    "report_to_log": True,
+                    "verify_window_marks": True,
+                },
+            )
+
+            # File input with valid options.
+            opts_src = repo / "work" / "input_opts.json"
+            opts_src.write_text(
+                json.dumps({"max_dispatches": 1000, "verify_window_marks": False}),
+                encoding="utf-8",
+            )
+            report_file = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                boot_options=str(opts_src),
+                repo_root=repo,
+            )
+            self.assertTrue(report_file["ok"])
+            self.assertTrue(report_file["boot_options_staged"])
+            self.assertEqual(
+                json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8")),
+                {"max_dispatches": 1000, "verify_window_marks": False},
+            )
+
+            # Invalid options fail without clobbering existing boot-options.json.
+            existing_text = (boot_dir / "boot-options.json").read_text(encoding="utf-8")
+            bad_cases = [
+                "{bad",
+                "[]",
+                '{"unknown_key": true}',
+                '{"verify_window_marks": "true"}',
+                '{"max_wall_ms": true}',
+                '{"max_wall_ms": -1}',
+            ]
+            for bad_input in bad_cases:
+                with self.subTest(bad_input=bad_input):
+                    bad_report = sbb.stage_browser_boot(
+                        boot_dir=boot_dir,
+                        boot_options=bad_input,
+                        repo_root=repo,
+                    )
+                    self.assertFalse(bad_report["ok"])
+                    self.assertFalse(bad_report["boot_options_staged"])
+                    self.assertEqual(bad_report["boot_options"]["status"], "refused")
+                    self.assertEqual(
+                        (boot_dir / "boot-options.json").read_text(encoding="utf-8"),
+                        existing_text,
+                    )
+
+    def test_cli_sidecar_and_boot_options_json_and_text_output_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="W119SecretHost_") as tmp:
+            base = Path(tmp)
+            repo = _make_repo_skeleton(base)
+            src_pack = base / "external_pack.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=9))
+            sidecar_bytes = (json.dumps(_sample_reflect_sidecar(stage_count=2)) + "\n").encode(
+                "utf-8"
+            )
+            Path(str(src_pack) + ".reflect.json").write_bytes(sidecar_bytes)
+
+            ext_boot = base / "ext_boot_dir"
+            ext_shaders = base / "ext_shaders_dir"
+
+            # JSON CLI run
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc_json = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--shader-pack",
+                        str(src_pack),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--verify-window-marks",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc_json, 0)
+            payload = json.loads(buf_json.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["sidecar_staged"])
+            self.assertEqual(payload["sidecar_bytes"], len(sidecar_bytes))
+            self.assertTrue(payload["boot_options_staged"])
+
+            # Text CLI run (incremental unchanged)
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc_text = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--shader-pack",
+                        str(src_pack),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--verify-window-marks",
+                    ]
+                )
+            self.assertEqual(rc_text, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("sidecar_staged=true", text_out)
+            self.assertIn(f"sidecar_bytes={len(sidecar_bytes)}", text_out)
+            self.assertIn("boot_options_staged=true", text_out)
+
+            # Verify zero host paths or usernames in both JSON and text outputs.
+            for output in (buf_json.getvalue(), text_out):
+                self.assertNotIn("W119SecretHost_", output)
+                self.assertNotIn(str(base), output)
+                self.assertNotIn(str(base).replace("\\", "/"), output)
+                self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
+                self.assertNotIn("/Users/", output)
+                self.assertNotIn("/home/", output)
+                self.assertNotIn("/tmp/", output)
+                for username in sbb._current_usernames():
+                    self.assertNotRegex(
+                        output,
                         re.compile(
                             rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
                             re.IGNORECASE,
