@@ -1976,3 +1976,148 @@ test('W216: maxRecordedBytes bounded ring-buffer eviction, droppedRingPackets, s
   assert.equal(cleared.droppedRingPackets, 0);
   assert.deepEqual(cleared.skippedLargeUploads, []);
 });
+
+test('W277: bounded maxRecordedBytes ring cap enforces hard RAM ceiling across multi-thousand-frame sessions with peakRecordedBytes, evictedFrames, and resetStats()', () => {
+  // Default maxRecordedBytes is 16 MiB.
+  const defaultRec = new GpuFrameRecorder();
+  const defStats = defaultRec.getStats();
+  assert.equal(defStats.maxRecordedBytes, 16 * 1024 * 1024);
+  assert.equal(defStats.recordedBytes, 0);
+  assert.equal(defStats.peakRecordedBytes, 0);
+  assert.equal(defStats.evictedFrames, 0);
+
+  // Multi-thousand-frame stress test: 2,500 frames * 64B = 160,000B into a strict 640B ring (10 frames).
+  const singleFrameBytes = buildSimpleFrame(0.1, 3).byteLength;
+  assert.equal(singleFrameBytes, 64);
+  const CAP_FRAMES = 10;
+  const CAP_BYTES = singleFrameBytes * CAP_FRAMES; // 640 bytes
+
+  const rec = new GpuFrameRecorder({
+    maxFrames: 5000,
+    maxRecordedBytes: CAP_BYTES,
+    autoStart: true,
+  });
+
+  const lastTenFrames = [];
+  for (let i = 0; i < 2500; i += 1) {
+    const f = buildSimpleFrame((i % 256) / 255, i + 1);
+    rec.recordChunk(f);
+    lastTenFrames.push(f);
+    if (lastTenFrames.length > CAP_FRAMES) {
+      lastTenFrames.shift();
+    }
+    if (i < 20 || i % 250 === 0 || i === 2499) {
+      const s = rec.getStats();
+      assert.ok(s.recordedBytes <= CAP_BYTES, `recordedBytes ${s.recordedBytes} exceeded cap ${CAP_BYTES}`);
+      assert.ok(
+        s.peakRecordedBytes <= CAP_BYTES,
+        `peakRecordedBytes ${s.peakRecordedBytes} exceeded cap ${CAP_BYTES}`
+      );
+      assert.ok(s.peakRecordedBytes >= s.recordedBytes);
+    }
+  }
+
+  const finalStats = rec.getStats();
+  assert.equal(finalStats.frameCount, CAP_FRAMES);
+  assert.equal(finalStats.recordedBytes, CAP_BYTES);
+  assert.equal(finalStats.peakRecordedBytes, CAP_BYTES);
+  assert.equal(finalStats.evictedFrames, 2500 - CAP_FRAMES);
+  assert.equal(finalStats.maxRecordedBytes, CAP_BYTES);
+  assert.deepEqual(rec.exportTraceBytes(), concatUint8Arrays(lastTenFrames));
+
+  // Variable-size frames: peakRecordedBytes retains the high-water mark after multi-frame eviction.
+  const varRec = new GpuFrameRecorder({
+    maxFrames: 100,
+    maxRecordedBytes: 128,
+    autoStart: true,
+  });
+  const f64a = buildSimpleFrame(0.1, 3); // 64B
+  const f64b = buildSimpleFrame(0.2, 6); // 64B
+  // 96B frame: BeginFrame(8) + WriteBuffer(8 + 16 + 56 = 80) + Present(8) = 96B
+  const f96 = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(1, 0, new Uint8Array(56))
+    .present()
+    .finish();
+  assert.equal(f96.byteLength, 96);
+
+  varRec.recordChunk(f64a);
+  varRec.recordChunk(f64b);
+  assert.equal(varRec.getStats().recordedBytes, 128);
+  assert.equal(varRec.getStats().peakRecordedBytes, 128);
+  assert.equal(varRec.getStats().evictedFrames, 0);
+
+  // Adding 96B frame into 128B cap must evict BOTH 64B frames (evictedFrames=2), leaving 96B live and 128B peak.
+  varRec.recordChunk(f96);
+  const afterEvict = varRec.getStats();
+  assert.equal(afterEvict.frameCount, 1);
+  assert.equal(afterEvict.recordedBytes, 96);
+  assert.equal(afterEvict.peakRecordedBytes, 128);
+  assert.equal(afterEvict.evictedFrames, 2);
+  assert.equal(afterEvict.maxRecordedBytes, 128);
+  assert.deepEqual(varRec.exportTraceBytes(), f96);
+
+  // resetStats() clears eviction/drop counters and re-baselines peakRecordedBytes to live recordedBytes
+  // WITHOUT discarding retained frames.
+  const afterResetStats = varRec.resetStats();
+  assert.equal(afterResetStats.frameCount, 1);
+  assert.equal(afterResetStats.recordedBytes, 96);
+  assert.equal(afterResetStats.peakRecordedBytes, 96);
+  assert.equal(afterResetStats.evictedFrames, 0);
+  assert.equal(afterResetStats.droppedFrames, 0);
+  assert.equal(afterResetStats.droppedRingPackets, 0);
+  assert.equal(afterResetStats.maxRecordedBytes, 128);
+  assert.deepEqual(varRec.exportTraceBytes(), f96);
+
+  // clear() empties retained frames and resets recordedBytes / peakRecordedBytes / evictedFrames to 0.
+  varRec.clear();
+  const afterClear = varRec.getStats();
+  assert.equal(afterClear.frameCount, 0);
+  assert.equal(afterClear.recordedBytes, 0);
+  assert.equal(afterClear.peakRecordedBytes, 0);
+  assert.equal(afterClear.evictedFrames, 0);
+});
+
+test('W277: oversized streaming or unclosed frames in ring mode never exceed maxRecordedBytes or corrupt subsequent frames', () => {
+  const rec = new GpuFrameRecorder({
+    maxFrames: 10,
+    maxRecordedBytes: 256,
+    autoStart: true,
+  });
+
+  const fBefore = buildSimpleFrame(0.1, 3); // 64B
+  const fAfter = buildSimpleFrame(0.9, 9); // 64B
+  rec.recordChunk(fBefore);
+
+  // Stream a 32 KiB oversized frame in 512B chunks (>> 256B maxRecordedBytes).
+  const hugeFrame = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(1, 0, new Uint8Array(32 * 1024))
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  for (let pos = 0; pos < hugeFrame.byteLength; pos += 512) {
+    rec.recordChunk(hugeFrame.subarray(pos, Math.min(pos + 512, hugeFrame.byteLength)));
+  }
+
+  // Also stream an unclosed oversized frame (no Present) followed immediately by fAfter.
+  const unclosedHuge = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(2, 0, new Uint8Array(16 * 1024))
+    .finish();
+  for (let pos = 0; pos < unclosedHuge.byteLength; pos += 333) {
+    rec.recordChunk(unclosedHuge.subarray(pos, Math.min(pos + 333, unclosedHuge.byteLength)));
+  }
+
+  rec.recordChunk(fAfter);
+
+  const stats = rec.getStats();
+  assert.equal(stats.frameCount, 2);
+  assert.equal(stats.recordedBytes, fBefore.byteLength + fAfter.byteLength);
+  assert.equal(stats.peakRecordedBytes, fBefore.byteLength + fAfter.byteLength);
+  assert.ok(stats.peakRecordedBytes <= stats.maxRecordedBytes);
+  assert.equal(stats.evictedFrames, 0);
+  assert.equal(stats.droppedFrames, 1);
+  assert.deepEqual(rec.exportTraceBytes(), concatUint8Arrays([fBefore, fAfter]));
+});

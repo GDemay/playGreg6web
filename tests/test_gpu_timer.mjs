@@ -212,7 +212,11 @@ test('graceful no-op degradation when device lacks timestamp-query feature or is
     resolvedFrames: 0,
     skippedFrames: 0,
     droppedPasses: 0,
+    droppedQueryFrames: 0,
+    mapErrors: 0,
     lastFrameGpuMs: 0,
+    p50PassMs: 0,
+    p95PassMs: 0,
     passStats: {},
   });
 
@@ -328,7 +332,11 @@ test('supported lifecycle: allocates resources, profiles compute + render passes
     resolvedFrames: 1,
     skippedFrames: 0,
     droppedPasses: 0,
+    droppedQueryFrames: 0,
+    mapErrors: 0,
     lastFrameGpuMs: 5.75,
+    p50PassMs: 1.25,
+    p95PassMs: 4.5,
     passStats: {
       compute: { count: 1, lastMs: 1.25, avgMs: 1.25, maxMs: 1.25 },
       main_render: { count: 1, lastMs: 4.5, avgMs: 4.5, maxMs: 4.5 },
@@ -1367,4 +1375,214 @@ test('W209 reset() clears top-pass rankings, frame totals, and open CPU passes c
 
   gpuTimer.destroy();
   cpuTimer.destroy();
+});
+
+test('W277: guards mapAsync, getMappedRange, unmap, and resolveFrame against device-loss / abort / torn-down buffer errors without unhandled rejections or dangling mapped buffers', async () => {
+  // 1) mapAsync rejection (AbortError / device loss), getMappedRange throw, and unmap throw
+  const env = createMockWebGpu({ supported: true, deferMap: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 8,
+  });
+
+  // Frame 1: mapAsync rejects with AbortError (simulated device loss / abort)
+  timer.beginFrame();
+  timer.getPassTimestampWrites('shadow');
+  env.setFrameTimestamps([0n, 2_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const pAbort = timer.collectCompletedReadback();
+  assert.equal(env.pendingMaps.length, 1);
+  env.pendingMaps.shift().reject(new DOMException('Device was lost', 'AbortError'));
+  assert.equal(await pAbort, null);
+
+  let stats = timer.getStats();
+  assert.equal(stats.mapErrors, 1);
+  assert.equal(stats.droppedQueryFrames, 1);
+  assert.equal(stats.resolvedFrames, 0);
+  assert.equal(env.buffers[1].mapState, 'unmapped');
+
+  // Frame 2: getMappedRange throws after mapAsync resolves -> buffer MUST be unmapped (no dangling mapped buffer)
+  const readbackBuf0 = env.buffers[1];
+  const origGetMappedRange = readbackBuf0.getMappedRange.bind(readbackBuf0);
+  const unmapCallsBefore = readbackBuf0.unmapCalls;
+  readbackBuf0.getMappedRange = () => {
+    throw new Error('Buffer torn down during getMappedRange');
+  };
+
+  timer.beginFrame();
+  timer.getPassTimestampWrites('gbuffer');
+  env.setFrameTimestamps([0n, 3_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const pRangeErr = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  assert.equal(await pRangeErr, null);
+
+  assert.equal(readbackBuf0.mapState, 'unmapped');
+  assert.equal(readbackBuf0.unmapCalls, unmapCallsBefore + 1);
+  stats = timer.getStats();
+  assert.equal(stats.mapErrors, 2);
+  assert.equal(stats.droppedQueryFrames, 2);
+  assert.equal(stats.resolvedFrames, 0);
+  readbackBuf0.getMappedRange = origGetMappedRange;
+
+  // Frame 3: unmap() throws (torn-down buffer / device loss during unmap) -> no unhandled rejection, no double unmap
+  const origUnmap = readbackBuf0.unmap.bind(readbackBuf0);
+  let throwingUnmapCalls = 0;
+  readbackBuf0.unmap = function () {
+    throwingUnmapCalls += 1;
+    this.mapState = 'unmapped';
+    throw new Error('Device lost during unmap');
+  };
+
+  timer.beginFrame();
+  timer.getPassTimestampWrites('lighting');
+  env.setFrameTimestamps([0n, 4_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const pUnmapErr = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  assert.equal(await pUnmapErr, null);
+
+  assert.equal(throwingUnmapCalls, 1);
+  stats = timer.getStats();
+  assert.equal(stats.mapErrors, 3);
+  assert.equal(stats.droppedQueryFrames, 3);
+  assert.equal(stats.resolvedFrames, 0);
+  readbackBuf0.unmap = origUnmap;
+
+  // Frame 4: externally destroyed readback slot is skipped cleanly while healthy slot still resolves
+  readbackBuf0.destroy();
+  timer.beginFrame();
+  timer.getPassTimestampWrites('post');
+  env.setFrameTimestamps([0n, 5_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const pHealthy = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  const resHealthy = await pHealthy;
+  assert.deepEqual(resHealthy, {
+    totalGpuMs: 5.0,
+    passes: [{ name: 'post', durationMs: 5.0 }],
+  });
+  assert.equal(timer.getStats().resolvedFrames, 1);
+  assert.equal(timer.getStats().mapErrors, 3);
+  assert.equal(timer.getStats().droppedQueryFrames, 3);
+
+  // Frame 5: resolveQuerySet throwing on encoder is caught and increments droppedQueryFrames
+  timer.beginFrame();
+  timer.getPassTimestampWrites('broken_encode');
+  const throwingEncoder = {
+    resolveQuerySet() {
+      throw new Error('GPUQuerySet destroyed');
+    },
+    copyBufferToBuffer() {},
+  };
+  assert.equal(timer.resolveFrame(throwingEncoder), false);
+  assert.equal(timer.getStats().droppedQueryFrames, 4);
+  assert.equal(timer.getStats().mapErrors, 3);
+
+  timer.destroy();
+
+  // 2) WebGPU device.lost promise guards subsequent resolveFrame calls cleanly
+  let triggerDeviceLost;
+  const lostEnv = createMockWebGpu({ supported: true });
+  lostEnv.device.lost = new Promise((resolve) => {
+    triggerDeviceLost = resolve;
+  });
+  const lostTimer = new GpuPassTimer({
+    device: lostEnv.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+  });
+
+  triggerDeviceLost({ reason: 'destroyed', message: 'Simulated GPU device loss' });
+  await Promise.resolve();
+
+  lostTimer.beginFrame();
+  lostTimer.getPassTimestampWrites('after_loss');
+  assert.equal(lostTimer.resolveFrame(lostEnv.device.createCommandEncoder()), false);
+  assert.equal(lostEnv.resolveCalls.length, 0);
+  assert.equal(lostTimer.getStats().droppedQueryFrames, 1);
+  lostTimer.destroy();
+});
+
+test('W277: bounded rolling pass duration window computes p50PassMs and p95PassMs over multi-thousand-frame sessions with clean resetStats()', async () => {
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 100,
+  });
+
+  // Simulate 2,500 frames: first 2,400 frames have huge 50ms spikes that must evict cleanly,
+  // final 100 frames have pass durations 1ms..100ms -> exact nearest-rank p50=50ms, p95=95ms.
+  for (let frame = 0; frame < 2500; frame += 1) {
+    const durationMs = frame < 2400 ? 50 : frame - 2400 + 1;
+    timer.beginFrame();
+    timer.getPassTimestampWrites('main_render');
+    env.setFrameTimestamps([0n, BigInt(durationMs * 1_000_000)]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+
+  const stats = timer.getStats();
+  assert.equal(stats.resolvedFrames, 2500);
+  assert.equal(stats.droppedQueryFrames, 0);
+  assert.equal(stats.mapErrors, 0);
+  assert.equal(stats.p50PassMs, 50);
+  assert.equal(stats.p95PassMs, 95);
+
+  // resetStats() clears rolling window, counters, and errors while keeping GPU resources usable.
+  const afterReset = timer.resetStats();
+  assert.deepEqual(afterReset, {
+    supported: true,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    droppedQueryFrames: 0,
+    mapErrors: 0,
+    lastFrameGpuMs: 0,
+    p50PassMs: 0,
+    p95PassMs: 0,
+    passStats: {},
+  });
+  assert.equal(timer.isDestroyed, false);
+
+  // Fresh post-reset frames compute new p50PassMs / p95PassMs without leakage from prior 2,500 frames.
+  for (const ms of [2, 4, 6, 8]) {
+    timer.beginFrame();
+    timer.getPassTimestampWrites('post_reset');
+    env.setFrameTimestamps([0n, BigInt(ms * 1_000_000)]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+  const freshStats = timer.getStats();
+  assert.equal(freshStats.resolvedFrames, 4);
+  assert.equal(freshStats.p50PassMs, 4);
+  assert.equal(freshStats.p95PassMs, 8);
+
+  timer.destroy();
+
+  // In-flight mapAsync during resetStats() must still unmap cleanly when it resolves.
+  const deferEnv = createMockWebGpu({ supported: true, deferMap: true });
+  const deferTimer = new GpuPassTimer({
+    device: deferEnv.device,
+    maxPassesPerFrame: 2,
+    readbackSlots: 2,
+  });
+  deferTimer.beginFrame();
+  deferTimer.getPassTimestampWrites('stale_pass');
+  deferEnv.setFrameTimestamps([0n, 9_000_000n]);
+  assert.equal(deferTimer.resolveFrame(deferEnv.device.createCommandEncoder()), true);
+  const inFlight = deferTimer.collectCompletedReadback();
+  deferTimer.resetStats();
+
+  deferEnv.pendingMaps.shift().resolve();
+  assert.equal(await inFlight, null);
+  assert.equal(deferEnv.buffers[1].mapState, 'unmapped');
+  assert.equal(deferEnv.buffers[1].unmapCalls, 1);
+  assert.equal(deferTimer.getStats().p50PassMs, 0);
+  assert.equal(deferTimer.getStats().mapErrors, 0);
+  deferTimer.destroy();
 });
