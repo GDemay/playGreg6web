@@ -143,6 +143,14 @@ function getResponseHeader(response, headerName) {
   return null;
 }
 
+function normalizeHeaderString(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function parseNonNegativeInt(raw) {
   if (raw === null || raw === undefined) {
     return null;
@@ -179,6 +187,82 @@ function parseContentRange(headerValue) {
     return null;
   }
   return { start, end, total };
+}
+
+function parseContentRangeTotal(headerValue) {
+  if (typeof headerValue !== 'string') {
+    return null;
+  }
+  const satisfied = parseContentRange(headerValue);
+  if (satisfied) {
+    return satisfied.total;
+  }
+  const unsatisfied = /^\s*bytes\s+\*\/(\d+)\s*$/i.exec(headerValue);
+  if (!unsatisfied) {
+    return null;
+  }
+  const total = Number(unsatisfied[1]);
+  return Number.isSafeInteger(total) && total >= 0 ? total : null;
+}
+
+function looksLikeMidShaderCorruption(wgsl) {
+  if (typeof wgsl !== 'string' || wgsl.length === 0) {
+    return false;
+  }
+  if (wgsl.indexOf('\0') !== -1) {
+    return true;
+  }
+  // Skip leading whitespace and WGSL line/block comments to inspect the first module-scope token.
+  let i = 0;
+  const len = wgsl.length;
+  while (i < len) {
+    const ch = wgsl.charCodeAt(i);
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+      i += 1;
+      continue;
+    }
+    if (ch === 0x2f && i + 1 < len) {
+      const next = wgsl.charCodeAt(i + 1);
+      if (next === 0x2f) {
+        i += 2;
+        while (i < len && wgsl.charCodeAt(i) !== 0x0a) {
+          i += 1;
+        }
+        continue;
+      }
+      if (next === 0x2a) {
+        i += 2;
+        let depth = 1;
+        while (i < len && depth > 0) {
+          if (wgsl.charCodeAt(i) === 0x2f && i + 1 < len && wgsl.charCodeAt(i + 1) === 0x2a) {
+            depth += 1;
+            i += 2;
+          } else if (wgsl.charCodeAt(i) === 0x2a && i + 1 < len && wgsl.charCodeAt(i + 1) === 0x2f) {
+            depth -= 1;
+            i += 2;
+          } else {
+            i += 1;
+          }
+        }
+        continue;
+      }
+    }
+    break;
+  }
+  if (i >= len) {
+    return false;
+  }
+  const tail = wgsl.slice(i);
+  // Closing delimiters or binary operators cannot begin a valid WGSL module.
+  if (/^[}\]),.:?+\-*\/%&|^!=<>]/.test(tail)) {
+    return true;
+  }
+  // Function-body-only statements at module scope (e.g. `let` causing WebGPU's
+  // `CreateShaderModule: module-scope 'let' is invalid, use 'const'`).
+  if (/^(?:let|return|if|else|for|while|loop|switch|case|default|break|continue|discard)\b/.test(tail)) {
+    return true;
+  }
+  return false;
 }
 
 function mergeRequestInit(baseInit, overrides = {}) {
@@ -218,6 +302,9 @@ function mergeRequestInit(baseInit, overrides = {}) {
 
   if (overrides.method !== undefined) {
     init.method = overrides.method;
+  }
+  if (overrides.cache !== undefined && init.cache === undefined) {
+    init.cache = overrides.cache;
   }
   if (Object.keys(mergedHeaders).length > 0) {
     init.headers = mergedHeaders;
@@ -588,7 +675,10 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
     throw new RangeError(`Invalid HTTP byte range: bytes=${start}-${end}`);
   }
   const rangeHeader = `bytes=${start}-${end}`;
-  const response = await fetcher(url, mergeRequestInit(fetchInit, { headers: { Range: rangeHeader } }));
+  const response = await fetcher(
+    url,
+    mergeRequestInit(fetchInit, { cache: 'no-store', headers: { Range: rangeHeader } })
+  );
   if (!response || (!response.ok && response.status !== 206)) {
     const status = response ? response.status : 'unknown';
     const statusText = response && response.statusText ? ` ${response.statusText}` : '';
@@ -596,6 +686,9 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
       `Failed to fetch WGSL pack range (${rangeHeader}) from "${url}": HTTP ${status}${statusText}`
     );
     err.httpStatus = response && typeof response.status === 'number' ? response.status : 0;
+    err.etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
+    err.lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+    err.contentRangeTotal = parseContentRangeTotal(getResponseHeader(response, 'content-range'));
     throw err;
   }
 
@@ -603,12 +696,25 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
   const bytes = new Uint8Array(buffer);
   const contentRange = parseContentRange(getResponseHeader(response, 'content-range'));
   const contentLength = parseNonNegativeInt(getResponseHeader(response, 'content-length'));
+  const etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
+  const lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+  const totalSize =
+    contentRange && contentRange.total !== null
+      ? contentRange.total
+      : response.status === 200
+        ? contentLength !== null
+          ? contentLength
+          : bytes.byteLength
+        : null;
 
   return {
     status: response.status,
     bytes,
     contentRange,
     contentLength,
+    etag,
+    lastModified,
+    totalSize,
   };
 }
 
@@ -935,6 +1041,10 @@ export class WgslPack {
     initialRangeFetches = 0,
     initialRangeBytesFetched = 0,
     initialRangeFetchRetries = 0,
+    initialRangeBytes = DEFAULT_INITIAL_RANGE_BYTES,
+    etag = null,
+    lastModified = null,
+    totalSize = null,
     wgslCache = null,
     pinnedWgslCache = null,
     rangedDecodeCounter = null,
@@ -947,6 +1057,17 @@ export class WgslPack {
     this.lazyDecode = lazyDecode;
     this.mode = mode;
     this.url = url;
+    this.etag = normalizeHeaderString(etag);
+    this.lastModified = normalizeHeaderString(lastModified);
+    this.totalSize =
+      totalSize !== undefined &&
+      totalSize !== null &&
+      Number.isSafeInteger(totalSize) &&
+      totalSize >= 0
+        ? totalSize
+        : mode === 'buffer'
+          ? byteLength
+          : null;
     this.entries = byHash;
     this._byHex = byHex;
     this._entryList = entryList;
@@ -956,9 +1077,12 @@ export class WgslPack {
     this._dynamicHits = 0;
 
     // Ranged streaming state (bounded LRU cache with hot-hash pinning, FIFO concurrency
-    // semaphore, transient retry, coalesced range prefetch, and concurrent in-flight deduplication).
+    // semaphore, transient retry, coalesced range prefetch, stale-index reload guard,
+    // and concurrent in-flight deduplication).
     this._fetch = fetchImpl;
     this._fetchInit = fetchInit;
+    this._initialRangeBytes =
+      mode === 'ranged' ? validateInitialRangeBytes(initialRangeBytes) : null;
     this._maxCachedWgslBytes =
       mode === 'ranged'
         ? resolveMaxCacheBytes({ maxCacheBytes, maxCachedWgslBytes })
@@ -994,6 +1118,10 @@ export class WgslPack {
     this._rangeFetches = sanitizeNonNegativeInt(initialRangeFetches, 0);
     this._rangeBytesFetched = sanitizeNonNegativeInt(initialRangeBytesFetched, 0);
     this._rangeFetchRetries = sanitizeNonNegativeInt(initialRangeFetchRetries, 0);
+    this._staleIndexReloads = 0;
+    this._indexGeneration = 0;
+    this._indexReloadPromise = null;
+    this._onIndexReloaded = null;
     this._cacheHits = 0;
     this._cacheMisses = 0;
     this._lruHits = 0;
@@ -1516,17 +1644,238 @@ export class WgslPack {
     }
   }
 
+  _detectChunkStaleReason(chunk) {
+    if (!chunk) {
+      return null;
+    }
+    if (this.etag !== null && chunk.etag !== null && chunk.etag !== this.etag) {
+      return `etag mismatch (baseline ${this.etag}, got ${chunk.etag})`;
+    }
+    const respTotal =
+      chunk.totalSize !== undefined && chunk.totalSize !== null
+        ? chunk.totalSize
+        : chunk.contentRange && chunk.contentRange.total !== null
+          ? chunk.contentRange.total
+          : null;
+    if (this.totalSize !== null && respTotal !== null && respTotal !== this.totalSize) {
+      return `total size mismatch (baseline ${this.totalSize}, got ${respTotal})`;
+    }
+    if (
+      this.lastModified !== null &&
+      chunk.lastModified !== null &&
+      chunk.lastModified !== this.lastModified
+    ) {
+      return `last-modified mismatch (baseline ${this.lastModified}, got ${chunk.lastModified})`;
+    }
+    return null;
+  }
+
+  _detectErrorStaleReason(err) {
+    if (!err || typeof err.httpStatus !== 'number') {
+      return null;
+    }
+    if (err.httpStatus === 412) {
+      return 'HTTP 412 Precondition Failed';
+    }
+    if (err.httpStatus === 416) {
+      if (this.etag !== null && err.etag !== null && err.etag !== this.etag) {
+        return `HTTP 416 with changed ETag (baseline ${this.etag}, got ${err.etag})`;
+      }
+      if (
+        this.totalSize !== null &&
+        err.contentRangeTotal !== null &&
+        err.contentRangeTotal !== this.totalSize
+      ) {
+        return `HTTP 416 with changed total size (baseline ${this.totalSize}, got ${err.contentRangeTotal})`;
+      }
+      if (
+        this.lastModified !== null &&
+        err.lastModified !== null &&
+        err.lastModified !== this.lastModified
+      ) {
+        return `HTTP 416 with changed Last-Modified (baseline ${this.lastModified}, got ${err.lastModified})`;
+      }
+    }
+    return null;
+  }
+
+  async _reloadStaleIndex(fetcher, observedGeneration) {
+    if (this._indexGeneration !== observedGeneration) {
+      return;
+    }
+    if (this._indexReloadPromise !== null) {
+      await this._indexReloadPromise;
+      return;
+    }
+    if (!this.url) {
+      throw new Error('Cannot reload stale WGPK index: ranged pack has no URL');
+    }
+
+    const reloadPromise = (async () => {
+      // Immediately drop stale cached WGSL payloads (preserving _pinnedHashes so hot hashes
+      // re-pin automatically once re-fetched from the refreshed offsets).
+      this.clearWgslCache({ keepPinned: false });
+
+      const initialBytes = Math.max(
+        WGPK_HEADER_BYTES,
+        this._initialRangeBytes || DEFAULT_INITIAL_RANGE_BYTES
+      );
+      const initialChunk = await this._fetchRangeChunkBounded(fetcher, 0, initialBytes - 1);
+      this._rangeBytesFetched += sanitizeNonNegativeInt(initialChunk.bytes.byteLength, 0);
+
+      let etag = normalizeHeaderString(initialChunk.etag);
+      let lastModified = normalizeHeaderString(initialChunk.lastModified);
+      let totalBytes =
+        initialChunk.totalSize !== undefined && initialChunk.totalSize !== null
+          ? initialChunk.totalSize
+          : initialChunk.contentRange
+            ? initialChunk.contentRange.total
+            : null;
+      let indexBytes;
+
+      if (initialChunk.status !== 206) {
+        totalBytes = initialChunk.bytes.byteLength;
+        const fullHeader = parseWgpkHeader(initialChunk.bytes);
+        indexBytes = initialChunk.bytes.subarray(0, fullHeader.dataStart);
+      } else {
+        if (initialChunk.contentRange && initialChunk.contentRange.start !== 0) {
+          throw new Error(
+            `WGPK stale index reload from "${this.url}" started at byte ${initialChunk.contentRange.start} (expected 0)`
+          );
+        }
+        const header = parseWgpkHeader(initialChunk.bytes);
+        const tableEnd = header.dataStart;
+        if (totalBytes !== null && totalBytes < tableEnd) {
+          throw new Error(
+            `WGPK pack truncated on reload: ${totalBytes} total bytes (header + ${header.entryCount} entry table records require at least ${tableEnd} bytes)`
+          );
+        }
+        if (initialChunk.bytes.byteLength >= tableEnd) {
+          indexBytes = initialChunk.bytes.slice(0, tableEnd);
+        } else {
+          indexBytes = new Uint8Array(tableEnd);
+          indexBytes.set(initialChunk.bytes, 0);
+          let have = initialChunk.bytes.byteLength;
+
+          while (have < tableEnd) {
+            const remainder = await this._fetchRangeChunkBounded(fetcher, have, tableEnd - 1);
+            this._rangeBytesFetched += sanitizeNonNegativeInt(remainder.bytes.byteLength, 0);
+
+            if (remainder.status !== 206) {
+              totalBytes = remainder.bytes.byteLength;
+              const fullHeader = parseWgpkHeader(remainder.bytes);
+              indexBytes = remainder.bytes.subarray(0, fullHeader.dataStart);
+              etag = normalizeHeaderString(remainder.etag) ?? etag;
+              lastModified = normalizeHeaderString(remainder.lastModified) ?? lastModified;
+              break;
+            }
+
+            if (etag !== null && remainder.etag !== null && remainder.etag !== etag) {
+              throw new Error(
+                `WGPK pack ETag changed mid-reload from "${this.url}": expected ${etag}, got ${remainder.etag}`
+              );
+            }
+            if (etag === null && remainder.etag !== null) {
+              etag = remainder.etag;
+            }
+            if (
+              lastModified !== null &&
+              remainder.lastModified !== null &&
+              remainder.lastModified !== lastModified
+            ) {
+              throw new Error(
+                `WGPK pack Last-Modified changed mid-reload from "${this.url}": expected ${lastModified}, got ${remainder.lastModified}`
+              );
+            }
+            if (lastModified === null && remainder.lastModified !== null) {
+              lastModified = remainder.lastModified;
+            }
+
+            if (remainder.contentRange) {
+              if (remainder.contentRange.start !== have) {
+                throw new Error(
+                  `WGPK table continuation reload from "${this.url}" started at byte ${remainder.contentRange.start} (expected ${have})`
+                );
+              }
+              if (remainder.contentRange.total !== null) {
+                if (totalBytes !== null && remainder.contentRange.total !== totalBytes) {
+                  throw new Error(
+                    `WGPK pack total size changed mid-reload from "${this.url}": expected ${totalBytes}, got ${remainder.contentRange.total}`
+                  );
+                }
+                totalBytes = remainder.contentRange.total;
+              }
+            }
+
+            if (remainder.bytes.byteLength === 0) {
+              throw new Error(
+                `WGPK pack truncated while reloading entry table from "${this.url}": received 0 bytes at offset ${have}/${tableEnd}`
+              );
+            }
+
+            const copyLen = Math.min(remainder.bytes.byteLength, tableEnd - have);
+            indexBytes.set(remainder.bytes.subarray(0, copyLen), have);
+            have += copyLen;
+          }
+        }
+      }
+
+      const header = parseWgpkHeader(indexBytes);
+      const { rawEntries, stageCounts, totalPayloadBytes, maxEnd } = parseWgpkEntryTable(
+        indexBytes,
+        header,
+        totalBytes
+      );
+
+      this.version = header.version;
+      this.flags = header.flags;
+      this.byteLength = totalBytes !== null ? totalBytes : Math.max(header.dataStart, maxEnd);
+      this.dataStart = header.dataStart;
+      this.payloadBytes = totalPayloadBytes;
+      this._stageCounts = stageCounts;
+      this.etag = etag;
+      this.lastModified = lastModified;
+      this.totalSize = totalBytes;
+      this._entryList = populateRangedIndexEntries(
+        rawEntries,
+        this._wgslCache,
+        this._pinnedWgslCache,
+        this.entries,
+        this._byHex
+      );
+      this._indexGeneration += 1;
+      this._staleIndexReloads += 1;
+      if (typeof this._onIndexReloaded === 'function') {
+        this._onIndexReloaded(this);
+      }
+    })();
+
+    this._indexReloadPromise = reloadPromise;
+    try {
+      await reloadPromise;
+    } finally {
+      if (this._indexReloadPromise === reloadPromise) {
+        this._indexReloadPromise = null;
+      }
+    }
+  }
+
   /**
    * Asynchronously resolve the WGSL source string for a shader hash.
    * Works in both full-buffer mode (returns immediately) and ranged index mode
    * (checks bounded LRU cache, deduplicates concurrent in-flight requests, enforces
-   * bounded HTTP Range concurrency + transient retry, and fetches only the exact
+   * bounded HTTP Range concurrency + transient retry, validates ETag/size against
+   * stale index tables with bounded 1x auto-reload, and fetches only the exact
    * `[offset, offset + length - 1]` byte slice via HTTP `206 Range`).
    *
    * @param {bigint | string | number} hash
    * @returns {Promise<string | null>}
    */
   async getWgslAsync(hash) {
+    if (this._indexReloadPromise !== null) {
+      await this._indexReloadPromise;
+    }
+
     let key;
     let staticEntry;
     if (this._dynamicEntries.size === 0 && typeof hash === 'string') {
@@ -1592,46 +1941,130 @@ export class WgslPack {
     // (0x80000000..0xFFFFFFFF) never wrap negative.
     const start = staticEntry.offset >>> 0;
     const end = start + length - 1;
+    const generationBeforeFetch = this._indexGeneration;
 
     let settled = false;
     let fetchPromise;
     fetchPromise = (async () => {
       try {
-        const chunk = await this._fetchRangeChunkBounded(fetcher, start, end);
-        this._rangeBytesFetched += sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
+        let currentEntry = staticEntry;
+        let currentStart = start;
+        let currentLength = length;
+        let currentEnd = end;
+        let observedGeneration = generationBeforeFetch;
+        let reloaded = false;
 
-        let payloadBytes;
-        if (chunk.status === 206) {
-          if (chunk.contentRange && chunk.contentRange.start !== start) {
-            throw new Error(
-              `WGPK ranged fetch mismatch for ${staticEntry.hashHex}: expected start byte ${start}, got ${chunk.contentRange.start}`
-            );
-          }
-          if (chunk.bytes.byteLength < length) {
-            throw new Error(
-              `WGPK ranged payload truncated for ${staticEntry.hashHex}: expected ${length} bytes, received ${chunk.bytes.byteLength}`
-            );
-          }
-          payloadBytes = chunk.bytes.subarray(0, length);
-        } else {
-          // Server returned 200 OK (entire pack) instead of 206 Partial Content.
-          const sliceEnd = start + length;
-          if (chunk.bytes.byteLength < sliceEnd) {
-            throw new Error(
-              `WGPK full response truncated for ${staticEntry.hashHex}: need byte range [${start}..${sliceEnd}), received ${chunk.bytes.byteLength} bytes`
-            );
-          }
-          payloadBytes = chunk.bytes.subarray(start, sliceEnd);
-        }
+        for (;;) {
+          let chunk = null;
+          let fetchErr = null;
+          let staleReason = null;
 
-        const entryIdx =
-          staticEntry._index !== undefined ? staticEntry._index : staticEntry.hashHex;
-        const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
-        if (this._rangedDecodeCounter) {
-          this._rangedDecodeCounter.count += 1;
+          try {
+            chunk = await this._fetchRangeChunkBounded(fetcher, currentStart, currentEnd);
+          } catch (err) {
+            fetchErr = err;
+            staleReason = this._detectErrorStaleReason(err);
+          }
+
+          if (fetchErr !== null) {
+            if (staleReason !== null && !reloaded && this.url) {
+              reloaded = true;
+              await this._reloadStaleIndex(fetcher, observedGeneration);
+              observedGeneration = this._indexGeneration;
+              const refreshed = this.entries.get(key);
+              if (!refreshed) {
+                return null;
+              }
+              currentEntry = refreshed;
+              currentLength = refreshed.length >>> 0;
+              if (currentLength === 0) {
+                this._putWgslCache(key, '', 0);
+                return '';
+              }
+              currentStart = refreshed.offset >>> 0;
+              currentEnd = currentStart + currentLength - 1;
+              continue;
+            }
+            throw fetchErr;
+          }
+
+          this._rangeBytesFetched += sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
+
+          staleReason = this._detectChunkStaleReason(chunk);
+
+          if (staleReason === null) {
+            let payloadBytes = null;
+            if (chunk.status === 206) {
+              if (chunk.contentRange && chunk.contentRange.start !== currentStart) {
+                throw new Error(
+                  `WGPK ranged fetch mismatch for ${currentEntry.hashHex}: expected start byte ${currentStart}, got ${chunk.contentRange.start}`
+                );
+              }
+              if (chunk.bytes.byteLength < currentLength) {
+                if (
+                  !reloaded &&
+                  this.url &&
+                  (this.etag !== null || this.totalSize !== null || this.lastModified !== null)
+                ) {
+                  staleReason = `truncated ranged payload (expected ${currentLength}, got ${chunk.bytes.byteLength})`;
+                } else {
+                  throw new Error(
+                    `WGPK ranged payload truncated for ${currentEntry.hashHex}: expected ${currentLength} bytes, received ${chunk.bytes.byteLength}`
+                  );
+                }
+              } else {
+                payloadBytes = chunk.bytes.subarray(0, currentLength);
+              }
+            } else {
+              // Server returned 200 OK (entire pack) instead of 206 Partial Content.
+              const sliceEnd = currentStart + currentLength;
+              if (chunk.bytes.byteLength < sliceEnd) {
+                throw new Error(
+                  `WGPK full response truncated for ${currentEntry.hashHex}: need byte range [${currentStart}..${sliceEnd}), received ${chunk.bytes.byteLength} bytes`
+                );
+              }
+              payloadBytes = chunk.bytes.subarray(currentStart, sliceEnd);
+            }
+
+            if (staleReason === null) {
+              const entryIdx =
+                currentEntry._index !== undefined ? currentEntry._index : currentEntry.hashHex;
+              const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+              if (!reloaded && this.url && looksLikeMidShaderCorruption(wgsl)) {
+                staleReason = 'mid-shader offset corruption detected';
+              } else {
+                if (this._rangedDecodeCounter) {
+                  this._rangedDecodeCounter.count += 1;
+                }
+                this._putWgslCache(key, wgsl, currentLength);
+                return wgsl;
+              }
+            }
+          }
+
+          if (!reloaded && this.url) {
+            reloaded = true;
+            await this._reloadStaleIndex(fetcher, observedGeneration);
+            observedGeneration = this._indexGeneration;
+            const refreshed = this.entries.get(key);
+            if (!refreshed) {
+              return null;
+            }
+            currentEntry = refreshed;
+            currentLength = refreshed.length >>> 0;
+            if (currentLength === 0) {
+              this._putWgslCache(key, '', 0);
+              return '';
+            }
+            currentStart = refreshed.offset >>> 0;
+            currentEnd = currentStart + currentLength - 1;
+            continue;
+          }
+
+          throw new Error(
+            `WGPK stale pack mismatch (${staleReason}) persisted after index reload for ${currentEntry.hashHex}`
+          );
         }
-        this._putWgslCache(key, wgsl, length);
-        return wgsl;
       } finally {
         settled = true;
         if (this._inFlightFetches.get(key) === fetchPromise) {
@@ -1702,6 +2135,10 @@ export class WgslPack {
     }
     if (typeof hashes[Symbol.iterator] !== 'function') {
       throw new TypeError('hashes must be an iterable of shader hashes');
+    }
+
+    if (this._indexReloadPromise !== null) {
+      await this._indexReloadPromise;
     }
 
     const seen = new Set();
@@ -1817,6 +2254,8 @@ export class WgslPack {
     let completedBatches = 0;
     let bytesFetched = 0;
 
+    const generationBeforeFetch = this._indexGeneration;
+
     // Register per-hash in-flight promises synchronously BEFORE awaiting any batch so concurrent
     // getWgslAsync() or prefetchHashes() calls deduplicate cleanly onto the coalesced batch.
     const batchPromises = batches.map((batch) => {
@@ -1842,11 +2281,117 @@ export class WgslPack {
         }
       };
 
+      const retryAfterStaleReload = async () => {
+        await this._reloadStaleIndex(fetcher, generationBeforeFetch);
+        const decodedResults = new Array(deferreds.length);
+        let firstError = null;
+
+        for (let i = 0; i < deferreds.length; i += 1) {
+          const { item } = deferreds[i];
+          const refreshed = this.entries.get(item.key);
+          if (!refreshed) {
+            decodedResults[i] = { ok: true, wgsl: null };
+            continue;
+          }
+          const refreshedLen = refreshed.length >>> 0;
+          if (refreshedLen === 0) {
+            this._putWgslCache(item.key, '', 0);
+            prefetched += 1;
+            this._prefetchShaders += 1;
+            decodedResults[i] = { ok: true, wgsl: '' };
+            continue;
+          }
+          const rStart = refreshed.offset >>> 0;
+          const rEnd = rStart + refreshedLen - 1;
+          try {
+            const retryChunk = await this._fetchRangeChunkBounded(fetcher, rStart, rEnd);
+            const retryChunkBytes = sanitizeNonNegativeInt(retryChunk.bytes.byteLength, 0);
+            this._rangeBytesFetched += retryChunkBytes;
+            bytesFetched += retryChunkBytes;
+
+            const retryStale = this._detectChunkStaleReason(retryChunk);
+            if (retryStale !== null) {
+              throw new Error(
+                `WGPK stale pack mismatch (${retryStale}) persisted after index reload for ${refreshed.hashHex}`
+              );
+            }
+
+            let payloadBytes;
+            if (retryChunk.status === 206) {
+              if (retryChunk.contentRange && retryChunk.contentRange.start !== rStart) {
+                throw new Error(
+                  `WGPK ranged prefetch mismatch for ${refreshed.hashHex}: expected start byte ${rStart}, got ${retryChunk.contentRange.start}`
+                );
+              }
+              if (retryChunk.bytes.byteLength < refreshedLen) {
+                throw new Error(
+                  `WGPK ranged prefetch truncated for ${refreshed.hashHex}: expected ${refreshedLen} bytes, received ${retryChunk.bytes.byteLength}`
+                );
+              }
+              payloadBytes = retryChunk.bytes.subarray(0, refreshedLen);
+            } else {
+              const sliceEnd = rStart + refreshedLen;
+              if (retryChunk.bytes.byteLength < sliceEnd) {
+                throw new Error(
+                  `WGPK full prefetch response truncated for ${refreshed.hashHex}: need byte range [${rStart}..${sliceEnd}), received ${retryChunk.bytes.byteLength} bytes`
+                );
+              }
+              payloadBytes = retryChunk.bytes.subarray(rStart, sliceEnd);
+            }
+
+            const entryIdx =
+              refreshed._index !== undefined ? refreshed._index : refreshed.hashHex;
+            const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+            if (this._rangedDecodeCounter) {
+              this._rangedDecodeCounter.count += 1;
+            }
+            this._putWgslCache(item.key, wgsl, refreshedLen);
+            prefetched += 1;
+            this._prefetchShaders += 1;
+            decodedResults[i] = { ok: true, wgsl };
+          } catch (retryErr) {
+            if (firstError === null) {
+              firstError = retryErr;
+            }
+            decodedResults[i] = { ok: false, err: retryErr };
+          }
+        }
+
+        this._prefetchBatches += 1;
+        completedBatches += 1;
+        clearInFlight();
+
+        for (let i = 0; i < deferreds.length; i += 1) {
+          const res = decodedResults[i];
+          if (res.ok) {
+            deferreds[i].resolve(res.wgsl);
+          } else {
+            deferreds[i].reject(res.err);
+          }
+        }
+
+        if (firstError !== null) {
+          throw firstError;
+        }
+      };
+
       return (async () => {
         let chunk;
         try {
           chunk = await this._fetchRangeChunkBounded(fetcher, batch.start, batch.end - 1);
         } catch (err) {
+          if (this.url && this._detectErrorStaleReason(err) !== null) {
+            try {
+              await retryAfterStaleReload();
+              return;
+            } catch (reloadErr) {
+              clearInFlight();
+              for (let i = 0; i < deferreds.length; i += 1) {
+                deferreds[i].reject(reloadErr);
+              }
+              throw reloadErr;
+            }
+          }
           clearInFlight();
           for (let i = 0; i < deferreds.length; i += 1) {
             deferreds[i].reject(err);
@@ -1857,6 +2402,19 @@ export class WgslPack {
         const chunkBytes = sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
         this._rangeBytesFetched += chunkBytes;
         bytesFetched += chunkBytes;
+
+        if (this.url && this._detectChunkStaleReason(chunk) !== null) {
+          try {
+            await retryAfterStaleReload();
+            return;
+          } catch (reloadErr) {
+            clearInFlight();
+            for (let i = 0; i < deferreds.length; i += 1) {
+              deferreds[i].reject(reloadErr);
+            }
+            throw reloadErr;
+          }
+        }
 
         const expectedSpan = batch.end - batch.start;
         try {
@@ -2033,6 +2591,7 @@ export class WgslPack {
     const rangeFetchCount = sanitizeNonNegativeInt(this._rangeFetches, 0);
     const rangeBytesFetched = sanitizeNonNegativeInt(this._rangeBytesFetched, 0);
     const rangeFetchRetries = sanitizeNonNegativeInt(this._rangeFetchRetries, 0);
+    const staleIndexReloads = sanitizeNonNegativeInt(this._staleIndexReloads, 0);
     const activeRangeFetches = sanitizeNonNegativeInt(this._activeRangeFetches, 0);
     const peakConcurrentRangeFetches = sanitizeNonNegativeInt(this._peakConcurrentRangeFetches, 0);
     const cacheHits = sanitizeNonNegativeInt(this._cacheHits, 0);
@@ -2058,6 +2617,9 @@ export class WgslPack {
       version: this.version,
       flags: this.flags,
       mode: this.mode,
+      etag: this.etag,
+      lastModified: this.lastModified,
+      totalSize: this.totalSize,
       entryCount,
       byteLength: this.byteLength,
       headerBytes: WGPK_HEADER_BYTES,
@@ -2075,6 +2637,7 @@ export class WgslPack {
       rangeFetchCount,
       rangeBytesFetched,
       rangeFetchRetries,
+      staleIndexReloads,
       activeRangeFetches,
       peakConcurrentRangeFetches,
       maxConcurrentRangeFetches: this._maxConcurrentRangeFetches,
@@ -2200,44 +2763,10 @@ export function parseWgslPack(buffer, options = {}) {
   });
 }
 
-/**
- * Parse only the WGPK header + entry table into a ranged-mode `WgslPack` without
- * holding payload bytes in memory. Payloads are fetched on demand via `getWgslAsync(hash)`.
- *
- * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} indexBuffer
- * @param {{
- *   url?: string | null,
- *   totalBytes?: number | null,
- *   fetch?: typeof fetch,
- *   fetchInit?: RequestInit,
- *   maxCachedWgslBytes?: number,
- *   initialRangeFetches?: number,
- * }} [options]
- * @returns {WgslPack}
- */
-export function parseWgslPackIndex(indexBuffer, options = {}) {
-  const bytes = toBinaryView(indexBuffer);
-  const totalBytes =
-    options && options.totalBytes !== undefined && options.totalBytes !== null
-      ? options.totalBytes
-      : null;
-  if (totalBytes !== null && (!Number.isSafeInteger(totalBytes) || totalBytes < 0)) {
-    throw new RangeError(`totalBytes must be a non-negative safe integer, got: ${totalBytes}`);
-  }
-
-  const header = parseWgpkHeader(bytes);
-  const { rawEntries, stageCounts, totalPayloadBytes, maxEnd } = parseWgpkEntryTable(
-    bytes,
-    header,
-    totalBytes
-  );
-
-  const wgslCache = new Map();
-  const pinnedWgslCache = new Map();
-  const rangedDecodeCounter = { count: 0 };
-  const entryList = new Array(header.entryCount);
-  const byHash = new Map();
-  const byHex = new Map();
+function populateRangedIndexEntries(rawEntries, wgslCache, pinnedWgslCache, byHash, byHex) {
+  const entryList = new Array(rawEntries.length);
+  byHash.clear();
+  byHex.clear();
 
   for (let idx = 0; idx < rawEntries.length; idx += 1) {
     const raw = rawEntries[idx];
@@ -2276,6 +2805,61 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     byHex.set(raw.hashHex, entry);
   }
 
+  return entryList;
+}
+
+/**
+ * Parse only the WGPK header + entry table into a ranged-mode `WgslPack` without
+ * holding payload bytes in memory. Payloads are fetched on demand via `getWgslAsync(hash)`.
+ *
+ * @param {ArrayBuffer | SharedArrayBuffer | ArrayBufferView} indexBuffer
+ * @param {{
+ *   url?: string | null,
+ *   totalBytes?: number | null,
+ *   totalSize?: number | null,
+ *   etag?: string | null,
+ *   lastModified?: string | null,
+ *   initialRangeBytes?: number,
+ *   fetch?: typeof fetch,
+ *   fetchInit?: RequestInit,
+ *   maxCachedWgslBytes?: number,
+ *   initialRangeFetches?: number,
+ * }} [options]
+ * @returns {WgslPack}
+ */
+export function parseWgslPackIndex(indexBuffer, options = {}) {
+  const bytes = toBinaryView(indexBuffer);
+  const rawTotal =
+    options && options.totalSize !== undefined && options.totalSize !== null
+      ? options.totalSize
+      : options && options.totalBytes !== undefined && options.totalBytes !== null
+        ? options.totalBytes
+        : null;
+  if (rawTotal !== null && (!Number.isSafeInteger(rawTotal) || rawTotal < 0)) {
+    throw new RangeError(`totalBytes must be a non-negative safe integer, got: ${rawTotal}`);
+  }
+  const totalBytes = rawTotal;
+
+  const header = parseWgpkHeader(bytes);
+  const { rawEntries, stageCounts, totalPayloadBytes, maxEnd } = parseWgpkEntryTable(
+    bytes,
+    header,
+    totalBytes
+  );
+
+  const wgslCache = new Map();
+  const pinnedWgslCache = new Map();
+  const rangedDecodeCounter = { count: 0 };
+  const byHash = new Map();
+  const byHex = new Map();
+  const entryList = populateRangedIndexEntries(
+    rawEntries,
+    wgslCache,
+    pinnedWgslCache,
+    byHash,
+    byHex
+  );
+
   const maxCachedWgslBytes = resolveMaxCacheBytes(options);
   const maxCacheEntries = validateMaxCacheEntries(
     options ? options.maxCacheEntries : undefined,
@@ -2293,6 +2877,9 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
   const prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
   const prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
+  const initialRangeBytes = validateInitialRangeBytes(
+    options ? options.initialRangeBytes : undefined
+  );
   const initialRangeFetches = sanitizeNonNegativeInt(
     options ? options.initialRangeFetches : 0,
     0
@@ -2305,6 +2892,8 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     options ? options.initialRangeFetchRetries : 0,
     0
   );
+  const etag = normalizeHeaderString(options ? options.etag : null);
+  const lastModified = normalizeHeaderString(options ? options.lastModified : null);
 
   return new WgslPack({
     version: header.version,
@@ -2330,9 +2919,13 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     sleepFn,
     prefetchMaxGapBytes,
     prefetchMaxSpanBytes,
+    initialRangeBytes,
     initialRangeFetches,
     initialRangeBytesFetched,
     initialRangeFetchRetries,
+    etag,
+    lastModified,
+    totalSize: totalBytes,
     wgslCache,
     pinnedWgslCache,
     rangedDecodeCounter,
@@ -2358,6 +2951,9 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   const sleepFn = validateSleepFn(options ? options.sleepFn : undefined);
   const prefetchMaxGapBytes = resolvePrefetchMaxGapBytes(options);
   const prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
+  const initialRangeBytes = validateInitialRangeBytes(
+    options ? options.initialRangeBytes : undefined
+  );
 
   // If the server returned 200 OK instead of 206 Partial Content, fall back seamlessly to buffer mode.
   if (initialChunk.status !== 206) {
@@ -2370,7 +2966,14 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     );
   }
 
-  let totalBytes = initialChunk.contentRange ? initialChunk.contentRange.total : null;
+  let totalBytes =
+    initialChunk.totalSize !== undefined && initialChunk.totalSize !== null
+      ? initialChunk.totalSize
+      : initialChunk.contentRange
+        ? initialChunk.contentRange.total
+        : null;
+  let etag = normalizeHeaderString(initialChunk.etag);
+  let lastModified = normalizeHeaderString(initialChunk.lastModified);
   let rangeFetches = sanitizeNonNegativeInt(
     options && options.initialRangeFetches !== undefined ? options.initialRangeFetches : 1,
     1
@@ -2430,6 +3033,27 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
 
       rangeBytesFetched += sanitizeNonNegativeInt(remainder.bytes.byteLength, 0);
 
+      if (etag !== null && remainder.etag !== null && remainder.etag !== etag) {
+        throw new Error(
+          `WGPK pack ETag changed while fetching entry table from "${url}": expected ${etag}, got ${remainder.etag}`
+        );
+      }
+      if (etag === null && remainder.etag !== null) {
+        etag = remainder.etag;
+      }
+      if (
+        lastModified !== null &&
+        remainder.lastModified !== null &&
+        remainder.lastModified !== lastModified
+      ) {
+        throw new Error(
+          `WGPK pack Last-Modified changed while fetching entry table from "${url}": expected ${lastModified}, got ${remainder.lastModified}`
+        );
+      }
+      if (lastModified === null && remainder.lastModified !== null) {
+        lastModified = remainder.lastModified;
+      }
+
       if (remainder.contentRange) {
         if (remainder.contentRange.start !== have) {
           throw new Error(
@@ -2437,6 +3061,11 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
           );
         }
         if (remainder.contentRange.total !== null) {
+          if (totalBytes !== null && remainder.contentRange.total !== totalBytes) {
+            throw new Error(
+              `WGPK pack total size changed while fetching entry table from "${url}": expected ${totalBytes}, got ${remainder.contentRange.total}`
+            );
+          }
           totalBytes = remainder.contentRange.total;
         }
       }
@@ -2456,6 +3085,10 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   return parseWgslPackIndex(indexBytes, {
     url,
     totalBytes,
+    totalSize: totalBytes,
+    etag,
+    lastModified,
+    initialRangeBytes,
     fetch: fetcher,
     fetchInit: options.fetchInit,
     maxCachedWgslBytes,
@@ -2590,7 +3223,10 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
     let useFullGet = false;
     let useRanged = false;
 
-    const headResponse = await fetcher(url, mergeRequestInit(options.fetchInit, { method: 'HEAD' }));
+    const headResponse = await fetcher(
+      url,
+      mergeRequestInit(options.fetchInit, { method: 'HEAD', cache: 'no-store' })
+    );
     if (headResponse && headResponse.ok) {
       const acceptRanges = getResponseHeader(headResponse, 'accept-ranges');
       if (acceptRanges && acceptRanges.trim().toLowerCase() === 'none') {
@@ -2736,6 +3372,33 @@ export class WgslPackCache {
     };
   }
 
+  _syncReloadedPack(pack, name) {
+    if (this._packs.get(name) !== pack) {
+      return;
+    }
+    for (const [hash, record] of this._shaderEntries.entries()) {
+      if (record.packName === name) {
+        this._shaderEntries.delete(hash);
+        if (!this._dynamicEntries.has(hash)) {
+          this._evictModuleOnly(hash);
+        }
+      }
+    }
+    const toPinOnPack = [];
+    for (const entry of pack.listEntries()) {
+      if (this._shaderEntries.has(entry.hash) && !this._dynamicEntries.has(entry.hash)) {
+        this._evictModuleOnly(entry.hash);
+      }
+      this._shaderEntries.set(entry.hash, { entry, pack, packName: name });
+      if (this._pinnedHashes.has(entry.hash)) {
+        toPinOnPack.push(entry.hash);
+      }
+    }
+    if (toPinOnPack.length > 0 && typeof pack.pinHashes === 'function') {
+      pack.pinHashes(toPinOnPack);
+    }
+  }
+
   _registerPack(pack, packName) {
     const name =
       typeof packName === 'string' && packName.length > 0
@@ -2743,7 +3406,9 @@ export class WgslPackCache {
         : `pack-${this._nextPackId++}`;
 
     // If replacing an existing pack with the same name, detach its old entries first.
-    if (this._packs.has(name)) {
+    const previousPack = this._packs.get(name);
+    if (previousPack) {
+      previousPack._onIndexReloaded = null;
       for (const [hash, record] of this._shaderEntries.entries()) {
         if (record.packName === name) {
           this._shaderEntries.delete(hash);
@@ -2755,6 +3420,7 @@ export class WgslPackCache {
     }
 
     this._packs.set(name, pack);
+    pack._onIndexReloaded = () => this._syncReloadedPack(pack, name);
     const toPinOnPack = [];
     for (const entry of pack.listEntries()) {
       if (this._shaderEntries.has(entry.hash) && !this._dynamicEntries.has(entry.hash)) {
@@ -3670,10 +4336,11 @@ export class WgslPackCache {
     }
 
     this._stats.misses += 1;
+    const latestRecord = this._shaderEntries.get(key) || record;
     const prefix = labelPrefix !== undefined ? String(labelPrefix) : this._labelPrefix;
     const label = prefix
-      ? `${prefix}:${record.entry.stage}:${record.entry.hashHex}`
-      : `${record.entry.stage}:${record.entry.hashHex}`;
+      ? `${prefix}:${latestRecord.entry.stage}:${latestRecord.entry.hashHex}`
+      : `${latestRecord.entry.stage}:${latestRecord.entry.hashHex}`;
 
     const shaderModule = device.createShaderModule({
       label,
@@ -3824,6 +4491,9 @@ export class WgslPackCache {
    * @param {{ resetStats?: boolean }} [options]
    */
   clear(options = {}) {
+    for (const pack of this._packs.values()) {
+      pack._onIndexReloaded = null;
+    }
     this._packs.clear();
     this._shaderEntries.clear();
     this._dynamicEntries.clear();
@@ -4018,6 +4688,7 @@ export class WgslPackCache {
     let rangeFetches = 0;
     let rangeBytesFetched = 0;
     let rangeFetchRetries = 0;
+    let staleIndexReloads = 0;
     let activeRangeFetches = 0;
     let peakConcurrentRangeFetches = 0;
     let cacheHits = 0;
@@ -4044,6 +4715,7 @@ export class WgslPackCache {
       rangeFetches += sanitizeNonNegativeInt(s.rangeFetchCount, 0);
       rangeBytesFetched += sanitizeNonNegativeInt(s.rangeBytesFetched, 0);
       rangeFetchRetries += sanitizeNonNegativeInt(s.rangeFetchRetries, 0);
+      staleIndexReloads += sanitizeNonNegativeInt(s.staleIndexReloads, 0);
       activeRangeFetches += sanitizeNonNegativeInt(s.activeRangeFetches, 0);
       const packPeak = sanitizeNonNegativeInt(s.peakConcurrentRangeFetches, 0);
       if (packPeak > peakConcurrentRangeFetches) {
@@ -4133,6 +4805,7 @@ export class WgslPackCache {
       rangeFetchCount: rangeFetches,
       rangeBytesFetched,
       rangeFetchRetries,
+      staleIndexReloads,
       activeRangeFetches,
       peakConcurrentRangeFetches,
       cacheHits,
