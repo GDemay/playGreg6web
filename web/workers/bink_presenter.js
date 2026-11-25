@@ -15,12 +15,23 @@
   const DEFAULT_TARGET_FPS = 30;
   const DOUBLE_BUFFER_SLOTS = 2;
   const UNIFORM_FLAG_FULL_RANGE = 1;
+  const UNIFORM_FLAG_SWAP_CHROMA = 2;
 
   const BINK_PIXEL_FORMAT = Object.freeze({
     RGBA8: 'rgba8',
     YUV420P: 'yuv420p',
     YUVA420P: 'yuva420p',
     NV12: 'nv12',
+  });
+
+  const BINK_CHROMA_ORDER = Object.freeze({
+    YUV: 'yuv',
+    YVU: 'yvu',
+  });
+
+  const BINK_LOAD_OP = Object.freeze({
+    CLEAR: 'clear',
+    LOAD: 'load',
   });
 
   const YUV_COLOR_SPACE = Object.freeze({
@@ -185,8 +196,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(primary.rgb, primary.a * uniforms.opacity);
   }
 
-  let chroma_u = uv_sample.r;
-  let chroma_v = select(v_sample, uv_sample.g, uniforms.mode == 3u);
+  let raw_u = uv_sample.r;
+  let raw_v = select(v_sample, uv_sample.g, uniforms.mode == 3u);
+  let swap_chroma = (uniforms.flags & 2u) != 0u;
+  let chroma_u = select(raw_u, raw_v, swap_chroma);
+  let chroma_v = select(raw_v, raw_u, swap_chroma);
   let yuv = vec3<f32>(primary.r, chroma_u, chroma_v) - uniforms.yuv_offset.xyz;
   let rgb = clamp(
     vec3<f32>(
@@ -233,6 +247,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       throw new RangeError(
         `Unsupported colorRange "${colorRange}"; expected "${YUV_COLOR_RANGE.LIMITED}" or "${YUV_COLOR_RANGE.FULL}"`
       );
+    }
+  }
+
+  function validateChromaOrder(chromaOrder) {
+    if (chromaOrder !== BINK_CHROMA_ORDER.YUV && chromaOrder !== BINK_CHROMA_ORDER.YVU) {
+      throw new RangeError(
+        `Unsupported chromaOrder "${chromaOrder}"; expected "${BINK_CHROMA_ORDER.YUV}" or "${BINK_CHROMA_ORDER.YVU}"`
+      );
+    }
+  }
+
+  function validateLoadOp(loadOp) {
+    if (loadOp !== BINK_LOAD_OP.CLEAR && loadOp !== BINK_LOAD_OP.LOAD) {
+      throw new RangeError(
+        `Unsupported loadOp "${loadOp}"; expected "${BINK_LOAD_OP.CLEAR}" or "${BINK_LOAD_OP.LOAD}"`
+      );
+    }
+  }
+
+  function validateStoreOp(storeOp) {
+    if (storeOp !== 'store' && storeOp !== 'discard') {
+      throw new RangeError(`Unsupported storeOp "${storeOp}"; expected "store" or "discard"`);
+    }
+  }
+
+  function validateOpacity(opacity) {
+    if (typeof opacity !== 'number' || !Number.isFinite(opacity) || opacity < 0 || opacity > 1) {
+      throw new RangeError(`opacity must be a finite number in [0, 1], got ${opacity}`);
     }
   }
 
@@ -359,6 +401,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
    *   pixelFormat?: string,
    *   colorSpace?: string,
    *   colorRange?: string,
+   *   chromaOrder?: string,
    *   opacity?: number,
    *   flags?: number,
    *   uvTransform?: number[],
@@ -369,6 +412,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     const pixelFormat = params.pixelFormat ?? BINK_PIXEL_FORMAT.RGBA8;
     const colorSpace = params.colorSpace ?? YUV_COLOR_SPACE.BT709;
     const colorRange = params.colorRange ?? YUV_COLOR_RANGE.LIMITED;
+    const chromaOrder = params.chromaOrder ?? BINK_CHROMA_ORDER.YUV;
     const opacity = params.opacity ?? 1.0;
     const flags = params.flags ?? 0;
     const uvTransform = params.uvTransform ?? DEFAULT_UV_TRANSFORM;
@@ -376,6 +420,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     validatePixelFormat(pixelFormat);
     validateColorSpace(colorSpace);
     validateColorRange(colorRange);
+    validateChromaOrder(chromaOrder);
+    validateOpacity(opacity);
 
     const matrix = YUV_RANGE_MATRICES[colorRange][colorSpace];
     const buffer = new ArrayBuffer(UNIFORM_BUFFER_SIZE);
@@ -383,7 +429,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     const f32 = new Float32Array(buffer);
 
     const packedFlags =
-      ((flags >>> 0) | (colorRange === YUV_COLOR_RANGE.FULL ? UNIFORM_FLAG_FULL_RANGE : 0)) >>> 0;
+      ((flags >>> 0) |
+        (colorRange === YUV_COLOR_RANGE.FULL ? UNIFORM_FLAG_FULL_RANGE : 0) |
+        (chromaOrder === BINK_CHROMA_ORDER.YVU ? UNIFORM_FLAG_SWAP_CHROMA : 0)) >>> 0;
 
     // Header (bytes 0..15)
     u32[0] = PIXEL_FORMAT_MODE[pixelFormat];
@@ -471,19 +519,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   ) {
     validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
 
-    const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
-    const totalBytes = alignedBytesPerRow * height;
+    const isSrcStrideAligned =
+      srcStride % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0 && srcStride >= tightRowBytes;
+    const directTotalBytes = srcStride * height;
 
-    if (srcStride === alignedBytesPerRow && src.byteLength >= totalBytes) {
-      const slice = src.byteLength === totalBytes ? src : src.subarray(0, totalBytes);
+    if (isSrcStrideAligned && src.byteLength >= directTotalBytes) {
+      const slice = src.byteLength === directTotalBytes ? src : src.subarray(0, directTotalBytes);
       return {
         data: slice,
-        bytesPerRow: alignedBytesPerRow,
-        totalBytes,
+        bytesPerRow: srcStride,
+        totalBytes: directTotalBytes,
         padded: false,
         usesScratch: false,
       };
     }
+
+    const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
+    const totalBytes = alignedBytesPerRow * height;
 
     const canReuseScratch =
       scratchBuffer instanceof Uint8Array && scratchBuffer.byteLength >= totalBytes;
@@ -569,6 +621,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         stagingPool = null,
         colorSpace = YUV_COLOR_SPACE.BT709,
         colorRange = YUV_COLOR_RANGE.LIMITED,
+        chromaOrder = BINK_CHROMA_ORDER.YUV,
+        loadOp = BINK_LOAD_OP.CLEAR,
         targetFps = DEFAULT_TARGET_FPS,
         doubleBuffer = true,
         slotCount,
@@ -589,6 +643,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       validateColorSpace(colorSpace);
       validateColorRange(colorRange);
+      validateChromaOrder(chromaOrder);
+      validateLoadOp(loadOp);
       assertPositiveFinite(targetFps, 'targetFps');
 
       const resolvedSlotCount =
@@ -600,6 +656,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._stagingPool = stagingPool || null;
       this._colorSpace = colorSpace;
       this._colorRange = colorRange;
+      this._chromaOrder = chromaOrder;
+      this._loadOp = loadOp;
       this._targetFps = targetFps;
 
       // Reusable plane texture slots (double-buffered by default).
@@ -649,6 +707,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._resizeCount = 0;
       this._planeReallocations = 0;
       this._bytesUploaded = 0;
+      this._directZeroCopyUploads = 0;
+      this._chromaRepackUploads = 0;
       this._destroyed = false;
     }
 
@@ -662,6 +722,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     get colorRange() {
       return this._colorRange;
+    }
+
+    get chromaOrder() {
+      return this._chromaOrder;
+    }
+
+    get loadOp() {
+      return this._loadOp;
     }
 
     get targetFps() {
@@ -830,12 +898,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     _preparePlaneForUpload(src, tightRowBytes, height, srcStride, label) {
       validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
 
-      const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
-      const totalBytes = alignedBytesPerRow * height;
+      const isSrcStrideAligned =
+        srcStride % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0 && srcStride >= tightRowBytes;
+      const directTotalBytes = srcStride * height;
 
-      if (srcStride === alignedBytesPerRow && src.byteLength >= totalBytes) {
+      if (isSrcStrideAligned && src.byteLength >= directTotalBytes) {
         return prepareAlignedPlaneData(src, tightRowBytes, height, srcStride, label);
       }
+
+      const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
+      const totalBytes = alignedBytesPerRow * height;
 
       if (!this._uploadScratch || this._uploadScratch.byteLength < totalBytes) {
         this._uploadScratch = new Uint8Array(totalBytes);
@@ -852,7 +924,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       );
     }
 
-    _uploadPlane(slotIndex, dstTexture, prepared, width, height, commandEncoder) {
+    _uploadPlane(slotIndex, dstTexture, prepared, width, height, commandEncoder, isChroma = false) {
       if (this._stagingPool) {
         const layout = {
           width,
@@ -888,6 +960,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
 
       this._bytesUploaded += prepared.totalBytes;
+      if (!prepared.padded) {
+        this._directZeroCopyUploads += 1;
+      } else if (isChroma) {
+        this._chromaRepackUploads += 1;
+      }
     }
 
     _dropPendingUploadsForSlot(slotIndex) {
@@ -980,6 +1057,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         height,
         bytesPerRow: prepared.bytesPerRow,
         bytesUploaded: prepared.totalBytes,
+        zeroCopy: !prepared.padded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
       };
@@ -998,9 +1076,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      *   height: number,
      *   yStride?: number,
      *   uvStride?: number,
+     *   uStride?: number,
+     *   vStride?: number,
      *   aStride?: number,
      *   colorSpace?: string,
      *   colorRange?: string,
+     *   chromaOrder?: string,
      *   commandEncoder?: GPUCommandEncoder,
      *   encoder?: GPUCommandEncoder,
      * }} frame
@@ -1020,9 +1101,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         height,
         yStride,
         uvStride,
+        uStride,
+        vStride,
         aStride,
         colorSpace,
         colorRange,
+        chromaOrder,
       } = frame;
       const commandEncoder = frame.commandEncoder || frame.encoder || null;
 
@@ -1034,6 +1118,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (colorRange !== undefined && colorRange !== null) {
         validateColorRange(colorRange);
+      }
+      if (chromaOrder !== undefined && chromaOrder !== null) {
+        validateChromaOrder(chromaOrder);
       }
 
       const uvWidth = Math.ceil(width / 2);
@@ -1047,12 +1134,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const aSrc = hasAlpha ? toUint8Array(a, 'uploadYuv420Frame.a') : null;
 
       const resolvedYStride = yStride !== undefined ? yStride : width;
-      const resolvedUvStride = uvStride !== undefined ? uvStride : uvWidth;
+      const resolvedUStride =
+        uStride !== undefined ? uStride : uvStride !== undefined ? uvStride : uvWidth;
+      const resolvedVStride =
+        vStride !== undefined ? vStride : uvStride !== undefined ? uvStride : uvWidth;
       const resolvedAStride = aStride !== undefined ? aStride : width;
 
       validatePlaneBuffer(ySrc, width, height, resolvedYStride, 'Y plane');
-      validatePlaneBuffer(uSrc, uvWidth, uvHeight, resolvedUvStride, 'U plane');
-      validatePlaneBuffer(vSrc, uvWidth, uvHeight, resolvedUvStride, 'V plane');
+      validatePlaneBuffer(uSrc, uvWidth, uvHeight, resolvedUStride, 'U plane');
+      validatePlaneBuffer(vSrc, uvWidth, uvHeight, resolvedVStride, 'V plane');
       if (hasAlpha && aSrc) {
         validatePlaneBuffer(aSrc, width, height, resolvedAStride, 'A plane');
       }
@@ -1072,13 +1162,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedYStride,
         'Y plane'
       );
-      this._uploadPlane(writeSlotIndex, slot.y.texture, preparedY, width, height, commandEncoder);
+      this._uploadPlane(
+        writeSlotIndex,
+        slot.y.texture,
+        preparedY,
+        width,
+        height,
+        commandEncoder,
+        false
+      );
 
       const preparedU = this._preparePlaneForUpload(
         uSrc,
         uvWidth,
         uvHeight,
-        resolvedUvStride,
+        resolvedUStride,
         'U plane'
       );
       this._uploadPlane(
@@ -1087,14 +1185,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         preparedU,
         uvWidth,
         uvHeight,
-        commandEncoder
+        commandEncoder,
+        true
       );
 
       const preparedV = this._preparePlaneForUpload(
         vSrc,
         uvWidth,
         uvHeight,
-        resolvedUvStride,
+        resolvedVStride,
         'V plane'
       );
       this._uploadPlane(
@@ -1103,7 +1202,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         preparedV,
         uvWidth,
         uvHeight,
-        commandEncoder
+        commandEncoder,
+        true
       );
 
       let preparedA = null;
@@ -1115,7 +1215,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           resolvedAStride,
           'A plane'
         );
-        this._uploadPlane(writeSlotIndex, slot.a.texture, preparedA, width, height, commandEncoder);
+        this._uploadPlane(
+          writeSlotIndex,
+          slot.a.texture,
+          preparedA,
+          width,
+          height,
+          commandEncoder,
+          false
+        );
       }
 
       if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
@@ -1124,6 +1232,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (colorRange !== undefined && colorRange !== null && colorRange !== this._colorRange) {
         this._colorRange = colorRange;
+        this._uniformsDirty = true;
+      }
+      if (chromaOrder !== undefined && chromaOrder !== null && chromaOrder !== this._chromaOrder) {
+        this._chromaOrder = chromaOrder;
         this._uniformsDirty = true;
       }
       if (this._pixelFormat !== format) {
@@ -1148,6 +1260,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         format,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
         width,
         height,
         uvWidth,
@@ -1155,6 +1268,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         yBytesPerRow: preparedY.bytesPerRow,
         uvBytesPerRow: preparedU.bytesPerRow,
         aBytesPerRow: preparedA ? preparedA.bytesPerRow : null,
+        yZeroCopy: !preparedY.padded,
+        chromaZeroCopy: !preparedU.padded && !preparedV.padded,
         bytesUploaded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
@@ -1174,6 +1289,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      *   uvStride?: number,
      *   colorSpace?: string,
      *   colorRange?: string,
+     *   chromaOrder?: string,
      *   commandEncoder?: GPUCommandEncoder,
      *   encoder?: GPUCommandEncoder,
      * }} frame
@@ -1193,6 +1309,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         uvStride,
         colorSpace,
         colorRange,
+        chromaOrder,
       } = frame;
       const commandEncoder = frame.commandEncoder || frame.encoder || null;
 
@@ -1204,6 +1321,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (colorRange !== undefined && colorRange !== null) {
         validateColorRange(colorRange);
+      }
+      if (chromaOrder !== undefined && chromaOrder !== null) {
+        validateChromaOrder(chromaOrder);
       }
 
       const uvWidth = Math.ceil(width / 2);
@@ -1233,7 +1353,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedYStride,
         'Y plane'
       );
-      this._uploadPlane(writeSlotIndex, slot.y.texture, preparedY, width, height, commandEncoder);
+      this._uploadPlane(
+        writeSlotIndex,
+        slot.y.texture,
+        preparedY,
+        width,
+        height,
+        commandEncoder,
+        false
+      );
 
       const preparedUv = this._preparePlaneForUpload(
         uvSrc,
@@ -1248,7 +1376,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         preparedUv,
         uvWidth,
         uvHeight,
-        commandEncoder
+        commandEncoder,
+        true
       );
 
       if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
@@ -1257,6 +1386,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       if (colorRange !== undefined && colorRange !== null && colorRange !== this._colorRange) {
         this._colorRange = colorRange;
+        this._uniformsDirty = true;
+      }
+      if (chromaOrder !== undefined && chromaOrder !== null && chromaOrder !== this._chromaOrder) {
+        this._chromaOrder = chromaOrder;
         this._uniformsDirty = true;
       }
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.NV12) {
@@ -1277,12 +1410,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         format: BINK_PIXEL_FORMAT.NV12,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
         width,
         height,
         uvWidth,
         uvHeight,
         yBytesPerRow: preparedY.bytesPerRow,
         uvBytesPerRow: preparedUv.bytesPerRow,
+        yZeroCopy: !preparedY.padded,
+        chromaZeroCopy: !preparedUv.padded,
         bytesUploaded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
@@ -1496,6 +1632,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         pixelFormat: this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
         opacity,
         uvTransform: this._uvTransform,
       });
@@ -1532,13 +1669,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       assertPositiveFinite(dstWidth, 'dstWidth');
       assertPositiveFinite(dstHeight, 'dstHeight');
+      if (options !== undefined && options !== null && typeof options !== 'object') {
+        throw new TypeError('presentFrame options must be an object');
+      }
 
-      const {
-        clearColor = DEFAULT_CLEAR_COLOR,
-        loadOp = 'clear',
-        storeOp = 'store',
-        opacity = 1.0,
-      } = options || {};
+      const opts = options || {};
+      const clearColor = opts.clearColor !== undefined ? opts.clearColor : DEFAULT_CLEAR_COLOR;
+      const loadOp = opts.loadOp !== undefined ? opts.loadOp : this._loadOp;
+      const storeOp = opts.storeOp !== undefined ? opts.storeOp : 'store';
+      const opacity = opts.opacity !== undefined ? opts.opacity : 1.0;
+
+      validateLoadOp(loadOp);
+      validateStoreOp(storeOp);
+      validateOpacity(opacity);
 
       // Flush any deferred staging uploads before starting the render pass.
       if (this._stagingPool && this._pendingUploads.length > 0) {
@@ -1552,7 +1695,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         loadOp,
         storeOp,
       };
-      if (loadOp === 'clear') {
+      if (loadOp === BINK_LOAD_OP.CLEAR) {
         colorAttachment.clearValue = normalizeClearColor(clearColor);
       }
 
@@ -1569,6 +1712,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           format: this._pixelFormat,
           colorSpace: this._colorSpace,
           colorRange: this._colorRange,
+          chromaOrder: this._chromaOrder,
+          loadOp,
           slotIndex: this._activeSlotIndex,
           presentedFrames: this._presentedFrames,
           framesPresented: this._presentedFrames,
@@ -1607,6 +1752,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         format: this._pixelFormat,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
+        loadOp,
         slotIndex: this._activeSlotIndex,
         presentedFrames: this._presentedFrames,
         framesPresented: this._presentedFrames,
@@ -1652,6 +1799,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._colorRange = colorRange;
         this._uniformsDirty = true;
       }
+    }
+
+    /**
+     * Switch active chroma plane ordering (`yuv` for Y/Cb/Cr or `yvu` for Bink2 native Y/Cr/Cb).
+     */
+    setChromaOrder(chromaOrder) {
+      this._assertNotDestroyed();
+      validateChromaOrder(chromaOrder);
+      if (chromaOrder !== this._chromaOrder) {
+        this._chromaOrder = chromaOrder;
+        this._uniformsDirty = true;
+      }
+    }
+
+    /**
+     * Switch default render-pass `loadOp` (`clear` or `load` for menu/UI underlay composition).
+     */
+    setLoadOp(loadOp) {
+      this._assertNotDestroyed();
+      validateLoadOp(loadOp);
+      this._loadOp = loadOp;
     }
 
     /**
@@ -1760,6 +1928,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         pixelFormat: this._pixelFormat,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
+        loadOp: this._loadOp,
         presentationFormat: this._presentationFormat,
         frameWidth: this._frameWidth,
         frameHeight: this._frameHeight,
@@ -1774,6 +1944,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resizeCount: this._resizeCount,
         planeReallocations: this._planeReallocations,
         scratchAllocations: this._scratchAllocations,
+        directZeroCopyUploads: this._directZeroCopyUploads,
+        chromaRepackUploads: this._chromaRepackUploads,
         bytesUploaded: this._bytesUploaded,
         slotCount: this._slots.length,
         activeSlotIndex: this._activeSlotIndex,
@@ -1835,9 +2007,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     UNIFORM_BUFFER_SIZE,
     UNIFORM_FLAG_FULL_RANGE,
+    UNIFORM_FLAG_SWAP_CHROMA,
     DEFAULT_PRESENTATION_FORMAT,
     DEFAULT_TARGET_FPS,
     BINK_PIXEL_FORMAT,
+    BINK_CHROMA_ORDER,
+    BINK_LOAD_OP,
     YUV_COLOR_SPACE,
     YUV_COLOR_RANGE,
     YUV_MATRICES,
