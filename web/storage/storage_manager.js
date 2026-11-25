@@ -17,6 +17,16 @@ export const DEFAULT_CRITICAL_THRESHOLD_RATIO = 0.9;
 export const DEFAULT_QUOTA_BUDGET_RATIO = 0.6;
 export const DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO = 0.1;
 export const DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS = 1;
+export const DEFAULT_FAST_BOOT_SLAB_MAX_BYTES = 192 * 1024 * 1024; // 192 MiB healthy slab cap (#1077 / W255)
+export const MIN_FAST_BOOT_SLAB_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB floor under critical pressure
+export const DEFAULT_FAST_BOOT_OPFS_BUDGET_BYTES = 512 * 1024 * 1024; // 512 MiB default OPFS cache cap
+export const DEFAULT_FAST_BOOT_MEDIUM_THRESHOLD_RATIO = 0.5;
+export const FAST_BOOT_PRESSURE_LEVELS = Object.freeze({
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  CRITICAL: 'critical',
+});
 export const QUOTA_PRESSURE_LEVELS = Object.freeze({
   OK: 'ok',
   WARN: 'warn',
@@ -572,6 +582,162 @@ async function readFileHandleSize(handle) {
   return 0;
 }
 
+const FAST_BOOT_PRESSURE_RANK = Object.freeze({
+  [FAST_BOOT_PRESSURE_LEVELS.LOW]: 0,
+  [FAST_BOOT_PRESSURE_LEVELS.MEDIUM]: 1,
+  [FAST_BOOT_PRESSURE_LEVELS.HIGH]: 2,
+  [FAST_BOOT_PRESSURE_LEVELS.CRITICAL]: 3,
+});
+
+const FAST_BOOT_PRESSURE_BY_RANK = Object.freeze([
+  FAST_BOOT_PRESSURE_LEVELS.LOW,
+  FAST_BOOT_PRESSURE_LEVELS.MEDIUM,
+  FAST_BOOT_PRESSURE_LEVELS.HIGH,
+  FAST_BOOT_PRESSURE_LEVELS.CRITICAL,
+]);
+
+function normalizeFastBootPressureLevel(level) {
+  if (typeof level !== 'string') {
+    return null;
+  }
+  const lower = level.trim().toLowerCase();
+  if (lower === 'ok' || lower === 'low' || lower === 'normal') {
+    return FAST_BOOT_PRESSURE_LEVELS.LOW;
+  }
+  if (lower === 'medium' || lower === 'moderate') {
+    return FAST_BOOT_PRESSURE_LEVELS.MEDIUM;
+  }
+  if (lower === 'warn' || lower === 'warning' || lower === 'high') {
+    return FAST_BOOT_PRESSURE_LEVELS.HIGH;
+  }
+  if (lower === 'critical') {
+    return FAST_BOOT_PRESSURE_LEVELS.CRITICAL;
+  }
+  return null;
+}
+
+function maxFastBootPressure(a, b) {
+  const rankA = FAST_BOOT_PRESSURE_RANK[a] ?? 0;
+  const rankB = FAST_BOOT_PRESSURE_RANK[b] ?? 0;
+  return FAST_BOOT_PRESSURE_BY_RANK[Math.max(rankA, rankB)];
+}
+
+function classifyMemoryPressureForFastBoot(options = {}) {
+  let level = FAST_BOOT_PRESSURE_LEVELS.LOW;
+  if (!options || typeof options !== 'object') {
+    return level;
+  }
+
+  const explicit = normalizeFastBootPressureLevel(options.memoryPressure);
+  if (explicit) {
+    level = maxFastBootPressure(level, explicit);
+  }
+
+  const memObj = options.memory && typeof options.memory === 'object' ? options.memory : null;
+  const usedRaw =
+    options.jsHeapUsedBytes !== undefined
+      ? options.jsHeapUsedBytes
+      : memObj
+        ? memObj.usedJSHeapSize
+        : undefined;
+  const limitRaw =
+    options.jsHeapLimitBytes !== undefined
+      ? options.jsHeapLimitBytes
+      : memObj
+        ? memObj.jsHeapSizeLimit
+        : undefined;
+
+  if (
+    typeof usedRaw === 'number' &&
+    Number.isFinite(usedRaw) &&
+    typeof limitRaw === 'number' &&
+    Number.isFinite(limitRaw) &&
+    limitRaw > 0
+  ) {
+    const heapRatio = clampUnitRatio(Math.max(0, usedRaw) / limitRaw, 0);
+    if (heapRatio >= 0.9) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.CRITICAL);
+    } else if (heapRatio >= 0.75) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.HIGH);
+    } else if (heapRatio >= 0.55) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.MEDIUM);
+    }
+  }
+
+  if (
+    typeof options.deviceMemoryGb === 'number' &&
+    Number.isFinite(options.deviceMemoryGb) &&
+    options.deviceMemoryGb > 0
+  ) {
+    if (options.deviceMemoryGb <= 2) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.CRITICAL);
+    } else if (options.deviceMemoryGb <= 4) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.HIGH);
+    } else if (options.deviceMemoryGb <= 8) {
+      level = maxFastBootPressure(level, FAST_BOOT_PRESSURE_LEVELS.MEDIUM);
+    }
+  }
+
+  return level;
+}
+
+function normalizeDelegatedEvictionResult(rawResult) {
+  if (typeof rawResult === 'number') {
+    const evictedBytes = sanitizeNonNegativeInt(rawResult);
+    return {
+      evictedBytes,
+      evictedEntries: evictedBytes > 0 ? 1 : 0,
+      ok: true,
+    };
+  }
+  if (!rawResult || typeof rawResult !== 'object') {
+    return {
+      evictedBytes: 0,
+      evictedEntries: 0,
+      ok: true,
+    };
+  }
+
+  const evictedBytes = sanitizeNonNegativeInt(
+    rawResult.evictedBytes !== undefined
+      ? rawResult.evictedBytes
+      : rawResult.freedBytes !== undefined
+        ? rawResult.freedBytes
+        : rawResult.bytesEvicted !== undefined
+          ? rawResult.bytesEvicted
+          : rawResult.bytesFreed !== undefined
+            ? rawResult.bytesFreed
+            : rawResult.bytes
+  );
+
+  const evictedEntries = sanitizeNonNegativeInt(
+    rawResult.evictedEntries !== undefined
+      ? rawResult.evictedEntries
+      : rawResult.removedCount !== undefined
+        ? rawResult.removedCount
+        : rawResult.evictedCount !== undefined
+          ? rawResult.evictedCount
+          : rawResult.entriesEvicted !== undefined
+            ? rawResult.entriesEvicted
+            : rawResult.count !== undefined
+              ? rawResult.count
+              : rawResult.entries
+  );
+
+  let ok = true;
+  if (rawResult.ok !== undefined) {
+    ok = Boolean(rawResult.ok);
+  } else if (rawResult.supported === false) {
+    ok = false;
+  }
+
+  return {
+    evictedBytes,
+    evictedEntries,
+    ok,
+  };
+}
+
 export class BrowserStorageManager {
   /**
    * @param {object} [options]
@@ -660,10 +826,13 @@ export class BrowserStorageManager {
         : DEFAULT_CACHE_INDEX_FILENAME;
 
     this.persistCacheIndex = options.persistCacheIndex !== false;
+    this.opfsCache =
+      options.opfsCache && typeof options.opfsCache === 'object' ? options.opfsCache : null;
 
     this._evictedEntries = 0;
     this._evictedBytes = 0;
     this._cleanupCount = 0;
+    this._quotaEvictionRuns = 0;
     this._lastCleanupAtMs = null;
     this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
     this._lastQuotaUsageRatio = null;
@@ -781,6 +950,7 @@ export class BrowserStorageManager {
       evictedBytes: this._evictedBytes,
       evictedFormatted: formatBytes(this._evictedBytes),
       cleanupCount: this._cleanupCount,
+      quotaEvictionRuns: this._quotaEvictionRuns,
       lastCleanupAtMs: this._lastCleanupAtMs,
       warnThresholdRatio: this.warnThresholdRatio,
       criticalThresholdRatio: this.criticalThresholdRatio,
@@ -797,6 +967,7 @@ export class BrowserStorageManager {
     this._evictedEntries = 0;
     this._evictedBytes = 0;
     this._cleanupCount = 0;
+    this._quotaEvictionRuns = 0;
     this._lastCleanupAtMs = null;
     this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
     this._lastQuotaUsageRatio = null;
@@ -2379,6 +2550,7 @@ export class BrowserStorageManager {
       evictedEntries: this._cacheEvictedEntries,
       evictedBytes: this._cacheEvictedBytes,
       evictedFormatted: formatBytes(this._cacheEvictedBytes),
+      quotaEvictionRuns: this._quotaEvictionRuns,
       quotaUsagePct,
       budgetUsagePct,
       maxCacheBytes: this.maxCacheBytes,
@@ -3179,5 +3351,333 @@ export class BrowserStorageManager {
       warmBootReady,
       recommendation,
     };
+  }
+
+  /**
+   * Attaches or detaches an external OPFS chunk cache instance (e.g. OpfsChunkCache)
+   * for safe quota-pressure eviction delegation.
+   *
+   * @param {object|null} opfsCache
+   * @returns {object|null}
+   */
+  attachOpfsCache(opfsCache) {
+    this.opfsCache = opfsCache && typeof opfsCache === 'object' ? opfsCache : null;
+    return this.opfsCache;
+  }
+
+  /**
+   * Computes a sanitized, deterministic fast-boot budget and eviction plan combining
+   * W243 OPFS warm-boot readiness, browser storage quota headroom (`quota - usage`),
+   * and optional memory pressure signals (#1077).
+   *
+   * Recommends a 192 MiB slab LRU cap when headroom is healthy and scales down
+   * gracefully under medium/high/critical storage or memory pressure.
+   *
+   * @param {object} [options]
+   * @returns {Promise<{
+   *   warmCacheReady: boolean,
+   *   recommendedSlabMaxBytes: number,
+   *   recommendedOpfsBudgetBytes: number,
+   *   quotaHeadroomBytes: number,
+   *   pressureLevel: 'low'|'medium'|'high'|'critical',
+   *   shouldEvictColdChunks: boolean
+   * }>}
+   */
+  async getFastBootPlan(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+
+    let readiness =
+      opts.warmBootReadiness && typeof opts.warmBootReadiness === 'object'
+        ? opts.warmBootReadiness
+        : null;
+
+    if (!readiness) {
+      const readinessOpts = { ...opts };
+      if (
+        !readinessOpts.cacheSummary &&
+        !readinessOpts.cacheStats &&
+        !readinessOpts.opfsCache &&
+        !readinessOpts.summary &&
+        this.opfsCache &&
+        typeof this.opfsCache.getStats === 'function'
+      ) {
+        const root = await this._resolveOpfsRoot();
+        if (!root) {
+          try {
+            const attachedStats = this.opfsCache.getStats();
+            if (attachedStats && typeof attachedStats === 'object') {
+              readinessOpts.cacheStats = attachedStats;
+            }
+          } catch {
+            // Ignore attached cache stats errors and fall back cleanly.
+          }
+        }
+      }
+      readiness = await this.getWarmBootReadiness(readinessOpts);
+    }
+
+    const opfsSupported = Boolean(readiness.opfsSupported);
+    const warmCacheReady = Boolean(readiness.warmBootReady);
+    const quotaBytes = sanitizeNonNegativeInt(readiness.quotaBytes);
+    const usageBytes = sanitizeNonNegativeInt(readiness.usageBytes);
+    const cachedBytes = sanitizeNonNegativeInt(readiness.cachedBytes);
+    const quotaHeadroomBytes = quotaBytes > 0 ? Math.max(0, quotaBytes - usageBytes) : 0;
+
+    const thresholds = normalizeQuotaThresholds({
+      warnThresholdRatio:
+        opts.warnThresholdRatio !== undefined ? opts.warnThresholdRatio : this.warnThresholdRatio,
+      criticalThresholdRatio:
+        opts.criticalThresholdRatio !== undefined
+          ? opts.criticalThresholdRatio
+          : this.criticalThresholdRatio,
+    });
+    const highThresholdRatio = thresholds.warnThresholdRatio;
+    const criticalThresholdRatio = thresholds.criticalThresholdRatio;
+    const mediumThresholdRatio = Math.min(
+      clampUnitRatio(opts.mediumThresholdRatio, DEFAULT_FAST_BOOT_MEDIUM_THRESHOLD_RATIO),
+      highThresholdRatio
+    );
+
+    let storagePressure = FAST_BOOT_PRESSURE_LEVELS.MEDIUM;
+    if (quotaBytes > 0) {
+      const usageRatio = clampUnitRatio(usageBytes / quotaBytes, 0);
+      if (usageRatio >= criticalThresholdRatio) {
+        storagePressure = FAST_BOOT_PRESSURE_LEVELS.CRITICAL;
+      } else if (usageRatio >= highThresholdRatio) {
+        storagePressure = FAST_BOOT_PRESSURE_LEVELS.HIGH;
+      } else if (usageRatio >= mediumThresholdRatio) {
+        storagePressure = FAST_BOOT_PRESSURE_LEVELS.MEDIUM;
+      } else {
+        storagePressure = FAST_BOOT_PRESSURE_LEVELS.LOW;
+      }
+    }
+
+    const memoryPressure = classifyMemoryPressureForFastBoot(opts);
+    const pressureLevel = maxFastBootPressure(storagePressure, memoryPressure);
+
+    const healthySlabMaxBytes =
+      typeof opts.healthySlabMaxBytes === 'number' &&
+      Number.isFinite(opts.healthySlabMaxBytes) &&
+      opts.healthySlabMaxBytes > 0
+        ? Math.floor(opts.healthySlabMaxBytes)
+        : DEFAULT_FAST_BOOT_SLAB_MAX_BYTES;
+    const minSlabMaxBytes = Math.min(
+      healthySlabMaxBytes,
+      typeof opts.minSlabMaxBytes === 'number' &&
+        Number.isFinite(opts.minSlabMaxBytes) &&
+        opts.minSlabMaxBytes >= 0
+        ? Math.floor(opts.minSlabMaxBytes)
+        : MIN_FAST_BOOT_SLAB_MAX_BYTES
+    );
+
+    let slabScale = 1;
+    if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.MEDIUM) {
+      slabScale = 2 / 3;
+    } else if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.HIGH) {
+      slabScale = 0.5;
+    } else if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.CRITICAL) {
+      slabScale = 0.25;
+    }
+    const recommendedSlabMaxBytes = Math.max(
+      minSlabMaxBytes,
+      Math.min(healthySlabMaxBytes, Math.round(healthySlabMaxBytes * slabScale))
+    );
+
+    const maxOpfsBudgetBytes =
+      typeof opts.maxOpfsBudgetBytes === 'number' &&
+      Number.isFinite(opts.maxOpfsBudgetBytes) &&
+      opts.maxOpfsBudgetBytes >= 0
+        ? Math.floor(opts.maxOpfsBudgetBytes)
+        : this.maxCacheBytes !== null
+          ? this.maxCacheBytes
+          : DEFAULT_FAST_BOOT_OPFS_BUDGET_BYTES;
+
+    let recommendedOpfsBudgetBytes = 0;
+    if (opfsSupported) {
+      let opfsScale = 1;
+      let headroomFactor = 0.5;
+      let quotaCapRatio = DEFAULT_QUOTA_BUDGET_RATIO;
+      let includeCachedInHeadroom = true;
+
+      if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.MEDIUM) {
+        opfsScale = 0.5;
+        headroomFactor = 0.35;
+        quotaCapRatio = 0.45;
+        includeCachedInHeadroom = true;
+      } else if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.HIGH) {
+        opfsScale = 0.25;
+        headroomFactor = 0.25;
+        quotaCapRatio = 0.25;
+        includeCachedInHeadroom = false;
+      } else if (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.CRITICAL) {
+        opfsScale = 0.125;
+        headroomFactor = 0.1;
+        quotaCapRatio = 0.1;
+        includeCachedInHeadroom = false;
+      }
+
+      const scaledMax = Math.floor(maxOpfsBudgetBytes * opfsScale);
+      if (quotaBytes > 0) {
+        const headroomBase = includeCachedInHeadroom
+          ? quotaHeadroomBytes + cachedBytes
+          : quotaHeadroomBytes;
+        const headroomCap = Math.floor(headroomBase * headroomFactor);
+        const quotaCap = Math.floor(quotaBytes * quotaCapRatio);
+        recommendedOpfsBudgetBytes = Math.max(0, Math.min(scaledMax, headroomCap, quotaCap));
+      } else {
+        recommendedOpfsBudgetBytes = Math.max(0, scaledMax);
+      }
+    }
+
+    const shouldEvictColdChunks =
+      opfsSupported &&
+      (pressureLevel === FAST_BOOT_PRESSURE_LEVELS.HIGH ||
+        pressureLevel === FAST_BOOT_PRESSURE_LEVELS.CRITICAL ||
+        (cachedBytes > recommendedOpfsBudgetBytes && cachedBytes > 0));
+
+    return {
+      warmCacheReady,
+      recommendedSlabMaxBytes,
+      recommendedOpfsBudgetBytes,
+      quotaHeadroomBytes,
+      pressureLevel,
+      shouldEvictColdChunks,
+    };
+  }
+
+  /**
+   * Executes a safe quota-pressure eviction pass against any attached OPFS cache
+   * (`evictToTarget` -> `prune` -> `evictOldest` -> `evictToBudget`), falling back
+   * to this manager's built-in OPFS LRU cache (`evictToBudget`) when no external
+   * cache is attached. Never touches IndexedDB `/userdata` player saves.
+   *
+   * Always increments `quotaEvictionRuns` in stats telemetry.
+   *
+   * @param {number} [targetFreeBytes] Bytes of cold OPFS cache to reclaim.
+   * @param {object} [options]
+   * @param {object|null} [options.opfsCache] Optional per-call OPFS cache override.
+   * @returns {Promise<{ evictedBytes: number, evictedEntries: number, ok: boolean }>}
+   */
+  async runQuotaPressureEviction(targetFreeBytes, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const cache =
+      opts.opfsCache && typeof opts.opfsCache === 'object' ? opts.opfsCache : this.opfsCache;
+
+    this._quotaEvictionRuns += 1;
+
+    let resolvedTargetBytes;
+    if (targetFreeBytes === undefined) {
+      const plan = await this.getFastBootPlan(opts);
+      let currentBytes = 0;
+      if (cache && typeof cache.getStats === 'function') {
+        try {
+          let stats = cache.getStats();
+          if (stats && stats.initialized === false && typeof cache.init === 'function') {
+            await cache.init();
+            stats = cache.getStats();
+          }
+          currentBytes = sanitizeNonNegativeInt(
+            stats && stats.totalBytes !== undefined ? stats.totalBytes : stats && stats.cachedBytes
+          );
+        } catch {
+          currentBytes = 0;
+        }
+      } else {
+        if (!this._cacheIndexLoaded) {
+          await this.syncCacheIndex();
+        }
+        currentBytes = this._computeCacheTotals().totalBytes;
+      }
+      resolvedTargetBytes = Math.max(0, currentBytes - plan.recommendedOpfsBudgetBytes);
+    } else {
+      resolvedTargetBytes = sanitizeNonNegativeInt(targetFreeBytes);
+    }
+
+    if (resolvedTargetBytes === 0) {
+      return {
+        evictedBytes: 0,
+        evictedEntries: 0,
+        ok: true,
+      };
+    }
+
+    // Delegate safely to attached OPFS cache without ever touching /userdata saves.
+    if (cache) {
+      try {
+        let handled = false;
+        let rawResult;
+        if (typeof cache.evictToTarget === 'function') {
+          handled = true;
+          rawResult = await cache.evictToTarget(resolvedTargetBytes);
+        } else if (typeof cache.prune === 'function') {
+          handled = true;
+          rawResult = await cache.prune(resolvedTargetBytes);
+        } else if (typeof cache.evictOldest === 'function') {
+          handled = true;
+          rawResult = await cache.evictOldest(resolvedTargetBytes);
+        } else if (typeof cache.evictToBudget === 'function') {
+          handled = true;
+          let currentBytes = 0;
+          if (typeof cache.getStats === 'function') {
+            let stats = cache.getStats();
+            if (stats && stats.initialized === false && typeof cache.init === 'function') {
+              await cache.init();
+              stats = cache.getStats();
+            }
+            currentBytes = sanitizeNonNegativeInt(
+              stats && stats.totalBytes !== undefined
+                ? stats.totalBytes
+                : stats && stats.cachedBytes
+            );
+          }
+          const targetBudget = Math.max(0, currentBytes - resolvedTargetBytes);
+          rawResult = await cache.evictToBudget(targetBudget);
+        }
+
+        if (handled) {
+          const normalized = normalizeDelegatedEvictionResult(rawResult);
+          if (normalized.evictedEntries > 0 || normalized.evictedBytes > 0) {
+            this._cacheEvictedEntries += normalized.evictedEntries;
+            this._cacheEvictedBytes += normalized.evictedBytes;
+            this._recordCleanup(normalized.evictedEntries, normalized.evictedBytes);
+          }
+          return normalized;
+        }
+      } catch {
+        return {
+          evictedBytes: 0,
+          evictedEntries: 0,
+          ok: false,
+        };
+      }
+    }
+
+    // Fallback: evict cold unpinned OPFS entries managed directly by BrowserStorageManager.
+    try {
+      if (!this._cacheIndexLoaded) {
+        const synced = await this.syncCacheIndex();
+        if (!synced.supported) {
+          return {
+            evictedBytes: 0,
+            evictedEntries: 0,
+            ok: false,
+          };
+        }
+      }
+      const currentBytes = this._computeCacheTotals().totalBytes;
+      const targetBudget = Math.max(0, currentBytes - resolvedTargetBytes);
+      const ev = await this.evictToBudget(targetBudget);
+      return {
+        evictedBytes: sanitizeNonNegativeInt(ev.evictedBytes),
+        evictedEntries: sanitizeNonNegativeInt(ev.evictedEntries),
+        ok: Boolean(ev.supported),
+      };
+    } catch {
+      return {
+        evictedBytes: 0,
+        evictedEntries: 0,
+        ok: false,
+      };
+    }
   }
 }
