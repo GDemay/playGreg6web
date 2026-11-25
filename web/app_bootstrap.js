@@ -1973,6 +1973,19 @@ export function bootstrapPlayGta6App(options = {}) {
     return { found: false, value: undefined };
   }
 
+  function pickFirstBooleanField(sources, keys) {
+    for (let i = 0; i < sources.length; i += 1) {
+      const src = sources[i];
+      for (let j = 0; j < keys.length; j += 1) {
+        const key = keys[j];
+        if (Object.prototype.hasOwnProperty.call(src, key) && typeof src[key] === 'boolean') {
+          return { found: true, value: src[key] };
+        }
+      }
+    }
+    return { found: false, value: undefined };
+  }
+
   function resolveSanitizedPreferredShaderPackUrl() {
     const candidates = [
       startOverrideShaderPackUrl,
@@ -3377,16 +3390,27 @@ export function bootstrapPlayGta6App(options = {}) {
       data && data.swapchainStats,
       data && data.swapchain,
     ]);
-    const explicitVisible = pickFirstDefinedField(sources, [
-      'hasVisibleContent',
-      'has_visible_content',
+    // W349: check explicit boolean non-black pixel probe flags first (ignoring null/non-boolean
+    // placeholders). When the worker explicitly reports `firstVisibleFrame === false` (or
+    // `hasVisibleContent === false`), NEVER fall back to firing FIRST_VISIBLE_FRAME on
+    // `realPackDrawCount > 0` or `hasNonClearDraw`.
+    const explicitVisible = pickFirstBooleanField(sources, [
       'firstVisibleFrame',
       'first_visible_frame',
+      'hasVisibleContent',
+      'has_visible_content',
     ]);
-    if (explicitVisible.found && typeof explicitVisible.value === 'boolean') {
+    if (explicitVisible.found) {
+      if (explicitVisible.value === false) {
+        sawExplicitVisibleFrameGate = true;
+        return {
+          hasExplicitFlag: true,
+          isVisible: false,
+        };
+      }
       return {
         hasExplicitFlag: true,
-        isVisible: explicitVisible.value === true,
+        isVisible: true,
       };
     }
     const visiblePresents = pickFirstDefinedField(sources, [
@@ -3397,6 +3421,15 @@ export function bootstrapPlayGta6App(options = {}) {
       return {
         hasExplicitFlag: true,
         isVisible: true,
+      };
+    }
+    // W349: once the worker has signaled active non-black pixel probing (`firstVisibleFrame: false`),
+    // do not let subsequent partial telemetry payloads (without an explicit boolean flag) fall back
+    // to `realPackDrawCount > 0` before an explicit `first-visible-frame` / `firstVisibleFrame: true`.
+    if (sawExplicitVisibleFrameGate) {
+      return {
+        hasExplicitFlag: true,
+        isVisible: false,
       };
     }
     const realPackField = pickFirstDefinedField(sources, [
@@ -4956,12 +4989,26 @@ export function bootstrapPlayGta6App(options = {}) {
           toSafeNonNegativeInt(realPackField.value, 0)
         );
       }
+      if (
+        data.firstVisibleFrame === false ||
+        data.first_visible_frame === false ||
+        data.hasVisibleContent === false ||
+        data.has_visible_content === false
+      ) {
+        sawExplicitVisibleFrameGate = true;
+        return true;
+      }
       const rawBlackLoadingMs =
         data.blackLoadingMs !== undefined ? data.blackLoadingMs : data.black_loading_ms;
       const rawFirstVisibleFrameMs =
         data.firstVisibleFrameMs !== undefined
           ? data.firstVisibleFrameMs
           : data.first_visible_frame_ms;
+      const rawMaxLuma = data.maxLuma !== undefined ? data.maxLuma : data.max_luma;
+      const rawSuppressedBlackFrames =
+        data.suppressedBlackFrames !== undefined
+          ? data.suppressedBlackFrames
+          : data.suppressed_black_frames;
       notifyFirstVisibleFrame({
         source: sanitizeDiagnosticText(data.source || data.type, 64) || data.type,
         ...(typeof data.elapsedMs === 'number' && Number.isFinite(data.elapsedMs) && data.elapsedMs >= 0
@@ -4976,6 +5023,14 @@ export function bootstrapPlayGta6App(options = {}) {
         Number.isFinite(rawBlackLoadingMs) &&
         rawBlackLoadingMs >= 0
           ? { blackLoadingMs: rawBlackLoadingMs }
+          : {}),
+        ...(typeof rawMaxLuma === 'number' && Number.isFinite(rawMaxLuma) && rawMaxLuma >= 0
+          ? { maxLuma: Math.min(255, Math.floor(rawMaxLuma)) }
+          : {}),
+        ...(typeof rawSuppressedBlackFrames === 'number' &&
+        Number.isFinite(rawSuppressedBlackFrames) &&
+        rawSuppressedBlackFrames >= 0
+          ? { suppressedBlackFrames: Math.floor(rawSuppressedBlackFrames) }
           : {}),
         ...(typeof data.fadeOutMs === 'number' && Number.isFinite(data.fadeOutMs)
           ? { fadeOutMs: data.fadeOutMs }
@@ -5205,6 +5260,7 @@ export function bootstrapPlayGta6App(options = {}) {
   let ownsBootOrchestrator = false;
   let firstPresentNotified = false;
   let firstVisibleFrameNotified = false;
+  let sawExplicitVisibleFrameGate = false;
 
   function notifyFirstPresent(meta = {}) {
     if (destroyed) {

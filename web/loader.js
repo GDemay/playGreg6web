@@ -917,10 +917,84 @@ function formatGpuWorkerError(err) {
   return String(err);
 }
 
+function sanitizeGpuAdapterForTelemetry(raw) {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (raw === null) {
+    return null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const out = {};
+    let hasField = false;
+    for (const key of ['vendor', 'architecture', 'device', 'description', 'label']) {
+      if (typeof raw[key] === 'string') {
+        out[key] = raw[key];
+        hasField = true;
+      }
+    }
+    if (typeof raw.isFallbackAdapter === 'boolean') {
+      out.isFallbackAdapter = raw.isFallbackAdapter;
+      hasField = true;
+    }
+    return hasField ? out : null;
+  }
+  return undefined;
+}
+
+function pickTelemetryBoolean(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (typeof val === 'boolean') {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickTelemetryNumberOrNull(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (val === null) {
+        return { found: true, value: null };
+      }
+      if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickTelemetryFiniteNumber(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
 /**
  * Inspect a message emitted by `wgpu_worker.js`, sanitize/normalize GPU frame,
- * shader-fallback, missing-shader, and validation-error telemetry, and forward
- * to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
+ * shader-fallback, missing-shader, first-visible-frame, and validation-error telemetry,
+ * and forward to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
  */
 function forwardGpuWorkerMessage(eventData, postMessageFn) {
   if (
@@ -985,12 +1059,135 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     return payload;
   }
 
+  // W349: forward explicit first-visible-frame / visible-frame events straight through to main thread.
+  if (
+    eventData &&
+    typeof eventData === 'object' &&
+    !Array.isArray(eventData) &&
+    (eventData.type === 'first-visible-frame' || eventData.type === 'visible-frame')
+  ) {
+    const payload = {
+      type: eventData.type,
+      firstVisibleFrame:
+        typeof eventData.firstVisibleFrame === 'boolean' ? eventData.firstVisibleFrame : true,
+    };
+    if (
+      eventData.firstVisibleFrameMs === null ||
+      (typeof eventData.firstVisibleFrameMs === 'number' &&
+        Number.isFinite(eventData.firstVisibleFrameMs) &&
+        eventData.firstVisibleFrameMs >= 0)
+    ) {
+      payload.firstVisibleFrameMs = eventData.firstVisibleFrameMs;
+    }
+    if (
+      eventData.firstPresentMs === null ||
+      (typeof eventData.firstPresentMs === 'number' &&
+        Number.isFinite(eventData.firstPresentMs) &&
+        eventData.firstPresentMs >= 0)
+    ) {
+      payload.firstPresentMs = eventData.firstPresentMs;
+    }
+    if (
+      eventData.blackLoadingMs === null ||
+      (typeof eventData.blackLoadingMs === 'number' &&
+        Number.isFinite(eventData.blackLoadingMs) &&
+        eventData.blackLoadingMs >= 0)
+    ) {
+      payload.blackLoadingMs = eventData.blackLoadingMs;
+    }
+    if (typeof eventData.presentCount === 'number' && Number.isFinite(eventData.presentCount)) {
+      payload.presentCount = toNonNegativeInt(eventData.presentCount, 0);
+    }
+    if (
+      typeof eventData.framesPresented === 'number' &&
+      Number.isFinite(eventData.framesPresented)
+    ) {
+      payload.framesPresented = toNonNegativeInt(eventData.framesPresented, 0);
+    }
+    if (
+      typeof eventData.realPackDrawsThisFrame === 'number' &&
+      Number.isFinite(eventData.realPackDrawsThisFrame)
+    ) {
+      payload.realPackDrawsThisFrame = toNonNegativeInt(eventData.realPackDrawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.fallbackDrawsThisFrame === 'number' &&
+      Number.isFinite(eventData.fallbackDrawsThisFrame)
+    ) {
+      payload.fallbackDrawsThisFrame = toNonNegativeInt(eventData.fallbackDrawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.drawsThisFrame === 'number' &&
+      Number.isFinite(eventData.drawsThisFrame)
+    ) {
+      payload.drawsThisFrame = toNonNegativeInt(eventData.drawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.realPackDrawCount === 'number' &&
+      Number.isFinite(eventData.realPackDrawCount)
+    ) {
+      payload.realPackDrawCount = toNonNegativeInt(eventData.realPackDrawCount, 0);
+    }
+    if (typeof eventData.source === 'string' && eventData.source.length > 0) {
+      payload.source = eventData.source;
+    }
+    const rawMaxLuma =
+      eventData.maxLuma !== undefined ? eventData.maxLuma : eventData.lastSampledMaxLuma;
+    if (typeof rawMaxLuma === 'number' && Number.isFinite(rawMaxLuma)) {
+      payload.maxLuma = Math.max(0, Math.min(255, Math.floor(rawMaxLuma)));
+    }
+    if (
+      typeof eventData.suppressedBlackFrames === 'number' &&
+      Number.isFinite(eventData.suppressedBlackFrames)
+    ) {
+      payload.suppressedBlackFrames = toNonNegativeInt(eventData.suppressedBlackFrames, 0);
+    }
+    if (eventData.gpuAdapter !== undefined) {
+      const sanitizedAdapter = sanitizeGpuAdapterForTelemetry(eventData.gpuAdapter);
+      if (sanitizedAdapter !== undefined) {
+        payload.gpuAdapter = sanitizedAdapter;
+      }
+    }
+    if (
+      typeof eventData.elapsedMs === 'number' &&
+      Number.isFinite(eventData.elapsedMs) &&
+      eventData.elapsedMs >= 0
+    ) {
+      payload.elapsedMs = eventData.elapsedMs;
+    }
+    if (typeof eventData.fadeOutMs === 'number' && Number.isFinite(eventData.fadeOutMs)) {
+      payload.fadeOutMs = eventData.fadeOutMs;
+    }
+    if (
+      typeof eventData.fadeDurationMs === 'number' &&
+      Number.isFinite(eventData.fadeDurationMs)
+    ) {
+      payload.fadeDurationMs = eventData.fadeDurationMs;
+    }
+    if (typeof eventData.fadeMs === 'number' && Number.isFinite(eventData.fadeMs)) {
+      payload.fadeMs = eventData.fadeMs;
+    }
+    if (typeof eventData.timestamp === 'number' && Number.isFinite(eventData.timestamp)) {
+      payload.timestamp = eventData.timestamp;
+    }
+    if (typeof postMessageFn === 'function') {
+      try {
+        postMessageFn(payload);
+      } catch {
+        // Telemetry forwarding must never disrupt the GPU worker loop.
+      }
+    }
+    return payload;
+  }
+
   if (!isGpuTelemetryMessage(eventData)) {
     return null;
   }
 
   const rawStats =
     eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+  const rawFrameStats =
+    eventData.frameStats && typeof eventData.frameStats === 'object' ? eventData.frameStats : null;
   const rawFallback =
     eventData.fallbackStats ||
     eventData.shaderFallbackStats ||
@@ -1024,6 +1221,57 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
   if (renderStateStats) {
     telemetry.renderStateStats = renderStateStats;
     lastRenderStateStats = renderStateStats;
+  }
+
+  // W349: preserve explicit non-black probe & adapter fields on gpu-telemetry payloads.
+  const telemetrySources = [eventData, rawStats, rawFrameStats].filter(Boolean);
+  const firstVisibleField = pickTelemetryBoolean(telemetrySources, [
+    'firstVisibleFrame',
+    'first_visible_frame',
+  ]);
+  if (firstVisibleField.found) {
+    telemetry.firstVisibleFrame = firstVisibleField.value;
+  }
+  const firstVisibleMsField = pickTelemetryNumberOrNull(telemetrySources, [
+    'firstVisibleFrameMs',
+    'first_visible_frame_ms',
+  ]);
+  if (firstVisibleMsField.found) {
+    telemetry.firstVisibleFrameMs = firstVisibleMsField.value;
+  }
+  const blackLoadingMsField = pickTelemetryNumberOrNull(telemetrySources, [
+    'blackLoadingMs',
+    'black_loading_ms',
+  ]);
+  if (blackLoadingMsField.found) {
+    telemetry.blackLoadingMs = blackLoadingMsField.value;
+  }
+  const maxLumaField = pickTelemetryFiniteNumber(telemetrySources, [
+    'maxLuma',
+    'lastSampledMaxLuma',
+  ]);
+  if (maxLumaField.found) {
+    telemetry.maxLuma = Math.max(0, Math.min(255, Math.floor(maxLumaField.value)));
+  }
+  const suppressedBlackField = pickTelemetryFiniteNumber(telemetrySources, [
+    'suppressedBlackFrames',
+  ]);
+  if (suppressedBlackField.found) {
+    telemetry.suppressedBlackFrames = toNonNegativeInt(suppressedBlackField.value, 0);
+  }
+  const rawGpuAdapter =
+    eventData.gpuAdapter !== undefined
+      ? eventData.gpuAdapter
+      : rawStats && rawStats.gpuAdapter !== undefined
+        ? rawStats.gpuAdapter
+        : rawFrameStats && rawFrameStats.gpuAdapter !== undefined
+          ? rawFrameStats.gpuAdapter
+          : undefined;
+  if (rawGpuAdapter !== undefined) {
+    const sanitizedAdapter = sanitizeGpuAdapterForTelemetry(rawGpuAdapter);
+    if (sanitizedAdapter !== undefined) {
+      telemetry.gpuAdapter = sanitizedAdapter;
+    }
   }
 
   if (typeof postMessageFn === 'function') {
@@ -6839,6 +7087,10 @@ if (typeof self !== 'undefined') {
       if (!data || typeof data !== 'object') return;
       if (data.ready) {
         onWorkerReady('wgpu_worker', data.adapter);
+        return;
+      }
+      if (data.type === 'first-visible-frame' || data.type === 'visible-frame') {
+        forwardGpuWorkerMessage(data, postToMain);
         return;
       }
       if (data.frame) {

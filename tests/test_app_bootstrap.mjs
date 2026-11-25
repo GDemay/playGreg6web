@@ -5706,3 +5706,263 @@ test('W343 Export Report populates capabilities.wasm64 (Chrome 133+ address: i64
     await wasm32App.destroy();
   }
 });
+
+test('W349 gpu-telemetry with firstVisibleFrame: false holds splash despite realPackDrawCount > 0 until first-visible-frame arrives', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  function createHarness() {
+    const clock = createClock(1000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+    const broadcastInstances = [];
+    class MockBroadcastChannel {
+      constructor(name) {
+        this.name = name;
+        this.onmessage = null;
+        broadcastInstances.push(this);
+      }
+      close() {}
+    }
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+    windowObj.BroadcastChannel = MockBroadcastChannel;
+    documentObj.head = makeMockNode('head');
+    documentObj.createElement = (tag) => makeMockNode(tag);
+    documentObj.querySelector = () => null;
+
+    const mockWorker = createFakeEventTarget({
+      postMessage() {},
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({
+        ok: true,
+        coopCoep: true,
+        hasWasmBinary: true,
+        pgimUrl: '/boot/guest.pgim',
+        splashImage: '/game/xbs_splash.png',
+      }),
+      canvas: webgpu.canvas,
+      hud,
+      splashContainer: makeMockNode('div'),
+      SplashOverlayCtor: SplashOverlayController,
+      BootOrchestratorCtor: BootOrchestrator,
+      pgimPreloader: {
+        async preloadBootBundle() {
+          return {
+            pgim: new Uint8Array(4),
+            shaderPackBytes: null,
+            reflectionManifest: null,
+            bytesLoaded: 4,
+          };
+        },
+      },
+      splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: clock.now },
+      defaultHoldUntilVisible: true,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    return { app, clock, mockWorker, broadcastInstances };
+  }
+
+  // Scenario 1: Active non-black pixel probe reports firstVisibleFrame: false with realPackDrawCount: 42.
+  const gated = createHarness();
+  try {
+    const started = await gated.app.start();
+    assert.equal(started.ok, true);
+
+    // FIRST_PRESENT arrives -> splash enters hold-until-visible state.
+    gated.clock.advance(250);
+    gated.broadcastInstances[0].onmessage({ data: { label: 'WebGPU frame #1 presented' } });
+    assert.equal(gated.app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(gated.app.splashOverlay.getState().dismissed, false);
+
+    // gpu-telemetry reports realPackDrawCount: 42 while firstVisibleFrame: false -> MUST stay held!
+    gated.clock.advance(500);
+    gated.mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        firstVisibleFrame: false,
+        firstVisibleFrameMs: null,
+        blackLoadingMs: null,
+        maxLuma: 0,
+        suppressedBlackFrames: 12,
+        frameStats: {
+          framesPresented: 12,
+          droppedFrames: 0,
+          drawCalls: 64,
+          realPackDrawCount: 42,
+        },
+      },
+    });
+    assert.equal(gated.app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(gated.app.splashOverlay.getState().dismissed, false);
+    assert.equal(gated.app.bootTracer.getSummary().firstVisibleFrameMs, null);
+
+    // Even if hasVisibleContent is null alongside firstVisibleFrame: false, or a follow-up partial
+    // gpu-telemetry omits firstVisibleFrame while the probe gate is active, splash MUST stay held!
+    gated.clock.advance(500);
+    gated.mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        hasVisibleContent: null,
+        firstVisibleFrame: false,
+        frameStats: {
+          framesPresented: 24,
+          realPackDrawCount: 84,
+        },
+      },
+    });
+    gated.mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameStats: {
+          framesPresented: 30,
+          realPackDrawCount: 99,
+        },
+      },
+    });
+    assert.equal(gated.app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(gated.app.splashOverlay.getState().dismissed, false);
+    assert.equal(gated.app.bootTracer.getSummary().firstVisibleFrameMs, null);
+
+    // Explicit first-visible-frame with non-black pixels (maxLuma: 235) dismisses splash immediately!
+    gated.clock.advance(1000);
+    gated.mockWorker.dispatch('message', {
+      data: {
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        firstVisibleFrameMs: 2250,
+        firstPresentMs: 250,
+        blackLoadingMs: 2000,
+        presentCount: 31,
+        maxLuma: 235,
+        suppressedBlackFrames: 30,
+        source: 'swapchain_probe',
+        gpuAdapter: { vendor: 'nvidia', architecture: 'turing', label: 'nvidia turing' },
+      },
+    });
+    assert.equal(gated.app.splashOverlay.getState().dismissed, true);
+    assert.equal(
+      gated.app.splashOverlay.getState().dismissReason,
+      DISMISS_REASONS.FIRST_VISIBLE_FRAME,
+    );
+    assert.equal(gated.app.bootTracer.getSummary().stage, 'FIRST_VISIBLE_FRAME');
+    assert.equal(gated.app.getBootTelemetry().hasVisibleContent, true);
+  } finally {
+    await gated.app.destroy();
+  }
+
+  // Scenario 2: Backward compatibility — legacy mock worker omitting firstVisibleFrame still dismisses on realPackDrawCount > 0.
+  const legacy = createHarness();
+  try {
+    const started = await legacy.app.start();
+    assert.equal(started.ok, true);
+
+    legacy.clock.advance(200);
+    legacy.broadcastInstances[0].onmessage({ data: { label: 'WebGPU frame #1 presented' } });
+    assert.equal(legacy.app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(legacy.app.splashOverlay.getState().dismissed, false);
+
+    legacy.clock.advance(300);
+    legacy.mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameStats: {
+          framesPresented: 3,
+          realPackDrawCount: 6,
+        },
+      },
+    });
+    assert.equal(legacy.app.splashOverlay.getState().dismissed, true);
+    assert.equal(
+      legacy.app.splashOverlay.getState().dismissReason,
+      DISMISS_REASONS.FIRST_VISIBLE_FRAME,
+    );
+  } finally {
+    await legacy.app.destroy();
+  }
+});
