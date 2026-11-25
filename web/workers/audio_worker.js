@@ -19,6 +19,10 @@
   const DEFAULT_MAX_PCM_BYTES = 4 * 1024 * 1024;
   const MAX_ID_STRING_LEN = 128;
 
+  // Underrun de-click micro-fade ramp defaults (32 frames ~= 0.67 ms @ 48 kHz).
+  const DEFAULT_DECLICK_FRAMES = 32;
+  const MAX_DECLICK_FRAMES = 4096;
+
   const OUTPUT_STATES = Object.freeze({
     ACTIVE: 'active',
     SUSPENDED: 'suspended',
@@ -61,6 +65,16 @@
     const n = Math.floor(value);
     if (n < minVal) return fallback;
     if (maxVal !== undefined && n > maxVal) return maxVal;
+    return n;
+  }
+
+  function sanitizeDeclickFrames(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return fallback;
+    }
+    const n = Math.floor(value);
+    if (n < 0) return fallback;
+    if (n > MAX_DECLICK_FRAMES) return MAX_DECLICK_FRAMES;
     return n;
   }
 
@@ -457,7 +471,25 @@
     const muted = Boolean(s.muted);
     const effectiveGain = muted ? 0.0 : volume;
     const underruns = sanitizeNonNegInt(s.underruns, 0);
+    const underrunCount = sanitizeNonNegInt(
+      s.underrunCount !== undefined ? s.underrunCount : underruns,
+      underruns
+    );
     const underrunFrames = sanitizeNonNegInt(s.underrunFrames, 0);
+    const fadeOutCount = sanitizeNonNegInt(s.fadeOutCount, 0);
+    const fadeInCount = sanitizeNonNegInt(s.fadeInCount, 0);
+    const rawPeakFill = sanitizeNonNegInt(s.peakFillFrames, 0);
+    const peakFillFrames =
+      capacityFrames > 0 ? Math.min(rawPeakFill, capacityFrames) : rawPeakFill;
+    const rawMinFill = sanitizeNonNegInt(s.minFillFrames, 0);
+    const minFillFrames =
+      capacityFrames > 0 ? Math.min(rawMinFill, capacityFrames) : rawMinFill;
+    const rawAvgFillRatio =
+      typeof s.avgFillRatio === 'number' && Number.isFinite(s.avgFillRatio)
+        ? s.avgFillRatio
+        : 0.0;
+    const avgFillRatio =
+      rawAvgFillRatio < 0 ? 0.0 : rawAvgFillRatio > 1 ? 1.0 : rawAvgFillRatio;
     const overflows = sanitizeNonNegInt(s.overflows, 0);
     const overruns = sanitizeNonNegInt(
       s.overruns !== undefined ? s.overruns : overflows,
@@ -489,7 +521,13 @@
         effectiveGain,
         framesDrained,
         underruns,
+        underrunCount,
         underrunFrames,
+        fadeOutCount,
+        fadeInCount,
+        peakFillFrames,
+        minFillFrames,
+        avgFillRatio,
         overruns,
         overflows,
         droppedFrames,
@@ -528,10 +566,20 @@
       );
     }
 
-    static create(capacityFrames = DEFAULT_CAPACITY_FRAMES, channels = DEFAULT_CHANNELS) {
+    static create(
+      capacityFrames = DEFAULT_CAPACITY_FRAMES,
+      channels = DEFAULT_CHANNELS,
+      options = {}
+    ) {
       const byteLen = AudioRingBuffer.byteLength(capacityFrames, channels);
       const sab = new SharedArrayBuffer(byteLen);
-      return new AudioRingBuffer(sab, { capacityFrames, channels, initialize: true });
+      const opts = options && typeof options === 'object' ? options : {};
+      return new AudioRingBuffer(sab, {
+        ...opts,
+        capacityFrames,
+        channels,
+        initialize: true,
+      });
     }
 
     constructor(sab, options = {}) {
@@ -604,6 +652,19 @@
 
       this._volume = clampVolume(options.volume !== undefined ? options.volume : 1.0);
       this._muted = Boolean(options.muted);
+      this._declickFrames = sanitizeDeclickFrames(options.declickFrames, 0);
+      this._lastOutputFrame = new Float32Array(this._channels);
+      this._hasActiveAudio = false;
+      this._inUnderrun = false;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._fadeOutCount = 0;
+      this._fadeInCount = 0;
+      this._peakFillFrames = 0;
+      this._minFillFrames = Infinity;
+      this._fillFramesSum = 0;
+      this._fillSamples = 0;
+      this._lastObservedFill = null;
     }
 
     get sab() {
@@ -626,12 +687,46 @@
       return this._muted;
     }
 
+    get declickFrames() {
+      return this._declickFrames;
+    }
+
     get underruns() {
       return Atomics.load(this._ctrl, HDR_UNDERRUNS);
     }
 
+    get underrunCount() {
+      return this.underruns;
+    }
+
     get underrunFrames() {
       return Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES);
+    }
+
+    get fadeOutCount() {
+      return this._fadeOutCount;
+    }
+
+    get fadeInCount() {
+      return this._fadeInCount;
+    }
+
+    get peakFillFrames() {
+      return this._fillSamples > 0 ? this._peakFillFrames : 0;
+    }
+
+    get minFillFrames() {
+      return this._fillSamples > 0 ? this._minFillFrames : 0;
+    }
+
+    get avgFillRatio() {
+      if (this._fillSamples <= 0 || this._capacityFrames <= 0) {
+        return 0.0;
+      }
+      const ratio = this._fillFramesSum / this._fillSamples / this._capacityFrames;
+      if (ratio < 0) return 0.0;
+      if (ratio > 1) return 1.0;
+      return ratio;
     }
 
     get overflows() {
@@ -654,6 +749,37 @@
     setMuted(muted) {
       this._muted = Boolean(muted);
       return this._muted;
+    }
+
+    setDeclickFrames(frames) {
+      this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
+      return this._declickFrames;
+    }
+
+    _recordFillSample(fillFrames) {
+      const clamped =
+        fillFrames < 0
+          ? 0
+          : fillFrames > this._capacityFrames
+            ? this._capacityFrames
+            : fillFrames;
+      if (this._fillSamples === 0) {
+        this._peakFillFrames = clamped;
+        this._minFillFrames = clamped;
+      } else {
+        if (clamped > this._peakFillFrames) this._peakFillFrames = clamped;
+        if (clamped < this._minFillFrames) this._minFillFrames = clamped;
+      }
+      this._fillFramesSum += clamped;
+      this._fillSamples += 1;
+      this._lastObservedFill = clamped;
+    }
+
+    _recordFillTransition(beforeFill, afterFill) {
+      if (beforeFill !== afterFill && this._lastObservedFill !== beforeFill) {
+        this._recordFillSample(beforeFill);
+      }
+      this._recordFillSample(afterFill);
     }
 
     effectiveGain() {
@@ -728,6 +854,8 @@
         Atomics.store(this._ctrl, HDR_WRITE_CURSOR, nextWrite);
       }
 
+      this._recordFillSample(used + framesToWrite);
+
       if (framesToWrite < inputFrames) {
         Atomics.add(this._ctrl, HDR_OVERFLOWS, 1);
         Atomics.add(this._ctrl, HDR_DROPPED_FRAMES, inputFrames - framesToWrite);
@@ -738,12 +866,15 @@
 
     /**
      * Pulls interleaved PCM float samples out of the ring buffer into `output`.
-     * Applies master volume / mute gain. On underrun, zero-fills remaining
-     * frames and increments atomic underrun counters.
+     * Applies master volume / mute gain. On underrun, applies a smooth linear
+     * de-click fade-out when `declickFrames > 0` (or zero-fills when disabled)
+     * and increments atomic underrun counters. On recovery after underrun,
+     * applies a matching linear fade-in. Steady-state pulls with no underrun
+     * remain bit-exact unchanged.
      *
      * @param {Float32Array} output Destination buffer (length = frames * channels).
      * @param {number} [gainOverride] Optional explicit gain override in [0, 1].
-     * @returns {number} Number of real frames pulled before any zero-fill.
+     * @returns {number} Number of real frames pulled before any underrun fill.
      */
     pullSamples(output, gainOverride) {
       if (!(output instanceof Float32Array)) {
@@ -765,6 +896,9 @@
       let used = write - read;
       if (used < 0) {
         used += this._modulus;
+      }
+      if (used > cap) {
+        used = cap;
       }
 
       const framesToRead = requestedFrames <= used ? requestedFrames : used;
@@ -805,10 +939,111 @@
         Atomics.store(this._ctrl, HDR_READ_CURSOR, nextRead);
       }
 
+      const afterFill = Math.max(0, used - framesToRead);
+      this._recordFillTransition(used, afterFill);
+
+      const declickFrames = this._declickFrames;
+
+      // Apply smooth linear fade-in when valid audio resumes after an underrun.
+      if (framesToRead > 0 && declickFrames > 0) {
+        if (this._inUnderrun) {
+          this._inUnderrun = false;
+          this._fadeInPos = 0;
+          this._fadeInTotal = declickFrames;
+          this._fadeInCount += 1;
+        }
+        if (this._fadeInTotal > 0 && this._fadeInPos < this._fadeInTotal) {
+          const remaining = this._fadeInTotal - this._fadeInPos;
+          const rampCount = framesToRead < remaining ? framesToRead : remaining;
+          const total = this._fadeInTotal;
+          for (let f = 0; f < rampCount; f++) {
+            const rampGain = (this._fadeInPos + f) / total;
+            const base = f * channels;
+            for (let c = 0; c < channels; c++) {
+              output[base + c] *= rampGain;
+            }
+          }
+          this._fadeInPos += rampCount;
+          if (this._fadeInPos >= this._fadeInTotal) {
+            this._fadeInPos = 0;
+            this._fadeInTotal = 0;
+          }
+        }
+      }
+
       if (framesToRead < requestedFrames) {
-        output.fill(0, framesToRead * channels, requestedFrames * channels);
+        const missingFrames = requestedFrames - framesToRead;
+
+        if (declickFrames > 0) {
+          // Entering underrun cancels any partial recovery fade-in.
+          this._fadeInPos = 0;
+          this._fadeInTotal = 0;
+
+          if (framesToRead > 0 || this._hasActiveAudio) {
+            if (
+              framesToRead > 0 &&
+              missingFrames < declickFrames &&
+              framesToRead > missingFrames
+            ) {
+              // Fade out the last available frames toward 0.0, then zero-fill missing tail.
+              const fadeFrames =
+                declickFrames < framesToRead ? declickFrames : framesToRead;
+              const fadeStart = framesToRead - fadeFrames;
+              for (let i = 0; i < fadeFrames; i++) {
+                const rampGain = (fadeFrames - 1 - i) / fadeFrames;
+                const base = (fadeStart + i) * channels;
+                for (let c = 0; c < channels; c++) {
+                  output[base + c] *= rampGain;
+                }
+              }
+              output.fill(0, framesToRead * channels, requestedFrames * channels);
+            } else {
+              // Ramp smoothly from the last output sample toward 0.0 over the missing tail.
+              if (framesToRead > 0) {
+                const lastBase = (framesToRead - 1) * channels;
+                for (let c = 0; c < channels; c++) {
+                  this._lastOutputFrame[c] = output[lastBase + c];
+                }
+              }
+              const fadeFrames =
+                declickFrames < missingFrames ? declickFrames : missingFrames;
+              for (let i = 0; i < fadeFrames; i++) {
+                const rampGain = (fadeFrames - 1 - i) / fadeFrames;
+                const base = (framesToRead + i) * channels;
+                for (let c = 0; c < channels; c++) {
+                  output[base + c] = this._lastOutputFrame[c] * rampGain;
+                }
+              }
+              if (framesToRead + fadeFrames < requestedFrames) {
+                output.fill(
+                  0,
+                  (framesToRead + fadeFrames) * channels,
+                  requestedFrames * channels
+                );
+              }
+            }
+
+            this._fadeOutCount += 1;
+            this._hasActiveAudio = false;
+            this._lastOutputFrame.fill(0);
+          } else {
+            output.fill(0, framesToRead * channels, requestedFrames * channels);
+          }
+
+          this._inUnderrun = true;
+        } else {
+          output.fill(0, framesToRead * channels, requestedFrames * channels);
+        }
+
         Atomics.add(this._ctrl, HDR_UNDERRUNS, 1);
-        Atomics.add(this._ctrl, HDR_UNDERRUN_FRAMES, requestedFrames - framesToRead);
+        Atomics.add(this._ctrl, HDR_UNDERRUN_FRAMES, missingFrames);
+      } else {
+        // Steady-state full pull: record trailing frame without mutating output.
+        const lastBase = (requestedFrames - 1) * channels;
+        for (let c = 0; c < channels; c++) {
+          this._lastOutputFrame[c] = output[lastBase + c];
+        }
+        this._hasActiveAudio = true;
       }
 
       return framesToRead;
@@ -858,6 +1093,7 @@
         nextRead -= this._modulus;
       }
       Atomics.store(this._ctrl, HDR_READ_CURSOR, nextRead);
+      this._recordFillTransition(used, Math.max(0, used - toDiscard));
       return toDiscard;
     }
 
@@ -868,10 +1104,23 @@
       Atomics.store(this._ctrl, HDR_UNDERRUN_FRAMES, 0);
       Atomics.store(this._ctrl, HDR_OVERFLOWS, 0);
       Atomics.store(this._ctrl, HDR_DROPPED_FRAMES, 0);
+      this._lastOutputFrame.fill(0);
+      this._hasActiveAudio = false;
+      this._inUnderrun = false;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._fadeOutCount = 0;
+      this._fadeInCount = 0;
+      this._peakFillFrames = 0;
+      this._minFillFrames = Infinity;
+      this._fillFramesSum = 0;
+      this._fillSamples = 0;
+      this._lastObservedFill = null;
     }
 
     getStats() {
       const overflows = this.overflows;
+      const underruns = this.underruns;
       return {
         capacityFrames: this._capacityFrames,
         channels: this._channels,
@@ -880,8 +1129,15 @@
         volume: this._volume,
         muted: this._muted,
         effectiveGain: this.effectiveGain(),
-        underruns: this.underruns,
+        declickFrames: this._declickFrames,
+        underruns,
+        underrunCount: underruns,
         underrunFrames: this.underrunFrames,
+        fadeOutCount: this._fadeOutCount,
+        fadeInCount: this._fadeInCount,
+        peakFillFrames: this.peakFillFrames,
+        minFillFrames: this.minFillFrames,
+        avgFillRatio: this.avgFillRatio,
         overflows,
         overruns: overflows,
         droppedFrames: this.droppedFrames,
@@ -919,6 +1175,10 @@
         DEFAULT_MAX_PCM_BYTES,
         Float32Array.BYTES_PER_ELEMENT,
         64 * 1024 * 1024
+      );
+      this._declickFrames = sanitizeDeclickFrames(
+        opts.declickFrames,
+        DEFAULT_DECLICK_FRAMES
       );
       this._autoDrain = opts.autoDrain !== undefined ? Boolean(opts.autoDrain) : true;
       this._drainIntervalMs = sanitizePositiveInt(
@@ -1116,8 +1376,40 @@
       return drained;
     }
 
+    get declickFrames() {
+      return this._declickFrames;
+    }
+
+    setDeclickFrames(frames) {
+      this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
+      if (this.ring) {
+        this.ring.setDeclickFrames(this._declickFrames);
+      }
+      return this._declickFrames;
+    }
+
+    _resetTelemetryAndCounters() {
+      this.totalPushedFrames = 0;
+      this.totalPulledFrames = 0;
+      this.framesDrained = 0;
+      this._drainTicks = 0;
+      this._overruns = 0;
+      this._rejectedPackets = 0;
+      this._sabCopiedPackets = 0;
+      this._sanitizedSamples = 0;
+      this._lastDrainMs = null;
+    }
+
+    reset() {
+      if (this.ring) {
+        this.ring.reset();
+      }
+      this._resetTelemetryAndCounters();
+    }
+
     stop() {
       this._stopDrainTimer();
+      this.reset();
     }
 
     destroy() {
@@ -1128,7 +1420,7 @@
       return this.muted ? 0.0 : this.volume;
     }
 
-    pullSamples(output) {
+    pullSamples(output, gainOverride) {
       if (
         !(output instanceof Float32Array) ||
         (!isSharedArrayBuffer(output.buffer) && isDetachedArrayBuffer(output.buffer))
@@ -1139,7 +1431,7 @@
         output.fill(0);
         return 0;
       }
-      const framesRead = this.ring.pullSamples(output);
+      const framesRead = this.ring.pullSamples(output, gainOverride);
       this.totalPulledFrames += framesRead;
       return framesRead;
     }
@@ -1155,8 +1447,15 @@
             volume: this.volume,
             muted: this.muted,
             effectiveGain: this.effectiveGain(),
+            declickFrames: this._declickFrames,
             underruns: 0,
+            underrunCount: 0,
             underrunFrames: 0,
+            fadeOutCount: 0,
+            fadeInCount: 0,
+            peakFillFrames: 0,
+            minFillFrames: 0,
+            avgFillRatio: 0.0,
             overflows: 0,
             overruns: 0,
             droppedFrames: 0,
@@ -1175,9 +1474,16 @@
         volume: this.volume,
         muted: this.muted,
         effectiveGain: this.effectiveGain(),
+        declickFrames: this._declickFrames,
         framesDrained: this.framesDrained,
         underruns: ringStats.underruns,
+        underrunCount: ringStats.underrunCount,
         underrunFrames: ringStats.underrunFrames,
+        fadeOutCount: ringStats.fadeOutCount,
+        fadeInCount: ringStats.fadeInCount,
+        peakFillFrames: ringStats.peakFillFrames,
+        minFillFrames: ringStats.minFillFrames,
+        avgFillRatio: ringStats.avgFillRatio,
         overruns,
         overflows: ringStats.overflows,
         droppedFrames: ringStats.droppedFrames,
@@ -1254,6 +1560,12 @@
               64 * 1024 * 1024
             );
           }
+          if (msg.declickFrames !== undefined) {
+            this._declickFrames = sanitizeDeclickFrames(
+              msg.declickFrames,
+              this._declickFrames
+            );
+          }
 
           const nextSampleRate = sanitizeSampleRate(msg.sampleRate);
           const nextChannels = sanitizePositiveInt(
@@ -1286,11 +1598,18 @@
               this._safePostMessage(errReply);
               return;
             }
+            const reconfiguringSameSab = Boolean(
+              this.ring && this.ring.sab === msg.ringSab
+            );
             nextRing = new AudioRingBuffer(msg.ringSab, {
               channels: nextChannels,
               volume: this.volume,
               muted: this.muted,
+              declickFrames: this._declickFrames,
             });
+            if (reconfiguringSameSab) {
+              nextRing.reset();
+            }
           } else {
             const cap = sanitizePositiveInt(
               msg.capacityFrames,
@@ -1298,7 +1617,9 @@
               1,
               MAX_CAPACITY_FRAMES
             );
-            nextRing = AudioRingBuffer.create(cap, nextChannels);
+            nextRing = AudioRingBuffer.create(cap, nextChannels, {
+              declickFrames: this._declickFrames,
+            });
             nextRing.setVolume(this.volume);
             nextRing.setMuted(this.muted);
           }
@@ -1308,15 +1629,7 @@
           this.channels = nextRing.channels;
           this.outputState = this._resolveInitOutputState(msg);
           this.initialized = true;
-          this.totalPushedFrames = 0;
-          this.totalPulledFrames = 0;
-          this.framesDrained = 0;
-          this._drainTicks = 0;
-          this._overruns = 0;
-          this._rejectedPackets = 0;
-          this._sabCopiedPackets = 0;
-          this._sanitizedSamples = 0;
-          this._lastDrainMs = null;
+          this._resetTelemetryAndCounters();
 
           if (this._shouldDrain()) {
             this._startDrainTimer();
@@ -1470,6 +1783,18 @@
           return;
         }
 
+        if (msg.reset || msg.type === 'reset') {
+          this.reset();
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              reset: true,
+              outputState: this.outputState,
+            });
+          }
+          return;
+        }
+
         if (msg.stop || msg.destroy || msg.type === 'stop') {
           this.stop();
           if (safeId !== undefined) {
@@ -1520,6 +1845,8 @@
     MAX_CHANNELS,
     DEFAULT_DRAIN_INTERVAL_MS,
     DEFAULT_MAX_PCM_BYTES,
+    DEFAULT_DECLICK_FRAMES,
+    MAX_DECLICK_FRAMES,
     RING_HEADER_BYTES,
     extractSafePcmSamples,
     clonePcmForTransfer,
