@@ -878,6 +878,18 @@ CommandListBridge::CommandListBridge(StateBridgeDevice& device, CommandEncoder& 
 }
 
 void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
+    // O36: bound the per-list bind group cache. Its keys change per draw (ring-allocated root CBVs,
+    // descriptor table bases), so it grew for the whole run, each entry a live WebGPU bind group,
+    // until the browser renderer process ran out of memory (~215 s, #726). The previous recording
+    // is finished here, so dropped bind groups are destroyed at the head of the new one.
+    {
+        std::vector<uint32_t> evicted;
+        bind_groups_.end_epoch(kMaxCachedBindGroups, &evicted);
+        for (const uint32_t id : evicted) {
+            redirects_.erase(id);
+            encoder_.destroy_resource(id);
+        }
+    }
     tracker_.reset();
     root_args_.reset();
     resource_states_.reset();

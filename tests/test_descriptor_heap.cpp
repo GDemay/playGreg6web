@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1268,6 +1269,24 @@ void test_heap_indexed_bind_groups() {
     BindGroupLookup no_heap = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
     CHECK(no_heap.status == Status::Ok && no_heap.bind_group->entries[0].kind == BindResourceKind::Null);
     CHECK(no_heap.bind_group->entries[1].resource_id == 701 && cache.heap_index_misses() == 3);
+
+    // O36 end_epoch: under the bound nothing is dropped; above it, entries this epoch did not use
+    // are dropped (their gpu ids retired), and a full epoch above the bound empties the cache.
+    {
+        std::vector<uint32_t> retired;
+        const size_t before = cache.size();
+        CHECK(before >= 3);
+        CHECK(cache.end_epoch(before, &retired) == 0 && retired.empty() && cache.size() == before);
+        CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+        BindGroupLookup used = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);  // used this epoch
+        CHECK(used.bind_group != nullptr);
+        used.bind_group->gpu_id = 99;
+        const size_t cached = cache.size();
+        CHECK(cache.end_epoch(1, &retired) == cached - 1 && cache.size() == 1);
+        CHECK(std::find(retired.begin(), retired.end(), 99u) == retired.end());
+        CHECK(cache.end_epoch(0, &retired) == 1 && cache.size() == 0);
+        CHECK(std::find(retired.begin(), retired.end(), 99u) != retired.end());
+    }
 }
 
 // Binding array elements (G62, lane-indexed heap windows): element k reads the heap index plus k;
