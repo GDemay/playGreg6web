@@ -23,6 +23,15 @@
   const DEFAULT_DECLICK_FRAMES = 32;
   const MAX_DECLICK_FRAMES = 4096;
 
+  // Multi-channel ITU-R BS.775 downmix, soft-clip limiter, and resampling safeguards.
+  const DEFAULT_SOFT_CLIP_KNEE = 0.95;
+  const ITU_BS775_CENTER_GAIN = Math.SQRT1_2;
+  const ITU_BS775_SURROUND_GAIN = Math.SQRT1_2;
+  const ITU_BS775_LFE_GAIN = 0.0;
+  const MAX_RESAMPLE_RATIO = 16;
+  const DEFAULT_MAX_RESAMPLE_FRAMES = 524288;
+  const SUPPORTED_DOWNMIX_CHANNELS = Object.freeze([1, 2, 4, 6, 8]);
+
   const OUTPUT_STATES = Object.freeze({
     ACTIVE: 'active',
     SUSPENDED: 'suspended',
@@ -425,6 +434,426 @@
     return extracted.pcm;
   }
 
+  function clampSample(value, min, max) {
+    if (value < min) return min;
+    if (value > max) return max;
+    return value;
+  }
+
+  /**
+   * Smooth C1-continuous soft-clip peak limiter backed by Math.tanh.
+   * Non-finite inputs (NaN / +-Infinity) are sanitized to 0.0.
+   *
+   * @param {number} x
+   * @param {number} [knee=0.95]
+   * @returns {number}
+   */
+  function softClipSample(x, knee = DEFAULT_SOFT_CLIP_KNEE) {
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+    if (!Number.isFinite(x)) {
+      return 0.0;
+    }
+    const absX = Math.abs(x);
+    if (absX <= knee) {
+      return x;
+    }
+    const headroom = 1.0 - knee;
+    const compressed = knee + headroom * Math.tanh((absX - knee) / headroom);
+    const bounded = compressed > 1.0 ? 1.0 : compressed;
+    return x < 0 ? -bounded : bounded;
+  }
+
+  function validateDownmixGain(value, fallback, name) {
+    if (value === undefined) {
+      return fallback;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative finite number, got ${value}`);
+    }
+    return value;
+  }
+
+  /**
+   * ITU-R BS.775 multi-channel (1, 2, 4, 5.1 [6ch], 7.1 [8ch]) to stereo downmix
+   * with per-channel non-finite sanitization and smooth soft-clip peak limiting.
+   *
+   * @param {Float32Array|ArrayBuffer|SharedArrayBuffer|ArrayBufferView|number[]} samples
+   * @param {number} channels Source channel count (1, 2, 4, 6, or 8).
+   * @param {object} [options]
+   * @returns {Float32Array} Interleaved stereo Float32Array.
+   */
+  function downmixToStereo(samples, channels, options = {}) {
+    if (!Number.isInteger(channels) || !SUPPORTED_DOWNMIX_CHANNELS.includes(channels)) {
+      throw new RangeError(
+        `downmixToStereo channels must be one of ${SUPPORTED_DOWNMIX_CHANNELS.join(', ')}, got ${channels}`
+      );
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const centerGain = validateDownmixGain(
+      opts.centerGain !== undefined ? opts.centerGain : opts.centerWeight,
+      ITU_BS775_CENTER_GAIN,
+      'centerGain'
+    );
+    const surroundGain = validateDownmixGain(
+      opts.surroundGain !== undefined ? opts.surroundGain : opts.surroundWeight,
+      ITU_BS775_SURROUND_GAIN,
+      'surroundGain'
+    );
+    const lfeGain = validateDownmixGain(
+      opts.lfeGain !== undefined ? opts.lfeGain : opts.lfeWeight,
+      ITU_BS775_LFE_GAIN,
+      'lfeGain'
+    );
+    const softClip = opts.softClip !== undefined ? Boolean(opts.softClip) : true;
+    const knee =
+      opts.limiterKnee !== undefined
+        ? opts.limiterKnee
+        : opts.knee !== undefined
+          ? opts.knee
+          : DEFAULT_SOFT_CLIP_KNEE;
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`limiterKnee must be in [0, 1), got ${knee}`);
+    }
+
+    let src;
+    let nanSanitized = 0;
+    if (samples instanceof Float32Array && !isSharedArrayBuffer(samples.buffer)) {
+      if (isDetachedArrayBuffer(samples.buffer)) {
+        throw new TypeError('PCM TypedArray backing ArrayBuffer is detached');
+      }
+      src = samples;
+    } else {
+      const extracted = extractSafePcmSamples(samples, { maxPcmBytes: 64 * 1024 * 1024 });
+      if (!extracted.ok) {
+        throw new TypeError(extracted.error);
+      }
+      src = extracted.pcm;
+      nanSanitized += extracted.sanitizedSamples;
+    }
+
+    const frameCount = Math.floor(src.length / channels);
+    const out = new Float32Array(frameCount * 2);
+    let clipped = 0;
+    let peak = 0.0;
+
+    for (let f = 0; f < frameCount; f++) {
+      const base = f * channels;
+      let rawL;
+      let rawR;
+
+      if (channels === 6) {
+        // 5.1: FL, FR, FC, LFE, BL, BR
+        let fl = src[base];
+        let fr = src[base + 1];
+        let fc = src[base + 2];
+        let lfe = src[base + 3];
+        let bl = src[base + 4];
+        let br = src[base + 5];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fc)) { fc = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(lfe)) { lfe = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+
+        rawL = fl + fc * centerGain + bl * surroundGain + lfe * lfeGain;
+        rawR = fr + fc * centerGain + br * surroundGain + lfe * lfeGain;
+      } else if (channels === 8) {
+        // 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
+        let fl = src[base];
+        let fr = src[base + 1];
+        let fc = src[base + 2];
+        let lfe = src[base + 3];
+        let bl = src[base + 4];
+        let br = src[base + 5];
+        let sl = src[base + 6];
+        let sr = src[base + 7];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fc)) { fc = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(lfe)) { lfe = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(sl)) { sl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(sr)) { sr = 0.0; nanSanitized += 1; }
+
+        rawL = fl + fc * centerGain + (bl + sl) * surroundGain + lfe * lfeGain;
+        rawR = fr + fc * centerGain + (br + sr) * surroundGain + lfe * lfeGain;
+      } else if (channels === 4) {
+        // Quad: FL, FR, BL, BR
+        let fl = src[base];
+        let fr = src[base + 1];
+        let bl = src[base + 2];
+        let br = src[base + 3];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+
+        rawL = fl + bl * surroundGain;
+        rawR = fr + br * surroundGain;
+      } else if (channels === 2) {
+        let fl = src[base];
+        let fr = src[base + 1];
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        rawL = fl;
+        rawR = fr;
+      } else {
+        let m = src[base];
+        if (!Number.isFinite(m)) { m = 0.0; nanSanitized += 1; }
+        rawL = m;
+        rawR = m;
+      }
+
+      if (!Number.isFinite(rawL)) { rawL = 0.0; nanSanitized += 1; }
+      if (!Number.isFinite(rawR)) { rawR = 0.0; nanSanitized += 1; }
+
+      let outL;
+      let outR;
+      if (softClip) {
+        if (rawL > knee || rawL < -knee) clipped += 1;
+        if (rawR > knee || rawR < -knee) clipped += 1;
+        outL = softClipSample(rawL, knee);
+        outR = softClipSample(rawR, knee);
+      } else {
+        if (rawL > 1.0 || rawL < -1.0) clipped += 1;
+        if (rawR > 1.0 || rawR < -1.0) clipped += 1;
+        outL = clampSample(rawL, -1.0, 1.0);
+        outR = clampSample(rawR, -1.0, 1.0);
+      }
+
+      const absL = Math.abs(outL);
+      const absR = Math.abs(outR);
+      if (absL > peak) peak = absL;
+      if (absR > peak) peak = absR;
+
+      const outIdx = f * 2;
+      out[outIdx] = outL;
+      out[outIdx + 1] = outR;
+    }
+
+    if (opts.stats && typeof opts.stats === 'object') {
+      const dmFrames = channels > 2 ? frameCount : 0;
+      opts.stats.downmixedFrames = (opts.stats.downmixedFrames || 0) + dmFrames;
+      opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+      opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+      opts.stats.peakLevel = Math.max(opts.stats.peakLevel || 0.0, peak);
+    }
+
+    return out;
+  }
+
+  /**
+   * Smooth linear PCM resampler with safeguards for 44.1 kHz <-> 48 kHz and
+   * general Bink2 / XAudio2 sample-rate conversions.
+   *
+   * @param {Float32Array|ArrayBuffer|SharedArrayBuffer|ArrayBufferView|number[]} samples
+   * @param {number} channels Interleaved channel count (1..8).
+   * @param {number} srcSampleRate Source sample rate in Hz.
+   * @param {number} dstSampleRate Destination sample rate in Hz.
+   * @param {object} [options]
+   * @returns {Float32Array}
+   */
+  function resampleLinear(samples, channels, srcSampleRate, dstSampleRate, options = {}) {
+    if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
+      throw new RangeError(
+        `resampleLinear channels must be an integer in [1, ${MAX_CHANNELS}], got ${channels}`
+      );
+    }
+    if (
+      typeof srcSampleRate !== 'number' ||
+      !Number.isFinite(srcSampleRate) ||
+      srcSampleRate < MIN_SAMPLE_RATE ||
+      srcSampleRate > MAX_SAMPLE_RATE
+    ) {
+      throw new RangeError(
+        `srcSampleRate must be in [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}], got ${srcSampleRate}`
+      );
+    }
+    if (
+      typeof dstSampleRate !== 'number' ||
+      !Number.isFinite(dstSampleRate) ||
+      dstSampleRate < MIN_SAMPLE_RATE ||
+      dstSampleRate > MAX_SAMPLE_RATE
+    ) {
+      throw new RangeError(
+        `dstSampleRate must be in [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}], got ${dstSampleRate}`
+      );
+    }
+
+    const ratio = dstSampleRate / srcSampleRate;
+    if (
+      !Number.isFinite(ratio) ||
+      ratio <= 0 ||
+      ratio > MAX_RESAMPLE_RATIO ||
+      1.0 / ratio > MAX_RESAMPLE_RATIO
+    ) {
+      throw new RangeError(
+        `Resample ratio (${srcSampleRate} -> ${dstSampleRate}) exceeds max guard (${MAX_RESAMPLE_RATIO}x)`
+      );
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxOutputFrames =
+      typeof opts.maxOutputFrames === 'number' &&
+      Number.isFinite(opts.maxOutputFrames) &&
+      opts.maxOutputFrames > 0
+        ? Math.floor(opts.maxOutputFrames)
+        : DEFAULT_MAX_RESAMPLE_FRAMES;
+    const softClip = Boolean(opts.softClip);
+    const knee =
+      opts.limiterKnee !== undefined
+        ? opts.limiterKnee
+        : opts.knee !== undefined
+          ? opts.knee
+          : DEFAULT_SOFT_CLIP_KNEE;
+    if (softClip && (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0)) {
+      throw new RangeError(`limiterKnee must be in [0, 1), got ${knee}`);
+    }
+
+    let src;
+    let nanSanitized = 0;
+    if (samples instanceof Float32Array && !isSharedArrayBuffer(samples.buffer)) {
+      if (isDetachedArrayBuffer(samples.buffer)) {
+        throw new TypeError('PCM TypedArray backing ArrayBuffer is detached');
+      }
+      src = samples;
+    } else {
+      const extracted = extractSafePcmSamples(samples, { maxPcmBytes: 64 * 1024 * 1024 });
+      if (!extracted.ok) {
+        throw new TypeError(extracted.error);
+      }
+      src = extracted.pcm;
+      nanSanitized += extracted.sanitizedSamples;
+    }
+
+    const srcFrames = Math.floor(src.length / channels);
+    if (srcFrames <= 0) {
+      return new Float32Array(0);
+    }
+
+    const state = opts.state && typeof opts.state === 'object' ? opts.state : null;
+    const EPS = 1e-12;
+    let clipped = 0;
+
+    const startPhase =
+      state && typeof state.phase === 'number' && Number.isFinite(state.phase) && state.phase >= 0
+        ? state.phase
+        : 0.0;
+
+    if (srcSampleRate === dstSampleRate && startPhase < EPS) {
+      if (srcFrames > maxOutputFrames) {
+        throw new RangeError(
+          `Resampled output (${srcFrames} frames) exceeds maxOutputFrames (${maxOutputFrames})`
+        );
+      }
+      const totalSamples = srcFrames * channels;
+      const out = new Float32Array(totalSamples);
+      for (let i = 0; i < totalSamples; i++) {
+        let v = src[i];
+        if (!Number.isFinite(v)) {
+          v = 0.0;
+          nanSanitized += 1;
+        }
+        if (softClip) {
+          if (v > knee || v < -knee) clipped += 1;
+          v = softClipSample(v, knee);
+        }
+        out[i] = v;
+      }
+      if (state) {
+        state.phase = 0.0;
+      }
+      if (opts.stats && typeof opts.stats === 'object') {
+        opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+        opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+      }
+      return out;
+    }
+
+    const step = srcSampleRate / dstSampleRate;
+    if (srcFrames - startPhase <= EPS) {
+      if (state) {
+        const rem = startPhase - srcFrames;
+        state.phase = rem > EPS ? rem : 0.0;
+      }
+      return new Float32Array(0);
+    }
+
+    const outFrames = Math.floor((srcFrames - startPhase - EPS) / step) + 1;
+    if (outFrames > maxOutputFrames) {
+      throw new RangeError(
+        `Resampled output (${outFrames} frames) exceeds maxOutputFrames (${maxOutputFrames})`
+      );
+    }
+
+    const out = new Float32Array(outFrames * channels);
+    const lastFrame = srcFrames - 1;
+
+    for (let f = 0; f < outFrames; f++) {
+      const pos = startPhase + f * step;
+      let i0 = Math.floor(pos);
+      if (i0 < 0) i0 = 0;
+      else if (i0 > lastFrame) i0 = lastFrame;
+      const frac = pos - i0;
+      const i1 = i0 < lastFrame ? i0 + 1 : lastFrame;
+      const base0 = i0 * channels;
+      const base1 = i1 * channels;
+      const outBase = f * channels;
+
+      for (let c = 0; c < channels; c++) {
+        let s0 = src[base0 + c];
+        if (!Number.isFinite(s0)) {
+          s0 = 0.0;
+          nanSanitized += 1;
+        }
+        let val;
+        if (frac <= 0 || i1 === i0) {
+          val = s0;
+        } else {
+          let s1 = src[base1 + c];
+          if (!Number.isFinite(s1)) {
+            s1 = 0.0;
+            nanSanitized += 1;
+          }
+          val = s0 + (s1 - s0) * frac;
+          if (!Number.isFinite(val)) {
+            val = 0.0;
+            nanSanitized += 1;
+          }
+        }
+        if (softClip) {
+          if (val > knee || val < -knee) clipped += 1;
+          val = softClipSample(val, knee);
+        }
+        out[outBase + c] = val;
+      }
+    }
+
+    if (state) {
+      let nextPhase = startPhase + outFrames * step - srcFrames;
+      if (!Number.isFinite(nextPhase) || nextPhase < EPS) {
+        nextPhase = 0.0;
+      }
+      state.phase = nextPhase;
+    }
+
+    if (opts.stats && typeof opts.stats === 'object') {
+      opts.stats.resampledFrames = (opts.stats.resampledFrames || 0) + outFrames;
+      opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+      opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+    }
+
+    return out;
+  }
+
   /**
    * Builds a strictly sanitized `audio-stats` telemetry snapshot containing only
    * finite numeric counters, booleans, and whitelisted enum strings.
@@ -470,7 +899,10 @@
     const volume = clampVolume(s.volume !== undefined ? s.volume : 1.0);
     const muted = Boolean(s.muted);
     const effectiveGain = muted ? 0.0 : volume;
-    const underruns = sanitizeNonNegInt(s.underruns, 0);
+    const underruns = sanitizeNonNegInt(
+      s.underruns !== undefined ? s.underruns : s.underrunCount,
+      0
+    );
     const underrunCount = sanitizeNonNegInt(
       s.underrunCount !== undefined ? s.underrunCount : underruns,
       underruns
@@ -502,7 +934,25 @@
     const drainTicks = sanitizeNonNegInt(s.drainTicks, 0);
     const rejectedPackets = sanitizeNonNegInt(s.rejectedPackets, 0);
     const sabCopiedPackets = sanitizeNonNegInt(s.sabCopiedPackets, 0);
-    const sanitizedSamples = sanitizeNonNegInt(s.sanitizedSamples, 0);
+    const sanitizedSamples = sanitizeNonNegInt(
+      s.sanitizedSamples !== undefined
+        ? s.sanitizedSamples
+        : s.nanSanitizedSamples !== undefined
+          ? s.nanSanitizedSamples
+          : s.sanitizedNonFiniteSamples,
+      0
+    );
+    const nanSanitizedSamples = sanitizeNonNegInt(
+      s.nanSanitizedSamples !== undefined ? s.nanSanitizedSamples : sanitizedSamples,
+      sanitizedSamples
+    );
+    const downmixedFrames = sanitizeNonNegInt(s.downmixedFrames, 0);
+    const resampledFrames = sanitizeNonNegInt(s.resampledFrames, 0);
+    const clippedSamples = sanitizeNonNegInt(s.clippedSamples, 0);
+    const activeVoicePeak = sanitizeNonNegInt(
+      s.activeVoicePeak !== undefined ? s.activeVoicePeak : s.activeVoices,
+      0
+    );
     const outputState = normalizeOutputState(s.outputState, OUTPUT_STATES.HEADLESS_DRAIN);
 
     return {
@@ -537,6 +987,11 @@
         rejectedPackets,
         sabCopiedPackets,
         sanitizedSamples,
+        nanSanitizedSamples,
+        downmixedFrames,
+        resampledFrames,
+        clippedSamples,
+        activeVoicePeak,
       },
     };
   }
@@ -1204,6 +1659,18 @@
         this.outputState = detectDefaultOutputState();
       }
 
+      this._softClip = opts.softClip !== undefined ? Boolean(opts.softClip) : false;
+      const rawKnee =
+        opts.limiterKnee !== undefined
+          ? opts.limiterKnee
+          : opts.softClipKnee !== undefined
+            ? opts.softClipKnee
+            : DEFAULT_SOFT_CLIP_KNEE;
+      this._limiterKnee =
+        typeof rawKnee === 'number' && Number.isFinite(rawKnee) && rawKnee >= 0 && rawKnee < 1.0
+          ? rawKnee
+          : DEFAULT_SOFT_CLIP_KNEE;
+
       this.initialized = false;
       this.sampleRate = DEFAULT_SAMPLE_RATE;
       this.channels = DEFAULT_CHANNELS;
@@ -1218,6 +1685,12 @@
       this._rejectedPackets = 0;
       this._sabCopiedPackets = 0;
       this._sanitizedSamples = 0;
+      this._downmixedFrames = 0;
+      this._resampledFrames = 0;
+      this._clippedSamples = 0;
+      this._activeVoicePeak = 0;
+      this._resamplerState = { phase: 0.0 };
+      this._lastResampleSrcRate = null;
       this._drainTimer = null;
       this._lastDrainMs = null;
     }
@@ -1388,6 +1861,14 @@
       return this._declickFrames;
     }
 
+    recordActiveVoices(count) {
+      const sanitized = sanitizeNonNegInt(count, -1);
+      if (sanitized > this._activeVoicePeak) {
+        this._activeVoicePeak = sanitized;
+      }
+      return this._activeVoicePeak;
+    }
+
     _resetTelemetryAndCounters() {
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
@@ -1397,6 +1878,12 @@
       this._rejectedPackets = 0;
       this._sabCopiedPackets = 0;
       this._sanitizedSamples = 0;
+      this._downmixedFrames = 0;
+      this._resampledFrames = 0;
+      this._clippedSamples = 0;
+      this._activeVoicePeak = 0;
+      this._resamplerState = { phase: 0.0 };
+      this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
     }
 
@@ -1493,6 +1980,11 @@
         rejectedPackets: this._rejectedPackets,
         sabCopiedPackets: this._sabCopiedPackets,
         sanitizedSamples: this._sanitizedSamples,
+        nanSanitizedSamples: this._sanitizedSamples,
+        downmixedFrames: this._downmixedFrames,
+        resampledFrames: this._resampledFrames,
+        clippedSamples: this._clippedSamples,
+        activeVoicePeak: this._activeVoicePeak,
       };
     }
 
@@ -1565,6 +2057,16 @@
               msg.declickFrames,
               this._declickFrames
             );
+          }
+          if (msg.softClip !== undefined) {
+            this._softClip = Boolean(msg.softClip);
+          }
+          if (msg.limiterKnee !== undefined || msg.softClipKnee !== undefined) {
+            const rawKnee =
+              msg.limiterKnee !== undefined ? msg.limiterKnee : msg.softClipKnee;
+            if (typeof rawKnee === 'number' && Number.isFinite(rawKnee) && rawKnee >= 0 && rawKnee < 1.0) {
+              this._limiterKnee = rawKnee;
+            }
           }
 
           const nextSampleRate = sanitizeSampleRate(msg.sampleRate);
@@ -1668,6 +2170,59 @@
             return;
           }
 
+          const srcChannels = msg.channels !== undefined ? msg.channels : this.channels;
+          if (!Number.isInteger(srcChannels) || srcChannels < 1 || srcChannels > MAX_CHANNELS) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                error: `Unsupported PCM channel count: ${srcChannels}`,
+              });
+            }
+            return;
+          }
+          if (
+            srcChannels !== this.channels &&
+            !(this.channels === 2 && SUPPORTED_DOWNMIX_CHANNELS.includes(srcChannels))
+          ) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                error: `Cannot convert ${srcChannels}-channel PCM into ${this.channels}-channel ring`,
+              });
+            }
+            return;
+          }
+
+          const srcSampleRate = msg.sampleRate !== undefined ? msg.sampleRate : this.sampleRate;
+          if (
+            typeof srcSampleRate !== 'number' ||
+            !Number.isFinite(srcSampleRate) ||
+            srcSampleRate < MIN_SAMPLE_RATE ||
+            srcSampleRate > MAX_SAMPLE_RATE
+          ) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                error: `Invalid PCM sampleRate: ${srcSampleRate}`,
+              });
+            }
+            return;
+          }
+          const rateRatio = srcSampleRate / this.sampleRate;
+          if (rateRatio > MAX_RESAMPLE_RATIO || 1.0 / rateRatio > MAX_RESAMPLE_RATIO) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                error: `PCM sampleRate ratio (${srcSampleRate} -> ${this.sampleRate}) exceeds ${MAX_RESAMPLE_RATIO}x guard`,
+              });
+            }
+            return;
+          }
+
           if (extracted.copiedFromSab) {
             this._sabCopiedPackets += 1;
           }
@@ -1675,8 +2230,93 @@
             this._sanitizedSamples += extracted.sanitizedSamples;
           }
 
-          const pcm = extracted.pcm;
+          let pcm = extracted.pcm;
+
+          // Step 1: ITU-R BS.775 multi-channel (5.1 / 7.1 / 4ch) or mono -> stereo downmix/adapt.
+          if (srcChannels !== this.channels) {
+            const dmStats = {
+              downmixedFrames: 0,
+              clippedSamples: 0,
+              nanSanitizedSamples: 0,
+              peakLevel: 0.0,
+            };
+            const dmSoftClip = msg.softClip !== undefined ? Boolean(msg.softClip) : true;
+            const dmKnee =
+              msg.limiterKnee !== undefined
+                ? msg.limiterKnee
+                : msg.softClipKnee !== undefined
+                  ? msg.softClipKnee
+                  : this._limiterKnee;
+            pcm = downmixToStereo(pcm, srcChannels, {
+              centerGain: msg.centerGain,
+              surroundGain: msg.surroundGain,
+              lfeGain: msg.lfeGain,
+              softClip: dmSoftClip,
+              limiterKnee: dmKnee,
+              stats: dmStats,
+            });
+            this._downmixedFrames += dmStats.downmixedFrames;
+            this._clippedSamples += dmStats.clippedSamples;
+            this._sanitizedSamples += dmStats.nanSanitizedSamples;
+          } else if (msg.softClip === true || (msg.softClip === undefined && this._softClip)) {
+            const knee =
+              msg.limiterKnee !== undefined
+                ? msg.limiterKnee
+                : msg.softClipKnee !== undefined
+                  ? msg.softClipKnee
+                  : this._limiterKnee;
+            const limited = new Float32Array(pcm.length);
+            let clipped = 0;
+            for (let i = 0; i < pcm.length; i++) {
+              const v = pcm[i];
+              if (v > knee || v < -knee) {
+                clipped += 1;
+              }
+              limited[i] = softClipSample(v, knee);
+            }
+            this._clippedSamples += clipped;
+            pcm = limited;
+          }
+
+          // Step 2: Smooth 44.1 kHz <-> 48 kHz (and general) linear resampling with phase continuity.
+          if (srcSampleRate !== this.sampleRate) {
+            if (this._lastResampleSrcRate !== srcSampleRate) {
+              this._resamplerState = { phase: 0.0 };
+              this._lastResampleSrcRate = srcSampleRate;
+            }
+            const maxOutputFrames = Math.max(
+              1,
+              Math.floor(this._maxPcmBytes / (this.channels * Float32Array.BYTES_PER_ELEMENT))
+            );
+            const rsStats = {
+              resampledFrames: 0,
+              nanSanitizedSamples: 0,
+              clippedSamples: 0,
+            };
+            pcm = resampleLinear(pcm, this.channels, srcSampleRate, this.sampleRate, {
+              state: this._resamplerState,
+              maxOutputFrames,
+              stats: rsStats,
+            });
+            this._resampledFrames += rsStats.resampledFrames;
+            this._sanitizedSamples += rsStats.nanSanitizedSamples;
+            this._clippedSamples += rsStats.clippedSamples;
+          } else if (this._lastResampleSrcRate !== null) {
+            this._resamplerState = { phase: 0.0 };
+            this._lastResampleSrcRate = null;
+          }
+
           const inputFrames = Math.floor(pcm.length / this.channels);
+
+          if (
+            typeof msg.activeVoices === 'number' &&
+            Number.isFinite(msg.activeVoices) &&
+            msg.activeVoices >= 0
+          ) {
+            this.recordActiveVoices(msg.activeVoices);
+          } else if (inputFrames > 0) {
+            this.recordActiveVoices(1);
+          }
 
           // In headless-drain or autoplay-suspended mode, drain oldest frames at
           // bounded rate when ring pressure builds so guest audio producers never
@@ -1847,10 +2487,20 @@
     DEFAULT_MAX_PCM_BYTES,
     DEFAULT_DECLICK_FRAMES,
     MAX_DECLICK_FRAMES,
+    DEFAULT_SOFT_CLIP_KNEE,
+    ITU_BS775_CENTER_GAIN,
+    ITU_BS775_SURROUND_GAIN,
+    ITU_BS775_LFE_GAIN,
+    MAX_RESAMPLE_RATIO,
+    DEFAULT_MAX_RESAMPLE_FRAMES,
+    SUPPORTED_DOWNMIX_CHANNELS,
     RING_HEADER_BYTES,
     extractSafePcmSamples,
     clonePcmForTransfer,
     sanitizeTransferList,
+    softClipSample,
+    downmixToStereo,
+    resampleLinear,
     buildAudioTelemetrySnapshot,
   };
 

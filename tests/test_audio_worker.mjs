@@ -16,9 +16,14 @@ const {
   OUTPUT_STATES,
   DEFAULT_MAX_PCM_BYTES,
   DEFAULT_DECLICK_FRAMES,
+  ITU_BS775_CENTER_GAIN,
+  ITU_BS775_SURROUND_GAIN,
   extractSafePcmSamples,
   clonePcmForTransfer,
   sanitizeTransferList,
+  softClipSample,
+  downmixToStereo,
+  resampleLinear,
   buildAudioTelemetrySnapshot,
 } = audioMod;
 
@@ -1107,5 +1112,246 @@ test('W116 fill-level telemetry tracks peakFillFrames, minFillFrames, avgFillRat
   assert.equal(s.peakFillFrames, 0);
   assert.equal(s.minFillFrames, 0);
   assert.equal(s.avgFillRatio, 0);
+  worker.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W170: ITU-R BS.775 5.1 / 7.1 Downmix, 44.1<->48 kHz Resampling & Telemetry
+// ---------------------------------------------------------------------------
+
+test('W170 AudioMixerWorker downmixes 5.1 (6ch) and 7.1 (8ch) PCM to stereo with ITU-R BS.775 weights, soft-clip guard, and NaN isolation', () => {
+  assert.equal(typeof softClipSample, 'function');
+  assert.equal(typeof downmixToStereo, 'function');
+  assert.equal(typeof resampleLinear, 'function');
+  assert.ok(Math.abs(ITU_BS775_CENTER_GAIN - 0.70710678) < 1e-7);
+  assert.ok(Math.abs(ITU_BS775_SURROUND_GAIN - 0.70710678) < 1e-7);
+
+  const replies = [];
+  const worker = new AudioMixerWorker((msg) => replies.push(msg), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    outputState: 'active',
+  });
+
+  // 1. SAB-backed 5.1 packet (FL, FR, FC, LFE, BL, BR): 4 isolated frames.
+  const sab51 = new SharedArrayBuffer(4 * 6 * Float32Array.BYTES_PER_ELEMENT);
+  const view51 = new Float32Array(sab51);
+  view51.set([
+    0.5, 0.0, 0.0, 0.0, 0.0, 0.0, // FL
+    0.0, 0.0, 0.8, 0.9, 0.0, 0.0, // FC + LFE (LFE omitted by default)
+    0.0, 0.0, 0.0, 0.0, 0.6, 0.0, // BL
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.6, // BR
+  ]);
+  worker.handleMessage({ pushPcm: true, id: 1, channels: 6, samples: view51, activeVoices: 3 });
+  assert.equal(replies[replies.length - 1].pushedFrames, 4);
+  assert.equal(replies[replies.length - 1].droppedFrames, 0);
+
+  const out51 = new Float32Array(4 * 2);
+  assert.equal(worker.pullSamples(out51), 4);
+  assert.ok(Math.abs(out51[0] - 0.5) < 1e-6 && out51[1] === 0.0);
+  assert.ok(Math.abs(out51[2] - 0.8 * ITU_BS775_CENTER_GAIN) < 1e-6);
+  assert.ok(Math.abs(out51[3] - 0.8 * ITU_BS775_CENTER_GAIN) < 1e-6);
+  assert.ok(Math.abs(out51[4] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6 && out51[5] === 0.0);
+  assert.ok(out51[6] === 0.0 && Math.abs(out51[7] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6);
+
+  // 2. Full-scale 7.1 (8ch) packet triggers smooth soft-clip limiter instead of hard-clipping.
+  const hot71 = new Float32Array([
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0,
+  ]);
+  worker.handleMessage({ pushPcm: true, id: 2, channels: 8, samples: hot71, activeVoices: 5 });
+  assert.equal(replies[replies.length - 1].pushedFrames, 2);
+
+  const out71 = new Float32Array(2 * 2);
+  assert.equal(worker.pullSamples(out71), 2);
+  assert.ok(out71[0] > 0.95 && out71[0] <= 1.0);
+  assert.ok(out71[1] > 0.95 && out71[1] <= 1.0);
+  assert.ok(out71[2] < -0.95 && out71[2] >= -1.0);
+  assert.ok(out71[3] < -0.95 && out71[3] >= -1.0);
+
+  // 3. NaN / +-Infinity in 5.1 center/surround channels does not poison FL/FR.
+  const bad51 = new Float32Array([
+    0.4, -0.3, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0.2,
+  ]);
+  worker.handleMessage({ pushPcm: true, id: 3, channels: 6, samples: bad51 });
+  const outClean = new Float32Array(2);
+  assert.equal(worker.pullSamples(outClean), 1);
+  assert.ok(Math.abs(outClean[0] - 0.4) < 1e-6);
+  assert.ok(Math.abs(outClean[1] - (-0.3 + 0.2 * ITU_BS775_SURROUND_GAIN)) < 1e-6);
+
+  // 4. Unsupported channel counts are safely rejected without breaking subsequent packets.
+  worker.handleMessage({ pushPcm: true, id: 4, channels: 3, samples: new Float32Array(9) });
+  assert.match(replies[replies.length - 1].error, /Cannot convert/i);
+  worker.handleMessage({ pushPcm: true, id: 5, channels: 9, samples: new Float32Array(18) });
+  assert.match(replies[replies.length - 1].error, /Unsupported PCM channel count/i);
+
+  const stats = worker.getStats();
+  assert.equal(stats.downmixedFrames, 4 + 2 + 1);
+  assert.equal(stats.clippedSamples, 4);
+  assert.equal(stats.nanSanitizedSamples, 3);
+  assert.equal(stats.sanitizedSamples, 3);
+  assert.equal(stats.activeVoicePeak, 5);
+  assert.equal(stats.sabCopiedPackets, 1);
+  assert.equal(stats.rejectedPackets, 2);
+  worker.destroy();
+});
+
+test('W170 AudioMixerWorker resamples 44.1 kHz <-> 48 kHz (including 5.1 Bink2 intro) smoothly and rejects invalid sample rates', () => {
+  const replies = [];
+  const worker = new AudioMixerWorker((msg) => replies.push(msg), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 2048,
+    outputState: 'active',
+  });
+
+  // 1. Combined Bink2 5.1 @ 44.1 kHz (441 frames = 10 ms) -> downmix + resample to 480 stereo frames @ 48 kHz.
+  const bink51 = new Float32Array(441 * 6);
+  for (let f = 0; f < 441; f++) {
+    const tone = Math.sin((2 * Math.PI * 1000 * f) / 44100) * 0.5;
+    bink51[f * 6 + 0] = tone; // FL
+    bink51[f * 6 + 1] = -tone; // FR
+    bink51[f * 6 + 2] = 0.0;
+    bink51[f * 6 + 3] = 0.0;
+    bink51[f * 6 + 4] = 0.0;
+    bink51[f * 6 + 5] = 0.0;
+  }
+  worker.handleMessage({
+    pushPcm: true,
+    id: 10,
+    channels: 6,
+    sampleRate: 44100,
+    samples: bink51,
+  });
+  const ack = replies[replies.length - 1];
+  assert.equal(ack.id, 10);
+  assert.equal(ack.pushedFrames, 480);
+  assert.equal(ack.droppedFrames, 0);
+
+  const pulled48 = new Float32Array(480 * 2);
+  assert.equal(worker.pullSamples(pulled48), 480);
+  let sumSqErr = 0;
+  for (let f = 0; f < 478; f++) {
+    const expected = Math.sin((2 * Math.PI * 1000 * f) / 48000) * 0.5;
+    const dL = pulled48[f * 2] - expected;
+    const dR = pulled48[f * 2 + 1] - -expected;
+    sumSqErr += dL * dL + dR * dR;
+  }
+  const rms = Math.sqrt(sumSqErr / (478 * 2));
+  assert.ok(rms < 0.005, `Combined 5.1@44.1k -> stereo@48k RMS error too high: ${rms}`);
+
+  // 2. Reject invalid / out-of-range / extreme-ratio sampleRate safely.
+  worker.handleMessage({ pushPcm: true, id: 11, sampleRate: 0, samples: new Float32Array(8) });
+  assert.match(replies[replies.length - 1].error, /Invalid PCM sampleRate/i);
+  worker.handleMessage({ pushPcm: true, id: 12, sampleRate: Number.NaN, samples: new Float32Array(8) });
+  assert.match(replies[replies.length - 1].error, /Invalid PCM sampleRate/i);
+  worker.handleMessage({ pushPcm: true, id: 13, sampleRate: 999999, samples: new Float32Array(8) });
+  assert.match(replies[replies.length - 1].error, /Invalid PCM sampleRate/i);
+
+  const stats48 = worker.getStats();
+  assert.equal(stats48.downmixedFrames, 441);
+  assert.equal(stats48.resampledFrames, 480);
+  assert.equal(stats48.rejectedPackets, 3);
+
+  // 3. Reverse direction: 48 kHz -> 44.1 kHz worker (480 frames -> exact 441 frames).
+  worker.handleMessage({
+    init: true,
+    sampleRate: 44100,
+    channels: 2,
+    capacityFrames: 1024,
+    outputState: 'active',
+  });
+  const src48 = new Float32Array(480 * 2);
+  for (let f = 0; f < 480; f++) {
+    src48[f * 2] = Math.sin((2 * Math.PI * 1000 * f) / 48000) * 0.4;
+    src48[f * 2 + 1] = src48[f * 2];
+  }
+  worker.handleMessage({ pushPcm: true, id: 20, sampleRate: 48000, samples: src48 });
+  assert.equal(replies[replies.length - 1].pushedFrames, 441);
+  assert.equal(worker.getStats().resampledFrames, 441);
+  worker.destroy();
+});
+
+test('W170 sanitized audio-stats telemetry exposes downmixedFrames, clippedSamples, nanSanitizedSamples, underrunCount, activeVoicePeak and resets cleanly', () => {
+  const replies = [];
+  const worker = new AudioMixerWorker((msg) => replies.push(msg), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 64,
+    outputState: 'active',
+  });
+
+  // Push a hot 5.1 frame with 1 NaN sample and activeVoices=6, then pull more than available to trigger 1 underrun.
+  worker.handleMessage({
+    pushPcm: true,
+    channels: 6,
+    samples: new Float32Array([1.0, 1.0, 1.0, Number.NaN, 1.0, 1.0]),
+    activeVoices: 6,
+  });
+  const out = new Float32Array(4 * 2);
+  assert.equal(worker.pullSamples(out), 1);
+
+  worker.handleMessage({ stats: true, id: 'w170-stats' });
+  const reply = replies[replies.length - 1];
+  assert.equal(reply.type, 'audio-stats');
+  assert.equal(reply.id, 'w170-stats');
+  assert.equal(reply.stats.downmixedFrames, 1);
+  assert.equal(reply.stats.clippedSamples, 2);
+  assert.equal(reply.stats.nanSanitizedSamples, 1);
+  assert.equal(reply.stats.underrunCount, 1);
+  assert.equal(reply.stats.activeVoicePeak, 6);
+
+  // reset() zeroes all W170 telemetry cleanly.
+  worker.reset();
+  const afterReset = worker.getSanitizedStats();
+  assert.equal(afterReset.downmixedFrames, 0);
+  assert.equal(afterReset.resampledFrames, 0);
+  assert.equal(afterReset.clippedSamples, 0);
+  assert.equal(afterReset.nanSanitizedSamples, 0);
+  assert.equal(afterReset.underrunCount, 0);
+  assert.equal(afterReset.activeVoicePeak, 0);
+
+  // Dirty telemetry snapshot strictly sanitizes W170 fields and strips non-whitelisted fields.
+  const dirty = buildAudioTelemetrySnapshot(
+    {
+      downmixedFrames: -5,
+      resampledFrames: Infinity,
+      clippedSamples: Number.NaN,
+      sanitizedNonFiniteSamples: 7,
+      underrunCount: 3,
+      activeVoicePeak: 12.9,
+      hostPath: 'C:\\secret\\bink2.bk2',
+    },
+    { timestamp: 1234 }
+  );
+  assert.equal(dirty.stats.downmixedFrames, 0);
+  assert.equal(dirty.stats.resampledFrames, 0);
+  assert.equal(dirty.stats.clippedSamples, 0);
+  assert.equal(dirty.stats.nanSanitizedSamples, 7);
+  assert.equal(dirty.stats.underrunCount, 3);
+  assert.equal(dirty.stats.activeVoicePeak, 12);
+  assert.equal(JSON.stringify(dirty).includes('bink2.bk2'), false);
   worker.destroy();
 });
