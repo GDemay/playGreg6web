@@ -626,3 +626,265 @@ test('ResourceTable lifecycle, GpuResourceRegistry integration, and sanitized ge
   assert.equal(table.getStats().samplersActive, 0);
   assert.equal(table.getStats().shaderModulesActive, 0);
 });
+
+test('ResourceTable tracks peakLiveHandles, totalInserts, and totalDeletes across insert/delete waves (W141)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device);
+
+  let stats = table.getStats();
+  assert.equal(stats.liveHandles, 0);
+  assert.equal(stats.peakLiveHandles, 0);
+  assert.equal(stats.overwrites, 0);
+  assert.equal(stats.missingLookups, 0);
+  assert.equal(stats.totalInserts, 0);
+  assert.equal(stats.totalDeletes, 0);
+
+  // Wave 1: insert 6 handles across all 4 resource kinds (buffers, textures, texture2, samplers, shaders).
+  table.createBuffer(1, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX });
+  table.createBuffer(2, { size: 32, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(10, { size: { width: 32, height: 32 }, format: 'rgba8unorm' });
+  table.createTexture2(buildCreateTexture2Payload({ id: 11, width: 64, height: 64 }), 0);
+  table.createSampler(20, { magFilter: 'linear' });
+  table.createShaderModule(30, { code: '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }' });
+
+  stats = table.getStats();
+  assert.equal(stats.liveHandles, 6);
+  assert.equal(stats.peakLiveHandles, 6);
+  assert.equal(stats.totalInserts, 6);
+  assert.equal(stats.totalDeletes, 0);
+  assert.equal(stats.overwrites, 0);
+
+  // Wave 2: delete 4 handles + attempt deleting unknown handles (must not inflate totalDeletes).
+  assert.equal(table.destroyBuffer(1), true);
+  assert.equal(table.destroyBuffer(1), false);
+  assert.equal(table.destroyTexture(10), true);
+  assert.equal(table.destroyTexture(999), false);
+  assert.equal(table.destroy(20), 1);
+  assert.equal(table.destroy(30), 1);
+  assert.equal(table.destroy(12345), 0);
+
+  stats = table.getStats();
+  assert.equal(stats.liveHandles, 2);
+  assert.equal(stats.peakLiveHandles, 6);
+  assert.equal(stats.totalInserts, 6);
+  assert.equal(stats.totalDeletes, 4);
+
+  // Wave 3: insert 2 more (live=4 < peak=6 -> peak stays 6).
+  table.createBuffer(3, { size: 64, usage: GPU_BUFFER_USAGE.STORAGE });
+  table.createSampler(21, { minFilter: 'nearest' });
+
+  stats = table.getStats();
+  assert.equal(stats.liveHandles, 4);
+  assert.equal(stats.peakLiveHandles, 6);
+  assert.equal(stats.totalInserts, 8);
+  assert.equal(stats.totalDeletes, 4);
+
+  // Wave 4: insert 5 more (live=9 > peak=6 -> peak rises to 9).
+  for (let i = 0; i < 5; i += 1) {
+    table.createBuffer(100 + i, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX });
+  }
+  stats = table.getStats();
+  assert.equal(stats.liveHandles, 9);
+  assert.equal(stats.peakLiveHandles, 9);
+  assert.equal(stats.totalInserts, 13);
+  assert.equal(stats.totalDeletes, 4);
+  assert.equal(stats.liveHandles, stats.totalInserts - stats.overwrites - stats.totalDeletes);
+});
+
+test('ResourceTable accounts for overwrites across all resource kinds without double-counting deletes (W141)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device);
+
+  const b1 = table.createBuffer(1, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX });
+  const t1 = table.createTexture(2, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  const s1 = table.createSampler(3, { magFilter: 'linear' });
+  const m1 = table.createShaderModule(4, { code: '/* v1 */' });
+
+  assert.equal(table.getStats().liveHandles, 4);
+  assert.equal(table.getStats().peakLiveHandles, 4);
+  assert.equal(table.getStats().overwrites, 0);
+  assert.equal(table.getStats().totalInserts, 4);
+  assert.equal(table.getStats().totalDeletes, 0);
+
+  // Overwrite each live handle id once (plus a second texture overwrite via createTexture2).
+  const b2 = table.createBuffer(1, { size: 32, usage: GPU_BUFFER_USAGE.VERTEX });
+  const t2 = table.createTexture(2, { size: { width: 32, height: 32 }, format: 'rgba8unorm' });
+  const t3Res = table.createTexture2(buildCreateTexture2Payload({ id: 2, width: 64, height: 64 }), 0);
+  const s2 = table.createSampler(3, { magFilter: 'nearest' });
+  const m2 = table.createShaderModule(4, { code: '/* v2 */' });
+
+  assert.equal(b1.destroyed, true);
+  assert.equal(t1.destroyed, true);
+  assert.equal(t2.destroyed, true);
+  assert.notEqual(table.getBuffer(1), b1);
+  assert.equal(table.getBuffer(1), b2);
+  assert.equal(table.getTexture(2), t3Res.texture);
+  assert.notEqual(table.getSampler(3), s1);
+  assert.equal(table.getSampler(3), s2);
+  assert.notEqual(table.getShaderModule(4), m1);
+  assert.equal(table.getShaderModule(4), m2);
+
+  const stats = table.getStats();
+  assert.equal(stats.liveHandles, 4);
+  assert.equal(stats.peakLiveHandles, 4);
+  assert.equal(stats.overwrites, 5);
+  assert.equal(stats.totalInserts, 9);
+  assert.equal(stats.totalDeletes, 0);
+  assert.equal(stats.missingLookups, 0);
+  assert.equal(stats.liveHandles, stats.totalInserts - stats.overwrites - stats.totalDeletes);
+
+  // Re-inserting an explicitly deleted id is a fresh insert, not an overwrite.
+  assert.equal(table.destroyBuffer(1), true);
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.VERTEX });
+  const afterReinsert = table.getStats();
+  assert.equal(afterReinsert.overwrites, 5);
+  assert.equal(afterReinsert.totalInserts, 10);
+  assert.equal(afterReinsert.totalDeletes, 1);
+  assert.equal(afterReinsert.liveHandles, 4);
+  assert.equal(
+    afterReinsert.liveHandles,
+    afterReinsert.totalInserts - afterReinsert.overwrites - afterReinsert.totalDeletes
+  );
+});
+
+test('ResourceTable tracks missingLookups for unknown and deleted handles without counting hits or has* checks (W141)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device);
+
+  // Existence predicates must NOT increment missingLookups.
+  assert.equal(table.hasBuffer(999), false);
+  assert.equal(table.hasTexture(999), false);
+  assert.equal(table.getStats().missingLookups, 0);
+
+  // Lookups on unknown handle ids increment missingLookups.
+  assert.equal(table.getBuffer(101), undefined);
+  assert.equal(table.getBufferMeta(101), undefined);
+  assert.equal(table.getTexture(102), undefined);
+  assert.equal(table.getTextureView(102), undefined);
+  assert.equal(table.getTextureMeta(102), undefined);
+  assert.equal(table.getSampler(103), undefined);
+  assert.equal(table.getShaderModule(104), undefined);
+  assert.equal(table.writeBuffer(105, 0, new Uint8Array([1, 2, 3, 4])), false);
+  assert.equal(table.getStats().missingLookups, 8);
+
+  // Create valid handles and verify hits do NOT increment missingLookups.
+  table.createBuffer(1, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX | GPU_BUFFER_USAGE.COPY_DST });
+  table.createTexture(2, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  table.createSampler(3, {});
+  table.createShaderModule(4, { code: '/* ok */' });
+
+  assert.ok(table.getBuffer(1));
+  assert.ok(table.getBufferMeta(1));
+  assert.equal(table.writeBuffer(1, 0, new Uint8Array([1, 2, 3, 4])), true);
+  assert.ok(table.getTexture(2));
+  assert.ok(table.getTextureView(2));
+  assert.ok(table.getTextureMeta(2));
+  assert.ok(table.getSampler(3));
+  assert.ok(table.getShaderModule(4));
+  assert.equal(table.getStats().missingLookups, 8);
+
+  // Lookups on deleted handles increment missingLookups.
+  assert.equal(table.destroyBuffer(1), true);
+  assert.equal(table.destroyTexture(2), true);
+  assert.equal(table.destroy(3), 1);
+  assert.equal(table.destroy(4), 1);
+
+  assert.equal(table.getBuffer(1), undefined);
+  assert.equal(table.getTexture(2), undefined);
+  assert.equal(table.getTextureView(2), undefined);
+  assert.equal(table.getSampler(3), undefined);
+  assert.equal(table.getShaderModule(4), undefined);
+  assert.equal(table.writeBuffer(1, 0, new Uint8Array([1, 2, 3, 4])), false);
+  assert.equal(table.getStats().missingLookups, 14);
+});
+
+test('ResourceTable resetStats() preserves live handles with peak=currentLive and clear() resets deterministically (W141)', () => {
+  const { device } = createMockDevice({ features: new Set() });
+  const table = new ResourceTable(device);
+
+  // Build up a peak of 5 handles, trigger overwrite + missing lookup + hardening counters.
+  const b1 = table.createBuffer(1, { size: 5, usage: GPU_BUFFER_USAGE.VERTEX });
+  table.createBuffer(2, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX });
+  table.createTexture(3, { size: { width: 16, height: 16 }, mipLevelCount: 10, format: 'bc7-rgba-unorm' });
+  table.createSampler(4, {});
+  table.createShaderModule(5, { code: '/* s */' });
+
+  // Overwrite id 2 and probe missing id 999, then delete 3 handles so live=2 while peak=5.
+  table.createBuffer(2, { size: 32, usage: GPU_BUFFER_USAGE.VERTEX });
+  assert.equal(table.getBuffer(999), undefined);
+  table.destroyBuffer(2);
+  table.destroy(4);
+  table.destroy(5);
+
+  const beforeReset = table.getStats();
+  assert.equal(beforeReset.liveHandles, 2);
+  assert.equal(beforeReset.peakLiveHandles, 5);
+  assert.equal(beforeReset.overwrites, 1);
+  assert.equal(beforeReset.missingLookups, 1);
+  assert.equal(beforeReset.totalInserts, 6);
+  assert.equal(beforeReset.totalDeletes, 3);
+
+  // resetStats() zeroes counters, preserves live handles, and clamps peakLiveHandles to liveHandles (2).
+  table.resetStats();
+  const afterReset = table.getStats();
+  assert.equal(afterReset.buffersActive, 1);
+  assert.equal(afterReset.texturesActive, 1);
+  assert.equal(afterReset.liveHandles, 2);
+  assert.equal(afterReset.peakLiveHandles, 2);
+  assert.equal(afterReset.overwrites, 0);
+  assert.equal(afterReset.missingLookups, 0);
+  assert.equal(afterReset.totalInserts, 0);
+  assert.equal(afterReset.totalDeletes, 0);
+  assert.equal(afterReset.buffersCreated, 0);
+  assert.equal(afterReset.texturesCreated, 0);
+  assert.equal(afterReset.destroyCount, 0);
+  assert.equal(afterReset.bcFormatFallbackCount, 0);
+  assert.equal(afterReset.bufferAlignPadCount, 0);
+  assert.equal(afterReset.mipClampCount, 0);
+
+  // Preserved handles are still accessible.
+  assert.equal(table.getBuffer(1), b1);
+  assert.equal(b1.destroyed, false);
+  assert.ok(table.getTexture(3));
+
+  // New insert after resetStats() pushes peakLiveHandles from 2 -> 3.
+  table.createSampler(6, {});
+  assert.equal(table.getStats().liveHandles, 3);
+  assert.equal(table.getStats().peakLiveHandles, 3);
+  assert.equal(table.getStats().totalInserts, 1);
+
+  // clear() destroys all live handles while preserving cumulative peak and recording deletes.
+  table.clear();
+  const afterClear = table.getStats();
+  assert.equal(b1.destroyed, true);
+  assert.equal(afterClear.liveHandles, 0);
+  assert.equal(afterClear.buffersActive, 0);
+  assert.equal(afterClear.texturesActive, 0);
+  assert.equal(afterClear.textureViewsActive, 0);
+  assert.equal(afterClear.samplersActive, 0);
+  assert.equal(afterClear.shaderModulesActive, 0);
+  assert.equal(afterClear.peakLiveHandles, 3);
+  assert.equal(afterClear.totalDeletes, 3);
+  assert.equal(table.getBuffer(1), undefined);
+  assert.equal(table.getStats().missingLookups, 1);
+
+  // clear({ resetStats: true }) destroys live handles and resets all telemetry including peakLiveHandles=0.
+  table.createBuffer(7, { size: 16, usage: GPU_BUFFER_USAGE.VERTEX });
+  table.createBuffer(7, { size: 32, usage: GPU_BUFFER_USAGE.VERTEX });
+  assert.equal(table.getStats().overwrites, 1);
+  table.clear({ resetStats: true });
+
+  const afterClearReset = table.getStats();
+  assert.equal(afterClearReset.liveHandles, 0);
+  assert.equal(afterClearReset.peakLiveHandles, 0);
+  assert.equal(afterClearReset.overwrites, 0);
+  assert.equal(afterClearReset.missingLookups, 0);
+  assert.equal(afterClearReset.totalInserts, 0);
+  assert.equal(afterClearReset.totalDeletes, 0);
+  assert.equal(afterClearReset.destroyCount, 0);
+
+  for (const [k, v] of Object.entries(afterClearReset)) {
+    assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
+    assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
+  }
+});
